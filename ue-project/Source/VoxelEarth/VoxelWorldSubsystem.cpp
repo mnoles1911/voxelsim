@@ -14787,9 +14787,33 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// wrong units, which is worse than not having one.
 	if (LevelKey.Level == 0)
 	{
-		Req.BandOriginI = kBandApronOffset;
-		Req.BandOriginJ = kBandApronOffset;
-		Req.BandEdge = kBandGridEdge;
+		// -VoxelGpuBandColdOnly (default off, latched -- the -ExecCmds
+		// startup-window rule): ask for the band ONLY when this footprint's band
+		// is not already cached. The band is a pure function of (X,Y), one per
+		// footprint -- the request comment above says as much -- yet every
+		// level-0 job was asking, and under voxel.GPU.PoolAlloc the band is the
+		// job's ONLY remaining readback: 8.3 chunks share a footprint, so ~88%
+		// of level-0 jobs were paying a fence for a value already on this map.
+		// With it suppressed (and -VoxelGpuLeanBrickJobs on the manager side)
+		// a warm-footprint brick job reads back NOTHING and is deliverable the
+		// tick after dispatch. Consumers are unchanged: bBandValid=false already
+		// means "carries no band", and every cache Add is guarded on it.
+		// Observable in the manager's [gpu-lean] line: kept-for-band must fall
+		// toward the cold-footprint fraction, or the cache never warmed and
+		// this latch is dead.
+		static const bool bBandColdOnly = []
+		{
+			int32 Value = 0;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuBandColdOnly="), Value);
+			return Value != 0;
+		}();
+		if (!bBandColdOnly ||
+		    !FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
+		{
+			Req.BandOriginI = kBandApronOffset;
+			Req.BandOriginJ = kBandApronOffset;
+			Req.BandEdge = kBandGridEdge;
+		}
 	}
 	// The one place the raster-window arithmetic may live -- see
 	// VoxelGpuRegionBuild's header. Undersizing it does not fault; the kernel
@@ -15111,7 +15135,13 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 		// slot in that column instead of dispatching each one. This is also the
 		// only way the skip can ever fire on virgin terrain, which is precisely
 		// what speculation looks at.
-		if (Pending.Key.Level == 0)
+		// bBandValid GUARD (2026-08-23): this Add was unguarded, which was safe
+		// only while every level-0 job carried a band. Under -VoxelGpuBandColdOnly
+		// a warm-footprint job carries none, and an unguarded Add would cache a
+		// band of zeroes -- "this column is empty ground at z=0", silently, for
+		// the whole footprint. The demand path's Add (DrainResults) has always
+		// had this guard; this one now matches it.
+		if (Pending.Key.Level == 0 && GpuResult.bBandValid)
 		{
 			// + AssetBandRaiseVox: the GPU reduced ground columns only. See the
 			// helper's comment -- unraised, this cache entry proves crown

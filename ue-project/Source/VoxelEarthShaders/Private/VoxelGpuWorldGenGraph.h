@@ -373,16 +373,28 @@ namespace VoxelGpuWorldGen
 	// Returns the 8-dword claim buffer the three write passes consume. BrickTotals
 	// is the region graph's own totals buffer -- the two dwords that used to cross
 	// PCIe, now consumed where they were produced.
+	// TotalsChunkIndexPlusOne (stack-claim, 2026-08-23): 0 = classic totals at
+	// [0..1] of BrickTotals; n = fused-stack member n-1 -- the kernel reads its
+	// pair at [2+2c..] of the stack's per-chunk totals (bPerChunkBrickTotals)
+	// and derives its shared-scratch prefix in-kernel, which is what deletes
+	// the (2+2K)-dword stack totals READBACK and the CPU-side prefix harvest.
 	FRDGBufferRef AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
 	                                    const FBrickPoolAllocBuffers& Buffers,
 	                                    const FBrickPoolAllocLayout& Layout,
 	                                    FRDGBufferRef BrickTotals, uint32 ChunkSlot,
-	                                    uint32 OccWorstWords, uint32 MatWorstWords);
+	                                    uint32 OccWorstWords, uint32 MatWorstWords,
+	                                    uint32 TotalsChunkIndexPlusOne = 0,
+	                                    uint32 TotalsNumChunks = 0);
 
 	// The three writes: occ words, mat words (worst-case dispatch, actual count
 	// read from the claim), descriptors (claim-based rebase), and the record
 	// (zeroed on a failed claim). One call because their ordering relative to the
 	// claim is the only thing a caller could get wrong.
+	// SrcDescBase / ChunkMaskBase (stack-claim): a fused member's slice of the
+	// SHARED batch scratch -- chunkIndex * bricks-per-chunk descriptors,
+	// chunkIndex * 2 mask dwords. 0/0 on the classic single-chunk path, where
+	// the whole scratch is the chunk's; the word-copy source prefix travels in
+	// the claim itself (spare pair), not here.
 	void AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
 	                                  const FBrickPoolAllocBuffers& Buffers,
 	                                  FRDGBufferRef Claim,
@@ -391,7 +403,8 @@ namespace VoxelGpuWorldGen
 	                                  uint32 BrickCount, uint32 ChunkSlot, uint32 BrickBase,
 	                                  uint32 RingLevel, const FIntVector& OriginVoxel,
 	                                  const FVoxelBrickChunkShading& Shading,
-	                                  uint32 OccWorstWords, uint32 MatWorstWords);
+	                                  uint32 OccWorstWords, uint32 MatWorstWords,
+	                                  uint32 SrcDescBase = 0, uint32 ChunkMaskBase = 0);
 
 	// Eviction without a round trip: one thread per slot reads the side table,
 	// pushes the ranges onto their class stacks, clears the bitmap, zeroes the
