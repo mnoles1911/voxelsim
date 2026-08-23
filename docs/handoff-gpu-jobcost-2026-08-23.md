@@ -249,13 +249,22 @@ No code offered; noted so it is not missed.
 
 Two matched cold-start legs on the sanctioned harness (memory:
 `voxelsim-headless-leg-harness`), read with `tools/leg-summary.sh`, **never**
-`grep | tail -1`:
+`grep | tail -1`. `<STANDING>` is tonight's GPU-primary flag set, taken
+verbatim from whatever the previous leg used — the two arms must differ in
+exactly one thing.
 
-    ARM A (control, instrument only — proves the line and names the mechanism)
-      ...the standing -VoxelGpuPrimary cold-start flags, unchanged...
+```powershell
+# ARM A -- instrument only. This arm alone answers the whole question.
+pwsh tools/voxel-run-flight-leg.ps1 -LogName jobcost-ctl `
+  -ExtraArgs @('<STANDING>')
 
-    ARM B (collapse armed)
-      ...the same flags... -VoxelGpuJobLean=1
+# ARM B -- the collapse armed.
+pwsh tools/voxel-run-flight-leg.ps1 -LogName jobcost-lean `
+  -ExtraArgs @('<STANDING>', '-VoxelGpuJobLean=1')
+```
+
+Alternate them and take >= 2 of each: the two same-config readings ARE the
+noise floor (`wave-f-coldfill.ps1`'s ground rule 1).
 
 Read in this order:
 
