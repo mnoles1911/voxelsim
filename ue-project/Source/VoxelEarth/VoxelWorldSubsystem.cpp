@@ -3941,6 +3941,60 @@ int32 CutoffHeadroomDiv()
 	return Div;
 }
 
+// -VoxelWorkerTaskPri=N (2026-08-23): the scheduling priority of the CPU
+// mesh/worldgen worker task, today hardwired ETaskPriority::BackgroundNormal
+// at its one Launch site.
+//
+// WHY THIS IS THE 2,84x/s PLATEAU'S PRIME SUSPECT, with the arithmetic:
+// on the drainSec=16 leg (Saved/drain16.log) the empty-census worker-ms sums
+// give 11-15 worker-SECONDS per 5 s window at a 0.75-0.95 ms mean job -- an
+// EFFECTIVE CONCURRENCY of 2.5-3.0 worker threads, pinned there for 30+
+// consecutive windows, on a 24-logical-core box whose game thread is at
+// 12-32% and whose GPU is 1-2% utilised. Meanwhile the dispatch loop exits
+// on the in-flight cap on every single pass (exitCap=ALL, exitEmpty=0) with
+// cpuInFlightExactNow ~250-280 of 288: ~260 launched-but-unfinished tasks at
+// 0.8 ms of actual work each means each task waits ~87 ms in the SCHEDULER
+// for a worker. Little's law closes exactly: 3 effective workers / 0.00085 s
+// = ~3,000 chunks/s -- the measured 2,841/s plateau. The admission-side caps
+// (drain cap knee at 8/16/32 identical to the digit, rejB 154:1 over rejC)
+// were all sitting BEHIND this: the pipe from admission to launch is full
+// end-to-end and the tap is the background worker set.
+//
+// 0 = BackgroundNormal (control, byte-identical)   1 = BackgroundHigh
+// 2 = Normal (foreground worker set)               3 = High
+//
+// FAILING READINGS: effConc= on the dispatch-loop line NOT rising with the
+// switch = priority was not the limiter, the background pool's thread count
+// is (the next lever is a dedicated pool, not a bigger N here); effConc
+// rising while dispatched/5s stays flat = the wall moved downstream to the
+// game-thread drain/apply path, which the tick-budget line will show.
+// WATCH with it: frame p95 (foreground tasks compete with render-side task
+// work -- that competition is presumably why Background was picked, though
+// no comment records a measurement) and pool evictions (faster fill = more
+// pool pressure).
+int32 WorkerTaskPriority()
+{
+	static const int32 Pri = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelWorkerTaskPri="), Value);
+		return FMath::Clamp(Value, 0, 3);
+	}();
+	return Pri;
+}
+
+UE::Tasks::ETaskPriority WorkerTaskPriorityEnum()
+{
+	switch (WorkerTaskPriority())
+	{
+		default:
+		case 0: return UE::Tasks::ETaskPriority::BackgroundNormal;
+		case 1: return UE::Tasks::ETaskPriority::BackgroundHigh;
+		case 2: return UE::Tasks::ETaskPriority::Normal;
+		case 3: return UE::Tasks::ETaskPriority::High;
+	}
+}
+
 // --- drain-scaled admission cap (-VoxelAdmissionCapDrainSec, 2026-08-23) ----
 //
 // WHAT DRIVES cutoffM, spelled out because it took a night to trace: the
@@ -6730,6 +6784,17 @@ struct FVoxelWorldImpl
 	int64 DispatchExitEmptySinceLog = 0;
 	int64 DispatchCpuLaunchedSinceLog = 0;
 	int64 DispatchGpuForkedSinceLog = 0;
+	// Sum of Result.JobMs over this window's drained CPU results (the same
+	// population the empty census sums per level, aggregated). Divided by the
+	// window it is the EFFECTIVE WORKER CONCURRENCY -- the number that caught
+	// the 2,84x/s plateau: 2.5-3.0 thread-equivalents, flat for 30+ windows,
+	// on a 24-core box (drain16.log; see WorkerTaskPriority). CAVEAT baked
+	// into the name: JobMs is wall time inside the lambda, so in-lambda lock
+	// waits inflate it -- one recorded cold burst printed effConc=43 on a
+	// 24-core box, which is contention wearing a concurrency costume, not 43
+	// threads. Read the STEADY windows, and read effConc > cores as "lock
+	// contention in the job", not as parallelism.
+	double AccumCpuWorkerJobMsSinceLog = 0.0;
 	int64 LevelZeroQuadTotal[VoxelCoords::kNumLevels] = {};
 	int64 LevelChunksLoadedTotal[VoxelCoords::kNumLevels] = {}; // component creations per level, cumulative
 	int64 ResultsDrainedSinceLog = 0;   // DrainResults: results dequeued (live + stale)
@@ -9171,10 +9236,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// dominating with pendingJobs deep would refute that reading and indict
 	// admission/refill instead.
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel dispatch loop (5s window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d"),
+	       // effConc/wkPri appended 2026-08-23 (new columns at the END, same
+	       // old-leg-grep rule as the admission line): effConc is drained CPU
+	       // worker ms / window -- thread-equivalents of actual generation
+	       // work. THE reading that found the plateau: exitCap=ALL with
+	       // cpuInFlightExactNow near cap and effConc ~2.5 on a 24-core box =
+	       // ~260 launched tasks queueing ~87 ms each for a background
+	       // worker; the tap, not the pipe, is the limit. wkPri echoes
+	       // -VoxelWorkerTaskPri so a leg self-describes (a priority arm that
+	       // silently failed to latch must be readable as such).
+	       TEXT("Voxel dispatch loop (5s window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
+	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
-	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue());
+	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue(),
+	       AccumCpuWorkerJobMsSinceLog / 1000.0,
+	       ThisLogWindowSeconds > 0.f ? AccumCpuWorkerJobMsSinceLog / (1000.0 * ThisLogWindowSeconds) : 0.0,
+	       VoxelStreamAdmission::WorkerTaskPriority());
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
@@ -9210,6 +9288,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	DispatchExitEmptySinceLog = 0;
 	DispatchCpuLaunchedSinceLog = 0;
 	DispatchGpuForkedSinceLog = 0;
+	AccumCpuWorkerJobMsSinceLog = 0.0;
 
 	// M2 wave 2 item 1 ("Cross-job mip caching"): per-level worker mesh-job
 	// ms (rolling-window p50/p95, LastPerfSnapshot -- refreshed at 1Hz
@@ -9223,12 +9302,29 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// submit->deliver LATENCY used to be averaged into these cost rows through
 	// the shared JobMs field. The fork's latency gets its own clause on this
 	// same line -- a different quantity, so a different label, never summed.
+	// COMPUTED FROM THE WINDOWS DIRECTLY, NOT FROM LastPerfSnapshot
+	// (2026-08-23). This line printed all-zero p50/p95 on every headless leg
+	// of the drain-cap sweep while cpuLaunched ran 14-16k per window -- a
+	// working-looking instrument measuring nothing, the exact trap the
+	// project rules name. Cause: the snapshot is refreshed by
+	// UpdatePerfSnapshot only under the voxel.Debug HUD gate, which headless
+	// legs do not set; the gpuLatency line directly below never had the bug
+	// because it computes from its windows in place. Same fix here: same
+	// windows the snapshot path reads, same percentile helper, no gate. The
+	// snapshot keeps feeding the HUD; this line no longer goes through it.
+	// n= added per ring so an empty window reads as n=0 rather than as a
+	// suspicious 0.00.
 	const FVoxelPerfSnapshot& Snap = LastPerfSnapshot;
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel CPU worker ms/level: %s | gpuMesh submit->deliver ms p50=%.1f p95=%.1f max=%.1f | ")
 	       TEXT("mipCache bricks=%lld bytes=%lld evictions=%lld"),
 	       *JoinPerLevel([&](int32 L)
-	       { return FString::Printf(TEXT("R%d p50=%.2f p95=%.2f"), L, Snap.LevelWorkerMsP50[L], Snap.LevelWorkerMsP95[L]); }),
+	       {
+		       const FMsPercentiles P =
+			       ComputeMsPercentiles(LevelWorkerJobMsWindow[L], LevelWorkerJobMsWindowCount[L]);
+		       return FString::Printf(TEXT("R%d p50=%.2f p95=%.2f n=%d"), L, P.P50, P.P95,
+		                              LevelWorkerJobMsWindowCount[L]);
+	       }),
 	       Snap.GpuLatencyMsP50, Snap.GpuLatencyMsP95, Snap.GpuLatencyMsMax,
 	       (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes, (long long)Snap.MipCacheEvictions);
 
@@ -18258,7 +18354,12 @@ void FVoxelWorldImpl::DispatchJobs()
 				// (<= 8, the reconciliation jitter its doc comment states).
 				CpuCounterPtr->Decrement();
 			},
-			UE::Tasks::ETaskPriority::BackgroundNormal);
+			// -VoxelWorkerTaskPri (default: BackgroundNormal, the historical
+			// hardwired value). See WorkerTaskPriorityEnum's comment for the
+			// measured 2.5-3.0 effective-concurrency pin this switch exists
+			// to test -- ~260 of these 0.8 ms tasks queue ~87 ms each for a
+			// background worker while 24 cores idle.
+			VoxelStreamAdmission::WorkerTaskPriorityEnum());
 		InFlightTasks.Add(MoveTemp(Task));
 
 		// Cold-band throttle: a job is now genuinely in flight for this footprint
@@ -20193,6 +20294,11 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			if (!Result.bFromGpuMesh)
 			{
 				(ResultQuads == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
+				// Aggregate twin of the two census sums above, for the
+				// dispatch-loop line's effConc= (see the accumulator's doc
+				// comment). Same CPU-only gate, same "every drained result,
+				// stale included" population.
+				AccumCpuWorkerJobMsSinceLog += Result.JobMs;
 			}
 
 			// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): the
