@@ -1390,6 +1390,123 @@ RWStructuredBuffer<uint> OutCells VXC_REG(u2);
 // This is a GUARD, not a behavior change: for RasterSize.{x,y} >= 1 â€” every
 // window the harness/RDG pass ever binds â€” the guard is never taken and the
 // clamp is unchanged.
+// --- persistent raster atlas (UE-only permutation VXC_RASTER_ATLAS) --------
+//
+// docs/gpu-streaming-architecture.md's arithmetic blocker: FillRasterWindow
+// re-samples ~5,800 pixels (~46 KB) per chunk on the game thread, and at the
+// 50,000 chunks/s target that is 290 Mpx/s of CPU sampling over data whose
+// entire coarse representation is 0.30 Mpx -- the same pixels copied hundreds
+// of times per second (94% window overlap between lateral neighbours; 100%
+// between Z-siblings). Under this permutation the elevation/climate raster is
+// RESIDENT on the GPU as a page torus and the two accessors below read it by
+// GLOBAL tile-pixel coordinate; the request carries no window at all.
+//
+// NEVER DEFINED FOR THE STANDALONE BENCH. The #else arm below is the shipped
+// text, character for character, so the bench's SPIR-V (shaders/prebuilt) and
+// the VXC_RASTER_ATLAS=0 Unreal permutation -- the one the pinned digest gate
+// runs -- are byte-for-byte unchanged. Verify by recompiling the prebuilt
+// hashes; they must not move.
+//
+// A MISS IS COUNTED, NEVER A SILENT CLAMP. The inline window's failure mode
+// (D5, recorded at FillRasterWindow) was a clamped read: no fault, no error,
+// silently different terrain. The atlas CANNOT clamp -- there is no window
+// edge to clamp to -- so a tap whose page tag mismatches returns the SAME
+// documented answer the CPU samplers give a missing tile (kSeaLevelMm / bland
+// climate, see vxc::FineTileSampler::elevationMm) AND bumps AtlasMissStats[0],
+// recording the first four distinct missed page tags in [1..4]. The host reads
+// this back once per stats window and a non-zero count logs as a FAIL: the
+// failing reading is `[raster-atlas] gpuMiss=N page=(x,y)` plus sea-level-flat
+// terrain at the miss site -- loud twice, silent never.
+#if defined(VXC_RASTER_ATLAS) && VXC_RASTER_ATLAS
+
+// Page payloads, slot-major over the torus: slot = ty * AtlasPagesDim + tx
+// (tx/ty the floor-mod torus coordinates of the page), each slot AtlasPagePx^2
+// elements, row-major, x fastest -- exactly the order FVoxelRasterAtlasCpu
+// stages and VoxelRasterAtlasUpsert.usf scatters.
+StructuredBuffer<int> AtlasElevationMm;
+StructuredBuffer<uint> AtlasClimatePacked;
+// One tag per torus slot: packed ((py+32768)<<16)|((px+32768)&0xffff) of the
+// page the slot currently holds, 0xffffffff = invalid. The +32768 bias keeps
+// every reachable page distinct from the sentinel (page (32767,32767) would
+// need a tile-pixel coordinate ~4.2e6, an order of magnitude past the 15-tile
+// fine store's whole span).
+StructuredBuffer<uint> AtlasPageTags;
+// [0] miss count, [1..4] first distinct missed tags (0 = empty slot; tag 0 is
+// page (-32768,-32768), unreachable for the same reason as the sentinel).
+RWStructuredBuffer<uint> AtlasMissStats;
+// Loose ($Globals) -- deliberately NOT in the shared WorldGenParams block,
+// whose 56-byte layout is static_asserted against the bench's cbuffer.
+uint AtlasPagePx;    // page edge in pixels
+uint AtlasPagesDim;  // torus edge in pages
+
+// Torus slot of page coordinate c: floor-mod without % (HLSL signed % is UB
+// territory across vendors -- the floorDiv comment above).
+uint atlasTorus(int64_t pageC)
+{
+    const int64_t d = (int64_t)AtlasPagesDim;
+    return (uint)(pageC - floorDiv(pageC, d) * d);
+}
+
+uint atlasPackTag(int64_t pageX, int64_t pageY)
+{
+    return ((uint)(pageY + 32768) << 16) | ((uint)(pageX + 32768) & 0xffffu);
+}
+
+// Shared address resolution: returns true and the payload element index when
+// the tap's page is resident; false after counting the miss otherwise.
+bool atlasResolve(int64_t px, int64_t py, out uint elem)
+{
+    const int64_t pagePx = (int64_t)AtlasPagePx;
+    const int64_t pageX = floorDiv(px, pagePx);
+    const int64_t pageY = floorDiv(py, pagePx);
+    const uint tx = atlasTorus(pageX);
+    const uint ty = atlasTorus(pageY);
+    const uint slot = ty * AtlasPagesDim + tx;
+    const uint wantTag = atlasPackTag(pageX, pageY);
+    elem = 0u;
+    if (AtlasPageTags[slot] != wantTag)
+    {
+        uint prev;
+        InterlockedAdd(AtlasMissStats[0], 1u, prev);
+        // Best-effort first-four capture; a lost race here loses a sample,
+        // never the count.
+        [unroll]
+        for (uint i = 1u; i <= 4u; ++i)
+        {
+            uint seen;
+            InterlockedCompareExchange(AtlasMissStats[i], 0u, wantTag, seen);
+            if (seen == 0u || seen == wantTag) break;
+        }
+        return false;
+    }
+    const uint lx = (uint)(px - pageX * pagePx);
+    const uint ly = (uint)(py - pageY * pagePx);
+    elem = slot * (AtlasPagePx * AtlasPagePx) + ly * AtlasPagePx + lx;
+    return true;
+}
+
+// Same names, same signatures, same callers as the window accessors below --
+// the carrier/cavern arithmetic cannot tell which permutation it is in, which
+// is the whole determinism argument: the VALUES are filled through the same
+// vxc sampler funnel the window fill uses, so a resident tap is bit-identical
+// by construction and voxel.GPU.VerifyRasterAtlas byte-compares the two
+// permutations to prove it.
+int rasterElevationMm(int64_t px, int64_t py)
+{
+    uint elem;
+    if (!atlasResolve(px, py, elem)) return kSeaLevelMm;
+    return AtlasElevationMm[elem];
+}
+
+uint rasterClimate(int64_t px, int64_t py)
+{
+    uint elem;
+    if (!atlasResolve(px, py, elem)) return 0u;
+    return AtlasClimatePacked[elem];
+}
+
+#else // !VXC_RASTER_ATLAS -- the shipped inline-window accessors, unchanged.
+
 int rasterElevationMm(int64_t px, int64_t py)
 {
     if (RasterSize.x == 0u || RasterSize.y == 0u) return 0;
@@ -1409,6 +1526,8 @@ uint rasterClimate(int64_t px, int64_t py)
     const int64_t ly = clamp64(py - RasterOriginPx.y, 0, (int64_t)RasterSize.y - 1);
     return ClimatePacked[(uint)(lx + ly * RasterSize.x)];
 }
+
+#endif // VXC_RASTER_ATLAS
 
 // --- evalSurface: bit-exact mirror of vxc::Amplifier::evalSurface ----------
 // The surface half of column() â€” bilinear tile base plus the slope-scaled

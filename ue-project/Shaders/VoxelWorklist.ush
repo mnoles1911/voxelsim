@@ -1,0 +1,42 @@
+// VoxelWorklist.ush -- the HLSL half of the P3 chunk-record contract.
+// NOT INCLUDED BY ANY KERNEL YET (see VoxelGpuWorklist.h's banner). The
+// converted generation kernels will include this and read
+// WorklistRecords[WorklistControl[0] + recordIndexInSlice] instead of the
+// per-region $Globals -- that substitution IS the P3 conversion, kernel by
+// kernel, per docs/gpu-worklist-plan-2026-08-23.md.
+//
+// MIRROR OF FVoxelGpuChunkWorkRecord (VoxelGpuWorklist.h), 16 dwords, 64 B.
+// Field order and widths must match exactly; the host static_asserts its
+// offsets, and the plan doc requires each converted kernel to static_assert
+// its groups-per-record against the host table.
+
+struct GpuChunkWorkRecord
+{
+	int  OriginVx;          // halo-free chunk origin, level-L cell units
+	int  OriginVy;
+	int  BrickZMin;         // level-L brick z of the chunk base
+	uint LevelFlags;        // CoarseLevel:0..3 | RingSkirtMask:4..7 | hasAssets:8
+	uint ChunkSlot;
+	uint GenId;
+	uint AssetBase;
+	uint AssetCount;
+	uint ShadingClimatePacked;
+	uint ShadingGradPacked;
+	uint ShadingSurfaceZBits;
+	uint Reserved0;
+	uint Reserved1;
+	uint Reserved2;
+	uint Reserved3;
+	uint Reserved4;
+};
+
+uint worklistCoarseLevel(GpuChunkWorkRecord R) { return R.LevelFlags & 0xfu; }
+uint worklistCoarseScale(GpuChunkWorkRecord R)
+{
+	// No variable shifts in kernels (lint-shader-ub VARIABLE_SHIFT): 1<<L as
+	// a lookup over the 0..6 range the cascade streams.
+	const uint L = worklistCoarseLevel(R);
+	return (L == 0u) ? 1u : (L == 1u) ? 2u : (L == 2u) ? 4u : (L == 3u) ? 8u
+	     : (L == 4u) ? 16u : (L == 5u) ? 32u : 64u;
+}
+uint worklistHasAssets(GpuChunkWorkRecord R) { return (R.LevelFlags >> 8) & 1u; }

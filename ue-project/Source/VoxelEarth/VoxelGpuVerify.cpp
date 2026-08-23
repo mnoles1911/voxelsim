@@ -26,6 +26,8 @@
 #include "HAL/IConsoleManager.h"
 #include "VoxelGpuWorldGen.h"
 #include "VoxelGpuRegionBuild.h"
+#include "VoxelRasterAtlas.h"   // A: voxel.GPU.VerifyRasterAtlas builds scratch atlases
+#include "RenderingThread.h"     // FlushRenderingCommands, for the gate's scratch-atlas teardown
 #include "VoxelMeshTypes.h" // PackVoxelChunkQuad / UnpackVoxelChunkQuad, for the D4 round-trip check
 // The SHIPPING footprint-band reduction, lifted out of VoxelWorldSubsystem.cpp
 // so this gate compares BandReduceMain against it rather than a transcription.
@@ -1482,7 +1484,15 @@ namespace
 			return;
 		}
 
-		const int32 MaxLevel = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 0, 5) : 5;
+		// 0..6 SINCE THE 8.19 KM RING: GpuMeshMaxLevel now defaults to
+		// kNumLevels-1 = 6 and -VoxelMaxRingLevel=6 dispatches level-6 chunks to
+		// the fork, so a gate ceiling of 5 would leave the fork shipping a level
+		// this gate never proved. That is not hypothetical: raising the ceiling
+		// is what exposed the FillRasterWindow clamp still reading 0..5 while
+		// FillLooseParameters read 0..6 -- a level-6 window sized at scale 32
+		// under a kernel sampling at scale 64, the D5 defect one level up,
+		// clamping silently on every level-6 GPU chunk.
+		const int32 MaxLevel = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 0, 6) : 6;
 
 		vxc::SyntheticTileSampler Tiles(kSeed);
 		vxc::SyntheticTileSampler CpuTiles(kSeed);
@@ -1940,12 +1950,272 @@ namespace
 		}
 	}
 
+
+	// ------------------------------------------------------------------
+	// voxel.GPU.VerifyRasterAtlas -- the gate for A (the persistent raster
+	// atlas, -VoxelGpuRasterAtlas).
+	//
+	// TWO CLAIMS, EACH ABLE TO COME OUT THE OTHER WAY:
+	//
+	//  1. EQUALITY. An atlas-armed dispatch produces byte-identical columns,
+	//     cells and quads to the inline-window dispatch over the same region.
+	//     Run at BOTH pitches (30000, the digest pitch; 1875, the fine tier's
+	//     -- the first time any gate exercises the kernels at fine pitch) and
+	//     at levels 0/1/5/6 over both bench fixtures, including the
+	//     far-negative one that caught D5. Level 6 is deliberate: the
+	//     FillRasterWindow clamp was still 0..5 when the 8.19 km ring landed,
+	//     so level 6 is exactly where a stale ceiling reappears first.
+	//     Equality against the inline arm plus VerifyCoarse's inline-vs-CPU
+	//     equality is transitive bit-exactness against the CPU reference.
+	//
+	//  2. LOUDNESS. Drop ONE page under a fixture and demand that the failure
+	//     is loud twice: PrepareRequest must REFUSE to arm (the coverage
+	//     check firing), and a deliberately force-armed dispatch must count
+	//     GPU misses > 0 AND produce output that DIFFERS from the inline
+	//     reference. A dropped page that still read as a pass -- either a
+	//     zero miss count or byte-identical output -- would be the D5 silent
+	//     clamp wearing atlas clothes, and the gate FAILS on it. This is the
+	//     "counter that can come out the other way" proof, run every time.
+	//
+	// Pins nothing: the level-0 digest remains a statement about the inline
+	// permutation, which this gate leaves byte-for-byte alone.
+	void VerifyRasterAtlasCommand(const TArray<FString>& Args)
+	{
+		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("GPU worldgen needs SM6. Relaunch with -sm6."));
+			return;
+		}
+
+		const int32 Levels[] = {0, 1, 5, 6};
+		const int32 Pitches[] = {30000, 1875};
+		bool bAllOk = true;
+		int32 RegionsCompared = 0;
+
+		for (const int32 Pitch : Pitches)
+		{
+			vxc::SyntheticTileSampler Tiles(kSeed, Pitch);
+			vxc::SyntheticTileSampler CpuTiles(kSeed, Pitch);
+			vxc::Amplifier CpuAmp(kSeed, CpuTiles);
+
+			// Scratch atlas: 2 km of coverage comfortably holds every
+			// fixture's window (a level-6 64-column window is ~0.5 km).
+			FVoxelRasterAtlasCpu Atlas;
+			Atlas.Init(Pitch, /*CoverageRadiusMm=*/2000000, /*MaxCoarseLevel=*/6);
+
+			for (const int32 Level : Levels)
+			{
+				for (const FRegionSpec& Base : kRegions)
+				{
+					FRegionSpec Region = Base;
+					Region.CoarseLevel = Level;
+
+					TArray<vxc::ColumnSample> CpuColumns;
+					FVoxelGpuRegionRequest ReqInline = BuildRequest(Region, CpuAmp, Tiles, CpuColumns);
+					const FVoxelGpuRegionResult Inline = VoxelGpuWorldGen::RunRegionBlocking(ReqInline);
+					if (!Inline.bOk)
+					{
+						UE_LOG(LogVoxelGpuVerify, Error,
+						       TEXT("[raster-atlas gate] pitch %d L%d [%s]: inline arm failed: %s"),
+						       Pitch, Level, Region.Name, *Inline.Error);
+						bAllOk = false;
+						continue;
+					}
+
+					FVoxelGpuRegionRequest ReqAtlas = ReqInline;
+					Atlas.FillWindowNow(Tiles, ReqAtlas);
+					if (!Atlas.PrepareRequest(ReqAtlas))
+					{
+						// The coverage check and FillWindowNow run the SAME
+						// ComputeRasterWindowPx, so a refusal here means the
+						// two disagreed about their own shared arithmetic.
+						UE_LOG(LogVoxelGpuVerify, Error,
+						       TEXT("[raster-atlas gate] pitch %d L%d [%s]: PrepareRequest refused a ")
+						       TEXT("window FillWindowNow had just filled -- the rule disagrees with itself."),
+						       Pitch, Level, Region.Name);
+						bAllOk = false;
+						continue;
+					}
+					const FVoxelGpuRegionResult AtlasRes = VoxelGpuWorldGen::RunRegionBlocking(ReqAtlas);
+					if (!AtlasRes.bOk)
+					{
+						UE_LOG(LogVoxelGpuVerify, Error,
+						       TEXT("[raster-atlas gate] pitch %d L%d [%s]: atlas arm failed: %s"),
+						       Pitch, Level, Region.Name, *AtlasRes.Error);
+						bAllOk = false;
+						continue;
+					}
+
+					int64 BadColumns = 0, BadCells = 0, BadQuads = 0;
+					if (Inline.Columns.Num() != AtlasRes.Columns.Num() ||
+					    FMemory::Memcmp(Inline.Columns.GetData(), AtlasRes.Columns.GetData(),
+					                    Inline.Columns.Num() * Inline.Columns.GetTypeSize()) != 0)
+					{
+						for (int32 I = 0; I < FMath::Min(Inline.Columns.Num(), AtlasRes.Columns.Num()); ++I)
+						{
+							BadColumns += FMemory::Memcmp(&Inline.Columns[I], &AtlasRes.Columns[I],
+							                              sizeof(FVoxelGpuColumnSample)) != 0 ? 1 : 0;
+						}
+						BadColumns += FMath::Abs(Inline.Columns.Num() - AtlasRes.Columns.Num());
+					}
+					if (Inline.Cells.Num() != AtlasRes.Cells.Num() ||
+					    FMemory::Memcmp(Inline.Cells.GetData(), AtlasRes.Cells.GetData(),
+					                    Inline.Cells.Num() * sizeof(uint32)) != 0)
+					{
+						for (int32 I = 0; I < FMath::Min(Inline.Cells.Num(), AtlasRes.Cells.Num()); ++I)
+						{
+							BadCells += (Inline.Cells[I] != AtlasRes.Cells[I]) ? 1 : 0;
+						}
+						BadCells += FMath::Abs(Inline.Cells.Num() - AtlasRes.Cells.Num());
+					}
+					// Quads: only the first NumQuads entries are live output;
+					// the tail is transient-allocator noise on both arms.
+					if (Inline.NumQuads != AtlasRes.NumQuads)
+					{
+						BadQuads = FMath::Abs(int64(Inline.NumQuads) - int64(AtlasRes.NumQuads));
+					}
+					else if (Inline.NumQuads > 0 &&
+					         FMemory::Memcmp(Inline.Quads.GetData(), AtlasRes.Quads.GetData(),
+					                         Inline.NumQuads * sizeof(uint64)) != 0)
+					{
+						for (uint32 I = 0; I < Inline.NumQuads; ++I)
+						{
+							BadQuads += (Inline.Quads[I] != AtlasRes.Quads[I]) ? 1 : 0;
+						}
+					}
+
+					++RegionsCompared;
+					if (BadColumns + BadCells + BadQuads != 0)
+					{
+						UE_LOG(LogVoxelGpuVerify, Error,
+						       TEXT("[raster-atlas gate] pitch %d L%d [%s] FAIL: %lld column / %lld cell / ")
+						       TEXT("%lld quad mismatches between atlas and inline arms. The atlas is ")
+						       TEXT("serving different pixels than the window carried; do NOT arm ")
+						       TEXT("-VoxelGpuRasterAtlas."),
+						       Pitch, Level, Region.Name, BadColumns, BadCells, BadQuads);
+						bAllOk = false;
+					}
+					else
+					{
+						UE_LOG(LogVoxelGpuVerify, Log,
+						       TEXT("[raster-atlas gate] pitch %d L%d [%s] ok (%d columns, %d cells, %u quads)"),
+						       Pitch, Level, Region.Name,
+						       Inline.Columns.Num(), Inline.Cells.Num(), Inline.NumQuads);
+					}
+				}
+			}
+
+			// --- claim 2: LOUDNESS -- the drop-one-page arm -----------------
+			{
+				FRegionSpec Region = kRegions[0]; // origin
+				Region.CoarseLevel = 0;
+				TArray<vxc::ColumnSample> CpuColumns;
+				FVoxelGpuRegionRequest ReqInline = BuildRequest(Region, CpuAmp, Tiles, CpuColumns);
+				const FVoxelGpuRegionResult Inline = VoxelGpuWorldGen::RunRegionBlocking(ReqInline);
+
+				FVoxelGpuRegionRequest ReqFill = ReqInline;
+				Atlas.FillWindowNow(Tiles, ReqFill);
+
+				// The window's centre page, located through the one rule.
+				const VoxelGpuRegionBuild::FRasterWindowPx W =
+					VoxelGpuRegionBuild::ComputeRasterWindowPx(
+						ReqInline.OriginVx, ReqInline.OriginVy, ReqInline.DispatchColumns,
+						ReqInline.CoarseLevel, Pitch);
+				const int64 PagePx = int64(FVoxelRasterAtlasCpu::kPagePx);
+				const int64 DropX = vxc::floorDiv(W.PxMin + (W.PxMax - W.PxMin) / 2, PagePx);
+				const int64 DropY = vxc::floorDiv(W.PyMin + (W.PyMax - W.PyMin) / 2, PagePx);
+				Atlas.DebugDropPage(DropX, DropY);
+
+				// Layer 1: the coverage check must refuse.
+				FVoxelGpuRegionRequest ReqProbe = ReqInline;
+				if (Atlas.PrepareRequest(ReqProbe))
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[raster-atlas gate] pitch %d LOUDNESS FAIL: PrepareRequest armed a request ")
+					       TEXT("over a dropped page -- the coverage check cannot fire."), Pitch);
+					bAllOk = false;
+				}
+
+				// Layer 2: force-arm past the check (the gate deliberately does
+				// what production cannot) and demand a counted, visible miss.
+				FVoxelGpuRegionRequest ReqForced = ReqInline;
+				ReqForced.bRasterAtlas = true;
+				ReqForced.RasterAtlas = &Atlas.Gpu();
+				ReqForced.RasterOriginPx = FIntPoint::ZeroValue;
+				ReqForced.RasterSize = FUintVector2(0, 0);
+				ReqForced.ElevationMm.Reset();
+				ReqForced.ClimatePacked.Reset();
+				const FVoxelGpuRegionResult Forced = VoxelGpuWorldGen::RunRegionBlocking(ReqForced);
+
+				Atlas.Gpu().EnqueueMissStatsRead();
+				FVoxelRasterAtlasGpuDelta ClearDelta;
+				ClearDelta.bClearMissStats = true;
+				Atlas.Gpu().EnqueueUpsert(MoveTemp(ClearDelta));
+				FlushRenderingCommands();
+				FVoxelRasterAtlasMissStats Miss;
+				int32 Spins = 0;
+				while (!Atlas.Gpu().PollMissStats(Miss) && Spins++ < 2000)
+				{
+					FPlatformProcess::Sleep(0.001f);
+					FlushRenderingCommands();
+				}
+				if (Miss.Misses == 0)
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[raster-atlas gate] pitch %d LOUDNESS FAIL: a dispatch over a dropped page ")
+					       TEXT("counted ZERO GPU misses -- the miss counter cannot fire, which means a real ")
+					       TEXT("miss in production would be silent. Do NOT trust gpuMiss=0 readings."), Pitch);
+					bAllOk = false;
+				}
+				const bool bOutputMoved =
+					!Forced.bOk ||
+					Forced.Columns.Num() != Inline.Columns.Num() ||
+					FMemory::Memcmp(Forced.Columns.GetData(), Inline.Columns.GetData(),
+					                Inline.Columns.Num() * Inline.Columns.GetTypeSize()) != 0;
+				if (!bOutputMoved)
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[raster-atlas gate] pitch %d LOUDNESS FAIL: output over a dropped page is ")
+					       TEXT("byte-identical to the reference -- the missing-page answer is ")
+					       TEXT("indistinguishable from real terrain here, so the visible half of the ")
+					       TEXT("failure mode is not visible. Investigate before arming."), Pitch);
+					bAllOk = false;
+				}
+			}
+
+			// Scratch teardown: the GPU-side pooled buffers must be released
+			// and every enqueued command drained before the stack object dies.
+			Atlas.Shutdown();
+			FlushRenderingCommands();
+		}
+
+		if (bAllOk)
+		{
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("[raster-atlas gate] PASS: %d region pairs byte-identical across 2 pitches x 4 ")
+			       TEXT("levels, and the dropped-page arm was refused, counted, and visible at both ")
+			       TEXT("pitches. -VoxelGpuRasterAtlas is safe to arm."), RegionsCompared);
+		}
+		else
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("[raster-atlas gate] FAIL -- see lines above. Do NOT arm -VoxelGpuRasterAtlas."));
+		}
+	}
+
 	FAutoConsoleCommand GVoxelGpuVerifyCoarseCmd(
 		TEXT("voxel.GPU.VerifyCoarse"),
 		TEXT("D5: byte-compare GPU coarse generation against vxc::coarseColumns + makeCoarseBrick, ")
 		TEXT("level by level, stopping at the first failure. Does NOT touch the pinned level-0 ")
 		TEXT("digest. Usage: [maxLevel=5]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyCoarseCommand));
+
+	FAutoConsoleCommand GVoxelGpuVerifyRasterAtlasCmd(
+		TEXT("voxel.GPU.VerifyRasterAtlas"),
+		TEXT("A: byte-compare atlas-armed dispatches against inline-window dispatches at pitches ")
+		TEXT("30000 and 1875, levels 0/1/5/6, both bench fixtures; then drop one page and prove the ")
+		TEXT("refusal, the miss counter and the visible divergence all fire. Pins nothing."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyRasterAtlasCommand));
 
 	FAutoConsoleCommand GVoxelGpuVerifyBrickStackCmd(
 		TEXT("voxel.GPU.VerifyBrickStack"),

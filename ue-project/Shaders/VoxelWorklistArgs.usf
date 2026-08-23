@@ -1,0 +1,48 @@
+// VoxelWorklistArgs.usf -- the args-setup kernel for the persistent worklist
+// (P3; docs/gpu-worklist-plan-2026-08-23.md). NOT WIRED to any dispatch chain
+// yet -- see VoxelGpuWorklist.h's banner for the sequencing argument.
+//
+// ONE tiny dispatch per tick turns "N records pending" into one
+// DispatchIndirect argument triple PER STAGE, with the group-per-record
+// multiplier applied here on the GPU -- so the number of RDG passes per tick
+// is a constant (one per stage) no matter how many chunks are in flight. The
+// CPU uploads a head cursor and a slice budget; it never reads anything back.
+//
+// The control buffer is the identity the window log checks:
+//   [0] consumeFirst -- ring index of the first record this tick consumes
+//   [1] consumeCount -- how many (min(pending, SliceBudget))
+//   [2] tailCursor   -- persistent: first unconsumed record (GPU-owned)
+// A drifting appended == consumed + pending identity on the host log means
+// this kernel and the host disagree about the cursor -- the failing reading.
+
+#include "/Engine/Public/Platform.ush"
+
+RWStructuredBuffer<uint> WorklistControl;
+// EVoxelWorklistStage::COUNT triples of {groupsX, 1, 1}, consumed by
+// DispatchIndirect. Typed R32 (RWBuffer, not RWStructuredBuffer): the host
+// creates this with CreateIndirectDesc and binds a PF_R32_UINT UAV.
+RWBuffer<uint> WorklistArgs;
+// Per-stage groups-per-record, bound from the host enum table so the shader
+// carries no copy of the stage shapes.
+StructuredBuffer<uint> GroupsPerRecord;
+
+uint HeadCursor;     // host ring head (records appended so far, mod capacity handled host-side as monotonic counts)
+uint SliceBudget;    // max records the consuming graph may take this tick
+uint StageCount;
+
+[numthreads(1, 1, 1)]
+void WorklistArgsMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint Tail = WorklistControl[2];
+	const uint Pending = HeadCursor - Tail;   // monotonic counters: wrap-safe uint subtraction
+	const uint Take = min(Pending, SliceBudget);
+	WorklistControl[0] = Tail;
+	WorklistControl[1] = Take;
+	WorklistControl[2] = Tail + Take;
+	for (uint S = 0; S < StageCount; ++S)
+	{
+		WorklistArgs[S * 3u + 0u] = Take * GroupsPerRecord[S];
+		WorklistArgs[S * 3u + 1u] = 1u;
+		WorklistArgs[S * 3u + 2u] = 1u;
+	}
+}
