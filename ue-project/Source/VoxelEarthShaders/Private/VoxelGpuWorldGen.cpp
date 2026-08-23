@@ -1018,7 +1018,12 @@ namespace
 		// computed here where the level is already range-checked. Scale 1 is
 		// the identity in coarseRep(), so a request that never sets CoarseLevel
 		// is byte-for-byte the pre-D5 dispatch.
-		Out.CoarseScale     = 1u << static_cast<uint32>(FMath::Clamp(Req.CoarseLevel, 0, 5));
+		// 0..6 since the 8 km ring (2026-08-23): level 6 is just scale 64 to
+		// this kernel -- coarseRep() is closed-form in the scale, nothing else
+		// changes. The clamp ceiling mirrors FVoxelMarchChunkIndex::kLevels-1;
+		// a literal here is how the fork silently declines a level the
+		// cascade streams.
+		Out.CoarseScale     = 1u << static_cast<uint32>(FMath::Clamp(Req.CoarseLevel, 0, 6));
 		Out.RingSkirtMask   = Req.RingSkirtMask & 0xfu;
 		// Backlog 0.0b: one process-wide value, from the single accessor the
 		// CPU samplers and voxel.GPU.VerifyCoarse's reference also read -- so
@@ -1184,11 +1189,13 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		// the terrain's CoarseScale silently, and a stamp composed at a clamped
 		// scale would sit at the wrong offset inside plausible terrain -- the
 		// exact wrong-but-plausible output this function exists to catch.
-		if (Req.CoarseLevel < 0 || Req.CoarseLevel > 5)
+		// 0..6 since the 8 km ring -- must track FillLooseParameters' clamp
+		// above, for the reason stated there.
+		if (Req.CoarseLevel < 0 || Req.CoarseLevel > 6)
 		{
 			OutError = FString::Printf(
 				TEXT("AssetInstances (%d) on a CoarseLevel %d region — the stamp supports levels ")
-				TEXT("0..5 (the range the terrain kernels' CoarseScale is derived over); a clamped ")
+				TEXT("0..6 (the range the terrain kernels' CoarseScale is derived over); a clamped ")
 				TEXT("scale would stamp instances at the wrong offset inside plausible terrain."),
 				Req.AssetInstances.Num(), Req.CoarseLevel);
 			return false;

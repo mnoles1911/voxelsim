@@ -385,11 +385,15 @@ namespace VoxelMarchHoleWord
 		// there, because a zero that means "the code that counts this was
 		// compiled out" must never be printable as "no holes of this kind"
 		// (two retractions this week were exactly that shape).
-		UncLevelFirst,                        // + ring level 0..5 of the miss
-		UncReasonFirst = UncLevelFirst + 6,   // + VOXEL_MARCH_MISS_* 0..3
+		UncLevelFirst,                        // + ring level 0..6 of the miss
+		UncReasonFirst = UncLevelFirst + 7,   // + VOXEL_MARCH_MISS_* 0..3
 		Count = UncReasonFirst + 4
 	};
-	constexpr int32 kNumLevels = 6;
+	// 7 since level 6 (the 8 km ring) landed 2026-08-23. This widens the
+	// readback layout by one word; both sides move together because the shader
+	// gets these indices as defines from THIS enum (see the "one enum" note in
+	// VoxelMarch.usf) -- there is no hand mirror to update.
+	constexpr int32 kNumLevels = 7;
 	constexpr int32 kNumReasons = 4;
 	// The reason order, mirrored from VOXEL_MARCH_MISS_* in
 	// VoxelBrickTraverse.ush (never / pending / evicted / unattributed) --
@@ -415,7 +419,11 @@ struct FVoxelMarchHoleStats
 	// (BreakdownFrames counts those). Frames > 0 with BreakdownFrames == 0
 	// means the cheap counters measured and the breakdown DID NOT -- the
 	// consumer must print "not measured", never these zeros as data.
-	uint64 UncoveredByLevel[6] = {};
+	// Sized by the enum's constant, not a literal: when kNumLevels went 6 -> 7
+	// (level-6 ring, 2026-08-23) a literal 6 here would have let the fold-in
+	// loop write ByLevel[6] into UncoveredByReason[0] -- silent counter
+	// corruption, no bounds error.
+	uint64 UncoveredByLevel[VoxelMarchHoleWord::kNumLevels] = {};
 	// Order is the shader's VOXEL_MARCH_MISS_* codes: [0] never admitted,
 	// [1] admitted-pending, [2] evicted, [3] unattributed (the instrument
 	// refused to guess -- stale resident record or reserved code).

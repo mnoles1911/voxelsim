@@ -47,7 +47,21 @@ namespace VoxelCoords
 	// RingPresets outer radius collapses the clipmap to zero extent). Every one
 	// of those tables now carries a static_assert on its own length so the
 	// mistake is a compile error instead. Search kNumLevels.
-	inline constexpr int32 kNumLevels = 6;
+	//
+	// 7 SINCE 2026-08-23 (owner: "add additional LOD rings to reach 8-10km").
+	// Level 6 is the LAST ring level this architecture can carry without a
+	// format change: ground cover owns level 7 (FVoxelBrickPool::kCoverLevel),
+	// which is the ceiling of BOTH the chunk record's four-bit
+	// LevelAndFlags[0:3] and the VisBuffer's three-bit level field. An eighth
+	// ring would need a wider level field in two packed formats.
+	//
+	// The new ring is DORMANT BY DEFAULT: GetMaxRingLevel() defaults to 5 (the
+	// shipped 4 km cascade) so a flag-free run is byte-identical to the
+	// six-level build, and -VoxelMaxRingLevel=6 is the 8.19 km arm. L6 keeps
+	// the cascade's construction ratio Outer/ChunkEdge == 40 (8192 m / 204.8 m)
+	// so the march index aliasing proof (span 80 < kDimXY 128) holds unchanged
+	// at every level -- see VoxelMarchChunkIndex.cpp's static_asserts.
+	inline constexpr int32 kNumLevels = 7;
 
 	// Floored division matching vxc::floorDiv (C++ integer division truncates
 	// toward zero; voxel/brick/chunk lattice indexing needs floor instead).

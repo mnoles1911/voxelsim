@@ -575,7 +575,9 @@ void AVoxelEarthHUD::DrawStreamPanel()
 					else
 					{
 						uint64 Attributed = 0;
-						for (int32 L = 0; L < 6; ++L) { Attributed += B.UncoveredByLevel[L]; }
+						// The enum's constant, not 6 -- the array widened with the
+						// level-6 ring and a short sum would silently drop R6's misses.
+						for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L) { Attributed += B.UncoveredByLevel[L]; }
 						if (Attributed == 0)
 						{
 							// A real, measured zero: uncovered rays existed
@@ -590,13 +592,14 @@ void AVoxelEarthHUD::DrawStreamPanel()
 							const double Inv = 100.0 / double(Attributed);
 							AddRow(FString::Printf(
 							           TEXT("Holes by level: L0 %.0f%%  L1 %.0f%%  L2 %.0f%%  ")
-							           TEXT("L3 %.0f%%  L4 %.0f%%  L5 %.0f%%  (of %s misses)"),
+							           TEXT("L3 %.0f%%  L4 %.0f%%  L5 %.0f%%  L6 %.0f%%  (of %s misses)"),
 							           double(B.UncoveredByLevel[0]) * Inv,
 							           double(B.UncoveredByLevel[1]) * Inv,
 							           double(B.UncoveredByLevel[2]) * Inv,
 							           double(B.UncoveredByLevel[3]) * Inv,
 							           double(B.UncoveredByLevel[4]) * Inv,
 							           double(B.UncoveredByLevel[5]) * Inv,
+							           double(B.UncoveredByLevel[6]) * Inv,
 							           *CommaInt(int64(Attributed))),
 							       kStreamRowNeutral);
 							// Reason order is the shader's bucket codes:

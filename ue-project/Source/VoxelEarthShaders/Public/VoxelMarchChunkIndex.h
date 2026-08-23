@@ -186,14 +186,20 @@ public:
 	// The dimensions need no change per level and that is the cascade property,
 	// not a coincidence: ring L has outer radius 128 * 2^L m and chunk size
 	// 3.2 * 2^L m, so the chunks across a ring are 80 AT EVERY LEVEL. The
-	// existing static_assert therefore generalises as written.
+	// existing static_assert therefore generalises as written -- INCLUDING to
+	// level 6 (2026-08-23, the 8.19 km ring): 2 * 8192 m / 204.8 m = 80, the
+	// same safe number, because the ring keeps the Outer/ChunkEdge == 40
+	// construction ratio. That ratio is the entire aliasing argument; a ring
+	// that broke it (e.g. a 10.24 km level 6, ratio 50, span 100) would still
+	// fit under 128 but would have to prove it separately.
 	//
-	// 8 MiB per level, 48 MiB across six.
+	// 8 MiB per level, 56 MiB across seven.
 	//
 	// THE FULL REBUILD IS NOW THE THING TO WATCH. Rebuild-and-upload-everything
 	// was chosen so stale slots are structurally impossible, and at one level on
-	// dirty frames it was free. At six it is 48 MiB per dirty frame, and during
-	// cold fill that is most frames -- roughly 2.9 GB/s at 60 Hz, which is a
+	// dirty frames it was free. At seven ring levels plus the cover slot it is
+	// 64 MiB per dirty frame (56 MiB before level 6 landed), and during
+	// cold fill that is most frames -- roughly 3.8 GB/s at 60 Hz, which is a
 	// streaming regression introduced by the renderer rather than a rounding
 	// error.
 	//
@@ -203,7 +209,18 @@ public:
 	// up in a frame time. Measure before optimising is the rule that kept the
 	// first version blunt and it applies to its own successor. GetUploadBytes()
 	// is what decides it.
-	static constexpr uint32 kLevels = 6;
+	//
+	// 7 SINCE 2026-08-23: grid for the 8.19 km ring (VoxelCoords::kNumLevels).
+	// This is the LAST widening this constant can take -- kCoverLevel (7) is
+	// the ceiling of the record's four-bit and the VisBuffer's three-bit level
+	// fields, and with seven ring grids kCoverLevel == kRingGrids exactly, so
+	// an eighth ring would collide with cover in GridSlotForLevel (the
+	// static_assert in the .cpp fires). The grid exists whether or not the
+	// ring streams; the default run (-VoxelMaxRingLevel absent = 5) simply
+	// leaves slot 6 empty: +8 MiB of buffer, +8 MiB on the rare FULL uploads
+	// (attach and structural events), and zero extra ROUTINE traffic -- the
+	// delta path only moves dirty cells and an unstreamed slot never dirties.
+	static constexpr uint32 kLevels = 7;
 
 	// ===================================================================
 	// PHASE 6: THE COVER GRID. GRID SLOT IS NOT RING LEVEL.
@@ -258,6 +275,33 @@ public:
 			return Level;
 		}
 		return (Level == kCoverLevel) ? int32(kCoverGridSlot) : -1;
+	}
+
+	// How many ring LEVELS the streaming side is actually populating this run
+	// (GetMaxRingLevel() + 1), pushed once by UVoxelWorldSubsystem at
+	// streaming init. THE MARCHER'S DEFAULT RING COUNT FOLLOWS THIS
+	// (voxel.March.RingCount 0 = follow) so that arming the 8 km ring with
+	// -VoxelMaxRingLevel=6 cannot leave the renderer silently walking six
+	// rings over seven resident levels -- a switch that is on and draws
+	// nothing is the failure this project has paid for most often, and the
+	// symptom (nothing past 4 km) would read as a streaming bug, not a
+	// mismatched cvar. Lives HERE because this object is the one handle both
+	// modules already share: VoxelEarth cannot be included by the renderer
+	// (dependency direction), and a second spelling of the cascade depth in
+	// cvars is exactly the drift this class keeps paying for.
+	//
+	// Atomic because the write is game-thread (init, before the first march)
+	// and the read is the render thread's ring-spec build; relaxed is enough
+	// -- there is no data ordered behind it, it is a single self-contained
+	// count, and a one-frame-late read at worst walks the old ring count for
+	// that frame against an index whose extra slot is merely still empty.
+	void SetStreamedRingLevels(int32 NumLevels)
+	{
+		StreamedRingLevels.store(FMath::Clamp(NumLevels, 1, int32(kRingGrids)), std::memory_order_relaxed);
+	}
+	int32 GetStreamedRingLevels() const
+	{
+		return StreamedRingLevels.load(std::memory_order_relaxed);
 	}
 
 	// THE COVER BAND, IN COVER CHUNKS, AND IT IS LEVEL 0's PROOF REUSED.
@@ -812,6 +856,11 @@ private:
 	// heal, counted as FullBecauseLost. Atomic because it is the one flag that
 	// crosses render -> game.
 	std::atomic<bool> bGpuPublishLost{ false };
+
+	// See SetStreamedRingLevels. Defaults to 6 -- the shipped 4 km cascade --
+	// so a run where nothing pushes it behaves exactly as before level 6
+	// existed.
+	std::atomic<int32> StreamedRingLevels{ 6 };
 
 	TRefCountPtr<FRDGPooledBuffer> Pooled;
 	bool bAttached = false;

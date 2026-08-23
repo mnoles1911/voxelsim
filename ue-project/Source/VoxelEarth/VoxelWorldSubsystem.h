@@ -156,7 +156,18 @@ public:
 		{256.0, 512.0},
 		{512.0, 1024.0},
 		{1024.0, 2048.0},
-		{2048.0, 4096.0}, // R5: the 4 km cascade edge
+		{2048.0, 4096.0}, // R5: the 4 km cascade edge (default GetMaxRingLevel stops here)
+		// R6 (2026-08-23, owner: "add additional LOD rings to reach 8-10km").
+		// 8192 m keeps Outer/ChunkEdge == 40 (8192 / 204.8), the construction
+		// ratio every other ring has -- which is exactly what keeps the march
+		// index's resident span at 80 chunks < kDimXY 128 and the toroidal
+		// wrap alias-free (VoxelMarchChunkIndex.cpp). Stretching this ring to
+		// 10240 m instead (ratio 50, span 100) stays under 128 but breaks the
+		// ratio and the geometric shader derivation OuterUU(L) = R0 * 2^L,
+		// which the marcher deliberately computes from ONE uniform; 8.19 km is
+		// the value that changes no derivation anywhere. DORMANT unless
+		// -VoxelMaxRingLevel=6 -- see GetMaxRingLevel.
+		{4096.0, 8192.0},
 	};
 	// A short initializer list here is silently zero-filled by C++, and the
 	// consequences are runtime-silent rather than loud: a {0,0} annulus admits no
@@ -185,7 +196,9 @@ public:
 	static const FRingPreset* GetRingPresets();
 
 	// Outermost ring level actually streaming this run (-VoxelMaxRingLevel=<N>,
-	// default kNumLevels-1). GetRingPresets()[GetMaxRingLevel()].OuterMeters is
+	// default 5 -- the shipped 4 km cascade; level 6, the 8.19 km ring, is
+	// compiled in but streams only when this says 6, see the .cpp).
+	// GetRingPresets()[GetMaxRingLevel()].OuterMeters is
 	// therefore where the voxel world really ends, which is what
 	// AVoxelClipmapActor has to butt its inner hole against -- see
 	// SpacingUUForLevel. Resolved once from the command line at first use.
