@@ -4521,6 +4521,48 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 		FMemory::Memcpy(Presets, kDefaultRingPresets, sizeof(Presets));
 		bool bOverrideRequested = false;
 
+		// -VoxelRingScale=<f> (2026-08-23, owner: "increase the demand
+		// dramatically"): multiply EVERY level's radii by one factor. This is
+		// the one override shape that cannot produce a malformed cascade: the
+		// annuli still abut (both edges scale together) and the construction
+		// ratio Outer[L]/ChunkEdge[L] stays uniform across levels (40 * f), so
+		// the marcher's one-uniform derivation OuterUU(L) = R0 * 2^L stays
+		// exact -- streaming init pushes the scaled R0 into
+		// voxel.March.RingOuterM (see the SetStreamedRingLevels site) so the
+		// renderer walks the cascade residency actually builds.
+		//
+		// WHY THE CEILING IS WHERE IT IS: the marcher's chunk index is a
+		// toroidal grid, kDimXY = kDimZ = 128 cells per level, wrapping with a
+		// mask and carrying no origin. Its correctness is that a level's
+		// RESIDENT span stays under 128 chunks -- and the resident span is NOT
+		// 2*Outer/edge (the static_assert's 80 at defaults): eviction keeps
+		// chunks out to Outer * UnloadRingMult, and brick-backed speculative
+		// parking (T4-1) holds chunks up to VelocityLeadMaxUU + Outer AHEAD of
+		// the anchor. The span validation below and the joint speculative-lead
+		// clamp in TickStreaming enforce the whole sum; this parse only bounds
+		// the factor to something the validation can reason about.
+		//
+		// Applied BEFORE the explicit per-level lists so a list can still
+		// override an individual scaled level (the abut validation then judges
+		// the combined result). Scale != 1 counts as an override so the
+		// validation runs.
+		{
+			double Scale = 1.0;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingScale="), Scale) &&
+			    Scale != 1.0)
+			{
+				Scale = FMath::Clamp(Scale, 0.25, 4.0);
+				for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+				{
+					Presets[Level].InnerMeters *= Scale;
+					Presets[Level].OuterMeters *= Scale;
+				}
+				bOverrideRequested = true;
+				UE_LOG(LogVoxelEarth, Log, TEXT("-VoxelRingScale=%.3f: all ring radii scaled (R0 outer %.1f m)"),
+				       Scale, Presets[0].OuterMeters);
+			}
+		}
+
 		// -VoxelRingInnerMeters=<L0>,<L1>,... : overrides InnerMeters for as
 		// many leading levels as values are given; trailing levels keep the
 		// default. Same comma-list convention as -VoxelRingFloors
@@ -4647,10 +4689,108 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 				       OuterSpec.IsEmpty() ? TEXT("<absent>") : *OuterSpec, VoxelCoords::kNumLevels);
 			}
 		}
+
+		// THE TOROIDAL-SPAN VALIDATION (2026-08-23), and it runs on EVERY
+		// configuration including the defaults, because its premise mixes a
+		// compile-time constant (the march index's kDimXY = kDimZ = 128 cells
+		// per level) with three runtime switches (-VoxelRingScale=,
+		// -VoxelRingOuterMeters=, -VoxelUnloadRingMult=). The marcher's chunk
+		// index wraps chunk coordinates with & (kDim-1) and carries no origin;
+		// two resident chunks kDim apart on an axis silently share a cell, and
+		// the marcher's record validation turns the loser into a hole nobody
+		// ordered. That aliasing has already been live and silent in this
+		// codebase once (kDimZ was 64 against a span of 80 and the assert
+		// meant to catch it was a tautology) -- hence a refusal here, with the
+		// arithmetic, rather than a warning that scrolls away.
+		//
+		// The RESIDENT span per level is wider than the annulus:
+		//   eviction keeps chunks to Outer * UnloadRingMult (the trailing
+		//   hysteresis band), so the resident diameter is
+		//   2 * Outer * Mult, i.e. floor(2*Outer*Mult/edge)+1 chunk coords.
+		// Defaults: floor(2*128*1.25/3.2)+1 = 101 of 128 cells -- NOT the 80
+		// the index's static_assert quotes; that figure predates hysteresis
+		// accounting. 8 cells of safety margin are reserved on top for
+		// eviction lag while moving (the exit scan trails the anchor by a
+		// tick or two; 8 chunks = 25.6 m at L0 = ~0.1 s at 240 m/s).
+		// Brick-backed speculative parking spends the SAME budget ahead of
+		// the anchor; TickStreaming clamps the speculative lead to whatever
+		// this configuration leaves over (see the MaxLeadUU site).
+		//
+		// The construction keeps Outer/edge uniform across levels, so one
+		// level failing means all do -- but the loop checks every level
+		// anyway, because -VoxelRingOuterMeters= can move ONE ring.
+		{
+			constexpr int32 kSpanSafetyChunks = 8;
+			const int32 DimBudget =
+			    int32(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ)) -
+			    kSpanSafetyChunks;
+			const double Mult = GetUnloadRingMultiplier();
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				const double EdgeMeters = VoxelCoords::ChunkEdgeUUForLevel(Level) / 100.0;
+				const int32 SpanChunks =
+				    FMath::FloorToInt32(2.0 * Presets[Level].OuterMeters * Mult / EdgeMeters) + 1;
+				if (SpanChunks > DimBudget)
+				{
+					UE_LOG(LogVoxelEarth, Fatal,
+					       TEXT("Ring config would alias the marcher's toroidal chunk index at level %d: ")
+					       TEXT("resident span floor(2 * %.1f m outer * %.3f unload-mult / %.1f m edge)+1 = %d chunks ")
+					       TEXT("exceeds the index budget %d (kDim %d minus %d safety for eviction lag). ")
+					       TEXT("Two chunks would share a cell and the marcher would render a hole nobody ordered. ")
+					       TEXT("Lower -VoxelRingScale=, lower -VoxelUnloadRingMult= (>= ~1.08 to clear the ")
+					       TEXT("admit-pad tripwire at ring overlap 4), or raise kDimXY/kDimZ in ")
+					       TEXT("VoxelMarchChunkIndex.h -- a power of two; 256 is 8x the index memory, 56 -> 448 MiB."),
+					       Level, Presets[Level].OuterMeters, Mult, EdgeMeters, SpanChunks,
+					       DimBudget, int32(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ)),
+					       kSpanSafetyChunks);
+				}
+			}
+		}
 		return true;
 	}();
 	(void)bInit;
 	return Presets;
+}
+
+// -VoxelUnloadRingMult=<f>: the outer-edge eviction hysteresis, runtime since
+// 2026-08-23 (see the header). Default 1.25 = the old constexpr = the control
+// arm, byte-identical when the switch is absent.
+//
+// WHY IT IS TRADEABLE AT ALL: hysteresis exists so anchor jitter at a ring
+// edge does not load/unload the same chunk every recompute (the 11,779
+// unloads/s standing-still failure was two ANCHORS disagreeing, not thin
+// hysteresis). What jitter needs is a band comfortably wider than one chunk
+// edge and the anchor's per-tick wobble -- METERS, not a fraction. At default
+// R0 the band is 0.25 * 128 = 32 m; at -VoxelRingScale=1.25 a 1.15 multiplier
+// still leaves 0.15 * 160 = 24 m, wider than VoxelDetailAssetSubsystem's
+// shipping 1.15 hysteresis protects at 256 m. What the fraction COSTS is
+// toroidal index span (2*Outer*Mult/edge resident chunks -- see the span
+// validation in GetRingPresets), so a wide-ring arm wants the multiplier
+// trimmed in the same breath.
+//
+// FLOOR at 1.05: the admit pad reaches Outer + max(half-diag 0.87, overlap<=4)
+// chunk edges, i.e. Outer * (1 + 4/40) worst-case at default ratio; below that
+// the per-level thrash tripwire in RecomputeDesiredSet fires (admit band
+// touching unload band = admit/evict every alternate frame). The tripwire
+// stays armed regardless -- this floor just refuses configurations that are
+// wrong at parse time. FAILING READING for a trimmed multiplier: stationary
+// unloaded/s not flat -- the band no longer covers anchor jitter, and the
+// number to move is this one, back up.
+double UVoxelWorldSubsystem::GetUnloadRingMultiplier()
+{
+	static const double Mult = []
+	{
+		double Value = 1.25;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelUnloadRingMult="), Value);
+		const double Clamped = FMath::Clamp(Value, 1.05, 2.0);
+		if (Clamped != 1.25)
+		{
+			UE_LOG(LogVoxelEarth, Log, TEXT("-VoxelUnloadRingMult=%.3f (default 1.25): unload edge = ring outer * this"),
+			       Clamped);
+		}
+		return Clamped;
+	}();
+	return Mult;
 }
 
 template <typename FormatOneLevelFn>
@@ -7863,7 +8003,54 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// Recomputed every tick so it tracks a cvar change without a restart.
 	{
 		const double LeadSec = double(VoxelDebug::GetStreamVelocityLeadSec());
-		const double MaxLeadUU = double(VoxelDebug::GetStreamVelocityLeadMaxUU());
+
+		// THE JOINT SPAN BUDGET (2026-08-23), and it exists because the
+		// speculative lead and the ring configuration spend the SAME scarce
+		// resource: the marcher index's toroidal span at level 0. Speculative
+		// parking is brick-backed under the marcher (Parked.bBrickBacked --
+		// the chunk is RESIDENT in the brick pool, hence in the index), so a
+		// parked chunk LeadUU ahead of the anchor and a hysteresis-kept chunk
+		// Outer*Mult behind it must BOTH fit inside kDim*edge = 409.6 m of
+		// axis span, or two chunks share a cell and the marcher renders a
+		// hole nobody ordered. The budget:
+		//     lead_max = (kDim - safety) * edge  -  Outer * (1 + Mult)
+		// Defaults: (128-8)*3.2 - 128*2.25 = 96 m > the 60 m cvar clamp, so
+		// the control arm never binds and stays byte-identical. At
+		// -VoxelRingScale=1.25 -VoxelUnloadRingMult=1.15 the budget is
+		// (120*3.2) - 160*2.15 = 40 m and BINDS -- the wide ring buys demand
+		// reach by reining speculation, automatically, instead of aliasing.
+		// Raising kDimXY/kDimZ to 256 (448 MiB index) is what would give
+		// speculation room for a genuine high-speed lead (~450 m at default
+		// rings) -- that trade is the index owner's, not a knob here.
+		//
+		// Latched once: every input is command-line latched or compile-time.
+		// The one-time log prints which bound decided, so a leg where
+		// speculation parks less than expected reads as "the index budget
+		// bound it" rather than as a broken cvar.
+		static const double IndexLeadBudgetUU = []
+		{
+			constexpr int32 kSpanSafetyChunks = 8; // same reserve as GetRingPresets' validation
+			const double L0EdgeUU = VoxelCoords::ChunkEdgeUUForLevel(0);
+			const double L0OuterUU = UVoxelWorldSubsystem::GetRingPresets()[0].OuterMeters * 100.0;
+			const double Mult = UVoxelWorldSubsystem::GetUnloadRingMultiplier();
+			const double DimBudgetChunks =
+			    double(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ) -
+			           uint32(kSpanSafetyChunks));
+			const double Budget =
+			    FMath::Max(0.0, DimBudgetChunks * L0EdgeUU - L0OuterUU * (1.0 + Mult));
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("Speculative lead budget: %.0f UU (%.1f m) from the march index span ")
+			       TEXT("(%s the %.0f UU VelocityLeadMaxUU clamp %s)"),
+			       Budget, Budget / 100.0, Budget < double(VoxelDebug::GetStreamVelocityLeadMaxUU())
+			           ? TEXT("BINDS under") : TEXT("slack above"),
+			       double(VoxelDebug::GetStreamVelocityLeadMaxUU()),
+			       Budget < double(VoxelDebug::GetStreamVelocityLeadMaxUU())
+			           ? TEXT("-- the index, not the cvar, is the constraint")
+			           : TEXT("-- the cvar decides"));
+			return Budget;
+		}();
+		const double MaxLeadUU =
+		    FMath::Min(double(VoxelDebug::GetStreamVelocityLeadMaxUU()), IndexLeadBudgetUU);
 		const FVector Lead = SmoothedAnchorVelocity * LeadSec;
 		PredictedAnchorLocation =
 			Anchor + (Lead.SizeSquared() > MaxLeadUU * MaxLeadUU ? Lead.GetSafeNormal() * MaxLeadUU : Lead);
@@ -11753,9 +11940,9 @@ static double VerticalKeepUU(int32 Level, double ChunkEdgeUU)
 {
 	if (Level == 0)
 	{
-		return SightRadiusUU() * UVoxelWorldSubsystem::UnloadRingMultiplier + ChunkEdgeUU;
+		return SightRadiusUU() * UVoxelWorldSubsystem::GetUnloadRingMultiplier() + ChunkEdgeUU;
 	}
-	return double(KeepChunks[Level] + 1) * ChunkEdgeUU * UVoxelWorldSubsystem::UnloadRingMultiplier;
+	return double(KeepChunks[Level] + 1) * ChunkEdgeUU * UVoxelWorldSubsystem::GetUnloadRingMultiplier();
 }
 
 // The anchor counts as underground once it is this far below the amplifier
@@ -12738,7 +12925,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 			const int32 Level = It.Key().Level;
 			const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
 			const double KeepRadiusUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 *
-			                            UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+			                            UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
 			const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
 			const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
 			if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) >
@@ -12773,7 +12960,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	{
 		const UVoxelWorldSubsystem::FRingPreset& L0Preset = UVoxelWorldSubsystem::GetRingPresets()[0];
 		const double L0ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(0);
-		const double L0KeepRadiusUU = L0Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+		const double L0KeepRadiusUU = L0Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
 		const double L0KeepRadiusSq = FMath::Square(L0KeepRadiusUU);
 		for (auto It = FootprintBandCache.CreateIterator(); It; ++It)
 		{
@@ -12797,7 +12984,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 		const int32 Level = It.Key().Level;
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
 		const double KeepRadiusUU =
-			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
 		const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
 		if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > FMath::Square(KeepRadiusUU))
@@ -12813,7 +13000,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 		const int32 Level = It.Key().Level;
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
 		const double KeepRadiusUU =
-			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
 		const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
 		if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > FMath::Square(KeepRadiusUU))
@@ -12830,7 +13017,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 		const double CenterX = (double(Key.Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(Key.Key.Y) + 0.5) * ChunkEdge;
 		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-		const double KeepRadiusUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+		const double KeepRadiusUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
 		if (DistSq > FMath::Square(KeepRadiusUU))
 		{
 			It.RemoveCurrent();
@@ -14210,7 +14397,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			LP.AdmitOuterUU = LP.OuterUU + FMath::Max(ResidHalfDiag, ResidOverlapUU);
 			LP.InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(ResidLevel);
 			LP.InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(ResidLevel);
-			LP.UnloadOuterUU = LP.OuterUU * UVoxelWorldSubsystem::UnloadRingMultiplier;
+			LP.UnloadOuterUU = LP.OuterUU * UVoxelWorldSubsystem::GetUnloadRingMultiplier();
 			LP.VerticalKeepUU = VoxelUnderground::VerticalKeepUU(ResidLevel, LP.ChunkEdgeUU);
 			LP.CutoffSortKeySq = LevelAdmissionCutoffDistSq[ResidLevel];
 			const FVoxelCoord ResidAnchorVoxel = WorldToVoxelForLevel(Anchor, ResidLevel);
@@ -14307,7 +14494,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// Every one of those is a session constant: the preset table is a
 	// function-local static filled once from the command line and never
 	// written again (see GetRingPresets), ChunkEdgeUUForLevel is arithmetic on
-	// compile-time constants, UnloadRingMultiplier is constexpr, and
+	// compile-time constants, UnloadRingMultiplier latches once (see
+	// GetUnloadRingMultiplier -- a static read after the first call), and
 	// InnerHysteresisChunks latches its knob in a static on first call. So at
 	// ~271k tracked records this walk paid ~800k function calls per recompute
 	// to look up six-entry tables that cannot change between two iterations.
@@ -14324,7 +14512,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	{
 		ExitChunkEdgeUU[L] = ChunkEdgeUUForLevel(L);
 		ExitUnloadOuterUUSq[L] = FMath::Square(
-			UVoxelWorldSubsystem::GetRingPresets()[L].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier);
+			UVoxelWorldSubsystem::GetRingPresets()[L].OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier());
 		ExitInnerEvictUUSq[L] = FMath::Square(VoxelStreamAdmission::InnerEvictUU(L));
 	}
 	// Command-line-latched static, identical on every read within a run --
@@ -14957,7 +15145,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		if (RingOverlapChunks > 0)
 		{
 			static bool bWarnedThrash[VoxelCoords::kNumLevels] = {};
-			const double UnloadOuterUU = OuterUU * UVoxelWorldSubsystem::UnloadRingMultiplier;
+			const double UnloadOuterUU = OuterUU * UVoxelWorldSubsystem::GetUnloadRingMultiplier();
 			if (AdmitOuterUU >= UnloadOuterUU && !bWarnedThrash[Level])
 			{
 				bWarnedThrash[Level] = true;
@@ -23833,6 +24021,36 @@ void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
 	// first recompute can make anything resident, so -VoxelMaxRingLevel=6
 	// cannot stream an 8 km ring the renderer silently never walks.
 	GetGlobalVoxelMarchChunkIndex().SetStreamedRingLevels(GetMaxRingLevel() + 1);
+
+	// AND THE RING RADIUS FOLLOWS TOO (2026-08-23, -VoxelRingScale). The
+	// marcher derives EVERY ring bound from the single voxel.March.RingOuterM
+	// cvar (Ring0OuterUU; ring L covers [R0*2^(L-1), R0*2^L)), and the shadow
+	// march reads the same cvar -- deliberately its own spelling, because
+	// VoxelEarthShaders may not depend on VoxelEarth. That cvar's own doc
+	// names the failure this push prevents: "moving it away from the preset
+	// makes the marcher ask for levels at radii the pool does not populate --
+	// a hole, not an error." Residency's authority is GetRingPresets(); push
+	// it into the renderer's spelling here, the same one-direction bridge
+	// SetStreamedRingLevels just used.
+	//
+	// Guarded so the CONTROL ARM never calls Set at all (a Set marks the cvar
+	// SetByGameSetting even at an equal value; absent switches must stay
+	// byte-identical). SetByGameSetting rather than SetByCode so a console or
+	// device-profile sweep of voxel.March.RingOuterM can still outrank it.
+	{
+		const double PresetR0M = GetRingPresets()[0].OuterMeters;
+		IConsoleVariable* MarchRingOuterM =
+		    IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.March.RingOuterM"));
+		if (MarchRingOuterM &&
+		    !FMath::IsNearlyEqual(double(MarchRingOuterM->GetFloat()), PresetR0M, 1e-3))
+		{
+			MarchRingOuterM->Set(float(PresetR0M), ECVF_SetByGameSetting);
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("voxel.March.RingOuterM pushed to %.1f m to follow the ring presets ")
+			       TEXT("(the marcher and shadow march derive every ring bound from it)."),
+			       PresetR0M);
+		}
+	}
 
 	UE_LOG(LogVoxelStream, Log,
 	       TEXT("Voxel streaming initialized (seed %llu): load=%.0fm unload=%.0fm digRange=%.0fm maxRing=%d"),

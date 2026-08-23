@@ -175,7 +175,22 @@ public:
 	// spacing from RingPresets[kNumLevels-1].OuterMeters, so a zero there
 	// collapses the whole 30 km heightmap to a degenerate zero-extent mesh.
 	static_assert(UE_ARRAY_COUNT(kDefaultRingPresets) == VoxelCoords::kNumLevels, "kDefaultRingPresets must have one entry per level");
-	static constexpr double UnloadRingMultiplier = 1.25;
+
+	// Outer-edge eviction hysteresis: a chunk leaves its level's desired set
+	// once it crosses OuterMeters * this. RUNTIME ACCESSOR since 2026-08-23
+	// (-VoxelUnloadRingMult=<f>, default 1.25, latched once -- same storage
+	// move GetRingPresets() already made, and for the same reason: the value
+	// participates in the resident-span budget of the marcher's toroidal
+	// chunk index, and widening the rings without being able to trade
+	// hysteresis width against ring width would waste index span on the
+	// TRAILING band. The span arithmetic lives in GetRingPresets()'s
+	// validation block; the multiplier's floor is the admit-pad tripwire in
+	// RecomputeDesiredSet (AdmitOuterUU must stay inside UnloadOuterUU).
+	//
+	// The old compile-time constant was 1.25; that stays the default and the
+	// control arm. VoxelDetailAssetSubsystem's kUnloadMultiplier=1.15 is the
+	// in-repo precedent that 1.15 is a workable hysteresis on real flights.
+	static double GetUnloadRingMultiplier();
 
 	// Runtime accessor for the ring radii (docs/streaming-handoff.md: this
 	// table was static constexpr and had to become a runtime accessor before
@@ -184,7 +199,14 @@ public:
 	// overridden via -VoxelRingInnerMeters=<L0>,<L1>,.../-VoxelRingOuterMeters=
 	// <L0>,<L1>,... (comma lists, one entry per level, trailing levels left at
 	// default if the list is short -- same convention as
-	// VoxelStreamAdmission::GetRingSlotFloors's -VoxelRingFloors=).
+	// VoxelStreamAdmission::GetRingSlotFloors's -VoxelRingFloors=), or via
+	// -VoxelRingScale=<f> (2026-08-23), which multiplies EVERY level's radii
+	// by one factor -- the only shape of override that preserves both ring
+	// invariants at once (annuli abut, and Outer[L]/ChunkEdge[L] is the same
+	// at every level, which is what lets the marcher derive all its bounds
+	// from the single MarchRing0OuterUU uniform). The scale a run may ask for
+	// is bounded by the marcher index's toroidal span budget; GetRingPresets()
+	// validates that with the real arithmetic and refuses to start otherwise.
 	//
 	// Command-line rather than a cvar: ring radii decide the shape of the
 	// FIRST desired set. FVoxelWorldImpl::RecomputeDesiredSet runs on the
@@ -246,7 +268,7 @@ public:
 	// Functions, not constants, now that level 0's radii can be overridden at
 	// runtime (-VoxelRingOuterMeters=).
 	static double GetLoadRadiusMeters() { return GetRingPresets()[0].OuterMeters; }
-	static double GetUnloadRadiusMeters() { return GetRingPresets()[0].OuterMeters * UnloadRingMultiplier; }
+	static double GetUnloadRadiusMeters() { return GetRingPresets()[0].OuterMeters * GetUnloadRingMultiplier(); }
 
 	// Stage 2 decisions table: dig/place raycast range.
 	static constexpr double DigPlaceRangeMeters = 8.0;
