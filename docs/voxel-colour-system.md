@@ -175,6 +175,16 @@ feature. Emitting `MAT_SNOW` above a line would let that modifier be deleted.
   `palette=None`: a clipmap vertex is a heightmap sample with no material id to
   look one up with, so it stays climate-only. The two must not diverge at their
   seam, which is why the graph is shared code and not two copies.
+
+  **The LUT is a temperature ramp, not a Whittaker diagram** — measured, and
+  worth knowing before judging a vista capture. Its precipitation axis spans
+  u8 14–32 (636–1483 mm/yr), and `classifyBiome`'s precipitation gates are at
+  9, 10 and 34, so the entire axis lies inside one class: 0 of 64 rows change
+  biome across U, while 64 of 64 columns change across V. That follows from the
+  constants alone, with no tile data involved. The window is a plausible p1–p99
+  for real land and is `static_assert`ed in `VoxelClimateProbe.h`, so moving it
+  is a decision about what the whole vista shows and wants the real climate
+  distribution behind it. Recorded, not fixed.
 - **UI.** `prepare_ui_assets.py` and the front end.
 
 ---

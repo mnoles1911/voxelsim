@@ -55,6 +55,34 @@ int main(int argc, char** argv) {
     const int32_t tempLo = 100, tempHi = 189;
     const int32_t precipLo = 14, precipHi = 32;
 
+    // MEASURED, AND IT IS NOT WHAT THIS TEXTURE LOOKS LIKE IT IS.
+    //
+    // Inside this window the U axis cannot change the answer. classifyBiome's
+    // precipitation gates sit at 9 (arid), 10 (semi) and 34 (moderate) on the
+    // same u8 scale, so every column from 14 to 32 falls in ONE class -- the
+    // `precipU8 < kBiomePrecipModU8` branch -- and the biome is then decided by
+    // temperature and seasonality alone. Classifying the grid confirms it:
+    // 0 of 64 rows change biome across the whole precipitation axis, while
+    // 64 of 64 columns change across temperature.
+    //
+    // So the vista's 64x64 lookup is, today, a 64-entry TEMPERATURE ramp
+    // stretched sideways. That is a fact about the axis window versus the
+    // gates, not about any tile data -- it follows from the constants alone.
+    //
+    // NOT "FIXED" HERE, deliberately. The window is 636..1483 mm/yr, which is a
+    // reasonable p1..p99 for real WorldClim land, and it is static_asserted in
+    // VoxelClimateProbe.h against climate.h and duplicated in
+    // gen_terrain_textures.py -- moving it changes what the whole vista shows
+    // and wants the real climate distribution to decide, not this file. What is
+    // recorded here is that the next person should not read a horizontally
+    // banded LUT as a bug in this probe: it is the correct picture of a window
+    // that spans one precipitation class.
+    //
+    // (Measuring the repo's baked tile cache is NOT how to settle it. Its
+    // precipitation runs 101..145 u8, about 4700-6800 mm/yr everywhere, because
+    // those tiles are synthetic and their climate is not WorldClim's -- the
+    // caveat vxc_matcensus prints for exactly this reason.)
+
     // JUST ABOVE THE BEACH BAND, so the climate branch is what decides.
     // classifyBiome runs morphology gates FIRST -- sea level, then treeline --
     // and at a high elevation every cold cell would come back TUNDRA_ALPINE and
