@@ -160,6 +160,11 @@ inverts the last handoff's ordering, and the table above is the reason.
 
 ### 3.1 The hole metric now exists, is certified, and measures the owner's complaint
 
+> **SUPERSEDED 2026-08-23 by section 8.2 — "is certified" IS NO LONGER TRUE.**
+> Both halves of the level+reason breakdown fail in steady state: `byLevel` is
+> stuck at L0, and `byReason` collapses to `unattrib=100%` when the annotation
+> writer freezes. Do not quote this instrument. See backlog 0.0i.
+
 `voxel.March.HoleStats 1` (default off). `uncovered` = no hit anywhere + the ray crossed
 an ABSENT chunk (not merely an empty one) + it points below the horizon. `substituted` =
 a hit that came from a level coarser than the segment owning that ground, so it counts
@@ -430,3 +435,131 @@ leg that flips 8.1 on.
   shrink to shadow bookkeeping.
 - Holes gate: `uncovered` must not move with the switch on (admission order is untouched,
   so it should not — verify, don't assume).
+
+
+---
+
+## 8. Measured 2026-08-23, late session
+
+### 8.1 The recompute split — the number the whole plan was gated on
+
+Phase 1 landed (timers split, sums added beside the maxima, per-level radii
+hoisted out of the per-record and per-cell inner loops) and the leg
+`Saved/phase1-split.log` was run against it: flight `line`, spawn
+`-61440,-61440`, one binary.
+
+Steady-state windows, 5 s each:
+
+| stage | ms/window | share |
+| --- | --- | --- |
+| **admission** (`entryMs` summed over rings) | 116-186 | **~65%** |
+| **eviction walk** (`exitScanMs`, now isolated) | 45-78 | **~30%** |
+| sort | 2-8 | ~2% |
+| fine-tier residency tick | 1-8 | ~1% |
+| queue filter | **0.0** | 0% |
+
+**The parts sum to `totalMs` exactly.** e.g. 68.1 + 2.1 + 4.1 + 116.1 = 190.4,
+and it closes like that in every window. The residual bucket -- prologue, cutoff
+relaxation, `PruneFootprintZRangeCache`, `FlushAbsentMarks` -- is effectively
+zero, so nothing is hiding outside the named stages.
+
+**Two earlier claims in this document are corrected by this.**
+  1. "The bottleneck is the eviction pass walking 233,838 records" was
+     premature: the exit scan is **a third**, not the bulk. Admission is roughly
+     **twice** it.
+  2. The `queueFilterMs` that used to be bundled inside `exitScanMs` costs
+     **literally nothing**. It was part of what made the old combined number
+     unreadable.
+
+**Consequence for the plan:** Phase 2 (incremental admission) is correctly
+prioritised, and Phase 3 (bucketed eviction) remains worth doing at ~30% rather
+than being noise.
+
+### 8.2 The uncovered level+reason instrument fails both halves
+
+Three headless captures at 120 / 400 / 1200 m, read with `tools/read-holes.sh`.
+`byLevel` reads `L0=<everything> L1..L5=0` in every window of every rung.
+`byReason` starts honest (`never=100%`) and then collapses to `unattrib=100%`
+for the whole steady state -- and `annotWrites pending` **freezes** at 290,332 at
+exactly that moment. The annotation writer stops; the reason bits go stale.
+
+The capture side is sound: `attributed == uncovered` and
+`sum(byLevel) == sum(byReason)` hold in every window including the bad ones. The
+fault is isolated to annotation. Full entry: backlog 0.0i.
+
+### 8.3 Admission is rejecting candidates by the hundred thousand
+
+Same leg, `job flow` across the last six windows -- `candidatesRejected` against
+`dispatched`:
+
+```
+    6,438 / 16,227      61,933 / 13,420     268,484 /  9,883
+  471,884 /  9,845     595,763 /  9,512    748,677 /  9,646
+```
+
+Three-quarters of a million candidates rejected per 5 s window while dispatch
+falls ~40%. Unexplained as of this writing and under investigation; it is
+plausibly the same mechanism behind the owner's loading-order complaint (8.4).
+
+Note `chunksPerSec` reads 0.0 on this leg and is **not** a throughput figure
+here: `zeroQuad == drained`, i.e. every chunk meshes to zero quads by
+configuration in the marcher build. Use `dispatched` per window.
+
+### 8.4 Owner-reported: chunks load left-to-right, and far before near
+
+> "the chunks always load from left to right in relation to the player character
+> camera. and it does not always prioritize the nearest chunks to player camera.
+> rather sometimes far chunk areas load left to right in the far distance rather
+> than the clearly higher priority... chunk areas closer to player at LOD0."
+
+The same leg corroborates it. `entryMs` marches ring by ring, one level at a
+time, in level order:
+
+```
+R0=185.0 R1=45.7  R2=45.0  R3=89.5  R4=232.7 R5=661.4   (cold)
+R0=339.2 R1=56.9  R2=6.0   R3=0     R4=0     R5=0
+R0=0     R1=154.0 R2=37.9  R3=6.2   R4=0     R5=0
+R0=0     R1=0     R2=159.9 R3=16.1  R4=5.8   R5=0
+R0=0     R1=0     R2=0     R3=169.0 R4=14.4  R5=0
+R0=0     R1=0     R2=0     R3=0     R4=127.3 R5=0
+```
+
+That is **level-primary ordering** (the "far before near" half); a row-major
+grid sweep within a level is the "left to right" half. **This is a hypothesis
+fitted to a plot and must be confirmed against the code before being acted on.**
+
+Owner also wants the cascade extended from 4 km to **4-8 km**.
+
+**THE CONSTRAINT ANY 8 km PROPOSAL MUST CLEAR.** The marcher chunk index is a
+toroidal grid, `kDimXY = kDimZ = 128` per level, wrapping with `& (kDim-1)` and
+carrying **no origin**. Its correctness is a compile-time proof that a level's
+resident span is `< 128` chunks. At L5 today: chunk edge 102.4 m, span
+2 x 4096 = 8192 m, so **80 chunks**. Widening ring 5 to an 8 km outer radius
+gives 16384 / 102.4 = **160 chunks > 128 and the index ALIASES** -- the file's
+own words for the symptom are "one chunk silently shadowing another -- turned
+into a hole by the marcher's record validation, but a hole nobody ordered".
+That trap has already been live and silent in this file once, because the assert
+meant to catch it was a tautology.
+
+The clean route to 8 km is **an added ring level 6** (chunk edge 204.8 m ->
+16384 / 204.8 = 80 chunks, the same safe number), not a wider ring 5. Knock-on
+constraints to check: `kNumLevels`, the index's `kLevels`/`kRingGrids`, and
+`kCoverLevel`, which must stay `< 8` to fit the VisBuffer's three-bit level
+field and the record's four-bit `LevelAndFlags`.
+
+### 8.5 A build guard that earned its keep
+
+`tools/voxel-capture.ps1` refused to launch: `voxelcore.lib` was stale against
+`mips.h`. **UBT does not track voxel-core's sources**, so `Build.bat` reported
+"Result: Succeeded" while linking the previous day's library. Without that
+refusal the coarse-mip A/B pair would have been shot against an out-of-date
+generator, shown no difference, and been reported as an ineffective fix -- with
+a green build and clean logs throughout.
+
+The full sequence after any voxel-core header change is:
+
+```
+cmake --build build/voxel-core-msvc --config Release
+# then FORCE A RELINK -- rebuilding the lib alone does not trigger one:
+touch a file under ue-project/Source/VoxelEarth && Build.bat ...
+```

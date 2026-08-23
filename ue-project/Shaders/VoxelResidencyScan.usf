@@ -1,0 +1,597 @@
+// VoxelResidencyScan.usf -- T4-2 "GPU-resident residency": the desired-set
+// walks as compute, emitting a compact admit/evict delta.
+//
+// docs/gpu-residency-t42-plan.md is the design note. The short form:
+//
+//   RecomputeDesiredSet's two O(big) walks -- the O(tracked-records) eviction
+//   walk (~30% of recompute at 271,549 records) and the O(annulus-cells)
+//   entry scan (~65%) -- are pure geometry over the anchor plus two pieces of
+//   state: WHICH chunks are tracked, and each footprint's Z range. Both are
+//   mirrored here (ShadowGrid, ZRangeGrid), maintained exclusively by
+//   CPU-confirmed deltas, and the two walks become the two scan kernels
+//   below. The CPU consumes their appended proposals and adjudicates each one
+//   against the state only it may touch (fine-tile residency, edits, parked
+//   geometry, admission caps) in O(delta).
+//
+//   Aokana's rule (arXiv 2505.02017) is DECOUPLE, DON'T RELOCATE: the CPU
+//   never waits on any of this. Proposals ride an async readback and are
+//   consumed whenever they arrive; a late delta is a slightly stale annulus,
+//   which anchor motion already produces on its own.
+//
+// THE SHADOW IS A MIRROR, NEVER AN AUTHORITY. Every cell transition here is
+// commanded by the game thread (FeedbackCS ops emitted at the exact sites
+// that mutate ChunkRecords / PendingUnloadSet). The scans READ the mirror and
+// APPEND proposals; they never write cells. That is what keeps the CPU's
+// adjudication O(delta): it trusts the mirror to have already subtracted
+// everything tracked, instead of re-checking every candidate itself.
+//
+// ---------------------------------------------------------------------------
+// SHADOW CELL ENCODING (one uint per chunk cell, toroidal per level)
+// ---------------------------------------------------------------------------
+// Grid is kDimXY x kDimXY x kDimZ per level (128^3, wrap = AND with 127 --
+// the same rolling-window shape as FVoxelMarchChunkIndex, for the same
+// reason). A slot alone is ambiguous across torus periods, so the cell stores
+// the WRAP TAG of each axis -- (coord >> 7) & 0x1FF -- making the full signed
+// 16-bit chunk coordinate reconstructible: coord = signext16(wrap<<7 | slot).
+// 16 bits per axis is +-32,768 chunks: +-105 km at level 0, +-3,355 km at
+// level 5. A session cannot leave that range.
+//
+//   bit 31        occupied (a ChunkRecord exists for this coordinate)
+//   bit 30        pendingUnload (queued for unload; exit scan must skip it,
+//                 entry scan proposes RESURRECT instead of skipping)
+//   bit 29        deepAnchorRelative (record entered via the underground box;
+//                 exit scan applies the vertical keep-test)
+//   bits 27..28   reserved, zero
+//   bits 18..26   wrapZ (9 bits)
+//   bits  9..17   wrapY
+//   bits  0..8    wrapX
+//
+// A remove op clears a cell ONLY when the stored wraps match the removed
+// coordinate -- a mismatched remove targets a cell that was already
+// overwritten by an aliasing insert (counted, never guessed at). An insert
+// that lands on an occupied cell holding a DIFFERENT coordinate is an
+// ALIASING COLLISION: the old record just lost its mirror representation, so
+// its coordinate is appended to OrphanList for the CPU to move to its
+// residual (CPU-walked) set. Collisions require two live records 128 chunks
+// apart in some axis at the same slot -- possible only for unload-drain
+// stragglers under long fast flight -- and the orphan lane is exactly the
+// "decouple" answer: the mirror refuses to silently own what it cannot
+// represent.
+//
+// ---------------------------------------------------------------------------
+// PRECISION
+// ---------------------------------------------------------------------------
+// All distance math is float over ANCHOR-RELATIVE cell offsets (magnitudes
+// <= a ring diameter, ~1.3e6 UU worst case at level 5), against radii the CPU
+// computed in double and truncated once. Worst-case ulp at that magnitude is
+// ~0.125 UU against chunk edges of 320+ UU, so a float/double disagreement is
+// confined to candidates within epsilon of a radius. The CPU comparator
+// re-runs any mismatch in double and classifies it "boundary" -- the FAILING
+// reading is a mismatch that is NOT within epsilon of any boundary.
+//
+// ---------------------------------------------------------------------------
+// COUNTERS (RWStructuredBuffer<uint> Counters, one block per dispatch)
+// ---------------------------------------------------------------------------
+//  [0] admit proposals appended        [8] audit: occupied cells
+//  [1] evict proposals appended        [9] audit: xor-hash lo
+//  [2] resurrect proposals appended   [10] audit: xor-hash hi
+//  [3] cold footprints appended       [11] entry: candidate cells visited
+//  [4] orphans appended               [12] entry: cutoff-rejected candidates
+//  [5] feedback ops applied           [13] entry: z-items visited
+//  [6] feedback removes dropped       [14] overflow bits (1<<list, see below)
+//      (wrap mismatch)                [15] exit: tracked cells visited
+//  [7] insert aliasing collisions
+//
+// Overflow bits: 1=admit 2=evict 4=resurrect 8=cold 16=orphan. An overflowed
+// list is TRUNCATED, never wrapped; the CPU sees the bit and knows the delta
+// is a prefix. Dropped proposals are re-proposed next scan by construction
+// (they were not confirmed, so the mirror still shows them unhandled).
+
+#include "/Engine/Public/Platform.ush"
+
+// ---- dimensions -------------------------------------------------------------
+
+#define VOXRES_DIM_XY      128
+#define VOXRES_DIM_Z       128
+#define VOXRES_MASK        127
+#define VOXRES_WRAP_MASK   0x1FF
+#define VOXRES_CELLS_PER_LEVEL (VOXRES_DIM_XY * VOXRES_DIM_XY * VOXRES_DIM_Z)
+
+// Cell flag bits.
+#define VOXRES_CELL_OCCUPIED  0x80000000u
+#define VOXRES_CELL_PENDING   0x40000000u
+#define VOXRES_CELL_DEEP      0x20000000u
+
+// Feedback ops (entry dword 0, bits 0..2).
+#define VOXRES_OP_INSERT        1
+#define VOXRES_OP_REMOVE        2
+#define VOXRES_OP_MARK_PENDING  3
+#define VOXRES_OP_CLEAR_PENDING 4
+
+// Counter slots.
+#define VOXRES_CTR_ADMIT        0
+#define VOXRES_CTR_EVICT        1
+#define VOXRES_CTR_RESURRECT    2
+#define VOXRES_CTR_COLD         3
+#define VOXRES_CTR_ORPHAN       4
+#define VOXRES_CTR_FB_APPLIED   5
+#define VOXRES_CTR_FB_DROPPED   6
+#define VOXRES_CTR_COLLISION    7
+#define VOXRES_CTR_AUDIT_COUNT  8
+#define VOXRES_CTR_AUDIT_XOR_LO 9
+#define VOXRES_CTR_AUDIT_XOR_HI 10
+#define VOXRES_CTR_CAND_VISITED 11
+#define VOXRES_CTR_CUTOFF_REJ   12
+#define VOXRES_CTR_Z_VISITED    13
+#define VOXRES_CTR_OVERFLOW     14
+#define VOXRES_CTR_EXIT_VISITED 15
+
+// ---- shared resources -------------------------------------------------------
+
+RWStructuredBuffer<uint> ShadowGrid;   // NumLevels * VOXRES_CELLS_PER_LEVEL
+RWStructuredBuffer<uint2> ZRangeGrid;  // NumLevels * 128 * 128
+RWStructuredBuffer<uint> Counters;
+
+// Proposal lists. Entries are 4 dwords: [flagsAndLevel, X, Y, Z] with level in
+// bits 0..3 and flags above (bit 4 = deep, for evictions). Coordinates are
+// int32 reinterpreted as uint.
+RWStructuredBuffer<uint> AdmitList;
+RWStructuredBuffer<uint> EvictList;
+RWStructuredBuffer<uint> ResurrectList;
+RWStructuredBuffer<uint> ColdList;    // 4 dwords too, Z unused (footprint)
+RWStructuredBuffer<uint> OrphanList;
+
+uint NumLevels;
+uint AdmitCap;
+uint EvictCap;
+uint ResurrectCap;
+uint ColdCap;
+uint OrphanCap;
+
+// ---- per-level parameter arrays (filled on the game thread, by value) -------
+// Packed float4s so the parameter struct stays flat. See the manager for the
+// exact packing; unpack helpers below are the single source of truth here.
+
+float4 LevelRadiiA[8];   // x=ChunkEdgeUU y=OuterUUSq z=AdmitOuterUUSq w=InnerAdmitUUSq
+float4 LevelRadiiB[8];   // x=InnerEvictUUSq y=UnloadOuterUUSq z=VerticalKeepUU w=CutoffSortKeySq
+float4 LevelAnchorFrac[8]; // xyz = anchor - anchorChunk*edge (UU), w = BiasClampSq
+int4   LevelAnchorChunk[8]; // xyz = anchor chunk coord at this level, w = ChunkSpan
+uint   ScanLevelMask;    // which levels run the entry scan this dispatch
+uint   HierarchicalCoverage;
+uint   RingOverlapChunks;
+uint   UndergroundDisabledFlag; // 1 = -VoxelNoUnderground (skirt = 0 everywhere)
+float  SkirtNearFrac;    // band thresholds as fractions of OuterUU
+float  SkirtMidFrac;
+uint   SkirtChunksNearMidFar; // packed 10|10|10
+
+// ---- helpers ----------------------------------------------------------------
+
+uint CellIndex(uint Level, int3 C)
+{
+	const uint X = uint(C.x) & VOXRES_MASK;
+	const uint Y = uint(C.y) & VOXRES_MASK;
+	const uint Z = uint(C.z) & VOXRES_MASK;
+	return Level * VOXRES_CELLS_PER_LEVEL + (Z << 14) + (Y << 7) + X;
+}
+
+uint WrapTag(int V)
+{
+	return (uint(V) >> 7) & VOXRES_WRAP_MASK;
+}
+
+uint PackCell(int3 C, uint Flags)
+{
+	return Flags | (WrapTag(C.z) << 18) | (WrapTag(C.y) << 9) | WrapTag(C.x);
+}
+
+// Does this occupied cell name exactly coordinate C?
+bool CellMatches(uint Cell, int3 C)
+{
+	const uint Tags = (WrapTag(C.z) << 18) | (WrapTag(C.y) << 9) | WrapTag(C.x);
+	return (Cell & 0x07FFFFFFu) == Tags;
+}
+
+int SignExt16(uint V)
+{
+	return (int(V << 16)) >> 16;
+}
+
+// Reconstruct the full signed chunk coordinate from a cell's slot + wrap tags.
+int3 CellCoord(uint Cell, uint SlotIndexInLevel)
+{
+	const uint SX = SlotIndexInLevel & VOXRES_MASK;
+	const uint SY = (SlotIndexInLevel >> 7) & VOXRES_MASK;
+	const uint SZ = (SlotIndexInLevel >> 14) & VOXRES_MASK;
+	const uint WX = Cell & VOXRES_WRAP_MASK;
+	const uint WY = (Cell >> 9) & VOXRES_WRAP_MASK;
+	const uint WZ = (Cell >> 18) & VOXRES_WRAP_MASK;
+	return int3(SignExt16((WX << 7) | SX), SignExt16((WY << 7) | SY), SignExt16((WZ << 7) | SZ));
+}
+
+// The same two-lane key hash the CPU comparator uses. Any change here must
+// change VoxelResidencyGpu.cpp's HashKey in the same commit -- the audit gate
+// exists precisely to catch the day they drift.
+uint2 HashKey(uint Level, int3 C)
+{
+	const uint HX = uint(C.x) * 0x9E3779B1u;
+	const uint HY = uint(C.y) * 0x85EBCA77u;
+	const uint HZ = uint(C.z) * 0xC2B2AE3Du;
+	const uint HL = (Level + 1u) * 0x27D4EB2Fu;
+	uint Lo = HX ^ (HY << 3 | HY >> 29) ^ (HZ << 7 | HZ >> 25) ^ HL;
+	uint Hi = (HX << 11 | HX >> 21) ^ HY ^ (HZ << 17 | HZ >> 15) ^ (HL << 5 | HL >> 27);
+	return uint2(Lo, Hi);
+}
+
+bool AppendProposal(RWStructuredBuffer<uint> List, uint Cap, uint CounterSlot, uint OverflowBit,
+                    uint FlagsAndLevel, int3 C)
+{
+	uint Slot;
+	InterlockedAdd(Counters[CounterSlot], 1, Slot);
+	if (Slot >= Cap)
+	{
+		uint Ignored;
+		InterlockedOr(Counters[VOXRES_CTR_OVERFLOW], OverflowBit, Ignored);
+		return false;
+	}
+	const uint Base = Slot * 4;
+	List[Base + 0] = FlagsAndLevel;
+	List[Base + 1] = uint(C.x);
+	List[Base + 2] = uint(C.y);
+	List[Base + 3] = uint(C.z);
+	return true;
+}
+
+// ---- FeedbackCS -------------------------------------------------------------
+// Applies the game thread's confirmed mutations, IN ORDER, single-threaded.
+//
+// SINGLE-THREADED ON PURPOSE. Two ops in one batch can touch the same cell
+// (admit then truncate-drop of the same chunk between two recomputes), and
+// their order is the difference between an occupied and an empty mirror. A
+// parallel scatter has no order. The batch is a few thousand ops at recompute
+// cadence (~9 Hz in fast flight) and a one-off ~271k on resync; a single GPU
+// thread clears either in well under a millisecond of lane time. If this ever
+// shows up in a GPU profile, the fix is per-cell conflict partitioning, not
+// dropping the ordering rule.
+
+StructuredBuffer<uint> FeedbackOps; // 4 dwords per op: [op|level<<3|flags], X, Y, Z
+uint FeedbackOpCount;
+
+[numthreads(1, 1, 1)]
+void FeedbackCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (DTid.x != 0)
+	{
+		return;
+	}
+	for (uint I = 0; I < FeedbackOpCount; ++I)
+	{
+		const uint Base = I * 4;
+		const uint Head = FeedbackOps[Base + 0];
+		const uint Op = Head & 0x7u;
+		const uint Level = (Head >> 3) & 0xFu;
+		const uint Deep = (Head >> 7) & 0x1u;
+		const int3 C = int3(int(FeedbackOps[Base + 1]), int(FeedbackOps[Base + 2]), int(FeedbackOps[Base + 3]));
+		const uint Idx = CellIndex(Level, C);
+		const uint Cell = ShadowGrid[Idx];
+
+		if (Op == VOXRES_OP_INSERT)
+		{
+			if ((Cell & VOXRES_CELL_OCCUPIED) != 0 && !CellMatches(Cell, C))
+			{
+				// Aliasing collision: the resident coordinate this cell held is
+				// about to lose its mirror slot. Hand it to the CPU's residual
+				// set rather than silently forgetting it.
+				Counters[VOXRES_CTR_COLLISION] += 1;
+				const uint SlotInLevel = Idx - Level * VOXRES_CELLS_PER_LEVEL;
+				const int3 Old = CellCoord(Cell, SlotInLevel);
+				AppendProposal(OrphanList, OrphanCap, VOXRES_CTR_ORPHAN, 16u,
+				               Level | ((Cell & VOXRES_CELL_DEEP) != 0 ? 0x10u : 0u), Old);
+			}
+			ShadowGrid[Idx] = PackCell(C, VOXRES_CELL_OCCUPIED | (Deep != 0 ? VOXRES_CELL_DEEP : 0u));
+			Counters[VOXRES_CTR_FB_APPLIED] += 1;
+		}
+		else if (Op == VOXRES_OP_REMOVE)
+		{
+			if ((Cell & VOXRES_CELL_OCCUPIED) != 0 && CellMatches(Cell, C))
+			{
+				ShadowGrid[Idx] = 0;
+				Counters[VOXRES_CTR_FB_APPLIED] += 1;
+			}
+			else
+			{
+				// The cell was overwritten by an aliasing insert (its old
+				// occupant already went out through OrphanList) or never
+				// inserted (resync races). Dropped and counted, never guessed.
+				Counters[VOXRES_CTR_FB_DROPPED] += 1;
+			}
+		}
+		else if (Op == VOXRES_OP_MARK_PENDING || Op == VOXRES_OP_CLEAR_PENDING)
+		{
+			if ((Cell & VOXRES_CELL_OCCUPIED) != 0 && CellMatches(Cell, C))
+			{
+				ShadowGrid[Idx] = (Op == VOXRES_OP_MARK_PENDING) ? (Cell | VOXRES_CELL_PENDING)
+				                                                 : (Cell & ~VOXRES_CELL_PENDING);
+				Counters[VOXRES_CTR_FB_APPLIED] += 1;
+			}
+			else
+			{
+				Counters[VOXRES_CTR_FB_DROPPED] += 1;
+			}
+		}
+	}
+}
+
+// ---- ZRangeCS ---------------------------------------------------------------
+// Scatters footprint Z-range texels. Entries are pre-deduplicated on the CPU
+// (one entry per texel per batch), so a parallel scatter is order-free.
+//
+// Texel: x = occupied(1)<<31 | wrapY(9)<<9 | wrapX(9)   y = zmin16 | zmax16<<16
+// The Z range mirrors FootprintChunkZRangeCached's memo EXACTLY -- the
+// pre-skirt ZMin and the TRIMMED ZMax. The skirt is anchor-dependent and is
+// applied by EntryScanCS below, same as the CPU applies it outside the memo.
+
+StructuredBuffer<uint> ZRangeOps; // 4 dwords: [level], X, Y, [zmin16|zmax16<<16]
+uint ZRangeOpCount;
+
+[numthreads(64, 1, 1)]
+void ZRangeCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (DTid.x >= ZRangeOpCount)
+	{
+		return;
+	}
+	const uint Base = DTid.x * 4;
+	const uint Level = ZRangeOps[Base + 0];
+	const int X = int(ZRangeOps[Base + 1]);
+	const int Y = int(ZRangeOps[Base + 2]);
+	const uint Packed = ZRangeOps[Base + 3];
+	const uint Idx = Level * (VOXRES_DIM_XY * VOXRES_DIM_XY) +
+	                 ((uint(Y) & VOXRES_MASK) << 7) + (uint(X) & VOXRES_MASK);
+	ZRangeGrid[Idx] = uint2(0x80000000u | (WrapTag(Y) << 9) | WrapTag(X), Packed);
+}
+
+// ---- ExitScanCS -------------------------------------------------------------
+// The eviction walk: one thread per shadow cell, every level, pure geometry.
+// Mirrors RecomputeDesiredSet's exit pass condition for condition:
+//   bBeyondOuter   DistSqXY > UnloadOuterUUSq[L]
+//   bInsideInner   L > 0 && DistSqXY < InnerEvictUUSq[L] && !HierarchicalCoverage
+//   bBeyondVertical  deep-flagged && |centerZ - anchorZ| > VerticalKeepUU[L]
+// Pending-unload cells are skipped exactly as the CPU's PendingUnloadSet
+// check skips them. Retention/stand-in bookkeeping is NOT here: that is
+// adjudication, done by the CPU per accepted proposal, O(delta).
+
+[numthreads(8, 8, 8)]
+void ExitScanCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint Level = DTid.z / VOXRES_DIM_Z;
+	if (Level >= NumLevels)
+	{
+		return;
+	}
+	const uint LZ = DTid.z - Level * VOXRES_DIM_Z;
+	const uint SlotInLevel = (LZ << 14) + (DTid.y << 7) + DTid.x;
+	const uint Idx = Level * VOXRES_CELLS_PER_LEVEL + SlotInLevel;
+	const uint Cell = ShadowGrid[Idx];
+	if ((Cell & VOXRES_CELL_OCCUPIED) == 0 || (Cell & VOXRES_CELL_PENDING) != 0)
+	{
+		return;
+	}
+	uint IgnoredV;
+	InterlockedAdd(Counters[VOXRES_CTR_EXIT_VISITED], 1, IgnoredV);
+
+	const int3 C = CellCoord(Cell, SlotInLevel);
+	const float Edge = LevelRadiiA[Level].x;
+	const int3 Rel = C - LevelAnchorChunk[Level].xyz;
+	const float CX = (float(Rel.x) + 0.5f) * Edge - LevelAnchorFrac[Level].x;
+	const float CY = (float(Rel.y) + 0.5f) * Edge - LevelAnchorFrac[Level].y;
+	const float DistSq = CX * CX + CY * CY;
+
+	const bool bBeyondOuter = DistSq > LevelRadiiB[Level].y;
+	const bool bInsideInner = Level > 0 && DistSq < LevelRadiiB[Level].x && HierarchicalCoverage == 0;
+	bool bBeyondVertical = false;
+	if ((Cell & VOXRES_CELL_DEEP) != 0)
+	{
+		const float CZ = (float(Rel.z) + 0.5f) * Edge - LevelAnchorFrac[Level].z;
+		bBeyondVertical = abs(CZ) > LevelRadiiB[Level].z;
+	}
+	if (bBeyondOuter || bInsideInner || bBeyondVertical)
+	{
+		const uint Flags = Level | ((Cell & VOXRES_CELL_DEEP) != 0 ? 0x10u : 0u) |
+		                   (bInsideInner ? 0x20u : 0u) | (bBeyondOuter ? 0x40u : 0u);
+		AppendProposal(EvictList, EvictCap, VOXRES_CTR_EVICT, 2u, Flags, C);
+	}
+}
+
+// ---- EntryScanCS ------------------------------------------------------------
+// The admission walk for ONE level (LevelIndex), over the annulus bounding
+// box, mirroring the CPU's XY tests in order: inner-pad skip, outer edge with
+// the seam-parent exception (or the overlap band), then the Z loop against
+// the texel range with the skirt applied. Tracked cells are subtracted by the
+// shadow; pending-unload cells become RESURRECT proposals (the CPU's
+// resurrection branch). A footprint with no valid texel is emitted on the
+// COLD lane -- the CPU computes its Z range (the amplifier is CPU-only),
+// enumerates that one footprint itself, and uploads the texel so the next
+// scan owns it. Cold is the fallback lane, and it must SHRINK over a leg;
+// growing cold with warm texels is a failing reading.
+
+uint LevelIndex;
+
+[numthreads(8, 8, 1)]
+void EntryScanCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint L = LevelIndex;
+	const int Span = LevelAnchorChunk[L].w;
+	const int BoxEdge = 2 * Span + 1;
+	if (int(DTid.x) >= BoxEdge || int(DTid.y) >= BoxEdge)
+	{
+		return;
+	}
+	const int RelX = int(DTid.x) - Span;
+	const int RelY = int(DTid.y) - Span;
+	const int Cx = LevelAnchorChunk[L].x + RelX;
+	const int Cy = LevelAnchorChunk[L].y + RelY;
+
+	const float Edge = LevelRadiiA[L].x;
+	const float CX = (float(RelX) + 0.5f) * Edge - LevelAnchorFrac[L].x;
+	const float CY = (float(RelY) + 0.5f) * Edge - LevelAnchorFrac[L].y;
+	const float DistSq = CX * CX + CY * CY;
+
+	// Inner edge, padded (skip: a finer ring owns this footprint entirely).
+	if (L > 0 && DistSq < LevelRadiiA[L].w && HierarchicalCoverage == 0)
+	{
+		return;
+	}
+	// Outer edge with the seam-parent exception -- the CPU's test verbatim.
+	if (DistSq >= LevelRadiiA[L].y)
+	{
+		if (DistSq >= LevelRadiiA[L].z || L + 1 >= NumLevels)
+		{
+			return; // too far to be a seam case, or no coarser ring exists
+		}
+		if (RingOverlapChunks == 0)
+		{
+			const float ParentEdge = Edge * 2.0f;
+			// Parent lattice: index Cx>>1 (floor for negatives). Its centre,
+			// anchor-relative, via the parent's own anchor chunk at L+1.
+			const int PRelX = (Cx >> 1) - LevelAnchorChunk[L + 1].x;
+			const int PRelY = (Cy >> 1) - LevelAnchorChunk[L + 1].y;
+			const float PX = (float(PRelX) + 0.5f) * ParentEdge - LevelAnchorFrac[L + 1].x;
+			const float PY = (float(PRelY) + 0.5f) * ParentEdge - LevelAnchorFrac[L + 1].y;
+			if (PX * PX + PY * PY >= LevelRadiiA[L].y)
+			{
+				return; // parent admitted over this ground; redundant
+			}
+		}
+	}
+
+	uint IgnoredC;
+	InterlockedAdd(Counters[VOXRES_CTR_CAND_VISITED], 1, IgnoredC);
+
+	// Z range from the texel mirror; cold if absent or aliased.
+	const uint TexIdx = L * (VOXRES_DIM_XY * VOXRES_DIM_XY) +
+	                    ((uint(Cy) & VOXRES_MASK) << 7) + (uint(Cx) & VOXRES_MASK);
+	const uint2 Tex = ZRangeGrid[TexIdx];
+	const uint WantTags = (WrapTag(Cy) << 9) | WrapTag(Cx);
+	if ((Tex.x & 0x80000000u) == 0 || (Tex.x & 0x3FFFFu) != WantTags)
+	{
+		AppendProposal(ColdList, ColdCap, VOXRES_CTR_COLD, 8u, L, int3(Cx, Cy, 0));
+		return;
+	}
+	int ZMin = SignExt16(Tex.y & 0xFFFFu);
+	const int ZMax = SignExt16(Tex.y >> 16);
+
+	// Depth skirt: band by XY distance against this level's outer radius,
+	// mirroring VoxelUnderground::SkirtDepthChunks.
+	if (UndergroundDisabledFlag == 0)
+	{
+		const float OuterSq = LevelRadiiA[L].y;
+		uint Skirt;
+		if (DistSq < OuterSq * SkirtNearFrac * SkirtNearFrac)
+		{
+			Skirt = SkirtChunksNearMidFar & 0x3FFu;
+		}
+		else if (DistSq < OuterSq * SkirtMidFrac * SkirtMidFrac)
+		{
+			Skirt = (SkirtChunksNearMidFar >> 10) & 0x3FFu;
+		}
+		else
+		{
+			Skirt = (SkirtChunksNearMidFar >> 20) & 0x3FFu;
+		}
+		ZMin -= int(Skirt);
+	}
+
+	// The bias clamp (identity unless hierarchical coverage), then the ring's
+	// own admission cutoff -- both against the same squared key the CPU uses.
+	for (int Cz = ZMin; Cz <= ZMax; ++Cz)
+	{
+		uint IgnoredZ;
+		InterlockedAdd(Counters[VOXRES_CTR_Z_VISITED], 1, IgnoredZ);
+
+		const int3 C = int3(Cx, Cy, Cz);
+		const uint Cell = ShadowGrid[CellIndex(L, C)];
+		if ((Cell & VOXRES_CELL_OCCUPIED) != 0 && CellMatches(Cell, C))
+		{
+			if ((Cell & VOXRES_CELL_PENDING) != 0)
+			{
+				// Tracked but queued for unload and desired again: the CPU's
+				// resurrection branch, proposed rather than assumed.
+				AppendProposal(ResurrectList, ResurrectCap, VOXRES_CTR_RESURRECT, 4u, L, C);
+			}
+			continue; // already tracked -- the subtraction that makes the delta a delta
+		}
+
+		const float CZ = (float(Cz) - float(LevelAnchorChunk[L].z) + 0.5f) * Edge - LevelAnchorFrac[L].z;
+		const float DistSq3D = DistSq + CZ * CZ;
+		float SortKeySq = DistSq3D;
+		if (L > 0 && HierarchicalCoverage != 0)
+		{
+			SortKeySq = max(SortKeySq, LevelAnchorFrac[L].w); // BiasClampSq
+		}
+		if (SortKeySq >= LevelRadiiB[L].w) // CutoffSortKeySq
+		{
+			uint IgnoredR;
+			InterlockedAdd(Counters[VOXRES_CTR_CUTOFF_REJ], 1, IgnoredR);
+			continue;
+		}
+		AppendProposal(AdmitList, AdmitCap, VOXRES_CTR_ADMIT, 1u, L, C);
+	}
+}
+
+// ---- AuditCS ----------------------------------------------------------------
+// XOR-reduces every occupied cell's key hash plus a population count, so the
+// mirror can be held against the CPU's incrementally-maintained pair. This is
+// the gate that can fail IN BOTH DIRECTIONS: a mirror missing records lowers
+// the count, a mirror inventing them raises it, and either flips the xor.
+// (Cells orphaned by aliasing are on the CPU's residual ledger and are
+// excluded there, not here.)
+
+groupshared uint GXorLo[64];
+groupshared uint GXorHi[64];
+groupshared uint GCount[64];
+
+// Dispatched 2D (X fixed at 256 groups) because the cell count / 64 exceeds
+// the 65,535 groups-per-dimension limit in one dimension.
+#define VOXRES_AUDIT_X_THREADS (256 * 64)
+
+[numthreads(64, 1, 1)]
+void AuditCS(uint3 DTid : SV_DispatchThreadID, uint GI : SV_GroupIndex)
+{
+	uint Lo = 0, Hi = 0, N = 0;
+	const uint Linear = DTid.y * VOXRES_AUDIT_X_THREADS + DTid.x;
+	const uint Total = NumLevels * VOXRES_CELLS_PER_LEVEL;
+	if (Linear < Total)
+	{
+		const uint Cell = ShadowGrid[Linear];
+		if ((Cell & VOXRES_CELL_OCCUPIED) != 0)
+		{
+			const uint Level = Linear / VOXRES_CELLS_PER_LEVEL;
+			const uint SlotInLevel = Linear - Level * VOXRES_CELLS_PER_LEVEL;
+			const uint2 H = HashKey(Level, CellCoord(Cell, SlotInLevel));
+			Lo = H.x;
+			Hi = H.y;
+			N = 1;
+		}
+	}
+	GXorLo[GI] = Lo;
+	GXorHi[GI] = Hi;
+	GCount[GI] = N;
+	GroupMemoryBarrierWithGroupSync();
+	for (uint Stride = 32; Stride > 0; Stride >>= 1)
+	{
+		if (GI < Stride)
+		{
+			GXorLo[GI] ^= GXorLo[GI + Stride];
+			GXorHi[GI] ^= GXorHi[GI + Stride];
+			GCount[GI] += GCount[GI + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (GI == 0)
+	{
+		uint Ignored;
+		InterlockedXor(Counters[VOXRES_CTR_AUDIT_XOR_LO], GXorLo[0], Ignored);
+		InterlockedXor(Counters[VOXRES_CTR_AUDIT_XOR_HI], GXorHi[0], Ignored);
+		InterlockedAdd(Counters[VOXRES_CTR_AUDIT_COUNT], GCount[0], Ignored);
+	}
+}

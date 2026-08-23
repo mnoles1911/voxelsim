@@ -13,6 +13,7 @@
 #include "VoxelBrickCpuPackFromCore.h" // Phase 6: the ONE vxc::ChunkBrickPack -> FVoxelBrickCpuPack copy, shared with the cover producer
 #include "VoxelMarchRenderer.h"    // VoxelMarchPublishStreamingState -- the marcher's convergence signal
 #include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
+#include "VoxelResidencyGpu.h"     // T4-2: GPU-resident residency shadow (docs/gpu-residency-t42-plan.md)
 #include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
@@ -10802,6 +10803,11 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 		OutChunkZMin = Hit->ChunkZMin;
 		OutChunkZMax = Hit->ChunkZMax;
 		OutChunkZMaxUntrimmed = Hit->ChunkZMaxUntrimmed;
+		// T4-2 shadow: mirror the memo into the GPU Z-range texels (the
+		// manager dedups, so a hit is normally a no-op). Only MEMOIZED values
+		// are mirrored -- the non-resident fallback below deliberately never
+		// reaches a Note, for the memo's own resident-tiles reason.
+		FVoxelResidencyGpu::Get().NoteFootprintZRange(Level, ChunkX, ChunkY, OutChunkZMin, OutChunkZMax);
 		return;
 	}
 	ComputeFootprintChunkZRange(ChunkX, ChunkY, Level, OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed);
@@ -10851,6 +10857,8 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 		}
 	}
 	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed});
+	// T4-2 shadow: same rule as the memo add above it rides on.
+	FVoxelResidencyGpu::Get().NoteFootprintZRange(Level, ChunkX, ChunkY, OutChunkZMin, OutChunkZMax);
 }
 
 // Phase 2 shared column-grid cache: the residency question for one footprint's
@@ -11681,6 +11689,100 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		}
 	}
 
+	// --- T4-2 GPU-resident residency, SHADOW dispatch (2026-08-23) ----------
+	//
+	// Mode 0 (no -VoxelGpuResidency): one latched-int check and nothing else
+	// -- both CPU walks below run untouched, the control arm's behaviour.
+	// Mode 1: mirror both walks as a compute pass and dispatch it HERE,
+	// before either CPU walk runs, so the pass predicts exactly the decisions
+	// this call is about to make; the Note* calls at the mutation sites both
+	// feed the GPU mirror and double as the decision ledger the comparator
+	// holds it against. Every knob is captured by value into the params
+	// struct (the same rule VoxelBrickCpuArm applies to its gates), and the
+	// manager never reads streaming state itself -- adjudication of anything
+	// the GPU proposes stays on this thread, which keeps the fine-tile
+	// residency rule (game-thread-only) intact by construction rather than by
+	// discipline. Placed after the cutoff relaxation so the captured cutoffs
+	// are the ones this call's own entry scans will use.
+	// docs/gpu-residency-t42-plan.md is the design note.
+	if (FVoxelResidencyGpu::Get().GetMode() >= 1)
+	{
+		if (FVoxelResidencyGpu::Get().NeedsResync())
+		{
+			// Replay the whole tracked set through the same feedback lane the
+			// steady state uses. O(records), but only on enable and after a
+			// detected drift -- and it makes "the mirror equals ChunkRecords"
+			// an invariant with exactly one producer instead of two.
+			FVoxelResidencyGpu::Get().BeginResyncReplay();
+			for (const auto& RecordPair : ChunkRecords)
+			{
+				FVoxelResidencyGpu::Get().NoteRecordAdded(
+					RecordPair.Key.Level,
+					FIntVector(RecordPair.Key.Key.X, RecordPair.Key.Key.Y, RecordPair.Key.Key.Z),
+					RecordPair.Value.bDeepAnchorRelative);
+			}
+			for (const FVoxelLevelChunkKey& PendingKey : PendingUnloadSet)
+			{
+				FVoxelResidencyGpu::Get().NoteUnloadQueued(
+					PendingKey.Level,
+					FIntVector(PendingKey.Key.X, PendingKey.Key.Y, PendingKey.Key.Z),
+					/*bDeep -- unknown here, only used by the comparator*/ false);
+			}
+			FVoxelResidencyGpu::Get().EndResyncReplay();
+		}
+		FVoxelResidencyDispatchParams GpuResidParams;
+		GpuResidParams.Anchor = Anchor;
+		GpuResidParams.NumLevels = VoxelCoords::kNumLevels;
+		GpuResidParams.MaxRingLevel = UVoxelWorldSubsystem::GetMaxRingLevel();
+		GpuResidParams.bHierarchicalCoverage = VoxelStreamAdmission::HierarchicalCoverageEnabled();
+		GpuResidParams.RingOverlapChunks = UVoxelWorldSubsystem::GetRingOverlapChunks();
+		GpuResidParams.bAnchorUnderground = bAnchorUnderground;
+		GpuResidParams.bUndergroundDisabled = VoxelUnderground::UndergroundDisabled();
+		GpuResidParams.SkirtNearFrac = VoxelUnderground::NearFrac;
+		GpuResidParams.SkirtMidFrac = VoxelUnderground::MidFrac;
+		GpuResidParams.SkirtChunksNear = VoxelUnderground::SkirtChunksNear;
+		GpuResidParams.SkirtChunksMid = VoxelUnderground::SkirtChunksMid;
+		GpuResidParams.SkirtChunksFar = VoxelUnderground::SkirtChunksFar;
+		int32 GpuResidScratchBoxRadius = 0;
+		for (int32 ResidLevel = 0; ResidLevel < VoxelCoords::kNumLevels && ResidLevel < 8; ++ResidLevel)
+		{
+			FVoxelResidencyLevelParams& LP = GpuResidParams.Levels[ResidLevel];
+			const UVoxelWorldSubsystem::FRingPreset& ResidPreset =
+				UVoxelWorldSubsystem::GetRingPresets()[ResidLevel];
+			LP.ChunkEdgeUU = ChunkEdgeUUForLevel(ResidLevel);
+			LP.OuterUU = ResidPreset.OuterMeters * 100.0;
+			// Same derivations, in the same order, as the entry scan below --
+			// including the half-diagonal/overlap Max the seam-coverage fix
+			// established. A divergence here reads as adMISS in the compare,
+			// never as a streaming change.
+			const double ResidHalfDiag = LP.ChunkEdgeUU * 0.70710678118654752440;
+			const double ResidOverlapUU = double(GpuResidParams.RingOverlapChunks) * LP.ChunkEdgeUU;
+			LP.AdmitOuterUU = LP.OuterUU + FMath::Max(ResidHalfDiag, ResidOverlapUU);
+			LP.InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(ResidLevel);
+			LP.InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(ResidLevel);
+			LP.UnloadOuterUU = LP.OuterUU * UVoxelWorldSubsystem::UnloadRingMultiplier;
+			LP.VerticalKeepUU = VoxelUnderground::VerticalKeepUU(ResidLevel, LP.ChunkEdgeUU);
+			LP.CutoffSortKeySq = LevelAdmissionCutoffDistSq[ResidLevel];
+			const FVoxelCoord ResidAnchorVoxel = WorldToVoxelForLevel(Anchor, ResidLevel);
+			const FVoxelChunkKey ResidAnchorChunk = ChunkKeyForVoxel(ResidAnchorVoxel);
+			LP.AnchorChunk = FIntVector(ResidAnchorChunk.X, ResidAnchorChunk.Y, ResidAnchorChunk.Z);
+			LP.ChunkSpan = FMath::CeilToInt32(LP.AdmitOuterUU / LP.ChunkEdgeUU) + 1;
+			// The entry-scan gate, PREDICTED with the same comparisons the
+			// scan below applies (it updates the Last* state; this only reads
+			// it, so prediction and truth cannot interleave).
+			const bool bResidZMatters =
+				bAnchorUnderground &&
+				VoxelUnderground::BoxRadiusChunks(ResidLevel, 0.0, GpuResidScratchBoxRadius);
+			LP.bScanThisDispatch =
+				ResidLevel <= GpuResidParams.MaxRingLevel &&
+				!(bHasRecomputedLevel[ResidLevel] &&
+				  ResidAnchorChunk.X == LastAnchorChunkPerLevel[ResidLevel].X &&
+				  ResidAnchorChunk.Y == LastAnchorChunkPerLevel[ResidLevel].Y &&
+				  (!bResidZMatters || ResidAnchorChunk.Z == LastAnchorChunkPerLevel[ResidLevel].Z));
+		}
+		FVoxelResidencyGpu::Get().OnRecomputeBegin(GpuResidParams);
+	}
+
 	// 1. Hysteresis exit: currently-tracked chunks (any level) that drifted
 	// beyond their level's unload ring, OR drifted inside their level's inner
 	// edge (the next finer level has taken over), get queued for unload.
@@ -11897,6 +11999,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			PendingUnloadKeys.Add(LevelKey);
 			PendingUnloadSet.Add(LevelKey);
 			EvictedThisCall.Add(LevelKey);
+			// T4-2 shadow: eviction decision + pending mark. No-op in mode 0.
+			FVoxelResidencyGpu::Get().NoteUnloadQueued(
+				LevelKey.Level, FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
+				Rec.bDeepAnchorRelative);
 		}
 	};
 	// Latched in a static, not read per call: -ExecCmds cvars land after
@@ -12582,6 +12688,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 							Existing->RetainReplaceDir = RetainDir_None;
 							Existing->RetainUntilSeconds = 0.0;
 							++ResurrectionsSinceLog;
+							// T4-2 shadow: resurrection decision + pending clear.
+							FVoxelResidencyGpu::Get().NoteUnloadCancelled(
+								LevelKey.Level,
+								FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z));
 						}
 						return;
 					}
@@ -12635,6 +12745,15 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						else
 						{
 							VoxelStreaming::FChunkRecord& Adopted = ChunkRecords.Add(LevelKey);
+							// T4-2 shadow: an adoption IS an admission decision
+							// (the GPU proposes it as a plain admit -- parked
+							// chunks have no record, so their cell is
+							// untracked; routing it to the park is the CPU
+							// adjudicator's business).
+							FVoxelResidencyGpu::Get().NoteRecordAdded(
+								LevelKey.Level,
+								FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
+								bDeepAnchorRelative);
 							Adopted.PoolSlot = Parked->PoolHandle;
 							Adopted.GenerationId = Parked->GenerationId;
 							Adopted.LastQuadCount = Parked->QuadCount;
@@ -12840,6 +12959,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 
 					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
+					// T4-2 shadow: THE admission, mirrored + ledgered. No-op in mode 0.
+					FVoxelResidencyGpu::Get().NoteRecordAdded(
+						LevelKey.Level,
+						FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
+						bDeepAnchorRelative);
 					++RecordsAddedSinceLog;
 					++LevelRecordsAdded[QueueLevel];
 					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
@@ -13075,6 +13199,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// call takes back. No-op when nothing was marked (the overwhelmingly
 	// common case, and every case while disarmed).
 	GetGlobalVoxelMarchChunkIndex().FlushAbsentMarks();
+	// T4-2 shadow: close this recompute's decision ledger (and drain any
+	// arrived deltas through the comparator). No-op in mode 0.
+	FVoxelResidencyGpu::Get().OnRecomputeEnd();
 	++RecomputeCalls;
 }
 
@@ -13119,6 +13246,15 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 				// Phase 3 hook 3 of 4 (bounded admission drops a queued record
 				// that never meshed). No-op unless the switch is on.
 				EvictionIndex.Remove(Entry.Key);
+				// T4-2 shadow: truncation drop -- pure mirror feedback, not an
+				// eviction decision (the GPU does not model the record cap).
+				// BOTH hooks belong here and neither replaces the other: the
+				// eviction index tracks what the exit scan must examine, the shadow
+				// mirror tracks what the GPU believes is tracked. A future edit that
+				// moves this removal must carry BOTH with it.
+				FVoxelResidencyGpu::Get().NoteRecordRemoved(
+					Entry.Key.Level,
+					FIntVector(Entry.Key.Key.X, Entry.Key.Key.Y, Entry.Key.Key.Z));
 				// Un-admission (voxel.March.HoleStats 2): this chunk never
 				// generated and is no longer wanted, so a still-standing
 				// "pending" annotation would charge future misses here to
@@ -18576,6 +18712,11 @@ void FVoxelWorldImpl::DrainUnloads()
 		// would have quietly moved the exit scan's cost into DrainUnloads
 		// instead of removing it. No-op unless the switch is on.
 		EvictionIndex.Remove(Key);
+		// T4-2 shadow: the record's death, the cell's clear. No-op in mode 0.
+		// Both hooks, deliberately: see the matching pair in the truncation drop
+		// above. This is the hot site for BOTH -- keep both O(1).
+		FVoxelResidencyGpu::Get().NoteRecordRemoved(
+			Key.Level, FIntVector(Key.Key.X, Key.Key.Y, Key.Key.Z));
 		// voxel.March.HoleStats 2: a record unloaded BEFORE it ever produced
 		// bricks leaves no pool removal behind, so nothing would ever clear
 		// its "pending" annotation -- do it here. For a chunk that WAS
@@ -20755,6 +20896,10 @@ void UVoxelWorldSubsystem::Deinitialize()
 
 		Index.Detach();
 		Pool.Reset();
+		// T4-2 shadow: same PIE-restart bug class as the two lines above --
+		// a mirror surviving into the next session would double-count every
+		// record. Drops buffers and ledgers; next enable resyncs.
+		FVoxelResidencyGpu::Get().Reset();
 
 		// AND THE VIEW EXTENSION, which is the same bug a third time and the
 		// one that actually cost the owner three test sessions.

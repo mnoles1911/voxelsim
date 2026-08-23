@@ -26,6 +26,56 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0i The uncovered level+reason instrument FAILS BOTH HALVES — do not quote it
+
+Measured 2026-08-23 from three headless captures at 120 m / 400 m / 1200 m
+(`tools/voxel-zcutoff-ladder.ps1`), read with `tools/read-holes.sh`. This is the
+instrument the streaming plan leaned on to say whether remaining gaps are
+throughput, coverage or eviction. It cannot answer that yet.
+
+**Half one — `byLevel` is stuck at L0.** Every window of every rung reads
+`byLevel L0=<everything> L1=0 L2=0 L3=0 L4=0 L5=0`. That is the same failure the
+earlier `-VoxelMaxRingLevel=0` certification found, and it reproduces at three
+altitudes, so it is not a property of one pose. A histogram that only ever names
+one level cannot attribute a hole to a ring.
+
+**Half two — `byReason` collapses to `unattrib=100%` once the world settles.**
+The progression is consistent across rungs: early windows read `never=100%`
+(honest), then `never` and `unattrib` trade off, then `never=0` and
+`unattrib=100%` for the entire remaining steady state.
+
+**The mechanism is visible in the same line.** `annotWrites pending` climbs
+normally (72,678 -> 290,332 on the 120 m rung) and then FREEZES at 290,332 —
+and the freeze coincides exactly with `unattrib` reaching 100%. The annotation
+writer stops writing, the reason bits go stale, and every ray lands in
+"unattributed". So the reason split is only alive while annotations are still
+being produced.
+
+The instrument's own doc comment states the reading rule and it is worth quoting
+because it makes this unambiguous:
+
+    unattrib -- indicts the INSTRUMENT (stale resident records, uncaptured
+    rays); large values mean fix the meter, not the streaming.
+
+By its own rule, a steady-state reading from this instrument indicts itself.
+
+**CONSEQUENCES:**
+  * Do not use `byLevel` or `byReason` as evidence for any streaming decision
+    until both are fixed. Screenshots outrank them, per the standing rule.
+  * `uncovered` was ALREADY flagged untrustworthy (it rose while the owner
+    watched holes disappear). Phase 0 of the streaming plan expected this
+    instrument to restore it. It does not.
+  * The one thing that IS sound is the identity `attributed == uncovered` with
+    `sum(byLevel) == sum(byReason)` — it holds in every window, including the
+    all-unattrib ones. So the capture side is fine; it is the ANNOTATION side
+    that dies.
+
+**Where to look first:** why `annotWrites` stops. Candidates in order of
+cheapness — the writer being disarmed by a mode the settled world enters, a
+one-shot arm that is never re-armed after the first drain, or the annotation
+buffer filling and silently refusing further writes. The freeze at a round-ish
+stable number across many windows favours the last two.
+
 ### 0.0h The 10,814 gate leaks are a lake-sheet STARTUP-ORDER bug, not streaming — plus a live capture landmine
 
 REWRITTEN TWICE on 2026-08-23, and both wrong versions are recorded here because
