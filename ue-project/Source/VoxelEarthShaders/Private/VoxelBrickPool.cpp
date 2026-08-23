@@ -624,8 +624,60 @@ namespace VoxelBrickPoolDetail
 		// Dwords this readback actually copied (>= kGpuAllocCounterReadDwords;
 		// see that constant for why it stopped being the whole truth).
 		uint32 ReadDwords = kGpuAllocCounterReadDwords;
+		// Monotonic enqueue order, for the wrap-safe accumulation below: two
+		// readbacks can land in the same poll and the RemoveAtSwap walk visits
+		// them newest-first, so without this an older snapshot would read as a
+		// backwards step and the modular delta would add ~2^32.
+		uint64 Seq = 0;
 	};
 	TArray<FPendingAllocCounters> GPendingAllocCounters;
+	uint64 GAllocCounterSeqNext = 1;
+	uint64 GAllocCounterSeqLanded = 0;
+
+	// --- wrap-safe accumulation of the cumulative GPU counters --------------
+	//
+	// The state buffer's counters are uint32 because InterlockedAdd is, and
+	// most were safe forever at 2,805 chunks/s. AT THE 50,000/s TARGET THEY
+	// ARE NOT: the padded/actual DWORD accumulators grow ~38.4M dwords/s
+	// (claims x ~768 padded dwords) and wrap 2^32 in ~112 SECONDS -- after
+	// which the window line's padding figure is computed from two wrapped
+	// numbers and lies with total confidence. (At today's rate the same wrap
+	// arrives at ~2.5 h, so long soak legs were already exposed.) The GPU side
+	// stays uint32; the CPU harvest reconstructs the true 64-bit totals from
+	// MODULAR DELTAS -- uint32(New - LastRaw) is exact across any number of
+	// wraps as long as one 5 s window grows less than 2^32, and the worst
+	// window at 50k/s is ~192M dwords, 22x under the limit.
+	//
+	// Only MONOTONIC counters are listed: the bump cursors (0/1) and inFlight
+	// (11/12) legitimately go DOWN (give-backs, frees), so a modular delta
+	// would misread a decrease as a near-2^32 increase; they are bounded by
+	// arena size and stay raw. The stack peaks (17/18) are bounded by
+	// FreeStackCap and stay raw. Histogram buckets wrap only past 2^32 claims
+	// into ONE bucket (~24 h of 50k/s all-identical chunks) and are read raw.
+	constexpr int32 kGpuAllocMonotonicCtrs[] = {
+		kGpuAllocCtrClaims, kGpuAllocCtrStackPops,
+		kGpuAllocCtrClaimFailOcc, kGpuAllocCtrClaimFailMat, kGpuAllocCtrClaimFailWorst,
+		kGpuAllocCtrBitmapCollision, kGpuAllocCtrFrees,
+		kGpuAllocCtrFreePushOverflow, kGpuAllocCtrFreeBitmapMissing,
+		kGpuAllocCtrOccPaddedCum, kGpuAllocCtrOccActualCum,
+		kGpuAllocCtrMatPaddedCum, kGpuAllocCtrMatActualCum,
+	};
+	uint32 GAllocCtrLastRaw[UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs)] = {};
+	int64 GAllocCtrAccum[UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs)] = {};
+	// The accumulated (wrap-corrected) value for one counter index, after the
+	// current readback has been folded in. Linear scan of 13 -- not worth a map.
+	int64 AllocAccumOf(int32 CtrIndex)
+	{
+		for (int32 I = 0; I < UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs); ++I)
+		{
+			if (kGpuAllocMonotonicCtrs[I] == CtrIndex)
+			{
+				return GAllocCtrAccum[I];
+			}
+		}
+		checkNoEntry();
+		return 0;
+	}
 
 	void PollGpuAllocReadbacks_RenderThread()
 	{
@@ -693,12 +745,33 @@ namespace VoxelBrickPoolDetail
 				Pending.Readback->Unlock();
 			}
 			const uint32* C = CArr.GetData();
+			// Out-of-order landing: a snapshot older than one already folded
+			// in is DROPPED whole. Folding it would run the modular deltas
+			// backwards (+~2^32 each), and publishing it would put stale
+			// values over fresh ones. Nothing is lost -- the counters are
+			// cumulative, so the next in-order snapshot carries everything
+			// this one did.
+			if (Pending.Seq <= GAllocCounterSeqLanded)
+			{
+				delete Pending.Readback;
+				GPendingAllocCounters.RemoveAtSwap(I, EAllowShrinking::No);
+				continue;
+			}
+			GAllocCounterSeqLanded = Pending.Seq;
+			// Fold the raw uint32 counters into the 64-bit accumulators
+			// (wrap-safe modular deltas -- see kGpuAllocMonotonicCtrs).
+			for (int32 M = 0; M < UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs); ++M)
+			{
+				const uint32 Raw = C[kGpuAllocMonotonicCtrs[M]];
+				GAllocCtrAccum[M] += int64(uint32(Raw - GAllocCtrLastRaw[M]));
+				GAllocCtrLastRaw[M] = Raw;
+			}
 			// NEW failures, not merely non-zero ones: the counters are
 			// cumulative, so the delta against the last landed value is what
 			// gets announced. Announce BEFORE publishing the snapshot.
 			const int64 PrevCollision = GAllocSnapBitmapCollision.load(std::memory_order_relaxed);
 			const int64 PrevMissing = GAllocSnapFreeMissing.load(std::memory_order_relaxed);
-			if (int64(C[kGpuAllocCtrBitmapCollision]) > PrevCollision)
+			if (AllocAccumOf(kGpuAllocCtrBitmapCollision) > PrevCollision)
 			{
 				UE_LOG(LogVoxelBrickPool, Error,
 				       TEXT("[brick-gpualloc] DOUBLE GRANT: the page bitmap caught %lld new collision(s) ")
@@ -706,33 +779,38 @@ namespace VoxelBrickPoolDetail
 				       TEXT("colliding claims were FAILED and their ranges leaked rather than written. ")
 				       TEXT("This is the allocator's own correctness gate firing -- treat the leg as ")
 				       TEXT("invalid and diff the claim kernel."),
-				       int64(C[kGpuAllocCtrBitmapCollision]) - PrevCollision, C[kGpuAllocCtrBitmapCollision]);
+				       AllocAccumOf(kGpuAllocCtrBitmapCollision) - PrevCollision,
+				       C[kGpuAllocCtrBitmapCollision]);
 			}
-			if (int64(C[kGpuAllocCtrFreeBitmapMissing]) > PrevMissing)
+			if (AllocAccumOf(kGpuAllocCtrFreeBitmapMissing) > PrevMissing)
 			{
 				UE_LOG(LogVoxelBrickPool, Error,
 				       TEXT("[brick-gpualloc] BAD FREE: %lld new page(s) freed that were not marked owned ")
 				       TEXT("(total %u). A range was freed twice or never granted -- the free list may now ")
 				       TEXT("hold a live chunk's dwords, which resurfaces as terrain corruption on reuse."),
-				       int64(C[kGpuAllocCtrFreeBitmapMissing]) - PrevMissing, C[kGpuAllocCtrFreeBitmapMissing]);
+				       AllocAccumOf(kGpuAllocCtrFreeBitmapMissing) - PrevMissing,
+				       C[kGpuAllocCtrFreeBitmapMissing]);
 			}
+			// Bump cursors, inFlight and the stack peaks publish RAW (they are
+			// bounded, and two of them legitimately decrease); everything
+			// cumulative publishes the wrap-corrected 64-bit accumulator.
 			GAllocSnapOccBump.store(int64(C[kGpuAllocCtrOccBump]), std::memory_order_relaxed);
 			GAllocSnapMatBump.store(int64(C[kGpuAllocCtrMatBump]), std::memory_order_relaxed);
-			GAllocSnapClaims.store(int64(C[kGpuAllocCtrClaims]), std::memory_order_relaxed);
-			GAllocSnapStackPops.store(int64(C[kGpuAllocCtrStackPops]), std::memory_order_relaxed);
-			GAllocSnapClaimFailOcc.store(int64(C[kGpuAllocCtrClaimFailOcc]), std::memory_order_relaxed);
-			GAllocSnapClaimFailMat.store(int64(C[kGpuAllocCtrClaimFailMat]), std::memory_order_relaxed);
-			GAllocSnapClaimFailWorst.store(int64(C[kGpuAllocCtrClaimFailWorst]), std::memory_order_relaxed);
-			GAllocSnapBitmapCollision.store(int64(C[kGpuAllocCtrBitmapCollision]), std::memory_order_relaxed);
-			GAllocSnapFrees.store(int64(C[kGpuAllocCtrFrees]), std::memory_order_relaxed);
-			GAllocSnapPushOverflow.store(int64(C[kGpuAllocCtrFreePushOverflow]), std::memory_order_relaxed);
-			GAllocSnapFreeMissing.store(int64(C[kGpuAllocCtrFreeBitmapMissing]), std::memory_order_relaxed);
+			GAllocSnapClaims.store(AllocAccumOf(kGpuAllocCtrClaims), std::memory_order_relaxed);
+			GAllocSnapStackPops.store(AllocAccumOf(kGpuAllocCtrStackPops), std::memory_order_relaxed);
+			GAllocSnapClaimFailOcc.store(AllocAccumOf(kGpuAllocCtrClaimFailOcc), std::memory_order_relaxed);
+			GAllocSnapClaimFailMat.store(AllocAccumOf(kGpuAllocCtrClaimFailMat), std::memory_order_relaxed);
+			GAllocSnapClaimFailWorst.store(AllocAccumOf(kGpuAllocCtrClaimFailWorst), std::memory_order_relaxed);
+			GAllocSnapBitmapCollision.store(AllocAccumOf(kGpuAllocCtrBitmapCollision), std::memory_order_relaxed);
+			GAllocSnapFrees.store(AllocAccumOf(kGpuAllocCtrFrees), std::memory_order_relaxed);
+			GAllocSnapPushOverflow.store(AllocAccumOf(kGpuAllocCtrFreePushOverflow), std::memory_order_relaxed);
+			GAllocSnapFreeMissing.store(AllocAccumOf(kGpuAllocCtrFreeBitmapMissing), std::memory_order_relaxed);
 			GAllocSnapOccInFlight.store(int64(C[kGpuAllocCtrOccInFlight]), std::memory_order_relaxed);
 			GAllocSnapMatInFlight.store(int64(C[kGpuAllocCtrMatInFlight]), std::memory_order_relaxed);
-			GAllocSnapOccPaddedCum.store(int64(C[kGpuAllocCtrOccPaddedCum]), std::memory_order_relaxed);
-			GAllocSnapOccActualCum.store(int64(C[kGpuAllocCtrOccActualCum]), std::memory_order_relaxed);
-			GAllocSnapMatPaddedCum.store(int64(C[kGpuAllocCtrMatPaddedCum]), std::memory_order_relaxed);
-			GAllocSnapMatActualCum.store(int64(C[kGpuAllocCtrMatActualCum]), std::memory_order_relaxed);
+			GAllocSnapOccPaddedCum.store(AllocAccumOf(kGpuAllocCtrOccPaddedCum), std::memory_order_relaxed);
+			GAllocSnapOccActualCum.store(AllocAccumOf(kGpuAllocCtrOccActualCum), std::memory_order_relaxed);
+			GAllocSnapMatPaddedCum.store(AllocAccumOf(kGpuAllocCtrMatPaddedCum), std::memory_order_relaxed);
+			GAllocSnapMatActualCum.store(AllocAccumOf(kGpuAllocCtrMatActualCum), std::memory_order_relaxed);
 			// Stranded memory: what sits parked in free stacks. Depth x class
 			// size, per class, both arenas -- the honest cost of the no-coalesce
 			// design, printed rather than argued about.
@@ -773,9 +851,9 @@ namespace VoxelBrickPoolDetail
 			// leg whose numbers matter). zero = demand minus the bucket sum:
 			// chunks that asked for nothing in that arena and pad nothing.
 			{
-				const int64 Demand = int64(C[kGpuAllocCtrClaims])
-				                   + int64(C[kGpuAllocCtrClaimFailOcc])
-				                   + int64(C[kGpuAllocCtrClaimFailMat]);
+				const int64 Demand = AllocAccumOf(kGpuAllocCtrClaims)
+				                   + AllocAccumOf(kGpuAllocCtrClaimFailOcc)
+				                   + AllocAccumOf(kGpuAllocCtrClaimFailMat);
 				const auto LogHistLine = [&](const TCHAR* Arena, uint32 First, uint32 Buckets,
 				                             uint32 Width, int64 ActualCum, uint32 CurrentStep,
 				                             const uint32* CandidateSteps, int32 NumCandidates)
@@ -833,10 +911,10 @@ namespace VoxelBrickPoolDetail
 				static const uint32 OccSteps[] = { 32u, 48u, 64u, 96u, 128u };
 				static const uint32 MatSteps[] = { 128u, 192u, 256u, 384u, 512u };
 				LogHistLine(TEXT("occ"), Pending.OccHistFirst, Pending.OccHistBuckets,
-				            Pending.OccHistBucketWords, int64(C[kGpuAllocCtrOccActualCum]),
+				            Pending.OccHistBucketWords, AllocAccumOf(kGpuAllocCtrOccActualCum),
 				            Pending.OccClassStep, OccSteps, UE_ARRAY_COUNT(OccSteps));
 				LogHistLine(TEXT("mat"), Pending.MatHistFirst, Pending.MatHistBuckets,
-				            Pending.MatHistBucketWords, int64(C[kGpuAllocCtrMatActualCum]),
+				            Pending.MatHistBucketWords, AllocAccumOf(kGpuAllocCtrMatActualCum),
 				            Pending.MatClassStep, MatSteps, UE_ARRAY_COUNT(MatSteps));
 			}
 			GAllocCountersLanded.store(1, std::memory_order_relaxed);
@@ -2403,6 +2481,9 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 			PendingCounters.MatHistFirst = Layout.MatHistFirst;
 			PendingCounters.MatHistBuckets = Layout.MatHistBuckets;
 			PendingCounters.MatHistBucketWords = Layout.MatHistBucketWords;
+			// Render-thread serial, so this numbering IS the copy-pass order --
+			// what the wrap-safe accumulation's monotonic guard relies on.
+			PendingCounters.Seq = GAllocCounterSeqNext++;
 			GPendingAllocCounters.Add(PendingCounters);
 		}
 		GraphBuilder.Execute();
