@@ -2460,13 +2460,38 @@ int32 GetPendingJobCap()
 // so the two are independent and either can be measured alone.
 bool GpuMeshEnabled()
 {
-	// 2026-07-27: DEFAULT ON, and inverted to -VoxelNoGpuMesh so a PIE session
-	// gets it. A PIE run launched from the editor has no command line of its
-	// own, so an opt-IN FParse::Param switch can never reach it -- the fork
-	// would have been unreachable in exactly the session that is meant to
-	// evaluate it. Same idiom as -VoxelNoRingSkirt and -VoxelNoUnderground.
-	static const bool bDisabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoGpuMesh"));
-	return !bDisabled;
+	// DEFAULT OFF SINCE 2026-08-23, and this is a TEMPORARY state: the fork in
+	// its current shape is being replaced by the GPU streaming programme in
+	// docs/gpu-streaming-architecture.md. Off is not a verdict on GPU meshing;
+	// it is a verdict on a per-chunk readback fence plus per-chunk game-thread
+	// submission. Turn it on with -VoxelGpuMesh.
+	//
+	// WHY OFF. Matched 30 m/s legs, cap 24/core, changing only this:
+	//
+	//            frames   p95      hitches  brickPacks
+	//   fork on   10,832  41.46ms   1,257     913,197
+	//   fork off  11,745  32.00ms     474   1,009,737
+	//
+	// It packs 6.5% of chunks (brickFromGpu 49,665 of 768,799) and accounts for
+	// 90% of all hitches. Off costs NOTHING -- the CPU arm absorbed 100% of its
+	// work at the same total and the same coverage (holes=0 both arms).
+	//
+	// THREE THEORIES TESTED AND KILLED, so they are not re-run:
+	//   * "the GPU is contended" -- freeing 13 ms of GPU per frame (shadows off)
+	//     doubled the frame rate and moved streaming +0.5%.
+	//   * "it is the queue latency" -- -VoxelGpuMeshQueueDepth=16 cut
+	//     submit->deliver 1,068 -> 147 ms and the fork still lost on every axis.
+	//   * "it is pass count" -- B.1 batching cut passes 3.4x, throughput moved 0.
+	// What it actually is: game-thread dispatch cost 496 ms per 5s window with
+	// the fork on against 23 ms with it off, at the same fixed-latency config.
+	//
+	// Kept as the NEGATIVE-sense pair (-VoxelGpuMesh to enable) for the reason
+	// the original comment gave and which still holds: a PIE run launched from
+	// the editor has no command line of its own, so whichever way the default
+	// points, the switch that flips it has to be the one on the editor's own
+	// command line.
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelGpuMesh"));
+	return bEnabled;
 }
 
 // How many GPU mesh jobs may be outstanding at once, budgeted separately from

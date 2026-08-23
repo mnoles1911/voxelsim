@@ -478,8 +478,20 @@ TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 // cost, not a bigger quota.
 TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
 	TEXT("voxel.Stream.JobsInFlightPerCore"),
-	8,
-	TEXT("Worker jobs allowed in flight, as a multiple of logical cores (96 at the default 8 on a 12-thread box; ")
+	24,
+	TEXT("RAISED 8 -> 24 ON 2026-08-23. THIS IS NOT A CONCURRENCY CAP, IT IS A PER-TICK BATCH QUOTA, and at 8 it ")
+	TEXT("was below the owner's 6,200 chunks/s floor BY ARITHMETIC. DispatchJobs refills to the cap once per tick, ")
+	TEXT("so with jobs now retiring in ~0.5 ms inside a ~20.7 ms tick, '96 in flight' means '96 dispatched per ")
+	TEXT("tick, then the workers idle until the next one' = 96 x 48.3 ticks/s = 4,637 chunks/s, whatever the ")
+	TEXT("workers can actually do. Measured 4,341/s against that predicted ceiling. Matched legs, fork off: ")
+	TEXT("8/core = 4,498 chunks/s, 24/core = 6,763/s, 48/core = 6,673/s -- 24 is the knee, and past it the ")
+	TEXT("dispatch loop starts exiting on an EMPTY QUEUE (exitCap 40%% / exitEmpty 60%%) because admission, not ")
+	TEXT("dispatch, becomes the limiter. Cost: hitches rose 54 -> 511 in the arm where it was isolated. ")
+	TEXT("WHY THIS WAS NOT SEEN EARLIER: a 2026-08-22 audit concluded the cap 'never binds', correctly, WHILE THE ")
+	TEXT("GPU FORK WAS ON -- the fork's jobs inflated the blended in-flight counter so CPU occupancy read ~0 and ")
+	TEXT("the cap looked irrelevant. It was masked, not absent, and the planned 8 -> 2 sweep would have made ")
+	TEXT("things worse. The right direction was up. ")
+	TEXT("Worker jobs allowed in flight, as a multiple of logical cores (288 at the default 24 on a 12-thread box; ")
 	TEXT("raised from 2 on 2026-07-27, ~25% faster real-terrain cold fill, no hitch or coverage cost on record). ")
 	TEXT("DispatchJobs refills to this cap once per frame, so with short jobs (R0 p50 ~1.3ms) and a ~15ms frame the ")
 	TEXT("slots idle most of the frame -- measured ~9% worker utilisation and ~6,800 chunks per 5s evicted before ")
