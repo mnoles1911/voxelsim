@@ -591,6 +591,16 @@ private:
 	int64 WorklistWinChunks = 0;
 	int64 WorklistWinPasses = 0;
 	int64 WorklistWinPassesMaxTick = 0;
+	// DispatchBatch's share of THIS tick's passes, folded (plus the spine's
+	// per-tick constant) into the window by Tick. Split because the spine
+	// flushes on batchless ticks too: tallying only in DispatchBatch left
+	// those ticks' 2-3 real passes uncounted, which is how the window line
+	// read mean=0.0 while the GPU dispatched every tick (2026-08-23).
+	int64 WorklistBatchPassesThisTick = 0;
+	// Skip total at the last window boundary, so the quiet gate compares the
+	// WINDOW'S skips. Gating on the cumulative total kept every post-flight
+	// linger window printing zeros forever once any chunk had ever skipped.
+	int64 WorklistPrevSkipTotal = 0;
 	// Cumulative ring identity: appended == consumed + pending, or records
 	// are being lost/double-consumed and the window line says DRIFT.
 	uint64 WorklistCumAppended = 0;

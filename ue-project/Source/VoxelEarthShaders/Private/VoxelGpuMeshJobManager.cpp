@@ -2133,6 +2133,20 @@ void FVoxelGpuMeshJobManager::Tick()
 			Worklist.Flush(VoxelGpuWorklistBudget());
 		}
 		bWorklistFlushedThisTick = false;
+		// The tick's pass tally folds HERE, not in DispatchBatch, because the
+		// spine flushes on batchless ticks too and those ticks' 2-3 passes
+		// are real GPU work: args + prover always, plus the Column indirect
+		// dispatch once the stage is armed (recorded even at Take == 0 --
+		// constant pass count per tick is the property being bought).
+		// Tallying only inside DispatchBatch was the 2026-08-23 dead-counter
+		// bug: every batchless tick tallied 0 while dispatching 2-3 passes,
+		// and the window line read mean=0.0 over hundreds of ticks.
+		const int64 WorklistPassesThisTick = WorklistBatchPassesThisTick
+			+ VoxelGpuBatchDetail::kWorklistSpinePassesPerTick
+			+ (Worklist.IsColumnStageArmed() ? 1 : 0);
+		WorklistBatchPassesThisTick = 0;
+		WorklistWinPasses += WorklistPassesThisTick;
+		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, WorklistPassesThisTick);
 		MaybeLogWorklistWindow();
 	}
 
@@ -2243,6 +2257,13 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 //                                proof lines come from FVoxelGpuWorklist).
 //   refusedFull growing       -> ring back-pressure; raise -VoxelGpuWorklistCap
 //                                or the budget, and say which in the report.
+//   PASS TALLY DEAD marker    -> the passes/tick number itself measured
+//                                nothing this window (mean below the 2/tick
+//                                args+prover floor every armed tick pays);
+//                                nothing about pass counts on the leg is
+//                                believable. mean=0.0 without the marker
+//                                cannot happen any more -- if it appears,
+//                                the tripwire is broken too.
 void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 {
 	const double Now = FPlatformTime::Seconds();
@@ -2263,11 +2284,24 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	WorklistCumRefused += W.RefusedFull;
 	const int64 SkipTotal = WorklistSkipNoPack + WorklistSkipQuadMesh + WorklistSkipBand
 	                      + WorklistSkipNoAlloc + WorklistSkipNoAtlas;
-	if (WorklistWinChunks == 0 && W.Appended == 0 && SkipTotal == 0)
+	// The quiet gate reads the WINDOW'S skips, not the cumulative counters.
+	// Gating on the cumulative total was the other half of the 2026-08-23
+	// dead-counter reading: once any chunk had ever skipped, every
+	// post-flight linger window printed forever -- all zeros -- and the
+	// summary's tail -1 read exactly the linger line leg-summary.sh exists
+	// to avoid. Now an idle window stays quiet, so the LAST window line of
+	// a leg is its last ACTIVE window.
+	if (WorklistWinChunks == 0 && W.Appended == 0 && SkipTotal == WorklistPrevSkipTotal)
 	{
-		// Armed and idle (no jobs promoted at all): stay quiet, the
+		// Armed and idle (no jobs promoted this window): stay quiet, the
 		// [gpu-batch] rule. Armed-and-declining still prints, with reasons.
+		// Reset EVERYTHING windowed: the spine constant accrued real passes
+		// on these idle ticks, and leaking them into the next active window
+		// would overstate it.
 		WorklistWinTicks = 0;
+		WorklistWinChunks = 0;
+		WorklistWinPasses = 0;
+		WorklistWinPassesMaxTick = 0;
 		LastWorklistLogSeconds = Now;
 		return;
 	}
@@ -2279,11 +2313,20 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	const double MeanPasses = WorklistWinTicks > 0
 		? double(WorklistWinPasses) / double(WorklistWinTicks) : 0.0;
 	const bool bUnproven = P.Landed == 0 && WorklistCumConsumed > 0;
+	// The counter's own tripwire. Every armed tick tallies at least the
+	// args + prover constant, so a printed window whose mean sits below that
+	// floor is not a quiet spine -- it is this tally measuring nothing (the
+	// eighth self-reporting-healthy counter of 2026-08-23 was exactly this
+	// line). checked-not-assumed, because "mean=0.0" must never again parse
+	// as a plausible reading.
+	const bool bTallyDead = WorklistWinTicks > 0
+		&& WorklistWinPasses < int64(VoxelGpuBatchDetail::kWorklistSpinePassesPerTick)
+		                       * WorklistWinTicks;
 	UE_LOG(LogVoxelGpuMeshJob, Log,
 	       TEXT("[gpu-worklist] %.1fs window: passes/tick mean=%.1f max=%lld over %lld ticks ")
 	       TEXT("(%lld chunks, %.0f chunks/s); records appended=%llu consumed=%llu pending=%u ")
 	       TEXT("refusedFull=%llu; identity %s; skips noPack=%lld quads=%lld band=%lld ")
-	       TEXT("noAlloc=%lld noAtlas=%lld (cumulative); proof landed=%llu failed=%llu%s%s"),
+	       TEXT("noAlloc=%lld noAtlas=%lld (cumulative); proof landed=%llu failed=%llu%s%s%s"),
 	       WindowSeconds, MeanPasses, WorklistWinPassesMaxTick, WorklistWinTicks,
 	       WorklistWinChunks, WindowSeconds > 0.0 ? double(WorklistWinChunks) / WindowSeconds : 0.0,
 	       W.Appended, W.Consumed, W.Pending, W.RefusedFull,
@@ -2292,7 +2335,8 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	       WorklistSkipNoAlloc, WorklistSkipNoAtlas,
 	       P.Landed, P.Failed,
 	       P.Failed > 0 ? TEXT(" (PROOF FAILED -- LEG INVALID)") : TEXT(""),
-	       bUnproven ? TEXT(" (NO PROOF LANDED -- GPU consumption UNVERIFIED)") : TEXT(""));
+	       bUnproven ? TEXT(" (NO PROOF LANDED -- GPU consumption UNVERIFIED)") : TEXT(""),
+	       bTallyDead ? TEXT(" (PASS TALLY DEAD -- mean below the args+prover floor)") : TEXT(""));
 	// P3 Column stage line, armed-only (a spine-only or control leg must not
 	// gain a log line). THE FAILING READINGS: conv=0 with fb growing -- the
 	// stage is armed and converting nothing (ring refusing, records deferred
@@ -2317,6 +2361,7 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	WorklistWinChunks = 0;
 	WorklistWinPasses = 0;
 	WorklistWinPassesMaxTick = 0;
+	WorklistPrevSkipTotal = SkipTotal;
 	LastWorklistLogSeconds = Now;
 }
 
@@ -2508,10 +2553,10 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			RecordJobs.Add(Job);
 		}
 		const bool bColumnsArmed = VoxelGpuWorklistColumnsEnabled();
-		// Spine: args + prover, plus the Column indirect dispatch when stage 1
-		// is armed -- all constant per tick regardless of N.
-		PassesThisTick += VoxelGpuBatchDetail::kWorklistSpinePassesPerTick
-		                + (bColumnsArmed ? 1 : 0);
+		// The spine's own constant (args + prover + armed Column dispatch) is
+		// NOT tallied here: it is paid every armed tick, batch or no batch,
+		// so Tick owns it -- tallying it here was half of the dead-counter
+		// bug (batchless ticks tallied 0 while dispatching 2-3 passes).
 		TArray<uint32> RecordMono;
 		if (NewRecords.Num() > 0)
 		{
@@ -2580,8 +2625,9 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				}
 			}
 		}
-		WorklistWinPasses += PassesThisTick;
-		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, PassesThisTick);
+		// Handed to Tick, which adds the spine constant and folds the total
+		// into the window -- see the fold there for why the split exists.
+		WorklistBatchPassesThisTick += PassesThisTick;
 		WorklistWinChunks += Batch.Num();
 	}
 

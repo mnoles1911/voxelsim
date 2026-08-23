@@ -50,11 +50,16 @@ for f in "$@"; do
   b3=$(grep -o "assets RESOLVE (B\.3): .*" "$log" | tail -1)
   if [ -n "$b3" ]; then printf "%-18s   %s\n" "" "$b3"; fi
   # P3 worklist spine (-VoxelGpuWorklist). The window line prints only when
-  # something happened (armed-and-idle stays quiet), so tail -1 is the last
-  # ACTIVE window, not the linger trap this script exists for. skips= and
-  # proof counters inside the line are cumulative; passes/tick and records
-  # are windowed. Absent on a control leg by design -- an armed leg with no
-  # line here promoted no jobs at all.
+  # something happened THIS WINDOW (the quiet gate compares windowed skip
+  # deltas as of 2026-08-23 -- before that it compared the cumulative skip
+  # total, so every post-flight linger window printed zeros forever and
+  # tail -1 here read "passes/tick mean=0.0 max=0" on legs whose active
+  # windows read 70+; builds older than that fix still do this). tail -1 is
+  # the last ACTIVE window. skips= and proof counters inside the line are
+  # cumulative; passes/tick and records are windowed. Absent on a control
+  # leg by design -- an armed leg with no line here promoted no jobs at all.
+  # A "PASS TALLY DEAD" marker inside the line means the passes/tick number
+  # measured nothing; treat every pass-count conclusion from the leg as void.
   #
   # FAILING READINGS (the full list is on MaybeLogWorklistWindow):
   #   proofFAILs > 0 or identity DRIFT -> the leg is INVALID, full stop.
@@ -62,7 +67,11 @@ for f in "$@"; do
   #                                       skips= reasons for which gate.
   #   proof landed=0 with consumption  -> GPU consumption UNVERIFIED; treat
   #                                       the spine as dead, not as quiet.
-  wl=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" | tail -1)
+  # Last ACTIVE window: drop zero-chunk zero-record lines first (belt and
+  # braces for logs from builds predating the windowed quiet gate), fall back
+  # to the plain last line only if every window was idle.
+  wl=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" | grep -v "(0 chunks, 0 chunks/s); records appended=0" | tail -1)
+  [ -n "$wl" ] || wl=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" | tail -1)
   if [ -n "$wl" ]; then
     printf "%-18s   %s\n" "" "$wl"
     wlfails=$(grep -c "\[gpu-worklist\] proof .* FAIL" "$log")
