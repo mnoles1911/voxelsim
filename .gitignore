@@ -83,6 +83,16 @@ ue-project/Content/Voxel/T_SkyStarmap.uasset
 ue-project/Content/Voxel/T_MoonColor.uasset
 ue-project/Content/Voxel/T_MoonDisplacement.uasset
 
+# Editor auto-imports of the menu's committed loose art. The front end loads
+# Content/UI's .jpg and .ttf files BY FILESYSTEM PATH (see front end step 3:
+# no .uasset, no asset registry -- that is what let it be built with no
+# editor). But any INTERACTIVE editor session auto-imports loose files it
+# finds under Content/, so these .uassets reappear whenever someone opens the
+# editor. Nothing references them; committing them would re-introduce the
+# import dependency the design exists to avoid.
+ue-project/Content/UI/Backgrounds/*.uasset
+ue-project/Content/UI/Fonts/*.uasset
+
 # Work-item-2 survey dumps: ~140 MB of per-tile bake rasters. The REPORT and
 # the overlays are committed (docs/lake-survey/); these are the inputs.
 /out/
