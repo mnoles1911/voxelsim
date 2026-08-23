@@ -114,10 +114,12 @@ figures at 120.  This is a phase change, not a gradient.
 `dropped=` is the counter this file's own comment (AdmissionCapMax, and again
 at LeadHorizonSec) names as THE NUMBER THAT MUST BE WATCHED, with the failing
 reading written out in advance: "dropped= balloons while dispatched/s stays
-flat: truncate churn."  It balloons from ZERO to 498,025 per 2 s while
+flat: truncate churn."  It balloons from ZERO to a 470,376-per-2 s mean while
 dispatched FALLS.  The predicted failure mode is the one that is happening.
 
-"Voxel job flow (5s window)", same windows:
+"Voxel job flow (5s window)".  These are ONE representative mid-flight window
+per leg, not the 51-window means above -- the stale% and recordsAdded/
+dispatched ratios are what matter and they hold across the flight:
 
     speed   dispatched   drained    stale      recordsAdded  recordsEvicted
      30       15,734     15,461     0 (0.0%)        16,973        15,900
@@ -127,10 +129,12 @@ dispatched FALLS.  The predicted failure mode is the one that is happening.
 At 30 m/s recordsAdded (16,973) tracks dispatched (15,734): every record
 admitted is a record used.  At 120 m/s the system admits 503,424 records per
 2 s, dispatches 12,659 and evicts 15,144.  The other ~475,000 were added and
-then removed again by truncation inside the same or the next call.  That is
-~250,000 TMap insert/erase pairs PER SECOND on the game thread producing
-nothing, and it is 10,532 admitted per recompute call against 265 dispatched
-per call -- a 40:1 ratio.
+then removed again by truncation inside the same or the next call -- and the
+51-window mean of dropped= (470,376) says the same thing independently, from
+the counter that measures the removal directly.  That is ~235,000 TMap
+insert/erase pairs PER SECOND on the game thread producing nothing, and it is
+10,532 admitted per recompute call against 265 dispatched per call -- a 40:1
+ratio.
 
 DropFarthestOverCap's own comment states the design intent it is missing by
 that 40x: "the band admits only chunks that are clearly nearer, sized so a
