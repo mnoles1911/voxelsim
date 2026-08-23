@@ -38,7 +38,13 @@ $Ush = Join-Path $Root 'ue-project\Shaders\VoxelWorklist.ush'
 $ArgsUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistArgs.usf'
 $ConsumeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistConsume.usf'
 $ColumnUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistColumn.usf'
+$VoxelizeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistVoxelize.usf'
+$ClassifyUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistClassify.usf'
+$StampUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistAssetStamp.usf'
+$PackUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistPack.usf'
+$AssetStampUsf = Join-Path $Root 'ue-project\Shaders\VoxelAssetStamp.usf'
 $WorldGen = Join-Path $Root 'voxel-core\shaders\worldgen.ush'
+$BrickPack = Join-Path $Root 'voxel-core\shaders\brickpack.ush'
 $Stage = Join-Path $env:TEMP 'voxel-worklist-check'
 
 if (-not (Test-Path $Dxc)) { throw "dxc not found at $Dxc (run tools/fetch-dxc.ps1)" }
@@ -46,6 +52,9 @@ if (-not (Test-Path $Ush)) { throw "VoxelWorklist.ush not found at $Ush" }
 if (-not (Test-Path $ArgsUsf)) { throw "VoxelWorklistArgs.usf not found at $ArgsUsf" }
 if (-not (Test-Path $ConsumeUsf)) { throw "VoxelWorklistConsume.usf not found at $ConsumeUsf" }
 if (-not (Test-Path $ColumnUsf)) { throw "VoxelWorklistColumn.usf not found at $ColumnUsf" }
+if (-not (Test-Path $VoxelizeUsf)) { throw "VoxelWorklistVoxelize.usf not found at $VoxelizeUsf" }
+if (-not (Test-Path $ClassifyUsf)) { throw "VoxelWorklistClassify.usf not found at $ClassifyUsf" }
+if (-not (Test-Path $BrickPack)) { throw "brickpack.ush not found at $BrickPack" }
 if (-not (Test-Path $WorldGen)) { throw "worldgen.ush not found at $WorldGen" }
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
 New-Item -ItemType Directory -Path $Stage | Out-Null
@@ -73,6 +82,33 @@ Copy-Item $WorldGen (Join-Path $Stage 'worldgen.ush')
     Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
     Replace('"/VoxelCore/worldgen.ush"', '"worldgen.ush"') |
     Out-File (Join-Path $Stage 'VoxelWorklistColumn.hlsl') -Encoding utf8
+(Get-Content $VoxelizeUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelCore/worldgen.ush"', '"worldgen.ush"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistVoxelize.hlsl') -Encoding utf8
+Copy-Item $BrickPack (Join-Path $Stage 'brickpack.ush')
+(Get-Content $ClassifyUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelCore/brickpack.ush"', '"brickpack.ush"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistClassify.hlsl') -Encoding utf8
+# VoxelAssetStamp.usf is INCLUDED by the worklist stamp kernel (for the
+# factored gather helpers and the shared declarations); stage it with its own
+# Platform include stubbed the same way.
+(Get-Content $AssetStampUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub') |
+    Out-File (Join-Path $Stage 'VoxelAssetStamp.usf') -Encoding utf8
+(Get-Content $StampUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelEarth/VoxelAssetStamp.usf"', '"VoxelAssetStamp.usf"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistAssetStamp.hlsl') -Encoding utf8
+(Get-Content $PackUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelCore/brickpack.ush"', '"brickpack.ush"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistPack.hlsl') -Encoding utf8
 
 $Out = Join-Path $Stage 'out.bin'
 $Fail = 0
@@ -112,6 +148,48 @@ $ColumnDefines = @('VXC_UE=1', "VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion",
                    'VXC_WORKLIST_COLUMN_GROUPS=16', 'VXC_WORKLIST_COLS_PER_RECORD=1024')
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistColumn.hlsl') 'ColumnWorklistMain'       'column  DXIL  ColumnWorklistMain'       $ColumnDefines
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistColumn.hlsl') 'ColumnWorklistVerifyMain' 'colvfy  DXIL  ColumnWorklistVerifyMain' $ColumnDefines
+
+# The converted Voxelize stage (VoxelWorklistVoxelize.usf; P3 stage 2). Same
+# mechanism: the defines mirror FVoxelWorklistVoxelizeCS's (16 groups per
+# record -- one thread per COLUMN, the classic mapping -- over 1,024 columns /
+# 32,768 cells), and the kernel #errors on disagreement.
+$VoxelizeDefines = @('VXC_UE=1', "VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion",
+                     'VXC_RASTER_ATLAS=1',
+                     'VXC_WORKLIST_VOXELIZE_GROUPS=16', 'VXC_WORKLIST_COLS_PER_RECORD=1024',
+                     'VXC_WORKLIST_CELLS_PER_RECORD=32768')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistVoxelize.hlsl') 'VoxelizeWorklistMain'       'voxlize DXIL  VoxelizeWorklistMain'       $VoxelizeDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistVoxelize.hlsl') 'VoxelizeWorklistVerifyMain' 'voxvfy  DXIL  VoxelizeWorklistVerifyMain' $VoxelizeDefines
+
+# The fused ClassifyTotals stage (VoxelWorklistClassify.usf; P3 stage 3).
+# Compiles brickpack.ush under VXC_UE (no worldgen version lock -- brickpack
+# carries none); the defines mirror FVoxelWorklistClassifyCS's.
+$ClassifyDefines = @('VXC_UE=1',
+                     'VXC_WORKLIST_CLASSIFY_GROUPS=64', 'VXC_WORKLIST_BRICKS_PER_RECORD=64',
+                     'VXC_WORKLIST_CELLS_PER_RECORD=32768')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClassify.hlsl') 'ClassifyWorklistMain'             'clsify  DXIL  ClassifyWorklistMain'             $ClassifyDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClassify.hlsl') 'ClassifyTotalsWorklistMain'       'clstot  DXIL  ClassifyTotalsWorklistMain'       $ClassifyDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClassify.hlsl') 'ClassifyTotalsWorklistVerifyMain' 'ctvfy   DXIL  ClassifyTotalsWorklistVerifyMain' $ClassifyDefines
+
+# The order-preserving AssetStamp gather (VoxelWorklistAssetStamp.usf; P3
+# stage 4). Includes VoxelAssetStamp.usf for the factored helpers; no version
+# lock (asset composition is not terrain). Defines mirror
+# FVoxelWorklistAssetStampCS's.
+$StampDefines = @('VXC_WORKLIST_STAMP_GROUPS=16', 'VXC_WORKLIST_COLS_PER_RECORD=1024',
+                  'VXC_WORKLIST_CELLS_PER_RECORD=32768')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistAssetStamp.hlsl') 'AssetStampWorklistMain' 'stamp   DXIL  AssetStampWorklistMain' $StampDefines
+# And the classic stamp entry points, whose file gained the factored helpers:
+# the factoring must not have broken the shipped forms.
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelAssetStamp.usf') 'AssetStampMain'       'stamp   DXIL  AssetStampMain (classic)'
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelAssetStamp.usf') 'AssetStampCoarseMain' 'stamp   DXIL  AssetStampCoarseMain (classic)'
+
+# The converted Pack stage (VoxelWorklistPack.usf; P3 stage 5). Defines mirror
+# FVoxelWorklistPackCS's; the classic BrickPackMain forms are covered by
+# voxel-check-brickpack-shader.ps1 (the factoring must not break them).
+$PackDefines = @('VXC_UE=1',
+                 'VXC_WORKLIST_PACK_GROUPS=64', 'VXC_WORKLIST_BRICKS_PER_RECORD=64',
+                 'VXC_WORKLIST_CELLS_PER_RECORD=32768', 'VXC_WORKLIST_MATWORDS_PER_RECORD=8448')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistPack.hlsl') 'PackWorklistMain'       'pack    DXIL  PackWorklistMain'       $PackDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistPack.hlsl') 'PackWorklistVerifyMain' 'packvfy DXIL  PackWorklistVerifyMain' $PackDefines
 
 # The factored classic kernels, both atlas permutations -- the factoring must
 # not have broken the shipped forms (the digest gate proves bytes; this proves

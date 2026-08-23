@@ -1,0 +1,156 @@
+// VoxelWorklistVoxelize.usf -- the SECOND converted generation kernel of the
+// P3 worklist (Voxelize stage; docs/gpu-worklist-plan-2026-08-23.md,
+// conversion step 3). Behind -VoxelGpuWorklistVoxelize=1, on top of
+// -VoxelGpuWorklist=1 -VoxelGpuWorklistColumns=1 -- the column stage is a hard
+// prerequisite, because this kernel READS the column arena the column stage
+// wrote earlier in the SAME flush graph.
+//
+// WHAT CONVERSION MEANS, stage 1's line verbatim: VoxelizeMain's per-chunk
+// dispatch read its region off $Globals, one pass per chunk; THIS entry point
+// is dispatched ONCE PER TICK through the DispatchIndirect triple for
+// EVoxelWorklistStage::Voxelize (16 groups per consumed record -- one thread
+// per COLUMN, the classic kernel's own mapping, NOT one per cell: the cave and
+// cavern reductions are per-column and per-cell threads would recompute each
+// 32 times), and voxelizes every consumed record's 32x32x32 cells in one pass.
+//
+// THE MATH IS NOT COPIED, IT IS CALLED: voxelizeColumnInto in worldgen.ush is
+// the factored body of VoxelizeMain, and both entry points call the same text.
+// The record load, the arena read base and the arena write base are the only
+// lines that differ from the classic kernel.
+//
+// INPUT: the flush-level COLUMN ARENA at slice `rec` (same graph, same tick --
+// ColumnWorklistMain wrote it; RDG's external-buffer tracking orders the
+// write before this read). Bound as worldgen.ush's own InColumns.
+// OUTPUT: the flush-level CELL ARENA -- cellBudget x 32,768 uint cells, slice
+// `rec` at element rec * 32768. The same chunk's classic BrickClassifyMain /
+// BrickPackMain read the slice through brickpack.ush's CellReadBase in the
+// batch graph that follows.
+//
+// ASSET RECORDS: converted when their stamps are staged (stampsStaged, bit 9
+// -- the AssetStamp stage put their instances in this flush's blob and its
+// indirect dispatch stamps the arena BETWEEN this pass and the classify
+// pair, all inside the flush graph, so the batch graph still only READS the
+// arena and no UAV barrier ever splits it). A record with assets and NO
+// staged stamps -- stamp stage off, or the record deferred past the flush
+// that staged it -- falls back classic, group-uniformly, counted on the
+// host (wlvox fbAssets).
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelWorklist.ush"
+#include "/VoxelCore/worldgen.ush"
+
+// The stage-shape lock, VoxelWorklistColumn.usf's mechanism verbatim: a
+// mismatch between the host args table and this kernel's own derivation is a
+// TORN DISPATCH and must fail the COMPILE, not the leg.
+#ifndef VXC_WORKLIST_VOXELIZE_GROUPS
+#error "VXC_WORKLIST_VOXELIZE_GROUPS not defined -- dispatch this kernel only through FVoxelWorklistVoxelizeCS"
+#endif
+#ifndef VXC_WORKLIST_COLS_PER_RECORD
+#error "VXC_WORKLIST_COLS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistVoxelizeCS"
+#endif
+#ifndef VXC_WORKLIST_CELLS_PER_RECORD
+#error "VXC_WORKLIST_CELLS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistVoxelizeCS"
+#endif
+#if VXC_WORKLIST_VOXELIZE_GROUPS != 16
+#error "Voxelize stage shape drifted: 1,024 columns / 64 threads = 16 groups per record, and the host table must agree"
+#endif
+#if VXC_WORKLIST_COLS_PER_RECORD != 1024
+#error "Voxelize stage shape drifted: a lean brick chunk is 32x32 columns"
+#endif
+#if VXC_WORKLIST_CELLS_PER_RECORD != 32768
+#error "Voxelize stage shape drifted: a lean brick chunk is 32x32x32 cells (4 bricks of 8 in z)"
+#endif
+
+// The ring (same three bindings, same meanings, as every worklist consumer).
+StructuredBuffer<GpuChunkWorkRecord> WorklistRecords;
+StructuredBuffer<uint> WorklistControl;   // [0]=consumeFirst [1]=consumeCount
+uint RingCapacity;
+
+// InColumns (the COLUMN arena, SRV), OutCells (the CELL arena, UAV), SeedLo/
+// SeedHi, PixelSizeMm, SurfaceMip and the atlas bindings all come from
+// worldgen.ush's own declarations -- stage 1's rule: this file declares no
+// duplicate of anything the classic kernel binds.
+
+[numthreads(64, 1, 1)]
+void VoxelizeWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Take = WorklistControl[1];
+	const uint Rec = Gid.x / VXC_WORKLIST_VOXELIZE_GROUPS;
+	// Belt-and-braces against a torn args write, not a code path.
+	if (Rec >= Take)
+	{
+		return;
+	}
+	// Same guard both entry points keep -- see VoxelizeMain in worldgen.ush.
+	if (PixelSizeMm == 0)
+	{
+		return;
+	}
+	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
+	const GpuChunkWorkRecord R = WorklistRecords[Slot];
+	// Asset chunks keep their classic Voxelize + AssetStamp (header). R is
+	// uniform across the group (Rec derives from Gid), so the whole group
+	// retires together -- no divergence inside a wave.
+	if (worklistAssetsBlockRecord(R) != 0u)
+	{
+		return;
+	}
+
+	const uint ColIndex = (Gid.x % VXC_WORKLIST_VOXELIZE_GROUPS) * 64u + GTid.x;   // 0..1023
+	// 32x32, x fastest -- identical to VoxelizeMain's tid mapping over a
+	// 32-wide dispatch, and to ColumnWorklistMain's write order.
+	const uint2 T = uint2(ColIndex & 31u, ColIndex >> 5u);
+
+	const GpuColumnSample Col =
+		InColumns[Rec * VXC_WORKLIST_COLS_PER_RECORD + ColIndex];
+
+	// bricksZ = 4 and bricksX = 4: the lean brick chunk shape the eligibility
+	// gate already enforced host-side (32x32x32 voxels), restated by the
+	// CELLS_PER_RECORD lock above.
+	voxelizeColumnInto(Col, R.OriginVx, R.OriginVy, worklistCoarseScale(R),
+	                   R.BrickZMin, 4u, T, 4u,
+	                   Rec * VXC_WORKLIST_CELLS_PER_RECORD);
+}
+
+// --- VoxelizeWorklistVerifyMain: the stage's byte gate ----------------------
+//
+// Byte-compares ONE converted chunk's cell-arena slice against a classic
+// re-run of the same chunk into the region's transient Cells, reading the
+// SAME column arena slice the converted kernel read. TWO verify arms share
+// this kernel, split by VerifyStatsBase:
+//   base 6  (-VoxelGpuWorklistVerifyVox, terrain-only chunks): the classic
+//           re-run is VoxelizeMain alone -- isolates the voxelize conversion.
+//   base 10 (-VoxelGpuWorklistVerifyStamp, asset chunks): the classic re-run
+//           is VoxelizeMain + the per-instance AssetStamp passes -- compares
+//           the stamped result, isolating the stamp gather + ordering.
+// Mismatching CELLS accumulate into WorklistStats[base], cells compared into
+// WorklistStats[base+1]; both ride the ~5 s proof readback.
+//
+// THE FAILING READINGS: stats[base] > 0 -- the converted chain computes
+// different cells than the classic one; the leg is INVALID (wrong terrain is
+// in the pool). stats[base+1] staying 0 while converted chunks flow with the
+// verify switch armed -- the verify itself is dead and "no mismatches" is
+// vacuous. One 512-group pass per verified chunk, verify arm only.
+
+StructuredBuffer<uint> VerifyClassicCells;   // the classic dispatch's 32,768
+StructuredBuffer<uint> VerifyArenaCells;     // the cell arena (SRV this time)
+RWStructuredBuffer<uint> WorklistStats;
+uint VerifyArenaBase;                        // slice * 32768
+uint VerifyStatsBase;                        // 6 (vox) or 10 (stamp)
+
+[numthreads(64, 1, 1)]
+void VoxelizeWorklistVerifyMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x >= VXC_WORKLIST_CELLS_PER_RECORD)
+	{
+		return;
+	}
+	const uint A = VerifyArenaCells[VerifyArenaBase + tid.x];
+	const uint C = VerifyClassicCells[tid.x];
+	uint Unused;
+	InterlockedAdd(WorklistStats[VerifyStatsBase + 1u], 1u, Unused);
+	if (A != C)
+	{
+		InterlockedAdd(WorklistStats[VerifyStatsBase], 1u, Unused);
+	}
+}

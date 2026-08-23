@@ -577,6 +577,24 @@ private:
 	// Why a promoted chunk did NOT get a record, by first failing reason --
 	// the [gpu-lean] diagnosis pattern: "armed but records=0" must read as a
 	// named missing precondition, not a mystery.
+	// P3 Voxelize stage (cumulative, wlvox line). Converted: record consumed
+	// this flush AND asset-free -- the chunk's VoxelizeMain is skipped.
+	// FallbackAssets: consumed but carries assets (designed exclusion until
+	// the flush-level asset buffer lands). Fallback: everything else a
+	// column-converted chunk would also have fallen back for (deferred,
+	// refused, stack-fused).
+	int64 WorklistVoxConverted = 0;
+	int64 WorklistVoxFallback = 0;
+	int64 WorklistVoxFallbackAssets = 0;
+	// P3 fused ClassifyTotals (cumulative, wlct line): same three meanings.
+	int64 WorklistCtConverted = 0;
+	int64 WorklistCtFallback = 0;
+	int64 WorklistCtFallbackAssets = 0;
+	// P3 AssetStamp (cumulative, wlstamp line): asset-bearing chunks admitted
+	// to the converted chain (a subset of WorklistVoxConverted).
+	int64 WorklistStampConverted = 0;
+	// P3 Pack (cumulative, wlpack line): a subset of WorklistCtConverted.
+	int64 WorklistPackConverted = 0;
 	int64 WorklistSkipNoPack = 0;    // no brick region (quad-only leg, or shell refused)
 	int64 WorklistSkipQuadMesh = 0;  // job still emits quads (RetireQuads off)
 	int64 WorklistSkipBand = 0;      // job carries its footprint's band readback
@@ -591,6 +609,16 @@ private:
 	int64 WorklistWinChunks = 0;
 	int64 WorklistWinPasses = 0;
 	int64 WorklistWinPassesMaxTick = 0;
+	// DispatchBatch's share of THIS tick's passes, folded (plus the spine's
+	// per-tick constant) into the window by Tick. Split because the spine
+	// flushes on batchless ticks too: tallying only in DispatchBatch left
+	// those ticks' 2-3 real passes uncounted, which is how the window line
+	// read mean=0.0 while the GPU dispatched every tick (2026-08-23).
+	int64 WorklistBatchPassesThisTick = 0;
+	// Skip total at the last window boundary, so the quiet gate compares the
+	// WINDOW'S skips. Gating on the cumulative total kept every post-flight
+	// linger window printing zeros forever once any chunk had ever skipped.
+	int64 WorklistPrevSkipTotal = 0;
 	// Cumulative ring identity: appended == consumed + pending, or records
 	// are being lost/double-consumed and the window line says DRIFT.
 	uint64 WorklistCumAppended = 0;
