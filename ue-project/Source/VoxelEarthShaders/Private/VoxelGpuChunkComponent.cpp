@@ -44,7 +44,12 @@ public:
 
 		// Register the material for FMeshBatch::Validate's VerifyUsedMaterial
 		// check. Without this the batch is dropped before any mesh pass sees it.
-		#if !(UE_BUILD_SHIPPING)
+		// WITH_EDITOR and not !(UE_BUILD_SHIPPING): the setter itself only
+		// exists WITH_EDITOR (PrimitiveSceneProxy.h), so the old guard broke
+		// the Development GAME target -- not shipping, but no editor either.
+		// Outside the editor FMeshBatch::Validate's VerifyUsedMaterial check
+		// never runs, so there is nothing to register for.
+		#if WITH_EDITOR
 		{
 			TArray<UMaterialInterface*> UsedForVerification;
 			UsedForVerification.Add(Material);

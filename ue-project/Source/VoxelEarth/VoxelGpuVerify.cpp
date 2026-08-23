@@ -2166,7 +2166,13 @@ namespace
 			UE_LOG(LogVoxelGpuVerify, Error, TEXT("Failed to spawn actor"));
 			return;
 		}
+#if WITH_EDITOR
+		// The label is an editor-only nicety (AActor::SetActorLabel exists only
+		// WITH_EDITOR) so the actor can be found in the outliner. The game
+		// target has no outliner and no such method; the fixture works the
+		// same either way, the actor is just unnamed there.
 		Actor->SetActorLabel(TEXT("VoxelGpuTestChunk"));
+#endif
 
 		// The real terrain material, so the A/B compares like with like. Without
 		// it the chunk falls back to WorldGridMaterial and every difference is

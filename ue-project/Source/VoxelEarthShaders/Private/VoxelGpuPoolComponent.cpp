@@ -620,7 +620,12 @@ public:
 		MaterialProxy = Material->GetRenderProxy();
 		MaterialRelevance = Material->GetRelevance_Concurrent(GetScene().GetFeatureLevel());
 
-		#if !(UE_BUILD_SHIPPING)
+		// WITH_EDITOR and not !(UE_BUILD_SHIPPING): the setter itself only
+		// exists WITH_EDITOR (PrimitiveSceneProxy.h), so the old guard broke
+		// the Development GAME target -- not shipping, but no editor either.
+		// Outside the editor FMeshBatch::Validate's VerifyUsedMaterial check
+		// never runs, so there is nothing to register for.
+		#if WITH_EDITOR
 		{
 			TArray<UMaterialInterface*> UsedForVerification;
 			UsedForVerification.Add(Material);
