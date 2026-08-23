@@ -95,8 +95,17 @@ namespace
 	// ---- the arm ----------------------------------------------------------
 
 	TAutoConsoleVariable<int32> CVarVoxelShadowMarch(
-		TEXT("voxel.Shadow.March"), 2,
-		TEXT("S1 of docs/shadow-march-design-2026-08-20.md: march one sun ray per shaded ")
+		TEXT("voxel.Shadow.March"), 0,
+		TEXT("DEFAULT 0 SINCE 2026-08-23, BY OWNER DECISION -- terrain has no sun ")
+		TEXT("shadows until this is revisited. It is the largest single frame-time item ")
+		TEXT("in the renderer: matched 30 m/s legs, mode 2 vs mode 0, changed ONLY this ")
+		TEXT("cvar -- frames 10,832 -> 20,811 and p50 20.90 ms -> 7.76 ms. The frame rate ")
+		TEXT("DOUBLES without it, and it costs ~13 ms of a 20.7 ms frame on this box. ")
+		TEXT("Streaming throughput was UNAFFECTED (brickPacks 913,197 -> 917,797, +0.5%), ")
+		TEXT("which is also the measurement that killed the theory that terrain ")
+		TEXT("generation and the marcher were contending for the GPU -- freeing half the ")
+		TEXT("frame's GPU time moved streaming by nothing. Backlogged, not abandoned: see ")
+		TEXT("docs/backlog.md 'Marched sun shadows'. Set to 2 to get them back. ")
 		TEXT("pixel through the resident brick pyramid, from the depth buffer. ")
 		TEXT("0 = off (default; the extension declines every hook and the frame is ")
 		TEXT("byte-identical to a build without this file). ")

@@ -26,6 +26,33 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0a Marched sun shadows — TURNED OFF 2026-08-23, owner decision, revisit later
+
+`voxel.Shadow.March` now defaults to **0**. Terrain has no sun shadows until this
+comes back. Set it to 2 to restore them.
+
+**Why.** It is the largest single frame-time item in the renderer. Matched 30 m/s
+line legs changing ONLY this cvar:
+
+| | frames | p50 | brickPacks |
+|---|---|---|---|
+| mode 2 (shadows) | 10,832 | 20.90 ms | 913,197 |
+| mode 0 (off) | **20,811** | **7.76 ms** | 917,797 |
+
+The frame rate **doubles**; it costs ~13 ms of a 20.7 ms frame on this box.
+
+**Streaming was unaffected** (+0.5%), and that same leg is what killed the theory
+that terrain generation and the marcher contend for the GPU — freeing half the
+frame's GPU time moved streaming throughput by nothing.
+
+**Revisit when** the GPU streaming programme (`docs/gpu-streaming-architecture.md`)
+and the rest of the rendering pipeline are good. The reach dial
+(`voxel.Shadow.MarchRayReachM`, 48/96/256/512) was never chosen — 512 is the
+current cost and no one has measured whether 96 looks acceptable at a quarter of
+it. That measurement is the obvious first move when this is picked back up, and it
+was never taken.
+
+
 Everything below this section predates the streaming programme — except §§8-10 —
 and §6b in particular is stale and now says so.
 
