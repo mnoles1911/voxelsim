@@ -4112,6 +4112,95 @@ int32 AdmissionCapMax()
 	return Max;
 }
 
+// --- Cold-start settle probe (2026-08-23) -----------------------------------
+//
+// THE OWNER'S GOAL, verbatim: "all chunks out to the cascade horizon load in
+// only a few seconds. It currently takes almost a full minute to load and then
+// settle on launch." Until this probe, time-to-settle was read by EYEBALLING
+// resident0 across 5 s windows (Saved/wide-on-30.log: 14,372 -> 35,407 ->
+// 41,263 -> plateau 41,279), which quantises a 20-60 s quantity by 5 s and
+// cannot be diffed across arms. This makes settle a single grep-able line.
+//
+// WHAT "SETTLED" MEANS, and the two recorded traps it must dodge:
+//  * A LULL IS NOT A SETTLE. A leg once "settled" at loaded=40,615 against a
+//    true 43,328 and made a subsystem look 12% faster than it was (see the
+//    convergence-signal comment at VoxelMarchPublishStreamingState). So the
+//    quiet state must HOLD for SettleHoldSec, and the hold is EXCLUDED from
+//    the reported time. The deferred-refill trigger re-admits within a tick
+//    or two of a queue draining, so a false quiet cannot survive the hold.
+//  * JUDGE PER RING, NEVER AGGREGATE. Level-primary ordering once gave R3/R4
+//    zero loaded chunks for 90 s while the aggregate looked healthy. The
+//    settle line therefore prints per-ring last-activity time and per-ring
+//    job counts; a ring that finished suspiciously early or late is readable
+//    from the one line.
+//
+// ACTIVITY, per ring, is judged from counters that move on the MARCHER path
+// (the rings line's loaded= reads HoldsGeometry and prints 0 for entire
+// marcher legs -- the HoldsGeometry/HoldsTerrain trap): a ring is active while
+// its cumulative dispatch total moves, its pending queue is non-empty, or its
+// cpu/gpu in-flight split is non-zero. Global quiet additionally requires the
+// game-thread apply/unload backlogs empty and the blended in-flight counter
+// zero.
+//
+// FAILING READING, stated up front: if the cascade never quiets (steady churn
+// while standing still -- the same-anchor admit/evict defect, 11,779
+// unloads/s, would look like this), the probe prints ONE "NOT SETTLED"
+// warning at SettleTimeoutSec with per-ring last-activity ages and disarms.
+// Silence past the timeout is therefore a bug in the probe, not a slow leg.
+//
+// The probe is cold-start only: it arms at the first tick with streaming
+// demand, reports once (settle or timeout), and disarms for the life of the
+// process. O(kNumLevels) integer compares per tick, one log line per
+// SettleProgressSec while filling; -VoxelNoColdSettle removes even that.
+bool ColdSettleEnabled()
+{
+	static const bool bEnabled = !FParse::Param(FCommandLine::Get(), TEXT("VoxelNoColdSettle"));
+	return bEnabled;
+}
+
+// How long the quiet state must hold before it is believed. 3 s default:
+// longer than the deferred-refill re-arm latency (a tick or two) and the
+// render-thread brick-flush tail (~a frame), shorter than any real second
+// admission wave has ever taken to start.
+double ColdSettleHoldSec()
+{
+	static const double Sec = []
+	{
+		double Value = 3.0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSettleHoldSec="), Value);
+		return FMath::Clamp(Value, 0.5, 30.0);
+	}();
+	return Sec;
+}
+
+// The failure bound. 300 s = 5x the worst settle ever measured (~60 s,
+// owner-reported and matched by Saved/wide-on-30.log's wide arm); a cascade
+// still active past it is churning, not filling.
+double ColdSettleTimeoutSec()
+{
+	static const double Sec = []
+	{
+		double Value = 300.0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSettleTimeoutSec="), Value);
+		return FMath::Clamp(Value, 10.0, 3600.0);
+	}();
+	return Sec;
+}
+
+// Fill-curve cadence. 1 s default -- fine enough to read the per-ring fill
+// front (rings drain serially, ~4-6 s each on wide-on-30), cheap enough to
+// leave on. <= 0 keeps the settle/timeout line but silences the curve.
+double ColdSettleProgressSec()
+{
+	static const double Sec = []
+	{
+		double Value = 1.0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSettleProgressSec="), Value);
+		return FMath::Min(Value, 60.0);
+	}();
+	return Sec;
+}
+
 double ViewBiasStrength()
 {
 	static const double K = []
@@ -7112,6 +7201,17 @@ struct FVoxelWorldImpl
 	// final log line alone.
 	int64 LevelJobsDispatchedSinceLog[VoxelCoords::kNumLevels] = {};
 	int64 LevelJobsDispatchedTotal[VoxelCoords::kNumLevels] = {};
+	// --- Cold-start settle probe state (see VoxelStreamAdmission::
+	// ColdSettleEnabled for the design and the two traps it dodges). All of
+	// this is game-thread-only and touched inside TickColdSettleProbe.
+	double ColdStartSeconds = -1.0; // armed at the first tick with streaming demand
+	double ColdLevelLastActivitySeconds[VoxelCoords::kNumLevels] = {};
+	int64 ColdLevelLastDispatchTotal[VoxelCoords::kNumLevels] = {};
+	double ColdGlobalLastActivitySeconds = 0.0; // apply/unload backlogs + blended in-flight
+	double ColdLastProgressLogSeconds = 0.0;
+	int64 ColdLastProgressDispatched = 0;
+	bool bColdSettleReported = false; // one report (settle OR timeout), then the probe disarms
+	void TickColdSettleProbe();
 
 	// The dispatch split by ARM, per window -- companions to the blended
 	// since-log counter above and reset alongside it. GpuMeshDispatchedByLevel
@@ -8767,6 +8867,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	SET_DWORD_STAT(STAT_VoxelChunksLoaded, ChunkRecords.Num());
 	SET_DWORD_STAT(STAT_VoxelChunksInFlight, JobsInFlightCounter.GetValue());
 
+	// Cold-start settle probe: after dispatch and apply, before the periodic
+	// log, so a tick's own launches/drains are visible to the same tick's
+	// activity check (no one-tick lag on the settle stamp).
+	TickColdSettleProbe();
+
 	MaybeLogCounters(DeltaTime);
 
 	// Wall-clock ms this streaming tick has spent so far (one more
@@ -9189,6 +9294,146 @@ void PushLatencyMsSample(TArray<float>& Window, int32& Next, int32& Count, float
 	Count = FMath::Min(Count + 1, Window.Num());
 }
 } // namespace
+
+// Cold-start settle probe: the one-line time-to-settle instrument. Design,
+// traps, and reading rules at VoxelStreamAdmission::ColdSettleEnabled. Runs
+// every streaming tick until it has reported once, then costs one branch.
+void FVoxelWorldImpl::TickColdSettleProbe()
+{
+	if (bColdSettleReported || !VoxelStreamAdmission::ColdSettleEnabled())
+	{
+		return;
+	}
+	const double Now = FPlatformTime::Seconds();
+
+	// Arm at the first tick with streaming demand -- t=0 is "the subsystem
+	// first wanted a chunk", not process start, so the number measures the
+	// streaming pipeline and not shader compilation or level bring-up.
+	if (ColdStartSeconds < 0.0)
+	{
+		int64 AnyDispatch = 0;
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			AnyDispatch += LevelJobsDispatchedTotal[L];
+		}
+		if (AnyDispatch == 0 && PendingJobNum() == 0)
+		{
+			return; // no demand yet
+		}
+		ColdStartSeconds = Now;
+		ColdGlobalLastActivitySeconds = Now;
+		ColdLastProgressLogSeconds = Now;
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			ColdLevelLastActivitySeconds[L] = Now;
+			ColdLevelLastDispatchTotal[L] = LevelJobsDispatchedTotal[L];
+		}
+	}
+
+	// Per-ring activity: dispatch total moved, queue non-empty, or in-flight
+	// non-zero. Deliberately NOT HoldsGeometry/loaded= -- that counter reads 0
+	// for entire marcher legs (the HoldsGeometry/HoldsTerrain trap) while
+	// these three move on every arm.
+	int64 TotalDispatched = 0;
+	int32 TotalPending = 0;
+	for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+	{
+		const int64 D = LevelJobsDispatchedTotal[L];
+		TotalDispatched += D;
+		const int32 QueueNum = PendingJobKeysByLevel[L].Num();
+		TotalPending += QueueNum;
+		const bool bActive = (D != ColdLevelLastDispatchTotal[L]) || QueueNum > 0 ||
+		                     LevelCpuJobsInFlight[L] > 0 || LevelGpuJobsInFlight[L] > 0;
+		ColdLevelLastDispatchTotal[L] = D;
+		if (bActive)
+		{
+			ColdLevelLastActivitySeconds[L] = Now;
+		}
+	}
+	// Global quiet: the backlogs the per-ring counters cannot see. The blended
+	// in-flight counter is here as a belt-and-braces double of the per-ring
+	// split (the split has a recorded drift alarm; this one cannot drift).
+	if (PendingGameThreadKeys.Num() > 0 || PendingUnloadKeys.Num() > 0 ||
+	    JobsInFlightCounter.GetValue() > 0)
+	{
+		ColdGlobalLastActivitySeconds = Now;
+	}
+
+	double LastActivity = ColdGlobalLastActivitySeconds;
+	for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+	{
+		LastActivity = FMath::Max(LastActivity, ColdLevelLastActivitySeconds[L]);
+	}
+
+	const double SinceStart = Now - ColdStartSeconds;
+	const double HoldSec = VoxelStreamAdmission::ColdSettleHoldSec();
+	if (Now - LastActivity >= HoldSec)
+	{
+		// SETTLED. The hold is excluded: T is when the world stopped CHANGING,
+		// not when we finished waiting to believe it.
+		const double SettleT = LastActivity - ColdStartSeconds;
+		FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel cold settle: SETTLED t=%.1fs jobs=%lld mean=%.0f/s (hold=%.1fs excluded) | %s ")
+		       TEXT("| resident0=%d indexEntries=%d poolEvictions=%lld"),
+		       SettleT, (long long)TotalDispatched,
+		       SettleT > 0.0 ? double(TotalDispatched) / SettleT : 0.0, HoldSec,
+		       *JoinPerLevel(
+		           [&](int32 L)
+		           {
+			           return FString::Printf(TEXT("R%d t=%.1fs j=%lld"), L,
+			                                  ColdLevelLastActivitySeconds[L] - ColdStartSeconds,
+			                                  (long long)LevelJobsDispatchedTotal[L]);
+		           }),
+		       BrickPool.GetResidentChunkCountAtLevel(0),
+		       GetGlobalVoxelMarchChunkIndex().GetNumEntries(),
+		       (long long)BrickPool.GetEvictions());
+		bColdSettleReported = true;
+		return;
+	}
+	if (SinceStart >= VoxelStreamAdmission::ColdSettleTimeoutSec())
+	{
+		// THE FAILING READING: the cascade never quieted. Standing-still churn
+		// (the same-anchor admit/evict defect measured at 11,779 unloads/s)
+		// looks exactly like this; the per-ring ages below name the ring.
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("Voxel cold settle: NOT SETTLED at %.0fs: jobs=%lld pending=%d gameThread=%d unload=%d ")
+		       TEXT("inFlight=%d | last activity ages: %s"),
+		       SinceStart, (long long)TotalDispatched, TotalPending, PendingGameThreadKeys.Num(),
+		       PendingUnloadKeys.Num(), JobsInFlightCounter.GetValue(),
+		       *JoinPerLevel(
+		           [&](int32 L)
+		           {
+			           return FString::Printf(TEXT("R%d %.1fs"), L,
+			                                  Now - ColdLevelLastActivitySeconds[L]);
+		           }));
+		bColdSettleReported = true;
+		return;
+	}
+
+	// The fill curve, one line per SettleProgressSec while unsettled. Rate is
+	// over the probe's own cadence, so the curve's knees (ring hand-offs, the
+	// coarse-ring tail) land on the right second regardless of log interval.
+	const double ProgressSec = VoxelStreamAdmission::ColdSettleProgressSec();
+	if (ProgressSec > 0.0 && Now - ColdLastProgressLogSeconds >= ProgressSec)
+	{
+		const double Dt = Now - ColdLastProgressLogSeconds;
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel cold fill: t=%.1fs jobs=%lld (+%.0f/s) pending=%d inFlight=%d | %s"),
+		       SinceStart, (long long)TotalDispatched,
+		       Dt > 0.0 ? double(TotalDispatched - ColdLastProgressDispatched) / Dt : 0.0,
+		       TotalPending, JobsInFlightCounter.GetValue(),
+		       *JoinPerLevel(
+		           [&](int32 L)
+		           {
+			           return FString::Printf(TEXT("R%d j=%lld q=%d"), L,
+			                                  (long long)LevelJobsDispatchedTotal[L],
+			                                  PendingJobKeysByLevel[L].Num());
+		           }));
+		ColdLastProgressLogSeconds = Now;
+		ColdLastProgressDispatched = TotalDispatched;
+	}
+}
 
 void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 {
