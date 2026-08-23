@@ -237,9 +237,23 @@ inline int32 Mode()
 {
 	static const int32 Latched = []
 	{
-		int32 Value = 0;
+		// DEFAULT 3 (guard+cache) AS OF 2026-08-23. -1 sentinel, not 0, so an
+		// explicit -VoxelApplyFast=0 still selects the byte-identical control
+		// arm -- the same rule -VoxelGpuBandSeedOnly uses, and without it the
+		// control leg for this feature would be unrunnable.
+		//
+		// SHIPPED ON THIS EVIDENCE (q-audit.log, caps left at their defaults so
+		// the arm isolates the amplifier fix):
+		//   traffic   avoided/calls 79.6% -> 91.3% across the fill (not inert)
+		//   G3        mismatch=0 sentinel=0 offThread=0 holes=0, and the
+		//             cold-fill chunk population matched control to 1 chunk in
+		//             164,732 with every hit audited (audit=902,154)
+		//   headline  settle 23.7 s -> 21.8 s, 6,955 -> 7,547 chunks/s
+		// Its disproof condition -- avoided ~= calls with apply= unchanged --
+		// did not fire.
+		int32 Value = -1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyFast="), Value);
-		if (Value < 0) { Value = 0; }
+		if (Value < 0) { Value = kModeGuard | kModeCache; }
 		// Measurement is implied by either behavioural arm, so `sampleUs` is
 		// populated for whatever sampling still happens and the before/after is
 		// readable off ONE leg rather than two.
