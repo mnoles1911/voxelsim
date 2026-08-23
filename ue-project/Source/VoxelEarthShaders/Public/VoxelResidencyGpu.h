@@ -111,6 +111,13 @@ struct FVoxelResidencyLevelParams
 	double UnloadOuterUU = 0.0;  // outer * UnloadRingMultiplier
 	double VerticalKeepUU = 0.0; // deep-record vertical hysteresis
 	double CutoffSortKeySq = 0.0; // this ring's admission cutoff (post-relaxation)
+	// -VoxelResidencyAdmitBudget: how many candidates this ring's entry scan
+	// may PROPOSE, nearest first. 0 = "use the command-line value" (the
+	// default, so the switch works with no subsystem change at all). Set it to
+	// this ring's own gate-(a) allowance -- EffectivePendingJobCap/4 -- and the
+	// GPU stops proposing exactly what the CPU was going to reject. See
+	// docs/gpu-residency-admit-budget-2026-08-23.md for the one-line hook.
+	int32 AdmitBudget = 0;
 	FIntVector AnchorChunk = FIntVector::ZeroValue; // anchor's chunk at this level
 	int32 ChunkSpan = 0;         // annulus box half-span in chunks
 	bool bScanThisDispatch = false; // entry-scan gate verdict for this level

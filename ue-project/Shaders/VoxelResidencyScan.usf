@@ -80,7 +80,8 @@
 //  [5] feedback ops applied           [13] entry: z-items visited
 //  [6] feedback removes dropped       [14] overflow bits (1<<list, see below)
 //      (wrap mismatch)                [15] exit: tracked cells visited
-//  [7] insert aliasing collisions
+//  [7] insert aliasing collisions        [16] entry: budget-rejected candidates
+//                                        [17] entry: histogram-pass total
 //
 // Overflow bits: 1=admit 2=evict 4=resurrect 8=cold 16=orphan. An overflowed
 // list is TRUNCATED, never wrapped; the CPU sees the bit and knows the delta
@@ -125,6 +126,8 @@
 #define VOXRES_CTR_Z_VISITED    13
 #define VOXRES_CTR_OVERFLOW     14
 #define VOXRES_CTR_EXIT_VISITED 15
+#define VOXRES_CTR_BUDGET_REJ   16
+#define VOXRES_CTR_HIST_TOTAL   17
 
 // ---- shared resources -------------------------------------------------------
 
@@ -157,6 +160,58 @@ uint ResurrectCap;
 uint ColdCap;
 uint OrphanCap;
 
+// ---- the GPU admission budget (-VoxelResidencyAdmitBudget) ------------------
+// WHY THIS EXISTS. Without it the entry scan appends EVERY untracked in-cutoff
+// cell in the annulus, and the game thread pays one AdmitCandidateEvaluate per
+// append. Measured (Saved/t42-live.log, mode 2, 2026-08-23): prop=2,393,682 per
+// 5 s window against adOK=65,453 -- rejBud=2,283,374 of them, 95.4%, thrown
+// away by the CPU's own per-call budget gate (a) AFTER the game thread had
+// already evaluated each one. ad=636.87 ms/window: mode 2 was 2.4x WORSE than
+// the 246-266 ms CPU arm it replaces. The 50:1 evaluate-to-admit ratio was
+// RELOCATED into the readback, not removed -- the "moved, not removed" failure
+// this file's own header warns about.
+//
+// The fix: the CPU's budget is a COUNT, so make the GPU emit the NEAREST that
+// many. Two enumeration phases over the same annulus (the GPU enumeration is
+// 128x128 threads and is not the cost):
+//   EmitPhase 0     count candidates into a per-level histogram over SQUARED
+//                   distance (equal-area bins => roughly equal occupancy),
+//                   append nothing.
+//   BudgetResolveCS prefix-sum each level's bins, find the first bin whose
+//                   running total exceeds AdmitBudget, publish that bin's
+//                   UPPER edge as BudgetThresholdSq[level].
+//   EmitPhase 1     enumerate again and append only SortKeySq < threshold.
+// Overshoot is bounded by one bin (1/1024 of the disc) and is deliberate: the
+// CPU's gate (a) remains the authority, so emitting slightly too many costs a
+// few rejects while emitting too few STARVES admission. Every degenerate case
+// therefore resolves to +inf (no restriction), never to 0.
+//
+// AdmitBudget == 0 is OFF: phase 0 and the resolve are not dispatched at all,
+// EmitPhase is 1, and this kernel is byte-identical to the pre-budget one.
+RWStructuredBuffer<uint> AdmitHist;          // NumLevels * HistBins
+RWStructuredBuffer<float> BudgetThresholdSq; // NumLevels
+uint AdmitBudget;   // NON-ZERO = the feature is on. The per-level numbers
+                    // live in LevelAdmitBudget below; this is the gate, so a
+                    // level whose own budget is 0 still costs nothing when the
+                    // switch is off.
+uint EmitPhase;     // 0 = histogram only, 1 = emit
+uint HistBins;
+// Per-level budgets, packed 4-per-int4 (levels 0-3 then 4-7). Per level rather
+// than one global number because gate (a) on the CPU is per level: it is
+// EffectivePendingJobCap/4 counted separately for each ring, and a single
+// number would throttle a wide coarse ring by a fine ring's allowance. The CPU
+// fills every slot -- with the ring's own cap when the subsystem supplies one,
+// otherwise with the command-line value -- so the shader never has to decide.
+int4 LevelAdmitBudget[2];
+
+uint BudgetFor(uint L)
+{
+	const int4 V = LevelAdmitBudget[L >> 2];
+	const uint I = L & 3u;
+	const int B = (I == 0u) ? V.x : ((I == 1u) ? V.y : ((I == 2u) ? V.z : V.w));
+	return uint(max(B, 0));
+}
+
 // ---- per-level parameter arrays (filled on the game thread, by value) -------
 // Packed float4s so the parameter struct stays flat. See the manager for the
 // exact packing; unpack helpers below are the single source of truth here.
@@ -165,7 +220,9 @@ float4 LevelRadiiA[8];   // x=ChunkEdgeUU y=OuterUUSq z=AdmitOuterUUSq w=InnerAd
 float4 LevelRadiiB[8];   // x=InnerEvictUUSq y=UnloadOuterUUSq z=VerticalKeepUU w=CutoffSortKeySq
 float4 LevelAnchorFrac[8]; // xyz = anchor - anchorChunk*edge (UU), w = BiasClampSq
 int4   LevelAnchorChunk[8]; // xyz = anchor chunk coord at this level, w = ChunkSpan
-uint   ScanLevelMask;    // which levels run the entry scan this dispatch
+// (ScanLevelMask was declared here and read by NO kernel -- the per-level gate
+// is a CPU-side dispatch skip, not a shader test. Removed 2026-08-23: an unread
+// loose global is one edit away from being the MaxRingLevel trap again.)
 uint   HierarchicalCoverage;
 uint   RingOverlapChunks;
 uint   UndergroundDisabledFlag; // 1 = -VoxelNoUnderground (skirt = 0 everywhere)
@@ -229,6 +286,18 @@ uint2 HashKey(uint Level, int3 C)
 	uint Lo = HX ^ (HY << 3 | HY >> 29) ^ (HZ << 7 | HZ >> 25) ^ HL;
 	uint Hi = (HX << 11 | HX >> 21) ^ HY ^ (HZ << 17 | HZ >> 15) ^ (HL << 5 | HL >> 27);
 	return uint2(Lo, Hi);
+}
+
+// Bin a candidate's squared sort key over this level's admit disc. Squared
+// distance keeps the bins equal-AREA, so a uniform annulus fills them evenly
+// and the resolved threshold lands within one bin of the budget. Out-of-range
+// keys (the seam-parent band, deep Z columns) clamp into the last bin, which
+// the resolve treats as "no restriction" -- the safe direction.
+uint BinIndex(uint L, float SortKeySq, float RangeSq)
+{
+	const float T = SortKeySq / max(RangeSq, 1.0f);
+	const int B = int(T * float(HistBins));
+	return uint(clamp(B, 0, int(HistBins) - 1));
 }
 
 bool AppendProposal(RWStructuredBuffer<uint> List, uint Cap, uint CounterSlot, uint OverflowBit,
@@ -425,6 +494,10 @@ void ExitScanCS(uint3 DTid : SV_DispatchThreadID)
 
 uint LevelIndex;
 
+// Run TWICE per level when AdmitBudget != 0 (EmitPhase 0 then 1) and ONCE
+// (EmitPhase 1) when it is 0. Both phases must enumerate the identical
+// candidate set: the log's histTot == prop + budRej identity is the cross-pass
+// gate that catches the day they diverge, and it can fail in both directions.
 [numthreads(8, 8, 1)]
 void EntryScanCS(uint3 DTid : SV_DispatchThreadID)
 {
@@ -474,8 +547,15 @@ void EntryScanCS(uint3 DTid : SV_DispatchThreadID)
 		}
 	}
 
-	uint IgnoredC;
-	InterlockedAdd(Counters[VOXRES_CTR_CAND_VISITED], 1, IgnoredC);
+	// Traffic counters describe ONE enumeration, so only the emit phase writes
+	// them; otherwise every number here would silently double when the budget
+	// is switched on, and the switch would read as a regression in the shape
+	// of an instrument.
+	if (EmitPhase != 0)
+	{
+		uint IgnoredC;
+		InterlockedAdd(Counters[VOXRES_CTR_CAND_VISITED], 1, IgnoredC);
+	}
 
 	// Z range from the texel mirror; cold if absent or aliased.
 	const uint TexIdx = L * (VOXRES_DIM_XY * VOXRES_DIM_XY) +
@@ -484,8 +564,11 @@ void EntryScanCS(uint3 DTid : SV_DispatchThreadID)
 	const uint WantTags = (WrapTag(Cy) << 9) | WrapTag(Cx);
 	if ((Tex.x & 0x80000000u) == 0 || (Tex.x & 0x3FFFFu) != WantTags)
 	{
-		AppendProposal(ColdList, ColdCap, VOXRES_CTR_COLD, 8u, L, int3(Cx, Cy, 0));
-		return;
+		if (EmitPhase != 0)
+		{
+			AppendProposal(ColdList, ColdCap, VOXRES_CTR_COLD, 8u, L, int3(Cx, Cy, 0));
+		}
+		return; // both phases: a cold footprint contributes no Z candidates
 	}
 	int ZMin = SignExt16(Tex.y & 0xFFFFu);
 	const int ZMax = SignExt16(Tex.y >> 16);
@@ -515,14 +598,17 @@ void EntryScanCS(uint3 DTid : SV_DispatchThreadID)
 	// own admission cutoff -- both against the same squared key the CPU uses.
 	for (int Cz = ZMin; Cz <= ZMax; ++Cz)
 	{
-		uint IgnoredZ;
-		InterlockedAdd(Counters[VOXRES_CTR_Z_VISITED], 1, IgnoredZ);
+		if (EmitPhase != 0)
+		{
+			uint IgnoredZ;
+			InterlockedAdd(Counters[VOXRES_CTR_Z_VISITED], 1, IgnoredZ);
+		}
 
 		const int3 C = int3(Cx, Cy, Cz);
 		const uint Cell = ShadowGrid[CellIndex(L, C)];
 		if ((Cell & VOXRES_CELL_OCCUPIED) != 0 && CellMatches(Cell, C))
 		{
-			if ((Cell & VOXRES_CELL_PENDING) != 0)
+			if ((Cell & VOXRES_CELL_PENDING) != 0 && EmitPhase != 0)
 			{
 				// Tracked but queued for unload and desired again: the CPU's
 				// resurrection branch, proposed rather than assumed.
@@ -540,12 +626,78 @@ void EntryScanCS(uint3 DTid : SV_DispatchThreadID)
 		}
 		if (SortKeySq >= LevelRadiiB[L].w) // CutoffSortKeySq
 		{
-			uint IgnoredR;
-			InterlockedAdd(Counters[VOXRES_CTR_CUTOFF_REJ], 1, IgnoredR);
+			if (EmitPhase != 0)
+			{
+				uint IgnoredR;
+				InterlockedAdd(Counters[VOXRES_CTR_CUTOFF_REJ], 1, IgnoredR);
+			}
+			continue;
+		}
+
+		// From here the candidate WOULD be proposed. The two phases split.
+		if (EmitPhase == 0)
+		{
+			uint IgnoredH;
+			InterlockedAdd(AdmitHist[L * HistBins + BinIndex(L, SortKeySq, LevelRadiiA[L].z)],
+			               1, IgnoredH);
+			continue;
+		}
+		if (AdmitBudget != 0 && SortKeySq >= BudgetThresholdSq[L])
+		{
+			// Farther out than the budget reaches. This is a rejection the CPU
+			// will now never see -- which is the whole point: 2.28M
+			// game-thread evaluations per 5 s window that never leave the GPU.
+			uint IgnoredB;
+			InterlockedAdd(Counters[VOXRES_CTR_BUDGET_REJ], 1, IgnoredB);
 			continue;
 		}
 		AppendProposal(AdmitList, AdmitCap, VOXRES_CTR_ADMIT, 1u, L, C);
 	}
+}
+
+// ---- BudgetResolveCS --------------------------------------------------------
+// One thread per level. Prefix-sums that level's histogram and publishes the
+// squared radius the emit phase admits strictly inside.
+//
+// The two degenerate answers are both "+inf" (emit everything), never "0":
+//   * the level's total never exceeds AdmitBudget -- nothing to throttle;
+//   * the budget is only exceeded in the LAST bin -- out-of-disc keys clamp
+//     into that bin, so a threshold derived from it would be meaningless.
+// Refusing to throttle is the safe direction: an emit list that is too long
+// costs CPU rejects, one that is too short starves admission and stalls
+// streaming. Both show as budRej=0 on the log line, which is the "the feature
+// did not bind" reading -- distinguishable from "the switch is off" because
+// histTot is > 0 in the first case and 0 in the second.
+
+[numthreads(8, 1, 1)]
+void BudgetResolveCS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint L = DTid.x;
+	if (L >= NumLevels)
+	{
+		return;
+	}
+	const uint Budget = BudgetFor(L);
+	uint Total = 0;
+	uint Chosen = HistBins; // sentinel: budget never exceeded
+	for (uint B = 0; B < HistBins; ++B)
+	{
+		const uint N = AdmitHist[L * HistBins + B];
+		if (Chosen == HistBins && Total + N > Budget)
+		{
+			Chosen = B;
+		}
+		Total += N;
+	}
+	uint IgnoredT;
+	InterlockedAdd(Counters[VOXRES_CTR_HIST_TOTAL], Total, IgnoredT);
+
+	// Upper edge of the chosen bin: overshoot by at most one bin's occupancy,
+	// deliberately, because undershoot starves. See the header note.
+	BudgetThresholdSq[L] = (Chosen + 1u >= HistBins)
+	                           ? 3.402823e+38f
+	                           : (float(Chosen + 1u) / float(HistBins)) *
+	                                 max(LevelRadiiA[L].z, 1.0f);
 }
 
 // ---- AuditCS ----------------------------------------------------------------
