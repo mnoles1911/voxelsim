@@ -4131,6 +4131,161 @@ double ViewBiasStrength()
 	return K;
 }
 
+// -VoxelVelocityBias=<k> (0 = off; bare = 0.5, same scale and clamp as
+// -VoxelViewBias): the view-bias penalty aimed along the anchor's MEASURED
+// VELOCITY instead of the camera's facing.
+//
+// WHY A SECOND DIRECTION SOURCE EXISTS: the horizon defect this programme is
+// fixing is about where the player is GOING, and facing and heading are
+// different signals the moment he strafes, or looks around while flying --
+// on exactly those legs -VoxelViewBias spends its budget on ground the
+// camera is looking at and the player is leaving. Velocity is the signal
+// with the lead-time meaning; the floor (-VoxelLeadHorizonSec) sets how FAR
+// ahead admission may reach, this sets WHICH candidates inside that reach
+// queue first -- the pairing that turns an open horizon into terrain landing
+// in dispatch order along the flight path.
+//
+// PRECEDENCE when both are on: velocity wins while the anchor is actually
+// moving (> 1 m/s on the smoothed EMA -- below that the heading is noise and
+// a stationary player has no horizon problem), and the pair falls back to
+// (view dir, ViewBiasStrength) otherwise. Note the fallback strength is the
+// VIEW switch's: velocity bias off-moving is not a hidden view bias.
+//
+// WHY NO velocity analogue of the view-ROTATION rescan is wired: a change of
+// velocity direction requires motion, motion crosses chunk boundaries, and
+// boundary crossings already retrigger the entry scans (at 240 m/s R0
+// crosses ~75/s). The view rescan exists because a camera can rotate while
+// the anchor holds still, which velocity by definition cannot. (Corollary:
+// with BOTH switches on, view rotation still arms rescans that velocity-
+// keyed admission does not need -- harmless re-scans, not wrong answers.)
+//
+// CHURN SAFETY, same argument that shipped -VoxelViewBias: the penalty only
+// ever RAISES the key of an off-axis candidate, admission compares keys
+// against cutoffs derived from the same keys, and eviction never reads them
+// -- so a biased candidate is admitted later or not yet, never admitted-
+// then-evicted (the 11,779 unloads/s standing-still failure was two ANCHORS
+// disagreeing, which this does not touch).
+//
+// READINGS: dispatchDot (mean cos of DISPATCHED chunks to the VIEW dir) is
+// the wrong lens for this switch on a strafe leg by design; the proof of
+// traffic is per-ring loaded/pending holding at speed on a leg where the
+// camera yaws while the flight line holds. The FAILING reading is stationary
+// unloads/s moving with the switch on -- that would mean the penalty leaked
+// into an eviction decision, which must never happen.
+double VelocityBiasStrength()
+{
+	static const double K = []
+	{
+		double Value = 0.0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelVelocityBias="), Value))
+		{
+			return FMath::Clamp(Value, 0.0, 3.0);
+		}
+		return FParse::Param(FCommandLine::Get(), TEXT("VoxelVelocityBias")) ? 0.5 : 0.0;
+	}();
+	return K;
+}
+
+// --- velocity-scaled admission horizon (-VoxelLeadHorizonSec, 2026-08-23) ----
+//
+// THE DEFECT, measured on matched -VoxelPerfSpeed legs (identical binary):
+// the R0 admission cutoff COLLAPSES as speed rises -- 114-136 m at 30 m/s,
+// 31 m at 60 and 120 m/s, 36 m at 240 m/s. In lead time that is 4.0 s of
+// terrain ahead at 30 m/s falling to 0.15 s at 240 m/s, against a 4,096 m
+// cascade, while dispatched/s FELL 2,841 -> 1,917. The player out-runs the
+// fine ring because the system asks for less the faster he moves.
+//
+// THE MECHANISM: DropFarthestOverCap defines the cutoff as "the radius that
+// holds cap-many chunks", and the relax back to DBL_MAX fires only when the
+// queue at recompute entry is under 3/4 of the (ring share of the) cap. At
+// speed, every anchor chunk crossing refills the queue to cap, so the relax
+// never fires and the cutoff stays pinned at the cap radius -- which for R0
+// is ~31 m, because cap-share-many fine chunks pack into a tiny ball around
+// the anchor. The controller is closed on ITS OWN occupancy: more speed ->
+// more candidates -> fuller queue -> SMALLER horizon. Re-sizing the cap does
+// not help and was measured not to: -VoxelAdmissionCapDrainSec 8/16/32 gave
+// 2,841 / 2,841 / 2,842 chunks/s, identical to the digit, because occupancy
+// is judged as a FRACTION of whatever the cap is.
+//
+// Meanwhile NOTHING downstream is saturated: the apply stage exits on
+// queueEmpty=219 per window, worker effective concurrency 6.6 of 24 cores,
+// GPU compute 1-2%, subsystem tick 0.25% of wall. The consumer is idle; the
+// demand signal is what starves.
+//
+// THE FIX: a per-ring FLOOR under the cutoff, sized from the anchor's own
+// measured speed -- FloorUU = SmoothedAnchorSpeed x LeadHorizonSec, clamped
+// to the ring's admit-outer radius (beyond that no candidate exists; an
+// unclamped floor would also make the cut= column overstate the real
+// horizon). The floor does two things in DropFarthestOverCap, and they must
+// travel together or the fix thrashes: entries with keys inside the floor
+// are never dropped (so admitting them once is final -- without this, every
+// entry between the cap radius and the floor would be admitted by the scan
+// and re-dropped by the very next truncate, the exact ~46k adds+erases/s
+// churn the headroom band exists to prevent), and the reported cutoff is
+// raised to at least the floor (so the next scan admits out to it).
+// Stationary, the floor is ~0 and the whole path is byte-identical to
+// control; the queue may exceed the cap by at most the candidate count
+// inside the floor radius, which is bounded by the ring's own annulus.
+//
+// GEOMETRIC CEILING, stated so nobody re-measures it as a failure: R0's
+// annulus ends at 128 m + pad, so at 240 m/s NO admission policy can hold
+// more than ~0.55 s of R0 lead -- 3 s of fine-ring lead at that speed means
+// 720 m of R0, i.e. a ring-preset change, not an admission change. What the
+// floor buys at 240 m/s is R0 pinned at its full ~132 m (up from 36 m) and
+// the COARSE rings carrying the seconds: R2's floor is 720 m inside its
+// 512+pad... clamped to full, R3-R5 hold 720 m easily. The lead-time gate
+// must therefore be read per ring against min(speed x LeadSec, admit-outer).
+//
+// READINGS (Voxel admission detail line, new trailing flr=/kept= columns):
+//   HEALTHY  flr= tracks speed x LeadSec (clamped), cut= >= flr=, kept= > 0
+//            while moving fast, per-ring loaded/pending rising to annulus
+//            fill at every speed, stationary unloaded/s flat.
+//   FAILING  kept=0 and cut= unchanged at speed with the switch on: the
+//            floor never bound -- the speed EMA is broken or truncate never
+//            ran; the switch is doing nothing and must not be credited.
+//   FAILING  cut= sits at flr= but dispatched/s and per-ring loaded do not
+//            move: admission opened and dispatch did not follow -- the
+//            constraint is the per-call budget (cap/4) or the worker
+//            scheduler (see -VoxelWorkerTaskPri's Little's-law note), and
+//            widening the horizon further buys nothing.
+//   FAILING  dropped= balloons while dispatched/s stays flat: truncate
+//            thrash reintroduced beyond the floor; the floor/keep pairing
+//            above has been broken by a later edit.
+//
+// 0 = off = control arm. Bare -VoxelLeadHorizonSec = 3.0 s (the owner-felt
+// gap: at 240 m/s that is the difference between 36 m and the full ring).
+double LeadHorizonSec()
+{
+	static const double Sec = []
+	{
+		double Value = 0.0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelLeadHorizonSec="), Value))
+		{
+			return FMath::Clamp(Value, 0.0, 30.0);
+		}
+		return FParse::Param(FCommandLine::Get(), TEXT("VoxelLeadHorizonSec")) ? 3.0 : 0.0;
+	}();
+	return Sec;
+}
+
+// The ADMIT-outer radius of a ring -- Outer plus the seam pad the entry scan
+// applies (half-diagonal vs -VoxelRingOverlapChunks, Max of the two). The
+// same derivation is spelled inline at the entry scan and in the T4-2
+// GPU-residency capture ("same derivations, in the same order"); this helper
+// exists so the lead-horizon floor clamps against the SAME radius the scan
+// admits to -- a floor clamped to a third, drifted spelling would silently
+// stop at a different edge than admission does, the exact derived-not-
+// verified failure this file keeps documenting. Any edit to the entry scan's
+// pad must land here too.
+double AdmitOuterUU(int32 Level)
+{
+	const double OuterUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0;
+	const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+	const double ChunkHalfDiagUU = ChunkEdge * 0.70710678118654752440;
+	const double RingOverlapUU = double(UVoxelWorldSubsystem::GetRingOverlapChunks()) * ChunkEdge;
+	return OuterUU + FMath::Max(ChunkHalfDiagUU, RingOverlapUU);
+}
+
 // The one key every priority stage reads. Layered on BiasedSortKeySq rather
 // than replacing it: hierarchical coverage's inner-radius clamp and the view
 // bias compose (an interior coarse stand-in behind the camera queues behind
@@ -5887,6 +6042,19 @@ struct FVoxelWorldImpl
 	// treats zero as "no bias, no metric" rather than as a direction.
 	FVector2D StreamViewDirXY = FVector2D::ZeroVector;
 	void SetStreamViewDir(const FVector2D& DirXY) { StreamViewDirXY = DirXY; }
+	// The (direction, strength) pair the admission KEYS actually use --
+	// (StreamViewDirXY, ViewBiasStrength) in the control arm, the smoothed
+	// anchor velocity under -VoxelVelocityBias while moving (see
+	// VoxelStreamAdmission::VelocityBiasStrength for precedence and why).
+	// Recomputed once per streaming tick, immediately after the velocity EMA,
+	// so every key producer in one tick sees ONE pair -- the entry scan and
+	// SortPendingQueues disagreeing on the direction would store keys the
+	// cutoff was not derived against. Metrics that are ABOUT facing
+	// (dispatchDot, the rotation-rescan trigger) deliberately keep reading
+	// StreamViewDirXY: overriding it here would corrupt the instrument that
+	// proves where dispatches point.
+	FVector2D StreamBiasDirXY = FVector2D::ZeroVector;
+	double StreamBiasK = 0.0;
 	// The view direction each level's entry scan last decided admission
 	// against -- the rotation analogue of LastEntryScanAnchorXY, and the state
 	// that makes the rotation-rescan trigger self-quenching (the rescan it
@@ -6924,6 +7092,18 @@ struct FVoxelWorldImpl
 	int64 LevelRejFineSinceLog[VoxelCoords::kNumLevels] = {};
 	int64 LevelRejNearestSinceLog[VoxelCoords::kNumLevels] = {};
 
+	// -VoxelLeadHorizonSec proof-of-traffic (see VoxelStreamAdmission::
+	// LeadHorizonSec for the collapse measurement and the failing readings).
+	// LevelFloorKeptSinceLog: queue entries a truncate pass was still trying
+	// to drop when it crossed inside the velocity floor -- i.e. entries the
+	// PRE-FLOOR controller would have dropped and re-admitted. 0 while moving
+	// fast with the switch on is the FAILING reading (floor never bound).
+	// LevelFloorUUForLog: the clamped floor radius the last truncate used, UU
+	// (0 = off or stationary), printed as flr= so cut= can be judged against
+	// what the floor ASKED for rather than against memory of the speed.
+	int64 LevelFloorKeptSinceLog[VoxelCoords::kNumLevels] = {};
+	double LevelFloorUUForLog[VoxelCoords::kNumLevels] = {};
+
 	// -VoxelCutoffClamp bookkeeping (see VoxelStreamAdmission::
 	// CutoffClampEnabled). A clamped scan is NOT a full scan: cells outside
 	// the clamp radius were never enumerated, so their work is outstanding by
@@ -7408,7 +7588,13 @@ private:
 	// Drops the farthest entries of an ALREADY-SORTED (farthest-first) queue
 	// until it fits EntryCap, removing their chunk records too, and writes the
 	// re-admission cutoff distance. Returns true if anything was held back.
-	bool DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq);
+	// FloorKeySq (-VoxelLeadHorizonSec; 0 = off, byte-identical control) is
+	// the velocity floor in SORT-KEY units: entries with keys inside it are
+	// never dropped and the reported cutoff never sits below it -- both
+	// halves together, or the floor admits-then-drops in a loop (see
+	// VoxelStreamAdmission::LeadHorizonSec).
+	bool DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq,
+	                         double FloorKeySq);
 	// THE in-flight cap, computed in exactly one place. DispatchJobs ENFORCES
 	// this number (its `while (CpuJobsOutstanding() < ...)` loop condition) and
 	// UpdatePerfSnapshot PUBLISHES it (the HUD's "jobs N/cap" row) -- both must
@@ -7684,6 +7870,26 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	}
 	PrevAnchorLocation = Anchor;
 	bHasPrevAnchor = true;
+
+	// -VoxelVelocityBias: pick this tick's ONE (direction, strength) pair for
+	// every admission key producer (see StreamBiasDirXY's declaration). The
+	// 1 m/s gate is on the same smoothed speed the lead-horizon floor uses;
+	// under it (and always with the switch off) this is exactly the old
+	// (view, ViewBias) pair, so the control arm's keys are bit-identical.
+	StreamBiasDirXY = StreamViewDirXY;
+	StreamBiasK = VoxelStreamAdmission::ViewBiasStrength();
+	{
+		const double VelK = VoxelStreamAdmission::VelocityBiasStrength();
+		if (VelK > 0.0 && SmoothedAnchorSpeedUUPerSec > 100.0)
+		{
+			const FVector2D VelXY(SmoothedAnchorVelocity.X, SmoothedAnchorVelocity.Y);
+			if (!VelXY.IsNearlyZero()) // pure vertical flight has no XY heading; keep the view pair
+			{
+				StreamBiasDirXY = VelXY.GetSafeNormal();
+				StreamBiasK = VelK;
+			}
+		}
+	}
 
 	LastAnchorLocation = Anchor;
 
@@ -9906,11 +10112,21 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		           // beside the cutoff, "cut= pinned" cannot be told apart
 		           // from "cut= pinned AND the queue genuinely never drains",
 		           // which are opposite verdicts on the relax condition.
+		           // flr=/kept= appended 2026-08-23 (at the END, same old-leg-
+		           // grep rule as q=): the -VoxelLeadHorizonSec velocity floor
+		           // in metres and the entries it protected from truncation.
+		           // cut= below flr= in the same window is the FAILING reading
+		           // (the floor is not reaching the cutoff); flr=0 with the
+		           // switch on and speed= nonzero on the speculative line is
+		           // the OTHER failing reading (the speed EMA is not feeding
+		           // the floor). See LeadHorizonSec's doc comment.
 		           return FString::Printf(
-		               TEXT("R%d[cut=%.0f rejB=%lld rejC=%lld rejF=%lld rejN=%lld bk=%d q=%d]"), L, CutM,
+		               TEXT("R%d[cut=%.0f rejB=%lld rejC=%lld rejF=%lld rejN=%lld bk=%d q=%d flr=%.0f kept=%lld]"),
+		               L, CutM,
 		               (long long)LevelRejBudgetSinceLog[L], (long long)LevelRejCutoffSinceLog[L],
 		               (long long)LevelRejFineSinceLog[L], (long long)LevelRejNearestSinceLog[L],
-		               DeferredFootprints[L].Num(), PendingJobKeysByLevel[L].Num());
+		               DeferredFootprints[L].Num(), PendingJobKeysByLevel[L].Num(),
+		               LevelFloorUUForLog[L] / 100.0, (long long)LevelFloorKeptSinceLog[L]);
 	           }));
 	// -VoxelCutoffClamp proof-of-traffic (gated so old-leg greps stay clean):
 	// clampScans / skippedCells per ring. All zeros with the cutoffs relaxed
@@ -11203,6 +11419,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		LevelRejCutoffSinceLog[Level] = 0;
 		LevelRejFineSinceLog[Level] = 0;
 		LevelRejNearestSinceLog[Level] = 0;
+		LevelFloorKeptSinceLog[Level] = 0; // -VoxelLeadHorizonSec kept= (flr= is latest-state, not a window sum: no reset)
 		LevelClampedScansSinceLog[Level] = 0;
 		LevelClampSkippedCellsSinceLog[Level] = 0;
 	}
@@ -12692,8 +12909,13 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	// are bit-identical). Refreshing the VIEW term here, every recompute, is
 	// what makes a turn reorder the already-queued work without any rescan:
 	// the queue's stored keys are never older than the last recompute.
-	const double ViewBiasK = VoxelStreamAdmission::ViewBiasStrength();
-	const auto PriorityKeySq = [&Anchor, ViewBiasK, this](const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
+	// -VoxelVelocityBias: (StreamBiasDirXY, StreamBiasK) is the per-tick pair
+	// -- identical to (StreamViewDirXY, ViewBiasStrength) in the control arm,
+	// the velocity heading while moving with the switch on. Refreshing the
+	// SAME pair here and in the entry scan is what keeps stored keys and the
+	// cutoff on one scale.
+	const double BiasK = StreamBiasK;
+	const auto PriorityKeySq = [&Anchor, BiasK, this](const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
 	{
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(LevelKey.Level);
 		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
@@ -12702,7 +12924,7 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 		const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
 		                        FMath::Square(CenterZ - Anchor.Z);
 		return VoxelStreamAdmission::PrioritySortKeySq(LevelKey.Level, DistSq3D, CenterX - Anchor.X,
-		                                                CenterY - Anchor.Y, StreamViewDirXY, ViewBiasK);
+		                                                CenterY - Anchor.Y, StreamBiasDirXY, BiasK);
 	};
 	// docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
 	// within level, lower level (finer) wins priority at equal distance."
@@ -13327,9 +13549,12 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 	// it would mix two scales for interior coarse chunks, and
 	// mixing biased-and-unbiased view keys would do the same
 	// for chunks behind the camera.
+	// (StreamBiasDirXY, StreamBiasK): view pair in the control arm,
+	// velocity pair under -VoxelVelocityBias while moving -- the SAME
+	// pair SortPendingQueues refreshed this tick's stored keys with.
 	const double SortKeySq = VoxelStreamAdmission::PrioritySortKeySq(
-	    QueueLevel, DistSq3D, CenterX - Anchor.X, CenterY - Anchor.Y, StreamViewDirXY,
-	    VoxelStreamAdmission::ViewBiasStrength());
+	    QueueLevel, DistSq3D, CenterX - Anchor.X, CenterY - Anchor.Y, StreamBiasDirXY,
+	    StreamBiasK);
 	if (!bOverlayAware && SortKeySq >= LevelAdmissionCutoffDistSq[QueueLevel])
 	{
 		++CandidatesRejectedSinceLog;
@@ -15370,7 +15595,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	++RecomputeCalls;
 }
 
-bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq)
+bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq,
+                                          double FloorKeySq)
 {
 	// Bounded admission gate (b) -- see LevelAdmissionCutoffDistSq's doc
 	// comment. `Entries` must be sorted lowest-priority-first (farthest at
@@ -15409,6 +15635,26 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 					DeferredFootprints[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)].Add(
 						FIntPoint(Entry.Key.Key.X, Entry.Key.Key.Y));
 				}
+				continue;
+			}
+			// -VoxelLeadHorizonSec velocity floor: an entry inside the floor
+			// is ground the player will reach within LeadHorizonSec at the
+			// measured speed -- dropping it here just to re-admit it on the
+			// next scan is the admit/erase churn the headroom band was built
+			// against, now induced by the controller itself. Keep it, and
+			// count it: kept= is this switch's proof of traffic, and 0 while
+			// moving fast is the FAILING reading. Placed AFTER the dead-weight
+			// branch on purpose -- a record-less entry is queue hygiene, not
+			// desired work, and keeping it inside the floor would let the
+			// floor preserve garbage. Sorted farthest-first means every later
+			// entry is inside the floor too, but the loop still has to visit
+			// them to compact the array, so this is a per-entry test either
+			// way. FloorKeySq == 0 (switch off) never takes this branch:
+			// byte-identical control.
+			if (FloorKeySq > 0.0 && Entry.DistSq < FloorKeySq)
+			{
+				++LevelFloorKeptSinceLog[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+				Entries[Write++] = Entry;
 				continue;
 			}
 			// A queued chunk has never meshed, so it has no component and no job
@@ -15483,6 +15729,16 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 	const int32 Headroom = FMath::Max(1, EntryCap / VoxelStreamAdmission::CutoffHeadroomDiv());
 	const int32 CutoffIndex = FMath::Min(Headroom, Write - 1);
 	OutCutoffDistSq = (Write > 0) ? Entries[CutoffIndex].DistSq : DBL_MAX;
+	// -VoxelLeadHorizonSec: the OTHER half of the floor. Keeping in-floor
+	// entries above is useless if the reported cutoff still sits at the cap
+	// radius -- the next entry scan would go on rejecting (rejC) every
+	// candidate between the cap radius and the floor, and the horizon would
+	// stay collapsed with the queue merely a little deeper. The two must
+	// agree on the same boundary; see LeadHorizonSec's doc comment.
+	if (FloorKeySq > 0.0 && OutCutoffDistSq < FloorKeySq)
+	{
+		OutCutoffDistSq = FloorKeySq;
+	}
 	return true;
 }
 
@@ -15493,6 +15749,32 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 	const int32 Cap = EffectivePendingJobCap; // -VoxelAdmissionCapDrainSec: same per-tick cap admission spent
 	bool bHeldBack = false;
 	bool bLevelHeldBackThisCall[VoxelCoords::kNumLevels] = {}; // per-ring attribution for the clear below
+
+	// -VoxelLeadHorizonSec (see VoxelStreamAdmission::LeadHorizonSec): the
+	// velocity floor, computed ONCE per truncate from the same finite-
+	// differenced anchor speed the speculative lead uses (Pawn->GetVelocity()
+	// is zero for the whole of a -VoxelPerfFlight leg -- the speeds this fix
+	// exists for are exactly the ones that lane would read as stationary).
+	// Clamped per ring to the admit-outer radius: past it no candidate exists,
+	// and an unclamped floor would make cut= claim a horizon the annulus
+	// cannot deliver. In SORT-KEY units for the same reason the cutoff
+	// comparison is (see the entry scan's SortKeySq note): a floor compared
+	// against biased keys in raw-distance units would mix two scales. A
+	// straight-ahead candidate's key is its raw distance squared (view/
+	// velocity bias only ever RAISES off-axis keys), so Square(FloorUU)
+	// guarantees precisely the forward corridor -- which is the corridor the
+	// player is about to cross. Zero when off or stationary: byte-identical.
+	double FloorKeySqByLevel[VoxelCoords::kNumLevels] = {};
+	{
+		const double LeadSec = VoxelStreamAdmission::LeadHorizonSec();
+		const double FloorUU = (LeadSec > 0.0) ? SmoothedAnchorSpeedUUPerSec * LeadSec : 0.0;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			const double ClampedUU = FMath::Min(FloorUU, VoxelStreamAdmission::AdmitOuterUU(Level));
+			FloorKeySqByLevel[Level] = (ClampedUU > 0.0) ? FMath::Square(ClampedUU) : 0.0;
+			LevelFloorUUForLog[Level] = ClampedUU;
+		}
+	}
 
 	if (Cap <= 0)
 	{
@@ -15513,7 +15795,8 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 		{
 			const int32 LevelCap =
 				FMath::Max(1, FMath::RoundToInt(double(Cap) * VoxelStreamAdmission::kRingCapShare[Level]));
-			if (DropFarthestOverCap(PendingJobKeysByLevel[Level], LevelCap, LevelAdmissionCutoffDistSq[Level]))
+			if (DropFarthestOverCap(PendingJobKeysByLevel[Level], LevelCap, LevelAdmissionCutoffDistSq[Level],
+			                        FloorKeySqByLevel[Level]))
 			{
 				// This ring, and only this ring, still has candidates it could
 				// not take -- so only this ring's refill trigger stays armed.
@@ -15546,7 +15829,13 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 				    return A.Key.Level > B.Key.Level;
 			    });
 			double GlobalCutoff = DBL_MAX;
-			bHeldBack = DropFarthestOverCap(TruncateMergeScratch, Cap, GlobalCutoff);
+			// -VoxelRingQuota=0 composes with the lead floor the way one
+			// shared cap composes with everything: one boundary for all
+			// rings. The FINEST ring's floor is the right one -- it is the
+			// smallest (tightest admit-outer clamp), so the floor never
+			// claims a radius some ring's annulus cannot hold, and R0 is the
+			// ring the collapse starves first anyway.
+			bHeldBack = DropFarthestOverCap(TruncateMergeScratch, Cap, GlobalCutoff, FloorKeySqByLevel[0]);
 			if (bHeldBack)
 			{
 				// -VoxelRingQuota=0 reproduces the pre-quota behaviour exactly,
