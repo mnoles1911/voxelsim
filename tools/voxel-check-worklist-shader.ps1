@@ -42,6 +42,8 @@ $VoxelizeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistVoxelize.usf'
 $ClassifyUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistClassify.usf'
 $StampUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistAssetStamp.usf'
 $PackUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistPack.usf'
+$ClaimUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistClaim.usf'
+$PoolAllocUsf = Join-Path $Root 'ue-project\Shaders\VoxelBrickPoolAlloc.usf'
 $AssetStampUsf = Join-Path $Root 'ue-project\Shaders\VoxelAssetStamp.usf'
 $WorldGen = Join-Path $Root 'voxel-core\shaders\worldgen.ush'
 $BrickPack = Join-Path $Root 'voxel-core\shaders\brickpack.ush'
@@ -109,6 +111,17 @@ Copy-Item $BrickPack (Join-Path $Stage 'brickpack.ush')
     Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
     Replace('"/VoxelCore/brickpack.ush"', '"brickpack.ush"') |
     Out-File (Join-Path $Stage 'VoxelWorklistPack.hlsl') -Encoding utf8
+# VoxelBrickPoolAlloc.usf is INCLUDED by the worklist claim kernels (P3 stage
+# 6 -- the factored claim/write bodies live there); stage it with its own
+# Platform include stubbed, the VoxelAssetStamp pattern.
+(Get-Content $PoolAllocUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub') |
+    Out-File (Join-Path $Stage 'VoxelBrickPoolAlloc.usf') -Encoding utf8
+(Get-Content $ClaimUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelEarth/VoxelBrickPoolAlloc.usf"', '"VoxelBrickPoolAlloc.usf"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistClaim.hlsl') -Encoding utf8
 
 $Out = Join-Path $Stage 'out.bin'
 $Fail = 0
@@ -190,6 +203,23 @@ $PackDefines = @('VXC_UE=1',
                  'VXC_WORKLIST_CELLS_PER_RECORD=32768', 'VXC_WORKLIST_MATWORDS_PER_RECORD=8448')
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistPack.hlsl') 'PackWorklistMain'       'pack    DXIL  PackWorklistMain'       $PackDefines
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistPack.hlsl') 'PackWorklistVerifyMain' 'packvfy DXIL  PackWorklistVerifyMain' $PackDefines
+
+# The Claim stage (VoxelWorklistClaim.usf; P3 stage 6). Includes
+# VoxelBrickPoolAlloc.usf for the factored claim/write bodies; no version
+# lock (the alloc family moves dwords). Defines mirror the
+# FVoxelWorklistClaim* classes'; the kernels #error on drift.
+$ClaimDefines = @('VXC_WORKLIST_CLAIM_GROUPS=1', 'VXC_WORKLIST_WRITE_GROUPS=148',
+                  'VXC_WORKLIST_BRICKS_PER_RECORD=64', 'VXC_WORKLIST_MATWORDS_PER_RECORD=8448')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClaim.hlsl') 'ClaimWorklistMain'       'claim   DXIL  ClaimWorklistMain'       $ClaimDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClaim.hlsl') 'ClaimWriteWorklistMain'  'clmwr   DXIL  ClaimWriteWorklistMain'  $ClaimDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClaim.hlsl') 'ClaimRecordWorklistMain' 'clmrec  DXIL  ClaimRecordWorklistMain' $ClaimDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClaim.hlsl') 'ClaimWorklistVerifyMain' 'clmvfy  DXIL  ClaimWorklistVerifyMain' $ClaimDefines
+# And the classic alloc entry points, whose file gained the factored bodies:
+# the factoring must not have broken the shipped forms.
+foreach ($AllocEntry in @('BrickPoolClaimMain','BrickPoolAllocWordCopyMain','BrickPoolAllocDescMain',
+                          'BrickPoolAllocRecordMain','BrickPoolFreeMain','BrickPoolAllocVerifyMain')) {
+    $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelBrickPoolAlloc.usf') $AllocEntry "alloc   DXIL  $AllocEntry (classic)"
+}
 
 # The factored classic kernels, both atlas permutations -- the factoring must
 # not have broken the shipped forms (the digest gate proves bytes; this proves

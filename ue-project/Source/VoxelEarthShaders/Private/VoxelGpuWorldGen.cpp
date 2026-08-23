@@ -1240,6 +1240,13 @@ namespace
 			SHADER_PARAMETER(uint32, BrickBase)
 			// Stack-claim: this member's slice of the shared scratch descs.
 			SHADER_PARAMETER(uint32, SrcDescBase)
+			// P3 Pack stage (stage-6 audit): the same bases the claim folded
+			// into its spare pair, so the kernel can subtract them back out
+			// of the rebase term -- pack-arena descriptors are CHUNK-relative
+			// and must not be rebased by their word-copy source base. 0 on
+			// the classic and stack paths.
+			SHADER_PARAMETER(uint32, SrcWordsOccBase)
+			SHADER_PARAMETER(uint32, SrcWordsMatBase)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
@@ -1265,6 +1272,11 @@ namespace
 			// Stack-claim: this member's desc slice and L1-mask slot.
 			SHADER_PARAMETER(uint32, SrcDescBase)
 			SHADER_PARAMETER(uint32, ChunkMaskBase)
+			// P3 Pack stage (stage-6 audit): base of this chunk's occ words
+			// in InBrickOcc, for the allSolid reduce -- the pack arena's
+			// descs are chunk-relative while the arena is shared. 0 on the
+			// classic and stack paths (offsets there index the scratch from 0).
+			SHADER_PARAMETER(uint32, SrcWordsOccBase)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
@@ -1306,6 +1318,120 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InAllocSide)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InAllocBitmap)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutVerify)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- the worklist Claim stage (P3 stage 6; VoxelWorklistClaim.usf) ------
+	//
+	// Four kernels, one file, all including VoxelBrickPoolAlloc.usf for the
+	// factored claim/write bodies -- FVoxelBrickPoolShader base (SM5, no
+	// version lock: these move dwords and interpret nothing but the brick
+	// descriptor fields, the alloc family's own standing). DECLARED AFTER the
+	// base and the alloc classes above -- the C2504 declaration-order trap
+	// this file already paid for once (see FVoxelBrickPackCS's note).
+	//
+	// The stage-shape defines mirror the host table entries; the kernels
+	// #error on drift (the torn-dispatch lock, per converted kernel).
+	#define VOXEL_WORKLIST_CLAIM_SHAPE_DEFINES() \
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, \
+		                                         FShaderCompilerEnvironment& OutEnvironment) \
+		{ \
+			FVoxelBrickPoolShader::ModifyCompilationEnvironment(Parameters, OutEnvironment); \
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_CLAIM_GROUPS"), \
+			                         uint32(1)); \
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_WRITE_GROUPS"), \
+			                         FVoxelGpuWorklist::kWriteGroupsPerRecord); \
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_BRICKS_PER_RECORD"), \
+			                         FVoxelGpuWorklist::kBricksPerRecord); \
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_MATWORDS_PER_RECORD"), \
+			                         FVoxelGpuWorklist::kMatWordsPerRecord); \
+		}
+
+	// The ring + eligibility bindings every claim-stage kernel shares.
+	#define VOXEL_WORKLIST_CLAIM_RING_PARAMETERS() \
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords) \
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl) \
+		SHADER_PARAMETER(uint32, RingCapacity)
+
+	class FVoxelWorklistClaimCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistClaimCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistClaimCS, FVoxelBrickPoolShader);
+		VOXEL_WORKLIST_CLAIM_SHAPE_DEFINES()
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICK_ALLOC_LAYOUT_PARAMETERS()
+			VOXEL_WORKLIST_CLAIM_RING_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickTotals)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocState)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocBitmap)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocSide)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutClaim)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelWorklistClaimWriteCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistClaimWriteCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistClaimWriteCS, FVoxelBrickPoolShader);
+		VOXEL_WORKLIST_CLAIM_SHAPE_DEFINES()
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORKLIST_CLAIM_RING_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWordsOccArena)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWordsMatArena)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutWordsOcc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutWordsMat)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelWorklistClaimRecordCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistClaimRecordCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistClaimRecordCS, FVoxelBrickPoolShader);
+		VOXEL_WORKLIST_CLAIM_SHAPE_DEFINES()
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORKLIST_CLAIM_RING_PARAMETERS()
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkBrickMask)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkTable)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelWorklistClaimVerifyCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistClaimVerifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistClaimVerifyCS, FVoxelBrickPoolShader);
+		VOXEL_WORKLIST_CLAIM_SHAPE_DEFINES()
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORKLIST_CLAIM_RING_PARAMETERS()
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkBrickMask)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWordsOccArena)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWordsMatArena)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InPoolTable)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, VerifyPoolDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyPoolOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyPoolMat)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
@@ -1402,6 +1528,12 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistAssetStampCS, VOXEL_WORKLIST_ASSET_STAMP_U
 #define VOXEL_WORKLIST_PACK_USF "/VoxelEarth/VoxelWorklistPack.usf"
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistPackCS,       VOXEL_WORKLIST_PACK_USF, "PackWorklistMain",       SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistPackVerifyCS, VOXEL_WORKLIST_PACK_USF, "PackWorklistVerifyMain", SF_Compute);
+
+#define VOXEL_WORKLIST_CLAIM_USF "/VoxelEarth/VoxelWorklistClaim.usf"
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClaimCS,       VOXEL_WORKLIST_CLAIM_USF, "ClaimWorklistMain",       SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClaimWriteCS,  VOXEL_WORKLIST_CLAIM_USF, "ClaimWriteWorklistMain",  SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClaimRecordCS, VOXEL_WORKLIST_CLAIM_USF, "ClaimRecordWorklistMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClaimVerifyCS, VOXEL_WORKLIST_CLAIM_USF, "ClaimWorklistVerifyMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMeshCountCS,  VOXEL_WORLDGEN_USF, "MeshCountMain",  SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanBlocksCS, VOXEL_WORLDGEN_USF, "ScanBlocksMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanSumsCS,   VOXEL_WORLDGEN_USF, "ScanSumsMain",   SF_Compute);
@@ -3446,7 +3578,8 @@ void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
                                                     uint32 RingLevel, const FIntVector& OriginVoxel,
                                                     const FVoxelBrickChunkShading& Shading,
                                                     uint32 OccWorstWords, uint32 MatWorstWords,
-                                                    uint32 SrcDescBase, uint32 ChunkMaskBase)
+                                                    uint32 SrcDescBase, uint32 ChunkMaskBase,
+                                                    uint32 SrcWordsOccBase, uint32 SrcWordsMatBase)
 {
 	if (!Buffers.IsValid() || Claim == nullptr || SrcOcc == nullptr || SrcMat == nullptr ||
 	    SrcDesc == nullptr || SrcChunkMask == nullptr || BrickCount == 0)
@@ -3495,6 +3628,8 @@ void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
 		Params->BrickCount = BrickCount;
 		Params->BrickBase = BrickBase;
 		Params->SrcDescBase = SrcDescBase;
+		Params->SrcWordsOccBase = SrcWordsOccBase;
+		Params->SrcWordsMatBase = SrcWordsMatBase;
 		Params->InClaim = GraphBuilder.CreateSRV(Claim);
 		Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
 		Params->OutBrickDesc = GraphBuilder.CreateUAV(Buffers.PoolDesc);
@@ -3516,6 +3651,7 @@ void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
 		Params->OriginVoxel = FIntVector3(OriginVoxel.X, OriginVoxel.Y, OriginVoxel.Z);
 		Params->SrcDescBase = SrcDescBase;
 		Params->ChunkMaskBase = ChunkMaskBase;
+		Params->SrcWordsOccBase = SrcWordsOccBase;
 		Params->InClaim = GraphBuilder.CreateSRV(Claim);
 		Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
 		Params->InBrickOcc = GraphBuilder.CreateSRV(SrcOcc);
@@ -3581,6 +3717,117 @@ void VoxelGpuWorldGen::AddBrickPoolAllocVerifyPass(FRDGBuilder& GraphBuilder,
 	FComputeShaderUtils::AddPass(
 		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolAllocVerify(%u chunks)", NumEntries),
 		Shader, Params, FIntVector(FMath::DivideAndRoundUp(NumEntries, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddWorklistClaimPasses(FRDGBuilder& GraphBuilder,
+                                              const FWorklistClaimDispatch& Dispatch)
+{
+	check(IsInRenderingThread());
+	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs);
+	check(Dispatch.Totals && Dispatch.PackDesc && Dispatch.PackOcc);
+	check(Dispatch.PackMat && Dispatch.PackMask);
+	check(Dispatch.Pool.IsValid());
+	check(Dispatch.RingCapacity > 0 && Dispatch.ClaimBudgetRecords > 0);
+	check(Dispatch.ChunkRecordDwords > 0);
+	check(!Dispatch.bVerify || Dispatch.VerifyStats != nullptr);
+
+	// The per-flush claim buffer: 8 dwords per record, an RDG TRANSIENT --
+	// every consumer (the write pair, the verify) lives in this same graph,
+	// so unlike the arenas nothing outside the flush ever reads it. Claim
+	// failure/success facts persist where they always did: the AllocState
+	// counters and the side table.
+	FRDGBufferRef Claim = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(
+			sizeof(uint32),
+			Dispatch.ClaimBudgetRecords * FVoxelGpuWorklist::kClaimDwordsPerRecord),
+		TEXT("Voxel.WorklistClaim"));
+
+	// --- the claim proper: Record triple, 1 group per record ----------------
+	{
+		FVoxelWorklistClaimCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistClaimCS::FParameters>();
+		FillBrickAllocLayout(Params, Dispatch.PoolLayout);
+		Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+		Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+		Params->RingCapacity = Dispatch.RingCapacity;
+		Params->InBrickTotals = GraphBuilder.CreateSRV(Dispatch.Totals);
+		Params->AllocState = GraphBuilder.CreateUAV(Dispatch.Pool.AllocState);
+		Params->AllocBitmap = GraphBuilder.CreateUAV(Dispatch.Pool.AllocBitmap);
+		Params->AllocSide = GraphBuilder.CreateUAV(Dispatch.Pool.AllocSide);
+		Params->OutClaim = GraphBuilder.CreateUAV(Claim);
+		Params->IndirectArgs = Dispatch.IndirectArgs;
+		TShaderMapRef<FVoxelWorklistClaimCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClaim(indirect)"), Shader, Params,
+			Dispatch.IndirectArgs, Dispatch.RecordArgsOffset);
+	}
+
+	// --- both word copies: Write triple, 148 worst-case groups per record ---
+	{
+		FVoxelWorklistClaimWriteCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistClaimWriteCS::FParameters>();
+		Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+		Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+		Params->RingCapacity = Dispatch.RingCapacity;
+		Params->InClaim = GraphBuilder.CreateSRV(Claim);
+		Params->InWordsOccArena = GraphBuilder.CreateSRV(Dispatch.PackOcc);
+		Params->InWordsMatArena = GraphBuilder.CreateSRV(Dispatch.PackMat);
+		Params->OutWordsOcc = GraphBuilder.CreateUAV(Dispatch.Pool.PoolOcc);
+		Params->OutWordsMat = GraphBuilder.CreateUAV(Dispatch.Pool.PoolMat);
+		Params->IndirectArgs = Dispatch.IndirectArgs;
+		TShaderMapRef<FVoxelWorklistClaimWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClaimWrite(indirect)"), Shader, Params,
+			Dispatch.IndirectArgs, Dispatch.WriteArgsOffset);
+	}
+
+	// --- descriptors + the chunk record: Record triple ----------------------
+	{
+		FVoxelWorklistClaimRecordCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistClaimRecordCS::FParameters>();
+		Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+		Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+		Params->RingCapacity = Dispatch.RingCapacity;
+		Params->ChunkRecordDwords = Dispatch.ChunkRecordDwords;
+		Params->InClaim = GraphBuilder.CreateSRV(Claim);
+		Params->InBrickDesc = GraphBuilder.CreateSRV(Dispatch.PackDesc);
+		Params->InBrickOcc = GraphBuilder.CreateSRV(Dispatch.PackOcc);
+		Params->InChunkBrickMask = GraphBuilder.CreateSRV(Dispatch.PackMask);
+		Params->OutBrickDesc = GraphBuilder.CreateUAV(Dispatch.Pool.PoolDesc);
+		Params->OutChunkTable = GraphBuilder.CreateUAV(Dispatch.Pool.PoolTable);
+		Params->IndirectArgs = Dispatch.IndirectArgs;
+		TShaderMapRef<FVoxelWorklistClaimRecordCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClaimRecord(indirect)"), Shader, Params,
+			Dispatch.IndirectArgs, Dispatch.RecordArgsOffset);
+	}
+
+	// --- the byte gate, verify arm only: Record triple ----------------------
+	if (Dispatch.bVerify)
+	{
+		FVoxelWorklistClaimVerifyCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistClaimVerifyCS::FParameters>();
+		Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+		Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+		Params->RingCapacity = Dispatch.RingCapacity;
+		Params->ChunkRecordDwords = Dispatch.ChunkRecordDwords;
+		Params->InClaim = GraphBuilder.CreateSRV(Claim);
+		Params->InBrickDesc = GraphBuilder.CreateSRV(Dispatch.PackDesc);
+		Params->InBrickOcc = GraphBuilder.CreateSRV(Dispatch.PackOcc);
+		Params->InChunkBrickMask = GraphBuilder.CreateSRV(Dispatch.PackMask);
+		Params->InWordsOccArena = GraphBuilder.CreateSRV(Dispatch.PackOcc);
+		Params->InWordsMatArena = GraphBuilder.CreateSRV(Dispatch.PackMat);
+		Params->InPoolTable = GraphBuilder.CreateSRV(Dispatch.Pool.PoolTable);
+		Params->VerifyPoolDesc = GraphBuilder.CreateSRV(Dispatch.Pool.PoolDesc);
+		Params->VerifyPoolOcc = GraphBuilder.CreateSRV(Dispatch.Pool.PoolOcc);
+		Params->VerifyPoolMat = GraphBuilder.CreateSRV(Dispatch.Pool.PoolMat);
+		Params->WorklistStats = GraphBuilder.CreateUAV(Dispatch.VerifyStats);
+		Params->IndirectArgs = Dispatch.IndirectArgs;
+		TShaderMapRef<FVoxelWorklistClaimVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClaimVerify(indirect)"), Shader, Params,
+			Dispatch.IndirectArgs, Dispatch.RecordArgsOffset);
+	}
 }
 
 bool VoxelGpuWorldGen::IsSupportedOnCurrentRHI()

@@ -363,98 +363,43 @@ uint BitmapClear(uint BitmapFirst, uint Rel, uint Class, uint Step)
 }
 
 // ---------------------------------------------------------------------------
-// BrickPoolClaimMain -- ONE thread claims this chunk's two arena ranges.
+// poolClaimChunkAt -- the claim proper, FACTORED (P3 stage 6) so the classic
+// per-chunk entry point and the worklist Claim stage run the SAME TEXT (the
+// called-not-copied rule every converted stage follows). One thread claims one
+// chunk's two arena ranges: totals -> class -> pop-or-bump -> bitmap -> side
+// table + the 8-dword claim slice at ClaimBase. SrcOccOut/SrcMatOut land in
+// the spare pair [6]/[7] -- the word-copy source base, already summed by the
+// caller (stack prefix + SrcWords*Base on the classic path; the record's
+// pack-arena slice base on the worklist path).
 //
-// Reads the totals the scan already produced ON THE GPU (the same two dwords the
-// readback used to carry), classes them, pops-or-bumps, marks the bitmap, writes
-// the side table and the claim record the write passes consume. A failed claim
-// writes ok=0 and a reason; the write passes then write NOTHING except a zeroed
-// record, so failure renders as an absent chunk -- never as somebody else's bytes.
+// A failed claim writes ok=0 and a reason; the write passes then write
+// NOTHING except a zeroed record, so failure renders as an absent chunk --
+// never as somebody else's bytes.
 // ---------------------------------------------------------------------------
-[numthreads(1, 1, 1)]
-void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
+void poolClaimChunkAt(uint ClaimBase, uint TheChunkSlot,
+                      uint OccWords, uint MatWords,
+                      uint TheOccWorst, uint TheMatWorst,
+                      uint SrcOccOut, uint SrcMatOut)
 {
-	if (tid.x != 0u)
-	{
-		return;
-	}
-
-	// Stack-claim: a fused member reads its own totals pair and computes its
-	// scratch prefix; classic (TotalsChunkIndexPlusOne == 0) reads [0..1] with
-	// prefix 0, exactly as before. The prefix lands in OutClaim[6]/[7] -- the
-	// documented spare pair -- where the copy/desc kernels read it back; on the
-	// classic path those stay 0 and every consumer's arithmetic is the
-	// identity, which is what keeps the control byte-identical.
-	uint OccWords = 0u;
-	uint MatWords = 0u;
-	uint SrcOccFirst = 0u;
-	uint SrcMatFirst = 0u;
-	if (TotalsChunkIndexPlusOne == 0u)
-	{
-		// TotalsReadBase is 0 on every classic dispatch (see its declaration).
-		OccWords = InBrickTotals[TotalsReadBase + 0u];
-		MatWords = InBrickTotals[TotalsReadBase + 1u];
-	}
-	else
-	{
-		const uint C = TotalsChunkIndexPlusOne - 1u;
-		OccWords = InBrickTotals[2u + 2u * C];
-		MatWords = InBrickTotals[3u + 2u * C];
-		for (uint K = 0u; K < C; ++K)
-		{
-			SrcOccFirst += InBrickTotals[2u + 2u * K];
-			SrcMatFirst += InBrickTotals[3u + 2u * K];
-		}
-	}
-
-	OutClaim[1] = 0u; OutClaim[2] = 0u; OutClaim[3] = 0u; OutClaim[4] = 0u;
-	// P3 worklist Pack stage: SrcWordsOccBase/SrcWordsMatBase relocate the
-	// word-copy source into the worklist PACK ARENAS (sliceIndex * the
-	// per-record worst-case strides) -- 0 on every classic dispatch, and the
-	// stack prefix arithmetic above is untouched (fused stacks take no
-	// worklist feed, so the two terms never both fire).
-	OutClaim[6] = SrcOccFirst + SrcWordsOccBase;
-	OutClaim[7] = SrcMatFirst + SrcWordsMatBase;
-
-	// --- the split gate (stack-claim only; see TotalsNumChunks) -------------
-	// One thread, <=128 extra reads per member: cheap against the copy passes
-	// it protects. Runs BEFORE the side-table write below takes the failure
-	// path, so a failed gate leaves the same "nothing to free" state as every
-	// other refusal.
-	if (TotalsNumChunks > 0u)
-	{
-		uint SumOcc = 0u;
-		uint SumMat = 0u;
-		for (uint K2 = 0u; K2 < TotalsNumChunks; ++K2)
-		{
-			SumOcc += InBrickTotals[2u + 2u * K2];
-			SumMat += InBrickTotals[3u + 2u * K2];
-		}
-		if (SumOcc != InBrickTotals[0] || SumMat != InBrickTotals[1])
-		{
-			InterlockedAdd(AllocState[kCtrClaimFailWorst], 1u);
-			const uint SideF = ChunkSlot * 4u;
-			AllocSide[SideF + 0u] = 0u; AllocSide[SideF + 1u] = 0u;
-			AllocSide[SideF + 2u] = 0u; AllocSide[SideF + 3u] = 0u;
-			OutClaim[0] = 0u; OutClaim[5] = kFailStackSplit;
-			return;
-		}
-	}
+	OutClaim[ClaimBase + 1u] = 0u; OutClaim[ClaimBase + 2u] = 0u;
+	OutClaim[ClaimBase + 3u] = 0u; OutClaim[ClaimBase + 4u] = 0u;
+	OutClaim[ClaimBase + 6u] = SrcOccOut;
+	OutClaim[ClaimBase + 7u] = SrcMatOut;
 
 	// The side table entry is written on EVERY path, including failure, so the
 	// free pass for this slot always reads a defined entry. Failure writes
 	// class 0 twice -- "nothing to free".
-	const uint Side = ChunkSlot * 4u;
+	const uint Side = TheChunkSlot * 4u;
 
 	// A total above the scratch worst case did not come from the scan -- the CPU
 	// path refuses these at Deliver for the same reason (a copy sized from it
 	// would read past the scratch), and this path must not be softer.
-	if (OccWords > OccWorstWords || MatWords > MatWorstWords)
+	if (OccWords > TheOccWorst || MatWords > TheMatWorst)
 	{
 		InterlockedAdd(AllocState[kCtrClaimFailWorst], 1u);
 		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
 		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
-		OutClaim[0] = 0u; OutClaim[5] = kFailWorstCase;
+		OutClaim[ClaimBase + 0u] = 0u; OutClaim[ClaimBase + 5u] = kFailWorstCase;
 		return;
 	}
 
@@ -516,7 +461,7 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 		InterlockedAdd(AllocState[kCtrClaimFailOcc], 1u);
 		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
 		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
-		OutClaim[0] = 0u; OutClaim[5] = kFailOccSpace;
+		OutClaim[ClaimBase + 0u] = 0u; OutClaim[ClaimBase + 5u] = kFailOccSpace;
 		return;
 	}
 
@@ -556,7 +501,7 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 		InterlockedAdd(AllocState[kCtrClaimFailMat], 1u);
 		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
 		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
-		OutClaim[0] = 0u; OutClaim[5] = kFailMatSpace;
+		OutClaim[ClaimBase + 0u] = 0u; OutClaim[ClaimBase + 5u] = kFailMatSpace;
 		return;
 	}
 
@@ -575,7 +520,7 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 		InterlockedAdd(AllocState[kCtrBitmapCollision], Collisions);
 		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
 		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
-		OutClaim[0] = 0u; OutClaim[5] = kFailCollision;
+		OutClaim[ClaimBase + 0u] = 0u; OutClaim[ClaimBase + 5u] = kFailCollision;
 		return;
 	}
 
@@ -600,12 +545,95 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 	InterlockedAdd(AllocState[kCtrMatPaddedCum], MatClass * MatClassStep);
 	InterlockedAdd(AllocState[kCtrMatActualCum], MatWords);
 
-	OutClaim[0] = 1u;
-	OutClaim[1] = OccBaseAbs;
-	OutClaim[2] = OccWords;
-	OutClaim[3] = MatBaseAbs;
-	OutClaim[4] = MatWords;
-	OutClaim[5] = kFailNone;
+	OutClaim[ClaimBase + 0u] = 1u;
+	OutClaim[ClaimBase + 1u] = OccBaseAbs;
+	OutClaim[ClaimBase + 2u] = OccWords;
+	OutClaim[ClaimBase + 3u] = MatBaseAbs;
+	OutClaim[ClaimBase + 4u] = MatWords;
+	OutClaim[ClaimBase + 5u] = kFailNone;
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolClaimMain -- the classic per-chunk entry point: ONE thread, totals
+// read where the scan produced them (classic pair, worklist arena slice, or a
+// fused member's own pair with the in-kernel prefix + split gate), then the
+// FACTORED claim proper above -- the same text the worklist Claim stage runs.
+// ---------------------------------------------------------------------------
+[numthreads(1, 1, 1)]
+void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x != 0u)
+	{
+		return;
+	}
+
+	// Stack-claim: a fused member reads its own totals pair and computes its
+	// scratch prefix; classic (TotalsChunkIndexPlusOne == 0) reads [0..1] with
+	// prefix 0, exactly as before. The prefix lands in OutClaim[6]/[7] -- the
+	// documented spare pair -- where the copy/desc kernels read it back; on the
+	// classic path those stay 0 and every consumer's arithmetic is the
+	// identity, which is what keeps the control byte-identical.
+	uint OccWords = 0u;
+	uint MatWords = 0u;
+	uint SrcOccFirst = 0u;
+	uint SrcMatFirst = 0u;
+	if (TotalsChunkIndexPlusOne == 0u)
+	{
+		// TotalsReadBase is 0 on every classic dispatch (see its declaration).
+		OccWords = InBrickTotals[TotalsReadBase + 0u];
+		MatWords = InBrickTotals[TotalsReadBase + 1u];
+	}
+	else
+	{
+		const uint C = TotalsChunkIndexPlusOne - 1u;
+		OccWords = InBrickTotals[2u + 2u * C];
+		MatWords = InBrickTotals[3u + 2u * C];
+		for (uint K = 0u; K < C; ++K)
+		{
+			SrcOccFirst += InBrickTotals[2u + 2u * K];
+			SrcMatFirst += InBrickTotals[3u + 2u * K];
+		}
+	}
+
+	// --- the split gate (stack-claim only; see TotalsNumChunks) -------------
+	// One thread, <=128 extra reads per member: cheap against the copy passes
+	// it protects. Runs BEFORE poolClaimChunkAt's side-table write takes the
+	// failure path, so a failed gate leaves the same "nothing to free" state
+	// as every other refusal. The slice writes here mirror the factored
+	// function's failure shape ([1..4] zero, spare pair set) so a consumer of
+	// a split-failed claim reads the same bytes it always did.
+	if (TotalsNumChunks > 0u)
+	{
+		uint SumOcc = 0u;
+		uint SumMat = 0u;
+		for (uint K2 = 0u; K2 < TotalsNumChunks; ++K2)
+		{
+			SumOcc += InBrickTotals[2u + 2u * K2];
+			SumMat += InBrickTotals[3u + 2u * K2];
+		}
+		if (SumOcc != InBrickTotals[0] || SumMat != InBrickTotals[1])
+		{
+			InterlockedAdd(AllocState[kCtrClaimFailWorst], 1u);
+			const uint SideF = ChunkSlot * 4u;
+			AllocSide[SideF + 0u] = 0u; AllocSide[SideF + 1u] = 0u;
+			AllocSide[SideF + 2u] = 0u; AllocSide[SideF + 3u] = 0u;
+			OutClaim[1] = 0u; OutClaim[2] = 0u; OutClaim[3] = 0u; OutClaim[4] = 0u;
+			OutClaim[6] = SrcOccFirst + SrcWordsOccBase;
+			OutClaim[7] = SrcMatFirst + SrcWordsMatBase;
+			OutClaim[0] = 0u; OutClaim[5] = kFailStackSplit;
+			return;
+		}
+	}
+
+	// P3 worklist Pack stage: SrcWordsOccBase/SrcWordsMatBase relocate the
+	// word-copy source into the worklist PACK ARENAS (sliceIndex * the
+	// per-record worst-case strides) -- 0 on every classic dispatch, and the
+	// stack prefix arithmetic above is untouched (fused stacks take no
+	// worklist feed, so the two terms never both fire).
+	poolClaimChunkAt(0u, ChunkSlot, OccWords, MatWords,
+	                 OccWorstWords, MatWorstWords,
+	                 SrcOccFirst + SrcWordsOccBase,
+	                 SrcMatFirst + SrcWordsMatBase);
 }
 
 // ---------------------------------------------------------------------------
@@ -621,35 +649,103 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 // WordsClaimIndex selects the arena's claim pair: 0 = occ (claim[1]/[2]),
 // 1 = mat (claim[3]/[4]). One kernel, both arenas, the BrickWordCopyMain model.
 // ---------------------------------------------------------------------------
+// The claim-slice decode the copy shares with the worklist Write stage (P3
+// stage 6): one arena's landed run -- destination base, ACTUAL word count and
+// the source first index (the spare pair: 0 on the classic single-chunk path,
+// the member's slice start on a fused stack, the record's pack-arena slice
+// base on the worklist path). Returns false on a failed claim.
+bool poolAllocWordRun(uint ClaimBase, uint Pair,
+                      out uint DstBase, out uint Words, out uint SrcFirst)
+{
+	DstBase = 0u; Words = 0u; SrcFirst = 0u;
+	if (InClaim[ClaimBase + 0u] == 0u)
+	{
+		return false;
+	}
+	DstBase  = InClaim[ClaimBase + 1u + 2u * Pair];
+	Words    = InClaim[ClaimBase + 2u + 2u * Pair];
+	SrcFirst = InClaim[ClaimBase + 6u + Pair];
+	return true;
+}
+
 [numthreads(64, 1, 1)]
 void BrickPoolAllocWordCopyMain(uint3 tid : SV_DispatchThreadID)
 {
 	const uint i = tid.x;
-	if (i >= MaxWords || InClaim[0] == 0u)
+	uint Base, Words, SrcFirst;
+	if (i >= MaxWords || !poolAllocWordRun(0u, WordsClaimIndex, Base, Words, SrcFirst))
 	{
 		return;
 	}
-	const uint Base  = InClaim[1u + 2u * WordsClaimIndex];
-	const uint Words = InClaim[2u + 2u * WordsClaimIndex];
 	if (i >= Words)
 	{
 		return;
 	}
-	// The source prefix the claim wrote into the spare pair: 0 on the classic
-	// single-chunk path (chunk-relative scratch), the member's slice start on a
-	// fused stack (shared batch scratch). One read makes both cases one code
-	// path -- the classic kernel's "SrcFirst == 0" comment, now literal.
-	const uint SrcFirst = InClaim[6u + WordsClaimIndex];
 	OutWords[Base + i] = InWords[SrcFirst + i];
 }
 
 // ---------------------------------------------------------------------------
+// poolAllocRebaseDesc -- the descriptor rebase arithmetic, FACTORED (P3 stage
+// 6): the classic desc pass, the worklist ClaimRecord pass and the worklist
+// claim verify all call this one text. MIXED only -- a uniform brick's zero
+// offsets must stay zero, for VoxelBrickPoolWrite.usf's file-header reason.
+// OccSrcFirst/MatSrcFirst are the SOURCE-relative rebase terms (the stack
+// prefix; 0 when the source offsets are already relative to the slice read).
+// ---------------------------------------------------------------------------
+uint2 poolAllocRebaseDesc(uint2 D, uint OccBaseClaim, uint MatBaseClaim,
+                          uint OccSrcFirst, uint MatSrcFirst)
+{
+	const uint Kind = (D.x >> 28u) & 3u;
+	if (Kind == kBrickKindMixed)
+	{
+		const uint OccOffset = ((D.x & kBrickOffsetMask) - OccSrcFirst + OccBaseClaim) & kBrickOffsetMask;
+		const uint MatOffset = ((D.y & kBrickOffsetMask) - MatSrcFirst + MatBaseClaim) & kBrickOffsetMask;
+		D.x = OccOffset | (D.x & kBrickFieldMask);
+		D.y = MatOffset | (D.y & kBrickFieldMask);
+	}
+	return D;
+}
+
+// The desc write proper, shared by the classic entry point and the worklist
+// ClaimRecord kernel: fail-zero (a reused descriptor block must not keep its
+// previous tenant's descriptors) or rebase-and-write. RebaseSubOcc/Mat are
+// subtracted from the claim's spare pair to recover the true rebase term --
+// see the audit note in BrickPoolAllocDescMain below.
+void poolAllocDescWriteAt(uint ClaimBase, uint SrcIdx, uint DstIdx,
+                          uint RebaseSubOcc, uint RebaseSubMat)
+{
+	if (InClaim[ClaimBase + 0u] == 0u)
+	{
+		OutBrickDesc[DstIdx] = uint2(0u, 0u);
+		return;
+	}
+	OutBrickDesc[DstIdx] = poolAllocRebaseDesc(
+		InBrickDesc[SrcIdx],
+		InClaim[ClaimBase + 1u], InClaim[ClaimBase + 3u],
+		InClaim[ClaimBase + 6u] - RebaseSubOcc,
+		InClaim[ClaimBase + 7u] - RebaseSubMat);
+}
+
+// ---------------------------------------------------------------------------
 // BrickPoolAllocDescMain -- BrickDescPoolWriteMain with the two bases read from
-// the claim. The rebase arithmetic is VERBATIM; only where the bases come from
-// changed, and this file's header is the record of why. On a failed claim it
-// writes uniform-AIR zeros so a reused descriptor block cannot keep its previous
-// tenant's descriptors (the record is zeroed too, so nothing reads them -- this
-// is belt and braces, both cheap).
+// the claim. The rebase arithmetic is VERBATIM (factored above); only where
+// the bases come from changed, and this file's header is the record of why.
+//
+// Stack-claim: scratch descriptors of a fused member are BATCH-relative
+// (the pack is chunk-major over one shared scratch), so the member's slice
+// prefix -- the claim's spare pair -- comes back OFF before the pool base
+// goes ON. Classic path: SrcDescBase 0, spare pair 0, arithmetic verbatim.
+//
+// THE SPARE PAIR IS NOT THE REBASE TERM (2026-08-23 stage-6 audit). The
+// claim folds SrcWordsOccBase/SrcWordsMatBase -- the worklist Pack
+// stage's arena slice bases -- into [6]/[7] so the COPY kernels source
+// from the pack arenas. But pack-arena descriptors are CHUNK-relative
+// (the stage's one deliberate split), so their rebase term is ZERO, not
+// the slice base: subtracting the raw spare pair mis-rebased every
+// pack-fed chunk with slice > 0 into garbage pool offsets, invisibly to
+// every arena-level gate (the pool desc was never compared). Subtracting
+// the host-known SrcWords*Base back out leaves exactly the stack prefix:
+// stack (prefix, bases 0), classic (0, 0), pack-fed (0 = base - base).
 // ---------------------------------------------------------------------------
 [numthreads(64, 1, 1)]
 void BrickPoolAllocDescMain(uint3 tid : SV_DispatchThreadID)
@@ -659,93 +755,110 @@ void BrickPoolAllocDescMain(uint3 tid : SV_DispatchThreadID)
 	{
 		return;
 	}
-	if (InClaim[0] == 0u)
-	{
-		OutBrickDesc[BrickBase + i] = uint2(0u, 0u);
-		return;
-	}
-	const uint OccBaseClaim = InClaim[1];
-	const uint MatBaseClaim = InClaim[3];
-	// Stack-claim: scratch descriptors of a fused member are BATCH-relative
-	// (the pack is chunk-major over one shared scratch), so the member's slice
-	// prefix -- the claim's spare pair -- comes back OFF before the pool base
-	// goes ON. Classic path: SrcDescBase 0, spare pair 0, arithmetic verbatim.
-	const uint OccSrcFirst = InClaim[6];
-	const uint MatSrcFirst = InClaim[7];
-
-	uint2 D = InBrickDesc[SrcDescBase + i];
-	const uint Kind = (D.x >> 28u) & 3u;
-	if (Kind == kBrickKindMixed)
-	{
-		// MIXED only -- a uniform brick's zero offsets must stay zero, for
-		// VoxelBrickPoolWrite.usf's file-header reason.
-		const uint OccOffset = ((D.x & kBrickOffsetMask) - OccSrcFirst + OccBaseClaim) & kBrickOffsetMask;
-		const uint MatOffset = ((D.y & kBrickOffsetMask) - MatSrcFirst + MatBaseClaim) & kBrickOffsetMask;
-		D.x = OccOffset | (D.x & kBrickFieldMask);
-		D.y = MatOffset | (D.y & kBrickFieldMask);
-	}
-	OutBrickDesc[BrickBase + i] = D;
+	poolAllocDescWriteAt(0u, SrcDescBase + i, BrickBase + i,
+	                     SrcWordsOccBase, SrcWordsMatBase);
 }
 
 // ---------------------------------------------------------------------------
-// BrickPoolAllocRecordMain -- BrickChunkRecordMain's body (the allSolid reduce is
-// unchanged and still runs over the SCRATCH cell data, for that kernel's stated
-// reason), plus the one behaviour this path adds: a FAILED claim zeroes the whole
-// record, so the chunk reads as "nothing here" instead of resurrecting whatever a
-// previous tenant left. The record format is UNTOUCHED -- the arena ranges live in
-// the side table, not in the reserved tail, precisely so every existing record
-// consumer and verifier keeps working unmodified.
+// The chunk-record composition, FACTORED (P3 stage 6) so the classic record
+// pass, the worklist ClaimRecord kernel and the worklist claim verify all run
+// the same text.
 // ---------------------------------------------------------------------------
+
+// Per-brick allSolid: kind SOLID is all-solid by definition; kind MIXED reads
+// its 16 occupancy dwords from the SOURCE the descriptors were packed against.
+// OccSrcWordsBase (2026-08-23 stage-6 audit): the descriptor's occ offset is
+// relative to that source -- the shared scratch on the classic/stack paths
+// (base 0, offsets batch-relative) but the record's CHUNK-RELATIVE slice on
+// the worklist pack path, where InBrickOcc is the whole pack arena. Without
+// the base every pack-fed chunk with slice > 0 computed allSolid from slice
+// 0's words.
+bool poolAllocBrickAllSolid(uint2 D, uint OccSrcWordsBase)
+{
+	const uint Kind = (D.x >> 28u) & 3u;
+	if (Kind == 1u)
+	{
+		return true;
+	}
+	if (Kind != kBrickKindMixed)
+	{
+		return false;
+	}
+	const uint OccWord = OccSrcWordsBase + (D.x & kBrickOffsetMask);
+	uint Acc = 0xffffffffu;
+	for (uint k = 0u; k < kBrickOccWords; ++k)
+	{
+		Acc &= InBrickOcc[OccWord + k];
+	}
+	return (Acc == 0xffffffffu);
+}
+
+uint poolAllocLevelAndFlags(uint TheRingLevel, uint MaskLo, uint MaskHi, uint AllSolid)
+{
+	const uint AnySolid = ((MaskLo | MaskHi) != 0u) ? 1u : 0u;
+	return (TheRingLevel & 0xfu) | (AnySolid << 4u) | (AllSolid << 5u);
+}
+
+// Dword d of the 64 B chunk record (0 for the reserved tail). The one list of
+// what a record IS; the verify recomputes expectations through this same text.
+uint poolAllocRecordDword(uint d, int3 Origin, uint LevelAndFlags, uint TheBrickBase,
+                          uint MaskLo, uint MaskHi, uint Climate, uint Grad, uint SurfZ)
+{
+	if (d == 0u) { return asuint(Origin.x); }
+	if (d == 1u) { return asuint(Origin.y); }
+	if (d == 2u) { return asuint(Origin.z); }
+	if (d == 3u) { return LevelAndFlags; }
+	if (d == 4u) { return TheBrickBase; }
+	if (d == 5u) { return MaskLo; }
+	if (d == 6u) { return MaskHi; }
+	if (d == 7u) { return Climate; }
+	if (d == 8u) { return Grad; }
+	if (d == 9u) { return SurfZ; }
+	return 0u;
+}
+
 groupshared uint gsAllocAllSolid;
 
-[numthreads(64, 1, 1)]
-void BrickPoolAllocRecordMain(uint3 gtid : SV_GroupThreadID)
+// The cooperative record write: 64 threads reduce allSolid over the bricks,
+// thread 0 writes (or fail-zeroes) the record. Callable from any 64-thread
+// group whose per-record inputs are the arguments -- the classic entry point
+// passes its uniforms, the worklist kernel its record fields.
+void poolAllocRecordWriteAt(uint ClaimBase, uint GTidX, uint BrickCountL,
+                            uint DescSrcBase, uint OccSrcWordsBase, uint MaskElemBase,
+                            uint TheChunkSlot, int3 Origin, uint TheRingLevel,
+                            uint TheBrickBase, uint Climate, uint Grad, uint SurfZ)
 {
-	if (gtid.x == 0u)
+	if (GTidX == 0u)
 	{
 		gsAllocAllSolid = 1u;
 	}
 	GroupMemoryBarrierWithGroupSync();
 
-	const bool bOk = (InClaim[0] != 0u);
+	const bool bOk = (InClaim[ClaimBase + 0u] != 0u);
 
-	if (bOk && gtid.x < BrickCount)
+	if (bOk && GTidX < BrickCountL)
 	{
 		// Stack-claim: this member's descriptor slice. The occ offsets inside
-		// the descriptors stay BATCH-relative here on purpose -- they index the
-		// SHARED scratch this kernel reads (InBrickOcc), not the pool.
-		const uint2 D = InBrickDesc[SrcDescBase + gtid.x];
-		const uint Kind = (D.x >> 28u) & 3u;
-		bool bBrickAllSolid = false;
-		if (Kind == 1u)
-		{
-			bBrickAllSolid = true;
-		}
-		else if (Kind == kBrickKindMixed)
-		{
-			const uint OccWord = D.x & kBrickOffsetMask;
-			uint Acc = 0xffffffffu;
-			for (uint k = 0u; k < kBrickOccWords; ++k)
-			{
-				Acc &= InBrickOcc[OccWord + k];
-			}
-			bBrickAllSolid = (Acc == 0xffffffffu);
-		}
-		if (!bBrickAllSolid)
+		// the descriptors stay source-relative here on purpose -- they index
+		// what this kernel reads (InBrickOcc), not the pool.
+		if (!poolAllocBrickAllSolid(InBrickDesc[DescSrcBase + GTidX], OccSrcWordsBase))
 		{
 			InterlockedAnd(gsAllocAllSolid, 0u);
 		}
 	}
 	GroupMemoryBarrierWithGroupSync();
 
-	if (gtid.x != 0u)
+	if (GTidX != 0u)
 	{
 		return;
 	}
 
-	const uint Base = ChunkSlot * ChunkRecordDwords;
+	const uint Base = TheChunkSlot * ChunkRecordDwords;
 	if (!bOk)
 	{
+		// A FAILED claim zeroes the whole record, so the chunk reads as
+		// "nothing here" instead of resurrecting whatever a previous tenant
+		// left.
 		for (uint Z = 0u; Z < ChunkRecordDwords; ++Z)
 		{
 			OutChunkTable[Base + Z] = 0u;
@@ -753,28 +866,36 @@ void BrickPoolAllocRecordMain(uint3 gtid : SV_GroupThreadID)
 		return;
 	}
 
-	// Stack-claim: 2 dwords per chunk, chunk-major -- this member's slot.
-	// Classic path: ChunkMaskBase 0, same two dwords as always.
-	const uint MaskLo = InChunkBrickMask[ChunkMaskBase + 0u];
-	const uint MaskHi = InChunkBrickMask[ChunkMaskBase + 1u];
-	const uint AnySolid = ((MaskLo | MaskHi) != 0u) ? 1u : 0u;
+	// Stack-claim: 2 dwords per chunk, chunk-major -- this member's slot
+	// (an ELEMENT base). Classic path: 0, same two dwords as always.
+	const uint MaskLo = InChunkBrickMask[MaskElemBase + 0u];
+	const uint MaskHi = InChunkBrickMask[MaskElemBase + 1u];
 	const uint AllSolid = (gsAllocAllSolid != 0u) ? 1u : 0u;
-	const uint LevelAndFlags = (RingLevel & 0xfu) | (AnySolid << 4u) | (AllSolid << 5u);
+	const uint LevelAndFlags = poolAllocLevelAndFlags(TheRingLevel, MaskLo, MaskHi, AllSolid);
 
-	OutChunkTable[Base + 0u] = asuint(OriginVoxel.x);
-	OutChunkTable[Base + 1u] = asuint(OriginVoxel.y);
-	OutChunkTable[Base + 2u] = asuint(OriginVoxel.z);
-	OutChunkTable[Base + 3u] = LevelAndFlags;
-	OutChunkTable[Base + 4u] = BrickBase;
-	OutChunkTable[Base + 5u] = MaskLo;
-	OutChunkTable[Base + 6u] = MaskHi;
-	OutChunkTable[Base + 7u] = ChunkClimatePacked;
-	OutChunkTable[Base + 8u] = ChunkSurfaceGradPacked;
-	OutChunkTable[Base + 9u] = ChunkSurfaceZRelBits;
-	for (uint D2 = 10u; D2 < ChunkRecordDwords; ++D2)
+	for (uint D2 = 0u; D2 < ChunkRecordDwords; ++D2)
 	{
-		OutChunkTable[Base + D2] = 0u;
+		OutChunkTable[Base + D2] = poolAllocRecordDword(
+			D2, Origin, LevelAndFlags, TheBrickBase, MaskLo, MaskHi, Climate, Grad, SurfZ);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolAllocRecordMain -- BrickChunkRecordMain's body (the allSolid reduce
+// is unchanged and still runs over the SCRATCH cell data, for that kernel's
+// stated reason), factored above so the worklist Claim stage runs the same
+// text. The record format is UNTOUCHED -- the arena ranges live in the side
+// table, not in the reserved tail, precisely so every existing record
+// consumer and verifier keeps working unmodified.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickPoolAllocRecordMain(uint3 gtid : SV_GroupThreadID)
+{
+	poolAllocRecordWriteAt(0u, gtid.x, BrickCount,
+	                       SrcDescBase, SrcWordsOccBase, ChunkMaskBase,
+	                       ChunkSlot, OriginVoxel, RingLevel,
+	                       BrickBase, ChunkClimatePacked, ChunkSurfaceGradPacked,
+	                       ChunkSurfaceZRelBits);
 }
 
 // ---------------------------------------------------------------------------

@@ -74,8 +74,15 @@ VoxelGIQuadSpan
 VoxelGIVis
 VoxelGpuMeshMaxLevel
 VoxelGpuWorklist
+VoxelGpuWorklistAssetStamp
 VoxelGpuWorklistBudget
 VoxelGpuWorklistCap
+VoxelGpuWorklistCellBudget
+VoxelGpuWorklistClaim
+VoxelGpuWorklistClassify
+VoxelGpuWorklistColumns
+VoxelGpuWorklistPack
+VoxelGpuWorklistVoxelize
 VoxelL0BrickSkip
 VoxelL0GridScratch
 VoxelLakeSheetBands

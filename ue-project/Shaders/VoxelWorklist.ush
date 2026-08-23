@@ -21,6 +21,15 @@ struct GpuChunkWorkRecord
 	                        // Flush, only for records consumed the same flush
 	                        // they were staged, so a deferred record can never
 	                        // read another flush's blob)
+	                        // | claimStaged:10 (the Claim stage will claim and
+	                        // land THIS record's pool ranges -- set by Flush,
+	                        // only for records consumed the same flush they
+	                        // were staged AND only with the Claim stage armed.
+	                        // A record deferred past its staging flush keeps
+	                        // bit 10 clear forever: its host job already fell
+	                        // back to the classic per-chunk claim, and a
+	                        // second GPU claim for the same slot would leak
+	                        // the first ranges and overwrite the side table)
 	uint ChunkSlot;
 	uint GenId;
 	uint AssetBase;
@@ -28,7 +37,12 @@ struct GpuChunkWorkRecord
 	uint ShadingClimatePacked;
 	uint ShadingGradPacked;
 	uint ShadingSurfaceZBits;
-	uint Reserved0;
+	uint BrickBase;         // CPU-dispensed descriptor-block base (the shell's
+	                        // BrickBase) -- the one claim/write input that is
+	                        // neither derivable from the origin fields nor a
+	                        // process-wide constant. Truthful on every record
+	                        // since the Claim stage landed (the AssetCount
+	                        // precedent: flow the data before the consumer).
 	uint Reserved1;
 	uint Reserved2;
 	uint Reserved3;
@@ -46,6 +60,7 @@ uint worklistCoarseScale(GpuChunkWorkRecord R)
 }
 uint worklistHasAssets(GpuChunkWorkRecord R) { return (R.LevelFlags >> 8) & 1u; }
 uint worklistStampsStaged(GpuChunkWorkRecord R) { return (R.LevelFlags >> 9) & 1u; }
+uint worklistClaimStaged(GpuChunkWorkRecord R) { return (R.LevelFlags >> 10) & 1u; }
 // The converted-chain asset gate, shared by Voxelize / Classify /
 // ClassifyTotals / AssetStamp: a record participates in the cell-arena chain
 // unless it has assets whose instances are NOT in this flush's blob. Group
@@ -53,6 +68,15 @@ uint worklistStampsStaged(GpuChunkWorkRecord R) { return (R.LevelFlags >> 9) & 1
 uint worklistAssetsBlockRecord(GpuChunkWorkRecord R)
 {
 	return (worklistHasAssets(R) != 0u && worklistStampsStaged(R) == 0u) ? 1u : 0u;
+}
+// The Claim stage's eligibility, shared by the claim, the write pair and the
+// claim verify -- and mirrored EXACTLY by the host's bWorklistClaimFed
+// mapping: staged for this flush's claim, and the record's cells (terrain
+// and, when staged, stamps) actually reached the pack arenas. Group uniform
+// at every call site.
+uint worklistClaimEligible(GpuChunkWorkRecord R)
+{
+	return (worklistClaimStaged(R) != 0u && worklistAssetsBlockRecord(R) == 0u) ? 1u : 0u;
 }
 
 // --- the per-flush asset instance blob (AssetStamp stage) -------------------
@@ -106,7 +130,7 @@ uint worklistRecordFold(GpuChunkWorkRecord R)
 	F += worklistFoldTerm(R.ShadingClimatePacked, 8u);
 	F += worklistFoldTerm(R.ShadingGradPacked, 9u);
 	F += worklistFoldTerm(R.ShadingSurfaceZBits, 10u);
-	F += worklistFoldTerm(R.Reserved0, 11u);
+	F += worklistFoldTerm(R.BrickBase, 11u);
 	F += worklistFoldTerm(R.Reserved1, 12u);
 	F += worklistFoldTerm(R.Reserved2, 13u);
 	F += worklistFoldTerm(R.Reserved3, 14u);
