@@ -26,6 +26,70 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0b Coarse LOD browns out — the material mip discards thin surface layers
+
+**Owner-reported 2026-08-23, and present since the ray marcher landed.** The near
+ring renders "full" — every voxel a solid colour. Further rings are progressively
+less white and more brown, in visible bands by LOD.
+
+**Mechanism, verified in code, and it is two effects compounding:**
+
+`downsampleBricks` (`voxel-core/include/voxelcore/mips.h:42-88`) takes a
+**majority vote of the 8 child voxels**, ascending scan with strict `>`, so
+**ties break to the LOWEST material id**. And the ids are `MAT_AIR = 0`,
+**`MAT_ROCK = 2`**, `MAT_SNOW = 7`, `MAT_GRASS = 8`.
+
+Snow and grass are thin surface caps; rock is the thick body underneath. In any
+2x2x2 group straddling the surface, rock usually wins the vote outright — and on
+a 4-4 tie it wins anyway because 2 < 7. Each level compounds the last. Distance
+is LOD, so distance is brown.
+
+A third, related effect worth checking at the same time: `solidThreshold = 4`
+means a parent cell stays AIR unless at least 4 of its 8 children are solid,
+which erodes a sloped surface by up to half a voxel per level.
+
+**The fix is surface-preserving downsampling** — for the topmost solid cell of a
+column, carry the child's surface material instead of the majority. Standard
+technique; the work is in doing it without breaking two things:
+
+1. **The GPU must agree.** `voxel.GPU.VerifyCoarse` proves the GPU coarse path
+   bit-exact against the CPU one on columns, cells AND quads. An earlier audit
+   reports the GPU coarse worldgen POINT-SAMPLES one representative column
+   (`worldgen.ush:1804-1863`) rather than voting — **that reading is not
+   personally verified and should be the first thing checked**, because if the
+   two arms already disagree, the parity gate is not covering this and that is a
+   finding in itself.
+2. **Judge it by eye, not by a metric.** This is a colour/appearance defect; the
+   owner judges screenshots. Matched captures at a fixed pose across LOD bands.
+
+### 0.0c Small black TRIANGULAR gaps at LOD ring boundaries — still open
+
+**Owner-reported 2026-08-23**, after this session's ring fixes: "your recent
+fixes have closed most of the ring gaps but there are still these few triangular
+black gaps at LOD ring boundaries", concentric around the player.
+
+**Why the shape matters, and why the streaming hypotheses may be the wrong tree.**
+Three streaming explanations were tested with matched legs this session and ALL
+were refuted (skirt mask, coarse-ring starvation, hierarchical coverage — see
+`docs/gpu-streaming-architecture.md` §7). A *triangular wedge* at a boundary is
+the shape a TRAVERSAL handoff error makes, not the shape a missing chunk makes:
+a missing chunk is chunk-shaped (square, and the 2026-08-22 fix records exactly
+that — "holes were exactly one chunk square"). A wedge is what you get when a ray
+crosses between two differently-scaled grids and the t-interval handoff is
+slightly wrong.
+
+**So this may not be a residency problem at all**, which would explain why every
+residency fix failed to move it. Note also that `uncovered` may NOT be counting
+these: it requires the ray to have crossed a chunk with `bResident == false`, and
+a wedge missed between two RESIDENT grids would slip past that test entirely.
+**That is checkable and should be checked first** — if the owner can see gaps
+while `uncovered` is near zero, they are two different defects and the 4%
+flying-`uncovered` is a separate, real problem.
+
+Start at `VoxelBrickTraverse.ush`'s ring walk and the segment handoff
+(`t = R / |Dir.xy|`, the 2026-08-22 cylinder-vs-sphere fix), not at admission.
+
+
 ### 0.0a Marched sun shadows — TURNED OFF 2026-08-23, owner decision, revisit later
 
 `voxel.Shadow.March` now defaults to **0**. Terrain has no sun shadows until this
