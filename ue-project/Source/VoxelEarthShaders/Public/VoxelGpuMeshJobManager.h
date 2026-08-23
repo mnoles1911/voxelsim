@@ -318,22 +318,50 @@ struct FVoxelGpuMeshJobResult
 	// cap, the render thread being a frame behind, and the poll quantisation.
 	double SubmitToDeliverMs = 0.0;
 
-	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): the two stage
-	// splits that tell a genuine per-job GPU cost apart from Little's-law
-	// queueing (deep-review-streaming-perf-2026-07-27.md S1d) -- SubmitToDeliverMs
-	// alone cannot distinguish "this job is slow" from "this job waited behind a
-	// deep queue". Both are 0.0 unless voxel.GPU.MeshLatencyStats is on: the
-	// manager's own timestamps this relies on (FJob::PromotedSeconds) are only
-	// stamped under that cvar, so a stats-off run reports these as unmeasured
-	// rather than as a false zero.
+	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2), completed
+	// 2026-08-23 into a FULL PARTITION of SubmitToDeliverMs: the stage splits
+	// that tell a genuine per-job GPU cost apart from Little's-law queueing
+	// (deep-review-streaming-perf-2026-07-27.md S1d) -- SubmitToDeliverMs alone
+	// cannot distinguish "this job is slow" from "this job waited behind a deep
+	// queue", and on 2026-08-23 that distinction was worth 2.3 SECONDS: the
+	// fork's submit->deliver read p50=2281.5 ms with gpuDemandPending=240 while
+	// the demand queue drains at voxel.GPU.MeshBatchCap (4) per tick -- so
+	// Little's law alone predicts over a second of pure queue wait before any
+	// GPU work starts, and nothing in the log could confirm or deny it.
+	//
+	// THE FOUR STAGES TELESCOPE. All four are differences of the same five
+	// stamps (Submit, Promoted, Dispatched, Ready, Deliver), so on any job where
+	// bLatencyStagesComplete is true:
+	//
+	//   QueuedMs + PromoteToDispatchMs + DispatchToReadyMs + ReadyToDeliverMs
+	//     == SubmitToDeliverMs, exactly.
+	//
+	// A breakdown with an unexplained remainder is how this project produced
+	// (and retracted) the jobGHz=0.04 conclusion; the telescoping property is
+	// the guard against a second one. The streaming side's 5-second window
+	// prints the four means next to the total and their residual.
+	//
+	// ALWAYS MEASURED as of 2026-08-23. The claim that used to stand here --
+	// "both are 0.0 unless voxel.GPU.MeshLatencyStats is on" -- went stale when
+	// the timeout fix made FJob::PromotedSeconds unconditional (the timeout must
+	// not change behaviour with a stats cvar), and every other stamp was already
+	// unconditional. voxel.GPU.MeshLatencyStats now gates nothing here; see its
+	// definition for the history.
 	//
 	// Submit() to the moment this job was promoted out of the manager's Queued
 	// array in Tick(). This is QUEUE WAIT ONLY -- time spent behind MaxInFlight
-	// with no GPU work happening yet. It does NOT mean "this job is cheap to
-	// run"; a QueuedMs-dominated SubmitToDeliverMs means the fork is depth-bound
-	// at the current MaxInFlight/throughput ratio, not that any one job costs
-	// little.
+	// and the per-tick MeshBatchCap with no GPU work happening yet. It does NOT
+	// mean "this job is cheap to run"; a QueuedMs-dominated SubmitToDeliverMs
+	// means the fork is depth-bound at the current queue-depth/promotion-rate
+	// ratio, not that any one job costs little.
 	double QueuedMs = 0.0;
+	// Promotion (game thread, in Tick) to FJob::DispatchSeconds -- stamped on
+	// the RENDER thread the moment GraphBuilder.Execute() returned for the
+	// batch this job rode in. So this is the render thread being behind plus
+	// the graph build and pass setup for the whole batch: the cross-thread
+	// handoff the other three stages cannot see. Without it the four stages did
+	// not sum to the total and the gap was silently attributed to nothing.
+	double PromoteToDispatchMs = 0.0;
 	// First observed IsReady()==true (FJob::ReadySeconds, stamped in
 	// PollInFlight phase 1 -- see that stamp's own comment for why it is BEFORE
 	// the harvest budget check) to this Deliver() call. This is POLL
@@ -343,6 +371,14 @@ struct FVoxelGpuMeshJobResult
 	// sits here, ready and waiting, for however many ticks the budget stays
 	// exhausted.
 	double ReadyToDeliverMs = 0.0;
+	// True iff all five stamps existed at delivery, i.e. the four stage fields
+	// above are a complete, exactly-summing partition of SubmitToDeliverMs.
+	// False on any job that skipped a stage (Rejected never dispatched;
+	// TimedOut never went ready; Cancelled can die anywhere), whose stage
+	// fields are then partial and MUST NOT be summed into a breakdown -- that
+	// is how an unexplained remainder gets born. Consumers aggregate stages
+	// only from results with this set, and count the rest separately.
+	bool bLatencyStagesComplete = false;
 
 	bool IsOk() const { return Status == EVoxelGpuMeshJobStatus::Success; }
 };

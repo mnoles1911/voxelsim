@@ -153,23 +153,25 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshHarvestCap(
 	TEXT("cost, and with 150-256 jobs in flight one poll could do all of them."),
 	ECVF_Default);
 
-// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): gates the one NEW
-// FPlatformTime::Seconds() call this item adds (FJob::PromotedSeconds, stamped
-// in Tick's promote loop) -- the instrument must not be able to become what is
-// being measured. This module has no VoxelDebug dependency (that is a
-// VoxelEarth-module type), so it uses this file's own G.../CVarRef idiom
-// instead of a VoxelDebug:: accessor. Off by default; the streaming-side
-// voxel.Stream.LatencyStats is the one meant to be flipped for a leg -- this
-// one exists to be flipped alongside it if the mesh-job manager is ever
-// exercised standalone (e.g. a future bench harness) without the streaming
-// module above it.
+// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2) -- NOW VESTIGIAL,
+// kept registered so legs and scripts that set it do not start erroring.
+//
+// It existed to gate the one FPlatformTime::Seconds() call S0-3 added
+// (FJob::PromotedSeconds, stamped in Tick's promote loop) so the instrument
+// could not become what was being measured. Then the timeout-clock fix
+// (2026-08-22: 4,480 of 8,984 jobs spuriously timed out because the timeout
+// ran from SUBMIT, not promotion) made PromotedSeconds drive the in-flight
+// TIMEOUT, which must not change behaviour with a stats cvar -- so the stamp
+// went unconditional, and with it every stage field on the result is measured
+// on every run. As of 2026-08-23 this cvar gates NOTHING in this file; the
+// stage breakdown prints in the streaming side's 5-second window regardless.
 static int32 GVoxelGpuMeshLatencyStats = 0;
 static FAutoConsoleVariableRef CVarVoxelGpuMeshLatencyStats(
 	TEXT("voxel.GPU.MeshLatencyStats"),
 	GVoxelGpuMeshLatencyStats,
-	TEXT("Stamp FJob::PromotedSeconds (Submit -> promoted out of Queued in Tick), which feeds ")
-	TEXT("FVoxelGpuMeshJobResult::QueuedMs. Default 0. Game thread only (Tick() already requires it), ")
-	TEXT("so no thread-safety concern reading this cvar directly where it is checked."),
+	TEXT("VESTIGIAL (2026-08-23): the stamps it used to gate are unconditional now (the in-flight ")
+	TEXT("timeout depends on FJob::PromotedSeconds, and a timeout must not move with a stats cvar). ")
+	TEXT("Setting it does nothing; kept registered so existing legs do not error."),
 	ECVF_Default);
 
 // --- Tier B.1: amortise the worldgen/pack passes across Z-sibling chunks ----
@@ -1138,18 +1140,34 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 	{
 		Result.DispatchToReadyMs = (Job->ReadySeconds - Job->DispatchSeconds) * 1000.0;
 	}
-	// S0-3. Both computed from timestamps that already exist by the time this
-	// runs (or are 0.0 under voxel.GPU.MeshLatencyStats off, in which case the
-	// guard below leaves the result at its 0.0 default -- same "not measured"
-	// convention as DispatchToReadyMs above).
+	// S0-3. All computed from timestamps that are stamped unconditionally now
+	// (PromotedSeconds went unconditional with the timeout-clock fix;
+	// DispatchSeconds/ReadySeconds always were). The >0.0 guards are for jobs
+	// that never REACHED a stage -- Rejected never dispatched, TimedOut never
+	// went ready -- whose stage fields stay 0.0 meaning "did not happen", and
+	// bLatencyStagesComplete below is what tells a consumer the difference
+	// between that and a measured near-zero.
 	if (Job->PromotedSeconds > 0.0 && Job->SubmitSeconds > 0.0)
 	{
 		Result.QueuedMs = (Job->PromotedSeconds - Job->SubmitSeconds) * 1000.0;
+	}
+	// The cross-thread stage the original three-way split was missing: promoted
+	// on the game thread -> GraphBuilder.Execute() returned on the render
+	// thread. Without it queued + dispatchToReady + readyToDeliver fell short
+	// of submitToDeliver by exactly this much, and the shortfall was invisible.
+	if (Job->DispatchSeconds > 0.0 && Job->PromotedSeconds > 0.0)
+	{
+		Result.PromoteToDispatchMs = (Job->DispatchSeconds - Job->PromotedSeconds) * 1000.0;
 	}
 	if (Job->ReadySeconds > 0.0)
 	{
 		Result.ReadyToDeliverMs = (DeliverSeconds - Job->ReadySeconds) * 1000.0;
 	}
+	// The four stages telescope to the total exactly when every stamp exists --
+	// see the field's declaration for why partial jobs must not be summed.
+	Result.bLatencyStagesComplete =
+		Job->SubmitSeconds > 0.0 && Job->PromotedSeconds > 0.0 &&
+		Job->DispatchSeconds > 0.0 && Job->ReadySeconds > 0.0;
 
 	if (Status == EVoxelGpuMeshJobStatus::Success)
 	{

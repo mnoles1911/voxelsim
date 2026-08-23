@@ -2502,6 +2502,66 @@ int32 GpuMeshInFlight()
 	return N;
 }
 
+// How deep the fork may let the MANAGER'S OWN DEMAND QUEUE get before new
+// chunks fall to the CPU worker instead. 0 (the default) = unbounded, which is
+// today's behaviour exactly: the only bound is then GpuMeshInFlight above.
+//
+// WHY THIS EXISTS (2026-08-23). The manager's demand queue is strict FIFO and
+// drains at voxel.GPU.MeshBatchCap (4) promotions per tick -- a burst limiter
+// with a measured sweep behind it (32/64 gave 367 hitches vs 4/8's 8; raising
+// it is NOT the fix). GpuMeshInFlight (256) was sized so the manager never
+// binds before the streaming side's own budget -- correct for attributing
+// THROUGHPUT, but it lets ~250 demand jobs stack up in that FIFO, and at
+// 4/tick x ~21 ms ticks the LAST of them waits over a second before any GPU
+// work begins. Measured the same day the stage split landed: gpuMesh
+// submit->deliver p50=2281.5 ms / p95=3300.3 ms with gpuDemandPending=240 --
+// against a GPU whose in-flight population historically idles at ~11-20.
+//
+// Three things are wrong with that queue beyond the latency number itself:
+//
+//   1. STALE PRIORITY. The streaming scheduler re-sorts its pending rings by
+//      distance every recompute, but a job that entered the manager's FIFO is
+//      beyond re-sorting -- at 30 m/s the camera has moved ~40-70 m by the
+//      time a p50 job dispatches, so the fork spends its 4 slots/tick on where
+//      the player WAS. The hole metric's finding that uncovered rays are a
+//      leading-edge problem (3.99% flying vs 0.03% at rest) is exactly the
+//      failure this feeds.
+//   2. HELD RING SLOTS. Every entry sits in GpuJobsPending, which counts into
+//      jobsInFlight and the per-ring floors -- the audited "coarse rings
+//      dispatching 1-2 jobs per 5 s against 245-347 pending".
+//   3. AN IDLE CPU ARM. cpuInFlight measures 0 in the same windows: 8 worker
+//      threads at a measured level-0 p50 of 0.77 ms/job stand idle while jobs
+//      wait 2.3 s for a GPU promotion slot. A shallow GPU queue hands the
+//      overflow to them the same tick it appears.
+//
+// A cap of N keeps N/MeshBatchCap ticks of buffer ahead of the promoter --
+// 16 is four ticks, plenty against a dispatch loop that refills every frame
+// (twice, under voxel.Stream.DispatchAfterDrain) -- and shrinks expected
+// queue wait from ~queueDepth/(cap x fps) seconds to a few frames.
+//
+// DEFAULT 0 (OFF), DELIBERATELY, despite all of the above: this project has
+// measured "obviously wasteful" arrangements beating their obvious fixes
+// before (RingOverlapChunks; T4-1's park-everything speculation), and whether
+// the 2.3 s is really queue wait is precisely what the new always-on "Voxel
+// GPU mesh stages" window line now measures. Flip it AFTER that line has
+// shown queued= dominating, with: -VoxelGpuMeshQueueDepth=16. The fork line's
+// depthGateCpu= counter says how many chunks the cap re-routed, so an armed
+// cap is never a silent no-op.
+//
+// Command line rather than a cvar for the namespace's standing reason:
+// -ExecCmds cvars land after streaming has begun, and a depth cap that arms
+// mid-run would make the leg's numbers a blend of two regimes.
+int32 GpuMeshQueueDepth()
+{
+	static const int32 N = []
+	{
+		int32 Value = 0; // 0 = unbounded (today's behaviour)
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshQueueDepth="), Value);
+		return FMath::Max(0, Value);
+	}();
+	return N;
+}
+
 // Highest chunk level the fork may take (D5).
 //
 // FIVE BY DEFAULT -- THE WHOLE CASCADE -- AND THAT IS A MEASUREMENT, NOT
@@ -4946,6 +5006,51 @@ struct FVoxelWorldImpl
 	// OnGpuMeshJobComplete for why gpuLatencyTimeouts cannot stand in for this.
 	int64 GpuMeshSlowDeliveriesSinceLog = 0;
 	int64 GpuMeshSlowDeliveriesTotal = 0;
+
+	// --- THE STAGE LEDGER for the fork's submit->deliver latency -------------
+	//
+	// ALWAYS ON, unlike the S0-3 percentile windows below, because the number it
+	// explains is always on: the census line prints "gpuMesh submit->deliver ms
+	// p50=2281.5" (2026-08-23, 30 m/s leg) on every run, and a 2.3-second
+	// latency that cannot be attributed to a stage is exactly the shape of
+	// finding this project has had to retract before (jobGHz=0.04). The S0-3
+	// windows existed but were double-gated behind voxel.Stream.LatencyStats
+	// AND voxel.GPU.MeshLatencyStats, so the leg that measured the 2.3 s had no
+	// stage data at all -- and they also lacked the promote->dispatch stage, so
+	// even with both cvars on the stages did not sum to the total.
+	//
+	// Sums are DOUBLES accumulated per delivery (exact, unbounded), so the
+	// printed means partition the printed total to rounding; the sample arrays
+	// exist only for p50/p95 and are capped (kGpuStageSampleCap) so a window
+	// that never prints cannot grow them without bound. Only deliveries with
+	// bLatencyStagesComplete enter ANY of these -- a partial job's stages do
+	// not telescope and would manufacture a residual (see the result field's
+	// comment); the complete count is printed next to delivered= so the
+	// excluded population is visible rather than silent.
+	//
+	// Includes SPECULATIVE deliveries (accumulated before the speculative
+	// early-return in OnGpuMeshJobComplete), deliberately: they ride the same
+	// queue, the same promotion cap and the same polls, so excluding them would
+	// understate the very queueing being measured.
+	int64 GpuStageCompleteSinceLog = 0;
+	double GpuStageQueuedMsSinceLog = 0.0;
+	double GpuStagePromoteToDispatchMsSinceLog = 0.0;
+	double GpuStageDispatchToReadyMsSinceLog = 0.0;
+	double GpuStageReadyToDeliverMsSinceLog = 0.0;
+	double GpuStageTotalMsSinceLog = 0.0;
+	static constexpr int32 kGpuStageSampleCap = 8192; // ~40 s at the observed ~200 deliveries/s
+	TArray<float> GpuStageQueuedSamples;
+	TArray<float> GpuStagePromoteToDispatchSamples;
+	TArray<float> GpuStageDispatchToReadySamples;
+	TArray<float> GpuStageReadyToDeliverSamples;
+	TArray<float> GpuStageTotalSamples;
+	// Chunks that were eligible for the fork but fell to the CPU worker because
+	// of -VoxelGpuMeshQueueDepth (see VoxelStreamAdmission::GpuMeshQueueDepth).
+	// Counted so an armed depth cap is readable from the log rather than
+	// showing up only as a mysteriously lower dispatched= -- the switch that is
+	// on and silently doing nothing (or everything) is this project's most
+	// repeated failure.
+	int64 GpuDepthGateFellToCpuSinceLog = 0;
 
 	// Stage-0 measure-first census for the chunk-tile GPU-batching design
 	// (docs/measurements/gpu-throughput-wave-2026-07-27.txt): tallies, per 5s
@@ -8444,17 +8549,66 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		const double MeanDeliverMs = GpuMeshJobsDeliveredSinceLog > 0
 			? GpuMeshSubmitToDeliverMsSinceLog / double(GpuMeshJobsDeliveredSinceLog)
 			: 0.0;
+		// queued= vs inFlight= is the first split to read against a large
+		// submitToDeliver: queued jobs are waiting for a promotion slot
+		// (MeshBatchCap per tick), in-flight ones are on the GPU or waiting to
+		// be polled/harvested. depthGateCpu= counts fork-eligible chunks the
+		// -VoxelGpuMeshQueueDepth cap handed to the CPU worker instead (0
+		// whenever the switch is at its default).
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU mesh fork (5s window): dispatched=%lld delivered=%lld failed=%lld "
-		            "pending=%d queued=%d inFlight=%d | submitToDeliver mean=%.1f ms max=%.1f ms "
+		            "pending=%d queued=%d inFlight=%d depthGateCpu=%lld | submitToDeliver mean=%.1f ms max=%.1f ms "
 		            "slow(>=%.0fs)=%lld (total %lld)"),
 		       (long long)GpuMeshJobsDispatchedSinceLog, (long long)GpuMeshJobsDeliveredSinceLog,
 		       (long long)GpuMeshJobsFailedSinceLog, GpuJobsPending.Num(),
 		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumQueued() : 0,
 		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumInFlight() : 0,
+		       (long long)GpuDepthGateFellToCpuSinceLog,
 		       MeanDeliverMs, GpuMeshSubmitToDeliverMaxMs,
 		       kBlindJobMarkTimeoutSeconds,
 		       (long long)GpuMeshSlowDeliveriesSinceLog, (long long)GpuMeshSlowDeliveriesTotal);
+
+		// WHERE THE submit->deliver TIME GOES, stage by stage, and the stages
+		// MUST SUM: queued + promoteToDispatch + dispatchToReady +
+		// readyToDeliver telescope to submitToDeliver exactly on every job
+		// counted here (n excludes partial jobs -- rejects, timeouts -- whose
+		// stages cannot telescope; delivered= minus n is that population).
+		// residual is printed, not assumed: a nonzero residual means a stage
+		// went missing again, which is precisely how the jobGHz=0.04 class of
+		// wrong conclusion was manufactured. p50/p95 per stage come from the
+		// same capped sample set and need not sum -- percentiles of parts never
+		// sum to percentiles of wholes; the MEANS are the partition.
+		//
+		// How to read it: queued-dominated means the fork is depth-bound behind
+		// the per-tick promotion cap (Little's law: ~queueDepth / (MeshBatchCap
+		// x frame rate) -- 240 pending at 4/tick and ~21 ms frames predicts
+		// ~1.3 s of pure wait); promoteToDispatch-dominated means the render
+		// thread is behind; dispatchToReady-dominated means GPU execution or
+		// readback fences; readyToDeliver-dominated means poll cadence or
+		// voxel.GPU.MeshHarvestCap.
+		if (GpuStageCompleteSinceLog > 0)
+		{
+			const double N = double(GpuStageCompleteSinceLog);
+			const double MeanQueued = GpuStageQueuedMsSinceLog / N;
+			const double MeanPromote = GpuStagePromoteToDispatchMsSinceLog / N;
+			const double MeanDtr = GpuStageDispatchToReadyMsSinceLog / N;
+			const double MeanRtd = GpuStageReadyToDeliverMsSinceLog / N;
+			const double MeanTotal = GpuStageTotalMsSinceLog / N;
+			const double StageSum = MeanQueued + MeanPromote + MeanDtr + MeanRtd;
+			const FMsPercentiles PQ = ComputeMsPercentiles(GpuStageQueuedSamples, GpuStageQueuedSamples.Num());
+			const FMsPercentiles PP = ComputeMsPercentiles(GpuStagePromoteToDispatchSamples, GpuStagePromoteToDispatchSamples.Num());
+			const FMsPercentiles PD = ComputeMsPercentiles(GpuStageDispatchToReadySamples, GpuStageDispatchToReadySamples.Num());
+			const FMsPercentiles PR = ComputeMsPercentiles(GpuStageReadyToDeliverSamples, GpuStageReadyToDeliverSamples.Num());
+			const FMsPercentiles PT = ComputeMsPercentiles(GpuStageTotalSamples, GpuStageTotalSamples.Num());
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel GPU mesh stages (5s window, n=%lld complete): mean queued=%.1f + promoteToDispatch=%.1f ")
+			       TEXT("+ dispatchToReady=%.1f + readyToDeliver=%.1f = %.1f vs submitToDeliver=%.1f (residual %.2f ms) | ")
+			       TEXT("p50/p95 queued=%.1f/%.1f promoteToDispatch=%.1f/%.1f dispatchToReady=%.1f/%.1f ")
+			       TEXT("readyToDeliver=%.1f/%.1f submitToDeliver=%.1f/%.1f"),
+			       (long long)GpuStageCompleteSinceLog,
+			       MeanQueued, MeanPromote, MeanDtr, MeanRtd, StageSum, MeanTotal, MeanTotal - StageSum,
+			       PQ.P50, PQ.P95, PP.P50, PP.P95, PD.P50, PD.P95, PR.P50, PR.P95, PT.P50, PT.P95);
+		}
 		// THE TICK'S OWN BREAKDOWN. FVoxelGpuMeshJobManager::Tick was measured at
 		// ~18-19 ms per hitch frame -- the largest single item in the streaming
 		// tick, and therefore the world's generation ceiling, since throughput is
@@ -8572,6 +8726,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		GpuMeshSubmitToDeliverMsSinceLog = 0.0;
 		GpuMeshSlowDeliveriesTotal += GpuMeshSlowDeliveriesSinceLog;
 		GpuMeshSlowDeliveriesSinceLog = 0;
+		// The stage ledger is per-window like the counters above it. Reset()
+		// keeps the arrays' allocations, so the steady state allocates nothing.
+		GpuStageCompleteSinceLog = 0;
+		GpuStageQueuedMsSinceLog = 0.0;
+		GpuStagePromoteToDispatchMsSinceLog = 0.0;
+		GpuStageDispatchToReadyMsSinceLog = 0.0;
+		GpuStageReadyToDeliverMsSinceLog = 0.0;
+		GpuStageTotalMsSinceLog = 0.0;
+		GpuStageQueuedSamples.Reset();
+		GpuStagePromoteToDispatchSamples.Reset();
+		GpuStageDispatchToReadySamples.Reset();
+		GpuStageReadyToDeliverSamples.Reset();
+		GpuStageTotalSamples.Reset();
+		GpuDepthGateFellToCpuSinceLog = 0;
 		// Max is NOT reset: it is a run-high-water mark, and it is the number
 		// that says whether kBlindJobMarkTimeoutSeconds (5 s) is anywhere near
 		// being crossed. Resetting it every window would hide the one spike
@@ -8621,44 +8789,26 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// writes themselves (OnGpuMeshJobComplete, the CPU worker task body,
 	// DrainResults) -- see that cvar's source comment.
 	//
-	// CAVEAT on the GPU line below: queued/dispatchToReady/readyToDeliver read
-	// as a real 0.0, not "unmeasured", whenever voxel.GPU.MeshLatencyStats (the
-	// VoxelEarthShaders-module gate FJob::PromotedSeconds needs -- that module
-	// has no VoxelDebug dependency, hence the separate cvar) is off even though
-	// this cvar is on. Both must be set for those three columns to mean
-	// anything; submitToDeliver and deliverToApply do not depend on the
-	// shaders-side gate.
+	// The stage columns below are always measured now (the shaders-side
+	// voxel.GPU.MeshLatencyStats gate went vestigial with the timeout-clock
+	// fix; see that cvar's comment). This line's remaining value over the
+	// always-on "Voxel GPU mesh stages" window line is deliverToApply -- the
+	// consumer-side stage that happens after the manager delivered -- and the
+	// ring-buffer (last-N) rather than per-window population. Its stage set
+	// predates PromoteToDispatchMs and does not sum to submitToDeliver; the
+	// always-on line is the one whose parts partition the whole.
 	if (VoxelDebug::GetStreamLatencyStats())
 	{
-		// SAY SO IN THE LINE, not only in the comment above. Three of the five
-		// stage columns are zero rather than absent when the shaders-side gate is
-		// off, and "queued/dispatchToReady/readyToDeliver all read 0.0" is a
-		// publishable-looking result that would be an artifact of a cvar. This
-		// programme has already retracted one set of numbers and corrected two
-		// root-cause diagnoses; a reader of the log should not have to know which
-		// module owns which gate to avoid being the third.
-		//
-		// FindConsoleVariable rather than a VoxelDebug accessor because the cvar
-		// lives in VoxelEarthShaders, which has no VoxelDebug dependency -- same
-		// idiom ApplyMeshResult uses for voxel.Stream.GPUMaxChunks.
-		static const auto* CVarMeshLatencyStats =
-			IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GPU.MeshLatencyStats"));
-		const bool bGpuStagesMeasured = CVarMeshLatencyStats && CVarMeshLatencyStats->GetInt() != 0;
-
 		const FMsPercentiles GpuQueued = ComputeMsPercentiles(GpuQueuedMsWindow, GpuQueuedMsWindowCount);
 		const FMsPercentiles GpuDispatchToReady = ComputeMsPercentiles(GpuDispatchToReadyMsWindow, GpuDispatchToReadyMsWindowCount);
 		const FMsPercentiles GpuReadyToDeliver = ComputeMsPercentiles(GpuReadyToDeliverMsWindow, GpuReadyToDeliverMsWindowCount);
 		const FMsPercentiles GpuSubmitToDeliver = ComputeMsPercentiles(GpuSubmitToDeliverMsWindow, GpuSubmitToDeliverMsWindowCount);
 		const FMsPercentiles GpuDeliverToApply = ComputeMsPercentiles(GpuDeliverToApplyMsWindow, GpuDeliverToApplyMsWindowCount);
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel GPU latency stages (5s window, n=%d)%s: queued p50=%.1f p95=%.1f max=%.1f | ")
+		       TEXT("Voxel GPU latency stages (5s window, n=%d): queued p50=%.1f p95=%.1f max=%.1f | ")
 		       TEXT("dispatchToReady p50=%.1f p95=%.1f max=%.1f | readyToDeliver p50=%.1f p95=%.1f max=%.1f | ")
 		       TEXT("submitToDeliver p50=%.1f p95=%.1f max=%.1f | deliverToApply p50=%.1f p95=%.1f max=%.1f (n=%d)"),
 		       GpuSubmitToDeliverMsWindowCount,
-		       bGpuStagesMeasured
-		           ? TEXT("")
-		           : TEXT(" [queued/dispatchToReady/readyToDeliver NOT MEASURED -- set voxel.GPU.MeshLatencyStats 1; "
-		                  "the zeros below are the gate, not the pipeline]"),
 		       GpuQueued.P50, GpuQueued.P95, GpuQueued.Max,
 		       GpuDispatchToReady.P50, GpuDispatchToReady.P95, GpuDispatchToReady.Max,
 		       GpuReadyToDeliver.P50, GpuReadyToDeliver.P95, GpuReadyToDeliver.Max,
@@ -13044,12 +13194,34 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	GpuMeshSubmitToDeliverMsSinceLog += GpuResult.SubmitToDeliverMs;
 	GpuMeshSubmitToDeliverMaxMs = FMath::Max(GpuMeshSubmitToDeliverMaxMs, GpuResult.SubmitToDeliverMs);
 
-	// S0-3: the per-stage split. QueuedMs/ReadyToDeliverMs are 0.0 unless
-	// voxel.GPU.MeshLatencyStats is also on (see FVoxelGpuMeshJobResult's doc
-	// comment) -- pushing a real 0.0 into the window in that case would read as
-	// "this stage is free" rather than "not measured", so this is gated on the
-	// SAME cvar the streaming side uses and skips entirely when off, rather
-	// than pushing zeroes.
+	// THE STAGE LEDGER (always on; see the members' comment). Only complete
+	// jobs -- the four stages telescope to the total exactly on those, which is
+	// what lets the 5s line print a residual that MUST be ~0. Placed before the
+	// speculative early-return on purpose: speculative jobs share the queue and
+	// the polls, so they belong in the latency population.
+	if (GpuResult.bLatencyStagesComplete)
+	{
+		++GpuStageCompleteSinceLog;
+		GpuStageQueuedMsSinceLog += GpuResult.QueuedMs;
+		GpuStagePromoteToDispatchMsSinceLog += GpuResult.PromoteToDispatchMs;
+		GpuStageDispatchToReadyMsSinceLog += GpuResult.DispatchToReadyMs;
+		GpuStageReadyToDeliverMsSinceLog += GpuResult.ReadyToDeliverMs;
+		GpuStageTotalMsSinceLog += GpuResult.SubmitToDeliverMs;
+		if (GpuStageTotalSamples.Num() < kGpuStageSampleCap)
+		{
+			GpuStageQueuedSamples.Add(float(GpuResult.QueuedMs));
+			GpuStagePromoteToDispatchSamples.Add(float(GpuResult.PromoteToDispatchMs));
+			GpuStageDispatchToReadySamples.Add(float(GpuResult.DispatchToReadyMs));
+			GpuStageReadyToDeliverSamples.Add(float(GpuResult.ReadyToDeliverMs));
+			GpuStageTotalSamples.Add(float(GpuResult.SubmitToDeliverMs));
+		}
+	}
+
+	// S0-3: the ring-buffer percentile windows for the gated latency-stages log
+	// line. The stage fields are always measured now (see the ledger above and
+	// FVoxelGpuMeshJobResult's doc comment -- the MeshLatencyStats gate went
+	// vestigial with the timeout-clock fix), so this gate is purely "does the
+	// reader want the extra log line", not "does the data exist".
 	if (VoxelDebug::GetStreamLatencyStats())
 	{
 		PushLatencyMsSample(GpuQueuedMsWindow, GpuQueuedMsWindowNext, GpuQueuedMsWindowCount,
@@ -13378,6 +13550,9 @@ void FVoxelWorldImpl::DispatchJobs()
 	// unattributable to either, which is the trap the ring floor sweep fell
 	// into.
 	const int32 GpuMaxInFlight = VoxelStreamAdmission::GpuMeshInFlight();
+	// The fork's queue-depth cap (0 = unbounded, today's behaviour). Read once
+	// per call like GpuMaxInFlight above, and for the same reason.
+	const int32 GpuQueueDepthCap = VoxelStreamAdmission::GpuMeshQueueDepth();
 	// Read ONCE per call, not per chunk: it is a cvar read and this loop runs
 	// over every pending key. See VoxelBrickCpuArm::VolumeNeedsSolidChunks --
 	// with the brick volume off this is false and every skip below behaves
@@ -13812,7 +13987,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// fixture reports no cave column anywhere, the sweep says so out loud
 		// and the band's cave path is untested on that terrain -- read the PASS
 		// lines accordingly before trusting this in production.
-		const bool bUseGpuMesh =
+		const bool bGpuMeshEligible =
 			VoxelStreamAdmission::GpuMeshEnabled()
 			&& LevelKey.Level <= VoxelStreamAdmission::GpuMeshMaxLevel()
 			// THE SKIRT IS NOW ON THE GPU (D5.3), so boundary chunks are no
@@ -13844,6 +14019,28 @@ void FVoxelWorldImpl::DispatchJobs()
 			// condition so a chunk arriving when the GPU is full falls back to
 			// the CPU instead of stalling the whole dispatch loop.
 			&& GpuJobsPending.Num() < GpuMaxInFlight;
+
+		// -VoxelGpuMeshQueueDepth (default 0 = no cap, byte-identical control):
+		// with the cap armed, a fork-eligible chunk goes to the CPU worker
+		// whenever the manager's demand FIFO already holds a full buffer of
+		// promotions -- see VoxelStreamAdmission::GpuMeshQueueDepth for the
+		// 2,281 ms p50 queue-wait argument and why it is nevertheless off by
+		// default. NumQueuedDemand, not NumQueued: the speculative queue has
+		// its own submission cap and its own promotion allowance, and demand
+		// falling to the CPU because SPECULATION queued deep would be the
+		// priority inversion T4-1's two-queue design exists to prevent.
+		// Counted when it fires (depthGateCpu= on the fork window line), so an
+		// armed cap that changes nothing and one that re-routes everything are
+		// both readable states rather than a silent maybe.
+		const bool bGpuQueueHasRoom =
+			GpuQueueDepthCap <= 0
+			|| !GpuMeshJobs.IsValid()
+			|| GpuMeshJobs->NumQueuedDemand() < GpuQueueDepthCap;
+		if (bGpuMeshEligible && !bGpuQueueHasRoom)
+		{
+			++GpuDepthGateFellToCpuSinceLog;
+		}
+		const bool bUseGpuMesh = bGpuMeshEligible && bGpuQueueHasRoom;
 
 		// BRACKETED: everything from here to the end of the iteration is the job
 		// actually being built and handed off -- the GPU fork's region request
