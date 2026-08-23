@@ -53,7 +53,10 @@ param(
     [int]$GateRing = 3,
     [double]$MaxHold = 180,
 
-    [string]$Engine = 'D:/UE5/UE_5.8',
+    # The real install on this box (matches voxel-capture.ps1's default).
+    # The original 'D:/UE5/UE_5.8' was a cloud-session guess with no engine
+    # to check against.
+    [string]$Engine = 'D:/UE_5.8',
     [string]$Project,
     [int]$Width = 2560,
     [int]$Height = 1440,

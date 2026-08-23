@@ -600,7 +600,7 @@ void SVoxelMainMenu::ShowPanel(EVoxelMenuPanel Panel)
 
 FReply SVoxelMainMenu::OnKeyDown(const FGeometry& Geometry, const FKeyEvent& KeyEvent)
 {
-	if (KeyEvent.GetKey() == EKeys::Escape || KeyEvent.GetKey() == EKeys::Virtual_Back)
+	if (KeyEvent.GetKey() == EKeys::Escape || KeyEvent.GetKey() == EKeys::Virtual_Gamepad_Back.GetVirtualKey())
 	{
 		if (VisiblePanel != EVoxelMenuPanel::MainColumn)
 		{
