@@ -142,10 +142,20 @@ void FVoxelGpuWorklist::Init(uint32 RecordCapacity)
 	ENQUEUE_RENDER_COMMAND(VoxelWorklistCreate)(
 		[this](FRHICommandListImmediate& RHICmdList)
 	{
-		FRDGBuilder GraphBuilder(RHICmdList);
-		FRDGBufferRef Records = GraphBuilder.CreateBuffer(
+		// RECORDS IS ALLOCATED OUTSIDE THE GRAPH. It is written by CPU uploads,
+		// not by any RDG pass, so creating it here and extracting it hits
+		//   Assertion failed: Resource->bProduced || bExternal || bQueuedForUpload
+		//   "Unable to queue the extraction of Voxel.WorklistRecords because it
+		//    has not been produced by any pass."
+		// The same trap the raster atlas hit at init an hour earlier. Clearing
+		// it to satisfy RDG would zero 256 KiB every session for nothing --
+		// records are only ever read below the tail cursor the args kernel
+		// publishes, so untouched bytes are unreachable by construction.
+		PooledRecords = AllocatePooledBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelGpuChunkWorkRecord), Capacity),
 			TEXT("Voxel.WorklistRecords"));
+
+		FRDGBuilder GraphBuilder(RHICmdList);
 		FRDGBufferRef Args = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateIndirectDesc<FRHIDispatchIndirectParameters>(
 				uint32(EVoxelWorklistStage::COUNT)),
@@ -164,7 +174,8 @@ void FVoxelGpuWorklist::Init(uint32 RecordCapacity)
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Control), 0u);
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Args, PF_R32_UINT), 0u);
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Stats), 0u);
-		GraphBuilder.QueueBufferExtraction(Records, &PooledRecords);
+		// Records is already pooled above and never entered the graph; only the
+		// three CLEARED buffers are extracted.
 		GraphBuilder.QueueBufferExtraction(Args, &PooledArgs);
 		GraphBuilder.QueueBufferExtraction(Control, &PooledControl);
 		GraphBuilder.QueueBufferExtraction(Stats, &PooledStats);
