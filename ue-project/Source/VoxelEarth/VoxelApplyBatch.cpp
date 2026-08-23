@@ -419,3 +419,108 @@ FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChun
 }
 
 } // namespace VoxelApplyFast
+
+// ---------------------------------------------------------------------------
+// THE PER-TICK CEILINGS. See the block above these declarations in
+// VoxelApplyBatch.h for the ahead-on.log table that found them, the order they
+// bind in, and the failing readings both ways.
+//
+// All three are LATCHED and all three default to "whatever the caller already
+// had". With no switch on the command line every one of these returns its
+// argument (or 1024) and the drain loop is byte-identical to today.
+// ---------------------------------------------------------------------------
+
+namespace VoxelApplyFast
+{
+namespace
+{
+constexpr int32 kShippedDrainCap = 1024; // the constexpr this replaces
+
+// ONE LINE, ONCE, NAMING THE EFFECTIVE VALUES.
+//
+// Without it, "the switch is on" and "the switch did not parse" are the same
+// log. That is the eleven-inert-features failure in its purest form, and it is
+// cheaper to print three numbers than to run a leg that cannot be interpreted.
+// Printed from the first cap query of the session, which is inside DrainResults
+// on the game thread.
+void LogCapsOnce(int32 EffApplies, double EffBudgetSec, int32 EffDrains,
+                 int32 CvarApplies, double CvarBudgetSec)
+{
+	static bool bLogged = false;
+	if (bLogged)
+	{
+		return;
+	}
+	bLogged = true;
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel apply caps: maxApplies=%d (cvar %d) budgetMs=%.2f (cvar %.2f) drainCap=%d (shipped %d)")
+	       TEXT(" -- read `Voxel apply stages` exit= for which one binds; queueEmpty>0 during a FILLING")
+	       TEXT(" window means apply has caught up and is no longer the bound."),
+	       EffApplies, CvarApplies, EffBudgetSec * 1000.0, CvarBudgetSec * 1000.0,
+	       EffDrains, kShippedDrainCap);
+}
+
+int32 AppliesOverride()
+{
+	static const int32 Latched = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyCap="), Value);
+		return FMath::Max(0, Value); // 0 = use the cvar
+	}();
+	return Latched;
+}
+
+float BudgetMsOverride()
+{
+	static const float Latched = []
+	{
+		float Value = -1.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyBudgetMs="), Value);
+		return Value; // < 0 = use the cvar
+	}();
+	return Latched;
+}
+
+int32 DrainOverride()
+{
+	static const int32 Latched = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyDrainCap="), Value);
+		return FMath::Max(0, Value); // 0 = the shipped constant
+	}();
+	return Latched;
+}
+} // namespace
+
+// The pair AppliesPerTickCap last resolved, so ApplyBudgetSeconds -- called
+// three lines later on the same tick, always after it -- can print one complete
+// line instead of two half ones. Game thread only, like everything here.
+static int32 LastCvarApplies = 0;
+static int32 LastEffApplies = 0;
+
+int32 AppliesPerTickCap(int32 CvarValue)
+{
+	const int32 Override = AppliesOverride();
+	LastCvarApplies = CvarValue;
+	LastEffApplies = Override > 0 ? Override : CvarValue;
+	return LastEffApplies;
+}
+
+double ApplyBudgetSeconds(double CvarSeconds)
+{
+	const float OverrideMs = BudgetMsOverride();
+	const double Effective = OverrideMs >= 0.f ? double(OverrideMs) / 1000.0 : CvarSeconds;
+	// First point in a tick where all three effective values are known.
+	LogCapsOnce(LastEffApplies, Effective, DrainsPerTickCap(), LastCvarApplies, CvarSeconds);
+	return Effective;
+}
+
+int32 DrainsPerTickCap()
+{
+	const int32 Override = DrainOverride();
+	return Override > 0 ? Override : kShippedDrainCap;
+}
+
+} // namespace VoxelApplyFast

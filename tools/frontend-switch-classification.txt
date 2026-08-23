@@ -260,3 +260,14 @@ VoxelRecomputeDutyPct
 VoxelApplyFast
 VoxelApplyColumnCache
 VoxelApplyColumnCacheAudit
+
+# --- 2026-08-23 late: the drain loop's per-tick ceilings ---------------------
+# ue-project/Source/VoxelEarth/VoxelApplyBatch.h. Latched overrides for
+# voxel.Stream.MaxAppliesPerFrame, voxel.Stream.ApplyBudgetMs and the
+# kMaxResultDrainsPerFrame constexpr, because -ExecCmds lands after streaming
+# has begun and a cold-fill leg driven that way measures a blend of two caps.
+# Tuning: they change how much the drain loop may do per tick, and none of them
+# drives, poses or ends a run.
+VoxelApplyCap
+VoxelApplyBudgetMs
+VoxelApplyDrainCap
