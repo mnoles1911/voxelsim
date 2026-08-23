@@ -553,6 +553,8 @@ namespace VoxelBrickPoolDetail
 	std::atomic<int64> GAllocSnapMatActualCum{ 0 };
 	std::atomic<int64> GAllocSnapStrandedOccDwords{ 0 };
 	std::atomic<int64> GAllocSnapStrandedMatDwords{ 0 };
+	std::atomic<int64> GAllocSnapOccStackPeak{ 0 };
+	std::atomic<int64> GAllocSnapMatStackPeak{ 0 };
 	std::atomic<int32> GAllocCountersLanded{ 0 };
 	// The sampled verify tallies (cumulative across windows, reset never --
 	// they are verdict counters, and 0 ok / 0 FAIL with samples pending must
@@ -582,9 +584,16 @@ namespace VoxelBrickPoolDetail
 	constexpr int32 kGpuAllocCtrOccActualCum = 14;
 	constexpr int32 kGpuAllocCtrMatPaddedCum = 15;
 	constexpr int32 kGpuAllocCtrMatActualCum = 16;
+	// Free-stack depth high-water per arena (demanded depth, so it can and
+	// must be able to read ABOVE FreeStackCap -- that is the failing reading
+	// that explains leakedRuns; see the .usf counter comment).
+	constexpr int32 kGpuAllocCtrOccStackPeak = 17;
+	constexpr int32 kGpuAllocCtrMatStackPeak = 18;
 	// How many state dwords the counter readback copies AT MINIMUM: the counter
-	// block plus both stack-top arrays, which is what the stranded-dwords
-	// figures need. This was one constant (96) while the class steps were
+	// block, the claim-size histograms and both stack-top arrays, which is what
+	// the stranded-dwords and claim-size figures need. (The histograms sit
+	// BEFORE the tops in the state map precisely so the existing
+	// MatTopsFirst + MatClasses width covers them with no second contract.) This was one constant (96) while the class steps were
 	// constants; the step latches (-VoxelGpuPoolOccStep= etc.) can now grow the
 	// tops arrays past it, so the ACTUAL width is computed per readback from
 	// the layout (MatTopsFirst + MatClasses) and carried on the pending entry
@@ -608,6 +617,10 @@ namespace VoxelBrickPoolDetail
 		// The layout the readback was taken under, for the stack-top walk.
 		uint32 OccTopsFirst = 0, OccClasses = 0, OccClassStep = 0;
 		uint32 MatTopsFirst = 0, MatClasses = 0, MatClassStep = 0;
+		// And for the claim-size histogram walk (same rule: the harvest reads
+		// the geometry the readback was taken under, never the live layout).
+		uint32 OccHistFirst = 0, OccHistBuckets = 0, OccHistBucketWords = 0;
+		uint32 MatHistFirst = 0, MatHistBuckets = 0, MatHistBucketWords = 0;
 		// Dwords this readback actually copied (>= kGpuAllocCounterReadDwords;
 		// see that constant for why it stopped being the whole truth).
 		uint32 ReadDwords = kGpuAllocCounterReadDwords;
@@ -735,6 +748,97 @@ namespace VoxelBrickPoolDetail
 			}
 			GAllocSnapStrandedOccDwords.store(StrandedOcc, std::memory_order_relaxed);
 			GAllocSnapStrandedMatDwords.store(StrandedMat, std::memory_order_relaxed);
+			GAllocSnapOccStackPeak.store(int64(C[kGpuAllocCtrOccStackPeak]), std::memory_order_relaxed);
+			GAllocSnapMatStackPeak.store(int64(C[kGpuAllocCtrMatStackPeak]), std::memory_order_relaxed);
+
+			// --- the claim-size demand histogram, summarised ----------------
+			//
+			// The line the class steps must be chosen from. Per arena it prints
+			// quantile edges and the EXACT padded total each candidate step
+			// WOULD have produced over the same demand -- exact because every
+			// candidate is a multiple of the bucket width, so bucket upper
+			// edges land on class boundaries and ceil() is uniform within a
+			// bucket. The current step is in the candidate list, and its
+			// projected padding must agree with the counter-measured padding
+			// on the window line (claimFail 0 makes demand == grants); a
+			// DISAGREEMENT there is the instrument's own failing reading --
+			// the histogram is measuring a different population than the
+			// PaddedCum/ActualCum counters, and neither can be trusted until
+			// they reconcile.
+			//
+			// Demand = claims + claimFailOcc + claimFailMat (post-gate claim
+			// invocations; worst/split-gate refusals never reach the histogram
+			// or the class logic, and collision-failed claims are counted by
+			// PAGE, not claim, so they are left out -- they are zero on any
+			// leg whose numbers matter). zero = demand minus the bucket sum:
+			// chunks that asked for nothing in that arena and pad nothing.
+			{
+				const int64 Demand = int64(C[kGpuAllocCtrClaims])
+				                   + int64(C[kGpuAllocCtrClaimFailOcc])
+				                   + int64(C[kGpuAllocCtrClaimFailMat]);
+				const auto LogHistLine = [&](const TCHAR* Arena, uint32 First, uint32 Buckets,
+				                             uint32 Width, int64 ActualCum, uint32 CurrentStep,
+				                             const uint32* CandidateSteps, int32 NumCandidates)
+				{
+					if (First + Buckets > Pending.ReadDwords)
+					{
+						return; // layout drift; refuse to summarise garbage
+					}
+					int64 Total = 0;
+					for (uint32 B = 0; B < Buckets; ++B) { Total += int64(C[First + B]); }
+					if (Total <= 0)
+					{
+						return; // no demand yet -- print nothing, never "all zero"
+					}
+					uint32 P50 = 0, P90 = 0, P99 = 0;
+					int64 Cum = 0;
+					for (uint32 B = 0; B < Buckets; ++B)
+					{
+						Cum += int64(C[First + B]);
+						const uint32 Edge = (B + 1) * Width;
+						if (P50 == 0 && Cum * 2 >= Total) { P50 = Edge; }
+						if (P90 == 0 && Cum * 10 >= Total * 9) { P90 = Edge; }
+						if (P99 == 0 && Cum * 100 >= Total * 99) { P99 = Edge; }
+					}
+					FString Proj;
+					for (int32 S = 0; S < NumCandidates; ++S)
+					{
+						const uint32 Step = CandidateSteps[S];
+						int64 ProjPadded = 0;
+						for (uint32 B = 0; B < Buckets; ++B)
+						{
+							const uint32 Edge = (B + 1) * Width;
+							ProjPadded += int64(C[First + B]) * int64(((Edge + Step - 1) / Step) * Step);
+						}
+						const double Pct = ProjPadded > 0
+							? 100.0 * double(ProjPadded - ActualCum) / double(ProjPadded) : 0.0;
+						Proj += FString::Printf(TEXT("%s%u:%.1f%%"), Proj.IsEmpty() ? TEXT("") : TEXT(" "),
+						                        Step, Pct);
+					}
+					UE_LOG(LogVoxelBrickPool, Log,
+					       TEXT("[brick-gpualloc] claim sizes %s (cum): n %lld + zero %lld, ")
+					       TEXT("p50<=%u p90<=%u p99<=%u dw; padding by step { %s } (now %u). ")
+					       TEXT("The projection is EXACT per class (buckets cannot straddle a class ")
+					       TEXT("boundary); the current step's entry must MATCH the window line's ")
+					       TEXT("measured padding while claimFail is 0 -- a mismatch means the two ")
+					       TEXT("instruments are counting different populations and neither is ")
+					       TEXT("trustworthy until reconciled."),
+					       Arena, Total, FMath::Max<int64>(0, Demand - Total), P50, P90, P99,
+					       *Proj, CurrentStep);
+				};
+				// Candidates are multiples of the bucket widths (16 occ, 64
+				// mat) or the projection stops being exact. The current
+				// defaults (128/512) are included so the self-check against
+				// the measured padding is on the line every window.
+				static const uint32 OccSteps[] = { 32u, 48u, 64u, 96u, 128u };
+				static const uint32 MatSteps[] = { 128u, 192u, 256u, 384u, 512u };
+				LogHistLine(TEXT("occ"), Pending.OccHistFirst, Pending.OccHistBuckets,
+				            Pending.OccHistBucketWords, int64(C[kGpuAllocCtrOccActualCum]),
+				            Pending.OccClassStep, OccSteps, UE_ARRAY_COUNT(OccSteps));
+				LogHistLine(TEXT("mat"), Pending.MatHistFirst, Pending.MatHistBuckets,
+				            Pending.MatHistBucketWords, int64(C[kGpuAllocCtrMatActualCum]),
+				            Pending.MatClassStep, MatSteps, UE_ARRAY_COUNT(MatSteps));
+			}
 			GAllocCountersLanded.store(1, std::memory_order_relaxed);
 			delete Pending.Readback;
 			GPendingAllocCounters.RemoveAtSwap(I, EAllowShrinking::No);
@@ -1161,10 +1265,22 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 		L.MatClasses = (VoxelBrickPoolDetail::kBricksPerChunk * 132u + L.MatClassStep - 1u) / L.MatClassStep;
 		L.FreeStackCap = LatchedU32(TEXT("VoxelGpuPoolFreeStackCap="), kGpuAllocFreeStackCap,
 		                            256u, 65536u);
-		// State-buffer map: [0..63] counters, then the two top arrays, then the
-		// two storage arrays. The counter block width is part of the readback
-		// contract (kGpuAllocCounterReadDwords) -- it must cover the tops.
-		L.OccTopsFirst = 64;
+		// The claim-size demand histogram's geometry (see the header constants
+		// for why it exists). Bucket counts are DERIVED from the same worst
+		// cases the classes are, so a brick-format change moves them together.
+		L.OccHistBucketWords = kGpuAllocOccHistBucketWords;
+		L.MatHistBucketWords = kGpuAllocMatHistBucketWords;
+		L.OccHistBuckets = (VoxelBrickPoolDetail::kBricksPerChunk * 16u + L.OccHistBucketWords - 1u) / L.OccHistBucketWords;
+		L.MatHistBuckets = (VoxelBrickPoolDetail::kBricksPerChunk * 132u + L.MatHistBucketWords - 1u) / L.MatHistBucketWords;
+		// State-buffer map: [0..63] counters, then the two histograms, then the
+		// two top arrays, then the two storage arrays. The counter readback
+		// reads through MatTopsFirst + MatClasses, so placing the histograms
+		// BEFORE the tops keeps them inside every readback by construction --
+		// an under-read here would not fault, it would silently zero the
+		// histogram, which is the quiet-lie shape the width rule exists for.
+		L.OccHistFirst = 64;
+		L.MatHistFirst = L.OccHistFirst + L.OccHistBuckets;
+		L.OccTopsFirst = L.MatHistFirst + L.MatHistBuckets;
 		L.MatTopsFirst = L.OccTopsFirst + L.OccClasses;
 		L.OccStackFirst = L.MatTopsFirst + L.MatClasses;
 		L.MatStackFirst = L.OccStackFirst + L.OccClasses * L.FreeStackCap;
@@ -2080,6 +2196,7 @@ void FVoxelBrickPool::NoteGpuAllocFallback(EGpuAllocFallback Reason)
 	case EGpuAllocFallback::Stacked:      ++GpuFallbackStacked; break;
 	case EGpuAllocFallback::Discard:      ++GpuFallbackDiscard; break;
 	case EGpuAllocFallback::ShellRefused: ++GpuFallbackShellRefused; break;
+	case EGpuAllocFallback::ShellStolen:  ++GpuFallbackShellStolen; break;
 	}
 }
 
@@ -2248,6 +2365,12 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 			PendingCounters.MatTopsFirst = Layout.MatTopsFirst;
 			PendingCounters.MatClasses = Layout.MatClasses;
 			PendingCounters.MatClassStep = Layout.MatClassStep;
+			PendingCounters.OccHistFirst = Layout.OccHistFirst;
+			PendingCounters.OccHistBuckets = Layout.OccHistBuckets;
+			PendingCounters.OccHistBucketWords = Layout.OccHistBucketWords;
+			PendingCounters.MatHistFirst = Layout.MatHistFirst;
+			PendingCounters.MatHistBuckets = Layout.MatHistBuckets;
+			PendingCounters.MatHistBucketWords = Layout.MatHistBucketWords;
 			GPendingAllocCounters.Add(PendingCounters);
 		}
 		GraphBuilder.Execute();
@@ -2263,20 +2386,42 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 	{
 		const bool bLanded = GAllocCountersLanded.load(std::memory_order_relaxed) != 0;
 		const double MiB = 1024.0 * 1024.0;
-		const int64 PaddedCum = GAllocSnapOccPaddedCum.load(std::memory_order_relaxed)
-		                      + GAllocSnapMatPaddedCum.load(std::memory_order_relaxed);
-		const int64 ActualCum = GAllocSnapOccActualCum.load(std::memory_order_relaxed)
-		                      + GAllocSnapMatActualCum.load(std::memory_order_relaxed);
+		const int64 OccPaddedCum = GAllocSnapOccPaddedCum.load(std::memory_order_relaxed);
+		const int64 OccActualCum = GAllocSnapOccActualCum.load(std::memory_order_relaxed);
+		const int64 MatPaddedCum = GAllocSnapMatPaddedCum.load(std::memory_order_relaxed);
+		const int64 MatActualCum = GAllocSnapMatActualCum.load(std::memory_order_relaxed);
+		const int64 PaddedCum = OccPaddedCum + MatPaddedCum;
+		const int64 ActualCum = OccActualCum + MatActualCum;
+		const int64 SnapClaims = GAllocSnapClaims.load(std::memory_order_relaxed);
+		const int64 SnapFailOcc = GAllocSnapClaimFailOcc.load(std::memory_order_relaxed);
+		const int64 SnapFailMat = GAllocSnapClaimFailMat.load(std::memory_order_relaxed);
+		const int64 SnapFailWorst = GAllocSnapClaimFailWorst.load(std::memory_order_relaxed);
+		// The shells-vs-claims reconciliation (2026-08-23: one leg read shells
+		// 708,793 vs claims 708,753 -- a 40-count gap nothing could attribute).
+		// Every shell must end as exactly one of: a landed claim (success or
+		// any claim-side failure), a STOLEN shell (evicted by a later shell in
+		// the same dispatch loop, claim never enqueued), or a CPU-producer
+		// shell whose pack was dropped before its flush (counted into
+		// writesDropped). unclaimed = shells - stolen - claims - claimFails is
+		// therefore in-flight work plus the one-window readback staleness
+		// while streaming; its FAILING reading is a value that HOLDS at
+		// quiescence after the counters land -- shells whose claims never ran,
+		// each one a resident record slot with no volume behind it.
+		const int64 ShellsUnclaimed = GpuShellsAllocated - GpuFallbackShellStolen
+		                            - SnapClaims - SnapFailOcc - SnapFailMat - SnapFailWorst;
 		UE_LOG(LogVoxelBrickPool, Log,
-		       TEXT("[brick-gpualloc] shells %lld, freesQueued %lld; GPU (prev window%s): claims %lld ")
+		       TEXT("[brick-gpualloc] shells %lld (stolen %lld, unclaimed %lld), freesQueued %lld; ")
+		       TEXT("GPU (prev window%s): claims %lld ")
 		       TEXT("(%lld stack reuse), frees %lld, inFlight %.1f MiB occ + %.1f MiB mat, bump ")
-		       TEXT("high-water %.1f/%.1f MiB occ %.1f/%.1f MiB mat, padding %.1f%%, stranded ")
-		       TEXT("%.1f MiB, leakedRuns %lld; claimFail occ %lld mat %lld worst %lld; ")
+		       TEXT("high-water %.1f/%.1f MiB occ %.1f/%.1f MiB mat, padding %.1f%% ")
+		       TEXT("(occ %.1f%% mat %.1f%%), stranded ")
+		       TEXT("%.1f MiB, leakedRuns %lld, stackPeak occ %lld mat %lld of %u; ")
+		       TEXT("claimFail occ %lld mat %lld worst %lld; ")
 		       TEXT("FAIL: doubleGrant %lld badFree %lld; xcheck %lld ok / %lld FAIL ")
 		       TEXT("(%lld sampled, %lld unwritten, %d pending)"),
-		       GpuShellsAllocated, GpuFreesQueued,
+		       GpuShellsAllocated, GpuFallbackShellStolen, ShellsUnclaimed, GpuFreesQueued,
 		       bLanded ? TEXT("") : TEXT(", NOT LANDED YET -- no verdict"),
-		       GAllocSnapClaims.load(std::memory_order_relaxed),
+		       SnapClaims,
 		       GAllocSnapStackPops.load(std::memory_order_relaxed),
 		       GAllocSnapFrees.load(std::memory_order_relaxed),
 		       double(GAllocSnapOccInFlight.load(std::memory_order_relaxed)) * 4 / MiB,
@@ -2286,12 +2431,17 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 		       double(GAllocSnapMatBump.load(std::memory_order_relaxed)) * 4 / MiB,
 		       double(GpuAllocLayout.MatRegionWords) * 4 / MiB,
 		       ActualCum > 0 ? 100.0 * double(PaddedCum - ActualCum) / double(PaddedCum) : 0.0,
+		       OccPaddedCum > 0 ? 100.0 * double(OccPaddedCum - OccActualCum) / double(OccPaddedCum) : 0.0,
+		       MatPaddedCum > 0 ? 100.0 * double(MatPaddedCum - MatActualCum) / double(MatPaddedCum) : 0.0,
 		       double(GAllocSnapStrandedOccDwords.load(std::memory_order_relaxed)
 		              + GAllocSnapStrandedMatDwords.load(std::memory_order_relaxed)) * 4 / MiB,
 		       GAllocSnapPushOverflow.load(std::memory_order_relaxed),
-		       GAllocSnapClaimFailOcc.load(std::memory_order_relaxed),
-		       GAllocSnapClaimFailMat.load(std::memory_order_relaxed),
-		       GAllocSnapClaimFailWorst.load(std::memory_order_relaxed),
+		       GAllocSnapOccStackPeak.load(std::memory_order_relaxed),
+		       GAllocSnapMatStackPeak.load(std::memory_order_relaxed),
+		       GpuAllocLayout.FreeStackCap,
+		       SnapFailOcc,
+		       SnapFailMat,
+		       SnapFailWorst,
 		       GAllocSnapBitmapCollision.load(std::memory_order_relaxed),
 		       GAllocSnapFreeMissing.load(std::memory_order_relaxed),
 		       GAllocXchkOk.load(std::memory_order_relaxed),
@@ -2303,14 +2453,18 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 
 	// The GT fallback tallies get their own line only when non-zero -- a
 	// fallback means the armed path is DECLINING work, which must not hide.
-	if (GpuFallbackStacked + GpuFallbackDiscard + GpuFallbackShellRefused > 0)
+	if (GpuFallbackStacked + GpuFallbackDiscard + GpuFallbackShellRefused + GpuFallbackShellStolen > 0)
 	{
 		UE_LOG(LogVoxelBrickPool, Warning,
-		       TEXT("[brick-gpualloc] fallbacks: stacked %lld, discardArm %lld, shellRefused %lld ")
+		       TEXT("[brick-gpualloc] fallbacks: stacked %lld, discardArm %lld, shellRefused %lld, ")
+		       TEXT("shellStolen %lld ")
 		       TEXT("(cumulative). Stacked chunks lose their volume while armed (B.1 stacking is ")
 		       TEXT("skipped when PoolAlloc is on); shellRefused means the descriptor pool is full ")
-		       TEXT("even after eviction."),
-		       GpuFallbackStacked, GpuFallbackDiscard, GpuFallbackShellRefused);
+		       TEXT("even after eviction; shellStolen shells were evicted by a later allocation in ")
+		       TEXT("the same dispatch loop and their claims never ran -- they are one of the ")
+		       TEXT("legitimate terms in the shells-vs-claims reconciliation on the window line."),
+		       GpuFallbackStacked, GpuFallbackDiscard, GpuFallbackShellRefused,
+		       GpuFallbackShellStolen);
 	}
 }
 

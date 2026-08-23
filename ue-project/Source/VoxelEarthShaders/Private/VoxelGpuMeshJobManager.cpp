@@ -2412,7 +2412,11 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				Job->bGpuPoolAlloc = false;
 				Job->bGpuShellAllocated = false;
 				Job->bBrickPack = false;
-				Pool.NoteGpuAllocFallback(FVoxelBrickPool::EGpuAllocFallback::ShellRefused);
+				// STOLEN, not refused: this shell WAS allocated (and counted
+				// into `shells`) before a later allocation's eviction took its
+				// slot, and its claim never runs -- the distinction the
+				// shells-vs-claims reconciliation needs (see the enum).
+				Pool.NoteGpuAllocFallback(FVoxelBrickPool::EGpuAllocFallback::ShellStolen);
 			}
 		}
 		// Rule 3: frees before claims, always.
