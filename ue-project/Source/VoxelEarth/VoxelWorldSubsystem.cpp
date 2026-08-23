@@ -7518,6 +7518,38 @@ struct FVoxelWorldImpl
 	double AccumDispatchOverlayMs = 0.0;
 	double AccumDispatchLoopMs = 0.0;   // the whole pop loop: the honest denominator for perDispatch
 	double AccumGpuManagerTickMs = 0.0; // GpuMeshJobs->Tick(), bundled into dispatch= by T0..T1 but not dispatch
+	// THE GPU SUBMIT SPLIT (2026-08-23). Under -VoxelGpuPrimary the game-thread
+	// budget line reads dispatch=1,547 ms per 5 s window against the control's
+	// 32-70 ms -- 0.149 ms of game thread per forked chunk, which at the
+	// owner's 50,000 chunks/s target is 7.4 s of game thread per second of
+	// gameplay. The raster atlas reports fills=0 / gpuMiss=0, so the historical
+	// 46 KB FillRasterWindow answer does NOT hold and nothing in the tree could
+	// name the actual cost. These buckets bracket SubmitGpuMeshJob's six phases
+	// CONTIGUOUSLY (sequential stamps, so in-function drift must print ~0) and
+	// accumulate as SUM, not max -- a max cannot be optimised against, and this
+	// project has already shipped an unsplittable 853 ms figure once.
+	// Speculative and Submit-declined calls accumulate too: the quantity is
+	// "game thread spent building GPU submissions", whoever asked.
+	//
+	// FAILING READINGS (stated here because every counter must be able to come
+	// out the other way): drift= or loopMinusFn= dominating totalMs= means the
+	// brackets are in the wrong place; every bucket near zero while the budget
+	// line's dispatch= stays ~1,500 ms means the cost is per-pass or per-frame
+	// OUTSIDE the per-chunk path and this instrument is measuring the wrong
+	// thing -- both are findings, neither is a green light.
+	double AccumGpuSubmitReqHdrMs = 0.0;  // footprint/seed/climate shading/skirt
+	double AccumGpuSubmitBandMs = 0.0;    // band policy + request build
+	double AccumGpuSubmitRasterMs = 0.0;  // atlas PrepareRequest / FillRasterWindow
+	double AccumGpuSubmitAssetsMs = 0.0;  // resolve + span tables + instance marshal
+	double AccumGpuSubmitPoolMs = 0.0;    // direct-to-pool decision incl. GI probe
+	double AccumGpuSubmitMgrMs = 0.0;     // Manager->Submit + GpuJobsPending insert
+	double AccumGpuSubmitTotalMs = 0.0;   // whole SubmitGpuMeshJob wall
+	int64 GpuSubmitCallsSinceLog = 0;     // calls entered (success, decline, speculative)
+	// Loop-side bracket of SUCCESSFUL demand fork iterations (SubmitStart to
+	// the fork branch's continue) -- loopMinusFn = this minus totalMs is the
+	// fork-branch cost OUTSIDE SubmitGpuMeshJob when positive; negative means
+	// speculative/declined calls (in totalMs, not in this) outweigh it.
+	double AccumDispatchSubmitGpuMs = 0.0;
 	// P2: the brick pool's per-tick publication (one render command for every
 	// brick write the tick made). Its own bucket rather than folded into one of
 	// the four above, so the CPU arm's game-thread cost is attributable instead
@@ -10824,6 +10856,30 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	           - AccumDispatchPickMs - AccumDispatchOverlayMs,
 	       AccumGpuManagerTickMs, (long long)JobsDispatchedSinceLog,
 	       JobsDispatchedSinceLog > 0 ? AccumDispatchLoopMs / double(JobsDispatchedSinceLog) : 0.0);
+
+	// The gpu-submit split (see the AccumGpuSubmit* members for the 1,547 ms
+	// mechanism hunt and the FAILING readings). Printed whenever the fork ran
+	// this window; silent otherwise so a CPU-only leg's log is unchanged.
+	// drift= is totalMs minus the six buckets and must print ~0.00 (the stamps
+	// are contiguous; nonzero means someone broke that). loopMinusFn= is the
+	// loop-side successful-fork bracket minus totalMs: positive = fork-branch
+	// cost OUTSIDE SubmitGpuMeshJob, negative = speculative/declined calls
+	// (counted in totalMs, absent from the loop bracket) outweigh it.
+	if (GpuSubmitCallsSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel gpu submit split (5s window): totalMs=%.1f = reqHdr=%.1f + band=%.1f + raster=%.1f ")
+		       TEXT("+ assets=%.1f + pool=%.1f + mgrSubmit=%.1f (drift=%.2f) | calls=%lld perCallUs=%.1f ")
+		       TEXT("| loopSubmitGpuMs=%.1f loopMinusFn=%.1f"),
+		       AccumGpuSubmitTotalMs, AccumGpuSubmitReqHdrMs, AccumGpuSubmitBandMs, AccumGpuSubmitRasterMs,
+		       AccumGpuSubmitAssetsMs, AccumGpuSubmitPoolMs, AccumGpuSubmitMgrMs,
+		       AccumGpuSubmitTotalMs - AccumGpuSubmitReqHdrMs - AccumGpuSubmitBandMs - AccumGpuSubmitRasterMs
+		           - AccumGpuSubmitAssetsMs - AccumGpuSubmitPoolMs - AccumGpuSubmitMgrMs,
+		       (long long)GpuSubmitCallsSinceLog,
+		       AccumGpuSubmitTotalMs * 1000.0 / double(GpuSubmitCallsSinceLog),
+		       AccumDispatchSubmitGpuMs,
+		       AccumDispatchSubmitGpuMs - AccumGpuSubmitTotalMs);
+	}
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
 	// §2.2's testable prediction is that this decays monotonically across a
@@ -12436,6 +12492,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
 	AccumDispatchAirProofMs = AccumDispatchBandMs = AccumDispatchSubmitMs = AccumDispatchPickMs = 0.0;
 	AccumDispatchOverlayMs = AccumDispatchLoopMs = AccumGpuManagerTickMs = 0.0;
+	AccumGpuSubmitReqHdrMs = AccumGpuSubmitBandMs = AccumGpuSubmitRasterMs = 0.0;
+	AccumGpuSubmitAssetsMs = AccumGpuSubmitPoolMs = AccumGpuSubmitMgrMs = AccumGpuSubmitTotalMs = 0.0;
+	AccumDispatchSubmitGpuMs = 0.0;
+	GpuSubmitCallsSinceLog = 0;
 	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
@@ -17740,8 +17800,16 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
 	if (Manager == nullptr)
 	{
+		// Before the first stamp on purpose: an uncounted early exit here is a
+		// dead fork, not a submit cost, and it would dilute perCallUs.
 		return false;
 	}
+
+	// The gpu-submit split (see the AccumGpuSubmit* members for the 1,547 ms
+	// finding these exist to name). CONTIGUOUS sequential stamps: each bucket
+	// is the span to the previous stamp, so their sum telescopes to the total
+	// and the printed drift can only move if someone breaks that contiguity.
+	const double SubT0 = FPlatformTime::Seconds();
 
 	FVoxelGpuRegionRequest Req;
 	// The chunk footprint is LEVEL-AGNOSTIC and that is not a coincidence: the
@@ -17778,6 +17846,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// D5.3. Computed on the game thread where the anchor and RingPresets are
 	// live, exactly as the worker job's is, and baked into this dispatch.
 	Req.RingSkirtMask = RingSkirtMask;
+	const double SubT1 = FPlatformTime::Seconds(); // reqHdr: footprint/seed/shading/skirt
 
 	// Ask for the band (D6), which is what lets the fork take a chunk whose
 	// footprint has not been seen before instead of leaving every cold column to
@@ -17933,6 +18002,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			++GpuBandFreeSubmitsSinceLog;
 		}
 	}
+	const double SubT2 = FPlatformTime::Seconds(); // band: policy + request build
 	// The one place the raster-window arithmetic may live -- see
 	// VoxelGpuRegionBuild's header. Undersizing it does not fault; the kernel
 	// clamps to the window edge and silently produces different terrain.
@@ -17955,6 +18025,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	{
 		VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
 	}
+	const double SubT3 = FPlatformTime::Seconds(); // raster: atlas check / window fill
 
 	// --- Asset compose: stamp this chunk's terrain instances on the GPU ------
 	//
@@ -18040,6 +18111,19 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 					// One un-stampable instance and the whole chunk goes to
 					// the CPU mesher: a partial stamp is a hole in an asset,
 					// which is the failure this whole path exists to avoid.
+					// Counted into the split before leaving: the game thread
+					// paid for everything up to here whether or not a job came
+					// of it, and an uncounted decline path is how perCallUs
+					// drifts from the budget line's dispatch=.
+					{
+						const double SubTAbort = FPlatformTime::Seconds();
+						AccumGpuSubmitReqHdrMs += (SubT1 - SubT0) * 1000.0;
+						AccumGpuSubmitBandMs += (SubT2 - SubT1) * 1000.0;
+						AccumGpuSubmitRasterMs += (SubT3 - SubT2) * 1000.0;
+						AccumGpuSubmitAssetsMs += (SubTAbort - SubT3) * 1000.0;
+						AccumGpuSubmitTotalMs += (SubTAbort - SubT0) * 1000.0;
+						++GpuSubmitCallsSinceLog;
+					}
 					return false;
 				}
 				FVoxelGpuRegionRequest::FAssetInstance Inst;
@@ -18085,6 +18169,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			}
 		}
 	}
+	const double SubT4 = FPlatformTime::Seconds(); // assets: resolve + span marshal
 
 	// --- Wave D / D1: may this chunk's quads stay on the GPU? ----------------
 	//
@@ -18151,9 +18236,24 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		}
 	}
 
+	const double SubT5 = FPlatformTime::Seconds(); // pool: direct-to-pool + GI probe
+
 	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool,
 	                                     /*bLowPriority*/ bSpeculative);
 	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, bSpeculative });
+
+	// The gpu-submit split's normal exit (the decline path above mirrors it).
+	{
+		const double SubT6 = FPlatformTime::Seconds();
+		AccumGpuSubmitReqHdrMs += (SubT1 - SubT0) * 1000.0;
+		AccumGpuSubmitBandMs += (SubT2 - SubT1) * 1000.0;
+		AccumGpuSubmitRasterMs += (SubT3 - SubT2) * 1000.0;
+		AccumGpuSubmitAssetsMs += (SubT4 - SubT3) * 1000.0;
+		AccumGpuSubmitPoolMs += (SubT5 - SubT4) * 1000.0;
+		AccumGpuSubmitMgrMs += (SubT6 - SubT5) * 1000.0;
+		AccumGpuSubmitTotalMs += (SubT6 - SubT0) * 1000.0;
+		++GpuSubmitCallsSinceLog;
+	}
 	return true;
 }
 
@@ -19239,6 +19339,11 @@ void FVoxelWorldImpl::DispatchJobs()
 					FootprintBlindJobIsGpu.Add(SeedFootprint);
 				}
 			}
+			// Gpu-submit split: the loop-side half of loopMinusFn (see the
+			// AccumGpuSubmit* members). Same span the ON_SCOPE_EXIT adds to
+			// the blended submit= -- this is a subdivision of that bucket for
+			// SUCCESSFUL demand forks, not an addition to it.
+			AccumDispatchSubmitGpuMs += (FPlatformTime::Seconds() - SubmitStart) * 1000.0;
 			continue;
 		}
 
