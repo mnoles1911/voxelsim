@@ -107,6 +107,9 @@
 #include "PSOPrecache.h" // hitch isolation: FPSOPrecacheParams for the BeginPlay terrain-material PSO precache warmup
 #include "Stats/Stats.h"
 #include "Tasks/Task.h"
+#include "Async/Async.h"            // -VoxelWorkerPool: AsyncPool onto the dedicated mesh-worker pool
+#include "Async/Future.h"           // ...and the TFuture<void> handles WaitForInFlightTasks drains
+#include "Misc/QueuedThreadPool.h"  // ...the pool itself (FQueuedThreadPool::Allocate/Create)
 #include "UObject/UObjectGlobals.h"
 
 #include <algorithm>
@@ -3995,6 +3998,39 @@ UE::Tasks::ETaskPriority WorkerTaskPriorityEnum()
 	}
 }
 
+// -VoxelWorkerPool=N (2026-08-23): run the mesh workers on a DEDICATED
+// FQueuedThreadPool of N threads instead of the UE::Tasks scheduler.
+//
+// This is the named fallback for the -VoxelWorkerTaskPri arm (see
+// WorkerTaskPriority's comment for the measured 2.5-3.0 effective-concurrency
+// pin). The two arms separate two hypotheses that a single knob cannot:
+// priority moves the jobs BETWEEN the scheduler's existing worker sets;
+// this pool bypasses the scheduler entirely, so its thread COUNT is the one
+// variable. If effConc rises to ~N here after staying ~2.5 under wkPri=2/3,
+// the limiter was the scheduler's worker allotment, not priority.
+//
+// 0 = off (control, byte-identical: UE::Tasks::Launch exactly as before).
+// The pool's threads run TPri_BelowNormal -- above the engine's background
+// workers, below the game/render/RHI threads, so a saturated pool degrades
+// frame time gracefully instead of preempting the frame; if effConc under
+// this arm STILL pins low at, say, N=16 with 20 idle cores, OS thread
+// priority is implicated and the next probe is TPri_Normal here.
+//
+// Teardown is covered: pool futures are pruned in Tick beside InFlightTasks,
+// waited with the same deadline in WaitForInFlightTasks, and the pool is
+// destroyed there -- the raw-pointer capture contract ("no job outlives
+// Impl") is inherited unchanged.
+int32 WorkerPoolThreads()
+{
+	static const int32 Threads = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelWorkerPool="), Value);
+		return FMath::Clamp(Value, 0, 64);
+	}();
+	return Threads;
+}
+
 // --- drain-scaled admission cap (-VoxelAdmissionCapDrainSec, 2026-08-23) ----
 //
 // WHAT DRIVES cutoffM, spelled out because it took a night to trace: the
@@ -5572,6 +5608,27 @@ struct FVoxelWorldImpl
 	TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc> ResultsQueue;
 	FThreadSafeCounter JobsInFlightCounter;
 	TArray<UE::Tasks::TTask<void>> InFlightTasks; // only for a clean Deinitialize() wait; see WaitForInFlightTasks
+	// -VoxelWorkerPool arm (see VoxelStreamAdmission::WorkerPoolThreads): the
+	// dedicated pool and its futures. Same lifecycle contract as
+	// InFlightTasks -- pruned in Tick, drained with a deadline in
+	// WaitForInFlightTasks (where the pool is also destroyed). Both empty /
+	// null forever when the switch is off.
+	TArray<TFuture<void>> InFlightPoolFutures;
+	FQueuedThreadPool* WorkerPool = nullptr;
+	FQueuedThreadPool& GetOrCreateWorkerPool()
+	{
+		if (!WorkerPool)
+		{
+			WorkerPool = FQueuedThreadPool::Allocate();
+			// 1 MiB stacks: the job body runs full vxc worldgen columns; the
+			// UE workers it ran on before have engine-sized stacks, and a
+			// dedicated pool must not be the arm that introduces a stack
+			// overflow into an A/B. TPri_BelowNormal: see WorkerPoolThreads.
+			verify(WorkerPool->Create(VoxelStreamAdmission::WorkerPoolThreads(), 1024 * 1024,
+			                          TPri_BelowNormal, TEXT("VoxelMeshWorkers")));
+		}
+		return *WorkerPool;
+	}
 
 	// --- GPU meshing (ADR-0006, Wave D / D4) --------------------------------
 	//
@@ -8307,6 +8364,10 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	}
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
+	// -VoxelWorkerPool arm: same prune, same reason (WaitForInFlightTasks'
+	// hang postmortem property 1 -- an unpruned array makes teardown walk
+	// hundreds of already-finished entries). Empty forever when off.
+	InFlightPoolFutures.RemoveAllSwap([](const TFuture<void>& F) { return F.IsReady(); }, EAllowShrinking::No);
 
 	// docs/debug-tooling-plan.md P1 "Stats group": always-on DWORD counters
 	// (STATS macros already compile to nothing in Shipping; no extra gate).
@@ -8559,6 +8620,55 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		       TasksToWaitFor, WaitMs, TasksBeforePrune - TasksToWaitFor, TasksBeforePrune);
 	}
 	InFlightTasks.Empty();
+
+	// --- -VoxelWorkerPool arm (dedicated pool futures + the pool itself) ----
+	// Same prune / deadline-wait / report discipline as the task loop above,
+	// under the same overall deadline: the job body is the same code holding
+	// the same raw pointers into Impl, so every property of the hang
+	// postmortem applies verbatim. The pool is destroyed here and only here;
+	// after the futures drain its queue is empty, so Destroy() only joins
+	// idle threads.
+	if (InFlightPoolFutures.Num() > 0 || WorkerPool)
+	{
+		const double PoolWaitT0 = FPlatformTime::Seconds();
+		const int32 FuturesBeforePrune = InFlightPoolFutures.Num();
+		InFlightPoolFutures.RemoveAllSwap([](const TFuture<void>& F) { return F.IsReady(); },
+		                                  EAllowShrinking::No);
+		int32 PoolTimedOut = 0;
+		for (TFuture<void>& Future : InFlightPoolFutures)
+		{
+			const double Remaining = Deadline - FPlatformTime::Seconds();
+			if (Remaining <= 0.0 || !Future.WaitFor(FTimespan::FromSeconds(Remaining)))
+			{
+				++PoolTimedOut;
+			}
+		}
+		if (PoolTimedOut > 0)
+		{
+			UE_LOG(LogVoxelStream, Error,
+			       TEXT("WaitForInFlightTasks: %d of %d POOL job(s) (-VoxelWorkerPool) did NOT complete within the ")
+			       TEXT("shared deadline. Same unsound-shutdown consequences as the task arm above; the pool is ")
+			       TEXT("deliberately LEAKED rather than Destroy()ed, because Destroy() would block on the very jobs ")
+			       TEXT("that just proved they are stuck."),
+			       PoolTimedOut, InFlightPoolFutures.Num());
+		}
+		else
+		{
+			if (FuturesBeforePrune > 0)
+			{
+				UE_LOG(LogVoxelStream, Log,
+				       TEXT("WaitForInFlightTasks: drained %d pool job(s) (-VoxelWorkerPool) in %.0f ms."),
+				       FuturesBeforePrune, (FPlatformTime::Seconds() - PoolWaitT0) * 1000.0);
+			}
+			if (WorkerPool)
+			{
+				WorkerPool->Destroy();
+				delete WorkerPool;
+				WorkerPool = nullptr;
+			}
+		}
+		InFlightPoolFutures.Empty();
+	}
 
 	// --- GPU-meshed jobs (Wave D / D4) --------------------------------------
 	//
@@ -9246,13 +9356,13 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // -VoxelWorkerTaskPri so a leg self-describes (a priority arm that
 	       // silently failed to latch must be readable as such).
 	       TEXT("Voxel dispatch loop (5s window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
-	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d"),
+	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
 	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue(),
 	       AccumCpuWorkerJobMsSinceLog / 1000.0,
 	       ThisLogWindowSeconds > 0.f ? AccumCpuWorkerJobMsSinceLog / (1000.0 * ThisLogWindowSeconds) : 0.0,
-	       VoxelStreamAdmission::WorkerTaskPriority());
+	       VoxelStreamAdmission::WorkerTaskPriority(), VoxelStreamAdmission::WorkerPoolThreads());
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
@@ -17583,8 +17693,10 @@ void FVoxelWorldImpl::DispatchJobs()
 		CpuJobsInFlightCounter.Increment();
 		FThreadSafeCounter* CpuCounterPtr = &CpuJobsInFlightCounter;
 
-		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
-			TEXT("VoxelChunkMeshJob"),
+		// The job body, named so the two launch arms below can share ONE
+		// spelling (-VoxelWorkerPool routes it to a dedicated pool; default
+		// is UE::Tasks exactly as before). Captures unchanged.
+		auto JobBody =
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
@@ -18353,14 +18465,27 @@ void FVoxelWorldImpl::DispatchJobs()
 				// more than the workers currently between these two lines
 				// (<= 8, the reconciliation jitter its doc comment states).
 				CpuCounterPtr->Decrement();
-			},
-			// -VoxelWorkerTaskPri (default: BackgroundNormal, the historical
-			// hardwired value). See WorkerTaskPriorityEnum's comment for the
-			// measured 2.5-3.0 effective-concurrency pin this switch exists
-			// to test -- ~260 of these 0.8 ms tasks queue ~87 ms each for a
-			// background worker while 24 cores idle.
-			VoxelStreamAdmission::WorkerTaskPriorityEnum());
-		InFlightTasks.Add(MoveTemp(Task));
+			};
+		if (VoxelStreamAdmission::WorkerPoolThreads() > 0)
+		{
+			// -VoxelWorkerPool: the dedicated-pool arm (thread-count probe;
+			// see WorkerPoolThreads). Future stored for the teardown wait,
+			// exactly as the TTask is on the default arm.
+			InFlightPoolFutures.Add(
+			    AsyncPool(GetOrCreateWorkerPool(), TUniqueFunction<void()>(MoveTemp(JobBody))));
+		}
+		else
+		{
+			UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+				TEXT("VoxelChunkMeshJob"), MoveTemp(JobBody),
+				// -VoxelWorkerTaskPri (default: BackgroundNormal, the historical
+				// hardwired value). See WorkerTaskPriorityEnum's comment for the
+				// measured 2.5-3.0 effective-concurrency pin this switch exists
+				// to test -- ~260 of these 0.8 ms tasks queue ~87 ms each for a
+				// background worker while 24 cores idle.
+				VoxelStreamAdmission::WorkerTaskPriorityEnum());
+			InFlightTasks.Add(MoveTemp(Task));
+		}
 
 		// Cold-band throttle: a job is now genuinely in flight for this footprint
 		// and will produce its band, so hold the column-mates back until it
