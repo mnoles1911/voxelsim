@@ -248,3 +248,14 @@ VoxelSettleProgressSec
 # meant to be usable on an ordinary interactive flight -- which is exactly why
 # the name avoids a *Check/*Verify ending that would suppress the menu.
 VoxelRecomputeDutyPct
+
+# --- 2026-08-23: the apply path's per-chunk worldgen sampling ----------------
+# ue-project/Source/VoxelEarth/VoxelApplyBatch.h. All three are tuning: they
+# change how DrainResults computes a brick chunk's shading, and none of them
+# drives, poses or ends a run. VoxelApplyColumnCacheAudit is deliberately named
+# *Audit and NOT *Verify -- the naming rule in VoxelFrontEndPolicy.cpp treats a
+# switch containing "Verify" as self-driving and would suppress the front end
+# for what is a correctness cross-check on an ordinary interactive run.
+VoxelApplyFast
+VoxelApplyColumnCache
+VoxelApplyColumnCacheAudit
