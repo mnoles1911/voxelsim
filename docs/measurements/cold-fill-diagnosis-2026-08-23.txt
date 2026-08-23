@@ -1,0 +1,160 @@
+================================================================================
+COLD FILL IS CPU-CAPACITY BOUND AT THE HARDWARE, NOT PACED BY ANY GATE
+2026-08-23 -- read from Saved/wide-on-30.log, Saved/wk-pri2.log,
+Saved/wk-pool.log, Saved/inflight96.log. No new legs run; every number below
+is quoted from an instrument already in the tree.
+================================================================================
+
+Written against the owner's goal: "all chunks out to the cascade horizon load
+in only a few seconds. It currently takes almost a full minute." This file
+answers the four cold-fill questions the goal poses, in order, and records the
+one mechanism finding that settles the worker-concurrency argument for good.
+
+--------------------------------------------------------------------------------
+0. THE COLD FILL, ANATOMISED (wide-on-30.log, wide-ring arm, 2 s log windows)
+--------------------------------------------------------------------------------
+
+Timeline from first window (20:03:58) to first settle (~20:04:48, ~55 s):
+
+  * Rings fill STRICTLY SERIALLY -- R0's queue drains to 0 by +4 s, then R1
+    (+10 s), R2 (+14 s), R3 (+20 s), R4 (+28 s), R5 (+50 s). Nearest-first
+    popping makes the far rings wait; their queues sit at ~250 entries for
+    tens of seconds. (This is order, not throughput: total work is the same.)
+  * The pipe is FULL the whole time: pendingJobs never below 690, exitCap on
+    every dispatch pass, exitEmpty=0 in every fill window, jobsInFlight
+    steady ~500-530.
+  * Job population at first settle, per ring ("Voxel ring dispatch" totals):
+    R0 41,279 / R1 44,369 / R2 42,596 / R3 41,259 / R4 41,875 / R5 43,339
+    = 254,717 jobs. R0's dispatch total equals its resident0 EXACTLY
+    (41,279) -- at R0, every job admitted was a chunk the cascade needed.
+    The population is real work, not churn and not waste.
+  * Throughput: ~8,000-10,500 launches/s early (fine rings, 0.72 ms/job),
+    decaying to ~2-3k/s in the tail (coarse rings cost more per job; read
+    per-ring cost as workerMs/results on the census lines).
+  * 254,717 jobs / ~50 s = ~5,100 jobs/s average. That IS the settle time.
+
+--------------------------------------------------------------------------------
+1. WHERE DOES COLD-FILL TIME GO? (the parent's question 2, answered)
+--------------------------------------------------------------------------------
+
+Into worker-side generation, full stop. Same leg, first fill:
+
+  * Streaming tick: 11-19% of wall after the first window (the first window's
+    48% is the initial recompute burst, 1,810 ms once, ~3% of the fill).
+    The earlier "0.25% of wall" reading was a steady-state window, not a
+    fill window -- the tick-budget line is fine; the window was wrong.
+  * recompute= falls to ~50-90 ms/window after window 1. Admission is cheap.
+  * dispatch stages: perDispatch=0.002-0.006 ms. The 0.21 ms/chunk
+    game-thread dispatch cost recorded in the dispatch-stages comment does
+    NOT hold on this leg; the loop is ~30-100 ms/window at 8k+ launches/s.
+  * apply= 125-290 ms/window; brickFlush= 5-11 ms/window. Neither binds.
+  * Worker side: cpuJobSec pins at 15.1-15.4 per 2 s window = effConc
+    7.5-7.6, every fill window, while launches run 8k/s at 0.72 ms/job.
+    Little's law closes: ~7.6 effective workers / 0.72 ms = ~10.5k/s ceiling,
+    and the observed launch rate rides just under it.
+
+--------------------------------------------------------------------------------
+2. THE MECHANISM: WHY MORE THREADS DO NOT HELP (this is the keeper)
+--------------------------------------------------------------------------------
+
+The -VoxelWorkerPool=16 arm (wk-pool.log) against control (wide-on-30.log),
+same job mix, census perJob columns -- JobCycles is QueryThreadCycleTime, so
+Kcyc is cycles the thread actually executed, not wall:
+
+                    control (8-ish workers)    pool=16
+  perJob wall            721-818 us          1,419-1,829 us
+  perJob cycles          ~2,494-2,829 Kcyc   ~2,550-3,282 Kcyc   (SAME)
+  effective GHz          3.39-3.52           1.68-2.05           (HALVED)
+  effConc                7.5-7.6             15.6-16.2           (DOUBLED)
+  launches/window        ~14-16k             ~14-17k             (FLAT)
+
+Sixteen threads genuinely ran (effConc = pool size; the pool IS the tap
+opener the worker-tap doc asked for). Each job executed the SAME number of
+cycles -- no lock-spin appeared -- but the cycles came at half the clock.
+Twice the threads, half the per-thread speed, product constant. The box
+delivers ~10-11k jobs/s of this workload TOTAL regardless of thread count;
+8 threads at ~3.5 GHz and 16 at ~1.8 GHz are the same machine. (Whether the
+halving is turbo/power binning or P-core/E-core split on the 24-logical-core
+box changes nothing downstream: the falsified lever stays falsified, and now
+with its mechanism attached.) inflight96.log doubles the in-flight cap on
+top (cap=768 held 720-760) -- launches identical to wk-pool.log's. Queue
+depth past the pool was already dead as a lever; this is why.
+
+CONSEQUENCE, arithmetic form: the default cascade is ~130k chunks, the wide
+arm ~255k. At the hardware's ~10-11k jobs/s:
+
+    130k / 10.5k/s = ~12 s   <- CPU best case, default rings, perfect tap
+    255k / 10.5k/s = ~24 s   <- wide arm
+    target                  = 2.6-5 s
+
+NO CPU-side pacing, priority, cap, admission, or thread-count change can
+reach the target. The routes that remain are exactly three:
+  (a) fewer jobs, (b) cheaper jobs, (c) a second producer (the GPU worklist).
+(c) is the only one with 10x headroom -- GPU compute sits at 1-2% through
+the entire fill (gpuForked ~330/s = 4% of traffic, bounded by the per-chunk
+round trip that section 9.5 of the handoff already condemned). The worklist
+work in flight is therefore also the cold-start fix; cold start is its
+FIRST customer, not an afterthought.
+
+--------------------------------------------------------------------------------
+3. IS COLD FILL RATE-LIMITED BY DESIGN? (question 3: NO -- measured)
+--------------------------------------------------------------------------------
+
+Every pacing suspect was open during the fill:
+  * exitEmpty=0, exitCap=all passes: dispatch never starved, never idled.
+  * pendingJobs 690-10,474: admission kept the queue fed through all six
+    ring hand-offs (the sawtooth is the per-ring batch admission, and its
+    troughs never reach 0).
+  * apply exits: queueEmpty-dominated, countCap=0 (drain8/drain16 evidence).
+A cold-start "burst mode" that relaxes MaxAppliesPerFrame / ApplyBudgetMs /
+the Cap/4 budget would relax gates that are not binding. Do not author it;
+this paragraph exists so nobody re-runs that experiment.
+
+--------------------------------------------------------------------------------
+4. FEWER JOBS / CHEAPER JOBS: WHAT THE SKIPS ALREADY DO, AND TWO OPEN LEADS
+--------------------------------------------------------------------------------
+
+The skips are ON and honest where they apply -- the population above is net
+of them:
+  * Buried skip: 5,656 air skips in the first 6 s, then quiet (band coverage
+    ends with R0's fill). solidKept=13,848 -- would-be solid skips VETOED
+    because the marcher's brick volume needs solid bricks (volumeFed=1).
+    That is ~5% of the fill paid to feed the volume. A "canonical solid
+    brick" fast path inside the job (skip grid+mesh, emit uniform bricks)
+    could reclaim most of those 13.8k jobs' cost, but it needs per-voxel
+    material fidelity answered first -- flagged, not authored.
+  * Sky skip: R0 34-55/window, R1 <30, R2-R5 ZERO all leg. The outer rings'
+    populations (~41-44k each, same as R0's) are already Z-clamped to the
+    surface band, so "outer rings are overwhelmingly sky" does not hold on
+    this preset -- OR IsChunkProvablyAllAir's bound is too conservative at
+    L>=2 and a working skip is reading as no-op. One leg with the verify arm
+    (-VoxelVerifySkyBand) at R2+ would say which. Sixth-inert-feature
+    candidate; cheap to check; do not assume either way.
+  * Per-job cost: 2.5 Mcyc/job at L0, grid build 36-39% of it WITH the
+    shared cache hitting (cycPerColumn 765-833 during fill -- the cache is
+    working). The remaining ~60% is voxelize+mesh+CPU brick pack
+    (TimedMeshChunkBricks). Whether the coarse-ring tail (jobs 3-4x L0
+    cost) is grid-bound or pack-bound is readable TODAY from the census
+    per-ring workerMs -- read it before optimising either half.
+
+--------------------------------------------------------------------------------
+5. WHAT SHIPPED WITH THIS DOC, AND THE LEG THAT DECIDES NEXT
+--------------------------------------------------------------------------------
+
+Shipped: the cold-start settle probe (commit alongside this file) -- arms at
+first streaming demand, prints a 1 Hz per-ring fill curve, and reports ONE
+line: "Voxel cold settle: SETTLED t=..s jobs=.. mean=../s | R0 t=..s j=.."
+plus a Warning at timeout so churn cannot hide as silence. Every arm from
+now on is judged by that line's t=, per-ring, against these baselines:
+
+    wide arm, CPU-only, today:  t ~= 50 s, mean ~= 5,100 jobs/s
+
+The legs that matter next, in order:
+  1. Any leg at all (control): certify the probe's own line against the
+     eyeball method on the same log. Instrument first, always.
+  2. -VoxelVerifySkyBand with attention on R2+ verdicts: is the zero-skip
+     outer ring a fact of the preset or an inert proof?
+  3. The GPU worklist arms as they land: the settle line is their gate too,
+     and the pool evictions column on the settle line is the over-
+     subscription tell (faster fill = faster residency growth; the arena
+     was raised 192 -> 288 MiB for exactly this).
