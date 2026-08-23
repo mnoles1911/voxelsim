@@ -1,0 +1,127 @@
+================================================================================
+THE 2,84x/s PLATEAU IS THE WORKER TAP, NOT THE ADMISSION PIPE
+2026-08-23 -- read from Saved/drain8.log and Saved/drain16.log, no new legs run
+================================================================================
+
+Every number below is quoted from an instrument already in the tree, with the
+line that produced it named. Written alongside the -VoxelWorkerTaskPri change.
+
+--------------------------------------------------------------------------------
+0. WHAT WAS BELIEVED, IN ORDER, AND WHAT KILLED EACH BELIEF
+--------------------------------------------------------------------------------
+
+(1) "The admission cap is the wall."  Killed by the drainSec sweep: 8/16/32
+    all read 2,841-2,842/s, identical to the digit.  (Partly confounded: at
+    drainSec>=8 the EMA crosses the 32,768 ceiling and every rung runs the
+    same effective cap -- `capSrc=` on the admission line now names those
+    windows, and -VoxelAdmissionCapMax makes the ceiling sweepable.  But the
+    conclusion stands on other evidence below.)
+
+(2) "The relax condition / cutoff is the wall."  The per-ring detail line
+    showed cut= pinned (R0 97 m), which fit.  Killed by the per-REASON split
+    on the same line: rejB=251,698 vs rejC=1,636 -- the cutoff turns away
+    almost nothing; the budget gate does the rejecting.
+
+(3) "The per-level budget gate is the wall."  Verified in code: gate (a) and
+    the nearest-admit commit budget both read EffectivePendingJobCap (the
+    drain-sized cap), not the static 2048 -- the caps cannot disagree within
+    a tick.  And killed by (4): rejections upstream cannot matter when the
+    downstream queue never runs dry.
+
+(4) THE DECIDING LINE -- "Voxel dispatch loop (5s window)", drain16.log,
+    every warm window:
+
+        passes=118 exitCap=118 exitEmpty=0 cpuLaunched=14137 gpuForked=716
+        cap=288 cpuInFlightExactNow=260
+
+    The pop loop exits on the IN-FLIGHT CAP on every single pass and never
+    once on an empty queue.  Admission is not starving dispatch; the pipe is
+    full end-to-end.  No admission-side change can raise dispatched/s while
+    exitEmpty=0.
+
+--------------------------------------------------------------------------------
+1. WHERE THE IN-FLIGHT POPULATION ACTUALLY IS
+--------------------------------------------------------------------------------
+
+"Voxel empty census R# (5s window)" sums Result.JobMs (wall time INSIDE the
+worker lambda, stamped at lambda start) for every drained CPU result:
+
+    R0: results=13,293  workerMs=10,484.5   -> 0.79 ms per job
+    R1: results=938     workerMs=734.1      -> 0.78 ms
+    R2: results=87      workerMs=87.8       -> 1.01 ms
+
+Summed across rings, per 5 s window, for 30+ consecutive steady windows:
+11-15 worker-seconds of actual generation work = EFFECTIVE CONCURRENCY of
+2.5-3.0 worker threads.  On a 24-logical-core box.  While the streaming tick
+is 12-32% of wall and the GPU is 1-2% utilised.
+
+Reconcile with cpuInFlightExactNow=260: both in-flight counters increment at
+launch and decrement INSIDE the task lambda at its end (CpuCounterPtr->
+Decrement() one line after ResultsQueue.Enqueue), so the ~260 resident tasks
+are launched-but-unfinished.  At 0.8 ms of work each, 260 resident at
+~3,000/s throughput means each task spends ~87 ms in the UE task scheduler
+waiting for a worker and ~0.8 ms working.  Little's law closes exactly:
+
+    3 effective workers / 0.85 ms per job  ~=  3,000 chunks/s  =  the plateau.
+
+The tasks are launched at UE::Tasks::ETaskPriority::BackgroundNormal -- the
+one Launch site, no recorded measurement behind the choice.
+
+CAVEAT recorded so nobody trips on it: JobMs includes in-lambda lock waits.
+One cold-fill window printed 133k jobs / 215 workerSec = "effConc 43" on a
+24-core box -- that is contention (SharedMipCache et al) wearing a
+concurrency costume, not 43 threads.  Read steady windows; read
+effConc > cores as in-job contention.
+
+--------------------------------------------------------------------------------
+2. WHAT SHIPPED, AND HOW TO READ THE NEXT LEG
+--------------------------------------------------------------------------------
+
+Commits, each measurable alone, control arms byte-identical:
+
+  455fc07  drainEMA=/capSrc= on the admission line; per-ring q= on the detail
+           line; -VoxelAdmissionCapMax (ceiling was silently deciding the
+           drainSec sweep from ~8 up).
+  1d4ca6f  "Voxel dispatch stages (5s window)" -- the hitch-only dispatch
+           brackets as a standing per-window line with perDispatch=.
+  d69a99e  -VoxelPerRingRelax -- entry relax judged per ring.  Authored
+           before (4) landed; likely moot for THROUGHPUT (exitEmpty=0), may
+           still matter for ORDER/latency at the leading edge.
+  4fa1813  -VoxelCutoffHeadroomDiv -- ditto: the band is the other
+           drain-sized constant, but it cannot be the throughput wall while
+           exitEmpty=0.
+  1292a2e  -VoxelWorkerTaskPri=N (0=control BackgroundNormal, 1=BackgroundHigh,
+           2=Normal, 3=High); effConc=/wkPri= on the dispatch-loop line; the
+           dead "CPU worker ms/level" line now computes from its windows
+           (it read all zeros on every headless leg -- it went through
+           LastPerfSnapshot, refreshed only under the voxel.Debug HUD gate).
+
+THE ONE LEG THAT DECIDES: standard arm + -VoxelWorkerTaskPri=2.
+
+  * effConc RISES toward double digits and dispatched/5s rises with it
+      -> the tap was priority.  Sweep 1/2/3; watch frame p95 (foreground
+         contention with render tasks) and pool evictions (faster fill =
+         more pool pressure).  Judge per-ring residency, not aggregate.
+  * effConc FLAT ~2.5 with wkPri=2 echoed on the line
+      -> priority is not the limiter; the background/foreground worker
+         THREAD COUNT is.  Next lever: a dedicated FQueuedThreadPool for
+         the mesh workers (-VoxelWorkerPool=N, not yet authored).
+  * effConc rises, dispatched flat
+      -> the wall moved downstream to the game-thread drain/apply path;
+         the tick-budget and apply-stages lines name the stage.  ResultsQueue
+         is unbounded, so ALSO watch stale= and drained-vs-dispatched skew.
+
+Expected headroom if the tap opens fully: ~20 effective workers at 0.85 ms
+mean is ~23k chunks/s of CPU generation capacity -- against 2,841/s today.
+The next walls after that, in likely order: game-thread apply (already
+0.01-0.09 ms per apply, 146->1,297 ms/window across the drain8 leg as the
+world filled), admission scan cost at wider radii, then pool pressure.
+
+--------------------------------------------------------------------------------
+3. LOOSE END CARRIED FORWARD
+--------------------------------------------------------------------------------
+
+The drain8 leg's throughput DECAYS across the leg (dispatched/5s 17k -> 5k)
+while apply= climbs 146 -> 1,297 ms/window and the job mix coarsens (R3+
+jobs cost 100x an R0 job).  Once the tap is opened, per-ring job cost times
+ring share sets the new ceiling; the census line already prints both halves.
