@@ -560,6 +560,8 @@ private:
 	int32 BatchFallbacks[uint8(EBatchFallback::COUNT)] = { 0 };
 	double LastBatchLogSeconds = 0.0;
 	bool bBatchArmingLogged = false;
+	// P1: the WorldGenBatch + PoolAlloc conflict warning, once per run.
+	bool bPoolAllocStackConflictLogged = false;
 
 	void NoteBatchFallback(EBatchFallback Reason) { ++BatchFallbacks[uint8(Reason)]; }
 	void MaybeLogBatchWindow();

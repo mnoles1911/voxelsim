@@ -357,6 +357,39 @@ struct FVoxelBrickIndexDelta
 // skipped.
 using FVoxelBrickIndexSink = TFunction<void(const FVoxelBrickIndexDelta&)>;
 
+// --- P1 (voxel.GPU.PoolAlloc): the GPU allocator's layout --------------------
+//
+// Computed ONCE by FVoxelBrickPool::Init when the switch is armed, then bound to
+// every allocator kernel as parameters -- the ChunkRecordDwords rule: one
+// authoritative copy, never restated as a literal in HLSL. See
+// VoxelBrickPoolAlloc.usf's header for the allocator design this describes
+// (size-class bump + free stacks over the WHOLE occ/mat arenas -- the one
+// allocator both producers claim from) and for the state-buffer map these
+// offsets index.
+struct FVoxelBrickPoolAllocLayout
+{
+	uint32 OccRegionFirst = 0;  // 0 under the one-allocator rule: it owns the arena
+	uint32 OccRegionWords = 0;
+	uint32 MatRegionFirst = 0;
+	uint32 MatRegionWords = 0;
+	uint32 OccClassStep = 0;    // dwords per occ size class (and per bitmap page)
+	uint32 OccClasses = 0;
+	uint32 MatClassStep = 0;
+	uint32 MatClasses = 0;
+	uint32 FreeStackCap = 0;    // entries per class free stack
+	uint32 OccTopsFirst = 0;    // state-buffer dword offsets
+	uint32 MatTopsFirst = 0;
+	uint32 OccStackFirst = 0;
+	uint32 MatStackFirst = 0;
+	uint32 OccBitmapFirst = 0;  // bitmap-buffer dword offsets
+	uint32 MatBitmapFirst = 0;
+	uint32 StateDwords = 0;     // buffer sizes, for creation
+	uint32 BitmapDwords = 0;
+	uint32 SideDwords = 0;
+
+	bool IsValid() const { return StateDwords > 0; }
+};
+
 // The GPU side, in a shared holder for UVoxelGpuPoolComponent's lifetime reason:
 // a render command that is a frame behind must not be able to outlive the object
 // that owns the buffers it writes.
@@ -382,6 +415,30 @@ struct VOXELEARTHSHADERS_API FVoxelBrickPoolBuffers
 	FBufferRHIRef OccBuffer;
 	FBufferRHIRef MatBuffer;
 	FBufferRHIRef ChunkTableBuffer;
+
+	// --- P1 (voxel.GPU.PoolAlloc): the GPU allocator's own three buffers -----
+	//
+	// Created alongside the arenas (EnsureCreated_RenderThread) ONLY when the
+	// switch was armed at Init -- their dword counts below are zero otherwise,
+	// and IsValid() deliberately does not include them: an unarmed pool is
+	// complete without an allocator. Zero-initialised, which IS the allocator's
+	// initial state: bump cursors 0, stack tops 0, no bitmap bit set, every
+	// side-table entry "nothing allocated".
+	FBufferRHIRef AllocStateBuffer;
+	FBufferRHIRef AllocBitmapBuffer;
+	FBufferRHIRef AllocSideBuffer;
+	TRefCountPtr<FRDGPooledBuffer> AllocStatePooled;
+	TRefCountPtr<FRDGPooledBuffer> AllocBitmapPooled;
+	TRefCountPtr<FRDGPooledBuffer> AllocSidePooled;
+	uint32 AllocStateDwords = 0;
+	uint32 AllocBitmapDwords = 0;
+	uint32 AllocSideDwords = 0;
+
+	bool HasGpuAlloc() const
+	{
+		return AllocStatePooled.IsValid() && AllocBitmapPooled.IsValid()
+		    && AllocSidePooled.IsValid();
+	}
 
 	// The RDG half. RegisterExternalBuffer brings these into a graph, RDG emits
 	// the UAVCompute transition, and the epilogue hands them back as SRVs. No
@@ -807,6 +864,99 @@ public:
 	// in the same batch cannot end up cleared. GAME THREAD ONLY.
 	void Flush();
 
+	// --- P1: GPU-side pool allocation (voxel.GPU.PoolAlloc) ------------------
+	//
+	// See VoxelBrickPoolAlloc.usf for the whole design. The short form: when the
+	// switch is armed at Init, the occ/mat WORD arenas belong to ONE allocator
+	// living in a GPU buffer (size-class bump + free stacks), the generation
+	// graph claims its own ranges and writes its own record, and the totals
+	// readback -- the per-chunk fence -- does not exist on that path. Descriptor
+	// slots and the record slot stay CPU-allocated for both producers (fixed
+	// size, and their identity must be CPU-visible for eviction and the index).
+
+	// The class steps, spelled once. 128 dwords rounds the occ worst case
+	// (1,024) into 8 classes; 512 rounds the mat worst case (8,448) into 17.
+	// Against the measured per-chunk means (~194 occ / ~208 mat dwords) the
+	// round-up wastes about a quarter of a step per chunk per arena -- counted
+	// exactly by the PaddedCum/ActualCum counters, so the estimate never has to
+	// be believed.
+	static constexpr uint32 kGpuAllocOccClassStep = 128;
+	static constexpr uint32 kGpuAllocMatClassStep = 512;
+	// Free-stack depth per class. 2,048 ranges per class absorbs any churn the
+	// current pipeline can produce (nothing in streaming frees at all today);
+	// overflow LEAKS the range and counts it, it never corrupts.
+	static constexpr uint32 kGpuAllocFreeStackCap = 2048;
+
+	// Latched at Init from VoxelGpuPoolAllocEnabled(). The arming decision is
+	// per-process, deliberately: claims and the CPU arenas must agree for the
+	// whole run on who owns the words.
+	bool IsGpuAllocArmed() const { return bGpuAllocArmed; }
+	const FVoxelBrickPoolAllocLayout& GetGpuAllocLayout() const { return GpuAllocLayout; }
+
+	// Declared ahead of its definition below (the DEBUG section) so the two
+	// signatures here can name it; C++ allows the reference parameter on the
+	// incomplete type.
+	struct FResidentChunk;
+
+	// The CPU half of a GPU-allocated chunk: the 64-slot descriptor block and
+	// the record slot -- everything whose size is FIXED and whose identity the
+	// CPU must keep. GAME THREAD ONLY. Same re-add-frees-first and
+	// evict-until-it-fits semantics as AddChunkFrom*; the resident entry is
+	// marked bGpuArenas and its word fields stay zero (the GPU side table is
+	// the authority on the ranges). Queues the index Added entry, which the
+	// next Flush delivers -- AFTER the caller has enqueued the graph that
+	// writes the record, which is what makes the index seam's ordering
+	// guarantee hold on this path too. OriginVoxel is the chunk's min corner in
+	// level-L voxel coords -- not needed to allocate, carried so the sampled
+	// verify can check the landed record against what the CPU BELIEVED, rather
+	// than re-deriving it (derived, not verified, is the failure family).
+	bool AllocateGpuChunkShell(const FVoxelBrickChunkKey& Key, const FIntVector& OriginVoxel,
+	                           FResidentChunk& OutChunk);
+
+	// Undo of the above for a job that failed after its shell was taken
+	// (rejected, timed out, cancelled, or its graph refused the brick region).
+	// ExpectSlot guards against a re-add having already replaced the entry --
+	// in that case the old shell was freed by the replacement and this call
+	// must not touch the new tenant. GAME THREAD ONLY.
+	void ReleaseGpuChunkShell(const FVoxelBrickChunkKey& Key, uint32 ExpectSlot);
+
+	// Enqueues one render command freeing every pending GPU-allocated range
+	// (slot list -> BrickPoolFreeMain). GAME THREAD ONLY.
+	//
+	// THE ORDERING RULE, AND IT IS LOAD-BEARING: this must run BEFORE any
+	// command that could re-CLAIM a slot freed here is enqueued. The free pass
+	// reads the side table; a claim for a reused slot overwrites that entry, so
+	// a free that lands after the claim would free the NEW tenant's live
+	// ranges. FVoxelGpuMeshJobManager::DispatchBatch therefore calls this after
+	// its shell allocations and before its ENQUEUE, and Flush() calls it before
+	// its own command (which carries the CPU producer's claims). Cheap no-op
+	// when nothing is pending.
+	void FlushPendingGpuFrees();
+
+	// Why a GPU-alloc-armed producer fell back to the readback path for one
+	// chunk. Counted so the window line can say the arm is DECLINING work and
+	// why, instead of the arm silently carrying less than it appears to.
+	enum class EGpuAllocFallback : uint8
+	{
+		Stacked,       // Tier B.1 stack member -- stacks keep the readback path
+		Discard,       // voxel.GPU.BrickPackResident 0: pack-and-discard arm
+		ShellRefused,  // descriptor/record slot allocation failed (pool full)
+	};
+	void NoteGpuAllocFallback(EGpuAllocFallback Reason);
+
+	// The buffer holder, for the render-side callers this phase adds (the job
+	// manager registers the arenas into its own generation graph). Never null
+	// once Init has run -- the same guarantee Register() documents.
+	FVoxelBrickPoolBuffersRef GetBuffers() const { return Buffers; }
+
+	// Creates the RHI arenas (and, when armed, the allocator buffers) if they
+	// do not exist yet. RENDER THREAD ONLY. Factored out of the flush command
+	// because the generation graph can now touch the pool BEFORE the first
+	// flush ever runs, and "the first flush creates the buffers" stopped being
+	// a safe bootstrap the moment that became true.
+	static void EnsureCreated_RenderThread(FRHICommandListImmediate& RHICmdList,
+	                                       const FVoxelBrickPoolBuffersRef& Buffers);
+
 	// Drops every allocation and queues a clear of nothing -- the records are
 	// left as they are, because a Reset with no re-add is only used at teardown.
 	void Reset();
@@ -896,6 +1046,13 @@ public:
 		uint32 OccWords = 0;
 		uint32 MatWords = 0;
 		uint64 AddSequence = 0;
+		// P1 (voxel.GPU.PoolAlloc): this chunk's occ/mat words were claimed by
+		// the GPU allocator, so OccBase/MatBase/OccWords/MatWords above are 0 --
+		// the CPU never learned them (that ignorance is the whole point; the
+		// GPU-side side table holds them for the free pass). Freeing this chunk
+		// must queue a GPU free (FreeResident does), never touch the CPU word
+		// arenas, and never trust the four zeros as a size.
+		bool bGpuArenas = false;
 	};
 	bool DebugGetResidentChunk(const FVoxelBrickChunkKey& Key, FResidentChunk& Out) const;
 
@@ -1098,6 +1255,56 @@ private:
 	// half must not follow it there.
 	TArray<FVoxelBrickIndexEntry> PendingIndexRemovals;
 
+	// --- P1: GPU-side pool allocation state ----------------------------------
+	// Latched at Init; the layout is only meaningful while armed.
+	bool bGpuAllocArmed = false;
+	FVoxelBrickPoolAllocLayout GpuAllocLayout;
+	// Chunk slots whose GPU-side ranges must be returned. Drained by
+	// FlushPendingGpuFrees under the ordering rule on its declaration.
+	TArray<uint32> PendingGpuFreeSlots;
+	// Index Added entries for shells allocated since the last Flush. Delivered
+	// with (and ordered exactly like) the classic delta -- after the render
+	// commands that write the records those slots name.
+	TArray<FVoxelBrickIndexEntry> PendingGpuIndexAdds;
+	// The CPU producer's packs while armed: uploaded and claimed through the
+	// GPU allocator in Flush's render command -- the one-allocator rule. The
+	// classic FPendingWrite path stays for the UNARMED pool only.
+	struct FPendingGpuCpuWrite
+	{
+		FVoxelBrickCpuPackRef Pack;
+		FVoxelBrickChunkKey Key;
+		uint32 ChunkSlot = 0;
+		uint32 BrickBase = 0;
+		uint32 RingLevel = 0;
+		FVoxelBrickChunkShading Shading;
+		FIntVector OriginVoxel = FIntVector::ZeroValue;
+	};
+	TArray<FPendingGpuCpuWrite> PendingGpuCpuWrites;
+	// Game-thread tallies for the [brick-gpualloc] window line. The GPU-side
+	// truth (claims, frees, bytes in flight, the FAIL counters) lives in the
+	// state buffer and reaches the log via the async window readback.
+	int64 GpuShellsAllocated = 0;
+	int64 GpuFreesQueued = 0;
+	int64 GpuFallbackStacked = 0;
+	int64 GpuFallbackDiscard = 0;
+	int64 GpuFallbackShellRefused = 0;
+	// A small ring of recent shells for the sampled verify: fresh claims are
+	// where an allocator bug shows first, and sampling a ring is O(1) where a
+	// walk of ~100k residents per window is not. Stale entries (evicted or
+	// replaced since) are recognised by slot mismatch and skipped. The origin
+	// is carried from the producer so the verify checks the record against the
+	// CPU's belief instead of a re-derivation.
+	struct FRecentGpuShell
+	{
+		FVoxelBrickChunkKey Key;
+		uint32 ChunkSlot = 0;
+		FIntVector OriginVoxel = FIntVector::ZeroValue;
+	};
+	TArray<FRecentGpuShell> RecentGpuShells;
+	int32 RecentGpuShellCursor = 0;
+	// Samples + counter readback + window line, called from Flush while armed.
+	void MaybePumpGpuAllocWindow();
+
 	FVoxelBrickPoolBuffersRef Buffers;
 
 	int64 AllocFailures = 0;
@@ -1147,6 +1354,23 @@ private:
 // assumption. Read on the GAME THREAD and captured by value into a worker task,
 // which is this project's established pattern for getting a gate into a job body.
 VOXELEARTHSHADERS_API bool VoxelBrickPackOnCpuEnabled();
+
+// voxel.GPU.PoolAlloc -- P1 of docs/gpu-streaming-architecture.md, the keystone.
+// 1 = arena ranges for GPU-produced chunks are claimed BY THE GENERATION GRAPH
+// (an InterlockedAdd in a compute pass) and the per-chunk totals readback -- the
+// fence the whole GPU arm queues behind -- does not run; the CPU producer's packs
+// claim through the same GPU allocator in the pool flush. 0 (default) = today's
+// behaviour, byte-identical: CPU allocation from the readback, so a control leg
+// needs no rebuild.
+//
+// LATCHED AT FIRST CALL, cvar and command line both, and the first call happens
+// at pool Init -- deliberately stricter than the sibling gates' cvar-stays-live
+// convention, because arming decides WHO OWNS THE ARENA WORDS and a mid-run flip
+// would put two allocators over one range, which is the corruption this whole
+// design exists to make impossible. Use -VoxelGpuPoolAlloc=1 for legs (the
+// harness delivers cvars through -ExecCmds, after streaming has begun -- the
+// same startup window every producer switch here documents).
+VOXELEARTHSHADERS_API bool VoxelGpuPoolAllocEnabled();
 
 // voxel.Brick.SuppressQuadMesh. MEASUREMENT ONLY, AND IT EMPTIES THE WORLD --
 // see the cvar's own comment. 1 makes the CPU mesh worker pack bricks and skip

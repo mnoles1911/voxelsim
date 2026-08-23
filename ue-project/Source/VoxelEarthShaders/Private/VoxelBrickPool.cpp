@@ -461,6 +461,230 @@ namespace VoxelBrickPoolDetail
 			.SetInitActionZeroData();
 		return RHICmdList.CreateBuffer(Desc);
 	}
+
+	// --- P1: voxel.GPU.PoolAlloc -------------------------------------------
+	//
+	// The switch itself. Default 0 = today's behaviour byte-for-byte: CPU
+	// allocation from the per-chunk totals readback, so a control leg needs no
+	// rebuild. See the accessor's declaration in VoxelBrickPool.h for why this
+	// one is LATCHED at first call rather than staying live -- arming decides
+	// who owns the arena words for the whole process.
+	int32 GVoxelGpuPoolAlloc = 0;
+	FAutoConsoleVariableRef CVarVoxelGpuPoolAlloc(
+		TEXT("voxel.GPU.PoolAlloc"),
+		GVoxelGpuPoolAlloc,
+		TEXT("P1 of the GPU streaming architecture. 1 = brick-pool arena ranges are claimed by the ")
+		TEXT("GENERATION GRAPH (GPU-side size-class allocator; no per-chunk totals readback, which is ")
+		TEXT("the fence the GPU arm queues behind); the CPU producer claims through the same GPU ")
+		TEXT("allocator in the pool flush. 0 (default) = today's CPU allocation from the readback, ")
+		TEXT("byte-identical. LATCHED at pool Init -- use -VoxelGpuPoolAlloc=1 on the command line for ")
+		TEXT("legs; a cvar flip after Init is IGNORED (and says so), because mid-run re-arming would ")
+		TEXT("put two allocators over one range. Live cross-checks report on [brick-gpualloc]."),
+		ECVF_Default);
+
+	// --- [brick-gpualloc] window state ----------------------------------------
+	//
+	// Same shape as the flush-batch window above: render thread lands async
+	// readbacks into atomics, game thread prints every ~5 s. The GPU counters
+	// are CUMULATIVE (the state buffer is never reset), so the FAIL detectors
+	// below compare against the last landed value -- a counter that moved is a
+	// NEW failure, logged at Error; a counter that is merely non-zero was
+	// already reported.
+	std::atomic<int64> GAllocSnapClaims{ 0 };
+	std::atomic<int64> GAllocSnapStackPops{ 0 };
+	std::atomic<int64> GAllocSnapFrees{ 0 };
+	std::atomic<int64> GAllocSnapClaimFailOcc{ 0 };
+	std::atomic<int64> GAllocSnapClaimFailMat{ 0 };
+	std::atomic<int64> GAllocSnapClaimFailWorst{ 0 };
+	std::atomic<int64> GAllocSnapBitmapCollision{ 0 };
+	std::atomic<int64> GAllocSnapFreeMissing{ 0 };
+	std::atomic<int64> GAllocSnapPushOverflow{ 0 };
+	std::atomic<int64> GAllocSnapOccBump{ 0 };
+	std::atomic<int64> GAllocSnapMatBump{ 0 };
+	std::atomic<int64> GAllocSnapOccInFlight{ 0 };
+	std::atomic<int64> GAllocSnapMatInFlight{ 0 };
+	std::atomic<int64> GAllocSnapOccPaddedCum{ 0 };
+	std::atomic<int64> GAllocSnapOccActualCum{ 0 };
+	std::atomic<int64> GAllocSnapMatPaddedCum{ 0 };
+	std::atomic<int64> GAllocSnapMatActualCum{ 0 };
+	std::atomic<int64> GAllocSnapStrandedOccDwords{ 0 };
+	std::atomic<int64> GAllocSnapStrandedMatDwords{ 0 };
+	std::atomic<int32> GAllocCountersLanded{ 0 };
+	// The sampled verify tallies (cumulative across windows, reset never --
+	// they are verdict counters, and 0 ok / 0 FAIL with samples pending must
+	// read as "no verdict yet").
+	std::atomic<int64> GAllocXchkOk{ 0 };
+	std::atomic<int64> GAllocXchkFails{ 0 };
+	std::atomic<int64> GAllocXchkUnwritten{ 0 };
+	std::atomic<int64> GAllocXchkSamples{ 0 };
+	std::atomic<int32> GAllocXchkPending{ 0 };
+
+	// Counter indices in the state buffer -- MIRROR of the kCtr* list in
+	// VoxelBrickPoolAlloc.usf. Indices, not meanings, are the contract.
+	constexpr int32 kGpuAllocCtrOccBump = 0;
+	constexpr int32 kGpuAllocCtrMatBump = 1;
+	constexpr int32 kGpuAllocCtrClaims = 2;
+	constexpr int32 kGpuAllocCtrStackPops = 3;
+	constexpr int32 kGpuAllocCtrClaimFailOcc = 4;
+	constexpr int32 kGpuAllocCtrClaimFailMat = 5;
+	constexpr int32 kGpuAllocCtrClaimFailWorst = 6;
+	constexpr int32 kGpuAllocCtrBitmapCollision = 7;
+	constexpr int32 kGpuAllocCtrFrees = 8;
+	constexpr int32 kGpuAllocCtrFreePushOverflow = 9;
+	constexpr int32 kGpuAllocCtrFreeBitmapMissing = 10;
+	constexpr int32 kGpuAllocCtrOccInFlight = 11;
+	constexpr int32 kGpuAllocCtrMatInFlight = 12;
+	constexpr int32 kGpuAllocCtrOccPaddedCum = 13;
+	constexpr int32 kGpuAllocCtrOccActualCum = 14;
+	constexpr int32 kGpuAllocCtrMatPaddedCum = 15;
+	constexpr int32 kGpuAllocCtrMatActualCum = 16;
+	// How many state dwords the counter readback copies: the counter block plus
+	// both stack-top arrays, which is what the stranded-dwords figures need.
+	// Kept in one number so the readback and the harvest cannot disagree.
+	constexpr uint32 kGpuAllocCounterReadDwords = 96;
+
+	// RENDER THREAD ONLY, the GPendingFlushVerify shape (and the same
+	// deliberate leak-at-exit trade -- see that struct's comment).
+	struct FPendingAllocVerify
+	{
+		FRHIGPUBufferReadback* Readback = nullptr;
+		uint32 ExpectedChunks = 0;
+	};
+	TArray<FPendingAllocVerify> GPendingAllocVerify;
+	struct FPendingAllocCounters
+	{
+		FRHIGPUBufferReadback* Readback = nullptr;
+		// The layout the readback was taken under, for the stack-top walk.
+		uint32 OccTopsFirst = 0, OccClasses = 0, OccClassStep = 0;
+		uint32 MatTopsFirst = 0, MatClasses = 0, MatClassStep = 0;
+	};
+	TArray<FPendingAllocCounters> GPendingAllocCounters;
+
+	void PollGpuAllocReadbacks_RenderThread()
+	{
+		for (int32 I = GPendingAllocVerify.Num() - 1; I >= 0; --I)
+		{
+			FPendingAllocVerify& Pending = GPendingAllocVerify[I];
+			if (Pending.Readback == nullptr)
+			{
+				GPendingAllocVerify.RemoveAtSwap(I, EAllowShrinking::No);
+				continue;
+			}
+			if (!Pending.Readback->IsReady())
+			{
+				continue;
+			}
+			uint32 Result[3] = { 0, 0, 0 };
+			if (const void* Src = Pending.Readback->Lock(sizeof(Result)))
+			{
+				FMemory::Memcpy(Result, Src, sizeof(Result));
+				Pending.Readback->Unlock();
+			}
+			GAllocXchkSamples.fetch_add(int64(Pending.ExpectedChunks), std::memory_order_relaxed);
+			GAllocXchkUnwritten.fetch_add(int64(Result[2]), std::memory_order_relaxed);
+			if (Result[0] == 0 && Result[1] == Pending.ExpectedChunks)
+			{
+				GAllocXchkOk.fetch_add(int64(Result[1]) - int64(Result[2]), std::memory_order_relaxed);
+			}
+			else
+			{
+				GAllocXchkFails.fetch_add(1, std::memory_order_relaxed);
+				UE_LOG(LogVoxelBrickPool, Error,
+				       TEXT("[brick-gpualloc] ALLOCATOR CROSS-CHECK FAILED: %u mismatched values over %u ")
+				       TEXT("verified chunks (%u sampled, %u unwritten). A GPU-claimed chunk's record, ")
+				       TEXT("side-table range or bitmap ownership disagrees with what the CPU allocated ")
+				       TEXT("the slot for -- which is one chunk's bricks at another chunk's address: ")
+				       TEXT("plausible terrain, wrong place. Turn voxel.GPU.PoolAlloc off (relaunch ")
+				       TEXT("without -VoxelGpuPoolAlloc=1) and compare the claim kernel against ")
+				       TEXT("AllocateForChunk."),
+				       Result[0], Result[1], Pending.ExpectedChunks, Result[2]);
+			}
+			delete Pending.Readback;
+			GPendingAllocVerify.RemoveAtSwap(I, EAllowShrinking::No);
+			GAllocXchkPending.fetch_sub(1, std::memory_order_relaxed);
+		}
+
+		for (int32 I = GPendingAllocCounters.Num() - 1; I >= 0; --I)
+		{
+			FPendingAllocCounters& Pending = GPendingAllocCounters[I];
+			if (Pending.Readback == nullptr)
+			{
+				GPendingAllocCounters.RemoveAtSwap(I, EAllowShrinking::No);
+				continue;
+			}
+			if (!Pending.Readback->IsReady())
+			{
+				continue;
+			}
+			uint32 C[kGpuAllocCounterReadDwords] = {};
+			if (const void* Src = Pending.Readback->Lock(sizeof(C)))
+			{
+				FMemory::Memcpy(C, Src, sizeof(C));
+				Pending.Readback->Unlock();
+			}
+			// NEW failures, not merely non-zero ones: the counters are
+			// cumulative, so the delta against the last landed value is what
+			// gets announced. Announce BEFORE publishing the snapshot.
+			const int64 PrevCollision = GAllocSnapBitmapCollision.load(std::memory_order_relaxed);
+			const int64 PrevMissing = GAllocSnapFreeMissing.load(std::memory_order_relaxed);
+			if (int64(C[kGpuAllocCtrBitmapCollision]) > PrevCollision)
+			{
+				UE_LOG(LogVoxelBrickPool, Error,
+				       TEXT("[brick-gpualloc] DOUBLE GRANT: the page bitmap caught %lld new collision(s) ")
+				       TEXT("(total %u). The GPU allocator handed out dwords somebody already holds; the ")
+				       TEXT("colliding claims were FAILED and their ranges leaked rather than written. ")
+				       TEXT("This is the allocator's own correctness gate firing -- treat the leg as ")
+				       TEXT("invalid and diff the claim kernel."),
+				       int64(C[kGpuAllocCtrBitmapCollision]) - PrevCollision, C[kGpuAllocCtrBitmapCollision]);
+			}
+			if (int64(C[kGpuAllocCtrFreeBitmapMissing]) > PrevMissing)
+			{
+				UE_LOG(LogVoxelBrickPool, Error,
+				       TEXT("[brick-gpualloc] BAD FREE: %lld new page(s) freed that were not marked owned ")
+				       TEXT("(total %u). A range was freed twice or never granted -- the free list may now ")
+				       TEXT("hold a live chunk's dwords, which resurfaces as terrain corruption on reuse."),
+				       int64(C[kGpuAllocCtrFreeBitmapMissing]) - PrevMissing, C[kGpuAllocCtrFreeBitmapMissing]);
+			}
+			GAllocSnapOccBump.store(int64(C[kGpuAllocCtrOccBump]), std::memory_order_relaxed);
+			GAllocSnapMatBump.store(int64(C[kGpuAllocCtrMatBump]), std::memory_order_relaxed);
+			GAllocSnapClaims.store(int64(C[kGpuAllocCtrClaims]), std::memory_order_relaxed);
+			GAllocSnapStackPops.store(int64(C[kGpuAllocCtrStackPops]), std::memory_order_relaxed);
+			GAllocSnapClaimFailOcc.store(int64(C[kGpuAllocCtrClaimFailOcc]), std::memory_order_relaxed);
+			GAllocSnapClaimFailMat.store(int64(C[kGpuAllocCtrClaimFailMat]), std::memory_order_relaxed);
+			GAllocSnapClaimFailWorst.store(int64(C[kGpuAllocCtrClaimFailWorst]), std::memory_order_relaxed);
+			GAllocSnapBitmapCollision.store(int64(C[kGpuAllocCtrBitmapCollision]), std::memory_order_relaxed);
+			GAllocSnapFrees.store(int64(C[kGpuAllocCtrFrees]), std::memory_order_relaxed);
+			GAllocSnapPushOverflow.store(int64(C[kGpuAllocCtrFreePushOverflow]), std::memory_order_relaxed);
+			GAllocSnapFreeMissing.store(int64(C[kGpuAllocCtrFreeBitmapMissing]), std::memory_order_relaxed);
+			GAllocSnapOccInFlight.store(int64(C[kGpuAllocCtrOccInFlight]), std::memory_order_relaxed);
+			GAllocSnapMatInFlight.store(int64(C[kGpuAllocCtrMatInFlight]), std::memory_order_relaxed);
+			GAllocSnapOccPaddedCum.store(int64(C[kGpuAllocCtrOccPaddedCum]), std::memory_order_relaxed);
+			GAllocSnapOccActualCum.store(int64(C[kGpuAllocCtrOccActualCum]), std::memory_order_relaxed);
+			GAllocSnapMatPaddedCum.store(int64(C[kGpuAllocCtrMatPaddedCum]), std::memory_order_relaxed);
+			GAllocSnapMatActualCum.store(int64(C[kGpuAllocCtrMatActualCum]), std::memory_order_relaxed);
+			// Stranded memory: what sits parked in free stacks. Depth x class
+			// size, per class, both arenas -- the honest cost of the no-coalesce
+			// design, printed rather than argued about.
+			int64 StrandedOcc = 0;
+			for (uint32 K = 0; K < Pending.OccClasses && Pending.OccTopsFirst + K < kGpuAllocCounterReadDwords; ++K)
+			{
+				StrandedOcc += int64(C[Pending.OccTopsFirst + K]) * int64((K + 1) * Pending.OccClassStep);
+			}
+			int64 StrandedMat = 0;
+			for (uint32 K = 0; K < Pending.MatClasses && Pending.MatTopsFirst + K < kGpuAllocCounterReadDwords; ++K)
+			{
+				StrandedMat += int64(C[Pending.MatTopsFirst + K]) * int64((K + 1) * Pending.MatClassStep);
+			}
+			GAllocSnapStrandedOccDwords.store(StrandedOcc, std::memory_order_relaxed);
+			GAllocSnapStrandedMatDwords.store(StrandedMat, std::memory_order_relaxed);
+			GAllocCountersLanded.store(1, std::memory_order_relaxed);
+			delete Pending.Readback;
+			GPendingAllocCounters.RemoveAtSwap(I, EAllowShrinking::No);
+		}
+	}
+
+	// The window cadence. Game thread (Flush).
+	double GAllocWindowStart = 0.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +807,22 @@ bool VoxelBrickSuppressQuadMeshEnabled()
 bool VoxelBrickPackReuseMesherVoxelsEnabled()
 {
 	return VoxelBrickPoolDetail::GVoxelBrickPackReuseMesherVoxels != 0;
+}
+
+bool VoxelGpuPoolAllocEnabled()
+{
+	// LATCHED, cvar included -- see the declaration. The command line outranks
+	// the cvar; -1 means "not given" and the cvar's value AT FIRST CALL wins.
+	// First call happens at pool Init (or a producer's first gate read), both
+	// before any claim could have been enqueued, so the latched value is the
+	// value every claim and every arena decision ran under.
+	static const bool bEnabled = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuPoolAlloc="), Value);
+		return Value >= 0 ? Value != 0 : VoxelBrickPoolDetail::GVoxelGpuPoolAlloc != 0;
+	}();
+	return bEnabled;
 }
 
 void VoxelBrickNoteCpuFill(double FillMilliseconds)
@@ -787,6 +1027,66 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 	MatArena.Init(Config.MatWordCapacity);
 	bInitialised = true;
 
+	// --- P1: arm the GPU allocator (voxel.GPU.PoolAlloc) --------------------
+	//
+	// ONE allocator over the WHOLE of each word arena -- the owner's decision.
+	// The CPU Occ/MatArena objects above are still initialised but are NEVER
+	// ALLOCATED FROM while armed (AddChunkFromGpu refuses outright; the CPU
+	// producer routes through the GPU claim in Flush), so GetUsedOccWords /
+	// GetUsedMatWords read 0 on an armed pool and the [brick-gpualloc] window
+	// line carries the real usage. Descriptor slots and record slots stay on
+	// DescArena for both producers -- fixed size, one dispenser, CPU-visible
+	// identity for eviction and the index.
+	// GLOBAL POOL ONLY. voxel.GPU.VerifyBrickPack stands up PRIVATE pools to
+	// verify against, and those must keep the classic CPU allocator whatever
+	// the switch says -- an armed private pool would refuse AddChunkFromGpu and
+	// the gate would report a failure that is really a configuration collision.
+	// (Calling GetGlobalVoxelBrickPool here is safe: on the global instance the
+	// static is already constructed by the time any member function runs.)
+	bGpuAllocArmed = VoxelGpuPoolAllocEnabled() && (this == &GetGlobalVoxelBrickPool());
+	if (bGpuAllocArmed)
+	{
+		FVoxelBrickPoolAllocLayout& L = GpuAllocLayout;
+		L.OccRegionFirst = 0;
+		L.OccRegionWords = Config.OccWordCapacity;
+		L.MatRegionFirst = 0;
+		L.MatRegionWords = Config.MatWordCapacity;
+		L.OccClassStep = kGpuAllocOccClassStep;
+		L.MatClassStep = kGpuAllocMatClassStep;
+		// Classes cover the per-chunk worst case (64 bricks x 16 occ / 132 mat
+		// dwords), computed rather than restated so a brick-format change moves
+		// the class count with it.
+		L.OccClasses = (VoxelBrickPoolDetail::kBricksPerChunk * 16u + L.OccClassStep - 1u) / L.OccClassStep;
+		L.MatClasses = (VoxelBrickPoolDetail::kBricksPerChunk * 132u + L.MatClassStep - 1u) / L.MatClassStep;
+		L.FreeStackCap = kGpuAllocFreeStackCap;
+		// State-buffer map: [0..63] counters, then the two top arrays, then the
+		// two storage arrays. The counter block width is part of the readback
+		// contract (kGpuAllocCounterReadDwords) -- it must cover the tops.
+		L.OccTopsFirst = 64;
+		L.MatTopsFirst = L.OccTopsFirst + L.OccClasses;
+		L.OccStackFirst = L.MatTopsFirst + L.MatClasses;
+		L.MatStackFirst = L.OccStackFirst + L.OccClasses * L.FreeStackCap;
+		L.StateDwords = L.MatStackFirst + L.MatClasses * L.FreeStackCap;
+		// One bit per class-step page, both arenas, 32 pages per dword.
+		const uint32 OccPages = (L.OccRegionWords + L.OccClassStep - 1u) / L.OccClassStep;
+		const uint32 MatPages = (L.MatRegionWords + L.MatClassStep - 1u) / L.MatClassStep;
+		L.OccBitmapFirst = 0;
+		L.MatBitmapFirst = (OccPages + 31u) / 32u;
+		L.BitmapDwords = L.MatBitmapFirst + (MatPages + 31u) / 32u;
+		L.SideDwords = Config.ChunkCapacity * 4u;
+
+		UE_LOG(LogVoxelBrickPool, Log,
+		       TEXT("FVoxelBrickPool: GPU allocator ARMED (voxel.GPU.PoolAlloc). One allocator over both ")
+		       TEXT("word arenas: occ %u dwords in %u classes of %u, mat %u dwords in %u classes of %u; ")
+		       TEXT("free stacks %u deep; state %u + bitmap %u + side %u dwords (%.1f MiB overhead). The ")
+		       TEXT("per-chunk totals readback does not run for GPU-claimed chunks; correctness is watched ")
+		       TEXT("live on [brick-gpualloc] and any FAIL there invalidates the run."),
+		       L.OccRegionWords, L.OccClasses, L.OccClassStep,
+		       L.MatRegionWords, L.MatClasses, L.MatClassStep,
+		       L.FreeStackCap, L.StateDwords, L.BitmapDwords, L.SideDwords,
+		       double(uint64(L.StateDwords + L.BitmapDwords + L.SideDwords) * 4) / (1024.0 * 1024.0));
+	}
+
 	// THE HOLDER IS CREATED HERE, NOT LAZILY IN Flush, and the reason is a data
 	// race rather than tidiness. Register runs on the RENDER thread and reads
 	// this pointer; Flush runs on the GAME thread and used to be the only thing
@@ -955,8 +1255,80 @@ FVoxelBrickPoolBuffersRef FVoxelBrickPool::GetOrCreateBuffers()
 		Buffers->OccWords = Config.OccWordCapacity;
 		Buffers->MatWords = Config.MatWordCapacity;
 		Buffers->ChunkSlots = Config.ChunkCapacity;
+		// P1: zero when the GPU allocator is not armed, which is also what makes
+		// EnsureCreated skip the three allocator buffers on an unarmed pool.
+		Buffers->AllocStateDwords = bGpuAllocArmed ? GpuAllocLayout.StateDwords : 0;
+		Buffers->AllocBitmapDwords = bGpuAllocArmed ? GpuAllocLayout.BitmapDwords : 0;
+		Buffers->AllocSideDwords = bGpuAllocArmed ? GpuAllocLayout.SideDwords : 0;
 	}
 	return Buffers;
+}
+
+// RENDER THREAD ONLY. Creates the arenas (and, when armed, the allocator's
+// three buffers) if they do not exist yet. Factored out of the flush command
+// because the GENERATION graph can now touch the pool before the first flush
+// ever runs -- see the declaration.
+void FVoxelBrickPool::EnsureCreated_RenderThread(FRHICommandListImmediate& RHICmdList,
+                                                 const FVoxelBrickPoolBuffersRef& Buffers)
+{
+	if (!Buffers.IsValid())
+	{
+		return;
+	}
+	if (!Buffers->IsValid())
+	{
+		Buffers->DescBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Desc"),
+		                                        VoxelBrickPoolDetail::kBrickDescBytes, Buffers->DescSlots);
+		Buffers->OccBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Occ"),
+		                                       sizeof(uint32), Buffers->OccWords);
+		Buffers->MatBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Mat"),
+		                                       sizeof(uint32), Buffers->MatWords);
+		Buffers->ChunkTableBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.ChunkTable"),
+		                                              sizeof(uint32),
+		                                              Buffers->ChunkSlots * VoxelBrickPoolDetail::kChunkRecordDwords);
+
+		Buffers->DescPooled = new FRDGPooledBuffer(
+			RHICmdList, Buffers->DescBuffer,
+			FRDGBufferDesc::CreateStructuredDesc(VoxelBrickPoolDetail::kBrickDescBytes, Buffers->DescSlots),
+			Buffers->DescSlots, TEXT("VoxelBrickPool.Desc"));
+		Buffers->OccPooled = new FRDGPooledBuffer(
+			RHICmdList, Buffers->OccBuffer,
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->OccWords),
+			Buffers->OccWords, TEXT("VoxelBrickPool.Occ"));
+		Buffers->MatPooled = new FRDGPooledBuffer(
+			RHICmdList, Buffers->MatBuffer,
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->MatWords),
+			Buffers->MatWords, TEXT("VoxelBrickPool.Mat"));
+		Buffers->ChunkTablePooled = new FRDGPooledBuffer(
+			RHICmdList, Buffers->ChunkTableBuffer,
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),
+			                                     Buffers->ChunkSlots * VoxelBrickPoolDetail::kChunkRecordDwords),
+			Buffers->ChunkSlots * VoxelBrickPoolDetail::kChunkRecordDwords, TEXT("VoxelBrickPool.ChunkTable"));
+	}
+
+	// P1: the allocator's own buffers, only on an armed pool. Zero-initialised
+	// IS the allocator's initial state -- see the holder's comment.
+	if (Buffers->AllocStateDwords > 0 && !Buffers->HasGpuAlloc())
+	{
+		Buffers->AllocStateBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.AllocState"),
+		                                          sizeof(uint32), Buffers->AllocStateDwords);
+		Buffers->AllocBitmapBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.AllocBitmap"),
+		                                           sizeof(uint32), Buffers->AllocBitmapDwords);
+		Buffers->AllocSideBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.AllocSide"),
+		                                         sizeof(uint32), Buffers->AllocSideDwords);
+		Buffers->AllocStatePooled = new FRDGPooledBuffer(
+			RHICmdList, Buffers->AllocStateBuffer,
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->AllocStateDwords),
+			Buffers->AllocStateDwords, TEXT("VoxelBrickPool.AllocState"));
+		Buffers->AllocBitmapPooled = new FRDGPooledBuffer(
+			RHICmdList, Buffers->AllocBitmapBuffer,
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->AllocBitmapDwords),
+			Buffers->AllocBitmapDwords, TEXT("VoxelBrickPool.AllocBitmap"));
+		Buffers->AllocSidePooled = new FRDGPooledBuffer(
+			RHICmdList, Buffers->AllocSideBuffer,
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->AllocSideDwords),
+			Buffers->AllocSideDwords, TEXT("VoxelBrickPool.AllocSide"));
+	}
 }
 
 int32 FVoxelBrickPool::FindChunkSlot(const FVoxelBrickChunkKey& Key) const
@@ -984,6 +1356,35 @@ void FVoxelBrickPool::FreeResident(const FResidentChunk& Chunk)
 	Alloc.Offset = Chunk.BrickBase;
 	Alloc.NumQuads = VoxelBrickPoolDetail::kBricksPerChunk;
 	DescArena.Free(Alloc);
+
+	// P1: a GPU-allocated chunk's word ranges are returned BY A GPU PASS, fed
+	// from the side table -- the CPU never learned them and its word fields
+	// here are zeros, not sizes. The descriptor block above was CPU-allocated
+	// and is freed normally. Anything still queued for this slot is dropped
+	// with it: a CPU-producer claim (PendingGpuCpuWrites) that ran after the
+	// free would repopulate a record the resident map no longer owns, and a
+	// pending index add would announce a chunk that will never land.
+	if (Chunk.bGpuArenas)
+	{
+		for (int32 I = PendingGpuCpuWrites.Num() - 1; I >= 0; --I)
+		{
+			if (PendingGpuCpuWrites[I].ChunkSlot == Chunk.ChunkSlot)
+			{
+				PendingGpuCpuWrites.RemoveAt(I, EAllowShrinking::No);
+				++WritesDropped;
+			}
+		}
+		for (int32 I = PendingGpuIndexAdds.Num() - 1; I >= 0; --I)
+		{
+			if (PendingGpuIndexAdds[I].ChunkSlot == Chunk.ChunkSlot)
+			{
+				PendingGpuIndexAdds.RemoveAt(I, EAllowShrinking::No);
+			}
+		}
+		PendingGpuFreeSlots.Add(Chunk.ChunkSlot);
+		++GpuFreesQueued;
+		return;
+	}
 
 	if (Chunk.OccWords > 0)
 	{
@@ -1156,7 +1557,13 @@ bool FVoxelBrickPool::EvictOne()
 		if (FResidentChunk* Found = Resident.Find(Key))
 		{
 			FreeResident(*Found);
-			PendingClears.Add(Found->ChunkSlot);
+			// P1: a GPU-allocated chunk's record is zeroed by the FREE PASS
+			// (BrickPoolFreeMain) rather than by the classic clear -- one
+			// mechanism per slot, so the two can never race over who zeroes.
+			if (!Found->bGpuArenas)
+			{
+				PendingClears.Add(Found->ChunkSlot);
+			}
 			// P3: the same retirement, for the GPU-side chunk index. Queued in
 			// lockstep with the clear above so the index and the record table
 			// can never disagree about which slots are live -- see
@@ -1316,6 +1723,24 @@ int32 FVoxelBrickPool::AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload,
 	{
 		Init(FVoxelBrickPoolConfig{});
 	}
+	// P1: REFUSED on an armed pool, and loudly. This path allocates occ/mat
+	// words from the CPU arenas, and while voxel.GPU.PoolAlloc is armed those
+	// words belong to the GPU allocator -- a CPU grant here could overlap a GPU
+	// claim, which is precisely the corruption the one-allocator rule exists to
+	// make impossible. Nothing is supposed to reach this on an armed pool
+	// (GPU-claimed jobs never publish a payload; the pack-and-discard arm never
+	// publishes at all), so every hit is a wiring bug worth a line each.
+	if (bGpuAllocArmed)
+	{
+		++GpuFallbackShellRefused;
+		++AllocFailures;
+		UE_LOG(LogVoxelBrickPool, Error,
+		       TEXT("AddChunkFromGpu called for chunk (%d,%d,%d) L%d while voxel.GPU.PoolAlloc is armed. ")
+		       TEXT("Refused: the CPU word arenas are not this pool's allocator any more. The chunk has ")
+		       TEXT("no resident volume; find the producer that still takes the readback path."),
+		       Key.X, Key.Y, Key.Z, Key.Level);
+		return INDEX_NONE;
+	}
 	if (!Payload.IsValid() || Payload->BrickCount != VoxelBrickPoolDetail::kBricksPerChunk)
 	{
 		UE_LOG(LogVoxelBrickPool, Error,
@@ -1380,6 +1805,37 @@ int32 FVoxelBrickPool::AddChunkFromCpu(const FVoxelBrickCpuPackRef& Pack,
 		return INDEX_NONE;
 	}
 
+	// P1: on an armed pool the CPU producer claims through the GPU allocator --
+	// the one-allocator rule. The CPU half here is only the SHELL (descriptor
+	// block + record slot); the words are claimed by the same claim kernel the
+	// GPU producer uses, in Flush's render command, over an UPLOADED copy of
+	// this pack. Slower than the unarmed Lock/Memcpy path and deliberately so:
+	// edits and cold fallback are off the steady-state hot loop, and what this
+	// buys is that no dword can ever have two owners.
+	if (bGpuAllocArmed)
+	{
+		FResidentChunk Shell;
+		if (!AllocateGpuChunkShell(Key, Pack->OriginVoxel, Shell))
+		{
+			return INDEX_NONE;
+		}
+		++ChunksAddedFromCpu;
+		if (Shading.IsNeutral())
+		{
+			++ChunksAddedNeutralShading;
+		}
+		FPendingGpuCpuWrite Write;
+		Write.Pack = Pack;
+		Write.Key = Key;
+		Write.ChunkSlot = Shell.ChunkSlot;
+		Write.BrickBase = Shell.BrickBase;
+		Write.RingLevel = uint32(FMath::Clamp(Key.Level, 0, 15));
+		Write.Shading = Shading;
+		Write.OriginVoxel = Pack->OriginVoxel;
+		PendingGpuCpuWrites.Add(MoveTemp(Write));
+		return int32(Shell.ChunkSlot);
+	}
+
 	FResidentChunk Chunk;
 	if (!AllocateForChunk(Key, Pack->OccWords(), Pack->MatWords(), Chunk))
 	{
@@ -1428,7 +1884,11 @@ bool FVoxelBrickPool::RemoveChunk(const FVoxelBrickChunkKey& Key)
 			++WritesDropped;
 		}
 	}
-	PendingClears.Add(Slot);
+	// P1: the free pass zeroes a GPU-allocated chunk's record; see EvictOne.
+	if (!Found->bGpuArenas)
+	{
+		PendingClears.Add(Slot);
+	}
 	// P3, in lockstep with the clear, exactly as eviction does it. NOTHING IN
 	// STREAMING CALLS THIS YET -- which is precisely why the index consumer must
 	// implement removal before it is ever exercised, rather than after.
@@ -1436,6 +1896,314 @@ bool FVoxelBrickPool::RemoveChunk(const FVoxelBrickChunkKey& Key)
 	NoteResidentDelta(Key, -1);
 	Resident.Remove(Key);
 	return true;
+}
+
+// --- P1: GPU-side pool allocation (voxel.GPU.PoolAlloc) ----------------------
+
+bool FVoxelBrickPool::AllocateGpuChunkShell(const FVoxelBrickChunkKey& Key,
+                                            const FIntVector& OriginVoxel,
+                                            FResidentChunk& OutChunk)
+{
+	if (!bInitialised)
+	{
+		Init(FVoxelBrickPoolConfig{});
+	}
+	if (!bGpuAllocArmed)
+	{
+		// A caller that reached for the GPU path on an unarmed pool has read a
+		// different gate than Init did -- the half-covered state every accessor
+		// comment in this file warns about. Refuse rather than invent ranges.
+		UE_LOG(LogVoxelBrickPool, Error,
+		       TEXT("AllocateGpuChunkShell for chunk (%d,%d,%d) L%d on an UNARMED pool -- the caller's ")
+		       TEXT("gate and Init's disagree. Refused."),
+		       Key.X, Key.Y, Key.Z, Key.Level);
+		return false;
+	}
+
+	// OccWords/MatWords 0: the shell is the descriptor block and the record
+	// slot only. Everything else AllocateForChunk does -- re-add-frees-first,
+	// evict-until-it-fits, the resident record, the eviction order -- is wanted
+	// here unchanged, which is why this is a thin wrapper and not a fork.
+	if (!AllocateForChunk(Key, 0, 0, OutChunk))
+	{
+		++GpuFallbackShellRefused;
+		return false;
+	}
+	FResidentChunk* Entry = Resident.Find(Key);
+	Entry->bGpuArenas = true;
+	OutChunk.bGpuArenas = true;
+
+	// The index learns about the chunk on the next Flush, which runs after the
+	// caller has enqueued the graph that writes the record -- the seam's
+	// ordering guarantee, kept on this path by construction.
+	PendingGpuIndexAdds.Add(FVoxelBrickIndexEntry{ Key, OutChunk.ChunkSlot });
+	++GpuShellsAllocated;
+
+	// The verify ring. Fixed capacity, overwrite-oldest.
+	constexpr int32 kRingCap = 64;
+	FRecentGpuShell Recent;
+	Recent.Key = Key;
+	Recent.ChunkSlot = OutChunk.ChunkSlot;
+	Recent.OriginVoxel = OriginVoxel;
+	if (RecentGpuShells.Num() < kRingCap)
+	{
+		RecentGpuShells.Add(Recent);
+	}
+	else
+	{
+		RecentGpuShells[RecentGpuShellCursor % kRingCap] = Recent;
+	}
+	RecentGpuShellCursor = (RecentGpuShellCursor + 1) % kRingCap;
+	return true;
+}
+
+void FVoxelBrickPool::ReleaseGpuChunkShell(const FVoxelBrickChunkKey& Key, uint32 ExpectSlot)
+{
+	if (const FResidentChunk* Found = Resident.Find(Key))
+	{
+		// The slot guard: a re-add may have replaced this shell already, and the
+		// replacement freed the old one -- releasing the NEW tenant on behalf of
+		// a dead job would evict a healthy chunk.
+		if (Found->bGpuArenas && Found->ChunkSlot == ExpectSlot)
+		{
+			RemoveChunk(Key);
+		}
+	}
+}
+
+void FVoxelBrickPool::NoteGpuAllocFallback(EGpuAllocFallback Reason)
+{
+	switch (Reason)
+	{
+	case EGpuAllocFallback::Stacked:      ++GpuFallbackStacked; break;
+	case EGpuAllocFallback::Discard:      ++GpuFallbackDiscard; break;
+	case EGpuAllocFallback::ShellRefused: ++GpuFallbackShellRefused; break;
+	}
+}
+
+void FVoxelBrickPool::FlushPendingGpuFrees()
+{
+	if (PendingGpuFreeSlots.Num() == 0)
+	{
+		return;
+	}
+
+	TArray<uint32> Slots = MoveTemp(PendingGpuFreeSlots);
+	PendingGpuFreeSlots.Reset();
+	const FVoxelBrickPoolAllocLayout Layout = GpuAllocLayout;
+
+	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolGpuFree)(
+		[Buffers = GetOrCreateBuffers(), Slots = MoveTemp(Slots), Layout](FRHICommandListImmediate& RHICmdList)
+	{
+		EnsureCreated_RenderThread(RHICmdList, Buffers);
+		if (!Buffers.IsValid() || !Buffers->IsValid() || !Buffers->HasGpuAlloc())
+		{
+			// Nothing was ever claimed if the buffers do not exist, so there is
+			// nothing to free -- but creation FAILING after claims ran would be
+			// a leak, and it is worth a line.
+			UE_LOG(LogVoxelBrickPool, Error,
+			       TEXT("[brick-gpualloc] free of %d slot(s) dropped: allocator buffers unavailable."),
+			       Slots.Num());
+			return;
+		}
+
+		FRDGBuilder GraphBuilder(RHICmdList);
+		{
+			RDG_EVENT_SCOPE(GraphBuilder, "VoxelBrickPool.GpuFree(%d slots)", Slots.Num());
+			VoxelGpuWorldGen::FBrickPoolAllocBuffers AB;
+			AB.PoolDesc = GraphBuilder.RegisterExternalBuffer(Buffers->DescPooled, TEXT("VoxelBrickPool.Desc"));
+			AB.PoolOcc = GraphBuilder.RegisterExternalBuffer(Buffers->OccPooled, TEXT("VoxelBrickPool.Occ"));
+			AB.PoolMat = GraphBuilder.RegisterExternalBuffer(Buffers->MatPooled, TEXT("VoxelBrickPool.Mat"));
+			AB.PoolTable = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkTablePooled, TEXT("VoxelBrickPool.ChunkTable"));
+			AB.AllocState = GraphBuilder.RegisterExternalBuffer(Buffers->AllocStatePooled, TEXT("VoxelBrickPool.AllocState"));
+			AB.AllocBitmap = GraphBuilder.RegisterExternalBuffer(Buffers->AllocBitmapPooled, TEXT("VoxelBrickPool.AllocBitmap"));
+			AB.AllocSide = GraphBuilder.RegisterExternalBuffer(Buffers->AllocSidePooled, TEXT("VoxelBrickPool.AllocSide"));
+
+			FRDGBufferRef SlotList = CreateStructuredBuffer(
+				GraphBuilder, TEXT("Voxel.BrickPoolFreeSlots"), sizeof(uint32),
+				Slots.Num(), Slots.GetData(), Slots.Num() * sizeof(uint32));
+			VoxelGpuWorldGen::AddBrickPoolFreePass(GraphBuilder, AB, Layout, SlotList, uint32(Slots.Num()));
+		}
+		GraphBuilder.Execute();
+	});
+}
+
+void FVoxelBrickPool::MaybePumpGpuAllocWindow()
+{
+	using namespace VoxelBrickPoolDetail;
+
+	const double Now = FPlatformTime::Seconds();
+	if (GAllocWindowStart <= 0.0)
+	{
+		GAllocWindowStart = Now;
+		return;
+	}
+	if (Now - GAllocWindowStart < 5.0)
+	{
+		return;
+	}
+	GAllocWindowStart = Now;
+
+	// The latch promise: a cvar flip after Init does nothing, and SAYS so once
+	// rather than leaving someone to discover their control leg was not one.
+	static bool bWarnedFlip = false;
+	if (!bWarnedFlip && ((GVoxelGpuPoolAlloc != 0) != bGpuAllocArmed))
+	{
+		bWarnedFlip = true;
+		UE_LOG(LogVoxelBrickPool, Warning,
+		       TEXT("[brick-gpualloc] voxel.GPU.PoolAlloc was flipped after Init and is IGNORED -- the ")
+		       TEXT("allocator armed state is latched per process (armed=%d). Relaunch with ")
+		       TEXT("-VoxelGpuPoolAlloc=%d to actually change it."),
+		       bGpuAllocArmed ? 1 : 0, bGpuAllocArmed ? 0 : 1);
+	}
+
+	// --- sample the verify ring ---------------------------------------------
+	TArray<uint32> Expect;
+	int32 Samples = 0;
+	for (int32 I = 0; I < RecentGpuShells.Num() && Samples < 8; ++I)
+	{
+		const FRecentGpuShell& Shell = RecentGpuShells[I];
+		const FResidentChunk* Entry = Resident.Find(Shell.Key);
+		if (Entry == nullptr || !Entry->bGpuArenas || Entry->ChunkSlot != Shell.ChunkSlot)
+		{
+			continue; // evicted or replaced since -- stale, skip
+		}
+		Expect.Add(Entry->ChunkSlot);
+		Expect.Add(uint32(Shell.OriginVoxel.X));
+		Expect.Add(uint32(Shell.OriginVoxel.Y));
+		Expect.Add(uint32(Shell.OriginVoxel.Z));
+		Expect.Add(uint32(FMath::Clamp(Shell.Key.Level, 0, 15)));
+		Expect.Add(Entry->BrickBase);
+		Expect.Add(0u);
+		Expect.Add(0u);
+		++Samples;
+	}
+
+	const FVoxelBrickPoolAllocLayout Layout = GpuAllocLayout;
+	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolAllocWindow)(
+		[Buffers = GetOrCreateBuffers(), Layout, Expect = MoveTemp(Expect)](FRHICommandListImmediate& RHICmdList)
+	{
+		// Harvest anything a previous window enqueued -- same serial timeline.
+		PollGpuAllocReadbacks_RenderThread();
+
+		EnsureCreated_RenderThread(RHICmdList, Buffers);
+		if (!Buffers.IsValid() || !Buffers->IsValid() || !Buffers->HasGpuAlloc())
+		{
+			return;
+		}
+
+		FRDGBuilder GraphBuilder(RHICmdList);
+		{
+			RDG_EVENT_SCOPE(GraphBuilder, "VoxelBrickPool.AllocWindow");
+			VoxelGpuWorldGen::FBrickPoolAllocBuffers AB;
+			AB.PoolDesc = GraphBuilder.RegisterExternalBuffer(Buffers->DescPooled, TEXT("VoxelBrickPool.Desc"));
+			AB.PoolOcc = GraphBuilder.RegisterExternalBuffer(Buffers->OccPooled, TEXT("VoxelBrickPool.Occ"));
+			AB.PoolMat = GraphBuilder.RegisterExternalBuffer(Buffers->MatPooled, TEXT("VoxelBrickPool.Mat"));
+			AB.PoolTable = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkTablePooled, TEXT("VoxelBrickPool.ChunkTable"));
+			AB.AllocState = GraphBuilder.RegisterExternalBuffer(Buffers->AllocStatePooled, TEXT("VoxelBrickPool.AllocState"));
+			AB.AllocBitmap = GraphBuilder.RegisterExternalBuffer(Buffers->AllocBitmapPooled, TEXT("VoxelBrickPool.AllocBitmap"));
+			AB.AllocSide = GraphBuilder.RegisterExternalBuffer(Buffers->AllocSidePooled, TEXT("VoxelBrickPool.AllocSide"));
+
+			const uint32 NumEntries = uint32(Expect.Num() / 8);
+			if (NumEntries > 0)
+			{
+				FRDGBufferRef ExpectBuf = CreateStructuredBuffer(
+					GraphBuilder, TEXT("Voxel.BrickPoolAllocExpect"), sizeof(uint32),
+					Expect.Num(), Expect.GetData(), Expect.Num() * sizeof(uint32));
+				FRDGBufferRef VerifyBuf = GraphBuilder.CreateBuffer(
+					FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 3),
+					TEXT("Voxel.BrickPoolAllocVerify"));
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(VerifyBuf), 0u);
+				VoxelGpuWorldGen::AddBrickPoolAllocVerifyPass(GraphBuilder, AB, Layout,
+				                                              ExpectBuf, NumEntries, VerifyBuf);
+				FRHIGPUBufferReadback* Readback =
+					new FRHIGPUBufferReadback(TEXT("Voxel.BrickPoolAllocVerify"));
+				AddEnqueueCopyPass(GraphBuilder, Readback, VerifyBuf, 3 * sizeof(uint32));
+				FPendingAllocVerify Pending;
+				Pending.Readback = Readback;
+				Pending.ExpectedChunks = NumEntries;
+				GPendingAllocVerify.Add(Pending);
+				GAllocXchkPending.fetch_add(1, std::memory_order_relaxed);
+			}
+
+			// The counter block, always -- it is what carries the two always-on
+			// FAIL counters (bitmap collisions, bad frees) to the log.
+			FRHIGPUBufferReadback* Counters =
+				new FRHIGPUBufferReadback(TEXT("Voxel.BrickPoolAllocCounters"));
+			AddEnqueueCopyPass(GraphBuilder, Counters, AB.AllocState,
+			                   kGpuAllocCounterReadDwords * sizeof(uint32));
+			FPendingAllocCounters PendingCounters;
+			PendingCounters.Readback = Counters;
+			PendingCounters.OccTopsFirst = Layout.OccTopsFirst;
+			PendingCounters.OccClasses = Layout.OccClasses;
+			PendingCounters.OccClassStep = Layout.OccClassStep;
+			PendingCounters.MatTopsFirst = Layout.MatTopsFirst;
+			PendingCounters.MatClasses = Layout.MatClasses;
+			PendingCounters.MatClassStep = Layout.MatClassStep;
+			GPendingAllocCounters.Add(PendingCounters);
+		}
+		GraphBuilder.Execute();
+	});
+
+	// --- the window line, from the LAST LANDED snapshot ----------------------
+	//
+	// The GPU numbers are one window stale by construction (the readback above
+	// lands next window). That is the price of never waiting, and it is stated
+	// on the line itself so nobody reads a fresh CPU tally against a stale GPU
+	// one without knowing.
+	if (GpuShellsAllocated > 0 || GpuFreesQueued > 0)
+	{
+		const bool bLanded = GAllocCountersLanded.load(std::memory_order_relaxed) != 0;
+		const double MiB = 1024.0 * 1024.0;
+		const int64 PaddedCum = GAllocSnapOccPaddedCum.load(std::memory_order_relaxed)
+		                      + GAllocSnapMatPaddedCum.load(std::memory_order_relaxed);
+		const int64 ActualCum = GAllocSnapOccActualCum.load(std::memory_order_relaxed)
+		                      + GAllocSnapMatActualCum.load(std::memory_order_relaxed);
+		UE_LOG(LogVoxelBrickPool, Log,
+		       TEXT("[brick-gpualloc] shells %lld, freesQueued %lld; GPU (prev window%s): claims %lld ")
+		       TEXT("(%lld stack reuse), frees %lld, inFlight %.1f MiB occ + %.1f MiB mat, bump ")
+		       TEXT("high-water %.1f/%.1f MiB occ %.1f/%.1f MiB mat, padding %.1f%%, stranded ")
+		       TEXT("%.1f MiB, leakedRuns %lld; claimFail occ %lld mat %lld worst %lld; ")
+		       TEXT("FAIL: doubleGrant %lld badFree %lld; xcheck %lld ok / %lld FAIL ")
+		       TEXT("(%lld sampled, %lld unwritten, %d pending)"),
+		       GpuShellsAllocated, GpuFreesQueued,
+		       bLanded ? TEXT("") : TEXT(", NOT LANDED YET -- no verdict"),
+		       GAllocSnapClaims.load(std::memory_order_relaxed),
+		       GAllocSnapStackPops.load(std::memory_order_relaxed),
+		       GAllocSnapFrees.load(std::memory_order_relaxed),
+		       double(GAllocSnapOccInFlight.load(std::memory_order_relaxed)) * 4 / MiB,
+		       double(GAllocSnapMatInFlight.load(std::memory_order_relaxed)) * 4 / MiB,
+		       double(GAllocSnapOccBump.load(std::memory_order_relaxed)) * 4 / MiB,
+		       double(GpuAllocLayout.OccRegionWords) * 4 / MiB,
+		       double(GAllocSnapMatBump.load(std::memory_order_relaxed)) * 4 / MiB,
+		       double(GpuAllocLayout.MatRegionWords) * 4 / MiB,
+		       ActualCum > 0 ? 100.0 * double(PaddedCum - ActualCum) / double(PaddedCum) : 0.0,
+		       double(GAllocSnapStrandedOccDwords.load(std::memory_order_relaxed)
+		              + GAllocSnapStrandedMatDwords.load(std::memory_order_relaxed)) * 4 / MiB,
+		       GAllocSnapPushOverflow.load(std::memory_order_relaxed),
+		       GAllocSnapClaimFailOcc.load(std::memory_order_relaxed),
+		       GAllocSnapClaimFailMat.load(std::memory_order_relaxed),
+		       GAllocSnapClaimFailWorst.load(std::memory_order_relaxed),
+		       GAllocSnapBitmapCollision.load(std::memory_order_relaxed),
+		       GAllocSnapFreeMissing.load(std::memory_order_relaxed),
+		       GAllocXchkOk.load(std::memory_order_relaxed),
+		       GAllocXchkFails.load(std::memory_order_relaxed),
+		       GAllocXchkSamples.load(std::memory_order_relaxed),
+		       GAllocXchkUnwritten.load(std::memory_order_relaxed),
+		       GAllocXchkPending.load(std::memory_order_relaxed));
+	}
+
+	// The GT fallback tallies get their own line only when non-zero -- a
+	// fallback means the armed path is DECLINING work, which must not hide.
+	if (GpuFallbackStacked + GpuFallbackDiscard + GpuFallbackShellRefused > 0)
+	{
+		UE_LOG(LogVoxelBrickPool, Warning,
+		       TEXT("[brick-gpualloc] fallbacks: stacked %lld, discardArm %lld, shellRefused %lld ")
+		       TEXT("(cumulative). Stacked chunks lose their volume while armed (B.1 stacking is ")
+		       TEXT("skipped when PoolAlloc is on); shellRefused means the descriptor pool is full ")
+		       TEXT("even after eviction."),
+		       GpuFallbackStacked, GpuFallbackDiscard, GpuFallbackShellRefused);
+	}
 }
 
 void FVoxelBrickPool::Reset()
@@ -1451,6 +2219,15 @@ void FVoxelBrickPool::Reset()
 	PendingWrites.Reset();
 	PendingClears.Reset();
 	PendingIndexRemovals.Reset();
+	// P1. The GPU-side allocator state is NOT reset here -- Reset with no re-add
+	// is teardown-only (see the declaration), and the buffers die with the
+	// holder. What must not survive is the CPU-side pending work naming slots
+	// this pool no longer owns.
+	PendingGpuFreeSlots.Reset();
+	PendingGpuIndexAdds.Reset();
+	PendingGpuCpuWrites.Reset();
+	RecentGpuShells.Reset();
+	RecentGpuShellCursor = 0;
 }
 
 // Records every pending write and clear into Graph -- AND DOES NOT EXECUTE IT.
@@ -2060,8 +2837,21 @@ void FVoxelBrickPool::UploadCpuWrites_RenderThread(FRHICommandListImmediate& RHI
 
 void FVoxelBrickPool::Flush()
 {
-	if (PendingWrites.Num() == 0 && PendingClears.Num() == 0)
+	// P1: pending GPU-side frees go out FIRST, before anything below could
+	// enqueue a claim that reuses a freed slot -- the ordering rule on
+	// FlushPendingGpuFrees's declaration. No-op unarmed and when empty.
+	FlushPendingGpuFrees();
+
+	if (PendingWrites.Num() == 0 && PendingClears.Num() == 0 &&
+	    PendingGpuCpuWrites.Num() == 0 && PendingGpuIndexAdds.Num() == 0)
 	{
+		// The window still has to tick while the pipeline idles -- the counter
+		// readback is how a FAIL that happened at the END of activity reaches
+		// the log.
+		if (bGpuAllocArmed)
+		{
+			MaybePumpGpuAllocWindow();
+		}
 		return;
 	}
 
@@ -2100,12 +2890,32 @@ void FVoxelBrickPool::Flush()
 	FVoxelBrickIndexDelta IndexDelta;
 	IndexDelta.Removed = MoveTemp(PendingIndexRemovals);
 	PendingIndexRemovals.Reset();
+	// P1: the CPU producer's armed-path writes, moved out here for the same
+	// hollow-array reason as Writes below. Their claims ride the flush command's
+	// graph, so the index Added entries queued for them (and for the GPU
+	// producer's shells, whose graphs were enqueued in DispatchBatch earlier
+	// this tick) deliver at the bottom of this function -- behind every record
+	// write they name, exactly as the classic path's do.
+	TArray<FPendingGpuCpuWrite> GpuCpuWrites = MoveTemp(PendingGpuCpuWrites);
+	PendingGpuCpuWrites.Reset();
 	if (IndexSink)
 	{
-		IndexDelta.Added.Reserve(Writes.Num());
+		IndexDelta.Added.Reserve(Writes.Num() + PendingGpuIndexAdds.Num());
 		for (const FPendingWrite& W : Writes)
 		{
 			IndexDelta.Added.Add(FVoxelBrickIndexEntry{ W.Key, W.ChunkSlot });
+		}
+		IndexDelta.Added.Append(PendingGpuIndexAdds);
+	}
+	PendingGpuIndexAdds.Reset();
+	for (const FPendingGpuCpuWrite& W : GpuCpuWrites)
+	{
+		// This is PCIe traffic too -- the pack is uploaded to scratch before the
+		// claim copies it into the arenas -- so it stays on the same counter the
+		// unarmed Lock/Memcpy path uses.
+		if (W.Pack.IsValid())
+		{
+			CpuUploadBytes += int64(W.Pack->ResidentBytes());
 		}
 	}
 
@@ -2118,7 +2928,9 @@ void FVoxelBrickPool::Flush()
 	const bool bBatchedFlush = VoxelBrickPoolDetail::VoxelBrickFlushBatchEnabled();
 	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolFlush)(
 		[Buffers = GetOrCreateBuffers(), Writes = MoveTemp(Writes),
-		 Clears = MoveTemp(Clears), bBatchedFlush](FRHICommandListImmediate& RHICmdList) mutable
+		 Clears = MoveTemp(Clears), bBatchedFlush,
+		 GpuCpuWrites = MoveTemp(GpuCpuWrites),
+		 Layout = GpuAllocLayout](FRHICommandListImmediate& RHICmdList) mutable
 	{
 		if (!Buffers.IsValid())
 		{
@@ -2127,37 +2939,10 @@ void FVoxelBrickPool::Flush()
 
 		// First use creates the arenas. No scene proxy is involved -- nothing
 		// draws from this pool -- so there is no bootstrap to wait for and no
-		// window in which a write has nowhere to land.
-		if (!Buffers->IsValid())
-		{
-			Buffers->DescBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Desc"),
-			                                        VoxelBrickPoolDetail::kBrickDescBytes, Buffers->DescSlots);
-			Buffers->OccBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Occ"),
-			                                       sizeof(uint32), Buffers->OccWords);
-			Buffers->MatBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Mat"),
-			                                       sizeof(uint32), Buffers->MatWords);
-			Buffers->ChunkTableBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.ChunkTable"),
-			                                              sizeof(uint32),
-			                                              Buffers->ChunkSlots * VoxelBrickPoolDetail::kChunkRecordDwords);
-
-			Buffers->DescPooled = new FRDGPooledBuffer(
-				RHICmdList, Buffers->DescBuffer,
-				FRDGBufferDesc::CreateStructuredDesc(VoxelBrickPoolDetail::kBrickDescBytes, Buffers->DescSlots),
-				Buffers->DescSlots, TEXT("VoxelBrickPool.Desc"));
-			Buffers->OccPooled = new FRDGPooledBuffer(
-				RHICmdList, Buffers->OccBuffer,
-				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->OccWords),
-				Buffers->OccWords, TEXT("VoxelBrickPool.Occ"));
-			Buffers->MatPooled = new FRDGPooledBuffer(
-				RHICmdList, Buffers->MatBuffer,
-				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->MatWords),
-				Buffers->MatWords, TEXT("VoxelBrickPool.Mat"));
-			Buffers->ChunkTablePooled = new FRDGPooledBuffer(
-				RHICmdList, Buffers->ChunkTableBuffer,
-				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),
-				                                     Buffers->ChunkSlots * VoxelBrickPoolDetail::kChunkRecordDwords),
-				Buffers->ChunkSlots * VoxelBrickPoolDetail::kChunkRecordDwords, TEXT("VoxelBrickPool.ChunkTable"));
-		}
+		// window in which a write has nowhere to land. (P1 moved the creation
+		// into EnsureCreated_RenderThread because the generation graph can now
+		// touch the pool before the first flush -- same code, one home.)
+		EnsureCreated_RenderThread(RHICmdList, Buffers);
 
 		// Creation can fail (a lost device, an out-of-memory arena), and the
 		// next line would then register a null pooled buffer into a graph. This
@@ -2178,6 +2963,90 @@ void FVoxelBrickPool::Flush()
 		// it returns. See AddFlushPasses_RenderThread for why that is
 		// load-bearing.
 		AddFlushPasses_RenderThread(GraphBuilder, Buffers, Writes, Clears, bBatchedFlush);
+
+		// --- P1: the CPU producer's claims through the GPU allocator --------
+		//
+		// One-allocator rule: the pack was built on a worker, its SIZES are
+		// known here, but the RANGES are decided by the same claim kernel the
+		// GPU producer uses -- the sizes go up as a 2-dword upload standing in
+		// for the scan totals, the pack's bytes go up as transient scratch, and
+		// the identical write kernels land them. Recorded AFTER the classic
+		// passes but ordering against them is moot: an armed pool has no
+		// classic writes (AddChunkFromGpu refuses), and the frees these claims
+		// might reuse slots from were enqueued in their own command before this
+		// one (FlushPendingGpuFrees at the top of Flush).
+		if (GpuCpuWrites.Num() > 0 && Buffers->HasGpuAlloc())
+		{
+			RDG_EVENT_SCOPE(GraphBuilder, "VoxelBrickPool.CpuClaims(%d chunks)", GpuCpuWrites.Num());
+			VoxelGpuWorldGen::FBrickPoolAllocBuffers AB;
+			AB.PoolDesc = GraphBuilder.RegisterExternalBuffer(Buffers->DescPooled, TEXT("VoxelBrickPool.Desc"));
+			AB.PoolOcc = GraphBuilder.RegisterExternalBuffer(Buffers->OccPooled, TEXT("VoxelBrickPool.Occ"));
+			AB.PoolMat = GraphBuilder.RegisterExternalBuffer(Buffers->MatPooled, TEXT("VoxelBrickPool.Mat"));
+			AB.PoolTable = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkTablePooled, TEXT("VoxelBrickPool.ChunkTable"));
+			AB.AllocState = GraphBuilder.RegisterExternalBuffer(Buffers->AllocStatePooled, TEXT("VoxelBrickPool.AllocState"));
+			AB.AllocBitmap = GraphBuilder.RegisterExternalBuffer(Buffers->AllocBitmapPooled, TEXT("VoxelBrickPool.AllocBitmap"));
+			AB.AllocSide = GraphBuilder.RegisterExternalBuffer(Buffers->AllocSidePooled, TEXT("VoxelBrickPool.AllocSide"));
+
+			// A 1-dword stand-in for an arena a chunk owns nothing in. Never
+			// indexed (no MIXED brick exists when an arena is empty); it exists
+			// because an SRV must bind SOMETHING valid.
+			static const uint32 ZeroDword = 0;
+			FRDGBufferRef Dummy = CreateStructuredBuffer(
+				GraphBuilder, TEXT("Voxel.BrickPoolCpuClaimDummy"), sizeof(uint32), 1,
+				&ZeroDword, sizeof(uint32));
+
+			for (const FPendingGpuCpuWrite& W : GpuCpuWrites)
+			{
+				if (!W.Pack.IsValid())
+				{
+					continue;
+				}
+				const FVoxelBrickCpuPack& Pack = *W.Pack;
+				const uint32 OccWords = Pack.OccWords();
+				const uint32 MatWords = Pack.MatWords();
+				const uint32 Totals[2] = { OccWords, MatWords };
+				const uint32 Mask[2] = { uint32(Pack.BrickSolid & 0xffffffffull),
+				                         uint32((Pack.BrickSolid >> 32) & 0xffffffffull) };
+
+				FRDGBufferRef TotalsBuf = CreateStructuredBuffer(
+					GraphBuilder, TEXT("Voxel.BrickPoolCpuClaimTotals"), sizeof(uint32), 2,
+					Totals, sizeof(Totals));
+				FRDGBufferRef MaskBuf = CreateStructuredBuffer(
+					GraphBuilder, TEXT("Voxel.BrickPoolCpuClaimMask"), sizeof(uint32), 2,
+					Mask, sizeof(Mask));
+				FRDGBufferRef DescBuf = CreateStructuredBuffer(
+					GraphBuilder, TEXT("Voxel.BrickPoolCpuClaimDesc"), sizeof(uint32) * 2,
+					int32(VoxelBrickPoolDetail::kBricksPerChunk), Pack.Desc.GetData(),
+					Pack.Desc.Num() * sizeof(uint32));
+				FRDGBufferRef OccBuf = OccWords > 0
+					? CreateStructuredBuffer(GraphBuilder, TEXT("Voxel.BrickPoolCpuClaimOcc"),
+					                         sizeof(uint32), int32(OccWords), Pack.Occ.GetData(),
+					                         OccWords * sizeof(uint32))
+					: Dummy;
+				FRDGBufferRef MatBuf = MatWords > 0
+					? CreateStructuredBuffer(GraphBuilder, TEXT("Voxel.BrickPoolCpuClaimMat"),
+					                         sizeof(uint32), int32(MatWords), Pack.Mat.GetData(),
+					                         MatWords * sizeof(uint32))
+					: Dummy;
+
+				FRDGBufferRef Claim = VoxelGpuWorldGen::AddBrickPoolClaimPass(
+					GraphBuilder, AB, Layout, TotalsBuf, W.ChunkSlot,
+					VoxelBrickPoolDetail::kBricksPerChunk * 16u,
+					VoxelBrickPoolDetail::kBricksPerChunk * 132u);
+				VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(
+					GraphBuilder, AB, Claim, OccBuf, MatBuf, DescBuf, MaskBuf,
+					VoxelBrickPoolDetail::kBricksPerChunk, W.ChunkSlot, W.BrickBase,
+					W.RingLevel, W.OriginVoxel, W.Shading, OccWords, MatWords);
+			}
+		}
+		else if (GpuCpuWrites.Num() > 0)
+		{
+			UE_LOG(LogVoxelBrickPool, Error,
+			       TEXT("[brick-gpualloc] %d CPU-producer write(s) dropped: allocator buffers ")
+			       TEXT("unavailable. Those chunks hold a shell and no volume."),
+			       GpuCpuWrites.Num());
+		}
+
 		GraphBuilder.Execute();
 
 		// AFTER Execute(), and that is the clear-before-write rule rather than a
@@ -2207,6 +3076,12 @@ void FVoxelBrickPool::Flush()
 	if (bBatchedFlush)
 	{
 		VoxelBrickPoolDetail::MaybeLogFlushBatchWindow();
+	}
+	// P1: the allocator's window -- samples, counter readback, and the
+	// [brick-gpualloc] line. Same only-while-armed rule as above.
+	if (bGpuAllocArmed)
+	{
+		MaybePumpGpuAllocWindow();
 	}
 }
 
@@ -2343,6 +3218,17 @@ static FAutoConsoleCommand GVoxelBrickStatsCmd(
 	       VoxelBrickGetCpuPackCount(), PackSpanSeconds,
 	       PackSpanSeconds > 0.0 ? double(VoxelBrickGetCpuPackCount()) / PackSpanSeconds : 0.0);
 
+
+	// P1: on an armed pool the occ/mat rows above are CPU-arena numbers and the
+	// CPU arenas are retired -- they legitimately read 0 while the world is
+	// full. Said here so nobody reads "0 dwords used" as "the volume is empty".
+	if (Pool.IsGpuAllocArmed())
+	{
+		UE_LOG(LogVoxelBrickPool, Log,
+		       TEXT("  voxel.GPU.PoolAlloc is ARMED: occ/mat usage above reads 0 by design (the words ")
+		       TEXT("are GPU-allocated). Read bytes in flight, bump high-water, padding and the FAIL ")
+		       TEXT("counters off the [brick-gpualloc] window line instead."));
+	}
 
 	// --- residency by ring level -------------------------------------------
 	//

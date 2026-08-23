@@ -1,0 +1,798 @@
+// GPU-side pool allocation for the brick volume (docs/gpu-streaming-architecture.md P1).
+//
+// WHAT THIS FILE KILLS, IN ONE LINE. The per-chunk totals readback: today a chunk's
+// occupancy/material dword counts cross PCIe so FVoxelBrickPool::AllocateForChunk can
+// hand out arena ranges on the CPU, and that round trip is the fence the whole GPU
+// arm queues behind (dispatchToReady 28-37 ms of which ~28 ms is GPU work -- the rest
+// is the trip; queued p50 1,602 ms behind it). With these kernels the generation
+// graph CLAIMS its own ranges with atomics, writes its words, descriptors and record
+// in the same graph, and reads back NOTHING.
+//
+// ONE ALLOCATOR, NOT TWO -- the owner's decision (2026-08-23), and the design's
+// central statement. When voxel.GPU.PoolAlloc is armed, THIS allocator owns the
+// entire occupancy and material arenas (RegionFirst 0, RegionWords the full
+// capacity), and BOTH producers claim from it:
+//
+//   * THE GPU PRODUCER (pure worldgen, the steady state) claims in its own
+//     generation graph: the claim pass reads the scan's totals where they were
+//     produced and nothing crosses PCIe.
+//   * THE CPU PRODUCER (edited chunks, cold fallback, and the bit-exact oracle
+//     voxel.GPU.VerifyCoarse depends on -- it stays a producer permanently) knows
+//     its sizes up front, so its pack is UPLOADED to transient scratch and the
+//     SAME claim + write kernels run over it in the pool's flush command, with
+//     the totals arriving as a 2-dword upload instead of a scan output. Slower
+//     and coarser than the GPU path, deliberately -- it is off the steady-state
+//     hot loop -- but it draws from the SAME free space through the SAME atomics,
+//     so the two producers can never be handed the same words.
+//
+//   DESCRIPTOR SLOTS AND THE CHUNK RECORD SLOT stay CPU-allocated for both
+//   producers. That is not a second allocator over the same resource: slots are
+//   FIXED SIZE (64 descriptors, one 64 B record, always -- collapsed bricks
+//   included), need no generated sizes, and their identity must be CPU-visible
+//   for eviction, the march-index delta and FindChunkSlot. Each resource has
+//   exactly one dispenser: slots the CPU's DescArena, words this buffer.
+//
+// THE ALLOCATOR: SIZE-CLASS BUMP + FREE STACKS, chosen over a first-fit free list
+// on the GPU for one reason -- a concurrent first-fit scan with coalescing is a
+// correctness project of its own, and a wrong allocation here does not crash, it
+// writes one chunk's bricks over another's and renders as plausible terrain. So:
+//
+//   * A request is ROUNDED UP to a size class (occ: steps of OccClassStep dwords,
+//     mat: MatClassStep). Class-sized ranges are interchangeable within a class.
+//   * ALLOCATE: pop the class's free stack (LIFO, one InterlockedAdd on its top);
+//     on empty, bump the region cursor by the class size (one InterlockedAdd).
+//   * FREE: push the range back onto its class stack. No coalescing needed, ever,
+//     because a freed range is exactly the size the next same-class claim wants.
+//
+// FRAGMENTATION, STATED HONESTLY. External fragmentation is ZERO by construction --
+// classes never split or merge ranges. The costs are (a) INTERNAL padding, the
+// class round-up, counted exactly (PaddedCum vs ActualCum counters; expect ~5-15%
+// at 128/512-dword steps against the census means) and (b) STRANDING: dwords parked
+// in the free stack of a class the current mix no longer asks for. Both are printed
+// on the [brick-gpualloc] window line (padding %, per-arena stranded MiB, bump
+// high-water), so a caller finds out from the log, not from an allocFail. When the
+// region genuinely runs out (bump exhausted AND stack empty) the claim FAILS: the
+// chunk's record is written as zeros ("nothing here"), the failure is counted by
+// reason, and the world shows a missing chunk -- never a corrupted one.
+//
+// THE GATE THAT CAN FAIL: THE PAGE BITMAP. Every class step is one PAGE, and the
+// claim sets its pages with InterlockedOr, checking the PREVIOUS bits. A page that
+// was already set means the allocator granted the same dwords twice -- the exact
+// silent-corruption failure this codebase fears most -- and it is caught AT THE
+// MOMENT OF ALLOCATION, always-on, counted into BitmapCollisions (the claim then
+// fails rather than writing over the other tenant). The free pass symmetrically
+// checks the bits it clears WERE set (FreeBitmapMissing counts a range freed twice
+// or never granted). Both counters are read back asynchronously once per stats
+// window and any non-zero value logs as a cross-check FAIL. BrickPoolAllocVerifyMain
+// below adds the sampled record-vs-CPU-expectation check on top.
+//
+// LAYOUT CONTRACT. Every offset, class step, stack capacity and record stride below
+// is BOUND FROM THE HOST (FVoxelBrickPool::GetGpuAllocLayout), never a literal --
+// the ChunkRecordDwords rule. The state buffer is one RWStructuredBuffer<uint>:
+//
+//   [0]                 occ bump cursor, REGION-RELATIVE dwords (also the high-water)
+//   [1]                 mat bump cursor
+//   [2..31]             counters -- see the kCtr* indices, mirrored in
+//                       FVoxelBrickPool (kGpuAllocCtr*); indices, not meanings, are
+//                       what the two sides must agree on
+//   [OccTopsFirst..]    occ class stack tops (OccClasses entries)
+//   [MatTopsFirst..]    mat class stack tops (MatClasses entries)
+//   [OccStackFirst..]   occ stack storage, FreeStackCap entries per class
+//   [MatStackFirst..]   mat stack storage
+//
+// The bitmap is its own buffer ([OccBitmapFirst..] then [MatBitmapFirst..], one bit
+// per REGION-RELATIVE page). The side table is 4 dwords per chunk slot:
+// {occBaseAbs, occClass, matBaseAbs, matClass} -- it exists because FREEING without
+// a readback needs the ranges to live somewhere the FREE PASS can read: the CPU
+// knows WHICH slot to evict but never learned the ranges (that knowledge is what
+// the readback used to carry), so the eviction pass looks them up here. Class 0
+// means "no allocation in this arena" (an all-collapsed chunk).
+//
+// CONCURRENCY NOTE, RECORDED BECAUSE IT IS AN ASSUMPTION AND NOT A PROOF. Claims
+// run in generation graphs; frees run in the pool's flush command. RDG places
+// UAV barriers between passes that share these buffers, so a push and a pop are
+// never live at the same instant and the classic stack race (pop reading a slot
+// its pusher has not written) cannot occur under today's scheduling. If that ever
+// changes, the corruption it causes is a double-grant -- which is exactly what the
+// page bitmap exists to catch. The gate covers the assumption.
+
+#include "/Engine/Public/Platform.ush"
+
+// --- resources ---------------------------------------------------------------
+//
+// Loose globals, Unreal's $Globals convention, bound by reflected name from the
+// FParameters structs in VoxelGpuWorldGen.cpp -- VoxelBrickPoolWrite.usf's model.
+
+// The allocator state (bumps, counters, stack tops, stack storage).
+RWStructuredBuffer<uint> AllocState;
+// One bit per region-relative page, both arenas.
+RWStructuredBuffer<uint> AllocBitmap;
+// 4 dwords per chunk slot: occBaseAbs, occClass, matBaseAbs, matClass.
+RWStructuredBuffer<uint> AllocSide;
+// The per-job claim result: [0] ok, [1] occBaseAbs, [2] occWords (ACTUAL, not
+// padded), [3] matBaseAbs, [4] matWords, [5] fail reason, [6..7] spare.
+RWStructuredBuffer<uint> OutClaim;
+StructuredBuffer<uint>   InClaim;
+
+// The producing graph's outputs, exactly as VoxelBrickPoolWrite.usf names them.
+StructuredBuffer<uint>  InBrickTotals;  // [0] occ dwords, [1] mat dwords
+StructuredBuffer<uint>  InWords;        // scratch words, one arena per pass
+StructuredBuffer<uint2> InBrickDesc;    // scratch descriptors, chunk-relative
+StructuredBuffer<uint>  InBrickOcc;     // scratch occupancy, for allSolid
+StructuredBuffer<uint>  InChunkBrickMask;
+
+// The pool arenas.
+RWStructuredBuffer<uint>  OutWords;
+RWStructuredBuffer<uint2> OutBrickDesc;
+RWStructuredBuffer<uint>  OutChunkTable;
+
+// Free pass: the slots to retire. Verify pass: the expectation table.
+StructuredBuffer<uint> InSlotList;
+StructuredBuffer<uint> InExpect;
+// Verify read-only views (a kernel must never bind one buffer as UAV and SRV).
+StructuredBuffer<uint> InPoolTable;
+StructuredBuffer<uint> InAllocSide;
+StructuredBuffer<uint> InAllocBitmap;
+// [0] mismatched dwords, [1] chunks verified, [2] unwritten records seen.
+RWStructuredBuffer<uint> OutVerify;
+
+// --- parameters --------------------------------------------------------------
+// The region partition and layout, all bound from FVoxelBrickPool::GetGpuAllocLayout.
+uint OccRegionFirst;   // ABSOLUTE first dword of the GPU occ region in the arena
+uint OccRegionWords;
+uint MatRegionFirst;
+uint MatRegionWords;
+uint OccClassStep;     // dwords per occ class (and per occ bitmap page)
+uint OccClasses;
+uint MatClassStep;
+uint MatClasses;
+uint FreeStackCap;     // entries per class stack
+uint OccTopsFirst;     // state-buffer dword offsets
+uint MatTopsFirst;
+uint OccStackFirst;
+uint MatStackFirst;
+uint OccBitmapFirst;   // bitmap-buffer dword offsets
+uint MatBitmapFirst;
+
+// Per-chunk values, same meanings as VoxelBrickPoolWrite.usf's.
+uint ChunkSlot;
+uint BrickBase;
+uint BrickCount;
+uint RingLevel;
+uint ChunkRecordDwords;
+uint ChunkClimatePacked;
+uint ChunkSurfaceGradPacked;
+uint ChunkSurfaceZRelBits;
+int3 OriginVoxel;
+uint OccWorstWords;    // scratch worst case; a total above it is a scan fault
+uint MatWorstWords;
+uint MaxWords;         // copy pass: worst-case dispatch bound for one arena
+uint WordsClaimIndex;  // copy pass: 2 selects occ (claim[1]/[2]), 0 means read
+                       // occ pair, 1 means mat pair -- see the copy kernel
+uint NumSlots;         // free pass
+uint NumEntries;       // verify pass
+
+// Counter indices in AllocState. MIRRORED in FVoxelBrickPool (kGpuAllocCtr*);
+// a drifted index misattributes a counter, it does not corrupt terrain, which is
+// why params were not spent on all of them -- but keep the two lists in sync.
+static const uint kCtrOccBump          = 0u;
+static const uint kCtrMatBump          = 1u;
+static const uint kCtrClaims           = 2u;
+static const uint kCtrStackPops        = 3u;
+static const uint kCtrClaimFailOcc     = 4u;
+static const uint kCtrClaimFailMat     = 5u;
+static const uint kCtrClaimFailWorst   = 6u;
+static const uint kCtrBitmapCollision  = 7u;   // the always-on FAIL
+static const uint kCtrFrees            = 8u;
+static const uint kCtrFreePushOverflow = 9u;
+static const uint kCtrFreeBitmapMissing= 10u;  // the free-side FAIL
+static const uint kCtrOccInFlight      = 11u;  // padded dwords currently live
+static const uint kCtrMatInFlight      = 12u;
+static const uint kCtrOccPaddedCum     = 13u;
+static const uint kCtrOccActualCum     = 14u;
+static const uint kCtrMatPaddedCum     = 15u;
+static const uint kCtrMatActualCum     = 16u;
+
+// Claim fail reasons, mirrored as FVoxelBrickPool::EGpuClaimFail.
+static const uint kFailNone      = 0u;
+static const uint kFailWorstCase = 1u;
+static const uint kFailOccSpace  = 2u;
+static const uint kFailMatSpace  = 3u;
+static const uint kFailCollision = 4u;
+
+static const uint kBrickOffsetMask = 0x0fffffffu;
+static const uint kBrickFieldMask  = 0xf0000000u;
+static const uint kBrickKindMixed  = 2u;
+static const uint kBrickOccWords   = 16u;
+
+// ---------------------------------------------------------------------------
+// helpers -- each takes the arena's layout as arguments so one body serves both.
+// ---------------------------------------------------------------------------
+
+// Pop a class-sized range. Returns REGION-RELATIVE base via OutRel; false = empty.
+bool StackPop(uint TopsFirst, uint StackFirst, uint Class, out uint OutRel)
+{
+	OutRel = 0u;
+	uint Old;
+	// 0xffffffffu is two's-complement -1: InterlockedAdd has no signed form on a
+	// uint buffer, and the wrap-on-empty case is handled by the restore below.
+	InterlockedAdd(AllocState[TopsFirst + Class - 1u], 0xffffffffu, Old);
+	if (Old == 0u || Old > FreeStackCap)
+	{
+		// Empty (or a concurrent pop raced us past zero). Restore and report
+		// empty; the caller bumps instead. The unsigned wrap on an empty pop is
+		// why the restore is unconditional on this branch.
+		InterlockedAdd(AllocState[TopsFirst + Class - 1u], 1u);
+		return false;
+	}
+	OutRel = AllocState[StackFirst + (Class - 1u) * FreeStackCap + (Old - 1u)];
+	return true;
+}
+
+// Push a class-sized range back. False = stack full (the range is LEAKED, which
+// the caller counts -- a full stack means frees are outrunning reuse by
+// FreeStackCap * step dwords in one class, which the window line surfaces).
+bool StackPush(uint TopsFirst, uint StackFirst, uint Class, uint Rel)
+{
+	uint Old;
+	InterlockedAdd(AllocState[TopsFirst + Class - 1u], 1u, Old);
+	if (Old >= FreeStackCap)
+	{
+		InterlockedAdd(AllocState[TopsFirst + Class - 1u], 0xffffffffu);
+		return false;
+	}
+	AllocState[StackFirst + (Class - 1u) * FreeStackCap + Old] = Rel;
+	return true;
+}
+
+// Set the pages of a region-relative range. Returns the number of pages that were
+// ALREADY set -- non-zero means a double grant, the failure this bitmap exists for.
+uint BitmapSet(uint BitmapFirst, uint Rel, uint Class, uint Step)
+{
+	const uint FirstPage = Rel / Step;
+	uint Collisions = 0u;
+	for (uint P = 0u; P < Class; ++P)
+	{
+		const uint Page = FirstPage + P;
+		uint Old;
+		InterlockedOr(AllocBitmap[BitmapFirst + (Page >> 5u)], 1u << (Page & 31u), Old);
+		if ((Old & (1u << (Page & 31u))) != 0u)
+		{
+			++Collisions;
+		}
+	}
+	return Collisions;
+}
+
+// Clear the pages of a range. Returns pages that were ALREADY CLEAR (a range freed
+// twice, or never granted -- the free-side inconsistency).
+uint BitmapClear(uint BitmapFirst, uint Rel, uint Class, uint Step)
+{
+	const uint FirstPage = Rel / Step;
+	uint Missing = 0u;
+	for (uint P = 0u; P < Class; ++P)
+	{
+		const uint Page = FirstPage + P;
+		uint Old;
+		InterlockedAnd(AllocBitmap[BitmapFirst + (Page >> 5u)], ~(1u << (Page & 31u)), Old);
+		if ((Old & (1u << (Page & 31u))) == 0u)
+		{
+			++Missing;
+		}
+	}
+	return Missing;
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolClaimMain -- ONE thread claims this chunk's two arena ranges.
+//
+// Reads the totals the scan already produced ON THE GPU (the same two dwords the
+// readback used to carry), classes them, pops-or-bumps, marks the bitmap, writes
+// the side table and the claim record the write passes consume. A failed claim
+// writes ok=0 and a reason; the write passes then write NOTHING except a zeroed
+// record, so failure renders as an absent chunk -- never as somebody else's bytes.
+// ---------------------------------------------------------------------------
+[numthreads(1, 1, 1)]
+void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x != 0u)
+	{
+		return;
+	}
+
+	const uint OccWords = InBrickTotals[0];
+	const uint MatWords = InBrickTotals[1];
+
+	OutClaim[1] = 0u; OutClaim[2] = 0u; OutClaim[3] = 0u; OutClaim[4] = 0u;
+	OutClaim[6] = 0u; OutClaim[7] = 0u;
+
+	// The side table entry is written on EVERY path, including failure, so the
+	// free pass for this slot always reads a defined entry. Failure writes
+	// class 0 twice -- "nothing to free".
+	const uint Side = ChunkSlot * 4u;
+
+	// A total above the scratch worst case did not come from the scan -- the CPU
+	// path refuses these at Deliver for the same reason (a copy sized from it
+	// would read past the scratch), and this path must not be softer.
+	if (OccWords > OccWorstWords || MatWords > MatWorstWords)
+	{
+		InterlockedAdd(AllocState[kCtrClaimFailWorst], 1u);
+		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
+		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
+		OutClaim[0] = 0u; OutClaim[5] = kFailWorstCase;
+		return;
+	}
+
+	const uint OccClass = (OccWords + OccClassStep - 1u) / OccClassStep;  // 0 when 0
+	const uint MatClass = (MatWords + MatClassStep - 1u) / MatClassStep;
+
+	// --- occupancy ---------------------------------------------------------
+	uint OccRel = 0u;
+	bool bOccOk = true;
+	bool bOccFromStack = false;
+	if (OccClass > 0u)
+	{
+		bOccFromStack = StackPop(OccTopsFirst, OccStackFirst, OccClass, OccRel);
+		if (!bOccFromStack)
+		{
+			const uint Size = OccClass * OccClassStep;
+			uint Old;
+			InterlockedAdd(AllocState[kCtrOccBump], Size, Old);
+			if (Old + Size > OccRegionWords)
+			{
+				// Give the reservation back so the high-water stays honest and a
+				// later, smaller class can still fit.
+				InterlockedAdd(AllocState[kCtrOccBump], 0u - Size);
+				bOccOk = false;
+			}
+			else
+			{
+				OccRel = Old;
+			}
+		}
+	}
+	if (!bOccOk)
+	{
+		InterlockedAdd(AllocState[kCtrClaimFailOcc], 1u);
+		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
+		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
+		OutClaim[0] = 0u; OutClaim[5] = kFailOccSpace;
+		return;
+	}
+
+	// --- materials ---------------------------------------------------------
+	uint MatRel = 0u;
+	bool bMatOk = true;
+	bool bMatFromStack = false;
+	if (MatClass > 0u)
+	{
+		bMatFromStack = StackPop(MatTopsFirst, MatStackFirst, MatClass, MatRel);
+		if (!bMatFromStack)
+		{
+			const uint Size = MatClass * MatClassStep;
+			uint Old;
+			InterlockedAdd(AllocState[kCtrMatBump], Size, Old);
+			if (Old + Size > MatRegionWords)
+			{
+				InterlockedAdd(AllocState[kCtrMatBump], 0u - Size);
+				bMatOk = false;
+			}
+			else
+			{
+				MatRel = Old;
+			}
+		}
+	}
+	if (!bMatOk)
+	{
+		// Give the occupancy range back before failing -- the same
+		// give-back-what-succeeded rule AllocateForChunk's retry loop follows.
+		// It is class-sized whether it came from the stack or the bump, so the
+		// stack is always a legal home for it; a full stack leaks it, counted.
+		if (OccClass > 0u && !StackPush(OccTopsFirst, OccStackFirst, OccClass, OccRel))
+		{
+			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
+		}
+		InterlockedAdd(AllocState[kCtrClaimFailMat], 1u);
+		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
+		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
+		OutClaim[0] = 0u; OutClaim[5] = kFailMatSpace;
+		return;
+	}
+
+	// --- the double-grant gate ---------------------------------------------
+	uint Collisions = 0u;
+	if (OccClass > 0u) { Collisions += BitmapSet(OccBitmapFirst, OccRel, OccClass, OccClassStep); }
+	if (MatClass > 0u) { Collisions += BitmapSet(MatBitmapFirst, MatRel, MatClass, MatClassStep); }
+	if (Collisions != 0u)
+	{
+		// The allocator granted dwords somebody else holds. DO NOT write there.
+		// The ranges are deliberately leaked (returning them would hand the
+		// corruption to the next claim) and the collision counter turns the
+		// window line into a FAIL. Bits set by this claim on pages that were
+		// clear stay set -- part of the same leak, and the lesser evil against
+		// clearing a bit the true owner relies on.
+		InterlockedAdd(AllocState[kCtrBitmapCollision], Collisions);
+		AllocSide[Side + 0u] = 0u; AllocSide[Side + 1u] = 0u;
+		AllocSide[Side + 2u] = 0u; AllocSide[Side + 3u] = 0u;
+		OutClaim[0] = 0u; OutClaim[5] = kFailCollision;
+		return;
+	}
+
+	// --- success -----------------------------------------------------------
+	const uint OccBaseAbs = (OccClass > 0u) ? (OccRegionFirst + OccRel) : 0u;
+	const uint MatBaseAbs = (MatClass > 0u) ? (MatRegionFirst + MatRel) : 0u;
+
+	AllocSide[Side + 0u] = OccBaseAbs;
+	AllocSide[Side + 1u] = OccClass;
+	AllocSide[Side + 2u] = MatBaseAbs;
+	AllocSide[Side + 3u] = MatClass;
+
+	InterlockedAdd(AllocState[kCtrClaims], 1u);
+	if (bOccFromStack || bMatFromStack)
+	{
+		InterlockedAdd(AllocState[kCtrStackPops], (bOccFromStack ? 1u : 0u) + (bMatFromStack ? 1u : 0u));
+	}
+	InterlockedAdd(AllocState[kCtrOccInFlight], OccClass * OccClassStep);
+	InterlockedAdd(AllocState[kCtrMatInFlight], MatClass * MatClassStep);
+	InterlockedAdd(AllocState[kCtrOccPaddedCum], OccClass * OccClassStep);
+	InterlockedAdd(AllocState[kCtrOccActualCum], OccWords);
+	InterlockedAdd(AllocState[kCtrMatPaddedCum], MatClass * MatClassStep);
+	InterlockedAdd(AllocState[kCtrMatActualCum], MatWords);
+
+	OutClaim[0] = 1u;
+	OutClaim[1] = OccBaseAbs;
+	OutClaim[2] = OccWords;
+	OutClaim[3] = MatBaseAbs;
+	OutClaim[4] = MatWords;
+	OutClaim[5] = kFailNone;
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolAllocWordCopyMain -- one arena's run, base read FROM THE CLAIM rather
+// than from a CPU constant, which is the entire difference from BrickWordCopyMain.
+//
+// DISPATCHED AT THE WORST CASE (MaxWords threads) because the actual count lives
+// on the GPU and an indirect dispatch here would be building P3 early for no
+// measured reason (finding #1: pass/dispatch overhead is not the ceiling). The
+// worst case is 1,024 occ / 8,448 mat threads per chunk -- 16 / 132 groups --
+// and the excess threads read two dwords and exit.
+//
+// WordsClaimIndex selects the arena's claim pair: 0 = occ (claim[1]/[2]),
+// 1 = mat (claim[3]/[4]). One kernel, both arenas, the BrickWordCopyMain model.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickPoolAllocWordCopyMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= MaxWords || InClaim[0] == 0u)
+	{
+		return;
+	}
+	const uint Base  = InClaim[1u + 2u * WordsClaimIndex];
+	const uint Words = InClaim[2u + 2u * WordsClaimIndex];
+	if (i >= Words)
+	{
+		return;
+	}
+	// Scratch is chunk-relative from 0 on this path (single-chunk region), which
+	// is SrcFirst == 0 in the classic kernel's terms.
+	OutWords[Base + i] = InWords[i];
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolAllocDescMain -- BrickDescPoolWriteMain with the two bases read from
+// the claim. The rebase arithmetic is VERBATIM; only where the bases come from
+// changed, and this file's header is the record of why. On a failed claim it
+// writes uniform-AIR zeros so a reused descriptor block cannot keep its previous
+// tenant's descriptors (the record is zeroed too, so nothing reads them -- this
+// is belt and braces, both cheap).
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickPoolAllocDescMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= BrickCount)
+	{
+		return;
+	}
+	if (InClaim[0] == 0u)
+	{
+		OutBrickDesc[BrickBase + i] = uint2(0u, 0u);
+		return;
+	}
+	const uint OccBaseClaim = InClaim[1];
+	const uint MatBaseClaim = InClaim[3];
+
+	uint2 D = InBrickDesc[i];
+	const uint Kind = (D.x >> 28u) & 3u;
+	if (Kind == kBrickKindMixed)
+	{
+		// MIXED only -- a uniform brick's zero offsets must stay zero, for
+		// VoxelBrickPoolWrite.usf's file-header reason.
+		const uint OccOffset = ((D.x & kBrickOffsetMask) + OccBaseClaim) & kBrickOffsetMask;
+		const uint MatOffset = ((D.y & kBrickOffsetMask) + MatBaseClaim) & kBrickOffsetMask;
+		D.x = OccOffset | (D.x & kBrickFieldMask);
+		D.y = MatOffset | (D.y & kBrickFieldMask);
+	}
+	OutBrickDesc[BrickBase + i] = D;
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolAllocRecordMain -- BrickChunkRecordMain's body (the allSolid reduce is
+// unchanged and still runs over the SCRATCH cell data, for that kernel's stated
+// reason), plus the one behaviour this path adds: a FAILED claim zeroes the whole
+// record, so the chunk reads as "nothing here" instead of resurrecting whatever a
+// previous tenant left. The record format is UNTOUCHED -- the arena ranges live in
+// the side table, not in the reserved tail, precisely so every existing record
+// consumer and verifier keeps working unmodified.
+// ---------------------------------------------------------------------------
+groupshared uint gsAllocAllSolid;
+
+[numthreads(64, 1, 1)]
+void BrickPoolAllocRecordMain(uint3 gtid : SV_GroupThreadID)
+{
+	if (gtid.x == 0u)
+	{
+		gsAllocAllSolid = 1u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	const bool bOk = (InClaim[0] != 0u);
+
+	if (bOk && gtid.x < BrickCount)
+	{
+		const uint2 D = InBrickDesc[gtid.x];
+		const uint Kind = (D.x >> 28u) & 3u;
+		bool bBrickAllSolid = false;
+		if (Kind == 1u)
+		{
+			bBrickAllSolid = true;
+		}
+		else if (Kind == kBrickKindMixed)
+		{
+			const uint OccWord = D.x & kBrickOffsetMask;
+			uint Acc = 0xffffffffu;
+			for (uint k = 0u; k < kBrickOccWords; ++k)
+			{
+				Acc &= InBrickOcc[OccWord + k];
+			}
+			bBrickAllSolid = (Acc == 0xffffffffu);
+		}
+		if (!bBrickAllSolid)
+		{
+			InterlockedAnd(gsAllocAllSolid, 0u);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (gtid.x != 0u)
+	{
+		return;
+	}
+
+	const uint Base = ChunkSlot * ChunkRecordDwords;
+	if (!bOk)
+	{
+		for (uint Z = 0u; Z < ChunkRecordDwords; ++Z)
+		{
+			OutChunkTable[Base + Z] = 0u;
+		}
+		return;
+	}
+
+	const uint MaskLo = InChunkBrickMask[0];
+	const uint MaskHi = InChunkBrickMask[1];
+	const uint AnySolid = ((MaskLo | MaskHi) != 0u) ? 1u : 0u;
+	const uint AllSolid = (gsAllocAllSolid != 0u) ? 1u : 0u;
+	const uint LevelAndFlags = (RingLevel & 0xfu) | (AnySolid << 4u) | (AllSolid << 5u);
+
+	OutChunkTable[Base + 0u] = asuint(OriginVoxel.x);
+	OutChunkTable[Base + 1u] = asuint(OriginVoxel.y);
+	OutChunkTable[Base + 2u] = asuint(OriginVoxel.z);
+	OutChunkTable[Base + 3u] = LevelAndFlags;
+	OutChunkTable[Base + 4u] = BrickBase;
+	OutChunkTable[Base + 5u] = MaskLo;
+	OutChunkTable[Base + 6u] = MaskHi;
+	OutChunkTable[Base + 7u] = ChunkClimatePacked;
+	OutChunkTable[Base + 8u] = ChunkSurfaceGradPacked;
+	OutChunkTable[Base + 9u] = ChunkSurfaceZRelBits;
+	for (uint D2 = 10u; D2 < ChunkRecordDwords; ++D2)
+	{
+		OutChunkTable[Base + D2] = 0u;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolFreeMain -- eviction WITHOUT a round trip: the CPU sends the slot
+// numbers it decided to evict (it always knew WHICH); this pass looks the ranges
+// up in the side table (the knowledge the readback used to carry), pushes them
+// onto their class stacks, clears their bitmap pages, zeroes the record and the
+// side entry. Nothing comes back. A slot whose claim failed or never ran has a
+// zero side entry and frees nothing -- which is why the claim writes the side
+// table on every path.
+//
+// ORDERING IS THE CALLER'S LOAD-BEARING JOB: FVoxelBrickPool enqueues every
+// pending free BEFORE it enqueues any batch that could re-claim a freed slot, so
+// this pass can never read a side entry the re-claim has already overwritten.
+// See FlushPendingGpuFrees in VoxelBrickPool.cpp for the interleave that forced
+// that rule.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickPoolFreeMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint s = tid.x;
+	if (s >= NumSlots)
+	{
+		return;
+	}
+	const uint Slot = InSlotList[s];
+	const uint Side = Slot * 4u;
+
+	const uint OccBaseAbs = AllocSide[Side + 0u];
+	const uint OccClass   = AllocSide[Side + 1u];
+	const uint MatBaseAbs = AllocSide[Side + 2u];
+	const uint MatClass   = AllocSide[Side + 3u];
+
+	uint Missing = 0u;
+	if (OccClass > 0u)
+	{
+		const uint Rel = OccBaseAbs - OccRegionFirst;
+		Missing += BitmapClear(OccBitmapFirst, Rel, OccClass, OccClassStep);
+		if (!StackPush(OccTopsFirst, OccStackFirst, OccClass, Rel))
+		{
+			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
+		}
+		InterlockedAdd(AllocState[kCtrOccInFlight], 0u - OccClass * OccClassStep);
+	}
+	if (MatClass > 0u)
+	{
+		const uint Rel = MatBaseAbs - MatRegionFirst;
+		Missing += BitmapClear(MatBitmapFirst, Rel, MatClass, MatClassStep);
+		if (!StackPush(MatTopsFirst, MatStackFirst, MatClass, Rel))
+		{
+			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
+		}
+		InterlockedAdd(AllocState[kCtrMatInFlight], 0u - MatClass * MatClassStep);
+	}
+	if (Missing != 0u)
+	{
+		// A page this range should have owned was already clear: the range was
+		// freed twice, or granted past the bitmap. Either is the allocator lying
+		// about ownership -- FAIL-grade, surfaced on the window line.
+		InterlockedAdd(AllocState[kCtrFreeBitmapMissing], Missing);
+	}
+
+	AllocSide[Side + 0u] = 0u;
+	AllocSide[Side + 1u] = 0u;
+	AllocSide[Side + 2u] = 0u;
+	AllocSide[Side + 3u] = 0u;
+
+	for (uint D = 0u; D < ChunkRecordDwords; ++D)
+	{
+		OutChunkTable[Slot * ChunkRecordDwords + D] = 0u;
+	}
+	InterlockedAdd(AllocState[kCtrFrees], 1u);
+}
+
+// ---------------------------------------------------------------------------
+// BrickPoolAllocVerifyMain -- the sampled live cross-check, run every stats
+// window over a rotor of GPU-allocated resident chunks.
+//
+// EXPECTATIONS COME FROM THE CPU'S RESIDENT MAP, not from anything this
+// allocator wrote -- the derived-not-verified rule. Per entry (8 dwords):
+// {slot, originX, originY, originZ, ringLevel, brickBase, 0, 0}.
+//
+// WHAT FAILS IT (OutVerify[0]):
+//   * a NON-ZERO record whose origin, ring level or BrickBase disagree with what
+//     the CPU allocated the slot for -- one chunk's record describing another's
+//     ground, the exact silent corruption this phase must not ship;
+//   * a side-table range outside its GPU region or misaligned to its class step;
+//   * a side-table range whose bitmap pages are NOT all set -- ranges a free
+//     already reclaimed while the chunk is still resident.
+//
+// An ALL-ZERO record (dwords 0..6) counts into OutVerify[2] instead: the write
+// has not landed, the claim failed, or the job was abandoned -- diagnosed
+// CPU-side against the claim-fail counters, and NOT a corruption verdict. (A
+// real all-air chunk keyed exactly at origin (0,0,0) L0 with BrickBase 0 also
+// reads as this; one chunk in the world, an undercount and never a false FAIL.)
+// OutVerify[1] counts chunks checked, so a verify that checked nothing reads as
+// 0/0 -- "no verdict", never "pass". The vxc_gpu rule.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickPoolAllocVerifyMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint e = tid.x;
+	if (e >= NumEntries)
+	{
+		return;
+	}
+	const uint Base = e * 8u;
+	const uint Slot      = InExpect[Base + 0u];
+	const uint ExpOx     = InExpect[Base + 1u];
+	const uint ExpOy     = InExpect[Base + 2u];
+	const uint ExpOz     = InExpect[Base + 3u];
+	const uint ExpLevel  = InExpect[Base + 4u];
+	const uint ExpBrickBase = InExpect[Base + 5u];
+
+	const uint Rec = Slot * ChunkRecordDwords;
+	bool bAllZero = true;
+	for (uint D = 0u; D < 7u; ++D)
+	{
+		bAllZero = bAllZero && (InPoolTable[Rec + D] == 0u);
+	}
+	if (bAllZero)
+	{
+		InterlockedAdd(OutVerify[2], 1u);
+		InterlockedAdd(OutVerify[1], 1u);
+		return;
+	}
+
+	uint Mismatches = 0u;
+	Mismatches += (InPoolTable[Rec + 0u] != ExpOx) ? 1u : 0u;
+	Mismatches += (InPoolTable[Rec + 1u] != ExpOy) ? 1u : 0u;
+	Mismatches += (InPoolTable[Rec + 2u] != ExpOz) ? 1u : 0u;
+	Mismatches += ((InPoolTable[Rec + 3u] & 0xfu) != (ExpLevel & 0xfu)) ? 1u : 0u;
+	Mismatches += (InPoolTable[Rec + 4u] != ExpBrickBase) ? 1u : 0u;
+
+	// The side table's ranges: in-region, class-aligned, and still owned per the
+	// bitmap. Read-only bindings of the same buffers the allocator writes.
+	const uint Side = Slot * 4u;
+	const uint OccBaseAbs = InAllocSide[Side + 0u];
+	const uint OccClass   = InAllocSide[Side + 1u];
+	const uint MatBaseAbs = InAllocSide[Side + 2u];
+	const uint MatClass   = InAllocSide[Side + 3u];
+
+	if (OccClass > 0u)
+	{
+		const uint Rel = OccBaseAbs - OccRegionFirst;
+		const bool bInRegion = (OccBaseAbs >= OccRegionFirst)
+			&& (Rel + OccClass * OccClassStep <= OccRegionWords)
+			&& ((Rel % OccClassStep) == 0u);
+		if (!bInRegion)
+		{
+			++Mismatches;
+		}
+		else
+		{
+			const uint FirstPage = Rel / OccClassStep;
+			for (uint P = 0u; P < OccClass; ++P)
+			{
+				const uint Page = FirstPage + P;
+				if ((InAllocBitmap[OccBitmapFirst + (Page >> 5u)] & (1u << (Page & 31u))) == 0u)
+				{
+					++Mismatches;
+				}
+			}
+		}
+	}
+	if (MatClass > 0u)
+	{
+		const uint Rel = MatBaseAbs - MatRegionFirst;
+		const bool bInRegion = (MatBaseAbs >= MatRegionFirst)
+			&& (Rel + MatClass * MatClassStep <= MatRegionWords)
+			&& ((Rel % MatClassStep) == 0u);
+		if (!bInRegion)
+		{
+			++Mismatches;
+		}
+		else
+		{
+			const uint FirstPage = Rel / MatClassStep;
+			for (uint P = 0u; P < MatClass; ++P)
+			{
+				const uint Page = FirstPage + P;
+				if ((InAllocBitmap[MatBitmapFirst + (Page >> 5u)] & (1u << (Page & 31u))) == 0u)
+				{
+					++Mismatches;
+				}
+			}
+		}
+	}
+
+	if (Mismatches != 0u)
+	{
+		InterlockedAdd(OutVerify[0], Mismatches);
+	}
+	InterlockedAdd(OutVerify[1], 1u);
+}
