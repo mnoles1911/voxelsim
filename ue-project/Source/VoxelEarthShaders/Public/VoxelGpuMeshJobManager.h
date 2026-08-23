@@ -634,11 +634,20 @@ private:
 	int32 BatchStackPasses = 0;
 	int32 BatchClassicJobs = 0;
 	int32 BatchClassicPasses = 0;
+	// Chunks the sweep gathered but did NOT fuse, because the worklist claim
+	// stage is armed and a converted single job costs 0 batch passes against a
+	// fused stack's ~8.1/chunk. Zero with -VoxelGpuWorklistClaim=1 armed means
+	// the suppression never fired and conversion is still capped at the ~3%
+	// floor; nonzero while wlclaim conv stays flat means we stopped fusing
+	// without starting to convert -- a regression, revert rather than tune.
+	int64 BatchStackSuppressed = 0;
 	int32 BatchFallbacks[uint8(EBatchFallback::COUNT)] = { 0 };
 	double LastBatchLogSeconds = 0.0;
 	bool bBatchArmingLogged = false;
 	// P1: the WorldGenBatch + PoolAlloc conflict warning, once per run.
 	bool bPoolAllocStackConflictLogged = false;
+	// The fusion-suppression banner, once per run.
+	bool bStackSuppressLogged = false;
 
 	void NoteBatchFallback(EBatchFallback Reason) { ++BatchFallbacks[uint8(Reason)]; }
 	void MaybeLogBatchWindow();
@@ -715,6 +724,27 @@ private:
 	// wlcols line; the failing readings are documented at the log site.
 	int64 WorklistColConverted = 0;
 	int64 WorklistColFallback = 0;
+	// --- THE FALLBACK REASON SPLIT (2026-08-23) -----------------------------
+	//
+	// WorklistColFallback above is ONE undifferentiated number, and for one
+	// leg it was 739,829 against conv 26,789 -- 3.4% conversion -- with no way
+	// to say why. These name every path into it, and they must SUM to it:
+	// the window line prints the residual and says UNATTRIBUTED if it is not
+	// zero, because an unnamed majority is exactly what hid this.
+	//
+	//   Stack     -- the record's job is a stack-fused member. Its brick chain
+	//                runs through AddBrickStackPasses, which takes no arena
+	//                feed and claims the slot classically. THIS WAS 96% OF IT.
+	//   Deferred  -- appended but not consumed by this tick's flush: the ring
+	//                had a backlog, or the take was clamped by the cell budget
+	//                (-VoxelGpuWorklistCellBudget). Rises when a burst tick
+	//                appends more records than one flush may consume.
+	//   Unarmed   -- the column-stage CVar is on but the worklist object's
+	//                stage is not armed at flush time. Should be 0; growing
+	//                means arming is failing silently.
+	int64 WorklistFbStack = 0;
+	int64 WorklistFbDeferred = 0;
+	int64 WorklistFbUnarmed = 0;
 	// True when DispatchBatch flushed the worklist this tick (column stage:
 	// the flush must precede the batch render command); Tick then skips its
 	// own flush and clears the flag.

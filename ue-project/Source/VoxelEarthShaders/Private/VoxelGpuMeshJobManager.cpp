@@ -718,16 +718,36 @@ static bool VoxelGpuWorklistVerifyClaimEnabled()
 	return bEnabled;
 }
 
-// -VoxelGpuWorklistCellBudget=<n> (default 256): the per-flush record cap
+// -VoxelGpuWorklistCellBudget=<n> (default 384): the per-flush record cap
 // while the Voxelize stage is armed. The cell arena costs 128 KiB per record
-// (32,768 cells x 4 B) -- 256 is a 32 MiB arena and 15,360 chunks/s of
-// consume headroom at 60 ticks; the ring's default budget of 1,024 would be
-// 128 MiB. Sustained pending>0 on the window line is the raise-me signal.
+// (32,768 cells x 4 B) -- 384 is a 48 MiB arena; the ring's default budget of
+// 1,024 would be 128 MiB. Sustained pending>0 on the window line, or wlcols
+// fbBy deferred= growing, is the raise-me signal.
+//
+// WHY 384 AND NOT 256 (2026-08-23): a record deferred past its staging flush
+// is a chunk that falls back to the classic per-chunk chain, so the budget is
+// a direct cap on conversion. DispatchBatch can append at most MaxInFlight
+// records in one tick (JobsInFlightPerCore x cores = 288 today, the same
+// number the dispatch loop prints as cap=288), so a budget at or above that
+// makes deferral structurally impossible at today's in-flight ceiling rather
+// than merely unlikely. The leg that motivated this read pending=2 in exactly
+// one window -- small, but it is the ONLY remaining loss on the eligible set
+// once stack fusion stops taking 96% of it.
+//
+// THE HARD CEILING ABOVE THIS, stated because it is the next one to bind:
+// with the Claim stage armed the budget cannot exceed 442 (65,535 max groups
+// per indirect dispatch dimension / the Write triple's 148 groups per
+// record). At 60 ticks/s that caps the CONVERTED chain at ~26,500 chunks/s --
+// below the 50,000 goal. Passing it needs the Write triple to carry the
+// record in Y (dispatch {148, Take, 1} instead of {148 x Take, 1, 1}), which
+// is a change to the args kernel's uniform per-stage scheme and to every
+// kernel's shape lock; the arming path already REFUSES a budget over 442
+// loudly rather than clipping silently.
 static uint32 VoxelGpuWorklistCellBudget()
 {
 	static const uint32 Value = []
 	{
-		int32 Parsed = 256;
+		int32 Parsed = 384;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistCellBudget="), Parsed);
 		return uint32(FMath::Max(Parsed, 1));
 	}();
@@ -2427,8 +2447,55 @@ void FVoxelGpuMeshJobManager::Tick()
 	// and -- worse -- deliver them to nobody. A duplicate key (two queued jobs
 	// for the same chunk) breaks a run the same way and each part stands
 	// alone.
+	// --- P3 stage 6: fusion is now the WORSE of the two shapes ---------------
+	//
+	// THE ARITHMETIC, and it is the whole argument. A claim-based stack costs
+	// kStackClaimBasePasses + kPassesPerStackMemberClaim * N = 13 + 5N passes
+	// for N chunks -- at the ~4.2 chunks/stack this flight achieves, 8.1
+	// passes PER CHUNK. A single lean-alloc job whose seven worklist stages
+	// all convert costs 17 - 1 - 1 - 8 - 2 - 5 = ZERO batch passes. Fusing a
+	// chunk therefore BUYS IT 8.1 passes it would not otherwise pay, and --
+	// far worse -- takes it out of the converted chain entirely, because
+	// AddBrickStackPasses has no arena feed. On the leg that found this,
+	// stack membership WAS 96% of the worklist's fallbacks: 739,829 records
+	// fell back, ~25,300 of every 26,500-record window were stack members,
+	// and the non-stack remainder converted at 95%.
+	//
+	// So: with the claim stage armed, SWEEP but do not FUSE. The sweep still
+	// runs, so sibling promotion still rides the head's BatchCap allowance and
+	// per-tick promotion volume is unchanged (the cap's documented reason for
+	// the sweep is preserved); only the fusion is skipped, and each sibling
+	// dispatches as its own single job -- which is exactly the shape the
+	// worklist converts. Reducing the constant would be worth little here;
+	// this REMOVES THE TERM, which is the test the 50k budget doc sets.
+	//
+	// FAILING READINGS, both ways: `stackSuppressed` staying 0 with the claim
+	// switch armed means this gate never fired and conversion will stay at
+	// the 3.4% floor; `stackSuppressed` growing while wlclaim conv stays flat
+	// means we stopped fusing and did NOT start converting, which is strictly
+	// worse than before (17 passes/chunk instead of 8.1) and must be reverted,
+	// not tuned.
+	const bool bSuppressFusion = VoxelGpuWorklistEnabled() && Worklist.IsInitialized()
+	                          && Worklist.IsClaimStageArmed();
+	if (bSuppressFusion && !bStackSuppressLogged)
+	{
+		bStackSuppressLogged = true;
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-batch] stack FUSION SUPPRESSED: -VoxelGpuWorklistClaim is armed, so a ")
+		       TEXT("converted single job costs 0 batch passes against a fused stack's ~%d/chunk. ")
+		       TEXT("Sweeping continues (promotion volume and BatchCap semantics unchanged); only ")
+		       TEXT("the fuse is skipped. Read stackSuppressed on the [gpu-batch] line against ")
+		       TEXT("wlclaim conv: suppressed chunks that do not convert are a REGRESSION."),
+		       VoxelGpuBatchDetail::kPassesPerStackMemberClaim);
+	}
 	for (TArray<FJobPtr>& Sweep : StackSweeps)
 	{
+		if (bSuppressFusion)
+		{
+			// Counted, never silent: every chunk that would have fused.
+			BatchStackSuppressed += int64(Sweep.Num());
+			continue;
+		}
 		Sweep.Sort([](const FJobPtr& A, const FJobPtr& B)
 		{
 			return A->BrickKey.Z < B->BrickKey.Z;
@@ -2786,7 +2853,7 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 		FallbackTotal += BatchFallbacks[F];
 	}
 	if (BatchStacks == 0 && BatchClassicJobs == 0 && FallbackTotal == 0 &&
-	    CrossPass == 0 && CrossFail == 0)
+	    BatchStackSuppressed == 0 && CrossPass == 0 && CrossFail == 0)
 	{
 		LastBatchLogSeconds = Now;
 		return;
@@ -2812,7 +2879,10 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 	UE_LOG(LogVoxelGpuMeshJob, Log,
 	       TEXT("[gpu-batch] %.1fs window: %d stacks / %d chunks (~%d passes, vs ~%d per-chunk); ")
 	       TEXT("classic %d jobs (~%d passes); fallbacks quadmesh %d band %d assets %d raster %d ")
-	       TEXT("single %d invalid %d; crosscheck %s"),
+	       TEXT("single %d invalid %d; stackSuppressed %lld (chunks the sweep gathered and did ")
+	       TEXT("NOT fuse because the worklist claim stage lands them for 0 batch passes -- ")
+	       TEXT("read against wlclaim conv, and a gap between them is a REGRESSION); ")
+	       TEXT("crosscheck %s"),
 	       Now - LastBatchLogSeconds, BatchStacks, BatchStackChunks, BatchStackPasses,
 	       PerChunkEquivalent, BatchClassicJobs, BatchClassicPasses,
 	       BatchFallbacks[uint8(EBatchFallback::QuadMesh)],
@@ -2821,6 +2891,7 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 	       BatchFallbacks[uint8(EBatchFallback::Mismatch)],
 	       BatchFallbacks[uint8(EBatchFallback::Single)],
 	       BatchFallbacks[uint8(EBatchFallback::Invalid)],
+	       BatchStackSuppressed,
 	       *CrossText);
 
 	BatchStacks = 0;
@@ -2828,6 +2899,7 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 	BatchStackPasses = 0;
 	BatchClassicJobs = 0;
 	BatchClassicPasses = 0;
+	BatchStackSuppressed = 0;
 	FMemory::Memzero(BatchFallbacks, sizeof(BatchFallbacks));
 	LastBatchLogSeconds = Now;
 }
@@ -2940,10 +3012,26 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	{
 		const int64 ArenaMissing =
 			VoxelGpuBatchDetail::GWorklistColArenaMissing.load(std::memory_order_relaxed);
+		// THE REASON SPLIT. fb was one undifferentiated number and it hid the
+		// whole answer for a leg: 739,829 fallbacks against 26,789
+		// conversions, and 96% of them turned out to be ONE gate -- stack
+		// fusion -- that nobody suspected. Every path into fb is named here
+		// and the residual is printed: a nonzero residual means a path was
+		// added without a name and this line is lying by omission again.
+		const int64 FbNamed = WorklistFbStack + WorklistFbDeferred + WorklistFbUnarmed;
+		const int64 FbResidual = WorklistColFallback - FbNamed;
+		const int64 ConvDenom = WorklistColConverted + WorklistColFallback;
 		UE_LOG(LogVoxelGpuMeshJob, Log,
-		       TEXT("[gpu-worklist] wlcols conv=%lld fb=%lld arenaMissing=%lld ")
-		       TEXT("colverify checked=%llu mism=%llu (cumulative)%s%s"),
-		       WorklistColConverted, WorklistColFallback, ArenaMissing,
+		       TEXT("[gpu-worklist] wlcols conv=%lld fb=%lld (%.1f%% of records converted) ")
+		       TEXT("fbBy: stack=%lld deferred=%lld unarmed=%lld residual=%lld%s ")
+		       TEXT("arenaMissing=%lld colverify checked=%llu mism=%llu (cumulative)%s%s"),
+		       WorklistColConverted, WorklistColFallback,
+		       ConvDenom > 0 ? 100.0 * double(WorklistColConverted) / double(ConvDenom) : 0.0,
+		       WorklistFbStack, WorklistFbDeferred, WorklistFbUnarmed, FbResidual,
+		       FbResidual != 0
+		           ? TEXT(" (UNATTRIBUTED -- a fallback path with no reason counter)")
+		           : TEXT(""),
+		       ArenaMissing,
 		       P.ColumnsChecked, P.ColumnDwordMismatches,
 		       P.ColumnDwordMismatches > 0 ? TEXT(" (COLUMN VERIFY FAILED -- LEG INVALID)") : TEXT(""),
 		       ArenaMissing > 0 ? TEXT(" (ARENA MISSING -- converted jobs fell back)") : TEXT(""));
@@ -3022,11 +3110,33 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	// now attributed per flush.
 	if (VoxelGpuWorklistClaimEnabled())
 	{
+		// THE SET-IDENTITY TRIPLE, and it goes FIRST because it is the one
+		// that was missing. conv (this manager's converted jobs), hostStaged
+		// (the records Flush stamped claimStaged on) and gpuClaimed (stats[16],
+		// records ClaimWorklistMain actually claimed) are THE SAME SET or
+		// something is claiming a slot twice. On the leg that found this they
+		// read 26,789 / -- / ~766,618: every one of the ~740,000 excess GPU
+		// claims was a slot the batch graph ALSO claimed classically, the
+		// first grant of each pair leaked, the occ arena filled to 288/288 MiB
+		// and [brick-gpualloc] `unclaimed` ran to -643,164. gpuClaimed lags
+		// hostStaged by the readback latency; it may never EXCEED it.
+		const int64 HostStaged = Worklist.GetCumClaimStaged();
+		const int64 GpuClaimed = Worklist.GetGpuClaimEligible();
+		const bool bSetAhead = GpuClaimed > HostStaged;
+		const bool bSetShort = GpuClaimed == 0 && HostStaged > 0;
 		UE_LOG(LogVoxelGpuMeshJob, Log,
-		       TEXT("[gpu-worklist] wlclaim conv=%lld claimverify checked=%llu mism=%llu ")
-		       TEXT("(cumulative)%s%s"),
-		       WorklistClaimConverted,
+		       TEXT("[gpu-worklist] wlclaim conv=%lld hostStaged=%lld gpuClaimed=%lld ")
+		       TEXT("claimverify checked=%llu mism=%llu (cumulative)%s%s%s%s"),
+		       WorklistClaimConverted, HostStaged, GpuClaimed,
 		       P.ClaimDwordsChecked, P.ClaimDwordMismatches,
+		       bSetAhead
+		           ? TEXT(" (DOUBLE CLAIM: gpuClaimed > hostStaged -- pool ranges leaking, ")
+		             TEXT("cross-check [brick-gpualloc] unclaimed for the negative twin)")
+		           : TEXT(""),
+		       bSetShort
+		           ? TEXT(" (CLAIM STAGE DARK: hostStaged>0, gpuClaimed=0 -- those chunks' ")
+		             TEXT("batch brick chains were skipped and nothing landed them)")
+		           : TEXT(""),
 		       P.ClaimDwordMismatches > 0 ? TEXT(" (CLAIM VERIFY FAILED -- LEG INVALID)") : TEXT(""),
 		       (VoxelGpuWorklistVerifyClaimEnabled() && WorklistClaimConverted > 0 &&
 		        P.ClaimDwordsChecked == 0)
@@ -3322,6 +3432,13 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		// is consumed that same flush; otherwise it is dropped and the job
 		// below falls back classic like any deferred record.
 		const bool bStampArmed = Worklist.IsAssetStampStageArmed();
+		// Everything the host's claim veto depends on EXCEPT "consumed by
+		// this flush" -- which is the only half Flush can decide. The record
+		// carries this as LevelFlags bit 11 and Flush ANDs the two. See the
+		// bit's comment in VoxelWorklist.ush: without it, Flush stamped the
+		// GPU's claim bit on records the host then vetoed, and both graphs
+		// claimed the same slot.
+		const bool bClaimChainArmed = Worklist.IsClaimStageArmed();
 		TArray<FVoxelWorklistAssetPayload> RecordPayloads;
 		TSet<FVoxelGpuBrickStack*> TalliedStacks;
 		int64 PassesThisTick = 0;
@@ -3379,9 +3496,24 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			R.OriginVx = Job->BrickRegion.OriginVx;
 			R.OriginVy = Job->BrickRegion.OriginVy;
 			R.BrickZMin = Job->BrickRegion.BrickZMin;
+			const bool bJobHasAssets = Job->BrickRegion.AssetInstances.Num() > 0;
+			// Bit 11, hostClaimCandidate: this job's batch graph will run NO
+			// classic claim, so the flush graph may claim its slot. A
+			// stack-fused member is exactly the case that must NOT set it --
+			// its brick chain goes through AddBrickStackPasses, which claims
+			// classically. An asset record needs the stamp stage armed or its
+			// cells never reach the pack arenas the claim sources from.
+			// CONSERVATIVE BY CONSTRUCTION: every clause here is also a
+			// clause of the post-flush conversion test below, so bit 11 can
+			// only ever be a SUPERSET-free prefix of it -- and Flush's
+			// "consumed this flush" is the one remaining conjunct.
+			const bool bClaimCandidate = bClaimChainArmed
+				&& !Job->BrickStack.IsValid()
+				&& (!bJobHasAssets || bStampArmed);
 			R.LevelFlags = (uint32(FMath::Clamp(Job->BrickRegion.CoarseLevel, 0, 15)) & 0xFu)
 			             | ((Job->BrickRegion.RingSkirtMask & 0xFu) << 4)
-			             | ((Job->BrickRegion.AssetInstances.Num() > 0 ? 1u : 0u) << 8);
+			             | ((bJobHasAssets ? 1u : 0u) << 8)
+			             | ((bClaimCandidate ? 1u : 0u) << 11);
 			R.ChunkSlot = Job->GpuChunkSlot;
 			// Low 32 bits of the manager's JobId (starts at 1, so 0 is the
 			// prover's malformed-record tripwire until 2^32 jobs have run).
@@ -3483,6 +3615,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				if (RecordJobs[RIdx]->BrickStack.IsValid())
 				{
 					++WorklistColFallback;
+					++WorklistFbStack;
 					if (Worklist.IsVoxelizeStageArmed())
 					{
 						++WorklistVoxFallback;
@@ -3587,6 +3720,17 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				else
 				{
 					++WorklistColFallback;
+					// The two remaining reasons, told apart. Deferred is the
+					// ring/budget one and it is expected to be small; Unarmed
+					// is a silent-arming failure and should never move.
+					if (!Worklist.IsColumnStageArmed())
+					{
+						++WorklistFbUnarmed;
+					}
+					else
+					{
+						++WorklistFbDeferred;
+					}
 					if (Worklist.IsVoxelizeStageArmed())
 					{
 						++WorklistVoxFallback;

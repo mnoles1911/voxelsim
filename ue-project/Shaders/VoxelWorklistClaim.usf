@@ -138,6 +138,26 @@ void ClaimWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
 		return;
 	}
 	const uint Rec = Gid.x;
+	// THE STAGE'S TRAFFIC COUNTER, and it is not decoration: this number and
+	// the host's wlclaim conv MUST be the same number. They were not -- bit
+	// 10 was stamped on every consumed record while the host vetoed ~96% of
+	// them after the flush, so this kernel claimed 31x more slots than the
+	// host believed, each of those slots ALSO claimed classically in the
+	// batch graph, and the first grant of every pair leaked. Nothing could
+	// see it: `claimverify checked` was read as evidence over conv when it
+	// was really running over the larger set (at 9,647 dwords per conv record
+	// -- ABOVE the 9,616 a single record can possibly contribute, which is
+	// the arithmetic that finally exposed it). Written unconditionally, verify
+	// arm or not: a counter that only exists under a debug switch cannot be
+	// the thing that catches the next one.
+	//
+	// FAILING READINGS (the manager logs both): this counter ABOVE wlclaim
+	// conv = the GPU is claiming slots the host also claims classically --
+	// DOUBLE CLAIM, pool leaking. This counter at 0 with conv > 0 = the stage
+	// is dark and the host skipped batch brick chains for chunks nothing
+	// landed -- holes.
+	uint UnusedElig;
+	InterlockedAdd(WorklistStats[16], 1u, UnusedElig);
 	// TotalsReadBase is bound 0 on this dispatch; the slice base is explicit.
 	const uint OccWords = InBrickTotals[Rec * 2u + 0u];
 	const uint MatWords = InBrickTotals[Rec * 2u + 1u];

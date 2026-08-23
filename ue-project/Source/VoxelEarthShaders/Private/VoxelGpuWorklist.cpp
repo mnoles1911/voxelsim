@@ -88,6 +88,13 @@ namespace
 	std::atomic<uint32> GProofPackChecked{ 0 };
 	std::atomic<uint32> GProofClaimMismatch{ 0 };
 	std::atomic<uint32> GProofClaimChecked{ 0 };
+	// The claim stage's own TRAFFIC counter (stats[16]): how many records
+	// ClaimWorklistMain found eligible, cumulative, written on every armed
+	// tick whether or not a verify is armed. It is compared against the
+	// host's CumClaimStaged every proof, because those two being different
+	// sets is what let 96% of chunks be claimed TWICE -- once here and once
+	// classically in the batch graph -- with every existing indicator green.
+	std::atomic<uint32> GProofClaimEligible{ 0 };
 
 	// Groups per record per stage -- the host copy of the stage shapes the
 	// converted kernels are written against. The Column entry is LOCKED: it
@@ -413,17 +420,32 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 	// back to the classic per-chunk claim, and a second claim for the same
 	// slot would leak the first ranges and overwrite the side table. BEFORE
 	// the folds, so both proof mirrors cover the post-mutation bytes.
+	//
+	// AND bit 11 (hostClaimCandidate), which the manager stamps at record
+	// BUILD time for exactly the jobs whose batch graph will run NO classic
+	// claim. Without that conjunct this loop stamped bit 10 on every consumed
+	// record, while the host vetoed the majority of them AFTER the flush
+	// (a stack-fused member claims classically through AddBrickStackPasses)
+	// -- so those slots were claimed TWICE, once here and once in the batch
+	// graph, the first grant leaked, and [brick-gpualloc] `unclaimed` ran to
+	// -643,164 (claims + claimFails - shells: claims with no shell behind
+	// them). THE GPU'S ELIGIBLE SET AND THE HOST'S CONVERTED SET MUST BE THE
+	// SAME SET; ClaimStagedThisFlush below is the host's own count of it and
+	// the manager cross-checks it against the GPU's every proof.
+	ClaimStagedThisFlush = 0;
 	if (IsClaimStageArmed())
 	{
 		for (int32 I = 0; I < Staged.Num(); ++I)
 		{
 			const uint32 Mono = Head + uint32(I);
-			if (Mono - Tail < Take)
+			if (Mono - Tail < Take && (Staged[I].LevelFlags & (1u << 11)) != 0u)
 			{
 				Staged[I].LevelFlags |= (1u << 10);
+				++ClaimStagedThisFlush;
 			}
 		}
 	}
+	CumClaimStaged += ClaimStagedThisFlush;
 
 	// Slot folds for the records being uploaded this flush -- BEFORE the
 	// consume-fold mirror below, because the args pass sees HeadCursor ==
@@ -468,6 +490,10 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		const uint32 PackChecked = GProofPackChecked.load(std::memory_order_relaxed);
 		const uint32 ClaimMismatch = GProofClaimMismatch.load(std::memory_order_relaxed);
 		const uint32 ClaimChecked = GProofClaimChecked.load(std::memory_order_relaxed);
+		const uint32 ClaimEligible = GProofClaimEligible.load(std::memory_order_relaxed);
+		GpuClaimEligible = int64(ClaimEligible);
+		Proof.ClaimEligibleOnGpu = ClaimEligible;
+		Proof.ClaimStagedOnHost = CumClaimStaged;
 		Proof.MalformedOnGpu = GpuBad;
 		Proof.ColumnDwordMismatches = ColMismatch;
 		Proof.ColumnsChecked = ColChecked;
@@ -482,6 +508,43 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		Proof.ClaimDwordMismatches = ClaimMismatch;
 		Proof.ClaimDwordsChecked = ClaimChecked;
 		++Proof.Landed;
+		// --- THE SET-IDENTITY GATE (the one that was missing) ---------------
+		//
+		// The records the GPU claims and the records the host staged for a GPU
+		// claim must be THE SAME SET. Both counters are cumulative and both
+		// are captured at the same flush, so the compare is exact -- with one
+		// allowance: the GPU number is as of the flush whose readback landed,
+		// which is a few flushes behind the host's, so the GPU may be BEHIND.
+		// It may never be AHEAD.
+		//
+		// GPU AHEAD OF HOST is the double claim: the flush graph claimed a
+		// slot the batch graph also claims classically, the first grant is
+		// unreachable forever, and the pool arena fills at exactly that rate.
+		// Its other face is [brick-gpualloc] `unclaimed` going NEGATIVE --
+		// claims + claimFails exceeding shells, claims with no shell behind
+		// them. The leg that found this read unclaimed = -643,164.
+		if (int64(ClaimEligible) > CumClaimStaged)
+		{
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] CLAIM SET MISMATCH: the GPU claimed %u records but ")
+			       TEXT("the host staged only %lld for a GPU claim (excess %lld). Every ")
+			       TEXT("excess record is a slot claimed TWICE -- once in the flush graph, ")
+			       TEXT("once classically in the batch graph -- and the first grant of each ")
+			       TEXT("pair LEAKS. Cross-check [brick-gpualloc] `unclaimed`: it will be ")
+			       TEXT("negative by about this much. The leg is invalid."),
+			       ClaimEligible, CumClaimStaged, int64(ClaimEligible) - CumClaimStaged);
+		}
+		if (ClaimEligible == 0u && CumClaimStaged > 0)
+		{
+			// The other direction, and it is NOT harmless: the host skipped
+			// the batch graph's brick chain for chunks it believed the flush
+			// graph would land. Nothing claimed them; they arrive unwritten.
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] CLAIM STAGE DARK: host staged %lld records for a GPU ")
+			       TEXT("claim and the GPU claimed 0. Those chunks' batch brick chains were ")
+			       TEXT("skipped and nothing landed them -- expect holes, not corruption."),
+			       CumClaimStaged);
+		}
 		if (ClaimMismatch > 0)
 		{
 			// THE CLAIM FAILING READING: the pool holds different bytes than
@@ -581,10 +644,11 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       TEXT("== host (malformed-on-gpu=%u; colverify checked=%u mism=%u; ")
 			       TEXT("voxverify checked=%u mism=%u; ctverify checked=%u mism=%u; ")
 			       TEXT("stampverify checked=%u mism=%u; packverify checked=%u mism=%u; ")
-			       TEXT("claimverify checked=%u mism=%u)"),
+			       TEXT("claimverify checked=%u mism=%u; claimSet gpu=%u host=%lld)"),
 			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch,
 			       VoxChecked, VoxMismatch, CtChecked, CtMismatch, StampChecked, StampMismatch,
-			       PackChecked, PackMismatch, ClaimChecked, ClaimMismatch);
+			       PackChecked, PackMismatch, ClaimChecked, ClaimMismatch,
+			       ClaimEligible, CumClaimStaged);
 			if (GpuBad > 0)
 			{
 				UE_LOG(LogVoxelGpuWorklist, Error,
@@ -1026,11 +1090,13 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 								KDispatch.PoolLayout = PoolB.Layout;
 								KDispatch.ChunkRecordDwords = PoolB.ChunkRecordDwords;
 								KDispatch.bVerify = bClaimVerify;
-								if (bClaimVerify)
-								{
-									KDispatch.VerifyStats = GraphBuilder.RegisterExternalBuffer(
-										PooledStats, TEXT("Voxel.WorklistStats"));
-								}
+								// Unconditional: the claim kernel writes its
+								// eligible-record count to stats[16] on every
+								// armed tick. That counter is the one that
+								// would have caught the double claim on the
+								// first leg instead of the fourth.
+								KDispatch.VerifyStats = GraphBuilder.RegisterExternalBuffer(
+									PooledStats, TEXT("Voxel.WorklistStats"));
 								VoxelGpuWorldGen::AddWorklistClaimPasses(GraphBuilder, KDispatch);
 							}
 							else
