@@ -6183,6 +6183,37 @@ struct FVoxelWorldImpl
 	int64 PoolReusesAtLastPerfRefresh = 0;
 	FVoxelPerfSnapshot LastPerfSnapshot;
 
+	// --- GPU streaming panel (voxel.Debug 3) --------------------------------
+	//
+	// Published on the same 1 Hz rollover as LastPerfSnapshot, from counters
+	// the brick pool and this impl already maintain -- filling it is a handful
+	// of atomic loads, no walks. See FVoxelStreamPanelSnapshot (VoxelDebug.h)
+	// for what each field means and why throughput is pool ADDS, not the CPU
+	// pack count.
+	FVoxelStreamPanelSnapshot LastStreamPanel;
+	// False until the first 1 Hz publish has TAKEN BASELINES. The first window
+	// after the panel comes alive must not report (all adds since startup) /
+	// (one second) -- with mode 0 the whole perf path is skipped, so arming the
+	// panel an hour into a session would otherwise print a rate thousands of
+	// times too high for one refresh. That first publish only records the
+	// counters and leaves bValid false; the HUD shows "collecting...".
+	bool bPanelBaselineTaken = false;
+	int64 PoolAddsAtLastPanelRefresh = 0;
+	int64 PoolGpuAddsAtLastPanelRefresh = 0;
+	// Rolling peak: the max of the last kPanelPeakWindows 1 Hz rates, so the
+	// peak the owner sees is from THIS flight, not a burst half an hour ago.
+	static constexpr int32 kPanelPeakWindows = 30;
+	float PanelRateHistory[kPanelPeakWindows] = {};
+	int32 PanelRateHistoryNext = 0;
+	int32 PanelRateHistoryCount = 0;
+	// Dispatch-loop exit split since the last panel publish. Incremented every
+	// streaming tick in TickStreaming's dispatch section; consumed (and reset)
+	// by UpdatePerfSnapshot. Which exit dominates is what says whether the
+	// worker pool (cap) or the admission side (empty) is the limiter when
+	// chunks/s sits under the 6,200 floor.
+	int32 DispatchExitCapSincePanel = 0;
+	int32 DispatchExitEmptySincePanel = 0;
+
 	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() /
 	// IsRingsEnabled() so the off-transition can drop every component's MID
 	// exactly once (constraint: zero MID cost once both layers are off
@@ -6232,6 +6263,7 @@ struct FVoxelWorldImpl
 	uint64 LastBroadcastSeq = 0;
 
 	FVoxelPerfSnapshot GetPerfSnapshot() const { return LastPerfSnapshot; }
+	FVoxelStreamPanelSnapshot GetStreamPanelSnapshot() const { return LastStreamPanel; }
 
 private:
 	// M3 wave 1 (docs/m3-plan.md "Prediction reconcile v1"): drops
@@ -15197,6 +15229,14 @@ void FVoxelWorldImpl::DispatchJobs()
 		}
 
 	}
+	if (bLoopExitedQueueEmpty)
+	{
+		++DispatchExitEmptySincePanel;
+	}
+	else
+	{
+		++DispatchExitCapSincePanel;
+	}
 	ThisFrameDispatchLoopMs += float((FPlatformTime::Seconds() - DispatchLoopStart) * 1000.0);
 
 	// Exit attribution (see the DispatchExit* doc comment). Falling out of the
@@ -18737,6 +18777,93 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	LastPerfSnapshot.QuadsEmitted = PerfCounters.getQuadsEmitted();
 	LastPerfSnapshot.EditsApplied = PerfCounters.getEditsApplied();
 	LastPerfSnapshot.ColumnEvals = PerfCounters.getColumnEvals();
+
+	// --- GPU streaming panel (voxel.Debug 3), same 1 Hz window --------------
+	//
+	// Cost: ~a dozen atomic/int loads plus one iteration over GpuJobsPending
+	// (bounded by the GPU in-flight cap -- 256 by GpuMeshInFlight(), measured
+	// idling at ~11 in practice), once per second, and only while voxel.Debug
+	// >= 1 -- this function is behind that gate. See FVoxelStreamPanelSnapshot
+	// (VoxelDebug.h) for field semantics.
+	{
+		FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
+		const int64 AddsTotal = BrickPool.GetChunksAdded();
+		const int64 GpuAddsTotal = BrickPool.GetChunksAddedFromGpu();
+
+		if (!bPanelBaselineTaken)
+		{
+			// First publish since the panel came alive: record baselines only.
+			// Publishing a rate from a window that silently spans the whole
+			// pre-arm session is exactly the "instrument reads a number and is
+			// believed" failure this panel exists to prevent.
+			bPanelBaselineTaken = true;
+			LastStreamPanel.bValid = false;
+		}
+		else
+		{
+			const int64 WindowAdds = AddsTotal - PoolAddsAtLastPanelRefresh;
+			const int64 WindowGpuAdds = GpuAddsTotal - PoolGpuAddsAtLastPanelRefresh;
+			const float Rate = Window > 0.f ? float(double(WindowAdds) / double(Window)) : 0.f;
+
+			PanelRateHistory[PanelRateHistoryNext] = Rate;
+			PanelRateHistoryNext = (PanelRateHistoryNext + 1) % kPanelPeakWindows;
+			PanelRateHistoryCount = FMath::Min(PanelRateHistoryCount + 1, kPanelPeakWindows);
+			float Peak = 0.f;
+			for (int32 I = 0; I < PanelRateHistoryCount; ++I)
+			{
+				Peak = FMath::Max(Peak, PanelRateHistory[I]);
+			}
+
+			LastStreamPanel.bValid = true;
+			LastStreamPanel.ChunksPerSec = Rate;
+			LastStreamPanel.ChunksPerSecPeak = Peak;
+			LastStreamPanel.ChunksAddedTotal = AddsTotal;
+			LastStreamPanel.WindowAddsGpu = WindowGpuAdds;
+			LastStreamPanel.WindowAddsCpu = WindowAdds - WindowGpuAdds;
+		}
+		PoolAddsAtLastPanelRefresh = AddsTotal;
+		PoolGpuAddsAtLastPanelRefresh = GpuAddsTotal;
+
+		// The rows below are point-in-time reads, valid even on the baseline
+		// publish -- only the WINDOWED rows above need a baseline.
+		LastStreamPanel.TotalAddsGpu = GpuAddsTotal;
+		LastStreamPanel.TotalAddsCpu = AddsTotal - GpuAddsTotal;
+		LastStreamPanel.bGpuArmEnabled = VoxelGpuBrickPackEnabled();
+		LastStreamPanel.PoolResidentChunks = BrickPool.GetNumResidentChunks();
+		LastStreamPanel.PoolChunkCapacity = BrickPool.GetConfig().ChunkCapacity;
+		LastStreamPanel.PoolResidentBytes = BrickPool.GetResidentBytes();
+		LastStreamPanel.PoolEvictions = BrickPool.GetEvictions();
+		LastStreamPanel.PoolAllocFailures = BrickPool.GetAllocFailures();
+
+		LastStreamPanel.PendingJobs = PendingJobNum();
+		int32 GpuDemand = 0;
+		int32 GpuSpec = 0;
+		for (const auto& Pair : GpuJobsPending)
+		{
+			if (Pair.Value.bSpeculative)
+			{
+				++GpuSpec;
+			}
+			else
+			{
+				++GpuDemand;
+			}
+		}
+		// Same subtraction the dispatch loop's CpuJobsOutstanding makes: the
+		// shared counter includes GPU jobs, which occupy no worker thread.
+		LastStreamPanel.CpuJobsInFlight =
+			FMath::Max(0, JobsInFlightCounter.GetValue() - GpuJobsPending.Num());
+		LastStreamPanel.CpuJobsCap = MaxJobsInFlight;
+		LastStreamPanel.GpuDemandInFlight = GpuDemand;
+		LastStreamPanel.GpuSpecInFlight = GpuSpec;
+		LastStreamPanel.GpuInFlightCap = VoxelStreamAdmission::GpuMeshInFlight();
+		LastStreamPanel.SpecInFlightCap = VoxelDebug::GetStreamSpeculativeMaxInFlight();
+
+		LastStreamPanel.DispatchExitCap = DispatchExitCapSincePanel;
+		LastStreamPanel.DispatchExitEmpty = DispatchExitEmptySincePanel;
+		DispatchExitCapSincePanel = 0;
+		DispatchExitEmptySincePanel = 0;
+	}
 }
 
 void FVoxelWorldImpl::UpdateChunkStateTints()
@@ -21112,6 +21239,13 @@ int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU
 FVoxelPerfSnapshot UVoxelWorldSubsystem::GetPerfSnapshot() const
 {
 	return Impl ? Impl->GetPerfSnapshot() : FVoxelPerfSnapshot{};
+}
+
+FVoxelStreamPanelSnapshot UVoxelWorldSubsystem::GetStreamPanelSnapshot() const
+{
+	// Default-constructed means bValid == false, so a caller before Initialize
+	// (or after Deinitialize) reads "collecting...", never a stale panel.
+	return Impl ? Impl->GetStreamPanelSnapshot() : FVoxelStreamPanelSnapshot{};
 }
 
 int32 UVoxelWorldSubsystem::SpawnTreeFixtureAt(double WorldX, double WorldY)

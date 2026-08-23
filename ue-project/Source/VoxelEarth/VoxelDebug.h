@@ -45,17 +45,33 @@ DECLARE_DWORD_COUNTER_STAT_EXTERN(TEXT("Chunks In Flight"), STAT_VoxelChunksInFl
 
 namespace VoxelDebug
 {
-	// voxel.Debug: 0=off, 1=perf HUD, 2=HUD+visualizations
-	// (docs/debug-tooling-plan.md "Access model"). AVoxelEarthPlayerController's
-	// F3 binding cycles 0->1->2->0 via CycleDebugMode.
+	// voxel.Debug: 0=off, 1=perf HUD, 2=HUD+visualizations, 3=GPU streaming
+	// panel (docs/debug-tooling-plan.md "Access model"; mode 3 added for the
+	// GPU streaming programme). AVoxelEarthPlayerController's F3 binding
+	// cycles 0->1->2->3->0 via CycleDebugMode.
+	//
+	// MODE 3 IS DELIBERATELY NOT "MODE 2 PLUS MORE". It is the panel the owner
+	// reads WHILE FLYING at 30 m/s, judging whether the streaming pipeline
+	// keeps up -- so it must not drag in the mode-2 3D layers (chunk-state
+	// tints, bounds wireframes), whose per-chunk component walk is exactly the
+	// kind of game-thread cost that would perturb the number being read. The
+	// layer helpers below therefore gate on == 2, not >= 2.
 	VOXELEARTH_API int32 GetDebugMode();
 	VOXELEARTH_API void SetDebugMode(int32 NewMode);
 	VOXELEARTH_API void CycleDebugMode();
 
+	// voxel.GpuStream.Prototype: the one-switch arm for the GPU streaming
+	// shakedown (see the cvar's declaration in VoxelDebug.cpp for the list of
+	// cvar names it arms by name). Non-zero = armed. Read by the HUD so the
+	// panel can say it was armed this way.
+	VOXELEARTH_API int32 GetGpuStreamPrototype();
+
 	// Layer toggles (voxel.Debug.ChunkStates / voxel.Debug.Bounds): only
-	// visually active when GetDebugMode() >= 2, matching the "all live under
+	// visually active when GetDebugMode() == 2, matching the "all live under
 	// mode 2" access-model row -- both helpers already fold that mode check
 	// in, so call sites never need to check GetDebugMode() themselves.
+	// (== 2, not >= 2: mode 3 is the flight-readable streaming panel and must
+	// not silently arm the 3D layers -- see the mode comment above.)
 	VOXELEARTH_API bool IsChunkStatesEnabled();
 	VOXELEARTH_API bool IsBoundsEnabled();
 
@@ -651,3 +667,89 @@ struct FVoxelWaterPerfSnapshot
 	// same convention as FVoxelPerfSnapshot::SubsystemTickMs.
 	float TickMs = 0.f;
 };
+
+// --- GPU streaming panel (voxel.Debug 3) ------------------------------------
+//
+// Published at 1 Hz by FVoxelWorldImpl::UpdatePerfSnapshot alongside
+// FVoxelPerfSnapshot (same cadence, same doctrine: plain POD, no vxc:: types),
+// read by AVoxelEarthHUD's mode-3 streaming panel. Everything in here is a
+// read of counters that already exist -- the brick pool's add/eviction
+// counters, the subsystem's job bookkeeping -- so filling it costs a handful
+// of atomic loads once a second, not a walk.
+//
+// WHY THROUGHPUT IS POOL ADDS AND NOT THE CPU PACK COUNT. The 6,200/s floor
+// was derived for chunks entering ring 0 (docs/marcher-handoff-2026-08-22.md:
+// 30 m/s x 750 columns/s x 8.3 chunks/column), and a chunk only exists for the
+// marcher when it becomes RESIDENT IN THE POOL. FVoxelBrickPool::
+// GetChunksAdded() counts exactly that, from BOTH producer arms; the CPU pack
+// counter (VoxelBrickGetCpuPackCount) counts only the CPU arm, so it reads
+// ~equal today (adds 82,653 vs packs 82,749 on the measured leg -- the gap is
+// refused/discarded packs) and would read ~ZERO once the GPU path carries the
+// traffic, which is precisely when the owner will be looking at this panel.
+// One counter family serves throughput AND the producer split, so the two rows
+// cannot disagree about what a "chunk" is.
+struct FVoxelStreamPanelSnapshot
+{
+	// False until the first 1 Hz publish after the panel's data source went
+	// live. The HUD prints "collecting..." rather than zeros while false --
+	// this project has retracted two findings in one session because an
+	// instrument read zero and was believed to be "working, value zero".
+	bool bValid = false;
+
+	// --- Throughput (window = the ~1 s between publishes) -------------------
+	float ChunksPerSec = 0.f;      // pool adds/s, both arms
+	float ChunksPerSecPeak = 0.f;  // max 1 Hz window over the last ~30 s
+	int64 ChunksAddedTotal = 0;    // cumulative pool adds since startup
+
+	// --- Producer split -----------------------------------------------------
+	// Window deltas and cumulative totals of the same GetChunksAdded family.
+	// gpu + cpu == the window's adds, by construction.
+	int64 WindowAddsGpu = 0;
+	int64 WindowAddsCpu = 0;
+	int64 TotalAddsGpu = 0;
+	int64 TotalAddsCpu = 0;
+	// VoxelGpuBrickPackEnabled() at publish time: false means the GPU arm is
+	// switched OFF, so the HUD prints "arm off" instead of a 0% that would
+	// read as a broken pipeline.
+	bool bGpuArmEnabled = false;
+
+	// --- Brick pool ---------------------------------------------------------
+	int32 PoolResidentChunks = 0;
+	uint32 PoolChunkCapacity = 0;   // FVoxelBrickPoolConfig::ChunkCapacity
+	uint64 PoolResidentBytes = 0;   // format accounting, not VRAM commit
+	int64 PoolEvictions = 0;        // the stated gate is that this STAYS 0
+	int64 PoolAllocFailures = 0;    // adds refused even after eviction
+
+	// --- Queue health -------------------------------------------------------
+	int32 PendingJobs = 0;          // admission queue, all rings
+	int32 CpuJobsInFlight = 0;      // worker jobs minus GPU-pending (the
+	                                // dispatch loop's own CpuJobsOutstanding)
+	int32 CpuJobsCap = 0;           // JobsInFlightPerCore x logical cores --
+	                                // the REAL cap (the old snapshot printed a
+	                                // stale 2 x cores against a real 8 x)
+	int32 GpuDemandInFlight = 0;    // GpuJobsPending, non-speculative
+	int32 GpuSpecInFlight = 0;      // GpuJobsPending, speculative
+	int32 GpuInFlightCap = 0;       // VoxelStreamAdmission::GpuMeshInFlight()
+	int32 SpecInFlightCap = 0;      // voxel.Stream.SpeculativeMaxInFlight
+
+	// --- Dispatch-loop exit split (window counts) ---------------------------
+	// Every streaming tick the dispatch loop ends ONE of two ways: the
+	// in-flight cap filled (exitCap -- the workers are the limiter) or every
+	// ring's queue drained (exitEmpty -- the dispatcher/admission side is the
+	// limiter, or there is simply no work). The ratio is what says WHICH HALF
+	// of the pipeline to blame when chunks/s is under the floor.
+	int32 DispatchExitCap = 0;
+	int32 DispatchExitEmpty = 0;
+};
+
+namespace VoxelDebug
+{
+	// The floor the throughput row is judged against: 6,200 level-0 chunks/s.
+	// Derived, not chosen -- at the owner's 30 m/s flight speed, new ground
+	// enters ring 0 at 2 x R x v = 7,680 m^2/s, which is 750 columns/s at
+	// 10.24 m^2 per column, at 8.3 level-0 chunks per column
+	// (docs/marcher-handoff-2026-08-22.md section 1). Measured 968-2,435/s the
+	// day the floor was written down, i.e. a 3-6x shortfall; the panel's whole
+	// job is to show where that number is now without anyone doing arithmetic.
+	inline constexpr float kGpuStreamChunksPerSecFloor = 6200.f;
+}
