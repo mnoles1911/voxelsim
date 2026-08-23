@@ -292,6 +292,13 @@ FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChun
                                               FSampleParamsFn SampleParams,
                                               FShadingFromFn ShadingFrom);
 
+// The dispatch site's out-of-line entry point: same cache, guard unreachable.
+// See its definition for the reqHdr measurement that justified wiring it.
+FVoxelBrickChunkShading ShadingForDispatchSlow(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                               const USceneComponent& Root,
+                                               FSampleParamsFn SampleParams,
+                                               FShadingFromFn ShadingFrom);
+
 // THE ONE EXPRESSION THE HOOK REPLACES.
 //
 // Returns what VoxelBrickCpuArm::Publish should be handed for this result. The
@@ -317,6 +324,24 @@ FORCEINLINE FVoxelBrickChunkShading ShadingForPublish(const VoxelCoords::FVoxelL
 			Root, VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level), Key.Level));
 	}
 	return ShadingForPublishSlow(Key, Pack, Root, SampleParams, ShadingFrom);
+}
+
+// Dispatch-site twin of ShadingForPublish, and OFF IS FREE HERE FOR THE SAME
+// REASON: with the switch absent this folds to the exact expression it
+// replaced, so no branch survives, no counter moves, and a control leg prints
+// no 'Voxel apply fast' line at all. There is no pack at this site and the
+// result is always consumed, so there is no guard arm to select.
+FORCEINLINE FVoxelBrickChunkShading ShadingForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                                       const USceneComponent& Root,
+                                                       FSampleParamsFn SampleParams,
+                                                       FShadingFromFn ShadingFrom)
+{
+	if (Mode() == 0)
+	{
+		return ShadingFrom(SampleParams(
+			Root, VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level), Key.Level));
+	}
+	return ShadingForDispatchSlow(Key, Root, SampleParams, ShadingFrom);
 }
 
 // Emit the 5 s window line now and reset it, whatever the clock says.

@@ -162,6 +162,65 @@ constexpr float kSurfaceSentinelCeiling = -1.0e29f;
 
 } // namespace
 
+// Forward declaration: both public entry points below are thin wrappers over
+// this, and it is DEFINED further down beside the cache it drives. Declared
+// here rather than moved, so the cache body stays next to the slot layout and
+// the audit it belongs to.
+static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                           const FVoxelBrickCpuPackRef& Pack,
+                                           const USceneComponent& Root,
+                                           FSampleParamsFn SampleParams,
+                                           FShadingFromFn ShadingFrom,
+                                           bool bAllowGuard);
+
+FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                              const FVoxelBrickCpuPackRef& Pack,
+                                              const USceneComponent& Root,
+                                              FSampleParamsFn SampleParams,
+                                              FShadingFromFn ShadingFrom)
+{
+	return ShadingImpl(Key, Pack, Root, SampleParams, ShadingFrom, /*bAllowGuard*/ true);
+}
+
+// THE DIRECT CACHE-ENTRY API the dispatch site's own comment asks for.
+//
+// SubmitGpuMeshJob CONSUMES the shading it builds, so the publish guard must be
+// unreachable here -- previously that was arranged by disengaging VoxelApplyFast
+// entirely whenever the guard bit was set, which meant the shipping mode (3) ran
+// the raw four-column expression at this site while caching it at the other one.
+//
+// WHY IT MATTERS MORE HERE THAN AT THE DRAIN SITE, measured 2026-08-23 on
+// q-a1024.log (per-tick apply cap raised to 1024, so apply stopped being the
+// bound and this site became it):
+//
+//   window   dispatch ms   submit ms   reqHdr ms   calls   perCallUs
+//        2         412.4       339.6       299.5   15998        21.2
+//        4         850.3       811.1       753.7    8756        92.6
+//        6         854.3       825.0       658.3    4496       183.5
+//
+// reqHdr is footprint/seed/shading/skirt, and the shading is four
+// GetSurfaceHeightUU calls that each take the FINE-TIER SAMPLER LOCK
+// EXCLUSIVELY and run a full vxc::Amplifier::column on the game thread. As
+// throughput rises, CPU worker jobs contend for that same lock and the per-call
+// cost goes 21 us -> 183 us. Dispatch then consumed the entire game-thread tick
+// (2,456 ms of a 2,000 ms window) and the tick rate collapsed from ~50 Hz to
+// ~3 Hz. The apply-fast brief predicted this number ("under sampler-lock
+// contention it read 328 us/call") and said to read reqHdr off a leg before
+// applying this hook. This is that reading.
+//
+// FAILING READING: cacheHit ~= 0 at this site with cacheMiss ~= calls means the
+// dispatch population has no column reuse -- one entry per chunk, not per
+// column -- and this hook is pure loss. Read it on the 'Voxel apply fast' line
+// with the drain site's traffic, since both feed the same table.
+FVoxelBrickChunkShading ShadingForDispatchSlow(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                               const USceneComponent& Root,
+                                               FSampleParamsFn SampleParams,
+                                               FShadingFromFn ShadingFrom)
+{
+	return ShadingImpl(Key, FVoxelBrickCpuPackRef(), Root, SampleParams, ShadingFrom,
+	                   /*bAllowGuard*/ false);
+}
+
 void FlushStats(bool bForce)
 {
 	const double Now = FPlatformTime::Seconds();
@@ -229,11 +288,18 @@ void FlushStats(bool bForce)
 	LastLogSeconds = Now;
 }
 
-FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChunkKey& Key,
-                                              const FVoxelBrickCpuPackRef& Pack,
-                                              const USceneComponent& Root,
-                                              FSampleParamsFn SampleParams,
-                                              FShadingFromFn ShadingFrom)
+// The shared body. bAllowGuard is the ONLY difference between the two public
+// entry points: at the drain site the pack decides whether anything consumes
+// the result, and at the dispatch site the result is always consumed, so the
+// guard must not be reachable there at all. Passing that as a parameter keeps
+// ONE implementation of the cache -- a second transcription of the slot key or
+// the Z rebase is the defect shape this module was written to avoid.
+static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                           const FVoxelBrickCpuPackRef& Pack,
+                                           const USceneComponent& Root,
+                                           FSampleParamsFn SampleParams,
+                                           FShadingFromFn ShadingFrom,
+                                           bool bAllowGuard)
 {
 	const int32 M = Mode();
 	const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
@@ -286,7 +352,7 @@ FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChun
 	// for EVERY drained result (the fork publishes its bricks at completion),
 	// and the four amplifier columns were being computed and discarded 12,700
 	// times per 5 s window.
-	if ((M & kModeGuard) && !WillPublish(Pack))
+	if (bAllowGuard && (M & kModeGuard) && !WillPublish(Pack))
 	{
 		++GuardSkipped;
 		if (Pack.IsValid())

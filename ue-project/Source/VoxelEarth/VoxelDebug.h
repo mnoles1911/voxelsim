@@ -306,6 +306,12 @@ namespace VoxelDebug
 	// applies a small floor for progress, then drains while under this budget up
 	// to GetStreamMaxAppliesPerFrame.
 	VOXELEARTH_API float GetStreamApplyBudgetMs();
+	// Shipped cvar values, bypassing the -VoxelApplyPerTick / -VoxelApplyBudgetMs
+	// overrides; for the armed-indicator line only.
+	VOXELEARTH_API int32 GetStreamMaxAppliesPerFrameCvar();
+	VOXELEARTH_API float GetStreamApplyBudgetMsCvar();
+	// DrainResults' third per-tick ceiling (-VoxelApplyDrainCap=, default 1024).
+	VOXELEARTH_API int32 GetStreamDrainCapPerFrame();
 
 	// voxel.Stream.LodRetentionMs: load-before-unload grace (2026-07-24 pass).
 	// A visible chunk evicted by an LOD-ring transition is kept drawn as a

@@ -167,6 +167,10 @@ VoxelZstdDll
 # OFF and the switch became VoxelGpuMesh (the enable arm).
 VoxelAsyncAssetResolve
 VoxelAsyncAssetResolveWarm
+VoxelApplyBudgetMs
+VoxelApplyDrainCap
+VoxelApplyPerTick
+VoxelBandSeedCpu
 VoxelBrickPack
 VoxelBrickPackOnCpu
 VoxelBrickPoolChunks
