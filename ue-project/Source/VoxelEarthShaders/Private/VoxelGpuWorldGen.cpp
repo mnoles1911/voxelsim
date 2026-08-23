@@ -491,84 +491,7 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
-	// --- PackWorklistMain: the converted Pack stage (P3 stage 5) ------------
-	//
-	// One indirect dispatch per tick (64 groups per record, one group per
-	// brick -- the classic pack shape, the payload assembly is groupshared),
-	// reading the cell arena + the classify stage's offset arenas and
-	// writing the five pack arenas -- VoxelWorklistPack.usf has the whole
-	// argument, including the desc-vs-word base split that keeps descriptor
-	// offsets CHUNK-RELATIVE. Brickpack family: FVoxelBrickPackShader base.
-	class FVoxelWorklistPackCS : public FVoxelBrickPackShader
-	{
-	public:
-		DECLARE_GLOBAL_SHADER(FVoxelWorklistPackCS);
-		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistPackCS, FVoxelBrickPackShader);
 
-		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-			VOXEL_BRICKPACK_LOOSE_PARAMETERS()
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl)
-			SHADER_PARAMETER(uint32, RingCapacity)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCells)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOccOffsets)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickMatOffsets)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickOcc)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickMat)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickSkip)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkBrickMask)
-			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
-		END_SHADER_PARAMETER_STRUCT()
-
-		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
-		                                         FShaderCompilerEnvironment& OutEnvironment)
-		{
-			FVoxelBrickPackShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_PACK_GROUPS"),
-			                         FVoxelGpuWorklist::kPackGroupsPerRecord);
-			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_BRICKS_PER_RECORD"),
-			                         FVoxelGpuWorklist::kBricksPerRecord);
-			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_CELLS_PER_RECORD"),
-			                         FVoxelGpuWorklist::kCellsPerRecord);
-			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_MATWORDS_PER_RECORD"),
-			                         FVoxelGpuWorklist::kMatWordsPerRecord);
-		}
-	};
-
-	// PackWorklistVerifyMain (-VoxelGpuWorklistVerifyPack): converted desc +
-	// bounded word ranges + chunk mask vs the classic pack, into stats
-	// [12..13]. One 64-thread group per verified chunk, verify arm only.
-	class FVoxelWorklistPackVerifyCS : public FVoxelBrickPackShader
-	{
-	public:
-		DECLARE_GLOBAL_SHADER(FVoxelWorklistPackVerifyCS);
-		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistPackVerifyCS, FVoxelBrickPackShader);
-
-		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, VerifyClassicDesc)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicOcc)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicMat)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicMask)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, VerifyArenaDesc)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaOcc)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaMat)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaMask)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyTotals)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
-			SHADER_PARAMETER(uint32, VerifyDescBase)
-			SHADER_PARAMETER(uint32, VerifyOccBase)
-			SHADER_PARAMETER(uint32, VerifyMatBase)
-			SHADER_PARAMETER(uint32, VerifyMaskBase)
-			SHADER_PARAMETER(uint32, VerifyTotalsBase)
-		END_SHADER_PARAMETER_STRUCT()
-
-		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
-		                                         FShaderCompilerEnvironment& OutEnvironment)
-		{
-			FVoxelWorklistPackCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-		}
-	};
 
 	// --- AssetStampWorklistMain: the order-preserving gather (P3 stage 4) ---
 	//
@@ -789,6 +712,93 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickMatCounts)
 		END_SHADER_PARAMETER_STRUCT()
 	};
+
+	// --- PackWorklistMain: the converted Pack stage (P3 stage 5) ------------
+	//
+	// One indirect dispatch per tick (64 groups per record, one group per
+	// brick -- the classic pack shape, the payload assembly is groupshared),
+	// reading the cell arena + the classify stage's offset arenas and
+	// writing the five pack arenas -- VoxelWorklistPack.usf has the whole
+	// argument, including the desc-vs-word base split that keeps descriptor
+	// offsets CHUNK-RELATIVE. Brickpack family: FVoxelBrickPackShader base.
+	class FVoxelWorklistPackCS : public FVoxelBrickPackShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistPackCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistPackCS, FVoxelBrickPackShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICKPACK_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl)
+			SHADER_PARAMETER(uint32, RingCapacity)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCells)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOccOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickMatOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickMat)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickSkip)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkBrickMask)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FVoxelBrickPackShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_PACK_GROUPS"),
+			                         FVoxelGpuWorklist::kPackGroupsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_BRICKS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kBricksPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_CELLS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kCellsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_MATWORDS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kMatWordsPerRecord);
+		}
+	};
+
+	// PackWorklistVerifyMain (-VoxelGpuWorklistVerifyPack): converted desc +
+	// bounded word ranges + chunk mask vs the classic pack, into stats
+	// [12..13]. One 64-thread group per verified chunk, verify arm only.
+	class FVoxelWorklistPackVerifyCS : public FVoxelBrickPackShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistPackVerifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistPackVerifyCS, FVoxelBrickPackShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, VerifyClassicDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicMat)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicMask)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, VerifyArenaDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaMat)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaMask)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyTotals)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
+			SHADER_PARAMETER(uint32, VerifyDescBase)
+			SHADER_PARAMETER(uint32, VerifyOccBase)
+			SHADER_PARAMETER(uint32, VerifyMatBase)
+			SHADER_PARAMETER(uint32, VerifyMaskBase)
+			SHADER_PARAMETER(uint32, VerifyTotalsBase)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FVoxelWorklistPackCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		}
+	};
+	// MOVED HERE FROM ABOVE THE BRICKPACK BLOCK. This derives from
+	// FVoxelBrickPackShader and uses VOXEL_BRICKPACK_LOOSE_PARAMETERS(), both
+	// declared further down this file -- at its original position the base was
+	// an incomplete type and MSVC reported it as a cascade starting with
+	//   error C2504: FVoxelBrickPackShader: base class undefined
+	// which names the symbol but not the ordering that caused it.
+
+
 
 	class FVoxelBrickPackCS : public FVoxelBrickPackShader
 	{
