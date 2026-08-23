@@ -49,4 +49,25 @@ for f in "$@"; do
   #   but cycPerColumn unmoved     cost; distrust the whole leg.
   b3=$(grep -o "assets RESOLVE (B\.3): .*" "$log" | tail -1)
   if [ -n "$b3" ]; then printf "%-18s   %s\n" "" "$b3"; fi
+  # P3 worklist spine (-VoxelGpuWorklist). The window line prints only when
+  # something happened (armed-and-idle stays quiet), so tail -1 is the last
+  # ACTIVE window, not the linger trap this script exists for. skips= and
+  # proof counters inside the line are cumulative; passes/tick and records
+  # are windowed. Absent on a control leg by design -- an armed leg with no
+  # line here promoted no jobs at all.
+  #
+  # FAILING READINGS (the full list is on MaybeLogWorklistWindow):
+  #   proofFAILs > 0 or identity DRIFT -> the leg is INVALID, full stop.
+  #   appended=0 with chunks flowing   -> spine carries no traffic; read the
+  #                                       skips= reasons for which gate.
+  #   proof landed=0 with consumption  -> GPU consumption UNVERIFIED; treat
+  #                                       the spine as dead, not as quiet.
+  wl=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" | tail -1)
+  if [ -n "$wl" ]; then
+    printf "%-18s   %s\n" "" "$wl"
+    wlfails=$(grep -c "\[gpu-worklist\] proof .* FAIL" "$log")
+    if [ "$wlfails" -gt 0 ]; then
+      printf "%-18s   worklist: %s PROOF FAILURES -- LEG INVALID\n" "" "$wlfails"
+    fi
+  fi
 done
