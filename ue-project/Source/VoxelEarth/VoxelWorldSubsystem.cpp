@@ -15,6 +15,7 @@
 #include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
 #include "VoxelResidencyGpu.h"     // T4-2: GPU-resident residency shadow (docs/gpu-residency-t42-plan.md)
 #include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
+#include "VoxelRasterAtlas.h"       // A: the persistent GPU raster atlas (-VoxelGpuRasterAtlas)
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
@@ -2224,16 +2225,20 @@ namespace VoxelBrickCpuArm
 	// (VoxelGpuMeshJobManager's BrickKey block) because a brick chunk and a render
 	// chunk are the same 32-voxel cube -- if these two ever disagree, one arm
 	// overwrites the other's chunk under the other's key, which is a wrong world
-	// with no error anywhere. Level is clamped to 0..5 exactly as the fork clamps
-	// it, and VoxelCoords::kNumLevels is 6, so the clamp is exact rather than a
-	// collision.
+	// with no error anywhere. The clamp tracks kNumLevels-1 -- it was a literal
+	// 5 from the six-level world, and when kNumLevels went to 7 (2026-08-23,
+	// the 8.19 km ring) that literal silently turned every level-6 key into a
+	// level-5 one: under -VoxelMaxRingLevel=6 the fork's level-6 chunk would
+	// OVERWRITE the real level-5 chunk at the same coordinates -- exactly the
+	// wrong-world-no-error collision this comment warns about, from the clamp
+	// meant to prevent it.
 	inline FVoxelBrickChunkKey MakeKey(const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
 	{
 		FVoxelBrickChunkKey Key;
 		Key.X = LevelKey.Key.X;
 		Key.Y = LevelKey.Key.Y;
 		Key.Z = LevelKey.Key.Z;
-		Key.Level = FMath::Clamp(LevelKey.Level, 0, 5);
+		Key.Level = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
 		return Key;
 	}
 
@@ -4598,6 +4603,13 @@ struct FVoxelWorldImpl
 	// FineStreamer -> Voxels is the only order in which all three are valid.
 	TUniquePtr<FVoxelFineTileStreamer> FineStreamer;
 
+	// A (-VoxelGpuRasterAtlas): the persistent GPU raster atlas. Created
+	// lazily on the first streaming tick with the switch latched on, because
+	// it needs ActiveTiles()' pitch and the ring presets, both fixed by then
+	// for the whole session. Declared after FineStreamer because Tick() and
+	// the page fills borrow the sampler FineStreamer may own.
+	TUniquePtr<FVoxelRasterAtlasCpu> RasterAtlas;
+
 	// THE ASSET TERM (worldgen v24/v25), and it is DECLARED HERE FOR THE SAME
 	// REASON THE Tiles/FineStreamer/Voxels ORDER ABOVE IS LOAD-BEARING.
 	//
@@ -4743,7 +4755,11 @@ struct FVoxelWorldImpl
 		// span the whole level-0 footprint beneath it -- a corner sub-chunk
 		// check would let the GPU fork take a coarse chunk whose OTHER corner
 		// holds a forest.
-		const int64 ChunkVox = int64(VoxelCoords::ChunkEdgeVoxels) << FMath::Clamp(Level, 0, 5);
+		// Clamp tracks kNumLevels-1 (was a literal 5): at level 6 the stale
+		// literal spanned HALF the footprint, so the shortlist missed any forest
+		// in the other half -- assets absent with no error, only at ring 6.
+		const int64 ChunkVox = int64(VoxelCoords::ChunkEdgeVoxels)
+		                     << FMath::Clamp(Level, 0, VoxelCoords::kNumLevels - 1);
 		const vxc::AssetVoxelRect Rect{int64(ChunkX) * ChunkVox, int64(ChunkY) * ChunkVox,
 		                               int64(ChunkX) * ChunkVox + ChunkVox - 1,
 		                               int64(ChunkY) * ChunkVox + ChunkVox - 1};
@@ -7612,6 +7628,29 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		double T3 = 0.0;
 		double T3b = 0.0;
 		{
+		// A: raster-atlas maintenance BEFORE DispatchJobs, unconditionally
+		// ahead of the batch scope. Two reasons, both load-bearing:
+		//   * ORDERING. Page fills flush to the render thread as a command; a
+		//     dispatch this tick submits is a later command; commands run in
+		//     enqueue order. That is the entire guarantee behind
+		//     PrepareRequest's host-mirror residency answer.
+		//   * ACCOUNTING. The fill time lands inside the tick bracket like the
+		//     FillRasterWindow cost it replaces, so the A/B reads the same
+		//     buckets on both arms rather than moving cost somewhere unmetered.
+		if (FVoxelRasterAtlasCpu::Enabled())
+		{
+			if (!RasterAtlas.IsValid())
+			{
+				RasterAtlas = MakeUnique<FVoxelRasterAtlasCpu>();
+				const int32 MaxRing = UVoxelWorldSubsystem::GetMaxRingLevel();
+				const double OuterMeters = UVoxelWorldSubsystem::GetRingPresets()[MaxRing].OuterMeters;
+				RasterAtlas->Init(ActiveTiles().pixelSizeMm(),
+				                  int64(OuterMeters * 1000.0), MaxRing);
+			}
+			// Anchor is UU (cm); the raster lives in mm.
+			RasterAtlas->Tick(ActiveTiles(), int64(Anchor.X) * 10, int64(Anchor.Y) * 10);
+		}
+
 		T0 = FPlatformTime::Seconds();
 		// THE BATCH SCOPE STARTS HERE, NOT BELOW, AND T4-1 IS WHY.
 		//
@@ -8104,6 +8143,15 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 	// already-suspended cases itself. Guarded on GIsRHIInitialized because a
 	// -nullrhi / commandlet run has no render thread to flush and no RHI
 	// resources to leak.
+	// A: release the raster atlas' pooled buffers before the flush below, so
+	// the release command is inside the flush window rather than queued after
+	// it -- the same leaked-release shape the comment above records for the
+	// quad payloads.
+	if (RasterAtlas.IsValid())
+	{
+		RasterAtlas->Shutdown();
+	}
+
 	if (GIsRHIInitialized)
 	{
 		const double FlushT0 = FPlatformTime::Seconds();
@@ -15363,7 +15411,19 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// seam or a pop -- the two pitches make two entirely different worlds, and
 	// which one a chunk got would depend on whether it happened to take the GPU
 	// fork. See FVoxelWorldImpl::ActiveTiles' comment.
-	VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
+	//
+	// A (-VoxelGpuRasterAtlas): PrepareRequest runs the SAME window rule as a
+	// coverage check against the resident atlas and arms the request with NO
+	// window at all -- ~46 KB of game-thread sampling becomes ~64 bytes of
+	// constants. A decline (cold page, pitch fault) falls through to the
+	// inline fill below, which stays correct in every state; the decline is
+	// counted on the [raster-atlas] window line, and a leg where
+	// inlineFallback does not fall toward zero after warmup is measuring the
+	// control path wearing the atlas flag -- read it as NOT MEASURED.
+	if (!RasterAtlas.IsValid() || !RasterAtlas->PrepareRequest(Req))
+	{
+		VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
+	}
 
 	// --- Asset compose: stamp this chunk's terrain instances on the GPU ------
 	//

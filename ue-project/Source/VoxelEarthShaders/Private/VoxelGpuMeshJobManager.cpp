@@ -610,7 +610,11 @@ bool VoxelGpuChunkRegion::MakeBrickRegion(const FVoxelGpuRegionRequest& MeshReq,
 	// by one brick of LEVEL-L cells -- i.e. 8 << CoarseLevel level-0 voxels,
 	// because AnchorRelVx is in level-0 voxel units relative to OriginVx * 2^L.
 	// AnchorVz is absolute and does not move.
-	const int32 AnchorShift = int32(kBrickEdge) << FMath::Clamp(MeshReq.CoarseLevel, 0, 5);
+	// Ceiling 6, mirroring FillLooseParameters' CoarseScale clamp: the stale
+	// literal 5 halved the shift at level 6, displacing every asset anchor in
+	// a ring-6 brick region by 8x32 level-0 voxels -- plausible trees, wrong
+	// places, no error.
+	const int32 AnchorShift = int32(kBrickEdge) << FMath::Clamp(MeshReq.CoarseLevel, 0, 6);
 	for (FVoxelGpuRegionRequest::FAssetInstance& Inst : OutReq.AssetInstances)
 	{
 		Inst.AnchorRelVx -= AnchorShift;
@@ -1375,7 +1379,11 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 		Job->BrickKey.X = Job->BrickRegion.OriginVx / int32(VoxelGpuChunkRegion::kChunkEdgeVoxels);
 		Job->BrickKey.Y = Job->BrickRegion.OriginVy / int32(VoxelGpuChunkRegion::kChunkEdgeVoxels);
 		Job->BrickKey.Z = Job->BrickRegion.BrickZMin / int32(VoxelGpuChunkRegion::kInteriorBricks);
-		Job->BrickKey.Level = FMath::Clamp(Job->BrickRegion.CoarseLevel, 0, 5);
+		// Ceiling 6 (was a stale literal 5 from the six-level world): a level-6
+		// brick region keyed as level 5 collides with the true level-5 chunk at
+		// the same coordinates -- one overwrites the other in the pool and the
+		// march index, a wrong world with no error anywhere.
+		Job->BrickKey.Level = FMath::Clamp(Job->BrickRegion.CoarseLevel, 0, 6);
 		// Latched with the key, from the same region, for the same reason: the
 		// record is written at completion and the game thread that sampled this
 		// is long gone by then.
@@ -1990,10 +1998,23 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 	// per-chunk dispatches -- the number the fusion exists to beat.
 	const int32 PerChunkEquivalent =
 		BatchStackChunks * VoxelGpuBatchDetail::kPassesPerClassicBrickJob;
+	// THE CROSSCHECK COLUMN MUST NOT READ AS A VERDICT IT DID NOT REACH. The
+	// pass/fail pair lives in the TOTALS-READBACK harvest path, and
+	// -VoxelGpuStackClaim deletes that readback by design -- so under
+	// stack-claim the pair is structurally zero forever. Tonight's sweep read
+	// "crosscheck 0 ok / 0 FAIL" on an armed leg as if it were a green gate;
+	// it was a gate that never ran. Print N/A and point at the gates that ARE
+	// live on that path (the claim kernel's in-GPU split check and the bitmap
+	// double-grant counter, both on the [brick-gpualloc] line) instead of a
+	// zero that reads as health.
+	const bool bClaimPath = VoxelGpuStackClaimEnabled() && VoxelGpuPoolAllocEnabled();
+	const FString CrossText = (bClaimPath && CrossPass == 0 && CrossFail == 0)
+		? FString(TEXT("N/A under StackClaim (no totals readback -- verdicts live on [brick-gpualloc]: claimFail + doubleGrant)"))
+		: FString::Printf(TEXT("%d ok / %d FAIL"), CrossPass, CrossFail);
 	UE_LOG(LogVoxelGpuMeshJob, Log,
 	       TEXT("[gpu-batch] %.1fs window: %d stacks / %d chunks (~%d passes, vs ~%d per-chunk); ")
 	       TEXT("classic %d jobs (~%d passes); fallbacks quadmesh %d band %d assets %d raster %d ")
-	       TEXT("single %d invalid %d; crosscheck %d ok / %d FAIL"),
+	       TEXT("single %d invalid %d; crosscheck %s"),
 	       Now - LastBatchLogSeconds, BatchStacks, BatchStackChunks, BatchStackPasses,
 	       PerChunkEquivalent, BatchClassicJobs, BatchClassicPasses,
 	       BatchFallbacks[uint8(EBatchFallback::QuadMesh)],
@@ -2002,7 +2023,7 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 	       BatchFallbacks[uint8(EBatchFallback::Mismatch)],
 	       BatchFallbacks[uint8(EBatchFallback::Single)],
 	       BatchFallbacks[uint8(EBatchFallback::Invalid)],
-	       CrossPass, CrossFail);
+	       *CrossText);
 
 	BatchStacks = 0;
 	BatchStackChunks = 0;

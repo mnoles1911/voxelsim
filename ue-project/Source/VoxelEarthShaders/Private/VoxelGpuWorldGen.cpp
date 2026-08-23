@@ -1,5 +1,6 @@
 #include "VoxelGpuWorldGen.h"
 #include "VoxelGpuWorldGenGraph.h"
+#include "VoxelRasterAtlasGpu.h"   // A: the persistent raster atlas the VXC_RASTER_ATLAS permutation samples
 
 #include "GlobalShader.h"
 #include "RenderGraphBuilder.h"
@@ -123,15 +124,31 @@ namespace
 		}
 	};
 
+	// A (raster atlas). One permutation bit, ONLY on the three kernels whose
+	// entry points can reach rasterElevationMm/rasterClimate (ColumnMain,
+	// VoxelizeMain via the cavern mirror, BandReduceMain via cavernColumnFor).
+	// The FALSE permutation preprocesses to the shipped text -- worldgen.ush's
+	// #else arm is the original accessors character for character -- so the
+	// pinned digest gate and the control arm compile the program that shipped.
+	class FRasterAtlasDim : SHADER_PERMUTATION_BOOL("VXC_RASTER_ATLAS");
+
+	// The atlas bindings those three kernels share under the TRUE permutation.
+	// Loose uints deliberately NOT in VOXEL_WORLDGEN_LOOSE_PARAMETERS: that
+	// block's 56-byte layout is static_asserted against the bench's cbuffer,
+	// and the bench never compiles the atlas.
+	#define VOXEL_RASTER_ATLAS_PARAMETERS() 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, AtlasElevationMm) 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, AtlasClimatePacked) 		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, AtlasPageTags) 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AtlasMissStats) 		SHADER_PARAMETER(uint32, AtlasPagePx) 		SHADER_PARAMETER(uint32, AtlasPagesDim)
+
 	// --- ColumnMain: one thread per column, full stratigraphy ---------------
 	class FVoxelColumnCS : public FVoxelWorldGenShader
 	{
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelColumnCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelColumnCS, FVoxelWorldGenShader);
+		using FPermutationDomain = TShaderPermutationDomain<FRasterAtlasDim>;
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			VOXEL_RASTER_ATLAS_PARAMETERS()
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ClimatePacked)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GpuColumnSample>, OutColumns)
@@ -144,9 +161,11 @@ namespace
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelVoxelizeCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelVoxelizeCS, FVoxelWorldGenShader);
+		using FPermutationDomain = TShaderPermutationDomain<FRasterAtlasDim>;
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			VOXEL_RASTER_ATLAS_PARAMETERS()
 			// Bound again because the cavern pass evaluates terrain height at
 			// a cave site's own xy, which is usually not a dispatch column.
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
@@ -918,9 +937,11 @@ namespace
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelBandReduceCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelBandReduceCS, FVoxelWorldGenShader);
+		using FPermutationDomain = TShaderPermutationDomain<FRasterAtlasDim>;
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			VOXEL_RASTER_ATLAS_PARAMETERS()
 			SHADER_PARAMETER(uint32, BandOriginI)
 			SHADER_PARAMETER(uint32, BandOriginJ)
 			SHADER_PARAMETER(uint32, BandEdge)
@@ -1043,6 +1064,19 @@ namespace
 		Out.SurfaceMip      = VoxelGpuWorldGen::SurfaceMipEnabled() ? 1u : 0u;
 	}
 
+	// A. Fills the atlas half of the three sampling kernels' parameters. The
+	// caller has already Register()ed the atlas into this graph.
+	template <typename TParams>
+	void FillRasterAtlasParameters(TParams& Out, const FVoxelRasterAtlasBindings& B)
+	{
+		Out.AtlasElevationMm = B.ElevationMm;
+		Out.AtlasClimatePacked = B.ClimatePacked;
+		Out.AtlasPageTags = B.PageTags;
+		Out.AtlasMissStats = B.MissStats;
+		Out.AtlasPagePx = B.PagePx;
+		Out.AtlasPagesDim = B.PagesDim;
+	}
+
 	// P1-C. The three scan passes, over whichever count array is handed in.
 	//
 	// THIS IS worldgen.ush's SCAN, UNMODIFIED, AND THAT IS THE POINT. It is a
@@ -1128,20 +1162,49 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		OutError = TEXT("BricksZ must be non-zero");
 		return false;
 	}
-	if (Req.RasterSize.X == 0 || Req.RasterSize.Y == 0)
+	if (Req.bRasterAtlas)
 	{
-		OutError = TEXT("RasterSize must be non-zero on both axes");
-		return false;
+		// A: the atlas form carries NO window. Half-and-half is refused rather
+		// than letting one source silently win -- a request that set the flag
+		// but also filled a window has two authorities for the same pixels, and
+		// whichever the kernel compiled against would look correct while the
+		// other went stale.
+		if (Req.RasterAtlas == nullptr || !Req.RasterAtlas->IsInitialized())
+		{
+			OutError = TEXT("bRasterAtlas without an initialized RasterAtlas");
+			return false;
+		}
+		if (Req.RasterSize.X != 0 || Req.RasterSize.Y != 0 ||
+		    Req.ElevationMm.Num() != 0 || Req.ClimatePacked.Num() != 0)
+		{
+			OutError = TEXT("bRasterAtlas with an inline window: two raster authorities on one request");
+			return false;
+		}
+		if (Req.PixelSizeMm <= 0)
+		{
+			// The one raster fact the atlas form still carries -- the kernels'
+			// mm->pixel divisions run on it exactly as before.
+			OutError = TEXT("bRasterAtlas with PixelSizeMm <= 0");
+			return false;
+		}
 	}
-
-	const uint64 Expected = uint64(Req.RasterSize.X) * uint64(Req.RasterSize.Y);
-	if (uint64(Req.ElevationMm.Num()) != Expected || uint64(Req.ClimatePacked.Num()) != Expected)
+	else
 	{
-		OutError = FString::Printf(
-			TEXT("Raster arrays do not match RasterSize %ux%u (=%llu): elevation=%d climate=%d"),
-			Req.RasterSize.X, Req.RasterSize.Y, Expected,
-			Req.ElevationMm.Num(), Req.ClimatePacked.Num());
-		return false;
+		if (Req.RasterSize.X == 0 || Req.RasterSize.Y == 0)
+		{
+			OutError = TEXT("RasterSize must be non-zero on both axes");
+			return false;
+		}
+
+		const uint64 Expected = uint64(Req.RasterSize.X) * uint64(Req.RasterSize.Y);
+		if (uint64(Req.ElevationMm.Num()) != Expected || uint64(Req.ClimatePacked.Num()) != Expected)
+		{
+			OutError = FString::Printf(
+				TEXT("Raster arrays do not match RasterSize %ux%u (=%llu): elevation=%d climate=%d"),
+				Req.RasterSize.X, Req.RasterSize.Y, Expected,
+				Req.ElevationMm.Num(), Req.ClimatePacked.Num());
+			return false;
+		}
 	}
 
 	// --- Wave D / D6: the band window ---------------------------------------
@@ -1429,15 +1492,32 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	const uint32 Cy = Request.DispatchColumns.Y;
 
 	// --- inputs -----------------------------------------------------
-	FRDGBufferRef ElevationBuffer = CreateStructuredBuffer(
-		GraphBuilder, TEXT("Voxel.ElevationMm"), sizeof(int32),
-		Request.ElevationMm.Num(), Request.ElevationMm.GetData(),
-		Request.ElevationMm.Num() * sizeof(int32));
+	//
+	// A: under bRasterAtlas there IS no per-request raster -- the sampling
+	// kernels read the persistent page torus registered below, and the two
+	// upload buffers are never created. Register is idempotent per graph
+	// (RDG FindExternalBuffer returns the existing handle), so a batch of N
+	// atlas jobs in one graph still registers one atlas.
+	const bool bAtlas = Request.bRasterAtlas;
+	FVoxelRasterAtlasBindings AtlasBindings;
+	FRDGBufferRef ElevationBuffer = nullptr;
+	FRDGBufferRef ClimateBuffer = nullptr;
+	if (bAtlas)
+	{
+		AtlasBindings = Request.RasterAtlas->Register(GraphBuilder);
+	}
+	else
+	{
+		ElevationBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.ElevationMm"), sizeof(int32),
+			Request.ElevationMm.Num(), Request.ElevationMm.GetData(),
+			Request.ElevationMm.Num() * sizeof(int32));
 
-	FRDGBufferRef ClimateBuffer = CreateStructuredBuffer(
-		GraphBuilder, TEXT("Voxel.ClimatePacked"), sizeof(uint32),
-		Request.ClimatePacked.Num(), Request.ClimatePacked.GetData(),
-		Request.ClimatePacked.Num() * sizeof(uint32));
+		ClimateBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.ClimatePacked"), sizeof(uint32),
+			Request.ClimatePacked.Num(), Request.ClimatePacked.GetData(),
+			Request.ClimatePacked.Num() * sizeof(uint32));
+	}
 
 	// --- outputs ----------------------------------------------------
 	Out.Columns = GraphBuilder.CreateBuffer(
@@ -1452,11 +1532,20 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	{
 		FVoxelColumnCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelColumnCS::FParameters>();
 		FillLooseParameters(*Params, Request);
-		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
-		Params->ClimatePacked = GraphBuilder.CreateSRV(ClimateBuffer);
+		if (bAtlas)
+		{
+			FillRasterAtlasParameters(*Params, AtlasBindings);
+		}
+		else
+		{
+			Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+			Params->ClimatePacked = GraphBuilder.CreateSRV(ClimateBuffer);
+		}
 		Params->OutColumns = GraphBuilder.CreateUAV(Out.Columns);
 
-		TShaderMapRef<FVoxelColumnCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FVoxelColumnCS::FPermutationDomain Permutation;
+		Permutation.Set<FRasterAtlasDim>(bAtlas);
+		TShaderMapRef<FVoxelColumnCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), Permutation);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder, RDG_EVENT_NAME("Voxel.ColumnMain"), Shader, Params,
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
@@ -1466,11 +1555,20 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	{
 		FVoxelVoxelizeCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelVoxelizeCS::FParameters>();
 		FillLooseParameters(*Params, Request);
-		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		if (bAtlas)
+		{
+			FillRasterAtlasParameters(*Params, AtlasBindings);
+		}
+		else
+		{
+			Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		}
 		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);
 		Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
 
-		TShaderMapRef<FVoxelVoxelizeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FVoxelVoxelizeCS::FPermutationDomain Permutation;
+		Permutation.Set<FRasterAtlasDim>(bAtlas);
+		TShaderMapRef<FVoxelVoxelizeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), Permutation);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder, RDG_EVENT_NAME("Voxel.VoxelizeMain"), Shader, Params,
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
@@ -1622,11 +1720,20 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		Params->BandOriginI = Request.BandOriginI;
 		Params->BandOriginJ = Request.BandOriginJ;
 		Params->BandEdge = Request.BandEdge;
-		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		if (bAtlas)
+		{
+			FillRasterAtlasParameters(*Params, AtlasBindings);
+		}
+		else
+		{
+			Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		}
 		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);
 		Params->OutBand = GraphBuilder.CreateUAV(Out.Band);
 
-		TShaderMapRef<FVoxelBandReduceCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FVoxelBandReduceCS::FPermutationDomain Permutation;
+		Permutation.Set<FRasterAtlasDim>(bAtlas);
+		TShaderMapRef<FVoxelBandReduceCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), Permutation);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder, RDG_EVENT_NAME("Voxel.BandReduceMain"), Shader, Params,
 			FIntVector(1, 1, 1));   // exactly one workgroup, by design

@@ -1,0 +1,109 @@
+// VoxelRasterAtlasUpsert.usf -- writes page payloads and tags into the
+// persistent elevation/climate raster atlas (worldgen.ush's VXC_RASTER_ATLAS
+// permutation reads it; docs/gpu-streaming-architecture.md, the FillRasterWindow
+// arithmetic blocker).
+//
+// WHY A SCATTER KERNEL AND NOT A LOCKED UPLOAD. Same reason as
+// VoxelMarchIndexScatter.usf, whose pattern this copies: the staged pages ride
+// a transient RDG buffer and are scattered into the persistent torus inside the
+// same graph machinery every reader uses, so RDG's barriers order the write
+// against any generation pass -- the ordering is the graph's, not luck. The
+// game thread additionally enqueues the upsert command BEFORE the job manager's
+// dispatch command in the same tick, so within a tick no region pass can run
+// ahead of the pages it was admitted against.
+//
+// THREE KERNELS, ONE ORDER, AND THE ORDER IS THE CORRECTNESS ARGUMENT:
+//   1. RasterAtlasInvalidateMain -- sentinel the tags of every leaving page.
+//   2. RasterAtlasPayloadMain    -- write the entering pages' pixels.
+//   3. RasterAtlasCommitMain     -- write the entering pages' tags LAST.
+// A reader (a later pass in this graph, or any pass in a later graph) that
+// sees a valid tag therefore sees the complete payload behind it, and a reader
+// mid-recentre sees a counted miss -- never a torn page. Tag-after-payload is
+// the whole reason the tag write is its own dispatch instead of thread 0 of
+// the payload pass.
+//
+// Payload layout mirrors worldgen.ush's atlasResolve exactly: slot-major,
+// slot = ty * AtlasPagesDim + tx, AtlasPagePx^2 elements per slot, row-major,
+// x fastest. The HOST computes each staged page's destination slot and packed
+// tag with the same floor-mod + bias arithmetic (FVoxelRasterAtlasCpu); this
+// file just moves dwords to the addresses it is handed -- like the index
+// scatter, it does not understand the encoding and must not.
+
+#include "/Engine/Public/Platform.ush"
+
+// Entering pages, 3 dwords per page: [slot, tag, payloadBase]. payloadBase is
+// the element offset of this page's pixels inside the two staged payload
+// buffers (both share one base: element i of the page is StagedElevation
+// [payloadBase+i] and StagedClimate[payloadBase+i]).
+StructuredBuffer<uint> UpsertPages;
+// Leaving pages, 1 dword per page: the torus slot to sentinel.
+StructuredBuffer<uint> InvalidateSlots;
+
+StructuredBuffer<int> StagedElevationMm;
+StructuredBuffer<uint> StagedClimatePacked;
+
+RWStructuredBuffer<int> AtlasElevationMmRW;
+RWStructuredBuffer<uint> AtlasClimatePackedRW;
+RWStructuredBuffer<uint> AtlasPageTagsRW;
+// Cleared (slot 0 and the four capture slots) by the invalidate pass of a
+// stats-window flush when the host asks -- see ClearMissStats.
+RWStructuredBuffer<uint> AtlasMissStatsRW;
+
+uint UpsertCount;      // entering pages
+uint InvalidateCount;  // leaving pages
+uint PixelsPerPage;    // AtlasPagePx * AtlasPagePx
+uint ClearMissStats;   // 1 = invalidate pass also zeroes AtlasMissStats[0..4]
+
+// One thread per leaving page, plus thread 0 optionally clearing the miss
+// stats -- both writes the payload/commit passes never touch, so no ordering
+// is needed inside this dispatch.
+[numthreads(64, 1, 1)]
+void RasterAtlasInvalidateMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x == 0u && ClearMissStats != 0u)
+	{
+		AtlasMissStatsRW[0] = 0u;
+		AtlasMissStatsRW[1] = 0u;
+		AtlasMissStatsRW[2] = 0u;
+		AtlasMissStatsRW[3] = 0u;
+		AtlasMissStatsRW[4] = 0u;
+	}
+	if (tid.x >= InvalidateCount)
+	{
+		return;
+	}
+	AtlasPageTagsRW[InvalidateSlots[tid.x]] = 0xffffffffu;
+}
+
+// One GROUP per page, 64 threads striding the page's pixels: 16,384 px/page at
+// the default 128-px page = 256 pixels per thread, coalesced (consecutive
+// threads hit consecutive elements each stride step).
+[numthreads(64, 1, 1)]
+void RasterAtlasPayloadMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+	if (gid.x >= UpsertCount)
+	{
+		return;
+	}
+	const uint slot = UpsertPages[gid.x * 3u + 0u];
+	const uint srcBase = UpsertPages[gid.x * 3u + 2u];
+	const uint dstBase = slot * PixelsPerPage;
+	for (uint i = gtid.x; i < PixelsPerPage; i += 64u)
+	{
+		AtlasElevationMmRW[dstBase + i] = StagedElevationMm[srcBase + i];
+		AtlasClimatePackedRW[dstBase + i] = StagedClimatePacked[srcBase + i];
+	}
+}
+
+// One thread per entering page. Runs as its own pass AFTER the payload pass so
+// RDG's UAV barrier sits between pixels and tag -- a valid tag proves a
+// complete page.
+[numthreads(64, 1, 1)]
+void RasterAtlasCommitMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x >= UpsertCount)
+	{
+		return;
+	}
+	AtlasPageTagsRW[UpsertPages[tid.x * 3u + 0u]] = UpsertPages[tid.x * 3u + 1u];
+}

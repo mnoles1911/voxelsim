@@ -21,6 +21,8 @@
 
 #include "CoreMinimal.h"
 
+class FVoxelRasterAtlasGpu;   // A: the persistent raster atlas (VoxelRasterAtlasGpu.h)
+
 // Mirror of GpuColumnSample in worldgen.ush — the per-column stratigraphy the
 // ColumnMain kernel writes. Field order and types must match the HLSL struct
 // exactly; the .cpp static_asserts the size.
@@ -67,6 +69,34 @@ struct FVoxelGpuRegionRequest
 	int32 PixelSizeMm = 30000;
 	TArray<int32> ElevationMm;      // RasterSize.x * RasterSize.y, x fastest
 	TArray<uint32> ClimatePacked;   // same layout; t | s<<8 | p<<16 | v<<24
+
+	// --- A: sample the persistent raster atlas instead of an inline window --
+	//
+	// With this set the request carries NO raster: the arrays above stay
+	// empty, RasterOriginPx/RasterSize stay zero, and the three sampling
+	// kernels compile with VXC_RASTER_ATLAS, reading elevation/climate by
+	// GLOBAL tile-pixel coordinate from the atlas' resident page torus. The
+	// per-chunk payload collapses from ~5,800 sampled pixels (~46 KB, ~94%
+	// identical to the lateral neighbour's window, 100% identical to a
+	// Z-sibling's) to the ~64 bytes of loose constants the request always
+	// carried. PixelSizeMm must still be the sampler's pitch -- it is the one
+	// raster fact the atlas form keeps, and the kernels' mm->pixel divisions
+	// run on it exactly as before.
+	//
+	// SIZING STOPS BEING THE CALLER'S JOB AND BECOMES A COVERAGE CHECK: the
+	// submit path derives the request's window from the SAME
+	// ComputeRasterWindowPx the inline fill uses and refuses to dispatch a
+	// request the resident atlas does not cover -- and an atlas tap that
+	// misses anyway does NOT clamp; it returns the documented missing-tile
+	// answer and counts into AtlasMissStats, which the atlas owner logs as a
+	// FAIL. ValidateRegionRequest refuses half-and-half forms rather than let
+	// two raster authorities coexist on one request.
+	//
+	// The pointer must outlive graph execution: production passes the
+	// process-lifetime atlas owned by FVoxelWorldImpl; the verify gate passes
+	// a scratch one it keeps alive through its own FlushRenderingCommands.
+	bool bRasterAtlas = false;
+	FVoxelRasterAtlasGpu* RasterAtlas = nullptr;
 
 	// Vertical extent of the voxelized stack, in bricks.
 	int32 BrickZMin = 0;
