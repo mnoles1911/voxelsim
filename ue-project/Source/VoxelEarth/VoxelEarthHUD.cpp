@@ -680,17 +680,23 @@ void AVoxelEarthHUD::DrawStreamPanel()
 			// The dispatch loop's exit split says which half is the limiter:
 			// every cap exit is a tick where the WORKERS were full, every
 			// empty exit a tick where the DISPATCHER ran out of admitted work.
-			const int32 Exits = Snap.DispatchExitCap + Snap.DispatchExitEmpty;
+			const int32 Exits = Snap.DispatchExitCap + Snap.DispatchExitEmpty + Snap.DispatchExitBacklog;
 			if (Exits <= 0)
 			{
 				AddRow(TEXT("Dispatch exits: none this window (streaming tick idle?)"), kStreamRowMuted);
 			}
 			else
 			{
+				// Backlog exits outrank the cap/empty verdict: they mean the
+				// dispatch-ahead gate paused the loop because APPLY is behind
+				// (see FVoxelStreamPanelSnapshot::DispatchExitBacklog) -- neither the
+				// workers nor admission is the limiter in that regime.
 				const double CapPct = 100.0 * double(Snap.DispatchExitCap) / double(Exits);
-				AddRow(FString::Printf(TEXT("Dispatch exits: cap %d / empty %d (%.0f%% cap)  -> %s"),
-				                       Snap.DispatchExitCap, Snap.DispatchExitEmpty, CapPct,
-				                       CapPct >= 60.0 ? TEXT("worker-limited")
+				const double BacklogPct = 100.0 * double(Snap.DispatchExitBacklog) / double(Exits);
+				AddRow(FString::Printf(TEXT("Dispatch exits: cap %d / empty %d / backlog %d (%.0f%% cap)  -> %s"),
+				                       Snap.DispatchExitCap, Snap.DispatchExitEmpty, Snap.DispatchExitBacklog, CapPct,
+				                       BacklogPct >= 40.0 ? TEXT("apply-limited")
+				                       : CapPct >= 60.0 ? TEXT("worker-limited")
 				                       : CapPct <= 40.0 ? TEXT("admission-limited") : TEXT("balanced")),
 				       kStreamRowNeutral);
 			}

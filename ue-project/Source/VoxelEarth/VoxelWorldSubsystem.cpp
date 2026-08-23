@@ -2702,6 +2702,56 @@ int32 GpuMeshQueueDepth()
 	return N;
 }
 
+// How far DISPATCH may run ahead of APPLY, counted in un-applied results
+// sitting on ResultsQueue. 0 = unbounded. Default 4096 under -VoxelGpuPrimary,
+// 0 otherwise; explicit -VoxelDispatchAheadCap=N outranks either way (same
+// sentinel pattern as -VoxelGpuBandSeedOnly: primary changes defaults, never
+// outranks an explicit flag).
+//
+// WHY THIS EXISTS (2026-08-23, gp-pri.log vs gp-ctl.log; the full attribution
+// is docs/measurements/gpu-primary-ring-order-2026-08-23.txt). Under primary
+// the fork does not consume the CPU worker budget and GpuJobsPending clears at
+// DELIVERY, so nothing anywhere bounded the gap between "generated" and
+// "resident": dispatch ran ~6x ahead of DrainResults' per-frame apply budget
+// ("Voxel job flow" read dispatched=21,901 vs drained=9,439 in one 5 s window,
+// decaying to dispatched=5,162 vs drained=81), and by t~22 s a ~90,000-result
+// backlog sat on the FIFO ResultsQueue. That queue is level-agnostic, so it is
+// a 25-30 s level-BLIND reorder buffer -- per-ring settle order became pure
+// submission order, and R0, whose dispatch is additionally serialized behind
+// band seeds whose results were stuck in the same backlog (bandCache frozen at
+// 908 for 24 s against the 5 s blind-mark age-out), went from settling FIRST
+// (9.3 s, control) to LAST (47.7 s). The control never needs this cap because
+// its CPU arm can only get ~288 jobs ahead of apply -- which is exactly why
+// pop order == settle order there, and the property this cap restores.
+//
+// 4096 ~= 1 s of apply at the control's measured 4,029/s -- large enough that
+// both producers (288 CPU + ~800 GPU in flight) never starve while the gate
+// cycles, small enough that a ring's settle trails its last dispatch by about
+// the control's own ~1.2 s (R0 dispatch done 8.1 s, settled 9.3 s), and
+// comfortably below the 5 s blind-job mark so a band seed's result drains
+// before its footprint re-seeds.
+//
+// THE FAILING READINGS, both directions: exitBacklog=0 on the dispatch-loop
+// line across a primary cold fill whose job-flow backlog= exceeds the cap
+// means the gate never evaluated (inert-feature trap); backlog= climbing past
+// the cap WITH exitBacklog>0 means a producer is enqueueing outside the two
+// counted sites and the counter leaks. Healthy: backlog= saw-toothing at the
+// cap during fill, exitBacklog>0 there, both ~0 at steady state.
+int32 DispatchAheadCap()
+{
+	static const int32 N = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelDispatchAheadCap="), Value);
+		if (Value < 0)
+		{
+			Value = VoxelGpuPrimaryEnabled() ? 4096 : 0;
+		}
+		return Value;
+	}();
+	return N;
+}
+
 // Highest chunk level the fork may take (D5).
 //
 // FIVE BY DEFAULT -- THE WHOLE CASCADE -- AND THAT IS A MEASUREMENT, NOT
@@ -6247,6 +6297,18 @@ struct FVoxelWorldImpl
 	int64 LevelSkySkippedTotal[VoxelCoords::kNumLevels] = {};
 
 	TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc> ResultsQueue;
+	// Current ResultsQueue depth: delivered-but-not-yet-applied results.
+	// Incremented immediately before BOTH Enqueue sites (the CPU worker task
+	// and OnGpuMeshJobComplete's demand path -- speculative results never
+	// enqueue and are never counted), decremented after every successful
+	// Dequeue in DrainResults (stale discards included: this counts QUEUE
+	// DEPTH, not live results). TQueue has no Num(), and JobsInFlightCounter
+	// cannot stand in for it -- that counter decrements AT enqueue, so it goes
+	// blind at exactly the boundary this one exists to watch. Read by the
+	// dispatch loop's dispatch-ahead gate (VoxelStreamAdmission::
+	// DispatchAheadCap -- the ~90k-backlog mechanism is documented there) and
+	// printed as backlog= on the job-flow window line.
+	FThreadSafeCounter ResultsBacklogCounter;
 	FThreadSafeCounter JobsInFlightCounter;
 	TArray<UE::Tasks::TTask<void>> InFlightTasks; // only for a clean Deinitialize() wait; see WaitForInFlightTasks
 	// -VoxelWorkerPool arm (see VoxelStreamAdmission::WorkerPoolThreads): the
@@ -7534,9 +7596,10 @@ struct FVoxelWorldImpl
 	// readings of the pipeline were consistent with every number ever logged,
 	// and nothing recorded which loop exit actually fired.
 	//
-	// The loop has exactly two exits. exitEmpty: every ring queue was drained
-	// (the 'break' at "nothing pending in any ring"). exitCap: the while
-	// condition CpuJobsOutstanding() < MaxJobsInFlight went false. The
+	// The loop had exactly two exits when this was written (a third,
+	// exitBacklog, is documented just below). exitEmpty: every ring queue was
+	// drained (the 'break' at "nothing pending in any ring"). exitCap: the
+	// while condition CpuJobsOutstanding() < MaxJobsInFlight went false. The
 	// competing readings: (a) "the loop drains every queue to empty each
 	// tick" -- true in the 2026-08-22 audit's configuration, where the GPU
 	// fork carried the load and CpuJobsOutstanding sat at 0; (b) "the cap now
@@ -7547,9 +7610,17 @@ struct FVoxelWorldImpl
 	// 'Voxel dispatch loop:' line settles it. cpuLaunched/gpuForked per
 	// window complete the picture: cpuLaunched pinned near
 	// passes x (cap - residual) is the batch quota showing itself.
+	// THREE exits since the dispatch-ahead gate (2026-08-23; it used to be
+	// exactly two, and the exitCap arithmetic below relied on that).
+	// exitBacklog: the un-applied results backlog reached
+	// VoxelStreamAdmission::DispatchAheadCap and the loop yielded -- dominant
+	// during a primary cold fill by design (that is the gate working), and a
+	// hard zero when the cap is 0 or apply keeps up. exitCap must now be read
+	// as passes - exitEmpty - exitBacklog.
 	int64 DispatchPassesSinceLog = 0;
 	int64 DispatchExitCapSinceLog = 0;
 	int64 DispatchExitEmptySinceLog = 0;
+	int64 DispatchExitBacklogSinceLog = 0;
 	int64 DispatchCpuLaunchedSinceLog = 0;
 	int64 DispatchGpuForkedSinceLog = 0;
 	// Sum of Result.JobMs over this window's drained CPU results (the same
@@ -8053,6 +8124,7 @@ struct FVoxelWorldImpl
 	// chunks/s sits under the 6,200 floor.
 	int32 DispatchExitCapSincePanel = 0;
 	int32 DispatchExitEmptySincePanel = 0;
+	int32 DispatchExitBacklogSincePanel = 0;
 
 	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() /
 	// IsRingsEnabled() so the off-transition can drop every component's MID
@@ -10419,14 +10491,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // worker; the tap, not the pipe, is the limit. wkPri echoes
 	       // -VoxelWorkerTaskPri so a leg self-describes (a priority arm that
 	       // silently failed to latch must be readable as such).
+	       // exitBacklog appended 2026-08-23 (END of line, old-leg-grep rule):
+	       // passes where the dispatch-ahead gate paused the loop because the
+	       // un-applied results backlog hit -VoxelDispatchAheadCap. The
+	       // reading pair for that gate lives on its accessor; the twin
+	       // backlog= column is on the job-flow line.
 	       TEXT("Voxel dispatch loop (5s window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
-	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d"),
+	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
 	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue(),
 	       AccumCpuWorkerJobMsSinceLog / 1000.0,
 	       ThisLogWindowSeconds > 0.f ? AccumCpuWorkerJobMsSinceLog / (1000.0 * ThisLogWindowSeconds) : 0.0,
-	       VoxelStreamAdmission::WorkerTaskPriority(), VoxelStreamAdmission::WorkerPoolThreads());
+	       VoxelStreamAdmission::WorkerTaskPriority(), VoxelStreamAdmission::WorkerPoolThreads(),
+	       (long long)DispatchExitBacklogSinceLog);
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
@@ -10460,6 +10538,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	DispatchPassesSinceLog = 0;
 	DispatchExitCapSinceLog = 0;
 	DispatchExitEmptySinceLog = 0;
+	DispatchExitBacklogSinceLog = 0;
 	DispatchCpuLaunchedSinceLog = 0;
 	DispatchGpuForkedSinceLog = 0;
 	AccumCpuWorkerJobMsSinceLog = 0.0;
@@ -10758,12 +10837,22 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		ThisLogWindowSeconds > 0.f ? double(ChunksLoadedThisWindow) / double(ThisLogWindowSeconds) : 0.0;
 	ChunksLoadedAtLastLog = TotalChunksLoaded;
 	UE_LOG(LogVoxelPerf, Log,
+	       // backlog= appended 2026-08-23 (END of line, old-leg-grep rule): the
+	       // CURRENT delivered-but-unapplied results depth, i.e. the reorder
+	       // buffer the dispatch-ahead gate bounds. gp-pri.log implied ~90,000
+	       // here at t~22 s of a primary cold fill, derivable only by summing
+	       // dispatched-drained across windows; now it is a direct gauge.
+	       // Healthy under the gate: saw-toothing at -VoxelDispatchAheadCap
+	       // during fill with exitBacklog>0 on the dispatch-loop line, ~0 at
+	       // steady state. Climbing past the cap while exitBacklog>0 means an
+	       // uncounted producer (counter leak); pinned at the cap with
+	       // exitBacklog=0 means the gate is not being evaluated.
 	       TEXT("Voxel job flow (5s window): dispatched=%lld drained=%lld stale=%lld (%.1f%%) zeroQuad=%lld ")
-	       TEXT("recordsAdded=%lld recordsEvicted=%lld candidatesRejected=%lld chunksPerSec=%.1f"),
+	       TEXT("recordsAdded=%lld recordsEvicted=%lld candidatesRejected=%lld chunksPerSec=%.1f backlog=%d"),
 	       (long long)JobsDispatchedSinceLog, (long long)ResultsDrainedSinceLog, (long long)StaleDiscardsSinceLog,
 	       ResultsDrainedSinceLog > 0 ? 100.0 * double(StaleDiscardsSinceLog) / double(ResultsDrainedSinceLog) : 0.0,
 	       (long long)ZeroQuadAppliesSinceLog, (long long)RecordsAddedSinceLog, (long long)RecordsEvictedSinceLog,
-	       (long long)CandidatesRejectedSinceLog, ChunksPerSecThisWindow);
+	       (long long)CandidatesRejectedSinceLog, ChunksPerSecThisWindow, ResultsBacklogCounter.GetValue());
 	// Priority-order evidence (2026-08-23; see VoxelStreamAdmission::
 	// NearestAdmitEnabled and ViewBiasStrength for the defect and the design).
 	//  admMeanM     mean 2D admit distance per ring this window, metres, BOTH
@@ -18326,11 +18415,52 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 		// stale) still sees its one result.
 	}
 
+	// BAND INSTALL + FOOTPRINT-MARK RELEASE AT DELIVERY, not only at drain
+	// (2026-08-23). DrainResults keeps its identical block -- required for the
+	// CPU producer and harmless here (Add overwrites the same value, Remove
+	// no-ops) -- but for the GPU producer, waiting for drain routed R0's
+	// band-seed pipeline THROUGH the un-applied results backlog: under
+	// -VoxelGpuPrimary a seed delivered in ~250 ms
+	// (slow(>=5s)=0 the whole leg) and then sat 20-30 s behind ~90k queued
+	// results, so the 5 s blind mark ALWAYS aged out first -- bandCache froze
+	// at 908 for 24 s while gpuLatencyTimeouts burst 130-228 per window, and
+	// R0's dispatch advanced only in 5 s timeout generations (j pinned at
+	// 3,492, q pinned at 512), finishing LAST at 47.7 s against the control's
+	// 9.3 s. Full chain: docs/measurements/gpu-primary-ring-order-2026-08-23.txt.
+	//
+	// The band is a pure function of (X,Y) and the amplifier -- DrainResults
+	// already installs it BEFORE its stale-discard for exactly that reason, so
+	// installing it a queue earlier changes when, not what. The mark release
+	// mirrors DrainResults' rule verbatim: every level-0 result, band or not
+	// (a bandless result means the band either landed via the Add above or
+	// never will from this job). Speculative results took this same
+	// at-delivery path already (the early return above); demand now matches.
+	// The early-return failure path deliberately does NOT clear marks here --
+	// it produces no result, its CPU retry re-seeds, and the 5 s age-out
+	// remains its backstop (failed=0 across the whole gp-pri leg; not worth a
+	// third clearing site).
+	if (Pending.Key.Level == 0)
+	{
+		const FIntPoint DoneFootprint(Pending.Key.Key.X, Pending.Key.Key.Y);
+		if (Result.bBandValid)
+		{
+			FootprintBandCache.Add(DoneFootprint, Result.Band);
+		}
+		FootprintBlindJobInFlight.Remove(DoneFootprint);
+		FootprintBlindJobIsGpu.Remove(DoneFootprint);
+		FootprintBandRequestInFlight.Remove(DoneFootprint);
+	}
+
 	// The matching half of the fork's contract: exactly one FJobResult on the
 	// queue and exactly one decrement, in the same order the worker thread does
 	// them. LevelJobsInFlight[] is NOT touched here -- it is decremented in
 	// DrainResults for both producers alike, which is what keeps the GPU path
 	// an exact analogue rather than a second set of rules.
+	// Backlog INCREMENT BEFORE the enqueue (both producer sites agree): an
+	// early count over-reads depth by at most the producers between these two
+	// lines, which errs the dispatch-ahead gate toward pausing -- the safe
+	// direction. Counting after would under-read and let dispatch overshoot.
+	ResultsBacklogCounter.Increment();
 	ResultsQueue.Enqueue(MoveTemp(Result));
 	JobsInFlightCounter.Decrement();
 }
@@ -18493,6 +18623,15 @@ void FVoxelWorldImpl::DispatchJobs()
 	// The fork's queue-depth cap (0 = unbounded, today's behaviour). Read once
 	// per call like GpuMaxInFlight above, and for the same reason.
 	const int32 GpuQueueDepthCap = VoxelStreamAdmission::GpuMeshQueueDepth();
+	// Dispatch-ahead cap (0 = unbounded): how many delivered-but-unapplied
+	// results may accumulate before this loop yields the rest of its pass.
+	// Read once per call like the two caps above. See the accessor for the
+	// full mechanism; the two properties bought here are (1) pop order ==
+	// settle order to within ~1 s, which is the control arm's entire per-ring
+	// ordering guarantee, and (2) a band seed's result drains before its 5 s
+	// blind mark ages out, which is what keeps R0's per-footprint dispatch
+	// pipeline moving under -VoxelGpuPrimary.
+	const int32 DispatchAheadCapN = VoxelStreamAdmission::DispatchAheadCap();
 	// Read ONCE per call, not per chunk: it is a cvar read and this loop runs
 	// over every pending key. See VoxelBrickCpuArm::VolumeNeedsSolidChunks --
 	// with the brick volume off this is false and every skip below behaves
@@ -18505,12 +18644,32 @@ void FVoxelWorldImpl::DispatchJobs()
 
 	const double DispatchLoopStart = FPlatformTime::Seconds();
 	// Which exit the loop takes this pass -- see the DispatchExit* counters'
-	// doc comment for the two competing readings this settles. The loop has
-	// exactly these two ways out; a third would need its own counter or the
-	// exitCap arithmetic (exitCap = passes - exitEmpty) silently lies.
+	// doc comment for the competing readings this settles. The loop has
+	// exactly THREE ways out, each with its own counter, or the exitCap
+	// arithmetic (exitCap = passes - exitEmpty - exitBacklog) silently lies.
 	bool bLoopExitedQueueEmpty = false;
+	bool bLoopExitedBacklog = false;
 	while (CpuJobsOutstanding() < MaxJobsInFlight)
 	{
+		// Dispatch-ahead gate, FIRST and INSIDE the loop -- the while condition
+		// cannot carry it because the fork deliberately bypasses the CPU budget
+		// (a pass can fork thousands of GPU jobs while CpuJobsOutstanding never
+		// moves; gp-pri.log measured 12-15k gpuForked per 5 s window doing
+		// exactly that). Checked per iteration so a pass stops mid-drain the
+		// moment the backlog fills, and BEFORE the pick so a gated pass costs
+		// no ring-quota scan. Deliberately arm-agnostic: it pauses the CPU pop
+		// and the GPU fork together, so the popped-work GPU/CPU split -- the
+		// 75.6% routing share this cap must not claw back -- is untouched; the
+		// overflow chunk stays in its ring queue at its sorted priority instead
+		// of falling to the other arm, and the next pass re-pops it in ring
+		// order. That "stays sorted, re-picked by priority" property is the
+		// whole difference between this gate and the manager's FIFO, where an
+		// early pop is a 25-30 s commitment (see the attribution doc).
+		if (DispatchAheadCapN > 0 && ResultsBacklogCounter.GetValue() >= DispatchAheadCapN)
+		{
+			bLoopExitedBacklog = true;
+			break;
+		}
 		// Which ring gets this worker slot.
 		//
 		// Pass 1 (quota only): any ring that has work pending AND is below its
@@ -18916,6 +19075,10 @@ void FVoxelWorldImpl::DispatchJobs()
 		const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>* GenPtr = &Voxels.generated();
 		TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc>* QueuePtr = &ResultsQueue;
 		FThreadSafeCounter* CounterPtr = &JobsInFlightCounter;
+		// Dispatch-ahead depth counter -- same raw-pointer-into-Impl lifetime
+		// argument as QueuePtr/CounterPtr above (Deinitialize waits for every
+		// in-flight task before Impl is destroyed).
+		FThreadSafeCounter* BacklogPtr = &ResultsBacklogCounter;
 		vxc::Counters* PerfCountersPtr = &PerfCounters;
 		// M2 wave 2 item 1: shared cross-job mip cache -- see FSharedMipCache's
 		// doc comment for the lifetime/thread-safety argument (same "Impl
@@ -19194,7 +19357,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// spelling (-VoxelWorkerPool routes it to a dedicated pool; default
 		// is UE::Tasks exactly as before). Captures unchanged.
 		auto JobBody =
-			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
+			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, BacklogPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
 			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident,
@@ -19955,6 +20118,10 @@ void FVoxelWorldImpl::DispatchJobs()
 				{
 					Result.DeliverSeconds = FPlatformTime::Seconds();
 				}
+				// Backlog increment BEFORE the enqueue, matching the GPU
+				// producer site -- over-reading depth errs the dispatch-ahead
+				// gate toward pausing, the safe direction.
+				BacklogPtr->Increment();
 				QueuePtr->Enqueue(MoveTemp(Result));
 				CounterPtr->Decrement();
 				// The exact-CPU instrument's other half; adjacent to the
@@ -20002,6 +20169,10 @@ void FVoxelWorldImpl::DispatchJobs()
 	{
 		++DispatchExitEmptySincePanel;
 	}
+	else if (bLoopExitedBacklog)
+	{
+		++DispatchExitBacklogSincePanel;
+	}
 	else
 	{
 		++DispatchExitCapSincePanel;
@@ -20009,11 +20180,16 @@ void FVoxelWorldImpl::DispatchJobs()
 	ThisFrameDispatchLoopMs += float((FPlatformTime::Seconds() - DispatchLoopStart) * 1000.0);
 
 	// Exit attribution (see the DispatchExit* doc comment). Falling out of the
-	// while condition IS the cap exit -- the loop has no other way to end.
+	// while condition IS the cap exit -- the loop's only other ends are the
+	// two counted breaks (queue-empty and dispatch-ahead backlog).
 	++DispatchPassesSinceLog;
 	if (bLoopExitedQueueEmpty)
 	{
 		++DispatchExitEmptySinceLog;
+	}
+	else if (bLoopExitedBacklog)
+	{
+		++DispatchExitBacklogSinceLog;
 	}
 	else
 	{
@@ -21743,6 +21919,10 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			ExitReason = EDrainExit::QueueEmpty;
 			break;
 		}
+		// Dispatch-ahead depth: one dequeue, one decrement -- stale discards
+		// included, because the counter measures QUEUE DEPTH (what the
+		// dispatch loop's gate must not let grow), not live results.
+		ResultsBacklogCounter.Decrement();
 		++Drains;
 		++ResultsDrainedSinceLog;
 
@@ -23683,8 +23863,10 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 
 		LastStreamPanel.DispatchExitCap = DispatchExitCapSincePanel;
 		LastStreamPanel.DispatchExitEmpty = DispatchExitEmptySincePanel;
+		LastStreamPanel.DispatchExitBacklog = DispatchExitBacklogSincePanel;
 		DispatchExitCapSincePanel = 0;
 		DispatchExitEmptySincePanel = 0;
+		DispatchExitBacklogSincePanel = 0;
 	}
 }
 

@@ -740,6 +740,12 @@ struct FVoxelStreamPanelSnapshot
 	// of the pipeline to blame when chunks/s is under the floor.
 	int32 DispatchExitCap = 0;
 	int32 DispatchExitEmpty = 0;
+	// Third exit since 2026-08-23: the un-applied results backlog reached
+	// -VoxelDispatchAheadCap (see VoxelStreamAdmission::DispatchAheadCap) and
+	// the loop yielded so apply could catch up -- the APPLY side is the
+	// limiter. Folding these into exitCap would make the HUD verdict read
+	// "worker-limited" during exactly the regime the cap exists for.
+	int32 DispatchExitBacklog = 0;
 };
 
 namespace VoxelDebug
