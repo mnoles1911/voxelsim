@@ -21,7 +21,9 @@
 // never as a quiet pass: proofs are only ever taken with nonzero host-side
 // consumption, so "N proofs ok" cannot be vacuous.
 //
-// The stats buffer (4 dwords, persistent, cleared once at Init):
+// The stats buffer (8 dwords, persistent, cleared once at Init; THIS kernel
+// writes only [0..3] -- [4..5] belong to the column-stage verify in
+// VoxelWorklistColumn.usf, [6..7] are reserved for later stages):
 //   [0] cumulative records consumed (InterlockedAdd)
 //   [1] cumulative XOR of per-record folds (InterlockedXor) -- see
 //       worklistRecordFold in VoxelWorklist.ush for what a mismatch means
@@ -30,6 +32,8 @@
 //       which the fold alone would happily agree with
 //   [3] the ring tail after this tick's consume, as the args pass left it --
 //       plain store from group 0 only, no race
+//   [4] cumulative mismatching DWORDS, converted columns vs classic (verify)
+//   [5] cumulative columns compared by the verify pass
 
 #include "/Engine/Public/Platform.ush"
 #include "/VoxelEarth/VoxelWorklist.ush"

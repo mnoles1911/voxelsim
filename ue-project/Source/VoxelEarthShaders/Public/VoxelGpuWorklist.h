@@ -2,7 +2,22 @@
 // FVoxelGpuWorklist -- the persistent chunk-record ring for P3 (persistent
 // worklist + indirect dispatch; docs/gpu-worklist-plan-2026-08-23.md).
 //
-// *** SPINE WIRED, KERNELS NOT YET CONVERTED (2026-08-23). ***
+// *** SPINE WIRED; FIRST KERNEL CONVERTED: Column (2026-08-23). ***
+// Behind -VoxelGpuWorklistColumns=1 (on top of -VoxelGpuWorklist=1) the flush
+// graph now also dispatches ColumnWorklistMain (VoxelWorklistColumn.usf) once
+// per tick through the Column-stage indirect triple: every consumed record's
+// 1,024 columns land in a flush-level COLUMN ARENA, and the same chunk's
+// classic VoxelizeMain reads its slice through worldgen.ush's ColumnReadBase
+// instead of running its own ColumnMain pass. One pass per TICK replaces one
+// pass per CHUNK for this stage; the six remaining stages (Voxelize,
+// AssetStamp, ClassifyTotals, PackClaim, Write, Record) still read $Globals
+// per chunk, so passes/tick does not go FLAT yet -- it drops by ~1 x
+// chunks/tick. Gate: the pinned digest (classic path byte-identical) plus
+// ColumnWorklistVerifyMain (-VoxelGpuWorklistVerifyCols=1, converted bytes vs
+// a classic dispatch of the same chunks, riding the proof readback).
+//
+// The banner below is the pre-conversion state of the OTHER stages and stays
+// accurate for them.
 // FVoxelGpuMeshJobManager now drives this ring behind -VoxelGpuWorklist=1:
 // every lean-eligible brick chunk appends a real 64-byte record at dispatch,
 // Flush runs once per tick (upload + args pass + the indirect spine prover,
@@ -34,6 +49,7 @@
 
 class FRDGBuilder;
 class FRHIGPUBufferReadback;
+class FVoxelRasterAtlasGpu;
 
 // One chunk of pure-worldgen production, 64 bytes, mirrored bit-for-bit by
 // VoxelWorklist.ush's GpuChunkWorkRecord. 16 dwords; the .cpp static_asserts
@@ -77,6 +93,19 @@ enum class EVoxelWorklistStage : uint8
 class VOXELEARTHSHADERS_API FVoxelGpuWorklist
 {
 public:
+	// --- stage shapes, the HOST side of the torn-dispatch lock --------------
+	// A lean brick chunk is 32x32 columns; ColumnWorklistMain runs 64 threads
+	// per group, so 16 groups per record. kGroupsPerRecord[Column] in the .cpp
+	// args table is built from THIS constant, and the kernel #errors if the
+	// define built from it disagrees with its own derivation -- the mechanism
+	// the plan doc mandates per converted kernel.
+	static constexpr uint32 kColumnsPerRecord = 1024;
+	static constexpr uint32 kColumnGroupsPerRecord = kColumnsPerRecord / 64;
+	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
+	// [4..5] the column verify's mismatch/checked counters
+	// (VoxelWorklistColumn.usf), [6..7] reserved for later stages.
+	static constexpr uint32 kStatsDwords = 8;
+
 	~FVoxelGpuWorklist();
 
 	// Capacity is a latch, not a growth policy: a full ring REFUSES appends
@@ -86,8 +115,47 @@ public:
 	bool IsInitialized() const { return Capacity != 0; }
 
 	// Game thread: stage records for this tick. Returns how many were
-	// accepted (the rest refused-full and counted).
-	int32 Append(TArrayView<const FVoxelGpuChunkWorkRecord> Records);
+	// accepted (the rest refused-full and counted). OutMonotonicIndices, if
+	// given, receives one entry PER INPUT record: its monotonic ring index
+	// (the coordinate GetLastFlush()'s window is expressed in) or MAX_uint32
+	// if it was refused -- this is how a caller learns which arena slice the
+	// column stage will write for its chunk.
+	int32 Append(TArrayView<const FVoxelGpuChunkWorkRecord> Records,
+	             TArray<uint32>* OutMonotonicIndices = nullptr);
+
+	// --- the Column stage (-VoxelGpuWorklistColumns) ------------------------
+	//
+	// Game thread, before Flush, idempotent: hands over the process-wide
+	// generation inputs a column dispatch needs that no record carries (the
+	// atlas the VXC_RASTER_ATLAS accessors sample, the world seed, the raster
+	// pitch). First call arms the stage; Flush dispatches ColumnWorklistMain
+	// only once armed, so a spine-only leg (-VoxelGpuWorklist=1 alone) never
+	// reaches any of it and stays byte-identical to the measured spine.
+	void SetColumnStageInputs(FVoxelRasterAtlasGpu* Atlas, uint64 Seed, int32 PixelSizeMm);
+	bool IsColumnStageArmed() const { return bColumnStageArmed; }
+
+	// Game thread: the consume window the most recent Flush mirrored --
+	// [ConsumeFirst, ConsumeFirst + Take) in monotonic record indices. A
+	// record appended at monotonic index m was consumed by that flush iff
+	// m - ConsumeFirst < Take, and its column arena slice is that difference.
+	struct FLastFlush
+	{
+		uint32 ConsumeFirst = 0;
+		uint32 Take = 0;
+	};
+	FLastFlush GetLastFlush() const { return LastFlush; }
+
+	// Render thread, from inside a graph that consumes the column stage's
+	// output (the batch graph): registers the arena and the stats buffer.
+	// Arena is null until the first armed Flush has run on the render thread
+	// -- the caller must fall back to a classic ColumnMain pass AND COUNT IT
+	// when that happens, never silently read a buffer that does not exist.
+	struct FColumnStageBindings
+	{
+		FRDGBufferRef Arena = nullptr;   // budget x 1,024 GpuColumnSample
+		FRDGBufferRef Stats = nullptr;   // kStatsDwords dwords (verify writes [4..5])
+	};
+	FColumnStageBindings RegisterColumnStage(FRDGBuilder& GraphBuilder);
 
 	// Game thread: enqueue this tick's upload + the args-setup pass + the
 	// indirect spine-prover dispatch (VoxelWorklistConsume.usf). One render
@@ -113,11 +181,18 @@ public:
 	// project keeps paying for). MalformedOnGpu > 0 with proofs passing means
 	// the HOST staged garbage records -- the fold agrees on both sides
 	// because the garbage was faithfully transported.
+	// ColumnDwordMismatches > 0 means the CONVERTED column kernel and the
+	// classic one disagree on bytes -- leg invalid, terrain wrong, digest at
+	// risk. ColumnsChecked == 0 with the verify switch armed and converted
+	// chunks flowing means the verify itself is dead and "no mismatches" is
+	// vacuous. Both are cumulative GPU counters riding the proof readback.
 	struct FProofStatus
 	{
 		uint64 Landed = 0;
 		uint64 Failed = 0;
 		uint64 MalformedOnGpu = 0;
+		uint64 ColumnDwordMismatches = 0;
+		uint64 ColumnsChecked = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -152,9 +227,24 @@ private:
 	TRefCountPtr<FRDGPooledBuffer> PooledRecords;
 	TRefCountPtr<FRDGPooledBuffer> PooledArgs;
 	TRefCountPtr<FRDGPooledBuffer> PooledControl;
-	// The prover's 4-dword evidence buffer (VoxelWorklistConsume.usf's layout).
+	// The kStatsDwords-dword evidence buffer (prover [0..3], column verify
+	// [4..5]; VoxelWorklistConsume.usf documents the layout).
 	TRefCountPtr<FRDGPooledBuffer> PooledStats;
 	FWindow Window;
+
+	// --- Column stage (game-thread config, render-thread arena) -------------
+	// The arena is created lazily inside the first armed Flush's render
+	// command (AllocatePooledBuffer -- it must outlive the flush graph so the
+	// batch graph can read it) and only ever touched on the render thread
+	// after that; RegisterColumnStage is the render-thread accessor.
+	bool bColumnStageArmed = false;
+	FVoxelRasterAtlasGpu* ColumnAtlas = nullptr;
+	uint32 ColumnSeedLo = 0;
+	uint32 ColumnSeedHi = 0;
+	int32 ColumnPixelSizeMm = 0;
+	uint32 ColumnArenaRecords = 0;   // slices the arena holds; latched at creation
+	TRefCountPtr<FRDGPooledBuffer> PooledColumnArena;
+	FLastFlush LastFlush;
 
 	// --- the spine proof (game-thread state) --------------------------------
 	// Per-slot record folds, written when a staged record is assigned its ring

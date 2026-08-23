@@ -1374,6 +1374,22 @@ RWStructuredBuffer<GpuColumnSample> OutColumns VXC_REG(u0);
 // VoxelizeMain pipeline's descriptor set.
 StructuredBuffer<GpuColumnSample> InColumns VXC_REG(t3);
 
+// P3 worklist column stage (VXC_UE only; docs/gpu-worklist-plan-2026-08-23.md):
+// base ELEMENT added to every InColumns read. 0 on every classic dispatch --
+// the shipped indexing plus a uniform +0, which changes no output byte and
+// keeps the pinned coarse digest a statement about the same program -- and
+// sliceIndex * 1024 when a lean chunk's VoxelizeMain reads its columns out of
+// the shared worklist column arena (ColumnWorklistMain in
+// VoxelWorklistColumn.usf wrote them there, one 1,024-column slice per
+// consumed record). A loose global OUTSIDE the 56-byte WorldGenParams block,
+// AtlasPagePx's pattern: the block's layout is static_asserted against the
+// bench's cbuffer and the bench never compiles a worklist arm.
+#ifdef VXC_UE
+uint ColumnReadBase;
+#else
+static const uint ColumnReadBase = 0;
+#endif
+
 // One uint per cell, material id 0-255 in the low byte (packing optimization
 // left for later). Layout â€” see the VoxelizeMain doc comment below for the
 // precise brick/cell indexing this buffer is written with.
@@ -1966,30 +1982,24 @@ int64_t coarseRep(int64_t c, uint scale)
 }
 
 // --- ColumnMain: bit-exact mirror of vxc::Amplifier::column ----------------
+//
+// P3 WORKLIST FACTORING (2026-08-23, docs/gpu-worklist-plan-2026-08-23.md):
+// the whole per-column computation lives in columnSampleAt so the worklist
+// entry point (ColumnWorklistMain in VoxelWorklistColumn.usf, VXC_UE only)
+// can run the SAME TEXT with its origin and coarse scale taken from a
+// GpuChunkWorkRecord instead of $Globals -- that substitution is the whole
+// conversion. ColumnMain below inlines this right back with the $Globals
+// values, so the classic dispatch is the shipped program; the pinned coarse
+// digest (voxel.GPU.VerifyCoarse) is the gate that the factoring moved no
+// byte. ASSUMES PixelSizeMm != 0 -- both entry points keep the guard.
 
-[numthreads(8, 8, 1)]
-void ColumnMain(uint3 tid : SV_DispatchThreadID)
+GpuColumnSample columnSampleAt(int originVx, int originVy, uint coarseScale, uint2 t)
 {
-    if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
-        return;
-
-    // HARDENING (2026-07 cross-vendor UB pass, issue 4). PixelSizeMm is a
-    // host-supplied divisor that reaches floorDiv/truncDiv below (and
-    // `pxMm * pxMm`). Zero would be an OpUDiv-by-zero: undefined in SPIR-V,
-    // so the result is whatever the vendor's integer unit happens to produce
-    // (and on some stacks it can fault). There is no meaningful column to
-    // derive from a zero-size pixel, so refuse the dispatch deterministically.
-    // Mirrored by a host-side assert in voxel-core/bench/gpu_harness.cpp.
-    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 3750 (scale 8) â€”
-    // never 0 â€” so this branch is never taken on any real dispatch.
-    if (PixelSizeMm == 0)
-        return;
-
     const uint64_t seed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
-    // D5: OriginVx/OriginVy are in COARSE cell units at CoarseShift > 0, exactly
-    // as vxc::coarseColumns takes bx*B + x in level-L cells. Identity at level 0.
-    const int64_t vx = coarseRep((int64_t)OriginVx + (int64_t)tid.x, CoarseScale);
-    const int64_t vy = coarseRep((int64_t)OriginVy + (int64_t)tid.y, CoarseScale);
+    // D5: origins are in COARSE cell units at CoarseShift > 0, exactly as
+    // vxc::coarseColumns takes bx*B + x in level-L cells. Identity at level 0.
+    const int64_t vx = coarseRep((int64_t)originVx + (int64_t)t.x, coarseScale);
+    const int64_t vy = coarseRep((int64_t)originVy + (int64_t)t.y, coarseScale);
 
     const SurfaceEval se = evalSurface(seed, vx, vy);
     const int64_t px = se.px;
@@ -2107,7 +2117,31 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
                                      (int)clPrecipVar, outCol.surfaceMm, slopeMmPerM);
     outCol.surfaceMat = biomeSurfaceMaterial(biome, outCol.surfaceMm);
 
-    OutColumns[tid.x + tid.y * DispatchColumns.x] = outCol;
+    return outCol;
+}
+
+[numthreads(8, 8, 1)]
+void ColumnMain(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
+        return;
+
+    // HARDENING (2026-07 cross-vendor UB pass, issue 4). PixelSizeMm is a
+    // host-supplied divisor that reaches floorDiv/truncDiv inside
+    // columnSampleAt (and `pxMm * pxMm`). Zero would be an OpUDiv-by-zero:
+    // undefined in SPIR-V, so the result is whatever the vendor's integer
+    // unit happens to produce (and on some stacks it can fault). There is no
+    // meaningful column to derive from a zero-size pixel, so refuse the
+    // dispatch deterministically. Mirrored by a host-side assert in
+    // voxel-core/bench/gpu_harness.cpp, and kept by BOTH entry points that
+    // call columnSampleAt. GUARD ONLY: valid PixelSizeMm is 30000 (scale 1)
+    // or 3750 (scale 8) -- never 0 -- so this branch is never taken on any
+    // real dispatch.
+    if (PixelSizeMm == 0)
+        return;
+
+    OutColumns[tid.x + tid.y * DispatchColumns.x] =
+        columnSampleAt(OriginVx, OriginVy, CoarseScale, tid.xy);
 }
 
 // --- VoxelizeMain: bit-exact mirror of vxc::Amplifier::materialAt ---------
@@ -2759,7 +2793,9 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
     const uint bricksX = DispatchColumns.x / 8u;
     const uint footprintIndex = bx + bricksX * by;
 
-    const GpuColumnSample col = InColumns[tid.x + tid.y * DispatchColumns.x];
+    // ColumnReadBase is 0 on every classic dispatch (see its declaration);
+    // nonzero only when these columns live in the worklist column arena.
+    const GpuColumnSample col = InColumns[ColumnReadBase + tid.x + tid.y * DispatchColumns.x];
 
     // Cave pass: one reduction per column, reused down the whole brick stack â€”
     // the same split vxc::ColumnSample::cave makes on the CPU.

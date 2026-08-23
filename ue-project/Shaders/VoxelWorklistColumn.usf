@@ -1,0 +1,141 @@
+// VoxelWorklistColumn.usf -- the FIRST CONVERTED generation kernel of the P3
+// worklist (Column stage; docs/gpu-worklist-plan-2026-08-23.md, conversion
+// step 2). Behind -VoxelGpuWorklistColumns=1, on top of -VoxelGpuWorklist=1.
+//
+// WHAT CONVERSION MEANS, in one line: ColumnMain's per-chunk dispatch read its
+// origin and coarse scale from $Globals, one pass per chunk; THIS entry point
+// is dispatched ONCE PER TICK through the DispatchIndirect triple
+// VoxelWorklistArgs.usf wrote for EVoxelWorklistStage::Column (16 groups per
+// consumed record), reads Records[Control[0] + rec] off the GPU-owned cursor,
+// and computes every consumed chunk's 1,024 columns in that single pass. Pass
+// count for this stage stops scaling with chunk count -- which is the P3 gate
+// (passes/tick flat as chunk rate rises), NOT throughput, which today is
+// limited by admission and is expected NOT to move.
+//
+// THE MATH IS NOT COPIED, IT IS CALLED: columnSampleAt in worldgen.ush is the
+// factored body of ColumnMain, and both entry points call the same text. The
+// arena write below and the record load above are the only lines that differ
+// from the classic kernel. Order/byte parity is gated two ways: the pinned
+// coarse digest (classic path unchanged) and ColumnWorklistVerifyMain below
+// (converted bytes vs a classic dispatch of the same chunk, behind
+// -VoxelGpuWorklistVerifyCols=1).
+//
+// OUTPUT: the flush-level COLUMN ARENA -- budget x 1,024 GpuColumnSample,
+// slice `rec` (this tick's consume order, 0..Take-1) at element rec * 1024.
+// The same chunk's classic VoxelizeMain reads its slice through worldgen.ush's
+// ColumnReadBase (= slice * 1024) in the SAME frame: the flush graph runs
+// before the batch graph because its render command is enqueued first, and
+// RDG's external-buffer tracking orders the write before the read.
+//
+// ATLAS REQUIRED: a worklist record carries no raster window (the atlas is
+// what emptied it -- that is why P3 was sequenced after A), so this kernel
+// exists only in the VXC_RASTER_ATLAS=1 form. Eligibility on the host already
+// refuses records for inline-raster requests (skips noAtlas=...).
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelWorklist.ush"
+#include "/VoxelCore/worldgen.ush"
+
+// The stage-shape lock the plan doc requires: the host dispatches this kernel
+// through the args triple built from kGroupsPerRecord[Column], and passes that
+// same table entry in as a define. A mismatch is a TORN DISPATCH -- half the
+// records' columns computed, no error anywhere -- so it must fail the compile,
+// not the leg.
+#ifndef VXC_WORKLIST_COLUMN_GROUPS
+#error "VXC_WORKLIST_COLUMN_GROUPS not defined -- dispatch this kernel only through FVoxelWorklistColumnCS"
+#endif
+#ifndef VXC_WORKLIST_COLS_PER_RECORD
+#error "VXC_WORKLIST_COLS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistColumnCS"
+#endif
+#if VXC_WORKLIST_COLUMN_GROUPS != 16
+#error "Column stage shape drifted: 32x32 columns / 64 threads = 16 groups per record, and the host table must agree"
+#endif
+#if VXC_WORKLIST_COLS_PER_RECORD != 1024
+#error "Column stage shape drifted: a lean brick chunk is 32x32 columns"
+#endif
+
+// The ring (VoxelWorklistConsume.usf binds the same three; same meanings).
+StructuredBuffer<GpuChunkWorkRecord> WorklistRecords;
+// [0]=consumeFirst [1]=consumeCount, as VoxelWorklistArgs.usf wrote them
+// earlier in this same graph.
+StructuredBuffer<uint> WorklistControl;
+uint RingCapacity;
+
+// OutColumns (the arena UAV), SeedLo/SeedHi, PixelSizeMm, SurfaceMip and the
+// atlas bindings all come from worldgen.ush's own declarations -- this file
+// deliberately declares no duplicate of anything the classic kernel binds.
+
+[numthreads(64, 1, 1)]
+void ColumnWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Take = WorklistControl[1];
+	const uint Rec = Gid.x / VXC_WORKLIST_COLUMN_GROUPS;
+	// The args pass sized this dispatch to exactly Take * 16 groups; the guard
+	// is belt-and-braces against a torn args write, not a code path.
+	if (Rec >= Take)
+	{
+		return;
+	}
+	// Same guard both entry points keep -- see ColumnMain in worldgen.ush.
+	if (PixelSizeMm == 0)
+	{
+		return;
+	}
+	// consumeFirst is the MONOTONIC tail; the ring index is mod capacity,
+	// exactly as the host's upload placed the record (prover's arithmetic,
+	// verbatim -- the host mirror computes the same Rec for the job so the
+	// classic VoxelizeMain reads the slice this thread writes).
+	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
+	const GpuChunkWorkRecord R = WorklistRecords[Slot];
+
+	const uint ColIndex = (Gid.x % VXC_WORKLIST_COLUMN_GROUPS) * 64u + GTid.x;   // 0..1023
+	// 32x32, x fastest -- identical to ColumnMain's tid mapping over a 32-wide
+	// dispatch. Literal shift/mask: lint-shader-ub VARIABLE_SHIFT stays clean.
+	const uint2 T = uint2(ColIndex & 31u, ColIndex >> 5u);
+
+	OutColumns[Rec * VXC_WORKLIST_COLS_PER_RECORD + ColIndex] =
+		columnSampleAt(R.OriginVx, R.OriginVy, worklistCoarseScale(R), T);
+}
+
+// --- ColumnWorklistVerifyMain: the stage-2 gate from the plan doc -----------
+//
+// Byte-compares ONE converted chunk's arena slice against a classic ColumnMain
+// dispatch of the same chunk (which the host runs right before this pass, into
+// a transient buffer, ONLY under -VoxelGpuWorklistVerifyCols=1). Mismatching
+// DWORDS accumulate into WorklistStats[4], columns compared into
+// WorklistStats[5]; both ride the existing ~5 s proof readback.
+//
+// THE FAILING READINGS: stats[4] > 0 -- the converted kernel computes
+// different columns than the classic one; the leg is invalid and the pinned
+// digest is at risk the moment anything downstream consumes them. stats[5]
+// staying 0 while converted chunks flow (window line wlcols conv=N>0) with the
+// verify switch armed -- the verify itself is dead, and "no mismatches" is
+// vacuous. One 16-group pass per verified chunk, verify arm only.
+
+StructuredBuffer<GpuColumnSample> VerifyClassicColumns;   // the classic dispatch's 1,024
+StructuredBuffer<GpuColumnSample> VerifyArenaColumns;     // the arena (SRV this time)
+RWStructuredBuffer<uint> WorklistStats;
+uint VerifyArenaBase;                                     // slice * 1024
+
+[numthreads(64, 1, 1)]
+void ColumnWorklistVerifyMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x >= VXC_WORKLIST_COLS_PER_RECORD)
+	{
+		return;
+	}
+	const GpuColumnSample A = VerifyArenaColumns[VerifyArenaBase + tid.x];
+	const GpuColumnSample C = VerifyClassicColumns[tid.x];
+	uint Mismatch = 0u;
+	Mismatch += (A.surfaceMm      != C.surfaceMm)      ? 1u : 0u;
+	Mismatch += (A.topsoilMm      != C.topsoilMm)      ? 1u : 0u;
+	Mismatch += (A.subsoilMm      != C.subsoilMm)      ? 1u : 0u;
+	Mismatch += (A.bedrockDepthMm != C.bedrockDepthMm) ? 1u : 0u;
+	Mismatch += (A.surfaceMat     != C.surfaceMat)     ? 1u : 0u;
+	uint Unused;
+	InterlockedAdd(WorklistStats[5], 1u, Unused);
+	if (Mismatch != 0u)
+	{
+		InterlockedAdd(WorklistStats[4], Mismatch, Unused);
+	}
+}

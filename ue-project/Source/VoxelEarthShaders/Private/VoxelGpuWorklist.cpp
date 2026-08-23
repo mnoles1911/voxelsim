@@ -10,6 +10,10 @@
 
 #include "VoxelGpuWorklist.h"
 
+#include "VoxelGpuWorldGen.h"        // FVoxelGpuColumnSample -- the arena element
+#include "VoxelGpuWorldGenGraph.h"   // AddWorklistColumnPass (the converted Column dispatch)
+#include "VoxelRasterAtlasGpu.h"
+
 #include "GlobalShader.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -70,16 +74,21 @@ namespace
 	std::atomic<uint32> GProofGpuFold{ 0 };
 	std::atomic<uint32> GProofGpuBad{ 0 };
 	std::atomic<uint32> GProofGpuTail{ 0 };
+	// Column-stage verify counters (stats [4..5]); cumulative, like the rest.
+	std::atomic<uint32> GProofColMismatch{ 0 };
+	std::atomic<uint32> GProofColChecked{ 0 };
 
 	// Groups per record per stage -- the host copy of the stage shapes the
-	// converted kernels will be written against. 32x32 columns / 64 threads =
-	// 16; voxelize 32x32x32 cells / 64 = 512/32... kept as the DESIGN numbers
-	// from the plan doc; the conversion locks each entry the day its kernel
-	// lands, and a mismatch is a torn dispatch, so the plan doc calls for a
-	// static_assert per converted kernel against this table.
+	// converted kernels are written against. The Column entry is LOCKED: it
+	// comes from FVoxelGpuWorklist::kColumnGroupsPerRecord, the same constant
+	// FVoxelWorklistColumnCS hands the kernel as a define, and
+	// VoxelWorklistColumn.usf #errors on disagreement -- the torn-dispatch
+	// lock the plan doc mandates per converted kernel. The unconverted
+	// entries are still the DESIGN numbers from the plan doc; each locks the
+	// day its kernel lands.
 	const uint32 kGroupsPerRecord[uint8(EVoxelWorklistStage::COUNT)] =
 	{
-		16,   // Column: 1024 columns / 64
+		FVoxelGpuWorklist::kColumnGroupsPerRecord,   // Column: 1024 columns / 64 = 16 (LOCKED)
 		512,  // Voxelize: 32^3 cells / 64
 		16,   // AssetStamp: per-column gather, 1024 columns / 64
 		1,    // ClassifyTotals: 64 bricks, one group
@@ -153,13 +162,14 @@ void FVoxelGpuWorklist::Init(uint32 RecordCapacity)
 		FRDGBufferRef Control = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 3),
 			TEXT("Voxel.WorklistControl"));
-		// The prover's evidence (VoxelWorklistConsume.usf's 4-dword layout).
-		// Cleared ONCE, here: the counters are cumulative for the process, so
-		// the proof compares totals, never windows -- a readback that lands
-		// late compares against the flush that enqueued it, not against
-		// whatever window happens to be open.
+		// The evidence buffer (prover dwords [0..3], column verify [4..5];
+		// VoxelWorklistConsume.usf documents the layout). Cleared ONCE, here:
+		// the counters are cumulative for the process, so the proof compares
+		// totals, never windows -- a readback that lands late compares
+		// against the flush that enqueued it, not against whatever window
+		// happens to be open.
 		FRDGBufferRef Stats = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 4),
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), kStatsDwords),
 			TEXT("Voxel.WorklistStats"));
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Control), 0u);
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Args, PF_R32_UINT), 0u);
@@ -172,10 +182,16 @@ void FVoxelGpuWorklist::Init(uint32 RecordCapacity)
 	});
 }
 
-int32 FVoxelGpuWorklist::Append(TArrayView<const FVoxelGpuChunkWorkRecord> Records)
+int32 FVoxelGpuWorklist::Append(TArrayView<const FVoxelGpuChunkWorkRecord> Records,
+                                TArray<uint32>* OutMonotonicIndices)
 {
 	check(IsInGameThread());
 	check(IsInitialized());
+	if (OutMonotonicIndices != nullptr)
+	{
+		OutMonotonicIndices->Reset();
+		OutMonotonicIndices->Reserve(Records.Num());
+	}
 	// Head/Tail are MONOTONIC record counts (the ring index is count %
 	// Capacity), so pending is a plain subtraction and wrap costs nothing.
 	int32 Accepted = 0;
@@ -184,13 +200,43 @@ int32 FVoxelGpuWorklist::Append(TArrayView<const FVoxelGpuChunkWorkRecord> Recor
 		if (Head - Tail + uint32(Staged.Num()) >= Capacity)
 		{
 			++Window.RefusedFull;
+			if (OutMonotonicIndices != nullptr)
+			{
+				OutMonotonicIndices->Add(MAX_uint32);
+			}
 			continue;
+		}
+		// The monotonic index this record will occupy: Head advances only at
+		// Flush, so a staged record's index is Head + its staging position.
+		if (OutMonotonicIndices != nullptr)
+		{
+			OutMonotonicIndices->Add(Head + uint32(Staged.Num()));
 		}
 		Staged.Add(R);
 		++Accepted;
 	}
 	Window.Appended += uint64(Accepted);
 	return Accepted;
+}
+
+void FVoxelGpuWorklist::SetColumnStageInputs(FVoxelRasterAtlasGpu* Atlas, uint64 Seed,
+                                             int32 PixelSizeMm)
+{
+	check(IsInGameThread());
+	if (Atlas == nullptr || PixelSizeMm == 0)
+	{
+		// A null atlas or zero pitch cannot dispatch columns; stay (or go)
+		// unarmed rather than dispatch a kernel whose guard would silently
+		// early-out every thread -- the exact quiet-dead shape this project
+		// keeps paying for. The caller counts the fallback per chunk.
+		bColumnStageArmed = false;
+		return;
+	}
+	ColumnAtlas = Atlas;
+	ColumnSeedLo = uint32(Seed & 0xffffffffull);
+	ColumnSeedHi = uint32(Seed >> 32);
+	ColumnPixelSizeMm = PixelSizeMm;
+	bColumnStageArmed = true;
 }
 
 void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
@@ -221,6 +267,12 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		CumConsumedFold ^= FoldRing[int32((Tail + I) % Capacity)];
 	}
 	CumConsumedRecords += Take;
+	// The consume window this flush mirrors, published for the column-stage
+	// caller: a record at monotonic index m gets arena slice m - ConsumeFirst
+	// iff that difference is < Take -- the same arithmetic ColumnWorklistMain
+	// runs off WorklistControl on the GPU.
+	LastFlush.ConsumeFirst = Tail;
+	LastFlush.Take = Take;
 
 	// --- proof landing ------------------------------------------------------
 	// The render side stored the GPU's four dwords and then the sequence
@@ -232,8 +284,26 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		const uint32 GpuFold = GProofGpuFold.load(std::memory_order_relaxed);
 		const uint32 GpuBad = GProofGpuBad.load(std::memory_order_relaxed);
 		const uint32 GpuTail = GProofGpuTail.load(std::memory_order_relaxed);
+		const uint32 ColMismatch = GProofColMismatch.load(std::memory_order_relaxed);
+		const uint32 ColChecked = GProofColChecked.load(std::memory_order_relaxed);
 		Proof.MalformedOnGpu = GpuBad;
+		Proof.ColumnDwordMismatches = ColMismatch;
+		Proof.ColumnsChecked = ColChecked;
 		++Proof.Landed;
+		if (ColMismatch > 0)
+		{
+			// THE COLUMN-STAGE FAILING READING: the converted kernel computed
+			// different bytes than the classic dispatch of the same chunk.
+			// Terrain built from those columns is WRONG terrain -- the leg is
+			// invalid, and the pinned digest will move the moment the verify
+			// path samples it. Logged on every proof while nonzero (the
+			// counter is cumulative): this must not be missable.
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] COLUMN VERIFY FAIL: %u mismatching dwords over %u ")
+			       TEXT("columns compared (cumulative). The converted Column kernel and the ")
+			       TEXT("classic ColumnMain disagree; the leg is invalid."),
+			       ColMismatch, ColChecked);
+		}
 		const bool bOk = GpuConsumed == ProofStashConsumed
 		              && GpuFold == ProofStashFold
 		              && GpuTail == ProofStashTail;
@@ -258,8 +328,8 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		{
 			UE_LOG(LogVoxelGpuWorklist, Log,
 			       TEXT("[gpu-worklist] proof #%u ok: gpu consumed=%u fold=0x%08x tail=%u ")
-			       TEXT("== host (malformed-on-gpu=%u)"),
-			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad);
+			       TEXT("== host (malformed-on-gpu=%u; colverify checked=%u mism=%u)"),
+			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch);
 			if (GpuBad > 0)
 			{
 				UE_LOG(LogVoxelGpuWorklist, Error,
@@ -293,20 +363,28 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 
 	ENQUEUE_RENDER_COMMAND(VoxelWorklistFlush)(
 		[this, StagedNow = MoveTemp(Staged), FirstSlot, NewHead,
-		 SliceBudgetRecords, bRequestProof, RequestSeq = ProofSeq](FRHICommandListImmediate& RHICmdList)
+		 SliceBudgetRecords, bRequestProof, RequestSeq = ProofSeq,
+		 // Column stage: plain values latched on the game thread. The atlas
+		 // pointer is process-lifetime (FVoxelWorldImpl owns it), the same
+		 // lifetime argument every region graph already leans on.
+		 bColumns = bColumnStageArmed, Atlas = ColumnAtlas,
+		 ColSeedLo = ColumnSeedLo, ColSeedHi = ColumnSeedHi,
+		 ColPixelSizeMm = ColumnPixelSizeMm](FRHICommandListImmediate& RHICmdList)
 	{
 		// Land any outstanding proof copy BEFORE building this tick's graph:
 		// Lock/Unlock want a quiescent readback, and the values must be
 		// published before the game thread can see the sequence move.
 		if (bProofCopyInFlight && ProofReadback != nullptr && ProofReadback->IsReady())
 		{
-			const uint32* Data = static_cast<const uint32*>(ProofReadback->Lock(4 * sizeof(uint32)));
+			const uint32* Data = static_cast<const uint32*>(ProofReadback->Lock(kStatsDwords * sizeof(uint32)));
 			if (Data != nullptr)
 			{
 				GProofGpuConsumed.store(Data[0], std::memory_order_relaxed);
 				GProofGpuFold.store(Data[1], std::memory_order_relaxed);
 				GProofGpuBad.store(Data[2], std::memory_order_relaxed);
 				GProofGpuTail.store(Data[3], std::memory_order_relaxed);
+				GProofColMismatch.store(Data[4], std::memory_order_relaxed);
+				GProofColChecked.store(Data[5], std::memory_order_relaxed);
 				GProofLandedSeq.store(ProofCopySeq, std::memory_order_release);
 			}
 			ProofReadback->Unlock();
@@ -356,6 +434,60 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistArgs"), Shader, Params,
 			FIntVector(1, 1, 1));
 
+		// --- the CONVERTED Column stage: ONE indirect dispatch per tick -----
+		//
+		// Group count = Take * 16 off the triple the args pass just wrote;
+		// the CPU never sees it. Every consumed record's 1,024 columns land
+		// in the persistent arena at slice (mono - consumeFirst) * 1024; the
+		// batch graph -- whose render command was enqueued AFTER this one, so
+		// it executes after -- reads each chunk's slice through worldgen.ush's
+		// ColumnReadBase instead of running its own ColumnMain pass. This
+		// replaces one pass per CHUNK with one per TICK for this stage: the
+		// measured arithmetic is 15 passes/chunk x 2,108 chunks/s = 31,620
+		// passes/s (1.1x the ~500/tick hitch cliff) on the classic shape,
+		// against ~3 constant spine passes + 14 per chunk with this armed.
+		// The dispatch is recorded even at Take == 0 (zero groups): constant
+		// pass count per tick is the property being bought.
+		if (bColumns && Atlas != nullptr)
+		{
+			if (!PooledColumnArena.IsValid())
+			{
+				// Lazy, in the first armed flush's own render command:
+				// AllocatePooledBuffer, NOT an RDG transient, because the
+				// batch graph reads it -- and NOT QueueBufferExtraction from
+				// a graph, because tonight's sibling lesson is that RDG
+				// refuses to extract what no pass wrote. Sized to the latched
+				// slice budget: Take <= SliceBudget by construction.
+				ColumnArenaRecords = FMath::Max(SliceBudgetRecords, 1u);
+				PooledColumnArena = AllocatePooledBuffer(
+					FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelGpuColumnSample),
+					                                     ColumnArenaRecords * kColumnsPerRecord),
+					TEXT("Voxel.WorklistColumnArena"));
+				UE_LOG(LogVoxelGpuWorklist, Log,
+				       TEXT("[gpu-worklist] column arena created: %u slices x %u columns ")
+				       TEXT("(%.1f MiB); Column stage dispatching indirect from this flush on."),
+				       ColumnArenaRecords, kColumnsPerRecord,
+				       double(ColumnArenaRecords * kColumnsPerRecord *
+				              sizeof(FVoxelGpuColumnSample)) / (1024.0 * 1024.0));
+			}
+			FRDGBufferRef Arena = GraphBuilder.RegisterExternalBuffer(
+				PooledColumnArena, TEXT("Voxel.WorklistColumnArena"));
+
+			VoxelGpuWorldGen::FWorklistColumnDispatch Dispatch;
+			Dispatch.Records = Records;
+			Dispatch.Control = Control;
+			Dispatch.IndirectArgs = Args;
+			Dispatch.IndirectArgsOffset =
+				uint32(EVoxelWorklistStage::Column) * 3u * uint32(sizeof(uint32));
+			Dispatch.RingCapacity = Capacity;
+			Dispatch.ColumnArena = Arena;
+			Dispatch.Atlas = Atlas;
+			Dispatch.SeedLo = ColSeedLo;
+			Dispatch.SeedHi = ColSeedHi;
+			Dispatch.PixelSizeMm = ColPixelSizeMm;
+			VoxelGpuWorldGen::AddWorklistColumnPass(GraphBuilder, Dispatch);
+		}
+
 		// --- the spine prover: the first indirect consumer ------------------
 		// Group count comes from the Record-stage triple the args pass wrote
 		// (1 group per consumed record) -- the CPU never sees it. RDG orders
@@ -382,7 +514,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				{
 					ProofReadback = new FRHIGPUBufferReadback(TEXT("Voxel.WorklistProof"));
 				}
-				AddEnqueueCopyPass(GraphBuilder, ProofReadback, Stats, 4 * uint32(sizeof(uint32)));
+				AddEnqueueCopyPass(GraphBuilder, ProofReadback, Stats, kStatsDwords * uint32(sizeof(uint32)));
 				bProofCopyInFlight = true;
 				ProofCopySeq = RequestSeq;
 			}
@@ -412,6 +544,28 @@ FVoxelGpuWorklist::FBindings FVoxelGpuWorklist::Register(FRDGBuilder& GraphBuild
 	Out.Records = GraphBuilder.CreateSRV(Records);
 	Out.IndirectArgs = GraphBuilder.RegisterExternalBuffer(PooledArgs, TEXT("Voxel.WorklistArgs"));
 	Out.Control = GraphBuilder.CreateSRV(Control);
+	return Out;
+}
+
+FVoxelGpuWorklist::FColumnStageBindings FVoxelGpuWorklist::RegisterColumnStage(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
+	FColumnStageBindings Out;
+	// Null until the first ARMED flush executed on this thread. Render
+	// commands run in enqueue order and the flush that fills the arena is
+	// enqueued before any batch that consumes it, so a null here means the
+	// stage genuinely never dispatched -- the caller's fallback-and-count
+	// path, not a race to paper over.
+	if (PooledColumnArena.IsValid())
+	{
+		Out.Arena = GraphBuilder.RegisterExternalBuffer(PooledColumnArena,
+		                                                TEXT("Voxel.WorklistColumnArena"));
+	}
+	if (PooledStats.IsValid())
+	{
+		Out.Stats = GraphBuilder.RegisterExternalBuffer(PooledStats,
+		                                                TEXT("Voxel.WorklistStats"));
+	}
 	return Out;
 }
 

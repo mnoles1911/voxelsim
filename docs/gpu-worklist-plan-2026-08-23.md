@@ -93,6 +93,42 @@ themselves broken); proofs never landing despite consumption; `[gpu-worklist]`
 lines on the control arm; or arm B moving throughput/p50 materially in either
 direction (the spine is supposed to be ~free — if it costs, that is a finding).
 
+## Stage 1 LANDED: the Column kernel (2026-08-23, -VoxelGpuWorklistColumns)
+
+The first converted generation kernel, committed authored-not-yet-built.
+`ColumnWorklistMain` (ue-project/Shaders/VoxelWorklistColumn.usf) is dispatched
+ONCE PER TICK through the Column-stage indirect triple (16 groups per consumed
+record) and computes every consumed record's 1,024 columns into a flush-level
+column arena (budget x 1,024 GpuColumnSample; 20 MiB at the default 1,024
+budget, logged at creation). The chunk's classic VoxelizeMain reads its slice
+through `ColumnReadBase` (worldgen.ush) and the chunk's own ColumnMain pass is
+SKIPPED. The math is not copied: worldgen.ush's ColumnMain body was factored
+into `columnSampleAt` and BOTH entry points call the same text.
+
+* Switches: `-VoxelGpuWorklistColumns=1` (on top of `-VoxelGpuWorklist=1`);
+  byte gate `-VoxelGpuWorklistVerifyCols=1` (classic ColumnMain re-run per
+  converted chunk + a compare pass into stats [4..5], riding the proof
+  readback; +2 passes/chunk, verify arm only).
+* Ordering: DispatchBatch appends, then FLUSHES (upload + args + column
+  dispatch + prover), then enqueues the batch graph -- render commands execute
+  in enqueue order, so the arena is written before VoxelizeMain reads it.
+  With the stage off the flush stays in Tick, exactly where the spine was
+  measured.
+* Expected arithmetic: lean-alloc chunks drop 17 -> 16 passes; the spine's
+  constant goes 2 -> 3/tick. passes/tick DROPS by ~chunks/tick but does NOT
+  flatten -- six stages remain per-chunk. Throughput is expected NOT to move
+  (admission is the limiter).
+* Readings: `[gpu-worklist] wlcols conv= fb= arenaMissing= colverify checked=
+  mism=`. FAILING: conv=0 with fb growing (stage converts nothing);
+  arenaMissing>0 (flush/batch ordering broke -- every one fell back);
+  mism>0 (converted columns differ from classic: LEG INVALID); checked=0 with
+  conv>0 under the verify switch (the byte gate is dead).
+* Exclusions, counted as fb: stack-fused members (AddBrickStackPasses takes no
+  feed yet), records deferred past the budget, refused-full records.
+* Offline gate: tools/voxel-check-worklist-shader.ps1 now compiles all 10
+  kernels (both new entries, the factored classic forms in both atlas
+  permutations, and the bench form) in ~2 s without an editor.
+
 ## Conversion sequencing (the P3 work proper)
 
 Stage by stage, each stage gated before the next:

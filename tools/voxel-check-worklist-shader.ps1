@@ -37,18 +37,30 @@ if (-not (Test-Path $Dxc)) { $Dxc = 'D:\voxelsim\tools\dxc\bin\x64\dxc.exe' }
 $Ush = Join-Path $Root 'ue-project\Shaders\VoxelWorklist.ush'
 $ArgsUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistArgs.usf'
 $ConsumeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistConsume.usf'
+$ColumnUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistColumn.usf'
+$WorldGen = Join-Path $Root 'voxel-core\shaders\worldgen.ush'
 $Stage = Join-Path $env:TEMP 'voxel-worklist-check'
 
 if (-not (Test-Path $Dxc)) { throw "dxc not found at $Dxc (run tools/fetch-dxc.ps1)" }
 if (-not (Test-Path $Ush)) { throw "VoxelWorklist.ush not found at $Ush" }
 if (-not (Test-Path $ArgsUsf)) { throw "VoxelWorklistArgs.usf not found at $ArgsUsf" }
 if (-not (Test-Path $ConsumeUsf)) { throw "VoxelWorklistConsume.usf not found at $ConsumeUsf" }
+if (-not (Test-Path $ColumnUsf)) { throw "VoxelWorklistColumn.usf not found at $ColumnUsf" }
+if (-not (Test-Path $WorldGen)) { throw "worldgen.ush not found at $WorldGen" }
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
 New-Item -ItemType Directory -Path $Stage | Out-Null
+
+# The version lock, read from the file itself so this script cannot drift from
+# it (the converted column kernel compiles worldgen.ush, which #errors under
+# VXC_UE without a matching VXC_WORLDGEN_VERSION_CPP).
+$VersionLine = Select-String -Path $WorldGen -Pattern 'define VXC_WORLDGEN_VERSION_USH (\d+)'
+if (-not $VersionLine) { throw "VXC_WORLDGEN_VERSION_USH not found in $WorldGen" }
+$WorldGenVersion = $VersionLine.Matches[0].Groups[1].Value
 
 # The virtual include paths only resolve inside the engine; stage flat copies
 # with the includes rewritten. Nothing in the source tree is modified.
 Copy-Item $Ush (Join-Path $Stage 'VoxelWorklist.ush')
+Copy-Item $WorldGen (Join-Path $Stage 'worldgen.ush')
 (Get-Content $ArgsUsf -Raw).
     Replace('#include "/Engine/Public/Platform.ush"', '// platform stub') |
     Out-File (Join-Path $Stage 'VoxelWorklistArgs.hlsl') -Encoding utf8
@@ -56,13 +68,19 @@ Copy-Item $Ush (Join-Path $Stage 'VoxelWorklist.ush')
     Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
     Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"') |
     Out-File (Join-Path $Stage 'VoxelWorklistConsume.hlsl') -Encoding utf8
+(Get-Content $ColumnUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelCore/worldgen.ush"', '"worldgen.ush"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistColumn.hlsl') -Encoding utf8
 
 $Out = Join-Path $Stage 'out.bin'
 $Fail = 0
 $Total = 0
 
-function Try-Compile($Src, $EntryPoint, $Label) {
+function Try-Compile($Src, $EntryPoint, $Label, [string[]]$Defines = @()) {
     $ArgList = @('-T', 'cs_6_0', '-E', $EntryPoint, '-HV', '2021', '-O3', '-Fo', $script:Out, $Src)
+    foreach ($D in $Defines) { $ArgList += @('-D', $D) }
     # stderr to a file, not 2>&1: PowerShell 5.1 wraps native stderr lines in
     # NativeCommandError and aborts the run on the first failing kernel.
     $ErrFile = Join-Path $script:Stage 'dxc-stderr.txt'
@@ -83,6 +101,31 @@ function Try-Compile($Src, $EntryPoint, $Label) {
 
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistArgs.hlsl')    'WorklistArgsMain'    'args    DXIL  WorklistArgsMain'
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistConsume.hlsl') 'WorklistConsumeMain' 'consume DXIL  WorklistConsumeMain'
+
+# The converted Column stage (VoxelWorklistColumn.usf): compiles worldgen.ush
+# under VXC_UE + VXC_RASTER_ATLAS + the stage-shape defines the host class
+# sets. The defines mirror FVoxelWorklistColumnCS::ModifyCompilationEnvironment
+# (16 groups / 1,024 columns per record); the kernel #errors on disagreement,
+# so a shape drift fails HERE, not at editor boot.
+$ColumnDefines = @('VXC_UE=1', "VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion",
+                   'VXC_RASTER_ATLAS=1',
+                   'VXC_WORKLIST_COLUMN_GROUPS=16', 'VXC_WORKLIST_COLS_PER_RECORD=1024')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistColumn.hlsl') 'ColumnWorklistMain'       'column  DXIL  ColumnWorklistMain'       $ColumnDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistColumn.hlsl') 'ColumnWorklistVerifyMain' 'colvfy  DXIL  ColumnWorklistVerifyMain' $ColumnDefines
+
+# The factored classic kernels, both atlas permutations -- the factoring must
+# not have broken the shipped forms (the digest gate proves bytes; this proves
+# the compile before a leg is spent on it).
+$UeDefines = @('VXC_UE=1', "VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion")
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'worldgen.ush') 'ColumnMain'   'wg      DXIL  ColumnMain (VXC_UE)'            $UeDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'worldgen.ush') 'ColumnMain'   'wg      DXIL  ColumnMain (VXC_UE, atlas)'     ($UeDefines + 'VXC_RASTER_ATLAS=1')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'worldgen.ush') 'VoxelizeMain' 'wg      DXIL  VoxelizeMain (VXC_UE)'          $UeDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'worldgen.ush') 'VoxelizeMain' 'wg      DXIL  VoxelizeMain (VXC_UE, atlas)'   ($UeDefines + 'VXC_RASTER_ATLAS=1')
+# And the bench form (explicit cbuffer, no VXC_UE) -- worldgen.ush is shared
+# with the standalone Vulkan bench, and an edit that only compiles under
+# VXC_UE would break it silently.
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'worldgen.ush') 'ColumnMain'   'wg      DXIL  ColumnMain (bench form)'        @("VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion")
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'worldgen.ush') 'VoxelizeMain' 'wg      DXIL  VoxelizeMain (bench form)'      @("VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion")
 
 Write-Host ''
 if ($Fail -gt 0) {
