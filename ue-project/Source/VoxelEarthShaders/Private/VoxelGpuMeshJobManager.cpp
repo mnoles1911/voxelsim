@@ -1400,6 +1400,13 @@ struct FVoxelGpuMeshJobManager::FJob
 	// 0.0 otherwise, which Deliver()'s existing non-zero guard already treats
 	// as "not measured" the same way it does for DispatchSeconds/ReadySeconds.
 	double PromotedSeconds = 0.0;
+	// The manager's monotonic tick number at promotion. Delivery subtracts it
+	// to get this job's RESIDENCY IN TICKS, which is the denominator of the
+	// throughput ceiling (MaxInFlight / residency x tick rate). Ticks rather
+	// than seconds on purpose: the ceiling is a slots-per-tick argument, and a
+	// millisecond residency divided by a variable frame time is a different and
+	// much less useful number.
+	int64 PromotedTickSeq = 0;
 
 	void SetState(EJobState New) { State.store(int32(New), std::memory_order_release); }
 	EJobState GetState() const { return EJobState(State.load(std::memory_order_acquire)); }
@@ -2188,6 +2195,13 @@ void FVoxelGpuMeshJobManager::Tick()
 	// -- a per-frame cost divided by busy frames is how a per-tick term
 	// disguises itself as a per-chunk one.
 	++JobCost.Ticks;
+	++TickSeq;
+	// Sampled at tick START, before any promotion, so the depth is what the
+	// promote loop was actually facing rather than what it left behind.
+	JobCost.QueueDemandSum += int64(Queued.Num());
+	JobCost.QueueLowSum += int64(QueuedLowPriority.Num());
+	JobCost.InFlightSum += int64(InFlight.Num());
+	JobCost.InFlightMax = FMath::Max(JobCost.InFlightMax, InFlight.Num());
 
 	// Tier B.1. Latched once per tick so one tick behaves like one tick; safe
 	// to flip mid-run because both paths emit identical bytes (the residue of
@@ -2282,12 +2296,83 @@ void FVoxelGpuMeshJobManager::Tick()
 	// Tier B.1: per promoted stackable head, the head plus every Z-sibling
 	// swept out of the same queue. Turned into fused stacks after the loop.
 	TArray<TArray<FJobPtr>> StackSweeps;
+	// --- -VoxelGpuJobLean, half four: BatchCap IS THE 50k WALL ---------------
+	//
+	// THE ARITHMETIC, AND IT IS NOT CLOSE. BatchCap defaults to 64 under
+	// -VoxelGpuPrimary, so the fork can promote at most 64 chunks per tick:
+	// 64 x 60 fps = 3,840 chunks/s, against a target of 50,000/s, which needs
+	// 834 promotions per tick. One constant, a 13x shortfall. The measured GPU
+	// fork (~2,078/s) sits at 54% of it, which is exactly the regime in which a
+	// cap does not LOOK like the binding constraint and is about to become one.
+	//
+	// WHY THE CAP EXISTS, AND WHY THAT REASON HAS BEEN REMOVED FOR SOME JOBS.
+	// BatchCap's own comment is explicit: it is a per-tick BURST limiter
+	// protecting RENDER-THREAD PASS SETUP, not a capacity limit -- "~7 compute
+	// passes + 3-4 copy passes each", and the sweep behind it measured 32/64
+	// giving 367 hitches against 4/8's 8. Every one of those hitches was pass
+	// setup that scaled with the number of promoted chunks.
+	//
+	// Worklist stage 6 (-VoxelGpuWorklistClaim) took a claim-fed chunk's brick
+	// passes to ZERO: "a claim-fed job adds ZERO brick passes to the batch
+	// graph ... production is fully inside the flush graph". For such a chunk
+	// the entire justification for charging it a slice of BatchCap is gone --
+	// and this file already accepts that argument once, for Tier B.1 stack
+	// siblings: "a sibling rides its head's allowance instead of consuming one
+	// -- the per-chunk reason for the cap is exactly what the fusion removes".
+	// Same argument, same conclusion, a different mechanism.
+	//
+	// SO PASS-FREE JOBS GET THEIR OWN ALLOWANCE, and it is bounded by the
+	// resource that actually bounds them: the worklist's per-flush consume
+	// budget. Promoting more pass-free chunks in a tick than the flush can
+	// consume does not make them pass-free -- the surplus falls back to the
+	// classic chain and adds ~15 passes each, which is precisely the hitch
+	// BatchCap exists to prevent. The Write triple's 65,535-group ceiling
+	// (442 records) caps it in turn, and that ceiling is itself a 26,520/s wall
+	// on the claim stage -- a finding for the worklist lane, not this one.
+	//
+	// THE REFUTATION IS BUILT IN. passFreeOverCap counts only promotions that
+	// happened while DemandPromoted was ALREADY at BatchCap -- i.e. promotions
+	// the shipped gate would have blocked. If it reads 0 with the switch armed,
+	// this bought nothing: either nothing is claim-fed, or the cap was never
+	// the binding constraint on this leg. Both are findings and neither is a
+	// green light. Off, PassFreeCap is 0, the head test can never take the
+	// pass-free branch, and the loop is byte-identical.
+	const int32 PassFreeCap = (VoxelGpuJobLeanEnabled() && VoxelGpuWorklistEnabled()
+	                           && VoxelGpuWorklistClaimEnabled() && VoxelGpuPoolAllocEnabled())
+		? int32(FMath::Min(VoxelGpuWorklistCellBudget(),
+		                   65535u / FVoxelGpuWorklist::kWriteGroupsPerRecord))
+		: 0;
+
 	int32 DemandPromoted = 0;
+	int32 DemandPassFree = 0;
 	int32 LowPriorityPromoted = 0;
 	while (InFlight.Num() + Batch.Num() < MaxInFlight)
 	{
 		// Demand first, always, while it has both work and allowance.
-		const bool bDemandCanRun = Queued.Num() > 0 && DemandPromoted < BatchCap;
+		//
+		// THE HEAD IS PEEKED, NOT POPPED, so the allowance decision costs
+		// nothing and strict FIFO is untouched: a head that cannot be afforded
+		// stays exactly where it is, and low-priority still gets its turn
+		// exactly as it does today when demand exhausts BatchCap.
+		bool bHeadPassFree = false;
+		bool bDemandCanRun = false;
+		if (Queued.Num() > 0)
+		{
+			const FJobPtr& Head = Queued[0];
+			// Predicted from fields latched at Submit, and it mirrors the
+			// claim stage's own eligibility (brick-only, band-free, packing,
+			// atlas-fed). A prediction that turns out wrong costs the tick a
+			// few extra passes, never correctness: the record simply is not
+			// consumed and the chunk runs classic, which is the same fallback
+			// every deferred record already takes.
+			bHeadPassFree = PassFreeCap > 0
+				&& !Head->bQuadMesh
+				&& Head->Region.BandEdge == 0
+				&& Head->bBrickPack
+				&& Head->BrickRegion.bRasterAtlas;
+			bDemandCanRun = bHeadPassFree ? (DemandPassFree < PassFreeCap)
+			                              : (DemandPromoted < BatchCap);
+		}
 		const bool bLowCanRun = QueuedLowPriority.Num() > 0 && LowPriorityPromoted < SpecBatchCap;
 		if (!bDemandCanRun && !bLowCanRun)
 		{
@@ -2310,6 +2395,7 @@ void FVoxelGpuMeshJobManager::Tick()
 		// on. One FPlatformTime::Seconds() per promoted job is nothing against
 		// the seven compute passes that follow it.
 		Job->PromotedSeconds = FPlatformTime::Seconds();
+		Job->PromotedTickSeq = TickSeq;
 
 		FString ValidationError;
 		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
@@ -2317,10 +2403,44 @@ void FVoxelGpuMeshJobManager::Tick()
 			Rejected.Emplace(Job, TEXT("Requires SM6 (64-bit integer shader ops). Relaunch with -sm6."));
 			continue;
 		}
-		if (!VoxelGpuWorldGen::ValidateRegionRequest(Job->Region, ValidationError))
+		// -VoxelGpuJobLean, half three: a LEAN job's mesh region is never
+		// dispatched, so validating it and sizing its graph are two per-chunk
+		// terms paid for a request that no graph will ever see.
+		//
+		// WHY THE COVERAGE IS NOT LOST. The asset block of this validation is
+		// the only part that reads anything variable, and Submit already ran
+		// the identical check against the BRICK region -- which, on this path,
+		// holds those very instances (see MakeBrickRegionMoveAssets). Every
+		// other check is about the footprint SHAPE, which SetChunkFootprint
+		// constructs and which MakeBrickRegion re-derives and Submit
+		// re-validates. A job that reached here with bBrickPack set has
+		// therefore already passed an equivalent validation this same call
+		// stack. A job WITHOUT bBrickPack is not lean and takes the full path
+		// below, unchanged.
+		//
+		// WHY ComputeRegionGraphSizes GOES WITH IT. Every field of FJob::Sizes
+		// is read on the quad/readback path only -- CountsBytes, MaskCount,
+		// MaxQuads, QuadWriteBase -- and InteriorX/Y/Z feed
+		// RebaseQuadsToChunkLocal, which a brick-only job never reaches. They
+		// are zeroed rather than left stale, so a future reader gets a
+		// defensible zero instead of a plausible number from another shape.
+		const bool bLeanPromote = VoxelGpuJobLeanEnabled()
+			&& VoxelGpuLeanBrickJobsEnabled()
+			&& !Job->bQuadMesh
+			&& Job->Region.BandEdge == 0
+			&& Job->bBrickPack;
+		if (bLeanPromote)
 		{
-			Rejected.Emplace(Job, ValidationError);
-			continue;
+			++JobCost.LeanPromoteValSkipped;
+		}
+		else
+		{
+			++JobCost.LeanPromoteValRan;
+			if (!VoxelGpuWorldGen::ValidateRegionRequest(Job->Region, ValidationError))
+			{
+				Rejected.Emplace(Job, ValidationError);
+				continue;
+			}
 		}
 		// A JOB MUST PRODUCE SOMETHING -- and as of Phase 5 that is no longer the
 		// same statement as "must produce quads".
@@ -2345,15 +2465,48 @@ void FVoxelGpuMeshJobManager::Tick()
 			continue;
 		}
 
-		Job->Sizes = VoxelGpuWorldGen::ComputeRegionGraphSizes(Job->Region);
-		Job->InteriorX = Job->Sizes.BricksX - 2;
-		Job->InteriorY = Job->Sizes.BricksY - 2;
-		Job->InteriorZ = Job->Sizes.BricksZ - 2;
+		if (bLeanPromote)
+		{
+			// Zeroed, not left stale: Sizes.BricksX is 0 here, and
+			// `0 - 2` on the unsigned Interior fields would publish 4294967294
+			// -- a number that is wrong in the direction that looks like data.
+			Job->Sizes = VoxelGpuWorldGen::FRegionGraphSizes();
+			Job->InteriorX = 0;
+			Job->InteriorY = 0;
+			Job->InteriorZ = 0;
+		}
+		else
+		{
+			Job->Sizes = VoxelGpuWorldGen::ComputeRegionGraphSizes(Job->Region);
+			Job->InteriorX = Job->Sizes.BricksX - 2;
+			Job->InteriorY = Job->Sizes.BricksY - 2;
+			Job->InteriorZ = Job->Sizes.BricksZ - 2;
+		}
 
 		// Counted here, not at the take, so a REJECTED job still costs no
 		// allowance -- preserving BatchCap's documented "counts promoted jobs,
 		// not loop iterations" behaviour for demand exactly as before.
-		if (bTakeLowPriority) { ++LowPriorityPromoted; } else { ++DemandPromoted; }
+		if (bTakeLowPriority)
+		{
+			++LowPriorityPromoted;
+		}
+		else if (bHeadPassFree)
+		{
+			// Charged to the pass-free allowance, not to BatchCap.
+			++DemandPassFree;
+			++JobCost.PassFreePromotes;
+			if (DemandPromoted >= BatchCap)
+			{
+				// THE REFUTATION. This promotion would not have happened under
+				// the shipped gate. A window in which this stays 0 means the
+				// switch converted nothing.
+				++JobCost.PassFreeOverCap;
+			}
+		}
+		else
+		{
+			++DemandPromoted;
+		}
 		Batch.Add(MoveTemp(Job));
 
 		// --- Tier B.1: sweep this head's Z-siblings out of the same queue ---
@@ -2422,6 +2575,7 @@ void FVoxelGpuMeshJobManager::Tick()
 					// The main loop's promote bookkeeping, verbatim, minus the
 					// allowance increment -- see the cap note above.
 					Sibling->PromotedSeconds = FPlatformTime::Seconds();
+					Sibling->PromotedTickSeq = TickSeq;
 					FString SiblingError;
 					if (!VoxelGpuWorldGen::ValidateRegionRequest(Sibling->Region, SiblingError))
 					{
@@ -2437,6 +2591,25 @@ void FVoxelGpuMeshJobManager::Tick()
 				}
 			}
 		}
+	}
+
+	// WHY THE PROMOTE LOOP STOPPED. Three counters, evaluated once per tick,
+	// and they are the manager's own version of the streaming side's
+	// exitCap=/exitEmpty= pair -- which the handoff's standing rule says must
+	// be read together with dispatched/drained. Order matters: the cap is
+	// checked first because the loop condition is what enforces it, and a tick
+	// that hit the cap may ALSO have work left queued.
+	if (InFlight.Num() + Batch.Num() >= MaxInFlight)
+	{
+		++JobCost.PromoteExitCap;
+	}
+	else if (Queued.Num() > 0 || QueuedLowPriority.Num() > 0)
+	{
+		++JobCost.PromoteExitQuota;
+	}
+	else
+	{
+		++JobCost.PromoteExitEmpty;
 	}
 
 	// --- Tier B.1: turn the sweeps into fused stack dispatches --------------
@@ -3188,6 +3361,41 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 //  * bytesSaved=0 with assetMove>0: the moves ran and there was nothing to
 //    move (no assets on this leg). The switch is not broken; the leg has no
 //    asset traffic, and this collapse cannot be credited with anything.
+//  * promoteExit all three near zero: the promote loop did not run. Broken
+//    instrument, not a healthy manager.
+//  * promoteExit cap= dominating: DEPTH-bound. Read `drained` on the streaming
+//    side BEFORE believing it -- the 90,000-deep backlog is what makes a cap
+//    reading a trap, and raising a cap in front of a starved drain makes it
+//    strictly worse.
+//  * promoteExit quota= dominating: QUOTA-bound at MeshBatchCap with work
+//    queued. The per-tick promotion allowance is the limit; neither depth nor
+//    the GPU is.
+//  * promoteExit empty= dominating with inFlight low: STARVED. Nothing in this
+//    manager is the limit; the producer upstream is.
+//  * residSamples=0 while promoted>0: jobs are being promoted and never
+//    delivered. ceiling/s is then meaningless and MUST NOT be quoted -- that
+//    is a stranded population, which is the failure the exactly-one-outcome
+//    contract exists to make impossible.
+//  * ceiling/s below the measured fork rate: the derivation is wrong, not the
+//    fork. Suspect residency being sampled from a non-representative
+//    population before quoting anything.
+//  * poolReplaced>0 on a COLD FILL: chunks are being generated over chunks
+//    that are already resident. Each one is a wasted submit, shell, graph,
+//    claim and delivery -- whole chunks of work, not microseconds. With
+//    evictions=0 the only mechanism is AllocateForChunk's same-key
+//    replacement. poolReplaced/shellsTaken is the redundancy rate and it
+//    multiplies straight into the 7.1x that cold start needs.
+//  * passFreeOverCap=0 with -VoxelGpuJobLean armed: half four converted
+//    NOTHING -- either no job is claim-fed (check the worklist wlclaim line's
+//    conv=) or MeshBatchCap was never the binding constraint on this leg
+//    (check promoteExit quota=). Both are findings; neither is a green light,
+//    and no throughput difference between arms is attributable until this
+//    number is non-zero.
+//  * passFreeOverCap large while the measured fork rate does not move: the cap
+//    was not the wall. Read promoteExit again -- it will now say which of
+//    depth, quota or starvation replaced it.
+//  * leanPromoteSkip=0 with -VoxelGpuJobLean armed: half three converted
+//    nothing; same four preconditions as the asset move.
 //  * revalSkip=0 with -VoxelGpuJobLean armed: something LEFT the pool's
 //    resident map while the shells were being taken (an eviction, or two
 //    queued jobs for one chunk key), which is exactly when the revalidation is
@@ -3228,13 +3436,31 @@ void FVoxelGpuMeshJobManager::MaybeLogJobCostWindow()
 	const double TickChargedMs = JobCost.EnqDispatchMs + JobCost.EnqPollMs
 		+ JobCost.EnqFetchMs + JobCost.EnqReleaseMs + JobCost.DeliverMs;
 
+	// THE CEILING. Fork throughput cannot exceed MaxInFlight / residency x tick
+	// rate, whatever else is fixed, because a slot cannot be reused until the
+	// job in it is delivered. Derived from THIS window's own residency and tick
+	// rate rather than from a nominal frame time, so it is a measurement and
+	// not an assumption. Zero when nothing delivered -- see the failing reading.
+	const double WindowSeconds = FMath::Max(Now - LastJobCostLogSeconds, 1e-6);
+	const double TicksPerSec = double(JobCost.Ticks) / WindowSeconds;
+	const double MeanResidencyTicks = JobCost.ResidencySamples > 0
+		? double(JobCost.ResidencyTickSum) / double(JobCost.ResidencySamples)
+		: 0.0;
+	const double CeilingPerSec = MeanResidencyTicks > 0.0
+		? (double(MaxInFlight) / MeanResidencyTicks) * TicksPerSec
+		: 0.0;
+
 	UE_LOG(LogVoxelGpuMeshJob, Log,
 	       TEXT("[gpu-jobcost] submits=%lld subUs=%.2f (hdr %.2f + brick %.2f + queue %.2f, ")
 	       TEXT("drift %.3fms) | copyPerChunk rasterB=%.0f assetB=%.0f | ticks=%lld ")
 	       TEXT("promoted=%lld batches=%lld pollJobs/tick=%.0f | chargedMs=%.1f = enqDisp %.1f ")
 	       TEXT("+ enqPoll %.1f + enqFetch %.1f + enqRel %.1f + deliver %.1f | perTickUs=%.1f ")
 	       TEXT("perDeliverUs=%.1f delivered=%lld | jobLean=%s assetMove=%lld assetCopy=%lld ")
-	       TEXT("bytesSaved=%lld revalSkip=%lld revalRan=%lld"),
+	       TEXT("bytesSaved=%lld revalSkip=%lld revalRan=%lld leanPromoteSkip=%lld/%lld ")
+	       TEXT("passFree=%lld overCap=%lld")
+	       TEXT(" || FLOW qDemand=%.0f qLow=%.0f inFlight=%.0f/max %d/cap %d ")
+	       TEXT("promoteExit cap=%lld quota=%lld empty=%lld | residTicks=%.2f n=%lld ")
+	       TEXT("tickHz=%.1f CEILING=%.0f/s | shellsTaken=%lld poolReplaced=%lld (%.1f%%)"),
 	       JobCost.Submits,
 	       (JobCost.SubmitTotalMs * 1000.0) / SubN,
 	       (JobCost.SubmitHdrMs * 1000.0) / SubN,
@@ -3253,7 +3479,19 @@ void FVoxelGpuMeshJobManager::MaybeLogJobCostWindow()
 	       JobCost.Delivered,
 	       VoxelGpuJobLeanEnabled() ? TEXT("ON") : TEXT("off"),
 	       JobCost.LeanAssetMoves, JobCost.LeanAssetCopies, JobCost.LeanAssetBytesSaved,
-	       JobCost.LeanRevalSkipped, JobCost.LeanRevalRan);
+	       JobCost.LeanRevalSkipped, JobCost.LeanRevalRan,
+	       JobCost.LeanPromoteValSkipped, JobCost.LeanPromoteValRan,
+	       JobCost.PassFreePromotes, JobCost.PassFreeOverCap,
+	       double(JobCost.QueueDemandSum) / TickN,
+	       double(JobCost.QueueLowSum) / TickN,
+	       double(JobCost.InFlightSum) / TickN,
+	       JobCost.InFlightMax, MaxInFlight,
+	       JobCost.PromoteExitCap, JobCost.PromoteExitQuota, JobCost.PromoteExitEmpty,
+	       MeanResidencyTicks, JobCost.ResidencySamples,
+	       TicksPerSec, CeilingPerSec,
+	       JobCost.ShellsTaken, JobCost.PoolReplaced,
+	       JobCost.ShellsTaken > 0
+	           ? 100.0 * double(JobCost.PoolReplaced) / double(JobCost.ShellsTaken) : 0.0);
 
 	if (VoxelGpuJobLeanEnabled() && JobCost.Submits > 0 && JobCost.LeanAssetMoves == 0)
 	{
@@ -3264,6 +3502,21 @@ void FVoxelGpuMeshJobManager::MaybeLogJobCostWindow()
 		       TEXT("(-VoxelGpuBandSeedOnly) and the raster atlas (-VoxelGpuRasterAtlas). ")
 		       TEXT("Treat this window's asset-copy saving as NOT MEASURED."),
 		       JobCost.Submits, JobCost.LeanAssetCopies);
+	}
+
+	if (JobCost.PoolReplaced > 0)
+	{
+		UE_LOG(LogVoxelGpuMeshJob, Warning,
+		       TEXT("[gpu-jobcost] %lld of %lld shells REPLACED an already-resident chunk ")
+		       TEXT("(%.1f%%). On a cold fill nothing should be resident yet, so each one is a ")
+		       TEXT("whole chunk regenerated over itself: a wasted submit, shell, graph, claim ")
+		       TEXT("and delivery. Cross-check the pool's evictions= before reading it as ")
+		       TEXT("duplicate submission -- with evictions>0 this is churn, and only with ")
+		       TEXT("evictions=0 is AllocateForChunk's same-key replacement the sole mechanism ")
+		       TEXT("left."),
+		       JobCost.PoolReplaced, JobCost.ShellsTaken,
+		       JobCost.ShellsTaken > 0
+		           ? 100.0 * double(JobCost.PoolReplaced) / double(JobCost.ShellsTaken) : 0.0);
 	}
 
 	JobCost = FJobCostWindow();
@@ -3373,9 +3626,16 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		}
 		// Rule 2: drop the brick half of any job whose shell was stolen by a
 		// later allocation's eviction inside this very loop.
-		const bool bSkipReval = bLeanReval &&
-			(int64(Pool.GetNumResidentChunks() - ResidentBefore)
-			     == (Pool.GetChunksAdded() - AddedBefore));
+		// The two deltas, KEPT rather than discarded once compared. Their
+		// difference is the exact number of chunks that LEFT the resident map
+		// while this batch's shells were being taken -- see FJobCostWindow's
+		// PoolReplaced for why that count is the most valuable number in this
+		// file, and for what it means on a leg reporting evictions=0.
+		const int64 ShellsAdded = Pool.GetChunksAdded() - AddedBefore;
+		const int64 ResidentGrew = int64(Pool.GetNumResidentChunks() - ResidentBefore);
+		JobCost.ShellsTaken += ShellsAdded;
+		JobCost.PoolReplaced += (ShellsAdded - ResidentGrew);
+		const bool bSkipReval = bLeanReval && (ResidentGrew == ShellsAdded);
 		if (bSkipReval)
 		{
 			JobCost.LeanRevalSkipped += int64(Batch.Num());
@@ -4954,6 +5214,16 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 	const double DeliverStart = FPlatformTime::Seconds();
 	for (const FPending& P : Finished)
 	{
+		// Residency in TICKS, sampled from every delivery including failures
+		// and timeouts. Those belong in the population: a job that occupied a
+		// slot for the whole 10 s timeout is exactly the kind of resident this
+		// ceiling is about, and excluding it would flatter the number in the
+		// direction that hides the problem.
+		if (P.Job->PromotedTickSeq > 0)
+		{
+			JobCost.ResidencyTickSum += (TickSeq - P.Job->PromotedTickSeq);
+			++JobCost.ResidencySamples;
+		}
 		Deliver(P.Job, P.Status, P.Error);
 		ToRelease.Add(P.Job);
 	}

@@ -274,7 +274,18 @@ VOXELEARTHSHADERS_API bool VoxelGpuPrimaryEnabled();
 //      (MakeBrickRegionMoveAssets, above -- `assetMove=` vs `assetCopy=`);
 //   2. DispatchBatch's shell REVALIDATION pass is skipped when nothing left the
 //      pool's resident map while the shells were being taken, which is the only
-//      way a shell can be stolen (`revalSkip=` vs `revalRan=`).
+//      way a shell can be stolen (`revalSkip=` vs `revalRan=`);
+//   3. a LEAN job skips validating and sizing a mesh region no graph will ever
+//      see (`leanPromoteSkip=`);
+//   4. a job the worklist's claim stage will produce entirely inside the flush
+//      graph -- which adds ZERO passes to the batch graph -- stops consuming
+//      `voxel.GPU.MeshBatchCap`, whose whole purpose is bounding per-chunk
+//      RENDER-THREAD PASS SETUP. That cap is 64/tick under -VoxelGpuPrimary,
+//      i.e. 3,840 chunks/s at 60 fps against a 50,000/s target, and it is the
+//      largest single constant standing between the fork and that target.
+//      Pass-free promotion is bounded instead by the worklist's per-flush
+//      consume budget, which is what actually bounds it (`passFreeOverCap=`
+//      is the refutation).
 //
 // Off, every path is byte-identical -- the copy is made, the revalidation runs.
 VOXELEARTHSHADERS_API bool VoxelGpuJobLeanEnabled();
@@ -815,8 +826,80 @@ private:
 		int64 LeanAssetBytesSaved = 0;
 		int64 LeanRevalSkipped = 0;
 		int64 LeanRevalRan = 0;
+		int64 LeanPromoteValSkipped = 0;
+		int64 LeanPromoteValRan = 0;
+		// Half four. PassFreeOverCap is the REFUTATION and is the one to read:
+		// promotions that happened while DemandPromoted was already at
+		// MeshBatchCap, i.e. that the shipped gate would have blocked. Zero
+		// with the switch armed means the collapse bought nothing on this leg.
+		int64 PassFreePromotes = 0;
+		int64 PassFreeOverCap = 0;
+
+		// --- FLOW AND THE DERIVED CEILING ------------------------------------
+		//
+		// THE ONE THING NOBODY MEASURES ABOUT THIS MANAGER. Fork throughput is
+		// bounded by  MaxInFlight / round-trip-residency x tick rate, and that
+		// product has been argued about twice from opposite ends without ever
+		// being computed: the 2026-07-27 depth sweep FALSIFIED the depth
+		// hypothesis (590 chunks/s at cap 1024 vs 602 at 256, fork idling at
+		// ~11 in flight -- never depth-bound), while the 2026-08-23 cold fill
+		// shows a five-second dead window at inFlight=0 pending=512, which is
+		// the opposite failure: a STARVED promoter with a queue behind it.
+		// Both cannot be the regime, and only these counters say which.
+		//
+		// promoteExit is the decisive one, and it is the manager's own version
+		// of the exitCap=/exitEmpty= pair the streaming side already reads:
+		//   cap=   the loop stopped at MaxInFlight -- DEPTH-bound. Raising the
+		//          cap is on the table (but check drained first: the handoff's
+		//          90,000-deep backlog is what makes a cap reading a trap).
+		//   quota= it stopped at MeshBatchCap with work still queued --
+		//          QUOTA-bound. The per-tick promotion allowance is the limit,
+		//          not depth and not the GPU.
+		//   empty= it ran out of work -- STARVED. Nothing here is the limit;
+		//          the producer upstream is. This is what inFlight=0 pending=512
+		//          would have to read as, and if it does not, that reading was
+		//          about a different queue than this one.
+		// A window where all three are near zero means the promote loop did not
+		// run, which is a broken instrument rather than a healthy manager.
+		int64 QueueDemandSum = 0;   // depth at tick start, summed over ticks
+		int64 QueueLowSum = 0;
+		int64 InFlightSum = 0;
+		int32 InFlightMax = 0;
+		int64 PromoteExitCap = 0;
+		int64 PromoteExitQuota = 0;
+		int64 PromoteExitEmpty = 0;
+		// Ticks from promotion to delivery, per delivered job. The denominator
+		// of the ceiling; sampled from every delivery, so a population that
+		// never delivers reports samples=0 rather than a flattering small mean.
+		int64 ResidencyTickSum = 0;
+		int64 ResidencySamples = 0;
+
+		// --- what the pool's resident map lost while shells were taken -------
+		//
+		// EXACT, and free: it is the same two deltas the revalidation skip is
+		// gated on, kept instead of discarded. shellsTaken is the pool's own
+		// ChunksAdded delta; poolReplaced is how many chunks LEFT the resident
+		// map to make room for them. With evictions=0 the only mechanism is
+		// AllocateForChunk's same-key replacement -- i.e. a chunk that was
+		// ALREADY resident being produced again.
+		//
+		// This is the counter the 2026-08-23 revalRan=24,345 finding needs: it
+		// turns "the identity failed on batches totalling 24,345 job-slots"
+		// into "N chunks were regenerated over themselves", which is a count of
+		// WASTED WHOLE CHUNKS -- submit, shell, graph, claim and delivery -- and
+		// therefore the only lead in this file that can delete work rather than
+		// shave it.
+		int64 ShellsTaken = 0;
+		int64 PoolReplaced = 0;
 	};
 	FJobCostWindow JobCost;
 	double LastJobCostLogSeconds = 0.0;
 	void MaybeLogJobCostWindow();
+	// Monotonic tick number, never reset by the window. FJob::PromotedTickSeq
+	// is stamped from it, and the difference at delivery is the job's residency
+	// in ticks -- the denominator of the ceiling above. A window-scoped counter
+	// could not do this: a job promoted in one window and delivered in the next
+	// would produce a negative residency, which is exactly the kind of
+	// plausible-and-wrong number this project keeps retracting.
+	int64 TickSeq = 0;
 };

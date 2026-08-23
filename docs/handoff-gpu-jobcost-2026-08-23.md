@@ -284,3 +284,11 @@ Read in this order:
 **Do not read a throughput difference between the arms before step 3.** Eleven
 features in this project have read healthy while doing nothing; `assetMove` and
 `revalSkip` are the two counters that make that state unrepresentable here.
+
+---
+
+**Round 2 continues in `docs/handoff-gpu-jobcost-round2.md`** (sections 6-12):
+the denominator challenge was wrong, `enqDisp/enqPoll ~ 0` falsified the
+backpressure hypothesis, and the two things that are NOT per-chunk costs --
+`MeshBatchCap` as a 3,840/s wall and `poolReplaced` as a count of wasted whole
+chunks.
