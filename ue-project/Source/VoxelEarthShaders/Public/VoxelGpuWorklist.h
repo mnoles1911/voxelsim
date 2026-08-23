@@ -327,8 +327,11 @@ public:
 	// the flush command, must EnsureCreated the buffers and register them
 	// into the given graph, and returns false when the allocator is
 	// unavailable -- the flush then skips the claim dispatches for that tick
-	// and the stage stays dark (the host counted nothing claim-fed either,
-	// because arming is what it keys on... see the eligibility note below).
+	// (logged once, loud). The affected claim-staged records land NOTHING:
+	// their slots stay unwritten (missing chunks, the P1 xcheck's
+	// `unwritten` reading), never corrupted -- the batch side must still not
+	// claim classically for them, because it cannot know which flushes went
+	// dark.
 	struct FPoolBindings
 	{
 		FRDGBufferRef PoolDesc = nullptr;

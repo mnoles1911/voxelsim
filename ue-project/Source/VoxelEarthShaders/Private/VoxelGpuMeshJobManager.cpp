@@ -2319,7 +2319,23 @@ void FVoxelGpuMeshJobManager::Tick()
 			Worklist.SetClassifyStageArmed(VoxelGpuWorklistClassifyEnabled());
 			Worklist.SetAssetStampStageArmed(VoxelGpuWorklistAssetStampEnabled());
 			Worklist.SetPackStageArmed(VoxelGpuWorklistPackEnabled());
-			if (VoxelGpuWorklistClaimEnabled())
+			if (VoxelGpuWorklistClaimEnabled() &&
+			    VoxelGpuWorklistCellBudget() > 65535u / FVoxelGpuWorklist::kWriteGroupsPerRecord)
+			{
+				// The Write triple is Take x 148 groups in X; D3D caps an
+				// indirect dispatch dimension at 65,535 groups, so a consume
+				// budget above 442 records would silently clip the word
+				// copies -- torn pool payloads with no error anywhere.
+				// Refuse the arm loudly instead.
+				UE_LOG(LogVoxelGpuMeshJob, Error,
+				       TEXT("[gpu-worklist] CLAIM STAGE ARM REFUSED: -VoxelGpuWorklistCellBudget=%u ")
+				       TEXT("exceeds the Write triple's %u-record ceiling (65,535 groups / %u per ")
+				       TEXT("record). Lower the budget or split the dispatch before arming."),
+				       VoxelGpuWorklistCellBudget(),
+				       65535u / FVoxelGpuWorklist::kWriteGroupsPerRecord,
+				       FVoxelGpuWorklist::kWriteGroupsPerRecord);
+			}
+			else if (VoxelGpuWorklistClaimEnabled())
 			{
 				// The Claim stage's pool binder (the plan doc's decision: the
 				// worklist does not include the pool's lifecycle). Runs on
