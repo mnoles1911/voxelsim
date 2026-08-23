@@ -34,12 +34,31 @@
 //      (the notes and the dispatch add cost, deliberately accepted in this
 //      arm; the perf arm is mode 2). This is the validation arm and it is
 //      what tonight's leg runs.
-//   2  LIVE -- NOT YET WIRED. Requested mode 2 clamps to 1 with a warning.
-//      The adjudication path (consume deltas, skip the CPU walks) needs
-//      AddCandidate extracted from RecomputeDesiredSet's entry loop into a
-//      callable member, which is deliberately deferred until the three
-//      concurrent VoxelWorldSubsystem.cpp edit waves land. The design note
-//      carries the full wiring plan.
+//   2  LIVE (wired 2026-08-23, per the design note's §7). The CPU walks are
+//      SKIPPED on the steady path; the subsystem consumes the newest arrived
+//      delta (TakeLiveDelta) and adjudicates it in O(delta): admit/resurrect
+//      proposals through the extracted AdmitCandidateEvaluate (fine gate,
+//      parks, caps, overlay routing all intact), evict proposals through the
+//      SAME ExitVisitRecord lambda the CPU walk runs -- which re-derives the
+//      three exit tests in double against THIS call's anchor, so a stale or
+//      wrong proposal is vetoed, never obeyed. The CPU remains the sole
+//      adjudicator of residency; the GPU only proposes.
+//
+//      The fallback lanes that stay CPU, each counted on the live log line
+//      (the owner's standing decision -- "retain edits and cold fallback on
+//      CPU"):
+//        * underground recomputes (deep box; no dispatch, skipUG),
+//        * a level's true FIRST scan (cold start; liveCpuFirstScans),
+//        * cold Z-texel footprints (CPU-enumerated, budgeted per call),
+//        * edited footprints in the annulus (enumerated every consume --
+//          the texel mirror never carries the edit hatches),
+//        * mirror-orphaned records (the residual ledger, walked per call),
+//        * resync replays (audit drift), and
+//        * the STARVATION fallback: no delta for kLiveStarvationCalls
+//          consecutive consume-eligible recomputes runs the full CPU walks
+//          that call (liveCpuFallback). A dead GPU path therefore degrades
+//          to the CPU arm and READS as liveCpuFallback climbing -- it cannot
+//          impersonate a working GPU path.
 //
 // ===========================================================================
 // THE COMPARISON GATE, AND WHAT FAILURE LOOKS LIKE
@@ -114,6 +133,64 @@ struct FVoxelResidencyDispatchParams
 	FVoxelResidencyLevelParams Levels[8];
 };
 
+// One GPU proposal, unpacked for the game-thread adjudicator. For admit /
+// resurrect / evict lanes Coord is the level-L chunk coordinate; for the cold
+// lane Coord.Z is meaningless (a cold entry names a FOOTPRINT).
+struct FVoxelResidencyProposal
+{
+	int32 Level = 0;
+	FIntVector Coord = FIntVector::ZeroValue;
+};
+
+// Mode 2: one arrived scan's proposals, handed whole to the subsystem.
+// Params is the dispatch's own capture -- its Anchor / per-level AnchorChunk /
+// bScanThisDispatch are what the consumer stamps the per-level scan state
+// from (the GPU scan of level L at anchor A is, for the gating machinery,
+// "level L was scanned at A").
+struct FVoxelResidencyLiveDelta
+{
+	uint32 Seq = 0;
+	uint32 OverflowBits = 0; // 1=admit 2=evict 4=resurrect 8=cold 16=orphan (truncated prefix, rest re-proposes)
+	FVoxelResidencyDispatchParams Params;
+	TArray<FVoxelResidencyProposal> Admits;
+	TArray<FVoxelResidencyProposal> Evicts;
+	TArray<FVoxelResidencyProposal> Resurrects;
+	TArray<FVoxelResidencyProposal> Colds; // footprints with no valid Z texel: the CPU-enumeration lane
+};
+
+// Mode 2: what the subsystem's adjudication of one recompute actually did,
+// reported back so every live lane -- including every FALLBACK lane -- shows
+// on the [gpu-resid] live line. The failing readings are documented at the
+// log site; the rule is the file's usual one: no lane may be a statistic that
+// cannot come out the other way.
+struct FVoxelResidencyLiveOutcome
+{
+	uint32 ConsumedDelta = 0;      // 1 if a delta was consumed this recompute
+	uint32 NoDeltaCalls = 0;       // consume-eligible recompute found no delta ready
+	uint32 CpuFallbackCalls = 0;   // starvation: full CPU walks ran this call
+	uint32 CpuFirstScans = 0;      // levels swept CPU-side because never scanned (cold start)
+	uint32 AdmitProposals = 0;
+	uint32 AdmitAdmitted = 0;      // records actually created (direct + nearest-admit commit)
+	uint32 AdmitAdopted = 0;       // proposals answered from parked geometry
+	uint32 AdmitResurrected = 0;   // proposals (either lane) that cancelled a pending unload
+	uint32 AdmitStale = 0;         // already tracked, not pending -- mirror/readback lag
+	uint32 AdmitRejFine = 0;       // fine-tile gate refused (re-proposed by construction)
+	uint32 AdmitRejBudget = 0;     // per-level budget refused this call
+	uint32 AdmitRejCutoff = 0;     // ring cutoff refused (CPU-side re-check of the kernel's gate)
+	uint32 ResurrectProposals = 0;
+	uint32 EvictProposals = 0;
+	uint32 EvictQueued = 0;        // proposals the double recheck CONFIRMED (unload queued)
+	uint32 EvictVetoed = 0;        // recheck at this call's anchor said keep (stale/boundary)
+	uint32 EvictStale = 0;         // no record (already removed) or already pending
+	uint32 ColdProposals = 0;
+	uint32 ColdEnumerated = 0;     // cold footprints CPU-enumerated this call
+	uint32 ColdDeferred = 0;       // over the per-call cold budget; re-proposed next scan
+	uint32 EditedEnumerated = 0;   // edited footprints in the annulus enumerated this consume
+	uint32 ResidualWalked = 0;     // orphaned records walked with the CPU evict math
+	float EvictMs = 0.f;           // the live exit stage's cost (replaces the record walk)
+	float AdmitMs = 0.f;           // the live entry stage's cost (replaces the cell sweeps)
+};
+
 class VOXELEARTHSHADERS_API FVoxelResidencyGpu
 {
 public:
@@ -160,6 +237,26 @@ public:
 	// and on fill with the MEMO'S values (pre-skirt ZMin, trimmed ZMax); the
 	// manager dedups against its CPU-side mirror map and stages only changes.
 	void NoteFootprintZRange(int32 Level, int32 X, int32 Y, int32 ChunkZMin, int32 ChunkZMax);
+
+	// --- Mode 2 (LIVE) ------------------------------------------------------
+	// True when a consumable delta is staged. TickStreaming uses this to force
+	// a recompute while the anchor is stationary (consumption happens ONLY
+	// inside RecomputeDesiredSet, where the queue sort/filter that must follow
+	// any admission or eviction already runs). Cheap: a latched-int check plus
+	// a pointer test; modes 0/1 always return false.
+	bool HasActionableDelta();
+	// Move the newest staged delta out for adjudication. Polls first, never
+	// waits: false means "propose nothing this call", not "stall". An older
+	// staged delta that was superseded before consumption is counted, never
+	// silently merged.
+	bool TakeLiveDelta(FVoxelResidencyLiveDelta& Out);
+	// The orphan ledger (records aliased out of the mirror): the live arm must
+	// walk these with the CPU evict math every call, because the GPU exit scan
+	// can no longer see them. O(residual); empty in the overwhelming case.
+	void SnapshotResidual(TArray<FVoxelResidencyProposal>& Out);
+	// The subsystem reports what its adjudication of this recompute did; the
+	// manager folds it into the [gpu-resid] live line's window.
+	void NoteLiveOutcome(const FVoxelResidencyLiveOutcome& Outcome);
 
 	// PIE teardown / world switch: drop buffers, ledgers, stats; next enable
 	// resyncs. Safe to call in any mode.

@@ -142,6 +142,15 @@ RWStructuredBuffer<uint> ColdList;    // 4 dwords too, Z unused (footprint)
 RWStructuredBuffer<uint> OrphanList;
 
 uint NumLevels;
+// The outermost ACTIVE ring this run (-VoxelMaxRingLevel; default 5 with level
+// 6 compiled in but dormant). The seam-parent exception below must test THIS,
+// not NumLevels-1: past the outermost active ring there is no coarser ring
+// streaming, so inferring "parent covers this ground" from radii alone would
+// skip the seam chunk and open a hole band at the cascade edge -- the exact
+// defect the CPU entry scan's own MaxRingLevel comment records. (Before this
+// parameter existed the kernel tested L+1 >= NumLevels, which with kNumLevels
+// at 7 and the default cascade at 5 wrongly ran the parent test for L5.)
+uint MaxRingLevel;
 uint AdmitCap;
 uint EvictCap;
 uint ResurrectCap;
@@ -441,12 +450,13 @@ void EntryScanCS(uint3 DTid : SV_DispatchThreadID)
 	{
 		return;
 	}
-	// Outer edge with the seam-parent exception -- the CPU's test verbatim.
+	// Outer edge with the seam-parent exception -- the CPU's test verbatim
+	// (MaxRingLevel, not NumLevels-1: see the parameter's comment above).
 	if (DistSq >= LevelRadiiA[L].y)
 	{
-		if (DistSq >= LevelRadiiA[L].z || L + 1 >= NumLevels)
+		if (DistSq >= LevelRadiiA[L].z || L + 1 > MaxRingLevel)
 		{
-			return; // too far to be a seam case, or no coarser ring exists
+			return; // too far to be a seam case, or no coarser ring ACTIVE (clipmap takes over)
 		}
 		if (RingOverlapChunks == 0)
 		{
