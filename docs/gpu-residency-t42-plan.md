@@ -225,3 +225,90 @@ eviction is the likely one), the matching Note call must move with it — a
 missed note is exactly what the audit gate exists to catch (mismatch → logged
 FAIL → resync), so the failure is loud, not silent. New LOD rings: the manager
 sizes for 8 levels and takes `NumLevels` per dispatch; nothing hardcodes 6.
+
+---
+
+## 9. The first live leg, read correctly (2026-08-23, `Saved/t42-live.log`)
+
+The leg was scored as "dead path": `adOK=0` with `cons=427`, throughput
+2,401 -> 2,007/s (-16%). **That reading is wrong, and it violated §6's own
+rule ("never `grep | tail -1`").** The quoted window
+(`cons=427 sup=0 empty=0 noDelta=105 ... ms ev=0.02 ad=0.70`) is the log's
+FINAL window — minutes after the flight ended, anchor parked, records frozen
+at 239,815, `fb staged=0`. A converged, parked world proposing nothing is the
+pass working. The flight windows just above it show the pass proposing
+heavily:
+
+| window (08:1x) | ad prop | adOK | rejBud | ev prop / q | cold prop→enum | records |
+|---|---|---|---|---|---|---|
+| 10:39 | 1,595,376 | 35,840 | 1,526,218 | 0 / 0 | 16,384 → 2,048 | 22,457 |
+| 10:49 | 1,972,226 | 71,619 | 1,866,563 | 0 / 0 | 0 | 70,240 |
+| 11:29 | 637,451 | 28,160 | 597,841 | 0 / 0 | 0 | 159,475 |
+| 11:39–12:04 | 0 | 0 | 0 | 0 / 0 | 0 | 168,147 (frozen: parked) |
+| 12:09 | 71,539 | 42,929 | 96 | 19,276 / 7,320 | 10,143 → 10,143 | 199,380 |
+
+Also healthy across the whole leg: `audit pass=2..14 fail=0` with cpu==gpu
+counts at every audit, `VETO=0`, `cpuFallback=0`, `firstScans=0` after
+warm-up, `fb dropped=0 collide=0 residual=0`.
+
+### The real defect the log shows: a tick-rate recompute storm
+
+`disp=427/5s cons=427 empty=0` **while parked** is a genuine bug — the
+converged world never goes quiet. Chain, each link verified in code:
+
+1. Budget/cutoff/fine rejections arm `bAdmissionDeferredWork[L]`
+   (VoxelWorldSubsystem.cpp:12639/12908/12943/13016). In the flight phase
+   rejBud runs to millions per window, so every level arms.
+2. The ONLY clear (`:15173`) requires `bLevelScannedThisCall[L]`, whose only
+   writer was the CPU entry sweep (`:14107`) — **which mode 2 skips**. In
+   live mode the flag was a one-way latch.
+3. Queue drains (converged) → deferred-refill trigger (`:7639`) fires EVERY
+   TICK: `bLevelWantsRefill` → gate cleared + recompute forced → dispatch
+   with `bScanThisDispatch=true` → the scan of a fully-tracked annulus
+   returns zero proposals but a scanned level → the delta is STAGED (it is
+   stampable), never empty-retired → `HasActionableDelta()` (`:7804`) forces
+   the next tick's recompute. ~106 recomputes/s, ~85 dispatches/s, forever.
+4. While flying, the same loop multiplies recompute cadence 3–7x over the
+   crossing gates, so the capped admit list (65,536, `ovf` bit set in the
+   early windows) is re-adjudicated ~70x/5s: `ad ms` 260–637 per 5 s window
+   (5–13% of the game thread), plus a full `SortPendingQueues` +
+   `TruncatePendingJobQueue` per forced recompute. **That is the -16%.**
+
+### The fix (this commit)
+
+One line in the live stamp block (`VoxelWorldSubsystem.cpp` ~14880):
+`bLevelScannedThisCall[Level] = true;` — the GPU scan of level L is this
+call's scan of level L, so it earns the sixth stamp alongside the five the
+block already writes. The deferral clear's other guards (zero rejections
+this call, not held back, not clamped) still hold the flag armed whenever
+work is genuinely waiting, so the refill trigger's purpose is intact.
+Post-fix parked sequence: one final consume clears the deferral, the next
+dispatch has `ScanMask=0`, its delta is empty-retired, `HasActionableDelta`
+goes false, silence. Control arm and mode 1 untouched (the line is inside
+the mode-2-only stamp block).
+
+Plus instrumentation in `VoxelResidencyGpu.cpp`: the live line now prints
+`move=` (XY anchor displacement across the log window), so an all-zero
+window is readable alone — `prop=0, move~0` is convergence; `prop=0, move >>
+chunk edge` is the dead path.
+
+### Re-run gate for the next live leg
+
+- Parked/converged: `disp` per window collapses to ~0 (was 427) and `empty`
+  ticks once per re-arm, not never.
+- Flying: `cons` per window near the readback-latency bound (~20/s), not
+  tick rate; `ad ms` per 5 s window under ~100 ms and decaying as rings
+  fill; `adOK`/`ev q` tracking the control arm's admission/eviction volume;
+  `audit fail=0`; `cpuFallback=0`; per-ring residency tracking control.
+- Throughput judged only against those, per §6.
+
+### Known remaining risk (not addressed tonight)
+
+Per-consume adjudication walks the full admit proposal list to feed
+nearest-first commit — O(annulus backlog) bounded by the 65,536 cap, not
+O(accepted delta). It self-decays as rings fill (prop fell 2.4M → 0.36M/5s
+across the leg) and at natural consume cadence costs ~1–2% game thread in
+the worst window, but if the next leg still shows `ad ms` high with the
+storm gone, the fix is a cheap distance-key partial select before
+`AdmitCandidateEvaluate`, keeping nearest-first semantics — not a kernel
+change.
