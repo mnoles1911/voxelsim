@@ -26,7 +26,20 @@ int32 CacheSlots()
 		// camera is walking into. Direct-mapped, so oversizing costs only
 		// memory -- and cacheEvict is the counter that says whether it is
 		// undersized.
-		int32 Value = 8192;
+		// 8192 -> 131072 (2026-08-23). At 8192 the table THRASHED: cacheEvict
+		// was 96% of cacheMiss, which is this counter's documented "undersized"
+		// reading rather than its "wrong key" one (evict ~= 0 would be the
+		// latter). Matched legs, one switch, mode 3, shipped caps:
+		//
+		//   slots     avoided    hit rate   evict/miss   sampler misses   settle
+		//     8192      89.1%      81.5%          96%          204,243    23.4 s
+		//   131072      91.9%      86.1%          43%          155,401    22.3 s
+		//
+		// 24% fewer calls into the fine-tier sampler lock, and avoided/calls
+		// crosses the 90% the apply-fast brief set as its traffic gate. Cost is
+		// 131,072 x 40 B = 5.2 MB of a direct-mapped table, allocated once.
+		// evict/miss at 43% says the knee is at or above this; it is not below.
+		int32 Value = 131072;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyColumnCache="), Value);
 		Value = FMath::Clamp(Value, 64, 1 << 20);
 		// Rounded UP to a power of two so the index is a mask, not a modulo:
