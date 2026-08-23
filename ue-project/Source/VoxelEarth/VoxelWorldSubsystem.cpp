@@ -179,6 +179,7 @@ static TAutoConsoleVariable<bool> CVarVoxelCollapseEnabled(
 namespace VoxelStreamAdmission
 {
 int32 SharedGridCacheEntries();
+bool RingSkirtUsesPaddedInner();
 }
 
 namespace
@@ -3492,6 +3493,17 @@ double InnerHysteresisChunks()
 		return Value;
 	}();
 	return Chunks;
+}
+
+// Whether ComputeRingSkirtMask tests against the PADDED inner radius instead of
+// the raw one. -VoxelRingSkirtPaddedInner, default OFF (raw), and off is the
+// correct answer -- see the long note at the call site for why padding a
+// COVERAGE test is not the same as padding an ADMISSION test. Kept only so the
+// owner-visible artifact it caused can be reproduced on demand.
+bool RingSkirtUsesPaddedInner()
+{
+	static const bool bPadded = FParse::Param(FCommandLine::Get(), TEXT("VoxelRingSkirtPaddedInner"));
+	return bPadded;
 }
 
 double InnerEvictUU(int32 Level)
@@ -12537,12 +12549,31 @@ static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelK
 		// InnerAdmitUU read below was fixed for.
 		return 0;
 	}
-	// The raw InnerMeters is NOT the membership test any more -- admission pads
-	// this edge inward, so a neighbour out in [InnerAdmitUU, InnerMeters) is
-	// admitted at THIS level too and there is no seam across that face to wall
-	// off. Reading the raw radius here marked those faces as boundaries and
-	// dropped a retaining wall against a neighbour that was actually present.
-	const double InnerSq = FMath::Square(VoxelStreamAdmission::InnerAdmitUU(Level));
+	// REVERTED 2026-08-23 TO THE RAW RADIUS, AND THE REASONING THAT CHANGED IT
+	// WAS WRONG IN A WAY WORTH RECORDING.
+	//
+	// Earlier the same day this read InnerAdmitUU (the padded radius) on the
+	// argument that a neighbour in [InnerAdmitUU, InnerMeters) is ADMITTED at
+	// this level too, so there is no seam across that face to wall off. The
+	// admission part is true. The conclusion does not follow: **admitted is not
+	// resident.** While the camera moves, the neighbour that admission just
+	// accepted has not streamed in yet, and the retaining wall this mask drops
+	// is exactly what covers the gap until it does.
+	//
+	// The padded version therefore removed walls precisely in the band where
+	// they are load-bearing, and only while MOVING -- which is why no static
+	// measurement caught it and the owner did, flying, as dark arcs at LOD
+	// boundaries that fill in when he stops.
+	//
+	// The wider lesson, which this codebase keeps relearning: a coverage
+	// decision must be made against RESIDENCY, not against desire. Padding an
+	// admission test is safe; padding a COVERAGE test is not.
+	//
+	// -VoxelRingSkirtPaddedInner restores the padded version for bisection.
+	const double InnerSq = FMath::Square(
+		VoxelStreamAdmission::RingSkirtUsesPaddedInner()
+			? VoxelStreamAdmission::InnerAdmitUU(Level)
+			: UVoxelWorldSubsystem::GetRingPresets()[Level].InnerMeters * 100.0);
 	const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
 	// A face is retained only when the neighbour across it belongs to a FINER
 	// ring (its chunk centre falls inside this ring's inner hole). That is the

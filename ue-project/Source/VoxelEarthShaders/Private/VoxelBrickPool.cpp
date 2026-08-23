@@ -82,7 +82,25 @@ namespace VoxelBrickPoolDetail
 	// capacity; FVoxelBrickPool::GetResidentBytes is what tracks the world.
 	// Committed total at these defaults: 64.0 + 4.0 + 96 + 224 = 388.0 MiB
 	// (was 314.0).
-	int32 GVoxelBrickPoolChunks = 131072;
+	// RAISED 131,072 -> 262,144 ON 2026-08-23, and it is a fix, not a tuning.
+	//
+	// Raising voxel.Stream.JobsInFlightPerCore 8 -> 24 the same day (it was a
+	// per-tick batch quota below the owner's 6,200 chunks/s floor by
+	// arithmetic) put ~50% more chunks in flight, and the pool went from
+	// evictions=0 to EVICTING AND DROPPING WRITES: measured on flag-free legs,
+	// evictions 15,559 and writesDropped 769 on a line flight, 47,647 on a
+	// surface flight, with indexEntries pinned at the old 131,072 capacity.
+	// `evictions == 0` is a stated gate in this project and writesDropped is
+	// lost chunk data -- it showed up as holes 0 -> 8 in the coverage verifier.
+	//
+	// The owner has approved growing to 1-2 GB VRAM. Committed total roughly
+	// doubles with this, to ~776 MiB, which is inside that.
+	//
+	// THIS IS THE SHAPE TO WATCH, not the number: throughput changes that put
+	// more chunks in flight cost pool capacity, and the pool does not complain
+	// loudly -- it silently evicts and drops. Read `Voxel brick lifetime`'s
+	// evictions/writesDropped after any such change.
+	int32 GVoxelBrickPoolChunks = 262144;
 	FAutoConsoleVariableRef CVarVoxelBrickPoolChunks(
 		TEXT("voxel.Brick.PoolChunks"),
 		GVoxelBrickPoolChunks,
