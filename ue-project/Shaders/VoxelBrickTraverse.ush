@@ -538,6 +538,44 @@
 #define VOXEL_MARCH_HOLE_STATS 0
 #endif
 
+// LEVEL 2 OF THE HOLE METRIC (voxel.March.HoleStats 2): every uncovered ray
+// also reports WHICH ring level owned the ground at its first absent crossing,
+// and WHY that chunk was absent, in four buckets whose codes are the readback
+// word offsets (VoxelMarchRenderer.h pushes the base index; the bucket code is
+// added to it, so the codes below are part of the buffer layout, not just
+// names):
+//
+//   NEVER (0)   the index cell carries no streaming annotation for this coord
+//               -- the desired set never admitted it (or the annotation writer
+//               is disarmed; the CPU side prints its write counters precisely
+//               so a reader can tell those apart). A tag mismatch lands here
+//               too, and that is a deduction, not a guess: every admission and
+//               eviction of the wanted coord stamps the wanted coord's tag, so
+//               an alias's surviving tag proves the wanted coord had no
+//               streaming transition since that cell was last written.
+//               UP: -VoxelMaxRingLevel=0 (levels 1-5 are never admitted at
+//               all, so every miss beyond 128 m must land HERE -- the run that
+//               proves the split is not lying). DOWN: normal config, settled.
+//   PENDING (1) a streaming record exists; the chunk is queued or in flight.
+//               UP: flying faster than generation feeds (the R0 pending=242
+//               reading predicts this bucket dominates the owner's arcs).
+//               DOWN: hovering until the queues drain -- pending falls to 0
+//               and this bucket must fall with it or the tag plumbing is
+//               broken.
+//   EVICTED (2) the pool held this chunk and removed it. UP:
+//               -VoxelHierarchicalCoverage (measured 32,923 evictions from
+//               pool overflow -- the second proving run). DOWN: settled world,
+//               ample pool (evictions 0 in the shipping config's own log).
+//   UNATTRIBUTED (3) the instrument declines to guess: a resident entry that
+//               failed record validation (stale index), or a reserved reason
+//               code. If this bucket is ever large the INSTRUMENT is what
+//               needs investigating, and that is exactly why it is printed
+//               instead of folded into a real bucket.
+#define VOXEL_MARCH_MISS_NEVER         0u
+#define VOXEL_MARCH_MISS_PENDING       1u
+#define VOXEL_MARCH_MISS_EVICTED       2u
+#define VOXEL_MARCH_MISS_UNATTRIBUTED  3u
+
 #define VOXEL_MARCH_TRACK_ABSENT (VOXEL_MARCH_FALLTHROUGH > 0 || VOXEL_MARCH_HOLE_STATS)
 
 #define VOXEL_MARCH_HAS_OCCUPANCY 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY || VOXEL_MARCH_VERIFY_SOURCE)
@@ -841,6 +879,28 @@ struct FVoxelMarchHit
 	// only the ring loop knows both levels. Structurally false whenever
 	// VOXEL_MARCH_FALLTHROUGH is 0 -- no coarser walk exists to win.
 	bool bSubstituted;
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	// THE FIRST absent crossing's classification (VOXEL_MARCH_MISS_*), set by
+	// the walk at the moment it first flips bCrossedAbsentChunk and never
+	// overwritten -- the first crossing is the nearest one, i.e. the ground
+	// the owner's eye lands on, and averaging reasons across a ray would
+	// launder three different failures into one number, which is the exact
+	// mistake the level-2 metric exists to undo. Read from the SAME index
+	// load the residency test paid for (FVoxelMarchChunkCache.AbsentReason),
+	// so this costs registers, not bandwidth. Meaningful only while
+	// bCrossedAbsentChunk is true.
+	uint FirstAbsentReason;
+	// WHICH ring level's segment owned the ground at that first crossing --
+	// the level the ray WANTED, not whatever level a fallthrough retry was
+	// walking. Set by the ring loop (only it knows SegL) on the returned MISS;
+	// initialised to the 0xFFFFFFFF sentinel there, and the kernel counts a
+	// level word ONLY when this is < 6. That is deliberate honesty plumbing:
+	// a defaulted 0 would silently inflate L0 -- the very ring under
+	// investigation -- while the sentinel makes an uncaptured ray show up as
+	// sum(byLevel) < uncovered in the printed identity check, i.e. as an
+	// instrument defect, which is what it would be.
+	uint AbsentLevel;
+#endif
 #endif
 	uint2 FineBrickMask;
 	int3  FineMaskChunk;
@@ -1395,6 +1455,14 @@ struct FVoxelMarchChunkCache
 	// the honest picture there too, matching what the eviction race already
 	// looks like today (index cleared, chunk gone: a hole).
 	bool bResident;
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	// WHY bResident is false, pre-classified into a VOXEL_MARCH_MISS_* bucket
+	// by the lookup -- the one place that holds both the raw index entry and
+	// the coordinate that was asked for (the cache's own ChunkCoord is the
+	// 0x7FFFFFFF sentinel on the absent path, so a caller could not run the
+	// tag comparison itself). Costs one register on the level-2 permutation
+	// and nothing anywhere else. Meaningful only while bResident is false.
+	uint AbsentReason;
 #endif
 	uint BrickBase;     // first descriptor slot
 	uint2 BrickSolid;   // the 64-bit L1 mask, lo/hi
@@ -1417,6 +1485,12 @@ FVoxelMarchChunkCache VoxelMarchNoChunk()
 	C.bValid = false;
 #if VOXEL_MARCH_TRACK_ABSENT
 	C.bResident = false; // "nothing here" must read as absent, never as empty
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	// A cache nobody looked up has no entry to classify. UNATTRIBUTED, not
+	// NEVER: NEVER is a claim about the streaming system and this constructor
+	// has not consulted it. The lookup overwrites this on every real path.
+	C.AbsentReason = VOXEL_MARCH_MISS_UNATTRIBUTED;
+#endif
 #endif
 	C.BrickBase = 0u;
 	C.BrickSolid = uint2(0u, 0u);
@@ -1448,11 +1522,62 @@ uint VoxelMarchIndexCell(int3 ChunkCoord)
 	                                  MarchIndexCellsPerLevel, GVoxelMarchIndexGrid);
 }
 
+#if VOXEL_MARCH_HOLE_STATS >= 2
+// (raw index entry, wanted coord) -> VOXEL_MARCH_MISS_* bucket. Called on
+// every lookup under the level-2 permutation and stored on the cache, because
+// the walk that later discovers "this ray crossed absent ground" no longer has
+// the entry in hand. A handful of ALU on a load the residency test already
+// paid for; see the bucket definitions above the hole-metric block for what
+// moves each bucket both ways.
+uint VoxelMarchClassifyAbsent(uint Entry, int3 ChunkCoord)
+{
+	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u)
+	{
+		// The index says resident but the record failed validation (stale
+		// slot, stride mismatch, origin/level disagreement). The streaming
+		// system believes it holds this chunk; the marcher cannot use it.
+		// Declining to guess is the point of this bucket.
+		return VOXEL_MARCH_MISS_UNATTRIBUTED;
+	}
+	const uint Reason = Entry & VOXEL_MARCH_ABSENT_REASON_MASK;
+	if (Reason == VOXEL_MARCH_ABSENT_REASON_NONE)
+	{
+		return VOXEL_MARCH_MISS_NEVER;
+	}
+	if (((Entry >> VOXEL_MARCH_ABSENT_TAG_SHIFT) & VOXEL_MARCH_ABSENT_TAG_MASK) !=
+	    VoxelMarchAbsentTag(ChunkCoord))
+	{
+		// The annotation belongs to a torus alias of this coord. That PROVES
+		// the wanted coord had no admit/evict transition since the cell was
+		// last written (its own transition would have stamped its own tag),
+		// which is the definition of never-admitted here.
+		return VOXEL_MARCH_MISS_NEVER;
+	}
+	if (Reason == VOXEL_MARCH_ABSENT_REASON_PENDING)
+	{
+		return VOXEL_MARCH_MISS_PENDING;
+	}
+	if (Reason == VOXEL_MARCH_ABSENT_REASON_EVICTED)
+	{
+		return VOXEL_MARCH_MISS_EVICTED;
+	}
+	return VOXEL_MARCH_MISS_UNATTRIBUTED; // reserved code 3: refuse to guess
+}
+#endif
+
 FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 {
 	FVoxelMarchChunkCache C = VoxelMarchNoChunk();
 
 	const uint Entry = MarchChunkIndex[VoxelMarchIndexCell(ChunkCoord)];
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	// Classified unconditionally rather than on the absent paths only: every
+	// early return below is an absent path except the two resident-empty ones
+	// and the full success, all three of which set bResident=true and make
+	// AbsentReason unread. One classify against five return sites is cheaper
+	// to prove correct than five classifies.
+	C.AbsentReason = VoxelMarchClassifyAbsent(Entry, ChunkCoord);
+#endif
 	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) == 0u)
 	{
 		return C;
@@ -1937,6 +2062,15 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 	// arm that never sets the gate would walk a different cascade than the arm
 	// it is graded against. The solid test refreshed Chunk to the voxel just
 	// tested, so the flag reads the same lookup the walk paid for.
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	// FIRST crossing only -- test the flag BEFORE the OR below sets it. The
+	// nearest absent chunk is the one the reason split attributes, at all
+	// three capture sites identically.
+	if (!H.bCrossedAbsentChunk && !Chunk.bValid && !Chunk.bResident)
+	{
+		H.FirstAbsentReason = Chunk.AbsentReason;
+	}
+#endif
 	H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || (!Chunk.bValid && !Chunk.bResident);
 #endif
 
@@ -2000,6 +2134,13 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		// bool ONLY on this arm so the depth-0 control keeps its original
 		// text, not just its original meaning.
 		const bool bSolidNow = VoxelMarchBrickSolidAt(vNow, Chunk, Brick, Mat);
+#if VOXEL_MARCH_HOLE_STATS >= 2
+		// First crossing only -- see the start-voxel site above.
+		if (!H.bCrossedAbsentChunk && !Chunk.bValid && !Chunk.bResident)
+		{
+			H.FirstAbsentReason = Chunk.AbsentReason;
+		}
+#endif
 		H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || (!Chunk.bValid && !Chunk.bResident);
 		if (bSolidNow)
 #else
@@ -2576,6 +2717,15 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 			// chunk (bResident) is real air and must not send the ring loop
 			// coarser. One OR per skipped chunk, on values already in
 			// registers.
+#if VOXEL_MARCH_HOLE_STATS >= 2
+			// First crossing only -- see the flat walk's start-voxel site.
+			// bValid is already false in this branch, so the gate is just
+			// "not resident and nothing captured yet".
+			if (!H.bCrossedAbsentChunk && !Chunk.bResident)
+			{
+				H.FirstAbsentReason = Chunk.AbsentReason;
+			}
+#endif
 			H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || !Chunk.bResident;
 #endif
 			t = tChunkNext;
@@ -2806,6 +2956,15 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	FVoxelMarchHit Miss = (FVoxelMarchHit)0;
 	Miss.FaceAxis = -1;
 	Miss.Material = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	// SENTINEL, NOT ZERO. Level 0 is a legal answer -- and the prime suspect
+	// (R0 pending=242 mid-flight) -- so a zero default would silently vote
+	// for the hypothesis under test. The kernel refuses to count a level word
+	// unless this is < 6, which turns "the capture logic missed a ray" into a
+	// visible identity shortfall (sum(byLevel) < uncovered) instead of a
+	// phantom L0 hole.
+	Miss.AbsentLevel = 0xFFFFFFFFu;
+#endif
 	uint EnteredMask = 0u;
 
 	const uint RingCount = min(MarchRingCount, VOXEL_MARCH_MAX_RINGS);
@@ -2873,6 +3032,17 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	// under-count exactly the rays it exists for (an absent chunk in segment 2
 	// of 6, resident air after it). Folded into Miss at the bottom.
 	bool bAnyAbsent = false;
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	// The FIRST absent crossing's attribution, ray-wide. Captured only from a
+	// walk at the segment's OWN level (WalkL == SegL): the first walk of every
+	// ladder is that walk, and the fallthrough gate only lets the ladder
+	// continue when it crossed absent ground -- so if any walk of any segment
+	// crossed absent, the owner-level walk of the FIRST such segment did too,
+	// and the capture below cannot be starved by a retry. Attributing a
+	// coarser retry's crossing would answer "which level was WALKED" when the
+	// question is "which level was WANTED".
+	uint RayAbsentLevel = 0xFFFFFFFFu;
+	uint RayAbsentReason = VOXEL_MARCH_MISS_UNATTRIBUTED;
 #endif
 	[loop]
 	for (uint SegL = 0; SegL < RingCount; ++SegL)
@@ -2963,6 +3133,16 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				return H;
 			}
 #if VOXEL_MARCH_TRACK_ABSENT
+#if VOXEL_MARCH_HOLE_STATS >= 2
+			// First segment whose owner-level walk crossed absent ground wins
+			// the attribution; see the declaration of RayAbsentLevel for why
+			// WalkL == SegL is required and sufficient.
+			if (H.bCrossedAbsentChunk && WalkL == SegL && RayAbsentLevel == 0xFFFFFFFFu)
+			{
+				RayAbsentLevel = SegL;
+				RayAbsentReason = H.FirstAbsentReason;
+			}
+#endif
 			// Fold this walk's absent crossings into the ray-wide flag BEFORE
 			// the fallthrough gate can break out of the ladder.
 			bAnyAbsent = bAnyAbsent || H.bCrossedAbsentChunk;
@@ -2993,6 +3173,10 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	// discriminator lives at the kernel, not here: direction is the kernel's
 	// input and this function should not grow a second copy of it.
 	Miss.bCrossedAbsentChunk = bAnyAbsent;
+#if VOXEL_MARCH_HOLE_STATS >= 2
+	Miss.AbsentLevel = RayAbsentLevel;
+	Miss.FirstAbsentReason = RayAbsentReason;
+#endif
 #endif
 	return Miss;
 }

@@ -296,12 +296,98 @@ public:
 	static constexpr uint32 kAnySolidBit = 0x40000000u;
 	static constexpr uint32 kSlotMask    = 0x3FFFFFFFu;
 
+	// ---- THE ABSENT-CELL ANNOTATION (voxel.March.HoleStats 2) --------------
+	//
+	// A non-resident cell used to be literally 0, which threw away exactly
+	// what the dark-arcs investigation needs: WHY the chunk is not held.
+	// These bits are the CPU's answer, written on admission (reason 1) and on
+	// eviction (reason 2 replaces the old bare 0), read by the marcher in the
+	// same load its residency test already pays. The 9-bit tag records which
+	// torus wrap wrote the annotation so an aliased cell cannot lend its
+	// history to a different chunk 128 cells away -- a tag mismatch on the GPU
+	// side is classified as never-admitted, which is a deduction (any
+	// transition of the wanted coord would have stamped its own tag), not a
+	// guess. Mirrored BY HAND as VOXEL_MARCH_ABSENT_* in
+	// VoxelMarchIndexCell.ush, the same mirror discipline kResidentBit lives
+	// under, proven by the same voxel.March.IndexDeltaVerify readback gate.
+	//
+	// ARMED ONLY at voxel.March.HoleStats >= 2 and with
+	// voxel.March.IndexGpuResident OFF: a control run's index stream must be
+	// byte-identical, and the Phase 2 publish kernel clears cells to literal 0
+	// on the GPU while the shadow would hold a tag -- a guaranteed
+	// delta-verify FAIL, so the writer stands down instead (and the perf line
+	// prints its write counters, so a disarmed writer is visible rather than
+	// read as "nothing pending, nothing evicted").
+	static constexpr uint32 kAbsentReasonMask    = 0x3u;
+	static constexpr uint32 kAbsentReasonNone    = 0u;
+	static constexpr uint32 kAbsentReasonPending = 1u;
+	static constexpr uint32 kAbsentReasonEvicted = 2u;
+	static constexpr uint32 kAbsentTagShift      = 2u;
+	static constexpr uint32 kAbsentTagMask       = 0x1FFu;
+
+	// (coord >> 7) per axis, 3 bits each. The 7 is log2(kDimXY) == log2(kDimZ);
+	// the static_asserts pin that so a future grid resize cannot silently make
+	// every tag stale.
+	static uint32 AbsentTagOf(const FIntVector& Coord)
+	{
+		static_assert(kDimXY == 128 && kDimZ == 128,
+		              "AbsentTagOf hardcodes >>7 == log2(dim); update the shift and the "
+		              ".ush mirror together");
+		return ((uint32(Coord.X) >> 7) & 7u) | (((uint32(Coord.Y) >> 7) & 7u) << 3) |
+		       (((uint32(Coord.Z) >> 7) & 7u) << 6);
+	}
+	static uint32 MakeAbsentEntry(uint32 Reason, const FIntVector& Coord)
+	{
+		return (Reason & kAbsentReasonMask) | (AbsentTagOf(Coord) << kAbsentTagShift);
+	}
+
 	// Attaches to the global brick pool: registers the delta sink AND seeds the
 	// grid from the current resident set, in ONE call, because registering late
 	// is the normal case and a register-then-snapshot pair leaves a window where
 	// a delta lands on an unseeded index. GAME THREAD ONLY. Idempotent.
 	void AttachToGlobalPool();
 	void Detach();
+
+	// ---- the absent-annotation writer (voxel.March.HoleStats 2) ------------
+	//
+	// NoteChunkAdmitted: the streaming admission just created a record and
+	// queued a job for this chunk -- stamp its cell "admitted, not yet
+	// resident" so a marcher ray that misses it can be attributed to
+	// THROUGHPUT rather than to coverage or eviction. Writes only a
+	// non-resident cell (a resident one means the pool already holds it, and
+	// its eventual removal writes the evicted annotation instead). Coord is
+	// the brick/march chunk coordinate, Level the ring level 0..5; the cover
+	// grid deliberately has no annotations -- absent cover chunks are the
+	// NORMAL state ("no cover here" stores nothing at all) and annotating them
+	// would drown the ring signal in noise.
+	//
+	// NoteChunkNoLongerAdmitted: the admission was cancelled before the chunk
+	// ever generated (queue-cap truncation, or an unload of a record that
+	// never produced bricks). Clears ONLY a pending annotation that names this
+	// exact coord back to 0 -- an evicted annotation is history worth keeping,
+	// and a resident cell belongs to the delta path.
+	//
+	// Both are cheap shadow writes; nothing uploads until FlushAbsentMarks(),
+	// which the streaming tick calls once after its admission pass so a burst
+	// of admissions costs one staging, not one per chunk. All three are
+	// no-ops unless voxel.March.HoleStats >= 2 (a control run's index stream
+	// must stay byte-identical) and voxel.March.IndexGpuResident is 0 (the
+	// GPU publish kernel writes literal 0s and would fail delta-verify against
+	// an annotated shadow). GAME THREAD ONLY.
+	void NoteChunkAdmitted(const FIntVector& Coord, int32 Level);
+	void NoteChunkNoLongerAdmitted(const FIntVector& Coord, int32 Level);
+	void FlushAbsentMarks();
+
+	// The writer's own liveness, printed on the perf line beside the GPU's
+	// reason split: a split read against zero writes here is a split over
+	// stale bits and must be said so. Never reset -- monotonic, like the
+	// cover offer counters, and for the same reason: a rate can be derived,
+	// but a zero must be distinguishable from "nobody incremented this".
+	uint64 GetAbsentPendingMarks() const { return AbsentPendingMarks; }
+	uint64 GetAbsentEvictedMarks() const { return AbsentEvictedMarks; }
+	// True when the two cvars currently allow annotation writes; the perf
+	// line prints WHICH gate closed it when false.
+	bool AreAbsentMarksArmed() const;
 
 	// WHETHER THE SINK IS EVEN CONNECTED, and it is not a curiosity.
 	//
@@ -599,6 +685,14 @@ private:
 	void EnqueueGpuPublish(bool bVerifyWanted, uint64 ExpectedHash);
 	void NoteObservedSpan(const FIntVector& Coord, int32 Slot);
 	void NoteCellOwner(uint32 Cell, const FIntVector& Coord, int32 Slot);
+
+	// ---- absent-annotation state (voxel.March.HoleStats 2) -----------------
+	// Marks written since the last FlushAbsentMarks; a bool because the cells
+	// themselves already sit in DeltaPendingCells -- this only remembers that
+	// an upload is owed.
+	bool bAbsentMarksPending = false;
+	uint64 AbsentPendingMarks = 0;
+	uint64 AbsentEvictedMarks = 0;
 	// false => outside the cover band, refused and counted. Always true for a
 	// ring level: rings are bounded by their own presets and the static_asserts.
 	bool AdmitToSlot(const FIntVector& Coord, int32 Slot);

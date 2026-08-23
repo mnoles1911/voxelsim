@@ -185,7 +185,22 @@ namespace
 		TEXT("and falls to zero at rest or with fallthrough 0.\n")
 		TEXT("A SHADER PERMUTATION, default 0, and off is FREE: no UAV is created or bound, no ")
 		TEXT("groupshared word exists, no atomic runs -- the off arm is the byte-identical ")
-		TEXT("control, same rule as rings and fallthrough. Rings + source 1 only."),
+		TEXT("control, same rule as rings and fallthrough. Rings + source 1 only.\n")
+		TEXT("2 = THE BREAKDOWN (2026-08-23, the dark-arcs instrument): every uncovered ray also ")
+		TEXT("reports WHICH ring level owned the ground at its first absent crossing (histogram ")
+		TEXT("over the 6 levels, not a mean) and WHY that chunk was absent -- never admitted / ")
+		TEXT("admitted-pending / evicted / unattributed -- read from annotation bits the CPU ")
+		TEXT("streamer writes into NON-resident index cells (see VoxelMarchIndexCell.ush). ")
+		TEXT("PROVING RUNS: -VoxelMaxRingLevel=0 must push the reason mass into NEVER-ADMITTED ")
+		TEXT("at levels 1-5 (streaming never admits them); -VoxelHierarchicalCoverage must ")
+		TEXT("inflate EVICTED (32,923 pool evictions measured); hovering must drain PENDING to ")
+		TEXT("~0 alongside the pending queues. A large UNATTRIBUTED bucket, or a printed ")
+		TEXT("attributed-vs-uncovered shortfall, indicts the instrument itself and is printed ")
+		TEXT("rather than folded away. Level 1 leaves the breakdown words unwritten and the log ")
+		TEXT("says NOT MEASURED for them -- never zero. INCOMPATIBLE with ")
+		TEXT("voxel.March.IndexGpuResident 1: the GPU publish kernel clears cells to literal 0, ")
+		TEXT("so the annotations are not written there and the whole breakdown reads ")
+		TEXT("never-admitted; the writer disarms itself and the perf line says so."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchRingCount(
@@ -462,7 +477,13 @@ FVoxelMarchArm VoxelMarchGetArm()
 	// so without rings the dimension is forced to its control value -- the
 	// permutation for hole stats without rings is refused at compile and must
 	// not be asked for here either.
-	Arm.bHoleStats = Arm.bRings && (CVarVoxelMarchHoleStats.GetValueOnAnyThread() != 0);
+	// Clamped to the three permutation values that exist: 1 the cheap
+	// certified counters, 2 adds the per-level/per-reason uncovered breakdown.
+	// voxel.GpuStream.Prototype passes larger values through; clamping here
+	// (rather than rejecting) keeps that one-switch arm working.
+	Arm.HoleStatsLevel =
+		Arm.bRings ? FMath::Clamp(CVarVoxelMarchHoleStats.GetValueOnAnyThread(), 0, 2) : 0;
+	Arm.bHoleStats = Arm.HoleStatsLevel != 0;
 	Arm.ReachM = FMath::Max(CVarVoxelMarchReachM.GetValueOnAnyThread(), 0.0f);
 	Arm.bAO = CVarVoxelMarchAO.GetValueOnAnyThread() != 0;
 	Arm.bVelocity = CVarVoxelMarchVelocity.GetValueOnAnyThread() != 0;
@@ -2483,16 +2504,48 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// perf line can distinguish "on but no readback yet" (a warning-shaped
 	// zero) from "off" (silence). The distinction is the whole reason the
 	// shadow census has a refusal path.
-	Out.bArmed = VoxelMarchGetArm().bHoleStats;
+	const FVoxelMarchArm Arm = VoxelMarchGetArm();
+	Out.bArmed = Arm.bHoleStats;
+	Out.bBreakdownArmed = Arm.HoleStatsLevel >= 2;
 	if (!GMarchState.IsValid())
 	{
 		return Out;
 	}
 	FScopeLock Guard(&GMarchState->Lock);
 	const bool bArmed = Out.bArmed;
+	const bool bBreakdownArmed = Out.bBreakdownArmed;
 	Out = GMarchState->HoleWindow;
 	Out.bArmed = bArmed;
+	Out.bBreakdownArmed = bBreakdownArmed;
+	// Kept for the HUD's 1 Hz peek -- the panel must show what the log drained
+	// without becoming a second drainer (two drainers of one accumulator each
+	// see a random share).
+	GMarchState->LastDrainedHoleWindow = Out;
 	GMarchState->HoleWindow = FVoxelMarchHoleStats();
+	return Out;
+}
+
+FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
+{
+	FVoxelMarchHoleStats Out;
+	const FVoxelMarchArm Arm = VoxelMarchGetArm();
+	Out.bArmed = Arm.bHoleStats;
+	Out.bBreakdownArmed = Arm.HoleStatsLevel >= 2;
+	if (!GMarchState.IsValid())
+	{
+		// Frames == 0: "no window has completed", which the panel must word as
+		// no-sample, never as a healthy zero.
+		return Out;
+	}
+	FScopeLock Guard(&GMarchState->Lock);
+	const bool bArmed = Out.bArmed;
+	const bool bBreakdownArmed = Out.bBreakdownArmed;
+	Out = GMarchState->LastDrainedHoleWindow;
+	// The arm flags track the switch NOW, not the switch as it stood when the
+	// stale window was drained -- the panel's off/armed wording follows the
+	// cvar the owner just typed.
+	Out.bArmed = bArmed;
+	Out.bBreakdownArmed = bBreakdownArmed;
 	return Out;
 }
 
@@ -2629,7 +2682,13 @@ class FVoxelMarchFallthroughDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_FALLTHROUG
 // ever stops being true -- if a hole-stats branch gains the power to change a
 // hit -- it must move into the walk shape and be classified, per the
 // static_assert below.
-class FVoxelMarchHoleStatsDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_HOLE_STATS");
+//
+// AN INT SINCE 2026-08-23, three values: 0 off (unchanged, still the
+// byte-identical control), 1 the certified cheap counters (unchanged counting
+// code; only the shared word-count define grew), 2 the uncovered breakdown --
+// per-level and per-reason words, plus the per-ray capture registers in the
+// walk. Still observation-only at every level, same rule, same static_assert.
+class FVoxelMarchHoleStatsDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_HOLE_STATS", 3);
 
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
@@ -2768,10 +2827,30 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchHoleWord::Substituted));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNCOVERED"),
 		                         int32(VoxelMarchHoleWord::Uncovered));
+		// The level-2 breakdown's two word groups: 6 level words then 4
+		// reason words. The shader adds the ring level / the
+		// VOXEL_MARCH_MISS_* code to these bases, so the group sizes are
+		// layout shared with the enum -- static_asserted right below the
+		// class rather than trusted.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNC_LEVEL0"),
+		                         int32(VoxelMarchHoleWord::UncLevelFirst));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNC_REASON0"),
+		                         int32(VoxelMarchHoleWord::UncReasonFirst));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WORDS"),
 		                         int32(VoxelMarchHoleWord::Count));
 	}
 };
+// The breakdown's group sizes ARE the buffer layout (the shader indexes
+// base + level and base + reason code), so the enum must agree with itself
+// before anything is allowed to read a word by arithmetic.
+static_assert(int32(VoxelMarchHoleWord::UncReasonFirst) -
+                      int32(VoxelMarchHoleWord::UncLevelFirst) ==
+                  VoxelMarchHoleWord::kNumLevels,
+              "hole-stats level group size drifted from the enum layout");
+static_assert(int32(VoxelMarchHoleWord::Count) -
+                      int32(VoxelMarchHoleWord::UncReasonFirst) ==
+                  VoxelMarchHoleWord::kNumReasons,
+              "hole-stats reason group size drifted from the enum layout");
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchCS, VOXEL_MARCH_USF, "VoxelMarchMain", SF_Compute);
 
 class FVoxelMarchCompactCS : public FGlobalShader
@@ -3530,6 +3609,19 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			const uint32 Hits = Src[VoxelMarchHoleWord::Hits];
 			const uint32 Substituted = Src[VoxelMarchHoleWord::Substituted];
 			const uint32 Uncovered = Src[VoxelMarchHoleWord::Uncovered];
+			// The breakdown words, copied out BEFORE Unlock invalidates Src.
+			// Read regardless of level (the buffer always has Count words),
+			// folded in only for level-2 frames below.
+			uint32 ByLevel[VoxelMarchHoleWord::kNumLevels];
+			uint32 ByReason[VoxelMarchHoleWord::kNumReasons];
+			for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
+			{
+				ByLevel[L] = Src[int32(VoxelMarchHoleWord::UncLevelFirst) + L];
+			}
+			for (int32 R = 0; R < VoxelMarchHoleWord::kNumReasons; ++R)
+			{
+				ByReason[R] = Src[int32(VoxelMarchHoleWord::UncReasonFirst) + R];
+			}
 			Slot.Readback->Unlock();
 			FScopeLock Guard(&State->Lock);
 			State->HoleWindow.Rays += Rays;
@@ -3537,6 +3629,24 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.Substituted += Substituted;
 			State->HoleWindow.Uncovered += Uncovered;
 			State->HoleWindow.Frames++;
+			if (Slot.ArmLevel >= 2)
+			{
+				// Only frames whose kernel actually ran the breakdown count
+				// toward it. A level-1 frame's words are zeros by permutation,
+				// not by measurement, and summing them would let the window
+				// print a confident 0 for buckets nothing counted -- the
+				// zeros-mistaken-for-measurements failure this project
+				// retracted two readings over this week.
+				for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
+				{
+					State->HoleWindow.UncoveredByLevel[L] += ByLevel[L];
+				}
+				for (int32 R = 0; R < VoxelMarchHoleWord::kNumReasons; ++R)
+				{
+					State->HoleWindow.UncoveredByReason[R] += ByReason[R];
+				}
+				State->HoleWindow.BreakdownFrames++;
+			}
 		}
 		Slot.bInFlight = false;
 	}
@@ -4452,7 +4562,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// refused permutation.
 			Permutation.Set<FVoxelMarchFallthroughDim>(Arm.Fallthrough);
 			// Already false without rings (VoxelMarchGetArm), same rule.
-			Permutation.Set<FVoxelMarchHoleStatsDim>(Arm.bHoleStats);
+			Permutation.Set<FVoxelMarchHoleStatsDim>(Arm.HoleStatsLevel);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.
@@ -4500,6 +4610,10 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 					AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), HoleStats,
 					                   uint32(VoxelMarchHoleWord::Count) * sizeof(uint32));
 					Free->bInFlight = true;
+					// Which permutation filled this slot -- read at landing so
+					// a level-1 frame's structurally zero breakdown words are
+					// never folded in as measurements (see FHoleReadback).
+					Free->ArmLevel = Arm.HoleStatsLevel;
 				}
 			}
 		}

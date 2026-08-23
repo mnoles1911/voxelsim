@@ -332,6 +332,11 @@ struct FVoxelMarchArm
 	// only, forced false without them, because both counters are properties
 	// of the ring walk.
 	bool bHoleStats = false;
+	// The permutation value actually asked for: 0 off, 1 the cheap counters
+	// (the certified 0.0302% / 8.2479% instrument, unchanged), 2 adds the
+	// per-level / per-reason uncovered breakdown. bHoleStats stays the "any
+	// level" summary so existing consumers keep reading one bool.
+	int32 HoleStatsLevel = 0;
 	// voxel.March.ReachM. 0 keeps the occupancy volume's own box, which is what
 	// keeps the source A/B alive. Anything else moves the local frame and is
 	// source-1 only.
@@ -367,8 +372,28 @@ namespace VoxelMarchHoleWord
 		Hits,            // rays that hit at any level (substituted's denominator)
 		Substituted,     // hits from a level coarser than the owning segment
 		Uncovered,       // misses that crossed an ABSENT chunk, below horizon
-		Count
+
+		// ---- LEVEL 2 (voxel.March.HoleStats 2): the uncovered breakdown ----
+		// Six level words and four reason words, both written ONLY by the
+		// level-2 permutation. Every attributed uncovered ray adds exactly one
+		// word from each group, so sum(UncLevel*) == sum(UncReason*) ==
+		// "attributed uncovered", and attributed <= Uncovered is an identity
+		// the perf line CHECKS -- a shortfall is a capture defect in the
+		// shader, printed as such, never silently absorbed. Under level 1
+		// these ten words exist in the buffer (one layout, one enum, one
+		// readback size) and stay zero; the CPU reports them as NOT MEASURED
+		// there, because a zero that means "the code that counts this was
+		// compiled out" must never be printable as "no holes of this kind"
+		// (two retractions this week were exactly that shape).
+		UncLevelFirst,                        // + ring level 0..5 of the miss
+		UncReasonFirst = UncLevelFirst + 6,   // + VOXEL_MARCH_MISS_* 0..3
+		Count = UncReasonFirst + 4
 	};
+	constexpr int32 kNumLevels = 6;
+	constexpr int32 kNumReasons = 4;
+	// The reason order, mirrored from VOXEL_MARCH_MISS_* in
+	// VoxelBrickTraverse.ush (never / pending / evicted / unattributed) --
+	// the bucket CODES are word offsets, so this order is layout.
 }
 
 // What one 5 s perf-log window reads: sums over every frame whose readback
@@ -384,6 +409,19 @@ struct FVoxelMarchHoleStats
 	uint64 Uncovered = 0;
 	uint64 Frames = 0;   // readbacks landed in the window
 	bool bArmed = false; // voxel.March.HoleStats was on when asked
+
+	// ---- the level-2 breakdown (voxel.March.HoleStats 2) -------------------
+	// Summed ONLY from frames whose kernel ran the level-2 permutation
+	// (BreakdownFrames counts those). Frames > 0 with BreakdownFrames == 0
+	// means the cheap counters measured and the breakdown DID NOT -- the
+	// consumer must print "not measured", never these zeros as data.
+	uint64 UncoveredByLevel[6] = {};
+	// Order is the shader's VOXEL_MARCH_MISS_* codes: [0] never admitted,
+	// [1] admitted-pending, [2] evicted, [3] unattributed (the instrument
+	// refused to guess -- stale resident record or reserved code).
+	uint64 UncoveredByReason[4] = {};
+	uint64 BreakdownFrames = 0;
+	bool bBreakdownArmed = false; // voxel.March.HoleStats >= 2 when asked
 };
 
 // Drains the accumulated window (the GetAndReset pattern the 5 s perf log
@@ -391,6 +429,15 @@ struct FVoxelMarchHoleStats
 // the game thread; returns zeros with bArmed=false when the extension has
 // never run.
 VOXELEARTHSHADERS_API FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats();
+
+// The most recently DRAINED window, kept for the streaming HUD panel
+// (voxel.Debug 3), which redraws at 1 Hz and must not race or double-drain the
+// 5 s perf log -- the log drains, this peeks what the log drained. Frames == 0
+// in the returned struct means no window has completed yet ("no sample", not
+// "no holes"); bArmed/bBreakdownArmed are refreshed from the CURRENT arm at
+// call time so the panel's off/on wording tracks the switch, not the stale
+// window. Game thread.
+VOXELEARTHSHADERS_API FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow();
 
 // ---------------------------------------------------------------------------
 // THE STENCIL CONSTANT, MIRRORED BY HAND
@@ -1157,11 +1204,23 @@ public:
 	{
 		TUniquePtr<FRHIGPUBufferReadback> Readback;
 		bool bInFlight = false;
+		// Which permutation level the kernel that filled this slot ran at,
+		// recorded AT ENQUEUE. The cvar can change in the 1-3 frames a
+		// readback is in flight, and folding a level-1 frame's structurally
+		// zero breakdown words into the window would print "0 evicted" for a
+		// frame that measured no such thing -- the exact zeros-as-measurement
+		// mistake this week's two retractions were made of.
+		int32 ArmLevel = 0;
 	};
 	FHoleReadback HoleRing[kNumHoleReadbacks];
 	// Accumulated under Lock as readbacks land; drained by
 	// VoxelMarchGetAndResetHoleStats (bArmed is filled at drain, from the arm).
 	FVoxelMarchHoleStats HoleWindow;
+	// The last window the drain handed out, kept verbatim for the HUD's
+	// peek (VoxelMarchPeekLastHoleWindow) -- the panel reads at 1 Hz, the log
+	// drains at 5 s, and two drainers of one accumulator would each get a
+	// random share. Under Lock.
+	FVoxelMarchHoleStats LastDrainedHoleWindow;
 
 	// The depth gate's own readback ring. Separate from the tile ring: the two
 	// are enqueued by different passes under different cvars, and a shared ring

@@ -9312,6 +9312,114 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       Hits > 0.0 ? 100.0 * double(H.Substituted) / Hits : 0.0,
 			       (unsigned long long)H.Rays, (unsigned long long)H.Hits,
 			       (unsigned long long)H.Frames);
+
+			// Mirror for the streaming HUD's legacy row (registered by
+			// VoxelDebug.cpp; found by name because this module must not link
+			// against a registration that may not exist in a stripped build).
+			// This publish was MISSING when the panel shipped -- the row read
+			// "armed, no sample yet" forever -- so it lives here now, beside
+			// the drain that owns the number.
+			if (IConsoleVariable* Pct = IConsoleManager::Get().FindConsoleVariable(
+			        TEXT("voxel.March.HoleStats.UncoveredPct")))
+			{
+				Pct->Set(Rays > 0.0 ? float(100.0 * double(H.Uncovered) / Rays) : 0.0f,
+				         ECVF_SetByCode);
+			}
+
+			// ---- THE BREAKDOWN (voxel.March.HoleStats 2) -------------------
+			//
+			// WHAT MOVES EACH BUCKET, so the reader can check the split is
+			// alive in both directions before believing it:
+			//   byLevel   -- the established facts predict the mass at L0
+			//     (R0 pending=242 mid-flight, R1-R5 at 0). -VoxelMaxRingLevel=0
+			//     must move the mass OUT to L1-L5. If normal flight puts the
+			//     mass at L1+ instead, the coverage rule, not R0 throughput,
+			//     owns the arcs.
+			//   never    -- UP under -VoxelMaxRingLevel=0 (nothing above L0 is
+			//     ever admitted: THE proving run -- near-100% never, at L1-L5);
+			//     DOWN in the normal config where the desired set covers the
+			//     cascade.
+			//   pending  -- UP flying at 30 m/s (tracks the ring pending
+			//     queues); DOWN to ~0 hovering until they drain.
+			//   evicted  -- UP under -VoxelHierarchicalCoverage (32,923 pool
+			//     evictions measured 2026-08-23); DOWN to ~0 settled (the
+			//     shipping log prints evictions 0).
+			//   unattrib -- indicts the INSTRUMENT (stale resident records,
+			//     uncaptured rays); large values mean fix the meter, not the
+			//     streaming.
+			if (H.bBreakdownArmed && H.BreakdownFrames == 0)
+			{
+				UE_LOG(LogVoxelPerf, Warning,
+				       TEXT("Voxel march holes breakdown: ARMED BUT NO LEVEL-2 FRAMES LANDED ")
+				       TEXT("this window -- the cvar likely flipped mid-window. Not evidence ")
+				       TEXT("about reasons or levels either way."));
+			}
+			else if (H.BreakdownFrames > 0)
+			{
+				uint64 Attributed = 0;
+				uint64 ReasonSum = 0;
+				for (int32 L = 0; L < 6; ++L) { Attributed += H.UncoveredByLevel[L]; }
+				for (int32 R = 0; R < 4; ++R) { ReasonSum += H.UncoveredByReason[R]; }
+				// attributed == sum(byReason) is a shader-construction
+				// identity (one add from each group per attributed ray);
+				// attributed <= uncovered can legitimately fall short only by
+				// sentinel rays (capture defect -- printed, never absorbed)
+				// or by a window that mixed arm levels (uncovered counts all
+				// frames, the breakdown only level-2 ones -- said explicitly).
+				const bool bPureWindow = H.BreakdownFrames == H.Frames;
+				const uint64 Shortfall =
+					bPureWindow && H.Uncovered >= Attributed ? H.Uncovered - Attributed : 0;
+				FVoxelMarchChunkIndex& MarchIndex = GetGlobalVoxelMarchChunkIndex();
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march holes breakdown (5s window): byLevel L0=%llu L1=%llu ")
+				       TEXT("L2=%llu L3=%llu L4=%llu L5=%llu | byReason never=%llu pending=%llu ")
+				       TEXT("evicted=%llu unattrib=%llu | attributed=%llu of uncovered=%llu%s ")
+				       TEXT("| annotWrites pending=%llu evicted=%llu (lifetime)%s"),
+				       (unsigned long long)H.UncoveredByLevel[0],
+				       (unsigned long long)H.UncoveredByLevel[1],
+				       (unsigned long long)H.UncoveredByLevel[2],
+				       (unsigned long long)H.UncoveredByLevel[3],
+				       (unsigned long long)H.UncoveredByLevel[4],
+				       (unsigned long long)H.UncoveredByLevel[5],
+				       (unsigned long long)H.UncoveredByReason[0],
+				       (unsigned long long)H.UncoveredByReason[1],
+				       (unsigned long long)H.UncoveredByReason[2],
+				       (unsigned long long)H.UncoveredByReason[3],
+				       (unsigned long long)Attributed, (unsigned long long)H.Uncovered,
+				       !bPureWindow
+				           ? TEXT(" [WINDOW MIXED ARM LEVELS -- attributed covers fewer frames]")
+				           : (Shortfall > 0 ? TEXT(" [SHORTFALL: capture missed rays -- ")
+				                              TEXT("instrument defect, investigate]")
+				                            : TEXT("")),
+				       (unsigned long long)MarchIndex.GetAbsentPendingMarks(),
+				       (unsigned long long)MarchIndex.GetAbsentEvictedMarks(),
+				       MarchIndex.AreAbsentMarksArmed()
+				           ? TEXT("")
+				           : TEXT(" [ANNOTATION WRITER DISARMED (IndexGpuResident on?) -- ")
+				             TEXT("reasons are STALE BITS, read only the level histogram]"));
+				if (Attributed != ReasonSum)
+				{
+					// A construction identity broke: the readback and the
+					// kernel have diverged (the 60-vs-64-word incident's
+					// signature). The numbers above are not trustworthy.
+					UE_LOG(LogVoxelPerf, Error,
+					       TEXT("Voxel march holes breakdown: sum(byLevel)=%llu != ")
+					       TEXT("sum(byReason)=%llu -- word-layout divergence, DISCARD this ")
+					       TEXT("window's breakdown."),
+					       (unsigned long long)Attributed, (unsigned long long)ReasonSum);
+				}
+			}
+			else if (H.bArmed)
+			{
+				// Level 1: the cheap counters measured, the breakdown did not.
+				// Said out loud because a silent absence reads as "no data
+				// needed" and a zero would read as "no holes of any kind" --
+				// the two failure modes this project retracted readings over.
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march holes breakdown: NOT MEASURED at HoleStats 1 -- ")
+				       TEXT("voxel.March.HoleStats 2 (or voxel.GpuStream.Prototype 1, which ")
+				       TEXT("arms it) adds the per-level/per-reason split."));
+			}
 		}
 		// PUBLISH TO THE HUD PANEL'S TRANSPORT, and this hookup was MISSING on
 		// the night the panel shipped: the panel registers the float cvar
@@ -12142,6 +12250,19 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					++LevelRecordsAdded[QueueLevel];
 					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
 					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
+					// The absent-annotation writer (voxel.March.HoleStats 2):
+					// this is THE admission -- the one moment "admitted, not
+					// yet resident" becomes true -- so the march index's cell
+					// is stamped here and the uncovered breakdown can charge a
+					// miss on this chunk to THROUGHPUT instead of guessing.
+					// LevelKey's chunk coordinate is the brick/march chunk
+					// coordinate verbatim (VoxelBrickCpuArm::MakeKey copies
+					// the fields), so no translation happens here that could
+					// drift from the pool's. No-op unless armed; the uploads
+					// ride FlushAbsentMarks at this recompute's tail.
+					GetGlobalVoxelMarchChunkIndex().NoteChunkAdmitted(
+						FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
+						QueueLevel);
 					if (bOverlayAware)
 					{
 						PendingGameThreadKeys.Add(LevelKey);
@@ -12334,6 +12455,12 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	MaxRecomputeMs = FMath::Max(MaxRecomputeMs, ThisFrameRecomputeMs);
 	MaxExitScanMs = FMath::Max(MaxExitScanMs, ThisFrameExitScanMs);
 	MaxSortMs = FMath::Max(MaxSortMs, ThisFrameSortMs);
+	// voxel.March.HoleStats 2: one staging for this call's whole burst of
+	// pending/cleared annotations, AFTER the truncation above has retracted
+	// the ones it cancelled -- staging before it would upload marks this same
+	// call takes back. No-op when nothing was marked (the overwhelmingly
+	// common case, and every case while disarmed).
+	GetGlobalVoxelMarchChunkIndex().FlushAbsentMarks();
 	++RecomputeCalls;
 }
 
@@ -12375,6 +12502,14 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 			    !PendingUnloadSet.Contains(Entry.Key))
 			{
 				ChunkRecords.Remove(Entry.Key);
+				// Un-admission (voxel.March.HoleStats 2): this chunk never
+				// generated and is no longer wanted, so a still-standing
+				// "pending" annotation would charge future misses here to
+				// throughput when the truth is the coverage rule walked away.
+				// Clears only a pending mark naming exactly this coord.
+				GetGlobalVoxelMarchChunkIndex().NoteChunkNoLongerAdmitted(
+					FIntVector(Entry.Key.Key.X, Entry.Key.Key.Y, Entry.Key.Key.Z),
+					Entry.Key.Level);
 				++RecordsDroppedSinceLog;
 				++LevelRecordsDropped[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 				--ToDrop;
@@ -17818,6 +17953,14 @@ void FVoxelWorldImpl::DrainUnloads()
 			ReleaseChunkBricks(Key);
 		}
 		ChunkRecords.Remove(Key);
+		// voxel.March.HoleStats 2: a record unloaded BEFORE it ever produced
+		// bricks leaves no pool removal behind, so nothing would ever clear
+		// its "pending" annotation -- do it here. For a chunk that WAS
+		// resident this is a no-op (its cell still reads resident until the
+		// pool's removal delta lands, and that delta writes the EVICTED
+		// annotation, which is the one we want kept).
+		GetGlobalVoxelMarchChunkIndex().NoteChunkNoLongerAdmitted(
+			FIntVector(Key.Key.X, Key.Key.Y, Key.Key.Z), Key.Level);
 		++TotalChunksUnloaded;
 		++RecordsEvictedSinceLog;
 		++LevelRecordsEvicted[FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1)];

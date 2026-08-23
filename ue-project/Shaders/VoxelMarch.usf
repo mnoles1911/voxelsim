@@ -587,6 +587,27 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				else if (H.bCrossedAbsentChunk && Ray.DirWorld.z < 0.0f)
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNCOVERED], 1u);
+#if VOXEL_MARCH_HOLE_STATS >= 2
+					// LEVEL 2: which ring level owned the ground at the first
+					// absent crossing, and why that chunk was absent -- one
+					// level word and one reason word per uncovered ray, so
+					// sum(byLevel) == sum(byReason) == the attributed share of
+					// `uncovered` BY CONSTRUCTION, and the CPU prints the
+					// shortfall instead of hiding it. The < 6 guard is the
+					// sentinel check (see Miss.AbsentLevel in
+					// VoxelBrickTraverse.ush): an unattributed ray is counted
+					// in `uncovered` and in NEITHER breakdown, so a capture
+					// defect surfaces as attributed < uncovered rather than as
+					// a confident wrong histogram.
+					if (H.AbsentLevel < 6u)
+					{
+						InterlockedAdd(
+							GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNC_LEVEL0 + H.AbsentLevel], 1u);
+						InterlockedAdd(
+							GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNC_REASON0 +
+							                    min(H.FirstAbsentReason, 3u)], 1u);
+					}
+#endif
 				}
 #endif
 				if (H.bHit)
