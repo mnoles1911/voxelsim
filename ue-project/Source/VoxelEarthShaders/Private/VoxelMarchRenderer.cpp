@@ -140,7 +140,17 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchFallthrough(
-		TEXT("voxel.March.Fallthrough"), 0,
+		TEXT("voxel.March.Fallthrough"), 1,
+		TEXT("DEFAULT 1 SINCE 2026-08-23, ON THE OWNER'S DIRECT VISUAL VERDICT, AND IT ")
+		TEXT("OVERRULED THREE OF MY MEASUREMENTS. Toggled live in PIE it closed the black ")
+		TEXT("gaps at every LOD boundary the moment it went on, and re-opened them the ")
+		TEXT("moment it went off; flying, the holes became a wait for finer detail to ")
+		TEXT("arrive over coarse terrain instead of a wait for anything at all. ")
+		TEXT("THE INSTRUMENT SAID THE OPPOSITE: three matched legs put voxel.March.HoleStats' ")
+		TEXT("`uncovered` HIGHER with this on (3.99%% -> 4.56%%), which is backwards -- a ray ")
+		TEXT("that would have missed now hits at a coarser level, so uncovered should FALL. ")
+		TEXT("Until that is explained, `uncovered` is NOT a trustworthy hole gate and the ")
+		TEXT("screenshots outrank it. See docs/gpu-streaming-architecture.md 7. ")
 		TEXT("FINE -> COARSE FALLTHROUGH (Phase 1, the no-hole invariant): how many coarser ")
 		TEXT("levels a ring segment may retry after a miss that crossed a NON-RESIDENT chunk, so ")
 		TEXT("a missing level-0 chunk renders as level-1 detail instead of a hole. 0 (default) = ")

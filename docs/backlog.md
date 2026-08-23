@@ -26,6 +26,54 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0d Far clipmap renders white, and bright magenta at extreme distance
+
+**Owner-reported 2026-08-23**, immediately after the clipmap was restored (it had
+been suppressed by a `-VoxelNoClipmap` left in the launch script — see §0.0e for
+that mistake). The heightfield that carries terrain from the ring cascade's edge
+out to ~30 km draws with **no colour or terrain texture at all — flat white** —
+and at the greatest distances turns **bright purple/pink**.
+
+**Magenta is a strong signal, not a cosmetic one.** In UE it is the standard
+"invalid / missing material" colour, so the far band is likely not merely
+untextured but failing a lookup outright. White nearer in suggests the material
+loads but its colour inputs are unset or unbound, which is a different fault from
+the magenta — **treat them as two symptoms and confirm whether they share a
+cause before fixing either.**
+
+Start at `AVoxelClipmapActor` (`ue-project/Source/VoxelEarth/VoxelClipmapActor.cpp`):
+it loads `/Game/Voxel/M_VoxelClipmap` at `:135-136` and assigns it at `:147-149`,
+with a dynamic material instance and a snow band documented at `:71`. Check in
+this order:
+
+1. Does `StaticLoadObject` actually return the material at runtime? A null there
+   would give UE's default, which is the white.
+2. Are the biome/colour parameters being pushed to the MID at all (`:300`
+   onwards), and are they pushed for every band or only the near ones?
+3. What differs at the far bands specifically — a vertex-colour or texture
+   coordinate that runs out of range, or a parameter that is only set within some
+   radius. Magenta appearing ONLY at distance argues for a per-band difference
+   rather than a global miss.
+
+**Judged by eye, by the owner** — this is appearance, so matched captures at a
+fixed pose looking at the horizon, not a metric.
+
+### 0.0e A diagnostic flag shipped in the launch script for a session
+
+`tools/voxel-launch-prototype.ps1` passed **`-VoxelNoClipmap`**, copied out of the
+handoff's editor command line without noticing what it does: it SUPPRESSES the
+far-terrain clipmap, and it exists purely as a control for "is that distant
+terrain actually voxels?" The owner's first hands-on session therefore showed
+terrain ending a few km out against a flat blue plane, and reported it as a bug
+in the world. Fixed; it is now `-NoClipmap`, opt-in, with the reason at the call
+site.
+
+**The lesson worth keeping:** a command line copied from a measurement recipe is
+not a command line for playing the game. Diagnostic switches in this project are
+deliberately powerful (they suppress whole subsystems to make a control), and
+several read as ordinary settings by name alone.
+
+
 ### 0.0b Coarse LOD browns out — the material mip discards thin surface layers
 
 **Owner-reported 2026-08-23, and present since the ray marcher landed.** The near

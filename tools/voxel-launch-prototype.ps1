@@ -24,6 +24,9 @@ param(
     # measured-better producer TODAY -- see docs/gpu-streaming-architecture.md
     # for why that is a temporary state and what replaces it.
     [switch]$GpuStream,
+    # Suppress the far-terrain clipmap. A CONTROL for "is distant terrain
+    # voxels?", not something you want on for normal play -- see below.
+    [switch]$NoClipmap,
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe',
     [string[]]$ExtraArgs = @()
 )
@@ -38,7 +41,17 @@ if ($running.Count -gt 0) {
            "One editor per box. Close it first.")
 }
 
-$argList = @("`"$Project`"", '-dx12', '-sm6', "-VoxelSpawnAt=$SpawnAt", '-VoxelNoClipmap')
+# NO -VoxelNoClipmap. That flag is a DIAGNOSTIC CONTROL, not a normal setting:
+# it suppresses the heightmap clipmap that carries terrain from the ring
+# cascade's edge (~1 km) out to ~30 km, and it exists to answer "is that distant
+# terrain actually voxels?" by making everything non-voxel disappear.
+#
+# It was in this script for one session because it was copied out of the
+# handoff's editor command line, and the owner immediately hit the consequence:
+# terrain ending a few km out with a flat blue plane to the horizon. Pass
+# -NoClipmap deliberately if you want that control back.
+$argList = @("`"$Project`"", '-dx12', '-sm6', "-VoxelSpawnAt=$SpawnAt")
+if ($NoClipmap) { $argList += '-VoxelNoClipmap' }
 if ($GpuStream) { $argList += '-VoxelGpuMesh' }
 $argList += $ExtraArgs
 

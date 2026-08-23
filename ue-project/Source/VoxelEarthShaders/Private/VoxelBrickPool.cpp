@@ -93,8 +93,14 @@ namespace VoxelBrickPoolDetail
 	// `evictions == 0` is a stated gate in this project and writesDropped is
 	// lost chunk data -- it showed up as holes 0 -> 8 in the coverage verifier.
 	//
-	// The owner has approved growing to 1-2 GB VRAM. Committed total roughly
-	// doubles with this, to ~776 MiB, which is inside that.
+	// The owner has approved growing to 1-2 GB VRAM.
+	//
+	// THIS LINE ONCE CLAIMED THE COMMITTED TOTAL "roughly doubles ... to ~776
+	// MiB". THAT WAS FALSE WHEN WRITTEN: the occ/mat word arenas below are
+	// sized in MiB independently of this count, so raising it alone bought
+	// slots with no words to fill them, and the pool evicted at 59.5% slot
+	// occupancy. They are doubled now too, and the three capacities must move
+	// together -- see the note on GVoxelBrickPoolOccMiB.
 	//
 	// THIS IS THE SHAPE TO WATCH, not the number: throughput changes that put
 	// more chunks in flight cost pool capacity, and the pool does not complain
@@ -109,14 +115,34 @@ namespace VoxelBrickPoolDetail
 		TEXT("mesh path, INCLUDING the 37,539 that mesh to zero quads and store collapsed."),
 		ECVF_ReadOnly);
 
-	int32 GVoxelBrickPoolOccMiB = 96;
+	// SCALED WITH THE CHUNK COUNT ON 2026-08-23, AND THE BUG THIS FIXES WAS MINE.
+	//
+	// Earlier the same day GVoxelBrickPoolChunks went 131,072 -> 262,144 to stop
+	// capacity evictions after the dispatch cap was raised, and its comment
+	// claimed the committed total "roughly doubles ... to ~776 MiB". IT DID NOT.
+	// These word arenas are sized in MiB and were INDEPENDENT of the chunk
+	// count, so the change bought slots and no words to put in them.
+	//
+	// The owner found it in PIE within the hour: the panel read
+	// `Pool: 233,838 / 393,216 chunks (59.5%) 321 MiB evict 25,949 [GATE FAIL]`
+	// -- capacity-pressured eviction at 59.5% SLOT occupancy, which is only
+	// possible if a different arena is the one that is full. GetEvictions counts
+	// "chunks dropped to make room", never ordinary ring churn, so it could not
+	// be dismissed as normal traffic.
+	//
+	// Doubled to match, keeping the ~1.2 KiB occ + ~2.8 KiB mat per chunk ratio
+	// the original numbers encode. Committed total ~776 MiB, inside the owner's
+	// approved 1-2 GB. ANYONE CHANGING THE CHUNK COUNT MUST CHANGE THESE: the
+	// three capacities are one budget wearing three names, and nothing in the
+	// code ties them together.
+	int32 GVoxelBrickPoolOccMiB = 192;
 	FAutoConsoleVariableRef CVarVoxelBrickPoolOccMiB(
 		TEXT("voxel.Brick.PoolOccMiB"),
 		GVoxelBrickPoolOccMiB,
 		TEXT("Occupancy arena size in MiB (16 dwords per MIXED brick). Census: 56.0 MiB at 10 cm / 4 km."),
 		ECVF_ReadOnly);
 
-	int32 GVoxelBrickPoolMatMiB = 224;
+	int32 GVoxelBrickPoolMatMiB = 448;
 	FAutoConsoleVariableRef CVarVoxelBrickPoolMatMiB(
 		TEXT("voxel.Brick.PoolMatMiB"),
 		GVoxelBrickPoolMatMiB,

@@ -3557,7 +3557,13 @@ double InnerEvictUU(int32 Level)
 // makes it one read, decided before the first recompute.
 bool HierarchicalCoverageEnabled()
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelHierarchicalCoverage"));
+	// DEFAULT ON SINCE 2026-08-23. Fallthrough is useless without it -- it is
+	// what puts a coarse chunk under the fine ring for the marcher to fall
+	// through TO -- and the owner confirmed the pair visually in PIE. Inverted
+	// to the negative switch so a PIE session launched from the editor gets it,
+	// the same reason GpuMeshEnabled gives.
+	static const bool bDisabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoHierarchicalCoverage"));
+	const bool bEnabled = !bDisabled;
 	return bEnabled;
 }
 
@@ -9307,8 +9313,34 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       (unsigned long long)H.Rays, (unsigned long long)H.Hits,
 			       (unsigned long long)H.Frames);
 		}
+		// PUBLISH TO THE HUD PANEL'S TRANSPORT, and this hookup was MISSING on
+		// the night the panel shipped: the panel registers the float cvar
+		// voxel.March.HoleStats.UncoveredPct and reads it, this side owns the
+		// number, and nothing connected them -- so the owner's first hands-on
+		// PIE session read "armed, no sample yet" for a metric that was in fact
+		// being measured and logged one line above.
+		//
+		// Two independently-correct halves and no join is the same shape as the
+		// admit/evict radii that opened this session. The panel reads by NAME
+		// through IConsoleManager (it must -- VoxelEarth cannot link the shaders
+		// module's symbols), which is exactly the kind of seam that compiles
+		// perfectly while doing nothing.
+		//
+		// -1 means "no sample", which is what the panel prints as such. Only a
+		// window that actually landed readbacks publishes a real value, so an
+		// armed-but-not-measuring instrument can never masquerade as 0.00%.
+		if (IConsoleVariable* const HolePct =
+		        IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.March.HoleStats.UncoveredPct")))
+		{
+			const double Rays = double(H.Rays);
+			HolePct->Set(H.Frames > 0 && Rays > 0.0
+			                 ? float(100.0 * double(H.Uncovered) / Rays)
+			                 : -1.0f,
+			             ECVF_SetByCode);
+		}
 		// Not armed: silence, exactly like every other off instrument here.
 	}
+
 
 	if (VoxelTerrainQuadsRetired())
 	{
