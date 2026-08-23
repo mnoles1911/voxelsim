@@ -1368,9 +1368,11 @@ int3 VoxelMarchOriginVoxel()
 	return GVoxelMarchCtxSet ? GVoxelMarchOriginVoxelL : MarchBrickOriginVoxel;
 }
 
-#define VOXEL_MARCH_INDEX_RESIDENT_BIT 0x80000000u
-#define VOXEL_MARCH_INDEX_ANYSOLID_BIT 0x40000000u
-#define VOXEL_MARCH_INDEX_SLOT_MASK    0x3FFFFFFFu
+// The entry bit layout and the coord->cell wrap now live in a shared include,
+// because Phase 2 (GPU-written residency) gave the index a GPU WRITER as well
+// as this reader, and two hand-mirrored spellings of the same math is the
+// defect shape this project pays for most often. Same tokens, same values.
+#include "/VoxelEarth/VoxelMarchIndexCell.ush"
 
 #define VOXEL_MARCH_CHUNK_RECORD_DWORDS 16u
 #define VOXEL_MARCH_BRICKS_PER_CHUNK    64u
@@ -1434,15 +1436,16 @@ FVoxelMarchChunkCache VoxelMarchNoChunk()
 // the dims are powers of two.
 uint VoxelMarchIndexCell(int3 ChunkCoord)
 {
-	const uint cx = uint(ChunkCoord.x) & (MarchIndexDimChunks.x - 1u);
-	const uint cy = uint(ChunkCoord.y) & (MarchIndexDimChunks.y - 1u);
-	const uint cz = uint(ChunkCoord.z) & (MarchIndexDimChunks.z - 1u);
-	// The grid-slot offset. Zero on every single-level path, so this is the same
-	// address it has always been until a ring loop or the cover overlay says
-	// otherwise. SLOT, not level: the cover level is 7 and the grid does not
-	// carry eight sub-grids.
-	return GVoxelMarchIndexGrid * MarchIndexCellsPerLevel +
-	       cx + MarchIndexDimChunks.x * (cy + MarchIndexDimChunks.y * cz);
+	// The grid-slot offset (GVoxelMarchIndexGrid) is zero on every single-level
+	// path, so this is the same address it has always been until a ring loop or
+	// the cover overlay says otherwise. SLOT, not level: the cover level is 7
+	// and the grid does not carry eight sub-grids.
+	//
+	// The wrap itself is the SHARED function -- the same one the Phase 2
+	// publish kernel uses to WRITE these cells. If this call site and that one
+	// ever stop agreeing, the delta-verify readback gate is what says so.
+	return VoxelMarchIndexCellCompute(ChunkCoord, MarchIndexDimChunks,
+	                                  MarchIndexCellsPerLevel, GVoxelMarchIndexGrid);
 }
 
 FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)

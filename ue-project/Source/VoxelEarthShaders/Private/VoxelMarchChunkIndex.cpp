@@ -116,33 +116,69 @@ namespace
 	// flushes), so it is a measurement leg's switch, never a shipping one.
 	TAutoConsoleVariable<int32> CVarVoxelMarchIndexDeltaVerify(
 		TEXT("voxel.March.IndexDeltaVerify"), 0,
-		TEXT("1 = after each sampled delta scatter, read the whole index buffer back and "
-		     "FNV-compare it against the CPU grid state it was patched to equal (the hash a "
-		     "full upload of the same state would have). Results in GetUploadStats() "
-		     "VerifyPasses/VerifyFailures; a failure logs an Error with both hashes. Only "
-		     "meaningful with voxel.March.IndexDeltaUpload 1. EXPENSIVE (56 MiB readback + "
-		     "~17.5 ms hash per sample); for correctness legs, default 0. "
-		     "BROKEN AS OF 2026-08-23 -- SEE BELOW BEFORE USING."),
+		TEXT("1 = after each sampled delta scatter or GPU publish, read the whole index "
+		     "buffer back and FNV-compare it against the CPU grid state it was patched to "
+		     "equal (the hash a full upload of the same state would have). Results in "
+		     "GetUploadStats() VerifyPasses/VerifyFailures; a failure logs an Error with "
+		     "both hashes. Only meaningful with voxel.March.IndexDeltaUpload 1. EXPENSIVE "
+		     "(56 MiB readback + ~17.5 ms hash per sample); for correctness legs, default 0."),
 		ECVF_RenderThreadSafe);
 
-	// THE VERIFY GATE CRASHES THE RHI. Arming it took down a leg 28 s in:
+	// THE VERIFY GATE USED TO CRASH THE RHI, and the fix is the readback ring
+	// in the header (FVerifySlot). The crash, for the record:
 	//
 	//   Assertion failed: Fence->SyncPoints[GPUIndex] == nullptr
 	//   D3D12DirectCommandListManager.cpp:63
 	//   "The fence for the current GPU node has already been issued."
 	//
-	// The single readback is re-enqueued while its previous fence is still
-	// outstanding -- flushes come far faster than a readback completes (15,457
-	// of them in one flight), so "single-buffered is sufficient" does not hold
-	// at the real flush rate. It needs the same multi-slot ring the hole-stats
-	// and shadow-march readbacks use, and a skip when no slot is free.
+	// 28 s into a leg, at 15,457 flushes per flight. The single readback was
+	// re-enqueued while its previous fence was still outstanding: IsReady()
+	// polls a fence that is only re-armed when the copy pass EXECUTES, so
+	// between AddEnqueueCopyPass and graph execution it still reads signalled
+	// from the readback's previous completed use -- and Register() runs up to
+	// three times per frame (marcher, GI, shadow march), so a poll in that
+	// window retired garbage, freed the guard flag, and let a second copy be
+	// issued on the same fence. The ring + the ArmedFrame gate close both
+	// halves; see the header comment on FVerifySlot for the full argument.
+
+	// =======================================================================
+	// PHASE 2 (docs/gpu-streaming-architecture.md): GPU-WRITTEN RESIDENCY
+	// =======================================================================
 	//
-	// Recorded here rather than fixed because the DELTA PATH ITSELF measured
-	// clean without it and is now the default: two legs, holes=0 of ~24,320
-	// scanned in both, frames 12,323 / 12,381 against a control's 8,786 /
-	// 8,049. The gate is what is broken, not the thing it was meant to check --
-	// but that also means the delta path is running UNVERIFIED cell-by-cell,
-	// and closing this is the next correctness job on this file.
+	// A chunk becomes resident by the GPU writing its index cell -- the
+	// publish kernel derives the cell with THE MARCHER'S OWN wrap function
+	// (VoxelMarchIndexCell.ush, shared include) and composes the entry value
+	// itself -- instead of the game thread snapshotting [cell, value] pairs
+	// from the CPU shadow for Register() to scatter a frame later.
+	//
+	// WHAT CHANGES AND WHAT DOES NOT. The CPU shadow (Cells) is still updated
+	// by ApplyDelta, still carries every counter, and is still the reference
+	// the verify gate compares against -- but it stops being on the residency
+	// path: the publish command lands directly behind the pool's brick writes
+	// on the render thread, so the marcher finds the chunk resident without
+	// Register() staging anything. What the CPU still supplies per entry, and
+	// why, is spelled out at the kernel (VoxelMarchIndexScatter.usf); the
+	// short version is that the SLOT is the Phase 1 seam -- today it is the
+	// CPU allocator's answer carried in the entry, and under the GPU
+	// suballocator it becomes a buffer the kernel reads instead.
+	//
+	// DEFAULT 0 == TODAY'S BEHAVIOUR, byte-identical control leg, same
+	// discipline as every switch in this file. Requires IndexDeltaUpload 1
+	// (the ladder lives inside that branch); with the delta switch off this
+	// one is inert.
+	TAutoConsoleVariable<int32> CVarVoxelMarchIndexGpuResident(
+		TEXT("voxel.March.IndexGpuResident"), 0,
+		TEXT("1 = a flushed chunk's march-index cell is written by the GPU publish kernel "
+		     "in a render command enqueued directly behind the pool flush (the GPU derives "
+		     "cell and value; the marcher finds the chunk resident with no staging in "
+		     "Register()); 0 (DEFAULT) = today's CPU-staged pair scatter. Needs "
+		     "voxel.March.IndexDeltaUpload 1. The CPU shadow stays authoritative for "
+		     "counters and for the voxel.March.IndexDeltaVerify cross-check, which is the "
+		     "gate that proves the GPU-derived cells agree with what the CPU would have "
+		     "written -- run it on any leg that flips this on. Fallbacks (seed/first/"
+		     "pending/large/lost) stage full exactly as the delta path does; see "
+		     "GetUploadStats()."),
+		ECVF_RenderThreadSafe);
 
 	// One thread per changed cell; pairs are deduplicated BY CONSTRUCTION on
 	// the host (built from a TSet keyed by cell), so no two threads in a
@@ -172,10 +208,42 @@ namespace
 	// pair list -- which is a handful of silently wrong index cells, the exact
 	// failure shape this feature must never produce.
 	constexpr int32 kScatterGroupSize = 64;
+
+	// The Phase 2 publish kernel: entries in, cells derived and written on the
+	// GPU. Same .usf as the scatter, second entry point; the kernel header
+	// owns the entry layout and the removal-guard argument.
+	class FVoxelMarchIndexPublishCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelMarchIndexPublishCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelMarchIndexPublishCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, MarchIndexPublishEntries)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchChunkIndexRW)
+			SHADER_PARAMETER(uint32, MarchIndexPublishFirst)
+			SHADER_PARAMETER(uint32, MarchIndexPublishCount)
+			SHADER_PARAMETER(uint32, MarchIndexPublishMode)
+			SHADER_PARAMETER(FUintVector, MarchIndexPublishDimChunks)
+			SHADER_PARAMETER(uint32, MarchIndexPublishCellsPerLevel)
+			SHADER_PARAMETER(uint32, MarchIndexPublishCellCount)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// Dwords per publish entry: [x, y, z, gridSlot, chunkSlot]. Restated from
+	// the kernel for the same tail-dropping reason as kScatterGroupSize.
+	constexpr int32 kPublishEntryDwords = 5;
 }
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchIndexScatterCS, VOXEL_MARCH_INDEX_SCATTER_USF,
                         "VoxelMarchIndexScatterMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelMarchIndexPublishCS, VOXEL_MARCH_INDEX_SCATTER_USF,
+                        "VoxelMarchIndexPublishMain", SF_Compute);
 
 namespace
 {
@@ -354,6 +422,16 @@ void FVoxelMarchChunkIndex::Detach()
 	DeltaStagedCells.Reset();
 	bDeltaBaseEstablished = false;
 	PendingStagedBytes = 0;
+	// Phase 2 state goes with it, for the same reason as the staged delta: a
+	// publish scratch surviving a teardown would scatter the previous world's
+	// entries into the next world's buffer. The lost flag is cleared so the
+	// next world does not stage an unexplained healing full for a buffer that
+	// no longer exists. (Publish scratch is per-flush and normally empty here
+	// anyway; a verify slot still in flight is left to retire naturally -- its
+	// content and expected hash were captured as a consistent pair.)
+	GpuPublishRemoves.Reset();
+	GpuPublishAdds.Reset();
+	bGpuPublishLost.store(false);
 
 	// POOLED IS RENDER-THREAD STATE AND MUST BE RELEASED THERE. Register()
 	// writes it via QueueBufferExtraction while a graph is building, so
@@ -675,6 +753,14 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 	// console commands execute on this thread, so the value cannot flip
 	// between here and the MarkDirtyAndUpload this call ends with.
 	const bool bTrackDelta = CVarVoxelMarchIndexDeltaUpload.GetValueOnGameThread() != 0;
+	// Phase 2: while the GPU-resident mode is on, this flush's changes are
+	// ALSO collected as publish entries -- coord + gridSlot + slot, the form
+	// the kernel derives cells from -- alongside the cell tracking above. Both
+	// are kept because the ladder can still refuse the publish leaf (pending
+	// CPU pairs, oversized flush) and fall back to paths that need the cell
+	// sets; double bookkeeping at ~145 cells per measured flush is noise.
+	const bool bGpuPublish =
+		bTrackDelta && CVarVoxelMarchIndexGpuResident.GetValueOnGameThread() != 0;
 
 	// REMOVED BEFORE ADDED, AND IT IS NOT A STYLE CHOICE. Both halves can name
 	// the SAME SLOT in one delta, because a slot freed by an eviction can be
@@ -691,6 +777,22 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 			continue;
 		}
 		const uint32 Cell = CellOf(FIntVector(E.Key.X, E.Key.Y, E.Key.Z), RemSlot);
+		// Phase 2: emit the removal for the GPU's guarded clear UNCONDITIONALLY
+		// (level-filtered only). The guard below -- resident AND still naming
+		// this slot -- is executed independently by BOTH sides: here against
+		// the shadow, in the kernel against the GPU buffer. In-sync buffers
+		// give the same verdict, so emission is not the filter and must not
+		// be: an emit gated on the SHADOW's verdict would encode "the shadow
+		// already knew", which is exactly the derived-not-verified join this
+		// gate exists to check.
+		if (bGpuPublish)
+		{
+			GpuPublishRemoves.Add(uint32(E.Key.X));
+			GpuPublishRemoves.Add(uint32(E.Key.Y));
+			GpuPublishRemoves.Add(uint32(E.Key.Z));
+			GpuPublishRemoves.Add(uint32(RemSlot));
+			GpuPublishRemoves.Add(E.ChunkSlot & kSlotMask);
+		}
 		// Only clear the cell if it still names THIS slot. A cell already
 		// re-pointed by an earlier Added in the same batch must not be undone.
 		// THE RESIDENT BIT IS PART OF THE MATCH, AND SLOT 0 IS WHY.
@@ -780,6 +882,23 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 		{
 			DeltaPendingCells.Add(Cell);
 		}
+		// Phase 2: additions are emitted only when ADMITTED -- admission
+		// (level mapping, cover band, the mutation arm) is index POLICY and
+		// stays CPU-side with its counters; what the GPU derives is the cell
+		// and the value, not the decision. Keyed by the CPU's cell so the
+		// LAST add to a cell in one flush wins, matching the sequential
+		// shadow apply this loop just performed -- and so no two publish
+		// threads write one cell. (Keying by the CPU cell while the kernel
+		// derives its own is deliberate: if the two spellings ever drift the
+		// dedup is grouped wrong but the writes go where the KERNEL says, and
+		// the verify hash catches the drift.)
+		if (bGpuPublish)
+		{
+			FGpuPublishAdd& Add = GpuPublishAdds.FindOrAdd(Cell);
+			Add.Coord = AddCoord;
+			Add.GridSlot = AddSlot;
+			Add.Slot = E.ChunkSlot & kSlotMask;
+		}
 	}
 
 	const double UploadStart = FPlatformTime::Seconds();
@@ -868,6 +987,8 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 	// read from GetUploadStats() alone:
 	//   seed     -- Seed() rewrote the grid's meaning; the delta sets know
 	//               nothing about cells the attach memzero cleared.
+	//   lost     -- a Phase 2 publish command dropped its entries; a full
+	//               staging is the heal (see FullBecauseLost).
 	//   first    -- no full upload has been staged since the last Detach, so
 	//               there is nothing on the GPU to patch.
 	//   pending  -- a FULL staging is already waiting for Register(). Re-stage
@@ -876,12 +997,25 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 	//               for the same buffer.
 	//   large    -- the dirty set crossed voxel.March.IndexDeltaMaxCells; see
 	//               that cvar's comment for why ~7% of the grid is the line.
+	// Below the ladder, voxel.March.IndexGpuResident chooses between the two
+	// incremental arms: the Phase 2 publish (GPU derives and writes the cells,
+	// enqueued behind this flush's brick writes) or the CPU-staged pair
+	// scatter (consumed by the next Register()). Both are checked by the same
+	// verify gate against the same shadow.
 	bool bStageFull = true;
 	if (bDeltaSwitch)
 	{
 		if (bForceFullUpload)
 		{
 			++UploadStats.FullBecauseSeed;
+		}
+		else if (bGpuPublishLost.exchange(false))
+		{
+			// A publish command dropped its entries (no buffer to patch --
+			// structurally unreachable, but if it happened the GPU is now
+			// missing cells the shadow holds). A full staging is the heal:
+			// it carries every cell's current value.
+			++UploadStats.FullBecauseLost;
 		}
 		else if (!bDeltaBaseEstablished)
 		{
@@ -898,6 +1032,68 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 		}
 		else
 		{
+			// Clamped to what one dispatch can address: the scatter is 1-D and
+			// D3D12 caps a dispatch dimension at 65,535 groups -- 65,535 x 64
+			// threads = 4,194,240 pairs. A cvar raised past that would not make
+			// the delta path handle more cells; it would silently DROP the tail
+			// of the pair list, which is the silently-wrong-cell failure this
+			// whole feature is built to never produce. The publish leaf shares
+			// the bound: its two dispatch ranges are each below the total.
+			const int32 MaxCells = FMath::Clamp(
+				CVarVoxelMarchIndexDeltaMaxCells.GetValueOnGameThread(), 0, 65535 * 64);
+
+			// ---- PHASE 2 LEAF: publish instead of staging ------------------
+			//
+			// Taken only when nothing older is still on its way up. If a
+			// CPU-staged pair list is waiting for Register(), publishing NOW
+			// would let those OLDER values overwrite these cells when the
+			// pairs finally scatter -- stale terrain, no error -- so the
+			// flush falls back to the CPU path, which merges. That happens
+			// once per mid-flight ON-flip and then the sets stay drained.
+			bool bTryPublish = CVarVoxelMarchIndexGpuResident.GetValueOnGameThread() != 0;
+			if (bTryPublish)
+			{
+				bool bPendingCpuPairs = false;
+				{
+					FScopeLock Lock(&DeltaStageLock);
+					bPendingCpuPairs = bStagedDeltaValid;
+				}
+				if (bPendingCpuPairs)
+				{
+					++UploadStats.GpuFellBackPendingCpu;
+					bTryPublish = false;
+				}
+				// Belt: the publish scratch must cover every pending cell. It
+				// does whenever ApplyDelta ran with the mode on; if the cvar
+				// flipped between tracking and here (same thread, so only via
+				// an exotic reentrancy), an empty scratch against non-empty
+				// pending cells must NOT consume them -- fall back instead.
+				if (bTryPublish && GpuPublishRemoves.Num() == 0 && GpuPublishAdds.Num() == 0 &&
+				    DeltaPendingCells.Num() > 0)
+				{
+					bTryPublish = false;
+				}
+			}
+			if (bTryPublish)
+			{
+				const int32 TotalEntries =
+					GpuPublishRemoves.Num() / kPublishEntryDwords + GpuPublishAdds.Num();
+				if (TotalEntries > MaxCells)
+				{
+					++UploadStats.FullBecauseLarge;
+				}
+				else
+				{
+					// These cells go up with the publish command; nothing is
+					// left pending for the CPU staging machinery.
+					DeltaPendingCells.Reset();
+					DeltaStagedCells.Reset();
+					EnqueueGpuPublish(bVerifyWanted && bHashNowValid, HashNow);
+					bStageFull = false;
+				}
+			}
+			else
+			{
 			// Merge this flush's dirty cells into the set the staged pairs
 			// must cover. If the PREVIOUS pair list was already consumed, its
 			// cells are on the GPU and the covered set restarts from empty; if
@@ -917,14 +1113,6 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 			}
 			DeltaPendingCells.Reset();
 
-			// Clamped to what one dispatch can address: the scatter is 1-D and
-			// D3D12 caps a dispatch dimension at 65,535 groups -- 65,535 x 64
-			// threads = 4,194,240 pairs. A cvar raised past that would not make
-			// the delta path handle more cells; it would silently DROP the tail
-			// of the pair list, which is the silently-wrong-cell failure this
-			// whole feature is built to never produce.
-			const int32 MaxCells = FMath::Clamp(
-				CVarVoxelMarchIndexDeltaMaxCells.GetValueOnGameThread(), 0, 65535 * 64);
 			if (DeltaStagedCells.Num() > MaxCells)
 			{
 				++UploadStats.FullBecauseLarge;
@@ -972,11 +1160,18 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 				UploadStats.LastStagedCells = uint32(NumCells);
 				bStageFull = false;
 			}
+			}   // (CPU staging arm of the Phase 2 leaf split)
 		}
 	}
 
 	if (!bStageFull)
 	{
+		// Publish scratch that was not consumed by the publish leaf (mode off,
+		// or a fallback took the CPU staging arm) is DISCARDED here: the path
+		// that ran covers the same cells. Cheap no-op resets when the mode is
+		// off and the scratch was never populated.
+		GpuPublishRemoves.Reset();
+		GpuPublishAdds.Reset();
 		return;
 	}
 
@@ -1015,6 +1210,10 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 	}
 	DeltaPendingCells.Reset();
 	DeltaStagedCells.Reset();
+	// A full snapshot also supersedes any publish scratch this flush built:
+	// every cell it would have written is in Staged at its current value.
+	GpuPublishRemoves.Reset();
+	GpuPublishAdds.Reset();
 
 	UploadBytes -= PendingStagedBytes;
 	PendingStagedBytes = uint64(Cells.Num()) * sizeof(uint32);
@@ -1022,6 +1221,154 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 
 	++UploadStats.FullUploads;
 	UploadStats.LastStagedCells = uint32(Cells.Num());
+}
+
+// PHASE 2: the flush's residency travels to the GPU HERE, in its own render
+// command, instead of waiting in a staging for the next marcher graph.
+//
+// THE ORDERING ARGUMENT, in full, because the hazard this file once fixed was
+// an unsynchronised write to a buffer RDG believed it owned:
+//
+//   1. AGAINST THE BRICKS. This command is enqueued from MarkDirtyAndUpload,
+//      which runs inside the pool's index sink -- and FVoxelBrickPool::Flush
+//      enqueues its OWN render command (the arena and record writes) BEFORE it
+//      calls the sink. Render commands execute in order on the render thread,
+//      so the publish lands strictly after the brick writes for the same
+//      batch: the GPU can never march an index entry whose bricks are not in
+//      the arenas yet. This is the exact seam guarantee the CPU-staged path
+//      has always leaned on, inherited rather than re-derived.
+//   2. AGAINST THE MARCH PASSES. The scatter is an RDG pass with a UAV on the
+//      persistent buffer; every march pass reads the same buffer as an SRV in
+//      its own graph, registered external. RDG carries an external resource's
+//      access state ACROSS graphs, and graphs execute serially on the render
+//      thread, so a later graph's SRV read is transitioned against this
+//      graph's UAV write -- no march can observe a half-published index.
+//   3. AGAINST A FULL RE-UPLOAD. Register()'s full path replaces the pooled
+//      buffer via QueueBufferExtraction, which could orphan a publish -- but
+//      cannot: build and execute of any Register() graph happen inside ONE
+//      render command (the scene renderer's), and render commands are atomic,
+//      so by the time this command runs, any full consume it could race has
+//      fully executed and Pooled already names the replacement. And a full
+//      staged AFTER this flush necessarily absorbed it (it snapshots the
+//      shadow, which ApplyDelta updated before this was enqueued).
+//
+// The Removed-before-Added invariant rides the two dispatch phases: removals
+// are the first range and RDG's UAV barrier between the passes orders them
+// ahead of every addition -- the same rule ApplyDelta enforces sequentially,
+// preserved for the same reason (a slot freed and re-used in one flush).
+void FVoxelMarchChunkIndex::EnqueueGpuPublish(bool bVerifyWanted, uint64 ExpectedHash)
+{
+	const int32 RemoveCount = GpuPublishRemoves.Num() / kPublishEntryDwords;
+	const int32 AddCount = GpuPublishAdds.Num();
+	if (RemoveCount == 0 && AddCount == 0)
+	{
+		return;
+	}
+
+	// One flat buffer, removals first, additions appended -- the two dispatch
+	// ranges. Values were fixed on THIS thread when ApplyDelta built the
+	// scratch, so nothing here can race the next flush's shadow writes.
+	TArray<uint32> Entries = MoveTemp(GpuPublishRemoves);
+	GpuPublishRemoves.Reset();
+	Entries.Reserve(Entries.Num() + AddCount * kPublishEntryDwords);
+	for (const TPair<uint32, FGpuPublishAdd>& P : GpuPublishAdds)
+	{
+		Entries.Add(uint32(P.Value.Coord.X));
+		Entries.Add(uint32(P.Value.Coord.Y));
+		Entries.Add(uint32(P.Value.Coord.Z));
+		Entries.Add(uint32(P.Value.GridSlot));
+		Entries.Add(P.Value.Slot & kSlotMask);
+	}
+	GpuPublishAdds.Reset();
+
+	++UploadStats.GpuPublishes;
+	UploadStats.GpuCellsWritten += uint64(AddCount);
+	UploadStats.GpuCellsCleared += uint64(RemoveCount);
+	UploadStats.LastStagedCells = uint32(RemoveCount + AddCount);
+	// These bytes cross unconditionally when the command runs (the lost path
+	// is counted separately and heals via a full), so they are counted here,
+	// not staged-and-maybe-replaced like the pair path's.
+	UploadBytes += uint64(Entries.Num()) * sizeof(uint32);
+
+	ENQUEUE_RENDER_COMMAND(VoxelMarchIndexGpuPublish)(
+		[this, Entries = MoveTemp(Entries), RemoveCount, AddCount, bVerifyWanted,
+		 ExpectedHash](FRHICommandListImmediate& RHICmdList) mutable
+	{
+		// Retire any completed verify samples first, so a slot can free up for
+		// the one this command may arm. `this` is a global; no lifetime issue.
+		PollDeltaVerify();
+
+		if (!Pooled.IsValid())
+		{
+			// Structurally unreachable: the ladder requires an established
+			// base (a full upload extracted a buffer), and Detach clears the
+			// delta machinery before enqueueing the buffer's release, so no
+			// publish can be enqueued after it. If it fires anyway, the
+			// entries are DROPPED -- the GPU is now missing cells the shadow
+			// holds -- so the game thread is told to stage full and heal.
+			++UploadStats.GpuLostNoBuffer;
+			bGpuPublishLost.store(true);
+			return;
+		}
+
+		FRDGBuilder GraphBuilder(RHICmdList);
+		FRDGBufferRef Buffer =
+			GraphBuilder.RegisterExternalBuffer(Pooled, TEXT("VoxelMarch.ChunkIndex"));
+		// Copies the entry data now (same initial-data semantics as the pair
+		// path), so the captured array's lifetime ends with this lambda.
+		FRDGBufferRef EntriesBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("VoxelMarch.ChunkIndexPublishEntries"), sizeof(uint32),
+			Entries.Num(), Entries.GetData(), Entries.Num() * sizeof(uint32));
+
+		TShaderMapRef<FVoxelMarchIndexPublishCS> Shader(
+			GetGlobalShaderMap(GMaxRHIFeatureLevel));
+
+		if (RemoveCount > 0)
+		{
+			FVoxelMarchIndexPublishCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelMarchIndexPublishCS::FParameters>();
+			Params->MarchIndexPublishEntries = GraphBuilder.CreateSRV(EntriesBuffer);
+			Params->MarchChunkIndexRW = GraphBuilder.CreateUAV(Buffer, PF_R32_UINT);
+			Params->MarchIndexPublishFirst = 0;
+			Params->MarchIndexPublishCount = uint32(RemoveCount);
+			Params->MarchIndexPublishMode = 0;
+			Params->MarchIndexPublishDimChunks = FUintVector(kDimXY, kDimXY, kDimZ);
+			Params->MarchIndexPublishCellsPerLevel = kCellsPerLevel;
+			Params->MarchIndexPublishCellCount = uint32(kCells);
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
+				RDG_EVENT_NAME("VoxelMarch.IndexPublishClears(%d)", RemoveCount),
+				ERDGPassFlags::Compute, Shader, Params,
+				FComputeShaderUtils::GetGroupCount(RemoveCount, kScatterGroupSize));
+		}
+		if (AddCount > 0)
+		{
+			FVoxelMarchIndexPublishCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelMarchIndexPublishCS::FParameters>();
+			Params->MarchIndexPublishEntries = GraphBuilder.CreateSRV(EntriesBuffer);
+			Params->MarchChunkIndexRW = GraphBuilder.CreateUAV(Buffer, PF_R32_UINT);
+			Params->MarchIndexPublishFirst = uint32(RemoveCount);
+			Params->MarchIndexPublishCount = uint32(AddCount);
+			Params->MarchIndexPublishMode = 1;
+			Params->MarchIndexPublishDimChunks = FUintVector(kDimXY, kDimXY, kDimZ);
+			Params->MarchIndexPublishCellsPerLevel = kCellsPerLevel;
+			Params->MarchIndexPublishCellCount = uint32(kCells);
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
+				RDG_EVENT_NAME("VoxelMarch.IndexPublishAdds(%d)", AddCount),
+				ERDGPassFlags::Compute, Shader, Params,
+				FComputeShaderUtils::GetGroupCount(AddCount, kScatterGroupSize));
+		}
+
+		// The verify sample, in THIS graph, after both phases: the readback
+		// then holds exactly the state the expected hash describes.
+		if (bVerifyWanted)
+		{
+			EnqueueDeltaVerify(GraphBuilder, Buffer, ExpectedHash);
+		}
+
+		GraphBuilder.Execute();
+	});
 }
 
 FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
@@ -1136,12 +1483,13 @@ FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
 			// The verify gate, sampled: copy the whole patched buffer back and
 			// hash it against the CPU state it was patched to equal. Enqueued
 			// in THIS graph, after the scatter, so the snapshot is exactly
-			// this staging -- later scatters land in later graphs.
-			if (bStagedHashValid && !bVerifyInFlight)
+			// this staging -- later scatters land in later graphs. The ring
+			// handles "no slot free" by counting a skip.
+			if (bStagedHashValid)
 			{
-				VerifyExpectedHash = StagedContentHash;
+				const uint64 Expected = StagedContentHash;
 				bStagedHashValid = false;
-				EnqueueDeltaVerify(GraphBuilder, Buffer);
+				EnqueueDeltaVerify(GraphBuilder, Buffer, Expected);
 			}
 			return Buffer;
 		}
@@ -1158,68 +1506,99 @@ FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
 	return GraphBuilder.RegisterExternalBuffer(Pooled, TEXT("VoxelMarch.ChunkIndex"));
 }
 
-// The render-thread half of voxel.March.IndexDeltaVerify. Single-buffered on
-// purpose: one 56 MiB readback in flight, so at flush rates that outrun the
-// GPU the gate SAMPLES stagings rather than stalling anything -- and sampling
-// is sufficient, because a wrong cell is PERSISTENT divergence (the buffer
-// stays wrong until that exact cell is rewritten), so any later sample
-// catches it.
+// The render-thread half of voxel.March.IndexDeltaVerify, now a RING -- the
+// header comment on FVerifySlot owns the crash post-mortem this replaces. The
+// gate still SAMPLES rather than stalls: a full ring counts a skip, and
+// sampling is sufficient because a wrong cell is PERSISTENT divergence (the
+// buffer stays wrong until that exact cell is rewritten), so any later sample
+// catches the bug class.
 void FVoxelMarchChunkIndex::EnqueueDeltaVerify(FRDGBuilder& GraphBuilder,
-                                               FRDGBufferRef IndexBuffer)
+                                               FRDGBufferRef IndexBuffer,
+                                               uint64 ExpectedHash)
 {
-	if (!VerifyReadback.IsValid())
+	FVerifySlot* Free = nullptr;
+	for (int32 i = 0; i < kVerifySlots; ++i)
 	{
-		VerifyReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelMarch.IndexDeltaVerify"));
+		if (!VerifySlots[i].bInFlight)
+		{
+			Free = &VerifySlots[i];
+			break;
+		}
 	}
-	// Enqueued AFTER the scatter pass in the same graph, so RDG orders
-	// scatter -> copy and the readback holds this staging's result exactly.
-	AddEnqueueCopyPass(GraphBuilder, VerifyReadback.Get(), IndexBuffer,
+	if (Free == nullptr)
+	{
+		++UploadStats.VerifySkippedNoSlot;
+		return;
+	}
+	if (!Free->Readback.IsValid())
+	{
+		Free->Readback =
+			MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelMarch.IndexDeltaVerify"));
+	}
+	// Enqueued AFTER the scatter/publish passes in the same graph, so RDG
+	// orders write -> copy and the readback holds exactly the state the
+	// expected hash describes.
+	AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), IndexBuffer,
 	                   uint32(kCells) * sizeof(uint32));
-	bVerifyInFlight = true;
+	Free->ExpectedHash = ExpectedHash;
+	// The frame gate. IsReady() is MEANINGLESS until the graph that holds the
+	// copy pass has executed -- the fence is only re-armed then -- so this
+	// slot must not be polled in the frame that armed it. Strictly-greater in
+	// Poll guarantees at least one frame boundary, and the render thread has
+	// executed every prior frame's graphs by then.
+	Free->ArmedFrame = GFrameNumberRenderThread;
+	Free->bInFlight = true;
 }
 
 void FVoxelMarchChunkIndex::PollDeltaVerify()
 {
-	if (!bVerifyInFlight || !VerifyReadback.IsValid() || !VerifyReadback->IsReady())
+	for (int32 i = 0; i < kVerifySlots; ++i)
 	{
-		return;
-	}
-	bVerifyInFlight = false;
+		FVerifySlot& Slot = VerifySlots[i];
+		if (!Slot.bInFlight || !Slot.Readback.IsValid() ||
+		    GFrameNumberRenderThread <= Slot.ArmedFrame || !Slot.Readback->IsReady())
+		{
+			continue;
+		}
+		Slot.bInFlight = false;
 
-	const uint32 NumBytes = uint32(kCells) * sizeof(uint32);
-	const uint32* Data = static_cast<const uint32*>(VerifyReadback->Lock(NumBytes));
-	if (Data == nullptr)
-	{
-		return;
-	}
-	// The SAME hash, in the SAME order, as the game-thread FNV over Cells --
-	// so "delta-patched GPU buffer" and "what a full upload of that state
-	// would have carried" are compared as one number each. ~17.5 ms of render
-	// thread per sample (measured rate of the same loop on the game thread);
-	// the cvar's help text owns that cost.
-	uint64 Hash = 1469598103934665603ull;
-	for (uint32 i = 0; i < uint32(kCells); ++i)
-	{
-		Hash ^= uint64(Data[i]);
-		Hash *= 1099511628211ull;
-	}
-	VerifyReadback->Unlock();
+		const uint32 NumBytes = uint32(kCells) * sizeof(uint32);
+		const uint32* Data = static_cast<const uint32*>(Slot.Readback->Lock(NumBytes));
+		if (Data == nullptr)
+		{
+			continue;
+		}
+		// The SAME hash, in the SAME order, as the game-thread FNV over Cells
+		// -- so "GPU buffer after the sampled write" and "what a full upload
+		// of that state would have carried" are compared as one number each.
+		// ~17.5 ms of render thread per sample (measured rate of the same
+		// loop on the game thread); the cvar's help text owns that cost.
+		uint64 Hash = 1469598103934665603ull;
+		for (uint32 c = 0; c < uint32(kCells); ++c)
+		{
+			Hash ^= uint64(Data[c]);
+			Hash *= 1099511628211ull;
+		}
+		Slot.Readback->Unlock();
 
-	if (Hash == VerifyExpectedHash)
-	{
-		++UploadStats.VerifyPasses;
-	}
-	else
-	{
-		++UploadStats.VerifyFailures;
-		UE_LOG(LogVoxelMarchIndex, Error,
-		       TEXT("Voxel march index DELTA VERIFY FAILED: GPU buffer hash 0x%016llx != "
-		            "expected 0x%016llx (the hash of the CPU grid at the staging this buffer "
-		            "was patched to equal). The delta upload produced a world that differs "
-		            "from what a full upload would have -- at least one index cell is wrong, "
-		            "which renders as a hole or as another chunk's terrain, not as an error. "
-		            "Fall back to voxel.March.IndexDeltaUpload 0 and treat every delta leg "
-		            "since the last VerifyPasses as suspect."),
-		       Hash, VerifyExpectedHash);
+		if (Hash == Slot.ExpectedHash)
+		{
+			++UploadStats.VerifyPasses;
+		}
+		else
+		{
+			++UploadStats.VerifyFailures;
+			UE_LOG(LogVoxelMarchIndex, Error,
+			       TEXT("Voxel march index DELTA VERIFY FAILED: GPU buffer hash 0x%016llx != "
+			            "expected 0x%016llx (the hash of the CPU grid state this buffer was "
+			            "patched to equal). The GPU-written index differs from what the CPU "
+			            "would have written -- at least one cell is wrong, which renders as a "
+			            "hole or as another chunk's terrain, not as an error. If "
+			            "voxel.March.IndexGpuResident is on, suspect the publish path first "
+			            "(shared-wrap drift, a lost entry, a guard mismatch); fall back to "
+			            "voxel.March.IndexGpuResident 0, then voxel.March.IndexDeltaUpload 0, "
+			            "and treat every leg since the last VerifyPasses as suspect."),
+			       Hash, Slot.ExpectedHash);
+		}
 	}
 }

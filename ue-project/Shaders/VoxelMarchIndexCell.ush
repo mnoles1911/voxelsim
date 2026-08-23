@@ -1,0 +1,53 @@
+// VoxelMarchIndexCell.ush -- THE ONE SPELLING of (chunk coord) -> index cell.
+//
+// WHY THIS FILE EXISTS. Until Phase 2 of the GPU streaming programme
+// (docs/gpu-streaming-architecture.md) there was exactly one GPU reader of the
+// march chunk index (VoxelBrickTraverse.ush) and one CPU writer
+// (FVoxelMarchChunkIndex::CellOf), mirrored by hand. Phase 2 adds a GPU WRITER
+// -- the publish kernel in VoxelMarchIndexScatter.usf, which derives the cell
+// for a freshly generated or evicted chunk and writes the index entry itself.
+// A writer and a reader that each carry their own copy of the wrap math will
+// drift, and the drift renders as chunks published into cells the marcher
+// never reads -- holes with every counter healthy. This project has paid for
+// exactly that shape three times in one night ("the instrument must run the
+// engine's binding"), so the math lives here once and both sides include it.
+//
+// The function is parameterised rather than reading the uniforms directly
+// because the reader and the writer bind DIFFERENT uniform names (the marcher
+// has MarchIndexDimChunks and a per-level global; the publish kernel carries
+// its own copies and a per-ENTRY grid slot). The parameters are the seam; the
+// math is shared.
+//
+// Two's complement makes uint(x) & (dim-1) the correct modulo for negative
+// coordinates, which is the whole reason the dims are powers of two.
+// SLOT, NOT LEVEL: the cover level is 7 and the grid carries seven sub-grids,
+// not eight; FVoxelMarchChunkIndex::GridSlotForLevel is the single authority
+// for the mapping and every caller passes its answer here.
+//
+// MIRRORED (still, and on purpose) in FVoxelMarchChunkIndex's CellOf on the
+// CPU. That mirror cannot be an include; the delta-verify readback gate
+// (voxel.March.IndexDeltaVerify) is what proves the two agree, cell by cell,
+// and it can FAIL.
+
+#ifndef VOXEL_MARCH_INDEX_CELL_USH
+#define VOXEL_MARCH_INDEX_CELL_USH
+
+// The entry encoding, shared by the reader (VoxelBrickTraverse.ush), the
+// scatter/publish kernels, and -- as C++ constants kResidentBit / kAnySolidBit
+// / kSlotMask -- the CPU shadow. Moved here from VoxelBrickTraverse.ush so the
+// publish kernel does not restate them.
+#define VOXEL_MARCH_INDEX_RESIDENT_BIT 0x80000000u
+#define VOXEL_MARCH_INDEX_ANYSOLID_BIT 0x40000000u
+#define VOXEL_MARCH_INDEX_SLOT_MASK    0x3FFFFFFFu
+
+uint VoxelMarchIndexCellCompute(int3 ChunkCoord, uint3 DimChunks,
+                                uint CellsPerLevel, uint GridSlot)
+{
+	const uint cx = uint(ChunkCoord.x) & (DimChunks.x - 1u);
+	const uint cy = uint(ChunkCoord.y) & (DimChunks.y - 1u);
+	const uint cz = uint(ChunkCoord.z) & (DimChunks.z - 1u);
+	return GridSlot * CellsPerLevel +
+	       cx + DimChunks.x * (cy + DimChunks.y * cz);
+}
+
+#endif // VOXEL_MARCH_INDEX_CELL_USH

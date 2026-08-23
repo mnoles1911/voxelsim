@@ -133,6 +133,8 @@
 #include "RenderGraphFwd.h"
 #include "Templates/SharedPointer.h"
 
+#include <atomic>
+
 class FRDGBuilder;
 class FRDGPooledBuffer;
 class FRHIGPUBufferReadback;
@@ -451,6 +453,44 @@ public:
 		// was patched to equal. A single failure is a wrong world.
 		uint64 VerifyPasses = 0;
 		uint64 VerifyFailures = 0;
+		// Stagings the verify gate wanted to sample but could not, because
+		// every readback ring slot was still in flight. NOT an error -- a
+		// sampled gate is sufficient (a wrong cell is persistent divergence)
+		// -- but if this dwarfs Passes+Failures the ring is undersized for the
+		// flush rate and the gate's coverage claim weakens.
+		uint64 VerifySkippedNoSlot = 0;
+
+		// ---- Phase 2: GPU-written residency (voxel.March.IndexGpuResident) --
+		//
+		// Flushes whose index cells were written by the PUBLISH kernel -- the
+		// GPU deriving cell and value itself -- rather than staged as
+		// CPU-snapshotted pairs. "Cells written by GPU vs CPU" is
+		// GpuCellsWritten + GpuCellsCleared against DeltaCellsStaged (plus the
+		// full uploads, which are always CPU-snapshotted).
+		uint64 GpuPublishes = 0;
+		// Addition entries dispatched (residency the marcher discovers without
+		// the game thread staging anything for it).
+		uint64 GpuCellsWritten = 0;
+		// Removal entries dispatched -- evictions cleared by the GPU's guarded
+		// clear. Counts entries OFFERED to the guard, not guard matches: the
+		// guard's refusals (a retirement for a cell this index never wrote)
+		// are correct behaviour, and the CPU shadow's NumEntries is the
+		// residency census that would drift if a clear were ever lost.
+		uint64 GpuCellsCleared = 0;
+		// The publish leaf refused a flush because CPU-staged pairs were still
+		// waiting for Register(): scattering newer values ahead of an older
+		// staged pair list would let the stale pairs overwrite them later.
+		// The flush fell back to the CPU staging path, which merges. Expected
+		// exactly once per ON-flip mid-flight; growing steadily means the
+		// marcher stopped calling Register() and pairs never drain.
+		uint32 GpuFellBackPendingCpu = 0;
+		// The publish render command found no pooled buffer to patch --
+		// structurally unreachable (the ladder requires an established base,
+		// and Detach clears the mode's state before releasing the buffer),
+		// but if it ever fires the entries were DROPPED, so the next staging
+		// is forced full to heal, and FullBecauseLost counts that healing.
+		uint32 GpuLostNoBuffer = 0;
+		uint32 FullBecauseLost = 0;
 	};
 	// Snapshot by value. Verify counters are written on the render thread and
 	// the rest on the game thread; reads are diagnostic and a one-frame-stale
@@ -544,12 +584,19 @@ private:
 	void ApplyDelta(const struct FVoxelBrickIndexDelta& Delta);
 	void Seed(const TArray<struct FVoxelBrickIndexEntry>& Snapshot);
 	void MarkDirtyAndUpload();
-	// The two render-thread halves of the delta verify gate; called only from
-	// Register(). Enqueue copies the whole index buffer into VerifyReadback
-	// inside the graph that just scattered a delta; Poll hashes a completed
-	// readback and compares it to the hash the staging recorded.
-	void EnqueueDeltaVerify(FRDGBuilder& GraphBuilder, FRDGBufferRef IndexBuffer);
+	// The two render-thread halves of the delta verify gate. Enqueue finds a
+	// free ring slot and copies the whole index buffer into it inside the graph
+	// that just scattered (Register's delta branch, or the publish command),
+	// remembering the hash that buffer state must equal; Poll hashes completed
+	// readbacks and compares. RENDER THREAD ONLY, both.
+	void EnqueueDeltaVerify(FRDGBuilder& GraphBuilder, FRDGBufferRef IndexBuffer,
+	                        uint64 ExpectedHash);
 	void PollDeltaVerify();
+	// Phase 2: consumes the flush's publish scratch (removals + deduplicated
+	// additions) into a render command that scatters them into the persistent
+	// index buffer via the publish kernel. GAME THREAD; called only from
+	// MarkDirtyAndUpload's publish leaf, which owns the fallback ladder.
+	void EnqueueGpuPublish(bool bVerifyWanted, uint64 ExpectedHash);
 	void NoteObservedSpan(const FIntVector& Coord, int32 Slot);
 	void NoteCellOwner(uint32 Cell, const FIntVector& Coord, int32 Slot);
 	// false => outside the cover band, refused and counted. Always true for a
@@ -604,13 +651,73 @@ private:
 	FUploadStats UploadStats;
 	// voxel.March.IndexDeltaVerify: hash of Cells at the moment the current
 	// delta pairs were staged (game thread writes, render thread reads under
-	// DeltaStageLock), and the single-buffered readback that checks the GPU
-	// buffer against it. Readback members are render-thread state, like Pooled.
+	// DeltaStageLock). The readback that checks the GPU buffer against it is
+	// the RING below.
 	uint64 StagedContentHash = 0;
 	bool bStagedHashValid = false;
-	TUniquePtr<FRHIGPUBufferReadback> VerifyReadback;
-	bool bVerifyInFlight = false;
-	uint64 VerifyExpectedHash = 0;
+
+	// THE VERIFY READBACK RING, replacing a single readback that CRASHED THE
+	// D3D12 RHI (Fence->SyncPoints[GPUIndex] == nullptr, 28 s into a leg).
+	//
+	// The single-buffer design assumed one bInFlight flag was enough. It was
+	// not, for a reason specific to RDG readbacks: AddEnqueueCopyPass only
+	// RECORDS the copy -- the readback's fence is cleared and re-issued when
+	// the graph EXECUTES. Between pass-add and execution, IsReady() polls a
+	// fence still signalled from the readback's PREVIOUS completed use, so a
+	// poll in that window reads stale-ready, retires the previous buffer's
+	// bytes against the new expected hash, clears the flag -- and the next
+	// staging re-enqueues the same readback while the first copy is still
+	// outstanding. Two issued copies on one fence is exactly the assert. The
+	// window is real here because Register() runs up to three times per frame
+	// (marcher, GI, shadow march), each in its own graph, at 15,000+ flushes
+	// per flight.
+	//
+	// The fix is the same shape the hole-stats and shadow-march readbacks
+	// already run at high rates without crashing: N slots, arm a FREE one or
+	// skip (counted -- sampling is sufficient because a wrong cell is
+	// persistent divergence), and NEVER poll a slot in the frame that armed it
+	// (ArmedFrame gate) so a stale fence cannot be mistaken for a result.
+	// Each slot carries ITS OWN expected hash: with more than one copy in
+	// flight, "the hash this buffer state was patched to equal" is per-sample
+	// state, and the single shared VerifyExpectedHash was wrong the moment a
+	// second sample armed.
+	//
+	// Two slots on purpose, not four: each holds a 56 MiB staging allocation
+	// while armed, and the gate is a measurement leg's switch -- coverage
+	// needs any nonzero sampling rate, not a deep pipeline.
+	struct FVerifySlot
+	{
+		TUniquePtr<FRHIGPUBufferReadback> Readback;
+		bool bInFlight = false;
+		uint64 ExpectedHash = 0;
+		uint32 ArmedFrame = 0;
+	};
+	static constexpr int32 kVerifySlots = 2;
+	FVerifySlot VerifySlots[kVerifySlots];
+
+	// ---- Phase 2: GPU-written residency (voxel.March.IndexGpuResident) ------
+	//
+	// Per-flush scratch for the publish kernel, populated by ApplyDelta while
+	// the mode is on and consumed (or discarded -- a full staging supersedes
+	// it) by the same MarkDirtyAndUpload call that ends the flush. GAME THREAD
+	// ONLY; never alive across flushes, which is what keeps it out of the
+	// stage lock. Removals are a flat 5-dword-per-entry list (no dedup needed
+	// -- the kernel's guard makes racing removals converge); additions are
+	// keyed by cell so the LAST add to a cell in one flush wins, matching the
+	// shadow's sequential apply, and no two publish threads write one cell.
+	struct FGpuPublishAdd
+	{
+		FIntVector Coord;
+		int32 GridSlot = 0;
+		uint32 Slot = 0;
+	};
+	TArray<uint32> GpuPublishRemoves;
+	TMap<uint32, FGpuPublishAdd> GpuPublishAdds;
+	// Set by the publish render command if it ever finds no buffer to patch
+	// (entries dropped); the next MarkDirtyAndUpload forces a full staging to
+	// heal, counted as FullBecauseLost. Atomic because it is the one flag that
+	// crosses render -> game.
+	std::atomic<bool> bGpuPublishLost{ false };
 
 	TRefCountPtr<FRDGPooledBuffer> Pooled;
 	bool bAttached = false;
