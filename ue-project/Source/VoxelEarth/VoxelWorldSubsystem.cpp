@@ -11,6 +11,7 @@
 #include "VoxelGpuMeshJobManager.h" // Wave D / D4: the async GPU mesh runner, forked into DispatchJobs
 #include "VoxelBrickPool.h"        // P2: the resident brick volume both mesh arms now publish into
 #include "VoxelBrickCpuPackFromCore.h" // Phase 6: the ONE vxc::ChunkBrickPack -> FVoxelBrickCpuPack copy, shared with the cover producer
+#include "VoxelApplyBatch.h" // apply's per-chunk worldgen sampling, behind -VoxelApplyFast=
 #include "VoxelMarchRenderer.h"    // VoxelMarchPublishStreamingState -- the marcher's convergence signal
 #include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
 #include "VoxelResidencyGpu.h"     // T4-2: GPU-resident residency shadow (docs/gpu-residency-t42-plan.md)
@@ -2302,7 +2303,12 @@ namespace VoxelBrickCpuArm
 	                    const FVoxelBrickCpuPackRef& Pack,
 	                    const FVoxelBrickChunkShading& Shading)
 	{
-		if (!Pack.IsValid() || !VoxelGpuBrickPackResidentEnabled())
+		// Hook 5 (docs/apply-fast-path-2026-08-23.md §3): ONE definition of
+		// the will-this-publish predicate, shared with VoxelApplyFast's guard
+		// arm. The guard's correctness depends on this test and Publish's
+		// early-out never drifting apart, and nothing could observe the drift
+		// while they were two copies.
+		if (!VoxelApplyFast::WillPublish(Pack))
 		{
 			return;
 		}
@@ -10857,6 +10863,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       AccumGpuManagerTickMs, (long long)JobsDispatchedSinceLog,
 	       JobsDispatchedSinceLog > 0 ? AccumDispatchLoopMs / double(JobsDispatchedSinceLog) : 0.0);
 
+	// Hook 6 (docs/apply-fast-path-2026-08-23.md §3): flush VoxelApplyFast's
+	// window on THIS line's clock, so apply-us/chunk (its sampleUs over this
+	// window's drained=) divides two numbers from the same window.
+	VoxelApplyFast::FlushStats(/*bForce*/ true);
+
 	// The gpu-submit split (see the AccumGpuSubmit* members for the 1,547 ms
 	// mechanism hunt and the FAILING readings). Printed whenever the fork ran
 	// this window; silent otherwise so a CPU-only leg's log is unchanged.
@@ -17838,10 +17849,41 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// every tick rather than only when the quad pool is constructed.
 	if (const USceneComponent* PoolRootForShading = GpuPoolRoot.Get())
 	{
-		Req.BrickShading = ShadingFromChunkParams(SampleChunkParamsForPool(
-			*PoolRootForShading,
-			VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level),
-			LevelKey.Level));
+		// Hook 4 (docs/apply-fast-path-2026-08-23.md §3), applied on the
+		// condition that document set: "read reqHdr off a leg first". Read
+		// 2026-08-23 (ahead-off.log, the uncapped regime that produced the
+		// 1,547 ms dispatch= figure): reqHdr climbed to 1,302.9 ms per 5 s
+		// window -- 328.7 us per submission -- and even in the capped regime
+		// (ahead-on.log) it spikes to 190-377 ms/window during flight. This
+		// call IS that bucket's body: four GetSurfaceHeightUU amplifier
+		// columns plus a climate sample, per submission, on the game thread.
+		//
+		// THE GUARD ARM CANNOT APPLY AT THIS SITE -- the shading is consumed
+		// by the GPU job (Publish's null-pack early-out is what makes the
+		// guard sound at the drain site, and there is no pack here). So the
+		// cache is engaged only when the guard bit is OFF: mode 2 and the
+		// mode 4 measure-only leg take VoxelApplyFast's path (counted,
+		// cached, timed); a mode with the guard bit set (1, 3) keeps the raw
+		// expression at THIS site so a guard-skip can never hand a consumed
+		// request a default shading. If mode 3 ships, the honest upgrade is a
+		// direct cache-entry API in VoxelApplyFast -- noted there as the
+		// "call the cache directly" variant -- not a sentinel pack, whose
+		// validity would silently depend on voxel.GPU.BrickPackResident.
+		const int32 ApplyFastMode = VoxelApplyFast::Mode();
+		if ((ApplyFastMode & (VoxelApplyFast::kModeCache | VoxelApplyFast::kModeMeasure)) != 0 &&
+		    (ApplyFastMode & VoxelApplyFast::kModeGuard) == 0)
+		{
+			Req.BrickShading = VoxelApplyFast::ShadingForPublishSlow(
+				LevelKey, FVoxelBrickCpuPackRef(), *PoolRootForShading,
+				&SampleChunkParamsForPool, &ShadingFromChunkParams);
+		}
+		else
+		{
+			Req.BrickShading = ShadingFromChunkParams(SampleChunkParamsForPool(
+				*PoolRootForShading,
+				VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level),
+				LevelKey.Level));
+		}
 	}
 	// D5.3. Computed on the game thread where the anchor and RingPresets are
 	// live, exactly as the worker job's is, and baked into this dispatch.
@@ -22411,9 +22453,8 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			// ROOT frame -- subtracting GpuPoolRebase here would sample the
 			// climate and the surface plane at the wrong place on the map, and
 			// the result would still look like terrain.
-			ShadingFromChunkParams(SampleChunkParamsForPool(
-				Root, VoxelCoords::ChunkOriginWorldForLevel(Result.Key.Key, Result.Key.Level),
-				Result.Key.Level)));
+			VoxelApplyFast::ShadingForPublish(Result.Key, Result.BrickPack, Root,
+			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams));
 
 		// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2):
 		// DeliverToApplyMs, immediately AFTER the apply rather than inside
@@ -22598,9 +22639,8 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		// resident in the brick volume that the renderer has no record of.
 		VoxelBrickCpuArm::Publish(
 			LevelKey, BrickPack,
-			ShadingFromChunkParams(SampleChunkParamsForPool(
-				Root, VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level),
-				LevelKey.Level)));
+			VoxelApplyFast::ShadingForPublish(LevelKey, BrickPack, Root,
+			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams));
 	}
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);
 	ThisFrameEditRemeshes = Count;
