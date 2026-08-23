@@ -2,16 +2,21 @@
 // FVoxelGpuWorklist -- the persistent chunk-record ring for P3 (persistent
 // worklist + indirect dispatch; docs/gpu-worklist-plan-2026-08-23.md).
 //
-// *** NOT WIRED. NOTHING DISPATCHES FROM THIS YET. ***
-// This is the CONTRACT half of P3, landed ahead of the kernel conversion so
-// the record layout and ring discipline are fixed while the conversion is
-// authored: the 64-byte record, the host ring, and the args-setup pass that
-// turns "N records pending" into per-stage DispatchIndirect arguments. The
-// generation kernels still read per-region $Globals and are dispatched one
-// pass per stack; converting them to read Records[recordIndex] is the P3 work
-// proper, sequenced AFTER the raster atlas (A) because the atlas is what
-// empties the request of its variable-size half (the 46 KB window) -- without
-// A there is no 64-byte record to put in a ring.
+// *** SPINE WIRED, KERNELS NOT YET CONVERTED (2026-08-23). ***
+// FVoxelGpuMeshJobManager now drives this ring behind -VoxelGpuWorklist=1:
+// every lean-eligible brick chunk appends a real 64-byte record at dispatch,
+// Flush runs once per tick (upload + args pass + the indirect spine prover,
+// VoxelWorklistConsume.usf, whose group count comes off the GPU cursor), and
+// a 16-byte proof readback every ~5 s compares GPU consumption against the
+// host's no-readback mirror -- consumed count, record fold, tail cursor, all
+// three exact or the leg is invalid. What is NOT yet true: the generation
+// kernels still read per-region $Globals and are dispatched one pass set per
+// chunk/stack, so PASS COUNT PER TICK DOES NOT FLATTEN YET. Converting them
+// to read Records[recordIndex] through these args is the P3 work proper,
+// kernel by kernel against this now-verified spine, sequenced AFTER the
+// raster atlas (A) because the atlas is what empties the request of its
+// variable-size half (the 46 KB window) -- without A there is no 64-byte
+// record to put in a ring.
 //
 // WHY P3 EXISTS, BY ARITHMETIC RATHER THAN HOPE (the four-arm 2026-08-23
 // sweep showed pass-count work moves nothing at ~2,100 chunks/s -- this is
@@ -28,6 +33,7 @@
 #include "RenderGraphResources.h"
 
 class FRDGBuilder;
+class FRHIGPUBufferReadback;
 
 // One chunk of pure-worldgen production, 64 bytes, mirrored bit-for-bit by
 // VoxelWorklist.ush's GpuChunkWorkRecord. 16 dwords; the .cpp static_asserts
@@ -71,6 +77,8 @@ enum class EVoxelWorklistStage : uint8
 class VOXELEARTHSHADERS_API FVoxelGpuWorklist
 {
 public:
+	~FVoxelGpuWorklist();
+
 	// Capacity is a latch, not a growth policy: a full ring REFUSES appends
 	// and counts them (the caller keeps the chunk on its pending queue), so
 	// back-pressure is visible in a counter instead of hidden in a realloc.
@@ -81,9 +89,37 @@ public:
 	// accepted (the rest refused-full and counted).
 	int32 Append(TArrayView<const FVoxelGpuChunkWorkRecord> Records);
 
-	// Game thread: enqueue this tick's upload + the args-setup pass. One
-	// render command regardless of record count.
+	// Game thread: enqueue this tick's upload + the args-setup pass + the
+	// indirect spine-prover dispatch (VoxelWorklistConsume.usf). One render
+	// command regardless of record count. Every ~5 s of nonzero consumption
+	// it also enqueues the 16-byte PROOF readback and, when a prior proof has
+	// landed, compares GPU consumption (count, record fold, tail cursor)
+	// against the host mirror -- logging ok or a loud FAIL. All three values
+	// are captured at the same flush on both sides (render commands and GPU
+	// graphs execute in enqueue order), so the compare is exact, not
+	// windowed-and-hopeful.
 	void Flush(uint32 SliceBudgetRecords);
+
+	// The host half of worklistRecordFold (VoxelWorklist.ush) -- same 16
+	// terms, same derived multipliers, same uint32 wraparound. See the .ush
+	// comment for why XOR-across-records is the combine.
+	static uint32 FoldRecord(const FVoxelGpuChunkWorkRecord& Record);
+
+	// Proof tallies for the caller's window line. THE FAILING READINGS:
+	// Failed > 0 invalidates the leg outright (the GPU consumed different
+	// records than the host mirrored -- every downstream number is suspect);
+	// Landed == 0 while records flow means GPU consumption is UNVERIFIED and
+	// the spine may be dispatching nothing (the exact silent state this
+	// project keeps paying for). MalformedOnGpu > 0 with proofs passing means
+	// the HOST staged garbage records -- the fold agrees on both sides
+	// because the garbage was faithfully transported.
+	struct FProofStatus
+	{
+		uint64 Landed = 0;
+		uint64 Failed = 0;
+		uint64 MalformedOnGpu = 0;
+	};
+	FProofStatus GetProofStatus() const { return Proof; }
 
 	// Render thread: register the ring + args buffers into a graph that will
 	// consume them (the converted chain's dispatches).
@@ -116,5 +152,34 @@ private:
 	TRefCountPtr<FRDGPooledBuffer> PooledRecords;
 	TRefCountPtr<FRDGPooledBuffer> PooledArgs;
 	TRefCountPtr<FRDGPooledBuffer> PooledControl;
+	// The prover's 4-dword evidence buffer (VoxelWorklistConsume.usf's layout).
+	TRefCountPtr<FRDGPooledBuffer> PooledStats;
 	FWindow Window;
+
+	// --- the spine proof (game-thread state) --------------------------------
+	// Per-slot record folds, written when a staged record is assigned its ring
+	// slot, XORed into CumConsumedFold when the host mirror consumes the slot.
+	// 4 bytes per slot; this is what lets the host know EXACTLY what the GPU
+	// should have consumed without ever reading the ring back.
+	TArray<uint32> FoldRing;
+	uint64 CumConsumedRecords = 0;
+	uint32 CumConsumedFold = 0;
+	// One proof in flight at a time. The stash is the host's answer, captured
+	// at the requesting flush; the render side lands the GPU's answer in
+	// file-scope atomics (see .cpp) keyed by ProofSeq.
+	bool bProofPending = false;
+	uint32 ProofSeq = 0;
+	uint32 ProofStashTail = 0;
+	uint32 ProofStashConsumed = 0;
+	uint32 ProofStashFold = 0;
+	double LastProofSeconds = 0.0;
+	FProofStatus Proof;
+
+	// --- render-thread-only proof plumbing ----------------------------------
+	// Created lazily inside a Flush render command, polled at the top of each
+	// subsequent one, deleted by a render command from ~FVoxelGpuWorklist
+	// (FVoxelGpuBrickStack's readback-release pattern, verbatim).
+	FRHIGPUBufferReadback* ProofReadback = nullptr;
+	bool bProofCopyInFlight = false;
+	uint32 ProofCopySeq = 0;
 };

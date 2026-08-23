@@ -1,0 +1,71 @@
+// VoxelWorklistConsume.usf -- the P3 spine PROVER: the first real
+// DispatchIndirect consumer of the persistent worklist ring.
+//
+// WHAT THIS IS AND IS NOT. This kernel is dispatched every tick through the
+// args triple VoxelWorklistArgs.usf wrote for EVoxelWorklistStage::Record
+// (1 group per consumed record), so its group count comes off the GPU-owned
+// cursor and never touches the CPU -- the exact dispatch shape every converted
+// generation kernel will use. It generates NOTHING: it consumes each record of
+// this tick's slice and accumulates four dwords of evidence the host compares
+// against its own no-readback mirror. When the kernel conversion lands, stage
+// by stage, the converted kernels take over this dispatch pattern and this
+// prover retires (or stays as the cheap end-of-chain audit -- one group per
+// record, trivial).
+//
+// WHY IT EXISTS AT ALL: seven features in one night (2026-08-23) were found
+// running while doing nothing, every indicator green. A worklist whose args
+// pass dispatches zero groups forever would look exactly like a healthy quiet
+// one -- unless something on the GPU consumes and COUNTS. This kernel is that
+// counter, and the proof compare (FVoxelGpuWorklist::Flush) is built so a
+// dead spine reads as a loud FAIL (host consumed grows, GPU consumed stays 0),
+// never as a quiet pass: proofs are only ever taken with nonzero host-side
+// consumption, so "N proofs ok" cannot be vacuous.
+//
+// The stats buffer (4 dwords, persistent, cleared once at Init):
+//   [0] cumulative records consumed (InterlockedAdd)
+//   [1] cumulative XOR of per-record folds (InterlockedXor) -- see
+//       worklistRecordFold in VoxelWorklist.ush for what a mismatch means
+//   [2] cumulative malformed records (GenId 0 or CoarseLevel > 6) -- a
+//       nonzero here with a PASSING fold means the HOST staged garbage,
+//       which the fold alone would happily agree with
+//   [3] the ring tail after this tick's consume, as the args pass left it --
+//       plain store from group 0 only, no race
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelWorklist.ush"
+
+StructuredBuffer<GpuChunkWorkRecord> WorklistRecords;
+// [0]=consumeFirst [1]=consumeCount [2]=tailCursor, as VoxelWorklistArgs.usf
+// wrote them earlier in this same graph.
+StructuredBuffer<uint> WorklistControl;
+RWStructuredBuffer<uint> WorklistStats;
+uint RingCapacity;
+
+[numthreads(1, 1, 1)]
+void WorklistConsumeMain(uint3 Gid : SV_GroupID)
+{
+	const uint Take = WorklistControl[1];
+	// The args pass sized this dispatch to exactly Take groups (Record stage:
+	// 1 group per record); the guard is belt-and-braces against a torn args
+	// write, not a code path.
+	if (Gid.x >= Take)
+	{
+		return;
+	}
+	// consumeFirst is the MONOTONIC tail; the ring index is mod capacity,
+	// exactly as the host's upload placed the record.
+	const uint Slot = (WorklistControl[0] + Gid.x) % RingCapacity;
+	const GpuChunkWorkRecord R = WorklistRecords[Slot];
+
+	uint Unused;
+	InterlockedAdd(WorklistStats[0], 1u, Unused);
+	InterlockedXor(WorklistStats[1], worklistRecordFold(R), Unused);
+	if (R.GenId == 0u || worklistCoarseLevel(R) > 6u)
+	{
+		InterlockedAdd(WorklistStats[2], 1u, Unused);
+	}
+	if (Gid.x == 0u)
+	{
+		WorklistStats[3] = WorklistControl[2];
+	}
+}

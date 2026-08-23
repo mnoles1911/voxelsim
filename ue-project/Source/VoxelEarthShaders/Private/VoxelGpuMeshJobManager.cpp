@@ -391,6 +391,71 @@ static bool VoxelGpuStackClaimEnabled()
 	return bEnabled;
 }
 
+// --- P3 SPINE (-VoxelGpuWorklist, default OFF) ------------------------------
+//
+// Runs the persistent worklist ring (VoxelGpuWorklist.h) under real traffic:
+// every lean-eligible brick chunk appends a 64-byte record at dispatch, one
+// Flush per tick uploads the segment, runs the args-setup pass, and dispatches
+// the indirect spine prover whose group count comes off the GPU-owned cursor.
+// A ~5 s proof readback (16 bytes) compares GPU consumption against the host
+// mirror exactly -- see FVoxelGpuWorklist::Flush.
+//
+// WHAT THIS ARM DOES NOT DO YET, SAID PLAINLY SO A FLAT NUMBER CANNOT BE
+// MISREAD: the generation kernels are not converted, so every chunk still
+// pays its classic per-chunk/per-stack passes and PASSES-PER-TICK DOES NOT
+// FLATTEN on this arm -- it gains the constant +2/tick spine (args + prover).
+// Throughput will not move either (the 2026-08-23 four-arm sweep moved pass
+// count 4.3x and throughput 0% at ~2,100 chunks/s; today's limiter is
+// admission, not passes). What this arm buys is the VERIFIED dispatch spine
+// the kernel conversion lands on, stage by stage -- the piece of the 50k
+// arithmetic where 15 passes/chunk (25x the ~500/tick hitch cliff at 50k
+// chunks/s) becomes ~14 passes/TICK (36x under it), because pass count stops
+// scaling with N at all.
+//
+// Command-line latched, not a cvar: -ExecCmds lands after streaming has
+// begun, and a mid-run flip would split the ring across two configurations
+// (the -VoxelSurfaceMip reasoning, verbatim).
+static bool VoxelGpuWorklistEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklist="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// Ring capacity in records (-VoxelGpuWorklistCap). 4,096 x 64 B = 256 KiB,
+// ~5 ticks of the 50k target rate (834 records/tick at 60 fps); a full ring
+// refuses appends and COUNTS them rather than growing -- back-pressure is a
+// visible number, not a realloc.
+static uint32 VoxelGpuWorklistCapacity()
+{
+	static const uint32 Cap = []
+	{
+		int32 Value = 4096;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistCap="), Value);
+		return uint32(FMath::Clamp(Value, 64, 1 << 20));
+	}();
+	return Cap;
+}
+
+// Records the consuming dispatch may take per tick (-VoxelGpuWorklistBudget).
+// 1,024 default: 1.2x the 834 records/tick that 50,000 chunks/s needs at
+// 60 fps, so the budget is never the honest bottleneck in a 50k leg while
+// still bounding a burst's dispatch footprint.
+static uint32 VoxelGpuWorklistBudget()
+{
+	static const uint32 Budget = []
+	{
+		int32 Value = 1024;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistBudget="), Value);
+		return uint32(FMath::Clamp(Value, 1, 1 << 20));
+	}();
+	return Budget;
+}
+
 namespace VoxelGpuLeanDetail
 {
 	// Render-thread atomics, VoxelGpuBatchDetail's reason verbatim: the counts
@@ -463,6 +528,30 @@ namespace VoxelGpuBatchDetail
 	// Classic quad-mesh job (RetireQuads 0): 7 mesh-chain passes + quad total
 	// + copies; nominal.
 	constexpr int32 kPassesPerClassicQuadJob = 12;
+
+	// P3 spine tally constants, same DERIVED-FROM-CODE-SHAPE rule as above.
+	// These feed the [gpu-worklist] passes-per-tick line -- the number read
+	// FIRST on any worklist leg, because the 50k gate is this going FLAT with
+	// chunk rate, not throughput moving.
+	//
+	// Lean brick job under voxel.GPU.PoolAlloc: the halo-free brick region's
+	// 12 + claim + 4 alloc writes, no readback.
+	constexpr int32 kPassesPerLeanAllocJob = 17;
+	// Lean brick job on the readback path: brick region 12 + 2-dword totals
+	// copy.
+	constexpr int32 kPassesPerLeanReadbackJob = 13;
+	// Classic (non-lean) brick job under PoolAlloc: mesh region 2 + brick
+	// region 12 + claim + 4 writes, totals copy gone.
+	constexpr int32 kPassesPerClassicAllocJob = 19;
+	// Claim-based fused stack: the 13 compute passes (no stack-totals
+	// readback copy) + claim + 4 writes PER MEMBER.
+	constexpr int32 kStackClaimBasePasses = 13;
+	constexpr int32 kPassesPerStackMemberClaim = 5;
+	// The spine itself: args-setup + prover, once per tick regardless of N.
+	// This is the shape the converted chain inherits: ~14 passes per TICK
+	// (one per stage plus args) = 840/s at 60 fps, 36x under the ~500/tick
+	// hitch cliff, AT ANY chunk rate.
+	constexpr int32 kWorklistSpinePassesPerTick = 2;
 
 	// Crosscheck counters. File-scope atomics rather than manager members
 	// because they are incremented on the RENDER thread inside poll commands
@@ -1943,6 +2032,37 @@ void FVoxelGpuMeshJobManager::Tick()
 		VoxelGpuLeanDetail::MaybeLogWindow();
 	}
 
+	// --- P3 spine: one Flush per tick, every tick while armed ---------------
+	//
+	// Flushing on EMPTY ticks is the point, not waste: the constant-passes-
+	// per-tick shape (upload when there is one, args + prover always) is
+	// exactly what the converted chain will cost, so the spine's own overhead
+	// is measured honestly from day one. A control leg (switch off) reaches
+	// none of this -- no buffers, no passes, no log lines, byte-identical.
+	if (VoxelGpuWorklistEnabled())
+	{
+		if (!Worklist.IsInitialized())
+		{
+			Worklist.Init(VoxelGpuWorklistCapacity());
+		}
+		if (!bWorklistArmingLogged)
+		{
+			bWorklistArmingLogged = true;
+			UE_LOG(LogVoxelGpuMeshJob, Log,
+			       TEXT("[gpu-worklist] ARMED: ring cap %u records, budget %u/tick; args + ")
+			       TEXT("indirect prover dispatch every tick; proof readback (16 B) every ~5 s ")
+			       TEXT("of consumption. Kernels NOT converted yet: passes/tick will NOT ")
+			       TEXT("flatten on this leg -- the gate here is proof ok + records flowing. ")
+			       TEXT("FAILING READINGS: proof FAIL (leg invalid); records=0 with chunks ")
+			       TEXT("flowing (see the skips= reasons); proofs landed=0 with records ")
+			       TEXT("flowing (GPU consumption unverified -- the spine may be dead)."),
+			       VoxelGpuWorklistCapacity(), VoxelGpuWorklistBudget());
+		}
+		++WorklistWinTicks;
+		Worklist.Flush(VoxelGpuWorklistBudget());
+		MaybeLogWorklistWindow();
+	}
+
 	// --- 2. poll and harvest ------------------------------------------------
 	const double TickStage1 = FPlatformTime::Seconds();
 	TickStageMs.PromoteMs += (TickStage1 - TickStage0) * 1000.0;
@@ -2032,6 +2152,79 @@ void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
 	BatchClassicPasses = 0;
 	FMemory::Memzero(BatchFallbacks, sizeof(BatchFallbacks));
 	LastBatchLogSeconds = Now;
+}
+
+// The P3 spine window line, ~5 s cadence, armed-only (a control leg gains no
+// log line). Passes-per-tick sits FIRST and the chunk rate beside it, because
+// that pair is the 50k gate: 15 passes/chunk at 50,000 chunks/s is 25x the
+// ~500-passes-per-tick hitch cliff, and the converted chain's ~14/tick is 36x
+// UNDER it -- flatness against chunk rate is the win, throughput is not
+// (four-arm sweep, 2026-08-23: pass count moved 4.3x, throughput 0%).
+//
+// FAILING READINGS, in the order they should be checked:
+//   identity DRIFT           -> records lost or double-consumed; leg invalid.
+//   records=0, chunks flowing -> the spine carries no traffic; the skips=
+//                                reasons name the missing precondition.
+//   proof landed=0 w/ records -> GPU consumption UNVERIFIED; treat the spine
+//                                as dead until a proof lands (the [gpu-worklist]
+//                                proof lines come from FVoxelGpuWorklist).
+//   refusedFull growing       -> ring back-pressure; raise -VoxelGpuWorklistCap
+//                                or the budget, and say which in the report.
+void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
+{
+	const double Now = FPlatformTime::Seconds();
+	if (LastWorklistLogSeconds <= 0.0)
+	{
+		LastWorklistLogSeconds = Now;
+		return;
+	}
+	if (Now - LastWorklistLogSeconds < 5.0)
+	{
+		return;
+	}
+	const double WindowSeconds = Now - LastWorklistLogSeconds;
+	const FVoxelGpuWorklist::FWindow W = Worklist.ReadAndResetWindow();
+	const FVoxelGpuWorklist::FProofStatus P = Worklist.GetProofStatus();
+	WorklistCumAppended += W.Appended;
+	WorklistCumConsumed += W.Consumed;
+	WorklistCumRefused += W.RefusedFull;
+	const int64 SkipTotal = WorklistSkipNoPack + WorklistSkipQuadMesh + WorklistSkipBand
+	                      + WorklistSkipNoAlloc + WorklistSkipNoAtlas;
+	if (WorklistWinChunks == 0 && W.Appended == 0 && SkipTotal == 0)
+	{
+		// Armed and idle (no jobs promoted at all): stay quiet, the
+		// [gpu-batch] rule. Armed-and-declining still prints, with reasons.
+		WorklistWinTicks = 0;
+		LastWorklistLogSeconds = Now;
+		return;
+	}
+	// appended == consumed + pending over the CUMULATIVE counters (refusals
+	// were never appended). The host mirror makes this an arithmetic identity;
+	// a drift is a code bug in the ring, and everything measured on the leg
+	// is void until it is explained.
+	const int64 Drift = int64(WorklistCumAppended) - int64(WorklistCumConsumed) - int64(W.Pending);
+	const double MeanPasses = WorklistWinTicks > 0
+		? double(WorklistWinPasses) / double(WorklistWinTicks) : 0.0;
+	const bool bUnproven = P.Landed == 0 && WorklistCumConsumed > 0;
+	UE_LOG(LogVoxelGpuMeshJob, Log,
+	       TEXT("[gpu-worklist] %.1fs window: passes/tick mean=%.1f max=%lld over %lld ticks ")
+	       TEXT("(%lld chunks, %.0f chunks/s); records appended=%llu consumed=%llu pending=%u ")
+	       TEXT("refusedFull=%llu; identity %s; skips noPack=%lld quads=%lld band=%lld ")
+	       TEXT("noAlloc=%lld noAtlas=%lld (cumulative); proof landed=%llu failed=%llu%s%s"),
+	       WindowSeconds, MeanPasses, WorklistWinPassesMaxTick, WorklistWinTicks,
+	       WorklistWinChunks, WindowSeconds > 0.0 ? double(WorklistWinChunks) / WindowSeconds : 0.0,
+	       W.Appended, W.Consumed, W.Pending, W.RefusedFull,
+	       Drift == 0 ? TEXT("ok") : *FString::Printf(TEXT("DRIFT=%lld (LEG INVALID)"), Drift),
+	       WorklistSkipNoPack, WorklistSkipQuadMesh, WorklistSkipBand,
+	       WorklistSkipNoAlloc, WorklistSkipNoAtlas,
+	       P.Landed, P.Failed,
+	       P.Failed > 0 ? TEXT(" (PROOF FAILED -- LEG INVALID)") : TEXT(""),
+	       bUnproven ? TEXT(" (NO PROOF LANDED -- GPU consumption UNVERIFIED)") : TEXT(""));
+	WorklistWinTicks = 0;
+	WorklistWinChunks = 0;
+	WorklistWinPasses = 0;
+	WorklistWinPassesMaxTick = 0;
+	LastWorklistLogSeconds = Now;
 }
 
 void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
@@ -2131,6 +2324,104 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		}
 		// Rule 3: frees before claims, always.
 		Pool.FlushPendingGpuFrees();
+	}
+
+	// --- P3 spine: records + the passes-per-tick tally ----------------------
+	//
+	// HERE, not in Tick, because both need what the P1 shell loop just
+	// decided: ChunkSlot is only real after AllocateGpuChunkShell, and
+	// bGpuPoolAlloc/bBrickPack after the rule-2 revalidation. Game thread,
+	// before the enqueue -- the render command below knows nothing about it.
+	if (VoxelGpuWorklistEnabled() && Worklist.IsInitialized())
+	{
+		TArray<FVoxelGpuChunkWorkRecord> NewRecords;
+		NewRecords.Reserve(Batch.Num());
+		TSet<FVoxelGpuBrickStack*> TalliedStacks;
+		int64 PassesThisTick = 0;
+		const bool bLeanArmed = VoxelGpuLeanBrickJobsEnabled();
+		for (const FJobPtr& Job : Batch)
+		{
+			// The tally first: every promoted job costs passes, record or not.
+			// Constants are DERIVED FROM THE CODE SHAPE (their rule, stated at
+			// their definitions); the graph below is what they describe.
+			if (Job->BrickStack.IsValid())
+			{
+				if (!TalliedStacks.Contains(Job->BrickStack.Get()))
+				{
+					TalliedStacks.Add(Job->BrickStack.Get());
+					PassesThisTick += Job->BrickStack->bClaimBased
+						? VoxelGpuBatchDetail::kStackClaimBasePasses
+						  + VoxelGpuBatchDetail::kPassesPerStackMemberClaim * Job->BrickStack->NumChunks
+						: VoxelGpuBatchDetail::kPassesPerStackDispatch;
+				}
+			}
+			else
+			{
+				const bool bLean = bLeanArmed && Job->bBrickPack && !Job->bQuadMesh
+					&& Job->Region.BandEdge == 0;
+				if (bLean)
+				{
+					PassesThisTick += Job->bGpuPoolAlloc
+						? VoxelGpuBatchDetail::kPassesPerLeanAllocJob
+						: VoxelGpuBatchDetail::kPassesPerLeanReadbackJob;
+				}
+				else if (Job->bBrickPack)
+				{
+					PassesThisTick += Job->bGpuPoolAlloc
+						? VoxelGpuBatchDetail::kPassesPerClassicAllocJob
+						: VoxelGpuBatchDetail::kPassesPerClassicBrickJob;
+				}
+				else
+				{
+					PassesThisTick += VoxelGpuBatchDetail::kPassesPerClassicQuadJob;
+				}
+			}
+
+			// The record, for the chunks the converted chain will serve: brick
+			// half live, no quad chain, no band readback, GPU-allocated slot,
+			// and a request the atlas empties of its raster (a record built
+			// from an inline-window request would be un-runnable by the chain
+			// it exists for). First failing reason counted, [gpu-lean] style.
+			if (!Job->bBrickPack)                     { ++WorklistSkipNoPack; continue; }
+			if (Job->bQuadMesh)                       { ++WorklistSkipQuadMesh; continue; }
+			if (Job->Region.BandEdge != 0)            { ++WorklistSkipBand; continue; }
+			if (!Job->bGpuPoolAlloc)                  { ++WorklistSkipNoAlloc; continue; }
+			if (!Job->BrickRegion.bRasterAtlas)       { ++WorklistSkipNoAtlas; continue; }
+
+			FVoxelGpuChunkWorkRecord R;
+			R.OriginVx = Job->BrickRegion.OriginVx;
+			R.OriginVy = Job->BrickRegion.OriginVy;
+			R.BrickZMin = Job->BrickRegion.BrickZMin;
+			R.LevelFlags = (uint32(FMath::Clamp(Job->BrickRegion.CoarseLevel, 0, 15)) & 0xFu)
+			             | ((Job->BrickRegion.RingSkirtMask & 0xFu) << 4)
+			             | ((Job->BrickRegion.AssetInstances.Num() > 0 ? 1u : 0u) << 8);
+			R.ChunkSlot = Job->GpuChunkSlot;
+			// Low 32 bits of the manager's JobId (starts at 1, so 0 is the
+			// prover's malformed-record tripwire until 2^32 jobs have run).
+			R.GenId = uint32(Job->JobId);
+			// No flush-level asset buffer exists yet -- that is conversion
+			// work (the order-preserving AssetStamp gather needs it). Base 0
+			// with a TRUTHFUL count, so the day the buffer lands, records
+			// with AssetCount > 0 are already flowing to size it against.
+			R.AssetBase = 0;
+			R.AssetCount = uint32(Job->BrickRegion.AssetInstances.Num());
+			Job->BrickShading.Pack(R.ShadingClimatePacked, R.ShadingGradPacked,
+			                       R.ShadingSurfaceZBits);
+			NewRecords.Add(R);
+		}
+		PassesThisTick += VoxelGpuBatchDetail::kWorklistSpinePassesPerTick;
+		WorklistWinPasses += PassesThisTick;
+		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, PassesThisTick);
+		WorklistWinChunks += Batch.Num();
+		if (NewRecords.Num() > 0)
+		{
+			// Refusals (ring full) are counted inside Append; the chunk is
+			// unharmed either way -- the classic path below is still what
+			// generates it. Nothing retries: a refused record's chunk simply
+			// never enters the ring, and RefusedFull growing is the
+			// back-pressure reading the capacity latch exists to surface.
+			Worklist.Append(NewRecords);
+		}
 	}
 
 	// ONE graph for the whole batch. Every job's seven passes plus its three

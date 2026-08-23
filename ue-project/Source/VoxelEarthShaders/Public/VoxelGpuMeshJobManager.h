@@ -93,6 +93,7 @@
 #include "Delegates/Delegate.h"
 #include "VoxelBrickPool.h"
 #include "VoxelGpuQuadPayload.h"
+#include "VoxelGpuWorklist.h"
 #include "VoxelGpuWorldGen.h"
 
 // Geometry of the region that meshes exactly one 32^3 render chunk.
@@ -565,4 +566,37 @@ private:
 
 	void NoteBatchFallback(EBatchFallback Reason) { ++BatchFallbacks[uint8(Reason)]; }
 	void MaybeLogBatchWindow();
+
+	// --- P3 spine (-VoxelGpuWorklist; see VoxelGpuWorklist.h's banner) ------
+	//
+	// The ring itself: records appended in DispatchBatch (game thread, after
+	// the P1 shell loop so ChunkSlot is real), flushed once per Tick. All the
+	// counters below are game-thread and window-read by MaybeLogWorklistWindow,
+	// the single reader (FTickStageMs's two-readers rule).
+	FVoxelGpuWorklist Worklist;
+	// Why a promoted chunk did NOT get a record, by first failing reason --
+	// the [gpu-lean] diagnosis pattern: "armed but records=0" must read as a
+	// named missing precondition, not a mystery.
+	int64 WorklistSkipNoPack = 0;    // no brick region (quad-only leg, or shell refused)
+	int64 WorklistSkipQuadMesh = 0;  // job still emits quads (RetireQuads off)
+	int64 WorklistSkipBand = 0;      // job carries its footprint's band readback
+	int64 WorklistSkipNoAlloc = 0;   // voxel.GPU.PoolAlloc not armed / no shell
+	int64 WorklistSkipNoAtlas = 0;   // request carries an inline raster, not the atlas
+	// Passes-per-tick, the counter that gets read FIRST on any worklist leg:
+	// the pass term is the 50k wall (15/chunk = 25x the ~500/tick hitch cliff
+	// at 50k chunks/s), so the gate is this number going FLAT as chunk rate
+	// rises -- never throughput, which the 2026-08-23 four-arm sweep proved
+	// insensitive to pass count at ~2,100 chunks/s.
+	int64 WorklistWinTicks = 0;
+	int64 WorklistWinChunks = 0;
+	int64 WorklistWinPasses = 0;
+	int64 WorklistWinPassesMaxTick = 0;
+	// Cumulative ring identity: appended == consumed + pending, or records
+	// are being lost/double-consumed and the window line says DRIFT.
+	uint64 WorklistCumAppended = 0;
+	uint64 WorklistCumConsumed = 0;
+	uint64 WorklistCumRefused = 0;
+	double LastWorklistLogSeconds = 0.0;
+	bool bWorklistArmingLogged = false;
+	void MaybeLogWorklistWindow();
 };

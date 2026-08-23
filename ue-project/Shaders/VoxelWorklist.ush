@@ -40,3 +40,40 @@ uint worklistCoarseScale(GpuChunkWorkRecord R)
 	     : (L == 4u) ? 16u : (L == 5u) ? 32u : 64u;
 }
 uint worklistHasAssets(GpuChunkWorkRecord R) { return (R.LevelFlags >> 8) & 1u; }
+
+// --- the record fold, GPU half ----------------------------------------------
+//
+// MIRROR OF FVoxelGpuWorklist::FoldRecord (VoxelGpuWorklist.cpp) -- same 16
+// terms, same constants, same uint32 wraparound. Each side XOR-combines its
+// per-record folds and the spine proof (VoxelWorklistConsume.usf) compares the
+// two, so a single record dword that differs between what the host staged and
+// what the GPU consumed -- a torn ring-wrap copy, a stale slot, a cursor off
+// by one -- flips the compare and fails the proof loudly. XOR across records
+// ON PURPOSE: GPU consumption order is nondeterministic and XOR is the
+// order-independent combine.
+//
+// Per-dword multipliers are derived (0x9E3779B1 * odd index), not listed, so
+// the C++ side can loop the identical arithmetic instead of mirroring 16
+// literals -- one derivation, two loops, nothing to drift.
+uint worklistFoldTerm(uint d, uint idx) { return d * (0x9E3779B1u * (2u * idx + 1u)); }
+uint worklistRecordFold(GpuChunkWorkRecord R)
+{
+	uint F = 0u;
+	F += worklistFoldTerm(asuint(R.OriginVx), 0u);
+	F += worklistFoldTerm(asuint(R.OriginVy), 1u);
+	F += worklistFoldTerm(asuint(R.BrickZMin), 2u);
+	F += worklistFoldTerm(R.LevelFlags, 3u);
+	F += worklistFoldTerm(R.ChunkSlot, 4u);
+	F += worklistFoldTerm(R.GenId, 5u);
+	F += worklistFoldTerm(R.AssetBase, 6u);
+	F += worklistFoldTerm(R.AssetCount, 7u);
+	F += worklistFoldTerm(R.ShadingClimatePacked, 8u);
+	F += worklistFoldTerm(R.ShadingGradPacked, 9u);
+	F += worklistFoldTerm(R.ShadingSurfaceZBits, 10u);
+	F += worklistFoldTerm(R.Reserved0, 11u);
+	F += worklistFoldTerm(R.Reserved1, 12u);
+	F += worklistFoldTerm(R.Reserved2, 13u);
+	F += worklistFoldTerm(R.Reserved3, 14u);
+	F += worklistFoldTerm(R.Reserved4, 15u);
+	return F;
+}
