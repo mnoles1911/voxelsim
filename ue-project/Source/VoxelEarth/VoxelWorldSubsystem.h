@@ -577,6 +577,13 @@ public:
 	// safe to call from the game thread at any time after Initialize.
 	FVoxelPerfSnapshot GetPerfSnapshot() const;
 
+	// GPU streaming panel (voxel.Debug 3): published on the same 1 Hz rollover
+	// as GetPerfSnapshot, read by AVoxelEarthHUD's mode-3 panel. bValid stays
+	// false until a full window has elapsed with the perf path live -- the HUD
+	// must print "collecting...", never zeros, while it is false. Cheap struct
+	// copy, game thread.
+	FVoxelStreamPanelSnapshot GetStreamPanelSnapshot() const;
+
 	// --- M3 wave 1: multiplayer role split (docs/m3-plan.md) -----------------
 	//
 	// TryDig/TryPlace/CarveSphere above are role-aware internally (see the

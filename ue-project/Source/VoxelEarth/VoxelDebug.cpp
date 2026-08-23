@@ -28,7 +28,10 @@ namespace
 TAutoConsoleVariable<int32> CVarVoxelDebug(
 	TEXT("voxel.Debug"),
 	0,
-	TEXT("Voxel debug mode: 0=off, 1=perf HUD, 2=HUD+visualizations. F3 cycles in PIE/game."),
+	TEXT("Voxel debug mode: 0=off, 1=perf HUD, 2=HUD+visualizations, 3=GPU streaming panel ")
+	TEXT("(throughput vs the 6,200/s floor, producer split, hole %, pool, queues -- flight-readable, ")
+	TEXT("no 3D layers). F3 cycles in PIE/game. voxel.GpuStream.Prototype 1 arms mode 3 plus the ")
+	TEXT("hole stats in one command."),
 	ECVF_Default);
 
 TAutoConsoleVariable<bool> CVarVoxelDebugChunkStates(
@@ -67,6 +70,141 @@ TAutoConsoleVariable<bool> CVarVoxelDebugRings(
 	false,
 	TEXT("Tint loaded chunks by mip ring level (R0 green .. R4 magenta) instead of chunk-state tints. Live under voxel.Debug 2."),
 	ECVF_Default);
+
+// --- voxel.GpuStream.Prototype: the one-switch arm --------------------------
+//
+// The owner types ONE command tonight and gets the whole shakedown readout:
+// the mode-3 streaming panel plus the marcher's hole statistics. Setting it
+// back to 0 stands both down again.
+//
+// EVERY FOREIGN SWITCH IS FOUND BY NAME through IConsoleManager, never by
+// linking a symbol, because the switches this needs are being written in
+// parallel with this file and their exact names were not final when it was.
+// A name that is not found is LOGGED AND SKIPPED -- an umbrella that silently
+// half-arms is worse than one that says what it could not find, because the
+// panel would then show "off" for a field the owner believes he armed.
+//
+// THE COMPLETE LIST OF NAMES THIS LOOKS FOR (integrating session: if any of
+// these was renamed by the marcher/GPU-path work, fix the string here):
+//
+//   "voxel.March.HoleStats"   -- the hole-metric instrument's arming switch
+//                                (uncovered rays as % of rays; measured
+//                                0.03% standing / 3.99% at 30 m/s on
+//                                2026-08-23). Set to this cvar's own value,
+//                                so a frame-count semantic (like
+//                                voxel.March.VerifyDepth's) passes through:
+//                                voxel.GpuStream.Prototype 64 -> HoleStats 64.
+//   "voxel.March.HoleStats.UncoveredPct"
+//                             -- NOT armed, but read by the HUD: the float
+//                                transport the instrument publishes its
+//                                latest uncovered-% reading into (see the
+//                                guarded registration below). -1 = armed but
+//                                no sample yet, and the HUD says so.
+//
+// "voxel.Debug" is this module's own cvar and is set directly (to 3, the
+// streaming panel) rather than through the by-name path.
+TAutoConsoleVariable<int32> CVarVoxelGpuStreamPrototype(
+	TEXT("voxel.GpuStream.Prototype"),
+	0,
+	TEXT("One-switch arm for the GPU streaming shakedown: non-zero sets voxel.Debug 3 (streaming panel) ")
+	TEXT("and arms voxel.March.HoleStats (found by name; logged and skipped if absent). The value is ")
+	TEXT("passed through to HoleStats so a frame-count semantic survives. 0 stands both down."),
+	ECVF_Default);
+
+// The arm/disarm behavior. Runs on every change of the cvar (and once at
+// EndOfEngineInit if the value arrived via the command line before the
+// callback was attached -- see the registrar below).
+void ApplyGpuStreamPrototype()
+{
+	const int32 Value = CVarVoxelGpuStreamPrototype.GetValueOnGameThread();
+	IConsoleManager& ConsoleManager = IConsoleManager::Get();
+
+	// The by-name switches this umbrella arms. Kept as a table so the log can
+	// state exactly what was found and what was not, and so the integrating
+	// session edits ONE place when a name changes.
+	struct FArmTarget
+	{
+		const TCHAR* Name;
+		int32 OnValue;  // what "armed" means for this switch
+	};
+	const FArmTarget Targets[] = {
+		{ TEXT("voxel.March.HoleStats"), Value },
+	};
+
+	if (Value != 0)
+	{
+		VoxelDebug::SetDebugMode(3);
+		for (const FArmTarget& Target : Targets)
+		{
+			if (IConsoleVariable* Found = ConsoleManager.FindConsoleVariable(Target.Name))
+			{
+				Found->Set(Target.OnValue, ECVF_SetByCode);
+				UE_LOG(LogVoxelPerf, Log, TEXT("voxel.GpuStream.Prototype: armed %s = %d."),
+				       Target.Name, Target.OnValue);
+			}
+			else
+			{
+				UE_LOG(LogVoxelPerf, Warning,
+				       TEXT("voxel.GpuStream.Prototype: cvar '%s' NOT FOUND in this build -- it was ")
+				       TEXT("skipped, and the panel field it feeds will read n/a. If the switch was ")
+				       TEXT("renamed, fix the name table at this log line's source."),
+				       Target.Name);
+			}
+		}
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("voxel.GpuStream.Prototype: streaming panel ON (voxel.Debug 3). ")
+		       TEXT("voxel.GpuStream.Prototype 0 stands it down."));
+	}
+	else
+	{
+		// Stand down only what this switch stood up: leave voxel.Debug alone
+		// if the user has since moved it to a different mode themselves.
+		if (VoxelDebug::GetDebugMode() == 3)
+		{
+			VoxelDebug::SetDebugMode(0);
+		}
+		for (const FArmTarget& Target : Targets)
+		{
+			if (IConsoleVariable* Found = ConsoleManager.FindConsoleVariable(Target.Name))
+			{
+				Found->Set(0, ECVF_SetByCode);
+			}
+		}
+		UE_LOG(LogVoxelPerf, Log, TEXT("voxel.GpuStream.Prototype: stood down."));
+	}
+}
+
+// Attach the changed-callback once the engine is up, then apply a value that
+// may have arrived before the attach (command line / ini). Also register the
+// HOLE-METRIC TRANSPORT cvar if nothing else has: a float the marcher-side
+// instrument publishes its latest uncovered-% into so the HUD can read it by
+// name with no cross-module symbol. Default -1 = "armed but no sample yet" --
+// deliberately NOT 0, because 0 must remain a real measured zero (this
+// project has twice in one session believed a disarmed instrument's zero).
+// Guarded with FindConsoleVariable so that if the marcher work registers the
+// same name itself, theirs wins and this block is a no-op.
+FDelayedAutoRegisterHelper GVoxelGpuStreamPrototypeRegistrar(EDelayedRegisterRunPhase::EndOfEngineInit,
+	[]()
+	{
+		IConsoleManager& ConsoleManager = IConsoleManager::Get();
+		if (!ConsoleManager.FindConsoleVariable(TEXT("voxel.March.HoleStats.UncoveredPct")))
+		{
+			ConsoleManager.RegisterConsoleVariable(
+				TEXT("voxel.March.HoleStats.UncoveredPct"),
+				-1.0f,
+				TEXT("Transport for the streaming panel's hole row: the hole-stats instrument writes its ")
+				TEXT("latest 'uncovered rays as % of rays' here (by name, via IConsoleManager); the mode-3 ")
+				TEXT("HUD reads it. -1 = no sample published yet. Not a switch -- voxel.March.HoleStats is ")
+				TEXT("the switch."),
+				ECVF_Default);
+		}
+		CVarVoxelGpuStreamPrototype.AsVariable()->SetOnChangedCallback(
+			FConsoleVariableDelegate::CreateLambda([](IConsoleVariable*) { ApplyGpuStreamPrototype(); }));
+		if (CVarVoxelGpuStreamPrototype.GetValueOnGameThread() != 0)
+		{
+			ApplyGpuStreamPrototype();
+		}
+	});
 
 TAutoConsoleVariable<int32> CVarVoxelMipCacheBudgetMB(
 	TEXT("voxel.MipCacheBudgetMB"),
@@ -948,29 +1086,38 @@ int32 VoxelDebug::GetDebugMode()
 	return CVarVoxelDebug.GetValueOnAnyThread();
 }
 
+int32 VoxelDebug::GetGpuStreamPrototype()
+{
+	return CVarVoxelGpuStreamPrototype.GetValueOnAnyThread();
+}
+
 void VoxelDebug::SetDebugMode(int32 NewMode)
 {
-	CVarVoxelDebug->Set(FMath::Clamp(NewMode, 0, 2), ECVF_SetByCode);
+	CVarVoxelDebug->Set(FMath::Clamp(NewMode, 0, 3), ECVF_SetByCode);
 }
 
 void VoxelDebug::CycleDebugMode()
 {
-	SetDebugMode((GetDebugMode() + 1) % 3);
+	SetDebugMode((GetDebugMode() + 1) % 4);
 }
 
+// == 2, NOT >= 2, for all three layer gates below. Mode 3 is the streaming
+// panel the owner reads while FLYING; the 3D layers cost a per-chunk component
+// walk every tick (UpdateChunkStateTints) and would visually bury the terrain
+// being judged. Modes 0/1/2 behave exactly as before this change.
 bool VoxelDebug::IsChunkStatesEnabled()
 {
-	return GetDebugMode() >= 2 && CVarVoxelDebugChunkStates.GetValueOnAnyThread();
+	return GetDebugMode() == 2 && CVarVoxelDebugChunkStates.GetValueOnAnyThread();
 }
 
 bool VoxelDebug::IsBoundsEnabled()
 {
-	return GetDebugMode() >= 2 && CVarVoxelDebugBounds.GetValueOnAnyThread();
+	return GetDebugMode() == 2 && CVarVoxelDebugBounds.GetValueOnAnyThread();
 }
 
 bool VoxelDebug::IsRingsEnabled()
 {
-	return GetDebugMode() >= 2 && CVarVoxelDebugRings.GetValueOnAnyThread();
+	return GetDebugMode() == 2 && CVarVoxelDebugRings.GetValueOnAnyThread();
 }
 
 int32 VoxelDebug::GetWaterBucketFill()

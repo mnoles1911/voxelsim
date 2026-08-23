@@ -216,7 +216,16 @@ void AVoxelEarthHUD::DrawPerfHUD()
 				}
 				const double AvgWorstMs = SumMs / double(Count);
 				OnePercentLowFps = (AvgWorstMs > 0.0) ? (1000.0 / AvgWorstMs) : 0.0;
+
+				// Frame p50/p95 for the mode-3 streaming panel, from the SAME
+				// sorted history -- two indexed reads on an array this block
+				// already paid to sort. Sorted is DESCENDING (slowest first),
+				// so p95 -- the frame time 95% of frames beat -- sits 5% in
+				// from the slow end, and p50 is the middle.
+				CachedFrameP95Ms = Sorted[FMath::Clamp(int32(Sorted.Num() * 0.05f), 0, Sorted.Num() - 1)];
+				CachedFrameP50Ms = Sorted[FMath::Clamp(Sorted.Num() / 2, 0, Sorted.Num() - 1)];
 			}
+			CachedOnePercentLowFps = OnePercentLowFps;
 
 			CachedFpsValue = Fps;
 			CachedFpsText = FString::Printf(
@@ -227,6 +236,17 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			FpsWindowFrames = 0;
 			FpsWindowWorstMs = 0.0;
 		}
+	}
+
+	// Mode 3: the GPU streaming panel replaces the mode-1/2 perf text
+	// entirely. It is the flight-readable readout (few rows, pass/fail
+	// colours); mixing it with the eleven-line perf block would defeat that.
+	// The FPS machinery above still ran, so the panel's FPS + frame rows are
+	// as live at mode 3 as at mode 1.
+	if (VoxelDebug::GetDebugMode() >= 3)
+	{
+		DrawStreamPanel();
+		return;
 	}
 
 	UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>();
@@ -353,6 +373,255 @@ void AVoxelEarthHUD::DrawPerfHUD()
 }
 
 // ============================================================================
+// GPU streaming panel (voxel.Debug 3)
+// ============================================================================
+
+namespace
+{
+// Panel row colours. Distinct MUTED grey for "not measured": the one rule this
+// panel enforces everywhere is that a disarmed or not-yet-warm source prints
+// words in grey, never a zero in green -- this project retracted two findings
+// in a single session because an instrument read zero and was believed.
+const FLinearColor kStreamRowGood(0.2f, 1.0f, 0.3f, 1.0f);
+const FLinearColor kStreamRowWarn(1.0f, 0.85f, 0.2f, 1.0f);
+const FLinearColor kStreamRowBad(1.0f, 0.35f, 0.25f, 1.0f);
+const FLinearColor kStreamRowNeutral(0.85f, 0.85f, 0.85f, 1.0f);
+const FLinearColor kStreamRowMuted(0.55f, 0.55f, 0.55f, 1.0f);
+
+// 4392 -> "4,392". The panel's job is to be read mid-flight against a
+// five-digit floor; digit grouping is what makes 4392 vs 43920 a glance
+// instead of a count. FText::AsNumber does this too but with a culture lookup
+// per call; this is a fixed-format readout.
+FString CommaInt(int64 Value)
+{
+	const bool bNegative = Value < 0;
+	uint64 Magnitude = bNegative ? uint64(-(Value + 1)) + 1u : uint64(Value);
+	FString Digits = FString::Printf(TEXT("%llu"), (unsigned long long)Magnitude);
+	FString Out;
+	const int32 Len = Digits.Len();
+	for (int32 I = 0; I < Len; ++I)
+	{
+		if (I > 0 && (Len - I) % 3 == 0)
+		{
+			Out += TEXT(",");
+		}
+		Out += Digits[I];
+	}
+	return bNegative ? (TEXT("-") + Out) : Out;
+}
+} // namespace
+
+void AVoxelEarthHUD::DrawStreamPanel()
+{
+	UWorld* World = GetWorld();
+	if (!World || !Canvas)
+	{
+		return;
+	}
+
+	// Same cadence contract as the mode-1 panel: the subsystem publishes at
+	// 1 Hz, so the row strings are rebuilt at 1 Hz and drawn every frame from
+	// the cache. The rebuild below is a handful of Printf calls and two
+	// IConsoleManager name lookups -- comfortably under 0.05 ms once a second.
+	const float NowSeconds = World->GetTimeSeconds();
+	if (CachedStreamPanelRows.Num() == 0 ||
+	    (NowSeconds - StreamPanelLastRefreshWorldSeconds) >= PerfRefreshIntervalSeconds)
+	{
+		StreamPanelLastRefreshWorldSeconds = NowSeconds;
+		CachedStreamPanelRows.Reset();
+		const auto AddRow = [this](const FString& Text, const FLinearColor& Color)
+		{
+			CachedStreamPanelRows.Emplace(Text, Color);
+		};
+
+		// Header states HOW this panel was armed, so a screenshot is
+		// self-describing about its own conditions.
+		const int32 Prototype = VoxelDebug::GetGpuStreamPrototype();
+		AddRow(Prototype != 0
+			       ? FString::Printf(TEXT("GPU STREAMING  (voxel.GpuStream.Prototype %d)"), Prototype)
+			       : FString(TEXT("GPU STREAMING  (voxel.Debug 3 -- F3 cycles)")),
+		       FLinearColor(1.0f, 0.85f, 0.25f, 1.0f));
+
+		UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>();
+		const FVoxelStreamPanelSnapshot Snap =
+			Subsystem ? Subsystem->GetStreamPanelSnapshot() : FVoxelStreamPanelSnapshot{};
+
+		if (!Snap.bValid)
+		{
+			// NOT zeros. Either the first 1 s window has not completed since
+			// the perf path came alive, or there is no subsystem yet. Every
+			// data row is withheld rather than printed at rest value.
+			AddRow(Subsystem
+				       ? FString(TEXT("collecting... (throughput valid after the first full 1 s window)"))
+				       : FString(TEXT("n/a -- no voxel world subsystem in this world")),
+			       kStreamRowMuted);
+		}
+		else
+		{
+			// --- 1. Throughput vs the floor, no arithmetic left to the reader
+			const float Floor = VoxelDebug::kGpuStreamChunksPerSecFloor;
+			const bool bPass = Snap.ChunksPerSec >= Floor;
+			const FLinearColor RateColor =
+				bPass ? kStreamRowGood : (Snap.ChunksPerSec >= 0.5f * Floor ? kStreamRowWarn : kStreamRowBad);
+			AddRow(FString::Printf(TEXT("Chunks/s: %s / %s floor  [%s x%.2f]   peak(30s) %s"),
+			                       *CommaInt(int64(Snap.ChunksPerSec + 0.5f)), *CommaInt(int64(Floor)),
+			                       bPass ? TEXT("PASS") : TEXT("FAIL"),
+			                       Floor > 0.f ? Snap.ChunksPerSec / Floor : 0.f,
+			                       *CommaInt(int64(Snap.ChunksPerSecPeak + 0.5f))),
+			       RateColor);
+
+			// --- 2. Producer split: the programme's headline number ---------
+			const int64 WindowTotal = Snap.WindowAddsGpu + Snap.WindowAddsCpu;
+			if (WindowTotal <= 0)
+			{
+				// Zero chunks moved this window. That is a fact about DEMAND
+				// (standing still on covered ground), not a 0% GPU share --
+				// claiming a split of nothing is how a stalled arm hides.
+				AddRow(FString::Printf(TEXT("Producer: no chunks this window (lifetime GPU %s / CPU %s)%s"),
+				                       *CommaInt(Snap.TotalAddsGpu), *CommaInt(Snap.TotalAddsCpu),
+				                       Snap.bGpuArmEnabled ? TEXT("") : TEXT("   GPU arm OFF")),
+				       kStreamRowMuted);
+			}
+			else
+			{
+				const double GpuPct = 100.0 * double(Snap.WindowAddsGpu) / double(WindowTotal);
+				// Colour tracks the PROGRAMME, not health: near-0% GPU is
+				// today's truth (under 5% measured), near-100% is the goal.
+				// Neutral in between; amber callout if the arm is switched off
+				// entirely, because then the % is a config fact, not a result.
+				AddRow(FString::Printf(TEXT("Producer: GPU %.1f%% (%s)  CPU %.1f%% (%s) this window%s"),
+				                       GpuPct, *CommaInt(Snap.WindowAddsGpu),
+				                       100.0 - GpuPct, *CommaInt(Snap.WindowAddsCpu),
+				                       Snap.bGpuArmEnabled ? TEXT("") : TEXT("   GPU arm OFF (voxel.GPU.BrickPack 0)")),
+				       Snap.bGpuArmEnabled ? kStreamRowNeutral : kStreamRowWarn);
+			}
+		}
+
+		// --- 3. The hole metric: the number the owner actually cares about --
+		// Found BY NAME because the instrument is being built in parallel and
+		// this HUD must not link against a symbol that may not exist tonight.
+		// Every failure mode gets its own words; none of them prints a number.
+		{
+			IConsoleManager& ConsoleManager = IConsoleManager::Get();
+			IConsoleVariable* HoleSwitch = ConsoleManager.FindConsoleVariable(TEXT("voxel.March.HoleStats"));
+			if (!HoleSwitch)
+			{
+				AddRow(TEXT("Holes: n/a -- voxel.March.HoleStats is not in this build"), kStreamRowMuted);
+			}
+			else if (HoleSwitch->GetInt() == 0)
+			{
+				AddRow(TEXT("Holes: off (voxel.March.HoleStats 0 -- voxel.GpuStream.Prototype 1 arms it)"),
+				       kStreamRowMuted);
+			}
+			else
+			{
+				IConsoleVariable* HolePct =
+					ConsoleManager.FindConsoleVariable(TEXT("voxel.March.HoleStats.UncoveredPct"));
+				const float UncoveredPct = HolePct ? HolePct->GetFloat() : -1.0f;
+				if (UncoveredPct < 0.0f)
+				{
+					AddRow(TEXT("Holes: armed, no sample yet (voxel.March.HoleStats.UncoveredPct unset)"),
+					       kStreamRowWarn);
+				}
+				else
+				{
+					// Thresholds from the 2026-08-23 measurements: 0.03%
+					// standing still, 3.99% flying at 30 m/s. Green means
+					// "at or better than today's standing-still reading";
+					// red means "the flying failure the programme exists
+					// to remove".
+					const FLinearColor HoleColor = (UncoveredPct <= 0.1f) ? kStreamRowGood
+					                             : (UncoveredPct <= 1.0f) ? kStreamRowWarn
+					                                                      : kStreamRowBad;
+					AddRow(FString::Printf(TEXT("Holes: uncovered %.2f%% of rays  [%s]"), UncoveredPct,
+					                       (UncoveredPct <= 0.1f) ? TEXT("OK")
+					                       : (UncoveredPct <= 1.0f) ? TEXT("WARN") : TEXT("BAD")),
+					       HoleColor);
+				}
+			}
+		}
+
+		// --- 4. Frame percentiles, from the FPS block's own sorted history --
+		if (CachedFrameP50Ms <= 0.0)
+		{
+			AddRow(TEXT("Frame: warming up (needs ~20 frames of history)"), kStreamRowMuted);
+		}
+		else
+		{
+			const FLinearColor FrameColor = (CachedOnePercentLowFps >= 55.0) ? kStreamRowGood
+			                              : (CachedOnePercentLowFps >= 30.0) ? kStreamRowWarn
+			                                                                 : kStreamRowBad;
+			AddRow(FString::Printf(TEXT("Frame: p50 %.1f ms  p95 %.1f ms  1%% low %.1f fps"),
+			                       CachedFrameP50Ms, CachedFrameP95Ms, CachedOnePercentLowFps),
+			       FrameColor);
+		}
+
+		if (Snap.bValid)
+		{
+			// --- 5. Pool: occupancy plus the two counters gated at zero -----
+			const double OccupancyPct = Snap.PoolChunkCapacity > 0
+				? 100.0 * double(Snap.PoolResidentChunks) / double(Snap.PoolChunkCapacity)
+				: 0.0;
+			const bool bPoolBad = Snap.PoolEvictions > 0 || Snap.PoolAllocFailures > 0;
+			AddRow(FString::Printf(TEXT("Pool: %s / %s chunks (%.1f%%)  %.0f MiB  evict %s [%s]  allocFail %s"),
+			                       *CommaInt(Snap.PoolResidentChunks), *CommaInt(int64(Snap.PoolChunkCapacity)),
+			                       OccupancyPct, double(Snap.PoolResidentBytes) / (1024.0 * 1024.0),
+			                       *CommaInt(Snap.PoolEvictions),
+			                       Snap.PoolEvictions == 0 ? TEXT("OK") : TEXT("GATE FAIL"),
+			                       *CommaInt(Snap.PoolAllocFailures)),
+			       bPoolBad ? kStreamRowBad : (OccupancyPct > 90.0 ? kStreamRowWarn : kStreamRowGood));
+
+			// --- 6. Queue health --------------------------------------------
+			AddRow(FString::Printf(TEXT("Queues: pending %s | cpu %d/%d  gpuDemand %d/%d  spec %d/%d"),
+			                       *CommaInt(Snap.PendingJobs),
+			                       Snap.CpuJobsInFlight, Snap.CpuJobsCap,
+			                       Snap.GpuDemandInFlight, Snap.GpuInFlightCap,
+			                       Snap.GpuSpecInFlight, Snap.SpecInFlightCap),
+			       kStreamRowNeutral);
+
+			// The dispatch loop's exit split says which half is the limiter:
+			// every cap exit is a tick where the WORKERS were full, every
+			// empty exit a tick where the DISPATCHER ran out of admitted work.
+			const int32 Exits = Snap.DispatchExitCap + Snap.DispatchExitEmpty;
+			if (Exits <= 0)
+			{
+				AddRow(TEXT("Dispatch exits: none this window (streaming tick idle?)"), kStreamRowMuted);
+			}
+			else
+			{
+				const double CapPct = 100.0 * double(Snap.DispatchExitCap) / double(Exits);
+				AddRow(FString::Printf(TEXT("Dispatch exits: cap %d / empty %d (%.0f%% cap)  -> %s"),
+				                       Snap.DispatchExitCap, Snap.DispatchExitEmpty, CapPct,
+				                       CapPct >= 60.0 ? TEXT("worker-limited")
+				                       : CapPct <= 40.0 ? TEXT("admission-limited") : TEXT("balanced")),
+				       kStreamRowNeutral);
+			}
+		}
+	}
+
+	// --- Draw: background, then the 4 Hz FPS line, then the 1 Hz rows -------
+	const int32 TotalLines = CachedStreamPanelRows.Num() + (CachedFpsText.IsEmpty() ? 0 : 1);
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.55f), PerfPanelMarginPx, PerfPanelMarginPx, 620.f,
+	         PerfPanelLineHeightPx * float(TotalLines) + 8.f);
+
+	float LineY = PerfPanelMarginPx + 4.f;
+	if (!CachedFpsText.IsEmpty())
+	{
+		const FLinearColor FpsColor =
+			(CachedFpsValue >= 55.0) ? kStreamRowGood
+			: (CachedFpsValue >= 30.0) ? kStreamRowWarn
+			                           : kStreamRowBad;
+		DrawText(CachedFpsText, FpsColor, PerfPanelMarginPx + 6.f, LineY, nullptr, 1.f, false);
+		LineY += PerfPanelLineHeightPx;
+	}
+	for (const TPair<FString, FLinearColor>& Row : CachedStreamPanelRows)
+	{
+		DrawText(Row.Key, Row.Value, PerfPanelMarginPx + 6.f, LineY, nullptr, 1.f, false);
+		LineY += PerfPanelLineHeightPx;
+	}
+}
+
+// ============================================================================
 // In-game debug overlay (usability task)
 // ============================================================================
 
@@ -399,9 +668,10 @@ void AVoxelEarthHUD::AdjustOverlaySelection(int32 Delta)
 		break;
 
 	case EOverlayRow::DebugMode:
-		// 0 -> 1 -> 2 -> 0, the same cycle F3 drives; Left steps backwards so
-		// the row behaves like every other value row.
-		VoxelDebug::SetDebugMode((VoxelDebug::GetDebugMode() + (Delta >= 0 ? 1 : 2)) % 3);
+		// 0 -> 1 -> 2 -> 3 -> 0, the same cycle F3 drives (3 = the GPU
+		// streaming panel); Left steps backwards so the row behaves like
+		// every other value row.
+		VoxelDebug::SetDebugMode((VoxelDebug::GetDebugMode() + (Delta >= 0 ? 1 : 3)) % 4);
 		break;
 
 	case EOverlayRow::ChunkStates:
@@ -796,11 +1066,14 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 	               PanelX, Y);
 
 	DrawOverlayRow(EOverlayRow::DebugMode, TEXT("voxel.Debug    (F3)"),
-	               FString::Printf(TEXT("%d  (0 off, 1 perf HUD, 2 +layers)"), VoxelDebug::GetDebugMode()), PanelX, Y);
+	               FString::Printf(TEXT("%d  (0 off, 1 perf HUD, 2 +layers, 3 streaming)"), VoxelDebug::GetDebugMode()), PanelX, Y);
 
 	// The three layer rows show the CVAR value and, when mode < 2 is holding
 	// them back, say so -- otherwise flipping one at mode 1 looks broken.
-	const TCHAR* Gated = (VoxelDebug::GetDebugMode() >= 2) ? TEXT("") : TEXT("  (needs voxel.Debug 2)");
+	// == 2, matching the layer helpers themselves (VoxelDebug.cpp): mode 3 is
+	// the streaming panel and deliberately does NOT arm the 3D layers, so the
+	// hint must reappear there too.
+	const TCHAR* Gated = (VoxelDebug::GetDebugMode() == 2) ? TEXT("") : TEXT("  (needs voxel.Debug 2)");
 	DrawOverlayRow(EOverlayRow::ChunkStates, TEXT("  Chunk states"),
 	               FString::Printf(TEXT("%s%s"), *OnOff(VoxelDebug::GetChunkStatesCVar()), Gated), PanelX, Y);
 	DrawOverlayRow(EOverlayRow::Bounds, TEXT("  Chunk bounds"),

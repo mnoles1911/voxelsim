@@ -117,6 +117,25 @@ private:
 	FString CachedPerfHUDText;
 	float PerfHUDLastRefreshWorldSeconds = -1000.f;
 
+	// --- GPU streaming panel (voxel.Debug 3) --------------------------------
+	//
+	// The flight-readable readout for the GPU streaming programme: throughput
+	// against the 6,200/s floor, producer split (GPU vs CPU arm), the hole
+	// metric, frame percentiles, pool occupancy/evictions, queue depths and
+	// the dispatch-loop exit split. Drawn INSTEAD of the mode-1/2 perf text at
+	// mode 3 -- the owner is flying at 30 m/s when he reads this, so it is few
+	// rows, big facts, and every row carries its own pass/fail colour.
+	//
+	// Rows are cached as (text, colour) pairs rebuilt at the same 1 Hz the
+	// subsystem publishes FVoxelStreamPanelSnapshot at (rebuilding faster
+	// would re-format identical data); the FPS line keeps its own 4 Hz cache
+	// exactly as the mode-1 panel does. Per-frame cost is the DrawText calls
+	// for ~10 rows plus one DrawRect -- a readout, not a profiler.
+	void DrawStreamPanel();
+
+	TArray<TPair<FString, FLinearColor>> CachedStreamPanelRows;
+	float StreamPanelLastRefreshWorldSeconds = -1000.f;
+
 	// --- FPS counter -------------------------------------------------------
 	//
 	// SEPARATE FROM THE 1 Hz PERF PANEL ON PURPOSE. The panel republishes once
@@ -147,4 +166,12 @@ private:
 	// and re-parsing a formatted string to recover a value it was built from is
 	// the kind of thing that survives until someone changes the format.
 	double CachedFpsValue = 0.0;
+
+	// Frame-time percentiles over the same rolling history the 1% low uses,
+	// computed in the same 4 Hz refresh (the array is already sorted there, so
+	// these are two extra indexed reads). The mode-3 streaming panel's "Frame"
+	// row reads them; 0.0 means "history not warm yet" and the row says so.
+	double CachedFrameP50Ms = 0.0;
+	double CachedFrameP95Ms = 0.0;
+	double CachedOnePercentLowFps = 0.0;
 };
