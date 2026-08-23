@@ -10316,9 +10316,27 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	//     below the horizon. This is the real hole count. UP under
 	//     -VoxelMaxRingLevel=0 (streaming holds level 0 only, the walk covers
 	//     4 km), a cold start, or flight faster than streaming feeds; DOWN to
-	//     near zero on a settled stationary world. Known over-count, stated:
-	//     a below-horizon ray whose true ground lies beyond the cascade's
-	//     edge but which crossed a sky-band-trimmed chunk on the way.
+	//     near zero on a settled stationary world.
+	//
+	//     THE "KNOWN OVER-COUNT" IS NOT AN EDGE CASE. It used to read here as
+	//     a caveat -- "a below-horizon ray whose true ground lies beyond the
+	//     cascade's edge but which crossed a sky-band-trimmed chunk on the
+	//     way". Measured 2026-08-23 (Saved/capture-zcut-alt120.log): on a
+	//     SETTLED, STATIONARY world with nothing in flight, uncovered read
+	//     25.27% OF ALL RAYS, unchanged window after window, with the picture
+	//     on screen static. The streamed set is a shell around the surface and
+	//     everything outside it -- the air the camera flies in, the sky above
+	//     a distant ridge, the rock below the buried-skip floor -- is absent
+	//     and correctly so. Nor did it fall to "near zero" settled: it never
+	//     fell at all. So this counter does NOT track visible holes, which is
+	//     exactly the complaint that had it flagged untrustworthy (it rose
+	//     while the owner watched holes disappear).
+	//
+	//     READ uncShell ON THE BREAKDOWN LINE INSTEAD. It narrows this to
+	//     absent chunks FACE-ADJACENT to resident ones -- gaps in ground the
+	//     streaming system holds. `uncovered` is kept unchanged so the two are
+	//     comparable window for window and so the level-1 arm stays what every
+	//     historical leg measured; it is not evidence about holes on its own.
 	//
 	// rays is the denominator for both rates; frames is how many per-frame
 	// readbacks landed in this window (GPU readback runs 1-3 frames behind,
@@ -10368,17 +10386,53 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 
 			// ---- THE BREAKDOWN (voxel.March.HoleStats 2) -------------------
 			//
+			// WHAT THE BREAKDOWN COUNTS SINCE 2026-08-23, because it is NOT
+			// what `uncovered` on the line above counts and quoting one for
+			// the other is how this instrument spent a night lying.
+			//
+			// `uncovered` fires on any absent crossing. The streamed set is a
+			// SHELL around the surface (~4.4 chunks per column at level 0),
+			// the camera flies in the air outside it, and ring segment 0
+			// starts AT the camera -- so the first absent chunk on nearly
+			// every ray is the air the camera sits in. Measured consequence:
+			// uncovered = 25.27% of ALL RAYS on a settled stationary world,
+			// byLevel L0=100% in every window of all three zcut rungs, and a
+			// reason split decided by ONE cell (hence all-or-nothing, and
+			// hence flipping never<->unattrib between windows with nothing
+			// streaming). See VoxelMarchAbsentTouchesShell.
+			//
+			// `uncShell` fires only where the absent chunk is FACE-ADJACENT to
+			// a resident one -- a gap in ground the streaming system holds.
+			// That is the hole count, and it is what the histograms below
+			// break down. uncShell/uncovered is the share of the old number
+			// that was ever about holes; read it every time before quoting
+			// either.
+			//
 			// WHAT MOVES EACH BUCKET, so the reader can check the split is
 			// alive in both directions before believing it:
-			//   byLevel   -- the established facts predict the mass at L0
-			//     (R0 pending=242 mid-flight, R1-R5 at 0). -VoxelMaxRingLevel=0
-			//     must move the mass OUT to L1-L5. If normal flight puts the
-			//     mass at L1+ instead, the coverage rule, not R0 throughput,
-			//     owns the arcs.
-			//   never    -- UP under -VoxelMaxRingLevel=0 (nothing above L0 is
-			//     ever admitted: THE proving run -- near-100% never, at L1-L5);
-			//     DOWN in the normal config where the desired set covers the
-			//     cascade.
+			//   uncShell -- UP flying faster than streaming feeds, UP under
+			//     -VoxelHierarchicalCoverage, UP under -VoxelMaxRingLevel=0.
+			//     DOWN to near zero settled and stationary. THE FAILING
+			//     READING: uncShell == uncovered means the shell test is not
+			//     narrowing anything (a stuck MarchIndexLevelPopulated = 0
+			//     does exactly that), and uncShell == 0 across a whole flight
+			//     with visible arcs means it narrowed too far.
+			//   byLevel   -- must show mass at MORE THAN ONE level on a normal
+			//     flight. All of it at L0 was the pre-2026-08-23 defect and is
+			//     the first thing to check. -VoxelMaxRingLevel=0 must move the
+			//     mass OUT of L0 (levels 1-5 stream nothing, so their slots
+			//     read unpopulated and every absent chunk there is a hole);
+			//     expect it to pile at the first starved segment the ray
+			//     enters, not to spread evenly.
+			//   never    -- MEANS SOMETHING NOW THAT IT IS SHELL-GATED: a chunk
+			//     touching held ground that the desired set never admitted,
+			//     i.e. a COVERAGE bug. Ungated it also swallowed every cubic
+			//     metre of correct air, which is why it read 100% for whole
+			//     rungs. UP under -VoxelMaxRingLevel=0 (nothing above L0 is
+			//     ever admitted, so those slots read unpopulated and every
+			//     absent chunk in them is a hole: THE proving run -- near-100%
+			//     never, above L0); DOWN in the normal config where the
+			//     desired set covers the cascade.
 			//   pending  -- UP flying at 30 m/s (tracks the ring pending
 			//     queues); DOWN to ~0 hovering until they drain.
 			//   evicted  -- UP under -VoxelHierarchicalCoverage (32,923 pool
@@ -10387,6 +10441,17 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			//   unattrib -- indicts the INSTRUMENT (stale resident records,
 			//     uncaptured rays); large values mean fix the meter, not the
 			//     streaming.
+			//
+			// annotWrites FREEZING IS NORMAL AND IS NOT EVIDENCE OF ANYTHING.
+			// It was read as the cause of a stuck reason split (backlog 0.0i)
+			// and it is not. It counts admissions, and a settled world admits
+			// nothing -- records/level R0[+0 -0 ev0] on the same window. The
+			// alt400 rung falsifies the correlation outright: the counter
+			// CLIMBS 27,661 -> 48,018 through windows reading unattrib=100%
+			// and sits FROZEN through later windows reading never=100%. It
+			// moves independently of the split in both directions. What it IS
+			// good for is the zero case: no writes ever, with the disarm
+			// marker absent, means the annotation path never ran.
 			if (H.bBreakdownArmed && H.BreakdownFrames == 0)
 			{
 				UE_LOG(LogVoxelPerf, Warning,
@@ -10398,22 +10463,44 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			{
 				uint64 Attributed = 0;
 				uint64 ReasonSum = 0;
-				for (int32 L = 0; L < 6; ++L) { Attributed += H.UncoveredByLevel[L]; }
-				for (int32 R = 0; R < 4; ++R) { ReasonSum += H.UncoveredByReason[R]; }
+				// kNumLevels, NOT the literal 6 this loop used to carry. The
+				// enum has held SEVEN level words since the 8 km ring landed,
+				// and a loop stopping at 6 dropped every level-6 attribution
+				// out of `attributed` -- which then printed as a SHORTFALL,
+				// i.e. as a capture defect in the shader, on a shader that had
+				// counted the ray correctly.
+				for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
+				{
+					Attributed += H.UncoveredByLevel[L];
+				}
+				for (int32 R = 0; R < VoxelMarchHoleWord::kNumReasons; ++R)
+				{
+					ReasonSum += H.UncoveredByReason[R];
+				}
 				// attributed == sum(byReason) is a shader-construction
 				// identity (one add from each group per attributed ray);
-				// attributed <= uncovered can legitimately fall short only by
+				// attributed <= uncShell can legitimately fall short only by
 				// sentinel rays (capture defect -- printed, never absorbed)
-				// or by a window that mixed arm levels (uncovered counts all
-				// frames, the breakdown only level-2 ones -- said explicitly).
+				// or by a window that mixed arm levels (uncShell counts
+				// level-2 frames, so a mixed window is flagged rather than
+				// differenced).
 				const bool bPureWindow = H.BreakdownFrames == H.Frames;
-				const uint64 Shortfall =
-					bPureWindow && H.Uncovered >= Attributed ? H.Uncovered - Attributed : 0;
+				// AGAINST uncShell, NOT AGAINST uncovered. The two count
+				// different populations on purpose since 2026-08-23 (see the
+				// block above), so checking attribution against `uncovered`
+				// would report the shell narrowing -- the fix -- as a
+				// permanent capture defect. uncShell is the exact denominator:
+				// every ray that sets bCrossedShellAbsent adds one level word
+				// and one reason word unless its level sentinel survived.
+				const uint64 Shortfall = bPureWindow && H.UncoveredShell >= Attributed
+				                             ? H.UncoveredShell - Attributed
+				                             : 0;
 				FVoxelMarchChunkIndex& MarchIndex = GetGlobalVoxelMarchChunkIndex();
 				UE_LOG(LogVoxelPerf, Log,
 				       TEXT("Voxel march holes breakdown (5s window): byLevel L0=%llu L1=%llu ")
-				       TEXT("L2=%llu L3=%llu L4=%llu L5=%llu | byReason never=%llu pending=%llu ")
-				       TEXT("evicted=%llu unattrib=%llu | attributed=%llu of uncovered=%llu%s ")
+				       TEXT("L2=%llu L3=%llu L4=%llu L5=%llu L6=%llu | byReason never=%llu ")
+				       TEXT("pending=%llu evicted=%llu unattrib=%llu | attributed=%llu of ")
+				       TEXT("uncShell=%llu (%.2f%% of uncovered=%llu)%s ")
 				       TEXT("| annotWrites pending=%llu evicted=%llu (lifetime)%s"),
 				       (unsigned long long)H.UncoveredByLevel[0],
 				       (unsigned long long)H.UncoveredByLevel[1],
@@ -10421,11 +10508,27 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				       (unsigned long long)H.UncoveredByLevel[3],
 				       (unsigned long long)H.UncoveredByLevel[4],
 				       (unsigned long long)H.UncoveredByLevel[5],
+				       // L6 EXISTS AND WAS NEVER PRINTED. The 8 km ring took
+				       // the seventh level word on 2026-08-23 and this line
+				       // stopped at L5, so a level-6 hole was invisible in the
+				       // one place the histogram is read.
+				       (unsigned long long)H.UncoveredByLevel[6],
 				       (unsigned long long)H.UncoveredByReason[0],
 				       (unsigned long long)H.UncoveredByReason[1],
 				       (unsigned long long)H.UncoveredByReason[2],
 				       (unsigned long long)H.UncoveredByReason[3],
-				       (unsigned long long)Attributed, (unsigned long long)H.Uncovered,
+				       (unsigned long long)Attributed,
+				       (unsigned long long)H.UncoveredShell,
+				       // THE CONTAMINATION RATIO, printed rather than left to
+				       // be derived: how much of the old `uncovered` was ever
+				       // about holes. It read 100% by construction before the
+				       // shell test existed; if it reads 100% again the test
+				       // is not narrowing anything and the histograms below it
+				       // are back to describing the air the camera sits in.
+				       H.Uncovered > 0
+				           ? 100.0 * double(H.UncoveredShell) / double(H.Uncovered)
+				           : 0.0,
+				       (unsigned long long)H.Uncovered,
 				       !bPureWindow
 				           ? TEXT(" [WINDOW MIXED ARM LEVELS -- attributed covers fewer frames]")
 				           : (Shortfall > 0 ? TEXT(" [SHORTFALL: capture missed rays -- ")

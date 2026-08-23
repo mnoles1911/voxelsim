@@ -588,24 +588,50 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNCOVERED], 1u);
 #if VOXEL_MARCH_HOLE_STATS >= 2
-					// LEVEL 2: which ring level owned the ground at the first
-					// absent crossing, and why that chunk was absent -- one
-					// level word and one reason word per uncovered ray, so
-					// sum(byLevel) == sum(byReason) == the attributed share of
-					// `uncovered` BY CONSTRUCTION, and the CPU prints the
-					// shortfall instead of hiding it. The < 6 guard is the
-					// sentinel check (see Miss.AbsentLevel in
-					// VoxelBrickTraverse.ush): an unattributed ray is counted
-					// in `uncovered` and in NEITHER breakdown, so a capture
-					// defect surfaces as attributed < uncovered rather than as
-					// a confident wrong histogram.
-					if (H.AbsentLevel < 6u)
+					// LEVEL 2, AND IT NOW COUNTS A DIFFERENT POPULATION THAN
+					// `uncovered` ABOVE -- deliberately, and the two are
+					// printed side by side so the difference is a reading.
+					//
+					// `uncovered` fires on any absent crossing, which on a
+					// settled stationary world was 25.27% of all rays because
+					// the streamed set is a shell and the camera flies in the
+					// air outside it (Saved/capture-zcut-alt120.log). This
+					// counts only rays that crossed a GAP IN THE SHELL --
+					// see VoxelMarchAbsentTouchesShell for the three captures
+					// that forced the split. uncShell/uncovered is therefore
+					// the share of the old counter that was ever about holes,
+					// and it is the number the streaming plan should quote.
+					if (H.bCrossedShellAbsent)
 					{
 						InterlockedAdd(
-							GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNC_LEVEL0 + H.AbsentLevel], 1u);
-						InterlockedAdd(
-							GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNC_REASON0 +
-							                    min(H.FirstAbsentReason, 3u)], 1u);
+							GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNCOVERED_SHELL], 1u);
+						// Which ring level owned the ground at that crossing,
+						// and why the chunk was absent -- one level word and
+						// one reason word per attributed ray, so
+						// sum(byLevel) == sum(byReason) == the attributed
+						// share of uncShell BY CONSTRUCTION, and the CPU
+						// prints the shortfall instead of hiding it.
+						//
+						// THE BOUND IS PUSHED FROM THE ENUM, NOT WRITTEN 6.
+						// It WAS the literal 6 while the enum already carried
+						// seven level words (the 8 km ring, 2026-08-23), so
+						// every level-6 miss was dropped into the shortfall
+						// with no way to tell it from a capture defect. The
+						// guard is still the sentinel check for
+						// Miss.AbsentLevel (0xFFFFFFFF = nothing captured):
+						// an unattributed ray counts in uncShell and in
+						// NEITHER breakdown, which surfaces as
+						// attributed < uncShell rather than as a confident
+						// wrong histogram.
+						if (H.AbsentLevel < uint(VOXEL_MARCH_HOLE_NUM_LEVELS))
+						{
+							InterlockedAdd(
+								GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNC_LEVEL0 +
+								                    H.AbsentLevel], 1u);
+							InterlockedAdd(
+								GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNC_REASON0 +
+								                    min(H.FirstAbsentReason, 3u)], 1u);
+						}
 					}
 #endif
 				}

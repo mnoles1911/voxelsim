@@ -2596,6 +2596,13 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// an unbound parameter, and reach 0 is the honest "cover is off" value.
 	SHADER_PARAMETER(uint32, MarchCoverIndexGrid)
 	SHADER_PARAMETER(float, MarchCoverReachUU)
+	// One bit per index grid slot: set means that slot holds at least one
+	// resident chunk. Read ONLY by the voxel.March.HoleStats 2 permutation
+	// (VoxelMarchAbsentTouchesShell), bound on every arm for the reason the
+	// cover pair above is -- an unbound uniform is a silent zero, and a zero
+	// here means every slot is empty, which would make every absent chunk read
+	// as a hole rather than none.
+	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -2635,6 +2642,13 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchEmitParameters, )
 	// an unbound parameter, and reach 0 is the honest "cover is off" value.
 	SHADER_PARAMETER(uint32, MarchCoverIndexGrid)
 	SHADER_PARAMETER(float, MarchCoverReachUU)
+	// One bit per index grid slot: set means that slot holds at least one
+	// resident chunk. Read ONLY by the voxel.March.HoleStats 2 permutation
+	// (VoxelMarchAbsentTouchesShell), bound on every arm for the reason the
+	// cover pair above is -- an unbound uniform is a silent zero, and a zero
+	// here means every slot is empty, which would make every absent chunk read
+	// as a hole rather than none.
+	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -2831,6 +2845,15 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchHoleWord::Substituted));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNCOVERED"),
 		                         int32(VoxelMarchHoleWord::Uncovered));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNCOVERED_SHELL"),
+		                         int32(VoxelMarchHoleWord::UncoveredShell));
+		// THE LEVEL-GROUP SIZE, PUSHED RATHER THAN WRITTEN. The kernel's
+		// sentinel guard was the literal `< 6u` while this group already held
+		// seven words, so a level-6 miss (the 8 km ring) was silently dropped
+		// into the shortfall the perf line reports as "capture missed rays".
+		// One authority, and it moves when the enum does.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_NUM_LEVELS"),
+		                         VoxelMarchHoleWord::kNumLevels);
 		// The level-2 breakdown's two word groups: 6 level words then 4
 		// reason words. The shader adds the ring level / the
 		// VOXEL_MARCH_MISS_* code to these bases, so the group sizes are
@@ -3055,6 +3078,13 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifySourceParameters, )
 	// an unbound parameter, and reach 0 is the honest "cover is off" value.
 	SHADER_PARAMETER(uint32, MarchCoverIndexGrid)
 	SHADER_PARAMETER(float, MarchCoverReachUU)
+	// One bit per index grid slot: set means that slot holds at least one
+	// resident chunk. Read ONLY by the voxel.March.HoleStats 2 permutation
+	// (VoxelMarchAbsentTouchesShell), bound on every arm for the reason the
+	// cover pair above is -- an unbound uniform is a silent zero, and a zero
+	// here means every slot is empty, which would make every absent chunk read
+	// as a hole rather than none.
+	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -3152,6 +3182,13 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifyIndexParameters, )
 	// an unbound parameter, and reach 0 is the honest "cover is off" value.
 	SHADER_PARAMETER(uint32, MarchCoverIndexGrid)
 	SHADER_PARAMETER(float, MarchCoverReachUU)
+	// One bit per index grid slot: set means that slot holds at least one
+	// resident chunk. Read ONLY by the voxel.March.HoleStats 2 permutation
+	// (VoxelMarchAbsentTouchesShell), bound on every arm for the reason the
+	// cover pair above is -- an unbound uniform is a silent zero, and a zero
+	// here means every slot is empty, which would make every absent chunk read
+	// as a hole rather than none.
+	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -3456,6 +3493,40 @@ static bool VoxelMarchBindPool(FRDGBuilder& GraphBuilder, int32 Source, Paramete
 	// cost a second near-field traversal for nothing. This is the value that
 	// makes voxel.Cover.March's control arm the default rather than an option.
 	Params.MarchCoverReachUU = VoxelMarchCoverReachUU();
+	// ---- the hole breakdown's shell test (voxel.March.HoleStats 2) --------
+	//
+	// WHICH SLOTS HOLD ANYTHING, one bit each. The marcher's shell test asks
+	// "is this absent chunk next to a chunk we hold" -- a good question for a
+	// level that streams something and a meaningless one for a level that
+	// streams nothing, and -VoxelMaxRingLevel=0 is exactly the second case for
+	// levels 1-5. That run is the instrument's proving run (it must read
+	// near-100% holes above L0), so an empty slot has to short-circuit the
+	// test rather than silently answer "no holes here". The bit is what lets
+	// the shader tell the two apart.
+	//
+	// FILLED ON EVERY ARM, level 1 and level 0 included, for the reason the
+	// cover pair above is filled: an unbound uniform reads as zero, and zero
+	// here is "everything is empty" -- the loudest possible wrong answer
+	// rather than a quiet one, but still one nobody asked for.
+	//
+	// GetNumEntriesAtLevel TAKES A LEVEL AND MAPS IT ITSELF, so the cover slot
+	// is reached through kCoverLevel and not by counting grid slots here --
+	// GridSlotForLevel stays the single authority for the mapping.
+	{
+		uint32 PopulatedMask = 0u;
+		for (uint32 L = 0; L < FVoxelMarchChunkIndex::kRingGrids; ++L)
+		{
+			if (Index.GetNumEntriesAtLevel(L) > 0)
+			{
+				PopulatedMask |= (1u << L);
+			}
+		}
+		if (Index.GetCoverEntries() > 0)
+		{
+			PopulatedMask |= (1u << uint32(FVoxelMarchChunkIndex::kCoverGridSlot));
+		}
+		Params.MarchIndexLevelPopulated = PopulatedMask;
+	}
 	// Ring segments, near to far, as plain t intervals in UU. Filled even when
 	// the rings permutation is off, for the same reason both sources' bindings
 	// ride one struct: an unset uniform is a silent zero, and a zero outer
@@ -3623,6 +3694,7 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			// The breakdown words, copied out BEFORE Unlock invalidates Src.
 			// Read regardless of level (the buffer always has Count words),
 			// folded in only for level-2 frames below.
+			const uint32 UncoveredShell = Src[VoxelMarchHoleWord::UncoveredShell];
 			uint32 ByLevel[VoxelMarchHoleWord::kNumLevels];
 			uint32 ByReason[VoxelMarchHoleWord::kNumReasons];
 			for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
@@ -3656,6 +3728,12 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 				{
 					State->HoleWindow.UncoveredByReason[R] += ByReason[R];
 				}
+				// Level-2 only, folded here with the histograms and NOT beside
+				// Uncovered above: a level-1 frame writes zero to this word by
+				// permutation, and summing those in would let a mixed window
+				// print a shell count that under-reports by however many
+				// frames ran the cheap kernel.
+				State->HoleWindow.UncoveredShell += UncoveredShell;
 				State->HoleWindow.BreakdownFrames++;
 			}
 		}
