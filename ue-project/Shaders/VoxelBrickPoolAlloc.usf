@@ -670,8 +670,19 @@ void BrickPoolAllocDescMain(uint3 tid : SV_DispatchThreadID)
 	// (the pack is chunk-major over one shared scratch), so the member's slice
 	// prefix -- the claim's spare pair -- comes back OFF before the pool base
 	// goes ON. Classic path: SrcDescBase 0, spare pair 0, arithmetic verbatim.
-	const uint OccSrcFirst = InClaim[6];
-	const uint MatSrcFirst = InClaim[7];
+	//
+	// THE SPARE PAIR IS NOT THE REBASE TERM (2026-08-23 stage-6 audit). The
+	// claim folds SrcWordsOccBase/SrcWordsMatBase -- the worklist Pack
+	// stage's arena slice bases -- into [6]/[7] so the COPY kernels source
+	// from the pack arenas. But pack-arena descriptors are CHUNK-relative
+	// (the stage's one deliberate split), so their rebase term is ZERO, not
+	// the slice base: subtracting the raw spare pair mis-rebased every
+	// pack-fed chunk with slice > 0 into garbage pool offsets, invisibly to
+	// every arena-level gate (the pool desc was never compared). Subtracting
+	// the host-known SrcWords*Base back out leaves exactly the stack prefix:
+	// stack (prefix, bases 0), classic (0, 0), pack-fed (0 = base - base).
+	const uint OccSrcFirst = InClaim[6] - SrcWordsOccBase;
+	const uint MatSrcFirst = InClaim[7] - SrcWordsMatBase;
 
 	uint2 D = InBrickDesc[SrcDescBase + i];
 	const uint Kind = (D.x >> 28u) & 3u;
@@ -723,7 +734,14 @@ void BrickPoolAllocRecordMain(uint3 gtid : SV_GroupThreadID)
 		}
 		else if (Kind == kBrickKindMixed)
 		{
-			const uint OccWord = D.x & kBrickOffsetMask;
+			// SrcWordsOccBase (2026-08-23 stage-6 audit): the descriptor's
+			// occ offset is relative to the SOURCE the descs were packed
+			// against -- the shared scratch on the classic/stack paths (base
+			// 0, offsets batch-relative) but the record's CHUNK-RELATIVE
+			// slice on the worklist pack path, where InBrickOcc is the whole
+			// pack arena. Without the base every pack-fed chunk with
+			// slice > 0 computed allSolid from slice 0's words.
+			const uint OccWord = SrcWordsOccBase + (D.x & kBrickOffsetMask);
 			uint Acc = 0xffffffffu;
 			for (uint k = 0u; k < kBrickOccWords; ++k)
 			{

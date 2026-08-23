@@ -143,10 +143,17 @@ namespace VoxelGpuWorldGen
 		uint32 BrickDescReadBase = 0;     // SliceIndex * 64
 		uint32 BrickOccSrcBase = 0;       // SliceIndex * 1,024
 		uint32 BrickMatSrcBase = 0;       // SliceIndex * 8,448
-		uint32 ChunkMaskReadBase = 0;     // SliceIndex * 2 -- NOTE: element base
-		                                  // into the mask arena; the write pass
-		                                  // wants a CHUNK index, so the caller
-		                                  // passes SliceIndex (base / 2) there.
+		uint32 ChunkMaskReadBase = 0;     // SliceIndex * 2 -- ELEMENT base into
+		                                  // the mask arena, and that is what the
+		                                  // record write pass's ChunkMaskBase
+		                                  // takes (the stack path passes C * 2
+		                                  // the same way). A prior note here
+		                                  // claimed the pass wanted a CHUNK
+		                                  // index and the caller divided by 2 --
+		                                  // the kernel never multiplied, so
+		                                  // every slice > 0 record read its
+		                                  // masks from the wrong elements.
+		                                  // Fixed 2026-08-23 (stage-6 audit).
 
 		// Tier B.1 (voxel.GPU.WorldGenBatch): (2 + 2*NumBrickChunks) uints --
 		// the region totals pair, then each chunk's own occ/mat dword pair.
@@ -596,9 +603,16 @@ namespace VoxelGpuWorldGen
 	// claim is the only thing a caller could get wrong.
 	// SrcDescBase / ChunkMaskBase (stack-claim): a fused member's slice of the
 	// SHARED batch scratch -- chunkIndex * bricks-per-chunk descriptors,
-	// chunkIndex * 2 mask dwords. 0/0 on the classic single-chunk path, where
-	// the whole scratch is the chunk's; the word-copy source prefix travels in
-	// the claim itself (spare pair), not here.
+	// chunkIndex * 2 mask dwords (BOTH element bases). 0/0 on the classic
+	// single-chunk path, where the whole scratch is the chunk's; the
+	// word-copy source prefix travels in the claim itself (spare pair), not
+	// here.
+	// SrcWordsOccBase / SrcWordsMatBase (P3 Pack stage, stage-6 audit): the
+	// same values the claim folded into its spare pair -- the pack arenas'
+	// per-record slice bases. The desc pass subtracts them back out of the
+	// rebase term (pack descs are CHUNK-relative) and the record pass adds
+	// the occ one to its allSolid reads (the arena is shared, the offsets
+	// are not). 0/0 on the classic and stack paths, byte-identical there.
 	void AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
 	                                  const FBrickPoolAllocBuffers& Buffers,
 	                                  FRDGBufferRef Claim,
@@ -608,7 +622,8 @@ namespace VoxelGpuWorldGen
 	                                  uint32 RingLevel, const FIntVector& OriginVoxel,
 	                                  const FVoxelBrickChunkShading& Shading,
 	                                  uint32 OccWorstWords, uint32 MatWorstWords,
-	                                  uint32 SrcDescBase = 0, uint32 ChunkMaskBase = 0);
+	                                  uint32 SrcDescBase = 0, uint32 ChunkMaskBase = 0,
+	                                  uint32 SrcWordsOccBase = 0, uint32 SrcWordsMatBase = 0);
 
 	// Eviction without a round trip: one thread per slot reads the side table,
 	// pushes the ranges onto their class stacks, clears the bitmap, zeroes the

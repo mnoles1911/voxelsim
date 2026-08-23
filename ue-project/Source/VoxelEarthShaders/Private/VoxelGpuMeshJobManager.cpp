@@ -3472,10 +3472,19 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 							uint32(FMath::Clamp(Job->BrickKey.Level, 0, 15)),
 							Job->BrickOriginVoxel, Job->BrickShading,
 							BrickGraph.Sizes.BrickOccWordsMax, BrickGraph.Sizes.BrickMatWordsMax,
-							// SrcDescBase is a BRICK index; ChunkMaskBase a
-							// CHUNK index (the kernel multiplies by 2).
+							// Both ELEMENT bases -- desc a BRICK index, mask a
+							// DWORD index (SliceIndex * 2, exactly as the
+							// stack path passes C * 2). This used to divide
+							// the mask base by 2 on a claim the kernel never
+							// multiplied back, so every slice > 0 record read
+							// its L1 masks from the wrong elements -- fixed
+							// 2026-08-23 (stage-6 audit), with the two word
+							// bases below closing the desc-rebase and
+							// allSolid halves of the same seam.
 							BrickGraph.BrickDescReadBase,
-							BrickGraph.ChunkMaskReadBase / 2u);
+							BrickGraph.ChunkMaskReadBase,
+							BrickGraph.BrickOccSrcBase,
+							BrickGraph.BrickMatSrcBase);
 					}
 					else
 					{
