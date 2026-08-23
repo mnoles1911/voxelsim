@@ -4201,6 +4201,95 @@ double ColdSettleProgressSec()
 	return Sec;
 }
 
+// -VoxelRecomputeDutyPct=N: a ceiling on the share of wall time
+// RecomputeDesiredSet is allowed to occupy.  0 = off = the control arm, byte
+// for byte.  Bare -VoxelRecomputeDutyPct means 25.
+//
+// THE DEFECT, measured 2026-08-23 across one binary and one flight varying
+// only -VoxelPerfSpeed (docs/measurements/speed-tail-2026-08-23.txt, and the
+// counters named there are all pre-existing):
+//
+//     speed    p50     p95     recompute calls/2s   ms per call   share of wall
+//      30     9.71   17.06           12.5              25.91          16%
+//      60    11.16   38.94           54.7              22.07          60%
+//     120     9.94   47.36           47.8              29.90          71%
+//
+// ** ms PER CALL IS FLAT AND THE CALL COUNT IS WHAT MOVES. **  That is the
+// entire justification for a rate bound rather than an optimisation.  The
+// recompute is triggered by a LEVEL-0 chunk crossing -- 3.2 m -- so at 120 m/s
+// it is a 37.5 Hz timer on a 25-30 ms function.  The 3.2 m trigger was sized
+// for walking speed; nothing about it was ever a statement that the desired
+// set needs re-deriving 24 times a second.
+//
+// AND DEFERRING COSTS NOTHING IN WORK.  The per-level entry scans are already
+// gated on that level's OWN chunk crossing and enumerate a disc, not a
+// crescent: a call that runs after 12.8 m of travel walks exactly the same
+// cells as one that runs after 3.2 m.  The flat ms/call above is that fact
+// measured -- a 4x speed range moved per-call cost by 15%.  So halving the
+// call rate halves the cost and loses only admission GRANULARITY, not
+// admission WORK.  This is the property that separates a rate bound here from
+// a rate bound on something whose cost accrues per metre; do not port it to
+// such a stage without re-measuring ms/call first.
+//
+// SELF-CALIBRATING, DELIBERATELY, rather than a fixed interval in ms: the
+// bound is expressed in the same unit as the diagnosis (share of wall), so at
+// 30 m/s -- where the natural period is 160 ms against a 25.9 ms call, i.e.
+// 16% duty -- it is under any sane ceiling and NEVER FIRES.  The switch is a
+// no-op at the speed that already works and bites only where the defect is.
+// A fixed ms interval would have to be re-tuned per speed and would silently
+// throttle the 30 m/s arm.
+//
+// READINGS (the "Voxel recompute rate bound" line, printed only under the
+// switch so old-leg greps stay clean):
+//   HEALTHY  defer= > 0 at speed, calls/2s down, recompute share of wall at
+//            roughly the requested pct, p95 down, p50 UNCHANGED.
+//   FAILING  defer=0 with the switch on -- the bound never engaged and any
+//            p95 change in the leg came from something else.  This is the
+//            reading that makes the feature falsifiable and it is the one
+//            nine features tonight could not produce.
+//   FAILING  maxHeldMs climbing into the hundreds -- admission latency has
+//            been traded away, and per-ring residency and `holes` are where
+//            that shows up.  Judge on per-ring residency, never aggregate
+//            throughput.
+//   FAILING  p50 rises -- the deferred work did not disappear, it moved into
+//            frames that were previously clean, and the premise above (cost
+//            is per call, not per metre) is wrong for this build.
+//
+// HOW MUCH OF THE GATE THIS CAN CLOSE ON ITS OWN -- stated in advance so a
+// partial result is not read as a dead feature.  p95 is the 95th percentile
+// FRAME, so it falls to the no-recompute baseline only once recompute frames
+// are under 5% of frames.  At 120 m/s today that is 23.9 calls/s against
+// ~63 fps = 38% of frames.  At pct=25 the bound gives 8.4 calls/s, and the
+// frame rate rises as the recompute stops eating the thread, so roughly 9-10%
+// of frames -- still above the 5% line.  EXPECT p95 to fall from 47 ms to the
+// high twenties, NOT to the 17 ms of the 30 m/s arm.  The pct that would
+// reach 5% is ~12, and 12 is below the 16% duty the 30 m/s arm already runs
+// at, so it would throttle the speed that already works: this knob cannot
+// close the whole gap and must not be turned down until it does.
+//
+// The rest of the gap is per-call COST, which this switch does not touch and
+// which two other levers do -- shrinking the admission cap so the
+// admit/truncate churn stops (-VoxelAdmissionCapDrainSec down, untested
+// direction) and -VoxelIncrementalAdmission so the entry scan stops walking
+// the full disc.  All three are orthogonal; measure them apart, then together.
+// docs/measurements/speed-tail-2026-08-23.txt section 7 has the order.
+int32 RecomputeDutyPct()
+{
+	static const int32 Pct = []
+	{
+		int32 Value = 0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRecomputeDutyPct="), Value))
+		{
+			// 1% would stall admission outright and 100% is the control arm
+			// with extra bookkeeping; clamp to the band where the knob means
+			// something.
+			return FMath::Clamp(Value, 5, 100);
+		}
+		return FParse::Param(FCommandLine::Get(), TEXT("VoxelRecomputeDutyPct")) ? 25 : 0;
+	}();
+	return Pct;
+}
+
 double ViewBiasStrength()
 {
 	static const double K = []
@@ -7533,6 +7622,71 @@ struct FVoxelWorldImpl
 	//   ema    = tracking drain             max   = ceiling clamped (the bound decided)
 	const TCHAR* EffectiveCapSrc = TEXT("static");
 
+	// --- -VoxelRecomputeDutyPct state (see VoxelStreamAdmission::RecomputeDutyPct)
+	//
+	// The bound needs two things: when the last recompute ENDED, and what a
+	// recompute currently costs.  Cost is an EMA rather than the last sample
+	// because the distribution has a long tail (mean 29.9 ms, worst call in the
+	// 120 m/s leg 109.8 ms) and keying the next permitted call off a single
+	// outlier would lock admission out for a third of a second on a fluke.
+	// Alpha 0.25: four calls to substantially re-learn, which at 24 calls/s is
+	// well inside one log window, so a genuine regime change (a teleport, a
+	// ring coming online) is tracked, not averaged away.
+	double LastRecomputeEndSeconds = -1.0; // <0 = no recompute yet; the first is never gated
+	double RecomputeCostEMASec = 0.0;
+	double RecomputeHeldSinceSeconds = -1.0; // when the currently-blocked trigger first wanted to run
+	// Proof of traffic, reset per log window. defer= is the counter that makes
+	// this switch falsifiable: 0 at speed with the switch on means the bound
+	// never engaged and nothing in the leg can be attributed to it.
+	int64 RecomputeDeferralsSinceLog = 0;
+	double MaxRecomputeHeldMs = 0.0; // worst admission latency the bound imposed
+
+	// Returns true if a WANTED recompute may run this tick. Switch off returns
+	// true unconditionally and touches no state -- byte-identical control.
+	bool AllowRateBoundedRecompute()
+	{
+		const int32 Pct = VoxelStreamAdmission::RecomputeDutyPct();
+		if (Pct <= 0 || LastRecomputeEndSeconds < 0.0 || RecomputeCostEMASec <= 0.0)
+		{
+			return true; // off, or nothing measured yet to bound against
+		}
+		const double Now = FPlatformTime::Seconds();
+		// duty = cost / (cost + gap)  ->  gap = cost x (100/pct - 1).
+		// At pct=25 and cost 29.9 ms that is an 89.7 ms gap, a 119.6 ms period,
+		// 8.4 calls/s against the 23.9 measured -- and at 30 m/s the natural
+		// period is already 160 ms, so the gate never closes there.
+		const double RequiredGapSec = RecomputeCostEMASec * (100.0 / double(Pct) - 1.0);
+		if (Now - LastRecomputeEndSeconds >= RequiredGapSec)
+		{
+			if (RecomputeHeldSinceSeconds >= 0.0)
+			{
+				MaxRecomputeHeldMs =
+					FMath::Max(MaxRecomputeHeldMs, (Now - RecomputeHeldSinceSeconds) * 1000.0);
+				RecomputeHeldSinceSeconds = -1.0;
+			}
+			return true;
+		}
+		// Held. Stamp the FIRST tick of this hold so maxHeldMs measures the
+		// latency the bound actually imposed on one trigger, not the gap
+		// between two calls -- those differ whenever several ticks in a row
+		// want a recompute, which at speed is most of them.
+		if (RecomputeHeldSinceSeconds < 0.0)
+		{
+			RecomputeHeldSinceSeconds = Now;
+		}
+		++RecomputeDeferralsSinceLog;
+		return false;
+	}
+
+	// Called immediately after a recompute returns, with its measured cost.
+	void NoteRecomputeRan(double CostMs)
+	{
+		LastRecomputeEndSeconds = FPlatformTime::Seconds();
+		const double CostSec = FMath::Max(0.0, CostMs) / 1000.0;
+		RecomputeCostEMASec = (RecomputeCostEMASec <= 0.0) ? CostSec
+		                                                   : RecomputeCostEMASec + 0.25 * (CostSec - RecomputeCostEMASec);
+	}
+
 	void UpdateEffectivePendingJobCap()
 	{
 		const int32 StaticCap = VoxelStreamAdmission::GetPendingJobCap();
@@ -8722,8 +8876,43 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	{
 		bAdmissionRefill = true;
 	}
-	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y ||
-	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill)
+	// -VoxelRecomputeDutyPct (see the accessor for the measurement and the
+	// failing readings). Split into WANTED and URGENT so the rate bound can
+	// hold back the two triggers that fire at speed -- the level-0 chunk
+	// crossing and the refill -- without ever holding back the two that
+	// change the desired set QUALITATIVELY rather than by a margin. A first
+	// scan has no predecessor to be stale against, and an underground
+	// transition swaps the whole Z-span rule; delaying either is a
+	// correctness question, not a latency one.
+	//
+	// The gate is on the WHOLE block, not on the RecomputeDesiredSet call
+	// alone: the block also clears bHasRecomputedLevel and arms
+	// bLevelRefillRescan, and setting those without consuming them would
+	// leave a refill cause attributed to a later, unrelated scan. Held
+	// triggers are not lost -- LastAnchorChunk is only stamped inside the
+	// block, and bAdmissionRefill is rebuilt from scratch every tick, so both
+	// re-arm on the next tick and fire as soon as the bound opens.
+	//
+	// WHAT ELSE RIDES ON THIS CADENCE, because a rate bound delays all of it
+	// and this is where somebody will come looking:
+	//   * the fine-tier residency tick (fineMs -- 1.3 ms per 2 s window at
+	//     120 m/s, so cheap, but a delayed tile load is a delayed tile load),
+	//   * PruneFootprintZRangeCache and FlushAbsentMarks (the recompute's
+	//     "residual" bucket, measured effectively zero),
+	//   * the T4-2 GPU residency delta, which is consumed only inside
+	//     RecomputeDesiredSet. A held tick leaves it staged and
+	//     HasActionableDelta() keeps bAdmissionRefill armed, so it is delayed,
+	//     never dropped -- but mode 2 adds readback latency on top of the
+	//     bound, so re-measure the bound's held time before running the two
+	//     together.
+	// None of these is a correctness hazard at the tens-of-milliseconds the
+	// bound imposes; all of them are latency, and maxHeldMs is the number that
+	// says how much.
+	const bool bRecomputeWanted = !bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X ||
+	                              AnchorChunk.Y != LastAnchorChunk.Y || bUndergroundChanged ||
+	                              (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill;
+	const bool bRecomputeUrgent = !bHasRecomputed || bUndergroundChanged;
+	if (bRecomputeWanted && (bRecomputeUrgent || AllowRateBoundedRecompute()))
 	{
 		if (bAdmissionRefill)
 		{
@@ -8781,6 +8970,12 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		{
 			RecomputeDesiredSet(Anchor);
 		}
+		// -VoxelRecomputeDutyPct: feed the bound what this call actually cost.
+		// ThisFrameRecomputeMs is stamped at the END of RecomputeDesiredSet and
+		// zeroed once per tick, and there is exactly one recompute per tick, so
+		// it is this call's cost and nothing else's. No-op with the switch off
+		// beyond two stores the gate never reads.
+		NoteRecomputeRan(ThisFrameRecomputeMs);
 		LastAnchorChunk = AnchorChunk;
 		bHasRecomputed = true;
 	}
@@ -10383,6 +10578,32 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("entryMs %s"),
 	       AccumRecomputeMs, AccumFineResidencyMs, AccumExitScanMs, AccumQueueFilterMs, AccumSortMs,
 	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.1f"), L, AccumLevelEntryMs[L]); }));
+	// -VoxelRecomputeDutyPct proof of traffic (see the accessor's READINGS).
+	// Under the switch only, so old-leg greps stay clean -- and an armed leg
+	// with no line here ran no ticks at all.
+	//
+	// duty= is the number the switch is ABOUT, computed against the REAL
+	// window (ThisLogWindowSeconds), never the nominal interval: the sweep
+	// this feature was diagnosed from ran -VoxelPerfLogInterval=2 while the
+	// neighbouring tick-budget line still divides by a hard-coded 5000 ms, so
+	// a duty read off that line would be 2.5x wrong and would look like the
+	// bound overshooting.
+	//
+	// defer=0 IS THE FAILING READING and the reason this line exists: it says
+	// the bound never engaged, so nothing else in the leg may be attributed to
+	// it. calls= on the max line above is the other half -- defer= high with
+	// calls= unmoved would mean the deferrals are landing on ticks that had no
+	// trigger anyway, i.e. the counter is measuring nothing.
+	if (VoxelStreamAdmission::RecomputeDutyPct() > 0)
+	{
+		const double WindowRealMs = double(ThisLogWindowSeconds) * 1000.0;
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel recompute rate bound (%.1fs window): pct=%d defer=%lld maxHeldMs=%.1f ")
+		       TEXT("costEMAms=%.2f duty=%.1f%%"),
+		       ThisLogWindowSeconds, VoxelStreamAdmission::RecomputeDutyPct(),
+		       (long long)RecomputeDeferralsSinceLog, MaxRecomputeHeldMs, RecomputeCostEMASec * 1000.0,
+		       WindowRealMs > 0.0 ? 100.0 * AccumRecomputeMs / WindowRealMs : 0.0);
+	}
 	// Incremental admission traffic (see LevelIncrScansSinceLog's doc
 	// comment). Only under the switch, so old-leg greps stay clean. Read it
 	// TOGETHER with the "scans" field of the max line above: incr close to
@@ -12079,6 +12300,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// describe the same set of calls.
 	AccumFineResidencyMs = AccumExitScanMs = AccumQueueFilterMs = AccumSortMs = 0.0;
 	RecomputeCalls = 0;
+	// -VoxelRecomputeDutyPct window counters, reset here with the recompute
+	// stage sums they must be read against. RecomputeCostEMASec is NOT reset:
+	// it is the controller's running state, not a window statistic, and
+	// clearing it every window would re-open the bound for one call each time.
+	RecomputeDeferralsSinceLog = 0;
+	MaxRecomputeHeldMs = 0.0;
 	FramesOver60FpsBarSinceLog = 0;
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
