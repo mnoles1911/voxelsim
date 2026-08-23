@@ -358,11 +358,27 @@ namespace VoxelDebug
 
 	// voxel.Stream.DispatchAfterDrain: run a second DispatchJobs() pass after
 	// DrainGameThreadMesh (i.e. once slots freed by this frame's DrainResults
-	// are visible), instead of refilling only once per frame. Default 1. See
-	// the cvar's source comment for the ~9% worker-utilisation measurement
-	// this complements (voxel.Stream.JobsInFlightPerCore=8 widens the buffer;
-	// this shortens the once-per-frame refill cadence that starves it).
+	// are visible), instead of refilling only once per frame. Default 0 --
+	// this comment and the call-site one both said "default 1" while the cvar
+	// registration shipped 0; the registration is the authority and its
+	// default-off verdict was a measured A/B (2026-07-27). See the cvar's
+	// source comment, including the 2026-08-23 re-derivation: with jobs at
+	// 0.34-0.6 ms the once-per-frame refill is again the CPU arm's ceiling
+	// (~96 launches x 48.3 ticks/s = 4,637/s against a 6,200 floor), so this
+	// lever is live again -- measure, don't assume, via the
+	// 'Voxel dispatch loop:' exitCap/exitEmpty counters.
 	VOXELEARTH_API int32 GetStreamDispatchAfterDrain();
+
+	// voxel.Stream.RingFloorCpuOnly: ring slot floors count CPU-arm jobs only,
+	// and a floor-deficit pick dispatches on the CPU worker rather than
+	// offering the GPU fork. Default 0 (floors test the blended CPU+GPU
+	// count -- today's behaviour, under which a ~2.3 s GPU round trip holds a
+	// ring's floor slot and starves R2-R5 to 1-2 dispatches per 5 s). See the
+	// cvar's source comment for the measured mechanism and the paired
+	// worked/did-not-work gates. -VoxelRingFloorCpuOnly=<0|1> on the command
+	// line wins over the cvar (the -VoxelAdmissionBandSkip idiom: legs must
+	// not run their first cold-fill seconds on the other arm).
+	VOXELEARTH_API int32 GetStreamRingFloorCpuOnly();
 
 	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
 	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
