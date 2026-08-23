@@ -100,12 +100,16 @@ Stage split, ms per 2 s window, windows 50..100 (the parts sum to the total):
 3. WHAT THE TIME IS ACTUALLY SPENT ON: ADMIT/TRUNCATE CHURN
 --------------------------------------------------------------------------------
 
-"Voxel admission (5s window)", mid-flight window:
+"Voxel admission (5s window)", aggregated over ALL 51 flight windows
+(50..100), not a single window -- the churn is a steady state, not a spike:
 
-    speed     cap     capSrc   cutoffM   rejected     dropped    drainEMA
-     30     32,768     max       -1             0           0     7,671
-     60     32,768     max       67     1,521,978     143,870     8,139
-    120     32,768     max       67     1,634,858     498,025     6,425
+    speed   mean cap   capSrc over 51 windows   mean drainEMA   mean dropped
+     30      32,768    max x51                      7,820              0
+     60      32,448    max x50, ema x1              7,528        206,479
+    120      32,768    max x51                      6,203        470,376
+
+dropped= is ZERO IN EVERY ONE of the 51 windows at 30 m/s and never below six
+figures at 120.  This is a phase change, not a gradient.
 
 `dropped=` is the counter this file's own comment (AdmissionCapMax, and again
 at LeadHorizonSec) names as THE NUMBER THAT MUST BE WATCHED, with the failing
@@ -174,6 +178,23 @@ crossing.  ** THE SWEEP WAS THREE IDENTICAL ARMS. **  It read
 times.  The only untested direction is DOWN, and down is the direction this
 churn analysis points.
 
+AND IT IS WORSE THAN THAT.  Every -VoxelAdmissionCapDrainSec value ever put on
+a command line, across every log in Saved/:
+
+    drainSec=4  : 6 legs   (b3b-off/on, cut-drain, p3-a/b/c)
+    drainSec=8  : 23 legs
+    drainSec=16 : 1 leg
+    drainSec=32 : 1 leg
+
+All six drainSec=4 legs carry NO -VoxelPerfSpeed, i.e. they ran at 30 m/s --
+the speed at which dropped= is zero in every window and the cap never binds at
+all.  They are also from a build predating the instrument: their admission
+line has no drainEMA=/capSrc= columns and reads cap=2048 throughout, the
+static floor.  So the drain-sized cap has NEVER been swept at speed, on any
+build that could report which bound decided.  The one arm that could have
+distinguished the ceiling from the controller was run six times, at the one
+speed where neither is in force.
+
 --------------------------------------------------------------------------------
 5. THE LEAD-HORIZON FLOOR IS NOT THE CAUSE (it is a ~8% aggravator)
 --------------------------------------------------------------------------------
@@ -206,9 +227,12 @@ authored, default-off lever that this sweep never armed.
 All at -VoxelPerfSpeed=120, against spd120.log as control.  Judge on per-ring
 residency, never aggregate throughput.
 
-(1) NO CODE AT ALL -- shrink the cap.  -VoxelAdmissionCapDrainSec=1 (cap
-    becomes ~6,400 from the EMA, capSrc=ema) and =2 (~12,800).  This is the
-    untested half of section 4's sweep.
+(1) NO CODE AT ALL -- shrink the cap.  -VoxelAdmissionCapDrainSec=1 and =2.
+    At the measured drainEMA of 6,203/s those give Wanted = 6,203 and 12,406,
+    both inside [StaticCap 2048, ceiling 32,768], so capSrc= must read `ema`
+    and not `max`.  ** capSrc=max on either rung means the arm did not take
+    and the leg measured the control twice ** -- check it before reading
+    anything else.  This is the untested half of section 4's sweep.
       PREDICTED: dropped= collapses toward 0, pendingJob falls ~5x, sortMs
       falls ~10x, stale% falls from 28.7%, recompute share falls from 71%,
       p95 falls.
@@ -224,10 +248,21 @@ residency, never aggregate throughput.
       FAILING READING: incr ~0, or incr high with entryMs unmoved -- the
       switch is on and doing nothing.
 
-(3) The rate bound authored alongside this note (-VoxelRecomputeDutyPct),
+(3) The rate bound authored alongside this note (-VoxelRecomputeDutyPct=25),
     which attacks the call COUNT rather than the per-call cost, and is
     therefore orthogonal to (1) and (2).  Its own readings are on the
-    accessor's comment.
+    accessor's comment, including the magnitude it can and cannot deliver:
+    p95 47 -> high twenties, NOT to the 17 ms of the 30 m/s arm, because p95
+    is a percentile over FRAMES and 8.4 calls/s is still ~9% of them.  Do not
+    read a partial result as a dead feature; read defer= first.
+
+    NOTE ON COMPOSING (1) AND (3): (1) makes each call cheaper, and the rate
+    bound is expressed as a duty cycle, so a cheaper call automatically buys
+    MORE calls at the same duty.  The two do not fight, and (1)+(3) together
+    is the arm that should clear the gate -- but run them apart first, because
+    a duty bound sitting on top of an already-cheap recompute may never engage
+    (defer=0) and would then be carried forward as "measured, works" when it
+    was never tested.
 
 --------------------------------------------------------------------------------
 8. WHAT THIS NOTE DOES NOT CLAIM
