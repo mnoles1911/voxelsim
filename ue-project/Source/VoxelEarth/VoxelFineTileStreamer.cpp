@@ -876,6 +876,59 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 	// the surrounding code refuses to make about tile loads.
 	const auto NamespaceNote = [this, Tile]() -> FString { return DiagnoseNamespace(Tile); };
 
+	// HOW FAR IS THIS LEAK FROM THE PLAYER? The one question that separates the
+	// two causes, and until now the log could not be asked it.
+	//
+	// MEASURED 2026-08-23, the owner's PIE session. 10,814 leaks, into exactly
+	// four tiles -- (0,0), (0,-1), (-1,0), (-1,-1) -- which are the four that
+	// meet at the WORLD ORIGIN. The streaming anchor was in tile (-4,-4) and
+	// never left it (it moved 1.2 km all session; a tile is 15.36 km). So the
+	// leaks were 4 tiles, ~61 km, away from any ground the player could see.
+	// Residency was correct the whole time. The actual cause was
+	// AVoxelWaterSheetActor's FIRST lake-sheet gather running at CamUU (0,0) --
+	// before the pawn had a position -- and reading 10,814 elevations out of
+	// ground nobody has ever baked (only 15 fine tiles exist, all in the -3..-15
+	// band). The line this function printed said "move the camera to a baked
+	// tile", which was the wrong advice about the wrong place, and the session
+	// was filed as a streaming regression on the strength of it.
+	//
+	// HOW TO READ THE DISTANCE (Chebyshev, in coarse tiles):
+	//   0 or 1  -- the anchor is standing on, or one dilated footprint away
+	//              from, unbaked ground. A genuine coverage gap: bake it, or
+	//              raise -VoxelFineTileRingRadius so the neighbour arrives
+	//              before the player does.
+	//   >1      -- SOME CALLER QUERIED TERRAIN THE PLAYER IS NOWHERE NEAR. The
+	//              bake is not the problem, the ring is not the problem, and no
+	//              radius would have prevented it. Find the caller.
+	//   never   -- TickResidencyAndEviction has not run at all. That is its own
+	//              bug and it is not a coverage question.
+	//
+	// A LAMBDA, for the same reason NamespaceNote above is one: the non-fatal
+	// path reaches here on EVERY leaking query and the audit that motivated this
+	// gate measured 18.7 million of them in one run. This note is only two
+	// subtractions, but it is also an FString::Printf, and 18.7 million string
+	// allocations on the funnel is the same mistake in a smaller size.
+	const auto AnchorNote = [this, Tile]() -> FString
+	{
+		if (LastRingCentre_.x == INT32_MIN && LastRingCentre_.y == INT32_MIN)
+		{
+			return TEXT(" The residency tick has NEVER RUN (no ring centre), so nothing has been prefetched for any ")
+			       TEXT("position -- this is a missing TickResidencyAndEviction call, not a coverage gap.");
+		}
+		const int64 DistX = FMath::Abs(int64(Tile.x) - int64(LastRingCentre_.x));
+		const int64 DistY = FMath::Abs(int64(Tile.y) - int64(LastRingCentre_.y));
+		const int64 Dist = FMath::Max(DistX, DistY);
+		return FString::Printf(
+			TEXT(" The streaming anchor is in tile (%d,%d), so this query is %lld tile(s) (~%lld km) away from the ")
+			TEXT("player. %s"),
+			LastRingCentre_.x, LastRingCentre_.y, (long long)Dist, (long long)(Dist * kTileFootprintMm / 1000000),
+			Dist > 1
+				? TEXT("THAT IS TOO FAR TO BE A COVERAGE GAP: some caller is sampling terrain the player is nowhere ")
+				  TEXT("near, and no ring radius or bake would prevent it. Find the caller before baking anything.")
+				: TEXT("That is adjacent to the player, so it IS a coverage question: bake the tile, or raise ")
+				  TEXT("-VoxelFineTileRingRadius so the neighbour is resident before the player reaches it."));
+	};
+
 	FString RefusalNote;
 	if (auto FailIt = LoadFailures_.find(TileHash(Tile)); FailIt != LoadFailures_.end())
 	{
@@ -894,13 +947,13 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 		       TEXT("and on the fine tier sea level is not a fallback -- it is terrain no other client computes, so this ")
 		       TEXT("run's output would not be reproducible. Stopping instead of producing an artifact that looks fine. ")
 		       TEXT("Leaks so far=%llu, blocking loads=%llu, resident=%llu tile(s), absentOnDisk=%llu, corrupt=%llu, ")
-		       TEXT("identityMismatch=%llu, refusedTiles=%llu.%s%s Pass -VoxelFineTileGateFatal=0 to downgrade ")
+		       TEXT("identityMismatch=%llu, refusedTiles=%llu.%s%s%s Pass -VoxelFineTileGateFatal=0 to downgrade ")
 		       TEXT("this to an Error."),
 		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
 		       (unsigned long long)BlockingLoads_.load(std::memory_order_relaxed), (unsigned long long)Sampler_.tileCount(),
 		       (unsigned long long)MissingFileLoads_, (unsigned long long)CorruptLoads_,
-		       (unsigned long long)IdentityMismatches_, (unsigned long long)GivenUpTiles_, *RefusalNote,
-		       *NamespaceNote());
+		       (unsigned long long)IdentityMismatches_, (unsigned long long)GivenUpTiles_, *AnchorNote(),
+		       *RefusalNote, *NamespaceNote());
 		// UE_LOG(Fatal) does not return. The sea-level answer below is
 		// unreachable here and exists only for the non-fatal path.
 	}
@@ -911,9 +964,9 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 		       TEXT("FINE TIER GATE LEAK: elevation query at fine pixel (%lld,%lld) landed in NON-RESIDENT tile (%d,%d) ")
 		       TEXT("(%s) and is being answered with SEA LEVEL. That is a desync, not a fallback: this client's terrain, ")
 		       TEXT("collision and edits here will not match a client that has the tile. Logged once per tile; total ")
-		       TEXT("leaks=%llu. Thread=%s. Unattended runs stop on this instead (SetLeakIsFatal).%s%s"),
+		       TEXT("leaks=%llu. Thread=%s. Unattended runs stop on this instead (SetLeakIsFatal).%s%s%s"),
 		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
-		       IsInGameThread() ? TEXT("game") : TEXT("worker"), *RefusalNote, *NamespaceNote());
+		       IsInGameThread() ? TEXT("game") : TEXT("worker"), *AnchorNote(), *RefusalNote, *NamespaceNote());
 	}
 
 	// The sampler's own missingTileQueries bump happens inside this call, which
@@ -939,6 +992,14 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 		// What DOES earn a fresh attempt is the file itself changing; see
 		// EnsureTileResident_Locked.
 		KnownMissing_.clear();
+		// Counted BEFORE the assignment and only when a centre already existed,
+		// so ringMoves==0 reads as "the anchor has not crossed a tile boundary"
+		// and not as "the tick has never run" -- the sentinel centre says the
+		// second thing, and the two needed separating. See the header.
+		if (!(LastRingCentre_.x == INT32_MIN && LastRingCentre_.y == INT32_MIN))
+		{
+			++RingCentreMoves_;
+		}
 		LastRingCentre_ = PlayerCoarseTile;
 	}
 
@@ -996,4 +1057,23 @@ uint64 FVoxelFineTileStreamer::ResidentTileCount() const
 {
 	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
 	return uint64(Sampler_.tileCount());
+}
+
+vxc::TileCoord FVoxelFineTileStreamer::RingCentreTile() const
+{
+	// Shared lock for consistency with the other diagnostics rather than out of
+	// necessity: today the only writer is TickResidencyAndEviction on the game
+	// thread and the only reader is the 5 s perf log, also on the game thread.
+	// It costs one uncontended shared acquire every five seconds, and it means
+	// this accessor does not become the exception the day something else reads
+	// it. The sentinel (INT32_MIN, INT32_MIN) is returned as-is -- the caller
+	// must be able to see "never ticked", see the header.
+	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	return LastRingCentre_;
+}
+
+uint64 FVoxelFineTileStreamer::RingCentreMovesSinceStart() const
+{
+	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	return RingCentreMoves_;
 }
