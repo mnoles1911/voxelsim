@@ -5303,6 +5303,53 @@ struct FVoxelWorldImpl
 	// slot floor against.
 	int32 LevelJobsInFlight[VoxelCoords::kNumLevels] = {};
 
+	// THE SAME POPULATION, SPLIT BY WHO IS MESHING IT -- because the blended
+	// count above mixes two units. A CPU slot turns over in 0.34-0.6 ms
+	// (worker p50, all levels, 2026-08-23); a GPU slot is a round trip
+	// measured at p50 2,281-2,348 ms. One in-flight GPU job satisfies its
+	// ring's slot floor for seconds at a time, which is how R2-R5 measured
+	// 1-2 dispatches per 5 s against 245-347 pending while the floor deficit
+	// never fired (see CVarVoxelStreamRingFloorCpuOnly in VoxelDebug.cpp for
+	// the full mechanism). These arrays exist (a) so the ring-floor test can
+	// count CPU occupancy alone under voxel.Stream.RingFloorCpuOnly, and
+	// (b) so the 'Voxel ring split:' log line can show each ring's pending /
+	// dispatched / in-flight per arm -- the starvation above was invisible
+	// for weeks because the blended number looked healthy.
+	//
+	// Bookkeeping contract, kept deliberately parallel to the blended array:
+	// game thread only. Incremented in DispatchJobs at the point the fork
+	// RESOLVES (GPU: SubmitGpuMeshJob returned true; CPU: the worker task is
+	// about to launch) -- unlike the blended array, which increments before
+	// the fork decides. Decremented where the blended array is decremented:
+	// DrainResults for every drained result (routed on Result.bFromGpuMesh),
+	// and OnGpuMeshJobComplete's failure-requeue path (which produces no
+	// result; GPU side only). Speculative jobs touch neither, same as they
+	// never touch JobsInFlightCounter. Invariant, checked at log time:
+	// LevelCpuJobsInFlight[L] + LevelGpuJobsInFlight[L] == LevelJobsInFlight[L]
+	// for every L; the 'Voxel ring split:' line prints a SPLIT-DRIFT warning
+	// when it fails, because a silent drift here is exactly the class of bug
+	// (a join computed instead of checked) this project keeps paying for.
+	int32 LevelCpuJobsInFlight[VoxelCoords::kNumLevels] = {};
+	int32 LevelGpuJobsInFlight[VoxelCoords::kNumLevels] = {};
+
+	// CPU-arm jobs in flight, EXACT, as an atomic the worker decrements at the
+	// same moment it decrements JobsInFlightCounter (one line after its
+	// ResultsQueue.Enqueue). Instrumentation only -- no dispatch decision
+	// reads it. Exists because the loop's own budget expression,
+	// max(0, JobsInFlightCounter - GpuJobsPending.Num()), is a DERIVED number:
+	// exact for GPU demand jobs (they increment the counter and sit in the
+	// map, cancelling), but understated by the speculative population (in the
+	// map, never on the counter), so it reads CPU - spec and the clamp hides
+	// the negative. Verified 2026-08-23 that this understatement can only
+	// WIDEN dispatch (by at most SpeculativeMaxInFlight=16), never narrow it
+	// -- the blend is NOT why the workers starve -- but "verified by reading
+	// the subtraction" is how the last two instrument artifacts survived so
+	// long. This counter is the checked join: cpuInFlightExact= on the
+	// 'Voxel in-flight split:' line must reconcile with the derived
+	// cpuInFlight= + specPending= within worker-decrement jitter (<= 8, one
+	// per background worker).
+	FThreadSafeCounter CpuJobsInFlightCounter;
+
 	// True while the cap is holding work back (something was rejected or
 	// dropped by the two gates above). This is what makes the cap safe for a
 	// player who STOPS: RecomputeDesiredSet is triggered by anchor movement, so
@@ -5686,6 +5733,43 @@ struct FVoxelWorldImpl
 	// final log line alone.
 	int64 LevelJobsDispatchedSinceLog[VoxelCoords::kNumLevels] = {};
 	int64 LevelJobsDispatchedTotal[VoxelCoords::kNumLevels] = {};
+
+	// The dispatch split by ARM, per window -- companions to the blended
+	// since-log counter above and reset alongside it. GpuMeshDispatchedByLevel
+	// already counts the GPU side but is reset in the GPU fork's own log
+	// block, so it cannot be read against LevelJobsDispatchedSinceLog without
+	// window skew; these two reset with the ring lines and always sum to the
+	// blended counter. What they make legible: "R3 disp=2" was unreadable --
+	// two CPU jobs (0.4 ms each, ring healthy but rationed) and two GPU jobs
+	// (3.4 s each, ring floor-blocked all window) print identically on the
+	// blended line, and the difference is the entire coarse-ring starvation
+	// diagnosis.
+	int64 LevelCpuDispatchedSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelGpuDispatchedSinceLog[VoxelCoords::kNumLevels] = {};
+
+	// WHICH EXIT DispatchJobs' pop loop took, per window -- same shape as the
+	// DrainExit* counters above, added 2026-08-23 for the same reason: two
+	// readings of the pipeline were consistent with every number ever logged,
+	// and nothing recorded which loop exit actually fired.
+	//
+	// The loop has exactly two exits. exitEmpty: every ring queue was drained
+	// (the 'break' at "nothing pending in any ring"). exitCap: the while
+	// condition CpuJobsOutstanding() < MaxJobsInFlight went false. The
+	// competing readings: (a) "the loop drains every queue to empty each
+	// tick" -- true in the 2026-08-22 audit's configuration, where the GPU
+	// fork carried the load and CpuJobsOutstanding sat at 0; (b) "the cap now
+	// binds every tick and functions as a per-tick batch quota of ~96, which
+	// is the 4,342-chunks/s ceiling" -- what today's arithmetic says
+	// (measured 84.1 CPU launches/tick against cap 96 minus ~12 residual).
+	// Whichever of exitCap= / exitEmpty= dominates a mid-flight window on the
+	// 'Voxel dispatch loop:' line settles it. cpuLaunched/gpuForked per
+	// window complete the picture: cpuLaunched pinned near
+	// passes x (cap - residual) is the batch quota showing itself.
+	int64 DispatchPassesSinceLog = 0;
+	int64 DispatchExitCapSinceLog = 0;
+	int64 DispatchExitEmptySinceLog = 0;
+	int64 DispatchCpuLaunchedSinceLog = 0;
+	int64 DispatchGpuForkedSinceLog = 0;
 	int64 LevelZeroQuadTotal[VoxelCoords::kNumLevels] = {};
 	int64 LevelChunksLoadedTotal[VoxelCoords::kNumLevels] = {}; // component creations per level, cumulative
 	int64 ResultsDrainedSinceLog = 0;   // DrainResults: results dequeued (live + stale)
@@ -6852,12 +6936,19 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			T3 = FPlatformTime::Seconds();
 
 		// Second DispatchJobs() pass (voxel.Stream.DispatchAfterDrain, default
-		// 1) -- refills the slots DrainResults just freed IN THIS FRAME rather
-		// than leaving them idle until next frame's single dispatch. See
-		// CVarVoxelStreamDispatchAfterDrain's comment in VoxelDebug.cpp for the
-		// ~9% worker-utilisation measurement this addresses and how it
-		// complements JobsInFlightPerCore=8 (which widens the buffer but does
-		// not touch the once-per-frame cadence).
+		// 0 -- this comment said "default 1" while the cvar registration
+		// shipped 0; the registration is the authority and its off-default was
+		// itself a measured A/B, 2026-07-27) -- refills the slots DrainResults
+		// just freed IN THIS FRAME rather than leaving them idle until next
+		// frame's single dispatch. See CVarVoxelStreamDispatchAfterDrain's
+		// comment in VoxelDebug.cpp for the ~9% worker-utilisation measurement
+		// this addresses, how it complements JobsInFlightPerCore=8 (which
+		// widens the buffer but does not touch the once-per-frame cadence) --
+		// and the 2026-08-23 re-derivation: with worker jobs at 0.34-0.6 ms
+		// the once-per-frame cadence is again the CPU arm's arithmetic
+		// ceiling, so this lever is live again and the 'Voxel dispatch loop:'
+		// exitCap/exitEmpty counters are the instrument to run before and
+		// after flipping it.
 		//
 		// SLOT CHOICE: after DrainGameThreadMesh, before DrainUnloads -- not
 		// straight after DrainResults. Two reasons. First, DrainResults is what
@@ -7634,10 +7725,18 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			SpecPendingNow += Pair.Value.bSpeculative ? 1 : 0;
 		}
 		const int32 GpuPendingTotal = GpuJobsPending.Num();
+		// cpuInFlightExact= is the COUNTED CPU-arm population
+		// (CpuJobsInFlightCounter -- incremented at worker launch, decremented
+		// by the worker beside its JobsInFlightCounter decrement), against
+		// which the DERIVED cpuInFlight= to its left can finally be checked:
+		// derived = exact - specPending, up to worker-decrement jitter (<= 8).
+		// The derivation held by construction for months while meaning the
+		// wrong thing; this is the checked join.
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel in-flight split: cpuInFlight=%d gpuDemandPending=%d specPending=%d ")
+		       TEXT("Voxel in-flight split: cpuInFlight=%d cpuInFlightExact=%d gpuDemandPending=%d specPending=%d ")
 		       TEXT("(jobsInFlight=%d gpuPendingTotal=%d)"),
 		       JobsInFlightCounter.GetValue() - GpuPendingTotal,
+		       CpuJobsInFlightCounter.GetValue(),
 		       GpuPendingTotal - SpecPendingNow, SpecPendingNow,
 		       JobsInFlightCounter.GetValue(), GpuPendingTotal);
 	}
@@ -7778,9 +7877,68 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		                              (long long)LevelChunksLoadedTotal[L], (long long)LevelZeroQuadTotal[L]);
 	       }));
 
+	// The disp= number above, split by ARM, plus each arm's in-flight count at
+	// this instant -- the line that makes ring starvation attributable. A new
+	// line rather than a widened one, per the standing convention (older-leg
+	// greps must keep matching). Reading it: dispCpu/dispGpu are this 5 s
+	// window; inflight cpu/gpu are now-instant occupancy, and it is the GPU
+	// one that holds a ring's slot floor for a whole 2.3 s round trip under
+	// the default (blended) floor test. drift= appears only when the split
+	// arrays stop summing to the blended LevelJobsInFlight -- the checked-join
+	// alarm; it must never print on a healthy run.
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel ring split: %s"), *JoinPerLevel([&](int32 L)
+	       {
+		       const int32 Drift = LevelJobsInFlight[L] - (LevelCpuJobsInFlight[L] + LevelGpuJobsInFlight[L]);
+		       return FString::Printf(TEXT("R%d dispCpu=%lld dispGpu=%lld inFlightCpu=%d inFlightGpu=%d%s"), L,
+		                              (long long)LevelCpuDispatchedSinceLog[L], (long long)LevelGpuDispatchedSinceLog[L],
+		                              LevelCpuJobsInFlight[L], LevelGpuJobsInFlight[L],
+		                              Drift != 0 ? *FString::Printf(TEXT(" SPLIT-DRIFT=%d"), Drift) : TEXT(""));
+	       }));
+
+	// One line per starving ring, so nobody has to cross-read three per-level
+	// lines to see it. "Starving" = a real queue (>=64 pending, i.e. clearly
+	// above trickle) served fewer than 5 dispatches in a 5 s window -- the
+	// measured pathology was 1-2 against 245-347 pending, and a healthy ring
+	// at today's job costs clears hundreds, so the band between the thresholds
+	// is wide on both sides. The floor diagnosis is printed right on the line:
+	// when the ring's floor is fully occupied by GPU jobs, that occupancy is
+	// WHY the deficit pass never picked it (under the default blended test).
+	for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+	{
+		const int64 WindowDisp = LevelCpuDispatchedSinceLog[L] + LevelGpuDispatchedSinceLog[L];
+		const int32 Pending = PendingJobKeysByLevel[L].Num();
+		if (Pending >= 64 && WindowDisp < 5)
+		{
+			const int32* const Floors = VoxelStreamAdmission::GetRingSlotFloors();
+			const bool bFloorHeldByGpu =
+				Floors[L] > 0 && LevelGpuJobsInFlight[L] >= Floors[L] && LevelCpuJobsInFlight[L] == 0;
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel ring STARVED: R%d pending=%d dispCpu=%lld dispGpu=%lld inFlightCpu=%d inFlightGpu=%d floor=%d%s"),
+			       L, Pending,
+			       (long long)LevelCpuDispatchedSinceLog[L], (long long)LevelGpuDispatchedSinceLog[L],
+			       LevelCpuJobsInFlight[L], LevelGpuJobsInFlight[L], Floors[L],
+			       bFloorHeldByGpu ? TEXT(" (floor slot held by GPU round trip -- see voxel.Stream.RingFloorCpuOnly)")
+			                       : TEXT(""));
+		}
+	}
+
+	// Which exit the dispatch loop took, per window (see the DispatchExit*
+	// doc comment for the two competing throughput readings this settles).
+	// cpuLaunched pinned near passes x (cap - residual) with exitCap
+	// dominating is the per-tick batch quota showing itself; exitEmpty
+	// dominating with pendingJobs deep would refute that reading and indict
+	// admission/refill instead.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel dispatch loop (5s window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d"),
+	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
+	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
+	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue());
+
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
-	// against the zq= counts on the line above -- skip= is work that no longer
-	// happens at all, zq= is work that still happened and produced nothing.
+	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
+	// adjacent -- the ring split/starvation lines sit between) -- skip= is work
+	// that no longer happens at all, zq= is work that still happened and
+	// produced nothing.
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel sky skip: %s%s"),
 	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d skip=%lld"), L, (long long)LevelSkySkippedTotal[L]); }),
 	       VoxelSkyBand::GetVerifyEnabled() ? TEXT(" [VERIFY MODE: verdicts computed, jobs dispatched anyway]") : TEXT(""));
@@ -7799,6 +7957,17 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		V = 0;
 	}
+	// The split-arm dispatch counters reset with the blended one above so all
+	// three always describe the same window (GpuMeshDispatchedByLevel could
+	// not be reused for exactly this reason -- it resets in the GPU fork's own
+	// log block, on a different cadence).
+	for (int64& V : LevelCpuDispatchedSinceLog) { V = 0; }
+	for (int64& V : LevelGpuDispatchedSinceLog) { V = 0; }
+	DispatchPassesSinceLog = 0;
+	DispatchExitCapSinceLog = 0;
+	DispatchExitEmptySinceLog = 0;
+	DispatchCpuLaunchedSinceLog = 0;
+	DispatchGpuForkedSinceLog = 0;
 
 	// M2 wave 2 item 1 ("Cross-job mip caching"): per-level worker mesh-job
 	// ms (rolling-window p50/p95, LastPerfSnapshot -- refreshed at 1Hz
@@ -13219,6 +13388,14 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 				Rec->bJobInFlight = false;
 				Rec->bNoGpuRetry = true;
 				--LevelJobsInFlight[FMath::Clamp(Pending.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+				// Split-array mirror of the line above. GPU side by
+				// construction: only a job the fork accepted can reach this
+				// failure path, so the blended slot being released here was
+				// counted in LevelGpuJobsInFlight at submit. Clamped like the
+				// DrainResults decrement, so one miscount degrades one gauge
+				// instead of wedging a ring's floor negative forever.
+				LevelGpuJobsInFlight[FMath::Clamp(Pending.Key.Level, 0, VoxelCoords::kNumLevels - 1)] =
+					FMath::Max(0, LevelGpuJobsInFlight[FMath::Clamp(Pending.Key.Level, 0, VoxelCoords::kNumLevels - 1)] - 1);
 				JobsInFlightCounter.Decrement();
 				return;
 			}
@@ -13285,6 +13462,20 @@ void FVoxelWorldImpl::DispatchJobs()
 	// comment for the 24-vs-96 readout that fix removed).
 	const int32 MaxJobsInFlight = MaxJobsInFlightCap();
 	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
+	// voxel.Stream.RingFloorCpuOnly (default 0 = the blended behaviour below).
+	// Read once per call like every other gate in this loop; see the cvar's
+	// comment in VoxelDebug.cpp for the starvation mechanism and the paired
+	// gates. Two effects when ON, and they only work together: the floor
+	// deficit counts LevelCpuJobsInFlight instead of the blended array, and a
+	// floor-deficit pick skips the GPU fork -- without the second half a
+	// deficit pick that forked would leave CPU occupancy at zero, the same
+	// level would win the deficit again next iteration, and one ring could
+	// pump its queue into the fork until GpuMaxInFlight filled (at cold start,
+	// with the fork empty, that is up to 256 coarse jobs ahead of any R0
+	// demand). The blended count never had that hazard precisely because a
+	// fork raised it; counting CPU only removes the self-limit, so the
+	// dispatch arm has to be pinned instead.
+	const bool bFloorCpuOnly = VoxelDebug::GetStreamRingFloorCpuOnly() != 0;
 
 	// Cold-band throttle (see the block after the record lookup below). Hoisted:
 	// loop-invariant, and the check runs on every popped level-0 candidate.
@@ -13389,6 +13580,11 @@ void FVoxelWorldImpl::DispatchJobs()
 	};
 
 	const double DispatchLoopStart = FPlatformTime::Seconds();
+	// Which exit the loop takes this pass -- see the DispatchExit* counters'
+	// doc comment for the two competing readings this settles. The loop has
+	// exactly these two ways out; a third would need its own counter or the
+	// exitCap arithmetic (exitCap = passes - exitEmpty) silently lies.
+	bool bLoopExitedQueueEmpty = false;
 	while (CpuJobsOutstanding() < MaxJobsInFlight)
 	{
 		// Which ring gets this worker slot.
@@ -13424,7 +13620,15 @@ void FVoxelWorldImpl::DispatchJobs()
 				{
 					continue;
 				}
-				const int32 Deficit = Floors[Level] - LevelJobsInFlight[Level];
+				// Which population a floor slot is held against is the whole
+				// switch: blended, a p50 2.3 s GPU round trip satisfies the
+				// floor for its entire flight and the deficit below never
+				// fires (measured: R2-R5 at 1-2 dispatches per 5 s against
+				// 245-347 pending); CPU-only, the slot is held for the
+				// 0.34-0.44 ms p50 the floors were actually sized against.
+				const int32 Occupancy =
+					bFloorCpuOnly ? LevelCpuJobsInFlight[Level] : LevelJobsInFlight[Level];
+				const int32 Deficit = Floors[Level] - Occupancy;
 				if (Deficit > BestDeficit)
 				{
 					BestDeficit = Deficit;
@@ -13432,6 +13636,10 @@ void FVoxelWorldImpl::DispatchJobs()
 				}
 			}
 		}
+		// Whether the ring-quota pass chose this pick. Latched here, before the
+		// nearest-first pass can overwrite PickLevel, because the CPU-only mode
+		// pins floor-deficit picks to the CPU arm at the fork below.
+		const bool bFloorDeficitPick = (PickLevel != INDEX_NONE);
 		if (PickLevel == INDEX_NONE)
 		{
 			double BestDistSq = 0.0;
@@ -13452,6 +13660,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		}
 		if (PickLevel == INDEX_NONE)
 		{
+			bLoopExitedQueueEmpty = true;
 			break; // nothing pending in any ring
 		}
 
@@ -13843,7 +14052,17 @@ void FVoxelWorldImpl::DispatchJobs()
 			// The fork's own bound. Applied HERE rather than in the loop
 			// condition so a chunk arriving when the GPU is full falls back to
 			// the CPU instead of stalling the whole dispatch loop.
-			&& GpuJobsPending.Num() < GpuMaxInFlight;
+			&& GpuJobsPending.Num() < GpuMaxInFlight
+			// voxel.Stream.RingFloorCpuOnly: a pick the floor-deficit pass
+			// chose stays on the CPU arm -- the floor reserved a WORKER slot,
+			// so it delivers one. Also the flood guard: with the floor
+			// counting CPU occupancy only, a deficit pick that forked would
+			// leave that occupancy at zero and the same ring would win the
+			// deficit on every iteration until the fork's 256-job budget
+			// filled. Nearest-first picks (bFloorDeficitPick false) fork
+			// exactly as before, so the fork's demand supply is otherwise
+			// untouched. No-op with the switch off (default).
+			&& !(bFloorCpuOnly && bFloorDeficitPick);
 
 		// BRACKETED: everything from here to the end of the iteration is the job
 		// actually being built and handed off -- the GPU fork's region request
@@ -13859,6 +14078,13 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId, RingSkirtMask))
 		{
+			// The fork resolved GPU: this ring's in-flight slot is now held by
+			// a round trip (p50 2.3 s), not a worker (p50 <1 ms). The split
+			// arrays record which -- the blended increment already happened
+			// before the fork, at the shared site above.
+			++LevelGpuJobsInFlight[PickLevel];
+			++LevelGpuDispatchedSinceLog[PickLevel];
+			++DispatchGpuForkedSinceLog;
 			++GpuMeshJobsDispatchedSinceLog;
 			++GpuMeshDispatchedByLevel[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
 			// Stage-0 tile-batching census (see TileCensusSinceLog doc comment):
@@ -13933,9 +14159,19 @@ void FVoxelWorldImpl::DispatchJobs()
 		// scattered-sampling packer this project measured at 0.743 ms/chunk.
 		const bool bReuseMesherVoxels = VoxelBrickPackReuseMesherVoxelsEnabled();
 
+		// The fork resolved CPU (GPU declined, failed to submit, or was
+		// excluded). Split bookkeeping mirrors the GPU branch above; the
+		// atomic is the exact-CPU instrument (see its doc comment) and is
+		// decremented by the worker at the same moment as JobsInFlightCounter.
+		++LevelCpuJobsInFlight[PickLevel];
+		++LevelCpuDispatchedSinceLog[PickLevel];
+		++DispatchCpuLaunchedSinceLog;
+		CpuJobsInFlightCounter.Increment();
+		FThreadSafeCounter* CpuCounterPtr = &CpuJobsInFlightCounter;
+
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
-			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
+			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
 			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident]()
@@ -14665,6 +14901,11 @@ void FVoxelWorldImpl::DispatchJobs()
 				}
 				QueuePtr->Enqueue(MoveTemp(Result));
 				CounterPtr->Decrement();
+				// The exact-CPU instrument's other half; adjacent to the
+				// decrement above so the two counters can never disagree by
+				// more than the workers currently between these two lines
+				// (<= 8, the reconciliation jitter its doc comment states).
+				CpuCounterPtr->Decrement();
 			},
 			UE::Tasks::ETaskPriority::BackgroundNormal);
 		InFlightTasks.Add(MoveTemp(Task));
@@ -14684,6 +14925,18 @@ void FVoxelWorldImpl::DispatchJobs()
 
 	}
 	ThisFrameDispatchLoopMs += float((FPlatformTime::Seconds() - DispatchLoopStart) * 1000.0);
+
+	// Exit attribution (see the DispatchExit* doc comment). Falling out of the
+	// while condition IS the cap exit -- the loop has no other way to end.
+	++DispatchPassesSinceLog;
+	if (bLoopExitedQueueEmpty)
+	{
+		++DispatchExitEmptySinceLog;
+	}
+	else
+	{
+		++DispatchExitCapSinceLog;
+	}
 
 	// Re-queue the chunks held back by the cold-band throttle. Order is
 	// irrelevant here -- SortPendingQueues re-sorts both queues on the next
@@ -16650,7 +16903,18 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 				}
 				else
 				{
-					AccumLevel0GpuLatencyMs += Result.JobMs;
+					// GpuSubmitToDeliverMs, NOT JobMs. The 2026-08-23 census
+					// split moved the GPU arm's latency into its own field and
+					// left JobMs at 0 on that arm (see OnGpuMeshJobComplete,
+					// "Into its OWN field, not JobMs") -- but this line kept
+					// reading JobMs, so the gpuLatency census summed zeros
+					// against a non-zero AccumLevel0GpuJobs and printed
+					// 0.0 ms/job: a dead gauge shaped exactly like the "row of
+					// zeros that looked like a working instrument" the
+					// per-level split was written to avoid. Found by reading,
+					// not by a leg; the tell in a log would have been
+					// gpuJobs>0 with gpuLatencyMs=0.0 in every window.
+					AccumLevel0GpuLatencyMs += Result.GpuSubmitToDeliverMs;
 					++AccumLevel0GpuJobs;
 				}
 			}
@@ -16660,6 +16924,21 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			// stale `continue` below or a ring would leak slots against its
 			// floor.
 			LevelJobsInFlight[Lvl] = FMath::Max(0, LevelJobsInFlight[Lvl] - 1);
+			// Split-array mirror, routed on the same flag the census split
+			// above routes on. bFromGpuMesh is set only by OnGpuMeshJobComplete
+			// and defaults false on the worker arm, so this decrement always
+			// lands on the array the dispatch-side increment landed on. Same
+			// placement rule as the blended line: before the stale `continue`,
+			// or the split leaks where the blended count does not and the
+			// SPLIT-DRIFT check fires on the next ring log.
+			if (Result.bFromGpuMesh)
+			{
+				LevelGpuJobsInFlight[Lvl] = FMath::Max(0, LevelGpuJobsInFlight[Lvl] - 1);
+			}
+			else
+			{
+				LevelCpuJobsInFlight[Lvl] = FMath::Max(0, LevelCpuJobsInFlight[Lvl] - 1);
+			}
 		}
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Result.Key);

@@ -453,6 +453,29 @@ TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 // results landing per frame (bounded by voxel.Stream.MaxAppliesPerFrame /
 // ApplyBudgetMs), more peak memory in flight, and more STALE results (a chunk
 // evicted while its job runs is discarded -- watch the "job flow" census).
+//
+// 2026-08-23 SIZING NOTE -- the starvation above is back, one octave up. The
+// index-upload fix made the CPU arm the majority producer (93.5% of packs)
+// with jobs at p50 0.34-0.6 ms, and once per tick the dispatch loop fills to
+// the cap and stops: measured 4,342 chunks/s mean = 84.1 CPU launches per
+// 20.7 ms tick, which is exactly cap 96 minus the ~12 still in flight when
+// the tick starts. The cap is therefore functioning as a PER-TICK BATCH
+// QUOTA, and its ceiling is cap x tick rate: 96 x 48.3 = 4,637/s -- below
+// the owner's 6,200 chunks/s floor by construction, no matter how idle the
+// 8 workers are (they retire 96 x 0.5 ms / 8 = ~6 ms of work and then idle
+// the remaining ~14 ms of every tick). To make 6,200 REACHABLE with the GPU
+// arm contributing its measured ~280/s: (6,200 - 280) / 48.3 = 122.6 CPU
+// launches/tick, i.e. this cvar at >= 11; 12 gives headroom (144/tick,
+// ~6,950/s ceiling). THE CAVEAT THAT KEEPS THIS A NOTE AND NOT A NEW
+// DEFAULT: the ceiling this lifts is the quota, not the game thread. The
+// dispatch bucket already measures 42-86% of wall, and per-dispatched-chunk
+// game-thread cost was last measured at ~0.21 ms -- at which 123/tick costs
+// ~26 ms and blows the tick. Whether that per-chunk figure still holds
+// post-merge is UNKNOWN (never re-measured); run the FrameAttribution leg
+// and read the 'Voxel dispatch loop:' exitCap/exitEmpty counters before and
+// after any raise. If chunks/s does not rise with the cap while exitCap
+// still dominates, the game thread is the wall and the fix is per-dispatch
+// cost, not a bigger quota.
 TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
 	TEXT("voxel.Stream.JobsInFlightPerCore"),
 	8,
@@ -496,6 +519,86 @@ TAutoConsoleVariable<int32> CVarVoxelStreamDispatchAfterDrain(
 	TEXT("are refilled same-frame instead of idling until next frame's dispatch. Default 0: with ")
 	TEXT("JobsInFlightPerCore=8 the motion A/B measured no throughput gain and +14 hitches (2026-07-27). ")
 	TEXT("Skipped cheaply when nothing is pending. A/B lever for cold-fill work."),
+	ECVF_Default);
+
+// 2026-08-23 RE-DERIVATION OF THE ABOVE, after the index-upload fix moved the
+// pipeline ceiling. The 2026-07-27 "no throughput gain" verdict was taken when
+// the in-flight cap never bound (the GPU fork carried most chunks and
+// CpuJobsOutstanding read 0 all run -- see the phase-3 oversubscription
+// audit). Today the producer mix is inverted -- the CPU arm packs 93.5% of
+// chunks (brickFromGpu=49,665 of brickPacks=768,799) at p50 0.34-0.6 ms/job --
+// and the arithmetic now says the cap DOES bind, as a per-tick batch quota:
+//   measured 4,342 chunks/s mean, CPU arm ~4,060/s, frames p50 20.7 ms
+//   (48.3 ticks/s) => 84.1 CPU launches per tick, against a cap of 96 with
+//   ~12 still in flight at the log point -- 96 - 12 = 84. Exact agreement.
+// A worker retires a 0.5 ms job long before the next tick, so "96 in flight"
+// degenerates into "96 dispatched per tick, then the workers go idle until
+// the next tick's single top-up" -- the same starvation shape the 2->8 raise
+// fixed on 2026-07-27, reappearing one octave up. The owner floor is 6,200
+// chunks/s; 96 x 48.3 = 4,637/s is below it BY CONSTRUCTION.
+// The 'Voxel dispatch loop:' log line (exitCap= vs exitEmpty=) is the
+// instrument that decides this: exitCap dominating a flight window proves the
+// batch-quota reading; exitEmpty dominating refutes it and moves the blame to
+// admission/refill cadence. Until that leg is read, the paragraph above is
+// arithmetic on one flight's counters, not a measured verdict.
+
+// 2026-08-23: test the ring slot floors against CPU-arm occupancy only, and
+// make a floor-deficit pick dispatch on the CPU arm.
+//
+// THE EFFECT THIS EXISTS FOR: mid-flight the coarse rings starve while their
+// queues sit full. Measured (phase-3 oversubscription audit, one 5 s window):
+// R2-R5 dispatched 1-2 jobs each against 245-347 pending -- and those pending
+// numbers are EXACTLY kRingCapShare x PendingJobCap (0.17*2048=348,
+// 0.15*2048=307, 0.13*2048=266, 0.12*2048=245), i.e. the admission caps are
+// pinned because dispatch never drains them. A repeating exact number is a
+// clamp.
+//
+// THE MECHANISM, read from the code, not inferred: DispatchJobs increments
+// LevelJobsInFlight[level] BEFORE the GPU fork decides who meshes the chunk,
+// so a GPU job occupies its ring's floor slot for its whole round trip --
+// measured p50 2,281-2,348 ms, p95 3,300-3,458 ms submit->deliver. The floor
+// deficit test (Floors[L] - LevelJobsInFlight[L] > 0) therefore never fires
+// for a ring whose ONE outstanding job is a GPU job, the ring is served only
+// by the nearest-first pass -- which R0's 38.4 m-deep column always wins --
+// and the cycle self-sustains: the GPU job completes, the deficit fires once,
+// the pick forks to the GPU again, another ~2.3 s hold. One dispatch per GPU
+// round trip per ring is precisely the measured 1-2 per 5 s.
+//
+// The floors were sized in worker-slot units ("R0 jobs are ~0.8 ms p50...a
+// reserved slot is not a small loan" -- see kRingSlotFloorDefault), and a
+// 2.3-second GPU round trip is not a worker slot. With this switch ON the
+// floor test counts only CPU-arm jobs, and a pick that a floor deficit chose
+// goes to the CPU worker directly instead of offering the fork -- the floor
+// promised a WORKER slot, so it delivers one. Without that second half a
+// deficit pick could fork to the GPU without ever raising CPU occupancy, and
+// one ring could pump its whole queue into the fork in a single tick (the
+// blended count self-limited exactly because the fork raised it).
+//
+// WHY THIS IS A SWITCH AND DEFAULT OFF: the recorded floor catastrophe
+// (floors {0,2,3,4,4} reserved 13 of 24 slots; whole-run throughput collapsed
+// 49,179 -> 558 chunks) was long jobs occupying the ~8-thread worker pool
+// itself. This change does not resize the floors (still at most 5 slots of
+// 96, 5.2%) and the jobs those floors now admit cost 0.34-0.44 ms p50
+// (2026-08-23, all levels), so a floor slot is returned in under a
+// millisecond -- the catastrophe's mechanism (3-second jobs on real threads)
+// is not reachable from here at today's job costs. But the catastrophe is
+// also the recorded reason floors and caps are never retuned in the same
+// change, and this ships in the same window as other dispatch work -- so it
+// defaults to today's behaviour and is flipped alone, in its own leg.
+//
+// PROVES IT WORKED: R2-R5 disp= on the 'Voxel ring dispatch' line rises out
+// of the floor (>=50 per ring per 5 s against the measured 1-2) AND their
+// pending= values fall off the exact admission-cap numbers above. PROVES IT
+// DID NOT: R0 disp= or R0 residency falls >10%, or brickPacks/s falls -- either
+// says the coarse rings bought their slots from the near field, which is the
+// 49,179->558 failure in miniature. Revert on either.
+TAutoConsoleVariable<int32> CVarVoxelStreamRingFloorCpuOnly(
+	TEXT("voxel.Stream.RingFloorCpuOnly"),
+	0,
+	TEXT("Ring slot floors count CPU-arm jobs only, and a floor-deficit pick dispatches on the CPU worker ")
+	TEXT("(a ~2.3 s GPU round trip no longer satisfies a floor sized for sub-millisecond worker slots, which ")
+	TEXT("starved R2-R5 to 1-2 dispatches per 5 s against 245-347 pending). Default 0: floors test the blended ")
+	TEXT("CPU+GPU in-flight count, exactly the pre-2026-08-23 behaviour."),
 	ECVF_Default);
 
 // S2-0 (2026-07-27). Bounded admission had a second failure mode that only
@@ -1233,6 +1336,24 @@ int32 VoxelDebug::GetStreamJobsInFlightPerCore()
 int32 VoxelDebug::GetStreamDispatchAfterDrain()
 {
 	return CVarVoxelStreamDispatchAfterDrain.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamRingFloorCpuOnly()
+{
+	// -VoxelRingFloorCpuOnly=<0|1> overrides the cvar and WINS, the
+	// -VoxelAdmissionBandSkip idiom: an -ExecCmds cvar lands only after the
+	// world has begun streaming, and the floor test steers dispatch order
+	// from the very first cold-fill tick -- a leg that flips the cvar via
+	// -ExecCmds would run its first seconds on the blended test and call the
+	// contaminated result an arm. The cvar remains for interactive A/B in a
+	// live session, where the first seconds are long gone anyway.
+	static const int32 CmdLineOverride = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingFloorCpuOnly="), Value);
+		return Value;
+	}();
+	return CmdLineOverride >= 0 ? CmdLineOverride : CVarVoxelStreamRingFloorCpuOnly.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamAdmissionRecordCap()
