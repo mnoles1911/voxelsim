@@ -26,6 +26,50 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0f Night sky: no moon at all, and the ground is brighter at night than by day
+
+**Owner-reported 2026-08-23** from a PIE session played through to nightfall. Two defects,
+possibly one cause, and they should be investigated together before either is "fixed":
+
+1. **No moon is visible at any point in the night.** Expected behaviour is a moon that moves
+   across the night sky on its own arc. The stars and the night sky itself look right — the
+   owner said so explicitly — so whatever is wrong is specific to the moon body, not to the
+   night sky as a whole.
+2. **The ground is lit brighter at night than during the day.** Not merely "too bright" —
+   *inverted*. That is a strong signal: a moon/night light whose intensity is being applied
+   without its day/night falloff, or a sky-light intensity that scales the wrong way through
+   midnight, would produce exactly this.
+
+**Why they are probably related and must be looked at as a pair:** a moon light that is
+present and driving ground illumination but whose *body* is not being drawn would explain
+both at once — invisible moon, and its light landing at full strength. Confirming or ruling
+that out is the first move; if the moon light does not exist at all, then the night ground
+brightness is a separate sky-light problem and the two split.
+
+Start in `UVoxelSkySubsystem` (`ue-project/Source/VoxelEarth/VoxelSkySubsystem.cpp`), which
+owns the day/night clock (`-VoxelTimeOfDay` / `-VoxelDate` / `-VoxelTimeScale`, and the
+frozen-noon defaults every measurement leg pins). Note that legs run with `TimeScale 0` at
+12:00, so **no headless measurement in this project has ever rendered a night sky** — this
+is a class of defect the leg harness structurally cannot catch, which is worth remembering
+beyond this item.
+
+**Reproduce headlessly**: `tools/voxel-capture.ps1` with `-VoxelTimeOfDay=00:00` (and a
+sweep across e.g. 20:00 / 00:00 / 04:00) rather than asking the owner to play to nightfall
+again. Judged by eye, by the owner, on that capture set.
+
+### 0.0g The sky/fog cvars do not take effect live
+
+**Owner-reported 2026-08-23.** `voxel.Sky.FogDensity`, `voxel.Sky.FogHeightFalloff` and
+`voxel.Sky.Fog` were each set in a live PIE session with **no visible change**. They are
+almost certainly read once when the fog component is configured and never re-applied on
+change.
+
+This is the "switch that is armed and does nothing" shape, and it makes the fog untunable in
+the session where you can actually see it. Fog is acceptable as it stands after the clipmap
+was restored, so this is tuning ergonomics rather than urgent — but until it is fixed,
+**nobody can trust a fog A/B taken by flipping these at runtime.**
+
+
 ### 0.0d Far clipmap renders white, and bright magenta at extreme distance
 
 **Owner-reported 2026-08-23**, immediately after the clipmap was restored (it had
