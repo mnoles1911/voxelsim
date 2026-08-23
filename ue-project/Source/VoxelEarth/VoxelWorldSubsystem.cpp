@@ -5781,7 +5781,25 @@ struct FVoxelWorldImpl
 	// can be attributed to a specific ring level before anything is changed.
 	// Same always-collected, log-only-on-hitch policy as the timers above.
 	float ThisFrameRecomputeMs = 0.f;
+	// SPLIT ON 2026-08-23, and the meaning of ExitScanMs NARROWED. Before that
+	// date, ThisFrameExitScanMs was everything from the top of
+	// RecomputeDesiredSet to the start of the per-level entry scans: the
+	// prologue resets, the fine-tier residency tick (documented at its site as
+	// capable of a MULTI-SECOND synchronous stall), the cutoff relaxation, the
+	// ChunkRecords eviction walk, AND an O(queue-depth) filter over the pending
+	// queues. Every plan that read "exitScanMs" as "the record walk" was
+	// attributing up to five passes to one of them -- the same "true number,
+	// wrong denominator" mistake recorded in docs/lessons-2026-07-27-s0-s1.md.
+	// Now: FineResidencyMs is the fine-tier tick alone, ExitScanMs is the
+	// ChunkRecords walk alone, QueueFilterMs is the evicted-key queue filter
+	// alone. The prologue and the cutoff relaxation (a handful of resets plus
+	// one 6-entry loop, constant work) are deliberately in no sub-bucket; they
+	// remain inside RecomputeMs, so total minus parts bounds them. When
+	// comparing against logs older than 2026-08-23, exitScanMs is not the same
+	// quantity.
+	float ThisFrameFineResidencyMs = 0.f;
 	float ThisFrameExitScanMs = 0.f;
+	float ThisFrameQueueFilterMs = 0.f;
 	float ThisFrameSortMs = 0.f;
 	float ThisFrameLevelEntryMs[VoxelCoords::kNumLevels] = {};
 	int32 ThisFrameLevelFootprints[VoxelCoords::kNumLevels] = {}; // in-annulus XY footprints visited (= ComputeFootprintChunkZRange calls)
@@ -5791,7 +5809,9 @@ struct FVoxelWorldImpl
 	// cross the hitch threshold is invisible to the per-hitch log above, so
 	// these give the cost distribution independent of whether it hitched.
 	float MaxRecomputeMs = 0.f;
+	float MaxFineResidencyMs = 0.f;
 	float MaxExitScanMs = 0.f;
+	float MaxQueueFilterMs = 0.f;
 	float MaxSortMs = 0.f;
 	float MaxLevelEntryMs[VoxelCoords::kNumLevels] = {};
 	int32 LevelEntryScans[VoxelCoords::kNumLevels] = {}; // how many times each level's entry scan actually ran
@@ -5867,6 +5887,23 @@ struct FVoxelWorldImpl
 	// costs one relaxed load per log and cannot miss a pack.
 	int64 LastLogBrickPackCount = 0;
 	double AccumRecomputeMs = 0.0;
+	// SUMS of the recompute stage timers over the log window, beside the maxima
+	// above (2026-08-23). The maxima alone cannot be optimised against: a stage
+	// whose worst call is 8 ms and a stage whose worst call is 3 ms tell you
+	// nothing about which one the window actually SPENT more on -- the 3 ms
+	// stage may run five times as often. AccumRecomputeMs already proved the
+	// pattern (it is what put RecomputeDesiredSet at 59% of voxel tick time);
+	// these give the same window-sum reading for each of its parts, so the
+	// exit-vs-entry share of that 59% is finally a number that can be read off
+	// one log line instead of inferred from maxima. Accumulated once per
+	// RecomputeDesiredSet call at the site where each stage timer is finalised
+	// (not per tick -- a tick with no recompute contributes nothing), reset by
+	// MaybeLogCounters with the maxima.
+	double AccumFineResidencyMs = 0.0;
+	double AccumExitScanMs = 0.0;
+	double AccumQueueFilterMs = 0.0;
+	double AccumSortMs = 0.0;
+	double AccumLevelEntryMs[VoxelCoords::kNumLevels] = {};
 	double AccumTickMs = 0.0;
 	int32 AccumTicks = 0;
 	int64 JobsDispatchedSinceLog = 0;   // DispatchJobs: worker jobs actually launched
@@ -6701,7 +6738,9 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	ThisFrameUnloads = 0;
 	ThisFramePoolReuses = 0;
 	ThisFrameRecomputeMs = 0.f;
+	ThisFrameFineResidencyMs = 0.f;
 	ThisFrameExitScanMs = 0.f;
+	ThisFrameQueueFilterMs = 0.f;
 	ThisFrameDispatchAirProofMs = 0.f;
 	ThisFrameDispatchBandMs = 0.f;
 	ThisFrameDispatchSubmitMs = 0.f;
@@ -7340,9 +7379,14 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// TickStreaming the line above does not cover. Split out rather than
 		// widened into that format string so the existing line stays greppable.
 		UE_LOG(LogVoxelPerf, Warning,
-		       TEXT("Hitch frame recompute: recomputeMs=%.2f exitScanMs=%.2f sortMs=%.2f | ")
+		       // fineMs/queueFilterMs added with the 2026-08-23 timer split:
+		       // exitScanMs used to contain both, and a fine-tier tile load is
+		       // the single largest stall this function can produce -- a hitch
+		       // line that dropped it when the split landed would have made
+		       // the worst case UNATTRIBUTABLE exactly where it matters most.
+		       TEXT("Hitch frame recompute: recomputeMs=%.2f fineMs=%.2f exitScanMs=%.2f queueFilterMs=%.2f sortMs=%.2f | ")
 		       TEXT("entryMs %s | footprints %s | tracked=%d"),
-		       ThisFrameRecomputeMs, ThisFrameExitScanMs, ThisFrameSortMs,
+		       ThisFrameRecomputeMs, ThisFrameFineResidencyMs, ThisFrameExitScanMs, ThisFrameQueueFilterMs, ThisFrameSortMs,
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.2f"), L, ThisFrameLevelEntryMs[L]); }),
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, ThisFrameLevelFootprints[L]); }),
 		       ChunkRecords.Num());
@@ -8278,15 +8322,39 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// last periodic log, per level. Independent of the hitch log (a burst that
 	// lands on a frame under the 33.3ms threshold is invisible there), so this
 	// is what quantifies "what does R3/R4 recompute cost when it fires".
+	//
+	// FORMAT CHANGE 2026-08-23, twice over, and both matter when grepping old
+	// legs: (1) exitScanMs is now the ChunkRecords walk ALONE -- fineMs (the
+	// fine-tier residency tick) and queueFilterMs (the evicted-key queue
+	// filter) used to be inside it, and are printed beside it now; (2) maxima
+	// alone cannot be optimised against (a stage with the smaller max can
+	// still own more of the window by running more often), so the "sum" line
+	// below prints the same stages SUMMED over the window, following the
+	// AccumRecomputeMs pattern. It is the sum line, not this one, that says
+	// which half of RecomputeDesiredSet the window actually paid for.
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel recompute (max since last log): totalMs=%.2f exitScanMs=%.2f sortMs=%.2f calls=%d | ")
+	       TEXT("Voxel recompute (max since last log): totalMs=%.2f fineMs=%.2f exitScanMs=%.2f queueFilterMs=%.2f sortMs=%.2f calls=%d | ")
 	       TEXT("entryMs %s | scans %s | ")
 	       TEXT("tracked=%d pendingJob=%d pendingGT=%d pendingUnload=%d | framesOver16.6ms=%d (total %lld)"),
-	       MaxRecomputeMs, MaxExitScanMs, MaxSortMs, RecomputeCalls,
+	       MaxRecomputeMs, MaxFineResidencyMs, MaxExitScanMs, MaxQueueFilterMs, MaxSortMs, RecomputeCalls,
 	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.2f"), L, MaxLevelEntryMs[L]); }),
 	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelEntryScans[L]); }),
 	       ChunkRecords.Num(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       FramesOver60FpsBarSinceLog, (long long)TotalFramesOver60FpsBar);
+	// The window-sum counterpart (see the format-change note above). totalMs
+	// here is AccumRecomputeMs -- the same number the tick-budget line's
+	// "recompute=" prints -- repeated so this line is self-contained: the
+	// parts and the whole they should account for sit in one grep hit. The
+	// residual (total minus fine/exitScan/queueFilter/sort/entry) is the
+	// prologue, the cutoff relaxation, PruneFootprintZRangeCache and
+	// FlushAbsentMarks -- deliberately unbucketed constant-ish work; if the
+	// residual ever turns large, one of those has stopped being cheap and
+	// deserves a bucket of its own, not a guess.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel recompute (sum since last log): totalMs=%.1f fineMs=%.1f exitScanMs=%.1f queueFilterMs=%.1f sortMs=%.1f | ")
+	       TEXT("entryMs %s"),
+	       AccumRecomputeMs, AccumFineResidencyMs, AccumExitScanMs, AccumQueueFilterMs, AccumSortMs,
+	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.1f"), L, AccumLevelEntryMs[L]); }));
 	// Streaming pipeline re-measure (docs/status.md "Streaming pipeline
 	// re-measure + rework"): the two questions the existing logs could not
 	// answer. (1) Where does per-tick time go -- the hitch log breaks a tick
@@ -9635,13 +9703,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	FMemory::Memzero(LevelEvictVertical);
 
 	MaxRecomputeMs = 0.f;
+	MaxFineResidencyMs = 0.f;
 	MaxExitScanMs = 0.f;
+	MaxQueueFilterMs = 0.f;
 	MaxSortMs = 0.f;
+	// The recompute stage sums (2026-08-23 split) share the maxima's window:
+	// reset here, beside them, so the max line and the sum line always
+	// describe the same set of calls.
+	AccumFineResidencyMs = AccumExitScanMs = AccumQueueFilterMs = AccumSortMs = 0.0;
 	RecomputeCalls = 0;
 	FramesOver60FpsBarSinceLog = 0;
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		MaxLevelEntryMs[Level] = 0.f;
+		AccumLevelEntryMs[Level] = 0.0;
 		LevelEntryScans[Level] = 0;
 	}
 
@@ -11361,6 +11436,14 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// measures frame time on a fine-tier world this is the first thing they
 		// must not mistake for a streaming regression.
 		const double FineMs = (FPlatformTime::Seconds() - FineT0) * 1000.0;
+		// Timer split (2026-08-23): this tick used to be silently inside
+		// exitScanMs, so its multi-second worst case read as "the record walk
+		// is slow" -- on a fine-tier world, the single most misleading
+		// attribution this function could make. Own bucket now; stays 0.0
+		// (from the per-tick reset) when FineStreamer is null, i.e. on every
+		// run without -VoxelFineTileDir, so a zero here means "not in play",
+		// not "measured cheap".
+		ThisFrameFineResidencyMs = float(FineMs);
 		if (FineMs > 50.0)
 		{
 			UE_LOG(LogVoxelStream, Log,
@@ -11439,6 +11522,43 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// still inside the unload ring stay tracked untouched -- this is the
 	// same hysteresis gap the original single-ring code had, now evaluated
 	// per level.
+	//
+	// PER-LEVEL RADII HOISTED OUT OF THE WALK (2026-08-23, pure refactor). The
+	// loop body used to reach GetRingPresets() THREE times per record -- once
+	// directly, and twice more through InnerEvictUU -> InnerAdmitUU (which
+	// also re-reads InnerHysteresisChunks and ChunkEdgeUUForLevel each time).
+	// Every one of those is a session constant: the preset table is a
+	// function-local static filled once from the command line and never
+	// written again (see GetRingPresets), ChunkEdgeUUForLevel is arithmetic on
+	// compile-time constants, UnloadRingMultiplier is constexpr, and
+	// InnerHysteresisChunks latches its knob in a static on first call. So at
+	// ~271k tracked records this walk paid ~800k function calls per recompute
+	// to look up six-entry tables that cannot change between two iterations.
+	// The tables below are those same values computed once per call; each
+	// per-record expression (including the FMath::Square around the two
+	// radii) is the identical double arithmetic in the identical order, so
+	// every admitted/evicted verdict is bit-for-bit what the per-record form
+	// produced. If eviction counts move under this change, the hoist is wrong
+	// -- there is no intended behavioural surface at all.
+	double ExitChunkEdgeUU[VoxelCoords::kNumLevels];
+	double ExitUnloadOuterUUSq[VoxelCoords::kNumLevels];
+	double ExitInnerEvictUUSq[VoxelCoords::kNumLevels];
+	for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+	{
+		ExitChunkEdgeUU[L] = ChunkEdgeUUForLevel(L);
+		ExitUnloadOuterUUSq[L] = FMath::Square(
+			UVoxelWorldSubsystem::GetRingPresets()[L].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier);
+		ExitInnerEvictUUSq[L] = FMath::Square(VoxelStreamAdmission::InnerEvictUU(L));
+	}
+	// Command-line-latched static, identical on every read within a run --
+	// hoisted for the same reason and with the same non-argument.
+	const bool bHierarchicalCoverage = VoxelStreamAdmission::HierarchicalCoverageEnabled();
+
+	// Timer split (2026-08-23): from here to the end of the ChunkRecords loop
+	// is what exitScanMs now means -- the O(tracked) eviction walk and nothing
+	// else. See ThisFrameExitScanMs' doc comment for what the old number
+	// bundled in.
+	const double ExitWalkT0 = FPlatformTime::Seconds();
 	for (auto& Pair : ChunkRecords)
 	{
 		const FVoxelLevelChunkKey& LevelKey = Pair.Key;
@@ -11446,14 +11566,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		{
 			continue;
 		}
-		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[LevelKey.Level];
-		const double ChunkEdge = ChunkEdgeUUForLevel(LevelKey.Level);
+		const double ChunkEdge = ExitChunkEdgeUU[LevelKey.Level];
 		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(LevelKey.Key.Y) + 0.5) * ChunkEdge;
 		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-		const double UnloadOuterUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier;
-		const double InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(LevelKey.Level);
-		const bool bBeyondOuter = DistSq > FMath::Square(UnloadOuterUU);
+		const bool bBeyondOuter = DistSq > ExitUnloadOuterUUSq[LevelKey.Level];
 		// UNDER -VoxelHierarchicalCoverage THERE IS NO INNER EDGE TO EVICT
 		// INTO: the entry pass admits the whole disc, so a coarse chunk inside
 		// the finer rings is DESIRED, not stale, and evicting it would re-open
@@ -11464,8 +11581,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// bBeyondOuter or bBeyondVertical. (Also note the stationary
 		// admit/evict thrash Phase 0.1 fixed cannot come back through this
 		// arm: with no inner eviction there is no inner band to churn.)
-		const bool bInsideInner = LevelKey.Level > 0 && DistSq < FMath::Square(InnerEvictUU) &&
-		                          !VoxelStreamAdmission::HierarchicalCoverageEnabled();
+		const bool bInsideInner = LevelKey.Level > 0 && DistSq < ExitInnerEvictUUSq[LevelKey.Level] &&
+		                          !bHierarchicalCoverage;
 		// Underground streaming (see namespace VoxelUnderground): the two tests
 		// above are XY-only, which is correct for every chunk whose desired-ness
 		// is a pure function of its footprint (the surface band and the depth
@@ -11580,6 +11697,13 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			EvictedThisCall.Add(LevelKey);
 		}
 	}
+	// Timer split (2026-08-23): the record walk ends here; the queue filter
+	// below is O(evictions x queue depth in the worst case) and scales with a
+	// completely different variable (pending-queue depth, ~19k under flight)
+	// than the walk does (tracked records, ~271k). One number over both could
+	// not say which of those two populations a regression lives in.
+	const double ExitWalkT1 = FPlatformTime::Seconds();
+	ThisFrameExitScanMs = float((ExitWalkT1 - ExitWalkT0) * 1000.0);
 
 	// Drop the just-evicted keys from the two pending queues in ONE filtering
 	// pass instead of a TArray::RemoveSingle per eviction. RemoveSingle is a
@@ -11606,6 +11730,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		PendingGameThreadKeys.RemoveAllSwap([this](const FVoxelLevelChunkKey& K) { return EvictedThisCall.Contains(K); },
 		                                    EAllowShrinking::No);
 	}
+	// The filter's own bucket (see the split note above ExitWalkT0). Measured
+	// from ExitWalkT1 so the two stages tile with no gap; a call with zero
+	// evictions legitimately reads ~0.00 here because the whole block is
+	// skipped.
+	ThisFrameQueueFilterMs = float((FPlatformTime::Seconds() - ExitWalkT1) * 1000.0);
 
 	// 2. Hysteresis entry, per level: XY footprints within level L's annulus
 	// [Inner(L), Outer(L)) that aren't already tracked become newly tracked
@@ -11619,8 +11748,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// chunk is (1<<L) times larger, so re-running this O(candidates) scan on
 	// every level-0 chunk crossing (every 3.2m) would be wasted work for
 	// outer levels once their own chunk hasn't actually changed.
-	const double RecomputeT1 = FPlatformTime::Seconds();
-	ThisFrameExitScanMs = float((RecomputeT1 - RecomputeT0) * 1000.0);
+	//
+	// (Until 2026-08-23 ThisFrameExitScanMs was closed HERE, spanning the
+	// prologue, the fine-tier residency tick, the cutoff relaxation, the
+	// record walk and the queue filter all at once. It is now closed at the
+	// end of the record walk alone -- see ThisFrameExitScanMs' doc comment.)
 
 	int32 ScratchBoxRadius = 0; // BoxRadiusChunks out-param, used only for its bool return in the level gate
 
@@ -11781,6 +11913,20 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 		const int32 ChunkSpan = FMath::CeilToInt32(AdmitOuterUU / ChunkEdge) + 1;
 
+		// HOISTED OUT OF THE CELL LOOP (2026-08-23, pure refactor, same batch
+		// as the exit scan's per-level tables). The inner-pad radius was
+		// recomputed PER GRID CELL below -- (2*ChunkSpan+1)^2 = ~7,200 calls
+		// per level-0 scan at today's radii -- and each call re-derives it
+		// from GetRingPresets() and ChunkEdgeUUForLevel. Both are fixed for
+		// the session (static table filled once from the command line;
+		// arithmetic on compile-time constants), so every cell of one scan
+		// got the same double back. Computed once per level here; the
+		// per-cell comparison below is unchanged, FMath::Square included, so
+		// the admitted set is bit-identical. HierarchicalCoverageEnabled() is
+		// a command-line-latched static read, hoisted on the same argument.
+		const double LevelInnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
+		const bool bLevelHierarchicalCoverage = VoxelStreamAdmission::HierarchicalCoverageEnabled();
+
 		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
 		{
 			for (int32 Cx = AnchorChunk.X - ChunkSpan; Cx <= AnchorChunk.X + ChunkSpan; ++Cx)
@@ -11828,9 +11974,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// The finer ring still streams first -- the interior's sort
 				// keys are clamped to this same InnerAdmitUU radius, so it
 				// queues BEHIND the fine level's leading edge, not ahead of it.
-				const double InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
-				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU) &&
-				    !VoxelStreamAdmission::HierarchicalCoverageEnabled())
+				// (LevelInnerAdmitUU is VoxelStreamAdmission::InnerAdmitUU(Level),
+				// hoisted above the loop -- see the note at the hoist.)
+				if (Level > 0 && DistSq < FMath::Square(LevelInnerAdmitUU) &&
+				    !bLevelHierarchicalCoverage)
 				{
 					continue; // a finer ring owns this footprint, entirely
 				}
@@ -12436,6 +12583,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// reading we want.
 		ThisFrameLevelEntryMs[Level] = float((FPlatformTime::Seconds() - LevelT0) * 1000.0);
 		MaxLevelEntryMs[Level] = FMath::Max(MaxLevelEntryMs[Level], ThisFrameLevelEntryMs[Level]);
+		// Window SUM beside the window max (see AccumFineResidencyMs' doc
+		// comment). Gated levels never reach this line, so a level that did
+		// not scan adds nothing -- same rule its max already follows.
+		AccumLevelEntryMs[Level] += ThisFrameLevelEntryMs[Level];
 	}
 
 	PruneFootprintZRangeCache(Anchor);
@@ -12453,8 +12604,17 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	ThisFrameSortMs = float((SortT1 - SortT0) * 1000.0);
 	ThisFrameRecomputeMs = float((SortT1 - RecomputeT0) * 1000.0);
 	MaxRecomputeMs = FMath::Max(MaxRecomputeMs, ThisFrameRecomputeMs);
+	MaxFineResidencyMs = FMath::Max(MaxFineResidencyMs, ThisFrameFineResidencyMs);
 	MaxExitScanMs = FMath::Max(MaxExitScanMs, ThisFrameExitScanMs);
+	MaxQueueFilterMs = FMath::Max(MaxQueueFilterMs, ThisFrameQueueFilterMs);
 	MaxSortMs = FMath::Max(MaxSortMs, ThisFrameSortMs);
+	// Window sums, once per call (AccumRecomputeMs itself is fed per tick in
+	// TickStreaming from the per-frame value; these four are finalised only
+	// here, so this is the one site that can add each exactly once).
+	AccumFineResidencyMs += ThisFrameFineResidencyMs;
+	AccumExitScanMs += ThisFrameExitScanMs;
+	AccumQueueFilterMs += ThisFrameQueueFilterMs;
+	AccumSortMs += ThisFrameSortMs;
 	// voxel.March.HoleStats 2: one staging for this call's whole burst of
 	// pending/cleared annotations, AFTER the truncation above has retracted
 	// the ones it cancelled -- staging before it would upload marks this same
