@@ -2,8 +2,20 @@
 // FVoxelGpuWorklist -- the persistent chunk-record ring for P3 (persistent
 // worklist + indirect dispatch; docs/gpu-worklist-plan-2026-08-23.md).
 //
-// *** SPINE WIRED; KERNELS CONVERTED: Column, Voxelize, fused ClassifyTotals
-// (2026-08-23). ***
+// *** SPINE WIRED; KERNELS CONVERTED: Column, Voxelize, fused ClassifyTotals,
+// AssetStamp (2026-08-23). ***
+// Behind -VoxelGpuWorklistAssetStamp=1 (on top of the Voxelize switch) Flush
+// stages every consumed asset record's resolved instances into a per-flush
+// blob (stampsStaged, LevelFlags bit 9 -- set ONLY for records consumed the
+// same flush, so a deferred record can never read another flush's blob, and
+// set BEFORE the folds so both proof mirrors see the same bytes) and
+// dispatches the ORDER-PRESERVING gather (one thread per column, instances
+// walked in slice order -- the classic per-instance pass order, in-thread)
+// between the voxelize and classify dispatches. ASSET CHUNKS thereby enter
+// the whole cell-arena chain. Byte gate: -VoxelGpuWorklistVerifyStamp=1 into
+// stats [10..11] (classic voxelize + per-instance stamps as the reference).
+// Three stages remain: PackClaim, Write, Record.
+//
 // Behind -VoxelGpuWorklistClassify=1 (on top of the Voxelize switch) the
 // flush graph ALSO dispatches the fused ClassifyTotals pair -- one group per
 // BRICK classify off the cell arena, then a one-group-per-record in-group
@@ -12,8 +24,7 @@
 // conversion's largest single cut (15 -> 7 on the lean-alloc shape).
 // BrickPackMain reads offsets through brickpack.ush's BrickScanReadBase; the
 // claim pass reads totals through VoxelBrickPoolAlloc.usf's TotalsReadBase.
-// Byte gate: -VoxelGpuWorklistVerifyCT=1 into stats [8..9]. Four stages
-// remain: AssetStamp, PackClaim, Write, Record.
+// Byte gate: -VoxelGpuWorklistVerifyCT=1 into stats [8..9].
 //
 // Behind -VoxelGpuWorklistVoxelize=1 (on top of the two switches below) the
 // flush graph ALSO dispatches VoxelizeWorklistMain once per tick: every
@@ -98,6 +109,42 @@ struct FVoxelGpuChunkWorkRecord
 };
 static_assert(sizeof(FVoxelGpuChunkWorkRecord) == 64, "the 64-byte record IS the contract");
 
+// One resolved asset instance as the worklist AssetStamp gather reads it --
+// MIRROR of GpuAssetStampInstance (VoxelWorklist.ush), 12 dwords, 48 B.
+// AnchorRelVx/Vy are relative to the OWNING record's OriginVx/Vy;
+// ColStartsBase indexes the flush blob's ColStarts, whose VALUES index the
+// flush blob's Spans (both rebased when Flush stages the payload).
+struct FVoxelWorklistAssetInstance
+{
+	int32  AnchorRelVx = 0;
+	int32  AnchorRelVy = 0;
+	int32  AnchorVz = 0;
+	int32  GridOriginZ = 0;
+	int32  RotOriginX = 0;
+	int32  RotOriginY = 0;
+	uint32 YawQuarter = 0;
+	uint32 SizeX = 0;
+	uint32 SizeY = 0;
+	uint32 SizeZ = 0;
+	uint32 ColStartsBase = 0;
+	uint32 Pad0 = 0;
+};
+static_assert(sizeof(FVoxelWorklistAssetInstance) == 48, "the 48-byte instance IS the contract");
+
+// A record's asset payload, handed to Append alongside the record and staged
+// into the FLUSH that consumes it (never uploaded for deferred records --
+// stampsStaged, LevelFlags bit 9, is set only when instances actually landed
+// in the flush blob). Instance ColStartsBase indexes THIS payload's
+// ColStarts; ColStarts values index THIS payload's Spans; Flush rebases both
+// as it concatenates.
+struct FVoxelWorklistAssetPayload
+{
+	TArray<FVoxelWorklistAssetInstance> Instances;
+	TArray<uint32> ColStarts;
+	TArray<uint32> Spans;
+	bool IsEmpty() const { return Instances.Num() == 0; }
+};
+
 // The stages a converted chain dispatches, one indirect dispatch each per
 // tick regardless of record count. Group counts per record differ per stage;
 // the args-setup kernel multiplies them in on the GPU.
@@ -140,11 +187,15 @@ public:
 	static constexpr uint32 kBricksPerRecord = 64;
 	static constexpr uint32 kClassifyGroupsPerRecord = kBricksPerRecord;
 	static constexpr uint32 kClassifyTotalsGroupsPerRecord = 1;
+	// The AssetStamp gather: one thread per column, the Column stage's shape.
+	static constexpr uint32 kStampGroupsPerRecord = kColumnsPerRecord / 64;
 	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
 	// [4..5] the column verify's mismatch/checked counters
 	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's
 	// (VoxelWorklistVoxelize.usf), [8..9] the classify-totals verify's
-	// (VoxelWorklistClassify.usf), [10..11] reserved for later stages.
+	// (VoxelWorklistClassify.usf), [10..11] the asset-stamp verify's (the
+	// voxelize verify kernel with VerifyStatsBase 10 -- it compares the
+	// stamped cells).
 	static constexpr uint32 kStatsDwords = 12;
 
 	~FVoxelGpuWorklist();
@@ -161,8 +212,12 @@ public:
 	// (the coordinate GetLastFlush()'s window is expressed in) or MAX_uint32
 	// if it was refused -- this is how a caller learns which arena slice the
 	// column stage will write for its chunk.
+	// AssetPayloads (AssetStamp stage): parallel to Records when given --
+	// element i is record i's instances, empty for an asset-free record. A
+	// REFUSED record's payload is dropped with it. Payloads are MOVED from.
 	int32 Append(TArrayView<const FVoxelGpuChunkWorkRecord> Records,
-	             TArray<uint32>* OutMonotonicIndices = nullptr);
+	             TArray<uint32>* OutMonotonicIndices = nullptr,
+	             TArray<FVoxelWorklistAssetPayload>* AssetPayloads = nullptr);
 
 	// --- the Column stage (-VoxelGpuWorklistColumns) ------------------------
 	//
@@ -199,6 +254,17 @@ public:
 	// ~1 KiB per record, three orders under the cell arena's clamp.
 	void SetClassifyStageArmed(bool bArmed) { bClassifyStageArmed = bArmed; }
 	bool IsClassifyStageArmed() const { return bClassifyStageArmed && IsVoxelizeStageArmed(); }
+
+	// --- the AssetStamp gather stage (-VoxelGpuWorklistAssetStamp) ----------
+	//
+	// Gated behind the Voxelize stage (it stamps the cell arena that stage
+	// fills). Arming it is what lets asset-bearing records into the whole
+	// cell-arena chain: Flush stages their instance payloads into a per-flush
+	// blob (for records consumed that same flush -- stampsStaged bit 9) and
+	// dispatches the order-preserving gather between the voxelize and
+	// classify dispatches.
+	void SetAssetStampStageArmed(bool bArmed) { bStampStageArmed = bArmed; }
+	bool IsAssetStampStageArmed() const { return bStampStageArmed && IsVoxelizeStageArmed(); }
 
 	// Game thread: the consume window the most recent Flush mirrored --
 	// [ConsumeFirst, ConsumeFirst + Take) in monotonic record indices. A
@@ -283,6 +349,11 @@ public:
 		// corruption, the leg invalid outright.
 		uint64 CtDwordMismatches = 0;
 		uint64 CtDwordsChecked = 0;
+		// The AssetStamp gather's byte gate (stats [10..11]): the stamped
+		// cell arena vs a classic voxelize + per-instance stamp re-run. A
+		// mismatch is a wrong asset voxel in the pool -- leg invalid.
+		uint64 StampCellMismatches = 0;
+		uint64 StampCellsChecked = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -339,6 +410,13 @@ private:
 	uint32 VoxelizeCellBudget = 0;   // per-flush record cap while armed (see setter)
 	uint32 CellArenaRecords = 0;     // slices the cell arena holds; latched at creation
 	TRefCountPtr<FRDGPooledBuffer> PooledCellArena;
+	// --- AssetStamp gather stage --------------------------------------------
+	bool bStampStageArmed = false;
+	// Parallel to Staged: record i's asset payload (empty for asset-free).
+	// Consumed by Flush -- staged into the flush blob for records the flush
+	// consumes, dropped (with a counter's worth of nothing: the record falls
+	// back on the host) for deferred ones.
+	TArray<FVoxelWorklistAssetPayload> StagedAssets;
 	// --- fused ClassifyTotals stage (same lifetime rules) -------------------
 	bool bClassifyStageArmed = false;
 	uint32 ClassifyArenaRecords = 0; // slices the five arenas hold; latched at creation

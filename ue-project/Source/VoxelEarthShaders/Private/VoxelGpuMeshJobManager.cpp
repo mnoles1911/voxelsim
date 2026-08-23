@@ -563,6 +563,41 @@ static bool VoxelGpuWorklistVerifyCtEnabled()
 	return bEnabled;
 }
 
+// -VoxelGpuWorklistAssetStamp=1 (P3 stage 4), on top of
+// -VoxelGpuWorklistVoxelize: Flush stages every consumed asset record's
+// resolved instances into a per-flush blob and dispatches the
+// ORDER-PRESERVING gather (one thread per column, instances walked in slice
+// order -- the classic per-instance pass order, in-thread) between the
+// voxelize and classify dispatches. This is what admits ASSET CHUNKS to the
+// whole cell-arena chain: wlvox/wlct fbAssets stop growing and those chunks
+// drop their VoxelizeMain, their per-instance stamp passes and (with the
+// classify stage) the eight count-side passes. Command-line latched.
+static bool VoxelGpuWorklistAssetStampEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistAssetStamp="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// The stamp's byte gate (-VoxelGpuWorklistVerifyStamp): every converted ASSET
+// chunk ALSO runs classic VoxelizeMain + the classic per-instance AssetStamp
+// passes into the transient plus a 512-group compare of the STAMPED cells
+// into stats [10..11], riding the proof readback. Verify arm only.
+static bool VoxelGpuWorklistVerifyStampEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistVerifyStamp="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
 // -VoxelGpuWorklistCellBudget=<n> (default 256): the per-flush record cap
 // while the Voxelize stage is armed. The cell arena costs 128 KiB per record
 // (32,768 cells x 4 B) -- 256 is a 32 MiB arena and 15,360 chunks/s of
@@ -2203,6 +2238,7 @@ void FVoxelGpuMeshJobManager::Tick()
 			Worklist.SetVoxelizeStageArmed(VoxelGpuWorklistVoxelizeEnabled(),
 			                               VoxelGpuWorklistCellBudget());
 			Worklist.SetClassifyStageArmed(VoxelGpuWorklistClassifyEnabled());
+			Worklist.SetAssetStampStageArmed(VoxelGpuWorklistAssetStampEnabled());
 		}
 		if (!bWorklistArmingLogged)
 		{
@@ -2243,6 +2279,18 @@ void FVoxelGpuMeshJobManager::Tick()
 				       VoxelGpuWorklistColumnsEnabled()
 					       ? TEXT("") : TEXT(" -- MISSING on this leg, so EVERY chunk will fall back"));
 			}
+			if (VoxelGpuWorklistAssetStampEnabled())
+			{
+				UE_LOG(LogVoxelGpuMeshJob, Log,
+				       TEXT("[gpu-worklist] ASSETSTAMP STAGE ARMED (-VoxelGpuWorklistAssetStamp): ")
+				       TEXT("asset instances ride the flush as a per-flush blob and the ")
+				       TEXT("order-preserving gather stamps the cell arena -- ASSET CHUNKS now ")
+				       TEXT("enter the converted chain (fbAssets should stop growing; wlstamp ")
+				       TEXT("conv must grow on any flight with assets). Requires ")
+				       TEXT("-VoxelGpuWorklistVoxelize=1%s. Verify arm: -VoxelGpuWorklistVerifyStamp=1."),
+				       VoxelGpuWorklistVoxelizeEnabled()
+					       ? TEXT("") : TEXT(" -- MISSING on this leg, so EVERY chunk will fall back"));
+			}
 			if (VoxelGpuWorklistClassifyEnabled())
 			{
 				UE_LOG(LogVoxelGpuMeshJob, Log,
@@ -2281,6 +2329,7 @@ void FVoxelGpuMeshJobManager::Tick()
 			+ VoxelGpuBatchDetail::kWorklistSpinePassesPerTick
 			+ (Worklist.IsColumnStageArmed() ? 1 : 0)
 			+ (Worklist.IsVoxelizeStageArmed() ? 1 : 0)
+			+ (Worklist.IsAssetStampStageArmed() ? 1 : 0)
 			+ (Worklist.IsClassifyStageArmed() ? 2 : 0);
 		WorklistBatchPassesThisTick = 0;
 		WorklistWinPasses += WorklistPassesThisTick;
@@ -2531,6 +2580,21 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		       P.CtDwordMismatches > 0 ? TEXT(" (CLASSIFYTOTALS VERIFY FAILED -- LEG INVALID)") : TEXT(""),
 		       CtArenaMissing > 0 ? TEXT(" (SCAN ARENAS MISSING -- converted jobs fell back)") : TEXT(""));
 	}
+	// P3 AssetStamp line, armed-only. THE FAILING READINGS: conv=0 while
+	// wlvox conv grows AND the flight carries assets (the stage is armed and
+	// admitting nothing -- check the arming order); mism>0 (LEG INVALID: a
+	// wrong asset voxel is in the pool); checked=0 with conv>0 under the
+	// verify switch (dead gate). conv=0 on an asset-free flight is the
+	// expected reading, not a failure.
+	if (VoxelGpuWorklistAssetStampEnabled())
+	{
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-worklist] wlstamp conv=%lld stampverify checked=%llu mism=%llu ")
+		       TEXT("(cumulative)%s"),
+		       WorklistStampConverted,
+		       P.StampCellsChecked, P.StampCellMismatches,
+		       P.StampCellMismatches > 0 ? TEXT(" (ASSETSTAMP VERIFY FAILED -- LEG INVALID)") : TEXT(""));
+	}
 	WorklistWinTicks = 0;
 	WorklistWinChunks = 0;
 	WorklistWinPasses = 0;
@@ -2652,6 +2716,13 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		// stage can hand the job its arena slice after the flush.
 		TArray<FJobPtr> RecordJobs;
 		RecordJobs.Reserve(Batch.Num());
+		// Parallel to NewRecords when the AssetStamp stage is armed: record
+		// i's resolved-instance payload (empty for asset-free records).
+		// Flush stages a payload into the per-flush blob only if the record
+		// is consumed that same flush; otherwise it is dropped and the job
+		// below falls back classic like any deferred record.
+		const bool bStampArmed = Worklist.IsAssetStampStageArmed();
+		TArray<FVoxelWorklistAssetPayload> RecordPayloads;
 		TSet<FVoxelGpuBrickStack*> TalliedStacks;
 		int64 PassesThisTick = 0;
 		const bool bLeanArmed = VoxelGpuLeanBrickJobsEnabled();
@@ -2725,6 +2796,34 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			                       R.ShadingSurfaceZBits);
 			NewRecords.Add(R);
 			RecordJobs.Add(Job);
+			if (bStampArmed)
+			{
+				FVoxelWorklistAssetPayload& P = RecordPayloads.AddDefaulted_GetRef();
+				const FVoxelGpuRegionRequest& Reg = Job->BrickRegion;
+				if (Reg.AssetInstances.Num() > 0)
+				{
+					P.Instances.Reserve(Reg.AssetInstances.Num());
+					for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Reg.AssetInstances)
+					{
+						FVoxelWorklistAssetInstance& W = P.Instances.AddDefaulted_GetRef();
+						W.AnchorRelVx = Inst.AnchorRelVx;
+						W.AnchorRelVy = Inst.AnchorRelVy;
+						W.AnchorVz = Inst.AnchorVz;
+						W.GridOriginZ = Inst.GridOriginZ;
+						W.RotOriginX = Inst.RotOriginX;
+						W.RotOriginY = Inst.RotOriginY;
+						W.YawQuarter = Inst.YawQuarter;
+						W.SizeX = Inst.SizeX;
+						W.SizeY = Inst.SizeY;
+						W.SizeZ = Inst.SizeZ;
+						// Payload-relative for now; Flush rebases into the
+						// flush blob as it concatenates.
+						W.ColStartsBase = Inst.ColStartsBase;
+					}
+					P.ColStarts = Reg.AssetColStarts;
+					P.Spans = Reg.AssetSpans;
+				}
+			}
 		}
 		const bool bColumnsArmed = VoxelGpuWorklistColumnsEnabled();
 		// The spine's own constant (args + prover + armed Column dispatch) is
@@ -2739,7 +2838,8 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			// generates it. Nothing retries: a refused record's chunk simply
 			// never enters the ring, and RefusedFull growing is the
 			// back-pressure reading the capacity latch exists to surface.
-			Worklist.Append(NewRecords, bColumnsArmed ? &RecordMono : nullptr);
+			Worklist.Append(NewRecords, bColumnsArmed ? &RecordMono : nullptr,
+			                bStampArmed ? &RecordPayloads : nullptr);
 		}
 
 		// --- Column stage: flush HERE, before the batch render command ------
@@ -2812,14 +2912,29 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 					// designed exclusion, fb is the ring falling behind.
 					if (Worklist.IsVoxelizeStageArmed())
 					{
-						if (RecordJobs[RIdx]->BrickRegion.AssetInstances.Num() == 0)
+						const bool bJobAssets =
+							RecordJobs[RIdx]->BrickRegion.AssetInstances.Num() > 0;
+						if (!bJobAssets || bStampArmed)
 						{
 							RecordJobs[RIdx]->bWorklistCellsFed = true;
 							++WorklistVoxConverted;
+							if (bJobAssets)
+							{
+								// The stamp stage's own conversion count. Its
+								// classic per-instance stamp passes also
+								// disappear, but they were never in the pass
+								// tally (the per-job constants predate
+								// assets), so the tally's -1 below
+								// UNDERSTATES the real win for these chunks
+								// -- stated rather than silently wrong.
+								++WorklistStampConverted;
+							}
 							// Same shape as the column term: drops its
-							// VoxelizeMain (-1); verify puts it back and adds
-							// the compare (net +1).
-							PassesThisTick += VoxelGpuWorklistVerifyVoxEnabled() ? 1 : -1;
+							// VoxelizeMain (-1); the active verify arm puts
+							// it back and adds the compare (net +1).
+							PassesThisTick += (bJobAssets
+								? VoxelGpuWorklistVerifyStampEnabled()
+								: VoxelGpuWorklistVerifyVoxEnabled()) ? 1 : -1;
 							// P3 stage 3: the fused ClassifyTotals rides the
 							// cell feed. Drops classify + both 3-pass scans +
 							// totals (-8, the conversion's largest cut);
@@ -2834,6 +2949,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 						}
 						else
 						{
+							// Stamp stage NOT armed: the designed exclusion.
 							++WorklistVoxFallbackAssets;
 							if (Worklist.IsClassifyStageArmed())
 							{
@@ -2877,9 +2993,10 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	const bool bVerifyColsArmed = VoxelGpuWorklistVerifyColsEnabled();
 	const bool bVerifyVoxArmed = VoxelGpuWorklistVerifyVoxEnabled();
 	const bool bVerifyCtArmed = VoxelGpuWorklistVerifyCtEnabled();
+	const bool bVerifyStampArmed = VoxelGpuWorklistVerifyStampEnabled();
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshDispatchBatch)(
 		[Jobs = MoveTemp(Batch), WorklistPtr, bVerifyColsArmed,
-		 bVerifyVoxArmed, bVerifyCtArmed](FRHICommandListImmediate& RHICmdList)
+		 bVerifyVoxArmed, bVerifyCtArmed, bVerifyStampArmed](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 
@@ -3145,6 +3262,17 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 							ColumnFeed.CellArena = WorklistCols.CellArena;
 							ColumnFeed.bVerifyVox =
 								bVerifyVoxArmed && WorklistCols.Stats != nullptr;
+							// A cell-fed job with assets is only ever flagged
+							// when the stamp stage staged them (the set site
+							// requires the stage armed, and Flush stages
+							// exactly the records it consumes) -- the region
+							// graph's checkf holds by that construction.
+							if (Job->BrickRegion.AssetInstances.Num() > 0)
+							{
+								ColumnFeed.bCellsIncludeAssets = true;
+								ColumnFeed.bVerifyStamp =
+									bVerifyStampArmed && WorklistCols.Stats != nullptr;
+							}
 						}
 						else
 						{

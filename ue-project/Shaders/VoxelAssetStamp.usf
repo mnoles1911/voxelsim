@@ -176,6 +176,55 @@ uint2 CellBoxSize;       // threads dispatched over this; box is inclusive of
                          // every cell whose rep the instance COULD cover --
                          // the rep-in-box test below is the exact filter
 
+// --- the two parity-critical gather pieces, factored --------------------------
+//
+// P3 worklist AssetStamp (2026-08-23): the worklist's order-preserving gather
+// kernel (VoxelWorklistAssetStamp.usf) walks the same rotated-box test, the
+// same inverse yaw map and the same span search as AssetStampCoarseMain --
+// worldgen.ush's columnSampleAt rule applied here: factor the text and CALL
+// it from both entry points, so the two cannot drift.
+
+// Inverse quarter-turn -- the EXACT mirror of AssetGrid::atYaw's at()
+// arguments, not of the forward map the scatter kernel uses:
+//   yaw 0: at(rx, ry, .)
+//   yaw 1: at(ry, SizeY-1-rx, .)
+//   yaw 2: at(SizeX-1-rx, SizeY-1-ry, .)
+//   yaw 3: at(SizeX-1-ry, rx, .)
+void assetYawInverse(uint YawQ, uint SzX, uint SzY, int Rx, int Ry,
+                     out int Bx, out int By)
+{
+    switch (YawQ & 3u)
+    {
+        case 0u: Bx = Rx;                By = Ry;                break;
+        case 1u: Bx = Ry;                By = int(SzY) - 1 - Rx; break;
+        case 2u: Bx = int(SzX) - 1 - Rx; By = int(SzY) - 1 - Ry; break;
+        default: Bx = int(SzX) - 1 - Ry; By = Rx;                break;
+    }
+}
+
+// Gather: the material of the span containing Rz, or 0 (air). Spans are
+// ascending and non-overlapping (columnRuns visits ascending z; air runs
+// were dropped at build), so the first span starting past Rz ends it.
+uint assetSpanMatAt(uint S0, uint S1, int Rz)
+{
+    uint Mat = 0u;
+    for (uint S = S0; S < S1; ++S)
+    {
+        const uint Packed = Spans[S];
+        const int Z0 = int(Packed >> 20);
+        if (Rz < Z0)
+        {
+            break;
+        }
+        if (Rz < Z0 + int((Packed >> 8) & 0xfffu))
+        {
+            Mat = Packed & 0xffu;
+            break;
+        }
+    }
+    return Mat;
+}
+
 [numthreads(8, 8, 1)]
 void AssetStampCoarseMain(uint3 Tid : SV_DispatchThreadID)
 {
@@ -206,20 +255,10 @@ void AssetStampCoarseMain(uint3 Tid : SV_DispatchThreadID)
         return;
     }
 
-    // Inverse quarter-turn -- the EXACT mirror of AssetGrid::atYaw's at()
-    // arguments, not of the forward map the scatter kernel uses:
-    //   yaw 0: at(rx, ry, .)
-    //   yaw 1: at(ry, SizeY-1-rx, .)
-    //   yaw 2: at(SizeX-1-rx, SizeY-1-ry, .)
-    //   yaw 3: at(SizeX-1-ry, rx, .)
+    // Inverse quarter-turn -- factored (see assetYawInverse above), called
+    // from here and from the worklist gather kernel.
     int Bx, By;
-    switch (YawQuarter & 3u)
-    {
-        case 0u: Bx = Rx;                  By = Ry;                  break;
-        case 1u: Bx = Ry;                  By = int(SizeY) - 1 - Rx; break;
-        case 2u: Bx = int(SizeX) - 1 - Rx; By = int(SizeY) - 1 - Ry; break;
-        default: Bx = int(SizeX) - 1 - Ry; By = Rx;                  break;
-    }
+    assetYawInverse(YawQuarter, SizeX, SizeY, Rx, Ry, Bx, By);
 
     const uint C = uint(Bx) * SizeY + uint(By);
     const uint S0 = ColStarts[ColStartsBase + C];
@@ -251,24 +290,9 @@ void AssetStampCoarseMain(uint3 Tid : SV_DispatchThreadID)
             continue;   // at() answers MAT_AIR out of range; so does this
         }
 
-        // Gather: the span containing Rz, if any. Spans are ascending and
-        // non-overlapping (columnRuns visits ascending z; air runs were
-        // dropped at build), so the first span starting past Rz ends it.
-        uint Mat = 0u;
-        for (uint S = S0; S < S1; ++S)
-        {
-            const uint Packed = Spans[S];
-            const int Z0 = int(Packed >> 20);
-            if (Rz < Z0)
-            {
-                break;
-            }
-            if (Rz < Z0 + int((Packed >> 8) & 0xfffu))
-            {
-                Mat = Packed & 0xffu;
-                break;
-            }
-        }
+        // Gather -- factored (see assetSpanMatAt above), called from here and
+        // from the worklist gather kernel.
+        const uint Mat = assetSpanMatAt(S0, S1, Rz);
         if (Mat == 0u)
         {
             continue;   // air in THIS instance falls through to the next

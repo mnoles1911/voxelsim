@@ -306,6 +306,9 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaCells)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
 			SHADER_PARAMETER(uint32, VerifyArenaBase)
+			// 6 (vox verify) or 10 (stamp verify) -- the kernel writes
+			// mismatches to [base], checked to [base+1].
+			SHADER_PARAMETER(uint32, VerifyStatsBase)
 		END_SHADER_PARAMETER_STRUCT()
 
 		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
@@ -486,6 +489,49 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Spans)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
 		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- AssetStampWorklistMain: the order-preserving gather (P3 stage 4) ---
+	//
+	// One indirect dispatch per tick (16 groups per record, one thread per
+	// column) stamping every stamps-staged record's instances into its cell
+	// arena slice -- VoxelWorklistAssetStamp.usf has the whole argument.
+	// FGlobalShader base like its classic siblings (the file it includes
+	// carries no worldgen version lock); the stage defines are the
+	// torn-dispatch lock.
+	class FVoxelWorklistAssetStampCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistAssetStampCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistAssetStampCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return true;
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl)
+			SHADER_PARAMETER(uint32, RingCapacity)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuAssetStampInstance>, WorklistAssetInstances)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ColStarts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Spans)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_STAMP_GROUPS"),
+			                         FVoxelGpuWorklist::kStampGroupsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_COLS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kColumnsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_CELLS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kCellsPerRecord);
+		}
 	};
 
 	// --- QuadTotalMain: the 4-byte scan total (Wave D / D3) ----------------
@@ -1252,6 +1298,8 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistVoxelizeVerifyCS, VOXEL_WORKLIST_VOXELIZE_
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClassifyCS,       VOXEL_WORKLIST_CLASSIFY_USF, "ClassifyWorklistMain",             SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClassifyTotalsCS, VOXEL_WORKLIST_CLASSIFY_USF, "ClassifyTotalsWorklistMain",       SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClassifyVerifyCS, VOXEL_WORKLIST_CLASSIFY_USF, "ClassifyTotalsWorklistVerifyMain", SF_Compute);
+#define VOXEL_WORKLIST_ASSET_STAMP_USF "/VoxelEarth/VoxelWorklistAssetStamp.usf"
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistAssetStampCS, VOXEL_WORKLIST_ASSET_STAMP_USF, "AssetStampWorklistMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMeshCountCS,  VOXEL_WORLDGEN_USF, "MeshCountMain",  SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanBlocksCS, VOXEL_WORLDGEN_USF, "ScanBlocksMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanSumsCS,   VOXEL_WORLDGEN_USF, "ScanSumsMain",   SF_Compute);
@@ -1774,16 +1822,33 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	const bool bWorklistCells = bWorklistColumns && ColumnFeed->CellArena != nullptr;
 	if (bWorklistCells)
 	{
-		checkf(Request.AssetInstances.Num() == 0 && Request.BricksZ == 4
+		// Asset instances are admissible only when the flush graph's gather
+		// already stamped them into the arena (stage 4) -- otherwise the
+		// arena is terrain-only and packing this chunk from it would drop
+		// its assets silently.
+		checkf((Request.AssetInstances.Num() == 0 || ColumnFeed->bCellsIncludeAssets)
+		       && Request.BricksZ == 4
 		       && Request.bBrickPack && !Request.bMeshChain,
-		       TEXT("worklist cell feed on a region that is not a lean asset-free brick chunk"));
+		       TEXT("worklist cell feed on a region that is not a lean brick chunk ")
+		       TEXT("(or carries assets the stamp stage did not stage)"));
 	}
 	// Verify arm for the cells: the classic VoxelizeMain still runs (into the
 	// region transient, reading the SAME arena columns the converted kernel
 	// read) purely as the byte reference; the brick chain reads the ARENA
-	// either way, so the verified path is the live path.
+	// either way, so the verified path is the live path. Asset-free chunks
+	// only -- an asset chunk's arena holds STAMPED cells and its reference
+	// is the verify-stamp arm below.
 	const bool bVerifyVox = bWorklistCells && ColumnFeed->bVerifyVox
-	                     && ColumnFeed->VerifyStats != nullptr;
+	                     && ColumnFeed->VerifyStats != nullptr
+	                     && Request.AssetInstances.Num() == 0;
+	// Verify arm for the stamp (P3 stage 4): classic VoxelizeMain AND the
+	// classic per-instance AssetStamp passes into the transient, compared
+	// against the stamped arena slice into stats [10..11].
+	const bool bVerifyStamp = bWorklistCells && ColumnFeed->bVerifyStamp
+	                       && ColumnFeed->VerifyStats != nullptr
+	                       && Request.AssetInstances.Num() > 0;
+	// Any arm that needs the classic transient as a byte reference.
+	const bool bClassicCellsRef = bVerifyVox || bVerifyStamp;
 
 	// --- P3 fused ClassifyTotals: brick counts/offsets/totals in arenas? ----
 	//
@@ -1855,7 +1920,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	// transient exists for this region -- the cells live in the worklist cell
 	// arena and the brick chain reads them there. Null-not-unwritten, the
 	// Columns rule above verbatim.
-	Out.Cells = (!bWorklistCells || bVerifyVox)
+	Out.Cells = (!bWorklistCells || bClassicCellsRef)
 		? GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumCells),
 			TEXT("Voxel.Cells"))
@@ -1917,7 +1982,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	// Voxelize stage's entire win, the Column skip's twin. Under the verify
 	// arm the classic pass still runs, into the transient, purely as the
 	// byte reference; the brick chain reads the ARENA either way.
-	if (!bWorklistCells || bVerifyVox)
+	if (!bWorklistCells || bClassicCellsRef)
 	{
 		FVoxelVoxelizeCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelVoxelizeCS::FParameters>();
 		FillLooseParameters(*Params, Request);
@@ -1947,24 +2012,6 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
 	}
 
-	// --- pass 2v (verify arm only): converted cells vs classic --------------
-	if (bVerifyVox)
-	{
-		FVoxelWorklistVoxelizeVerifyCS::FParameters* Params =
-			GraphBuilder.AllocParameters<FVoxelWorklistVoxelizeVerifyCS::FParameters>();
-		Params->VerifyClassicCells = GraphBuilder.CreateSRV(Out.Cells);
-		Params->VerifyArenaCells = GraphBuilder.CreateSRV(ColumnFeed->CellArena);
-		Params->WorklistStats = GraphBuilder.CreateUAV(ColumnFeed->VerifyStats);
-		Params->VerifyArenaBase = ColumnFeed->SliceIndex * FVoxelGpuWorklist::kCellsPerRecord;
-
-		TShaderMapRef<FVoxelWorklistVoxelizeVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-		FComputeShaderUtils::AddPass(
-			GraphBuilder,
-			RDG_EVENT_NAME("Voxel.WorklistVoxelizeVerify(slice %u)", ColumnFeed->SliceIndex),
-			Shader, Params,
-			FIntVector(FVoxelGpuWorklist::kCellsPerRecord / 64, 1, 1));
-	}
-
 	// --- pass 2a: AssetStampMain / AssetStampCoarseMain, one dispatch per ----
 	// --- instance -------------------------------------------------------------
 	//
@@ -1979,7 +2026,10 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	//
 	// An empty request skips all of this, including for the verify/digest
 	// path, which never fills the arrays and therefore stays terrain-only.
-	if (Request.AssetInstances.Num() > 0)
+	// SKIPPED for a cell-fed asset chunk (the flush graph's gather already
+	// stamped the arena) -- unless the verify-stamp arm needs the classic
+	// chain as its byte reference, in which case it stamps the TRANSIENT.
+	if (Request.AssetInstances.Num() > 0 && (!bWorklistCells || bVerifyStamp))
 	{
 		FRDGBufferRef ColStartsBuffer = CreateStructuredBuffer(
 			GraphBuilder, TEXT("Voxel.AssetColStarts"), sizeof(uint32),
@@ -2093,6 +2143,31 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 					           FMath::DivideAndRoundUp(uint32(C1y - C0y + 1), 8u), 1));
 			}
 		}
+	}
+
+	// --- pass 2v (verify arms only): converted cells vs classic -------------
+	//
+	// AFTER the classic AssetStamp block, so the verify-stamp arm compares
+	// the fully composed transient. For the vox arm (asset-free chunks) this
+	// position is identical to comparing right after VoxelizeMain.
+	if (bVerifyVox || bVerifyStamp)
+	{
+		FVoxelWorklistVoxelizeVerifyCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistVoxelizeVerifyCS::FParameters>();
+		Params->VerifyClassicCells = GraphBuilder.CreateSRV(Out.Cells);
+		Params->VerifyArenaCells = GraphBuilder.CreateSRV(ColumnFeed->CellArena);
+		Params->WorklistStats = GraphBuilder.CreateUAV(ColumnFeed->VerifyStats);
+		Params->VerifyArenaBase = ColumnFeed->SliceIndex * FVoxelGpuWorklist::kCellsPerRecord;
+		// [6..7] isolates the voxelize conversion; [10..11] the stamp gather.
+		Params->VerifyStatsBase = bVerifyStamp ? 10u : 6u;
+
+		TShaderMapRef<FVoxelWorklistVoxelizeVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("Voxel.WorklistCellsVerify(slice %u, stats %u)",
+			               ColumnFeed->SliceIndex, bVerifyStamp ? 10u : 6u),
+			Shader, Params,
+			FIntVector(FVoxelGpuWorklist::kCellsPerRecord / 64, 1, 1));
 	}
 
 	// --- pass 2b: BandReduceMain (Wave D / D6) -----------------------
@@ -2660,6 +2735,33 @@ void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
 			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClassifyTotals(indirect)"), Shader, Params,
 			Dispatch.IndirectArgs, Dispatch.TotalsArgsOffset);
 	}
+}
+
+void VoxelGpuWorldGen::AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder,
+                                                 const FWorklistAssetStampDispatch& Dispatch)
+{
+	check(IsInRenderingThread());
+	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs && Dispatch.CellArena);
+	check(Dispatch.Instances && Dispatch.ColStarts && Dispatch.Spans);
+	check(Dispatch.RingCapacity > 0);
+
+	FVoxelWorklistAssetStampCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelWorklistAssetStampCS::FParameters>();
+	Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+	Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+	Params->RingCapacity = Dispatch.RingCapacity;
+	Params->WorklistAssetInstances = GraphBuilder.CreateSRV(Dispatch.Instances);
+	Params->ColStarts = GraphBuilder.CreateSRV(Dispatch.ColStarts);
+	Params->Spans = GraphBuilder.CreateSRV(Dispatch.Spans);
+	// The cell arena, stamped in place -- worldgen's OutCells name, both
+	// classic stamp kernels' convention.
+	Params->OutCells = GraphBuilder.CreateUAV(Dispatch.CellArena);
+	Params->IndirectArgs = Dispatch.IndirectArgs;
+
+	TShaderMapRef<FVoxelWorklistAssetStampCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistAssetStamp(indirect)"), Shader, Params,
+		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
 }
 
 void VoxelGpuWorldGen::AddQuadCompactPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,

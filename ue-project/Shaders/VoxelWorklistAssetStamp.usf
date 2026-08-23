@@ -1,0 +1,168 @@
+// VoxelWorklistAssetStamp.usf -- the FOURTH converted stage of the P3
+// worklist: the ORDER-PRESERVING AssetStamp gather (docs/
+// gpu-worklist-plan-2026-08-23.md, conversion step 5). Behind
+// -VoxelGpuWorklistAssetStamp=1, on top of -VoxelGpuWorklistVoxelize=1.
+//
+// WHAT IT UNLOCKS: asset-bearing chunks for the Voxelize and ClassifyTotals
+// stages, which until now fell back classic (wlvox/wlct fbAssets). One
+// indirect dispatch per tick (16 groups per record, one thread per COLUMN)
+// stamps every stamps-staged record's instances into its CELL ARENA slice,
+// between the voxelize dispatch (terrain in) and the classify pair (bricks
+// out), all inside the flush graph -- the batch graph still only READS the
+// arena, so no UAV barrier ever splits it.
+//
+// ORDER PRESERVATION, THE CONTRACT THE PLAN NAMED. The classic path runs one
+// pass PER INSTANCE, in array order, each writing AIR cells only -- so the
+// first instance in order wins every overlapped cell, and terrain always
+// wins over assets. Here ONE THREAD owns one column and loops the record's
+// instances [AssetBase, AssetBase+AssetCount) IN THAT SAME ORDER, writing
+// air cells only: sequential in-thread writes reproduce the pass ordering
+// exactly, with no cross-thread races (no other thread touches this
+// column's cells).
+//
+// THE MATH IS NOT COPIED, IT IS CALLED: the rotated-box rep test, the
+// inverse yaw map (assetYawInverse) and the span gather (assetSpanMatAt) are
+// AssetStampCoarseMain's own text, factored in VoxelAssetStamp.usf. At
+// CoarseScale 1 the rep of a cell is the cell itself, so the same gather is
+// the level-0 form -- the CPU's own sampling direction
+// (AssetField::materialAtResolved gathers too). Parity with the level-0
+// SCATTER kernel rests on the forward/inverse map bijection, and the verify
+// arm measures it rather than trusting the argument
+// (-VoxelGpuWorklistVerifyStamp, stats [10..11]).
+//
+// INPUTS: this flush's asset blob (instances + ColStarts + Spans, transient,
+// staged by FVoxelGpuWorklist::Flush ONLY for records consumed this same
+// flush -- stampsStaged, bit 9, is the gate, so a deferred record can never
+// read another flush's blob).
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelWorklist.ush"
+// For the factored helpers AND the ColStarts/Spans/OutCells declarations --
+// this file deliberately declares no duplicate of anything the classic
+// kernels bind. The classic entry points come along unreferenced; the
+// per-instance uniforms they read are dead here and strip.
+#include "/VoxelEarth/VoxelAssetStamp.usf"
+
+#ifndef VXC_WORKLIST_STAMP_GROUPS
+#error "VXC_WORKLIST_STAMP_GROUPS not defined -- dispatch this kernel only through FVoxelWorklistAssetStampCS"
+#endif
+#ifndef VXC_WORKLIST_COLS_PER_RECORD
+#error "VXC_WORKLIST_COLS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistAssetStampCS"
+#endif
+#ifndef VXC_WORKLIST_CELLS_PER_RECORD
+#error "VXC_WORKLIST_CELLS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistAssetStampCS"
+#endif
+#if VXC_WORKLIST_STAMP_GROUPS != 16
+#error "AssetStamp stage shape drifted: 1,024 columns / 64 threads = 16 groups per record, and the host table must agree"
+#endif
+#if VXC_WORKLIST_COLS_PER_RECORD != 1024
+#error "AssetStamp stage shape drifted: a lean brick chunk is 32x32 columns"
+#endif
+#if VXC_WORKLIST_CELLS_PER_RECORD != 32768
+#error "AssetStamp stage shape drifted: a lean brick chunk is 32x32x32 cells"
+#endif
+
+// The ring (same three bindings, same meanings, as every worklist consumer).
+StructuredBuffer<GpuChunkWorkRecord> WorklistRecords;
+StructuredBuffer<uint> WorklistControl;   // [0]=consumeFirst [1]=consumeCount
+uint RingCapacity;
+
+// This flush's staged instances (GpuAssetStampInstance; VoxelWorklist.ush).
+StructuredBuffer<GpuAssetStampInstance> WorklistAssetInstances;
+
+[numthreads(64, 1, 1)]
+void AssetStampWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Take = WorklistControl[1];
+	const uint Rec = Gid.x / VXC_WORKLIST_STAMP_GROUPS;
+	// Belt-and-braces against a torn args write, not a code path.
+	if (Rec >= Take)
+	{
+		return;
+	}
+	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
+	const GpuChunkWorkRecord R = WorklistRecords[Slot];
+	// Only records whose instances are in THIS flush's blob (group-uniform).
+	// Asset-free records have nothing to stamp; deferred asset records fall
+	// back classic on the host and their arena slices go unread.
+	if (worklistHasAssets(R) == 0u || worklistStampsStaged(R) == 0u)
+	{
+		return;
+	}
+
+	const uint ColIndex = (Gid.x % VXC_WORKLIST_STAMP_GROUPS) * 64u + GTid.x;   // 0..1023
+	const uint2 T = uint2(ColIndex & 31u, ColIndex >> 5u);
+
+	// AssetStampCoarseMain's rep arithmetic, per record instead of per
+	// $Globals. Scale 1 (level 0): Half is 0 and the rep is the cell itself.
+	const int Scale = int(worklistCoarseScale(R));
+	const int Half = int(worklistCoarseScale(R) >> 1u);   // literal shift: lint-clean
+
+	// Cell indexing -- the same six mirrored lines as both classic kernels,
+	// with the lean shape (bricksX 4, bricksZ 4) and the record's arena base.
+	const uint Lx = T.x & 7u;
+	const uint Ly = T.y & 7u;
+	const uint FootprintIndex = (T.x >> 3) + 4u * (T.y >> 3);
+	const uint CellArenaBase = Rec * VXC_WORKLIST_CELLS_PER_RECORD;
+	const int ZCellBase = R.BrickZMin * 8;
+	const int RegionZCells = 32;   // BricksZ 4 x 8, the lean shape
+
+	// Instances IN SLICE ORDER -- the classic per-instance pass order, so
+	// first-non-air-wins picks the same winner for every overlapped cell.
+	for (uint I = 0u; I < R.AssetCount; ++I)
+	{
+		const GpuAssetStampInstance Inst = WorklistAssetInstances[R.AssetBase + I];
+
+		// Rotated-box-local coordinates of this column's rep -- the CPU
+		// shortlist's exact admission test, per thread (AssetStampCoarseMain's
+		// text with the instance's fields for the $Globals).
+		const int Rx = int(T.x) * Scale + Half - Inst.AnchorRelVx - Inst.RotOriginX;
+		const int Ry = int(T.y) * Scale + Half - Inst.AnchorRelVy - Inst.RotOriginY;
+		const bool bYawSwaps = (Inst.YawQuarter & 1u) != 0u;
+		const int RotSizeX = bYawSwaps ? int(Inst.SizeY) : int(Inst.SizeX);
+		const int RotSizeY = bYawSwaps ? int(Inst.SizeX) : int(Inst.SizeY);
+		if (Rx < 0 || Rx >= RotSizeX || Ry < 0 || Ry >= RotSizeY)
+		{
+			continue;
+		}
+
+		int Bx, By;
+		assetYawInverse(Inst.YawQuarter, Inst.SizeX, Inst.SizeY, Rx, Ry, Bx, By);
+		const uint C = uint(Bx) * Inst.SizeY + uint(By);
+		const uint S0 = ColStarts[Inst.ColStartsBase + C];
+		const uint S1 = ColStarts[Inst.ColStartsBase + C + 1u];
+		if (S0 == S1)
+		{
+			continue;   // baked column is all air
+		}
+
+		for (int K = 0; K < RegionZCells; ++K)
+		{
+			// Baked-local z of this cell's rep -- AssetStampCoarseMain's line.
+			const int Rz = (ZCellBase + K) * Scale + Half - Inst.AnchorVz - Inst.GridOriginZ;
+			if (Rz < 0 || Rz >= int(Inst.SizeZ))
+			{
+				continue;   // at() answers MAT_AIR out of range; so does this
+			}
+			const uint Mat = assetSpanMatAt(S0, S1, Rz);
+			if (Mat == 0u)
+			{
+				continue;   // air in THIS instance falls through to the next
+			}
+
+			const uint BzBrick = uint(K) >> 3;
+			const uint Lz = uint(K) & 7u;
+			const uint BrickIndex = FootprintIndex * 4u + BzBrick;
+			const uint CellIndex = CellArenaBase + BrickIndex * 512u
+			                     + (Lx + 8u * (Ly + 8u * Lz));
+			const uint Cell = OutCells[CellIndex];
+			// AIR ONLY -- terrain (and every earlier instance this thread
+			// already stamped) wins; upper bits preserved, both classic
+			// kernels' rule verbatim.
+			if ((Cell & 0xffu) == 0u)
+			{
+				OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+			}
+		}
+	}
+}

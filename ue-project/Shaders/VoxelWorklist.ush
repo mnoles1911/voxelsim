@@ -16,6 +16,11 @@ struct GpuChunkWorkRecord
 	int  OriginVy;
 	int  BrickZMin;         // level-L brick z of the chunk base
 	uint LevelFlags;        // CoarseLevel:0..3 | RingSkirtMask:4..7 | hasAssets:8
+	                        // | stampsStaged:9 (this record's asset instances
+	                        // are in THIS flush's blob at AssetBase -- set by
+	                        // Flush, only for records consumed the same flush
+	                        // they were staged, so a deferred record can never
+	                        // read another flush's blob)
 	uint ChunkSlot;
 	uint GenId;
 	uint AssetBase;
@@ -40,6 +45,37 @@ uint worklistCoarseScale(GpuChunkWorkRecord R)
 	     : (L == 4u) ? 16u : (L == 5u) ? 32u : 64u;
 }
 uint worklistHasAssets(GpuChunkWorkRecord R) { return (R.LevelFlags >> 8) & 1u; }
+uint worklistStampsStaged(GpuChunkWorkRecord R) { return (R.LevelFlags >> 9) & 1u; }
+// The converted-chain asset gate, shared by Voxelize / Classify /
+// ClassifyTotals / AssetStamp: a record participates in the cell-arena chain
+// unless it has assets whose instances are NOT in this flush's blob. Group
+// uniform at every call site (R derives from the group id).
+uint worklistAssetsBlockRecord(GpuChunkWorkRecord R)
+{
+	return (worklistHasAssets(R) != 0u && worklistStampsStaged(R) == 0u) ? 1u : 0u;
+}
+
+// --- the per-flush asset instance blob (AssetStamp stage) -------------------
+// MIRROR OF FVoxelWorklistAssetInstance (VoxelGpuWorklist.h), 12 dwords, 48 B.
+// A record with stampsStaged reads instances [AssetBase, AssetBase+AssetCount)
+// of THIS flush's blob; ColStartsBase indexes the flush ColStarts buffer,
+// whose VALUES index the flush Spans buffer (both rebased at staging).
+// AnchorRelVx/Vy are relative to the OWNING record's OriginVx/Vy.
+struct GpuAssetStampInstance
+{
+	int  AnchorRelVx;
+	int  AnchorRelVy;
+	int  AnchorVz;
+	int  GridOriginZ;
+	int  RotOriginX;
+	int  RotOriginY;
+	uint YawQuarter;
+	uint SizeX;
+	uint SizeY;
+	uint SizeZ;
+	uint ColStartsBase;
+	uint Pad0;
+};
 
 // --- the record fold, GPU half ----------------------------------------------
 //

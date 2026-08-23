@@ -26,13 +26,14 @@
 // BrickPackMain read the slice through brickpack.ush's CellReadBase in the
 // batch graph that follows.
 //
-// ASSET RECORDS FALL BACK, counted on the host: AssetStamp writes cells
-// between Voxelize and the brick chain, and stamping into the shared arena
-// from the batch graph would put UAV barriers on a buffer every other chunk
-// is reading -- serializing the whole batch. Until the flush-level asset
-// buffer lands (conversion step 5), a record with hasAssets keeps its classic
-// VoxelizeMain + AssetStamp, and this kernel's guard below makes the skip
-// group-uniform.
+// ASSET RECORDS: converted when their stamps are staged (stampsStaged, bit 9
+// -- the AssetStamp stage put their instances in this flush's blob and its
+// indirect dispatch stamps the arena BETWEEN this pass and the classify
+// pair, all inside the flush graph, so the batch graph still only READS the
+// arena and no UAV barrier ever splits it). A record with assets and NO
+// staged stamps -- stamp stage off, or the record deferred past the flush
+// that staged it -- falls back classic, group-uniformly, counted on the
+// host (wlvox fbAssets).
 
 #include "/Engine/Public/Platform.ush"
 #include "/VoxelEarth/VoxelWorklist.ush"
@@ -90,7 +91,7 @@ void VoxelizeWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
 	// Asset chunks keep their classic Voxelize + AssetStamp (header). R is
 	// uniform across the group (Rec derives from Gid), so the whole group
 	// retires together -- no divergence inside a wave.
-	if (worklistHasAssets(R) != 0u)
+	if (worklistAssetsBlockRecord(R) != 0u)
 	{
 		return;
 	}
@@ -114,24 +115,28 @@ void VoxelizeWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
 // --- VoxelizeWorklistVerifyMain: the stage's byte gate ----------------------
 //
 // Byte-compares ONE converted chunk's cell-arena slice against a classic
-// VoxelizeMain dispatch of the same chunk (which the host runs into the
-// region's transient Cells, ONLY under -VoxelGpuWorklistVerifyVox=1, reading
-// the SAME column arena slice the converted kernel read -- so the compare
-// isolates the voxelize conversion, not the column one). Mismatching CELLS
-// accumulate into WorklistStats[6], cells compared into WorklistStats[7];
-// both ride the existing ~5 s proof readback.
+// re-run of the same chunk into the region's transient Cells, reading the
+// SAME column arena slice the converted kernel read. TWO verify arms share
+// this kernel, split by VerifyStatsBase:
+//   base 6  (-VoxelGpuWorklistVerifyVox, terrain-only chunks): the classic
+//           re-run is VoxelizeMain alone -- isolates the voxelize conversion.
+//   base 10 (-VoxelGpuWorklistVerifyStamp, asset chunks): the classic re-run
+//           is VoxelizeMain + the per-instance AssetStamp passes -- compares
+//           the stamped result, isolating the stamp gather + ordering.
+// Mismatching CELLS accumulate into WorklistStats[base], cells compared into
+// WorklistStats[base+1]; both ride the ~5 s proof readback.
 //
-// THE FAILING READINGS: stats[6] > 0 -- the converted kernel computes
+// THE FAILING READINGS: stats[base] > 0 -- the converted chain computes
 // different cells than the classic one; the leg is INVALID (wrong terrain is
-// in the pool). stats[7] staying 0 while converted chunks flow (wlvox conv=N>0)
-// with the verify switch armed -- the verify itself is dead and "no
-// mismatches" is vacuous. One 512-group pass per verified chunk, verify arm
-// only.
+// in the pool). stats[base+1] staying 0 while converted chunks flow with the
+// verify switch armed -- the verify itself is dead and "no mismatches" is
+// vacuous. One 512-group pass per verified chunk, verify arm only.
 
 StructuredBuffer<uint> VerifyClassicCells;   // the classic dispatch's 32,768
 StructuredBuffer<uint> VerifyArenaCells;     // the cell arena (SRV this time)
 RWStructuredBuffer<uint> WorklistStats;
 uint VerifyArenaBase;                        // slice * 32768
+uint VerifyStatsBase;                        // 6 (vox) or 10 (stamp)
 
 [numthreads(64, 1, 1)]
 void VoxelizeWorklistVerifyMain(uint3 tid : SV_DispatchThreadID)
@@ -143,9 +148,9 @@ void VoxelizeWorklistVerifyMain(uint3 tid : SV_DispatchThreadID)
 	const uint A = VerifyArenaCells[VerifyArenaBase + tid.x];
 	const uint C = VerifyClassicCells[tid.x];
 	uint Unused;
-	InterlockedAdd(WorklistStats[7], 1u, Unused);
+	InterlockedAdd(WorklistStats[VerifyStatsBase + 1u], 1u, Unused);
 	if (A != C)
 	{
-		InterlockedAdd(WorklistStats[6], 1u, Unused);
+		InterlockedAdd(WorklistStats[VerifyStatsBase], 1u, Unused);
 	}
 }

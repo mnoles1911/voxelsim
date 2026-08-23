@@ -40,6 +40,8 @@ $ConsumeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistConsume.usf'
 $ColumnUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistColumn.usf'
 $VoxelizeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistVoxelize.usf'
 $ClassifyUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistClassify.usf'
+$StampUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistAssetStamp.usf'
+$AssetStampUsf = Join-Path $Root 'ue-project\Shaders\VoxelAssetStamp.usf'
 $WorldGen = Join-Path $Root 'voxel-core\shaders\worldgen.ush'
 $BrickPack = Join-Path $Root 'voxel-core\shaders\brickpack.ush'
 $Stage = Join-Path $env:TEMP 'voxel-worklist-check'
@@ -90,6 +92,17 @@ Copy-Item $BrickPack (Join-Path $Stage 'brickpack.ush')
     Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
     Replace('"/VoxelCore/brickpack.ush"', '"brickpack.ush"') |
     Out-File (Join-Path $Stage 'VoxelWorklistClassify.hlsl') -Encoding utf8
+# VoxelAssetStamp.usf is INCLUDED by the worklist stamp kernel (for the
+# factored gather helpers and the shared declarations); stage it with its own
+# Platform include stubbed the same way.
+(Get-Content $AssetStampUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub') |
+    Out-File (Join-Path $Stage 'VoxelAssetStamp.usf') -Encoding utf8
+(Get-Content $StampUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelEarth/VoxelAssetStamp.usf"', '"VoxelAssetStamp.usf"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistAssetStamp.hlsl') -Encoding utf8
 
 $Out = Join-Path $Stage 'out.bin'
 $Fail = 0
@@ -150,6 +163,18 @@ $ClassifyDefines = @('VXC_UE=1',
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClassify.hlsl') 'ClassifyWorklistMain'             'clsify  DXIL  ClassifyWorklistMain'             $ClassifyDefines
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClassify.hlsl') 'ClassifyTotalsWorklistMain'       'clstot  DXIL  ClassifyTotalsWorklistMain'       $ClassifyDefines
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClassify.hlsl') 'ClassifyTotalsWorklistVerifyMain' 'ctvfy   DXIL  ClassifyTotalsWorklistVerifyMain' $ClassifyDefines
+
+# The order-preserving AssetStamp gather (VoxelWorklistAssetStamp.usf; P3
+# stage 4). Includes VoxelAssetStamp.usf for the factored helpers; no version
+# lock (asset composition is not terrain). Defines mirror
+# FVoxelWorklistAssetStampCS's.
+$StampDefines = @('VXC_WORKLIST_STAMP_GROUPS=16', 'VXC_WORKLIST_COLS_PER_RECORD=1024',
+                  'VXC_WORKLIST_CELLS_PER_RECORD=32768')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistAssetStamp.hlsl') 'AssetStampWorklistMain' 'stamp   DXIL  AssetStampWorklistMain' $StampDefines
+# And the classic stamp entry points, whose file gained the factored helpers:
+# the factoring must not have broken the shipped forms.
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelAssetStamp.usf') 'AssetStampMain'       'stamp   DXIL  AssetStampMain (classic)'
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelAssetStamp.usf') 'AssetStampCoarseMain' 'stamp   DXIL  AssetStampCoarseMain (classic)'
 
 # The factored classic kernels, both atlas permutations -- the factoring must
 # not have broken the shipped forms (the digest gate proves bytes; this proves

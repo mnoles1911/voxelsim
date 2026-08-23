@@ -231,6 +231,49 @@ chunks fall back with it (wlct fbAssets).
   checked= mism=`. FAILING: same table as wlvox, plus mism>0 = leg invalid
   outright.
 
+## Stage 4 LANDED: the AssetStamp gather (2026-08-23, -VoxelGpuWorklistAssetStamp)
+
+Authored-not-yet-built. The order-preserving gather the plan named, and the
+stage that ADMITS ASSET CHUNKS to the whole cell-arena chain (wlvox/wlct
+fbAssets stop growing):
+
+* **The flush-level asset buffer exists**: DispatchBatch hands each record's
+  resolved instances (+ its ColStarts/Spans blobs) to Append; Flush
+  concatenates the payloads of exactly the records IT CONSUMES into per-flush
+  transient buffers, rebasing ColStartsBase into the blob ColStarts and the
+  ColStarts VALUES into the blob Spans, writes the record's AssetBase, and
+  sets **stampsStaged (LevelFlags bit 9)**. A record deferred past its
+  staging flush keeps bit 9 clear forever -- the GPU chain skips it and the
+  host already fell it back -- so no record can ever read another flush's
+  blob. The mutation happens BEFORE the folds, so both proof mirrors cover
+  the post-mutation bytes.
+* `AssetStampWorklistMain` (VoxelWorklistAssetStamp.usf, 16 groups/record,
+  one thread per COLUMN) runs between the voxelize and classify dispatches,
+  stamping each stamps-staged record's cell-arena slice. ORDER PRESERVED
+  IN-THREAD: one thread owns one column and walks the record's instances in
+  slice order writing AIR cells only -- the classic per-instance pass
+  ordering, reproduced sequentially, no cross-thread races.
+* THE MATH IS CALLED, NOT COPIED: the inverse yaw map (assetYawInverse) and
+  the span gather (assetSpanMatAt) are factored out of AssetStampCoarseMain
+  in VoxelAssetStamp.usf and both entry points call them. At CoarseScale 1
+  the rep of a cell is itself, so the same gather is the level-0 form (the
+  CPU's own sampling direction); parity with the level-0 SCATTER kernel
+  rests on the forward/inverse bijection -- and the verify arm measures it.
+* Switches: `-VoxelGpuWorklistAssetStamp=1` (requires the Voxelize switch);
+  byte gate `-VoxelGpuWorklistVerifyStamp=1` -- classic VoxelizeMain + the
+  classic per-instance stamps re-run into the transient, compared against
+  the STAMPED arena slice into stats [10..11] (the voxelize verify kernel,
+  now parameterized by VerifyStatsBase: 6 = vox arm, 10 = stamp arm; the vox
+  arm is asset-free chunks only, since an asset chunk's arena holds stamps).
+* Readings: `[gpu-worklist] wlstamp conv= stampverify checked= mism=`.
+  FAILING: conv=0 while wlvox conv grows on an asset-bearing flight; mism>0
+  (LEG INVALID -- a wrong asset voxel in the pool); checked=0 with conv>0
+  under the verify switch. conv=0 on an asset-free flight is the expected
+  reading, not a failure.
+* Pass accounting caveat, stated: the per-job tally constants never included
+  the classic per-instance stamp passes, so the tally's -1 per converted
+  asset chunk UNDERSTATES the real cut (which also removes N stamp passes).
+
 ## Conversion sequencing (the P3 work proper)
 
 Stage by stage, each stage gated before the next:

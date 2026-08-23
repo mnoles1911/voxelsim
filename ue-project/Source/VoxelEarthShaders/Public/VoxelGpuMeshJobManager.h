@@ -590,6 +590,9 @@ private:
 	int64 WorklistCtConverted = 0;
 	int64 WorklistCtFallback = 0;
 	int64 WorklistCtFallbackAssets = 0;
+	// P3 AssetStamp (cumulative, wlstamp line): asset-bearing chunks admitted
+	// to the converted chain (a subset of WorklistVoxConverted).
+	int64 WorklistStampConverted = 0;
 	int64 WorklistSkipNoPack = 0;    // no brick region (quad-only leg, or shell refused)
 	int64 WorklistSkipQuadMesh = 0;  // job still emits quads (RetireQuads off)
 	int64 WorklistSkipBand = 0;      // job carries its footprint's band readback

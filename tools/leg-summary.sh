@@ -78,7 +78,7 @@ for f in "$@"; do
     # leg's total -- tail -1 is correct here). One per armed stage; absent on
     # spine-only and control legs by design. Their FAILING READINGS live on
     # MaybeLogWorklistWindow.
-    for stage in wlcols wlvox wlct; do
+    for stage in wlcols wlvox wlct wlstamp; do
       sl=$(grep -o "\[gpu-worklist\] $stage .*" "$log" | tail -1)
       if [ -n "$sl" ]; then printf "%-18s   %s\n" "" "$sl"; fi
     done

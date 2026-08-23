@@ -187,8 +187,21 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef CellArena = nullptr;    // cellBudget x 32,768 uint
 		// Verify arm for the Voxelize stage: run the classic VoxelizeMain as
 		// well (into the region's transient Cells, reading the SAME column
-		// arena slice) plus a compare pass into VerifyStats [6..7].
+		// arena slice) plus a compare pass into VerifyStats [6..7]. Only ever
+		// set for asset-FREE chunks (an asset chunk's arena holds stamped
+		// cells; comparing it against bare voxelize would false-fail).
 		bool bVerifyVox = false;
+		// P3 AssetStamp stage: this chunk's asset instances were stamped into
+		// its cell arena slice by the flush graph's gather dispatch, so the
+		// arena is the FULL composed result and the classic AssetStamp
+		// passes are SKIPPED (with VoxelizeMain). The cells checkf admits
+		// asset instances only with this set.
+		bool bCellsIncludeAssets = false;
+		// Verify arm for the stamp: run classic VoxelizeMain AND the classic
+		// per-instance AssetStamp passes into the transient, then compare
+		// the stamped arena slice into VerifyStats [10..11] (the voxelize
+		// verify kernel with VerifyStatsBase 10). Asset chunks only.
+		bool bVerifyStamp = false;
 
 		// P3 fused ClassifyTotals stage: non-null when this chunk's brick
 		// counts/offsets/totals were also computed this tick (the two fused
@@ -267,6 +280,23 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef Totals = nullptr;
 	};
 	void AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder, const FWorklistClassifyDispatch& Dispatch);
+
+	// The AssetStamp gather's once-per-tick indirect dispatch (P3 stage 4),
+	// added to the worklist FLUSH graph between the voxelize pass (whose cell
+	// arena it stamps) and the classify pair (which must see the stamps).
+	struct FWorklistAssetStampDispatch
+	{
+		FRDGBufferRef Records = nullptr;
+		FRDGBufferRef Control = nullptr;
+		FRDGBufferRef IndirectArgs = nullptr;
+		uint32 IndirectArgsOffset = 0;         // byte offset of the AssetStamp triple
+		uint32 RingCapacity = 0;
+		FRDGBufferRef CellArena = nullptr;     // stamped in place
+		FRDGBufferRef Instances = nullptr;     // this flush's GpuAssetStampInstance blob
+		FRDGBufferRef ColStarts = nullptr;     // rebased per-column span starts
+		FRDGBufferRef Spans = nullptr;         // rebased packed spans
+	};
+	void AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder, const FWorklistAssetStampDispatch& Dispatch);
 
 	// Adds the seven passes to GraphBuilder and returns the buffers they wrote.
 	// RENDER THREAD ONLY. Does not execute the graph, does not enqueue any

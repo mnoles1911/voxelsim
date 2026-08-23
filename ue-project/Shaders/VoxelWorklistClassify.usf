@@ -86,7 +86,7 @@ void ClassifyWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
 	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
 	const GpuChunkWorkRecord R = WorklistRecords[Slot];
 	// Asset chunks keep the classic chain (header). Group-uniform.
-	if (worklistHasAssets(R) != 0u)
+	if (worklistAssetsBlockRecord(R) != 0u)
 	{
 		return;
 	}
@@ -140,7 +140,7 @@ void ClassifyTotalsWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThr
 	}
 	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
 	const GpuChunkWorkRecord R = WorklistRecords[Slot];
-	if (worklistHasAssets(R) != 0u)
+	if (worklistAssetsBlockRecord(R) != 0u)
 	{
 		return;
 	}
