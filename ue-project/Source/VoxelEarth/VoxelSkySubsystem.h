@@ -293,6 +293,17 @@ private:
 // everything non-reflected out of its way.
 namespace VoxelSky
 {
+	// The material parameter collection every sky-coupled system binds to:
+	// M_NightSky's parameters, the weather wind vector, the bathy and ripple
+	// field windows. Named ONCE, here, because the string appears in LoadObject
+	// calls and diagnostics across four .cpp files and a typo in any of them is
+	// a system that renders the asset's DEFAULTS rather than an error. It lived
+	// as four per-file internal-linkage copies until 2026-08-23, when two of
+	// them landed in the same unity blob of the GAME target (the editor target
+	// happened to group them apart) and the module stopped compiling with
+	// C2374. An inline constexpr is one entity; it cannot collide with itself.
+	inline constexpr const TCHAR* kSkyCollectionPath = TEXT("/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky");
+
 	VOXELEARTH_API bool IsEnabled();
 	VOXELEARTH_API float GetTimeScale();
 	VOXELEARTH_API void SetTimeScale(float NewScale); // ECVF_SetByCode; -VoxelTimeScale= uses it

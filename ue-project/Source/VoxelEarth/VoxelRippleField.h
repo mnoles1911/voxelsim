@@ -416,3 +416,25 @@ private:
 	UTextureRenderTarget2D* Front() const;
 	UTextureRenderTarget2D* Back() const;
 };
+
+// Shared between the ripple field's own impact response and VoxelThrownItem's
+// estimate of the same impact, so a thrown cube and the auto-watcher agree on
+// how hard the water was hit. They used to exist TWICE -- in
+// VoxelRippleField.cpp's anonymous namespace, and copied by value into
+// VoxelThrownItem.cpp with a comment honestly citing the drift hazard. The
+// copy did not drift; it collided: a unity blob of the game target merged the
+// two internal-linkage definitions and the module stopped compiling
+// (2026-08-23). One inline constexpr each is both safer and buildable.
+namespace VoxelRipple
+{
+	// The speed at which an impact counts as full strength, m/s. ~6 m/s is a
+	// 1.8 m fall, which is about the height a player jumps into water from.
+	// Not a console variable: it is the shape of the curve, not a level, and
+	// two knobs for one effect is how a tuning session stops converging.
+	inline constexpr double kFullImpactSpeedMPS = 6.0;
+
+	// Floor under that curve, so wading in still makes something rather than
+	// nothing. A ripple that only appears above a speed threshold reads as
+	// broken.
+	inline constexpr double kMinImpactFraction = 0.25;
+}

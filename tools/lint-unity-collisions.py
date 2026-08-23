@@ -51,10 +51,20 @@ under unity, when it is declared:
 Two files in the SAME MODULE declaring the same such name is a finding when
 the declarations are not interchangeable:
 
-  ALIAS / VARIABLE  finding when the declaration text differs. Two IDENTICAL
+  ALIAS             finding when the aliased text differs. Two IDENTICAL
                     `using` aliases are a legal redeclaration, so they are not
                     reported; `= TSharedRef<FSweBreachRun,...>` versus
                     `= TSharedRef<FOceanRun,...>` is the shipped bug.
+  VARIABLE          finding on ANY duplicate name. A namespace-scope variable
+                    declaration without `extern` is a DEFINITION, so even two
+                    character-identical `const TCHAR* kPath = TEXT(...);`
+                    lines are C2374 once a blob merges them. (Variables were
+                    originally lumped with aliases; the escape was found by
+                    the VoxelEarth game target in 2026-08: three files each
+                    defined kSkyCollectionPath identically, and two more
+                    disagreed on kParamOrigin -- which string-blanking had
+                    made LOOK identical to this lint. Both classes are real
+                    redefinitions.)
   RECORD / ENUM     finding on ANY duplicate name. A class, struct, union or
                     enum cannot be defined twice in one translation unit even
                     if the two definitions are character-identical. Forward
@@ -228,8 +238,15 @@ def collides(a: "Decl", b: "Decl") -> bool:
 
     The rule is NOT the same in both directions, which is the easy mistake:
 
-      ALIAS / VARIABLE  conflict when the definitions DIFFER. Two identical
+      ALIAS             conflict when the definitions DIFFER. Two identical
                         `using` aliases are a legal redeclaration.
+      VARIABLE          ALWAYS conflict. At namespace scope a variable
+                        declaration without `extern` is a definition, and one
+                        translation unit cannot define the same name twice
+                        even character-identically -- same rule as RECORD.
+                        Comparing text here would also be meaningless: string
+                        literals are blanked before matching, so initializers
+                        that differ only inside TEXT("...") look equal.
       FUNCTION          conflict when the signatures MATCH. Two functions of
                         the same name and different parameters are an
                         overload set, which is legal and common here --
@@ -251,6 +268,8 @@ def collides(a: "Decl", b: "Decl") -> bool:
         return True
     if a.kind == "FUNCTION":
         return a.sig == b.sig
+    if a.kind == "VARIABLE":
+        return True
     return a.sig != b.sig
 
 
@@ -327,10 +346,17 @@ def classify(raw_head: str, has_body: bool, start_line: int, path: str):
     # not a bare forward declaration or a function prototype.
     if head.startswith(("struct", "class", "union", "enum")):
         return None            # forward declaration: legal to repeat
-    if "(" in head:
-        return None            # prototype or macro: not modelled
 
+    # Look for parentheses only LEFT of the '='. Testing the whole head
+    # skipped every variable whose INITIALIZER contains a call -- which is
+    # all of `const TCHAR* kPath = TEXT("...")`, the single most common
+    # file-local constant shape in these modules, and exactly the escape
+    # that let three definitions of kSkyCollectionPath through in 2026-08.
+    # A '(' before the '=' still bails: that is a prototype, a macro, or a
+    # constructor-style init, none of which is modelled.
     lhs = head.split("=", 1)[0]
+    if "(" in lhs:
+        return None            # prototype or macro: not modelled
     m = VAR_RE.search(normalize(lhs))
     if m and m.group(1) not in CONTROL_KEYWORDS and " " in normalize(lhs):
         return Decl("VARIABLE", m.group(1), head, at(m.group(1)), path)

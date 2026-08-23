@@ -1,5 +1,7 @@
 #include "VoxelBathyField.h"
 
+#include "VoxelSkySubsystem.h" // VoxelSky::kSkyCollectionPath
+
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
@@ -27,10 +29,12 @@ const TCHAR* kBathyTexturePath = TEXT("/Game/Voxel/T_VoxelBathyInfo.T_VoxelBathy
 // ue-project/Tools/create_sky_material.py -- if a name below is not in that
 // script's SCALAR_PARAMS/VECTOR_PARAMS, the Set* call logs a warning and does
 // nothing, which is the silent-no-op trap that script's comments describe.
-const TCHAR* kSkyCollectionPath = TEXT("/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky");
+// The collection's path is VoxelSky::kSkyCollectionPath (VoxelSkySubsystem.h)
+// -- one definition for the whole module; per-file copies collided in a unity
+// blob of the game target.
 
-const TCHAR* kParamOrigin = TEXT("BathyFieldOrigin");
-const TCHAR* kParamInvSize = TEXT("BathyFieldInvSize");
+const TCHAR* kBathyParamOrigin = TEXT("BathyFieldOrigin");
+const TCHAR* kBathyParamInvSize = TEXT("BathyFieldInvSize");
 const TCHAR* kParamValid = TEXT("BathyFieldValid");
 
 // Saturation of the baked shore plane, in metres (vxc::kBathyShoreClampMm).
@@ -335,15 +339,15 @@ void UVoxelBathyFieldSubsystem::PublishWindow(int64 Px0, int64 Py0)
 	if (UWorld* World = GetWorld())
 	{
 		if (UMaterialParameterCollection* Sky =
-		        LoadObject<UMaterialParameterCollection>(nullptr, kSkyCollectionPath))
+		        LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath))
 		{
 			const double OriginXUU = static_cast<double>(OriginPx_) * kTexelUU;
 			const double OriginYUU = static_cast<double>(OriginPy_) * kTexelUU;
 			UKismetMaterialLibrary::SetVectorParameterValue(
-				World, Sky, kParamOrigin,
+				World, Sky, kBathyParamOrigin,
 				FLinearColor(static_cast<float>(OriginXUU), static_cast<float>(OriginYUU), 0.0f, 0.0f));
 			UKismetMaterialLibrary::SetScalarParameterValue(
-				World, Sky, kParamInvSize, static_cast<float>(1.0 / (kSize * kTexelUU)));
+				World, Sky, kBathyParamInvSize, static_cast<float>(1.0 / (kSize * kTexelUU)));
 			UKismetMaterialLibrary::SetScalarParameterValue(World, Sky, kParamValid, 1.0f);
 		}
 	}
@@ -358,7 +362,7 @@ void UVoxelBathyFieldSubsystem::PublishInvalid()
 		return;
 	}
 	if (UMaterialParameterCollection* Sky =
-	        LoadObject<UMaterialParameterCollection>(nullptr, kSkyCollectionPath))
+	        LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath))
 	{
 		UKismetMaterialLibrary::SetScalarParameterValue(World, Sky, kParamValid, 0.0f);
 	}

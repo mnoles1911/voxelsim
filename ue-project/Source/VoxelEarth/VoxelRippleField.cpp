@@ -1,5 +1,7 @@
 #include "VoxelRippleField.h"
 
+#include "VoxelSkySubsystem.h" // VoxelSky::kSkyCollectionPath
+
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h" // TActorIterator, for the auto-watcher
@@ -32,11 +34,13 @@ const TCHAR* kDeriveMaterialPath = TEXT("/Game/Voxel/M_VoxelRippleDerive.M_Voxel
 // run, so a name that script does not know about makes the Set* calls below log
 // a warning and do nothing. That is the silent-no-op trap, and it is why
 // Initialize checks membership once and then refuses to write at all.
-const TCHAR* kSkyCollectionPath = TEXT("/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky");
+// The collection's path is VoxelSky::kSkyCollectionPath (VoxelSkySubsystem.h)
+// -- one definition for the whole module; per-file copies collided in a unity
+// blob of the game target.
 
-const TCHAR* kParamOrigin = TEXT("RippleFieldOrigin");
-const TCHAR* kParamInvSize = TEXT("RippleFieldInvSize");
-const TCHAR* kParamGain = TEXT("RippleFieldGain");
+const TCHAR* kRippleParamOrigin = TEXT("RippleFieldOrigin");
+const TCHAR* kRippleParamInvSize = TEXT("RippleFieldInvSize");
+const TCHAR* kRippleParamGain = TEXT("RippleFieldGain");
 
 // ---------------------------------------------------------------------------
 // CONSOLE VARIABLES
@@ -162,14 +166,9 @@ TAutoConsoleVariable<float> CVarVoxelWaterRippleObjectStrength(
 	TEXT("full speed. Its RADIUS comes from the object's own bounds, not from here."),
 	ECVF_Default);
 
-// The speed at which an impact counts as full strength, m/s. ~6 m/s is a 1.8 m
-// fall, which is about the height a player jumps into water from. Not a console
-// variable: it is the shape of the curve, not a level, and two knobs for one
-// effect is how a tuning session stops converging.
-constexpr double kFullImpactSpeedMPS = 6.0;
-// Floor under that curve, so wading in still makes something rather than
-// nothing. A ripple that only appears above a speed threshold reads as broken.
-constexpr double kMinImpactFraction = 0.25;
+// The impact-strength curve's two constants live in VoxelRippleField.h as
+// VoxelRipple::kFullImpactSpeedMPS and VoxelRipple::kMinImpactFraction, shared with
+// VoxelThrownItem.cpp -- see the header for why they moved.
 
 UVoxelRippleFieldSubsystem* FindRippleSubsystem(UWorld* World)
 {
@@ -474,18 +473,18 @@ void UVoxelRippleFieldSubsystem::Initialize(FSubsystemCollectionBase& Collection
 	// frame that would be 180 lines a second of warning and would bury every
 	// other diagnostic in the run. The honest failure is one line saying which
 	// patch has not been applied.
-	SkyCollection_ = LoadObject<UMaterialParameterCollection>(nullptr, kSkyCollectionPath);
+	SkyCollection_ = LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath);
 	if (const UMaterialParameterCollection* Sky = SkyCollection_)
 	{
 		bool bHasOrigin = false, bHasInvSize = false, bHasGain = false;
 		for (const FCollectionVectorParameter& P : Sky->VectorParameters)
 		{
-			bHasOrigin |= (P.ParameterName == FName(kParamOrigin));
+			bHasOrigin |= (P.ParameterName == FName(kRippleParamOrigin));
 		}
 		for (const FCollectionScalarParameter& P : Sky->ScalarParameters)
 		{
-			bHasInvSize |= (P.ParameterName == FName(kParamInvSize));
-			bHasGain |= (P.ParameterName == FName(kParamGain));
+			bHasInvSize |= (P.ParameterName == FName(kRippleParamInvSize));
+			bHasGain |= (P.ParameterName == FName(kRippleParamGain));
 		}
 		bMpcHasParams_ = bHasOrigin && bHasInvSize && bHasGain;
 	}
@@ -498,7 +497,7 @@ void UVoxelRippleFieldSubsystem::Initialize(FSubsystemCollectionBase& Collection
 		       TEXT("two patches in docs/water-interactive-ripples.md -- create_sky_material.py's ")
 		       TEXT("parameter table and M_WaterVoxel's wave block -- then regenerate sky, dome, ")
 		       TEXT("water IN THAT ORDER."),
-		       kParamOrigin, kParamInvSize, kParamGain);
+		       kRippleParamOrigin, kRippleParamInvSize, kRippleParamGain);
 	}
 
 	Pending_.Reserve(kMaxPending);
@@ -903,11 +902,11 @@ void UVoxelRippleFieldSubsystem::PublishWindow(float Gain)
 	const double OriginXUU = static_cast<double>(OriginPx_) * kTexelUU;
 	const double OriginYUU = static_cast<double>(OriginPy_) * kTexelUU;
 	UKismetMaterialLibrary::SetVectorParameterValue(
-		World, Sky, kParamOrigin,
+		World, Sky, kRippleParamOrigin,
 		FLinearColor(static_cast<float>(OriginXUU), static_cast<float>(OriginYUU), 0.0f, 0.0f));
 	UKismetMaterialLibrary::SetScalarParameterValue(
-		World, Sky, kParamInvSize, static_cast<float>(1.0 / kWindowUU));
-	UKismetMaterialLibrary::SetScalarParameterValue(World, Sky, kParamGain, Gain);
+		World, Sky, kRippleParamInvSize, static_cast<float>(1.0 / kWindowUU));
+	UKismetMaterialLibrary::SetScalarParameterValue(World, Sky, kRippleParamGain, Gain);
 	bPublished_ = (Gain > 0.0f);
 }
 
@@ -1067,9 +1066,9 @@ void UVoxelRippleFieldSubsystem::Tick(float DeltaTime)
 // AVERAGE vertical speed over the frame that contains the crossing, so a longer
 // frame averages in more of the post-entry deceleration and reports a slower
 // impact: the same jump makes a different ring at 30 fps and at 120. TWO THINGS
-// BOUND HOW MUCH THAT MATTERS. ImpactFraction saturates at kFullImpactSpeedMPS
+// BOUND HOW MUCH THAT MATTERS. ImpactFraction saturates at VoxelRipple::kFullImpactSpeedMPS
 // (6 m/s, a 1.8 m fall), so any real jump into water is already pinned at full
-// strength on every machine, and it floors at kMinImpactFraction (0.25), so the
+// strength on every machine, and it floors at VoxelRipple::kMinImpactFraction (0.25), so the
 // gentlest wade is pinned too. Only the middle band -- entries between 1.5 and
 // 6 m/s, i.e. falls of 0.11 to 1.8 m -- varies with frame rate, and there by at
 // most the ratio of the two frame times.
@@ -1120,7 +1119,7 @@ void UVoxelRippleFieldSubsystem::AutoWatch(float DeltaTime)
 	auto ImpactFraction = [](double DownSpeedUUPerSec) -> double
 	{
 		const double MPS = FMath::Max(0.0, DownSpeedUUPerSec) / 100.0;
-		return FMath::Clamp(MPS / kFullImpactSpeedMPS, kMinImpactFraction, 1.0);
+		return FMath::Clamp(MPS / VoxelRipple::kFullImpactSpeedMPS, VoxelRipple::kMinImpactFraction, 1.0);
 	};
 
 	// --- the player -----------------------------------------------------------

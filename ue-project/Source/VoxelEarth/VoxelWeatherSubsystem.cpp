@@ -214,7 +214,9 @@ namespace
 	// VECTOR_PARAMS tables exactly. ResolveCollection below checks that they do,
 	// at runtime, and logs an Error naming each missing one -- which is the one
 	// thing that turns the silent failure above into a log line.
-	const TCHAR* kSkyCollectionPath = TEXT("/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky");
+	// The collection's path is VoxelSky::kSkyCollectionPath (VoxelSkySubsystem.h)
+	// -- one definition for the whole module. This file's private copy met the
+	// sky subsystem's in a unity blob of the game target and stopped compiling.
 	// ONE VELOCITY VECTOR, NOT A DIRECTION PLUS A SPEED.
 	//
 	// This started as five parameters -- WindFlowDirection, WindSpeedMps,
@@ -598,7 +600,7 @@ UMaterialParameterCollection* UVoxelWeatherSubsystem::ResolveCollection()
 		// VoxelSkySubsystem.cpp:1697-1705 gives: /Game/ may not resolve through
 		// the asset registry that early, and a failed LoadObject is a synchronous
 		// package open that must not happen every frame either.
-		Impl->Collection.Reset(LoadObject<UMaterialParameterCollection>(nullptr, kSkyCollectionPath));
+		Impl->Collection.Reset(LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath));
 
 		UMaterialParameterCollection* C = Impl->Collection.Get();
 		if (!C)
@@ -608,7 +610,7 @@ UMaterialParameterCollection* UVoxelWeatherSubsystem::ResolveCollection()
 			       TEXT("without it, so the water will keep using its authored constant wave ")
 			       TEXT("direction and amplitude and will look like a working feature. Run ")
 			       TEXT("Tools/create_sky_material.py."),
-			       kSkyCollectionPath);
+			       VoxelSky::kSkyCollectionPath);
 			return nullptr;
 		}
 
@@ -664,14 +666,14 @@ UMaterialParameterCollection* UVoxelWeatherSubsystem::ResolveCollection()
 			       TEXT("collection that no longer exists in the form it expected, which is the ")
 			       TEXT("2026-08-10 all-water-drew-with-the-default-material failure). The ")
 			       TEXT("required entries are written out in docs/weather-system-v0.md."),
-			       kSkyCollectionPath, Missing.Num(), *MissingText);
+			       VoxelSky::kSkyCollectionPath, Missing.Num(), *MissingText);
 		}
 		else
 		{
 			UE_LOG(LogVoxelWeather, Log,
 			       TEXT("VoxelWeather bound to %s -- both wind parameters present. Driven every ")
 			       TEXT("frame."),
-			       kSkyCollectionPath);
+			       VoxelSky::kSkyCollectionPath);
 		}
 	}
 	// Published even when parameters are missing: the writes are harmless

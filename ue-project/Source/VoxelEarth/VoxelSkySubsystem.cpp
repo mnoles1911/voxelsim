@@ -1273,12 +1273,13 @@ namespace
 
 	// --- the night sky's material (M_NightSky + MPC_VoxelSky) ----------------
 
-	// The collection M_NightSky binds every one of its parameters to. Named once,
-	// here, because the string appears in a LoadObject and in three separate
-	// diagnostics and a typo in any of them is a night sky that renders the
-	// asset's DEFAULTS -- a plausible-looking star field frozen at the wrong
+	// The collection M_NightSky binds every one of its parameters to. The name
+	// is VoxelSky::kSkyCollectionPath (VoxelSkySubsystem.h) -- defined once for
+	// the whole module, because a typo in any copy is a night sky that renders
+	// the asset's DEFAULTS -- a plausible-looking star field frozen at the wrong
 	// sidereal time with a moon due east at 45 degrees -- rather than an error.
-	const TCHAR* kSkyCollectionPath = TEXT("/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky");
+	// (This file, the weather, the bathy field and the ripple field each carried
+	// a private copy until two met in one unity blob of the game target.)
 
 	// THE STAR FIELD'S SUNRISE FADE, and it is NOT optional decoration.
 	//
@@ -3335,7 +3336,7 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	if (!Impl->bSkyParamsLoadAttempted)
 	{
 		Impl->bSkyParamsLoadAttempted = true;
-		Impl->SkyParams.Reset(LoadObject<UMaterialParameterCollection>(nullptr, kSkyCollectionPath));
+		Impl->SkyParams.Reset(LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath));
 		if (!Impl->SkyParams.IsValid())
 		{
 			// ERROR, NOT WARNING, AND THIS IS THE POINT OF THE WHOLE DIAGNOSTIC
@@ -3350,14 +3351,14 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 			       TEXT("field frozen at sidereal time 0 and a permanently-full moon due east at 45 deg -- ")
 			       TEXT("which looks like a working night sky and is not one. Nothing in this subsystem can ")
 			       TEXT("reach the material without it. Run Tools/create_sky_material.py."),
-			       kSkyCollectionPath);
+			       VoxelSky::kSkyCollectionPath);
 		}
 		else
 		{
 			UE_LOG(LogVoxelSky, Log,
 			       TEXT("VoxelSky material params bound to %s (%d scalars, %d vectors in the asset). Driven ")
 			       TEXT("EVERY FRAME, outside the voxel.Sky.ShadowUpdateHz gate."),
-			       kSkyCollectionPath,
+			       VoxelSky::kSkyCollectionPath,
 			       Impl->SkyParams->ScalarParameters.Num(), Impl->SkyParams->VectorParameters.Num());
 		}
 	}
@@ -3501,7 +3502,7 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 		       // tan(45 deg), which is 1. Spelled as the constant it evaluates to
 		       // rather than as a tan() of a literal that is always the same angle.
 		       2.f * FMath::DegreesToRadians(MoonRadiusDeg) * 1100.f,
-		       kSkyCollectionPath);
+		       VoxelSky::kSkyCollectionPath);
 	}
 
 	// --- where the moon actually IS -------------------------------------------
@@ -3609,7 +3610,7 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 		       TEXT("%+.3f), so StarRotation is being driven as %+.1f * (LST/360 + %.4f turns). Flipping the ")
 		       TEXT("MPC scalar mirrors the map AND re-signs this drive together; driving +LST against a -1 ")
 		       TEXT("map would rotate the sky backwards."),
-		       StarU, kSkyCollectionPath, RawStarU, StarU, VoxelSky::GetStarRotationOffsetTurns());
+		       StarU, VoxelSky::kSkyCollectionPath, RawStarU, StarU, VoxelSky::GetStarRotationOffsetTurns());
 	}
 
 	// --- the sunrise fade ----------------------------------------------------
@@ -3707,7 +3708,7 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 		       TEXT("capture: ground/sky luminance must equal the ground's albedo."),
 		       StarAmbientGain,
 		       bStarAmbientDerived ? TEXT("DERIVED from kStarAmbientCalibration") : TEXT("OVERRIDDEN explicitly"),
-		       CVarSkyStarAmbientGain.GetValueOnAnyThread(), kSkyCollectionPath,
+		       CVarSkyStarAmbientGain.GetValueOnAnyThread(), VoxelSky::kSkyCollectionPath,
 		       bStarAmbientDerived
 		           ? TEXT("Derived means appearance and illumination cannot drift apart unnoticed; the ")
 		             TEXT("constant was measured at voxel.Sky.StarGain 0.15 against a snowfield whose ")

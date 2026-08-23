@@ -97,14 +97,11 @@ TAutoConsoleVariable<float> CVarThrowableSplashScale(
 
 // --- the impact ramp, restated rather than shared ---------------------------
 //
-// These two are `constexpr` inside VoxelRippleField.cpp's anonymous namespace
-// (:141 and :144) and are therefore not reachable from here. They are copied,
-// with the same values, so that a thrown cube and the auto-watcher's estimate of
-// the same cube agree; if the ripple field ever changes its ramp, this is the
-// other place to change. Cited rather than silently duplicated, because an
-// unfindable copy is how two systems drift.
-constexpr double kFullImpactSpeedMPS = 6.0;   // VoxelRippleField.cpp:141 -- a 1.8 m fall
-constexpr double kMinImpactFraction = 0.25;   // VoxelRippleField.cpp:144 -- a wade still rings
+// The impact-strength curve is shared with the ripple field through
+// VoxelRipple::kFullImpactSpeedMPS / VoxelRipple::kMinImpactFraction (VoxelRippleField.h).
+// This file used to carry a BY-VALUE COPY of both, with a comment citing the
+// drift hazard; the copy never drifted, but a unity blob of the game target
+// merged it with the original and the module stopped compiling (2026-08-23).
 
 // A crossing may not fire again for this long. bWasUnderwater is already
 // edge-triggered so this is insurance, not the mechanism -- see the header's
@@ -256,7 +253,7 @@ FAutoConsoleCommandWithWorldAndArgs GThrowableDropAtCmd(
 			       TEXT("Throwable.DropAt: %s at (%.0f, %.0f, %.0f) UU falling at %.0f UU/s ")
 			       TEXT("(%.2f m/s; the impact ramp saturates at %.1f m/s)."),
 			       Item ? TEXT("dropped") : TEXT("FAILED to spawn"), P.X, P.Y, P.Z,
-			       FMath::Abs(DownUU), FMath::Abs(DownUU) / 100.0, kFullImpactSpeedMPS);
+			       FMath::Abs(DownUU), FMath::Abs(DownUU) / 100.0, VoxelRipple::kFullImpactSpeedMPS);
 		}));
 
 FAutoConsoleCommandWithWorldAndArgs GThrowableStatCmd(
@@ -633,7 +630,7 @@ void AVoxelThrownItem::Splash(const FVector& CrossPointUU)
 	const double DownUUPerSec = Projectile ? FMath::Max(0.0, -Projectile->Velocity.Z) : 0.0;
 	const double DownMPS = DownUUPerSec / 100.0;
 	const double ImpactFraction =
-		FMath::Clamp(DownMPS / kFullImpactSpeedMPS, kMinImpactFraction, 1.0);
+		FMath::Clamp(DownMPS / VoxelRipple::kFullImpactSpeedMPS, VoxelRipple::kMinImpactFraction, 1.0);
 
 	// ------------------------------------------------------------------------
 	// RADIUS AND STRENGTH, DERIVED FROM THE CUBE
