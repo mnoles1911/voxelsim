@@ -14877,6 +14877,26 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				bLevelRefillRescan[Level] = false;
 				bLevelEditRescan[Level] = false;
 				++LevelEntryScans[Level];
+				// THE MISSING SIXTH STAMP (2026-08-23, the t42-live.log tick-rate
+				// loop). The deferral CLEAR at the bottom of this call tests
+				// bLevelScannedThisCall -- whose only other writer is the CPU
+				// entry sweep this arm skips. Without this line, mode 2 turns
+				// bAdmissionDeferredWork into a ONE-WAY LATCH (armed by every
+				// rejBud/rejCut/rejFine, clearable by nothing), and the moment a
+				// level's queue drains the deferred-refill trigger fires EVERY
+				// TICK: it clears this level's dispatch gate, forces a recompute,
+				// the recompute dispatches a scan of a fully-tracked annulus, the
+				// scan comes back empty-but-scanned, gets STAGED (a scanned level
+				// is stampable), and HasActionableDelta forces the next tick's
+				// recompute -- measured in Saved/t42-live.log as disp=427/5s,
+				// cons=427, empty=0 with all-zero proposals, sustained for
+				// minutes PARKED, and a 3-7x recompute-cadence storm while
+				// flying (ad walks 2.4M proposals per 5s window, ~600 ms of
+				// game thread). The GPU scan of level L IS this call's scan of
+				// level L, so it earns the same stamp; the clear's other guards
+				// (zero rejections this call, not held back, not clamped) still
+				// hold the flag armed whenever work is genuinely waiting.
+				bLevelScannedThisCall[Level] = true;
 			}
 		}
 		LiveOutcome.AdmitMs += float((FPlatformTime::Seconds() - LiveAdmitT0) * 1000.0);

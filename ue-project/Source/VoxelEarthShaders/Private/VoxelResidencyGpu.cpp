@@ -365,6 +365,16 @@ struct FVoxelResidencyGpu::FImpl
 	FStats Total; // lifetime
 	int32 AuditMismatchStreak = 0;
 	double LastLogSeconds = 0.0;
+	// Anchor of the most recent OnRecomputeBegin, and its value at the last
+	// log flush: their XY distance prints on the live line as move=, which is
+	// what makes an all-zero window READABLE ON ITS OWN. Zero proposals with
+	// move ~0 is a converged, parked world -- the healthy reading; zero
+	// proposals with move >> a chunk edge is the dead-path reading. The
+	// t42-live.log misdiagnosis was exactly this ambiguity: the final parked
+	// windows (cons=427, prop=0) were read as a dead pass when the flight
+	// windows just above them carried prop in the millions.
+	FVector LastDispatchAnchor = FVector::ZeroVector;
+	FVector LogWindowAnchor = FVector::ZeroVector;
 	TArray<uint64> MissedSurfaceSamples; // up to 4 per window, logged then cleared
 
 	// ------------------------------------------------------------------------
@@ -541,6 +551,7 @@ struct FVoxelResidencyGpu::FImpl
 		FSeqLedger& L = Ledgers.AddDefaulted_GetRef();
 		L.Seq = NextSeq++;
 		L.Params = P;
+		LastDispatchAnchor = P.Anchor;
 		L.bUnderground = P.bAnchorUnderground;
 		L.AuditCount = CpuCount;
 		L.AuditXorLo = CpuXorLo;
@@ -1567,9 +1578,16 @@ struct FVoxelResidencyGpu::FImpl
 		       (long long)Since.LastAuditGpuCount, (long long)CpuCount);
 		// The mode-2 line. Failing readings, stated in advance (the counter
 		// rule: every lane here can come out the other way):
-		//   admit=0 (adOK+adopt+res all zero) over a moving leg with disp>0
-		//     -> the pass proposes nothing the CPU accepts: dead kernel, dead
-		//        readback, or a gate rejecting everything. THE failure.
+		//   admit=0 (adOK+adopt+res all zero) WITH move >> a chunk edge and
+		//     disp>0 -> the pass proposes nothing the CPU accepts: dead kernel,
+		//        dead readback, or a gate rejecting everything. THE failure.
+		//     THE SAME ZEROS WITH move~0 ARE HEALTH, not failure: a converged,
+		//     parked world has nothing to propose, and a leg's final windows
+		//     print exactly this shape after the flight ends. Read the flight
+		//     windows, never the tail (t42-live.log, 2026-08-23: the tail's
+		//     cons=427/prop=0 was misread as a dead pass while the flight
+		//     windows above it carried prop in the millions and adOK=26-71k
+		//     per window). move= exists so one line answers which case it is.
 		//   cpuFallback>0 after warmup -> the live arm starved (no delta for
 		//     kLiveStarvationCalls recomputes) and the run is silently CPU;
 		//     the leg's timings then measure the CPU arm, not this feature.
@@ -1590,13 +1608,16 @@ struct FVoxelResidencyGpu::FImpl
 		if (Mode == 2)
 		{
 			const FVoxelResidencyLiveOutcome& L = Since.Live;
+			const double MoveUU =
+				FVector2D(LastDispatchAnchor.X - LogWindowAnchor.X,
+			              LastDispatchAnchor.Y - LogWindowAnchor.Y).Size();
 			UE_LOG(LogVoxelResidGpu, Log,
-			       TEXT("[gpu-resid] live: delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
+			       TEXT("[gpu-resid] live: move=%.0fuu delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
 			       TEXT("ad: prop=%u adOK=%u adopt=%u res=%u stale=%u rejFine=%u rejBud=%u ")
 			       TEXT("rejCut=%u | ev: prop=%u q=%u VETO=%u stale=%u resid=%u | cold: prop=%u ")
 			       TEXT("enum=%u defer=%u | edit=%u | fallback: cpuCalls=%u firstScans=%u | ")
 			       TEXT("ms ev=%.2f ad=%.2f"),
-			       Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
+			       MoveUU, Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
 			       L.NoDeltaCalls, L.AdmitProposals, L.AdmitAdmitted, L.AdmitAdopted,
 			       L.AdmitResurrected, L.AdmitStale, L.AdmitRejFine, L.AdmitRejBudget,
 			       L.AdmitRejCutoff, L.EvictProposals, L.EvictQueued, L.EvictVetoed,
@@ -1604,6 +1625,7 @@ struct FVoxelResidencyGpu::FImpl
 			       L.ColdDeferred, L.EditedEnumerated, L.CpuFallbackCalls, L.CpuFirstScans,
 			       L.EvictMs, L.AdmitMs);
 		}
+		LogWindowAnchor = LastDispatchAnchor;
 		if (MissedSurfaceSamples.Num() > 0)
 		{
 			FString Samples;
