@@ -183,6 +183,15 @@ namespace VoxelStreamAdmission
 {
 int32 SharedGridCacheEntries();
 bool RingSkirtUsesPaddedInner();
+// B.3 mesh-worker resolve accounting, forward-declared here because
+// FCoarseChunkGridSampler (below, anonymous namespace) resolves assets per
+// coarse chunk and must be able to say so -- that resolve ran UNCOUNTED for
+// the whole first B.3 leg, which is half of how a cache with 40,831 entries
+// served zero hits without anybody noticing the consumers weren't wired to it.
+// Definitions live with the other B.3 atomics in the admission block.
+bool AsyncAssetResolveEnabled();
+extern std::atomic<uint64> GAssetResolveMeshWorkerInline;
+extern std::atomic<int64> GAssetResolveMeshWorkerUs;
 }
 
 namespace
@@ -1022,9 +1031,20 @@ struct FCoarseChunkGridSampler
 	// asset shortlist below stays per-job (it is cheap relative to the columns
 	// and folding the resolve into the cache would widen the residency rect the
 	// gate must prove -- see IsColumnGridFootprintResident).
+	// PreResolved (B.3): the footprint's instance list as the dispatch pass
+	// found it in AssetResolveCache -- non-null means SKIP the per-chunk
+	// resolve below and compose from this list instead. Null is the pre-B.3
+	// behaviour verbatim: resolve inline on this worker. The list is a pure
+	// function of (Level, X, Y) and the resident raster -- Key.Z appears
+	// nowhere in the rect -- so a cached copy is byte-parity substitutable,
+	// and its ORDER is load-bearing (first-non-air-wins) and preserved by the
+	// copy. Passing the LIST rather than letting this ctor read the cache is
+	// the thread rule: streaming state is game-thread-only, and this ctor runs
+	// on a worker.
 	FCoarseChunkGridSampler(const GenT& Gen, int32 InLevel, const VoxelCoords::FVoxelChunkKey& Key,
 	                        vxc::Counters* PerfCounters,
-	                        FSharedColumnGridCache* SharedCache = nullptr, bool bFootprintResident = false)
+	                        FSharedColumnGridCache* SharedCache = nullptr, bool bFootprintResident = false,
+	                        const std::vector<vxc::AssetField::ResolvedAssetInstance>* PreResolved = nullptr)
 		: Level(InLevel)
 		, BaseVX(int64(Key.X) * ChunkVox)
 		, BaseVY(int64(Key.Y) * ChunkVox)
@@ -1112,10 +1132,27 @@ struct FCoarseChunkGridSampler
 		// operator() a 0-to-few walk.
 		if (const vxc::AssetField* AField = Gen.assetField(); AField != nullptr && !AField->empty())
 		{
+			if (PreResolved != nullptr)
+			{
+				// B.3 hit, delivered by dispatch. Same list, same order; the
+				// Amplifier::column-per-site enumeration below never runs.
+				Resolved = *PreResolved;
+			}
+			else
+			{
 			const vxc::AssetVoxelRect ARect{GenT::coarseRep(BaseVX - 1, Level),
 			                                GenT::coarseRep(BaseVY - 1, Level),
 			                                GenT::coarseRep(BaseVX + ChunkVox, Level),
 			                                GenT::coarseRep(BaseVY + ChunkVox, Level)};
+			// B.3: timed and counted only with the switch on, so a control leg
+			// stays byte-identical. This block is the EXPENSIVE resolve -- the
+			// rect spans (32+2)*2^L level-0 voxels per axis, 1,156x level 0's
+			// area at level 5 -- and it ran invisible for the whole first B.3
+			// leg: meshWorkerInline falling toward first-ask-only is the fix
+			// working; meshWorkerInline tracking coarse dispatch count is the
+			// cache still serving nobody.
+			const bool bB3Count = VoxelStreamAdmission::AsyncAssetResolveEnabled();
+			const double AT0 = bB3Count ? FPlatformTime::Seconds() : 0.0;
 			Resolved = AField->resolveForCompose(AField->instancesForRect(
 				ARect,
 				// Facts through the world's channel source (bake-28 planes +
@@ -1128,6 +1165,13 @@ struct FCoarseChunkGridSampler
 					                                       Gen.assetChannelsAt(AVX, AVY));
 				},
 				/*terrainOnly*/ true));
+			if (bB3Count)
+			{
+				VoxelStreamAdmission::GAssetResolveMeshWorkerInline.fetch_add(1, std::memory_order_relaxed);
+				VoxelStreamAdmission::GAssetResolveMeshWorkerUs.fetch_add(
+					int64((FPlatformTime::Seconds() - AT0) * 1e6), std::memory_order_relaxed);
+			}
+			}
 			if (!Resolved.empty())
 			{
 				ColShortlist.SetNum(GridEdge * GridEdge);
@@ -2933,6 +2977,42 @@ std::atomic<uint64> GAssetResolveWarmNotResident{0}; // ...discarded: footprint 
 std::atomic<uint64> GAssetResolveUncached{0};        // inline resolves NOT cached, same residency reason
 std::atomic<int64> GAssetResolveGameThreadUs{0};     // microseconds of resolve STILL on the game thread
 std::atomic<int64> GAssetResolveWorkerUs{0};         // microseconds of resolve MOVED to the task pool
+
+// THE 2026-08-23 REWIRE, and why these exist. The first B.3 leg read hits=0
+// against 40,831 stored entries, and the counters above proved why by
+// arithmetic: inline (65,215) equalled ADMIT footprints (65,215) EXACTLY --
+// the only caller of ResolvedAssetsForFootprint was exact admission, which
+// sits behind the FootprintZRangeCache memo and asks each footprint once for
+// the session. The repeat consumer the cache was built for, SubmitGpuMeshJob,
+// went default-OFF (GpuMeshEnabled, same day) and the real per-chunk resolves
+// moved to the CPU workers -- the level-0 job body and FCoarseChunkGridSampler
+// -- which are worker-side and CANNOT read a game-thread cache. Entries went
+// in; nobody who repeats a key ever looked.
+//
+// The rewire: DispatchJobs PEEKS the cache on the game thread per CPU-arm
+// chunk and hands a hit's list to the worker by value; a miss changes nothing
+// (the worker resolves inline exactly as before -- no resolve ever moves ONTO
+// the game thread). These counters read the rewire:
+//   peekHit        -> also counted into GAssetResolveCacheHits; the gate is
+//                     hits ~8:1 against inline WITH cycPerColumn falling.
+//   peekMissFirst  -> no entry has ever existed for the key: first ask, or the
+//                     warm pass never reached it. The designed cold path.
+//   peekMissEvicted-> an entry EXISTED and the prune removed it before the
+//                     consumer arrived: the prune eating the live set. Must
+//                     stay near zero; rising with travel means the keep radius
+//                     is wrong.
+//   meshWorkerInline/-Us -> worker resolves still running inline (the ~9.3x
+//                     duplication itself, invisible until now). FAILING
+//                     reading: meshWorkerInline tracking the CPU dispatch
+//                     count after warmup -- that is hits=0 wearing a new name.
+//   pruneEvicted   -> entries the prune removed, so 40,831-entries-vs-8,192-
+//                     trigger is readable instead of a mystery.
+std::atomic<uint64> GAssetResolvePeekHit{0};
+std::atomic<uint64> GAssetResolvePeekMissFirst{0};
+std::atomic<uint64> GAssetResolvePeekMissEvicted{0};
+std::atomic<uint64> GAssetResolveMeshWorkerInline{0};
+std::atomic<int64> GAssetResolveMeshWorkerUs{0};
+std::atomic<uint64> GAssetResolvePruneEvicted{0};
 
 // Per-BRICK emptiness skip inside a level-0 job (default ON).
 //
@@ -5785,6 +5865,16 @@ struct FVoxelWorldImpl
 	// mover.
 	mutable TSet<VoxelCoords::FVoxelLevelChunkKey> AssetResolveInFlight;
 
+	// Every key EVER stored in AssetResolveCache this session. Game thread
+	// only, diagnosis only: it exists to split a dispatch-peek miss into
+	// "first ask" (the designed cold path) versus "stored once and pruned
+	// since" (the prune eating the live set) -- the two need opposite fixes
+	// and one miss counter cannot tell them apart. Grows with footprints
+	// visited (~16 bytes each, ~2 MB over the longest leg to date) and is
+	// never pruned: pruning it would re-classify an evicted key as a first
+	// ask, which is precisely the lie it exists to catch.
+	mutable TSet<VoxelCoords::FVoxelLevelChunkKey> AssetResolveEverStored;
+
 	// Worker -> game thread. Same MPSC shape as ResultsQueue and for the same
 	// reason: many task threads produce, exactly one consumer drains.
 	struct FAssetResolveResult
@@ -8503,6 +8593,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       double(VoxelStreamAdmission::GAssetResolveGameThreadUs.load(std::memory_order_relaxed)) / 1000.0,
 			       double(VoxelStreamAdmission::GAssetResolveWorkerUs.load(std::memory_order_relaxed)) / 1000.0,
 			       AssetResolveCache.Num(), AssetResolveInFlight.Num());
+			// The rewire's own line (see GAssetResolvePeekHit's doc comment for
+			// the reading and the failing states). Separate from the line above
+			// so every log taken between B.3 and this change stays
+			// field-comparable with both.
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("assets RESOLVE peek: hit=%llu missFirst=%llu missEvicted=%llu | "
+			            "meshWorker inline=%llu (%.1f ms) | pruned=%llu (everStored %d)"),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePeekHit.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePeekMissFirst.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePeekMissEvicted.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveMeshWorkerInline.load(std::memory_order_relaxed),
+			       double(VoxelStreamAdmission::GAssetResolveMeshWorkerUs.load(std::memory_order_relaxed)) / 1000.0,
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePruneEvicted.load(std::memory_order_relaxed),
+			       AssetResolveEverStored.Num());
 		}
 
 		// The histogram, by NAME, sorted by share. A bankId is only a number to
@@ -11737,6 +11841,7 @@ const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::Reso
 			// would only let WarmAssetResolves launch a SECOND task for the same
 			// footprint before the first one returned.
 			AssetResolveCache.Add(CacheKey, OutScratch);
+			AssetResolveEverStored.Add(CacheKey);
 			return AssetResolveCache.Find(CacheKey);
 		}
 		// Not resident: honest answer for THIS caller, not yet a fact worth
@@ -11782,6 +11887,7 @@ void FVoxelWorldImpl::DrainAssetResolveResults()
 			continue;
 		}
 		AssetResolveCache.Add(Landed.Key, MoveTemp(Landed.Resolved));
+		AssetResolveEverStored.Add(Landed.Key);
 	}
 }
 
@@ -11923,6 +12029,13 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 			    FMath::Square(KeepRadiusUU))
 			{
 				It.RemoveCurrent();
+				// Counted so the entry-count-vs-trigger gap is readable: the
+				// first leg sat at 40,831 entries against an 8,192 trigger and
+				// nothing said whether the prune was running at all. Paired
+				// with peekMissEvicted: pruneEvicted high + peekMissEvicted
+				// near zero is the prune doing its job on genuinely departed
+				// ground; both high is the prune discarding the live set.
+				VoxelStreamAdmission::GAssetResolvePruneEvicted.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
 	}
@@ -16988,6 +17101,60 @@ void FVoxelWorldImpl::DispatchJobs()
 		// scattered-sampling packer this project measured at 0.743 ms/chunk.
 		const bool bReuseMesherVoxels = VoxelBrickPackReuseMesherVoxelsEnabled();
 
+		// B.3 DISPATCH PEEK -- the rewire that gives the cache its consumers.
+		//
+		// The cache's designed repeat consumer (SubmitGpuMeshJob, above) went
+		// default-OFF the day B.3 shipped, so on the shipping path the ONLY
+		// caller left was exact admission -- once per footprint, behind its own
+		// memo -- and the first leg read hits=0 against 40,831 entries. The
+		// chunks that actually repeat a footprint (8.3 Z-siblings per level-0
+		// column, every coarse stack) resolve on WORKERS, which may not touch
+		// game-thread state. So the game thread looks the answer up HERE, at
+		// dispatch, and hands a hit to the worker by value.
+		//
+		// A MISS HANDS NOTHING AND RESOLVES NOTHING: the worker falls back to
+		// its own inline resolve exactly as before. Peeking rather than
+		// resolving is load-bearing -- resolving a miss here would move the
+		// 82 s of measured resolve work back ONTO the game thread to buy hits,
+		// the exact inversion of what B.3 is for.
+		//
+		// WHY THE HIT RATE IS STRUCTURAL, not hopeful: exact admission resolves
+		// and stores every level-0 footprint (residency permitting) in the same
+		// recompute that queues its chunks, so a level-0 chunk reaching this
+		// line ~always finds its footprint stored -- that is the 8.3:1. Coarse
+		// footprints are warmed by WarmAssetResolves walking this same queue
+		// many ticks ahead; a coarse first-ask that beats its warm task is the
+		// designed miss and stays a worker-side resolve.
+		//
+		// The empty list is a VALID hit (resident ground with no trees), which
+		// is why the flag exists instead of empty-means-miss: treating empty as
+		// a miss would re-resolve every treeless footprint per chunk forever
+		// and the counters would still look healthy. Switch off: no lookup, no
+		// copy, flag stays false, worker path byte-identical.
+		bool bAssetResolveFromCache = false;
+		std::vector<vxc::AssetField::ResolvedAssetInstance> AssetResolveList;
+		if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
+		{
+			const VoxelCoords::FVoxelLevelChunkKey ResolveKey{
+				LevelKey.Level, VoxelCoords::FVoxelChunkKey{LevelKey.Key.X, LevelKey.Key.Y, 0}};
+			if (const std::vector<vxc::AssetField::ResolvedAssetInstance>* Hit =
+			        AssetResolveCache.Find(ResolveKey))
+			{
+				AssetResolveList = *Hit; // copied: the prune may drop the entry while the job flies
+				bAssetResolveFromCache = true;
+				VoxelStreamAdmission::GAssetResolveCacheHits.fetch_add(1, std::memory_order_relaxed);
+				VoxelStreamAdmission::GAssetResolvePeekHit.fetch_add(1, std::memory_order_relaxed);
+			}
+			else if (AssetResolveEverStored.Contains(ResolveKey))
+			{
+				VoxelStreamAdmission::GAssetResolvePeekMissEvicted.fetch_add(1, std::memory_order_relaxed);
+			}
+			else
+			{
+				VoxelStreamAdmission::GAssetResolvePeekMissFirst.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+
 		// The fork resolved CPU (GPU declined, failed to submit, or was
 		// excluded). Split bookkeeping mirrors the GPU branch above; the
 		// atomic is the exact-CPU instrument (see its doc comment) and is
@@ -17003,7 +17170,11 @@ void FVoxelWorldImpl::DispatchJobs()
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
-			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident]()
+			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident,
+			 // B.3: the peeked list rides into the task BY VALUE, like every
+			 // other game-thread fact this lambda latches -- the closure's copy
+			 // outlives any prune. MoveTemp: the loop iteration is done with it.
+			 bAssetResolveFromCache, AssetResolveList = MoveTemp(AssetResolveList)]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -17274,8 +17445,25 @@ void FVoxelWorldImpl::DispatchJobs()
 					std::vector<vxc::AssetField::ResolvedAssetInstance> AResolved;
 					if (AField != nullptr && !AField->empty())
 					{
+						if (bAssetResolveFromCache)
+						{
+							// B.3 hit, peeked at dispatch: exact admission (or a
+							// warm task) already ran this footprint's resolve and
+							// the dispatch pass handed the list over. Same list,
+							// same order (first-non-air-wins is order-dependent);
+							// the per-site Amplifier::column enumeration below is
+							// the ~8.3x duplication this branch deletes.
+							AResolved = AssetResolveList;
+						}
+						else
+						{
 						const vxc::AssetVoxelRect ARect{
 							BaseVX, BaseVY, BaseVX + ChunkVox - 1, BaseVY + ChunkVox - 1};
+						// B.3: timed/counted only with the switch on -- control
+						// leg byte-identical. See GAssetResolveMeshWorkerInline's
+						// doc comment for the reading.
+						const bool bB3Count = VoxelStreamAdmission::AsyncAssetResolveEnabled();
+						const double AT0 = bB3Count ? FPlatformTime::Seconds() : 0.0;
 						// terrainOnly: this list exists solely to feed
 						// resolveForCompose, which drops detail instances anyway
 						// -- skipping their sites here saves the ~85% of
@@ -17292,6 +17480,13 @@ void FVoxelWorldImpl::DispatchJobs()
 							                                       GenPtr->assetChannelsAt(AVX, AVY));
 						}, /*terrainOnly*/ true);
 						AResolved = AField->resolveForCompose(AInsts);
+						if (bB3Count)
+						{
+							VoxelStreamAdmission::GAssetResolveMeshWorkerInline.fetch_add(1, std::memory_order_relaxed);
+							VoxelStreamAdmission::GAssetResolveMeshWorkerUs.fetch_add(
+								int64((FPlatformTime::Seconds() - AT0) * 1e6), std::memory_order_relaxed);
+						}
+						}
 						// MESHER-SIDE resolve accounting, because the bank tap
 						// can no longer answer "is the mesher composing":
 						// resolveForCompose issues ~one bankGrid call per
@@ -17629,7 +17824,12 @@ void FVoxelWorldImpl::DispatchJobs()
 						// ever reclaim from one.
 						const double GridStartSeconds = FPlatformTime::Seconds();
 						const FCoarseChunkGridSampler CoarseSampler(*GenPtr, LevelKey.Level, Key, PerfCountersPtr,
-						                                            SharedGridCachePtr, bColumnGridResident);
+						                                            SharedGridCachePtr, bColumnGridResident,
+						                                            // B.3: the dispatch peek's answer, if it had one.
+						                                            // The COARSE resolve is the expensive one (1,156x
+						                                            // level 0's rect area at level 5) and warm tasks
+						                                            // exist precisely to have it ready here.
+						                                            bAssetResolveFromCache ? &AssetResolveList : nullptr);
 						Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
 						// P2 coverage, coarse levels. FCoarseChunkGridSampler satisfies the
 						// same (int64,int64,int64) -> MaterialId contract the packer wants,
