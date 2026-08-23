@@ -61,6 +61,25 @@ uint worklistCoarseScale(GpuChunkWorkRecord R)
 uint worklistHasAssets(GpuChunkWorkRecord R) { return (R.LevelFlags >> 8) & 1u; }
 uint worklistStampsStaged(GpuChunkWorkRecord R) { return (R.LevelFlags >> 9) & 1u; }
 uint worklistClaimStaged(GpuChunkWorkRecord R) { return (R.LevelFlags >> 10) & 1u; }
+// Bit 11, HOST CLAIM CANDIDATE -- set by the manager at record BUILD time for
+// exactly the jobs whose batch graph will NOT run a classic claim, and read
+// by Flush as the precondition for stamping claimStaged (bit 10).
+//
+// WHY IT EXISTS (the 2026-08-23 double-claim): bit 10 used to be stamped for
+// every record a flush consumed, but the host decides conversion AFTER the
+// flush and vetoes a large majority of records there -- a stack-fused
+// member's brick chain runs through AddBrickStackPasses, which claims the
+// slot classically in the batch graph. So the GPU claimed those slots too,
+// and every vetoed chunk was claimed TWICE: the first grant leaked (the side
+// table only remembers the last), the pool arena filled, and the claim verify
+// caught the corner of it where two records for the same slot landed inside
+// one flush. Read [brick-gpualloc] `unclaimed`: it went to -643,164, which is
+// exactly claims + claimFails - shells -- claims with no shell behind them.
+//
+// The rule this encodes: NOTHING outside the flush graph may claim a slot the
+// flush graph claims. Bit 11 is the host's half of that; bit 10 is the
+// flush's half; the GPU reads their AND.
+uint worklistHostClaimCandidate(GpuChunkWorkRecord R) { return (R.LevelFlags >> 11) & 1u; }
 // The converted-chain asset gate, shared by Voxelize / Classify /
 // ClassifyTotals / AssetStamp: a record participates in the cell-arena chain
 // unless it has assets whose instances are NOT in this flush's blob. Group

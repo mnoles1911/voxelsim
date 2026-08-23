@@ -73,12 +73,31 @@ for f in "$@"; do
   wl=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" | grep -v "(0 chunks, 0 chunks/s); records appended=0" | tail -1)
   [ -n "$wl" ] || wl=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" | tail -1)
   if [ -n "$wl" ]; then
-    printf "%-18s   %s\n" "" "$wl"
+    printf "%-18s   last:  %s\n" "" "$wl"
+    # AND THE PEAK-RATE WINDOW, because "last active" is not "representative".
+    # The 2026-08-23 worklist leg's last active window carried 2,010 chunks at
+    # 402 chunks/s while the flight's own windows carried 29,796 at 5,941 --
+    # and passes/tick read 36.6 there against 1,231.6 mid-flight. The drain
+    # tail is an ACTIVE window by every test this script applies, so it passed
+    # the quiet gate and was read as the leg's answer: a 34x understatement of
+    # the one number the whole programme is gated on. Printing both means no
+    # single line can quietly be the tail again. Read them as a PAIR; they
+    # should be close, and when they are not, the peak one is the flight.
+    wlpeak=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" \
+             | sed 's/.*(\([0-9]*\) chunks, .*/\1 &/' \
+             | sort -k1,1nr | head -1 | cut -d" " -f2-)
+    if [ -n "$wlpeak" ] && [ "$wlpeak" != "$wl" ]; then
+      printf "%-18s   peak:  %s\n" "" "$wlpeak"
+    fi
     # Converted-stage lines (cumulative counters, so the LAST line is the
     # leg's total -- tail -1 is correct here). One per armed stage; absent on
     # spine-only and control legs by design. Their FAILING READINGS live on
     # MaybeLogWorklistWindow.
-    for stage in wlcols wlvox wlct wlstamp wlpack; do
+    # wlclaim was MISSING from this list while stage 6 was the whole point of
+    # the leg -- the stage that takes per-chunk passes to zero had no line in
+    # the summary at all, and its set-identity triple (conv / hostStaged /
+    # gpuClaimed) is what catches a double claim.
+    for stage in wlcols wlvox wlct wlstamp wlpack wlclaim; do
       sl=$(grep -o "\[gpu-worklist\] $stage .*" "$log" | tail -1)
       if [ -n "$sl" ]; then printf "%-18s   %s\n" "" "$sl"; fi
     done

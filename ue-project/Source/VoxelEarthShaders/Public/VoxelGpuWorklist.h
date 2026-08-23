@@ -233,8 +233,17 @@ public:
 	// voxelize verify kernel with VerifyStatsBase 10 -- it compares the
 	// stamped cells), [12..13] the pack verify's (VoxelWorklistPack.usf),
 	// [14..15] the claim verify's (VoxelWorklistClaim.usf -- [14]
-	// mismatches, [15] dwords checked).
-	static constexpr uint32 kStatsDwords = 16;
+	// mismatches, [15] dwords checked), [16] THE CLAIM STAGE'S OWN TRAFFIC
+	// COUNTER: how many records ClaimWorklistMain actually found eligible,
+	// cumulative, written on every armed tick whether or not any verify is
+	// armed. It exists because the two things that must be the same set --
+	// the records the GPU claims and the chunks the host counts as converted
+	// -- were NOT the same set, and no instrument in the system could say so:
+	// `checked` was read as evidence over the host's conv count when it was
+	// really running over ~31x that many records. [17..19] reserved (the
+	// readback copies whole dwords; kept a multiple of 4).
+	static constexpr uint32 kStatsDwords = 20;
+	static constexpr uint32 kStatsClaimEligible = 16;
 
 	~FVoxelGpuWorklist();
 
@@ -372,6 +381,26 @@ public:
 	};
 	FLastFlush GetLastFlush() const { return LastFlush; }
 
+	// Game thread: how many records the LAST flush stamped claimStaged (bit
+	// 10) on, and the running total. This is the HOST's count of the set the
+	// GPU's ClaimWorklistMain will find eligible; the manager compares it to
+	// its own bWorklistClaimFed count and to the GPU's [16] every proof.
+	// THE FAILING READINGS, both directions:
+	//   * CumClaimStaged > the manager's WorklistClaimConverted -- records
+	//     staged for a GPU claim whose host job did NOT convert, so its batch
+	//     graph claims the same slot too: A DOUBLE CLAIM, pool ranges leaking
+	//     at exactly that rate ([brick-gpualloc] `unclaimed` goes negative).
+	//   * CumClaimStaged < WorklistClaimConverted -- the host skipped a batch
+	//     graph's brick chain for a chunk nothing ever claimed: the chunk
+	//     lands unwritten (holes), never corruption.
+	//   * CumClaimStaged > 0 with the GPU's [16] flat at 0 -- the stage is
+	//     staging records and the kernel is not running: DEAD STAGE.
+	uint32 GetClaimStagedThisFlush() const { return ClaimStagedThisFlush; }
+	int64 GetCumClaimStaged() const { return CumClaimStaged; }
+	// The GPU's own count of records ClaimWorklistMain found eligible, as of
+	// the last landed proof; -1 until a proof has landed.
+	int64 GetGpuClaimEligible() const { return GpuClaimEligible; }
+
 	// Render thread, from inside a graph that consumes the column stage's
 	// output (the batch graph): registers the arena and the stats buffer.
 	// Arena is null until the first armed Flush has run on the render thread
@@ -470,6 +499,14 @@ public:
 		// under the verify switch is a DEAD GATE, never a pass.
 		uint64 ClaimDwordMismatches = 0;
 		uint64 ClaimDwordsChecked = 0;
+		// The set-identity pair. ClaimEligibleOnGpu is stats[16] -- records
+		// ClaimWorklistMain actually claimed; ClaimStagedOnHost is the host's
+		// own count of records it stamped claimStaged on. THEY MUST BE THE
+		// SAME NUMBER (the GPU lagging by the readback latency is the only
+		// permitted gap, and only in that direction). GPU ahead = a double
+		// claim, one leaked grant per excess record.
+		uint64 ClaimEligibleOnGpu = 0;
+		int64 ClaimStagedOnHost = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -554,6 +591,13 @@ private:
 	bool bClaimStageArmed = false;
 	bool bClaimVerifyArmed = false;
 	FPoolBinder ClaimPoolBinder;
+	// The host's own count of the set the GPU will claim: records this flush
+	// stamped claimStaged on (bit 10, which now requires the manager's bit 11
+	// hostClaimCandidate). Compared against the manager's converted count and
+	// the GPU's stats[16] -- see GetClaimStagedThisFlush's failing readings.
+	uint32 ClaimStagedThisFlush = 0;
+	int64 CumClaimStaged = 0;
+	int64 GpuClaimEligible = -1;   // GPU stats[16] as of the last landed proof
 	FLastFlush LastFlush;
 
 	// --- the spine proof (game-thread state) --------------------------------

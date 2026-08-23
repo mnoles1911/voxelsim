@@ -1368,6 +1368,11 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocBitmap)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocSide)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutClaim)
+			// Bound on EVERY armed tick, not just the verify arm: the claim
+			// kernel's traffic counter (stats[16], eligible records) is what
+			// makes "the GPU claimed a slot the host also claims classically"
+			// a readable number instead of a leak nobody can see.
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
 			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
 		END_SHADER_PARAMETER_STRUCT()
 	};
@@ -3729,7 +3734,10 @@ void VoxelGpuWorldGen::AddWorklistClaimPasses(FRDGBuilder& GraphBuilder,
 	check(Dispatch.Pool.IsValid());
 	check(Dispatch.RingCapacity > 0 && Dispatch.ClaimBudgetRecords > 0);
 	check(Dispatch.ChunkRecordDwords > 0);
-	check(!Dispatch.bVerify || Dispatch.VerifyStats != nullptr);
+	// Stats is now REQUIRED on every armed dispatch (the claim kernel's
+	// eligible-record traffic counter lives at [16]); the verify arm adds
+	// [14..15] on top.
+	check(Dispatch.VerifyStats != nullptr);
 
 	// The per-flush claim buffer: 8 dwords per record, an RDG TRANSIENT --
 	// every consumer (the write pair, the verify) lives in this same graph,
@@ -3755,6 +3763,7 @@ void VoxelGpuWorldGen::AddWorklistClaimPasses(FRDGBuilder& GraphBuilder,
 		Params->AllocBitmap = GraphBuilder.CreateUAV(Dispatch.Pool.AllocBitmap);
 		Params->AllocSide = GraphBuilder.CreateUAV(Dispatch.Pool.AllocSide);
 		Params->OutClaim = GraphBuilder.CreateUAV(Claim);
+		Params->WorklistStats = GraphBuilder.CreateUAV(Dispatch.VerifyStats);
 		Params->IndirectArgs = Dispatch.IndirectArgs;
 		TShaderMapRef<FVoxelWorklistClaimCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 		FComputeShaderUtils::AddPass(
