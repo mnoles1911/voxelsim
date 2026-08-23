@@ -31,4 +31,22 @@ for f in "$@"; do
       T += n*grab($0, "submitToDeliver") }
     END { if (N > 0) printf "n=%d queued=%.1f promoteToDispatch=%.1f dispatchToReady=%.1f readyToDeliver=%.1f sum=%.1f submitToDeliver=%.1f", N, Q/N, P/N, D/N, R/N, (Q+P+D+R)/N, T/N }')
   if [ -n "$gpustages" ]; then printf "%-18s   gpuStages: %s\n" "" "$gpustages"; fi
+  # B.3 asset-resolve accounting (-VoxelAsyncAssetResolve). Unlike the windowed
+  # lines above, these counters are CUMULATIVE since process start, so the LAST
+  # line holds the leg's totals and the linger-window trap this script exists
+  # for does not apply -- tail -1 is correct here, and only here. Absent on a
+  # control leg by design (the line prints only with the switch on), and absent
+  # on any leg missing -VoxelAssetDir, which makes the whole feature an empty
+  # branch -- an armed leg with no line here measured nothing.
+  #
+  # FAILING READINGS, so a healthy-looking line cannot lie unchallenged:
+  #   hits ~= inline            -> residency gate refusing to store (or the cache
+  #                                is not being consulted); expect ~8:1 warm.
+  #   worker=0.0 ms with coarse -> warm pass is a silent no-op; the only win is
+  #   chunks dispatching           the cache. Level-0-only traffic is expected.
+  #   raced ~= landed           -> warm work was never on the critical path.
+  #   hits/(hits+inline) ~ 8/9  -> the cache is lying about what the resolve
+  #   but cycPerColumn unmoved     cost; distrust the whole leg.
+  b3=$(grep -o "assets RESOLVE (B\.3): .*" "$log" | tail -1)
+  if [ -n "$b3" ]; then printf "%-18s   %s\n" "" "$b3"; fi
 done
