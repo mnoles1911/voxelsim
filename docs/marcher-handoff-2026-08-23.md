@@ -747,3 +747,95 @@ Also open: **stack fusion is weak** -- 311 chunks over 77 stacks (~4/stack) and
 127 over 57 (~2.2/stack) against a design assumption of ~8, with 33 then 73 jobs
 falling back to `single`. The quota counts stacks, so weak fusion directly halves
 the benefit.
+
+
+---
+
+## 11. THE PERSISTENT RASTER ATLAS SHIPPED AND WORKS
+
+The owner's stated blocker, built and measured. `-VoxelGpuRasterAtlas=1`.
+
+### 11.1 Result
+
+| arm | dispatched | p50 | **p95** |
+| --- | --- | --- | --- |
+| atlas off | 2,022/s | 9.99 ms | **43.31 ms** |
+| **atlas on** | **2,225/s (+10%)** | 9.96 ms | **34.02 ms (-21%)** |
+
+89 active windows each, one binary, one switch, bare terrain (no `-VoxelAssetDir`).
+
+Warm steady state:
+
+```
+[raster-atlas] window: served=1696 inlineFallback=0 fills=0 (0.00 MiB, 0.0 ms GT)
+               resident=1521/1681 pages gpuMiss=0 lifetimeMiss=0
+```
+
+**Every request served from the atlas. Zero inline fallbacks. Zero game-thread
+cost. Zero misses.** Cold fill is `served=119 inlineFallback=141 fills=12
+(13.7 ms GT)` at 12/1681 pages resident, and the whole-run fill cost is 75.7
+ms/window while covering new ground, falling to 0.0 once the torus is resident.
+
+**I predicted this would not move throughput and I was wrong.** The prediction
+was based on the raster term not binding at 2,000 chunks/s (subsystem tick is
+0.14% of wall). The +10%/-21% says the per-chunk window was costing real
+game-thread time even at this rate — and the p95 improvement is the honest tell,
+since that is where a 46 KB per-chunk allocation-and-sample lands.
+
+### 11.2 Init, and why the shape is what it is
+
+```
+[raster-atlas] init: pitch=1875 mm/px, coverage r=4.10 km, margin=50 px
+  (probed through ComputeRasterWindowPx over levels 0..5),
+  torus 41x41 pages of 128 px -> 210.1 MiB payload + 6.6 KiB tags
+```
+
+**ONE LEVEL, NOT A CLIPMAP, and that is load-bearing.** Pitch is a WORLD
+property, not an LOD: with the fine tier live every chunk at every ring level
+samples the same 1.875 m raster. A near-fine/far-coarse clipmap would regenerate
+far chunks from different pixels than the CPU reference and the collision world
+use -- the cross-arm divergence `FVoxelWorldImpl::ActiveTiles` forbids. So the
+atlas holds the whole coverage at world pitch: **210 MiB at fine pitch over
+4.10 km**, ~2.6 MiB at coarse. (An earlier estimate in this document of "1.71 MB
+for the whole cascade" assumed a coarse/fine clipmap and is therefore wrong for
+the fine-tier world.)
+
+**THE WINDOW RULE IS CONSUMED, NOT COPIED.** The margin is probed through
+`VoxelGpuRegionBuild::ComputeRasterWindowPx` -- the single spelling that
+`FillRasterWindow` and both verify harnesses run. No second copy to drift; the
+D5 lesson honoured structurally.
+
+**A MISS CANNOT BE SILENT.** Tags clear to a SENTINEL, not zero -- zero packs
+page (-32768,-32768), a real coordinate, so an all-zero table would be full of
+absurd-but-valid pages. All-sentinel means every tap before the first upsert is
+a COUNTED miss. `lifetimeMiss=0` is therefore a real reading, not an absent one.
+
+### 11.3 Two crashes, both only findable by running it
+
+1. **RDG extraction.** `Assertion failed: Resource->bProduced || bExternal ||
+   bQueuedForUpload` -- "Unable to queue the extraction of
+   Voxel.RasterAtlasElev because it has not been produced by any pass." The
+   payloads are deliberately never cleared (a payload behind a sentinel tag is
+   unreachable; clearing ~210 MiB at init is a hitch bought for nothing), and
+   RDG cannot express "allocate, do not write". Fixed with
+   `AllocatePooledBuffer`, outside the graph. Only Tags and Miss still go
+   through create-clear-extract.
+2. **Thread affinity.** `PollMissStats` ran the readback's `IsReady()`/`Lock()`
+   from `TickStreaming`; those are RHI calls asserting `IsInRenderingThread()`
+   and the run died at 37 s. The render thread now polls inside the upsert
+   command and publishes into atomics.
+
+### 11.4 Still open: the indirect-dispatch worklist
+
+`VoxelGpuWorklist.{h,cpp}`, `VoxelWorklist.ush`, `VoxelWorklistArgs.usf` and
+`VoxelWorklistConsume.usf` exist and compile, and wiring into
+`VoxelGpuMeshJobManager` is in progress. Nothing referenced them for several
+hours -- a library with no caller.
+
+The arithmetic it must satisfy: **15.0 passes/chunk** measured, so 31,620
+passes/s at 2,108 chunks/s -- **already 1.1x the recorded ~500-passes-per-tick
+hitch cliff** (30,000/s at 60 fps), which is consistent with p95 43 ms against
+p50 10 ms. At 50,000 chunks/s the per-chunk path is **750,000 passes/s = 25x the
+cliff**, and even fused stacks are 5.8x. Indirect dispatch is ~14 passes per
+TICK regardless of N = **840 passes/s, 36x under the cliff.** The gate is that
+passes-per-tick goes FLAT as chunk rate rises, not merely lower.
