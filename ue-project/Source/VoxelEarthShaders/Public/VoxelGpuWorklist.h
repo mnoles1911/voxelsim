@@ -2,7 +2,19 @@
 // FVoxelGpuWorklist -- the persistent chunk-record ring for P3 (persistent
 // worklist + indirect dispatch; docs/gpu-worklist-plan-2026-08-23.md).
 //
-// *** SPINE WIRED; KERNELS CONVERTED: Column, Voxelize (2026-08-23). ***
+// *** SPINE WIRED; KERNELS CONVERTED: Column, Voxelize, fused ClassifyTotals
+// (2026-08-23). ***
+// Behind -VoxelGpuWorklistClassify=1 (on top of the Voxelize switch) the
+// flush graph ALSO dispatches the fused ClassifyTotals pair -- one group per
+// BRICK classify off the cell arena, then a one-group-per-record in-group
+// scan + totals -- and every cell-fed chunk skips its classic
+// BrickClassifyMain, BOTH 3-pass scans and BrickTotalMain: EIGHT passes, the
+// conversion's largest single cut (15 -> 7 on the lean-alloc shape).
+// BrickPackMain reads offsets through brickpack.ush's BrickScanReadBase; the
+// claim pass reads totals through VoxelBrickPoolAlloc.usf's TotalsReadBase.
+// Byte gate: -VoxelGpuWorklistVerifyCT=1 into stats [8..9]. Four stages
+// remain: AssetStamp, PackClaim, Write, Record.
+//
 // Behind -VoxelGpuWorklistVoxelize=1 (on top of the two switches below) the
 // flush graph ALSO dispatches VoxelizeWorklistMain once per tick: every
 // consumed asset-free record's 32,768 cells land in a flush-level CELL ARENA
@@ -11,8 +23,7 @@
 // through brickpack.ush's CellReadBase, and the chunk's own VoxelizeMain is
 // SKIPPED (16 -> 15 passes on the lean-alloc shape). Asset chunks fall back
 // by design until the flush-level asset buffer lands. Byte gate:
-// -VoxelGpuWorklistVerifyVox=1 into stats [6..7]. Five stages remain:
-// AssetStamp, ClassifyTotals, PackClaim, Write, Record.
+// -VoxelGpuWorklistVerifyVox=1 into stats [6..7].
 //
 // The stage-1 banner, still accurate for the Column stage:
 // Behind -VoxelGpuWorklistColumns=1 (on top of -VoxelGpuWorklist=1) the flush
@@ -92,10 +103,12 @@ static_assert(sizeof(FVoxelGpuChunkWorkRecord) == 64, "the 64-byte record IS the
 // the args-setup kernel multiplies them in on the GPU.
 enum class EVoxelWorklistStage : uint8
 {
-	Column = 0,     // 32x32 columns / 64 threads = 16 groups per record
-	Voxelize,       // 32x32xBricksZ*8 cells -> 4*BricksZ groups (BricksZ=4 fixed)
+	Column = 0,     // 32x32 columns / 64 threads = 16 groups per record (LOCKED)
+	Voxelize,       // one thread per COLUMN (cave/cavern are per-column), 16 groups (LOCKED)
 	AssetStamp,     // per-column gather loop, 16 groups (order-preserving form)
-	ClassifyTotals, // 64 bricks, single group: classify + in-group scan + totals
+	Classify,       // ONE GROUP PER BRICK (the classic classify shape --
+	                // brickBuildOccupancy is groupshared), 64 groups (LOCKED)
+	ClassifyTotals, // in-group exclusive scan of the 64 counts + totals, 1 group (LOCKED)
 	PackClaim,      // pack + claim fused, 64 bricks / group pair
 	Write,          // occ+mat word copies, groups from claim sizes (upper bound)
 	Record,         // descriptor + chunk record + index cell, 1 group
@@ -120,11 +133,19 @@ public:
 	// arena slice is the lean chunk's 32x32x32 cells.
 	static constexpr uint32 kCellsPerRecord = 32768;
 	static constexpr uint32 kVoxelizeGroupsPerRecord = kColumnsPerRecord / 64;
+	// The fused ClassifyTotals stage: one group per BRICK for the classify
+	// half (brickBuildOccupancy is groupshared -- the classic shape is the
+	// only shape that calls the same text), one group per RECORD for the
+	// scan + totals half.
+	static constexpr uint32 kBricksPerRecord = 64;
+	static constexpr uint32 kClassifyGroupsPerRecord = kBricksPerRecord;
+	static constexpr uint32 kClassifyTotalsGroupsPerRecord = 1;
 	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
 	// [4..5] the column verify's mismatch/checked counters
-	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's mismatch/checked
-	// counters (VoxelWorklistVoxelize.usf).
-	static constexpr uint32 kStatsDwords = 8;
+	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's
+	// (VoxelWorklistVoxelize.usf), [8..9] the classify-totals verify's
+	// (VoxelWorklistClassify.usf), [10..11] reserved for later stages.
+	static constexpr uint32 kStatsDwords = 12;
 
 	~FVoxelGpuWorklist();
 
@@ -169,6 +190,16 @@ public:
 	void SetVoxelizeStageArmed(bool bArmed, uint32 CellBudgetRecords);
 	bool IsVoxelizeStageArmed() const { return bVoxelizeStageArmed && bColumnStageArmed; }
 
+	// --- the fused ClassifyTotals stage (-VoxelGpuWorklistClassify) ---------
+	//
+	// Same flag-not-inputs shape as the Voxelize arm, and gated BEHIND it:
+	// the classify half reads the CELL arena, so without the Voxelize stage
+	// there is nothing to classify and the stage stays dark (every chunk
+	// falls back, counted). No budget of its own -- its five arenas total
+	// ~1 KiB per record, three orders under the cell arena's clamp.
+	void SetClassifyStageArmed(bool bArmed) { bClassifyStageArmed = bArmed; }
+	bool IsClassifyStageArmed() const { return bClassifyStageArmed && IsVoxelizeStageArmed(); }
+
 	// Game thread: the consume window the most recent Flush mirrored --
 	// [ConsumeFirst, ConsumeFirst + Take) in monotonic record indices. A
 	// record appended at monotonic index m was consumed by that flush iff
@@ -188,11 +219,19 @@ public:
 	struct FColumnStageBindings
 	{
 		FRDGBufferRef Arena = nullptr;     // budget x 1,024 GpuColumnSample
-		FRDGBufferRef Stats = nullptr;     // kStatsDwords dwords (verifies write [4..7])
+		FRDGBufferRef Stats = nullptr;     // kStatsDwords dwords (verifies write [4..9])
 		// The Voxelize stage's cell arena (cellBudget x 32,768 uint). Null
 		// until the first voxelize-armed Flush has run on the render thread
 		// -- same fallback-and-count contract as Arena.
 		FRDGBufferRef CellArena = nullptr;
+		// The fused ClassifyTotals stage's arenas (null until its first armed
+		// flush, same contract). Offsets/counts: budget x 64 uints each;
+		// totals: budget x 2. The batch graph binds the offsets to
+		// BrickPackMain (BrickScanReadBase) and the totals to the claim pass
+		// (TotalsReadBase); the counts exist for the verify compare only.
+		FRDGBufferRef OccOffsetsArena = nullptr;
+		FRDGBufferRef MatOffsetsArena = nullptr;
+		FRDGBufferRef TotalsArena = nullptr;
 	};
 	FColumnStageBindings RegisterColumnStage(FRDGBuilder& GraphBuilder);
 
@@ -238,6 +277,12 @@ public:
 		// gate is dead and "no mismatches" is vacuous.
 		uint64 VoxCellMismatches = 0;
 		uint64 VoxCellsChecked = 0;
+		// The fused ClassifyTotals stage's byte gate, same contract: offsets
+		// + totals compared (which determine the counts), so a mismatch here
+		// means the pack offsets or the claim size are WRONG -- pool
+		// corruption, the leg invalid outright.
+		uint64 CtDwordMismatches = 0;
+		uint64 CtDwordsChecked = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -294,6 +339,14 @@ private:
 	uint32 VoxelizeCellBudget = 0;   // per-flush record cap while armed (see setter)
 	uint32 CellArenaRecords = 0;     // slices the cell arena holds; latched at creation
 	TRefCountPtr<FRDGPooledBuffer> PooledCellArena;
+	// --- fused ClassifyTotals stage (same lifetime rules) -------------------
+	bool bClassifyStageArmed = false;
+	uint32 ClassifyArenaRecords = 0; // slices the five arenas hold; latched at creation
+	TRefCountPtr<FRDGPooledBuffer> PooledOccCountsArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledMatCountsArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledOccOffsetsArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledMatOffsetsArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledTotalsArena;
 	FLastFlush LastFlush;
 
 	// --- the spine proof (game-thread state) --------------------------------

@@ -131,6 +131,11 @@ namespace VoxelGpuWorldGen
 		// The ONLY thing the CPU reads on this path, and what the pool
 		// allocation is made from.
 		FRDGBufferRef BrickTotals = nullptr;
+		// P3 fused ClassifyTotals: element base of THIS chunk's totals pair
+		// inside BrickTotals. 0 on every classic path (BrickTotals is then a
+		// 2-dword transient); SliceIndex * 2 when BrickTotals is the worklist
+		// totals arena. The claim pass reads through it (TotalsReadBase).
+		uint32 BrickTotalsReadBase = 0;
 
 		// Tier B.1 (voxel.GPU.WorldGenBatch): (2 + 2*NumBrickChunks) uints --
 		// the region totals pair, then each chunk's own occ/mat dword pair.
@@ -184,6 +189,21 @@ namespace VoxelGpuWorldGen
 		// well (into the region's transient Cells, reading the SAME column
 		// arena slice) plus a compare pass into VerifyStats [6..7].
 		bool bVerifyVox = false;
+
+		// P3 fused ClassifyTotals stage: non-null when this chunk's brick
+		// counts/offsets/totals were also computed this tick (the two fused
+		// indirect dispatches). AddRegionPasses then SKIPS BrickClassifyMain,
+		// BOTH 3-pass scans and BrickTotalMain (eight passes), binds
+		// BrickPackMain's offset reads to these arenas at BrickScanReadBase =
+		// SliceIndex * 64, and returns Out.BrickTotals = TotalsArena with
+		// Out.BrickTotalsReadBase = SliceIndex * 2 for the claim pass.
+		// Requires the cell feed (the classify half read the cell arena).
+		FRDGBufferRef OccOffsetsArena = nullptr;   // budget x 64 uint
+		FRDGBufferRef MatOffsetsArena = nullptr;   // budget x 64 uint
+		FRDGBufferRef TotalsArena = nullptr;       // budget x 2 uint
+		// Verify arm: run the classic classify + scans + totals as well and
+		// compare offsets + totals into VerifyStats [8..9].
+		bool bVerifyCt = false;
 	};
 
 	// The once-per-tick indirect Column dispatch, added to the worklist FLUSH
@@ -225,6 +245,28 @@ namespace VoxelGpuWorldGen
 		int32 PixelSizeMm = 0;
 	};
 	void AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder, const FWorklistVoxelizeDispatch& Dispatch);
+
+	// The fused ClassifyTotals stage's TWO once-per-tick indirect dispatches
+	// (P3 stage 3), added to the worklist FLUSH graph after the voxelize
+	// pass: ClassifyWorklistMain (one group per brick, the classic classify
+	// shape, cell arena -> count arenas) then ClassifyTotalsWorklistMain
+	// (one group per record, in-group scan -> offset + totals arenas).
+	struct FWorklistClassifyDispatch
+	{
+		FRDGBufferRef Records = nullptr;
+		FRDGBufferRef Control = nullptr;
+		FRDGBufferRef IndirectArgs = nullptr;
+		uint32 ClassifyArgsOffset = 0;   // byte offset of the Classify triple
+		uint32 TotalsArgsOffset = 0;     // byte offset of the ClassifyTotals triple
+		uint32 RingCapacity = 0;
+		FRDGBufferRef CellArena = nullptr;   // read by the classify half
+		FRDGBufferRef OccCounts = nullptr;   // written / read between the halves
+		FRDGBufferRef MatCounts = nullptr;
+		FRDGBufferRef OccOffsets = nullptr;  // written: the batch graph reads these
+		FRDGBufferRef MatOffsets = nullptr;
+		FRDGBufferRef Totals = nullptr;
+	};
+	void AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder, const FWorklistClassifyDispatch& Dispatch);
 
 	// Adds the seven passes to GraphBuilder and returns the buffers they wrote.
 	// RENDER THREAD ONLY. Does not execute the graph, does not enqueue any
@@ -466,7 +508,8 @@ namespace VoxelGpuWorldGen
 	                                    FRDGBufferRef BrickTotals, uint32 ChunkSlot,
 	                                    uint32 OccWorstWords, uint32 MatWorstWords,
 	                                    uint32 TotalsChunkIndexPlusOne = 0,
-	                                    uint32 TotalsNumChunks = 0);
+	                                    uint32 TotalsNumChunks = 0,
+	                                    uint32 TotalsReadBase = 0);
 
 	// The three writes: occ words, mat words (worst-case dispatch, actual count
 	// read from the claim), descriptors (claim-based rebase), and the record

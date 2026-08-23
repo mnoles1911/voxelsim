@@ -153,8 +153,16 @@ uint ChunkRecordBase;
 // the descriptor bytes cannot be touched by a read-side offset. The bench form
 // never compiles a worklist arm, so it keeps the literal 0.
 uint CellReadBase;
+// P3 worklist ClassifyTotals stage (VXC_UE only): base ELEMENT added to
+// BrickPackMain's two scanned-offset reads, CellReadBase's pattern verbatim.
+// 0 on every classic dispatch (a uniform +0); sliceIndex * 64 when this
+// chunk's offsets live in the worklist scan arenas (the fused
+// ClassifyTotalsWorklistMain wrote them, one 64-brick slice per record; the
+// occ and mat arenas are separate buffers, so ONE base serves both reads).
+uint BrickScanReadBase;
 #else
 static const uint CellReadBase = 0;
+static const uint BrickScanReadBase = 0;
 #endif
 #ifndef VXC_UE
 cbuffer BrickPackParams : register(b0)
@@ -405,6 +413,21 @@ void brickComputeInfo()
     gsInfo[kInfoUniformMat] = uniformMat;
 }
 
+// The two COUNT formulas, factored from BrickClassifyMain's write lines so the
+// worklist's converted Classify stage (VoxelWorklistClassify.usf) and the
+// classic entry point emit counts from the same text -- the worldgen.ush
+// columnSampleAt / voxelizeColumnInto rule applied here. Thread 0 only, after
+// brickComputeInfo (they read gsInfo).
+uint brickOccCountFromInfo()
+{
+    return (gsInfo[kInfoKind] == kBrickKindMixed) ? kBrickOccWords : 0u;
+}
+uint brickMatCountFromInfo()
+{
+    return (gsInfo[kInfoKind] == kBrickKindMixed)
+               ? (gsInfo[kInfoPaletteDwords] + gsInfo[kInfoPayloadDwords]) : 0u;
+}
+
 // Palette rank of a material: the number of present materials below it. This is
 // the canonical palette index, by definition of "ascending MaterialId".
 uint paletteRankOf(uint mat)
@@ -439,15 +462,15 @@ void BrickClassifyMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (gtid.x == 0u)
     {
         brickComputeInfo();
-        const bool mixed = (gsInfo[kInfoKind] == kBrickKindMixed);
         // Bounded: the index is gid.x, capped by decodeBrick's `packIndex >=
         // chunksX*chunksY*chunksZ*64` early-out above, and the host sizes both
         // count buffers to exactly that brick count -- the same contract the
-        // scan's ScanCount carries.
-        OutBrickOccCounts[gid.x] = mixed ? kBrickOccWords : 0u;
+        // scan's ScanCount carries. The formulas live in brickOccCountFromInfo
+        // / brickMatCountFromInfo so the worklist Classify stage emits the
+        // same text.
+        OutBrickOccCounts[gid.x] = brickOccCountFromInfo();
         // Same bound as the line above, same buffer size contract.
-        OutBrickMatCounts[gid.x] =
-            mixed ? (gsInfo[kInfoPaletteDwords] + gsInfo[kInfoPayloadDwords]) : 0u;
+        OutBrickMatCounts[gid.x] = brickMatCountFromInfo();
     }
 }
 
@@ -545,8 +568,10 @@ void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     const uint kind = gsInfo[kInfoKind];
     const uint bpp = gsInfo[kInfoBpp];
     const uint paletteDwords = gsInfo[kInfoPaletteDwords];
-    const uint occBase = OccWriteBase + InBrickOccOffsets[gid.x];
-    const uint matBase = MatWriteBase + InBrickMatOffsets[gid.x];
+    // BrickScanReadBase is 0 on every classic dispatch (see its declaration);
+    // nonzero only when the offsets live in the worklist scan arenas.
+    const uint occBase = OccWriteBase + InBrickOccOffsets[BrickScanReadBase + gid.x];
+    const uint matBase = MatWriteBase + InBrickMatOffsets[BrickScanReadBase + gid.x];
 
     if (gtid.x == 0u)
     {

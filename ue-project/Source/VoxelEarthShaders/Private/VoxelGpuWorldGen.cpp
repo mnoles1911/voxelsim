@@ -648,7 +648,8 @@ namespace
 		SHADER_PARAMETER(uint32,       OccWriteBase) \
 		SHADER_PARAMETER(uint32,       MatWriteBase) \
 		SHADER_PARAMETER(uint32,       ChunkRecordBase) \
-		SHADER_PARAMETER(uint32,       CellReadBase)
+		SHADER_PARAMETER(uint32,       CellReadBase) \
+		SHADER_PARAMETER(uint32,       BrickScanReadBase)
 
 	class FVoxelBrickClassifyCS : public FVoxelBrickPackShader
 	{
@@ -681,6 +682,96 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickSkip)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkBrickMask)
 		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- the fused ClassifyTotals stage (P3 stage 3) ------------------------
+	//
+	// Three kernels, one file (VoxelWorklistClassify.usf), all compiling
+	// brickpack.ush under VXC_UE -- so FVoxelBrickPackShader base, NOT
+	// FVoxelWorldGenShader (brickpack.ush carries no worldgen version lock;
+	// VoxelBrickPack.usf's header has the long argument). The stage-shape
+	// defines mirror the host table entries; the kernels #error on drift.
+	class FVoxelWorklistClassifyCS : public FVoxelBrickPackShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistClassifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistClassifyCS, FVoxelBrickPackShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICKPACK_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl)
+			SHADER_PARAMETER(uint32, RingCapacity)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCells)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistOccCounts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistMatCounts)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FVoxelBrickPackShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_CLASSIFY_GROUPS"),
+			                         FVoxelGpuWorklist::kClassifyGroupsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_BRICKS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kBricksPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_CELLS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kCellsPerRecord);
+		}
+	};
+
+	class FVoxelWorklistClassifyTotalsCS : public FVoxelBrickPackShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistClassifyTotalsCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistClassifyTotalsCS, FVoxelBrickPackShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl)
+			SHADER_PARAMETER(uint32, RingCapacity)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistOccCountsIn)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistMatCountsIn)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistOccOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistMatOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistTotals)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FVoxelWorklistClassifyCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		}
+	};
+
+	// ClassifyTotalsWorklistVerifyMain (-VoxelGpuWorklistVerifyCT): converted
+	// offsets + totals vs the classic classify + scans + totals chain, into
+	// stats [8..9]. One 1-group pass per verified chunk, verify arm only.
+	class FVoxelWorklistClassifyVerifyCS : public FVoxelBrickPackShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistClassifyVerifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistClassifyVerifyCS, FVoxelBrickPackShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicOccOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicMatOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicTotals)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaOccOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaMatOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaTotals)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
+			SHADER_PARAMETER(uint32, VerifyScanBase)
+			SHADER_PARAMETER(uint32, VerifyTotalsBase)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FVoxelWorklistClassifyCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		}
 	};
 
 	// --- P1-C / P2: the pool-write kernels ---------------------------------
@@ -967,6 +1058,9 @@ namespace
 			SHADER_PARAMETER(uint32, TotalsChunkIndexPlusOne)
 			// Stack size K; non-zero arms the in-kernel split gate.
 			SHADER_PARAMETER(uint32, TotalsNumChunks)
+			// P3 fused ClassifyTotals: element base of the chunk's totals
+			// pair when InBrickTotals is the worklist arena; 0 classic.
+			SHADER_PARAMETER(uint32, TotalsReadBase)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickTotals)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocState)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocBitmap)
@@ -1154,6 +1248,10 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistColumnVerifyCS, VOXEL_WORKLIST_COLUMN_USF,
 #define VOXEL_WORKLIST_VOXELIZE_USF "/VoxelEarth/VoxelWorklistVoxelize.usf"
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistVoxelizeCS,       VOXEL_WORKLIST_VOXELIZE_USF, "VoxelizeWorklistMain",       SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistVoxelizeVerifyCS, VOXEL_WORKLIST_VOXELIZE_USF, "VoxelizeWorklistVerifyMain", SF_Compute);
+#define VOXEL_WORKLIST_CLASSIFY_USF "/VoxelEarth/VoxelWorklistClassify.usf"
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClassifyCS,       VOXEL_WORKLIST_CLASSIFY_USF, "ClassifyWorklistMain",             SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClassifyTotalsCS, VOXEL_WORKLIST_CLASSIFY_USF, "ClassifyTotalsWorklistMain",       SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistClassifyVerifyCS, VOXEL_WORKLIST_CLASSIFY_USF, "ClassifyTotalsWorklistVerifyMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMeshCountCS,  VOXEL_WORLDGEN_USF, "MeshCountMain",  SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanBlocksCS, VOXEL_WORLDGEN_USF, "ScanBlocksMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanSumsCS,   VOXEL_WORLDGEN_USF, "ScanSumsMain",   SF_Compute);
@@ -1183,6 +1281,8 @@ namespace
 		// of a cell-fed chunk, which override it after this call. A READ
 		// base -- the four zero WRITE bases above keep their contract.
 		Out.CellReadBase = 0;
+		// P3 fused ClassifyTotals: same rule, BrickPackMain's offset reads.
+		Out.BrickScanReadBase = 0;
 	}
 
 	// Fills the loose parameters that every kernel shares. ScanCount varies by
@@ -1685,6 +1785,31 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	const bool bVerifyVox = bWorklistCells && ColumnFeed->bVerifyVox
 	                     && ColumnFeed->VerifyStats != nullptr;
 
+	// --- P3 fused ClassifyTotals: brick counts/offsets/totals in arenas? ----
+	//
+	// Rides the cell feed (the classify half read the cell arena). With this
+	// set, the ENTIRE classic count side -- BrickClassifyMain, both 3-pass
+	// scans, BrickTotalMain, eight passes -- is skipped; BrickPackMain reads
+	// its offsets through BrickScanReadBase and the caller's claim pass reads
+	// Out.BrickTotals (the totals ARENA) through Out.BrickTotalsReadBase.
+	const bool bWorklistTotals = bWorklistCells
+	                          && ColumnFeed->OccOffsetsArena != nullptr
+	                          && ColumnFeed->MatOffsetsArena != nullptr
+	                          && ColumnFeed->TotalsArena != nullptr;
+	if (bWorklistTotals)
+	{
+		// A totals-fed chunk is a single lean chunk on the alloc path; the
+		// stack-totals split kernel must not be asked for (its output would
+		// not exist).
+		checkf(!Request.bPerChunkBrickTotals,
+		       TEXT("worklist totals feed on a region requesting per-chunk stack totals"));
+	}
+	const bool bVerifyCt = bWorklistTotals && ColumnFeed->bVerifyCt
+	                    && ColumnFeed->VerifyStats != nullptr;
+	// The classic count side runs when the stage is not feeding this chunk,
+	// or purely as the verify arm's byte reference.
+	const bool bClassicScan = !bWorklistTotals || bVerifyCt;
+
 	// --- inputs -----------------------------------------------------
 	//
 	// A: under bRasterAtlas there IS no per-request raster -- the sampling
@@ -2024,22 +2149,26 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	{
 		RDG_EVENT_SCOPE(GraphBuilder, "Voxel.BrickPack");
 
-		FRDGBufferRef OccCounts = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickOccCounts"));
-		FRDGBufferRef OccOffsets = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickOccOffsets"));
-		FRDGBufferRef MatCounts = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickMatCounts"));
-		FRDGBufferRef MatOffsets = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickMatOffsets"));
+		// The classic count-side transients exist only when the classic
+		// count side runs (see bClassicScan): a totals-fed chunk's counts
+		// live in the worklist arenas. Null-not-unwritten, the Columns rule.
+		const auto MakeScanBuf = [&](uint32 Elements, const TCHAR* Name) -> FRDGBufferRef
+		{
+			return bClassicScan
+				? GraphBuilder.CreateBuffer(
+					FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Elements), Name)
+				: nullptr;
+		};
+		FRDGBufferRef OccCounts = MakeScanBuf(S.NumBricks, TEXT("Voxel.BrickOccCounts"));
+		FRDGBufferRef OccOffsets = MakeScanBuf(S.NumBricks, TEXT("Voxel.BrickOccOffsets"));
+		FRDGBufferRef MatCounts = MakeScanBuf(S.NumBricks, TEXT("Voxel.BrickMatCounts"));
+		FRDGBufferRef MatOffsets = MakeScanBuf(S.NumBricks, TEXT("Voxel.BrickMatOffsets"));
 		// One block-sum buffer per scan rather than one reused twice: reuse
 		// would be correct (RDG would order the two by the write-after-read on
 		// it) but it would also make the second scan wait on the first for no
 		// reason other than a buffer name.
-		FRDGBufferRef OccBlockSums = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.BrickScanBlocks), TEXT("Voxel.BrickOccBlockSums"));
-		FRDGBufferRef MatBlockSums = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.BrickScanBlocks), TEXT("Voxel.BrickMatBlockSums"));
+		FRDGBufferRef OccBlockSums = MakeScanBuf(S.BrickScanBlocks, TEXT("Voxel.BrickOccBlockSums"));
+		FRDGBufferRef MatBlockSums = MakeScanBuf(S.BrickScanBlocks, TEXT("Voxel.BrickMatBlockSums"));
 
 		Out.BrickDesc = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32) * 2, S.NumBricks), TEXT("Voxel.BrickDesc"));
@@ -2058,8 +2187,29 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks * 2), TEXT("Voxel.BrickSkip"));
 		Out.BrickChunkMask = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBrickChunks * 2), TEXT("Voxel.BrickChunkMask"));
-		Out.BrickTotals = GraphBuilder.CreateBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2), TEXT("Voxel.BrickTotals"));
+		// Totals-fed: Out.BrickTotals IS the worklist totals arena, and the
+		// claim pass reads this chunk's pair through Out.BrickTotalsReadBase.
+		// The verify arm still compares against a classic transient below,
+		// but the LIVE path -- what the claim sizes from -- is the arena, so
+		// the verified path is the live path (the column stage's rule).
+		FRDGBufferRef ClassicTotals = nullptr;
+		if (bWorklistTotals)
+		{
+			Out.BrickTotals = ColumnFeed->TotalsArena;
+			Out.BrickTotalsReadBase = ColumnFeed->SliceIndex * 2u;
+			if (bClassicScan)
+			{
+				ClassicTotals = GraphBuilder.CreateBuffer(
+					FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2),
+					TEXT("Voxel.BrickTotalsClassic"));
+			}
+		}
+		else
+		{
+			Out.BrickTotals = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2), TEXT("Voxel.BrickTotals"));
+			ClassicTotals = Out.BrickTotals;
+		}
 
 		// THE L1 MASK IS ACCUMULATED WITH InterlockedOr AND MUST BE ZEROED
 		// FIRST. An RDG transient buffer is not zero-initialised -- it is
@@ -2071,6 +2221,13 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Out.BrickChunkMask), 0u);
 
 		// --- brick pass 1: BrickClassifyMain ------------------------------
+		//
+		// SKIPPED (with the six scan passes and BrickTotalMain below) when
+		// the fused ClassifyTotals stage fed this chunk -- eight passes, the
+		// conversion's largest single cut. Under the verify arm the classic
+		// chain still runs, into the transients, purely as the byte
+		// reference.
+		if (bClassicScan)
 		{
 			FVoxelBrickClassifyCS::FParameters* Params =
 				GraphBuilder.AllocParameters<FVoxelBrickClassifyCS::FParameters>();
@@ -2096,8 +2253,11 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		}
 
 		// --- brick passes 2-7: the two scans, worldgen.ush's own -----------
-		AddBrickScanPasses(GraphBuilder, Request, S, OccCounts, OccOffsets, OccBlockSums, TEXT("Occ"));
-		AddBrickScanPasses(GraphBuilder, Request, S, MatCounts, MatOffsets, MatBlockSums, TEXT("Mat"));
+		if (bClassicScan)
+		{
+			AddBrickScanPasses(GraphBuilder, Request, S, OccCounts, OccOffsets, OccBlockSums, TEXT("Occ"));
+			AddBrickScanPasses(GraphBuilder, Request, S, MatCounts, MatOffsets, MatBlockSums, TEXT("Mat"));
+		}
 
 		// --- brick pass 8: BrickPackMain ----------------------------------
 		{
@@ -2111,8 +2271,14 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 				bWorklistCells ? ColumnFeed->CellArena : Out.Cells);
 			Params->CellReadBase = bWorklistCells
 				? ColumnFeed->SliceIndex * FVoxelGpuWorklist::kCellsPerRecord : 0u;
-			Params->InBrickOccOffsets = GraphBuilder.CreateSRV(OccOffsets);
-			Params->InBrickMatOffsets = GraphBuilder.CreateSRV(MatOffsets);
+			// Totals-fed: the offsets come from the fused stage's arenas at
+			// BrickScanReadBase (the LIVE path, verify arm included).
+			Params->InBrickOccOffsets = GraphBuilder.CreateSRV(
+				bWorklistTotals ? ColumnFeed->OccOffsetsArena : OccOffsets);
+			Params->InBrickMatOffsets = GraphBuilder.CreateSRV(
+				bWorklistTotals ? ColumnFeed->MatOffsetsArena : MatOffsets);
+			Params->BrickScanReadBase = bWorklistTotals
+				? ColumnFeed->SliceIndex * FVoxelGpuWorklist::kBricksPerRecord : 0u;
 			Params->OutBrickDesc = GraphBuilder.CreateUAV(Out.BrickDesc);
 			Params->OutBrickOcc = GraphBuilder.CreateUAV(Out.BrickOcc);
 			Params->OutBrickMat = GraphBuilder.CreateUAV(Out.BrickMat);
@@ -2133,6 +2299,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		// GPU's totals against the CPU's derivation from the same scan arrays.
 		// A kernel only the streaming path exercises is a kernel whose first bug
 		// shows up in the streaming path.
+		if (bClassicScan)
 		{
 			FVoxelBrickTotalCS::FParameters* Params =
 				GraphBuilder.AllocParameters<FVoxelBrickTotalCS::FParameters>();
@@ -2141,12 +2308,36 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			Params->InOccOffsets = GraphBuilder.CreateSRV(OccOffsets);
 			Params->InMatCounts = GraphBuilder.CreateSRV(MatCounts);
 			Params->InMatOffsets = GraphBuilder.CreateSRV(MatOffsets);
-			Params->OutBrickTotals = GraphBuilder.CreateUAV(Out.BrickTotals);
+			// Totals-fed verify arm: the classic total lands in its own
+			// transient (the byte reference); the live totals are the arena.
+			Params->OutBrickTotals = GraphBuilder.CreateUAV(ClassicTotals);
 
 			TShaderMapRef<FVoxelBrickTotalCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 			FComputeShaderUtils::AddPass(
 				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickTotalMain"), Shader, Params,
 				FIntVector(1, 1, 1));
+		}
+
+		// --- brick pass 9v (verify arm only): fused offsets/totals vs classic
+		if (bVerifyCt)
+		{
+			FVoxelWorklistClassifyVerifyCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelWorklistClassifyVerifyCS::FParameters>();
+			Params->VerifyClassicOccOffsets = GraphBuilder.CreateSRV(OccOffsets);
+			Params->VerifyClassicMatOffsets = GraphBuilder.CreateSRV(MatOffsets);
+			Params->VerifyClassicTotals = GraphBuilder.CreateSRV(ClassicTotals);
+			Params->VerifyArenaOccOffsets = GraphBuilder.CreateSRV(ColumnFeed->OccOffsetsArena);
+			Params->VerifyArenaMatOffsets = GraphBuilder.CreateSRV(ColumnFeed->MatOffsetsArena);
+			Params->VerifyArenaTotals = GraphBuilder.CreateSRV(ColumnFeed->TotalsArena);
+			Params->WorklistStats = GraphBuilder.CreateUAV(ColumnFeed->VerifyStats);
+			Params->VerifyScanBase = ColumnFeed->SliceIndex * FVoxelGpuWorklist::kBricksPerRecord;
+			Params->VerifyTotalsBase = ColumnFeed->SliceIndex * 2u;
+
+			TShaderMapRef<FVoxelWorklistClassifyVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
+				RDG_EVENT_NAME("Voxel.WorklistClassifyVerify(slice %u)", ColumnFeed->SliceIndex),
+				Shader, Params, FIntVector(1, 1, 1));
 		}
 
 		// --- brick pass 10, Tier B.1 only: BrickStackTotalsMain ------------
@@ -2406,6 +2597,69 @@ void VoxelGpuWorldGen::AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder,
 	FComputeShaderUtils::AddPass(
 		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistVoxelize(indirect)"), Shader, Params,
 		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
+}
+
+void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
+                                                 const FWorklistClassifyDispatch& Dispatch)
+{
+	check(IsInRenderingThread());
+	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs && Dispatch.CellArena);
+	check(Dispatch.OccCounts && Dispatch.MatCounts && Dispatch.OccOffsets &&
+	      Dispatch.MatOffsets && Dispatch.Totals);
+	check(Dispatch.RingCapacity > 0);
+
+	// Pass 1: the classify half. One group per BRICK (the classic shape --
+	// brickBuildOccupancy is groupshared), cell arena in, count arenas out.
+	{
+		FVoxelWorklistClassifyCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistClassifyCS::FParameters>();
+		// The lean chunk shape decodeBrick decodes; the per-record cell base
+		// is added in-kernel (CellReadBase stays 0 -- it is a uniform and
+		// this dispatch spans records). The four write bases and ScanCount
+		// are dead weight here, zeroed like every reflection-required field.
+		Params->DispatchColumns = FUintVector2(32, 32);
+		Params->BricksZ = 4;
+		Params->ScanCount = 0;
+		Params->BrickDescBase = 0;
+		Params->OccWriteBase = 0;
+		Params->MatWriteBase = 0;
+		Params->ChunkRecordBase = 0;
+		Params->CellReadBase = 0;
+		Params->BrickScanReadBase = 0;
+		Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+		Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+		Params->RingCapacity = Dispatch.RingCapacity;
+		Params->InCells = GraphBuilder.CreateSRV(Dispatch.CellArena);
+		Params->WorklistOccCounts = GraphBuilder.CreateUAV(Dispatch.OccCounts);
+		Params->WorklistMatCounts = GraphBuilder.CreateUAV(Dispatch.MatCounts);
+		Params->IndirectArgs = Dispatch.IndirectArgs;
+
+		TShaderMapRef<FVoxelWorklistClassifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClassify(indirect)"), Shader, Params,
+			Dispatch.IndirectArgs, Dispatch.ClassifyArgsOffset);
+	}
+
+	// Pass 2: the scan + totals half. One group per RECORD; reads what pass 1
+	// wrote (RDG orders them by the count-arena dependency).
+	{
+		FVoxelWorklistClassifyTotalsCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistClassifyTotalsCS::FParameters>();
+		Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+		Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+		Params->RingCapacity = Dispatch.RingCapacity;
+		Params->WorklistOccCountsIn = GraphBuilder.CreateSRV(Dispatch.OccCounts);
+		Params->WorklistMatCountsIn = GraphBuilder.CreateSRV(Dispatch.MatCounts);
+		Params->WorklistOccOffsets = GraphBuilder.CreateUAV(Dispatch.OccOffsets);
+		Params->WorklistMatOffsets = GraphBuilder.CreateUAV(Dispatch.MatOffsets);
+		Params->WorklistTotals = GraphBuilder.CreateUAV(Dispatch.Totals);
+		Params->IndirectArgs = Dispatch.IndirectArgs;
+
+		TShaderMapRef<FVoxelWorklistClassifyTotalsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClassifyTotals(indirect)"), Shader, Params,
+			Dispatch.IndirectArgs, Dispatch.TotalsArgsOffset);
+	}
 }
 
 void VoxelGpuWorldGen::AddQuadCompactPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,
@@ -2809,7 +3063,8 @@ FRDGBufferRef VoxelGpuWorldGen::AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
                                                       FRDGBufferRef BrickTotals, uint32 ChunkSlot,
                                                       uint32 OccWorstWords, uint32 MatWorstWords,
                                                       uint32 TotalsChunkIndexPlusOne,
-                                                      uint32 TotalsNumChunks)
+                                                      uint32 TotalsNumChunks,
+                                                      uint32 TotalsReadBase)
 {
 	if (!Buffers.IsValid() || BrickTotals == nullptr)
 	{
@@ -2827,6 +3082,7 @@ FRDGBufferRef VoxelGpuWorldGen::AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
 	Params->MatWorstWords = MatWorstWords;
 	Params->TotalsChunkIndexPlusOne = TotalsChunkIndexPlusOne;
 	Params->TotalsNumChunks = TotalsNumChunks;
+	Params->TotalsReadBase = TotalsReadBase;
 	Params->InBrickTotals = GraphBuilder.CreateSRV(BrickTotals);
 	Params->AllocState = GraphBuilder.CreateUAV(Buffers.AllocState);
 	Params->AllocBitmap = GraphBuilder.CreateUAV(Buffers.AllocBitmap);

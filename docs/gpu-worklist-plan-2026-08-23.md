@@ -193,6 +193,44 @@ spine constant 3 -> 4/tick. worldgen.ush's VoxelizeMain body is factored into
   `CellReadBase = 0` / `cellBase + 0`, and the factored entry points call the
   same text the shipped kernels ran.
 
+## Stage 3 LANDED: fused ClassifyTotals (2026-08-23, -VoxelGpuWorklistClassify)
+
+Authored-not-yet-built. The conversion's largest single cut: per cell-fed
+chunk, BrickClassifyMain + BOTH 3-pass scans + BrickTotalMain -- EIGHT passes
+-- are replaced by TWO indirect dispatches per tick (VoxelWorklistClassify.usf):
+
+* `ClassifyWorklistMain`, **64 groups per record, ONE GROUP PER BRICK** -- the
+  classic classify shape, NOT the plan's provisional single group, because
+  `brickBuildOccupancy` is groupshared and the classic shape is the only one
+  that calls the same text. Counts are emitted through the newly factored
+  `brickOccCountFromInfo` / `brickMatCountFromInfo` (brickpack.ush), which the
+  classic entry point now also calls.
+* `ClassifyTotalsWorklistMain`, 1 group per record: double-barriered
+  Hillis-Steele in-group exclusive scan of the 64 counts (both kinds) +
+  totals. A prefix sum over the same integers is unique, so it equals the
+  classic 3-pass scan by arithmetic -- and the verify kernel measures it
+  anyway.
+
+BrickPackMain reads its offset slices through brickpack.ush's
+`BrickScanReadBase` (one base serves both kinds -- the occ and mat arenas are
+separate buffers); the claim pass reads its totals pair through
+VoxelBrickPoolAlloc.usf's `TotalsReadBase` (plumbed through
+AddBrickPoolClaimPass / FRegionGraphResources.BrickTotalsReadBase). Classic
+dispatches compile +0 on both. Five small arenas (~1 KiB/record total; the
+cell-budget clamp already bounds them). 15 -> 7 passes on the lean-alloc
+shape; spine constant 4 -> 6/tick. Eligibility rides the cell feed, so asset
+chunks fall back with it (wlct fbAssets).
+
+* Switches: `-VoxelGpuWorklistClassify=1` (requires the Voxelize switch);
+  byte gate `-VoxelGpuWorklistVerifyCT=1` -- classic classify + scans +
+  totals re-run into transients + a 1-group compare of offsets + totals
+  (which determine the counts) into stats [8..9] (kStatsDwords widened
+  8 -> 12). A ctverify mismatch is POOL CORRUPTION (pack offsets / claim
+  sizes wrong), the loudest of the three stage gates.
+* Readings: `[gpu-worklist] wlct conv= fb= fbAssets= arenaMissing= ctverify
+  checked= mism=`. FAILING: same table as wlvox, plus mism>0 = leg invalid
+  outright.
+
 ## Conversion sequencing (the P3 work proper)
 
 Stage by stage, each stage gated before the next:

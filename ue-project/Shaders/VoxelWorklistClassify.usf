@@ -1,0 +1,232 @@
+// VoxelWorklistClassify.usf -- the THIRD converted stage of the P3 worklist:
+// the fused ClassifyTotals (docs/gpu-worklist-plan-2026-08-23.md, conversion
+// step 4). Behind -VoxelGpuWorklistClassify=1, on top of
+// -VoxelGpuWorklistVoxelize=1 -- the cell arena is this stage's input.
+//
+// WHAT IT REPLACES, which is why this is the biggest single pass cut of the
+// conversion: per lean chunk, BrickClassifyMain (1) + the two 3-pass scans
+// (6) + BrickTotalMain (1) = EIGHT passes, all replaced by TWO indirect
+// dispatches per tick:
+//
+//   ClassifyWorklistMain       -- 64 groups per record, ONE GROUP PER BRICK:
+//     exactly the classic classify shape, calling brickBuildOccupancy and
+//     brickComputeInfo verbatim (the groupshared build is why this is not a
+//     one-thread-per-brick kernel), emitting the two counts through
+//     brickOccCountFromInfo / brickMatCountFromInfo -- the same text the
+//     classic entry point emits through -- into per-record COUNT arenas.
+//
+//   ClassifyTotalsWorklistMain -- 1 group per record, 64 threads: in-group
+//     exclusive scan of the 64 counts (both kinds) into per-record OFFSET
+//     arenas, plus the two totals. An exclusive prefix sum over the same
+//     integers is unique, so these offsets equal the classic 3-pass scan's
+//     by arithmetic, not by luck -- and the verify kernel below checks the
+//     bytes anyway, because "unique by arithmetic" is an argument and the
+//     gate is a measurement.
+//
+// The chunk's BrickPackMain then reads its offset slices through
+// brickpack.ush's BrickScanReadBase, and the claim pass reads its totals
+// slice through VoxelBrickPoolAlloc.usf's TotalsReadBase. Classic dispatches
+// compile a +0 on both.
+//
+// ASSET RECORDS FALL BACK (group-uniform early-out, host-counted): their
+// cells are not in the cell arena. Same rule, same reason, as the Voxelize
+// stage.
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelWorklist.ush"
+#include "/VoxelCore/brickpack.ush"
+
+// The stage-shape locks, the other converted kernels' mechanism verbatim.
+#ifndef VXC_WORKLIST_CLASSIFY_GROUPS
+#error "VXC_WORKLIST_CLASSIFY_GROUPS not defined -- dispatch this kernel only through FVoxelWorklistClassifyCS"
+#endif
+#ifndef VXC_WORKLIST_BRICKS_PER_RECORD
+#error "VXC_WORKLIST_BRICKS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistClassifyCS"
+#endif
+#ifndef VXC_WORKLIST_CELLS_PER_RECORD
+#error "VXC_WORKLIST_CELLS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistClassifyCS"
+#endif
+#if VXC_WORKLIST_CLASSIFY_GROUPS != 64
+#error "Classify stage shape drifted: one group per brick, 64 bricks per lean chunk, and the host table must agree"
+#endif
+#if VXC_WORKLIST_BRICKS_PER_RECORD != 64
+#error "Classify stage shape drifted: a lean brick chunk is 4x4x4 = 64 bricks"
+#endif
+#if VXC_WORKLIST_CELLS_PER_RECORD != 32768
+#error "Classify stage shape drifted: a lean brick chunk is 32x32x32 cells"
+#endif
+
+// The ring (same three bindings, same meanings, as every worklist consumer).
+StructuredBuffer<GpuChunkWorkRecord> WorklistRecords;
+StructuredBuffer<uint> WorklistControl;   // [0]=consumeFirst [1]=consumeCount
+uint RingCapacity;
+
+// The cell arena (read; VoxelizeWorklistMain wrote it earlier in this same
+// graph) is bound as brickpack.ush's own InCells. DispatchColumns (32,32) and
+// BricksZ (4) come from the loose block so decodeBrick decodes the lean chunk
+// shape; CellReadBase is 0 for this dispatch (the per-record base is added
+// explicitly below, because it varies per record inside one dispatch and a
+// $Globals uniform cannot).
+
+// Stage outputs: per-record slices, 64 dwords each (totals: 2).
+RWStructuredBuffer<uint> WorklistOccCounts;
+RWStructuredBuffer<uint> WorklistMatCounts;
+
+[numthreads(64, 1, 1)]
+void ClassifyWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Take = WorklistControl[1];
+	const uint Rec = Gid.x / VXC_WORKLIST_CLASSIFY_GROUPS;
+	// Group-uniform (Gid-derived), so the barriers inside
+	// brickBuildOccupancy below stay legal. Belt-and-braces, not a code path.
+	if (Rec >= Take)
+	{
+		return;
+	}
+	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
+	const GpuChunkWorkRecord R = WorklistRecords[Slot];
+	// Asset chunks keep the classic chain (header). Group-uniform.
+	if (worklistHasAssets(R) != 0u)
+	{
+		return;
+	}
+
+	const uint PackIndex = Gid.x % VXC_WORKLIST_CLASSIFY_GROUPS;
+	uint3 Brick;
+	uint CellBase, ChunkIndex, LocalIndex;
+	// Group-uniform: reads PackIndex and the cbuffer only. With the lean
+	// shape (32x32 columns, BricksZ 4) every PackIndex < 64 decodes.
+	if (!decodeBrick(PackIndex, Brick, CellBase, ChunkIndex, LocalIndex))
+	{
+		return;
+	}
+
+	// The record's slice base is added HERE, not through CellReadBase (which
+	// is a uniform and this dispatch spans records).
+	brickBuildOccupancy(Rec * VXC_WORKLIST_CELLS_PER_RECORD + CellBase, GTid.x);
+
+	if (GTid.x == 0u)
+	{
+		brickComputeInfo();
+		WorklistOccCounts[Rec * VXC_WORKLIST_BRICKS_PER_RECORD + PackIndex] =
+			brickOccCountFromInfo();
+		WorklistMatCounts[Rec * VXC_WORKLIST_BRICKS_PER_RECORD + PackIndex] =
+			brickMatCountFromInfo();
+	}
+}
+
+// --- ClassifyTotalsWorklistMain: the scan + totals half ---------------------
+//
+// One group per record, 64 threads, exclusive scan of both count kinds and
+// the two totals. Reads what ClassifyWorklistMain wrote in this same graph.
+
+StructuredBuffer<uint> WorklistOccCountsIn;
+StructuredBuffer<uint> WorklistMatCountsIn;
+RWStructuredBuffer<uint> WorklistOccOffsets;
+RWStructuredBuffer<uint> WorklistMatOffsets;
+RWStructuredBuffer<uint> WorklistTotals;   // 2 dwords per record: occ, mat
+
+groupshared uint gsScanOcc[64];
+groupshared uint gsScanMat[64];
+
+[numthreads(64, 1, 1)]
+void ClassifyTotalsWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Take = WorklistControl[1];
+	const uint Rec = Gid.x;   // 1 group per record
+	if (Rec >= Take)
+	{
+		return;
+	}
+	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
+	const GpuChunkWorkRecord R = WorklistRecords[Slot];
+	if (worklistHasAssets(R) != 0u)
+	{
+		return;
+	}
+
+	const uint T = GTid.x;
+	const uint Base = Rec * VXC_WORKLIST_BRICKS_PER_RECORD;
+	const uint OccCount = WorklistOccCountsIn[Base + T];
+	const uint MatCount = WorklistMatCountsIn[Base + T];
+	gsScanOcc[T] = OccCount;
+	gsScanMat[T] = MatCount;
+	GroupMemoryBarrierWithGroupSync();
+
+	// Hillis-Steele INCLUSIVE scan, double-barriered (read the neighbour,
+	// sync, add, sync). Exclusive = inclusive - own count. A prefix sum over
+	// the same integers is unique, so this equals the classic 3-pass scan's
+	// output byte for byte -- which the verify kernel measures rather than
+	// assumes.
+	[unroll]
+	for (uint Step = 1u; Step < 64u; Step <<= 1u)
+	{
+		const uint AddOcc = (T >= Step) ? gsScanOcc[T - Step] : 0u;
+		const uint AddMat = (T >= Step) ? gsScanMat[T - Step] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		gsScanOcc[T] += AddOcc;
+		gsScanMat[T] += AddMat;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	WorklistOccOffsets[Base + T] = gsScanOcc[T] - OccCount;
+	WorklistMatOffsets[Base + T] = gsScanMat[T] - MatCount;
+	if (T == 63u)
+	{
+		WorklistTotals[Rec * 2u + 0u] = gsScanOcc[63];
+		WorklistTotals[Rec * 2u + 1u] = gsScanMat[63];
+	}
+}
+
+// --- ClassifyTotalsWorklistVerifyMain: the stage's byte gate ----------------
+//
+// Compares ONE converted chunk's arena OFFSETS (both kinds) and TOTALS
+// against the classic classify + 3-pass scans + BrickTotalMain run of the
+// same chunk (the host runs those into transients ONLY under
+// -VoxelGpuWorklistVerifyCT=1). Offsets + totals determine the counts
+// (counts[t] = offsets[t+1] - offsets[t]; the last from the total), so this
+// pair catches any count error too. Mismatching DWORDS accumulate into
+// WorklistStats[8], dwords compared into WorklistStats[9]; both ride the
+// proof readback. One 1-group pass per verified chunk, verify arm only.
+//
+// THE FAILING READINGS: stats[8] > 0 -- the fused stage disagrees with the
+// classic chain; the leg is INVALID (pack offsets or the claim size are
+// wrong, i.e. pool corruption, not cosmetics). stats[9] staying 0 while
+// converted chunks flow with the verify switch armed -- the gate is dead.
+
+StructuredBuffer<uint> VerifyClassicOccOffsets;
+StructuredBuffer<uint> VerifyClassicMatOffsets;
+StructuredBuffer<uint> VerifyClassicTotals;      // 2 dwords
+StructuredBuffer<uint> VerifyArenaOccOffsets;
+StructuredBuffer<uint> VerifyArenaMatOffsets;
+StructuredBuffer<uint> VerifyArenaTotals;
+RWStructuredBuffer<uint> WorklistStats;
+uint VerifyScanBase;     // slice * 64
+uint VerifyTotalsBase;   // slice * 2
+
+[numthreads(64, 1, 1)]
+void ClassifyTotalsWorklistVerifyMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x >= VXC_WORKLIST_BRICKS_PER_RECORD)
+	{
+		return;
+	}
+	uint Mismatch = 0u;
+	uint Checked = 2u;
+	Mismatch += (VerifyArenaOccOffsets[VerifyScanBase + tid.x] !=
+	             VerifyClassicOccOffsets[tid.x]) ? 1u : 0u;
+	Mismatch += (VerifyArenaMatOffsets[VerifyScanBase + tid.x] !=
+	             VerifyClassicMatOffsets[tid.x]) ? 1u : 0u;
+	if (tid.x == 0u)
+	{
+		Mismatch += (VerifyArenaTotals[VerifyTotalsBase + 0u] != VerifyClassicTotals[0]) ? 1u : 0u;
+		Mismatch += (VerifyArenaTotals[VerifyTotalsBase + 1u] != VerifyClassicTotals[1]) ? 1u : 0u;
+		Checked += 2u;
+	}
+	uint Unused;
+	InterlockedAdd(WorklistStats[9], Checked, Unused);
+	if (Mismatch != 0u)
+	{
+		InterlockedAdd(WorklistStats[8], Mismatch, Unused);
+	}
+}

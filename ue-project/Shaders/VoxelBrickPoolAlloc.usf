@@ -116,6 +116,12 @@ StructuredBuffer<uint>   InClaim;
 
 // The producing graph's outputs, exactly as VoxelBrickPoolWrite.usf names them.
 StructuredBuffer<uint>  InBrickTotals;  // [0] occ dwords, [1] mat dwords
+// P3 worklist ClassifyTotals stage: base ELEMENT added to the CLASSIC-FORM
+// totals reads ([0]/[1]) when InBrickTotals is the worklist totals arena
+// (sliceIndex * 2). 0 on every classic dispatch -- a uniform +0. The
+// stack-claim form (TotalsChunkIndexPlusOne != 0) never reads through it:
+// fused stacks take no worklist feed.
+uint TotalsReadBase;
 StructuredBuffer<uint>  InWords;        // scratch words, one arena per pass
 StructuredBuffer<uint2> InBrickDesc;    // scratch descriptors, chunk-relative
 StructuredBuffer<uint>  InBrickOcc;     // scratch occupancy, for allSolid
@@ -342,8 +348,9 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 	uint SrcMatFirst = 0u;
 	if (TotalsChunkIndexPlusOne == 0u)
 	{
-		OccWords = InBrickTotals[0];
-		MatWords = InBrickTotals[1];
+		// TotalsReadBase is 0 on every classic dispatch (see its declaration).
+		OccWords = InBrickTotals[TotalsReadBase + 0u];
+		MatWords = InBrickTotals[TotalsReadBase + 1u];
 	}
 	else
 	{
