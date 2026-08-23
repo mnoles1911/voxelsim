@@ -95,7 +95,14 @@ def source() -> str:
     lines = [
         '"""What each material looks like. GENERATED — do not edit.',
         "",
-        f"Source: {HEADER.as_posix()}",
+        # REPO-RELATIVE, NOT ABSOLUTE. This line is compared byte for byte by
+        # the selftest's drift check, so an absolute path makes the check
+        # machine-specific: generated on the Windows box it records
+        # D:/voxelsim/..., and CI then fails every single run on line 3 while
+        # the actual table is fine. It did, for long enough that the failure
+        # became background noise -- which is how forge/palette.py sat with
+        # seven stale biome_tint values that this very check exists to catch.
+        f"Source: {HEADER.relative_to(ROOT.parent).as_posix()}",
         "Regenerate: python tools/gen_palette.py",
         "",
         "One flat colour per voxel face, varied per voxel. See ADR-0008 for why",

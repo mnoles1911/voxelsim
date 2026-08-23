@@ -1,6 +1,6 @@
 """What each material looks like. GENERATED — do not edit.
 
-Source: /home/user/voxelsim/voxel-core/include/voxelcore/materialpalette.h
+Source: voxel-core/include/voxelcore/materialpalette.h
 Regenerate: python tools/gen_palette.py
 
 One flat colour per voxel face, varied per voxel. See ADR-0008 for why
