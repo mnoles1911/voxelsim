@@ -662,13 +662,14 @@ namespace VoxelBrickPoolDetail
 		kGpuAllocCtrOccPaddedCum, kGpuAllocCtrOccActualCum,
 		kGpuAllocCtrMatPaddedCum, kGpuAllocCtrMatActualCum,
 	};
+	constexpr int32 kGpuAllocNumMonotonicCtrs = int32(UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs));
 	uint32 GAllocCtrLastRaw[UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs)] = {};
 	int64 GAllocCtrAccum[UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs)] = {};
 	// The accumulated (wrap-corrected) value for one counter index, after the
 	// current readback has been folded in. Linear scan of 13 -- not worth a map.
 	int64 AllocAccumOf(int32 CtrIndex)
 	{
-		for (int32 I = 0; I < UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs); ++I)
+		for (int32 I = 0; I < kGpuAllocNumMonotonicCtrs; ++I)
 		{
 			if (kGpuAllocMonotonicCtrs[I] == CtrIndex)
 			{
@@ -760,7 +761,7 @@ namespace VoxelBrickPoolDetail
 			GAllocCounterSeqLanded = Pending.Seq;
 			// Fold the raw uint32 counters into the 64-bit accumulators
 			// (wrap-safe modular deltas -- see kGpuAllocMonotonicCtrs).
-			for (int32 M = 0; M < UE_ARRAY_COUNT(kGpuAllocMonotonicCtrs); ++M)
+			for (int32 M = 0; M < kGpuAllocNumMonotonicCtrs; ++M)
 			{
 				const uint32 Raw = C[kGpuAllocMonotonicCtrs[M]];
 				GAllocCtrAccum[M] += int64(uint32(Raw - GAllocCtrLastRaw[M]));
