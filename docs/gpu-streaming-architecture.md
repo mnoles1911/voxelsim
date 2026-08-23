@@ -92,10 +92,26 @@ Everything here was taken this session, matched legs, quiet box.
    and moved nothing. **Do not build more pass batching and expect throughput.**
 2. **The GPU is not contended.** Turning off shadow marching freed ~13 ms of GPU per frame,
    doubled the frame rate, and moved streaming **+0.5%**. There is GPU headroom.
-3. **Latency alone is not the cost.** `-VoxelGpuMeshQueueDepth=16` cut submit→deliver
-   1,068 → 147 ms and the fork still lost on every axis. Something per-chunk on the CPU or
-   render thread costs more than the wait did — **unexplained, and P1 must measure it, not
-   assume it dies with the readback.**
+3. **Latency alone is not the cost — and the residual is now NAMED.** `-VoxelGpuMeshQueueDepth=16`
+   cut submit→deliver 1,068 → 147 ms and the fork still lost on every axis. Comparing
+   game-thread tick buckets between the two arms says why:
+
+   | | tick | recompute | **dispatch** | apply | chunks/s |
+   |---|---|---|---|---|---|
+   | fork off | 1,450 ms | 853 | **23** | 431 | 6,589 |
+   | fork on + queue 16 | 1,680 ms | 740 | **496** | 319 | 5,999 |
+
+   **`dispatch` costs 21x more with the fork on** — 496 ms against 23 ms of game thread per
+   5-second window, or 139 ms of game thread per 1,000 chunks against 109 ms. The fork's
+   residual cost is **game-thread submission and bookkeeping**, not GPU work and not the
+   wait. That is exactly what P1 (submit and forget) and P3 (persistent worklist, no
+   per-chunk CPU submission) delete, which is the strongest evidence this programme is
+   aimed at the right thing.
+
+4. **`recompute` is the next limiter after this programme.** It is already the largest
+   game-thread bucket at 853 ms of a 1,450 ms tick (59%), and the dispatch loop now exits
+   on an empty queue 60% of the time. Once P1-P3 land, admission is what will bind. Do not
+   be surprised by it, and do not start on it first — it is not binding yet.
 4. **More throughput did not reduce holes.** +52% chunks/s took `uncovered` 3.99% → 4.97%.
    Holes are an admission-ORDER problem. **`uncovered`, not chunks/s, is the gate that
    matters to the owner.**
