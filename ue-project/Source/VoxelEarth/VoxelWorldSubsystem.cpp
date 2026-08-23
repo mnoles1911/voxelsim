@@ -3370,6 +3370,36 @@ int32 ColdBandDeferParkEnabled()
 	return Value;
 }
 
+// FALSIFIED 2026-08-23 BY ITS OWN DISPROOF CONDITION. DO NOT RE-RUN.
+// Leg q-seed.log, one switch off the q-ctl control, same binary:
+//
+//   arm      seedCpu   bandCache fill (per 2 s)        R0 settle   total
+//   q-ctl          0   785 1343 1763 2187 2552 ...       19.5 s    24.5 s
+//   q-seed    50,913   739 1323 1727 2144 2509 ...       23.3 s    24.3 s
+//
+// The traffic counter proves the switch RAN (50,913 forks declined). The band
+// cache fill rate is UNCHANGED to within 2%, which is the reading written below
+// as "seed latency is NOT the bound -- REVERT, do not tune". R0 got 3.8 s
+// WORSE, and seedCpu at ~2x R0's whole level-0 dispatch count is the second
+// failing reading below: during flight, footprints keep going cold and this
+// switch was taking R0 off the GPU wholesale.
+//
+// WHERE THE ATTRIBUTION BELOW WENT WRONG, because the mechanism half of it is
+// still true and worth keeping: R0's settle really does track the band-cache
+// fill (both legs agree). But the fill is NOT bounded by the seed's ARM
+// latency. The two legs the attribution was derived from -- gp-ctl2 and
+// ahead-on -- differ in many flags, not one (`-VoxelGpuMesh` vs
+// `-VoxelGpuPrimary`), and the 740 fp/s "control" rate belongs to the
+// CPU-primary configuration. A GPU-primary control (q-ctl) fills at ~250 fp/s,
+// the same as ahead-on. The 3x was a configuration difference read as a seed
+// latency difference. The real bound on the fill is how many footprints can
+// hold a blind mark concurrently, which is set by how far into R0's queue the
+// pop loop gets per pass -- not by which arm serves the seed.
+//
+// Kept, defaulted OFF, because the counter and the two legs are the evidence
+// that closes this line of attack; deleting it would invite the next agent to
+// re-derive the same wrong lever from the same two mismatched legs.
+//
 // -VoxelBandSeedCpu=1 (default 0 = OFF, byte-identical): a cold footprint's
 // BAND SEED -- the one level-0 chunk whose result populates FootprintBandCache
 // and thereby releases its ~16 deferred column-mates -- stays on the CPU worker
