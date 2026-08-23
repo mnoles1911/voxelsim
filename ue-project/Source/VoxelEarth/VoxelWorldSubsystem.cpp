@@ -3602,6 +3602,24 @@ double BiasedSortKeySq(int32 Level, double DistSq)
 	}
 	return FMath::Max(DistSq, FMath::Square(InnerAdmitUU(Level)));
 }
+
+// -VoxelIncrementalAdmission: the entry scan only re-visits grid cells whose
+// per-cell verdict could have changed since this level's last scan, instead of
+// re-walking the whole per-level disc on every crossing. OFF (default) is
+// byte-for-byte today's full sweep -- the change has to be measured against a
+// control, and residency parity per RING is the gate, not aggregate
+// throughput (level-primary ordering once measured "R3/R4 at 0 loaded chunks
+// for 90 s" while the aggregate looked fine).
+//
+// Command line, not a cvar, for the same reason -VoxelNoUnderground gives:
+// -ExecCmds cvars land after streaming has already begun, so an -ExecCmds A/B
+// would run its first (largest) recomputes on the same arm both times and
+// silently measure the same desired set twice.
+bool IncrementalAdmissionEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelIncrementalAdmission"));
+	return bEnabled;
+}
 } // namespace VoxelStreamAdmission
 
 // --- sky band: never mesh chunks that are provably above the terrain ---------
@@ -5177,6 +5195,39 @@ struct FVoxelWorldImpl
 	// r=124-128 m across four independent instrumented legs).
 	FVector2D LastEntryScanAnchorXY[VoxelCoords::kNumLevels] = {};
 
+	// INCREMENTAL ADMISSION (-VoxelIncrementalAdmission) per-level state.
+	//
+	// The XY bounding box of every anchor RecomputeDesiredSet has run at since
+	// this level's last entry scan, INCLUDING that scan's own anchor and the
+	// current call's. Why a box and not just the two scan endpoints: evictions
+	// happen in the EXIT pass, which runs on every recompute call (level-0
+	// crossing cadence, ~3.2 m) with that call's anchor -- while a level-L
+	// entry scan fires only on a level-L chunk crossing. Between two level-L
+	// scans the anchor can wander up to a level-L chunk diagonal, dip within
+	// InnerEvictUU of a cell (evicting it), and be back outside InnerAdmitUU by
+	// the time the next scan compares endpoints -- endpoints identical, record
+	// gone, chunk-shaped hole. The default inner hysteresis is 0.25 chunk
+	// edges (InnerHysteresisChunks), far less than the 1.41-edge wander a
+	// chunk allows, so this is a routine strafe, not a corner case. The box
+	// over-approximates the anchors the exit pass actually saw (AABB corners
+	// were never visited) -- conservative in the safe direction: extra
+	// re-visits, never a missed one.
+	FVector2D ScanAnchorBoxMin[VoxelCoords::kNumLevels] = {};
+	FVector2D ScanAnchorBoxMax[VoxelCoords::kNumLevels] = {};
+	// The scan-shaping inputs the last entry scan of each level ran under. An
+	// incremental pass may only diff against a predecessor that answered the
+	// same QUESTION: the deep box exists only while underground (and follows
+	// the anchor's Z continuously via the sight sphere), the depth-skirt bands
+	// exist only while voxel.Stream.Underground is on, and the two band-skip
+	// drops flip with VolumeNeedsSolidChunks(). Any of these differing from
+	// the last scan means interior cells' verdicts moved without the anchor
+	// moving, so the level takes one full sweep and re-stamps. All are
+	// initialized-false and irrelevant until the first scan, which is always
+	// full (bHasRecomputedLevel starts false).
+	bool bLevelLastScanUnderground[VoxelCoords::kNumLevels] = {};
+	bool bLevelLastScanSkirtOn[VoxelCoords::kNumLevels] = {};
+	bool bLevelLastScanVolumeNeedsSolid[VoxelCoords::kNumLevels] = {};
+
 	// Quiescence detector for the stale-scan refill (rev B): the trigger above
 	// only fires once the anchor has been effectively still for half a second,
 	// because firing it while MOVING fed re-admission churn without buying any
@@ -5802,7 +5853,14 @@ struct FVoxelWorldImpl
 	float ThisFrameQueueFilterMs = 0.f;
 	float ThisFrameSortMs = 0.f;
 	float ThisFrameLevelEntryMs[VoxelCoords::kNumLevels] = {};
-	int32 ThisFrameLevelFootprints[VoxelCoords::kNumLevels] = {}; // in-annulus XY footprints visited (= ComputeFootprintChunkZRange calls)
+	// In-annulus XY footprints on which the per-footprint work actually ran
+	// (= ComputeFootprintChunkZRange calls) -- the same quantity in BOTH
+	// admission arms, which is what makes it the incremental fork's traffic
+	// proof: under -VoxelIncrementalAdmission it must FALL by roughly the
+	// margin/disc ratio, because cells skipped by the crossing test never
+	// reach the increment. If it does not fall, the fallback counters
+	// (IncrFull*SinceLog) say which full-sweep cause ate the win.
+	int32 ThisFrameLevelFootprints[VoxelCoords::kNumLevels] = {};
 
 	// Running maxima since the last periodic counter log (MaybeLogCounters
 	// resets them): a recompute burst that lands on a frame which does NOT
@@ -5815,6 +5873,19 @@ struct FVoxelWorldImpl
 	float MaxSortMs = 0.f;
 	float MaxLevelEntryMs[VoxelCoords::kNumLevels] = {};
 	int32 LevelEntryScans[VoxelCoords::kNumLevels] = {}; // how many times each level's entry scan actually ran
+	// Incremental-admission traffic proof (-VoxelIncrementalAdmission). A fork
+	// in this file once carried zero traffic for weeks, so "is it faster" is
+	// never accepted without "did the work actually move": these say, per 5s
+	// window, how many of each level's scans took the incremental path and,
+	// when one did not, WHY -- because a fallback cause that fires on most
+	// scans (e.g. deferred-armed on every call of an admission-limited burst)
+	// makes ThisFrameLevelFootprints not drop, and that must be attributable
+	// from the log, not guessed. Reset beside LevelEntryScans.
+	int32 LevelIncrScansSinceLog[VoxelCoords::kNumLevels] = {};
+	int32 IncrFullForcedSinceLog = 0;      // first scan / refill / edit-forced rescan (bHasRecomputedLevel was false)
+	int32 IncrFullDeferredSinceLog = 0;    // bAdmissionDeferredWork[L] armed: prior rejections may sit anywhere in the annulus
+	int32 IncrFullUndergroundSinceLog = 0; // underground now or at the level's last scan
+	int32 IncrFullConfigSinceLog = 0;      // skirt on/off or VolumeNeedsSolidChunks flipped since the last scan
 	int32 RecomputeCalls = 0;
 
 	// --- Streaming pipeline re-measure (docs/status.md "Streaming pipeline
@@ -8355,6 +8426,22 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("entryMs %s"),
 	       AccumRecomputeMs, AccumFineResidencyMs, AccumExitScanMs, AccumQueueFilterMs, AccumSortMs,
 	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.1f"), L, AccumLevelEntryMs[L]); }));
+	// Incremental admission traffic (see LevelIncrScansSinceLog's doc
+	// comment). Only under the switch, so old-leg greps stay clean. Read it
+	// TOGETHER with the "scans" field of the max line above: incr close to
+	// scans means the fast path is carrying the traffic; a persistent gap is
+	// the fallback counters' job to attribute, and a window that is all
+	// fallbacks with footprints not falling means the switch is on and doing
+	// nothing -- the fork-carried-zero-traffic failure this line exists to
+	// make visible.
+	if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel incremental admission (5s window): incr %s | full: forced=%d deferred=%d underground=%d config=%d"),
+		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelIncrScansSinceLog[L]); }),
+		       IncrFullForcedSinceLog, IncrFullDeferredSinceLog, IncrFullUndergroundSinceLog,
+		       IncrFullConfigSinceLog);
+	}
 	// Streaming pipeline re-measure (docs/status.md "Streaming pipeline
 	// re-measure + rework"): the two questions the existing logs could not
 	// answer. (1) Where does per-tick time go -- the hitch log breaks a tick
@@ -9718,7 +9805,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		MaxLevelEntryMs[Level] = 0.f;
 		AccumLevelEntryMs[Level] = 0.0;
 		LevelEntryScans[Level] = 0;
+		LevelIncrScansSinceLog[Level] = 0;
 	}
+	IncrFullForcedSinceLog = IncrFullDeferredSinceLog = IncrFullUndergroundSinceLog = IncrFullConfigSinceLog = 0;
 
 	// Track B2 missing-tile telemetry: only meaningful once a real tile grid
 	// is in use (bUsingTileGrid) -- the synthetic sampler has no concept of a
@@ -11414,6 +11503,25 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		LevelCandidatesRejectedThisCall[Level] = 0;
 	}
 
+	// Incremental admission: fold this call's anchor into every level's
+	// anchor box BEFORE the passes run. The exit pass below evicts against
+	// exactly this anchor, and evictions are the one thing that can change a
+	// cell's realized state between two entry scans without the entry
+	// endpoints seeing it (see ScanAnchorBoxMin's doc comment) -- so the box
+	// must contain every anchor an exit pass has used since the level's last
+	// scan, this one included. Gated on the latched switch so the control arm
+	// executes nothing new; the box is reset at each level's scan site.
+	if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
+	{
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			ScanAnchorBoxMin[Level].X = FMath::Min(ScanAnchorBoxMin[Level].X, Anchor.X);
+			ScanAnchorBoxMin[Level].Y = FMath::Min(ScanAnchorBoxMin[Level].Y, Anchor.Y);
+			ScanAnchorBoxMax[Level].X = FMath::Max(ScanAnchorBoxMax[Level].X, Anchor.X);
+			ScanAnchorBoxMax[Level].Y = FMath::Max(ScanAnchorBoxMax[Level].Y, Anchor.Y);
+		}
+	}
+
 	// Phase 2 fine-tier streaming (VoxelFineTileStreamer.h): pin the prefetch
 	// ring around the anchor, best-effort load whatever in it is missing, and
 	// evict whatever the LRU budget disallows outside that ring. A no-op
@@ -11781,6 +11889,22 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		{
 			continue; // nothing new can have entered this level's annulus
 		}
+		// Incremental admission: capture the two things the stamps below are
+		// about to overwrite. PrevScanAnchorXY is A0 -- the unquantized anchor
+		// every one of this level's realized per-cell verdicts was decided
+		// against; the crossing test in the cell loop diffs each cell's side
+		// of each decision radius at A0 vs at this call's anchor. Correct even
+		// across a CHAIN of incremental scans, because "no crossing between
+		// consecutive scan anchors" is transitive: a cell skipped at every
+		// step has been on the same side of every radius since it was last
+		// actually evaluated. bWasForcedScan is the bHasRecomputedLevel=false
+		// entry path -- first scan, admission/stale-scan refill, edit-forced
+		// rescan -- all of which exist precisely because something OTHER than
+		// a simple anchor translation invalidated the level, so all take the
+		// full sweep. (-VoxelMaxRingLevel is command-line-latched and cannot
+		// change mid-run, so it needs no fallback of its own.)
+		const bool bWasForcedScan = !bHasRecomputedLevel[Level];
+		const FVector2D PrevScanAnchorXY = LastEntryScanAnchorXY[Level];
 		LastAnchorChunkPerLevel[Level] = AnchorChunk;
 		// Stale-scan refill (see LastEntryScanAnchorXY): the UNQUANTIZED anchor
 		// this scan is about to make its distance decisions against. Written here,
@@ -11794,6 +11918,94 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		++LevelsScannedThisCall;
 		bLevelScannedThisCall[Level] = true;
 		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
+
+		// Incremental admission (-VoxelIncrementalAdmission): decide whether
+		// THIS scan may diff against the previous one instead of re-walking
+		// the full disc. The file has named the asymmetry for a while ("a
+		// one-chunk anchor step changes only the annulus MARGIN" -- see the
+		// FootprintZRangeCache doc comment): the memos made the per-footprint
+		// work cheap but left the iteration count at full disc, and with the
+		// workers idle ("cap 0 / empty" on the HUD) this scan IS the pipeline
+		// limit. Every condition below is a recorded reason a diff would lie:
+		//
+		//  - bWasForcedScan: the forcing paths (first scan, refills, edit
+		//    rescans) exist because verdicts changed WITHOUT the anchor
+		//    moving; there is no valid predecessor to diff against.
+		//  - bAdmissionDeferredWork[Level]: the last scan REJECTED candidates
+		//    (budget, cutoff, fine-tier residency), and those sit anywhere in
+		//    the annulus, not in the margin. The OFF arm re-attempts them on
+		//    every crossing once the cutoff relaxes; skipping the interior
+		//    here would quietly starve the ring against its control. NOTE for
+		//    future refactors: this flag's CLEAR is per-level in
+		//    TruncatePendingJobQueue and must stay per-level -- the one-way
+		//    latch (global early-return over a per-level clear) is a recorded
+		//    bug there ("428/421 full-annulus rescans in a 14 s burst"), and
+		//    this fallback would inherit it doubled: a never-clearing flag
+		//    here means never taking the incremental path at all.
+		//  - underground / config: see the doc comments on
+		//    bLevelLastScanUnderground and its two siblings.
+		//
+		// Note what is NOT here: no fallback on how FAR the anchor moved. The
+		// crossing test is exact for any translation -- a teleport just makes
+		// every cell cross something and the pass degrades to a full sweep by
+		// itself, paying only the cheap per-cell test on top.
+		const bool bSkirtOn = !VoxelUnderground::UndergroundDisabled();
+		bool bIncrementalScan = false;
+		FVector2D IncrBoxMin(0.0, 0.0), IncrBoxMax(0.0, 0.0);
+		if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
+		{
+			if (bWasForcedScan)
+			{
+				++IncrFullForcedSinceLog;
+			}
+			else if (bAdmissionDeferredWork[Level])
+			{
+				++IncrFullDeferredSinceLog;
+			}
+			else if (bAnchorUnderground || bLevelLastScanUnderground[Level])
+			{
+				++IncrFullUndergroundSinceLog;
+			}
+			else if (bLevelLastScanSkirtOn[Level] != bSkirtOn ||
+			         bLevelLastScanVolumeNeedsSolid[Level] != bVolumeNeedsSolid)
+			{
+				++IncrFullConfigSinceLog;
+			}
+			else if (Level == 0 && VoxelStreamAdmission::AdmissionBandSkipMode() != 0)
+			{
+				// The level-0 band skip's verdict is NOT a function of the
+				// anchor: FootprintBandCache warms as jobs drain, and a band
+				// update can flip an interior chunk from provably-empty back
+				// to admittable with nothing crossing any radius. Only a full
+				// sweep re-asks, so level 0 stays on full sweeps for as long
+				// as the mode is on (it is a runtime cvar; default 0, and the
+				// measure-only mode 2 is refused too -- an incremental pass
+				// would silently under-count the verdicts it exists to
+				// measure). Counted as config: the cause is a knob, not the
+				// anchor.
+				++IncrFullConfigSinceLog;
+			}
+			else
+			{
+				bIncrementalScan = true;
+				++LevelIncrScansSinceLog[Level];
+			}
+			// The box the cell loop diffs against (already includes this
+			// call's anchor -- expanded at the top of the call), then reset to
+			// this scan's anchor alone: the next inter-scan window starts
+			// here. Reset on BOTH arms of the decision -- a full sweep
+			// re-realizes every verdict at this anchor, so it is just as
+			// valid a baseline as an incremental pass.
+			IncrBoxMin = ScanAnchorBoxMin[Level];
+			IncrBoxMax = ScanAnchorBoxMax[Level];
+			ScanAnchorBoxMin[Level] = FVector2D(Anchor.X, Anchor.Y);
+			ScanAnchorBoxMax[Level] = FVector2D(Anchor.X, Anchor.Y);
+			// Stamp the inputs this scan runs under, for the next one's diff
+			// eligibility.
+			bLevelLastScanUnderground[Level] = bAnchorUnderground;
+			bLevelLastScanSkirtOn[Level] = bSkirtOn;
+			bLevelLastScanVolumeNeedsSolid[Level] = bVolumeNeedsSolid;
+		}
 
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
 		const double OuterUU = Preset.OuterMeters * 100.0;
@@ -11927,6 +12139,29 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const double LevelInnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
 		const bool bLevelHierarchicalCoverage = VoxelStreamAdmission::HierarchicalCoverageEnabled();
 
+		// Incremental admission: the squared decision radii the cell loop's
+		// crossing test diffs against. THE LIST IS THE CONTRACT. Each entry
+		// mirrors, with the same comparison sense, one place the body below
+		// consults the anchor's distance -- the inner skip (LevelInnerAdmitUU),
+		// the annulus outer edge (OuterUU), the seam pad (AdmitOuterUU), and
+		// the two depth-skirt band edges (BandForDistance's NearFrac/MidFrac
+		// fractions of Outer, live only while the skirt is). Anyone adding a
+		// DistSq-dependent decision to the cell body MUST add its radius here,
+		// or the incremental arm silently stops re-asking that question --
+		// which is the "derived, not verified" detach this project has paid
+		// for five times over. IncrInnerEvictSq is deliberately read from
+		// ExitInnerEvictUUSq -- the SAME hoisted table the exit pass evicts
+		// with this call, so the lune test below can never disagree with the
+		// eviction it exists to detect.
+		const double IncrOuterSq = FMath::Square(OuterUU);
+		const double IncrAdmitOuterSq = FMath::Square(AdmitOuterUU);
+		const double IncrInnerAdmitSq = FMath::Square(LevelInnerAdmitUU);
+		const double IncrNearBandSq = FMath::Square(OuterUU * VoxelUnderground::NearFrac);
+		const double IncrMidBandSq = FMath::Square(OuterUU * VoxelUnderground::MidFrac);
+		const double IncrInnerEvictSq = ExitInnerEvictUUSq[Level];
+		const double PrevAX = PrevScanAnchorXY.X;
+		const double PrevAY = PrevScanAnchorXY.Y;
+
 		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
 		{
 			for (int32 Cx = AnchorChunk.X - ChunkSpan; Cx <= AnchorChunk.X + ChunkSpan; ++Cx)
@@ -11934,6 +12169,85 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+				// INCREMENTAL ADMISSION: skip this cell unless something about
+				// it could have CHANGED since this level's last scan. "Could
+				// have changed" is exactly: (a) the cell crossed one of the
+				// decision radii between the two scan anchors -- entry
+				// verdicts materialize only at scans, so only the endpoints
+				// matter for them; (b) the cell stayed admitted at the
+				// endpoints but some intermediate recompute's EXIT pass may
+				// have evicted it (the inner-evict lune against the anchor
+				// box -- see ScanAnchorBoxMin's doc comment; the OUTER evict
+				// radius needs no lune, it sits 0.25*Outer past the admit
+				// edge, ~9 chunk edges beyond any possible inter-scan
+				// wander); or (c) the cell sat in the seam band while its
+				// PARENT crossed the Outer radius, flipping the
+				// parent-admitted test without the cell itself crossing
+				// anything. Every skipped cell's realized state -- rejections
+				// included, since a deferred-armed level takes the full sweep
+				// instead of this path -- is therefore already what this scan
+				// would have produced for it. The skip sits BEFORE the
+				// footprint counter on purpose: ThisFrameLevelFootprints
+				// keeps meaning "cells the per-footprint work ran on" in both
+				// arms, and its fall is the proof the work was deleted rather
+				// than moved.
+				if (bIncrementalScan)
+				{
+					const double PrevDistSq =
+					    FMath::Square(CenterX - PrevAX) + FMath::Square(CenterY - PrevAY);
+					const auto Crossed = [DistSq, PrevDistSq](double RadiusSq)
+					{ return (PrevDistSq < RadiusSq) != (DistSq < RadiusSq); };
+					bool bRevisit = Crossed(IncrOuterSq) || Crossed(IncrAdmitOuterSq);
+					if (!bRevisit && Level > 0 && !bLevelHierarchicalCoverage)
+					{
+						bRevisit = Crossed(IncrInnerAdmitSq);
+						if (!bRevisit && DistSq >= IncrInnerAdmitSq)
+						{
+							// (b): still-admitted cell -- did any intermediate
+							// anchor come within the inner EVICT radius?
+							// Squared min distance from the cell centre to the
+							// anchor box, zero when the centre is inside it.
+							const double DxOut = FMath::Max3(IncrBoxMin.X - CenterX, CenterX - IncrBoxMax.X, 0.0);
+							const double DyOut = FMath::Max3(IncrBoxMin.Y - CenterY, CenterY - IncrBoxMax.Y, 0.0);
+							bRevisit = (DxOut * DxOut + DyOut * DyOut) < IncrInnerEvictSq;
+						}
+					}
+					if (!bRevisit && bSkirtOn)
+					{
+						// Depth-skirt band edges: crossing one inward means
+						// this footprint now wants DEEPER chunks than the
+						// last scan admitted. (An outward crossing changes
+						// nothing resident -- the entry pass never removes
+						// records -- but re-visiting both directions keeps
+						// this a pure "did it cross", with no baked-in claim
+						// about direction for a later change to invalidate.)
+						bRevisit = Crossed(IncrNearBandSq) || Crossed(IncrMidBandSq);
+					}
+					if (!bRevisit && RingOverlapChunks == 0 && Level + 1 < VoxelCoords::kNumLevels &&
+					    DistSq >= IncrOuterSq && DistSq < IncrAdmitOuterSq)
+					{
+						// (c): in the seam band at both endpoints (reaching
+						// here means no Outer/AdmitOuter crossing, so both
+						// endpoints sit on DistSq's side of both radii). The
+						// admit verdict is the PARENT's side of Outer; diff
+						// that the same way the body tests it. Skipped
+						// entirely under -VoxelRingOverlapChunks>0, where the
+						// band admits unconditionally and the verdict is
+						// constant.
+						const double SeamParentEdge = ChunkEdge * 2.0;
+						const double SeamParentCX = (double(Cx >> 1) + 0.5) * SeamParentEdge;
+						const double SeamParentCY = (double(Cy >> 1) + 0.5) * SeamParentEdge;
+						const double SeamParentD1 =
+						    FMath::Square(SeamParentCX - Anchor.X) + FMath::Square(SeamParentCY - Anchor.Y);
+						const double SeamParentD0 =
+						    FMath::Square(SeamParentCX - PrevAX) + FMath::Square(SeamParentCY - PrevAY);
+						bRevisit = (SeamParentD0 < IncrOuterSq) != (SeamParentD1 < IncrOuterSq);
+					}
+					if (!bRevisit)
+					{
+						continue;
+					}
+				}
 				// INNER EDGE PADDED BY THE SAME HALF-DIAGONAL AS THE OUTER
 				// EDGE, and its absence was a real owner-visible defect:
 				// perfectly square chunk-shaped holes in a ring at every LOD
