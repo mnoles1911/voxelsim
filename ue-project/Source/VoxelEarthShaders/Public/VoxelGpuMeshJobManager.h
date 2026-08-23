@@ -150,6 +150,55 @@ namespace VoxelGpuChunkRegion
 	// the one brick the origin moved.
 	VOXELEARTHSHADERS_API bool MakeBrickRegion(const FVoxelGpuRegionRequest& MeshReq,
 	                                           FVoxelGpuRegionRequest& OutReq);
+
+	// --- 50k: the same derivation, but the asset span tables MOVE ------------
+	//
+	// MakeBrickRegion above starts with `OutReq = MeshReq`, which DEEP-COPIES
+	// every array the request carries. Per chunk that is
+	//
+	//     4 * (ElevationMm.Num() + ClimatePacked.Num())        raster window
+	//   + 44 * AssetInstances.Num()                            instances
+	//   +  4 * (AssetColStarts.Num() + AssetSpans.Num())       span tables
+	//
+	// bytes of malloc + memcpy on the GAME THREAD, once per chunk routed to the
+	// GPU. The raster term is zero under -VoxelGpuRasterAtlas (the arrays are
+	// empty by construction and ValidateRegionRequest enforces it), which is
+	// exactly why the atlas fixed the owner's original 46 KB finding and why
+	// something else had to have replaced it. The asset terms did NOT go away:
+	// a chunk carrying trees carries its species' whole column-prefix and span
+	// tables, and this copy duplicates them.
+	//
+	// THE COPY IS PURE WASTE ON A LEAN JOB. Under -VoxelGpuLeanBrickJobs (which
+	// -VoxelGpuPrimary implies) a brick-only, band-free, packing job never calls
+	// AddRegionPasses(Job->Region) at all -- see that accessor's banner. So the
+	// mesh region's arrays are built by the caller, copied here, and then read
+	// by NOTHING. This overload moves them instead: same bytes in OutReq, zero
+	// allocations, zero memcpy, and MeshReq keeps every scalar field (an
+	// implicit move-assign copies scalars and only steals the TArrays).
+	//
+	// WHAT MeshReq LOSES, AND WHY EACH LOSS IS SAFE. Only AssetInstances,
+	// AssetColStarts and AssetSpans are taken, and only the caller's own gate
+	// (Submit's, which mirrors DispatchBatch's lean gate plus bRasterAtlas)
+	// decides to call this:
+	//   * ValidateRegionRequest(Job->Region) in Tick's promote loop then skips
+	//     its asset block. Coverage is MOVED, not lost: Submit validates
+	//     OutReq -- which now holds those same instances -- before latching
+	//     bBrickPack, exactly as it did before.
+	//   * ComputeRegionGraphSizes reads neither the instances nor the tables.
+	//   * The one path that can still dispatch the mesh region after this --
+	//     a job whose pool shell was refused in DispatchBatch, which clears
+	//     bBrickPack and so fails the lean gate -- was ALREADY generating into
+	//     a graph with no readback attached to it and discarding the result.
+	//     It now discards the same terrain without asset stamps on it. Nothing
+	//     reads either.
+	// The raster arrays are deliberately NOT moved even though they are empty
+	// under the atlas: moving them would make ValidateRegionRequest(Job->Region)
+	// fail on the inline-window control path, where they are 46 KB and real.
+	//
+	// Returns false, and leaves both requests untouched, on the same
+	// non-standard-footprint condition MakeBrickRegion refuses.
+	VOXELEARTHSHADERS_API bool MakeBrickRegionMoveAssets(FVoxelGpuRegionRequest& MeshReq,
+	                                                     FVoxelGpuRegionRequest& OutReq);
 }
 
 // Why a job ended. Exactly one of these is delivered per Submit().
@@ -215,6 +264,20 @@ VOXELEARTHSHADERS_API bool VoxelGpuWorldGenBatchEnabled();
 // one-owner reason as VoxelGpuBrickPackEnabled above. Default off: without the
 // flag every default is byte-identical to the shipped configuration.
 VOXELEARTHSHADERS_API bool VoxelGpuPrimaryEnabled();
+
+// -VoxelGpuJobLean=1 (default OFF, latched -- the -ExecCmds startup-window rule
+// every other gate in this file follows): collapse the manager's per-CHUNK
+// game-thread work. Today it does two things, both counted on the
+// [gpu-jobcost] window line and both individually readable as dead:
+//
+//   1. the brick region's asset span tables MOVE instead of being deep-copied
+//      (MakeBrickRegionMoveAssets, above -- `assetMove=` vs `assetCopy=`);
+//   2. DispatchBatch's shell REVALIDATION pass is skipped when nothing left the
+//      pool's resident map while the shells were being taken, which is the only
+//      way a shell can be stolen (`revalSkip=` vs `revalRan=`).
+//
+// Off, every path is byte-identical -- the copy is made, the revalidation runs.
+VOXELEARTHSHADERS_API bool VoxelGpuJobLeanEnabled();
 
 struct FVoxelGpuMeshJobResult
 {
@@ -657,4 +720,73 @@ private:
 	// own flush and clears the flag.
 	bool bWorklistFlushedThisTick = false;
 	void MaybeLogWorklistWindow();
+
+	// --- 50k blocker: this manager's own per-CHUNK and per-TICK cost ---------
+	//
+	// WHY A SECOND LEDGER WHEN FTickStageMs ALREADY EXISTS. FTickStageMs has no
+	// DENOMINATOR. It says promote took 1,200 ms this window; it cannot say
+	// whether that is 10,000 chunks at 0.12 ms each or 200 ticks at 6 ms each,
+	// and those have opposite fixes. The 2026-08-23 headline
+	// (dispatch=1,547 ms/window, 0.149 ms per forked chunk) was DIVIDED by a
+	// chunk count that dispatch= does not actually scale with: dispatch=
+	// brackets both the per-chunk submit loop AND this manager's whole per-frame
+	// Tick. Every number here therefore ships with the count it is per.
+	//
+	// THE FOUR ENQUEUE BRACKETS ARE THE POINT. The game-thread work in this
+	// class is a few hundred bytes of struct per chunk and three walks of an
+	// array bounded by MaxInFlight (288) per tick -- arithmetic that cannot
+	// reach 0.149 ms/chunk however it is counted. The only mechanism in this
+	// file that CAN is the game thread BLOCKING at an
+	// ENQUEUE_RENDER_COMMAND against a saturated render thread, and no
+	// instrument anywhere splits those four sites apart. If enqDispatchUs /
+	// enqPollUs dominate, the finding is render-thread backpressure, the fix is
+	// on the render side, and every per-chunk micro-optimisation in this file is
+	// beside the point. That is a finding, not a failure.
+	//
+	// Read-and-reset with a SINGLE reader (MaybeLogJobCostWindow), for the
+	// two-readers-halve-each-other reason FTickStageMs documents.
+	struct FJobCostWindow
+	{
+		// --- Submit(): contiguous, so the three sum to subTotalMs exactly ----
+		double SubmitHdrMs = 0.0;    // MakeShared<FJob> + the region move + latches
+		double SubmitBrickMs = 0.0;  // MakeBrickRegion(+MoveAssets) + Validate + key
+		double SubmitQueueMs = 0.0;  // the queue Add
+		double SubmitTotalMs = 0.0;  // whole call, so drift must print ~0
+		int64 Submits = 0;
+		// EXACT bytes the brick-region derivation deep-copied, by term. This is
+		// the direct successor to the owner's "FillRasterWindow samples ~46 KB
+		// per chunk", in the same units, for the code that replaced it.
+		// rasterB must read 0 under -VoxelGpuRasterAtlas; anything else means
+		// the atlas is declining and the inline fill is live.
+		int64 BrickCopyRasterBytes = 0;
+		int64 BrickCopyAssetBytes = 0;
+
+		// --- Tick(): per-tick terms with their per-tick counts ---------------
+		int64 Ticks = 0;
+		int64 Promoted = 0;          // jobs that left a queue into a batch
+		int64 Batches = 0;           // DispatchBatch calls
+		int64 PollJobsVisited = 0;   // sum over ticks of the InFlight walks
+		int64 Delivered = 0;         // Deliver() calls from the harvest
+		double DeliverMs = 0.0;
+
+		// --- the four render-command handoffs, bracketed apart ---------------
+		double EnqDispatchMs = 0.0;  // DispatchBatch's batch graph
+		double EnqPollMs = 0.0;      // PollInFlight's poll command
+		double EnqFetchMs = 0.0;     // phase 2 fetch + compact
+		double EnqReleaseMs = 0.0;   // the readback release command
+		int64 EnqDispatchN = 0;
+		int64 EnqPollN = 0;
+		int64 EnqFetchN = 0;
+		int64 EnqReleaseN = 0;
+
+		// --- -VoxelGpuJobLean traffic (see the accessor) ---------------------
+		int64 LeanAssetMoves = 0;
+		int64 LeanAssetCopies = 0;
+		int64 LeanAssetBytesSaved = 0;
+		int64 LeanRevalSkipped = 0;
+		int64 LeanRevalRan = 0;
+	};
+	FJobCostWindow JobCost;
+	double LastJobCostLogSeconds = 0.0;
+	void MaybeLogJobCostWindow();
 };

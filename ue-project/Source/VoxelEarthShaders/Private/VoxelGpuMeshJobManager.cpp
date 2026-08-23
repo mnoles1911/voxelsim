@@ -904,6 +904,42 @@ bool VoxelGpuBrickPackResidentEnabled()
 	return GVoxelGpuBrickPackResident != 0;
 }
 
+// See the declaration for what this collapses and for the counters that make
+// each half readable as dead. Latched, like every other gate in this file: the
+// -ExecCmds startup window opens after the first chunks have already been
+// submitted, so a cvar cannot gate a cold-start measurement.
+bool VoxelGpuJobLeanEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuJobLean="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+namespace VoxelGpuJobCostDetail
+{
+	// The bytes a deep copy of this request's arrays costs, split the way the
+	// window line reports them. Counted from the arrays themselves rather than
+	// from a remembered constant, because the whole point of the number is that
+	// nobody knows what it is per chunk on this path.
+	inline int64 RasterCopyBytes(const FVoxelGpuRegionRequest& Req)
+	{
+		return int64(Req.ElevationMm.Num()) * int64(sizeof(int32))
+		     + int64(Req.ClimatePacked.Num()) * int64(sizeof(uint32));
+	}
+
+	inline int64 AssetCopyBytes(const FVoxelGpuRegionRequest& Req)
+	{
+		return int64(Req.AssetInstances.Num())
+		         * int64(sizeof(FVoxelGpuRegionRequest::FAssetInstance))
+		     + int64(Req.AssetColStarts.Num()) * int64(sizeof(uint32))
+		     + int64(Req.AssetSpans.Num()) * int64(sizeof(uint32));
+	}
+}
+
 const TCHAR* LexToString(EVoxelGpuMeshJobStatus Status)
 {
 	switch (Status)
@@ -936,26 +972,86 @@ void VoxelGpuChunkRegion::SetChunkFootprint(FVoxelGpuRegionRequest& Req,
 	Req.bMeshChain = true;
 }
 
+namespace
+{
+	// The one shape test both derivations make. Only the standard single-chunk
+	// footprint: anything else and the one-brick shift is arithmetic about a
+	// shape that is not there -- see MakeBrickRegion's declaration for what
+	// packing the wrong bricks looks like.
+	inline bool IsStandardChunkFootprint(const FVoxelGpuRegionRequest& MeshReq)
+	{
+		return MeshReq.DispatchColumns.X == VoxelGpuChunkRegion::kColumns
+		    && MeshReq.DispatchColumns.Y == VoxelGpuChunkRegion::kColumns
+		    && MeshReq.BricksZ == VoxelGpuChunkRegion::kBricksZ;
+	}
+
+	// Everything the halo-free derivation does AFTER the struct has been
+	// copied (or moved) across. Reads each field before it writes it, so it is
+	// correct in place -- which is what lets the moving overload share it.
+	void ApplyBrickRegionShape(FVoxelGpuRegionRequest& OutReq);
+}
+
 bool VoxelGpuChunkRegion::MakeBrickRegion(const FVoxelGpuRegionRequest& MeshReq,
                                           FVoxelGpuRegionRequest& OutReq)
 {
-	// Only the standard single-chunk footprint. Anything else and the one-brick
-	// shift below is arithmetic about a shape that is not there -- see the
-	// declaration for what packing the wrong bricks looks like.
-	if (MeshReq.DispatchColumns.X != kColumns || MeshReq.DispatchColumns.Y != kColumns ||
-	    MeshReq.BricksZ != kBricksZ)
+	if (!IsStandardChunkFootprint(MeshReq))
 	{
 		return false;
 	}
 
 	OutReq = MeshReq;
+	ApplyBrickRegionShape(OutReq);
+	return true;
+}
+
+// See the declaration for the byte arithmetic, the lean gate this mirrors, and
+// why each thing MeshReq loses is safe.
+bool VoxelGpuChunkRegion::MakeBrickRegionMoveAssets(FVoxelGpuRegionRequest& MeshReq,
+                                                    FVoxelGpuRegionRequest& OutReq)
+{
+	// The refusal happens BEFORE anything is taken, so a refused derivation
+	// leaves MeshReq exactly as it found it -- same contract as the copying
+	// overload, which matters because Submit falls back to that one.
+	if (!IsStandardChunkFootprint(MeshReq))
+	{
+		return false;
+	}
+
+	// Taken FIRST, into locals, so the struct assignment below sees three empty
+	// arrays and allocates nothing for them. Doing it the other way round --
+	// copy, then overwrite with moves -- would pay the whole copy and then
+	// throw it away, which is the bug this function exists to remove.
+	TArray<FVoxelGpuRegionRequest::FAssetInstance> Instances = MoveTemp(MeshReq.AssetInstances);
+	TArray<uint32> ColStarts = MoveTemp(MeshReq.AssetColStarts);
+	TArray<uint32> Spans = MoveTemp(MeshReq.AssetSpans);
+
+	// The raster arrays are still COPIED. They are empty under
+	// -VoxelGpuRasterAtlas (ValidateRegionRequest refuses a request that is
+	// both atlas-armed and window-filled), so this costs nothing there; on the
+	// inline-window control path they are real, and moving them would make
+	// ValidateRegionRequest(Job->Region) fail in Tick's promote loop.
+	OutReq = MeshReq;
+
+	OutReq.AssetInstances = MoveTemp(Instances);
+	OutReq.AssetColStarts = MoveTemp(ColStarts);
+	OutReq.AssetSpans = MoveTemp(Spans);
+
+	ApplyBrickRegionShape(OutReq);
+	return true;
+}
+
+namespace
+{
+void ApplyBrickRegionShape(FVoxelGpuRegionRequest& OutReq)
+{
+	using namespace VoxelGpuChunkRegion;
 
 	// Drop the halo: one brick on every axis, on the negative side, and the
 	// interior extent on the positive.
 	OutReq.DispatchColumns = FUintVector2(kChunkEdgeVoxels, kChunkEdgeVoxels);
-	OutReq.OriginVx = MeshReq.OriginVx + int32(kBrickEdge);
-	OutReq.OriginVy = MeshReq.OriginVy + int32(kBrickEdge);
-	OutReq.BrickZMin = MeshReq.BrickZMin + 1;
+	OutReq.OriginVx += int32(kBrickEdge);
+	OutReq.OriginVy += int32(kBrickEdge);
+	OutReq.BrickZMin += 1;
 	OutReq.BricksZ = kInteriorBricks;
 
 	// This region generates and packs. It does NOT mesh: the mesh chain is the
@@ -998,15 +1094,14 @@ bool VoxelGpuChunkRegion::MakeBrickRegion(const FVoxelGpuRegionRequest& MeshReq,
 	// literal 5 halved the shift at level 6, displacing every asset anchor in
 	// a ring-6 brick region by 8x32 level-0 voxels -- plausible trees, wrong
 	// places, no error.
-	const int32 AnchorShift = int32(kBrickEdge) << FMath::Clamp(MeshReq.CoarseLevel, 0, 6);
+	const int32 AnchorShift = int32(kBrickEdge) << FMath::Clamp(OutReq.CoarseLevel, 0, 6);
 	for (FVoxelGpuRegionRequest::FAssetInstance& Inst : OutReq.AssetInstances)
 	{
 		Inst.AnchorRelVx -= AnchorShift;
 		Inst.AnchorRelVy -= AnchorShift;
 	}
-
-	return true;
 }
+} // namespace
 
 // ---------------------------------------------------------------------------
 // The job
@@ -1710,6 +1805,13 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 {
 	check(IsInGameThread());
 
+	// The per-CHUNK half of this manager's game-thread cost, bracketed
+	// CONTIGUOUSLY so the three buckets telescope to the total and any drift is
+	// a broken bracket rather than an unattributed remainder. See FJobCostWindow
+	// for why a denominator-free ms figure is what produced the 0.149 ms/chunk
+	// reading in the first place.
+	const double SubT0 = FPlatformTime::Seconds();
+
 	FJobPtr Job = MakeShared<FJob, ESPMode::ThreadSafe>();
 	Job->JobId = NextJobId++;
 	Job->UserTag = UserTag;
@@ -1755,6 +1857,31 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	// Non-chunk footprints (the bench fixtures, the blocking verify path) simply
 	// do not pack, which is correct: the brick volume is a per-render-chunk
 	// structure and there is no such thing as packing two thirds of one.
+	const double SubT1 = FPlatformTime::Seconds(); // hdr: alloc + region move + latches
+
+	// -VoxelGpuJobLean: may this job's asset span tables MOVE into the brick
+	// region instead of being deep-copied into it?
+	//
+	// THE GATE MIRRORS DispatchBatch'S LEAN GATE, TERM FOR TERM, plus the atlas.
+	// Anything looser and a job whose mesh region still gets dispatched would
+	// find its arrays gone; anything tighter and the collapse is dead on the
+	// only configuration that matters. The one term that can still change AFTER
+	// this point is bBrickPack (DispatchBatch clears it when the pool refuses a
+	// shell), and that case is covered in the declaration: it dispatches a mesh
+	// graph with no readback attached and discards the result either way.
+	const bool bMoveAssets =
+		VoxelGpuJobLeanEnabled()
+		&& VoxelGpuLeanBrickJobsEnabled()
+		&& !Job->bQuadMesh
+		&& Job->Region.BandEdge == 0
+		&& Job->Region.bRasterAtlas;
+	// Counted BEFORE the derivation, off the arrays as they stand, because
+	// afterwards the moving path has emptied the originals and the number would
+	// read zero -- which is exactly the shape of a saving that is really a
+	// broken measurement.
+	const int64 RasterBytes = VoxelGpuJobCostDetail::RasterCopyBytes(Job->Region);
+	const int64 AssetBytes = VoxelGpuJobCostDetail::AssetCopyBytes(Job->Region);
+
 	FString BrickRegionError;
 	// VoxelGpuBrickPackEnabled(), NOT the raw cvar. THE GATE IS NO LONGER "A
 	// CVAR" -- it is a cvar with a command-line override, and only the accessor
@@ -1764,8 +1891,31 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	// the fork carried zero traffic and `added (gpu 0, cpu 28123)` was the only
 	// sign. The invariant moved when the override landed; every read has to move
 	// with it.
-	if (VoxelGpuBrickPackEnabled() &&
-	    VoxelGpuChunkRegion::MakeBrickRegion(Job->Region, Job->BrickRegion) &&
+	// Hoisted out of the condition below so the "did the collapse actually run"
+	// counter is the truth rather than the intent: the gate can be armed and
+	// the derivation still refuse (a non-chunk footprint), and a counter that
+	// reported a saving in that case would be the eleventh feature in this
+	// project to read healthy while doing nothing. Short-circuit order is
+	// preserved exactly -- no derivation without BrickPack, no validation
+	// without a derivation.
+	bool bBrickRegionDerived = false;
+	bool bAssetsMoved = false;
+	if (VoxelGpuBrickPackEnabled())
+	{
+		if (bMoveAssets)
+		{
+			bBrickRegionDerived =
+				VoxelGpuChunkRegion::MakeBrickRegionMoveAssets(Job->Region, Job->BrickRegion);
+			bAssetsMoved = bBrickRegionDerived;
+		}
+		else
+		{
+			bBrickRegionDerived =
+				VoxelGpuChunkRegion::MakeBrickRegion(Job->Region, Job->BrickRegion);
+		}
+	}
+
+	if (bBrickRegionDerived &&
 	    // VALIDATED HERE TOO, and not because MakeBrickRegion is suspect. The
 	    // mesh region is validated in Tick before it reaches a graph; the brick
 	    // region is derived rather than submitted, so nothing else would ever
@@ -1810,6 +1960,7 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	}
 
 	Job->SubmitSeconds = FPlatformTime::Seconds();
+	const double SubT2 = Job->SubmitSeconds; // brick: derive + validate + key
 
 	// Low-priority work goes to its own queue and is promoted only when the
 	// demand queue is empty -- see Submit's declaration for why submit-last
@@ -1821,6 +1972,31 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	else
 	{
 		Queued.Add(Job);
+	}
+
+	{
+		const double SubT3 = FPlatformTime::Seconds();
+		++JobCost.Submits;
+		JobCost.SubmitHdrMs += (SubT1 - SubT0) * 1000.0;
+		JobCost.SubmitBrickMs += (SubT2 - SubT1) * 1000.0;
+		JobCost.SubmitQueueMs += (SubT3 - SubT2) * 1000.0;
+		JobCost.SubmitTotalMs += (SubT3 - SubT0) * 1000.0;
+		JobCost.BrickCopyRasterBytes += RasterBytes;
+		JobCost.BrickCopyAssetBytes += AssetBytes;
+		if (bAssetsMoved)
+		{
+			++JobCost.LeanAssetMoves;
+			JobCost.LeanAssetBytesSaved += AssetBytes;
+		}
+		else if (bBrickRegionDerived)
+		{
+			// A derivation that ran and COPIED. Jobs that derived nothing at
+			// all (BrickPack off, non-chunk footprint) are in neither column
+			// on purpose: they never paid the copy, so counting them as
+			// "declined to move" would make the switch look inert on a leg
+			// where there was nothing to move.
+			++JobCost.LeanAssetCopies;
+		}
 	}
 	return Job->JobId;
 }
@@ -1987,6 +2163,11 @@ void FVoxelGpuMeshJobManager::Tick()
 	// it is the largest item in the streaming tick and therefore the world's
 	// generation ceiling, and it had exactly one number.
 	const double TickStage0 = FPlatformTime::Seconds();
+	// The per-TICK denominator FTickStageMs has never had. Counted before any
+	// early exit can exist, so ticks= is every call and not just the busy ones
+	// -- a per-frame cost divided by busy frames is how a per-tick term
+	// disguises itself as a per-chunk one.
+	++JobCost.Ticks;
 
 	// Tier B.1. Latched once per tick so one tick behaves like one tick; safe
 	// to flip mid-run because both paths emit identical bytes (the residue of
@@ -2329,6 +2510,10 @@ void FVoxelGpuMeshJobManager::Tick()
 
 	if (Batch.Num() > 0)
 	{
+		// Counted here, where the batch is final (heads plus every Z-sibling
+		// the sweep took), so promoteMs/promoted is a true per-chunk figure.
+		JobCost.Promoted += int64(Batch.Num());
+		++JobCost.Batches;
 		InFlight.Append(Batch);
 		DispatchBatch(MoveTemp(Batch));
 	}
@@ -2569,6 +2754,8 @@ void FVoxelGpuMeshJobManager::Tick()
 	GetGlobalVoxelBrickPool().Flush();
 	const double TickStage3 = FPlatformTime::Seconds();
 	TickStageMs.BrickFlushMs += (TickStage3 - TickStage2) * 1000.0;
+
+	MaybeLogJobCostWindow();
 }
 
 // The Tier B.1 window line. ~5 s cadence, and it prints ONLY when something
@@ -2853,6 +3040,126 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	LastWorklistLogSeconds = Now;
 }
 
+// --- [gpu-jobcost]: the manager's own cost, WITH ITS DENOMINATORS -----------
+//
+// ~5 s cadence, silent on a window in which nothing was submitted and nothing
+// was in flight, so a CPU-only leg's log is unchanged.
+//
+// WHY EVERY NUMBER IS PRINTED AS A RATE PER SOMETHING. The 2026-08-23 headline
+// -- 0.149 ms of game thread per chunk routed to the GPU -- was
+// dispatch=1,547 ms divided by gpuForked=10,391. dispatch= brackets both the
+// per-chunk submit loop AND this manager's whole per-frame Tick, and those two
+// do not scale with the same thing. Over a 5 s window at 30-60 fps the tick
+// term alone is 150-300 ticks; 1,547 ms over 200 ticks is 7.7 ms per TICK,
+// which is the same order as this class's own recorded "~18-19 ms per hitch
+// frame". So the division may be against the wrong denominator entirely, and
+// nothing in the tree could tell. These print both.
+//
+// FAILING READINGS -- state them, because "did work move?" and "is it faster?"
+// are different questions and this codebase has repeatedly answered the second
+// while the first was zero:
+//
+//  * subUs near zero while the budget line's dispatch= stays ~1,500 ms:
+//    this manager's per-chunk half is NOT the cost. Read tickUs next.
+//  * tickUs x ticks accounting for the bulk: the cost is PER TICK, and every
+//    per-chunk optimisation anywhere in this file is beside the point. The
+//    fix is then a lower tick rate for this work or a smaller in-flight
+//    population, not cheaper chunks.
+//  * enqDispUs / enqPollUs dominating: the game thread is BLOCKING at the
+//    render-command handoff. Constructing those commands is a MoveTemp and a
+//    few bools, so any material time in these brackets is render-thread
+//    backpressure -- a finding about the render thread, not about this file.
+//  * rasterB > 0: the raster atlas is DECLINING and the inline 46 KB window
+//    fill is live. Every "the atlas fixed it" claim is then void for this leg.
+//  * assetMove=0 with submits flowing and -VoxelGpuJobLean armed: the collapse
+//    converted nothing. The gate needs quads retired, the lean switch, a
+//    band-free request and the atlas -- the line prints assetCopy= beside it so
+//    "armed and declining" is a readable state and not a mystery.
+//  * bytesSaved=0 with assetMove>0: the moves ran and there was nothing to
+//    move (no assets on this leg). The switch is not broken; the leg has no
+//    asset traffic, and this collapse cannot be credited with anything.
+//  * revalSkip=0 with -VoxelGpuJobLean armed: something LEFT the pool's
+//    resident map while the shells were being taken (an eviction, or two
+//    queued jobs for one chunk key), which is exactly when the revalidation is
+//    NOT redundant. That is the switch behaving correctly, not failing -- but
+//    revalRan growing every window on a leg reporting evictions=0 means
+//    duplicate keys are reaching one batch, which is a finding of its own.
+void FVoxelGpuMeshJobManager::MaybeLogJobCostWindow()
+{
+	const double Now = FPlatformTime::Seconds();
+	if (LastJobCostLogSeconds <= 0.0)
+	{
+		LastJobCostLogSeconds = Now;
+		return;
+	}
+	if (Now - LastJobCostLogSeconds < 5.0)
+	{
+		return;
+	}
+
+	if (JobCost.Submits == 0 && JobCost.PollJobsVisited == 0 && JobCost.Delivered == 0)
+	{
+		JobCost = FJobCostWindow();
+		LastJobCostLogSeconds = Now;
+		return;
+	}
+
+	const double SubN = double(FMath::Max<int64>(JobCost.Submits, 1));
+	const double TickN = double(FMath::Max<int64>(JobCost.Ticks, 1));
+	const double DelN = double(FMath::Max<int64>(JobCost.Delivered, 1));
+	// The three Submit buckets are contiguous, so this must print ~0.00.
+	const double SubDriftMs = JobCost.SubmitTotalMs
+		- JobCost.SubmitHdrMs - JobCost.SubmitBrickMs - JobCost.SubmitQueueMs;
+	// Everything this manager charges the game thread per tick, whatever it is
+	// per: the four handoffs plus the delivery loop. Deliberately NOT compared
+	// against TickStageMs -- that accessor is read-and-reset and has exactly one
+	// reader (the subsystem's log line); reading it here would halve its totals,
+	// which is the trap its own comment documents.
+	const double TickChargedMs = JobCost.EnqDispatchMs + JobCost.EnqPollMs
+		+ JobCost.EnqFetchMs + JobCost.EnqReleaseMs + JobCost.DeliverMs;
+
+	UE_LOG(LogVoxelGpuMeshJob, Log,
+	       TEXT("[gpu-jobcost] submits=%lld subUs=%.2f (hdr %.2f + brick %.2f + queue %.2f, ")
+	       TEXT("drift %.3fms) | copyPerChunk rasterB=%.0f assetB=%.0f | ticks=%lld ")
+	       TEXT("promoted=%lld batches=%lld pollJobs/tick=%.0f | chargedMs=%.1f = enqDisp %.1f ")
+	       TEXT("+ enqPoll %.1f + enqFetch %.1f + enqRel %.1f + deliver %.1f | perTickUs=%.1f ")
+	       TEXT("perDeliverUs=%.1f delivered=%lld | jobLean=%s assetMove=%lld assetCopy=%lld ")
+	       TEXT("bytesSaved=%lld revalSkip=%lld revalRan=%lld"),
+	       JobCost.Submits,
+	       (JobCost.SubmitTotalMs * 1000.0) / SubN,
+	       (JobCost.SubmitHdrMs * 1000.0) / SubN,
+	       (JobCost.SubmitBrickMs * 1000.0) / SubN,
+	       (JobCost.SubmitQueueMs * 1000.0) / SubN,
+	       SubDriftMs,
+	       double(JobCost.BrickCopyRasterBytes) / SubN,
+	       double(JobCost.BrickCopyAssetBytes) / SubN,
+	       JobCost.Ticks, JobCost.Promoted, JobCost.Batches,
+	       double(JobCost.PollJobsVisited) / TickN,
+	       TickChargedMs,
+	       JobCost.EnqDispatchMs, JobCost.EnqPollMs, JobCost.EnqFetchMs,
+	       JobCost.EnqReleaseMs, JobCost.DeliverMs,
+	       (TickChargedMs * 1000.0) / TickN,
+	       (JobCost.DeliverMs * 1000.0) / DelN,
+	       JobCost.Delivered,
+	       VoxelGpuJobLeanEnabled() ? TEXT("ON") : TEXT("off"),
+	       JobCost.LeanAssetMoves, JobCost.LeanAssetCopies, JobCost.LeanAssetBytesSaved,
+	       JobCost.LeanRevalSkipped, JobCost.LeanRevalRan);
+
+	if (VoxelGpuJobLeanEnabled() && JobCost.Submits > 0 && JobCost.LeanAssetMoves == 0)
+	{
+		UE_LOG(LogVoxelGpuMeshJob, Warning,
+		       TEXT("[gpu-jobcost] -VoxelGpuJobLean is ARMED and moved NOTHING this window ")
+		       TEXT("(%lld submits, %lld copied). The move needs ALL of: quads retired ")
+		       TEXT("(voxel.Terrain.RetireQuads), -VoxelGpuLeanBrickJobs, a band-free request ")
+		       TEXT("(-VoxelGpuBandSeedOnly) and the raster atlas (-VoxelGpuRasterAtlas). ")
+		       TEXT("Treat this window's asset-copy saving as NOT MEASURED."),
+		       JobCost.Submits, JobCost.LeanAssetCopies);
+	}
+
+	JobCost = FJobCostWindow();
+	LastJobCostLogSeconds = Now;
+}
+
 void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 {
 	// THE ENQUEUE ONLY, NOT THE GRAPH. The lambda below runs on the RENDER
@@ -2887,6 +3194,30 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	if (VoxelGpuPoolAllocEnabled())
 	{
 		FVoxelBrickPool& Pool = GetGlobalVoxelBrickPool();
+		// -VoxelGpuJobLean, half two: skip rule 2's revalidation pass when it is
+		// PROVABLY a no-op.
+		//
+		// A shell can only be stolen if something was REMOVED from the resident
+		// map while these shells were being taken. There are two such removals
+		// and the obvious guard only catches one: EvictOne (counted by
+		// GetEvictions) and AllocateForChunk's same-key replacement (counted by
+		// nothing -- two queued jobs for one chunk key, a state the Tier B.1
+		// grouping comment already names as reachable). Gating on evictions
+		// alone would therefore be exactly the kind of derived-instead-of-
+		// checked join this project has paid for repeatedly.
+		//
+		// So gate on the identity instead: every successful allocation
+		// increments ChunksAdded AND grows Resident by one, UNLESS it removed
+		// something first. If the two deltas agree across the loop, nothing was
+		// removed by any mechanism, named or not, and no shell can have moved.
+		//
+		// What it saves, per chunk, per tick: one TMap lookup keyed on a
+		// 16-byte FVoxelBrickChunkKey plus one ~64-byte FResidentChunk copy out,
+		// for an outcome the identity says cannot have occurred. Every
+		// GPU-primary arm measured to date reports evictions=0 for the whole leg.
+		const bool bLeanReval = VoxelGpuJobLeanEnabled();
+		const int32 ResidentBefore = Pool.GetNumResidentChunks();
+		const int64 AddedBefore = Pool.GetChunksAdded();
 		for (const FJobPtr& Job : Batch)
 		{
 			if (!Job->bBrickPack)
@@ -2932,8 +3263,23 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		}
 		// Rule 2: drop the brick half of any job whose shell was stolen by a
 		// later allocation's eviction inside this very loop.
+		const bool bSkipReval = bLeanReval &&
+			(int64(Pool.GetNumResidentChunks() - ResidentBefore)
+			     == (Pool.GetChunksAdded() - AddedBefore));
+		if (bSkipReval)
+		{
+			JobCost.LeanRevalSkipped += int64(Batch.Num());
+		}
+		else
+		{
+			JobCost.LeanRevalRan += int64(Batch.Num());
+		}
 		for (const FJobPtr& Job : Batch)
 		{
+			if (bSkipReval)
+			{
+				break;
+			}
 			if (!Job->bGpuPoolAlloc)
 			{
 				continue;
@@ -3275,6 +3621,13 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	const bool bVerifyCtArmed = VoxelGpuWorklistVerifyCtEnabled();
 	const bool bVerifyStampArmed = VoxelGpuWorklistVerifyStampEnabled();
 	const bool bVerifyPackArmed = VoxelGpuWorklistVerifyPackEnabled();
+	// TIGHT bracket, around the HANDOFF ONLY. TickStageMs.EnqueueMs spans this
+	// whole function (shell loop, worklist records, enqueue) and so cannot
+	// answer the one question that decides this investigation: is the game
+	// thread WAITING here? Constructing this command is a MoveTemp of an array
+	// of shared pointers and five bools -- nanoseconds -- so anything this
+	// bracket reports above that is the render thread refusing to take it.
+	const double EnqDispatchStart = FPlatformTime::Seconds();
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshDispatchBatch)(
 		[Jobs = MoveTemp(Batch), WorklistPtr, bVerifyColsArmed,
 		 bVerifyVoxArmed, bVerifyCtArmed, bVerifyStampArmed,
@@ -3745,7 +4098,10 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		}
 	});
 
-	TickStageMs.EnqueueMs += (FPlatformTime::Seconds() - DispatchBatchStart) * 1000.0;
+	const double DispatchBatchEnd = FPlatformTime::Seconds();
+	TickStageMs.EnqueueMs += (DispatchBatchEnd - DispatchBatchStart) * 1000.0;
+	JobCost.EnqDispatchMs += (DispatchBatchEnd - EnqDispatchStart) * 1000.0;
+	++JobCost.EnqDispatchN;
 }
 
 // PHASE 2. The total has landed, so fetch exactly that many quads out of the
@@ -3877,6 +4233,14 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 	const double Now = FPlatformTime::Seconds();
 
 	// --- poll both pending phases in one render command ---------------------
+	//
+	// THE THREE WALKS ARE COUNTED, NOT ASSUMED. This function walks InFlight
+	// three times per tick and InFlight is bounded by MaxInFlight (288 under
+	// -VoxelGpuPrimary: JobsInFlightPerCore 8 x 36 logical cores). That is a
+	// per-TICK cost, and pollJobs/ticks is what says whether it is the one the
+	// budget line has been attributing per chunk.
+	JobCost.PollJobsVisited += int64(InFlight.Num()) * 3;
+
 	TArray<FJobPtr> ToPoll;
 	for (const FJobPtr& Job : InFlight)
 	{
@@ -3899,6 +4263,9 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 		// poll, not change budget halfway through.
 		const int32 HarvestCap = VoxelGpuMeshHarvestCapEffective();
 
+		// Same tight-bracket reason as the batch command: this handoff moves one
+		// array and copies one int.
+		const double EnqPollStart = FPlatformTime::Seconds();
 		ENQUEUE_RENDER_COMMAND(VoxelGpuMeshPoll)(
 			[Jobs = MoveTemp(ToPoll), HarvestCap](FRHICommandListImmediate&)
 		{
@@ -4226,6 +4593,8 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 				}
 			}
 		});
+		JobCost.EnqPollMs += (FPlatformTime::Seconds() - EnqPollStart) * 1000.0;
+		++JobCost.EnqPollN;
 	}
 
 	// --- start phase 2 for anything whose total has landed -------------------
@@ -4311,6 +4680,7 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 			ToFetch.Add(Job);
 		}
 
+		const double EnqFetchStart = FPlatformTime::Seconds();
 		if (ToFetch.Num() > 0)
 		{
 			DispatchQuadFetch(MoveTemp(ToFetch));
@@ -4323,6 +4693,11 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 		{
 			DispatchQuadCompact(MoveTemp(ToCompact));
 		}
+		// Both phase-2 handoffs together: they are disjoint by construction and
+		// a tick has at most one of each, so one bracket answers the same
+		// "is the game thread waiting here" question for both.
+		JobCost.EnqFetchMs += (FPlatformTime::Seconds() - EnqFetchStart) * 1000.0;
+		++JobCost.EnqFetchN;
 	}
 
 	// Harvest, in two phases.
@@ -4426,12 +4801,28 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 	// lands ahead of this one.
 	TArray<FJobPtr> ToRelease;
 	ToRelease.Reserve(Finished.Num());
+	// Deliver() is the manager's per-DELIVERED-CHUNK cost, and it is a different
+	// quantity from the streaming side's apply= (0.054 ms/chunk, the handoff's
+	// second blocker). Bracketed here so the two can be told apart instead of
+	// both being charged to whichever bucket happens to span them: this covers
+	// the result marshal, the brick-pool publication and OnJobComplete's own
+	// body, which is where DrainResults' enqueue lives.
+	const double DeliverStart = FPlatformTime::Seconds();
 	for (const FPending& P : Finished)
 	{
 		Deliver(P.Job, P.Status, P.Error);
 		ToRelease.Add(P.Job);
 	}
+	const double DeliverEnd = FPlatformTime::Seconds();
+	JobCost.Delivered += int64(Finished.Num());
+	JobCost.DeliverMs += (DeliverEnd - DeliverStart) * 1000.0;
+
 	ReleaseReadbacksOnRenderThread(MoveTemp(ToRelease));
+	if (Finished.Num() > 0)
+	{
+		JobCost.EnqReleaseMs += (FPlatformTime::Seconds() - DeliverEnd) * 1000.0;
+		++JobCost.EnqReleaseN;
+	}
 }
 
 void FVoxelGpuMeshJobManager::CancelAll()
