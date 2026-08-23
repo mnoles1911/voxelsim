@@ -7607,6 +7607,13 @@ struct FVoxelWorldImpl
 	int64 LevelEvictInner[VoxelCoords::kNumLevels] = {};
 	int64 LevelEvictOuter[VoxelCoords::kNumLevels] = {};
 	int64 LevelEvictVertical[VoxelCoords::kNumLevels] = {};
+	// Of those, the ones evicted while this level's ANCHOR CHUNK had not moved
+	// since the previous recompute -- the 11,779-unloads/s standing-still churn
+	// signature, now countable on a moving leg. Not a fourth bucket: it is a
+	// cross-cut of the three above and does NOT sum with them. See the
+	// bExitAnchorChunkUnmoved block in RecomputeDesiredSet for both failing
+	// readings.
+	int64 LevelEvictStationary[VoxelCoords::kNumLevels] = {};
 
 	// --- Buried-chunk pre-dispatch skip, step 1 census (docs/status.md).
 	// Per RING LEVEL, over the same 5s window as everything above: results
@@ -10845,8 +10852,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			{
 				continue;
 			}
-			Line += FString::Printf(TEXT("R%d[in=%lld out=%lld vert=%lld] "), Level, (long long)LevelEvictInner[Level],
-			                        (long long)LevelEvictOuter[Level], (long long)LevelEvictVertical[Level]);
+			// stat= IS A CROSS-CUT OF THE OTHER THREE, not a fourth bucket:
+			// evictions at a ring whose anchor chunk had not moved since the
+			// previous recompute. HEALTHY is 0 at every ring at every speed.
+			// Non-zero is the 11,779-unloads/s standing-still churn band, and
+			// the ring it appears on says which radius pair opened it. The
+			// other failing reading -- stat=0 on a leg that is otherwise
+			// churning -- is in the exit scan's own comment.
+			Line += FString::Printf(TEXT("R%d[in=%lld out=%lld vert=%lld stat=%lld] "), Level,
+			                        (long long)LevelEvictInner[Level], (long long)LevelEvictOuter[Level],
+			                        (long long)LevelEvictVertical[Level], (long long)LevelEvictStationary[Level]);
 		}
 		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel evictions/level (5s window): %s"),
 		       Line.IsEmpty() ? TEXT("(none)") : *Line);
@@ -12052,6 +12067,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	FMemory::Memzero(LevelEvictInner);
 	FMemory::Memzero(LevelEvictOuter);
 	FMemory::Memzero(LevelEvictVertical);
+	FMemory::Memzero(LevelEvictStationary);
 
 	MaxRecomputeMs = 0.f;
 	MaxFineResidencyMs = 0.f;
@@ -14996,6 +15012,56 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		ExitUnloadOuterUUSq[L] = FMath::Square(VoxelStreamAdmission::UnloadOuterUU(L));
 		ExitInnerEvictUUSq[L] = FMath::Square(VoxelStreamAdmission::InnerEvictUU(L));
 	}
+
+	// THE CHURN SIGNATURE, MEASURED RATHER THAN INFERRED (2026-08-23).
+	//
+	// This project's recorded eviction failure is "11,779 unloads/s WITH THE
+	// PLAYER STANDING STILL", and the only way anyone has ever detected it is
+	// by flying a stationary leg and eyeballing an unload rate. That test
+	// cannot be run on a moving leg -- which is where every eviction question
+	// tonight actually lives -- so the two cases have never been separable in
+	// one reading.
+	//
+	// They are separable per level, cheaply, right here: a level's desired set
+	// is a pure function of its ANCHOR CHUNK (plus Z when the anchor is
+	// underground), and the entry scan skips a level entirely when that chunk
+	// has not changed. So an eviction at a level whose anchor chunk is
+	// UNCHANGED since the last recompute is, by construction, not the world
+	// moving away from a chunk -- it is the admit and evict radii disagreeing
+	// about ground that did not move. That is the 11,779/s failure, and it now
+	// has a counter of its own instead of a procedure.
+	//
+	// Read at exit-scan time, so LastAnchorChunkPerLevel still holds the
+	// PREVIOUS call's value -- the entry scan below is what updates it. A
+	// level that has never been recomputed counts as moved (bHasRecomputedLevel
+	// false): the first scan of a level legitimately evicts.
+	//
+	// HEALTHY: stat= 0 at every ring, at every speed, on every arm.
+	// FAILING: stat= non-zero, and its RING says which radius pair to look at.
+	// THE OTHER FAILING READING, and it is the one that would make this
+	// instrument a liar: stat= 0 on a leg that is otherwise known to churn
+	// (out= far exceeding what the ring's leading edge can sweep in the
+	// window). That means the anchor chunk IS moving every call -- the level's
+	// rescan gate is firing constantly -- and the churn is admission/eviction
+	// racing a moving anchor, not a static band. Different bug, different fix.
+	bool bExitAnchorChunkUnmoved[VoxelCoords::kNumLevels] = {};
+	{
+		// THE SAME THREE COMPARISONS THE ENTRY SCAN'S SKIP GATE MAKES, in the
+		// same order, including the bZMatters condition -- a looser or tighter
+		// spelling here would make stat= under- or over-report, and a
+		// diagnostic that can only come out one way is worse than none.
+		int32 ExitScratchBoxRadius = 0;
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			const FVoxelChunkKey ExitAnchorChunk = ChunkKeyForVoxel(WorldToVoxelForLevel(Anchor, L));
+			const bool bExitZMatters =
+				bAnchorUnderground && VoxelUnderground::BoxRadiusChunks(L, 0.0, ExitScratchBoxRadius);
+			bExitAnchorChunkUnmoved[L] =
+				bHasRecomputedLevel[L] && ExitAnchorChunk.X == LastAnchorChunkPerLevel[L].X &&
+				ExitAnchorChunk.Y == LastAnchorChunkPerLevel[L].Y &&
+				(!bExitZMatters || ExitAnchorChunk.Z == LastAnchorChunkPerLevel[L].Z);
+		}
+	}
 	// Command-line-latched static, identical on every read within a run --
 	// hoisted for the same reason and with the same non-argument.
 	const bool bHierarchicalCoverage = VoxelStreamAdmission::HierarchicalCoverageEnabled();
@@ -15164,6 +15230,12 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				else
 				{
 					++LevelEvictVertical[EvictLevelIdx];
+				}
+				// CROSS-CUT, not a fourth bucket: this counts a subset of the
+				// three above, so it must not be in the same if/else chain.
+				if (bExitAnchorChunkUnmoved[EvictLevelIdx])
+				{
+					++LevelEvictStationary[EvictLevelIdx];
 				}
 			}
 			PendingUnloadKeys.Add(LevelKey);
