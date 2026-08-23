@@ -22,6 +22,7 @@
 #include "VoxelFineTileStreamer.h" // Phase 2 fine-tier residency/prefetch/eviction gate (-VoxelFineTileDir=)
 #include "VoxelTileCodec.h" // GetFineTileDecompressor -- the asset channel source decodes .vxtl v2 tiles
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
+#include "VoxelEvictionIndex.h" // Phase 3: the bucket index the hysteresis-exit scan walks instead of every record
 #include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
 // M3 wave 1 (docs/m3-plan.md): role split needs the relay actor (broadcast
@@ -4684,6 +4685,20 @@ struct FVoxelWorldImpl
 	// keys behave identically to the pre-M2 single-ring scheme. ---
 
 	TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStreaming::FChunkRecord> ChunkRecords;
+
+	// Phase 3 bucketed eviction (-VoxelBucketedExitScan; see VoxelEvictionIndex.h
+	// for the whole argument). A (Level, ChunkX>>2, ChunkY>>2) bucket index over
+	// EXACTLY the keys in the map above, so RecomputeDesiredSet's exit scan can
+	// walk the buckets straddling a ring edge instead of all 271,549 records.
+	//
+	// IT MUST BE UPDATED FROM EVERY SITE THAT ADDS TO OR REMOVES FROM
+	// ChunkRecords, and there are exactly four today: the two adds in
+	// AddCandidate (adoption and fresh admission), DropFarthestOverCap's drop,
+	// and DrainUnloads' remove. A fifth added without a hook here does not
+	// crash -- the world silently stops evicting those chunks -- so the index
+	// checks Num() against ChunkRecords.Num() on every scan and logs an Error
+	// on drift. Inert (every method returns immediately) unless the switch is on.
+	VoxelStreaming::FVoxelEvictionIndex EvictionIndex;
 
 	// --- S2-3: parked geometry (docs/speculative-generation-plan.md Wave S2) --
 	//
@@ -11718,12 +11733,39 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// else. See ThisFrameExitScanMs' doc comment for what the old number
 	// bundled in.
 	const double ExitWalkT0 = FPlatformTime::Seconds();
-	for (auto& Pair : ChunkRecords)
+	// PHASE 3, BUCKETED EVICTION (2026-08-23). The verdict below is a pure
+	// function of (Level, ChunkX, ChunkY) and the anchor's XY for every record
+	// that is not bDeepAnchorRelative, so most of this walk re-derives "keep"
+	// for ground that has not moved relative to a ring edge since the last
+	// call. VoxelEvictionIndex.h buckets the records on (Level, ChunkX>>2,
+	// ChunkY>>2) -- TileCensusSinceLog's existing tile key, not a second
+	// spelling of it -- and offers only the buckets that straddle one. The
+	// whole argument, including why this contradicts docs/status.md's "did not
+	// make the exit scan bucketed" note (that was reasoned at tracked ~= 10k;
+	// the marcher-era figure is 271,549), lives in that header.
+	//
+	// THE BODY IS A LAMBDA SO THE TWO ARMS CANNOT DRIFT. Duplicating it into
+	// the switched path would leave two copies of the retention stamp, the
+	// cause split and the PendingUnloadSet early-out to keep in step, which is
+	// the exact bug class this file spends most of its comments on. The control
+	// arm below is the original `for (auto& Pair : ChunkRecords)` calling the
+	// same lambda -- same arithmetic, same order, same doubles, and the index
+	// is not even populated (its mutation hooks return immediately when the
+	// switch is off), so the control arm carries no cost from this change at
+	// all.
+	//
+	// NOT DONE, DELIBERATELY: the PendingUnloadSet early-out stays at the TOP,
+	// where it has always been, even though it is provably equivalent to test
+	// it inside the evict branch (nothing above that branch has a side effect)
+	// and that would save a hash lookup per examined record. Dropping or moving
+	// it is how the retention stamp re-applies and extends the safety cap
+	// indefinitely; it is not worth risking on the same commit that changes
+	// which records are examined. Separate lever, separate measurement.
+	auto ExitVisitRecord = [&](const FVoxelLevelChunkKey& LevelKey, VoxelStreaming::FChunkRecord& Rec)
 	{
-		const FVoxelLevelChunkKey& LevelKey = Pair.Key;
 		if (PendingUnloadSet.Contains(LevelKey))
 		{
-			continue;
+			return;
 		}
 		const double ChunkEdge = ExitChunkEdgeUU[LevelKey.Level];
 		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
@@ -11750,7 +11792,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// player surfaced, since their footprint is still well inside its ring.
 		// Same hysteresis shape as the outer XY edge (UnloadRingMultiplier).
 		bool bBeyondVertical = false;
-		if (Pair.Value.bDeepAnchorRelative)
+		if (Rec.bDeepAnchorRelative)
 		{
 			const double KeepUU = VoxelUnderground::VerticalKeepUU(LevelKey.Level, ChunkEdge);
 			const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
@@ -11768,7 +11810,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			// cover it; retaining would only delay cleanup). A zero-quad chunk
 			// shows nothing, so there is no hole to bridge -- also not retained.
 			const bool bLodTransition = bBeyondOuter || bInsideInner;
-			auto& Rec = Pair.Value;
+			// (`Rec` is the visitor's record parameter -- Phase 3 turned this
+			// body into a lambda; it was `auto& Rec = Pair.Value;` here.)
 			// WAVE 1.2b WAS TRIED HERE AND REVERTED. THE MEASUREMENT IS THE
 			// REASON, AND IT IS RECORDED SO THE IDEA IS NOT RE-ATTEMPTED BLIND.
 			//
@@ -11855,6 +11898,36 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			PendingUnloadSet.Add(LevelKey);
 			EvictedThisCall.Add(LevelKey);
 		}
+	};
+	// Latched in a static, not read per call: -ExecCmds cvars land after
+	// streaming has begun, so a cvar would flip this mid-run with a
+	// half-populated index behind it -- the one state the structure has no
+	// defined behaviour for. Same convention as HierarchicalCoverageEnabled and
+	// InnerHysteresisChunks.
+	static const bool bBucketedExitScan = VoxelStreaming::EvictionIndexEnabled();
+	if (bBucketedExitScan)
+	{
+		// The scan reads the SAME hoisted per-level tables and the SAME anchor
+		// the per-record test above reads -- passed by pointer, not copied --
+		// so there is no way for the bucket bound and the record verdict to
+		// disagree about where a ring edge is. That is the project's hardest
+		// constraint on this function (admit and evict must see one anchor, or
+		// the tripwires below stop protecting the 11,779 unloads/s churn band)
+		// expressed as a type rather than as a comment.
+		VoxelStreaming::FEvictScanParams ScanParams;
+		ScanParams.Anchor = Anchor;
+		ScanParams.ChunkEdgeUU = ExitChunkEdgeUU;
+		ScanParams.UnloadOuterUUSq = ExitUnloadOuterUUSq;
+		ScanParams.InnerEvictUUSq = ExitInnerEvictUUSq;
+		ScanParams.bHierarchicalCoverage = bHierarchicalCoverage;
+		EvictionIndex.ForEachEvictCandidate(ScanParams, ChunkRecords, ExitVisitRecord);
+	}
+	else
+	{
+		for (auto& Pair : ChunkRecords)
+		{
+			ExitVisitRecord(Pair.Key, Pair.Value);
+		}
 	}
 	// Timer split (2026-08-23): the record walk ends here; the queue filter
 	// below is O(evictions x queue depth in the worst case) and scales with a
@@ -11863,6 +11936,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// not say which of those two populations a regression lives in.
 	const double ExitWalkT1 = FPlatformTime::Seconds();
 	ThisFrameExitScanMs = float((ExitWalkT1 - ExitWalkT0) * 1000.0);
+	// Phase 3 census ("did work actually move?"): examined= vs tracked= per 5 s
+	// window. OUTSIDE the timer on purpose -- see MaybeLogCensus. No-op unless
+	// the switch is on.
+	EvictionIndex.MaybeLogCensus();
 
 	// Drop the just-evicted keys from the two pending queues in ONE filtering
 	// pass instead of a TArray::RemoveSingle per eviction. RemoveSingle is a
@@ -12562,6 +12639,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 							Adopted.GenerationId = Parked->GenerationId;
 							Adopted.LastQuadCount = Parked->QuadCount;
 							Adopted.bDeepAnchorRelative = bDeepAnchorRelative;
+							// Phase 3 hook 1 of 4 (adoption re-admits a parked
+							// chunk). Paired with the ChunkRecords.Add above;
+							// see EvictionIndex's declaration for what a
+							// missing hook costs. No-op unless the switch is on.
+							EvictionIndex.Insert(LevelKey, bDeepAnchorRelative);
 							// SETTLED, and that is the point: the geometry is
 							// final and on screen the moment the table entry is
 							// restored, so this record can immediately release a
@@ -12762,6 +12844,13 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					++LevelRecordsAdded[QueueLevel];
 					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
 					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
+					// Phase 3 hook 2 of 4 (fresh admission -- THE admission).
+					// Placed against the flag write rather than the Add
+					// because the index needs both, and bDeepAnchorRelative is
+					// immutable from here on, which is what lets the index
+					// decide once whether this record can ever need the
+					// vertical test.
+					EvictionIndex.Insert(LevelKey, bDeepAnchorRelative);
 					// The absent-annotation writer (voxel.March.HoleStats 2):
 					// this is THE admission -- the one moment "admitted, not
 					// yet resident" becomes true -- so the march index's cell
@@ -13027,6 +13116,9 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 			    !PendingUnloadSet.Contains(Entry.Key))
 			{
 				ChunkRecords.Remove(Entry.Key);
+				// Phase 3 hook 3 of 4 (bounded admission drops a queued record
+				// that never meshed). No-op unless the switch is on.
+				EvictionIndex.Remove(Entry.Key);
 				// Un-admission (voxel.March.HoleStats 2): this chunk never
 				// generated and is no longer wanted, so a still-standing
 				// "pending" annotation would charge future misses here to
@@ -18478,6 +18570,12 @@ void FVoxelWorldImpl::DrainUnloads()
 			ReleaseChunkBricks(Key);
 		}
 		ChunkRecords.Remove(Key);
+		// Phase 3 hook 4 of 4, and the hot one: this is where thousands of
+		// records can leave in a single call, which is why the index's Remove
+		// is O(1) (per-bucket TSet, no linear scan) -- a linear removal here
+		// would have quietly moved the exit scan's cost into DrainUnloads
+		// instead of removing it. No-op unless the switch is on.
+		EvictionIndex.Remove(Key);
 		// voxel.March.HoleStats 2: a record unloaded BEFORE it ever produced
 		// bricks leaves no pool removal behind, so nothing would ever clear
 		// its "pending" annotation -- do it here. For a chunk that WAS
