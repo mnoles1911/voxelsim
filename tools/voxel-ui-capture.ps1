@@ -62,7 +62,15 @@ param(
     [int]$Height = 1440,
     # Settle before the menu shutter. The background art decodes on a worker
     # and glyphs rasterise lazily, so frame one is a half-built menu.
-    [double]$SettleSec = 2.0
+    [double]$SettleSec = 2.0,
+
+    # Extra engine switches, appended verbatim -- mirrors voxel-capture.ps1's
+    # parameter of the same name. Added for the colour probe: the SRGBTint
+    # A/B needs voxel.UI.SRGBTint=0 SET BEFORE THE MENU PAINTS, and
+    # -dpcvars applies at engine init where -ExecCmds may land after the
+    # style has already baked its colours. Example:
+    #   toolsoxel-ui-capture.ps1 -Shot Menu -ExtraArgs '-dpcvars=voxel.UI.SRGBTint=0'
+    [string[]]$ExtraArgs = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,6 +147,8 @@ switch ($Shot) {
                       '-VoxelMenuWatchdog=300')
     }
 }
+
+if ($ExtraArgs) { $argList += $ExtraArgs }
 
 Write-Host ''
 Write-Host '=== voxel-ui-capture =========================================='
