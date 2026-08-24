@@ -31,6 +31,16 @@
 //       top-level one) must produce a NEGATIVE residual, not a small positive
 //       one -- double-counted shares are the harder bug and an absolute value
 //       would hide them.
+//   C1  the radial census predictor is bounded: never more than the cells
+//       seen, and monotone in the budget.
+//   C2  admissions in an OUTER crescent -- what steady flight produces, since
+//       the resident interior admits nothing -- make the budget stop save
+//       almost NOTHING. The predictor must say so. That is the answer the
+//       feature would rather not give, and a predictor that cannot give it is
+//       not a predictor.
+//   C3  a budget that never binds predicts EVERY cell, not zero. A predictor
+//       returning 0 for a disabled feature would report an infinite speedup.
+//
 //   P3  "never ran" and "ran and cost nothing" are distinguishable. Both print
 //       0.00 ms; only the call count separates them, and three lanes in this
 //       codebase have already been found inert because it did not.
@@ -205,7 +215,18 @@ static void TestStopRuleConservative(int Span, int Budget)
 // ---------------------------------------------------------------------------
 // R5 -- the measurement, printed not asserted.
 // ---------------------------------------------------------------------------
-static void ReportSaving(int Span, double InnerChunks, double OuterChunks, int Budget)
+// AdmitEveryNth is the admission DENSITY: 1 means every visited cell admits
+// (a fully cold ring -- the best case for the budget stop), 16 means one in
+// sixteen does, which is what the legs actually show (423-465 admissions per
+// scan over ~7,225 cells = 5.9-6.4%).
+//
+// This parameter exists because its absence produced a WRONG PUBLISHED NUMBER.
+// The first version of this function admitted on every cell and printed
+// "11.3x fewer"; that is the cold-ring bound, not the steady-state answer, and
+// at the measured density the same configuration gives 1.6x. A harness that
+// can only model the flattering case is not a harness.
+static void ReportSaving(int Span, double InnerChunks, double OuterChunks, int Budget,
+                         int AdmitEveryNth)
 {
 	const VoxelRingOrder::FTable* T = VoxelRingOrder::Get(Span);
 	if (!T) { return; }
@@ -221,12 +242,16 @@ static void ReportSaving(int Span, double InnerChunks, double OuterChunks, int B
 			break;
 		}
 		++Visited;
-		if (LatchRSq < 0 && ++Admitted >= Budget) { LatchRSq = T->RadiusSqAt(I); }
+		if (LatchRSq < 0 && (Visited % AdmitEveryNth) == 0 && ++Admitted >= Budget)
+		{
+			LatchRSq = T->RadiusSqAt(I);
+		}
 	}
 	const int Square = T->Num();
-	std::printf("      span=%-4d inner=%-6.1f outer=%-6.1f budget=%-5d  square=%-8d "
-	            "window=%-8d visited=%-7d  %.1fx fewer\n",
-	            Span, InnerChunks, OuterChunks, Budget, Square, W.End - W.Begin, Visited,
+	std::printf("      span=%-3d inner=%-5.1f outer=%-5.1f budget=%-6d 1-in-%-3d  square=%-6d "
+	            "window=%-6d visited=%-6d  %.2fx\n",
+	            Span, InnerChunks, OuterChunks, Budget, AdmitEveryNth, Square,
+	            W.End - W.Begin, Visited,
 	            Visited > 0 ? double(Square) / double(Visited) : 0.0);
 }
 
@@ -407,6 +432,74 @@ static void TestRecomputeProfile()
 	std::printf("      profile: 8 named stages, residual signed, N kept beside every Ms\n");
 }
 
+// ---------------------------------------------------------------------------
+// C1, C2, C3 -- the radial census predictor.
+// ---------------------------------------------------------------------------
+static void TestRadialCensus()
+{
+	using namespace VoxelRingOrder;
+	const int32_t Span = 42;
+	const int32_t MaxRSq = 2 * Span * Span;
+
+	// Spread: admissions uniform through the disc -- the cold-fill shape.
+	FRadialCensus Spread;
+	Spread.MaxRadiusSq = MaxRSq;
+	// Outer crescent: admissions ONLY in the far bands -- the steady-flight
+	// shape, where the resident interior admits nothing.
+	FRadialCensus Crescent;
+	Crescent.MaxRadiusSq = MaxRSq;
+
+	const FTable* T = Get(Span);
+	Check(T != nullptr, "census: table available");
+	if (!T) { return; }
+	for (int32_t I = 0; I < T->Num(); ++I)
+	{
+		const int32_t RSq = T->RadiusSqAt(I);
+		const int32_t B = FRadialCensus::BandOf(RSq, MaxRSq);
+		Spread.Note(RSq, (I % 16) == 0);
+		Crescent.Note(RSq, B >= kCensusBands - 4 && (I % 3) == 0);
+	}
+	Check(Spread.TotalCells() == T->Num(), "C1 census sees every cell");
+	Check(Crescent.TotalCells() == T->Num(), "C1 census sees every cell (crescent)");
+	Check(Spread.TotalAdmits() > 0 && Crescent.TotalAdmits() > 0, "C1 both have admissions");
+
+	const int64_t Budget = 256;
+	const int64_t VS = PredictBudgetStopVisited(Spread, Budget);
+	const int64_t VC = PredictBudgetStopVisited(Crescent, Budget);
+
+	Check(VS >= 0 && VS <= Spread.TotalCells(), "C1 spread prediction is bounded");
+	Check(VC >= 0 && VC <= Crescent.TotalCells(), "C1 crescent prediction is bounded");
+
+	// C2: the crescent must predict a strictly worse saving than the spread,
+	// and specifically NO saving at all -- the budget is only reached in the
+	// last bands, so the walk has already visited everything by then. If the
+	// predictor could not produce this answer it would be blind to the case
+	// that decides whether the budget stop is worth anything.
+	Check(VC > VS, "C2 an outer crescent predicts a worse saving than a spread");
+	Check(VC == Crescent.TotalCells(),
+	      "C2 an outer-crescent admission profile defeats the budget stop ENTIRELY");
+	std::printf("      radial census (span=%d budget=%lld): spread visits %lld of %lld (%.1fx), "
+	            "outer crescent visits %lld (%.1fx)\n",
+	            Span, (long long)Budget, (long long)VS, (long long)Spread.TotalCells(),
+	            double(Spread.TotalCells()) / double(VS ? VS : 1), (long long)VC,
+	            double(Crescent.TotalCells()) / double(VC ? VC : 1));
+
+	// C3: no budget means every cell, never zero.
+	Check(PredictBudgetStopVisited(Spread, 0) == Spread.TotalCells(),
+	      "C3 a budget that never binds predicts every cell, not zero");
+	Check(PredictBudgetStopVisited(Spread, 1 << 30) == Spread.TotalCells(),
+	      "C3 an unreachable budget predicts every cell");
+
+	// Monotone in the budget: a bigger budget can never visit fewer cells.
+	int64_t Prev = 0;
+	for (int64_t B = 8; B <= 4096; B *= 2)
+	{
+		const int64_t V = PredictBudgetStopVisited(Spread, B);
+		Check(V >= Prev, "C1 prediction is monotone in the budget");
+		Prev = V;
+	}
+}
+
 int main()
 {
 	std::printf("VoxelRingOrder / VoxelEditedLaneGate -- standalone checks\n\n");
@@ -428,14 +521,26 @@ int main()
 	TestStopRuleConservative(42, 512);
 
 	std::printf("  R5 saving (measurement, not an assertion)\n");
-	ReportSaving(42, 0.0, 42.0, 512);   // level 0: no inner pad, budget binds
-	ReportSaving(42, 0.0, 42.0, 128);
-	ReportSaving(42, 21.0, 42.0, 512);  // a coarse ring: inner pad plus budget
-	ReportSaving(42, 21.0, 42.0, 1 << 30); // inner pad and corners only, no budget
-	ReportSaving(61, 30.0, 61.0, 512);
+	std::printf("      -- COLD RING (every visited cell admits): the upper bound --\n");
+	ReportSaving(42, 0.0, 42.0, 512, 1);
+	ReportSaving(42, 0.0, 42.0, 128, 1);
+	ReportSaving(42, 21.0, 42.0, 512, 1);
+	ReportSaving(61, 30.0, 61.0, 512, 1);
+	std::printf("      -- MEASURED DENSITY (1 admission per 16 cells, from the legs) --\n");
+	ReportSaving(42, 0.0, 42.0, 512, 16);
+	ReportSaving(42, 0.0, 42.0, 256, 16);
+	ReportSaving(42, 21.0, 42.0, 256, 16);
+	ReportSaving(61, 30.0, 61.0, 256, 16);
+	std::printf("      -- NO BUDGET EVER LATCHING: the window bound alone, the FLOOR --\n");
+	ReportSaving(42, 0.0, 42.0, 1 << 30, 1);
+	ReportSaving(42, 21.0, 42.0, 1 << 30, 1);
+	ReportSaving(61, 30.0, 61.0, 1 << 30, 1);
 
 	std::printf("  E1/E2 edited-footprint lane gate\n");
 	TestEditedLaneGate();
+
+	std::printf("  C1/C2/C3 radial census predictor\n");
+	TestRadialCensus();
 
 	std::printf("  P1/P2/P3 recompute profile reconciliation\n");
 	TestRecomputeProfile();

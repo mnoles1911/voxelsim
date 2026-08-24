@@ -430,6 +430,18 @@ struct FVoxelResidencyGpu::FImpl
 	FStats Total; // lifetime
 	int32 AuditMismatchStreak = 0;
 	double LastLogSeconds = 0.0;
+	double LastWindowSeconds = 0.0; // the REAL span of the window just closed
+	// THE WINDOW IS NOT 5 SECONDS (2026-08-23). This logger gated on a
+	// hardcoded 5.0 while every flight leg passes -VoxelPerfLogInterval=2, so
+	// its windows and the LogVoxelPerf windows were 2.5x apart and any
+	// side-by-side reading of the two families -- "prop per window" against
+	// "recompute per window" -- was wrong by that factor. This is the same
+	// defect the lane holder found in MaybeLogCounters' `WindowMs = 5000.0`
+	// divisor, in a second place, which is why the interval is now READ rather
+	// than assumed and the real elapsed seconds are PRINTED on the line. A
+	// window whose length is asserted rather than measured is a denominator
+	// nobody checks.
+	double LogIntervalSeconds = 0.0; // 0 = not latched yet
 	// Anchor of the most recent OnRecomputeBegin, and its value at the last
 	// log flush: their XY distance prints on the live line as move=, which is
 	// what makes an all-zero window READABLE ON ITS OWN. Zero proposals with
@@ -1729,10 +1741,21 @@ struct FVoxelResidencyGpu::FImpl
 			LastLogSeconds = Now;
 			return;
 		}
-		if (Now - LastLogSeconds < 5.0)
+		if (LogIntervalSeconds <= 0.0)
+		{
+			// Same source the perf logger reads, latched once. Falls back to 5 s
+			// only when the switch is absent, which is also what the perf lines
+			// do, so the two families stay on the same window by construction
+			// instead of by coincidence.
+			float Interval = 0.f;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfLogInterval="), Interval);
+			LogIntervalSeconds = Interval > 0.f ? double(Interval) : 5.0;
+		}
+		if (Now - LastLogSeconds < LogIntervalSeconds)
 		{
 			return;
 		}
+		LastWindowSeconds = Now - LastLogSeconds;
 		LastLogSeconds = Now;
 		// Nothing moved and nothing pending: stay quiet (idle menus etc.).
 		// SkippedUnderground and the two live CPU-fallback lanes join the quiet
@@ -1749,7 +1772,7 @@ struct FVoxelResidencyGpu::FImpl
 			return;
 		}
 		UE_LOG(LogVoxelResidGpu, Log,
-		       TEXT("[gpu-resid] disp=%llu skipFull=%llu skipUG=%llu uncmp=%llu inflight=%d | ")
+		       TEXT("[gpu-resid] win=%.1fs disp=%llu skipFull=%llu skipUG=%llu uncmp=%llu inflight=%d | ")
 		       TEXT("gpu: admit=%llu evict=%llu res=%llu cold=%llu orphan=%llu ovf=%llu | ")
 		       TEXT("enum: candV=%llu zV=%llu cutRej=%llu budRej=%llu histTot=%llu ")
 		       TEXT("exitV=%llu | ")
@@ -1758,7 +1781,7 @@ struct FVoxelResidencyGpu::FImpl
 		       TEXT("adOvf=%llu extra=%llu resOK=%llu resMiss=%llu | fb: staged=%llu ")
 		       TEXT("applied=%llu dropped=%llu collide=%llu residual=%d | audit: pass=%llu ")
 		       TEXT("fail=%llu cpu=%lld gpu=%lld | records~%lld"),
-		       Since.Dispatches, Since.SkippedInFlight, Since.SkippedUnderground,
+		       LastWindowSeconds, Since.Dispatches, Since.SkippedInFlight, Since.SkippedUnderground,
 		       Since.Uncompared, InFlight.Num(), Since.GpuAdmit, Since.GpuEvict,
 		       Since.GpuResurrect, Since.GpuCold, Since.GpuOrphan, Since.Overflows,
 		       Since.GpuCandVisited, Since.GpuZVisited, Since.GpuCutoffRej, Since.GpuBudgetRej,
@@ -1865,14 +1888,14 @@ struct FVoxelResidencyGpu::FImpl
 				FVector2D(LastDispatchAnchor.X - LogWindowAnchor.X,
 			              LastDispatchAnchor.Y - LogWindowAnchor.Y).Size();
 			UE_LOG(LogVoxelResidGpu, Log,
-			       TEXT("[gpu-resid] live: move=%.0fuu delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
+			       TEXT("[gpu-resid] live: win=%.1fs move=%.0fuu delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
 			       TEXT("ad: prop=%u adOK=%u adopt=%u res=%u stale=%u rejFine=%u rejBud=%u ")
 			       TEXT("rejCut=%u | ev: prop=%u q=%u VETO=%u stale=%u resid=%u | cold: prop=%u ")
 			       TEXT("enum=%u defer=%u | edit: enum=%u full=%u dirty=%u skip=%u defer=%u | ")
 			       TEXT("fallback: cpuCalls=%u firstScans=%u ")
 			       TEXT("ug=%llu resync=%llu | ")
 			       TEXT("ms ev=%.2f ad=%.2f"),
-			       MoveUU, Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
+			       LastWindowSeconds, MoveUU, Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
 			       L.NoDeltaCalls, L.AdmitProposals, L.AdmitAdmitted, L.AdmitAdopted,
 			       L.AdmitResurrected, L.AdmitStale, L.AdmitRejFine, L.AdmitRejBudget,
 			       L.AdmitRejCutoff, L.EvictProposals, L.EvictQueued, L.EvictVetoed,

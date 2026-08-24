@@ -251,4 +251,126 @@ namespace VoxelRingOrder
 		const double R = std::sqrt(double(LatchRSq)) + 2.0 * kHalfDiag;
 		return int32_t(std::ceil(R * R));
 	}
+
+	// =======================================================================
+	// FRadialCensus -- WHERE IN RADIUS THE ADMISSIONS ACTUALLY SIT
+	// =======================================================================
+	// WHY THIS EXISTS, and it is a refusal turned into a measurement.
+	//
+	// The least-squares fit over three legs (docs/entry-half-arithmetic-
+	// 2026-08-23.md) says entryMs is ~6.8 ms PER SCAN and that the
+	// per-rejection term is not identifiable: adding it changes R^2 by
+	// 0.0000. So the cost is per-CELL work, ~940 ns of it, and the only lever
+	// on the entry half is CELLS VISITED PER SCAN.
+	//
+	// WindowFor's saving (inner disc + corners) is therefore predictable from
+	// geometry alone -- 1.25x at level 0, 1.6x with an inner pad, measured.
+	// The BUDGET STOP's saving is not, and the difference between the two is
+	// large: if admissions are spread through the disc the stop fires early
+	// and the walk collapses (11.3x measured in the test harness), and if they
+	// sit in an outer crescent -- which is what steady flight produces, since
+	// the resident interior admits nothing -- the stop fires late and saves
+	// almost nothing.
+	//
+	// NOTHING IN ANY LOG SAYS WHICH. So this counts it: cells and admissions
+	// per equal-area radius band, per level, per window. PredictBudgetStop-
+	// Visited then turns that distribution into the number the ring-ordered
+	// walk would actually visit -- BEFORE the switch is flipped, and as a
+	// PREDICTION the same leg can then falsify against ringSkip/ringStop.
+	//
+	// Bands partition SQUARED radius so they are equal-AREA and a uniform
+	// annulus fills them evenly -- the same reason the GPU admission
+	// histogram does it that way.
+	//
+	// FAILING READINGS, BOTH WAYS:
+	//   every admission in band 0        -> the census is being fed the
+	//                                       anchor cell's radius for every
+	//                                       cell; the band math is not wired.
+	//   Cells all zero with entryMs > 0  -> the census is outside the loop it
+	//                                       claims to describe.
+	//   admissions concentrated in the
+	//     OUTERMOST band                 -> a true and unwelcome answer: the
+	//                                       budget stop cannot help, and
+	//                                       -VoxelRingOrderScan is worth only
+	//                                       its window bound. This is the
+	//                                       reading the feature would rather
+	//                                       not produce, which is exactly why
+	//                                       it must be able to.
+	constexpr int32_t kCensusBands = 32;
+
+	struct FRadialCensus
+	{
+		int64_t Cells[kCensusBands] = {};
+		int64_t Admits[kCensusBands] = {};
+		int32_t MaxRadiusSq = 1; // the scan square's corner, set once per scan
+
+		static int32_t BandOf(int32_t RadiusSq, int32_t InMaxRadiusSq)
+		{
+			if (InMaxRadiusSq <= 0) { return 0; }
+			int64_t B = (int64_t(RadiusSq) * kCensusBands) / InMaxRadiusSq;
+			if (B < 0) { B = 0; }
+			if (B >= kCensusBands) { B = kCensusBands - 1; }
+			return int32_t(B);
+		}
+
+		void Note(int32_t RadiusSq, bool bAdmitted)
+		{
+			const int32_t B = BandOf(RadiusSq, MaxRadiusSq);
+			++Cells[B];
+			if (bAdmitted) { ++Admits[B]; }
+		}
+
+		void Add(const FRadialCensus& O)
+		{
+			for (int32_t I = 0; I < kCensusBands; ++I)
+			{
+				Cells[I] += O.Cells[I];
+				Admits[I] += O.Admits[I];
+			}
+		}
+
+		int64_t TotalCells() const
+		{
+			int64_t T = 0;
+			for (int32_t I = 0; I < kCensusBands; ++I) { T += Cells[I]; }
+			return T;
+		}
+		int64_t TotalAdmits() const
+		{
+			int64_t T = 0;
+			for (int32_t I = 0; I < kCensusBands; ++I) { T += Admits[I]; }
+			return T;
+		}
+	};
+
+	// How many cells a distance-ordered, budget-stopped walk would visit,
+	// given where this census says the admissions are.
+	//
+	// The walk stops one band PAST the band in which the budget is reached:
+	// StopRadiusSqAfterLatch continues to sqrt(latch) + 2h, and one band is a
+	// conservative cover for that at 32 bands over a scan square. Over-
+	// predicting the visit count is the safe direction -- it under-claims the
+	// saving, and a feature's own predictor must never round in its favour.
+	//
+	// Budget <= 0 means the budget never binds, so the answer is every cell
+	// the census saw -- NOT zero. A predictor that returns 0 for "no budget"
+	// would report an infinite speedup for a disabled feature.
+	inline int64_t PredictBudgetStopVisited(const FRadialCensus& C, int64_t Budget)
+	{
+		const int64_t Total = C.TotalCells();
+		if (Budget <= 0) { return Total; }
+		int64_t Cells = 0;
+		int64_t Admits = 0;
+		for (int32_t B = 0; B < kCensusBands; ++B)
+		{
+			Cells += C.Cells[B];
+			Admits += C.Admits[B];
+			if (Admits >= Budget)
+			{
+				if (B + 1 < kCensusBands) { Cells += C.Cells[B + 1]; } // the overrun band
+				return Cells < Total ? Cells : Total;
+			}
+		}
+		return Total; // the budget was never reached: the walk ran to the end
+	}
 } // namespace VoxelRingOrder
