@@ -6,6 +6,40 @@ If a figure cannot be traced to a line below, it does not belong on this page.
 Updated 2026-08-24. Baseline column = what the OWNER experiences (stock editor,
 no extra flags). "Armed" = our leg config, which he does not run.
 
+> ## THE TWO COLUMNS BELOW SWAPPED MEANING AT c52b2d2 — READ THIS FIRST
+>
+> **The owner decided to arm the GPU-primary set as shipping defaults**, so as
+> of that commit the "armed" column IS what a stock editor with no extra flags
+> runs. The "baseline (stock)" column is now HISTORICAL — it describes a
+> configuration reachable only by passing `-VoxelGpuPrimary=0` explicitly.
+> **Numbers in the table below have NOT yet been re-measured on the new
+> default**; the re-measurement is the next leg. Do not quote the baseline
+> column as "what the owner experiences" until this note is removed.
+>
+> **One flag, eleven behaviours.** `-VoxelGpuPrimary` is not one switch: it
+> implies the GPU mesh fork ON, and re-points `GpuMeshInFlight` 256 -> 1024,
+> `DispatchAheadCap` 0 -> 4096, `MeshBatchCap` **4 -> 64**, `MeshHarvestCap`
+> 8 -> 0, and `LeanBrickJobs` OFF -> ON. The four sibling flags
+> (`PoolAlloc`, `WorldGenBatch`, `StackClaim`, `RasterAtlas`) are armed
+> alongside it. **Any sweep of one of those constants must now start from the
+> primary-implied value, not the cvar default** — `MeshBatchCap`'s stock is
+> **64**, not 4. This is the "three caps in series make a throughput number
+> unattributable" hazard at a scale of eleven, and it is the price of shipping
+> the block the measurements were taken on.
+>
+> **Atlas fill mode 3 (async) is NOT part of the set and stays OFF.** Arming
+> the atlas master switch must never imply mode 3; if it ever does, that is a
+> defect, not a tuning decision.
+>
+> **UNRESOLVED, AND IT OUTRANKS THE HEADLINE.** The matched leg behind the
+> armed column (recorded in the body of `VoxelGpuPrimaryEnabled()`) reports
+> `holes` **0 -> 10** and `R0` **6.4 s -> 16.4 s** under arming. Those are the
+> two OWNER-VISIBLE DEFECTS below. The owner accepted this trade having been
+> told the set *fixes* the arcs; on that leg it worsens them and de-prioritises
+> the near ring he named first. Settling this is the first job of the next leg,
+> and its failing readings are written into the code both ways so the leg can
+> come out either way.
+
 ---
 
 ## THE THREE GOALS
