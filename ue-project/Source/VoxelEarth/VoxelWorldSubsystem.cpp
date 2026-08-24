@@ -12,6 +12,7 @@
 #include "VoxelBrickPool.h"        // P2: the resident brick volume both mesh arms now publish into
 #include "VoxelBrickCpuPackFromCore.h" // Phase 6: the ONE vxc::ChunkBrickPack -> FVoxelBrickCpuPack copy, shared with the cover producer
 #include "VoxelApplyBatch.h" // apply's per-chunk worldgen sampling, behind -VoxelApplyFast=
+#include "VoxelFramePhase.h" // Goal 3: frame distribution segmented at the cold-settle boundary
 #include "VoxelMarchRenderer.h"    // VoxelMarchPublishStreamingState -- the marcher's convergence signal
 #include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
 #include "VoxelResidencyGpu.h"     // T4-2: GPU-resident residency shadow (docs/gpu-residency-t42-plan.md)
@@ -9513,6 +9514,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// given window's ticks are all summed before the log that reports them --
 	// consistent, not lagged, because the reset happens in the same call).
 	AccumTickMs += TickMsSoFar;
+	// GOAL 3 HOOK 1. Every frame, not just hitch frames: the >100 FPS target is
+	// a distribution claim about SETTLED play, and a hitch-gated feed can only
+	// ever describe frames that already exceeded 33.3 ms. Histogram, so this
+	// costs one bin increment and cannot start dropping samples on a long leg.
+	VoxelFramePhase::NoteFrame(double(TickMsSoFar), ThisFrameAppliesFromWorker);
 
 	// Constraint: "keep all debug work zero-cost when voxel.Debug=0 (branch
 	// out early)" -- FVoxelPerfSnapshot collection (array iteration, once/sec
@@ -10000,6 +10006,12 @@ void FVoxelWorldImpl::TickColdSettleProbe()
 		// SETTLED. The hold is excluded: T is when the world stopped CHANGING,
 		// not when we finished waiting to believe it.
 		const double SettleT = LastActivity - ColdStartSeconds;
+		// GOAL 3 HOOK 2. The segment boundary is TOLD, from the settle line
+		// itself, not guessed from apply volume -- the whole point of the
+		// instrument is that `post-warmup (t>=10s)` opened at 10 s while this
+		// leg settles at ~21 s, so eleven seconds of authorised cold-fill
+		// hitching were being averaged into the settled p95.
+		VoxelFramePhase::NoteSettled(SettleT);
 		FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel cold settle: SETTLED t=%.1fs jobs=%lld mean=%.0f/s (hold=%.1fs excluded) | %s ")

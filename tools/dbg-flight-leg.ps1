@@ -113,6 +113,9 @@ param(
     # the block below the param() for why arming it is the default and what it
     # cost when it was not.
     [switch]$NoCoverageVerify,
+    # Same reasoning as -NoCoverageVerify: silencing the Goal 3 instrument is a
+    # decision someone has to type.
+    [switch]$NoFramePhase,
     [switch]$KeepEditLog,
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
     # Keep Epic's MCP server up for this leg (default: off, see below).
@@ -170,6 +173,42 @@ if (-not $NoCoverageVerify) {
     Write-Host "  coverage verify ARMED (holes= on the streaming line)"
 } else {
     Write-Host "  coverage verify DISARMED by -NoCoverageVerify -- this leg cannot report a hole" -ForegroundColor Yellow
+}
+
+# ============================================================================
+# THE GOAL 3 INSTRUMENT IS ARMED ON EVERY LEG
+# ============================================================================
+#
+# The owner's third goal is ">100 FPS after cold start settles". Until
+# -VoxelFramePhase existed, every frame figure this campaign produced blended
+# two regimes: the log's `post-warmup (t>=10s)` bucket opens at t=10 s while a
+# leg settles at ~21 s, so ELEVEN SECONDS of cold-fill storm -- the regime where
+# hitches are explicitly authorised -- were averaged into the same p95 as ~270 s
+# of settled play. That is why the baseline reads p95=30.62 ms against
+# p50=9.84 ms. No leg taken before this switch can support a >100 FPS claim.
+#
+# -VoxelFramePhase=1 segments the frame histogram at the ACTUAL cold-settle
+# boundary, told by the settle line itself rather than guessed from apply
+# volume. It is a histogram (4.4 KB at any leg length, so a long leg cannot
+# silently start dropping samples) and it prints its bin width beside every
+# percentile, because p95 is judged against a 10.00 ms gate and a reader has to
+# see that 0.10 ms is 1% of that.
+#
+# Armed by default for the reason CoverageVerify is: a gated instrument nobody
+# remembers to arm is this project's eleven-inert-features failure, and Goal 3
+# requires EVERY leg to report its settled segment.
+#
+# FAILING READINGS: no `Voxel frame dist` line at all = the hooks are not in
+# the build. `SETTLED total: n=0` = the leg never settled, or hook 2 is missing
+# -- and NO >100 FPS CLAIM MAY BE MADE FROM SUCH A LEG in either case. Never
+# report fill-segment numbers under a settled heading.
+if (-not $NoFramePhase) {
+    if ($ExtraArgs -notmatch 'VoxelFramePhase') {
+        $ExtraArgs = @($ExtraArgs) + @('-VoxelFramePhase=1')
+    }
+    Write-Host "  frame phase ARMED (settled-segment p50/p95/p99 -- Goal 3)"
+} else {
+    Write-Host "  frame phase DISARMED by -NoFramePhase -- this leg cannot support a >100 FPS claim" -ForegroundColor Yellow
 }
 $Project = (Resolve-Path "$PSScriptRoot\..\ue-project\VoxelEarth.uproject").Path
 $LogPath = Join-Path (Resolve-Path "$PSScriptRoot\..").Path "Saved\$LogName.log"
