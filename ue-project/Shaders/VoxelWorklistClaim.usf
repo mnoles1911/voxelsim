@@ -65,6 +65,22 @@
 #ifndef VXC_WORKLIST_MATWORDS_PER_RECORD
 #error "VXC_WORKLIST_MATWORDS_PER_RECORD not defined -- dispatch these kernels only through the FVoxelWorklistClaim* shader classes"
 #endif
+#ifndef VXC_WORKLIST_WRITE_RECORD_IN_Y
+#error "VXC_WORKLIST_WRITE_RECORD_IN_Y not defined -- dispatch these kernels only through the FVoxelWorklistClaim* shader classes"
+#endif
+#if VXC_WORKLIST_WRITE_RECORD_IN_Y != 1
+// THE SILENT ONE, WHICH IS WHY IT IS AN #error AND NOT A COMMENT.
+// ClaimWriteWorklistMain takes its record from Gid.y, which is only correct
+// while the args kernel emits {148, Take, 1} for the Write stage. If the host
+// table ever says the record rides X again, Gid.y is 0 for every group: the
+// kernel writes RECORD 0's pool words 148 x Take times and never touches any
+// other record, so every other chunk's volume is left unwritten. Holes, no
+// error, and a throughput number that would look fine. This define and the
+// args kernel's RecordInY table are filled from the SAME host constant
+// (FVoxelGpuWorklist::kWriteRecordInY), so they cannot disagree without this
+// firing at compile time.
+#error "Write stage shape drifted: ClaimWriteWorklistMain reads its record from Gid.y and the args kernel must emit {groups, Take, 1} for the Write triple"
+#endif
 #if VXC_WORKLIST_CLAIM_GROUPS != 1
 #error "Claim stage shape drifted: the claim, desc+record and verify dispatches ride the Record triple at ONE group per record"
 #endif
@@ -175,17 +191,27 @@ void ClaimWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
 // kernels' own worst-case-dispatch decision, kept). Sources are the pack
 // arenas through the claim's spare pair, exactly as the classic copies
 // source; destinations are the claimed pool ranges.
+//
+// THE RECORD RIDES Y, and it is the difference between 26,500 chunks/s and
+// 61,000. A dispatch dimension is capped at 65,535 groups, so while this
+// stage's record rode X the triple was {148 x Take, 1, 1} and a flush could
+// carry at most 442 records -- ~26,500 chunks/s at 60 ticks, the lowest
+// ceiling of any stage and BELOW the 50,000 goal. As {148, Take, 1}, X is a
+// constant 148 and the binding stage becomes whichever 1D stage has the most
+// groups per record (Classify and Pack, at 64) = 1,023 records = ~61,000
+// chunks/s. Gid.x is now the within-record group and Gid.y the record; the
+// #error above locks that against the host's args table.
 // ---------------------------------------------------------------------------
 [numthreads(64, 1, 1)]
 void ClaimWriteWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
 {
-	const uint Rec = Gid.x / VXC_WORKLIST_WRITE_GROUPS;
+	const uint Rec = Gid.y;
 	GpuChunkWorkRecord R;
 	if (worklistClaimFetch(Rec, R) == 0u)
 	{
 		return;
 	}
-	const uint i = (Gid.x % VXC_WORKLIST_WRITE_GROUPS) * 64u + GTid.x;
+	const uint i = Gid.x * 64u + GTid.x;
 	uint Base, Words, SrcFirst;
 	if (i < kWlOccWordsPerRecord)
 	{
