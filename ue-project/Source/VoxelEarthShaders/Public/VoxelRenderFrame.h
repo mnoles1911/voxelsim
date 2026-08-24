@@ -351,6 +351,27 @@ VOXELEARTHSHADERS_API void Touch(FRDGBuilder& GraphBuilder);
 // frame wins.
 VOXELEARTHSHADERS_API void NoteSetupEnd();
 
+// THE SETTLE LATCH, PUBLISHED BY THE GAMEPLAY MODULE RATHER THAN POLLED HERE.
+//
+// This instrument used to latch on VoxelMarchIsStreamConverged(), which needs
+// JobsInFlight==0 AND PendingJobs==0 AND a stable chunk count. On a flight leg
+// that condition is never observed even once: measured across 134 windows, the
+// SETTLED-MOVING and SETTLED-PARKED populations were n=0 in EVERY window while
+// FILL took all 214 frames -- and the frame-phase instrument on the same leg
+// classified 5,174 moving frames. Every render-frame number was therefore filed
+// under cold fill, including the moving population that Goal 3 is about, and a
+// level-2 tail attribution run on it would have produced a confident breakdown
+// of the wrong frames.
+//
+// Verified independent of the admission cap: identical n=0 / FILL=214 at
+// -VoxelAdmissionCapDrainSec=0 and =8, so the queue depth is not the cause.
+//
+// The fix is the one VoxelFramePhase already uses and documents: a ONE-SHOT
+// hook at the cold-settle site, which fires exactly once and cannot be driven
+// back to zero by the streaming a flight causes. Called next to
+// VoxelFramePhase::NoteSettled so the two segmenters cannot disagree again.
+VOXELEARTHSHADERS_API void NoteSettled();
+
 // Per-frame traffic, banked with the sample. A traffic counter before a timing
 // one: if these do not move between parked and moving, no timing difference
 // between them has a mechanism.

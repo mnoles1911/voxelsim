@@ -499,6 +499,24 @@ void FVoxelFluidRenderExtension::PreRenderViewFamily_RenderThread(
 	// nothing at all for the quad control arm -- the exact configuration a
 	// render-frame comparison would want to measure.
 	VoxelRenderFrame::Touch(GraphBuilder);
+
+	// AND THE VIEW ORIGIN, for exactly the reason the anchor above is shared.
+	//
+	// NoteView() lived ONLY in the marcher's extension, which declines
+	// IsActiveThisFrame on a stock leg -- so on the quad path the split's
+	// camera speed stayed 0.0 for every frame, `bMoving` was never true, and
+	// every settled frame was filed as SETTLED-PARKED. That is worse than the
+	// empty population the settle latch produced: measured on M-split, a leg
+	// flying at 23 m/s reported 199 PARKED frames and 0 MOVING ones, so the
+	// PARKED bucket was not missing data, it was MISLABELLED flight.
+	//
+	// Goal 3 is a MOVING-frame goal, so a split that cannot see moving frames
+	// answers a question nobody asked. Publishing here costs one FVector copy
+	// on a hook the quad path already runs.
+	if (InViewFamily.Views.Num() > 0 && InViewFamily.Views[0] != nullptr)
+	{
+		VoxelRenderFrame::NoteView(InViewFamily.Views[0]->ViewMatrices.GetViewOrigin());
+	}
 	VOXEL_RENDER_FRAME_SCOPE(Fluid);
 
 	// Consume the mailbox exactly once; a second view family this frame sims

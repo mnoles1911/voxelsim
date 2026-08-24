@@ -6,6 +6,7 @@
 // reconciliation delta so that a drifting instrument is loud rather than
 // silent.
 
+#include <atomic>
 #include "VoxelRenderFrame.h"
 
 #include "HAL/PlatformProcess.h"
@@ -28,6 +29,10 @@ DEFINE_LOG_CATEGORY_STATIC(LogVoxelRenderFrame, Log, All);
 // 100 UU/s moving threshold instead of inventing one.
 VOXELEARTHSHADERS_API int32 VoxelMarchGetStreamConvergedFrames();
 VOXELEARTHSHADERS_API bool VoxelMarchIsStreamConverged();
+
+// Set once by NoteSettled(), read on the render thread. Atomic because the
+// publisher is the game thread and the consumer is not.
+static std::atomic<bool> GRenderFrameSettledLatch{false};
 
 namespace VoxelRenderFrame
 {
@@ -693,7 +698,11 @@ namespace
 		// flight causes, so a live read would classify the whole flight as
 		// COLD FILL -- and folding the flight into the fill population is
 		// exactly the substitution the segmentation exists to prevent.
-		if (VoxelMarchIsStreamConverged())
+		// Either witness latches it. NoteSettled() is authoritative and fires
+		// once at the cold-settle site; the converged poll is kept as a
+		// fallback for runs that never reach that site (a leg killed early),
+		// but it is NOT sufficient on its own -- see NoteSettled()'s comment.
+		if (GRenderFrameSettledLatch.load(std::memory_order_relaxed) || VoxelMarchIsStreamConverged())
 		{
 			S.bEverSettled = true;
 		}
@@ -948,5 +957,13 @@ void MutateHere(int32 ArmId)
 		return;
 	}
 	BurnMs(LatchedMutateMs());
+}
+} // namespace VoxelRenderFrame
+
+namespace VoxelRenderFrame
+{
+void NoteSettled()
+{
+	GRenderFrameSettledLatch.store(true, std::memory_order_relaxed);
 }
 } // namespace VoxelRenderFrame

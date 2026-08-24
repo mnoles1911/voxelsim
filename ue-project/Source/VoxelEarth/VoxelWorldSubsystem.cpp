@@ -14,6 +14,7 @@
 #include "VoxelApplyBatch.h" // apply's per-chunk worldgen sampling, behind -VoxelApplyFast=
 #include "VoxelFramePhase.h" // Goal 3: frame distribution segmented at the cold-settle boundary
 #include "VoxelMarchRenderer.h"    // VoxelMarchPublishStreamingState -- the marcher's convergence signal
+#include "VoxelRenderFrame.h"   // VoxelRenderFrame::NoteSettled -- the render split's settle latch
 #include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
 #include "VoxelResidencyGpu.h"     // T4-2: GPU-resident residency shadow (docs/gpu-residency-t42-plan.md)
 #include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
@@ -10100,6 +10101,10 @@ void FVoxelWorldImpl::TickColdSettleProbe()
 		// leg settles at ~21 s, so eleven seconds of authorised cold-fill
 		// hitching were being averaged into the settled p95.
 		VoxelFramePhase::NoteSettled(SettleT);
+		// The render-frame split segments on the SAME one-shot signal, for the
+		// reason its own NoteSettled() comment records: polling the converged
+		// counter filed every render-frame sample under FILL.
+		VoxelRenderFrame::NoteSettled();
 		FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel cold settle: SETTLED t=%.1fs jobs=%lld mean=%.0f/s (hold=%.1fs excluded) | %s ")
