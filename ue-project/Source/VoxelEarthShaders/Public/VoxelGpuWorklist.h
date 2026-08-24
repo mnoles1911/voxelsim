@@ -225,6 +225,36 @@ public:
 	static constexpr uint32 kWriteGroupsPerRecord =
 		(kOccWordsPerRecord + kMatWordsPerRecord) / 64;
 	static constexpr uint32 kClaimDwordsPerRecord = 8;
+
+	// --- THE RECORD DIMENSION, and why the Write triple alone uses Y --------
+	//
+	// Every stage's indirect triple was {Take x groupsPerRecord, 1, 1}. A
+	// dispatch dimension is capped at 65,535 groups (D3D12_CS_DISPATCH_MAX_
+	// THREAD_GROUPS_PER_DIMENSION), so the Write stage's 148 groups/record
+	// capped a flush at 442 records = ~26,500 chunks/s at 60 ticks -- BELOW
+	// the 50,000 goal, and the lowest ceiling of any stage by a factor of
+	// 2.3. Carrying the record in Y instead, {148, Take, 1}, removes it: X is
+	// a constant 148 and Y is the record count.
+	//
+	// ONE CONSTANT, TWO CONSUMERS, WHICH IS THE WHOLE POINT. This value fills
+	// the args kernel's RecordInY table AND is handed to the claim kernels as
+	// VXC_WORKLIST_WRITE_RECORD_IN_Y, and VoxelWorklistClaim.usf #errors if it
+	// is not 1. A torn dispatch here is not loud on its own -- if the args
+	// went back to 1D, Gid.y would be 0 for every group and only record 0's
+	// pool words would be written, leaving every other chunk's volume
+	// unwritten: HOLES, silently. The #error is what makes that impossible
+	// rather than unlikely.
+	static constexpr uint32 kWriteRecordInY = 1;
+
+	// The per-flush record cap the 1D stages still impose. With the Write
+	// stage on Y, the binding stage is whichever REMAINING stage has the most
+	// groups per record -- Classify and Pack, at 64 (one group per brick) --
+	// so 65,535 / 64 = 1,023 records per flush = ~61,000 chunks/s at 60
+	// ticks, above the 50,000 goal. The .cpp static_asserts that no 1D stage
+	// exceeds 64, so this number cannot drift away from the table it
+	// describes; the arming path REFUSES a cell budget above it, loudly,
+	// rather than clipping a dispatch silently.
+	static constexpr uint32 kMaxRecordsPerFlush = 65535 / 64;
 	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
 	// [4..5] the column verify's mismatch/checked counters
 	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's

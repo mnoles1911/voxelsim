@@ -42,6 +42,7 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistControl)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, WorklistArgs)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, GroupsPerRecord)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, RecordInY)
 			SHADER_PARAMETER(uint32, HeadCursor)
 			SHADER_PARAMETER(uint32, SliceBudget)
 			SHADER_PARAMETER(uint32, StageCount)
@@ -130,6 +131,52 @@ namespace
 		// desc+record and verify dispatches -- all 1 group per record.
 		1,    // Record (LOCKED)
 	};
+
+	// Which dimension carries the RECORD, parallel to kGroupsPerRecord and
+	// uploaded beside it. 0 = X ({Take x groups, 1, 1}); 1 = Y ({groups,
+	// Take, 1}). Only the Write stage uses Y, and only because its 148 groups
+	// per record capped a flush at 65,535/148 = 442 records = ~26,500
+	// chunks/s -- the lowest ceiling of any stage and below the 50,000 goal.
+	// See FVoxelGpuWorklist::kWriteRecordInY for the whole argument and for
+	// the #error that locks the consuming kernel to this same constant.
+	const uint32 kRecordInY[uint8(EVoxelWorklistStage::COUNT)] =
+	{
+		0,  // Column
+		0,  // Voxelize
+		0,  // AssetStamp
+		0,  // Classify
+		0,  // ClassifyTotals
+		0,  // PackClaim
+		FVoxelGpuWorklist::kWriteRecordInY,   // Write (LOCKED, and the only Y)
+		0,  // Record
+	};
+
+	// THE CAP AND THE TABLE CANNOT DRIFT APART. kMaxRecordsPerFlush is
+	// 65,535/64, which is only the true per-flush ceiling while every stage
+	// that still carries its record in X has at most 64 groups per record.
+	// Add a stage with more, or move one off Y, and this fires at compile
+	// time instead of clipping a dispatch on a leg.
+	// AND THE POSITION ITSELF, because kRecordInY is a POSITIONAL table with
+	// exactly one nonzero entry. Insert a stage into the enum above Write and
+	// every entry shifts: Y lands on Pack (whose kernel reads its record from
+	// Gid.x) and the Write triple goes back to 1D -- so Pack silently
+	// processes only record 0 AND the word copies silently clip past 442
+	// records. Two silent failures from one insertion. This pins it.
+	static_assert(uint8(EVoxelWorklistStage::Write) == 6
+	           && uint8(EVoxelWorklistStage::COUNT) == 8,
+	              "kRecordInY is positional -- its single nonzero entry must sit on Write");
+	static_assert(FVoxelGpuWorklist::kMaxRecordsPerFlush == 65535 / 64,
+	              "kMaxRecordsPerFlush must stay the 1D stages' own ceiling");
+	static_assert(FVoxelGpuWorklist::kWriteRecordInY == 1,
+	              "the Write stage carries its record in Y; the kernel #errors on anything else");
+	static_assert(FVoxelGpuWorklist::kColumnGroupsPerRecord <= 64
+	           && FVoxelGpuWorklist::kVoxelizeGroupsPerRecord <= 64
+	           && FVoxelGpuWorklist::kStampGroupsPerRecord <= 64
+	           && FVoxelGpuWorklist::kClassifyGroupsPerRecord <= 64
+	           && FVoxelGpuWorklist::kClassifyTotalsGroupsPerRecord <= 64
+	           && FVoxelGpuWorklist::kPackGroupsPerRecord <= 64,
+	              "a stage carrying its record in X now exceeds 64 groups/record -- "
+	              "kMaxRecordsPerFlush is no longer 65535/64; move it to Y or lower the cap");
 }
 
 #define VOXEL_WORKLIST_ARGS_USF "/VoxelEarth/VoxelWorklistArgs.usf"
@@ -758,12 +805,19 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		FRDGBufferRef GroupsBuf = CreateStructuredBuffer(
 			GraphBuilder, TEXT("Voxel.WorklistGroups"), sizeof(uint32),
 			GroupsTable.Num(), GroupsTable.GetData(), GroupsTable.Num() * sizeof(uint32));
+		// Parallel to the groups table: which dimension carries the record.
+		const TArray<uint32> RecordInYTable(kRecordInY, int32(uint8(EVoxelWorklistStage::COUNT)));
+		FRDGBufferRef RecordInYBuf = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.WorklistRecordInY"), sizeof(uint32),
+			RecordInYTable.Num(), RecordInYTable.GetData(),
+			RecordInYTable.Num() * sizeof(uint32));
 
 		FVoxelWorklistArgsCS::FParameters* Params =
 			GraphBuilder.AllocParameters<FVoxelWorklistArgsCS::FParameters>();
 		Params->WorklistControl = GraphBuilder.CreateUAV(Control);
 		Params->WorklistArgs = GraphBuilder.CreateUAV(Args, PF_R32_UINT);
 		Params->GroupsPerRecord = GraphBuilder.CreateSRV(GroupsBuf);
+		Params->RecordInY = GraphBuilder.CreateSRV(RecordInYBuf);
 		Params->HeadCursor = NewHead;
 		Params->SliceBudget = SliceBudgetRecords;
 		Params->StageCount = uint32(EVoxelWorklistStage::COUNT);

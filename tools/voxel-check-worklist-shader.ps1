@@ -208,8 +208,14 @@ $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistPack.hlsl') 'P
 # VoxelBrickPoolAlloc.usf for the factored claim/write bodies; no version
 # lock (the alloc family moves dwords). Defines mirror the
 # FVoxelWorklistClaim* classes'; the kernels #error on drift.
+# VXC_WORKLIST_WRITE_RECORD_IN_Y mirrors FVoxelGpuWorklist::kWriteRecordInY:
+# ClaimWriteWorklistMain takes its record from Gid.y, which is correct only
+# while the args kernel emits {148, Take, 1} for the Write triple. The kernel
+# #errors on anything but 1 -- and that #error is what caught this list being
+# out of date the first time it ran, which is the whole reason it exists.
 $ClaimDefines = @('VXC_WORKLIST_CLAIM_GROUPS=1', 'VXC_WORKLIST_WRITE_GROUPS=148',
-                  'VXC_WORKLIST_BRICKS_PER_RECORD=64', 'VXC_WORKLIST_MATWORDS_PER_RECORD=8448')
+                  'VXC_WORKLIST_BRICKS_PER_RECORD=64', 'VXC_WORKLIST_MATWORDS_PER_RECORD=8448',
+                  'VXC_WORKLIST_WRITE_RECORD_IN_Y=1')
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClaim.hlsl') 'ClaimWorklistMain'       'claim   DXIL  ClaimWorklistMain'       $ClaimDefines
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClaim.hlsl') 'ClaimWriteWorklistMain'  'clmwr   DXIL  ClaimWriteWorklistMain'  $ClaimDefines
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistClaim.hlsl') 'ClaimRecordWorklistMain' 'clmrec  DXIL  ClaimRecordWorklistMain' $ClaimDefines

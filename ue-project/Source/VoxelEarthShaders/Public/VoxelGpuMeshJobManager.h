@@ -742,6 +742,12 @@ private:
 	//   Unarmed   -- the column-stage CVar is on but the worklist object's
 	//                stage is not armed at flush time. Should be 0; growing
 	//                means arming is failing silently.
+	// Band-edge chunks that got a record because -VoxelGpuWorklistBandChunks
+	// is armed. Zero with the switch armed and band chunks flowing means the
+	// admission never fired and passes/tick keeps its ~1.25 x chunks/tick
+	// slope; growing while wlclaim conv does not means they are admitted and
+	// falling back for a second reason (read wlcols fbBy).
+	int64 WorklistBandAdmitted = 0;
 	int64 WorklistFbStack = 0;
 	int64 WorklistFbDeferred = 0;
 	int64 WorklistFbUnarmed = 0;

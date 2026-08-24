@@ -701,6 +701,58 @@ static bool VoxelGpuWorklistClaimEnabled()
 	return bEnabled;
 }
 
+// -VoxelGpuWorklistBandChunks=1: admit BAND-EDGE chunks to the converted
+// chain. Off is byte-identical (the band skip stands exactly as before).
+//
+// WHY THE SKIP WAS WRONG, and it is the "derived, not verified" shape this
+// codebase keeps paying for. The record-append gate refused a chunk whose
+// `Job->Region.BandEdge != 0` -- but a job carries TWO region requests, and
+// the record is built entirely from the OTHER one. `Job->Region` is the
+// 48x48x6 MESH region (one brick of halo) that produces the footprint band;
+// `Job->BrickRegion` is the halo-free 32x32xN region the worklist converts,
+// and ApplyBrickRegionShape sets `OutReq.BandEdge = 0` UNCONDITIONALLY, with
+// a comment saying the band belongs to the mesh region. So the brick region
+// of a band chunk is byte-for-byte the same shape as the brick region of a
+// lean chunk, and the gate was testing a field the converted chain never
+// reads. It was copied from the LEAN gate (bLeanJob), where testing
+// Region.BandEdge is CORRECT because that decision is about whether to skip
+// the mesh-region graph.
+//
+// The two halves are separate AddRegionPasses calls into the same
+// FRDGBuilder, so admitting the brick half changes nothing about the band
+// half: the mesh-region graph still runs ColumnMain + VoxelizeMain +
+// BandReduceMain and still enqueues the 2-int32 band readback. What the
+// chunk stops paying is its brick region's 12 + claim + 4 writes = 17 of its
+// 21 passes.
+//
+// WHAT CANNOT BE CONVERTED, stated with its arithmetic: the band half is 3
+// passes + 1 readback copy on a DIFFERENT region shape (48x48 columns, not
+// the record's 32x32 -- kColumnsPerRecord is static_asserted at 1,024) and it
+// ends in a CPU readback that VoxelStreaming::MakeFootprintBand consumes. It
+// is per-chunk by nature and stays per-chunk. Band chunks are 6.6% of this
+// flight, so the residual term is
+//     passes/tick = 11 + 0.066 x chunksPerTick x 4
+// which reaches the ~500/tick hitch cliff only at ~1,850 chunks/tick =
+// ~111,000 chunks/s at 60 fps. That is 2.2x past the 50,000 goal, so the
+// pass term stops being the binding constraint here -- which is the whole
+// point, and is NOT the same claim as "flat".
+//
+// FAILING READINGS: bandAdmitted=0 with the switch armed and band chunks
+// flowing = the gate never fired, and passes/tick will hold at the
+// ~1.25 x chunks/tick slope. bandAdmitted growing while wlclaim conv does
+// not = they are admitted and falling back for a second reason; read
+// wlcols fbBy. Band chunks appearing in wlstamp/wlvox fbAssets is normal.
+static bool VoxelGpuWorklistBandChunksEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistBandChunks="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
 // The Claim stage's byte gate (-VoxelGpuWorklistVerifyClaim): one extra
 // indirect dispatch per tick comparing the LANDED pool state (descriptors,
 // bounded word ranges, the chunk record or its fail-zero) against the
@@ -841,6 +893,22 @@ namespace VoxelGpuBatchDetail
 	// Classic (non-lean) brick job under PoolAlloc: mesh region 2 + brick
 	// region 12 + claim + 4 writes, totals copy gone.
 	constexpr int32 kPassesPerClassicAllocJob = 19;
+	// ...AND the two this constant has always been missing on a BAND job.
+	// "mesh region 2" is ColumnMain + VoxelizeMain, which is right for a
+	// brick-only job whose mesh region nobody reads. A job with
+	// Region.BandEdge > 0 ALSO runs BandReduceMain in that region (one pass,
+	// AddRegionPasses "pass 2b") and enqueues the 2-int32 band readback copy
+	// in DispatchBatch -- so its true cost is 21, not 19, and the readback
+	// copy counts because every other constant here counts its own
+	// (kPassesPerStackDispatch is explicitly "13 compute + 1 readback copy").
+	//
+	// This is a +1.5% correction on the leg that found it (2,059 band chunks
+	// of 30,994 in the peak window = +18 passes/tick on a 1,203 reading), so
+	// it changes no conclusion -- but it is the ONLY term left in passes/tick
+	// once the brick halves convert, and a residual measured with a constant
+	// known to be 2 low is not a measurement. DO NOT compare a passes/tick
+	// number from before this commit to one after without this in hand.
+	constexpr int32 kPassesPerBandJobExtra = 2;
 	// Claim-based fused stack: the 13 compute passes (no stack-totals
 	// readback copy) + claim + 4 writes PER MEMBER.
 	constexpr int32 kStackClaimBasePasses = 13;
@@ -2623,20 +2691,33 @@ void FVoxelGpuMeshJobManager::Tick()
 			Worklist.SetAssetStampStageArmed(VoxelGpuWorklistAssetStampEnabled());
 			Worklist.SetPackStageArmed(VoxelGpuWorklistPackEnabled());
 			if (VoxelGpuWorklistClaimEnabled() &&
-			    VoxelGpuWorklistCellBudget() > 65535u / FVoxelGpuWorklist::kWriteGroupsPerRecord)
+			    VoxelGpuWorklistCellBudget() > FVoxelGpuWorklist::kMaxRecordsPerFlush)
 			{
-				// The Write triple is Take x 148 groups in X; D3D caps an
-				// indirect dispatch dimension at 65,535 groups, so a consume
-				// budget above 442 records would silently clip the word
-				// copies -- torn pool payloads with no error anywhere.
-				// Refuse the arm loudly instead.
+				// D3D caps an indirect dispatch dimension at 65,535 groups, so
+				// a stage whose triple is {Take x groups, 1, 1} caps a flush at
+				// 65,535/groups records -- and a budget above that would
+				// SILENTLY CLIP the dispatch: torn pool payloads, or a Write
+				// stage that copies some chunks' words and not others, with no
+				// error anywhere. Refuse the arm loudly instead. A cap that
+				// refuses is worth more than one that clips.
+				//
+				// The number moved 442 -> 1,023 when the Write triple's record
+				// went to Y ({148, Take, 1}). 148 groups/record was the lowest
+				// ceiling in the system by 2.3x and put the converted chain's
+				// wall at ~26,500 chunks/s, BELOW the 50,000 goal; the binding
+				// stage is now whichever still rides X with the most groups
+				// per record -- Classify and Pack at 64 -- for ~61,000
+				// chunks/s. kMaxRecordsPerFlush is static_asserted against
+				// exactly that in VoxelGpuWorklist.cpp, so this message cannot
+				// drift away from the table it describes.
 				UE_LOG(LogVoxelGpuMeshJob, Error,
 				       TEXT("[gpu-worklist] CLAIM STAGE ARM REFUSED: -VoxelGpuWorklistCellBudget=%u ")
-				       TEXT("exceeds the Write triple's %u-record ceiling (65,535 groups / %u per ")
-				       TEXT("record). Lower the budget or split the dispatch before arming."),
+				       TEXT("exceeds the %u-record per-flush ceiling (65,535 groups / the 64 per ")
+				       TEXT("record the widest 1D stage dispatches). The Write triple carries its ")
+				       TEXT("record in Y and is no longer the limit. Lower the budget, or move the ")
+				       TEXT("next stage to Y, before arming."),
 				       VoxelGpuWorklistCellBudget(),
-				       65535u / FVoxelGpuWorklist::kWriteGroupsPerRecord,
-				       FVoxelGpuWorklist::kWriteGroupsPerRecord);
+				       FVoxelGpuWorklist::kMaxRecordsPerFlush);
 			}
 			else if (VoxelGpuWorklistClaimEnabled())
 			{
@@ -2989,13 +3070,14 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	       TEXT("[gpu-worklist] %.1fs window: passes/tick mean=%.1f max=%lld over %lld ticks ")
 	       TEXT("(%lld chunks, %.0f chunks/s); records appended=%llu consumed=%llu pending=%u ")
 	       TEXT("refusedFull=%llu; identity %s; skips noPack=%lld quads=%lld band=%lld ")
-	       TEXT("noAlloc=%lld noAtlas=%lld (cumulative); proof landed=%llu failed=%llu%s%s%s"),
+	       TEXT("noAlloc=%lld noAtlas=%lld bandAdmitted=%lld (cumulative); ")
+	       TEXT("proof landed=%llu failed=%llu%s%s%s"),
 	       WindowSeconds, MeanPasses, WorklistWinPassesMaxTick, WorklistWinTicks,
 	       WorklistWinChunks, WindowSeconds > 0.0 ? double(WorklistWinChunks) / WindowSeconds : 0.0,
 	       W.Appended, W.Consumed, W.Pending, W.RefusedFull,
 	       Drift == 0 ? TEXT("ok") : *FString::Printf(TEXT("DRIFT=%lld (LEG INVALID)"), Drift),
 	       WorklistSkipNoPack, WorklistSkipQuadMesh, WorklistSkipBand,
-	       WorklistSkipNoAlloc, WorklistSkipNoAtlas,
+	       WorklistSkipNoAlloc, WorklistSkipNoAtlas, WorklistBandAdmitted,
 	       P.Landed, P.Failed,
 	       P.Failed > 0 ? TEXT(" (PROOF FAILED -- LEG INVALID)") : TEXT(""),
 	       bUnproven ? TEXT(" (NO PROOF LANDED -- GPU consumption UNVERIFIED)") : TEXT(""),
@@ -3439,6 +3521,9 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		// GPU's claim bit on records the host then vetoed, and both graphs
 		// claimed the same slot.
 		const bool bClaimChainArmed = Worklist.IsClaimStageArmed();
+		// Band-edge admission (-VoxelGpuWorklistBandChunks). Off is
+		// byte-identical: the skip below stands exactly as it did.
+		const bool bBandChunksArmed = VoxelGpuWorklistBandChunksEnabled();
 		TArray<FVoxelWorklistAssetPayload> RecordPayloads;
 		TSet<FVoxelGpuBrickStack*> TalliedStacks;
 		int64 PassesThisTick = 0;
@@ -3474,6 +3559,12 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 					PassesThisTick += Job->bGpuPoolAlloc
 						? VoxelGpuBatchDetail::kPassesPerClassicAllocJob
 						: VoxelGpuBatchDetail::kPassesPerClassicBrickJob;
+					// The band reduce + its readback copy, which neither
+					// classic constant ever included. See the constant.
+					if (Job->Region.BandEdge > 0)
+					{
+						PassesThisTick += VoxelGpuBatchDetail::kPassesPerBandJobExtra;
+					}
 				}
 				else
 				{
@@ -3488,9 +3579,20 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			// it exists for). First failing reason counted, [gpu-lean] style.
 			if (!Job->bBrickPack)                     { ++WorklistSkipNoPack; continue; }
 			if (Job->bQuadMesh)                       { ++WorklistSkipQuadMesh; continue; }
-			if (Job->Region.BandEdge != 0)            { ++WorklistSkipBand; continue; }
+			// The band skip, now switch-gated -- see
+			// VoxelGpuWorklistBandChunksEnabled for why it was testing the
+			// wrong region's field. `Job->BrickRegion.BandEdge` is zero on
+			// EVERY job by construction (ApplyBrickRegionShape), so there is
+			// nothing on the converted side this can conflict with; the
+			// assert inside AddRegionPasses' column feed checks exactly that
+			// and is what makes this safe rather than hopeful.
+			const bool bJobBand = Job->Region.BandEdge != 0;
+			if (bJobBand && !bBandChunksArmed)        { ++WorklistSkipBand; continue; }
 			if (!Job->bGpuPoolAlloc)                  { ++WorklistSkipNoAlloc; continue; }
 			if (!Job->BrickRegion.bRasterAtlas)       { ++WorklistSkipNoAtlas; continue; }
+			// Counted AFTER every gate, so this is band chunks that actually
+			// got a record -- the reading that says the admission fired.
+			if (bJobBand)                             { ++WorklistBandAdmitted; }
 
 			FVoxelGpuChunkWorkRecord R;
 			R.OriginVx = Job->BrickRegion.OriginVx;

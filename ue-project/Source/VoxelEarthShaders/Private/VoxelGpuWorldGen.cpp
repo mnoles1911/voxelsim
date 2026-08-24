@@ -1345,6 +1345,14 @@ namespace
 			                         FVoxelGpuWorklist::kBricksPerRecord); \
 			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_MATWORDS_PER_RECORD"), \
 			                         FVoxelGpuWorklist::kMatWordsPerRecord); \
+			/* The SAME host constant that fills the args kernel's RecordInY \
+			   table. ClaimWriteWorklistMain reads its record from Gid.y and \
+			   #errors if this is not 1 -- the two sides cannot disagree, and \
+			   they must not: disagreement writes record 0's pool words 148 x \
+			   Take times and leaves every other chunk unwritten, with no \
+			   error anywhere. */ \
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_WRITE_RECORD_IN_Y"), \
+			                         FVoxelGpuWorklist::kWriteRecordInY); \
 		}
 
 	// The ring + eligibility bindings every claim-stage kernel shares.
