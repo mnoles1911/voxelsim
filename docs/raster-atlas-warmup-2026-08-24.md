@@ -75,7 +75,7 @@ ships is the breakdown itself, on every window line, in every mode:
     [raster-atlas] fill: mode=... | ok | perPage 2.830 ms = elev X (n%) + climate Y (n%)
       + stage Z (n%) + resid R (n%) | callsPerPage elev=16384 climate=16384 of 16384 px
       (dedup off, 1x) | audit checked=0 mismatch=0 | async pages=0 launches=0 inFlight=0
-      prime=0 | disc 1194/1521 pages | lifetime fills=N win=2.00s
+      prime=0 | disc 1036/1521 pages | lifetime fills=N win=2.00s
 
 * Three phases, one `Cycles64` pair each: **six timer reads per page against
   32,768 sampler calls, ~0.005%.** The phase split changes no value —
@@ -117,8 +117,18 @@ lookup and spline evaluation are. The buckets decide it, not the bracket.
 ### Mode 1 — the sweep fills a square, coverage is a disc
 `RadiusPages` is a Chebyshev radius **rounded up** from `CoverageRadiusPx`, and
 the sweep walks the whole 39x39 = 1,521-page square. Rings admit on a RADIUS
-(`AdmitOuterUU`), so the corners — about 22% — are never requested. Predicted
-1,521 -> ~1,194 pages.
+(`AdmitOuterUU`), so the corners are never requested.
+
+At the shipped geometry — `CoverageRadiusPx` = floorDiv(4,100,000 / 1875) + 1 +
+50 = **2,237 px = 4.19 km**, `RadiusPages` = 19 — the square reaches **6.45 km**
+at its corner. Counting pages whose nearest pixel is inside the circle:
+
+    anchor at page origin   1,036 of 1,521   (485 skipped, 31.9%)
+    anchor at page centre   1,021 of 1,521   (500 skipped, 32.9%)
+
+**~32%, not the ~22% I first estimated.** At 2.83 ms/page mode 1 alone is worth
+**~1.37 s** of the 4.30 s, with no threading change and no arithmetic
+assumption.
 
 Cannot generate wrong terrain even if the disc were too tight: a page the sweep
 skips is still demand-queued and inline-filled by `PrepareRequest`. **The cost

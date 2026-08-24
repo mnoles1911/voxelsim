@@ -287,8 +287,12 @@ bool FVoxelRasterAtlasCpu::IsPageInCoverage(int64 PageX, int64 PageY,
 	// THE SWEEP VISITS A SQUARE; COVERAGE IS A DISC. RadiusPages is a Chebyshev
 	// radius rounded up from CoverageRadiusPx, so the 39x39 square the sweep
 	// walks circumscribes the circle the rings actually admit to (AdmitOuterUU
-	// is a RADIUS -- VoxelWorldSubsystem.cpp). The corners are ~22% of the
-	// square and no chunk in the cascade ever asks for them.
+	// is a RADIUS -- VoxelWorldSubsystem.cpp). At the shipped geometry
+	// (CoverageRadiusPx=2,237 px = 4.19 km, RadiusPages=19) the disc admits
+	// 1,021-1,036 of the square's 1,521 pages depending on where inside its own
+	// page the anchor sits -- the corners are ~32% of the sweep, and the square
+	// reaches 6.45 km at its corner against a 4.19 km circle, so no chunk in
+	// the cascade ever asks for them.
 	//
 	// The test is the NEAREST pixel of the page against CoverageRadiusPx, which
 	// over-covers on purpose: a page that only clips the circle is filled. And

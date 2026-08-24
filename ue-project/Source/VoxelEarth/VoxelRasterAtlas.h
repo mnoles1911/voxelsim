@@ -162,8 +162,11 @@ public:
 	//      still prints the buckets, so ONE leg answers "where does the
 	//      2.83 ms go".
 	//   1  DISC, NOT SQUARE. The sweep visits the 39x39 page square while
-	//      coverage is a 4.10 km + margin DISC (AdmitOuterUU is a radius). The
-	//      corners are ~22% of the square and no chunk ever asks for them.
+	//      coverage is a 4.10 km + margin DISC (AdmitOuterUU is a radius). At
+	//      the shipped geometry (CoverageRadiusPx=2,237, RadiusPages=19) the
+	//      disc admits 1,021-1,036 of the 1,521 pages depending on where in its
+	//      page the anchor sits: the corners are ~32% of the sweep and no chunk
+	//      ever asks for them. At 2.83 ms/page that is ~1.37 s on its own.
 	//      A page is skipped when its NEAREST pixel is outside CoverageRadiusPx
 	//      -- the radius Init derived the margin from, not a second spelling.
 	//      Skipping too much cannot generate wrong terrain: it costs a
