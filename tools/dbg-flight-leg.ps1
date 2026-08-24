@@ -203,7 +203,12 @@ if (-not $NoCoverageVerify) {
 # -- and NO >100 FPS CLAIM MAY BE MADE FROM SUCH A LEG in either case. Never
 # report fill-segment numbers under a settled heading.
 if (-not $NoFramePhase) {
-    if ($ExtraArgs -notmatch 'VoxelFramePhase') {
+    # -notmatch on an ARRAY returns the FILTERED ARRAY, not a boolean, and a
+    # non-empty array is truthy -- so this fired even when the caller had
+    # already passed -VoxelFramePhase=3, putting BOTH =3 and =1 on the command
+    # line. FParse::Value takes the first, so the caller's value happened to
+    # win and M20 was valid, but that was luck. -join makes it a string test.
+    if (($ExtraArgs -join ' ') -notmatch 'VoxelFramePhase') {
         $ExtraArgs = @($ExtraArgs) + @('-VoxelFramePhase=1')
     }
     Write-Host "  frame phase ARMED (settled-segment p50/p95/p99 -- Goal 3)"
