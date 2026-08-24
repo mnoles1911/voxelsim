@@ -110,6 +110,28 @@
 //   no "Voxel frame phase" line, with -VoxelFramePhase=1
 //                       -> the hook was not applied. Nothing here ran.
 //   frames=0            -> the hook is present but not called.
+//   seg=SETTLED-MOVING n=0
+//                       -> THE LEG NEVER FLEW AFTER SETTLE, or hook 1 is not
+//                          receiving anchor speed. NO >100 FPS CLAIM MAY BE
+//                          MADE, and the SETTLED-PARKED row may never be
+//                          quoted in its place -- a parked camera reads
+//                          9.3-10.4 ms / 108 fps on a build whose flight reads
+//                          43-51 ms, and that substitution is exactly what
+//                          nearly got reported as the achievement on S1.
+//   gateSpeed=BELOW-20MPS-LEG-DOES-NOT-TEST-GATE
+//                       -> the MOVING segment averaged under the 20 m/s the
+//                          owner specified. Whatever it says about p95, it did
+//                          not test the gate. Not a pass and not a fail: an
+//                          invalid leg.
+//   gateP95=PASS gateSteady=FAIL (or the reverse)
+//                       -> A HALF-PASS IS NOT A PASS. "Steady AND above 100"
+//                          is two requirements; gate= is the AND of them and
+//                          is the only field that may be quoted as the result.
+//   stutters=0 but maxMs large
+//                       -> a single outlier below the 0.10% bar. Steady is
+//                          about what the player feels, so read maxMs before
+//                          calling it clean; the bar is a switch for this
+//                          reason.
 //   heavyN=0            -> THE LEG NEVER ENTERED THE REGIME BEING ASKED ABOUT.
 //                          It says nothing about lifted caps and must not be
 //                          read as evidence about them. Check the caps line;
@@ -174,16 +196,82 @@ inline int32 Mode()
 inline constexpr int32 kModeDistribution = 1;
 inline constexpr int32 kModeReconcile    = 2;
 
-// The out-of-line body. Never called with Mode() == 0.
-void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame);
+// THE MOVING/PARKED THRESHOLD, IN UU/s. Default 100.0 = 1 m/s.
+//
+// BORROWED, NOT INVENTED. 100.0 is the exact constant the velocity-bias
+// admission path already tests SmoothedAnchorSpeedUUPerSec against
+// (VoxelWorldSubsystem.cpp: `VelK > 0.0 && SmoothedAnchorSpeedUUPerSec >
+// 100.0`). Using the same number means this segmenter and admission agree
+// about what "moving" is; a second opinion about the same word is how two
+// instruments come to describe different worlds.
+inline double MoveThresholdUU()
+{
+	static const double Latched = []
+	{
+		float Value = 100.0f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFramePhaseMoveUU="), Value);
+		return double(FMath::Max(0.0f, Value));
+	}();
+	return Latched;
+}
 
-// HOOK 1, at the end of the streaming tick, with two values the caller has
+// THE GATE'S SPEED FLOOR, m/s. Owner, 2026-08-23: "steady and above 100 when
+// player character is moving at 20 meters per second in game world at least."
+// 20 is the FLOOR at which the gate must hold; faster is better and the harness
+// flight line already runs 30. A SETTLED-MOVING segment whose mean speed is
+// below this did not test the gate, and the dist row says so instead of
+// printing an indistinguishable PASS.
+inline double GateSpeedMps()
+{
+	static const double Latched = []
+	{
+		float Value = 20.0f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFramePhaseGateMps="), Value);
+		return double(FMath::Max(0.0f, Value));
+	}();
+	return Latched;
+}
+
+// "STEADY" AS A NUMBER, AND IT IS A JUDGEMENT CALL FLAGGED AS ONE.
+//
+// The owner said hitches "~0", not a percentage. 0.10% is one dropped frame per
+// thousand -- about one every ten seconds at 100 fps -- and it is a switch
+// (-VoxelFramePhaseSteadyPct=) exactly because the right answer may be a hard
+// zero. The RAW stutter count is printed beside the verdict either way, so the
+// pass/fail can be re-derived under any bar without a rebuild.
+inline double SteadyPct()
+{
+	static const double Latched = []
+	{
+		float Value = 0.10f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFramePhaseSteadyPct="), Value);
+		return double(FMath::Max(0.0f, Value));
+	}();
+	return Latched;
+}
+
+// The out-of-line body. Never called with Mode() == 0.
+void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpeedUUPerSec);
+
+// HOOK 1, at the end of the streaming tick, with three values the caller has
 // already computed.
-FORCEINLINE void NoteFrame(double VoxelTickMs, int32 AppliesThisFrame)
+//
+// THE THIRD STATE, AND WHY IT IS NOT OPTIONAL. Segmenting fill from settled was
+// not enough: within SETTLED, a PARKED camera and a FLYING one are different
+// worlds, and on the S1 leg the parked windows read p95=9.3-10.4 ms (GOAL3
+// PASS, 108 fps) while the flight windows read p95=43-51 ms with ~40 hitches
+// per 5 s. Parked frames outnumber flying ones about 2:1 in the settled
+// population, which drags the settled TOTAL to 34 ms -- a number that describes
+// neither state and flatters the one that matters by 4-5x.
+//
+// Nobody plays this game holding still. GOAL3 PASS/FAIL is therefore judged on
+// SETTLED-MOVING alone; the other two are printed so the split is visible, and
+// carry "gate n/a" so no reader can lift a PASS off a parked row.
+FORCEINLINE void NoteFrame(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpeedUUPerSec)
 {
 	if (Mode() != 0)
 	{
-		NoteFrameImpl(VoxelTickMs, AppliesThisFrame);
+		NoteFrameImpl(VoxelTickMs, AppliesThisFrame, AnchorSpeedUUPerSec);
 	}
 }
 

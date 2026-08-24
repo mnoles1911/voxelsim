@@ -185,3 +185,138 @@ baseline that `p50=9.84 / p95=30.62` cannot.
   breath as the 14,099 chunks/s.
 - **G4 (control identity).** With no switch, no `Voxel frame dist` line at all.
 ```
+
+---
+
+## 7. UPDATE 2026-08-23 late: the third state, and the gate sharpened
+
+### The S1 result that forced this
+
+    window                        segment              n     p50    p95    hitches
+    02:20:18-02:21:18   PARKED, pre-flight            ~506   9.9    10.4   0
+    02:21:33-02:23:18   THE FLIGHT                    ~215  22.5   43-51   ~40/window
+    02:23:33-02:24:18   PARKED, linger                ~566   8.9     9.3   0
+
+Parked frames outnumber flying ones about **2:1** in the settled population,
+which drags the settled total to `p95=34 ms` — a number describing neither
+state and flattering the one that matters by **4-5x**. The windows reading
+`GOAL3 PASS` at 108 fps are **a parked camera**.
+
+### What changed
+
+**A third state.** `SETTLED` now splits into `SETTLED-MOVING` and
+`SETTLED-PARKED`, keyed on `SmoothedAnchorSpeedUUPerSec` — the same EMA, and the
+same **100 UU/s** constant, that admission's velocity-bias path already tests
+(`VelK > 0.0 && SmoothedAnchorSpeedUUPerSec > 100.0`). One opinion about what
+"moving" means, not two. `-VoxelFramePhaseMoveUU=` overrides it.
+
+**`GOAL3 PASS/FAIL` is judged on `SETTLED-MOVING` only.** All three segments
+print; the other two carry `gate=n/a-not-settled-moving` so a PASS cannot be
+lifted off a parked row.
+
+**The gate now has two parts, judged and printed separately** (owner: *"The FPS
+needs to be steady and above 100 when player character is moving at 20 meters
+per second in game world at least"*):
+
+| field | test |
+|---|---|
+| `gateP95` | `p95 < 10.00 ms` — above 100 FPS |
+| `gateSteady` | `stutterPct <= 0.10` — steady |
+| `gateSpeed` | `meanSpeedMps >= 20.0` — the leg actually tested the gate |
+| `gate` | the **AND** of all three. **The only field that may be quoted as the result.** |
+
+`p99` and `maxMs` are printed beside `p95`, because "steady" lives in the tail
+past p95 and a 10 ms p95 with a 200 ms max is a failure the player feels.
+
+**Two hitch bars, neither renamed.** `hitches` stays at the legacy **33.3 ms**
+so every historical leg remains comparable. `stutters` is a new counter at
+**2x the gate = 20.00 ms** — a dropped frame at 100 fps — and *that* is what
+part 2 is judged on. 33.3 ms is the 30 fps bar and is the wrong instrument for a
+100 fps target.
+
+**`hitches <= n` is now impossible to miss.** The lane holder mis-parsed these
+rows three times and the tell was `hitches=46` against `n=24`. Two fixes: the
+rows are strict `key=value` with **no spaces inside any value** and with `n=`
+immediately beside `hitches=`, so the pair a reader must compare cannot be
+picked up from two places on a line; and `EmitDist` **asserts it at the site**,
+logging `SELF-CHECK FAILED ... hitches CANNOT exceed n` as an **Error** with
+both numbers, plus a running `selfCheckFailures=` on the window header.
+
+### The reconciliation now points at the flight
+
+Mode `2` gained a second bucket pair. `EmitDelta` is factored so both questions
+get identical arithmetic and identical disproof thresholds:
+
+    DELTA tag=MOVE  settled-moving minus settled-parked  <- THE GOAL 3 QUESTION
+    DELTA tag=LOAD  heavy-apply minus light-apply        <- the lifted-cap question
+
+The MOVE delta is emitted first and asks exactly the right thing: **what makes a
+flying frame 43-51 ms when a parked frame is 9?** Same build, same settled
+state, same everything but the anchor moving. Move buckets are **settled-only** —
+a fill frame is neither, and folding it in would put the load storm back into
+the number the segmentation exists to keep it out of.
+
+Candidates the residual must be able to reject out loud: `recompute`
+(300-555 ms/window, rising with tracked count, **and a moving anchor is exactly
+when it scans**); eviction churn (`poolReplaced` 2.0-2.8%, `evictions=89,287` —
+**parked evicts nothing**, which fits the delta shape); and proxy creation /
+brick-pool upload flushes / RDG setup / frame-end sync, all outside `tickMs`.
+
+The first two scale with anchor motion and neither happens parked. **H3 must
+still be able to say "none of the above".**
+
+### THE ONLY HOOK CHANGE — one argument, `VoxelWorldSubsystem.cpp` line 9521
+
+Both hooks are already applied. Hook 1 needs a third argument and nothing else
+changes. **Line 9521**, replace:
+
+```cpp
+	VoxelFramePhase::NoteFrame(double(TickMsSoFar), ThisFrameAppliesFromWorker);
+```
+
+with:
+
+```cpp
+	VoxelFramePhase::NoteFrame(double(TickMsSoFar), ThisFrameAppliesFromWorker,
+	                           SmoothedAnchorSpeedUUPerSec);
+```
+
+`SmoothedAnchorSpeedUUPerSec` is an `FVoxelWorldImpl` member (declared line
+7570) updated at **line 8678** inside this same `TickStreaming` call, ~840 lines
+above the hook — so it is **this** tick's speed, not last tick's. It is the same
+value admission's velocity-bias path reads at line 8758, which is the point: one
+opinion about what "moving" means.
+
+Hook 2 (`NoteSettled(SettleT)`, line 10014) is unchanged.
+
+### The legs — two speeds, not one point
+
+| leg | log | `-ExtraArgs` |
+|---|---|---|
+| **M20** the gate floor | `fps-m20.log` | `-VoxelFramePhase=3`, flight line at **20 m/s** |
+| **M30** the harness default | `fps-m30.log` | `-VoxelFramePhase=3`, flight line at **30 m/s** |
+| **M0** parked control | `fps-park.log` | `-VoxelFramePhase=3`, no flight |
+
+**Two speeds because the shape is the diagnosis.** If the flight tail scales
+with speed, the cause is per-distance work — recompute scans and eviction churn
+both are. If it is flat in speed, it is per-tick work that merely happens to be
+gated on motion. That is a different fix, and one point cannot tell them apart.
+
+M0 exists to prove `SETTLED-MOVING n=0` there and to give the parked baseline
+the MOVE delta is measured against.
+
+### Gates for these legs
+
+- **G5 (validity).** `gateSpeed=PASS` on M20 and M30; `selfCheckFailures=0`;
+  `SETTLED-MOVING n` large enough to matter (the S1 flight windows held only
+  ~215 frames — quote `n` with every percentile).
+- **G6 (the answer).** `gate=` from the **`SETTLED-MOVING total`** row of the
+  **last window with `drained>0`**, quoted with its `n`, its `meanSpeedMps` and
+  the window it came from.
+- **G7 (the diagnosis).** `DELTA tag=MOVE` `VERDICT=` on both M20 and M30, with
+  the `dResidualPct` beside it. If both read `H3-UNATTRIBUTED`, the ~94 ms and
+  the flight tail are the same unnamed term and that is the finding.
+- **G8 (the standing rule).** Any arm reporting a cold-start or throughput win
+  must quote its `SETTLED-MOVING gate=` in the same breath. **An arm that
+  improves cold start and worsens moving p95 is not a win** — which the
+  apply-ceiling lift, at 3 Hz and ~333 ms/frame, currently is not.

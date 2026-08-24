@@ -305,3 +305,11 @@ VoxelFineLockMeter
 # end away from a developer who only wanted the numbers.
 VoxelFramePhase
 VoxelFramePhaseHeavy
+# The moving/parked split and the two-part Goal 3 gate (owner, 2026-08-23:
+# "steady and above 100 when moving at 20 meters per second at least").
+# MoveUU borrows admission's own 100 UU/s constant; GateMps is the 20 m/s
+# floor; SteadyPct is the operationalisation of "hitches ~ 0" and is a switch
+# precisely because it is a judgement call.
+VoxelFramePhaseMoveUU
+VoxelFramePhaseGateMps
+VoxelFramePhaseSteadyPct
