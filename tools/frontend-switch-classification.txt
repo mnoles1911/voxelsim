@@ -291,3 +291,17 @@ VoxelApplyDrainCap
 # the rule is right and the name was wrong.
 VoxelFineLockFast
 VoxelFineLockMeter
+
+# --- 2026-08-23 late: frame-phase reconciliation ----------------------------
+# ue-project/Source/VoxelEarth/VoxelFramePhase.h. A passive per-frame meter
+# that splits a frame into voxelTick / gameOther / gameWait / RESIDUAL and
+# prints the residual explicitly, so "not the render thread" is a sayable
+# result. -VoxelFramePhaseHeavy= sizes the heavy-frame bucket. Instrument and
+# tuning; neither drives, poses or ends a run, and both are meant to be
+# readable on an ordinary launch.
+#
+# NOT named *Probe or *Verify, for the reason VoxelFineLockMeter records: those
+# substrings are in kSelfDrivingSubstrings and would silently take the front
+# end away from a developer who only wanted the numbers.
+VoxelFramePhase
+VoxelFramePhaseHeavy
