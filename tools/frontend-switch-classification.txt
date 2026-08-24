@@ -265,6 +265,16 @@ VoxelApplyFast
 VoxelApplyColumnCache
 VoxelApplyColumnCacheAudit
 
+# --- 2026-08-23 late: the drain loop's per-tick ceilings ---------------------
+# ue-project/Source/VoxelEarth/VoxelApplyBatch.h. Latched overrides for
+# voxel.Stream.MaxAppliesPerFrame, voxel.Stream.ApplyBudgetMs and the
+# kMaxResultDrainsPerFrame constexpr, because -ExecCmds lands after streaming
+# has begun and a cold-fill leg driven that way measures a blend of two caps.
+# Tuning: they change how much the drain loop may do per tick, and none of them
+# drives, poses or ends a run.
+VoxelApplyCap
+VoxelApplyBudgetMs
+VoxelApplyDrainCap
 # --- 2026-08-23: the fine-tier sampler lock ---------------------------------
 # ue-project/Source/VoxelEarth/VoxelFineLockMeter.h and VoxelFineTileStreamer.
 # Both are tuning/instrument: -VoxelFineLockFast picks how RequestFootprint
@@ -281,3 +291,17 @@ VoxelApplyColumnCacheAudit
 # the rule is right and the name was wrong.
 VoxelFineLockFast
 VoxelFineLockMeter
+
+# --- 2026-08-23 late: frame-phase reconciliation ----------------------------
+# ue-project/Source/VoxelEarth/VoxelFramePhase.h. A passive per-frame meter
+# that splits a frame into voxelTick / gameOther / gameWait / RESIDUAL and
+# prints the residual explicitly, so "not the render thread" is a sayable
+# result. -VoxelFramePhaseHeavy= sizes the heavy-frame bucket. Instrument and
+# tuning; neither drives, poses or ends a run, and both are meant to be
+# readable on an ordinary launch.
+#
+# NOT named *Probe or *Verify, for the reason VoxelFineLockMeter records: those
+# substrings are in kSelfDrivingSubstrings and would silently take the front
+# end away from a developer who only wanted the numbers.
+VoxelFramePhase
+VoxelFramePhaseHeavy
