@@ -12,7 +12,81 @@ for f in "$@"; do
   printf "%-18s " "$f"
   grep "VoxelPerfRun complete" "$log" | tail -1 | grep -o "frames=[0-9]* p50=[0-9.]*ms p95=[0-9.]*ms.*hitches=[0-9]*" | tr -d '\n'
   packs=$(grep -o 'brickPacks=[0-9]*' "$log" | sort -t= -k2 -n | tail -1 | cut -d= -f2)
-  holes=$(grep -o 'holes=[0-9]* scanned=[0-9]*' "$log" | tail -1)
+  # HOLES: PEAK **AND** LAST, and the peak is the one that means anything.
+  #
+  # THIS LINE USED TO BE `grep ... | tail -1` -- the exact "last:" read the
+  # header of this very script exists to forbid, in the one counter where the
+  # last window is guaranteed to be the least interesting. The flight ends,
+  # LingerSec seconds of PARKED pose follow, and a parked camera has had time
+  # to cover everything it can see, so the tail reads ~0 by construction. It is
+  # not a measurement of coverage; it is a measurement of having stopped.
+  #
+  # WHAT IT COST. The D-stock/D-armed pair was read through this line and
+  # reported `holes 0 -> 10`, i.e. "arming the GPU-primary set introduces
+  # holes". That number went into a source comment as an owner-visible-defect
+  # regression and into a decision the owner was asked to make. Read over the
+  # FLIGHT windows instead, the same two logs say:
+  #
+  #     leg       last window   peak in-flight window
+  #     D-stock   0             8382   of 30168 scanned
+  #     D-armed   10            1859   of 30154 scanned
+  #
+  # The sign REVERSES: armed has ~4.5x FEWER holes while actually flying, which
+  # is the regime the owner complains about ("whenever the player flies
+  # forward"). The armed leg's residual 10 are a frozen parked-pose residue --
+  # the same 8 R2 columns at r=511-512 m, cause=no-record, byte-identical in
+  # all 29 linger windows.
+  #
+  # So this is the SECOND time this script has been the source of the trap it
+  # was written to prevent (the first was passes/tick, wrong by 33x, fixed by
+  # adding last:/peak: to the other counters -- and holes was simply missed).
+  # Printing both is the fix, because for holes the two numbers answer
+  # different questions and BOTH get asked: peak = "did the player ever see
+  # through the world", last = "did it converge once parked". A leg that ends
+  # with holesLast>0 has a genuine unadmitted residue worth a coordinate dump;
+  # a leg with a large holesPeak had visible gaps in flight even if it tidied
+  # up afterwards.
+  # THE GLOBAL PEAK IS ALSO THE WRONG WINDOW, for the opposite reason to last:.
+  #
+  # Window 1 is taken before anything has streamed, so EVERY leg peaks at
+  # ~27,000 holes there regardless of configuration -- it measures having just
+  # started, exactly as `last:` measures having stopped. Reading the global peak
+  # on the D-pair gives 27,498 vs 27,197: a 1% difference, which reads as "the
+  # configuration makes no difference to holes" and buries the finding.
+  #
+  # The regime that matters is FLIGHT, and its boundary needs no hand-picked
+  # index: the initial fill is over the first time coverage converges. So peak
+  # AFTER first convergence is the flight peak, and it is reproducible.
+  # On the D-pair that rule yields:
+  #
+  #     leg       fill peak   FLIGHT peak   flight mean   last
+  #     D-stock   27498       8382          2651          0
+  #     D-armed   27197       1859           721         10
+  #
+  # Armed has 4.5x FEWER holes in flight and 3.7x fewer on average -- the regime
+  # the owner complains about ("whenever the player flies forward"). Its
+  # residual 10 is a frozen parked-pose residue: the same 8 R2 columns at
+  # r=511-512 m, cause=no-record, byte-identical across all 29 linger windows.
+  #
+  # Read holesFlight for "did the player ever see through the world while
+  # moving", and holesLast for "did it converge once parked". Both get asked and
+  # they can disagree in sign, which is how `holes 0 -> 10` reached a source
+  # comment and an owner decision as a regression when flight says the reverse.
+  holes=$(grep -o 'holes=[0-9]* scanned=[0-9]*' "$log" | awk '
+    { split($0, a, /[= ]/); h[NR] = a[2] + 0; sc[NR] = a[4] + 0 }
+    END {
+      if (NR == 0) { printf "holes=UNARMED(no coverage line -- this leg cannot report a hole)"; exit }
+      conv = 0
+      for (i = 1; i <= NR; i++) if (h[i] <= 10) { conv = i; break }
+      fill = 0
+      for (i = 1; i <= (conv ? conv : NR); i++) if (h[i] > fill) fill = h[i]
+      fpk = 0; fsum = 0; fn = 0
+      if (conv) for (i = conv + 1; i <= NR; i++) { if (h[i] > fpk) fpk = h[i]; fsum += h[i]; fn++ }
+      printf "holesFill=%d holesFlight=%d", fill, fpk
+      if (fn) printf " holesFlightMean=%.0f", fsum / fn
+      printf " holesLast=%d/%d", h[NR], sc[NR]
+      if (!conv) printf " (NEVER CONVERGED -- flight window undefined)"
+    }')
   cyc=$(grep -o "cycPerColumn=[0-9]*" "$log" | awk -F= '{if($2>0){s+=$2;n++}} END{if(n)printf "%.0f",s/n; else printf "n/a"}')
   disp=$(grep -o "job flow ([^)]*window): dispatched=[0-9]*" "$log" | awk -F= '{s+=$NF} END{printf "%d",s}')
   echo " | packs=$packs cycPerColumn=$cyc dispatched=$disp $holes"

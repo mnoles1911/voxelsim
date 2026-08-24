@@ -184,13 +184,24 @@ if (-not $Mcp) {
     $argList += '-ini:EditorPerProjectUserSettings:[/Script/ModelContextProtocolEngine.ModelContextProtocolSettings]:bAutoStartServer=False'
 }
 
+# EXIT CODES, NOT JUST A RETURN VALUE.
+#
+# Every VOID path below used `return $false`. At script scope that sets no
+# process exit code, so `powershell -File voxel-run-flight-leg.ps1 ...` exits 0
+# on a leg this script has just correctly diagnosed as void -- the careful
+# three-witness acceptance test below reaches nothing that automates it. A leg
+# that died 15 s into a 270 s flight reported success to its caller, which is
+# the same failure family as a piped Build.bat reporting the pager's exit code.
+# No caller consumes the boolean (checked across tools/ and docs/ -- every
+# other reference is a comment), so these are `exit 1` / `exit 0` now.
+
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
 $p.WaitForExit($TimeoutSec * 1000) | Out-Null
 
 if (-not $p.HasExited) {
     Stop-Process -Id $p.Id -Force
     Write-Host "  ${LogName}: KILLED at ${TimeoutSec}s -- treat as VOID, not as a slow result." -ForegroundColor Yellow
-    return $false
+    exit 1
 }
 
 # A flight leg's own clock is ~PreflightSec + RunSec + LingerSec. Much shorter
@@ -200,7 +211,7 @@ $expected = $PreflightSec + $RunSec + $LingerSec
 if ($elapsed -lt ($expected * 0.9)) {
     Write-Host ("  ${LogName}: exited after ${elapsed}s but the run's own clock is ~${expected}s -- " +
                 "VOID (it did not complete its flight).") -ForegroundColor Yellow
-    return $false
+    exit 1
 }
 
 # THE WALL-CLOCK TEST ALONE IS NOT AN ACCEPTANCE TEST, and it has now let a bad
@@ -236,11 +247,11 @@ if (-not $logSaysComplete -or -not $perfJson) {
     Write-Host ("  ${LogName}: ran ${elapsed}s but " + ($why -join ' and ') +
                 " -- VOID. FinishRun did not complete, so the flight phase this leg " +
                 "claims to measure did not finish. Do not read numbers out of it.") -ForegroundColor Yellow
-    return $false
+    exit 1
 }
 
 # The sun goes in the console line for the same reason the resolution does: a
 # result pasted out of a terminal without it is not a result.
 $sun = if ($TimeScale -eq 0) { "frozen $TimeOfDay $Date" } else { "MOVING x$TimeScale from $TimeOfDay $Date" }
 Write-Host "  ${LogName}: ok (${elapsed}s) at ${Width}x${Height}, sun $sun" -ForegroundColor Green
-return $true
+exit 0
