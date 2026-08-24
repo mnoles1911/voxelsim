@@ -183,6 +183,11 @@ VoxelGpuMesh
 VoxelGpuMeshQueueDepth
 VoxelGpuPoolAlloc
 VoxelGpuWorldGenBatch
+VoxelEditedLaneGate
+VoxelRadialCensus
+VoxelRecomputeCensus
+VoxelResidencyAdmitBudget
+VoxelRingOrderScan
 VoxelHierarchicalCoverage
 VoxelInnerHysteresisChunks
 VoxelNoHierarchicalCoverage

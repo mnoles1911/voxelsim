@@ -61,7 +61,16 @@ namespace VoxelResidency
 	constexpr uint32 kCtrZVisited = 13;
 	constexpr uint32 kCtrOverflow = 14;
 	constexpr uint32 kCtrExitVisited = 15;
-	constexpr uint32 kNumCounters = 16;
+	constexpr uint32 kCtrBudgetRej = 16;
+	constexpr uint32 kCtrHistTotal = 17;
+	constexpr uint32 kNumCounters = 18;
+
+	// Distance-histogram resolution for the GPU admission budget. Bins are
+	// equal-AREA (they partition SQUARED distance), so a uniform annulus fills
+	// them evenly and the resolved threshold lands within one bin's occupancy
+	// of the budget. 1024 bins is 4 KB per level -- 24 KB of transient buffer
+	// for the whole cascade, cleared per dispatch.
+	constexpr uint32 kHistBins = 1024;
 
 	constexpr uint32 kOpInsert = 1;
 	constexpr uint32 kOpRemove = 2;
@@ -205,6 +214,11 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AdmitList)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ResurrectList)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ColdList)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AdmitHist)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, BudgetThresholdSq)
+			SHADER_PARAMETER(uint32, AdmitBudget)
+			SHADER_PARAMETER(uint32, EmitPhase)
+			SHADER_PARAMETER(uint32, HistBins)
 			SHADER_PARAMETER(uint32, AdmitCap)
 			SHADER_PARAMETER(uint32, ResurrectCap)
 			SHADER_PARAMETER(uint32, ColdCap)
@@ -221,6 +235,32 @@ namespace
 			SHADER_PARAMETER_ARRAY(FVector4f, LevelRadiiB, [8])
 			SHADER_PARAMETER_ARRAY(FVector4f, LevelAnchorFrac, [8])
 			SHADER_PARAMETER_ARRAY(FIntVector4, LevelAnchorChunk, [8])
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// The budget resolve. EVERY loose global its kernel reads must be declared
+	// here: the .usf shares one global namespace across all six kernels, and a
+	// global a kernel reads but its FParameters omits binds to nothing and
+	// reads garbage silently. (MaxRingLevel was missing from four of five
+	// structs until 2026-08-23.) tools/lint-residency-globals.py checks this
+	// mechanically -- run it after touching either file.
+	class FVoxelResidencyBudgetResolveCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelResidencyBudgetResolveCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelResidencyBudgetResolveCS, FGlobalShader);
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& P)
+		{
+			return IsFeatureLevelSupported(P.Platform, ERHIFeatureLevel::SM5);
+		}
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AdmitHist)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, BudgetThresholdSq)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, Counters)
+			SHADER_PARAMETER(uint32, NumLevels)
+			SHADER_PARAMETER(uint32, HistBins)
+			SHADER_PARAMETER_ARRAY(FIntVector4, LevelAdmitBudget, [2])
+			SHADER_PARAMETER_ARRAY(FVector4f, LevelRadiiA, [8])
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
@@ -246,6 +286,8 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelResidencyFeedbackCS, VOXEL_RESIDENCY_USF, "Feedbac
 IMPLEMENT_GLOBAL_SHADER(FVoxelResidencyZRangeCS, VOXEL_RESIDENCY_USF, "ZRangeCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelResidencyExitScanCS, VOXEL_RESIDENCY_USF, "ExitScanCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelResidencyEntryScanCS, VOXEL_RESIDENCY_USF, "EntryScanCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelResidencyBudgetResolveCS, VOXEL_RESIDENCY_USF, "BudgetResolveCS",
+                        SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelResidencyAuditCS, VOXEL_RESIDENCY_USF, "AuditCS", SF_Compute);
 
 // ---------------------------------------------------------------------------
@@ -305,6 +347,10 @@ struct FVoxelResidencyGpu::FImpl
 
 	// ---- game-thread state --------------------------------------------------
 	int32 Mode = -1; // -1 = not latched yet
+	// -VoxelResidencyAdmitBudget=N, latched with the mode. 0 = OFF and the
+	// dispatch is byte-identical to the pre-budget one (no histogram pass, no
+	// resolve pass, EmitPhase 1 only). See the .usf header for why it exists.
+	int32 AdmitBudget = 0;
 	bool bNeedsResync = true;
 	bool bClearGridOnNextDispatch = true;
 	bool bInBracket = false;
@@ -347,6 +393,17 @@ struct FVoxelResidencyGpu::FImpl
 		uint64 Dispatches = 0, SkippedInFlight = 0, SkippedUnderground = 0, Uncompared = 0;
 		uint64 GpuAdmit = 0, GpuEvict = 0, GpuResurrect = 0, GpuCold = 0, GpuOrphan = 0;
 		uint64 Overflows = 0;
+		// The kernels' own enumeration traffic. These were written by the
+		// shader from the first commit and read by NOTHING until 2026-08-23 --
+		// four InterlockedAdds on the hot path feeding an instrument that did
+		// not exist. They are the GPU-side answer to "how many candidates does
+		// the annulus produce, and where do they die".
+		uint64 GpuCandVisited = 0;  // XY footprints past the inner/outer/seam gates
+		uint64 GpuZVisited = 0;     // Z-column cells examined
+		uint64 GpuCutoffRej = 0;    // cells the ring cutoff refused
+		uint64 GpuBudgetRej = 0;    // cells the GPU admission budget refused
+		uint64 GpuHistTotal = 0;    // histogram-pass total; == GpuAdmit + GpuBudgetRej
+		uint64 GpuExitVisited = 0;  // tracked cells the exit kernel walked
 		uint64 FbStaged = 0, FbApplied = 0, FbDropped = 0, FbCollisions = 0;
 		uint64 EvictMatch = 0, EvictMissed = 0, EvictExtra = 0, EvictBoundary = 0;
 		uint64 AdmitCovered = 0, MissedSurface = 0, MissedBoundary = 0, MissedDeep = 0;
@@ -359,12 +416,32 @@ struct FVoxelResidencyGpu::FImpl
 		uint64 LiveConsumed = 0;     // deltas handed to the subsystem
 		uint64 LiveSuperseded = 0;   // staged deltas replaced by a newer one before consumption
 		uint64 LiveEmptyRetired = 0; // deltas with no proposals and no scanned level (nothing stampable)
+		// The two mode-2 lanes that fall back to the FULL CPU walks without the
+		// subsystem ever building a live outcome, so they used to report as an
+		// all-zero live line -- indistinguishable from a dead GPU path. Counted
+		// here, where the manager already knows both facts, so no subsystem
+		// hook is needed. Either climbing means the leg's timings are measuring
+		// the CPU arm.
+		uint64 LiveUndergroundCalls = 0; // anchor underground: recompute is CPU-only by design
+		uint64 LiveResyncCalls = 0;      // mirror replayed this call: CPU walks forced
 		FVoxelResidencyLiveOutcome Live; // summed subsystem adjudication reports
 	};
 	FStats Since; // reset each log window
 	FStats Total; // lifetime
 	int32 AuditMismatchStreak = 0;
 	double LastLogSeconds = 0.0;
+	double LastWindowSeconds = 0.0; // the REAL span of the window just closed
+	// THE WINDOW IS NOT 5 SECONDS (2026-08-23). This logger gated on a
+	// hardcoded 5.0 while every flight leg passes -VoxelPerfLogInterval=2, so
+	// its windows and the LogVoxelPerf windows were 2.5x apart and any
+	// side-by-side reading of the two families -- "prop per window" against
+	// "recompute per window" -- was wrong by that factor. This is the same
+	// defect the lane holder found in MaybeLogCounters' `WindowMs = 5000.0`
+	// divisor, in a second place, which is why the interval is now READ rather
+	// than assumed and the real elapsed seconds are PRINTED on the line. A
+	// window whose length is asserted rather than measured is a denominator
+	// nobody checks.
+	double LogIntervalSeconds = 0.0; // 0 = not latched yet
 	// Anchor of the most recent OnRecomputeBegin, and its value at the last
 	// log flush: their XY distance prints on the live line as move=, which is
 	// what makes an all-zero window READABLE ON ITS OWN. Zero proposals with
@@ -385,8 +462,21 @@ struct FVoxelResidencyGpu::FImpl
 			int32 Requested = 0;
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuResidency="), Requested);
 			Mode = FMath::Clamp(Requested, 0, 2);
+			int32 Budget = 0;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelResidencyAdmitBudget="), Budget);
+			AdmitBudget = FMath::Max(0, Budget);
 			if (Mode != 0)
 			{
+				if (AdmitBudget > 0)
+				{
+					UE_LOG(LogVoxelResidGpu, Log,
+					       TEXT("[gpu-resid] admission budget ON: the entry scan emits only the ")
+					       TEXT("NEAREST ~%d candidates per level. Read budRej WITH adOK -- budRej ")
+					       TEXT("climbing while adOK holds is the win; adOK falling with it is ")
+					       TEXT("over-throttling. budRej=0 with histTot>0 means the threshold ")
+					       TEXT("never bound."),
+					       AdmitBudget);
+				}
 				if (Mode == 2)
 				{
 					UE_LOG(LogVoxelResidGpu, Log,
@@ -507,6 +597,14 @@ struct FVoxelResidencyGpu::FImpl
 	// ---- resync ------------------------------------------------------------
 	void BeginResyncReplay()
 	{
+		// Mode 2: this recompute's CPU walks are forced (bResidResyncedThisCall
+		// in the subsystem), and the replay itself is O(ChunkRecords). Counted
+		// so a drift storm cannot read as a healthy live window.
+		if (Mode == 2)
+		{
+			++Since.LiveResyncCalls;
+			++Total.LiveResyncCalls;
+		}
 		StagedFeedback.Reset();
 		StagedTexels.Reset();
 		TexelMirror.Reset();
@@ -566,6 +664,14 @@ struct FVoxelResidencyGpu::FImpl
 			// level). No dispatch; the recompute is CPU-owned and counted.
 			++Since.SkippedUnderground;
 			++Total.SkippedUnderground;
+			if (Mode == 2)
+			{
+				// Mode 2's second silent CPU lane: no dispatch, no delta, and
+				// the subsystem's live-outcome block is skipped entirely, so
+				// this call reports as all-zero on the live line. Counted here.
+				++Since.LiveUndergroundCalls;
+				++Total.LiveUndergroundCalls;
+			}
 			return;
 		}
 		if (InFlight.Num() >= kMaxInFlight)
@@ -629,9 +735,12 @@ struct FVoxelResidencyGpu::FImpl
 			float SkirtMidFrac = 0.f;
 			uint32 SkirtPacked = 0;
 			uint32 ScanMask = 0;
+			int32 AdmitBudget = 0;
+			int32 LevelBudget[8] = {};
 			int32 Spans[8] = {};
 		};
 		FShaderConsts K;
+		K.AdmitBudget = AdmitBudget; // captured by value with everything else
 		K.NumLevels = uint32(FMath::Clamp(P.NumLevels, 1, int32(kMaxLevels)));
 		// Clamped below NumLevels so the kernel's seam-parent access at L+1
 		// can never index past the populated params (the CPU accessor already
@@ -665,6 +774,10 @@ struct FVoxelResidencyGpu::FImpl
 			K.AnchorChunk[I] =
 				FIntVector4(LP.AnchorChunk.X, LP.AnchorChunk.Y, LP.AnchorChunk.Z, LP.ChunkSpan);
 			K.Spans[I] = LP.ChunkSpan;
+			// The ring's own allowance when the subsystem supplies one, else
+			// the command-line number. Resolved HERE, once, by value -- the
+			// shader must never have to choose between two sources for a knob.
+			K.LevelBudget[I] = LP.AdmitBudget > 0 ? LP.AdmitBudget : AdmitBudget;
 			if (LP.bScanThisDispatch && I <= P.MaxRingLevel)
 			{
 				K.ScanMask |= 1u << I;
@@ -725,6 +838,25 @@ struct FVoxelResidencyGpu::FImpl
 			FRDGBufferRef Cold = MakeList(TEXT("VoxelResidency.Cold"), kColdCap);
 			FRDGBufferRef Orphan = MakeList(TEXT("VoxelResidency.Orphan"), kOrphanCap);
 
+			// The budget lane's two transient buffers. Always created and
+			// always bound (an unbound UAV is a validation failure even on a
+			// path that never reads it); only WRITTEN when the budget is on.
+			// The histogram must start at zero every dispatch -- a stale
+			// histogram would resolve a threshold for the PREVIOUS anchor,
+			// which is the quiet way this feature could throttle the wrong
+			// ring. BudgetThresholdSq is cleared to +inf as 0x7F7FFFFF so that
+			// a resolve pass that never ran cannot throttle anything: the
+			// failure direction is always "emit everything", never "emit
+			// nothing".
+			FRDGBufferRef AdmitHist = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Levels * kHistBins),
+				TEXT("VoxelResidency.AdmitHist"));
+			FRDGBufferRef BudgetThresh = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(float), FMath::Max(Levels, 1u)),
+				TEXT("VoxelResidency.BudgetThresholdSq"));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(AdmitHist), 0u);
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(BudgetThresh), 0x7F7FFFFFu);
+
 			const auto ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 
 			// 1. Feedback (ordered, single lane -- see the kernel's comment).
@@ -783,15 +915,21 @@ struct FVoxelResidencyGpu::FImpl
 					FIntVector(int32(kDimXY / 8), int32(kDimXY / 8), int32(Levels * kDimZ / 8)));
 			}
 
-			// 4. Entry scan, per gated level.
-			for (uint32 LevelIdx = 0; LevelIdx < Levels; ++LevelIdx)
+			// 4. Entry scan. With the budget OFF this is exactly one emit pass
+			// per gated level, as before. With it ON the chain is
+			// histogram(all levels) -> resolve -> emit(all levels); RDG's UAV
+			// dependencies order the three, and both enumeration phases MUST
+			// see the same ShadowGrid (nothing writes it between them).
+			const uint32 Budget = uint32(K.AdmitBudget);
+			auto AddEntryPass = [&](uint32 LevelIdx, uint32 EmitPhase)
 			{
-				if ((K.ScanMask & (1u << LevelIdx)) == 0)
-				{
-					continue;
-				}
 				TShaderMapRef<FVoxelResidencyEntryScanCS> CS(ShaderMap);
 				auto* Params = GraphBuilder.AllocParameters<FVoxelResidencyEntryScanCS::FParameters>();
+				Params->AdmitHist = GraphBuilder.CreateUAV(AdmitHist);
+				Params->BudgetThresholdSq = GraphBuilder.CreateUAV(BudgetThresh);
+				Params->AdmitBudget = Budget;
+				Params->EmitPhase = EmitPhase;
+				Params->HistBins = kHistBins;
 				Params->ShadowGrid = GraphBuilder.CreateUAV(Shadow);
 				Params->ZRangeGrid = GraphBuilder.CreateUAV(ZRange);
 				Params->Counters = GraphBuilder.CreateUAV(Counters);
@@ -819,9 +957,49 @@ struct FVoxelResidencyGpu::FImpl
 				}
 				const int32 BoxEdge = 2 * K.Spans[LevelIdx] + 1;
 				const int32 Groups = FMath::DivideAndRoundUp(BoxEdge, 8);
+				FComputeShaderUtils::AddPass(
+					GraphBuilder,
+					RDG_EVENT_NAME("VoxelResidency::EntryScan L%u phase%u", LevelIdx, EmitPhase),
+					CS, Params, FIntVector(Groups, Groups, 1));
+			};
+
+			if (Budget > 0)
+			{
+				for (uint32 LevelIdx = 0; LevelIdx < Levels; ++LevelIdx)
+				{
+					if ((K.ScanMask & (1u << LevelIdx)) != 0)
+					{
+						AddEntryPass(LevelIdx, 0u);
+					}
+				}
+				TShaderMapRef<FVoxelResidencyBudgetResolveCS> CS(ShaderMap);
+				auto* Params =
+					GraphBuilder.AllocParameters<FVoxelResidencyBudgetResolveCS::FParameters>();
+				Params->AdmitHist = GraphBuilder.CreateUAV(AdmitHist);
+				Params->BudgetThresholdSq = GraphBuilder.CreateUAV(BudgetThresh);
+				Params->Counters = GraphBuilder.CreateUAV(Counters);
+				Params->NumLevels = Levels;
+				Params->HistBins = kHistBins;
+				for (int32 I = 0; I < 2; ++I)
+				{
+					Params->LevelAdmitBudget[I] =
+						FIntVector4(K.LevelBudget[I * 4 + 0], K.LevelBudget[I * 4 + 1],
+					                K.LevelBudget[I * 4 + 2], K.LevelBudget[I * 4 + 3]);
+				}
+				for (int32 I = 0; I < 8; ++I)
+				{
+					Params->LevelRadiiA[I] = K.RadiiA[I];
+				}
 				FComputeShaderUtils::AddPass(GraphBuilder,
-				                             RDG_EVENT_NAME("VoxelResidency::EntryScan L%u", LevelIdx),
-				                             CS, Params, FIntVector(Groups, Groups, 1));
+				                             RDG_EVENT_NAME("VoxelResidency::BudgetResolve"), CS,
+				                             Params, FIntVector(1, 1, 1));
+			}
+			for (uint32 LevelIdx = 0; LevelIdx < Levels; ++LevelIdx)
+			{
+				if ((K.ScanMask & (1u << LevelIdx)) != 0)
+				{
+					AddEntryPass(LevelIdx, 1u);
+				}
 			}
 
 			// 5. Audit, on cadence.
@@ -923,6 +1101,10 @@ struct FVoxelResidencyGpu::FImpl
 		A.ColdEnumerated += B.ColdEnumerated;
 		A.ColdDeferred += B.ColdDeferred;
 		A.EditedEnumerated += B.EditedEnumerated;
+		A.EditedFullSweeps += B.EditedFullSweeps;
+		A.EditedDirtyPasses += B.EditedDirtyPasses;
+		A.EditedSkipped += B.EditedSkipped;
+		A.EditedDeferred += B.EditedDeferred;
 		A.ResidualWalked += B.ResidualWalked;
 		A.EvictMs += B.EvictMs;
 		A.AdmitMs += B.AdmitMs;
@@ -1219,6 +1401,21 @@ struct FVoxelResidencyGpu::FImpl
 		Total.FbDropped += Seq.Counters[kCtrFbDropped];
 		Since.FbCollisions += Seq.Counters[kCtrCollision];
 		Total.FbCollisions += Seq.Counters[kCtrCollision];
+		// The enumeration traffic the kernels have always counted. candV/zV
+		// are what the CPU sweep used to walk on the game thread; budRej is
+		// what the GPU budget kept off it.
+		Since.GpuCandVisited += Seq.Counters[kCtrCandVisited];
+		Total.GpuCandVisited += Seq.Counters[kCtrCandVisited];
+		Since.GpuZVisited += Seq.Counters[kCtrZVisited];
+		Total.GpuZVisited += Seq.Counters[kCtrZVisited];
+		Since.GpuCutoffRej += Seq.Counters[kCtrCutoffRej];
+		Total.GpuCutoffRej += Seq.Counters[kCtrCutoffRej];
+		Since.GpuBudgetRej += Seq.Counters[kCtrBudgetRej];
+		Total.GpuBudgetRej += Seq.Counters[kCtrBudgetRej];
+		Since.GpuHistTotal += Seq.Counters[kCtrHistTotal];
+		Total.GpuHistTotal += Seq.Counters[kCtrHistTotal];
+		Since.GpuExitVisited += Seq.Counters[kCtrExitVisited];
+		Total.GpuExitVisited += Seq.Counters[kCtrExitVisited];
 
 		// Orphans move to the CPU residual ledger: their hash leaves the CPU
 		// xor (their cell no longer names them) and their eventual removal
@@ -1544,14 +1741,30 @@ struct FVoxelResidencyGpu::FImpl
 			LastLogSeconds = Now;
 			return;
 		}
-		if (Now - LastLogSeconds < 5.0)
+		if (LogIntervalSeconds <= 0.0)
+		{
+			// Same source the perf logger reads, latched once. Falls back to 5 s
+			// only when the switch is absent, which is also what the perf lines
+			// do, so the two families stay on the same window by construction
+			// instead of by coincidence.
+			float Interval = 0.f;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfLogInterval="), Interval);
+			LogIntervalSeconds = Interval > 0.f ? double(Interval) : 5.0;
+		}
+		if (Now - LastLogSeconds < LogIntervalSeconds)
 		{
 			return;
 		}
+		LastWindowSeconds = Now - LastLogSeconds;
 		LastLogSeconds = Now;
 		// Nothing moved and nothing pending: stay quiet (idle menus etc.).
+		// SkippedUnderground and the two live CPU-fallback lanes join the quiet
+		// test deliberately: a recompute that took one of them dispatches
+		// nothing, so without them a fully underground flight -- or a drift
+		// storm -- would print NO line at all and read as an idle menu.
 		if (Since.Dispatches == 0 && Since.GpuAdmit == 0 && Since.FbStaged == 0 &&
-		    InFlight.Num() == 0)
+		    Since.SkippedUnderground == 0 && Since.LiveUndergroundCalls == 0 &&
+		    Since.LiveResyncCalls == 0 && InFlight.Num() == 0)
 		{
 			Since = FStats();
 			Since.LastAuditGpuCount = Total.LastAuditGpuCount;
@@ -1559,16 +1772,20 @@ struct FVoxelResidencyGpu::FImpl
 			return;
 		}
 		UE_LOG(LogVoxelResidGpu, Log,
-		       TEXT("[gpu-resid] disp=%llu skipFull=%llu skipUG=%llu uncmp=%llu inflight=%d | ")
+		       TEXT("[gpu-resid] win=%.1fs disp=%llu skipFull=%llu skipUG=%llu uncmp=%llu inflight=%d | ")
 		       TEXT("gpu: admit=%llu evict=%llu res=%llu cold=%llu orphan=%llu ovf=%llu | ")
+		       TEXT("enum: candV=%llu zV=%llu cutRej=%llu budRej=%llu histTot=%llu ")
+		       TEXT("exitV=%llu | ")
 		       TEXT("cmp: evOK=%llu evMISS=%llu evEXTRA=%llu evBnd=%llu adOK=%llu ")
 		       TEXT("adMISS-SURFACE=%llu adBnd=%llu adDeep=%llu adHatch=%llu adCold=%llu ")
 		       TEXT("adOvf=%llu extra=%llu resOK=%llu resMiss=%llu | fb: staged=%llu ")
 		       TEXT("applied=%llu dropped=%llu collide=%llu residual=%d | audit: pass=%llu ")
 		       TEXT("fail=%llu cpu=%lld gpu=%lld | records~%lld"),
-		       Since.Dispatches, Since.SkippedInFlight, Since.SkippedUnderground,
+		       LastWindowSeconds, Since.Dispatches, Since.SkippedInFlight, Since.SkippedUnderground,
 		       Since.Uncompared, InFlight.Num(), Since.GpuAdmit, Since.GpuEvict,
 		       Since.GpuResurrect, Since.GpuCold, Since.GpuOrphan, Since.Overflows,
+		       Since.GpuCandVisited, Since.GpuZVisited, Since.GpuCutoffRej, Since.GpuBudgetRej,
+		       Since.GpuHistTotal, Since.GpuExitVisited,
 		       Since.EvictMatch, Since.EvictMissed, Since.EvictExtra, Since.EvictBoundary,
 		       Since.AdmitCovered, Since.MissedSurface, Since.MissedBoundary, Since.MissedDeep,
 		       Since.MissedEditHatch, Since.MissedCold, Since.MissedOverflow,
@@ -1576,6 +1793,37 @@ struct FVoxelResidencyGpu::FImpl
 		       Since.FbStaged, Since.FbApplied, Since.FbDropped, Since.FbCollisions,
 		       Residual.Num(), Since.AuditPass, Since.AuditFail, (long long)Since.LastAuditCpuCount,
 		       (long long)Since.LastAuditGpuCount, (long long)CpuCount);
+		// The enum: block, and its failing readings. These are GPU-side traffic --
+		// they move whether or not anything is consumed, which is why they go
+		// first.
+		//   candV/zV = 0 with disp > 0  -> the entry kernel is not running at
+		//     all (dead permutation, empty ScanMask, span 0). No comparison and
+		//     no timing on such a leg means anything.
+		//   zV enormous against admit   -> the annulus is producing candidates
+		//     the CPU cannot use. This is the GPU-side form of the streaming
+		//     line's candidatesRejected, and it is the ratio the budget below
+		//     exists to close.
+		//   exitV = 0 while records~ > 0 -> the mirror is empty; the exit scan
+		//     is walking nothing and evict proposals cannot appear at all.
+		// The BUDGET (-VoxelResidencyAdmitBudget), and its pair rule -- never
+		// read budRej alone:
+		//   budRej = 0, histTot = 0     -> the switch is OFF, or never latched.
+		//   budRej = 0, histTot > 0     -> the switch is on and the threshold
+		//     NEVER BOUND: either every level fits inside the budget (legitimate
+		//     once the world converges) or the resolve fell into its last-bin
+		//     catch-all. "Fired but did nothing" -- a different fault from the
+		//     line above, and the two are distinguishable only because histTot
+		//     is printed next to it.
+		//   admit + budRej != histTot   -> the histogram phase and the emit
+		//     phase enumerated different candidate sets. This is an exact
+		//     identity across the two passes, not a statistic, and it can fail
+		//     in both directions.
+		//   budRej climbing WITH adOK holding -> the win.
+		//   budRej climbing WITH adOK falling -> OVER-THROTTLED: the budget is
+		//     below what the level can absorb, and streaming will starve. This
+		//     is the reading that makes the switch refutable instead of merely
+		//     "the numbers got smaller".
+		//
 		// The mode-2 line. Failing readings, stated in advance (the counter
 		// rule: every lane here can come out the other way):
 		//   admit=0 (adOK+adopt+res all zero) WITH move >> a chunk edge and
@@ -1603,8 +1851,36 @@ struct FVoxelResidencyGpu::FImpl
 		//     -> everything is coming back through the CPU-enumeration lane:
 		//        the walk has been MOVED, not removed. Aokana's failure.
 		//   firstScans climbing past kNumLevels -> live never holds a level.
+		//   ug= or resync= climbing -> the recompute took a lane that runs the
+		//     FULL CPU walks and never builds a live outcome, so every other
+		//     number on this line stays 0 for that call. Before these two
+		//     counters existed, an underground flight or a drift storm printed
+		//     exactly the same all-zero live line as a dead GPU path.
 		//   editEnum growing without edits happening -> the edited maps are
 		//     leaking into the annulus test.
+		// The -VoxelEditedLaneGate lanes (editFull/editDirty/editSkip/editDefer).
+		// The lane they bound re-walked the WHOLE edit map every live call, so
+		// these are read as a PAIR and neither alone is a verdict:
+		//   editSkip=0 with edits present and move= large -> the gate NEVER
+		//     SKIPS. Either a footprint is parked on a ring edge (slack is
+		//     genuinely 0 -- legitimate, and the floor is exactly the old
+		//     behaviour) or NoteEnumerated is not being called and the slack
+		//     was never computed at all. Only distinguishable because the
+		//     gate's own slack is printed beside it by the caller.
+		//   editFull=0 across a window containing a teleport or a long flight
+		//     -> the gate NEVER SWEEPS: the slack arithmetic is wrong in the
+		//     UNSAFE direction and edited chunks are being missed. This is the
+		//     dangerous half, and it is why editFull is a counter rather than
+		//     an implied remainder.
+		//   editFull+editDirty+editSkip != consume calls with edits present ->
+		//     a call took none of the three paths. That is the silent-lane
+		//     failure this file has now found in three places (underground,
+		//     resync, and this one).
+		//   editDefer climbing while editFull does not -> the per-call sweep
+		//     budget is under the edit-map size and the tail is starving. Not
+		//     a hole (the sweep resumes by construction, the gate refuses to
+		//     publish a slack for a truncated sweep), but a dig then takes
+		//     several recomputes to appear.
 		if (Mode == 2)
 		{
 			const FVoxelResidencyLiveOutcome& L = Since.Live;
@@ -1612,17 +1888,21 @@ struct FVoxelResidencyGpu::FImpl
 				FVector2D(LastDispatchAnchor.X - LogWindowAnchor.X,
 			              LastDispatchAnchor.Y - LogWindowAnchor.Y).Size();
 			UE_LOG(LogVoxelResidGpu, Log,
-			       TEXT("[gpu-resid] live: move=%.0fuu delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
+			       TEXT("[gpu-resid] live: win=%.1fs move=%.0fuu delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
 			       TEXT("ad: prop=%u adOK=%u adopt=%u res=%u stale=%u rejFine=%u rejBud=%u ")
 			       TEXT("rejCut=%u | ev: prop=%u q=%u VETO=%u stale=%u resid=%u | cold: prop=%u ")
-			       TEXT("enum=%u defer=%u | edit=%u | fallback: cpuCalls=%u firstScans=%u | ")
+			       TEXT("enum=%u defer=%u | edit: enum=%u full=%u dirty=%u skip=%u defer=%u | ")
+			       TEXT("fallback: cpuCalls=%u firstScans=%u ")
+			       TEXT("ug=%llu resync=%llu | ")
 			       TEXT("ms ev=%.2f ad=%.2f"),
-			       MoveUU, Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
+			       LastWindowSeconds, MoveUU, Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
 			       L.NoDeltaCalls, L.AdmitProposals, L.AdmitAdmitted, L.AdmitAdopted,
 			       L.AdmitResurrected, L.AdmitStale, L.AdmitRejFine, L.AdmitRejBudget,
 			       L.AdmitRejCutoff, L.EvictProposals, L.EvictQueued, L.EvictVetoed,
 			       L.EvictStale, L.ResidualWalked, L.ColdProposals, L.ColdEnumerated,
-			       L.ColdDeferred, L.EditedEnumerated, L.CpuFallbackCalls, L.CpuFirstScans,
+			       L.ColdDeferred, L.EditedEnumerated, L.EditedFullSweeps, L.EditedDirtyPasses,
+			       L.EditedSkipped, L.EditedDeferred, L.CpuFallbackCalls, L.CpuFirstScans,
+			       Since.LiveUndergroundCalls, Since.LiveResyncCalls,
 			       L.EvictMs, L.AdmitMs);
 		}
 		LogWindowAnchor = LastDispatchAnchor;
