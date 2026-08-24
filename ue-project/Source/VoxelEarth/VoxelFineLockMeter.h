@@ -1,5 +1,5 @@
 #pragma once
-// VoxelFineLockProbe.h -- the instrument for FVoxelFineTileStreamer::Lock_, the
+// VoxelFineLockMeter.h -- the instrument for FVoxelFineTileStreamer::Lock_, the
 // one RWLock every terrain read in this process passes through.
 //
 // WHY THIS EXISTS
@@ -53,7 +53,7 @@
 // QPC reads) per acquire, which is stated in the report line rather than
 // assumed away.
 //
-// MODES (-VoxelFineLockProbe=N)
+// MODES (-VoxelFineLockMeter=N)
 //   0  OFF (default). No counters, no timing, no shard touched. The lock paths
 //      are byte-identical to the pre-probe build.
 //   1  TRAFFIC ONLY. Acquisition counts per site, shared vs exclusive. This is
@@ -139,18 +139,28 @@ inline const TCHAR* SiteName(ESite Site)
 
 // --- the switches ------------------------------------------------------------
 //
+// WHY THE INSTRUMENT IS -VoxelFineLockMeter AND NOT -VoxelFineLockProbe, which
+// is what it would naturally be called: VoxelFrontEndPolicy.cpp's
+// kSelfDrivingSubstrings treats "Probe" as meaning "this run drives itself,
+// poses, captures and quits", and rule 5 SUPPRESSES THE MAIN MENU for any such
+// switch. This one does nothing of the kind -- it is a passive counter that
+// must be readable on an ordinary interactive launch -- so naming it *Probe
+// would silently take the front end away from a developer who only wanted the
+// numbers. The file keeps the word because that is what the thing IS; the
+// switch does not, because the switch is what the policy reads.
+//
 // Both latch on first call. FVoxelFineTileStreamer's constructor calls both, on
 // the game thread, before any worker can reach them: FCommandLine::Get() is
 // cheap but it is not something to first touch from inside a worker's hot read
 // path, and a function-local static's guard variable is one more thing not to
 // make a worker discover.
 
-inline int32 ProbeMode()
+inline int32 MeterMode()
 {
 	static const int32 Latched = []
 	{
 		int32 Value = 0;
-		FParse::Value(FCommandLine::Get(), TEXT("VoxelFineLockProbe="), Value);
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFineLockMeter="), Value);
 		return FMath::Clamp(Value, 0, 3);
 	}();
 	return Latched;
@@ -241,7 +251,7 @@ public:
 		: Lock(InLock)
 		, Type(InType)
 	{
-		const int32 Mode = ProbeMode();
+		const int32 Mode = MeterMode();
 		if (Mode <= 0)
 		{
 			if (Type == SLT_Write) { Lock.WriteLock(); } else { Lock.ReadLock(); }

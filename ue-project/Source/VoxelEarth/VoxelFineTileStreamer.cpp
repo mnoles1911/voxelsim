@@ -1,7 +1,7 @@
 #include "VoxelFineTileStreamer.h"
 
 #include "VoxelEarth.h"      // LogVoxelEarth
-#include "VoxelFineLockProbe.h" // FLockScope -- the instrument on Lock_, and the two switches
+#include "VoxelFineLockMeter.h" // FLockScope -- the instrument on Lock_, and the two switches
 #include "VoxelDebug.h"    // LogVoxelPerf -- the probe line rides the perf category
 #include "VoxelTileCodec.h"  // VoxelEarth::GetFineTileDecompressor -- CODEC_ZSTD host boundary
 #include "Misc/Paths.h"      // FPaths::Combine
@@ -163,26 +163,26 @@ FVoxelFineTileStreamer::FVoxelFineTileStreamer(FString RootDir, FString Provider
 
 	// LATCH BOTH SWITCHES HERE, ON THE GAME THREAD, AND BEFORE THE GATE
 	// SELF-CHECK BELOW USES THEM. They are function-local statics inside
-	// VoxelFineLockProbe.h, and a worker's first elevationMm would otherwise be
+	// VoxelFineLockMeter.h, and a worker's first elevationMm would otherwise be
 	// the thread that initialises them -- which puts FCommandLine::Get() and a
 	// static guard variable on the hottest read in the process. Reading them
 	// once here makes every later read a plain load.
-	const int32 ProbeModeNow = VoxelFineLock::ProbeMode();
+	const int32 MeterModeNow = VoxelFineLock::MeterMode();
 	const int32 FastModeNow = VoxelFineLock::FastMode();
 	LastProbeLogSeconds_ = FPlatformTime::Seconds();
 
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Fine lock: fast=%d (%s) probe=%d (%s). Fast modes: 0=exclusive always (today), ")
+	       TEXT("Fine lock: fast=%d (%s) meter=%d (%s). Fast modes: 0=exclusive always (today), ")
 	       TEXT("1=shared when already resident, 2=+lock-free game-thread mirror, 3=+mirror audit. ")
-	       TEXT("Probe modes: 0=off, 1=traffic, 2=traffic+timing except the per-pixel reads (the mode to ")
+	       TEXT("Meter modes: 0=off, 1=traffic, 2=traffic+timing except the per-pixel reads (the mode to ")
 	       TEXT("measure with), 3=timing everywhere (depresses throughput; never quote chunks/s from it)."),
 	       FastModeNow,
 	       FastModeNow == 0 ? TEXT("RequestFootprint takes Lock_ EXCLUSIVELY on every call")
 	                        : TEXT("RequestFootprint escalates to exclusive only when a tile must be loaded"),
-	       ProbeModeNow,
-	       ProbeModeNow == 0   ? TEXT("no counters, no timing -- lock paths byte-identical")
-	       : ProbeModeNow == 1 ? TEXT("acquisition counts only")
-	       : ProbeModeNow == 2 ? TEXT("counts everywhere + wait/hold except on the per-pixel reads")
+	       MeterModeNow,
+	       MeterModeNow == 0   ? TEXT("no counters, no timing -- lock paths byte-identical")
+	       : MeterModeNow == 1 ? TEXT("acquisition counts only")
+	       : MeterModeNow == 2 ? TEXT("counts everywhere + wait/hold except on the per-pixel reads")
 	                           : TEXT("counts + wait/hold EVERYWHERE, per-pixel reads included"));
 
 	// SELF-CHECK 1: THE ALLOCATION-FREE COVERAGE AGREES WITH voxel-core'S.
@@ -766,7 +766,7 @@ vxc::BathyRectStats FVoxelFineTileStreamer::ReadBathyRect(int64 Px0, int64 Py0, 
 // is not what work does.
 //
 // THE DISPROOF CONDITION, REGISTERED BEFORE THE MEASUREMENT:
-//   If -VoxelFineLockProbe=2 shows the EXCLUSIVE sites' WAIT time is a small
+//   If -VoxelFineLockMeter=2 shows the EXCLUSIVE sites' WAIT time is a small
 //   share of their total (under ~1 us per TIMED acquire at peak throughput),
 //   then the lock
 //   was never the term, the 183 us is vxc::Amplifier::column doing work, and
@@ -1415,11 +1415,11 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 // THE THREE READINGS THIS LINE MUST KEEP APART, because this project has found
 // twelve instruments that were green while sitting outside the path:
 //
-//   probe=off                     the switch is 0. Nothing was measured. The
+//   meter=off                     the switch is 0. Nothing was measured. The
 //                                 line still prints, and still carries the
 //                                 always-on RequestFootprint traffic, so an
 //                                 unarmed leg is not a silent leg.
-//   PROBE ARMED BUT NEVER ENTERED entered=0 with the probe on. No acquisition
+//   METER ARMED BUT NEVER ENTERED entered=0 with the probe on. No acquisition
 //                                 of any kind reached the guard. That is an
 //                                 instrument outside the path -- NOT an
 //                                 uncontended lock -- and it is said in words.
@@ -1453,7 +1453,7 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	}
 	LastProbeLogSeconds_ = Now;
 
-	const int32 Probe = VoxelFineLock::ProbeMode();
+	const int32 Meter = VoxelFineLock::MeterMode();
 	const int32 Fast = VoxelFineLock::FastMode();
 
 	// Deltas, not cumulative totals. A rate divided by the wrong denominator is
@@ -1482,12 +1482,12 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	// path running and catching nothing, which is the reading that says revert.
 	const double AvoidedPct = DCalls > 0 ? 100.0 * double(DFree + DShared) / double(DCalls) : 0.0;
 
-	if (Probe <= 0)
+	if (Meter <= 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Fine lock: probe=off fast=%d | req calls=%llu lockFree=%llu shared=%llu excl=%llu ")
+		       TEXT("Fine lock: meter=off fast=%d | req calls=%llu lockFree=%llu shared=%llu excl=%llu ")
 		       TEXT("(exclusive avoided %.1f%%) | cumulative calls=%llu excl=%llu | audit checked=%llu ")
-		       TEXT("mismatch=%llu mirrorOffThread=%llu | -VoxelFineLockProbe=1 for acquisition counts, ")
+		       TEXT("mismatch=%llu mirrorOffThread=%llu | -VoxelFineLockMeter=1 for acquisition counts, ")
 		       TEXT("=2 for wait/hold win=%.2fs"),
 		       Fast, (unsigned long long)DCalls, (unsigned long long)DFree, (unsigned long long)DShared,
 		       (unsigned long long)DEscal, AvoidedPct, (unsigned long long)Calls, (unsigned long long)Escal,
@@ -1517,12 +1517,12 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	if (Now_.Entered == 0)
 	{
 		UE_LOG(LogVoxelPerf, Warning,
-		       TEXT("Fine lock: PROBE ARMED BUT NEVER ENTERED (mode=%d, entered=0 acquisitions of any kind, ")
+		       TEXT("Fine lock: METER ARMED BUT NEVER ENTERED (mode=%d, entered=0 acquisitions of any kind, ")
 		       TEXT("cumulative). This is an INSTRUMENT OUTSIDE THE PATH, not an uncontended lock: no ")
 		       TEXT("FLockScope has been constructed at all, so either the fine tier is not being queried or ")
 		       TEXT("the guard is no longer at the lock sites. Do not read this as zero contention. ")
 		       TEXT("req calls=%llu win=%.2fs"),
-		       Probe, (unsigned long long)DCalls, WindowSec);
+		       Meter, (unsigned long long)DCalls, WindowSec);
 		return;
 	}
 
@@ -1554,7 +1554,7 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 
 	const TCHAR* Verdict =
 		(ExTimed + ShTimed) == 0
-			? TEXT("timing NOT armed: pass -VoxelFineLockProbe=2 for wait/hold -- this line's ")
+			? TEXT("timing NOT armed: pass -VoxelFineLockMeter=2 for wait/hold -- this line's ")
 			  TEXT("wait/hold shares are UNMEASURED, not zero")
 	    : (TotalWait * 100 < TotalHold)
 	          ? TEXT("contended=NO: the probe ran and waiting is under 1% of time in the lock -- the cost ")
@@ -1562,7 +1562,7 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	          : TEXT("contended=YES: waiting is a real share of time in the lock");
 
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Fine lock: probe=%d fast=%d | req calls=%llu lockFree=%llu shared=%llu excl=%llu ")
+	       TEXT("Fine lock: meter=%d fast=%d | req calls=%llu lockFree=%llu shared=%llu excl=%llu ")
 	       TEXT("(exclusive avoided %.1f%%) | EXCL acq=%llu timed=%llu wait=%.1fms hold=%.1fms us/timed ")
 	       TEXT("wait=%.2f hold=%.2f | SHARED acq=%llu timed=%llu wait=%.1fms hold=%.1fms us/timed wait=%.3f ")
 	       TEXT("| waitShare=%.1f%% of %llu ns in-lock | worstSinceStart us: wait excl=%.1f shared=%.1f hold excl=%.1f ")
@@ -1570,7 +1570,7 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	       TEXT("isResident=%llu bathy=%llu diag=%llu] | entered=%llu | audit checked=%llu mismatch=%llu ")
 	       TEXT("mirrorOffThread=%llu | %s ")
 	       TEXT("win=%.2fs"),
-	       Probe, Fast, (unsigned long long)DCalls, (unsigned long long)DFree, (unsigned long long)DShared,
+	       Meter, Fast, (unsigned long long)DCalls, (unsigned long long)DFree, (unsigned long long)DShared,
 	       (unsigned long long)DEscal, AvoidedPct,
 	       (unsigned long long)ExAcq, (unsigned long long)ExTimed, double(ExWait) / 1.0e6,
 	       double(ExHold) / 1.0e6, ExWaitUsPer, ExHoldUsPer,
