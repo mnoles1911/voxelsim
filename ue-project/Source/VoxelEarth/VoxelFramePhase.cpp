@@ -34,6 +34,134 @@ int32 HeavyThreshold()
 // measured against. A delta whose BOTH ends move is not a delta.
 constexpr int32 kLightThreshold = 64;
 
+// ---------------------------------------------------------------------------
+// GOAL 3: THE SETTLED-ONLY FRAME DISTRIBUTION
+// ---------------------------------------------------------------------------
+//
+// The only frame statistic in the tree is cumulative over the whole leg:
+//
+//   VoxelPerfRun post-warmup (t>=10s): frames=19425 p50=9.84ms p95=30.62ms
+//                                      max=115.28ms hitches=564
+//
+// On q-repro-main that window opens at t=10 s and the world SETTLES at t=21.3 s,
+// so eleven seconds of cold-fill storm -- the regime where hitches are
+// explicitly authorised -- are averaged into the same p95 as the 270 s of
+// settled play the >100 FPS goal is actually about. The two regimes have
+// opposite rules now (fill: optimise settle seconds, hitches tolerated;
+// settled: optimise p95, >100 fps means p95 < 10 ms), and one statistic cannot
+// serve both. Nothing here can be judged until they are separated.
+//
+// A HISTOGRAM, NOT A SAMPLE BUFFER, so a 300 s leg and a 3,000 s leg cost the
+// same 4.4 KB per segment and no leg length can silently start dropping
+// samples. The bin width is printed beside every percentile: p95 is compared
+// against a 10.00 ms gate, so a 0.10 ms bin below 32 ms is 1% at the gate, and
+// a reader must be able to see that rather than assume exactness. The MAX is
+// tracked exactly, outside the histogram, because the max is the one value a
+// bin cannot approximate usefully.
+constexpr int32 kFineBins   = 320;   // 0.10 ms each, 0 .. 32 ms
+constexpr double kFineMs    = 0.10;
+constexpr int32 kCoarseBins = 224;   // 1.00 ms each, 32 .. 256 ms
+constexpr double kCoarseMs  = 1.00;
+constexpr int32 kOverflowBin = kFineBins + kCoarseBins; // >= 256 ms
+constexpr int32 kNumBins    = kOverflowBin + 1;
+
+// The >100 FPS gate, and the hitch bar, as named constants so the log can print
+// what it is judging against instead of leaving a reader to remember.
+constexpr double kFpsGateMs = 10.0;   // 100 fps
+constexpr double kHitchMs   = 33.3;   // the project's existing hitch bar
+
+struct FDist
+{
+	int64 Bins[kNumBins] = {};
+	int64 N = 0;
+	int64 Hitches = 0;
+	double MaxMs = 0.0;
+	double SumMs = 0.0;
+
+	void Add(double Ms)
+	{
+		++N;
+		SumMs += Ms;
+		MaxMs = FMath::Max(MaxMs, Ms);
+		if (Ms >= kHitchMs) { ++Hitches; }
+		int32 Bin;
+		if (Ms < 32.0)       { Bin = FMath::Clamp(int32(Ms / kFineMs), 0, kFineBins - 1); }
+		else if (Ms < 256.0) { Bin = kFineBins + FMath::Clamp(int32((Ms - 32.0) / kCoarseMs), 0, kCoarseBins - 1); }
+		else                 { Bin = kOverflowBin; }
+		++Bins[Bin];
+	}
+
+	// Upper edge of the bin the requested quantile falls in. UPPER, not centre:
+	// a gate is a "must be under" test, so the pessimistic edge is the honest
+	// one to compare against 10.00 ms. Stated here rather than left implicit.
+	double Quantile(double Q) const
+	{
+		if (N <= 0) { return 0.0; }
+		const int64 Target = int64(double(N) * Q);
+		int64 Seen = 0;
+		for (int32 I = 0; I < kNumBins; ++I)
+		{
+			Seen += Bins[I];
+			if (Seen > Target)
+			{
+				if (I < kFineBins)       { return double(I + 1) * kFineMs; }
+				if (I < kOverflowBin)    { return 32.0 + double(I - kFineBins + 1) * kCoarseMs; }
+				return MaxMs; // overflow bin: the exact max is the only honest answer
+			}
+		}
+		return MaxMs;
+	}
+	double Mean() const { return N > 0 ? SumMs / double(N) : 0.0; }
+};
+
+// Two segments, each with a per-window view and a cumulative view.
+//
+// CUMULATIVE IS WHAT THE GOAL IS JUDGED ON, and it is printed on every window
+// precisely so that `grep | tail -1` -- which has produced four retractions on
+// this project by landing on the post-flight linger -- cannot pick up a window
+// with three frames in it and call it the answer. A cumulative row is monotone
+// and carries its own n.
+FDist FillWindow, FillTotal, SettledWindow, SettledTotal;
+bool bSettled = false;
+double SettleSeconds = -1.0;
+
+const TCHAR* SegName() { return bSettled ? TEXT("SETTLED") : TEXT("FILL   "); }
+
+void EmitDist(const TCHAR* Seg, const TCHAR* Scope, const FDist& D)
+{
+	if (D.N == 0)
+	{
+		// A hard, loud zero. On the SETTLED row this means the leg never settled
+		// (or hook 2 was not applied), and the ONLY correct reading is "this leg
+		// cannot speak to GOAL 3" -- never the fill numbers under a settled
+		// heading, which is the exact blend the segmentation exists to undo.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel frame dist %s %s: n=0 -- NO FRAMES IN THIS SEGMENT. ")
+		       TEXT("If this is SETTLED, the leg never reached settle or hook 2 was not applied, ")
+		       TEXT("and NO >100 FPS claim may be made from this leg either way."), Seg, Scope);
+		return;
+	}
+	const double P50 = D.Quantile(0.50);
+	const double P95 = D.Quantile(0.95);
+	const double P99 = D.Quantile(0.99);
+	// FPS printed beside every ms so nobody has to divide, and the gate verdict
+	// stated rather than left to the reader -- but ONLY on the settled segment,
+	// because the fill is explicitly exempt from it by the owner's standing
+	// directive.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel frame dist %s %s: n=%lld mean=%.2fms | p50=%.2fms (%.0f fps) p95=%.2fms (%.0f fps) ")
+	       TEXT("p99=%.2fms (%.0f fps) max=%.2fms | hitches=%lld (>%.1fms, %.2f%%) | bin=%.2f/%.2fms | %s"),
+	       Seg, Scope, (long long)D.N, D.Mean(),
+	       P50, P50 > 0 ? 1000.0 / P50 : 0.0,
+	       P95, P95 > 0 ? 1000.0 / P95 : 0.0,
+	       P99, P99 > 0 ? 1000.0 / P99 : 0.0,
+	       D.MaxMs, (long long)D.Hitches, kHitchMs, 100.0 * double(D.Hitches) / double(D.N),
+	       kFineMs, kCoarseMs,
+	       bSettled && FCString::Strcmp(Seg, TEXT("SETTLED")) == 0
+	           ? (P95 < kFpsGateMs ? TEXT("GOAL3 PASS (p95 < 10.00ms)") : TEXT("GOAL3 FAIL (p95 >= 10.00ms)"))
+	           : TEXT("gate n/a -- fill is exempt (hitches authorised during the load storm)"));
+}
+
 struct FBucket
 {
 	double Frame = 0, Tick = 0, GameThread = 0, GameWait = 0;
@@ -96,6 +224,32 @@ void Emit(const TCHAR* Name, const FBucket& B)
 void Flush(double Now)
 {
 	const double WindowSec = Now - LastLogSeconds;
+
+	if (Mode() & kModeDistribution)
+	{
+		// THE WINDOW ROW SAYS WHICH REGIME IT DESCRIBES, in its own segment tag,
+		// and the CUMULATIVE row beside it is what the goal is judged on.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel frame dist (%.1fs window): segment=%s settleT=%s | gate: p95 < %.2fms == 100 fps"),
+		       WindowSec, SegName(),
+		       SettleSeconds >= 0.0 ? *FString::Printf(TEXT("%.1fs"), SettleSeconds) : TEXT("NOT SETTLED"),
+		       kFpsGateMs);
+		EmitDist(bSettled ? TEXT("SETTLED") : TEXT("FILL"), TEXT("window"),
+		         bSettled ? SettledWindow : FillWindow);
+		EmitDist(TEXT("FILL"),    TEXT("total "), FillTotal);
+		EmitDist(TEXT("SETTLED"), TEXT("total "), SettledTotal);
+		FillWindow = SettledWindow = FDist{};
+	}
+
+	if ((Mode() & kModeReconcile) == 0)
+	{
+		All = Heavy = Light = FBucket{};
+		PeakAppliesThisWindow = 0;
+		ZeroGameThreadFrames = 0;
+		NegativeResidualFrames = 0;
+		LastLogSeconds = Now;
+		return;
+	}
 
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel frame phase (%.1fs window): heavy>=%d light<%d peakAppl/frame=%d ")
@@ -190,6 +344,28 @@ void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame)
 	const double FrameMs = (Now - LastFrameSeconds) * 1000.0;
 	LastFrameSeconds = Now;
 
+	// THE DISTRIBUTION TAKES EVERY FRAME, AND IT IS FED HERE -- ABOVE THE
+	// STALE-GLOBALS GUARD BELOW -- ON PURPOSE.
+	//
+	// That guard rejects frames whose ENGINE GLOBALS are describing history
+	// rather than this frame. The frame TIME is not one of those globals: it
+	// came from this function's own clock two lines up and is sound whatever
+	// the render timers say. Dropping a real 400 ms frame out of the tail
+	// statistic because an unrelated global was stale would corrupt the exact
+	// number GOAL 3 is judged on, in the conservative-looking direction, which
+	// is the worst direction for a gate.
+	if (Mode() & kModeDistribution)
+	{
+		(bSettled ? SettledWindow : FillWindow).Add(FrameMs);
+		(bSettled ? SettledTotal  : FillTotal ).Add(FrameMs);
+	}
+
+	if ((Mode() & kModeReconcile) == 0)
+	{
+		if (Now - LastLogSeconds >= 5.0) { Flush(Now); }
+		return;
+	}
+
 	const double CyToMs = FPlatformTime::GetSecondsPerCycle() * 1000.0;
 	const double RenderMs     = double(GRenderThreadTime) * CyToMs;
 	const double RenderWaitMs = double(GRenderThreadWaitTime) * CyToMs;
@@ -203,8 +379,12 @@ void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame)
 	// not describing that frame; it is describing history. Two such frames
 	// exist in ahead-on.log and they are frames 1 and 2 -- and one of them is
 	// the entire reason this investigation was commissioned.
+	//
+	// RECONCILIATION ONLY. The distribution above has already banked this
+	// frame's time.
 	if (RenderMs > 3.0 * FrameMs || RenderWaitMs > 3.0 * FrameMs || GameMs > 3.0 * FrameMs)
 	{
+		if (Now - LastLogSeconds >= 5.0) { Flush(Now); }
 		return;
 	}
 
@@ -234,6 +414,22 @@ void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame)
 	{
 		Flush(Now);
 	}
+}
+
+void NoteSettledImpl(double InSettleSeconds)
+{
+	if (bSettled)
+	{
+		return; // the cold-settle line fires once; a second call is not a second boundary
+	}
+	bSettled = true;
+	SettleSeconds = InSettleSeconds;
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel frame dist: SEGMENT BOUNDARY at t=%.1fs -- every frame from here is SETTLED. ")
+	       TEXT("Fill so far: n=%lld p95=%.2fms max=%.2fms hitches=%lld (fill is exempt from the ")
+	       TEXT("100 fps gate; everything after this line is not)."),
+	       InSettleSeconds, (long long)FillTotal.N, FillTotal.Quantile(0.95),
+	       FillTotal.MaxMs, (long long)FillTotal.Hitches);
 }
 
 } // namespace VoxelFramePhase

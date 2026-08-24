@@ -147,29 +147,64 @@
 
 namespace VoxelFramePhase
 {
-// -VoxelFramePhase=1, latched. 0 = off = this file does nothing at all and
-// NoteFrame folds to a single predicted-not-taken branch on a latched bool.
-inline bool Enabled()
+// -VoxelFramePhase=N, latched bitmask. 0 = OFF = this file does nothing at all
+// and both hooks fold to a single predicted-not-taken branch on a latched int.
+//
+//   1  FRAME DISTRIBUTION, segmented at the cold-settle boundary. This is the
+//      one GOAL 3 requires and it should be on for EVERY leg from here.
+//   2  PHASE RECONCILIATION (the frame = tick + gameOther + gameWait + residual
+//      breakdown above), for the lifted-cap 94 ms question.
+//   3  both.
+//
+// Split rather than one flag because they answer different questions and cost
+// different amounts: the distribution is a histogram increment per frame and is
+// cheap enough to leave on permanently, while the reconciliation reads five
+// engine globals and keeps six running sums per bucket.
+inline int32 Mode()
 {
-	static const bool bLatched = []
+	static const int32 Latched = []
 	{
 		int32 Value = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelFramePhase="), Value);
-		return Value != 0;
+		return FMath::Max(0, Value);
 	}();
-	return bLatched;
+	return Latched;
 }
 
-// The out-of-line body. Never called with Enabled() == false.
+inline constexpr int32 kModeDistribution = 1;
+inline constexpr int32 kModeReconcile    = 2;
+
+// The out-of-line body. Never called with Mode() == 0.
 void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame);
 
-// ONE HOOK, at the end of the streaming tick, with two values the caller has
+// HOOK 1, at the end of the streaming tick, with two values the caller has
 // already computed.
 FORCEINLINE void NoteFrame(double VoxelTickMs, int32 AppliesThisFrame)
 {
-	if (Enabled())
+	if (Mode() != 0)
 	{
 		NoteFrameImpl(VoxelTickMs, AppliesThisFrame);
+	}
+}
+
+// HOOK 2, at the cold-settle SETTLED log site, which fires exactly once.
+//
+// THE BOUNDARY IS TOLD, NOT DERIVED, and that is the whole reason this hook
+// exists rather than an apply-volume heuristic. "Derived, not verified,
+// detaches" has produced five bugs on this project in three days, and a
+// segment boundary guessed from throughput would silently mislabel the tail of
+// the fill as settled -- which is precisely the blend GOAL 3 exists to undo.
+//
+// If it never fires, EVERY frame stays in FILL and the SETTLED segment reports
+// n=0. The instrument says that loudly rather than printing fill numbers under
+// a settled heading; see the failing readings above.
+void NoteSettledImpl(double SettleSeconds);
+
+FORCEINLINE void NoteSettled(double SettleSeconds)
+{
+	if (Mode() != 0)
+	{
+		NoteSettledImpl(SettleSeconds);
 	}
 }
 
