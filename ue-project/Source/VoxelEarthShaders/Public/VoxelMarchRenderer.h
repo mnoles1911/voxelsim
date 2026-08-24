@@ -1403,6 +1403,27 @@ VOXELEARTHSHADERS_API FVoxelMarchStats VoxelMarchGetStats();
 VOXELEARTHSHADERS_API void VoxelMarchPublishStreamingState(int32 JobsInFlight, int32 PendingJobs,
                                                            int64 ChunksLoaded);
 
+// The convergence counter the line above maintains, readable from any thread.
+//
+// EXPOSED RATHER THAN RE-DERIVED. The render-frame split needs to know where
+// the cold-fill boundary is so that a fill frame is not folded into the settled
+// population the owner's gate is about, and the streaming subsystem already
+// publishes exactly that signal every tick. A second settle rule computed from
+// a different signal is how two instruments come to disagree about which frames
+// they described while both look healthy.
+//
+// -1 means the publisher has never been called: the wire is DEAD, not settled.
+// A reader must treat that as "unknown", never as "not yet converged".
+VOXELEARTHSHADERS_API int32 VoxelMarchGetStreamConvergedFrames();
+
+// THE VERDICT, not the raw count -- so the settle threshold lives in exactly one
+// place. voxel.March.SettleFrames is applied here, inside the file that owns it,
+// rather than being duplicated by every reader; a constant copied into a second
+// file is how two instruments come to disagree about the same boundary while
+// both look right. Returns false when the publisher has never been called: an
+// unwired signal is NOT a settled world.
+VOXELEARTHSHADERS_API bool VoxelMarchIsStreamConverged();
+
 // ---------------------------------------------------------------------------
 // The extension
 // ---------------------------------------------------------------------------
@@ -1416,6 +1437,19 @@ public:
 	virtual void SetupViewFamily(FSceneViewFamily& InViewFamily) override {}
 	virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override {}
 	virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override {}
+
+	// ANCHOR A AND ANCHOR B OF THE RENDER-FRAME SPLIT, and they exist for no
+	// other reason. See VoxelRenderFrame.h. The marcher does no rendering work
+	// in either: PreRenderViewFamily is the FIRST render-thread hook the engine
+	// calls (SceneRendering.cpp:4299) and PostRenderViewFamily is the LAST
+	// (SceneRendering.cpp:4956), so together they bracket the scene renderer's
+	// graph-construction half exactly, and everything outside them is the
+	// render thread's OTHER work -- which is what the split is trying to see.
+	// With -VoxelRenderFrame=0 both fold to one branch on a latched int.
+	virtual void PreRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder,
+	                                              FSceneViewFamily& InViewFamily) override;
+	virtual void PostRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder,
+	                                               FSceneViewFamily& InViewFamily) override;
 
 	// Stash. The ONLY hook that is handed a view before the base pass, which is
 	// why the march -- which needs a camera and a projection -- cannot live

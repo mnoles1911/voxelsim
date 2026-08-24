@@ -35,6 +35,7 @@
 #include "SceneView.h"
 #include "ShaderParameterStruct.h"
 #include "ProfilingDebugging/RealtimeGPUProfiler.h"
+#include "VoxelRenderFrame.h" // the render-frame split: anchors A and B live in this file
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelMarch, Log, All);
 
@@ -2490,6 +2491,24 @@ void VoxelMarchPublishStreamingState(int32 JobsInFlight, int32 PendingJobs, int6
 	}
 }
 
+int32 VoxelMarchGetStreamConvergedFrames()
+{
+	return GStreamConvergedFrames.load();
+}
+
+bool VoxelMarchIsStreamConverged()
+{
+	const int32 Frames = GStreamConvergedFrames.load();
+	if (Frames < 0)
+	{
+		// -1 is "the publisher has never been called". The wire is DEAD, and a
+		// dead wire is not a settled world -- the same distinction the depth
+		// gate makes at bStreamWired.
+		return false;
+	}
+	return Frames >= FMath::Max(CVarVoxelMarchSettleFrames.GetValueOnAnyThread(), 0);
+}
+
 FVoxelMarchStats VoxelMarchGetStats()
 {
 	if (!GMarchState.IsValid())
@@ -4126,11 +4145,58 @@ namespace
 }
 
 // ---------------------------------------------------------------------------
+// ANCHOR A -- the render-frame split's frame boundary
+// ---------------------------------------------------------------------------
+//
+// This hook does NO RENDERING WORK AND MUST NOT ACQUIRE ONE. It is the first
+// render-thread hook the engine calls (SceneRendering.cpp:4299) and its only
+// job is to close the previous frame's sample and open this one. Deliberately
+// BEFORE any arm check: a frame in which the marcher declines is still a frame
+// whose render thread did 9-18 ms of something, and that is precisely the frame
+// the split exists to describe.
+void FVoxelMarchRenderExtension::PreRenderViewFamily_RenderThread(
+	FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
+{
+	// No scope here on purpose. Anchor A IS the start of the frame, so a bucket
+	// scope wrapping the call that takes the anchor would either measure nothing
+	// or measure across the anchor -- and a sub-bucket that straddles its own
+	// frame boundary is how setupOther starts printing negative for a reason
+	// that has nothing to do with the split being wrong.
+	VoxelRenderFrame::Touch(GraphBuilder);
+}
+
+// ANCHOR B. Last render-thread hook of the scene renderer
+// (SceneRendering.cpp:4956). Everything after it on this thread is RDG Execute
+// and then the tail.
+void FVoxelMarchRenderExtension::PostRenderViewFamily_RenderThread(
+	FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
+{
+	// Symmetrically unscoped: anchor B IS the end of setup. mFam therefore reads
+	// 0.000 by construction and is kept in the bucket list only so a future hook
+	// added here has a named place to land instead of silently inflating
+	// setupOther. Its DEAD READING is that zero, and it is stated here rather
+	// than left for a reader to discover.
+	VoxelRenderFrame::NoteSetupEnd();
+}
+
+// ---------------------------------------------------------------------------
 // HOOK 1 -- stash
 // ---------------------------------------------------------------------------
 void FVoxelMarchRenderExtension::PreRenderView_RenderThread(FRDGBuilder& GraphBuilder,
                                                             FSceneView& InView)
 {
+	// ANCHOR FIRST, THEN THE SCOPE. The anchor is taken here as well as in the
+	// family hook because extension iteration order is not ours to control: if
+	// another extension's PreRenderViewFamily ran first the frame is already
+	// open and this is a no-op, and if the family hook ever stopped being called
+	// this keeps the split alive instead of silently emitting nothing. Touch()
+	// is idempotent within a frame. Taking it before the scope opens matters:
+	// a scope that started before its own frame did would bill this frame for
+	// the previous one's tail.
+	VoxelRenderFrame::Touch(GraphBuilder);
+	VoxelRenderFrame::NoteView(InView.ViewMatrices.GetViewOrigin());
+	VOXEL_RENDER_FRAME_SCOPE(MarchView);
+
 	RetireTimingQueries();
 
 	const FVoxelMarchArm Arm = VoxelMarchGetArm();
@@ -4235,6 +4301,30 @@ void FVoxelMarchRenderExtension::PreRenderView_RenderThread(FRDGBuilder& GraphBu
 void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& GraphBuilder,
                                                                 bool bDepthBufferIsPopulated)
 {
+	VOXEL_RENDER_FRAME_SCOPE(MarchBase);
+	// MUTATION ARMS 1 and 3. See VoxelRenderFrame.h: arm 1 burns CPU here and
+	// must appear in mBase; arm 3 BLOCKS here and must appear in sveBlocked and
+	// renderWait while leaving mBase busy and renderBusy unchanged. Arm 3 is the
+	// one that can come out red and invalidate the whole file, which is why it
+	// is the arm to run first.
+	VoxelRenderFrame::MutateHere(1);
+	VoxelRenderFrame::MutateHere(3);
+	if (VoxelRenderFrame::MutateArm() == 4)
+	{
+		// MUTATION ARM 4: burn inside an RDG pass lambda, which runs during
+		// Execute and must therefore land in executeMs, not setupMs. Gated on
+		// the arm being SELECTED, not on the instrument being armed: an
+		// ordinary -VoxelRenderFrame=1 leg must add no pass, or the measured
+		// build and the control differ by one and the split is measuring
+		// itself.
+		GraphBuilder.AddPass(RDG_EVENT_NAME("VoxelRenderFrame.Mutate4"),
+		                     ERDGPassFlags::NeverCull,
+		                     [](FRHICommandListImmediate&)
+		                     {
+			                     VoxelRenderFrame::MutateHere(4);
+		                     });
+	}
+
 	const FVoxelMarchArm Arm = VoxelMarchGetArm();
 	if (Arm.Mode == 0)
 	{
@@ -5135,6 +5225,8 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 
 	CloseBracket(GraphBuilder, Timing, TEXT("March"));
 
+	VoxelRenderFrame::NoteMarchTiles(TotalTiles);
+
 	FScopeLock Guard(&State->Lock);
 	State->Stats.Frames++;
 	State->Stats.Mode = Arm.Mode;
@@ -5149,6 +5241,7 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 	const FRenderTargetBindingSlots& RenderTargets,
 	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures)
 {
+	VOXEL_RENDER_FRAME_SCOPE(MarchEmit);
 	const FVoxelMarchArm Arm = VoxelMarchGetArm();
 	if (Arm.Mode == 0)
 	{

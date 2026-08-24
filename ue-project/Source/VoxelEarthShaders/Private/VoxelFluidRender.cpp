@@ -29,6 +29,7 @@
 #include "SceneTexturesConfig.h" // FSceneTextureUniformParameters (ENGINE_API, public)
 #include "ShaderParameterStruct.h"
 #include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
+#include "VoxelRenderFrame.h" // the render-frame split: water is a named bucket, not residual
 
 // `stat GPU` line for the whole screen-space fluid pass chain (splat ->
 // smoothX -> smoothY -> shadeComposite). Same note as VoxelFluidSim.cpp's:
@@ -491,6 +492,15 @@ bool FVoxelFluidRenderExtension::IsActiveThisFrame_Internal(
 void FVoxelFluidRenderExtension::PreRenderViewFamily_RenderThread(
 	FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
 {
+	// THE FRAME ANCHOR IS TAKEN HERE TOO, and this is the reason it is a shared
+	// idempotent call rather than something the marcher owns: on a leg with
+	// voxel.March 0 the marcher's extension declines IsActiveThisFrame and not
+	// one of its hooks is called, so an anchor that lived only there would emit
+	// nothing at all for the quad control arm -- the exact configuration a
+	// render-frame comparison would want to measure.
+	VoxelRenderFrame::Touch(GraphBuilder);
+	VOXEL_RENDER_FRAME_SCOPE(Fluid);
+
 	// Consume the mailbox exactly once; a second view family this frame sims
 	// nothing (and pays nothing).
 	TOptional<FVoxelFluidSimTickArgs> Args;
@@ -612,9 +622,16 @@ void FVoxelFluidRenderExtension::PreRenderViewFamily_RenderThread(
 	VoxelFluidSim::AddSimPasses(GraphBuilder, *Sim, Args.GetValue());
 }
 
+void FVoxelFluidRenderExtension::PostRenderViewFamily_RenderThread(
+	FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
+{
+	VoxelRenderFrame::NoteSetupEnd();
+}
+
 void FVoxelFluidRenderExtension::PrePostProcessPass_RenderThread(
 	FRDGBuilder& GraphBuilder, const FSceneView& InView, const FPostProcessingInputs& Inputs)
 {
+	VOXEL_RENDER_FRAME_SCOPE(Fluid);
 	check(IsInRenderingThread());
 	if (!State.IsValid())
 	{

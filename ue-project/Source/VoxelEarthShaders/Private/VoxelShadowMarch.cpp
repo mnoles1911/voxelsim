@@ -36,6 +36,7 @@
 #include "SceneView.h"
 #include "ShaderParameterStruct.h"
 #include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED / RDG_EVENT_SCOPE_STAT
+#include "VoxelRenderFrame.h" // the render-frame split: shadow is a named bucket whose ZERO is the point
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelShadowMarch, Log, All);
 
@@ -502,6 +503,13 @@ bool FVoxelShadowMarchExtension::IsActiveThisFrame_Internal(
 void FVoxelShadowMarchExtension::PreRenderView_RenderThread(FRDGBuilder& GraphBuilder,
                                                             FSceneView& InView)
 {
+	// SCOPED EVEN THOUGH voxel.Shadow.March DEFAULTS 0. When the arm is off this
+	// extension declines IsActiveThisFrame and the scope never runs, so the
+	// split prints shadowMs=0.000 -- and that zero is the file's own named DEAD
+	// READING, not a measurement that shadows are free. The scope exists so that
+	// the day the arm is turned back on, the cost lands in a bucket with a name
+	// on it instead of inflating setupOther by an amount nobody can attribute.
+	VOXEL_RENDER_FRAME_SCOPE(Shadow);
 	// Retired BEFORE any gate -- the marcher's rule: an un-polled ring after
 	// the cvar drops to 0 reports "pending" forever, which reads exactly like
 	// "the pass never ran".
@@ -565,6 +573,7 @@ void FVoxelShadowMarchExtension::PostRenderBasePassDeferred_RenderThread(
 	const FRenderTargetBindingSlots& RenderTargets,
 	TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextures)
 {
+	VOXEL_RENDER_FRAME_SCOPE(Shadow);
 	const FVoxelShadowArm Arm = VoxelShadowGetArm();
 	if (Arm.Mode == 0 || !State.IsValid())
 	{
