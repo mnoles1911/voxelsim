@@ -109,6 +109,10 @@ param(
     [string]$TimeOfDay = '12:00',
     [string]$Date = '03-20',
     [double]$TimeScale = 0,
+    # SILENCE THE CORRECTNESS INSTRUMENT. Deliberate, stated, and rare -- see
+    # the block below the param() for why arming it is the default and what it
+    # cost when it was not.
+    [switch]$NoCoverageVerify,
     [switch]$KeepEditLog,
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
     # Keep Epic's MCP server up for this leg (default: off, see below).
@@ -116,6 +120,57 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ============================================================================
+# THE CORRECTNESS INSTRUMENT IS ARMED ON EVERY LEG, WHATEVER -Cvars SAYS
+# ============================================================================
+#
+# voxel.Stream.CoverageVerify counts XY footprints in a ring's core annulus
+# that no level is visibly covering -- the see-through holes, as a number. It
+# defaults to 0 in VoxelDebug.cpp, so it exists only if a leg asks for it.
+#
+# IT USED TO BE ARMED ONLY BY THE -Cvars DEFAULT, WHICH IS NOT THE SAME THING.
+# -Cvars is a single string: any caller passing -Cvars for an unrelated reason
+# REPLACED the default and silently disarmed the hole counter. That is exactly
+# what happened -- every leg of the 50k campaign (gp-ctl2, ahead-on, and ~20
+# legs after them) passed -Cvars 'voxel.Debug 0' to pin the HUD, and so ran
+# with the only instrument that can see a silent-correctness failure switched
+# off. Note voxel.Debug never gated it; the string replacement did.
+#
+# The cost of that: a leg carrying a DARK GPU claim stage -- 909,717 records
+# the host staged and the GPU claimed none of -- was read as the session's best
+# result, and nothing in the log could have contradicted it. When the counter
+# was finally armed on the same configuration it read holes 26,364 -> 0 and the
+# P1 xcheck read 0 unwritten, which is what actually cleared that leg.
+#
+# So it is appended here, after the caller's string, rather than being a
+# default the caller can displace without noticing. Silencing it now takes
+# -NoCoverageVerify, which is a decision someone has to type and which says so
+# in the log line below.
+#
+# COST: the verify re-walks every ring's annulus once per log window. The
+# closest matched observation is q-cache128k (verify OFF) against q-repro-main
+# (verify ON), same arm: both settle 22.3 s at 7,387 chunks/s, identical to the
+# digit. Those two legs differ in BINARY as well as in this switch, so strictly
+# they bound the PAIR of changes at ~0 rather than this switch alone -- two
+# variables, one equation. Read it as "no cost has ever been observed", not as
+# a measured cost. If a leg ever does find it perturbing a result, state the
+# number and disarm deliberately -- do not quietly drop it by passing -Cvars.
+#
+# (An earlier revision of this comment claimed "21.3 s -> 21.5 s, under 1%".
+# That was never measured; the legs it named were different configurations.
+# Corrected 2026-08-23 rather than deleted, because an invented number inside a
+# comment that justifies a default is exactly the shape this file exists to
+# stop.)
+if (-not $NoCoverageVerify) {
+    if ($Cvars -notmatch 'CoverageVerify') {
+        $Cvars = if ([string]::IsNullOrWhiteSpace($Cvars)) { 'voxel.Stream.CoverageVerify 1' }
+                 else { "$Cvars, voxel.Stream.CoverageVerify 1" }
+    }
+    Write-Host "  coverage verify ARMED (holes= on the streaming line)"
+} else {
+    Write-Host "  coverage verify DISARMED by -NoCoverageVerify -- this leg cannot report a hole" -ForegroundColor Yellow
+}
 $Project = (Resolve-Path "$PSScriptRoot\..\ue-project\VoxelEarth.uproject").Path
 $LogPath = Join-Path (Resolve-Path "$PSScriptRoot\..").Path "Saved\$LogName.log"
 
