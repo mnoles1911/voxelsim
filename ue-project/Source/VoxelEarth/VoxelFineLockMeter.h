@@ -174,6 +174,41 @@ inline bool SiteIsPerPixel(ESite Site)
 	return Site == ESite::ElevShared || Site == ESite::ClimateShared;
 }
 
+// MEASURED VERDICT 2026-08-23: THE MECHANISM IS REAL, THE FIX WORKS, AND IT
+// BUYS NO THROUGHPUT. Default stays 0. Do not raise it without a new reason.
+//
+// L1 (fast=0, meter=2, caps 1024/24): the registered disproof did NOT fire.
+// waitShare climbed 45.4 -> 93.7 -> 99.4% of all time in the lock, exclusive
+// wait per timed acquire rose 0.11 -> 4.22 -> 62.53 us, and the imbalance is
+// elev=34,029,408 shared acquisitions in one window against reqExcl=1,522.
+// The serialization is exactly as described.
+//
+// L2 (fast=2): req calls=12,648 lockFree=12,648 excl=0, exclusive avoided
+// 100.0%, total lock wait 8,687 ms -> 79 ms (110x), mirrorOffThread=0.
+//
+// L3 (fast=3, audit): mismatch=0 over 3,317,511 audited samples,
+// mirrorOffThread=0, chunk population 164,724 vs the control's 164,740
+// (0.01%), holes 0, gate-leak lines unchanged. Correctness is CLEAN.
+//
+// THE MATCHED THROUGHPUT PAIR -- same binary, caps 192/6, meter=1, ONE switch:
+//     fl-tp-ctl  fast=0   23.5 s   7,010 chunks/s   exclusive avoided   0.0%
+//     q-L4ship   fast=2   23.7 s   6,951 chunks/s   exclusive avoided 100.0%
+// -0.8%: no better, and if anything marginally worse. The same null appeared at
+// caps 1024/24 (38.0 s -> 37.6 s), so both configurations agree.
+//
+// WHAT THAT MEANS, stated plainly because it is a real result and not a
+// failure: the waiting was on the EXCLUSIVE side -- ~1,500 game-thread
+// prefetches per window -- while the 34 million per-pixel SHARED readers waited
+// 0.026-0.264 us each and were never meaningfully blocked. The 8.7 s of wait
+// was spread across ~36 worker threads over 218 s of wall and was absorbed by
+// parallelism; it never became wall time. The bound is the WORK those readers
+// do (vxc::Amplifier::column), which is what the original disproof was pointing
+// at even though its per-acquire threshold was not the reading that settled it.
+//
+// A WINDOW-SELECTION WARNING, because this nearly went the other way: L1's
+// FIRST window reads contended=NO (entered=16,695, elev=10,570). That is the
+// preflight, before the worker pool is loaded. Reading it alone would have
+// falsified a mechanism that is real. Read the loaded windows.
 inline int32 FastMode()
 {
 	static const int32 Latched = []
