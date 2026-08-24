@@ -251,8 +251,28 @@ struct FBucket
 	// lag, not work that un-happened. The clamp pushes that error into the
 	// residual, where it is visible, instead of into a named bucket, where it
 	// would not be.
-	double MOther() const { return FMath::Max(0.0, M(GameThread) - M(Tick)); }
+	// UNCLAMPED SINCE 2026-08-23, AND THE CLAMP WAS HIDING THE ANSWER.
+	//
+	// It used to be Max(0, ...), on the argument that a negative "other" is an
+	// artifact of the one-frame lag rather than work that un-happened. On the
+	// M20/M30 flying windows that clamp fired on 12 of 16 rows and printed
+	// gameOther=0.00 -- which reads as "there is no other game-thread work" and
+	// is indistinguishable from "GGameThreadTime came in BELOW the tick and the
+	// instrument swallowed the difference". Those are different findings and the
+	// clamp made them the same line.
+	//
+	// A BUCKET THAT CANNOT GO NEGATIVE IS NOT A MEASUREMENT, for the same reason
+	// a residual that cannot stay large is not a residual: it silently absorbs
+	// its own error. Unclamped, gameOther can print negative, the residual stays
+	// exactly frame - tick - other - wait, and the pair says which case it is.
+	double MOther() const { return M(GameThread) - M(Tick); }
 	double MResidual() const { return M(Frame) - M(Tick) - MOther() - M(GameWait); }
+	// The two PIPELINE STAGES, which is what actually decides thread ownership.
+	// Game-thread BUSY is GGameThreadTime and nothing else: the engine computes
+	// it as (frame period - waits), so it already excludes the blocking wait and
+	// is directly comparable to the render thread's own busy time.
+	double MGameBusy() const { return M(GameThread); }
+	double MRenderBusy() const { return M(Render); }
 };
 
 // HEAVY/LIGHT answers the lifted-cap question (does applying 1,024 chunks in a
@@ -262,6 +282,21 @@ struct FBucket
 // mixing it in would put the load storm back into the number the segmentation
 // exists to keep out of it.
 FBucket All, Heavy, Light, SMoving, SParked;
+// CUMULATIVE TWINS, AND THEY EXIST BECAUSE THE PER-WINDOW DELTA WAS BLIND.
+//
+// On M20 and M30, 51 of 53 windows printed DELTA tag=MOVE VERDICT=NOT-COMPUTED.
+// The reason is structural, not a bug: a window in which the camera flew the
+// WHOLE window contains no parked frames, so the pair has an empty side and the
+// delta refuses -- correctly, by its own "a window without both populations
+// says nothing" rule. The only windows that computed were the two TRANSITION
+// windows at the start and end of the flight, with n=196/21 and n=46/482:
+// tiny, unbalanced, and describing the moment of takeoff rather than the
+// flight.
+//
+// So the delta that answers the Goal 3 question has to be taken across the LEG,
+// not within a window: every settled-moving frame against every settled-parked
+// frame. These accumulate for the whole run and are never reset.
+FBucket SMovingTotal, SParkedTotal;
 double LastFrameSeconds = 0.0;
 double LastLogSeconds = 0.0;
 int32 PeakAppliesThisWindow = 0;
@@ -272,26 +307,56 @@ void Emit(const TCHAR* Name, const FBucket& B)
 {
 	if (B.N == 0)
 	{
-		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel frame phase %s: n=0 -- THIS POPULATION IS EMPTY. ")
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel frame phase seg=%s n=0 -- THIS POPULATION IS EMPTY. ")
 		                          TEXT("Nothing below describes it and no verdict may be drawn from it."), Name);
 		return;
 	}
 	const double F = B.M(B.Frame);
-	// SHARES ARE PRINTED BESIDE THEIR OWN ABSOLUTE, ALWAYS. waitShare=99% was
-	// true and meaningless tonight; a share with no millisecond next to it is
-	// not a measurement on this project any more.
+	auto Pct = [F](double V) { return F > 0 ? 100.0 * V / F : 0.0; };
+
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel frame phase %s: n=%d appl/frame=%.1f | frame=%.2fms = tick %.2f (%.0f%%) ")
-	       TEXT("+ gameOther %.2f (%.0f%%) + gameWait %.2f (%.0f%%) + RESIDUAL %.2f (%.0f%%) ")
-	       TEXT("|| render=%.2f (%.0f%% of frame) renderWait=%.2f rhi=%.2f"),
-	       Name, B.N, B.N > 0 ? double(B.Applies) / double(B.N) : 0.0,
-	       F,
-	       B.M(B.Tick),    F > 0 ? 100.0 * B.M(B.Tick) / F : 0.0,
-	       B.MOther(),     F > 0 ? 100.0 * B.MOther() / F : 0.0,
-	       B.M(B.GameWait), F > 0 ? 100.0 * B.M(B.GameWait) / F : 0.0,
-	       B.MResidual(),  F > 0 ? 100.0 * B.MResidual() / F : 0.0,
-	       B.M(B.Render),  F > 0 ? 100.0 * B.M(B.Render) / F : 0.0,
-	       B.M(B.RenderWait), B.M(B.RHI));
+	       TEXT("Voxel frame phase seg=%s n=%d applPerFrame=%.1f frameMs=%.2f tickMs=%.2f tickPct=%.0f ")
+	       TEXT("gameOtherMs=%.2f gameOtherPct=%.0f gameWaitMs=%.2f gameWaitPct=%.0f ")
+	       TEXT("residualMs=%.2f residualPct=%.0f renderMs=%.2f renderPct=%.0f ")
+	       TEXT("renderWaitMs=%.2f rhiMs=%.2f"),
+	       Name, B.N, double(B.Applies) / double(B.N),
+	       F, B.M(B.Tick), Pct(B.M(B.Tick)),
+	       B.MOther(), Pct(B.MOther()), B.M(B.GameWait), Pct(B.M(B.GameWait)),
+	       B.MResidual(), Pct(B.MResidual()),
+	       B.MRenderBusy(), Pct(B.MRenderBusy()), B.M(B.RenderWait), B.M(B.RHI));
+
+	// THE PIPELINE LINE -- WHICH THREAD IS THE LONGER STAGE.
+	//
+	// This is the question the four buckets above cannot answer on their own,
+	// because they describe ONE thread's frame and the ceiling may belong to the
+	// other. Game-thread busy and render-thread busy are both wall time on a
+	// single thread, so they are directly comparable; the frame cannot be
+	// shorter than the longer of them, whatever the game thread's own split
+	// looks like.
+	//
+	// GAMEBOUND  game busy is the longer stage -- game-thread microseconds pay.
+	// RENDERBOUND render busy is the longer stage -- game-thread work can be
+	//            deleted entirely and the frame will not move below it. Every
+	//            per-chunk game-thread optimisation is then aimed at the wrong
+	//            thread, and that is a claim worth printing rather than
+	//            leaving to be inferred from two numbers on different lines.
+	// BALANCED   within 15%: neither dominates and both must come down.
+	//
+	// headroomMs is what the frame WOULD be if the shorter stage vanished: the
+	// floor any single-thread fix is working against.
+	const double GameBusy = B.MGameBusy();
+	const double RenderBusy = B.MRenderBusy();
+	const double Longer = FMath::Max(GameBusy, RenderBusy);
+	const double Ratio = Longer > 0 ? FMath::Abs(GameBusy - RenderBusy) / Longer : 0.0;
+	const TCHAR* Bound = (GameBusy <= 0.0 || RenderBusy <= 0.0) ? TEXT("UNKNOWN-A-STAGE-READS-ZERO")
+	                   : (Ratio < 0.15)          ? TEXT("BALANCED")
+	                   : (GameBusy > RenderBusy) ? TEXT("GAMEBOUND")
+	                                             : TEXT("RENDERBOUND");
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel frame phase PIPELINE seg=%s gameBusyMs=%.2f renderBusyMs=%.2f frameMs=%.2f ")
+	       TEXT("longerStageMs=%.2f floorFps=%.0f gapPct=%.0f bound=%s"),
+	       Name, GameBusy, RenderBusy, F, Longer,
+	       Longer > 0 ? 1000.0 / Longer : 0.0, 100.0 * Ratio, Bound);
 }
 
 // One delta, one verdict, for any pair of buckets. Factored so the two
@@ -389,12 +454,22 @@ void Flush(double Now)
 		Emit(TEXT("HEAVY-APPLY"),    Heavy);
 		Emit(TEXT("SETTLED-PARKED"), SParked);
 		Emit(TEXT("SETTLED-MOVING"), SMoving);
+		Emit(TEXT("SETTLED-PARKED-LEG"), SParkedTotal);
+		Emit(TEXT("SETTLED-MOVING-LEG"), SMovingTotal);
 
 		// THE MOVE DELTA IS THE GOAL 3 QUESTION and is emitted first for that
 		// reason: what makes a FLYING frame 43-51 ms when a PARKED frame is 9?
 		// Same build, same settled state, same everything but the anchor moving.
-		EmitDelta(TEXT("MOVE"), TEXT("settled-moving"), TEXT("settled-parked"), SMoving, SParked,
+		// LEG SCOPE FIRST -- it is the one that computes on a fully-flying
+		// window, and therefore the one that answers the question. The
+		// window-scope delta below it is kept because a transition window is a
+		// genuine within-5-seconds comparison, immune to any drift across the
+		// leg; it just cannot fire while the camera is simply flying.
+		EmitDelta(TEXT("MOVE-LEG"), TEXT("settled-moving-leg"), TEXT("settled-parked-leg"),
+		          SMovingTotal, SParkedTotal,
 		          TEXT("what-makes-a-FLYING-frame-slow--THE-GOAL3-QUESTION"));
+		EmitDelta(TEXT("MOVE"), TEXT("settled-moving"), TEXT("settled-parked"), SMoving, SParked,
+		          TEXT("same-question-within-one-window--fires-only-on-transition-windows"));
 		EmitDelta(TEXT("LOAD"), TEXT("heavy-apply"), TEXT("light-apply"), Heavy, Light,
 		          TEXT("what-applying-many-chunks-in-one-frame-costs--the-lifted-cap-question"));
 	}
@@ -508,6 +583,8 @@ void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpee
 	if (bSettled)
 	{
 		(bMoving ? SMoving : SParked)
+			.Add(FrameMs, VoxelTickMs, GameMs, GameWaitMs, RenderMs, RenderWaitMs, RHIMs, AppliesThisFrame);
+		(bMoving ? SMovingTotal : SParkedTotal)
 			.Add(FrameMs, VoxelTickMs, GameMs, GameWaitMs, RenderMs, RenderWaitMs, RHIMs, AppliesThisFrame);
 	}
 
