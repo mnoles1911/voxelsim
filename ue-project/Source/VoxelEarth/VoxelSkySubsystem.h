@@ -126,6 +126,35 @@ struct FVoxelSkyState
 	int64 LightUpdates = 0;
 	double SecondsSinceLightUpdate = 0.0;
 
+	// --- measurement arms ----------------------------------------------------
+	//
+	// PROOF OF TRAFFIC. These are here in the state struct, and not only in a log
+	// line, because this project has shipped arms that were accepted on the
+	// command line, changed nothing, and read as armed for weeks -- five of them
+	// in one night. A cvar being SET proves a string parsed; these three fields
+	// are what prove a branch ran.
+	//
+	// Re-orientation steps SUPPRESSED by voxel.Sky.PinLightOrientation. Exactly 0
+	// in every shipped build and in every leg that failed to set the cvar; climbs
+	// at the voxel.Sky.ShadowUpdateHz rate in a leg that really engaged the arm.
+	int64 LightOrientationsPinned = 0;
+	// How far the pinned sun has drifted from where the ephemeris says it should
+	// be, in degrees, READ BACK off the actor rather than integrated from the
+	// request. It exists to catch the arm's one silent failure: a leg that also
+	// pinned voxel.Sky.TimeScale 0 will show LightOrientationsPinned climbing
+	// while this stays at 0, because a sun that was not going to move anyway
+	// costs nothing to stop -- that leg measured nothing and this is the only
+	// reading that says so.
+	float PinnedSunErrorDeg = 0.f;
+	// What USkyLightComponent::IsRealTimeCaptureEnabled() ACTUALLY RETURNS after
+	// voxel.Sky.RealTimeCapture was pushed -- not what was pushed. -1 = never
+	// pushed (which is the default build: SpawnRig's call is the only one). The
+	// distinction is the point: the engine ANDs our flag with the component's
+	// mobility and with r.SkyLight.RealTimeReflectionCapture
+	// (SkyLightComponent.cpp:1159-1162), so a leg that echoed its own request
+	// could report an armed capture the renderer had already ignored.
+	int32 RealTimeCaptureActive = -1;
+
 	bool bSunUp = false;   // apparent altitude > 0 (refraction already folded in)
 	bool bMoonUp = false;
 	bool bClockRunning = false; // voxel.Sky.Enabled && TimeScale != 0
@@ -296,6 +325,17 @@ private:
 	// real-time capture is reading. -1 = never applied.
 	int32 AppliedSkyLightAtGroundZ = -1;
 
+	// Last value of voxel.Sky.RealTimeCapture actually pushed into the SkyLight,
+	// so the per-frame call is an int compare rather than a
+	// SetRealTimeCaptureEnabled (which calls MarkRenderStateDirty and
+	// SetCaptureIsDirty on every invocation, i.e. it is NOT free to re-assert).
+	// SEEDED TO 1 BY SpawnRig, not left at -1, because SpawnRig has just set the
+	// component true: that is what makes a default build byte-for-byte the build
+	// it was before this arm existed, rather than one redundant render-state
+	// dirty per session. -1 would mean "never pushed" and is only reachable if
+	// SpawnRig never ran.
+	int32 AppliedRealTimeCapture = -1;
+
 	// Re-applies voxel.Sky.SkyLightAtGroundZ. LIVE rather than spawn-time-only,
 	// and that is not a nicety: tools/voxel-capture.ps1 passes -Cvars through
 	// -ExecCmds, which lands AFTER BeginPlay (the script says so at :114-116 and
@@ -305,6 +345,21 @@ private:
 	// a switch that cannot be flipped inside one session makes its own A/B
 	// unreadable.
 	void ApplySkyLightPlacement();
+
+	// Pushes voxel.Sky.RealTimeCapture into the SkyLight and logs the value READ
+	// BACK off the component. LIVE for the same reason ApplySkyLightPlacement is,
+	// with one consequence worth knowing before you go looking for it: it is
+	// driven from Tick, and Tick does not run at voxel.Sky.Enabled 0, so the arm
+	// is unreachable while the clock is off. That is documented in the cvar's
+	// help rather than worked around, because a second application path is a
+	// second thing that can disagree about the state of one component.
+	//
+	// This is a COST arm, not an appearance one -- it is the only switch in this
+	// file that exists purely so a perf leg can size something -- but it has an
+	// appearance consequence at 0 (the ambient term freezes rather than following
+	// the sky down), which is why its default is 1 and why nothing in this file
+	// chooses 0 on its own.
+	void ApplySkyLightRealTimeCapture();
 
 	void SpawnRig(UWorld& World);
 	void ApplyStaticRigPose();

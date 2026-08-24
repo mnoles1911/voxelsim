@@ -209,11 +209,16 @@ namespace
 
 	TAutoConsoleVariable<int32> CVarSkyEnabled(
 		TEXT("voxel.Sky.Enabled"), 1,
-		TEXT("Day/night world clock drives the light rig. 1 = on (default). 0 = off, and genuinely ")
-		TEXT("zero per-frame cost: UVoxelSkySubsystem::IsTickable goes false and the rig is left at ")
-		TEXT("the fixed pose the pre-W4 static rig used, so switching this off does NOT switch the ")
-		TEXT("lights off -- it freezes them. CLIENT-SIDE RENDERING ONLY, outside the determinism ")
-		TEXT("boundary."),
+		TEXT("Day/night world clock drives the light rig. 1 = on (default). 0 = off: ")
+		TEXT("UVoxelSkySubsystem::IsTickable goes false, so THIS SUBSYSTEM'S per-frame cost is ")
+		TEXT("genuinely zero, and the rig is left at the fixed pose the pre-W4 static rig used -- ")
+		TEXT("switching this off does NOT switch the lights off, it freezes them. WHAT 0 DOES NOT ")
+		TEXT("STOP, and the help string used to imply otherwise: the SkyLight's real-time cubemap ")
+		TEXT("capture is a flag on the component, not a tick, so at 0 the renderer keeps capturing ")
+		TEXT("and convolving the (now completely static) sky every frame. voxel.Sky.RealTimeCapture ")
+		TEXT("is the switch for that one and the two are independent -- and note that at 0 this ")
+		TEXT("subsystem stops ticking, so it also stops being able to apply that switch. ")
+		TEXT("CLIENT-SIDE RENDERING ONLY, outside the determinism boundary."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyTimeScale(
@@ -227,7 +232,7 @@ namespace
 
 	TAutoConsoleVariable<float> CVarSkyDayLengthSeconds(
 		TEXT("voxel.Sky.DayLengthSeconds"), 3600.0f,
-		TEXT("Wall-clock seconds per game day. Default 2400 = a 40-minute day. DOUBLED from 1200 ")
+		TEXT("Wall-clock seconds per game day. Default 3600 = a 60-minute day. Lengthened from 2400 ")
 		TEXT("on 2026-08-09: at 1200 the sky visibly moved while you stood still. This is the one ")
 		TEXT("knob that sets the whole sky's angular rate -- the sun, the moon and the star field ")
 		TEXT("all derive from frac(epoch / DayLengthSeconds), so doubling it halves every one of ")
@@ -243,7 +248,7 @@ namespace
 	TAutoConsoleVariable<float> CVarSkyDaysPerYear(
 		TEXT("voxel.Sky.DaysPerYear"), 48.0f,
 		TEXT("Game days per game year. Default 48, i.e. a season per ~8 hours of play at the ")
-		TEXT("default day length (48 * 2400 s = 32 h per year, /4 = 8 h per season). NOTE the ")
+		TEXT("default day length (48 * 3600 s = 48 h per year, /4 = 12 h per season). NOTE the ")
 		TEXT("consequence VoxelEphemeris.h:130-138 spells out: the solar declination moves ")
 		TEXT("VISIBLY WITHIN one game day at this compression (365.2425/48 = 7.6 real days per ")
 		TEXT("game day), so the sun rises at a different point on the horizon than it set at. ")
@@ -505,10 +510,106 @@ namespace
 		TEXT("continuously rotating directional light invalidates UE's cached whole-scene shadow ")
 		TEXT("setup every single frame; stepping it instead quantises shadow motion, which is ")
 		TEXT("visible as a pop if the step is coarse. 10 Hz is a starting guess, NOT a measurement ")
-		TEXT("-- at the default 2400 s day the sun moves 0.015 deg per step, which should be below ")
+		TEXT("-- at the default 3600 s day the sun moves 0.010 deg per step, which should be below ")
 		TEXT("the visible-pop threshold, and whether the cap buys anything at all is exactly what ")
 		TEXT("the W7 perf leg exists to settle. 0 = uncapped (re-orient every frame), which is the ")
 		TEXT("control arm of that measurement."),
+		ECVF_Default);
+
+	// How often the two MEASUREMENT ARMS in this file (voxel.Sky.PinLightOrientation
+	// below, voxel.Sky.RealTimeCapture further down) print their proof-of-traffic
+	// line while engaged. Five seconds is short enough that a 30 s leg gets several
+	// samples and long enough that the line cannot become the thing being measured.
+	// NOTHING prints at all while both arms sit at their defaults, which is what
+	// keeps a default build identical to the one before these arms existed.
+	constexpr double kArmHeartbeatSeconds = 5.0;
+
+	// ======================================================================
+	// voxel.Sky.PinLightOrientation -- THE MISSING CONTROL ARM FOR THE CAP ABOVE.
+	//
+	// voxel.Sky.ShadowUpdateHz has two arms today and NEITHER of them is the one
+	// its own hypothesis needs. 10 (default) steps the sun ten times a second; 0
+	// steps it every frame. Both MOVE the light. There has never been an arm that
+	// stops the light moving at all while leaving the rest of this subsystem
+	// running, so "what does re-orienting the sun cost" has never had a control --
+	// which is the real reason the W7 leg keeps not settling anything.
+	//
+	// THE OBVIOUS SUBSTITUTE IS NOT GOOD ENOUGH, and it is worth saying why in
+	// full because it is what a reader reaches for first. voxel.Sky.TimeScale 0
+	// does stop the sun -- and also freezes the exposure ladder, the fog term, the
+	// MPC writes that drive M_NightSky, and bClockRunning. A difference measured
+	// against a frozen clock is a difference against FIVE changes at once and can
+	// be attributed to none of them. This arm changes exactly one thing:
+	// SetActorRotation is not called on the sun or the moon. The clock, the
+	// exposure, the material params, and the lights' intensity and colour all keep
+	// running exactly as they do in the shipped build.
+	//
+	// ROTATION ONLY, AND THAT IS THE DESIGN, NOT AN OVERSIGHT. The claim under
+	// test is specifically that a directional light whose ROTATION changes
+	// invalidates UE's cached whole-scene shadow setup, because the rotation is
+	// what places the cascades. Intensity and colour dirty the light's render
+	// state too (ULightComponent::UpdateColorAndBrightness -> MarkRenderStateDirty,
+	// LightComponent.cpp:1455-1477, which the long block in ApplyLightsFromState
+	// already documents for a different reason) but they do not move a cascade.
+	// Leaving them live keeps this arm measuring the cascade question instead of
+	// the much vaguer "does touching a light at all cost anything".
+	//
+	// WHAT WOULD CONFIRM THE HYPOTHESIS: parked, streaming quiet, sun above the
+	// horizon, this at 1 versus this at 0 with nothing else moved -- setupOther
+	// falls by materially more than the run-to-run spread of the parked floor.
+	//
+	// WHAT WOULD REFUTE IT, WRITTEN DOWN HERE BEFORE THE RUN BECAUSE THAT IS THE
+	// RULE IN THIS CODEBASE: setupOther at 1 sits inside the noise of setupOther
+	// at 0. If that is the reading then the 10 Hz cap is buying nothing, and
+	// voxel.Sky.ShadowUpdateHz should be revisited as a SIMPLIFICATION -- uncap
+	// it, delete the accumulator and the bDue branch -- rather than defended. A
+	// cap that costs a branch and a quantisation artifact and saves nothing is
+	// worse than no cap.
+	//
+	// AND THE PRIOR IS ALREADY AGAINST THE HYPOTHESIS. The 2026-08-24 render-frame
+	// split legs ran a matched pair, on a verified binary, in which octree shadow
+	// culling was restored, the CSM cascade count was cut from 10 to 4, volumetric
+	// fog was switched off and SSR was switched off -- ALL FOUR TOGETHER -- and the
+	// parked setupOther moved 7.53 ms -> 7.35 ms. That is 2.4% for four changes at
+	// once. If more than halving the cached shadow setup is worth 2.4%,
+	// invalidating that same setup ten times a second is unlikely to be the
+	// dominant term in a 7.5 ms parked cost. This arm exists to CLOSE the question
+	// cheaply, not because anyone expects it to win; it is here so the next person
+	// to suspect the moving sun spends one leg instead of an argument.
+	//
+	// DEFAULT 0 IS TODAY'S BUILD EXACTLY. The branch below is not taken, no counter
+	// moves, no line is logged, and the only cost is one int compare inside a block
+	// that already runs at most ten times a second.
+	//
+	// PROOF OF TRAFFIC, WHICH IS NOT OPTIONAL HERE. An arm nobody can prove engaged
+	// is worse than no arm: this repo produced five arms in one night that were
+	// accepted on the command line and changed nothing, and every one of them read
+	// as armed. So at 1 this subsystem (a) increments
+	// FVoxelSkyState::LightOrientationsPinned once per SUPPRESSED step, (b)
+	// computes the angle between where the sun actually points and where the
+	// ephemeris says it should point, READ BACK OFF THE ACTOR rather than echoed
+	// from the request, and (c) logs both every kArmHeartbeatSeconds. A leg that
+	// cannot show LightOrientationsPinned climbing AND PinnedSunErrorDeg growing
+	// away from zero did not run this arm, whatever its command line says. The
+	// second of those catches the subtle failure: a leg that ALSO pinned TimeScale
+	// 0 will show the counter climbing while the error stays at 0, because a frozen
+	// sun has nowhere to drift from -- that leg measured nothing, and its own log
+	// is what says so rather than someone noticing afterwards.
+	// ======================================================================
+	TAutoConsoleVariable<int32> CVarSkyPinLightOrientation(
+		TEXT("voxel.Sky.PinLightOrientation"), 0,
+		TEXT("MEASUREMENT ARM, OFF BY DEFAULT, NOT A SHIPPING SETTING. 0 = what ships: the sun and ")
+		TEXT("moon are re-oriented on the voxel.Sky.ShadowUpdateHz cadence. 1 = the lights are left ")
+		TEXT("at whatever rotation they last had and are never turned again, while the clock, the ")
+		TEXT("exposure curve, the fog and the night-sky material keep running normally. This is the ")
+		TEXT("control arm for 'does moving the directional light cost anything on this draw path', ")
+		TEXT("and it is deliberately NOT voxel.Sky.TimeScale 0, which freezes five things at once ")
+		TEXT("and can attribute none of them. VISIBLE: at 1 the shadows stop tracking the sun while ")
+		TEXT("the sky keeps brightening, so a moving-sun scene goes visibly wrong within a minute -- ")
+		TEXT("this is a stopwatch, not a setting. LIVE, and it has to be: tools/voxel-capture.ps1 ")
+		TEXT("routes -Cvars through -ExecCmds, which lands after BeginPlay. While engaged it logs a ")
+		TEXT("heartbeat carrying the suppressed-step count and the pointing error read back off the ")
+		TEXT("actor; if that line is absent from a leg's log, the arm did not run."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarSkyExposureMode(
@@ -697,6 +798,123 @@ namespace
 		TEXT("cubemap is largely the fog's own colour rather than the sky's. LIVE -- re-applied ")
 		TEXT("every frame by ApplyFogFromState and logged on change, so it can be flipped inside one ")
 		TEXT("session. Note this is a property of the FOG, so it does nothing at voxel.Sky.Fog 0."),
+		ECVF_Default);
+
+	// ======================================================================
+	// voxel.Sky.RealTimeCapture -- AN ARM ON THE MOST EXPENSIVE THING THIS
+	// SUBSYSTEM SWITCHES ON, AND THE ONE NOBODY HAS EVER SIZED.
+	//
+	// SpawnRig calls SkyComp->SetRealTimeCaptureEnabled(true). WHAT THAT BUYS is
+	// written up at that call site and it is not decorative: it is how night gets
+	// dark here, because the ambient term follows the sky down as the sun sets
+	// without anything having to dim it, and nothing in this file is allowed to
+	// crush the GI term instead. WHAT IT COSTS has never been measured on this
+	// project, on this draw path, at all -- not once.
+	//
+	// WHAT THE FLAG ACTUALLY TURNS ON, read out of the engine rather than assumed.
+	// The file:lines are UE 5.8 and are quoted so the next reader can check them
+	// rather than trust this paragraph:
+	//
+	//   DeferredShadingRenderer.cpp:2859-2867 gates the whole feature on
+	//   Scene->SkyLight->bRealTimeCaptureEnabled and, when it is true, calls
+	//   FScene::AllocateAndCaptureFrameSkyEnvMap EVERY FRAME from inside
+	//   FDeferredShadingSceneRenderer::Render -- on the render thread, during graph
+	//   construction, before the base pass.
+	//
+	//   ReflectionEnvironmentRealTimeCapture.cpp:385-412 then takes a FULL
+	//   FViewInfo SNAPSHOT of the main view (MainView.CreateSnapshot() followed by
+	//   SetupUniformBufferParameters) and re-projects it as a 90-degree cube view.
+	//   That is CPU work on the render thread and it happens before any GPU work is
+	//   queued.
+	//
+	//   :1261-1285 renders the six cube faces through FSkyPassMeshProcessor,
+	//   generates the mip chain, runs the specular convolution over every mip and
+	//   then the diffuse-irradiance SH.
+	//   r.SkyLight.RealTimeReflectionCapture.TimeSlice (default 1, and this project
+	//   does not override it in DefaultEngine.ini) spreads that across frames --
+	//   but time slicing spreads the GPU work. It does NOT stop the function being
+	//   entered, the view snapshot being taken, or RDG passes being added, every
+	//   single frame.
+	//
+	// WHY THIS IS THE FIRST THING TO POINT A LEG AT AND NOT THE SECOND. The
+	// 2026-08-24 render-frame split legs put the PARKED frame -- essentially zero
+	// streaming -- at renderBusy 8.85 ms with setupMs 7.66 ms, of which 7.62 ms was
+	// setupOther, i.e. engine scene-renderer graph construction, against a 10 ms
+	// frame target; the voxel marcher's own render-thread hooks were 0.044 ms of
+	// that. So the binding constraint on this project today is per-frame
+	// render-thread setup that happens whether or not anything streamed. The
+	// paragraphs above describe work with exactly that shape: unconditional,
+	// per-frame, render-thread, graph-construction, and completely independent of
+	// the voxel world. THAT IS A REASON TO MEASURE IT FIRST. It is not a finding,
+	// and nothing here claims a number for it, because nobody has run the leg. The
+	// owner has separately called this capture "highly inefficient"; that is
+	// another reason to measure it first, and it is still not a measurement.
+	//
+	// AND HERE IS SOMETHING EVERY LEG THIS PROJECT HAS EVER RUN WAS PAYING FOR.
+	// Captures pin voxel.Sky.TimeScale 0 at 12:00 for reproducibility (see the
+	// exposure-ladder note above voxel.Sky.SkyLightAtGroundZ). With the clock
+	// frozen the sun does not move, the atmosphere does not change, and this world
+	// has no volumetric cloud -- so the cubemap being re-captured and re-convolved
+	// is bit-for-bit the one from the previous frame. THAT REDUNDANCY IS REAL, and
+	// it is a measurement hazard rather than a bug: a parked leg's floor includes a
+	// capture the parked leg did not need, which means whatever this arm recovers
+	// on a frozen-clock leg is an UPPER bound on what the shipped, moving-sun game
+	// would recover. Read the leg that way. It is deliberately NOT "fixed" here,
+	// because in the shipped game the sun does move and the capture is then doing
+	// exactly the job it was switched on for; putting a cadence on it is a visible
+	// change to how the ambient term tracks the sky, and this project settles
+	// appearance on a screenshot rather than on an argument in a comment.
+	//
+	// WHAT WOULD CONFIRM THE SUSPICION: parked, streaming quiet, this at 0 versus 1
+	// with nothing else moved -- setupOther falls by materially more than the parked
+	// floor's run-to-run spread, and the CaptureConvolveSkyEnvMap scope disappears
+	// from the GPU profile.
+	//
+	// WHAT WOULD REFUTE IT, WRITTEN DOWN BEFORE THE RUN: setupOther at 0 sits inside
+	// the noise of setupOther at 1. If that is the reading then the capture is not
+	// where the 7.6 ms is, the "highly inefficient" suspicion is wrong for this
+	// build, and the search moves on -- and this arm should be LEFT IN PLACE
+	// precisely so nobody re-opens the question from intuition a third time.
+	//
+	// WHAT 0 LOOKS LIKE, SO NOBODY MISTAKES IT FOR A FREE WIN. Clearing the flag
+	// calls MarkRenderStateDirty and SetCaptureIsDirty (SkyLightComponent.cpp:1164
+	// and :354), and SetCaptureIsDirty queues ONE ordinary capture which
+	// USkyLightComponent::UpdateSkyCaptureContents (:920) then services -- such
+	// entries are dropped while real-time capture is on (:943 removes exactly them)
+	// and stop being dropped the moment the flag clears. So the ambient term does
+	// NOT go black: it FREEZES at the sky as it was when the arm engaged, and stops
+	// following the sun down. On a frozen-clock perf leg that is invisible, which is
+	// exactly why this arm is safe to MEASURE with and not safe to SHIP at 0.
+	// Whether a frozen ambient term is acceptable in a moving-sun scene is a
+	// screenshot question and it belongs to the owner, not to this file.
+	//
+	// DEFAULT 1 IS TODAY'S BUILD EXACTLY. AppliedRealTimeCapture is seeded to 1 at
+	// the SetRealTimeCaptureEnabled(true) call in SpawnRig, so at the default this
+	// costs one int compare per frame and never touches the component.
+	//
+	// PROOF OF TRAFFIC. FVoxelSkyState::RealTimeCaptureActive carries what
+	// USkyLightComponent::IsRealTimeCaptureEnabled() RETURNS after the push, not
+	// what was pushed, and the APPLIED log line prints that same read-back. The
+	// distinction is the whole point: the engine ANDs our flag with the component's
+	// mobility and with r.SkyLight.RealTimeReflectionCapture
+	// (SkyLightComponent.cpp:1159-1162), so a leg that echoed its own request could
+	// report an armed capture the renderer had already ignored -- or, worse, report
+	// a disarmed one while the renderer kept capturing.
+	// ======================================================================
+	TAutoConsoleVariable<int32> CVarSkyRealTimeCapture(
+		TEXT("voxel.Sky.RealTimeCapture"), 1,
+		TEXT("Whether the SkyLight re-captures and re-convolves the sky cubemap every frame. 1 = ")
+		TEXT("yes, WHICH IS WHAT SHIPS (default) and is how the ambient term follows the sky down at ")
+		TEXT("dusk. 0 = MEASUREMENT ARM: the flag is cleared, the engine stops entering ")
+		TEXT("FScene::AllocateAndCaptureFrameSkyEnvMap altogether (DeferredShadingRenderer.cpp:2859 ")
+		TEXT("gates on it), and the ambient term FREEZES at the sky it last saw rather than going ")
+		TEXT("black. Exists because this call has never been sized on this draw path and the parked ")
+		TEXT("frame is bounded by exactly the kind of work it does -- per-frame, render-thread, graph ")
+		TEXT("construction, independent of streaming. NOT A SHIPPING SETTING: at 0 night stops ")
+		TEXT("getting dark. LIVE -- re-applied from Tick and logged with the value READ BACK off the ")
+		TEXT("component via IsRealTimeCaptureEnabled(), so a leg can prove the arm engaged rather ")
+		TEXT("than prove its own command line parsed. Needs voxel.Sky.Enabled 1, because at 0 this ")
+		TEXT("subsystem stops ticking and nothing re-applies it."),
 		ECVF_Default);
 
 	// --- the star ambient calibration ----------------------------------------
@@ -977,6 +1195,12 @@ namespace VoxelSky
 
 	float GetShadowUpdateHz() { return FMath::Max(0.f, CVarSkyShadowUpdateHz.GetValueOnAnyThread()); }
 
+	// The MEASUREMENT ARM for the cadence above. A plain bool with nothing to
+	// clamp, named here rather than read at its use site for the reason the
+	// header gives for this whole block: a cvar four files can reach is a value
+	// four files interpret four ways.
+	bool IsLightOrientationPinned() { return CVarSkyPinLightOrientation.GetValueOnAnyThread() != 0; }
+
 	int32 GetExposureMode() { return FMath::Clamp(CVarSkyExposureMode.GetValueOnAnyThread(), 0, 2); }
 
 	float GetExposureBias() { return CVarSkyExposureBias.GetValueOnAnyThread(); }
@@ -990,6 +1214,15 @@ namespace VoxelSky
 	bool IsSkyLightAtGroundZ() { return CVarSkySkyLightAtGroundZ.GetValueOnAnyThread() != 0; }
 
 	bool IsFogInSkyCapture() { return CVarSkyFogInSkyCapture.GetValueOnAnyThread() != 0; }
+
+	// The third arm on the ambient term, and the only one of the three that is
+	// about COST rather than appearance. Note carefully that this is what the
+	// project ASKS FOR; whether the renderer honours it is a separate question
+	// answered by USkyLightComponent::IsRealTimeCaptureEnabled(), which ANDs it
+	// with the component's mobility and with r.SkyLight.RealTimeReflectionCapture
+	// (SkyLightComponent.cpp:1159-1162). ApplySkyLightRealTimeCapture reads that
+	// back and it is the read-back, not this, that a leg should believe.
+	bool IsRealTimeSkyCaptureEnabled() { return CVarSkyRealTimeCapture.GetValueOnAnyThread() != 0; }
 
 	// Floored at 1e6 UU (10 km) purely so that a fat-fingered 0 or a negative
 	// value cannot collapse the dome to a point at the camera, which renders as a
@@ -1774,7 +2007,7 @@ namespace
 	// dimming lights and an exposure stop, never from crushing albedo. Nothing in
 	// this file touches voxel.GI.AmbientFloor or any other GI cvar and it must not.
 	//
-	// THE 3-DEGREE BAND IS NOT ABRUPT. At the default 2400 s day the sun sweeps
+	// THE 3-DEGREE BAND IS NOT ABRUPT. At the default 3600 s day the sun sweeps
 	// 3 degrees in ~20 seconds of wall clock, so this is a 2-stop fade over twenty
 	// seconds -- 0.10 stops/s, still no faster than what ships at sunrise, where
 	// the table below now moves 5.89 stops across the 8 degrees from -6 to +2
@@ -1892,6 +2125,16 @@ struct FVoxelSkyImpl
 	// Cadence accumulator for voxel.Sky.ShadowUpdateHz.
 	double LightUpdateAccumulator = 0.0;
 	bool bLightsEverApplied = false;
+
+	// Seconds remaining until the next proof-of-traffic line from the two
+	// MEASUREMENT ARMS (voxel.Sky.PinLightOrientation, voxel.Sky.RealTimeCapture).
+	// It counts down ONLY while an arm is engaged and is reset to 0 the moment
+	// both are back at their defaults, so (a) a default build never touches it
+	// after this initialiser and never logs, and (b) the first frame after an arm
+	// engages prints immediately rather than up to kArmHeartbeatSeconds later --
+	// which matters because a short leg could otherwise finish before its own
+	// proof line appeared and look exactly like an arm that never engaged.
+	double ArmHeartbeatCountdown = 0.0;
 
 	// Latched state of the sun's CastShadows flag, so the hysteresis in
 	// ApplyLightsFromState has something to compare against and so the flip is
@@ -2512,6 +2755,24 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 			// GI term multiplies ALBEDO, so crushing it to make night dark would
 			// mean a torch on a black wall lights nothing.
 			SkyComp->SetRealTimeCaptureEnabled(true);
+
+			// AND WHAT IT COSTS IS NOW MEASURABLE, WHICH IT WAS NOT. The
+			// paragraph above says what this buys. Nothing said what it costs,
+			// and nothing could: there was no way to turn it off for one leg and
+			// on for the next. voxel.Sky.RealTimeCapture is that switch, its long
+			// comment carries the engine call chain this line actually starts and
+			// the reading that would refute the suspicion, and
+			// ApplySkyLightRealTimeCapture is what pushes it live.
+			//
+			// SEEDING THE LATCH HERE, not leaving it at -1, is what makes the
+			// default build identical to the build before that switch existed: at
+			// the default of 1 the Apply function finds Want == Applied on its
+			// very first tick and never touches this component again. A -1 seed
+			// would cost one redundant SetRealTimeCaptureEnabled and one
+			// MarkRenderStateDirty on the first frame of every session, which is
+			// small, invisible, and exactly the kind of thing that turns "the arm
+			// is off by default" into a claim rather than a fact.
+			AppliedRealTimeCapture = 1;
 		}
 
 		// THE BUG THIS FIXES, and it is the one the brief called out. The old rig
@@ -2830,6 +3091,7 @@ void UVoxelSkySubsystem::ApplyStaticRigPose()
 		Impl->AppliedExposureBias = TNumericLimits<double>::Max();
 		Impl->bLightsEverApplied = false;
 		Impl->bSunShadowsOn = true; // matches the SetCastShadows(true) just applied
+		Impl->ArmHeartbeatCountdown = 0.0; // next engaged arm prints on its first frame
 	}
 }
 
@@ -2986,6 +3248,15 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// routes -Cvars through -ExecCmds, which lands after BeginPlay, so a
 	// spawn-time-only switch is unreachable by the very sweep meant to judge it.
 	ApplySkyLightPlacement();
+	// Same shape and the same reason: one int compare per frame unless
+	// voxel.Sky.RealTimeCapture moved, live because -ExecCmds lands after
+	// BeginPlay. NOTE THE CONSEQUENCE OF LIVING HERE: at voxel.Sky.Enabled 0 this
+	// subsystem does not tick, so the capture arm cannot be flipped -- the
+	// component keeps whatever it last had. That is stated in the cvar's help
+	// rather than worked around, because the alternative is a second application
+	// path and two paths that can disagree about the state of one component is
+	// the bug ApplySkyLightPlacement exists to avoid.
+	ApplySkyLightRealTimeCapture();
 
 	// --- the night sky's material parameters, ALSO EVERY frame ---------------
 	//
@@ -2995,7 +3266,7 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// primitive and bust no cached shadow setup, so the cap has nothing to save
 	// here. And one reason of their own, which is stronger than exposure's: this
 	// drives the position of a moon disc 0.52 degrees wide. A 10 Hz step through a
-	// 2400 s day moves the sun and moon 0.015 degrees per step -- invisible on a
+	// 3600 s day moves the sun and moon 0.010 degrees per step -- invisible on a
 	// shadow, but 3% of the moon's own diameter, i.e. a disc that visibly jerks
 	// ten times a second while everything around it moves smoothly.
 	ApplySkyMaterialParams();
@@ -3006,7 +3277,7 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// invalidates UE's cached whole-scene shadow setup every frame. Stepping the
 	// rotation instead lets that cache survive between steps -- at the cost of
 	// quantising shadow motion, which shows up as a pop if the step is coarse
-	// enough. At the default 2400 s day and 10 Hz that step is 0.015 degrees of
+	// enough. At the default 3600 s day and 10 Hz that step is 0.010 degrees of
 	// solar motion, which should be far below the visible-pop threshold.
 	//
 	// THE TRADEOFF IS UNMEASURED. "Should be" is doing real work in that
@@ -3017,10 +3288,71 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// has run, treat both the existence of the cap and the choice of 10 Hz as
 	// hypotheses. voxel.Sky.ShadowUpdateHz 0 is the uncapped control arm.
 	//
+	// ---- DOES THE SUN NEED TO MOVE TEN TIMES A SECOND? THE TRADE, NOT A PICK --
+	//
+	// This is ARITHMETIC OFF THE SHIPPED CONFIG, not a measurement, and it is
+	// written out so the owner can pick a rate on a screenshot instead of on a
+	// feeling. Nobody in this file should pick it.
+	//
+	// The sun's angular rate is 360 deg / voxel.Sky.DayLengthSeconds, scaled by
+	// voxel.Sky.TimeScale. At the SHIPPED defaults (DayLengthSeconds 3600,
+	// TimeScale 1.0) that is 0.1 deg/s, so the per-step motion is:
+	//
+	//     10 Hz (today)  0.010 deg      2 Hz  0.050 deg      1 Hz  0.100 deg
+	//
+	// THE 2400 s FIGURE THAT USED TO APPEAR IN FOUR NEIGHBOURING COMMENTS WAS
+	// STALE, AND IS NOW SETTLED: the owner confirmed on 2026-08-24 that the day
+	// was deliberately lengthened to 3600 s and the comments simply were not
+	// updated. 3600 is the intended value; 0.015 deg/step was correct arithmetic
+	// for the old 2400 s day and is wrong for what ships. The four sites (this
+	// paragraph, voxel.Sky.ShadowUpdateHz's help, voxel.Sky.DayLengthSeconds'
+	// help, and ApplySkyMaterialParams) now all read 3600 s / 0.010 deg.
+	//
+	// Kept as a note rather than deleted because the arithmetic below is derived
+	// from the day length: anyone changing DayLengthSeconds again must re-derive
+	// this table and the dusk figures, or reintroduce exactly this drift.
+	//
+	// WHAT A STEP LOOKS LIKE. The quantisation shows up as the shadow direction
+	// jumping rather than sliding, and the size of the jump is NOT constant
+	// through the day -- it depends on where the sun is. For a caster of height h
+	// at sun altitude A, the shadow length is h/tan(A), so a step dA moves the
+	// shadow's TIP by roughly h*dA/sin^2(A). For a 30 m tree:
+	//
+	//     A = 45 deg (midday-ish)   10 Hz ~ 1 cm     1 Hz ~ 10 cm
+	//     A =  5 deg (low sun)      10 Hz ~ 0.7 m    1 Hz ~ 6.9 m
+	//
+	// So the honest answer to "does it need 10 Hz" is: NOT AT MIDDAY, where even
+	// 1 Hz moves a tree's shadow tip a hand's width per step and the sun is the
+	// least of what is on screen. NEAR SUNRISE AND SUNSET IT IS A DIFFERENT
+	// QUESTION -- that is when shadows are long, when they are the most visible
+	// thing in the frame, and when the same angular step moves their tips by
+	// metres. A rate chosen at noon will look fine and fail at dusk, so any
+	// screenshot A/B of a lower rate has to be shot at LOW SUN or it has not
+	// tested the case that matters.
+	//
+	// TWO MULTIPLIERS THAT MOVE ALL OF THE ABOVE AND ARE EASY TO FORGET: a leg or
+	// a player running voxel.Sky.TimeScale above 1 scales every number here
+	// linearly, and a shorter voxel.Sky.DayLengthSeconds does the same. A rate
+	// that is invisible at TimeScale 1 is not invisible at 10.
+	//
+	// AND THE OTHER HALF OF THE TRADE HAS NO NUMBER YET AT ALL: what a lower rate
+	// BUYS. Nothing in this project has measured that, which is the entire reason
+	// voxel.Sky.PinLightOrientation exists -- it puts a floor under the question
+	// (what does stopping the sun entirely save?) so that nobody has to guess at
+	// intermediate rates. If the pinned arm saves nothing, no rate below 10 Hz
+	// can save anything either and this whole paragraph is moot.
+	//
 	// The WHOLE light state (rotation, intensity, colour) is stepped together
 	// rather than only the rotation. Splitting them would leave the sun's
 	// brightness ahead of its position by up to a step, which is a subtler and
 	// harder-to-attribute artifact than a slightly stale light.
+	// Read ONCE per tick and above the gate, because it is needed in two places:
+	// inside the gate to suppress the rotation, and below the gate by the
+	// proof-of-traffic heartbeat. Reading it twice would let a console command
+	// landing between the two produce a frame whose log disagrees with its own
+	// behaviour, which is a small thing that costs an afternoon when it happens.
+	const bool bPinned = VoxelSky::IsLightOrientationPinned();
+
 	const float UpdateHz = VoxelSky::GetShadowUpdateHz();
 	Impl->LightUpdateAccumulator += (double)DeltaTime;
 	const double UpdatePeriod = UpdateHz > 0.f ? 1.0 / (double)UpdateHz : 0.0;
@@ -3039,17 +3371,128 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 		// spells out at length because getting it backwards produces a scene lit
 		// from underground at noon and blazing at midnight -- and that looks
 		// enough like a broken ephemeris that the search starts in the wrong file.
-		if (SunLight)
+		// ===================================================================
+		// AND HERE IS THE MEASUREMENT ARM, voxel.Sky.PinLightOrientation.
+		//
+		// It wraps THESE TWO CALLS AND NOTHING ELSE. Everything around it -- the
+		// clock, the exposure ladder, the fog, the MPC writes, and
+		// ApplyLightsFromState just below with the sun's intensity, colour and
+		// shadow-casting hysteresis -- keeps running exactly as it does in the
+		// shipped build. That is what makes the arm attributable: the only
+		// difference between its two states is whether a directional light was
+		// turned. See the cvar's own comment for what confirms and what refutes.
+		//
+		// LightUpdates STILL INCREMENTS WHEN PINNED, deliberately. It counts
+		// light UPDATES, not rotations, and ApplyLightsFromState still runs; more
+		// to the point, two instruments outside this file read it as a liveness
+		// check (VoxelSkyLadderFixture treats LightUpdates == 0 as "the subsystem
+		// never drove the rig", and VoxelPerfRunSubsystem prints it in its run
+		// header). An arm that silently froze that counter would make this
+		// subsystem look dead to both of them, which is a fine way to spend a
+		// night chasing the wrong bug. LightOrientationsPinned is the new
+		// counter, and it is the one that proves the arm carried traffic.
+		// ===================================================================
+		if (bPinned)
 		{
-			SunLight->SetActorRotation((-Sun.Direction).Rotation());
+			S.LightOrientationsPinned++;
+
+			// THE PROOF, AND IT IS A READ-BACK RATHER THAN AN ECHO. The angle
+			// between where the sun ACTUALLY points (off the actor) and where the
+			// ephemeris says it should point. A leg that engaged this arm on a
+			// running clock will watch this grow without bound; a leg that shows
+			// LightOrientationsPinned climbing while this stays pinned at 0.0000
+			// also froze the clock (voxel.Sky.TimeScale 0) and therefore measured
+			// nothing, because a sun that was not going to move anyway costs
+			// nothing to stop. That failure is silent in every other reading a
+			// leg takes, which is exactly why this number exists.
+			if (SunLight)
+			{
+				const FVector Want = (-Sun.Direction).GetSafeNormal();
+				const FVector Have = SunLight->GetActorForwardVector();
+				const double Cos = FMath::Clamp(FVector::DotProduct(Want, Have), -1.0, 1.0);
+				S.PinnedSunErrorDeg = (float)FMath::RadiansToDegrees(FMath::Acos(Cos));
+			}
 		}
-		if (MoonLight)
+		else
 		{
-			MoonLight->SetActorRotation((-Moon.Direction).Rotation());
+			if (SunLight)
+			{
+				SunLight->SetActorRotation((-Sun.Direction).Rotation());
+			}
+			if (MoonLight)
+			{
+				MoonLight->SetActorRotation((-Moon.Direction).Rotation());
+			}
+			// Zero BY CONSTRUCTION on this path, and written rather than left
+			// stale so that a leg which toggles the arm off mid-run cannot report
+			// a pointing error it no longer has.
+			S.PinnedSunErrorDeg = 0.f;
 		}
 		ApplyLightsFromState();
 		S.LightUpdates++;
 		S.SecondsSinceLightUpdate = 0.0;
+	}
+
+	// --- proof of traffic for the two measurement arms -----------------------
+	//
+	// ======================================================================
+	// AN ARM THAT HAS NEVER BEEN OBSERVED CARRYING TRAFFIC IS WORTHLESS, and
+	// this repo has the receipts: five separate arms turned out to be inert
+	// while appearing armed, on the same night, and every one of them was
+	// "verified" by the fact that the command line was accepted. A console
+	// variable being SET proves the string parsed. It does not prove the branch
+	// ran, does not prove the engine honoured it, and does not prove the arm was
+	// still engaged at the end of the leg rather than only at the start.
+	//
+	// So both arms report continuously, not once at the flip:
+	//
+	//   PinLightOrientation -- the count of re-orientation steps SUPPRESSED, and
+	//   the accumulated pointing error read back off the actor. Both must move.
+	//   The count alone is satisfied by a frozen clock, which measures nothing.
+	//
+	//   RealTimeCapture -- what was asked for AND what
+	//   USkyLightComponent::IsRealTimeCaptureEnabled() reports, which are not the
+	//   same thing: the engine ANDs the flag with the component's mobility and
+	//   with r.SkyLight.RealTimeReflectionCapture (SkyLightComponent.cpp:
+	//   1159-1162). Asking for 1 and reading 0 back is a silently disabled arm --
+	//   the single most common failure mode in this codebase -- and it is exactly
+	//   what would happen if a future edit made the SkyLight Static again.
+	//
+	// COSTS NOTHING WHEN BOTH ARMS ARE AT THEIR DEFAULTS: two int compares and a
+	// store, no formatting, no log. That matters here more than usual, because
+	// the thing being measured is a per-frame cost of a few milliseconds and an
+	// instrument that showed up in the frame would be measuring itself.
+	// ======================================================================
+	{
+		const bool bCaptureArmed = !VoxelSky::IsRealTimeSkyCaptureEnabled();
+		if (bPinned || bCaptureArmed)
+		{
+			Impl->ArmHeartbeatCountdown -= (double)DeltaTime;
+			if (Impl->ArmHeartbeatCountdown <= 0.0)
+			{
+				Impl->ArmHeartbeatCountdown = kArmHeartbeatSeconds;
+				UE_LOG(LogVoxelSky, Log,
+				       TEXT("VoxelSky MEASUREMENT ARM heartbeat: PinLightOrientation=%d (suppressed %lld ")
+				       TEXT("re-orientation steps, sun pointing error %.4f deg READ BACK off the actor); ")
+				       TEXT("RealTimeCapture requested=%d, component reports %d; LightUpdates=%lld, ")
+				       TEXT("TimeScale=%.3f, SunAlt=%.2f deg. THIS LINE IS THE PROOF THE ARM ENGAGED. A ")
+				       TEXT("leg whose log does not contain it did not run an arm, whatever its command ")
+				       TEXT("line said. A leg showing suppressed steps climbing while the pointing error ")
+				       TEXT("stays at 0.0000 also froze the clock and measured nothing. A leg where ")
+				       TEXT("'requested' and 'component reports' disagree is measuring an arm the ")
+				       TEXT("renderer ignored."),
+				       bPinned ? 1 : 0, (long long)S.LightOrientationsPinned, S.PinnedSunErrorDeg,
+				       VoxelSky::IsRealTimeSkyCaptureEnabled() ? 1 : 0, S.RealTimeCaptureActive,
+				       (long long)S.LightUpdates, VoxelSky::GetTimeScale(), S.SunAltitudeDeg);
+			}
+		}
+		else
+		{
+			// Both arms at their defaults. Zeroed rather than left running so the
+			// first frame after an arm engages prints immediately -- a 10 s leg
+			// must not be able to finish before its own proof line appears.
+			Impl->ArmHeartbeatCountdown = 0.0;
+		}
 	}
 
 	bHasState = true;
@@ -3503,6 +3946,98 @@ void UVoxelSkySubsystem::ApplySkyLightPlacement()
 	       TEXT("than sky; voxel.Sky.FogInSkyCapture 0 is the other arm of that pair, and the fog's ")
 	       TEXT("own APPLIED line prints the density at both altitudes."),
 	       SkyLightActor->GetActorLocation().Z / 100.0, Now, SpawnGroundZUU / 100.0);
+}
+
+void UVoxelSkySubsystem::ApplySkyLightRealTimeCapture()
+{
+	// ======================================================================
+	// PUSHES voxel.Sky.RealTimeCapture, WHICH IS A COST ARM AND NOT AN
+	// APPEARANCE ONE -- but it has an appearance CONSEQUENCE, and the cvar's
+	// long comment spells it out: at 0 the ambient term does not go black, it
+	// freezes at the sky it last saw and stops following the sun down. That is
+	// invisible on the frozen-clock legs this project runs and very visible in
+	// a moving-sun scene, which is why 1 is the default and why nothing in this
+	// file will ever choose 0 on its own.
+	//
+	// Deliberately the same shape as ApplySkyLightPlacement immediately above:
+	// a latch, an early-out compare, a push, and a log line carrying the value
+	// READ BACK off the engine object. Three of those four are not decoration.
+	// ======================================================================
+	if (!SkyLightActor)
+	{
+		return;
+	}
+
+	const int32 Want = VoxelSky::IsRealTimeSkyCaptureEnabled() ? 1 : 0;
+	if (Want == AppliedRealTimeCapture)
+	{
+		// One int compare per frame in the steady state, which is every frame of
+		// every default build -- SpawnRig seeds the latch to 1 to match the
+		// SetRealTimeCaptureEnabled(true) it just performed, so the default path
+		// never reaches the component at all.
+		return;
+	}
+	AppliedRealTimeCapture = Want;
+
+	USkyLightComponent* SkyComp = SkyLightActor->GetLightComponent();
+	if (!SkyComp)
+	{
+		return;
+	}
+	SkyComp->SetRealTimeCaptureEnabled(Want != 0);
+
+	// READ BACK OFF THE COMPONENT, NEVER ECHOED FROM THE REQUEST, and this one is
+	// not a stylistic preference. USkyLightComponent::IsRealTimeCaptureEnabled
+	// (SkyLightComponent.cpp:1159-1162) returns bRealTimeCapture AND'd with the
+	// component's mobility being Movable or Stationary AND with
+	// r.SkyLight.RealTimeReflectionCapture. Any of those three can be false while
+	// our flag is true, and in every one of those cases an echoed log line would
+	// report an armed capture that the renderer had already stopped running --
+	// the exact failure this project hit five times in one night, where a leg
+	// measured a control arm against another control arm and reported a null
+	// result with total confidence.
+	const bool bActive = SkyComp->IsRealTimeCaptureEnabled();
+	if (Impl)
+	{
+		Impl->State.RealTimeCaptureActive = bActive ? 1 : 0;
+		// A change of capture state is a change of the thing being measured, so
+		// the heartbeat prints on the very next frame rather than up to
+		// kArmHeartbeatSeconds later.
+		Impl->ArmHeartbeatCountdown = 0.0;
+	}
+
+	UE_LOG(LogVoxelSky, Log,
+	       TEXT("VoxelSky REAL-TIME SKY CAPTURE APPLIED: voxel.Sky.RealTimeCapture=%d, component ")
+	       TEXT("reports IsRealTimeCaptureEnabled()=%d. THIS IS THE FLAG ")
+	       TEXT("DeferredShadingRenderer.cpp:2859 GATES ON: while it reads 1 the renderer calls ")
+	       TEXT("FScene::AllocateAndCaptureFrameSkyEnvMap every frame from inside ")
+	       TEXT("FDeferredShadingSceneRenderer::Render -- a full main-view snapshot, six cube faces, ")
+	       TEXT("the mip chain, the specular convolution and the diffuse-irradiance SH -- and while ")
+	       TEXT("it reads 0 that call is not entered at all. At 0 the ambient term does not go ")
+	       TEXT("black; SetCaptureIsDirty queues one ordinary capture (SkyLightComponent.cpp:354, ")
+	       TEXT("serviced at :920 once :943 stops discarding it), so the ambient FREEZES at the sky ")
+	       TEXT("it last saw and stops following the sun down. This is a measurement arm, not a ")
+	       TEXT("shipping setting."),
+	       Want, bActive ? 1 : 0);
+
+	if (Want != 0 && !bActive)
+	{
+		// THE SILENTLY-DISABLED-ARM CASE, promoted to a warning because it is the
+		// one that produces a confident wrong answer rather than an obvious
+		// failure. Reaching here means this subsystem asked for real-time capture
+		// and the engine is not doing it -- the SkyLight went Static (SpawnRig's
+		// SetMobility(Movable) regressed) or r.SkyLight.RealTimeReflectionCapture
+		// is 0 on this platform. Either way the ambient term is frozen, night has
+		// stopped getting dark, and any A/B run against this build is comparing a
+		// disabled capture with a disabled capture.
+		UE_LOG(LogVoxelSky, Warning,
+		       TEXT("VoxelSky asked for real-time sky capture and the component REFUSED it: mobility ")
+		       TEXT("must be Movable or Stationary AND r.SkyLight.RealTimeReflectionCapture must be ")
+		       TEXT("non-zero (SkyLightComponent.cpp:1159-1162). The ambient term is now frozen at ")
+		       TEXT("whatever it last captured, so night will not get dark -- and any leg A/B'ing ")
+		       TEXT("voxel.Sky.RealTimeCapture on this build is measuring nothing, because both of ")
+		       TEXT("its arms have the capture off."));
+	}
 }
 
 void UVoxelSkySubsystem::ApplyFogFromState()

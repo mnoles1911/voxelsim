@@ -468,3 +468,13 @@ VoxelWaterParityTest = Fixture: drives the run and exits on its own; the naming 
 VoxelWaterPersistTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelWaterWakeTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelWindingCheck = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+
+# --- 2026-08-24: the streaming tick per-frame work budget -------------------
+# ue-project/Source/VoxelEarth/VoxelTickBudget.h. Defers whole stages at their
+# existing loop boundaries so a burst becomes several ordinary frames instead
+# of one long one. Tuning: they change how much of a frame the streaming tick
+# may spend, and none of them drives, poses or ends a run. 0 = off = the
+# shipped behaviour byte for byte.
+VoxelTickBudgetMs
+VoxelTickBudgetMaxDefer
+VoxelTickBudgetReserveMs

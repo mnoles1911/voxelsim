@@ -15,6 +15,7 @@
 #include "VoxelFramePhase.h" // Goal 3: frame distribution segmented at the cold-settle boundary
 #include "VoxelMarchRenderer.h"    // VoxelMarchPublishStreamingState -- the marcher's convergence signal
 #include "VoxelRenderFrame.h"   // VoxelRenderFrame::NoteSettled -- the render split's settle latch
+#include "VoxelTickBudget.h" // per-frame work budget for the streaming tick, behind -VoxelTickBudgetMs=
 #include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
 #include "VoxelResidencyGpu.h"     // T4-2: GPU-resident residency shadow (docs/gpu-residency-t42-plan.md)
 #include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
@@ -8745,6 +8746,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 {
 	SCOPE_CYCLE_COUNTER(STAT_VoxelSubsystemTick);
 	const double TickStartSeconds = FPlatformTime::Seconds();
+	VoxelTickBudget::BeginTick(TickStartSeconds);
 
 	using namespace VoxelCoords;
 
@@ -9268,7 +9270,8 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	                              AnchorChunk.Y != LastAnchorChunk.Y || bUndergroundChanged ||
 	                              (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill;
 	const bool bRecomputeUrgent = !bHasRecomputed || bUndergroundChanged;
-	if (bRecomputeWanted && (bRecomputeUrgent || AllowRateBoundedRecompute()))
+	if (bRecomputeWanted && (bRecomputeUrgent || AllowRateBoundedRecompute()) &&
+	    VoxelTickBudget::MayStartRecompute(bRecomputeUrgent))
 	{
 		if (bAdmissionRefill)
 		{
@@ -10170,6 +10173,10 @@ void FVoxelWorldImpl::TickColdSettleProbe()
 
 void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 {
+	// Hook C: align the tick-budget window with this one. Also the only place
+	// the INERT diagnostic can fire, which is how a never-hooked budget announces
+	// itself instead of silently reading as 'no deferrals'.
+	VoxelTickBudget::FlushStats(true);
 	// Cadence is 5 s by default and overridable with -VoxelPerfLogInterval=<sec>.
 	//
 	// The override exists because this line is the ONLY instrument for cold-fill

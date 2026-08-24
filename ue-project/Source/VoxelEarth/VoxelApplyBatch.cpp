@@ -4,6 +4,7 @@
 #include "VoxelApplyBatch.h"
 
 #include "VoxelDebug.h" // LogVoxelPerf
+#include "VoxelTickBudget.h" // the tick-wide clock this per-stage budget subordinates to
 
 #include "Components/SceneComponent.h"
 #include "Engine/World.h"
@@ -590,7 +591,14 @@ int32 AppliesPerTickCap(int32 CvarValue)
 double ApplyBudgetSeconds(double CvarSeconds)
 {
 	const float OverrideMs = BudgetMsOverride();
-	const double Effective = OverrideMs >= 0.f ? double(OverrideMs) / 1000.0 : CvarSeconds;
+	double Effective = OverrideMs >= 0.f ? double(OverrideMs) / 1000.0 : CvarSeconds;
+	// THE TICK BUDGET SUBORDINATES THIS ONE, and this is the only place it needs
+	// to happen: DrainResults gets its wall budget from here and nowhere else,
+	// so one clock ends up owning both. Two per-frame budgets that do not know
+	// about each other is how a third invisible ceiling appears -- see
+	// VoxelTickBudget.h, design question 3. Identity when -VoxelTickBudgetMs is
+	// absent: ClampStageSeconds returns its argument untouched.
+	Effective = VoxelTickBudget::ClampStageSeconds(Effective);
 	// First point in a tick where all three effective values are known.
 	LogCapsOnce(LastEffApplies, Effective, DrainsPerTickCap(), LastCvarApplies, CvarSeconds);
 	return Effective;
