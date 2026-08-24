@@ -42,6 +42,61 @@ no extra flags). "Armed" = our leg config, which he does not run.
 
 ---
 
+## 2026-08-24: RE-MEASURED ON THE SHIPPING DEFAULT, AND THE LANE REDIRECTS
+
+Matched legs, one verified binary (`Result: Succeeded` + a second run reporting
+"Target is up to date"), baked pose `-61440,-61440`, 1600x900, Flight=line,
+`voxel.Stream.CoverageVerify` armed. The default now includes nearest-first
+admission (see `VoxelStreamAdmission::NearestAdmitEnabled`).
+
+| leg | cold | chunks/s | dispatched | R0 | p50 | p95 | stutter |
+|---|---|---|---|---|---|---|---|
+| drain 0 (default) | 22.3 s | 7,397/s | 1,108,557 | 12.2 s | 21.10 ms | 37.00 | 53.31% |
+| drain 2 | 21.3 s | 7,725/s | 1,109,087 | 7.3 s | 21.20 ms | 39.00 | 53.77% |
+| drain 4 | 21.1 s | 7,822/s | 1,109,054 | 6.5 s | 21.30 ms | 40.00 | 54.34% |
+| drain 8 | 20.7 s | 7,967/s | 1,109,036 | 6.3 s | 21.00 ms | 40.00 | 53.91% |
+
+**THE ADMISSION QUEUE IS NOT THE THROUGHPUT BOUND, and this is the second
+failing reading of `AdmissionCapDrainSec()` firing exactly as written.** The cap
+climbed 16x (2,048 -> 32,768) and dispatched work moved 0.05%. The +7.7% on
+chunks/s is not extra work: total jobs is fixed by the world (~164,750), so
+chunks/s = jobs / settle-time and it rose because settling got shorter. Per that
+comment's own instruction the lane is redirected rather than re-run.
+
+**WHERE THE BOUND ACTUALLY IS** (leg `I-bound3`, `-VoxelFramePhase=3`,
+residualPct=9 so the reading is valid, no negative buckets):
+
+    gameBusyMs=5.54  renderBusyMs=20.62  frameMs=22.91  floorFps=48
+    tickMs=3.41 (15%)  gameWaitMs=15.22 (66%)  renderMs=20.62 (90%)  rhiMs=8.48
+    bound=RENDERBOUND
+
+The game thread is IDLE 66% of every moving frame, waiting on the render thread,
+and the entire streaming tick is 3.41 ms inside a 20.62 ms render stage. The
+streaming tick is 1.27% of WALL on the tick-budget line, with recompute at
+0.0 ms. **Goal 2 and Goal 3 are one problem and it lives on the render thread.**
+Deleting 100% of remaining game-thread streaming work moves 22.91 ms -> 20.62 ms:
+48 fps -> 48 fps. Further admission-side throughput work cannot pay.
+
+**TWO SCOREBOARD CLAIMS ABOVE ARE NOW SETTLED AND BOTH WERE OVERSTATED.**
+
+*holes 0 -> 10 is VOID.* The GPU-primary flip states its own failing readings;
+one of them is that holes=0 with `CoverageVerify` ARMED means the 0->10 was an
+unarmed-watcher artefact. Every leg above reads `holesLast=0/30154` with that
+watcher armed. Independently, segmenting the D-pair by regime (fill / flight /
+parked) gives flight peaks of 8,382 stock vs 1,859 armed -- armed has 4.5x FEWER
+holes while flying, the regime the owner reports. The `0 -> 10` came from the
+parked linger window, which reads ~0 by construction.
+
+*The steadiness cost is real but ~1/3 smaller than reported.* The sibling
+failing reading predicted >=65% confirms and <31.4% refutes. Measured: 53-54%.
+Neither; the cost reproduces at about two thirds of the table's figure.
+
+**R0, THE DEFECT THE OWNER NAMED FIRST, IS LARGELY RECOVERED:** 15.8 s -> 6.3 s
+across nearest-first (15.8 -> 12.7) and the drain cap (12.2 -> 6.3), against a
+pre-arming stock of 5.5 s -- with moving p50 unchanged at 21 ms throughout.
+
+---
+
 ## THE THREE GOALS
 
 | # | metric | baseline (stock) | armed | TARGET | status |
