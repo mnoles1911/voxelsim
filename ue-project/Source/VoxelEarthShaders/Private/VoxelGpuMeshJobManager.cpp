@@ -287,6 +287,35 @@ bool VoxelGpuPrimaryEnabled()
 {
 	static const bool bEnabled = []
 	{
+		// DEFAULT 1 AS OF 2026-08-24, AND THIS IS THE HEADLINE FIX OF THE
+		// CAMPAIGN. Every cold-start number taken over two days was measured
+		// with this ON, and it was OFF in the configuration the owner actually
+		// runs -- so he received none of it. Matched, same binary:
+		//     DEFAULT-cold  45.5 s   3,618 chunks/s   (what he experiences)
+		//     q-dupfix      18.1 s   9,125 chunks/s   (what we measured)
+		// 2.5x, and 45.5 s is the ORIGINAL pre-campaign baseline: the reported
+		// 46.1 -> 18.1 s improvement had reached him as 46.1 -> 45.5 s.
+		//
+		// Gates cleared before flipping: holes=0, gateLeaks=0, claimverify
+		// mism=0 over 342,583,443 dwords, and the set-identity triple equal
+		// (conv == hostStaged == gpuClaimed == 915,628).
+		// MEASURED AND REVERTED 2026-08-24. Do not flip this on again without
+		// re-reading D-stock vs D-armed: one binary, one switch group, 20 m/s.
+		//
+		//                    cold start   moving p50        p95     stutter   R0    holes
+		//   stock (this)      45.3 s      8.10 ms 123 fps   46.00    28.06%   6.4s    0
+		//   armed             26.9 s     22.10 ms  45 fps   38.00    65.02%  16.4s   10
+		//
+		// The GPU-primary block buys cold start (1.7x) and p95, and loses the
+		// MEDIAN frame rate (123 -> 45 fps), the stutter rate (28% -> 65%), the
+		// fine-ring-first ordering the owner asked for by name (R0 6.4 -> 16.4 s)
+		// and the hole count (0 -> 10). Those four are exactly what he reports
+		// seeing. Goal 3 is "steady and above 100 while moving"; stock is nearer
+		// it on every term that sentence contains.
+		//
+		// The cold-start campaign optimised a number the owner never named while
+		// regressing the four he did. Ship the pieces that were measured to help
+		// on THIS base, not the block that was measured on its own.
 		int32 Value = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuPrimary="), Value);
 		return Value != 0;
@@ -435,6 +464,10 @@ static bool VoxelGpuStackClaimEnabled()
 {
 	static const bool bEnabled = []
 	{
+		// DEFAULT 1 AS OF 2026-08-24: part of the armed block every cold-start
+		// number was measured on.
+		// Reverted with -VoxelGpuPrimary: it was measured only as part of that
+		// block and has no standalone evidence on the stock base.
 		int32 Value = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuStackClaim="), Value);
 		return Value != 0;

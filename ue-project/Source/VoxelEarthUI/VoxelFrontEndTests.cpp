@@ -19,6 +19,7 @@
 #include "VoxelUITheme.h"
 #include "VoxelWorldReadyProbe.h"
 #include "VoxelSaveLibrary.h"
+#include "VoxelFrontEndPolicy.h"
 
 #include "Misc/AutomationTest.h"
 
@@ -144,6 +145,104 @@ bool FVoxelFrontEndSlugifyTest::RunTest(const FString& Parameters)
 	// directory each time.
 	const FString Once = VoxelSave::Slugify(TEXT("Copper Isles: Day 1"));
 	TestEqual(TEXT("idempotent"), VoxelSave::Slugify(Once), Once);
+
+	return true;
+}
+
+// --- Rule 5's switch classifier ----------------------------------------------
+//
+// WHY THIS TEST EXISTS. Rule 5 decides whether a run gets a main menu by
+// looking for 14 substrings ANYWHERE in a -Voxel* switch name. That is a
+// deliberate fuzzy rule with an asymmetric error budget (see
+// VoxelFrontEndPolicy.cpp), and the fuzziness is the right call -- but it had
+// no test, and the tool meant to police it cannot see this class of mistake:
+// lint-frontend-switch-coverage.py SKIPS every name the substring rule already
+// matches, so a name matched BY ACCIDENT is invisible to it by construction.
+//
+// Of 366 -Voxel* names in the tree, 81 match rule 5. Most deserve to. The ones
+// that do not are ordinary knobs and instruments that merely inherited a
+// fixture's vocabulary, and each one silently costs its user the menu.
+//
+// This test pins the two directions that matter. It is cheap, it is headless,
+// and it fails loudly if somebody deletes an exemption -- which is the property
+// the exemption table needs in order to be worth having.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFrontEndSwitchPolicyTest, "VoxelEarth.FrontEnd.SwitchPolicy",
+                                 VoxelFrontEndTestsDetail::kTestFlags)
+
+bool FVoxelFrontEndSwitchPolicyTest::RunTest(const FString& Parameters)
+{
+	using VoxelFrontEnd::IsSelfDrivingSwitchName;
+
+	// Direction 1: the rule still does its job. These are real fixtures, and a
+	// menu in front of any of them is a hung capture -- the expensive failure.
+	TestTrue(TEXT("a *Test fixture is self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelGICaveTest")));
+	TestTrue(TEXT("a *Shot capture is self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelVistaShot")));
+	TestTrue(TEXT("a timed *After is self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelScreenshotAfter")));
+	TestTrue(TEXT("a named extra is self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelPerfRun")));
+	TestTrue(TEXT("mid-name Shot still counts"), IsSelfDrivingSwitchName(TEXT("VoxelHudShotOnly")));
+
+	// A switch that did not exist when the rule was written must still classify
+	// from its name alone. This is the property that makes a rule better than a
+	// list, so it is worth pinning rather than assuming.
+	TestTrue(TEXT("an unknown *Test classifies from the convention alone"),
+	         IsSelfDrivingSwitchName(TEXT("VoxelSomethingNobodyHasWrittenYetTest")));
+
+	// Direction 2: the accidental match. -VoxelReadyProbeLog contains "Probe"
+	// but is a log flag for FVoxelWorldReadyProbe -- the loading screen's gate,
+	// which exists ONLY while the front end is up. Classified self-driving, it
+	// suppressed the front end, which removed the loading screen, which removed
+	// the probe: the diagnostic switch guaranteed its own subject never ran.
+	//
+	// Delete the exemption in VoxelFrontEndPolicy.cpp and this line fails --
+	// which is the point of writing it down.
+	TestFalse(TEXT("-VoxelReadyProbeLog is a log flag, not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelReadyProbeLog")));
+
+	// The other twelve accidents, spot-checked across all three substrings that
+	// produced them. Every one of these is recorded ACCIDENTAL in
+	// tools/frontend-switch-classification.txt; this is the half that makes the
+	// recording true of the running game rather than only of the lint.
+	//
+	// -VoxelGpuMeshInFlight is the case worth keeping forever: it already ENDS
+	// in the substring that caught it, so the advice the lint used to print --
+	// "rename it to end in Test/Shot/After and the rule handles it" -- cannot
+	// fix this class of mistake, and a suffix convention cannot encode intent.
+	TestFalse(TEXT("a job in-flight cap is not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelGpuMeshInFlight")));
+	TestFalse(TEXT("a per-core job cap is not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelJobsInFlightPerCore")));
+
+	// The correctness arms. These verify DURING an ordinary run and never end
+	// one, so they are exactly the switches a person arms interactively -- which
+	// is the only situation where rule 5 is reached at all, since rule 4
+	// (unattended) short-circuits every capture leg before rule 5 runs.
+	TestFalse(TEXT("the solid-skip correctness arm is not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelVerifySolidSkip")));
+	TestFalse(TEXT("the buried-skip correctness arm is not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelVerifyBuriedSkip")));
+	TestFalse(TEXT("the sky-band correctness arm is not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelVerifySkyBand")));
+	TestFalse(TEXT("a worklist byte gate is not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelGpuWorklistVerifyCT")));
+	TestFalse(TEXT("the eviction-index exit-scan arm is not a fixture"),
+	          IsSelfDrivingSwitchName(TEXT("VoxelBucketedExitScanVerify")));
+
+	// An exemption must not leak to a NEIGHBOURING name. The table matches whole
+	// names, not substrings, and a genuine fixture that merely shares a prefix
+	// with an exempted switch must still be caught.
+	TestTrue(TEXT("an exemption does not spread to a longer name"),
+	         IsSelfDrivingSwitchName(TEXT("VoxelVerifySolidSkipTest")));
+
+	// Ordinary configuration must never be caught. These are the plain cases
+	// the rule gets right, and they are cheap insurance against a future
+	// substring being added that is too greedy to be safe.
+	TestFalse(TEXT("a seed is not self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelSeed")));
+	TestFalse(TEXT("a spawn pose is not self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelSpawnAt")));
+	TestFalse(TEXT("the front-end switch itself is not self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelFrontEnd")));
+
+	// The match is case-sensitive by construction; a lowercase spelling is a
+	// different switch and must not inherit the classification.
+	TestFalse(TEXT("classification is case-sensitive"), IsSelfDrivingSwitchName(TEXT("Voxelgicavetest")));
 
 	return true;
 }

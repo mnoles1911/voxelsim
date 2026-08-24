@@ -249,6 +249,15 @@ bool FVoxelRasterAtlasCpu::Enabled()
 	// configuration twice (the project rule, learned on the GPU fork).
 	static const bool bEnabled = []
 	{
+		// DEFAULT 1 AS OF 2026-08-24. The fill-mode default of 2 shipped hours
+		// earlier was INERT without this master switch: a leg run with no atlas
+		// flag prints no [raster-atlas] line at all, so the disc sweep and the
+		// climate dedup never ran. That is the inert-feature trap -- the one I
+		// have caught in three other people's work tonight -- in my own.
+		// Reverted with -VoxelGpuPrimary. The atlas serves the GPU fork's region
+		// requests; with the fork off there is little for it to serve, and it
+		// was never measured on the stock base. Its fill modes 1+2 remain
+		// correct and default-2 -- they simply do not run until the atlas does.
 		int32 Value = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlas="), Value);
 		return Value != 0;

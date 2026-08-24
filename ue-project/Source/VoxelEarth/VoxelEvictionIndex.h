@@ -150,7 +150,11 @@ namespace VoxelStreaming
 // behaviour change, which is what makes the control arm a real control.
 inline bool EvictionIndexEnabled()
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelBucketedExitScan"));
+	// DEFAULT ON AS OF 2026-08-24; -VoxelNoBucketedExitScan is the control.
+	// Measured together with incremental admission (they were never separated),
+	// so the pair ships together and the pair is what the numbers describe.
+	static const bool bEnabled =
+		!FParse::Param(FCommandLine::Get(), TEXT("VoxelNoBucketedExitScan"));
 	return bEnabled;
 }
 

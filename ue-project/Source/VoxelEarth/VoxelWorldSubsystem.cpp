@@ -3936,7 +3936,14 @@ double BiasedSortKeySq(int32 Level, double DistSq)
 // silently measure the same desired set twice.
 bool IncrementalAdmissionEnabled()
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelIncrementalAdmission"));
+	// DEFAULT ON AS OF 2026-08-24; -VoxelNoIncrementalAdmission is the control.
+	// Measured on the moving segment, matched arms, R-ctl vs R-armB/B2:
+	//     footprints R0  269,440 -> 3,908  (69x)   entryMs R0  423.0 -> 23.8
+	//     settled-moving p95  50.00 -> 37.00 ms,   hitches 971 -> 499/514
+	// Hook I is what makes this safe to ship: footprints and ms fell TOGETHER,
+	// so the scan stopped enumerating rather than merely got faster. holes=0.
+	static const bool bEnabled =
+		!FParse::Param(FCommandLine::Get(), TEXT("VoxelNoIncrementalAdmission"));
 	return bEnabled;
 }
 

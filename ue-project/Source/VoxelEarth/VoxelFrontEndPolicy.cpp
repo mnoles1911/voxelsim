@@ -76,6 +76,64 @@ const FNamedException kSelfDrivingExtras[] = {
 	{TEXT("VoxelGIRelight"), TEXT("GI relight fixture: forces a relight then reports")},
 };
 
+// RULE 5 EXEMPTIONS: names the substring rule catches BY ACCIDENT.
+//
+// The substring rule reads intent off a naming convention, and mostly that
+// works. But it matches anywhere in the name, not just the suffix, so a switch
+// can inherit a fixture's vocabulary without being a fixture -- and the run
+// then loses its menu for no reason the developer can see.
+//
+// THESE ARE NEUTRAL, NOT FORCED-ON. That distinction is the whole point, and it
+// is why this is a separate table from kFrontEndCaptureSwitches above. Putting
+// a name here says only "rule 5 must not read this as self-driving"; the run's
+// OTHER switches still decide. If -VoxelReadyProbeLog were forced ON instead,
+// then a genuine capture run that also passed it -- which is exactly when you
+// want the probe's log -- would stop at a menu and hang, and a hung capture is
+// the expensive half of this file's error budget.
+//
+// Each entry needs a reason, for the same reason kSelfDrivingExtras does.
+//
+// THIS TABLE IS THE RUNTIME HALF OF A DECISION THAT WAS ALREADY MADE.
+// tools/frontend-switch-classification.txt records all thirteen of these as
+// `= ACCIDENTAL`, with the substring that caught each one -- but nothing reads
+// that file at runtime; it feeds the lint only. So recording the decision made
+// the lint green and left the menu still disappearing. The names below are
+// taken from that file rather than re-judged here, and
+// VoxelEarth.FrontEnd.SwitchPolicy fails if the two ever drift apart.
+const FNamedException kRule5Exemptions[] = {
+	{TEXT("VoxelBucketedExitScanVerify"), TEXT("'Verify': correctness arm for the eviction index's bucketed exit scan; verifies DURING a normal run")},
+	{TEXT("VoxelGpuMeshInFlight"), TEXT("'Flight', as a SUFFIX: a job in-flight cap, pure tuning -- the case that proves a suffix rename cannot fix this class")},
+	{TEXT("VoxelGpuWorklistVerifyCT"), TEXT("'Verify': byte gate for the worklist ClassifyTotals stage; adds a compare pass and ends nothing")},
+	{TEXT("VoxelGpuWorklistVerifyClaim"), TEXT("'Verify': byte gate for the worklist Claim stage")},
+	{TEXT("VoxelGpuWorklistVerifyCols"), TEXT("'Verify': byte gate for the worklist Column stage")},
+	{TEXT("VoxelGpuWorklistVerifyPack"), TEXT("'Verify': byte gate for the worklist Pack stage")},
+	{TEXT("VoxelGpuWorklistVerifyStamp"), TEXT("'Verify': byte gate for the worklist AssetStamp stage")},
+	{TEXT("VoxelGpuWorklistVerifyVox"), TEXT("'Verify': byte gate for the worklist Voxelize stage")},
+	{TEXT("VoxelJobsInFlightPerCore"), TEXT("'Flight': the per-core job cap knob, pure tuning")},
+	{TEXT("VoxelReadyProbeLog"), TEXT("'Probe': a log flag for the loading gate, and the gate only runs when the front end does -- see below")},
+	{TEXT("VoxelVerifyBuriedSkip"), TEXT("'Verify': correctness arm for the buried-chunk skip; verifies during a normal run")},
+	{TEXT("VoxelVerifySkyBand"), TEXT("'Verify': correctness arm for the sky band; verifies during a normal run")},
+	{TEXT("VoxelVerifySolidSkip"), TEXT("'Verify': correctness arm for the solid-skip admission gate; verifies during a normal run")},
+};
+
+// WHY THE ONE ABOVE IS NOT MERELY COSMETIC. FVoxelWorldReadyProbe is the
+// loading screen's gate; it exists only while the front end is up.
+// -VoxelReadyProbeLog is the flag you add to find out why that gate is not
+// opening. Caught by rule 5, it suppressed the front end, which removed the
+// loading screen, which removed the probe -- so the diagnostic switch
+// guaranteed its own subject never ran and printed nothing at all. It is the
+// same self-defeating shape kFrontEndCaptureSwitches was added for; that list
+// caught -VoxelMenuShot and -VoxelHourglassShot and missed this one only
+// because the name does not contain "Shot".
+//
+// Found by desk-check, not by the lint: tools/lint-frontend-switch-coverage.py
+// SKIPS any name the substring rule already matches, on the reasoning that the
+// rule handles it -- so an accidental match is invisible to exactly the tool
+// that exists to catch unclassified switches. Roughly a dozen more accidental
+// matches exist outside this module (job-count caps matching "Flight",
+// byte-verify toggles matching "Verify"); they belong to their owners and are
+// being classified on the lint branch rather than guessed at here.
+
 // THE FRONT END'S OWN CAPTURE SWITCHES, which the rule above would otherwise
 // suppress the front end for -- -VoxelMenuShot and -VoxelHourglassShot both
 // contain "Shot", and both exist precisely to photograph a menu. Passing
@@ -107,6 +165,15 @@ bool NameIsFrontEndCapture(const FString& SwitchName)
 
 bool NameIsSelfDriving(const FString& SwitchName)
 {
+	// Exemptions first: an accidental substring match must lose to the
+	// recorded decision, not race it.
+	for (const FNamedException& Entry : kRule5Exemptions)
+	{
+		if (SwitchName.Equals(Entry.Name, ESearchCase::CaseSensitive))
+		{
+			return false;
+		}
+	}
 	for (const TCHAR* Needle : kSelfDrivingSubstrings)
 	{
 		if (SwitchName.Contains(Needle, ESearchCase::CaseSensitive))
