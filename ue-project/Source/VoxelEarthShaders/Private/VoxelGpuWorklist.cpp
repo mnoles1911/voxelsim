@@ -96,6 +96,14 @@ namespace
 	// sets is what let 96% of chunks be claimed TWICE -- once here and once
 	// classically in the batch graph -- with every existing indicator green.
 	std::atomic<uint32> GProofClaimEligible{ 0 };
+	// The claim verify's witness triple (stats [17..19]): which categories of
+	// byte disagreed, and the first record that disagreed. A count told us
+	// only that there was a race; these say whether it is the descriptors
+	// (the duplicate-slot mechanism), the word copies, the record composer,
+	// or a slot the free path failed to clear.
+	std::atomic<uint32> GProofClaimWitnessCat{ 0 };
+	std::atomic<uint32> GProofClaimWitnessSlot{ 0 };
+	std::atomic<uint32> GProofClaimWitnessRec{ 0 };
 
 	// Groups per record per stage -- the host copy of the stage shapes the
 	// converted kernels are written against. The Column entry is LOCKED: it
@@ -105,7 +113,10 @@ namespace
 	// lock the plan doc mandates per converted kernel. The unconverted
 	// entries are still the DESIGN numbers from the plan doc; each locks the
 	// day its kernel lands.
-	const uint32 kGroupsPerRecord[uint8(EVoxelWorklistStage::COUNT)] =
+	// constexpr, not const: the static_asserts below INDEX these tables, and an
+	// lvalue-to-rvalue conversion on a subobject of a merely-const array is not
+	// a constant expression. Making them constexpr is what lets the lock exist.
+	constexpr uint32 kGroupsPerRecord[uint8(EVoxelWorklistStage::COUNT)] =
 	{
 		FVoxelGpuWorklist::kColumnGroupsPerRecord,   // Column: 1024 columns / 64 = 16 (LOCKED)
 		// Voxelize keeps the classic kernel's one-thread-per-COLUMN mapping
@@ -139,7 +150,7 @@ namespace
 	// chunks/s -- the lowest ceiling of any stage and below the 50,000 goal.
 	// See FVoxelGpuWorklist::kWriteRecordInY for the whole argument and for
 	// the #error that locks the consuming kernel to this same constant.
-	const uint32 kRecordInY[uint8(EVoxelWorklistStage::COUNT)] =
+	constexpr uint32 kRecordInY[uint8(EVoxelWorklistStage::COUNT)] =
 	{
 		0,  // Column
 		0,  // Voxelize
@@ -162,9 +173,68 @@ namespace
 	// Gid.x) and the Write triple goes back to 1D -- so Pack silently
 	// processes only record 0 AND the word copies silently clip past 442
 	// records. Two silent failures from one insertion. This pins it.
-	static_assert(uint8(EVoxelWorklistStage::Write) == 6
+	// THE FAMILY LOCK (2026-08-23). kRecordInY was flagged as a positional
+	// table pinned by an assert rather than by the type system -- and the
+	// audit that followed found it is not alone. TWO tables here are indexed
+	// by this enum's ORDER (kGroupsPerRecord and kRecordInY) and neither
+	// entry names the stage it belongs to. Every OTHER consumer of the enum
+	// is symbolic -- every args offset is uint32(EVoxelWorklistStage::X) * 3,
+	// which moves with the enum because the args kernel writes at the same S
+	// the C++ names -- so the tables are the whole exposure, and this is it
+	// closed.
+	//
+	// WHY IT MATTERS MORE FOR kGroupsPerRecord: insert one stage and every
+	// group count slides onto the wrong stage. Column/Voxelize/AssetStamp are
+	// all 16, so a slide near the top is INVISIBLE; a slide across
+	// Classify(64) / ClassifyTotals(1) / PackClaim(64) / Write(148) /
+	// Record(1) dispatches wildly wrong group counts with no error anywhere.
+	// So the lock is not "COUNT is 8" -- it is every index, by name, plus
+	// every table entry cross-checked against the constant it is supposed to
+	// be. A positional table that is checked entry-by-entry is no longer a
+	// positional table.
+	static_assert(uint8(EVoxelWorklistStage::Column) == 0
+	           && uint8(EVoxelWorklistStage::Voxelize) == 1
+	           && uint8(EVoxelWorklistStage::AssetStamp) == 2
+	           && uint8(EVoxelWorklistStage::Classify) == 3
+	           && uint8(EVoxelWorklistStage::ClassifyTotals) == 4
+	           && uint8(EVoxelWorklistStage::PackClaim) == 5
+	           && uint8(EVoxelWorklistStage::Write) == 6
+	           && uint8(EVoxelWorklistStage::Record) == 7
 	           && uint8(EVoxelWorklistStage::COUNT) == 8,
-	              "kRecordInY is positional -- its single nonzero entry must sit on Write");
+	              "kGroupsPerRecord and kRecordInY are POSITIONAL tables -- pin every index, "
+	              "not just COUNT: a stage inserted anywhere slides every entry onto the "
+	              "wrong stage, and the three 16s at the top would hide it");
+	// Entry-by-entry, so the tables cannot drift from the constants they
+	// mirror even without an enum change (a hand-edited entry is the other
+	// half of the same hazard).
+	static_assert(kGroupsPerRecord[uint8(EVoxelWorklistStage::Column)]
+	                  == FVoxelGpuWorklist::kColumnGroupsPerRecord
+	           && kGroupsPerRecord[uint8(EVoxelWorklistStage::Voxelize)]
+	                  == FVoxelGpuWorklist::kVoxelizeGroupsPerRecord
+	           && kGroupsPerRecord[uint8(EVoxelWorklistStage::AssetStamp)]
+	                  == FVoxelGpuWorklist::kStampGroupsPerRecord
+	           && kGroupsPerRecord[uint8(EVoxelWorklistStage::Classify)]
+	                  == FVoxelGpuWorklist::kClassifyGroupsPerRecord
+	           && kGroupsPerRecord[uint8(EVoxelWorklistStage::ClassifyTotals)]
+	                  == FVoxelGpuWorklist::kClassifyTotalsGroupsPerRecord
+	           && kGroupsPerRecord[uint8(EVoxelWorklistStage::PackClaim)]
+	                  == FVoxelGpuWorklist::kPackGroupsPerRecord
+	           && kGroupsPerRecord[uint8(EVoxelWorklistStage::Write)]
+	                  == FVoxelGpuWorklist::kWriteGroupsPerRecord
+	           && kGroupsPerRecord[uint8(EVoxelWorklistStage::Record)] == 1,
+	              "a kGroupsPerRecord entry no longer matches the constant its stage's kernel "
+	              "is compiled against -- that is a torn dispatch, silent");
+	static_assert(kRecordInY[uint8(EVoxelWorklistStage::Write)]
+	                  == FVoxelGpuWorklist::kWriteRecordInY
+	           && kRecordInY[uint8(EVoxelWorklistStage::Column)] == 0
+	           && kRecordInY[uint8(EVoxelWorklistStage::Voxelize)] == 0
+	           && kRecordInY[uint8(EVoxelWorklistStage::AssetStamp)] == 0
+	           && kRecordInY[uint8(EVoxelWorklistStage::Classify)] == 0
+	           && kRecordInY[uint8(EVoxelWorklistStage::ClassifyTotals)] == 0
+	           && kRecordInY[uint8(EVoxelWorklistStage::PackClaim)] == 0
+	           && kRecordInY[uint8(EVoxelWorklistStage::Record)] == 0,
+	              "exactly one stage carries its record in Y and it must be Write -- "
+	              "any other kernel reading Gid.y would see 0 and process only record 0");
 	static_assert(FVoxelGpuWorklist::kMaxRecordsPerFlush == 65535 / 64,
 	              "kMaxRecordsPerFlush must stay the 1D stages' own ceiling");
 	static_assert(FVoxelGpuWorklist::kWriteRecordInY == 1,
@@ -482,11 +552,52 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 	ClaimStagedThisFlush = 0;
 	if (IsClaimStageArmed())
 	{
+		// THE TRIPWIRE THAT MUST STAY AT ZERO. Two records for one ChunkSlot
+		// in one flush both run poolClaimChunkAt, and the second overwrites
+		// the first's side-table entry -- the first grant leaks and the
+		// loser's landed descriptors disagree with its own sources. That is
+		// the diagnosed cause of claimverify mism=138/174, and the manager
+		// now refuses the second record at build time (wlcols skips
+		// dupSlot=). This checks the property the manager is supposed to
+		// guarantee, HERE, where the bit is actually stamped -- because the
+		// manager's guard covers one batch and this is the set that really
+		// claims. If the manager ever grows a second path into the ring, or
+		// batch scope stops equalling flush scope, this fires and the fix has
+		// a gap. Checked, not believed.
+		//
+		// The set is bounded by the flush budget (384 default, 1,023 ceiling),
+		// so this is a few hundred hash inserts per tick against a per-tick
+		// cost that is already flat in N.
+		ClaimSlotsThisFlush.Reset();
 		for (int32 I = 0; I < Staged.Num(); ++I)
 		{
 			const uint32 Mono = Head + uint32(I);
 			if (Mono - Tail < Take && (Staged[I].LevelFlags & (1u << 11)) != 0u)
 			{
+				bool bAlreadySeen = false;
+				ClaimSlotsThisFlush.Add(Staged[I].ChunkSlot, &bAlreadySeen);
+				if (bAlreadySeen)
+				{
+					// Refuse the bit rather than trust the caller. The record
+					// still rides the arena chain (its columns/cells/pack are
+					// harmless per-slice work); it simply does not claim, and
+					// the manager already fell its job back.
+					++CumClaimDupRefused;
+					if (!bClaimDupLogged)
+					{
+						bClaimDupLogged = true;
+						UE_LOG(LogVoxelGpuWorklist, Error,
+						       TEXT("[gpu-worklist] DUPLICATE CLAIM SLOT %u staged twice in one ")
+						       TEXT("flush. Both records would claim, the second would overwrite ")
+						       TEXT("the first's side-table entry, the first grant would LEAK and ")
+						       TEXT("the loser's descriptors would fail claimverify. Refused here, ")
+						       TEXT("but the manager's own dupSlot guard should have caught it ")
+						       TEXT("first -- it has a gap. Logged once; the count is on the ")
+						       TEXT("wlclaim line."),
+						       Staged[I].ChunkSlot);
+					}
+					continue;
+				}
 				Staged[I].LevelFlags |= (1u << 10);
 				++ClaimStagedThisFlush;
 			}
@@ -538,6 +649,9 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		const uint32 ClaimMismatch = GProofClaimMismatch.load(std::memory_order_relaxed);
 		const uint32 ClaimChecked = GProofClaimChecked.load(std::memory_order_relaxed);
 		const uint32 ClaimEligible = GProofClaimEligible.load(std::memory_order_relaxed);
+		Proof.ClaimWitnessCategories = GProofClaimWitnessCat.load(std::memory_order_relaxed);
+		Proof.ClaimWitnessSlot = GProofClaimWitnessSlot.load(std::memory_order_relaxed);
+		Proof.ClaimWitnessRecord = GProofClaimWitnessRec.load(std::memory_order_relaxed);
 		GpuClaimEligible = int64(ClaimEligible);
 		Proof.ClaimEligibleOnGpu = ClaimEligible;
 		Proof.ClaimStagedOnHost = CumClaimStaged;
@@ -598,11 +712,24 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			// the Claim stage's own sources demand -- a torn dispatch, a
 			// wrong base, a racing tenant. POOL CORRUPTION at the landing
 			// site; the leg is invalid outright.
+			const uint32 Cat = Proof.ClaimWitnessCategories;
 			UE_LOG(LogVoxelGpuWorklist, Error,
 			       TEXT("[gpu-worklist] CLAIM VERIFY FAIL: %u mismatching dwords over %u ")
 			       TEXT("compared (cumulative). The landed pool state and the Claim stage's ")
-			       TEXT("sources disagree; the leg is invalid."),
-			       ClaimMismatch, ClaimChecked);
+			       TEXT("sources disagree; the leg is invalid. WITNESS: categories=%s%s%s%s%s ")
+			       TEXT("first failing ChunkSlot=%d record=%u. DESC ALONE is the duplicate-slot ")
+			       TEXT("signature: two records for one shell describe the same terrain, so ")
+			       TEXT("only the rebased offsets of NON-EMPTY bricks differ -- 2 dwords each, ")
+			       TEXT("which is why every increment observed was even. WORDS point at the ")
+			       TEXT("copies instead, and FAILZERO at a slot the free path did not clear."),
+			       ClaimMismatch, ClaimChecked,
+			       (Cat & (1u << 0)) ? TEXT("desc ") : TEXT(""),
+			       (Cat & (1u << 1)) ? TEXT("occWords ") : TEXT(""),
+			       (Cat & (1u << 2)) ? TEXT("matWords ") : TEXT(""),
+			       (Cat & (1u << 3)) ? TEXT("recordDwords ") : TEXT(""),
+			       (Cat & (1u << 4)) ? TEXT("failZero ") : TEXT(""),
+			       int32(Proof.ClaimWitnessSlot) - 1,
+			       Proof.ClaimWitnessRecord >> 8);
 		}
 		if (PackMismatch > 0)
 		{
@@ -793,6 +920,15 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				// cannot be caught by checking the producer -- which is what
 				// every elimination pass here did.
 				GProofClaimEligible.store(Data[16], std::memory_order_relaxed);
+				// [17..19]: the claim verify's WITNESS -- categories seen, the
+				// first failing record's ChunkSlot (+1), and its packed
+				// record-index/category. Read here and nowhere else, and read
+				// UNCONDITIONALLY: the last three dwords of this buffer were
+				// allocated, written and copied and then not read for a whole
+				// session, which is the defect this very line replaces.
+				GProofClaimWitnessCat.store(Data[17], std::memory_order_relaxed);
+				GProofClaimWitnessSlot.store(Data[18], std::memory_order_relaxed);
+				GProofClaimWitnessRec.store(Data[19], std::memory_order_relaxed);
 				GProofLandedSeq.store(ProofCopySeq, std::memory_order_release);
 			}
 			ProofReadback->Unlock();

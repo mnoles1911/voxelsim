@@ -758,6 +758,26 @@ private:
 	// admission never fired and passes/tick keeps its ~1.25 x chunks/tick
 	// slope; growing while wlclaim conv does not means they are admitted and
 	// falling back for a second reason (read wlcols fbBy).
+	// Jobs refused a record because another job in the SAME batch already has
+	// one for that shell. Two records for one shell in one flush both claim,
+	// and the second overwrites the first's side-table entry -- the diagnosed
+	// cause of claimverify mism=138/174. Expected small and bursty (it tracks
+	// re-request waves, i.e. eviction boundaries); a hard 0 across a whole
+	// flight with mism still nonzero means the duplicate is NOT the mechanism
+	// and the verify witness on the wlclaim line names the real one.
+	// Jobs the post-flush loop would have marked claim-fed while their record
+	// does NOT carry hostClaimCandidate (bit 11). The flush graph claims only
+	// bit-11 records, so every one of these would be a chunk whose batch brick
+	// chain was skipped and whose slot nothing claimed: A HOLE. Refused and
+	// counted rather than trusted, because wlclaim conv has exceeded
+	// hostStaged by a CONSTANT 56 on every leg measured -- across chunk counts
+	// differing by 2.7x, so it is a fixed set of chunks and not a race. If
+	// this counter reads 56, it is the whole gap and the two clauses differ
+	// somewhere the reasoning said they could not; if it reads 0 while the gap
+	// persists, the gap is on the Flush side instead (a record staged with
+	// bit 11 that Flush declined) and dupRefused names it.
+	int64 WorklistClaimFedNoBit = 0;
+	int64 WorklistSkipDupSlot = 0;
 	int64 WorklistBandAdmitted = 0;
 	int64 WorklistFbStack = 0;
 	int64 WorklistFbDeferred = 0;

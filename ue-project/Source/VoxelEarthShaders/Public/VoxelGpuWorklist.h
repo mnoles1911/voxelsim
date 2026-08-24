@@ -427,6 +427,10 @@ public:
 	//     staging records and the kernel is not running: DEAD STAGE.
 	uint32 GetClaimStagedThisFlush() const { return ClaimStagedThisFlush; }
 	int64 GetCumClaimStaged() const { return CumClaimStaged; }
+	// Records refused claimStaged because another record in the SAME flush
+	// already claimed that shell. MUST BE 0: nonzero means two claims for one
+	// slot reached this far and the manager's own guard has a gap.
+	int64 GetCumClaimDupRefused() const { return CumClaimDupRefused; }
 	// The GPU's own count of records ClaimWorklistMain found eligible, as of
 	// the last landed proof; -1 until a proof has landed.
 	int64 GetGpuClaimEligible() const { return GpuClaimEligible; }
@@ -537,6 +541,13 @@ public:
 		// claim, one leaked grant per excess record.
 		uint64 ClaimEligibleOnGpu = 0;
 		int64 ClaimStagedOnHost = 0;
+		// The claim verify's witness: OR of every mismatch category seen (bit
+		// 0 desc, 1 occ words, 2 mat words, 3 record dwords, 4 failed-claim
+		// zero check), the first failing record's ChunkSlot + 1 (0 = none),
+		// and that record's flush-relative index in bits 8..31.
+		uint32 ClaimWitnessCategories = 0;
+		uint32 ClaimWitnessSlot = 0;
+		uint32 ClaimWitnessRecord = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -627,6 +638,17 @@ private:
 	// the GPU's stats[16] -- see GetClaimStagedThisFlush's failing readings.
 	uint32 ClaimStagedThisFlush = 0;
 	int64 CumClaimStaged = 0;
+	// The duplicate-ChunkSlot tripwire's scratch and count. Two records for
+	// one shell in one flush both claim; the second overwrites the first's
+	// side-table entry, the first grant leaks, and the loser's descriptors
+	// fail claimverify -- the diagnosed cause of mism=138/174. The manager
+	// refuses the second record at build time; this checks that guarantee
+	// where the bit is actually stamped. FAILING READING: any nonzero value
+	// means the manager's dupSlot guard has a gap (a second path into the
+	// ring, or batch scope no longer equalling flush scope).
+	TSet<uint32> ClaimSlotsThisFlush;
+	int64 CumClaimDupRefused = 0;
+	bool bClaimDupLogged = false;
 	int64 GpuClaimEligible = -1;   // GPU stats[16] as of the last landed proof
 	FLastFlush LastFlush;
 
