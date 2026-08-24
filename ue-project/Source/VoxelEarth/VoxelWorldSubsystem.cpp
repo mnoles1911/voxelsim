@@ -4283,7 +4283,35 @@ int32 AdmissionCapDrainSec()
 {
 	static const int32 Seconds = []
 	{
-		int32 Value = 0;
+		// DEFAULT 8 AS OF 2026-08-24, AND IT IS A LATENCY FIX, NOT A
+		// THROUGHPUT ONE. The sweep below fired this switch's OWN second
+		// failing reading -- cap climbed 16x (2,048 -> 32,768) and dispatched
+		// work moved 0.05% -- so the queue is NOT the throughput bound and
+		// nobody should re-run this arm hoping for chunks/s. What it buys is
+		// the near ring, measured on one binary at the baked pose:
+		//
+		//   N     cold     chunks/s   dispatched   R0      p50       p95
+		//   0    22.3 s     7,397     1,108,557   12.2 s  21.10 ms  37.00
+		//   2    21.3 s     7,725     1,109,087    7.3 s  21.20 ms  39.00
+		//   4    21.1 s     7,822     1,109,054    6.5 s  21.30 ms  40.00
+		//   8    20.7 s     7,967     1,109,036    6.3 s  21.00 ms  40.00
+		//
+		// R0 halves. It is the ring the owner named FIRST and the one the
+		// GPU-primary flip cost him; with nearest-first it goes 15.8 -> 6.3 s
+		// against a pre-arming stock of 5.5 s. Moving p50 does not move, so the
+		// standing rule (a throughput win costing the moving p50 is not a win)
+		// is not engaged. The p95 +3 ms sits inside a 20.62 ms RENDERBOUND
+		// stage and is the whole price.
+		//
+		// It also cuts wasted enumeration ~10x: rejections per admission fall
+		// 5.6 -> 0.8 (10.0 M -> 0.98 M), which is the "1-2 M rejections per
+		// window re-enumerating the strangled annulus" described above.
+		//
+		// FAILING READINGS still stand and are unchanged by this default: cap=
+		// pinned at 2048 means the arm is inert. And if R0 regresses past the
+		// N=0 leg's 12.2 s, or moving p50 rises above 21.4 ms by more than a
+		// window's spread, this goes back to 0.
+		int32 Value = 8;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelAdmissionCapDrainSec="), Value);
 		return FMath::Clamp(Value, 0, 60);
 	}();
