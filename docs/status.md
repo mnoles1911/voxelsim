@@ -1,3 +1,18 @@
+> ## STANDING PERFORMANCE TARGETS (owner-set 2026-08-24 — maintain these)
+>
+> | metric | target | stock baseline 2026-08-24 |
+> |---|---|---|
+> | cold start to settle | **<= 5 s** | 45.5 s |
+> | streaming throughput | **50,000 chunks/s** | 3,618/s |
+> | frame p95 while MOVING >= 20 m/s | **< 10.00 ms (>100 fps)** | 44.00 ms (23 fps) |
+> | steadiness while moving | **<= 0.10% stutters** (frame > 20 ms) | 31.4% |
+>
+> Priority order: **chunks/s, FPS, cold start.** Stationary does not count.
+> Full scoreboard and the log line behind every figure: **`docs/SCOREBOARD.md`**.
+> **An arm that improves cold start or throughput and worsens the moving p95 is
+> not a win.** Report the STOCK number as the headline — armed configs are an
+> upper bound on a setup the owner does not run.
+
 # Milestone gate status
 
 > **HISTORICAL — this file stops at 2026-07-29 and is no longer being written.**
