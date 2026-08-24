@@ -258,7 +258,25 @@ bool FVoxelRasterAtlasCpu::Enabled()
 		// requests; with the fork off there is little for it to serve, and it
 		// was never measured on the stock base. Its fill modes 1+2 remain
 		// correct and default-2 -- they simply do not run until the atlas does.
-		int32 Value = 0;
+		//
+		// RE-ARMED 2026-08-24 with the rest of the GPU-primary set, by owner
+		// decision. The reason it was reverted is also the reason re-arming it
+		// is coherent: it serves the GPU fork's region requests, and the fork is
+		// now on by default, so there IS something for it to serve again.
+		//
+		// FillMode() below stays at 2. MODE 3 (async fill) REMAINS OFF AND IS
+		// NOT PART OF THIS ARMING -- a worker touching a non-resident pixel
+		// reaches ReportGateLeak_Locked, which is FATAL on an unattended run,
+		// and no arm on that ladder was ever measured against the moving-segment
+		// frame gate. Arming the master switch does NOT arm mode 3; if a future
+		// change makes it do so, that is a defect.
+		//
+		// FAILING READINGS, both ways: a leg on this default that prints NO
+		// [raster-atlas] line at all means the master switch is inert again (the
+		// exact trap this comment was written about); and a leg that prints the
+		// line with mismatch>0 has had its climate dedup disabled for the
+		// session and its per-page figures are not comparable to a clean arm.
+		int32 Value = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlas="), Value);
 		return Value != 0;
 	}();

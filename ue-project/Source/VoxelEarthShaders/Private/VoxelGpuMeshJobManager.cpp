@@ -227,7 +227,17 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshLatencyStats(
 // also honoured mid-run because a flip cannot corrupt anything -- both paths
 // produce the same bytes, so the only residue of a mid-run flip is in the
 // stats, not the world.
-static int32 GVoxelGpuWorldGenBatch = 0;
+// DEFAULT 1 AS OF 2026-08-24, by owner decision, as part of the GPU-primary
+// shipping set. Armed at the cvar rather than in the accessor so the command
+// line keeps outranking it: -VoxelGpuWorldGenBatch=0 still gives the
+// byte-identical per-chunk-graph control leg the A/B needs. The trade the owner
+// accepted -- and the two owner-visible defects the matched leg says this set
+// makes WORSE -- are recorded on VoxelGpuPrimaryEnabled() below.
+// FAILING READING, both ways: [gpu-batch] stacks=0 with this armed means the
+// fusion never fired (the arm measured the classic path under a new flag);
+// stacks>0 with voxel.GPU.VerifyBrickStack reporting a mismatch invalidates the
+// leg, because the two paths are required to emit identical bytes.
+static int32 GVoxelGpuWorldGenBatch = 1;
 static FAutoConsoleVariableRef CVarVoxelGpuWorldGenBatch(
 	TEXT("voxel.GPU.WorldGenBatch"),
 	GVoxelGpuWorldGenBatch,
@@ -316,7 +326,33 @@ bool VoxelGpuPrimaryEnabled()
 		// The cold-start campaign optimised a number the owner never named while
 		// regressing the four he did. Ship the pieces that were measured to help
 		// on THIS base, not the block that was measured on its own.
-		int32 Value = 0;
+		//
+		// RE-ARMED 2026-08-24 BY THE OWNER'S EXPLICIT DECISION, AFTER BEING
+		// SHOWN THE TABLE ABOVE. He weighed the trade and took it: cold start
+		// 45.3 -> 26.9 s and moving p95 46.00 -> 38.00 ms, at the cost of the
+		// median frame rate (123 -> 45 fps). That trade is his to make and it
+		// is made; do not re-litigate it here. The standing job attached to
+		// this flip is to WIN THE MEDIAN BACK, not to flip it off again.
+		//
+		// TWO TERMS OF THAT TABLE ARE **NOT** PART OF WHAT HE ACCEPTED, and
+		// they are the two OWNER-VISIBLE DEFECTS on docs/SCOREBOARD.md:
+		//   holes  0 -> 10    (the black arcs at LOD boundaries)
+		//   R0     6.4 -> 16.4 s (the fine ring he asked for BY NAME first)
+		// He was told this set FIXES the arcs. The matched leg says it makes
+		// them worse and de-prioritises the near ring. Arming proceeds because
+		// he decided it; the discrepancy is reported to him rather than
+		// silently resolved either way, and it is the first thing the next
+		// leg must settle.
+		//
+		// FAILING READINGS, both stated: if the armed default's own leg reads
+		// holes>0 with voxel.Stream.CoverageVerify ARMED, the arc defect is
+		// CAUSED here and this flip must go back to the owner -- and if it
+		// reads holes=0 with the same watcher armed, the 0->10 above was an
+		// unarmed-watcher artefact and the table's hole column is void.
+		// Sibling: stutterPct >= 65% on SETTLED-MOVING at >=20 m/s confirms
+		// the steadiness cost; < 31.4% would mean the cost is not reproducible
+		// and the table is stale. Neither reading is the "expected" one.
+		int32 Value = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuPrimary="), Value);
 		return Value != 0;
 	}();
@@ -468,7 +504,16 @@ static bool VoxelGpuStackClaimEnabled()
 		// number was measured on.
 		// Reverted with -VoxelGpuPrimary: it was measured only as part of that
 		// block and has no standalone evidence on the stock base.
-		int32 Value = 0;
+		// RE-ARMED 2026-08-24 with the rest of the block, by owner decision.
+		// Still no standalone evidence on the stock base -- it ships as part of
+		// a group, and that is recorded rather than glossed. It is inert
+		// without WorldGenBatch AND PoolAlloc (see the requires note above), so
+		// the group is also the only configuration in which it does anything.
+		// FAILING READING: [gpu-batch] stacks=0 with this armed means the
+		// fusion never fired and the arm measured the classic path wearing a
+		// new flag; stacks>0 with xcheck FAIL>0 or doubleGrant>0 invalidates
+		// the leg outright.
+		int32 Value = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuStackClaim="), Value);
 		return Value != 0;
 	}();

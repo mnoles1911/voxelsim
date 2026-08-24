@@ -578,7 +578,22 @@ namespace VoxelBrickPoolDetail
 	// rebuild. See the accessor's declaration in VoxelBrickPool.h for why this
 	// one is LATCHED at first call rather than staying live -- arming decides
 	// who owns the arena words for the whole process.
-	int32 GVoxelGpuPoolAlloc = 0;
+	//
+	// DEFAULT 1 AS OF 2026-08-24, by owner decision, as part of the GPU-primary
+	// shipping set (-VoxelGpuPrimary / -VoxelGpuPoolAlloc / -VoxelGpuWorldGenBatch
+	// / -VoxelGpuStackClaim / -VoxelGpuRasterAtlas). Armed HERE, at the cvar,
+	// rather than in the accessor, so that the command line keeps outranking it
+	// (-VoxelGpuPoolAlloc=0 still gives a byte-identical CPU-allocation control
+	// leg) and so the sweep tooling that reads the cvar still sees one source of
+	// truth. The trade he accepted, and the two terms he did NOT, are recorded
+	// on VoxelGpuPrimaryEnabled() in VoxelGpuMeshJobManager.cpp -- read that
+	// before changing this.
+	//
+	// FAILING READINGS, both ways: [brick-gpualloc] xcheck FAIL>0 or
+	// doubleGrant>0 invalidates any leg run on this default; and xcheck
+	// samples=0 with this armed means the GPU allocator never claimed anything
+	// and the leg measured the CPU path under an armed flag.
+	int32 GVoxelGpuPoolAlloc = 1;
 	FAutoConsoleVariableRef CVarVoxelGpuPoolAlloc(
 		TEXT("voxel.GPU.PoolAlloc"),
 		GVoxelGpuPoolAlloc,
