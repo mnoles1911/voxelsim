@@ -103,6 +103,35 @@ def parse_policy() -> tuple[list[str], dict[str, str], list[str]]:
     return substrings, extras, errors
 
 
+EXEMPTIONS_RE = re.compile(
+    r"kRule5Exemptions\[\]\s*=\s*\{(.*?)\};", re.DOTALL)
+
+
+def parse_exemptions() -> tuple[dict[str, str], list[str]]:
+    """Returns ({exempt_name: reason}, errors) from kRule5Exemptions[].
+
+    WHY THIS IS CHECKED AT ALL. Recording a switch as ACCIDENTAL in the
+    classification file changes NOTHING about what the game does -- no C++ reads
+    that file; it feeds this lint and nothing else. So a decision recorded there
+    and not mirrored into kRule5Exemptions leaves this lint green while the menu
+    still disappears for that switch, which is the precise failure this project
+    keeps finding: an indicator that is not in the path it claims to watch.
+    """
+    errors: list[str] = []
+    source = read(POLICY_CPP)
+    match = EXEMPTIONS_RE.search(source)
+    if not match:
+        errors.append(f"{POLICY_CPP}: could not find kRule5Exemptions[]")
+        return {}, errors
+    out: dict[str, str] = {}
+    for name, reason in EXTRA_ENTRY_RE.findall(match.group(1)):
+        if len(reason.strip()) < MIN_REASON:
+            errors.append(
+                f"{POLICY_CPP}: kRule5Exemptions entry '{name}' has no meaningful reason")
+        out[name] = reason
+    return out, errors
+
+
 # The acknowledgement section marker. Everything after it is
 # "Name = reason" rather than a bare name.
 ACK_MARKER = "## SUBSTRING-MATCHED -- ACKNOWLEDGED"
@@ -223,12 +252,53 @@ def main() -> int:
         print(f"lint-frontend-switch-coverage: {len(stale_ack)} acknowledged name(s) "
               f"no longer appear in the source (not an error): {', '.join(stale_ack)}")
 
-    if errors or unclassified or unacknowledged:
+    # --- the two halves of an ACCIDENTAL decision must agree -------------
+    #
+    # The classification file says which matches are accidents; kRule5Exemptions
+    # is what actually spares them at runtime. Either one alone is a half-fix,
+    # and the half that is easy to write is the one that does nothing.
+    exemptions, exemption_errors = parse_exemptions()
+    errors.extend(exemption_errors)
+
+    accidental = {n for n, r in acknowledged.items()
+                  if r.lstrip().upper().startswith("ACCIDENTAL")}
+    missing_exemption = sorted(n for n in accidental if n not in exemptions)
+    orphan_exemption = sorted(n for n in exemptions if n not in accidental)
+
+    if missing_exemption:
+        print()
+        print(f"lint-frontend-switch-coverage: {len(missing_exemption)} switch(es) are "
+              f"recorded ACCIDENTAL but are NOT in kRule5Exemptions[], so rule 5 "
+              f"still suppresses the main menu for them on interactive runs:")
+        print()
+        for name in missing_exemption:
+            print(f"  {name}")
+        print()
+        print(f"  Recording the decision in {CLASSIFICATION} does not change what")
+        print(f"  the game does -- no C++ reads that file. Add each name to")
+        print(f"  kRule5Exemptions[] in {POLICY_CPP} with a reason.")
+        print()
+
+    if orphan_exemption:
+        print()
+        print(f"lint-frontend-switch-coverage: {len(orphan_exemption)} name(s) in "
+              f"kRule5Exemptions[] are not recorded ACCIDENTAL in {CLASSIFICATION}:")
+        print()
+        for name in orphan_exemption:
+            print(f"  {name}")
+        print()
+        print("  An exemption nobody wrote down is indistinguishable from a mistake.")
+        print("  Either record the decision or drop the exemption.")
+        print()
+
+    if (errors or unclassified or unacknowledged
+            or missing_exemption or orphan_exemption):
         return 1
     print(f"lint-frontend-switch-coverage: clean ({len(sites)} switch(es), "
           f"{len(substrings)} rule(s), {len(extras)} named exception(s), "
           f"{len(classified)} classified as tuning, "
-          f"{len(acknowledged)} substring-matched decisions recorded)")
+          f"{len(acknowledged)} substring-matched decisions recorded, "
+          f"{len(exemptions)} of them exempted at runtime)")
     return 0
 
 
