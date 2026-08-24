@@ -103,14 +103,43 @@ def parse_policy() -> tuple[list[str], dict[str, str], list[str]]:
     return substrings, extras, errors
 
 
-def parse_classification() -> set[str]:
+# The acknowledgement section marker. Everything after it is
+# "Name = reason" rather than a bare name.
+ACK_MARKER = "## SUBSTRING-MATCHED -- ACKNOWLEDGED"
+
+
+def parse_classification() -> tuple[set[str], dict[str, str]]:
+    """Returns (tuning names, {substring-matched name: reason}).
+
+    THE SECOND MAP IS THE 2026-08-23 ADDITION, and the defect it exists for is
+    worth stating. Rule 5 suppresses the main menu for any switch CONTAINING
+    Test/Shot/After/Check/Verify/Probe/... -- and the lint above then SKIPS
+    that switch entirely, on the reasoning that "the rule handles it". So a
+    switch whose name matches by accident is both mis-behaving (it suppresses
+    the menu on an interactive launch) AND invisible to the one lint built to
+    catch exactly this. `-VoxelFineLockProbe` was caught by a human, by luck.
+
+    The suffix advice this lint prints does not fix the class either:
+    `-VoxelGpuMeshInFlight` ENDS in "Flight" and is a job-count cap, not a
+    fixture. Intent cannot be read off a name, so the decision has to be
+    recorded instead of inferred -- which is what this section is.
+    """
     names: set[str] = set()
+    acknowledged: dict[str, str] = {}
+    in_ack = False
     for line in read(CLASSIFICATION).splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+        stripped = line.strip()
+        if stripped.startswith(ACK_MARKER):
+            in_ack = True
             continue
-        names.add(line)
-    return names
+        if not stripped or stripped.startswith("#"):
+            continue
+        if in_ack:
+            name, _, reason = stripped.partition("=")
+            acknowledged[name.strip()] = reason.strip()
+        else:
+            names.add(stripped)
+    return names, acknowledged
 
 
 def find_switches() -> dict[str, list[str]]:
@@ -135,13 +164,19 @@ def find_switches() -> dict[str, list[str]]:
 
 def main() -> int:
     substrings, extras, errors = parse_policy()
-    classified = parse_classification()
+    classified, acknowledged = parse_classification()
     sites = find_switches()
 
     unclassified: list[tuple[str, str]] = []
+    unacknowledged: list[tuple[str, str, str]] = []
     for name in sorted(sites):
-        if any(needle in name for needle in substrings):
-            continue          # the rule handles it
+        matched = [needle for needle in substrings if needle in name]
+        if matched:
+            # The rule DECIDES this one -- which is exactly why it needs a
+            # recorded decision rather than a silent skip.
+            if name not in acknowledged or len(acknowledged[name]) < MIN_REASON:
+                unacknowledged.append((name, sites[name][0], ",".join(matched)))
+            continue
         if name in extras:
             continue          # explicitly named as self-driving
         if name in classified:
@@ -152,6 +187,7 @@ def main() -> int:
     # a deleted switch should not fail the build -- but it IS worth saying, so
     # the file does not silently accumulate ghosts.
     stale = sorted(classified - set(sites))
+    stale_ack = sorted(set(acknowledged) - set(sites))
 
     for message in errors:
         print(f"lint-frontend-switch-coverage: {message}", file=sys.stderr)
@@ -166,14 +202,33 @@ def main() -> int:
         print(f"  kSelfDrivingExtras in {POLICY_CPP} with a reason.", file=sys.stderr)
         print(f"  If it is ordinary tuning or configuration, add it to {CLASSIFICATION}.", file=sys.stderr)
 
+    if unacknowledged:
+        print("lint-frontend-switch-coverage: substring-matched switch(es) with no "
+              "recorded decision:", file=sys.stderr)
+        for name, site, matched in unacknowledged:
+            print(f"  -{name}   matches '{matched}'   first seen at {site}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  Rule 5 already treats each of these as SELF-DRIVING and suppresses the main", file=sys.stderr)
+        print("  menu whenever it is on the command line -- so if any is ordinary tuning or a", file=sys.stderr)
+        print("  diagnostic arm, it is changing front-end behaviour by accident AND is invisible", file=sys.stderr)
+        print("  to the rest of this lint, which skips anything the rule matches.", file=sys.stderr)
+        print(f"  Record the decision under '{ACK_MARKER}' in {CLASSIFICATION} as", file=sys.stderr)
+        print("  'Name = reason', or rename the switch. Note that renaming to a SUFFIX does not", file=sys.stderr)
+        print("  help: -VoxelGpuMeshInFlight already ends in 'Flight' and is a job cap.", file=sys.stderr)
+
     if stale:
         print(f"lint-frontend-switch-coverage: {len(stale)} name(s) in {CLASSIFICATION} "
               f"no longer appear in the source (not an error): {', '.join(stale)}")
+    if stale_ack:
+        print(f"lint-frontend-switch-coverage: {len(stale_ack)} acknowledged name(s) "
+              f"no longer appear in the source (not an error): {', '.join(stale_ack)}")
 
-    if errors or unclassified:
+    if errors or unclassified or unacknowledged:
         return 1
     print(f"lint-frontend-switch-coverage: clean ({len(sites)} switch(es), "
-          f"{len(substrings)} rule(s), {len(extras)} named exception(s), {len(classified)} classified as tuning)")
+          f"{len(substrings)} rule(s), {len(extras)} named exception(s), "
+          f"{len(classified)} classified as tuning, "
+          f"{len(acknowledged)} substring-matched decisions recorded)")
     return 0
 
 
