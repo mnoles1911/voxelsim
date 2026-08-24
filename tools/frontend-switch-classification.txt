@@ -264,3 +264,15 @@ VoxelRecomputeDutyPct
 VoxelApplyFast
 VoxelApplyColumnCache
 VoxelApplyColumnCacheAudit
+
+# --- 2026-08-23: the fine-tier sampler lock ---------------------------------
+# ue-project/Source/VoxelEarth/VoxelFineLockProbe.h and VoxelFineTileStreamer.
+# Both are tuning/instrument: -VoxelFineLockFast picks how RequestFootprint
+# acquires the streamer's RWLock (0 = today's unconditional exclusive), and
+# -VoxelFineLockProbe arms the acquisition counters. Neither drives, poses or
+# ends a run, and both are meant to be readable on an ordinary interactive
+# launch -- which is exactly why the names avoid a *Check/*Verify/*Test ending
+# that the rule in VoxelFrontEndPolicy.cpp would read as self-driving and use
+# to suppress the front end.
+VoxelFineLockFast
+VoxelFineLockProbe
