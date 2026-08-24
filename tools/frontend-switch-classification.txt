@@ -313,3 +313,138 @@ VoxelFramePhaseHeavy
 VoxelFramePhaseMoveUU
 VoxelFramePhaseGateMps
 VoxelFramePhaseSteadyPct
+VoxelAdmissionCapDrainSec
+VoxelAdmissionCapMax
+VoxelBrickPoolMatMiB
+VoxelBrickPoolOccMiB
+VoxelBucketedExitScan
+VoxelCutoffClamp
+VoxelCutoffHeadroomDiv
+VoxelGpuBandColdOnly
+VoxelGpuBandSeedOnly
+VoxelGpuLeanBrickJobs
+VoxelGpuMeshBatchCap
+VoxelGpuMeshHarvestCap
+VoxelGpuMeshSpecCap
+VoxelGpuPrimary
+VoxelGpuRasterAtlas
+VoxelGpuRasterAtlasClimateAudit
+VoxelGpuRasterAtlasClimatePitchMm
+VoxelGpuRasterAtlasFill
+VoxelGpuRasterAtlasFillBatch
+VoxelGpuRasterAtlasFillMs
+VoxelGpuRasterAtlasFillTasks
+VoxelGpuResidency
+VoxelGpuStackClaim
+VoxelGpuWorklistBandChunks
+VoxelIncrementalAdmission
+VoxelLeadHorizonSec
+VoxelNearestAdmit
+VoxelPerRingRelax
+VoxelRingScale
+VoxelSpecLeadMaxM
+VoxelSurfaceMip
+VoxelUnloadBandChunks
+VoxelUnloadRingMult
+VoxelVelocityBias
+VoxelViewBias
+VoxelWorkerPool
+VoxelWorkerTaskPri
+
+## SUBSTRING-MATCHED -- ACKNOWLEDGED
+#
+# Everything below is a switch whose NAME contains one of rule 5's substrings,
+# so VoxelFrontEndPolicy already treats it as self-driving and suppresses the
+# main menu whenever it is on the command line. Until 2026-08-23 the lint
+# SKIPPED every one of these ("the rule handles it") -- which meant a switch
+# that matched BY ACCIDENT was both changing front-end behaviour and invisible
+# to the one lint built to catch that. -VoxelFineLockProbe was caught by a
+# human, by luck.
+#
+# The suffix advice the lint prints does not fix the class either:
+# -VoxelGpuMeshInFlight ENDS in "Flight" and is a job-count cap. Intent cannot
+# be read off a name, so the decision is RECORDED here rather than inferred.
+#
+# Format: Name = reason. The lint requires a reason of real length -- the rule
+# kSelfDrivingExtras already uses -- because an unexplained entry is how a
+# table starts rotting.
+#
+# 13 entries are marked ACCIDENTAL. None is renamed here: renaming mid-campaign
+# would break leg commands, tools and docs other agents are running against
+# right now. Each accidental entry names the rename it wants and the owner.
+VoxelAutoDigAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelBreachTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelBucketedExitScanVerify = ACCIDENTAL ('Verify'). Correctness arm for the bucketed exit scan in the eviction index; verifies during a normal run. Owner: VoxelEvictionIndex.*
+VoxelCaveTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelCavernShot = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelChopTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelClientScreenshotAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelCoarseGridVerify = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelCollapseTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelDigDownTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelDigSwarmTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelDumpAgentsAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelDumpDigestAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelExecAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelFloodTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelGICaveTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelGIColorCheck = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelGIConverge = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelGIConvergeLegacy = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelGIConvergeSeed = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelGIConvergeSettle = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelGIRelightAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelGITest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelGpuMeshInFlight = ACCIDENTAL ('Flight', and as a SUFFIX). A job in-flight cap, pure tuning. THIS IS THE ENTRY THAT PROVES A SUFFIX RENAME CANNOT FIX THIS CLASS: it already ends in the substring the lint tells you to rename to. RECOMMEND RENAME to -VoxelGpuMeshJobCap by whoever owns VoxelWorldSubsystem.cpp.
+VoxelGpuWorklistVerifyCT = ACCIDENTAL ('Verify'). Byte gate for the worklist ClassifyTotals stage, not a fixture: it adds a compare pass and ends nothing. Not renamed, because every leg command, tools/leg-summary.sh and docs/gpu-worklist-plan-2026-08-23.md cite it mid-campaign; suppressing the menu is harmless on the headless legs it is actually used on.
+VoxelGpuWorklistVerifyClaim = ACCIDENTAL ('Verify'). Byte gate for the worklist Claim stage. Same reasoning as VerifyCT.
+VoxelGpuWorklistVerifyCols = ACCIDENTAL ('Verify'). Byte gate for the worklist Column stage. Same reasoning as VerifyCT.
+VoxelGpuWorklistVerifyPack = ACCIDENTAL ('Verify'). Byte gate for the worklist Pack stage. Same reasoning as VerifyCT.
+VoxelGpuWorklistVerifyStamp = ACCIDENTAL ('Verify'). Byte gate for the worklist AssetStamp stage. Same reasoning as VerifyCT.
+VoxelGpuWorklistVerifyVox = ACCIDENTAL ('Verify'). Byte gate for the worklist Voxelize stage. Same reasoning as VerifyCT.
+VoxelHeadlessDigTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelHourglassShot = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelHudShotOnly = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelJobsInFlightPerCore = ACCIDENTAL ('Flight'). Per-core job cap -- the cap=288 knob the 50k budget doc reads. Pure tuning. RECOMMEND RENAME to -VoxelJobsPerCoreCap by whoever owns VoxelDebug.cpp.
+VoxelL0GridCacheProbe = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelL0GridVerify = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelLoadingShot = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelMatHistogram = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelMenuShot = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelOceanDigAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelOceanSurvey = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelOceanSurveyStepM = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelOverlayShot = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelPerfFlight = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelReadyProbeLog = ACCIDENTAL ('Probe'). Enables a readiness log line; a diagnostic, not a run that drives itself.
+VoxelReplicationSelfTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelSaveWorldAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelScreenshotAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelScreenshotBurst = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelScreenshotBurstIntervalSec = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelSkyLadder = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelSkyLadderAltA = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelSkyLadderAltB = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelSkyLadderAltCvar = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelSkyLadderPreflight = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelSkyLadderSettle = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelSkyLadderStartHour = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
+VoxelSpawnWaterTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelStructureTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelSwarmTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelSweBreachTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelTier1RegionGraphTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelTreeTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelUndergroundTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelVerifyBuriedSkip = ACCIDENTAL ('Verify'). Runtime correctness arm for the buried-chunk skip: it verifies DURING a normal run and never drives or ends one. Arming it interactively would silently lose the main menu.
+VoxelVerifySkyBand = ACCIDENTAL ('Verify'). Runtime correctness arm for the sky band; verifies during a normal run.
+VoxelVerifySolidSkip = ACCIDENTAL ('Verify'). Runtime correctness arm for the solid-skip admission gate; verifies during a normal run.
+VoxelVistaShot = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelWalkModeAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelWalkTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelWaterLoadCheck = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelWaterMemoTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelWaterParityTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelWaterPersistTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelWaterWakeTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelWindingCheck = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
