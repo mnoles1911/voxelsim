@@ -273,7 +273,7 @@ void FlushStats(bool bForce)
 	// drained chunk. At mode=4 (measure only, behaviour unchanged) it is the
 	// entire claim of this change, measured, before anything is altered.
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel apply fast (5s window): mode=%d(%s%s%s) calls=%lld avoided=%lld (%.1f%%) ")
+	       TEXT("Voxel apply fast (window): mode=%d(%s%s%s) calls=%lld avoided=%lld (%.1f%%) ")
 	       TEXT("| guardSkip=%lld (withPack=%lld) cacheHit=%lld cacheMiss=%lld cacheEvict=%lld ")
 	       TEXT("sentinel=%lld | sampled=%lld sampleUs/sample=%.2f sampleUs/call=%.2f ")
 	       TEXT("sampleMsWindow=%.1f | audit=%lld mismatch=%lld maxMismatchUU=%.4f ")

@@ -66,7 +66,7 @@ function Evidence($logPath) {
     $g.draining = @($t | Select-String 'RefreshImplicitWater: STILL DRAINING').Count
     $g.sheet    = @($t | Select-String 'Lake sheets: DRAINED build').Count
     $g.refused  = @($t | Select-String 'was REFUSED').Count
-    $g.fine     = ($t | Select-String 'Fine tier \(5s window\)' | Select-Object -Last 1)
+    $g.fine     = ($t | Select-String 'Fine tier \(([^)]*window)\)' | Select-Object -Last 1)
     $g.shutter  = ($t | Select-String 'Capture: cam loc=' | Select-Object -First 1)
     $g.undrawn  = @($t | Select-String 'Chunk left undrawn').Count
     return $g

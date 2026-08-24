@@ -9,6 +9,7 @@
 #include "VoxelGpuWorldGen.h"
 
 #include "voxelcore/core.h"
+#include "voxelcore/tilestore.h"  // vxc::tilePixelSizeMm -- the climate-pitch default
 
 #include "Misc/CommandLine.h"
 #include "RenderingThread.h"   // ENQUEUE_RENDER_COMMAND (Shutdown)
@@ -96,7 +97,36 @@ namespace
 		{
 			int32 V = 0;
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlasClimatePitchMm="), V);
-			return V;
+			if (V > 0)
+			{
+				return V;   // explicitly TOLD; outranks the derivation below
+			}
+			// DERIVED, NOT GUESSED, and this is what makes fill mode 2 safe to
+			// default. The comment above is right that this file must not
+			// restate FineTileSampler's /16 -- so it does not. It reads the
+			// SAME switch the coarse sampler is constructed from
+			// (-VoxelTileScale, VoxelWorldSubsystem.cpp:1415-1517, default 1)
+			// and asks voxelcore for that scale's pitch. If the two ever
+			// disagree it is because someone changed the sampler's scale
+			// without changing this switch, which is the one thing the switch
+			// exists to say.
+			//
+			// WHY IT HAD TO CHANGE BEFORE MODE 2 COULD SHIP: the default was 0
+			// = "not told", and `bDedup` requires ClimateRunPx > 1, so
+			// defaulting the fill mode to 2 with the pitch still 0 would have
+			// shipped the dedup PERMANENTLY OFF while the mode said it was on.
+			// That is the inert-feature shape this project has now found twelve
+			// times, and the window line would have read
+			// `climateDedup=UNAVAILABLE` on every shipped run.
+			//
+			// An unsupported scale returns 0 from tilePixelSizeMm, which lands
+			// back on "not told" -- dedup off, per-pixel fills, correct. The
+			// 64-probe audit still runs on every page and still disables the
+			// dedup for the session on any mismatch, so a derivation that is
+			// somehow wrong is caught rather than written into the atlas.
+			int32 TileScale = 1;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelTileScale="), TileScale);
+			return int32(vxc::tilePixelSizeMm(uint8(TileScale)));
 		}();
 		return Value;
 	}
@@ -230,7 +260,37 @@ int32 FVoxelRasterAtlasCpu::FillMode()
 {
 	static const int32 Value = []
 	{
-		int32 V = 0;
+		// DEFAULT 2 (disc sweep + climate dedup) AS OF 2026-08-23. Mode 3
+		// (async fill) is DELIBERATELY NOT the default -- see below.
+		//
+		// SHIPPED ON THIS LADDER (atl-f0..f3, matched arms, one switch each):
+		//   mode  perPage    elev            climate         fill ms GT  settle
+		//     0   1.093 ms   0.642 (59%)     0.445 (41%)       4,363 ms   21.4 s
+		//     1   0.971      0.563           0.397             3,071      20.9
+		//     2   0.587      0.572 (97%)     0.006 ( 1%)       1,877      20.9
+		//     3   0.902      0.894           0.008               330      20.3
+		// Mode 1 is a counted 1,020-of-1,521-page saving (the corner pages of
+		// the square sweep are outside the coverage disc and were being filled
+		// for nothing). Mode 2 collapses the climate term 98.7% by sampling
+		// once per coarse run instead of once per pixel -- callsPerPage climate
+		// 16,384 -> 64, a 256x reduction -- and its audit re-samples 64 probes
+		// per page on every leg and disables the dedup for the session on any
+		// mismatch. mismatch=0, gateLeaks=0, holes=0 on every arm, every ring
+		// improved and none lost.
+		//
+		// WHY NOT 3, given it is the fastest arm. Two reasons, and the second
+		// decides it. (1) It is where all the concurrency risk lives: a worker
+		// touching a non-resident pixel reaches ReportGateLeak_Locked, which is
+		// FATAL on an unattended run, and the four-corner prime that guards it
+		// can be defeated by a racing eviction. (2) No arm in this ladder was
+		// measured against the >100 FPS-after-settle goal, and adding threads
+		// without a settled-segment p95 instrument is exactly the trade that
+		// goal exists to prevent. 0.6 s is not worth taking that on blind.
+		//
+		// AND THE HONEST NUMBER: removing 4,033 ms of game thread bought 1.1 s
+		// of settle -- 27%, not 1:1. Game-thread milliseconds are not wall
+		// milliseconds. This is the third measurement tonight to say so.
+		int32 V = 2;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlasFill="), V);
 		return FMath::Clamp(V, 0, 3);
 	}();

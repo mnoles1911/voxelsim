@@ -217,7 +217,7 @@ foreach ($name in $LogName) {
     $poolLine = @($lines | Select-String -SimpleMatch 'Voxel GPU pool:') | Select-Object -Last 1
     $allocFail = if ($poolLine -and $poolLine.Line -match 'allocFail=([0-9]+)') { $Matches[1] } else { 'n/a' }
 
-    $parkLine = @($lines | Select-String -SimpleMatch 'Voxel park (5s window)') | Select-Object -Last 1
+    $parkLine = @($lines | Select-String -SimpleMatch 'Voxel park ([^)]*window)') | Select-Object -Last 1
     $park = if ($parkLine -and $parkLine.Line -match 'cumulative parked=([0-9]+) adopted=([0-9]+) \(hit ([0-9]+)%\)') {
         "parked=$($Matches[1]) adopted=$($Matches[2]) hit=$($Matches[3])%"
     } else { 'parking off' }
@@ -236,7 +236,7 @@ foreach ($name in $LogName) {
     # the same leg was 46% on that denominator. Four denominator mistakes in this
     # programme have each been arithmetically true and directionally wrong
     # (docs/lessons-2026-07-27-s0-s1.md, appendix), so both are printed.
-    $specLine = @($lines | Select-String -SimpleMatch 'Voxel speculation (5s window)') | Select-Object -Last 1
+    $specLine = @($lines | Select-String -SimpleMatch 'Voxel speculation ([^)]*window)') | Select-Object -Last 1
     $spec = 'spec off'
     if ($specLine -and $specLine.Line -match 'cumulative dispatched=([0-9]+) adopted=([0-9]+)') {
         $d = [double]$Matches[1]; $a = [double]$Matches[2]

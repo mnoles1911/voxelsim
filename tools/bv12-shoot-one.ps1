@@ -53,7 +53,7 @@ function L1($pat) { $m = Select-String $L -Pattern $pat | Select-Object -Last 1;
 $rib = L1 'River ribbons: DRAINED build.*'
 $dis = L1 'River ribbons: DISABLED.*'
 $str = L1 'Voxel streaming: loaded=.*jobsInFlight.*'
-$fin = L1 'Fine tier \(5s window\).*'
+$fin = L1 'Fine tier \(([^)]*window)\).*'
 $cam = L1 'Capture: cam loc=.*'
 
 Write-Host "FILE     : $dest"

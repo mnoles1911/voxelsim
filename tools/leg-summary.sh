@@ -14,7 +14,7 @@ for f in "$@"; do
   packs=$(grep -o 'brickPacks=[0-9]*' "$log" | sort -t= -k2 -n | tail -1 | cut -d= -f2)
   holes=$(grep -o 'holes=[0-9]* scanned=[0-9]*' "$log" | tail -1)
   cyc=$(grep -o "cycPerColumn=[0-9]*" "$log" | awk -F= '{if($2>0){s+=$2;n++}} END{if(n)printf "%.0f",s/n; else printf "n/a"}')
-  disp=$(grep -o "job flow (5s window): dispatched=[0-9]*" "$log" | awk -F= '{s+=$NF} END{printf "%d",s}')
+  disp=$(grep -o "job flow ([^)]*window): dispatched=[0-9]*" "$log" | awk -F= '{s+=$NF} END{printf "%d",s}')
   echo " | packs=$packs cycPerColumn=$cyc dispatched=$disp $holes"
   # The GPU fork's submit->deliver STAGE PARTITION, aggregated across active
   # windows only (each window weighted by its complete-job count n, so quiet

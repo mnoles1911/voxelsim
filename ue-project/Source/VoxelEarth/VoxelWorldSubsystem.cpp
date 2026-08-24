@@ -10505,7 +10505,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			if (CT.Gathers > 0)
 			{
 				UE_LOG(LogVoxelPerf, Log,
-				       TEXT("Voxel cull timing (5s window): gathers=%d | walk=%.1f ms (%.3f ms/gather, "
+				       TEXT("Voxel cull timing (window): gathers=%d | walk=%.1f ms (%.3f ms/gather, "
 				            "%lld runs seen) | emit=%.1f ms (%.3f ms/gather, %d ranges) | walk+emit=%.1f ms"),
 				       CT.Gathers, CT.WalkUs / 1000.0, CT.WalkUs / 1000.0 / double(CT.Gathers),
 				       (long long)CT.RunsSeen,
@@ -10626,7 +10626,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // un-applied results backlog hit -VoxelDispatchAheadCap. The
 	       // reading pair for that gate lives on its accessor; the twin
 	       // backlog= column is on the job-flow line.
-	       TEXT("Voxel dispatch loop (5s window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
+	       TEXT("Voxel dispatch loop (window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
 	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld seedCpu=%lld"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
@@ -10758,7 +10758,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		const int64 Probes = L0ProbeHitsSinceLog + L0ProbeMissesSinceLog;
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel L0 grid-cache probe (5s window): cap=%d dispatches=%lld distinct=%d hits=%lld (%.1f%%) ")
+		       TEXT("Voxel L0 grid-cache probe (window): cap=%d dispatches=%lld distinct=%d hits=%lld (%.1f%%) ")
 		       TEXT("misses=%lld coldMisses=%lld | ceiling=%.1f%%"),
 		       ProbeCap, (long long)Probes, L0ProbeDistinct.Num(), (long long)L0ProbeHitsSinceLog,
 		       Probes > 0 ? 100.0 * double(L0ProbeHitsSinceLog) / double(Probes) : 0.0,
@@ -10795,7 +10795,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		GridCacheEvictionsAtLastLog = CacheEvictions;
 		const int64 WinLookups = WinHits + WinMisses;
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel shared grid cache (5s window): cap=%d hits=%lld misses=%lld (hit%%=%.1f) ")
+		       TEXT("Voxel shared grid cache (window): cap=%d hits=%lld misses=%lld (hit%%=%.1f) ")
 		       TEXT("residencyRefused=%lld evictions=%lld | totals hits=%lld misses=%lld refused=%lld ")
 		       TEXT("evictions=%lld entries=%lld (%.0f MB)"),
 		       GridCacheCap, (long long)WinHits, (long long)WinMisses,
@@ -10899,7 +10899,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel incremental admission (5s window): incr %s | full: first=%d edit=%d underground=%d config=%d"),
+		       TEXT("Voxel incremental admission (window): incr %s | full: first=%d edit=%d underground=%d config=%d"),
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelIncrScansSinceLog[L]); }),
 		       IncrFullFirstSinceLog, IncrFullEditSinceLog, IncrFullUndergroundSinceLog,
 		       IncrFullConfigSinceLog);
@@ -10947,7 +10947,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	const int64 BrickPacksThisWindow = BrickPacksNow - LastLogBrickPackCount;
 	LastLogBrickPackCount = BrickPacksNow;
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel tick budget (5s window): ticks=%d tickMs=%.1f (%.2f%% of wall) | recompute=%.1f dispatch=%.1f ")
+	       TEXT("Voxel tick budget (window): ticks=%d tickMs=%.1f (%.2f%% of wall) | recompute=%.1f dispatch=%.1f ")
 	       TEXT("apply=%.1f remesh=%.1f unload=%.1f | specEnum=%.1f specDispatch=%.1f specPark=%.1f (of dispatch) ")
 	       TEXT("| brickFlush=%.1f brickPacks=%lld (%.0f/s) | perTick tick=%.3f recompute=%.3f win=%.2fs"),
 	       AccumTicks, AccumTickMs, WindowMs > 0.0 ? 100.0 * AccumTickMs / WindowMs : 0.0, AccumRecomputeMs, AccumDispatchMs,
@@ -10971,7 +10971,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// other= is loop minus the named brackets: large and stable means the
 	// per-candidate bookkeeping nobody has bracketed yet.
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel dispatch stages (5s window): loopMs=%.1f = airProof=%.1f + band=%.1f + submit=%.1f ")
+	       TEXT("Voxel dispatch stages (window): loopMs=%.1f = airProof=%.1f + band=%.1f + submit=%.1f ")
 	       TEXT("+ pick=%.1f + overlay=%.1f + other=%.1f | gpuMgrTickMs=%.1f | dispatched=%lld ")
 	       TEXT("perDispatch=%.3fms"),
 	       AccumDispatchLoopMs, AccumDispatchAirProofMs, AccumDispatchBandMs, AccumDispatchSubmitMs,
@@ -11032,7 +11032,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // steady state. Climbing past the cap while exitBacklog>0 means an
 	       // uncounted producer (counter leak); pinned at the cap with
 	       // exitBacklog=0 means the gate is not being evaluated.
-	       TEXT("Voxel job flow (5s window): dispatched=%lld drained=%lld stale=%lld (%.1f%%) zeroQuad=%lld ")
+	       TEXT("Voxel job flow (window): dispatched=%lld drained=%lld stale=%lld (%.1f%%) zeroQuad=%lld ")
 	       TEXT("recordsAdded=%lld recordsEvicted=%lld candidatesRejected=%lld chunksPerSec=%.1f backlog=%d"),
 	       (long long)JobsDispatchedSinceLog, (long long)ResultsDrainedSinceLog, (long long)StaleDiscardsSinceLog,
 	       ResultsDrainedSinceLog > 0 ? 100.0 * double(StaleDiscardsSinceLog) / double(ResultsDrainedSinceLog) : 0.0,
@@ -11092,7 +11092,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			}
 		}
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel speculation (5s window): dispatched=%lld parked=%lld adopted=%lld evictedUnused=%lld ")
+		       TEXT("Voxel speculation (window): dispatched=%lld parked=%lld adopted=%lld evictedUnused=%lld ")
 		       TEXT("| bandSkipped=%lld dropOvertaken=%lld dropEmpty=%lld (top=%lld mid=%lld bot=%lld) dropPoolFull=%lld ")
 		       TEXT("| queued=%d tracked=%d gpuInFlight=%d parkedNow=%d leadSec=%.2f speed=%.1f m/s ")
 		       TEXT("| cumulative dispatched=%lld adopted=%lld (hit %.0f%%)"),
@@ -11117,7 +11117,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		    SpecDroppedBrickNotResidentSinceLog > 0 || SpecBrickParkLostSinceLog > 0)
 		{
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel speculation brick arm (5s window): parkedBrick=%lld dropBrickOnly=%lld ")
+			       TEXT("Voxel speculation brick arm (window): parkedBrick=%lld dropBrickOnly=%lld ")
 			       TEXT("dropBrickNotResident=%lld adoptLostBricks=%lld parkBricks=%d"),
 			       (long long)SpecParkedBrickSinceLog, (long long)SpecDroppedBrickOnlySinceLog,
 			       (long long)SpecDroppedBrickNotResidentSinceLog, (long long)SpecBrickParkLostSinceLog,
@@ -11146,7 +11146,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		const UVoxelGpuPoolComponent* Pool = GpuPool.Get();
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel park (5s window): parked=%lld adopted=%lld evictedStale=%lld evictedCap=%lld | ")
+		       TEXT("Voxel park (window): parked=%lld adopted=%lld evictedStale=%lld evictedCap=%lld | ")
 		       TEXT("refused: noGeom=%lld unsettled=%lld notFiner=%lld edited=%lld | ")
 		       TEXT("held=%d poolParked=%d | cumulative parked=%lld adopted=%lld (hit %.0f%%)"),
 		       (long long)ChunksParkedSinceLog, (long long)ChunksAdoptedSinceLog,
@@ -11227,7 +11227,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	}
 
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld ")
+	       TEXT("Voxel admission (window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld ")
 	       // drainEMA/capSrc appended 2026-08-23 (new columns at the END so
 	       // old-leg greps still parse): the drain-sec sweep cannot be read
 	       // from cap= alone -- cap=32768 is both "EMA x N landed there" and
@@ -11255,7 +11255,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// bk= is DeferredFootprints (the rejection backlog incremental rescans
 	// re-attempt -- if rejections are pathological this is the pathology,
 	// preserved). Always on: one line per 5 s, integers already counted.
-	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission detail (5s window): %s"),
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission detail (window): %s"),
 	       *JoinPerLevel(
 	           [&](int32 L)
 	           {
@@ -11293,7 +11293,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// the enumeration was not where that time went.
 	if (VoxelStreamAdmission::CutoffClampEnabled())
 	{
-		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel cutoff clamp (5s window): %s"),
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel cutoff clamp (window): %s"),
 		       *JoinPerLevel(
 		           [&](int32 L)
 		           {
@@ -11320,7 +11320,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		const double TimedApplies = double(FMath::Max<int64>(1, AppliesTimedSinceLog));
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel apply stages (5s window): exit queueEmpty=%lld wallClock=%lld countCap=%lld drainCap=%lld ")
+		       TEXT("Voxel apply stages (window): exit queueEmpty=%lld wallClock=%lld countCap=%lld drainCap=%lld ")
 		       TEXT("| timedApplies=%lld pack=%.2fms params=%.2fms poolAdd=%.2fms ")
 		       TEXT("| per-apply pack=%.3f params=%.3f poolAdd=%.3f"),
 		       (long long)DrainExitQueueEmptySinceLog, (long long)DrainExitWallClockSinceLog,
@@ -11346,7 +11346,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		const UVoxelGpuPoolComponent::FPoolPushStats Push = Pool->GetAndResetPushStats();
 		const double PerBuild = double(FMath::Max<int64>(1, Push.RunsBuilt));
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel pool publish (5s window): pushes=%lld runsBuilt=%lld allocsWalked=%lld runsEmitted=%lld ")
+		       TEXT("Voxel pool publish (window): pushes=%lld runsBuilt=%lld allocsWalked=%lld runsEmitted=%lld ")
 		       TEXT("(mean walk=%.0f emit=%.0f) | game tableCopy=%.2fms buildRuns=%.2fms ")
 		       TEXT("| render runBounds=%.2fms calls=%lld runsWalked=%lld"),
 		       (long long)Push.Pushes, (long long)Push.RunsBuilt,
@@ -11389,7 +11389,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			                        (long long)LevelRecordsDropped[Level],
 			                        (long long)LevelRecordsEvicted[Level]);
 		}
-		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel records/level (5s window): %s"), *Line);
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel records/level (window): %s"), *Line);
 	}
 	{
 		// WHICH exit test did the evicting, per ring (see LevelEvictInner). The
@@ -11423,7 +11423,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			                        (long long)LevelEvictInner[Level], (long long)LevelEvictOuter[Level],
 			                        (long long)LevelEvictVertical[Level], (long long)LevelEvictStationary[Level]);
 		}
-		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel evictions/level (5s window): %s"),
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel evictions/level (window): %s"),
 		       Line.IsEmpty() ? TEXT("(none)") : *Line);
 	}
 	// Buried-chunk pre-dispatch skip, step 1 census. One line per ring level:
@@ -11483,7 +11483,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 		const double TotalMs = LevelZeroQuadMsSinceLog[Level] + LevelQuadMsSinceLog[Level];
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel empty census R%d (5s window): results=%lld zeroQuad=%lld (%.1f%%) air=%lld solid=%lld mixed=%lld | ")
+		       TEXT("Voxel empty census R%d (window): results=%lld zeroQuad=%lld (%.1f%%) air=%lld solid=%lld mixed=%lld | ")
 		       TEXT("workerMs zeroQuad=%.1f quad=%.1f (zeroQuad %.1f%% of worker time)%s"),
 		       Level, (long long)LevelResultsSinceLog[Level], (long long)LevelZeroQuadSinceLog[Level],
 		       100.0 * double(LevelZeroQuadSinceLog[Level]) / double(LevelResultsSinceLog[Level]),
@@ -11502,7 +11502,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	if (AccumLevel0GpuJobs > 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel empty census R0 gpu arm (5s window): gpuJobs=%lld gpuLatencyMs=%.1f perJob gpuLatencyUs=%.0f"),
+		       TEXT("Voxel empty census R0 gpu arm (window): gpuJobs=%lld gpuLatencyMs=%.1f perJob gpuLatencyUs=%.0f"),
 		       (long long)AccumLevel0GpuJobs, AccumLevel0GpuLatencyMs,
 		       1000.0 * AccumLevel0GpuLatencyMs / double(AccumLevel0GpuJobs));
 	}
@@ -11510,7 +11510,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	BuriedSolidKeptTotal += BuriedSolidKeptSinceLog;
 	const bool bVolumeFedForSkipLog = VoxelBrickCpuArm::VolumeNeedsSolidChunks();
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel buried skip (5s window): enabled=%d verify=%d volumeFed=%d skipped=%lld ")
+	       TEXT("Voxel buried skip (window): enabled=%d verify=%d volumeFed=%d skipped=%lld ")
 	       TEXT("(air=%lld solid=%lld) solidKept=%lld (total %lld) R0=%lld | ")
 	       TEXT("bandCache=%d | verifyChecked=%lld (total %lld) violations=%lld"),
 	       VoxelStreamAdmission::BuriedSkipEnabled() ? 1 : 0, VoxelStreamAdmission::VerifyBuriedSkipEnabled() ? 1 : 0,
@@ -11574,7 +11574,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// gpuLatencyTimeouts can be read against how much of the population is even
 	// eligible to produce one.
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel cold-band throttle (5s window): defers=%lld heldLastPass=%d bandCache=%d blindInFlight=%d "
+	       TEXT("Voxel cold-band throttle (window): defers=%lld heldLastPass=%d bandCache=%d blindInFlight=%d "
 	            "(gpu=%d) markTimeouts=%lld gpuLatencyTimeouts=%lld"),
 	       (long long)ColdBandDefersSinceLog, ColdBandHeldThisFrame, FootprintBandCache.Num(),
 	       FootprintBlindJobInFlight.Num(), FootprintBlindJobIsGpu.Num(),
@@ -11586,7 +11586,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	if (ColdBandParkedEntryCount > 0 || ColdBandParkFlushedSinceLog > 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel cold-band park (5s window): parkedNow=%d footprints=%d flushed=%lld"),
+		       TEXT("Voxel cold-band park (window): parkedNow=%d footprints=%d flushed=%lld"),
 		       ColdBandParkedEntryCount, ColdBandParkedByFootprint.Num(),
 		       (long long)ColdBandParkFlushedSinceLog);
 	}
@@ -11616,7 +11616,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	        GpuBandFreeSubmitsSinceLog > 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel GPU band requests (5s window): seed=%lld dup=%lld redundant=%lld free=%lld ")
+		       TEXT("Voxel GPU band requests (window): seed=%lld dup=%lld redundant=%lld free=%lld ")
 		       TEXT("reqInFlight=%d bandCache=%d"),
 		       (long long)GpuBandReqSeedSinceLog, (long long)GpuBandReqDupSinceLog,
 		       (long long)GpuBandReqRedundantSinceLog, (long long)GpuBandFreeSubmitsSinceLog,
@@ -11648,7 +11648,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// -VoxelGpuMeshQueueDepth cap handed to the CPU worker instead (0
 		// whenever the switch is at its default).
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel GPU mesh fork (5s window): dispatched=%lld delivered=%lld failed=%lld "
+		       TEXT("Voxel GPU mesh fork (window): dispatched=%lld delivered=%lld failed=%lld "
 		            "pending=%d queued=%d inFlight=%d depthGateCpu=%lld | submitToDeliver mean=%.1f ms max=%.1f ms "
 		            "slow(>=%.0fs)=%lld (total %lld)"),
 		       (long long)GpuMeshJobsDispatchedSinceLog, (long long)GpuMeshJobsDeliveredSinceLog,
@@ -11715,7 +11715,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			const FVoxelGpuMeshJobManager::FTickStageMs Stages =
 				GpuMeshJobs->GetAndResetTickStageMs();
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel GPU mesh tick (5s window): promoteMs=%.1f (of which enqueueMs=%.1f) "
+			       TEXT("Voxel GPU mesh tick (window): promoteMs=%.1f (of which enqueueMs=%.1f) "
 			            "pollMs=%.1f brickFlushMs=%.1f"),
 			       Stages.PromoteMs, Stages.EnqueueMs, Stages.PollMs, Stages.BrickFlushMs);
 
@@ -11742,7 +11742,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			const FVoxelMarchChunkIndex::FApplyDeltaMs A =
 				GetGlobalVoxelMarchChunkIndex().GetAndResetApplyDeltaMs();
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel march index applyDelta (5s window): removedMs=%.1f (n=%lld) "
+			       TEXT("Voxel march index applyDelta (window): removedMs=%.1f (n=%lld) "
 			            "addedMs=%.1f (n=%lld) uploadMs=%.1f"),
 			       A.RemovedMs, (long long)A.RemovedCount,
 			       A.AddedMs, (long long)A.AddedCount, A.UploadMs);
@@ -11790,7 +11790,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel GPU mesh fork by level (5s window): L0=%lld L1=%lld L2=%lld L3=%lld "
+		       TEXT("Voxel GPU mesh fork by level (window): L0=%lld L1=%lld L2=%lld L3=%lld "
 		            "L4=%lld L5=%lld (cap L%d)"),
 		       (long long)GpuMeshDispatchedByLevel[0], (long long)GpuMeshDispatchedByLevel[1],
 		       (long long)GpuMeshDispatchedByLevel[2], (long long)GpuMeshDispatchedByLevel[3],
@@ -11818,7 +11818,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			const int32 TileCount = TileCensusSinceLog.Num();
 			const double MeanOcc = TileCount > 0 ? double(TileDispatches) / double(TileCount) : 0.0;
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel tile census (5s window): dispatches=%d tiles=%d meanOcc=%.1f | "
+			       TEXT("Voxel tile census (window): dispatches=%d tiles=%d meanOcc=%.1f | "
 			            "occ 1:%d 2-3:%d 4-7:%d 8-15:%d 16+:%d"),
 			       TileDispatches, TileCount, MeanOcc, Occ1, Occ2to3, Occ4to7, Occ8to15, Occ16Plus);
 			TileCensusSinceLog.Reset();
@@ -11931,7 +11931,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		const FMsPercentiles CpuEndToEnd = ComputeMsPercentiles(CpuWorkerEndToEndMsWindow, CpuWorkerEndToEndMsWindowCount);
 		const FMsPercentiles CpuDeliverToApply = ComputeMsPercentiles(CpuDeliverToApplyMsWindow, CpuDeliverToApplyMsWindowCount);
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel CPU worker latency (5s window): endToEnd p50=%.1f p95=%.1f max=%.1f (n=%d) | ")
+		       TEXT("Voxel CPU worker latency (window): endToEnd p50=%.1f p95=%.1f max=%.1f (n=%d) | ")
 		       TEXT("deliverToApply p50=%.1f p95=%.1f max=%.1f (n=%d)"),
 		       CpuEndToEnd.P50, CpuEndToEnd.P95, CpuEndToEnd.Max, CpuWorkerEndToEndMsWindowCount,
 		       CpuDeliverToApply.P50, CpuDeliverToApply.P95, CpuDeliverToApply.Max, CpuDeliverToApplyMsWindowCount);
@@ -11958,7 +11958,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			const double MeanQuads = double(LevelQuadSumSinceLog[Level]) / double(LevelChunks);
 			const int64* Hist = LevelQuadHistSinceLog[Level];
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel quad census L%d (5s window): chunks=%lld mean=%.1f | ")
+			       TEXT("Voxel quad census L%d (window): chunks=%lld mean=%.1f | ")
 			       TEXT("0:%lld 1-255:%lld 256-1023:%lld 1024-4095:%lld 4096-16383:%lld 16384+:%lld"),
 			       Level, (long long)LevelChunks, MeanQuads,
 			       (long long)Hist[0], (long long)Hist[1], (long long)Hist[2],
@@ -12031,7 +12031,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			Suffix += FString::Printf(TEXT(" | cap/level: %s"), *CapPerLevel);
 		}
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel LOD retention (5s window): held=%d covRelSettled=%lld covRelAbsent=%lld capRel=%lld ")
+		       TEXT("Voxel LOD retention (window): held=%d covRelSettled=%lld covRelAbsent=%lld capRel=%lld ")
 		       TEXT("resurrected=%lld (capRel %.1f%% of releases, covRelAbsent %.1f%%) | retentionMs=%.0f%s"),
 		       RetainHeldThisFrame, (long long)RetainCoveredSettledReleasesSinceLog,
 		       (long long)RetainCoveredAbsentReleasesSinceLog, (long long)RetainCapReleasesSinceLog,
@@ -12134,7 +12134,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 		auto PctOf = [](double Used, double Cap) { return Cap > 0.0 ? 100.0 * Used / Cap : 0.0; };
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel brick lifetime (5s window): released=%lld absent=%lld | resident0=%d ")
+		       TEXT("Voxel brick lifetime (window): released=%lld absent=%lld | resident0=%d ")
 		       TEXT("indexEntries=%d | cumulative released=%lld evictions=%lld writesDropped=%lld ")
 		       TEXT("neutralShading=%lld | residentAll=%d/%u (%.1f%%) perLevel=%s ")
 		       TEXT("arenas desc=%.1f%% occ=%.1f%% mat=%.1f%% | evByDist=%lld allocFail=%lld"),
@@ -12223,7 +12223,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			// are how counters lie. Armed with nothing landed is "not
 			// measuring", never "no holes".
 			UE_LOG(LogVoxelPerf, Warning,
-			       TEXT("Voxel march holes (5s window): ARMED BUT NO READBACKS LANDED -- ")
+			       TEXT("Voxel march holes (window): ARMED BUT NO READBACKS LANDED -- ")
 			       TEXT("refusing a healthy-looking zero. Either the march pass is not ")
 			       TEXT("running (voxel.March 0, no pool, no view) or every slot ring was ")
 			       TEXT("full. This line is not evidence about holes either way."));
@@ -12233,7 +12233,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			const double Rays = double(H.Rays);
 			const double Hits = double(H.Hits);
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel march holes (5s window): uncovered=%llu (%.4f%% of rays) ")
+			       TEXT("Voxel march holes (window): uncovered=%llu (%.4f%% of rays) ")
 			       TEXT("substituted=%llu (%.4f%% of hits) | rays=%llu hits=%llu ")
 			       TEXT("framesMeasured=%llu"),
 			       (unsigned long long)H.Uncovered,
@@ -12369,7 +12369,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				                             : 0;
 				FVoxelMarchChunkIndex& MarchIndex = GetGlobalVoxelMarchChunkIndex();
 				UE_LOG(LogVoxelPerf, Log,
-				       TEXT("Voxel march holes breakdown (5s window): byLevel L0=%llu L1=%llu ")
+				       TEXT("Voxel march holes breakdown (window): byLevel L0=%llu L1=%llu ")
 				       TEXT("L2=%llu L3=%llu L4=%llu L5=%llu L6=%llu | byReason never=%llu ")
 				       TEXT("pending=%llu evicted=%llu unattrib=%llu | attributed=%llu of ")
 				       TEXT("uncShell=%llu (%.2f%% of uncovered=%llu)%s ")
@@ -12472,7 +12472,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		const int64 BrickChunks = VoxelBrickGetCpuPackCount();
 		const int64 BrickFromGpu = GetGlobalVoxelBrickPool().GetChunksAddedFromGpu();
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel Phase 5 (5s window): retired=1 terrainPoolUsedQuads=%u (capacity %d, NOT the ")
+		       TEXT("Voxel Phase 5 (window): retired=1 terrainPoolUsedQuads=%u (capacity %d, NOT the ")
 		       TEXT("number to read) residentQuads=%lld brickPacks=%lld brickFromGpu=%lld ")
 		       TEXT("forkDispatched=%lld. Water pools are separate instances and are not counted here."),
 		       TerrainUsedQuads, TerrainPool != nullptr ? TerrainPool->GetNumQuads() : 0,
@@ -12545,7 +12545,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	SolidAdmittedForVolumeTotal += SolidAdmittedForVolumeSinceLog;
 	SolidVerifyCheckedTotal += SolidVerifyCheckedSinceLog;
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel solid skip at admission (5s window): enabled=%d verify=%d volumeFed=%d ")
+	       TEXT("Voxel solid skip at admission (window): enabled=%d verify=%d volumeFed=%d ")
 	       TEXT("skipped=%lld (total %lld) admittedForVolume=%lld (total %lld) | ")
 	       TEXT("R0=%lld R1=%lld | floorCache=%d | verifyChecked=%lld (total %lld) VIOLATIONS=%lld"),
 	       VoxelStreamAdmission::SolidSkipEnabled() ? 1 : 0, VoxelStreamAdmission::VerifySolidSkipEnabled() ? 1 : 0,
@@ -12592,7 +12592,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// below the worldgen floor) and is expected to be 0 on any run with no edits.
 	BandSkippedAtAdmissionTotal += BandSkippedAtAdmissionSinceLog;
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel band skip at admission (5s window): mode=%d warm=%lld cold=%lld skipped=%lld (total %lld) ")
+	       TEXT("Voxel band skip at admission (window): mode=%d warm=%lld cold=%lld skipped=%lld (total %lld) ")
 	       TEXT("editVeto=%lld | editFloor widened=%lld deepest=%d chunks forcedRescans=%lld"),
 	       VoxelStreamAdmission::AdmissionBandSkipMode(), (long long)BandAdmitWarmSinceLog,
 	       (long long)BandAdmitColdSinceLog, (long long)BandSkippedAtAdmissionSinceLog,
@@ -12734,7 +12734,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	if (FineStreamer)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Fine tier (5s window): resident=%llu tile(s) %.2f/%.2f GiB (decoded %.2f GiB) | loaded=%llu ")
+		       TEXT("Fine tier (window): resident=%llu tile(s) %.2f/%.2f GiB (decoded %.2f GiB) | loaded=%llu ")
 		       TEXT("absentOnDisk=%llu corrupt=%llu identityMismatch=%llu refusedTiles=%llu retriesSuppressed=%llu ")
 		       // ringCentre/ringMoves ADDED 2026-08-23. Without them this line
 		       // cannot tell "the streamer stopped following the player" from

@@ -78,7 +78,7 @@
 // branch -- and under voxel.Terrain.RetireQuads (the default) every chunk
 // returns from the NumQuads == 0 branch ABOVE it. So every marcher leg prints
 //
-//     Voxel apply stages (5s window): ... timedApplies=0 params=0.00ms ...
+//     Voxel apply stages (window): ... timedApplies=0 params=0.00ms ...
 //
 // params=0.00ms is not "the sampler is free". It is "the branch this
 // instrument watches was never taken". The sampler that DOES run is the one in

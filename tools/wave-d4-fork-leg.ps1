@@ -7,7 +7,7 @@
 # That is the shape this project keeps getting caught by, so this leg exists to
 # make the fork prove it fired.
 #
-# The decisive line is "Voxel GPU mesh fork (5s window): dispatched=N ..." with
+# The decisive line is "Voxel GPU mesh fork ([^)]*window): dispatched=N ..." with
 # N > 0, which is printed ONLY when -VoxelGpuMesh is on. failed>0 is the other
 # line to read: a failed GPU job delivers an EMPTY chunk, which on screen is
 # indistinguishable from terrain that is genuinely empty.
@@ -75,7 +75,7 @@ function Invoke-Leg {
         ForEach-Object { $_.Line -replace '^\[[^\]]+\]\[[^\]]+\]', '' } | Select-Object -Last 12
 
     if ($Fork) {
-        $fired = Select-String -Path $log -Pattern 'GPU mesh fork \(5s window\): dispatched=([1-9]\d*)'
+        $fired = Select-String -Path $log -Pattern 'GPU mesh fork \(([^)]*window)\): dispatched=([1-9]\d*)'
         if (-not $fired) {
             Write-Host "  FORK NEVER FIRED: dispatched=0 in every window. The wiring is present and inert." -ForegroundColor Red
         } else {
