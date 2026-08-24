@@ -137,6 +137,11 @@ namespace
 		double TailBusy = 0.0;
 
 		double Sub[int32(EBucket::Num)] = {};
+		double SubHits[int32(EBucket::Num)] = {};
+		// Busy banked by WHICH HALF OF THE FRAME the scope closed in, so each of
+		// the three residuals subtracts exactly what was measured inside it and
+		// nothing that was measured elsewhere. 0 = setup, 1 = execute, 2 = tail.
+		double PhaseBusy[3] = {};
 		double SveBlocked = 0.0;
 
 		double PeriodWall = 0.0;
@@ -160,11 +165,32 @@ namespace
 			return S;
 		}
 
-		// setupOther CAN COME OUT NEGATIVE and is deliberately not clamped. A
-		// bucket that cannot go negative is not a measurement: if the named
-		// sub-scopes ever exceed the A->B span the split is wrong, and the only
-		// way a reader finds that out is by seeing a minus sign.
-		double SetupOther() const { return SetupBusy - SubTotal(); }
+		double TailGroupTotal() const
+		{
+			double S = 0.0;
+			for (int32 i = int32(kFirstTailBucket); i < int32(EBucket::Num); ++i) { S += Sub[i]; }
+			return S;
+		}
+
+		double TailGroupHits() const
+		{
+			double S = 0.0;
+			for (int32 i = int32(kFirstTailBucket); i < int32(EBucket::Num); ++i) { S += SubHits[i]; }
+			return S;
+		}
+
+		// ALL THREE RESIDUALS CAN COME OUT NEGATIVE AND NONE IS CLAMPED. A bucket
+		// that cannot go negative is not a measurement: if the named scopes ever
+		// exceed the span they sit inside, the split is wrong, and the only way a
+		// reader finds that out is by seeing a minus sign.
+		//
+		// tailOther is the one the coordinator asked to stay explicit. If the 29
+		// render-command sites do not account for tail, this number stays large
+		// and SAYS SO, rather than the remainder being distributed into whatever
+		// happens to be measured.
+		double SetupOther()   const { return SetupBusy   - PhaseBusy[0]; }
+		double ExecuteOther() const { return ExecuteBusy - PhaseBusy[1]; }
+		double TailOther()    const { return TailBusy    - PhaseBusy[2]; }
 
 		// THE RECONCILIATION. Positive means the buckets claim more busy time
 		// than the engine says the thread had.
@@ -192,6 +218,8 @@ namespace
 		int32  ViewsThisFrame = 0;
 		uint32 MarchTilesThisFrame = 0;
 		double SubThisFrame[int32(EBucket::Num)] = {};
+		double SubHitsThisFrame[int32(EBucket::Num)] = {};
+		double PhaseBusyThisFrame[3] = {};
 		double SveBlockedThisFrame = 0.0;
 		FVector LastViewOrigin = FVector::ZeroVector;
 		bool   bHaveLastViewOrigin = false;
@@ -214,6 +242,12 @@ namespace
 		// populations
 		FBucketSums MoveWindow, ParkWindow, FillWindow;
 		FBucketSums MoveTotal, ParkTotal, FillTotal;
+
+		// THE INSTRUMENT'S OWN COST, MEASURED AT ARM TIME rather than asserted.
+		// Level 2 puts a scope on every render command, and the render-command
+		// population is the thing under suspicion -- so its overhead is printed
+		// with its own absolute beside the bucket it could contaminate.
+		double ScopeCostNs = 0.0;
 
 		double WindowStartSeconds = 0.0;
 		double LastLogSeconds = 0.0;
@@ -243,6 +277,38 @@ namespace
 		Sink = Acc;
 	}
 
+	// THE INSTRUMENT'S OWN COST, MEASURED ONCE AT ARM TIME.
+	//
+	// Level 2 puts a scope on every render command, and the render-command
+	// population is exactly what is under suspicion, so "the overhead is
+	// negligible" is not something this file is entitled to assert. It times the
+	// primitive operations an FScope open/close performs -- two Cycles64 reads,
+	// two idle samples (a TLS lookup plus a global load each) -- and prints the
+	// per-hit figure. The two accumulator adds are excluded and are the only
+	// thing this understates; they are a pair of doubles.
+	//
+	// The loop uses the raw operations rather than real FScope objects on
+	// purpose: constructing 4,096 real scopes would bank 4,096 hits into the
+	// first frame's buckets, and an instrument whose calibration shows up in its
+	// own first window is the failure mode this file exists to avoid.
+	double CalibrateScopeNs()
+	{
+		constexpr int32 kIterations = 4096;
+		static volatile uint64 CycleSink = 0;
+		static volatile uint32 IdleSink = 0;
+		const uint64 Start = FPlatformTime::Cycles64();
+		for (int32 i = 0; i < kIterations; ++i)
+		{
+			const uint64 C0 = FPlatformTime::Cycles64();
+			const uint32 I0 = SampleIdleCycles();
+			const uint64 C1 = FPlatformTime::Cycles64();
+			const uint32 I1 = SampleIdleCycles();
+			CycleSink = C1 - C0;
+			IdleSink = I1 - I0;
+		}
+		return (CyToMs(FPlatformTime::Cycles64() - Start) * 1.0e6) / double(kIterations);
+	}
+
 	// ---- printing --------------------------------------------------------
 	void EmitSegment(const TCHAR* Name, const FBucketSums& B, double WindowSec)
 	{
@@ -255,6 +321,8 @@ namespace
 			       Name, WindowSec);
 			return;
 		}
+
+		FState& S = Get();
 
 		const double RenderBusy = B.M(B.RenderBusy);
 		const double Setup   = B.M(B.SetupBusy);
@@ -299,11 +367,64 @@ namespace
 		           + B.Sub[int32(EBucket::MarchBase)] + B.Sub[int32(EBucket::MarchEmit)]),
 		       Other, Pct(Other), B.M(B.SveBlocked), WindowSec);
 
+		// ---- THE TAIL ATTRIBUTION, level 2 only -------------------------
+		//
+		// tailMs is where the D4 prior says the parked->moving delta lives: 29
+		// ENQUEUE_RENDER_COMMAND sites that the render thread executes BETWEEN
+		// scene renders, every one of them driven by streaming. These six groups
+		// are what turn "tail is large" into "tail is THIS".
+		if (LatchedMode() >= 2)
+		{
+			const double TailOther = B.M(B.TailOther());
+			const double GroupTotal = B.M(B.TailGroupTotal());
+			const double Hits = B.M(B.TailGroupHits());
+			const double OverheadMs = Hits * S.ScopeCostNs / 1.0e6;
+			auto TailPct = [Tail](double V) { return Tail > 1e-9 ? 100.0 * V / Tail : 0.0; };
+
+			UE_LOG(LogVoxelRenderFrame, Log,
+			       TEXT("Voxel render frame seg=%s TAIL tailMs=%.2f | meshJobMs=%.3f(h=%.1f) ")
+			       TEXT("brickPoolMs=%.3f(h=%.1f) chunkIndexMs=%.3f(h=%.1f) residencyMs=%.3f(h=%.1f) ")
+			       TEXT("poolCompMs=%.3f(h=%.1f) giVolMs=%.3f(h=%.1f) | groupTotalMs=%.2f (%.0f%% of tail) ")
+			       TEXT("tailOtherMs=%.2f (%.0f%% of tail) execOtherMs=%.2f | l2Hits/frame=%.1f ")
+			       TEXT("scopeCostNs=%.1f l2OverheadMs=%.3f (%.1f%% of tail) win=%.2fs"),
+			       Name, Tail,
+			       B.M(B.Sub[int32(EBucket::TailGpuMeshJob)]),    B.M(B.SubHits[int32(EBucket::TailGpuMeshJob)]),
+			       B.M(B.Sub[int32(EBucket::TailBrickPool)]),     B.M(B.SubHits[int32(EBucket::TailBrickPool)]),
+			       B.M(B.Sub[int32(EBucket::TailChunkIndex)]),    B.M(B.SubHits[int32(EBucket::TailChunkIndex)]),
+			       B.M(B.Sub[int32(EBucket::TailResidency)]),     B.M(B.SubHits[int32(EBucket::TailResidency)]),
+			       B.M(B.Sub[int32(EBucket::TailPoolComponent)]), B.M(B.SubHits[int32(EBucket::TailPoolComponent)]),
+			       B.M(B.Sub[int32(EBucket::TailGIVolume)]),      B.M(B.SubHits[int32(EBucket::TailGIVolume)]),
+			       GroupTotal, TailPct(GroupTotal),
+			       TailOther, TailPct(TailOther), B.M(B.ExecuteOther()),
+			       Hits, S.ScopeCostNs, OverheadMs, TailPct(OverheadMs), WindowSec);
+
+			// FAILING READINGS FOR THIS LINE, BOTH WAYS, PER GROUP -- stated in
+			// the line's own text because that is the cheapest defence this
+			// project has found, and because two of these six groups are
+			// EXPECTED to read zero on a stock leg for reasons that have nothing
+			// to do with them being cheap.
+			UE_LOG(LogVoxelRenderFrame, Log,
+			       TEXT("Voxel render frame seg=%s TAIL-READING -- h=0 with ms=0.000 is a DEAD SCOPE ")
+			       TEXT("or a subsystem that did not run, and is NOT the same reading as h>0 with ")
+			       TEXT("ms=0.000, which is a group that RAN AND COST NOTHING. Only the second may be ")
+			       TEXT("reported as cheap. TWO GROUPS ARE EXPECTED TO READ h=0 HERE and neither is a ")
+			       TEXT("defect: chunkIndex, because its only per-frame site is the GPU publish and ")
+			       TEXT("voxel.March.IndexGpuResident is off by default (the leg's own line reads ")
+			       TEXT("'publishes=0'), so the index's real cost is a game-thread QueueBufferUpload ")
+			       TEXT("this bucket cannot see; and poolComp, because it serves the QUAD renderer and ")
+			       TEXT("under voxel.March 1 terrain rides the brick pool instead. A zero from either ")
+			       TEXT("is NOT evidence that the subsystem is free. tailOtherMs is UNCLAMPED and is ")
+			       TEXT("the honest answer to 'do the 29 sites account for tail': if it stays large, ")
+			       TEXT("they do not, and the remainder is Slate, Present, RDG cleanup or a render ")
+			       TEXT("command nobody has instrumented -- it is NOT to be distributed into the ")
+			       TEXT("groups that happen to be measured. win=%.2fs"),
+			       Name, WindowSec);
+		}
+
 		// TRAFFIC BEFORE TIMING. If these do not move between parked and moving
 		// then no timing difference between the two has a mechanism, and any
 		// bucket delta is asking to be explained by something this file cannot
 		// see.
-		FState& S = Get();
 		UE_LOG(LogVoxelRenderFrame, Log,
 		       TEXT("Voxel render frame seg=%s TRAFFIC families/frame=%.2f%s views/frame=%.2f ")
 		       TEXT("marchTiles/frame=%.0f camSpeedMS=%.1f framesTotal=%lld dropped=%lld skippedStartup=%lld ")
@@ -385,6 +506,55 @@ namespace
 		       bD3 ? TEXT("held") : TEXT("disproved"),
 		       bD4 ? TEXT("CONFIRMED") : TEXT("not-confirmed"),
 		       WindowSec);
+
+		// ---- D4's ATTRIBUTION, level 2 only ------------------------------
+		//
+		// D4 says the delta is outside the scene renderer. This line says WHICH
+		// SUBSYSTEM, and it is the number that decides whether the render-thread
+		// ceiling and the chunks/s ceiling are the same problem: every one of
+		// these six groups is streaming work paid on the render thread.
+		//
+		// dTailOther is printed beside them and is NOT clamped. If it carries
+		// most of dTail then the 29 instrumented sites are NOT the mechanism,
+		// and that must be reported as such rather than by naming the largest of
+		// six small groups.
+		if (LatchedMode() >= 2)
+		{
+			const double DGroup = Hi.M(Hi.TailGroupTotal()) - Lo.M(Lo.TailGroupTotal());
+			const double DOtherTail = Hi.M(Hi.TailOther()) - Lo.M(Lo.TailOther());
+			const bool bGroupsExplainIt =
+				FMath::Abs(DTail) > 1e-9 && FMath::Abs(DGroup) > 0.50 * FMath::Abs(DTail);
+
+			UE_LOG(LogVoxelRenderFrame, Log,
+			       TEXT("Voxel render frame DELTA-TAIL tag=%s VERDICT=%s dTailMs=%+.2f ")
+			       TEXT("dGroupTotalMs=%+.2f (%.0f%% of dTail) dTailOtherMs=%+.2f (%.0f%% of dTail) ")
+			       TEXT("| dMeshJobMs=%+.3f dBrickPoolMs=%+.3f dChunkIndexMs=%+.3f dResidencyMs=%+.3f ")
+			       TEXT("dPoolCompMs=%+.3f dGiVolMs=%+.3f | dMeshJobHits=%+.1f dBrickPoolHits=%+.1f ")
+			       TEXT("dResidencyHits=%+.1f dGiVolHits=%+.1f -- HITS ARE THE TRAFFIC COUNTER AND ")
+			       TEXT("THEY COME FIRST: a group whose ms rose while its hit count did not is a group ")
+			       TEXT("whose commands got MORE EXPENSIVE, and a group whose hits rose is one that ran ")
+			       TEXT("MORE OFTEN; those are different fixes. If dTailOther carries most of dTail the ")
+			       TEXT("29 instrumented sites are NOT the mechanism and no group here may be named as ")
+			       TEXT("it. win=%.2fs"),
+			       Tag,
+			       bGroupsExplainIt ? TEXT("STREAMING-RENDER-COMMANDS-EXPLAIN-THE-DELTA")
+			                        : TEXT("GROUPS-DO-NOT-EXPLAIN-DTAIL-SEE-dTailOther"),
+			       DTail, DGroup,
+			       FMath::Abs(DTail) > 1e-9 ? 100.0 * DGroup / DTail : 0.0,
+			       DOtherTail,
+			       FMath::Abs(DTail) > 1e-9 ? 100.0 * DOtherTail / DTail : 0.0,
+			       Hi.M(Hi.Sub[int32(EBucket::TailGpuMeshJob)])    - Lo.M(Lo.Sub[int32(EBucket::TailGpuMeshJob)]),
+			       Hi.M(Hi.Sub[int32(EBucket::TailBrickPool)])     - Lo.M(Lo.Sub[int32(EBucket::TailBrickPool)]),
+			       Hi.M(Hi.Sub[int32(EBucket::TailChunkIndex)])    - Lo.M(Lo.Sub[int32(EBucket::TailChunkIndex)]),
+			       Hi.M(Hi.Sub[int32(EBucket::TailResidency)])     - Lo.M(Lo.Sub[int32(EBucket::TailResidency)]),
+			       Hi.M(Hi.Sub[int32(EBucket::TailPoolComponent)]) - Lo.M(Lo.Sub[int32(EBucket::TailPoolComponent)]),
+			       Hi.M(Hi.Sub[int32(EBucket::TailGIVolume)])      - Lo.M(Lo.Sub[int32(EBucket::TailGIVolume)]),
+			       Hi.M(Hi.SubHits[int32(EBucket::TailGpuMeshJob)]) - Lo.M(Lo.SubHits[int32(EBucket::TailGpuMeshJob)]),
+			       Hi.M(Hi.SubHits[int32(EBucket::TailBrickPool)])  - Lo.M(Lo.SubHits[int32(EBucket::TailBrickPool)]),
+			       Hi.M(Hi.SubHits[int32(EBucket::TailResidency)])  - Lo.M(Lo.SubHits[int32(EBucket::TailResidency)]),
+			       Hi.M(Hi.SubHits[int32(EBucket::TailGIVolume)])   - Lo.M(Lo.SubHits[int32(EBucket::TailGIVolume)]),
+			       WindowSec);
+		}
 	}
 
 	void Flush(double Now)
@@ -482,6 +652,11 @@ namespace
 		for (int32 i = 0; i < int32(EBucket::Num); ++i)
 		{
 			Sample.Sub[i] = S.SubThisFrame[i];
+			Sample.SubHits[i] = S.SubHitsThisFrame[i];
+		}
+		for (int32 i = 0; i < 3; ++i)
+		{
+			Sample.PhaseBusy[i] = S.PhaseBusyThisFrame[i];
 		}
 		Sample.SveBlocked = S.SveBlockedThisFrame;
 		Sample.PeriodWall = PeriodMs;
@@ -530,7 +705,12 @@ namespace
 			Dst.SetupBusy += Sample.SetupBusy;
 			Dst.ExecuteBusy += Sample.ExecuteBusy;
 			Dst.TailBusy += Sample.TailBusy;
-			for (int32 i = 0; i < int32(EBucket::Num); ++i) { Dst.Sub[i] += Sample.Sub[i]; }
+			for (int32 i = 0; i < int32(EBucket::Num); ++i)
+			{
+				Dst.Sub[i] += Sample.Sub[i];
+				Dst.SubHits[i] += Sample.SubHits[i];
+			}
+			for (int32 i = 0; i < 3; ++i) { Dst.PhaseBusy[i] += Sample.PhaseBusy[i]; }
 			Dst.SveBlocked += Sample.SveBlocked;
 			Dst.PeriodWall += Sample.PeriodWall;
 			Dst.RenderBusy += Sample.RenderBusy;
@@ -606,7 +786,12 @@ void Touch(FRDGBuilder& GraphBuilder)
 	S.MarchTilesThisFrame = 0;
 	S.SveBlockedThisFrame = 0.0;
 	S.bHaveViewOriginThisFrame = false;
-	for (int32 i = 0; i < int32(EBucket::Num); ++i) { S.SubThisFrame[i] = 0.0; }
+	for (int32 i = 0; i < int32(EBucket::Num); ++i)
+	{
+		S.SubThisFrame[i] = 0.0;
+		S.SubHitsThisFrame[i] = 0.0;
+	}
+	for (int32 i = 0; i < 3; ++i) { S.PhaseBusyThisFrame[i] = 0.0; }
 
 	if (!S.bStarted)
 	{
@@ -614,15 +799,19 @@ void Touch(FRDGBuilder& GraphBuilder)
 		S.WindowStartSeconds = FPlatformTime::Seconds();
 		S.LastLogSeconds = S.WindowStartSeconds;
 		S.LegStartSeconds = S.WindowStartSeconds;
+		S.ScopeCostNs = CalibrateScopeNs();
 		UE_LOG(LogVoxelRenderFrame, Display,
 		       TEXT("Voxel render frame ARMED (-VoxelRenderFrame=%d, mutate=%d %.2fms, window=%.2fs ")
 		       TEXT("from -VoxelPerfLogInterval, moveThresholdUU=%.0f). Anchors: A=PreRenderViewFamily, ")
 		       TEXT("B=PostRenderViewFamily, E=RDG post-execute. Buckets are BUSY (idle subtracted from ")
 		       TEXT("FThreadIdleStats::Waits + GRenderThreadIdle[GPUQuery]) and reconcile against ")
 		       TEXT("GRenderThreadTime with the delta printed. If no 'Voxel render frame seg=' line ")
-		       TEXT("follows this one, the hooks were applied but no frame ever closed."),
+		       TEXT("follows this one, the hooks were applied but no frame ever closed. ")
+		       TEXT("scopeCostNs=%.1f measured at arm time (level 2 pays this per render command; ")
+		       TEXT("multiply by l2Hits on the TAIL line for the armed overhead, and if that is a ")
+		       TEXT("meaningful share of tailMs the attribution arm is not a control for the D4 arm)."),
 		       LatchedMode(), LatchedMutateArm(), LatchedMutateMs(), LatchedWindowSeconds(),
-		       LatchedMoveThresholdUU());
+		       LatchedMoveThresholdUU(), S.ScopeCostNs);
 	}
 
 	// ANCHOR E. Registered on the graph that is about to be built, so it fires
@@ -696,10 +885,10 @@ void NoteMarchTiles(uint32 Tiles)
 	}
 }
 
-FScope::FScope(EBucket InBucket)
+FScope::FScope(EBucket InBucket, int32 InMinMode)
 	: Bucket(InBucket)
 {
-	if (LatchedMode() == 0 || !IsInRenderingThread())
+	if (LatchedMode() < InMinMode || !IsInRenderingThread())
 	{
 		return;
 	}
@@ -719,9 +908,25 @@ FScope::~FScope()
 	FState& S = Get();
 	if (!S.bFrameOpen)
 	{
+		// A render command that ran with no frame open -- before the first scene
+		// render, or after the last. Counted nowhere rather than banked into an
+		// arbitrary frame; the frame's own residual is what would absorb it, and
+		// absorbing work that did not happen in a frame is how a residual stops
+		// meaning anything.
 		return;
 	}
-	S.SubThisFrame[int32(Bucket)] += (WallMs - IdleMs);
+
+	// WHICH HALF OF THE FRAME THIS CLOSED IN, decided by the anchors that have
+	// already fired rather than by an assumption about where render commands
+	// run. A tail-group scope that ever closed inside the scene renderer would
+	// be booked to setup and would show up as setupOther shrinking -- visible,
+	// rather than silently inflating tail.
+	const int32 Phase = !S.bHaveB ? 0 : (!S.bHaveE ? 1 : 2);
+
+	const double BusyMs = WallMs - IdleMs;
+	S.SubThisFrame[int32(Bucket)] += BusyMs;
+	S.SubHitsThisFrame[int32(Bucket)] += 1.0;
+	S.PhaseBusyThisFrame[Phase] += BusyMs;
 	S.SveBlockedThisFrame += IdleMs;
 }
 

@@ -53,3 +53,20 @@ echo "===    a different population and NEITHER may be quoted until that is"
 echo "===    resolved. Same leg, same segment, same number, or stop. ==="
 grep "Voxel frame phase PIPELINE seg=SETTLED-MOVING-LEG" "$LOG" | tail -1
 grep "Voxel frame phase PIPELINE seg=SETTLED-PARKED-LEG" "$LOG" | tail -1
+
+echo
+echo "=== 7. TAIL ATTRIBUTION (-VoxelRenderFrame=2 only; empty at level 1 is"
+echo "===    CORRECT, not missing). h= is the traffic counter and it comes"
+echo "===    first: h=0 with ms=0.000 is a DEAD SCOPE or a subsystem that did"
+echo "===    not run; h>0 with ms=0.000 is a group that ran and cost nothing."
+echo "===    Only the second may be reported as cheap. ==="
+grep "Voxel render frame seg=SETTLED-MOVING-LEG TAIL " "$LOG" | tail -1
+grep "Voxel render frame seg=SETTLED-PARKED-LEG TAIL " "$LOG" | tail -1
+grep -m1 "TAIL-READING" "$LOG"
+
+echo
+echo "=== 8. WHICH SUBSYSTEM D4 IS. If dTailOther carries most of dTail the 29"
+echo "===    instrumented sites are NOT the mechanism and no group may be named"
+echo "===    as it. Read l2OverheadMs on the TAIL line before quoting a tailMs"
+echo "===    from a level-2 leg against one from a level-1 leg. ==="
+grep "Voxel render frame DELTA-TAIL tag=moving-vs-parked-LEG" "$LOG" | tail -1

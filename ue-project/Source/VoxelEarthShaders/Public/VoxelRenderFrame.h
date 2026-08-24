@@ -229,6 +229,34 @@
 //   every bucket EQUAL between MOVING and PARKED
 //               -> the render thread does not respond to motion anywhere this
 //                  file can see. Say that. Do not pick the largest bucket.
+//   LEVEL 2 ONLY, and the distinction is the whole point of the hit counters:
+//   a group with h=0 and ms=0.000
+//               -> A DEAD SCOPE, or a subsystem that did not run. It is NOT the
+//                  same reading as h>0 with ms=0.000, which is a group that ran
+//                  and cost nothing. Only the second may be reported as cheap.
+//   chunkIndex h=0
+//               -> EXPECTED on a stock leg and not a defect. Its only per-frame
+//                  site is the GPU publish, and voxel.March.IndexGpuResident is
+//                  off by default -- G10-M20's own log reads "publishes=0". The
+//                  index's real per-frame cost is a game-thread
+//                  QueueBufferUpload that this bucket cannot see, so a zero here
+//                  is not evidence the chunk index is free.
+//   poolComp h=0
+//               -> EXPECTED under voxel.March 1. UVoxelGpuPoolComponent serves
+//                  the QUAD renderer; marched terrain rides the brick pool. Same
+//                  rule: not evidence it is free, evidence it is not in use.
+//   tailOtherMs stays large
+//               -> THE 29 INSTRUMENTED SITES DO NOT ACCOUNT FOR tail. The
+//                  remainder is Slate, Present, RDG cleanup, or a render command
+//                  nobody has instrumented. It is reported as unattributed and
+//                  is NOT to be distributed into the groups that happen to be
+//                  measured. The field is unclamped for exactly this reason.
+//   l2OverheadMs a meaningful share of tailMs
+//               -> the attribution arm is not a control for the D4 arm. That is
+//                  why they are separate switch levels: run -VoxelRenderFrame=1
+//                  for the D4 answer and =2 for the attribution, and never quote
+//                  a tailMs from the =2 leg against a tailMs from the =1 leg
+//                  without subtracting this.
 //   shadow=0.00
 //               -> CORRECT AND EXPECTED on a stock leg. voxel.Shadow.March
 //                  defaults 0 and the extension declines IsActiveThisFrame, so
@@ -258,6 +286,23 @@ namespace VoxelRenderFrame
 // O(1) per FRAME, not per chunk, and it is stated rather than assumed.
 //
 //   1  the render-frame split (this file's whole purpose)
+//   2  1, PLUS TAIL ATTRIBUTION: the 29 ENQUEUE_RENDER_COMMAND sites that run
+//      on the render thread outside the scene renderer, grouped by subsystem.
+//
+// SEPARABLE ON PURPOSE. The leg that answers D4 (is the parked->moving delta in
+// tail at all?) and the leg that attributes tail are different legs. Level 1
+// adds SIX scopes per frame; level 2 adds one per render command, and the
+// render-command population is exactly what is under suspicion. If arming the
+// attribution cost anything, folding it into the D4 answer would put the
+// instrument inside its own measurement -- which is the -VoxelFineLockMeter
+// mistake, and that one cost 5% of a cold start.
+//
+// WHAT LEVEL 2 COSTS, MEASURED RATHER THAN ASSERTED. The file calibrates its own
+// scope at arm time (empty open/close pairs) and prints scopeCostNs, then prints
+// l2Hits/frame and l2OverheadMs/frame = hits x scopeCostNs on every TAIL line.
+// So the overhead is a printed number with its own absolute, not a claim -- and
+// the TAIL line says so in its own text when it is a meaningful share of tailMs
+// instead of leaving a reader to work it out.
 VOXELEARTHSHADERS_API int32 Mode();
 
 // Which named bucket a scope belongs to. Order is the print order.
@@ -269,8 +314,30 @@ enum class EBucket : uint8
 	MarchEmit,         // marcher PostRenderBasePassDeferred_RenderThread
 	Fluid,             // fluid render extension hooks
 	Shadow,            // shadow marcher hooks
+
+	// ---- LEVEL 2 ONLY: the tail groups -------------------------------------
+	//
+	// These do NOT run inside the scene renderer. They are ENQUEUE_RENDER_COMMAND
+	// bodies, which the render thread executes between scene renders -- i.e. in
+	// the tail bucket -- and every one of them is driven by streaming. That is
+	// the D4 mechanism, and these six buckets are what turn "tail is large" into
+	// "tail is THIS".
+	//
+	// Grouped by owning file rather than per command, because the routing of a
+	// fix is per file and because 29 separate buckets would be a log line nobody
+	// reads. Per-command detail stays recoverable from the hit counters.
+	TailGpuMeshJob,    // VoxelGpuMeshJobManager.cpp   7 sites
+	TailBrickPool,     // VoxelBrickPool.cpp           4 sites
+	TailChunkIndex,    // VoxelMarchChunkIndex.cpp     2 sites
+	TailResidency,     // VoxelResidencyGpu.cpp        3 sites
+	TailPoolComponent, // VoxelGpuPoolComponent.cpp    5 sites
+	TailGIVolume,      // VoxelGI.cpp                  8 sites
 	Num
 };
+
+// The first tail-group bucket, so the printer can tell the two halves apart
+// without a second table that could drift out of step with the enum.
+inline constexpr EBucket kFirstTailBucket = EBucket::TailGpuMeshJob;
 
 // ANCHOR A. Called from the FIRST render-thread extension hook of the frame,
 // by every extension this workstream owns. The first call of a given
@@ -295,7 +362,10 @@ VOXELEARTHSHADERS_API void NoteMarchTiles(uint32 Tiles);
 // separately into sveBlocked rather than being silently folded into busy.
 struct VOXELEARTHSHADERS_API FScope
 {
-	explicit FScope(EBucket InBucket);
+	// InMinMode gates the scope: 1 for the scene-renderer scopes, 2 for the tail
+	// groups. A scope below the current mode costs one compare on a latched int
+	// and never reads a clock.
+	explicit FScope(EBucket InBucket, int32 InMinMode = 1);
 	~FScope();
 
 	FScope(const FScope&) = delete;
@@ -331,3 +401,14 @@ VOXELEARTHSHADERS_API int32 MutateArm();
 #define VOXEL_RENDER_FRAME_SCOPE(BucketName) \
 	VoxelRenderFrame::FScope PREPROCESSOR_JOIN(VoxelRenderFrameScope_, __LINE__)( \
 		VoxelRenderFrame::EBucket::BucketName)
+
+// THE TAIL-GROUP SCOPE. One line, first line of an ENQUEUE_RENDER_COMMAND
+// lambda body, nothing else changing. Arms only at -VoxelRenderFrame=2.
+//
+// It is safe anywhere on the render thread: the scope banks into whichever of
+// setup / execute / tail the frame is in WHEN IT CLOSES, so a command that ever
+// ran inside the scene renderer would be booked to the right half rather than
+// silently inflating tail. Nothing has to assume where these run.
+#define VOXEL_RENDER_FRAME_SCOPE_TAIL(BucketName) \
+	VoxelRenderFrame::FScope PREPROCESSOR_JOIN(VoxelRenderFrameTailScope_, __LINE__)( \
+		VoxelRenderFrame::EBucket::BucketName, 2)

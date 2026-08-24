@@ -181,10 +181,107 @@ resolution, and a matched pair must not straddle one.
   with streaming, and streaming is what motion causes. **That is the prior for
   D4, and it is stated before the measurement rather than after it.**
 
-## The hooks this lane does not own
+## Level 2: tail attribution, built before the leg
 
-If the leg confirms D4, attributing `tail` further needs one
-`VOXEL_RENDER_FRAME_SCOPE` inside the lambda of each `ENQUEUE_RENDER_COMMAND`
-listed above, in files owned by other agents. That is a one-line change per
-site and needs a new `EBucket` per group. Nothing else in this instrument
-changes.
+`-VoxelRenderFrame=2` = level 1 **plus** a scope on every
+`ENQUEUE_RENDER_COMMAND` body that runs on the render thread outside the scene
+renderer, grouped by owning file. Six new buckets: `TailGpuMeshJob`,
+`TailBrickPool`, `TailChunkIndex`, `TailResidency`, `TailPoolComponent`,
+`TailGIVolume`.
+
+**Separable from the D4 answer on purpose.** Level 1 adds six scopes per frame;
+level 2 adds one per render command, and the render-command population is
+exactly what is under suspicion. Folding the attribution into the D4 leg would
+put the instrument inside its own measurement — the `-VoxelFineLockMeter`
+mistake, which cost 5% of a cold start.
+
+### Count correction: 29 sites, not 32
+
+The 32 came from `grep -c "ENQUEUE_RENDER_COMMAND"`, which counts comment
+mentions. Three of the 32 are prose:
+`VoxelGpuMeshJobManager.cpp:1513`, `VoxelMarchChunkIndex.cpp:1376`,
+`VoxelGI.cpp:420`. Real call sites: 7 / 4 / 2 / 3 / 5 / 8 = **29**.
+
+### Scopes are phase-aware, so nothing has to assume where these run
+
+Each scope banks into whichever of setup / execute / tail the frame is in **when
+it closes**, decided by which anchors have already fired. A render command that
+ever ran inside the scene renderer is booked to setup — visible as `setupOther`
+shrinking — rather than silently inflating tail.
+
+That gives **three** unclamped residuals, not one:
+
+    setupOther   = setupBusy   - (busy measured in the setup phase)
+    executeOther = executeBusy - (busy measured in the execute phase)
+    tailOther    = tailBusy    - (busy measured in the tail phase)
+
+`tailOther` is the honest answer to *do the 29 sites account for `tail`?* If it
+stays large they do not, the remainder is Slate / Present / RDG cleanup / an
+uninstrumented render command, and it is reported as unattributed rather than
+distributed into whatever happens to be measured.
+
+### Hit counters, and why they come first
+
+Every group carries `h=` alongside its ms. **`h=0` with `ms=0.000` is a dead
+scope or a subsystem that did not run; `h>0` with `ms=0.000` is a group that ran
+and cost nothing. Only the second may be reported as cheap.** The `DELTA-TAIL`
+line prints hit deltas beside ms deltas for the same reason: a group whose ms
+rose while its hits did not got *more expensive per command*; a group whose hits
+rose ran *more often*. Different fixes.
+
+**Two groups are expected to read `h=0` on a stock leg, and neither is a defect
+— both are stated inline in the log text:**
+
+- **`chunkIndex`** — its only per-frame site is the GPU publish, and
+  `voxel.March.IndexGpuResident` is off by default. `G10-M20`'s own log reads
+  `publishes=0`. The index's real per-frame cost is a **game-thread**
+  `QueueBufferUpload` this bucket cannot see. A zero here is not evidence the
+  chunk index is free.
+- **`poolComp`** — `UVoxelGpuPoolComponent` serves the **quad** renderer; under
+  `voxel.March 1` terrain rides the brick pool. Not evidence it is free;
+  evidence it is not in use.
+
+### What level 2 costs, measured rather than asserted
+
+The file calibrates its own scope at arm time — 4,096 raw open/close pairs (two
+`Cycles64` reads, two idle samples: a TLS lookup plus a global load each) — and
+prints `scopeCostNs` on the ARMED line. Every `TAIL` line then prints
+`l2Hits/frame`, `scopeCostNs`, and `l2OverheadMs = hits x scopeCostNs` **with
+its share of `tailMs` beside it**. The calibration loop deliberately uses the
+raw operations rather than real `FScope` objects: constructing 4,096 real scopes
+would bank 4,096 hits into the first frame's buckets, and an instrument whose
+calibration shows up in its own first window is the failure this file exists to
+avoid.
+
+**If `l2OverheadMs` is a meaningful share of `tailMs`, the level-2 leg is not a
+control for the level-1 leg** and the two `tailMs` figures may not be quoted
+against each other without subtracting it. That is why they are separate levels.
+
+## Two standing cautions carried into this lane
+
+**The 9.23 / 18.60 ms baseline is from the ARMED configuration.** `G10-M20` ran
+`-VoxelGpuPrimary=1 -VoxelGpuPoolAlloc=1 -VoxelGpuWorldGenBatch=1
+-VoxelGpuStackClaim=1 -VoxelGpuRasterAtlas=1`. The owner's editor arms none of
+them — his stock cold start measures 45.5 s / 3,618 per s against our armed
+legs' 18.1 s / 9,125. **Nobody may quote 9.23 / 18.60 as the owner's
+experience**, and once the validated default set lands this baseline needs
+re-taking against stock. Both legs in the leg list above are armed legs and are
+labelled as such.
+
+**A percentage without its absolute is not a measurement**, and adding 29 more
+scopes is where that rule gets tested. Tonight an agent measured a lock at
+`waitShare=99%`, fixed it perfectly, and got −0.8%, because the wait was spread
+over 36 threads and never became wall time. Every group in the `TAIL` line
+prints ms beside its share, every share names the quantity it is a share *of*
+(`% of tail`), and the render thread is a **single thread** — so its milliseconds
+are wall time and are directly comparable to the frame. No worker-pool aggregate
+appears anywhere in this file.
+
+## The 29 call sites — routing
+
+Enum entries and the `VOXEL_RENDER_FRAME_SCOPE_TAIL` macro are in this branch.
+The 29 call-site lines are one line each, first line of the lambda body, nothing
+else changing; they are listed in the agent report grouped by owning file.
+**Anchor on the `ENQUEUE_RENDER_COMMAND(<Name>)` macro name, not the line
+number** — three of the six files are being edited by other agents right now and
+line numbers will drift.
