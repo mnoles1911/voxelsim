@@ -1,6 +1,8 @@
 #include "VoxelFineTileStreamer.h"
 
 #include "VoxelEarth.h"      // LogVoxelEarth
+#include "VoxelFineLockMeter.h" // FLockScope -- the instrument on Lock_, and the two switches
+#include "VoxelDebug.h"    // LogVoxelPerf -- the probe line rides the perf category
 #include "VoxelTileCodec.h"  // VoxelEarth::GetFineTileDecompressor -- CODEC_ZSTD host boundary
 #include "Misc/Paths.h"      // FPaths::Combine
 
@@ -118,7 +120,7 @@ int32_t FVoxelFineTileSamplerProxy::elevationMm(int64_t px, int64_t py)
 	// FVoxelFineTileStreamer::CoveredTiles.
 	const vxc::TileCoord Tile = vxc::tileCoordForPixel(px, py, int64(vxc::kFineTileSize));
 	{
-		FRWScopeLock Lock(Owner.Lock_, SLT_ReadOnly);
+		VoxelFineLock::FLockScope Lock(Owner.Lock_, SLT_ReadOnly, VoxelFineLock::ESite::ElevShared);
 		// Whole-tile decode at load makes residency a per-TILE fact, so this one
 		// lookup is the complete check.
 		if (Owner.Sampler_.findTile(Tile.x, Tile.y) != nullptr)
@@ -135,7 +137,7 @@ vxc::ClimateSample FVoxelFineTileSamplerProxy::climate(int64_t px, int64_t py)
 {
 	// The delegate (the coarse vxc::TileGridSampler) is itself read-only after
 	// init, but it is reached THROUGH Sampler_, so it takes the same lock.
-	FRWScopeLock Lock(Owner.Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Owner.Lock_, SLT_ReadOnly, VoxelFineLock::ESite::ClimateShared);
 	return Owner.Sampler_.climate(px, py);
 }
 
@@ -159,7 +161,38 @@ FVoxelFineTileStreamer::FVoxelFineTileStreamer(FString RootDir, FString Provider
 	// (FineError::kNoDecompressor), which is the intended loud failure.
 	Sampler_.setDecompressor(VoxelEarth::GetFineTileDecompressor());
 
-	// SELF-CHECK: THE GATE REFUSES WHEN NOTHING IS RESIDENT.
+	// LATCH BOTH SWITCHES HERE, ON THE GAME THREAD, AND BEFORE THE GATE
+	// SELF-CHECK BELOW USES THEM. They are function-local statics inside
+	// VoxelFineLockMeter.h, and a worker's first elevationMm would otherwise be
+	// the thread that initialises them -- which puts FCommandLine::Get() and a
+	// static guard variable on the hottest read in the process. Reading them
+	// once here makes every later read a plain load.
+	const int32 MeterModeNow = VoxelFineLock::MeterMode();
+	const int32 FastModeNow = VoxelFineLock::FastMode();
+	LastProbeLogSeconds_ = FPlatformTime::Seconds();
+
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Fine lock: fast=%d (%s) meter=%d (%s). Fast modes: 0=exclusive always (today), ")
+	       TEXT("1=shared when already resident, 2=+lock-free game-thread mirror, 3=+mirror audit. ")
+	       TEXT("Meter modes: 0=off, 1=traffic, 2=traffic+timing except the per-pixel reads (the mode to ")
+	       TEXT("measure with), 3=timing everywhere (depresses throughput; never quote chunks/s from it)."),
+	       FastModeNow,
+	       FastModeNow == 0 ? TEXT("RequestFootprint takes Lock_ EXCLUSIVELY on every call")
+	                        : TEXT("RequestFootprint escalates to exclusive only when a tile must be loaded"),
+	       MeterModeNow,
+	       MeterModeNow == 0   ? TEXT("no counters, no timing -- lock paths byte-identical")
+	       : MeterModeNow == 1 ? TEXT("acquisition counts only")
+	       : MeterModeNow == 2 ? TEXT("counts everywhere + wait/hold except on the per-pixel reads")
+	                           : TEXT("counts + wait/hold EVERYWHERE, per-pixel reads included"));
+
+	// SELF-CHECK 1: THE ALLOCATION-FREE COVERAGE AGREES WITH voxel-core'S.
+	// Runs BEFORE the gate self-check below, because with -VoxelFineLockFast>0
+	// that check now goes through the fast path -- so the fast path's own
+	// coverage has to be established first, or a wrong range would be validated
+	// by a gate that a wrong range had already broken.
+	SelfCheckTileRangeAgreesWithCoverage_();
+
+	// SELF-CHECK 2: THE GATE REFUSES WHEN NOTHING IS RESIDENT.
 	//
 	// Nothing has been loaded yet, so IsFootprintResident MUST be false for any
 	// footprint at all. That sounds too trivial to assert -- and it is precisely
@@ -191,6 +224,7 @@ FVoxelFineTileStreamer::FVoxelFineTileStreamer(FString RootDir, FString Provider
 		       TEXT("start rather than produce it."),
 		       bRefusesOrigin ? 1 : 0, bRefusesNegative ? 1 : 0);
 	}
+
 }
 
 FString FVoxelFineTileStreamer::LocalPathFor(vxc::TileCoord Tile) const
@@ -555,6 +589,14 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 			TEXT("does not."),
 			/*bTransient=*/false);
 	}
+	// THE MIRROR, WRITE 1 OF 3. Kept literally beside the loadTile it mirrors
+	// so the two cannot be edited apart -- the whole safety argument for the
+	// lock-free read (see ResidentTiles_ in the header) is that this set says
+	// exactly what FineTileSampler::findTile says. Placed here rather than
+	// after the prewarm below so that the mirror and findTile agree at EVERY
+	// point, including the few milliseconds the decode takes.
+	NoteMirrorWriteThread_();
+	ResidentTiles_.insert(TileHash(Tile));
 
 	// RULE 1 (see the header's threading note): decode the WHOLE tile now, on
 	// this thread, under the exclusive lock. After this the tile's block map is
@@ -571,6 +613,8 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	{
 		++CorruptLoads_;
 		Sampler_.unloadTile(Tile.x, Tile.y);
+		NoteMirrorWriteThread_();
+		ResidentTiles_.erase(TileHash(Tile)); // THE MIRROR, WRITE 2 OF 3
 		return RecordLoadFailure_Locked(
 			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("decode"),
 			FString::Printf(
@@ -699,13 +743,275 @@ vxc::BathyRectStats FVoxelFineTileStreamer::ReadBathyRect(int64 Px0, int64 Py0, 
 	// SHARED, not exclusive -- see the header. sampleBathyRect decodes into the
 	// caller's buffers and touches no state inside Sampler_, so this is a read in
 	// the same sense IsFootprintResident is, just a much longer one.
-	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::BathyShared);
 	return vxc::sampleBathyRect(Sampler_, Px0, Py0, Px1, Py1, DepthOut, ShoreOut, RowStrideElems);
+}
+
+// ---------------------------------------------------------------------------
+// THE LOCK FAST PATH (-VoxelFineLockFast) AND ITS SAFETY ARGUMENT
+//
+// THE MEASUREMENT THIS EXISTS FOR. GetSurfaceHeightUU is the most expensive
+// per-chunk call in the pipeline -- four per chunk at two hot sites -- and each
+// one calls RequestFootprint, which took Lock_ EXCLUSIVELY on every call
+// whether or not there was anything to load. Meanwhile the meshing pool reads
+// terrain through FVoxelFineTileSamplerProxy::elevationMm, which takes the SAME
+// lock SHARED once per sampled pixel from up to 36 threads. So each of those
+// prefetches was a full barrier across the worker pool: it had to wait for
+// every in-flight reader to drain, and every reader arriving behind it queued.
+// At the 14,099 chunks/s peak that is 56,000-112,000 barriers a second.
+//
+// That is the mechanism the 12-20x degradation under load points at -- 9-15 us
+// per call uncontended, up to 183 us contended, the degradation arriving
+// exactly when throughput rises, which is what a serialization point does and
+// is not what work does.
+//
+// THE DISPROOF CONDITION, REGISTERED BEFORE THE MEASUREMENT:
+//   If -VoxelFineLockMeter=2 shows the EXCLUSIVE sites' WAIT time is a small
+//   share of their total (under ~1 us per TIMED acquire at peak throughput),
+//   then the lock
+//   was never the term, the 183 us is vxc::Amplifier::column doing work, and
+//   this change must be reverted rather than tuned. `excl wait us/acq` in the
+//   probe line is that number, and it can come out either way -- which is the
+//   only reason it is worth printing.
+//
+// WHAT THE FIX DOES. Nothing about the exclusive path changes. What changes is
+// that the exclusive path is only ENTERED when a tile actually has to be
+// loaded. In the steady state every covered tile is already resident, so
+// today's exclusive section was a pure read that happened to be holding a
+// writer lock.
+//
+//   mode 0  today: SLT_Write, unconditionally. Byte-identical.
+//   mode 1  check residency under SLT_ReadOnly first; escalate only on a miss.
+//   mode 2  on the GAME THREAD, check the ResidentTiles_ mirror with NO lock at
+//           all; escalate only on a miss. (See ResidentTiles_ in the header for
+//           why a lock-free read is sound: the single writer and the reader are
+//           the same thread.)
+//   mode 3  mode 2 plus an audit -- every mirror answer is cross-checked
+//           against FineTileSampler::findTile under the shared lock, and the
+//           SAMPLER'S answer is the one returned. Disagreement is an Error and
+//           a counter, never a silent correction.
+//
+// WHY EACH READ IS SAFE, stated per mode because a torn or stale read here does
+// not crash, it silently produces terrain no other client reproduces:
+//
+//   mode 1's read is the SAME read IsFootprintResident already performs, under
+//   the same shared lock, which is sound by the header's threading rule 2: the
+//   tile map is only ever mutated under the lock held exclusively, so no rehash
+//   can be in flight while a shared holder is inside findTile. Nothing here can
+//   observe a half-inserted tile.
+//
+//   Returning true without loading is exactly what mode 0 does in the same
+//   case: EnsureTileResident_Locked's first statement is "if (findTile != null)
+//   return true", and it mutates nothing on that path. So mode 1 changes the
+//   lock mode of a section that was already a pure read, and nothing else.
+//
+//   Eviction cannot race the answer. Evictions take the lock exclusively, so
+//   nothing can be unloaded while the shared check holds it. The window between
+//   returning true and the caller voxelizing is not new -- mode 0 released the
+//   lock before returning too. This changes the lock mode, not the lifetime of
+//   the answer.
+//
+//   mode 2's read is lock-free and it is safe by thread identity rather than by
+//   ordering: the mirror's only writers sit beside the three
+//   loadTile/unloadTile calls, all under the exclusive lock AND all on the game
+//   thread, and the lock-free read only happens inside IsInGameThread(). A
+//   stale TRUE -- the dangerous direction -- is therefore impossible; a stale
+//   FALSE falls through to mode 1's shared check and then to the exclusive
+//   load, i.e. to mode 0's behaviour.
+// ---------------------------------------------------------------------------
+
+FVoxelFineTileStreamer::FTileRange FVoxelFineTileStreamer::CoveredTileRange(int64 WorldMmX0, int64 WorldMmY0,
+                                                                           int64 WorldMmX1, int64 WorldMmY1)
+{
+	// THE SAME TWO voxel-core CALLS, IN THE SAME ORDER, THAT
+	// vxc::tilesCoveringFootprint MAKES INTERNALLY -- fineReadPixelRect, which
+	// is the single authority on the cavern read margin and the carrier
+	// stencil, then tileCoordForPixel on the two corners. No dilation is
+	// computed here and none may ever be: a second arithmetic for the read
+	// reach is exactly how the gate and the GPU raster window came to disagree
+	// once already. The constructor's SelfCheckTileRangeAgreesWithCoverage_
+	// asserts the agreement rather than trusting this comment.
+	const vxc::PixelRect Rect = vxc::fineReadPixelRect(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1, kFineReadMarginMm);
+	if (Rect.px1 < Rect.px0 || Rect.py1 < Rect.py0)
+	{
+		return FTileRange{}; // degenerate: bValid stays false, and false means REFUSE
+	}
+	const vxc::TileCoord Lo = vxc::tileCoordForPixel(Rect.px0, Rect.py0, int64(vxc::kFineTileSize));
+	const vxc::TileCoord Hi = vxc::tileCoordForPixel(Rect.px1, Rect.py1, int64(vxc::kFineTileSize));
+	FTileRange Out;
+	Out.X0 = Lo.x;
+	Out.Y0 = Lo.y;
+	Out.X1 = Hi.x;
+	Out.Y1 = Hi.y;
+	Out.bValid = true;
+	return Out;
+}
+
+void FVoxelFineTileStreamer::SelfCheckTileRangeAgreesWithCoverage_()
+{
+	// A GATE THAT CAN BE SEEN FAILING. To watch this go red, delete
+	// kFineReadMarginMm from CoveredTileRange's fineReadPixelRect call (pass 0):
+	// the third case below sits one millimetre further inside the tile than the
+	// cavern read margin reaches, so WITH the margin it covers two tiles in X
+	// and WITHOUT it one, and this refuses to start. That is the exact defect
+	// class this check exists for -- an under-dilated gate does not fault, it
+	// admits chunks whose cavern reads land in a non-resident tile and come
+	// back as sea level.
+	struct FCase
+	{
+		int64 X0, Y0, X1, Y1;
+		const TCHAR* Why;
+	};
+	const int64 T = kTileFootprintMm;
+	const FCase Cases[] = {
+		{0, 0, 1, 1, TEXT("the origin, and the 1 mm point footprint GetSurfaceHeightUU passes")},
+		{-1000000000, -1000000000, -999999999, -999999999,
+		 TEXT("far negative -- floorDiv and truncation differ ONLY on this side, and the leaking capture ")
+		 TEXT("spawned at negative X")},
+		{T - kFineReadMarginMm - 1000, 0, T - kFineReadMarginMm - 999, 1,
+		 TEXT("one millimetre further inside the +X tile boundary than the cavern read margin reaches, so ")
+		 TEXT("this case covers two tiles in X WITH the margin and one WITHOUT it -- it is the case that ")
+		 TEXT("goes red if the margin is ever dropped from CoveredTileRange")},
+		{-1, -1, 1, 1, TEXT("straddling the tile corner at the world origin")},
+		{0, 0, T * 3, T * 2, TEXT("a multi-tile rect: the COUNT, not just the corners")},
+		{-T * 2, T, -T, T * 3, TEXT("a multi-tile rect in the -X/+Y quadrant")},
+	};
+
+	for (const FCase& Case : Cases)
+	{
+		const std::vector<vxc::TileCoord> Truth = CoveredTiles(Case.X0, Case.Y0, Case.X1, Case.Y1);
+		const FTileRange Range = CoveredTileRange(Case.X0, Case.Y0, Case.X1, Case.Y1);
+
+		bool bAgree = (Range.bValid == !Truth.empty()) && (Range.Count() == int64(Truth.size()));
+		if (bAgree)
+		{
+			for (const vxc::TileCoord& Tile : Truth)
+			{
+				if (Tile.x < Range.X0 || Tile.x > Range.X1 || Tile.y < Range.Y0 || Tile.y > Range.Y1)
+				{
+					bAgree = false;
+					break;
+				}
+			}
+		}
+		if (!bAgree)
+		{
+			UE_LOG(LogVoxelEarth, Fatal,
+			       TEXT("FINE LOCK FAST PATH IS UNSOUND: the allocation-free tile range disagrees with ")
+			       TEXT("vxc::tilesCoveringFootprint on the case '%s'. Rect mm [%lld,%lld)-[%lld,%lld): voxel-core ")
+			       TEXT("covers %d tile(s), the range covers %lld (x %d..%d, y %d..%d, valid=%d). The fast path ")
+			       TEXT("would gate on a DIFFERENT footprint than the gate does, which admits chunks over ")
+			       TEXT("non-resident tiles and produces terrain no other client reproduces. Refusing to start."),
+			       Case.Why, (long long)Case.X0, (long long)Case.Y0, (long long)Case.X1, (long long)Case.Y1,
+			       int32(Truth.size()), (long long)Range.Count(), Range.X0, Range.X1, Range.Y0, Range.Y1,
+			       Range.bValid ? 1 : 0);
+		}
+	}
+}
+
+bool FVoxelFineTileStreamer::RangeResidentInMirror_(const FTileRange& Range) const
+{
+	// NO LOCK, GAME THREAD ONLY. See ResidentTiles_ in the header: the single
+	// writer and this reader are the same thread, so there is nothing to order
+	// and nothing to be stale about. Callers must have tested IsInGameThread().
+	if (!Range.bValid)
+	{
+		return false;
+	}
+	for (int32 Ty = Range.Y0; Ty <= Range.Y1; ++Ty)
+	{
+		for (int32 Tx = Range.X0; Tx <= Range.X1; ++Tx)
+		{
+			if (ResidentTiles_.find(TileHash(vxc::TileCoord{Tx, Ty})) == ResidentTiles_.end())
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool FVoxelFineTileStreamer::RangeResidentInSampler_Locked(const FTileRange& Range) const
+{
+	if (!Range.bValid)
+	{
+		return false;
+	}
+	for (int32 Ty = Range.Y0; Ty <= Range.Y1; ++Ty)
+	{
+		for (int32 Tx = Range.X0; Tx <= Range.X1; ++Tx)
+		{
+			if (Sampler_.findTile(Tx, Ty) == nullptr)
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool FVoxelFineTileStreamer::AuditMirrorAgainstSampler_Locked(const FTileRange& Range,
+                                                              bool bMirrorSaid) const
+{
+	// THE SAMPLER IS THE TRUTH AND IT IS WHAT IS RETURNED. The audit never lets
+	// the mirror decide, so a mode-3 run is safe even if the mirror is wrong --
+	// which is the only kind of audit worth running on a path whose failure mode
+	// is silent wrong terrain rather than a fault.
+	const bool bTruth = RangeResidentInSampler_Locked(Range);
+	MirrorAudits_.fetch_add(1, std::memory_order_relaxed);
+	if (bMirrorSaid != bTruth)
+	{
+		const uint64 Count = MirrorMismatches_.fetch_add(1, std::memory_order_relaxed) + 1;
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("FINE LOCK MIRROR DRIFT: the lock-free residency mirror said %s for tile range x %d..%d ")
+		       TEXT("y %d..%d and FineTileSampler says %s. Mismatches=%llu of %llu audited. The mirror is ")
+		       TEXT("maintained at the three loadTile/unloadTile sites; a drift means one of them was edited ")
+		       TEXT("apart from its tile mutation. -VoxelFineLockFast=2 would have TRUSTED this answer, so ")
+		       TEXT("treat any nonzero count as a correctness fault, not a tuning observation."),
+		       bMirrorSaid ? TEXT("RESIDENT") : TEXT("NOT resident"), Range.X0, Range.X1, Range.Y0, Range.Y1,
+		       bTruth ? TEXT("RESIDENT") : TEXT("NOT resident"), (unsigned long long)Count,
+		       (unsigned long long)MirrorAudits_.load(std::memory_order_relaxed));
+	}
+	return bTruth;
 }
 
 bool FVoxelFineTileStreamer::IsFootprintResident(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1,
                                                  int64 WorldMmY1) const
 {
+	// THE ALLOCATION IS THE POINT OF THE FAST PATH HERE, not the lock: this is
+	// already a shared read. It is called once per admission CANDIDATE by the
+	// recompute sweep, which is the largest single game-thread item in the perf
+	// log (300-555 ms/window), and every call heap-allocates a std::vector to
+	// enumerate what is almost always ONE tile. The range covers the same tiles
+	// -- the constructor checks that against voxel-core -- with no allocation.
+	const int32 FastHere = VoxelFineLock::FastMode();
+	if (FastHere > 0)
+	{
+		const FTileRange Range = CoveredTileRange(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1);
+		if (!Range.bValid)
+		{
+			return false; // "covers nothing" must never read as "all resident"
+		}
+		// Mode 2+: the game thread does not need the lock at all. This is the
+		// one place a FALSE answer from the mirror is final rather than a
+		// fall-through -- and a false FALSE is impossible for the same
+		// thread-identity reason a false TRUE is (see ResidentTiles_ in the
+		// header), so the admission gate becomes neither more permissive nor
+		// more conservative.
+		if (FastHere >= 2 && IsInGameThread())
+		{
+			const bool bMirror = RangeResidentInMirror_(Range);
+			if (FastHere < 3)
+			{
+				return bMirror;
+			}
+			VoxelFineLock::FLockScope AuditLock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::FootprintShared);
+			return AuditMirrorAgainstSampler_Locked(Range, bMirror);
+		}
+		VoxelFineLock::FLockScope FastLock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::FootprintShared);
+		return RangeResidentInSampler_Locked(Range);
+	}
+
 	const std::vector<vxc::TileCoord> Tiles = CoveredTiles(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1);
 	if (Tiles.empty())
 	{
@@ -715,7 +1021,7 @@ bool FVoxelFineTileStreamer::IsFootprintResident(int64 WorldMmX0, int64 WorldMmY
 		return false;
 	}
 
-	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::FootprintShared);
 	// Whole-tile decode at load makes residency a per-TILE fact, so this is the
 	// complete check -- no block walk, no decode, no I/O.
 	for (const vxc::TileCoord& T : Tiles)
@@ -730,13 +1036,58 @@ bool FVoxelFineTileStreamer::IsFootprintResident(int64 WorldMmX0, int64 WorldMmY
 
 bool FVoxelFineTileStreamer::RequestFootprint(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1, int64 WorldMmY1)
 {
+	// TRAFFIC BEFORE TIMING, and unconditionally: one increment per CALL (not
+	// per pixel) on the game thread. Without it the fast path's share is
+	// unknowable, and "the fast path never ran" and "the fast path never caught
+	// anything" would read identically as an absent line.
+	ReqCalls_.fetch_add(1, std::memory_order_relaxed);
+
+	const int32 Fast = VoxelFineLock::FastMode();
+	if (Fast > 0)
+	{
+		const FTileRange Range = CoveredTileRange(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1);
+		if (!Range.bValid)
+		{
+			return false; // see IsFootprintResident: decline, never admit
+		}
+		const bool bUseMirror = (Fast >= 2) && IsInGameThread();
+		if (bUseMirror && Fast < 3)
+		{
+			// NO LOCK ACQUIRED AT ALL. This removes the term rather than
+			// reducing the constant: in the steady state every tile is already
+			// resident, so the exclusive barrier this call used to raise across
+			// the worker pool 4-8 times per chunk simply does not happen.
+			if (RangeResidentInMirror_(Range))
+			{
+				ReqFastFree_.fetch_add(1, std::memory_order_relaxed);
+				return true;
+			}
+		}
+		else
+		{
+			const bool bMirrorSaid = bUseMirror ? RangeResidentInMirror_(Range) : false;
+			VoxelFineLock::FLockScope FastLock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::ReqShared);
+			const bool bResident = (bUseMirror && Fast >= 3)
+			                           ? AuditMirrorAgainstSampler_Locked(Range, bMirrorSaid)
+			                           : RangeResidentInSampler_Locked(Range);
+			if (bResident)
+			{
+				ReqFastShared_.fetch_add(1, std::memory_order_relaxed);
+				return true;
+			}
+		}
+		// Fall through: something really is missing, so the exclusive load path
+		// below is the RIGHT place to be, and it is unchanged.
+	}
+
 	const std::vector<vxc::TileCoord> Tiles = CoveredTiles(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1);
 	if (Tiles.empty())
 	{
 		return false; // see IsFootprintResident: decline, never admit
 	}
 
-	FRWScopeLock Lock(Lock_, SLT_Write);
+	ReqEscalated_.fetch_add(1, std::memory_order_relaxed);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::ReqExcl);
 	bool bAllResident = true;
 	for (const vxc::TileCoord& T : Tiles)
 	{
@@ -776,7 +1127,7 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 	// correct answer instead of sea level, without a gate call of its own.
 	if (IsInGameThread())
 	{
-		FRWScopeLock Lock(Lock_, SLT_Write);
+		VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::ColdGameExcl);
 		// Re-check under the exclusive lock: another game-thread call earlier in
 		// this frame, or TickResidencyAndEviction, may have loaded it since the
 		// shared-lock miss above.
@@ -822,7 +1173,7 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 	// NOT loaded here: a worker taking this lock exclusively for a 200 MB read
 	// serialises every other worker behind it, and the tile may never arrive
 	// anyway, so "block" would mean "hang".
-	FRWScopeLock Lock(Lock_, SLT_Write);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::ColdWorkerExcl);
 	if (Sampler_.findTile(Tile.x, Tile.y) != nullptr)
 	{
 		return Sampler_.elevationMm(px, py); // raced with a load; not a leak
@@ -976,86 +1327,289 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 
 void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoarseTile)
 {
-	FRWScopeLock Lock(Lock_, SLT_Write);
-
-	if (!(PlayerCoarseTile == LastRingCentre_))
+	// SCOPED, so the probe's own report is NOT inside the exclusive section it
+	// is measuring. An instrument that appears in its own hold time reads a
+	// number nobody can act on, and this one prints an FString::Printf with a
+	// dozen conversions.
 	{
-		// The ring moved: everything we believed absent is worth one more look
-		// (the bake frontier advances, and this is the only thing that retries).
-		//
-		// LoadFailures_ is deliberately NOT cleared with it. Absence is a fact
-		// about the world and the frontier moves; a tile that was read and
-		// refused is a fact about those bytes and this binary, and walking the
-		// player around changes neither. Clearing it here would restore the
-		// per-frame re-read this change exists to stop -- the memo would be
-		// wiped on the same tick it was written, every tick the anchor moved.
-		// What DOES earn a fresh attempt is the file itself changing; see
-		// EnsureTileResident_Locked.
-		KnownMissing_.clear();
-		// Counted BEFORE the assignment and only when a centre already existed,
-		// so ringMoves==0 reads as "the anchor has not crossed a tile boundary"
-		// and not as "the tick has never run" -- the sentinel centre says the
-		// second thing, and the two needed separating. See the header.
-		if (!(LastRingCentre_.x == INT32_MIN && LastRingCentre_.y == INT32_MIN))
+		VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::TickExcl);
+
+		if (!(PlayerCoarseTile == LastRingCentre_))
 		{
-			++RingCentreMoves_;
+			// The ring moved: everything we believed absent is worth one more look
+			// (the bake frontier advances, and this is the only thing that retries).
+			//
+			// LoadFailures_ is deliberately NOT cleared with it. Absence is a fact
+			// about the world and the frontier moves; a tile that was read and
+			// refused is a fact about those bytes and this binary, and walking the
+			// player around changes neither. Clearing it here would restore the
+			// per-frame re-read this change exists to stop -- the memo would be
+			// wiped on the same tick it was written, every tick the anchor moved.
+			// What DOES earn a fresh attempt is the file itself changing; see
+			// EnsureTileResident_Locked.
+			KnownMissing_.clear();
+			// Counted BEFORE the assignment and only when a centre already existed,
+			// so ringMoves==0 reads as "the anchor has not crossed a tile boundary"
+			// and not as "the tick has never run" -- the sentinel centre says the
+			// second thing, and the two needed separating. See the header.
+			if (!(LastRingCentre_.x == INT32_MIN && LastRingCentre_.y == INT32_MIN))
+			{
+				++RingCentreMoves_;
+			}
+			LastRingCentre_ = PlayerCoarseTile;
 		}
-		LastRingCentre_ = PlayerCoarseTile;
-	}
 
-	const std::vector<vxc::TileCoord> Ring = vxc::squareTileRing(PlayerCoarseTile, RingRadiusTiles_);
+		const std::vector<vxc::TileCoord> Ring = vxc::squareTileRing(PlayerCoarseTile, RingRadiusTiles_);
 
-	std::unordered_set<std::string> Pinned;
-	Pinned.reserve(Ring.size());
-	for (const vxc::TileCoord& T : Ring)
-	{
-		Pinned.insert(vxc::formatFineTileCacheKey(ProviderId_, Seed_, T.x, T.y));
-	}
-	Budget_.setPinned(std::move(Pinned));
-
-	// Prefetch: best-effort load of every ring tile not yet resident. A tile
-	// the frontier has not generated yet simply stays non-resident --
-	// IsFootprintResident keeps refusing that area, which is the intended
-	// "block until ready" behavior, not a bug to work around here.
-	for (const vxc::TileCoord& T : Ring)
-	{
-		if (KnownMissing_.find(TileHash(T)) == KnownMissing_.end())
+		std::unordered_set<std::string> Pinned;
+		Pinned.reserve(Ring.size());
+		for (const vxc::TileCoord& T : Ring)
 		{
-			EnsureTileResident_Locked(T);
+			Pinned.insert(vxc::formatFineTileCacheKey(ProviderId_, Seed_, T.x, T.y));
 		}
+		Budget_.setPinned(std::move(Pinned));
+
+		// Prefetch: best-effort load of every ring tile not yet resident. A tile
+		// the frontier has not generated yet simply stays non-resident --
+		// IsFootprintResident keeps refusing that area, which is the intended
+		// "block until ready" behavior, not a bug to work around here.
+		for (const vxc::TileCoord& T : Ring)
+		{
+			if (KnownMissing_.find(TileHash(T)) == KnownMissing_.end())
+			{
+				EnsureTileResident_Locked(T);
+			}
+		}
+
+		// Evict whatever the budget now disallows, outside the pinned ring.
+		for (const std::string& Key : Budget_.selectEvictions())
+		{
+			auto It = KeyToTile_.find(Key);
+			if (It == KeyToTile_.end())
+			{
+				continue; // defensive: should not happen, every touched key is recorded above
+			}
+			UE_LOG(LogVoxelEarth, Log, TEXT("Fine tile (%d,%d) evicted (LRU budget %.2f GiB exceeded)."),
+			       It->second.x, It->second.y, double(Budget_.budgetBytes()) / double(1ull << 30));
+			Sampler_.unloadTile(It->second.x, It->second.y);
+			NoteMirrorWriteThread_();
+			ResidentTiles_.erase(TileHash(It->second)); // THE MIRROR, WRITE 3 OF 3
+			Budget_.remove(Key);
+			KeyToTile_.erase(It);
+		}
+	} // Lock_ released here -- see the scope comment at the top of the function.
+
+	MaybeLogLockProbe_();
+}
+
+// ---------------------------------------------------------------------------
+// THE PROBE'S REPORT
+//
+// SELF-CONTAINED ON PURPOSE. It is emitted from here rather than from
+// FVoxelWorldImpl::MaybeLogCounters so that every leg -- including one whose
+// author never heard of this switch -- carries the traffic reading without a
+// second file having to be edited. TickResidencyAndEviction is called once per
+// RecomputeDesiredSet on the game thread, so the cadence is a tick and the
+// interval below is what turns that into a window.
+//
+// THE THREE READINGS THIS LINE MUST KEEP APART, because this project has found
+// twelve instruments that were green while sitting outside the path:
+//
+//   meter=off                     the switch is 0. Nothing was measured. The
+//                                 line still prints, and still carries the
+//                                 always-on RequestFootprint traffic, so an
+//                                 unarmed leg is not a silent leg.
+//   METER ARMED BUT NEVER ENTERED entered=0 with the probe on. No acquisition
+//                                 of any kind reached the guard. That is an
+//                                 instrument outside the path -- NOT an
+//                                 uncontended lock -- and it is said in words.
+//   contended=NO                  entered>0, acquisitions>0, and the wait
+//                                 totals are ~0. The probe ran and the lock was
+//                                 genuinely free. THIS IS THE DISPROOF of the
+//                                 fast path: if it reads this way at peak
+//                                 throughput, the 183 us/call is work and this
+//                                 change should be reverted, not tuned.
+//
+// `win=` is appended at the END, per the old-leg-grep rule this project adopted
+// after % of wall was found to have been 2.5x low on every leg ever run.
+// ---------------------------------------------------------------------------
+void FVoxelFineTileStreamer::MaybeLogLockProbe_()
+{
+	// Same interval the perf log uses, read from the same switch, so the probe
+	// window and the `Voxel apply stages` window line up and can be divided by
+	// one another. Legs pass -VoxelPerfLogInterval=2.
+	static const double IntervalSec = []
+	{
+		float Value = 5.0f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfLogInterval="), Value);
+		return double(FMath::Clamp(Value, 0.25f, 600.0f));
+	}();
+
+	const double Now = FPlatformTime::Seconds();
+	const double WindowSec = Now - LastProbeLogSeconds_;
+	if (WindowSec < IntervalSec)
+	{
+		return;
+	}
+	LastProbeLogSeconds_ = Now;
+
+	const int32 Meter = VoxelFineLock::MeterMode();
+	const int32 Fast = VoxelFineLock::FastMode();
+
+	// Deltas, not cumulative totals. A rate divided by the wrong denominator is
+	// the single most common retracted finding in this project's history, so
+	// the window's own numbers are what is printed and the window's own length
+	// is printed beside them.
+	static VoxelFineLock::FAggregate Prev;
+	static uint64 PrevCalls = 0, PrevFree = 0, PrevShared = 0, PrevEscal = 0;
+	const VoxelFineLock::FAggregate Now_ = VoxelFineLock::Collect();
+
+	const uint64 Calls = ReqCalls_.load(std::memory_order_relaxed);
+	const uint64 Free = ReqFastFree_.load(std::memory_order_relaxed);
+	const uint64 Shared = ReqFastShared_.load(std::memory_order_relaxed);
+	const uint64 Escal = ReqEscalated_.load(std::memory_order_relaxed);
+	const uint64 DCalls = Calls - PrevCalls;
+	const uint64 DFree = Free - PrevFree;
+	const uint64 DShared = Shared - PrevShared;
+	const uint64 DEscal = Escal - PrevEscal;
+	PrevCalls = Calls;
+	PrevFree = Free;
+	PrevShared = Shared;
+	PrevEscal = Escal;
+
+	// The headline: what share of RequestFootprint calls no longer raise a
+	// barrier across the worker pool. 0.0% with Calls>0 and Fast>0 is the fast
+	// path running and catching nothing, which is the reading that says revert.
+	const double AvoidedPct = DCalls > 0 ? 100.0 * double(DFree + DShared) / double(DCalls) : 0.0;
+
+	if (Meter <= 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Fine lock: meter=off fast=%d | req calls=%llu lockFree=%llu shared=%llu excl=%llu ")
+		       TEXT("(exclusive avoided %.1f%%) | cumulative calls=%llu excl=%llu | audit checked=%llu ")
+		       TEXT("mismatch=%llu mirrorOffThread=%llu | -VoxelFineLockMeter=1 for acquisition counts, ")
+		       TEXT("=2 for wait/hold win=%.2fs"),
+		       Fast, (unsigned long long)DCalls, (unsigned long long)DFree, (unsigned long long)DShared,
+		       (unsigned long long)DEscal, AvoidedPct, (unsigned long long)Calls, (unsigned long long)Escal,
+		       (unsigned long long)MirrorAudits_.load(std::memory_order_relaxed),
+		       (unsigned long long)MirrorMismatches_.load(std::memory_order_relaxed),
+		       (unsigned long long)MirrorOffThreadWrites_.load(std::memory_order_relaxed), WindowSec);
+		return;
 	}
 
-	// Evict whatever the budget now disallows, outside the pinned ring.
-	for (const std::string& Key : Budget_.selectEvictions())
+	VoxelFineLock::FAggregate D;
+	for (int32 I = 0; I < VoxelFineLock::kSiteCount; ++I)
 	{
-		auto It = KeyToTile_.find(Key);
-		if (It == KeyToTile_.end())
-		{
-			continue; // defensive: should not happen, every touched key is recorded above
-		}
-		UE_LOG(LogVoxelEarth, Log, TEXT("Fine tile (%d,%d) evicted (LRU budget %.2f GiB exceeded)."),
-		       It->second.x, It->second.y, double(Budget_.budgetBytes()) / double(1ull << 30));
-		Sampler_.unloadTile(It->second.x, It->second.y);
-		Budget_.remove(Key);
-		KeyToTile_.erase(It);
+		D.Acq[I] = Now_.Acq[I] - Prev.Acq[I];
+		D.TimedAcq[I] = Now_.TimedAcq[I] - Prev.TimedAcq[I];
+		D.WaitNs[I] = Now_.WaitNs[I] - Prev.WaitNs[I];
+		D.HoldNs[I] = Now_.HoldNs[I] - Prev.HoldNs[I];
+		// MAXIMA ARE CUMULATIVE AND ARE NEVER RESET, and the log says so with
+		// worstSinceStart: a per-window max would have to be zeroed from the
+		// game thread while workers are still writing it, which loses samples
+		// exactly in the window that had the worst one.
+		D.WaitMaxNs[I] = Now_.WaitMaxNs[I];
+		D.HoldMaxNs[I] = Now_.HoldMaxNs[I];
 	}
+	D.Entered = Now_.Entered - Prev.Entered;
+	Prev = Now_;
+
+	if (Now_.Entered == 0)
+	{
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("Fine lock: METER ARMED BUT NEVER ENTERED (mode=%d, entered=0 acquisitions of any kind, ")
+		       TEXT("cumulative). This is an INSTRUMENT OUTSIDE THE PATH, not an uncontended lock: no ")
+		       TEXT("FLockScope has been constructed at all, so either the fine tier is not being queried or ")
+		       TEXT("the guard is no longer at the lock sites. Do not read this as zero contention. ")
+		       TEXT("req calls=%llu win=%.2fs"),
+		       Meter, (unsigned long long)DCalls, WindowSec);
+		return;
+	}
+
+	const uint64 ExAcq = D.AcqIn(true);
+	const uint64 ShAcq = D.AcqIn(false);
+	// THE DENOMINATOR IS THE **TIMED** COUNT, NOT THE ACQUISITION COUNT. At
+	// mode 2 the per-pixel reads are counted but not timed, so the two differ
+	// by orders of magnitude on the shared side and dividing by the wrong one
+	// would report a per-acquire wait that is nonsense in the reassuring
+	// direction. Both are printed so the ratio is visible.
+	const uint64 ExTimed = D.TimedAcqIn(true);
+	const uint64 ShTimed = D.TimedAcqIn(false);
+	const uint64 ExWait = D.WaitNsIn(true);
+	const uint64 ExHold = D.HoldNsIn(true);
+	const uint64 ShWait = D.WaitNsIn(false);
+	const uint64 ShHold = D.HoldNsIn(false);
+	const double ExWaitUsPer = ExTimed > 0 ? double(ExWait) / 1000.0 / double(ExTimed) : 0.0;
+	const double ExHoldUsPer = ExTimed > 0 ? double(ExHold) / 1000.0 / double(ExTimed) : 0.0;
+	const double ShWaitUsPer = ShTimed > 0 ? double(ShWait) / 1000.0 / double(ShTimed) : 0.0;
+
+	// WAIT VERSUS WORK, which is the one question this whole instrument exists
+	// to answer. Undefined rather than 0 when the timing half is not armed, so
+	// a mode-1 leg cannot be quoted as "0% waiting".
+	const uint64 TotalWait = ExWait + ShWait;
+	const uint64 TotalHold = ExHold + ShHold;
+	const double WaitShare = (TotalWait + TotalHold) > 0
+	                             ? 100.0 * double(TotalWait) / double(TotalWait + TotalHold)
+	                             : 0.0;
+
+	const TCHAR* Verdict =
+		(ExTimed + ShTimed) == 0
+			? TEXT("timing NOT armed: pass -VoxelFineLockMeter=2 for wait/hold -- this line's ")
+			  TEXT("wait/hold shares are UNMEASURED, not zero")
+	    : (TotalWait * 100 < TotalHold)
+	          ? TEXT("contended=NO: the probe ran and waiting is under 1% of time in the lock -- the cost ")
+	            TEXT("here is WORK, and the fast path's premise is FALSIFIED")
+	          : TEXT("contended=YES: waiting is a real share of time in the lock");
+
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Fine lock: meter=%d fast=%d | req calls=%llu lockFree=%llu shared=%llu excl=%llu ")
+	       TEXT("(exclusive avoided %.1f%%) | EXCL acq=%llu timed=%llu wait=%.1fms hold=%.1fms us/timed ")
+	       TEXT("wait=%.2f hold=%.2f | SHARED acq=%llu timed=%llu wait=%.1fms hold=%.1fms us/timed wait=%.3f ")
+	       TEXT("| waitShare=%.1f%% of %llu ns in-lock | worstSinceStart us: wait excl=%.1f shared=%.1f hold excl=%.1f ")
+	       TEXT("| acq[reqExcl=%llu reqFast=%llu tick=%llu coldGame=%llu coldWorker=%llu elev=%llu climate=%llu ")
+	       TEXT("isResident=%llu bathy=%llu diag=%llu] | entered=%llu | audit checked=%llu mismatch=%llu ")
+	       TEXT("mirrorOffThread=%llu | %s ")
+	       TEXT("win=%.2fs"),
+	       Meter, Fast, (unsigned long long)DCalls, (unsigned long long)DFree, (unsigned long long)DShared,
+	       (unsigned long long)DEscal, AvoidedPct,
+	       (unsigned long long)ExAcq, (unsigned long long)ExTimed, double(ExWait) / 1.0e6,
+	       double(ExHold) / 1.0e6, ExWaitUsPer, ExHoldUsPer,
+	       (unsigned long long)ShAcq, (unsigned long long)ShTimed, double(ShWait) / 1.0e6,
+	       double(ShHold) / 1.0e6, ShWaitUsPer,
+	       WaitShare, (unsigned long long)(TotalWait + TotalHold),
+	       double(D.MaxWaitNsIn(true)) / 1000.0, double(D.MaxWaitNsIn(false)) / 1000.0,
+	       double(D.MaxHoldNsIn(true)) / 1000.0,
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ReqExcl)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ReqShared)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::TickExcl)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ColdGameExcl)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ColdWorkerExcl)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ElevShared)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ClimateShared)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::FootprintShared)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::BathyShared)],
+	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::DiagShared)],
+	       (unsigned long long)D.Entered,
+	       (unsigned long long)MirrorAudits_.load(std::memory_order_relaxed),
+	       (unsigned long long)MirrorMismatches_.load(std::memory_order_relaxed),
+	       (unsigned long long)MirrorOffThreadWrites_.load(std::memory_order_relaxed), Verdict, WindowSec);
 }
 
 uint64 FVoxelFineTileStreamer::ResidentBytes() const
 {
-	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::DiagShared);
 	return Budget_.residentBytes();
 }
 
 uint64 FVoxelFineTileStreamer::BudgetBytes() const
 {
-	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::DiagShared);
 	return Budget_.budgetBytes();
 }
 
 uint64 FVoxelFineTileStreamer::ResidentTileCount() const
 {
-	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::DiagShared);
 	return uint64(Sampler_.tileCount());
 }
 
@@ -1068,12 +1622,12 @@ vxc::TileCoord FVoxelFineTileStreamer::RingCentreTile() const
 	// this accessor does not become the exception the day something else reads
 	// it. The sentinel (INT32_MIN, INT32_MIN) is returned as-is -- the caller
 	// must be able to see "never ticked", see the header.
-	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::DiagShared);
 	return LastRingCentre_;
 }
 
 uint64 FVoxelFineTileStreamer::RingCentreMovesSinceStart() const
 {
-	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::DiagShared);
 	return RingCentreMoves_;
 }
