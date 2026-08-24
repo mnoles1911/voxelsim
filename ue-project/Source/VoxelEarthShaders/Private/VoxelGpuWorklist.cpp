@@ -770,6 +770,29 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				GProofPackChecked.store(Data[13], std::memory_order_relaxed);
 				GProofClaimMismatch.store(Data[14], std::memory_order_relaxed);
 				GProofClaimChecked.store(Data[15], std::memory_order_relaxed);
+				// [16..19] WERE ALLOCATED, WRITTEN AND COPIED, AND THEN NEVER
+				// READ. The stats buffer is kStatsDwords = 20 dwords, the copy
+				// pass copies all 20, and Lock() maps all 20 -- but this unpack
+				// stopped at Data[15]. GProofClaimEligible therefore never left
+				// its {0} initialiser, and `wlclaim gpuClaimed` printed a hard
+				// 0 on every leg the claim stage has ever run.
+				//
+				// That zero was read as "CLAIM STAGE DARK: hostStaged>0,
+				// gpuClaimed=0 -- those chunks' slots land nothing", which is
+				// the manager's own documented failing reading, and it was
+				// believed twice: it struck two legs as invalid and sent a
+				// session's worth of localisation after a kernel that may have
+				// been healthy the whole time. The kernel writes
+				// WorklistStats[16] unconditionally and faithfully; nothing on
+				// this side ever looked at it.
+				//
+				// THE SHAPE, because it is the one this file already warns
+				// about in three other places: a counter whose producer is
+				// correct, whose transport is correct, and whose CONSUMER is
+				// missing, reads as the most alarming value in its range. It
+				// cannot be caught by checking the producer -- which is what
+				// every elimination pass here did.
+				GProofClaimEligible.store(Data[16], std::memory_order_relaxed);
 				GProofLandedSeq.store(ProofCopySeq, std::memory_order_release);
 			}
 			ProofReadback->Unlock();

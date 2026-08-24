@@ -10997,7 +10997,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	if (GpuSubmitCallsSinceLog > 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel gpu submit split (5s window): totalMs=%.1f = reqHdr=%.1f + band=%.1f + raster=%.1f ")
+		       TEXT("Voxel gpu submit split (window): totalMs=%.1f = reqHdr=%.1f + band=%.1f + raster=%.1f ")
 		       TEXT("+ assets=%.1f + pool=%.1f + mgrSubmit=%.1f (drift=%.2f) | calls=%lld perCallUs=%.1f ")
 		       TEXT("| loopSubmitGpuMs=%.1f loopMinusFn=%.1f"),
 		       AccumGpuSubmitTotalMs, AccumGpuSubmitReqHdrMs, AccumGpuSubmitBandMs, AccumGpuSubmitRasterMs,
