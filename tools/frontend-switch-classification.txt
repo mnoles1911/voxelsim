@@ -318,3 +318,16 @@ VoxelFramePhaseHeavy
 VoxelFramePhaseMoveUU
 VoxelFramePhaseGateMps
 VoxelFramePhaseSteadyPct
+
+# ue-project/Source/VoxelEarthShaders/Public/VoxelRenderFrame.h. The
+# render-frame split: it names where the render thread's 9.23 ms parked /
+# 18.60 ms moving actually goes (scene-renderer setup, RDG execute, and
+# everything else), reconciled against GRenderThreadTime with the delta
+# printed. Passive per-frame meter, off by default, no run behaviour.
+# -VoxelRenderFrameMutate= / -VoxelRenderFrameMutateMs= are the negative
+# controls: they inject a known cost or a known BLOCK into a named bucket so
+# the split can be observed FAILING rather than only observed passing. All
+# three are configuration; none of them drives a run or quits it.
+VoxelRenderFrame
+VoxelRenderFrameMutate
+VoxelRenderFrameMutateMs

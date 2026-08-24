@@ -500,6 +500,15 @@ public:
 
 	virtual void PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView,
 	                                             const FPostProcessingInputs& Inputs) override;
+
+	// ANCHOR B OF THE RENDER-FRAME SPLIT, and no fluid work at all. See
+	// VoxelRenderFrame.h. It is duplicated here and in the marcher for the same
+	// reason the A anchor is: on a leg with voxel.March 0 the marcher's
+	// extension declines every hook, and an anchor that lived in only one of
+	// them would silently stop closing frames -- which reads exactly like the
+	// instrument not being applied.
+	virtual void PostRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder,
+	                                               FSceneViewFamily& InViewFamily) override;
 	//~ End ISceneViewExtension
 
 protected:
