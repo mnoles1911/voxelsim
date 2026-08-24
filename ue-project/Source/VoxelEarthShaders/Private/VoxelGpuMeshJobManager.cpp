@@ -3243,14 +3243,15 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	       TEXT("[gpu-worklist] %.1fs window: passes/tick mean=%.1f max=%lld over %lld ticks ")
 	       TEXT("(%lld chunks, %.0f chunks/s); records appended=%llu consumed=%llu pending=%u ")
 	       TEXT("refusedFull=%llu; identity %s; skips noPack=%lld quads=%lld band=%lld ")
-	       TEXT("noAlloc=%lld noAtlas=%lld bandAdmitted=%lld (cumulative); ")
+	       TEXT("noAlloc=%lld noAtlas=%lld dupSlot=%lld bandAdmitted=%lld (cumulative); ")
 	       TEXT("proof landed=%llu failed=%llu%s%s%s"),
 	       WindowSeconds, MeanPasses, WorklistWinPassesMaxTick, WorklistWinTicks,
 	       WorklistWinChunks, WindowSeconds > 0.0 ? double(WorklistWinChunks) / WindowSeconds : 0.0,
 	       W.Appended, W.Consumed, W.Pending, W.RefusedFull,
 	       Drift == 0 ? TEXT("ok") : *FString::Printf(TEXT("DRIFT=%lld (LEG INVALID)"), Drift),
 	       WorklistSkipNoPack, WorklistSkipQuadMesh, WorklistSkipBand,
-	       WorklistSkipNoAlloc, WorklistSkipNoAtlas, WorklistBandAdmitted,
+	       WorklistSkipNoAlloc, WorklistSkipNoAtlas, WorklistSkipDupSlot,
+	       WorklistBandAdmitted,
 	       P.Landed, P.Failed,
 	       P.Failed > 0 ? TEXT(" (PROOF FAILED -- LEG INVALID)") : TEXT(""),
 	       bUnproven ? TEXT(" (NO PROOF LANDED -- GPU consumption UNVERIFIED)") : TEXT(""),
@@ -3381,16 +3382,26 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		const bool bSetShort = GpuClaimed == 0 && HostStaged > 0;
 		UE_LOG(LogVoxelGpuMeshJob, Log,
 		       TEXT("[gpu-worklist] wlclaim conv=%lld hostStaged=%lld gpuClaimed=%lld ")
-		       TEXT("claimverify checked=%llu mism=%llu (cumulative)%s%s%s%s"),
+		       TEXT("dupRefused=%lld fedNoBit=%lld claimverify checked=%llu mism=%llu ")
+		       TEXT("witness cat=0x%02x slot=%d (cumulative)%s%s%s%s%s"),
 		       WorklistClaimConverted, HostStaged, GpuClaimed,
+		       Worklist.GetCumClaimDupRefused(), WorklistClaimFedNoBit,
 		       P.ClaimDwordsChecked, P.ClaimDwordMismatches,
+		       P.ClaimWitnessCategories, int32(P.ClaimWitnessSlot) - 1,
 		       bSetAhead
 		           ? TEXT(" (DOUBLE CLAIM: gpuClaimed > hostStaged -- pool ranges leaking, ")
 		             TEXT("cross-check [brick-gpualloc] unclaimed for the negative twin)")
 		           : TEXT(""),
 		       bSetShort
 		           ? TEXT(" (CLAIM STAGE DARK: hostStaged>0, gpuClaimed=0 -- those chunks' ")
-		             TEXT("batch brick chains were skipped and nothing landed them)")
+		             TEXT("batch brick chains were skipped and nothing landed them. READ THE ")
+		             TEXT("CONSUMER FIRST: this exact line printed a hard 0 for a whole session ")
+		             TEXT("because the readback unpacked Data[0..15] and stopped, while the ")
+		             TEXT("kernel wrote [16] faithfully throughout)")
+		           : TEXT(""),
+		       Worklist.GetCumClaimDupRefused() > 0
+		           ? TEXT(" (DUPLICATE CLAIM SLOTS REFUSED IN FLUSH -- the manager's own dupSlot ")
+		             TEXT("guard has a gap; without this refusal each one is a leaked grant)")
 		           : TEXT(""),
 		       P.ClaimDwordMismatches > 0 ? TEXT(" (CLAIM VERIFY FAILED -- LEG INVALID)") : TEXT(""),
 		       (VoxelGpuWorklistVerifyClaimEnabled() && WorklistClaimConverted > 0 &&
@@ -3784,6 +3795,14 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		// Band-edge admission (-VoxelGpuWorklistBandChunks). Off is
 		// byte-identical: the skip below stands exactly as it did.
 		const bool bBandChunksArmed = VoxelGpuWorklistBandChunksEnabled();
+		// Shells already given a record THIS BATCH. A flush consumes exactly
+		// one batch's staged records (Flush runs inside this block, right
+		// after Append), so batch scope is flush scope and this is the whole
+		// duplicate exposure. Reserve rather than grow: this runs per tick on
+		// the game thread and the 0.020 ms/chunk budget has no room for
+		// rehashing.
+		TSet<uint32> BatchSlotsSeen;
+		BatchSlotsSeen.Reserve(Batch.Num());
 		TArray<FVoxelWorklistAssetPayload> RecordPayloads;
 		TSet<FVoxelGpuBrickStack*> TalliedStacks;
 		int64 PassesThisTick = 0;
@@ -3850,6 +3869,45 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			if (bJobBand && !bBandChunksArmed)        { ++WorklistSkipBand; continue; }
 			if (!Job->bGpuPoolAlloc)                  { ++WorklistSkipNoAlloc; continue; }
 			if (!Job->BrickRegion.bRasterAtlas)       { ++WorklistSkipNoAtlas; continue; }
+			// TWO RECORDS FOR ONE SHELL IN ONE FLUSH IS A DOUBLE CLAIM, and it
+			// is the diagnosed cause of claimverify mism=138 / mism=174.
+			//
+			// A chunk re-requested while an earlier job for it is still in
+			// flight gets the SAME shell back (AllocateGpuChunkShell is keyed
+			// by chunk key), so both jobs carry the same GpuChunkSlot and the
+			// same GpuBrickBase -- FVoxelBrickPool dispenses ChunkSlot =
+			// BrickBase / 64, so those are one quantity, not two. The stack
+			// sweep has always known this case exists ("a duplicate key -- two
+			// queued jobs for the same chunk -- breaks a run"). Both records
+			// were claim-staged in the same flush, both groups ran
+			// poolClaimChunkAt, and the second claim's ranges overwrote the
+			// first's side-table entry: the first grant leaks and the loser's
+			// descriptors disagree with the landed pool.
+			//
+			// THE SIGNATURE THAT IDENTIFIED IT: both records describe the SAME
+			// terrain, so their descriptors are identical except for the
+			// rebased pool offsets -- which differ only on NON-EMPTY bricks.
+			// Every mismatch increment across two legs (+56 +82 / +98 +18 +8
+			// +50) is even, and the desc compare is the only one contributing
+			// 2 per unit; 28 / 41 / 49 / 9 / 4 / 25 non-empty bricks of 64 is
+			// exactly a per-chunk occupancy count. The arithmetic named the
+			// mechanism before any instrument did.
+			//
+			// The fix is to keep the SECOND one out of the ring entirely,
+			// rather than to un-stage it later: a record that never exists
+			// cannot be claim-staged, cannot be handed a slice, and is never
+			// in RecordJobs -- so the host's post-flush conversion test never
+			// sees it and cannot diverge from the GPU's eligibility. Its job
+			// dispatches fully classic, which is what a non-eligible chunk has
+			// always done. Un-staging it after the fact would have been the
+			// dangerous shape: the host would skip its batch brick chain while
+			// the GPU skipped its claim, and the chunk would land NOTHING.
+			if (BatchSlotsSeen.Contains(Job->GpuChunkSlot))
+			{
+				++WorklistSkipDupSlot;
+				continue;
+			}
+			BatchSlotsSeen.Add(Job->GpuChunkSlot);
 			// Counted AFTER every gate, so this is band chunks that actually
 			// got a record -- the reading that says the admission fired.
 			if (bJobBand)                             { ++WorklistBandAdmitted; }
@@ -4061,6 +4119,34 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 									// spine constant, not here.
 									if (Worklist.IsClaimStageArmed())
 									{
+										// THE SET-IDENTITY CHECK, AT THE ONE
+										// PLACE IT CAN BE CHECKED RATHER THAN
+										// ARGUED. Setting bWorklistClaimFed
+										// removes this chunk's ENTIRE brick
+										// chain from the batch graph, on the
+										// promise that the flush graph claimed
+										// it -- and the flush graph claims
+										// exactly the records carrying bit 11.
+										// If this job converts while its record
+										// does not carry the bit, NOTHING lands
+										// the chunk: a hole, silent.
+										//
+										// It is checked because the two counts
+										// DISAGREE BY A CONSTANT 56 on all
+										// three legs measured so far
+										// (909,737/909,681 - 339,050/338,994 -
+										// 912,479/912,423), across chunk counts
+										// differing by 2.7x. A constant that
+										// does not scale with N is not a race;
+										// it is a fixed set of chunks, and the
+										// argument that these clauses are
+										// identical is evidently wrong
+										// somewhere. This says WHICH side.
+										if ((NewRecords[RIdx].LevelFlags & (1u << 11)) == 0u)
+										{
+											++WorklistClaimFedNoBit;
+											continue;
+										}
 										RecordJobs[RIdx]->bWorklistClaimFed = true;
 										++WorklistClaimConverted;
 										PassesThisTick += -5;

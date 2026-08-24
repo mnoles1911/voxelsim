@@ -316,6 +316,8 @@ void ClaimWorklistVerifyMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThread
 	const uint RecBase = R.ChunkSlot * ChunkRecordDwords;
 	uint Mismatch = 0u;
 	uint Checked = 0u;
+	// Which KIND of byte disagreed -- see the witness block at the end.
+	uint Category = 0u;
 
 	if (InClaim[CB + 0u] == 0u)
 	{
@@ -323,7 +325,9 @@ void ClaimWorklistVerifyMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThread
 		for (uint z = GTid.x; z < ChunkRecordDwords; z += 64u)
 		{
 			Checked += 1u;
-			Mismatch += (InPoolTable[RecBase + z] != 0u) ? 1u : 0u;
+			const uint Bad = (InPoolTable[RecBase + z] != 0u) ? 1u : 0u;
+			Mismatch += Bad;
+			Category |= (Bad != 0u) ? (1u << 4) : 0u;
 		}
 	}
 	else
@@ -338,8 +342,17 @@ void ClaimWorklistVerifyMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThread
 				InClaim[CB + 7u] - Rec * kWlMatWordsPerRecord);
 			const uint2 A = VerifyPoolDesc[R.BrickBase + GTid.x];
 			Checked += 2u;
-			Mismatch += (A.x != E.x) ? 1u : 0u;
-			Mismatch += (A.y != E.y) ? 1u : 0u;
+			const uint BadD = ((A.x != E.x) ? 1u : 0u) + ((A.y != E.y) ? 1u : 0u);
+			Mismatch += BadD;
+			// Bit 0: DESCRIPTORS. This is the bit the duplicate-ChunkSlot
+			// mechanism predicts, and predicts alone -- two records for one
+			// shell describe the same terrain, so only the rebased pool
+			// offsets differ, i.e. only NON-EMPTY bricks, two dwords each.
+			// Every increment observed so far (+56 +82 +98 +18 +8 +50) is
+			// even. If this bit is set and the others are clear, the
+			// duplicate is the mechanism; if bits 1/2 light up instead, the
+			// word copies are the mechanism and the fix is elsewhere.
+			Category |= (BadD != 0u) ? (1u << 0) : 0u;
 		}
 
 		// Words: strided across the group, bounded by the ACTUAL counts.
@@ -348,13 +361,17 @@ void ClaimWorklistVerifyMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThread
 		for (uint i = GTid.x; i < Words; i += 64u)
 		{
 			Checked += 1u;
-			Mismatch += (VerifyPoolOcc[Base + i] != InWordsOccArena[SrcFirst + i]) ? 1u : 0u;
+			const uint BadO = (VerifyPoolOcc[Base + i] != InWordsOccArena[SrcFirst + i]) ? 1u : 0u;
+			Mismatch += BadO;
+			Category |= (BadO != 0u) ? (1u << 1) : 0u;
 		}
 		poolAllocWordRun(CB, 1u, Base, Words, SrcFirst);
 		for (uint j = GTid.x; j < Words; j += 64u)
 		{
 			Checked += 1u;
-			Mismatch += (VerifyPoolMat[Base + j] != InWordsMatArena[SrcFirst + j]) ? 1u : 0u;
+			const uint BadM = (VerifyPoolMat[Base + j] != InWordsMatArena[SrcFirst + j]) ? 1u : 0u;
+			Mismatch += BadM;
+			Category |= (BadM != 0u) ? (1u << 2) : 0u;
 		}
 
 		// The record: re-run the allSolid reduce through the same factored
@@ -384,7 +401,9 @@ void ClaimWorklistVerifyMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThread
 				d, Origin, LF, R.BrickBase, MaskLo, MaskHi,
 				R.ShadingClimatePacked, R.ShadingGradPacked, R.ShadingSurfaceZBits);
 			Checked += 1u;
-			Mismatch += (InPoolTable[RecBase + d] != E) ? 1u : 0u;
+			const uint BadR = (InPoolTable[RecBase + d] != E) ? 1u : 0u;
+			Mismatch += BadR;
+			Category |= (BadR != 0u) ? (1u << 3) : 0u;
 		}
 	}
 
@@ -393,5 +412,30 @@ void ClaimWorklistVerifyMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThread
 	if (Mismatch != 0u)
 	{
 		InterlockedAdd(WorklistStats[14], Mismatch, Unused);
+		// --- THE WITNESS, because a count is not an address ------------------
+		//
+		// mism=138 and mism=174 on two runs of the same binary told us there
+		// was a race and nothing else. Which BYTES disagree is the whole
+		// question: descriptors point at the claim's rebase, words point at
+		// the copy, record dwords point at the composer, and the fail-zero
+		// branch points at a slot the free path should have cleared. These
+		// three dwords cost one Or and one CompareExchange on the failing
+		// path only -- nothing on a clean leg.
+		//
+		// [17] every category seen, ORed across the leg (bit 0 desc, 1 occ
+		//      words, 2 mat words, 3 record dwords, 4 the failed-claim
+		//      all-zeros check).
+		// [18] the FIRST failing record's ChunkSlot, +1 so 0 reads as "none".
+		// [19] that same record's category bits in 0..7 and its flush-relative
+		//      record index in 8..31 -- the slice to look at in a capture.
+		InterlockedOr(WorklistStats[17], Category, Unused);
+		uint PrevSlot;
+		InterlockedCompareExchange(WorklistStats[18], 0u, R.ChunkSlot + 1u, PrevSlot);
+		if (PrevSlot == 0u)
+		{
+			// We are the first failure of the leg; publish our detail beside
+			// the slot we just claimed the witness with.
+			InterlockedExchange(WorklistStats[19], (Rec << 8) | (Category & 0xffu), Unused);
+		}
 	}
 }
