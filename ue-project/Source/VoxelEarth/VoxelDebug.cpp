@@ -457,7 +457,7 @@ TAutoConsoleVariable<int32> CVarVoxelStreamApplyStageStats(
 	TEXT("voxel.Stream.ApplyStageStats"),
 	0,
 	TEXT("1 = time each apply's quad pack, SampleChunkParamsForPool and pool add (including the ")
-	TEXT("PushUpdatesToProxy each ends in), reported per 5s window. Default 0. Pair it with ")
+	TEXT("PushUpdatesToProxy each ends in), reported per log window (-VoxelPerfLogInterval, 2s on flight legs -- NOT 5s). Default 0. Pair it with ")
 	TEXT("voxel.Stream.PoolPushStats, which splits the pool-add bucket across both threads."),
 	ECVF_Default);
 

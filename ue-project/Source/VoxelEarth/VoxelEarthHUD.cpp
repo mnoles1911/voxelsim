@@ -569,7 +569,7 @@ void AVoxelEarthHUD::DrawStreamPanel()
 					}
 					else if (B.BreakdownFrames == 0)
 					{
-						AddRow(TEXT("Holes breakdown: armed, no 5s window landed yet"),
+						AddRow(TEXT("Holes breakdown: armed, no log window landed yet"),
 						       kStreamRowWarn);
 					}
 					else

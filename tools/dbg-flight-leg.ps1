@@ -151,7 +151,16 @@ $ErrorActionPreference = 'Stop'
 # -NoCoverageVerify, which is a decision someone has to type and which says so
 # in the log line below.
 #
-# COST: the verify re-walks every ring's annulus once per log window. The
+# COST, SETTLED 2026-08-23 against an apparent contradiction in the source.
+# The cvar help says it "re-walks every ring's annulus"; the call site's comment
+# says "one cvar read when off". Both are true and they describe different
+# states: LogCoverageVerify() is called from MaybeLogCounters, which runs ONCE
+# PER LOG WINDOW (-VoxelPerfLogInterval, 2 s on every leg here) and NOT per
+# tick. So the armed cost is one annulus walk per ~100 ticks, and the disarmed
+# cost is a single cvar read. There is no contradiction to resolve in the code;
+# the imprecision was in an earlier revision of THIS comment.
+#
+# The closest matched observation: the
 # closest matched observation is q-cache128k (verify OFF) against q-repro-main
 # (verify ON), same arm: both settle 22.3 s at 7,387 chunks/s, identical to the
 # digit. Those two legs differ in BINARY as well as in this switch, so strictly

@@ -10926,11 +10926,33 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// incremental). Do not diff the fields across the two formats.
 	if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
 	{
+		// NAMES ITS OWN DEAD READING, INLINE. This line's all-zero state is
+		// indistinguishable from "the switch is inert", and that is exactly how
+		// it was nearly reported: `incr` sums to 0 in EVERY post-flight linger
+		// window -- nothing is moving, so nothing is admitted -- and the tail of
+		// a leg therefore says the feature never fired. It fired. The flying
+		// windows of that same leg read incr R0=24 R1=16 R2=7.
+		//
+		// Tenth window-selection trap of the session; the nine before it were
+		// caught by lines that said this out loud, so this one now does too.
+		int32 IncrSumThisWindow = 0;
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			IncrSumThisWindow += LevelIncrScansSinceLog[L];
+		}
+		const bool bAllZero = (IncrSumThisWindow == 0) && (IncrFullFirstSinceLog == 0)
+		                   && (IncrFullEditSinceLog == 0) && (IncrFullUndergroundSinceLog == 0)
+		                   && (IncrFullConfigSinceLog == 0);
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel incremental admission (window): incr %s | full: first=%d edit=%d underground=%d config=%d"),
+		       TEXT("Voxel incremental admission (window): incr %s | full: first=%d edit=%d underground=%d config=%d%s"),
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelIncrScansSinceLog[L]); }),
 		       IncrFullFirstSinceLog, IncrFullEditSinceLog, IncrFullUndergroundSinceLog,
-		       IncrFullConfigSinceLog);
+		       IncrFullConfigSinceLog,
+		       bAllZero
+		           ? TEXT(" -- ALL ZERO, WHICH IS THE EXPECTED READING FOR A PARKED OR LINGER WINDOW "
+		                  "(no motion, nothing to admit). NOT evidence the switch is inert: read a "
+		                  "window with dispatched>0 before concluding that.")
+		           : TEXT(""));
 	}
 	// Streaming pipeline re-measure (docs/status.md "Streaming pipeline
 	// re-measure + rework"): the two questions the existing logs could not

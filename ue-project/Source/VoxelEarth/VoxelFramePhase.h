@@ -186,7 +186,23 @@ inline int32 Mode()
 {
 	static const int32 Latched = []
 	{
-		int32 Value = 0;
+		// DEFAULT 1 AS OF 2026-08-23, and the default is the fix.
+		//
+		// -VoxelFramePhase was armed by exactly ONE of the six scripts that can
+		// launch a perf leg. Five of six ways to run a leg produced no Goal 3
+		// verdict at all, and the render lane -- which is now the critical path
+		// to that goal -- was about to run legs through them. Arming the five
+		// would have left the sixth for the next person to forget; a default
+		// cannot be forgotten by a script that does not exist yet.
+		//
+		// 1 rather than 3 on this file's own cost argument, twenty lines up:
+		// the distribution is a histogram increment per frame and is "cheap
+		// enough to leave on permanently", while the reconciliation reads five
+		// engine globals and keeps six running sums per bucket. A leg that
+		// wants the reconciliation asks for =3; every leg gets the gate.
+		//
+		// -VoxelFramePhase=0 still turns the file off completely.
+		int32 Value = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelFramePhase="), Value);
 		return FMath::Max(0, Value);
 	}();
