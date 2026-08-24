@@ -4004,7 +4004,46 @@ bool IncrementalAdmissionEnabled()
 // taken that way silently measures the same state twice).
 bool NearestAdmitEnabled()
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNearestAdmit"));
+	static const bool bEnabled = []
+	{
+		// DEFAULT 1 AS OF 2026-08-24. Matched pair, one binary, baked pose
+		// -61440,-61440, 1600x900, Flight=line, CoverageVerify armed:
+		//
+		//                      R0      cold    chunks/s   p50      p95    stutter
+		//   E-ctl  (off)      15.8 s   20.3 s   8,113    21.40 ms  37.00  54.26%
+		//   E-near2 (on)      12.7 s   21.1 s   7,802    21.40 ms  38.00  54.95%
+		//
+		// R0 -20%: the fine ring the owner named FIRST, and the one the
+		// GPU-primary flip cost him (6.4 -> 16.4 s on its own leg). It is bought
+		// for ~4% of cold start and throughput and NOTHING on the frame: p50 is
+		// identical to the centisecond and p95/stutter move less than the
+		// between-window spread. An arm that improves throughput while worsening
+		// the moving p50 is not a win here; this one does not touch it.
+		//
+		// PROOF OF TRAFFIC, because a fork in this file once carried none for
+		// weeks: `Voxel admit order:` reads nearestAdmit=40,810 armed against
+		// exactly 0 in control, and admMeanM shows the ORDERING itself change --
+		// R0 walks 28/48/73/96 m outward from the inner edge under this flag,
+		// against 111/87/71/73 m scattered without it, and R5 admits 3.2x nearer
+		// (3,863 -> 1,209 m). Never re-read this default from the settle line
+		// alone; both of those must move or the arm is not running.
+		//
+		// -VoxelViewBias IS NOT COVERED BY THIS MEASUREMENT and stays off. Its
+		// leg read viewRescans=0 because rescans are rotation-armed and
+		// Flight=line never rotates -- untested, not disproven. It needs a
+		// rotating path before anyone claims anything about it.
+		//
+		// FAILING READINGS, stated so this can come out the other way: if a leg
+		// with this default reads nearestAdmit=0 in every window with data, the
+		// flag has stopped latching and every number above is void. If R0
+		// regresses past the control's 15.8 s, or moving p50 rises above the
+		// control's 21.40 ms by more than a window's spread, the trade has
+		// inverted and this goes back to 0. Read windows with admissions only --
+		// the parked linger windows are 0 for every counter by construction.
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelNearestAdmit="), Value);
+		return Value != 0;
+	}();
 	return bEnabled;
 }
 
