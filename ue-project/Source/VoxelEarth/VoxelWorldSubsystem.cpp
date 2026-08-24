@@ -7511,6 +7511,18 @@ struct FVoxelWorldImpl
 	// does not fall, the fallback counters (IncrFull*SinceLog) say which
 	// full-sweep cause ate the win.
 	int32 ThisFrameLevelFootprints[VoxelCoords::kNumLevels] = {};
+	// HOOK I. The per-window sum of the same counter, printed on the recompute
+	// SUM line next to the ms it is the denominator of.
+	//
+	// THE READING NO TIMING CAN PRODUCE: footprints FLAT while ms/scan falls
+	// means the work was MOVED, not deleted -- the entry scan still visits
+	// every cell and something else got cheaper, or the cost went somewhere
+	// unmetered. Incremental admission's whole claim is that it stops
+	// ENUMERATING, so footprints must fall by roughly the factor ms does. A
+	// timing alone cannot tell "deleted" from "relocated", and this project has
+	// paid for that confusion twice (T4-2's entry walk was 2.4x WORSE after
+	// being "removed", and read as a win on its timing).
+	int64 AccumLevelFootprints[VoxelCoords::kNumLevels] = {};
 
 	// Running maxima since the last periodic counter log (MaybeLogCounters
 	// resets them): a recompute burst that lands on a frame which does NOT
@@ -8835,6 +8847,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		ThisFrameLevelEntryMs[Level] = 0.f;
+		AccumLevelFootprints[Level] += ThisFrameLevelFootprints[Level];
 		ThisFrameLevelFootprints[Level] = 0;
 	}
 
@@ -9518,7 +9531,8 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// a distribution claim about SETTLED play, and a hitch-gated feed can only
 	// ever describe frames that already exceeded 33.3 ms. Histogram, so this
 	// costs one bin increment and cannot start dropping samples on a long leg.
-	VoxelFramePhase::NoteFrame(double(TickMsSoFar), ThisFrameAppliesFromWorker);
+	VoxelFramePhase::NoteFrame(double(TickMsSoFar), ThisFrameAppliesFromWorker,
+	                           SmoothedAnchorSpeedUUPerSec);
 
 	// Constraint: "keep all debug work zero-cost when voxel.Debug=0 (branch
 	// out early)" -- FVoxelPerfSnapshot collection (array iteration, once/sec
@@ -10862,9 +10876,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// deserves a bucket of its own, not a guess.
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel recompute (sum since last log): totalMs=%.1f fineMs=%.1f exitScanMs=%.1f queueFilterMs=%.1f sortMs=%.1f | ")
-	       TEXT("entryMs %s"),
+	       TEXT("entryMs %s | footprints %s"),
 	       AccumRecomputeMs, AccumFineResidencyMs, AccumExitScanMs, AccumQueueFilterMs, AccumSortMs,
-	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.1f"), L, AccumLevelEntryMs[L]); }));
+	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.1f"), L, AccumLevelEntryMs[L]); }),
+	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%lld"), L, (long long)AccumLevelFootprints[L]); }));
+	for (int64& V : AccumLevelFootprints) { V = 0; }
 	// -VoxelRecomputeDutyPct proof of traffic (see the accessor's READINGS).
 	// Under the switch only, so old-leg greps stay clean -- and an armed leg
 	// with no line here ran no ticks at all.
@@ -16201,8 +16217,21 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// anchor.
 				++IncrFullConfigSinceLog;
 			}
-			else if (VoxelStreamAdmission::CutoffClampEnabled() &&
-			         (LevelAdmissionCutoffDistSq[Level] < DBL_MAX || bLevelLastScanClamped[Level]))
+			// HOOK D: the CutoffClampEnabled() qualifier is GONE, deliberately.
+			// bLevelLastScanClamped already means "the last scan of this level
+			// did not evaluate its outer annulus", which is exactly what this
+			// gate asks -- and it was only correct to qualify it while the
+			// -VoxelCutoffClamp path was the SOLE mechanism that could stop a
+			// scan early. A third mechanism now sets the same flag, so with the
+			// qualifier in place an incremental diff could trust verdicts a
+			// clamped predecessor never produced whenever the clamp switch was
+			// off. Testing the flag on its own makes the third mechanism
+			// inherit the fix.
+			//
+			// FAILING READING, both directions: with BOTH switches on, config=
+			// must be NON-ZERO (the qualifier is not silently still gating it)
+			// and must NOT equal the scan count (it has not become unconditional).
+			else if (LevelAdmissionCutoffDistSq[Level] < DBL_MAX || bLevelLastScanClamped[Level])
 			{
 				// -VoxelCutoffClamp: a clamped scan never evaluates the outer
 				// annulus, so it can neither BE incremental (the diff would
