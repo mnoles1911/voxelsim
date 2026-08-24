@@ -167,6 +167,10 @@ VoxelZstdDll
 # OFF and the switch became VoxelGpuMesh (the enable arm).
 VoxelAsyncAssetResolve
 VoxelAsyncAssetResolveWarm
+VoxelApplyBudgetMs
+VoxelApplyDrainCap
+VoxelApplyPerTick
+VoxelBandSeedCpu
 VoxelBrickPack
 VoxelBrickPackOnCpu
 VoxelBrickPoolChunks
@@ -271,3 +275,19 @@ VoxelApplyColumnCacheAudit
 VoxelApplyCap
 VoxelApplyBudgetMs
 VoxelApplyDrainCap
+# --- 2026-08-23: the fine-tier sampler lock ---------------------------------
+# ue-project/Source/VoxelEarth/VoxelFineLockMeter.h and VoxelFineTileStreamer.
+# Both are tuning/instrument: -VoxelFineLockFast picks how RequestFootprint
+# acquires the streamer's RWLock (0 = today's unconditional exclusive), and
+# -VoxelFineLockMeter arms the acquisition counters. Neither drives, poses or
+# ends a run, and both are meant to be readable on an ordinary interactive
+# launch.
+#
+# THE METER IS NOT CALLED *Probe ON PURPOSE, and the near-miss is worth
+# recording: "Probe" is in kSelfDrivingSubstrings, so -VoxelFineLockProbe would
+# have matched the rule, suppressed the main menu, and never appeared in this
+# file at all -- a passive counter quietly taking the front end away from a
+# developer who only wanted the numbers. Renamed rather than excepted, because
+# the rule is right and the name was wrong.
+VoxelFineLockFast
+VoxelFineLockMeter

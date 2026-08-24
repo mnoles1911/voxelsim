@@ -389,6 +389,58 @@ public:
 	// time, and it is the number that explains a stuttering game thread.
 	uint64 BlockingLoadsSinceStart() const { return BlockingLoads_.load(std::memory_order_relaxed); }
 
+	// --- THE LOCK FAST PATH'S TRAFFIC (-VoxelFineLockFast) ------------------
+	//
+	// TRAFFIC BEFORE TIMING. These four are ALWAYS counted, at every mode
+	// including 0, because the first question about a fast path is not how fast
+	// it is but whether it ran, and the second is what share of calls it caught.
+	// They are one increment per RequestFootprint call -- not per pixel -- on
+	// the game thread, so they cost nothing worth gating.
+	//
+	// HOW EACH ONE FAILS, so a zero can be read:
+	//   fastCalls == 0                  the switch is off (mode 0), or nothing
+	//                                   called RequestFootprint at all. The
+	//                                   report line prints `fast=0` for the
+	//                                   first, so the two are distinguishable.
+	//   fastFree + fastShared == 0 with fastCalls > 0
+	//                                   the fast path is IN the path and never
+	//                                   answers -- every call still escalates.
+	//                                   That is the fix doing nothing, and it
+	//                                   is the reading that says revert.
+	//   escalated == 0 during cold fill THE COLD PATH IS NOT BEING EXERCISED.
+	//                                   Suspect a leg with everything already
+	//                                   resident; this fix is untested there.
+	uint64 FootprintRequestsSinceStart() const { return ReqCalls_.load(std::memory_order_relaxed); }
+	// Answered with NO lock acquisition at all (mode 2+, game thread, mirror hit).
+	uint64 FootprintRequestsLockFreeSinceStart() const { return ReqFastFree_.load(std::memory_order_relaxed); }
+	// Answered under a SHARED acquire only (mode 1+, all covered tiles resident).
+	uint64 FootprintRequestsSharedSinceStart() const { return ReqFastShared_.load(std::memory_order_relaxed); }
+	// Fell through to the EXCLUSIVE load path -- the acquisitions this change
+	// exists to remove. In steady state this should be ~0.
+	uint64 FootprintRequestsExclusiveSinceStart() const { return ReqEscalated_.load(std::memory_order_relaxed); }
+	// THE MODE-2 SAFETY ARGUMENT, AS A NUMBER RATHER THAN A CLAIM. The
+	// lock-free mirror read is sound because its only writer is the game
+	// thread. That is an argument about call sites, and call sites move. This
+	// counts every mirror mutation that happened on some OTHER thread, so the
+	// day a background tile loader lands, or someone calls RequestFootprint
+	// from a worker, the assumption fails LOUDLY in the probe line instead of
+	// silently producing a stale residency answer.
+	//
+	// Its failing readings: 0 is the required value and is what the argument
+	// predicts. ANY nonzero value means -VoxelFineLockFast=2 is unsound on this
+	// build and must be dropped to 1 (which is safe under any threading,
+	// because it holds the shared lock). It is reported next to the audit
+	// counters so the two cannot be read apart.
+	uint64 MirrorOffThreadWritesSinceStart() const
+	{
+		return MirrorOffThreadWrites_.load(std::memory_order_relaxed);
+	}
+	// -VoxelFineLockFast=3 only: mirror answers cross-checked against
+	// FineTileSampler::findTile under the shared lock, and how many disagreed.
+	// A single mismatch is a correctness fault, not a tuning observation.
+	uint64 MirrorAuditsSinceStart() const { return MirrorAudits_.load(std::memory_order_relaxed); }
+	uint64 MirrorMismatchesSinceStart() const { return MirrorMismatches_.load(std::memory_order_relaxed); }
+
 private:
 	friend class FVoxelFineTileSamplerProxy;
 
@@ -489,6 +541,63 @@ private:
 	// Lock_ (shared is enough, but every current caller holds it exclusively).
 	bool IsSettledFailure_Locked(vxc::TileCoord Tile) const;
 
+	// --- THE ALLOCATION-FREE COVERAGE, AND WHY IT IS NOT A SECOND ARITHMETIC --
+	//
+	// CoveredTiles() returns a std::vector, i.e. a heap allocation, and
+	// RequestFootprint is called four times per chunk at two hot sites. At the
+	// 14,099 chunks/s peak that is ~100,000 allocations a second on the game
+	// thread for a rect that covers ONE tile in the overwhelming majority of
+	// cases. This is the same coverage with no allocation: a closed tile RANGE
+	// [X0..X1] x [Y0..Y1] instead of an enumerated vector.
+	//
+	// IT COMPOSES THE SAME TWO voxel-core CALLS, IN THE SAME ORDER, AS
+	// vxc::tilesCoveringFootprint DOES INTERNALLY -- fineReadPixelRect (the one
+	// authority on the cavern read margin and the carrier stencil) then
+	// tileCoordForPixel on the two corners. It does NOT re-derive either. The
+	// margin and the stencil are exactly where they were: a dilation this file
+	// computed for itself is precisely how the gate came to disagree with the
+	// GPU raster window once already.
+	//
+	// And composition is not proof, so the constructor CHECKS it: see
+	// SelfCheckTileRangeAgreesWithCoverage_, which compares this against
+	// vxc::tilesCoveringFootprint over origin, negative, boundary-straddling and
+	// multi-tile rects and refuses to start on a disagreement.
+	struct FTileRange
+	{
+		int32 X0 = 0, Y0 = 0, X1 = -1, Y1 = -1;
+		bool bValid = false;
+		int64 Count() const
+		{
+			return bValid ? (int64(X1) - int64(X0) + 1) * (int64(Y1) - int64(Y0) + 1) : 0;
+		}
+	};
+	static FTileRange CoveredTileRange(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1, int64 WorldMmY1);
+	// Runs at construction. Fatal on disagreement -- see the comment above.
+	static void SelfCheckTileRangeAgreesWithCoverage_();
+	// True iff every tile in Range is in ResidentTiles_. GAME THREAD ONLY and no
+	// lock: see the mirror's comment on ResidentTiles_ for why that is sound.
+	bool RangeResidentInMirror_(const FTileRange& Range) const;
+	// True iff every tile in Range is resident per FineTileSampler. Caller must
+	// hold Lock_ (shared is enough).
+	bool RangeResidentInSampler_Locked(const FTileRange& Range) const;
+	// -VoxelFineLockFast=3: compares the two above and reports any disagreement.
+	// Caller must hold Lock_ shared. Returns the SAMPLER's answer, always --
+	// the audit never lets the mirror decide.
+	bool AuditMirrorAgainstSampler_Locked(const FTileRange& Range, bool bMirrorSaid) const;
+	// Called at every one of the three mirror writes. See
+	// MirrorOffThreadWritesSinceStart() for what a nonzero count means.
+	void NoteMirrorWriteThread_()
+	{
+		if (!IsInGameThread())
+		{
+			MirrorOffThreadWrites_.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	// The probe's own report line. Game thread, called from
+	// TickResidencyAndEviction with Lock_ RELEASED (it must not be timed as
+	// part of the hold it is measuring), on the -VoxelPerfLogInterval cadence.
+	void MaybeLogLockProbe_();
+
 	FString RootDir_;
 	std::string ProviderId_;
 	uint64 Seed_;
@@ -541,6 +650,73 @@ private:
 	// their own previous value.
 	std::atomic<uint64> GateLeaks_{0};
 	std::atomic<uint64> BlockingLoads_{0};
+
+	// --- THE GAME-THREAD RESIDENCY MIRROR (-VoxelFineLockFast=2 and 3) -------
+	//
+	// The set of tile hashes currently resident in Sampler_. It exists so the
+	// hot fast path can answer "is this footprint already resident" WITHOUT
+	// touching Lock_ at all -- not even shared, because a shared acquire is
+	// still an atomic write to one cacheline that 36 worker threads are also
+	// writing, four to eight times per chunk.
+	//
+	// WHY READING IT WITHOUT A LOCK IS SAFE, AND IT IS A THREAD-IDENTITY
+	// ARGUMENT RATHER THAN A MEMORY-ORDERING ONE:
+	//
+	//   WRITERS. Exactly three statements mutate it, and each sits immediately
+	//   beside the Sampler_.loadTile / Sampler_.unloadTile it mirrors:
+	//     1. EnsureTileResident_Locked, after a successful loadTile      (insert)
+	//     2. EnsureTileResident_Locked, on the prewarm failure unloadTile (erase)
+	//     3. TickResidencyAndEviction's LRU eviction unloadTile           (erase)
+	//   All three are inside Lock_ held EXCLUSIVELY, and all three are on the
+	//   GAME THREAD: RequestFootprint and TickResidencyAndEviction are game
+	//   thread by contract, and ResolveNonResidentPixel only loads on the
+	//   IsInGameThread() branch (its worker branch takes the lock but never
+	//   loads or unloads -- it reports a leak and returns).
+	//
+	//   READERS. The lock-free read happens ONLY inside `IsInGameThread()`.
+	//
+	//   So the single writer and the lock-free reader are the SAME THREAD.
+	//   There is no race to order and no staleness to bound: the value the game
+	//   thread reads is the value the game thread last wrote. Nothing needs to
+	//   be atomic and nothing needs a fence.
+	//
+	// WHY A STALE READ CANNOT PRODUCE WRONG TERRAIN, which is the failure this
+	// project fears most because it does not crash:
+	//   * A stale TRUE ("resident" when it is not) is the dangerous direction,
+	//     and it is impossible: the only thing that removes residency is an
+	//     eviction, evictions run on the game thread under the exclusive lock,
+	//     and they erase from here in the same statement group that calls
+	//     unloadTile. A reader on any other thread never consults this at all.
+	//   * A stale FALSE is harmless and self-correcting: the call falls through
+	//     to the shared-lock check and then to today's exclusive load path, so
+	//     the worst case is exactly the behaviour of -VoxelFineLockFast=0.
+	//   * The window between this answering TRUE and the caller voxelizing is
+	//     NOT new. Today's exclusive path releases the lock before returning
+	//     too, so a later eviction could always invalidate an answer already
+	//     given. This changes the lock mode, not the lifetime of the answer.
+	//
+	// -VoxelFineLockFast=3 cross-checks every mirror answer against
+	// FineTileSampler::findTile under the shared lock and reports disagreement
+	// as an Error with a count, so "the mirror drifted" is a measured number
+	// rather than this comment's promise.
+	std::unordered_set<uint64> ResidentTiles_;
+	// RequestFootprint traffic. Relaxed atomics rather than plain uint64s
+	// purely defensively: the contract is game-thread-only, and if some future
+	// caller breaks it these must still not be UB while the assert-shaped
+	// IsInGameThread() branches route it to the locked path.
+	std::atomic<uint64> ReqCalls_{0};
+	std::atomic<uint64> ReqFastFree_{0};
+	std::atomic<uint64> ReqFastShared_{0};
+	std::atomic<uint64> ReqEscalated_{0};
+	std::atomic<uint64> MirrorOffThreadWrites_{0};
+	// mutable: the audit runs from the const IsFootprintResident, and an audit
+	// that could not count from a const path would simply not be run there --
+	// which is the admission sweep, i.e. most of the calls.
+	mutable std::atomic<uint64> MirrorAudits_{0};
+	mutable std::atomic<uint64> MirrorMismatches_{0};
+	// When the probe last printed. FPlatformTime::Seconds() at construction, so
+	// the first window is a full interval rather than an instant one.
+	double LastProbeLogSeconds_ = 0.0;
 	// Written once by SetLeakIsFatal before the streamer is handed to the world
 	// (MakeFineTileStreamer), read on every leak thereafter -- publish before
 	// use, so a plain bool is sound.

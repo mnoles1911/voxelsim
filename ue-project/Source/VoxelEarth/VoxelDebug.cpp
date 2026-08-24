@@ -1421,14 +1421,127 @@ int32 VoxelDebug::GetWaterMaxActiveBricks()
 	return CVarVoxelWaterMaxActiveBricks.GetValueOnAnyThread();
 }
 
+// -VoxelApplyPerTick=N / -VoxelApplyBudgetMs=F: latched command-line overrides
+// for the two per-tick apply quotas. <= 0 (the default on both) means "use the
+// cvar", which is byte-identical to the shipped behaviour -- the override is a
+// single Max() on a value that is already read once per frame.
+//
+// WHY A COMMAND-LINE LATCH RATHER THAN JUST SETTING THE CVARS. Both are the
+// dominant quota during the COLD FILL, and -ExecCmds lands after streaming has
+// begun: a cvar set that way would leave the first seconds of the fill running
+// the old quota and make the leg a blend of two behaviours. This is the same
+// reason every switch in VoxelStreamAdmission is latched.
+//
+// WHY THEY NEEDED AN OVERRIDE AT ALL -- the constants are sized for a pipeline
+// that no longer exists. Measured on ahead-on.log (2026-08-23), steady state,
+// 'Voxel apply stages' exit split per ~103-tick window:
+//
+//   arm        queueEmpty   wallClock   countCap    drained/tick
+//   gp-ctl2    70-187       0-12        0-28        (drain empties the queue)
+//   ahead-on   0            23-37       67-81       135
+//
+// On the GPU-primary arm the drain loop NEVER reaches an empty queue: ~70% of
+// ticks stop at MaxAppliesPerFrame and ~30% at ApplyBudgetMs, with a
+// delivered-but-unapplied backlog pinned at ~4,000. Throughput is therefore
+// 192 applies x ~20.6 ticks/s = ~3,900/s at the ceiling, and ~3,000/s measured.
+// Meanwhile the streaming tick occupies 24-26% of wall -- the game thread has
+// ~4x of headroom the quota will not let it use.
+//
+// Both constants were tuned against the QUAD/COMPONENT path, and both exist to
+// protect the render thread from proxy churn: MaxAppliesPerFrame's own comment
+// scopes it to "RENDER-THREAD-FACING applies (ApplyMeshResult -> SetChunkQuads
+// -> MarkRenderStateDirty -> FScene::AddPrimitive + GPU buffer upload)", and
+// ApplyBudgetMs is "deliberately below a full frame" to leave room for "the
+// true proxy-create/GPU-upload cost [that] partly surfaces on the render thread
+// a frame or two later". 192 was measured as the knee at 1,040 chunks/s in the
+// 2026-07-27 S1 close.
+//
+// On the marcher path zeroQuad == drained in EVERY window of every leg: the
+// geometry lives in the brick pool and an apply creates no component, no proxy
+// and no upload. The population these ceilings were sized to protect is empty.
+//
+// FAILING READINGS -- read the 'Voxel apply stages' exit split, never a
+// throughput number alone:
+//   countCap still dominant after -> the override did not latch (typo in the
+//     raising -VoxelApplyPerTick      switch name; FParse leaves the value
+//                                     untouched and no warning is printed).
+//   wallClock becomes dominant     -> the COUNT is no longer the bound but the
+//     and drained/tick is flat        6 ms wall is. Raise -VoxelApplyBudgetMs
+//                                     too; neither alone releases the other.
+//   queueEmpty rises to dominate   -> the quota is gone and the pipeline is now
+//     but throughput is flat          starved from UPSTREAM. Nothing further is
+//                                     bought here; go look at dispatch.
+//   throughput up, per-ring settle -> the ordering guarantee has been traded
+//     worse for R0                    away. This is the recorded failure at
+//                                     VoxelWorldSubsystem.cpp:3571-3579 (R3/R4
+//                                     at 0 loaded chunks for 90 s). REVERT.
+static int32 ApplyPerTickOverride()
+{
+	static const int32 Value = []
+	{
+		int32 V = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyPerTick="), V);
+		return V;
+	}();
+	return Value;
+}
+
+static float ApplyBudgetMsOverride()
+{
+	static const float Value = []
+	{
+		float V = 0.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyBudgetMs="), V);
+		return V;
+	}();
+	return Value;
+}
+
 int32 VoxelDebug::GetStreamMaxAppliesPerFrame()
 {
+	if (const int32 Override = ApplyPerTickOverride(); Override > 0)
+	{
+		return Override;
+	}
 	return FMath::Max(1, CVarVoxelStreamMaxAppliesPerFrame.GetValueOnGameThread());
 }
 
 float VoxelDebug::GetStreamApplyBudgetMs()
 {
+	if (const float Override = ApplyBudgetMsOverride(); Override > 0.f)
+	{
+		return Override;
+	}
 	return FMath::Max(0.f, CVarVoxelStreamApplyBudgetMs.GetValueOnGameThread());
+}
+
+// The SHIPPED values, unfiltered by the overrides above. Only the "Voxel apply
+// caps" armed-indicator line reads these: printing the effective value beside
+// the value it replaced is what makes "armed" distinguishable from "the switch
+// name was misspelled and FParse left it alone".
+int32 VoxelDebug::GetStreamMaxAppliesPerFrameCvar()
+{
+	return FMath::Max(1, CVarVoxelStreamMaxAppliesPerFrame.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamApplyBudgetMsCvar()
+{
+	return FMath::Max(0.f, CVarVoxelStreamApplyBudgetMs.GetValueOnGameThread());
+}
+
+// -VoxelApplyDrainCap=N: the third per-tick ceiling in DrainResults, which
+// until now was a bare constexpr with no knob. Default 1024 = the shipped
+// constant, byte-identical. See its use site for why it is raised only as a
+// guard on the sweep rather than as a lever in its own right.
+int32 VoxelDebug::GetStreamDrainCapPerFrame()
+{
+	static const int32 Value = []
+	{
+		int32 V = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyDrainCap="), V);
+		return V > 0 ? V : 1024;
+	}();
+	return Value;
 }
 
 float VoxelDebug::GetStreamLodRetentionMs()

@@ -237,9 +237,23 @@ inline int32 Mode()
 {
 	static const int32 Latched = []
 	{
-		int32 Value = 0;
+		// DEFAULT 3 (guard+cache) AS OF 2026-08-23. -1 sentinel, not 0, so an
+		// explicit -VoxelApplyFast=0 still selects the byte-identical control
+		// arm -- the same rule -VoxelGpuBandSeedOnly uses, and without it the
+		// control leg for this feature would be unrunnable.
+		//
+		// SHIPPED ON THIS EVIDENCE (q-audit.log, caps left at their defaults so
+		// the arm isolates the amplifier fix):
+		//   traffic   avoided/calls 79.6% -> 91.3% across the fill (not inert)
+		//   G3        mismatch=0 sentinel=0 offThread=0 holes=0, and the
+		//             cold-fill chunk population matched control to 1 chunk in
+		//             164,732 with every hit audited (audit=902,154)
+		//   headline  settle 23.7 s -> 21.8 s, 6,955 -> 7,547 chunks/s
+		// Its disproof condition -- avoided ~= calls with apply= unchanged --
+		// did not fire.
+		int32 Value = -1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyFast="), Value);
-		if (Value < 0) { Value = 0; }
+		if (Value < 0) { Value = kModeGuard | kModeCache; }
 		// Measurement is implied by either behavioural arm, so `sampleUs` is
 		// populated for whatever sampling still happens and the before/after is
 		// readable off ONE leg rather than two.
@@ -291,6 +305,13 @@ FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChun
                                               const USceneComponent& Root,
                                               FSampleParamsFn SampleParams,
                                               FShadingFromFn ShadingFrom);
+
+// The dispatch site's out-of-line entry point: same cache, guard unreachable.
+// See its definition for the reqHdr measurement that justified wiring it.
+FVoxelBrickChunkShading ShadingForDispatchSlow(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                               const USceneComponent& Root,
+                                               FSampleParamsFn SampleParams,
+                                               FShadingFromFn ShadingFrom);
 
 // THE ONE EXPRESSION THE HOOK REPLACES.
 //
@@ -424,6 +445,23 @@ double ApplyBudgetSeconds(double CvarSeconds);
 // Effective per-tick total dequeue ceiling (stale discards included).
 // Replaces the bare constexpr 1024. Absent -> 1024.
 int32 DrainsPerTickCap();
+// Dispatch-site twin of ShadingForPublish, and OFF IS FREE HERE FOR THE SAME
+// REASON: with the switch absent this folds to the exact expression it
+// replaced, so no branch survives, no counter moves, and a control leg prints
+// no 'Voxel apply fast' line at all. There is no pack at this site and the
+// result is always consumed, so there is no guard arm to select.
+FORCEINLINE FVoxelBrickChunkShading ShadingForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                                       const USceneComponent& Root,
+                                                       FSampleParamsFn SampleParams,
+                                                       FShadingFromFn ShadingFrom)
+{
+	if (Mode() == 0)
+	{
+		return ShadingFrom(SampleParams(
+			Root, VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level), Key.Level));
+	}
+	return ShadingForDispatchSlow(Key, Root, SampleParams, ShadingFrom);
+}
 
 // Emit the 5 s window line now and reset it, whatever the clock says.
 //

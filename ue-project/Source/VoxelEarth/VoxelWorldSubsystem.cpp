@@ -3370,6 +3370,93 @@ int32 ColdBandDeferParkEnabled()
 	return Value;
 }
 
+// FALSIFIED 2026-08-23 BY ITS OWN DISPROOF CONDITION. DO NOT RE-RUN.
+// Leg q-seed.log, one switch off the q-ctl control, same binary:
+//
+//   arm      seedCpu   bandCache fill (per 2 s)        R0 settle   total
+//   q-ctl          0   785 1343 1763 2187 2552 ...       19.5 s    24.5 s
+//   q-seed    50,913   739 1323 1727 2144 2509 ...       23.3 s    24.3 s
+//
+// The traffic counter proves the switch RAN (50,913 forks declined). The band
+// cache fill rate is UNCHANGED to within 2%, which is the reading written below
+// as "seed latency is NOT the bound -- REVERT, do not tune". R0 got 3.8 s
+// WORSE, and seedCpu at ~2x R0's whole level-0 dispatch count is the second
+// failing reading below: during flight, footprints keep going cold and this
+// switch was taking R0 off the GPU wholesale.
+//
+// WHERE THE ATTRIBUTION BELOW WENT WRONG, because the mechanism half of it is
+// still true and worth keeping: R0's settle really does track the band-cache
+// fill (both legs agree). But the fill is NOT bounded by the seed's ARM
+// latency. The two legs the attribution was derived from -- gp-ctl2 and
+// ahead-on -- differ in many flags, not one (`-VoxelGpuMesh` vs
+// `-VoxelGpuPrimary`), and the 740 fp/s "control" rate belongs to the
+// CPU-primary configuration. A GPU-primary control (q-ctl) fills at ~250 fp/s,
+// the same as ahead-on. The 3x was a configuration difference read as a seed
+// latency difference. The real bound on the fill is how many footprints can
+// hold a blind mark concurrently, which is set by how far into R0's queue the
+// pop loop gets per pass -- not by which arm serves the seed.
+//
+// Kept, defaulted OFF, because the counter and the two legs are the evidence
+// that closes this line of attack; deleting it would invite the next agent to
+// re-derive the same wrong lever from the same two mismatched legs.
+//
+// -VoxelBandSeedCpu=1 (default 0 = OFF, byte-identical): a cold footprint's
+// BAND SEED -- the one level-0 chunk whose result populates FootprintBandCache
+// and thereby releases its ~16 deferred column-mates -- stays on the CPU worker
+// arm instead of taking the GPU fork.
+//
+// WHY, with the numbers that forced it (gp-ctl2 vs ahead-on, 2026-08-23):
+// the cold-band throttle allows ONE blind job per footprint at a time and the
+// mark clears in DrainResults, so R0's dispatch rate is
+// (footprints seeding concurrently) / (seed dispatch->drain latency). R0 has
+// 5,088 footprints. Measured band-cache fill:
+//
+//   arm        bandCache 0 -> 5088   R0 dispatch complete   seed mark lifetime
+//   gp-ctl2    ~6 s (~740 fp/s)      7.5 s                  ~81 ms
+//   ahead-on   ~20 s (~235 fp/s)     22.6 s                 ~600 ms
+//
+// The two middle columns track to within 5%: R0's settle IS the band-cache
+// fill, and the fill is bounded by seed latency. Under -VoxelGpuPrimary the
+// seed takes the fork, whose submitToDeliver alone measured 95-370 ms before
+// the drain queue is added -- 7.4x the CPU arm's whole round trip -- so R0's
+// candidates spend the cold fill being deferred (12,643 defers in a window
+// against 5,168 R0 dispatches) and the nearest-first pick hands R0's turn to
+// R1. That, not any backlog, is why R0 finishes FOURTH on the GPU arm and
+// FIRST on the CPU arm.
+//
+// The seed population is 5,088 chunks out of ~165,000 (3.1%), and under
+// primary the CPU worker pool is the idle arm, so paying for them there is
+// free capacity spent on the only jobs that gate other jobs.
+//
+// Command line, not a cvar, for this family's usual reason: -ExecCmds lands
+// after streaming has begun and a mid-fill flip would make the leg a blend.
+//
+// FAILING READINGS (seedCpu= on the 'Voxel dispatch loop' window line):
+//   seedCpu=0 while armed        -> the predicate never matched. Either
+//                                   bBandSkipActive is false (buried skip off,
+//                                   or -VoxelNoColdBandThrottle) or the fork
+//                                   was already ineligible for every seed.
+//                                   NOTHING IN THIS SWITCH RAN -- a FAIL, not
+//                                   a null result, whatever the settle says.
+//   seedCpu ~= R0's whole level-0-> every level-0 chunk is being treated as a
+//     dispatch count, bandCache     seed: the cache is not warming and this
+//     flat                          switch has simply taken R0 off the GPU.
+//                                   Read bandCache= on the cold-band line to
+//                                   tell this apart from success.
+//   seedCpu high, bandCache fill -> seed latency is NOT the bound. The
+//     rate unchanged vs control     diagnosis above is wrong: REVERT, do not
+//                                   tune.
+int32 BandSeedCpuEnabled()
+{
+	static const int32 Value = []
+	{
+		int32 V = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelBandSeedCpu="), V);
+		return V;
+	}();
+	return Value;
+}
+
 bool BuriedSkipEnabled()
 {
 	static const bool bEnabled = []
@@ -7661,6 +7748,11 @@ struct FVoxelWorldImpl
 	int64 DispatchExitBacklogSinceLog = 0;
 	int64 DispatchCpuLaunchedSinceLog = 0;
 	int64 DispatchGpuForkedSinceLog = 0;
+	// -VoxelBandSeedCpu traffic: fork-eligible level-0 chunks kept on the CPU
+	// arm because they are their footprint's cold-band SEED. Its failing
+	// readings live on VoxelStreamAdmission::BandSeedCpuEnabled; the short form
+	// is that a zero here with the switch armed means nothing in it ran.
+	int64 DispatchBandSeedCpuSinceLog = 0;
 	// Sum of Result.JobMs over this window's drained CPU results (the same
 	// population the empty census sums per level, aggregated). Divided by the
 	// window it is the EFFECTIVE WORKER CONCURRENCY -- the number that caught
@@ -10535,14 +10627,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // reading pair for that gate lives on its accessor; the twin
 	       // backlog= column is on the job-flow line.
 	       TEXT("Voxel dispatch loop (5s window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
-	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld"),
+	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld seedCpu=%lld"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
 	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue(),
 	       AccumCpuWorkerJobMsSinceLog / 1000.0,
 	       ThisLogWindowSeconds > 0.f ? AccumCpuWorkerJobMsSinceLog / (1000.0 * ThisLogWindowSeconds) : 0.0,
 	       VoxelStreamAdmission::WorkerTaskPriority(), VoxelStreamAdmission::WorkerPoolThreads(),
-	       (long long)DispatchExitBacklogSinceLog);
+	       (long long)DispatchExitBacklogSinceLog, (long long)DispatchBandSeedCpuSinceLog);
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
@@ -10579,6 +10671,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	DispatchExitBacklogSinceLog = 0;
 	DispatchCpuLaunchedSinceLog = 0;
 	DispatchGpuForkedSinceLog = 0;
+	DispatchBandSeedCpuSinceLog = 0;
 	AccumCpuWorkerJobMsSinceLog = 0.0;
 
 	// M2 wave 2 item 1 ("Cross-job mip caching"): per-level worker mesh-job
@@ -10822,8 +10915,32 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// component creations, so it understates worker throughput by every buried
 	// chunk and overstates efficiency by every wasted job.
 	// The window is the log cadence itself (LogTimerAccumSeconds has already
-	// been reset to 0 above), i.e. 5s plus at most one frame.
-	constexpr double WindowMs = 5000.0;
+	// been reset to 0 above), i.e. the -VoxelPerfLogInterval plus at most one
+	// frame.
+	//
+	// THIS WAS A HARDCODED 5000.0 AND IT MADE EVERY PERCENTAGE ON THIS LINE
+	// WRONG ON EVERY LEG THIS PROJECT RUNS. The comment directly above it
+	// already said the window is the log cadence; the constant said otherwise,
+	// and the constant is what divided. Every flight leg passes
+	// -VoxelPerfLogInterval=2, so the true window is 2,000 ms and `% of wall`
+	// was reported 2.5x LOW.
+	//
+	// What that cost, 2026-08-23: `ahead-on` steady state was read as "the
+	// streaming tick is 24-26% of wall, the game thread is only 25% busy,
+	// there is 4x of headroom and a per-tick quota is stopping us taking it".
+	// The real occupancy in those same windows is 61-68%. The headroom was
+	// ~1.5x, not 4x -- and an arm that raised the per-tick apply quota 5.3x on
+	// the strength of the 25% figure saturated the game thread and collapsed
+	// the tick rate from ~50 Hz to ~3 Hz.
+	//
+	// The corroborating reading that should have caught it earlier: `drained`
+	// per window divided by 5 s gives ~3,000 chunks/s, but the leg's own settle
+	// time gives 164,735 / 23.5 s = ~7,010 chunks/s. Those two disagreed by
+	// exactly 2.5x for as long as this constant has existed.
+	//
+	// AccumTicks / drained / apply-us are all per-window over per-window and
+	// were never affected -- only the two figures that divide by wall time.
+	const double WindowMs = double(ThisLogWindowSeconds) * 1000.0;
 	// Read once and reused for both the count and the rate, so the two cannot
 	// disagree by a pack that landed between them.
 	const int64 BrickPacksNow = VoxelBrickGetCpuPackCount();
@@ -10832,13 +10949,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel tick budget (5s window): ticks=%d tickMs=%.1f (%.2f%% of wall) | recompute=%.1f dispatch=%.1f ")
 	       TEXT("apply=%.1f remesh=%.1f unload=%.1f | specEnum=%.1f specDispatch=%.1f specPark=%.1f (of dispatch) ")
-	       TEXT("| brickFlush=%.1f brickPacks=%lld (%.0f/s) | perTick tick=%.3f recompute=%.3f"),
+	       TEXT("| brickFlush=%.1f brickPacks=%lld (%.0f/s) | perTick tick=%.3f recompute=%.3f win=%.2fs"),
 	       AccumTicks, AccumTickMs, WindowMs > 0.0 ? 100.0 * AccumTickMs / WindowMs : 0.0, AccumRecomputeMs, AccumDispatchMs,
 	       AccumApplyMs, AccumRemeshMs, AccumUnloadMs, AccumSpecEnumerateMs, AccumSpecDispatchMs, AccumSpecParkMs,
 	       AccumBrickFlushMs, BrickPacksThisWindow,
 	       ThisLogWindowSeconds > 0.f ? double(BrickPacksThisWindow) / double(ThisLogWindowSeconds) : 0.0,
 	       AccumTicks > 0 ? AccumTickMs / AccumTicks : 0.0,
-	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
+	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0,
+	       double(ThisLogWindowSeconds));
 	// DISPATCH STAGES, PER WINDOW (2026-08-23) -- the hitch-only breakdown
 	// promoted to a standing column, because the admission programme's next
 	// wall is arithmetic on exactly these numbers: at the measured 0.21 ms of
@@ -10879,7 +10997,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	if (GpuSubmitCallsSinceLog > 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel gpu submit split (5s window): totalMs=%.1f = reqHdr=%.1f + band=%.1f + raster=%.1f ")
+		       TEXT("Voxel gpu submit split (window): totalMs=%.1f = reqHdr=%.1f + band=%.1f + raster=%.1f ")
 		       TEXT("+ assets=%.1f + pool=%.1f + mgrSubmit=%.1f (drift=%.2f) | calls=%lld perCallUs=%.1f ")
 		       TEXT("| loopSubmitGpuMs=%.1f loopMinusFn=%.1f"),
 		       AccumGpuSubmitTotalMs, AccumGpuSubmitReqHdrMs, AccumGpuSubmitBandMs, AccumGpuSubmitRasterMs,
@@ -17869,21 +17987,15 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		// direct cache-entry API in VoxelApplyFast -- noted there as the
 		// "call the cache directly" variant -- not a sentinel pack, whose
 		// validity would silently depend on voxel.GPU.BrickPackResident.
-		const int32 ApplyFastMode = VoxelApplyFast::Mode();
-		if ((ApplyFastMode & (VoxelApplyFast::kModeCache | VoxelApplyFast::kModeMeasure)) != 0 &&
-		    (ApplyFastMode & VoxelApplyFast::kModeGuard) == 0)
-		{
-			Req.BrickShading = VoxelApplyFast::ShadingForPublishSlow(
-				LevelKey, FVoxelBrickCpuPackRef(), *PoolRootForShading,
-				&SampleChunkParamsForPool, &ShadingFromChunkParams);
-		}
-		else
-		{
-			Req.BrickShading = ShadingFromChunkParams(SampleChunkParamsForPool(
-				*PoolRootForShading,
-				VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level),
-				LevelKey.Level));
-		}
+		// HOOK 4, now via the guard-free entry point. The branch that used to
+		// stand here disengaged VoxelApplyFast whenever the guard bit was set,
+		// which meant the SHIPPING mode (3) cached at the drain site and ran the
+		// raw four-column expression here -- at the site the reqHdr measurement
+		// says is the expensive one. ShadingForDispatch cannot reach the guard,
+		// so mode 3 caches at both. Mode 0 still folds to the raw expression.
+		Req.BrickShading = VoxelApplyFast::ShadingForDispatch(
+			LevelKey, *PoolRootForShading,
+			&SampleChunkParamsForPool, &ShadingFromChunkParams);
 	}
 	// D5.3. Computed on the game thread where the anchor and RingPresets are
 	// live, exactly as the worker job's is, and baked into this dispatch.
@@ -18774,6 +18886,10 @@ void FVoxelWorldImpl::DispatchJobs()
 	// blind mark ages out, which is what keeps R0's per-footprint dispatch
 	// pipeline moving under -VoxelGpuPrimary.
 	const int32 DispatchAheadCapN = VoxelStreamAdmission::DispatchAheadCap();
+	// -VoxelBandSeedCpu (0 = off, byte-identical): keep a cold footprint's band
+	// SEED on the CPU arm. Read once per call like the caps above -- it is a
+	// latched command-line value and this loop runs over every pending key.
+	const int32 BandSeedCpuN = VoxelStreamAdmission::BandSeedCpuEnabled();
 	// Read ONCE per call, not per chunk: it is a cvar read and this loop runs
 	// over every pending key. See VoxelBrickCpuArm::VolumeNeedsSolidChunks --
 	// with the brick volume off this is false and every skip below behaves
@@ -19271,7 +19387,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// fixture reports no cave column anywhere, the sweep says so out loud
 		// and the band's cave path is untested on that terrain -- read the PASS
 		// lines accordingly before trusting this in production.
-		const bool bGpuMeshEligible =
+		const bool bGpuMeshEligibleBeforeSeed =
 			VoxelStreamAdmission::GpuMeshEnabled()
 			&& LevelKey.Level <= VoxelStreamAdmission::GpuMeshMaxLevel()
 			// THE SKIRT IS NOW ON THE GPU (D5.3), so boundary chunks are no
@@ -19313,6 +19429,37 @@ void FVoxelWorldImpl::DispatchJobs()
 			// exactly as before, so the fork's demand supply is otherwise
 			// untouched. No-op with the switch off (default).
 			&& !(bFloorCpuOnly && bFloorDeficitPick);
+
+		// -VoxelBandSeedCpu: is THIS chunk its footprint's cold-band seed?
+		//
+		// Reaching here at level 0 with the throttle active and no cache entry
+		// is exactly that: the throttle block above already `continue`d every
+		// candidate whose footprint has a live mark, so the only level-0
+		// uncached chunk that survives to the fork decision is the one about
+		// to become the seed. (It is the same test the GPU branch below uses
+		// to SET the mark -- one condition, read twice, not two conditions
+		// that can drift.)
+		//
+		// The seed's result is what clears the mark and populates
+		// FootprintBandCache, releasing ~16 deferred column-mates, so its
+		// latency multiplies. The fork's round trip is 7.4x the worker's; see
+		// VoxelStreamAdmission::BandSeedCpuEnabled for the measured fill rates
+		// and for what a zero on the counter below means.
+		const bool bColdBandSeed =
+			BandSeedCpuN != 0
+			&& LevelKey.Level == 0
+			&& bBandSkipActive
+			&& !FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
+		// Counted only when the term CHANGED the outcome -- i.e. the fork was
+		// otherwise eligible and this predicate is what sent the chunk to the
+		// worker. A seed that was going to the CPU anyway (GPU full, level
+		// gate, bNoGpuRetry) is not traffic this switch created, and counting
+		// it would let an inert switch read healthy.
+		if (bColdBandSeed && bGpuMeshEligibleBeforeSeed)
+		{
+			++DispatchBandSeedCpuSinceLog;
+		}
+		const bool bGpuMeshEligible = bGpuMeshEligibleBeforeSeed && !bColdBandSeed;
 
 		// -VoxelGpuMeshQueueDepth (default 0 = no cap, byte-identical control):
 		// with the cap armed, a fork-eligible chunk goes to the CPU worker
@@ -22018,7 +22165,35 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	// to 0 under aggressive unloading before this split). The cheap discard
 	// work is instead bounded by a much larger per-frame drain cap so a huge
 	// stale backlog can't stall the game thread either.
-	constexpr int32 kMaxResultDrainsPerFrame = 1024;
+	// -VoxelApplyDrainCap=N overrides it (<= 0 = shipped 1024, byte-identical).
+	// const rather than constexpr: it is only read in the loop condition and in
+	// the exit attribution, neither of which needs a constant expression.
+	//
+	// This is the THIRD ceiling in series in this loop, and the only one that
+	// had no knob at all -- a leg that hit it needed a rebuild to find out.
+	// It does not bind today (drainCap=0 in every window of every leg on disk)
+	// and it cannot bind while MaxApplies < 1024, since Applied <= Drains. It
+	// is raised here so the sweep that lifts the first two cannot silently walk
+	// into it and read the result as a property of the pipeline.
+	const int32 kMaxResultDrainsPerFrame = VoxelDebug::GetStreamDrainCapPerFrame();
+	// ARMED INDICATOR, printed once per process. "The switch is on" and "the
+	// switch name was misspelled and FParse left the value alone" produce
+	// identical logs otherwise, and this project has shipped eleven features
+	// that were inert while every indicator read healthy. If this line is
+	// absent the hooks are not in the build; if it is present but shows the
+	// cvar values, the override did not latch.
+	{
+		static bool bLoggedApplyCaps = false;
+		if (!bLoggedApplyCaps)
+		{
+			bLoggedApplyCaps = true;
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel apply caps: maxApplies=%d (cvar %d) budgetMs=%.2f (cvar %.2f) drainCap=%d (shipped 1024)"),
+			       MaxApplies, VoxelDebug::GetStreamMaxAppliesPerFrameCvar(),
+			       VoxelDebug::GetStreamApplyBudgetMs(), VoxelDebug::GetStreamApplyBudgetMsCvar(),
+			       kMaxResultDrainsPerFrame);
+		}
+	}
 	int32 Applied = 0; // render-thread-facing applies (live results) this frame -- gated by MaxApplies
 	int32 Drains = 0;  // total results dequeued incl. stale discards (game-thread-cheap) -- gated by kMaxResultDrainsPerFrame
 	int32 ProxiesCreated = 0;

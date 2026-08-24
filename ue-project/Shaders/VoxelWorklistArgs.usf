@@ -18,13 +18,33 @@
 #include "/Engine/Public/Platform.ush"
 
 RWStructuredBuffer<uint> WorklistControl;
-// EVoxelWorklistStage::COUNT triples of {groupsX, 1, 1}, consumed by
+// EVoxelWorklistStage::COUNT triples of {groupsX, groupsY, 1}, consumed by
 // DispatchIndirect. Typed R32 (RWBuffer, not RWStructuredBuffer): the host
 // creates this with CreateIndirectDesc and binds a PF_R32_UINT UAV.
 RWBuffer<uint> WorklistArgs;
 // Per-stage groups-per-record, bound from the host enum table so the shader
 // carries no copy of the stage shapes.
 StructuredBuffer<uint> GroupsPerRecord;
+// Per-stage RECORD DIMENSION, parallel to GroupsPerRecord and bound from the
+// same host table: 0 = the record is carried in X (the triple is
+// {Take x groups, 1, 1}), 1 = the record is carried in Y ({groups, Take, 1}).
+//
+// A dispatch dimension is capped at 65,535 groups, so a stage with G groups
+// per record caps a flush at 65,535/G records while its record rides X. The
+// Write stage (the Claim stage's two word copies, 148 groups per record --
+// the biggest of any stage by 2.3x) capped it at 442 = ~26,500 chunks/s at
+// 60 ticks, BELOW the 50,000 goal. Moving only that stage's record to Y makes
+// its X a constant 148 and leaves the binding stage at 64 groups/record
+// (Classify, Pack) = 1,023 records = ~61,000 chunks/s.
+//
+// A table rather than a stage-index literal here, for the reason the
+// GroupsPerRecord table exists: this kernel must carry no copy of the stage
+// shapes. The consuming kernel is locked to the SAME host constant through
+// its own #error (VXC_WORKLIST_WRITE_RECORD_IN_Y), because the failure is
+// silent otherwise -- a kernel reading the record from Y against a 1D triple
+// sees Gid.y == 0 for every group and writes only record 0, leaving every
+// other chunk's pool words unwritten. HOLES, with no error anywhere.
+StructuredBuffer<uint> RecordInY;
 
 uint HeadCursor;     // host ring head (records appended so far, mod capacity handled host-side as monotonic counts)
 uint SliceBudget;    // max records the consuming graph may take this tick
@@ -41,8 +61,10 @@ void WorklistArgsMain(uint3 tid : SV_DispatchThreadID)
 	WorklistControl[2] = Tail + Take;
 	for (uint S = 0; S < StageCount; ++S)
 	{
-		WorklistArgs[S * 3u + 0u] = Take * GroupsPerRecord[S];
-		WorklistArgs[S * 3u + 1u] = 1u;
+		const uint G = GroupsPerRecord[S];
+		const bool bRecY = RecordInY[S] != 0u;
+		WorklistArgs[S * 3u + 0u] = bRecY ? G : (Take * G);
+		WorklistArgs[S * 3u + 1u] = bRecY ? Take : 1u;
 		WorklistArgs[S * 3u + 2u] = 1u;
 	}
 }

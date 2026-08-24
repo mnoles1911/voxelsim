@@ -488,3 +488,91 @@ Re-measure before believing any of it helps (the architecture doc's own
 rule): the conversion becomes NECESSARY somewhere above ~17,000 chunks/s
 (500 passes/tick / 14 per stack x 8 chunks x 60 ticks); below that it is
 pure overhead and the spine's own cost must stay invisible.
+
+## Band-edge chunks ADMITTED, and the Write triple's Y carry (2026-08-23, night 3)
+
+Two ceilings, both named in the stage-6 handoff, both removed. Authored, not
+built.
+
+### The band skip was testing the wrong region's field
+
+`-VoxelGpuWorklistBandChunks=1` (off is byte-identical). The record-append
+gate refused any chunk with `Job->Region.BandEdge != 0` -- but a job carries
+TWO region requests and the record is built entirely from the other one.
+`Job->Region` is the 48x48x6 MESH region (one brick of halo) that produces the
+footprint band; `Job->BrickRegion` is the halo-free 32x32xN region the worklist
+converts, and `ApplyBrickRegionShape` sets `OutReq.BandEdge = 0`
+UNCONDITIONALLY with a comment saying the band belongs to the mesh region. So
+a band chunk's brick region is byte-for-byte the same shape as a lean chunk's,
+and the gate was reading a field the converted chain never touches. It was
+copied from the LEAN gate (`bLeanJob`), where testing `Region.BandEdge` is
+CORRECT because that decision is about whether to skip the mesh-region graph.
+
+The two halves are separate `AddRegionPasses` calls into the same
+`FRDGBuilder`, so admitting the brick half changes nothing about the band
+half. `AddRegionPasses`' own column-feed `checkf` already asserts
+`Request.BandEdge == 0`, and it holds by construction -- which is what makes
+this safe rather than hopeful. Delivery is unchanged: the poll path gates on
+`bNeedBand` exactly as before, and the flush graph's claim is enqueued BEFORE
+the batch graph that carries the band readback copy, so the claim is complete
+by the time the band lands. Strictly safer than the existing lean shape.
+
+WHAT STAYS PER-CHUNK, with its arithmetic: the band half is 3 passes
+(ColumnMain + VoxelizeMain + BandReduceMain on the 48x48 region) + 1 readback
+copy, on a region shape the record cannot describe (`kColumnsPerRecord` is
+static_asserted at 1,024 = 32x32) and ending in a CPU readback that
+`VoxelStreaming::MakeFootprintBand` consumes. Band chunks are 6.6% of this
+flight, so the residual is
+
+        passes/tick = 11 + 0.066 x chunksPerTick x 4
+
+which reaches the ~500/tick hitch cliff only at ~1,850 chunks/tick =
+**~111,000 chunks/s at 60 fps, 2.2x past the 50,000 goal.** The pass term
+therefore stops being the binding constraint -- which is NOT the same claim as
+"flat", and should not be written down as one.
+
+`kPassesPerBandJobExtra = 2` corrects a tally bug found on the way:
+`kPassesPerClassicAllocJob = 19` counts "mesh region 2" (Column + Voxelize),
+which is right for a brick-only job nobody reads but misses a band job's
+BandReduceMain pass and its readback copy. True cost 21. A +1.5% correction
+that changes no conclusion, but the band term is the ONLY one left in
+passes/tick once the brick halves convert, and a residual measured with a
+constant known to be 2 low is not a measurement. **Do not compare a
+passes/tick number from before this commit to one after without this in hand.**
+
+Readings: `bandAdmitted=` on the window line. FAILING: 0 with the switch armed
+and band chunks flowing = the gate never fired; growing while `wlclaim conv`
+does not = admitted and falling back for a second reason (read `wlcols fbBy`).
+
+### The Write triple carries its record in Y
+
+A dispatch dimension is capped at 65,535 groups. Every stage's triple was
+`{Take x groupsPerRecord, 1, 1}`, so the Write stage's 148 groups/record --
+the largest of any stage by 2.3x -- capped a flush at 442 records = **~26,500
+chunks/s at 60 ticks, below the goal.** It is now `{148, Take, 1}`: X is a
+constant 148, Y is the record count, and the binding stage becomes whichever
+still rides X with the most groups per record (Classify and Pack, at 64) =
+**1,023 records = ~61,000 chunks/s.**
+
+`kMaxRecordsPerFlush` (65,535/64) replaces the hardcoded 442 in the arming
+path's refusal. **The refusal stays loud** -- a budget above the ceiling would
+silently clip a dispatch, and a cap that refuses is worth more than one that
+clips.
+
+The mechanism is one host constant with two consumers:
+`FVoxelGpuWorklist::kWriteRecordInY` fills the args kernel's new `RecordInY`
+table (parallel to `GroupsPerRecord`, same reason: the args kernel carries no
+copy of the stage shapes) AND is handed to the claim kernels as
+`VXC_WORKLIST_WRITE_RECORD_IN_Y`, which `VoxelWorklistClaim.usf` `#error`s on
+if it is not 1. That lock is load-bearing because the failure is otherwise
+SILENT: a kernel reading its record from `Gid.y` against a 1D triple sees
+`Gid.y == 0` for every group, writes record 0's pool words 148 x Take times
+and leaves every other chunk's volume unwritten -- holes, no error, and a
+throughput number that looks fine. Four `static_assert`s back it: the ceiling
+against 65,535/64, the constant against 1, every X-carrying stage against 64
+groups, and `EVoxelWorklistStage::Write == 6` because `kRecordInY` is a
+POSITIONAL table whose single nonzero entry must sit on Write.
+
+`tools/voxel-check-worklist-shader.ps1` gained the define and all 30 kernels
+compile. The `#error` fired on the first run before the script was updated,
+which is the lock working.

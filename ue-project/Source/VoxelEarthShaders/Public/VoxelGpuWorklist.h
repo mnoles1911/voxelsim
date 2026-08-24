@@ -225,6 +225,36 @@ public:
 	static constexpr uint32 kWriteGroupsPerRecord =
 		(kOccWordsPerRecord + kMatWordsPerRecord) / 64;
 	static constexpr uint32 kClaimDwordsPerRecord = 8;
+
+	// --- THE RECORD DIMENSION, and why the Write triple alone uses Y --------
+	//
+	// Every stage's indirect triple was {Take x groupsPerRecord, 1, 1}. A
+	// dispatch dimension is capped at 65,535 groups (D3D12_CS_DISPATCH_MAX_
+	// THREAD_GROUPS_PER_DIMENSION), so the Write stage's 148 groups/record
+	// capped a flush at 442 records = ~26,500 chunks/s at 60 ticks -- BELOW
+	// the 50,000 goal, and the lowest ceiling of any stage by a factor of
+	// 2.3. Carrying the record in Y instead, {148, Take, 1}, removes it: X is
+	// a constant 148 and Y is the record count.
+	//
+	// ONE CONSTANT, TWO CONSUMERS, WHICH IS THE WHOLE POINT. This value fills
+	// the args kernel's RecordInY table AND is handed to the claim kernels as
+	// VXC_WORKLIST_WRITE_RECORD_IN_Y, and VoxelWorklistClaim.usf #errors if it
+	// is not 1. A torn dispatch here is not loud on its own -- if the args
+	// went back to 1D, Gid.y would be 0 for every group and only record 0's
+	// pool words would be written, leaving every other chunk's volume
+	// unwritten: HOLES, silently. The #error is what makes that impossible
+	// rather than unlikely.
+	static constexpr uint32 kWriteRecordInY = 1;
+
+	// The per-flush record cap the 1D stages still impose. With the Write
+	// stage on Y, the binding stage is whichever REMAINING stage has the most
+	// groups per record -- Classify and Pack, at 64 (one group per brick) --
+	// so 65,535 / 64 = 1,023 records per flush = ~61,000 chunks/s at 60
+	// ticks, above the 50,000 goal. The .cpp static_asserts that no 1D stage
+	// exceeds 64, so this number cannot drift away from the table it
+	// describes; the arming path REFUSES a cell budget above it, loudly,
+	// rather than clipping a dispatch silently.
+	static constexpr uint32 kMaxRecordsPerFlush = 65535 / 64;
 	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
 	// [4..5] the column verify's mismatch/checked counters
 	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's
@@ -233,8 +263,17 @@ public:
 	// voxelize verify kernel with VerifyStatsBase 10 -- it compares the
 	// stamped cells), [12..13] the pack verify's (VoxelWorklistPack.usf),
 	// [14..15] the claim verify's (VoxelWorklistClaim.usf -- [14]
-	// mismatches, [15] dwords checked).
-	static constexpr uint32 kStatsDwords = 16;
+	// mismatches, [15] dwords checked), [16] THE CLAIM STAGE'S OWN TRAFFIC
+	// COUNTER: how many records ClaimWorklistMain actually found eligible,
+	// cumulative, written on every armed tick whether or not any verify is
+	// armed. It exists because the two things that must be the same set --
+	// the records the GPU claims and the chunks the host counts as converted
+	// -- were NOT the same set, and no instrument in the system could say so:
+	// `checked` was read as evidence over the host's conv count when it was
+	// really running over ~31x that many records. [17..19] reserved (the
+	// readback copies whole dwords; kept a multiple of 4).
+	static constexpr uint32 kStatsDwords = 20;
+	static constexpr uint32 kStatsClaimEligible = 16;
 
 	~FVoxelGpuWorklist();
 
@@ -372,6 +411,26 @@ public:
 	};
 	FLastFlush GetLastFlush() const { return LastFlush; }
 
+	// Game thread: how many records the LAST flush stamped claimStaged (bit
+	// 10) on, and the running total. This is the HOST's count of the set the
+	// GPU's ClaimWorklistMain will find eligible; the manager compares it to
+	// its own bWorklistClaimFed count and to the GPU's [16] every proof.
+	// THE FAILING READINGS, both directions:
+	//   * CumClaimStaged > the manager's WorklistClaimConverted -- records
+	//     staged for a GPU claim whose host job did NOT convert, so its batch
+	//     graph claims the same slot too: A DOUBLE CLAIM, pool ranges leaking
+	//     at exactly that rate ([brick-gpualloc] `unclaimed` goes negative).
+	//   * CumClaimStaged < WorklistClaimConverted -- the host skipped a batch
+	//     graph's brick chain for a chunk nothing ever claimed: the chunk
+	//     lands unwritten (holes), never corruption.
+	//   * CumClaimStaged > 0 with the GPU's [16] flat at 0 -- the stage is
+	//     staging records and the kernel is not running: DEAD STAGE.
+	uint32 GetClaimStagedThisFlush() const { return ClaimStagedThisFlush; }
+	int64 GetCumClaimStaged() const { return CumClaimStaged; }
+	// The GPU's own count of records ClaimWorklistMain found eligible, as of
+	// the last landed proof; -1 until a proof has landed.
+	int64 GetGpuClaimEligible() const { return GpuClaimEligible; }
+
 	// Render thread, from inside a graph that consumes the column stage's
 	// output (the batch graph): registers the arena and the stats buffer.
 	// Arena is null until the first armed Flush has run on the render thread
@@ -470,6 +529,14 @@ public:
 		// under the verify switch is a DEAD GATE, never a pass.
 		uint64 ClaimDwordMismatches = 0;
 		uint64 ClaimDwordsChecked = 0;
+		// The set-identity pair. ClaimEligibleOnGpu is stats[16] -- records
+		// ClaimWorklistMain actually claimed; ClaimStagedOnHost is the host's
+		// own count of records it stamped claimStaged on. THEY MUST BE THE
+		// SAME NUMBER (the GPU lagging by the readback latency is the only
+		// permitted gap, and only in that direction). GPU ahead = a double
+		// claim, one leaked grant per excess record.
+		uint64 ClaimEligibleOnGpu = 0;
+		int64 ClaimStagedOnHost = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -554,6 +621,13 @@ private:
 	bool bClaimStageArmed = false;
 	bool bClaimVerifyArmed = false;
 	FPoolBinder ClaimPoolBinder;
+	// The host's own count of the set the GPU will claim: records this flush
+	// stamped claimStaged on (bit 10, which now requires the manager's bit 11
+	// hostClaimCandidate). Compared against the manager's converted count and
+	// the GPU's stats[16] -- see GetClaimStagedThisFlush's failing readings.
+	uint32 ClaimStagedThisFlush = 0;
+	int64 CumClaimStaged = 0;
+	int64 GpuClaimEligible = -1;   // GPU stats[16] as of the last landed proof
 	FLastFlush LastFlush;
 
 	// --- the spine proof (game-thread state) --------------------------------
