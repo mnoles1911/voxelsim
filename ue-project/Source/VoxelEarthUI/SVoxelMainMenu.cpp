@@ -160,6 +160,11 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	const float HalfSep = L.MainColumnSeparation * 0.5f;
 	const FMargin SlotPad(0.f, HalfSep);
 
+	// TWO COLUMNS, NOT ONE, AND THE SPLIT IS THE FIX. Everything in `Column`
+	// is 520 units wide (MainPanelHalfWidth * 2, the Godot _main_panel width)
+	// because the BUTTONS want to be. The title does not fit in 520 and must
+	// not inherit it -- see the return at the bottom of this function.
+	TSharedRef<SVerticalBox> TitleColumn = SNew(SVerticalBox);
 	TSharedRef<SVerticalBox> Column = SNew(SVerticalBox);
 	TSharedPtr<SVoxelMenuButton> NewGameButton;
 	TSharedPtr<SVoxelMenuButton> SettingsButton;
@@ -167,29 +172,16 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	TSharedPtr<SVoxelMenuButton> CreditsButton;
 	TSharedPtr<SVoxelMenuButton> QuitButton;
 
-	// THE TITLE IS DELIBERATELY WIDER THAN THE PANEL IT SITS IN. Everything
-	// else in this column is 520 units across (MainPanelHalfWidth * 2, the
-	// Godot _main_panel width), and that number is about the BUTTONS. The
-	// title inherited it and Slate's text layout cut the string at the
-	// boundary -- the first capture rendered "VOXELMARK" as "OXELMAR". The
-	// SBox gives the text its own, measured width; the slot stays centred, so
-	// the extra width spills symmetrically and nothing else moves. See
-	// TitleBoxWidth in VoxelUITheme.h for the measurement and backlog 0.0l.
-	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
+	TitleColumn->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
 	[
-		SNew(SBox)
-		.WidthOverride(L.TitleBoxWidth)
-		.HAlign(HAlign_Center)
-		[
-			SNew(STextBlock)
-			.Text(VoxelUIStrings::Title())
-			.Font(Style.Serif(L.TitleFontSize))
-			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
-			.Justification(ETextJustify::Center)
-		]
+		SNew(STextBlock)
+		.Text(VoxelUIStrings::Title())
+		.Font(Style.Serif(L.TitleFontSize))
+		.ColorAndOpacity(FVoxelUIStyle::TitleColour())
+		.Justification(ETextJustify::Center)
 	];
 
-	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
+	TitleColumn->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
 	[
 		SNew(STextBlock)
 		.Text(VoxelUIStrings::Subtitle())
@@ -198,7 +190,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 		.Justification(ETextJustify::Center)
 	];
 
-	Column->AddSlot().AutoHeight()
+	TitleColumn->AddSlot().AutoHeight()
 	[
 		SNew(SSpacer).Size(FVector2D(0.f, L.TitleToButtonsSpacer))
 	];
@@ -295,13 +287,40 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	// lives on each SVoxelMenuButton's inner SButton rather than here -- see
 	// that file for why a container is the wrong place for it.
 
+	// THE TITLE SITS OUTSIDE THE BUTTON PANEL'S WIDTH, and it has to -- a child
+	// cannot escape a narrower parent by asking for more. Slate's AlignChild
+	// (LayoutUtils.h) clamps a non-Fill child to its parent by default:
+	//
+	//     ChildSize = bClampToParent ? Min(ChildDesiredSize, AllottedSize) : ...
+	//
+	// so an inner SBox asking for 720 inside a 520 parent is silently given
+	// 520. That was tried first and produced a byte-identical capture, which is
+	// how the clamp was found. The width has to come from the PARENT chain.
+	//
+	// So the outer box is TitleBoxWidth and the buttons get their own 520 box
+	// inside it. Everything the buttons care about is unchanged: same width,
+	// same centring, same fixed height. Only the title and subtitle see the
+	// wider box. See backlog 0.0l.
 	return SNew(SBox)
-		.WidthOverride(L.MainPanelHalfWidth * 2.f)
+		.WidthOverride(L.TitleBoxWidth)
 		.HeightOverride(L.MainPanelHalfHeight * 2.f)
-		.HAlign(HAlign_Fill)
+		.HAlign(HAlign_Center)
 		.VAlign(VAlign_Center)
 		[
-			Column
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+			[
+				TitleColumn
+			]
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+			[
+				SNew(SBox)
+				.WidthOverride(L.MainPanelHalfWidth * 2.f)
+				.HAlign(HAlign_Fill)
+				[
+					Column
+				]
+			]
 		];
 }
 
