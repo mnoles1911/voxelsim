@@ -57,7 +57,7 @@ add(
 add(
     one("mag_ashfallen_cast", "An armoured revenant working magic, a clipped joyless discharge that visibly costs it, no voice and never triumphant, %s" % DRY, 1.6, 0.38, 3, "Combat", "19"),
     loop_("mag_hand_ritual_chant_loop", "a group ritual working, low rhythmic non-verbal intoning with no intelligible words in any language, strained and joyless", 20, 0.28, "Ambient", "19"),
-    loop_("mag_ashlord_presence_loop", "the presence of an overwhelming hostile power nearby, an oppressive pressure field with everything else going quiet under it", 22, 0.26, "Ambient", "19"),
+    loop_("mag_ashlord_presence_loop", "the presence of an overwhelming hostile power nearby, an oppressive pressure field with everything else going quiet under it", 20, 0.26, "Ambient", "19"),
     one("mag_ashlord_unmask_sting", "A concealed power revealing itself, a single low wrong tone with the air collapsing inward, dreadful rather than grand, %s" % DRY, 3.0, 0.32, 1, "Ambient", "19"),
-    loop_("mag_mordvar_ambient_loop", "the world thinning near something ancient and wrong, a sustained absence where sound should be, with no discrete event in it", 25, 0.24, "Ambient", "19"),
+    loop_("mag_mordvar_ambient_loop", "the world thinning near something ancient and wrong, a sustained absence where sound should be, with no discrete event in it", 20, 0.24, "Ambient", "19"),
 )

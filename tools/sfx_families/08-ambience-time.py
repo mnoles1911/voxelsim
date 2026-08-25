@@ -58,8 +58,8 @@ REGIONS = {
         "the edge of an unnatural sea, waves moving wrongly against each other with a low harmonic underneath and no gulls"),
 }
 for r, (day, night) in REGIONS.items():
-    add(loop_("amb_%s_day_loop" % r, "%s, wide stereo field" % day, 30, 0.25, "Ambient", "10"))
-    add(loop_("amb_%s_night_loop" % r, "%s, wide stereo field" % night, 30, 0.25, "Ambient", "10"))
+    add(loop_("amb_%s_day_loop" % r, "%s, wide stereo field" % day, 20, 0.25, "Ambient", "10"))
+    add(loop_("amb_%s_night_loop" % r, "%s, wide stereo field" % night, 20, 0.25, "Ambient", "10"))
 
 # Sub-ambience one-shots, randomised over the beds (the Minecraft cave-sound
 # model). These must sit UNDER the bed, so they are quiet and un-startling

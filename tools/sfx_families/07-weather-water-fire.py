@@ -49,12 +49,21 @@ WX_STATES = {
     "ash_haze":  "an ashfall haze, dry dead air with fine grit drifting and no living sound at all",
 }
 for s, detail in WX_STATES.items():
-    add(loop_("wx_%s_bed_loop" % s, "%s, wide stereo field" % detail, 25, 0.25, "Ambient", "07"))
+    add(loop_("wx_%s_bed_loop" % s, "%s, wide stereo field" % detail, 20, 0.25, "Ambient", "07"))
 
 add(
     one("wx_storm_front_approach", "A storm front arriving, distant wind and thunder building steadily closer over several seconds, %s" % DRY, 8.0, 0.30, 2, "Ambient", "07"),
     one("wx_rain_onset_ramp", "Rain beginning, the first scattered drops building into steady rainfall, %s" % DRY, 6.0, 0.30, 1, "Ambient", "07"),
     one("wx_rain_tailoff", "Rain ending, steady rainfall thinning to scattered last drops and dripping, %s" % DRY, 6.0, 0.30, 1, "Ambient", "07"),
+    # THE ONE DELIBERATE OVER-LENGTH ENTRY. Every other loop is clamped to the
+    # 20 s the prompts doc calls for ("Loops use a fixed 12-20 s"), because
+    # ElevenLabs caps SFX duration and an over-length request comes back
+    # truncated rather than refused -- which looks like a bad take, not a bad
+    # request. This one keeps 30 s because its id names the duration and the
+    # library specifies the swell as a 30-second shape. If the API will not
+    # give 30 s, render it in two halves and join, the way section 6 of the
+    # music doc handles the long cues -- do NOT quietly shorten it to 20 and
+    # leave the id saying 30.
     one("wx_weather_swell_30s", "A slow thirty second swell of weather intensity rising and easing again, a single long breath of wind and rain, %s" % DRY, 30.0, 0.25, 1, "Ambient", "07"),
     loop_("wx_snowfall_hiss_loop", "snow falling steadily, a fine dry hiss with the world hushed around it", 20, 0.25, "Ambient", "07"),
     loop_("wx_ashfall_whisper_loop", "ash falling steadily, a dry whispering drift of fine particles, dead and lifeless", 20, 0.25, "Ambient", "07"),
@@ -83,11 +92,11 @@ add(
     loop_("water_river_flow_loop", "a river flowing steadily over a rocky bed, continuous rushing water, wide stereo field", 20, 0.28, "Ambient", "08"),
     loop_("water_brook_trickle_loop", "a small brook trickling over stones, light bright running water", 16, 0.30, "Ambient", "08"),
     loop_("water_channel_rush_loop", "water running fast down a narrow dug channel, a confined urgent rush", 16, 0.30, "Ambient", "08"),
-    loop_("water_surf_cliff_loop", "heavy surf breaking against cliffs, deep swells collapsing and dragging back, wide stereo field", 25, 0.28, "Ambient", "08"),
+    loop_("water_surf_cliff_loop", "heavy surf breaking against cliffs, deep swells collapsing and dragging back, wide stereo field", 20, 0.28, "Ambient", "08"),
     loop_("water_harbor_lap_loop", "harbour water lapping against stone and timber, small regular slaps with hulls creaking faintly", 20, 0.28, "Ambient", "08"),
     loop_("water_drip_cluster_loop", "scattered water drips falling in a wet cave, irregular plops at different distances", 18, 0.28, "Ambient", "08"),
     loop_("water_runoff_postrain_loop", "water running off after rain, gutters and channels draining with steady trickles", 18, 0.28, "Ambient", "08"),
-    loop_("water_wave_shroud_boundary_loop", "an unnatural sea boundary, waves moving against themselves with a wrong low harmonic underneath, unsettling, wide stereo field", 25, 0.25, "Ambient", "08"),
+    loop_("water_wave_shroud_boundary_loop", "an unnatural sea boundary, waves moving against themselves with a wrong low harmonic underneath, unsettling, wide stereo field", 20, 0.25, "Ambient", "08"),
 )
 
 # --- Category 09: Fire & Camp ---------------------------------------------

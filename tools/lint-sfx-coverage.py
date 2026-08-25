@@ -33,6 +33,14 @@ import sfx_spec  # noqa: E402
 
 ID_RE = re.compile(r"^[a-z][a-z0-9_]{3,}$")
 
+# docs/sfx-prompts.md section 1: "Loops use a fixed 12-20 s."
+LOOP_MAX_SECONDS = 20
+DURATION_EXEMPT = {
+    # Its id names its duration and the library specifies a 30-second shape.
+    # Render in two halves and join if the API will not give 30 s in one take.
+    "wx_weather_swell_30s",
+}
+
 
 def prompt_ids(path):
     """Every id in the prompts doc, as {id: line number}."""
@@ -91,6 +99,18 @@ def main():
             print("  %-40s (prompts doc line %d)" % (i, doc_ids[i]))
         if len(orphan) > 40:
             print("  ... and %d more" % (len(orphan) - 40))
+
+    # Duration guard. The prompts doc says loops are "a fixed 12-20 s", and
+    # ElevenLabs caps SFX length -- an over-length request comes back TRUNCATED
+    # rather than refused, so it reads as a bad take instead of a bad request.
+    # That is expensive to diagnose by ear, so catch it here instead.
+    long_ids = sorted(e["id"] for e in spec
+                      if float(e["dur"]) > LOOP_MAX_SECONDS and e["id"] not in DURATION_EXEMPT)
+    if long_ids:
+        print("\n%d IDS ASK FOR MORE THAN %d SECONDS:" % (len(long_ids), LOOP_MAX_SECONDS))
+        for i in long_ids:
+            print("  %-40s %ss" % (i, spec_ids[i]["dur"]))
+        print("  Clamp them, or add to DURATION_EXEMPT with a reason.")
 
     # Printed EVERY run, pass or fail. The drift is tolerated, not resolved,
     # and an untracked tolerance becomes permanent by default.
