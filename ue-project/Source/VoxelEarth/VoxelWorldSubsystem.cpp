@@ -25647,6 +25647,9 @@ void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
 	{
 		return;
 	}
+	// Stamped before anything else can early-out past it. See
+	// HasWorldSessionSettled() for why one frame matters.
+	WorldSessionStartFrame = GFrameCounter;
 	if (bWorldSessionStartAttempted)
 	{
 		// Not an error worth stopping for, but always worth saying: the only

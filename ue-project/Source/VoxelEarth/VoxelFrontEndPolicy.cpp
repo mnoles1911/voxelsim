@@ -365,16 +365,24 @@ bool IsWorldHeldForMenu(const UWorld* World)
 		return false;
 	}
 
-	// The SAME ChunkOwner the streamer gates on. When the session has started,
-	// the menu has handed over and every subsystem is free again -- including
-	// during the loading screen, which must stream precisely so the gate it
-	// waits on can converge.
+	// The SAME ChunkOwner the streamer gates on, plus one frame. When the
+	// session has settled, the menu has handed over and every subsystem is
+	// free again -- including for the whole loading screen, which must stream
+	// precisely so the gate it waits on can converge.
+	//
+	// SETTLED, NOT MERELY STARTED, and the difference is one frame that cost a
+	// capture. The pawn is spawned and possessed on the same tick the session
+	// starts, but APlayerCameraManager has not ticked yet, so the player view
+	// point still reads as the WORLD ORIGIN for the rest of that frame. The
+	// four callers below are all camera-driven; releasing them a frame early
+	// hands them (0,0) and they fault on a tile nobody baked. See
+	// UVoxelWorldSubsystem::HasWorldSessionSettled().
 	const UVoxelWorldSubsystem* Terrain = World->GetSubsystem<UVoxelWorldSubsystem>();
 	if (Terrain == nullptr)
 	{
 		// No terrain subsystem means no worldgen to fault on. Nothing to hold.
 		return false;
 	}
-	return !Terrain->HasWorldSessionStarted();
+	return !Terrain->HasWorldSessionSettled();
 }
 } // namespace VoxelFrontEnd

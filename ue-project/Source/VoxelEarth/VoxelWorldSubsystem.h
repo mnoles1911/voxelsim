@@ -611,6 +611,26 @@ public:
 	void StartWorldSession(const FString& EditLogPathOrEmpty);
 	bool HasWorldSessionStarted() const { return ChunkOwner != nullptr; }
 
+	// Started AND at least one full frame ago.
+	//
+	// THE ONE-FRAME GAP IS REAL AND IT KILLED A CAPTURE. BeginPlayerSession
+	// spawns and possesses the pawn on the same tick StartWorldSession runs,
+	// so HasWorldSessionStarted() goes true immediately -- but
+	// APlayerCameraManager has not ticked yet, so PC->GetPlayerViewPoint()
+	// still reports the pre-possession default of the WORLD ORIGIN for the
+	// remainder of that frame. Anything camera-driven that asks worldgen a
+	// question in that window asks it about (0,0), which on a world whose
+	// origin tile is not baked is fatal by design. Measured: pawn spawned at
+	// 04:13:04.200 frame 31, fine-tile gate leak at 04:13:04.201 frame 31.
+	//
+	// This is deliberately NOT "does the controller have a pawn" -- it does,
+	// synchronously, which is exactly why that test would pass and the view
+	// would still be wrong. The thing that lags is the VIEW, not the pawn.
+	bool HasWorldSessionSettled() const
+	{
+		return ChunkOwner != nullptr && GFrameCounter > WorldSessionStartFrame;
+	}
+
 	// Always-live streaming counters for the loading screen's progress bar and
 	// readiness gate. See FVoxelStreamingProgress (VoxelDebug.h) for why
 	// GetPerfSnapshot() cannot serve this purpose, and for the 5 Hz poll
@@ -794,6 +814,9 @@ private:
 	// ChunkOwner null but must NOT invite a retry that replays the edit log a
 	// second time on top of itself.
 	bool bWorldSessionStartAttempted = false;
+
+	// GFrameCounter at StartWorldSession, for HasWorldSessionSettled().
+	uint64 WorldSessionStartFrame = 0;
 
 	// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): set true once
 	// OnWorldBeginPlay actually runs its game-world/Impl-present body (i.e.

@@ -3,6 +3,7 @@
 #include "VoxelEarthUI.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/Paths.h" // FPaths::ProjectConfigDir -- see IniPath()
 
 namespace VoxelUIThemeDetail
 {
@@ -71,14 +72,39 @@ FColor Darkened(const FColor& Colour, float Amount)
 namespace VoxelUILayoutDetail
 {
 const TCHAR* const kSection = TEXT("VoxelUI.Layout");
-const TCHAR* const kIniName = TEXT("VoxelUI");
+
+// THE FULL PATH, NOT THE BARE NAME "VoxelUI", AND THAT IS THE WHOLE BUG.
+//
+// This read `TEXT("VoxelUI")` and relied on GConfig resolving it to
+// Config/DefaultVoxelUI.ini by convention. It does not, and it never did:
+// measured 2026-08-25, the first run of an unconditional diagnostic printed
+// `ini branch 'VoxelUI' ABSENT`. Every getter therefore returned false for
+// every key since the file was added -- a documented mechanism that has never
+// once worked, whose own header advertises it as the way to tune this screen
+// without a compiler.
+//
+// Nothing said so because FConfigCacheIni's getters open with
+//
+//     FConfigBranch* Branch = FindOrLoadNoSafeReload(this, Filename);
+//     if (Branch == nullptr) { return false; }
+//
+// so an unresolvable NAME and a file with no matching KEYS are the same
+// observable. See backlog 0.0m.
+const FString& IniPath()
+{
+	// Function-local static, not a file-scope FString: FPaths is not safe to
+	// call during static initialisation, and this is read from Load() which
+	// runs on first Get().
+	static const FString Path = FPaths::ProjectConfigDir() / TEXT("DefaultVoxelUI.ini");
+	return Path;
+}
 
 int32 OverrideCount = 0;
 
 void ReadFloat(const TCHAR* Key, float& InOut)
 {
 	float Value = 0.f;
-	if (GConfig && GConfig->GetFloat(kSection, Key, Value, kIniName))
+	if (GConfig && GConfig->GetFloat(kSection, Key, Value, IniPath()))
 	{
 		InOut = Value;
 		++OverrideCount;
@@ -88,7 +114,7 @@ void ReadFloat(const TCHAR* Key, float& InOut)
 void ReadInt(const TCHAR* Key, int32& InOut)
 {
 	int32 Value = 0;
-	if (GConfig && GConfig->GetInt(kSection, Key, Value, kIniName))
+	if (GConfig && GConfig->GetInt(kSection, Key, Value, IniPath()))
 	{
 		InOut = Value;
 		++OverrideCount;
@@ -98,6 +124,16 @@ void ReadInt(const TCHAR* Key, int32& InOut)
 FVoxelMenuLayout Load()
 {
 	FVoxelMenuLayout L;
+
+	// LOAD IT EXPLICITLY. Passing a full path to the getters is necessary and
+	// not sufficient -- they call FindOrLoadNoSafeReload, and a config the
+	// engine has never been asked to load has no branch to find. This is the
+	// line that creates it. Cheap and idempotent: GConfig returns the existing
+	// branch on every call after the first.
+	if (GConfig)
+	{
+		GConfig->LoadFile(IniPath());
+	}
 
 	// The macro pairs the ini key to the member so the two can never disagree
 	// -- a renamed member is a compile error here rather than an ini key that
@@ -195,10 +231,24 @@ FVoxelMenuLayout Load()
 	// found and the keys did not match, which is a far smaller problem.
 	//
 	// Do not make this conditional again. See backlog 0.0m.
-	const bool bBranchPresent = GConfig != nullptr && GConfig->FindConfigFile(kIniName) != nullptr;
-	UE_LOG(LogVoxelUI, Log,
-	       TEXT("FVoxelMenuLayout: ini branch '%s' %s; %d value(s) overridden."),
-	       kIniName, bBranchPresent ? TEXT("PRESENT") : TEXT("ABSENT"), OverrideCount);
+	const bool bBranchPresent = GConfig != nullptr && GConfig->FindConfigFile(IniPath()) != nullptr;
+	if (bBranchPresent)
+	{
+		UE_LOG(LogVoxelUI, Log, TEXT("FVoxelMenuLayout: ini '%s' loaded; %d value(s) overridden."),
+		       *IniPath(), OverrideCount);
+	}
+	else
+	{
+		// WARNING, NOT LOG. A silently-absent config branch is exactly the
+		// failure that survived from the day this file was added until it was
+		// measured, across dozens of runs that all printed nothing. If it ever
+		// goes absent again -- a moved file, a renamed directory, a packaged
+		// build that does not stage Config/ -- this is the line that says so.
+		UE_LOG(LogVoxelUI, Warning,
+		       TEXT("FVoxelMenuLayout: ini '%s' NOT LOADED -- every layout override in it is being ignored. ")
+		       TEXT("Layout falls back to the compiled defaults."),
+		       *IniPath());
+	}
 	return L;
 }
 } // namespace VoxelUILayoutDetail
