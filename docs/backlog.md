@@ -131,6 +131,45 @@ is not reproducible.
 
 ---
 
+### 0.0m The front end's ini override path has NEVER been shown to work
+
+Open, 2026-08-25. `FVoxelMenuLayout` reads every layout number from
+`ue-project/Config/DefaultVoxelUI.ini` at startup, and that file's own header
+explains why it matters: *"there is no editor available to most people who will
+want to nudge this screen ... the next best thing is that moving the title up
+four pixels is a text edit and a relaunch, with no compiler."*
+
+It may not work. Evidence, such as it is:
+
+  * A capture run with `MainPanelHalfWidth=400.0` under a correct
+    `[VoxelUI.Layout]` section produced a pixel-identical image, and the log
+    had no `N value(s) overridden from DefaultVoxelUI.ini` line -- which
+    `VoxelUITheme.cpp:182` emits whenever `OverrideCount > 0`.
+  * No `Saved/Config/WindowsEditor/VoxelUI.ini` has ever been generated, across
+    every run to date. A custom ini GConfig has actually registered would
+    normally produce one.
+  * The shipped file contains NO keys, only comments -- its header calls an
+    empty file "the normal case". So nobody has ever exercised the path. This
+    is not a regression; it has never been demonstrated.
+
+**THE TEST THAT PRODUCED THE FIRST BULLET WAS CONTAMINATED, and by me.** I
+created the probe with `cat >` without checking what was already at that path,
+clobbering the tracked 1,411-byte file, and then deleted it afterwards as
+though it were mine. Another session restored it from HEAD. The file WAS
+present with correct content while the capture ran, so the null is not
+explained by absence -- but a test run against a file I had just destroyed is
+not evidence I would accept from anyone else.
+
+RE-RUN IT PROPERLY before acting on this: APPEND one key to the restored file,
+do not overwrite it, capture `-Shot Menu`, and grep the log for the override
+count. If it logs, the path works and this entry closes. If it does not, there
+is a documented mechanism in the tree that silently does nothing, and it is the
+only way to adjust this screen without a compiler.
+
+Related: 0.0l, whose diagnosis this probe was meant to serve and did not.
+
+---
+
 ### 0.0l The menu TITLE is clipped at both ends, measured -- "VOXELMARK" renders as "OXELMAR"
 
 Found in the first menu capture, 2026-08-25. NOT a font-load failure: the string
