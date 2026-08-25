@@ -92,6 +92,7 @@ ue-project/Content/Voxel/T_MoonDisplacement.uasset
 # import dependency the design exists to avoid.
 ue-project/Content/UI/Backgrounds/*.uasset
 ue-project/Content/UI/Fonts/*.uasset
+ue-project/Content/Audio/Music/*.uasset
 
 # Work-item-2 survey dumps: ~140 MB of per-tile bake rasters. The REPORT and
 # the overlays are committed (docs/lake-survey/); these are the inputs.
