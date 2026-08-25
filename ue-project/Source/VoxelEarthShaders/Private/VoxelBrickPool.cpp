@@ -230,6 +230,386 @@ namespace VoxelBrickPoolDetail
 		TEXT("voxel.GPU.BrickPackResident (packed and discarded when that is 0)."),
 		ECVF_Default);
 
+	// --- the CPU arm's UPLOAD: coalesced locks and batched transitions -------
+	//
+	// WHY THIS EXISTS, AND THE ONE MEASUREMENT IT IS AIMED AT. On the 2026-08-25
+	// HEAVY/LIGHT leg -- the first leg in which the frame-phase instrument's
+	// HEAVY bucket was ever non-empty, its threshold having sat at 512
+	// chunks/frame while the game only ever applies ~57 -- frames that applied
+	// 163.2 chunks cost 18.61 ms of frame against 8.41 ms for frames that
+	// applied none. Of that +10.20 ms, +8.87 ms (87%) was RENDER THREAD and
+	// only +0.95 ms (9.3%) was game thread, and RHI went 1.68 -> 6.35 ms. That
+	// is ~0.054 ms of render-thread cost per applied chunk, and the shape is
+	// command translation, not memcpy. THOSE ARE THE OWNER'S NUMBERS FROM THAT
+	// LEG; nothing in this comment claims a measurement of its own.
+	//
+	// WHERE THE COST IS. voxel.Brick.PackOnCpu defaults to 1, so every pending
+	// write carries a valid CpuPack, AddFlushPasses_RenderThread `continue`s
+	// over ALL of them, and the whole RDG arm -- voxel.GPU.BrickFlushBatch
+	// included -- operates on an empty set and cannot help on the shipping
+	// config. The bytes move in UploadCpuWrites_RenderThread, which does FOUR
+	// LockBuffer / Memcpy / UnlockBuffer cycles PER CHUNK on the IMMEDIATE
+	// command list: occupancy arena, material arena, descriptors, record. At
+	// 163 chunks that is ~650 lock/unlock pairs in one frame.
+	//
+	// WHAT A LOCK/UNLOCK PAIR ACTUALLY COSTS ON D3D12, read out of UE 5.8's own
+	// source rather than assumed, because the obvious guess is WRONG. There is
+	// NO RHI-thread stall: FD3D12DynamicRHI overrides RHILockBuffer outright
+	// (D3D12Buffer.cpp:836/872), so the generic FDynamicRHI::RHILockBuffer path
+	// with its FRHICommandListScopedFlushAndExecute never runs for a Static
+	// buffer locked RLM_WriteOnly. What a pair DOES cost, per pair:
+	//
+	//   ON THE RENDER THREAD, and this is the big one:
+	//     TWO complete FRHITransition create/begin/end pairs -- Unknown ->
+	//     CopyDest before the unlock and CopyDest -> Unknown after
+	//     (D3D12Buffer.cpp:879-891). They are gated on
+	//     FRHICommandListBase::NeedsExtraTransitions(), and D3D12 sets
+	//     GRHIGlobals.NeedsExtraTransitions = true UNCONDITIONALLY
+	//     (D3D12RHI.cpp:262). At 650 pairs that is ~1,300 transition objects
+	//     built and recorded in one frame.
+	//   ON THE RENDER THREAD, per lock: one upload-heap suballocation under two
+	//     NESTED critical sections shared with every other lock in the engine
+	//     (D3D12Allocation.cpp:1103-1134, :809, :542), buddy-rounded to a
+	//     512 B minimum -- so a 64 B record lock burns 512 B of upload heap.
+	//   ON THE RHI TIMELINE, per unlock: one EnqueueLambda carrying an SRV
+	//     unbind, a scoped resource barrier + FlushResourceBarriers, two
+	//     residency updates, ONE CopyBufferRegion, and a
+	//     ConditionalSplitCommandList that can close the D3D12 command list
+	//     when the command count runs away (D3D12Buffer.cpp:780-830).
+	//
+	// So the term is per PAIR, not per byte, which is exactly the shape of a
+	// +8.87 ms render-thread delta that arrives with a 4x RHI multiplier.
+	//
+	// TWO INDEPENDENT REDUCTIONS, AND THEY ARE SEPARATELY SELECTABLE ON PURPOSE
+	// (bitmask, so a leg can run the 2x2 matrix and attribute the win instead
+	// of shipping a bundle and guessing which half did it):
+	//
+	//   BIT 0, kUploadCoalesceMergeLocks -- FEWER PAIRS. Group a flush's writes
+	//     BY DESTINATION BUFFER, sort each group by destination offset, merge
+	//     EXACTLY-ADJACENT ranges, and issue ONE lock per merged run. It NEVER
+	//     merges across a gap: a RLM_WriteOnly lock hands back a recycled
+	//     upload suballocation whose contents are UNDEFINED and copies the
+	//     WHOLE locked range back (D3D12Buffer.cpp:750, :818-824), so a merged
+	//     span with a hole in it would write last frame's garbage over whatever
+	//     live chunk owns the hole. Exact adjacency is the only safe merge, and
+	//     it is worth doing because FVoxelGpuGeometryPool::Alloc is EXACT-SIZE
+	//     FIRST FIT over a coalescing free list -- IT DOES NOT PAD -- so
+	//     consecutive allocations out of one free run are byte-adjacent by
+	//     construction, and descriptor allocations are always exactly 64 slots
+	//     (which is also why the record table merges on the same predicate:
+	//     ChunkSlot == BrickBase / 64). A burst streaming into an unfragmented
+	//     arena collapses towards 4 locks; a churning one degrades gracefully
+	//     towards the per-chunk count and NEVER past it.
+	//     THIS BIT'S WIN IS DATA-DEPENDENT. It buys nothing if the arenas are
+	//     fragmented enough that nothing is adjacent, and the window line says
+	//     which world it is running in rather than leaving it to be assumed.
+	//
+	//   BIT 1, kUploadCoalesceBatchTransitions -- FEWER TRANSITIONS PER PAIR,
+	//     and this one is NOT data-dependent: it removes ~2 render-thread
+	//     transitions per lock unconditionally. It is the engine's OWN
+	//     sanctioned pattern for exactly this situation, copied from
+	//     FRDGBuilder::SubmitBufferUploads (RenderGraphBuilder.cpp:2717-2799):
+	//     hold FRHICommandListScopedAllowExtraTransitions(RHICmdList, false)
+	//     across the whole batch so Lock/Unlock stop emitting their implicit
+	//     pair, and issue ONE Unknown -> CopyDest TransitionInternal covering
+	//     all four buffers before the batch and ONE CopyDest -> Unknown after.
+	//     THE SUPPRESSION AND THE MANUAL TRANSITIONS ARE ONE THING: turning the
+	//     implicit transitions off without issuing the explicit ones would copy
+	//     into buffers that were never moved to CopyDest, which is a debug-layer
+	//     error and a wrong world, not a slow one. Sound here because NOTHING
+	//     ELSE touches the four pool buffers between the two transitions -- this
+	//     function is straight-line code that runs after GraphBuilder.Execute()
+	//     and enqueues nothing but these copies.
+	//
+	// THE FALSIFIER, and it is why the counters below are collected on BOTH
+	// ARMS rather than only this one:
+	//   * If [brick-cpuupload]'s locks-per-flush does not FALL between a
+	//     mode=0 leg and a mode=1 leg, BIT 0 DID NOT ENGAGE -- the arenas are
+	//     fragmented and this shape is wrong for them. "No crash" is not
+	//     evidence, and neither is a better frame time on a leg whose
+	//     locks/jobs ratio printed 1.00x.
+	//   * If `transitions` does not fall by roughly 2x locks between a mode=0
+	//     leg and a mode=2 leg, BIT 1 DID NOT ENGAGE (NeedsExtraTransitions
+	//     was already false, or the scope did not cover the batch).
+	//   * If either count falls and the HEAVY-APPLY minus LIGHT-APPLY `render`
+	//     delta does NOT shrink, then lock/unlock pairs were NOT the cost.
+	//     REVERT THIS rather than keep it because it is tidier -- a switch kept
+	//     on tidiness is how the next reader gets told a falsified mechanism is
+	//     load-bearing. The next suspect in that case is the 128-dword
+	//     descriptor rebase loop, which this change deliberately leaves
+	//     untouched and per chunk so that it stays measurable as itself.
+	//   * Any hole, flicker or corrupted chunk means the ORDERING, the
+	//     ADJACENCY or the TRANSITION argument broke. `overlaps` on the window
+	//     line is the adjacency half saying so out loud, and a hit there is a
+	//     bug in the pool's "a pending write holds a LIVE allocation, every
+	//     free drops the write" invariant, not in the merge.
+	//
+	// DEFAULT 0 AND BYTE-IDENTICAL OFF: with the switch off, the per-chunk loop
+	// is the pre-existing one verbatim -- same locks, same offsets, same issue
+	// order, same bytes -- and the only thing added is arithmetic on counters,
+	// so a control leg needs no rebuild to be comparable. Command-line override
+	// for VoxelBrickPackOnCpuEnabled's -ExecCmds reason (the harness delivers
+	// cvars AFTER streaming begins, and a half-covered leg misleads whoever
+	// reads it). Honoured mid-run: every mode emits identical bytes, so a
+	// flip's only residue is in the stats.
+	constexpr int32 kUploadCoalesceMergeLocks = 1;
+	constexpr int32 kUploadCoalesceBatchTransitions = 2;
+
+	int32 GVoxelBrickUploadCoalesce = 0;
+	FAutoConsoleVariableRef CVarVoxelBrickUploadCoalesce(
+		TEXT("voxel.Brick.UploadCoalesce"),
+		GVoxelBrickUploadCoalesce,
+		TEXT("BITMASK over the CPU arm's flush upload, which today does four ")
+		TEXT("LockBuffer/Memcpy/UnlockBuffer cycles per chunk on the immediate command list. ")
+		TEXT("bit 0 (1) = group the writes by destination buffer, merge exactly-adjacent ")
+		TEXT("destination ranges and issue one lock per merged run (records still go LAST, as a ")
+		TEXT("group). bit 1 (2) = suppress D3D12's implicit per-unlock CopyDest transition pair ")
+		TEXT("and issue one batched transition for all four buffers around the whole flush. ")
+		TEXT("3 = both. 0 (default) = today's four locks per chunk, byte-identical. Every mode ")
+		TEXT("reports locks, jobs, transitions and bytes on the [brick-cpuupload] window line; ")
+		TEXT("a leg whose locks or transitions do not fall has not engaged this."),
+		ECVF_Default);
+
+	int32 VoxelBrickUploadCoalesceMode()
+	{
+		// -VoxelBrickUploadCoalesce=<n> outranks the cvar; -1 means "not given"
+		// and the cvar wins, so a run that passes nothing behaves as before.
+		static const int32 CmdLine = []
+		{
+			int32 Value = -1;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelBrickUploadCoalesce="), Value);
+			return Value;
+		}();
+		return CmdLine >= 0 ? CmdLine : GVoxelBrickUploadCoalesce;
+	}
+
+	// A single coalesced lock may not exceed this. A run only ever covers bytes
+	// the flush actually writes, so at 163 chunks it is a few MiB and this
+	// never binds -- it exists so a pathological flush cannot ask the upload
+	// heap for one enormous staging allocation and fail where 650 small ones
+	// would have succeeded. A split is COUNTED, not silent. A single job larger
+	// than this is still issued whole, because splitting one job would not
+	// change how many locks the per-chunk arm would have paid for it.
+	constexpr uint32 kMaxCoalescedLockBytes = 16u * 1024u * 1024u;
+
+	// One CONTIGUOUS destination range in one pool buffer, and the system-memory
+	// bytes that fill it. Src is a RAW POINTER and is only valid for the length
+	// of one UploadCpuWrites_RenderThread call: it points either into a pack the
+	// flush's write list is holding alive, or into a staging array that call
+	// sized exactly once and never grows. Both conditions are stated at the
+	// point they are established.
+	struct FUploadJob
+	{
+		uint32 DstByte = 0;
+		uint32 Bytes = 0;
+		const uint8* Src = nullptr;
+	};
+
+	// --- bit 1: the batched CopyDest transition -----------------------------
+	//
+	// Holds all four pool buffers in CopyDest for the whole upload and turns OFF
+	// the implicit per-unlock transition pair D3D12 would otherwise emit
+	// (D3D12Buffer.cpp:879-891, gated on FRHICommandListBase::NeedsExtraTransitions
+	// which D3D12 forces true at D3D12RHI.cpp:262). This is FRDGBuilder::
+	// SubmitBufferUploads' pattern (RenderGraphBuilder.cpp:2717-2799) applied to
+	// a batch of sub-range writes instead of a batch of whole-buffer ones.
+	//
+	// THE SUPPRESSION AND THE EXPLICIT TRANSITIONS ARE ONE INDIVISIBLE THING.
+	// Suppressing without issuing would leave the copies targeting buffers that
+	// were never moved to CopyDest -- a debug-layer error and a wrong world, not
+	// a slow one -- so both live in this one object and neither can be enabled
+	// alone. If the RHI does not want extra transitions in the first place, this
+	// declines to do anything at all rather than issuing a pair nobody asked
+	// for, which is what keeps the window line's `transitions` column honest on
+	// a non-D3D12 RHI.
+	//
+	// SOUND BECAUSE NOTHING ELSE TOUCHES THESE FOUR BUFFERS INSIDE THE SCOPE.
+	// UploadCpuWrites_RenderThread is straight-line render-thread code that runs
+	// AFTER GraphBuilder.Execute() and enqueues nothing but these copies, so
+	// there is no reader to starve of a real state and no writer to race.
+	class FScopedPoolCopyDest
+	{
+	public:
+		FScopedPoolCopyDest(FRHICommandListImmediate& InRHICmdList,
+		                    const FVoxelBrickPoolBuffersRef& Buffers,
+		                    bool bEnabled,
+		                    int64& InOutTransitionCount)
+			: RHICmdList(InRHICmdList)
+			, TransitionCount(InOutTransitionCount)
+		{
+			if (!bEnabled || !Buffers.IsValid() || !RHICmdList.NeedsExtraTransitions())
+			{
+				return;
+			}
+
+			FRHIBuffer* const Pool[] = {
+				Buffers->OccBuffer.GetReference(), Buffers->MatBuffer.GetReference(),
+				Buffers->DescBuffer.GetReference(), Buffers->ChunkTableBuffer.GetReference()
+			};
+			for (FRHIBuffer* const Buffer : Pool)
+			{
+				if (Buffer == nullptr)
+				{
+					continue;
+				}
+				CopyDest.Add(FRHITransitionInfo(Buffer, ERHIAccess::Unknown, ERHIAccess::CopyDest,
+				                                EResourceTransitionFlags::IgnoreAfterState));
+				Revert.Add(FRHITransitionInfo(Buffer, ERHIAccess::CopyDest, ERHIAccess::Unknown,
+				                              EResourceTransitionFlags::IgnoreAfterState));
+			}
+			if (CopyDest.Num() == 0)
+			{
+				return;
+			}
+
+			// THE PIPELINE GUARD IS NOT DECORATION. FRHICommandListBase::
+			// TransitionInternal builds the transition with GetPipeline() as
+			// BOTH source and destination (RHICommandList.cpp:2516-2540), and
+			// the per-unlock transitions this replaces are issued from inside
+			// FRHICommandListBase::UnlockBuffer's own
+			// FRHICommandListScopedPipelineGuard -- so they are always created
+			// with Graphics active. Straight-line render-thread code after
+			// GraphBuilder.Execute() has NO pipeline active, so without this the
+			// batched transitions would be created against ERHIPipeline::None,
+			// which is not the same command and not something to find out about
+			// in a driver. Held across the whole batch, it also collapses the
+			// activate/deactivate cycle every LockBuffer and UnlockBuffer would
+			// otherwise do into one -- their own guards nest harmlessly inside
+			// it and become no-ops.
+			PipelineGuard.Emplace(RHICmdList);
+
+			bPrevAllowExtraTransitions = RHICmdList.SetAllowExtraTransitions(false);
+			bActive = true;
+			RHICmdList.TransitionInternal(CopyDest, ERHITransitionCreateFlags::AllowDuringRenderPass);
+			TransitionCount += CopyDest.Num();
+		}
+
+		~FScopedPoolCopyDest()
+		{
+			if (!bActive)
+			{
+				return;
+			}
+			// The revert is issued from the destructor BODY, which runs before
+			// any member is destroyed -- so the pipeline guard below is still
+			// holding Graphics when it lands, exactly as it was for the
+			// CopyDest transition.
+			RHICmdList.TransitionInternal(Revert, ERHITransitionCreateFlags::AllowDuringRenderPass);
+			TransitionCount += Revert.Num();
+			RHICmdList.SetAllowExtraTransitions(bPrevAllowExtraTransitions);
+			PipelineGuard.Reset();
+		}
+
+		FScopedPoolCopyDest(const FScopedPoolCopyDest&) = delete;
+		FScopedPoolCopyDest& operator=(const FScopedPoolCopyDest&) = delete;
+
+	private:
+		FRHICommandListImmediate& RHICmdList;
+		int64& TransitionCount;
+		TArray<FRHITransitionInfo, TInlineAllocator<4>> CopyDest;
+		TArray<FRHITransitionInfo, TInlineAllocator<4>> Revert;
+		TOptional<FRHICommandListScopedPipelineGuard> PipelineGuard;
+		bool bPrevAllowExtraTransitions = true;
+		bool bActive = false;
+	};
+
+	// --- [brick-cpuupload]: the proof of traffic ----------------------------
+	//
+	// COLLECTED ON EVERY MODE, INCLUDING mode=0, and that is deliberate: the
+	// control arm's lock and transition counts are the DENOMINATOR of this
+	// switch's entire claim and there is no other way to obtain them. The
+	// per-chunk path issues exactly one lock per job and D3D12 adds two
+	// transitions per lock, so mode=0 MUST print locks == jobs and transitions
+	// == 2 x locks. A mode=1 leg printing locks == jobs anyway means the merge
+	// found nothing adjacent and this shape is wrong for the allocator's real
+	// state -- which is a RESULT, and has to be readable as one. Twelve
+	// mechanisms in this repo have turned out inert-or-never-run, including the
+	// flush-batch arm above (fused=0, and its [brick-flushbatch] line never
+	// printed at all) and the HEAVY bucket that was empty for its entire
+	// existence.
+	std::atomic<int64> GUploadFlushes{ 0 };          // flushes carrying >= 1 CPU write
+	std::atomic<int64> GUploadCoalescedFlushes{ 0 }; // ... of those, ones that took the merged path
+	std::atomic<int64> GUploadChunks{ 0 };           // CPU-packed chunks uploaded
+	std::atomic<int64> GUploadJobs{ 0 };             // destination ranges written == the per-chunk arm's lock count
+	std::atomic<int64> GUploadLocks{ 0 };            // LockBuffer calls actually issued
+	std::atomic<int64> GUploadTransitions{ 0 };      // FRHITransitionInfos recorded, implicit ones included
+	std::atomic<int64> GUploadBytes{ 0 };            // bytes inside the locked ranges
+	std::atomic<int64> GUploadLockFails{ 0 };        // LockBuffer returned null; those chunks did NOT land
+	std::atomic<int64> GUploadOverlaps{ 0 };         // buckets where two writes claimed one byte -- a POOL bug
+	std::atomic<int64> GUploadSplits{ 0 };           // runs cut by kMaxCoalescedLockBytes
+	std::atomic<int64> GUploadMaxChunks{ 0 };        // the worst SINGLE flush in the window -- the HEAVY frame
+	std::atomic<int64> GUploadMaxJobs{ 0 };
+	std::atomic<int64> GUploadMaxLocks{ 0 };
+
+	// Window maxima. A mean over a 5 s window hides the frame that misses the
+	// 1%-low gate, and the frame that misses it is the whole subject here.
+	void NoteUploadMax(std::atomic<int64>& Slot, int64 Value)
+	{
+		int64 Prev = Slot.load(std::memory_order_relaxed);
+		while (Value > Prev && !Slot.compare_exchange_weak(Prev, Value, std::memory_order_relaxed))
+		{
+		}
+	}
+
+	double GUploadWindowStart = 0.0;
+	void MaybeLogCpuUploadWindow(int32 CoalesceMode)
+	{
+		const double Now = FPlatformTime::Seconds();
+		if (GUploadWindowStart <= 0.0)
+		{
+			GUploadWindowStart = Now;
+			return;
+		}
+		const double Elapsed = Now - GUploadWindowStart;
+		if (Elapsed < 5.0)
+		{
+			return;
+		}
+		GUploadWindowStart = Now;
+
+		const int64 Flushes = GUploadFlushes.exchange(0, std::memory_order_relaxed);
+		const int64 Coalesced = GUploadCoalescedFlushes.exchange(0, std::memory_order_relaxed);
+		const int64 Chunks = GUploadChunks.exchange(0, std::memory_order_relaxed);
+		const int64 JobCount = GUploadJobs.exchange(0, std::memory_order_relaxed);
+		const int64 LockCount = GUploadLocks.exchange(0, std::memory_order_relaxed);
+		const int64 Transitions = GUploadTransitions.exchange(0, std::memory_order_relaxed);
+		const int64 ByteCount = GUploadBytes.exchange(0, std::memory_order_relaxed);
+		const int64 LockFails = GUploadLockFails.exchange(0, std::memory_order_relaxed);
+		const int64 Overlaps = GUploadOverlaps.exchange(0, std::memory_order_relaxed);
+		const int64 Splits = GUploadSplits.exchange(0, std::memory_order_relaxed);
+		const int64 MaxChunks = GUploadMaxChunks.exchange(0, std::memory_order_relaxed);
+		const int64 MaxJobs = GUploadMaxJobs.exchange(0, std::memory_order_relaxed);
+		const int64 MaxLocks = GUploadMaxLocks.exchange(0, std::memory_order_relaxed);
+
+		if (Flushes == 0)
+		{
+			// Silent ONLY when the CPU arm did nothing at all -- a
+			// voxel.Brick.PackOnCpu 0 leg must not gain a line it could not
+			// fill. Any traffic at all prints, in any mode.
+			return;
+		}
+
+		// THE THREE NUMBERS TO READ are "N locks of M jobs", "T transitions"
+		// and "worst flush". mode=1 with a 1.00x lock ratio is a NULL RESULT,
+		// never a pass; mode=2 with transitions still at 2 x locks is the same;
+		// and lockFail > 0 means chunks were allocated, accounted for, and left
+		// blank, which is a wrong world, not a slow one.
+		UE_LOG(LogVoxelBrickPool, Log,
+		       TEXT("[brick-cpuupload] %.1fs window: mode=%d (merge %s, batchTransitions %s), ")
+		       TEXT("%lld flushes (%lld merged), %lld chunks; %lld locks of %lld jobs (%.2fx fewer), ")
+		       TEXT("%lld transitions (%.2f per lock), %.2f MiB locked; worst flush %lld chunks / ")
+		       TEXT("%lld jobs / %lld locks; lockFail %lld, overlaps %lld, splits %lld"),
+		       Elapsed, CoalesceMode,
+		       (CoalesceMode & kUploadCoalesceMergeLocks) ? TEXT("on") : TEXT("off"),
+		       (CoalesceMode & kUploadCoalesceBatchTransitions) ? TEXT("on") : TEXT("off"),
+		       Flushes, Coalesced, Chunks,
+		       LockCount, JobCount,
+		       (LockCount > 0) ? double(JobCount) / double(LockCount) : 0.0,
+		       Transitions, (LockCount > 0) ? double(Transitions) / double(LockCount) : 0.0,
+		       double(ByteCount) / (1024.0 * 1024.0),
+		       MaxChunks, MaxJobs, MaxLocks, LockFails, Overlaps, Splits);
+	}
+
 	// --- PHASE 5: the terrain quad path, retired ---------------------------
 	//
 	// THE REAL SWITCH, and it is OFF BY DEFAULT and must stay that way until the
@@ -3206,7 +3586,8 @@ void FVoxelBrickPool::AddFlushPasses_RenderThread(FRDGBuilder& GraphBuilder,
 // the reason this function copies flags rather than inspecting descriptors.
 void FVoxelBrickPool::UploadCpuWrites_RenderThread(FRHICommandListImmediate& RHICmdList,
                                                    const FVoxelBrickPoolBuffersRef& Buffers,
-                                                   const TArray<FPendingWrite>& Writes)
+                                                   const TArray<FPendingWrite>& Writes,
+                                                   int32 CoalesceMode)
 {
 	// docs/brick-volume-format.md section 2. Restated here for the same
 	// no-voxel-core reason the rest of this file restates its constants, and
@@ -3216,99 +3597,472 @@ void FVoxelBrickPool::UploadCpuWrites_RenderThread(FRHICommandListImmediate& RHI
 	constexpr uint32 kBrickFieldMask  = 0xf0000000u;
 	constexpr uint32 kBrickKindMixed  = 2u;
 
-	// Scratch reused across the batch: a chunk's rebased descriptors are 128
-	// dwords and building them per chunk into a fresh TArray would allocate once
-	// per chunk on the render thread, which is the cost this pool exists to avoid
-	// paying per chunk anywhere.
-	TArray<uint32> RebasedDesc;
-	RebasedDesc.SetNumUninitialized(int32(VoxelBrickPoolDetail::kBricksPerChunk) * 2);
+	const bool bMergeLocks =
+		(CoalesceMode & VoxelBrickPoolDetail::kUploadCoalesceMergeLocks) != 0;
+	const bool bBatchTransitions =
+		(CoalesceMode & VoxelBrickPoolDetail::kUploadCoalesceBatchTransitions) != 0;
 
+	// COUNTED FIRST, and it does three jobs at once: it is the denominator of
+	// the window line, it sizes the staging arrays below EXACTLY (so the raw
+	// pointers taken into them can never be invalidated by a growth), and it
+	// short-circuits the batches that carry nothing -- which is every batch
+	// under voxel.Brick.PackOnCpu 0.
+	int32 NumCpuWrites = 0;
 	for (const FPendingWrite& Write : Writes)
 	{
-		const FVoxelBrickCpuPackRef& P = Write.CpuPack;
-		if (!P.IsValid())
+		if (Write.CpuPack.IsValid())
 		{
-			continue; // a GPU write; the graph already handled it
+			++NumCpuWrites;
 		}
+	}
+	if (NumCpuWrites == 0)
+	{
+		return;
+	}
 
-		// --- descriptors, with the pool bases folded into the offset fields ---
-		//
-		// MIXED ONLY. A uniform brick's offset fields are zero by contract and
-		// must stay zero: rebasing them would point a collapsed brick at a real
-		// arena range, which is worse than useless because it reads as valid.
-		for (uint32 I = 0; I < VoxelBrickPoolDetail::kBricksPerChunk; ++I)
-		{
-			uint32 Dx = P->Desc[int32(I) * 2 + 0];
-			uint32 Dy = P->Desc[int32(I) * 2 + 1];
-			if (((Dx >> 28) & 3u) == kBrickKindMixed)
-			{
-				const uint32 OccOffset = ((Dx & kBrickOffsetMask) + Write.OccBase) & kBrickOffsetMask;
-				const uint32 MatOffset = ((Dy & kBrickOffsetMask) + Write.MatBase) & kBrickOffsetMask;
-				Dx = OccOffset | (Dx & kBrickFieldMask);
-				Dy = MatOffset | (Dy & kBrickFieldMask);
-			}
-			RebasedDesc[int32(I) * 2 + 0] = Dx;
-			RebasedDesc[int32(I) * 2 + 1] = Dy;
-		}
+	// Per-flush tallies, folded into the window counters once at the bottom.
+	// Locals rather than atomics per chunk: four relaxed adds per chunk would
+	// be noise against a lock, but the window numbers are the whole point of
+	// this function's instrumentation and they must not themselves be a term.
+	//
+	// Jobs is the count of CONTIGUOUS DESTINATION RANGES this flush has to
+	// write, which is EXACTLY the number of locks the per-chunk arm issues.
+	// That is what makes mode=0 a usable control: it prints locks == jobs by
+	// construction, and any mode that does not beat it did not engage.
+	//
+	// TransitionCount is ASKED, NOT PREDICTED. Each lock/unlock pair is tallied
+	// as `RHICmdList.NeedsExtraTransitions() ? 2 : 0`, which is false exactly
+	// while FScopedPoolCopyDest has the implicit pair suppressed and false
+	// anyway on an RHI that never wanted one -- so the column counts what the
+	// RHI DID, not what this code assumed it would do. FScopedPoolCopyDest adds
+	// its own two batched transitions to the same tally through the reference it
+	// is handed, so the number is directly comparable across modes.
+	int64 JobCount = 0;
+	int64 LockCount = 0;
+	int64 TransitionCount = 0;
+	int64 ByteCount = 0;
+	int64 LockFailCount = 0;
 
-		// --- the three arena writes ---------------------------------------
-		//
-		// ORDER WITHIN A CHUNK MATTERS AND IS THE KERNELS' ORDER: payload first,
-		// descriptors second, RECORD LAST. A record is what makes a chunk visible
-		// to a marcher, so it must not name arena ranges that have not been
-		// written yet. These land on one command list in the order they are
-		// issued, so the ordering is the issue order and nothing else.
-		if (P->OccWords() > 0)
-		{
-			const uint32 Bytes = P->OccWords() * 4;
-			if (void* Dst = RHICmdList.LockBuffer(Buffers->OccBuffer, Write.OccBase * 4u,
-			                                      Bytes, RLM_WriteOnly))
-			{
-				FMemory::Memcpy(Dst, P->Occ.GetData(), Bytes);
-				RHICmdList.UnlockBuffer(Buffers->OccBuffer);
-			}
-		}
-		if (P->MatWords() > 0)
-		{
-			const uint32 Bytes = P->MatWords() * 4;
-			if (void* Dst = RHICmdList.LockBuffer(Buffers->MatBuffer, Write.MatBase * 4u,
-			                                      Bytes, RLM_WriteOnly))
-			{
-				FMemory::Memcpy(Dst, P->Mat.GetData(), Bytes);
-				RHICmdList.UnlockBuffer(Buffers->MatBuffer);
-			}
-		}
-		{
-			const uint32 Bytes = VoxelBrickPoolDetail::kBricksPerChunk * VoxelBrickPoolDetail::kBrickDescBytes;
-			if (void* Dst = RHICmdList.LockBuffer(
-				    Buffers->DescBuffer,
-				    Write.BrickBase * VoxelBrickPoolDetail::kBrickDescBytes, Bytes, RLM_WriteOnly))
-			{
-				FMemory::Memcpy(Dst, RebasedDesc.GetData(), Bytes);
-				RHICmdList.UnlockBuffer(Buffers->DescBuffer);
-			}
-		}
+	if (!bMergeLocks)
+	{
+		// =====================================================================
+		// THE CONTROL ARM, UNTOUCHED. Same locks, same offsets, same issue
+		// order, same bytes as before this switch existed -- the only additions
+		// are the tallies above and, when bit 1 is set, the transition scope
+		// wrapped around the whole loop (which changes WHO issues the CopyDest
+		// transitions, never what lands in the buffers).
+		// =====================================================================
 
-		// --- the 32 B record ------------------------------------------------
-		//
-		// Eight dwords, field for field with BrickChunkRecordMain's tail:
-		// origin xyz, LevelAndFlags ([0:3] ring level, [4] anySolid, [5]
-		// allSolid), BrickBase, the 64-bit L1 mask as two dwords, and a zero.
+		// Scratch reused across the batch: a chunk's rebased descriptors are 128
+		// dwords and building them per chunk into a fresh TArray would allocate once
+		// per chunk on the render thread, which is the cost this pool exists to avoid
+		// paying per chunk anywhere.
+		TArray<uint32> RebasedDesc;
+		RebasedDesc.SetNumUninitialized(int32(VoxelBrickPoolDetail::kBricksPerChunk) * 2);
+
+		VoxelBrickPoolDetail::FScopedPoolCopyDest ScopedCopyDest(
+			RHICmdList, Buffers, bBatchTransitions, TransitionCount);
+
+		for (const FPendingWrite& Write : Writes)
 		{
-			uint32 Record[kChunkRecordDwords];
+			const FVoxelBrickCpuPackRef& P = Write.CpuPack;
+			if (!P.IsValid())
+			{
+				continue; // a GPU write; the graph already handled it
+			}
+
+			// --- descriptors, with the pool bases folded into the offset fields ---
+			//
+			// MIXED ONLY. A uniform brick's offset fields are zero by contract and
+			// must stay zero: rebasing them would point a collapsed brick at a real
+			// arena range, which is worse than useless because it reads as valid.
+			for (uint32 I = 0; I < VoxelBrickPoolDetail::kBricksPerChunk; ++I)
+			{
+				uint32 Dx = P->Desc[int32(I) * 2 + 0];
+				uint32 Dy = P->Desc[int32(I) * 2 + 1];
+				if (((Dx >> 28) & 3u) == kBrickKindMixed)
+				{
+					const uint32 OccOffset = ((Dx & kBrickOffsetMask) + Write.OccBase) & kBrickOffsetMask;
+					const uint32 MatOffset = ((Dy & kBrickOffsetMask) + Write.MatBase) & kBrickOffsetMask;
+					Dx = OccOffset | (Dx & kBrickFieldMask);
+					Dy = MatOffset | (Dy & kBrickFieldMask);
+				}
+				RebasedDesc[int32(I) * 2 + 0] = Dx;
+				RebasedDesc[int32(I) * 2 + 1] = Dy;
+			}
+
+			// --- the three arena writes ---------------------------------------
+			//
+			// ORDER WITHIN A CHUNK MATTERS AND IS THE KERNELS' ORDER: payload first,
+			// descriptors second, RECORD LAST. A record is what makes a chunk visible
+			// to a marcher, so it must not name arena ranges that have not been
+			// written yet. These land on one command list in the order they are
+			// issued, so the ordering is the issue order and nothing else.
+			if (P->OccWords() > 0)
+			{
+				const uint32 Bytes = P->OccWords() * 4;
+				++JobCount;
+				if (void* Dst = RHICmdList.LockBuffer(Buffers->OccBuffer, Write.OccBase * 4u,
+				                                      Bytes, RLM_WriteOnly))
+				{
+					FMemory::Memcpy(Dst, P->Occ.GetData(), Bytes);
+					RHICmdList.UnlockBuffer(Buffers->OccBuffer);
+					++LockCount;
+					ByteCount += Bytes;
+					TransitionCount += RHICmdList.NeedsExtraTransitions() ? 2 : 0; // asked, not predicted
+				}
+				else
+				{
+					++LockFailCount;
+				}
+			}
+			if (P->MatWords() > 0)
+			{
+				const uint32 Bytes = P->MatWords() * 4;
+				++JobCount;
+				if (void* Dst = RHICmdList.LockBuffer(Buffers->MatBuffer, Write.MatBase * 4u,
+				                                      Bytes, RLM_WriteOnly))
+				{
+					FMemory::Memcpy(Dst, P->Mat.GetData(), Bytes);
+					RHICmdList.UnlockBuffer(Buffers->MatBuffer);
+					++LockCount;
+					ByteCount += Bytes;
+					TransitionCount += RHICmdList.NeedsExtraTransitions() ? 2 : 0; // asked, not predicted
+				}
+				else
+				{
+					++LockFailCount;
+				}
+			}
+			{
+				const uint32 Bytes = VoxelBrickPoolDetail::kBricksPerChunk * VoxelBrickPoolDetail::kBrickDescBytes;
+				++JobCount;
+				if (void* Dst = RHICmdList.LockBuffer(
+					    Buffers->DescBuffer,
+					    Write.BrickBase * VoxelBrickPoolDetail::kBrickDescBytes, Bytes, RLM_WriteOnly))
+				{
+					FMemory::Memcpy(Dst, RebasedDesc.GetData(), Bytes);
+					RHICmdList.UnlockBuffer(Buffers->DescBuffer);
+					++LockCount;
+					ByteCount += Bytes;
+					TransitionCount += RHICmdList.NeedsExtraTransitions() ? 2 : 0; // asked, not predicted
+				}
+				else
+				{
+					++LockFailCount;
+				}
+			}
+
+			// --- the 64 B record ------------------------------------------------
+			//
+			// kChunkRecordDwords dwords, field for field with BrickChunkRecordMain's
+			// tail: origin xyz, LevelAndFlags ([0:3] ring level, [4] anySolid, [5]
+			// allSolid), BrickBase, the 64-bit L1 mask as two dwords, then the
+			// shading terms and the reserved zeroes.
+			{
+				uint32 Record[kChunkRecordDwords];
+				BuildChunkRecord(Write.OriginVoxel, Write.RingLevel, P->bAnySolid, P->bAllSolid,
+				                 Write.BrickBase, P->BrickSolid, Write.Shading, Record);
+
+				// uint32 throughout: the table is ChunkCapacity * 64 B, which at the
+				// 131,072-chunk default is 8 MiB, and LockBuffer takes a uint32 offset.
+				const uint32 Offset = Write.ChunkSlot * VoxelBrickPoolDetail::kChunkRecordBytes;
+				++JobCount;
+				if (void* Dst = RHICmdList.LockBuffer(Buffers->ChunkTableBuffer, Offset,
+				                                      VoxelBrickPoolDetail::kChunkRecordBytes, RLM_WriteOnly))
+				{
+					FMemory::Memcpy(Dst, Record, VoxelBrickPoolDetail::kChunkRecordBytes);
+					RHICmdList.UnlockBuffer(Buffers->ChunkTableBuffer);
+					++LockCount;
+					ByteCount += VoxelBrickPoolDetail::kChunkRecordBytes;
+					TransitionCount += RHICmdList.NeedsExtraTransitions() ? 2 : 0; // asked, not predicted
+				}
+				else
+				{
+					++LockFailCount;
+				}
+			}
+		}
+	}
+	else
+	{
+		// =====================================================================
+		// THE MERGED ARM (bit 0 of voxel.Brick.UploadCoalesce).
+		// =====================================================================
+
+		// --- the staging arrays ---------------------------------------------
+		//
+		// SIZED ONCE, UP FRONT, AND NEVER GROWN. The job list below holds RAW
+		// POINTERS into these; a TArray growth would move the buffer and every
+		// one of those pointers would then name freed memory. That is why
+		// NumCpuWrites is counted before anything is emitted rather than
+		// reserved optimistically. Occupancy and material need no staging at
+		// all: their bytes are already contiguous and stable inside the pack,
+		// and Writes keeps every pack alive for the whole call.
+		TArray<uint32> DescStage;
+		DescStage.SetNumUninitialized(NumCpuWrites * int32(VoxelBrickPoolDetail::kBricksPerChunk) * 2);
+		TArray<uint32> RecordStage;
+		RecordStage.SetNumUninitialized(NumCpuWrites * kChunkRecordDwords);
+
+		// Bucket index IS the ordering argument -- see the emit loop.
+		enum : int32 { kBucketOcc = 0, kBucketMat = 1, kBucketDesc = 2, kBucketRecord = 3, kNumBuckets = 4 };
+
+		TArray<VoxelBrickPoolDetail::FUploadJob> Buckets[kNumBuckets];
+		Buckets[kBucketOcc].Reserve(NumCpuWrites);
+		Buckets[kBucketMat].Reserve(NumCpuWrites);
+		Buckets[kBucketDesc].Reserve(NumCpuWrites);
+		Buckets[kBucketRecord].Reserve(NumCpuWrites);
+
+		FRHIBuffer* const Targets[kNumBuckets] = {
+			Buffers->OccBuffer.GetReference(), Buffers->MatBuffer.GetReference(),
+			Buffers->DescBuffer.GetReference(), Buffers->ChunkTableBuffer.GetReference()
+		};
+		static const TCHAR* const TargetNames[kNumBuckets] = {
+			TEXT("occupancy"), TEXT("material"), TEXT("descriptor"), TEXT("record")
+		};
+
+		int32 StageSlot = 0;
+		for (const FPendingWrite& Write : Writes)
+		{
+			const FVoxelBrickCpuPackRef& P = Write.CpuPack;
+			if (!P.IsValid())
+			{
+				continue; // a GPU write; the graph already handled it
+			}
+
+			// --- descriptors, with the pool bases folded into the offset fields ---
+			//
+			// VERBATIM from the control arm, into this chunk's slice of the
+			// staging array instead of a reused scratch. DELIBERATELY STILL PER
+			// CHUNK AND STILL 128 DWORDS: if the render-thread delta does not
+			// move when the locks fall, this loop is the next suspect, and it
+			// can only be measured as itself if this change leaves it alone.
+			//
+			// MIXED ONLY. A uniform brick's offset fields are zero by contract and
+			// must stay zero: rebasing them would point a collapsed brick at a real
+			// arena range, which is worse than useless because it reads as valid.
+			uint32* const Rebased =
+				DescStage.GetData() + int64(StageSlot) * int64(VoxelBrickPoolDetail::kBricksPerChunk) * 2;
+			for (uint32 I = 0; I < VoxelBrickPoolDetail::kBricksPerChunk; ++I)
+			{
+				uint32 Dx = P->Desc[int32(I) * 2 + 0];
+				uint32 Dy = P->Desc[int32(I) * 2 + 1];
+				if (((Dx >> 28) & 3u) == kBrickKindMixed)
+				{
+					const uint32 OccOffset = ((Dx & kBrickOffsetMask) + Write.OccBase) & kBrickOffsetMask;
+					const uint32 MatOffset = ((Dy & kBrickOffsetMask) + Write.MatBase) & kBrickOffsetMask;
+					Dx = OccOffset | (Dx & kBrickFieldMask);
+					Dy = MatOffset | (Dy & kBrickFieldMask);
+				}
+				Rebased[I * 2 + 0] = Dx;
+				Rebased[I * 2 + 1] = Dy;
+			}
+
+			// The four destination ranges, byte for byte the ones the control
+			// arm locks -- same offsets, same sizes, same source bytes. All this
+			// loop does is describe them instead of issuing them.
+			if (P->OccWords() > 0)
+			{
+				Buckets[kBucketOcc].Add(VoxelBrickPoolDetail::FUploadJob{
+					Write.OccBase * 4u, P->OccWords() * 4u,
+					reinterpret_cast<const uint8*>(P->Occ.GetData()) });
+			}
+			if (P->MatWords() > 0)
+			{
+				Buckets[kBucketMat].Add(VoxelBrickPoolDetail::FUploadJob{
+					Write.MatBase * 4u, P->MatWords() * 4u,
+					reinterpret_cast<const uint8*>(P->Mat.GetData()) });
+			}
+			Buckets[kBucketDesc].Add(VoxelBrickPoolDetail::FUploadJob{
+				Write.BrickBase * VoxelBrickPoolDetail::kBrickDescBytes,
+				VoxelBrickPoolDetail::kBricksPerChunk * VoxelBrickPoolDetail::kBrickDescBytes,
+				reinterpret_cast<const uint8*>(Rebased) });
+
+			uint32* const Record = RecordStage.GetData() + int64(StageSlot) * kChunkRecordDwords;
 			BuildChunkRecord(Write.OriginVoxel, Write.RingLevel, P->bAnySolid, P->bAllSolid,
 			                 Write.BrickBase, P->BrickSolid, Write.Shading, Record);
+			Buckets[kBucketRecord].Add(VoxelBrickPoolDetail::FUploadJob{
+				Write.ChunkSlot * VoxelBrickPoolDetail::kChunkRecordBytes,
+				VoxelBrickPoolDetail::kChunkRecordBytes,
+				reinterpret_cast<const uint8*>(Record) });
 
-			// uint32 throughout: the table is ChunkCapacity * 32 B, which at the
-			// 131,072-chunk default is 4 MiB, and LockBuffer takes a uint32 offset.
-			const uint32 Offset = Write.ChunkSlot * VoxelBrickPoolDetail::kChunkRecordBytes;
-			if (void* Dst = RHICmdList.LockBuffer(Buffers->ChunkTableBuffer, Offset,
-			                                      VoxelBrickPoolDetail::kChunkRecordBytes, RLM_WriteOnly))
+			++StageSlot;
+		}
+
+		// --- one lock per merged run, bucket by bucket ------------------------
+		//
+		// WHY THIS ORDERING IS SAFE, SAID EXPLICITLY BECAUSE IT IS THE ONE THING
+		// A REVIEWER MUST NOT HAVE TO RECONSTRUCT. The rule the control arm
+		// states is "payload first, descriptors second, RECORD LAST, because a
+		// record is what makes a chunk visible to a marcher and it must not name
+		// arena ranges that have not been written yet." Emitting bucket by
+		// bucket in the order occupancy, material, descriptors, RECORDS LAST
+		// makes that rule STRICTLY STRONGER, not weaker: under the control arm
+		// chunk N's record is issued before chunk N+1's payload, whereas here
+		// EVERY record in the flush is issued after EVERY payload and EVERY
+		// descriptor in the flush. There is no chunk whose record moves earlier
+		// relative to anything it names, and no chunk whose payload moves later
+		// than its own record. Both arms land on ONE immediate command list in
+		// issue order, which is the only ordering either ever relied on, and
+		// nothing reads the pool between the two transitions.
+		//
+		// AND WHY MERGING IS SAFE. A run absorbs the next range only when that
+		// range STARTS EXACTLY where the previous one ENDS, so every byte of the
+		// locked span is written by one of the jobs in it. No byte of the
+		// recycled upload suballocation is left at its undefined value and
+		// copied back over live pool data. Non-adjacent ranges get their own
+		// lock, exactly as today.
+		//
+		// OVERLAP IS CHECKED, NOT BELIEVED. It is impossible by the pool's own
+		// invariant -- a pending write holds a LIVE allocation, and every free
+		// (AllocateForChunk's replace, RemoveChunk, EvictOne) drops the write
+		// that named the freed range -- and the allocator never hands out two
+		// live ranges that touch. That is exactly the shape of join this
+		// codebase has been burned by five times in three days: derived rather
+		// than verified. So a hit is counted, logged loudly, and made harmless
+		// by falling that bucket back to one lock per job in ISSUE order.
+		VoxelBrickPoolDetail::FScopedPoolCopyDest ScopedCopyDest(
+			RHICmdList, Buffers, bBatchTransitions, TransitionCount);
+
+		TArray<int32> Order;
+		for (int32 B = 0; B < kNumBuckets; ++B)
+		{
+			TArray<VoxelBrickPoolDetail::FUploadJob>& Bucket = Buckets[B];
+			if (Bucket.Num() == 0)
 			{
-				FMemory::Memcpy(Dst, Record, VoxelBrickPoolDetail::kChunkRecordBytes);
-				RHICmdList.UnlockBuffer(Buffers->ChunkTableBuffer);
+				continue;
+			}
+			JobCount += Bucket.Num();
+
+			FRHIBuffer* const Target = Targets[B];
+			if (Target == nullptr)
+			{
+				// Buffers->IsValid() already gated this in the caller; counted
+				// rather than assumed away, because "assumed away" is how a
+				// batch of chunks becomes silently blank.
+				LockFailCount += Bucket.Num();
+				continue;
+			}
+
+			// An index sort, not a sort of the jobs, so the overlap fallback can
+			// still replay the bucket in its original ISSUE order.
+			Order.SetNumUninitialized(Bucket.Num(), EAllowShrinking::No);
+			for (int32 I = 0; I < Bucket.Num(); ++I)
+			{
+				Order[I] = I;
+			}
+			Order.Sort([&Bucket](int32 A, int32 C) { return Bucket[A].DstByte < Bucket[C].DstByte; });
+
+			bool bOverlap = false;
+			for (int32 I = 1; I < Order.Num(); ++I)
+			{
+				const VoxelBrickPoolDetail::FUploadJob& Prev = Bucket[Order[I - 1]];
+				if (Bucket[Order[I]].DstByte < Prev.DstByte + Prev.Bytes)
+				{
+					bOverlap = true;
+					break;
+				}
+			}
+
+			if (bOverlap)
+			{
+				VoxelBrickPoolDetail::GUploadOverlaps.fetch_add(1, std::memory_order_relaxed);
+				UE_LOG(LogVoxelBrickPool, Error,
+				       TEXT("[brick-cpuupload] two writes in ONE flush claim overlapping %s bytes ")
+				       TEXT("(%d ranges over %d chunks). That is the pool's \"a pending write holds a ")
+				       TEXT("LIVE allocation\" invariant broken, not a merge bug -- this bucket falls ")
+				       TEXT("back to one lock per range in issue order so the frame is still correct, ")
+				       TEXT("but the allocator needs looking at."),
+				       TargetNames[B], Bucket.Num(), NumCpuWrites);
+				for (int32 I = 0; I < Bucket.Num(); ++I)
+				{
+					Order[I] = I;
+				}
+			}
+
+			int32 RunFirst = 0;
+			while (RunFirst < Order.Num())
+			{
+				const VoxelBrickPoolDetail::FUploadJob& First = Bucket[Order[RunFirst]];
+				const uint32 RunStart = First.DstByte;
+				uint32 RunEnd = First.DstByte + First.Bytes;
+				int32 RunLast = RunFirst;
+
+				// Merging is disabled wholesale on the overlap fallback: with
+				// the bucket back in issue order, "next starts where this ended"
+				// is no longer a statement about a sorted sequence.
+				while (!bOverlap && RunLast + 1 < Order.Num())
+				{
+					const VoxelBrickPoolDetail::FUploadJob& Next = Bucket[Order[RunLast + 1]];
+					if (Next.DstByte != RunEnd)
+					{
+						break; // a gap; a merged lock would write garbage into it
+					}
+					if (uint64(RunEnd - RunStart) + uint64(Next.Bytes) >
+					    uint64(VoxelBrickPoolDetail::kMaxCoalescedLockBytes))
+					{
+						VoxelBrickPoolDetail::GUploadSplits.fetch_add(1, std::memory_order_relaxed);
+						break;
+					}
+					RunEnd = Next.DstByte + Next.Bytes;
+					++RunLast;
+				}
+
+				const uint32 RunBytes = RunEnd - RunStart;
+				if (void* Dst = RHICmdList.LockBuffer(Target, RunStart, RunBytes, RLM_WriteOnly))
+				{
+					for (int32 I = RunFirst; I <= RunLast; ++I)
+					{
+						const VoxelBrickPoolDetail::FUploadJob& Job = Bucket[Order[I]];
+						FMemory::Memcpy(static_cast<uint8*>(Dst) + (Job.DstByte - RunStart),
+						                Job.Src, Job.Bytes);
+					}
+					RHICmdList.UnlockBuffer(Target);
+					++LockCount;
+					ByteCount += RunBytes;
+					TransitionCount += RHICmdList.NeedsExtraTransitions() ? 2 : 0; // asked, not predicted
+				}
+				else
+				{
+					LockFailCount += (RunLast - RunFirst + 1);
+				}
+
+				RunFirst = RunLast + 1;
 			}
 		}
+	}
+
+	// --- the window counters, folded in once ---------------------------------
+	//
+	// See MaybeLogCpuUploadWindow. These are collected in EVERY mode, mode=0
+	// included, because the control arm's lock and transition counts are what
+	// the armed leg has to be read against.
+	// Qualified rather than a using-directive, for the unity-build reason at the
+	// top of this file.
+	VoxelBrickPoolDetail::GUploadFlushes.fetch_add(1, std::memory_order_relaxed);
+	if (bMergeLocks)
+	{
+		VoxelBrickPoolDetail::GUploadCoalescedFlushes.fetch_add(1, std::memory_order_relaxed);
+	}
+	VoxelBrickPoolDetail::GUploadChunks.fetch_add(NumCpuWrites, std::memory_order_relaxed);
+	VoxelBrickPoolDetail::GUploadJobs.fetch_add(JobCount, std::memory_order_relaxed);
+	VoxelBrickPoolDetail::GUploadLocks.fetch_add(LockCount, std::memory_order_relaxed);
+	VoxelBrickPoolDetail::GUploadTransitions.fetch_add(TransitionCount, std::memory_order_relaxed);
+	VoxelBrickPoolDetail::GUploadBytes.fetch_add(ByteCount, std::memory_order_relaxed);
+	VoxelBrickPoolDetail::GUploadLockFails.fetch_add(LockFailCount, std::memory_order_relaxed);
+	VoxelBrickPoolDetail::NoteUploadMax(VoxelBrickPoolDetail::GUploadMaxChunks, NumCpuWrites);
+	VoxelBrickPoolDetail::NoteUploadMax(VoxelBrickPoolDetail::GUploadMaxJobs, JobCount);
+	VoxelBrickPoolDetail::NoteUploadMax(VoxelBrickPoolDetail::GUploadMaxLocks, LockCount);
+
+	// A lock that fails leaves a chunk allocated, accounted for, resident in the
+	// index, and BLANK -- the exact shape this file logs loudly everywhere else.
+	// It was silent here before this change.
+	if (LockFailCount > 0)
+	{
+		UE_LOG(LogVoxelBrickPool, Error,
+		       TEXT("[brick-cpuupload] %lld of %lld destination ranges FAILED to lock this flush ")
+		       TEXT("(%d chunks). Those chunks hold an allocation, a record slot and no volume."),
+		       LockFailCount, JobCount, NumCpuWrites);
 	}
 }
 
@@ -3403,9 +4157,12 @@ void FVoxelBrickPool::Flush()
 	// under, not whatever the cvar says by then -- half a flush on each arm is
 	// the one state neither arm's counters describe.
 	const bool bBatchedFlush = VoxelBrickPoolDetail::VoxelBrickFlushBatchEnabled();
+	// Same rule, same reason, for the CPU arm's upload -- see
+	// UploadCpuWrites_RenderThread's declaration.
+	const int32 CoalesceMode = VoxelBrickPoolDetail::VoxelBrickUploadCoalesceMode();
 	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolFlush)(
 		[Buffers = GetOrCreateBuffers(), Writes = MoveTemp(Writes),
-		 Clears = MoveTemp(Clears), bBatchedFlush,
+		 Clears = MoveTemp(Clears), bBatchedFlush, CoalesceMode,
 		 GpuCpuWrites = MoveTemp(GpuCpuWrites),
 		 Layout = GpuAllocLayout](FRHICommandListImmediate& RHICmdList) mutable
 	{
@@ -3530,7 +4287,7 @@ void FVoxelBrickPool::Flush()
 		// preference -- see UploadCpuWrites_RenderThread's declaration. Returns
 		// immediately when the batch holds no CPU writes, which is every batch
 		// under voxel.Brick.PackOnCpu 0.
-		UploadCpuWrites_RenderThread(RHICmdList, Buffers, Writes);
+		UploadCpuWrites_RenderThread(RHICmdList, Buffers, Writes, CoalesceMode);
 	});
 	const double FlushSinkStart = FPlatformTime::Seconds();
 	FlushStageMs.EnqueueMs += (FlushSinkStart - FlushEnqueueStart) * 1000.0;
@@ -3554,6 +4311,13 @@ void FVoxelBrickPool::Flush()
 	{
 		VoxelBrickPoolDetail::MaybeLogFlushBatchWindow();
 	}
+	// The CPU arm's upload window, and it is NOT gated on the switch being
+	// armed -- unlike the line above. The whole claim of voxel.Brick.UploadCoalesce
+	// is "fewer locks and fewer transitions than the control", and the control's
+	// counts exist nowhere else. A mode=0 leg therefore has to print this line
+	// too. It self-silences when the CPU arm moved nothing at all, so a
+	// voxel.Brick.PackOnCpu 0 leg still gains nothing.
+	VoxelBrickPoolDetail::MaybeLogCpuUploadWindow(CoalesceMode);
 	// P1: the allocator's window -- samples, counter readback, and the
 	// [brick-gpualloc] line. Same only-while-armed rule as above.
 	if (bGpuAllocArmed)

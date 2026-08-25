@@ -317,6 +317,52 @@ namespace
 		TEXT("moment the streaming origin rebases. Use 0 only to bisect a smearing artefact."),
 		ECVF_RenderThreadSafe);
 
+	// ---- HALF-RESOLUTION MARCHING -----------------------------------------
+	//
+	// A PERMUTATION, like the three bisection switches above, and for the same
+	// reason plus one more: at half res the VisBuffer is PHYSICALLY half-size,
+	// so a uniform branch would leave a shader able to index it at full-res
+	// coordinates. The size of the buffer and the shader that reads it are
+	// decided together or not at all.
+	TAutoConsoleVariable<int32> CVarVoxelMarchHalfRes(
+		TEXT("voxel.March.HalfRes"), 0,
+		TEXT("One march ray per 2x2 block instead of one per pixel, with the FULL-RES DEPTH ")
+		TEXT("RECONSTRUCTED EXACTLY in the emit rather than upsampled. 0 = off and byte-identical ")
+		TEXT("to every leg before this arm existed; 1 = on.\n")
+		TEXT("WHY IT IS WORTH A SWITCH. The march is the render floor -- 5.42 ms of a 9.55 ms ")
+		TEXT("parked frame -- and its cost is RAY-COUNT LINEAR: the 2026-08-25 screen-percentage ")
+		TEXT("sweep measured 4.37 / 3.99 / 3.91 ms per Mray across a 5.7x range, linear within ")
+		TEXT("2%%. Every tuning knob is spent (StepBudget flat across a 4x cut, SkipLevels 1 and 2 ")
+		TEXT("byte-identical, AO free, Velocity free, ReachM inert), and the only knob that moved ")
+		TEXT("cost -- RingCount -- pays for it in draw distance, which is refused. Quartering the ")
+		TEXT("rays is the structural version of the same lever and it costs NO view distance.\n")
+		TEXT("WHY THE DEPTH IS NOT MERELY UPSAMPLED. Every quantity the emit needs is a property ")
+		TEXT("of the HIT VOXEL AND FACE, and the hit surface is an axis-aligned PLANE -- so for a ")
+		TEXT("pixel whose true hit lies on the same face as a neighbouring sample's, the exact t ")
+		TEXT("is one ray/plane divide. AO stays pixel-exact and velocity stays exact because both ")
+		TEXT("descend from that t. Error is confined to pixels whose true voxel is none of the ")
+		TEXT("four candidates -- silhouettes and sub-sample features -- which fall back to plain ")
+		TEXT("nearest-neighbour.\n")
+		TEXT("HOW TO PROVE IT ENGAGED RATHER THAN ASSUME IT. Three readings, and take all three: ")
+		TEXT("(1) the '[voxel-march] halfres:' line below, printed unconditionally whenever the ")
+		TEXT("shape changes, which names the dispatch and the VisBuffer extent the march actually ")
+		TEXT("ran; (2) voxel.March.Stats 'tiles total/drawn', which fall ~4x because the emit tile ")
+		TEXT("is 16x16 full-res pixels instead of 8x8 -- and 'drawn' is a GPU READBACK, not a ")
+		TEXT("CPU count; (3) voxel.March.VerifyDepth 1 in mode 2, which under this arm grades the ")
+		TEXT("RECONSTRUCTION at full res against the raster depth.\n")
+		TEXT("THE FALSIFIER, PRE-REGISTERED: the gate's INTERIOR (non-edge) disagreement rate must ")
+		TEXT("be ~0. A silhouette may disagree -- both renderers are point samples of a step ")
+		TEXT("function there -- but an interior pixel has no excuse available, so a non-zero ")
+		TEXT("interior rate means the reconstruction is WRONG and refutes this arm rather than ")
+		TEXT("qualifying it. Read 'edge' beside 'compared' so the exemption's size stays visible.\n")
+		TEXT("WHAT IS DELIBERATELY NOT DONE: the cone slope is NOT doubled, so the march samples ")
+		TEXT("the same LOD at half the density. That keeps the first measurement about the ")
+		TEXT("reconstruction alone. If the gate shows an interior rate that grows with distance, ")
+		TEXT("the doubled slope is the change to try -- see VoxelMarch.usf. And there is no ")
+		TEXT("silhouette fixup pass yet, on purpose: its size should come from a measured fallback ")
+		TEXT("rate, not a guess."),
+		ECVF_RenderThreadSafe);
+
 	TAutoConsoleVariable<int32> CVarVoxelMarchHTileProbe(
 		TEXT("voxel.March.HTileProbe"), 0,
 		TEXT("THE ONLY WAY TO MEASURE THE HTILE BILL, and it needs voxel.March 2. ")
@@ -475,6 +521,29 @@ namespace
 	// One-shot complaint for the DBuffer cvar, so an operator who sets it to 1
 	// finds out why nothing happened instead of concluding decals are broken.
 	bool GVoxelMarchDBufferComplained = false;
+
+	// ---- WHAT THE MARCH LAST ACTUALLY DISPATCHED ---------------------------
+	//
+	// NOT what the cvar asks for. voxel.March.Stats runs on the game thread and
+	// can only read cvars; a cvar reads back whatever was typed, including on
+	// frames where the pass declined, and this project has a recorded incident
+	// of exactly that shape -- a switch that was armed, printed as armed, and
+	// ran the same configuration twice.
+	//
+	// So the march hook stamps the dimensions it really handed the dispatch, and
+	// the stats line prints those. -1 for the shift means the march has not run
+	// since this process started, which is a different statement from 0 and is
+	// printed as a different word.
+	//
+	// Written render thread, read game thread. Relaxed atomics rather than plain
+	// ints: nothing else is ordered against these -- they are a report, not a
+	// handshake -- but a torn read would print a shape that never existed, and
+	// this line's entire job is to be believable.
+	std::atomic<int32> GVoxelMarchRanSampleWidth{0};
+	std::atomic<int32> GVoxelMarchRanSampleHeight{0};
+	std::atomic<int32> GVoxelMarchRanViewWidth{0};
+	std::atomic<int32> GVoxelMarchRanViewHeight{0};
+	std::atomic<int32> GVoxelMarchRanResShift{-1};
 }
 
 FVoxelMarchArm VoxelMarchGetArm()
@@ -688,6 +757,46 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 		       S.DeclinedNoView, S.DeclinedNoVolume, S.DeclinedNoTextures,
 		       S.DeclinedNonPrimary,
 		       S.DeclinedUnsupported, S.DeclinedNoPool);
+		// ---- HALF RES: WHAT WAS ASKED FOR, AND WHAT ACTUALLY RAN -----------
+		//
+		// TWO FIELDS, NOT ONE, and they are printed side by side on purpose. A
+		// cvar reads back whatever was typed -- including on a frame where the
+		// pass declined, or before the first march of the session -- so "asked"
+		// alone is exactly the reading that let nine switches in this project sit
+		// armed and inert. "ran" is stamped by the march hook from the dimensions
+		// it handed the dispatch, and "never-ran" is a WORD rather than a
+		// plausible zero.
+		//
+		// asked != ran on a settled leg is a defect, not a race: the two can
+		// differ for one frame after a live cvar change and no longer than that.
+		{
+			const int32 RanShift = GVoxelMarchRanResShift.load(std::memory_order_relaxed);
+			const int32 Asked = (CVarVoxelMarchHalfRes.GetValueOnAnyThread() != 0) ? 1 : 0;
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("  halfRes: asked=%d ran=%s | rays=%dx%d for view=%dx%d | "
+			            "tile=%d full-res px | reconstruction=%s"),
+			       Asked,
+			       RanShift < 0 ? TEXT("never-ran")
+			                    : (RanShift != 0 ? TEXT("1 (half)") : TEXT("0 (full)")),
+			       GVoxelMarchRanSampleWidth.load(std::memory_order_relaxed),
+			       GVoxelMarchRanSampleHeight.load(std::memory_order_relaxed),
+			       GVoxelMarchRanViewWidth.load(std::memory_order_relaxed),
+			       GVoxelMarchRanViewHeight.load(std::memory_order_relaxed),
+			       kVoxelMarchTileSize << FMath::Max(RanShift, 0),
+			       RanShift < 0 ? TEXT("never-ran")
+			                    : (RanShift != 0 ? TEXT("exact ray/plane + nearest-neighbour "
+			                                            "fallback")
+			                                     : TEXT("none (direct Load)")));
+			if (RanShift >= 0 && RanShift != Asked)
+			{
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("  voxel.March.HalfRes asks for %d and the march last RAN %d. One "
+				            "frame of this is a live cvar change settling; anything longer means "
+				            "the switch is armed and not engaging, and every timing taken since "
+				            "describes the other arm."),
+				       Asked, RanShift);
+			}
+		}
 		if (Arm.Source == 1 && S.IndexEntries == 0)
 		{
 			UE_LOG(LogVoxelMarch, Warning,
@@ -2746,6 +2855,19 @@ class FVoxelMarchFallthroughDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_FALLTHROUG
 // walk. Still observation-only at every level, same rule, same static_assert.
 class FVoxelMarchHoleStatsDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_HOLE_STATS", 3);
 
+// HALF-RESOLUTION MARCHING (voxel.March.HalfRes). Carried by every shader that
+// touches the VisBuffer -- the march that writes it, BOTH vertex shaders (the
+// emit tile is 16x16 full-res pixels instead of 8x8, and that is a compile-time
+// scale in the quad), both pixel shaders that read it, and the depth gate.
+//
+// EVERY ONE OF THOSE, OR NONE. The buffer is physically half-size on this arm,
+// so a shader compiled for the wrong side of the switch does not render
+// slightly differently -- it indexes a texture that is not the size it thinks,
+// which is the silent-wrong-answer failure this file keeps naming. The host
+// therefore derives the emit-side value from the VisBuffer's OWN EXTENT rather
+// than from a second read of the cvar; see the emit hook.
+class FVoxelMarchHalfResDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_HALFRES");
+
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
 // ===========================================================================
@@ -2825,7 +2947,8 @@ class FVoxelMarchCS : public FGlobalShader
 	using FParameters = FVoxelMarchCSParameters;
 	using FPermutationDomain =
 		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchSkipDim, FVoxelMarchRingsDim,
-		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim>;
+		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim,
+		                         FVoxelMarchHalfResDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -2956,6 +3079,12 @@ class FVoxelMarchEmitVS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FVoxelMarchEmitVS);
 	SHADER_USE_PARAMETER_STRUCT(FVoxelMarchEmitVS, FGlobalShader);
 	using FParameters = FVoxelMarchEmitParameters;
+	// THE VERTEX SHADER CARRIES THE HALF-RES BIT TOO, and it is not decoration:
+	// the tile quad's size in screen pixels is VOXEL_MARCH_FULL_TILE_SIZE, which
+	// is 8 at full res and 16 at half. A VS compiled for the wrong side would
+	// rasterise a quarter of the tile it was handed and three quarters of the
+	// terrain would simply not be drawn, with no error anywhere.
+	using FPermutationDomain = TShaderPermutationDomain<FVoxelMarchHalfResDim>;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -2981,7 +3110,8 @@ class FVoxelMarchEmitPS : public FGlobalShader
 	using FParameters = FVoxelMarchEmitParameters;
 	using FPermutationDomain =
 		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchAODim, FVoxelMarchDBufferDim,
-		                         FVoxelMarchVelocityDim, FVoxelMarchRingsDim>;
+		                         FVoxelMarchVelocityDim, FVoxelMarchRingsDim,
+		                         FVoxelMarchHalfResDim>;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -3045,6 +3175,9 @@ class FVoxelMarchDepthOnlyVS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FVoxelMarchDepthOnlyVS);
 	SHADER_USE_PARAMETER_STRUCT(FVoxelMarchDepthOnlyVS, FGlobalShader);
 	using FParameters = FVoxelMarchDepthOnlyParameters;
+	// Same entry point as the emit's VS and therefore the same reason for the
+	// dimension: the quad's size in screen pixels is a compile-time constant.
+	using FPermutationDomain = TShaderPermutationDomain<FVoxelMarchHalfResDim>;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -3064,6 +3197,11 @@ class FVoxelMarchDepthOnlyPS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FVoxelMarchDepthOnlyPS);
 	SHADER_USE_PARAMETER_STRUCT(FVoxelMarchDepthOnlyPS, FGlobalShader);
 	using FParameters = FVoxelMarchDepthOnlyParameters;
+	// It must run the SAME reconstruction the emit runs, over the same four
+	// samples, or the emit's equal-depth test fails against the depth this pass
+	// wrote and terrain disappears in patches. One function in the shader, one
+	// dimension here.
+	using FPermutationDomain = TShaderPermutationDomain<FVoxelMarchHalfResDim>;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
@@ -3091,6 +3229,13 @@ class FVoxelMarchVerifyDepthCS : public FGlobalShader
 	DECLARE_GLOBAL_SHADER(FVoxelMarchVerifyDepthCS);
 	SHADER_USE_PARAMETER_STRUCT(FVoxelMarchVerifyDepthCS, FGlobalShader);
 	using FParameters = FVoxelMarchVerifyParameters;
+	// THE GATE MUST GRADE THE RECONSTRUCTION, NOT THE MARCH. It keeps running at
+	// FULL res -- one thread per screen pixel, the dispatch below is unchanged --
+	// but on this arm it reaches the VisBuffer through the same reconstruction
+	// the emit uses, so what it scores is the depth the emit would have written.
+	// A gate that read the half-res samples directly would certify the march and
+	// say nothing about the step that stands between the march and the picture.
+	using FPermutationDomain = TShaderPermutationDomain<FVoxelMarchHalfResDim>;
 
 	static constexpr int32 kGroupSize = kVoxelMarchTileSize;
 
@@ -4457,6 +4602,21 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 	const FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
 	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelMarch, "VoxelMarch");
 
+	// ---- HALF RES: ONE READ, ABOVE THE VIEW LOOP ---------------------------
+	//
+	// voxel.March.HalfRes decides the size of the VisBuffer, the shape of the
+	// dispatch, the size of the emit's tile quad and which permutation of five
+	// shaders runs. Every one of those has to describe the SAME buffer, so the
+	// cvar is read ONCE for the frame and every view in the family gets the same
+	// answer. A per-view read would let a split-screen family march one view at
+	// half res and rasterise it with the other view's tile size, and the symptom
+	// would be three quarters of the terrain missing from one viewport.
+	//
+	// The EMIT hook does not read this at all -- it derives the same bit from
+	// the extent of the VisBuffer the march actually wrote, which is the one
+	// thing that cannot have drifted. See PostRenderBasePassDeferred.
+	const int32 ResShift = (CVarVoxelMarchHalfRes.GetValueOnRenderThread() != 0) ? 1 : 0;
+
 	FVoxelMarchState::FTimingPair* Timing = OpenBracket(GraphBuilder, State->MarchTiming, TEXT("March"));
 
 	uint32 TotalTiles = 0;
@@ -4492,8 +4652,40 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		}
 
 		const FIntPoint Size = Entry.ViewRect.Size();
-		const FIntPoint TileCount(FMath::DivideAndRoundUp(Size.X, kVoxelMarchTileSize),
-		                          FMath::DivideAndRoundUp(Size.Y, kVoxelMarchTileSize));
+
+		// ---- THREE SIZES, AND EACH ONE ANSWERS A DIFFERENT QUESTION -------
+		//
+		//   Size          the view rect, in screen pixels. What the emit
+		//                 rasterises and what the depth gate walks.
+		//   MarchSize     the march's SAMPLE GRID. Equal to Size at full res;
+		//                 half of it, ROUNDED UP, at half res. This is the
+		//                 VisBuffer's extent and the ray count.
+		//   TileCount     the march's GROUP grid, which is also the emit's tile
+		//                 grid. The group is 8x8 THREADS at both resolutions --
+		//                 the group IS the tile-hit reduction and that is not
+		//                 negotiable -- so at half res one group owns a 16x16
+		//                 FULL-RES tile and the emit's quad grows to match
+		//                 (VOXEL_MARCH_FULL_TILE_SIZE in the shader).
+		//
+		// The rounding agrees by identity rather than by luck:
+		// ceil(ceil(W/2)/8) == ceil(W/16). So the tile grid derived from the
+		// sample grid is the same grid the emit would get from dividing the
+		// screen by 16, and the two halves cannot disagree about how many tiles
+		// there are -- which they must not, because MarchOutTileHit is indexed
+		// by group id and read by the compaction as a flat array.
+		const int32 ResDiv = 1 << ResShift;
+		const FIntPoint MarchSize(FMath::DivideAndRoundUp(Size.X, ResDiv),
+		                          FMath::DivideAndRoundUp(Size.Y, ResDiv));
+		const FIntPoint TileCount(FMath::DivideAndRoundUp(MarchSize.X, kVoxelMarchTileSize),
+		                          FMath::DivideAndRoundUp(MarchSize.Y, kVoxelMarchTileSize));
+		// The FULL-RES tile grid, for the diagnostics that still run one thread
+		// per SCREEN pixel. The source comparator is the one that matters: it
+		// marches every screen pixel three times and compares populations, so
+		// dispatching it over the half-res grid would silently halve the
+		// population it judges and every rate it prints would describe a quarter
+		// of the frame while looking like a whole one.
+		const FIntPoint FullResTileCount(FMath::DivideAndRoundUp(Size.X, kVoxelMarchTileSize),
+		                                 FMath::DivideAndRoundUp(Size.Y, kVoxelMarchTileSize));
 		Entry.TileCount = TileCount;
 		const uint32 TileTotal = uint32(TileCount.X) * uint32(TileCount.Y);
 		TotalTiles += TileTotal;
@@ -4513,17 +4705,82 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		// world -- the exact failure the plan's item 2 warns about, arriving by a
 		// different route.
 		//
-		// Sized to the VIEW RECT and indexed in view-local pixels, not to the
-		// scene extent. A split-screen or stereo family gets one of these per
-		// view and they cannot alias.
+		// Derived from the VIEW RECT and indexed in view-local coordinates, not
+		// from the scene extent. A split-screen or stereo family gets one of
+		// these per view and they cannot alias.
+		//
+		// AND SIZED TO THE MARCH SAMPLE GRID RATHER THAN TO THE RECT. At full res
+		// those are the same number. At half res this buffer is physically a
+		// quarter of the pixels, which is what makes voxel.March.HalfRes
+		// impossible to arm without engaging: a shader compiled for the other
+		// side of the switch does not render slightly differently, it indexes a
+		// texture that is not the size it thinks it is.
 		FRDGTextureRef Vis = GraphBuilder.CreateTexture(
-			FRDGTextureDesc::Create2D(Size, PF_R32G32_UINT, FClearValueBinding::None,
+			FRDGTextureDesc::Create2D(MarchSize, PF_R32G32_UINT, FClearValueBinding::None,
 			                          TexCreate_ShaderResource | TexCreate_UAV),
 			TEXT("VoxelMarch.Vis"));
 		FRDGTextureRef HitT = GraphBuilder.CreateTexture(
-			FRDGTextureDesc::Create2D(Size, PF_R32_FLOAT, FClearValueBinding::None,
+			FRDGTextureDesc::Create2D(MarchSize, PF_R32_FLOAT, FClearValueBinding::None,
 			                          TexCreate_ShaderResource | TexCreate_UAV),
 			TEXT("VoxelMarch.HitT"));
+
+		// ---- PROOF OF TRAFFIC ---------------------------------------------
+		//
+		// UNCONDITIONAL, and it prints what the pass IS ABOUT TO RUN rather than
+		// what any cvar says. This project has had nine switches turn out
+		// inert-but-armed in two days, including one that ran the same
+		// configuration twice and read as a clean null result; the discipline
+		// that caught that was the raster atlas's "fill: mode=N" line, and this
+		// is that line for this arm.
+		//
+		// Printed on CHANGE rather than every frame -- a per-frame line at 100+
+		// fps buries the log -- but the change set includes the view size, so a
+		// resolution change or a screen-percentage sweep re-prints it and a leg
+		// always has one line per configuration it actually ran.
+		//
+		// READ IT WITH TWO OTHER THINGS, because a CPU log line only proves what
+		// was DISPATCHED: voxel.March.Stats 'tiles drawn' is a GPU READBACK of
+		// the compaction's own output and falls ~4x on this arm, and
+		// voxel.March.VerifyDepth in mode 2 grades the reconstruction itself.
+		{
+			static int32 LoggedSampleW = -1;
+			static int32 LoggedSampleH = -1;
+			static int32 LoggedViewW = -1;
+			static int32 LoggedViewH = -1;
+			static int32 LoggedShift = -2;
+			if (MarchSize.X != LoggedSampleW || MarchSize.Y != LoggedSampleH ||
+			    Size.X != LoggedViewW || Size.Y != LoggedViewH || ResShift != LoggedShift)
+			{
+				LoggedSampleW = MarchSize.X;
+				LoggedSampleH = MarchSize.Y;
+				LoggedViewW = Size.X;
+				LoggedViewH = Size.Y;
+				LoggedShift = ResShift;
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("[voxel-march] halfres: arm=%d | view=%dx%d px | rays=%dx%d "
+				            "(%.3f Mray, %.2fx the pixels) | dispatch=%dx%d groups of %dx%d "
+				            "threads | tile=%d full-res px, tiles=%dx%d=%u | Vis=%dx%d "
+				            "HitT=%dx%d | emit+depth+gate read the VisBuffer by: %s"),
+				       ResShift != 0 ? 1 : 0, Size.X, Size.Y, MarchSize.X, MarchSize.Y,
+				       double(MarchSize.X) * double(MarchSize.Y) / 1.0e6,
+				       double(MarchSize.X) * double(MarchSize.Y) /
+				           FMath::Max(1.0, double(Size.X) * double(Size.Y)),
+				       TileCount.X, TileCount.Y, kVoxelMarchTileSize, kVoxelMarchTileSize,
+				       kVoxelMarchTileSize << ResShift, TileCount.X, TileCount.Y, TileTotal,
+				       Vis->Desc.Extent.X, Vis->Desc.Extent.Y, HitT->Desc.Extent.X,
+				       HitT->Desc.Extent.Y,
+				       ResShift != 0
+				           ? TEXT("EXACT RAY/PLANE RECONSTRUCTION over the 2x2 sample "
+				                  "neighbourhood, nearest-neighbour fallback where no candidate "
+				                  "face covers the pixel")
+				           : TEXT("a direct Load at the pixel's own texel (no reconstruction)"));
+			}
+			GVoxelMarchRanSampleWidth.store(MarchSize.X, std::memory_order_relaxed);
+			GVoxelMarchRanSampleHeight.store(MarchSize.Y, std::memory_order_relaxed);
+			GVoxelMarchRanViewWidth.store(Size.X, std::memory_order_relaxed);
+			GVoxelMarchRanViewHeight.store(Size.Y, std::memory_order_relaxed);
+			GVoxelMarchRanResShift.store(ResShift, std::memory_order_relaxed);
+		}
 
 		// ---- the reach, and the frame it implies ------------------------
 		//
@@ -4810,6 +5067,10 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			Permutation.Set<FVoxelMarchFallthroughDim>(Arm.Fallthrough);
 			// Already false without rings (VoxelMarchGetArm), same rule.
 			Permutation.Set<FVoxelMarchHoleStatsDim>(Arm.HoleStatsLevel);
+			// The buffer this dispatch is about to write is MarchSize, so the
+			// kernel that writes it must be the one compiled for MarchSize. The
+			// two are set from the same ResShift, four lines apart, deliberately.
+			Permutation.Set<FVoxelMarchHalfResDim>(ResShift != 0);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.
@@ -4830,9 +5091,13 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// the verify pass reads its output. Relying on that would make the
 			// timing arm depend on the gate arm being on, which is precisely the
 			// coupling the two cvars exist to avoid.)
+			// BOTH SIZES IN THE EVENT NAME. ProfileGPU and RenderDoc show this
+			// string and nothing else about the pass, so "rays for px" is where
+			// a capture proves half res engaged without a log at all.
 			FComputeShaderUtils::AddPass(
-				GraphBuilder, RDG_EVENT_NAME("VoxelMarch.March(%dx%d, budget %d)", Size.X, Size.Y,
-				                             Arm.StepBudget),
+				GraphBuilder,
+				RDG_EVENT_NAME("VoxelMarch.March(%dx%d rays for %dx%d px, budget %d)",
+				               MarchSize.X, MarchSize.Y, Size.X, Size.Y, Arm.StepBudget),
 				ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
 				Shader, Params, FIntVector(TileCount.X, TileCount.Y, 1));
 
@@ -4944,8 +5209,17 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				                     ERenderTargetLoadAction::ELoad,
 				                     FExclusiveDepthStencil::DepthWrite_StencilWrite);
 
-			TShaderMapRef<FVoxelMarchDepthOnlyVS> VertexShader(ShaderMap);
-			TShaderMapRef<FVoxelMarchDepthOnlyPS> PixelShader(ShaderMap);
+			// THE SAME SIDE OF THE SWITCH AS THE MARCH THAT JUST RAN. The VS
+			// needs it for the tile quad's size in screen pixels; the PS needs it
+			// because it must run the SAME reconstruction the emit will run, or
+			// the emit's equal-depth test fails against the depth written here
+			// and terrain disappears in patches.
+			FVoxelMarchDepthOnlyVS::FPermutationDomain DepthVSPermutation;
+			DepthVSPermutation.Set<FVoxelMarchHalfResDim>(ResShift != 0);
+			FVoxelMarchDepthOnlyPS::FPermutationDomain DepthPSPermutation;
+			DepthPSPermutation.Set<FVoxelMarchHalfResDim>(ResShift != 0);
+			TShaderMapRef<FVoxelMarchDepthOnlyVS> VertexShader(ShaderMap, DepthVSPermutation);
+			TShaderMapRef<FVoxelMarchDepthOnlyPS> PixelShader(ShaderMap, DepthPSPermutation);
 			const FIntRect DepthViewRect = Entry.ViewRect;
 			FRDGBufferRef DepthDrawArgs = DrawArgs;
 
@@ -5197,10 +5471,15 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				// different cascade than the one drawn.
 				CPermutation.Set<FVoxelMarchFallthroughDim>(Arm.Fallthrough);
 				TShaderMapRef<FVoxelMarchVerifySourceCS> CShader(ShaderMap, CPermutation);
+				// FULL-RES GRID, NOT THE MARCH'S. This kernel is one thread per
+				// SCREEN pixel and compares populations; dispatched over the
+				// half-res grid it would judge a quarter of the frame and print
+				// rates that looked like whole-frame rates. It is unchanged at
+				// full res -- FullResTileCount == TileCount there.
 				FComputeShaderUtils::AddPass(
 					GraphBuilder, RDG_EVENT_NAME("VoxelMarch.VerifySource"),
 					ERDGPassFlags::Compute | ERDGPassFlags::NeverCull, CShader, CParams,
-					FIntVector(TileCount.X, TileCount.Y, 1));
+					FIntVector(FullResTileCount.X, FullResTileCount.Y, 1));
 
 				if (!State->SourceCompareReadback.IsValid())
 				{
@@ -5335,6 +5614,47 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		FScopeLock Guard(&State->Lock);
 		State->Stats.DeclinedNoView++;
 		return;
+	}
+
+	// ---- HALF RES: TAKEN FROM THE BUFFER, NOT FROM THE CVAR ----------------
+	//
+	// This hook runs LATER IN THE FRAME than the march. Re-reading
+	// voxel.March.HalfRes here would let a mid-frame flip give the emit a
+	// different answer from the march that produced the buffer it is about to
+	// read -- and the symptom would not be a flicker, it would be a pixel shader
+	// indexing a texture at twice its extent. The march's own output settles it:
+	// if the VisBuffer is not the size of the view rect, the march ran half res.
+	//
+	// AND IT IS CHECKED, NOT MERELY DERIVED. Five bugs in this project in three
+	// days shared one shape -- a join COMPUTED instead of CHECKED -- so the
+	// derived answer is validated against the arithmetic it should satisfy, and
+	// a mismatch is loud rather than silently plausible.
+	const FIntPoint EmitViewSize = Entry->ViewRect.Size();
+	const FIntPoint EmitVisExtent =
+		(Entry->VisBuffer != nullptr) ? Entry->VisBuffer->Desc.Extent : EmitViewSize;
+	const bool bHalfResEmit =
+		(EmitVisExtent.X != EmitViewSize.X) || (EmitVisExtent.Y != EmitViewSize.Y);
+	if (bHalfResEmit)
+	{
+		const FIntPoint Expected(FMath::DivideAndRoundUp(EmitViewSize.X, 2),
+		                         FMath::DivideAndRoundUp(EmitViewSize.Y, 2));
+		if (EmitVisExtent != Expected)
+		{
+			static bool bComplained = false;
+			if (!bComplained)
+			{
+				bComplained = true;
+				UE_LOG(LogVoxelMarch, Error,
+				       TEXT("Voxel march emit: the VisBuffer is %dx%d for a %dx%d view rect, "
+				            "which is neither full res nor the %dx%d half-res grid the march is "
+				            "supposed to produce. The emit is about to reconstruct from a buffer "
+				            "whose sample lattice it does not know, which draws terrain in the "
+				            "wrong place with no other symptom. Something other than "
+				            "voxel.March.HalfRes changed the march's output extent."),
+				       EmitVisExtent.X, EmitVisExtent.Y, EmitViewSize.X, EmitViewSize.Y,
+				       Expected.X, Expected.Y);
+			}
+		}
 	}
 
 	TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe> Volume;
@@ -5625,6 +5945,15 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 			                          TEXT("GBufferC"), TEXT("GBufferD"), TEXT("GBufferE"),
 			                          TEXT("Velocity") };
 			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("[voxel-march] emit halfres: %s -- VisBuffer %dx%d for a %dx%d view "
+			            "rect, tile %d full-res px, reconstruction %s"),
+			       bHalfResEmit ? TEXT("HALF RES") : TEXT("full res"), EmitVisExtent.X,
+			       EmitVisExtent.Y, EmitViewSize.X, EmitViewSize.Y,
+			       kVoxelMarchTileSize << (bHalfResEmit ? 1 : 0),
+			       bHalfResEmit ? TEXT("ON (exact ray/plane over the 2x2, nearest-neighbour "
+			                           "fallback)")
+			                    : TEXT("off (direct Load)"));
+			UE_LOG(LogVoxelMarch, Display,
 			       TEXT("Voxel march emit bindings (mode %d, scratch %d): depth %s %dx%d"),
 			       Arm.Mode, bScratch ? 1 : 0,
 			       SceneDepth ? SceneDepth->Name : TEXT("NULL"),
@@ -5787,8 +6116,16 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Permutation.Set<FVoxelMarchDBufferDim>(Arm.bDBuffer);
 		Permutation.Set<FVoxelMarchVelocityDim>(bWriteVelocity);
 		Permutation.Set<FVoxelMarchRingsDim>(Arm.bRings);
+		// FROM THE BUFFER, not from the cvar -- see the derivation at the top of
+		// this hook. The VS carries it too: the tile quad's size in screen pixels
+		// is a compile-time constant and a VS on the wrong side of the switch
+		// would cover a quarter of its tile.
+		Permutation.Set<FVoxelMarchHalfResDim>(bHalfResEmit);
 
-		TShaderMapRef<FVoxelMarchEmitVS> VertexShader(ShaderMap);
+		FVoxelMarchEmitVS::FPermutationDomain VSPermutation;
+		VSPermutation.Set<FVoxelMarchHalfResDim>(bHalfResEmit);
+
+		TShaderMapRef<FVoxelMarchEmitVS> VertexShader(ShaderMap, VSPermutation);
 		TShaderMapRef<FVoxelMarchEmitPS> PixelShader(ShaderMap, Permutation);
 		const FIntRect ViewRect = Entry->ViewRect;
 		FRDGBufferRef DrawArgs = Entry->EmitDrawArgs;
@@ -5924,7 +6261,15 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 				Params->MarchOutVerify = CountersUAV;
 
 				const FIntPoint Size = Entry->ViewRect.Size();
-				TShaderMapRef<FVoxelMarchVerifyDepthCS> Shader(ShaderMap);
+				// FULL-RES DISPATCH, HALF-RES PERMUTATION, and that pairing is
+				// the whole point: the gate walks every SCREEN pixel and reaches
+				// the VisBuffer through the same reconstruction the emit uses, so
+				// what it scores is the depth the emit would have written. A gate
+				// dispatched over the half-res grid would grade the march and
+				// certify nothing about the reconstruction.
+				FVoxelMarchVerifyDepthCS::FPermutationDomain GatePermutation;
+				GatePermutation.Set<FVoxelMarchHalfResDim>(bHalfResEmit);
+				TShaderMapRef<FVoxelMarchVerifyDepthCS> Shader(ShaderMap, GatePermutation);
 				FComputeShaderUtils::AddPass(
 					GraphBuilder, RDG_EVENT_NAME("VoxelMarch.VerifyDepth"), Shader, Params,
 					FIntVector(FMath::DivideAndRoundUp(Size.X, FVoxelMarchVerifyDepthCS::kGroupSize),

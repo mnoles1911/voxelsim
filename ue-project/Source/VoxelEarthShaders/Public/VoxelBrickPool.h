@@ -1241,9 +1241,24 @@ private:
 	//
 	// RENDER THREAD ONLY. Static for AddFlushPasses_RenderThread's reason:
 	// everything it needs was moved out from under the game thread first.
+	//
+	// CoalesceMode is voxel.Brick.UploadCoalesce, READ ON THE GAME THREAD in
+	// Flush() and captured by value, for bBatchedFlush's reason above: the
+	// render command may run a frame later and the batch must be uploaded under
+	// the mode it was queued with, not whatever the cvar says by then. Half a
+	// flush on each arm is the one state neither arm's counters describe.
+	//
+	// It is a BITMASK, not a bool -- bit 0 merges exactly-adjacent destination
+	// ranges into one lock per run, bit 1 replaces D3D12's implicit per-unlock
+	// CopyDest transition pair with one batched pair around the whole flush, and
+	// the two are separable so a leg can attribute the win instead of shipping a
+	// bundle. 0 is the pre-existing four-locks-per-chunk path, byte for byte.
+	// See the switch's own comment in the .cpp for the measurement it is aimed
+	// at, what a lock/unlock pair actually costs on D3D12, and the falsifier.
 	static void UploadCpuWrites_RenderThread(FRHICommandListImmediate& RHICmdList,
 	                                         const FVoxelBrickPoolBuffersRef& Buffers,
-	                                         const TArray<FPendingWrite>& Writes);
+	                                         const TArray<FPendingWrite>& Writes,
+	                                         int32 CoalesceMode);
 
 	FVoxelBrickPoolConfig Config;
 	bool bInitialised = false;

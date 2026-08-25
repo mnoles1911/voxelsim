@@ -136,6 +136,38 @@ $LogPath = Join-Path (Resolve-Path "$PSScriptRoot\..").Path "Saved\$LogName.log"
 # obvious three-name check misses exactly the window where the link happens.
 # (Credit: the front-end session, which was checking this by hand.)
 $running = @(Get-Process UnrealEditor-Cmd, UnrealEditor, cl, link, UnrealBuildTool, MSBuild, dotnet -ErrorAction SilentlyContinue)
+
+# AND HOW OLD THE HOLDER IS, because "an editor is running" is not the same
+# question as "the box is in use".
+#
+# On 2026-08-25 a capture held the box for FOUR HOURS and two queued jobs of mine
+# expired waiting politely behind it -- about two and a half hours of measurement
+# time, and I reported to the owner that the other lane was busy. It was not busy
+# in any sense that mattered.
+#
+# THE PART THAT DEFEATS THE OBVIOUS HEURISTICS: it was NOT wedged. It was working
+# perfectly and had simply never been told to stop -- both its shots had fired,
+# its log was still growing at 45 MB, it had rendered 1.58 MILLION settled frames,
+# CPU ~2.5 cores, Responding=True. A process doing exactly its job forever is
+# indistinguishable from a spinning one by CPU, and from a blocked one by
+# responsiveness. Do not try to classify it.
+#
+# So this does NOT say "wedged" -- that would have been wrong about the real case.
+# It says the only thing that is both true and actionable: this has held the box
+# far longer than any leg should, so a human (or the session that owns it) needs
+# to look, rather than the next job queuing behind it in silence.
+#
+# The cause there was a real defect worth knowing: -VoxelLoadingShotAt does not
+# quit after its last shot if that shot lands AFTER hand-off -- the front end
+# tears down and takes whatever quits the run with it. The image is produced and
+# the process never exits.
+if ($running.Count -gt 0) {
+    $oldestMin = ($running | ForEach-Object { ((Get-Date) - $_.StartTime).TotalMinutes } | Measure-Object -Maximum).Maximum
+    if ($oldestMin -gt 15) {
+        Write-Host ("  NOTE: the holding process is {0:N0} minutes old. No leg runs that long -- it has " -f $oldestMin) -ForegroundColor Yellow
+        Write-Host "  most likely finished its work and never exited. Check it rather than waiting for it." -ForegroundColor Yellow
+    }
+}
 if ($running.Count -gt 0) {
     $detail = ($running | ForEach-Object { "PID $($_.Id) ($($_.ProcessName))" }) -join ', '
     throw ("REFUSING TO START: $($running.Count) editor process(es) already running -- $detail. " +

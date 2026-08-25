@@ -7,7 +7,10 @@
 // which of those encodings are not what the plan said they were.
 //
 //   VoxelMarchMain           [cs] one ray per pixel -> VisBuffer + float t,
-//                                 plus one hit bit per 8x8 tile
+//                                 plus one hit bit per tile. (One ray per 2x2
+//                                 BLOCK under voxel.March.HalfRes, with the
+//                                 full-res depth reconstructed exactly in the
+//                                 emit -- see the half-res section below.)
 //   VoxelMarchCompactTilesMain [cs] hit tiles -> tile list + DrawIndirect args
 //   VoxelMarchEmitVS/PS      [raster, indirect] SV_Depth + stencil + GBuffers
 //
@@ -250,6 +253,183 @@
 // reading is the START of that argument and not the end of it.
 //   * no blending. Every channel written here REPLACES what the base pass put
 //     there; a blend on a GBuffer is not a softer surface, it is a corrupt one.
+//
+// ===========================================================================
+// HALF-RESOLUTION MARCHING WITH EXACT DEPTH RECONSTRUCTION (voxel.March.HalfRes)
+// ===========================================================================
+//
+// OFF BY DEFAULT. At VOXEL_MARCH_HALFRES 0 every kernel below compiles exactly
+// as it did before this arm existed -- same expressions, same loads, same tile
+// size -- so today's path stays the control arm and an A/B is an A/B.
+//
+// ---------------------------------------------------------------------------
+// WHY: THE MARCH IS RAY-COUNT LINEAR AND EVERY TUNING KNOB IS SPENT
+// ---------------------------------------------------------------------------
+//
+// From the 2026-08-25 screen-percentage sweep (parked pose, r.ScreenPercentage
+// swept over a 5.7x ray-count range, the 4.13 ms non-marcher floor subtracted):
+//
+//     0.65 M rays -> 2.84 ms      4.37 ms/Mray
+//     1.36 M rays -> 5.43 ms      3.99 ms/Mray
+//     3.69 M rays -> 14.43 ms     3.91 ms/Mray
+//
+// Linear within 2% across the range. The same day's frame anatomy puts the
+// marcher at 5.42 ms of a 9.55 ms parked frame -- it IS the render floor -- and
+// every knob that could have moved it has been measured flat: StepBudget flat
+// across a 4x cut, SkipLevels 1 and 2 byte-identical, AO free, Velocity free,
+// ReachM inert. Only RingCount moved cost, and it moves it by shortening the
+// marched range, which is the one trade the owner has refused outright.
+//
+// Linear in rays with no knob left means the remaining lever is THE RAY COUNT
+// ITSELF. One ray per 2x2 block is a quarter of them, which the fit above
+// prices at ~1.4 ms in place of 5.43 -- and it costs NO view distance, because
+// every ray still runs the full cascade to the same reach.
+//
+// ---------------------------------------------------------------------------
+// AND WHY THIS IS NOT ORDINARY UPSAMPLING: THE FULL-RES DEPTH IS EXACT
+// ---------------------------------------------------------------------------
+//
+// The usual objection to a half-res depth buffer is that upsampled depth is
+// wrong everywhere, not just at edges, and wrong depth is worse than no depth.
+// That objection does not apply here, and the reason is a property of the
+// volume rather than a filtering trick.
+//
+// EVERY QUANTITY THE EMIT NEEDS IS A PROPERTY OF THE HIT VOXEL AND ITS FACE,
+// NOT OF THE PIXEL. The hit surface is an AXIS-ALIGNED PLANE. So if a full-res
+// pixel's true hit lies on the SAME voxel face a half-res neighbour already
+// found, that pixel's exact t is one divide:
+//
+//     t = (facePlaneCoord - Ray.OriginLocalUU[FaceAxis]) / Ray.DirWorld[FaceAxis]
+//
+// and that is the number the full-res march would have produced, because it is
+// the same plane and the same ray. Everything downstream then stays exact
+// rather than approximately right:
+//
+//   * HitLocalUU is exact, so VoxelMarchFaceUV is exact, so the corner AO
+//     gradient is PIXEL-EXACT and not a 2x2 blur of four AO values.
+//   * HitTWS is exact, so the velocity vector is exact -- which matters more
+//     than it looks, because TSR is the consumer and a half-res-quantised
+//     motion vector smears a static world.
+//   * The world voxel, the material, the level and the face-neighbour mask are
+//     carried in the vis packet and are properties of the voxel, so they are
+//     not reconstructed at all. They are simply read.
+//
+// SO THE ERROR IS NOT SPREAD OVER THE IMAGE. It is confined to pixels whose
+// TRUE first-hit voxel is not one of the four candidates -- silhouettes,
+// voxel-boundary pixels, and features thinner than a half-res sample. Those
+// pixels fall back to the containing sample, which is plain nearest-neighbour
+// upsampling, which is what a half-res renderer without this argument would
+// have done EVERYWHERE.
+//
+// ---------------------------------------------------------------------------
+// THE CANDIDATE TEST, AND WHY IT IS AN EXTENT TEST AND NOT A DEPTH HEURISTIC
+// ---------------------------------------------------------------------------
+//
+// A candidate is ACCEPTED when the reconstructed point lands inside that
+// candidate's own voxel face -- two compares, in the face's U and V axes, in
+// voxel units. That is a statement about geometry ("this pixel's ray really
+// does cross that face"), not a tolerance ("these depths are close enough"),
+// and it is the whole reason this can claim exactness rather than plausibility.
+// Among accepted candidates the NEAREST t wins, which is the correct occlusion
+// answer over the set of surfaces that are known.
+//
+// Two further refusals, each of which exists because of a specific hazard:
+//
+//   ON-LATTICE. A candidate's hit must sit on its own level's voxel lattice in
+//   the face axis, within 1/64 of a voxel. A real face crossing does by
+//   construction. A STARTED-INSIDE hit does not: VoxelBrickTraverse.ush returns
+//   bHit with no face when the segment begins in solid, and VoxelMarchPackVis
+//   stores max(FaceAxis, 0) -- so such a hit arrives here claiming face axis 0
+//   with a t that is a segment entry, not a plane crossing. Left unrefused it
+//   would hand its neighbours a plane that does not exist. The camera clipping
+//   into the ground is a normal event in this project, not an edge case.
+//
+//   FACING. The full-res ray must cross the plane in the same direction the
+//   candidate did (DirWorld[axis] * FaceSign > 0). Without it a pixel can be
+//   handed the BACK of a face it is looking away from.
+//
+// The on-lattice test is also the guard on the one assumption underneath the
+// snap: that the level-L voxel lattice is aligned with local-frame zero. It is
+// -- the frame origin is snapped to 1024 level-0 voxels with the cascade on and
+// to a 32-voxel chunk without it -- but if that ever stops being true, EVERY
+// candidate fails the test, every pixel takes the nearest-neighbour fallback,
+// and the result is a slightly softer image rather than terrain in the wrong
+// place. That is the failure direction this renderer wants.
+//
+// ---------------------------------------------------------------------------
+// THE ONE PLACE HALF RES CAN DELETE TERRAIN, AND WHAT IS DONE ABOUT IT
+// ---------------------------------------------------------------------------
+//
+// The march clips every ray to the prepass depth (`TMax = min(TMax, SceneTUU)`)
+// and that read is now ONE read standing for FOUR PIXELS. Taken at the block
+// centre it would clip the whole block to whatever the NEAREST occluder in it
+// happened to be -- so a full-res pixel that looks past the edge of a tree
+// would have its ground clipped away by the tree, and the hole would be real
+// missing terrain, not a soft edge.
+//
+// So the read is CONSERVATIVE over the 2x2: the FARTHEST of the four view Z
+// values wins. Rays then survive that any of the four pixels could see, and the
+// ones that should not have survived are rejected later by the hardware depth
+// test against the very prepass depth that would have clipped them. Cheap, and
+// it fails in the direction of drawing too much rather than too little.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS DELIBERATELY NOT CHANGED: THE CONE SLOPE
+// ---------------------------------------------------------------------------
+//
+// MarchPixelConeSlope is the LOD rule's whole input, and at half res a sample
+// genuinely covers twice the width -- so the "correct" half-res render doubles
+// it and picks one level coarser everywhere. IT IS NOT DOUBLED HERE, ON
+// PURPOSE: doubling it changes which voxels exist in the far field, and that
+// would land in the same measurement as the reconstruction, leaving no way to
+// tell a reconstruction defect from an LOD change. The first reading has to
+// isolate the reconstruction.
+//
+// WHAT THAT COSTS, STATED RATHER THAN HIDDEN: at the unchanged slope the far
+// field holds voxels about one FULL-RES pixel across, so a half-res sample
+// takes one sample per four such voxels and the "true voxel is not one of the
+// four candidates" case stops being rare out there. If the depth gate shows an
+// interior disagreement rate that rises with distance, THAT is the cause, and
+// the change to try is the doubled slope -- one multiply at the three places
+// VoxelMarchRenderer.cpp assigns MarchPixelConeSlope (march, emit, gate), which
+// must move together or the tint fade will disagree with the level the ray
+// actually sampled.
+//
+// ---------------------------------------------------------------------------
+// THE FALSIFIER -- and it is a refutation, not a caveat
+// ---------------------------------------------------------------------------
+//
+// `voxel.March.VerifyDepth` mode 2 already implements exactly the right gate,
+// and under this arm IT GRADES THE RECONSTRUCTION rather than the march: the
+// verify kernel runs at FULL res and goes through the same reconstruction the
+// emit does, so what it scores is the number the emit would have written.
+//
+//     fraction of pixels with |delta linear depth| > 0.5 * voxelSize(level)
+//     must be < 0.5%, AND the failures must fall inside the dilated
+//     raster-depth edge mask. INTERIOR (non-edge) disagreements must be ~0.
+//
+// An interior disagreement is not aliasing. Both renderers are point samples of
+// a step function AT A SILHOUETTE and are entitled to differ there; away from
+// one, there is no excuse available. So a non-zero interior rate means the
+// reconstruction is WRONG -- and that REFUTES this arm rather than qualifying
+// it. Read `edge` beside `compared` as always, so the exemption's size stays
+// visible, and read the reference-self control: a rate below it is consistent
+// with sampling noise and is NOT proof of correctness.
+//
+// The gate is also the strongest available proof that the reconstruction ran at
+// all. The vis buffer is physically half-size under this arm; a build in which
+// the reconstruction had been compiled out would index it at full-res
+// coordinates and the gate would not pass, it would explode.
+//
+// ---------------------------------------------------------------------------
+// NOT BUILT YET, ON PURPOSE: THE SILHOUETTE FIXUP
+// ---------------------------------------------------------------------------
+//
+// The obvious completion is a second, sparse full-res march over exactly the
+// pixels that took the fallback. It is deliberately absent: its size and its
+// cost should be decided from a MEASURED fallback rate at a real pose, not from
+// a guess, and the base arm has to be measured before anything is built on top
+// of it.
 
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/DeferredShadingCommon.ush"
@@ -272,6 +452,29 @@
 #ifndef VOXEL_MARCH_VELOCITY
 #define VOXEL_MARCH_VELOCITY 1
 #endif
+
+// ONE RAY PER 2x2 BLOCK. 0 = one ray per full-res pixel and every kernel below
+// compiles exactly as it did before this arm existed. See HALF-RESOLUTION
+// MARCHING WITH EXACT DEPTH RECONSTRUCTION at the top of this file.
+#ifndef VOXEL_MARCH_HALFRES
+#define VOXEL_MARCH_HALFRES 0
+#endif
+
+// Full-res pixels per march sample, as a SHIFT so the pixel <-> sample map is
+// exact integer arithmetic in both directions and there is no rounding rule for
+// the two halves of this renderer to disagree about.
+#if VOXEL_MARCH_HALFRES
+#define VOXEL_MARCH_RES_SHIFT 1
+#else
+#define VOXEL_MARCH_RES_SHIFT 0
+#endif
+
+// THE EMIT'S TILE, IN FULL-RES PIXELS -- and the march GROUP is still 8x8
+// THREADS, which is not negotiable: the group IS the tile-hit reduction that
+// fills the emit's draw list. At half res those 64 threads own a 16x16 full-res
+// tile, so VoxelMarchEmitVS's quad must grow with it. The host derives
+// MarchTileCount from the same relation, so the two cannot drift.
+#define VOXEL_MARCH_FULL_TILE_SIZE (VOXEL_MARCH_TILE_SIZE << VOXEL_MARCH_RES_SHIFT)
 
 // ---------------------------------------------------------------------------
 // Bindings
@@ -542,6 +745,276 @@ float VoxelMarchSceneViewZ(float DeviceZ)
 	       1.0f / (DeviceZ * MarchInvDeviceZToWorldZ[2] - MarchInvDeviceZToWorldZ[3]);
 }
 
+// ---------------------------------------------------------------------------
+// THE MARCH'S OWN SAMPLE GRID (half res)
+// ---------------------------------------------------------------------------
+//
+// At VOXEL_MARCH_HALFRES 0 these two are the expressions that used to be
+// written inline at their call sites, unchanged, so the off arm compiles to the
+// same thing it always did.
+
+int2 VoxelMarchSampleGridSize()
+{
+	const int2 Full = int2(MarchViewRectSize);
+#if VOXEL_MARCH_HALFRES
+	// ROUNDED UP. A rect with an odd width still needs a sample for its last
+	// column; rounding down would leave a one-pixel unmarched stripe at the
+	// right or bottom edge that no counter reports and that reads as a seam.
+	//
+	// It also keeps the tile arithmetic consistent: ceil(ceil(W/2)/8) ==
+	// ceil(W/16), which is exactly the full-res tile count the host computes for
+	// VoxelMarchEmitVS. The two roundings agree by identity, not by luck.
+	return (Full + 1) >> 1;
+#else
+	return Full;
+#endif
+}
+
+// The SV_Position a march SAMPLE stands at. At full res that is the pixel
+// centre, exactly as before. At half res it is the CENTRE OF THE 2x2 BLOCK --
+// the corner the four full-res pixels share -- so the sample is equidistant
+// from all four and no quadrant is systematically favoured.
+//
+// THE ALTERNATIVE, AND WHY IT IS REJECTED ON AN ARGUMENT RATHER THAN A
+// MEASUREMENT (it has not been measured, and saying so is the point): putting
+// the sample on ONE of the four pixel centres makes that pixel exact and the
+// other three reconstructions, so the fallback population would be
+// systematically offset toward one corner of every block. That is a
+// direction-dependent artefact, and direction-dependent artefacts in this
+// project have twice been mistaken for terrain features. Equidistant costs
+// nothing and cannot produce one.
+float2 VoxelMarchSampleSvPosition(int2 SampleXY)
+{
+#if VOXEL_MARCH_HALFRES
+	return MarchViewRectMin + float2(SampleXY << 1) + 1.0f;
+#else
+	return MarchViewRectMin + float2(SampleXY) + 0.5f;
+#endif
+}
+
+#if VOXEL_MARCH_HALFRES
+
+// One component of a vector by a runtime axis index. Written as two selects
+// rather than V[Axis] for the reason VoxelMarchFaceUV gives: dynamic vector
+// indexing is legal HLSL and compiles to scratch traffic on some drivers, and
+// this is inside a four-iteration unrolled loop.
+float VoxelMarchAxisComponent(float3 V, int Axis)
+{
+	return (Axis == 0) ? V.x : ((Axis == 1) ? V.y : V.z);
+}
+
+// ---------------------------------------------------------------------------
+// THE EXACT FULL-RES RECONSTRUCTION
+// ---------------------------------------------------------------------------
+//
+// The argument for why this is exact rather than filtered is at the top of this
+// file, under HALF-RESOLUTION MARCHING WITH EXACT DEPTH RECONSTRUCTION. What
+// follows is the mechanism.
+//
+// Returns what the emit would have loaded at full res: a vis packet and a float
+// t. bExact says which of the two paths produced it -- an accepted candidate
+// (the exact reconstruction) or the containing sample (nearest-neighbour). It
+// is carried because a future silhouette fixup needs exactly that bit, and it
+// is the honest name for the difference; nothing reads it yet.
+struct FVoxelMarchRecon
+{
+	bool           bHit;
+	bool           bExact;
+	float          THitUU;
+	FVoxelMarchVis V;
+};
+
+// Direction only: VoxelMarchBuildRay's first four lines without the slab
+// intersection, because a candidate's ray is used only to place the candidate's
+// OWN hit and the box test is a property of the pixel being shaded.
+//
+// COPIED LINE FOR LINE AND NOT APPROXIMATED. If this direction differs from the
+// one VoxelMarchMain used for that sample by so much as a ulp, the plane derived
+// below is not the plane the march crossed -- and the failure would be a
+// sub-voxel depth error spread over the whole image, which is the hardest kind
+// of defect to attribute in this renderer. The same "the same rays, not merely
+// similar ones" discipline the census applies.
+float3 VoxelMarchSampleDirWorld(float2 SvPositionXY)
+{
+	const float2 LocalPixel = SvPositionXY - MarchViewRectMin;
+	float2 Ndc = (LocalPixel / MarchViewRectSize) * 2.0f - 1.0f;
+	Ndc.y = -Ndc.y; // clip y is up, pixel y is down
+
+	const float3 DirView = float3(Ndc * MarchInvProjDiag, 1.0f);
+	return normalize(mul(float4(DirView, 0.0f), MarchViewToTranslatedWorld).xyz);
+}
+
+// How far off its own level's lattice a candidate's hit may sit, in voxels,
+// before it is refused. 1/64 of a voxel.
+//
+// THE BUDGET, so this is a number and not a feeling. Under the cascade every hit
+// is at most 1,280 voxels OF ITS OWN LEVEL from the frame origin (the cascade
+// property -- see VoxelMarchSourceOriginVoxelAtLevel), so the float32 ulp on
+// HitPos/VoxelSize is 1,280 * 2^-23 = 1.5e-4 voxels. 1/64 = 1.6e-2 is a hundred
+// times that, which leaves room for the rescale and the advance nudge and still
+// refuses a started-inside hit -- whose "plane" is a segment entry and lands
+// anywhere in the voxel, so it survives this test only 3% of the time.
+//
+// IF THE DEPTH GATE SHOWS AN UNEXPECTED INTERIOR RATE, THIS IS THE FIRST THING
+// TO LOOSEN, and loosening it fails safe: a rejected candidate costs the pixel
+// its exactness (it takes the nearest-neighbour fallback), never its correctness.
+#define VOXEL_MARCH_RECON_LATTICE_TOL (1.0f / 64.0f)
+
+FVoxelMarchRecon VoxelMarchReconstruct(int2 LocalPixelFull, FVoxelMarchRay Ray)
+{
+	FVoxelMarchRecon R;
+	R.bHit = false;
+	R.bExact = false;
+	R.THitUU = 0.0f;
+	R.V = VoxelMarchUnpackVis(uint2(0u, 0u));
+
+	const int2 GridMax = VoxelMarchSampleGridSize() - 1;
+
+	// The containing sample, and the three neighbours on the side of it this
+	// pixel actually lies -- the bilinear 2x2, chosen with integer arithmetic
+	// rather than a Gather so that no sampler, no filter mode and no half-texel
+	// convention can get between the march and the emit. Four Loads of each
+	// texture; the emit's entire measured cost is 0.12-0.29 ms on mode=scene
+	// legs and it is overhead-bound rather than bandwidth-bound (see the
+	// binding log's note in the .cpp), so this is not where the budget goes.
+	const int2 Base = LocalPixelFull >> 1;
+	const int2 Step = ((LocalPixelFull & 1) << 1) - 1; // -1 toward low, +1 toward high
+
+	int2 Cand[4];
+	Cand[0] = Base;                                    // CONTAINING -- also the fallback
+	Cand[1] = int2(Base.x + Step.x, Base.y);
+	Cand[2] = int2(Base.x, Base.y + Step.y);
+	Cand[3] = Base + Step;
+
+	float BestT = 1e30f;
+
+	[unroll]
+	for (int i = 0; i < 4; ++i)
+	{
+		// Clamped rather than skipped at the frame edge: a clamped duplicate of
+		// the containing sample is a legal candidate that simply cannot win
+		// twice, whereas skipping would leave edge pixels with fewer candidates
+		// and a fallback rate that varies with screen position -- which would
+		// then have to be explained every time someone reads the gate.
+		const int2 C = clamp(Cand[i], int2(0, 0), GridMax);
+
+		const FVoxelMarchVis Vc = VoxelMarchUnpackVis(MarchVis.Load(int3(C, 0)));
+		if (!Vc.bHit)
+		{
+			continue;
+		}
+
+		const float  Tc = MarchHitT.Load(int3(C, 0));
+		const float3 Dc = VoxelMarchSampleDirWorld(VoxelMarchSampleSvPosition(C));
+
+		// EVERY RAY IN THIS PASS SHARES ONE ORIGIN (VoxelMarchBuildRay sets
+		// R.OriginLocalUU = MarchRayOriginLocalUU unconditionally), which is what
+		// makes a neighbour's hit position one multiply-add away rather than a
+		// second frame conversion.
+		const int   A  = Vc.FaceAxis;
+		const float S  = VoxelMarchVoxelSizeUU(Vc.Level);
+		const float OA = VoxelMarchAxisComponent(Ray.OriginLocalUU, A);
+		const float DcA = VoxelMarchAxisComponent(Dc, A);
+		const float HcA = OA + DcA * Tc;
+
+		// THE PLANE, SNAPPED TO THE LATTICE. The hit surface IS a lattice plane;
+		// snapping removes the neighbour's own float error instead of carrying it
+		// into this pixel. The snap is only legitimate because the level-L
+		// lattice is aligned with local-frame zero (the frame origin is snapped
+		// to 1024 level-0 voxels under the cascade), and the tolerance test below
+		// is the guard on exactly that -- if the alignment ever stops holding,
+		// every candidate is refused and the image degrades to nearest-neighbour
+		// rather than moving.
+		const float Lattice = HcA / S;
+		const float Plane   = round(Lattice);
+		if (abs(Lattice - Plane) > VOXEL_MARCH_RECON_LATTICE_TOL)
+		{
+			continue;
+		}
+
+		// FACING, AND THE DIVISION GUARD, IN ONE TEST. Vc.FaceSign is +1 when the
+		// march entered moving in +A, so DcA has that sign; this pixel may only
+		// claim the same face if it crosses it the same way. The comparison
+		// against the min-component epsilon doubles as the guard on the divide:
+		// a ray parallel to the plane has no crossing to reconstruct.
+		const float DpA = VoxelMarchAxisComponent(Ray.DirWorld, A);
+		if (DpA * float(Vc.FaceSign) <= VOXEL_MARCH_MIN_DIR_COMPONENT)
+		{
+			continue;
+		}
+
+		// THE ONE DIVIDE THIS WHOLE ARM RESTS ON.
+		const float T = (Plane * S - OA) / DpA;
+		if (!(T > 0.0f) || T >= BestT)
+		{
+			continue;
+		}
+
+		// THE FACE EXTENT TEST -- two compares, in the face's own U and V, in
+		// voxel units. This is what makes the result a geometric claim ("this
+		// ray really does cross that face") instead of a depth tolerance.
+		//
+		// Done RELATIVE to the candidate's own hit, so the large absolute
+		// coordinate is subtracted away before the divide rather than frac'd
+		// twice -- the argument VoxelMarchFaceUV makes about losing the
+		// fractional part at range, applied to a difference instead of a point.
+		const float3 Hc = Ray.OriginLocalUU + Dc * Tc;
+		const float3 Hp = Ray.OriginLocalUU + Ray.DirWorld * T;
+		int AU, AV;
+		VoxelMarchFaceAxes(A, AU, AV);
+		const float HcU = VoxelMarchAxisComponent(Hc, AU);
+		const float HcV = VoxelMarchAxisComponent(Hc, AV);
+		const float2 UV = float2(frac(HcU / S) + (VoxelMarchAxisComponent(Hp, AU) - HcU) / S,
+		                         frac(HcV / S) + (VoxelMarchAxisComponent(Hp, AV) - HcV) / S);
+		if (any(UV < 0.0f) || any(UV >= 1.0f))
+		{
+			continue;
+		}
+
+		BestT = T;
+		R.bHit = true;
+		R.bExact = true;
+		R.THitUU = T;
+		R.V = Vc;
+	}
+
+	if (!R.bHit)
+	{
+		// THE FALLBACK, AND WHY IT IS THE CONTAINING SAMPLE VERBATIM.
+		//
+		// Nothing covered this pixel, so its true voxel is not among the four:
+		// a silhouette, a voxel boundary, or a feature thinner than a sample.
+		// There is no exact answer available, so the honest degradation is the
+		// one a half-res renderer WITHOUT this argument would have used
+		// everywhere -- plain nearest-neighbour.
+		//
+		// TAKEN VERBATIM (this sample's own t) rather than extrapolated through
+		// the plane formula, because an extrapolation from a grazing plane can
+		// return an arbitrarily large t and would put terrain at a depth NO ray
+		// ever measured. The verbatim t is bounded by construction: it is a
+		// distance some adjacent ray really found, so the error is at most the
+		// depth step between neighbouring samples on the surface, and at a true
+		// silhouette it is the silhouette -- which is precisely the population
+		// the depth gate's dilated edge mask exempts.
+		//
+		// If the containing sample MISSED, this pixel misses. That is also the
+		// nearest-neighbour answer and it is the one that cannot invent terrain.
+		const int2 C = clamp(Base, int2(0, 0), GridMax);
+		const FVoxelMarchVis Vc = VoxelMarchUnpackVis(MarchVis.Load(int3(C, 0)));
+		if (Vc.bHit)
+		{
+			R.bHit = true;
+			R.bExact = false;
+			R.THitUU = MarchHitT.Load(int3(C, 0));
+			R.V = Vc;
+		}
+	}
+
+	return R;
+}
+
+#endif // VOXEL_MARCH_HALFRES
+
 // ===========================================================================
 // 1. THE MARCH
 // ===========================================================================
@@ -610,8 +1083,12 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 #endif
 	GroupMemoryBarrierWithGroupSync();
 
+	// AT HALF RES THIS IS A SAMPLE INDEX, NOT A PIXEL INDEX -- one sample per
+	// 2x2 full-res block. VoxelMarchSampleGridSize owns the rounding and is the
+	// only place it is written; at VOXEL_MARCH_HALFRES 0 it returns
+	// int2(MarchViewRectSize) and this line is what it always was.
 	const int2 LocalPixel = int2(DispatchThreadId.xy);
-	const bool bInView = all(LocalPixel < int2(MarchViewRectSize));
+	const bool bInView = all(LocalPixel < VoxelMarchSampleGridSize());
 
 	uint2 Packed = uint2(0u, 0u);
 	float HitT = 0.0f;
@@ -624,7 +1101,7 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 		// pixel shader reconstructs the ray from its own SV_Position, so the two
 		// halves of this renderer trace the same ray and not merely a similar
 		// one -- the same discipline VoxelMarchSpike.usf's census applies.
-		const float2 SvPositionXY = MarchViewRectMin + float2(LocalPixel) + 0.5f;
+		const float2 SvPositionXY = VoxelMarchSampleSvPosition(LocalPixel);
 		const FVoxelMarchRay Ray = VoxelMarchBuildRay(SvPositionXY);
 
 		if (Ray.bValid)
@@ -644,9 +1121,55 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 			// simply not be there.
 			if (MarchHasPrepassDepth != 0)
 			{
+#if VOXEL_MARCH_HALFRES
+				// CONSERVATIVE OVER THE WHOLE 2x2 BLOCK, AND THIS IS THE ONE
+				// PLACE HALF RES COULD DELETE TERRAIN RATHER THAN SOFTEN IT.
+				//
+				// One depth read now stands for four pixels. Read at the block
+				// centre it would clip all four to whatever the NEAREST occluder
+				// in the block happens to be -- so a pixel looking PAST the edge
+				// of a tree would lose its ground to that tree, and the result is
+				// missing terrain, not a soft edge. Exactly the failure mode this
+				// file's conservative-depth note calls the worst kind this
+				// renderer has: geometry the hardware removes with no error
+				// anywhere.
+				//
+				// So the FARTHEST of the four wins: every ray any of the four
+				// pixels could see survives the clip. The ones that should not
+				// have survived are rejected downstream by the hardware depth
+				// test against the very prepass depth that would have clipped
+				// them (CF_DepthNearOrEqual, both raster passes), so the cost of
+				// being conservative here is march steps, not wrong pixels.
+				//
+				// FOUR CONVERSIONS RATHER THAN A MIN OF DEVICE Z AND ONE
+				// CONVERSION. The device-Z shortcut is only valid if
+				// VoxelMarchSceneViewZ is monotonic in DeviceZ, which it is for
+				// every reverse-Z projection this project uses -- and relying on
+				// it would be a trick rather than a measurement. The pass is
+				// ray-bound at ~4 ms per Mray; four divides are not the budget.
+				//
+				// A far-plane texel (DeviceZ 0, nothing drawn there) converts to
+				// an enormous view Z and therefore wins the max, which is the
+				// right answer: it means one of the four pixels sees clear sky
+				// and its ray must be allowed to run to the box edge.
+				const int2 DepthBase = int2(MarchViewRectMin) + (LocalPixel << 1);
+				float SceneViewZ = -1e30f;
+				[unroll]
+				for (int Dy = 0; Dy < 2; ++Dy)
+				{
+					[unroll]
+					for (int Dx = 0; Dx < 2; ++Dx)
+					{
+						const float BlockDeviceZ =
+							MarchSceneDepthTexture.Load(int3(DepthBase + int2(Dx, Dy), 0)).r;
+						SceneViewZ = max(SceneViewZ, VoxelMarchSceneViewZ(BlockDeviceZ));
+					}
+				}
+#else
 				const float DeviceZ =
 					MarchSceneDepthTexture.Load(int3(int2(SvPositionXY), 0)).r;
 				const float SceneViewZ = VoxelMarchSceneViewZ(DeviceZ);
+#endif
 				// view Z -> distance along the ray. ViewZPerUU converts the other
 				// way, so divide.
 				const float SceneTUU = SceneViewZ / max(Ray.ViewZPerUU, 1e-6f);
@@ -889,7 +1412,15 @@ void VoxelMarchEmitVS(uint VertexId : SV_VertexID, uint InstanceId : SV_Instance
 	// View-LOCAL pixel coordinates. The host has already set the viewport to the
 	// view rect, so NDC maps onto the rect and the rect's origin does not enter
 	// here -- adding it would double-count on a split-screen family.
-	const float2 PixelLocal = float2((Tile + Corner) * uint(VOXEL_MARCH_TILE_SIZE));
+	//
+	// IN FULL-RES PIXELS, WHICH IS WHY THIS IS NOT VOXEL_MARCH_TILE_SIZE. The
+	// march group is 8x8 THREADS at both resolutions, but at half res each
+	// thread owns a 2x2 full-res block, so the tile this quad has to cover is
+	// 16x16 screen pixels. The host derives MarchTileCount from the same
+	// relation; if the two ever disagreed the emit would rasterise a fraction of
+	// the screen and the rest of the terrain would simply not be drawn.
+	// VOXEL_MARCH_FULL_TILE_SIZE is 8 at VOXEL_MARCH_HALFRES 0.
+	const float2 PixelLocal = float2((Tile + Corner) * uint(VOXEL_MARCH_FULL_TILE_SIZE));
 	float2 Ndc = (PixelLocal / MarchViewRectSize) * 2.0f - 1.0f;
 	Ndc.y = -Ndc.y;
 
@@ -949,11 +1480,20 @@ void VoxelMarchDepthOnlyPS(FVoxelMarchEmitInterp In, out float OutDepth : SV_Dep
 	ResolvedView = ResolveView();
 
 	const int2 LocalPixel = int2(In.Position.xy) - int2(MarchViewRectMin);
+#if VOXEL_MARCH_HALFRES
+	// THE RAY COMES FIRST HERE because the reconstruction is expressed in it:
+	// the candidate planes are intersected with THIS pixel's ray, not with the
+	// sample's. See VoxelMarchReconstruct.
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(In.Position.xy);
+	const FVoxelMarchRecon Recon = VoxelMarchReconstruct(LocalPixel, Ray);
+	const FVoxelMarchVis V = Recon.V;
+#else
 	const FVoxelMarchVis V = VoxelMarchUnpackVis(MarchVis.Load(int3(LocalPixel, 0)));
+#endif
 	if (!V.bHit)
 	{
-		// The tile quad covers 8x8; the march hit only some of them. The rest
-		// must leave depth exactly as the prepass left it.
+		// The tile quad covers the whole tile; the march hit only some of it. The
+		// rest must leave depth exactly as the prepass left it.
 		discard;
 		OutDepth = 0.0f;
 		return;
@@ -963,8 +1503,19 @@ void VoxelMarchDepthOnlyPS(FVoxelMarchEmitInterp In, out float OutDepth : SV_Dep
 	// their own SV_Position and both project through ResolvedView, so the depth
 	// this pass writes and the depth the emit computes are the same number and
 	// the emit's equal-depth test cannot fail on rounding.
+	//
+	// AT HALF RES THAT AGREEMENT IS STRICTER, NOT LOOSER: both passes run the
+	// SAME VoxelMarchReconstruct over the SAME four samples for the same pixel,
+	// so they still produce one number. A reconstruction that differed between
+	// the two would show up as the emit failing its own equal-depth test and
+	// terrain vanishing in patches -- which is why the reconstruction is one
+	// function and not two.
+#if VOXEL_MARCH_HALFRES
+	const float THitUU = Recon.THitUU;
+#else
 	const float THitUU = MarchHitT.Load(int3(LocalPixel, 0));
 	const FVoxelMarchRay Ray = VoxelMarchBuildRay(In.Position.xy);
+#endif
 	const float3 HitLocalUU = Ray.OriginLocalUU + Ray.DirWorld * THitUU;
 	const float3 VolumeOriginTWS =
 		ResolvedView.TranslatedWorldCameraOrigin - MarchRayOriginLocalUU;
@@ -1056,12 +1607,26 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	ResolvedView = ResolveView();
 
 	const int2 LocalPixel = int2(In.Position.xy) - int2(MarchViewRectMin);
+#if VOXEL_MARCH_HALFRES
+	// HALF RES: the vis packet and the t are RECONSTRUCTED for this exact pixel
+	// from the 2x2 sample neighbourhood, not loaded from it. Everything below
+	// this point is unchanged and does not know the difference -- which is the
+	// whole design: the reconstruction hands the emit the same two values the
+	// full-res march would have written, so AO, the palette, the surface gate,
+	// the climate tint, GI and velocity all keep operating on the exact voxel
+	// and the exact hit position rather than on an upsampled approximation of
+	// them. See VoxelMarchReconstruct.
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(In.Position.xy);
+	const FVoxelMarchRecon Recon = VoxelMarchReconstruct(LocalPixel, Ray);
+	const FVoxelMarchVis V = Recon.V;
+#else
 	const uint2 Packed = MarchVis.Load(int3(LocalPixel, 0));
 	const FVoxelMarchVis V = VoxelMarchUnpackVis(Packed);
+#endif
 
 	if (!V.bHit)
 	{
-		// The tile quad covers 8x8 pixels; the march hit some of them. The rest
+		// The tile quad covers the whole tile; the march hit some of it. The rest
 		// leave without touching depth, stencil, any GBuffer or velocity.
 		//
 		// A discard here is safe in a way it explicitly was NOT in
@@ -1081,8 +1646,6 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 		return;
 	}
 
-	const float THitUU = MarchHitT.Load(int3(LocalPixel, 0));
-
 	// ---- rebuild the hit, from the float t --------------------------------
 	//
 	// NOT from the encoded depth, and not from a stored position. The ray is
@@ -1092,7 +1655,17 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	// depth AND the previous-frame position -- descends from this one number, so
 	// any quantisation applied to it is applied to both and they stay consistent
 	// with each other even when they are wrong.
+	//
+	// AT HALF RES the t is the reconstructed one and the rule is unchanged and
+	// load-bearing for the same reason: depth, the AO face UV and the velocity
+	// all descend from this single number, so they agree with each other on a
+	// fallback pixel exactly as they do on an exact one.
+#if VOXEL_MARCH_HALFRES
+	const float THitUU = Recon.THitUU;
+#else
+	const float THitUU = MarchHitT.Load(int3(LocalPixel, 0));
 	const FVoxelMarchRay Ray = VoxelMarchBuildRay(In.Position.xy);
+#endif
 	const float3 HitLocalUU = Ray.OriginLocalUU + Ray.DirWorld * THitUU;
 
 	// The volume's min corner in translated world. Derived rather than passed:
@@ -1652,6 +2225,32 @@ void VoxelMarchVerifyDepthMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 		return;
 	}
 
+#if VOXEL_MARCH_HALFRES
+	// THE GATE GRADES THE RECONSTRUCTION, NOT THE MARCH, AND THAT IS THE POINT.
+	//
+	// This kernel keeps running at FULL res -- one thread per screen pixel --
+	// and goes through the SAME VoxelMarchReconstruct the emit does. So what it
+	// scores is the depth the emit would have written for that pixel, which is
+	// the only thing worth grading: a gate that read the half-res samples
+	// directly would certify the march and say nothing at all about the
+	// reconstruction that stands between the march and the picture.
+	//
+	// It is also the strongest available proof that this arm is not
+	// inert-but-armed. MarchVis is PHYSICALLY half-size here; a build where the
+	// reconstruction had been compiled out would index it at full-res
+	// coordinates and this gate would not quietly pass, it would produce
+	// nonsense loudly.
+	const float2 SvPositionXY = MarchViewRectMin + float2(LocalPixel) + 0.5f;
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(SvPositionXY);
+	const FVoxelMarchRecon Recon = VoxelMarchReconstruct(LocalPixel, Ray);
+	const FVoxelMarchVis V = Recon.V;
+	if (!V.bHit)
+	{
+		InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_MISS], 1u);
+		return;
+	}
+	const float THitUU = Recon.THitUU;
+#else
 	const FVoxelMarchVis V = VoxelMarchUnpackVis(MarchVis.Load(int3(LocalPixel, 0)));
 	if (!V.bHit)
 	{
@@ -1662,6 +2261,7 @@ void VoxelMarchVerifyDepthMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 	const float2 SvPositionXY = MarchViewRectMin + float2(LocalPixel) + 0.5f;
 	const FVoxelMarchRay Ray = VoxelMarchBuildRay(SvPositionXY);
 	const float THitUU = MarchHitT.Load(int3(LocalPixel, 0));
+#endif
 
 	// The marcher's LINEAR view depth. t is distance along the ray and
 	// ViewZPerUU is the cosine to the forward axis, so their product is view Z --
