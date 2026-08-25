@@ -15,9 +15,10 @@ THREE THINGS TO KNOW BEFORE READING THE COUNTS:
    the difference: footsteps (240), the tool x material voxel matrix (273),
    the weapon-class matrix (216), and damage-type impacts + enemies (~250).
 
-2. 548 of these are ALREADY RENDERED and committed in the Test repo, 25.1 MB
-   of loose takes: locomotion 288, voxel 134, environment 123, ui 7. They are
-   raw and unpruned -- the designer's own verdict was "functional but sound
+2. 548 takes are ALREADY RENDERED and committed in the Test repo, 25.1 MB of
+   loose .mp3: locomotion 287, voxel 133, environment 122, ui 6. That is 108
+   distinct sound ids at ~5 variation takes each, NOT 548 distinct sounds.
+   They are raw and unpruned -- the designer's own verdict was "functional but sound
    quality is rough", and the fix is a listen-and-delete curation pass, not
    regeneration. See docs/sfx-prompts.md §8b.
 
@@ -25,9 +26,15 @@ THREE THINGS TO KNOW BEFORE READING THE COUNTS:
    the one family that was deferred on budget (~9,585 ElevenLabs credits), so
    `combat/` upstream holds nothing but a .gitkeep.
 
-The "EXISTING (already on disk -- 14 files)" status below counts the Godot
-repo's dice/lockpicking sounds, none of which are in voxelsim. From this
-repo's point of view every entry is NEEDED.
+THE STATUS COLUMN BELOW IS STALE, and it understates what exists. Its
+"EXISTING -- 14 files" is the Godot repo's dice (8) and lockpicking (6) only:
+it was written 2026-05-17, the 548 takes landed 2026-05-18 (PR #226), and the
+"flip the entry to EXISTING" step in docs/sfx-prompts.md §8 task 3 was part of
+the curation pass that never ran. So the library still reads NEEDED for 108
+ids that have audio. Trust the prompts doc's §8 for what is rendered.
+
+From voxelsim's point of view every entry is NEEDED regardless -- none of this
+audio is in this repo yet.
 
 Cross-references to design/AUDIO_DESIGN.md and design/MUSIC_PROMPTS.md point
 at the Test repo. The music one is here as docs/music-prompts.md; AUDIO_DESIGN
