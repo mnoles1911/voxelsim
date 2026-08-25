@@ -159,6 +159,31 @@ jobs:
       - name: Every -Voxel* switch is classified against the front-end policy
         run: python tools/lint-frontend-switch-coverage.py
 
+  # docs/sfx-library.md is a spec written as matrices ("4 gaits x 12 surfaces x
+  # var 5"); docs/sfx-prompts.md is one row per file id. Different granularity
+  # on purpose, which made "does every entry have a prompt?" a question nobody
+  # could answer by reading -- and an unanswerable question is how a join rots.
+  # tools/sfx_families/ expands the matrices once; this job proves the two
+  # documents still agree in BOTH directions. A missing prompt means a sound
+  # nobody can render; an orphan prompt is usually a half-landed rename.
+  #
+  # It also guards the second check, which is cheaper here than by ear:
+  # ElevenLabs truncates an over-length request instead of refusing it, so a
+  # loop asking for more than 20 s renders short and reads as a bad take rather
+  # than a bad request. 43 of them shipped that way before this existed.
+  sfx-prompt-coverage:
+    name: SFX library and prompts match 1:1
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Every library id has exactly one prompt, and vice versa
+        run: python tools/lint-sfx-coverage.py
+      - name: The generated prompt block is up to date with tools/sfx_families/
+        run: python tools/gen-sfx-prompts.py --check
+
   # ADR-0001 determinism surface: the M0 gate passed on AMD and failed on
   # NVIDIA running the IDENTICAL committed SPIR-V, because worldgen.ush's
   # floorDiv derived its flooring correction from `a % b` and HLSL leaves `%`

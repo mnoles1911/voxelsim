@@ -94,6 +94,13 @@ ue-project/Content/UI/Backgrounds/*.uasset
 ue-project/Content/UI/Fonts/*.uasset
 ue-project/Content/Audio/Music/*.uasset
 
+# CC0 VFX and atmosphere source assets, fetched by tools/fetch-vfx-assets.ps1.
+# 329 MB of HDRIs, sprite packs and PBR sets against a repo whose largest
+# tracked binary is 385 KB -- same call as the sky EXR/TIFF sources above.
+# Provenance, licence and pinned byte sizes are committed in
+# ue-project/Content/VFX/VFX_ASSET_CREDITS.md; the bytes are not.
+tools/vfx-assets/
+
 # Work-item-2 survey dumps: ~140 MB of per-tile bake rasters. The REPORT and
 # the overlays are committed (docs/lake-survey/); these are the inputs.
 /out/
