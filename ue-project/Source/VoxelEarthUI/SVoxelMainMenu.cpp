@@ -569,13 +569,28 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(EVoxelMenuPanel Panel, con
 			.Font(Style.Serif(L.SubPanelTitleSize))
 			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
 		]
+		// SCROLLED, because the body outgrew the panel the moment CREDITS
+		// stopped being "Credits coming soon." The frame is a fixed
+		// SubPanelHalfWidth x SubPanelHalfHeight box (720x560), which fits
+		// roughly twenty lines at SubPanelBodySize -- the third-party notices
+		// are already longer than that and only ever grow. Without this the
+		// overflow is silent: the text simply stops, and a missing licence
+		// notice that LOOKS like the end of the list is the worst possible
+		// failure for this particular panel.
+		//
+		// HELP and SETTINGS get it too. They are placeholders today and will
+		// have the same problem on the day they are not.
 		+ SVerticalBox::Slot().FillHeight(1.f).Padding(FMargin(0.f, HalfSep))
 		[
-			SNew(STextBlock)
-			.Text(Body)
-			.Font(Style.Serif(L.SubPanelBodySize))
-			.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-			.AutoWrapText(true)
+			SNew(SScrollBox)
+			+ SScrollBox::Slot()
+			[
+				SNew(STextBlock)
+				.Text(Body)
+				.Font(Style.Serif(L.SubPanelBodySize))
+				.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+				.AutoWrapText(true)
+			]
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
 		[

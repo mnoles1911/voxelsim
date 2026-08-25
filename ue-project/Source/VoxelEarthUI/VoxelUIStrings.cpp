@@ -25,7 +25,54 @@ FText LoadPanelEmpty() { return LOCTEXT("LoadPanelEmpty", "No saves yet. Start a
 FText HelpPanelTitle() { return LOCTEXT("HelpPanelTitle", "HELP"); }
 FText HelpPanelBody() { return LOCTEXT("HelpPanelBody", "Help content coming soon."); }
 FText CreditsPanelTitle() { return LOCTEXT("CreditsPanelTitle", "CREDITS"); }
-FText CreditsPanelBody() { return LOCTEXT("CreditsPanelBody", "Credits coming soon."); }
+// THE CREDITS SCREEN IS A SHIPPING OBLIGATION, NOT A COURTESY, and that is why
+// it stopped being a placeholder. The owner cleared the project's own assets
+// for commercial release on 2026-08-25 (see the credits files under
+// Content/), but clearance is a permission and the NASA/ESA notices below are
+// a CONDITION of use -- they have to appear in any build that renders those
+// textures, and until now there was nowhere in the game for them to appear.
+//
+// TWO THINGS TO GET RIGHT IF THIS IS EDITED.
+//
+// 1. The MOON lines always apply: T_MoonColor and T_MoonDisplacement are
+//    fetched from NASA SVS and imported in every build. The STAR MAP line
+//    applies only to builds that import the NASA EXR -- the default star map
+//    is procedural and contains no NASA data (see
+//    Content/Voxel/TextureSource/SKY_ASSET_CREDITS.md, and note the date on
+//    that decision: 2026-08-09). It is included here unconditionally because
+//    over-crediting is harmless and under-crediting is a licence breach, and
+//    because a static string cannot know which texture a given build imported.
+//    If that ever needs to be exact, the sky subsystem knows which star map it
+//    loaded and this could be built at runtime instead.
+//
+// 2. The Unreal attribution wording should be checked against Epic's CURRENT
+//    requirement before release rather than trusted from here. It is included
+//    because omitting it entirely is the worse error.
+FText CreditsPanelBody()
+{
+	return LOCTEXT("CreditsPanelBody",
+		"VOXELMARK\n"
+		"Mira-Thal Trilogy - Game One\n"
+		"\n\n"
+		"THIRD-PARTY NOTICES\n"
+		"\n"
+		"Moon surface and elevation\n"
+		"NASA's Scientific Visualization Studio.\n"
+		"\n"
+		"Star map\n"
+		"NASA/Goddard Space Flight Center Scientific\n"
+		"Visualization Studio. Gaia DR2: ESA/Gaia/DPAC.\n"
+		"\n"
+		"Macondo Swash Caps\n"
+		"Open Font Licence 1.1.\n"
+		"\n"
+		"Unreal Engine\n"
+		"Unreal Engine, copyright Epic Games, Inc.\n"
+		"All rights reserved.\n"
+		"\n\n"
+		"Music, sound and menu art are original to this\n"
+		"project.\n");
+}
 FText SettingsPanelTitle() { return LOCTEXT("SettingsPanelTitle", "SETTINGS"); }
 FText SettingsPanelBody() { return LOCTEXT("SettingsPanelBody", "Settings coming soon."); }
 
