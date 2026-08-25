@@ -150,24 +150,62 @@ public:
 	// GetOrCreateGpuPool was resized from the same measurement. The annuli must
 	// still abut exactly (Outer[L] == Inner[L+1]) -- GetRingPresets() enforces
 	// it for overrides; for these defaults it holds by construction.
+	// DEEPENED 2026-08-25, OWNER-JUDGED ON A PINNED-POSE A/B. The cascade's cost
+	// is LINEAR in ring count while its range is EXPONENTIAL:
+	//
+	//     chunk iterations = R0/3.2 + (N-1) * R0/6.4     range = R0 * 2^(N-1)
+	//
+	// So holding range fixed and trading R0 for one more ring is close to free.
+	// At 7 rings / R0 64 m the range is the SAME 4096 m for 80 chunk iterations
+	// instead of 140 (-43%), and because chunks per ring go as (R0/3.2)^2 there
+	// are ~3.4x fewer resident chunks. Matched legs, one binary, baked pose:
+	//
+	//                      p50 moving      p95     stutter   cold    R0 fill
+	//   6 rings @ 128 m   20.80 ms 48fps  40.00    53.18%   20.6 s   6.4 s
+	//   7 rings @  64 m   11.00 ms 91fps  27.20    15.26%   13.5 s   2.5 s
+	//
+	// Every Goal 3 term moved together, and Goal 1 and the near-ring defect with
+	// them. Hole RATE is unchanged (926/30168 = 3.1% vs 263/8814 = 3.0%); the
+	// smaller absolute counts are the smaller resident set, not better coverage.
+	//
+	// THE COST IS VISUAL AND THE OWNER TOOK IT KNOWINGLY: every band beyond 64 m
+	// now holds voxels twice as large (64-128 m goes 10 cm -> 20 cm, and so on
+	// outward). Inside 64 m nothing changes. On a 2560x1440 display that moves
+	// terrain voxels from >=3.1 px to >=1.6 px. He compared the two captures at
+	// a pinned pose (35.7% of pixels differ) and judged them "very similar".
+	//
+	// WHAT WOULD REVERT THIS: a rise in the hole RATE (not count) over a settled
+	// stationary world, or far-field blockiness the owner rejects on a later
+	// screenshot. Both are his call, not a counter's. Restore the old cascade
+	// with -VoxelRingInnerMeters / -VoxelRingOuterMeters plus
+	// -VoxelMaxRingLevel=5 and voxel.March.RingOuterM 128 -- all seven entries
+	// must be passed, the subsystem is Fatal on a malformed cascade.
+	//
+	// THE TORUS ASSERT GETS SAFER, not tighter: R0 now spans 40 chunks against
+	// kDimXY 128 where it spanned 80. And AVoxelClipmapActor is unaffected -- it
+	// reads RingPresets[GetMaxRingLevel()].OuterMeters, which is 4096 m before
+	// and after, so the 30 km heightmap's vertex spacing does not move.
 	static constexpr FRingPreset kDefaultRingPresets[VoxelCoords::kNumLevels] = {
-		{0.0, 128.0},
+		{0.0, 64.0},
+		{64.0, 128.0},
 		{128.0, 256.0},
 		{256.0, 512.0},
 		{512.0, 1024.0},
 		{1024.0, 2048.0},
-		{2048.0, 4096.0}, // R5: the 4 km cascade edge (default GetMaxRingLevel stops here)
-		// R6 (2026-08-23, owner: "add additional LOD rings to reach 8-10km").
-		// 8192 m keeps Outer/ChunkEdge == 40 (8192 / 204.8), the construction
-		// ratio every other ring has -- which is exactly what keeps the march
-		// index's resident span at 80 chunks < kDimXY 128 and the toroidal
-		// wrap alias-free (VoxelMarchChunkIndex.cpp). Stretching this ring to
-		// 10240 m instead (ratio 50, span 100) stays under 128 but breaks the
-		// ratio and the geometric shader derivation OuterUU(L) = R0 * 2^L,
-		// which the marcher deliberately computes from ONE uniform; 8.19 km is
-		// the value that changes no derivation anywhere. DORMANT unless
-		// -VoxelMaxRingLevel=6 -- see GetMaxRingLevel.
-		{4096.0, 8192.0},
+		{2048.0, 4096.0}, // R6: the 4 km cascade edge (GetMaxRingLevel stops here)
+		// THE OLD DORMANT R6 {4096, 8192} IS GONE, and that is the whole point of
+		// the deepening: the seventh ring is no longer a dormant 8 km extension,
+		// it is the ring that lets the SAME 4 km be reached from R0 = 64 m. The
+		// construction ratio the old comment protected (Outer/ChunkEdge == 40) is
+		// preserved on every entry above -- 64/1.6, 128/3.2, ... 4096/102.4 -- so
+		// the geometric derivation OuterUU(L) = R0 * 2^L that the marcher computes
+		// from ONE uniform still holds, with R0 now 64 m on both sides.
+		//
+		// TO REACH 8 km, add an EIGHTH ring rather than stretching this one: raise
+		// VoxelCoords::kNumLevels to 8, append {4096, 8192}, give it a cap share,
+		// and set kDefaultMaxRingLevel to 7. That costs 90 chunk iterations against
+		// today's 80 -- still well under the 140 the six-ring 4 km cascade cost --
+		// and it is the reason this deepening is the right shape for 8 km too.
 	};
 	// A short initializer list here is silently zero-filled by C++, and the
 	// consequences are runtime-silent rather than loud: a {0,0} annulus admits no

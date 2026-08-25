@@ -4996,7 +4996,10 @@ int32 UVoxelWorldSubsystem::GetMaxRingLevel()
 	// cover's, see VoxelCoords::kNumLevels).
 	static const int32 MaxLevel = []
 	{
-		constexpr int32 kDefaultMaxRingLevel = 5; // the shipped 4 km cascade edge
+		// 6 AS OF 2026-08-25: seven rings. The cascade reaches the same 4 km at
+		// R0 = 64 m for 43% fewer chunk iterations -- see kDefaultRingPresets
+		// for the measured pair and the visual trade the owner accepted.
+		constexpr int32 kDefaultMaxRingLevel = 6; // the 4 km cascade edge, 7 rings
 		int32 Value = kDefaultMaxRingLevel;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelMaxRingLevel="), Value);
 		return FMath::Clamp(Value, 0, VoxelCoords::kNumLevels - 1);

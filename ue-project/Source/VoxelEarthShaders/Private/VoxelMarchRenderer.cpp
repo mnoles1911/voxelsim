@@ -235,7 +235,12 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<float> CVarVoxelMarchRingOuterM(
-		TEXT("voxel.March.RingOuterM"), 128.0f,
+		// 64 AS OF 2026-08-25 -- THIS MUST TRACK kDefaultRingPresets AND THERE IS
+		// NO ASSERT THAT IT DOES. The marcher derives every ring boundary from
+		// this ONE uniform as OuterUU(L) = R0 * 2^L; residency derives its own
+		// from the presets. If they disagree the marcher asks for levels at
+		// radii the pool never populates, and that is a HOLE, not an error.
+		TEXT("voxel.March.RingOuterM"), 64.0f,
 		TEXT("Outer radius of ring 0 in METRES; ring 1 runs from there to twice it. 128 gives ")
 		TEXT("the 0-128 / 128-256 split of kDefaultRingPresets, which is what residency actually ")
 		TEXT("builds, and moving it away from the preset makes the marcher ask for levels at radii ")
