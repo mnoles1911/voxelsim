@@ -1,6 +1,7 @@
 #include "VoxelSkySubsystem.h"
 
 #include "VoxelEarth.h"
+#include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelEarthGameMode.h" // VoxelEarthSpawn::ParseSpawnColumnUU -- see SpawnRig
 #include "VoxelEphemeris.h"
 #include "VoxelSkyDomeActor.h"
@@ -2511,6 +2512,22 @@ void UVoxelSkySubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		return;
 	}
 
+	// THE MENU HOLDS THE WORLD; the rig waits for it. SpawnRig resolves the
+	// spawn column's ground height from worldgen, and during the menu nothing
+	// has been prefetched for any position, so that query is fatal on a world
+	// whose spawn tile is not baked. Deferred to the first unheld Tick rather
+	// than skipped -- skipping OnWorldBeginPlay's only call means no sky for
+	// the whole session. See bRigSpawnDeferredForMenu in the header, and
+	// backlog 0.0k.
+	if (VoxelFrontEnd::IsWorldHeldForMenu(&InWorld))
+	{
+		bRigSpawnDeferredForMenu = true;
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("Sky rig spawn DEFERRED: the front end holds the world. It will spawn on the "
+		            "first tick after the world session starts, with a real ground height."));
+		return;
+	}
+
 	SpawnRig(InWorld);
 
 	// Put the rig somewhere sane before the first Tick. With the clock off this
@@ -3146,6 +3163,25 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	if (!Impl)
 	{
 		return;
+	}
+
+	// The deferred rig from OnWorldBeginPlay. Runs on the first tick after the
+	// world session starts, which is the earliest moment GetSurfaceHeightUU has
+	// a residency tick behind it. IsTickable() is `VoxelSky::IsEnabled() ||
+	// bHasState` and does not depend on the rig existing, so this tick is
+	// genuinely reached with no rig spawned -- that is what makes deferring
+	// safe rather than a silent no-sky.
+	if (bRigSpawnDeferredForMenu)
+	{
+		UWorld* HeldWorld = GetWorld();
+		if (HeldWorld && !VoxelFrontEnd::IsWorldHeldForMenu(HeldWorld))
+		{
+			bRigSpawnDeferredForMenu = false;
+			SpawnRig(*HeldWorld);
+			ApplyStaticRigPose();
+			UE_LOG(LogVoxelSky, Log,
+			       TEXT("Sky rig spawned (deferred past the front end); the world session has started."));
+		}
 	}
 
 	if (!VoxelSky::IsEnabled())

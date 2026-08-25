@@ -1,6 +1,8 @@
 #include "VoxelFrontEndPolicy.h"
 
 #include "VoxelEarth.h" // LogVoxelEarth
+#include "VoxelWorldSubsystem.h" // IsWorldHeldForMenu reads HasWorldSessionStarted()
+#include "Engine/World.h"
 #include "Misc/App.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
@@ -343,5 +345,36 @@ const TCHAR* WhyThisAnswer()
 bool IsSelfDrivingSwitchName(const FString& SwitchName)
 {
 	return VoxelFrontEndPolicyDetail::NameIsSelfDriving(SwitchName);
+}
+
+bool IsWorldHeldForMenu(const UWorld* World)
+{
+	// Cheapest test first, and it is the one that protects the archive: with
+	// no front end this run, nothing is held and no caller changes behaviour.
+	if (!IsEnabledThisRun() || World == nullptr)
+	{
+		return false;
+	}
+
+	// Only game worlds have a session to hold. The editor's preview and the
+	// transient loading world never call StartWorldSession, so treating them
+	// as "held" would freeze water in worlds that have no menu in front of
+	// them at all.
+	if (!World->IsGameWorld())
+	{
+		return false;
+	}
+
+	// The SAME ChunkOwner the streamer gates on. When the session has started,
+	// the menu has handed over and every subsystem is free again -- including
+	// during the loading screen, which must stream precisely so the gate it
+	// waits on can converge.
+	const UVoxelWorldSubsystem* Terrain = World->GetSubsystem<UVoxelWorldSubsystem>();
+	if (Terrain == nullptr)
+	{
+		// No terrain subsystem means no worldgen to fault on. Nothing to hold.
+		return false;
+	}
+	return !Terrain->HasWorldSessionStarted();
 }
 } // namespace VoxelFrontEnd

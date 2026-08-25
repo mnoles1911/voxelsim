@@ -1,6 +1,7 @@
 #include "VoxelOceanActor.h"
 
 #include "Camera/PlayerCameraManager.h"
+#include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "Components/PostProcessComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Scene.h" // FWeightedBlendable -- the post-process blendable list entry
@@ -284,6 +285,17 @@ void AVoxelOceanActor::UpdateUnderwaterState(float DeltaTime)
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
 	if (!PC)
+	{
+		return;
+	}
+
+	// Held while the menu owns the screen -- the second offender of the pair in
+	// backlog 0.0k, and the one that only appeared after the first was silenced.
+	// The camera fallback below is the pawn's location, and during the menu
+	// there is no pawn (bStartPlayersAsSpectators), so this ran its underwater
+	// test at the world origin and faulted worldgen on an unbaked tile. There
+	// is nothing to be underwater in front of while a menu is up.
+	if (VoxelFrontEnd::IsWorldHeldForMenu(World))
 	{
 		return;
 	}

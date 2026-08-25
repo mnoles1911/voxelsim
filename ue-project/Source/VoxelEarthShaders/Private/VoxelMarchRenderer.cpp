@@ -331,7 +331,20 @@ namespace
 		TEXT("differs ONLY in whether the real depth's HTILE survived.\n")
 		TEXT("IT CORRUPTS THE IMAGE BY CONSTRUCTION -- real depth, raster colour, terrain lit at ")
 		TEXT("the wrong depth. TIMING ARM ONLY. Never screenshot it, never run the depth gate with ")
-		TEXT("it on (it is refused there), and read the frame time, not EmitGpuMs."),
+		TEXT("it on (it is refused there), and read the frame time, not EmitGpuMs.\n")
+		TEXT("AS OF 2026-08-24 THIS HAS NEVER BEEN SET TO 1 ON A SINGLE LEG. Grep Saved/ for ")
+		TEXT("htileProbe=1 -- there are no hits. So the 0.2-0.4 ms in ")
+		TEXT("docs/ray-marching-plan-2026-08-19.md:932 is a budget line that has never been a ")
+		TEXT("reading, and nothing should be built to reclaim it until it has been.\n")
+		TEXT("AND WHEN IT HAS: the bill has two halves and only one of them is addressable. ")
+		TEXT("Per-pixel SV_Depth breaks plane-equation depth compression outright, and no ")
+		TEXT("conservative-depth declaration restores it. What a conservative declaration can ")
+		TEXT("preserve is one side of the HiZ z-range -- and the side that keeps a DOWNSTREAM ")
+		TEXT("reader able to reject is the LOWER bound under reverse-Z (SV_DepthGreaterEqual), ")
+		TEXT("which is the OPPOSITE of the upper bound (SV_DepthLessEqual) that would buy early-Z ")
+		TEXT("on the emit itself. One flag cannot be both. The early-Z half is separately settled ")
+		TEXT("and it is settled NO -- see CONSERVATIVE DEPTH: THE PRIZE IS STRUCTURALLY ZERO in ")
+		TEXT("VoxelMarch.usf, which shows the t_max clamp has already done that culling."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchSettleFrames(
@@ -4883,6 +4896,20 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		// path keeps the real targets and the marcher touches nothing the image
 		// depends on; writing real depth there would corrupt the control arm and
 		// silently invalidate every gate that runs in it.
+		//
+		// WHERE ITS TIME LANDS, because someone will ask and the perf line does
+		// not say. This pass is INSIDE the March bracket (opened above, closed
+		// after the gate passes), so it is folded into marchMs and there is no
+		// depthPreEmitMs anywhere. The only per-pass reading available today is
+		// ProfileGPU, which sees it by the RDG_EVENT_NAME below. Adding a fourth
+		// timing ring would mean a field in FVoxelMarchState (VoxelMarchRenderer.h)
+		// -- worth doing if this pass ever becomes interesting, and it is not
+		// yet: it rasterises the SAME tile list as the emit with a strictly
+		// cheaper pixel shader (a Load, a ray rebuild, one matrix multiply, and
+		// no MRT), so it is bounded above by emitMs, which measures 0.12-0.29 ms
+		// on mode=scene legs. That bound is what settled the conservative-depth
+		// question in VoxelMarch.usf: there is under half a millisecond in both
+		// raster passes combined, and the early-Z share of it is zero.
 		if (Arm.Mode == 1)
 		{
 			auto* Params = GraphBuilder.AllocParameters<FVoxelMarchDepthOnlyParameters>();

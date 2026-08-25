@@ -232,6 +232,26 @@ private:
 	// IsTickable() true for exactly the one frame needed to undo the feature.
 	bool bHasState = false;
 
+	// True when OnWorldBeginPlay found the world HELD BY THE MENU and deferred
+	// the rig spawn to the first unheld Tick.
+	//
+	// SpawnRig resolves the spawn column's ground height through
+	// GetSurfaceHeightUU, which is a worldgen query -- and during the menu no
+	// tile has been prefetched for anywhere, so on a world whose spawn tile is
+	// not baked that query is fatal in an unattended run. It was the third and
+	// last offender found in backlog 0.0k, and the only one that is not a tick:
+	// OnWorldBeginPlay fires exactly once, so it could not simply be skipped
+	// the way the water and ocean ticks are -- skipping it means no sky at all.
+	//
+	// Deferring rather than degrading to Z=0 is deliberate. The Z=0 path a few
+	// lines above in SpawnRig is documented as "the least-wrong constant" for a
+	// world with no terrain subsystem at all, which is a permanent condition.
+	// The menu is a temporary one, and taking the permanent fallback for it
+	// would leave the rig referenced to sea level for the whole session that
+	// follows -- exactly the two-different-altitudes defect that block of
+	// comments exists to prevent.
+	bool bRigSpawnDeferredForMenu = false;
+
 	// The rig. Spawned in OnWorldBeginPlay (MOVED here wholesale from
 	// AVoxelEarthGameMode::BeginPlay, which no longer spawns any of it) so that
 	// the thing that drives the lights is the same thing that created them --

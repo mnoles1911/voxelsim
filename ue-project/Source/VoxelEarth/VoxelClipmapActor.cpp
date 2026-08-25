@@ -11,6 +11,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelWorldSubsystem.h"
 // Biome appearance: the SAME climate->vertex-colour encoding
 // UVoxelChunkComponent uses, so the vista and the near field cannot diverge.
@@ -561,6 +562,17 @@ bool AVoxelClipmapActor::IsCameraUnderRock(const FVector& CameraLocUU) const
 	if (!Subsystem)
 	{
 		return false; // fail OPEN: never veil the vista on a missing subsystem
+	}
+
+	// Same fail-open, for the same reason, while the menu holds the world: the
+	// question cannot be answered yet. The probe below walks IsSolidAtVoxel up
+	// a column, which is a worldgen query, and during the menu nothing has been
+	// prefetched anywhere -- so on a world whose column is not baked it is
+	// fatal in an unattended run. There is also nothing to veil: the menu is
+	// full-screen. Fourth and last offender in backlog 0.0k.
+	if (VoxelFrontEnd::IsWorldHeldForMenu(World))
+	{
+		return false;
 	}
 
 	const int64 Vx = (int64)FMath::FloorToDouble(CameraLocUU.X / VoxelCoords::VoxelSizeUU);

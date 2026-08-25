@@ -34,6 +34,8 @@
 
 #include "CoreMinimal.h"
 
+class UWorld;
+
 namespace VoxelFrontEnd
 {
 // True when the main menu should own the session's first screen. Resolved
@@ -49,6 +51,40 @@ VOXELEARTH_API bool IsEnabledThisRun();
 // evidence for which arm it ran -- a screenshot that came out wrong is then
 // diagnosable from the log rather than by re-running it.
 VOXELEARTH_API const TCHAR* WhyThisAnswer();
+
+// True while the menu owns the screen and the world must not be touched.
+//
+// WHY THIS EXISTS, and it is not a nicety either. The comment at the top of
+// this file states the invariant as already achieved -- "nothing streams while
+// the player is reading a menu" -- and for the CHUNK STREAMER that was true:
+// ChunkOwner stays null and UVoxelWorldSubsystem::Tick no-ops. Nothing held
+// the other world-touching tickers, and on 2026-08-25 that made the main menu
+// unphotographable on this box. Two of them queried worldgen every tick:
+//
+//   UVoxelWaterSubsystem::Tick -> RefreshImplicitWater -> EnsureWorldgenColumn
+//   AVoxelOceanActor::UpdateUnderwaterState -> IsUnderwaterAtWorld
+//
+// and because the front end also sets bStartPlayersAsSpectators, no pawn
+// exists yet, so the player viewpoint is the WORLD ORIGIN regardless of
+// -VoxelSpawnAt. They therefore queried worldgen at (0,0) -- a place the run
+// never intended to visit -- the fine tier had no tile baked there, and
+// FVoxelFineTileStreamer is fatal by design on a gate leak in an unattended
+// run. Three capture attempts, three fatals, no image. See backlog 0.0k.
+//
+// The deadlock is worth stating because it is not obvious: the held subsystem
+// is the one that PREFETCHES. Hold it and leave the others running, and the
+// others fault on tiles nothing will ever fetch for them. The log says so in
+// as many words -- "The residency tick has NEVER RUN (no ring centre)".
+//
+// Derived, not stored. It reads UVoxelWorldSubsystem::HasWorldSessionStarted()
+// -- the same ChunkOwner the streamer gates on -- rather than a flag the UI
+// module sets on state transitions. A second copy of "is the menu up" is a
+// second thing that can be wrong, and this codebase has been bitten enough by
+// joins computed instead of checked.
+//
+// Returns false when the front end is not enabled this run, so the invariant
+// at the top of this file holds: with no menu, no caller behaves differently.
+VOXELEARTH_API bool IsWorldHeldForMenu(const UWorld* World);
 
 // Exposed for tools/lint-frontend-switch-coverage.py's counterpart test and
 // for -VoxelFrontEndExplain: classify one switch NAME (no leading dash, no

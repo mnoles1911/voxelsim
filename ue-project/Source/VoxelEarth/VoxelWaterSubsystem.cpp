@@ -2,6 +2,7 @@
 
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelEditRelay.h"
 #include "VoxelWaterChunkComponent.h"
 #include "VoxelFineTileStreamer.h"  // CoarseTileForWorldMm -- one addressing rule
@@ -6065,6 +6066,25 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 void UVoxelWaterSubsystem::Tick(float DeltaTime)
 {
 	if (!Impl)
+	{
+		return;
+	}
+
+	// THE MENU HOLDS THE WORLD, AND THAT HAS TO INCLUDE THIS SUBSYSTEM.
+	//
+	// VoxelFrontEndPolicy.h states the invariant as "nothing streams while the
+	// player is reading a menu", and the chunk streamer honours it by leaving
+	// ChunkOwner null. This Tick did not, and on 2026-08-25 that made the main
+	// menu unphotographable: RefreshImplicitWater below sweeps around the
+	// PLAYER VIEWPOINT, no pawn exists during the menu (the front end sets
+	// bStartPlayersAsSpectators), so the sweep ran at the world origin, hit a
+	// fine tile nobody had baked, and the gate killed the run. Backlog 0.0k.
+	//
+	// Returning here is not a behaviour change for any run without a menu:
+	// IsWorldHeldForMenu is false whenever the front end is off, and false
+	// again the moment the world session starts -- including for the whole
+	// loading screen, which must stream so its gate can converge.
+	if (VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
 	{
 		return;
 	}
