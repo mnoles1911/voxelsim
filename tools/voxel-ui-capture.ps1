@@ -49,6 +49,13 @@ param(
     # -Shot Hourglass only: comma-separated progress values.
     [string]$Progress = '0.0,0.25,0.5,0.75,1.0',
 
+    # Hard ceiling on the whole run, seconds. NOT a tuning knob -- it is the
+    # backstop that stops a finished-but-unexited editor holding the box all
+    # night. Generous on purpose: a stock cold start is ~45 s and the load gate
+    # can legitimately wait 60 s or more, so this only ever fires on a genuine
+    # runaway. See the note at the launch site.
+    [int]$TimeoutSec = 600,
+
     # -Shot GateSweep only: which ring the readiness gate requires.
     [int]$GateRing = 3,
     [double]$MaxHold = 180,
@@ -160,7 +167,31 @@ Write-Host "  switches : $($argList -join ' ')"
 Write-Host '==============================================================='
 Write-Host ''
 
-$process = Start-Process -FilePath $EditorExe -ArgumentList $argList -PassThru -Wait -NoNewWindow
+# BOUNDED, NOT `-Wait`. On 2026-08-25 a `-Shot Loading -At '2,50'` run held the
+# box for 241 MINUTES and cost another session two queued jobs. It was not hung:
+# both shots fired, the log was still growing at 45 MB, and it had rendered
+# 1.58 million settled frames. It had finished its work and was never told to
+# stop, and `-Wait` waits forever for that quite happily.
+#
+# THE ROOT DEFECT: -VoxelLoadingShotAt does not quit after its last shot when
+# that shot lands AFTER hand-off. The front end tears down at hand-off and takes
+# whatever ends the run with it -- so the image is produced and the process
+# lives on. `-At '1,5'` (both shots inside the loading screen) exits 0 cleanly;
+# `-At '2,50'` (past the ~15 s gate) does not.
+#
+# AND WHY THE ENGINE-SIDE WATCHDOG CANNOT BE THE ONLY ANSWER: -VoxelMenuWatchdog
+# is a FRONT-END mechanism, and the failure is precisely that the front end is
+# already gone. A watchdog owned by the thing that has torn down is silent in
+# exactly the case it exists for. Hence a bound out here, where nothing can
+# tear down underneath it.
+$process = Start-Process -FilePath $EditorExe -ArgumentList $argList -PassThru -NoNewWindow
+if (-not $process.WaitForExit($TimeoutSec * 1000)) {
+    Write-Warning ("TIMEOUT: the editor is still alive after {0}s and is being killed. " -f $TimeoutSec)
+    Write-Warning ("  It has most likely FINISHED its work and not exited -- check the shot list and the log " +
+                   "before assuming it was stuck. A shot time after hand-off does this (see the note above).")
+    try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { Write-Warning "  kill failed: $_" }
+    $null = $process.WaitForExit(15000)
+}
 Write-Host "editor exited with code $($process.ExitCode)"
 
 # --- What the front end actually decided --------------------------------------
