@@ -45,6 +45,11 @@ public class VoxelEarthUI : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",       // UWorld, UGameViewportClient, UTickableWorldSubsystem
+			// USoundWaveProcedural and UAudioComponent for the menu music.
+			// AudioMixerCore is here for one symbol -- INDEFINITELY_LOOPING_DURATION
+			// in AudioDefines.h, which is what tells the audio engine the
+			// procedural wave outlives its own file length. See VoxelUIMusic.h.
+			"AudioMixerCore",
 			"Slate",        // SCompoundWidget, SButton, SOverlay, ...
 			"SlateCore",    // FSlateBrush, FSlateDrawElement, FSlateFontInfo
 			"InputCore",    // FKey, for the menu's keyboard handling

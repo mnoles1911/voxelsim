@@ -94,6 +94,19 @@ ue-project/Content/UI/Backgrounds/*.uasset
 ue-project/Content/UI/Fonts/*.uasset
 ue-project/Content/Audio/Music/*.uasset
 
+# THE MUSIC ITSELF. The designer sources and places these locally; they are not
+# committed and never will be. The set on this machine is 30 tracks and 1.1 GB,
+# the largest single file is 92 MB, and GitHub refuses anything over 100 MB
+# while warning above 50 -- so this is not a preference, it is the only option.
+# FVoxelUIMusic scans the folder at runtime and plays one at random, so adding
+# a track is dropping a .wav in and relaunching. An empty folder is a supported
+# state: the menu runs silent and logs why.
+ue-project/Content/Audio/Music/*.wav
+ue-project/Content/Audio/Music/*.ogg
+ue-project/Content/Audio/Music/*.mp3
+ue-project/Content/Audio/Music/*.flac
+ue-project/Content/Audio/Music/*.mp4
+
 # CC0 VFX and atmosphere source assets, fetched by tools/fetch-vfx-assets.ps1.
 # 329 MB of HDRIs, sprite packs and PBR sets against a repo whose largest
 # tracked binary is 385 KB -- same call as the sky EXR/TIFF sources above.

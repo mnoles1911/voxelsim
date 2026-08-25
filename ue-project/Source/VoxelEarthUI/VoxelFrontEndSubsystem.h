@@ -133,6 +133,11 @@ private:
 	// one. This records whether that has happened.
 	bool bMenuInputApplied = false;
 
+	// The music fade is a one-shot, and TickHandOff runs every frame until
+	// the curtain finishes. Without this the fade would be restarted on each
+	// tick and never actually descend.
+	bool bMusicFadeStarted = false;
+
 	// Seconds spent in the current state, for the capture switches' timed
 	// actions and for the unattended watchdog.
 	float StateSeconds = 0.f;

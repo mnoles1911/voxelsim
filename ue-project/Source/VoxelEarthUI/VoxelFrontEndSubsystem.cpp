@@ -4,6 +4,7 @@
 #include "SVoxelLoadingScreen.h"
 #include "SVoxelMainMenu.h"
 #include "VoxelUIAssetLibrary.h"
+#include "VoxelUIMusic.h"
 #include "VoxelWorldReadyProbe.h"
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
@@ -240,6 +241,19 @@ void UVoxelFrontEndSubsystem::EnterMenu()
 	else if (!Panel.IsEmpty())
 	{
 		UE_LOG(LogVoxelUI, Warning, TEXT("-VoxelMenuPanel=%s not recognised; showing the main column."), *Panel);
+	}
+
+	// MUSIC STARTS WITH THE MENU AND IS NOT RESTARTED AFTERWARDS. The contract
+	// ADR-0009 recorded before there was any audio to apply it to is "adopt at
+	// BeginLoad, fade at hand-off" -- so the track that starts here is the same
+	// one still playing through the loading screen. StartRandom is a no-op once
+	// something is playing, which is what makes that true without a state flag.
+	//
+	// The stream is the one the backgrounds were shuffled from, so a seeded run
+	// pairs the same art with the same track.
+	{
+		FRandomStream MusicStream = MakeVoxelUIRandomStream();
+		FVoxelUIMusic::Get().StartRandom(GetWorld(), MusicStream);
 	}
 
 	State = EVoxelFrontEndState::Menu;
@@ -486,6 +500,17 @@ void UVoxelFrontEndSubsystem::BeginLoad(const FString& EditLogPath, const FTrans
 	LoadElapsedSeconds = 0.f;
 	LastProgress = 0.f;
 	NextLoadingShotIndex = 0;
+
+	// Normally a no-op: the menu started a track and this is the same session,
+	// so the loading screen inherits it rather than restarting -- which is the
+	// whole point of "adopt at BeginLoad". It matters for the path where a
+	// loading screen goes up WITHOUT a menu in front of it, which no switch
+	// takes today and which would otherwise be silently music-less.
+	{
+		FRandomStream MusicStream = MakeVoxelUIRandomStream();
+		FVoxelUIMusic::Get().StartRandom(GetWorld(), MusicStream);
+	}
+
 	State = EVoxelFrontEndState::ArmLoading;
 	StateSeconds = 0.f;
 }
@@ -614,6 +639,16 @@ void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 	HandOffSeconds += DeltaSeconds;
 
+	// The fade is started ONCE, on the first hand-off tick, and runs alongside
+	// the curtain rather than after it. MusicFadeOut (1.5s) is independent of
+	// FadeDuration on purpose: the picture and the sound do not have to leave
+	// at the same rate, and the Godot build's music outlived its curtain.
+	if (!bMusicFadeStarted)
+	{
+		bMusicFadeStarted = true;
+		FVoxelUIMusic::Get().FadeOut(L.MusicFadeOut);
+	}
+
 	const float Alpha = L.FadeDuration > 0.f ? FMath::Clamp(HandOffSeconds / L.FadeDuration, 0.f, 1.f) : 1.f;
 	if (LoadingWidget.IsValid())
 	{
@@ -634,12 +669,26 @@ void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
 	// be holding for the rest of a session on a project whose stated
 	// constraint is the frame-time tail.
 	FVoxelUIAssetLibrary::Get().ReleaseTextures();
+	// And the track, which is 30-92 MB of decoded PCM. Stopped only now, after
+	// the curtain is fully down: stopping it when the fade STARTED would cut
+	// the fade off at its first frame, which sounds like a bug rather than a
+	// choice. If MusicFadeOut is ever set longer than FadeDuration the tail is
+	// clipped here, and that is the trade -- the front end does not outlive
+	// itself to finish a fade.
+	FVoxelUIMusic::Get().Stop();
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: handed off to the player."));
 	State = EVoxelFrontEndState::Playing;
 }
 
 void UVoxelFrontEndSubsystem::TeardownMenu()
 {
+	// Every path out of the front end passes through here, including the
+	// ones that never reach hand-off -- a quit from the menu, or a run that
+	// ends while the loading screen is still up. Stop() is idempotent and
+	// silent when nothing is playing, so this is the backstop rather than a
+	// second owner of the decision.
+	FVoxelUIMusic::Get().Stop();
+
 	UWorld* World = GetWorld();
 	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
 	if (MenuWidget.IsValid())
