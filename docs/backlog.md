@@ -41,7 +41,7 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
-### 0.0k FIXED 2026-08-25 -- the menu is photographed; the world is now held for it
+### 0.0k FIXED 2026-08-25 -- menu AND loading screen photographed; the world is held until the view settles
 
 Found 2026-08-25, first time `tools/voxel-ui-capture.ps1 -Shot Menu` has ever
 been run. It has never produced an image: `ue-project/Saved/` contains no
@@ -122,7 +122,25 @@ edits to `VoxelWorldSubsystem.cpp/.h` and `VoxelMarchRenderer.cpp`. Building
 would compile their half-finished work and corrupt the DLL pair they are
 measuring against.
 
-Stages 2-6 of `docs/front-end-local-verification-handoff.md` are UNBLOCKED.
+**A SECOND FRAME-EXACT CAUSE, found when the loading screen still died after
+the menu was fixed.** The hold released on `HasWorldSessionStarted()`, which
+goes true the instant `StartWorldSession` runs -- but `BeginPlayerSession`
+spawns and possesses the pawn on that SAME tick, and
+`APlayerCameraManager` has not ticked yet, so `GetPlayerViewPoint()` still
+reports the pre-possession world ORIGIN for the rest of that frame. Measured:
+pawn spawned 04:13:04.200 frame 31, gate leak 04:13:04.201 frame 31.
+
+I had this diagnosed as "the pawn is not placed yet" and was about to place it
+earlier. The log said otherwise. The pawn is placed; the VIEW lags it by one
+frame. The fix is `HasWorldSessionSettled()` -- session started AND
+`GFrameCounter` moved on -- and deliberately not "does the controller have a
+pawn", because it does, synchronously, which is why that test would have passed
+while the view was still wrong.
+
+`-Shot Loading` now exits 0 and produces images. Stages 2-6 of
+`docs/front-end-local-verification-handoff.md` are UNBLOCKED, and the full menu
+-> loading -> hand-off cycle is verified: gate closed after 15.01s (world
+ready), music faded over 1.50s, handed off.
 `tools/voxel-ui-capture.ps1 -Shot Menu` exits 0 and writes VoxelMenu00000.png
 with no workaround switches -- and specifically without
 `-VoxelFineTileGateFatal=0`, which the fatal itself offers and which would have
@@ -131,7 +149,7 @@ is not reproducible.
 
 ---
 
-### 0.0m The front end's ini override path has NEVER been shown to work
+### 0.0m FIXED -- the ini override path never resolved; now it does, proven in pixels
 
 Open, 2026-08-25. `FVoxelMenuLayout` reads every layout number from
 `ue-project/Config/DefaultVoxelUI.ini` at startup, and that file's own header
@@ -160,11 +178,26 @@ present with correct content while the capture ran, so the null is not
 explained by absence -- but a test run against a file I had just destroyed is
 not evidence I would accept from anyone else.
 
-RE-RUN IT PROPERLY before acting on this: APPEND one key to the restored file,
-do not overwrite it, capture `-Shot Menu`, and grep the log for the override
-count. If it logs, the path works and this entry closes. If it does not, there
-is a documented mechanism in the tree that silently does nothing, and it is the
-only way to adjust this screen without a compiler.
+**RESULT: ABSENT. The branch never resolved.** The unconditional diagnostic
+printed `ini branch 'VoxelUI' ABSENT; 0 value(s) overridden` on its first
+capture. Reading the bare name `"VoxelUI"` relied on GConfig resolving it to
+`Config/DefaultVoxelUI.ini` by convention, and it does not -- so every getter
+had returned false for every key since the file was added.
+
+**FIXED** in the same pass: a full path through `FPaths::ProjectConfigDir()`
+plus an explicit `GConfig->LoadFile`. The path alone is necessary and not
+sufficient -- the getters call `FindOrLoadNoSafeReload`, and a config nobody
+asked to load has no branch to find.
+
+**Proven in pixels, not just in the log**, because the first confirmation was
+the exact shape of null that had already fooled me twice: `TitleBoxWidth=900`
+gave "1 value(s) overridden" and a byte-identical capture, which is CORRECT
+(the title already fits in 720, so widening cannot move it) and is
+indistinguishable from a no-op. Re-run with `TitleBoxWidth=400`, which must
+clip: the title came back at centre-267, and 400 x 1.335 / 2 = 267 exactly.
+
+The ABSENT case is now a **Warning**, not a Log. A silently-absent config branch
+is what survived from the day the file was added until it was measured.
 
 Related: 0.0l, whose diagnosis this probe was meant to serve and did not.
 
