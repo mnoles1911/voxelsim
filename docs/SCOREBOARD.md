@@ -129,6 +129,21 @@ verified on a leg passing no ring arguments. See VoxelWorldSubsystem.h's
 kDefaultRingPresets for the measured pair and the visual trade the owner
 accepted. Goal 1 and the near-ring defect moved with it.
 
+**ONE ARGUMENT IN THAT COMMIT IS WEAKER THAN ITS SENTENCE.** Commit 7e69459
+supports the visual case partly with "hole RATE is unchanged (926/30168 = 3.1%
+vs 263/8814 = 3.0%)". Flagged by its own author on 2026-08-25 and recorded here
+rather than left standing: when fallthrough-off was later proposed, `uncovered`
+moved **0.02 percentage points** and the owner rejected it on sight -- small
+black arc holes at LOD boundaries. So that family of counters can barely move
+at all for a defect he refuses instantly, and "hole rate unchanged, therefore
+safe" is close to no information.
+
+THE CASCADE CHANGE ITSELF STANDS. It was decided on a pinned-pose A/B that the
+owner judged "very similar", and that is the evidence that carried it -- not the
+counter. The distinction matters because the counter is the part a later reader
+would be tempted to reuse. See [[test-must-be-able-to-fail]] shape: a
+confirmation that cannot come out the other way is not a confirmation.
+
 ---
 
 ## THE THREE GOALS
