@@ -36,6 +36,22 @@ ids that have audio. Trust the prompts doc's §8 for what is rendered.
 From voxelsim's point of view every entry is NEEDED regardless -- none of this
 audio is in this repo yet.
 
+EVERY ENTRY BELOW NOW HAS A PROMPT. As of 2026-08-24 docs/sfx-prompts.md
+carries one row per id in this document -- 724 ids -- and
+tools/lint-sfx-coverage.py fails if that stops being true in either direction.
+
+The join is not a claim, it is checked. The matrices below ("4 gaits x 12
+surfaces x var 5") are expanded to explicit ids in tools/sfx_families/, one
+file per category, each citing the section here it transcribes. THIS DOCUMENT
+REMAINS AUTHORITATIVE: if a family file and this text disagree, the family file
+has the bug. The expansion totals 1,968 files against the "~1,930" in section
+22 -- the difference is variation counts this text leaves implicit, not extra
+sounds.
+
+Adding a sound here means adding it to the matching tools/sfx_families/ file
+and running `python tools/gen-sfx-prompts.py`; the lint will tell you if you
+forget.
+
 Cross-references to design/AUDIO_DESIGN.md and design/MUSIC_PROMPTS.md point
 at the Test repo. The music one is here as docs/music-prompts.md; AUDIO_DESIGN
 (bus layout, routing, the Godot-side file conventions) was not ported, because

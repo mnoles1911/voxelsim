@@ -1,0 +1,40 @@
+# Category 05 -- Crafting & Stations              docs/sfx-library.md section 7
+#
+# Station foley. All ids carry the craft_ prefix per the library folder plan.
+# The confirms are deliberately understated -- AUDIO_DESIGN forbids fanfare,
+# and a craft completion is a diegetic settle, not a jingle.
+
+add(
+    loop_("craft_forge_bellows_loop", "a smithing bellows being worked, a slow rhythmic push of air into a fire", 12, 0.35, "SFX", "05"),
+    loop_("craft_forge_fire_roar_loop", "a forge fire under forced air, a steady deep roar of burning charcoal", 14, 0.35, "SFX", "05"),
+    one("craft_forge_hammer_anvil_peak", "A smith striking hot iron on an anvil at full force, a bright ringing hammer blow with a clean sustain, %s" % DRY, 1.0, 0.48, 5, "SFX", "05"),
+    one("craft_forge_hammer_anvil_weak", "A smith striking hot iron off-centre, a dull mistimed hammer blow with no ring, %s" % DRY, 0.8, 0.48, 4, "SFX", "05"),
+    one("craft_forge_quench_hiss", "Hot steel plunged into a quench trough, a violent burst of steam settling into a fading hiss, %s" % DRY, 2.0, 0.42, 3, "SFX", "05"),
+    one("craft_forge_ingot_deform_thunk", "A heated ingot deforming under the hammer, a dense dull thunk of metal moving, %s" % DRY, 0.7, 0.45, 4, "SFX", "05"),
+    one("craft_forge_reheat_whoosh", "A workpiece pushed back into the forge fire, a soft whoosh of flame swallowing it, %s" % DRY, 1.2, 0.38, 2, "SFX", "05"),
+    one("craft_forge_scale_sizzle", "Hot scale flaking off steel and sizzling, small crackling pops, %s" % DRY, 1.0, 0.40, 2, "SFX", "05"),
+    one("craft_forge_tier_up_resolve", "A finished blade settling as it reaches a higher quality, a clean single ring of good steel, understated, no fanfare, %s" % DRY, 1.2, 0.42, 1, "SFX", "05"),
+    loop_("craft_grindstone_wheel_loop", "a foot-treadle grindstone turning, a steady stone rumble with the treadle knocking", 12, 0.38, "SFX", "05"),
+    one("craft_grindstone_spark_burst", "A blade pressed to a spinning grindstone, a harsh grinding shriek with sparks throwing, %s" % DRY, 1.2, 0.45, 4, "SFX", "05"),
+    one("craft_grindstone_sharpen_complete", "A blade lifted from the grindstone finished, the wheel running free and a single test ring off the edge, %s" % DRY, 1.4, 0.42, 1, "SFX", "05"),
+    loop_("craft_still_bubble_steep_loop", "a glass vessel of liquid steeping over low heat, slow irregular bubbling", 14, 0.35, "SFX", "05"),
+    loop_("craft_still_distill_drip_loop", "a distillation condenser dripping into a glass receiver, slow regular drips with a faint glass ring", 14, 0.35, "SFX", "05"),
+    one("craft_still_vial_cork_seal", "A cork pressed into a glass vial, a tight squeaking push ending in a soft seated pop, %s" % DRY, 0.7, 0.45, 3, "SFX", "05"),
+    one("craft_still_foul_residue_hiss", "A failed brew souring in the vessel, an ugly sputtering hiss with a thick bubble collapsing, %s" % DRY, 1.4, 0.40, 2, "SFX", "05"),
+    one("craft_still_potion_complete", "A finished potion settling in glass, a soft liquid swirl and one clean glass ring, understated, no fanfare, %s" % DRY, 1.2, 0.40, 1, "SFX", "05"),
+    one("craft_bench_saw_stroke", "A hand saw drawn through a plank, one full rasping stroke with the blade flexing, %s" % DRY, 1.2, 0.42, 5, "SFX", "05"),
+    one("craft_bench_plane_shave", "A hand plane pushed along timber, a long clean shaving curl peeling away, %s" % DRY, 1.2, 0.42, 4, "SFX", "05"),
+    one("craft_bench_wood_hammer", "A wooden mallet driving a joint home, a dull solid knock of wood on wood, %s" % DRY, 0.6, 0.45, 5, "SFX", "05"),
+    one("craft_bench_schematic_complete", "A wooden assembly seating together finished, a final firm knock and settle, understated, no fanfare, %s" % DRY, 1.0, 0.42, 1, "SFX", "05"),
+    loop_("craft_cook_sizzle_loop", "food frying in a pan over a fire, a steady bright sizzle with occasional spits", 12, 0.35, "SFX", "05"),
+    loop_("craft_cook_boil_loop", "a pot boiling over a fire, steady rolling bubbles with a faint lid rattle", 12, 0.35, "SFX", "05"),
+    one("craft_cook_stir", "A wooden spoon stirring a thick pot, a slow wet drag around the sides, %s" % DRY, 1.2, 0.38, 3, "SFX", "05"),
+    one("craft_cook_meal_complete", "A finished meal lifted off the fire, a pot set down and a spoon laid aside, understated, no fanfare, %s" % DRY, 1.2, 0.40, 1, "SFX", "05"),
+    one("craft_assembly_bind_wrap", "Cord being wrapped tight around a haft, several fast turns pulling taut, %s" % DRY, 1.2, 0.42, 4, "SFX", "05"),
+    one("craft_assembly_component_click", "Two fitted components pressed together, a small precise mechanical click, %s" % DRY, 0.4, 0.48, 4, "SFX", "05"),
+    one("craft_assembly_device_complete", "A small device coming together finished, a final component seating with a quiet mechanical settle, understated, no fanfare, %s" % DRY, 1.0, 0.45, 1, "SFX", "05"),
+    one("craft_quick_confirm", "A quick craft finishing, one short dry practical sound of work set down, minimal, no fanfare, %s" % DRY, 0.5, 0.42, 1, "SFX", "05"),
+    one("craft_care_confirm", "A careful craft finishing, a slower deliberate settle of a finished piece being placed, minimal, no fanfare, %s" % DRY, 0.9, 0.42, 1, "SFX", "05"),
+    one("craft_mastery_confirm", "A masterwork craft finishing, a single clean sustained ring of exceptional quality, still restrained, no fanfare, %s" % DRY, 1.4, 0.42, 1, "SFX", "05"),
+    one("craft_recipe_learned_chime", "A recipe understood, one soft low tone with a quill stroke under it, very restrained, no fanfare, %s" % DRY, 0.8, 0.42, 1, "SFX", "05"),
+)
