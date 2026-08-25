@@ -174,13 +174,31 @@ FVoxelMenuLayout Load()
 #undef VOXELUI_LAYOUT_FLOAT
 #undef VOXELUI_LAYOUT_INT
 
-	if (OverrideCount > 0)
-	{
-		// Silent when there is no ini, loud when there is: a menu that looks
-		// wrong on one machine and right on another is otherwise a long
-		// afternoon.
-		UE_LOG(LogVoxelUI, Log, TEXT("FVoxelMenuLayout: %d value(s) overridden from DefaultVoxelUI.ini."), OverrideCount);
-	}
+	// THIS LINE IS UNCONDITIONAL, AND THAT IS THE POINT. It used to fire only
+	// when OverrideCount > 0, with a comment saying "silent when there is no
+	// ini, loud when there is". That is precisely backwards for diagnosis: a
+	// mechanism whose only output is conditional on its own success cannot be
+	// told apart from one that never ran. On 2026-08-25 a probe put a correct
+	// key under a correct section in DefaultVoxelUI.ini, changed nothing, and
+	// logged nothing -- and there was no way to tell "the key did not match"
+	// from "the ini was never resolved at all".
+	//
+	// GConfig cannot tell you either. Every FConfigCacheIni getter opens with
+	//
+	//     FConfigBranch* Branch = FindOrLoadNoSafeReload(this, Filename);
+	//     if (Branch == nullptr) { return false; }
+	//
+	// so an unresolvable ini NAME and a file with no matching KEYS return the
+	// identical false. Hence the branch is reported separately from the count:
+	// ABSENT means the name never resolved and no key here would ever be read,
+	// whatever the file contains; PRESENT with a zero count means the file was
+	// found and the keys did not match, which is a far smaller problem.
+	//
+	// Do not make this conditional again. See backlog 0.0m.
+	const bool bBranchPresent = GConfig != nullptr && GConfig->FindConfigFile(kIniName) != nullptr;
+	UE_LOG(LogVoxelUI, Log,
+	       TEXT("FVoxelMenuLayout: ini branch '%s' %s; %d value(s) overridden."),
+	       kIniName, bBranchPresent ? TEXT("PRESENT") : TEXT("ABSENT"), OverrideCount);
 	return L;
 }
 } // namespace VoxelUILayoutDetail
