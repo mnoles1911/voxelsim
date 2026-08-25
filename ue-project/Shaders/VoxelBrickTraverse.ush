@@ -586,7 +586,7 @@
 // the control leg -- and both legs must be compiled separately, never one binary
 // asked to behave two ways.
 #ifndef VOXEL_MARCH_FALLTHROUGH_SHELL
-#define VOXEL_MARCH_FALLTHROUGH_SHELL 1
+#define VOXEL_MARCH_FALLTHROUGH_SHELL 0
 #endif
 
 // THE HOLE METRIC (voxel.March.HoleStats). Counts, per frame, on the shipping
