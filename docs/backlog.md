@@ -41,7 +41,7 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
-### 0.0k The MAIN MENU CANNOT BE PHOTOGRAPHED on this box, and it is a front-end hold bug
+### 0.0k FIXED 2026-08-25 -- the menu is photographed; the world is now held for it
 
 Found 2026-08-25, first time `tools/voxel-ui-capture.ps1 -Shot Menu` has ever
 been run. It has never produced an image: `ue-project/Saved/` contains no
@@ -89,22 +89,82 @@ whose whole purpose is to show what the front end really looks like.
 It answers elevation with sea level and yields a screenshot that looks right and
 is not reproducible.
 
-**The fix is in the front end, not in the tile cache.** While the front end owns
-the screen, either every world-querying ticker is held the way the chunk
-streamer is, or the pawn is placed at its intended position before the world
-begins ticking. The second is probably better: it fixes the menu AND means the
-loading screen is streaming the place the player is about to be, rather than
-the origin.
+**FIXED in d073de6.** `VoxelFrontEnd::IsWorldHeldForMenu(World)` is the
+predicate, DERIVED from `UVoxelWorldSubsystem::HasWorldSessionStarted()` -- the
+same ChunkOwner the streamer already gates on -- rather than a flag the UI
+module sets on state transitions. That choice paid for itself: a stored flag
+would have needed all four callers known in advance, and only two were.
+
+**THERE WERE FOUR, NOT TWO, AND THAT IS THE REUSABLE LESSON.** They surfaced one
+at a time, each hidden behind the last -- silencing water revealed the ocean
+actor, which revealed the sky rig, which revealed the clipmap veil probe:
+
+    UVoxelWaterSubsystem::Tick -> RefreshImplicitWater
+    AVoxelOceanActor::UpdateUnderwaterState
+    UVoxelSkySubsystem::OnWorldBeginPlay -> SpawnRig
+    AVoxelClipmapActor::IsCameraUnderRock
+
+A fail-fast gate reports the FIRST caller, not the class, so it turns a class of
+bugs into a QUEUE of bugs and the queue is invisible. This entry said "two
+offenders, confirmed by callstack" and that was true and still wrong. Anything
+of the shape "N things call X while X is unavailable" has to be enumerated from
+the call graph, not discovered by repeated fatals.
+
+Three of the four are early returns. The sky is not: `OnWorldBeginPlay` fires
+once, so skipping it means no sky for the session -- its rig spawn is deferred
+to the first unheld tick. The `Z=0` fallback already in `SpawnRig` was NOT
+taken: that constant is documented for a world with no terrain subsystem at
+all, which is permanent, and borrowing it for a temporary condition would leave
+the rig referenced to sea level for the whole session afterwards.
 
 NOT ATTEMPTED, deliberately: the tree carries another session's uncommitted
 edits to `VoxelWorldSubsystem.cpp/.h` and `VoxelMarchRenderer.cpp`. Building
 would compile their half-finished work and corrupt the DLL pair they are
 measuring against.
 
-Consequence for the front-end verification plan: stages 2-6 of
-`docs/front-end-local-verification-handoff.md` (non-regression diff, captures,
-gate sweep, play) are ALL blocked on this, not merely undone. No capture lane
-exists until the menu can survive one tick.
+Stages 2-6 of `docs/front-end-local-verification-handoff.md` are UNBLOCKED.
+`tools/voxel-ui-capture.ps1 -Shot Menu` exits 0 and writes VoxelMenu00000.png
+with no workaround switches -- and specifically without
+`-VoxelFineTileGateFatal=0`, which the fatal itself offers and which would have
+answered elevation with sea level and produced a picture that looks right and
+is not reproducible.
+
+---
+
+### 0.0l The menu TITLE is clipped at both ends, measured -- "VOXELMARK" renders as "OXELMAR"
+
+Found in the first menu capture, 2026-08-25. NOT a font-load failure: the string
+is `"VOXELMARK"` and `menu font loaded` is in every log.
+
+**Measured off the capture, not eyeballed** -- my first read of the screenshot
+was that it clipped, my first measurement said it fit, and the pixels settled
+it. Gold title pixels in `VoxelMenu00000.png` span x = 933..1626 in a 2560-wide
+image: centre-347 to centre+346. Symmetric to within one pixel, which is a
+container clip and not a layout offset. 347 = 260 x 1.335, i.e. exactly
+`MainPanelHalfWidth` at this capture's Slate layout scale.
+
+**So the clipper is the `SBox` in `SVoxelMainMenu.cpp:285`,**
+`.WidthOverride(L.MainPanelHalfWidth * 2.f)` = 520 local units. That number
+came from the Godot original's `_main_panel` offsets (-260,-400)-(260,400),
+where it governed the BUTTON column; in Slate the title is inside the same box
+and gets clipped by it. Roughly a quarter more width is needed than the box
+gives.
+
+Note that measuring the TTF alone does not predict this. `MacondoSwashCaps` at
+nominal 84 px measures 483 px advance / 518 px ink for the string, which fits
+520 comfortably -- Slate lays it out materially wider than the raw face
+metrics, so the only trustworthy measurement is the rendered capture.
+
+ADR-0009 flagged the risk ("Macondo at 84 px will not lay out identically in
+Slate and Godot; expect a few pixels of difference in title width and
+centring"). It is real, and it is not a few pixels.
+
+THE FIX IS A DESIGN CALL, not a mechanical one, which is why it is not already
+made: either the title stops being constrained by the button panel (move it out
+of that `SBox`, or give it its own wider one -- it should size itself rather
+than inherit a number meant for buttons), or `TitleFontSize` comes down from 84.
+The first preserves the intended look; the second changes it. Owner's call.
+Nothing here should be tuned by arithmetic alone -- re-capture and look.
 
 ### 0.0j Chunks admit LEFT-TO-RIGHT and FAR-BEFORE-NEAR — diagnosed, fix authored, NOT YET IN ANY BINARY
 
