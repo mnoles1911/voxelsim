@@ -97,6 +97,40 @@ pre-arming stock of 5.5 s -- with moving p50 unchanged at 21 ms throughout.
 
 ---
 
+## 2026-08-25: GOAL 3b RESTATED BY THE OWNER, AND THE CASCADE DEEPENED
+
+**GOAL 3b IS NO LONGER "<= 0.10% STUTTERS". THAT NUMBER WAS NEVER THE OWNER'S.**
+An agent chose it as its own reading of the word "steady", wrote it here, and it
+was then quoted back to him as his requirement. He replaced it on 2026-08-25 with
+
+    1% low (p99 frame time) >= 50 fps while MOVING at >= 20 m/s
+
+which is what commercial practice actually reports (1% low / 0.1% low alongside
+the average), and which cannot be gamed by a threshold count. **A stutter
+percentage is a fragile gate**: `stutterPct` counts frames over a fixed 20.00 ms
+bar, so a 20.1 ms frame scores identically to a 293 ms one. Keep reading it as
+texture, never as the gate.
+
+Shipped default today, 8,658 moving frames:
+
+    mean 13.95 | p50 11.80 (85 fps) | p95 27.10 (37) | p99 34.00 (29) | max 293.04
+    stutters >20ms   17.07%  = one every 0.07 s
+    hitches  >33.3ms  0.92%  = one every 1.3 s
+
+So the honest reading is 85 fps average with a **29 fps 1% low** -- the average
+is nearly at target and the tail is at 34% of it, where a smooth-feeling game
+wants roughly 50%. **The 293 ms maximum is a separate defect** from general
+judder: a third of a second of freeze has a specific cause and should be hunted
+as its own bug, not averaged into a percentage.
+
+**THE CASCADE WAS DEEPENED** -- 7 rings at R0 = 64 m, same 4096 m range, 43%
+fewer chunk iterations, ~3.4x fewer resident chunks, shipped as CODE DEFAULTS and
+verified on a leg passing no ring arguments. See VoxelWorldSubsystem.h's
+kDefaultRingPresets for the measured pair and the visual trade the owner
+accepted. Goal 1 and the near-ring defect moved with it.
+
+---
+
 ## THE THREE GOALS
 
 | # | metric | baseline (stock) | armed | TARGET | status |
