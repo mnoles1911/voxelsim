@@ -50,3 +50,17 @@ _None yet._
 | File | Source | Output | sha256 (source) |
 |---|---|---|---|
 | -- | -- | -- | -- |
+
+## Rights: CLEARED FOR COMMERCIAL RELEASE
+
+The owner confirmed on 2026-08-25 that every asset in this directory is cleared
+for use in the commercial game. That is the project's position and it does not
+need re-opening per asset or per batch.
+
+Recorded as what it is: the determination of the account holder who sourced the
+material. It is not a third-party legal review and does not claim to be. If the
+basis ever has to be re-established, the thing to re-check is the terms of the
+generating account at the time each file was made -- not this paragraph.
+
+Applies to the tracks the designer places in this folder, however they were
+produced (the portfolio in `docs/music-prompts.md` was written for Suno).

@@ -56,3 +56,17 @@ imply opposite gitignore rules:
 
 No `.uasset` ignore rule has been added for this directory precisely because
 adding one would quietly pick route 2. Decide it when the first sound lands.
+
+## Rights: CLEARED FOR COMMERCIAL RELEASE
+
+The owner confirmed on 2026-08-25 that every asset in this directory is cleared
+for use in the commercial game. That is the project's position and it does not
+need re-opening per asset or per batch.
+
+Recorded as what it is: the determination of the account holder who sourced the
+material. It is not a third-party legal review and does not claim to be. If the
+basis ever has to be re-established, the thing to re-check is the terms of the
+generating account at the time each file was made -- not this paragraph.
+
+Applies to the rendered takes as well as the prompts (`docs/sfx-prompts.md`
+was written for ElevenLabs Sound Effects).

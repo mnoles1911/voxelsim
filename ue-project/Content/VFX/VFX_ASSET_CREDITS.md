@@ -30,6 +30,22 @@ attribution obligation recorded in
 `../Voxel/TextureSource/SKY_ASSET_CREDITS.md`, and that obligation ships with
 any build that renders them. Do not conflate the two sets.
 
+## Rights: unchanged by the 2026-08-25 clearance, and one obligation still ships
+
+The owner cleared the project's OWN generated assets (menu art, music, SFX) for
+commercial release on 2026-08-25. That statement does not apply here and does
+not need to: these eight are third-party CC0, which already permits commercial
+use with no attribution.
+
+THE SKY TEXTURES ARE THE EXCEPTION AND THE CLEARANCE DOES NOT TOUCH THEM. The
+NASA/ESA credit recorded in `../Voxel/TextureSource/SKY_ASSET_CREDITS.md` is an
+attribution REQUIREMENT of that source, not a permission question -- being
+cleared to use something is not the same as being free of the condition
+attached to it. That credit line still has to appear in any build that renders
+those textures, and as of today it appears in no shipping surface: there is no
+credits screen wired to it (the menu's CREDITS panel is a placeholder). Whoever
+builds that screen owns this.
+
 ## Assets
 
 | File | Source page | Feeds | Bytes | sha256 |

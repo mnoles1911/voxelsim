@@ -28,3 +28,17 @@ quietly destroyed.
 | forest_fight.jpg | forest_fight_background1.jpg 5516x3072 (8.39 MB) | 1920x1069 (328 KB) | `bd6ef8cb6a94b1b9a36ad69e72c14bb1b672026384c9b85f7dc5957308028128` |
 | fortress_battles.jpg | fortress_battles_background1.jpg 5524x3072 (9.04 MB) | 1920x1068 (339 KB) | `0e3016159f30f371e31a8283a1ab1028c75a8369f2e880b076c168da7fe6184f` |
 | sailing.jpg | sailing_background1.jpg 2758x1536 (3.02 MB) | 1920x1069 (412 KB) | `d64251cc810eb2f6d1b62262d88393f07f55216a4348d559ab4dcbf0bae2ed36` |
+
+## Rights: CLEARED FOR COMMERCIAL RELEASE
+
+The owner confirmed on 2026-08-25 that every asset in this directory is cleared
+for use in the commercial game. That is the project's position and it does not
+need re-opening per asset or per batch.
+
+Recorded as what it is: the determination of the account holder who sourced the
+material. It is not a third-party legal review and does not claim to be. If the
+basis ever has to be re-established, the thing to re-check is the terms of the
+generating account at the time each file was made -- not this paragraph.
+
+Applies to the six background images. The typeface is separate and always was:
+Macondo Swash Caps ships under the Open Font Licence, see `../Fonts/OFL.txt`.
