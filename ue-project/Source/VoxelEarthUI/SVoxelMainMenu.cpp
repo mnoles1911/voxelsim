@@ -167,13 +167,26 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	TSharedPtr<SVoxelMenuButton> CreditsButton;
 	TSharedPtr<SVoxelMenuButton> QuitButton;
 
+	// THE TITLE IS DELIBERATELY WIDER THAN THE PANEL IT SITS IN. Everything
+	// else in this column is 520 units across (MainPanelHalfWidth * 2, the
+	// Godot _main_panel width), and that number is about the BUTTONS. The
+	// title inherited it and Slate's text layout cut the string at the
+	// boundary -- the first capture rendered "VOXELMARK" as "OXELMAR". The
+	// SBox gives the text its own, measured width; the slot stays centred, so
+	// the extra width spills symmetrically and nothing else moves. See
+	// TitleBoxWidth in VoxelUITheme.h for the measurement and backlog 0.0l.
 	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
 	[
-		SNew(STextBlock)
-		.Text(VoxelUIStrings::Title())
-		.Font(Style.Serif(L.TitleFontSize))
-		.ColorAndOpacity(FVoxelUIStyle::TitleColour())
-		.Justification(ETextJustify::Center)
+		SNew(SBox)
+		.WidthOverride(L.TitleBoxWidth)
+		.HAlign(HAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::Title())
+			.Font(Style.Serif(L.TitleFontSize))
+			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
+			.Justification(ETextJustify::Center)
+		]
 	];
 
 	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)

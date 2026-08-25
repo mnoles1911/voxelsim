@@ -109,6 +109,11 @@ FVoxelMenuLayout Load()
 	VOXELUI_LAYOUT_FLOAT(MainPanelHalfHeight);
 	VOXELUI_LAYOUT_FLOAT(MainColumnSeparation);
 	VOXELUI_LAYOUT_FLOAT(TitleToButtonsSpacer);
+	// Registered so the title width can be retuned from a capture without a
+	// rebuild -- which matters more here than for the other layout floats,
+	// because the only way to check it is to shoot the menu and measure the
+	// rendered span. See TitleBoxWidth in the header.
+	VOXELUI_LAYOUT_FLOAT(TitleBoxWidth);
 	VOXELUI_LAYOUT_FLOAT(QuitSpacer);
 	VOXELUI_LAYOUT_FLOAT(ButtonMinHeight);
 	VOXELUI_LAYOUT_INT(ButtonFontSize);

@@ -136,6 +136,28 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	// 84, not the mock's 108, and with no letter-spacing (the mock asks for
 	// 10px; Slate has no tracking and the Godot build applies none either).
 	int32 TitleFontSize        = 84;
+	// THE TITLE GETS ITS OWN WIDTH, WIDER THAN THE PANEL. Without this the
+	// title is laid out inside MainPanelHalfWidth*2 = 520 and Slate's text
+	// layout cuts it at that boundary: the first capture rendered "VOXELMARK"
+	// as "OXELMAR", losing the V and the K, clipped symmetrically. 520 is the
+	// Godot _main_panel width and it governs the BUTTON column; the title was
+	// never meant to inherit it.
+	//
+	// 720 IS MEASURED, NOT GUESSED, and the measurement is the interesting
+	// part. The gold title pixels in the first capture spanned centre-347 to
+	// centre+346 of a 2560-wide shot -- symmetric, and 347 = 260 x 1.335, which
+	// identified both the clipper and the layout scale. Backing the visible
+	// substring out against the face's advance widths puts the full string at
+	// 659 local units. 720 is that plus headroom.
+	//
+	// DO NOT RE-DERIVE THIS FROM THE FONT FILE. MacondoSwashCaps at nominal
+	// 84 px measures 483 px advance and 518 px ink for "VOXELMARK", which fits
+	// 520 comfortably -- and it does not. Slate lays the string out about 25%
+	// wider than the raw face metrics predict, so an offline measurement
+	// clears this as fine. Only a rendered capture is trustworthy here; if the
+	// title string or TitleFontSize changes, re-shoot -Shot Menu and re-measure
+	// the span rather than recomputing it. See backlog 0.0l.
+	float TitleBoxWidth        = 720.f;
 	int32 SubtitleFontSize     = 18;
 	int32 VersionFontSize      = 12;
 	float VersionInsetLeft     = 16.f;

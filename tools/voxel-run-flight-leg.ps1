@@ -120,7 +120,22 @@ $Project = (Resolve-Path "$PSScriptRoot\..\ue-project\VoxelEarth.uproject").Path
 $LogPath = Join-Path (Resolve-Path "$PSScriptRoot\..").Path "Saved\$LogName.log"
 
 # THE GUARD. See the header.
-$running = @(Get-Process UnrealEditor-Cmd, UnrealEditor -ErrorAction SilentlyContinue)
+# THE GUARD ALSO HAS TO SEE A BUILD, NOT JUST ANOTHER EDITOR.
+#
+# It used to check for editors only. A leg started into a live build is exactly
+# the contended-numbers case this guard exists to prevent -- five cl.exe eating
+# the cores produce a leg that reads like a slow configuration, and nothing in
+# the log says so. Worse, the reverse order corrupts the binary rather than the
+# numbers: a build that starts while an editor holds
+# UnrealEditor-VoxelEarthShaders.dll fails its link, leaves one DLL of the pair
+# relinked and the other stale, and everything that runs afterwards measures an
+# incoherent build. Both of those happened on 2026-08-24/25.
+#
+# dotnet IS ON THE LIST DELIBERATELY: UnrealBuildTool runs as dotnet.exe, so a
+# build in its UBT phase shows up under neither cl nor UnrealBuildTool and the
+# obvious three-name check misses exactly the window where the link happens.
+# (Credit: the front-end session, which was checking this by hand.)
+$running = @(Get-Process UnrealEditor-Cmd, UnrealEditor, cl, link, UnrealBuildTool, MSBuild, dotnet -ErrorAction SilentlyContinue)
 if ($running.Count -gt 0) {
     $detail = ($running | ForEach-Object { "PID $($_.Id) ($($_.ProcessName))" }) -join ', '
     throw ("REFUSING TO START: $($running.Count) editor process(es) already running -- $detail. " +

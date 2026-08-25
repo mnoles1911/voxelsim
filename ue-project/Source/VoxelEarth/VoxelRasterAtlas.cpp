@@ -8,8 +8,11 @@
 
 #include "VoxelGpuWorldGen.h"
 
+#include "VoxelFineTileStreamer.h"  // kDefaultFineRingRadiusTiles -- the pin mode 3 rides on
+
 #include "voxelcore/core.h"
-#include "voxelcore/tilestore.h"  // vxc::tilePixelSizeMm -- the climate-pitch default
+#include "voxelcore/tilestore.h"      // vxc::tilePixelSizeMm -- the climate-pitch default
+#include "voxelcore/tilestreaming.h"  // vxc::tileCoordForPixel -- THE page->tile rule, not a restatement
 
 #include "Misc/CommandLine.h"
 #include "RenderingThread.h"   // ENQUEUE_RENDER_COMMAND (Shutdown)
@@ -171,17 +174,175 @@ namespace
 	//     deliberate design (VoxelFineTileStreamer.cpp: "an unattended run that
 	//     continues past this point does not degrade, it LIES").
 	// So naively moving this fill to a worker converts a silent blocking load
-	// into a killed leg. The guard is in LaunchAsyncSlots: every page is PRIMED
+	// into a killed leg. The FIRST half of the guard -- necessary, and on its
+	// own NOT sufficient; the section below is the other half -- is in
+	// LaunchAsyncSlots: every page is PRIMED
 	// on the game thread with four corner samples first -- a page is 128 px and
 	// a fine tile is 8,192, so four corners name exactly the tiles the page can
 	// span -- which forces the game-thread branch and leaves the worker reading
 	// resident tiles only. Four calls per page against 32,768 is 0.01%.
 	//
-	// The residual risk, stated: TickResidencyAndEviction could evict a tile
-	// between the prime and the worker's read. With ringRadius=0 and 1.82 of a
-	// 12.00 GiB budget resident, no eviction happens on a cold start -- but if
-	// one ever did, the reading is `gateLeaks>0` on the `Fine tier` line (or a
-	// fatal), and mode 3 must not ship on that evidence.
+	// THE PRIME IS NOT A PROOF. WHAT CLOSES IT (2026-08-24) ------------------
+	//
+	// The residual risk, stated as it always was: TickResidencyAndEviction can
+	// evict a tile BETWEEN the prime and the worker's read of it, and a worker
+	// reading an evicted tile is the fatal branch. The old note answered that
+	// with "with ringRadius=0 and 1.82 of a 12.00 GiB budget resident, no
+	// eviction happens on a cold start" -- which is an observation about one
+	// leg's headroom, not a property of the code. A long flight is precisely
+	// the run that spends that headroom, and an unattended leg that dies at
+	// minute nine loses the whole leg. So the prime alone can never be the
+	// guard, and mode 3 was correctly kept off while it was.
+	//
+	// WHAT WAS TRIED FIRST AND IS NOT POSSIBLE FROM THIS FILE, recorded so the
+	// next person does not spend the afternoon rediscovering it. The obvious
+	// design is: a worker that finds a non-resident pixel ABANDONS the page and
+	// requeues it for a game-thread fill -- a fatal race becomes a rare slow
+	// path, and nothing is lost because the game-thread path blocks on a
+	// synchronous load and is documented as "slow, but correct". It cannot be
+	// written here. The atlas holds a vxc::ITileSampler&, whose entire surface
+	// is pixelSizeMm / elevationMm / climate (voxelcore/tiles.h) -- no try-form,
+	// no residency query. DISCOVERING that a pixel is non-resident and TRIPPING
+	// the fatal report are therefore the SAME instruction, and both live in
+	// another file: elevationMm -> ResolveNonResidentPixel -> its worker branch
+	// -> ReportGateLeak_Locked. There is no signal to abandon on. (The
+	// abandonment design is still the right one; see the last paragraph for the
+	// six lines that would create the signal.)
+	//
+	// SO THE GUARD IS A PIN INSTEAD -- and the residency system already has
+	// one; it just is not spelled as an API. TickResidencyAndEviction calls
+	// Budget_.setPinned(squareTileRing(anchorTile, R)) every tick, and
+	// LruBudgetCache::selectEvictions() excludes every pinned key "even if that
+	// leaves the cache over budget" (voxelcore/tilestreaming.h). A tile inside
+	// the ring CANNOT be evicted, budget pressure or not. This class cannot
+	// take a pin of its own, but it can confine its workers to pages that are
+	// already inside somebody else's, which is exactly as strong.
+	//
+	// THE PROOF, in the four steps it actually rests on:
+	//   1. ORDER. TickResidencyAndEviction runs inside RecomputeDesiredSet,
+	//      which is EARLIER in the same streaming tick than this atlas's Tick
+	//      (VoxelWorldSubsystem.cpp: the residency call, then the raster-atlas
+	//      block placed ahead of DispatchJobs). Every eviction of tick N is
+	//      already behind us when we launch; the next one cannot happen until
+	//      tick N+1.
+	//   2. ADMISSION. A page is handed to a worker only if EVERY fine tile it
+	//      can touch lies within Chebyshev R-1 of the anchor's tile, R being
+	//      the streamer's ring radius (-VoxelFineTileRingRadius, default 0).
+	//      Four corners name exactly the tiles a page can span, for the same
+	//      arithmetic the prime uses: 128 px page, 8,192 px tile.
+	//   3. ONE CROSSING OF SLACK. The anchor moves at most one coarse tile per
+	//      tick (a tile is 15.36 km; even 240 m/s is ~4 m per frame), so tick
+	//      N+1's ring is centred at most one tile away and still contains
+	//      everything within R-1 of tick N's centre. Pages in flight are still
+	//      pinned through the first eviction pass that could see them.
+	//   4. THE BARRIER. That slack is spent after ONE crossing, so the atlas
+	//      DRAINS -- waits out every busy slot and harvests it -- the moment it
+	//      sees the anchor's coarse tile change. By (1) the drain happens in the
+	//      same tick as the eviction pass that moved the ring, so no worker
+	//      survives into the second one.
+	// The other eviction site cannot reach us either: EnsureTileResident_Locked
+	// unloads only a tile it JUST loaded and failed to decode, and it returns
+	// early on an already-resident tile, so it can never unload one a worker is
+	// reading.
+	//
+	// WHAT R=0 MEANS, said plainly rather than hidden in the arithmetic: R-1 is
+	// -1, so the default admits NOTHING. With only the anchor's own tile pinned
+	// there is no page whose tiles survive a crossing. Mode 3 then fills
+	// synchronously and the window line SAYS SO (`asyncSafety=`, `syncFallback=`
+	// and `asyncPages=0` together). Measuring mode 3 on a fine-tier leg
+	// therefore requires -VoxelFineTileRingRadius=1 AND a cache budget that
+	// holds a 3x3 of decoded tiles. That is a real constraint on the experiment,
+	// not a formality, and a leg that forgets it measures mode 2 wearing mode
+	// 3's name.
+	//
+	// THE BARRIER'S COST, UNMEASURED AND SAID SO: a drain waits out whatever is
+	// left of a batch (tasks x batch pages of worker sampling) on the GAME
+	// THREAD, once per coarse-tile crossing -- one crossing per 15.36 km, so
+	// ~once per 64 s at 240 m/s and ~once per 12.8 min at the frame gate's
+	// 20 m/s. It is printed as `drains=N (... ms GT)` because a safety path
+	// that costs the tail must show its bill. If that ms ever becomes a visible
+	// share of a window, shrink -VoxelGpuRasterAtlasFillBatch; do not remove
+	// the barrier.
+	//
+	// WHAT WOULD BE BETTER, AND IT IS NOT IN THIS FILE. Six lines in
+	// VoxelFineTileStreamer beat all of the above:
+	//     bool FVoxelFineTileSamplerProxy::tryElevationMm(px, py, int32_t& Out)
+	// answering FALSE on a worker instead of calling ReportGateLeak_Locked.
+	// The atlas would then abandon the page, requeue it at demand priority and
+	// let the game thread fill it correctly -- no ring requirement, no barrier,
+	// no drain, and the fatal race unreachable by construction rather than by
+	// argument. A pin/refcount API is the WORSE of the two options and should
+	// not be built: it makes the game thread's eviction wait on a worker, which
+	// is the same tail cost mode 3 exists to remove, and Budget_::setPinned is
+	// REPLACED wholesale every residency tick, so a pin added naively beside it
+	// would be silently wiped -- inert while looking armed, which is the trap
+	// this file already documents twice.
+	//
+	// -VoxelGpuRasterAtlasFillSafety=N, latched:
+	//   0  OFF -- prime and hope. Exactly the arm the ladder's mode-3 row was
+	//      measured on, kept so that measurement can be reproduced, and it can
+	//      still kill an unattended run.
+	//   1  PINNED-RING ADMISSION + drain barrier (DEFAULT). Safe by the proof
+	//      above. Pages it refuses are filled SYNCHRONOUSLY in the same tick
+	//      under the ordinary budget, so warmup still finishes and the refusal
+	//      costs correctness nothing.
+	int32 AsyncSafetyMode()
+	{
+		static const int32 Value = []
+		{
+			int32 V = 1;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlasFillSafety="), V);
+			return FMath::Clamp(V, 0, 1);
+		}();
+		return Value;
+	}
+
+	// The streamer's ring radius, read from the SAME switch the streamer is
+	// constructed from (VoxelWorldSubsystem.cpp's FineRingRadius: <0 leaves
+	// FVoxelFineTileStreamer::kDefaultFineRingRadiusTiles). This is the rule
+	// ClimatePitchMm() already follows -- read the producer's switch, never
+	// restate the producer's policy -- and it matters more here than there,
+	// because a value that is too LARGE makes the admission test wrong in the
+	// UNSAFE direction. So the window line prints the number this file used and
+	// the streamer prints its own on the `Fine tier ENABLED:` startup line: two
+	// independent spellings of one fact, in one log, greppable side by side.
+	int32 FineRingRadiusTiles()
+	{
+		static const int32 Value = []
+		{
+			int32 V = -1;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), V);
+			return (V >= 0) ? V : int32(FVoxelFineTileStreamer::kDefaultFineRingRadiusTiles);
+		}();
+		return Value;
+	}
+
+	// CAN A WORKER OF OURS REACH THE FATAL GATE THROUGH THIS SAMPLER?
+	//
+	// FAIL-CLOSED, AND BY PITCH RATHER THAN BY TYPE, because this module is
+	// compiled /GR- (bUseRTTI defaults false -- VoxelWaterSubsystem.cpp records
+	// the same constraint at its own type test), so dynamic_cast is not
+	// available. The only sampler that can leak is FVoxelFineTileSamplerProxy,
+	// and it is the only sampler this project puts on ActiveTiles() at
+	// 1,875 mm/px. The alternatives are worker-safe at any pitch and say so
+	// themselves: vxc::TileGridSampler is immutable after init ("tiles_ is
+	// populated only during init ... otherwise pure reads of immutable data",
+	// tilestore.h) and vxc::SyntheticTileSampler is a pure function of a seed.
+	//
+	// THE ONE FALSE POSITIVE IS THE SAFE DIRECTION: a coarse TileGridSampler
+	// run at -VoxelTileScale=16 is also 1,875 mm/px and would be treated as
+	// leak-capable. That costs async admission on a configuration nothing in
+	// this repo uses. The opposite error costs a leg.
+	//
+	// WHAT WOULD REFUTE IT: an ITileSampler that mutates on query and does NOT
+	// report 1,875 mm/px would be classified safe and would be wrong. That is
+	// why the answer is printed (`asyncSafety=` on the window line) instead of
+	// being assumed -- a run states which classification it got.
+	bool SamplerCanLeakOnWorker(const vxc::ITileSampler& Tiles)
+	{
+		return Tiles.pixelSizeMm() == vxc::tilePixelSizeMm(vxc::kFineTileScale);
+	}
+
 	int32 AsyncFillTasks()
 	{
 		static const int32 Value = []
@@ -305,18 +466,73 @@ int32 FVoxelRasterAtlasCpu::FillMode()
 		// mismatch. mismatch=0, gateLeaks=0, holes=0 on every arm, every ring
 		// improved and none lost.
 		//
-		// WHY NOT 3, given it is the fastest arm. Two reasons, and the second
-		// decides it. (1) It is where all the concurrency risk lives: a worker
-		// touching a non-resident pixel reaches ReportGateLeak_Locked, which is
-		// FATAL on an unattended run, and the four-corner prime that guards it
-		// can be defeated by a racing eviction. (2) No arm in this ladder was
-		// measured against the >100 FPS-after-settle goal, and adding threads
-		// without a settled-segment p95 instrument is exactly the trade that
-		// goal exists to prevent. 0.6 s is not worth taking that on blind.
+		// WHY NOT 3, given it is the fastest arm. Two reasons were recorded.
+		// BOTH HAVE NOW MOVED, and neither is deleted here, because an
+		// objection that has been overtaken should be written down as overtaken
+		// rather than quietly dropped -- otherwise the next person cannot tell
+		// a resolved risk from one nobody thought about.
 		//
-		// AND THE HONEST NUMBER: removing 4,033 ms of game thread bought 1.1 s
-		// of settle -- 27%, not 1:1. Game-thread milliseconds are not wall
-		// milliseconds. This is the third measurement tonight to say so.
+		// (1) THE CONCURRENCY RISK -- "a worker touching a non-resident pixel
+		//     reaches ReportGateLeak_Locked, which is FATAL on an unattended
+		//     run, and the four-corner prime that guards it can be defeated by
+		//     a racing eviction." STILL REAL, and now GUARDED rather than
+		//     hoped about: -VoxelGpuRasterAtlasFillSafety=1 (the default)
+		//     admits a page to a worker only when every fine tile it can touch
+		//     is inside the streamer's PINNED ring with a tile of margin, and
+		//     drains every worker the moment the anchor crosses a tile. The
+		//     four-step proof, its cost, and the streamer-side change that
+		//     would beat it are at AsyncSafetyMode() above. The price is that
+		//     the default ring radius (0) admits nothing, so mode 3 on a
+		//     fine-tier leg needs -VoxelFineTileRingRadius=1 to be measuring
+		//     anything at all.
+		//
+		// (2) "No arm in this ladder was measured against the >100
+		//     FPS-after-settle goal, and adding threads without a
+		//     settled-segment p95 instrument is exactly the trade that goal
+		//     exists to prevent." THIS OBJECTION IS OVERTAKEN: that instrument
+		//     now exists. `Voxel frame dist seg=SETTLED-MOVING scope=total`
+		//     reports p50/p95/p99/max and stutter counts over the settled
+		//     moving segment, and it is what the owner's frame gate is read
+		//     from. The gate itself changed too -- it is no longer a stutter
+		//     percentage but "1% low (p99 frame time) >= 50 fps while moving at
+		//     >= 20 m/s" -- so the TAIL is the target, and mode 3's case is now
+		//     a tail case rather than a settle-time case.
+		//
+		// WHY THE TAIL IS WHERE MODE 3 IS SUPPOSED TO PAY. Measured on the
+		// 2026-08-25 EE-default leg, and NOT BY ME -- I cannot run a leg from
+		// here, so nothing in this comment is a number I produced: the worst
+		// frames of a flight are game-thread stalls inside GPU job submission
+		// (a hitch frame reported frameMs=400.00, itself a clamp of a 1,104.66
+		// ms tick, of which dispatchMs=1093.47 and submitMs=1089.77). submitMs
+		// is bimodal -- n=96, p50=0.00, p90=0.60, max=1,089.77 ms -- and the
+		// submit bracket covers the GPU fork's region request, which pulls
+		// raster-atlas pages that fill SYNCHRONOUSLY on the game thread. The
+		// same log's per-window atlas cost was 385.0 / 245.4 / 217.7 / 156.1 ms
+		// at perPage 2.736 ms = elev 2.699 (99%). That is the term mode 3 moves
+		// off the tick.
+		//
+		// AND THE HONEST NUMBER, WHICH CUTS AGAINST ALL OF THAT: removing
+		// 4,033 ms of game thread bought 1.1 s of settle -- 27%, not 1:1.
+		// Game-thread milliseconds are not wall milliseconds. The claim above
+		// is about the TAIL and that caveat is about SETTLE TIME, and they are
+		// different quantities -- but the caveat is the reason the tail claim
+		// is a hypothesis and not a plan: work removed from the game thread has
+		// already been measured, on this very feature, NOT to convert into wall
+		// time at anything like 1:1.
+		//
+		// THE FALSIFIER FOR ARMING MODE 3, registered before the leg (the
+		// owner's, 2026-08-24). With mode 3 armed:
+		//   * `gateLeaks` must be 0 AND `mismatch` must be 0 across a full
+		//     flight leg. A non-zero gateLeaks means the safety path is NOT
+		//     covering the race and this change is WRONG -- not tunable,
+		//     wrong -- and mode 3 goes back off immediately.
+		//   * the settled-moving p99 must IMPROVE. If it does not, then moving
+		//     ~1.5 s of game thread off the tick did not reach the tail, mode 3
+		//     stays off regardless of how safe it is, and the tail is somewhere
+		//     else -- which is a result worth the leg either way.
+		//   * `asyncPages` must be > 0. Zero means the ring/admission gate
+		//     refused everything (read `asyncSafety=` and `declinedUnpinned=`
+		//     on the atlas window line) and the leg measured mode 2.
 		int32 V = 2;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlasFill="), V);
 		return FMath::Clamp(V, 0, 3);
@@ -845,8 +1061,127 @@ void FVoxelRasterAtlasCpu::HarvestAsyncSlots()
 	}
 }
 
+bool FVoxelRasterAtlasCpu::AnyAsyncSlotBusy() const
+{
+	for (const TUniquePtr<FFillSlot>& SlotPtr : FillSlots)
+	{
+		if (SlotPtr.IsValid() && SlotPtr->bBusy)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// STEP 2 OF THE PROOF at AsyncSafetyMode(). Only the arithmetic lives here.
+bool FVoxelRasterAtlasCpu::IsPageAsyncSafe(int64 PageX, int64 PageY) const
+{
+	if (AsyncSafetyMode() == 0 || !bAsyncSamplerCanLeak)
+	{
+		// Either the operator explicitly asked for the unguarded arm, or this
+		// sampler has no worker path into ReportGateLeak_Locked at all
+		// (immutable coarse grid / pure synthetic), in which case there is
+		// nothing to be safe FROM and confining the sweep would only cost.
+		return true;
+	}
+
+	// R-1, not R: the anchor can cross ONE tile before the barrier fires, and
+	// the ring that will exist AFTER that crossing is the one that has to still
+	// contain this page. R=0 therefore admits nothing, which is the honest
+	// answer for a run whose streamer pins only the tile under the player.
+	const int32 Margin = FineRingRadiusTiles() - 1;
+	if (Margin < 0)
+	{
+		return false;
+	}
+
+	// vxc::tileCoordForPixel, NOT floorDiv(px, 8192) written out again: the
+	// page->tile mapping has exactly one spelling and the streamer's own gate
+	// reads it from there too. A second copy here is the D5 drift this whole
+	// class is built to avoid.
+	const int64 TileSizePx = int64(vxc::kFineTileSize);
+	const vxc::TileCoord AnchorTile = vxc::tileCoordForPixel(LastAnchorPxX, LastAnchorPxY, TileSizePx);
+	const int64 X0 = PageX * int64(kPagePx);
+	const int64 Y0 = PageY * int64(kPagePx);
+	const int64 X1 = X0 + int64(kPagePx) - 1;
+	const int64 Y1 = Y0 + int64(kPagePx) - 1;
+	// Four corners name EVERY tile the page can span, by the same arithmetic
+	// the prime probe uses: a page is 128 px, a fine tile is 8,192.
+	const vxc::TileCoord Corners[4] = {
+		vxc::tileCoordForPixel(X0, Y0, TileSizePx),
+		vxc::tileCoordForPixel(X1, Y0, TileSizePx),
+		vxc::tileCoordForPixel(X0, Y1, TileSizePx),
+		vxc::tileCoordForPixel(X1, Y1, TileSizePx)};
+	for (const vxc::TileCoord& T : Corners)
+	{
+		const int64 Dist = FMath::Max(FMath::Abs(int64(T.x) - int64(AnchorTile.x)),
+		                              FMath::Abs(int64(T.y) - int64(AnchorTile.y)));
+		if (Dist > int64(Margin))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+void FVoxelRasterAtlasCpu::DrainAsyncSlots()
+{
+	for (TUniquePtr<FFillSlot>& SlotPtr : FillSlots)
+	{
+		FFillSlot* S = SlotPtr.Get();
+		if (S != nullptr && S->bBusy && S->Task.IsValid())
+		{
+			S->Task.Wait();
+		}
+	}
+	// HARVEST, do not discard. Everything these workers sampled was read while
+	// its tiles were still pinned (step 3 of the proof), so the pages are
+	// correct and throwing them away would spend the barrier's cost twice.
+	// Task.Wait() has returned, so bDone's release store is visible and
+	// HarvestAsyncSlots' acquire load will see every slot finished.
+	HarvestAsyncSlots();
+}
+
+void FVoxelRasterAtlasCpu::FillDeferredPagesSync(vxc::ITileSampler& Tiles, const TArray<FPagePt>& Pages)
+{
+	if (Pages.Num() == 0)
+	{
+		return;
+	}
+	// They were marked in-flight only so the sweep would step past them while
+	// the batch was being built; they are not in flight and nobody is filling
+	// them but us. Clear the marks BEFORE filling so that an exhausted budget
+	// cannot leave a page permanently unfillable.
+	for (const FPagePt& P : Pages)
+	{
+		PagesInFlight.Remove(PageKey(P.X, P.Y));
+	}
+
+	// The ordinary budget, and the ordinary overshoot: the deadline is tested
+	// BEFORE a page, never during, so this pays at most one whole page past it
+	// -- exactly as the synchronous modes do. That is deliberate. When the
+	// admission test refuses everything (ring radius 0), mode 3's game-thread
+	// cost must land on mode 2's number rather than on some third value nobody
+	// can compare, or the ladder stops being a ladder.
+	const double Deadline = FPlatformTime::Seconds() + FillBudgetMs() / 1000.0;
+	for (const FPagePt& P : Pages)
+	{
+		if (FPlatformTime::Seconds() >= Deadline)
+		{
+			break;
+		}
+		if (IsPageResident(P.X, P.Y))
+		{
+			continue;
+		}
+		FillPage(Tiles, P.X, P.Y);
+		++AsyncSyncFallbackPages;
+	}
+}
+
 void FVoxelRasterAtlasCpu::LaunchAsyncSlots(vxc::ITileSampler& Tiles,
-                                            int64 AnchorPxX, int64 AnchorPxY)
+                                            int64 AnchorPxX, int64 AnchorPxY,
+                                            TArray<FPagePt>& OutDeferred)
 {
 	constexpr uint32 PixelsPerPage = kPagePx * kPagePx;
 	const int32 WantSlots = AsyncFillTasks();
@@ -866,13 +1201,36 @@ void FVoxelRasterAtlasCpu::LaunchAsyncSlots(vxc::ITileSampler& Tiles,
 
 		TArray<FPagePt> Batch;
 		Batch.Reserve(BatchPages);
-		while (Batch.Num() < BatchPages)
+		// BOUNDED SCAN, and the bound is the same one that was always here.
+		// Every candidate the admission test refuses consumes one of this
+		// batch's attempts instead of restarting the search, so a leg where
+		// NOTHING is admissible (ring radius 0) costs the same tasks x batch
+		// sweep probes per tick it costs today -- it does not walk the disc.
+		for (int32 Considered = 0; Considered < BatchPages && Batch.Num() < BatchPages; ++Considered)
 		{
 			FPagePt P;
 			bool bFromDemand = false;
 			if (!NextPageToFill(AnchorPxX, AnchorPxY, P, bFromDemand))
 			{
 				break;
+			}
+
+			// THE SAFETY ADMISSION (AsyncSafetyMode(), step 2 of the proof).
+			// Refused pages are NOT dropped and NOT lost: they go on the
+			// deferred list, the caller fills them synchronously in this same
+			// tick under the ordinary budget, and the page is as correct as it
+			// would have been in mode 2. The temporary in-flight mark is the
+			// only trick here -- it makes NextPageToFill step past this page
+			// for the rest of the batch (and, for a demand page, drop its queue
+			// entry) instead of returning it forever. FillDeferredPagesSync
+			// clears every mark before it fills anything.
+			if (!IsPageAsyncSafe(P.X, P.Y))
+			{
+				PagesInFlight.Add(PageKey(P.X, P.Y));
+				OutDeferred.Add(P);
+				++AsyncDeclinedUnpinned;
+				++AsyncDeclinedUnpinnedLifetime;
+				continue;
 			}
 
 			// THE PRIME PROBE -- the guard that keeps a worker off the fatal
@@ -903,7 +1261,12 @@ void FVoxelRasterAtlasCpu::LaunchAsyncSlots(vxc::ITileSampler& Tiles,
 
 		if (Batch.Num() == 0)
 		{
-			return; // nothing left to fill; leave the remaining slots idle
+			// Nothing left to fill, OR nothing the admission test will let a
+			// worker touch. Either way the remaining slots stay idle this tick;
+			// whatever was refused is on OutDeferred and the caller fills it on
+			// the game thread. The two cases are told apart in the log by
+			// `declinedUnpinned=` -- zero is the first, non-zero the second.
+			return;
 		}
 
 		S->Pages = MoveTemp(Batch);
@@ -1006,8 +1369,61 @@ void FVoxelRasterAtlasCpu::Tick(vxc::ITileSampler& Tiles, int64 AnchorXMm, int64
 
 	if (FillMode() >= 3)
 	{
+		// LATCH WHAT KIND OF SAMPLER WE WERE HANDED, once, and SAY IT. A leg
+		// that cannot tell which arm it got cannot be read: the same command
+		// line produces a guarded run on a fine-tier world and an unguarded
+		// (and unnecessary to guard) one on a coarse world, and the difference
+		// decides whether `asyncPages=0` is a bug or the design.
+		if (!bAsyncSafetyLatched)
+		{
+			bAsyncSafetyLatched = true;
+			bAsyncSamplerCanLeak = SamplerCanLeakOnWorker(Tiles);
+			UE_LOG(LogVoxelRasterAtlas, Log,
+			       TEXT("[raster-atlas] mode 3 ARMED: safety=%d, sampler %s reach the fine tier's fatal ")
+			       TEXT("gate from a worker (pitch=%d mm/px), ringRadius=%d -> async admits pages within ")
+			       TEXT("Chebyshev %d tile(s) of the anchor's tile. %s"),
+			       AsyncSafetyMode(),
+			       bAsyncSamplerCanLeak ? TEXT("CAN") : TEXT("cannot"),
+			       Tiles.pixelSizeMm(), FineRingRadiusTiles(), FineRingRadiusTiles() - 1,
+			       (AsyncSafetyMode() == 0)
+			           ? TEXT("SAFETY OFF: this is the prime-and-hope arm and it CAN kill an unattended run.")
+			       : (!bAsyncSamplerCanLeak)
+			           ? TEXT("Nothing to guard against on this sampler; every page is admissible.")
+			       : (FineRingRadiusTiles() >= 1)
+			           ? TEXT("Guarded by the pinned ring; pages outside it fill synchronously.")
+			           : TEXT("RING RADIUS 0 ADMITS NOTHING -- this run will fill synchronously and measure ")
+			             TEXT("mode 2. Pass -VoxelFineTileRingRadius=1 to actually measure mode 3."));
+		}
+
+		// THE BARRIER -- step 4 of the proof at AsyncSafetyMode(). The anchor's
+		// coarse tile changed, so the one crossing of slack the admission test
+		// left is now spent: every worker still running must finish before the
+		// NEXT residency tick can evict anything it is reading. Because
+		// TickResidencyAndEviction runs earlier in this same streaming tick,
+		// draining here is early enough, and the eviction pass that moved the
+		// ring has already been survived.
+		const vxc::TileCoord AnchorTile =
+			vxc::tileCoordForPixel(LastAnchorPxX, LastAnchorPxY, int64(vxc::kFineTileSize));
+		if (bAsyncSamplerCanLeak && AsyncSafetyMode() != 0 && AnyAsyncSlotBusy() &&
+		    (AnchorTile.x != InFlightAnchorTileX || AnchorTile.y != InFlightAnchorTileY))
+		{
+			const uint64 DrainT0 = FPlatformTime::Cycles64();
+			DrainAsyncSlots();
+			AsyncDrainCycles += FPlatformTime::Cycles64() - DrainT0;
+			++AsyncDrains;
+			++AsyncDrainsLifetime;
+		}
+		InFlightAnchorTileX = AnchorTile.x;
+		InFlightAnchorTileY = AnchorTile.y;
+
 		HarvestAsyncSlots();
-		LaunchAsyncSlots(Tiles, LastAnchorPxX, LastAnchorPxY);
+		// Declared here rather than inside LaunchAsyncSlots so that the pages
+		// the admission test refuses are filled INSIDE the GtFillCycles bracket
+		// -- the safety path's game-thread cost has to land in the number the
+		// registered disproof is written against, not beside it.
+		TArray<FPagePt> Deferred;
+		LaunchAsyncSlots(Tiles, LastAnchorPxX, LastAnchorPxY, Deferred);
+		FillDeferredPagesSync(Tiles, Deferred);
 	}
 	else
 	{
@@ -1199,13 +1615,30 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 		}
 	}
 
+	// WHICH SAFETY ARM THIS RUN IS ON, in words. The four states are printed
+	// apart because they fail apart: "not latched" is a mode-3 run whose Tick
+	// has never reached the async branch (a DEAD reading), "OFF-UNSAFE" is the
+	// arm that can kill an unattended leg, "RING-0-ADMITS-NOTHING" is a leg
+	// that thinks it is measuring mode 3 and is measuring mode 2, and
+	// "PINNED-RING" is the guarded arm. None of them is "ok" without the
+	// counters beside them.
+	const TCHAR* SafetyState =
+		(FillMode() < 3)              ? TEXT("n/a (mode<3)")
+		: !bAsyncSafetyLatched        ? TEXT("NOT-LATCHED (mode 3 set but the async branch never ran)")
+		: (AsyncSafetyMode() == 0)    ? TEXT("OFF-UNSAFE (prime-and-hope; can kill an unattended run)")
+		: !bAsyncSamplerCanLeak       ? TEXT("n/a (this sampler has no worker path to the fatal gate)")
+		: (FineRingRadiusTiles() >= 1) ? TEXT("PINNED-RING (guarded)")
+		                              : TEXT("RING-0-ADMITS-NOTHING (this leg is measuring mode 2)");
+
 	const double ClimatePixels = double(FMath::Max<uint64>(WindowCost.ClimatePixels, 1));
 	UE_LOG(LogVoxelRasterAtlas, Log,
 	       TEXT("[raster-atlas] fill: mode=%s | %s | perPage %.3f ms = elev %.3f (%.0f%%) ")
 	       TEXT("+ climate %.3f (%.0f%%) + stage %.3f (%.0f%%) + resid %.3f (%.0f%%) ")
 	       TEXT("| callsPerPage elev=%.0f climate=%.0f of %.0f px (dedup %s, %.0fx) ")
 	       TEXT("| audit checked=%llu mismatch=%llu | async pages=%llu launches=%llu inFlight=%d ")
-	       TEXT("prime=%llu | disc %lld/%lld pages | lifetime fills=%llu win=%.2fs"),
+	       TEXT("prime=%llu | asyncSafety=%s ring=%d declinedUnpinned=%llu (lifetime %llu) ")
+	       TEXT("syncFallback=%llu drains=%llu (lifetime %llu, %.2f ms GT) ")
+	       TEXT("| disc %lld/%lld pages | lifetime fills=%llu win=%.2fs"),
 	       FillModeName(FillMode()), *Health,
 	       TotalMs / Pages,
 	       ElevMs / Pages, ElevMs * Pct,
@@ -1223,6 +1656,9 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	       double(WindowCost.ClimatePixels) / double(FMath::Max<uint64>(WindowCost.ClimateCalls, 1)),
 	       WindowCost.AuditChecked, WindowCost.AuditMismatch,
 	       AsyncPagesHarvested, AsyncLaunches, PagesInFlight.Num(), PrimeCalls,
+	       SafetyState, FineRingRadiusTiles(),
+	       AsyncDeclinedUnpinned, AsyncDeclinedUnpinnedLifetime, AsyncSyncFallbackPages,
+	       AsyncDrains, AsyncDrainsLifetime, MsFromCycles(AsyncDrainCycles),
 	       DiscPages, SquarePages, PagesFilledLifetime, Elapsed);
 
 	// THE SECOND GAME-THREAD RASTER TERM, and the split the submit line cannot
@@ -1248,6 +1684,14 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	AsyncPagesHarvested = 0;
 	AsyncLaunches = 0;
 	PrimeCalls = 0;
+	// WINDOW counters reset; the two LIFETIME totals beside them deliberately
+	// do not. A drain is rare enough (one per coarse-tile crossing) that a
+	// per-window count is almost always 0, and a reader needs to be able to see
+	// that the path has fired at all this run without grepping every window.
+	AsyncDeclinedUnpinned = 0;
+	AsyncSyncFallbackPages = 0;
+	AsyncDrains = 0;
+	AsyncDrainCycles = 0;
 	PrepareCycles = 0;
 	PrepareCalls = 0;
 	GtFillCycles = 0;

@@ -152,6 +152,102 @@
 //     shader's, and the emit's quad has no meaningful bound to give. Plain
 //     SV_Depth it is, early-Z is off for these tiles, and that cost is exactly
 //     what the indirect hit-tile dispatch exists to confine.
+//
+//     THAT REASON IS TRUE, FIXABLE, AND NOT THE ONE THAT SETTLES IT. Read on
+//     before reopening this; the section below exists because the paragraph
+//     above has already been read as an invitation.
+//
+// ===========================================================================
+// CONSERVATIVE DEPTH: THE PRIZE IS STRUCTURALLY ZERO (worked 2026-08-24)
+// ===========================================================================
+//
+// The obvious repair for the paragraph above is to stop emitting the quad at a
+// fixed clip z. VoxelMarchMain already runs a groupshared reduction per 8x8
+// tile (GVoxelMarchGroupHit); a second reduction over the hit's device z would
+// hand VoxelMarchEmitVS a TRUE per-tile bound to emit in place of the literal
+// 0.5f, and both pixel shaders could then declare conservative depth honestly.
+// The plumbing is real work but it is ordinary work.
+//
+// DO NOT DO IT. Not because the bound cannot be made true -- it can -- but
+// because a true bound would reject NOTHING. This is an argument about what
+// CAN happen, from the code, not a measurement, and it is stated that way so
+// it can be attacked on its own terms.
+//
+// FIRST, THE DIRECTION, because the flag names actively mislead here and this
+// is the step a reader gets backwards. Both raster passes run
+// CF_DepthNearOrEqual (VoxelMarchRenderer.cpp:4929 for the depth pre-emit,
+// :5783 for the emit). In UE 5.8 that no longer resolves by platform:
+// RHIDefinitions.h:402 reads `CF_DepthNearOrEqual = CF_GreaterEqual` flat, and
+// :286-289 reads `FarPlane = 0, NearPlane = 1`. So this is reverse-Z, NEARER
+// IS LARGER device z, and the hardware test passes when the shader's z is
+// >= the stored z.
+//
+// To reject a pixel before the shader runs, the hardware must be able to prove
+// that test FAILS, which needs an UPPER bound on what the shader can write.
+// That is SV_DepthLessEqual, and the per-tile reduction it wants is the MAX of
+// device z -- the NEAREST hit in the tile -- not the min. "LessEqual" is the
+// correct flag here precisely BECAUSE the comparison is GreaterEqual.
+// SV_DepthGreaterEqual bounds from below and a lower bound cannot prove a
+// >= test fails, so it buys no early-Z at all on this pass.
+//
+// NOW ASK WHAT THAT UPPER BOUND COULD EVER REJECT.
+//
+//   DEPTH PRE-EMIT. Every ray is clipped to the prepass depth before it walks
+//   -- `TMax = min(TMax, SceneTUU)` in VoxelMarchMain, then TOut = TMax minus
+//   an inset. So a pixel can only carry a hit when that hit is NEARER than
+//   whatever the prepass already drew there: a tree, a character, Nanite. A
+//   hit pixel's device z is therefore strictly greater than the stored z, the
+//   tile's max is >= that, and the bound is >= stored on every hit pixel. The
+//   hardware can never prove failure. Rejections: zero.
+//
+//   And the tile that IS entirely behind a tree has no hits at all -- it never
+//   sets MarchOutTileHit, VoxelMarchCompactTilesMain never lists it, and it is
+//   never rasterised. THE OCCLUSION EARLY-Z WOULD DO IS ALREADY DONE: by the
+//   t_max clamp, at per-pixel granularity, one pass earlier, for free. That is
+//   what the prepass read is FOR, and it is easy to forget it is there when
+//   reasoning about the raster half in isolation.
+//
+//   EMIT. Stronger still. By emit time SceneDepth holds, on exactly the hit
+//   pixels, the number VoxelMarchDepthOnlyPS wrote -- deliberately the same
+//   arithmetic, see the note on that shader. Stored == the value this shader
+//   is about to output. An upper bound over the tile is >= that by
+//   construction. Rejections: zero, provably rather than probably.
+//
+// What is left is the non-hit pixels inside a hit tile, and they already leave
+// on a `discard` after one Load and an unpack -- before the chunk lookup,
+// before the GI probes, before the palette and the AO. At the poses this
+// project measures they are a low single-digit percentage: mode=scene legs run
+// drawn=21,120 of 21,340 tiles, and the march hits 98.8% of pixels at the pose
+// recorded in VoxelMarchEmitPS below. Removing a Load and a discard from ~1%
+// of the pixels of a pass whose ENTIRE measured cost is emitMs = 0.12-0.29 ms
+// (Saved/*.log, mode=scene, dozens of legs; 0.04-0.08 ms in mode 2) is not
+// worth the failure mode that comes with it.
+//
+// AND THE FAILURE MODE IS THE WORST KIND THIS RENDERER HAS. A conservative
+// depth promise that is false is not a wrong colour; it is terrain the
+// hardware deletes, silently, with no error anywhere. If anyone does reopen
+// this, THE FALSIFIER IS: voxel.March.VerifyDepth must show culled terrain as
+// a rise in `miss` on the marcher side with the raster side unchanged, and a
+// pinned-pose A/B capture must be PIXEL-IDENTICAL. Any tile that vanishes
+// means the bound was not a true bound over every hit pixel in its tile -- the
+// standard cause being a reduction read before its
+// GroupMemoryBarrierWithGroupSync, i.e. pixels whose hit landed after the
+// barrier and were never folded into the max.
+//
+// WHAT WOULD REOPEN IT, PRECISELY. Not "early-Z would be nice". A MEASURED
+// HTILE BILL. The 0.2-0.4 ms in docs/ray-marching-plan-2026-08-19.md:932 is a
+// BUDGET LINE and has never been a reading: voxel.March.HTileProbe has not
+// been set to 1 on a single leg in Saved/ -- grep it. Measure it first (probe
+// 1 vs 0, mode 2, same pose, read the FRAME time, not emitMs).
+//
+// Then note, before spending anything on the reading: the two halves of that
+// bill want OPPOSITE promises. An UPPER bound (LessEqual) is what would buy
+// early-Z on this pass; keeping a downstream HiZ range usable under reverse-Z
+// wants the LOWER bound (GreaterEqual) instead, because what a later opaque
+// draw rejects against is the tile's surviving z-min. One flag cannot be both.
+// And neither of them restores plane-equation depth compression, which
+// per-pixel shader depth breaks whatever flag is declared. So a nonzero probe
+// reading is the START of that argument and not the end of it.
 //   * no blending. Every channel written here REPLACES what the base pass put
 //     there; a blend on a GBuffer is not a softer surface, it is a corrupt one.
 
@@ -575,6 +671,15 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				// force: absent crossings can only happen inside ring
 				// segments, which end at the cascade's outer radius.
 				InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RAYS], 1u);
+				// THE FALLTHROUGH LADDER. Guarded on Considered rather than added
+				// unconditionally: a ray that was never offered a rung contributes
+				// nothing, so the common ray pays no atomics at all and the
+				// denominator holds only decisions that were actually made.
+				if (H.FallthroughConsidered != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_FT_CONSIDERED], H.FallthroughConsidered);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_FT_TAKEN], H.FallthroughTaken);
+				}
 				if (H.bHit)
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HITS], 1u);
@@ -762,6 +867,11 @@ struct FVoxelMarchEmitInterp
 // mid-range depth, and it is IRRELEVANT: the pixel shader writes SV_Depth, so
 // the interpolated value is never the one tested. It is stated here because a
 // reader will otherwise assume it is load-bearing and try to make it correct.
+//
+// THIS IS THE LITERAL THE CONSERVATIVE-DEPTH IDEA WANTS TO REPLACE with a
+// per-tile bound reduced in VoxelMarchMain. It would work; it would buy
+// nothing. See CONSERVATIVE DEPTH: THE PRIZE IS STRUCTURALLY ZERO at the top
+// of this file for the argument and for the one measurement that reopens it.
 void VoxelMarchEmitVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID,
                       out FVoxelMarchEmitInterp Out)
 {
@@ -890,10 +1000,34 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
                       // will only ever push the surface FURTHER than the
                       // rasterised quad's depth. The quad is emitted at a fixed
                       // clip z that has nothing to do with the terrain, so the
-                      // promise would be false roughly half the time and the
-                      // hardware would cull real surface. The early-Z loss is
-                      // the cost item (c) budgets and the indirect hit-tile
-                      // dispatch confines.
+                      // promise is not one this shader is entitled to make and
+                      // the hardware would be free to cull real surface.
+                      //
+                      // ONE CORRECTION, because the number that used to be here
+                      // was wrong in the flattering direction and a reader who
+                      // checks it will discount the rest of this note. It said
+                      // the promise "would be false roughly half the time". It
+                      // would not. With the default 10 uu near plane and a
+                      // reversed infinite-far projection, device z = Near/ViewZ,
+                      // so z = 0.5 is reached only at 20 cm from the camera and
+                      // ALL ordinary terrain sits far below it -- the promise
+                      // would hold almost always. It is still not safe: a voxel
+                      // camera clipping into the ground is a normal event, not
+                      // an edge case, and "almost always true" is exactly the
+                      // shape of a promise that deletes terrain at the one pose
+                      // nobody screenshots.
+                      //
+                      // The conclusion is unchanged and the REASON is now a
+                      // different, stronger one: even a per-tile bound that is
+                      // always true would reject zero pixels here. See
+                      // CONSERVATIVE DEPTH: THE PRIZE IS STRUCTURALLY ZERO at
+                      // the top of this file -- the short form is that the
+                      // t_max clamp against the prepass depth has already done
+                      // that culling, per pixel, before any quad exists, and
+                      // that by emit time SceneDepth already holds this
+                      // shader's own output on every hit pixel. The early-Z
+                      // loss is the cost item (c) budgets and the indirect
+                      // hit-tile dispatch confines.
                       out float OutDepth : SV_Depth)
 {
 	// RESOLVE THE VIEW FIRST, AND THIS LINE IS THE WHOLE REASON MODE 1 DREW

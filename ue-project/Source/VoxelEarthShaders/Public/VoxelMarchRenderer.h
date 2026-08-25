@@ -384,6 +384,30 @@ namespace VoxelMarchHoleWord
 		// stationary world. Written only by the level-2 permutation, and it is
 		// the denominator the attributed identity is checked against.
 		UncoveredShell,
+		// THE FALLTHROUGH LADDER, considered vs taken, added 2026-08-25 with the
+		// shell gate (VoxelBrickTraverse.ush's VOXEL_MARCH_FALLTHROUGH_SHELL).
+		//
+		// WHY BOTH, AND WHY NEITHER ALONE WILL DO. `substituted` already counts
+		// retries that WON A HIT -- it is a numerator with no denominator, so a
+		// change that halves the retries and a change that halves their hit rate
+		// read identically through it. Considered is every rung the ladder was
+		// offered; Taken is every rung it actually walked. Taken/Considered is the
+		// retry rate, and it is the ONLY reading that can show the shell gate is
+		// doing something rather than merely compiled in.
+		//
+		// PLACED HERE, between UncoveredShell and the level words, and the reason
+		// is worth stating because I checked it rather than assuming: this enum has
+		// NO static_assert pinning its indices. The coupling that actually matters
+		// is that the shader indexes the same buffer by the same enum and the CPU
+		// reads it back by name (Src[VoxelMarchHoleWord::...] in
+		// VoxelMarchRenderer.cpp), so inserting a member RENUMBERS every word after
+		// it on BOTH sides at once and stays consistent -- but ONLY if the shader
+		// is recompiled against the new header. A stale shader cache here reads the
+		// wrong word and reports plausible nonsense, which is worse than a crash.
+		// If you insert here, force a shader recompile and check one known-good
+		// counter before trusting any of them.
+		FallthroughConsidered,
+		FallthroughTaken,
 		// SEVEN level words (kNumLevels -- the 8 km ring took the seventh on
 		// 2026-08-23) and four reason words, both written ONLY by the level-2
 		// permutation. Every attributed ray adds exactly one word from each
@@ -423,6 +447,13 @@ struct FVoxelMarchHoleStats
 	uint64 Hits = 0;
 	uint64 Substituted = 0;
 	uint64 Uncovered = 0;
+	// The fallthrough ladder. Taken/Considered is the retry RATE -- the only
+	// reading that separates "the shell gate cut the retries" from "the shell
+	// gate is compiled in and inert". Substituted alone cannot: it counts
+	// retries that WON, so a halved retry count and a halved win rate look
+	// identical through it.
+	uint64 FallthroughConsidered = 0;
+	uint64 FallthroughTaken = 0;
 	uint64 Frames = 0;   // readbacks landed in the window
 	bool bArmed = false; // voxel.March.HoleStats was on when asked
 

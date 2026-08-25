@@ -2883,6 +2883,13 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchHoleWord::Substituted));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNCOVERED"),
 		                         int32(VoxelMarchHoleWord::Uncovered));
+		// The fallthrough ladder, so the shader can name the two words the CPU
+		// reads back. Without these the counters compile to nothing and the
+		// shell gate is unprovable -- see FallthroughConsidered in the header.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_FT_CONSIDERED"),
+		                         int32(VoxelMarchHoleWord::FallthroughConsidered));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_FT_TAKEN"),
+		                         int32(VoxelMarchHoleWord::FallthroughTaken));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNCOVERED_SHELL"),
 		                         int32(VoxelMarchHoleWord::UncoveredShell));
 		// THE LEVEL-GROUP SIZE, PUSHED RATHER THAN WRITTEN. The kernel's
@@ -3733,6 +3740,12 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			// Read regardless of level (the buffer always has Count words),
 			// folded in only for level-2 frames below.
 			const uint32 UncoveredShell = Src[VoxelMarchHoleWord::UncoveredShell];
+			// The fallthrough ladder. Read on EVERY frame, not only level-2 ones:
+			// unlike the shell/level/reason breakdown these are written by the plain
+			// kernel too, so folding them in below the level-2 gate would divide a
+			// full-rate numerator by a level-2 denominator and under-report the rate.
+			const uint32 FtConsidered = Src[VoxelMarchHoleWord::FallthroughConsidered];
+			const uint32 FtTaken = Src[VoxelMarchHoleWord::FallthroughTaken];
 			uint32 ByLevel[VoxelMarchHoleWord::kNumLevels];
 			uint32 ByReason[VoxelMarchHoleWord::kNumReasons];
 			for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
@@ -3749,6 +3762,8 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.Hits += Hits;
 			State->HoleWindow.Substituted += Substituted;
 			State->HoleWindow.Uncovered += Uncovered;
+			State->HoleWindow.FallthroughConsidered += FtConsidered;
+			State->HoleWindow.FallthroughTaken += FtTaken;
 			State->HoleWindow.Frames++;
 			if (Slot.ArmLevel >= 2)
 			{

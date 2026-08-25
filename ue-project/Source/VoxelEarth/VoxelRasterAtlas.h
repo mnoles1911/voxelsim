@@ -187,6 +187,15 @@ public:
 	//      them into the delta and flips the mirror. This REMOVES the term
 	//      rather than reducing it -- and it carries a hazard the other modes
 	//      do not; see AsyncFillTasks() in the .cpp before arming it.
+	//      STILL OFF BY DEFAULT. As of 2026-08-24 the hazard is GUARDED rather
+	//      than merely described: -VoxelGpuRasterAtlasFillSafety=1 (default)
+	//      hands a worker only pages whose fine tiles are inside the streamer's
+	//      pinned ring, and drains every worker when the anchor crosses a tile.
+	//      Read AsyncSafetyMode() in the .cpp for the four-step proof, the two
+	//      switches a mode-3 leg needs (-VoxelFineTileRingRadius=1 is one of
+	//      them, and without it mode 3 measures mode 2), and the six-line
+	//      change in VoxelFineTileStreamer that would make the whole ring
+	//      requirement unnecessary.
 	//
 	// THE REGISTERED DISPROOF, written before any of it was measured: mode 3
 	// must move `[raster-atlas] window: ... ms GT` to ~0 (with `asyncPages` > 0
@@ -318,8 +327,33 @@ private:
 
 	// --- mode 3 -------------------------------------------------------------
 	void HarvestAsyncSlots();
-	void LaunchAsyncSlots(vxc::ITileSampler& Tiles, int64 AnchorPxX, int64 AnchorPxY);
+	// Fills as many slots as the sweep can feed. Pages the SAFETY ADMISSION
+	// refuses (see AsyncSafetyMode() in the .cpp) are appended to OutDeferred
+	// instead of being launched -- they are NOT dropped: the caller fills them
+	// synchronously in the same tick, which is why refusing is only ever a cost
+	// and never a correctness question.
+	void LaunchAsyncSlots(vxc::ITileSampler& Tiles, int64 AnchorPxX, int64 AnchorPxY,
+	                      TArray<FPagePt>& OutDeferred);
 	void WaitForAsyncSlots();
+
+	// Is this page safe to hand to a worker? True when the safety mode is off,
+	// or when the sampler cannot reach the fine tier's fatal gate at all;
+	// otherwise true only when every fine tile the page can touch is inside the
+	// streamer's pinned ring with one tile of margin. THE WHOLE ARGUMENT is at
+	// AsyncSafetyMode() in the .cpp -- this is only the arithmetic.
+	bool IsPageAsyncSafe(int64 PageX, int64 PageY) const;
+	bool AnyAsyncSlotBusy() const;
+	// THE BARRIER (step 4 of the proof). Waits out every busy slot and HARVESTS
+	// it -- the pages are correct, because everything a worker sampled it
+	// sampled while its tiles were still pinned, so discarding them would cost
+	// the warmup for nothing. Distinct from WaitForAsyncSlots, which throws the
+	// work away because it is used when the sampler itself is no longer
+	// trusted.
+	void DrainAsyncSlots();
+	// The synchronous half of mode 3: fill, under the ordinary per-tick budget,
+	// the pages the admission test refused. Nearest-first order is preserved
+	// because the list comes off the one sweep in the order it produced them.
+	void FillDeferredPagesSync(vxc::ITileSampler& Tiles, const TArray<FPagePt>& Pages);
 
 	// Game thread. Turns a worker-counted audit mismatch into the one log line
 	// and the one latch. Workers only COUNT; this decides.
@@ -392,6 +426,45 @@ private:
 	uint64 AsyncPagesHarvested = 0;
 	uint64 AsyncLaunches = 0;
 	uint64 PrimeCalls = 0;
+
+	// --- PROOF OF TRAFFIC FOR THE SAFETY PATH -------------------------------
+	//
+	// EIGHT SWITCHES IN THIS REPO TURNED OUT TO BE INERT WHILE LOOKING ARMED in
+	// a single night, so a safety path that has never been observed to fire is
+	// not a safety path, it is a comment. These are what make "zero" readable.
+	//
+	// THE COUNTER PROVES ITSELF, and that is the point of having two of them
+	// rather than one: on any fine-tier leg with mode 3 armed, the DEFAULT ring
+	// radius (0) admits nothing, so the leg MUST print declinedUnpinned > 0 and
+	// asyncPages == 0. Re-run it with -VoxelFineTileRingRadius=1 and the two
+	// must swap: asyncPages > 0 and declinedUnpinned falling to the pages that
+	// genuinely straddle the ring edge. A pair that does not move between those
+	// two legs is a dead counter, and neither reading can be confused with "the
+	// feature never ran" -- which is exactly the confusion that made the other
+	// eight look armed.
+	//
+	// AND THE ONE THAT MUST STAY SMALL: drains are the barrier's own cost, on
+	// the GAME THREAD. They are counted AND timed, because a safety path whose
+	// bill is never printed is how a tail regression gets shipped as a fix.
+	uint64 AsyncDeclinedUnpinned = 0;
+	uint64 AsyncDeclinedUnpinnedLifetime = 0;
+	uint64 AsyncSyncFallbackPages = 0;
+	uint64 AsyncDrains = 0;
+	uint64 AsyncDrainsLifetime = 0;
+	uint64 AsyncDrainCycles = 0;
+
+	// Latched on the first mode-3 tick: does the sampler we were handed have a
+	// path a WORKER can take into ReportGateLeak_Locked? See
+	// SamplerCanLeakOnWorker in the .cpp -- it is a fail-closed test by pitch,
+	// because this module is compiled without RTTI.
+	bool bAsyncSafetyLatched = false;
+	bool bAsyncSamplerCanLeak = false;
+	// The anchor's COARSE tile at the moment the busy slots were launched. The
+	// invariant every busy slot depends on: because the barrier fires the tick
+	// this changes, all busy slots were always launched under the value stored
+	// here, so one pair suffices for all of them.
+	int32 InFlightAnchorTileX = MIN_int32;
+	int32 InFlightAnchorTileY = MIN_int32;
 	// THE OTHER HALF OF THE GAME-THREAD RASTER COST, and it was never split.
 	//
 	// The submit path's `raster` bucket (VoxelWorldSubsystem's SubT3 - SubT2)

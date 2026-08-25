@@ -12374,12 +12374,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			UE_LOG(LogVoxelPerf, Log,
 			       TEXT("Voxel march holes (window): uncovered=%llu (%.4f%% of rays) ")
 			       TEXT("substituted=%llu (%.4f%% of hits) | rays=%llu hits=%llu ")
+			       // THE FALLTHROUGH RATE, and it is the proof-of-traffic for the
+			       // shell gate (VOXEL_MARCH_FALLTHROUGH_SHELL). taken/considered
+			       // must FALL between the arms or the gate is compiled in and
+			       // inert -- which is the failure mode eight switches in this
+			       // repo turned out to have on 2026-08-24/25. considered=0 means
+			       // the ladder was never offered a rung and the leg proves
+			       // nothing either way; it is NOT the same reading as taken=0.
+			       TEXT("| fallthrough taken=%llu/%llu (%.2f%%) ")
 			       TEXT("framesMeasured=%llu"),
 			       (unsigned long long)H.Uncovered,
 			       Rays > 0.0 ? 100.0 * double(H.Uncovered) / Rays : 0.0,
 			       (unsigned long long)H.Substituted,
 			       Hits > 0.0 ? 100.0 * double(H.Substituted) / Hits : 0.0,
 			       (unsigned long long)H.Rays, (unsigned long long)H.Hits,
+			       (unsigned long long)H.FallthroughTaken,
+			       (unsigned long long)H.FallthroughConsidered,
+			       H.FallthroughConsidered > 0
+			           ? 100.0 * double(H.FallthroughTaken) / double(H.FallthroughConsidered)
+			           : 0.0,
 			       (unsigned long long)H.Frames);
 
 			// Mirror for the streaming HUD's legacy row (registered by

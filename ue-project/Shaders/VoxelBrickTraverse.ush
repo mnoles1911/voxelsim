@@ -507,6 +507,88 @@
 #define VOXEL_MARCH_FALLTHROUGH 0
 #endif
 
+// ---------------------------------------------------------------------------
+// WHICH ABSENCE OPENS THE LADDER -- VOXEL_MARCH_FALLTHROUGH_SHELL (2026-08-24)
+// ---------------------------------------------------------------------------
+//
+//   1 (default) the retry gate is bCrossedShellAbsent: a GAP IN GROUND THE
+//               STREAMING SYSTEM HOLDS.
+//   0           the retry gate is bCrossedAbsentChunk: anything not resident,
+//               AIR INCLUDED. THE CONTROL ARM, and it is the gate that shipped
+//               before this date, compiled with none of the shell machinery in
+//               the binary (see VOXEL_MARCH_TRACK_SHELL).
+//
+// WHY THE GATE MOVED. bCrossedAbsentChunk answers "did this ray cross anything
+// absent", and for a sky ray the answer is YES. The streamed set is a thin
+// shell around the surface -- about 4.4 chunks per column at level 0 -- the
+// sky-band trim leaves everything above the terrain legitimately non-resident,
+// and ring segment 0 starts AT THE CAMERA, so the first absent chunk on
+// essentially every ray is the air the camera is sitting in. The old gate's own
+// comment admitted the consequence in one line ("sky rays DO take the retries")
+// and then priced it as a cost ceiling. It is worse than a cost: a retry that
+// succeeds at the coarser level puts COARSE ROCK WHERE THE FINE LEVEL PROVED
+// AIR, which is the regression the "non-resident, never invalid" rule exists to
+// prevent, arriving through the other door.
+//
+// THE POPULATION IS A READING, NOT AN ARGUMENT. This file's own note on
+// bAnyShellAbsent (at :3186 before this edit, quoting
+// Saved/capture-zcut-alt120.log) records the old flag firing on 25.27% of rays
+// on a SETTLED STATIONARY world. Near-horizon rays enter every ring, so the
+// doubled population is the expensive TAIL rather than the average -- and the
+// frame-rate gate in force is a 1%-low gate, i.e. the tail is the thing being
+// graded. NO NUMBER IS CLAIMED HERE; the leg has not been run.
+//
+// THE MACHINERY IS NOT NEW. VoxelMarchAbsentTouchesShell already separates a
+// gap in held ground from air nobody holds, with six index loads, an early-out
+// and the Z probes first; it was already trusted enough to be the trigger for
+// the entire level-2 breakdown. All that changes is WHEN it is compiled
+// (VOXEL_MARCH_TRACK_SHELL) and WHO reads it.
+//
+// WHAT WOULD REFUTE THIS, written down before any leg runs, because a gate that
+// can only come out one way is the mistake this file has paid for most often:
+//
+//   * `uncShell` MUST NOT RISE. It counts misses that crossed a gap in ground
+//     the streaming system holds. If narrowing the retry gate makes it rise,
+//     the shell test is REJECTING REAL GAPS -- fills the owner could see are
+//     being dropped -- and this change is WRONG, not merely cheaper.
+//   * `substituted` must stay near its parked value. It counts hits won by a
+//     coarser walk and parks near zero on a settled world. `substituted`
+//     collapsing while `uncShell` HOLDS is the change working: the
+//     substitutions it removed were sky and camera-column air. `substituted`
+//     collapsing while `uncShell` RISES is the change removing real fills.
+//   * `uncovered` collapsing while `uncShell` holds is the intended reading --
+//     the air population leaves the metric and the holes stay counted.
+//   * FVoxelMarchHit.FallthroughTaken / FallthroughConsidered -- the retry rate
+//     -- MUST FALL between the arms. If it does not move, the switch is inert,
+//     seven switches in this repo were inert while looking armed this week, and
+//     no frame-time reading taken off it means anything.
+//
+// THE KNOWN RESIDUAL, stated because a bounded change that hides its bound is
+// how this file earns its next retraction: a level-L gap whose whole
+// neighbourhood is also absent at level L -- a cold start, or flight far ahead
+// of streaming -- touches no shell, so it gets NO retry where the old gate gave
+// it one. The near face of such a region still touches the shell whenever any
+// level-L chunk around it is resident, which is the common case; a region with
+// no resident level-L chunk anywhere near it is the uncommon one, and
+// MarchIndexLevelPopulated already short-circuits the degenerate version of it
+// (a level that streams nothing at all). If that residual is real it shows up as
+// `uncShell` RISING, which is the falsifier above and not a separate one.
+//
+// A PERMUTATION, NOT A RUNTIME BRANCH, for the reason VOXEL_MARCH_SKIP_LEVELS
+// records above: `if (bShellGate) ...` would leave the other arm's six index
+// loads in the binary, and the control would pay for memory traffic it never
+// reads -- which flatters whichever arm is called the control.
+//
+// HOW THE CONTROL ARM IS ARMED. This is #ifndef-guarded, so it can be pushed
+// from ModifyCompilationEnvironment (SetDefine) or ridden as a permutation
+// dimension exactly as VOXEL_MARCH_FALLTHROUGH is, with no edit here. Until such
+// a dimension exists, flipping the 1 below to 0 and recompiling the shaders IS
+// the control leg -- and both legs must be compiled separately, never one binary
+// asked to behave two ways.
+#ifndef VOXEL_MARCH_FALLTHROUGH_SHELL
+#define VOXEL_MARCH_FALLTHROUGH_SHELL 1
+#endif
+
 // THE HOLE METRIC (voxel.March.HoleStats). Counts, per frame, on the shipping
 // kernel: rays marched, rays that hit, hits that came from a level COARSER
 // than the segment that owns that ground (`substituted`), and misses that
@@ -580,6 +662,19 @@
 #define VOXEL_MARCH_MISS_UNATTRIBUTED  3u
 
 #define VOXEL_MARCH_TRACK_ABSENT (VOXEL_MARCH_FALLTHROUGH > 0 || VOXEL_MARCH_HOLE_STATS)
+
+// WHO NEEDS THE SHELL TEST, and since 2026-08-24 it is no longer only the
+// instrument: the level-2 breakdown triggers on it AND the retry ladder gates
+// on it whenever VOXEL_MARCH_FALLTHROUGH_SHELL is on.
+//
+// SPELLED AS ITS OWN CONDITION rather than folded into VOXEL_MARCH_TRACK_ABSENT,
+// which would have been one token shorter and wrong: TRACK_ABSENT is also true
+// for the shell-gate CONTROL arm (fallthrough on, shell gate off) and for
+// hole-stats level 1, and compiling up to six index loads per absent chunk into
+// arms that never read the answer would leave dead loads in the control's
+// binary -- the precise way VoxelMarchSpike.usf's note says an A/B gets
+// flattered. Every site guarded by this compiles only where something reads it.
+#define VOXEL_MARCH_TRACK_SHELL (VOXEL_MARCH_HOLE_STATS >= 2 || (VOXEL_MARCH_FALLTHROUGH > 0 && VOXEL_MARCH_FALLTHROUGH_SHELL))
 
 #define VOXEL_MARCH_HAS_OCCUPANCY 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY || VOXEL_MARCH_VERIFY_SOURCE)
 #define VOXEL_MARCH_HAS_BRICKPOOL 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_BRICKPOOL || VOXEL_MARCH_VERIFY_SOURCE)
@@ -886,24 +981,36 @@ struct FVoxelMarchHit
 	bool bSubstituted;
 #if VOXEL_MARCH_HOLE_STATS >= 2
 	// THE FIRST absent crossing's classification (VOXEL_MARCH_MISS_*), set by
-	// the walk at the moment it first flips bCrossedAbsentChunk and never
+	// the walk at the moment it first flips bCrossedShellAbsent and never
 	// overwritten -- the first crossing is the nearest one, i.e. the ground
 	// the owner's eye lands on, and averaging reasons across a ray would
 	// launder three different failures into one number, which is the exact
 	// mistake the level-2 metric exists to undo. Read from the SAME index
 	// load the residency test paid for (FVoxelMarchChunkCache.AbsentReason),
 	// so this costs registers, not bandwidth. Meaningful only while
-	// bCrossedAbsentChunk is true.
+	// bCrossedShellAbsent is true.
 	uint FirstAbsentReason;
-	// THE FLAG THE BREAKDOWN ACTUALLY TRIGGERS ON, and it is deliberately NOT
-	// bCrossedAbsentChunk. That one has a second owner -- the fallthrough gate
-	// -- and must keep firing on every non-resident chunk or the retry ladder
-	// changes shape; it is also the flag whose "absent means air" contamination
-	// pinned byLevel to L0 in all three zcut rungs. This one fires only where
-	// the absent chunk touches the resident shell (see
-	// VoxelMarchAbsentTouchesShell). Two flags, two owners, and the shipping
-	// arm's gate is untouched.
+#endif
+#if VOXEL_MARCH_TRACK_SHELL
+	// THE FLAG THE BREAKDOWN TRIGGERS ON -- AND, SINCE 2026-08-24, THE FLAG THE
+	// RETRY LADDER GATES ON. It fires only where an absent chunk is
+	// FACE-ADJACENT to a resident one (see VoxelMarchAbsentTouchesShell), i.e.
+	// on a GAP IN GROUND THE STREAMING SYSTEM HOLDS.
+	//
+	// IT USED TO BE DELIBERATELY NOT THE GATE, and the reason recorded here was
+	// "bCrossedAbsentChunk must keep firing on every non-resident chunk or the
+	// retry ladder changes shape". Changing the ladder's shape is now the POINT.
+	// bCrossedAbsentChunk fires on air as readily as on holes -- the same
+	// "absent means air" contamination that pinned byLevel to L0 in all three
+	// zcut rungs -- so gating on it made every sky ray, and every ray through
+	// the camera's own air column, re-walk its segments for nothing, and let a
+	// coarser walk answer with rock where the fine walk had proved air. Two
+	// flags, still two meanings; WHICH ONE THE LADDER READS is now a permutation
+	// (VOXEL_MARCH_FALLTHROUGH_SHELL) so both can be measured against each other
+	// instead of argued about.
 	bool bCrossedShellAbsent;
+#endif
+#if VOXEL_MARCH_HOLE_STATS >= 2
 	// WHICH ring level's segment owned the ground at that first crossing --
 	// the level the ray WANTED, not whatever level a fallthrough retry was
 	// walking. Set by the ring loop (only it knows SegL) on the returned MISS;
@@ -914,6 +1021,22 @@ struct FVoxelMarchHit
 	// sum(byLevel) < uncovered in the printed identity check, i.e. as an
 	// instrument defect, which is what it would be.
 	uint AbsentLevel;
+#endif
+#if VOXEL_MARCH_HOLE_STATS
+	// THE ENGAGEMENT PAIR -- "was a retry CONSIDERED" against "was a retry
+	// TAKEN", summed over the ray's ladder rungs rather than reduced to a bit.
+	// The kernel divides them: Taken / Considered IS THE RETRY RATE, the number
+	// that must FALL when VOXEL_MARCH_FALLTHROUGH_SHELL narrows the gate, and
+	// the only reading that can show the switch is not inert. Structurally zero
+	// with VOXEL_MARCH_FALLTHROUGH 0 -- there is no ladder to consider -- in
+	// exactly the way bSubstituted is, and for the same reason.
+	//
+	// GUARDED BY VOXEL_MARCH_HOLE_STATS AND NOT BY THE FALLTHROUGH DEPTH: the
+	// counting kernel is compiled once per hole-stats permutation and has to be
+	// able to name these fields on the fallthrough-0 arm too, where they read a
+	// real, measured zero rather than failing to compile.
+	uint FallthroughConsidered;
+	uint FallthroughTaken;
 #endif
 #endif
 	uint2 FineBrickMask;
@@ -1345,7 +1468,7 @@ uint MarchCoverIndexGrid;
 // for a reach the grid cannot address.
 float MarchCoverReachUU;
 
-#if VOXEL_MARCH_HOLE_STATS >= 2
+#if VOXEL_MARCH_TRACK_SHELL
 // WHICH GRID SLOTS HOLD ANYTHING AT ALL, one bit per slot (bit S set => slot S
 // has at least one resident chunk this frame). Filled from
 // FVoxelMarchChunkIndex::GetNumEntriesAtLevel in VoxelMarchBindPool.
@@ -1360,7 +1483,11 @@ float MarchCoverReachUU;
 // "every absent chunk here is a hole", which is the literal truth for a level
 // that streams nothing.
 //
-// Level 2 only: the shipping kernel neither declares nor reads it.
+// Declared wherever the shell test is compiled (VOXEL_MARCH_TRACK_SHELL): the
+// level-2 instrument, and -- since 2026-08-24 -- the fallthrough arm whose retry
+// gate reads the shell answer. The C++ side already fills it ON EVERY ARM (see
+// the note directly above), so widening the shader-side guard binds nothing new
+// and cannot read a stale or unset uniform.
 uint MarchIndexLevelPopulated;
 #endif
 
@@ -1496,13 +1623,16 @@ struct FVoxelMarchChunkCache
 	// tag comparison itself). Costs one register on the level-2 permutation
 	// and nothing anywhere else. Meaningful only while bResident is false.
 	uint AbsentReason;
+#endif
+#if VOXEL_MARCH_TRACK_SHELL
 	// Whether this chunk's absence is a GAP IN THE SHELL rather than plain air
 	// -- see VoxelMarchAbsentTouchesShell for the captures that made this the
-	// gate on the whole level-2 breakdown. Computed here, in the one place
-	// that holds both the entry and the coordinate asked for, for the same
-	// reason AbsentReason is. Meaningful only while bResident is false.
+	// gate on the whole level-2 breakdown, and, since 2026-08-24, the gate on
+	// the retry ladder itself. Computed in the one place that holds both the
+	// entry and the coordinate asked for, for the same reason AbsentReason is.
+	// Meaningful only while bResident is false.
 	bool bAbsentTouchesShell;
-#endif // VOXEL_MARCH_HOLE_STATS >= 2
+#endif
 #endif
 	uint BrickBase;     // first descriptor slot
 	uint2 BrickSolid;   // the 64-bit L1 mask, lo/hi
@@ -1530,9 +1660,13 @@ FVoxelMarchChunkCache VoxelMarchNoChunk()
 	// NEVER: NEVER is a claim about the streaming system and this constructor
 	// has not consulted it. The lookup overwrites this on every real path.
 	C.AbsentReason = VOXEL_MARCH_MISS_UNATTRIBUTED;
+#endif
+#if VOXEL_MARCH_TRACK_SHELL
 	// A cache nobody looked up has touched no shell either. FALSE, so an
 	// unconsulted cache can never be attributed -- the same refusal as the
-	// UNATTRIBUTED above, one step earlier.
+	// UNATTRIBUTED above, one step earlier -- and, since the retry ladder gates
+	// on this flag, so that an unconsulted cache can never OPEN THE LADDER
+	// either. False is the conservative answer to both questions at once.
 	C.bAbsentTouchesShell = false;
 #endif
 #endif
@@ -1566,7 +1700,7 @@ uint VoxelMarchIndexCell(int3 ChunkCoord)
 	                                  MarchIndexCellsPerLevel, GVoxelMarchIndexGrid);
 }
 
-#if VOXEL_MARCH_HOLE_STATS >= 2
+#if VOXEL_MARCH_TRACK_SHELL
 // ---------------------------------------------------------------------------
 // IS THIS ABSENT CHUNK A HOLE, OR IS IT JUST AIR? (2026-08-23)
 // ---------------------------------------------------------------------------
@@ -1614,9 +1748,15 @@ uint VoxelMarchIndexCell(int3 ChunkCoord)
 // by the near-surface grazing band; the old rule's contamination was the whole
 // 25.27% of rays the 120 m rung read as uncovered.
 //
-// COST IS ON THE DIAGNOSTIC PERMUTATION ONLY. voxel.March.HoleStats 2 is a
-// separate permutation from the shipping kernel; nothing below is compiled
-// into a leg that does not arm it, so the control arm stays byte-identical.
+// WHO PAYS FOR IT, and that answer changed on 2026-08-24. It used to be the
+// diagnostic permutation alone (voxel.March.HoleStats 2). Now the retry ladder
+// gates on this answer, so VOXEL_MARCH_TRACK_SHELL also compiles it into the
+// fallthrough arm -- but ONLY while VOXEL_MARCH_FALLTHROUGH_SHELL is on, so the
+// shell-gate CONTROL arm (fallthrough on, shell gate off) still gets a binary
+// with none of this in it. That is the whole reason the gate is a permutation
+// and not a runtime branch: a control that carries the other arm's loads
+// flatters the arm under test, which VoxelMarchSpike.usf paid three legs to
+// learn.
 bool VoxelMarchAbsentTouchesShell(int3 ChunkCoord)
 {
 	// A slot that streams NOTHING has no shell to touch, and the honest answer
@@ -1653,7 +1793,9 @@ bool VoxelMarchAbsentTouchesShell(int3 ChunkCoord)
 	     VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u) { return true; }
 	return false;
 }
+#endif // VOXEL_MARCH_TRACK_SHELL
 
+#if VOXEL_MARCH_HOLE_STATS >= 2
 // (raw index entry, wanted coord) -> VOXEL_MARCH_MISS_* bucket. Called on
 // every lookup under the level-2 permutation and stored on the cache, because
 // the walk that later discovers "this ray crossed absent ground" no longer has
@@ -1708,6 +1850,8 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// AbsentReason unread. One classify against five return sites is cheaper
 	// to prove correct than five classifies.
 	C.AbsentReason = VoxelMarchClassifyAbsent(Entry, ChunkCoord);
+#endif
+#if VOXEL_MARCH_TRACK_SHELL
 	// SKIPPED WHOLE ON THE RESIDENT PATH, and the skip is also the correct
 	// answer there: a cell the index calls resident IS the shell, so a chunk
 	// whose record later fails validation still reaches the breakdown and lands
@@ -1716,6 +1860,21 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// have quietly deleted it. Non-resident cells pay the probe (six loads
 	// worst case, one in a healthy shell); resident ones pay nothing, which is
 	// what keeps the hot path off it.
+	//
+	// THIS PROBE IS NOW ON THE SHIPPING FALLTHROUGH ARM, not only on the level-2
+	// instrument, and that is a cost deliberately added in one place to remove a
+	// larger one in another: up to six index loads on a NON-RESIDENT chunk,
+	// against a whole second walk of the segment for every sky ray. The
+	// short-circuit order inside VoxelMarchAbsentTouchesShell (Z probes first)
+	// is what keeps the common case at one load, and the resident path here
+	// still pays nothing at all.
+	//
+	// WHAT WOULD REFUTE THE TRADE: the marcher's GPU time not moving, or moving
+	// the wrong way, on an arm where the retry rate demonstrably fell
+	// (FVoxelMarchHit.FallthroughTaken / FallthroughConsidered). Then the six
+	// loads cost more than the walks they saved and the gate belongs back where
+	// it was -- which is exactly why the old gate is still COMPILABLE
+	// (VOXEL_MARCH_FALLTHROUGH_SHELL 0) rather than deleted.
 	C.bAbsentTouchesShell = ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u) ||
 	                        VoxelMarchAbsentTouchesShell(ChunkCoord);
 #endif
@@ -2203,16 +2362,19 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 	// arm that never sets the gate would walk a different cascade than the arm
 	// it is graded against. The solid test refreshed Chunk to the voxel just
 	// tested, so the flag reads the same lookup the walk paid for.
-#if VOXEL_MARCH_HOLE_STATS >= 2
+#if VOXEL_MARCH_TRACK_SHELL
 	// FIRST SHELL crossing only -- test the flag BEFORE the OR below sets it.
 	// The nearest absent chunk that touches held ground is the one the reason
 	// split attributes, at all three capture sites identically. Plain air (the
 	// camera's own column, the sky above a distant ridge) sets neither flag
-	// here and the ray falls through to whatever it crosses next.
+	// here and the ray falls through to whatever it crosses next -- which, since
+	// 2026-08-24, is also what stops it from opening the retry ladder.
 	if (!H.bCrossedShellAbsent && !Chunk.bValid && !Chunk.bResident &&
 	    Chunk.bAbsentTouchesShell)
 	{
+#if VOXEL_MARCH_HOLE_STATS >= 2
 		H.FirstAbsentReason = Chunk.AbsentReason;
+#endif
 		H.bCrossedShellAbsent = true;
 	}
 #endif
@@ -2279,12 +2441,14 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		// bool ONLY on this arm so the depth-0 control keeps its original
 		// text, not just its original meaning.
 		const bool bSolidNow = VoxelMarchBrickSolidAt(vNow, Chunk, Brick, Mat);
-#if VOXEL_MARCH_HOLE_STATS >= 2
+#if VOXEL_MARCH_TRACK_SHELL
 		// First SHELL crossing only -- see the start-voxel site above.
 		if (!H.bCrossedShellAbsent && !Chunk.bValid && !Chunk.bResident &&
 		    Chunk.bAbsentTouchesShell)
 		{
+#if VOXEL_MARCH_HOLE_STATS >= 2
 			H.FirstAbsentReason = Chunk.AbsentReason;
+#endif
 			H.bCrossedShellAbsent = true;
 		}
 #endif
@@ -2864,13 +3028,21 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 			// chunk (bResident) is real air and must not send the ring loop
 			// coarser. One OR per skipped chunk, on values already in
 			// registers.
-#if VOXEL_MARCH_HOLE_STATS >= 2
+#if VOXEL_MARCH_TRACK_SHELL
 			// First SHELL crossing only -- see the flat walk's start-voxel
 			// site. bValid is already false in this branch, so the gate is
 			// just "not resident, touching held ground, nothing captured yet".
+			// TRACK_SHELL and no longer the level-2 guard: since 2026-08-24 the
+			// retry ladder gates on this flag, so the shipping fallthrough arm has
+			// to set it as well as the instrument does.
 			if (!H.bCrossedShellAbsent && !Chunk.bResident && Chunk.bAbsentTouchesShell)
 			{
+#if VOXEL_MARCH_HOLE_STATS >= 2
+				// The REASON stays level-2-only: the ladder needs the flag, the
+				// breakdown needs the bucket, and only the breakdown reads
+				// AbsentReason.
 				H.FirstAbsentReason = Chunk.AbsentReason;
+#endif
 				H.bCrossedShellAbsent = true;
 			}
 #endif
@@ -3183,23 +3355,38 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 #if VOXEL_MARCH_HOLE_STATS >= 2
 	// The FIRST absent crossing's attribution, ray-wide. Captured only from a
 	// walk at the segment's OWN level (WalkL == SegL): the first walk of every
-	// ladder is that walk, and the fallthrough gate only lets the ladder
-	// continue when it crossed absent ground -- so if any walk of any segment
-	// crossed absent, the owner-level walk of the FIRST such segment did too,
-	// and the capture below cannot be starved by a retry. Attributing a
-	// coarser retry's crossing would answer "which level was WALKED" when the
-	// question is "which level was WANTED".
+	// ladder is that walk, so the capture below cannot be starved by a retry
+	// however the gate is set -- and under VOXEL_MARCH_FALLTHROUGH_SHELL the
+	// ladder continues on the SAME flag this capture triggers on, which makes
+	// the argument tighter than it was, not looser. Attributing a coarser
+	// retry's crossing would answer "which level was WALKED" when the question
+	// is "which level was WANTED".
 	uint RayAbsentLevel = 0xFFFFFFFFu;
 	uint RayAbsentReason = VOXEL_MARCH_MISS_UNATTRIBUTED;
-	// The OR of every walk's SHELL-crossing flag, the level-2 twin of
-	// bAnyAbsent above. Separate because the two flags now mean different
-	// things: bAnyAbsent still says "the ray crossed ground we do not hold"
-	// (air included, which is why `uncovered` reads 25.27% of rays on a settled
-	// stationary world) and this says "the ray crossed a GAP in ground we do
-	// hold". The kernel counts both and prints the ratio, so the size of the
-	// old counter's contamination is a reading rather than an argument.
+#endif
+#if VOXEL_MARCH_TRACK_SHELL
+	// The OR of every walk's SHELL-crossing flag, the twin of bAnyAbsent above.
+	// Separate because the two flags mean different things: bAnyAbsent says "the
+	// ray crossed ground we do not hold" -- air included, which is why
+	// `uncovered` read 25.27% of rays on a SETTLED STATIONARY world
+	// (Saved/capture-zcut-alt120.log) -- and this says "the ray crossed a GAP in
+	// ground we DO hold". The kernel counts both and prints the ratio, so the
+	// size of the old counter's contamination is a reading rather than an
+	// argument. Since 2026-08-24 this flag also OPENS THE RETRY LADDER, which is
+	// why it is tracked on the fallthrough arm and not only under the level-2
+	// instrument.
 	bool bAnyShellAbsent = false;
-#endif // VOXEL_MARCH_HOLE_STATS >= 2
+#endif
+#if VOXEL_MARCH_HOLE_STATS
+	// THE ENGAGEMENT PAIR (see the gate below). Ray-wide, folded into whichever
+	// of the hit or the miss leaves this function. uint and not bool, because
+	// the question is a RATE -- retries per opportunity -- and one bit per ray
+	// would collapse a six-segment ladder into "did anything retry", which is
+	// the same averaging that laundered three failures into one number and cost
+	// the level-2 breakdown its first shape.
+	uint RayFtConsidered = 0u;
+	uint RayFtTaken = 0u;
+#endif
 #endif
 	[loop]
 	for (uint SegL = 0; SegL < RingCount; ++SegL)
@@ -3286,6 +3473,13 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				// not come down would be worthless; this one falling to zero
 				// while stationary is the invariant's success reading.
 				H.bSubstituted = (WalkL > SegL);
+#if VOXEL_MARCH_HOLE_STATS
+				// The ladder rungs this ray had already consumed when it hit. See
+				// the fold onto the miss at the bottom of this function for why the
+				// hit has to carry them too.
+				H.FallthroughConsidered = RayFtConsidered;
+				H.FallthroughTaken = RayFtTaken;
+#endif
 #endif
 				return H;
 			}
@@ -3299,6 +3493,12 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				RayAbsentLevel = SegL;
 				RayAbsentReason = H.FirstAbsentReason;
 			}
+#endif
+#if VOXEL_MARCH_TRACK_SHELL
+			// Folded BEFORE the gate below, which now reads the SAME flag: the
+			// ladder can break out of this segment on the next statement, and a
+			// ray-wide OR that ran after the break would lose the very crossing
+			// that caused it.
 			bAnyShellAbsent = bAnyShellAbsent || H.bCrossedShellAbsent;
 #endif
 			// Fold this walk's absent crossings into the ray-wide flag BEFORE
@@ -3306,17 +3506,75 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			bAnyAbsent = bAnyAbsent || H.bCrossedAbsentChunk;
 #endif
 #if VOXEL_MARCH_FALLTHROUGH > 0
-			// THE GATE. A miss that crossed no absent chunk is a TRUE miss:
-			// every chunk on the segment was resident (solid parts missed,
-			// empties genuinely empty), so a coarser retry could only add rock
-			// where this level proved air -- cave mouths, doorways, overhangs,
-			// the sky above a ridge. Break, do not retry. A miss that DID
-			// cross absent ground may be a hole, and the next WalkL re-walks
-			// the SAME SegIn/SegOut one level coarser. Note the sky-band trim
-			// makes chunks above the terrain legitimately non-resident, so sky
-			// rays DO take the retries; that is the cost ceiling of the depth,
-			// not a defect of the gate.
-			if (!H.bCrossedAbsentChunk)
+			// THE GATE, AND IT MOVED ON 2026-08-24. A miss that crossed no absent
+			// chunk is a TRUE miss: every chunk on the segment was resident (solid
+			// parts missed, empties genuinely empty), so a coarser retry could only
+			// add rock where this level proved air -- cave mouths, doorways,
+			// overhangs, the sky above a ridge. Break, do not retry.
+			//
+			// WHAT THE OLD GATE GOT WRONG, and it is not a tuning miss. It asked
+			// bCrossedAbsentChunk -- "did this ray cross ANYTHING not resident" --
+			// and the streamed set is a thin shell around the surface (about 4.4
+			// chunks per column at level 0). The sky-band trim leaves everything
+			// above the terrain legitimately non-resident, and ring segment 0 starts
+			// AT THE CAMERA, so the first absent chunk on essentially every ray is
+			// the air the camera is sitting in. The comment this one replaces said
+			// so in one line -- "sky rays DO take the retries" -- and then priced it
+			// as a cost ceiling. It is worse than a cost: where the coarser walk
+			// DOES hit, the retry puts COARSE ROCK WHERE THE FINE LEVEL PROVED AIR,
+			// which is the exact regression the resident/invalid distinction was
+			// written to prevent, arriving through the other door.
+			//
+			// THE SIZE OF THE POPULATION IS A READING, NOT AN ARGUMENT: this file's
+			// own note on bAnyShellAbsent (:3186 before this edit, quoting
+			// Saved/capture-zcut-alt120.log) records the old flag firing on 25.27%
+			// of rays on a SETTLED STATIONARY world. Near-horizon rays enter every
+			// ring, so the doubled population is the expensive TAIL, which is what a
+			// 1%-low frame-rate gate is made of.
+			//
+			// THE NEW GATE asks bCrossedShellAbsent: did the ray cross a GAP IN
+			// GROUND THE STREAMING SYSTEM HOLDS. That is the question the no-hole
+			// invariant was always about. Air nobody holds is not a hole and buys
+			// no second walk.
+			//
+			// WHAT WOULD REFUTE IT: `uncShell` RISING against the control arm. That
+			// would mean the shell test is rejecting REAL gaps and this gate is
+			// dropping fills the owner can see -- the change would be wrong, not
+			// merely cheap. `uncovered` collapsing while `uncShell` holds is the
+			// intended reading. The full falsifier list is at
+			// VOXEL_MARCH_FALLTHROUGH_SHELL.
+			//
+			// ONE DECISION, WRITTEN ONCE. The gate is hoisted into a bool so the
+			// counters below and the break cannot become two spellings of one
+			// decision -- that is how a counter ends up certifying a branch it does
+			// not actually describe.
+#if VOXEL_MARCH_FALLTHROUGH_SHELL
+			const bool bGateOpen = H.bCrossedShellAbsent;
+#else
+			const bool bGateOpen = H.bCrossedAbsentChunk;
+#endif
+#if VOXEL_MARCH_HOLE_STATS
+			// PROOF OF TRAFFIC, and it is the reason any frame-time reading off
+			// this change can be believed. `Considered` counts rungs where a
+			// coarser level existed and the gate was actually consulted; `Taken`
+			// counts the rungs the gate opened, i.e. the extra walks paid for.
+			// Taken / Considered IS THE RETRY RATE, and it must FALL between the
+			// control arm and this one. If it does not move, THE SWITCH IS INERT
+			// and nothing else measured on that leg means anything -- seven
+			// switches in this repo were inert while looking armed, which is why
+			// this is a counter and not an inference from `substituted`.
+			//
+			// WalkL < LastWalkL, not "always": at the top of the ladder there is no
+			// coarser level to consult, so counting a rung there would fill the
+			// denominator with decisions nobody made and make the rate read better
+			// than it is on exactly the deepest rays.
+			if (WalkL < LastWalkL)
+			{
+				RayFtConsidered += 1u;
+				RayFtTaken += bGateOpen ? 1u : 0u;
+			}
+#endif
+			if (!bGateOpen)
 			{
 				break;
 			}
@@ -3331,10 +3589,25 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	// discriminator lives at the kernel, not here: direction is the kernel's
 	// input and this function should not grow a second copy of it.
 	Miss.bCrossedAbsentChunk = bAnyAbsent;
+#if VOXEL_MARCH_TRACK_SHELL
+	// Folded under TRACK_SHELL rather than under the level-2 guard it used to
+	// sit in, because the flag now has TWO readers: the kernel's `uncShell`
+	// counter and the retry gate above (VOXEL_MARCH_FALLTHROUGH_SHELL). Same
+	// value, same fold, one more arm that compiles it.
+	Miss.bCrossedShellAbsent = bAnyShellAbsent;
+#endif
 #if VOXEL_MARCH_HOLE_STATS >= 2
 	Miss.AbsentLevel = RayAbsentLevel;
 	Miss.FirstAbsentReason = RayAbsentReason;
-	Miss.bCrossedShellAbsent = bAnyShellAbsent;
+#endif
+#if VOXEL_MARCH_HOLE_STATS
+	// PROOF OF TRAFFIC. Carried on the miss AND on the hit (see the hit return
+	// above), because the retry rate's denominator is ladder rungs, not misses:
+	// a ray that hits on its third rung paid two retries, and dropping it would
+	// bias the rate towards whichever arm returns hits earlier -- i.e. towards
+	// flattering the change under test.
+	Miss.FallthroughConsidered = RayFtConsidered;
+	Miss.FallthroughTaken = RayFtTaken;
 #endif
 #endif
 	return Miss;
@@ -3479,11 +3752,31 @@ FVoxelMarchHit VoxelMarchTraverseWithCover(float3 OriginLocalUU, float3 DirWorld
 	// ITS OWN DIAL. See VOXEL_MARCH_COVER_SKIP -- cover must not inherit the
 	// terrain arm's hierarchical walk while that walk has an open directional
 	// skip defect, or a cover bug and that defect are one symptom.
-	const FVoxelMarchHit C =
+	// NOT const since 2026-08-24 -- see the counter carry below. Removing the
+	// qualifier changes no codegen and no arm's behaviour; it is here only so
+	// the one field that belongs to the RAY rather than to the winning walk can
+	// be written before the return.
+	FVoxelMarchHit C =
 		VoxelMarchTraverseCoverSeg(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU,
 		                           VOXEL_MARCH_COVER_SKIP > 0);
 	if (C.bHit && (!T.bHit || C.THitUU < T.THitUU))
 	{
+#if VOXEL_MARCH_HOLE_STATS
+		// THE COVER WALK RUNS NO LADDER, so its FallthroughConsidered /
+		// FallthroughTaken are structurally zero -- and returning them
+		// unchanged would DELETE the terrain walk's rungs for every pixel
+		// cover happens to win. That is exactly the shape of an instrument
+		// that reads better the more work the frame did, which is the failure
+		// this file has retracted findings over; so the counters are carried
+		// across from the walk that actually paid them. Nothing else on C
+		// moves: the PICTURE is the cover hit's, the ACCOUNTING is the ray's.
+		//
+		// WHAT WOULD SHOW THIS MATTERING: a leg with voxel.March.Cover on
+		// reading a lower retry rate than the same leg with it off. The rate
+		// is a property of the terrain cascade and cover cannot lower it.
+		C.FallthroughConsidered = T.FallthroughConsidered;
+		C.FallthroughTaken = T.FallthroughTaken;
+#endif
 		return C;
 	}
 #endif
