@@ -1157,6 +1157,7 @@ struct FVoxelMarchStats
 	uint64 DeclinedNoVolume = 0;    // no occupancy volume published yet
 	uint64 DeclinedNoTextures = 0;  // scene textures unavailable at the hook
 	uint64 DeclinedUnsupported = 0; // RHI/feature level refuses the pass
+	uint64 DeclinedNonPrimary = 0;  // reflection/scene-capture view, not the player's
 };
 
 // ---------------------------------------------------------------------------

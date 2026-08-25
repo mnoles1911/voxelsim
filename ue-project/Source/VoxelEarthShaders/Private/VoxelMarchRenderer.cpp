@@ -658,7 +658,7 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 		       TEXT("Voxel march: mode=%s source=%s stepBudget=%d ao=%d dbuffer=%d "
 		            "velocity=%d htileProbe=%d | marchMs=%s emitMs=%s scratchMs=%s | "
 		            "frames=%llu emitFrames=%llu | tiles total=%u drawn=%u | indexEntries=%d | "
-		            "declined noView=%llu noVolume=%llu noTextures=%llu unsupported=%llu "
+		            "declined noView=%llu noVolume=%llu noTextures=%llu nonPrimary=%llu unsupported=%llu "
 		            "noPool=%llu"),
 		       Arm.Mode == 0 ? TEXT("off") : (Arm.Mode == 1 ? TEXT("scene") : TEXT("scratch")),
 		       Arm.Source == 0 ? TEXT("occupancy") : TEXT("brickpool"),
@@ -668,6 +668,7 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 		       *Ms(S.ScratchGpuMs, S.ScratchFrames), S.Frames,
 		       S.EmitFrames, S.TilesTotal, S.TilesHit, S.IndexEntries,
 		       S.DeclinedNoView, S.DeclinedNoVolume, S.DeclinedNoTextures,
+		       S.DeclinedNonPrimary,
 		       S.DeclinedUnsupported, S.DeclinedNoPool);
 		if (Arm.Source == 1 && S.IndexEntries == 0)
 		{
@@ -4227,6 +4228,40 @@ void FVoxelMarchRenderExtension::PreRenderView_RenderThread(FRDGBuilder& GraphBu
 	const FIntRect ViewRect = UE::FXRenderingUtils::GetRawViewRectUnsafe(InView);
 	if (ViewRect.Area() <= 0)
 	{
+		return;
+	}
+
+	// THE MARCHER RUNS ON THE PLAYER'S VIEW ONLY, AND UNTIL 2026-08-25 IT SAID SO
+	// NOWHERE -- positive area was the whole test, so any view the engine handed
+	// this hook was marched.
+	//
+	// That is latent, not theoretical. It crashed a leg. With
+	// voxel.Sky.RealTimeCapture 0 the sky light falls back to a ONE-SHOT cubemap
+	// capture, which renders six 128x128 cube faces through this same hook; the
+	// marcher joined them, and registered resources against a graph that is not
+	// the one it built them for:
+	//
+	//   Assertion failed: ResourceMap.Contains(Resource)
+	//   Resource ... registered with pass VoxelMarch.March(128x128, budget 3328)
+	//   is not part of the graph and is likely a dangling pointer
+	//
+	// The steady-state default hides it: with real-time capture ON the engine
+	// re-uses cached sky data, so a control leg shows exactly ONE March pass per
+	// frame at 1552x873 and views/frame=1.00, and zero 128x128 passes. The
+	// nocap leg shows two. So this was reachable by anything that triggers a
+	// non-real-time capture -- a scene capture component, a planar reflection,
+	// a cubemap recapture -- and the sky arm is merely what found it first.
+	//
+	// Marching a 128x128 cube face is also pure waste even where it does not
+	// crash: the capture wants sky and distant atmosphere, and the marcher draws
+	// near-field terrain into a probe nobody reads terrain out of.
+	//
+	// Declined BY REASON, per this struct's own "not one flag" rule, so a leg
+	// can tell "no capture happened" from "captures happened and were skipped".
+	if (InView.bIsSceneCapture || InView.bIsReflectionCapture || InView.bIsPlanarReflection)
+	{
+		FScopeLock Guard(&State->Lock);
+		State->Stats.DeclinedNonPrimary++;
 		return;
 	}
 
