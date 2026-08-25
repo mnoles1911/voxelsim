@@ -41,6 +41,71 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0k The MAIN MENU CANNOT BE PHOTOGRAPHED on this box, and it is a front-end hold bug
+
+Found 2026-08-25, first time `tools/voxel-ui-capture.ps1 -Shot Menu` has ever
+been run. It has never produced an image: `ue-project/Saved/` contains no
+`ui-capture-*.log` before today. Three runs, three fatals, exit code 3 every
+time, no screenshot.
+
+**The front end reaches its menu correctly.** Every run logs
+`VoxelFrontEnd: active`, `menu font loaded`, and `0 save(s) listed` -- the
+subsystem, the Macondo font, the background art and the save-list query all
+work. The menu is built. What kills the run is the WORLD ticking underneath it.
+
+**The mechanism.** In `EVoxelFrontEndState::Menu` the front end holds streaming
+by leaving `ChunkOwner` null, so `UVoxelWorldSubsystem::Tick` returns on its
+first line. Nothing holds the other world-touching tickers, and no pawn has
+been placed yet -- so the player viewpoint is the world ORIGIN regardless of
+`-VoxelSpawnAt`. Those tickers then query worldgen at (0,0), the fine tier has
+no tile (-1,-1) baked on this box, and `FVoxelFineTileStreamer` is fatal by
+design on a gate leak in an unattended run.
+
+Two independent offenders confirmed by callstack, which is what makes this a
+class and not a switch:
+
+    UVoxelWaterSubsystem::Tick
+      -> RefreshImplicitWater          (VoxelWaterSubsystem.cpp:6176)
+      -> EnsureWorldgenColumn -> Amplifier::evalSurface -> gate leak
+
+    AVoxelOceanActor::UpdateUnderwaterState   (VoxelOceanActor.cpp:321)
+      -> IsUnderwaterAtWorld -> GetWaterFillAtWorld -> World<8>::materialAt
+      -> gate leak
+
+The log's own diagnosis is exact and worth quoting: *"The residency tick has
+NEVER RUN (no ring centre), so nothing has been prefetched for any position."*
+That is the deadlock stated plainly -- one subsystem is held, the others are
+not, and the unheld ones depend on the held one's prefetch.
+
+**What was tried, and why the workarounds are the wrong fix.**
+`-VoxelSpawnAt=-61440,-61440` (the baked 2x2 centre) got the run further and
+loaded `resident=4` tiles, but did not help: the camera is at the origin during
+the menu, not at the spawn. `-VoxelWaterMarkerOnly=1` removed the water
+subsystem offender and the ocean actor took its place. Chasing each one with a
+switch is whack-a-mole, and every switch changes engine behaviour in a shot
+whose whole purpose is to show what the front end really looks like.
+
+**`-VoxelFineTileGateFatal=0` IS NOT THE ANSWER** even though the log offers it.
+It answers elevation with sea level and yields a screenshot that looks right and
+is not reproducible.
+
+**The fix is in the front end, not in the tile cache.** While the front end owns
+the screen, either every world-querying ticker is held the way the chunk
+streamer is, or the pawn is placed at its intended position before the world
+begins ticking. The second is probably better: it fixes the menu AND means the
+loading screen is streaming the place the player is about to be, rather than
+the origin.
+
+NOT ATTEMPTED, deliberately: the tree carries another session's uncommitted
+edits to `VoxelWorldSubsystem.cpp/.h` and `VoxelMarchRenderer.cpp`. Building
+would compile their half-finished work and corrupt the DLL pair they are
+measuring against.
+
+Consequence for the front-end verification plan: stages 2-6 of
+`docs/front-end-local-verification-handoff.md` (non-regression diff, captures,
+gate sweep, play) are ALL blocked on this, not merely undone. No capture lane
+exists until the menu can survive one tick.
+
 ### 0.0j Chunks admit LEFT-TO-RIGHT and FAR-BEFORE-NEAR — diagnosed, fix authored, NOT YET IN ANY BINARY
 
 Owner-reported twice, most recently 2026-08-23 while the fix was still in merge:
