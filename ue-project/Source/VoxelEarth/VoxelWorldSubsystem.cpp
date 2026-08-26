@@ -181,6 +181,48 @@ static TAutoConsoleVariable<bool> CVarVoxelCollapseEnabled(
 	TEXT("M5: run brick-resolution differential-support structural collapse for edits too large for voxel-resolution island detection."),
 	ECVF_Default);
 
+// STEP 1 OF THE ZCUT SOURCE SWAP -- A MEASUREMENT, NOT A FEATURE. Default 0.
+//
+// voxel.March.ZCut's bound comes from GetResidentChunkZBound, a CUMULATIVE
+// UNION of resident chunk Z that never narrows. The proposal is to replace it
+// with the WORLD-DERIVED FootprintSurfaceUpperBoundMm, which is crown-inclusive
+// and declines rather than guessing. Before building that swap, one number
+// decides whether it can pay at all:
+//
+//     HEADROOM(L) = H_world(L) - CameraZ
+//
+// where H_world(L) is the world-derived surface upper bound maxed over every
+// level-L footprint inside ring L's outer radius. That is the vertical distance
+// a ray aimed upward must still cross before ANY sound ceiling can cut it. If
+// it is kilometres, there is nothing to cut and the swap is a null however
+// tight the bound is -- the world's highest land is 6,331 m, so no constant can
+// stand in for this and it must be measured.
+//
+// PRINTED PER LEVEL, NOT AS ONE SCALAR, because the rings are XY annuli: a
+// near-vertical ray never leaves ring 0's footprint, so its ceiling is
+// H_world(0) over 64 m, while a horizon ray crosses every ring and meets
+// H_world(6) over 4 km. Those two can differ by a kilometre over the same
+// ground and they are the two regimes the 1.108 ms / 5.638 ms spread is made
+// of.
+//
+// AND PRINTED BESIDE THE RESIDENT TOP, which is the reading that actually
+// decides the swap. Headroom bounds the PRIZE; the world-vs-resident delta
+// bounds what the SWAP can win of it. Where the two tops agree, the swap is a
+// null by construction no matter how tight either one is -- and that is a
+// separate finding from "there is nothing above the camera".
+//
+// O(41^2) memoised bound calls per level per log window, on the 5 s cadence
+// only, and the block times itself and prints the cost so the instrument
+// cannot quietly become a share of what it measures.
+static TAutoConsoleVariable<int32> CVarVoxelZCutHeadroomProbe(
+	TEXT("voxel.March.ZCutHeadroomProbe"), 0,
+	TEXT("MEASUREMENT ONLY, changes no rendering. 1 = print one zcutHeadroom line per periodic "
+	     "log window: camera Z, the world-derived surface upper bound over each ring's reach, and "
+	     "their difference. Reads FootprintSurfaceUpperBoundMmCached, the same crown-inclusive "
+	     "bound the desired-set pass already uses, so it measures the source a voxel.March.ZCut "
+	     "swap would actually bind -- not a re-derivation of it."),
+	ECVF_Default);
+
 // Forward declaration at GLOBAL scope, deliberately outside the anonymous
 // namespace below: FSharedColumnGridCache (inside it) reads its capacity from
 // this accessor, whose definition lives with its siblings in the real
@@ -11638,6 +11680,105 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (long long)RecomputeDeferralsSinceLog, MaxRecomputeHeldMs, RecomputeCostEMASec * 1000.0,
 		       WindowRealMs > 0.0 ? 100.0 * AccumRecomputeMs / WindowRealMs : 0.0);
 	}
+	// ---- THE ZCUT HEADROOM PROBE (voxel.March.ZCutHeadroomProbe) ---------
+	//
+	// See the cvar for what this decides and why it is per level. Everything
+	// here is READ-ONLY against the world; nothing it touches feeds streaming,
+	// rendering or admission, and at 0 the block does not execute at all.
+	//
+	// WHY THE RESIDENT TOP IS NOT PRINTED HERE. It lives in
+	// FVoxelMarchChunkIndex, in VoxelEarthShaders, and this module depends on
+	// that one rather than the other way round -- so reaching it from here
+	// would mean a new global written across a module boundary for a
+	// measurement that is meant to be temporary. It is already printed, in this
+	// same log, by the marcher's "padded chunk-Z bound:" line under
+	// voxel.March.Stats. The two lines are read TOGETHER: this one gives
+	// H_world as a level-L chunk index precisely so the comparison against that
+	// line's per-slot top is an integer subtraction and not a unit conversion
+	// done by hand in a report.
+	if (CVarVoxelZCutHeadroomProbe.GetValueOnGameThread() != 0)
+	{
+		using namespace VoxelCoords;
+		const double ProbeStartSec = FPlatformTime::Seconds();
+		const FVector Anchor = LastAnchorLocation;
+		const double CamZM = Anchor.Z / 100.0;
+		const int32 MaxRing = UVoxelWorldSubsystem::GetMaxRingLevel();
+
+		FString Per;
+		int64 TotalCalls = 0;
+		int64 TotalDeclined = 0;
+		for (int32 Level = 0; Level <= MaxRing; ++Level)
+		{
+			// RING L'S OWN OUTER RADIUS, not the cascade edge. That is the
+			// whole reason this is per level: the level-L slab can only ever be
+			// asked about ground inside the level-L grid, and a max taken over
+			// the full 4 km would report level 0's ceiling as the mountain
+			// 4 km away that no level-0 ray can ever reach.
+			const double OuterUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0;
+			const double EdgeUU = ChunkEdgeUUForLevel(Level);
+			const int32 R = FMath::CeilToInt32(OuterUU / EdgeUU);
+			const int32 CX = FMath::FloorToInt32(Anchor.X / EdgeUU);
+			const int32 CY = FMath::FloorToInt32(Anchor.Y / EdgeUU);
+
+			int64 BestMm = MIN_int64;
+			int64 Declined = 0;
+			int64 Calls = 0;
+			for (int32 DY = -R; DY <= R; ++DY)
+			{
+				for (int32 DX = -R; DX <= R; ++DX)
+				{
+					// Disc, not square: the corners of the square sit up to
+					// 1.41x the ring radius away and are covered by a COARSER
+					// ring, so including them would credit this level with
+					// ground it never carries.
+					if (DX * DX + DY * DY > R * R)
+					{
+						continue;
+					}
+					++Calls;
+					const int64 Mm = FootprintSurfaceUpperBoundMmCached(Level, CX + DX, CY + DY);
+					if (Mm == INT64_MAX)
+					{
+						// DECLINED IS NOT ZERO AND IS NOT A CEILING. Counted
+						// and reported, because a level whose footprints mostly
+						// decline has no world-derived bound to swap TO, and
+						// that is a different verdict from a wide one.
+						++Declined;
+						continue;
+					}
+					BestMm = FMath::Max(BestMm, Mm);
+				}
+			}
+			TotalCalls += Calls;
+			TotalDeclined += Declined;
+
+			if (BestMm == MIN_int64)
+			{
+				Per += FString::Printf(TEXT(" L%d[declined %lld/%lld]"), Level,
+				                       (long long)Declined, (long long)Calls);
+				continue;
+			}
+			// As a level-L chunk index, the same lattice the marcher's
+			// "padded chunk-Z bound:" line prints its top in.
+			const int64 TopVoxel = vxc::floorDiv(BestMm, int64(vxc::kVoxelSizeMm));
+			const int64 TopChunkL =
+				vxc::floorDiv(TopVoxel, int64(ChunkEdgeVoxels) * (int64(1) << Level));
+			const double HM = double(BestMm) / 1000.0;
+			Per += FString::Printf(TEXT(" L%d[H=%.0fm dz=%+.0fm top=%lld dec=%lld/%lld]"),
+			                       Level, HM, HM - CamZM, (long long)TopChunkL,
+			                       (long long)Declined, (long long)Calls);
+		}
+
+		const double ProbeMs = (FPlatformTime::Seconds() - ProbeStartSec) * 1000.0;
+		// probeMs IS PART OF THE READING, not a footnote: this block calls a
+		// worldgen-grade bound thousands of times, and an instrument that costs
+		// a visible share of the window it reports from is the failure this
+		// project has recorded most often. Default 0 keeps it off every timing
+		// leg regardless.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("zcutHeadroom: camZ=%.0fm |%s | calls=%lld declined=%lld probeMs=%.1f"),
+		       CamZM, *Per, (long long)TotalCalls, (long long)TotalDeclined, ProbeMs);
+	}
 	// Incremental admission traffic (see LevelIncrScansSinceLog's doc
 	// comment). Only under the switch, so old-leg greps stay clean. Read it
 	// TOGETHER with the "scans" field of the max line above: incr close to
@@ -13048,6 +13189,162 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			{
 				Pct->Set(Rays > 0.0 ? float(100.0 * double(H.Uncovered) / Rays) : 0.0f,
 				         ECVF_SetByCode);
+			}
+
+			// ---- THE CHUNK-CELL LOOKUP CENSUS ------------------------------
+			//
+			// WHAT IT ANSWERS. VoxelMarchLookupChunk has seven return sites.
+			// Four of them return before the record fetch (one dword of index,
+			// no table traffic); three return AFTER fetching four dwords out of
+			// the ~15.7 MB VoxelBrickChunkTable, which at 99.7% index emptiness
+			// is a scattered miss more often than not. One of those three --
+			// cellResidentEmpty -- fetches the record purely to be told the
+			// chunk is resident and ENTIRELY AIR, a fact the index dword
+			// already has a bit for (VOXEL_MARCH_INDEX_ANYSOLID_BIT). The share
+			// of PAYING lookups that end that way is the size of the prize for
+			// teaching the three index writers to set that bit honestly, and
+			// this line is the only place it is measured.
+			//
+			// THE IDENTITY IS THE GATE, NOT DECORATION. The seven outcome words
+			// are written at the seven return sites and nowhere else, so they
+			// must sum to cellsProbed EXACTLY. They can only fail to if a
+			// return path was added without a counter -- an INSTRUMENT defect,
+			// and the one failure that would make every ratio above it a
+			// confident wrong number. It prints PASS/FAIL and the FAIL is an
+			// Error, because this project's recorded house failure is a probe
+			// that was armed, measured nothing, and printed a plausible zero. A
+			// check that cannot come out the other way is not a check; this one
+			// comes out the other way the moment the shader and the counters
+			// disagree.
+			//
+			// EVERY COUNT IS PRINTED WITH ITS DENOMINATOR. The three pre-fetch
+			// outcomes are shares of cellsProbed; the four post-fetch ones are
+			// shares of recordFetches, which is their own sum. A bare count has
+			// produced a wrong reading here twice.
+			//
+			// cellIndexEmpty IS EXPECTED TO BE EXACTLY ZERO, and that is a
+			// finding rather than a silence: all three writers of the index
+			// entry hardcode the anySolid bit SET (VoxelMarchChunkIndex.cpp:867
+			// and :1362, VoxelMarchIndexScatter.usf:184), so the branch that
+			// reads it has never fired. A NON-zero here means somebody made the
+			// bit real and this measurement describes a world that is gone.
+			//
+			// AND THESE ARE DECISIONS, NOT NANOSECONDS -- the same warning the
+			// zcut and blockskip groups carry, for the same three published
+			// measurements. A high ratio says a lever EXISTS; only
+			// VoxelMarch.March from ProfileGPU can say it is worth pulling.
+			if (!H.bCensusArmed)
+			{
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march cell census: NOT MEASURED "
+				            "(voxel.March.HoleStats is 0). This line is not evidence "
+				            "about lookup costs either way."));
+			}
+			else if (H.CellsProbed == 0)
+			{
+				UE_LOG(LogVoxelPerf, Warning,
+				       TEXT("Voxel march cell census: ARMED AND INERT -- cellsProbed=0 "
+				            "over %llu measured frames in which the marcher walked %llu "
+				            "rays. A ray that walks cannot probe zero chunk cells, so "
+				            "this is the INSTRUMENT and not the world: the C++ half of "
+				            "the census (enum words, defines, readback) can land without "
+				            "the shader half, and in that state this warning is correct "
+				            "rather than a bug. grep VOXEL_MARCH_HOLE_CELLS_PROBED in "
+				            "VoxelBrickTraverse.ush before looking anywhere else."),
+				       (unsigned long long)H.Frames, (unsigned long long)H.Rays);
+			}
+			else
+			{
+				const double Probed = double(H.CellsProbed);
+				const uint64 Parts = H.CellNonResident + H.CellIndexEmpty +
+				                     H.CellSlotReject + H.CellStale +
+				                     H.CellResidentEmpty + H.CellBrickOOB + H.CellReal;
+				// The lookups that PAID FOR THE RECORD FETCH -- the three
+				// post-validation outcomes plus the stale one, which fetched the
+				// four dwords precisely in order to discover it was stale.
+				const uint64 Fetches = H.CellStale + H.CellResidentEmpty +
+				                       H.CellBrickOOB + H.CellReal;
+				const double Fetched = double(Fetches);
+				const bool bIdentity = (Parts == H.CellsProbed);
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march cell census: cellsProbed=%llu over %llu frames "
+				            "| PRE-FETCH nonResident=%llu (%.2f%% of probed) "
+				            "indexEmpty=%llu (%.4f%% of probed) slotReject=%llu "
+				            "(%.4f%% of probed) | POST-FETCH stale=%llu (%.2f%% of "
+				            "fetches) residentEmpty=%llu (%.2f%% of fetches) "
+				            "brickOOB=%llu (%.4f%% of fetches) real=%llu (%.2f%% of "
+				            "fetches) | recordFetches=%llu (%.2f%% of probed)"),
+				       (unsigned long long)H.CellsProbed,
+				       (unsigned long long)H.Frames,
+				       (unsigned long long)H.CellNonResident,
+				       100.0 * double(H.CellNonResident) / Probed,
+				       (unsigned long long)H.CellIndexEmpty,
+				       100.0 * double(H.CellIndexEmpty) / Probed,
+				       (unsigned long long)H.CellSlotReject,
+				       100.0 * double(H.CellSlotReject) / Probed,
+				       (unsigned long long)H.CellStale,
+				       Fetched > 0.0 ? 100.0 * double(H.CellStale) / Fetched : 0.0,
+				       (unsigned long long)H.CellResidentEmpty,
+				       Fetched > 0.0 ? 100.0 * double(H.CellResidentEmpty) / Fetched : 0.0,
+				       (unsigned long long)H.CellBrickOOB,
+				       Fetched > 0.0 ? 100.0 * double(H.CellBrickOOB) / Fetched : 0.0,
+				       (unsigned long long)H.CellReal,
+				       Fetched > 0.0 ? 100.0 * double(H.CellReal) / Fetched : 0.0,
+				       (unsigned long long)Fetches,
+				       100.0 * Fetched / Probed);
+				// THE HEADLINE, ON ITS OWN LINE so it can be grepped without the
+				// census line's width, and stated as the thing it would buy
+				// rather than as a bare percentage.
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march cell census: HEADLINE residentEmpty/"
+				            "recordFetches = %llu/%llu = %.2f%% -- the share of "
+				            "~16-byte scattered chunk-table fetches thrown away as air, "
+				            "i.e. what an honest anySolid bit in the index dword would "
+				            "remove at zero added cost. DECISIONS, NOT NANOSECONDS: only "
+				            "VoxelMarch.March from ProfileGPU can price it."),
+				       (unsigned long long)H.CellResidentEmpty,
+				       (unsigned long long)Fetches,
+				       Fetched > 0.0 ? 100.0 * double(H.CellResidentEmpty) / Fetched : 0.0);
+				// THE GATE.
+				if (bIdentity)
+				{
+					UE_LOG(LogVoxelPerf, Log,
+					       TEXT("Voxel march cell census: IDENTITY PASS -- nonResident+"
+					            "indexEmpty+slotReject+stale+residentEmpty+brickOOB+real "
+					            "= %llu == cellsProbed %llu. Every return site of "
+					            "VoxelMarchLookupChunk is accounted for; the shares above "
+					            "partition the function with no residue."),
+					       (unsigned long long)Parts,
+					       (unsigned long long)H.CellsProbed);
+				}
+				else
+				{
+					UE_LOG(LogVoxelPerf, Error,
+					       TEXT("Voxel march cell census: IDENTITY FAIL -- the seven "
+					            "outcome words sum to %llu but cellsProbed is %llu "
+					            "(difference %lld). A return path in "
+					            "VoxelMarchLookupChunk is UNCOUNTED, or a counter is "
+					            "incremented twice. DO NOT READ THE HEADLINE ABOVE: it "
+					            "is a confident wrong number until this reads PASS."),
+					       (unsigned long long)Parts,
+					       (unsigned long long)H.CellsProbed,
+					       (long long)(int64(Parts) - int64(H.CellsProbed)));
+				}
+				// The bit that has never been real. Loud when it stops being so,
+				// because every conclusion drawn from this census assumes it is
+				// not.
+				if (H.CellIndexEmpty != 0)
+				{
+					UE_LOG(LogVoxelPerf, Warning,
+					       TEXT("Voxel march cell census: cellIndexEmpty=%llu is "
+					            "NON-ZERO. All three writers of the index entry "
+					            "hardcoded the anySolid bit SET when this census was "
+					            "built, so this branch could not fire. Somebody made the "
+					            "bit real -- the residentEmpty headline above is now "
+					            "measuring the REMAINDER after that change, not the "
+					            "original prize."),
+					       (unsigned long long)H.CellIndexEmpty);
+				}
 			}
 
 			// ---- THE BREAKDOWN (voxel.March.HoleStats 2) -------------------

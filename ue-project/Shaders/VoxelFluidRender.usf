@@ -132,7 +132,20 @@ SamplerState     BilinearClampSampler;
 float2 ShadeHalfTexSize;
 float2 ShadeViewRectMin;          // on the scene colour target
 float2 ShadeViewRectSize;
-float2 InvProjDiag;               // (1/Proj[0][0], 1/Proj[1][1]) -- symmetric proj assumed; TAA jitter is sub-pixel and ignored
+float2 InvProjDiag;               // (1/Proj[0][0], 1/Proj[1][1]) -- symmetric proj assumed
+// THE FRAME'S TAA/TSR JITTER IN NDC (voxel.Fluid.Render.TAAJitter), or (0,0)
+// when the arm is off. The line above USED to end "TAA jitter is sub-pixel
+// and ignored", which had the premise RIGHT and the conclusion BACKWARDS: the
+// jitter lives in the projection's THIRD ROW (M[2][0]/M[2][1]) and never touches
+// the DIAGONAL that InvProjDiag is taken from, so this pass could not see it
+// even in principle. Being sub-pixel is the REASON it matters, not a reason to
+// ignore it: the SceneDepth this pass shades against was rasterised WITH the
+// offset, so an unjittered reconstruction puts the surface normal and the
+// refraction offset a fraction of a pixel off the geometry they describe --
+// every frame, by a different amount. Same defect and same fix as
+// voxel.March.TAAJitter; the host resolves the phase in
+// PrePostProcessPass_RenderThread, which is after InitViews and before TSR.
+float2 FluidTemporalAAJitter;
 float3 SunDirView;                // TOWARD the sun (ephemeris convention), rotated into view space
 float  SunDayGate;                // saturate(sunDirWorld.z), computed CPU-side
 // (SceneDepthTexture + InvDeviceZToWorldZ are shared with the splat block.)
@@ -155,7 +168,9 @@ float3 FluidViewPosFromPixel(float2 LocalPixel, float2 RectSize, float ViewZ)
 {
 	float2 Ndc = (LocalPixel / RectSize) * 2.0f - 1.0f;
 	Ndc.y = -Ndc.y;
-	return float3(Ndc * InvProjDiag * ViewZ, ViewZ);
+	// ndc = d * M00 + J under UE's row-vector convention, so
+	// d = (ndc - J) / M00. SUBTRACT, exactly as VoxelMarch.usf:869 and :1044 do.
+	return float3((Ndc - FluidTemporalAAJitter) * InvProjDiag * ViewZ, ViewZ);
 }
 
 // ===========================================================================

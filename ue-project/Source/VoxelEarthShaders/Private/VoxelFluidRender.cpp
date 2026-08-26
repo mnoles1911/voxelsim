@@ -56,6 +56,40 @@ DECLARE_GPU_STAT_NAMED(VoxelFluidRender, TEXT("VoxelFluidRender"));
 
 namespace
 {
+	// CARRY THE ENGINE'S TAA/TSR SUB-PIXEL JITTER ON THE WATER SURFACE
+	// RECONSTRUCTION. Same defect, same shape, as voxel.March.TAAJitter: the
+	// shade pass rebuilds a view-space position from InvProjDiag, the projection
+	// DIAGONAL, while UE puts the jitter in the third row (M[2][0]/M[2][1]). The
+	// old comment on VoxelFluidRender.usf:135 stated the premise correctly and
+	// drew the wrong conclusion from it -- "TAA jitter is sub-pixel and ignored".
+	// It is sub-pixel, and being sub-pixel is precisely why it matters: the SCENE
+	// DEPTH this pass reads was rasterised WITH the jitter, so reconstructing the
+	// ray without it puts the surface normal and the refraction offset a fraction
+	// of a pixel away from the geometry they are shading, every frame, by a
+	// different amount.
+	//
+	// DEFAULT 0, DELIBERATELY. The owner has approved the MARCHER arm, not this
+	// one; this ships dark until it has been measured at a pose with near-field
+	// water in frame.
+	//
+	// THE HOOK IS SAFE, AND THAT IS NOT LUCK -- IT IS THE ONE THING THAT SANK THE
+	// MARCHER FOR A DAY. Reading GetTemporalAAJitter() in
+	// PreRenderView_RenderThread returns exactly (0,0), because that hook runs
+	// from OnRenderBegin, BEFORE BeginInitViews applies the jitter. This pass
+	// runs from PrePostProcessPass_RenderThread, which is after InitViews and
+	// before TSR, so the value here is the real per-frame offset.
+	TAutoConsoleVariable<int32> CVarVoxelFluidRenderTAAJitter(
+		TEXT("voxel.Fluid.Render.TAAJitter"), 0,
+		TEXT("Subtract the frame's TemporalAAJitter from NDC before the water shade pass "
+		     "rebuilds a view-space position. 0 = the shipping behaviour (the ray ignores the "
+		     "jitter entirely, so it disagrees with the jittered SceneDepth it is shading "
+		     "against). 1 = carry it, which is what voxel.March.TAAJitter does for the marched "
+		     "ray.\nNOT MEASURED YET. Needs a pose with near-field water actually in frame, and "
+		     "voxel.Fluid.Render is itself default 0, so BOTH must be on before an A/B here "
+		     "means anything -- an A/B with no water on screen compares the arm against "
+		     "itself.\nNOT A PERMUTATION: a float2 uniform every permutation already binds."),
+		ECVF_RenderThreadSafe);
+
 	// VoxelFluidRender.usf VOXEL_FLUID_DEPTH_SENTINEL -- the splat depth
 	// target's clear value ("no fluid"). Mirrored like the sim's kernel
 	// coefficients: change both or the empty test breaks.
@@ -140,6 +174,10 @@ namespace
 		SHADER_PARAMETER(FVector2f, ShadeViewRectMin)
 		SHADER_PARAMETER(FVector2f, ShadeViewRectSize)
 		SHADER_PARAMETER(FVector2f, InvProjDiag)
+		// The frame's TAA/TSR jitter in NDC (voxel.Fluid.Render.TAAJitter), or
+		// (0,0) when the arm is off. Subtracted from NDC before the
+		// reconstruction -- the inverse of what UE did to the projection row 2.
+		SHADER_PARAMETER(FVector2f, FluidTemporalAAJitter)
 		SHADER_PARAMETER(FVector4f, InvDeviceZToWorldZ)
 		SHADER_PARAMETER(FVector3f, SunDirView)
 		SHADER_PARAMETER(float, SunDayGate)
@@ -480,6 +518,14 @@ void FVoxelFluidRenderExtension::PrePostProcessPass_RenderThread(
 		return; // degenerate projection (ortho shadow-ish view); nothing sane to draw
 	}
 	const FVector2f InvProjDiag(1.0f / ProjXX, 1.0f / ProjYY);
+	// Resolved HERE, in the same hook that uses it. PrePostProcessPass runs
+	// after InitViews, so this is the real offset and not the (0,0) that the
+	// earlier PreRenderView hook would hand back.
+	const FVector2D FluidJitterD = VM.GetTemporalAAJitter();
+	const FVector2f FluidTemporalAAJitter =
+	    (CVarVoxelFluidRenderTAAJitter.GetValueOnRenderThread() != 0)
+	        ? FVector2f(float(FluidJitterD.X), float(FluidJitterD.Y))
+	        : FVector2f::ZeroVector;
 	// Rotation-only transform of the toward-the-sun direction into view space
 	// (double matrix, then narrowed -- directions have no precision seam).
 	const FVector SunDirViewD =
@@ -640,6 +686,7 @@ void FVoxelFluidRenderExtension::PrePostProcessPass_RenderThread(
 		Params->ShadeViewRectMin = FVector2f(ViewRect.Min);
 		Params->ShadeViewRectSize = FVector2f(ViewRect.Size());
 		Params->InvProjDiag = InvProjDiag;
+		Params->FluidTemporalAAJitter = FluidTemporalAAJitter;
 		Params->InvDeviceZToWorldZ = InView.InvDeviceZToWorldZTransform;
 		Params->SunDirView = SunDirView;
 		Params->SunDayGate = Settings.SunDayGate;

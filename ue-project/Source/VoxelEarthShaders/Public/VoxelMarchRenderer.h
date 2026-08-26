@@ -611,6 +611,74 @@ namespace VoxelMarchHoleWord
 		BlockSkyLicensed,
 		BlockSkyRunBlocks,
 		BlockSkyRuns,
+
+		// ---- THE CHUNK-CELL LOOKUP CENSUS (2026-08-26) --------------------
+		// APPENDED, for the reason every group since the Z bound has been:
+		// appending renumbers nothing, so a stale shader cache still reads
+		// every older word correctly and simply leaves these eight at zero --
+		// which a reader has to word as NOT MEASURED anyway.
+		//
+		// WHAT THIS MEASURES AND WHY IT IS EIGHT WORDS AND NOT ONE. Every
+		// return site of VoxelMarchLookupChunk (VoxelBrickTraverse.ush), so
+		// the census PARTITIONS the function: the seven outcome words sum
+		// EXACTLY to CellsProbed, by construction, and the CPU prints that
+		// identity as a PASS/FAIL on the log line. That check is the whole
+		// point of the shape -- this project has repeatedly shipped probes
+		// that were armed and counted nothing, and a total that must
+		// reconstruct from its parts is the one arrangement where "the
+		// instrument did not run" and "the instrument ran and found zero"
+		// cannot be spelled the same way.
+		//
+		//   CellsProbed        every call. THE DENOMINATOR.
+		//   CellNonResident    the index dword's resident bit is clear. The
+		//                      cheap early-out; one dword, no record.
+		//   CellIndexEmpty     resident, and the index dword's ANYSOLID bit is
+		//                      CLEAR. EXPECTED TO BE EXACTLY ZERO TODAY and
+		//                      that is not a defect: all three writers of the
+		//                      entry hardcode the bit set
+		//                      (VoxelMarchChunkIndex.cpp:867 and :1362,
+		//                      VoxelMarchIndexScatter.usf:184), so the branch
+		//                      that reads it has never fired. It is counted
+		//                      ANYWAY, because a hardcoded bit is exactly the
+		//                      kind of thing that quietly becomes real, and
+		//                      because a zero this word cannot produce would
+		//                      break the identity instead of hiding.
+		//   CellSlotReject     slot out of the pool's bounds, or the record
+		//                      stride cross-check failed. Both are corruption
+		//                      guards; both return before the record fetch.
+		//   CellStale          THE RECORD WAS FETCHED (4 dwords out of the
+		//                      ~15.7 MB chunk table) and its origin or ring
+		//                      level disagreed with the key. A stale index.
+		//   CellResidentEmpty  THE RECORD WAS FETCHED and says the chunk is
+		//                      resident and ENTIRELY AIR. This is the word the
+		//                      census exists for: every one of these paid a
+		//                      scattered ~16 B fetch to learn something the
+		//                      index dword could have carried in a bit that is
+		//                      already there.
+		//   CellBrickOOB       the record validated and its brick base fell
+		//                      outside the descriptor pool. Also post-fetch,
+		//                      so it belongs on the paying side of the ratio;
+		//                      counted separately rather than folded into
+		//                      CellSlotReject precisely because folding it
+		//                      would move a post-fetch outcome into a
+		//                      pre-fetch bucket and corrupt the denominator.
+		//   CellReal           a full, valid chunk. The work the fetch is for.
+		//
+		// THE RATIO THE CENSUS COMPUTES is
+		//     CellResidentEmpty / (CellStale + CellResidentEmpty +
+		//                          CellBrickOOB + CellReal)
+		// -- of the lookups that PAY FOR THE RECORD FETCH, the share thrown
+		// away as air. It is a count of DECISIONS, not of nanoseconds, and the
+		// same warning every group above carries applies unchanged: the saving
+		// would be VoxelMarch.March from ProfileGPU and nothing else.
+		CellsProbed,
+		CellNonResident,
+		CellIndexEmpty,
+		CellSlotReject,
+		CellStale,
+		CellResidentEmpty,
+		CellBrickOOB,
+		CellReal,
 		Count
 	};
 	// 7 since level 6 (the 8 km ring) landed 2026-08-23. This widens the
@@ -702,6 +770,28 @@ struct FVoxelMarchHoleStats
 	uint64 BlockSkyRunBlocks = 0;
 	uint64 BlockSkyRuns = 0;
 	int32 BlockSkyMode = 0;
+
+	// ---- the chunk-cell lookup census --------------------------------------
+	// Counted on EVERY hole-stats level, like the Z bound's and the block
+	// level's groups and for the same reason: "how often does this branch
+	// fire" is a level-1-cheap question and gating it behind level 2 would
+	// make every level-1 leg read the census as inert.
+	//
+	// THE SEVEN OUTCOMES MUST SUM TO CellsProbed. The perf line computes that
+	// sum and prints PASS or FAIL. A FAIL means a return path in
+	// VoxelMarchLookupChunk is uncounted -- an INSTRUMENT defect -- and the
+	// ratio below it must not be read at all on such a window. bCensusArmed
+	// separates "the counters were compiled out" from "they ran and the world
+	// had nothing to count"; zeros with the flag FALSE are not a reading.
+	uint64 CellsProbed = 0;
+	uint64 CellNonResident = 0;
+	uint64 CellIndexEmpty = 0;
+	uint64 CellSlotReject = 0;
+	uint64 CellStale = 0;
+	uint64 CellResidentEmpty = 0;
+	uint64 CellBrickOOB = 0;
+	uint64 CellReal = 0;
+	bool bCensusArmed = false;
 };
 
 // Drains the accumulated window (the GetAndReset pattern the 5 s perf log
@@ -1747,6 +1837,24 @@ private:
 		FMatrix44f ViewToTranslatedWorld;
 		FVector3f RayOriginLocalUU = FVector3f::ZeroVector;
 		FVector2f InvProjDiag = FVector2f(1.0f, 1.0f);
+
+		// THE FRAME'S TAA/TSR JITTER, IN NDC, OR ZERO (voxel.March.TAAJitter).
+		//
+		// Resolved ONCE here, on the render thread, from the same FViewMatrices
+		// the diagonal above came from -- so the march, the emit's ray
+		// reconstruction and the verify gate cannot read three different phases
+		// of one frame. Zero when the arm is off, which is the shipping arm and
+		// reproduces every capture in the archive exactly.
+		//
+		// STASHED RATHER THAN READ FROM ResolvedView IN THE SHADER, and that is
+		// not a style choice. VoxelMarchBuildRay runs in the MARCH COMPUTE
+		// KERNEL, which never calls ResolveView(); InstancedStereo.ush:52
+		// declares ResolvedView as a ZERO-INITIALISED static, so
+		// ResolvedView.TemporalAAJitter there is silently (0,0) and the arm
+		// would read as armed and do nothing. This renderer has already lost
+		// days to exactly that -- see the ResolvedView note at VoxelMarch.usf.
+		FVector2f TemporalAAJitter = FVector2f::ZeroVector;
+
 		FVector4f InvDeviceZToWorldZ = FVector4f(0, 0, 0, 0);
 
 		// THE CONE SLOPE. World-space pixel half-width per unit of distance

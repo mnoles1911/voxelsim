@@ -766,12 +766,21 @@ TEXT("voxel.March.SkyLadder"), 0,
 		TEXT("is a worse defect than the graininess it replaced. JUDGE THIS ON A MOVING CAPTURE. ")
 		TEXT("A parked capture cannot show a temporal artefact at all, so a parked A/B is ")
 		TEXT("necessary and is not sufficient.\n")
-		TEXT("NOT ALIGNED TO THE ENGINE'S TAA/TSR JITTER PHASE, on purpose: the emit builds its ")
-		TEXT("quads' NDC by hand and both halves build their rays from the projection DIAGONAL, ")
-		TEXT("while a perspective TAA jitter lives in the third row -- so the marcher's samples ")
-		TEXT("have never sat where TSR believes a sample sits, and there is no phase to align to. ")
-		TEXT("What alignment was for is avoiding a BEAT, and both cycle lengths are powers of two ")
-		TEXT("against r.TemporalAASamples (8), so the combined pattern repeats in 8 frames."),
+		TEXT("NOT THE ENGINE'S TAA/TSR JITTER, AND NOT A SUBSTITUTE FOR IT. This offset is in ")
+		TEXT("full-res PIXELS inside a 2x2 block; the engine's is in NDC and spans +/-0.5 of ONE ")
+		TEXT("full-res pixel, so unscaled it reaches only the middle quarter of the block and can ")
+		TEXT("never place a sample on the outer pixels' centres -- it cannot do this arm's job. ")
+		TEXT("The two are ORTHOGONAL and compose; see voxel.March.TAAJitter, which carries the ")
+		TEXT("engine's phase on the RAY.\n")
+		TEXT("THE OLD TEXT HERE CLAIMED 'there is no phase to align to' BECAUSE THE RAY IS BUILT ")
+		TEXT("FROM THE PROJECTION DIAGONAL WHILE THE JITTER LIVES IN THE THIRD ROW. The premise is ")
+		TEXT("right and is a BUG; the conclusion was wrong. With UE's row-vector convention the ")
+		TEXT("jitter survives the perspective divide as a constant NDC translation, so it inverts ")
+		TEXT("exactly -- see voxel.March.TAAJitter's block for the derivation. Every half-res ")
+		TEXT("jitter number in the archive was measured with the RAY UNJITTERED.\n")
+		TEXT("What this arm's own alignment was for is avoiding a BEAT, and both cycle lengths are ")
+		TEXT("powers of two against r.TemporalAASamples (8), so the combined pattern repeats in 8 ")
+		TEXT("frames."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchHalfResJitterPhase(
@@ -788,6 +797,113 @@ TEXT("voxel.March.SkyLadder"), 0,
 		TEXT("A PINNED PHASE IS A STATIC LATTICE. It is a measurement tool and never a shipping ")
 		TEXT("configuration -- pinned, this arm gives TSR nothing new and reproduces exactly the ")
 		TEXT("graininess it was built to remove. Values are taken modulo the scheme's cycle."),
+		ECVF_RenderThreadSafe);
+
+	// ---- THE ENGINE'S OWN TAA/TSR JITTER, CARRIED BY THE MARCHED RAY -------
+	//
+	// THIS IS NOT voxel.March.HalfRes.Jitter AND THE TWO MUST NOT BE CONFLATED.
+	// That one moves the HALF-RES SAMPLE inside its 2x2 block, in full-res
+	// PIXELS, and its job is to let every full-res pixel be marched once per
+	// cycle. This one applies the ENGINE's per-frame sub-pixel offset -- the
+	// same one every rasterised primitive in the frame already carries -- to the
+	// RAY, in NDC. They are orthogonal: at full res the half-res uniform is
+	// forced to zero and this one is the only offset in play.
+	//
+	// THE DEFECT IT FIXES, and it was asserted to be unfixable three feet above
+	// this line. The comment on HalfRes.Jitter says "there is no phase to align
+	// to" because "both halves build their rays from the projection DIAGONAL,
+	// while a perspective TAA jitter lives in the third row". The FIRST half of
+	// that is exactly right and is the bug; the CONCLUSION does not follow.
+	//
+	// UE writes the jitter into ViewToClip.M[2][0]/M[2][1]
+	// (SceneView.h:631-650, HackAddTemporalAAProjectionJitter, perspective
+	// branch), in NDC units, Y already negated to clip convention
+	// (SceneVisibility.cpp:5450). MarchInvProjDiag is 1/M[0][0], 1/M[1][1], so
+	// it is PROVABLY jitter-invariant -- the marched ray is bit-identical
+	// whether the frame is jittered or not, while the raster geometry around it
+	// moves normally. TSR has been reconstructing terrain from a signal that
+	// carries no new spatial information frame to frame.
+	//
+	// But with UE's row-vector convention and M[2][3] == 1:
+	//
+	//     ndc.x = (view.x / view.z) * M[0][0] + M[2][0]
+	//
+	// the jitter SURVIVES the perspective divide as a constant NDC translation.
+	// So there IS a phase to align to, and inverting that line gives the whole
+	// fix: view.x/view.z = (ndc.x - jitter.x) * (1 / M[0][0]).
+	//
+	// THE SECOND SYMPTOM, which is the one an image A/B may not show and the
+	// depth gate will. VoxelMarch.usf:1961 already projects the hit through the
+	// JITTERED TranslatedWorldToClip, deliberately. The x/y jitter does not
+	// reach clip.z or clip.w, so the depth VALUE is unaffected -- but the point
+	// being projected was found along an UNJITTERED ray, while the raster
+	// prepass writes at that same pixel the depth of the surface along the
+	// JITTERED ray. The two renderers therefore disagree sub-pixel at every
+	// pixel with a depth gradient, which is precisely what voxel.March.VerifyDepth
+	// measures. Turning this on should move that gate DOWN, and that is a
+	// numeric prediction that can come out the other way.
+	//
+	// DEFAULTED TO 0, WHICH IS THE CURRENT SHIPPING BEHAVIOUR. The unjittered
+	// ray is the control every image and every leg in the archive was taken
+	// against, and it stays reachable.
+	//
+	// THE HONEST COST, so nobody reports only the win: a frozen sample is a
+	// STABLE sample. The marcher's parked near-field instability is ~0.0013%
+	// against a 0.0124% control-vs-control noise floor -- it had accidentally
+	// cured its own shimmer by being frozen, and an aliased-but-still image
+	// scores perfectly on a frame-to-frame metric. Expect that number to RISE
+	// toward the quad path's documented 0.92% near / 0.43% far
+	// (Config/DefaultEngine.ini:39-84). This is a TRADE, not a free win.
+	//
+	// NOT A PERMUTATION, for the same reason MarchSampleJitter is not: it
+	// changes no buffer extent, no dispatch shape and no tile size -- only a
+	// float2 uniform that every permutation already binds.
+	TAutoConsoleVariable<int32> CVarVoxelMarchTAAJitter(
+		TEXT("voxel.March.TAAJitter"), 1,
+		TEXT("CARRY THE ENGINE'S TAA/TSR SUB-PIXEL JITTER ON THE MARCHED RAY. DEFAULT 1 SINCE ")
+		TEXT("2026-08-26; 0 is the OLD behaviour and is now a measurement arm, not the shipping ")
+		TEXT("one: the ray is built from the projection DIAGONAL only, so it is bit-")
+		TEXT("identical whether the frame is jittered or not and TSR accumulates a signal with no ")
+		TEXT("new spatial information. 1 = subtract the frame's TemporalAAJitter from NDC before ")
+		TEXT("the ray is built, so the marched sample lands where TSR believes a sample for that ")
+		TEXT("pixel lands -- the same offset every rasterised primitive already carries.\n")
+		TEXT("THE PHASE IS READ IN PreRenderBasePass_RenderThread, NOT IN THE VIEW STASH, and that ")
+		TEXT("is not a preference. PreRenderView_RenderThread runs from OnRenderBegin, which is ")
+		TEXT("BEFORE BeginInitViews adds the jitter to the projection, so GetTemporalAAJitter() ")
+		TEXT("there is exactly (0,0) on every frame and this arm would be silently inert. Read the ")
+		TEXT("'[voxel-march] taajitter window' line to see which of FREE-RUNNING / PINNED / STATIC ")
+		TEXT("AT ZERO the run actually had -- it reports the SETTLED state, not the boot state.\n")
+		TEXT("NOT voxel.March.HalfRes.Jitter. That moves the HALF-RES sample inside its 2x2 block, ")
+		TEXT("in full-res PIXELS. This is the ENGINE's phase, in NDC, and at full res it is the ")
+		TEXT("only offset in play. The two are orthogonal and compose.\n")
+		TEXT("BOTH RAY SITES MOVE TOGETHER OR NEITHER DOES. VoxelMarchBuildRay (the march) and ")
+		TEXT("VoxelMarchSampleDirWorld (the emit's reconstruction) read this same uniform from the ")
+		TEXT("same frame's resolve. If only one moved, the emit would rebuild a different ray than ")
+		TEXT("the one the march measured t along -- a sub-voxel depth error on every pixel, which ")
+		TEXT("VoxelMarch.usf names as the hardest defect to attribute in this renderer.\n")
+		TEXT("THE FALSIFIER, PRE-REGISTERED. INERT: with r.TemporalAA.Debug.OverrideTemporalIndex ")
+		TEXT("pinned to two different values, a settled pinned-pose capture must DIFFER under 1 and ")
+		TEXT("must be identical (to the control-vs-control noise floor) under 0. If arm 1 is also ")
+		TEXT("identical, the uniform never arrived and every image since is of arm 0.\n")
+		TEXT("MEASURED 2026-08-26, PINNED POSE (-61440,-61440 / alt 220 m / pitch -12), AND THIS ")
+		TEXT("IS WHY THE DEFAULT IS 1. IMAGE: 41.44%% of pixels differ between arm 0 and arm 1 ")
+		TEXT("against a 0.0138%% control-vs-control noise floor -- three thousand times the ")
+		TEXT("floor, so the uniform provably arrives. Correctly LOCALISED: terrain 54.0%%, sky ")
+		TEXT("2.3%%, i.e. it moves the marched surface and leaves the un-marched background ")
+		TEXT("alone, which is what a ray-origin offset must do and what a global tint could ")
+		TEXT("not.\n")
+		TEXT("TIMING: FREE. Alternated A,B,A,B to absorb drift -- p50 8.45 / 8.43 / 8.42 / 8.41 ")
+		TEXT("ms. The arm is two subtracts in the ray setup; there is no cost to trade against ")
+		TEXT("and no reason to gate it on scalability.\n")
+		TEXT("THE COST, WHICH IS REAL AND IS NOT TIME. A frozen sample is a STABLE sample, and ")
+		TEXT("the marcher had accidentally cured its own shimmer by being aliased-but-still. ")
+		TEXT("Parked instability RISES ~30x, 0.0071%% -> 0.2097%%. That is the honest price and ")
+		TEXT("it is paid knowingly. FOR SCALE: the quad path this renderer replaces ships at ")
+		TEXT("0.92%% near / 0.43%% far (Config/DefaultEngine.ini:39-84), so arm 1 is still ")
+		TEXT("4.4x steadier than the path already in the owner's hands. Report both sides.\n")
+		TEXT("WHAT THE PARKED NUMBER CANNOT TELL YOU: shimmer IN MOTION. A parked capture ")
+		TEXT("cannot show a temporal artefact at all. The parked A/B is necessary and is not ")
+		TEXT("sufficient; the shipping verdict is a moving PIE session."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchHTileProbe(
@@ -948,6 +1064,12 @@ TEXT("voxel.March.SkyLadder"), 0,
 	// One-shot complaint for the DBuffer cvar, so an operator who sets it to 1
 	// finds out why nothing happened instead of concluding decals are broken.
 	bool GVoxelMarchDBufferComplained = false;
+
+	// One-shot latch for voxel.March.TAAJitter's sign self-test. A file-scope
+	// bool rather than a function static so the check is re-runnable by nothing
+	// -- it is a statement about the engine's matrices, not about a leg, and one
+	// PASS per process is the whole of it.
+	bool GVoxelMarchTAAJitterSignChecked = false;
 
 	// ---- WHAT THE MARCH LAST ACTUALLY DISPATCHED ---------------------------
 	//
@@ -3731,6 +3853,15 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// forces the mode to 0 when the permutation is off, so this can never report
 	// a licence the kernel has no code for.
 	Out.BlockSkyMode = Arm.BlockSkyMode;
+	// The chunk-cell census is compiled under VOXEL_MARCH_HOLE_STATS at ANY
+	// level, so its arming is the hole-stats arming and nothing else. Carried
+	// as its own named flag rather than left to the reader to infer from
+	// bArmed: the eight census words can be zero for two entirely different
+	// reasons (never compiled in, or compiled in against a kernel that made no
+	// lookups) and a consumer must be able to separate them without inspecting
+	// the numbers it is trying to interpret -- the same rule bZCutArmed and
+	// bBlockSkipArmed exist for.
+	Out.bCensusArmed = Arm.bHoleStats;
 	if (!GMarchState.IsValid())
 	{
 		return Out;
@@ -3740,12 +3871,14 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	const bool bBreakdownArmed = Out.bBreakdownArmed;
 	const bool bZCutArmed = Out.bZCutArmed;
 	const bool bBlockSkipArmed = Out.bBlockSkipArmed;
+	const bool bCensusArmed = Out.bCensusArmed;
 	const int32 BlockSkyMode = Out.BlockSkyMode;
 	Out = GMarchState->HoleWindow;
 	Out.bArmed = bArmed;
 	Out.bBreakdownArmed = bBreakdownArmed;
 	Out.bZCutArmed = bZCutArmed;
 	Out.bBlockSkipArmed = bBlockSkipArmed;
+	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	// Kept for the HUD's 1 Hz peek -- the panel must show what the log drained
 	// without becoming a second drainer (two drainers of one accumulator each
@@ -3773,6 +3906,8 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	const bool bZCutArmed = CVarVoxelMarchZCut.GetValueOnAnyThread() != 0;
 	// See the drain: the arm, not the cvar, because this one is a permutation.
 	const bool bBlockSkipArmed = Arm.bBlockSkip;
+	// See the drain: the census rides the hole-stats permutation itself.
+	const bool bCensusArmed = Arm.bHoleStats;
 	const int32 BlockSkyMode = Arm.BlockSkyMode;
 	Out = GMarchState->LastDrainedHoleWindow;
 	// The arm flags track the switch NOW, not the switch as it stood when the
@@ -3782,6 +3917,7 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	Out.bBreakdownArmed = bBreakdownArmed;
 	Out.bZCutArmed = bZCutArmed;
 	Out.bBlockSkipArmed = bBlockSkipArmed;
+	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	return Out;
 }
@@ -3802,6 +3938,16 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchViewParameters, )
 	SHADER_PARAMETER(FVector2f, MarchViewRectMin)
 	SHADER_PARAMETER(FVector2f, MarchViewRectSize)
 	SHADER_PARAMETER(FVector2f, MarchInvProjDiag)
+	// THE ENGINE'S TAA/TSR JITTER FOR THIS FRAME, IN NDC (voxel.March.TAAJitter),
+	// or (0,0) when the arm is off. Subtracted from NDC before the ray is built,
+	// which is the exact inverse of what UE does to the projection's third row.
+	//
+	// RIDES THIS STRUCT FOR THE REASON THE WHOLE STRUCT EXISTS: the march and
+	// the emit's reconstruction must build the SAME ray for the same pixel, and
+	// a jitter applied to one and not the other is a sub-voxel depth error on
+	// every pixel. Bound on every permutation -- a shader global with no entry
+	// here is an UNBOUND uniform, which fails the global shader compile outright.
+	SHADER_PARAMETER(FVector2f, MarchTemporalAAJitter)
 	// THE HALF-RES LATTICE'S PER-FRAME OFFSET, in full-res pixels, inside the
 	// 2x2 block. It rides THIS struct rather than any one pass's own parameters
 	// precisely because the march, the depth pre-emit, the GBuffer emit and the
@@ -4320,6 +4466,26 @@ class FVoxelMarchCS : public FGlobalShader
 		// into an #error rather than trusting anyone to notice.
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_BLOCK_CHUNKS"),
 		                         int32(FVoxelMarchChunkIndex::kBlockChunks));
+		// The chunk-cell lookup census (VoxelMarchLookupChunk's return-site
+		// partition), pushed from the same enum for the same reason every
+		// other word is: a hand mirror here reads a plausible number out of
+		// the wrong slot.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELLS_PROBED"),
+		                         int32(VoxelMarchHoleWord::CellsProbed));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_NONRESIDENT"),
+		                         int32(VoxelMarchHoleWord::CellNonResident));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_INDEX_EMPTY"),
+		                         int32(VoxelMarchHoleWord::CellIndexEmpty));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_SLOT_REJECT"),
+		                         int32(VoxelMarchHoleWord::CellSlotReject));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_STALE"),
+		                         int32(VoxelMarchHoleWord::CellStale));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_RESIDENT_EMPTY"),
+		                         int32(VoxelMarchHoleWord::CellResidentEmpty));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_BRICK_OOB"),
+		                         int32(VoxelMarchHoleWord::CellBrickOOB));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_REAL"),
+		                         int32(VoxelMarchHoleWord::CellReal));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WORDS"),
 		                         int32(VoxelMarchHoleWord::Count));
 	}
@@ -4363,15 +4529,33 @@ static_assert(int32(VoxelMarchHoleWord::BlockSkyLicensed) -
               "appended -- it fired on a correct layout, which is the assert doing its "
               "job: it guards a GROUP SIZE, so it must be pinned against the first word "
               "AFTER the group, never against Count once anything can follow.");
-// AND THE SKY-LICENCE TRIO IS PINNED THE SAME WAY, against Count because it is
-// currently last. WHOEVER APPENDS NEXT repoints THIS one at their first word.
-// That has now happened three times (reason group, ZCut, BlockSkip) and each
-// time the build failed loudly rather than the counter silently reading a
-// neighbouring group's value -- which is the whole reason these exist.
-static_assert(int32(VoxelMarchHoleWord::Count) -
+// AND THE SKY-LICENCE TRIO IS PINNED THE SAME WAY. REPOINTED 2026-08-26 from
+// Count to CellsProbed when the chunk-cell census was appended -- it fired on a
+// correct layout, which is the assert doing its job for the FOURTH time (reason
+// group, ZCut, BlockSkip, and now the census). Each time the build failed
+// loudly rather than a counter silently reading a neighbouring group's value,
+// which is the whole reason these exist.
+static_assert(int32(VoxelMarchHoleWord::CellsProbed) -
                       int32(VoxelMarchHoleWord::BlockSkyLicensed) == 3,
               "the sky-licence word group is not three words, or something was appended "
               "after it without repointing this assert at the new group's first word");
+// THE CHUNK-CELL CENSUS IS PINNED AGAINST Count, because it is currently last.
+// WHOEVER APPENDS NEXT repoints THIS one at their first word.
+//
+// EIGHT WORDS, AND THE COUNT IS LOAD-BEARING IN A WAY THE OTHER GROUPS' ARE
+// NOT: seven of them are outcome buckets that the perf line SUMS and compares
+// against the eighth. A ninth word appended INSIDE this group rather than after
+// it would join neither the sum nor the denominator and the identity would keep
+// printing PASS while the census silently lost a return path -- so the size is
+// asserted here as well as checked at runtime.
+static_assert(int32(VoxelMarchHoleWord::Count) -
+                      int32(VoxelMarchHoleWord::CellsProbed) == 8,
+              "the chunk-cell census word group is not eight words (one denominator plus "
+              "seven outcomes, one per return site of VoxelMarchLookupChunk), or "
+              "something was appended after it without repointing this assert at the new "
+              "group's first word. If you added a return site to that function, it needs "
+              "a bucket of its own AND a slot in the perf line's identity sum -- see "
+              "VoxelWorldSubsystem.cpp's 'Voxel march cell census' block.");
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchCS, VOXEL_MARCH_USF, "VoxelMarchMain", SF_Compute);
 
 class FVoxelMarchCompactCS : public FGlobalShader
@@ -5506,6 +5690,18 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			const uint32 BlkSkyLic = Src[VoxelMarchHoleWord::BlockSkyLicensed];
 			const uint32 BlkSkyRunB = Src[VoxelMarchHoleWord::BlockSkyRunBlocks];
 			const uint32 BlkSkyRuns = Src[VoxelMarchHoleWord::BlockSkyRuns];
+			// The chunk-cell lookup census. Read on EVERY frame for the reason
+			// the three groups above are: the cheap kernel writes them too, so
+			// gating them behind the level-2 fold would report the census inert
+			// on every level-1 leg.
+			const uint32 CellsProbed = Src[VoxelMarchHoleWord::CellsProbed];
+			const uint32 CellNonRes = Src[VoxelMarchHoleWord::CellNonResident];
+			const uint32 CellIdxEmpty = Src[VoxelMarchHoleWord::CellIndexEmpty];
+			const uint32 CellSlotRej = Src[VoxelMarchHoleWord::CellSlotReject];
+			const uint32 CellStale = Src[VoxelMarchHoleWord::CellStale];
+			const uint32 CellResEmpty = Src[VoxelMarchHoleWord::CellResidentEmpty];
+			const uint32 CellBrickOOB = Src[VoxelMarchHoleWord::CellBrickOOB];
+			const uint32 CellReal = Src[VoxelMarchHoleWord::CellReal];
 			uint32 ByLevel[VoxelMarchHoleWord::kNumLevels];
 			uint32 ByReason[VoxelMarchHoleWord::kNumReasons];
 			for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
@@ -5533,6 +5729,14 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.BlockSkyLicensed += BlkSkyLic;
 			State->HoleWindow.BlockSkyRunBlocks += BlkSkyRunB;
 			State->HoleWindow.BlockSkyRuns += BlkSkyRuns;
+			State->HoleWindow.CellsProbed += CellsProbed;
+			State->HoleWindow.CellNonResident += CellNonRes;
+			State->HoleWindow.CellIndexEmpty += CellIdxEmpty;
+			State->HoleWindow.CellSlotReject += CellSlotRej;
+			State->HoleWindow.CellStale += CellStale;
+			State->HoleWindow.CellResidentEmpty += CellResEmpty;
+			State->HoleWindow.CellBrickOOB += CellBrickOOB;
+			State->HoleWindow.CellReal += CellReal;
 			State->HoleWindow.Frames++;
 			if (Slot.ArmLevel >= 2)
 			{
@@ -6082,8 +6286,41 @@ void FVoxelMarchRenderExtension::PreRenderView_RenderThread(FRDGBuilder& GraphBu
 	Entry.ViewRect = ViewRect;
 	Entry.ViewToTranslatedWorld = FMatrix44f(VM.GetInvTranslatedViewMatrix());
 	Entry.InvProjDiag = FVector2f(1.0f / ProjXX, 1.0f / ProjYY);
-	Entry.InvDeviceZToWorldZ = InView.InvDeviceZToWorldZTransform;
-	Entry.ViewUniformBuffer = InView.ViewUniformBuffer.GetReference();
+
+	// THE FRAME'S TAA/TSR PHASE, resolved once (voxel.March.TAAJitter).
+	//
+	// VM.GetTemporalAAJitter() is the value UE added to ViewToClip.M[2][0] and
+	// M[2][1] -- already in NDC, already sign-flipped in Y to clip convention
+	// (SceneVisibility.cpp:5450 passes SampleY * -2 / Height). So it subtracts
+	// straight off the shader's Ndc, which has itself already been flipped to
+	// clip convention on the line above the ray. No scaling, no second negate.
+	//
+	// Read ONCE, not per bind site: the march, the emit and the verify gate all
+	// copy this Entry, so they provably share one phase.
+	// TemporalAAJitter IS DELIBERATELY NOT RESOLVED HERE, AND THIS IS THE WHOLE
+	// TRAP. THIS HOOK RUNS BEFORE THE FRAME HAS A JITTER AT ALL.
+	//
+	// PreRenderView_RenderThread is called from FSceneRenderer::OnRenderBegin
+	// (SceneRendering.cpp:4303), which the deferred renderer runs at
+	// DeferredShadingRenderer.cpp:1892 -- deliberately early, so that an
+	// extension can still move the camera ("This must be done after
+	// ViewExtension->PreRenderView_RenderThread performs any updates to the
+	// camera position", SceneRendering.cpp:4317). The jitter is added ~230 lines
+	// later, in BeginInitViews (:2123) -> PreVisibilityFrameSetup
+	// (SceneVisibility.cpp:5918 -> 5911 -> 4986) ->
+	// HackAddTemporalAAProjectionJitter (:5450).
+	//
+	// So VM.GetTemporalAAJitter() is EXACTLY (0,0) here on every frame, in every
+	// configuration, however TSR is set up. MEASURED 2026-08-26: resolving it at
+	// this hook produced (0.000000, 0.000000) for 120+ consecutive frames on a
+	// free-running capture with TSR upscaling 1552x873 -> 2560x1440, and the arm
+	// was SILENTLY INERT while every switch read as armed.
+	//
+	// It is resolved in PreRenderBasePass_RenderThread instead, which runs after
+	// InitViews. Nothing else in this stash has the problem: the jitter never
+	// touches the projection DIAGONAL that InvProjDiag is taken from, nor the
+	// view matrix, so those are the same before and after.
+	Entry.TemporalAAJitter = FVector2f::ZeroVector;
 
 	// THE PRECISION SEAM, and it is the same one the spike documents: both
 	// operands are world UU at planet scale (tens of km, past where float32 UU
@@ -6172,6 +6409,258 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		FScopeLock Guard(&State->Lock);
 		State->Stats.DeclinedNoView++;
 		return;
+	}
+
+	// ---- THE FRAME'S TAA/TSR PHASE, RESOLVED WHERE IT EXISTS ---------------
+	//
+	// HERE AND NOT IN THE STASH HOOK. PreRenderView_RenderThread runs from
+	// OnRenderBegin (DeferredShadingRenderer.cpp:1892), and the jitter is not
+	// added to the projection until BeginInitViews (:2123) ->
+	// PreVisibilityFrameSetup -> HackAddTemporalAAProjectionJitter
+	// (SceneVisibility.cpp:5450). Read at the stash it is always exactly (0,0);
+	// read HERE, inside the base pass, it is the real per-frame offset.
+	//
+	// ONE RESOLVE FEEDS ALL THREE CONSUMERS. This writes into the stashed
+	// FViewMarch, and PostRenderBasePassDeferred_RenderThread recovers the SAME
+	// entry through FindView(&InView) later in the same frame -- so the march,
+	// the emit's ray reconstruction and the verify gate provably share one
+	// phase, which is the property the whole FVoxelMarchViewParameters struct
+	// exists to guarantee. Placed above the volume guard so a frame that
+	// declines to march still leaves a truthful value behind rather than a
+	// stale one.
+	//
+	// ViewKey is the FSceneView this entry was stashed from, this frame; Views
+	// is pruned by frame number at the top of the stash hook, so it cannot be a
+	// pointer from a previous frame.
+	{
+		const bool bArmed = CVarVoxelMarchTAAJitter.GetValueOnRenderThread() != 0;
+		FVector2D FrameJitter = FVector2D::ZeroVector;
+		// WHAT THE SHADER WILL ACTUALLY GET, read back OUT of the stash entry
+		// after the write rather than re-derived from bArmed and FrameJitter.
+		// The house failure is a join COMPUTED instead of CHECKED: "arm is on
+		// and the engine phase is non-zero, therefore the shader is jittered"
+		// is exactly that inference, and it stays true even if the entry the
+		// bind sites read is a different one. This is the value the three bind
+		// sites copy into MarchTemporalAAJitter, so a stuck or zero reading
+		// here is a stuck or zero UNIFORM.
+		FVector2f ResolvedJitter = FVector2f::ZeroVector;
+		FIntRect JitterRect;
+		for (FViewMarch& E : Views)
+		{
+			if (E.ViewKey == nullptr)
+			{
+				continue;
+			}
+			const FVector2D J = E.ViewKey->ViewMatrices.GetTemporalAAJitter();
+			E.TemporalAAJitter =
+			    bArmed ? FVector2f(float(J.X), float(J.Y)) : FVector2f::ZeroVector;
+			FrameJitter = J;
+			ResolvedJitter = E.TemporalAAJitter; // read back, not re-derived
+			JitterRect = E.ViewRect;
+		}
+
+		// ---- THE SIGN, CHECKED AGAINST THE ENGINE'S OWN MATRICES ----------
+		//
+		// ONE SHOT, AND IT CAN FAIL. Getting the sign backwards would not look
+		// like a bug: it would DOUBLE the misalignment instead of removing it,
+		// and every other reading in this investigation -- the arm engages, the
+		// effect scales with |J|, the image changes far above the noise floor --
+		// would come out exactly the same. Image-space displacement estimators
+		// were tried first and could not settle it: phase correlation and a
+		// best-fit translation DISAGREED on sign for one of the two pinned
+		// phases, because the two images differ by more than a translation
+		// (different sub-pixel samples of an aliased signal, then reconstructed).
+		//
+		// So this asks the engine instead, using its own no-AA matrix rather
+		// than anything re-derived here:
+		//
+		//   A. the projection DIAGONAL must be identical with and without the
+		//      jitter -- that is the whole defect, stated as an assertion:
+		//      MarchInvProjDiag physically cannot see the jitter.
+		//   B. the jitter must be exactly the THIRD-ROW delta between the
+		//      jittered and un-jittered matrices, i.e.
+		//      ViewToClip.M[2][0] - NoAA.M[2][0] == GetTemporalAAJitter().X.
+		//
+		// If both hold then, with UE's row-vector convention and M[2][3] == 1,
+		// ndc = d * M00 + J and therefore d = (ndc - J) / M00 -- which is
+		// arithmetic, not judgement, and is exactly what the shader now does.
+		if (!GVoxelMarchTAAJitterSignChecked && !FrameJitter.IsNearlyZero())
+		{
+			for (const FViewMarch& E : Views)
+			{
+				if (E.ViewKey == nullptr)
+				{
+					continue;
+				}
+				GVoxelMarchTAAJitterSignChecked = true;
+				const FViewMatrices& CheckVM = E.ViewKey->ViewMatrices;
+				const FMatrix Jittered = CheckVM.GetViewToClip();
+				const FMatrix NoAA = CheckVM.ComputeProjectionNoAAMatrix();
+				const double DiagDX = Jittered.M[0][0] - NoAA.M[0][0];
+				const double DiagDY = Jittered.M[1][1] - NoAA.M[1][1];
+				const double RowDX = Jittered.M[2][0] - NoAA.M[2][0];
+				const double RowDY = Jittered.M[2][1] - NoAA.M[2][1];
+				const FVector2D J = CheckVM.GetTemporalAAJitter();
+				const bool bDiagClean = FMath::IsNearlyZero(DiagDX, 1e-12) &&
+				                        FMath::IsNearlyZero(DiagDY, 1e-12);
+				const bool bRowIsJitter = FMath::IsNearlyEqual(RowDX, J.X, 1e-12) &&
+				                          FMath::IsNearlyEqual(RowDY, J.Y, 1e-12);
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("[voxel-march] taajitter signcheck: diag delta (%.3e, %.3e) -> %s | "
+				            "row2 delta (%+.9f, %+.9f) vs jitter (%+.9f, %+.9f) -> %s | %s"),
+				       DiagDX, DiagDY,
+				       bDiagClean ? TEXT("DIAGONAL IS JITTER-BLIND (the defect, asserted)")
+				                  : TEXT("*** DIAGONAL MOVED -- the whole diagnosis is wrong ***"),
+				       RowDX, RowDY, J.X, J.Y,
+				       bRowIsJitter ? TEXT("JITTER LIVES IN ROW 2, EXACTLY")
+				                    : TEXT("*** ROW 2 DELTA IS NOT THE JITTER ***"),
+				       (bDiagClean && bRowIsJitter)
+				           ? TEXT("PASS: ndc = d*M00 + J, so d = (ndc - J)/M00 -- SUBTRACT is "
+				                  "correct, which is what VoxelMarch.usf:869 and :1044 do")
+				           : TEXT("FAIL: do not trust voxel.March.TAAJitter until this is "
+				                  "explained"));
+				break;
+			}
+		}
+
+		// ---- PROVE IT, AND LET IT FAIL ------------------------------------
+		//
+		// Reports the ENGINE's phase whether the arm is on or off, because the
+		// question "is there a phase to carry at all" is logically upstream of
+		// the arm and must be answerable without it. The image A/B cannot answer
+		// it: measured 2026-08-26, the quad path at this project's vista pose
+		// draws only a smooth untextured ridge, and a sub-pixel shift on a
+		// smooth gradient moves no pixel by a readable amount. A number can.
+		//
+		// THE INERT CASE IS REAL AND IS NOT ALWAYS A BUG: with no temporal AA
+		// method active UE never jitters at all, GetTemporalAAJitter() is
+		// honestly (0,0), and an A/B taken in that state compares the arm
+		// against ITSELF while every switch reads as armed. That is the failure
+		// this block exists to make loud -- it has already caught one.
+		// A WINDOW, NOT THE FIRST FEW FRAMES, AND THAT DISTINCTION COST A BUILD.
+		//
+		// The first version logged the first 8 DISTINCT offsets and stopped. All
+		// eight land in the first eight rendered frames -- before -ExecCmds has
+		// run -- so it reported the state at BOOT and could never report the
+		// state at the SHUTTER. It printed "arm is OFF" on a run launched with
+		// voxel.March.TAAJitter 1, and showed a free-running sequence on a run
+		// launched with r.TemporalAA.Debug.OverrideTemporalIndex 5, purely
+		// because both cvars land later. Neither reading was about the
+		// configuration under test.
+		//
+		// So the settled instrument is a WINDOW COUNT: how many times the offset
+		// CHANGED over the last kJitterWindow frames. Free-running that is ~the
+		// window size; pinned by OverrideTemporalIndex it is exactly 0 with a
+		// non-zero offset; with no temporal AA at all it is 0 with a zero
+		// offset. Three states, three signatures, none of them silent. Same
+		// argument the half-res arm's 'phasesSeen on a settled leg' makes.
+		constexpr int32 kJitterWindow = 300;
+		static int32 DistinctLogged = 0;
+		static FVector2D LastLogged(3.4e+38, 3.4e+38);
+		static int32 ZeroFrames = 0;
+		static bool bZeroComplained = false;
+		static bool bLastArmed = false;
+		static int32 WindowFrames = 0;
+		static int32 WindowChanges = 0;
+		static FVector2D WindowPrev(3.4e+38, 3.4e+38);
+		// The SAME window over the resolved uniform. Two counters and not one,
+		// because they answer two different questions and only the second is
+		// about this arm: "is there a phase to carry" (engine) vs "does the
+		// value the shader reads actually move" (resolved). With the arm ON
+		// they must agree; with it OFF the resolved count must be 0 at a zero
+		// offset while the engine count is still ~the window. If the engine
+		// count is high and the resolved count is 0 while the arm reads ON,
+		// the write above is not reaching the entry the binds read -- which is
+		// precisely the silent-inert failure this whole block exists for.
+		static int32 WindowResolvedChanges = 0;
+		static FVector2f WindowResolvedPrev(3.4e+38f, 3.4e+38f);
+
+		// Re-open the distinct log whenever the ARM ITSELF flips, so the frame
+		// -ExecCmds turns this on prints with "ON" instead of being swallowed by
+		// a counter that filled up during startup.
+		if (bArmed != bLastArmed)
+		{
+			bLastArmed = bArmed;
+			DistinctLogged = 0;
+			LastLogged = FVector2D(3.4e+38, 3.4e+38);
+		}
+
+		++WindowFrames;
+		if (FrameJitter != WindowPrev)
+		{
+			++WindowChanges;
+			WindowPrev = FrameJitter;
+		}
+		if (ResolvedJitter != WindowResolvedPrev)
+		{
+			++WindowResolvedChanges;
+			WindowResolvedPrev = ResolvedJitter;
+		}
+		if (WindowFrames >= kJitterWindow)
+		{
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("[voxel-march] taajitter window: %d frames, engine offset CHANGED %d "
+			            "times | UNIFORM (what the shader reads) CHANGED %d times, now "
+			            "(%+.6f, %+.6f) | current engine (%+.6f, %+.6f) NDC | arm %s | %s | %s"),
+			       WindowFrames, WindowChanges, WindowResolvedChanges, ResolvedJitter.X,
+			       ResolvedJitter.Y, FrameJitter.X, FrameJitter.Y,
+			       bArmed ? TEXT("ON") : TEXT("OFF"),
+			       (bArmed && WindowResolvedChanges <= 1)
+			           ? TEXT("*** UNIFORM IS STUCK -- arm reads ON but the value the binds copy "
+			                  "did not move across the window: SILENTLY INERT, do not trust any "
+			                  "image from this leg ***")
+			           : (bArmed ? TEXT("UNIFORM IS LIVE -- the marched ray carries a moving "
+			                            "sub-pixel phase")
+			                     : TEXT("uniform held at zero, as arm 0 requires")),
+			       WindowChanges == 0
+			           ? (FrameJitter.IsNearlyZero()
+			                  ? TEXT("STATIC AT ZERO -- no temporal AA is running, so this arm "
+			                         "cannot do anything and an A/B here is arm-vs-itself")
+			                  : TEXT("PINNED -- a fixed non-zero phase, i.e. "
+			                         "r.TemporalAA.Debug.OverrideTemporalIndex is in force"))
+			           : TEXT("FREE-RUNNING -- the engine sequence is live"));
+			WindowFrames = 0;
+			WindowChanges = 0;
+			WindowResolvedChanges = 0;
+		}
+
+		if (FrameJitter != LastLogged && DistinctLogged < 8)
+		{
+			LastLogged = FrameJitter;
+			++DistinctLogged;
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("[voxel-march] taajitter: engine phase #%d = (%+.6f, %+.6f) NDC = "
+			            "(%+.3f, %+.3f) px of a %dx%d view | marcher arm is %s"),
+			       DistinctLogged, FrameJitter.X, FrameJitter.Y,
+			       FrameJitter.X * 0.5 * double(FMath::Max(1, JitterRect.Width())),
+			       FrameJitter.Y * -0.5 * double(FMath::Max(1, JitterRect.Height())),
+			       JitterRect.Width(), JitterRect.Height(),
+			       bArmed
+			           ? TEXT("ON (voxel.March.TAAJitter 1) -- this offset is subtracted from "
+			                  "Ndc in BOTH VoxelMarchBuildRay and VoxelMarchSampleDirWorld")
+			           : TEXT("OFF (voxel.March.TAAJitter 0) -- the ray ignores this offset "
+			                  "entirely, which is the shipping behaviour"));
+		}
+
+		if (FrameJitter.IsNearlyZero())
+		{
+			++ZeroFrames;
+			if (ZeroFrames == 120 && !bZeroComplained)
+			{
+				bZeroComplained = true;
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("[voxel-march] taajitter: NO ENGINE JITTER -- 120 consecutive frames "
+				            "at exactly (0,0), read INSIDE the base pass where the jitter does "
+				            "exist. UE only jitters the projection when a temporal AA method is "
+				            "active, so check r.AntiAliasingMethod and r.TemporalAASamples. "
+				            "voxel.March.TAAJitter CANNOT DO ANYTHING in this state, and an A/B "
+				            "taken here compares the arm against itself."));
+			}
+		}
+		else
+		{
+			ZeroFrames = 0;
+		}
 	}
 
 	TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe> Volume;
@@ -6677,6 +7166,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		MarchView.MarchViewRectMin = FVector2f(Entry.ViewRect.Min);
 		MarchView.MarchViewRectSize = FVector2f(Size);
 		MarchView.MarchInvProjDiag = Entry.InvProjDiag;
+		MarchView.MarchTemporalAAJitter = Entry.TemporalAAJitter;
 		MarchView.MarchInvDeviceZToWorldZ = Entry.InvDeviceZToWorldZ;
 		MarchView.MarchPixelConeSlope = Entry.PixelConeSlope;
 		MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
@@ -7725,6 +8215,7 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->MarchView.MarchViewRectMin = FVector2f(Entry->ViewRect.Min);
 		Params->MarchView.MarchViewRectSize = FVector2f(Entry->ViewRect.Size());
 		Params->MarchView.MarchInvProjDiag = Entry->InvProjDiag;
+		Params->MarchView.MarchTemporalAAJitter = Entry->TemporalAAJitter;
 		Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 		Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
@@ -7976,6 +8467,7 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 				Params->MarchView.MarchViewRectMin = FVector2f(Entry->ViewRect.Min);
 				Params->MarchView.MarchViewRectSize = FVector2f(Entry->ViewRect.Size());
 				Params->MarchView.MarchInvProjDiag = Entry->InvProjDiag;
+				Params->MarchView.MarchTemporalAAJitter = Entry->TemporalAAJitter;
 				Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 				Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();

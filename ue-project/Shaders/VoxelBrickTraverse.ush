@@ -1863,6 +1863,47 @@ static uint GVoxelMarchIndexGrid = 0u;
 // underneath the comparator defect of 2026-08-21. See the check itself.
 static uint GVoxelMarchRecordLevel = 0u;
 
+#if VOXEL_MARCH_HOLE_STATS
+// ---- THE CHUNK-CELL LOOKUP CENSUS -----------------------------------------
+//
+// EIGHT PER-THREAD COUNTERS, ACCUMULATED INSIDE VoxelMarchLookupChunk ITSELF
+// and folded once per thread by the kernel (VoxelMarch.usf). Observation only:
+// nothing here may change any ray's bHit or THitUU, exactly as the doctrine
+// block on VOXEL_MARCH_HOLE_STATS requires.
+//
+// WHY STATICS AND NOT FIELDS ON FVoxelMarchHit, WHICH IS HOW EVERY OTHER GROUP
+// IN THIS FILE IS PLUMBED. Those groups are accumulated by the WALK, which owns
+// an H and hands it up one return path. This census is accumulated by the
+// LOOKUP, which has four call sites (the chunk loop, the shell probe's own
+// resolve, the fallthrough retry, and the kernel's post-walk shading lookup)
+// and returns a FVoxelMarchChunkCache that three of them discard. Threading a
+// count out through the cache would mean adding an accumulate at every call
+// site, and the value of this instrument is precisely that its total must
+// reconstruct from its parts -- a call site someone forgets to accumulate
+// breaks the identity and reads as an instrument defect. Incrementing where the
+// branch is taken makes MISSING A CALL SITE IMPOSSIBLE: there is one writer per
+// outcome and it sits on the branch it names.
+//
+// A THREAD-LOCAL uint IS THE RIGHT WIDTH. These count chunk-cell decisions made
+// by ONE ray, not by a frame -- hundreds to low thousands against a budget of
+// MarchStepBudget -- so there is no wrap here. The frame-scale sum is a uint32
+// in the readback buffer, which the CPU widens to uint64 per window; a single
+// frame at 1552x873 with ~1e3 probes per ray reaches ~1.4e9 and is inside a
+// uint32, but only just, which is why the CPU folds per frame rather than
+// letting the GPU buffer accumulate across a window.
+//
+// READ THE ++ SITE, NOT THE NAME. Each of the seven outcome counters is
+// incremented at exactly one place: the return site whose branch it describes.
+static uint GVoxelMarchCellsProbed = 0u;        // every call
+static uint GVoxelMarchCellNonResident = 0u;    // index resident bit clear
+static uint GVoxelMarchCellIndexEmpty = 0u;     // index anySolid bit clear (never fires today)
+static uint GVoxelMarchCellSlotReject = 0u;     // slot out of bounds, or stride mismatch
+static uint GVoxelMarchCellStale = 0u;          // record fetched, origin/level disagreed
+static uint GVoxelMarchCellResidentEmpty = 0u;  // record fetched, says entirely air
+static uint GVoxelMarchCellBrickOOB = 0u;       // record fetched, brick base out of pool
+static uint GVoxelMarchCellReal = 0u;           // a real chunk
+#endif
+
 void VoxelMarchBeginLevel(uint Level)
 {
 	GVoxelMarchIndexLevel = Level;
@@ -2173,6 +2214,13 @@ uint VoxelMarchClassifyAbsent(uint Entry, int3 ChunkCoord)
 FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 {
 	FVoxelMarchChunkCache C = VoxelMarchNoChunk();
+#if VOXEL_MARCH_HOLE_STATS
+	// THE DENOMINATOR, counted on ENTRY and before any early-out, so that no
+	// arrangement of the branches below can leave a call uncounted. Every one
+	// of the seven outcome counters is incremented on exactly one return path,
+	// so the seven must sum to this -- the identity the CPU prints as PASS/FAIL.
+	++GVoxelMarchCellsProbed;
+#endif
 
 	const uint Entry = MarchChunkIndex[VoxelMarchIndexCell(ChunkCoord)];
 #if VOXEL_MARCH_HOLE_STATS >= 2
@@ -2225,6 +2273,9 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 #endif
 	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) == 0u)
 	{
+#if VOXEL_MARCH_HOLE_STATS
+		++GVoxelMarchCellNonResident;
+#endif
 		return C;
 	}
 	// anySolid clear means the chunk is resident and entirely air. Rejected
@@ -2241,6 +2292,17 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 		// per axis, so no live chunk can alias this cell.
 		C.bResident = true;
 #endif
+#if VOXEL_MARCH_HOLE_STATS
+		// EXPECTED TO STAY AT EXACTLY ZERO, and counted anyway. All three
+		// writers of the index entry hardcode this bit SET
+		// (VoxelMarchChunkIndex.cpp:867 and :1362, VoxelMarchIndexScatter.usf
+		// :184), so this branch has never fired -- which is the whole reason
+		// the census exists, since the chunks it WOULD reject are instead
+		// paying a record fetch and landing in GVoxelMarchCellResidentEmpty
+		// below. A non-zero here means the bit became real and the headline
+		// ratio is now measuring the remainder rather than the prize.
+		++GVoxelMarchCellIndexEmpty;
+#endif
 		return C;
 	}
 
@@ -2250,6 +2312,9 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// the one failure on this path that looks like terrain.
 	if (Slot >= VoxelBrickChunkSlots)
 	{
+#if VOXEL_MARCH_HOLE_STATS
+		++GVoxelMarchCellSlotReject;
+#endif
 		return C;
 	}
 
@@ -2272,6 +2337,15 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// mistake for terrain. One compare per lookup buys that.
 	if (VoxelBrickChunkRecordDwords != VOXEL_MARCH_CHUNK_RECORD_DWORDS)
 	{
+#if VOXEL_MARCH_HOLE_STATS
+		// THE SAME BUCKET AS THE SLOT BOUNDS CHECK ABOVE, deliberately: both
+		// are pre-fetch corruption guards, both are structurally zero on a
+		// healthy build, and separating them would add a word to the readback
+		// to distinguish two impossibilities from each other. If this bucket is
+		// ever non-zero the world is already empty and the census is the least
+		// of it.
+		++GVoxelMarchCellSlotReject;
+#endif
 		return C;
 	}
 
@@ -2300,6 +2374,13 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	const int3 WantOrigin = ChunkCoord * 32;
 	if (any(RecOrigin != WantOrigin) || (LevelAndFlags & 0xFu) != GVoxelMarchRecordLevel)
 	{
+#if VOXEL_MARCH_HOLE_STATS
+		// ON THE PAYING SIDE OF THE CENSUS. The four record dwords above have
+		// already been fetched at this point -- that is precisely how the
+		// staleness was discovered -- so this outcome belongs in the
+		// recordFetches denominator and not with the pre-fetch rejects.
+		++GVoxelMarchCellStale;
+#endif
 		return C;
 	}
 	// bit 4 anySolid, bit 5 allSolid. Re-checked from the record because the
@@ -2310,12 +2391,34 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 		// The validated record itself says empty: real air, so no fallthrough.
 		C.bResident = true;
 #endif
+#if VOXEL_MARCH_HOLE_STATS
+		// THE NUMBER THE CENSUS EXISTS FOR. This chunk is resident, its record
+		// is valid, and the record says it is entirely air -- so the four
+		// scattered dwords fetched out of the ~15.7 MB chunk table bought
+		// exactly one bit of information, and that bit already has a home in
+		// the index dword this function loaded first
+		// (VOXEL_MARCH_INDEX_ANYSOLID_BIT). Every increment here is one fetch
+		// an honest anySolid writer would delete, at zero added cost, because
+		// the mask and compare that would reject it sit on a value already in
+		// a register.
+		++GVoxelMarchCellResidentEmpty;
+#endif
 		return C;
 	}
 
 	const uint BrickBase = VoxelBrickChunkTable[Base + 4u];
 	if (BrickBase + VOXEL_MARCH_BRICKS_PER_CHUNK > VoxelBrickDescSlots)
 	{
+#if VOXEL_MARCH_HOLE_STATS
+		// A SEVENTH BUCKET, AND IT IS NOT A TIDINESS DECISION. This return site
+		// is post-fetch, so folding it into the pre-fetch slotReject bucket --
+		// which it superficially resembles, both being pool bounds checks --
+		// would move a paying lookup out of the recordFetches denominator and
+		// silently inflate the headline ratio. It is structurally zero on a
+		// healthy pool; it is counted so the identity cannot be broken by the
+		// one path a reader of the stage list is most likely to overlook.
+		++GVoxelMarchCellBrickOOB;
+#endif
 		return C;
 	}
 
@@ -2330,6 +2433,13 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	C.ClimatePacked     = VoxelBrickChunkTable[Base + 7u];
 	C.SurfaceGradPacked = VoxelBrickChunkTable[Base + 8u];
 	C.SurfaceZRelUU     = asfloat(VoxelBrickChunkTable[Base + 9u]);
+#if VOXEL_MARCH_HOLE_STATS
+	// The work the fetch is for. Counted on the fall-through return rather than
+	// derived as probed minus the six above, because a derived total cannot
+	// disagree with its parts and a census whose identity cannot fail is not a
+	// census.
+	++GVoxelMarchCellReal;
+#endif
 	return C;
 }
 

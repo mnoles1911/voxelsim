@@ -470,24 +470,47 @@
 //      a static artefact -- this is the thing to try, and the box is shared, so
 //      a second build costs a day.
 //
-// WHY THE OFFSET IS NOT ALIGNED TO THE ENGINE'S OWN TAA/TSR JITTER PHASE, which
-// is the first thing to ask and the answer is not "it was not worth it":
+// WHY THIS OFFSET IS NOT THE ENGINE'S OWN TAA/TSR JITTER PHASE, which is the
+// first thing to ask:
 //
-//   THERE IS NO PHASE TO ALIGN TO ON THE MARCHER'S SIDE. The emit does not go
-//   through the jittered projection at all. VoxelMarchEmitVS builds its NDC by
-//   hand from PixelLocal / MarchViewRectSize, so its quads cover exact pixel
-//   rects whatever the jitter is doing, and both the march and the emit build
-//   their rays from MarchInvProjDiag -- the projection matrix DIAGONAL, whereas
-//   a perspective TAA jitter lives in the third row. So the marcher's samples
-//   have never sat where TSR believes a sample sits, at full res or at half. An
-//   offset copied from ResolvedView.TemporalAAJitter would not fix that; it
-//   would only make the marcher's error track the engine's sequence.
+//   THE ENGINE JITTER IS THE WRONG SIZE FOR THIS JOB. It spans +/-0.5 of a
+//   FULL-RES pixel, and the half-res block is two pixels across, so unscaled it
+//   can only reach the middle quarter of the block and can never place a sample
+//   on the outer pixels' centres -- which is the one property scheme 1 exists
+//   for. Scaled by two it is no longer the sequence TSR expects, so the
+//   alignment it was supposed to buy is gone anyway. The two are ORTHOGONAL,
+//   not alternatives, and they compose.
 //
-//   THE ENGINE JITTER IS ALSO THE WRONG SIZE. It spans +/-0.5 of a FULL-RES
-//   pixel, and the half-res block is two pixels across, so unscaled it can only
-//   reach the middle quarter of the block and can never place a sample on the
-//   outer pixels' centres. Scaled by two it is no longer the sequence TSR
-//   expects, so the alignment it was supposed to buy is gone anyway.
+//   WHAT THIS COMMENT USED TO SAY, AND WHY IT WAS WRONG -- left here because it
+//   hid a real defect for the life of the arm. It read: "THERE IS NO PHASE TO
+//   ALIGN TO ON THE MARCHER'S SIDE ... both the march and the emit build their
+//   rays from MarchInvProjDiag -- the projection matrix DIAGONAL, whereas a
+//   perspective TAA jitter lives in the third row. So the marcher's samples
+//   have never sat where TSR believes a sample sits ... An offset copied from
+//   ResolvedView.TemporalAAJitter would not fix that."
+//
+//   Every factual clause there is TRUE and together they are a BUG REPORT, not
+//   a justification. The conclusion does not follow. With UE's row-vector
+//   convention and M[2][3] == 1:
+//
+//       ndc.x = (view.x / view.z) * M[0][0] + M[2][0]
+//
+//   so the jitter survives the perspective divide as a CONSTANT NDC
+//   TRANSLATION, and it inverts exactly:
+//
+//       view.x / view.z = (ndc.x - jitter.x) * (1 / M[0][0])
+//
+//   That is the whole of voxel.March.TAAJitter, and it is why BOTH ray builders
+//   now subtract MarchTemporalAAJitter from Ndc. The emit's QUADS still build
+//   their NDC by hand and must keep doing so -- a quad covers an exact pixel
+//   rect, exactly as the raster GBuffer grid is unjittered while the geometry
+//   sampled through it is jittered.
+//
+//   MEASURED CONSEQUENCE, 2026-08-26: with the arm off, a settled pinned-pose
+//   capture is invariant to r.TemporalAA.Debug.OverrideTemporalIndex -- 0.0145%
+//   of pixels differ between index 0 and index 5, against a 0.0138%
+//   control-vs-control noise floor at the same pose. The marched image does not
+//   move when the engine's sample position does.
 //
 //   WHAT ALIGNMENT WAS ACTUALLY FOR IS AVOIDING A BEAT, and that IS handled: a
 //   cycle of 4 or 8 against the engine's own power-of-two sample count
@@ -622,6 +645,22 @@ float    MarchVolumeExtentUU;
 float2   MarchViewRectMin;
 float2   MarchViewRectSize;
 float2   MarchInvProjDiag;
+// THE ENGINE'S TAA/TSR JITTER FOR THIS FRAME, IN NDC, or (0,0) when
+// voxel.March.TAAJitter is 0 (the shipping arm). SUBTRACTED FROM Ndc BEFORE THE
+// RAY IS BUILT, which is the exact inverse of what UE does to the projection.
+//
+// WHY IT IS A UNIFORM AND NOT ResolvedView.TemporalAAJitter. VoxelMarchBuildRay
+// runs in the MARCH COMPUTE KERNEL, which never calls ResolveView() --
+// InstancedStereo.ush:52 declares ResolvedView as a ZERO-INITIALISED static, so
+// reading the jitter off it there is silently (0,0) and the arm reads as armed
+// while doing nothing. The host resolves the phase ONCE per frame instead, so
+// the march, the emit reconstruction and the verify gate provably share it.
+//
+// NOT MarchSampleJitter. That one is in full-res PIXELS and moves the half-res
+// sample inside its 2x2 block; this one is in NDC and is the engine's own
+// sub-pixel phase. At full res MarchSampleJitter is forced to zero and this is
+// the only offset in play. Bound on EVERY permutation.
+float2   MarchTemporalAAJitter;
 // THE HALF-RES SAMPLE LATTICE'S PER-FRAME OFFSET, in FULL-RES PIXELS, applied
 // INSIDE the 2x2 block (voxel.March.HalfRes.Jitter). Zero is the static lattice
 // this arm shipped with, and the host forces it to zero at full res -- see
@@ -827,7 +866,7 @@ FVoxelMarchRay VoxelMarchBuildRay(float2 SvPositionXY)
 
 	// UE view space: X right, Y up, Z forward. z = 1 makes t along this
 	// UNNORMALISED direction equal to view-space Z.
-	const float3 DirView = float3(Ndc * MarchInvProjDiag, 1.0f);
+	const float3 DirView = float3((Ndc - MarchTemporalAAJitter) * MarchInvProjDiag, 1.0f);
 	R.ViewZPerUU = rsqrt(dot(DirView, DirView));
 	R.DirWorld = normalize(mul(float4(DirView, 0.0f), MarchViewToTranslatedWorld).xyz);
 	R.OriginLocalUU = MarchRayOriginLocalUU;
@@ -1002,7 +1041,7 @@ float3 VoxelMarchSampleDirWorld(float2 SvPositionXY)
 	float2 Ndc = (LocalPixel / MarchViewRectSize) * 2.0f - 1.0f;
 	Ndc.y = -Ndc.y; // clip y is up, pixel y is down
 
-	const float3 DirView = float3(Ndc * MarchInvProjDiag, 1.0f);
+	const float3 DirView = float3((Ndc - MarchTemporalAAJitter) * MarchInvProjDiag, 1.0f);
 	return normalize(mul(float4(DirView, 0.0f), MarchViewToTranslatedWorld).xyz);
 }
 
@@ -1524,6 +1563,51 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 		MarchOutVis[LocalPixel] = Packed;
 		MarchOutHitT[LocalPixel] = HitT;
 	}
+
+#if VOXEL_MARCH_HOLE_STATS
+	// ---- THE CHUNK-CELL LOOKUP CENSUS, FOLDED ------------------------------
+	//
+	// FOLDED HERE AND NOT INSIDE `if (bInView)`, WHICH IS WHERE EVERY OTHER
+	// HOLE-STATS FOLD IN THIS KERNEL LIVES. Those read fields off the walk's
+	// FVoxelMarchHit, which only exists where a walk happened. These read
+	// thread-local statics that VoxelMarchLookupChunk incremented wherever it
+	// was called from -- and it is called from the shell probe's resolve and
+	// the fallthrough retry as well as the chunk loop. Folding under the
+	// in-view guard would drop any lookup made outside it and the identity
+	// would still PASS while under-reporting the frame, which is the one
+	// failure shape a sum-of-parts check cannot catch. Unconditional is the
+	// only placement where "every lookup this thread made" is literally true.
+	//
+	// EIGHT GUARDED ATOMICS, ON THE `cellsProbed != 0` TEST, so a thread that
+	// walked nothing pays none of them -- the same guard shape the fallthrough,
+	// zcut and blockskip groups use, and for the same reason: a ray that made
+	// no decisions must contribute to neither numerator nor denominator.
+	//
+	// THE EMIT PIXEL SHADER IN THIS FILE ALSO CALLS VoxelMarchLookupChunk (the
+	// post-walk shading lookup). It is a different entry point, so it gets its
+	// own copies of these statics and never folds them; the census is the
+	// MARCH kernel's lookups and nothing else, which is what the ratio is
+	// about.
+	if (GVoxelMarchCellsProbed != 0u)
+	{
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELLS_PROBED],
+		               GVoxelMarchCellsProbed);
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_NONRESIDENT],
+		               GVoxelMarchCellNonResident);
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_INDEX_EMPTY],
+		               GVoxelMarchCellIndexEmpty);
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_SLOT_REJECT],
+		               GVoxelMarchCellSlotReject);
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_STALE],
+		               GVoxelMarchCellStale);
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_RESIDENT_EMPTY],
+		               GVoxelMarchCellResidentEmpty);
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_BRICK_OOB],
+		               GVoxelMarchCellBrickOOB);
+		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_REAL],
+		               GVoxelMarchCellReal);
+	}
+#endif
 
 	if (bHit)
 	{
