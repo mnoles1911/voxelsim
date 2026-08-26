@@ -3,6 +3,20 @@
 2026-08-23 late. Follows `docs/50k-budget-2026-08-23.md`'s correction ("the game
 thread is only 25% busy … find and raise the per-tick bound first").
 
+> **STATUS, 2026-08-26 — THE MEASUREMENT STANDS; THE CODE IN SECTION 3 IS GONE.**
+> `VoxelApplyFast::AppliesPerTickCap` / `ApplyBudgetSeconds` /
+> `DrainsPerTickCap` and their `-VoxelApply{Cap,BudgetMs,DrainCap}=` switches
+> were **deleted** from `VoxelApplyBatch.{h,cpp}`. The hooks in section 4 were
+> designed against `0a71fed` and **never applied**, so all three functions had
+> zero call sites for their entire life while reading as the live governor of
+> the drain loop. Sections 1, 2 and the failing-readings table below are the
+> reason this page is still worth reading; sections 3-5 describe work that was
+> never wired. What governs the loop today: count ->
+> `VoxelDebug::GetStreamMaxAppliesPerFrame` (`-VoxelApplyPerTick=` overrides
+> it); clock -> `VoxelDebug::GetStreamApplyBudgetMs`; drains -> the bare
+> `kMaxResultDrainsPerFrame` constant. `-VoxelApplyCap=` still warns loudly in
+> `VoxelDebug.cpp` if a leg passes it.
+
 **No new leg and no new code were needed to find this.** It was already in
 `Saved/ahead-on.log`, on the `Voxel apply stages` line, which has printed the
 drain loop's exit attribution since Wave S0.
@@ -93,9 +107,28 @@ drain loop is byte-identical.
 
 | switch | overrides | absent |
 |---|---|---|
-| `-VoxelApplyCap=N` | `voxel.Stream.MaxAppliesPerFrame` | the cvar |
+| `-VoxelApplyPerTick=N` | `voxel.Stream.MaxAppliesPerFrame` | the cvar |
 | `-VoxelApplyBudgetMs=F` | `voxel.Stream.ApplyBudgetMs` | the cvar |
 | `-VoxelApplyDrainCap=N` | `kMaxResultDrainsPerFrame` | 1024 |
+
+> **`-VoxelApplyCap=` IS RETIRED AND WAS NEVER LIVE HERE (corrected 2026-08-25).**
+> Every table on this page originally read `-VoxelApplyCap=`. That switch is
+> parsed only by `VoxelApplyFast::AppliesOverride` (`VoxelApplyBatch.cpp:543`),
+> whose sole caller `AppliesPerTickCap` (`:583`) **has no callers at all** --
+> the identifier occurs exactly three times in the whole `Source` tree: a
+> comment, the definition and the declaration. `DrainResults` gets its ceiling
+> from `VoxelDebug::GetStreamMaxAppliesPerFrame` -> `ApplyPerTickOverride`
+> (`VoxelDebug.cpp:1483`), which parses **`-VoxelApplyPerTick=`**.
+>
+> `FParse::Value` leaves the value untouched when the name does not match and
+> prints nothing, so a leg run from the old tables kept the shipped 192 ceiling
+> while the doc said 1024 or 4096 -- the silent-success shape this project keeps
+> paying for. The two legs on disk that DID reach `maxApplies=1024` (`q-L1`,
+> `q-a1024f3`) both passed `-VoxelApplyPerTick=`; the `fp-1024.log` and
+> `fps-1024.log` named in the F1/S2 rows do not exist on disk at all.
+>
+> Read the `Voxel apply caps:` line before trusting any leg on this page: if
+> `maxApplies=` equals the `(cvar N)` beside it, nothing was lifted.
 
 **Latched, not cvars-via-`-ExecCmds`.** The cvars *are* settable, but `-ExecCmds`
 lands after streaming has begun (`tools/voxel-capture.ps1:114`), so a cold-fill
@@ -113,7 +146,7 @@ exactly the right instrument. One new line is printed once per session so that
 | reading | verdict |
 |---|---|
 | `Voxel apply caps:` line **missing** | the hooks were not applied / module not called. Nothing here ran. |
-| `-VoxelApplyCap=2048`, `countCap` still 65-76%, appl/tick still ~150 | **the override did not latch.** FAIL. |
+| `-VoxelApplyPerTick=2048`, `countCap` still 65-76%, appl/tick still ~150 | **the override did not latch.** FAIL. |
 | `countCap` -> 0, `wallClock` now dominant | **working.** `ApplyBudgetMs` is now the governor. Expected first result; raise `-VoxelApplyBudgetMs` next. |
 | `drainCap > 0` | **working**, and 1024 is now binding. Raise `-VoxelApplyDrainCap`. |
 | **`queueEmpty > 0` during a FILLING window** | **the success condition and the stop signal.** The drain has caught up with the producers; apply is no longer the bound. Hand back to dispatch/generation. |
@@ -186,15 +219,15 @@ Read with `tools/leg-summary.sh`, **every window**, never `grep | tail -1`.
 | leg | log | `-ExtraArgs` |
 |---|---|---|
 | **L1** control on the new binary | `cap-ctl.log` | *(none)* |
-| **L2** lift ceiling 1 only | `cap-a.log` | `-VoxelApplyCap=4096` |
-| **L3** lift 1+2 | `cap-ab.log` | `-VoxelApplyCap=4096`, `-VoxelApplyBudgetMs=40` |
-| **L4** lift 1+2+3 | `cap-abc.log` | `-VoxelApplyCap=4096`, `-VoxelApplyBudgetMs=40`, `-VoxelApplyDrainCap=16384` |
+| **L2** lift ceiling 1 only | `cap-a.log` | `-VoxelApplyPerTick=4096` |
+| **L3** lift 1+2 | `cap-ab.log` | `-VoxelApplyPerTick=4096`, `-VoxelApplyBudgetMs=40` |
+| **L4** lift 1+2+3 | `cap-abc.log` | `-VoxelApplyPerTick=4096`, `-VoxelApplyBudgetMs=40`, `-VoxelApplyDrainCap=16384` |
 | **L5** all three + the sampler fix | `cap-abc-fast.log` | as L4, plus `-VoxelApplyFast=3` |
 
 All with `-ClearEditLog -BudgetSec 300`, e.g.
 
 ```
-pwsh -File tools/voxel-run-leg.ps1 -LogPath D:\voxelsim\Saved\cap-a.log -ClearEditLog -BudgetSec 300 -ExtraArgs @('-VoxelApplyCap=4096')
+pwsh -File tools/voxel-run-leg.ps1 -LogPath D:\voxelsim\Saved\cap-a.log -ClearEditLog -BudgetSec 300 -ExtraArgs @('-VoxelApplyPerTick=4096')
 ```
 
 **L2 is deliberately one switch.** Two caps in series make a throughput number

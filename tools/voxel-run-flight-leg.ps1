@@ -189,7 +189,32 @@ $argList = @(
     "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', '-dx12',
 
     "-abslog=`"$LogPath`"",
+    # RESOLUTION: -ResX/-ResY ALONE IS INERT. Proven 2026-08-25 -- a leg run
+    # with -ResX=2560 -ResY=1440 and a leg with -ResX=800 -ResY=450 BOTH
+    # rendered view=1552x873, byte-identical to every -ResX=1600 leg on disk.
+    # The size came from GameUserSettings (resolution.resx="1280" in the log)
+    # scaled by the 1.25 desktop DPI; the command line never touched it. So
+    # every frame-rate number this project held was taken at 1552x873 while
+    # its own banner claimed whatever -Width said.
+    #
+    # The ini overrides are what actually move it. FullscreenMode 2 = windowed.
+    # VERIFY, DO NOT ASSUME: the post-run check below reads the marcher's own
+    # view= and refuses a clean 'ok' when it disagrees with -Width.
     "-ResX=$Width", "-ResY=$Height", '-WinX=0', '-WinY=0',
+    "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:ResolutionSizeX=$Width",
+    "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:ResolutionSizeY=$Height",
+    "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:LastUserConfirmedResolutionSizeX=$Width",
+    "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:LastUserConfirmedResolutionSizeY=$Height",
+    # FULLSCREEN MODE 1 = WINDOWED-FULLSCREEN (borderless), NOT 2 = windowed.
+    # THE OWNER PLAYS FULLSCREEN AT 2560x1440 (stated 2026-08-25), so a windowed
+    # leg measures a different game: 1.36 Mpx against 3.69, a 2.7x difference in
+    # anything pixel-bound. Mode 2 was the first thing tried here and it is why
+    # -ResX/-ResY looked inert -- ResX/ResY are honoured on the FULLSCREEN path.
+    # Borderless rather than exclusive (mode 0) because an -unattended leg that
+    # takes exclusive display mode can wedge the box.
+    "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:FullscreenMode=1",
+    "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:LastConfirmedFullscreenMode=1",
+    '-ForceRes',
     "-VoxelSpawnAt=$SpawnAt",
     # Beside the spawn, because they are the same kind of thing: state that
     # decides what the run measures and that nothing downstream can recover if
@@ -300,5 +325,25 @@ if (-not $logSaysComplete -or -not $perfJson) {
 # The sun goes in the console line for the same reason the resolution does: a
 # result pasted out of a terminal without it is not a result.
 $sun = if ($TimeScale -eq 0) { "frozen $TimeOfDay $Date" } else { "MOVING x$TimeScale from $TimeOfDay $Date" }
-Write-Host "  ${LogName}: ok (${elapsed}s) at ${Width}x${Height}, sun $sun" -ForegroundColor Green
+# THE BANNER USED TO ECHO ITS OWN PARAMETER, WHICH IS NOT A MEASUREMENT.
+#
+# It printed "at ${Width}x${Height}" straight from the argument it was handed,
+# so a leg that asked for 2560x1440 and rendered 1552x873 reported success at
+# 2560x1440 and was quoted that way. Read the ENGINE'S size instead: the
+# marcher prints `view=WxH px` and the renderer prints `SceneColor WxH`. This
+# is the same rule as every other arm here -- prove it engaged, never assume.
+$actualRes = $null
+try {
+    $m = Select-String -Path $LogPath -Pattern 'view=(\d+)x(\d+) px' -List -ErrorAction SilentlyContinue
+    if ($m) { $actualRes = "$($m.Matches[0].Groups[1].Value)x$($m.Matches[0].Groups[2].Value)" }
+} catch { }
+if (-not $actualRes) {
+    Write-Host "  ${LogName}: ok (${elapsed}s) at RESOLUTION UNVERIFIED (no view= line in the log -- do not quote an fps number from this leg until you know its size), sun $sun" -ForegroundColor Yellow
+}
+elseif ($actualRes -ne "${Width}x${Height}") {
+    Write-Host "  ${LogName}: ok (${elapsed}s) but RENDERED ${actualRes}, NOT the ${Width}x${Height} requested -- the size came from GameUserSettings/DPI, not the command line. The leg is VALID, but quote ${actualRes}. sun $sun" -ForegroundColor Yellow
+}
+else {
+    Write-Host "  ${LogName}: ok (${elapsed}s) at ${actualRes} (verified from the engine, not the argument), sun $sun" -ForegroundColor Green
+}
 exit 0

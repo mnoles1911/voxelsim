@@ -162,7 +162,7 @@ second call returns without moving the boundary.
 | leg | log | `-ExtraArgs` |
 |---|---|---|
 | **S1** the GOAL 3 baseline | `fps-main.log` | `-VoxelFramePhase=1` |
-| **S2** the collapse regime | `fps-1024.log` | `-VoxelFramePhase=3`, `-VoxelApplyCap=1024`, `-VoxelApplyBudgetMs=24` |
+| **S2** the collapse regime | `fps-1024.log` | `-VoxelFramePhase=3`, `-VoxelApplyPerTick=1024`, `-VoxelApplyBudgetMs=24` |
 | **S3** default-cap control for S2 | `fps-ctl.log` | `-VoxelFramePhase=3` |
 
 All with `-ClearEditLog -BudgetSec 300`. S2 and S3 answer the 94 ms question

@@ -218,3 +218,125 @@ that improves cold start or throughput and worsens the moving p95 is not a win.*
 - A residual that cannot stay large is not a residual.
 - A check that has never failed is not yet known to be a check. **Six mutation
   arms exist in this codebase and none has ever been run.**
+
+---
+
+## 2026-08-25 (later): THE WORKLIST CLAIM CHAIN SHIPS, AND A CORRECTNESS BUG WAS FOUND UNDER IT
+
+### Headline, matched legs (line flight 23.5 m/s, sun frozen 12:00 03-20)
+
+    config                moving p99      stutters   hitches   doubleGrant
+    stock (classic)       34.00 ms 29fps   17.08%       100        113
+    worklist, cap 16      21.30 ms 47fps    1.2-3.3%     35          0
+
+n=3 on the worklist arm (21.20 / 21.40 / 20.60). **The worklist chain now defaults
+ON** (owner decision) -- all eight gates in `VoxelGpuMeshJobManager.cpp` latch to 1
+when absent; `-VoxelGpuWorklist=0` is the control.
+
+**The mechanism, not just the number.** `[gpu-worklist]` reads `passes/tick mean=25.1
+max=76` at 4,260 chunks/s, replacing ~1,300 RDG passes built in a single render
+command. The pass term went flat in N, which is what the chain was built to do.
+Correctness on THIS build: `-VoxelGpuWorklistVerifyClaim=1` cross-checked
+**207,983,035 dwords** against the classic path, `mism=0 dupRefused=0 fedNoBit=0`.
+
+### The cap sweep closed, with a knee
+
+    MeshBatchCap    64      32      16      8
+    moving p99   35.0    22.0    21.3   22.0   ms
+
+cap=16 is the minimum; cap=8 costs throughput without buying tail.
+
+### THE POOL DOUBLE GRANT -- found, root-caused, fixed
+
+At the SHIPPING `MeshBatchCap=64` the GPU pool allocator granted dwords somebody
+already held: `doubleGrant == badFree`, 100-176 per leg, `UE_LOG(Error)` firing 9-13
+times. Zero at cap<=16. It was NOT the worklist -- a stock leg with no worklist flags
+shows it too. Reproduced on 4/4 cap=64 legs going back to RR-heavy, so it has been
+live for days.
+
+**Cause.** `FreeResident` appended `ChunkSlot` with no dedupe; `AllocateForChunk`
+frees-then-reallocs on a same-key re-request and the coalesced first-fit arena hands
+the SAME slot back. One slot entered a single free dispatch twice, and
+`BrickPoolFreeMain` (`numthreads(64)`) plain-read `AllocSide` with no atomic claim --
+both threads cleared the same bitmap range (one `badFree`) and both pushed the range
+onto the free stack (one `doubleGrant` when popped twice). The exact equality of the
+two counters is structural, not coincidence.
+
+**Fix.** (1) `FlushPendingGpuFrees` dedupes the drained list and counts collapses into
+a new `dupFreeSlots` on the `[brick-gpualloc]` line. (2) `BrickPoolFreeMain` takes the
+slot with `InterlockedExchange` on the class words, so a duplicate sees class 0 and
+frees nothing; base words are zeroed only on the branch that won its class.
+
+**Confirmed on the exact leg that failed before**, and the gate could have failed:
+
+    leg                 doubleGrant  badFree  Errors  dupSlot  dupFreeSlots
+    UU-wl64  (before)       152        152      13       34        --
+    VV-wl64fix (after)        0          0       0       24        19
+
+`dupSlot`/`dupFreeSlots` non-zero prove the TRIGGER STILL FIRED and only the damage is
+gone. `dupFreeSlots 0` on a cap=64 leg is NOT a pass.
+
+**Standing rule:** `voxel.GPU.PoolAlloc`'s own comment says `doubleGrant>0` invalidates
+any leg run on that default. Check `grep -c 'DOUBLE GRANT'` before quoting ANY leg.
+
+### EVERY FRAME-RATE NUMBER ON THIS PAGE IS AT ~1552x873, NOT 2560x1440
+
+`-ResX`/`-ResY` are INERT. A leg requesting 2560x1440 and a leg requesting 800x450
+both rendered `view=1552x873`, byte-identical to every 1600x900 leg on disk. The
+harness banner printed the requested size because it echoed its own argument.
+
+The banner is fixed -- it now reads the marcher's `view=` and refuses a clean 'ok' on a
+mismatch. **Reaching 2560x1440 is still unsolved** (ini overrides move the size but not
+to target; `r.setres` voided the leg). The comparisons above are like-for-like so the
+DELTAS stand, but the absolute fps figures are not at the resolution the target is
+stated in. **Open question for the owner: what size is your PIE window?** If it is also
+~1600x900 these numbers already describe what you see.
+
+---
+
+## 2026-08-26: GOAL 3b REACHED AT THE LINE -- p99 49.8 fps, from 29
+
+Three matched flag-free legs, shipping defaults, no command line beyond the phase
+instrument. Internal 1552x873, TSR upscaled to 2560x1440 (the owner's own config).
+
+    leg          p50     p95     p99             holesFlight
+    ZZ-final     9.40   15.70   20.20 (50 fps)      224
+    ZZ-finalb    9.30   15.70   19.70 (51 fps)      213
+    ZZ-finalc    9.40   15.90   20.30 (49 fps)      218
+
+**Mean p99 20.07 ms = 49.8 fps against a >=50 fps goal.** Two legs clear it, one does
+not. Reached WITHIN NOISE, not comfortably met -- a harder pose or a slower machine
+misses. This morning: 34.00 ms / 29 fps.
+
+Hitches 33 totalling 2624 ms with 1 >=200 ms, against 4795 ms / 35 / 10 this morning.
+
+### What produced it -- NONE of it from the marcher
+
+    worklist claim chain default ON    p99 34.00 -> 21.3   (208M dwords verified, mism=0)
+    raster page rescue, cap 256        >=200ms freezes 10 -> 1, hitch time -47%
+    speculative park default ON        redundant regeneration 13.6% -> 0.5%
+    pool double-grant fixed            152/leg -> 0 at the SHIPPING cap
+
+Verified engaged flag-free: stackSuppressed=31461, capHit=0, noAtlas=0, doubleGrant=0,
+poolReplaced 0.5%.
+
+### The marcher is untouched and is now the whole remaining problem
+
+It is **54% of the GPU frame** and FIVE approaches were built and refuted:
+
+    Z slab                  skipped 0.00% at the horizon
+    4^3 block occupancy     23.7 tests/ray to avoid 11.2 cells, +30%
+    beam pre-pass           refuted BY PROOF -- nothing in the index is provably empty
+    sky mark + ladder       -7.6% WAS the terrain it deleted; honest version +3.1%
+    RingCount reduction     -1.356 ms but pays in draw distance
+
+**The rules those establish.** Nothing that adds a PER-STEP TEST can pay inside this ring
+cascade (segments are 20-40 cells; there is never a long enough empty run to amortise
+one). Nothing that infers emptiness from RESIDENCY can work (air is not resident, so
+'empty' and 'not streamed' are the same bit pattern). And nothing may skip the retry
+ladder on level-L evidence -- a coarse voxel is a downsample and can be solid over a
+proven-air fine footprint, which is what a near mountain is MADE OF.
+
+**Still open, in order:** adaptive per-ray ring depth (the one uncontested 1.356 ms);
+rasteriser-bounded rays (GigaVoxels/SparseLeap/Teardown/Dreams all converged on it);
+`kAnySolidBit` is a hardcoded 1 so the marcher's advertised cheapest skip has never fired.

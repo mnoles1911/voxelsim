@@ -176,7 +176,7 @@ The measurement is **within one leg**, so a single lifted-cap run answers it.
 
 | leg | log | `-ExtraArgs` |
 |---|---|---|
-| **F1** the question | `fp-1024.log` | `-VoxelFramePhase=1`, `-VoxelApplyCap=1024`, `-VoxelApplyBudgetMs=24` |
+| **F1** the question | `fp-1024.log` | `-VoxelFramePhase=1`, `-VoxelApplyPerTick=1024`, `-VoxelApplyBudgetMs=24` |
 | **F2** default-cap control | `fp-ctl.log` | `-VoxelFramePhase=1` |
 | **F3** cross-check | `fp-1024-attr.log` | as F1, plus `-ExecCmds="voxel.Stream.FrameAttribution 1"` |
 
