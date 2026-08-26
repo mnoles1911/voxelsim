@@ -41,6 +41,34 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0n A capture run that finishes its work never exits -- symptom bounded, cause open
+
+`-VoxelLoadingShotAt` does not quit after its last shot when that shot lands
+AFTER hand-off. The front end tears down at hand-off and takes whatever ends the
+run with it, so the image IS produced and the process lives on forever.
+
+Measured 2026-08-25, the expensive way: a `-Shot Loading -At '2,50'` run held the
+box for **241 minutes** and cost another session two queued jobs. It was not
+hung -- both shots fired, the log was still growing at 45 MB, and it had
+rendered 1,577,156 settled frames at ~2.5 cores with `Responding=True`. It had
+finished and was never told to stop.
+
+`-At '1,5'` (both shots inside the loading screen) exits 0 cleanly. Anything past
+the ~15 s gate does not.
+
+**SYMPTOM IS BOUNDED, CAUSE IS NOT.** `tools/voxel-ui-capture.ps1` now runs with
+a `-TimeoutSec` (default 600) and kills a run that outlives it, so this can no
+longer eat a night. But the run still does not end itself, so anyone driving
+`UnrealEditor-Cmd` directly -- a leg script, a CI job, a hand-typed command --
+gets the original behaviour.
+
+**`-VoxelMenuWatchdog` CANNOT BE THE FIX and it is worth understanding why.** It
+is a FRONT-END mechanism, and the failure is precisely that the front end has
+already torn down. A watchdog owned by the thing that goes away is silent in
+exactly the case it exists for -- the same shape as an ini branch that never
+resolves and a cvar that was never a cvar. Whatever ends these runs has to
+outlive the front end.
+
 ### 0.0k FIXED 2026-08-25 -- menu AND loading screen photographed; the world is held until the view settles
 
 Found 2026-08-25, first time `tools/voxel-ui-capture.ps1 -Shot Menu` has ever
