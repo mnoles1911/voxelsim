@@ -350,6 +350,43 @@ struct FVoxelMarchArm
 	bool bAO = true;
 	bool bDBuffer = true;
 	bool bVelocity = true;
+	// voxel.March.BlockSkip: the coarse occupancy level above the chunk index
+	// (VOXEL_MARCH_BLOCK_SKIP). A PERMUTATION and not a uniform -- the same rule
+	// Rings / Fallthrough / HoleStats follow and for the harder version of the
+	// reason: this arm adds TWO BUFFER LOADS PER BLOCK, so a runtime branch
+	// would leave that traffic in the control's binary and flatter the arm under
+	// test. Rings only, forced false without them, because it is the ring walk's
+	// chunk loop that consults it.
+	bool bBlockSkip = false;
+	// THE RETRY LADDER GATE (voxel.March.SkyLadder). A permutation, unlike
+	// BlockSkyMode below: it puts a field on the chunk cache and a fold at five
+	// walk sites, so the control must not carry it. Forced false without rings
+	// and without a fallthrough depth, matching the refused permutation -- there
+	// is no ladder to gate without one.
+	bool bSkyLadder = false;
+	// THE SKY LICENCE (voxel.March.BlockSkySkip), a UNIFORM inside the
+	// VOXEL_MARCH_BLOCK_SKIP permutation and NOT a permutation of its own.
+	//
+	// ARGUED, NOT ASSUMED, because the doctrine every other arm here follows is
+	// the opposite. That doctrine exists so a control does not carry the
+	// treatment's LOADS. This mode selects between two predicates over bits the
+	// block consult is already loading, and the one buffer it adds
+	// (MarchBlockAllSky) is read under `if (Mode != 0)` -- a uniform branch,
+	// coherent across the entire dispatch, so mode 0 issues no sky load at all
+	// and the residency-only arm keeps EXACTLY the traffic its published
+	// -30% result was measured with. There is no traffic for an off-arm to
+	// carry, which is the same test voxel.March.ZCut passed to be a uniform.
+	//
+	// AND IT BUYS THE THING A PERMUTATION WOULD NOT: all three states on ONE
+	// binary, so off / residency-only / sky-licensed can be interleaved in one
+	// leg instead of compared across three builds. That is how the -30% figure
+	// this arm has to beat was NOT measured.
+	//
+	//   0  residency-only -- byte-identical to the shipped BlockSkip arm
+	//   1  both: a block may be skipped if it is unoccupied OR provably sky
+	//   2  sky-only: residency alone no longer licenses a skip, so the sky
+	//      predicate is measured on its own
+	int32 BlockSkyMode = 0;
 };
 VOXELEARTHSHADERS_API FVoxelMarchArm VoxelMarchGetArm();
 
@@ -423,7 +460,158 @@ namespace VoxelMarchHoleWord
 		// (two retractions this week were exactly that shape).
 		UncLevelFirst,                        // + ring level 0..6 of the miss
 		UncReasonFirst = UncLevelFirst + 7,   // + VOXEL_MARCH_MISS_* 0..3
-		Count = UncReasonFirst + 4
+
+		// ---- THE RESIDENT-Z BOUND'S ENGAGEMENT TRIO (voxel.March.ZCut) -----
+		// APPENDED AFTER EVERY EXISTING WORD, ON PURPOSE. The note on
+		// FallthroughConsidered above says inserting RENUMBERS both sides at
+		// once and is only safe with a forced shader recompile; appending
+		// renumbers nothing, so a stale shader cache still reads every OLD
+		// word correctly and simply leaves these three at zero -- which the
+		// reader has to word as "not measured" in any case.
+		//
+		// THREE WORDS BECAUSE ONE CANNOT ANSWER THE QUESTION. `Consulted` is
+		// every (segment, walk-level) pair where the arm was on AND that level
+		// had a usable bound, i.e. every decision the arm was actually asked
+		// to make -- it is the DENOMINATOR, and Consulted == 0 while the cvar
+		// reads 1 is the arm being INERT, which is this project's house
+		// failure and must never be spellable as "it cut nothing".
+		// `Skipped` is the pairs whose interval came back EMPTY (the walk
+		// never ran at all). `Clipped` is the pairs the cut NARROWED without
+		// emptying -- the near-horizon case, where the ray does reach resident
+		// ground but leaves the slab long before the ring ends. Skipped alone
+		// would under-report the arm on exactly those rays, which is why there
+		// are two numerators and not one.
+		//
+		// THE THREE PARTITION THE DECISION EXACTLY:
+		//     Consulted - Skipped - Clipped = pairs the cut left ALONE.
+		// So "armed, consulted, and changed nothing" is a readable, separate
+		// finding rather than an inference from a silence.
+		//
+		// A SUMMED CUT *LENGTH* WAS THE OBVIOUS FOURTH WORD AND IT IS
+		// DELIBERATELY ABSENT. At 1.3M rays and up to seven segments each, a
+		// per-frame sum of removed ray length in UU reaches ~1e12 and WRAPS A
+		// uint32 SILENTLY -- a counter that reads small precisely when the arm
+		// worked hardest, which is the counter-that-means-the-opposite-of-its
+		// -label failure this project has already paid for.
+		//
+		// THESE THREE WORDS PROVE ENGAGEMENT. THEY DO NOT ESTIMATE THE SAVING,
+		// AND USING THEM THAT WAY IS A KNOWN WAY TO BE WRONG. Iteration counts
+		// and wall time move in OPPOSITE directions often enough that three
+		// independent groups have published it: VoxelRT measured iterations
+		// -60% while traversal time went +10-15%, and Aila & Laine record
+		// "~20% slower code gives same measured perf". A skipped/consulted
+		// ratio is a statement about DECISIONS, not about nanoseconds -- the
+		// work removed was scattered loads whose cost depends on cache state
+		// and occupancy, not on how many of them there were.
+		//
+		// THE SAVING IS `VoxelMarch.March` FROM ProfileGPU AND NOTHING ELSE.
+		// A leg where skipped is large and that number does not move is a
+		// REAL NULL RESULT, not a broken counter.
+		ZCutConsulted = UncReasonFirst + 4,
+		ZCutSkipped,
+		ZCutClipped,
+
+		// ---- THE COARSE OCCUPANCY LEVEL'S ENGAGEMENT TRIO -----------------
+		//                                        (voxel.March.BlockSkip)
+		// APPENDED, for the reason the Z bound's trio was: appending renumbers
+		// nothing, so a stale shader cache still reads every older word
+		// correctly and leaves these three at zero -- which a reader has to
+		// word as "not measured" anyway.
+		//
+		// THREE WORDS, PARTITIONING THE DECISION, and one of them is a SCALE
+		// rather than a count:
+		//   BlockConsulted  4^3 blocks the walk actually loaded a bit for --
+		//                   every decision the coarse level was asked to make.
+		//                   THE DENOMINATOR. Zero while voxel.March.BlockSkip
+		//                   reads 1 is the arm ARMED AND INERT, which is this
+		//                   project's house failure and must never be
+		//                   spellable as "there was nothing to skip".
+		//   BlockSkipped    blocks that came back with no resident chunk in
+		//                   them AND whose exit jump beat the ordinary
+		//                   one-chunk advance, i.e. skips actually TAKEN. A
+		//                   block can be consulted, read empty, and still not
+		//                   be skipped -- see the shader's progress guard --
+		//                   and that case has to stay visible rather than
+		//                   inflating the skip rate.
+		//   BlockCellsAvoided  chunk cells the jumps spanned, measured as the
+		//                   JUMPED RAY LENGTH divided by the chunk size at that
+		//                   level. This is the number the change exists to
+		//                   move, and it is a LOWER bound: a diagonal DDA
+		//                   visits up to sqrt(3) times the axis count over the
+		//                   same span.
+		//                   DELIBERATELY NOT 64 x BlockSkipped, and both
+		//                   reasons are load-bearing. That figure would carry
+		//                   NO information beyond BlockSkipped itself, and at
+		//                   1.3M rays it would reach ~8e9 in a frame and WRAP A
+		//                   uint32 SILENTLY -- a counter that reads small
+		//                   precisely when the arm worked hardest, which is the
+		//                   failure the Z bound's group refused a fourth word
+		//                   over.
+		//
+		// THESE ARE DECISIONS, NOT NANOSECONDS, AND USING THEM AS NANOSECONDS
+		// IS A PUBLISHED WAY TO BE WRONG. Iteration counts and wall time move
+		// in OPPOSITE directions often enough that three independent groups
+		// have measured it -- VoxelRT recorded iterations -60% against
+		// traversal time +10-15%, and Aila & Laine record "~20% slower code
+		// gives same measured perf". THE SAVING IS `VoxelMarch.March` FROM
+		// ProfileGPU AND NOTHING ELSE. A leg where BlockCellsAvoided is
+		// enormous and that number does not move is a REAL NULL RESULT, not a
+		// broken counter.
+		BlockConsulted,
+		BlockSkipped,
+		BlockCellsAvoided,
+
+		// ---- THE SKY LICENCE (voxel.March.BlockSkySkip) -------------------
+		// APPENDED, for the reason both earlier groups were: appending
+		// renumbers nothing, so a stale shader cache reads every older word
+		// correctly and leaves these three at zero -- which a reader has to
+		// word as NOT MEASURED anyway.
+		//
+		// WHY THREE MORE WORDS RATHER THAN READING BlockSkipped. BlockSkipped
+		// counts blocks skipped WHATEVER LICENSED THEM, so with both
+		// predicates on it cannot say which one paid. These three describe the
+		// sky predicate alone.
+		//
+		//   BlockSkyLicensed  blocks whose consult found the all-sky bit SET.
+		//                     Its denominator is BlockConsulted, already
+		//                     counted, so the rate is licensed/consulted --
+		//                     "how much of the space this ray crossed is
+		//                     PROVABLY empty". Zero while the cvar reads
+		//                     non-zero is the arm ARMED AND INERT.
+		//
+		//   BlockSkyRunBlocks / BlockSkyRuns  THE NUMBER THIS WHOLE PROGRAMME
+		//                     TURNS ON, and the reason it is a pair rather
+		//                     than a mean computed in the shader: a mean
+		//                     cannot be summed across rays, and an atomic per
+		//                     ray of a float is not available here. A RUN is a
+		//                     maximal sequence of CONSECUTIVE sky-licensed
+		//                     blocks along one ray; the mean is
+		//                     RunBlocks / Runs on the CPU.
+		//
+		//                     WHY IT DECIDES: three previous skip arms died
+		//                     because there was nothing long enough to
+		//                     amortise a test over -- the residency-only block
+		//                     arm paid 23.7 tests to avoid 11.2 cells. Here
+		//                     one licensed block IS a 4-chunk advance off one
+		//                     load, so the break-even is a run of 1. The run
+		//                     length says how far past break-even this gets,
+		//                     and a mean near 1.0 with a high licensed rate
+		//                     means sky is SCATTERED -- which would say the
+		//                     4^3 granularity is wrong, not that the mark is.
+		//
+		// A SUMMED SKIPPED *DISTANCE* IS DELIBERATELY ABSENT, for the reason
+		// the Z bound's fourth word is: at 1.3M rays it reaches ~1e12 and
+		// wraps a uint32 silently -- a counter that reads small precisely when
+		// the arm worked hardest.
+		//
+		// AND THESE PROVE ENGAGEMENT, NOT SAVING. Decisions, not nanoseconds.
+		// The saving is VoxelMarch.March from ProfileGPU and nothing else; a
+		// leg where the licensed rate is large and that number does not move
+		// is a REAL NULL RESULT, and the third one this project has had here.
+		BlockSkyLicensed,
+		BlockSkyRunBlocks,
+		BlockSkyRuns,
+		Count
 	};
 	// 7 since level 6 (the 8 km ring) landed 2026-08-23. This widens the
 	// readback layout by one word; both sides move together because the shader
@@ -478,6 +666,42 @@ struct FVoxelMarchHoleStats
 	uint64 UncoveredShell = 0;
 	uint64 BreakdownFrames = 0;
 	bool bBreakdownArmed = false; // voxel.March.HoleStats >= 2 when asked
+
+	// ---- the resident-Z bound (voxel.March.ZCut) ---------------------------
+	// Counted on EVERY hole-stats level, not only level 2: the arm's
+	// engagement question is "did it run", which is level-1 cheap. bZCutArmed
+	// is refreshed from the CURRENT cvar at drain/peek time exactly as bArmed
+	// is, so a reader can separate "off" (silence) from "on and
+	// ZCutConsulted == 0" (armed and inert -- the loud case) from "on and
+	// cutting". Zeros here with bZCutArmed FALSE are not a reading at all;
+	// they are the arm being off.
+	uint64 ZCutConsulted = 0;
+	uint64 ZCutSkipped = 0;
+	uint64 ZCutClipped = 0;
+	bool bZCutArmed = false;      // voxel.March.ZCut was on when asked
+
+	// ---- the coarse occupancy level (voxel.March.BlockSkip) ----------------
+	// Counted on EVERY hole-stats level, like the Z bound's trio and for the
+	// same reason: "did it run" is a level-1-cheap question.
+	//
+	// bBlockSkipArmed IS NOT THE CVAR AND MUST NOT BE READ AS IT. Unlike
+	// voxel.March.ZCut, this arm is a PERMUTATION -- the kernel either has the
+	// code in it or does not -- so the flag is refreshed from the arm actually
+	// selected. Zeros with the flag FALSE are the arm being off and are not a
+	// reading at all; zeros with the flag TRUE are the loud case.
+	uint64 BlockConsulted = 0;
+	uint64 BlockSkipped = 0;
+	uint64 BlockCellsAvoided = 0;
+	bool bBlockSkipArmed = false;
+	// The sky licence. BlockSkyMode is the UNIFORM as the dispatch actually saw
+	// it, not the cvar: a leg whose kernel was compiled without
+	// VOXEL_MARCH_BLOCK_SKIP reads none of these however the cvar is set, and
+	// bBlockSkipArmed beside it is what separates "armed and inert" from "not
+	// compiled in". Both must be printed or a zero is unreadable.
+	uint64 BlockSkyLicensed = 0;
+	uint64 BlockSkyRunBlocks = 0;
+	uint64 BlockSkyRuns = 0;
+	int32 BlockSkyMode = 0;
 };
 
 // Drains the accumulated window (the GetAndReset pattern the 5 s perf log

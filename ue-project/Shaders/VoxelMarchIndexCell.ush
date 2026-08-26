@@ -63,7 +63,11 @@
 //                        1 = admitted: a streaming record exists and the chunk
 //                            is queued or in flight, not yet in the pool
 //                        2 = evicted: the pool held it and removed it
-//                        3 = reserved, classified as unattributable
+//                        3 = OPEN SKY (voxel.Stream.SkyMark, 2026-08-25): the
+//                            coverage rule CONSIDERED this chunk, PROVED it is
+//                            above the terrain surface, and declined to admit
+//                            it. Was "reserved, unattributable" and nothing
+//                            ever wrote it. See the note below this block.
 //   bits [10:2] tag      3 bits per axis of (coord >> 7) & 7 -- WHICH torus
 //                        wrap wrote this annotation. The grid is 128 cells per
 //                        axis, so coords 128 apart share a cell; without the
@@ -80,10 +84,40 @@
 // VoxelMarchChunkIndex.h (the CPU writer), the same hand mirror kResidentBit
 // already lives under, checked by the same delta-verify readback gate. The
 // >>7 is log2(kDimXY)=log2(kDimZ)=7, static_asserted on the CPU side.
+// ---------------------------------------------------------------------------
+// THE OPEN-SKY MARK -- the one absence a skip is PERMITTED to advance through
+// ---------------------------------------------------------------------------
+//
+// Every other non-resident state has to be treated as BLOCKING, and that is not
+// conservatism, it is the shape of this world: only a thin surface shell
+// streams (about 4.4 chunks per column at level 0; 50,052 resident cells of
+// 16,777,216), AIR IS NOT RESIDENT, and a chunk that has not streamed yet may
+// contain surface. So "nothing in this cell" has never licensed an advance --
+// which is why voxel.March.ZCut skipped 0.00% at the horizon and why
+// voxel.March.BlockSkip paid 23.7 block tests to avoid 11.2 cells and ran 30%
+// slower. There was nothing anywhere a skip was allowed to cross.
+//
+// Reason 3 is that thing. The CPU's coverage rule already ran a worldgen-grade
+// proof (IsChunkProvablyAllAir, verified in production by -VoxelVerifySkyBand)
+// and DECLINED to admit on the strength of it, then threw the answer away. Now
+// it writes it here, into bits this dword was not using, which the residency
+// test already loads. No extra buffer, no extra load, no extra inner-loop test.
+//
+// THE TAG IS PART OF THE TEST AND NOT DECORATION. The grid is toroidal, so a
+// cell can hold a valid mark stamped by a coord 128 cells away. A tag mismatch
+// means the mark is not about the chunk being asked about, and the answer falls
+// back to NOT SKY -- the safe side, since an unmarked cell merely costs a walk
+// while a wrongly skipped one deletes terrain.
+//
+// AND THE ZERO PATTERN MEANS NOT SKY, which is the whole safety argument for
+// the encoding direction. An unwritten cell, a cleared cell, a GPU publish
+// clear, a freshly seeded grid and a binary from before this existed all read
+// reason 0 = NONE. Inverted, every one of those would claim the world is empty.
 #define VOXEL_MARCH_ABSENT_REASON_MASK    0x3u
 #define VOXEL_MARCH_ABSENT_REASON_NONE    0u
 #define VOXEL_MARCH_ABSENT_REASON_PENDING 1u
 #define VOXEL_MARCH_ABSENT_REASON_EVICTED 2u
+#define VOXEL_MARCH_ABSENT_REASON_OPENSKY 3u
 #define VOXEL_MARCH_ABSENT_TAG_SHIFT      2u
 #define VOXEL_MARCH_ABSENT_TAG_MASK       0x1FFu
 
@@ -94,6 +128,31 @@ uint VoxelMarchAbsentTag(int3 ChunkCoord)
 	       (((uint(ChunkCoord.z) >> 7u) & 7u) << 6u);
 }
 
+// (raw index entry, wanted coord) -> is this cell PROVABLY OPEN SKY for that
+// coord? Three tests and every one of them is load-bearing:
+//
+//   * NOT RESIDENT. With bit 31 set the low bits are a POOL SLOT, not a reason
+//     code, and slot 3 would otherwise read as the sky code. Leading with this
+//     is what stops a resident chunk in slot 3 being skipped as air.
+//   * REASON == OPENSKY. Only the CPU's coverage proof writes it.
+//   * TAG == this coord's. Otherwise the mark belongs to a torus alias and says
+//     nothing about the chunk being asked about.
+//
+// Pure ALU on a dword the caller already holds. Nothing here loads anything.
+bool VoxelMarchIsOpenSky(uint Entry, int3 ChunkCoord)
+{
+	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u)
+	{
+		return false;
+	}
+	if ((Entry & VOXEL_MARCH_ABSENT_REASON_MASK) != VOXEL_MARCH_ABSENT_REASON_OPENSKY)
+	{
+		return false;
+	}
+	return ((Entry >> VOXEL_MARCH_ABSENT_TAG_SHIFT) & VOXEL_MARCH_ABSENT_TAG_MASK) ==
+	       VoxelMarchAbsentTag(ChunkCoord);
+}
+
 uint VoxelMarchIndexCellCompute(int3 ChunkCoord, uint3 DimChunks,
                                 uint CellsPerLevel, uint GridSlot)
 {
@@ -102,6 +161,39 @@ uint VoxelMarchIndexCellCompute(int3 ChunkCoord, uint3 DimChunks,
 	const uint cz = uint(ChunkCoord.z) & (DimChunks.z - 1u);
 	return GridSlot * CellsPerLevel +
 	       cx + DimChunks.x * (cy + DimChunks.y * cz);
+}
+
+// ---------------------------------------------------------------------------
+// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip) -- the shared derivation
+// ---------------------------------------------------------------------------
+//
+// (chunk coord, grid slot) -> block index, over 4x4x4 blocks of the SAME cell
+// grid the function above addresses. It lives here for exactly the reason that
+// function does: FVoxelMarchChunkIndex::BlockOf writes these blocks on the CPU
+// and the marcher reads them on the GPU, and a writer and a reader that each
+// carry their own copy of the wrap math drift into blocks that are published
+// but never consulted -- which renders as skipped ground, i.e. holes, with
+// every counter healthy.
+//
+// WRAP FIRST, THEN DIVIDE, in that order and in both spellings. The grid is
+// toroidal, so a block is a region of the WRAPPED cell grid rather than of world
+// chunk space -- and that is only coherent while 4 divides the dimension, which
+// FVoxelMarchChunkIndex static_asserts (128 % 4 == 0). Under that condition
+// (coord & (dim-1)) / 4 and (coord / 4) & (dim/4 - 1) are the same number, so no
+// 4^3 block can straddle the seam and hold two disjoint pieces of the world.
+//
+// BLOCKS PER SLOT IS PASSED IN, not derived from DimChunks here, for the reason
+// CellsPerLevel is passed in above: the reader and the writer bind different
+// uniform names and the parameters are the seam.
+uint VoxelMarchIndexBlockCompute(int3 ChunkCoord, uint3 DimChunks,
+                                 uint BlocksPerSlot, uint GridSlot)
+{
+	const uint bx = (uint(ChunkCoord.x) & (DimChunks.x - 1u)) >> 2u;
+	const uint by = (uint(ChunkCoord.y) & (DimChunks.y - 1u)) >> 2u;
+	const uint bz = (uint(ChunkCoord.z) & (DimChunks.z - 1u)) >> 2u;
+	const uint bdx = DimChunks.x >> 2u;
+	const uint bdy = DimChunks.y >> 2u;
+	return GridSlot * BlocksPerSlot + bx + bdx * (by + bdy * bz);
 }
 
 #endif // VOXEL_MARCH_INDEX_CELL_USH

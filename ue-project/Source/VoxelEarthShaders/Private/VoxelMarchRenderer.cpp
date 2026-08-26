@@ -154,8 +154,10 @@ namespace
 		TEXT("screenshots outrank it. See docs/gpu-streaming-architecture.md 7. ")
 		TEXT("FINE -> COARSE FALLTHROUGH (Phase 1, the no-hole invariant): how many coarser ")
 		TEXT("levels a ring segment may retry after a miss that crossed a NON-RESIDENT chunk, so ")
-		TEXT("a missing level-0 chunk renders as level-1 detail instead of a hole. 0 (default) = ")
-		TEXT("off, and off is the byte-identical control -- it is a SHADER PERMUTATION for the ")
+		TEXT("a missing level-0 chunk renders as level-1 detail instead of a hole. 0 = off, the ")
+		TEXT("byte-identical control -- and NOT the default: THIS SHIPS AT 1 since 2026-08-23, ")
+		TEXT("because the owner reports black arc holes at LOD boundaries without it. It is a ")
+		TEXT("SHADER PERMUTATION for the ")
 		TEXT("same reason rings are. 1 is the intended arm (worst case two walks per segment); 2 ")
 		TEXT("is the measurable step beyond it. Clamped to 0..2.\n")
 		TEXT("THE GATE IS RESIDENCY, NOT VALIDITY: a resident-but-empty chunk is real air and ")
@@ -163,9 +165,13 @@ namespace
 		TEXT("and overhangs with coarse rock, a visible regression no counter catches. Sky rays ")
 		TEXT("are NOT protected by the gate (sky-band-trimmed chunks are legitimately ")
 		TEXT("non-resident), so each depth step is paid on them; that is the cost ceiling.\n")
-		TEXT("USELESS WITHOUT -VoxelHierarchicalCoverage on the game side: the coarse levels ")
-		TEXT("must actually COVER the ground inside them for a coarser retry to find anything. ")
-		TEXT("With coverage off this fires and misses, burning the extra walks for nothing. ")
+		TEXT("USELESS WITHOUT HIERARCHICAL COVERAGE on the game side: the coarse levels must ")
+		TEXT("actually COVER the ground inside them for a coarser retry to find anything. With ")
+		TEXT("coverage off this fires and misses, burning the extra walks for nothing. Coverage ")
+		TEXT("is ON BY DEFAULT since 2026-08-23 and its switch is the NEGATIVE ")
+		TEXT("-VoxelNoHierarchicalCoverage (VoxelWorldSubsystem.cpp HierarchicalCoverageEnabled). ")
+		TEXT("Do NOT read a command line for -VoxelHierarchicalCoverage to decide whether this ")
+		TEXT("arm is useful: nothing passes it any more. ")
 		TEXT("Rings + source 1 only."),
 		ECVF_RenderThreadSafe);
 
@@ -193,8 +199,10 @@ namespace
 		TEXT("admitted-pending / evicted / unattributed -- read from annotation bits the CPU ")
 		TEXT("streamer writes into NON-resident index cells (see VoxelMarchIndexCell.ush). ")
 		TEXT("PROVING RUNS: -VoxelMaxRingLevel=0 must push the reason mass into NEVER-ADMITTED ")
-		TEXT("at levels 1-5 (streaming never admits them); -VoxelHierarchicalCoverage must ")
-		TEXT("inflate EVICTED (32,923 pool evictions measured); hovering must drain PENDING to ")
+		TEXT("at levels 1-5 (streaming never admits them); hierarchical coverage inflates ")
+		TEXT("EVICTED (32,923 pool evictions measured -- coverage is now ON by default, so the ")
+		TEXT("control leg for that comparison is -VoxelNoHierarchicalCoverage); hovering must ")
+		TEXT("drain PENDING to ")
 		TEXT("~0 alongside the pending queues. A large UNATTRIBUTED bucket, or a printed ")
 		TEXT("attributed-vs-uncovered shortfall, indicts the instrument itself and is printed ")
 		TEXT("rather than folded away. Level 1 leaves the breakdown words unwritten and the log ")
@@ -202,6 +210,354 @@ namespace
 		TEXT("voxel.March.IndexGpuResident 1: the GPU publish kernel clears cells to literal 0, ")
 		TEXT("so the annotations are not written there and the whole breakdown reads ")
 		TEXT("never-admitted; the writer disarms itself and the perf line says so."),
+		ECVF_RenderThreadSafe);
+
+	// ---- THE RESIDENT-Z BOUND -------------------------------------------
+	//
+	// Measured gap, four matched static legs, real ProfileGPU, one spawn, only
+	// camera PITCH differing:
+	//
+	//     -90 down   VoxelMarch.March 1.108 ms   frame 7.45 ms
+	//     -20        3.656 ms                    8.76 ms
+	//       0        4.448 ms                    9.08 ms
+	//     +30 sky    5.638 ms                    9.55 ms
+	//
+	// 5.1x and a 4.5 ms swing on ONE GPU pass, tracking EMPTY SPACE CROSSED
+	// rather than geometry hit. At the horizon this pass is 49% of the frame.
+	// The cause is structural, not micro: above the chunk grid there is no
+	// acceleration structure and NO Z BOUND AT ALL, so a ray within ~2.2
+	// degrees of vertical walks the full 4,198 m FrameExtentUU half-extent at
+	// level 0 -- about 1,310 chunk steps -- hits the 512-chunk cap, returns
+	// TERM_CHUNK_CAP and produces nothing. voxel.March.StepBudget cannot stop
+	// it: its only consumer sits INSIDE the brick loop and an empty ray never
+	// reaches a brick.
+	TAutoConsoleVariable<int32> CVarVoxelMarchZCut(
+		TEXT("voxel.March.ZCut"), 0,
+		TEXT("THE RESIDENT-Z BOUND. 0 = off, THE CONTROL, and the default. 1 = before walking a ")
+		TEXT("ring segment at level L, intersect the segment's t-interval with the Z SLAB that ")
+		TEXT("CONTAINS every chunk level L holds, and hand the walk the intersection instead. An ")
+		TEXT("empty intersection skips the walk outright.\n")
+		TEXT("WHAT IT IS FOR: the ring walk is bounded horizontally (ring radii, corrected to ")
+		TEXT("CYLINDERS in 2026-08-20) and not bounded vertically at all, while the streamed set ")
+		TEXT("is a thin shell around the surface -- about 4.4 chunks per column at level 0. A ")
+		TEXT("near-vertical ray therefore spends its entire budget stepping through air nothing ")
+		TEXT("holds, one scattered load into a ~67 MB buffer per 3.2 m.\n")
+		TEXT("A UNIFORM AND NOT A PERMUTATION, which is a departure from voxel.March.Rings / ")
+		TEXT("Fallthrough / HoleStats and is argued rather than assumed: the doctrine those three ")
+		TEXT("follow is that a runtime branch leaves the OTHER ARM'S LOADS in the binary and ")
+		TEXT("re-bases the control. This arm adds no load and no memory traffic of any kind -- a ")
+		TEXT("handful of ALU per SEGMENT (at most 7 per ray) against hundreds of chunk steps -- so ")
+		TEXT("there is no traffic for an off-arm to carry. Being a uniform is also what lets one ")
+		TEXT("build serve both arms of a pitch sweep, which is how this will be measured.\n")
+		TEXT("IT CANNOT MAKE A HOLE, and that is the property that had to be built rather than ")
+		TEXT("hoped for. The slab is the CUMULATIVE union of every chunk Z ever admitted at that ")
+		TEXT("level (FVoxelMarchChunkIndex::GetResidentChunkZBound), widened further by ")
+		TEXT("voxel.March.ZCutPadChunks; removals never narrow it. So the bound is a strict ")
+		TEXT("SUPERSET of the resident set, every chunk the cut removes is provably NOT RESIDENT, ")
+		TEXT("and a level holding nothing is refused a bound entirely rather than given an empty ")
+		TEXT("one. Its failure mode over a long flight is that the union widens until the cut ")
+		TEXT("removes nothing -- LOST BENEFIT, never a hole.\n")
+		TEXT("FALLTHROUGH SEMANTICS ARE PRESERVED EXACTLY. bCrossedAbsentChunk is set whenever ")
+		TEXT("the cut removes any part of an interval, because a full walk over that part would ")
+		TEXT("have set it; and the pad guarantees every removed chunk is at least TWO chunks in Z ")
+		TEXT("from anything resident, so it cannot be face-adjacent to a resident chunk and ")
+		TEXT("bCrossedShellAbsent is left untouched -- which is exactly what the full walk would ")
+		TEXT("have left it. Both fallthrough gates therefore see the same value they saw before.\n")
+		TEXT("PROVE IT ENGAGED BEFORE BELIEVING A TIMING: voxel.March.Stats prints the arm state, ")
+		TEXT("the per-level bound actually uploaded, and -- with voxel.March.HoleStats on -- ")
+		TEXT("consulted / skipped / clipped, which partition every decision the bound was asked ")
+		TEXT("to make. consulted == 0 with this at 1 means ")
+		TEXT("the arm is ARMED AND INERT and no timing taken on that leg means anything.\n")
+		TEXT("THOSE COUNTERS PROVE ENGAGEMENT AND DO NOT ESTIMATE THE SAVING. Iterations and ")
+		TEXT("wall time move in opposite directions often enough to have been published three ")
+		TEXT("times over -- VoxelRT measured iterations -60%% against traversal time +10-15%%, ")
+		TEXT("and Aila & Laine record that ~20%% slower code gives the same measured perf. ")
+		TEXT("THE SAVING IS `VoxelMarch.March` FROM ProfileGPU AND NOTHING ELSE. A leg where ")
+		TEXT("skipped is large and that number does not move is a REAL NULL RESULT, not a ")
+		TEXT("broken counter.\n")
+		TEXT("WHAT WOULD REFUTE IT: any black arc or missing ground that appears with this at 1 ")
+		TEXT("and is absent at 0 on the same spawn. That is a hole, it outranks every millisecond ")
+		TEXT("here, and the correct response is to turn this off, not to widen the pad."),
+		ECVF_RenderThreadSafe);
+
+	// =====================================================================
+	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip)
+	// =====================================================================
+	//
+	// THE GAP THIS CLOSES, and it is the one the resident-Z bound could not.
+	// The chunk index is 99.7% EMPTY -- 50,052 resident chunks
+	// (perLevel 6671/7070/7082/7226/7112/7275/7616) in a 128^3 x 8-slot,
+	// 16,777,216-cell, 64 MiB grid -- and the walk pays one scattered 4-byte
+	// load into that 64 MiB for every 3.2 m of nothing at level 0. The marcher
+	// is 54% of the GPU frame and VoxelMarch.March swings 1.108 ms looking
+	// straight down to 5.638 ms at sky, 5.1x, tracking EMPTY SPACE CROSSED.
+	//
+	// WHY NOT THE Z SLAB, WHICH IS ALREADY IN THE TREE AND ALREADY REFUTED:
+	// voxel.March.ZCut engaged over 3.79e9 decisions at the horizon and skipped
+	// 0.00%. The slab is about 37 chunks (~118 m) tall and a HORIZONTAL ray
+	// never leaves it -- it was +2% WORSE at the horizon and -6% at sky. A Z or
+	// column bound cannot reach horizontal rays, which is where the frame is
+	// spent. This one is a 3D bound and reaches them.
+	//
+	// WHY NOT A DEEPER PYRAMID, also settled: our own spike measured a SECOND
+	// coarse level moving miss-cost 56.5 -> 34.6 steps and hit-cost 48.6 ->
+	// 68.9. Levoy 1990 published the rule -- a level pays only where
+	// P(empty) x distance skipped exceeds the cost of the test, and that
+	// product collapses at both ends of the ray. Literature at 0.55%
+	// occupancy: one occupancy map 9.0x, a distance field on top +4.5%, a
+	// third structure +0%. ONE LEVEL. Do not add a second.
+	//
+	// A PERMUTATION AND NOT A UNIFORM, which is the OPPOSITE choice to
+	// voxel.March.ZCut two entries up, and the difference is the whole reason
+	// that one argued its case. The Z bound adds a handful of ALU per SEGMENT
+	// and no memory traffic, so an off-arm carrying its code carries nothing.
+	// This arm adds TWO BUFFER LOADS PER BLOCK. A runtime branch would leave
+	// that traffic in the control's binary, and a control that pays for loads
+	// it never reads flatters whichever arm is under test -- which is exactly
+	// what VOXEL_MARCH_SKIP_LEVELS' own note records and what VoxelMarchSpike
+	// paid three legs to learn. 0 must be BYTE-IDENTICAL to today, and it is
+	// only byte-identical if the code is not there.
+	TAutoConsoleVariable<int32> CVarVoxelMarchBlockSkip(
+		TEXT("voxel.March.BlockSkip"), 0,
+		TEXT("THE COARSE OCCUPANCY LEVEL ABOVE THE CHUNK INDEX. 0 = off, THE CONTROL, and the ")
+		TEXT("default. 1 = before stepping a chunk, consult a bit that says whether ANY of the ")
+		TEXT("4x4x4 block of chunk cells around it is resident, and when none is, jump to the ")
+		TEXT("block's far side in one step instead of walking 4 to 12 chunk cells through it.\n")
+		TEXT("WHAT IT IS FOR: the chunk index is 99.7%% empty -- 50,052 resident chunks in a ")
+		TEXT("16,777,216-cell, 64 MiB grid -- and empty space costs one scattered 4-byte load ")
+		TEXT("into that 64 MiB per 3.2 m at level 0. voxel.March.ZCut cannot help here: it ")
+		TEXT("engaged over 3.79e9 decisions at the horizon and skipped 0.00%%, because its slab ")
+		TEXT("is ~118 m tall and a horizontal ray never leaves it. This bound is 3D.\n")
+		TEXT("A PERMUTATION, NOT A UNIFORM, and deliberately unlike voxel.March.ZCut: this arm ")
+		TEXT("adds two buffer loads per block, and a runtime branch would leave that traffic in ")
+		TEXT("the control's binary and flatter the arm under test. Both arms must be COMPILED ")
+		TEXT("separately; one binary must never be asked to behave two ways.\n")
+		TEXT("IT CANNOT MAKE A HOLE, and that had to be built rather than hoped for. Two things ")
+		TEXT("carry it. (1) A block is skipped only when NO cell in it is resident, so every ")
+		TEXT("cell the jump passes is one the walk would have found absent anyway. (2) The jump ")
+		TEXT("to the block's far side is biased conservatively SHORT -- a full chunk short, ")
+		TEXT("applied AFTER the float conversion -- and is taken only when it still beats the ")
+		TEXT("ordinary one-chunk advance, so the ray lands INSIDE the block it is leaving and ")
+		TEXT("the chunk loop finishes the crossing. Danskin & Hanrahan measured why the bias is ")
+		TEXT("needed: a ray taking even a tiny step can step through three pyramid nodes, so a ")
+		TEXT("max/OR bound is NOT automatically conservative once you JUMP to the far side of ")
+		TEXT("it.\n")
+		TEXT("FALLTHROUGH SEMANTICS ARE PRESERVED EXACTLY. A skipped block sets ")
+		TEXT("bCrossedAbsentChunk from its own AnyAbsent bit -- which is what the walk would ")
+		TEXT("have set on the first non-resident chunk inside it -- and a block holding ANY ")
+		TEXT("resident chunk is never skipped, so resident-empty chunks are still walked one by ")
+		TEXT("one and still do NOT open the ladder. That distinction is why there are two bits ")
+		TEXT("and not one: a resident-empty chunk is real air, and letting a coarser level stand ")
+		TEXT("in for it plugs cave mouths, doorways and overhangs with rock.\n")
+		TEXT("PROVE IT ENGAGED BEFORE BELIEVING A TIMING: with voxel.March.HoleStats on, ")
+		TEXT("voxel.March.Stats prints blkConsulted / blkSkipped / blkCellsAvoided. ")
+		TEXT("blkConsulted == 0 while this reads 1 means the arm is ARMED AND INERT and no ")
+		TEXT("timing taken on that leg means anything -- and check blockFallback in the same ")
+		TEXT("line, which counts frames that marched against an all-ones coarse level, i.e. ")
+		TEXT("against the control.\n")
+		TEXT("THOSE COUNTERS PROVE ENGAGEMENT AND DO NOT ESTIMATE THE SAVING. Iterations and ")
+		TEXT("wall time move in opposite directions often enough to have been published three ")
+		TEXT("times over -- VoxelRT measured iterations -60%% against traversal time +10-15%%, ")
+		TEXT("and Aila & Laine record that ~20%% slower code gives the same measured perf. ")
+		TEXT("THE SAVING IS `VoxelMarch.March` FROM ProfileGPU AND NOTHING ELSE. A leg where ")
+		TEXT("blkCellsAvoided is enormous and that number does not move is a REAL NULL RESULT, ")
+		TEXT("not a broken counter.\n")
+		TEXT("WHAT WOULD REFUTE IT: any black arc, missing ground or terrain-through-terrain ")
+		TEXT("that appears with this compiled at 1 and is absent at 0 on the same spawn and the ")
+		TEXT("same pose. That is a hole, it outranks every millisecond here, and the correct ")
+		TEXT("response is to turn the arm off -- not to shrink the block or widen the bias."),
+		ECVF_RenderThreadSafe);
+
+	// ---- THE SKY LADDER GATE (voxel.March.SkyLadder) ----------------------
+	TAutoConsoleVariable<int32> CVarVoxelMarchSkyLadder(
+		// RETIRED 2026-08-26 -- MEASURED, AND THE WIN WAS THE DEFECT.
+//
+// This arm read -7.6% on the marcher and it was buying that number by
+// DELETING TERRAIN. Owner-visible: 96.33% of pixels changed and a near
+// mountain was replaced by the valley behind it. After the mark was made
+// honest (dilated across every level the ladder can retry into), the owner
+// confirmed the pair identical -- and the timing inverted:
+//
+//     pitch    off        on(fixed)    delta      fallthrough taken
+//       0    4.458 ms    4.595 ms     +3.1%      98.79% -> 89.09%
+//     +30    5.587 ms    5.921 ms     +6.0%      99.54% -> 92.11%
+//
+// The correct mark licenses about a tenth as many declines as the broken one
+// (9.7pp of retry rate instead of 62pp), and checking it costs more than those
+// declines save. THE SAVING WAS THE SKIPPED WORK THAT WAS ACTUALLY NEEDED: the
+// coarse stand-in a near mountain is MADE OF when its own-level chunks were
+// never admitted.
+//
+// FOR AN ARM THAT CHANGES WHAT IS DRAWN, THE IMAGE COMES FIRST AND THE TIMING
+// SECOND. This one was swept for timing, had a default set from that sweep, and
+// was rebuilt -- all before anyone looked at a frame. Every one of those numbers
+// was real and every one of them was worthless.
+//
+// Kept at default 0 with its machinery intact because the SKY MARK ITSELF is
+// now verified correct (0 wrong marks in 398 sampled chunks / 9,950 columns,
+// sampled against Amplifier::surfaceMm rather than the bound it was derived
+// from) and may serve a different consumer. What is retired is using it to
+// gate the retry ladder.
+TEXT("voxel.March.SkyLadder"), 0,
+		TEXT("WHAT OPENS THE FINE->COARSE RETRY LADDER. 0 = off, THE CONTROL, and the default: ")
+		TEXT("the gate is bCrossedAbsentChunk, byte-identical to the shipped marcher. 1 = the ")
+		TEXT("gate becomes 'did this ray cross an absence that is NOT PROVEN OPEN SKY'.\n")
+		TEXT("THE POLARITY, AND GETTING IT BACKWARDS PLUGS CAVE MOUTHS, DOORWAYS AND OVERHANGS ")
+		TEXT("WITH COARSE ROCK: a SKY-MARKED absence licenses NOT retrying. EVERY OTHER absence ")
+		TEXT("-- pending, evicted, never-admitted, a torus alias's tag, a stale record, an ")
+		TEXT("unconsulted cache -- must STILL RETRY. The predicate is written as 'absent AND NOT ")
+		TEXT("PROVEN SKY' and never as 'not proven non-sky', so every bit pattern this feature ")
+		TEXT("did not write falls on the retry side.\n")
+		TEXT("WHAT IT IS FOR. The live gate asks 'did this ray cross ANYTHING not resident', and ")
+		TEXT("the streamed set is a thin shell around the surface -- about 4.4 chunks per column ")
+		TEXT("at level 0. Ring segment 0 starts AT THE CAMERA and the camera is in air, so the ")
+		TEXT("first absent chunk on essentially every ray is that air, the gate opens at every ")
+		TEXT("rung, and A SKY RAY WALKS THE CHUNK INDEX AT UP TO SEVEN LEVELS INSTEAD OF ONE. ")
+		TEXT("Measured population, from this file's own note quoting ")
+		TEXT("Saved/capture-zcut-alt120.log: 25.27%% of rays on a SETTLED STATIONARY world.\n")
+		TEXT("AND IT ANSWERS THE QUESTION FOR FREE. VOXEL_MARCH_FALLTHROUGH_SHELL was written to ")
+		TEXT("fix exactly this and is NOT COMPILED -- no permutation dimension, no SetDefine ")
+		TEXT("anywhere in Source/ -- and its answer costs up to SIX extra scattered index loads ")
+		TEXT("per non-resident chunk. This arm reads the coverage rule's own proof out of bits ")
+		TEXT("the residency test already loaded: one mask, one compare, no loads.\n")
+		TEXT("A PERMUTATION AND NOT A UNIFORM, unlike voxel.March.BlockSkySkip: this one adds a ")
+		TEXT("field to the chunk cache and a fold at five sites in the walk, i.e. registers and ")
+		TEXT("ALU in the inner loop, and a control that carries the treatment's work flatters ")
+		TEXT("the treatment. Rings + fallthrough > 0 only; other combinations are refused at ")
+		TEXT("compile rather than built and never selected.\n")
+		TEXT("bCrossedAbsentChunk IS UNTOUCHED at all five of its write sites, so `uncovered`, ")
+		TEXT("the hole metric and the shell counters read on this arm exactly what they read on ")
+		TEXT("the control. This arm adds a SECOND flag and changes only which one the gate reads.\n")
+		TEXT("PROOF OF TRAFFIC, AND NOTHING ELSE ON THE LEG MEANS ANYTHING WITHOUT IT: ")
+		TEXT("FallthroughTaken / FallthroughConsidered, printed by voxel.March.Stats with ")
+		TEXT("voxel.March.HoleStats on, MUST FALL between the control and this arm. If it does ")
+		TEXT("not move, THE SWITCH IS INERT -- report that, not a millisecond. Seven switches in ")
+		TEXT("this repo were inert while looking armed. It also requires the STREAMING side: ")
+		TEXT("with voxel.Stream.SkyMark 0 no cell is marked, every absence reads non-sky, and ")
+		TEXT("this arm is byte-identical to the control BY CONSTRUCTION -- which is a correct ")
+		TEXT("null, not a bug, and the skyMark lines on the LogVoxelPerf log say which it is.\n")
+		TEXT("WHAT WOULD REFUTE IT: `uncShell` RISING against the control. That would mean the ")
+		TEXT("sky mark is being read over REAL gaps and this gate is dropping fills the owner ")
+		TEXT("can see. `uncovered` collapsing while `uncShell` holds is the intended reading. ")
+		TEXT("And a screenshot outranks both: any black arc, missing ground, or coarse rock in a ")
+		TEXT("cave mouth that appears at 1 and is absent at 0 on the same spawn and pose is a ")
+		TEXT("hole, and the response is to turn the arm off.\n")
+		TEXT("IT HAS ALREADY BEEN REFUTED ONCE, and both causes are fixed rather than tuned. ")
+		TEXT("2026-08-25, pinned pose, deterministic harness (control-vs-control 0.048%%): armed ")
+		TEXT("with voxel.Stream.SkyMarkChunks 32 the frame differed from the control by 96.33%% of ")
+		TEXT("pixels -- a near mountain gone and the valley behind it drawn. (1) A level-L mark ")
+		TEXT("was declining a retry at level L+1, which it cannot speak for; the writer now takes ")
+		TEXT("its bound as a MAX over a dilated set covering every level this switch can retry ")
+		TEXT("into, and it READS voxel.March.Fallthrough to know how far that is. (2) This gate ")
+		TEXT("read a TRUNCATED walk as evidence -- the hierarchical walk caps its chunk loop at ")
+		TEXT("512 and a near-vertical ray needs 1,310 -- so a truncated walk now always reopens ")
+		TEXT("the ladder.\n")
+		TEXT("FOR AN ARM THAT CHANGES WHAT IS DRAWN, THE IMAGE COMES FIRST AND THE TIMING SECOND. ")
+		TEXT("The band was swept for timing, the knee became the default, the binary was rebuilt ")
+		TEXT("-- all before the visual check. The timing was real and correct; the arm was ")
+		TEXT("deleting terrain at every band it was measured at. Shoot the control/armed pinned ")
+		TEXT("pose pair FIRST and require it to match to within the harness's own noise floor; ")
+		TEXT("only then does a millisecond off this switch mean anything."),
+		ECVF_RenderThreadSafe);
+
+	// ---- THE SKY LICENCE (voxel.March.BlockSkySkip) -----------------------
+	TAutoConsoleVariable<int32> CVarVoxelMarchBlockSkySkip(
+		TEXT("voxel.March.BlockSkySkip"), 0,
+		TEXT("WHAT LICENSES A BLOCK SKIP. Read only inside a kernel compiled with ")
+		TEXT("voxel.March.BlockSkip 1; with that off this changes nothing and the marcher is ")
+		TEXT("the byte-identical control.\n")
+		TEXT("  0 = RESIDENCY ONLY, the default and byte-identical to the shipped BlockSkip arm: ")
+		TEXT("a block is skipped when no cell in it is resident. No sky buffer is loaded at all ")
+		TEXT("(the load sits under a uniform branch), so this arm keeps EXACTLY the memory ")
+		TEXT("traffic its published result was measured with.\n")
+		TEXT("  1 = BOTH: unoccupied OR provably sky.\n")
+		TEXT("  2 = SKY ONLY: residency alone stops licensing a skip.\n")
+		TEXT("READ THIS BEFORE TAKING A TIMING OFF 1 OR 2 -- THIS ARM CANNOT WIN, BY PROOF, AND ")
+		TEXT("IS AN INSTRUMENT RATHER THAN A TREATMENT.\n")
+		TEXT("The all-sky bit is set only when all 64 cells are marked AND NONE IS RESIDENT ")
+		TEXT("(FVoxelMarchChunkIndex::RefreshBlockBits), so AllSky IMPLIES !Occupied. Therefore ")
+		TEXT("mode 1's predicate (!Occupied || AllSky) is IDENTICAL to mode 0's (!Occupied) -- ")
+		TEXT("not similar, identical -- and mode 2's is a strict SUBSET of it. Every block this ")
+		TEXT("arm skips is one the shipped residency arm already skipped, so it can only skip ")
+		TEXT("FEWER blocks and can never be faster. Any timing difference between 0 and 1 on ")
+		TEXT("this switch is run-to-run noise and must be reported as such.\n")
+		TEXT("WHY IT EXISTS ANYWAY: the block level is the wrong consumer for the mark, and this ")
+		TEXT("is how that was established rather than assumed. What these modes DO buy is the ")
+		TEXT("measurement -- blkSkyLicensed of blkConsulted says what FRACTION of the space a ")
+		TEXT("ray crosses is PROVABLY empty rather than merely unstreamed, and the run mean says ")
+		TEXT("whether that space clusters. Those two numbers are what a future coarser skip would ")
+		TEXT("be sized from. The mark's actual payoff is on the RETRY LADDER (see ")
+		TEXT("voxel.March.SkyLadder), where 'this absence is air, not a gap in held ground' ")
+		TEXT("changes which rays walk the index seven times instead of once.\n")
+		TEXT("WHAT THE RESIDENCY-ONLY ARM ACTUALLY MEASURED, corrected 2026-08-25: it skipped ")
+		TEXT("24.74%% of 11.1e9 blocks and ran 30%% SLOWER, paying 23.7 block tests per ray to ")
+		TEXT("avoid 11.2 cells. The failure was NOT that the bit could not license an advance -- ")
+		TEXT("read the traversal, it jumps on !Occupied and always has. The failure was the ")
+		TEXT("ARITHMETIC: the tests cost more than the cells they removed. A narrower predicate ")
+		TEXT("does not change that arithmetic in the helpful direction, which is why 1 and 2 ")
+		TEXT("below are instruments and not treatments.\n")
+		TEXT("A UNIFORM AND NOT A PERMUTATION, which departs from voxel.March.BlockSkip's own ")
+		TEXT("doctrine and is argued rather than assumed: that doctrine exists so a control does ")
+		TEXT("not carry the treatment's LOADS, and mode 0 issues no sky load (uniform branch, ")
+		TEXT("coherent across the dispatch). What it buys is all three states on ONE binary, ")
+		TEXT("interleavable in one leg -- which is exactly how the -30%% figure this has to beat ")
+		TEXT("was NOT measured.\n")
+		TEXT("IT CANNOT MAKE A HOLE, and that is built rather than hoped for. The sky bit is set ")
+		TEXT("only when ALL 64 cells carry a valid open-sky mark AND none is resident; the marks ")
+		TEXT("come from IsChunkProvablyAllAir, a worldgen-grade proof already verified in ")
+		TEXT("production by -VoxelVerifySkyBand; a block's 64 cells share one torus tag ")
+		TEXT("(128 %% 4 == 0), so a mark from a coord 128 cells away resets the block's count ")
+		TEXT("rather than licensing it; and every streaming transition on a cell overwrites the ")
+		TEXT("mark and withdraws the licence BEFORE the cell stops saying so. Unbound, the ")
+		TEXT("buffer reads zeros = nothing is sky = the arm is inert, the opposite of the ")
+		TEXT("occupancy pair's failure direction.\n")
+		TEXT("FALLTHROUGH SEMANTICS ARE PRESERVED EXACTLY, unchanged from mode 0: a skipped ")
+		TEXT("block still sets bCrossedAbsentChunk from its own AnyAbsent bit, so the ")
+		TEXT("fine->coarse ladder retries exactly the rays it does today. A sky-marked cell is ")
+		TEXT("STILL NON-RESIDENT and must still open that ladder -- the mark says the streaming ")
+		TEXT("system chose not to hold it, not that the ladder should stop caring.\n")
+		TEXT("PROVE IT ENGAGED BEFORE BELIEVING A TIMING. With voxel.March.HoleStats on, ")
+		TEXT("voxel.March.Stats prints blkSkyLicensed of blkConsulted and the run mean. ")
+		TEXT("blkSkyLicensed == 0 with blkConsulted > 0 means the marcher found NO licensed ")
+		TEXT("block, which is the streaming writer not running -- check voxel.Stream.SkyMark is ")
+		TEXT("1 and read the skyMark CELLS line, where written=0 of offered>0 names the cause. ")
+		TEXT("A run mean near 1.0 against a high licensed rate says sky is SCATTERED at 4^3 ")
+		TEXT("granularity, which indicts the block size, not the mark.\n")
+		TEXT("THOSE COUNTERS ARE DECISIONS, NOT NANOSECONDS. THE SAVING IS `VoxelMarch.March` ")
+		TEXT("FROM ProfileGPU AND NOTHING ELSE. A leg where the licensed rate is large and that ")
+		TEXT("number does not move is a REAL NULL RESULT -- and it would be the FOURTH here, so ")
+		TEXT("report it as one rather than looking for a counter to blame.\n")
+		TEXT("WHAT WOULD REFUTE IT: any black arc, missing ground or sky where terrain belongs ")
+		TEXT("that appears at 1 or 2 and is absent at 0 on the same spawn and the same pose. ")
+		TEXT("That is a hole, it outranks every millisecond here, and the response is to turn ")
+		TEXT("the arm off and read skyVerifyBad -- not to shrink the band."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<int32> CVarVoxelMarchZCutPadChunks(
+		TEXT("voxel.March.ZCutPadChunks"), 4,
+		TEXT("How many EXTRA chunks, at that level's own chunk size, the resident-Z slab is ")
+		TEXT("widened by on each side before it is used to cut. Clamped to a minimum of 1 and ")
+		TEXT("that minimum is LOAD-BEARING, not defensive tidiness: at pad 0 a removed chunk ")
+		TEXT("could sit face-adjacent in Z to a resident one, VoxelMarchAbsentTouchesShell would ")
+		TEXT("have answered TRUE for it, and skipping it would silently drop a ")
+		TEXT("bCrossedShellAbsent the retry ladder gates on -- changing which rays retry, which ")
+		TEXT("is a hole risk rather than a speed one. At pad >= 1 every removed chunk is at least ")
+		TEXT("two chunks away in Z from anything resident and all six of that test's neighbour ")
+		TEXT("probes are provably non-resident.\n")
+		TEXT("4 RATHER THAN 1 buys freshness as well: the bound is read on the render thread from ")
+		TEXT("state the game thread widens, so a chunk admitted just outside the previous frame's ")
+		TEXT("union is covered by the pad rather than by an ordering argument. 4 chunks is 12.8 m ")
+		TEXT("at level 0 and 819 m at level 6, against a level-0 shell about 14 m thick -- so the ")
+		TEXT("pad is the dominant term at the near levels and rounding noise at the far ones, ")
+		TEXT("which is the correct way round.\n")
+		TEXT("IT ACTS IN INTEGER CHUNK SPACE, BEFORE THE SHADER CONVERTS THE SLAB TO WORLD UU, ")
+		TEXT("and it is therefore NOT the guard against float error in that conversion or in ")
+		TEXT("the divide by Dir.z that follows it. THAT guard is a SEPARATE outward bias of one ")
+		TEXT("full chunk applied to the t-interval AFTER the conversion -- see THE OUTWARD BIAS ")
+		TEXT("in VoxelBrickTraverse.ush. The two are deliberately not the same number: this one ")
+		TEXT("is load-bearing for the bCrossedShellAbsent argument and that one for arithmetic, ")
+		TEXT("and a single knob doing both jobs would break both at once when it was lowered.\n")
+		TEXT("RAISING IT IS ALWAYS SAFE AND ALWAYS COSTS SPEED. LOWERING IT BELOW 1 IS REFUSED."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchRingCount(
@@ -361,6 +717,77 @@ namespace
 		TEXT("the doubled slope is the change to try -- see VoxelMarch.usf. And there is no ")
 		TEXT("silhouette fixup pass yet, on purpose: its size should come from a measured fallback ")
 		TEXT("rate, not a guess."),
+		ECVF_RenderThreadSafe);
+
+	// ---- THE TEMPORALLY VARYING SAMPLE LATTICE ----------------------------
+	//
+	// A SECOND SWITCH RATHER THAN A CHANGE TO THE FIRST, so a leg measures THREE
+	// arms and not two: full-res, half-res-static, half-res-jittered. Folding it
+	// into voxel.March.HalfRes would delete the static arm, which is the control
+	// the owner's rejection was recorded against and therefore the one thing
+	// that must survive.
+	//
+	// NOT A PERMUTATION. Unlike HalfRes itself, this changes no buffer extent,
+	// no dispatch shape and no tile size -- only a float2 uniform that every
+	// permutation already binds. The march, the depth pre-emit, the GBuffer emit
+	// and the verify gate all read the SAME uniform from the SAME frame's
+	// resolve, so there is no second construction of the lattice to drift.
+	TAutoConsoleVariable<int32> CVarVoxelMarchHalfResJitter(
+		TEXT("voxel.March.HalfRes.Jitter"), 0,
+		TEXT("MOVE THE HALF-RES SAMPLE LATTICE INSIDE ITS 2x2 BLOCK, ONE POSITION PER FRAME, so ")
+		TEXT("TSR has something new to accumulate. 0 = the static lattice this arm shipped with ")
+		TEXT("(sample at the block centre, byte-identical to every half-res leg so far); 1 = a ")
+		TEXT("FOUR-FRAME ROTATION over the four full-res pixel centres; 2 = an EIGHT-FRAME ")
+		TEXT("HALTON(2,3) over the same +/-0.5 px box. Ignored at voxel.March.HalfRes 0, where ")
+		TEXT("the uniform is forced to zero -- a jittered FULL-res march would hand the emit a t ")
+		TEXT("measured along a different ray than the one the emit rebuilds, which is a wrong ")
+		TEXT("depth on every pixel rather than a softer one.\n")
+		TEXT("WHAT IT IS FOR. The owner rejected half res on quality: 'the half res distant ")
+		TEXT("terrain does not look good. Very grainy and low res', 25.85%% of pixels differing ")
+		TEXT("at a pinned pose. In the far field about one voxel projects to one FULL-RES pixel, ")
+		TEXT("so one half-res sample stands for about four voxels and the reconstruction's ")
+		TEXT("nearest-neighbour fallback -- an edge case up close -- becomes the common case out ")
+		TEXT("there. Depth was always the only quantity this arm called exact; which voxel ")
+		TEXT("supplies the normal, material and AO is resolved from four samples over four times ")
+		TEXT("the area, so the SHADING at distance is quarter res. A lattice that moves converts ")
+		TEXT("a blocky point sample into a temporally dithered one, which is what checkerboard ")
+		TEXT("rendering and temporal upsampling do in shipped titles.\n")
+		TEXT("HOW TO PROVE IT ENGAGED RATHER THAN ASSUME IT, and take both: (1) the ")
+		TEXT("'[voxel-march] jitter:' line, printed once per DISTINCT PHASE actually dispatched, ")
+		TEXT("so a four-frame cycle produces four lines with four different offsets and a static ")
+		TEXT("lattice produces exactly one; (2) voxel.March.Stats 'halfResJitter', which prints ")
+		TEXT("phasesSeen and the phase mask -- phasesSeen=1 on a settled leg means the lattice is ")
+		TEXT("STATIC and every image taken since describes the arm this was meant to replace.\n")
+		TEXT("THE FALSIFIER, PRE-REGISTERED. INERT: the offset does not change between frames. ")
+		TEXT("REFUTED: it does change and the far-field graininess is unchanged on a pinned-pose ")
+		TEXT("A/B -- then temporal accumulation is not the cure for a four-voxels-per-sample ")
+		TEXT("undersample and this should be REVERTED rather than tuned. WORSE: any new shimmer ")
+		TEXT("or crawl IN MOTION refutes it even if the parked image improves, because a flicker ")
+		TEXT("is a worse defect than the graininess it replaced. JUDGE THIS ON A MOVING CAPTURE. ")
+		TEXT("A parked capture cannot show a temporal artefact at all, so a parked A/B is ")
+		TEXT("necessary and is not sufficient.\n")
+		TEXT("NOT ALIGNED TO THE ENGINE'S TAA/TSR JITTER PHASE, on purpose: the emit builds its ")
+		TEXT("quads' NDC by hand and both halves build their rays from the projection DIAGONAL, ")
+		TEXT("while a perspective TAA jitter lives in the third row -- so the marcher's samples ")
+		TEXT("have never sat where TSR believes a sample sits, and there is no phase to align to. ")
+		TEXT("What alignment was for is avoiding a BEAT, and both cycle lengths are powers of two ")
+		TEXT("against r.TemporalAASamples (8), so the combined pattern repeats in 8 frames."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<int32> CVarVoxelMarchHalfResJitterPhase(
+		TEXT("voxel.March.HalfRes.JitterPhase"), -1,
+		TEXT("PIN THE LATTICE TO ONE PHASE. -1 = free-running from the render-thread frame ")
+		TEXT("number, which is what a real leg wants. 0..N-1 = hold that phase every frame, ")
+		TEXT("which is what a MEASUREMENT wants.\n")
+		TEXT("WHY IT EXISTS. voxel.March.VerifyDepth grades the reconstruction at full res, and ")
+		TEXT("under a moving lattice its numbers become frame-dependent: a fallback pixel is ")
+		TEXT("graded against a sample up to a pixel further away than it was under the static ")
+		TEXT("lattice. Pinning makes the gate repeatable, makes a phase-0 against phase-1 A/B a ")
+		TEXT("clean image-space demonstration that the lattice really moved, and lets a still ")
+		TEXT("capture isolate ONE lattice instead of averaging the cycle.\n")
+		TEXT("A PINNED PHASE IS A STATIC LATTICE. It is a measurement tool and never a shipping ")
+		TEXT("configuration -- pinned, this arm gives TSR nothing new and reproduces exactly the ")
+		TEXT("graininess it was built to remove. Values are taken modulo the scheme's cycle."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchHTileProbe(
@@ -544,6 +971,226 @@ namespace
 	std::atomic<int32> GVoxelMarchRanViewWidth{0};
 	std::atomic<int32> GVoxelMarchRanViewHeight{0};
 	std::atomic<int32> GVoxelMarchRanResShift{-1};
+
+	// ---- THE RESIDENT-Z BOUND, AS ACTUALLY UPLOADED (voxel.March.ZCut) -----
+	//
+	// SAME RAN-FLAG DISCIPLINE AS THE BLOCK ABOVE, and for the same reason: the
+	// cvar reads back what was typed, the bind reports what was sent. -1 for
+	// the enable means VoxelMarchBindPool has NEVER RUN since this process
+	// started, which the stats line prints as a word rather than as an off.
+	//
+	// UsableMask is the half that catches the interesting failure. Enable 1
+	// with UsableMask 0 is "the arm is on and every level refused a bound" --
+	// an index that has never seeded, or a run with nothing resident -- and it
+	// is a completely different finding from "the arm is on and cut nothing",
+	// which reads Enable 1, UsableMask non-zero, zcutSkipped 0.
+	//
+	// Written render thread, read game thread, relaxed: a report, not a
+	// handshake.
+	std::atomic<int32> GVoxelMarchZCutRanEnable{-1};
+	std::atomic<int32> GVoxelMarchZCutRanUsableMask{0};
+	std::atomic<int32> GVoxelMarchZCutRanPad{0};
+	std::atomic<int32> GVoxelMarchZCutRanZMin[8] = {};
+	std::atomic<int32> GVoxelMarchZCutRanZMax[8] = {};
+
+	// ---- THE HALF-RES LATTICE'S PER-FRAME OFFSET ---------------------------
+	//
+	// ONE TABLE, ONE RESOLVE, READ BY FOUR PASSES. The march, the depth
+	// pre-emit, the GBuffer emit and the verify gate must all place the sample
+	// at the SAME point, because the reconstruction intersects this pixel's ray
+	// with a plane derived from the CANDIDATE's ray -- and if the two halves
+	// disagree about where the candidate stood, the plane is not the plane the
+	// march crossed. The failure is a sub-voxel depth error spread over the
+	// whole image, which is the hardest defect to attribute in this renderer.
+	// So the offset is a pure function of (scheme, phase) and nobody computes a
+	// second version of it.
+	//
+	// IN FULL-RES PIXELS, applied INSIDE the 2x2 block, so the sample stays in
+	// its own block at every phase and 'the containing sample' keeps meaning
+	// what VoxelMarchReconstruct's Base index says it means.
+
+	// Cycle length per scheme. Both are POWERS OF TWO, which is the whole of the
+	// answer to "why not align to the engine's TAA phase": against
+	// r.TemporalAASamples (8 by default) the least common multiple is 8, so the
+	// combined pattern repeats in eight frames instead of beating slowly, and a
+	// slow beat is a worse artefact than the static graininess this replaces.
+	constexpr int32 kVoxelMarchJitterCycle[3] = { 1, 4, 8 };
+
+	int32 VoxelMarchJitterCycleLength(int32 Scheme)
+	{
+		return kVoxelMarchJitterCycle[FMath::Clamp(Scheme, 0, 2)];
+	}
+
+	// SCHEME 1 -- the four full-res pixel CENTRES, in an order whose consecutive
+	// frames are diagonally opposite and then adjacent, so no two-frame swing
+	// dominates and there is no left-right shuffle to read as a wobble.
+	//
+	// Its property, and the reason it is the one to try first: over one cycle
+	// EVERY full-res pixel is marched exactly once AT ITS OWN CENTRE, so TSR has
+	// seen the ground truth for every pixel within four frames. That is plain
+	// checkerboard rendering, with this arm's exact-depth reconstruction filling
+	// the other three frames instead of a filter.
+	//
+	// VoxelMarch.usf's VoxelMarchSampleSvPosition refuses a STATIC corner sample
+	// on the ground that it biases the fallback population toward one corner of
+	// every block, which is a direction-dependent artefact. The rotation removes
+	// the premise rather than overruling it: the bias exists in any one frame
+	// and has no direction at all over the cycle.
+	constexpr int32 kVoxelMarchJitterHaltonCount = 8;
+
+	FVector2f VoxelMarchJitterOffset(int32 Scheme, int32 Phase)
+	{
+		static const FVector2f Quad[4] = {
+			FVector2f(-0.5f, -0.5f), FVector2f(+0.5f, +0.5f),
+			FVector2f(+0.5f, -0.5f), FVector2f(-0.5f, +0.5f),
+		};
+		// SCHEME 2 -- Halton(2,3), the first eight terms, mapped from [0,1) onto
+		// the same +/-0.5 box. Eight distinct positions instead of four and none
+		// of them a pixel centre, so no pixel is ever exact by construction --
+		// which is the trade against scheme 1 and is why scheme 1 is the
+		// default when on. It exists because if scheme 1 shows visible
+		// FOUR-FRAME structure (a rotating artefact rather than a static one)
+		// this is the thing to try, and the box is shared between sessions, so
+		// a second build costs a day.
+		static const FVector2f Halton[kVoxelMarchJitterHaltonCount] = {
+			FVector2f(0.5000f - 0.5f, 0.3333f - 0.5f),
+			FVector2f(0.2500f - 0.5f, 0.6667f - 0.5f),
+			FVector2f(0.7500f - 0.5f, 0.1111f - 0.5f),
+			FVector2f(0.1250f - 0.5f, 0.4444f - 0.5f),
+			FVector2f(0.6250f - 0.5f, 0.7778f - 0.5f),
+			FVector2f(0.3750f - 0.5f, 0.2222f - 0.5f),
+			FVector2f(0.8750f - 0.5f, 0.5556f - 0.5f),
+			FVector2f(0.0625f - 0.5f, 0.8889f - 0.5f),
+		};
+		if (Scheme == 1) { return Quad[Phase & 3]; }
+		if (Scheme == 2) { return Halton[Phase & 7]; }
+		return FVector2f::ZeroVector;
+	}
+
+	struct FVoxelMarchJitter
+	{
+		int32     Scheme = 0;
+		int32     Phase = 0;
+		int32     Cycle = 1;
+		FVector2f Offset = FVector2f::ZeroVector;
+	};
+
+	// THE ONE RESOLVE. bHalfRes gates it because a jittered FULL-res march is
+	// not a softer picture, it is a wrong one: at full res the emit does a
+	// direct Load at the pixel's own texel and rebuilds its ray from its own
+	// unjittered SV_Position, so a moved march ray would hand it a t measured
+	// along a different ray for every pixel on screen. VoxelMarch.usf guards the
+	// same thing with an #if; neither half can arm this alone.
+	FVoxelMarchJitter VoxelMarchResolveJitter(bool bHalfRes, uint32 FrameNumber)
+	{
+		FVoxelMarchJitter J;
+		if (!bHalfRes)
+		{
+			return J;
+		}
+		J.Scheme = FMath::Clamp(CVarVoxelMarchHalfResJitter.GetValueOnRenderThread(), 0, 2);
+		if (J.Scheme == 0)
+		{
+			return J;
+		}
+		J.Cycle = VoxelMarchJitterCycleLength(J.Scheme);
+		// PINNED IS A MEASUREMENT MODE AND A PINNED LATTICE IS A STATIC ONE --
+		// see the cvar's own help. It is here so the verify gate is repeatable
+		// and so a phase-0 against phase-1 still capture demonstrates in image
+		// space that the lattice really moves.
+		const int32 Pinned = CVarVoxelMarchHalfResJitterPhase.GetValueOnRenderThread();
+		J.Phase = (Pinned >= 0) ? (Pinned % J.Cycle)
+		                        : int32(FrameNumber % uint32(J.Cycle));
+		J.Offset = VoxelMarchJitterOffset(J.Scheme, J.Phase);
+		return J;
+	}
+
+	// ---- WHAT THE MARCH LAST ACTUALLY JITTERED BY --------------------------
+	//
+	// Same discipline as the Ran* block above and for the same recorded reason:
+	// a cvar reads back what was TYPED. These are stamped by the march hook from
+	// the value it handed the dispatch, and -1 means the march has not run since
+	// this process started, which is a different statement from 0.
+	//
+	// StampFrame is the JOIN, and it is CHECKED rather than derived. The emit
+	// and the gate run later in the same frame and re-derive the phase from
+	// their own frame number; if the derived answer disagrees with the stamp,
+	// something moved the lattice between the march and the emit and the
+	// reconstruction is about to intersect a plane the march never crossed.
+	// Five bugs in this project in three days shared exactly that shape -- a
+	// join COMPUTED instead of CHECKED.
+	//
+	// PhaseMask is the proof of traffic: one bit per phase dispatched since the
+	// scheme last changed. Its popcount is 'phasesSeen', and phasesSeen=1 on a
+	// settled leg is the reading that says this arm is armed and inert.
+	std::atomic<uint32> GVoxelMarchJitterStampFrame{0u};
+	std::atomic<int32>  GVoxelMarchRanJitterScheme{-1};
+	std::atomic<int32>  GVoxelMarchRanJitterPhase{-1};
+	std::atomic<int32>  GVoxelMarchRanJitterCycle{0};
+	std::atomic<uint32> GVoxelMarchRanJitterPhaseMask{0u};
+	std::atomic<uint64> GVoxelMarchRanJitterFrames{0};
+
+	// THE EMIT AND GATE SIDE OF THE JOIN. Returns the offset the MARCH actually
+	// used, and CHECKS it against the phase this hook would have derived on its
+	// own.
+	//
+	// THE STAMP IS THE AUTHORITY AND THE DERIVATION IS THE CHECK, in that order
+	// and not the other way round. The reconstruction intersects this pixel's
+	// ray with a plane taken from a CANDIDATE's ray, so it must stand where the
+	// march stood; only the march knows that. The two can differ solely because
+	// voxel.March.HalfRes.Jitter moved between the two hooks of one frame, which
+	// is one frame of settling and no longer -- and it is reported rather than
+	// absorbed, because a join computed instead of checked is the shape five
+	// bugs in this project shared in three days.
+	FVector2f VoxelMarchJitterForEmit(bool bHalfResEmit, uint32 FrameNumber)
+	{
+		if (!bHalfResEmit)
+		{
+			// FULL RES IS ALWAYS ZERO. The emit loads the pixel's own texel here
+			// and rebuilds its ray from its own unjittered SV_Position; an
+			// offset would make those two describe different rays.
+			return FVector2f::ZeroVector;
+		}
+		const uint32 StampFrame = GVoxelMarchJitterStampFrame.load(std::memory_order_relaxed);
+		const int32 Scheme = GVoxelMarchRanJitterScheme.load(std::memory_order_relaxed);
+		const int32 Phase = GVoxelMarchRanJitterPhase.load(std::memory_order_relaxed);
+		if (StampFrame != FrameNumber || Scheme < 0)
+		{
+			static bool bStampComplained = false;
+			if (!bStampComplained)
+			{
+				bStampComplained = true;
+				UE_LOG(LogVoxelMarch, Error,
+				       TEXT("Voxel march emit: the half-res lattice stamp is from frame %u and "
+				            "this hook is on frame %u (scheme %d). The emit cannot know where the "
+				            "march stood, so it is falling back to the STATIC lattice -- which "
+				            "means the reconstruction is about to intersect planes the march did "
+				            "not cross, and the symptom is terrain at a sub-voxel wrong depth "
+				            "with no other error. This should be unreachable: the emit already "
+				            "requires the view to have marched this frame."),
+				       StampFrame, FrameNumber, Scheme);
+			}
+			return FVector2f::ZeroVector;
+		}
+		const FVoxelMarchJitter Derived = VoxelMarchResolveJitter(true, FrameNumber);
+		if (Derived.Scheme != Scheme || Derived.Phase != Phase)
+		{
+			static bool bDriftWarned = false;
+			if (!bDriftWarned)
+			{
+				bDriftWarned = true;
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("Voxel march emit: the march ran lattice scheme %d phase %d and this "
+				            "hook derives scheme %d phase %d for the same frame. ONE frame of "
+				            "this is a live voxel.March.HalfRes.Jitter change settling. Longer "
+				            "means the two hooks are reading different switches, and every image "
+				            "taken since has a reconstruction built on the wrong sample point. "
+				            "The emit is using the MARCH's values, which are the correct ones."),
+				       Scheme, Phase, Derived.Scheme, Derived.Phase);
+			}
+		}
+		return VoxelMarchJitterOffset(Scheme, Phase);
+	}
 }
 
 FVoxelMarchArm VoxelMarchGetArm()
@@ -575,6 +1222,22 @@ FVoxelMarchArm VoxelMarchGetArm()
 	Arm.HoleStatsLevel =
 		Arm.bRings ? FMath::Clamp(CVarVoxelMarchHoleStats.GetValueOnAnyThread(), 0, 2) : 0;
 	Arm.bHoleStats = Arm.HoleStatsLevel != 0;
+	// The coarse occupancy level. RINGS ONLY, for the reason the fallthrough
+	// depth is: it is the RING walk's chunk loop that consults it, the
+	// permutation for block skip without rings is refused at compile, and an arm
+	// that asks for a permutation that does not exist gets whatever
+	// TShaderMapRef falls back to -- which is a silently different kernel.
+	Arm.bBlockSkip = Arm.bRings && (CVarVoxelMarchBlockSkip.GetValueOnAnyThread() != 0);
+	// FORCED OFF WITHOUT A LADDER TO GATE, matching the refused permutation, so
+	// the reported arm can never claim a gate the kernel has no code for.
+	Arm.bSkyLadder = Arm.bRings && Arm.Fallthrough > 0 &&
+	                 (CVarVoxelMarchSkyLadder.GetValueOnAnyThread() != 0);
+	// CLAMPED AND FORCED TO 0 WITHOUT THE PERMUTATION, so the reported mode can
+	// never claim an arm the kernel does not contain -- the same rule
+	// bBlockSkipArmed follows, one layer up.
+	Arm.BlockSkyMode = Arm.bBlockSkip
+	                       ? FMath::Clamp(CVarVoxelMarchBlockSkySkip.GetValueOnAnyThread(), 0, 2)
+	                       : 0;
 	Arm.ReachM = FMath::Max(CVarVoxelMarchReachM.GetValueOnAnyThread(), 0.0f);
 	Arm.bAO = CVarVoxelMarchAO.GetValueOnAnyThread() != 0;
 	Arm.bVelocity = CVarVoxelMarchVelocity.GetValueOnAnyThread() != 0;
@@ -795,6 +1458,400 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 				            "the switch is armed and not engaging, and every timing taken since "
 				            "describes the other arm."),
 				       Asked, RanShift);
+			}
+		}
+		// ---- THE RESIDENT-Z BOUND: ASKED, RAN, AND WHAT IT ACTUALLY CUT ---
+		//
+		// THREE QUESTIONS, PRINTED SEPARATELY, BECAUSE THEY FAIL SEPARATELY.
+		//
+		//   1. asked   the cvar. Reads back whatever was typed, on a frame the
+		//              pass declined as readily as on one it ran.
+		//   2. ran     what VoxelMarchBindPool last UPLOADED, plus which slots
+		//              were given a usable bound. "never-ran" is a WORD.
+		//              ran=1 usable=0x00 is "on, and every level refused a
+		//              bound" -- an index that never seeded, or a world with
+		//              nothing resident -- and it is a different finding from
+		//              "on and cut nothing".
+		//   3. cut     what the GPU did with it. Needs voxel.March.HoleStats,
+		//              and says NOT MEASURED, never zero, when that is off.
+		//
+		// THE ONE READING THAT CONDEMNS THE ARM: asked=1 ran=1 usable non-zero
+		// and consulted=0. That is armed-and-inert -- the house failure -- and
+		// no frame time taken on such a leg describes this change.
+		{
+			const int32 Asked = (CVarVoxelMarchZCut.GetValueOnAnyThread() != 0) ? 1 : 0;
+			const int32 AskedPad =
+				FMath::Max(CVarVoxelMarchZCutPadChunks.GetValueOnAnyThread(), 1);
+			const int32 RanEnable = GVoxelMarchZCutRanEnable.load(std::memory_order_relaxed);
+			const int32 UsableMask =
+				GVoxelMarchZCutRanUsableMask.load(std::memory_order_relaxed);
+			const int32 RanPad = GVoxelMarchZCutRanPad.load(std::memory_order_relaxed);
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("  zcut: asked=%d pad=%d | ran=%s usableSlots=0x%02x ranPad=%d"),
+			       Asked, AskedPad,
+			       RanEnable < 0 ? TEXT("never-ran") : (RanEnable != 0 ? TEXT("1") : TEXT("0")),
+			       uint32(UsableMask), RanPad);
+			if (RanEnable > 0)
+			{
+				// THE BOUND ITSELF, PER SLOT, IN CHUNKS AT THAT SLOT'S OWN
+				// LATTICE. Printed because "the arm skipped nothing" and "the
+				// arm was handed a bound 1,300 chunks tall" are different
+				// diagnoses with different owners, and only this line
+				// separates them. A slot with no usable bound prints the word
+				// rather than the pair it did not receive.
+				FString Bounds;
+				for (uint32 L = 0; L < FVoxelMarchChunkIndex::kRingGrids; ++L)
+				{
+					if ((UsableMask & (1 << int32(L))) != 0)
+					{
+						const int32 Lo =
+							GVoxelMarchZCutRanZMin[int32(L)].load(std::memory_order_relaxed);
+						const int32 Hi =
+							GVoxelMarchZCutRanZMax[int32(L)].load(std::memory_order_relaxed);
+						Bounds += FString::Printf(TEXT(" L%u[%d..%d,%d]"), L, Lo, Hi,
+						                          Hi - Lo + 1);
+					}
+					else
+					{
+						Bounds += FString::Printf(TEXT(" L%u[no-bound]"), L);
+					}
+				}
+				UE_LOG(LogVoxelMarch, Display, TEXT("    padded chunk-Z bound:%s"), *Bounds);
+			}
+			const FVoxelMarchHoleStats HW = VoxelMarchPeekLastHoleWindow();
+			if (!HW.bArmed || HW.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: NOT MEASURED (%s). The uniform above proves the "
+				            "DATA reached the shader; only these counters prove the shader "
+				            "USED it."),
+				       !HW.bArmed ? TEXT("voxel.March.HoleStats is 0")
+				                  : TEXT("armed, no readback has landed yet"));
+			}
+			else
+			{
+				// consulted - skipped - clipped IS the untouched count, so the
+				// three partition every decision and there is no residue to
+				// wonder about. Printed as the partition rather than as two
+				// rates for exactly that reason.
+				const uint64 ZUntouched =
+					HW.ZCutConsulted >= (HW.ZCutSkipped + HW.ZCutClipped)
+						? HW.ZCutConsulted - HW.ZCutSkipped - HW.ZCutClipped
+						: 0;
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: consulted=%llu = skipped %llu (%.2f%%) + "
+				            "clipped %llu (%.2f%%) + untouched %llu, over %llu frames"),
+				       (unsigned long long)HW.ZCutConsulted,
+				       (unsigned long long)HW.ZCutSkipped,
+				       HW.ZCutConsulted > 0
+				           ? 100.0 * double(HW.ZCutSkipped) / double(HW.ZCutConsulted)
+				           : 0.0,
+				       (unsigned long long)HW.ZCutClipped,
+				       HW.ZCutConsulted > 0
+				           ? 100.0 * double(HW.ZCutClipped) / double(HW.ZCutConsulted)
+				           : 0.0,
+				       (unsigned long long)ZUntouched,
+				       (unsigned long long)HW.Frames);
+				// SAID ON THE LINE ITSELF, not only in a header nobody reading a
+				// log will open. A skipped share counts DECISIONS; the work it
+				// removed was scattered loads whose cost depends on cache state
+				// and occupancy, not on how many of them there were. Three
+				// published measurements have iterations and wall time moving
+				// in OPPOSITE directions, so a reader converting this
+				// percentage into an expected millisecond saving is doing
+				// something already known to be wrong.
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("      (engagement only -- these are DECISIONS, not nanoseconds. "
+				            "The saving is VoxelMarch.March from ProfileGPU and nothing else.)"));
+				if (HW.bZCutArmed && HW.ZCutConsulted == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.ZCut is 1 and the shader consulted the bound "
+					            "ZERO times over %llu measured frames. THE ARM IS ARMED AND "
+					            "INERT -- every level refused a bound, the uniform never "
+					            "reached this permutation, or the walk never asked. No frame "
+					            "time measured on this leg describes the Z bound. FIRST THING "
+					            "TO CHECK: this half of the change (the cvar, the uniform and "
+					            "these counters) can land WITHOUT the traversal half in "
+					            "VoxelBrickTraverse.ush, and in that state the arm is inert BY "
+					            "CONSTRUCTION and this warning is correct rather than a bug -- "
+					            "grep MarchZCutEnable in the .ush before looking anywhere "
+					            "else."),
+					       (unsigned long long)HW.Frames);
+				}
+				else if (HW.bZCutArmed && HW.ZCutSkipped == 0 && HW.ZCutClipped == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.ZCut is 1, the bound WAS consulted %llu times "
+					            "and removed nothing at all. That is a real measured null: "
+					            "the slabs are wider than the segments. Check the per-slot "
+					            "spans printed above before blaming the traversal."),
+					       (unsigned long long)HW.ZCutConsulted);
+				}
+			}
+		}
+		// ---- THE COARSE OCCUPANCY LEVEL: ARMED, AND WHAT IT SKIPPED -------
+		//
+		// TWO QUESTIONS, PRINTED SEPARATELY, BECAUSE THEY FAIL SEPARATELY AND
+		// THERE IS NO "uploaded" MIDDLE TERM HERE. The Z bound is a uniform, so
+		// it has three states (asked / uploaded / used). This is a PERMUTATION:
+		// the code is either compiled into the kernel or it is not, so the only
+		// questions are "was the arm selected" and "did the shader use it".
+		//
+		//   1. armed   the arm actually selected for the dispatch, NOT the raw
+		//              cvar -- rings off forces it down and the permutation for
+		//              that pairing does not exist.
+		//   2. used    what the GPU did with it. Needs voxel.March.HoleStats.
+		//              consulted == 0 while armed is ARMED AND INERT, which is
+		//              this project's house failure and is printed as a warning
+		//              rather than left to be inferred from a silence.
+		//
+		//   plus fallback, which is neither: frames that marched against an
+		//   ALL-ONES coarse level because no block buffer existed yet. Those
+		//   frames behave exactly like the control, so a leg with a climbing
+		//   fallback count has not measured the arm at all.
+		{
+			const FVoxelMarchHoleStats BW = VoxelMarchPeekLastHoleWindow();
+			const FVoxelMarchChunkIndex& BlkIdx = GetGlobalVoxelMarchChunkIndex();
+			const uint64 Fallback = BlkIdx.GetBlockFallbackBinds();
+			const uint64 BindCalls = BlkIdx.GetBlockBindCalls();
+			// PRINTED AS A RATIO AGAINST BINDS, AND THAT IS A CORRECTION.
+			// This line used to print the bare cumulative fallback count beside
+			// the per-window frame count on the line below it, and the two were
+			// read as a rate: "210 over 349 frames" was taken to mean 60% of
+			// frames, when VoxelMarchBindPool runs up to FOUR times a frame and
+			// 210 was ~15% of about 1,400 binds. The denominator now travels
+			// with the numerator so the ratio cannot be assembled out of two
+			// numbers that do not share one.
+			//
+			// BOTH ARE CUMULATIVE SINCE BOOT and the word says so, because the
+			// engagement line beneath is per-window and the mixture is exactly
+			// what misled once already.
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("  blockSkip: armed=%d fallbackBinds=%llu of %llu binds (%.2f%%, "
+			            "cumulative since boot)"),
+			       BW.bBlockSkipArmed ? 1 : 0, (unsigned long long)Fallback,
+			       (unsigned long long)BindCalls,
+			       BindCalls > 0 ? 100.0 * double(Fallback) / double(BindCalls) : 0.0);
+			// WHAT A CLEAN LEG LOOKS LIKE, said here so the next reader does not
+			// have to decide what "small" means: a SMALL CONSTANT from genuine
+			// startup -- the binds between the index's first upload and that
+			// graph's extraction landing -- and then FLAT. A count that keeps
+			// climbing during a static leg is the lifetime defect of
+			// 2026-08-25, and FVoxelMarchChunkIndex logs it by name past its
+			// grace count.
+			if (BW.bBlockSkipArmed && Fallback > 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("      (fallback binds marched against an ALL-ONES coarse level, "
+				            "i.e. against the CONTROL -- they descend into every block and "
+				            "cannot skip. Expect a small constant from startup, then FLAT. "
+				            "Still climbing = the timing on this leg is contaminated.)"));
+			}
+			if (!BW.bArmed || BW.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: NOT MEASURED (%s). Only these counters prove the "
+				            "shader consulted the coarse level; the permutation being selected "
+				            "does not."),
+				       !BW.bArmed ? TEXT("voxel.March.HoleStats is 0")
+				                  : TEXT("armed, no readback has landed yet"));
+			}
+			else
+			{
+				// consulted - skipped IS the count of blocks that were read,
+				// found empty or occupied, and stepped through anyway -- so the
+				// two partition every decision with no residue.
+				const uint64 BlkNotSkipped = BW.BlockConsulted >= BW.BlockSkipped
+				                                 ? BW.BlockConsulted - BW.BlockSkipped
+				                                 : 0;
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: blkConsulted=%llu = blkSkipped %llu (%.2f%%) + "
+				            "stepped %llu; blkCellsAvoided=%llu, over %llu frames"),
+				       (unsigned long long)BW.BlockConsulted,
+				       (unsigned long long)BW.BlockSkipped,
+				       BW.BlockConsulted > 0
+				           ? 100.0 * double(BW.BlockSkipped) / double(BW.BlockConsulted)
+				           : 0.0,
+				       (unsigned long long)BlkNotSkipped,
+				       (unsigned long long)BW.BlockCellsAvoided,
+				       (unsigned long long)BW.Frames);
+				// SAID ON THE LINE ITSELF, not only in a header nobody reading a
+				// log will open -- the same sentence the Z bound's line carries,
+				// and for the same three published measurements.
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("      (engagement only -- these are DECISIONS, not nanoseconds. "
+				            "blkCellsAvoided is the JUMPED RAY LENGTH expressed in chunk "
+				            "cells, so it is a LOWER bound on cells avoided -- a diagonal DDA "
+				            "visits up to sqrt(3) times the axis count over the same span. It "
+				            "is deliberately NOT 64 per skipped block, which would carry no "
+				            "information beyond blkSkipped and would wrap a uint32. The saving "
+				            "is VoxelMarch.March from ProfileGPU and nothing else.)"));
+				// ---- THE SKY LICENCE, AND THE NUMBER IT IS JUDGED ON ------
+				//
+				// PRINTED WHENEVER THE BLOCK LEVEL IS ARMED, mode 0 included,
+				// because "the licence is off" and "the licence is on and found
+				// nothing" are different findings and a suppressed line makes
+				// them identical. Mode 0 must read licensed=0: it issues no sky
+				// load at all, so a non-zero there would indict the instrument.
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    sky licence: mode=%d, blkSkyLicensed=%llu of %llu consulted "
+				            "(%.2f%%), run mean %.2f blocks (%llu blocks / %llu runs)"),
+				       BW.BlockSkyMode,
+				       (unsigned long long)BW.BlockSkyLicensed,
+				       (unsigned long long)BW.BlockConsulted,
+				       BW.BlockConsulted > 0
+				           ? 100.0 * double(BW.BlockSkyLicensed) / double(BW.BlockConsulted)
+				           : 0.0,
+				       BW.BlockSkyRuns > 0
+				           ? double(BW.BlockSkyRunBlocks) / double(BW.BlockSkyRuns)
+				           : 0.0,
+				       (unsigned long long)BW.BlockSkyRunBlocks,
+				       (unsigned long long)BW.BlockSkyRuns);
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("      (THE RUN MEAN IS THE DECIDING NUMBER, and it is a count of "
+				            "DECISIONS. One licensed block is a 4-chunk advance off one load, "
+				            "so break-even is a run of 1.0 and everything above it is margin. "
+				            "A mean near 1.0 against a HIGH licensed rate says open sky is "
+				            "SCATTERED at 4^3 granularity -- that indicts the BLOCK SIZE, not "
+				            "the mark, and the next move would be a coarser block rather than "
+				            "a different predicate. The saving is still VoxelMarch.March from "
+				            "ProfileGPU and nothing else.)"));
+				if (BW.BlockSkyMode != 0 && BW.BlockSkyLicensed == 0 && BW.BlockConsulted > 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.BlockSkySkip is %d and the marcher found ZERO "
+					            "sky-licensed blocks over %llu consults. THE LICENCE IS ARMED "
+					            "AND INERT, and no frame time on this leg describes it. The "
+					            "cause is almost certainly upstream, not here: this arm reads "
+					            "a bit the STREAMING side writes. Check, in order -- (1) is "
+					            "voxel.Stream.SkyMark 1 (it defaults to 0); (2) the 'skyMark "
+					            "CELLS' line on the LogVoxelPerf 5 s log, where written=0 of "
+					            "offered>0 names the cause and a DISCONNECTED SINK warning "
+					            "names it exactly; (3) the 'skyMark COLUMNS' line, where "
+					            "marked=0 of considered>0 means no column passed the coverage "
+					            "proof. A block needs ALL 64 of its cells marked, so a partial "
+					            "band licenses nothing -- voxel.Stream.SkyMarkChunks below 4 "
+					            "cannot license a single block at any relief."),
+					       BW.BlockSkyMode, (unsigned long long)BW.BlockConsulted);
+				}
+				if (BW.bBlockSkipArmed && BW.BlockConsulted == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.BlockSkip is armed and the shader consulted "
+					            "the coarse level ZERO times over %llu measured frames. THE "
+					            "ARM IS ARMED AND INERT -- no frame time measured on this leg "
+					            "describes the coarse level. FIRST THING TO CHECK: the C++ "
+					            "half of this change (the cvar, the permutation, the buffers "
+					            "and these counters) can land WITHOUT the traversal half in "
+					            "VoxelBrickTraverse.ush, and in that state the arm is inert BY "
+					            "CONSTRUCTION and this warning is correct rather than a bug -- "
+					            "grep VOXEL_MARCH_BLOCK_SKIP in the .ush before looking "
+					            "anywhere else. SECOND: fallbackBinds above."),
+					       (unsigned long long)BW.Frames);
+				}
+				else if (BW.bBlockSkipArmed && BW.BlockSkipped == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.BlockSkip is armed, the coarse level WAS "
+					            "consulted %llu times and skipped nothing at all. That is a "
+					            "real measured null, not a broken counter: either every block "
+					            "the rays crossed held a resident chunk, or the block exit "
+					            "never beat the ordinary one-chunk advance. Check "
+					            "fallbackBinds above before blaming the traversal."),
+					       (unsigned long long)BW.BlockConsulted);
+				}
+			}
+		}
+		// ---- THE MOVING LATTICE: ASKED, RAN, AND WHETHER IT IS MOVING ------
+		//
+		// THREE FIELDS, AND THE THIRD IS THE ONE THAT MATTERS. 'asked' and 'ran'
+		// are the same asked/ran discipline the halfRes line above uses, and
+		// they catch a switch that never reached a dispatch. They do NOT catch
+		// the failure this arm is actually exposed to, which is a lattice that
+		// is armed, dispatched, and never moves -- a pinned phase, a cycle
+		// length of one, a frame counter that does not advance on a paused
+		// leg. So 'phasesSeen' is a popcount of the phases the march has really
+		// dispatched since the scheme last changed, and it is the falsifier:
+		//
+		//     phasesSeen = cycle   the lattice is moving; the arm is engaged
+		//     phasesSeen = 1       the lattice is STATIC, whatever the cvar
+		//                          says, and every image taken since describes
+		//                          the arm this was built to replace
+		//
+		// This is the same reading the raster atlas's 'fill: mode=N' line exists
+		// to give, applied to a thing that changes over TIME rather than over
+		// configuration -- which is why a single-frame line could not have said
+		// it and a running mask can.
+		{
+			const int32 RanScheme = GVoxelMarchRanJitterScheme.load(std::memory_order_relaxed);
+			const int32 RanPhase = GVoxelMarchRanJitterPhase.load(std::memory_order_relaxed);
+			const int32 RanCycle = GVoxelMarchRanJitterCycle.load(std::memory_order_relaxed);
+			const uint32 Mask = GVoxelMarchRanJitterPhaseMask.load(std::memory_order_relaxed);
+			const uint64 JitterFrames = GVoxelMarchRanJitterFrames.load(std::memory_order_relaxed);
+			int32 PhasesSeen = 0;
+			for (uint32 M = Mask; M != 0u; M >>= 1)
+			{
+				PhasesSeen += int32(M & 1u);
+			}
+			const int32 AskedScheme =
+				FMath::Clamp(CVarVoxelMarchHalfResJitter.GetValueOnAnyThread(), 0, 2);
+			const int32 AskedPhase = CVarVoxelMarchHalfResJitterPhase.GetValueOnAnyThread();
+			// Recomputed from the SAME table the dispatch used, so this line
+			// cannot report an offset the shader never carried.
+			const FVector2f RanOffset =
+				(RanScheme > 0) ? VoxelMarchJitterOffset(RanScheme, RanPhase)
+				                : FVector2f::ZeroVector;
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("  halfResJitter: asked=%d ran=%s | phase=%s of %d | last offset="
+			            "(%+.4f, %+.4f) full-res px | phasesSeen=%d/%d mask=0x%02X | "
+			            "pin=%s | frames=%llu"),
+			       AskedScheme,
+			       RanScheme < 0 ? TEXT("never-ran")
+			                     : (RanScheme == 0 ? TEXT("0 (static block centre)")
+			                                       : (RanScheme == 1 ? TEXT("1 (4-frame quad)")
+			                                                         : TEXT("2 (8-frame Halton)"))),
+			       RanPhase < 0 ? TEXT("never-ran") : *FString::FromInt(RanPhase),
+			       RanCycle, RanOffset.X, RanOffset.Y, PhasesSeen, FMath::Max(RanCycle, 1), Mask,
+			       AskedPhase < 0 ? TEXT("free-running")
+			                      : *FString::Printf(TEXT("PINNED to %d"), AskedPhase),
+			       JitterFrames);
+			if (RanScheme > 0 && PhasesSeen <= 1 && JitterFrames > 4)
+			{
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("  voxel.March.HalfRes.Jitter is %d but the march has dispatched "
+				            "exactly ONE lattice position across %llu frames (mask 0x%02X). The "
+				            "sample lattice is STATIC, so TSR is being handed the same %d%% of "
+				            "pixels every frame and has nothing new to accumulate -- which is "
+				            "precisely the condition this arm exists to remove. Check "
+				            "voxel.March.HalfRes.JitterPhase (a pinned phase IS a static "
+				            "lattice) before reading any image from this leg as evidence about "
+				            "temporal reconstruction."),
+				       RanScheme, JitterFrames, Mask, 25);
+			}
+			// THE FULL-RES CASE IS NOT A DEFECT AND MUST NOT PRINT AS ONE.
+			// The resolve forces the scheme to 0 whenever the march ran full
+			// res, so asked != ran is EXPECTED there and is reported as a note.
+			// Only a half-res leg whose scheme did not take is a warning.
+			const int32 RanShiftForJitter = GVoxelMarchRanResShift.load(std::memory_order_relaxed);
+			if (RanShiftForJitter == 0 && AskedScheme != 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("  voxel.March.HalfRes.Jitter %d is IGNORED because the march ran "
+				            "FULL RES. There is no 2x2 block to move a sample inside, and a "
+				            "jittered full-res march would hand the emit a t measured along a "
+				            "different ray for every pixel on screen. Set voxel.March.HalfRes 1 "
+				            "first."),
+				       AskedScheme);
+			}
+			else if (RanScheme >= 0 && RanScheme != AskedScheme)
+			{
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("  voxel.March.HalfRes.Jitter asks for %d and the march last RAN %d. "
+				            "One frame of this is a live cvar change settling. Anything longer "
+				            "means the switch is armed and not engaging, and every image taken "
+				            "since describes the other lattice."),
+				       AskedScheme, RanScheme);
 			}
 		}
 		if (Arm.Source == 1 && S.IndexEntries == 0)
@@ -2658,6 +3715,22 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	const FVoxelMarchArm Arm = VoxelMarchGetArm();
 	Out.bArmed = Arm.bHoleStats;
 	Out.bBreakdownArmed = Arm.HoleStatsLevel >= 2;
+	// From the CVAR, like the two above, and NOT from whether any zcut word is
+	// non-zero: "the arm is off" and "the arm is on and cut nothing" are
+	// different findings and a consumer must be able to tell them apart without
+	// inspecting the numbers it is trying to interpret.
+	Out.bZCutArmed = CVarVoxelMarchZCut.GetValueOnAnyThread() != 0;
+	// FROM THE ARM, NOT FROM THE CVAR, and that is not a shortcut -- it is the
+	// difference between the two switches. voxel.March.ZCut is a uniform, so the
+	// cvar IS the arm. voxel.March.BlockSkip selects a PERMUTATION, and the arm
+	// forces it off without rings; reading the raw cvar here would report
+	// "armed" for a kernel that does not contain the code, and the inert-arm
+	// warning below would then fire on a leg where inertness is correct.
+	Out.bBlockSkipArmed = Arm.bBlockSkip;
+	// FROM THE ARM, for the reason bBlockSkipArmed is: VoxelMarchGetArm already
+	// forces the mode to 0 when the permutation is off, so this can never report
+	// a licence the kernel has no code for.
+	Out.BlockSkyMode = Arm.BlockSkyMode;
 	if (!GMarchState.IsValid())
 	{
 		return Out;
@@ -2665,9 +3738,15 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	FScopeLock Guard(&GMarchState->Lock);
 	const bool bArmed = Out.bArmed;
 	const bool bBreakdownArmed = Out.bBreakdownArmed;
+	const bool bZCutArmed = Out.bZCutArmed;
+	const bool bBlockSkipArmed = Out.bBlockSkipArmed;
+	const int32 BlockSkyMode = Out.BlockSkyMode;
 	Out = GMarchState->HoleWindow;
 	Out.bArmed = bArmed;
 	Out.bBreakdownArmed = bBreakdownArmed;
+	Out.bZCutArmed = bZCutArmed;
+	Out.bBlockSkipArmed = bBlockSkipArmed;
+	Out.BlockSkyMode = BlockSkyMode;
 	// Kept for the HUD's 1 Hz peek -- the panel must show what the log drained
 	// without becoming a second drainer (two drainers of one accumulator each
 	// see a random share).
@@ -2691,12 +3770,19 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	FScopeLock Guard(&GMarchState->Lock);
 	const bool bArmed = Out.bArmed;
 	const bool bBreakdownArmed = Out.bBreakdownArmed;
+	const bool bZCutArmed = CVarVoxelMarchZCut.GetValueOnAnyThread() != 0;
+	// See the drain: the arm, not the cvar, because this one is a permutation.
+	const bool bBlockSkipArmed = Arm.bBlockSkip;
+	const int32 BlockSkyMode = Arm.BlockSkyMode;
 	Out = GMarchState->LastDrainedHoleWindow;
 	// The arm flags track the switch NOW, not the switch as it stood when the
 	// stale window was drained -- the panel's off/armed wording follows the
 	// cvar the owner just typed.
 	Out.bArmed = bArmed;
 	Out.bBreakdownArmed = bBreakdownArmed;
+	Out.bZCutArmed = bZCutArmed;
+	Out.bBlockSkipArmed = bBlockSkipArmed;
+	Out.BlockSkyMode = BlockSkyMode;
 	return Out;
 }
 
@@ -2716,6 +3802,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchViewParameters, )
 	SHADER_PARAMETER(FVector2f, MarchViewRectMin)
 	SHADER_PARAMETER(FVector2f, MarchViewRectSize)
 	SHADER_PARAMETER(FVector2f, MarchInvProjDiag)
+	// THE HALF-RES LATTICE'S PER-FRAME OFFSET, in full-res pixels, inside the
+	// 2x2 block. It rides THIS struct rather than any one pass's own parameters
+	// precisely because the march, the depth pre-emit, the GBuffer emit and the
+	// verify gate must all place the sample at the same point -- the same reason
+	// MarchInvProjDiag is here. Zero at full res and under Jitter 0, and bound
+	// on every permutation: a shader global with no entry here is an UNBOUND
+	// uniform, which fails the global shader compile outright.
+	SHADER_PARAMETER(FVector2f, MarchSampleJitter)
 	SHADER_PARAMETER(FVector4f, MarchInvDeviceZToWorldZ)
 	SHADER_PARAMETER(float, MarchPixelConeSlope)
 	SHADER_PARAMETER(float, MarchClimateStrength)
@@ -2736,6 +3830,39 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	VOXEL_FLUID_OCCUPANCY_PARAMETERS()
 	VOXEL_BRICK_POOL_PARAMETERS()
 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchChunkIndex)
+	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip). One bit per 4x4x4
+	// block of chunk cells: Occupied means at least one cell in the block is
+	// resident, AnyAbsent means at least one is not. 32 KiB each against the
+	// 64 MiB they bound.
+	//
+	// BOUND ON EVERY PERMUTATION, INCLUDING VOXEL_MARCH_BLOCK_SKIP 0, for the
+	// reason the cover pair below is bound on every arm -- and here the stakes
+	// are higher than a silent zero. An unbound Buffer<uint> reads as ZEROS,
+	// zero in Occupied means "no chunk in this block is resident", and a
+	// marcher that believed that would skip the entire world in one jump: every
+	// ray a hole, no error anywhere. FVoxelMarchChunkIndex::RegisterWithBlocks
+	// therefore guarantees a non-null pair whenever it returns an index at all,
+	// falling back to an ALL-ONES grid (descend everywhere, i.e. the control)
+	// rather than to nothing.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockOccupied)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAnyAbsent)
+	// THE SKY LICENCE (voxel.March.BlockSkySkip). One bit per block: all 64
+	// cells carry a valid open-sky mark AND none is resident.
+	//
+	// BOUND ON EVERY PERMUTATION for the reason the pair above is, but its
+	// FAILURE DIRECTION IS THE OPPOSITE and that is worth saying at the binding
+	// rather than only at the writer. Unbound reads as zeros; zero here means
+	// "no block is provably sky", so the arm licenses nothing and the marcher
+	// descends exactly as the control does. INERT, not wrong -- which is why
+	// this one falls back to all ZEROS while the occupancy pair falls back to
+	// all ones.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAllSky)
+	// 0 residency-only / 1 both / 2 sky-only. A uniform rather than a
+	// permutation -- see FVoxelMarchArm::BlockSkyMode for that argument. Bound
+	// on every permutation because an unset uniform is a silent zero, and zero
+	// is also the correct "sky licence off" value: the safe default and the
+	// honest default are the same number here.
+	SHADER_PARAMETER(uint32, MarchBlockSkyMode)
 	SHADER_PARAMETER(FUintVector, MarchIndexDimChunks)
 	SHADER_PARAMETER(uint32, MarchIndexCellsPerLevel)
 	// PHASE 6. Bound on every permutation, including the ones compiled with
@@ -2750,6 +3877,21 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// here means every slot is empty, which would make every absent chunk read
 	// as a hole rather than none.
 	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
+	// THE RESIDENT-Z BOUND (voxel.March.ZCut). Bound on every permutation for
+	// the reason the two above are: an unbound uniform is a silent zero, and
+	// zero in MarchZCutEnable is the honest "do not cut" value, so the safe
+	// default and the correct default are again the same number.
+	//
+	// One int4 per INDEX GRID SLOT, not per ring level -- the cover slot has
+	// its own walk and is simply never given a usable bound.
+	//   .x  min chunk Z, already padded outward
+	//   .y  max chunk Z, already padded outward, INCLUSIVE
+	//   .z  1 = this slot's bound is usable; 0 = DO NOT CUT this slot
+	//   .w  unused, 0
+	// Padding is applied CPU-side so the shader has one number to trust and
+	// there is no second place for the pad to be forgotten.
+	SHADER_PARAMETER(int32, MarchZCutEnable)
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -2782,6 +3924,39 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchEmitParameters, )
 	VOXEL_FLUID_OCCUPANCY_PARAMETERS()
 	VOXEL_BRICK_POOL_PARAMETERS()
 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchChunkIndex)
+	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip). One bit per 4x4x4
+	// block of chunk cells: Occupied means at least one cell in the block is
+	// resident, AnyAbsent means at least one is not. 32 KiB each against the
+	// 64 MiB they bound.
+	//
+	// BOUND ON EVERY PERMUTATION, INCLUDING VOXEL_MARCH_BLOCK_SKIP 0, for the
+	// reason the cover pair below is bound on every arm -- and here the stakes
+	// are higher than a silent zero. An unbound Buffer<uint> reads as ZEROS,
+	// zero in Occupied means "no chunk in this block is resident", and a
+	// marcher that believed that would skip the entire world in one jump: every
+	// ray a hole, no error anywhere. FVoxelMarchChunkIndex::RegisterWithBlocks
+	// therefore guarantees a non-null pair whenever it returns an index at all,
+	// falling back to an ALL-ONES grid (descend everywhere, i.e. the control)
+	// rather than to nothing.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockOccupied)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAnyAbsent)
+	// THE SKY LICENCE (voxel.March.BlockSkySkip). One bit per block: all 64
+	// cells carry a valid open-sky mark AND none is resident.
+	//
+	// BOUND ON EVERY PERMUTATION for the reason the pair above is, but its
+	// FAILURE DIRECTION IS THE OPPOSITE and that is worth saying at the binding
+	// rather than only at the writer. Unbound reads as zeros; zero here means
+	// "no block is provably sky", so the arm licenses nothing and the marcher
+	// descends exactly as the control does. INERT, not wrong -- which is why
+	// this one falls back to all ZEROS while the occupancy pair falls back to
+	// all ones.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAllSky)
+	// 0 residency-only / 1 both / 2 sky-only. A uniform rather than a
+	// permutation -- see FVoxelMarchArm::BlockSkyMode for that argument. Bound
+	// on every permutation because an unset uniform is a silent zero, and zero
+	// is also the correct "sky licence off" value: the safe default and the
+	// honest default are the same number here.
+	SHADER_PARAMETER(uint32, MarchBlockSkyMode)
 	SHADER_PARAMETER(FUintVector, MarchIndexDimChunks)
 	SHADER_PARAMETER(uint32, MarchIndexCellsPerLevel)
 	// PHASE 6. Bound on every permutation, including the ones compiled with
@@ -2796,6 +3971,21 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchEmitParameters, )
 	// here means every slot is empty, which would make every absent chunk read
 	// as a hole rather than none.
 	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
+	// THE RESIDENT-Z BOUND (voxel.March.ZCut). Bound on every permutation for
+	// the reason the two above are: an unbound uniform is a silent zero, and
+	// zero in MarchZCutEnable is the honest "do not cut" value, so the safe
+	// default and the correct default are again the same number.
+	//
+	// One int4 per INDEX GRID SLOT, not per ring level -- the cover slot has
+	// its own walk and is simply never given a usable bound.
+	//   .x  min chunk Z, already padded outward
+	//   .y  max chunk Z, already padded outward, INCLUSIVE
+	//   .z  1 = this slot's bound is usable; 0 = DO NOT CUT this slot
+	//   .w  unused, 0
+	// Padding is applied CPU-side so the shader has one number to trust and
+	// there is no second place for the pad to be forgotten.
+	SHADER_PARAMETER(int32, MarchZCutEnable)
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -2868,6 +4058,19 @@ class FVoxelMarchHoleStatsDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_HOLE_STATS",
 // than from a second read of the cvar; see the emit hook.
 class FVoxelMarchHalfResDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_HALFRES");
 
+// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip). A PERMUTATION for the
+// reason recorded at the cvar and NOT the reason voxel.March.ZCut is a uniform:
+// this arm adds two buffer loads per 4^3 block, so a runtime branch would leave
+// that traffic in the off arm's binary and the control would pay for memory it
+// never reads. 0 is byte-identical to the pre-block kernel.
+class FVoxelMarchBlockSkipDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_BLOCK_SKIP");
+// The retry ladder's gate (voxel.March.SkyLadder). A PERMUTATION for the reason
+// block skip is one: it puts a field on the chunk cache and a fold at five walk
+// sites, and a control carrying the treatment's registers is not a control.
+// Only meaningful with rings AND fallthrough > 0; the other combinations are
+// refused in ShouldCompilePermutation rather than built and never selected.
+class FVoxelMarchSkyLadderDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_SKY_LADDER");
+
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
 // ===========================================================================
@@ -2901,8 +4104,9 @@ class FVoxelMarchHalfResDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_HALFRES");
 // have to say whether the comparator MUST MATCH it or DELIBERATELY VARIES it.
 // There is no third answer and no way to skip the question.
 //
-// Source, SkipLevels, Rings, Cover, CoverSkip, Fallthrough.
-constexpr int32 kVoxelMarchWalkShapeDims = 6;
+// Source, SkipLevels, Rings, Cover, CoverSkip, Fallthrough, BlockSkip,
+// SkyLadder.
+constexpr int32 kVoxelMarchWalkShapeDims = 8;
 
 // THE COVER REACH, IN ONE PLACE. Both the shader binding and the comparator
 // guard read this; two spellings of "is cover in the picture" is how a guard
@@ -2931,6 +4135,30 @@ struct FVoxelMarchWalkShape
 	// FVoxelMarchFallthroughDim in the comparator's own permutation domain,
 	// exactly as Rings is.
 	int32 Fallthrough = 0;
+	// The coarse occupancy level (VOXEL_MARCH_BLOCK_SKIP). A WALK-SHAPE
+	// DIMENSION AND NOT AN OBSERVATION ONE, and the distinction was checked
+	// rather than assumed: hole stats is exempt because nothing under it can
+	// change a ray's bHit or THitUU, and this CAN. A skipped block sets
+	// bCrossedAbsentChunk at BLOCK granularity rather than at the granularity of
+	// the chunks the ray actually crossed, which changes which rays the
+	// fallthrough ladder retries, and a retried ray can HIT where it previously
+	// holed. The direction is safe -- more retries, never fewer -- but "safe"
+	// is not "identical", and a comparator grading a different picture is the
+	// failure this struct exists to make impossible.
+	int32 BlockSkip = 0;
+	// The retry ladder's gate (VOXEL_MARCH_SKY_LADDER). A WALK-SHAPE DIMENSION,
+	// and the classification is not a formality: this switch decides WHICH RAYS
+	// RETRY at a coarser level, and a retried ray can HIT where it previously
+	// holed. So it changes bHit and THitUU, which is exactly the test that
+	// separates a walk-shape dimension from an observation one -- hole stats is
+	// exempt because nothing under it can change a hit, and this can.
+	//
+	// MUST MATCH, not DELIBERATELY VARIED: a comparator run at a different gate
+	// grades a different picture, which is the failure the walk-shape struct
+	// exists to make impossible. And the comparator's own permutation domain
+	// does NOT carry this dimension, so with the arm on the two must be reported
+	// as incomparable rather than compared -- see the check below.
+	int32 SkyLadder = 0;
 };
 static_assert(sizeof(FVoxelMarchWalkShape) == kVoxelMarchWalkShapeDims * sizeof(int32),
               "a walk-shape dimension was added or removed without updating "
@@ -2948,7 +4176,8 @@ class FVoxelMarchCS : public FGlobalShader
 	using FPermutationDomain =
 		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchSkipDim, FVoxelMarchRingsDim,
 		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim,
-		                         FVoxelMarchHalfResDim>;
+		                         FVoxelMarchHalfResDim, FVoxelMarchBlockSkipDim,
+		                         FVoxelMarchSkyLadderDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -2978,12 +4207,30 @@ class FVoxelMarchCS : public FGlobalShader
 		{
 			return false;
 		}
+		// The sky ladder GATES the fallthrough ladder, so without a ladder there
+		// is nothing for it to gate: the define would compile a second flag,
+		// fold it at five sites, and have no reader. Refused rather than built,
+		// for the reason the clause above is -- and it also HALVES the
+		// permutation count this dimension would otherwise add, since every
+		// fallthrough-0 and rings-off combination is now excluded.
+		if (P.Get<FVoxelMarchSkyLadderDim>() &&
+		    (P.Get<FVoxelMarchFallthroughDim>() == 0 || !P.Get<FVoxelMarchRingsDim>()))
+		{
+			return false;
+		}
 		// The hole counters are ring-walk properties (substituted compares the
 		// walked level against the owning segment; uncovered needs per-level
 		// residency), so hole stats without rings would build, bind and mean
 		// nothing -- refused for the reason the pair above is. Rings already
 		// imply source 1, so that pairing needs no third clause.
 		if (P.Get<FVoxelMarchHoleStatsDim>() && !P.Get<FVoxelMarchRingsDim>())
+		{
+			return false;
+		}
+		// The coarse occupancy level is consulted by the RING walk's chunk loop
+		// and by nothing else, so block skip without rings would build, bind and
+		// mean nothing -- refused for the reason the three clauses above are.
+		if (P.Get<FVoxelMarchBlockSkipDim>() && !P.Get<FVoxelMarchRingsDim>())
 		{
 			return false;
 		}
@@ -3031,6 +4278,48 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchHoleWord::UncLevelFirst));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNC_REASON0"),
 		                         int32(VoxelMarchHoleWord::UncReasonFirst));
+		// The resident-Z bound's engagement trio (voxel.March.ZCut), pushed
+		// from the same enum for the same reason every other word is: a hand
+		// mirror here reads a plausible number out of the wrong slot, which is
+		// the incident VoxelMarchHoleWord's own note records.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZCUT_CONSULTED"),
+		                         int32(VoxelMarchHoleWord::ZCutConsulted));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZCUT_SKIPPED"),
+		                         int32(VoxelMarchHoleWord::ZCutSkipped));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZCUT_CLIPPED"),
+		                         int32(VoxelMarchHoleWord::ZCutClipped));
+		// The coarse occupancy level's engagement trio (voxel.March.BlockSkip),
+		// pushed from the same enum for the same reason every other word is.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BLK_CONSULTED"),
+		                         int32(VoxelMarchHoleWord::BlockConsulted));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BLK_SKIPPED"),
+		                         int32(VoxelMarchHoleWord::BlockSkipped));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BLK_SKY_LICENSED"),
+		                         int32(VoxelMarchHoleWord::BlockSkyLicensed));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BLK_SKY_RUNBLOCKS"),
+		                         int32(VoxelMarchHoleWord::BlockSkyRunBlocks));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BLK_SKY_RUNS"),
+		                         int32(VoxelMarchHoleWord::BlockSkyRuns));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BLK_CELLS"),
+		                         int32(VoxelMarchHoleWord::BlockCellsAvoided));
+		// The block grid's own shape, pushed rather than written in the .ush,
+		// under exactly the discipline the word layout above follows: the CPU
+		// sizes and fills these bitfields and the shader indexes them, and a
+		// hand-mirrored 32,768 in the shader against a widened index grid on the
+		// CPU reads another slot's bits -- ground claimed empty that is not,
+		// which is a hole with every counter healthy.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_BLOCKS_PER_SLOT"),
+		                         int32(FVoxelMarchChunkIndex::kBlocksPerSlot));
+		// THE BLOCK SIZE ITSELF, PUSHED SO THE SHADER CANNOT DRIFT FROM IT.
+		// VoxelMarchIndexBlockCompute spells the divide as `>> 2` -- the cheap,
+		// correct form for 4 and silently WRONG for any other value -- and the
+		// traversal spells `ChunkCoord >> 2` and a +/-4 neighbour step the same
+		// way. Raising kBlockChunks on the CPU without those would publish bits
+		// for one block size and read them at another: ground claimed empty that
+		// is not, i.e. holes, with every counter healthy. The .ush turns this
+		// into an #error rather than trusting anyone to notice.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_BLOCK_CHUNKS"),
+		                         int32(FVoxelMarchChunkIndex::kBlockChunks));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WORDS"),
 		                         int32(VoxelMarchHoleWord::Count));
 	}
@@ -3042,10 +4331,47 @@ static_assert(int32(VoxelMarchHoleWord::UncReasonFirst) -
                       int32(VoxelMarchHoleWord::UncLevelFirst) ==
                   VoxelMarchHoleWord::kNumLevels,
               "hole-stats level group size drifted from the enum layout");
-static_assert(int32(VoxelMarchHoleWord::Count) -
+// PINNED AGAINST ZCutConsulted, NOT AGAINST Count, SINCE 2026-08-25. This
+// assert used to read `Count - UncReasonFirst == kNumReasons`, which silently
+// encoded "the reason group is LAST". It is not any more -- the resident-Z
+// bound's three words were appended after it -- and reading it against Count
+// would now fire on a correct layout while saying nothing about the group it
+// exists to guard. The first word AFTER the group is the group's real end, so
+// that is what it names.
+static_assert(int32(VoxelMarchHoleWord::ZCutConsulted) -
                       int32(VoxelMarchHoleWord::UncReasonFirst) ==
                   VoxelMarchHoleWord::kNumReasons,
               "hole-stats reason group size drifted from the enum layout");
+// AND THE APPENDED GROUP IS PINNED TOO, so the next person to append gets the
+// same protection the reason group just lost and got back. Three words, and
+// Count sits immediately past them.
+static_assert(int32(VoxelMarchHoleWord::BlockConsulted) -
+                      int32(VoxelMarchHoleWord::ZCutConsulted) == 3,
+              "the voxel.March.ZCut word group is not three words. PINNED AGAINST THE FIRST "
+              "WORD AFTER IT, not against Count, since 2026-08-25: it read against Count "
+              "until voxel.March.BlockSkip appended its own trio, at which point it would "
+              "have fired on a correct layout while saying nothing about the group it "
+              "guards -- the same drift the reason group's assert had already been through.");
+// AND THE NEWEST GROUP IS PINNED THE SAME WAY, against Count because it is
+// currently last. WHOEVER APPENDS NEXT must repoint this at their first word,
+// exactly as the two asserts above were repointed, or it silently stops
+// guarding anything.
+static_assert(int32(VoxelMarchHoleWord::BlockSkyLicensed) -
+                      int32(VoxelMarchHoleWord::BlockConsulted) == 3,
+              "the voxel.March.BlockSkip word group is not three words. REPOINTED "
+              "2026-08-25 from Count to BlockSkyLicensed when the sky-licence trio was "
+              "appended -- it fired on a correct layout, which is the assert doing its "
+              "job: it guards a GROUP SIZE, so it must be pinned against the first word "
+              "AFTER the group, never against Count once anything can follow.");
+// AND THE SKY-LICENCE TRIO IS PINNED THE SAME WAY, against Count because it is
+// currently last. WHOEVER APPENDS NEXT repoints THIS one at their first word.
+// That has now happened three times (reason group, ZCut, BlockSkip) and each
+// time the build failed loudly rather than the counter silently reading a
+// neighbouring group's value -- which is the whole reason these exist.
+static_assert(int32(VoxelMarchHoleWord::Count) -
+                      int32(VoxelMarchHoleWord::BlockSkyLicensed) == 3,
+              "the sky-licence word group is not three words, or something was appended "
+              "after it without repointing this assert at the new group's first word");
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchCS, VOXEL_MARCH_USF, "VoxelMarchMain", SF_Compute);
 
 class FVoxelMarchCompactCS : public FGlobalShader
@@ -3261,6 +4587,39 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifySourceParameters, )
 	VOXEL_BRICK_POOL_PARAMETERS()
 	SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelMarchViewParameters, MarchView)
 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchChunkIndex)
+	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip). One bit per 4x4x4
+	// block of chunk cells: Occupied means at least one cell in the block is
+	// resident, AnyAbsent means at least one is not. 32 KiB each against the
+	// 64 MiB they bound.
+	//
+	// BOUND ON EVERY PERMUTATION, INCLUDING VOXEL_MARCH_BLOCK_SKIP 0, for the
+	// reason the cover pair below is bound on every arm -- and here the stakes
+	// are higher than a silent zero. An unbound Buffer<uint> reads as ZEROS,
+	// zero in Occupied means "no chunk in this block is resident", and a
+	// marcher that believed that would skip the entire world in one jump: every
+	// ray a hole, no error anywhere. FVoxelMarchChunkIndex::RegisterWithBlocks
+	// therefore guarantees a non-null pair whenever it returns an index at all,
+	// falling back to an ALL-ONES grid (descend everywhere, i.e. the control)
+	// rather than to nothing.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockOccupied)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAnyAbsent)
+	// THE SKY LICENCE (voxel.March.BlockSkySkip). One bit per block: all 64
+	// cells carry a valid open-sky mark AND none is resident.
+	//
+	// BOUND ON EVERY PERMUTATION for the reason the pair above is, but its
+	// FAILURE DIRECTION IS THE OPPOSITE and that is worth saying at the binding
+	// rather than only at the writer. Unbound reads as zeros; zero here means
+	// "no block is provably sky", so the arm licenses nothing and the marcher
+	// descends exactly as the control does. INERT, not wrong -- which is why
+	// this one falls back to all ZEROS while the occupancy pair falls back to
+	// all ones.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAllSky)
+	// 0 residency-only / 1 both / 2 sky-only. A uniform rather than a
+	// permutation -- see FVoxelMarchArm::BlockSkyMode for that argument. Bound
+	// on every permutation because an unset uniform is a silent zero, and zero
+	// is also the correct "sky licence off" value: the safe default and the
+	// honest default are the same number here.
+	SHADER_PARAMETER(uint32, MarchBlockSkyMode)
 	SHADER_PARAMETER(FUintVector, MarchIndexDimChunks)
 	SHADER_PARAMETER(uint32, MarchIndexCellsPerLevel)
 	// PHASE 6. Bound on every permutation, including the ones compiled with
@@ -3275,6 +4634,21 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifySourceParameters, )
 	// here means every slot is empty, which would make every absent chunk read
 	// as a hole rather than none.
 	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
+	// THE RESIDENT-Z BOUND (voxel.March.ZCut). Bound on every permutation for
+	// the reason the two above are: an unbound uniform is a silent zero, and
+	// zero in MarchZCutEnable is the honest "do not cut" value, so the safe
+	// default and the correct default are again the same number.
+	//
+	// One int4 per INDEX GRID SLOT, not per ring level -- the cover slot has
+	// its own walk and is simply never given a usable bound.
+	//   .x  min chunk Z, already padded outward
+	//   .y  max chunk Z, already padded outward, INCLUSIVE
+	//   .z  1 = this slot's bound is usable; 0 = DO NOT CUT this slot
+	//   .w  unused, 0
+	// Padding is applied CPU-side so the shader has one number to trust and
+	// there is no second place for the pad to be forgotten.
+	SHADER_PARAMETER(int32, MarchZCutEnable)
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -3365,6 +4739,39 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifyIndexParameters, )
 	VOXEL_FLUID_OCCUPANCY_PARAMETERS()
 	VOXEL_BRICK_POOL_PARAMETERS()
 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchChunkIndex)
+	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip). One bit per 4x4x4
+	// block of chunk cells: Occupied means at least one cell in the block is
+	// resident, AnyAbsent means at least one is not. 32 KiB each against the
+	// 64 MiB they bound.
+	//
+	// BOUND ON EVERY PERMUTATION, INCLUDING VOXEL_MARCH_BLOCK_SKIP 0, for the
+	// reason the cover pair below is bound on every arm -- and here the stakes
+	// are higher than a silent zero. An unbound Buffer<uint> reads as ZEROS,
+	// zero in Occupied means "no chunk in this block is resident", and a
+	// marcher that believed that would skip the entire world in one jump: every
+	// ray a hole, no error anywhere. FVoxelMarchChunkIndex::RegisterWithBlocks
+	// therefore guarantees a non-null pair whenever it returns an index at all,
+	// falling back to an ALL-ONES grid (descend everywhere, i.e. the control)
+	// rather than to nothing.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockOccupied)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAnyAbsent)
+	// THE SKY LICENCE (voxel.March.BlockSkySkip). One bit per block: all 64
+	// cells carry a valid open-sky mark AND none is resident.
+	//
+	// BOUND ON EVERY PERMUTATION for the reason the pair above is, but its
+	// FAILURE DIRECTION IS THE OPPOSITE and that is worth saying at the binding
+	// rather than only at the writer. Unbound reads as zeros; zero here means
+	// "no block is provably sky", so the arm licenses nothing and the marcher
+	// descends exactly as the control does. INERT, not wrong -- which is why
+	// this one falls back to all ZEROS while the occupancy pair falls back to
+	// all ones.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchBlockAllSky)
+	// 0 residency-only / 1 both / 2 sky-only. A uniform rather than a
+	// permutation -- see FVoxelMarchArm::BlockSkyMode for that argument. Bound
+	// on every permutation because an unset uniform is a silent zero, and zero
+	// is also the correct "sky licence off" value: the safe default and the
+	// honest default are the same number here.
+	SHADER_PARAMETER(uint32, MarchBlockSkyMode)
 	SHADER_PARAMETER(FUintVector, MarchIndexDimChunks)
 	SHADER_PARAMETER(uint32, MarchIndexCellsPerLevel)
 	// PHASE 6. Bound on every permutation, including the ones compiled with
@@ -3379,6 +4786,21 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifyIndexParameters, )
 	// here means every slot is empty, which would make every absent chunk read
 	// as a hole rather than none.
 	SHADER_PARAMETER(uint32, MarchIndexLevelPopulated)
+	// THE RESIDENT-Z BOUND (voxel.March.ZCut). Bound on every permutation for
+	// the reason the two above are: an unbound uniform is a silent zero, and
+	// zero in MarchZCutEnable is the honest "do not cut" value, so the safe
+	// default and the correct default are again the same number.
+	//
+	// One int4 per INDEX GRID SLOT, not per ring level -- the cover slot has
+	// its own walk and is simply never given a usable bound.
+	//   .x  min chunk Z, already padded outward
+	//   .y  max chunk Z, already padded outward, INCLUSIVE
+	//   .z  1 = this slot's bound is usable; 0 = DO NOT CUT this slot
+	//   .w  unused, 0
+	// Padding is applied CPU-side so the shader has one number to trust and
+	// there is no second place for the pad to be forgotten.
+	SHADER_PARAMETER(int32, MarchZCutEnable)
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -3616,6 +5038,17 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	Shipping.Fallthrough = (Shipping.Rings != 0)
 	                           ? FMath::Clamp(CVarVoxelMarchFallthrough.GetValueOnRenderThread(), 0, 2)
 	                           : 0;
+	// Same gating again: rings off forces the dimension to its control value and
+	// the permutation for the other combination is refused at compile.
+	Shipping.BlockSkip =
+		(Shipping.Rings != 0 && CVarVoxelMarchBlockSkip.GetValueOnRenderThread() != 0) ? 1 : 0;
+	// Same gating a third time: VoxelMarchGetArm forces this off without rings
+	// and without a fallthrough depth, and the permutation for the other
+	// combinations is refused at compile.
+	Shipping.SkyLadder = (Shipping.Rings != 0 && Shipping.Fallthrough > 0 &&
+	                      CVarVoxelMarchSkyLadder.GetValueOnRenderThread() != 0)
+	                         ? 1
+	                         : 0;
 
 	// What the comparator kernel is actually compiled with. Rings rides its
 	// permutation domain; the other two do not exist in it at all, which is
@@ -3627,6 +5060,25 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	Comparator.Cover = 0;                          // NOT in FVoxelMarchVerifySourceCS's domain
 	Comparator.CoverSkip = 0;
 	Comparator.Fallthrough = Shipping.Fallthrough; // carried by FVoxelMarchFallthroughDim
+	// NOT in FVoxelMarchVerifySourceCS's domain, exactly like Cover -- so with
+	// block skip on the comparator would compare two walks that BOTH lack it.
+	Comparator.BlockSkip = 0;
+	// NOT in FVoxelMarchVerifySourceCS's domain either, exactly like Cover and
+	// BlockSkip.
+	Comparator.SkyLadder = 0;
+
+	if (Shipping.SkyLadder != Comparator.SkyLadder)
+	{
+		OutWhy = TEXT("the marcher is running the SKY LADDER GATE (voxel.March.SkyLadder 1) and "
+		              "the comparator is not -- that dimension is not in "
+		              "FVoxelMarchVerifySourceCS's permutation domain at all. The gate decides "
+		              "WHICH RAYS RETRY at a coarser level, and a retried ray can HIT where it "
+		              "previously holed, so the two kernels would be grading DIFFERENT PICTURES. "
+		              "Both of the comparator's arms would use the old gate equally, which makes "
+		              "it a FALSE PASS about a picture the marcher is not drawing -- not a false "
+		              "fail. Run the comparator with voxel.March.SkyLadder 0.");
+		return false;
+	}
 
 	if (Shipping.Cover != Comparator.Cover)
 	{
@@ -3645,6 +5097,25 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 		              "comparator.");
 		return false;
 	}
+	// BLOCK SKIP: EXCLUSION, THE SAME ANSWER COVER GETS AND FOR THE SAME REASON.
+	// The dimension is not in FVoxelMarchVerifySourceCS's permutation domain, so
+	// with the arm on BOTH comparator walks would run without the coarse level
+	// and report agreement about a picture the marcher is not drawing -- a false
+	// PASS, which is the dangerous direction. Routing the comparator through the
+	// arm instead is the obvious move and is refused for the reason it was
+	// refused for cover: it would change the population inside a live instrument
+	// whose disagreement counts are currently the only handle on two open
+	// stepping defects.
+	if (Shipping.BlockSkip != Comparator.BlockSkip)
+	{
+		OutWhy = TEXT("the marcher is walking the COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip "
+		              "1) and the comparator is not -- the dimension is not in its permutation "
+		              "domain. Both of its arms would skip nothing, so it would report AGREEMENT "
+		              "about a walk the marcher is not performing: a false pass, not a false "
+		              "fail. Run the comparator with voxel.March.BlockSkip 0, which is also the "
+		              "arm whose correctness it is being asked about.");
+		return false;
+	}
 	return true;
 }
 
@@ -3657,15 +5128,67 @@ static bool VoxelMarchBindPool(FRDGBuilder& GraphBuilder, int32 Source, Paramete
 	OutIndexEntries = Index.GetNumEntries();
 
 	const bool bPoolBound = Pool.BindShaderParameters(GraphBuilder, Params);
-	FRDGBufferRef IndexBuffer = Index.Register(GraphBuilder);
+	// ONE CALL FOR THE INDEX AND ITS COARSE LEVEL, and that is the coherence
+	// argument rather than a convenience: the three buffers are staged from one
+	// snapshot of one shadow and consumed into this one graph, so no pass this
+	// function's caller adds can see a block bitfield from a different
+	// generation than the index it describes. Splitting this into two calls
+	// would reintroduce exactly the window it exists to not have.
+	const FVoxelMarchChunkIndex::FBuffers IndexBuffers = Index.RegisterWithBlocks(GraphBuilder);
+	FRDGBufferRef IndexBuffer = IndexBuffers.Index;
 	if (IndexBuffer != nullptr)
 	{
 		Params.MarchChunkIndex = GraphBuilder.CreateSRV(IndexBuffer, PF_R32_UINT);
+		// NON-NULL WHENEVER THE INDEX IS -- RegisterWithBlocks guarantees it,
+		// falling back to an all-ones grid rather than to nothing, because an
+		// unbound Buffer<uint> reads as zeros and zeros here mean "nothing is
+		// resident anywhere", i.e. skip the world. Checked anyway: this is the
+		// one binding whose failure mode is every ray a hole.
+		if (IndexBuffers.BlockOccupied != nullptr && IndexBuffers.BlockAnyAbsent != nullptr &&
+		    IndexBuffers.BlockAllSky != nullptr)
+		{
+			Params.MarchBlockOccupied =
+				GraphBuilder.CreateSRV(IndexBuffers.BlockOccupied, PF_R32_UINT);
+			Params.MarchBlockAnyAbsent =
+				GraphBuilder.CreateSRV(IndexBuffers.BlockAnyAbsent, PF_R32_UINT);
+			// ALL THREE OR NONE. RegisterWithBlocks stages them from one shadow
+			// snapshot under one generation stamp, so binding two of three would
+			// hand the marcher a sky licence from one flush against a residency
+			// picture from another -- and those two disagreeing is precisely the
+			// state in which a block reads all-sky while a chunk has landed in
+			// it. The three-way test is the seam where that is enforced.
+			Params.MarchBlockAllSky =
+				GraphBuilder.CreateSRV(IndexBuffers.BlockAllSky, PF_R32_UINT);
+		}
+		else
+		{
+			static bool bBlockBindComplained = false;
+			if (!bBlockBindComplained)
+			{
+				bBlockBindComplained = true;
+				UE_LOG(LogVoxelMarch, Error,
+				       TEXT("Voxel march: the chunk index returned a buffer but no coarse "
+				            "occupancy level, which RegisterWithBlocks is written to make "
+				            "impossible. Any kernel compiled with VOXEL_MARCH_BLOCK_SKIP 1 "
+				            "will now read an unbound Buffer<uint> as zeros, conclude that "
+				            "no chunk anywhere is resident, and skip the entire world -- "
+				            "every ray a hole with no other error. Run "
+				            "voxel.March.BlockSkip 0 and rebuild the shaders."));
+			}
+		}
 	}
 	Params.MarchIndexDimChunks = FUintVector(FVoxelMarchChunkIndex::kDimXY,
 	                                         FVoxelMarchChunkIndex::kDimXY,
 	                                         FVoxelMarchChunkIndex::kDimZ);
 	Params.MarchIndexCellsPerLevel = FVoxelMarchChunkIndex::kCellsPerLevel;
+	// THE SKY LICENCE MODE, SET HERE -- in the one place that fills the pool
+	// bindings, on EVERY arm including the ones that will never read it. An
+	// unset uniform is a silent zero and this file has paid for that twice; zero
+	// is also the correct "residency only" value, so the safe default and the
+	// honest default coincide. Read from the ARM, not the cvar, so a kernel
+	// compiled without VOXEL_MARCH_BLOCK_SKIP is handed 0 rather than a mode it
+	// has no code for.
+	Params.MarchBlockSkyMode = uint32(FMath::Clamp(VoxelMarchGetArm().BlockSkyMode, 0, 2));
 	// ---- PHASE 6: ground cover -------------------------------------------
 	//
 	// FILLED HERE, IN THE ONE PLACE THAT FILLS THE POOL BINDINGS, and filled on
@@ -3716,6 +5239,79 @@ static bool VoxelMarchBindPool(FRDGBuilder& GraphBuilder, int32 Source, Paramete
 			PopulatedMask |= (1u << uint32(FVoxelMarchChunkIndex::kCoverGridSlot));
 		}
 		Params.MarchIndexLevelPopulated = PopulatedMask;
+	}
+	// ---- THE RESIDENT-Z BOUND (voxel.March.ZCut) --------------------------
+	//
+	// FILLED HERE, BESIDE THE POPULATED MASK, and deliberately from the SAME
+	// object at the SAME point in the frame. The two answers have to agree
+	// about which slots hold anything -- the shader refuses to cut a slot the
+	// mask calls empty, because the shell test short-circuits there -- and the
+	// only way to guarantee that is to read them from one index at one moment
+	// rather than from two reads that could straddle a flush.
+	//
+	// THE ORDERING ARGUMENT, because a render-thread read of game-thread state
+	// deserves one rather than a shrug. Every widening of this bound happens in
+	// NoteObservedSpan, which runs IMMEDIATELY BEFORE the kResidentBit write
+	// for the same chunk, on the game thread, inside Seed or ApplyDelta. Those
+	// cells reach the GPU only through an upload that is enqueued after that
+	// loop returns, so by the time the marcher can SEE a resident cell, the
+	// widening that covers it was already published. This read happens later
+	// still. The pad below is what covers the remaining slack rather than an
+	// argument about memory order.
+	{
+		const bool bZCut = CVarVoxelMarchZCut.GetValueOnRenderThread() != 0;
+		// AT LEAST 1, AND THE MINIMUM IS LOAD-BEARING -- see the cvar's help.
+		// Pad 0 would let a cut chunk sit face-adjacent in Z to a resident one
+		// and drop a bCrossedShellAbsent the retry ladder gates on.
+		const int32 Pad = FMath::Max(CVarVoxelMarchZCutPadChunks.GetValueOnRenderThread(), 1);
+		// The array is 8 int4s because the index carries 8 grid slots. Spelled
+		// as a literal in the parameter struct and in VoxelBrickTraverse.ush
+		// (int4 MarchLevelChunkZ[8]), so the one authority checks the two
+		// spellings HERE rather than letting a widened index silently write
+		// past the uniform.
+		static_assert(FVoxelMarchChunkIndex::kGridSlots == 8,
+		              "MarchLevelChunkZ is declared [8] in FVoxelMarchCSParameters and as "
+		              "int4 MarchLevelChunkZ[8] in VoxelBrickTraverse.ush. The index grew a "
+		              "slot; widen both, or the far slots read another slot's Z bound.");
+		int32 UsableMask = 0;
+		for (uint32 S = 0; S < FVoxelMarchChunkIndex::kGridSlots; ++S)
+		{
+			// .z = 0 IS THE DEFAULT AND MEANS "DO NOT CUT". Every slot is
+			// written on every arm, including the cover slot (which has its own
+			// walk and is never given a bound) and including the arm where the
+			// cvar is off, so there is no path on which the shader reads a
+			// stale or unset triple.
+			FIntVector4 Bound(0, 0, 0, 0);
+			if (bZCut && S < FVoxelMarchChunkIndex::kRingGrids)
+			{
+				int32 MinZ = 0;
+				int32 MaxZ = 0;
+				if (Index.GetResidentChunkZBound(int32(S), MinZ, MaxZ))
+				{
+					// OUTWARD ON BOTH ENDS, ALWAYS. A too-tight bound is a
+					// hole; a too-wide one is only slower.
+					Bound = FIntVector4(MinZ - Pad, MaxZ + Pad, 1, 0);
+					UsableMask |= (1 << int32(S));
+				}
+			}
+			Params.MarchLevelChunkZ[int32(S)] = Bound;
+			GVoxelMarchZCutRanZMin[int32(S)].store(Bound.X, std::memory_order_relaxed);
+			GVoxelMarchZCutRanZMax[int32(S)].store(Bound.Y, std::memory_order_relaxed);
+		}
+		Params.MarchZCutEnable = bZCut ? 1 : 0;
+		// WHAT WAS ACTUALLY UPLOADED, stamped from the values just written
+		// rather than re-read from the cvar, and printed beside the cvar by
+		// voxel.March.Stats for the reason halfRes prints asked next to ran: a
+		// cvar reads back whatever was typed, and that reading alone is what
+		// let nine switches in this project sit armed and inert.
+		//
+		// SAY EXACTLY WHAT THIS PROVES AND NO MORE. This is the BIND, one step
+		// before the dispatch, so it proves the uniform was FILLED -- not that
+		// the pass ran (frames / marchMs say that) and not that the shader used
+		// it (the engagement counters say that, and only they do).
+		GVoxelMarchZCutRanEnable.store(bZCut ? 1 : 0, std::memory_order_relaxed);
+		GVoxelMarchZCutRanUsableMask.store(UsableMask, std::memory_order_relaxed);
+		GVoxelMarchZCutRanPad.store(Pad, std::memory_order_relaxed);
 	}
 	// Ring segments, near to far, as plain t intervals in UU. Filled even when
 	// the rings permutation is off, for the same reason both sources' bindings
@@ -3891,6 +5487,25 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			// full-rate numerator by a level-2 denominator and under-report the rate.
 			const uint32 FtConsidered = Src[VoxelMarchHoleWord::FallthroughConsidered];
 			const uint32 FtTaken = Src[VoxelMarchHoleWord::FallthroughTaken];
+			// The resident-Z bound's engagement trio. Read on EVERY frame for
+			// the reason the ladder's pair is: the plain kernel writes them
+			// too, so gating them behind the level-2 fold would report the
+			// arm as inert on every level-1 leg -- the exact misreading these
+			// counters exist to make impossible.
+			const uint32 ZCutConsulted = Src[VoxelMarchHoleWord::ZCutConsulted];
+			const uint32 ZCutSkipped = Src[VoxelMarchHoleWord::ZCutSkipped];
+			const uint32 ZCutClipped = Src[VoxelMarchHoleWord::ZCutClipped];
+			// The coarse occupancy level's trio. Read on EVERY frame for the
+			// reason the Z bound's is: the cheap kernel writes them too, so
+			// gating them behind the level-2 fold would report the arm inert on
+			// every level-1 leg.
+			const uint32 BlkConsulted = Src[VoxelMarchHoleWord::BlockConsulted];
+			const uint32 BlkSkipped = Src[VoxelMarchHoleWord::BlockSkipped];
+			const uint32 BlkCells = Src[VoxelMarchHoleWord::BlockCellsAvoided];
+			// The sky licence's trio, read on every frame for the same reason.
+			const uint32 BlkSkyLic = Src[VoxelMarchHoleWord::BlockSkyLicensed];
+			const uint32 BlkSkyRunB = Src[VoxelMarchHoleWord::BlockSkyRunBlocks];
+			const uint32 BlkSkyRuns = Src[VoxelMarchHoleWord::BlockSkyRuns];
 			uint32 ByLevel[VoxelMarchHoleWord::kNumLevels];
 			uint32 ByReason[VoxelMarchHoleWord::kNumReasons];
 			for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
@@ -3909,6 +5524,15 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.Uncovered += Uncovered;
 			State->HoleWindow.FallthroughConsidered += FtConsidered;
 			State->HoleWindow.FallthroughTaken += FtTaken;
+			State->HoleWindow.ZCutConsulted += ZCutConsulted;
+			State->HoleWindow.ZCutSkipped += ZCutSkipped;
+			State->HoleWindow.ZCutClipped += ZCutClipped;
+			State->HoleWindow.BlockConsulted += BlkConsulted;
+			State->HoleWindow.BlockSkipped += BlkSkipped;
+			State->HoleWindow.BlockCellsAvoided += BlkCells;
+			State->HoleWindow.BlockSkyLicensed += BlkSkyLic;
+			State->HoleWindow.BlockSkyRunBlocks += BlkSkyRunB;
+			State->HoleWindow.BlockSkyRuns += BlkSkyRuns;
 			State->HoleWindow.Frames++;
 			if (Slot.ArmLevel >= 2)
 			{
@@ -4617,6 +6241,71 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 	// thing that cannot have drifted. See PostRenderBasePassDeferred.
 	const int32 ResShift = (CVarVoxelMarchHalfRes.GetValueOnRenderThread() != 0) ? 1 : 0;
 
+	// ---- THE SAMPLE LATTICE, RESOLVED ONCE FOR THE FRAME -------------------
+	//
+	// Above the view loop for the same reason ResShift is: every view in a
+	// family gets the same lattice, and the emit and the gate re-derive nothing
+	// -- they read this frame's stamp. Full res forces it to zero here as well
+	// as in the .usf's #if, so neither half can arm it alone.
+	const FVoxelMarchJitter Jitter =
+		VoxelMarchResolveJitter(ResShift != 0, GFrameNumberRenderThread);
+
+	// ---- PROOF OF TRAFFIC FOR THE MOVING LATTICE ---------------------------
+	//
+	// ONE LINE PER DISTINCT PHASE ACTUALLY DISPATCHED, then silent: four lines
+	// under scheme 1, eight under scheme 2, and EXACTLY ONE if the lattice is
+	// static. So a static arm and a jittered one are distinguishable FROM THE
+	// RAW LOG ALONE -- no console command, no readback, no counting frames.
+	// Reset when the scheme changes, so a live flip re-prints its own cycle.
+	//
+	// IT PRINTS THE OFFSET IN FLOATING POINT, not merely the phase index,
+	// because a phase index that advances while the offset table is wrong would
+	// still read as motion. The pair of numbers in this line IS the number the
+	// uniform carries, taken from the same VoxelMarchJitterOffset call the
+	// dispatch below is about to use.
+	//
+	// READ IT WITH voxel.March.Stats 'halfResJitter', which prints the running
+	// phase mask: this line proves the phases were dispatched at least once,
+	// that one proves they are still cycling on a settled leg.
+	{
+		static int32 LoggedJitterScheme = -2;
+		static uint32 LoggedJitterPhaseMask = 0u;
+		if (Jitter.Scheme != LoggedJitterScheme)
+		{
+			LoggedJitterScheme = Jitter.Scheme;
+			LoggedJitterPhaseMask = 0u;
+			GVoxelMarchRanJitterPhaseMask.store(0u, std::memory_order_relaxed);
+			GVoxelMarchRanJitterFrames.store(0, std::memory_order_relaxed);
+		}
+		const uint32 PhaseBit = 1u << uint32(Jitter.Phase);
+		const bool bPhasePinned =
+			CVarVoxelMarchHalfResJitterPhase.GetValueOnRenderThread() >= 0;
+		if ((LoggedJitterPhaseMask & PhaseBit) == 0u)
+		{
+			LoggedJitterPhaseMask |= PhaseBit;
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("[voxel-march] jitter: halfRes=%d scheme=%d (%s) | phase %d of %d | "
+			            "sample = 2x2 block centre + (%+.4f, %+.4f) full-res px | %s"),
+			       ResShift, Jitter.Scheme,
+			       Jitter.Scheme == 0
+			           ? TEXT("STATIC block centre")
+			           : (Jitter.Scheme == 1
+			                  ? TEXT("4-frame rotation over the four full-res pixel centres")
+			                  : TEXT("8-frame Halton(2,3) over the same +/-0.5 px box")),
+			       Jitter.Phase, Jitter.Cycle, Jitter.Offset.X, Jitter.Offset.Y,
+			       bPhasePinned
+			           ? TEXT("PHASE PINNED by voxel.March.HalfRes.JitterPhase -- a measurement "
+			                  "mode, and a pinned lattice is a STATIC one")
+			           : TEXT("free-running on the render-thread frame number"));
+		}
+		GVoxelMarchJitterStampFrame.store(GFrameNumberRenderThread, std::memory_order_relaxed);
+		GVoxelMarchRanJitterScheme.store(Jitter.Scheme, std::memory_order_relaxed);
+		GVoxelMarchRanJitterPhase.store(Jitter.Phase, std::memory_order_relaxed);
+		GVoxelMarchRanJitterCycle.store(Jitter.Cycle, std::memory_order_relaxed);
+		GVoxelMarchRanJitterPhaseMask.fetch_or(PhaseBit, std::memory_order_relaxed);
+		GVoxelMarchRanJitterFrames.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	FVoxelMarchState::FTimingPair* Timing = OpenBracket(GraphBuilder, State->MarchTiming, TEXT("March"));
 
 	uint32 TotalTiles = 0;
@@ -4748,9 +6437,18 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			static int32 LoggedViewW = -1;
 			static int32 LoggedViewH = -1;
 			static int32 LoggedShift = -2;
+			// THE LATTICE IS PART OF THE SHAPE THIS LINE DESCRIBES, so a flip of
+			// voxel.March.HalfRes.Jitter re-prints it and no leg can read a
+			// half-res line and assume the static lattice it used to mean. The
+			// PHASE is deliberately NOT in the change set -- it moves every
+			// frame and would bury the log; the '[voxel-march] jitter:' line
+			// above carries the phase, one line per distinct phase dispatched.
+			static int32 LoggedJitterSchemeOnLine = -2;
 			if (MarchSize.X != LoggedSampleW || MarchSize.Y != LoggedSampleH ||
-			    Size.X != LoggedViewW || Size.Y != LoggedViewH || ResShift != LoggedShift)
+			    Size.X != LoggedViewW || Size.Y != LoggedViewH || ResShift != LoggedShift ||
+			    Jitter.Scheme != LoggedJitterSchemeOnLine)
 			{
+				LoggedJitterSchemeOnLine = Jitter.Scheme;
 				LoggedSampleW = MarchSize.X;
 				LoggedSampleH = MarchSize.Y;
 				LoggedViewW = Size.X;
@@ -4760,7 +6458,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				       TEXT("[voxel-march] halfres: arm=%d | view=%dx%d px | rays=%dx%d "
 				            "(%.3f Mray, %.2fx the pixels) | dispatch=%dx%d groups of %dx%d "
 				            "threads | tile=%d full-res px, tiles=%dx%d=%u | Vis=%dx%d "
-				            "HitT=%dx%d | emit+depth+gate read the VisBuffer by: %s"),
+				            "HitT=%dx%d | lattice=%s | emit+depth+gate read the VisBuffer by: %s"),
 				       ResShift != 0 ? 1 : 0, Size.X, Size.Y, MarchSize.X, MarchSize.Y,
 				       double(MarchSize.X) * double(MarchSize.Y) / 1.0e6,
 				       double(MarchSize.X) * double(MarchSize.Y) /
@@ -4769,6 +6467,16 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				       kVoxelMarchTileSize << ResShift, TileCount.X, TileCount.Y, TileTotal,
 				       Vis->Desc.Extent.X, Vis->Desc.Extent.Y, HitT->Desc.Extent.X,
 				       HitT->Desc.Extent.Y,
+				       ResShift == 0
+				           ? TEXT("full res -- one ray per pixel centre")
+				           : (Jitter.Scheme == 0
+				                  ? TEXT("STATIC -- sample at the 2x2 block centre every "
+				                         "frame (voxel.March.HalfRes.Jitter 0)")
+				                  : (Jitter.Scheme == 1
+				                         ? TEXT("MOVING -- 4-frame rotation over the four "
+				                                "full-res pixel centres")
+				                         : TEXT("MOVING -- 8-frame Halton(2,3) inside the "
+				                                "2x2 block"))),
 				       ResShift != 0
 				           ? TEXT("EXACT RAY/PLANE RECONSTRUCTION over the 2x2 sample "
 				                  "neighbourhood, nearest-neighbour fallback where no candidate "
@@ -4972,6 +6680,10 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		MarchView.MarchInvDeviceZToWorldZ = Entry.InvDeviceZToWorldZ;
 		MarchView.MarchPixelConeSlope = Entry.PixelConeSlope;
 		MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
+		// The frame's one lattice, resolved above the loop. The depth pre-emit
+		// and the source comparator copy this whole struct, so they cannot get a
+		// different sample point than the march did.
+		MarchView.MarchSampleJitter = Jitter.Offset;
 		MarchView.MarchTileCount = TileCount;
 
 		FRDGBufferRef TileHit = GraphBuilder.CreateBuffer(
@@ -5067,6 +6779,13 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			Permutation.Set<FVoxelMarchFallthroughDim>(Arm.Fallthrough);
 			// Already false without rings (VoxelMarchGetArm), same rule.
 			Permutation.Set<FVoxelMarchHoleStatsDim>(Arm.HoleStatsLevel);
+			// The coarse occupancy level. Already false without rings
+			// (VoxelMarchGetArm), matching the refused permutation.
+			Permutation.Set<FVoxelMarchBlockSkipDim>(Arm.bBlockSkip);
+			// The retry ladder's gate. Already false without rings or without a
+			// fallthrough depth (VoxelMarchGetArm), matching the refused
+			// permutation.
+			Permutation.Set<FVoxelMarchSkyLadderDim>(Arm.bSkyLadder);
 			// The buffer this dispatch is about to write is MarchSize, so the
 			// kernel that writes it must be the one compiled for MarchSize. The
 			// two are set from the same ResShift, four lines apart, deliberately.
@@ -6009,6 +7728,12 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 		Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
+		// TAKEN FROM THE MARCH'S OWN STAMP, not re-read from the cvar -- the
+		// same argument bHalfResEmit above makes about the VisBuffer extent,
+		// applied to the sample point inside it. bHalfResEmit gates it, so a
+		// full-res frame gets zero however the cvar is set.
+		Params->MarchView.MarchSampleJitter =
+			VoxelMarchJitterForEmit(bHalfResEmit, Entry->FrameNumber);
 		Params->MarchView.MarchTileCount = Entry->TileCount;
 		Params->MarchStepBudget = Arm.StepBudget;
 		Params->MarchBrickOriginVoxel = Entry->FrameOriginVoxel;
@@ -6254,6 +7979,14 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 				Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 				Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
+				// THE GATE MUST STAND WHERE THE EMIT STANDS. It grades the depth
+				// the emit would have written, so it goes through the same
+				// reconstruction over the same lattice; a gate on a different
+				// sample point would grade a picture nobody renders. Its numbers
+				// are frame-dependent under a moving lattice -- pin the phase
+				// (voxel.March.HalfRes.JitterPhase) to compare single frames.
+				Params->MarchView.MarchSampleJitter =
+					VoxelMarchJitterForEmit(bHalfResEmit, Entry->FrameNumber);
 				Params->MarchView.MarchTileCount = Entry->TileCount;
 				Params->MarchVis = Entry->VisBuffer;
 				Params->MarchHitT = Entry->HitDistance;

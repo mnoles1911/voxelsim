@@ -27,6 +27,12 @@
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderingThread.h"
+// THE TAIL-GROUP SCOPE, one line per ENQUEUE_RENDER_COMMAND body. See
+// VoxelRenderFrame.h: these bodies run on the RENDER THREAD BETWEEN scene
+// renders -- i.e. in the tail bucket -- and tailMs is where the parked->moving
+// delta is expected to live. Costs one compare on a latched int unless the leg
+// is run with -VoxelRenderFrame=2.
+#include "VoxelRenderFrame.h"
 
 // Wave 1.3 (delta upload): the scatter kernel, its cvars, and the verify
 // readback. Explicit rather than transitive, for the same reason RHI.h is
@@ -361,7 +367,21 @@ FVoxelMarchChunkIndex& GetGlobalVoxelMarchChunkIndex()
 	return Index;
 }
 
-FVoxelMarchChunkIndex::FVoxelMarchChunkIndex() = default;
+FVoxelMarchChunkIndex::FVoxelMarchChunkIndex()
+{
+	// THE SENTINEL PAIR, SET HERE AND NOT ONLY IN Seed. FIntVector's default
+	// constructor does not initialise, and `= default` therefore left
+	// ObservedMin/Max holding stack garbage on any path that reached ApplyDelta
+	// before the first Seed. GetCumulativeCoordSpan survived that because it is
+	// a diagnostic nobody gates on; GetResidentChunkZBound would not -- garbage
+	// there is a bound narrower than the resident set, i.e. a hole. Same values
+	// Seed writes, so nothing downstream can tell the two paths apart.
+	for (uint32 S = 0; S < kGridSlots; ++S)
+	{
+		ObservedMin[S] = FIntVector(MAX_int32, MAX_int32, MAX_int32);
+		ObservedMax[S] = FIntVector(MIN_int32, MIN_int32, MIN_int32);
+	}
+}
 FVoxelMarchChunkIndex::~FVoxelMarchChunkIndex() = default;
 
 void FVoxelMarchChunkIndex::AttachToGlobalPool()
@@ -487,7 +507,18 @@ void FVoxelMarchChunkIndex::Detach()
 	ENQUEUE_RENDER_COMMAND(VoxelMarchChunkIndexDetach)(
 		[this](FRHICommandListImmediate&)
 		{
+			VOXEL_RENDER_FRAME_SCOPE_TAIL(TailChunkIndex);
 			Pooled.SafeRelease();
+			// THE COARSE LEVEL GOES WITH THE INDEX, IN THE SAME COMMAND. If
+			// these outlived the index buffer, the next world's first frames
+			// would march a fresh index against the PREVIOUS world's block
+			// bitfields -- Occupied set where the new world holds nothing
+			// (slower, harmless) and, in the direction that matters, Occupied
+			// CLEAR over ground the new world does hold, which is a skip over
+			// real terrain and therefore a hole. Same lifetime, same command,
+			// no window.
+			PooledBlockOccupied.SafeRelease();
+			PooledBlockAnyAbsent.SafeRelease();
 		});
 
 	// A DETACHED INDEX MUST REPORT EMPTY, because it IS empty -- it is wired to
@@ -501,6 +532,31 @@ void FVoxelMarchChunkIndex::Detach()
 	// keeps its own memzero: it is the one that must also handle the very first
 	// sizing, and an attach that has not been preceded by a detach.
 	FMemory::Memzero(Cells.GetData(), SIZE_T(Cells.Num()) * sizeof(uint32));
+	// The coarse level's shadow follows the cells it describes, for the reason
+	// the cells are zeroed here at all: a detached index that reports empty by
+	// counter and stale by content is the shape this class has already been
+	// caught in once. ResetBlocks leaves Occupied clear and AnyAbsent SET,
+	// which is the honest description of a grid holding nothing.
+	ResetBlocks();
+	// The upload mirror goes with it, and the generation is reset to 0 -- the
+	// "nothing has ever been mirrored" state, which is the only one in which the
+	// all-ones fallback is legitimate. A mirror surviving the detach would
+	// upload this world's residency into the next world's buffers.
+	//
+	// UNDER THE LOCK, AND IT IS NOT OPTIONAL -- the same rule StagedDeltaPairs
+	// carries a paragraph about. RegisterWithBlocks memcpys out of these arrays
+	// on the RENDER thread while holding this lock; Reset() frees the
+	// allocation, so doing it unguarded is a DANGLING POINTER, not a torn value.
+	// (It was unguarded when the mirror was a one-shot staging, which was
+	// already wrong and merely narrower.)
+	{
+		FScopeLock Lock(&DeltaStageLock);
+		BlockMirrorOccupied.Reset();
+		BlockMirrorAnyAbsent.Reset();
+		BlockMirrorAllSky.Reset();
+		BlockShadowGeneration = 0;
+		PooledBlockGeneration = 0;
+	}
 	CellOwner.Reset();
 	NumEntries = 0;
 	FMemory::Memzero(PerSlotEntries, sizeof(PerSlotEntries));
@@ -573,6 +629,38 @@ FIntVector FVoxelMarchChunkIndex::GetCumulativeCoordSpan(int32 Level) const
 	return FIntVector(ObservedMax[Slot].X - ObservedMin[Slot].X + 1,
 	                  ObservedMax[Slot].Y - ObservedMin[Slot].Y + 1,
 	                  ObservedMax[Slot].Z - ObservedMin[Slot].Z + 1);
+}
+
+bool FVoxelMarchChunkIndex::GetResidentChunkZBound(int32 Level, int32& OutMinZ,
+                                                   int32& OutMaxZ) const
+{
+	// See the long note at the declaration for why a CUMULATIVE union is the
+	// correct source for a CONTAINMENT question while being the wrong source
+	// for the aliasing question the same fields once answered.
+	const int32 Slot = GridSlotForLevel(Level);
+	if (Slot < 0)
+	{
+		return false;
+	}
+	// THE SAME CONDITION MarchIndexLevelPopulated PUBLISHES, read from the same
+	// counter (VoxelMarchRenderer.cpp's bind uses GetNumEntriesAtLevel, which
+	// is this array). Spelled against PerSlotEntries rather than against the
+	// span so the two answers cannot disagree about an empty slot -- the span
+	// stays valid forever once anything has been seen, and cutting an empty
+	// slot would silently change what the marcher's shell test means there.
+	if (PerSlotEntries[Slot] <= 0)
+	{
+		return false;
+	}
+	// Never observed: the sentinel pair from Seed/the constructor. Distinct
+	// from "empty" above, and refused for the same reason.
+	if (ObservedMax[Slot].Z < ObservedMin[Slot].Z)
+	{
+		return false;
+	}
+	OutMinZ = ObservedMin[Slot].Z;
+	OutMaxZ = ObservedMax[Slot].Z;
+	return true;
 }
 
 // ===========================================================================
@@ -717,6 +805,16 @@ void FVoxelMarchChunkIndex::Seed(const TArray<FVoxelBrickIndexEntry>& Snapshot)
 	FMemory::Memzero(OfferedPerLevel, sizeof(OfferedPerLevel));
 	FMemory::Memzero(AliasCollisions, sizeof(AliasCollisions));
 	CellOwner.Reset();
+	// THE COARSE LEVEL RESTARTS WITH THE GRID IT DESCRIBES. Seed rewrites the
+	// whole index, so a block count carried over from the previous world would
+	// claim residency for cells the attach memzero just cleared -- Occupied set
+	// over empty ground, which is only slower -- AND, worse, could leave
+	// AnyAbsent CLEAR over ground that is now entirely absent, which drops a
+	// bCrossedAbsentChunk the fallthrough ladder gates on. Reset here, beside
+	// the loop that rebuilds it, rather than at the attach memzero, so the
+	// authority for "what a seeded block count is" is the function that fills
+	// it.
+	ResetBlocks();
 	// EVERY SLOT, INCLUDING COVER. Looping to kLevels left the cover slot's span
 	// at its default and GetCumulativeCoordSpan would have read an uninitialised
 	// pair -- a plausible number about a slot nothing had touched.
@@ -759,7 +857,26 @@ void FVoxelMarchChunkIndex::Seed(const TArray<FVoxelBrickIndexEntry>& Snapshot)
 		{
 			const uint32 SeedCell = CellOf(Coord, Slot);
 			NoteCellOwner(SeedCell, Coord, Slot);
+			// The sky licence, withdrawn before the cell stops saying so.
+			// STRUCTURALLY DEAD ON THIS PATH -- ResetBlocks memzeroed both the
+			// grid and every sky count immediately above, so no cell here can
+			// carry a mark. Called anyway, because "structurally unreachable"
+			// is a claim this file has been wrong about before and the cost is
+			// one predictable branch on a path that runs once per attach.
+			ClearBlockCellSkyIfMarked(Cells[int32(SeedCell)], Coord, Slot);
 			Cells[int32(SeedCell)] = kResidentBit | kAnySolidBit | (E.ChunkSlot & kSlotMask);
+			// THE COARSE LEVEL, AT THE SAME MOMENT AND ON THE SAME CONDITION.
+			// AdmitToSlot has already refused everything it means to refuse and
+			// ResetBlocks left every count at zero, so this loop is the whole
+			// seeded population -- one increment per resident cell, and the
+			// grid the marcher skips against is built from the same admissions
+			// the grid it skips into is.
+			//
+			// NO TRANSITION TEST HERE, unlike the ApplyDelta add: the grid was
+			// memzeroed at attach, so no cell in this loop can already be
+			// resident. AdmitToSlot's alias counter is what would say otherwise
+			// and it is checked separately.
+			NoteBlockCellResident(Coord, Slot);
 		}
 		++NumEntries;
 		++PerSlotEntries[Slot];
@@ -773,6 +890,273 @@ void FVoxelMarchChunkIndex::Seed(const TArray<FVoxelBrickIndexEntry>& Snapshot)
 	bForceFullUpload = true;
 	bDirty = true;
 	MarkDirtyAndUpload();
+}
+
+// ---------------------------------------------------------------------------
+// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip) -- the CPU half
+// ---------------------------------------------------------------------------
+//
+// A COUNT PER 4^3 BLOCK OF CELLS, AND TWO BITS DERIVED FROM IT. See the header
+// for why one level and not a pyramid, and for why the two bits are a
+// correctness requirement rather than fidelity.
+//
+// GAME THREAD ONLY, like every other mutable on the shadow side. The bitfields
+// reach the GPU through the staging in MarkDirtyAndUpload and are consumed by
+// RegisterWithBlocks in the same call that hands out the index, so there is no
+// moment at which a marcher can hold one and not the other.
+
+void FVoxelMarchChunkIndex::ResetBlocks()
+{
+	check(IsInGameThread());
+	// SetNumUninitialized + an explicit fill, NOT SetNumZeroed, and the reason
+	// is the one this file already records for Cells: this object outlives a
+	// UWorld, so on the SECOND attach the arrays are already the right length
+	// and SetNumZeroed only touches elements it ADDS -- it would be a silent
+	// no-op and the previous world's residency would survive into the next one.
+	BlockResidentCount.SetNumUninitialized(int32(kNumBlocks));
+	FMemory::Memzero(BlockResidentCount.GetData(), SIZE_T(BlockResidentCount.Num()));
+	BlockOccupiedWords.SetNumUninitialized(int32(kBlockWords));
+	BlockAnyAbsentWords.SetNumUninitialized(int32(kBlockWords));
+	BlockSkyCount.SetNumUninitialized(int32(kNumBlocks));
+	FMemory::Memzero(BlockSkyCount.GetData(), SIZE_T(BlockSkyCount.Num()));
+	BlockSkyTag.SetNumUninitialized(int32(kNumBlocks));
+	// 0xFFFF is "no tag yet", outside the 9-bit tag range by construction, so
+	// the FIRST mark into any block always takes the reset branch and the count
+	// starts from a tag that is genuinely this block's rather than inheriting a
+	// previous world's.
+	FMemory::Memset(BlockSkyTag.GetData(), 0xFF, SIZE_T(BlockSkyTag.Num()) * sizeof(uint16));
+	BlockAllSkyWords.SetNumUninitialized(int32(kBlockWords));
+	// OCCUPIED CLEAR, ANYABSENT SET, and that pairing is the conservative start
+	// in BOTH directions at once rather than in the obvious one. Occupied clear
+	// says "descend into nothing", which cannot invent terrain. AnyAbsent set
+	// says "the ground under this block is not held", which is what the walk
+	// would have concluded chunk by chunk over an empty grid -- so the
+	// fallthrough ladder sees exactly what it sees today rather than a quieter
+	// version of it. All-zero would have been the tidy default and would have
+	// silently DISARMED the ladder over an empty world.
+	FMemory::Memzero(BlockOccupiedWords.GetData(),
+	                 SIZE_T(BlockOccupiedWords.Num()) * sizeof(uint32));
+	FMemory::Memset(BlockAnyAbsentWords.GetData(), 0xFF,
+	                SIZE_T(BlockAnyAbsentWords.Num()) * sizeof(uint32));
+	// ALL-SKY STARTS CLEAR, which is the conservative direction for THIS bit and
+	// the opposite of AnyAbsent's. Clear means "no block is provably sky", so an
+	// unseeded grid licenses no skip at all and the arm is inert until the
+	// streaming side has actually proved something. Set would have claimed the
+	// entire world is empty over a grid that has never been written -- every ray
+	// a hole, no counter moving.
+	FMemory::Memzero(BlockAllSkyWords.GetData(),
+	                 SIZE_T(BlockAllSkyWords.Num()) * sizeof(uint32));
+}
+
+void FVoxelMarchChunkIndex::RefreshBlockBits(uint32 Block)
+{
+	// THE ONE PLACE A COUNT BECOMES A BIT. Both bits come from the same number
+	// and are written together, so they cannot disagree about a block -- which
+	// is the only way this pair could produce a hole that the index alone would
+	// not.
+	const uint32 Count = uint32(BlockResidentCount[int32(Block)]);
+	const int32 Word = int32(Block >> 5);
+	const uint32 Mask = 1u << (Block & 31u);
+	if (Count > 0u)
+	{
+		BlockOccupiedWords[Word] |= Mask;
+	}
+	else
+	{
+		BlockOccupiedWords[Word] &= ~Mask;
+	}
+	// STRICTLY LESS THAN THE WHOLE BLOCK. Equality means every cell in the block
+	// is resident and there is nothing absent to report; anything short of that
+	// means the walk would have met at least one non-resident chunk in here and
+	// set bCrossedAbsentChunk on it.
+	if (Count < kChunksPerBlock)
+	{
+		BlockAnyAbsentWords[Word] |= Mask;
+	}
+	else
+	{
+		BlockAnyAbsentWords[Word] &= ~Mask;
+	}
+	// ---- THE SKY LICENCE, AND IT NEEDS BOTH HALVES -------------------------
+	//
+	// ALL 64 CELLS PROVED SKY *AND* NOTHING RESIDENT. The second half is not
+	// belt-and-braces: a cell can hold a stale sky mark while a chunk is
+	// resident in it, because becoming resident overwrites the dword and the
+	// count is only decremented at the write sites -- so a count of 64 alone
+	// could outlive the marks it counts. `Count == 0` is maintained exactly, by
+	// the two residency notes, at every transition. ANDing the two makes the
+	// licence at least as conservative as residency, which is the arm's floor.
+	//
+	// COMPUTED HERE, in the one place a count becomes a bit, for the reason the
+	// other two are: three bits derived from three counters in three places
+	// drift, and a drifted sky bit is not a slow frame, it is deleted terrain.
+	if (BlockSkyCount.Num() == int32(kNumBlocks) &&
+	    uint32(BlockSkyCount[int32(Block)]) == kChunksPerBlock && Count == 0u)
+	{
+		BlockAllSkyWords[Word] |= Mask;
+	}
+	else
+	{
+		BlockAllSkyWords[Word] &= ~Mask;
+	}
+}
+
+// A cell just gained a valid open-sky mark for Coord.
+//
+// THE TAG RESET IS THE ALIAS DEFENCE. All 64 cells of a block share one tag
+// (a block spans 4 chunks per axis, 128 % 4 == 0, so no block straddles a
+// 128-chunk tag boundary), so a mark arriving under a DIFFERENT tag proves the
+// count describes coords that are no longer the ones being asked about -- the
+// camera has moved a torus period. Resetting to zero costs the block its licence
+// until all 64 cells are re-marked under the new tag. That is lost benefit; the
+// alternative, keeping the count, is a block licensed by a different part of the
+// world, which is a hole.
+void FVoxelMarchChunkIndex::NoteBlockCellSky(const FIntVector& Coord, int32 Slot)
+{
+	if (BlockSkyCount.Num() == 0)
+	{
+		return;   // before the first attach; nothing to describe yet
+	}
+	const uint32 Block = BlockOf(Coord, Slot);
+	const uint16 Tag = uint16(AbsentTagOf(Coord));
+	if (BlockSkyTag[int32(Block)] != Tag)
+	{
+		BlockSkyTag[int32(Block)] = Tag;
+		BlockSkyCount[int32(Block)] = 0;
+	}
+	uint8& Count = BlockSkyCount[int32(Block)];
+	// SATURATE, the same argument NoteBlockCellResident makes: a wrap past 64
+	// would read as 0 and merely lose the licence, but a count that could
+	// exceed 64 would need `>= 64` at the read site and then a double-count
+	// would license a block that is not fully marked. Bounded here instead.
+	if (Count < uint8(kChunksPerBlock))
+	{
+		++Count;
+	}
+	RefreshBlockBits(Block);
+}
+
+// A cell is ABOUT to be overwritten with something that is not this coord's
+// open-sky mark. Called BEFORE the write, with the value the cell still holds --
+// see the declaration for why that ordering is the safety property.
+void FVoxelMarchChunkIndex::ClearBlockCellSkyIfMarked(uint32 Existing, const FIntVector& Coord,
+                                                      int32 Slot)
+{
+	if (BlockSkyCount.Num() == 0)
+	{
+		return;
+	}
+	// A RESIDENT ENTRY IS NOT A SKY MARK. kResidentBit set means the low bits
+	// are a POOL SLOT, not a reason code, and slot 3 would otherwise read as
+	// kAbsentReasonOpenSky -- a resident chunk in slot 3 decrementing a count it
+	// never incremented, until the count underflows and a block that is not
+	// fully sky reads as one. This is the whole reason the test leads with the
+	// resident bit rather than masking the reason field first.
+	if ((Existing & kResidentBit) != 0u ||
+	    (Existing & kAbsentReasonMask) != kAbsentReasonOpenSky)
+	{
+		return;
+	}
+	const uint32 Block = BlockOf(Coord, Slot);
+	// Only OUR tag's mark counts against OUR count. An alias's mark was never
+	// added to this count (NoteBlockCellSky would have reset the count when the
+	// tag changed), so decrementing for it would under-count and, worse, could
+	// underflow.
+	if (BlockSkyTag[int32(Block)] != uint16(AbsentTagOf(Coord)))
+	{
+		return;
+	}
+	uint8& Count = BlockSkyCount[int32(Block)];
+	// FLOOR AT ZERO. An underflow reads as 255, never equals kChunksPerBlock,
+	// and would therefore hold the licence CLEAR forever -- inert, not wrong,
+	// which is the direction this file demands but still worth not doing.
+	if (Count > 0u)
+	{
+		--Count;
+	}
+	RefreshBlockBits(Block);
+}
+
+// THE NUMBER THE WHOLE ARM IS JUDGED ON, and it is swept rather than maintained.
+//
+// A full pass over 262,144 bytes once per perf window is nothing, and it cannot
+// drift from the state it describes -- which an incrementally maintained pair of
+// tallies demonstrably can, since that is precisely the failure mode the sky
+// count itself has to be defended against above.
+//
+// THREE NUMBERS BECAUSE ONE IS UNREADABLE. `Licensed` alone says nothing:
+// 100 licensed blocks is triumphant against 120 touched and meaningless against
+// 120,000. `Touched` (any sky mark at all) is the denominator, and `Partial`
+// (marked but not fully) is what says whether sky CLUSTERS or is scattered --
+// the property three previous skip arms lacked and the one that decides whether
+// a block-granular advance can amortise.
+void FVoxelMarchChunkIndex::GetBlockSkyCensus(uint64& OutLicensed, uint64& OutPartial,
+                                              uint64& OutTouched) const
+{
+	OutLicensed = 0;
+	OutPartial = 0;
+	OutTouched = 0;
+	if (BlockSkyCount.Num() != int32(kNumBlocks))
+	{
+		return;   // never attached: leave all three at zero, and the caller says so
+	}
+	for (int32 i = 0; i < int32(kNumBlocks); ++i)
+	{
+		const uint32 C = uint32(BlockSkyCount[i]);
+		if (C == 0u)
+		{
+			continue;
+		}
+		++OutTouched;
+		if (C >= kChunksPerBlock)
+		{
+			++OutLicensed;
+		}
+		else
+		{
+			++OutPartial;
+		}
+	}
+}
+
+void FVoxelMarchChunkIndex::NoteBlockCellResident(const FIntVector& Coord, int32 Slot)
+{
+	if (BlockResidentCount.Num() == 0)
+	{
+		return;   // before the first attach; nothing to describe yet
+	}
+	const uint32 Block = BlockOf(Coord, Slot);
+	uint8& Count = BlockResidentCount[int32(Block)];
+	// SATURATE RATHER THAN WRAP, and say so out loud. A count that wrapped past
+	// 64 would read as 0, clear Occupied over a block full of resident chunks,
+	// and skip real ground -- the exact defect this whole change is built to
+	// never produce. The callers are both transition-guarded so this cannot
+	// fire; the check costs one compare against a value already in a register
+	// and turns a latent hole into a bounded over-estimate.
+	if (Count < uint8(kChunksPerBlock))
+	{
+		++Count;
+	}
+	RefreshBlockBits(Block);
+}
+
+void FVoxelMarchChunkIndex::NoteBlockCellAbsent(const FIntVector& Coord, int32 Slot)
+{
+	if (BlockResidentCount.Num() == 0)
+	{
+		return;
+	}
+	const uint32 Block = BlockOf(Coord, Slot);
+	uint8& Count = BlockResidentCount[int32(Block)];
+	// FLOOR AT ZERO, same argument mirrored: an underflow reads as 255, holds
+	// Occupied set forever (slow, not wrong) but also holds AnyAbsent CLEAR
+	// forever, which silently stops the ladder being told about absent ground.
+	// That one IS a hole, so the guard is not symmetric politeness.
+	if (Count > 0u)
+	{
+		--Count;
+	}
+	RefreshBlockBits(Block);
 }
 
 void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
@@ -874,6 +1258,13 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 			// bury the ring signal. Disarmed this is the bare 0 it always was,
 			// so a control run's index stream is byte-identical.
 			const bool bAnnotateThis = bAnnotateAbsent && RemSlot != int32(kCoverGridSlot);
+			// The sky licence. `Existing` is resident here so this is a no-op by
+			// the resident test -- the decrement for this cell was taken when it
+			// BECAME resident, in the Added loop below. Kept for the same reason
+			// the seed site keeps it: the invariant is "every overwrite of a
+			// cell consults the licence first", and an exception is how the next
+			// writer added to this function forgets.
+			ClearBlockCellSkyIfMarked(Existing, RemCoord, RemSlot);
 			Cells[int32(Cell)] =
 				bAnnotateThis ? MakeAbsentEntry(kAbsentReasonEvicted, RemCoord) : 0u;
 			if (bAnnotateThis)
@@ -884,6 +1275,13 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 			{
 				DeltaPendingCells.Add(Cell);
 			}
+			// THE COARSE LEVEL, INSIDE THE SAME GUARD THE ENTRY COUNTERS ARE
+			// INSIDE. This branch is the one place a cell stops being resident,
+			// and it is already slot-equality guarded against the double-count
+			// that once drifted NumEntries permanently. The block count is the
+			// same kind of quantity and gets the same protection by sitting
+			// here rather than beside the emit above.
+			NoteBlockCellAbsent(RemCoord, RemSlot);
 			--NumEntries;
 			--PerSlotEntries[RemSlot];
 			// Only drop the ownership record if it still names THIS chunk; a
@@ -934,7 +1332,33 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 		{
 			++NumEntries;
 			++PerSlotEntries[AddSlot];
+			// THE COARSE LEVEL, ON THE INDEX'S OWN TRANSITION TEST AND NOT ON A
+			// SECOND ONE. A re-add to a cell that is already resident (a new
+			// slot for the same coord, or an alias) must not increment: the
+			// count is RESIDENT CELLS, and counting the same cell twice would
+			// leave Occupied set after the cell was finally cleared -- ground
+			// claimed to exist that does not, which costs only time -- and
+			// leave AnyAbsent clear over a block with absent cells in it, which
+			// drops a bCrossedAbsentChunk and is a hole. Reading the index's
+			// own guard rather than adding one is what keeps the two counts
+			// from ever disagreeing about what a transition is.
+			NoteBlockCellResident(AddCoord, AddSlot);
 		}
+		// THE SKY LICENCE, AND THIS IS THE SITE THAT MATTERS MOST.
+		//
+		// A cell the streamer marked as open sky can be admitted later -- the
+		// anchor moves, the memo re-derives against a tile that has since become
+		// resident, and the admitted top rises over ground the analytic bound
+		// had covered. That is the one transition where a stale licence would
+		// let the marcher skip a block containing a chunk the pool now HOLDS.
+		//
+		// OUTSIDE the transition test above deliberately: that test guards a
+		// RESIDENCY count, and a re-add to an already-resident cell must not
+		// touch it. The sky count is a different question -- "does this cell
+		// still say sky" -- and the answer must be reconciled on every write,
+		// re-add included, or a cell that was marked between two adds keeps its
+		// contribution forever.
+		ClearBlockCellSkyIfMarked(Cells[int32(Cell)], AddCoord, AddSlot);
 		Cells[int32(Cell)] = kResidentBit | kAnySolidBit | (E.ChunkSlot & kSlotMask);
 		if (bTrackDelta)
 		{
@@ -1029,6 +1453,9 @@ void FVoxelMarchChunkIndex::NoteChunkAdmitted(const FIntVector& Coord, int32 Lev
 		// not re-dirty the cell or the delta stream doubles for free.
 		return;
 	}
+	// The sky licence: this cell is about to say "pending", not "sky". A chunk
+	// on its way IN is the last thing a skip may advance through.
+	ClearBlockCellSkyIfMarked(Existing, Coord, Slot);
 	Cells[int32(Cell)] = Value;
 	if (CVarVoxelMarchIndexDeltaUpload.GetValueOnGameThread() != 0)
 	{
@@ -1066,12 +1493,150 @@ void FVoxelMarchChunkIndex::NoteChunkNoLongerAdmitted(const FIntVector& Coord, i
 	{
 		return;
 	}
+	// The sky licence. Existing is a PENDING annotation on this path (the guard
+	// above proved it), so this is a no-op by the reason test -- the decrement
+	// was taken when the pending mark overwrote the sky one. Present for the
+	// invariant, not for an effect.
+	ClearBlockCellSkyIfMarked(Existing, Coord, Slot);
 	Cells[int32(Cell)] = 0u;
 	if (CVarVoxelMarchIndexDeltaUpload.GetValueOnGameThread() != 0)
 	{
 		DeltaPendingCells.Add(Cell);
 	}
 	bAbsentMarksPending = true;
+}
+
+// ---------------------------------------------------------------------------
+// THE OPEN-SKY WRITER (voxel.Stream.SkyMark)
+// ---------------------------------------------------------------------------
+//
+// ITS OWN ARMING PREDICATE, and the difference from AreAbsentMarksArmed() is
+// the whole reason this feature exists rather than being a fourth reason code
+// on the old writer.
+//
+// AreAbsentMarksArmed() requires voxel.March.HoleStats >= 2. That is correct
+// for the pending/evicted annotations -- they are a diagnostic, and a control
+// leg's index stream must stay byte-identical. But it is exactly what made the
+// absent-reason bits useless to the marcher: IN EVERY PERF RUN, EVERY ABSENT
+// CELL READS NONE. A fast path cannot be built on a fact that disappears
+// whenever the clock is running. So this writer is armed by its own streaming
+// switch and is indifferent to HoleStats.
+//
+// IT KEEPS ONE GATE, AND THAT ONE IS CORRECTNESS. With
+// voxel.March.IndexGpuResident on, the Phase 2 publish kernel writes literal 0
+// into cells on the GPU while the shadow would hold a mark -- a guaranteed
+// delta-verify FAIL, the same collision the older annotations stand down for.
+// Standing down is COUNTED (the caller's refusedOther bucket, and the perf
+// line names this gate by name), because a disarmed writer must read as
+// disarmed and never as "no sky anywhere".
+bool FVoxelMarchChunkIndex::IsOpenSkyWriterArmed() const
+{
+	// THE SAME cvar OBJECT AreAbsentMarksArmed() reads, not a
+	// FindConsoleVariable("voxel.March.IndexGpuResident") by name. A string
+	// lookup that misses returns null and the gate silently opens -- which
+	// would let the writer run in exactly the mode whose publish kernel clears
+	// these cells to 0, and the failure would surface as a delta-verify hash
+	// mismatch a long way from here.
+	if (CVarVoxelMarchIndexGpuResident.GetValueOnGameThread() != 0)
+	{
+		return false;
+	}
+	return Cells.Num() > 0;
+}
+
+// A cell the sky trim proved is above the terrain surface and declined to
+// admit. Modelled line for line on NoteChunkAdmitted above -- same slot
+// resolution, same resident refusal, same idempotence guard, same
+// DeltaPendingCells / bAbsentMarksPending bookkeeping -- so the two writers
+// cannot drift into different notions of what a cell write costs.
+//
+// THE ORDERING THAT KEEPS A MARK FROM OUTLIVING ITS JUSTIFICATION, stated
+// explicitly because getting it wrong is a hole and holes are what the owner
+// reports on sight:
+//
+//  * A MARK NEVER LANDS ON A CELL SOMETHING ELSE OWNS. kResidentBit set means
+//    the pool holds a chunk here -- either this coord or a torus alias 128
+//    cells away -- and the write is refused outright. A pending or evicted
+//    annotation is also refused: pending means a chunk is on its way into this
+//    cell and the mark would be overwritten within the flush anyway, while
+//    evicted is history that belongs to a chunk, not to the sky.
+//
+//  * EVERY STREAMING TRANSITION DESTROYS A MARK, at the transition, not after
+//    it. Admission writes kResidentBit | slot through ApplyDelta's Added loop;
+//    NoteChunkAdmitted writes the PENDING annotation; eviction writes EVICTED
+//    or a bare 0. All three overwrite the whole dword, so the instant streaming
+//    decides anything else about this cell the sky claim is gone. There is no
+//    ordering in which a mark survives the decision that justified it, because
+//    the mark is not a separate bit that must be cleared -- IT IS THE REASON
+//    FIELD ITSELF, and any other reason evicts it by writing.
+//
+//  * AND THE RE-ADMISSION EDGE ERRS UNMARKED. If a marked cell is admitted, the
+//    admission wins and the cell is resident. If the admission is later
+//    cancelled, NoteChunkNoLongerAdmitted clears to 0 = NONE = NOT SKY, and the
+//    mark is only restored when the streaming pass RE-DERIVES the proof from
+//    scratch. Unmarked costs time; wrongly marked deletes terrain, so both
+//    edges resolve to the expensive side rather than the invisible one.
+//
+// THE TAG IS WHAT MAKES THE ALIAS CASE SAFE IN THE OTHER DIRECTION. A cell can
+// hold a valid open-sky mark stamped for a coord 128 cells away; the marcher's
+// read compares AbsentTagOf(wanted) and treats a mismatch as NOT SKY. So the
+// worst an alias can do is cost a walk, which is the direction every doubt in
+// this file resolves to.
+FVoxelMarchChunkIndex::EOpenSkyMark FVoxelMarchChunkIndex::NoteChunkOpenSky(const FIntVector& Coord,
+                                                                            int32 Level)
+{
+	check(IsInGameThread());
+	if (!IsOpenSkyWriterArmed())
+	{
+		return EOpenSkyMark::RefusedOther;
+	}
+	const int32 Slot = GridSlotForLevel(Level);
+	if (Slot < 0 || Slot == int32(kCoverGridSlot))
+	{
+		return EOpenSkyMark::RefusedOther; // rings only -- see the header
+	}
+	const uint32 Cell = CellOf(Coord, Slot);
+	const uint32 Existing = Cells[int32(Cell)];
+	if ((Existing & kResidentBit) != 0u)
+	{
+		// The pool holds a chunk in this cell. Never paint over it: at best
+		// this coord's own chunk arrived between the trim and here, at worst it
+		// is a torus alias and marking would delete a DIFFERENT column's ground.
+		return EOpenSkyMark::RefusedResident;
+	}
+	const uint32 Value = MakeAbsentEntry(kAbsentReasonOpenSky, Coord);
+	if (Existing == Value)
+	{
+		// Already marked, for this exact coord. RecomputeDesiredSet re-scans
+		// every un-admitted candidate on anchor movement, so without this the
+		// delta stream would carry the whole marked band again on every pass --
+		// the same trap NoteChunkAdmitted guards, and a much larger one here
+		// because a column offers a whole band rather than one cell.
+		return EOpenSkyMark::RefusedOther;
+	}
+	if ((Existing & kAbsentReasonMask) != kAbsentReasonNone)
+	{
+		// A pending or evicted annotation, or an alias's sky mark. All three
+		// belong to a chunk transition this function did not cause and must not
+		// erase -- pending in particular is a chunk on its way IN, and
+		// converting it to "sky" would tell the marcher to skip ground the
+		// streamer is actively fetching.
+		return EOpenSkyMark::RefusedOther;
+	}
+	Cells[int32(Cell)] = Value;
+	// AFTER the write, and the asymmetry against ClearBlockCellSkyIfMarked's
+	// before-the-write rule is the point: a licence is GRANTED only once the
+	// cell actually says so, and WITHDRAWN before the cell stops saying so. Both
+	// orderings put the window on the conservative side -- there is no instant
+	// at which a block claims all-sky over a cell that does not carry the mark.
+	NoteBlockCellSky(Coord, Slot);
+	if (CVarVoxelMarchIndexDeltaUpload.GetValueOnGameThread() != 0)
+	{
+		DeltaPendingCells.Add(Cell);
+	}
+	bAbsentMarksPending = true;
+	++OpenSkyMarks;
+	return EOpenSkyMark::Written;
 }
 
 void FVoxelMarchChunkIndex::FlushAbsentMarks()
@@ -1100,6 +1665,43 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 	}
 	bDirty = false;
 	++Uploads;
+
+	// ---- THE COARSE OCCUPANCY LEVEL, STAGED ON EVERY FLUSH -----------------
+	//
+	// HERE, BEFORE THE PATH LADDER, AND UNCONDITIONALLY. Every route out of
+	// this function publishes SOMETHING -- a full snapshot, a pair scatter, or
+	// a Phase 2 publish command -- and every one of them can change which cells
+	// are resident, so every one of them owes the marcher a matching coarse
+	// level. Staging above the ladder is what makes that true without a second
+	// list of which branches need it; the ladder has already grown three leaves
+	// and would grow a fourth without this one being updated.
+	//
+	// A WHOLE 64 KiB SNAPSHOT AND NOT A DELTA. The delta machinery below exists
+	// because the index is 64 MiB and a flush moves ~9,500 cells; the bitfields
+	// are 32 KiB each, so the whole thing is smaller than one flush's pair list
+	// and there is nothing to save. It also buys the property that matters: a
+	// complete snapshot CANNOT be missing a block that the index staging
+	// carries, which is the failure a block-level delta would have to be proved
+	// against.
+	//
+	// SNAPSHOTTED FROM THE SHADOW ON THIS THREAD, for the reason `Staged =
+	// Cells` is: by the time the render thread reads this, the game thread may
+	// be part-way through the next flush. Under the same lock the pair list
+	// uses, because these arrays are assigned (and so may reallocate) rather
+	// than overwritten in place.
+	//
+	// REFRESHED, NOT CONSUMED. The render side never clears this; it compares
+	// generations. That is the whole fix for the one-shot staging that spent a
+	// static leg on the all-ones fallback -- see the mirror's declaration.
+	{
+		FScopeLock Lock(&DeltaStageLock);
+		BlockMirrorOccupied = BlockOccupiedWords;
+		BlockMirrorAnyAbsent = BlockAnyAbsentWords;
+		BlockMirrorAllSky = BlockAllSkyWords;
+		// BUMPED WITH THE COPY, UNDER THE SAME LOCK, so a render thread that
+		// sees this generation is guaranteed to see the bytes that go with it.
+		++BlockShadowGeneration;
+	}
 
 	const bool bDeltaSwitch = CVarVoxelMarchIndexDeltaUpload.GetValueOnGameThread() != 0;
 	const bool bVerifyWanted =
@@ -1490,6 +2092,13 @@ void FVoxelMarchChunkIndex::EnqueueGpuPublish(bool bVerifyWanted, uint64 Expecte
 		[this, Entries = MoveTemp(Entries), RemoveCount, AddCount, bVerifyWanted,
 		 ExpectedHash](FRHICommandListImmediate& RHICmdList) mutable
 	{
+		// THE INDEX'S ONLY PER-FRAME RENDER-THREAD SITE. Its h= is EXPECTED to
+		// read 0 on a stock leg (voxel.March.IndexGpuResident defaults off, the
+		// leg's own line reads publishes=0) and a zero here is NOT evidence the
+		// chunk index is free -- its real per-frame cost is a game-thread
+		// QueueBufferUpload this bucket cannot see. Stated at the site as well
+		// as in the log so neither reader has to find the other.
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailChunkIndex);
 		// Retire any completed verify samples first, so a slot can free up for
 		// the one this command may arm. `this` is a global; no lifetime issue.
 		PollDeltaVerify();
@@ -1567,6 +2176,9 @@ void FVoxelMarchChunkIndex::EnqueueGpuPublish(bool bVerifyWanted, uint64 Expecte
 	});
 }
 
+// THE INDEX HALF, UNCHANGED. Split out of Register only so the coarse level can
+// be consumed in the SAME call without this function growing a second concern;
+// every branch, flag and comment below is the pre-block code verbatim.
 FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
 {
 	// Retire a completed verify readback (if any) before possibly arming a new
@@ -1700,6 +2312,224 @@ FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
 		return nullptr;
 	}
 	return GraphBuilder.RegisterExternalBuffer(Pooled, TEXT("VoxelMarch.ChunkIndex"));
+}
+
+// ---------------------------------------------------------------------------
+// THE INDEX AND ITS COARSE LEVEL, HANDED OUT TOGETHER
+// ---------------------------------------------------------------------------
+//
+// COHERENCE IS STRUCTURAL HERE AND NOT ARGUED. The three buffers are staged by
+// one MarkDirtyAndUpload from one snapshot of one shadow and consumed by this
+// one call into one FRDGBuilder, so every pass the caller adds afterwards sees
+// all three at the same generation. There is no ordering rule to get right
+// because there is no window in which one has landed and another has not:
+//
+//   * a staged block snapshot is uploaded into THIS graph, and RDG orders the
+//     upload ahead of every later read of the same resource in the same graph;
+//   * an unstaged frame registers the persistent copies, which by then hold the
+//     state the last consumed staging put there -- the same state the index's
+//     own Pooled holds, for the same reason;
+//   * the Phase 2 publish (voxel.March.IndexGpuResident, DEFAULT 0) writes the
+//     index from its own render command, enqueued by the same flush that staged
+//     these words. Render commands run in order and a march only ever happens
+//     inside a graph that called this function first, so the coarse level is
+//     never BEHIND the index at the moment a ray reads it. If it were ever
+//     ahead, that is a block claiming Occupied over ground not yet published --
+//     descend into nothing, slower, no hole. Over-covering costs time;
+//     under-covering is a hole, and the asymmetry is why this is written down.
+FVoxelMarchChunkIndex::FBuffers
+FVoxelMarchChunkIndex::RegisterWithBlocks(FRDGBuilder& GraphBuilder)
+{
+	FBuffers Out;
+	Out.Index = Register(GraphBuilder);
+	if (Out.Index == nullptr)
+	{
+		// NEVER UPLOADED. All three stay null together so a caller cannot bind
+		// a coarse level for an index that does not exist -- the contract the
+		// index half already had, extended rather than duplicated.
+		return Out;
+	}
+
+	++BlockBindCalls;
+
+	// ---- IS WHAT THE GPU HOLDS THE GENERATION WE WANT, AND DOES IT STILL
+	//      EXIST? Two questions, and BOTH have to be asked.
+	//
+	// The generation half is the ordinary one: a flush changed the shadow, so
+	// re-upload. The IsValid() half is the one that was missing and is the whole
+	// reason this leg was contaminated. QueueBufferExtraction writes the pooled
+	// pointer at graph EXECUTE, not at queue time, so an upload queued into a
+	// graph that is then abandoned -- and VoxelMarchBindPool's march site
+	// declines with `continue` AFTER this function has run -- leaves the pointer
+	// null. Under the old one-shot staging there was then nothing left to upload
+	// FROM until the next flush; on a static leg that is seconds of all-ones
+	// fallback. Testing the pointer as well as the generation makes any such
+	// failure self-heal on the very next bind.
+	//
+	// PooledBlockGeneration is therefore set OPTIMISTICALLY at queue time, which
+	// is safe only because it is never read alone.
+	bool bUploaded = false;
+	{
+		FScopeLock Lock(&DeltaStageLock);
+		const bool bHaveMirror = BlockShadowGeneration != 0 &&
+		                         BlockMirrorOccupied.Num() == int32(kBlockWords) &&
+		                         BlockMirrorAnyAbsent.Num() == int32(kBlockWords) &&
+		                         BlockMirrorAllSky.Num() == int32(kBlockWords);
+		const bool bGpuCopyUsable = PooledBlockOccupied.IsValid() &&
+		                            PooledBlockAnyAbsent.IsValid() &&
+		                            PooledBlockAllSky.IsValid() &&
+		                            PooledBlockGeneration == BlockShadowGeneration;
+		if (bHaveMirror && !bGpuCopyUsable)
+		{
+			Out.BlockOccupied = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), kBlockWords),
+				TEXT("VoxelMarch.BlockOccupied"));
+			GraphBuilder.QueueBufferUpload(Out.BlockOccupied, BlockMirrorOccupied.GetData(),
+			                               BlockMirrorOccupied.Num() * sizeof(uint32),
+			                               ERDGInitialDataFlags::None);
+			GraphBuilder.QueueBufferExtraction(Out.BlockOccupied, &PooledBlockOccupied);
+
+			Out.BlockAnyAbsent = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), kBlockWords),
+				TEXT("VoxelMarch.BlockAnyAbsent"));
+			GraphBuilder.QueueBufferUpload(Out.BlockAnyAbsent, BlockMirrorAnyAbsent.GetData(),
+			                               BlockMirrorAnyAbsent.Num() * sizeof(uint32),
+			                               ERDGInitialDataFlags::None);
+			GraphBuilder.QueueBufferExtraction(Out.BlockAnyAbsent, &PooledBlockAnyAbsent);
+
+			// ALL THREE MOVE TOGETHER, ON ONE GENERATION. Uploading the sky
+			// bitfield on a different schedule from the residency pair would let
+			// the marcher hold a sky licence from one flush against a residency
+			// picture from another -- and the two disagreeing is exactly the
+			// state in which a block reads all-sky while a chunk has landed in
+			// it. One generation stamp, one condition, three uploads.
+			Out.BlockAllSky = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), kBlockWords),
+				TEXT("VoxelMarch.BlockAllSky"));
+			GraphBuilder.QueueBufferUpload(Out.BlockAllSky, BlockMirrorAllSky.GetData(),
+			                               BlockMirrorAllSky.Num() * sizeof(uint32),
+			                               ERDGInitialDataFlags::None);
+			GraphBuilder.QueueBufferExtraction(Out.BlockAllSky, &PooledBlockAllSky);
+			PooledBlockGeneration = BlockShadowGeneration;
+
+			// ERDGInitialDataFlags::None copies the data now, exactly as the
+			// index's full path does, so releasing the lock below is safe.
+			bUploaded = true;
+		}
+	}
+	if (bUploaded)
+	{
+		return Out;
+	}
+
+	if (PooledBlockOccupied.IsValid() && PooledBlockAnyAbsent.IsValid() &&
+	    PooledBlockAllSky.IsValid())
+	{
+		Out.BlockOccupied =
+			GraphBuilder.RegisterExternalBuffer(PooledBlockOccupied, TEXT("VoxelMarch.BlockOccupied"));
+		Out.BlockAnyAbsent =
+			GraphBuilder.RegisterExternalBuffer(PooledBlockAnyAbsent, TEXT("VoxelMarch.BlockAnyAbsent"));
+		Out.BlockAllSky =
+			GraphBuilder.RegisterExternalBuffer(PooledBlockAllSky, TEXT("VoxelMarch.BlockAllSky"));
+		return Out;
+	}
+
+	// ---- THE ALL-ONES FALLBACK ------------------------------------------
+	//
+	// An index buffer exists and a coarse level does not. Structurally that is
+	// the frames between an attach's first index upload and its first block
+	// consume, and nothing else -- but "structurally unreachable" is a claim
+	// this file has been wrong about before, and the failure mode here is not
+	// survivable: an UNBOUND Buffer<uint> reads as ZEROS, zeros mean "no chunk
+	// in this block is resident", and the marcher would skip the entire world
+	// in one jump. Every ray a hole, no error anywhere.
+	//
+	// SO THE FALLBACK IS THE OPPOSITE BIT PATTERN, NOT A NULL. All ones means
+	// "every block might hold something": the walk descends into every block and
+	// behaves exactly as the control arm does. The arm goes INERT rather than
+	// wrong, which is the only acceptable direction, and BlockFallbackBinds is
+	// what stops that inertness being silent -- see its declaration.
+	// ---- AND IT IS A DEFECT NOW, NOT A TRANSIENT --------------------------
+	//
+	// The legitimate window for this path is the handful of binds between the
+	// index's first upload and that graph's extraction landing. Past the grace
+	// count it means the coarse level's lifetime is broken again, and the arm is
+	// silently behaving as the control -- so it says so, once, naming the cause
+	// rather than leaving the next person to re-derive it from a bare number.
+	//
+	// A LOG AND NOT A check(): the failure is INERT, not corrupting. Every ray
+	// still renders correctly against an all-ones grid -- that is the entire
+	// point of choosing all-ones -- so crashing a leg over it would destroy
+	// exactly the run that could diagnose it.
+	const uint64 Fallbacks = ++BlockFallbackBinds;
+	if (Fallbacks > kBlockFallbackGraceBinds &&
+	    !bBlockFallbackComplained.exchange(true))
+	{
+		UE_LOG(LogVoxelMarchIndex, Warning,
+		       TEXT("Voxel march coarse occupancy level: %llu binds have fallen back to the "
+		            "ALL-ONES grid (of %llu binds), past the %llu-bind startup grace. The "
+		            "block bitfields are not surviving from one bind to the next, so the "
+		            "marcher is descending into every block and CANNOT SKIP ANYTHING: "
+		            "voxel.March.BlockSkip 1 is behaving as the control, and any frame time "
+		            "measured on this leg is not the arm's.\n"
+		            "THE CAUSE IS A LIFETIME, NOT THE TRAVERSAL. The mirror is uploaded only "
+		            "when the pooled buffer is missing or its generation is stale, and "
+		            "QueueBufferExtraction populates that pointer at graph EXECUTE -- so this "
+		            "fires when the extraction is not landing (a graph built and abandoned, a "
+		            "pass culled, or a bind on a graph that never executes). Check "
+		            "FVoxelMarchChunkIndex::RegisterWithBlocks and the four VoxelMarchBindPool "
+		            "call sites before touching VoxelBrickTraverse.ush -- the traversal half "
+		            "measured clean at 11.2e9 blocks consulted and 24.74%% skipped."),
+		       (unsigned long long)Fallbacks,
+		       (unsigned long long)BlockBindCalls.load(std::memory_order_relaxed),
+		       (unsigned long long)kBlockFallbackGraceBinds);
+	}
+	static const TArray<uint32> AllOnes = []
+	{
+		TArray<uint32> A;
+		A.Init(0xFFFFFFFFu, int32(kBlockWords));
+		return A;
+	}();
+	Out.BlockOccupied = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), kBlockWords),
+		TEXT("VoxelMarch.BlockOccupied.Fallback"));
+	GraphBuilder.QueueBufferUpload(Out.BlockOccupied, AllOnes.GetData(),
+	                               AllOnes.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
+	Out.BlockAnyAbsent = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), kBlockWords),
+		TEXT("VoxelMarch.BlockAnyAbsent.Fallback"));
+	GraphBuilder.QueueBufferUpload(Out.BlockAnyAbsent, AllOnes.GetData(),
+	                               AllOnes.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
+	// THE SKY BITFIELD'''S FALLBACK IS ALL ZEROS, NOT ALL ONES, AND THE
+	// ASYMMETRY IS THE SAFETY ARGUMENT RATHER THAN AN OVERSIGHT.
+	//
+	// For the two above, zeros mean "no chunk in this block is resident" and
+	// would skip the world -- hence the inversion. For this one, zeros mean "no
+	// block is provably sky", so the marcher licenses no skip and descends
+	// exactly as the control does. All-ones here would claim the ENTIRE WORLD is
+	// open sky over a grid that has never been written, which is every ray a
+	// hole with no counter moving. The conservative pattern is whichever one
+	// makes the arm inert, and for this bit that is zero.
+	//
+	// STILL ALLOCATED AND STILL UPLOADED rather than left null: an unbound
+	// Buffer<uint> also reads as zeros, but binding nothing is how a shader
+	// parameter validation failure turns into a startup crash. Explicit zeros
+	// cost 32 KiB on a path that only runs during the startup grace.
+	static const TArray<uint32> AllZeros = []
+	{
+		TArray<uint32> A;
+		A.Init(0u, int32(kBlockWords));
+		return A;
+	}();
+	Out.BlockAllSky = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), kBlockWords),
+		TEXT("VoxelMarch.BlockAllSky.Fallback"));
+	GraphBuilder.QueueBufferUpload(Out.BlockAllSky, AllZeros.GetData(),
+	                               AllZeros.Num() * sizeof(uint32), ERDGInitialDataFlags::None);
+	// NOT EXTRACTED. A fallback must never become the persistent copy: the next
+	// real staging has to win, and a pooled all-ones grid would make the arm
+	// permanently inert with nothing to say so.
+	return Out;
 }
 
 // The render-thread half of voxel.March.IndexDeltaVerify, now a RING -- the

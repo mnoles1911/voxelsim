@@ -585,6 +585,85 @@
 // a dimension exists, flipping the 1 below to 0 and recompiling the shaders IS
 // the control leg -- and both legs must be compiled separately, never one binary
 // asked to behave two ways.
+// ---------------------------------------------------------------------------
+// VOXEL_MARCH_SKY_LADDER (voxel.March.SkyLadder, 2026-08-25) -- the retry
+// ladder's gate, narrowed by PROOF instead of by a neighbour probe
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM, AND IT IS THIS FILE'S OWN WORDS. The live gate is
+// bCrossedAbsentChunk -- "did this ray cross ANYTHING not resident" -- and the
+// streamed set is a thin shell around the surface. Ring segment 0 starts AT THE
+// CAMERA and the camera is in air, so the first absent chunk on essentially
+// every ray is that air, the gate opens at every rung, and A SKY RAY WALKS THE
+// CHUNK INDEX AT UP TO SEVEN LEVELS INSTEAD OF ONE. The measured population,
+// recorded above and quoted from Saved/capture-zcut-alt120.log, is 25.27% of
+// rays ON A SETTLED STATIONARY WORLD. That is a multiplier on exactly the
+// empty-space cost the marcher is 54% of the GPU frame for.
+//
+// VOXEL_MARCH_FALLTHROUGH_SHELL WAS THE AUTHORED FIX AND IT IS NOT COMPILED.
+// It has no permutation dimension and no SetDefine anywhere in Source/ -- the
+// only two matches are prose comments -- so it defaults to 0 here and the #else
+// gate below is what actually runs. Its answer, VoxelMarchAbsentTouchesShell,
+// also costs UP TO SIX EXTRA SCATTERED INDEX LOADS per non-resident chunk, a
+// trade this file flags as unproven.
+//
+// THIS ARM ASKS THE SAME QUESTION FOR FREE. voxel.Stream.SkyMark writes, into
+// the non-resident cell dword, that the coverage rule PROVED this chunk is
+// above the terrain surface and declined to admit it. The lookup already loads
+// that dword for the residency test, so the answer costs a mask and a compare
+// and NOT ONE ADDITIONAL LOAD. Air nobody holds is not a hole and buys no
+// second walk; every other absence still does.
+//
+// GETTING IT BACKWARDS PLUGS CAVE MOUTHS AND DOORWAYS WITH COARSE ROCK. A
+// sky-marked absence licenses NOT retrying. Any OTHER absence -- pending,
+// evicted, never-admitted, an alias's tag, a stale record -- must still retry,
+// because those are the gaps the ladder exists to fill. The predicate is
+// therefore written as "absent AND NOT PROVEN SKY", never as "not proven
+// non-sky": an unmarked cell must fall on the retry side, and it does, because
+// VoxelMarchIsOpenSky returns false for every bit pattern this feature did not
+// write.
+//
+// bCrossedAbsentChunk IS UNTOUCHED, at every one of its five write sites. It
+// still fires on air exactly as it does today, so `uncovered`, the hole metric
+// and the shell counters all read what they read on the control arm. This arm
+// adds a SECOND flag and changes only which flag the gate consults.
+//
+// A PERMUTATION AND NOT A UNIFORM, unlike voxel.March.BlockSkySkip: this one
+// adds a field to the chunk cache and a fold at five sites in the walk, i.e.
+// register pressure and ALU in the inner loop on every arm that carries it. The
+// control must not carry it.
+//
+// AND IT CHANGES WHAT THE OWNER SEES, so it ships as a measurable arm and a
+// screenshot decides. WHAT WOULD REFUTE IT: `uncShell` RISING against the
+// control, which would mean the sky mark is being read over REAL gaps and this
+// gate is dropping fills that are visible. `uncovered` collapsing while
+// `uncShell` holds is the intended reading. FallthroughTaken /
+// FallthroughConsidered is the proof of traffic and MUST FALL; if it does not
+// move, the switch is inert and no timing on that leg means anything.
+//
+// AND IT ALREADY REFUTED ITSELF ONCE, WHICH IS WHY THE GATE BELOW IS NOT THE
+// ONE THIS BLOCK ORIGINALLY DESCRIBED. Measured 2026-08-25, pinned pose,
+// deterministic harness (control-vs-control 0.048%): armed with band 32, 96.33%
+// of pixels changed -- a near mountain deleted and the valley behind it drawn
+// instead. Two things were wrong and both are fixed:
+//
+//   1. THE MARK WAS USED BEYOND WHAT IT PROVED. A level-L mark declined a retry
+//      at level L+1, whose chunk covers four level-L footprints and whose voxels
+//      are a downsample. MarkOpenSkyColumn now takes its bound as a MAX over a
+//      dilated set -- 3x3 in XY at this level plus every level the ladder can
+//      retry into -- so nothing is marked unless every level the consumer might
+//      read instead is also proven air.
+//   2. THE GATE READ A TRUNCATED WALK AS EVIDENCE. See the gate itself for the
+//      512-chunk cap and the step budget, and why the control arm never noticed.
+//
+// FOR AN ARM THAT CHANGES WHAT IS DRAWN, THE IMAGE COMES FIRST AND THE TIMING
+// SECOND. The band was swept for timing, the knee was made the default and the
+// binary was rebuilt before anyone looked at a frame. The timing was clean and
+// correct the whole time the arm was destroying the image.
+#ifndef VOXEL_MARCH_SKY_LADDER
+#define VOXEL_MARCH_SKY_LADDER 0
+#endif
+
 #ifndef VOXEL_MARCH_FALLTHROUGH_SHELL
 #define VOXEL_MARCH_FALLTHROUGH_SHELL 0
 #endif
@@ -621,6 +700,23 @@
 // cannot change the picture).
 #ifndef VOXEL_MARCH_HOLE_STATS
 #define VOXEL_MARCH_HOLE_STATS 0
+#endif
+
+// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip). One level above the chunk
+// index and EXACTLY ONE -- see the cvar in VoxelMarchRenderer.cpp for the
+// measurements that settled both halves of that (a second level moved miss-cost
+// 56.5 -> 34.6 steps and hit-cost 48.6 -> 68.9; Levoy 1990 says why).
+//
+// A PERMUTATION, NOT A UNIFORM, and deliberately the opposite choice to
+// MarchZCutEnable below. That arm adds a handful of ALU per SEGMENT and no
+// memory traffic, so an off-arm carrying its code carries nothing. THIS arm adds
+// TWO BUFFER LOADS PER BLOCK, and a control that pays for loads it never reads
+// flatters whichever arm is under test -- the same reason
+// VOXEL_MARCH_SKIP_LEVELS' own note gives, and what VoxelMarchSpike.usf paid
+// three legs to learn. 0 must be BYTE-IDENTICAL to the pre-block kernel, and it
+// is only byte-identical if the code is not in the binary.
+#ifndef VOXEL_MARCH_BLOCK_SKIP
+#define VOXEL_MARCH_BLOCK_SKIP 0
 #endif
 
 // LEVEL 2 OF THE HOLE METRIC (voxel.March.HoleStats 2): every uncovered ray
@@ -675,6 +771,15 @@
 // binary -- the precise way VoxelMarchSpike.usf's note says an A/B gets
 // flattered. Every site guarded by this compiles only where something reads it.
 #define VOXEL_MARCH_TRACK_SHELL (VOXEL_MARCH_HOLE_STATS >= 2 || (VOXEL_MARCH_FALLTHROUGH > 0 && VOXEL_MARCH_FALLTHROUGH_SHELL))
+// VOXEL_MARCH_SKY_LADDER, folded with what it needs -- see its doctrine block
+// above VOXEL_MARCH_FALLTHROUGH_SHELL.
+//
+// PLACED HERE, BELOW VOXEL_MARCH_TRACK_ABSENT, and not beside its own #ifndef.
+// Object-like macros expand at USE, so the forward reference would in fact have
+// worked -- and that is exactly the kind of thing that works until someone adds
+// a #if that reads it earlier. Defined after its ingredients so the order on the
+// page is the order of dependency.
+#define VOXEL_MARCH_TRACK_SKY (VOXEL_MARCH_SKY_LADDER && VOXEL_MARCH_FALLTHROUGH > 0 && VOXEL_MARCH_TRACK_ABSENT)
 
 #define VOXEL_MARCH_HAS_OCCUPANCY 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY || VOXEL_MARCH_VERIFY_SOURCE)
 #define VOXEL_MARCH_HAS_BRICKPOOL 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_BRICKPOOL || VOXEL_MARCH_VERIFY_SOURCE)
@@ -973,6 +1078,18 @@ struct FVoxelMarchHit
 	// metric asks "did this ray cross ground we do not hold anywhere", and a
 	// ray whose absent crossing was in segment 2 of 6 must still count.
 	bool bCrossedAbsentChunk;
+#if VOXEL_MARCH_TRACK_SKY
+	// Did this walk cross an absence that is NOT proven open sky? The retry
+	// ladder's gate under VOXEL_MARCH_SKY_LADDER.
+	//
+	// A SECOND FLAG RATHER THAN A NARROWING OF THE FIRST, and that is the
+	// requirement rather than a preference: bCrossedAbsentChunk feeds
+	// `uncovered`, the hole metric and the shell counters, and every one of them
+	// must read on this arm exactly what it reads on the control or the two arms
+	// are not comparable. So the old flag is untouched at all five of its write
+	// sites and this one is folded beside it.
+	bool bCrossedNonSkyAbsent;
+#endif
 	// A HIT whose winning walk was COARSER than the segment that owns that
 	// ground (WalkL > SegL under fallthrough): the player is looking at a
 	// stand-in. Countable at the ring loop's return and nowhere else, because
@@ -1037,6 +1154,84 @@ struct FVoxelMarchHit
 	// real, measured zero rather than failing to compile.
 	uint FallthroughConsidered;
 	uint FallthroughTaken;
+	// ---- THE RESIDENT-Z BOUND'S ENGAGEMENT TRIO (voxel.March.ZCut) --------
+	//
+	// SAME DISCIPLINE AS THE PAIR ABOVE, AND FOR THE SAME REASON: this project
+	// has shipped eleven arms in one night that were armed and inert, so an arm
+	// that cannot prove it engaged is not measured. Summed over the ray's
+	// (segment, walk-level) pairs, folded onto whichever of the hit or the miss
+	// leaves VoxelMarchTraverseRings.
+	//
+	//   ZCutConsulted  pairs where the arm was ON and the level HAD a usable
+	//                  bound, i.e. decisions the arm was actually asked to
+	//                  make. THE DENOMINATOR. Zero while the cvar reads 1 is
+	//                  the arm being inert and nothing else.
+	//   ZCutSkipped    pairs whose interval came back EMPTY -- the walk never
+	//                  ran at all.
+	//   ZCutClipped    ray length, in whole world UU, removed from the
+	//                  intervals actually handed to the walk. A cut that
+	//                  NARROWS without emptying moves only this, which is why
+	//                  ZCutSkipped alone would under-report the arm on exactly
+	//                  the near-horizon rays it exists for.
+	//
+	// GUARDED BY VOXEL_MARCH_HOLE_STATS AND NOT BY MarchZCutEnable, because the
+	// enable is a UNIFORM: the fields must exist in the binary on the control
+	// arm too, where they read a real measured zero rather than failing to
+	// compile. Same argument the fallthrough pair carries against the depth.
+	uint ZCutConsulted;
+	uint ZCutSkipped;
+	uint ZCutClipped;
+	// ---- THE COARSE OCCUPANCY LEVEL'S TRIO (voxel.March.BlockSkip) --------
+	//
+	// SAME DISCIPLINE AS THE TWO GROUPS ABOVE. Accumulated by the chunk loop
+	// directly onto this struct (it is the walk's own H and starts zeroed), then
+	// summed across segments and rungs by VoxelMarchTraverseRings.
+	//
+	//   BlockConsulted     4^3 blocks the walk loaded a bit for. THE
+	//                      DENOMINATOR. Zero while the arm is compiled in is
+	//                      the arm being INERT and nothing else.
+	//   BlockSkipped       blocks that held no resident chunk AND whose exit
+	//                      jump beat the ordinary one-chunk advance -- skips
+	//                      actually TAKEN. A block can be consulted, read
+	//                      empty, and still not be skipped (the progress
+	//                      guard), and that case must stay visible rather than
+	//                      inflate the skip rate.
+	//   BlockCellsAvoided  chunk cells the jumps spanned, as ray length divided
+	//                      by the chunk size at this level. DELIBERATELY NOT
+	//                      64 x BlockSkipped, which would carry no information
+	//                      at all AND would reach ~8e9 in a frame and WRAP A
+	//                      uint32 SILENTLY -- a counter that reads small
+	//                      precisely when the arm worked hardest, which is the
+	//                      failure the Z bound's group refused a fourth word
+	//                      over. It is a LOWER bound on cells avoided: a
+	//                      diagonal DDA visits up to sqrt(3) times the axis
+	//                      count over the same span.
+	//
+	// GUARDED BY VOXEL_MARCH_HOLE_STATS AND NOT BY VOXEL_MARCH_BLOCK_SKIP, so
+	// the fields exist in the binary on the control arm too, where they read a
+	// real measured zero rather than failing to compile. Same argument the two
+	// groups above carry.
+	uint BlockConsulted;
+	uint BlockSkipped;
+	uint BlockCellsAvoided;
+	//   BlockSkyLicensed   consults whose all-sky bit was SET. Its denominator
+	//                      is BlockConsulted, already here, so the rate reads
+	//                      "how much of the space this ray crossed is PROVABLY
+	//                      empty" rather than "how many blocks happened to hold
+	//                      nothing resident" -- which is the difference between
+	//                      this arm and the one that ran 30% slower.
+	//   BlockSkyRunBlocks / BlockSkyRuns   A RUN is a maximal sequence of
+	//                      CONSECUTIVE sky-licensed consults along one walk. The
+	//                      mean (blocks/runs) is computed on the CPU because a
+	//                      mean cannot be summed across rays. THIS IS THE NUMBER
+	//                      THE ARM IS JUDGED ON: one licensed block is a 4-chunk
+	//                      advance off one load, so break-even is a run of 1.0
+	//                      and a mean near 1.0 against a high licensed rate says
+	//                      open sky is SCATTERED at 4^3 granularity -- which
+	//                      indicts the block size, not the mark.
+	uint BlockSkyLicensed;
+	uint BlockSkyRunBlocks;
+	uint BlockSkyRuns;
 #endif
 #endif
 	uint2 FineBrickMask;
@@ -1468,6 +1663,128 @@ uint MarchCoverIndexGrid;
 // for a reach the grid cannot address.
 float MarchCoverReachUU;
 
+// ---- THE RESIDENT-Z BOUND (voxel.March.ZCut) -------------------------------
+//
+// THE GAP THIS CLOSES. The ring walk is bounded HORIZONTALLY -- ring radii,
+// corrected from spheres to CYLINDERS on 2026-08-20, see the long note in
+// VoxelMarchTraverseRings -- and bounded VERTICALLY not at all. The streamed
+// set is a thin shell around the surface (about 4.4 chunks per column at level
+// 0), so a near-vertical ray steps through kilometres of air nothing holds, one
+// scattered load into a ~67 MB buffer per chunk. Measured: VoxelMarch.March
+// swings 1.108 -> 5.638 ms across a pitch sweep on ONE spawn, 5.1x, tracking
+// EMPTY SPACE CROSSED rather than geometry hit. MarchStepBudget cannot bound it
+// -- its only consumer is inside the BRICK loop and an empty ray never reaches
+// a brick.
+//
+// 1 = cut, 0 = do not. A UNIFORM AND NOT A PERMUTATION, which is a deliberate
+// departure from Rings / Fallthrough / HoleStats: those are permutations
+// because a runtime branch would leave the OTHER ARM'S LOADS in the binary and
+// re-base the control. This arm adds no load and no memory traffic -- a handful
+// of ALU per SEGMENT, at most seven per ray, against hundreds of chunk steps --
+// so there is no traffic for an off-arm to carry, and one build then serves
+// both arms of a pitch sweep.
+int MarchZCutEnable;
+// One int4 per INDEX GRID SLOT (8 of them -- kGridSlots, seven rings plus
+// cover). The size is spelled as a literal here and as [8] in the parameter
+// struct; the static_assert beside the fill in VoxelMarchBindPool is the one
+// authority that checks the two agree.
+//
+//   .x  min chunk Z at THIS SLOT'S OWN LATTICE, already padded outward
+//   .y  max chunk Z, already padded outward, INCLUSIVE
+//   .z  1 = usable; 0 = DO NOT CUT THIS SLOT
+//   .w  unused
+//
+// PADDED ON THE HOST, NOT HERE, so there is exactly one place the pad can be
+// forgotten. The pad is at least 1 chunk and that minimum is load-bearing: it
+// is what guarantees every chunk this cut removes is at least TWO chunks in Z
+// from anything resident, so none of them could have been face-adjacent to a
+// resident chunk and none of them could have set bCrossedShellAbsent. That is
+// the whole reason the retry ladder's meaning survives this change.
+//
+// .z == 0 FOR AN EMPTY SLOT, ON PURPOSE. VoxelMarchAbsentTouchesShell
+// short-circuits to TRUE for a slot holding nothing (see MarchIndexLevelPopulated
+// below), so cutting an empty slot would have to reproduce that short-circuit to
+// keep the flag's meaning. Refusing to cut it is the conservative answer and
+// costs an empty slot nothing it was not already paying.
+int4 MarchLevelChunkZ[8];
+
+#if VOXEL_MARCH_BLOCK_SKIP
+// ---- THE COARSE OCCUPANCY LEVEL'S TWO BITFIELDS ---------------------------
+//
+// One bit per 4x4x4 block of chunk cells, per index grid slot: 32x32x32 = 32,768
+// blocks a slot, 8 slots, 262,144 bits = 32 KiB each. Written by
+// FVoxelMarchChunkIndex at the index publish -- the single point at which "this
+// chunk is resident at this cell" becomes true -- and never by the worklist,
+// which does not write the march index at all.
+//
+//   MarchBlockOccupied   >= 1 chunk cell in this block is RESIDENT.
+//   MarchBlockAnyAbsent  >= 1 chunk cell in this block is NOT resident.
+//
+// TWO BITS BECAUSE THE FLAG NEEDS TWO ANSWERS, AND THAT IS CORRECTNESS RATHER
+// THAN FIDELITY. bCrossedAbsentChunk gates the fine->coarse ladder that keeps
+// black arcs out of LOD boundaries, and the walk below sets it for NON-RESIDENT
+// chunks and deliberately NOT for resident-empty ones -- a resident-empty chunk
+// is real air, and letting a coarser level stand in for it plugs cave mouths,
+// doorways and overhangs with rock. So a skip has to know WHICH KIND of
+// emptiness it just jumped over, and it READS that rather than deriving it from
+// !Occupied. (Today the index carries only residency -- kAnySolidBit is a
+// hardcoded 1 at every writer and says nothing -- so !Occupied does in fact
+// imply AnyAbsent. The read is what stops that becoming a silent hole the day
+// Occupied gains a solidity meaning; see the header's note.)
+//
+// DECLARED ONLY ON THIS PERMUTATION. The C++ parameter struct declares them on
+// every arm (an unbound Buffer<uint> reads as ZEROS, and zeros in Occupied mean
+// "nothing is resident anywhere", i.e. skip the world), but the off arm must not
+// carry the loads -- so the globals exist only where something reads them,
+// exactly as VOXEL_MARCH_TRACK_SHELL's six index probes do.
+Buffer<uint> MarchBlockOccupied;
+Buffer<uint> MarchBlockAnyAbsent;
+// ---------------------------------------------------------------------------
+// THE SKY LICENCE (voxel.March.BlockSkySkip)
+// ---------------------------------------------------------------------------
+//
+//   MarchBlockAllSky  every one of this block's 64 chunk cells carries a valid
+//                     open-sky mark AND none of them is resident.
+//
+// WHY THIS BIT AND NOT THE ONE ABOVE. `Occupied == 0` means ALL 64 ARE
+// NON-RESIDENT, and non-resident has to be treated as BLOCKING here, because
+// air is not resident in this world -- only a thin surface shell streams, and a
+// chunk that has not streamed yet may contain surface. So the occupancy bit
+// could never license an advance; it could only say "you may pass through what
+// you would have walked anyway", which is why the arm paid 23.7 block tests per
+// ray to avoid 11.2 cells and came out 30% slower. This bit is a PROOF from the
+// streaming side that there is nothing here, so it licenses the jump outright.
+//
+// UNBOUND READS AS ZEROS AND THAT IS THE SAFE DIRECTION FOR THIS ONE, the exact
+// opposite of MarchBlockOccupied's. Zero means "no block is provably sky", so a
+// missing buffer makes the arm INERT and the marcher descends exactly as the
+// control does. RegisterWithBlocks still falls it back to explicit all-ZEROS
+// rather than leaving it null.
+//
+// THE MODE IS A UNIFORM, not a permutation, and the argument is in
+// FVoxelMarchArm::BlockSkyMode: mode 0 issues no sky load at all (the branch
+// below is uniform and coherent across the whole dispatch), so the
+// residency-only arm keeps exactly the traffic its published result was
+// measured with, and all three states fit on one binary.
+//
+//   0  residency only -- byte-identical to the shipped block arm
+//   1  both: unoccupied OR provably sky
+//   2  sky only: residency alone stops licensing a skip
+Buffer<uint> MarchBlockAllSky;
+uint MarchBlockSkyMode;
+
+// THE BLOCK SIZE IS PINNED, NOT ASSUMED. Three places below spell 4 as a shift
+// or a step -- VoxelMarchIndexBlockCompute's `>> 2`, the traversal's
+// `ChunkCoord >> 2`, and the shell test's +/-4 neighbour offsets -- because at 4
+// those are the cheap correct forms and at any other value they are silently
+// wrong in the direction that skips ground the index holds. The host pushes its
+// own kBlockChunks here (FVoxelMarchCS::ModifyCompilationEnvironment), so the
+// two halves cannot disagree without failing to compile.
+#if VOXEL_MARCH_BLOCK_CHUNKS != 4
+#error "FVoxelMarchChunkIndex::kBlockChunks is no longer 4. The shader half of the coarse occupancy level spells the block size as a >>2 and as +/-4 neighbour steps in three places; fix all of them (and VoxelMarchIndexBlockCompute in VoxelMarchIndexCell.ush) before changing it, or the marcher will read the wrong block's bit and skip ground it holds."
+#endif
+#endif
+
 #if VOXEL_MARCH_TRACK_SHELL
 // WHICH GRID SLOTS HOLD ANYTHING AT ALL, one bit per slot (bit S set => slot S
 // has at least one resident chunk this frame). Filled from
@@ -1633,6 +1950,14 @@ struct FVoxelMarchChunkCache
 	// Meaningful only while bResident is false.
 	bool bAbsentTouchesShell;
 #endif
+#if VOXEL_MARCH_TRACK_SKY
+	// PROVABLY OPEN SKY for THIS coord -- reason 3 with a matching torus tag,
+	// decoded from the entry the residency test already loaded. Meaningful only
+	// while bResident is false. Computed in the one place that holds both the
+	// entry and the coordinate asked for, for the same reason AbsentReason and
+	// bAbsentTouchesShell are.
+	bool bOpenSky;
+#endif
 #endif
 	uint BrickBase;     // first descriptor slot
 	uint2 BrickSolid;   // the 64-bit L1 mask, lo/hi
@@ -1668,6 +1993,13 @@ FVoxelMarchChunkCache VoxelMarchNoChunk()
 	// on this flag, so that an unconsulted cache can never OPEN THE LADDER
 	// either. False is the conservative answer to both questions at once.
 	C.bAbsentTouchesShell = false;
+#endif
+#if VOXEL_MARCH_TRACK_SKY
+	// A cache nobody looked up has proved nothing. FALSE, which puts an
+	// unconsulted cache on the RETRY side of the gate -- the same refusal
+	// bAbsentTouchesShell makes one line up, and for the same reason: an
+	// unconsulted cache must never be able to suppress a fill.
+	C.bOpenSky = false;
 #endif
 #endif
 	C.BrickBase = 0u;
@@ -1877,6 +2209,19 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// (VOXEL_MARCH_FALLTHROUGH_SHELL 0) rather than deleted.
 	C.bAbsentTouchesShell = ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u) ||
 	                        VoxelMarchAbsentTouchesShell(ChunkCoord);
+#endif
+#if VOXEL_MARCH_TRACK_SKY
+	// ZERO ADDITIONAL LOADS. `Entry` is the dword the residency test below is
+	// about to read; this is a mask, a compare and the tag test, all on a value
+	// already in a register. That is the entire reason this approach can work
+	// where three others could not -- see the doctrine block on
+	// VOXEL_MARCH_SKY_LADDER.
+	//
+	// Computed BEFORE the resident early-out so there is one call site rather
+	// than one per return path, exactly as AbsentReason is. VoxelMarchIsOpenSky
+	// leads with the resident-bit test itself, so a resident cell whose pool
+	// SLOT happens to be 3 can never read as sky.
+	C.bOpenSky = VoxelMarchIsOpenSky(Entry, ChunkCoord);
 #endif
 	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) == 0u)
 	{
@@ -2379,6 +2724,15 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 	}
 #endif
 	H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || (!Chunk.bValid && !Chunk.bResident);
+#if VOXEL_MARCH_TRACK_SKY
+	// AND NOT PROVEN SKY. The extra term can only make this flag FALSE where the
+	// old one is true, never the reverse, so the ladder it gates can only retry
+	// FEWER rays than the control -- never more. That direction is the whole
+	// safety argument: a retry that does not happen shows the fine level's own
+	// answer, and the fine level PROVED this chunk is above the terrain.
+	H.bCrossedNonSkyAbsent = H.bCrossedNonSkyAbsent ||
+	                         (!Chunk.bValid && !Chunk.bResident && !Chunk.bOpenSky);
+#endif
 #endif
 
 	const float3 d = Exit - Entry;
@@ -2453,6 +2807,10 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		}
 #endif
 		H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || (!Chunk.bValid && !Chunk.bResident);
+#if VOXEL_MARCH_TRACK_SKY
+		H.bCrossedNonSkyAbsent = H.bCrossedNonSkyAbsent ||
+		                         (!Chunk.bValid && !Chunk.bResident && !Chunk.bOpenSky);
+#endif
 		if (bSolidNow)
 #else
 		if (VoxelMarchBrickSolidAt(vNow, Chunk, Brick, Mat))
@@ -2720,6 +3078,48 @@ float VoxelMarchCellEnterT(float3 OriginLocalUU, float3 InvDir, int3 CellMinWorl
 // above float noise at these ranges and four orders below a voxel.
 #define VOXEL_MARCH_HIER_NUDGE_UU (VOXEL_FLUID_VOXEL_UU * 0.001f)
 
+// ===========================================================================
+// THE BLOCK EXIT'S CONSERVATIVE BACKOFF -- the arithmetic half of hole safety
+// ===========================================================================
+//
+// ONE FULL CHUNK AT THIS LEVEL, SUBTRACTED FROM THE BLOCK EXIT, APPLIED AFTER
+// THE FLOAT CONVERSION. The walk is written in units where one level-L voxel
+// measures VOXEL_FLUID_VOXEL_UU (the ray is pre-divided by 2^L before it gets
+// here), so this is automatically the right size at every level with no rescale.
+//
+// WHY A BACKOFF AT ALL, AND WHY IT IS THE JUMP AND NOT THE MASK THAT NEEDS ONE.
+// Danskin & Hanrahan measured that a plain max/OR bound is NOT automatically
+// conservative: "a ray taking even a tiny step can step through three pyramid
+// nodes". The exposure is not the bit -- a block with no resident cell in it
+// contains nothing to miss -- it is the LEAP to the block's far side. Computing
+// that leap in floating point can land the ray PAST a cell it genuinely clipped,
+// and that cell is then never tested. That is a hole, and holes are the defect
+// this project reports on sight.
+//
+// AFTER THE CONVERSION, NEVER BEFORE, AND THAT IS THE LESSON RATHER THAN THE
+// RULE. The Z bound's first version padded in INTEGER CHUNK COORDINATES
+// UPSTREAM of the float conversion, so the converted interval carried no bias at
+// all -- the pad was load-bearing for a different argument and did nothing for
+// this one. VoxelMarchCellExitT rounds when it builds the cell's min corner in
+// UU and rounds again on the multiply by InvDir; the backoff has to be applied
+// to the RESULT of that, which is what this constant's only use site does.
+//
+// SHORT, NOT LONG. The Z bound biases OUTWARD (it is narrowing an interval, so
+// safety is a wider interval); this biases INWARD (it is advancing a ray, so
+// safety is a shorter advance). Same principle, opposite sign, and getting the
+// sign wrong here is a hole rather than a slowdown.
+//
+// A CHUNK RATHER THAN AN EPSILON, for the reason the Z bound gives: a chunk is
+// the unit actually being skipped, the ray lands inside a cell the block was
+// going to be non-resident in anyway, and it costs at most one ordinary chunk
+// step per block against the four to twelve it removes. Against float error it
+// is roughly six orders of magnitude of margin at the ranges this walk reaches.
+#define VOXEL_MARCH_BLOCK_BACKOFF_UU (VOXEL_FLUID_VOXEL_UU * 32.0f)
+// The reciprocal of one chunk in walk units, for BlockCellsAvoided. A
+// compile-time constant so the counter costs one multiply on a skip and no
+// divide anywhere.
+#define VOXEL_MARCH_INV_CHUNK_UU (1.0f / (VOXEL_FLUID_VOXEL_UU * 32.0f))
+
 // The fine walk, INSIDE one brick whose descriptor is already in hand.
 //
 // A real DDA and not a point sample: the crossed face is what gives the normal
@@ -2959,6 +3359,65 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 	FVoxelMarchChunkCache Chunk = VoxelMarchNoChunk();
 	FVoxelMarchBrickCache Brick = VoxelMarchNoBrick();
 
+#if VOXEL_MARCH_BLOCK_SKIP
+	// ---- THE COARSE OCCUPANCY LEVEL'S PER-WALK CACHE ----------------------
+	//
+	// CACHED FOR THE SAME REASON THE CHUNK RECORD IS. Consulting the bitfields
+	// on every chunk step would ADD a load per chunk to buy a load per chunk --
+	// exactly nothing. A walk crosses 4 to 12 chunk cells inside one 4^3 block,
+	// so this turns the coarse level's cost into roughly one pair of loads per
+	// twelve chunk steps, and into ZERO extra loads on the blocks it skips.
+	//
+	// THE SENTINEL COORDINATE IS ONE NO BLOCK CAN HOLD, so the first iteration
+	// always consults rather than trusting the initial values -- the same
+	// constructor discipline VoxelMarchNoChunk uses, and for the same reason
+	// (block (0,0,0) is a legal block).
+	int3 BlockCoord = int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
+	// THE INITIAL VALUES ARE THE CONTROL'S BEHAVIOUR, not zeroes. Occupied means
+	// "descend", so an unconsulted cache can never skip; AnyAbsent false means
+	// "claim nothing", so it can never assert a crossing it did not make. Both
+	// are unreachable (the sentinel forces a consult) and both are chosen so
+	// that if they ever WERE reached the arm degrades to the control.
+	bool bBlockOccupied = true;
+	// FALSE IS THE CONTROL'S BEHAVIOUR HERE, and the asymmetry against
+	// bBlockOccupied above is deliberate: "not licensed" is what makes an
+	// unconsulted cache unable to skip, which is the same property `Occupied =
+	// true` buys for the other bit. Both degrade to the control if ever reached.
+	bool bBlockAllSky = false;
+	bool bBlockAnyAbsent = false;
+	// Whether skipping this block can drop a bCrossedShellAbsent -- see the
+	// consult below. Compile-time true where no shell flag exists.
+	bool bBlockShellSafe = true;
+#if VOXEL_MARCH_HOLE_STATS
+	// Whether the PREVIOUS consult came back sky-licensed, which is all the run
+	// counter needs.
+	//
+	// TALLIED FORWARD, NOT CLOSED AT THE END, and that is the difference between
+	// a run counter that is right and one that is systematically wrong on
+	// exactly the rays it exists for. A run held open and flushed at the end of
+	// the walk needs a flush at EVERY exit -- and this function has four, three
+	// of them hits -- so any exit that forgot would silently drop the run. And
+	// the run most likely to still be open when the walk ends is a long one
+	// through sky, i.e. the case being measured. So instead: every licensed
+	// consult adds a block, and a licensed consult whose predecessor was NOT
+	// licensed opens a run. Nothing has to be closed, and the mean is
+	// RunBlocks / Runs with no end-of-walk bookkeeping at all.
+	//
+	// COUNTED AT THE CONSULT AND NOT AT THE SKIP, for the reason BlockConsulted
+	// is: counting at the skip would make the denominator the numerator, and
+	// "licensed but not skipped" -- a block whose backed-off exit did not beat
+	// the ordinary one-chunk advance -- would become invisible. That is the
+	// finding that separates "open sky is scattered at this granularity" from
+	// "the jump geometry is refusing", and they have different fixes.
+	bool bPrevConsultSky = false;
+#endif
+	// One authority for the block's size as a shift, derived from the chunk's
+	// rather than spelled again: a 4^3 block of chunks is 4 x 32 = 128 level-L
+	// voxels, i.e. ChunkShift + 2. Doctrine 5 -- the same expression written
+	// twice is still two authorities.
+	const int BlockShift = ChunkShift + 2;
+#endif
+
 	int Steps = 0;
 	float t = TMinUU;
 	H.LastBrickIndex = -1;
@@ -3013,6 +3472,277 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 		// be WRITTEN, and then it must be shown to differ from level 2 before any
 		// number is read off it.
 		H.LastChunkCoord = ChunkCoord;
+
+#if VOXEL_MARCH_BLOCK_SKIP
+		// ===================================================================
+		// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip)
+		// ===================================================================
+		//
+		// ONE BIT ABOVE THE CHUNK, CONSULTED BEFORE THE INDEX LOAD BELOW AND
+		// THAT ORDER IS THE ENTIRE POINT. The chunk index is 99.7% empty and
+		// each miss in it costs one scattered 4-byte load into 64 MiB; this
+		// answers "is there anything at all in the 12.8 m cube around me" out of
+		// a 32 KiB buffer that stays resident, and when the answer is no it
+		// removes 4 to 12 of those scattered loads in one step.
+		//
+		// PLACED AFTER LastChunkCoord AND BEFORE THE LOOKUP: the diagnostic
+		// records the cell the walk reached, and the load is the thing being
+		// avoided.
+		{
+			// INTEGER CONTAINMENT, NOT THE FLOAT t. Which block the ray is in is
+			// `ChunkCoord >> 2`, exactly, and an arithmetic shift is the correct
+			// floor for negative coordinates where a divide is not. The brick
+			// loop decides its own membership the same way and for the same
+			// reason (doctrine 4): a float guard on t cannot be the authority on
+			// which cell the ray occupies, because it disagrees with the floor
+			// that produced the cell by ULP at exactly the boundary.
+			const int3 BlockNow = int3(ChunkCoord.x >> 2, ChunkCoord.y >> 2, ChunkCoord.z >> 2);
+			if (any(BlockNow != BlockCoord))
+			{
+				BlockCoord = BlockNow;
+				// THE SHARED DERIVATION, not a local spelling of it: the CPU
+				// writes these blocks through FVoxelMarchChunkIndex::BlockOf and
+				// this reads them through the same math in
+				// VoxelMarchIndexCell.ush. A writer and a reader with private
+				// copies of the wrap drift into blocks that are published and
+				// never consulted, which renders as skipped ground with every
+				// counter healthy -- the shape this project has paid for three
+				// times in one night.
+				const uint Blk = VoxelMarchIndexBlockCompute(
+					ChunkCoord, MarchIndexDimChunks, uint(VOXEL_MARCH_BLOCKS_PER_SLOT),
+					GVoxelMarchIndexGrid);
+				const uint BlkWord = MarchBlockOccupied[Blk >> 5u];
+				const uint BlkAbsentWord = MarchBlockAnyAbsent[Blk >> 5u];
+				// lint-shader-ub: allow VARIABLE_SHIFT - Blk & 31 is 0..31 by construction
+				const uint BlkMask = 1u << (Blk & 31u);
+				bBlockOccupied = (BlkWord & BlkMask) != 0u;
+				bBlockAnyAbsent = (BlkAbsentWord & BlkMask) != 0u;
+				// THE SKY LICENCE. Loaded ONLY when the mode asks for it: the
+				// branch is on a uniform, so it is coherent across the entire
+				// dispatch and mode 0 issues no load at all -- which is what
+				// keeps the residency-only arm byte-comparable with the result
+				// it has to beat.
+				bBlockAllSky = false;
+				if (MarchBlockSkyMode != 0u)
+				{
+					const uint BlkSkyWord = MarchBlockAllSky[Blk >> 5u];
+					bBlockAllSky = (BlkSkyWord & BlkMask) != 0u;
+				}
+#if VOXEL_MARCH_HOLE_STATS
+				if (bBlockAllSky)
+				{
+					++H.BlockSkyLicensed;
+					// RunBlocks TRACKS Licensed EXACTLY, by construction, and
+					// that redundancy is deliberate: the CPU prints both, and
+					// RunBlocks != Licensed is a self-indictment of this
+					// instrument rather than a fact about the world. A counter
+					// that cannot disagree with itself cannot report its own
+					// breakage.
+					++H.BlockSkyRunBlocks;
+					if (!bPrevConsultSky)
+					{
+						// A licensed consult whose predecessor was not opens a
+						// run. Consults are consecutive DISTINCT blocks along
+						// the ray (the cache only re-consults on a block
+						// change), so "consecutive consults" is "consecutive
+						// blocks" with no gaps to reason about.
+						++H.BlockSkyRuns;
+					}
+				}
+				bPrevConsultSky = bBlockAllSky;
+#endif
+#if VOXEL_MARCH_TRACK_SHELL
+				// ===========================================================
+				// THE SHELL FLAG'S DEBT, PAID BEFORE THE SKIP IS OFFERED
+				// ===========================================================
+				//
+				// bCrossedShellAbsent has gated the retry ladder since
+				// 2026-08-24, and it does NOT fire for every absent chunk -- it
+				// fires for an absent chunk FACE-ADJACENT TO A RESIDENT ONE, a
+				// gap in ground we hold rather than air outside the shell. A
+				// block with no resident cell in it can still CONTAIN such a
+				// chunk: one on the block's own boundary whose neighbour lives
+				// in the next block along. Skipping that block would drop the
+				// flag, the ladder would not open, and the black arcs it exists
+				// to prevent come back. That is a hole and it outranks every
+				// millisecond here.
+				//
+				// SO THE SKIP IS REFUSED UNLESS IT IS PROVABLY SAFE, and the
+				// proof is six more bit tests. Every cell in this block has its
+				// six face neighbours either INSIDE the block or in one of the
+				// six FACE-ADJACENT blocks. If none of those seven blocks holds
+				// a resident cell, then no cell in this block has a resident
+				// face neighbour, VoxelMarchAbsentTouchesShell would have
+				// answered FALSE for every one of them, and leaving the flag
+				// alone REPRODUCES the full walk's answer rather than
+				// approximating it.
+				//
+				// +/- 4 CHUNKS MOVES EXACTLY ONE BLOCK, whatever the position
+				// within the block, because 4 IS the block size: (4b + k + 4)>>2
+				// is b+1 for every k in 0..3, and the arithmetic shift floors
+				// correctly on the negative side. So the neighbour coordinate is
+				// fed through the SAME derivation rather than through a second
+				// one that works in block space.
+				//
+				// AND THE EMPTY SLOT IS REFUSED OUTRIGHT: for a slot holding
+				// nothing, VoxelMarchAbsentTouchesShell SHORT-CIRCUITS to TRUE
+				// (see MarchIndexLevelPopulated), so every absent chunk there
+				// sets the flag and the argument above does not hold at all. The
+				// proving run -- -VoxelMaxRingLevel=0, which must read near-100%
+				// holes above L0 -- is exactly that case.
+				//
+				// COMPILED ONLY WHERE SOMETHING READS THE FLAG. With the shell
+				// gate off (the default, VOXEL_MARCH_FALLTHROUGH_SHELL 0) and
+				// hole stats below 2, none of this exists and the skip is
+				// offered on the two bits alone.
+				bBlockShellSafe =
+					(MarchIndexLevelPopulated & (1u << GVoxelMarchIndexGrid)) != 0u;
+				if (bBlockShellSafe && !bBlockOccupied)
+				{
+					const int3 NOffs[6] = { int3(4, 0, 0),  int3(-4, 0, 0), int3(0, 4, 0),
+					                        int3(0, -4, 0), int3(0, 0, 4),  int3(0, 0, -4) };
+					[unroll]
+					for (int nf = 0; nf < 6; ++nf)
+					{
+						const uint NBlk = VoxelMarchIndexBlockCompute(
+							ChunkCoord + NOffs[nf], MarchIndexDimChunks,
+							uint(VOXEL_MARCH_BLOCKS_PER_SLOT), GVoxelMarchIndexGrid);
+						// lint-shader-ub: allow VARIABLE_SHIFT - NBlk & 31 is 0..31 by construction
+						if ((MarchBlockOccupied[NBlk >> 5u] & (1u << (NBlk & 31u))) != 0u)
+						{
+							bBlockShellSafe = false;
+						}
+					}
+				}
+#endif
+#if VOXEL_MARCH_HOLE_STATS
+				// COUNTED AT THE CONSULT, WHICH IS THE DECISION. Counting at the
+				// skip instead would make the denominator the numerator and the
+				// rate unreadable -- and "consulted, and it held something"
+				// would become invisible, which is the finding that separates
+				// "the arm is inert" from "the world is not empty here".
+				++H.BlockConsulted;
+#endif
+			}
+			// ---- WHAT LICENSES THE JUMP ----------------------------------
+			//
+			// Mode 0 is the shipped predicate, character for character. Mode 1
+			// adds the sky proof as an ALTERNATIVE licence. Mode 2 REMOVES the
+			// residency licence so the sky proof is measured on its own -- which
+			// is the only way to attribute a delta to the new predicate rather
+			// than to the pair of them.
+			//
+			// THE SHELL-SAFETY TEST STILL GATES ALL THREE, unchanged. It exists
+			// because skipping a block can drop a bCrossedShellAbsent that the
+			// per-chunk walk would have set, and that flag is a hole question,
+			// not a speed one. A sky-licensed block is no more exempt from it
+			// than an unoccupied one: a block with no resident cell can still
+			// CONTAIN a chunk face-adjacent to a resident one in the next block
+			// along, and the sky proof says nothing about that neighbour.
+			//
+			// AND bCrossedAbsentChunk IS UNCHANGED BELOW, deliberately. A
+			// sky-marked cell is STILL NON-RESIDENT. The mark says the streaming
+			// system chose not to hold it; it does not say the fine->coarse
+			// ladder should stop being told. Making the mark suppress that flag
+			// is a separate arm with a separate switch, because it changes which
+			// rays retry and therefore what the owner sees.
+			const bool bBlockLicensed =
+				(MarchBlockSkyMode == 2u) ? bBlockAllSky
+				                          : (!bBlockOccupied || (MarchBlockSkyMode == 1u &&
+				                                                 bBlockAllSky));
+			if (bBlockLicensed && bBlockShellSafe)
+			{
+				// The block's min corner from the WORLD voxel, exactly as the
+				// chunk's and the brick's are -- not from a local-UU floor that
+				// assumes an aligned frame origin.
+				const int3 BlockMinWorld = int3(WorldVoxel.x >> BlockShift,
+				                                WorldVoxel.y >> BlockShift,
+				                                WorldVoxel.z >> BlockShift) << BlockShift;
+				const float tBlockExitTrue =
+					VoxelMarchCellExitT(OriginLocalUU, InvDir, BlockMinWorld, BlockShift);
+				// THE BACKOFF, APPLIED HERE AND NOWHERE ELSE -- see the constant
+				// for why it is subtracted from the CONVERTED value rather than
+				// applied in integer block space upstream, which is the mistake
+				// the Z bound's pad made and paid for.
+				const float tBlockJump = tBlockExitTrue - VOXEL_MARCH_BLOCK_BACKOFF_UU;
+				// THE PROGRESS GUARD, AND IT IS WHAT MAKES THE BACKOFF SAFE
+				// RATHER THAN MERELY CONSERVATIVE.
+				//
+				// A backoff with no guard has a failure mode worse than a hole:
+				// a ray that CLIPS A CORNER of the block crosses it over less
+				// than a chunk, so the backed-off exit lands BEFORE the ray's
+				// current position, `t` does not move, the block is consulted
+				// again, and the walk spins on one cell until the 512-iteration
+				// cap ends it -- terrain that simply stops, reported as
+				// TERM_CHUNK_CAP.
+				//
+				// Taking the jump ONLY when it beats the ordinary one-chunk
+				// advance removes that entirely, and buys two more properties
+				// for free: this loop can never take MORE iterations than the
+				// control (every iteration advances at least as far as the
+				// control's would), and the landing point is strictly past the
+				// current chunk's exit, so no cell is ever re-tested.
+				//
+				// WHERE THE RAY LANDS, AND WHY THAT IS NOT A HOLE. Between
+				// tBlockJump and the true block exit lies at most one chunk of
+				// this block, and the block holds NO resident cell -- so the
+				// cell the ray lands in is one the walk would have found absent.
+				// The chunk loop below reaches it on the next iteration, takes
+				// the `!Chunk.bValid` branch, sets the same flags it always
+				// would, and steps out of the block by itself.
+				if (tBlockJump > tChunkNext)
+				{
+#if VOXEL_MARCH_TRACK_ABSENT
+					// bCrossedAbsentChunk MUST STILL FIRE FOR THE CHUNKS THE
+					// SKIP JUMPED, or the fine->coarse gate silently changes
+					// meaning and the black arcs come back.
+					//
+					// WHY THIS IS EXACT AND NOT MERELY CONSERVATIVE. Occupied
+					// is clear, so NO cell in this block is resident; the
+					// walk's own site (`if (!Chunk.bValid)` ->
+					// `H.bCrossedAbsentChunk || !Chunk.bResident`) would have
+					// set the flag on the FIRST cell it reached in here.
+					// AnyAbsent is read rather than assumed for the reason the
+					// second buffer exists at all -- see its declaration.
+					//
+					// AND WHAT IS NOT PERTURBED: a block holding ANY resident
+					// cell is never skipped, so resident-empty chunks are still
+					// walked one at a time and still do NOT set the flag. That
+					// asymmetry is the whole correctness requirement, and it
+					// survives because the skip's precondition is residency,
+					// not emptiness.
+					H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || bBlockAnyAbsent;
+#if VOXEL_MARCH_TRACK_SKY
+					// CONSERVATIVE, AND DELIBERATELY NOT bBlockAllSky. The block
+					// bit is only loaded when voxel.March.BlockSkySkip asks for
+					// it, so on a leg with the block level on and that mode 0 it
+					// is a stale `false` -- using it would make the ladder's
+					// answer depend on a switch that is supposed to be
+					// orthogonal. Treating every jumped block as non-sky opens
+					// the ladder exactly as today: LOST BENEFIT on the
+					// BlockSkip-on legs, never a dropped fill. The two arms are
+					// measured separately anyway, and both default off.
+					H.bCrossedNonSkyAbsent = H.bCrossedNonSkyAbsent || bBlockAnyAbsent;
+#endif
+#endif
+#if VOXEL_MARCH_HOLE_STATS
+					++H.BlockSkipped;
+					// RAY LENGTH IN CHUNKS, NOT 64 PER BLOCK. 64 x BlockSkipped
+					// carries no information beyond BlockSkipped AND reaches
+					// ~8e9 in a frame, which wraps a uint32 silently -- a
+					// counter that reads small precisely when the arm worked
+					// hardest. This is a LOWER bound: a diagonal DDA visits up
+					// to sqrt(3) times the axis count over the same span.
+					H.BlockCellsAvoided +=
+						uint(max((tBlockJump - t) * VOXEL_MARCH_INV_CHUNK_UU, 0.0f));
+#endif
+					t = tBlockJump;
+					continue;
+				}
+			}
+		}
+#endif
+
 		if (any(ChunkCoord != Chunk.ChunkCoord))
 		{
 			Chunk = VoxelMarchLookupChunk(ChunkCoord);
@@ -3047,6 +3777,14 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 			}
 #endif
 			H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || !Chunk.bResident;
+#if VOXEL_MARCH_TRACK_SKY
+			// THE SITE THAT MATTERS: this is where essentially every ray's first
+			// absent crossing happens -- the near-field air the camera sits in,
+			// which the sky trim declined and this mark now names. bOpenSky is
+			// decoded from the same dword the residency test above read.
+			H.bCrossedNonSkyAbsent =
+				H.bCrossedNonSkyAbsent || (!Chunk.bResident && !Chunk.bOpenSky);
+#endif
 #endif
 			t = tChunkNext;
 			continue;
@@ -3386,6 +4124,32 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	// the level-2 breakdown its first shape.
 	uint RayFtConsidered = 0u;
 	uint RayFtTaken = 0u;
+	// The resident-Z bound's engagement trio, ray-wide. See the fields on
+	// FVoxelMarchHit for what each one is and why one counter will not do.
+	uint RayZCutConsulted = 0u;
+	uint RayZCutSkipped = 0u;
+	uint RayZCutClipped = 0u;
+	// The coarse occupancy level's engagement trio, ray-wide. SUMMED FROM THE
+	// WALKS rather than counted here, because the decision is taken inside the
+	// chunk loop -- but summed HERE rather than left on the per-walk H, because
+	// the ladder can run the same segment at several levels and H is overwritten
+	// on every rung. See the fields on FVoxelMarchHit for what each one is.
+	// NO RAY-WIDE FOLD FOR bCrossedNonSkyAbsent, deliberately, and the asymmetry
+	// against bAnyAbsent below is the point. bAnyAbsent exists because
+	// Miss.bCrossedAbsentChunk -- read by the uncovered counter and the hole
+	// metric -- is a statement about the WHOLE RAY. The sky gate is a statement about ONE RUNG:
+	// it asks whether THIS walk crossed a non-sky absence, exactly as the
+	// shipped gate asks whether this walk crossed any absence. A ray-wide
+	// version would keep the ladder open on later rungs because of an earlier
+	// segment, which is neither what the shipped gate does nor what this arm
+	// means. An unused accumulator here would also be the only variable in this
+	// function with no reader, which is how a fold gets quietly repurposed.
+	uint RayBlockConsulted = 0u;
+	uint RayBlockSkipped = 0u;
+	uint RayBlockCells = 0u;
+	uint RayBlockSkyLicensed = 0u;
+	uint RayBlockSkyRunBlocks = 0u;
+	uint RayBlockSkyRuns = 0u;
 #endif
 #endif
 	[loop]
@@ -3419,6 +4183,187 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			const float S = float(1u << WalkL);
 			const float InvS = 1.0f / S;
 
+			// ===========================================================
+			// THE RESIDENT-Z BOUND (voxel.March.ZCut)
+			// ===========================================================
+			//
+			// Intersect this walk's t-interval with the Z SLAB THAT CONTAINS
+			// every chunk this level holds. An empty intersection means the
+			// walk cannot reach a single resident chunk and is skipped
+			// outright; a partial one is narrowed and the walk gets the
+			// narrower interval. Both are the same test.
+			//
+			// PER WalkL, NOT PER SegL, and that is stricter rather than looser:
+			// the slab has to describe the grid the walk will actually READ,
+			// and under the retry ladder that is WalkL's grid, not the
+			// segment owner's. A level-0 segment retried at level 2 is tested
+			// against level 2's own slab.
+			//
+			// AFTER VoxelMarchBeginLevel, ON PURPOSE. VoxelMarchOriginVoxel()
+			// is the single authority for the frame origin expressed in
+			// level-L voxels, and recomputing MarchBrickOriginVoxel >> WalkL
+			// here would be a second spelling of it -- doctrine 5, and the
+			// exact shape that pinned this file to level 0 once already.
+			float WalkIn = SegIn;
+			float WalkOut = SegOut;
+			// Set when the cut removed ANY part of the interval. It is what
+			// stands in for the absent chunks the walk will now not visit --
+			// see the fold below the traverse call.
+			bool bZCutRemoved = false;
+			// Set when nothing at all is left: the walk does not run.
+			bool bZCutEmpty = false;
+			if (MarchZCutEnable != 0 && MarchLevelChunkZ[WalkL].z != 0)
+			{
+#if VOXEL_MARCH_TRACK_ABSENT
+#if VOXEL_MARCH_HOLE_STATS
+				RayZCutConsulted += 1u;
+#endif
+#endif
+				// The slab's faces in the SAME space SegIn/SegOut live in:
+				// world-UU t along DirWorld from OriginLocalUU. A level-L
+				// chunk is 32 level-L voxels, and one level-L voxel is
+				// VOXEL_FLUID_VOXEL_UU * S of world UU.
+				//
+				// * 32 AND NOT << 5: the min bound is routinely negative and
+				// a left shift of a negative int is the kind of thing that is
+				// fine until a compiler decides otherwise. A multiply says
+				// what is meant.
+				//
+				// .y + 1 BECAUSE .y IS INCLUSIVE. The top face of the last
+				// chunk is the START of the one above it, and using .y here
+				// would clip a whole chunk of resident ground off the top --
+				// a hole, from an off-by-one, in the one direction this
+				// change may never round.
+				const int OriginZL = VoxelMarchOriginVoxel().z;
+				const float VoxUU = VOXEL_FLUID_VOXEL_UU * S;
+				const float SlabLoUU = float(MarchLevelChunkZ[WalkL].x * 32 - OriginZL) * VoxUU;
+				const float SlabHiUU =
+					float((MarchLevelChunkZ[WalkL].y + 1) * 32 - OriginZL) * VoxUU;
+
+				// DirWorld IS NORMALISED -- the ring scale above depends on
+				// exactly that ("horizontal distance at parameter t is
+				// t * |Dir.xy|"), so t and world UU are the same unit and the
+				// slab test is a plain slab test with no rescale.
+				//
+				// THE PARALLEL CASE IS NOT A DIVIDE-BY-ZERO GUARD, it is a
+				// different answer: a ray with no Z component either lies
+				// inside the slab for its whole length or outside it for its
+				// whole length. Tested against DirWorld.z rather than
+				// SafeDir.z deliberately -- SafeDir nudges an exact zero to a
+				// tiny non-zero, and reading that would produce an enormous
+				// finite t whose sign is an artefact of the nudge. The
+				// threshold is generous for the same reason, and every ray it
+				// captures is treated as INSIDE unless it is provably outside,
+				// which is the conservative direction.
+				if (abs(DirWorld.z) < 1e-6f)
+				{
+					if (OriginLocalUU.z < SlabLoUU || OriginLocalUU.z > SlabHiUU)
+					{
+						WalkOut = WalkIn;
+					}
+				}
+				else
+				{
+					const float InvDz = 1.0f / DirWorld.z;
+					const float tA = (SlabLoUU - OriginLocalUU.z) * InvDz;
+					const float tB = (SlabHiUU - OriginLocalUU.z) * InvDz;
+					WalkIn = max(WalkIn, min(tA, tB));
+					WalkOut = min(WalkOut, max(tA, tB));
+				}
+				// ===================================================
+				// THE OUTWARD BIAS -- the arithmetic half of hole safety
+				// ===================================================
+				//
+				// ONE FULL CHUNK AT THIS LEVEL, OUTWARD ON BOTH ENDS, APPLIED
+				// AFTER THE CONVERSION AND AFTER THE DIVIDE. Everything above
+				// this line is exact in integers right up to the moment it is
+				// not: the slab faces are an exact int expression, but
+				// float(...) * VoxUU rounds once and the divide by Dir.z
+				// rounds twice more -- and the result is THE START OF A JUMP.
+				// Every chunk between SegIn and WalkIn is skipped unexamined,
+				// so a WalkIn that lands even a few ULPs INSIDE the true slab
+				// entry silently drops a cell nobody ever tests. That is a
+				// hole, and holes are this project's report-on-sight defect.
+				//
+				// Danskin & Hanrahan measured exactly this class: a ray taking
+				// even a tiny step can step through three pyramid nodes, so a
+				// max/OR bound is NOT automatically conservative once you JUMP
+				// to the far side of it. VoxelRT works around the same problem
+				// by biasing intersection distances. This is that bias.
+				//
+				// NOT THE SAME KNOB AS voxel.March.ZCutPadChunks, ON PURPOSE.
+				// That pad acts in INTEGER CHUNK SPACE BEFORE this conversion,
+				// and it is load-bearing for a DIFFERENT claim: it is what
+				// keeps every removed chunk two chunks clear of anything
+				// resident, so bCrossedShellAbsent is preserved exactly. One
+				// number serving both arguments would break both at once the
+				// first time somebody lowered it, and they fail for unrelated
+				// reasons -- one geometric, one arithmetic.
+				//
+				// A CHUNK RATHER THAN AN EPSILON because a chunk is the unit
+				// actually being skipped, and because it costs at most one
+				// extra chunk step per segment end against the hundreds this
+				// removes -- insurance at a price not worth measuring. Sized
+				// at the WALK's level, since the cells at risk are WalkL's.
+				//
+				// RE-CLAMPED INTO [SegIn, SegOut]: widening past the segment
+				// would walk ground this ring does not own. The bias may only
+				// ever give back what the cut took, never more.
+				const float ZCutBiasUU = 32.0f * VOXEL_FLUID_VOXEL_UU * S;
+				WalkIn = max(SegIn, WalkIn - ZCutBiasUU);
+				WalkOut = min(SegOut, WalkOut + ZCutBiasUU);
+
+				// COMPUTED AFTER THE BIAS, NOT BEFORE. These two decide what
+				// the counters report AND what the absent-chunk fold below
+				// claims, so they must describe the interval actually handed
+				// to the walk. Computing them first would let the arm report a
+				// skip it did not take and -- far worse -- assert
+				// bCrossedAbsentChunk for chunks the biased interval still
+				// visits.
+				//
+				// THE SAFETY ARGUMENT COMES OUT STRONGER, NOT WEAKER: a chunk
+				// still removed after biasing outward by a full chunk is now
+				// at least one chunk FURTHER outside the slab than the
+				// unbiased test claimed. Both "every removed chunk is
+				// non-resident" and "no removed chunk touches the resident
+				// shell" now hold with a margin they did not have before.
+				bZCutEmpty = (WalkOut <= WalkIn);
+				bZCutRemoved = bZCutEmpty || (WalkIn > SegIn) || (WalkOut < SegOut);
+				// AN EMPTY INTERVAL COLLAPSES TO (SegIn, SegIn), NOT TO
+				// (WalkIn, WalkIn), AND THE DIFFERENCE IS CORRECTNESS.
+				//
+				// The walk is still CALLED on the empty case rather than
+				// replaced by a hand-built miss struct: its chunk loop is
+				// `t < TMaxUU`, so an empty interval exits before the first
+				// iteration and returns the function's OWN miss, with every
+				// field initialised the way every other miss on this path is.
+				// A synthetic struct here would be a second spelling of "what
+				// a miss looks like" and would drift from the real one.
+				//
+				// But WalkIn on an empty interval can sit PAST SegOut (the
+				// slab is entered only after the segment ends), and the FLAT
+				// walk tests its START VOXEL before its loop and can return a
+				// bStartedInside hit from it. Starting it out there would let
+				// it report a hit from beyond the ring it was asked about.
+				// SegIn is inside the segment by construction -- the
+				// `SegOut <= SegIn` guard above already ran -- and a start
+				// voxel at SegIn cannot produce a false hit either, because an
+				// empty intersection means SegIn is OUTSIDE the slab and the
+				// slab contains every resident chunk at this level, so the
+				// chunk there is absent and nothing in it can be solid.
+				if (bZCutEmpty)
+				{
+					WalkIn = SegIn;
+					WalkOut = SegIn;
+				}
+#if VOXEL_MARCH_TRACK_ABSENT
+#if VOXEL_MARCH_HOLE_STATS
+				RayZCutSkipped += bZCutEmpty ? 1u : 0u;
+				RayZCutClipped += (!bZCutEmpty && bZCutRemoved) ? 1u : 0u;
+#endif
+#endif
+			}
+
 			// if/else, not a ternary: HLSL's conditional operator takes numeric
 			// scalars, vectors and matrices only, never a struct.
 			// Armed only where the level matches -- see the note on the
@@ -3428,18 +4373,92 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			const int3 RingWatch = (int(WalkL) == WatchLevel)
 			                           ? WatchChunk
 			                           : int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
+			// WalkIn / WalkOut, NOT SegIn / SegOut. With the Z bound off, or on
+			// a level with no usable bound, they ARE SegIn / SegOut -- assigned
+			// from them and never touched -- so the control arm hands the walk
+			// byte-identical arguments.
 			FVoxelMarchHit H;
 			if (bHierarchical)
 			{
 				H = VoxelMarchTraverseBrickHierWatch(OriginLocalUU * InvS, DirWorld,
-				                                     SegIn * InvS, SegOut * InvS, ConeSlopeUU,
+				                                     WalkIn * InvS, WalkOut * InvS, ConeSlopeUU,
 				                                     RingWatch);
 			}
 			else
 			{
 				H = VoxelMarchTraverseBrick(OriginLocalUU * InvS, DirWorld,
-				                            SegIn * InvS, SegOut * InvS, ConeSlopeUU);
+				                            WalkIn * InvS, WalkOut * InvS, ConeSlopeUU);
 			}
+#if VOXEL_MARCH_TRACK_ABSENT
+#if VOXEL_MARCH_HOLE_STATS
+			// DRAINED FROM THE WALK IMMEDIATELY, BEFORE THE NEXT RUNG
+			// OVERWRITES H. The flat walk zeroes these fields like every other,
+			// so the `+=` is correct on both arms of the branch above and the
+			// non-hierarchical control contributes a measured zero rather than
+			// whatever the previous rung left behind.
+			RayBlockConsulted += H.BlockConsulted;
+			RayBlockSkipped += H.BlockSkipped;
+			RayBlockCells += H.BlockCellsAvoided;
+			// SUMMED PER SEGMENT, NOT PER RAY, and that matters for the run
+			// mean: a run cannot span two ring segments, because each segment
+			// starts its own walk with its own block cache and its own sentinel.
+			// Folding here keeps a segment boundary acting as a run boundary,
+			// which is the honest reading -- the marcher really does re-consult
+			// there.
+			RayBlockSkyLicensed += H.BlockSkyLicensed;
+			RayBlockSkyRunBlocks += H.BlockSkyRunBlocks;
+			RayBlockSkyRuns += H.BlockSkyRuns;
+#endif
+			// ===========================================================
+			// THE Z BOUND PAYS ITS DEBT TO THE FALLTHROUGH GATE HERE
+			// ===========================================================
+			//
+			// bCrossedAbsentChunk MUST STILL FIRE FOR THE CHUNKS THE CUT
+			// SKIPPED, or the fine->coarse gate silently changes meaning and
+			// the black arcs at LOD boundaries come back -- which is a hole,
+			// and holes outrank every millisecond this change is worth.
+			//
+			// WHY THIS IS EXACT AND NOT MERELY CONSERVATIVE. Every chunk the
+			// cut removed lies outside the padded slab, and the slab contains
+			// every chunk this level holds, so every removed chunk is
+			// NON-RESIDENT. The walk's own site (`if (!Chunk.bValid)` ->
+			// `H.bCrossedAbsentChunk || !Chunk.bResident`) would have set the
+			// flag on the first one it reached. bZCutRemoved is true exactly
+			// when at least one such chunk was removed -- if WalkIn > SegIn
+			// then the point at SegIn is beyond a slab face, i.e. in a chunk at
+			// least one Z step outside the resident extent, and that is the
+			// very chunk the walk evaluates on its first iteration.
+			//
+			// bCrossedShellAbsent IS DELIBERATELY NOT TOUCHED, AND THAT IS ALSO
+			// EXACT. VoxelMarchAbsentTouchesShell asks whether an absent chunk
+			// is FACE-ADJACENT to a resident one -- six probes, and the Z pair
+			// first. The host pads the slab by at least ONE chunk, so every
+			// removed chunk sits at least TWO chunks in Z outside the resident
+			// extent and all six of its neighbours are themselves outside it.
+			// The test would have answered FALSE for every one of them, so
+			// leaving the flag alone reproduces the full walk's answer rather
+			// than approximating it. THIS IS WHY THE PAD MINIMUM IS CLAMPED TO
+			// 1 ON THE HOST AND NOT MERELY DEFAULTED TO 4.
+			//
+			// The empty-slot refusal (.z == 0) is the third leg of the same
+			// argument: for a slot holding nothing that test SHORT-CIRCUITS to
+			// TRUE, so the reasoning above does not hold there -- and the host
+			// therefore never hands such a slot a usable bound.
+			//
+			// Net effect on both gates: with VOXEL_MARCH_FALLTHROUGH_SHELL on
+			// the ladder reads bCrossedShellAbsent and sees exactly what it saw
+			// before; with it off the ladder reads bCrossedAbsentChunk and
+			// again sees exactly what it saw before. `uncovered` in the kernel
+			// reads the same flag and is likewise unchanged.
+			H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || bZCutRemoved;
+#if VOXEL_MARCH_TRACK_SKY
+			// CONSERVATIVE, for the block skip's reason: the cut removes an
+			// interval without consulting any cell in it, so nothing here has
+			// proved anything about those chunks. Opening the ladder is the
+			// same behaviour as today.
+			H.bCrossedNonSkyAbsent = H.bCrossedNonSkyAbsent || bZCutRemoved;
+#endif
+#endif
 			if (H.bHit)
 			{
 				// Back into world units. Voxel and VoxelSizeUU stay in LEVEL-
@@ -3479,6 +4498,25 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				// hit has to carry them too.
 				H.FallthroughConsidered = RayFtConsidered;
 				H.FallthroughTaken = RayFtTaken;
+				// Carried onto the HIT as well as onto the miss, for the reason
+				// the pair above is: a ray that hit still consulted the bound on
+				// every segment it walked to get there, and dropping those would
+				// make the denominator read better exactly where the arm worked.
+				H.ZCutConsulted = RayZCutConsulted;
+				H.ZCutSkipped = RayZCutSkipped;
+				H.ZCutClipped = RayZCutClipped;
+				// Assigned from the ray-wide sums and NOT left as the winning
+				// walk's own fields, which is the whole reason those sums exist:
+				// H here is the LAST walk's struct, so leaving it alone would
+				// report only the rung that hit and delete every block the
+				// earlier segments consulted -- a denominator that shrinks in
+				// proportion to how early the ray succeeded.
+				H.BlockConsulted = RayBlockConsulted;
+				H.BlockSkipped = RayBlockSkipped;
+				H.BlockCellsAvoided = RayBlockCells;
+				H.BlockSkyLicensed = RayBlockSkyLicensed;
+				H.BlockSkyRunBlocks = RayBlockSkyRunBlocks;
+				H.BlockSkyRuns = RayBlockSkyRuns;
 #endif
 #endif
 				return H;
@@ -3550,6 +4588,59 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			// not actually describe.
 #if VOXEL_MARCH_FALLTHROUGH_SHELL
 			const bool bGateOpen = H.bCrossedShellAbsent;
+#elif VOXEL_MARCH_TRACK_SKY
+			// THE SKY GATE. Same question the shell gate asks -- is this absence
+			// air, or a gap in ground we hold -- answered from the CPU's own
+			// coverage proof instead of from six scattered neighbour probes.
+			//
+			// FIRST IN THE #elif CHAIN AFTER THE SHELL GATE, not before it: if
+			// someone ever compiles the shell arm, that one is the more
+			// conservative of the two (it opens the ladder for any absence
+			// touching held ground, marked or not) and must win. Ordering the
+			// chain so the stricter gate is reachable only when the looser one
+			// is off would be the way round that quietly drops fills.
+			//
+			// AND A WALK THAT DID NOT FINISH ITS INTERVAL HAS PROVED NOTHING
+			// ABOUT THE PART IT DID NOT WALK (added 2026-08-26).
+			//
+			// Both walks can return a MISS with segment left. The hierarchical
+			// one caps its chunk loop at 512 (`for (int ci = 0; ci < 512 && t <
+			// TMaxUU; ++ci)`) and sets TermReason = VOXEL_MARCH_TERM_CHUNK_CAP;
+			// it also returns bExhausted with TERM_BUDGET when MarchStepBudget
+			// runs out inside the brick loop. The flat walk sets bExhausted when
+			// its own MarchStepBudget loop falls through. NONE of those three
+			// paths sets bCrossedAbsentChunk or bCrossedNonSkyAbsent for the
+			// cells they never reached -- there is no write site on them.
+			//
+			// THIS IS NOT HYPOTHETICAL AND IT IS NOT RARE. Ring segments are
+			// bounded by HORIZONTAL distance and converted to a ray parameter by
+			// RingTScale = 1/|Dir.xy|, so a ray within ~2.24 degrees of vertical
+			// makes segment 0 own the whole ray: 1,310 level-0 chunk cells
+			// against a 512 cap. VoxelMarchRenderer.cpp's own note on ZCut says
+			// so in those words -- "hits the 512-chunk cap, returns
+			// TERM_CHUNK_CAP and produces nothing".
+			//
+			// THE CONTROL GATE GOT AWAY WITH IT AND THIS ONE CANNOT. On the
+			// shipped gate a truncated walk had almost always crossed some
+			// non-resident air before it stopped, so bCrossedAbsentChunk was set
+			// and the ladder retried at a coarser level -- where the same
+			// interval costs half the chunk steps and the walk COMPLETES. That
+			// retry is not a hole-filler there, it is the reach. The moment the
+			// sky mark reclassifies that same air as PROVEN, the only evidence
+			// keeping the ladder open on a truncated walk disappears, and the
+			// ray abandons the untraversed tail of its segment and drops to the
+			// next ring -- which is a near hit lost and whatever is behind it
+			// drawn instead.
+			//
+			// WRITTEN AS A SUBSET OF THE CONTROL, DELIBERATELY. bCrossedAbsentChunk
+			// is ANDed on top so this arm can still only ever retry FEWER rays
+			// than the shipped gate, never more -- the safety property this whole
+			// file is written around. A truncated walk that crossed nothing
+			// absent behaves exactly as the control does: no retry.
+			const bool bWalkTruncated =
+				H.bExhausted || H.TermReason == int(VOXEL_MARCH_TERM_CHUNK_CAP);
+			const bool bGateOpen =
+				H.bCrossedAbsentChunk && (H.bCrossedNonSkyAbsent || bWalkTruncated);
 #else
 			const bool bGateOpen = H.bCrossedAbsentChunk;
 #endif
@@ -3608,6 +4699,15 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	// flattering the change under test.
 	Miss.FallthroughConsidered = RayFtConsidered;
 	Miss.FallthroughTaken = RayFtTaken;
+	Miss.ZCutConsulted = RayZCutConsulted;
+	Miss.ZCutSkipped = RayZCutSkipped;
+	Miss.ZCutClipped = RayZCutClipped;
+	Miss.BlockConsulted = RayBlockConsulted;
+	Miss.BlockSkipped = RayBlockSkipped;
+	Miss.BlockCellsAvoided = RayBlockCells;
+	Miss.BlockSkyLicensed = RayBlockSkyLicensed;
+	Miss.BlockSkyRunBlocks = RayBlockSkyRunBlocks;
+	Miss.BlockSkyRuns = RayBlockSkyRuns;
 #endif
 #endif
 	return Miss;
@@ -3776,6 +4876,29 @@ FVoxelMarchHit VoxelMarchTraverseWithCover(float3 OriginLocalUU, float3 DirWorld
 		// is a property of the terrain cascade and cover cannot lower it.
 		C.FallthroughConsidered = T.FallthroughConsidered;
 		C.FallthroughTaken = T.FallthroughTaken;
+		// Same argument, same direction: the cover walk consults no Z bound
+		// (its slot is never given a usable one), so returning C's structural
+		// zeros would delete the terrain walk's decisions for every pixel cover
+		// wins and make the arm read inert in proportion to how much cover is
+		// on screen.
+		C.ZCutConsulted = T.ZCutConsulted;
+		C.ZCutSkipped = T.ZCutSkipped;
+		C.ZCutClipped = T.ZCutClipped;
+		// SUMMED, NOT ASSIGNED, and that is the one place this group departs
+		// from the two above it. The cover walk consults no Z bound (its slot is
+		// never given a usable one), so carrying the terrain walk's trio across
+		// is the whole of the accounting there. The cover walk DOES consult the
+		// coarse level -- the cover slot has its own 32,768 blocks like every
+		// other -- so its decisions are real and were really paid for. T and C
+		// are separate walks over separate ground; adding them counts each
+		// decision exactly once, and assigning T's would delete however much
+		// work the cover overlay did.
+		C.BlockConsulted = T.BlockConsulted + C.BlockConsulted;
+		C.BlockSkipped = T.BlockSkipped + C.BlockSkipped;
+		C.BlockCellsAvoided = T.BlockCellsAvoided + C.BlockCellsAvoided;
+		C.BlockSkyLicensed = T.BlockSkyLicensed + C.BlockSkyLicensed;
+		C.BlockSkyRunBlocks = T.BlockSkyRunBlocks + C.BlockSkyRunBlocks;
+		C.BlockSkyRuns = T.BlockSkyRuns + C.BlockSkyRuns;
 #endif
 		return C;
 	}

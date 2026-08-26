@@ -422,6 +422,135 @@
 // coordinates and the gate would not pass, it would explode.
 //
 // ---------------------------------------------------------------------------
+// THE TEMPORALLY VARYING SAMPLE LATTICE (voxel.March.HalfRes.Jitter)
+// ---------------------------------------------------------------------------
+//
+// OFF BY DEFAULT, AND SWITCHABLE INDEPENDENTLY OF HalfRes ITSELF, so a leg can
+// measure three arms rather than two: full-res, half-res-static, and
+// half-res-jittered. Jitter 0 restores the static lattice exactly.
+//
+// WHAT THE OWNER REJECTED, AND WHY THE DIAGNOSIS IS NOT "THE RECONSTRUCTION IS
+// WRONG". The verdict on the static arm was "the half res distant terrain does
+// not look good. Very grainy and low res", and 25.85% of pixels differed from
+// full res at a pinned pose. That is exactly where the cone-slope note above
+// predicted it: in the FAR FIELD roughly one voxel projects to one FULL-RES
+// pixel, so a half-res sample stands for about four voxels and "the true voxel
+// is none of my four candidates" stops being an edge phenomenon and becomes the
+// common case. Depth was always the only thing this arm called exact; WHICH
+// voxel supplies the normal, the material and the AO is resolved from four
+// samples over four times the area, so the SHADING out there is quarter res and
+// always was.
+//
+// WHY A MOVING LATTICE IS THE STANDARD CURE. At one voxel per pixel the correct
+// far-field image is the BOX AVERAGE over the pixel footprint -- which is not
+// what a full-res marcher produces either; it point-samples one voxel and
+// aliases. The half-res failure is that it point-samples one voxel per FOUR
+// pixels, so the same aliasing arrives four times coarser and reads as blocks.
+// Moving the sample turns a spatially blocky point sample into a temporally
+// dithered one, and TSR's accumulation is then an approximation of the box
+// average nobody is computing. That is what checkerboard rendering and temporal
+// upsampling do in shipped titles, and the reconstruction already supports it
+// because it only ever needed the candidate's SvPosition.
+//
+// THE SCHEMES. Both cycle lengths are powers of two, which is the whole of the
+// alignment answer below.
+//
+//   1  FOUR-FRAME QUAD ROTATION. The sample visits the four full-res pixel
+//      centres, offset (-.5,-.5) (+.5,+.5) (+.5,-.5) (-.5,+.5). Consecutive
+//      frames are diagonally opposite, then adjacent, so no two-frame swing
+//      dominates. Its property is the reason it is the default when on: over
+//      one cycle EVERY full-res pixel is marched exactly once, AT ITS OWN
+//      CENTRE, so TSR has seen the ground truth for every pixel within four
+//      frames. This is plain checkerboard rendering with an exact-depth
+//      reconstruction bolted to it.
+//
+//   2  EIGHT-FRAME HALTON(2,3), scaled to the same +/-0.5 box. Eight distinct
+//      positions instead of four, none of them a pixel centre. Offered because
+//      if scheme 1 shows visible four-frame structure -- a rotating rather than
+//      a static artefact -- this is the thing to try, and the box is shared, so
+//      a second build costs a day.
+//
+// WHY THE OFFSET IS NOT ALIGNED TO THE ENGINE'S OWN TAA/TSR JITTER PHASE, which
+// is the first thing to ask and the answer is not "it was not worth it":
+//
+//   THERE IS NO PHASE TO ALIGN TO ON THE MARCHER'S SIDE. The emit does not go
+//   through the jittered projection at all. VoxelMarchEmitVS builds its NDC by
+//   hand from PixelLocal / MarchViewRectSize, so its quads cover exact pixel
+//   rects whatever the jitter is doing, and both the march and the emit build
+//   their rays from MarchInvProjDiag -- the projection matrix DIAGONAL, whereas
+//   a perspective TAA jitter lives in the third row. So the marcher's samples
+//   have never sat where TSR believes a sample sits, at full res or at half. An
+//   offset copied from ResolvedView.TemporalAAJitter would not fix that; it
+//   would only make the marcher's error track the engine's sequence.
+//
+//   THE ENGINE JITTER IS ALSO THE WRONG SIZE. It spans +/-0.5 of a FULL-RES
+//   pixel, and the half-res block is two pixels across, so unscaled it can only
+//   reach the middle quarter of the block and can never place a sample on the
+//   outer pixels' centres. Scaled by two it is no longer the sequence TSR
+//   expects, so the alignment it was supposed to buy is gone anyway.
+//
+//   WHAT ALIGNMENT WAS ACTUALLY FOR IS AVOIDING A BEAT, and that IS handled: a
+//   cycle of 4 or 8 against the engine's own power-of-two sample count
+//   (r.TemporalAASamples, 8 by default) has a least common multiple of 8. The
+//   combined pattern repeats in eight frames, which is far too fast to read as
+//   the low-frequency wobble a coprime pair would produce.
+//
+// VELOCITY AND REPROJECTION ARE UNAFFECTED, AND HERE IS THE ARGUMENT. The emit
+// does not difference this frame's buffer against last frame's; it takes ONE
+// world point (HitTWS) and projects it through the current and the previous
+// clip transforms. Move that point and BOTH projections move with it, so the
+// velocity vector stays the camera's motion for the point actually shaded --
+// no apparent motion is injected. On an EXACT pixel the point is that pixel's
+// own true hit and nothing changes at all. On a FALLBACK pixel the point moves
+// within the block each frame, so the velocity is the right vector at a
+// slightly wrong place: a second-order error, not a spurious first-order one.
+//
+// WHAT DOES CHANGE ON A FALLBACK PIXEL IS ITS DEPTH, and that is the risk to
+// watch. The depth pre-emit writes SV_Depth from this same reconstruction, so
+// under the jitter the SCENE DEPTH BUFFER itself moves by a sub-voxel amount
+// every frame at fallback pixels -- and TSR uses depth to decide disocclusion.
+// If it reads that wobble as disocclusion it will reject history there, and
+// rejected history is a flicker. Nothing written here can settle that; it is
+// the measurement.
+//
+// THE OTHER TWO CONSUMERS OF THE LATTICE, CHECKED RATHER THAN ASSUMED:
+//
+//   voxel.March 2 (scratch) redirects the emit's RENDER TARGETS and nothing
+//   else -- same reconstruction, same lattice, same shader. It has no opinion
+//   about where the sample sits and needs no change.
+//
+//   THE VERIFY GATE keeps running at full res through the same reconstruction,
+//   so it still grades the number the emit would have written, which is what it
+//   is for. But its result is now FRAME-DEPENDENT: a fallback pixel is graded
+//   against a sample up to a pixel further away than it was under the static
+//   lattice, so the fallback population's disagreement grows and varies with
+//   the phase. THAT IS NOT A BREAKAGE AND IT IS NOT A LICENCE -- the
+//   pre-registered falsifier is the INTERIOR rate, and an interior pixel whose
+//   true voxel IS among the candidates is still reconstructed exactly, at any
+//   phase. To read the gate against the static arm's numbers, PIN THE PHASE
+//   (voxel.March.HalfRes.JitterPhase 0..N-1) so the same lattice is graded
+//   twice; free-running, compare distributions and not single frames.
+//
+// THE FALSIFIER FOR THIS ARM, PRE-REGISTERED AND SEPARATE FROM THE HALF-RES ONE:
+//
+//   INERT: if the sample offset does not change between frames, the arm did
+//   nothing. voxel.March.Stats prints 'phasesSeen'; anything short of the full
+//   cycle count on a settled leg means the lattice is static, and every image
+//   taken since describes the arm this was supposed to replace.
+//
+//   REFUTED: if the offset does change and the FAR-FIELD GRAININESS is
+//   unchanged on a pinned-pose A/B, then temporal accumulation is not the cure
+//   for a four-voxels-per-sample undersample, and this should be REVERTED
+//   rather than tuned. Tuning the amplitude or the sequence after that reading
+//   is fitting noise.
+//
+//   WORSE: any new shimmer or crawl IN MOTION refutes it even if the parked
+//   image improves, because a flicker is a worse defect than the graininess it
+//   replaced. THIS MUST BE JUDGED ON A MOVING CAPTURE. A parked capture cannot
+//   show a temporal artefact at all, so a parked A/B is necessary and is not
+//   sufficient, and no verdict may be given from one.
+//
+// ---------------------------------------------------------------------------
 // NOT BUILT YET, ON PURPOSE: THE SILHOUETTE FIXUP
 // ---------------------------------------------------------------------------
 //
@@ -493,6 +622,16 @@ float    MarchVolumeExtentUU;
 float2   MarchViewRectMin;
 float2   MarchViewRectSize;
 float2   MarchInvProjDiag;
+// THE HALF-RES SAMPLE LATTICE'S PER-FRAME OFFSET, in FULL-RES PIXELS, applied
+// INSIDE the 2x2 block (voxel.March.HalfRes.Jitter). Zero is the static lattice
+// this arm shipped with, and the host forces it to zero at full res -- see
+// VoxelMarchSampleSvPosition for why a full-res jitter would be a bug and not a
+// feature. Bound on EVERY permutation, including the ones compiled with
+// VOXEL_MARCH_HALFRES 0, for the reason the cover pair in the .cpp gives: a
+// shader-side global with no entry in the parameter struct is an UNBOUND
+// uniform, and this project has already spent days on switches that were armed
+// and silently reading zero.
+float2   MarchSampleJitter;
 float4   MarchInvDeviceZToWorldZ;
 float    MarchPixelConeSlope;
 float    MarchClimateStrength;   // 0 = no climate tint (byte-identical to before)
@@ -777,16 +916,39 @@ int2 VoxelMarchSampleGridSize()
 //
 // THE ALTERNATIVE, AND WHY IT IS REJECTED ON AN ARGUMENT RATHER THAN A
 // MEASUREMENT (it has not been measured, and saying so is the point): putting
-// the sample on ONE of the four pixel centres makes that pixel exact and the
-// other three reconstructions, so the fallback population would be
-// systematically offset toward one corner of every block. That is a
+// the sample on ONE of the four pixel centres AND LEAVING IT THERE makes that
+// pixel exact and the other three reconstructions, so the fallback population
+// would be systematically offset toward one corner of every block. That is a
 // direction-dependent artefact, and direction-dependent artefacts in this
 // project have twice been mistaken for terrain features. Equidistant costs
 // nothing and cannot produce one.
+//
+// MarchSampleJitter IS THAT ALTERNATIVE MADE ADMISSIBLE, and the words doing
+// the work above are "AND LEAVING IT THERE". Under voxel.March.HalfRes.Jitter 1
+// the sample visits all four pixel centres in a four-frame rotation, so the
+// corner bias exists in any ONE frame and has NO DIRECTION AT ALL over the
+// cycle -- the premise of the refusal is removed rather than overruled. Under
+// Jitter 0 the offset is exactly zero and this function is character for
+// character the expression it always was.
+//
+// THIS IS THE ONLY PLACE THE LATTICE IS DEFINED, and that is load-bearing.
+// VoxelMarchMain builds the MARCHED ray from it, and VoxelMarchReconstruct
+// rebuilds a CANDIDATE's ray from it (through VoxelMarchSampleDirWorld) -- so a
+// moving lattice moves both by construction. If the two ever derived the sample
+// point separately, the plane the reconstruction intersects would not be the
+// plane the march crossed, and the failure is a sub-voxel depth error spread
+// over the whole image: the hardest defect to attribute in this renderer.
+//
+// AND THE JITTER IS HALF-RES ONLY, WHICH IS A CORRECTNESS REQUIREMENT AND NOT A
+// SCOPE DECISION. At full res the emit does a direct Load at the pixel's own
+// texel and rebuilds its ray from its own unjittered SV_Position; a jittered
+// march would then hand it a t measured along a DIFFERENT ray, and every pixel
+// on screen would take a wrong depth. The #if below is the guard, and the host
+// zeroes the uniform at full res as well, so neither half can arm it alone.
 float2 VoxelMarchSampleSvPosition(int2 SampleXY)
 {
 #if VOXEL_MARCH_HALFRES
-	return MarchViewRectMin + float2(SampleXY << 1) + 1.0f;
+	return MarchViewRectMin + float2(SampleXY << 1) + 1.0f + MarchSampleJitter;
 #else
 	return MarchViewRectMin + float2(SampleXY) + 0.5f;
 #endif
@@ -999,6 +1161,26 @@ FVoxelMarchRecon VoxelMarchReconstruct(int2 LocalPixelFull, FVoxelMarchRay Ray)
 		//
 		// If the containing sample MISSED, this pixel misses. That is also the
 		// nearest-neighbour answer and it is the one that cannot invent terrain.
+		//
+		// UNDER voxel.March.HalfRes.Jitter THIS IS THE POPULATION AT RISK, and
+		// it is worth being explicit because it is the one way the jitter can
+		// make the picture WORSE rather than better. A fallback pixel takes the
+		// containing sample's t and vis packet VERBATIM, and the containing
+		// sample now MOVES inside its block every frame. So a pixel that falls
+		// back every frame gets a different depth, normal, material and AO every
+		// frame, with no motion to explain the change:
+		//
+		//   * where TSR accepts the variation, the four candidates average and
+		//     the pixel goes from a fixed wrong value to a soft correct-on-
+		//     average one, which is the entire point of the change;
+		//   * where TSR's neighbourhood clamp REJECTS it, the pixel flickers --
+		//     and a flicker is a worse defect than the softness it replaced.
+		//
+		// Which of the two happens is a property of the SCENE and cannot be
+		// argued from here, so it is a measurement and not a claim. It is also
+		// why this arm's falsifier is a MOVING capture: a parked pose cannot
+		// show a temporal artefact at all. See THE TEMPORALLY VARYING SAMPLE
+		// LATTICE at the top of this file.
 		const int2 C = clamp(Base, int2(0, 0), GridMax);
 		const FVoxelMarchVis Vc = VoxelMarchUnpackVis(MarchVis.Load(int3(C, 0)));
 		if (Vc.bHit)
@@ -1202,6 +1384,51 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_FT_CONSIDERED], H.FallthroughConsidered);
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_FT_TAKEN], H.FallthroughTaken);
+				}
+				// THE RESIDENT-Z BOUND'S ENGAGEMENT TRIO (voxel.March.ZCut).
+				// Guarded on Consulted for the same reason the ladder is: with
+				// the arm off nothing is consulted, so the control leg pays no
+				// atomics here and its counters are a structural zero rather
+				// than a measured one -- which is exactly what makes
+				// "consulted == 0 while the cvar reads 1" a verdict on the arm
+				// and not on the world.
+				if (H.ZCutConsulted != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZCUT_CONSULTED], H.ZCutConsulted);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZCUT_SKIPPED], H.ZCutSkipped);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZCUT_CLIPPED], H.ZCutClipped);
+				}
+				// THE COARSE OCCUPANCY LEVEL'S ENGAGEMENT TRIO
+				// (voxel.March.BlockSkip). Guarded on Consulted for the reason
+				// the two groups above are: with the arm compiled out nothing is
+				// consulted, so the control leg pays no atomics here and its
+				// counters are a STRUCTURAL zero rather than a measured one --
+				// which is exactly what makes "consulted == 0 while the arm is
+				// armed" a verdict on the arm and not on the world.
+				//
+				// THE FIELDS EXIST ON BOTH ARMS (they are guarded by
+				// VOXEL_MARCH_HOLE_STATS, not by VOXEL_MARCH_BLOCK_SKIP), so
+				// this compiles unchanged with the coarse level switched off and
+				// reads a real zero there.
+				if (H.BlockConsulted != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BLK_CONSULTED], H.BlockConsulted);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BLK_SKIPPED], H.BlockSkipped);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BLK_CELLS], H.BlockCellsAvoided);
+					// The sky licence's trio, emitted under the SAME
+					// `BlockConsulted != 0` guard as the three above, and that
+					// is not tidiness. It is what makes blkSkyLicensed=0 a
+					// verdict on the SKY WRITER rather than an artefact of a
+					// ray that consulted no block at all: a ray that never
+					// reached the coarse level contributes to neither the
+					// numerator nor the denominator, so the licensed rate stays
+					// a rate over decisions actually made.
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BLK_SKY_LICENSED],
+					               H.BlockSkyLicensed);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BLK_SKY_RUNBLOCKS],
+					               H.BlockSkyRunBlocks);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BLK_SKY_RUNS],
+					               H.BlockSkyRuns);
 				}
 				if (H.bHit)
 				{
