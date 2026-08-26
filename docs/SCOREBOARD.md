@@ -340,3 +340,161 @@ proven-air fine footprint, which is what a near mountain is MADE OF.
 **Still open, in order:** adaptive per-ray ring depth (the one uncontested 1.356 ms);
 rasteriser-bounded rays (GigaVoxels/SparseLeap/Teardown/Dreams all converged on it);
 `kAnySolidBit` is a hardcoded 1 so the marcher's advertised cheapest skip has never fired.
+
+---
+
+## 2026-08-26 (later): THE MARCHER, MEASURED PROPERLY
+
+Everything below is from matched legs on ONE binary, `view=1552x873` read from the
+marcher's own line, `DOUBLE GRANT: 0` on every leg quoted.
+
+### The law that governs this problem
+
+**Marcher cost is RAY-COUNT LINEAR and nothing else moves it.** The 2026-08-25
+screen-percentage sweep: 4.37 / 3.99 / 3.91 ms per Mray across a 5.7x range,
+linear within 2%. Every per-ray knob is spent -- StepBudget flat across a 4x cut,
+SkipLevels 1 and 2 byte-identical, AO free, Velocity free, ReachM inert
+(`VoxelMarchRenderer.cpp:687`).
+
+**That is why five empty-space arms died.** They were all attempts to make a ray
+cheaper. The per-ray cost does not move. The lever is RAY COUNT.
+
+### Half-res + jitter: four matched MOVING legs (`line`, 23.4 m/s)
+
+    arm                  rays        p50    p95    p99      fps   lattice proof
+    A control (ship)     1.355 Mray  9.20  15.40  19.70     51    full-res, correct
+    B half-static        0.339 Mray  7.00  12.10  16.80     60    phasesSeen=1/1
+    C half + jitter x4   0.339 Mray  7.00  11.90  16.70     60    phasesSeen=4/4 mask=0x0F
+    D half + Halton x8   0.339 Mray  7.00  12.00  16.50     61    phasesSeen=8/8 mask=0xFF
+
+**The jitter is FREE.** B/C/D spread (16.50-16.80) is narrower than the control's
+own run-to-run spread. Half-res also lifts streaming throughput 26% (399 -> 504
+chunks/s). Control reproduces the published band (19.70 vs 20.20/19.70/20.30).
+
+**NO ARM READ INERT.** The jitter ran for the first time since it was written:
+four and eight DISTINCT offsets logged, zero STATIC-lattice warnings.
+
+### The jitter FAILED its own pre-registered falsifier
+
+Frozen camera, frozen sun, settled world. Noise floor 0.0124% (control vs control):
+
+    arm            frame-to-frame     first vs last (1.25 s)
+    control        0.0004-0.0015%     0.0013%
+    half-static    0.0001-0.0015%     0.0010%
+    half-jitter4   0.337-0.416%       1.289%
+    half-jitter8   0.301-0.436%       1.294%
+
+Both unjittered arms converge to a still image. **Neither jittered arm settles** --
+flat at ~0.35-0.42% with NO DECAY over 1.25 s, ~300x the control, diverging further
+on a longer baseline. Concentrated in the **NEAR field** (bottom band 1.05%, top
+band 0.07%) -- not the far field the arm exists to fix.
+
+The arm's own falsifier named this in advance: "any new shimmer or crawl IN MOTION
+refutes it even if the parked image improves."
+
+**A MOVING CAPTURE DOES NOT EXIST AS A CAPABILITY HERE.** `voxel-capture.ps1` is
+frozen-pose only; bolting a flight onto it produced a CONTROL that differed from
+ITSELF by 70-81% frame to frame. That set was discarded, not reported. Judging
+shimmer-in-motion needs the owner flying it or a video path nobody has built.
+
+Captures for the owner's verdict: `Saved/jitter-captures-2026-08-26/`.
+
+### The anySolid census: the skip that has never fired
+
+`VoxelBrickTraverse.ush:2233` reads `VOXEL_MARCH_INDEX_ANYSOLID_BIT` and early-outs
+-- "the cheapest possible skip". All three writers hardcode the bit to 1
+(`VoxelMarchChunkIndex.cpp:867`, `:1362`, `VoxelMarchIndexScatter.usf:184`), so the
+branch has NEVER EXECUTED. Such chunks are rejected one step later at
+`LevelAndFlags & 0x10u` (`:2305`) -- AFTER a scattered 16-byte fetch into the
+15.7 MB chunk table.
+
+Census over 7 outcome buckets, identity PASS on all three poses:
+
+    pose      probes/ray   pay for fetch   OF THOSE, WASTED   wasted/frame
+    down          5.2         88.16%          35.11%             2.20 M
+    horizon      85.5         28.79%          69.13%            23.06 M
+    sky         194.4         12.10%          73.10%            23.30 M
+
+The absolute wasted-fetch count goes 2.2 -> 23.1 -> 23.3 M, a 10x jump tracking the
+1.108 / 4.45 / 5.638 ms cost curve.
+
+**TEMPER THE EXPECTATION.** This box is an RX 7800 XT: 4 MB L2, 64 MB Infinity
+Cache. The 15.7 MB table does NOT fit L2 but DOES fit MALL, so these are L2 misses
+hitting Infinity Cache, not DRAM. And neighbouring rays in a wave probe the SAME
+chunks -- nothing here measures distinct lines. **Expect single-digit to
+low-double-digit percent of march time (~0.2-0.4 ms), NOT anything proportional
+to 73%.**
+
+Instrument costs +28% of march time (1.432/5.695/7.155 vs 1.108/4.448/5.638), so
+those legs must never be quoted for ms. Left in place, defaulted off, rides
+`voxel.March.HoleStats 1`.
+
+### RETIRED: the open-sky mark as a tStart bound
+
+**Structurally dead, with proof.** `MarkOpenSkyColumn` has ONE call site, inside
+`EnumerateSurfaceFootprintCandidates`, reached only for footprints that passed
+`EntryFootprintXYWanted`. It marks a RIND above the admitted top --
+`min(SkyMarkChunks=8, SkyMarkMetres=512 m)`, i.e. **25.6 m at level 0**. The cap is
+not a tuning oversight: the toroidal grid is 128 cells deep per level, so "mark the
+sky" is NOT EXPRESSIBLE in it.
+
+    marked cells      50,784 of 16,777,216   = 0.303%
+    licensed blocks      125 of 262,144      = 0.048%
+    not-proven-empty                         >= 99.09%
+
+And the dilation fix that made the mark SOUND cost 4.4x of its licensing power
+(mark's contribution to ladder skips 42.89 pp -> 9.70 pp), moving "unprovable gap
+above admitted top" from 4.59% to **85.87% of columns**. The marked slab now FLOATS,
+separated from the resident shell by unmarked blocking air, in 85% of columns.
+A tStart collapses to that gap. **Do not revisit.**
+
+### The elevation atlas is NOT a ceiling source
+
+`VoxelRasterAtlas.cpp:842` is ONE `Tiles.elevationMm(px,py)` per pixel -- a POINT
+SAMPLE, no max, no mean. At the shipped 1,875 mm pitch what it returns is a **cubic
+B-spline CONTROL POINT, not the surface** (`voxelcore/tiles.h:51-56`). Terrain only,
+no crowns. A sound ceiling is constructible from it but goes **silently unsound on a
+coarse-tier run** (30 m pitch, raw samples, 2.98x prefilter sharpening gain --
+`amplifier.cpp:1920-1930` calls that "a hole in the world").
+
+Worth keeping: **absence is OUT-OF-BAND here**, uniquely in this codebase.
+`rasterElevationMm` returns `kSeaLevelMm` on a miss, but `atlasResolve` returns a
+BOOL off a per-slot page tag (`worldgen.ush:1473-1502`), so a consumer CAN tell
+"no data" from "low ground".
+
+### ZCut: the refutation was of its INPUT, not its structure
+
+`voxel.March.ZCut` was recorded as "+2% at the horizon, -6% at sky, skipped 0.00%".
+**The shader is sound and already clamps BOTH ends of every segment**
+(`VoxelBrickTraverse.ush:4296-4475`) -- the near-end bound assumed missing is
+already there. Three real defects, none inherent to the idea:
+
+1. Its source `GetResidentChunkZBound` is a **cumulative union of resident chunk Z
+   that never narrows** -- its own cvar help admits it "widens until the cut removes
+   nothing". That is RESIDENCY, which cannot prove emptiness in this world.
+2. The pad is 2^L -- **819 m at level 6** (`VoxelMarchRenderer.cpp:551-553`) plus a
+   204.8 m in-shader bias. It structurally cannot bind at the coarse rings where a
+   sky ray spends its time.
+3. `bZCutRemoved` sets BOTH conjuncts of the retry gate (`:4453`, `:4459` vs
+   `:4638`), so a merely-NARROWED segment force-buys a second full walk.
+
+A sound world-derived bound already exists and runs every streaming tick:
+`FootprintSurfaceUpperBoundMm` (`VoxelWorldSubsystem.cpp:14066`) ->
+`Amplifier::surfaceUpperBoundMm`. Crown-inclusive at EVERY level, memoised,
+declines rather than guessing. Swapping the source makes the soundness claim
+STRONGER: a cut chunk goes from "provably not resident" to "provably all air".
+
+**The go/no-go number is `H - Zc`**, relief above the camera within reach. World's
+highest land is 6,331 m so no constant serves. If median headroom is kilometres
+this is a null.
+
+### Corrections to standing notes
+
+- **Tallest baked asset is 45.0 m** (sitka spruce / western red cedar), tightened
+  from the 60 m authored cap by `assetmanifest.cpp:442-462`. The "~17 m" figure in
+  circulation is STALE. A flagged +7.4 m nominal-vs-baked discrepancy exists.
+- `TExitUU` appears **0 times** in `VoxelBrickTraverse.ush`. `TMaxUU`'s real readers
+  are `:4269` and a **second at `:4860`**.
+- **Do NOT shrink the camera-centred box asymmetrically.** `bValid` is a dead test
+  today, so an asymmetric box gives it a false population written out as a miss with
+  ZERO instrumentation.
