@@ -93,9 +93,18 @@ Copy-Item (Join-Path $Shaders 'VoxelMaterialPalette.ush') $Stage
 (Get-Content (Join-Path $Shaders 'VoxelFluidCollision.ush') -Raw).
     Replace('"/VoxelEarth/VoxelFluidContract.ush"', '"VoxelFluidContract.ush"') |
     Out-File (Join-Path $Stage 'VoxelFluidCollision.ush') -Encoding utf8
+# VoxelMarchIndexCell.ush IS AN UNCONDITIONAL INCLUDE OF VoxelBrickTraverse.ush
+# (:1953, "the entry bit layout and the coord->cell wrap now live in a shared
+# include"), and staging it was never added when that include was introduced.
+# Without it EVERY check in this script died on 'file not found' -- 21 of 29
+# FAILs whose only visible line was an unrelated -Wambig-lit-shift WARNING from
+# the same file, which reads exactly like a mid-edit shader tree and is not one.
+# It has no includes of its own, so a straight copy is enough.
+Copy-Item (Join-Path $Shaders 'VoxelMarchIndexCell.ush') $Stage
 (Get-Content (Join-Path $Shaders 'VoxelBrickTraverse.ush') -Raw).
     Replace('"/VoxelEarth/VoxelFluidCollision.ush"', '"VoxelFluidCollision.ush"').
-    Replace('"/VoxelEarth/VoxelMaterialPalette.ush"', '"VoxelMaterialPalette.ush"') |
+    Replace('"/VoxelEarth/VoxelMaterialPalette.ush"', '"VoxelMaterialPalette.ush"').
+    Replace('"/VoxelEarth/VoxelMarchIndexCell.ush"', '"VoxelMarchIndexCell.ush"') |
     Out-File (Join-Path $Stage 'VoxelBrickTraverse.ush') -Encoding utf8
 (Get-Content (Join-Path $Shaders 'VoxelMarch.usf') -Raw).
     Replace('#include "/Engine/Private/Common.ush"', '#include "engine-stub.ush"').

@@ -334,7 +334,33 @@ if ($SpawnYaw -ne 45) {
 # Only `voxel.*` is checked. Engine names (r.*, t.*, sg.*) are registered inside
 # the engine, not in this tree, so demanding a match would reject valid ones.
 if ($Cvars) {
-    $names = [regex]::Matches($Cvars, '(?:^|\|)\s*([A-Za-z_][\w.]*)') |
+    # REFUSE THE PIPE, BECAUSE UE IGNORES IT AND THIS SCRIPT USED TO ENDORSE IT.
+    #
+    # UE splits -ExecCmds on COMMA ONLY (ParseExecCommands.cpp:11-55, and note
+    # that a comma inside single quotes is protected -- the pipe is not special
+    # anywhere in that function). A pipe is just another character appended to
+    # the command being built, so
+    #
+    #     -ExecCmds="voxel.March 1|voxel.March.TAAJitter 1"
+    #
+    # reaches the console as ONE command, `voxel.March` is set from the argument
+    # string "1|voxel.March.TAAJitter", the leading 1 parses, and EVERY CVAR
+    # AFTER THE FIRST PIPE IS SILENTLY DISCARDED. No warning, no log line.
+    #
+    # This check exists because the validator directly below used to split on
+    # '|' -- so a pipe-separated list passed validation, looked correct in the
+    # banner, and measured only its first cvar. Measured 2026-08-26: five capture
+    # arms that differed only in a second, piped cvar produced five images that
+    # differed only at the noise floor, which reads exactly like a null result
+    # and was a dropped argument. tools\voxel-run-flight-leg.ps1:73 has always
+    # documented the comma; this script documented nothing and validated a pipe.
+    if ($Cvars -match '\|') {
+        throw ("REFUSING TO START: -Cvars contains a '|'. UE splits -ExecCmds on COMMA only " +
+               "(ParseExecCommands.cpp:11-55); a pipe is not a separator, so everything after " +
+               "the first one is silently dropped and the capture measures only the first cvar. " +
+               "Use ',' -- e.g. -Cvars 'voxel.March 1, voxel.March.TAAJitter 1'.")
+    }
+    $names = [regex]::Matches($Cvars, '(?:^|,)\s*([A-Za-z_][\w.]*)') |
              ForEach-Object { $_.Groups[1].Value } |
              Where-Object { $_ -like 'voxel.*' }
     if ($names) {
