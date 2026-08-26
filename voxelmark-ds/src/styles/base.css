@@ -1,0 +1,83 @@
+/* The root wrapper and the typographic scale.
+ *
+ * EVERY COMPONENT IN THIS SYSTEM MUST BE INSIDE .vm-root. That is where the
+ * serif face, the ink colour and the square-cornered baseline are applied --
+ * outside it, components render in the host page's font and inherit whatever
+ * colour it uses, which is the single most common way a VoxelMark screen ends
+ * up looking wrong. VoxelMarkRoot renders this class for you.
+ */
+.vm-root {
+  font-family: var(--vm-font-serif);
+  color: var(--vm-ink);
+  background: var(--vm-menu-backdrop);
+  line-height: 1.35;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* NO ROUNDED CORNERS ANYWHERE. The whole visual language is square: panels,
+ * buttons, bars and caps are all hard rectangles, and a stray border-radius
+ * reads immediately as not-this-game. */
+.vm-root *,
+.vm-root *::before,
+.vm-root *::after {
+  box-sizing: border-box;
+  border-radius: 0;
+}
+
+/* --- typography ---------------------------------------------------------- */
+
+.vm-text {
+  margin: 0;
+  font-family: var(--vm-font-serif);
+}
+
+.vm-text--title { color: var(--vm-gold); }
+.vm-text--body  { color: var(--vm-ink); }
+.vm-text--dim   { color: var(--vm-ink-dim); }
+.vm-text--mute  { color: var(--vm-ink-mute); }
+.vm-text--gold  { color: var(--vm-gold); }
+.vm-text--parchment { color: var(--vm-parchment); }
+.vm-text--danger { color: var(--vm-hp-bright); }
+
+/* The drop shadows the screens actually use, as named steps rather than
+ * arbitrary values -- these three are the only ones in the front end. */
+.vm-shadow-title { text-shadow: 3px 3px 0 rgba(0, 0, 0, 0.95); }
+.vm-shadow-body  { text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.85); }
+.vm-shadow-tight { text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.7); }
+
+/* --- the screen frame ---------------------------------------------------- */
+/* Both screens are the same construction: flat backdrop, optional photographic
+ * art, a wash over the art, then content. */
+
+.vm-screen {
+  position: relative;
+  overflow: hidden;
+  background: var(--vm-menu-backdrop);
+  width: 100%;
+  height: 100%;
+}
+
+.vm-screen__art {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* THE WASH GOES AWAY WITH THE ART, deliberately. With no art the menu sits on
+ * its flat #0a0a0f backdrop, and adding the wash anyway would put near-black
+ * buttons on near-black. The component omits this element rather than
+ * rendering it transparent. */
+.vm-screen__wash {
+  position: absolute;
+  inset: 0;
+}
+
+.vm-screen__content {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
