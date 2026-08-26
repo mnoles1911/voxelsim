@@ -341,110 +341,35 @@ FORCEINLINE FVoxelBrickChunkShading ShadingForPublish(const VoxelCoords::FVoxelL
 }
 
 // ===========================================================================
-// THE PER-TICK CEILING -- read Saved/ahead-on.log before touching any of this
+// THE PER-TICK CEILING -- RETIRED 2026-08-26, NEVER HOOKED
 // ===========================================================================
 //
-// THE DRAIN LOOP IS NOT COST-BOUND. IT IS CAP-BOUND, AND THE CAP ALREADY
-// COUNTS ITSELF. `Voxel apply stages` prints the loop's exit attribution, and
-// on ahead-on.log (the fixed configuration) every FILLING window reads:
+// AppliesPerTickCap / ApplyBudgetSeconds / DrainsPerTickCap and their three
+// -VoxelApply* command-line switches lived here and WERE NEVER CALLED. The
+// hooks in docs/apply-per-tick-ceiling-2026-08-23.md section 4 were designed
+// but never applied to VoxelWorldSubsystem.cpp, so all three functions had
+// zero call sites for their whole life while reading as the live governor of
+// the drain loop. Deleted so nobody else reads them that way.
 //
-//   win ticks  %wall | qEmpty wall cntCap drnCap | drained | appl/tick us/chunk
-//     2   103  26.1  |      0   36     67      0 |  13873  |   134.7    26.9
-//     3   107  24.7  |      0   30     77      0 |  15816  |   147.8    21.7
-//     4    94  24.4  |      0   23     71      0 |  14054  |   149.5    18.9
-//     5    95  20.9  |      0   25     70      0 |  14174  |   149.2    19.8
-//     6   106  25.3  |      0   29     77      0 |  15473  |   146.0    19.8
-//     7   107  27.4  |      0   29     78      0 |  16028  |   149.8    20.4
-//     8   105  29.0  |      0   27     78      0 |  15697  |   149.5    21.5
-//    11   114  21.5  |      0   33     81      0 |  16407  |   143.9    19.8
+// THE MEASUREMENT THEY WERE BUILT FROM IS NOT LOST. The ahead-on.log census
+// (every filling window, the three-facts reading, the order the three ceilings
+// bind in, the failing readings both ways, and the `tail -1` trap that has
+// produced four retractions) is reproduced in full in
+// docs/apply-per-tick-ceiling-2026-08-23.md. Read that before touching the
+// apply loop; it is still the current understanding.
 //
-// Three facts, none of which needed a new leg:
+// WHAT ACTUALLY GOVERNS THE APPLY LOOP TODAY:
+//   count  -> VoxelDebug::GetStreamMaxAppliesPerFrame (voxel.Stream.
+//             MaxAppliesPerFrame, overridable by -VoxelApplyPerTick=)
+//   clock  -> VoxelDebug::GetStreamApplyBudgetMs, read by DrainResults into
+//             its own local named ApplyBudgetSeconds -- a LOCAL VARIABLE that
+//             happens to share this function's old name, which is exactly what
+//             made the dead layer easy to misread as live.
+//   drains -> the bare kMaxResultDrainsPerFrame constant in DrainResults.
 //
-//   queueEmpty = 0 IN EVERY FILLING WINDOW. The drain never once ran out of
-//   results. The producer is NOT the limit; "results are not arriving" is
-//   refuted for this configuration.
-//
-//   countCap is 65-76% of tick exits. That exit is `Applied >= MaxApplies`,
-//   i.e. voxel.Stream.MaxAppliesPerFrame = 192. A countCap tick delivers
-//   EXACTLY 192, so ~93% of every window's drained chunks come out of ticks
-//   that stopped because of this number. Throughput = 192 x tickRate: at the
-//   observed ~21 Hz that is 4,032/s, and measured is ~3,163/s.
-//
-//   The game thread is 21-29% of wall. There is 3-4x of headroom the pipeline
-//   is not taking, because a COUNT ceiling -- not a cost -- is stopping it.
-//
-// 50,000/s at 21 Hz needs 2,381 applies/tick. The ceiling is 192. TWELVE
-// TIMES SHORT, and it is the throttle rather than the safety rail its own
-// cvar help text says it is ("a safety ceiling, not the steady-state
-// throttle"). It was set to 192 on 2026-07-27 for a 1,040 chunks/s target,
-// when an apply was expensive enough that 192 filled the 6 ms budget. It is a
-// cap sized for a system that no longer exists.
-//
-// THE ORDER THE THREE CEILINGS BIND IN, which is why all three are here and
-// raising one alone buys almost nothing:
-//
-//   1. MaxAppliesPerFrame 192      binds NOW.        -> ~4,000/s
-//   2. ApplyBudgetMs 6.0           binds NEXT. Apply is 2.5-3.9 ms/tick today,
-//                                  under 6, which is why wallClock is the
-//                                  minority exit. Raise (1) and this governs:
-//                                  6 ms / 0.021 ms = 286/tick = ~6,000/s.
-//   3. kMaxResultDrainsPerFrame    binds THIRD, at 1024 x 21 Hz = ~21,500/s --
-//      1024, a constexpr with       and it is a COMPILE-TIME CONSTANT with no
-//      NO CVAR AT ALL               cvar, so a leg that hits it has no knob to
-//                                   turn. Raised here pre-emptively so the
-//                                   next wall is not discovered by a rebuild.
-//
-// Only after all three does the 0.021 ms/chunk per-chunk cost decide anything:
-// at 2,381 chunks/tick it is 50 ms/tick = 105% of a 21 Hz thread, which is the
-// 50k budget's "apply must roughly halve" restated per tick.
-//
-// WHY LATCHED SWITCHES AND NOT JUST THE CVARS. The cvars are settable, but
-// -ExecCmds lands AFTER streaming has begun (tools/voxel-capture.ps1:114), so
-// a cold-fill leg driven that way measures a blend of 192 and the new value
-// and its time-to-settle is uninterpretable. These decide before the first
-// tick. ABSENT = the cvar/constant, unchanged, byte for byte.
-//
-// PROOF OF TRAFFIC IS THE EXIT LINE THAT ALREADY EXISTS -- no new counter is
-// added, because `Voxel apply stages` is already exactly the right
-// instrument. The readings, both ways:
-//
-//   -VoxelApplyCap=2048 on, countCap STILL 65-76% of exits, appl/tick still
-//     ~150            -> the override did NOT latch. The hook was not applied
-//                        or the parse failed. Check the one-shot
-//                        `Voxel apply caps:` line below: if it is missing, the
-//                        module is not being called at all.
-//   countCap -> 0, wallClock now dominant
-//                     -> WORKING, and ApplyBudgetMs is now the governor. This
-//                        is the expected first result, not a failure. Raise
-//                        -VoxelApplyBudgetMs next.
-//   drainCap > 0      -> WORKING, and kMaxResultDrainsPerFrame is now binding.
-//                        Expected past ~1024 drains/tick; raise
-//                        -VoxelApplyDrainCap.
-//   queueEmpty > 0 DURING A FILLING WINDOW
-//                     -> THE SUCCESS CONDITION AND THE STOP SIGNAL. The drain
-//                        has caught up with the producers; apply is no longer
-//                        the bound and further work here buys nothing. Hand
-//                        back to dispatch/generation.
-//   appl/tick rises but drained/s does NOT
-//                     -> the caps were not the bound after all. Revert them
-//                        and re-read; do not keep raising.
-//
-// A caution the log itself teaches: windows 13+ of ahead-on.log read
-// queueEmpty=201 with drained=0. That is the settled post-fill linger, not a
-// starved drain. `grep | tail -1` lands there and has produced four
-// retractions. Read every window, and confirm drained>0.
+// -VoxelApplyCap= IS RETIRED. VoxelDebug.cpp warns if it is passed; keep that
+// warning -- it is what stops a doc-driven leg silently measuring nothing.
 
-// Effective per-tick apply ceiling. Pass the cvar's value; the switch
-// overrides it when present. -VoxelApplyCap=0 or absent -> CvarValue.
-int32 AppliesPerTickCap(int32 CvarValue);
-
-// Effective per-tick wall-clock budget, SECONDS. Pass the cvar's value in
-// seconds; -VoxelApplyBudgetMs= overrides it. Absent -> CvarSeconds.
-double ApplyBudgetSeconds(double CvarSeconds);
-
-// Effective per-tick total dequeue ceiling (stale discards included).
-// Replaces the bare constexpr 1024. Absent -> 1024.
-int32 DrainsPerTickCap();
 // Dispatch-site twin of ShadingForPublish, and OFF IS FREE HERE FOR THE SAME
 // REASON: with the switch absent this folds to the exact expression it
 // replaced, so no branch survives, no counter moves, and a control leg prints

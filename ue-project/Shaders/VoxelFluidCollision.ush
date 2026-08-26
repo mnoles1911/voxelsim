@@ -274,19 +274,6 @@ bool VoxelFluidSolidAtVoxel(int3 worldVoxel)
 #endif // VOXEL_FLUID_SOLID_NO_FETCH
 }
 
-// Volume-local UU -> world voxel. One floor and one integer add, which is what
-// the FluidOriginUU == FluidVolumeOriginVoxel * VOXEL_FLUID_VOXEL_UU rule at
-// the top of this file buys.
-int3 VoxelFluidVoxelForPosUU(float3 posUU)
-{
-	return (int3)floor(posUU / VOXEL_FLUID_VOXEL_UU) + FluidVolumeOriginVoxel;
-}
-
-bool VoxelFluidSolidAtPosUU(float3 posUU)
-{
-	return VoxelFluidSolidAtVoxel(VoxelFluidVoxelForPosUU(posUU));
-}
-
 // ---------------------------------------------------------------------------
 // The voxel-line walk
 // ---------------------------------------------------------------------------

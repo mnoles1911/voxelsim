@@ -2366,7 +2366,10 @@ reserving 13 of 24 slots and collapsing throughput from 49,179 chunks to 558 —
 what a second invisible constraint looks like.
 
 **Consequence 2 — `MaxJobsInFlight` does not bound the result queue, and never did.**
-`DrainResults` has a budget (`kMinAppliesPerFrame` / `ApplyBudgetSeconds`) and
+`DrainResults` has a budget (`kMinAppliesPerFrame` / the wall budget it reads
+from `VoxelDebug::GetStreamApplyBudgetMs` into a local it calls
+`ApplyBudgetSeconds` — note that `VoxelApplyFast::ApplyBudgetSeconds()` was a
+different, never-called function, deleted 2026-08-26) and
 breaks out with results still queued. `JobsInFlightCounter` has already decremented
 for those, so the dispatch loop keeps launching while the drain backlog grows.
 True on the CPU path today; GPU latency does not change the mechanism, only the

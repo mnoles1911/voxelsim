@@ -36,11 +36,6 @@ int32 MaxConsecutiveSeen = 0;
 // throttle-vs-redistribute disproof is settled against: work genuinely carried
 // costs cold start at most this much.
 double DeferredMs = 0.0;
-// Stage clamps: how often, and by how much, a stage asked for more wall than
-// the tick had left.
-int64 StageClamps = 0;
-double StageClampedMs = 0.0;
-int64 StageQueries = 0;
 
 double LastLogSeconds = 0.0;
 
@@ -87,13 +82,11 @@ void FlushStats(bool bForce)
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel tick budget window=%.1fs budgetMs=%.2f reserveMs=%.2f maxDefer=%d ")
 	       TEXT("hookedTicks=%lld recomputeWanted=%lld deferrals=%lld escalations=%lld ")
-	       TEXT("urgentPass=%lld fitPass=%lld maxConsecutiveDefer=%d deferredMs=%.1f ")
-	       TEXT("stageQueries=%lld stageClamps=%lld stageClampedMs=%.1f"),
+	       TEXT("urgentPass=%lld fitPass=%lld maxConsecutiveDefer=%d deferredMs=%.1f"),
 	       WindowSec, BudgetMs(), ReserveMs(), MaxConsecutiveDefer(),
 	       (long long)HookedTicks, (long long)RecomputeWanted, (long long)RecomputeDeferred,
 	       (long long)RecomputeEscalated, (long long)RecomputeUrgentPass,
-	       (long long)RecomputeFit, MaxConsecutiveSeen, DeferredMs,
-	       (long long)StageQueries, (long long)StageClamps, StageClampedMs);
+	       (long long)RecomputeFit, MaxConsecutiveSeen, DeferredMs);
 
 	// The instrument names its own dead readings inline, because the eighth
 	// window-selection trap tonight was caught only because one did.
@@ -104,13 +97,35 @@ void FlushStats(bool bForce)
 		       TEXT("The switch latched and the module is linked, but NOTHING IN IT RAN. Any tail ")
 		       TEXT("change this leg shows came from somewhere else."));
 	}
-	else if (RecomputeDeferred == 0 && StageClamps == 0)
+	// THE STAGE HALF OF THIS BUDGET NO LONGER EXISTS, AND THAT IS THE FINDING.
+	//
+	// Until 2026-08-26 this module also exported ClampStageSeconds and
+	// RemainingSecondsForStage, and printed stageQueries/stageClamps/
+	// stageClampedMs on the line above. THEY WERE NEVER REACHED. Their only
+	// caller was VoxelApplyFast::ApplyBudgetSeconds, and that function had no
+	// callers of its own -- DrainResults takes its wall budget from
+	// VoxelDebug::GetStreamApplyBudgetMs and always has. (What made it hard to
+	// see: DrainResults holds the result in a LOCAL VARIABLE also named
+	// ApplyBudgetSeconds, so a grep matches and reads as a call.)
+	//
+	// Every leg on disk printed stageQueries=0 stageClamps=0 -- 40,412 lines,
+	// no other value ever observed -- and the warning that fired here told each
+	// of those readers to lower a budget that was never consulted.
+	//
+	// So VoxelTickBudget.h's old claim, "ApplyBudgetMs BECOMES TICK-AWARE ...
+	// NO NEW HOOK. One clock, one owner", was a FALSE PREMISE: there was no
+	// hook, and the apply budget is not tick-aware. THIS MODULE GOVERNS THE
+	// RECOMPUTE HALF ONLY. If the apply budget is ever to be subordinated to
+	// the tick clock, it needs a real hook in DrainResults -- design question 3
+	// in the header is unanswered work, not a shipped property.
+	else if (RecomputeDeferred == 0)
 	{
 		UE_LOG(LogVoxelPerf, Warning,
-		       TEXT("Voxel tick budget NEVER BOUND: hookedTicks=%lld but deferrals=0 and ")
-		       TEXT("stageClamps=0 -- the budget of %.2f ms was never exceeded, so this arm is ")
-		       TEXT("BEHAVIOURALLY IDENTICAL to control. Lower -VoxelTickBudgetMs before reading ")
-		       TEXT("anything into the tail."),
+		       TEXT("Voxel tick budget NEVER BOUND: hookedTicks=%lld but deferrals=0 -- the ")
+		       TEXT("budget of %.2f ms was asked and never exceeded, so this arm is ")
+		       TEXT("BEHAVIOURALLY IDENTICAL to control. Lower -VoxelTickBudgetMs before ")
+		       TEXT("reading anything into the tail. NOTE: this module governs the RECOMPUTE ")
+		       TEXT("half only; the apply budget is NOT tick-aware and never was."),
 		       (long long)HookedTicks, BudgetMs());
 	}
 	else if (RecomputeDeferred > 0 && RecomputeEscalated >= RecomputeDeferred)
@@ -125,10 +140,8 @@ void FlushStats(bool bForce)
 
 	HookedTicks = RecomputeWanted = RecomputeUrgentPass = 0;
 	RecomputeDeferred = RecomputeEscalated = RecomputeFit = 0;
-	StageClamps = StageQueries = 0;
 	MaxConsecutiveSeen = 0;
 	DeferredMs = 0.0;
-	StageClampedMs = 0.0;
 	LastLogSeconds = Now;
 }
 
@@ -138,22 +151,6 @@ void BeginTickImpl(double InTickStartSeconds)
 	bTickOpen = true;
 	++HookedTicks;
 	MaybeLog(FPlatformTime::Seconds());
-}
-
-double RemainingSecondsForStage()
-{
-	if (!Enabled() || !bTickOpen)
-	{
-		// UNBOUNDED, and deliberately a huge finite number rather than infinity:
-		// callers take a Min() against it and a NaN or an inf would propagate
-		// silently into a wall-clock comparison. With the switch off this is the
-		// only statement that runs.
-		return 1.0e9;
-	}
-	++StageQueries;
-	const double ElapsedSec = FPlatformTime::Seconds() - TickStartSeconds;
-	const double RemainingSec = (BudgetMs() - ReserveMs()) / 1000.0 - ElapsedSec;
-	return RemainingSec;
 }
 
 bool MayStartRecomputeImpl(bool bUrgent)
@@ -217,28 +214,6 @@ bool MayStartRecomputeImpl(bool bUrgent)
 	++RecomputeFit;
 	RecomputeConsecutiveDefers = 0;
 	return true;
-}
-
-// Called by VoxelApplyFast::ApplyBudgetSeconds. Separate from
-// RemainingSecondsForStage only so the clamp can be counted where it happens.
-double ClampStageSeconds(double RequestedSeconds)
-{
-	if (!Enabled() || !bTickOpen)
-	{
-		return RequestedSeconds;
-	}
-	const double Remaining = RemainingSecondsForStage();
-	if (Remaining >= RequestedSeconds)
-	{
-		return RequestedSeconds;
-	}
-	++StageClamps;
-	StageClampedMs += (RequestedSeconds - FMath::Max(0.0, Remaining)) * 1000.0;
-	// NEVER BELOW ZERO. DrainResults applies a kMinAppliesPerFrame floor before
-	// it consults the wall budget at all, so a zero here does not stall the
-	// pipeline -- it makes the loop take its floor and yield, which is exactly
-	// the redistribution this file exists to cause.
-	return FMath::Max(0.0, Remaining);
 }
 
 } // namespace VoxelTickBudget

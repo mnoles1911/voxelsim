@@ -119,6 +119,12 @@ inline bool SiteIsExclusive(ESite Site)
 	return Site >= ESite::ReqExcl;
 }
 
+// THE ONLY PLACE A SITE IS NAMED. Consumed by the `Fine lock:` line's acq[]
+// field (VoxelFineTileStreamer.cpp), which loops 0..kSiteCount and asks here --
+// so adding an ESite adds a field to the log automatically. It had NO caller
+// until 2026-08-26 while the log hand-typed the ten names beside ten literal
+// ESite:: lookups; that mirror is exactly the drift this project keeps paying
+// for. If you add a site, add its case here and nothing else.
 inline const TCHAR* SiteName(ESite Site)
 {
 	switch (Site)

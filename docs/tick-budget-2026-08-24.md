@@ -95,7 +95,7 @@ budget is not reaching `DrainResults` at all.
 |---|---|
 | **`stutterPct` falls while cold start rises by more than `deferredMs` explains** | **THROTTLING, not redistribution. REVERT, do not tune.** Work genuinely carried costs cold start *at most* the amount deferred, and less in practice because it overlaps. `deferredMs` is summed per window so this is a comparison, not a judgement. |
 | `escalations >= deferrals` | not deferring — a branch that then does the work anyway. Traffic without effect. The instrument says this inline. |
-| `deferrals = 0` and `stageClamps = 0` with the switch on | the budget never bound; this arm is **behaviourally identical to control**. Lower `-VoxelTickBudgetMs` before reading anything into the tail. Said inline. |
+| `deferrals = 0` with the switch on | the budget never bound; this arm is **behaviourally identical to control**. Lower `-VoxelTickBudgetMs` before reading anything into the tail. Said inline. (`stageClamps` was also on this row until 2026-08-26; see the correction below.) |
 | **`hookedTicks = 0`** | hook A was never applied. Latched, linked, and **completely inert**. Said inline, as a Warning. |
 | any per-ring `loaded=` at 0 for >10 s | the R3/R4 stall reproduced. **REVERT** regardless of the tail. |
 | `p50` improves while `p99`/`max`/`stutterPct` do not | the budget moved the median and left the tail — the exact opposite of the point. |
@@ -181,9 +181,20 @@ on exactly the recompute ticks — the bursty term the bimodal finding identifie
 
 ## 8. What I have not done
 
-Deferral is wired for **recompute** (the bursty term the tail analysis points at)
-and for **apply** (via the existing budget subordination). `DrainUnloads`,
-`DrainGameThreadMesh` and `DispatchJobs` are *not* budgeted yet — they each
-already have a count cap, and adding three more clocks before knowing whether one
-works would be three more ceilings nobody can attribute. If B8 moves the tail,
-the same `RemainingSecondsForStage()` extends to them one at a time.
+> **CORRECTION, 2026-08-26 — the apply half was never wired.** This page said
+> deferral was wired for **apply** "via the existing budget subordination". It
+> was not. `VoxelTickBudget::ClampStageSeconds` / `RemainingSecondsForStage`
+> were called only by `VoxelApplyFast::ApplyBudgetSeconds`, and *that* function
+> had no callers at all — `DrainResults` reads
+> `VoxelDebug::GetStreamApplyBudgetMs` into a local variable that happens to
+> share the name. Every leg on disk printed `stageQueries=0 stageClamps=0`
+> (40,412 lines, no other value ever observed). All of it was deleted on
+> 2026-08-26 along with the `stageQueries` / `stageClamps` / `stageClampedMs`
+> fields on the `Voxel tick budget` line.
+
+Deferral is wired for **recompute** (the bursty term the tail analysis points
+at) and for **nothing else**. `DrainResults`, `DrainUnloads`,
+`DrainGameThreadMesh` and `DispatchJobs` are *not* budgeted — they each already
+have a count cap, and adding more clocks before knowing whether one works would
+be more ceilings nobody can attribute. Extending to them needs a **real hook
+inside each stage**, which is the step the apply half skipped.

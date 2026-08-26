@@ -1552,6 +1552,23 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	                             ? 100.0 * double(TotalWait) / double(TotalWait + TotalHold)
 	                             : 0.0;
 
+	// THE PER-SITE BREAKDOWN IS BUILT FROM ESite, NOT HAND-TYPED. It used to be
+	// ten literal `name=%llu` pairs and ten literal ESite:: arguments in the
+	// format string below, which is a hand mirror of an enum -- add a site and
+	// the arrays silently widen while the line keeps printing the old nine.
+	// VoxelFineLock::SiteName is the single naming authority; this loop cannot
+	// disagree with it or with kSiteCount. Field ORDER is now enum order
+	// (shared sites first, exclusive from ReqExcl on) rather than the old
+	// exclusive-first hand order -- nothing parses this field.
+	FString AcqBySite;
+	for (int32 SiteIdx = 0; SiteIdx < VoxelFineLock::kSiteCount; ++SiteIdx)
+	{
+		AcqBySite += FString::Printf(
+			TEXT("%s%s=%llu"), SiteIdx == 0 ? TEXT("") : TEXT(" "),
+			VoxelFineLock::SiteName(VoxelFineLock::ESite(SiteIdx)),
+			(unsigned long long)D.Acq[SiteIdx]);
+	}
+
 	const TCHAR* Verdict =
 		(ExTimed + ShTimed) == 0
 			? TEXT("timing NOT armed: pass -VoxelFineLockMeter=2 for wait/hold -- this line's ")
@@ -1566,8 +1583,7 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	       TEXT("(exclusive avoided %.1f%%) | EXCL acq=%llu timed=%llu wait=%.1fms hold=%.1fms us/timed ")
 	       TEXT("wait=%.2f hold=%.2f | SHARED acq=%llu timed=%llu wait=%.1fms hold=%.1fms us/timed wait=%.3f ")
 	       TEXT("| waitShare=%.1f%% of %llu ns in-lock | worstSinceStart us: wait excl=%.1f shared=%.1f hold excl=%.1f ")
-	       TEXT("| acq[reqExcl=%llu reqFast=%llu tick=%llu coldGame=%llu coldWorker=%llu elev=%llu climate=%llu ")
-	       TEXT("isResident=%llu bathy=%llu diag=%llu] | entered=%llu | audit checked=%llu mismatch=%llu ")
+	       TEXT("| acq[%s] | entered=%llu | audit checked=%llu mismatch=%llu ")
 	       TEXT("mirrorOffThread=%llu | %s ")
 	       TEXT("win=%.2fs"),
 	       Meter, Fast, (unsigned long long)DCalls, (unsigned long long)DFree, (unsigned long long)DShared,
@@ -1579,16 +1595,7 @@ void FVoxelFineTileStreamer::MaybeLogLockProbe_()
 	       WaitShare, (unsigned long long)(TotalWait + TotalHold),
 	       double(D.MaxWaitNsIn(true)) / 1000.0, double(D.MaxWaitNsIn(false)) / 1000.0,
 	       double(D.MaxHoldNsIn(true)) / 1000.0,
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ReqExcl)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ReqShared)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::TickExcl)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ColdGameExcl)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ColdWorkerExcl)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ElevShared)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::ClimateShared)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::FootprintShared)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::BathyShared)],
-	       (unsigned long long)D.Acq[int32(VoxelFineLock::ESite::DiagShared)],
+	       *AcqBySite,
 	       (unsigned long long)D.Entered,
 	       (unsigned long long)MirrorAudits_.load(std::memory_order_relaxed),
 	       (unsigned long long)MirrorMismatches_.load(std::memory_order_relaxed),

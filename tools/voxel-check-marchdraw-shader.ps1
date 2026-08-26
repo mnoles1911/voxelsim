@@ -1,6 +1,8 @@
 # voxel-check-marchdraw-shader.ps1 -- does VoxelMarch.usf compile, in EVERY permutation?
 #
-# THE SAME REASON tools\voxel-check-march-shader.ps1 EXISTS, and the same rule.
+# THE SAME REASON THE RETIRED tools\voxel-check-march-shader.ps1 EXISTED
+# (deleted 2026-08-26 together with VoxelMarchSpike.usf; the findings both of
+# them protected now live in docs/march-spike-p0-findings.md), same rule.
 # ue-project\Shaders is shared, the editor compiles global shaders AT BOOT, and
 # VoxelMarch.usf now carries four IMPLEMENT_GLOBAL_SHADER entry points. A
 # half-finished .usf here does not fail a build -- it fails an editor launch, and

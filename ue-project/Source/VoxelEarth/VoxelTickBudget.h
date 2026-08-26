@@ -111,11 +111,28 @@
 // third invisible ceiling appears. This one subordinates them rather than
 // competing:
 //
-//   ApplyBudgetMs   BECOMES TICK-AWARE, through the interception that already
-//                   exists: VoxelApplyFast::ApplyBudgetSeconds() is already the
-//                   single place DrainResults gets its wall budget, so it now
-//                   returns min(its own value, what the tick has left minus the
-//                   reserve). NO NEW HOOK. One clock, one owner.
+//   ApplyBudgetMs   WAS SUPPOSED TO BECOME TICK-AWARE this way, and DID NOT.
+//                   ***THIS PARAGRAPH DESCRIBED A HOOK THAT WAS NEVER BUILT.***
+//                   The design said: intercept in
+//                   VoxelApplyFast::ApplyBudgetSeconds(), "the single place
+//                   DrainResults gets its wall budget", return min(its own
+//                   value, what the tick has left minus the reserve), NO NEW
+//                   HOOK, one clock one owner. Every clause of that was wrong.
+//                   ApplyBudgetSeconds was NOT where DrainResults gets its wall
+//                   budget and never had a caller at all: DrainResults reads
+//                   VoxelDebug::GetStreamApplyBudgetMs into a LOCAL VARIABLE
+//                   that happens to share the name, which is what let the
+//                   mistake stand. The clamp functions this module exported for
+//                   it (ClampStageSeconds, RemainingSecondsForStage) were
+//                   deleted on 2026-08-26 having never once been called --
+//                   40,412 lines of leg logs, all reading stageQueries=0.
+//
+//                   SO: THIS MODULE GOVERNS THE RECOMPUTE HALF ONLY. Two
+//                   per-frame budgets that do not know about each other is
+//                   still how a third invisible ceiling appears, and that
+//                   remains true here -- it is UNRESOLVED DESIGN WORK, not a
+//                   shipped property. Subordinating the apply budget needs a
+//                   REAL hook inside DrainResults.
 //
 //   MaxAppliesPerFrame  IS LEFT ALONE, deliberately. It is a COUNT, and the
 //                   apply-ceiling census established it is a safety ceiling
@@ -125,10 +142,13 @@
 //                   (countCap/wallClock/queueEmpty/drainCap) is exactly how
 //                   anyone tells this budget apart from the ones underneath it.
 //
-// THE EXISTING EXIT CENSUS IS THIS FEATURE'S PROOF OF TRAFFIC. Under a binding
-// tick budget, wallClock must RISE and countCap must FALL, because the loop is
-// now stopping on a clock it did not previously have. If neither moves, the
-// budget is not reaching DrainResults at all.
+// THE EXIT CENSUS WOULD BE THE PROOF OF TRAFFIC -- FOR A HOOK THAT DOES NOT
+// EXIST. The test was: under a binding tick budget wallClock must RISE and
+// countCap must FALL, because the loop is now stopping on a clock it did not
+// previously have; if neither moves, the budget is not reaching DrainResults.
+// Neither ever moved, in any leg, because the budget never reached DrainResults
+// at all. Keep the test -- it is the right one -- but it is a gate for FUTURE
+// work on the apply half, not evidence about anything this module does today.
 //
 // ===========================================================================
 // REGISTERED DISPROOF -- WRITTEN BEFORE THE LEG
@@ -233,16 +253,11 @@ FORCEINLINE bool MayStartRecompute(bool bUrgent)
 	return !Enabled() || MayStartRecomputeImpl(bUrgent);
 }
 
-// Seconds left in this tick, minus the reserve. Negative means over budget.
-// Consumed by VoxelApplyFast::ApplyBudgetSeconds -- NO HOOK. Returns a very
-// large number when the switch is off, so callers need no branch of their own.
-double RemainingSecondsForStage();
-
-// Clamp a stage's requested wall budget to what the tick has left, counting the
-// clamp where it happens. Consumed by VoxelApplyFast::ApplyBudgetSeconds --
-// NO HOOK, because that function is already the single place DrainResults gets
-// its wall budget. Returns RequestedSeconds unchanged when the switch is off.
-double ClampStageSeconds(double RequestedSeconds);
+// THERE IS NO STAGE HOOK. RemainingSecondsForStage and ClampStageSeconds were
+// declared here until 2026-08-26 and were never called by anything; see design
+// question 3 above for what they were meant to do and why it did not happen.
+// Do not re-add them without a real call site in DrainResults -- an exported
+// clamp with no caller is what made this budget look twice as wired as it was.
 
 // Self-clocked 5 s report; also callable from MaybeLogCounters for exact window
 // alignment (optional hook C).
