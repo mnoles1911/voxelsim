@@ -1,0 +1,15 @@
+/* The menu face. Macondo Swash Caps, Open Font Licence 1.1 -- the same 31 KB
+ * .ttf the game loads at runtime, copied byte-for-byte (re-encoding a typeface
+ * is how hinting gets quietly destroyed). Licence text ships alongside it.
+ *
+ * Every screen in this system is set in this one face, so if it fails to load
+ * the whole design reads as a different product -- which is why it ships here
+ * rather than being expected from the host.
+ */
+@font-face {
+  font-family: 'Macondo Swash Caps';
+  src: url('./MacondoSwashCaps-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}

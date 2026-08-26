@@ -1,0 +1,75 @@
+{
+  "pkg": "@voxelmark/design-system",
+  "globalName": "VoxelMark",
+  "projectId": "78d6f5f9-cace-4535-874b-2062cc48ac00",
+  "shape": "package",
+  "buildCmd": "npm run build",
+  "srcDir": "src",
+  "tsconfig": "tsconfig.json",
+  "cssEntry": "dist/voxelmark.css",
+  "docsDir": "docs",
+  "guidelinesGlob": [
+    "docs/guides/*.md"
+  ],
+  "provider": {
+    "component": "VoxelMarkRoot",
+    "props": {
+      "fill": false
+    }
+  },
+  "overrides": {
+    "Panel": {
+      "cardMode": "column"
+    },
+    "ScreenFrame": {
+      "cardMode": "column"
+    },
+    "VoxelMarkRoot": {
+      "cardMode": "column"
+    },
+    "FpsReadout": {
+      "cardMode": "column"
+    },
+    "Hourglass": {
+      "cardMode": "column"
+    },
+    "LoadingQuip": {
+      "cardMode": "column"
+    },
+    "LoadingScreen": {
+      "cardMode": "column"
+    },
+    "ProgressBar": {
+      "cardMode": "column"
+    },
+    "TipFooter": {
+      "cardMode": "column"
+    },
+    "MainMenuScreen": {
+      "cardMode": "column",
+      "viewport": "960x900"
+    },
+    "MenuButton": {
+      "cardMode": "column"
+    },
+    "MenuColumn": {
+      "cardMode": "column"
+    },
+    "MenuColumnGap": {
+      "cardMode": "column"
+    },
+    "MenuTitle": {
+      "cardMode": "column"
+    },
+    "MessagePanel": {
+      "cardMode": "column"
+    },
+    "SaveList": {
+      "cardMode": "column"
+    },
+    "SaveRow": {
+      "cardMode": "column"
+    }
+  },
+  "readmeHeader": ".design-sync/conventions.md"
+}
