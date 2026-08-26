@@ -21,6 +21,12 @@
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RenderingThread.h"
+// THE TAIL-GROUP SCOPE, one line per ENQUEUE_RENDER_COMMAND body. See
+// VoxelRenderFrame.h: these bodies run on the RENDER THREAD BETWEEN scene
+// renders -- i.e. in the tail bucket -- and tailMs is where the parked->moving
+// delta is expected to live. Costs one compare on a latched int unless the leg
+// is run with -VoxelRenderFrame=2.
+#include "VoxelRenderFrame.h"
 #include "RHIGPUReadback.h"
 #include "ShaderParameterStruct.h"
 #include "Containers/Ticker.h"
@@ -789,6 +795,11 @@ struct FVoxelResidencyGpu::FImpl
 			[Self, Seq, K, bAudit, bClearGrid, Feedback = MoveTemp(Feedback),
 			 ZOps = MoveTemp(ZOps)](FRHICommandListImmediate& RHICmdList) mutable
 		{
+			// Builds and executes its OWN RDG graph on the render thread,
+			// outside the scene renderer: pass construction, buffer creation and
+			// upload, SRV/UAV creation. This is the shape the tail buckets exist
+			// to name.
+			VOXEL_RENDER_FRAME_SCOPE_TAIL(TailResidency);
 			FRDGBuilder GraphBuilder(RHICmdList);
 
 			// Persistent buffers: create+clear on first use (or resync), else
@@ -1134,6 +1145,11 @@ struct FVoxelResidencyGpu::FImpl
 			ENQUEUE_RENDER_COMMAND(VoxelResidencyPoll)(
 				[Batch = MoveTemp(Snapshot)](FRHICommandListImmediate&)
 			{
+				// READBACK HANDLING -- IsReady polls plus the Lock/copy/Unlock
+				// of whichever samples completed. Render-thread work whose cost
+				// depends on how many dispatches are in flight, i.e. on how hard
+				// the leg is streaming.
+				VOXEL_RENDER_FRAME_SCOPE_TAIL(TailResidency);
 				for (const FSeqPtr& Seq : Batch)
 				{
 					if (Seq->State.load(std::memory_order_acquire) != 0)
@@ -1947,6 +1963,7 @@ struct FVoxelResidencyGpu::FImpl
 		AuditMismatchStreak = 0;
 		FImpl* Self = this;
 		ENQUEUE_RENDER_COMMAND(VoxelResidencyRelease)([Self](FRHICommandListImmediate&) {
+			VOXEL_RENDER_FRAME_SCOPE_TAIL(TailResidency);
 			Self->ShadowPooled.SafeRelease();
 			Self->ZRangePooled.SafeRelease();
 			Self->AllocatedLevels = 0;

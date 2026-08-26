@@ -213,6 +213,41 @@
 //                  capture, split screen). setupMs then swallows an entire
 //                  intermediate Execute and the three-way split is NOT a
 //                  partition. Reported as its own field so it cannot hide.
+//
+//                  WHAT THIS FIELD COUNTS, because it counted the wrong thing
+//                  for the whole life of the instrument: DISTINCT RDG GRAPHS
+//                  per frame, not Touch() calls. Touch() is a shared idempotent
+//                  anchor taken from THREE hooks -- the marcher's
+//                  PreRenderViewFamily AND PreRenderView (a deliberate safety
+//                  anchor, because extension order is not ours to control and
+//                  the marcher declines every hook under voxel.March 0) and the
+//                  fluid extension's PreRenderViewFamily. Counting calls made a
+//                  healthy one-family frame read 2.00, so D0 FAILED ON EVERY
+//                  LEG ON DISK and the entire breakdown was unquotable --
+//                  the instrument gagged itself while the anchors were fine
+//                  (reconDeltaMs=-0.00).
+//
+//                  The key is the FRDGBuilder, because what actually breaks the
+//                  partition is a second GraphBuilder.Execute() inside the A->B
+//                  span, and SceneRenderBuilder.cpp:873 builds one FRDGBuilder
+//                  per render node with :916 executing it. The key is CLEARED
+//                  at anchor E rather than compared by pointer alone: the two
+//                  builders are stack objects in consecutive iterations of one
+//                  loop and the second is very likely to be given the FIRST's
+//                  ADDRESS, so pointer identity on its own would undercount --
+//                  the direction that makes a gate unable to fail.
+//
+//                  touches/frame IS PRINTED BESIDE IT, with both numerators and
+//                  the frame denominator. touches/frame of 1.00-3.00 against
+//                  families/frame of 1.00 is the HEALTHY reading, not a defect.
+//
+//   AND THE GATE HAS ITS OWN RED ARM: -VoxelRenderFrameFakeFamilies=2 adds one
+//               synthetic family per frame and nothing else. The leg must then
+//               print families/frame=2.00 and VERDICT=D0-FAILED-... If it does
+//               not, families/frame has become a constant 1.00 -- the opposite
+//               failure, and one that LOOKS HEALTHY. A gate only ever observed
+//               passing is not a gate, and this one has already been observed
+//               only ever failing.
 //   renderBusyMs=0.00
 //               -> HARD ZERO. GRenderThreadTime is not populated in this
 //                  configuration. It must NOT be read as "the render thread is
@@ -234,6 +269,31 @@
 //               -> A DEAD SCOPE, or a subsystem that did not run. It is NOT the
 //                  same reading as h>0 with ms=0.000, which is a group that ran
 //                  and cost nothing. Only the second may be reported as cheap.
+//
+//                  WHICH ONE IS NOW PRINTED, on the TAIL-WIRING line, per group,
+//                  read from the build rather than guessed. It had to be: from
+//                  the day this file was written until 2026-08-25 the macro
+//                  VOXEL_RENDER_FRAME_SCOPE_TAIL had ZERO CALL SITES IN THE
+//                  ENTIRE REPOSITORY, so all six groups were dead scopes, every
+//                  h read 0, and the DELTA-TAIL line printed
+//                  GROUPS-DO-NOT-EXPLAIN-DTAIL for any input whatsoever -- a
+//                  confirmation that could not come out the other way. No leg on
+//                  disk was ever run at -VoxelRenderFrame=2 (zero "TAIL tailMs="
+//                  lines across every log in Saved/), so it was never noticed.
+//
+//                  18 of the 29 sites are wired now: chunkIndex 2, residency 3,
+//                  poolComp 5, giVol 8. The remaining 11 -- meshJob 7 and
+//                  brickPool 4 -- are UNWIRED and the line says so by name.
+//                  Those two are the groups most likely to carry the streaming
+//                  tail, so WHILE groupsUnwired>0 THE DELTA-TAIL LINE'S NEGATIVE
+//                  VERDICT IS NOT DECIDABLE and reads NOT-DECIDABLE rather than
+//                  a conclusion. The positive verdict is unaffected: hits that
+//                  were recorded are evidence whatever else is missing.
+//
+//                  The wiring table is hand-maintained and therefore able to
+//                  drift, so it CHECKS ITSELF: a group marked UNWIRED that
+//                  records hits prints tableCheck=TABLE-LIES. Trust the hits and
+//                  fix the table, never the other way round.
 //   chunkIndex h=0
 //               -> EXPECTED on a stock leg and not a defect. Its only per-frame
 //                  site is the GPU publish, and voxel.March.IndexGpuResident is

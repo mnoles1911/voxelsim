@@ -12,6 +12,12 @@
 #include "RenderGraphUtils.h"
 #include "RHIGPUReadback.h"
 #include "RenderGraphResources.h"
+// THE TAIL-GROUP SCOPE, one line per ENQUEUE_RENDER_COMMAND body. See
+// VoxelRenderFrame.h: these bodies run on the RENDER THREAD BETWEEN scene
+// renders -- i.e. in the tail bucket -- and tailMs is where the parked->moving
+// delta is expected to live. Costs one compare on a latched int unless the leg
+// is run with -VoxelRenderFrame=2.
+#include "VoxelRenderFrame.h"
 #include "SceneManagement.h"
 #include "RHIResourceUtils.h"
 #include "Misc/ScopeExit.h"
@@ -3566,6 +3572,11 @@ void UVoxelGpuPoolComponent::FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&&
 		[Buffers = GetOrCreatePoolBuffers(), Writes = MoveTemp(Writes), Hides = MoveTemp(Hides),
 		 Name = PoolName](FRHICommandListImmediate& RHICmdList)
 	{
+		// UVoxelGpuPoolComponent SERVES THE QUAD RENDERER. Under voxel.March 1
+		// terrain rides the brick pool instead, so h=0 is the EXPECTED reading
+		// on a marcher leg and is evidence the component is NOT IN USE, not
+		// evidence that it is free.
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailPoolComponent);
 		FRDGBuilder GraphBuilder(RHICmdList);
 		VoxelGpuPoolAddWritePasses(GraphBuilder, Buffers, Writes, Hides, *Name);
 		GraphBuilder.Execute();
@@ -3777,6 +3788,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 		 Buffers = GetOrCreatePoolBuffers(),
 		 Name = PoolName](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailPoolComponent);
 		// FIRST, BEFORE THE TWO UPDATES BELOW, AND THAT IS THE ORDERING RULE
 		// D1 RESTS ON (Wave D / D1). Those updates are what publish a range as
 		// drawable -- UpdateChunkTable_RenderThread hands the cull its runs and
@@ -4475,6 +4487,7 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 	ENQUEUE_RENDER_COMMAND(VoxelGpuHideProbeReadback)(
 		[Buffers, Rb, First, Count](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailPoolComponent);
 		if (!Buffers.IsValid() || !Buffers->ChunkIdPooled.IsValid())
 		{
 			return;
@@ -4512,6 +4525,7 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 		[Rb, First, Count, Boundary, IdB, HiddenId,
 		 &HeadWrong, &TailWrong, &FirstBadIndex, &FirstBadValue, &bLocked](FRHICommandListImmediate&)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailPoolComponent);
 		const uint32* Data = static_cast<const uint32*>(Rb->Lock(Count * sizeof(uint32)));
 		if (Data == nullptr)
 		{
@@ -4633,6 +4647,7 @@ void UVoxelGpuPoolComponent::BeginDestroy()
 		ENQUEUE_RENDER_COMMAND(VoxelGpuPoolReleaseBuffers)(
 			[Buffers = MoveTemp(PoolBuffers)](FRHICommandListImmediate&) mutable
 		{
+			VOXEL_RENDER_FRAME_SCOPE_TAIL(TailPoolComponent);
 			Buffers.Reset();
 		});
 		PoolBuffers.Reset();

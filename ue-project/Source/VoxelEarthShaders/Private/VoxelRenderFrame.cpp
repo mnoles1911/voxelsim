@@ -72,6 +72,33 @@ namespace
 		return Latched;
 	}
 
+	// THE D0 GATE'S OWN MUTATION ARM. -VoxelRenderFrameFakeFamilies=N.
+	//
+	// A GATE THAT CANNOT FAIL IS NOT A GATE, and the families/frame gate has
+	// now been on both sides of that: it read 2.00 on every leg on disk because
+	// the count was "how many times Touch was called" rather than "how many
+	// graphs were built", so D0 failed unconditionally and nothing below it was
+	// ever quotable. Repairing it moves the risk to the opposite failure -- a
+	// count that now reads 1.00 unconditionally would be equally useless and
+	// would look healthy.
+	//
+	// So the repaired count has a runnable red arm. N>1 adds N-1 SYNTHETIC
+	// families per frame and nothing else; the leg must then print
+	// families/frame=N.00 and VERDICT=D0-FAILED. If it does not, the gate is
+	// dead and the level-1 numbers under it may not be quoted. Default 0/1 =
+	// no effect, and the ARMED line prints the value so a leg carrying the arm
+	// can never be mistaken for a stock one.
+	int32 LatchedFakeFamilies()
+	{
+		static const int32 Latched = []
+		{
+			int32 Value = 0;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelRenderFrameFakeFamilies="), Value);
+			return FMath::Max(0, Value);
+		}();
+		return Latched;
+	}
+
 	// THE SAME SWITCH THE PRODUCER USES. Two hardcoded window divisors were
 	// found in two different files in one night, both surviving the life of the
 	// project, and every figure that divided by one of them was wrong by 2.5x.
@@ -156,6 +183,13 @@ namespace
 
 		double CamSpeedUU = 0.0;
 		double Families = 0.0;
+		// RAW Touch() CALLS. Families is the count of DISTINCT RDG graphs; this
+		// is the count of anchor-A hook invocations that reached Touch. They are
+		// NOT the same number and reading one as the other is the defect this
+		// pair exists to make impossible to repeat: two extensions x one family
+		// x (one family hook + one view hook) is four touches and ONE family.
+		// Printed side by side so the ratio is visible rather than inferred.
+		double Touches = 0.0;
 		double Views = 0.0;
 		double MarchTiles = 0.0;
 
@@ -220,6 +254,32 @@ namespace
 		uint32 IdleE = 0;
 		bool   bHaveE = false;
 		int32  FamiliesThisFrame = 0;
+		int32  TouchesThisFrame = 0;
+		// THE GRAPH ANCHOR A IS CURRENTLY OPEN ON, and the whole of the
+		// families/frame repair.
+		//
+		// Touch() is called from three hooks that this workstream owns
+		// (VoxelMarchRenderer.cpp PreRenderViewFamily and PreRenderView,
+		// VoxelFluidRender.cpp PreRenderViewFamily) and the second and third
+		// exist on purpose -- they are idempotent safety anchors, because
+		// extension iteration order is not ours to control and the marcher
+		// extension declines every hook under voxel.March 0. Counting CALLS
+		// therefore counted hooks, not families: every leg on disk read
+		// families/frame=2.00 and failed D0 unconditionally.
+		//
+		// What actually breaks the three-way split is not a second hook, it is
+		// a second GRAPH -- an intermediate GraphBuilder.Execute() inside the
+		// A->B span, which is what an extra view family brings with it
+		// (SceneRenderBuilder.cpp:873 constructs one FRDGBuilder per render node
+		// and :916 executes it). So the count keys on the graph.
+		//
+		// Cleared by anchor E. That matters and is not decoration: the two
+		// builders are stack objects in consecutive iterations of the same loop,
+		// so the SECOND one is very likely to be handed the SAME ADDRESS as the
+		// first. Pointer identity alone would therefore UNDERCOUNT -- the exact
+		// direction that makes a gate unable to fail. E fires between them, so
+		// the comparison is only ever made against a graph that is still live.
+		const void* OpenGraph = nullptr;
 		int32  ViewsThisFrame = 0;
 		uint32 MarchTilesThisFrame = 0;
 		double SubThisFrame[int32(EBucket::Num)] = {};
@@ -312,6 +372,105 @@ namespace
 			IdleSink = I1 - I0;
 		}
 		return (CyToMs(FPlatformTime::Cycles64() - Start) * 1.0e6) / double(kIterations);
+	}
+
+	// ANCHOR E, registered on ONE graph. Factored out of Touch() because a
+	// second view family in the same frame builds a SECOND graph, and that
+	// graph needs its own callback or CyE would still be the first graph's
+	// Execute while B had already moved to the last family's -- an executeMs
+	// that ended before the span it is supposed to close.
+	//
+	// LAST EXECUTE WINS, symmetrically with NoteSetupEnd()'s last-family-wins.
+	// Registering on a graph also CLEARS OpenGraph when that graph finishes, so
+	// the next Touch() is compared against nothing rather than against a dead
+	// pointer that a later stack allocation may reuse.
+	void RegisterAnchorE(FRDGBuilder& GraphBuilder)
+	{
+		GraphBuilder.AddPostExecuteCallback([]()
+		{
+			FState& St = Get();
+			if (LatchedMutateArm() == 2)
+			{
+				BurnMs(LatchedMutateMs());
+			}
+			St.CyE = FPlatformTime::Cycles64();
+			St.IdleE = SampleIdleCycles();
+			St.bHaveE = true;
+			// This graph is done. Anything that touches next is a new graph,
+			// whatever address it happens to be given.
+			St.OpenGraph = nullptr;
+		});
+	}
+
+	// ---- HOW MANY CALL SITES EACH TAIL GROUP ACTUALLY HAS IN THIS BUILD ----
+	//
+	// h=0 IS TWO DIFFERENT READINGS AND THE LOG COULD NOT TELL THEM APART. The
+	// header's own reading rules call h=0 "a DEAD SCOPE, or a subsystem that did
+	// not run" -- and for the whole life of the instrument it was the first:
+	// VOXEL_RENDER_FRAME_SCOPE_TAIL had ZERO call sites in the entire repository
+	// (verified by unpiped count), so all six groups printed h=0 and the
+	// DELTA-TAIL line printed GROUPS-DO-NOT-EXPLAIN-DTAIL for ANY input. That is
+	// a confirmation that cannot come out the other way, which is not one.
+	//
+	// This table makes the distinction decidable at read time instead of leaving
+	// it to a reader who would have to grep the build to find out. It is
+	// hand-maintained, so it can drift -- and the drift is CHECKED rather than
+	// trusted: a group with sites=0 that nevertheless records hits prints
+	// TABLE-LIES, which is the direction that would otherwise make an UNWIRED
+	// label hide real data.
+	//
+	// WHOEVER WIRES THE TWO LOCKED FILES MUST BUMP THIS. The counts below are
+	// the identified sites, by ENQUEUE_RENDER_COMMAND name:
+	//   TailGpuMeshJob  VoxelGpuMeshJobManager.cpp -- VoxelGpuQuadPayloadRelease,
+	//                   VoxelGpuBrickStackRelease, VoxelGpuMeshReleaseReadbacks,
+	//                   VoxelGpuMeshDispatchBatch, VoxelGpuMeshFetchQuads,
+	//                   VoxelGpuMeshCompactQuads, VoxelGpuMeshPoll      (7)
+	//   TailBrickPool   VoxelBrickPool.cpp -- VoxelGpuBrickPayloadRelease,
+	//                   VoxelBrickPoolGpuFree, VoxelBrickPoolAllocWindow,
+	//                   VoxelBrickPoolFlush                             (4)
+	int32 TailSitesWired(EBucket B)
+	{
+		switch (B)
+		{
+		// WIRED 2026-08-25, after the two files came free. These are the two
+		// groups most likely to carry the streaming tail, which is why the
+		// instrument refuses to conclude anything while either reads 0 here.
+		// Sites, by ENQUEUE_RENDER_COMMAND name (line numbers drift, names do not):
+		//   TailGpuMeshJob: QuadPayloadRelease, BrickStackRelease,
+		//     MeshReleaseReadbacks, MeshDispatchBatch, MeshFetchQuads,
+		//     MeshCompactQuads, MeshPoll
+		//   TailBrickPool: BrickPayloadRelease, BrickPoolGpuFree,
+		//     BrickPoolAllocWindow, BrickPoolFlush
+		// If a site is deleted or renamed without updating these counts, the log
+		// prints tableCheck=TABLE-LIES rather than quietly under-reporting.
+		case EBucket::TailGpuMeshJob:    return 7;
+		case EBucket::TailBrickPool:     return 4;
+		case EBucket::TailChunkIndex:    return 2;
+		case EBucket::TailResidency:     return 3;
+		case EBucket::TailPoolComponent: return 5;
+		case EBucket::TailGIVolume:      return 8;
+		default:                         return -1;
+		}
+	}
+
+	int32 TailSitesWiredTotal()
+	{
+		int32 T = 0;
+		for (int32 i = int32(kFirstTailBucket); i < int32(EBucket::Num); ++i)
+		{
+			T += FMath::Max(0, TailSitesWired(EBucket(i)));
+		}
+		return T;
+	}
+
+	int32 TailGroupsUnwired()
+	{
+		int32 U = 0;
+		for (int32 i = int32(kFirstTailBucket); i < int32(EBucket::Num); ++i)
+		{
+			if (TailSitesWired(EBucket(i)) == 0) { ++U; }
+		}
+		return U;
 	}
 
 	// ---- printing --------------------------------------------------------
@@ -424,6 +583,43 @@ namespace
 			       TEXT("command nobody has instrumented -- it is NOT to be distributed into the ")
 			       TEXT("groups that happen to be measured. win=%.2fs"),
 			       Name, WindowSec);
+
+			// WHICH h=0 IS WHICH. The reading rule above says h=0 is EITHER a
+			// dead scope OR a subsystem that did not run; this line says which,
+			// per group, from the build rather than from a guess -- and checks
+			// its own table against the hits so an UNWIRED label cannot hide
+			// real data.
+			FString Wiring;
+			bool bTableLies = false;
+			static const TCHAR* const GroupNames[] = {
+				TEXT("meshJob"), TEXT("brickPool"), TEXT("chunkIndex"),
+				TEXT("residency"), TEXT("poolComp"), TEXT("giVol") };
+			for (int32 i = int32(kFirstTailBucket); i < int32(EBucket::Num); ++i)
+			{
+				const int32 Sites = TailSitesWired(EBucket(i));
+				const double GroupHits = B.SubHits[i];
+				if (Sites == 0 && GroupHits > 0.0) { bTableLies = true; }
+				Wiring += FString::Printf(
+					TEXT("%s=%d%s(hits=%.0f/frames=%lld) "),
+					GroupNames[i - int32(kFirstTailBucket)], Sites,
+					Sites == 0 ? TEXT("-UNWIRED-h0-IS-A-DEAD-SCOPE")
+					           : TEXT("-wired-h0-MEANS-IT-DID-NOT-RUN"),
+					GroupHits, (long long)B.N);
+			}
+
+			UE_LOG(LogVoxelRenderFrame, Log,
+			       TEXT("Voxel render frame seg=%s TAIL-WIRING sitesWired=%d groupsUnwired=%d ")
+			       TEXT("| %s| tableCheck=%s -- an UNWIRED group's h=0 says NOTHING about that ")
+			       TEXT("subsystem's cost; it says this build contains no scope for it. Both ")
+			       TEXT("unwired groups (meshJob, brickPool) live in files that were locked when ")
+			       TEXT("this instrument was repaired, and they are the two most likely to carry ")
+			       TEXT("the streaming tail -- so while groupsUnwired>0 the DELTA-TAIL line's ")
+			       TEXT("negative verdict is NOT DECIDABLE and may not be quoted as 'streaming ")
+			       TEXT("render commands do not explain dTail'. tableCheck=TABLE-LIES means a ")
+			       TEXT("group marked UNWIRED recorded hits: the table above is stale, trust the ")
+			       TEXT("hits and fix the table. win=%.2fs"),
+			       Name, TailSitesWiredTotal(), TailGroupsUnwired(), *Wiring,
+			       bTableLies ? TEXT("TABLE-LIES") : TEXT("ok"), WindowSec);
 		}
 
 		// TRAFFIC BEFORE TIMING. If these do not move between parked and moving
@@ -431,14 +627,27 @@ namespace
 		// bucket delta is asking to be explained by something this file cannot
 		// see.
 		UE_LOG(LogVoxelRenderFrame, Log,
-		       TEXT("Voxel render frame seg=%s TRAFFIC families/frame=%.2f%s views/frame=%.2f ")
-		       TEXT("marchTiles/frame=%.0f camSpeedMS=%.1f framesTotal=%lld dropped=%lld skippedStartup=%lld ")
-		       TEXT("settleLatched=%s -- families/frame above 1.01 means setupMs swallowed an ")
-		       TEXT("intermediate Execute and the three-way split is NOT a partition; camSpeedMS ")
-		       TEXT("near zero on a MOVING line means the segmenter is wrong and the leg is invalid, ")
-		       TEXT("not fast. win=%.2fs"),
+		       TEXT("Voxel render frame seg=%s TRAFFIC families/frame=%.2f%s (graphs=%.0f / frames=%lld) ")
+		       TEXT("touches/frame=%.2f (touches=%.0f / frames=%lld) views/frame=%.2f (views=%.0f / frames=%lld) ")
+		       TEXT("fakeFamilyArm=%d marchTiles/frame=%.0f camSpeedMS=%.1f framesTotal=%lld dropped=%lld ")
+		       TEXT("skippedStartup=%lld settleLatched=%s -- EVERY RATE ON THIS LINE CARRIES ITS OWN ")
+		       TEXT("NUMERATOR AND DENOMINATOR, because two counters were misread in one night for ")
+		       TEXT("lack of one. families/frame COUNTS DISTINCT RDG GRAPHS, NOT Touch() CALLS: three ")
+		       TEXT("hooks take the anchor (marcher family, marcher view, fluid family) and a healthy ")
+		       TEXT("one-family frame therefore reads touches/frame 1.00-3.00 with families/frame 1.00. ")
+		       TEXT("families/frame above 1.01 means a second graph EXECUTED inside the A->B span, ")
+		       TEXT("setupMs swallowed that Execute and the three-way split is NOT a partition; ")
+		       TEXT("touches/frame above families/frame is NORMAL and is not that. If families/frame ")
+		       TEXT("reads 1.00 on every leg ever run, the gate is unproven -- run one leg with ")
+		       TEXT("-VoxelRenderFrameFakeFamilies=2 and confirm it reads 2.00 and D0 FAILS. ")
+		       TEXT("camSpeedMS near zero on a MOVING line means the segmenter is wrong and the leg ")
+		       TEXT("is invalid, not fast. win=%.2fs"),
 		       Name, FamPerFrame, bMultiFamily ? TEXT(" MULTI-FAMILY-SPLIT-NOT-A-PARTITION") : TEXT(""),
-		       B.M(B.Views), B.M(B.MarchTiles), B.M(B.CamSpeedUU) / 100.0,
+		       B.Families, (long long)B.N,
+		       B.M(B.Touches), B.Touches, (long long)B.N,
+		       B.M(B.Views), B.Views, (long long)B.N,
+		       LatchedFakeFamilies(),
+		       B.M(B.MarchTiles), B.M(B.CamSpeedUU) / 100.0,
 		       (long long)S.FramesSeen, (long long)S.Dropped, (long long)S.SkippedStartup,
 		       S.bEverSettled ? TEXT("yes") : TEXT("NO"),
 		       WindowSec);
@@ -476,8 +685,20 @@ namespace
 		// D0 first: if the instrument is invalid the rest is unreadable.
 		const double HiRecon = Hi.M(Hi.ReconDelta());
 		const double HiBusy  = Hi.M(Hi.RenderBusy);
-		const bool bD0 = (HiBusy > 1e-9) && (FMath::Abs(HiRecon) <= 0.15 * HiBusy)
-		               && (Hi.M(Hi.Families) <= 1.01);
+		const double HiFam = Hi.M(Hi.Families);
+		const bool bD0Busy  = HiBusy > 1e-9;
+		const bool bD0Recon = bD0Busy && FMath::Abs(HiRecon) <= 0.15 * HiBusy;
+		const bool bD0Fam   = HiFam <= 1.01;
+		const bool bD0 = bD0Busy && bD0Recon && bD0Fam;
+		// WHICH of the three D0 clauses failed, named in the line. D0 read
+		// FAILED on every leg on disk and the line did not say which clause did
+		// it, so the whole breakdown was unquotable without anyone being able to
+		// see that the cause was a hook counter rather than the split.
+		const TCHAR* D0Why =
+			  !bD0Busy  ? TEXT("renderBusy=0-GRenderThreadTime-not-populated")
+			: !bD0Fam   ? TEXT("families/frame>1.01-a-second-graph-executed-inside-A..B")
+			: !bD0Recon ? TEXT("recon-delta-over-15pct")
+			:             TEXT("-");
 
 		const bool bD1 = FMath::Abs(DMarcher) >= 0.20 * FMath::Abs(DRender);
 		const bool bD2 = FMath::Abs(DOther)   >= 0.20 * FMath::Abs(DRender);
@@ -498,14 +719,14 @@ namespace
 		       TEXT("Voxel render frame DELTA tag=%s VERDICT=%s nMoving=%lld nParked=%lld ")
 		       TEXT("dRenderBusyMs=%+.2f | dSetupMs=%+.2f (%.0f%%) dExecuteMs=%+.2f (%.0f%%) ")
 		       TEXT("dTailMs=%+.2f (%.0f%%) | dMarcherMs=%+.3f (%.0f%%) dSetupOtherMs=%+.2f (%.0f%%) ")
-		       TEXT("| D0=%s D1=%s D2=%s D3=%s D4=%s -- thresholds are the ones registered in ")
+		       TEXT("| D0=%s(%s famPerFrame=%.2f over n=%lld) D1=%s D2=%s D3=%s D4=%s -- thresholds are the ones registered in ")
 		       TEXT("VoxelRenderFrame.h BEFORE this leg ran; D1 was expected to be DISPROVED. ")
 		       TEXT("All four disproved at once is a legitimate result and must be reported as ")
 		       TEXT("such, not resolved by picking the largest bucket. win=%.2fs"),
 		       Tag, Verdict, (long long)Hi.N, (long long)Lo.N, DRender,
 		       DSetup, Share(DSetup), DExec, Share(DExec), DTail, Share(DTail),
 		       DMarcher, Share(DMarcher), DOther, Share(DOther),
-		       bD0 ? TEXT("ok") : TEXT("FAILED"),
+		       bD0 ? TEXT("ok") : TEXT("FAILED"), D0Why, HiFam, (long long)Hi.N,
 		       bD1 ? TEXT("held") : TEXT("disproved"),
 		       bD2 ? TEXT("held") : TEXT("disproved"),
 		       bD3 ? TEXT("held") : TEXT("disproved"),
@@ -530,8 +751,31 @@ namespace
 			const bool bGroupsExplainIt =
 				FMath::Abs(DTail) > 1e-9 && FMath::Abs(DGroup) > 0.50 * FMath::Abs(DTail);
 
+			// THE NEGATIVE VERDICT NEEDS A PRECONDITION, and not having one is
+			// how this line came to print GROUPS-DO-NOT-EXPLAIN-DTAIL for every
+			// input ever fed to it: with zero scopes compiled in, DGroup was
+			// identically 0 and the else branch was unreachable-by-arithmetic.
+			// A verdict that cannot come out the other way is not a verdict.
+			//
+			// So a group total of zero across an armed level-2 window is now
+			// reported as an INSTRUMENT state, not as a finding about streaming,
+			// and any unwired group at all downgrades the negative verdict to
+			// NOT-DECIDABLE. The POSITIVE verdict is unaffected: hits that were
+			// actually recorded are evidence whatever else is missing.
+			const int32 Unwired = TailGroupsUnwired();
+			const double HitsHi = Hi.M(Hi.TailGroupHits());
+			const double HitsLo = Lo.M(Lo.TailGroupHits());
+			const bool bNoScopeRan = (HitsHi + HitsLo) <= 0.0;
+
+			const TCHAR* TailVerdict =
+				  bGroupsExplainIt ? TEXT("STREAMING-RENDER-COMMANDS-EXPLAIN-THE-DELTA")
+				: bNoScopeRan      ? TEXT("NO-TAIL-SCOPE-RECORDED-A-SINGLE-HIT-THIS-IS-AN-INSTRUMENT-STATE-NOT-A-FINDING")
+				: Unwired > 0      ? TEXT("NOT-DECIDABLE-GROUPS-ARE-UNWIRED-SEE-TAIL-WIRING")
+				:                    TEXT("GROUPS-DO-NOT-EXPLAIN-DTAIL-SEE-dTailOther");
+
 			UE_LOG(LogVoxelRenderFrame, Log,
-			       TEXT("Voxel render frame DELTA-TAIL tag=%s VERDICT=%s dTailMs=%+.2f ")
+			       TEXT("Voxel render frame DELTA-TAIL tag=%s VERDICT=%s sitesWired=%d ")
+			       TEXT("groupsUnwired=%d groupHits/frame=%.1f(moving,n=%lld) %.1f(parked,n=%lld) dTailMs=%+.2f ")
 			       TEXT("dGroupTotalMs=%+.2f (%.0f%% of dTail) dTailOtherMs=%+.2f (%.0f%% of dTail) ")
 			       TEXT("| dMeshJobMs=%+.3f dBrickPoolMs=%+.3f dChunkIndexMs=%+.3f dResidencyMs=%+.3f ")
 			       TEXT("dPoolCompMs=%+.3f dGiVolMs=%+.3f | dMeshJobHits=%+.1f dBrickPoolHits=%+.1f ")
@@ -540,10 +784,12 @@ namespace
 			       TEXT("whose commands got MORE EXPENSIVE, and a group whose hits rose is one that ran ")
 			       TEXT("MORE OFTEN; those are different fixes. If dTailOther carries most of dTail the ")
 			       TEXT("29 instrumented sites are NOT the mechanism and no group here may be named as ")
-			       TEXT("it. win=%.2fs"),
-			       Tag,
-			       bGroupsExplainIt ? TEXT("STREAMING-RENDER-COMMANDS-EXPLAIN-THE-DELTA")
-			                        : TEXT("GROUPS-DO-NOT-EXPLAIN-DTAIL-SEE-dTailOther"),
+			       TEXT("it -- BUT ONLY IF groupsUnwired=0. While groupsUnwired>0 this line cannot ")
+			       TEXT("reach that conclusion at all: the missing scopes are meshJob and brickPool, ")
+			       TEXT("the two groups most likely to carry it. sitesWired is the DENOMINATOR of ")
+			       TEXT("every ms and hit figure on this line. win=%.2fs"),
+			       Tag, TailVerdict, TailSitesWiredTotal(), Unwired,
+			       HitsHi, (long long)Hi.N, HitsLo, (long long)Lo.N,
 			       DTail, DGroup,
 			       FMath::Abs(DTail) > 1e-9 ? 100.0 * DGroup / DTail : 0.0,
 			       DOtherTail,
@@ -669,6 +915,7 @@ namespace
 		Sample.RenderWait = RenderWaitMs;
 		Sample.RhiBusy    = RhiMs;
 		Sample.Families   = double(S.FamiliesThisFrame);
+		Sample.Touches    = double(S.TouchesThisFrame);
 		Sample.Views      = double(S.ViewsThisFrame);
 		Sample.MarchTiles = double(S.MarchTilesThisFrame);
 
@@ -727,6 +974,7 @@ namespace
 			Dst.RhiBusy += Sample.RhiBusy;
 			Dst.CamSpeedUU += Sample.CamSpeedUU;
 			Dst.Families += Sample.Families;
+			Dst.Touches += Sample.Touches;
 			Dst.Views += Sample.Views;
 			Dst.MarchTiles += Sample.MarchTiles;
 		};
@@ -771,14 +1019,43 @@ void Touch(FRDGBuilder& GraphBuilder)
 	const uint32 Frame = GFrameNumberRenderThread;
 	const uint64 Cy = FPlatformTime::Cycles64();
 	const uint32 Idle = SampleIdleCycles();
+	// THE FAMILY KEY. Not the FSceneViewFamily -- Touch()'s signature does not
+	// carry one and the two hooks that call it are in a file this change may
+	// not edit -- but the RDG graph, which is the thing whose extra Execute is
+	// what actually breaks the split. One graph per render node, one render
+	// node per family (SceneRenderBuilder.cpp:873/:916).
+	const void* const GraphKey = static_cast<const void*>(&GraphBuilder);
 
 	if (S.bFrameOpen && S.OpenFrameNumber == Frame)
 	{
-		// A LATER FAMILY OF THE SAME FRAME. Counted, not anchored -- and the
-		// count is printed, because with more than one family the A->B span
-		// swallows an entire intermediate Execute and the three-way split
-		// stops being a partition.
+		++S.TouchesThisFrame;
+
+		if (GraphKey == S.OpenGraph)
+		{
+			// THE SAME GRAPH, A LATER HOOK. This is the ordinary case and it is
+			// the whole defect: PreRenderView_RenderThread is a deliberate
+			// idempotent safety anchor and the fluid extension takes the anchor
+			// too, so a healthy one-family frame reaches here one to three
+			// times. It must not count a family. It stays safe to call.
+			return;
+		}
+
+		// A DIFFERENT GRAPH INSIDE THE SAME FRAME. Anchor E has already fired
+		// for the previous one (that is what cleared OpenGraph), so an entire
+		// Execute has now happened between anchor A and the anchor B that is
+		// still to come: setupMs will swallow it and the three-way split is NOT
+		// a partition. Counted, printed, and D0 fails on it.
 		++S.FamiliesThisFrame;
+		S.OpenGraph = GraphKey;
+		// B AND E MOVE TO THE NEW GRAPH, which is what makes the printed
+		// numbers match the header's own description of this case: setupMs then
+		// runs A(family 1) -> B(last family) and SWALLOWS the intermediate
+		// Execute. Leaving bHaveE set from the previous graph would instead
+		// book this family's setup scopes into the TAIL phase and hide the
+		// swallowing inside a bucket that is not supposed to contain it.
+		S.bHaveB = false;
+		S.bHaveE = false;
+		RegisterAnchorE(GraphBuilder);
 		return;
 	}
 
@@ -790,7 +1067,11 @@ void Touch(FRDGBuilder& GraphBuilder)
 	S.IdleA = Idle;
 	S.bHaveB = false;
 	S.bHaveE = false;
-	S.FamiliesThisFrame = 1;
+	S.OpenGraph = GraphKey;
+	// ONE GRAPH SO FAR. The fake-family arm adds synthetic ones so the gate can
+	// be shown to fail on demand; at its default of 0 or 1 it adds nothing.
+	S.FamiliesThisFrame = FMath::Max(1, LatchedFakeFamilies());
+	S.TouchesThisFrame = 1;
 	S.ViewsThisFrame = 0;
 	S.MarchTilesThisFrame = 0;
 	S.SveBlockedThisFrame = 0.0;
@@ -810,7 +1091,8 @@ void Touch(FRDGBuilder& GraphBuilder)
 		S.LegStartSeconds = S.WindowStartSeconds;
 		S.ScopeCostNs = CalibrateScopeNs();
 		UE_LOG(LogVoxelRenderFrame, Display,
-		       TEXT("Voxel render frame ARMED (-VoxelRenderFrame=%d, mutate=%d %.2fms, window=%.2fs ")
+		       TEXT("Voxel render frame ARMED (-VoxelRenderFrame=%d, mutate=%d %.2fms, fakeFamilies=%d, ")
+		       TEXT("window=%.2fs ")
 		       TEXT("from -VoxelPerfLogInterval, moveThresholdUU=%.0f). Anchors: A=PreRenderViewFamily, ")
 		       TEXT("B=PostRenderViewFamily, E=RDG post-execute. Buckets are BUSY (idle subtracted from ")
 		       TEXT("FThreadIdleStats::Waits + GRenderThreadIdle[GPUQuery]) and reconcile against ")
@@ -819,24 +1101,15 @@ void Touch(FRDGBuilder& GraphBuilder)
 		       TEXT("scopeCostNs=%.1f measured at arm time (level 2 pays this per render command; ")
 		       TEXT("multiply by l2Hits on the TAIL line for the armed overhead, and if that is a ")
 		       TEXT("meaningful share of tailMs the attribution arm is not a control for the D4 arm)."),
-		       LatchedMode(), LatchedMutateArm(), LatchedMutateMs(), LatchedWindowSeconds(),
+		       LatchedMode(), LatchedMutateArm(), LatchedMutateMs(), LatchedFakeFamilies(),
+		       LatchedWindowSeconds(),
 		       LatchedMoveThresholdUU(), S.ScopeCostNs);
 	}
 
 	// ANCHOR E. Registered on the graph that is about to be built, so it fires
 	// at the end of THIS frame's Execute (RenderGraphBuilder.cpp:2214), after
 	// the parallel-translate await.
-	GraphBuilder.AddPostExecuteCallback([]()
-	{
-		FState& St = Get();
-		if (LatchedMutateArm() == 2)
-		{
-			BurnMs(LatchedMutateMs());
-		}
-		St.CyE = FPlatformTime::Cycles64();
-		St.IdleE = SampleIdleCycles();
-		St.bHaveE = true;
-	});
+	RegisterAnchorE(GraphBuilder);
 
 	const double Now = FPlatformTime::Seconds();
 	if (Now - S.LastLogSeconds >= LatchedWindowSeconds())

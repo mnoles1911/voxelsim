@@ -33,6 +33,12 @@
 #include "Misc/Parse.h"
 #include "Misc/ScopeExit.h"
 #include "RenderingThread.h"
+// THE TAIL-GROUP SCOPE, one line per ENQUEUE_RENDER_COMMAND body. See
+// VoxelRenderFrame.h: these bodies run on the RENDER THREAD BETWEEN scene
+// renders -- i.e. in the tail bucket -- and tailMs is where the parked->moving
+// delta is expected to live. Costs one compare on a latched int unless the leg
+// is run with -VoxelRenderFrame=2.
+#include "VoxelRenderFrame.h"
 #include "UObject/UObjectIterator.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGI, Log, All);
@@ -775,7 +781,11 @@ void UVoxelGISubsystem::ClearAllState()
 		Off.bLocalEnabled = false;
 		LastVolumeSettings = Off;
 		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeOffOnClear)(
-			[Off](FRHICommandListImmediate&) { GVoxelGIVolume.UpdateParameters_RenderThread(Off); });
+			[Off](FRHICommandListImmediate&)
+			{
+				VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
+				GVoxelGIVolume.UpdateParameters_RenderThread(Off);
+			});
 	}
 }
 
@@ -1718,6 +1728,7 @@ void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
 		[Min, Size, BytesPos = MoveTemp(PayloadPos), BytesNeg = MoveTemp(PayloadNeg)]
 		(FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
 		GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Min, Size,
 		                                         BytesPos.GetData(), BytesNeg.GetData());
 	});
@@ -1913,6 +1924,7 @@ void UVoxelGISubsystem::PushVolumeParamsIfChanged()
 	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeParams)(
 		[New](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
 		GVoxelGIVolume.UpdateParameters_RenderThread(New);
 	});
 }
@@ -1929,7 +1941,11 @@ void UVoxelGISubsystem::TickVolume()
 			Off.bEnabled = false;
 			LastVolumeSettings = Off;
 			ENQUEUE_RENDER_COMMAND(VoxelGIVolumeOff)(
-				[Off](FRHICommandListImmediate&) { GVoxelGIVolume.UpdateParameters_RenderThread(Off); });
+				[Off](FRHICommandListImmediate&)
+				{
+					VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
+					GVoxelGIVolume.UpdateParameters_RenderThread(Off);
+				});
 		}
 		return;
 	}
@@ -1947,7 +1963,10 @@ void UVoxelGISubsystem::TickVolume()
 		const bool bWantLocal = VoxelGIVolume::IsLocalEnabled();
 		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeAlloc)(
 			[bWantLocal](FRHICommandListImmediate& RHICmdList)
-			{ GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList, bWantLocal); });
+			{
+				VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
+				GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList, bWantLocal);
+			});
 	}
 
 	// --- local lights: arm, allocate, splat ---------------------------------
@@ -1997,7 +2016,10 @@ void UVoxelGISubsystem::TickVolume()
 		// everywhere except in the one place that matters.
 		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeLocalAlloc)(
 			[](FRHICommandListImmediate& RHICmdList)
-			{ GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList, /*bWantLocal*/ true); });
+			{
+				VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
+				GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList, /*bWantLocal*/ true);
+			});
 	}
 
 	if (bVolumeRecentring)
@@ -2194,6 +2216,11 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeUpload)(
 		[Payload = MoveTemp(Runs)](FRHICommandListImmediate& RHICmdList)
 	{
+		// THE PER-FRAME GI TEXEL UPLOAD, and the one whose hit count is expected
+		// to move with streaming: one run per re-staged brick. HITS BEFORE MS --
+		// ms up with hits flat is a more expensive upload, ms up with hits up is
+		// more of them, and those are different fixes.
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
 		for (const FVoxelGIVolumeRun& Run : Payload)
 		{
 			GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Run.Min, Run.Size,
@@ -2596,6 +2623,7 @@ void UVoxelGISubsystem::SplatLocalBox(const FIntVector& Min, const FIntVector& S
 	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeLocalUpload)(
 		[Min, Size, Bytes = MoveTemp(Payload)](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGIVolume);
 		GVoxelGIVolume.UpdateLocalTexels_RenderThread(RHICmdList, Min, Size, Bytes.GetData());
 	});
 
