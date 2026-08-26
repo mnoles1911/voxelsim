@@ -149,6 +149,50 @@ public:
         return log;
     }
 
+    // WHAT A REFUSED FILE IS CARRYING.
+    //
+    // parse() answers exactly one bit -- usable or not -- which is the right
+    // answer for a loader and the WRONG answer for the human who has to decide
+    // what to do next. "Written by an older kWorldGenVersion" and "the bytes
+    // are damaged" both arrive as std::nullopt, and they want OPPOSITE
+    // responses: the first wants a migration written against intact data, the
+    // second wants a restore. A caller that cannot tell them apart logs "corrupt
+    // or unrecognized" for both and loses the distinction forever.
+    //
+    // peekHeader reads ONLY the fixed-size prefix, allocates nothing, and
+    // reports each field it MANAGED to read (haveX false = the file ended
+    // before that field). It is total: any byte sequence, including an empty
+    // one, produces an answer.
+    //
+    // IT LIVES BESIDE parse() ON PURPOSE. The prefix layout is written down
+    // twice -- once here, once in parse() -- and putting the two within a
+    // screen of each other is what keeps them from detaching. Anything that
+    // changes serialize()'s header must change both, and will see both.
+    struct HeaderPeek {
+        bool haveMagic = false;
+        uint32_t magic = 0;
+        bool haveFormat = false;
+        uint32_t format = 0;
+        bool haveWorldGen = false;
+        uint32_t worldGen = 0;
+        bool haveSeed = false;
+        uint64_t seed = 0;
+        bool haveBrickEdge = false;
+        uint8_t brickEdge = 0;
+    };
+
+    static HeaderPeek peekHeader(const uint8_t* data, size_t size) {
+        HeaderPeek h;
+        if (data == nullptr) return h;
+        ByteReader r(data, size);
+        if (!(h.haveMagic = r.u32(h.magic))) return h;
+        if (!(h.haveFormat = r.u32(h.format))) return h;
+        if (!(h.haveWorldGen = r.u32(h.worldGen))) return h;
+        if (!(h.haveSeed = r.u64(h.seed))) return h;
+        h.haveBrickEdge = r.u8(h.brickEdge);
+        return h;
+    }
+
 private:
     enum PayloadMode : uint8_t { kSparse = 0, kRle = 1 };
 

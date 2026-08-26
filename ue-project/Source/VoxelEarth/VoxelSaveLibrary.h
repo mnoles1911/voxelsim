@@ -38,6 +38,11 @@ class UVoxelWorldSubsystem;
 
 namespace VoxelSave
 {
+// meta.json's OWN schema version. 1 is the first that carries any version
+// stamps at all; a meta.json written before this reads back as 0 (see
+// FSaveInfo::MetaVersion) and is not an error.
+inline constexpr int32 kMetaVersion = 1;
+
 // One row of the LOAD GAME list, read from a save's meta.json.
 struct VOXELEARTH_API FSaveInfo
 {
@@ -51,6 +56,26 @@ struct VOXELEARTH_API FSaveInfo
 	int32 PlayTimeSeconds = 0;
 	int64 EditCount = 0;
 	bool bIsAutosave = false;
+
+	// --- VERSION STAMPS ---
+	//
+	// WHY THEY EXIST. Until these landed, meta.json recorded no version of
+	// anything. When world.vxlog beside it stopped loading -- which is what a
+	// kWorldGenVersion bump does to every save at once -- there was no way to
+	// tell "written by an older build, bytes intact, migratable" from
+	// "damaged". Those want opposite responses, and a migration cannot even be
+	// WRITTEN without knowing which version it is migrating FROM. This is the
+	// precondition for that, not the migration itself.
+	//
+	// ZERO MEANS UNSTAMPED, not zero. A save written before this field existed
+	// reads back as 0, exactly as EditLog::checkProvider treats an empty
+	// providerId as kUnstamped rather than as a mismatch -- refusing a save for
+	// not carrying a field that did not exist when it was written would strand
+	// every save on disk today. Compare against 0 first, then against the
+	// build's constant.
+	int32 MetaVersion = 0;           // kMetaVersion at write time
+	int32 WorldGenVersion = 0;       // vxc::kWorldGenVersion at write time
+	int32 EditLogFormatVersion = 0;  // vxc::EditLog::kFormatVersion at write time
 };
 
 // Every save on disk, NEWEST FIRST. That ordering is not cosmetic: MainMenu.gd

@@ -16,6 +16,11 @@
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
 
+// After the UE headers, matching every other .cpp in this module that reaches
+// into voxel-core (VoxelAgentSubsystem.cpp, VoxelCoverVerify.cpp, ...).
+#include "voxelcore/core.h"    // kWorldGenVersion -- stamped into meta.json
+#include "voxelcore/editlog.h" // EditLog::kFormatVersion -- stamped beside it
+
 namespace VoxelSaveDetail
 {
 // Named namespace, not anonymous: see tools/lint-unity-collisions.py.
@@ -68,6 +73,14 @@ bool ReadMeta(const FString& Slug, VoxelSave::FSaveInfo& Out)
 	Out.PlayTimeSeconds = int32(Root->GetNumberField(TEXT("play_time_seconds")));
 	Out.EditCount = int64(Root->GetNumberField(TEXT("edit_count")));
 	Out.bIsAutosave = Root->GetBoolField(TEXT("is_autosave"));
+
+	// TryGetNumberField, not GetNumberField: an absent field leaves the 0 that
+	// FSaveInfo documents as UNSTAMPED. A save written before these fields
+	// existed must still list and still load -- see FSaveInfo's comment on why
+	// 0 is a third answer rather than a bad version.
+	Root->TryGetNumberField(TEXT("meta_version"), Out.MetaVersion);
+	Root->TryGetNumberField(TEXT("world_gen_version"), Out.WorldGenVersion);
+	Root->TryGetNumberField(TEXT("edit_log_format_version"), Out.EditLogFormatVersion);
 
 	const TSharedPtr<FJsonObject>* Position = nullptr;
 	if (Root->TryGetObjectField(TEXT("player_position"), Position) && Position != nullptr)
@@ -195,6 +208,16 @@ bool Write(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool b
 	Root->SetNumberField(TEXT("play_time_seconds"), double(PlayTimeSeconds));
 	Root->SetNumberField(TEXT("edit_count"), double(World.GetLogSize()));
 	Root->SetBoolField(TEXT("is_autosave"), bIsAutosave);
+
+	// THE VERSION STAMPS. meta.json had none, which meant that when the
+	// world.vxlog beside it stopped loading, nothing on disk recorded WHICH
+	// version had written it -- so "older build, bytes intact" and "damaged"
+	// were indistinguishable, and no migration could ever be written because
+	// there was nothing to migrate FROM. All three are plain JSON numbers and
+	// safely below 2^53, unlike the seed above.
+	Root->SetNumberField(TEXT("meta_version"), double(kMetaVersion));
+	Root->SetNumberField(TEXT("world_gen_version"), double(vxc::kWorldGenVersion));
+	Root->SetNumberField(TEXT("edit_log_format_version"), double(vxc::EditLog::kFormatVersion));
 
 	const TSharedRef<FJsonObject> Position = MakeShared<FJsonObject>();
 	Position->SetNumberField(TEXT("x"), PlayerTransform.GetLocation().X);

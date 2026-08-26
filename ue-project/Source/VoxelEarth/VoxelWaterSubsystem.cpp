@@ -8,6 +8,7 @@
 #include "VoxelFineTileStreamer.h"  // CoarseTileForWorldMm -- one addressing rule
 #include "VoxelTileCodec.h"         // GetFineTileDecompressor -- the CODEC_ZSTD boundary
 #include "VoxelWorldSubsystem.h"
+#include "VoxelSaveGuard.h"        // a blob this build could not READ must not be a blob it may WRITE
 
 // ADR-0006 water pool (voxel.Water.GPU): a SECOND INSTANCE of the terrain
 // geometry pool, not a copy of it. See GetOrCreateWaterPool below for what had
@@ -3681,6 +3682,16 @@ FString GetTerrainSaveFilePath(uint64 Seed)
 // never a truncated/corrupt blob a later load would have to reject.
 bool WriteWaterBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
 {
+	// THE REFUSAL GATE (VoxelSaveGuard.h), the same one WriteBytesAtomic in
+	// VoxelWorldSubsystem.cpp carries, and here for the same reason: this
+	// helper writes BOTH the .vxwater and the .vxhydro, so one check covers
+	// both blobs and any third one added later. Per-PATH, so a quarantined
+	// .vxwater never blocks its sibling .vxhydro.
+	if (VoxelSaveGuard::RefuseWrite(Path, TEXT("SaveWaterState")))
+	{
+		return false;
+	}
+
 	const FString TmpPath = Path + TEXT(".tmp");
 	if (!FFileHelper::SaveArrayToFile(Bytes, *TmpPath))
 	{
@@ -3789,6 +3800,12 @@ void LoadWaterStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 		       TEXT("LoadWaterState: water blob %s exists but could NOT be READ -- falling back to a fully implicit world; ")
 		       TEXT("every drained cavern WILL REFILL (ADR-0005)."),
 		       *Path);
+		// Quarantine but do NOT move aside: the blob exists and we have no
+		// evidence it is malformed, only that we could not open it -- and a
+		// rename would likely fail for whatever reason the read did. See the
+		// identical branch in LoadEditLogFromPath.
+		VoxelSaveGuard::Quarantine(
+			Path, TEXT("the file exists but this session could not open it (locked, permissions, or failing disk)."));
 		return;
 	}
 
@@ -3806,6 +3823,15 @@ void LoadWaterStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 		       TEXT("(engine is now v%u), corrupt/truncated, or a failed totalVolume integrity cross-check. Falling back to a ")
 		       TEXT("fully implicit world; EVERY drained cavern in this world WILL REFILL (ADR-0005)."),
 		       *Path, Bytes.Num(), vxc::kWaterCAVersion);
+		// SAME SHAPE AS THE TERRAIN LOG, VERIFIED not assumed: this branch used
+		// to return with the blob still at Path, and UVoxelWaterSubsystem::
+		// Deinitialize (bWorldBegunPlay + "there is water to persist") then
+		// wrote THIS session's water over it. A kWaterCAVersion bump lands
+		// every world here at once, exactly as a kWorldGenVersion bump does for
+		// the log. ClassifyWaterState separates "stale version, bytes intact"
+		// from genuine damage, which the line above cannot do.
+		VoxelSaveGuard::RefuseFile(Path, VoxelSaveGuard::ClassifyWaterState(Bytes.GetData(), Bytes.Num()),
+		                           TEXT("water state"));
 		return;
 	}
 
@@ -3969,6 +3995,8 @@ void LoadHydroStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 	{
 		UE_LOG(LogVoxelWater, Warning,
 		       TEXT("LoadHydroState: %s exists but could NOT be READ -- lakes revert to baked equilibrium."), *Path);
+		VoxelSaveGuard::Quarantine(
+			Path, TEXT("the file exists but this session could not open it (locked, permissions, or failing disk)."));
 		return;
 	}
 
@@ -3981,6 +4009,13 @@ void LoadHydroStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 		       TEXT("LoadHydroState: %s (%d bytes) is not a v%u hydrology blob -- REFUSED. Lakes revert to baked ")
 		       TEXT("equilibrium."),
 		       *Path, Bytes.Num(), kHydroFormatVersion);
+		// Third file, same class: SaveHydroStateToDisk is called from inside
+		// SaveWaterStateToDisk on every save, so a refused .vxhydro was being
+		// overwritten on shutdown just like the other two.
+		VoxelSaveGuard::RefuseFile(Path,
+		                           VoxelSaveGuard::ClassifyContainer(Bytes.GetData(), Bytes.Num(), kHydroMagic,
+		                                                             kHydroFormatVersion, TEXT("hydrology blob")),
+		                           TEXT("hydrology state"));
 		return;
 	}
 	// The header is 12 bytes; sections follow it in order and their lengths must
@@ -3991,6 +4026,13 @@ void LoadHydroStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 	{
 		UE_LOG(LogVoxelWater, Warning, TEXT("LoadHydroState: %s has an out-of-range ledger section -- REFUSED."),
 		       *Path);
+		VoxelSaveGuard::FRefusal Refusal;
+		Refusal.Token = TEXT("bad-section-length");
+		Refusal.Detail = FString::Printf(
+			TEXT("the container header is valid but its ledger section claims %u byte(s) inside a %llu-byte file. "
+			     "Structurally damaged, not a version mismatch."),
+			LedgerBytes, (unsigned long long)Total);
+		VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("hydrology state"));
 		return;
 	}
 	const uint8* LedgerAt = Bytes.GetData() + 12;
@@ -4002,6 +4044,19 @@ void LoadHydroStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 		       TEXT("Every lake reverts to its BAKED EQUILIBRIUM level."),
 		       *Path, vxc::kBasinLedgerVersion);
 		// Fall through: a bad ledger must not also cost the routing graph.
+		//
+		// BUT THE FILE IS STILL QUARANTINED. A section this build cannot read
+		// is a section a MIGRATION could read, and saving over the file is the
+		// one action that makes that impossible forever. The trade is explicit:
+		// this session's lake drift is not written back, and the bytes that
+		// recorded every previous session's survive. The token carries the
+		// SECTION's own diagnosis, prefixed so it cannot collide with a refusal
+		// of the container itself.
+		VoxelSaveGuard::FRefusal Inner = VoxelSaveGuard::ClassifyContainer(
+			LedgerAt, int32(LedgerBytes), vxc::BasinLedgerState::kMagic, vxc::kBasinLedgerVersion,
+			TEXT("basin ledger"));
+		Inner.Token = FString(TEXT("ledger-")) + Inner.Token;
+		VoxelSaveGuard::RefuseFile(Path, Inner, TEXT("hydrology state (basin-ledger section)"));
 	}
 
 	const uint8* GraphLenAt = LedgerAt + LedgerBytes;
@@ -4011,6 +4066,15 @@ void LoadHydroStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 	{
 		UE_LOG(LogVoxelWater, Warning, TEXT("LoadHydroState: %s has an out-of-range graph section -- graph not restored."),
 		       *Path);
+		// Same reasoning as the ledger section above: bytes this build cannot
+		// place are bytes a later build must still be able to look at.
+		VoxelSaveGuard::FRefusal Refusal;
+		Refusal.Token = TEXT("graph-bad-section-length");
+		Refusal.Detail = FString::Printf(
+			TEXT("the ledger section read cleanly but the routing-graph section's length is missing or runs past "
+			     "the end of a %llu-byte file. Structurally damaged, not a version mismatch."),
+			(unsigned long long)Total);
+		VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("hydrology state (routing-graph section)"));
 		GraphBytes = 0;
 	}
 	if (GraphBytes > 0)

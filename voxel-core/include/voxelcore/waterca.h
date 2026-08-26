@@ -1769,6 +1769,33 @@ public:
     // Snapshots `ca` + `mob` into `out` (appends; does not clear).
     static void serialize(const WaterCA& ca, const WaterMobilizer& mob, std::vector<uint8_t>& out);
 
+    // WHAT A REFUSED BLOB IS CARRYING. parse() collapses "stale
+    // kWaterCAVersion" and "the bytes are damaged" into one std::nullopt, and
+    // those want opposite responses from whoever reads the log -- the first is
+    // intact data an older build wrote, the second is a loss. peekHeader reads
+    // only the three-u32 prefix documented under ENCODING above, allocates
+    // nothing, is total over any byte sequence, and reports each field it
+    // managed to read (haveX false = the blob ended before it). Inline and
+    // beside parse() so the prefix layout cannot detach from it.
+    struct HeaderPeek {
+        bool haveMagic = false;
+        uint32_t magic = 0;
+        bool haveFormat = false;
+        uint32_t format = 0;
+        bool haveCaVersion = false;
+        uint32_t caVersion = 0;
+    };
+
+    static HeaderPeek peekHeader(const uint8_t* data, size_t size) {
+        HeaderPeek h;
+        if (data == nullptr) return h;
+        ByteReader r(data, size);
+        if (!(h.haveMagic = r.u32(h.magic))) return h;
+        if (!(h.haveFormat = r.u32(h.format))) return h;
+        h.haveCaVersion = r.u32(h.caVersion);
+        return h;
+    }
+
     // Fully decodes AND validates a blob without touching any live state.
     // std::nullopt on: bad magic, format/CA version mismatch, truncation,
     // trailing bytes, an out-of-range or non-ascending key, a payload that
