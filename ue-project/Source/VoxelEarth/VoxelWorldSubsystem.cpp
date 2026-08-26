@@ -25,6 +25,7 @@
 #include "VoxelEarth.h"
 #include "VoxelFrontEndPolicy.h" // front-end suppression rules; see the header for the invariant
 #include "VoxelSaveLibrary.h"      // autosave-on-shutdown writes back to the active named save
+#include "VoxelSaveGuard.h"        // a file this build could not READ must not be a file it may WRITE
 #include "VoxelFineTileStreamer.h" // Phase 2 fine-tier residency/prefetch/eviction gate (-VoxelFineTileDir=)
 #include "VoxelTileCodec.h" // GetFineTileDecompressor -- the asset channel source decodes .vxtl v2 tiles
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
@@ -3843,9 +3844,13 @@ double InnerEvictUU(int32 Level)
 // --- hierarchical coverage: every coarser level also covers the ground -------
 // --- inside it (Phase 1 of the no-hole plan) ---------------------------------
 //
-// -VoxelHierarchicalCoverage. DEFAULT OFF, and off is byte-identical to today:
-// every test below that consults this reduces to the code that was there
-// before, so a control leg needs no rebuild and no second binary.
+// HIERARCHICAL COVERAGE. DEFAULT **ON** SINCE 2026-08-23, and the switch is
+// the NEGATIVE -VoxelNoHierarchicalCoverage (see HierarchicalCoverageEnabled
+// below). The control leg is therefore the one that PASSES a flag, not the
+// one that omits it; -VoxelHierarchicalCoverage is not read anywhere any
+// more and passing it does nothing. Off is still byte-identical to the
+// pre-2026-08-23 code, so a control leg needs no rebuild and no second
+// binary -- it just needs the negative flag.
 //
 // WHAT IT CHANGES. Today exactly ONE level covers any given ground -- the
 // entry pass skips a coarse candidate whose centre falls inside InnerAdmitUU
@@ -3864,10 +3869,14 @@ double InnerEvictUU(int32 Level)
 // annulus is 3x the area of the whole disc below it (the presets are
 // area-balanced by design -- see kDefaultRingPresets), so full coverage is a
 // flat x4/3 per coarse level, +24.3% resident chunks overall, ~120,350. That
-// puts the DEFAULT 131,072-chunk brick pool at 92% -- inside eviction range
-// under flight, and pool evictions must stay at zero (the P2 gate). The pool
-// is therefore raised alongside this switch, from the SAME command-line flag,
-// in VoxelBrickPool.cpp's Init -- see the note there. The steady-state
+// put the THEN-DEFAULT 131,072-chunk brick pool at 92% -- inside eviction
+// range under flight, and pool evictions must stay at zero (the P2 gate).
+// THAT COUPLING IS GONE AND NO LONGER NEEDED: the pool default is now
+// 393,216, so ~120,350 is 31% of it. VoxelBrickPool.cpp's Init used to
+// raise capacity from the SAME command-line flag; that branch was deleted
+// on 2026-08-25 because it read a spelling nothing passes any more AND its
+// max(393216, 262144) could not raise anything. Do not re-add the coupling
+// without re-checking both halves. The steady-state
 // admission RATE goes DOWN, not up: an annulus sweeping sideways gains ground
 // at two edges (leading outer arc plus the inner hole vacating), a disc gains
 // at one, so each coarse level's admission rate falls to 2/3 of today's
@@ -4953,6 +4962,423 @@ bool GetVerifyEnabled()
 	return bEnabled;
 }
 } // namespace VoxelSkyBand
+
+// ---------------------------------------------------------------------------
+// THE OPEN-SKY MARK (voxel.Stream.SkyMark) -- turning a streaming DECISION into
+// a fact the marcher can read
+// ---------------------------------------------------------------------------
+//
+// WHAT PROBLEM THIS IS THE PREREQUISITE FOR. VoxelMarch.March is 54% of the GPU
+// frame and its cost tracks EMPTY SPACE CROSSED, not geometry hit: 1.108 ms
+// looking straight down, 4.448 ms at the horizon, 5.638 ms at the sky, over
+// four matched static legs differing only in pitch. A horizon ray does ~208
+// chunk-cell iterations and hits on 5-10 of them, and each of the other ~200 is
+// one scattered 4-byte load into a 64 MiB index.
+//
+// THREE ARMS TRIED TO SKIP THAT AIR AND ALL THREE FAILED FOR ONE REASON.
+// voxel.March.ZCut skipped 0.00% at the horizon. voxel.March.BlockSkip skipped
+// 24.74% of 11.1e9 blocks and ran 30% SLOWER -- per ray it paid 23.7 block
+// tests to avoid 11.2 cells. A beam pre-pass was refuted before it was written.
+// The common cause is not tuning:
+//
+//     THERE IS NO "KNOWN EMPTY" STATE IN THIS WORLD.
+//
+// Only a thin surface shell is streamed -- about 4.4 chunks per column at level
+// 0, 50,052 resident chunks in a 16,777,216-cell index, 99.7% empty. AIR IS NOT
+// RESIDENT. So `MarchBlockOccupied == 0` means "all 64 of these chunks are
+// non-resident", and non-resident MUST be treated as blocking, because a chunk
+// that has not streamed yet may contain surface. There was nothing anywhere
+// that a skip was permitted to advance through.
+//
+// AND THE STREAMING SIDE ALREADY KNEW THE ANSWER AND THREW IT AWAY. The sky
+// trim (namespace VoxelSkyBand, and ComputeFootprintChunkZRange's SKY-BAND TRIM
+// block) does not merely fail to admit the air above a ridge -- the same
+// analytic bound backs IsChunkProvablyAllAir, a worldgen-grade proof that a
+// chunk contains no terrain, and the streamer DECLINES to admit on the strength
+// of it. "This cell is open sky and I chose not to admit it" is exactly the
+// missing fact. It was computed, acted on, and discarded.
+//
+// SO THIS NAMESPACE WRITES IT DOWN. The decision is recorded into the march
+// index's own non-resident cell dword -- bits the marcher ALREADY FETCHES for
+// its residency test. That is the whole reason this approach can work where the
+// other three could not: no added load, no added bandwidth, nothing new in the
+// inner loop. Any design that adds an inner-loop test is dead on arrival here;
+// three arms have proved it.
+//
+// A WRONGLY MARKED CELL IS A HOLE, which is the defect the owner reports on
+// sight, so the predicate is affirmative and narrow. See MarkOpenSkyColumn for
+// the conditions and why each one exists. The direction of every doubt is
+// UNMARKED: unmarked costs time, wrongly marked deletes terrain.
+//
+// DEFAULT 0, AND WHY THAT IS NOT THE OLD MISTAKE. The absent-reason annotations
+// this sits beside are gated on voxel.March.HoleStats 2, which is why in EVERY
+// perf run every absent cell reads NONE -- the information exists only on legs
+// nobody measures. That is the failure being corrected, and the correction is
+// that this writer is NOT gated on a diagnostic arm: HoleStats can be 0 and the
+// marks are still written. What it IS gated on is its own master switch, so the
+// game-thread cost it adds to the streaming tick (already this project's
+// bottleneck -- see the streaming tick ceiling) has a byte-identical control
+// arm. A measurement leg sets this and the consumer arm together.
+namespace VoxelSkyMark
+{
+// The master switch. See the block above for why a switch here is not the
+// HoleStats mistake repeated.
+static int32 GEnabled = 0;
+static FAutoConsoleVariableRef CVarSkyMarkEnabled(
+	TEXT("voxel.Stream.SkyMark"),
+	GEnabled,
+	TEXT("THE OPEN-SKY MARK. 0 = off, THE CONTROL, and the default: no cell is marked, the ")
+	TEXT("index stream is byte-identical to a pre-2026-08-25 binary, and every consumer arm ")
+	TEXT("reads an empty world. 1 = where the sky-band coverage rule AFFIRMATIVELY PROVED a ")
+	TEXT("chunk is above the terrain surface and declined to admit it, stamp that decision ")
+	TEXT("into the chunk index's non-resident cell dword.\n")
+	TEXT("WHAT IT IS FOR: the marcher is 54% of the GPU frame and its cost tracks EMPTY SPACE ")
+	TEXT("CROSSED (1.108 ms down / 4.448 horizon / 5.638 sky, four matched static legs). Three ")
+	TEXT("skip arms failed because non-resident had to be treated as blocking -- air is not ")
+	TEXT("resident here, so 'nothing in this cell' could never license an advance. This writes ")
+	TEXT("the one state that can: PROVABLY AIR.\n")
+	TEXT("IT WRITES NOTHING THE MARCHER PAYS TO READ. The mark rides bits 0..10 of a cell whose ")
+	TEXT("dword the residency test already loads. No new buffer, no new inner-loop test. The ")
+	TEXT("CONSUMERS are separate default-0 arms; this switch alone changes no pixel and no GPU ")
+	TEXT("work.\n")
+	TEXT("FAILING READINGS -- what says it is INERT rather than working: skyCols=0 with ")
+	TEXT("footprints>0 means no column ever passed the predicate, and the decline split names ")
+	TEXT("the owner (trimOff / boundDecl / edited / notResident -- notResident on a SETTLED leg ")
+	TEXT("means the run has no fine tier, or the footprint is outside tile coverage, and this ")
+	TEXT("arm marks nothing there ON PURPOSE because a missing tile answers sea level and sea ")
+	TEXT("level under-states the surface). skyOffered=0 with skyCols>0 is ")
+	TEXT("an arithmetic bug in the band, not a world property. skyWritten=0 with skyOffered>0 ")
+	TEXT("means the index refused every write: refResident points at torus aliasing, refOther ")
+	TEXT("at a disarmed writer (voxel.March.IndexGpuResident on -- the GPU publish kernel would ")
+	TEXT("clear these cells to literal 0, so the writer stands down on purpose).\n")
+	TEXT("THE FALSIFIER, and it is a test that CAN come out the other way: skyVerifyBad > 0. ")
+	TEXT("The band's floor is derived by inverting IsChunkProvablyAllAir's own inequality, and ")
+	TEXT("-VoxelSkyMarkVerify calls that function at the floor (must be TRUE) and one chunk ")
+	TEXT("BELOW it (must be FALSE) for every column marked. A single mismatch means the ")
+	TEXT("derivation has drifted from the proof -- treat any non-zero as a hole waiting to be ")
+	TEXT("photographed, not as a rounding difference.\n")
+	TEXT("THESE COUNTERS ARE DECISIONS, NOT NANOSECONDS. Nothing here is a time saving. The ")
+	TEXT("only saving is VoxelMarch.March from ProfileGPU, and nothing else.\n")
+	TEXT("FOR AN ARM THAT CHANGES WHAT IS DRAWN, THE IMAGE COMES FIRST AND THE TIMING SECOND. ")
+	TEXT("This arm was band-swept for TIMING, the knee was made the default, and the binary was ")
+	TEXT("rebuilt -- all before anyone looked at a frame. The timing was clean and correct and ")
+	TEXT("the arm was destroying the image the whole time: a pinned-pose pair differed by 96.33%% ")
+	TEXT("of pixels, with a near mountain deleted and the valley behind it showing through. ")
+	TEXT("Every number on the skyMark lines proves the writer ENGAGED and none of them says it ")
+	TEXT("was RIGHT. Shoot the control/armed capture pair FIRST; only once it matches to within ")
+	TEXT("the harness noise floor does a millisecond off this arm mean anything."),
+	ECVF_Default);
+
+// How many level-L chunks above the proven sky floor to mark, per column.
+//
+// WHY THERE IS A CAP AT ALL. The sky is unbounded and the toroidal grid holds
+// only 128 cells per axis per level, so "mark all of it" is neither possible
+// nor affordable: every marked cell is a shadow write plus an entry in the
+// delta upload's pair list, against a flush that today moves ~9,500 cells in
+// total. The cap is the whole cost knob.
+//
+// WHY 8 IS THE DEFAULT. The consumer that can pay is the 4^3 block level, and a
+// block is only fully sky if all four of its Z layers are -- so a band must
+// cover at least 4 chunks, and 8 covers one whole block whatever the phase of
+// the floor against the block grid. It is also the number the run-length
+// counter exists to challenge: if mean marked-run length comes back AT the cap,
+// the cap is the binding constraint and this should rise; if it comes back well
+// under, the terrain relief is, and raising it buys only upload traffic.
+// DEFAULT 32, MEASURED 2026-08-25 (pitch 0, static, ProfileGPU, matched arms):
+//
+//     band   VoxelMarch.March   vs control   fallthrough taken   run mean
+//     off          4.512 ms          --            98.79%           --
+//       8          4.199 ms        -6.9%           55.90%          8.00
+//      32          4.171 ms        -7.6%           36.57%         32.00
+//     128          4.142 ms        -8.2%           36.57%         64.00
+//
+// THE RETRY RATE PLATEAUS AT 36.57% FROM 32 UPWARD. Past that the extra marks
+// license nothing new, which is the number that chose this default -- not the
+// 0.03 ms that 128 adds for double the writer work.
+//
+// READ THE RUN MEAN AGAINST THE CAP, AND AGAINST THE CLAMP. It sat exactly on
+// the cap at every band, including 128 -- which is CLAMPED TO 64 below, so that
+// row's 64.00 is the clamp biting, NOT the terrain running out of sky. I read it
+// as terrain-limited first and it is not. A run mean pinned to the cap means
+// RATIONED; only a run mean strictly below it means the sky was exhausted. Same
+// signature the raster page cap showed at 4 and 16 earlier the same day.
+//
+// Writer cost is cumulative over a leg, on a game thread that is 64-75%% idle:
+// 4.58 / 31.47 / 67.82 ms for the three bands. The PARKED frame improved anyway
+// (8.77 -> 8.39 ms), so this is not bought from the CPU.
+//
+// Inert while voxel.Stream.SkyMark is 0 (its default) -- nothing reads the marks.
+// REVERTED TO 8 AND THE ARM IS UNSAFE AT ANY BAND -- see the capture evidence
+// below. 32 was set from a timing sweep BEFORE the visual check; the timing was
+// real and the arm still deletes terrain. Timing first, image second, is the
+// wrong order and this is what it costs.
+//
+// MEASURED 2026-08-25, pinned pose, deterministic harness (two identical runs
+// differ by 0.0046%, control-vs-control by 0.048%):
+//
+//     armed (SkyMark 1 + SkyLadder 1, band 32) vs control:  96.33% of pixels
+//
+// The control frame is a mountain slope filling the view. The ARMED frame shows
+// the VALLEY BEHIND IT -- the near mountain is gone. That is not an LOD
+// difference, it is deleted terrain, and it scales with the band: at 8 the same
+// pair differed by 0.147%, at 32 by 96.33%.
+//
+// DIAGNOSED 2026-08-26, AND NEITHER SUSPECT WAS WHAT IT LOOKED LIKE.
+//
+//   * NOT A PER-COLUMN FLOOR. FootprintSurfaceUpperBoundMm builds its rect from
+//     the CHUNK SPAN, not from a column, so the floor was already a statement
+//     about the whole level-L footprint and was already sound for a diagonal
+//     ray. That suspect is refuted by the code that computes the bound.
+//   * THE BAND UNITS ARE A DOSE, NOT THE POISON. Marking MORE true sky cannot
+//     by itself delete anything. What the level-L band units did was decide HOW
+//     MUCH of each ray's air path got marked, and the gate downstream closes
+//     only when EVERY absence a ray crossed is marked. That is a conjunction
+//     over a whole walk, which is why the failure jumped from 0.147%% at band 8
+//     to 96.33%% at band 32 instead of scaling by four. The units are still
+//     wrong and voxel.Stream.SkyMarkMetres now fixes them, but they are the
+//     dose.
+//   * THE CAUSE IS THAT THE MARK WAS USED BEYOND WHAT IT PROVES. The consumer
+//     (voxel.March.SkyLadder) reads a level-L mark and on the strength of it
+//     declines to re-walk the segment at level L+1. A level-L+1 chunk covers
+//     four level-L footprints and its voxels are a DOWNSAMPLE, so proving level
+//     L is air says nothing about what level L+1 holds over the same line -- and
+//     the coarse stand-in the gate then skips is what the control frame's near
+//     mountain was made of. MarkOpenSkyColumn now takes the bound as a MAX over
+//     a dilated set (3x3 in XY at this level, plus every level the ladder can
+//     retry into), so a mark can only be written where every level the consumer
+//     might read instead is also proven air.
+//
+// Inert while voxel.Stream.SkyMark is 0 (its default), which is why nothing
+// shipped. Do not raise this, or arm SkyMark/SkyLadder, until a pinned-pose
+// capture matches the control.
+static int32 GBandChunks = 8;
+static FAutoConsoleVariableRef CVarSkyMarkBandChunks(
+	TEXT("voxel.Stream.SkyMarkChunks"),
+	GBandChunks,
+	TEXT("Level-L chunks of open sky to mark above each column's proven sky floor (default 8, ")
+	TEXT("clamped 1..64). THE COST KNOB: every marked cell is one shadow write and one entry in ")
+	TEXT("the index delta upload, against a flush that today moves ~9,500 cells. Raise it only ")
+	TEXT("against a run-length reading that says the CAP is the binding constraint rather than ")
+	TEXT("the terrain relief -- see skyRunMean on the perf line. Cells above the cap are simply ")
+	TEXT("unmarked, which is the safe direction: unmarked costs time, wrongly marked deletes ")
+	TEXT("terrain.\n")
+	TEXT("ALSO CAPPED IN METRES by voxel.Stream.SkyMarkMetres, tighter wins, because a level-L ")
+	TEXT("chunk is 3.2 * 2^L m tall and this number alone means seven different bands.\n")
+	TEXT("FOR AN ARM THAT CHANGES WHAT IS DRAWN, THE IMAGE COMES FIRST AND THE TIMING SECOND. ")
+	TEXT("This band was swept for timing, 32 was the knee, 32 became the default and the binary ")
+	TEXT("was rebuilt -- all before the visual check. The timing was real; the arm was deleting a ")
+	TEXT("mountain at every band it was measured at. Sweep the CAPTURE PAIR first and the clock ")
+	TEXT("second."),
+	ECVF_Default);
+
+// THE BAND'S SECOND CAP, AND IT IS THE ONE EXPRESSED IN THE WORLD'S OWN UNITS.
+//
+// voxel.Stream.SkyMarkChunks counts LEVEL-L CHUNKS, and a level-L chunk is
+// 3.2 * 2^L m tall. The same number therefore means 25.6 m of sky at level 0
+// and 6,554 m at level 6 -- the band is not one quantity, it is seven, and the
+// timing sweep that chose 32 was sweeping all seven at once. That is why the
+// sweep's knee moved with the level and why the failure got worse the coarser
+// the ring: at level 6 a band of 32 reserves 6.5 km of Z above every column and
+// then asks one analytic bound to speak for all of it.
+//
+// SO THE CAP IS ALSO EXPRESSED IN METRES AND THE TIGHTER OF THE TWO WINS. The
+// metre cap is level-INVARIANT by construction, so raising the chunk cap can no
+// longer mean seven different things, and the marked volume above a column is
+// the same physical slab at every ring. Tighter-of-two only ever marks FEWER
+// cells, which is the safe direction: unmarked costs time, wrongly marked
+// deletes terrain.
+//
+// 512 m: four times the tallest relief a single near-ring footprint sees, and
+// enough to cover the 4-chunk minimum the 4^3 block consumer needs at every
+// level up to 5 (512 / 102.4 = 5 chunks at level 5, 2 at level 6). 0 disables
+// the metre cap and restores the pure chunk count -- the control for THIS
+// change, not a recommended setting.
+static int32 GBandMetres = 512;
+static FAutoConsoleVariableRef CVarSkyMarkBandMetres(
+	TEXT("voxel.Stream.SkyMarkMetres"),
+	GBandMetres,
+	TEXT("Level-INVARIANT cap on the marked sky band, in METRES above each column's proven sky ")
+	TEXT("floor (default 512, 0 = no metre cap). The band is min(this, ")
+	TEXT("voxel.Stream.SkyMarkChunks converted at the level), so the tighter one wins and this ")
+	TEXT("can only ever mark FEWER cells.\n")
+	TEXT("WHY IT EXISTS: SkyMarkChunks counts LEVEL-L chunks, which are 3.2 * 2^L m tall, so one ")
+	TEXT("number means 25.6 m at level 0 and 6,554 m at level 6. A band swept for timing was ")
+	TEXT("therefore sweeping seven different physical bands at once, and the coarsest ring got ")
+	TEXT("the largest and least justified one. This makes the knob mean one thing.\n")
+	TEXT("Cells above either cap are simply unmarked, which is the safe direction: unmarked ")
+	TEXT("costs time, wrongly marked deletes terrain."),
+	ECVF_Default);
+
+static bool Enabled() { return GEnabled != 0; }
+static int32 BandChunks() { return FMath::Clamp(GBandChunks, 1, 64); }
+
+// The band actually offered at a level: the chunk cap and the metre cap, tighter
+// wins, floor of at least 1 so an armed writer always offers something (an arm
+// that is on and offers nothing reads as "no sky in this world", which is the
+// failure mode this project has paid for most often).
+static int32 BandChunksAtLevel(int32 Level)
+{
+	const int32 ByChunks = BandChunks();
+	if (GBandMetres <= 0)
+	{
+		return ByChunks;
+	}
+	// Chunk height at this level, in mm, from the same two constants every other
+	// Z conversion in this file uses. int64 throughout: level 6 is 204,800 mm.
+	const int64 ChunkMm =
+		int64(VoxelCoords::ChunkEdgeVoxels) * (int64(1) << Level) * int64(vxc::kVoxelSizeMm);
+	const int64 ByMetres = (int64(GBandMetres) * 1000) / ChunkMm;
+	return int32(FMath::Clamp<int64>(FMath::Min<int64>(ByChunks, ByMetres), 1, 64));
+}
+
+// -VoxelSkyMarkVerifyStride=<N>: probe one marked column in every N (default 64,
+// clamped >= 1). THE DENOMINATOR IS REPORTED, so a small sample reads as a small
+// sample and never as a pass -- see the perf line. Stride rather than "probe
+// everything" because the probe calls the GENERATOR, which is worldgen-grade
+// work on the streaming tick this project is already bottlenecked on.
+static int32 VerifyStride()
+{
+	static const int32 Stride = []
+	{
+		int32 Value = 64;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSkyMarkVerifyStride="), Value);
+		return FMath::Max(Value, 1);
+	}();
+	return Stride;
+}
+
+// -VoxelSkyMarkVerifyGrid=<N>: N x N sample columns across the probed chunk's
+// footprint, corners included (default 5, clamped 2..17). A 5x5 grid over a
+// level-0 footprint is one sample every 0.8 m; over a level-6 footprint it is
+// one every 51.2 m, which is why a clean reading is evidence and not proof --
+// stated on the perf line rather than left to be assumed.
+static int32 VerifyGrid()
+{
+	static const int32 Grid = []
+	{
+		int32 Value = 5;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSkyMarkVerifyGrid="), Value);
+		return FMath::Clamp(Value, 2, 17);
+	}();
+	return Grid;
+}
+
+// The stride's own cursor. Game thread only in practice, atomic anyway so the
+// counter and the sampler cannot disagree about how many were skipped.
+inline std::atomic<uint64> GSkyVerifyCursor{0};
+static bool TakeVerifySample()
+{
+	const uint64 N = GSkyVerifyCursor.fetch_add(1, std::memory_order_relaxed);
+	return (N % uint64(VerifyStride())) == 0;
+}
+
+// -VoxelSkyMarkVerify: SAMPLE THE GENERATOR INSIDE A MARKED CHUNK AND SEE
+// WHETHER ANY GROUND IS IN THERE.
+//
+// WHAT THIS REPLACED, AND WHY THE REPLACEMENT WAS FORCED (2026-08-26). The first
+// version of this check called IsChunkProvablyAllAir at the derived floor and
+// one chunk below it. That verified the DERIVATION -- that inverting the
+// inequality reproduces the function it was inverted from -- and nothing else.
+// It shares every input with the thing it was checking: the same cached bound,
+// the same rect, the same conversion. So it could confirm the arithmetic and
+// could never, by construction, notice that the mark was WRONG ABOUT THE WORLD.
+// The arm deleted a mountain in a pinned-pose capture while that check was
+// available to be run, and the check would have said zero. A confirmation that
+// cannot come out the other way is not one.
+//
+// WHAT THIS DOES INSTEAD. For one marked column in every -VoxelSkyMarkVerifyStride,
+// it takes the LOWEST chunk the band actually marks -- the dangerous one, the
+// one closest to the ground -- and calls Amplifier::surfaceMm on an N x N grid
+// of columns across that chunk's own footprint. surfaceMm is the generator's
+// real surface evaluation, not a bound over a tile raster: it is the other side
+// of the inequality surfaceUpperBoundMm claims to bound. If any sample's topmost
+// solid voxel reaches the chunk's bottom voxel, the mark is wrong and says so,
+// with the overshoot in level-0 voxels so the SIZE of the error is legible.
+//
+// WHAT IT STILL CANNOT SEE, stated so a clean reading is not over-read:
+//   * ASSETS. surfaceMm is terrain only; a tree crown above it is composed by
+//     the asset field, so a mark wrong ONLY because of a crown reads clean here.
+//     -VoxelVerifySkyBand is the complete-but-expensive check for that: it
+//     dispatches every predicted-air chunk anyway and grades the verdict against
+//     the mesh the worker really produced.
+//   * BETWEEN THE SAMPLES. An N x N grid over a level-6 footprint is one column
+//     every 51.2 m. The perf line prints the grid and the stride for exactly
+//     this reason: a zero here is evidence, not proof.
+//
+// Command line rather than cvar so it is latched before the first
+// RecomputeDesiredSet, the same reason -VoxelNoUnderground is.
+static bool VerifyEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelSkyMarkVerify"));
+	return bEnabled;
+}
+
+// ---- the tallies (game thread writes, the 5 s perf line reads) -------------
+//
+// EVERY ONE OF THESE IS A DECISION COUNT, NOT A DURATION, and the perf line
+// says so. The saving this whole programme is chasing is VoxelMarch.March out
+// of ProfileGPU and nothing else; a healthy count here proves the mark EXISTS,
+// never that it paid.
+//
+// DENOMINATORS FIRST, because three arms died reading numerators. Columns
+// considered is the denominator for columns marked, and the decline split is
+// exhaustive by construction -- considered == marked + trimOff + boundDecl +
+// edited -- so a shortfall in that identity indicts this instrument rather than
+// being folded away. Cells offered is the denominator for cells written, and
+// written + refResident + refOther == offered for the same reason.
+//
+// GSkyFloorAboveAdmitted is NOT a decline; it is the reading that says how much
+// of the gap this arm cannot close. It counts columns whose PROVEN sky floor
+// sits strictly above the admitted top -- the band between them is air the
+// streamer does not hold and the analytic bound does not cover, so it stays
+// unmarked and the marcher must keep treating it as blocking. That gap is the
+// +2-chunk sampled headroom at levels 0-1, where the sky trim's own comment
+// says the analytic bound does not bind. A large count here is the honest
+// statement of this arm's ceiling, not a bug.
+std::atomic<uint64> GSkyColumnsConsidered{0};    // footprint-columns the writer looked at
+std::atomic<uint64> GSkyColumnsMarked{0};        // ...that produced >= 1 offered cell
+std::atomic<uint64> GSkyDeclineTrimOff{0};       // -VoxelSkyTrim=0: there is no decision to record
+std::atomic<uint64> GSkyDeclineBoundDeclined{0}; // the analytic bound refused to bound (INT64_MAX)
+std::atomic<uint64> GSkyDeclineEdited{0};        // a player edit exists here: worldgen's proof does not cover it
+// NOT the same finding as boundDecl and given its own bucket for that reason.
+// boundDecl means the analytic bound REFUSED to bound; this means the bound
+// would have answered, but from tiles that are not here -- and a tile sampler
+// with no block answers kSeaLevelMm, which UNDER-states the surface. A large
+// count here on a cold leg is the writer waiting for the world, and a large one
+// on a SETTLED leg is a run with no fine tier (or a footprint outside tile
+// coverage), where this arm marks nothing on purpose.
+std::atomic<uint64> GSkyDeclineNotResident{0};
+std::atomic<uint64> GSkyFloorAboveAdmitted{0};   // NOT a decline: the unprovable gap between admitted top and proven floor
+std::atomic<uint64> GSkyCellsOffered{0};         // cells proposed to the index
+std::atomic<uint64> GSkyCellsWritten{0};         // ...the index actually took
+std::atomic<uint64> GSkyCellsRefusedResident{0}; // refused: a resident chunk holds that cell (torus alias, or a race)
+std::atomic<uint64> GSkyCellsRefusedOther{0};    // refused: already marked, pending, or the writer is disarmed
+// RUN LENGTH -- THE NUMBER THAT DECIDES HOW BIG THE WIN CAN BE. Three arms died
+// because there was nothing long enough to amortise a test over. Here there is
+// no per-step cost at all, so the run length does not decide whether the mark
+// is affordable; it decides the ceiling on any skip built on it, because the
+// 4^3 block consumer needs four consecutive marked cells on an axis to license
+// one advance. A run is one column's contiguous marked band; mean = cells/runs.
+std::atomic<uint64> GSkyRunCells{0};
+std::atomic<uint64> GSkyRuns{0};
+// The writer's own game-thread cost, so a streaming-tick regression can be
+// attributed to it rather than argued about.
+std::atomic<uint64> GSkyMarkMicros{0};
+// The falsifier's tallies -- see VerifyEnabled. GSkyVerifyChecked is the
+// DENOMINATOR (marked chunks actually probed) and GSkyVerifyBad the numerator
+// (probed chunks that hold ground). The two sample-level counts sit beside them
+// because "one chunk wrong at one of 25 samples" and "one chunk wrong at all 25"
+// are different findings: the first is a ridge clipping a corner, the second is
+// a whole marked chunk sitting inside a hillside.
+std::atomic<uint64> GSkyVerifyChecked{0};
+std::atomic<uint64> GSkyVerifyBad{0};
+std::atomic<uint64> GSkyVerifySamples{0};      // columns evaluated across all probes
+std::atomic<uint64> GSkyVerifyWrongSamples{0}; // ...that landed at or above a marked floor
+// The worst overshoot seen, in LEVEL-0 VOXELS above the marked chunk's bottom.
+// A max, not a sum: one 400-voxel overshoot and four 1-voxel ones are not a
+// 404-voxel problem, and the biggest is what a screenshot would show.
+std::atomic<int64> GSkyVerifyWorstOvershoot{0};
+} // namespace VoxelSkyMark
 
 // FVoxelWorldImpl -- the voxel-core side of the subsystem, defined only here
 // so VoxelWorldSubsystem.h (UHT-parsed) never sees a voxel-core header. Also
@@ -8445,6 +8871,16 @@ private:
 	// callers must veto on NeedsOverlayAwarePath first (a placed block is solid
 	// material in what worldgen calls sky).
 	bool IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const;
+	// THE OPEN-SKY MARK (voxel.Stream.SkyMark). Records the sky trim's own
+	// affirmative decision -- "this chunk is provably above the terrain surface
+	// and I declined to admit it" -- into the march index's non-resident cell
+	// dword, where the marcher reads it in the load its residency test already
+	// pays for. Called once per footprint COLUMN with the surface band's FINAL
+	// admitted top (after the sky-band edit hatch), which is the one point where
+	// that decision is fully made. No-op unless voxel.Stream.SkyMark is 1. See
+	// the definition for the four conditions and for why every doubt resolves to
+	// UNMARKED: unmarked costs time, wrongly marked deletes terrain.
+	void MarkOpenSkyColumn(int32 Level, int32 Cx, int32 Cy, int32 AdmittedChunkZMax) const;
 	// Memoized vxc::Amplifier::solidBelowBoundMm for this level-L footprint:
 	// absolute mm below which every voxel of the footprint is provably solid,
 	// or INT64_MIN if the bound declined. Pure in (Level, ChunkX, ChunkY).
@@ -10229,6 +10665,212 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// vxc_assetprobe, the field logged INSTALLED, and the capture was
 	// indistinguishable from its own control at the pixel level. `requests` is
 	// the number that separates "composed and invisible" from "never composed".
+	// ---- THE OPEN-SKY MARK (voxel.Stream.SkyMark) --------------------------
+	//
+	// PRINTED WHENEVER THE SWITCH IS ON, INCLUDING WHEN EVERYTHING READS ZERO,
+	// because "armed and marking nothing" and "not armed" are different
+	// findings with different owners and a suppressed line makes them identical.
+	//
+	// EVERY NUMBER HERE IS A DECISION COUNT, NOT A DURATION. Nothing on this
+	// line is a time saving and none of it may be quoted as one: the only
+	// saving this programme is chasing is VoxelMarch.March out of ProfileGPU,
+	// and nothing else. `skyMs` is the writer's own COST, the opposite sign.
+	//
+	// DENOMINATOR BESIDE EVERY COUNT, in the house style, because this project
+	// has now twice read a right number in the wrong units (fallbackBinds=210
+	// read as 60% of frames when it was 15% of binds; `promoteExit cap=` that
+	// turned out to name MaxInFlight rather than the batch cap).
+	if (VoxelSkyMark::Enabled())
+	{
+		const uint64 Considered = VoxelSkyMark::GSkyColumnsConsidered.load(std::memory_order_relaxed);
+		const uint64 Marked = VoxelSkyMark::GSkyColumnsMarked.load(std::memory_order_relaxed);
+		const uint64 TrimOff = VoxelSkyMark::GSkyDeclineTrimOff.load(std::memory_order_relaxed);
+		const uint64 BoundDecl = VoxelSkyMark::GSkyDeclineBoundDeclined.load(std::memory_order_relaxed);
+		const uint64 Edited = VoxelSkyMark::GSkyDeclineEdited.load(std::memory_order_relaxed);
+		const uint64 NotRes = VoxelSkyMark::GSkyDeclineNotResident.load(std::memory_order_relaxed);
+		const uint64 GapAbove = VoxelSkyMark::GSkyFloorAboveAdmitted.load(std::memory_order_relaxed);
+		const uint64 Offered = VoxelSkyMark::GSkyCellsOffered.load(std::memory_order_relaxed);
+		const uint64 Written = VoxelSkyMark::GSkyCellsWritten.load(std::memory_order_relaxed);
+		const uint64 RefRes = VoxelSkyMark::GSkyCellsRefusedResident.load(std::memory_order_relaxed);
+		const uint64 RefOther = VoxelSkyMark::GSkyCellsRefusedOther.load(std::memory_order_relaxed);
+		const uint64 RunCells = VoxelSkyMark::GSkyRunCells.load(std::memory_order_relaxed);
+		const uint64 Runs = VoxelSkyMark::GSkyRuns.load(std::memory_order_relaxed);
+
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("skyMark COLUMNS: marked=%llu of %llu considered (%.2f%%) | declined trimOff=%llu "
+		            "boundDecl=%llu edited=%llu notResident=%llu | unprovable gap above admitted "
+		            "top=%llu of %llu (%.2f%%) | writer cost %.2f ms  [DECISIONS, not nanoseconds]"),
+		       (unsigned long long)Marked, (unsigned long long)Considered,
+		       Considered > 0 ? 100.0 * double(Marked) / double(Considered) : 0.0,
+		       (unsigned long long)TrimOff, (unsigned long long)BoundDecl, (unsigned long long)Edited,
+		       (unsigned long long)NotRes,
+		       (unsigned long long)GapAbove, (unsigned long long)Considered,
+		       Considered > 0 ? 100.0 * double(GapAbove) / double(Considered) : 0.0,
+		       double(VoxelSkyMark::GSkyMarkMicros.load(std::memory_order_relaxed)) / 1000.0);
+
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("skyMark CELLS: written=%llu of %llu offered (%.2f%%) | refused resident=%llu "
+		            "other=%llu | run mean %.2f cells (%llu cells / %llu runs), band cap %d chunks "
+		            "-> %d at level 0, %d at the top ring (the metre cap is what makes those "
+		            "differ, and a run mean pinned to the effective cap means RATIONED, not sky "
+		            "exhausted)"),
+		       (unsigned long long)Written, (unsigned long long)Offered,
+		       Offered > 0 ? 100.0 * double(Written) / double(Offered) : 0.0,
+		       (unsigned long long)RefRes, (unsigned long long)RefOther,
+		       Runs > 0 ? double(RunCells) / double(Runs) : 0.0,
+		       (unsigned long long)RunCells, (unsigned long long)Runs,
+		       VoxelSkyMark::BandChunks(), VoxelSkyMark::BandChunksAtLevel(0),
+		       VoxelSkyMark::BandChunksAtLevel(UVoxelWorldSubsystem::GetMaxRingLevel()));
+
+		// THE IDENTITY, CHECKED RATHER THAN ASSERTED IN PROSE. The decline split
+		// is exhaustive by construction, so a shortfall means a path returns
+		// without counting -- which would make every rate above read better than
+		// it is. Printed as an indictment of this instrument, not folded away.
+		if (Considered != Marked + TrimOff + BoundDecl + Edited + NotRes)
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("    skyMark INSTRUMENT SHORTFALL: %llu columns considered but only %llu "
+			            "accounted (marked %llu + trimOff %llu + boundDecl %llu + edited %llu + "
+			            "notResident %llu). A return path in MarkOpenSkyColumn is not counting "
+			            "itself; every rate on the line above is optimistic by the difference."),
+			       (unsigned long long)Considered,
+			       (unsigned long long)(Marked + TrimOff + BoundDecl + Edited + NotRes),
+			       (unsigned long long)Marked, (unsigned long long)TrimOff,
+			       (unsigned long long)BoundDecl, (unsigned long long)Edited,
+			       (unsigned long long)NotRes);
+		}
+		if (Offered > 0 && Written != Offered - RefRes - RefOther)
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("    skyMark INSTRUMENT SHORTFALL: %llu cells offered, %llu written + %llu "
+			            "refusedResident + %llu refusedOther does not close. The index writer has a "
+			            "return path that reports no outcome."),
+			       (unsigned long long)Offered, (unsigned long long)Written,
+			       (unsigned long long)RefRes, (unsigned long long)RefOther);
+		}
+		if (Offered > 0 && Written == 0)
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("    skyMark: %llu cells offered and NONE written. This is a DISCONNECTED "
+			            "SINK, not an empty sky. Check, in order: is the march chunk index attached "
+			            "at all (FVoxelMarchChunkIndex::IsAttached -- the attach is driven by the "
+			            "FLUID subsystem, so a leg without fluids never attaches and every counter "
+			            "here stays zero); and is voxel.March.IndexGpuResident 1, which disarms the "
+			            "writer on purpose because the GPU publish kernel clears these cells to "
+			            "literal 0 and an annotated shadow would fail delta-verify."),
+			       (unsigned long long)Offered);
+		}
+		// ---- THE BLOCK CENSUS -- what the marcher's consumer can actually see
+		//
+		// SWEPT FROM THE INDEX RATHER THAN DERIVED FROM THE CELL COUNTS ABOVE,
+		// and the difference is the whole point of printing it. `written` counts
+		// cells this writer accepted; a 4^3 BLOCK licenses a skip only when ALL
+		// 64 of its cells carry a mark and none is resident. So a huge written
+		// count with `licensed=0` is not a contradiction -- it is the finding
+		// that the marked band is too thin or the terrain relief too rough for
+		// this granularity, which is a statement about the BLOCK SIZE and not
+		// about the mark. Three arms died for want of exactly this distinction.
+		//
+		// `touched` (blocks holding at least one mark) is the denominator that
+		// makes `licensed` readable: 100 licensed is triumphant against 120
+		// touched and meaningless against 120,000.
+		{
+			uint64 SkyBlocksLicensed = 0, SkyBlocksPartial = 0, SkyBlocksTouched = 0;
+			FVoxelMarchChunkIndex& Idx = GetGlobalVoxelMarchChunkIndex();
+			Idx.GetBlockSkyCensus(SkyBlocksLicensed, SkyBlocksPartial, SkyBlocksTouched);
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("skyMark BLOCKS: licensed=%llu of %llu touched (%.2f%%), partial=%llu | "
+			            "writer armed=%d, attached=%d, lifetime marks=%llu"),
+			       (unsigned long long)SkyBlocksLicensed, (unsigned long long)SkyBlocksTouched,
+			       SkyBlocksTouched > 0
+			           ? 100.0 * double(SkyBlocksLicensed) / double(SkyBlocksTouched)
+			           : 0.0,
+			       (unsigned long long)SkyBlocksPartial,
+			       Idx.IsOpenSkyWriterArmed() ? 1 : 0, Idx.IsAttached() ? 1 : 0,
+			       (unsigned long long)Idx.GetOpenSkyMarks());
+			if (!Idx.IsAttached())
+			{
+				UE_LOG(LogVoxelPerf, Warning,
+				       TEXT("    skyMark: the march chunk index is NOT ATTACHED, so every number "
+				            "on these lines is about a sink nobody is listening to. The attach is "
+				            "driven by VoxelMarchPublishSource, which the FLUID subsystem calls -- "
+				            "a leg without fluids never attaches. This is 'the index was never "
+				            "listening', which is a different finding from 'no sky was found'."));
+			}
+			else if (!Idx.IsOpenSkyWriterArmed() && VoxelSkyMark::Enabled())
+			{
+				UE_LOG(LogVoxelPerf, Warning,
+				       TEXT("    skyMark: voxel.Stream.SkyMark is 1 but the index writer is "
+				            "DISARMED, so nothing was written. The only gate that does this is "
+				            "voxel.March.IndexGpuResident 1: the GPU publish kernel clears these "
+				            "cells to literal 0 and an annotated shadow would fail delta-verify, "
+				            "so the writer stands down on purpose. Set it to 0 for any leg that "
+				            "measures this arm."));
+			}
+		}
+		if (VoxelSkyMark::VerifyEnabled())
+		{
+			const uint64 VChecked = VoxelSkyMark::GSkyVerifyChecked.load(std::memory_order_relaxed);
+			const uint64 VBad = VoxelSkyMark::GSkyVerifyBad.load(std::memory_order_relaxed);
+			const uint64 VSamples = VoxelSkyMark::GSkyVerifySamples.load(std::memory_order_relaxed);
+			const uint64 VWrongS =
+				VoxelSkyMark::GSkyVerifyWrongSamples.load(std::memory_order_relaxed);
+			const int64 VWorst =
+				VoxelSkyMark::GSkyVerifyWorstOvershoot.load(std::memory_order_relaxed);
+			const double VBadPct = VChecked > 0 ? 100.0 * double(VBad) / double(VChecked) : 0.0;
+			// SPELLED TWICE, at two verbosities, rather than once through a variable
+			// format or a macro. UE_LOG wants a literal, and a falsifier that prints
+			// at Log when it FIRES is one nobody sees -- which is how a test that can
+			// fail becomes a test that never does.
+			if (VBad > 0)
+			{
+				UE_LOG(LogVoxelPerf, Warning,
+				       TEXT("skyMark VERIFY (-VoxelSkyMarkVerify): wrongMarks=%llu of %llu marked ")
+				       TEXT("chunks sampled (%.4f%%), %llu of %llu sample columns hit ground, worst ")
+				       TEXT("overshoot %lld level-0 voxels (%.1f m). THE FALSIFIER HAS FIRED: a cell ")
+				       TEXT("the marcher will treat as PROVEN AIR contains terrain the generator puts ")
+				       TEXT("there. That is deleted geometry, not a rounding difference -- the ")
+				       TEXT("per-chunk WRONG MARK warnings above carry the coordinates. Do not read ")
+				       TEXT("any march timing off this leg, and do not arm voxel.March.SkyLadder."),
+				       (unsigned long long)VBad, (unsigned long long)VChecked, VBadPct,
+				       (unsigned long long)VWrongS, (unsigned long long)VSamples,
+				       (long long)VWorst, double(VWorst * int64(vxc::kVoxelSizeMm)) / 1000.0);
+			}
+			else
+			{
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("skyMark VERIFY (-VoxelSkyMarkVerify): wrongMarks=0 of %llu marked chunks ")
+				       TEXT("sampled (%llu sample columns, grid %dx%d, stride 1 in %d). The generator ")
+				       TEXT("was asked directly -- Amplifier::surfaceMm, not the bound the mark was ")
+				       TEXT("derived from -- and put no ground in any probed chunk.\n")
+				       TEXT("    READ THE DENOMINATOR BEFORE READING THIS AS A PASS. sampled=0 means no ")
+				       TEXT("column was ever marked, which is a null result. And a clean reading is ")
+				       TEXT("EVIDENCE, NOT PROOF: the probe samples terrain only (an asset crown above ")
+				       TEXT("the surface reads clean here -- -VoxelVerifySkyBand is the complete ")
+				       TEXT("check), and it samples a grid, so at level 6 that is one column every ")
+				       TEXT("51.2 m of a 204.8 m footprint."),
+				       (unsigned long long)VChecked, (unsigned long long)VSamples,
+				       VoxelSkyMark::VerifyGrid(), VoxelSkyMark::VerifyGrid(),
+				       VoxelSkyMark::VerifyStride());
+			}
+		}
+		else
+		{
+			// AN ARMED WRITER WITH NO FALSIFIER RUNNING SAYS SO. Reached only
+			// inside the enclosing 'SkyMark is on' block, so this is exactly
+			// 'armed, and nobody asked whether it was right'. The arm's own
+			// counters prove it engaged and say nothing about whether it was
+			// RIGHT, and that gap is what cost a pinned-pose capture pair and a
+			// mountain. One line, at Log, so a leg that measured timing without
+			// ever asking the correctness question cannot look like one that did.
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("skyMark VERIFY: NOT RUNNING on this leg (-VoxelSkyMarkVerify absent). Every "
+			            "number on the skyMark lines above is a DECISION COUNT: they prove the writer "
+			            "engaged and say nothing about whether any mark is correct. A timing taken "
+			            "here is not evidence that the image is intact."));
+		}
+	}
+
 	if (Voxels.assetField() != nullptr)
 	{
 		const vxc::AssetBankLibrary::Stats B = AssetBanks.stats();
@@ -13422,6 +14064,515 @@ bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkK
 	return BottomVoxel > TopSolidUpperBound;
 }
 
+// ---------------------------------------------------------------------------
+// THE TRIM'S DECISION, WRITTEN DOWN (voxel.Stream.SkyMark)
+// ---------------------------------------------------------------------------
+//
+// Called once per footprint COLUMN from EnumerateSurfaceFootprintCandidates,
+// with the surface band's final admitted top -- after the sky-band edit hatch
+// and before the Z loop. That is the one point in this file where "how far up
+// does streaming go here, and why" is fully decided, which is why the mark is
+// written here and not at the chunk sites downstream.
+//
+// A MARK IS A POSITIVE STATEMENT DERIVED FROM THE TRIM'S OWN PROOF. It is never
+// inferred from the absence of another mark: reason NONE already covers "never
+// admitted", and never-admitted includes THE COVERAGE RULE BEING WRONG. Reading
+// a coverage bug as sky converts a visible black arc into invisibly deleted
+// terrain, which is strictly worse -- the owner can photograph an arc and
+// cannot photograph ground that was silently skipped.
+//
+// FOUR CONDITIONS, AND EACH ONE CLOSES A SPECIFIC WAY TO MAKE A HOLE:
+//
+//  1. THE TRIM MUST BE ON (VoxelSkyBand::GetTrimEnabled). With -VoxelSkyTrim=0
+//     the streamer falls back to the unconditional +2-chunk headroom and takes
+//     no analytic decision at all, so there is no decision to record. Marking
+//     anyway would mean marking on a proof the running binary is not using.
+//
+//  2. THE BOUND MUST HAVE BOUND (BoundMm != INT64_MAX). The analytic bound
+//     declines when a footprint needs more tile-pixel corners than the cap
+//     allows. Declined means NO INFORMATION, and IsChunkProvablyAllAir already
+//     refuses to claim air on it -- "never claim air on no information" is that
+//     function's own comment and this inherits it verbatim by asking the same
+//     question.
+//
+//  3. NO EDIT MAY EXIST IN THIS COLUMN. IsChunkProvablyAllAir's declaration
+//     says it plainly: it "does NOT consider edits -- callers must veto ...
+//     (a placed block is solid material in what worldgen calls sky)". TryPlace
+//     writes arbitrary solid material into the air above a hilltop and the
+//     fixture stampers place whole structures there. The sky-band trim's own
+//     escape hatch (EnumerateSurfaceFootprintCandidates) restores those chunks
+//     to the desired set by raising the admitted top; this refuses the whole
+//     column instead, which is stricter than the hatch and deliberately so --
+//     the hatch only has to get the ADMITTED set right, while a wrong mark
+//     deletes ground the marcher would otherwise have walked into and found.
+//     The map is normally empty, so this is one hash probe on an empty TMap.
+//
+//  4. NOTHING AT OR BELOW THE ADMITTED TOP IS EVER MARKED. The band starts at
+//     AdmittedChunkZMax + 1 whatever the proof says, so a cell the entry pass
+//     wants -- including one an asset crown raised the top to cover -- can
+//     never be marked as sky by this function even if the terrain-only bound
+//     would have permitted it.
+//
+// AND THE FIFTH CONDITION IS NOT HERE: the index writer refuses to mark a cell
+// that carries kResidentBit, which is what keeps a torus ALIAS (a resident
+// chunk 128 cells away sharing this cell) from being painted over. That test
+// belongs where the cell is read, not here, and it is counted separately.
+//
+// EVICTION AND RE-ADMISSION ORDERING, and why it errs unmarked. Every streaming
+// transition on a cell OVERWRITES the whole dword: admission writes
+// kResidentBit | slot through the delta path, NoteChunkAdmitted writes the
+// PENDING annotation, and eviction writes EVICTED (or a bare 0). All three
+// destroy an open-sky mark, and all three happen at the transition rather than
+// after it. The mark therefore cannot outlive the decision that justified it in
+// the only direction that matters: it is destroyed the moment streaming decides
+// anything else about that cell, and it is only ever re-created by this function
+// re-deriving the proof from scratch on a later pass. The reverse ordering --
+// a mark landing on a cell that has just become resident -- is what condition 5
+// refuses. Both edges resolve to UNMARKED, which is the safe side.
+//
+// THE CAMERA IS ~5 m ABOVE GROUND IN THE TEST LEGS, inside a resident chunk, so
+// the first absent cell on nearly every ray is near-field air one or two chunks
+// up. WHAT THIS MARK DOES THERE: nothing, at level 0, in the common case. That
+// air sits inside the +2-chunk sampled headroom the trim leaves untrimmed at
+// levels 0-1 (the analytic bound does not bind there -- a 3.2 m footprint sits
+// well inside one 30 m tile pixel, so the pixel-corner maximum is a much weaker
+// statement than the sampled columns), so the admitted top is ABOVE it and
+// condition 4 refuses it. The marked band begins above the admitted shell.
+// GSkyFloorAboveAdmitted is the size of that unmarkable gap, counted rather
+// than argued about.
+//
+// COST. One cached bound lookup, one empty-TMap probe, a handful of integer ops,
+// and BandChunks() offers into the index -- each of which is one shadow read and
+// at most one shadow write, with the index's own idempotence guard suppressing
+// the re-scan traffic (RecomputeDesiredSet re-evaluates every un-admitted
+// candidate on anchor movement, so the second and later passes over a settled
+// column write nothing). Timed into GSkyMarkMicros so a streaming-tick
+// regression is attributable rather than arguable.
+void FVoxelWorldImpl::MarkOpenSkyColumn(int32 Level, int32 Cx, int32 Cy, int32 AdmittedChunkZMax) const
+{
+	using namespace VoxelCoords;
+
+	if (!VoxelSkyMark::Enabled())
+	{
+		return;
+	}
+	const double T0 = FPlatformTime::Seconds();
+	VoxelSkyMark::GSkyColumnsConsidered.fetch_add(1, std::memory_order_relaxed);
+
+	// (1) the trim is the decision; with it off there is no decision to record.
+	if (!VoxelSkyBand::GetTrimEnabled())
+	{
+		VoxelSkyMark::GSkyDeclineTrimOff.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
+	// (3) A PLAYER EDIT PUTS SOLID MATERIAL WHERE WORLDGEN'S BOUND SAYS SKY.
+	// Refuse the column outright -- and refuse it for an edit in any of the
+	// NINE footprints the dilated bound below reads, not just this one. The
+	// dilation widened what a mark claims; the veto has to widen with it, or
+	// the claim outruns the thing that vetoes it.
+	if (EditedFootprintMaxZ[Level].Num() > 0)
+	{
+		for (int32 Dy = -1; Dy <= 1; ++Dy)
+		{
+			for (int32 Dx = -1; Dx <= 1; ++Dx)
+			{
+				if (EditedFootprintMaxZ[Level].Find(FIntPoint(Cx + Dx, Cy + Dy)) != nullptr)
+				{
+					VoxelSkyMark::GSkyDeclineEdited.fetch_add(1, std::memory_order_relaxed);
+					return;
+				}
+			}
+		}
+	}
+
+	// =====================================================================
+	// (2) THE BOUND, TAKEN AS A MAX OVER A DILATED SET OF FOOTPRINTS
+	// =====================================================================
+	//
+	// WHY THIS IS A MAX AND NOT ONE LOOKUP (2026-08-26, after the arm deleted a
+	// mountain). The single-footprint bound was never wrong about the chunk it
+	// describes. FootprintSurfaceUpperBoundMm builds its rect from the CHUNK
+	// SPAN, not from a column, so "no solid voxel in this level-L chunk" already
+	// holds for a diagonal ray exactly as it does for a vertical one. The defect
+	// is that the mark is USED for more than it proves, in two directions:
+	//
+	//   * THE CONSUMER DECLINES A COARSER RETRY, WHICH THIS LEVEL CANNOT SPEAK
+	//     FOR. voxel.March.SkyLadder reads a mark at level L and on the strength
+	//     of it refuses to re-walk that segment at levels L+1..L+Fallthrough. A
+	//     level-L+1 chunk covers FOUR level-L footprints and its voxels are a
+	//     DOWNSAMPLE: a coarse voxel standing over this footprint can be solid
+	//     because a SIBLING footprint holds a ridge. Proving level L is air
+	//     licenses nothing about level L+1 -- and the coarse stand-in the gate
+	//     then skips is the ground the control frame was made of.
+	//
+	//   * AND A RAY ENTERS ON A FACE, NOT DOWN A COLUMN. Danskin & Hanrahan's
+	//     result for max/OR bounds is that a ray taking even a tiny step can
+	//     step through several pyramid nodes, so a max bound stops being
+	//     conservative the moment something JUMPS on it; their fix is to dilate
+	//     by the neighbours BEFORE reducing (max^27). Here the Z axis needs no
+	//     dilation -- the floor IS a Z threshold and every marked cell is at or
+	//     above it -- so max^27 collapses to max^9 IN THE PLANE, plus the walk
+	//     UP THE PYRAMID that the consumer actually takes.
+	//
+	// SO THE BOUND IS THE MAXIMUM over every footprint the consumer could read
+	// instead of this one: the 3x3 XY neighbourhood at this level, and every
+	// chunk at every level the ladder can retry into that overlaps that dilated
+	// rect. Because it is a MAX, the floor derived from it can only RISE against
+	// the single-footprint version and the marked set can only SHRINK -- this
+	// change cannot mark a cell the old code refused. ANY decline anywhere in
+	// the set refuses the whole column: no information about one member of a max
+	// is no information about the max.
+	//
+	// THE SET IS SELF-LIMITING, which is why this is a handful of probes and not
+	// a sweep. The dilated rect is 3 chunks wide at level L, so it meets 3 chunks
+	// there, at most 2 at L+1, and 1 or 2 at each level above. Every one goes
+	// through FootprintSurfaceUpperBoundMmCached -- the memo the sky trim is
+	// already filling for those same footprints -- so the common case is map
+	// probes, and the cost lands in skyMs like the rest of this writer.
+	const int64 LevelScale = int64(1) << Level;
+	const int64 SpanVoxels = int64(ChunkEdgeVoxels) * LevelScale;
+
+	// The dilated footprint in LEVEL-0 voxel indices: this chunk's rect grown by
+	// one full level-L chunk on every side, inclusive at both ends -- the same
+	// convention Amplifier::surfaceUpperBoundMm takes.
+	const int64 DilVx0 = (int64(Cx) - 1) * SpanVoxels;
+	const int64 DilVy0 = (int64(Cy) - 1) * SpanVoxels;
+	const int64 DilVx1 = (int64(Cx) + 2) * SpanVoxels - 1;
+	const int64 DilVy1 = (int64(Cy) + 2) * SpanVoxels - 1;
+
+	// HOW FAR UP THE PYRAMID, READ FROM THE CONSUMER RATHER THAN AGREED WITH IT.
+	// The ladder's depth is voxel.March.Fallthrough, and a mark must cover every
+	// level that switch lets a ray retry into. Reading the number is the only
+	// way the two cannot drift; a constant here that "matches the default" is
+	// the derived-not-verified shape this project pays for most often.
+	//
+	// AND THE MISSING-CVAR CASE FALLS THE SAFE WAY. A FindConsoleVariable that
+	// misses returns null, and a null read that defaulted to 0 would silently
+	// stop consulting any coarser level at all -- the exact failure this fix
+	// exists to close. Null therefore means CONSULT EVERY COARSER RING, which
+	// costs marks and never geometry.
+	const int32 LadderDepth = []() -> int32
+	{
+		// CACHED ONCE FOUND, NOT ONCE LOOKED FOR. A FindConsoleVariable that runs
+		// before VoxelEarthShaders has registered its cvars returns null, and
+		// latching THAT would pin this writer to the fallback for the whole
+		// session -- an arm that goes quiet for a module-load-order reason and
+		// reads on the perf line as "no sky in this world".
+		static IConsoleVariable* CVar = nullptr;
+		if (CVar == nullptr)
+		{
+			CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.March.Fallthrough"));
+		}
+		return CVar != nullptr ? FMath::Clamp(CVar->GetInt(), 0, VoxelCoords::kNumLevels - 1)
+		                       : (VoxelCoords::kNumLevels - 1);
+	}();
+	const int32 TopConsultLevel =
+		FMath::Clamp(FMath::Min(Level + LadderDepth, UVoxelWorldSubsystem::GetMaxRingLevel()),
+		             Level, VoxelCoords::kNumLevels - 1);
+
+	// (2a) THE TILES THE BOUND IS DERIVED FROM MUST ACTUALLY BE HERE.
+	//
+	// THIS IS THE OTHER HALF OF THE DEFECT AND IT IS NOT ARITHMETIC. The tile
+	// samplers answer kSeaLevelMm for a block they do not hold -- "missing block
+	// == open ocean" is the comment on the return in tilestore.cpp -- and a
+	// sea-level answer UNDER-STATES the surface, which is the one direction that
+	// turns real ground into proven air. FootprintSurfaceUpperBoundMmCached
+	// already knows this and refuses to MEMOIZE such an answer, but refusing to
+	// memoize is not refusing to act: it still RETURNS the value and the caller
+	// still uses it. That is fine for the trim, which only has to get the
+	// ADMITTED set right and is repaired by the retry ladder when it is wrong.
+	// It is not fine here, because this mark is what SWITCHES THE LADDER OFF.
+	//
+	// So the mark refuses the whole column unless the fine tier is present AND
+	// the dilated rect is resident. Two failures close with one test:
+	//   * NO FINE TIER AT ALL (-VoxelFineTileDir absent). Then there is no
+	//     residency gate anywhere on this path, and a coarse sampler missing a
+	//     tile writes a sea-level bound into the cache PERMANENTLY. A run with
+	//     no fine tier marks nothing, which is a correct null and reads on the
+	//     perf line as skyCols=0.
+	//   * A TILE NOT YET RESIDENT. The bound would be sea level for this pass.
+	//
+	// WHAT THIS STILL DOES NOT CLOSE, said plainly rather than implied: an entry
+	// already in FootprintSurfaceUpperBoundCache from an EARLIER pass, computed
+	// before the tile arrived, is never invalidated -- the cache is only ever
+	// distance-pruned. That is a defect in the cache, not in this writer, and
+	// papering over it here would hide it. The sampled probe below is what
+	// catches it: Amplifier::surfaceMm reads the tile that is resident NOW, so a
+	// mark standing on a stale sea-level bound announces itself as a wrong mark
+	// rather than as a screenshot.
+	//
+	// WIDENED BY THE ASSET REACH, the same widening
+	// FootprintSurfaceUpperBoundMmCached applies for the same reason: the
+	// asset-aware bound consults columns out to the widest terrain layer's
+	// radius at every level, so those columns have to be resident too.
+	if (FineStreamer == nullptr)
+	{
+		VoxelSkyMark::GSkyDeclineNotResident.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	{
+		int64 RectX0Mm = DilVx0 * int64(vxc::kVoxelSizeMm);
+		int64 RectY0Mm = DilVy0 * int64(vxc::kVoxelSizeMm);
+		int64 RectX1Mm = DilVx1 * int64(vxc::kVoxelSizeMm) + int64(vxc::kVoxelSizeMm) - 1;
+		int64 RectY1Mm = DilVy1 * int64(vxc::kVoxelSizeMm) + int64(vxc::kVoxelSizeMm) - 1;
+		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+		{
+			int64 ReachMm = 0;
+			for (const vxc::AssetLayer& L : Field->layers())
+			{
+				if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
+			}
+			RectX0Mm -= ReachMm; RectY0Mm -= ReachMm; RectX1Mm += ReachMm; RectY1Mm += ReachMm;
+		}
+		if (!FineStreamer->IsFootprintResident(RectX0Mm, RectY0Mm, RectX1Mm, RectY1Mm))
+		{
+			VoxelSkyMark::GSkyDeclineNotResident.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+
+	int64 TopSolidUpperBound = MIN_int64;
+	int32 FootprintsConsulted = 0;
+	for (int32 L = Level; L <= TopConsultLevel; ++L)
+	{
+		const int64 SpanL = int64(ChunkEdgeVoxels) * (int64(1) << L);
+		const int64 Lx0 = VoxelCoords::FloorDiv(DilVx0, SpanL);
+		const int64 Lx1 = VoxelCoords::FloorDiv(DilVx1, SpanL);
+		const int64 Ly0 = VoxelCoords::FloorDiv(DilVy0, SpanL);
+		const int64 Ly1 = VoxelCoords::FloorDiv(DilVy1, SpanL);
+		for (int64 Ly = Ly0; Ly <= Ly1; ++Ly)
+		{
+			for (int64 Lx = Lx0; Lx <= Lx1; ++Lx)
+			{
+				if (Lx < int64(MIN_int32) || Lx > int64(MAX_int32) ||
+				    Ly < int64(MIN_int32) || Ly > int64(MAX_int32))
+				{
+					// Not a world coordinate. Refuse rather than truncate into a
+					// legal-looking footprint and bound the wrong ground.
+					VoxelSkyMark::GSkyDeclineBoundDeclined.fetch_add(1, std::memory_order_relaxed);
+					return;
+				}
+				const int64 B = FootprintSurfaceUpperBoundMmCached(L, int32(Lx), int32(Ly));
+				if (B == INT64_MAX)
+				{
+					VoxelSkyMark::GSkyDeclineBoundDeclined.fetch_add(1, std::memory_order_relaxed);
+					return;
+				}
+				// IsChunkProvablyAllAir's own conversion, character for
+				// character: the topmost level-0 voxel INDEX that could be solid.
+				// A voxel is solid iff its centre (vz*kVoxelSizeMm +
+				// kVoxelSizeMm/2) is at or below the surface, and floorDiv rounds
+				// toward -inf, i.e. outward on the safe side for a bound that may
+				// be negative.
+				const int64 TopSolidHere =
+					vxc::floorDiv(B - int64(vxc::kVoxelSizeMm) / 2, int64(vxc::kVoxelSizeMm));
+				TopSolidUpperBound = FMath::Max(TopSolidUpperBound, TopSolidHere);
+				++FootprintsConsulted;
+			}
+		}
+	}
+	if (FootprintsConsulted == 0)
+	{
+		// An empty consult set is not a proof of anything. It should be
+		// unreachable -- L == Level always meets its own 3x3 -- and if it ever
+		// becomes reachable the answer must be "no mark", never "mark on
+		// nothing".
+		VoxelSkyMark::GSkyDeclineBoundDeclined.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
+	// THE FLOOR, DERIVED BY INVERTING IsChunkProvablyAllAir'S OWN INEQUALITY
+	// rather than calling it once per chunk in the band:
+	//
+	//   IsChunkProvablyAllAir(Cz)  <=>  Cz * Span > TopSolidUpperBound
+	//   smallest such Cz           ==   FloorDiv(TopSolidUpperBound, Span) + 1
+	//
+	// because FloorDiv(T,S)*S <= T (so Cz-1 fails, exactly) and
+	// (FloorDiv(T,S)+1)*S >= T+1 > T (so Cz passes).
+	//
+	// EXACT AGAINST THE MAX, STRICTLY HIGHER THAN ANY ONE MEMBER OF IT. Since
+	// the dilation above, TopSolidUpperBound is the maximum over the whole
+	// consulted set, so this floor sits at or ABOVE the floor
+	// IsChunkProvablyAllAir would give for this footprint alone.
+	//
+	// AND THAT IS WHY THE OLD VERIFY HAD TO GO. Its below-floor half asserted
+	// IsChunkProvablyAllAir(SkyFloorCz - 1) == false -- true only while the
+	// floor was exact for THIS footprint, which the dilation deliberately
+	// breaks. More to the point, both halves re-asked the question the floor was
+	// derived from, so the check could only ever confirm the derivation and
+	// never the WORLD. It is replaced below by a probe that samples the
+	// generator itself, which can come out the other way.
+	const int64 SkyFloorCz64 = VoxelCoords::FloorDiv(TopSolidUpperBound, SpanVoxels) + 1;
+
+	// A bound this far out is not a world coordinate, it is a defect. Refuse
+	// rather than truncate into a legal-looking chunk Z.
+	if (SkyFloorCz64 < int64(MIN_int32) / 2 || SkyFloorCz64 > int64(MAX_int32) / 2)
+	{
+		VoxelSkyMark::GSkyDeclineBoundDeclined.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	const int32 SkyFloorCz = int32(SkyFloorCz64);
+
+	// The unprovable gap: air above the admitted shell that the analytic bound
+	// does not cover. NOT a decline -- see the counter's declaration.
+	if (SkyFloorCz > AdmittedChunkZMax + 1)
+	{
+		VoxelSkyMark::GSkyFloorAboveAdmitted.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// (4) never at or below the admitted top, whatever the proof says.
+	const int32 FirstCz = FMath::Max(SkyFloorCz, AdmittedChunkZMax + 1);
+	const int32 Band = VoxelSkyMark::BandChunksAtLevel(Level);
+
+	// -VoxelSkyMarkVerify: THE PROBE THAT CAN COME OUT THE OTHER WAY.
+	//
+	// HERE, AFTER FirstCz, AND THAT POSITION IS THE POINT. The chunk this probes
+	// is the LOWEST ONE THE BAND ACTUALLY MARKS -- not the derived floor, which
+	// may be below the admitted top and never marked at all. A check aimed at a
+	// cell nobody writes is a check of the arithmetic; this one is aimed at the
+	// cell the marcher will read and skip.
+	//
+	// It calls Amplifier::surfaceMm, the generator's own surface evaluation, and
+	// NOT the bound the mark was derived from. That independence is the whole
+	// value: every earlier version of this check shared its inputs with the
+	// thing it was checking and could only ever agree. See VerifyEnabled for
+	// what it still cannot see (assets, and anything between the samples).
+	if (VoxelSkyMark::VerifyEnabled() && VoxelSkyMark::TakeVerifySample())
+	{
+		const int32 Grid = VoxelSkyMark::VerifyGrid();
+		const int64 Vx0 = int64(Cx) * SpanVoxels;
+		const int64 Vy0 = int64(Cy) * SpanVoxels;
+		// The lowest level-0 voxel index the marked chunk covers. Anything at or
+		// above this that is solid is inside a cell claimed to be sky.
+		const int64 BottomVoxel = int64(FirstCz) * SpanVoxels;
+		int32 WrongSamples = 0;
+		int64 WorstTop = MIN_int64;
+		for (int32 Iy = 0; Iy < Grid; ++Iy)
+		{
+			for (int32 Ix = 0; Ix < Grid; ++Ix)
+			{
+				// Corners INCLUDED: Ix == 0 gives Vx0, Ix == Grid-1 gives the
+				// last voxel in the footprint. The bound's own weakness is
+				// interior extremes, so the interior samples are the ones that
+				// earn their keep -- but a corner that fails is the cheapest
+				// possible refutation and must stay reachable.
+				const int64 Vx = Vx0 + ((SpanVoxels - 1) * int64(Ix)) / int64(Grid - 1);
+				const int64 Vy = Vy0 + ((SpanVoxels - 1) * int64(Iy)) / int64(Grid - 1);
+				const int64 SurfaceMm = int64(Voxels.amplifier().surfaceMm(Vx, Vy));
+				// The same solidity convention as everywhere else in this file:
+				// a voxel is solid iff its centre is at or below the surface.
+				const int64 TopSolidHere = vxc::floorDiv(
+					SurfaceMm - int64(vxc::kVoxelSizeMm) / 2, int64(vxc::kVoxelSizeMm));
+				WorstTop = FMath::Max(WorstTop, TopSolidHere);
+				if (TopSolidHere >= BottomVoxel)
+				{
+					++WrongSamples;
+				}
+			}
+		}
+		VoxelSkyMark::GSkyVerifyChecked.fetch_add(1, std::memory_order_relaxed);
+		VoxelSkyMark::GSkyVerifySamples.fetch_add(uint64(Grid) * uint64(Grid),
+		                                          std::memory_order_relaxed);
+		if (WrongSamples > 0)
+		{
+			VoxelSkyMark::GSkyVerifyBad.fetch_add(1, std::memory_order_relaxed);
+			VoxelSkyMark::GSkyVerifyWrongSamples.fetch_add(uint64(WrongSamples),
+			                                               std::memory_order_relaxed);
+			// Compare-and-swap max: <atomic> has no fetch_max, and a plain store
+			// would let a small overshoot arriving late erase a large one.
+			const int64 Overshoot = WorstTop - BottomVoxel + 1;
+			int64 Seen = VoxelSkyMark::GSkyVerifyWorstOvershoot.load(std::memory_order_relaxed);
+			while (Overshoot > Seen &&
+			       !VoxelSkyMark::GSkyVerifyWorstOvershoot.compare_exchange_weak(
+				       Seen, Overshoot, std::memory_order_relaxed))
+			{
+			}
+			// AT WARNING AND ON EVERY OCCURRENCE, not once. A wrong mark is a
+			// hole with a coordinate attached, and the coordinate is what makes
+			// it reproducible without a screenshot.
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("skyMark WRONG MARK: level %d chunk (%d,%d,%d) is marked OPEN SKY and "
+			            "the generator puts ground in it -- %d of %d sampled columns reach it, "
+			            "worst overshoot %lld level-0 voxels (%.1f m) above the chunk floor. "
+			            "This is deleted terrain, not a rounding difference."),
+			       Level, Cx, Cy, FirstCz, WrongSamples, Grid * Grid,
+			       (long long)Overshoot, double(Overshoot * int64(vxc::kVoxelSizeMm)) / 1000.0);
+		}
+	}
+
+	FVoxelMarchChunkIndex& Index = GetGlobalVoxelMarchChunkIndex();
+	int32 Offered = 0;
+	int32 Written = 0;
+	int32 RefusedResident = 0;
+	int32 RefusedOther = 0;
+	// THE RUN LENGTH IS MEASURED OVER ACCEPTED CELLS, NOT OFFERED ONES, and the
+	// difference is the whole value of the number.
+	//
+	// The offered band is contiguous in Z by construction -- one loop, no gaps
+	// -- so counting offers would make every run exactly BandChunks() long and
+	// the mean would report the cap back to itself. That is a counter that
+	// cannot come out the other way, which this project has learned to treat as
+	// no counter at all. What the consumer actually needs is how many
+	// CONSECUTIVE cells the marcher will find marked, and a refusal (a resident
+	// alias, an annotation this writer must not erase) breaks the run exactly
+	// as a gap in the sky would. So a refusal closes the current run and starts
+	// a new one.
+	int32 CurrentRun = 0;
+	const auto CloseRun = [&CurrentRun]()
+	{
+		if (CurrentRun > 0)
+		{
+			VoxelSkyMark::GSkyRunCells.fetch_add(uint64(CurrentRun), std::memory_order_relaxed);
+			VoxelSkyMark::GSkyRuns.fetch_add(1, std::memory_order_relaxed);
+			CurrentRun = 0;
+		}
+	};
+	for (int32 Cz = FirstCz; Cz < FirstCz + Band; ++Cz)
+	{
+		++Offered;
+		switch (Index.NoteChunkOpenSky(FIntVector(Cx, Cy, Cz), Level))
+		{
+		case FVoxelMarchChunkIndex::EOpenSkyMark::Written:
+			++Written;
+			++CurrentRun;
+			break;
+		case FVoxelMarchChunkIndex::EOpenSkyMark::RefusedResident:
+			++RefusedResident;
+			CloseRun();
+			break;
+		default:
+			// REFUSED-OTHER IS TWO DIFFERENT WORLDS AND THE RUN TREATS THEM
+			// DIFFERENTLY ON PURPOSE. The dominant case by far is IDEMPOTENCE:
+			// the cell already carries this coord's mark from an earlier scan,
+			// so the marcher WILL find it marked and the run continues. The
+			// other cases (a pending/evicted annotation, a disarmed writer) do
+			// break the run -- but they cannot be told apart from here without
+			// widening the writer's return, and counting a live mark as a gap
+			// would under-report the run length on every settled column, which
+			// is every column in a static leg. Erring toward CONTINUING is the
+			// direction that makes the number optimistic, so it is stated here
+			// rather than buried: if refOther is large AND the writer is
+			// disarmed, skyRunMean is meaningless and the disarmed warning on
+			// the perf line is what says so.
+			++RefusedOther;
+			++CurrentRun;
+			break;
+		}
+	}
+	CloseRun();
+	VoxelSkyMark::GSkyCellsOffered.fetch_add(uint64(Offered), std::memory_order_relaxed);
+	VoxelSkyMark::GSkyCellsWritten.fetch_add(uint64(Written), std::memory_order_relaxed);
+	VoxelSkyMark::GSkyCellsRefusedResident.fetch_add(uint64(RefusedResident), std::memory_order_relaxed);
+	VoxelSkyMark::GSkyCellsRefusedOther.fetch_add(uint64(RefusedOther), std::memory_order_relaxed);
+	if (Offered > 0)
+	{
+		VoxelSkyMark::GSkyColumnsMarked.fetch_add(1, std::memory_order_relaxed);
+	}
+	VoxelSkyMark::GSkyMarkMicros.fetch_add(
+		uint64(FMath::Max((FPlatformTime::Seconds() - T0) * 1.0e6, 0.0)), std::memory_order_relaxed);
+}
+
 int64 FVoxelWorldImpl::FootprintSolidFloorMmCached(int32 Level, int32 ChunkX, int32 ChunkY) const
 {
 	using namespace VoxelCoords;
@@ -15305,6 +16456,21 @@ void FVoxelWorldImpl::EnumerateSurfaceFootprintCandidates(int32 Level, int32 Cx,
 			}
 		}
 	}
+
+	// THE SKY TRIM'S DECISION, WRITTEN DOWN (voxel.Stream.SkyMark).
+	//
+	// HERE, AND THE POSITION IS THE ARGUMENT. ChunkZMax is final at this line:
+	// the memo has answered, the sky-band EDIT HATCH above has already restored
+	// any chunk a player built into the air, and the two lines below only ever
+	// move ChunkZMin DOWNWARD (depth skirt, edit-floor hatch). So this is the
+	// one point in the entry pass where "how far up does streaming go in this
+	// column, and why" is fully decided -- which is exactly the fact the marcher
+	// has never had. Placed BEFORE the Z loop rather than inside it because the
+	// decision is a property of the COLUMN, and evaluating it per chunk would
+	// re-derive one answer up to a dozen times.
+	//
+	// No-op unless voxel.Stream.SkyMark is 1; that switch is the control arm.
+	MarkOpenSkyColumn(Level, Cx, Cy, ChunkZMax);
 
 	// Backlog recording (see DeferredFootprints): one insert per
 	// FOOTPRINT per scan, not per rejected chunk -- the Z loop
@@ -18340,7 +19506,52 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// counted on the [raster-atlas] window line, and a leg where
 	// inlineFallback does not fall toward zero after warmup is measuring the
 	// control path wearing the atlas flag -- read it as NOT MEASURED.
-	if (!RasterAtlas.IsValid() || !RasterAtlas->PrepareRequest(Req))
+	// THE DECLINE IS NOT FREE, AND IT ARRIVES ON A METRONOME. Measured in
+	// Saved/UU-wl16.log (line flight, 23.9 m/s): a ~200-240 ms GAME-THREAD
+	// stall every ~10.2 s (hitches at :11.878, :22.138, :32.338, :42.562 ->
+	// 10.26 / 10.20 / 10.22 s), entirely inside submitMs
+	// (dispatchMs=241.99 = ... + submitMs=241.49 + ...), and entirely inside
+	// the raster bucket below (`Voxel gpu submit split`'s raster= peaks at
+	// 1,148.2 ms, and every window over 10 ms carries 7-25 atlas declines).
+	//
+	// THE PERIOD IS THE ATLAS PAGE GRID. One page is 128 px x 1.875 m = 240 m
+	// of ground; at 23.9 m/s that is 10.04 s per page crossing. The owner's
+	// quarter-second freeze every ten seconds IS the page column going past.
+	//
+	// WHY THE DECLINE COSTS SO MUCH: PrepareRequest itself is ~0.06 us, so
+	// essentially all of it is FillRasterWindow, which is PER CHUNK -- ~5,800
+	// pixels x (elevationMm + climate) into a ~46 KB payload, uploaded once and
+	// discarded, with overlapping chunk windows re-sampling the same pixels.
+	// On a crossing, 7-25 chunks each pay a full window in ONE tick, and the
+	// disc sweep cannot pre-empt it: its budget is 2.0 ms tested BEFORE a page,
+	// so steady state is one page per tick against a column that needs many.
+	//
+	// AND IT COSTS A SECOND TIME ON THE GPU. The worklist claim chain refuses a
+	// job whose region is not atlas-armed (VoxelGpuMeshJobManager.cpp's
+	// `if (!Job->BrickRegion.bRasterAtlas) { ++WorklistSkipNoAtlas; continue; }`),
+	// so a declined chunk builds the full classic graph -- ~19 extra RDG passes
+	// -- instead of converting. VERIFIED: the per-window `noAtlas` deltas match
+	// the declines exactly (23,20,7,7 against 23,20,7,7). `noAtlas` is
+	// therefore a SECOND, independent witness that this rescue is working.
+	//
+	// SO: on a decline, fill the window's missing PAGES into the persistent
+	// atlas (~1.5 ms/page measured) and RETRY the coverage check. The page is
+	// shared -- the first declining chunk of a crossing pays for it and every
+	// later chunk over the same ground is served for ~0.06 us -- and the fill
+	// is capped per streaming tick so a page-column crossing spreads over a few
+	// ticks instead of landing in one frame. Past the cap, and on any refusal,
+	// this falls through to exactly today's inline path, which stays correct in
+	// every state.
+	//
+	// FAILING READINGS on the `[raster-atlas] window:` line: `inlineFallback`
+	// (and `declines`, and `noAtlas`) NOT falling toward 0 after warmup means
+	// the rescue is not engaging and the leg is NOT MEASURED -- it is the
+	// control path wearing the fix, not a null result. `demandRescued=0` with
+	// `inlineFallback` large is the same DEAD reading from the other side.
+	// `demandRetryFail>0` invalidates the leg outright.
+	if (!RasterAtlas.IsValid() ||
+	    (!RasterAtlas->PrepareRequest(Req) &&
+	     !(RasterAtlas->FillWindowOnDemand(ActiveTiles(), Req) && RasterAtlas->PrepareRequest(Req))))
 	{
 		VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
 	}
@@ -24981,6 +26192,15 @@ FString GetWorldSaveFilePath(uint64 Seed)
 // .tmp file behind, never a truncated/corrupt Path.
 bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
 {
+	// THE REFUSAL GATE, and it is here rather than at each call site so that a
+	// writer added later inherits it instead of having to remember it. If this
+	// session could not READ the file at Path, writing it now is not a save, it
+	// is a deletion. See VoxelSaveGuard.h.
+	if (VoxelSaveGuard::RefuseWrite(Path, TEXT("SaveWorld")))
+	{
+		return false;
+	}
+
 	const FString TmpPath = Path + TEXT(".tmp");
 	if (!FFileHelper::SaveArrayToFile(Bytes, *TmpPath))
 	{
@@ -25062,6 +26282,12 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 		return;
 	}
 
+	// ABSENCE IS NOT REFUSAL, and this test is what makes the two different
+	// BRANCHES rather than different shades of the same one. A world with no
+	// file is a NEW world: it starts fresh and it saves normally, exactly as it
+	// always has. Every failure below this point is a file that DOES exist,
+	// which is why the guard can only ever be armed on a path already proven to
+	// be on disk. Nothing about this branch changes.
 	if (!FPaths::FileExists(Path))
 	{
 		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: no saved world at %s -- starting fresh."), *Path);
@@ -25071,20 +26297,52 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 	TArray<uint8> Bytes;
 	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
 	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: failed to read %s -- starting fresh."), *Path);
+		// The file EXISTS and we could not open it -- a lock, a permission, a
+		// failing disk. Quarantine (we must not overwrite bytes we never saw)
+		// but do NOT move it aside: we have no evidence it is malformed, and a
+		// rename would probably fail for the same reason the read did.
+		UE_LOG(LogVoxelEdit, Error,
+		       TEXT("LoadWorld: %s EXISTS but could not be read -- starting fresh. This is not corruption; the file "
+		            "is intact as far as we know."),
+		       *Path);
+		VoxelSaveGuard::Quarantine(
+			Path, TEXT("the file exists but this session could not open it (locked, permissions, or failing disk)."));
 		return;
 	}
 
 	const std::optional<vxc::EditLog> ParsedLog = vxc::EditLog::parse(Bytes.GetData(), (size_t)Bytes.Num());
 	if (!ParsedLog)
 	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: %s is corrupt or unrecognized -- starting fresh."), *Path);
+		// WAS: one Error line saying "corrupt or unrecognized", then a plain
+		// return -- after which Deinitialize's autosave wrote an empty log over
+		// this exact path. A kWorldGenVersion bump lands here for EVERY save on
+		// EVERY machine, so that line was one constant away from destroying
+		// every player's world at once. ClassifyEditLog says which of the two it
+		// actually was; RefuseFile latches the path unwritable and moves the
+		// bytes aside. See VoxelSaveGuard.h.
+		VoxelSaveGuard::RefuseFile(Path, VoxelSaveGuard::ClassifyEditLog(Bytes.GetData(), Bytes.Num()),
+		                           TEXT("saved world"));
+		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: starting fresh; %s will NOT be overwritten by this session."),
+		       *Path);
 		return;
 	}
 
 	if (!Impl.Voxels.replay(*ParsedLog))
 	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: seed/brickEdge mismatch replaying %s -- starting fresh."), *Path);
+		// Same class, different door: the file parsed, so the bytes are fine,
+		// but they describe a different world than the one running. Replaying
+		// would be wrong and overwriting would be worse.
+		VoxelSaveGuard::FRefusal Refusal;
+		Refusal.Token = TEXT("seed-mismatch");
+		Refusal.bVersionMismatch = false;
+		Refusal.Detail = FString::Printf(
+			TEXT("the log parsed cleanly but records seed %llu / brickEdge %u, and this world is seed %llu. The "
+			     "bytes are intact; they belong to a different world."),
+			(unsigned long long)ParsedLog->seed(), uint32(ParsedLog->brickEdge()),
+			(unsigned long long)Impl.Voxels.amplifier().seed());
+		VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("saved world"));
+		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: starting fresh; %s will NOT be overwritten by this session."),
+		       *Path);
 		return;
 	}
 

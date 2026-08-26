@@ -924,10 +924,41 @@ void BrickPoolFreeMain(uint3 tid : SV_DispatchThreadID)
 	const uint Slot = InSlotList[s];
 	const uint Side = Slot * 4u;
 
+	// TAKE THE SLOT, DO NOT READ IT. Two threads of this dispatch can be handed
+	// the SAME Slot: the CPU's free queue used to append a slot number per
+	// FreeResident call with no dedupe, and a same-key re-request inside one
+	// batch frees the resident before reallocating -- over an always-coalesced
+	// first-fit descriptor arena the realloc hands the SAME slot back, so the
+	// two queue entries are one slot twice, not two slots.
+	//
+	// The old plain reads let both threads see class > 0, so both BitmapCleared
+	// the same pages (the loser counting every page as Missing -> badFree) and
+	// both StackPushed the same Rel, putting one range on the free stack twice
+	// -> a later claim's BitmapSet collided -> doubleGrant. That is the
+	// structural doubleGrant == badFree signature on the window line: one pair
+	// of threads over one range produces exactly one of each per page.
+	//
+	// The exchange makes the class words the claim ticket. Exactly one thread
+	// can observe a non-zero class for a slot; the duplicate observes 0 and
+	// frees nothing, which is the same path a slot whose claim failed has
+	// always taken. FlushPendingGpuFrees now dedupes CPU-side and counts the
+	// collapses (dupFreeSlots) -- this is the guard a future caller who
+	// re-introduces a duplicate cannot bypass, and it needs no new uniform and
+	// no new binding: AllocSide is already a UAV on this pass.
+	//
+	// ORDER MATTERS: the classes are taken BEFORE the bases are read, and the
+	// BASE words are zeroed only on the branch that WON its class. A losing
+	// thread therefore never writes Side+0 / Side+2, so the winner's read of the
+	// base after its exchange cannot race a duplicate's cleanup. (No behaviour
+	// changes for a genuine class-0 entry: every writer that stores class 0 also
+	// stores base 0, so the removed unconditional zeroing wrote 0 over 0.)
+	uint OccClass = 0u;
+	uint MatClass = 0u;
+	InterlockedExchange(AllocSide[Side + 1u], 0u, OccClass);
+	InterlockedExchange(AllocSide[Side + 3u], 0u, MatClass);
+
 	const uint OccBaseAbs = AllocSide[Side + 0u];
-	const uint OccClass   = AllocSide[Side + 1u];
 	const uint MatBaseAbs = AllocSide[Side + 2u];
-	const uint MatClass   = AllocSide[Side + 3u];
 
 	uint Missing = 0u;
 	if (OccClass > 0u)
@@ -939,6 +970,7 @@ void BrickPoolFreeMain(uint3 tid : SV_DispatchThreadID)
 			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
 		}
 		InterlockedAdd(AllocState[kCtrOccInFlight], 0u - OccClass * OccClassStep);
+		AllocSide[Side + 0u] = 0u;
 	}
 	if (MatClass > 0u)
 	{
@@ -949,6 +981,7 @@ void BrickPoolFreeMain(uint3 tid : SV_DispatchThreadID)
 			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
 		}
 		InterlockedAdd(AllocState[kCtrMatInFlight], 0u - MatClass * MatClassStep);
+		AllocSide[Side + 2u] = 0u;
 	}
 	if (Missing != 0u)
 	{
@@ -958,11 +991,16 @@ void BrickPoolFreeMain(uint3 tid : SV_DispatchThreadID)
 		InterlockedAdd(AllocState[kCtrFreeBitmapMissing], Missing);
 	}
 
-	AllocSide[Side + 0u] = 0u;
-	AllocSide[Side + 1u] = 0u;
-	AllocSide[Side + 2u] = 0u;
-	AllocSide[Side + 3u] = 0u;
-
+	// The class words were already zeroed by the exchanges above and each base
+	// word is zeroed by the branch that won it, so the side entry is fully clear
+	// here on every path -- including a duplicate's, whose entry the winner
+	// clears.
+	//
+	// The record zeroing and the frees tally stay UNCONDITIONAL, exactly as
+	// before: a duplicate thread writes the same zeros the winner writes (no
+	// hazard, one value), and `frees` has always counted slot list entries
+	// processed, not ranges reclaimed. Changing either would move a number the
+	// window line's reconciliation reads.
 	for (uint D = 0u; D < ChunkRecordDwords; ++D)
 	{
 		OutChunkTable[Slot * ChunkRecordDwords + D] = 0u;

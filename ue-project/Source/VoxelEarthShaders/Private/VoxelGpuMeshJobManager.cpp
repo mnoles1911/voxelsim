@@ -8,6 +8,7 @@
 #include "RHIGPUReadback.h"
 #include "RenderingThread.h"
 #include "Misc/ScopeExit.h"
+#include "VoxelRenderFrame.h"
 
 #include <atomic>
 
@@ -50,7 +51,8 @@ static FAutoConsoleVariableRef CVarVoxelGpuBrickPack(
 	GVoxelGpuBrickPack,
 	TEXT("1 = every mesh job also packs its chunk into the resident brick volume ")
 	TEXT("(BrickClassify -> Scan x2 -> BrickPack on a halo-free 32x32x4 region, in the same graph). ")
-	TEXT("0 (default) = byte-identical to the graph without it. Read once per Submit."),
+	TEXT("0 = byte-identical to the graph without it -- the CONTROL ARM, and NOT the default: ")
+	TEXT("THIS SHIPS AT 1. Read once per Submit."),
 	ECVF_Default);
 
 // THE 'PUBLICATION STUBBED' ARM, and it is a measurement instrument rather than
@@ -243,7 +245,8 @@ static FAutoConsoleVariableRef CVarVoxelGpuWorldGenBatch(
 	GVoxelGpuWorldGenBatch,
 	TEXT("1 = fuse contiguous Z-sibling brick-only mesh jobs into one tall region per column ")
 	TEXT("stack: ONE set of worldgen+pack passes and ONE totals readback for K chunks, instead ")
-	TEXT("of K of each. 0 (default) = today's per-chunk graphs, byte-identical. Outputs are ")
+	TEXT("of K of each. 0 = today's per-chunk graphs, byte-identical -- the CONTROL ARM, and ")
+	TEXT("NOT the default: THIS SHIPS AT 1. Outputs are ")
 	TEXT("bit-exact either way (gate: voxel.GPU.VerifyBrickStack); read once per Tick."),
 	ECVF_Default);
 
@@ -544,11 +547,56 @@ static bool VoxelGpuStackClaimEnabled()
 // Command-line latched, not a cvar: -ExecCmds lands after streaming has
 // begun, and a mid-run flip would split the ring across two configurations
 // (the -VoxelSurfaceMip reasoning, verbatim).
+// ============================================================================
+// THE WORKLIST CHAIN DEFAULTS **ON** AS OF 2026-08-25 (owner decision).
+// ============================================================================
+//
+// All eight gates below (Worklist / Columns / Voxelize / Classify / AssetStamp /
+// Pack / Claim / BandChunks) now latch to 1 when their switch is ABSENT. The
+// control leg is therefore the one that PASSES a flag: -VoxelGpuWorklist=0
+// still gives the classic per-chunk chain, because FParse::Value only
+// overwrites the value when the name is present.
+//
+// WHY, measured on matched flight legs (line flight, 23.5 m/s, sun frozen
+// 12:00 03-20, all at the SAME render size -- see the resolution caveat below):
+//
+//     config                 moving p99      stutters   hitches   doubleGrant
+//     stock (classic)        34.00 ms 29fps   17.08%      100         113
+//     worklist, cap 16       21.30 ms 47fps    1.2-3.3%    35           0
+//
+// n=3 on the worklist arm (21.20 / 21.40 / 20.60). The mechanism is visible on
+// the [gpu-worklist] window line: passes/tick mean=25.1 max=76 at 4,260
+// chunks/s, replacing ~1,300 RDG passes built in a single render command. The
+// pass term went flat in N, which is what this chain was built to do.
+//
+// CORRECTNESS, on this build, not an older one: -VoxelGpuWorklistVerifyClaim=1
+// cross-checked 207,983,035 dwords against the classic path with mism=0,
+// dupRefused=0, fedNoBit=0.
+//
+// TWO THINGS THAT ARE **NOT** SETTLED, and must not be read into the above:
+//
+//   1. RESOLUTION. Every leg quoted here rendered at 1552x873, NOT the owner's
+//      2560x1440 -- -ResX/-ResY is inert (a leg requesting 2560x1440 produced
+//      a byte-identical view=1552x873). The comparison is like-for-like, so
+//      the DELTA stands, but the absolute fps figures are not at the
+//      resolution the target is stated in. Read `view=` in the log, never the
+//      harness banner, which echoes its own parameter.
+//
+//   2. THE POOL DOUBLE GRANT IS A SEPARATE DEFECT. At MeshBatchCap 64 the
+//      allocator granted already-owned dwords (doubleGrant == badFree, 100-176
+//      per leg; 0 at cap 16). It is NOT caused by this chain -- a stock leg
+//      with no worklist flags at all shows it too. Cause: a duplicate
+//      ChunkSlot in one free dispatch; fixed 2026-08-25 in
+//      FlushPendingGpuFrees + BrickPoolFreeMain. Any leg whose
+//      [brick-gpualloc] line shows doubleGrant > 0 is INVALID by
+//      voxel.GPU.PoolAlloc's own stated gate -- check it before quoting a
+//      number from this table or any other.
+//
 static bool VoxelGpuWorklistEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklist="), Value);
 		return Value != 0;
 	}();
@@ -600,7 +648,7 @@ static bool VoxelGpuWorklistColumnsEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistColumns="), Value);
 		return Value != 0;
 	}();
@@ -635,7 +683,7 @@ static bool VoxelGpuWorklistVoxelizeEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistVoxelize="), Value);
 		return Value != 0;
 	}();
@@ -669,7 +717,7 @@ static bool VoxelGpuWorklistClassifyEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistClassify="), Value);
 		return Value != 0;
 	}();
@@ -705,7 +753,7 @@ static bool VoxelGpuWorklistAssetStampEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistAssetStamp="), Value);
 		return Value != 0;
 	}();
@@ -739,7 +787,7 @@ static bool VoxelGpuWorklistPackEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistPack="), Value);
 		return Value != 0;
 	}();
@@ -772,7 +820,7 @@ static bool VoxelGpuWorklistClaimEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistClaim="), Value);
 		return Value != 0;
 	}();
@@ -824,7 +872,7 @@ static bool VoxelGpuWorklistBandChunksEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = 1;   // DEFAULT ON 2026-08-25 (owner decision) -- see the note above VoxelGpuWorklistEnabled
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistBandChunks="), Value);
 		return Value != 0;
 	}();
@@ -1045,6 +1093,7 @@ FVoxelGpuQuadPayload::~FVoxelGpuQuadPayload()
 	ENQUEUE_RENDER_COMMAND(VoxelGpuQuadPayloadRelease)(
 		[Buffer = MoveTemp(Quads)](FRHICommandListImmediate&) mutable
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGpuMeshJob);
 		Buffer.SafeRelease();
 	});
 }
@@ -1567,6 +1616,7 @@ namespace
 	bool CopyReadback(FRHIGPUBufferReadback& Readback, void* Dest, uint32 Bytes,
 	                  const TCHAR* Name, FString& OutError)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGpuMeshJob);
 		if (Bytes == 0)
 		{
 			return true;
@@ -1651,6 +1701,7 @@ namespace
 	// +1-brick term that version adds is exactly what has to come back out.
 	TArray<uint64> RebaseQuadsToChunkLocal(const FVoxelGpuMeshJobManager::FJob& Job)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGpuMeshJob);
 		TArray<uint64> Rebased;
 		Rebased.Reserve(Job.RawQuads.Num());
 
@@ -4303,6 +4354,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		 bVerifyVoxArmed, bVerifyCtArmed, bVerifyStampArmed,
 		 bVerifyPackArmed](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGpuMeshJob);
 		FRDGBuilder GraphBuilder(RHICmdList);
 
 		// P3 Column stage: the arena and stats buffers, registered once for
@@ -4788,6 +4840,7 @@ void FVoxelGpuMeshJobManager::DispatchQuadFetch(TArray<FJobPtr>&& Batch)
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshFetchQuads)(
 		[Jobs = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGpuMeshJob);
 		FRDGBuilder GraphBuilder(RHICmdList);
 
 		TArray<FJobPtr> Built;
@@ -4861,6 +4914,7 @@ void FVoxelGpuMeshJobManager::DispatchQuadCompact(TArray<FVoxelGpuQuadPayloadRef
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshCompactQuads)(
 		[Payloads = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGpuMeshJob);
 		FRDGBuilder GraphBuilder(RHICmdList);
 
 		for (const FVoxelGpuQuadPayloadRef& Payload : Payloads)
@@ -5279,6 +5333,7 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 	// done with it, and duplicating them into each branch is how the two paths
 	// would drift.
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailGpuMeshJob);
 		TArray<FJobPtr> ToFetch;
 		TArray<FVoxelGpuQuadPayloadRef> ToCompact;
 		for (const FJobPtr& Job : InFlight)

@@ -13,6 +13,7 @@
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
 #include "RenderingThread.h"
+#include "VoxelRenderFrame.h"
 
 #include <atomic>
 
@@ -980,7 +981,12 @@ namespace VoxelBrickPoolDetail
 		TEXT("P1 of the GPU streaming architecture. 1 = brick-pool arena ranges are claimed by the ")
 		TEXT("GENERATION GRAPH (GPU-side size-class allocator; no per-chunk totals readback, which is ")
 		TEXT("the fence the GPU arm queues behind); the CPU producer claims through the same GPU ")
-		TEXT("allocator in the pool flush. 0 (default) = today's CPU allocation from the readback, ")
+		TEXT("allocator in the pool flush. 0 = today's CPU allocation from the readback -- the ")
+		TEXT("byte-identical CONTROL ARM, and NOT the default: THIS SHIPS AT 1 (owner decision, ")
+		TEXT("2026-08-24). While it is 1 the pool is armed, AddChunkFromGpu refuses outright and ")
+		TEXT("AddChunkFromCpu diverts to PendingGpuCpuWrites, so PendingWrites is structurally ")
+		TEXT("EMPTY and everything downstream of it (UploadCpuWrites_RenderThread, PendingClears, ")
+		TEXT("voxel.GPU.BrickFlushBatch, voxel.Brick.UploadCoalesce) is off-path. ")
 		TEXT("byte-identical. LATCHED at pool Init -- use -VoxelGpuPoolAlloc=1 on the command line for ")
 		TEXT("legs; a cvar flip after Init is IGNORED (and says so), because mid-run re-arming would ")
 		TEXT("put two allocators over one range. Live cross-checks report on [brick-gpualloc]."),
@@ -1002,6 +1008,23 @@ namespace VoxelBrickPoolDetail
 	std::atomic<int64> GAllocSnapClaimFailWorst{ 0 };
 	std::atomic<int64> GAllocSnapBitmapCollision{ 0 };
 	std::atomic<int64> GAllocSnapFreeMissing{ 0 };
+	// NOT a GPU readback: a CPU-side tally of duplicate slot numbers collapsed
+	// out of one free dispatch by FlushPendingGpuFrees. It lives with the
+	// snapshots because it prints on the same window line, and it is
+	// cumulative for the same reason they are.
+	//
+	// A DUPLICATE MUST NEVER BE SILENT AGAIN. See FlushPendingGpuFrees for the
+	// mechanism; the readings are:
+	//   dupFreeSlots > 0, doubleGrant 0 badFree 0  -- the fix WORKING. The
+	//       trigger (a same-key re-request inside one batch) still occurs; the
+	//       damage is gone. This is the expected steady state, not a warning.
+	//   dupFreeSlots 0 on a cap=64 leg              -- the trigger did not
+	//       occur and the leg PROVES NOTHING about this fix. Do not read it as
+	//       a pass.
+	//   dupFreeSlots > 0 with doubleGrant/badFree moving -- the dedupe is not
+	//       the only producer of duplicates; look for a second free path that
+	//       does not go through PendingGpuFreeSlots.
+	std::atomic<int64> GAllocDupFreeSlots{ 0 };
 	std::atomic<int64> GAllocSnapPushOverflow{ 0 };
 	std::atomic<int64> GAllocSnapOccBump{ 0 };
 	std::atomic<int64> GAllocSnapMatBump{ 0 };
@@ -1409,6 +1432,7 @@ FVoxelGpuBrickPayload::~FVoxelGpuBrickPayload()
 		[D = MoveTemp(Desc), O = MoveTemp(Occ), M = MoveTemp(Mat),
 		 C = MoveTemp(ChunkMask)](FRHICommandListImmediate&) mutable
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailBrickPool);
 		D.SafeRelease();
 		O.SafeRelease();
 		M.SafeRelease();
@@ -1654,32 +1678,16 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 	{
 		Config.ChunkCapacity = uint32(FMath::Max(1, VoxelBrickPoolDetail::GVoxelBrickPoolChunks));
 
-		// --- hierarchical coverage headroom (Phase 1 of the no-hole plan) ---
+		// --- pool capacity, and the hierarchical-coverage raise that used to
+		// --- live here (see the note below the explicit knob) ---
 		//
-		// -VoxelHierarchicalCoverage makes every coarse streaming level cover
-		// the ground inside it (VoxelWorldSubsystem.cpp, VoxelStreamAdmission::
-		// HierarchicalCoverageEnabled -- READ FROM THE COMMAND LINE HERE TOO,
-		// deliberately, because this module must not depend on VoxelEarth; the
-		// flag string is the shared contract). Measured per-level residency
-		// (MODEFP, settled 4 km cascade: 96,814 chunks) projects to ~120,350
-		// under full coverage -- 92% of the default 131,072 slots, and peak
-		// residency under flight sits above settled. The pool evicts
-		// farthest-from-focus on pressure and GetEvictions() == 0 is a stated
-		// gate, so running the switch against the default pool would fail its
-		// own gate by construction. The switch therefore brings its own
-		// headroom: 262,144 slots. Committed cost at that size: descriptors
-		// 128 MiB + records 8 MiB on top of the unchanged occupancy/material
-		// arenas (those are paid per MIXED brick, not per slot) -- inside the
-		// owner's approved 1-2 GB envelope.
-		//
-		// EXPLICIT AND REVERSIBLE, not a default change: without the flag this
-		// block does not run and the pool is byte-identical to today. An
-		// explicit -VoxelBrickPoolChunks=N outranks both the default and the
-		// hierarchical raise (that is the right-sizing knob for step 4 of the
-		// plan, and the pre-existing cvar path stays: voxel.Brick.PoolChunks
-		// is ECVF_ReadOnly and read once, above). Command line and not a
-		// console command because this is read ONCE, here, and a resize after
-		// Init is refused -- see the guard at the top of this function.
+		// The default is GVoxelBrickPoolChunks (393,216). Hierarchical coverage
+		// is now ON by default on the game side and the pool needs no separate
+		// headroom step for it: the measured projection that motivated the raise
+		// (~120,350 resident under full coverage, from MODEFP's settled 4 km
+		// cascade at 96,814 chunks) is 31% of 393,216, not 92% of 131,072. The
+		// GetEvictions() == 0 gate therefore holds on the default pool.
+
 		int32 ExplicitChunks = 0;
 		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelBrickPoolChunks="), ExplicitChunks) &&
 		    ExplicitChunks > 0)
@@ -1689,15 +1697,26 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 			       TEXT("FVoxelBrickPool: chunk capacity %u from -VoxelBrickPoolChunks="),
 			       Config.ChunkCapacity);
 		}
-		else if (FParse::Param(FCommandLine::Get(), TEXT("VoxelHierarchicalCoverage")))
-		{
-			Config.ChunkCapacity = FMath::Max(Config.ChunkCapacity, 262144u);
-			UE_LOG(LogVoxelBrickPool, Log,
-			       TEXT("FVoxelBrickPool: chunk capacity raised to %u for -VoxelHierarchicalCoverage ")
-			       TEXT("(projected residency ~120,350 of the default 131,072 = 92%%, and the ")
-			       TEXT("evictions==0 gate must hold)."),
-			       Config.ChunkCapacity);
-		}
+		// THE HIERARCHICAL-COVERAGE RAISE IS GONE, AND BOTH ITS REASONS EXPIRED.
+		// (deleted 2026-08-25; it had been a silent no-op on two counts)
+		//
+		// It read -VoxelHierarchicalCoverage, and the game side stopped using that
+		// spelling on 2026-08-23: HierarchicalCoverageEnabled() is DEFAULT ON and
+		// latches the NEGATIVE -VoxelNoHierarchicalCoverage
+		// (VoxelWorldSubsystem.cpp). So the pool was waiting on a flag nothing
+		// passes -- the coupling comment there, "the pool is therefore raised
+		// alongside this switch, from the SAME command-line flag", was false in
+		// both directions.
+		//
+		// And had it fired it would have done nothing: it raised capacity to
+		// max(ChunkCapacity, 262144) while GVoxelBrickPoolChunks has been 393216
+		// since the pool grew, so the max() returns the default unchanged. Its log
+		// line still quoted "the default 131,072", a figure 3x stale, which is
+		// what a raise that can no longer raise anything looks like from a log.
+		//
+		// -VoxelBrickPoolChunks=N above remains the right-sizing knob and is
+		// unaffected. Nothing here changes behaviour: 393216 was already what
+		// every leg got, with or without the flag.
 	}
 	// -VoxelBrickPoolOccMiB= / -VoxelBrickPoolMatMiB= are the arena analogues
 	// of -VoxelBrickPoolChunks= above, added with the 2026-08-23 slot raise so
@@ -2801,11 +2820,73 @@ void FVoxelBrickPool::FlushPendingGpuFrees()
 
 	TArray<uint32> Slots = MoveTemp(PendingGpuFreeSlots);
 	PendingGpuFreeSlots.Reset();
+
+	// --- ONE SLOT, ONE FREE ---------------------------------------------------
+	//
+	// FreeResident appends Chunk.ChunkSlot with no dedupe, and this drain used
+	// to hand the list to the GPU verbatim. That is a defect, because a slot
+	// number can legitimately be queued TWICE inside one batch:
+	//
+	//   * AllocateForChunk frees the existing resident on a SAME-KEY re-request
+	//     before it reallocates -- a chunk re-requested while an earlier job for
+	//     it is still in flight (the manager counts these as `dupSlot`);
+	//   * ChunkSlot = DescAlloc.Offset / 64 over an always-coalesced first-fit
+	//     descriptor arena then usually hands THE SAME SLOT BACK (see
+	//     VoxelGpuMeshJobManager.cpp's duplicate-key note, which says so
+	//     outright). That is what makes it one slot queued twice rather than
+	//     two distinct slots -- without the same-slot-back behaviour there is
+	//     no duplicate to collapse.
+	//
+	// Two entries meant two BrickPoolFreeMain threads over one side-table entry,
+	// each freeing the same range: both cleared the same bitmap pages (the loser
+	// counting every page as Missing -> badFree) and both pushed the same Rel
+	// onto the free stack, so the range was handed out twice later and the second
+	// claim's BitmapSet collided -> doubleGrant. That is why doubleGrant ==
+	// badFree EXACTLY on every dirty leg (34 dupSlot -> 152/152, 20 -> 100/100,
+	// 2 -> 2/2): the equality is structural, not coincidence -- one duplicated
+	// range produces one badFree page and one doubleGrant page per page, from the
+	// same pair of threads over the same range. A leg where they DIVERGE is a
+	// different defect and this comment does not cover it.
+	//
+	// The GPU side now also takes the slot atomically (BrickPoolFreeMain's
+	// InterlockedExchange of the class words), so a duplicate that reaches the
+	// dispatch by some other route frees nothing. This dedupe is the real fix;
+	// that guard is what a future caller cannot bypass.
+	const int32 RawSlotCount = Slots.Num();
+	{
+		TSet<uint32> SeenSlots;
+		SeenSlots.Reserve(RawSlotCount);
+		for (int32 I = 0; I < Slots.Num(); )
+		{
+			bool bAlreadySeen = false;
+			SeenSlots.Add(Slots[I], &bAlreadySeen);
+			if (bAlreadySeen)
+			{
+				// Order is irrelevant to the free pass (one thread per entry,
+				// no cross-entry dependency), so the cheap swap-remove is safe.
+				Slots.RemoveAtSwap(I, EAllowShrinking::No);
+			}
+			else
+			{
+				++I;
+			}
+		}
+	}
+	const int32 CollapsedSlots = RawSlotCount - Slots.Num();
+	if (CollapsedSlots > 0)
+	{
+		// Surfaced as dupFreeSlots on the [brick-gpualloc] window line. Rising
+		// while doubleGrant/badFree stay 0 is this fix working; see the counter's
+		// declaration for the full reading table.
+		VoxelBrickPoolDetail::GAllocDupFreeSlots.fetch_add(int64(CollapsedSlots), std::memory_order_relaxed);
+	}
+
 	const FVoxelBrickPoolAllocLayout Layout = GpuAllocLayout;
 
 	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolGpuFree)(
 		[Buffers = GetOrCreateBuffers(), Slots = MoveTemp(Slots), Layout](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailBrickPool);
 		EnsureCreated_RenderThread(RHICmdList, Buffers);
 		if (!Buffers.IsValid() || !Buffers->IsValid() || !Buffers->HasGpuAlloc())
 		{
@@ -2894,6 +2975,7 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolAllocWindow)(
 		[Buffers = GetOrCreateBuffers(), Layout, Expect = MoveTemp(Expect)](FRHICommandListImmediate& RHICmdList)
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailBrickPool);
 		// Harvest anything a previous window enqueued -- same serial timeline.
 		PollGpuAllocReadbacks_RenderThread();
 
@@ -3012,6 +3094,7 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 		       TEXT("(occ %.1f%% mat %.1f%%), stranded ")
 		       TEXT("%.1f MiB, leakedRuns %lld, stackPeak occ %lld mat %lld of %u; ")
 		       TEXT("claimFail occ %lld mat %lld worst %lld; ")
+		       TEXT("dupFreeSlots %lld; ")
 		       TEXT("FAIL: doubleGrant %lld badFree %lld; xcheck %lld ok / %lld FAIL ")
 		       TEXT("(%lld sampled, %lld unwritten, %d pending)"),
 		       GpuShellsAllocated, GpuFallbackShellStolen, ShellsUnclaimed, GpuFreesQueued,
@@ -3037,6 +3120,12 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 		       SnapFailOcc,
 		       SnapFailMat,
 		       SnapFailWorst,
+		       // dupFreeSlots: same-key re-requests whose duplicate free this
+		       // window's flushes collapsed. Non-zero WITH doubleGrant/badFree 0
+		       // is the healthy reading -- trigger present, damage removed. Zero
+		       // on a cap=64 leg means the trigger never fired and the leg is
+		       // not evidence either way.
+		       GAllocDupFreeSlots.load(std::memory_order_relaxed),
 		       GAllocSnapBitmapCollision.load(std::memory_order_relaxed),
 		       GAllocSnapFreeMissing.load(std::memory_order_relaxed),
 		       GAllocXchkOk.load(std::memory_order_relaxed),
@@ -4166,6 +4255,7 @@ void FVoxelBrickPool::Flush()
 		 GpuCpuWrites = MoveTemp(GpuCpuWrites),
 		 Layout = GpuAllocLayout](FRHICommandListImmediate& RHICmdList) mutable
 	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailBrickPool);
 		if (!Buffers.IsValid())
 		{
 			return;

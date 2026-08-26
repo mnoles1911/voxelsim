@@ -72,6 +72,96 @@ namespace
 		return Value;
 	}
 
+	// --- THE DEMAND-FILL CAP, IN PAGES PER STREAMING TICK -------------------
+	//
+	// FillWindowOnDemand (see its comment in the header) rescues a declined
+	// chunk by filling its window's missing pages instead of letting it sample
+	// a 5,800-pixel window inline. Uncapped, that trades one unbounded
+	// game-thread cost for another: on the 240 m page crossing that produces
+	// the measured 10.2 s hitch, 7-25 chunks decline in ONE tick, and a tick
+	// that filled every page all of them wanted would simply be a differently
+	// shaped 240 ms.
+	//
+	// PAGES, NOT MILLISECONDS, and deliberately so. FillBudgetMs() is a time
+	// budget tested BEFORE a page, and its own comment records what that costs:
+	// a tick with 0.1 ms left still pays a whole page, so the "2.0 ms" budget
+	// measures 2.83 ms/page in practice. A count is the unit that actually
+	// bounds the tick here -- 4 pages x ~1.5 ms measured
+	// (`fills=16 (2.00 MiB, 23.9 ms GT)`) is ~6 ms of game thread, and it
+	// cannot overshoot by a page the way a deadline can.
+	//
+	// 4 IS A STARTING VALUE, not a derived one, and it is switchable precisely
+	// so it does not need to be defended as derived. A level-0 window is
+	// ~76 px across and spans at most 2x2 = 4 pages, so 4 admits a whole
+	// level-0 window in one call -- which is the case that matters, because a
+	// crossing is many chunks sharing a few pages, not one chunk wanting many.
+	// A level-6 window is ~64x wider in world terms and can span 3x3; those
+	// windows will hit the cap, take the inline path, and be picked up by the
+	// sweep's demand queue on a later tick, which is exactly today's behaviour
+	// and therefore not a regression.
+	//
+	// THE REFUSAL IS ALL-OR-NOTHING, and that is the whole reason the cap is
+	// safe. A partial fill would leave the window still uncovered, so the chunk
+	// would pay the pages AND the inline window -- strictly worse than today.
+	// Refusing outright costs the chunk exactly what it costs now, and the
+	// pages it wanted are already in the demand queue (PrepareRequest queued
+	// them when it declined, before this was ever called), so the sweep fills
+	// them next tick and the NEXT chunk over that ground is served.
+	//
+	// 0 disables the demand path entirely -- the A/B control arm, and the way
+	// to reproduce the pre-fix hitch on a build that has the fix in it.
+	int32 DemandPagesPerTick()
+	{
+		static const int32 Value = []
+		{
+			// DEFAULT 64, MEASURED 2026-08-25. It took three legs to find this and the
+			// two smaller values LOOKED LIKE THE FIX HAD FAILED, so the numbers stay here:
+			//
+			// Swept twice, because the FIRST sweep was run with
+			// -VoxelGpuMeshBatchCap=16 passed and therefore never saw the SHIPPING
+			// MeshBatchCap of 64, which promotes far more chunks per tick and so
+			// brings far more declines due at once. A fix measured under a
+			// non-default flag has not been measured.
+			//
+			//   at MeshBatchCap 16:  cap 4 -> rescued 6/capHit 14;  16 -> 118/119;
+			//                        64 -> 150/0
+			//   at MeshBatchCap 64 (THE DEFAULT, what actually ships):
+			//     cap   capHit  rescued  noAtlas  worstFrame  hitch time / count / >=200ms
+			//      64     1070      264     1070     98.65 ms   4058 ms / 40 / 4
+			//     256        0      548        0     87.42 ms   2544 ms / 31 / 1   <- ships
+			//    1024        0      523        0     91.17 ms   3074 ms / 38 / 2
+			//
+			// 1024 is WORSE than 256: an effectively unbounded cap lets a single
+			// tick fill hundreds of pages and rebuilds a stall of its own. The cap
+			// exists to RATION, not to permit.
+			//
+			// Against pre-fix stock: total time in hitch frames 4795 -> 2544 ms
+			// (-47%), frames >= 200 ms 10 -> 1, worst moving frame 242 -> 87 ms.
+			//
+			// Below 64 the cap REFUSED most page-column crossings, they fell back to
+			// the per-chunk inline window, and the 10.2 s metronome survived intact --
+			// the fix reads as ineffective when it is simply rationed. `capHit` is the
+			// discriminator: a leg with capHit comparable to rescued is CAP-BOUND, not
+			// a null result. At 64, capHit=0 and noAtlas fell 1196 -> 0.
+			//
+			// A crossing needs far more than a handful of pages at once: a page is
+			// 128 px x 1875 mm/px = 240 m, so at 20+ m/s one is crossed every ~10 s
+			// and a whole page COLUMN comes due in one tick.
+			//
+			// WHY NOT ASYNC (-VoxelGpuRasterAtlasFill=3) INSTEAD: measured, and it is
+			// WORSE despite moving 85% of the fill off the game thread (489 -> 79 ms
+			// per 2 s window). It SPREADS the stall rather than removing it. Total time
+			// in hitch frames over one flight: baseline 4795 ms / 35 hitches, this fix
+			// 3957 ms / 58, async 5834 ms / 77. Severity, frames >= 200 ms: baseline 10,
+			// this fix 1, async 4. The game-thread number alone would have sold async;
+			// summing the hitch time is what refuted it.
+			int32 V = 256;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlasDemandPagesPerTick="), V);
+			return FMath::Max(0, V);
+		}();
+		return Value;
+	}
+
 	// THE COARSE CLIMATE PITCH, in mm, and why it is a switch rather than
 	// derived here.
 	//
@@ -1358,6 +1448,18 @@ void FVoxelRasterAtlasCpu::Tick(vxc::ITileSampler& Tiles, int64 AnchorXMm, int64
 	LastAnchorPxX = vxc::floorDiv(AnchorXMm, PixelSizeMm);
 	LastAnchorPxY = vxc::floorDiv(AnchorYMm, PixelSizeMm);
 
+	// THE DEMAND CAP'S TICK BOUNDARY, and a streaming tick is the right unit
+	// because it is the unit the cost came in. The measured hitch is 7-25
+	// chunks declining inside ONE DispatchJobs, and DispatchJobs runs once per
+	// streaming tick immediately after this call -- so resetting here bounds
+	// exactly the batch that produced the 241 ms and lets a page crossing
+	// spread over consecutive ticks instead of landing in one frame. A
+	// per-frame or per-call reset would not: SubmitGpuMeshJob is called many
+	// times inside the batch this is bounding. Also stale-proof: if the
+	// subsystem ever stops calling Tick, the counter simply stops being
+	// refilled and the demand path stops, which fails toward today's behaviour.
+	DemandPagesThisTick = 0;
+
 	// EVERYTHING THE FILL COSTS THE GAME THREAD IS INSIDE THIS BRACKET, and
 	// nothing else is. This is the number the registered disproof is written
 	// against: mode 3 must drive it to ~0 while `asyncPages` proves the work
@@ -1538,15 +1640,54 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	// and the prime probes and nothing else. That is the difference the mode
 	// exists to make, and it must not be confused with the per-page cost on the
 	// second line, which is wherever the sampling ran.
+	//
+	// THE DEMAND-FILL FIELDS, appended before `win=` so the old-leg-grep rule
+	// still holds (`win=` stays last) and every existing grep on served= /
+	// inlineFallback= / fills= still lands unchanged.
+	//
+	// HOW TO READ THEM TOGETHER, because no one of them is a verdict:
+	//   * `inlineFallback` is now the count of chunks that ACTUALLY sampled a
+	//     ~5,800-pixel window inline -- a rescued decline has been taken back
+	//     off it (see PrepareRequest). On a flight leg it must FALL toward 0
+	//     after warmup. Not falling means the demand path is not engaging and
+	//     the leg is NOT MEASURED: it is the control path wearing the fix.
+	//   * `demandRescued` is what it fell BY, and it is the proof of traffic.
+	//     0 across a whole flight leg, with `inlineFallback` still large, is
+	//     the DEAD reading -- and it cannot be confused with the healthy
+	//     steady state, where `inlineFallback` is 0 too and there was simply
+	//     nothing to rescue.
+	//   * `demandMs` is the GAME-THREAD bill this path adds to the submit
+	//     path. It is the number that has to be SMALL where
+	//     `Voxel gpu submit split`'s raster= was 241 ms. Large demandMs with
+	//     inlineFallback falling means the cost was renamed, not removed.
+	//   * `demandRetryFail` must be 0. Non-zero says the fill and the coverage
+	//     check disagree about which pages a window covers.
 	UE_LOG(LogVoxelRasterAtlas, Log,
 	       TEXT("[raster-atlas] window: served=%llu inlineFallback=%llu fills=%llu ")
-	       TEXT("(%.2f MiB, %.1f ms GT) resident=%u/%u pages gpuMiss=%s lifetimeMiss=%llu win=%.2fs"),
+	       TEXT("(%.2f MiB, %.1f ms GT) resident=%u/%u pages gpuMiss=%s lifetimeMiss=%llu ")
+	       TEXT("| demand: calls=%llu rescued=%llu (lifetime %llu) pages=%llu (lifetime %llu) ")
+	       TEXT("capHit=%llu (lifetime %llu) cap=%d/tick %.1f ms GT retryFail=%llu%s win=%.2fs"),
 	       Served, DeclinedCold, PagesFilled,
 	       double(BytesUploaded) / (1024.0 * 1024.0),
 	       MsFromCycles(GtFillCycles),
 	       ResidentPages, PagesDim * PagesDim,
 	       bHaveMiss ? *FString::Printf(TEXT("%u"), Miss.Misses) : TEXT("PENDING"),
-	       GpuMissLifetime, Elapsed);
+	       GpuMissLifetime,
+	       DemandCalls, DemandRescued, DemandRescuedLifetime,
+	       DemandPagesFilled, DemandPagesFilledLifetime,
+	       DemandCapHits, DemandCapHitsLifetime, DemandPagesPerTick(),
+	       MsFromCycles(DemandCycles), DemandRetryFailLifetime,
+	       (DemandRetryFailLifetime > 0)
+	           ? TEXT(" FAIL-RETRY-REFUSED (the window's pages were filled and the coverage ")
+	             TEXT("check still declined -- fill and check disagree; this leg is invalid)")
+	       : (DemandPagesPerTick() == 0)
+	           ? TEXT(" DEMAND-PATH-OFF (control arm: -VoxelGpuRasterAtlasDemandPagesPerTick=0)")
+	       : (DemandCalls == 0 && DeclinedCold > 0)
+	           ? TEXT(" DEAD: chunks took the inline path and the demand path was never called")
+	       : (DemandCalls > 0 && DemandRescued == 0 && DemandPagesFilled > 0)
+	           ? TEXT(" FAIL: pages were filled and NOTHING was rescued")
+	       : TEXT(""),
+	       Elapsed);
 
 	// --- THE BREAKDOWN, with its residual -----------------------------------
 	//
@@ -1692,6 +1833,16 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	AsyncSyncFallbackPages = 0;
 	AsyncDrains = 0;
 	AsyncDrainCycles = 0;
+	// Same split as the async pair above: the WINDOW counts reset, the lifetime
+	// totals beside them do not. `demandRetryFail` is lifetime-ONLY and has no
+	// window twin on purpose -- it is a correctness latch, and a fault that
+	// fired once four windows ago must still be visible on the line the reader
+	// happens to open.
+	DemandCalls = 0;
+	DemandPagesFilled = 0;
+	DemandRescued = 0;
+	DemandCapHits = 0;
+	DemandCycles = 0;
 	PrepareCycles = 0;
 	PrepareCalls = 0;
 	GtFillCycles = 0;
@@ -1709,6 +1860,13 @@ bool FVoxelRasterAtlasCpu::PrepareRequest(FVoxelGpuRegionRequest& Req)
 	const uint64 PrepT0 = FPlatformTime::Cycles64();
 	++PrepareCalls;
 	ON_SCOPE_EXIT { PrepareCycles += FPlatformTime::Cycles64() - PrepT0; };
+
+	// IS THIS THE DEMAND PATH'S RETRY? Taken and cleared here, so exactly one
+	// PrepareRequest can ever be the retry for one FillWindowOnDemand -- the
+	// caller makes them back to back on the same request (SubmitGpuMeshJob),
+	// with nothing in between that could call in again.
+	const bool bDemandRetry = bDemandRetryPending;
+	bDemandRetryPending = false;
 
 	// THE COVERAGE CHECK IS THE WINDOW RULE -- the same call FillRasterWindow
 	// makes, over the same request fields, at the same pitch. Undersizing is
@@ -1750,8 +1908,47 @@ bool FVoxelRasterAtlasCpu::PrepareRequest(FVoxelGpuRegionRequest& Req)
 
 	if (!bCovered)
 	{
+		if (bDemandRetry)
+		{
+			// HARD FAIL, and the one the counter exists for. FillWindowOnDemand
+			// just filled every page CollectMissingWindowPages named for this
+			// exact request, and the walk above -- the same rule, the same
+			// fields, the same pitch -- still found a hole. The two cannot
+			// disagree unless someone gave one of them a second spelling, which
+			// is the D5 drift this class is built to make impossible. Counted
+			// lifetime-only and printed on the window line; it must be 0.
+			++DemandRetryFailLifetime;
+		}
 		++DeclinedCold;
 		return false;
+	}
+
+	if (bDemandRetry)
+	{
+		// THE RESCUE, AND WHY IT DECREMENTS.
+		//
+		// `inlineFallback` (DeclinedCold) is documented -- in this header, in
+		// VoxelWorldSubsystem's call site, and in every leg note written
+		// against it -- as "chunks that took the inline FillRasterWindow path".
+		// Before the demand path a decline and an inline fill were the same
+		// event, so counting the decline was counting the fill. They are no
+		// longer the same event: this chunk declined, was rescued, and is being
+		// SERVED. Leaving the first check's decline on the counter would make
+		// `inlineFallback` unable to fall to 0 even on a perfectly working
+		// build, which would destroy the one reading rule the whole feature is
+		// judged by. So the decline is taken back and the rescue is counted in
+		// its own right, and the two are printed side by side so the trade is
+		// visible rather than inferred.
+		//
+		// `PrepareCalls` is deliberately NOT adjusted: two coverage walks
+		// really did run, and the us/call figure on the prepare line should say
+		// so.
+		if (DeclinedCold > 0)
+		{
+			--DeclinedCold;
+		}
+		++DemandRescued;
+		++DemandRescuedLifetime;
 	}
 
 	Req.bRasterAtlas = true;
@@ -1767,12 +1964,15 @@ bool FVoxelRasterAtlasCpu::PrepareRequest(FVoxelGpuRegionRequest& Req)
 	return true;
 }
 
-void FVoxelRasterAtlasCpu::FillWindowNow(vxc::ITileSampler& Tiles, const FVoxelGpuRegionRequest& Req)
+void FVoxelRasterAtlasCpu::CollectMissingWindowPages(const FVoxelGpuRegionRequest& Req,
+                                                     TArray<FPagePt>& Out) const
 {
-	check(IsInGameThread());
-	check(IsInitialized());
-	// The SAME rule PrepareRequest and FillRasterWindow run -- gate coverage
-	// is derived, never respelled.
+	// The SAME rule PrepareRequest and FillRasterWindow run -- coverage is
+	// derived, never respelled. Lifted out of FillWindowNow's body when the
+	// hot path (FillWindowOnDemand) needed the same page list, precisely so
+	// there would not be two loops to drift apart: if this ever disagreed with
+	// PrepareRequest's walk, the symptom would be `demandRetryFail`, which is
+	// the counter that exists to catch exactly that.
 	const VoxelGpuRegionBuild::FRasterWindowPx W =
 		VoxelGpuRegionBuild::ComputeRasterWindowPx(
 			Req.OriginVx, Req.OriginVy, Req.DispatchColumns, Req.CoarseLevel, PixelSizeMm);
@@ -1784,15 +1984,105 @@ void FVoxelRasterAtlasCpu::FillWindowNow(vxc::ITileSampler& Tiles, const FVoxelG
 		{
 			if (!IsPageResident(Px, Py))
 			{
-				FillPage(Tiles, Px, Py);
+				Out.Add(FPagePt{Px, Py});
 			}
 		}
+	}
+}
+
+void FVoxelRasterAtlasCpu::FillWindowNow(vxc::ITileSampler& Tiles, const FVoxelGpuRegionRequest& Req)
+{
+	check(IsInGameThread());
+	check(IsInitialized());
+	// GATE CONTRACT UNCHANGED: every page of the window, no cap, no budget.
+	// The per-tick cap lives in FillWindowOnDemand and NOT here, because the
+	// verify harness (VoxelGpuVerify.cpp:2026 and :2117 -- until this change,
+	// the only two callers this function had ever had) needs the fixture
+	// COMPLETELY covered before it can assert anything about a tap.
+	DemandPageScratch.Reset();
+	CollectMissingWindowPages(Req, DemandPageScratch);
+	for (const FPagePt& P : DemandPageScratch)
+	{
+		FillPage(Tiles, P.X, P.Y);
 	}
 	if (PendingDelta.PageMeta.Num() > 0)
 	{
 		GpuAtlas.EnqueueUpsert(MoveTemp(PendingDelta));
 		PendingDelta = FVoxelRasterAtlasGpuDelta();
 	}
+}
+
+bool FVoxelRasterAtlasCpu::FillWindowOnDemand(vxc::ITileSampler& Tiles,
+                                              const FVoxelGpuRegionRequest& Req)
+{
+	check(IsInGameThread());
+	check(IsInitialized());
+
+	// The pitch fault disables the atlas for the session and every request must
+	// take the inline path; filling pages we would never serve from would be
+	// pure cost. PrepareRequest refuses first for the same reason.
+	if (bLoggedPitchMismatch || DemandPagesPerTick() <= 0)
+	{
+		return false;
+	}
+
+	++DemandCalls;
+	const uint64 T0 = FPlatformTime::Cycles64();
+	// Counted in the caller's bracket ONLY -- see DemandCycles in the header
+	// for why this is deliberately outside GtFillCycles.
+	ON_SCOPE_EXIT { DemandCycles += FPlatformTime::Cycles64() - T0; };
+
+	DemandPageScratch.Reset();
+	CollectMissingWindowPages(Req, DemandPageScratch);
+	if (DemandPageScratch.Num() == 0)
+	{
+		// The coverage check declined two lines ago over this same rule, so the
+		// only way to get here is that the pages it was missing became resident
+		// in between -- which nothing on the game thread does between those two
+		// calls. Rare by construction, and NOT an error: returning false sends
+		// the chunk to the inline path exactly as today. `demandCalls` moving
+		// while `demandPages` does not is the reading that says this is
+		// happening a lot, and it would mean the two walks disagree.
+		return false;
+	}
+
+	// THE CAP, ALL-OR-NOTHING. See DemandPagesPerTick() above: a partial fill
+	// would leave the window uncovered and the chunk would pay the pages AND
+	// the inline window, which is strictly worse than paying the inline window
+	// alone. The pages are already in the demand queue -- PrepareRequest put
+	// them there when it declined, before this was called -- so refusing here
+	// costs nothing but a tick of latency.
+	const int32 Remaining = DemandPagesPerTick() - DemandPagesThisTick;
+	if (DemandPageScratch.Num() > Remaining)
+	{
+		++DemandCapHits;
+		++DemandCapHitsLifetime;
+		return false;
+	}
+
+	for (const FPagePt& P : DemandPageScratch)
+	{
+		FillPage(Tiles, P.X, P.Y);
+	}
+	DemandPagesThisTick += DemandPageScratch.Num();
+	DemandPagesFilled += uint64(DemandPageScratch.Num());
+	DemandPagesFilledLifetime += uint64(DemandPageScratch.Num());
+
+	// FLUSH NOW, not at the next Tick, and the ordering argument is the one
+	// PrepareRequest's host mirror already rests on: this runs inside
+	// SubmitGpuMeshJob, which FVoxelWorldImpl runs from DispatchJobs BEFORE
+	// GpuMeshJobs->Tick() enqueues any dispatch command. Render commands run in
+	// enqueue order, so the upsert lands on the GPU ahead of every dispatch
+	// this tick admits against the tags it just flipped.
+	if (PendingDelta.PageMeta.Num() > 0)
+	{
+		GpuAtlas.EnqueueUpsert(MoveTemp(PendingDelta));
+		PendingDelta = FVoxelRasterAtlasGpuDelta();
+	}
+
+	// Arms the retry's accounting; the next PrepareRequest takes and clears it.
+	bDemandRetryPending = true;
+	return true;
 }
 
 void FVoxelRasterAtlasCpu::DebugDropPage(int64 PageX, int64 PageY)

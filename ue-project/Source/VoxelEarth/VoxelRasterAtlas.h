@@ -115,6 +115,76 @@ public:
 	// correct in every state.
 	bool PrepareRequest(FVoxelGpuRegionRequest& Req);
 
+	// --- THE PAGE-CROSSING HITCH, AND WHY THE DECLINE PATH IS NOT FREE ------
+	//
+	// MEASURED (Saved/UU-wl16.log, line flight at 23.9 m/s):
+	//
+	//   19:43:11.878  19:43:22.138  19:43:32.338  19:43:42.562
+	//        -> intervals 10.26 / 10.20 / 10.22 s. A METRONOME, not a load spike.
+	//   Hitch frame dispatch: dispatchMs=241.99 = airProofMs=0.04 + bandMs=0.00
+	//                       + submitMs=241.49 + pickMs=0.02 + overlayMs=0.01
+	//                       + other=0.43
+	//   Top submitMs in the leg: 241.49, 231.65, 195.93, 168.07, 164.63 ms.
+	//   `Voxel gpu submit split`'s raster= bucket peaks at 1,148.2 ms, and every
+	//   window with raster > 10 ms carries prevAtlasDeclines of 7-25.
+	//
+	// THE PERIOD IS THIS CLASS'S OWN GEOMETRY. One page is kPagePx x pitch =
+	// 128 x 1.875 m = 240 m of ground. At 23.9 m/s that is 240 / 23.9 = 10.04 s
+	// per page crossing -- the observed 10.2 s, to within the anchor's own
+	// quantisation. The owner sees a quarter-second freeze every ten seconds
+	// and it is the page grid going past.
+	//
+	// WHAT THE TICK ACTUALLY PAYS. PrepareRequest costs ~0.06 us/call, so
+	// essentially all of `raster=` is the INLINE fallback -- and the inline
+	// fallback is per CHUNK, not per page: VoxelGpuRegionBuild::FillRasterWindow
+	// samples ~5,800 pixels x (elevationMm + climate) into a ~46 KB payload that
+	// is uploaded once and discarded, and overlapping chunk windows re-sample
+	// the overlapping pixels every time. When the page column crosses, 7-25
+	// chunks each pay a full window IN ONE TICK. The disc sweep cannot absorb
+	// it: FillBudgetMs() is 2.0 and is tested BEFORE a page, so steady state is
+	// exactly one page per tick against a column that needs many.
+	//
+	// AND A DECLINE COSTS A SECOND TIME, on the GPU side, which nothing on this
+	// line used to say. The worklist claim chain refuses a job whose region is
+	// not atlas-armed -- VoxelGpuMeshJobManager.cpp's
+	// `if (!Job->BrickRegion.bRasterAtlas) { ++WorklistSkipNoAtlas; continue; }`
+	// -- so a declined chunk builds the full classic graph (~19 extra RDG
+	// passes) instead of converting. VERIFIED: the per-window `noAtlas` deltas
+	// match the declines exactly (23,20,7,7 against 23,20,7,7). Halving the
+	// declines therefore buys a render-side saving as well as the game-thread
+	// one, and `noAtlas` is a second, independent witness that this path works.
+	//
+	// THIS FUNCTION IS THE ANSWER, and it is the SAME work by a cheaper unit.
+	// On a decline the caller hands the request back here; this fills the
+	// window's MISSING PAGES into the persistent atlas -- ~1.5 ms/page measured
+	// (`fills=16 (2.00 MiB, 23.9 ms GT)`) -- and the caller then RETRIES
+	// PrepareRequest. The page is shared: the first declining chunk of a
+	// crossing pays for the page and every later chunk whose window touches it
+	// is SERVED for ~0.06 us. Nothing about which pixels exist changes; only
+	// how many times they are sampled, and into what.
+	//
+	// Returns true iff it filled at least one page (so the caller's retry is
+	// worth making). Returns false, having filled nothing, when the window
+	// needs more pages than this tick's remaining cap allows -- see
+	// DemandPagesPerTick() in the .cpp for why the refusal is ALL-OR-NOTHING
+	// rather than partial, and why the cap exists at all.
+	//
+	// THE FAILING READINGS, stated before the leg is run: `inlineFallback` (and
+	// `declines`, and `noAtlas`) NOT falling toward 0 after warmup means this
+	// path is not engaging and the leg is NOT MEASURED -- it is the control
+	// path wearing the fix. That is a different reading from `demandPages=0
+	// demandCapHit=0` with `inlineFallback` ALREADY at 0, which is the healthy
+	// steady state (the sweep got there first and there was nothing to rescue).
+	// `demandRetryFail > 0` is a hard FAIL: every missing page of the window was
+	// just filled and the coverage check still refused, which can only mean the
+	// fill and the check disagree about which pages the window covers.
+	//
+	// Game thread, from SubmitGpuMeshJob, INSIDE the same streaming tick whose
+	// Tick() ran above: the delta it flushes is enqueued before the mesh job
+	// manager's Tick enqueues any dispatch, which is the same ordering argument
+	// PrepareRequest's host mirror already rests on.
+	bool FillWindowOnDemand(vxc::ITileSampler& Tiles, const FVoxelGpuRegionRequest& Req);
+
 	// PIE teardown: enqueues the GPU-side release. Safe to call once, after
 	// the last Tick.
 	void Shutdown();
@@ -315,6 +385,18 @@ private:
 	// mirror. The game-thread path (modes 0-2) and the gate's FillWindowNow.
 	void FillPage(vxc::ITileSampler& Tiles, int64 PageX, int64 PageY);
 
+	// THE WINDOW'S MISSING PAGES, ONE SPELLING. Runs ComputeRasterWindowPx --
+	// the same call PrepareRequest's coverage check and FillRasterWindow make,
+	// over the same request fields -- and appends every page of that window
+	// that is not already resident. FillWindowNow and FillWindowOnDemand both
+	// consume it, so "which pages does this window need" cannot drift between
+	// the gate's fill, the hot path's fill and the check that decides whether
+	// either was enough. That is the D5 rule this whole class is built on, and
+	// the reason the hot path did not get a second page loop of its own.
+	//
+	// Appends; does not reset Out.
+	void CollectMissingWindowPages(const FVoxelGpuRegionRequest& Req, TArray<FPagePt>& Out) const;
+
 	// Appends one page's worth of uninitialised pixels to the pending delta and
 	// returns their base index; its partner writes the page's meta and flips
 	// the mirror. Split so that "a page becomes resident" has ONE spelling
@@ -426,6 +508,88 @@ private:
 	uint64 AsyncPagesHarvested = 0;
 	uint64 AsyncLaunches = 0;
 	uint64 PrimeCalls = 0;
+
+	// --- THE DEMAND-FILL PATH'S TRAFFIC, AND WHY IT IS SIX COUNTERS ---------
+	//
+	// The page-fill call this path rescues with, FillWindowNow, had exactly two
+	// callers before this change -- VoxelGpuVerify.cpp:2026 and :2117, both the
+	// verify harness. It had NEVER run on the hot path, not once, and its
+	// production sibling here is new code on a cold road. A path with that
+	// history does not get to report "zero" without saying WHICH zero, so the
+	// counters below fail apart:
+	//
+	//   demandCalls=0                 -- SubmitGpuMeshJob never reached the
+	//                                    retry. Either no chunk declined this
+	//                                    window (healthy, and inlineFallback=0
+	//                                    beside it says so) or the call site
+	//                                    was not wired (DEAD -- and then
+	//                                    inlineFallback is LARGE beside it,
+	//                                    which is the pair that tells them
+	//                                    apart).
+	//   demandCalls>0 demandPages=0   -- every declining window's pages were
+	//                                    already resident or already in flight.
+	//                                    Possible, and it should be RARE: the
+	//                                    check that declined ran two lines
+	//                                    earlier over the same rule.
+	//   demandRescued                 -- THE HEADLINE. Declines this path
+	//                                    converted into serves. This is the
+	//                                    number that must be > 0 on a page
+	//                                    crossing and that `inlineFallback`
+	//                                    falls BY. demandRescued=0 with
+	//                                    demandPages>0 is its own failure: the
+	//                                    pages were filled and the retry still
+	//                                    did not serve, which is demandRetryFail
+	//                                    below.
+	//   demandCapHit>0                -- the per-tick cap refused a window and
+	//                                    it took the inline path anyway. Some
+	//                                    of these are the design working (a
+	//                                    crossing spread over ticks); a count
+	//                                    that stays high while inlineFallback
+	//                                    stays high means the cap is set below
+	//                                    what ONE window needs and the path can
+	//                                    never engage at all -- raise
+	//                                    -VoxelGpuRasterAtlasDemandPagesPerTick.
+	//   demandRetryFail>0             -- HARD FAIL. Every missing page of the
+	//                                    window was filled and PrepareRequest
+	//                                    still refused. The fill and the
+	//                                    coverage check disagree about the
+	//                                    window; the D5 drift this class exists
+	//                                    to prevent has happened anyway.
+	//   demandMs                      -- the GAME-THREAD bill, on the submit
+	//                                    path. It is NOT inside GtFillCycles
+	//                                    (that bracket is Tick's sweep and only
+	//                                    that), because the whole point of this
+	//                                    change is to move cost out of the
+	//                                    submit path and a number that hides
+	//                                    inside the thing it is replacing
+	//                                    cannot show that. It is the term that
+	//                                    must be SMALL where `raster=` was 241
+	//                                    ms: if demandMs is 241 ms the cost was
+	//                                    renamed, not removed.
+	uint64 DemandCalls = 0;
+	uint64 DemandPagesFilled = 0;
+	uint64 DemandPagesFilledLifetime = 0;
+	uint64 DemandRescued = 0;
+	uint64 DemandRescuedLifetime = 0;
+	uint64 DemandCapHits = 0;
+	uint64 DemandCapHitsLifetime = 0;
+	uint64 DemandRetryFailLifetime = 0;
+	uint64 DemandCycles = 0;
+	// Set by FillWindowOnDemand when it filled at least one page, taken and
+	// cleared by the very next PrepareRequest -- which is the caller's retry,
+	// two lines later in SubmitGpuMeshJob, on the same request. It is what lets
+	// the retry's OUTCOME be counted here rather than at the call site, and it
+	// is why `inlineFallback` keeps meaning "chunks that actually took the
+	// inline path" instead of silently becoming "coverage checks that failed";
+	// see the take-and-clear in PrepareRequest.
+	bool bDemandRetryPending = false;
+	// Pages this streaming tick's demand path has already filled, against
+	// DemandPagesPerTick(). Reset at the top of Tick -- see the reset there for
+	// why a streaming tick is the right unit and not a frame or a call.
+	int32 DemandPagesThisTick = 0;
+	// Reused so the hot path does not allocate per declined chunk. Game thread
+	// only, and never live across a call.
+	TArray<FPagePt> DemandPageScratch;
 
 	// --- PROOF OF TRAFFIC FOR THE SAFETY PATH -------------------------------
 	//

@@ -1069,7 +1069,27 @@ TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxInFlight(
 // old label was false).
 TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeParkBricks(
 	TEXT("voxel.Stream.SpeculativeParkBricks"),
-	0,
+	// DEFAULT 1 AS OF 2026-08-25, MEASURED. Matched flight legs, only this flag
+	// differing, both doubleGrant=0:
+	//
+	//     arm   poolReplaced      parked/adopted   p95     p99     hitch time / count / >=200ms
+	//      0    2877 (13.6%)         0 / 0        18.30   23.00    5580 ms / 48 / 6
+	//      1      82 ( 0.5%)       965 / 935      16.90   21.20    2261 ms / 26 / 2
+	//
+	// One chunk in seven was being fully regenerated over terrain the brick pool
+	// already held -- a wasted submit, shell, graph, claim and delivery each time.
+	// Parking them collapses that to one in two hundred: GPU dispatches over the
+	// leg fall 527,363 -> 480,415 (-9%), total time in hitch frames -59%.
+	//
+	// PROOF OF TRAFFIC, and read BOTH: poolReplaced must collapse AND parked/
+	// adopted must go non-zero. parked=0 while armed is an INERT ARM, not a null
+	// result -- admission is not consulting the park. poolReplaced falling with
+	// parked=0 would mean something else changed and this flag is not why.
+	//
+	// Flight holes are the thing to watch: count 196 -> 223 but mean 49 -> 47 on
+	// the measured pair. Mixed and small, but if a leg ever shows holesFlight
+	// rising with holesFlightMean, that is a real regression and outranks the ms.
+	1,
 	TEXT("1 = under voxel.Terrain.RetireQuads, park speculative GPU results as brick-backed entries so ")
 	TEXT("admission adopts them instead of re-dispatching a job for terrain the brick pool already holds. ")
 	TEXT("0 (default) = drop them exactly as before (counted as dropBrickOnly, not dropEmpty). ")
@@ -1481,6 +1501,38 @@ static int32 ApplyPerTickOverride()
 	{
 		int32 V = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyPerTick="), V);
+
+		// -VoxelApplyCap= IS RETIRED, AND ITS FAILURE IS SILENT BY CONSTRUCTION.
+		//
+		// It used to be parsed by VoxelApplyFast::AppliesOverride
+		// (VoxelApplyBatch.cpp) -- but that function's only caller,
+		// AppliesPerTickCap, had no callers itself, so the value went nowhere.
+		// That whole layer was DELETED on 2026-08-26; see the RETIRED tombstone
+		// at the head of VoxelApplyBatch.h. Nothing parses -VoxelApplyCap= any
+		// more except the warning below, which is the only reason it is still
+		// named in this file at all.
+		// DrainResults reads THIS override. FParse::Value leaves its out-param
+		// untouched on a name mismatch and prints nothing, so a leg passing the
+		// old switch silently kept the shipped 192 ceiling while its own notes
+		// said 1024 or 4096. Three doc leg-tables prescribed it that way until
+		// 2026-08-25.
+		//
+		// This file already names the general shape at the head of the section
+		// ("typo in the raising switch name; FParse leaves the value untouched
+		// and no warning is printed"). A retired switch is that same failure
+		// with a longer half-life, so it gets a warning rather than a comment.
+		int32 Retired = 0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyCap="), Retired))
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("-VoxelApplyCap=%d IS RETIRED AND DID NOTHING. The live switch is ")
+			       TEXT("-VoxelApplyPerTick=N; this leg %s. Re-run it before quoting any ")
+			       TEXT("apply-ceiling number from it."),
+			       Retired,
+			       V > 0 ? TEXT("also passed -VoxelApplyPerTick, which is what took effect")
+			             : TEXT("ran at the SHIPPED ceiling, not the one it asked for"));
+		}
+
 		return V;
 	}();
 	return Value;
