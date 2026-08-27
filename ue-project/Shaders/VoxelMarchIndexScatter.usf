@@ -184,3 +184,375 @@ void VoxelMarchIndexPublishMain(uint3 tid : SV_DispatchThreadID)
 			VOXEL_MARCH_INDEX_RESIDENT_BIT | VOXEL_MARCH_INDEX_ANYSOLID_BIT | Slot;
 	}
 }
+
+// ===========================================================================
+// MAKING kAnySolidBit REAL -- the refine pass and its audit
+// ===========================================================================
+//
+// THE SKIP THIS EXISTS FOR HAS BEEN WRITTEN, DOCUMENTED AND NEVER EXECUTED.
+// VoxelBrickTraverse.ush's VoxelMarchLookupChunk early-outs on
+// VOXEL_MARCH_INDEX_ANYSOLID_BIT with no record fetch at all -- "the cheapest
+// possible skip and it is why the bit rides the index dword instead of the
+// record" -- and its census word (cellIndexEmpty) reads EXACTLY ZERO on every
+// leg ever run, because all four writers of a resident entry hardcode the bit
+// SET. A resident, entirely-air chunk is instead rejected at
+// `LevelAndFlags & 0x10`, AFTER a scattered ~16 B fetch into the ~15.7 MB
+// VoxelBrickChunkTable. Of the lookups that PAY for that fetch, the census
+// measured 35.11% wasted looking down, 69.13% at the horizon and 73.10% at
+// sky.
+//
+// TEMPER THAT NUMBER WHEREVER IT IS QUOTED: 15.7 MB fits this box's 64 MB
+// Infinity Cache and neighbouring rays in a wave probe the SAME chunks, so
+// these are L2 misses that hit MALL, not DRAM. The move to expect is
+// ~0.2-0.4 ms, not anything proportional to 73%.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS RUNS PER POOL SLOT AND NOT PER CHANGED CELL
+// ---------------------------------------------------------------------------
+//
+// Because the answer lives in the RECORD, and the record is addressed by slot.
+// Driving from the record side makes the pass indifferent to which upload path
+// wrote the index -- the full staged upload, the delta pair scatter and the
+// Phase 2 publish all leave the same question, and so does the fallback ladder
+// (seed / first / pending / large / lost) which has no cell list at all. It
+// also makes the pass self-healing: a full upload re-writes bit 30 back to the
+// shadow's hardcoded 1, and this re-derives it in the same graph.
+//
+// AND IT CANNOT OUTRUN THE RECORDS. A record only changes in a flush; every
+// flush writes the index; this pass runs only where the index was written; and
+// the pool issues its record writes BEFORE the index sink on both producers
+// (the CPU arm's RECORDS-LAST bucket order, and the GPU shell's "the index
+// learns about the chunk on the next Flush, which runs after the caller has
+// enqueued the graph that writes the record"). So the record read here is
+// never older than the entry being refined. The reverse staleness -- a record
+// newer than the bit -- cannot delete ground either, because every producer of
+// a record is also a producer of an index add, and an index add writes bit 30
+// back to 1.
+//
+// ---------------------------------------------------------------------------
+// THE DIRECTION OF SAFETY. THIS IS THE WHOLE JOB.
+// ---------------------------------------------------------------------------
+//
+//     bit says SOLID, chunk is air  -> lose the saving, stay correct.  SAFE.
+//     bit says AIR, chunk has solid -> the marcher skips real ground.  A HOLE.
+//
+// EVERY EARLY RETURN BELOW LEAVES THE BIT SET. There is no downstream net to
+// fall into: the marcher's anySolid early-out returns BEFORE the record fetch,
+// and its own comment says "The record is never validated on this path", so
+// the RecOrigin/level check that turns every OTHER stale-index failure into a
+// harmless miss is bypassed entirely. The proof has to be complete HERE.
+//
+// The refusals, in the order the kernel takes them:
+//
+//   * THE STRIDE. The same cross-check the marcher runs. A stride that moved
+//     on one side only reads a NEIGHBOURING record's fields, and enough of
+//     them survive an origin validation to look like an answer.
+//   * A ZEROED RECORD VALIDATES AS AIR AT CHUNK (0,0,0) LEVEL 0. Both free
+//     passes zero a retired record; RecOrigin == (0,0,0) then matches
+//     WantOrigin at that chunk, LevelAndFlags == 0 matches level 0, and
+//     anySolid is clear. A live instance of absence-reads-as-air, sitting
+//     directly on this path. Refused on (dw0|dw1|dw2|dw3) == 0.
+//   * AN ORIGIN THAT IS NOT A CHUNK ORIGIN. WantOrigin is ChunkCoord * 32, so
+//     the inverse is defined only for a multiple of 32.
+//   * A LEVEL THAT MAPS TO NO GRID SLOT. The grid slot is derived FROM THE
+//     RECORD's level and the WHOLE computed cell must equal the cell being
+//     refined -- which is what stops a level-1 record clearing a level-0 cell
+//     at the same wrapped coordinate.
+//   * A SELF-INCONSISTENT RECORD. anySolid is derived by the record's OWN
+//     writers from the 64-bit L1 brick mask (poolAllocLevelAndFlags:
+//     (MaskLo|MaskHi) != 0; BuildChunkRecord carries P->BrickSolid beside
+//     P->bAnySolid), so "flag says air" over a NON-empty mask is a
+//     contradiction the storage cannot legitimately produce. Both must agree.
+//     This is the one test that does not read dword 3, so a shared misread of
+//     the flags field cannot pass it -- and it is free: the record is 16
+//     dwords, 64 B, ONE cache line, and dwords 5-6 are already in it.
+//
+// AND THE SHORTCUT THAT IS EXACTLY INVERTED: OccWords == 0 IS NOT PROOF OF
+// AIR. 64 uniform-SOLID bricks also have zero occupancy words. Nothing here
+// reads OccWords.
+//
+// THE COMPARE-AND-SWAP is not decoration either. The clear is committed only
+// if the cell still holds the exact dword the proof was made against, so an
+// entry rewritten between the read and the write -- by anything, in any order
+// -- abandons the clear and keeps the bit SET. "The cell changed under me" and
+// "the chunk is solid" therefore reach the same safe outcome.
+//
+// ---------------------------------------------------------------------------
+// MODE 1: THE AUDIT, AND IT IS THE GATE THAT MUST BE ABLE TO FAIL
+// ---------------------------------------------------------------------------
+//
+// Same walk, no writes: it counts identity-matched cells whose record says
+// SOLID (the denominator -- a zero there is an audit that did not run, never a
+// clean one) and, of those, how many have bit 30 CLEAR. That second number is
+// the hole count, and it is checked over EVERY resident chunk rather than only
+// the ones rays happened to touch. The C++ side schedules it LAST in the graph
+// -- after the index write and after the refine pass -- so it reads exactly the
+// state every march pass from there until the next flush consumes. Scheduling
+// it FIRST would be a test that cannot fail: on the full-upload path the buffer
+// is created in that graph with every anySolid bit already set.
+//
+// It treats a chunk as SOLID if EITHER the flag or the L1 mask says so -- the
+// opposite bias from the refine arm's "both must agree", and deliberately: a
+// detector should over-report the thing it is looking for and a writer should
+// under-commit. The two biases together mean no chunk can be both cleared by
+// one arm and ignored by the other.
+//
+// voxel.March.IndexAnySolidPoison forces the refine arm to clear on
+// identity-match ALONE, including proven-solid chunks. That is a deliberate
+// corruption whose only purpose is to make this counter fire; a green audit
+// after an unpoisoned leg means nothing until a poisoned one has come out
+// non-zero.
+
+#ifndef VOXEL_MARCH_INDEX_REFINE_RECORD_DWORDS
+#define VOXEL_MARCH_INDEX_REFINE_RECORD_DWORDS 16u
+#endif
+#ifndef VOXEL_REFINE_STAT_WORDS
+#define VOXEL_REFINE_STAT_WORDS 13
+#endif
+#ifndef VOXEL_REFINE_GROUP_SIZE
+#define VOXEL_REFINE_GROUP_SIZE 64
+#endif
+
+// The record's own fields, named rather than spelled as literals at the use
+// site. Mirrors VoxelBrickPool.h's layout table ([3] LevelAndFlags: [0:3] ring
+// level, [4] anySolid, [5] allSolid) and VoxelBrickTraverse.ush's reader.
+#define VOXEL_REFINE_REC_LEVEL_MASK 0xFu
+#define VOXEL_REFINE_REC_ANYSOLID   0x10u
+
+// The pool bindings, by the SAME names VOXEL_BRICK_POOL_PARAMETERS() declares
+// and FVoxelBrickPool::BindShaderParameters fills, so this kernel reads the
+// chunk table through the marcher's own filler rather than a second one. Only
+// the three the walk needs are declared; the rest of the macro's members go
+// unbound, which is what the macro is for.
+StructuredBuffer<uint> VoxelBrickChunkTable;
+uint VoxelBrickChunkSlots;
+uint VoxelBrickChunkRecordDwords;
+
+// TWO 12-dword blocks, refine first and audit second. Cleared by the host
+// before either pass; see the C++ note on why an uncleared UAV here would
+// report a wrongClear nobody committed.
+RWBuffer<uint> MarchIndexRefineStats;
+// Where THIS dispatch's block starts. Both arms can be armed on the same leg
+// -- that is the only combination in which the audit is judging the refine --
+// and both write the word named Cleared: the refine's "bits I cleared" and the
+// audit's "bits that are WRONGLY clear". One block each is what stops a hole
+// count being added to a saving and the sum being reported as either.
+uint  MarchIndexRefineStatBase;
+// The grid shape, the same values the marcher and the publish kernel bind.
+uint3 MarchIndexRefineDimChunks;
+uint  MarchIndexRefineCellsPerLevel;
+uint  MarchIndexRefineCellCount;
+// GridSlotForLevel's two halves, bound rather than spelled a second time here.
+uint  MarchIndexRefineRingGrids;
+uint  MarchIndexRefineCoverLevel;
+uint  MarchIndexRefineCoverGridSlot;
+// 0 = refine (clear on proof), 1 = audit (count, write nothing).
+uint  MarchIndexRefineMode;
+// 1 = the red arm; see the poison note above.
+uint  MarchIndexRefinePoison;
+
+// PER-GROUP FIRST, GLOBAL ONCE. Hundreds of thousands of threads each
+// hammering twelve global addresses would make the instrument cost more than
+// the pass it measures, and `NoMatch` alone is most of the dispatch. LDS
+// atomics collapse a group to one global add per word.
+groupshared uint GRefineTally[VOXEL_REFINE_STAT_WORDS];
+
+void RefineTally(uint Word)
+{
+	InterlockedAdd(GRefineTally[Word], 1u);
+}
+
+// FVoxelMarchChunkIndex::GridSlotForLevel, mirrored. The cover level is 7 and
+// the grid carries eight sub-grids with cover LAST, so this is a mapping and
+// not an identity; a level it cannot name returns false and the caller
+// refuses.
+bool VoxelMarchRefineGridSlot(uint Level, out uint OutGridSlot)
+{
+	OutGridSlot = 0u;
+	if (Level < MarchIndexRefineRingGrids)
+	{
+		OutGridSlot = Level;
+		return true;
+	}
+	if (Level == MarchIndexRefineCoverLevel)
+	{
+		OutGridSlot = MarchIndexRefineCoverGridSlot;
+		return true;
+	}
+	return false;
+}
+
+[numthreads(VOXEL_REFINE_GROUP_SIZE, 1, 1)]
+void VoxelMarchIndexRefineMain(uint3 tid : SV_DispatchThreadID, uint LocalId : SV_GroupIndex)
+{
+	if (LocalId < uint(VOXEL_REFINE_STAT_WORDS))
+	{
+		GRefineTally[LocalId] = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// EVERY EXIT BELOW GOES TO THE FLUSH AT THE BOTTOM, not to a bare `return`.
+	// A group whose threads returned early would leave its tally unflushed and
+	// the census would under-report by however many groups that was -- the
+	// silent-partial-instrument failure this project has retracted readings
+	// over. One structured path out.
+	const uint Slot = tid.x;
+	if (Slot < VoxelBrickChunkSlots)
+	{
+		// THE STRIDE CROSS-CHECK, first and for the marcher's reason. Also
+		// catches the unbound-uniform case: an unbound loose uint reads 0,
+		// which cannot equal the compiled constant, so a forgotten binding
+		// refuses everything instead of collapsing every record onto slot 0.
+		if (VoxelBrickChunkRecordDwords != VOXEL_MARCH_INDEX_REFINE_RECORD_DWORDS)
+		{
+			RefineTally(VOXEL_REFINE_STAT_BAD_STRIDE);
+		}
+		else
+		{
+			const uint Base = Slot * VOXEL_MARCH_INDEX_REFINE_RECORD_DWORDS;
+			const uint d0 = VoxelBrickChunkTable[Base + 0u];
+			const uint d1 = VoxelBrickChunkTable[Base + 1u];
+			const uint d2 = VoxelBrickChunkTable[Base + 2u];
+			const uint d3 = VoxelBrickChunkTable[Base + 3u];
+			// dwords 5-6: the 64-bit L1 brick mask. SAME CACHE LINE as the four
+			// above (the record is 16 dwords = 64 B), so the independent
+			// consistency check below costs no extra memory traffic.
+			const uint d5 = VoxelBrickChunkTable[Base + 5u];
+			const uint d6 = VoxelBrickChunkTable[Base + 6u];
+
+			RefineTally(VOXEL_REFINE_STAT_EXAMINED);
+
+			// A ZEROED RECORD VALIDATES AS AIR AT CHUNK (0,0,0) LEVEL 0.
+			if ((d0 | d1 | d2 | d3) == 0u)
+			{
+				RefineTally(VOXEL_REFINE_STAT_ZERO_RECORD);
+			}
+			else
+			{
+				const int3 RecOrigin = int3(asint(d0), asint(d1), asint(d2));
+				const uint RecLevel = d3 & VOXEL_REFINE_REC_LEVEL_MASK;
+				uint GridSlot = 0u;
+				// WantOrigin is ChunkCoord * 32, so the inverse exists only for
+				// a multiple of 32. Two's complement makes the mask correct for
+				// negative coordinates and the arithmetic shift below the exact
+				// inverse of the multiply.
+				if (any((RecOrigin & 31) != 0))
+				{
+					RefineTally(VOXEL_REFINE_STAT_BAD_ORIGIN);
+				}
+				else if (!VoxelMarchRefineGridSlot(RecLevel, GridSlot))
+				{
+					RefineTally(VOXEL_REFINE_STAT_BAD_LEVEL);
+				}
+				else
+				{
+					// THE MARCHER'S OWN WRAP, from the shared include, with the
+					// grid slot derived FROM THE RECORD. Requiring the whole
+					// computed cell to match is what makes a wrong-level or
+					// aliased record a refusal rather than a clear.
+					const uint Cell = VoxelMarchIndexCellCompute(
+						RecOrigin >> 5, MarchIndexRefineDimChunks,
+						MarchIndexRefineCellsPerLevel, GridSlot);
+					if (Cell >= MarchIndexRefineCellCount)
+					{
+						RefineTally(VOXEL_REFINE_STAT_BAD_CELL);
+					}
+					else
+					{
+						const uint Entry = MarchChunkIndexRW[Cell];
+						const bool bMatches =
+							(Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u &&
+							(Entry & VOXEL_MARCH_INDEX_SLOT_MASK) == Slot;
+						if (!bMatches)
+						{
+							// The cell is not resident, or it names another
+							// slot. This record is not the tenant of the cell
+							// its coordinate maps to -- ordinary once the torus
+							// has moved, and never a licence to write.
+							RefineTally(VOXEL_REFINE_STAT_NOMATCH);
+						}
+						else if (MarchIndexRefineMode != 0u)
+						{
+							// ---- THE AUDIT -------------------------------
+							// Biased to OVER-report solidity: either witness is
+							// enough. A detector that under-reports the thing
+							// it hunts is not a detector.
+							const bool bSolid =
+								((d3 & VOXEL_REFINE_REC_ANYSOLID) != 0u) || ((d5 | d6) != 0u);
+							if (bSolid)
+							{
+								// THE DENOMINATOR, in its OWN word. It used to
+								// reuse EXAMINED, which the shared prologue
+								// already increments for every slot -- so
+								// "checked" came out as slots + solid chunks
+								// and read 18x too large. The red leg caught
+								// it by checked exceeding
+								// dispatches x ChunkCapacity.
+								RefineTally(VOXEL_REFINE_STAT_AUDIT_SOLID);
+								if ((Entry & VOXEL_MARCH_INDEX_ANYSOLID_BIT) == 0u)
+								{
+									// A HOLE. The record proves solid content
+									// and the index tells the marcher to skip
+									// the chunk without ever fetching it.
+									RefineTally(VOXEL_REFINE_STAT_CLEARED);
+								}
+							}
+						}
+						else
+						{
+							// ---- THE REFINE ------------------------------
+							// Biased to UNDER-commit: BOTH witnesses must say
+							// air. Poison drops the requirement entirely, which
+							// is the corruption the audit has to catch.
+							const bool bProvenAir =
+								((d3 & VOXEL_REFINE_REC_ANYSOLID) == 0u) && ((d5 | d6) == 0u);
+							const bool bWantClear =
+								(MarchIndexRefinePoison != 0u) ? true : bProvenAir;
+							if (!bWantClear)
+							{
+								// Solid, or a record that disagrees with
+								// itself. Both leave the bit SET; they are
+								// counted apart so a contradiction cannot hide
+								// inside the ordinary case.
+								const bool bInconsistent =
+									(d3 & VOXEL_REFINE_REC_ANYSOLID) == 0u;
+								RefineTally(bInconsistent
+									? VOXEL_REFINE_STAT_INCONSISTENT
+									: VOXEL_REFINE_STAT_LEFT_SOLID);
+							}
+							else if ((Entry & VOXEL_MARCH_INDEX_ANYSOLID_BIT) == 0u)
+							{
+								// Already refined this flush, or by an earlier
+								// one that nothing has overwritten since.
+								RefineTally(VOXEL_REFINE_STAT_ALREADY_CLEAR);
+							}
+							else
+							{
+								// THE CLEAR, COMMITTED ONLY AGAINST THE EXACT
+								// DWORD THE PROOF WAS MADE ABOUT.
+								uint Prev = 0u;
+								InterlockedCompareExchange(
+									MarchChunkIndexRW[Cell], Entry,
+									Entry & ~VOXEL_MARCH_INDEX_ANYSOLID_BIT, Prev);
+								RefineTally((Prev == Entry)
+									? VOXEL_REFINE_STAT_CLEARED
+									: VOXEL_REFINE_STAT_CAS_LOST);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// ONE GLOBAL ADD PER WORD PER GROUP, and it runs for every group including
+	// the ones whose threads all fell out at the slot bound -- an unconditional
+	// flush is the only arrangement in which "this group counted nothing" and
+	// "this group never reported" cannot be spelled the same way.
+	GroupMemoryBarrierWithGroupSync();
+	if (LocalId < uint(VOXEL_REFINE_STAT_WORDS) && GRefineTally[LocalId] != 0u)
+	{
+		InterlockedAdd(MarchIndexRefineStats[MarchIndexRefineStatBase + LocalId],
+		               GRefineTally[LocalId]);
+	}
+}

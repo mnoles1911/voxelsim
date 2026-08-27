@@ -40,6 +40,28 @@
 #define VOXEL_MARCH_INDEX_ANYSOLID_BIT 0x40000000u
 #define VOXEL_MARCH_INDEX_SLOT_MASK    0x3FFFFFFFu
 
+// BIT 30 IS GPU-OWNED SINCE 2026-08-27; BIT 31 AND BITS 0..29 ARE NOT.
+//
+// Every writer of a RESIDENT entry -- FVoxelMarchChunkIndex::Seed, its
+// ApplyDelta add loop, and the publish kernel's addition arm below -- still
+// composes the bit as a hardcoded 1, and must keep doing so: the CPU cannot
+// answer the solidity question at all on the default producer (the GPU shell
+// allocator queues its index add before the record has been computed), so 1 is
+// both the safe value and the only honest one it can write.
+//
+// The bit is made REAL afterwards, by VoxelMarchIndexRefineMain in
+// VoxelMarchIndexScatter.usf, which re-reads the record that is in the slot NOW
+// and CLEARS bit 30 by compare-and-swap only on positive proof of air. So the
+// CPU shadow and the GPU buffer legitimately differ in exactly this bit --
+// which is why both sides of the delta-verify FNV mask it out
+// (FVoxelMarchChunkIndex::HashableCell) and why the refine kernel carries its
+// own audit arm instead.
+//
+// THE ASYMMETRY THAT GOVERNS EVERY EDIT TO THIS BIT:
+//     bit says SOLID, chunk is air  -> lose a saving, stay correct.
+//     bit says AIR, chunk has solid -> the marcher skips real ground. A HOLE.
+// Anything uncertain writes 1.
+
 // ---------------------------------------------------------------------------
 // THE ABSENT-CELL ANNOTATION (voxel.March.HoleStats 2) -- why a chunk is gone
 // ---------------------------------------------------------------------------

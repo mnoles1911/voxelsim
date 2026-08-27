@@ -340,6 +340,99 @@ public:
 	static constexpr uint32 kAnySolidBit = 0x40000000u;
 	static constexpr uint32 kSlotMask    = 0x3FFFFFFFu;
 
+	// ---- THE CPU SHADOW DOES NOT OWN kAnySolidBit ANY MORE -----------------
+	//
+	// Every CPU writer of a resident entry still sets kAnySolidBit
+	// UNCONDITIONALLY (Seed and ApplyDelta's add loop, and the GPU publish
+	// kernel's addition arm), and that is deliberate rather than left over:
+	// the CPU CANNOT ANSWER THE QUESTION. Under voxel.GPU.PoolAlloc (default
+	// on) the live producer is FVoxelBrickPool::AllocateGpuChunkShell, which
+	// queues its index add BEFORE the record has been computed at all;
+	// FResidentChunk, FVoxelBrickIndexEntry and FVoxelGpuBrickPayload carry no
+	// solidity field, and the only structure that does -- FVoxelBrickCpuPack::
+	// bAnySolid -- belongs to the fallback producer that is not running. A
+	// "solidity flag in the snapshot" would therefore light up only the
+	// producer nobody uses.
+	//
+	// So the truth lives on the GPU, in the record, and the bit is made real
+	// THERE: VoxelMarchIndexRefineMain (VoxelMarchIndexScatter.usf) re-reads
+	// the record that is in the slot NOW, re-runs the marcher's own
+	// origin-and-level validation against it, and CLEARS bit 30 by CAS only
+	// after positive proof of air. Every early return in that kernel leaves
+	// the bit SET, because the two error directions are not symmetric:
+	//
+	//     bit says SOLID, chunk is air  -> lose the saving, stay correct.
+	//     bit says AIR, chunk has solid -> the marcher skips real ground.
+	//
+	// WHICH IS WHY THE HASHES BELOW MASK IT. The CPU shadow keeps its
+	// hardcoded 1 while the GPU buffer holds the refined 0, so Cells[] and the
+	// GPU buffer legitimately differ in exactly this bit and
+	// voxel.March.IndexDeltaVerify would fail on every sample. Both sides of
+	// that comparison hash through HashableCell(), which drops bit 30 --
+	// the same "an instrument must not indict a change it was not asked
+	// about" move AreAbsentMarksArmed() already makes for the absent
+	// annotation. The verify still covers residency, slot and every absent
+	// bit; it stops covering the ONE bit the GPU is now authoritative for,
+	// which the refine kernel's own audit arm covers instead.
+	static constexpr uint32 kHashCellMask = ~kAnySolidBit;
+	static uint32 HashableCell(uint32 CellValue) { return CellValue & kHashCellMask; }
+
+	// ---- the refine/audit kernel's stats buffer -----------------------------
+	//
+	// PUBLIC because the kernel's ModifyCompilationEnvironment pushes these
+	// offsets as shader defines, which is the only arrangement in which the
+	// CPU reader and the GPU writer cannot drift -- the same reason the
+	// hole-stats census pushes VoxelMarchHoleWord rather than hand-mirroring
+	// it. Order IS the buffer layout: appending a word is safe, reordering is
+	// a silent misread of a plausible number out of the wrong slot.
+	//
+	// UNDER THE AUDIT MODE the kernel writes the SAME layout into the second
+	// block (kRefineStatBaseAudit) and two of the words carry a different
+	// reading: Examined becomes "resident, identity-matched, record says
+	// SOLID" (the denominator that must be non-zero for a pass to mean
+	// anything) and Cleared becomes "and its index bit 30 was CLEAR" -- the
+	// hole count. GetUploadStats() folds them into AuditChecked /
+	// AuditWrongClear so no caller has to carry that knowledge.
+	static constexpr int32 kRefineStatWords = 13;
+	enum ERefineStatWord : int32
+	{
+		RefineStat_Examined = 0,
+		RefineStat_NoMatch,
+		RefineStat_RefusedZeroRecord,
+		RefineStat_RefusedOrigin,
+		RefineStat_RefusedLevel,
+		RefineStat_RefusedCell,
+		RefineStat_RefusedStride,
+		RefineStat_RefusedInconsistent,
+		RefineStat_Cleared,
+		RefineStat_CasLost,
+		RefineStat_LeftSolid,
+		RefineStat_AlreadyClear,
+		// THE AUDIT'S OWN DENOMINATOR, and it is a separate word because it
+		// started life sharing Examined and that was a counter-name lie.
+		// The shared prologue increments Examined for EVERY slot, so an audit
+		// that also used it for "identity-matched chunks the record proves
+		// solid" reported checked = slots + solid chunks -- 87,283,419 where
+		// the real denominator was 4,708,059, an 18x inflation that would have
+		// made a clean wrongClear=0 look far stronger than it was. Caught on
+		// the 2026-08-27 red leg only because checked EXCEEDED
+		// dispatches x ChunkCapacity, which is impossible for one thread per
+		// slot counting once.
+		RefineStat_AuditSolid,
+	};
+	static_assert(int32(RefineStat_AuditSolid) + 1 == kRefineStatWords,
+	              "the refine stats readback is sized by the enum; the kernel indexes the "
+	              "same offsets and a short buffer reads another allocation's dwords.");
+	// TWO BLOCKS IN ONE BUFFER, refine at 0 and audit at kRefineStatWords, and
+	// that separation is not tidiness. Both arms can be armed on the same leg
+	// (that is the ONLY combination in which the audit is judging the refine),
+	// and both write the word named Cleared -- the refine's "bits I cleared"
+	// and the audit's "bits that are wrongly clear". Sharing one block would
+	// add a prize to an alarm and report the sum as either.
+	static constexpr int32 kRefineStatBufferWords = kRefineStatWords * 2;
+	static constexpr int32 kRefineStatBaseRefine = 0;
+	static constexpr int32 kRefineStatBaseAudit = kRefineStatWords;
+
 	// ---- THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip) ----------------
 	//
 	// ONE LEVEL ABOVE THE CHUNK INDEX AND EXACTLY ONE. The index is 99.7%
@@ -367,23 +460,37 @@ public:
 	// is skipping, and it READS that rather than deriving it -- see the shader's
 	// use of MarchBlockAnyAbsent.
 	//
-	// WHAT THE TWO BITS CAN AND CANNOT SAY TODAY, stated here because the
-	// difference is invisible from the names. kAnySolidBit above is a HARDCODED
-	// 1 at all three writers (this class's admission and Seed paths, and
-	// VoxelMarchIndexScatter.usf) and therefore carries no information, so the
-	// index publish knows RESIDENCY and nothing else. Both bits are consequently
-	// derived from ONE count -- resident cells in the block -- as
+	// WHAT THE TWO BITS CAN AND CANNOT SAY, stated here because the difference
+	// is invisible from the names. Both are derived from ONE count -- resident
+	// cells in the block -- as
 	//     Occupied  = (ResidentCount >  0)
 	//     AnyAbsent = (ResidentCount < 64)
 	// which makes the state (Occupied 0, AnyAbsent 0) -- "all 64 chunks resident
-	// and every one of them genuinely empty air" -- UNREACHABLE until a real
-	// solidity signal exists. That is not a defect and it costs no correctness:
-	// a block holding ANY resident chunk reads Occupied and is descended into
-	// chunk by chunk exactly as today, so resident-empty chunks are still walked
-	// individually and still do not set the flag. The second buffer is kept
-	// rather than folded into !Occupied precisely so that the day a solidity bit
-	// becomes real, the flag decision is a READ and not a derivation that has
-	// silently detached from what it claims to describe.
+	// and every one of them genuinely empty air" -- UNREACHABLE. That is not a
+	// defect and it costs no correctness: a block holding ANY resident chunk
+	// reads Occupied and is descended into chunk by chunk, so resident-empty
+	// chunks are still walked individually and still do not set the flag.
+	//
+	// AND IT STAYS A DERIVATION EVEN NOW THAT kAnySolidBit IS REAL, which is a
+	// deliberate decision and not an oversight. This paragraph used to say the
+	// state was unreachable "until a real solidity signal exists" and that the
+	// second buffer was kept so the flag could become a READ on the day one
+	// did. That day is voxel.March.IndexAnySolid (2026-08-27) -- the GPU refine
+	// pass clears bit 30 on proof of air -- and the derivation is STILL right,
+	// because these counts live on the GAME THREAD and the solidity now lives
+	// on the GPU. Wiring the block bits to the refined value would mean
+	// reading a GPU-owned bit back to the CPU once per flush, which is the
+	// per-chunk readback direct-to-pool exists to have removed.
+	//
+	// The two levels stay independent and both stay safe: the block level is
+	// derived from residency and over-reports Occupied (costing a descent), and
+	// the chunk level then rejects the air chunks on the index dword the
+	// descent already loaded. Over-reporting at the coarse level and proving at
+	// the fine one is the same direction of safety the refine kernel itself
+	// runs on. The second buffer is still kept rather than folded into
+	// !Occupied, for the reason it always was: a derivation that has silently
+	// detached from what it claims to describe is the failure this file keeps
+	// paying for.
 	//
 	// 4x4x4 BLOCKS OF THE EXISTING GRID. 32,768 blocks per slot x 8 slots =
 	// 262,144 blocks = 32 KiB per bitfield, against the 64 MiB it bounds.
@@ -855,6 +962,71 @@ public:
 		// is forced full to heal, and FullBecauseLost counts that healing.
 		uint32 GpuLostNoBuffer = 0;
 		uint32 FullBecauseLost = 0;
+
+		// ---- THE anySolid REFINE PASS (voxel.March.IndexAnySolid) -----------
+		//
+		// READ THE ++ SITE, NOT THE NAME -- these are folded from the kernel's
+		// own stats buffer (VoxelMarchIndexRefineMain), one readback per
+		// sampled dispatch, and each word is written at exactly one place in
+		// that kernel.
+		//
+		// RefineDispatches is the ARM'S PROOF OF LIFE. Zero here with the cvar
+		// on is "the pass never ran", which must never be read as "nothing to
+		// clear". RefineStatsSamples is how many of those dispatches got a
+		// readback slot; a window with dispatches>0 and samples==0 measured
+		// nothing and its Cleared/WrongClear are NOT zeros, they are absences.
+		uint64 RefineDispatches = 0;
+		uint64 RefineStatsSamples = 0;
+		// Slots the kernel looked at (the denominator), and the outcomes.
+		// Examined counts every thread that got as far as reading a record;
+		// Cleared is the prize. Refused is every conservative bail added
+		// together -- a zeroed record, a mis-aligned origin, a level that maps
+		// to no grid slot, a cell out of range, a stride cross-check failure,
+		// and the record self-inconsistency check (anySolid clear over a
+		// NON-empty L1 brick mask). Every one of them leaves bit 30 SET.
+		uint64 RefineExamined = 0;
+		uint64 RefineCleared = 0;
+		uint64 RefineRefused = 0;
+		// Identity did not match: the cell is not resident, or it names some
+		// other slot. Ordinary and large -- most pool slots are not the tenant
+		// of the cell their record's coordinate maps to once the torus has
+		// moved -- and separated from Refused so a genuine refusal cannot hide
+		// inside it.
+		uint64 RefineNoMatch = 0;
+		// The compare-and-swap lost: the cell changed between the read and the
+		// write, so the clear was ABANDONED and the bit stayed set. Safe by
+		// construction; counted because a large number would mean the pass is
+		// racing something it should not be.
+		uint64 RefineCasLost = 0;
+		// The chunk was proved solid, so the bit was left alone. Examined ==
+		// NoMatch + Refused + Cleared + CasLost + LeftSolid + AlreadyClear is
+		// the identity that says the partition is complete.
+		uint64 RefineLeftSolid = 0;
+		uint64 RefineAlreadyClear = 0;
+
+		// ---- THE AUDIT ARM (voxel.March.IndexAnySolidAudit) -----------------
+		//
+		// THE RED GATE, and it runs LAST in the graph -- after the index write
+		// and after the refine pass -- because that is the state every march
+		// pass from there until the next flush actually consumes. Auditing
+		// ahead of the refine would be a test that cannot fail: on the
+		// full-upload path the buffer is created in that graph with every
+		// entry carrying the shadow's hardcoded 1.
+		//
+		// AuditChecked is resident, identity-matched cells whose record says
+		// SOLID: the population that MUST have bit 30 set. It is the
+		// denominator and it must be non-zero for AuditWrongClear=0 to mean
+		// anything at all; a zero here is an audit that did not run, which is
+		// exactly the confirmation-that-cannot-fail this project keeps paying
+		// for.
+		//
+		// AuditWrongClear is the hole counter: a chunk the record proves has
+		// solid content whose index entry says AIR. ANY non-zero value means
+		// the marcher is skipping real ground, and it outranks every
+		// performance number on the leg. voxel.March.IndexAnySolidPoison is
+		// the arm that proves this counter CAN fire.
+		uint64 AuditChecked = 0;
+		uint64 AuditWrongClear = 0;
 	};
 	// Snapshot by value. Verify counters are written on the render thread and
 	// the rest on the game thread; reads are diagnostic and a one-frame-stale
@@ -1259,6 +1431,48 @@ private:
 	};
 	static constexpr int32 kVerifySlots = 2;
 	FVerifySlot VerifySlots[kVerifySlots];
+
+	// ---- the anySolid refine pass's own readback ---------------------------
+	//
+	// THE SAME RING SHAPE AS FVerifySlot ABOVE, and for the same reason: a
+	// single readback re-armed before its fence retired is what crashed the
+	// D3D12 command list manager here once already ("The fence for the current
+	// GPU node has already been issued"). Arm a FREE slot or skip; never poll
+	// a slot in the frame that armed it.
+	//
+	// Cheap where the verify ring is not: the payload is kRefineStatWords
+	// dwords, not 56 MiB, so four slots cost nothing and the sampling rate can
+	// follow the flush rate instead of trailing it.
+	//
+	// The AUDIT arm reuses the same buffer and the same readback, writing into
+	// the two words the refine arm leaves alone: Examined becomes "resident,
+	// identity-matched, record says SOLID" (the denominator) and Cleared
+	// becomes "and its index bit 30 was CLEAR" (the hole count). Sharing the
+	// buffer keeps one readback path rather than two; the mode uniform is what
+	// says which reading applies, and GetUploadStats() folds them into
+	// AuditChecked / AuditWrongClear so no caller has to know.
+	struct FRefineStatsSlot
+	{
+		TUniquePtr<FRHIGPUBufferReadback> Readback;
+		bool bInFlight = false;
+		uint32 ArmedFrame = 0;
+	};
+	static constexpr int32 kRefineStatsSlots = 4;
+	FRefineStatsSlot RefineStatsSlots[kRefineStatsSlots];
+
+	// Adds the refine pass (if armed) and then the audit pass (if armed) for
+	// an index buffer THIS GRAPH HAS JUST WRITTEN. Render thread only.
+	// Refine before audit: the audit must judge the state the marcher will
+	// read, and on the full-upload path anything ahead of the refine is
+	// looking at a buffer that was created with every anySolid bit set.
+	//
+	// CALLED ONLY WHERE THE INDEX WAS WRITTEN -- the full upload, the delta
+	// scatter, the GPU publish -- and never on the frames that merely
+	// re-register the persistent buffer. That is not a saving, it is the
+	// correctness condition: the refine pass reads records, and a record can
+	// only have changed in a flush, and a flush always writes the index.
+	void AddAnySolidPasses(FRDGBuilder& GraphBuilder, FRDGBufferRef IndexBuffer);
+	void PollRefineStats();
 
 	// ---- Phase 2: GPU-written residency (voxel.March.IndexGpuResident) ------
 	//

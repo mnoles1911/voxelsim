@@ -223,6 +223,177 @@ namespace
 		     "GetUploadStats()."),
 		ECVF_RenderThreadSafe);
 
+	// =======================================================================
+	// MAKING kAnySolidBit REAL (voxel.March.IndexAnySolid)
+	// =======================================================================
+	//
+	// THE SKIP HAS ALWAYS BEEN THERE AND HAS NEVER FIRED.
+	// VoxelBrickTraverse.ush's chunk lookup early-outs on
+	// VOXEL_MARCH_INDEX_ANYSOLID_BIT with no record fetch at all -- its own
+	// comment calls it "the cheapest possible skip and it is why the bit rides
+	// the index dword instead of the record" -- and the census word that counts
+	// it (cellIndexEmpty) reads EXACTLY ZERO on every leg ever run, because all
+	// four writers of a resident entry hardcode the bit set. A chunk that is
+	// resident and entirely air is instead rejected at `LevelAndFlags & 0x10`,
+	// AFTER a scattered ~16 B fetch into the ~15.7 MB chunk table.
+	//
+	// WHAT THE CENSUS MEASURED, of the lookups that PAY FOR THE RECORD FETCH:
+	//
+	//     pose      wasted as air     wasted fetches/frame
+	//     down          35.11%              2.20 M
+	//     horizon       69.13%             23.06 M
+	//     sky           73.10%             23.30 M
+	//
+	// AND THE EXPECTATION THAT GOES WITH IT, stated here so nobody quotes the
+	// percentage as a speedup: the whole chunk table is 15.7 MB and fits this
+	// box's 64 MB Infinity Cache, and neighbouring rays in a wave probe the
+	// SAME chunks, so these are L2 misses that hit MALL, not DRAM. The move to
+	// expect is ~0.2-0.4 ms, not anything proportional to 73%. A measured small
+	// win is still a win; a 73% headline attached to a 5% result is not.
+	//
+	// DEFAULT 0, like every switch in this file, so a control leg is
+	// byte-identical and the A/B lives in one binary.
+	TAutoConsoleVariable<int32> CVarVoxelMarchIndexAnySolid(
+		TEXT("voxel.March.IndexAnySolid"), 0,
+		TEXT("1 = after each index write, a compute pass re-reads the chunk RECORD for every "
+		     "pool slot, re-runs the marcher's own origin+level validation against the index "
+		     "cell that names it, and CLEARS the entry's anySolid bit (bit 30) on positive "
+		     "proof that the chunk is entirely air -- turning VoxelBrickTraverse.ush's "
+		     "never-taken cheapest skip on. 0 (DEFAULT) = the bit stays the hardcoded 1 it has "
+		     "always been. ENGAGEMENT PROOF is the census word cellIndexEmpty "
+		     "(voxel.March.HoleStats 1) leaving zero for the first time; CORRECTNESS PROOF is "
+		     "voxel.March.IndexAnySolidAudit reading wrongClear=0 over a non-zero checked "
+		     "count. The bit is a HINT and the record is truth: every uncertain case in the "
+		     "kernel leaves the bit SET, because a wrongly-set bit costs a fetch and a wrongly-"
+		     "cleared one deletes ground."),
+		ECVF_RenderThreadSafe);
+
+	// THE RED ARM, AND IT RUNS FIRST.
+	//
+	// A green leg after an unproven detector means nothing. This forces the
+	// refine kernel to clear bit 30 on EVERY identity-matched cell including
+	// the ones the record proves are solid -- i.e. it commits, deliberately,
+	// the exact defect the audit exists to catch. The audit must then report
+	// wrongClear > 0. If it does not, the audit cannot fail and no subsequent
+	// green reading from it is evidence of anything.
+	//
+	// IT ALSO DELETES TERRAIN, ON PURPOSE. The marcher will skip every solid
+	// chunk whose bit this clears, so a poison leg's capture is a broken world
+	// and that is the second, independent confirmation -- the counter and the
+	// image have to agree about the same corruption.
+	TAutoConsoleVariable<int32> CVarVoxelMarchIndexAnySolidPoison(
+		TEXT("voxel.March.IndexAnySolidPoison"), 0,
+		TEXT("RED ARM. 1 = the refine pass clears anySolid on every identity-matched index "
+		     "cell, INCLUDING chunks the record proves are solid. This is a deliberate "
+		     "corruption whose purpose is to make voxel.March.IndexAnySolidAudit fire: "
+		     "wrongClear MUST become non-zero and the capture MUST show missing terrain. Run "
+		     "this BEFORE any green leg -- a detector that has not been shown capable of "
+		     "failing has not been shown to work. Needs voxel.March.IndexAnySolid 1. NEVER "
+		     "ship, never quote a timing from a poison leg."),
+		ECVF_RenderThreadSafe);
+
+	// THE CORRECTNESS GATE. One thread per pool slot, run LAST in the graph --
+	// after the index write and after the refine pass -- so it reads exactly
+	// the state every march pass from there until the next flush consumes.
+	// Placing it ahead of the refine would be a test that CANNOT FAIL: on the
+	// full-upload path the buffer is created in that graph with every anySolid
+	// bit already set.
+	//
+	// It checks the invariant directly and over the whole resident set, not
+	// only over the cells rays happened to touch: no resident, identity-matched
+	// index cell whose record says solid may have bit 30 clear. That is
+	// strictly broader coverage than a marcher-side re-fetch, and it is
+	// indifferent to HOW a bit got wrong -- a wrong cell, a stale read, an
+	// ordering mistake and a logic bug all land in the same counter.
+	//
+	// THE DENOMINATOR IS PART OF THE READING. wrongClear=0 over checked=0 is
+	// not a pass, it is an audit that did not run, and the log line prints both
+	// for exactly that reason.
+	TAutoConsoleVariable<int32> CVarVoxelMarchIndexAnySolidAudit(
+		TEXT("voxel.March.IndexAnySolidAudit"), 0,
+		TEXT("1 = after each index write and refine, a compute pass walks every pool slot and counts "
+		     "index cells that say AIR (bit 30 clear) over a record that says SOLID -- the "
+		     "one error direction that deletes ground. Reported in GetUploadStats() as "
+		     "auditChecked / auditWrongClear; ANY non-zero wrongClear outranks every "
+		     "performance number on the leg. Read the CHECKED count too: zero there is an "
+		     "audit that never ran, not a clean one. Prove it can fire with "
+		     "voxel.March.IndexAnySolidPoison first. Costs one dispatch of ChunkCapacity "
+		     "threads plus a 48 B readback per sampled flush."),
+		ECVF_RenderThreadSafe);
+
+	// Matches [numthreads(64, 1, 1)] in every kernel in the .usf. Restated here
+	// because the dispatch size is computed from it and a mismatch drops the
+	// tail of the pair list -- which is a handful of silently wrong index
+	// cells, the exact failure shape this feature must never produce.
+	constexpr int32 kScatterGroupSize = 64;
+
+	// EVERY SHADER CLASS IN THIS FILE PUSHES THESE, NOT JUST THE ONE THAT USES
+	// THEM, AND THAT IS NOT TIDINESS -- IT IS A BOOT FATAL OTHERWISE.
+	//
+	// The three entry points live in ONE .usf, so the refine kernel's body is
+	// in the translation unit for every one of them. A macro it references that
+	// only the refine class defines makes VoxelMarchIndexScatterMain and
+	// VoxelMarchIndexPublishMain fail to compile -- and a shader that fails to
+	// compile does not fail a BUILD, it fails an editor LAUNCH, which costs a
+	// whole leg to discover. Caught by toolsoxel-check-indexscatter-shader.ps1
+	// on the first run of the very change that introduced it, which is exactly
+	// what that script exists for.
+	//
+	// The refine kernel deliberately gives the stat-word offsets NO #ifndef
+	// fallback: a dropped SetDefine must be a compile error, not a silent write
+	// into word 0 that reads as a plausible census. The guard case in that
+	// script asserts the failure mode still holds.
+	void VoxelMarchIndexScatterSetDefines(FShaderCompilerEnvironment& OutEnvironment)
+	{
+		// THE RECORD STRIDE, PUSHED FROM THE POOL'S OWN CONSTANT so the refine
+		// kernel is not a THIRD hand-spelling of it beside
+		// VoxelBrickTraverse.ush's #define and FVoxelBrickPool's
+		// kChunkRecordDwords. The kernel still cross-checks it against the
+		// BOUND VoxelBrickChunkRecordDwords at runtime and refuses to clear
+		// anything when they disagree -- the same guard the marcher runs, with
+		// the same reasoning: a stride that moved on one side only reads a
+		// neighbouring record's fields, and most of them survive an origin
+		// validation often enough to look like an answer.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_INDEX_REFINE_RECORD_DWORDS"),
+		                         uint32(FVoxelBrickPool::kChunkRecordDwords));
+		// The stats word offsets, from the enum that also sizes the readback. A
+		// hand mirror here reads a plausible number out of the wrong slot --
+		// the failure the hole-stats census pushes its own words to avoid.
+		using FIdx = FVoxelMarchChunkIndex;
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_EXAMINED"),
+		                         int32(FIdx::RefineStat_Examined));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_NOMATCH"),
+		                         int32(FIdx::RefineStat_NoMatch));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_ZERO_RECORD"),
+		                         int32(FIdx::RefineStat_RefusedZeroRecord));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_BAD_ORIGIN"),
+		                         int32(FIdx::RefineStat_RefusedOrigin));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_BAD_LEVEL"),
+		                         int32(FIdx::RefineStat_RefusedLevel));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_BAD_CELL"),
+		                         int32(FIdx::RefineStat_RefusedCell));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_BAD_STRIDE"),
+		                         int32(FIdx::RefineStat_RefusedStride));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_INCONSISTENT"),
+		                         int32(FIdx::RefineStat_RefusedInconsistent));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_CLEARED"),
+		                         int32(FIdx::RefineStat_Cleared));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_CAS_LOST"),
+		                         int32(FIdx::RefineStat_CasLost));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_LEFT_SOLID"),
+		                         int32(FIdx::RefineStat_LeftSolid));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_ALREADY_CLEAR"),
+		                         int32(FIdx::RefineStat_AlreadyClear));
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_AUDIT_SOLID"),
+		                         int32(FIdx::RefineStat_AuditSolid));
+		// Sizes the kernel's groupshared tally AND the readback; one number,
+		// one place.
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_STAT_WORDS"),
+		                         int32(FIdx::kRefineStatWords));
+		// Matches [numthreads(N,1,1)] and the group count this file computes.
+		OutEnvironment.SetDefine(TEXT("VOXEL_REFINE_GROUP_SIZE"), kScatterGroupSize);
+	}
+
 	// One thread per changed cell; pairs are deduplicated BY CONSTRUCTION on
 	// the host (built from a TSet keyed by cell), so no two threads in a
 	// dispatch write the same address -- see the .usf header for why that is
@@ -232,6 +403,19 @@ namespace
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelMarchIndexScatterCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelMarchIndexScatterCS, FGlobalShader);
+
+		// PUSHED BY EVERY CLASS IN THIS FILE, not only the one that reads them.
+		// This kernel uses none of these defines; it compiles the refine
+		// kernel's BODY anyway, because all three entry points share one .usf.
+		// Omitting the call here made VoxelMarchIndexScatterMain fail with
+		// "use of undeclared identifier 'VOXEL_REFINE_STAT_BAD_STRIDE'" -- an
+		// EDITOR BOOT fatal, not a build failure. See the function's comment.
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			VoxelMarchIndexScatterSetDefines(OutEnvironment);
+		}
 
 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 		{
@@ -246,12 +430,6 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
-	// Matches [numthreads(64, 1, 1)] in the kernel. Restated here because the
-	// dispatch size is computed from it and a mismatch drops the tail of the
-	// pair list -- which is a handful of silently wrong index cells, the exact
-	// failure shape this feature must never produce.
-	constexpr int32 kScatterGroupSize = 64;
-
 	// The Phase 2 publish kernel: entries in, cells derived and written on the
 	// GPU. Same .usf as the scatter, second entry point; the kernel header
 	// owns the entry layout and the removal-guard argument.
@@ -260,6 +438,15 @@ namespace
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelMarchIndexPublishCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelMarchIndexPublishCS, FGlobalShader);
+
+		// Same reason as the scatter class above: this kernel reads none of
+		// these defines and compiles the refine kernel's body regardless.
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			VoxelMarchIndexScatterSetDefines(OutEnvironment);
+		}
 
 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 		{
@@ -281,12 +468,81 @@ namespace
 	// Dwords per publish entry: [x, y, z, gridSlot, chunkSlot]. Restated from
 	// the kernel for the same tail-dropping reason as kScatterGroupSize.
 	constexpr int32 kPublishEntryDwords = 5;
+
+	// THE anySolid REFINE / AUDIT KERNEL. One thread per POOL SLOT, driven
+	// from the RECORD side rather than from a per-flush cell list, and that
+	// choice is the design:
+	//
+	//   * It is INDIFFERENT TO WHICH UPLOAD PATH RAN. The full staged upload,
+	//     the delta pair scatter and the Phase 2 publish all leave the same
+	//     question -- "does this cell's record say air" -- and a record-driven
+	//     pass answers it identically for all three, including the fallback
+	//     ladder (seed / first / pending / large / lost) that has no cell list
+	//     at all.
+	//   * It is SELF-HEALING. A full upload re-writes bit 30 back to the
+	//     shadow's hardcoded 1; this pass runs in the same graph, after it, and
+	//     re-derives the answer. There is no state to keep in sync and nothing
+	//     to lose.
+	//   * It cannot outrun the records. A record only changes in a flush, every
+	//     flush writes the index, this pass runs where the index was written,
+	//     and the pool issues its record writes BEFORE the index sink on both
+	//     producers (the CPU arm's "record last" bucket order; the GPU shell's
+	//     "the index learns about the chunk on the next Flush, which runs after
+	//     the caller has enqueued the graph that writes the record"). So the
+	//     record this pass reads is never older than the entry it is refining.
+	//
+	// The pool bindings come from VOXEL_BRICK_POOL_PARAMETERS() and are filled
+	// by FVoxelBrickPool::BindShaderParameters, so the chunk table, its slot
+	// count and the record stride reach this kernel through the SAME names and
+	// the SAME filler the marcher uses. The kernel reads three of them; the
+	// rest go unbound, which is what the macro is for.
+	class FVoxelMarchIndexRefineCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelMarchIndexRefineCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelMarchIndexRefineCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			VoxelMarchIndexScatterSetDefines(OutEnvironment);
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICK_POOL_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchChunkIndexRW)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchIndexRefineStats)
+			// Where THIS pass's 12-word block starts. The two arms share one
+			// buffer and both write a word named Cleared -- the refine's prize
+			// and the audit's alarm -- so the base is what keeps a hole count
+			// from being added to a saving.
+			SHADER_PARAMETER(uint32, MarchIndexRefineStatBase)
+			SHADER_PARAMETER(FUintVector, MarchIndexRefineDimChunks)
+			SHADER_PARAMETER(uint32, MarchIndexRefineCellsPerLevel)
+			SHADER_PARAMETER(uint32, MarchIndexRefineCellCount)
+			SHADER_PARAMETER(uint32, MarchIndexRefineRingGrids)
+			SHADER_PARAMETER(uint32, MarchIndexRefineCoverLevel)
+			SHADER_PARAMETER(uint32, MarchIndexRefineCoverGridSlot)
+			// 0 = refine (clear on proof), 1 = audit (count, write nothing).
+			SHADER_PARAMETER(uint32, MarchIndexRefineMode)
+			// 1 = the red arm: clear even when the record proves solid.
+			SHADER_PARAMETER(uint32, MarchIndexRefinePoison)
+		END_SHADER_PARAMETER_STRUCT()
+	};
 }
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchIndexScatterCS, VOXEL_MARCH_INDEX_SCATTER_USF,
                         "VoxelMarchIndexScatterMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchIndexPublishCS, VOXEL_MARCH_INDEX_SCATTER_USF,
                         "VoxelMarchIndexPublishMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelMarchIndexRefineCS, VOXEL_MARCH_INDEX_SCATTER_USF,
+                        "VoxelMarchIndexRefineMain", SF_Compute);
 
 namespace
 {
@@ -1743,10 +1999,22 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 	}
 	if (bWantHashNow)
 	{
+		// THROUGH HashableCell, WHICH DROPS BIT 30, and that is a cost this
+		// change had to land WITH the feature rather than after it. Once the
+		// GPU refine pass clears anySolid, the shadow (which always writes 1)
+		// and the GPU buffer legitimately differ in exactly that bit, and an
+		// unmasked FNV would report IndexDeltaVerify FAILED on every single
+		// sample -- a correctness gate that cries wolf is a correctness gate
+		// that gets turned off. Masking here and in PollDeltaVerify's readback
+		// hash keeps the gate covering residency, slot and every absent-reason
+		// bit, and hands the one bit it stops covering to the refine kernel's
+		// own audit arm. Precedent: AreAbsentMarksArmed() already stands the
+		// annotation writers down rather than let them indict a mode they were
+		// not asked about.
 		uint64 Hash = 1469598103934665603ull;
 		for (uint32 V : Cells)
 		{
-			Hash ^= uint64(V);
+			Hash ^= uint64(HashableCell(V));
 			Hash *= 1099511628211ull;
 		}
 		ContentHash = Hash;
@@ -2102,6 +2370,7 @@ void FVoxelMarchChunkIndex::EnqueueGpuPublish(bool bVerifyWanted, uint64 Expecte
 		// Retire any completed verify samples first, so a slot can free up for
 		// the one this command may arm. `this` is a global; no lifetime issue.
 		PollDeltaVerify();
+		PollRefineStats();
 
 		if (!Pooled.IsValid())
 		{
@@ -2165,6 +2434,11 @@ void FVoxelMarchChunkIndex::EnqueueGpuPublish(bool bVerifyWanted, uint64 Expecte
 				FComputeShaderUtils::GetGroupCount(AddCount, kScatterGroupSize));
 		}
 
+		// The anySolid refine, after both publish phases for the reason it runs
+		// after the scatter on the other arm: the addition phase writes the
+		// hardcoded anySolid 1 and a clear made ahead of it would be undone.
+		AddAnySolidPasses(GraphBuilder, Buffer);
+
 		// The verify sample, in THIS graph, after both phases: the readback
 		// then holds exactly the state the expected hash describes.
 		if (bVerifyWanted)
@@ -2184,6 +2458,7 @@ FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
 	// Retire a completed verify readback (if any) before possibly arming a new
 	// one below. Render thread, like everything else in this function.
 	PollDeltaVerify();
+	PollRefineStats();
 
 	if (bStagedValid)
 	{
@@ -2202,6 +2477,15 @@ FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
 		// Held across frames so a frame with no flush still has an index. RDG
 		// extraction is what makes a transient buffer outlive its graph.
 		GraphBuilder.QueueBufferExtraction(Buffer, &Pooled);
+		// THE FULL PATH NEEDS THE REFINE MOST, NOT LEAST. Staged is a copy of
+		// the CPU shadow, and the shadow's every resident entry carries the
+		// hardcoded anySolid 1 -- so a full upload UNDOES every clear the last
+		// refine made. Running it here, in the same graph, after the upload
+		// pass RDG has already ordered ahead of it, is what makes the arm
+		// survive the fallback ladder (seed / first / pending / large / lost)
+		// instead of silently switching itself off on exactly the flushes that
+		// change the most.
+		AddAnySolidPasses(GraphBuilder, Buffer);
 		bStagedValid = false;
 		// A consumed full snapshot supersedes any delta pairs staged before the
 		// game thread noticed it was pending (the staging ladder normally
@@ -2286,6 +2570,15 @@ FRDGBufferRef FVoxelMarchChunkIndex::Register(FRDGBuilder& GraphBuilder)
 					ERDGPassFlags::Compute, Shader, Params,
 					FComputeShaderUtils::GetGroupCount(int32(NumPairs), kScatterGroupSize));
 			}
+			// AFTER THE SCATTER AND BEFORE THE VERIFY COPY, in that order and
+			// deliberately. After the scatter, because the scatter re-writes
+			// this flush's cells with the shadow's hardcoded anySolid 1 and
+			// would undo a clear made ahead of it. Before the verify copy,
+			// because the readback must hold the state the marcher will
+			// actually read -- and the hash it is compared against masks bit
+			// 30 out on both sides (HashableCell), so a refined buffer and an
+			// unrefined shadow still agree about everything the verify covers.
+			AddAnySolidPasses(GraphBuilder, Buffer);
 			bStagedDeltaValid = false;
 
 			// The verify gate, sampled: copy the whole patched buffer back and
@@ -2576,6 +2869,320 @@ void FVoxelMarchChunkIndex::EnqueueDeltaVerify(FRDGBuilder& GraphBuilder,
 	Free->bInFlight = true;
 }
 
+// ---------------------------------------------------------------------------
+// MAKING kAnySolidBit REAL -- the passes, and the safety argument per writer
+// ---------------------------------------------------------------------------
+//
+// THE INDEX BIT IS A HINT; THE RECORD IS TRUTH. Everything below is arranged
+// around one asymmetry:
+//
+//     bit says SOLID, chunk is air  -> lose the saving, stay correct.  SAFE.
+//     bit says AIR, chunk has solid -> the marcher skips real ground.  A HOLE.
+//
+// AND THE USUAL STALE-INDEX PROTECTION DOES NOT COVER THIS PATH. The marcher's
+// `anySolid == 0` early-out returns BEFORE the record fetch -- its own comment
+// says "The record is never validated on this path" -- so the RecOrigin/level
+// check that turns every OTHER stale-index failure into a harmless miss is
+// bypassed entirely. There is no downstream net. The proof has to live in the
+// writer, which is why this pass exists at all rather than a flag on the
+// snapshot.
+//
+// WHAT IS LEFT UNCHANGED, DELIBERATELY: all four existing writers of a resident
+// entry keep their hardcoded `| kAnySolidBit` (Seed, ApplyDelta's add loop, and
+// the publish kernel's addition arm). They are the SAFE default and they are
+// also the only value the CPU can honestly produce -- see kAnySolidBit's block
+// in the header for why "add a solidity flag to the snapshot" is dead on
+// arrival. This pass is the only thing that ever clears the bit, and it clears
+// it only after proving air FROM THE RECORD THAT IS IN THE SLOT NOW.
+//
+// THE FIVE REFUSALS, each of which would be a hole if it were an assumption
+// instead of a test:
+//
+//   1. A ZEROED RECORD VALIDATES AS AIR AT CHUNK (0,0,0) LEVEL 0. Both free
+//      passes zero a retired record; RecOrigin == (0,0,0) then MATCHES
+//      WantOrigin at that chunk and LevelAndFlags == 0 matches level 0, with
+//      anySolid clear. That is a live instance of absence-reads-as-air sitting
+//      directly on this path. The kernel refuses on (dw0|dw1|dw2|dw3) == 0.
+//   2. AN ORIGIN THAT IS NOT A CHUNK ORIGIN. WantOrigin is ChunkCoord * 32, so
+//      the inverse is only defined for a multiple of 32. A record whose origin
+//      is not one is garbage and is refused rather than rounded.
+//   3. A LEVEL THAT MAPS TO NO GRID SLOT. GridSlotForLevel is the single
+//      authority; the kernel mirrors it and refuses anything it would answer
+//      -1 for. Deriving the grid slot FROM THE RECORD and then requiring the
+//      whole computed cell to equal the cell being refined is what stops a
+//      level-1 record clearing a level-0 cell.
+//   4. THE STRIDE CROSS-CHECK. The same one the marcher runs, for the same
+//      reason: a stride that moved on one side only reads a neighbouring
+//      record's fields, and enough of them survive validation to look like an
+//      answer.
+//   5. A SELF-INCONSISTENT RECORD. anySolid is derived by the record's own
+//      writers from the 64-bit L1 brick mask ((MaskLo|MaskHi) != 0 in
+//      poolAllocLevelAndFlags; P->BrickSolid alongside P->bAnySolid in
+//      BuildChunkRecord), so a record claiming AIR over a NON-empty mask is a
+//      contradiction the storage cannot legitimately produce. The kernel
+//      requires BOTH to agree before clearing. That is not belt-and-braces: it
+//      is the one check that is independent of dword 3, so a shared misread of
+//      the flags field cannot pass it. It costs nothing -- the record is 16
+//      dwords, 64 B, ONE cache line, and dwords 5-6 are already in it.
+//
+// AND ONE TRAP THAT LOOKS LIKE A SHORTCUT AND IS EXACTLY INVERTED: OccWords ==
+// 0 IS NOT PROOF OF AIR. 64 uniform-SOLID bricks also have zero occupancy
+// words. Nothing here reads OccWords.
+//
+// WHAT THE MARCHER SEES ON A CORRECT CLEAR: nothing new. Both empty paths --
+// the index early-out and the record's own `LevelAndFlags & 0x10` reject --
+// already set C.bResident = true, so the fallthrough ladder and `substituted`
+// are unaffected by moving the rejection earlier. That is checked as gate 4
+// (substituted must not rise) rather than merely asserted here.
+//
+// allSolid (record bit 5) IS NOT HOISTED ALONGSIDE, and that was verified
+// rather than assumed: zero code readers across all 40 LevelAndFlags matches. A
+// cleared anySolid means the ray needs NOTHING further; allSolid means it needs
+// EVERYTHING, just sooner. Only the first is a skip.
+void FVoxelMarchChunkIndex::AddAnySolidPasses(FRDGBuilder& GraphBuilder, FRDGBufferRef IndexBuffer)
+{
+	const bool bRefine = CVarVoxelMarchIndexAnySolid.GetValueOnRenderThread() != 0;
+	const bool bAudit = CVarVoxelMarchIndexAnySolidAudit.GetValueOnRenderThread() != 0;
+	if ((!bRefine && !bAudit) || IndexBuffer == nullptr)
+	{
+		return;
+	}
+
+	// THE POOL, THROUGH ITS OWN FILLER. Nothing here re-derives the chunk
+	// table's SRV, its slot count or the record stride: they arrive by the
+	// same names, from the same function, as the marcher's. False means the
+	// pool has nothing to march -- no arenas yet, or nothing resident -- which
+	// is ordinary in the first frames of a run and is a reason to do nothing,
+	// never a reason to guess.
+	FVoxelBrickPool& Pool = GetGlobalVoxelBrickPool();
+
+	// One stats buffer shared by both passes in this graph. Zero-filled first:
+	// an un-cleared UAV would read the previous allocation's dwords and the
+	// audit would report a wrongClear nobody committed -- and a FALSE alarm on
+	// this counter costs as much investigator time as a real one.
+	FRDGBufferRef StatsBuffer = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), uint32(kRefineStatBufferWords)),
+		TEXT("VoxelMarch.IndexAnySolidStats"));
+	FRDGBufferUAVRef StatsUAV = GraphBuilder.CreateUAV(StatsBuffer, PF_R32_UINT);
+	AddClearUAVPass(GraphBuilder, StatsUAV, 0u);
+
+	TShaderMapRef<FVoxelMarchIndexRefineCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+
+	auto FillCommon = [&](FVoxelMarchIndexRefineCS::FParameters* Params) -> bool
+	{
+		if (!Pool.BindShaderParameters(GraphBuilder, *Params))
+		{
+			return false;
+		}
+		Params->MarchChunkIndexRW = GraphBuilder.CreateUAV(IndexBuffer, PF_R32_UINT);
+		Params->MarchIndexRefineStats = StatsUAV;
+		Params->MarchIndexRefineDimChunks = FUintVector(kDimXY, kDimXY, kDimZ);
+		Params->MarchIndexRefineCellsPerLevel = kCellsPerLevel;
+		Params->MarchIndexRefineCellCount = uint32(kCells);
+		// GridSlotForLevel's two halves, bound rather than spelled a second
+		// time in HLSL. The cover level is 7 and the grid carries eight
+		// sub-grids with cover last; getting that mapping wrong in the shader
+		// would resolve a cover record onto a ring cell, and the whole-cell
+		// equality test is what makes binding these enough.
+		Params->MarchIndexRefineRingGrids = kRingGrids;
+		Params->MarchIndexRefineCoverLevel = uint32(kCoverLevel);
+		Params->MarchIndexRefineCoverGridSlot = kCoverGridSlot;
+		return true;
+	};
+
+	bool bDispatched = false;
+	auto AddOne = [&](uint32 Mode, uint32 StatBase, uint32 Poison, const TCHAR* Name)
+	{
+		FVoxelMarchIndexRefineCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelMarchIndexRefineCS::FParameters>();
+		if (!FillCommon(Params))
+		{
+			return;
+		}
+		Params->MarchIndexRefineMode = Mode;
+		Params->MarchIndexRefineStatBase = StatBase;
+		Params->MarchIndexRefinePoison = Poison;
+		// ONE THREAD PER POOL SLOT, sized from the value the POOL just bound
+		// rather than from a second copy of the capacity. The kernel
+		// bounds-checks against the same uniform, so a dispatch and a guard
+		// derived from one number cannot disagree about where the table ends.
+		const uint32 Groups = FMath::DivideAndRoundUp(Params->VoxelBrickChunkSlots,
+		                                              uint32(kScatterGroupSize));
+		if (Groups == 0)
+		{
+			return;
+		}
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("%s(%u slots)", Name, Params->VoxelBrickChunkSlots),
+			ERDGPassFlags::Compute, Shader, Params, FIntVector(int32(Groups), 1, 1));
+		bDispatched = true;
+	};
+
+	if (bRefine)
+	{
+		AddOne(0u, uint32(kRefineStatBaseRefine),
+		       CVarVoxelMarchIndexAnySolidPoison.GetValueOnRenderThread() != 0 ? 1u : 0u,
+		       TEXT("VoxelMarch.IndexAnySolidRefine"));
+	}
+
+	// ---- THE AUDIT, AFTER THE REFINE, AND THE ORDER IS THE WHOLE GATE ------
+	//
+	// It has to read the buffer THE MARCHER WILL READ. Every march pass from
+	// here until the next flush consumes the state this graph leaves behind,
+	// so auditing that state -- after the index write and after the refine
+	// pass -- is auditing exactly what the rays get.
+	//
+	// AUDITING FIRST WOULD BE A TEST THAT CANNOT FAIL, and it was written that
+	// way once before being caught here. On the full-upload path the buffer is
+	// CREATED in this graph and every entry in it carries the shadow's
+	// hardcoded anySolid 1, so an audit placed ahead of the refine would find
+	// nothing wrong no matter how badly the refine behaved -- including under
+	// the poison arm, which is the one leg whose entire purpose is to make
+	// this counter fire.
+	//
+	// The staleness an audit-first placement would have covered -- a record
+	// changing between graphs while the bit stayed cleared -- is closed
+	// elsewhere and by construction: every producer of a record is also a
+	// producer of an index add, and an index add writes bit 30 back to 1. And
+	// this pass walks EVERY pool slot on EVERY flush, so a bit that somehow
+	// went wrong out of band is caught at the next flush regardless.
+	if (bAudit)
+	{
+		AddOne(1u, uint32(kRefineStatBaseAudit), 0u, TEXT("VoxelMarch.IndexAnySolidAudit"));
+	}
+
+	// THE ARM'S PROOF OF LIFE, INCREMENTED ONLY WHERE A DISPATCH WAS ACTUALLY
+	// ADDED. Counting the call instead of the dispatch is how a switch that is
+	// on and does nothing reads as healthy -- the failure this project has
+	// paid for more than any other. With the cvar on and the pool not yet
+	// bindable (no arenas, nothing resident) this stays 0, and 0 with the cvar
+	// on is a diagnosis, not a reassurance.
+	if (bDispatched)
+	{
+		++UploadStats.RefineDispatches;
+	}
+	else
+	{
+		return;
+	}
+
+	// The readback, sampled on the same ring discipline as the delta verify's
+	// and for the same recorded crash: arm a FREE slot or skip, and never poll
+	// a slot in the frame that armed it. A skipped sample is a smaller sample,
+	// not a wrong one -- a wrongly cleared bit is PERSISTENT (nothing sets it
+	// back until that cell is rewritten), so any later sample still catches
+	// the bug class.
+	FRefineStatsSlot* Free = nullptr;
+	for (int32 i = 0; i < kRefineStatsSlots; ++i)
+	{
+		if (!RefineStatsSlots[i].bInFlight)
+		{
+			Free = &RefineStatsSlots[i];
+			break;
+		}
+	}
+	if (Free == nullptr)
+	{
+		return;
+	}
+	if (!Free->Readback.IsValid())
+	{
+		Free->Readback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelMarch.IndexAnySolidStats"));
+	}
+	AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), StatsBuffer,
+	                   uint32(kRefineStatBufferWords) * sizeof(uint32));
+	// BOTH BLOCKS TRAVEL IN ONE SAMPLE. An arm that was not dispatched left
+	// its block at the zeros AddClearUAVPass wrote, and zeros fold to nothing
+	// -- so the reader needs no flag for which arms ran, and cannot mistake
+	// one arm's words for the other's.
+	Free->ArmedFrame = GFrameNumberRenderThread;
+	Free->bInFlight = true;
+}
+
+void FVoxelMarchChunkIndex::PollRefineStats()
+{
+	for (int32 i = 0; i < kRefineStatsSlots; ++i)
+	{
+		FRefineStatsSlot& Slot = RefineStatsSlots[i];
+		if (!Slot.bInFlight || !Slot.Readback.IsValid() ||
+		    GFrameNumberRenderThread <= Slot.ArmedFrame || !Slot.Readback->IsReady())
+		{
+			continue;
+		}
+		Slot.bInFlight = false;
+
+		const uint32 NumBytes = uint32(kRefineStatBufferWords) * sizeof(uint32);
+		const uint32* Data = static_cast<const uint32*>(Slot.Readback->Lock(NumBytes));
+		if (Data == nullptr)
+		{
+			continue;
+		}
+		uint32 Buf[kRefineStatBufferWords];
+		FMemory::Memcpy(Buf, Data, NumBytes);
+		Slot.Readback->Unlock();
+
+		++UploadStats.RefineStatsSamples;
+
+		{
+			const uint32* W = Buf + kRefineStatBaseAudit;
+			// THE AUDIT'S TWO WORDS. Checked is the denominator -- resident,
+			// identity-matched cells whose record says SOLID -- and it must be
+			// non-zero for the other one to be a reading rather than a silence.
+			// ITS OWN WORD, not Examined -- see RefineStat_AuditSolid. On a
+			// healthy leg this must equal the refine arm's leftSolid, which is
+			// the same population counted by the other pass; they agreed to
+			// the unit (4,708,059) on the 2026-08-27 green leg.
+			UploadStats.AuditChecked += uint64(W[RefineStat_AuditSolid]);
+			UploadStats.AuditWrongClear += uint64(W[RefineStat_Cleared]);
+			if (W[RefineStat_Cleared] != 0)
+			{
+				UE_LOG(LogVoxelMarchIndex, Error,
+				       TEXT("Voxel march index anySolid AUDIT FAILED: %u index cells say AIR "
+				            "(bit 30 clear) over a chunk record that says SOLID, of %u "
+				            "identity-matched solid chunks checked. The marcher's cheapest "
+				            "skip is now skipping REAL GROUND on those chunks -- a hole, not "
+				            "an error, and it will not show in `uncovered` (that word is 25%% "
+				            "on a healthy leg and is not an arc detector). Set "
+				            "voxel.March.IndexAnySolid 0 and treat every capture and every "
+				            "timing since the last clean audit as suspect. If "
+				            "voxel.March.IndexAnySolidPoison is 1 this is the EXPECTED result "
+				            "and the red arm has passed."),
+				       W[RefineStat_Cleared], W[RefineStat_Examined]);
+			}
+		}
+		{
+			const uint32* W = Buf + kRefineStatBaseRefine;
+			UploadStats.RefineExamined += uint64(W[RefineStat_Examined]);
+			UploadStats.RefineNoMatch += uint64(W[RefineStat_NoMatch]);
+			UploadStats.RefineCleared += uint64(W[RefineStat_Cleared]);
+			UploadStats.RefineCasLost += uint64(W[RefineStat_CasLost]);
+			UploadStats.RefineLeftSolid += uint64(W[RefineStat_LeftSolid]);
+			UploadStats.RefineAlreadyClear += uint64(W[RefineStat_AlreadyClear]);
+			UploadStats.RefineRefused +=
+				uint64(W[RefineStat_RefusedZeroRecord]) + uint64(W[RefineStat_RefusedOrigin]) +
+				uint64(W[RefineStat_RefusedLevel]) + uint64(W[RefineStat_RefusedCell]) +
+				uint64(W[RefineStat_RefusedStride]) + uint64(W[RefineStat_RefusedInconsistent]);
+			// THE STRIDE WORD IS AN ALARM, NOT A STATISTIC. It can only be
+			// non-zero if VoxelBrickPool::kChunkRecordDwords and the define
+			// this kernel was compiled with have separated, in which case the
+			// marcher's own stride guard has already emptied the world -- but
+			// this says so at the site rather than leaving a blank screen to
+			// be diagnosed from scratch.
+			if (W[RefineStat_RefusedStride] != 0)
+			{
+				UE_LOG(LogVoxelMarchIndex, Error,
+				       TEXT("Voxel march index anySolid refine: the record stride cross-check "
+				            "failed on %u slots -- the bound VoxelBrickChunkRecordDwords and "
+				            "the kernel's compiled VOXEL_MARCH_INDEX_REFINE_RECORD_DWORDS "
+				            "disagree. No bit was cleared (the refusal is the safe direction), "
+				            "but the MARCHER reads the same table at its own stride and its "
+				            "guard empties the world. Rebuild the shaders."),
+				       W[RefineStat_RefusedStride]);
+			}
+		}
+	}
+}
+
 void FVoxelMarchChunkIndex::PollDeltaVerify()
 {
 	for (int32 i = 0; i < kVerifySlots; ++i)
@@ -2599,10 +3206,14 @@ void FVoxelMarchChunkIndex::PollDeltaVerify()
 		// of that state would have carried" are compared as one number each.
 		// ~17.5 ms of render thread per sample (measured rate of the same
 		// loop on the game thread); the cvar's help text owns that cost.
+		// THE SAME MASK AS THE GAME-THREAD SIDE, through the same function.
+		// Bit 30 is the GPU refine pass's to own (see MarkDirtyAndUpload's
+		// note); every other bit is still compared exactly as before, so a
+		// wrong slot, a lost cell or a drifted wrap still fails here.
 		uint64 Hash = 1469598103934665603ull;
 		for (uint32 c = 0; c < uint32(kCells); ++c)
 		{
-			Hash ^= uint64(Data[c]);
+			Hash ^= uint64(HashableCell(Data[c]));
 			Hash *= 1099511628211ull;
 		}
 		Slot.Readback->Unlock();
