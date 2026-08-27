@@ -6447,7 +6447,17 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		FIntRect JitterRect;
 		for (FViewMarch& E : Views)
 		{
-			if (E.ViewKey == nullptr)
+			// THE FRAME GUARD IS NOT OPTIONAL AND A NULL CHECK DOES NOT STAND IN
+			// FOR IT. ViewKey is a RAW POINTER to an FSceneView owned by the
+			// renderer (stashed at Entry.ViewKey = &InView). A viewport resize --
+			// F11, a resolution change, a PIE window rebuild -- destroys those
+			// views and builds new ones, and a stale FViewMarch from the previous
+			// frame survives in Views with a pointer that is DANGLING, NOT NULL.
+			// Dereferencing it is EXCEPTION_ACCESS_VIOLATION, which is exactly
+			// what F11 produced on 2026-08-26 with this loop guarded on null
+			// alone. The loop at the bottom of this function has always carried
+			// this test; these two jitter loops were added without it.
+			if (E.ViewKey == nullptr || E.FrameNumber != GFrameNumberRenderThread)
 			{
 				continue;
 			}
@@ -6488,7 +6498,11 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		{
 			for (const FViewMarch& E : Views)
 			{
-				if (E.ViewKey == nullptr)
+				// Same guard, same reason as the resolve loop above: a stale
+				// entry's ViewKey is dangling rather than null after a viewport
+				// rebuild, and ComputeProjectionNoAAMatrix() below dereferences
+				// it twice.
+				if (E.ViewKey == nullptr || E.FrameNumber != GFrameNumberRenderThread)
 				{
 					continue;
 				}
