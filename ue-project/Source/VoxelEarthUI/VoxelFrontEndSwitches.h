@@ -62,7 +62,41 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// Loading-gate tuning, so the GateMaxRing measurement is one flag rather
 	// than a rebuild. Defaults are the ported Godot contract.
 	int32 LoadGateMaxRing = 3;
-	float LoadMinHoldSeconds = 15.0f; // max(60 * 0.25, 5.0) from TransitionManager
+	// ---- THE MINIMUM HOLD: 15.0 -> 2.0, 2026-08-27 ------------------------
+	//
+	// THE MINIMUM IS NOT THE THING THAT MAKES THE PLAYER WAIT. The contract in
+	// TickLoading is `wait at least MinHold, then leave as soon as the world
+	// reports ready`, so what the player actually waits is
+	// max(MinHold, timeToReady) + HandOff. Time-to-ready is ~6.1 s (the settle,
+	// which is at its own concurrency floor: 34.5 CPU-seconds of worker work
+	// over 5.6 effective threads = 6.16 s modelled against 6.10 s observed).
+	//
+	// So at 15.0 the MINIMUM was binding and readiness was not: the world had
+	// been playable for ~9 seconds behind a curtain that would not lift. The
+	// player's cold start was 15.4 s against a standing <5 s target, and
+	// **none of it was streaming's fault**.
+	//
+	// WHY IT WAS INVISIBLE. Every leg this project has ever run passes
+	// -unattended, which suppresses the front end entirely (`VoxelFrontEnd:
+	// suppressed` in every log). So no measurement has ever included the hold,
+	// and `settleT` -- the number the <5 s target is tracked against -- both
+	// EXCLUDES engine bring-up and never sees this gate at all.
+	//
+	// WHY 2.0 AND NOT 0. The minimum has a real job, stated at the enforcement
+	// site: it stops a warm cache flashing the loading screen for a third of a
+	// second, "which reads as a glitch rather than as speed". Two seconds
+	// serves that comfortably. Fifteen served it 7.5x over.
+	//
+	// WHY NOT LOWER THAN THE SETTLE. Below ~6 s readiness binds instead, so
+	// dropping this further buys nothing until the settle itself moves --
+	// at which point this constant is already out of the way. 15.4 s -> ~7.5 s
+	// is the whole prize here and it is entirely in this line.
+	//
+	// The old value came from `max(60 * 0.25, 5.0)` in the ported
+	// TransitionManager and is a port artifact, not a tuned number.
+	// -VoxelLoadMinHold= overrides it; set 15 to reproduce every build before
+	// this change.
+	float LoadMinHoldSeconds = 2.0f;
 	float LoadMaxHoldSeconds = 60.0f; // the value both menu call sites pass
 
 	// -VoxelMenuWatchdog=<seconds>: under -unattended, refuse to sit on the
