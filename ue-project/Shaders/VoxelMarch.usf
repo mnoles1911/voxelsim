@@ -1830,9 +1830,22 @@ void VoxelMarchDepthOnlyPS(FVoxelMarchEmitInterp In, out float OutDepth : SV_Dep
 	const float3 HitLocalUU = Ray.OriginLocalUU + Ray.DirWorld * THitUU;
 	const float3 VolumeOriginTWS =
 		ResolvedView.TranslatedWorldCameraOrigin - MarchRayOriginLocalUU;
-	const float4 HitClip =
+	// PRECISE, AND IT IS THE FIX FOR A SHIPPED HALF-RES DEFECT. See THE TWO
+	// PASSES MUST AGREE BIT FOR BIT, AND `precise` IS WHAT MAKES THEM above
+	// VoxelMarchEmitPS's copy of this expression. Without it DXC compiles THIS
+	// shader's copy of VoxelMarchReconstruct with fast math and the emit's copy
+	// with strict math, the two produce different t for the same pixel, and the
+	// emit's CF_DepthNearOrEqual test then rejects about half the terrain.
+	precise float4 HitClip =
 		mul(float4(VolumeOriginTWS + HitLocalUU, 1.0f), ResolvedView.TranslatedWorldToClip);
-	OutDepth = HitClip.z / HitClip.w;
+	// THE DIVIDE IS PRECISE TOO, AND IT IS NOT COVERED BY THE LINE ABOVE. `precise`
+	// on HitClip constrains what PRODUCES HitClip; the quotient is a separate
+	// expression, and under fast math DXC is free to lower it as z * rcp(w) in one
+	// shader and as a correctly-rounded fdiv in the other. Measured: with only
+	// HitClip marked, the two shaders' depth chains agreed for 48 of 49 float ops
+	// and then split on exactly this divide.
+	precise float DepthOut = HitClip.z / HitClip.w;
+	OutDepth = DepthOut;
 }
 
 void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
@@ -1997,8 +2010,65 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	// the prepass by the jitter offset does not look like a depth bug; it looks
 	// like a silhouette that wobbles half a pixel, which is much harder to
 	// attribute.
-	const float4 HitClip = mul(float4(HitTWS, 1.0f), ResolvedView.TranslatedWorldToClip);
-	OutDepth = HitClip.z / HitClip.w;
+	// ---- THE TWO PASSES MUST AGREE BIT FOR BIT, AND `precise` IS WHAT MAKES
+	// THEM ------------------------------------------------------------------
+	//
+	// THE DEFECT THIS FIXES, because it shipped for weeks and its symptom looked
+	// like anything but a compiler flag. Under voxel.March.HalfRes 1 roughly half
+	// of all terrain pixels came out BLACK, in a smooth interference pattern, with
+	// Unreal's "YOUR SCENE CONTAINS A SKYDOME MESH WITH A SKY MATERIAL BUT IT DOES
+	// NOT COVER THAT PART OF THE SCREEN" placeholder legible through the gaps. The
+	// placeholder is the tell: it is stamped into SceneColor BEFORE the base pass
+	// with no depth test at all (BasePassRendering.cpp:1100), so it survives at
+	// exactly the pixels nothing later wrote SceneColor. Those pixels HAD terrain
+	// depth -- the sky pass skipped them -- and no GBuffer. The depth pre-emit had
+	// written, and this pass's fragments were then killed by the ROP.
+	//
+	// WHY THEY WERE KILLED. VoxelMarchDepthOnlyPS and this shader run the SAME
+	// VoxelMarchReconstruct over the SAME four samples and are required to produce
+	// the same t, and the file used to say the equal-depth test "cannot fail" on
+	// that ground. It is not a property of the source, it is a property of the
+	// CODEGEN, and DXC does not give the two entry points the same codegen. From
+	// the shipped disassembly (Saved/ShaderDebugInfo/.../Output.d3dasm):
+	//
+	//   FVoxelMarchDepthOnlyPS perm 1  (half res)  : 243 fast fp ops,   0 precise
+	//   FVoxelMarchEmitPS      perm 59 (half res)  : 260 fast fp ops, 234 precise
+	//
+	// and the backward slice from SV_Depth carries 19 FMads in one and 49 in the
+	// other. Same file, same DXC, same command line -- only -E differs.
+	//
+	// THE SOURCE OF THE ASYMMETRY IS THE VELOCITY OUTPUT. EncodeVelocityToTexture
+	// does asuint(V.z) on this same HitClip.z/HitClip.w (Common.ush:2076), and a
+	// bit reinterpret makes the exact bits observable, so DXC withdraws fast math
+	// from everything feeding it. At full res that chain stops at the MarchHitT
+	// texture Load and nothing upstream is affected; at half res it reaches back
+	// through the whole reconstruction and VoxelMarchBuildRay. The permutation
+	// table is its own control -- precise ops appear ONLY where VELOCITY 1 and
+	// HALFRES 1 are both set, which is exactly the shipping half-res arm:
+	//
+	//   perm 17/19 (Vel0, full res)  0 precise    perm 25/27 (Vel1, full res)  0 precise
+	//   perm 49/51 (Vel0, HALF res)  0 precise    perm 57/59 (Vel1, HALF res) 234 precise
+	//
+	// AND THE DIFFERENCE IS NOT ONE ULP, WHICH IS WHY THE LOSS IS HALF THE SCREEN
+	// AND NOT A SLIVER. VoxelMarchReconstruct turns its arithmetic into three
+	// DISCRETE decisions -- round() against a 1/64 lattice tolerance, a best-of-4
+	// (T >= BestT) selection, and a [0,1) face-extent test. A sub-ulp disagreement
+	// flips one of them, and then one pass takes the exact plane reconstruction
+	// while the other takes the nearest-neighbour fallback. Those are METRES
+	// apart, not ulps, and the smooth ringing is the phase of Lattice - round().
+	//
+	// `precise` removes the compiler's freedom to disagree: no reassociation and
+	// no contraction on anything feeding HitClip, in BOTH shaders, on EVERY
+	// permutation -- so the agreement is a language guarantee rather than a
+	// coincidence that held at full res and did not hold at half. The matching
+	// keyword is on VoxelMarchDepthOnlyPS's copy and the two must stay paired; if
+	// only one carries it the defect comes back inverted.
+	precise float4 HitClip = mul(float4(HitTWS, 1.0f), ResolvedView.TranslatedWorldToClip);
+	// Precise for the reason the depth pre-emit's copy gives: the quotient is not
+	// covered by `precise` on HitClip, and a rcp-vs-divide split on this one
+	// instruction is enough to fail CF_DepthNearOrEqual.
+	precise float DepthOut = HitClip.z / HitClip.w;
+	OutDepth = DepthOut;
 
 	// ---- the surface ------------------------------------------------------
 	// THE ORIGIN MUST BE TAKEN AT THE HIT'S OWN LEVEL. V.LocalVoxel is in
