@@ -130,3 +130,57 @@ footprint set a tick early). NOT yet attempted, and it must be measured with
 `avoided` and `reqHdr` read TOGETHER -- the module's own instructions say
 `avoided ~= calls` with a flat `reqHdr` means the diagnosis is wrong and the
 change should be reverted rather than tuned.
+
+---
+
+# The lock is NOT the lever, and the disk-I/O guess was wrong
+
+`-VoxelFineLockMeter=2`, one leg, the shipped default. The instrument was built
+for exactly this question and had never been run.
+
+    req calls=8,956  lockFree=0  shared=0  excl=8,956   (exclusive avoided 0.0%)
+    EXCL   timed=8,969   wait=10.0ms  hold=1.1ms   us/timed  wait=1.11  hold=0.12
+    SHARED timed=9,549   wait= 0.3ms  hold=0.4ms   us/timed  wait=0.033
+    waitShare=87.8% of 11,745,787 ns in-lock
+    acq[elev=1,019,320 climate=191,540 isResident=9,543 reqExcl=8,956 coldGame=0 ...]
+    entered=1,229,378                         contended=YES
+
+**It is armed and in the path** -- `entered` is 1.2 million, which is the reading
+that separates "no contention" from "instrument outside the path". The header
+insists on that distinction because twelve instruments on this project have read
+green while never being in the path.
+
+**And the verdict line says `contended=YES`, but the magnitudes refute the fix.**
+Most time INSIDE the lock is waiting (87.8%), yet the entire lock accounts for
+~11.7 ms per 2-second window while the sampler it guards costs up to 918-1000 ms
+in that same window. **Per call: 1.11 us of wait against a 22-587 us sample.**
+`-VoxelFineLockFast=1` -- the all-resident shared fast path, currently never taken
+(`reqFast=0`) -- would buy about a microsecond a call. It is not worth a leg.
+
+**`waitShare` is a RATIO AND ONLY A RATIO.** 87.8% of a small number is a small
+number, and reading that field without its denominator would have sold a fix
+worth ~1 us as though it were worth 500. The line prints `of 11,745,787 ns` for
+exactly that reason; read both.
+
+## And my own mechanism guess was wrong
+
+I attributed the 587 us to the fine-tier prefetch doing disk I/O on the game
+thread, reasoning from magnitude alone. **`coldGame=0`** -- `ResolveNonResidentPixel`
+on the game thread never fired once. There is no blocking tile load in this path
+on this leg.
+
+So the 587 us is neither lock waiting nor I/O. **It is work** -- four
+`vxc::Amplifier::column` evaluations plus a climate sample -- and it degrades 20x
+under load, which is what worker-pool pressure on cache and memory bandwidth does
+to a game-thread compute loop. That is a different problem with different fixes
+from the one I proposed.
+
+## What is left, honestly
+
+Not the lock (measured, ~1 us). Not the cache (89% avoided, negligible eviction).
+Not I/O (`coldGame=0`). The remaining shapes are: **sample fewer cold footprints**,
+**make the column evaluation cheaper**, or **stop paying for it on the submitting
+frame** -- and the last one is constrained by the sampler being game-thread-only
+by design (the table is unsynchronised; `offThread` is a checked hard zero).
+None of these is a flag, and none should be attempted on a magnitude argument
+again.
