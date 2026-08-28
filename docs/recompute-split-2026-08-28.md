@@ -77,3 +77,55 @@ a hitch.
 and leave R0-R2 immediate. A chunk 1-4 km away arriving one tick later is not
 visible; a chunk 60 m away arriving late is. Any attempt must carry a coverage
 check and matched captures, not a timing table alone.
+
+---
+
+# R5, chased and left open (2026-08-28)
+
+## What is established
+
+On the worst single recompute call of the leg (`totalMs=301.89`), the per-level
+entry maxima are:
+
+    R0 6.80   R1 8.30   R2 12.09   R3 23.65   R4 58.49   R5 180.39   R6 11.64
+
+**One R5 scan costs 180 ms.** It is the largest single event in the streaming
+tick, and R5's whole pooled cost is essentially two such scans. The growth
+R0->R5 is super-linear (x1.2, x1.5, x2.0, x2.5, x3.1) and then **collapses at
+R6**.
+
+## Three hypotheses, all dead
+
+1. **"Coarser costs more."** Refuted by R6 itself, which is coarser and cheap.
+2. **"R5 is the last ring inside atlas coverage."** `coverageRadius=2248` is
+   **pixels, not metres** -- ~4.2 km at 1875 mm/px, past R6's outer edge.
+3. **"Inside fine-tier coverage is expensive."** Refuted by the shape: R4 is
+   nearer, fully inside anything R5 is inside, and costs a third as much. The
+   curve is a PEAK, not a step, and no coverage boundary produces a peak.
+
+A fourth remains untested: that R6 is equally expensive but its costly scan
+happens during the 90 s preflight, outside the measured window -- which would
+dissolve the anomaly entirely rather than explain it.
+
+## A MEASUREMENT ERROR OF MINE, corrected here
+
+I built a us-per-CANDIDATE table (R5 52.6 vs R6 4.8) by dividing `entryMs` pooled
+over 65 windows by `rejN` taken from ONE window. **Two different populations, so
+the quotient means nothing.** Discarded. The us-per-FOOTPRINT table stands only
+because that one parses both fields from the same log line.
+
+Fourth population error of this programme, after the 33.3 ms hitch bar, a
+three-frame TAIL bucket, and a parked linger window. **The failure is not
+carelessness about one instrument -- it is combining two.**
+
+## Why the chase stops here
+
+Answering it needs a per-level instrumented build and another leg cycle, and the
+marginal value is low: **the outer-ring stagger already removes the practical
+harm.** R5's 180 ms scan hurts because it lands on the same tick as the other six
+rings; the stagger moves it off that tick and took the worst frame from 135 ms to
+26 ms. The cause of R5's size would be satisfying to know and would buy little on
+top of that.
+
+**Left open deliberately, with the dead hypotheses recorded so nobody re-runs
+them.**
