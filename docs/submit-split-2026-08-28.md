@@ -66,3 +66,67 @@ p99 is now 14.29 ms (70.0 fps). The owner's 1% low >= 50 fps gate is met with 20
 fps of margin. The older ">100 fps steady" target needs p99 at 10 ms, i.e. -4.3 ms
 -- and `loopSubmit` alone is 3.54 ms of the tail frame. **Submit is the right size
 to be the next target, and it is now two named terms rather than one opaque one.**
+
+---
+
+# What is inside `reqHdr`: a 100x-bimodal terrain sampler
+
+`reqHdr` spans `SubT0..SubT1`, and everything in it is trivial arithmetic --
+`SetChunkFootprint`, a seed copy, `CoarseLevel`, `RingSkirtMask` -- except one
+call: `VoxelApplyFast::ShadingForDispatch`, four `GetSurfaceHeightUU` amplifier
+columns plus a climate sample, per submission, on the game thread.
+
+## The cache in front of it IS working
+
+    busiest window   calls=45,125  avoided=40,025 (88.7%)  cacheHit=23,007  miss=5,100
+    another          calls=27,974  avoided=25,172 (90.0%)  cacheHit=13,157  miss=2,802
+
+~89% avoided, `cacheEvict` 173-208 against 131,072 slots, `mismatch=0`,
+`offThread=0`. Eviction is not the problem; the misses are genuine first touches
+on footprints the camera has never visited.
+
+## The MISSES are 100x bimodal, and that is the tail
+
+    per leg, 65 active windows      SUB-a            SUB-b
+    us/sample   min                  5.7              6.3
+                mean                30.8             35.9
+                MAX                327.6            587.0
+    ms/window   mean                38.3             39.8
+                MAX                917.9           1000.1
+    aggregate                     2,490 ms         2,587 ms   = 2% of game thread
+
+**A single sample swings 100x, and the worst 2-second window spends ~918-1000 ms
+of game thread -- about half of it -- inside this sampler.** In aggregate it is
+2%. Negligible mean, dominant tail: the same shape as every other real finding on
+this programme, and the reason a 1% low is a different problem from a mean.
+
+The magnitude points at I/O. `ShadingImpl`'s own comment says
+`GetSurfaceHeightUU`'s fine-tier prefetch "takes the sampler's lock exclusively
+and can do disk I/O", which is also why the whole thing is game-thread-only
+(`offThread` is a hard 0, checked rather than asserted).
+
+## A COMMENT AT THE CALL SITE IS WRONG, and worth fixing
+
+The site says the shading call "IS that bucket's body". That is right. But the
+first reading of `Voxel apply fast` taken here showed `calls=0` and appeared to
+refute it -- because it was read from the LAST windows of the leg, which fall in
+the 60 s parked linger where nothing streams. **69 of 134 windows legitimately
+read calls=0.** Sorting all windows instead shows 65 active ones peaking at
+45,125 calls.
+
+Third time tonight the same error class has appeared -- `Hitch frame` lines above
+33.3 ms, a per-window TAIL bucket of three frames, and now a parked linger window.
+**Check what population an instrument is describing before reading it**, and on
+this harness "the last window" is never the flight.
+
+## The lever
+
+Not the cache -- it is at 89% with almost no eviction. The cost is cold
+footprints being sampled inline at submit time, with a fine-tier fetch behind
+them. The candidate is to warm those samples ahead of the camera rather than pay
+them on the submitting frame; the streaming path already predicts where the
+camera is going (`voxel.Stream.VelocityLeadSec`, and the admission scan knows the
+footprint set a tick early). NOT yet attempted, and it must be measured with
+`avoided` and `reqHdr` read TOGETHER -- the module's own instructions say
+`avoided ~= calls` with a flat `reqHdr` means the diagnosis is wrong and the
+change should be reverted rather than tuned.
