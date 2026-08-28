@@ -16,6 +16,54 @@
 // For vxc::kWorldGenVersion, which ModifyCompilationEnvironment hands to
 // worldgen.ush as the version half of the mirror contract.
 #include "voxelcore/core.h"
+#include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
+#include "RHIBreadcrumbs.h"                         // RHI_BREADCRUMB_EVENT_STAT (5.8 spelling)
+#include "RenderGraphEvent.h" // RDG_EVENT_SCOPE_STAT, for the nested sub-terms
+
+// ---------------------------------------------------------------------------
+// STREAMING-SIDE GPU STATS -- the split for the unattributed +5.47 ms.
+//
+// THE SPELLING MATTERS AND THREE OF THEM ARE DEAD. In 5.8 SCOPED_GPU_STAT,
+// RDG_GPU_STAT_SCOPE and RDG_RHI_GPU_STAT_SCOPE are UE_DEPRECATED_MACRO and
+// expand to NOTHING -- they compile, they look armed, and they measure zero.
+// RHI_BREADCRUMB_EVENT_STAT (RHIBreadcrumbs.h:1302) and RDG_EVENT_SCOPE_STAT
+// (RenderGraphEvent.h:480) are the live spellings. These sites use the first;
+// see the note at each one for why the RDG form cannot be used here.
+//
+// WHAT THE COLUMN IS. Every DECLARE_GPU_STAT_NAMED stat has its per-frame
+// EXCLUSIVE (Busy + Wait) milliseconds written to the CSV profiler once per
+// frame, end-of-pipe, as GPU/<StatName> (GPUProfiler.cpp:1065-1067). The
+// engine also emits GPU/Unaccounted -- queue time inside NO stat scope
+// (GPUProfiler.cpp:800, accumulated at :1556 only when the stat stack is
+// empty). So the GPU/ columns of one row SUM to the frame's queue busy time
+// and the decomposition checks itself.
+//
+// KEEP THESE SIBLINGS, NEVER NESTED. Exclusive time is charged to the
+// innermost stat only; nesting would silently move a term and make "which
+// number am I reading" a live question. Each scope below wraps one standalone
+// FRDGBuilder in one ENQUEUE_RENDER_COMMAND, so they are siblings by
+// construction.
+//
+// ARMING: -csvGpuStats on the command line (r.GPUCsvStatsEnabled defaults 0 --
+// with it off the GPU/ columns are simply ABSENT, no error), plus
+// `CsvProfile FRAMES=N`. A CSV with no GPU/ column measured nothing.
+// ---------------------------------------------------------------------------
+DECLARE_GPU_STAT_NAMED(VoxelStreamRegionBlocking, TEXT("VoxelStreamRegionBlocking"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRegionGraph, TEXT("VoxelStreamRegionGraph"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRgGen, TEXT("VoxelStreamRgGen"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRgColumn, TEXT("VoxelStreamRgColumn"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRgVoxelize, TEXT("VoxelStreamRgVoxelize"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRgAsset, TEXT("VoxelStreamRgAsset"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRgBand, TEXT("VoxelStreamRgBand"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRgBrickPack, TEXT("VoxelStreamRgBrickPack"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamRgMesh, TEXT("VoxelStreamRgMesh"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamWlColumn, TEXT("VoxelStreamWlColumn"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamWlVoxelize, TEXT("VoxelStreamWlVoxelize"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamWlClassify, TEXT("VoxelStreamWlClassify"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamWlStamp, TEXT("VoxelStreamWlStamp"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamWlPack, TEXT("VoxelStreamWlPack"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamWlClaim, TEXT("VoxelStreamWlClaim"));
+DECLARE_GPU_STAT_NAMED(VoxelStreamPoolWrite, TEXT("VoxelStreamPoolWrite"));
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGpu, Log, All);
 
@@ -2035,6 +2083,14 @@ VoxelGpuWorldGen::FRegionGraphResources
 VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request,
                                   const FWorklistColumnFeed* ColumnFeed)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRegionGraph, "VoxelStreamRegionGraph");
 	check(IsInRenderingThread());
 
 	FRegionGraphResources Out;
@@ -2185,6 +2241,17 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			TEXT("Voxel.Cells"))
 		: nullptr;
 
+	// --- THE GENERATION HALF: density for this region ----------------------
+	// NESTED INSIDE VoxelStreamRegionGraph, and still a clean split: the CSV
+	// value is EXCLUSIVE busy+wait, charged to the INNERMOST open stat only, so
+	// the enclosing column reads as the REST of the region graph.
+	{
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRgGen, "VoxelStreamRgGen");
+	// Sibling of the other three inside VoxelStreamRgGen, so RgGen itself reads
+	// as the REST of the generation half. Exclusive time goes to the innermost
+	// open stat, so the four plus RgGen still sum to the queue total.
+	{
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRgColumn, "VoxelStreamRgColumn");
 	// --- pass 1: ColumnMain ----------------------------------------
 	//
 	// SKIPPED with a worklist column feed (the once-per-tick indirect
@@ -2234,6 +2301,13 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FIntVector(FVoxelGpuWorklist::kColumnGroupsPerRecord, 1, 1));
 	}
 
+	} // end VoxelStreamRgColumn
+
+	// Sibling of the other three inside VoxelStreamRgGen, so RgGen itself reads
+	// as the REST of the generation half. Exclusive time goes to the innermost
+	// open stat, so the four plus RgGen still sum to the queue total.
+	{
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRgVoxelize, "VoxelStreamRgVoxelize");
 	// --- pass 2: VoxelizeMain --------------------------------------
 	//
 	// SKIPPED with a worklist CELL feed (the once-per-tick indirect
@@ -2271,6 +2345,13 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
 	}
 
+	} // end VoxelStreamRgVoxelize
+
+	// Sibling of the other three inside VoxelStreamRgGen, so RgGen itself reads
+	// as the REST of the generation half. Exclusive time goes to the innermost
+	// open stat, so the four plus RgGen still sum to the queue total.
+	{
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRgAsset, "VoxelStreamRgAsset");
 	// --- pass 2a: AssetStampMain / AssetStampCoarseMain, one dispatch per ----
 	// --- instance -------------------------------------------------------------
 	//
@@ -2429,6 +2510,13 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FIntVector(FVoxelGpuWorklist::kCellsPerRecord / 64, 1, 1));
 	}
 
+	} // end VoxelStreamRgAsset
+
+	// Sibling of the other three inside VoxelStreamRgGen, so RgGen itself reads
+	// as the REST of the generation half. Exclusive time goes to the innermost
+	// open stat, so the four plus RgGen still sum to the queue total.
+	{
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRgBand, "VoxelStreamRgBand");
 	// --- pass 2b: BandReduceMain (Wave D / D6) -----------------------
 	//
 	// After ColumnMain, before anything else needs it, and independent of the
@@ -2464,6 +2552,9 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FIntVector(1, 1, 1));   // exactly one workgroup, by design
 	}
 
+	} // end VoxelStreamRgBand
+	} // end VoxelStreamRgGen
+
 	// --- P1-C: the brick chain, after AssetStamp and off the mesh path ------
 	//
 	// BrickClassifyMain -> ScanBlocks/ScanSums/ScanAdd x2 -> BrickPackMain, over
@@ -2482,6 +2573,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	if (S.bBrickPack)
 	{
 		RDG_EVENT_SCOPE(GraphBuilder, "Voxel.BrickPack");
+		RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRgBrickPack, "VoxelStreamRgBrickPack");
 
 		// The classic count-side transients exist only when the classic
 		// count side runs (see bClassicScan): a totals-fed chunk's counts
@@ -2788,6 +2880,12 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		return Out;
 	}
 
+	// --- THE MESH HALF: quad emission ---------------------------------------
+	// NESTED INSIDE VoxelStreamRegionGraph, and still a clean split: the CSV
+	// value is EXCLUSIVE busy+wait, charged to the INNERMOST open stat only, so
+	// the enclosing column reads as the REST of the region graph.
+	{
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamRgMesh, "VoxelStreamRgMesh");
 	Out.Counts = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.MaskCount), TEXT("Voxel.QuadCounts"));
 	Out.Offsets = GraphBuilder.CreateBuffer(
@@ -2897,6 +2995,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			GraphBuilder, RDG_EVENT_NAME("Voxel.QuadTotalMain"), Shader, Params,
 			FIntVector(1, 1, 1));
 	}
+	} // end VoxelStreamRgMesh
 
 	return Out;
 }
@@ -2911,6 +3010,14 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 void VoxelGpuWorldGen::AddWorklistColumnPass(FRDGBuilder& GraphBuilder,
                                              const FWorklistColumnDispatch& Dispatch)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamWlColumn, "VoxelStreamWlColumn");
 	check(IsInRenderingThread());
 	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs && Dispatch.ColumnArena);
 	check(Dispatch.Atlas != nullptr && Dispatch.PixelSizeMm != 0 && Dispatch.RingCapacity > 0);
@@ -2960,6 +3067,14 @@ void VoxelGpuWorldGen::AddWorklistColumnPass(FRDGBuilder& GraphBuilder,
 void VoxelGpuWorldGen::AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder,
                                                const FWorklistVoxelizeDispatch& Dispatch)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamWlVoxelize, "VoxelStreamWlVoxelize");
 	check(IsInRenderingThread());
 	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs);
 	check(Dispatch.ColumnArena && Dispatch.CellArena);
@@ -3009,6 +3124,14 @@ void VoxelGpuWorldGen::AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder,
 void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
                                                  const FWorklistClassifyDispatch& Dispatch)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamWlClassify, "VoxelStreamWlClassify");
 	check(IsInRenderingThread());
 	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs && Dispatch.CellArena);
 	check(Dispatch.OccCounts && Dispatch.MatCounts && Dispatch.OccOffsets &&
@@ -3072,6 +3195,14 @@ void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
 void VoxelGpuWorldGen::AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder,
                                                  const FWorklistAssetStampDispatch& Dispatch)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamWlStamp, "VoxelStreamWlStamp");
 	check(IsInRenderingThread());
 	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs && Dispatch.CellArena);
 	check(Dispatch.Instances && Dispatch.ColStarts && Dispatch.Spans);
@@ -3099,6 +3230,14 @@ void VoxelGpuWorldGen::AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder,
 void VoxelGpuWorldGen::AddWorklistPackPass(FRDGBuilder& GraphBuilder,
                                            const FWorklistPackDispatch& Dispatch)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamWlPack, "VoxelStreamWlPack");
 	check(IsInRenderingThread());
 	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs);
 	check(Dispatch.CellArena && Dispatch.OccOffsets && Dispatch.MatOffsets);
@@ -3550,6 +3689,14 @@ FRDGBufferRef VoxelGpuWorldGen::AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
                                                       uint32 SrcWordsOccBase,
                                                       uint32 SrcWordsMatBase)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamPoolWrite, "VoxelStreamPoolWrite");
 	if (!Buffers.IsValid() || BrickTotals == nullptr)
 	{
 		return nullptr;
@@ -3594,6 +3741,14 @@ void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
                                                     uint32 SrcDescBase, uint32 ChunkMaskBase,
                                                     uint32 SrcWordsOccBase, uint32 SrcWordsMatBase)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamPoolWrite, "VoxelStreamPoolWrite");
 	if (!Buffers.IsValid() || Claim == nullptr || SrcOcc == nullptr || SrcMat == nullptr ||
 	    SrcDesc == nullptr || SrcChunkMask == nullptr || BrickCount == 0)
 	{
@@ -3735,6 +3890,14 @@ void VoxelGpuWorldGen::AddBrickPoolAllocVerifyPass(FRDGBuilder& GraphBuilder,
 void VoxelGpuWorldGen::AddWorklistClaimPasses(FRDGBuilder& GraphBuilder,
                                               const FWorklistClaimDispatch& Dispatch)
 {
+	// NESTED, AND THE COLUMN IS STILL A CLEAN SPLIT. The CSV value is the stat's
+	// EXCLUSIVE busy+wait (GPUProfiler.cpp:1066), charged only while this stat is
+	// the INNERMOST open one (:1548-1552), so the enclosing scope reports itself
+	// MINUS this one and every GPU/ column still sums to the queue total. Read the
+	// enclosing name as "the rest of", never as the whole.
+	// RDG form is safe HERE (unlike at the top-level builders): this scope closes
+	// when the function returns, which is before anyone calls Execute.
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelStreamWlClaim, "VoxelStreamWlClaim");
 	check(IsInRenderingThread());
 	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs);
 	check(Dispatch.Totals && Dispatch.PackDesc && Dispatch.PackOcc);
@@ -3936,6 +4099,15 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		 StackTotalDwords, &BrickDescOut, &BrickOccOut, &BrickMatOut, &BrickTotalsOut, &StackTotalsOut]
 		(FRHICommandListImmediate& RHICmdList)
 	{
+		// ON THE RHI COMMAND LIST, NOT THE GRAPH, AND THAT IS FORCED. An
+		// RDG_EVENT_SCOPE_STAT here asserts at FRDGBuilder::Execute --
+		// RenderGraphBuilder.cpp:1770 checks the graph's breadcrumb is back at
+		// Sentinel -- because these builders Execute inside the scope rather than
+		// after it. Measured: it crashed the first leg at VoxelRasterAtlasGpu.
+		// RHI_BREADCRUMB_EVENT_STAT is the same stat on the RHI timeline, feeds
+		// the same GPU/<name> CSV column, and outlives the graph by construction
+		// (declared before it, destroyed after it).
+		RHI_BREADCRUMB_EVENT_STAT(RHICmdList, VoxelStreamRegionBlocking, "VoxelStreamRegionBlocking");
 		FRDGBuilder GraphBuilder(RHICmdList);
 
 		// The seven passes, shared verbatim with FVoxelGpuMeshJobManager.
@@ -4229,6 +4401,15 @@ bool VoxelGpuWorldGen::DecodeQuadsBlocking(const TArray<uint64>& Quads,
 		[&Quads, &Raw, &RenderError, NumQuads, NumVertices, LevelScale]
 		(FRHICommandListImmediate& RHICmdList)
 	{
+		// ON THE RHI COMMAND LIST, NOT THE GRAPH, AND THAT IS FORCED. An
+		// RDG_EVENT_SCOPE_STAT here asserts at FRDGBuilder::Execute --
+		// RenderGraphBuilder.cpp:1770 checks the graph's breadcrumb is back at
+		// Sentinel -- because these builders Execute inside the scope rather than
+		// after it. Measured: it crashed the first leg at VoxelRasterAtlasGpu.
+		// RHI_BREADCRUMB_EVENT_STAT is the same stat on the RHI timeline, feeds
+		// the same GPU/<name> CSV column, and outlives the graph by construction
+		// (declared before it, destroyed after it).
+		RHI_BREADCRUMB_EVENT_STAT(RHICmdList, VoxelStreamRegionBlocking, "VoxelStreamRegionBlocking");
 		FRDGBuilder GraphBuilder(RHICmdList);
 
 		FRDGBufferRef QuadsBuffer = CreateStructuredBuffer(

@@ -10,6 +10,38 @@
 #include "RenderingThread.h"
 #include "ShaderCompilerCore.h"
 #include "ShaderParameterStruct.h"
+#include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
+#include "RHIBreadcrumbs.h"                         // RHI_BREADCRUMB_EVENT_STAT (5.8 spelling)
+
+// ---------------------------------------------------------------------------
+// STREAMING-SIDE GPU STATS -- the split for the unattributed +5.47 ms.
+//
+// THE SPELLING MATTERS AND THREE OF THEM ARE DEAD. In 5.8 SCOPED_GPU_STAT,
+// RDG_GPU_STAT_SCOPE and RDG_RHI_GPU_STAT_SCOPE are UE_DEPRECATED_MACRO and
+// expand to NOTHING -- they compile, they look armed, and they measure zero.
+// RHI_BREADCRUMB_EVENT_STAT (RHIBreadcrumbs.h:1302) and RDG_EVENT_SCOPE_STAT
+// (RenderGraphEvent.h:480) are the live spellings. These sites use the first;
+// see the note at each one for why the RDG form cannot be used here.
+//
+// WHAT THE COLUMN IS. Every DECLARE_GPU_STAT_NAMED stat has its per-frame
+// EXCLUSIVE (Busy + Wait) milliseconds written to the CSV profiler once per
+// frame, end-of-pipe, as GPU/<StatName> (GPUProfiler.cpp:1065-1067). The
+// engine also emits GPU/Unaccounted -- queue time inside NO stat scope
+// (GPUProfiler.cpp:800, accumulated at :1556 only when the stat stack is
+// empty). So the GPU/ columns of one row SUM to the frame's queue busy time
+// and the decomposition checks itself.
+//
+// KEEP THESE SIBLINGS, NEVER NESTED. Exclusive time is charged to the
+// innermost stat only; nesting would silently move a term and make "which
+// number am I reading" a live question. Each scope below wraps one standalone
+// FRDGBuilder in one ENQUEUE_RENDER_COMMAND, so they are siblings by
+// construction.
+//
+// ARMING: -csvGpuStats on the command line (r.GPUCsvStatsEnabled defaults 0 --
+// with it off the GPU/ columns are simply ABSENT, no error), plus
+// `CsvProfile FRAMES=N`. A CSV with no GPU/ column measured nothing.
+// ---------------------------------------------------------------------------
+DECLARE_GPU_STAT_NAMED(VoxelStreamGIMarch, TEXT("VoxelStreamGIMarch"));
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGIMarch, Log, All);
 
@@ -176,6 +208,15 @@ namespace
 	void VoxelGIMarchDispatch_RenderThread(FRHICommandListImmediate& RHICmdList,
 	                                       const FVoxelGIMarchRequest& Request)
 	{
+		// ON THE RHI COMMAND LIST, NOT THE GRAPH, AND THAT IS FORCED. An
+		// RDG_EVENT_SCOPE_STAT here asserts at FRDGBuilder::Execute --
+		// RenderGraphBuilder.cpp:1770 checks the graph's breadcrumb is back at
+		// Sentinel -- because these builders Execute inside the scope rather than
+		// after it. Measured: it crashed the first leg at VoxelRasterAtlasGpu.
+		// RHI_BREADCRUMB_EVENT_STAT is the same stat on the RHI timeline, feeds
+		// the same GPU/<name> CSV column, and outlives the graph by construction
+		// (declared before it, destroyed after it).
+		RHI_BREADCRUMB_EVENT_STAT(RHICmdList, VoxelStreamGIMarch, "VoxelStreamGIMarch");
 		FRDGBuilder GraphBuilder(RHICmdList);
 
 		// The volumes first, because this is the refusal most likely to fire and

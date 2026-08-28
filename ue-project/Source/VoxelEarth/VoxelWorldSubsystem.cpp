@@ -121,6 +121,35 @@
 #include "Async/Future.h"           // ...and the TFuture<void> handles WaitForInFlightTasks drains
 #include "Misc/QueuedThreadPool.h"  // ...the pool itself (FQueuedThreadPool::Allocate/Create)
 #include "UObject/UObjectGlobals.h"
+#include "ProfilingDebugging/CsvProfiler.h" // the per-frame series the log line cannot carry
+
+// ---------------------------------------------------------------------------
+// THE PER-FRAME SERIES, so the GPU columns have something to be correlated
+// AGAINST inside one file.
+//
+// The attribution report below prints BUCKET MEANS -- FAST / SLOW / TAIL -- and
+// never the samples (FrameSamples is never printed and never cleared). That is
+// enough to say "the tail is +5.47 ms of GPU" and structurally unable to say
+// whether the chunk spike LEADS the GPU spike or LAGS it, which is the whole
+// reverse-causation question: an unlimited harvest cap means a 22 ms frame
+// gives async jobs 2.4x the wall time a 9 ms frame does, so chunks/frame would
+// correlate with frame time with ZERO causal contribution.
+//
+// These columns land in the same CSV row as GPU/<stat>, one row per frame, so a
+// cross-correlation at lag +/-N is computable offline. Recording is a no-op
+// unless a capture is running (FCsvProfiler::RecordCustomStat returns
+// immediately on !GCsvProfilerIsCapturing), so this costs a predicted-not-taken
+// branch per frame when nobody asked for it.
+//
+// GpuFrameMs IS THE TIMELINE CALIBRATION AND THAT IS ITS MAIN JOB. GPU/ columns
+// are written on the END-OF-PIPE timeline; these are written on the game
+// thread. The two timelines are both one-row-per-frame but need not share a
+// phase. GpuFrameMs is the SAME underlying quantity as the sum of the GPU/
+// columns (both come from the queue's busy cycles), so cross-correlating this
+// column against that sum measures the offset between the two timelines
+// directly, and every other lag can then be quoted net of it. Without it, a
+// "chunks lead GPU by 2 frames" reading could be an artefact of the plumbing.
+CSV_DEFINE_CATEGORY(VoxelStream, true);
 
 #include <algorithm>
 #include <atomic>
@@ -6737,6 +6766,27 @@ struct FVoxelWorldImpl
 		float DispatchMs = 0.f;   // the whole dispatch loop, game thread
 		float SubmitMs = 0.f;     // ... of which the submit bracket (raster-atlas fills land here)
 		float ApplyMs = 0.f;      // component apply, game thread
+		// THE REST OF THE TICK. dispatch + apply accounted for less than half of
+		// the p99 tick rise and the remainder had no field to live in, so it read
+		// as unattributable rather than as remesh/unload/brick-flush. These three
+		// plus dispatch and apply are the five stages the tick is actually made
+		// of; what is STILL left over is printed as `other` and is a real gap,
+		// not a rounding term.
+		// THE DISPATCH LOOP SPLIT, on the frame sample rather than only on the
+		// `Hitch frame dispatch` line. That line prints ONLY above 33.3 ms while
+		// the moving tail sits at 15-23 ms, so this split existed and had never
+		// once been read over the population it was needed for -- the third
+		// separate question that one bar has blocked. `submit` is a SUBSET of
+		// dispatch, not a sibling of it.
+		float DispAirProofMs = 0.f;
+		float DispBandMs = 0.f;
+		float DispPickMs = 0.f;
+		float DispOverlayMs = 0.f;
+		float DispLoopMs = 0.f;
+		float GpuMgrTickMs = 0.f;
+		float RemeshMs = 0.f;
+		float UnloadMs = 0.f;
+		float BrickFlushMs = 0.f;
 		int32 Applies = 0;        // chunks applied this frame
 	};
 	static constexpr int32 kMaxFrameSamples = 40000;
@@ -6782,6 +6832,15 @@ struct FVoxelWorldImpl
 	float PrevTickDispatchMs = 0.f;
 	float PrevTickSubmitMs = 0.f;
 	float PrevTickApplyMs = 0.f;
+	float PrevTickDispAirProofMs = 0.f;
+	float PrevTickDispBandMs = 0.f;
+	float PrevTickDispPickMs = 0.f;
+	float PrevTickDispOverlayMs = 0.f;
+	float PrevTickDispLoopMs = 0.f;
+	float PrevTickGpuMgrTickMs = 0.f;
+	float PrevTickRemeshMs = 0.f;
+	float PrevTickUnloadMs = 0.f;
+	float PrevTickBrickFlushMs = 0.f;
 	int32 PrevTickApplies = 0;
 
 	int64 SpecParkedSinceLog = 0;
@@ -8183,6 +8242,11 @@ struct FVoxelWorldImpl
 	float ThisFrameApplyMs = 0.f;
 	float ThisFrameRemeshMs = 0.f;
 	float ThisFrameUnloadMs = 0.f;
+	// THE FIFTH STAGE, and it was outside the four from the day it was added:
+	// the brick-pool Flush has only ever had a WINDOW accumulator
+	// (AccumBrickFlushMs), so it could not appear in a per-frame bucket and
+	// landed in the tick residual that nothing names.
+	float ThisFrameBrickFlushMs = 0.f;
 
 	// M1 steady-state-hitch wave (docs/status.md "R3/R4 recompute
 	// amortization"): the four Drain*/Dispatch timers above cover everything
@@ -10437,7 +10501,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// ThisFrameUnloadMs would be a cost nobody could attribute later.
 		const double BrickFlushT0 = FPlatformTime::Seconds();
 		GetGlobalVoxelBrickPool().Flush();
-		AccumBrickFlushMs += (FPlatformTime::Seconds() - BrickFlushT0) * 1000.0;
+		{
+			const double BrickFlushMs = (FPlatformTime::Seconds() - BrickFlushT0) * 1000.0;
+			AccumBrickFlushMs += BrickFlushMs;
+			ThisFrameBrickFlushMs = float(BrickFlushMs);
+		}
 
 		// Hitch attribution timing (docs/status.md "Perf-run hitches"
 		// isolation task): four cheap FPlatformTime::Seconds() calls (already
@@ -10573,6 +10641,23 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// same population the parked dist row reports, so the two can be compared
 	// directly and the clock either passes or fails on its own leg.
 	const bool bAttrSettled = AttributionMode >= 2 && VoxelFramePhase::IsSettled();
+
+	// THE GPU DRAIN IS UNCONDITIONAL NOW, and it has to be for the CSV series
+	// below to exist on frames the attribution gate declines. It is not a
+	// behaviour change for any leg on disk: the drain takes the FRESHEST
+	// published timing and discards the backlog, so a frame that qualifies
+	// reads exactly the same value whether or not the frames before it drained.
+	// (GpuSamplesSeen counts more pops than it used to. It is an ARMED/NOT-ARMED
+	// witness, not a rate, so that is harmless -- but it is stated rather than
+	// left for someone to trip over.)
+	{
+		uint64 GpuCycles = 0;
+		while (GpuHistoryState.PopFrameCycles(GpuCycles) != FRHIGPUFrameTimeHistory::EResult::Empty)
+		{
+			LastGpuMs = float(double(GpuCycles) * FPlatformTime::GetSecondsPerCycle64() * 1000.0);
+			++GpuSamplesSeen;
+		}
+	}
 	if (AttributionMode != 0
 	    && (AttributionMode == 1
 	        || (bAttrSettled && AttributionMode == 2
@@ -10589,23 +10674,23 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		Sample.RHIMs        = float(GRHIThreadTime * CyToMs);
 		Sample.GameWaitMs   = float(GGameThreadWaitTime * CyToMs);
 		Sample.GameMs       = float(GGameThreadTime * CyToMs);
-		// Drain to the freshest published GPU frame. Disjoint means we missed
-		// some, which is expected when the game thread outruns the queue and is
-		// not an error -- both Ok and Disjoint carry a valid timing.
-		{
-			uint64 GpuCycles = 0;
-			while (GpuHistoryState.PopFrameCycles(GpuCycles) != FRHIGPUFrameTimeHistory::EResult::Empty)
-			{
-				LastGpuMs = float(double(GpuCycles) * FPlatformTime::GetSecondsPerCycle64() * 1000.0);
-				++GpuSamplesSeen;
-			}
-		}
+		// Drained above, unconditionally -- see the note at bAttrSettled. Same
+		// value this bucket has always read.
 		Sample.GpuMs        = LastGpuMs;
 		// PREVIOUS tick's values -- see PrevTickDispatchMs for why pairing
 		// this frame's duration with this tick's work is wrong.
 		Sample.DispatchMs   = PrevTickDispatchMs;
 		Sample.SubmitMs     = PrevTickSubmitMs;
 		Sample.ApplyMs      = PrevTickApplyMs;
+		Sample.DispAirProofMs = PrevTickDispAirProofMs;
+		Sample.DispBandMs     = PrevTickDispBandMs;
+		Sample.DispPickMs     = PrevTickDispPickMs;
+		Sample.DispOverlayMs  = PrevTickDispOverlayMs;
+		Sample.DispLoopMs     = PrevTickDispLoopMs;
+		Sample.GpuMgrTickMs   = PrevTickGpuMgrTickMs;
+		Sample.RemeshMs     = PrevTickRemeshMs;
+		Sample.UnloadMs     = PrevTickUnloadMs;
+		Sample.BrickFlushMs = PrevTickBrickFlushMs;
 		Sample.Applies      = PrevTickApplies;
 		// NO DIRECT GPU TIME. It needs FRHIGPUFrameTimeHistory, a pull-based API
 		// with its own state, which is more plumbing than this pass warrants --
@@ -10619,6 +10704,39 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		}
 	}
 
+	// THE CSV ROW FOR THIS FRAME. THIS tick's raw counters, deliberately NOT the
+	// one-frame carry the FFrameSample uses: the carry exists so a bucket MEAN
+	// pairs work with the frame duration that contains it, and a cross-
+	// correlation must be handed the unshifted series or it is being told the
+	// answer. The shift is recoverable offline; a pre-applied one is not.
+	//
+	// Population selectors travel WITH the row rather than being reconstructed:
+	// every verdict in this investigation is quoted over SETTLED-MOVING, and an
+	// instrument whose population has to be guessed offline is how a p99 gets
+	// computed over a cold fill.
+	if (FCsvProfiler::IsCapturing())
+	{
+		const bool bCsvSettled = VoxelFramePhase::IsSettled();
+		const bool bCsvMoving  = VoxelFramePhase::IsMovingSpeed(SmoothedAnchorSpeedUUPerSec);
+		CSV_CUSTOM_STAT(VoxelStream, GpuFrameMs,    double(LastGpuMs),                 ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, ChunksApplied, double(ThisFrameAppliesFromWorker), ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, TickMs,        double(TickMsSoFar),               ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, DispatchMs,    double(ThisFrameDispatchMs),       ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SubmitMs,      double(ThisFrameDispatchSubmitMs), ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, ApplyMs,       double(ThisFrameApplyMs),          ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, DispAirProofMs, double(ThisFrameDispatchAirProofMs), ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, DispBandMs,    double(ThisFrameDispatchBandMs),   ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, DispPickMs,    double(ThisFrameDispatchPickMs),   ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, DispOverlayMs, double(ThisFrameDispatchOverlayMs), ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, GpuMgrTickMs,  double(ThisFrameGpuManagerTickMs), ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, RemeshMs,      double(ThisFrameRemeshMs),         ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, UnloadMs,      double(ThisFrameUnloadMs),         ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, BrickFlushMs,  double(ThisFrameBrickFlushMs),     ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, Settled,       bCsvSettled ? 1.0 : 0.0,           ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, Moving,        bCsvMoving  ? 1.0 : 0.0,           ECsvCustomStatOp::Set);
+		CSV_CUSTOM_STAT(VoxelStream, SpeedMps,      double(SmoothedAnchorSpeedUUPerSec) * 0.01, ECsvCustomStatOp::Set);
+	}
+
 	// Carry THIS tick's game-thread counters for the NEXT frame's sample, which
 	// is the frame whose DeltaTime will actually contain them. Unconditional and
 	// four stores: gating it on the cvar would leave stale values behind when a
@@ -10628,6 +10746,15 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	PrevTickDispatchMs = ThisFrameDispatchMs;
 	PrevTickSubmitMs   = ThisFrameDispatchSubmitMs;
 	PrevTickApplyMs    = ThisFrameApplyMs;
+	PrevTickDispAirProofMs = ThisFrameDispatchAirProofMs;
+	PrevTickDispBandMs     = ThisFrameDispatchBandMs;
+	PrevTickDispPickMs     = ThisFrameDispatchPickMs;
+	PrevTickDispOverlayMs  = ThisFrameDispatchOverlayMs;
+	PrevTickDispLoopMs     = ThisFrameDispatchLoopMs;
+	PrevTickGpuMgrTickMs   = ThisFrameGpuManagerTickMs;
+	PrevTickRemeshMs   = ThisFrameRemeshMs;
+	PrevTickUnloadMs   = ThisFrameUnloadMs;
+	PrevTickBrickFlushMs = ThisFrameBrickFlushMs;
 	PrevTickApplies    = ThisFrameAppliesFromWorker;
 
 	if (FrameMs > 16.6f) // the actual 60fps gate bar (see TotalFramesOver60FpsBar)
@@ -12600,6 +12727,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			double Game = 0;
 			double Gpu = 0; int32 GpuN = 0; float MaxGpu = 0.f;
 			double Dispatch = 0, Submit = 0, Apply = 0, Applies = 0;
+			double Remesh = 0, Unload = 0, BrickFlush = 0;
+			double DAir = 0, DBand = 0, DPick = 0, DOverlay = 0, DLoop = 0, GpuMgr = 0;
+			float MaxDAir = 0.f, MaxDBand = 0.f, MaxDPick = 0.f, MaxDOverlay = 0.f, MaxGpuMgr = 0.f;
+			float MaxRemesh = 0.f, MaxUnload = 0.f, MaxBrickFlush = 0.f;
 			float MaxSubmit = 0.f, MaxDispatch = 0.f, MaxApply = 0.f;
 			int32 N = 0;
 			void Add(const FFrameSample& F)
@@ -12611,6 +12742,17 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				// would drag every bucket toward a number that means nothing.
 				if (F.GpuMs >= 0.f) { Gpu += F.GpuMs; ++GpuN; MaxGpu = FMath::Max(MaxGpu, F.GpuMs); }
 				Dispatch += F.DispatchMs; Submit += F.SubmitMs; Apply += F.ApplyMs;
+				Remesh += F.RemeshMs; Unload += F.UnloadMs; BrickFlush += F.BrickFlushMs;
+				DAir += F.DispAirProofMs; DBand += F.DispBandMs; DPick += F.DispPickMs;
+				DOverlay += F.DispOverlayMs; DLoop += F.DispLoopMs; GpuMgr += F.GpuMgrTickMs;
+				MaxDAir = FMath::Max(MaxDAir, F.DispAirProofMs);
+				MaxDBand = FMath::Max(MaxDBand, F.DispBandMs);
+				MaxDPick = FMath::Max(MaxDPick, F.DispPickMs);
+				MaxDOverlay = FMath::Max(MaxDOverlay, F.DispOverlayMs);
+				MaxGpuMgr = FMath::Max(MaxGpuMgr, F.GpuMgrTickMs);
+				MaxRemesh = FMath::Max(MaxRemesh, F.RemeshMs);
+				MaxUnload = FMath::Max(MaxUnload, F.UnloadMs);
+				MaxBrickFlush = FMath::Max(MaxBrickFlush, F.BrickFlushMs);
 				Applies += double(F.Applies);
 				MaxSubmit = FMath::Max(MaxSubmit, F.SubmitMs);
 				MaxDispatch = FMath::Max(MaxDispatch, F.DispatchMs);
@@ -12716,6 +12858,105 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       Slow.M(Slow.Apply) - Fast.M(Fast.Apply),
 		       Slow.M(Slow.Applies) - Fast.M(Fast.Applies),
 		       Fast.M(Fast.GameWait));
+
+		// ---- THE TICK'S OWN FIVE STAGES, AND WHAT IS STILL NOT NAMED --------
+		//
+		// WHY THIS IS A SEPARATE LINE. The three bucket rows above carry
+		// dispatch, submit and apply, and on the pooled 13-leg p99 those account
+		// for roughly half of the tick's rise -- leaving the largest single term
+		// in the whole tail with no name. It had no name because FFrameSample had
+		// no FIELD for it: remesh, unload and the brick-pool flush are timed per
+		// tick (T2->T3, T3b->T4, and the BrickFlush bracket) and were only ever
+		// summed into a 5-second window, which cannot be bucketed by frame.
+		//
+		// READ `other` FIRST, AND READ IT AS A GAP. It is
+		//     tick - (dispatch + apply + remesh + unload + brickFlush)
+		// with NO clamp, deliberately. A negative `other` is not a small number,
+		// it is a SAMPLING FAULT -- all six come from the same tick via the carry,
+		// so they cannot legitimately sum past it. A large positive `other` means
+		// the tick spends time where none of the five brackets look, which is a
+		// different fix from all five of them.
+		//
+		// `submit` is a SUBSET of `dispatch`, not a sixth stage -- it is the
+		// submit bracket inside the dispatch loop, where the raster-atlas fills
+		// land. It is printed on the rows above; adding it here would double-count.
+		{
+			auto Other = [](const FAccum& A) -> double
+			{
+				return A.M(A.Tick) - (A.M(A.Dispatch) + A.M(A.Apply) + A.M(A.Remesh)
+				                      + A.M(A.Unload) + A.M(A.BrickFlush));
+			};
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel frame attribution TICK-STAGES (mean ms; other = tick - the five, UNCLAMPED): ")
+			       TEXT("FAST tick=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f | ")
+			       TEXT("SLOW tick=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f | ")
+			       TEXT("TAIL tick=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f"),
+			       Fast.M(Fast.Tick), Fast.M(Fast.Dispatch), Fast.M(Fast.Apply), Fast.M(Fast.Remesh),
+			       Fast.M(Fast.Unload), Fast.M(Fast.BrickFlush), Other(Fast),
+			       Slow.M(Slow.Tick), Slow.M(Slow.Dispatch), Slow.M(Slow.Apply), Slow.M(Slow.Remesh),
+			       Slow.M(Slow.Unload), Slow.M(Slow.BrickFlush), Other(Slow),
+			       Tail.M(Tail.Tick), Tail.M(Tail.Dispatch), Tail.M(Tail.Apply), Tail.M(Tail.Remesh),
+			       Tail.M(Tail.Unload), Tail.M(Tail.BrickFlush), Other(Tail));
+			// MAXES, for the same reason submitMs needed them: a stage that is zero
+			// on 99 frames in 100 and enormous on the hundredth has a mean that says
+			// "small" and a fix that is urgent.
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel frame attribution TICK-STAGES DELTA: slow-fast remesh=%+.2f unload=%+.2f brickFlush=%+.2f other=%+.2f | ")
+			       TEXT("tail-fast remesh=%+.2f unload=%+.2f brickFlush=%+.2f other=%+.2f | ")
+			       TEXT("maxRemesh slow=%.2f tail=%.2f | maxUnload slow=%.2f tail=%.2f | maxBrickFlush slow=%.2f tail=%.2f"),
+			       Slow.M(Slow.Remesh) - Fast.M(Fast.Remesh), Slow.M(Slow.Unload) - Fast.M(Fast.Unload),
+			       Slow.M(Slow.BrickFlush) - Fast.M(Fast.BrickFlush), Other(Slow) - Other(Fast),
+			       Tail.M(Tail.Remesh) - Fast.M(Fast.Remesh), Tail.M(Tail.Unload) - Fast.M(Fast.Unload),
+			       Tail.M(Tail.BrickFlush) - Fast.M(Fast.BrickFlush), Other(Tail) - Other(Fast),
+			       Slow.MaxRemesh, Tail.MaxRemesh, Slow.MaxUnload, Tail.MaxUnload,
+			       Slow.MaxBrickFlush, Tail.MaxBrickFlush);
+
+			// ---- INSIDE dispatch, over the population that needed it ---------
+			//
+			// This split is not new. It has printed on `Hitch frame dispatch`
+			// since the hitch work, and that line fires ONLY above 33.3 ms while
+			// the moving tail is 15-23 ms -- so it has never once been read over
+			// the frames the gate is about. Same numbers, bucketed by FRAME time
+			// instead of by a threshold nothing in the tail crosses.
+			//
+			// dOther = dispatch - (airProof + band + submit + pick + overlay),
+			// UNCLAMPED for the same reason `other` above is: negative would mean
+			// the brackets overlap or the carry is misaligned, which is a defect
+			// rather than a small number. gpuMgr is the GPU job manager Tick and
+			// sits OUTSIDE the dispatch bracket -- printed here because it is the
+			// next place to look when dOther is large, NOT as part of the sum.
+			auto DOther = [](const FAccum& A) -> double
+			{
+				return A.M(A.Dispatch) - (A.M(A.DAir) + A.M(A.DBand) + A.M(A.Submit)
+				                          + A.M(A.DPick) + A.M(A.DOverlay));
+			};
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel frame attribution DISPATCH-SPLIT (mean ms; dOther = dispatch - the five, UNCLAMPED; ")
+			       TEXT("gpuMgr is OUTSIDE dispatch): ")
+			       TEXT("FAST disp=%.2f airProof=%.2f band=%.2f submit=%.2f pick=%.2f overlay=%.2f dOther=%.2f loop=%.2f gpuMgr=%.2f | ")
+			       TEXT("SLOW disp=%.2f airProof=%.2f band=%.2f submit=%.2f pick=%.2f overlay=%.2f dOther=%.2f loop=%.2f gpuMgr=%.2f | ")
+			       TEXT("TAIL disp=%.2f airProof=%.2f band=%.2f submit=%.2f pick=%.2f overlay=%.2f dOther=%.2f loop=%.2f gpuMgr=%.2f"),
+			       Fast.M(Fast.Dispatch), Fast.M(Fast.DAir), Fast.M(Fast.DBand), Fast.M(Fast.Submit),
+			       Fast.M(Fast.DPick), Fast.M(Fast.DOverlay), DOther(Fast), Fast.M(Fast.DLoop), Fast.M(Fast.GpuMgr),
+			       Slow.M(Slow.Dispatch), Slow.M(Slow.DAir), Slow.M(Slow.DBand), Slow.M(Slow.Submit),
+			       Slow.M(Slow.DPick), Slow.M(Slow.DOverlay), DOther(Slow), Slow.M(Slow.DLoop), Slow.M(Slow.GpuMgr),
+			       Tail.M(Tail.Dispatch), Tail.M(Tail.DAir), Tail.M(Tail.DBand), Tail.M(Tail.Submit),
+			       Tail.M(Tail.DPick), Tail.M(Tail.DOverlay), DOther(Tail), Tail.M(Tail.DLoop), Tail.M(Tail.GpuMgr));
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel frame attribution DISPATCH-SPLIT DELTA: slow-fast airProof=%+.2f band=%+.2f submit=%+.2f pick=%+.2f overlay=%+.2f dOther=%+.2f gpuMgr=%+.2f | ")
+			       TEXT("tail-fast airProof=%+.2f band=%+.2f submit=%+.2f pick=%+.2f overlay=%+.2f dOther=%+.2f gpuMgr=%+.2f | ")
+			       TEXT("maxAirProof slow=%.2f tail=%.2f | maxBand slow=%.2f tail=%.2f | maxPick slow=%.2f tail=%.2f | maxGpuMgr slow=%.2f tail=%.2f"),
+			       Slow.M(Slow.DAir)-Fast.M(Fast.DAir), Slow.M(Slow.DBand)-Fast.M(Fast.DBand),
+			       Slow.M(Slow.Submit)-Fast.M(Fast.Submit), Slow.M(Slow.DPick)-Fast.M(Fast.DPick),
+			       Slow.M(Slow.DOverlay)-Fast.M(Fast.DOverlay), DOther(Slow)-DOther(Fast),
+			       Slow.M(Slow.GpuMgr)-Fast.M(Fast.GpuMgr),
+			       Tail.M(Tail.DAir)-Fast.M(Fast.DAir), Tail.M(Tail.DBand)-Fast.M(Fast.DBand),
+			       Tail.M(Tail.Submit)-Fast.M(Fast.Submit), Tail.M(Tail.DPick)-Fast.M(Fast.DPick),
+			       Tail.M(Tail.DOverlay)-Fast.M(Fast.DOverlay), DOther(Tail)-DOther(Fast),
+			       Tail.M(Tail.GpuMgr)-Fast.M(Fast.GpuMgr),
+			       Slow.MaxDAir, Tail.MaxDAir, Slow.MaxDBand, Tail.MaxDBand,
+			       Slow.MaxDPick, Tail.MaxDPick, Slow.MaxGpuMgr, Tail.MaxGpuMgr);
+		}
 	}
 
 	UE_LOG(LogVoxelPerf, Log,
