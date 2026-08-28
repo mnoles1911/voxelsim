@@ -668,6 +668,18 @@
 #define VOXEL_MARCH_FALLTHROUGH_SHELL 0
 #endif
 
+// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound, Stage 0b). A
+// PERMUTATION and not a uniform, and on the BlockSkip side of that argument,
+// not the ZCut side: the consumer adds up to seven Texture2DArray loads per
+// ray, and a runtime branch would leave that traffic in the control's binary
+// and flatter the arm under test. 0 is the byte-identical control -- no
+// texture global, no statics, no clamp, no atomics. The doctrine block, the
+// soundness claim and the refused combinations live in VoxelMarchBound.ush,
+// which only compiles in under this define.
+#ifndef VOXEL_MARCH_BOUND
+#define VOXEL_MARCH_BOUND 0
+#endif
+
 // THE HOLE METRIC (voxel.March.HoleStats). Counts, per frame, on the shipping
 // kernel: rays marched, rays that hit, hits that came from a level COARSER
 // than the segment that owns that ground (`substituted`), and misses that
@@ -1708,6 +1720,20 @@ int MarchZCutEnable;
 // costs an empty slot nothing it was not already paying.
 int4 MarchLevelChunkZ[8];
 
+#if VOXEL_MARCH_BOUND
+// ---- THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound) -----------------
+//
+// The texture binding, the per-ray registers, the loader and the whole
+// doctrine block (soundness claim, refused combinations, the census numbers
+// that authorised this) live in the shared include, because the PRODUCER
+// (VoxelMarchBound.usf) needs the encode half of the same contract and two
+// spellings of one texel format is how a bound comes to describe a different
+// interval than the one written. Included HERE -- after MarchRingCount and
+// VOXEL_MARCH_MAX_RINGS, both of which its loader reads -- and only on the
+// permutation, so the control carries not one token of it.
+#include "/VoxelEarth/VoxelMarchBound.ush"
+#endif
+
 #if VOXEL_MARCH_BLOCK_SKIP
 // ---- THE COARSE OCCUPANCY LEVEL'S TWO BITFIELDS ---------------------------
 //
@@ -1902,6 +1928,55 @@ static uint GVoxelMarchCellStale = 0u;          // record fetched, origin/level 
 static uint GVoxelMarchCellResidentEmpty = 0u;  // record fetched, says entirely air
 static uint GVoxelMarchCellBrickOOB = 0u;       // record fetched, brick base out of pool
 static uint GVoxelMarchCellReal = 0u;           // a real chunk
+#endif
+
+#if VOXEL_MARCH_HOLE_STATS
+// ---- THE RAY-BOUND CENSUS (Stage 0a) --------------------------------------
+//
+// These three counters exist to gate the rasteriser-bound arm (docs/plan):
+// removable = probesPre + probesPost; the GO gate is removable >= 40% of total
+// chunk probes at the horizon, or capRays >= 5% of rays. They measure, per
+// ray, how many chunk-loop iterations an ideal per-level resident-extent bound
+// would have deleted: the iterations a walk spends BEFORE its first resident
+// chunk and AFTER its last one are exactly the span such a bound would clamp
+// away without changing any hit.
+//
+// THE UNIT IS CHUNK-LOOP ITERATIONS, NOT LOOKUPS, AND THE CHOICE IS DELIBERATE.
+// GVoxelMarchCellsProbed above counts calls to VoxelMarchLookupChunk, and the
+// chunk loop caches the lookup across iterations inside one chunk -- so the
+// two units genuinely differ, and a bound deletes ITERATIONS (the loop simply
+// does not run over the clamped span) whether or not each one would have paid
+// a lookup. Numerators and denominator here are all iterations, so the
+// removable fraction is a like-for-like ratio; never divide these by
+// cellsProbed.
+//
+// STATICS AND NOT FIELDS ON FVoxelMarchHit, following the census above and
+// for its reason plus one more: the values must accumulate across every walk
+// of the ray -- one per ring segment, one more per fallthrough rung, and the
+// cover segment's walk -- and the walk function has four return sites, two of
+// them hits. Statics tally forward as the walk runs, so no exit has to
+// remember to flush a per-walk struct up through the cascade.
+//
+// PER-WALK MEANING, restated exactly because two of these need a definition
+// to be readable:
+//   Pre   iterations strictly before the iteration that first lands in a
+//         resident chunk (Chunk.bValid). A walk that never sees a resident
+//         chunk contributes ALL its iterations here -- the ideal bound would
+//         have deleted that walk whole, and "before the first resident chunk"
+//         is vacuously true of every iteration.
+//   Post  iterations after the most recent resident iteration, captured only
+//         when the walk ends WITHOUT a hit (budget or segment end). A walk
+//         that hits contributes 0 by definition: the hit IS in a resident
+//         chunk, so nothing trails it.
+// Pre and Post are disjoint by construction (Post only counts after the first
+// resident iteration), so removable = pre + post never double-counts.
+//
+// Observation only: nothing here may change any ray's bHit or THitUU, exactly
+// as the doctrine block on VOXEL_MARCH_HOLE_STATS requires.
+static uint GVoxelMarchRayChunkIters = 0u;     // every chunk-loop iteration, all walks (THE DENOMINATOR)
+static uint GVoxelMarchRayChunkItersPre = 0u;  // iterations before the walk's first resident chunk
+static uint GVoxelMarchRayChunkItersPost = 0u; // trailing iterations of walks that ended without a hit
+static uint GVoxelMarchRayTermChunkCap = 0u;   // 0/1: some walk of this ray ended TERM_CHUNK_CAP
 #endif
 
 void VoxelMarchBeginLevel(uint Level)
@@ -3478,6 +3553,21 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 	FVoxelMarchChunkCache Chunk = VoxelMarchNoChunk();
 	FVoxelMarchBrickCache Brick = VoxelMarchNoBrick();
 
+#if VOXEL_MARCH_HOLE_STATS
+	// The ray-bound census's per-walk registers (see the statics above the
+	// level context for what the census is for and the exact meanings).
+	// TALLIED FORWARD, NOT CLOSED AT THE END, the same choice the sky-run
+	// counter below documents and for its reason: this function has four
+	// return sites, two of them hits, and a per-walk value flushed at exit
+	// silently drops whichever exit forgets. Pre is added directly as the
+	// iterations happen; only the Post candidate needs a walk-end capture,
+	// and only at the two non-hit exits -- a hit walk's Post is 0 by
+	// definition, so the hit returns discard RbSinceResident correctly by
+	// doing nothing.
+	uint RbSinceResident = 0u;      // iterations since the last resident one
+	bool bRbSeenResident = false;   // has this walk probed a resident chunk yet
+#endif
+
 #if VOXEL_MARCH_BLOCK_SKIP
 	// ---- THE COARSE OCCUPANCY LEVEL'S PER-WALK CACHE ----------------------
 	//
@@ -3553,6 +3643,16 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 	[loop]
 	for (int ci = 0; ci < 512 && t < TMaxUU; ++ci)
 	{
+#if VOXEL_MARCH_HOLE_STATS
+		// THE DENOMINATOR, counted on ENTRY -- before the block skip's
+		// `continue` and before the resident test -- so that no path through
+		// the body can leave an iteration uncounted; the same discipline
+		// GVoxelMarchCellsProbed applies at the lookup's entry. The pre/post
+		// classification is NOT done here: it needs the resident verdict, and
+		// the two sites that know it (the block-skip jump, the post-lookup
+		// branch) each tally their own case below.
+		++GVoxelMarchRayChunkIters;
+#endif
 		const float3 P = OriginLocalUU + SafeDir * t;
 		const int3 LocalVoxel = (int3)floor(P / VOXEL_FLUID_VOXEL_UU);
 		const int3 WorldVoxel = LocalVoxel + VoxelMarchOriginVoxel();
@@ -3854,6 +3954,13 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 					// to sqrt(3) times the axis count over the same span.
 					H.BlockCellsAvoided +=
 						uint(max((tBlockJump - t) * VOXEL_MARCH_INV_CHUNK_UU, 0.0f));
+					// The ray-bound census's non-resident tally for the jump
+					// path: this iteration `continue`s before the lookup site
+					// below, and the skip's own precondition (no resident cell
+					// in the block) is the verdict the site below would have
+					// reached. Same classification as the !Chunk.bValid branch.
+					if (!bRbSeenResident) { ++GVoxelMarchRayChunkItersPre; }
+					else                  { ++RbSinceResident; }
 #endif
 					t = tBlockJump;
 					continue;
@@ -3867,6 +3974,22 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 			Chunk = VoxelMarchLookupChunk(ChunkCoord);
 			Brick = VoxelMarchNoBrick();
 		}
+#if VOXEL_MARCH_HOLE_STATS
+		// The ray-bound census's classification site. bValid is read off the
+		// CACHE, deliberately, so iterations that stay inside one resident
+		// chunk (no lookup made) still reset the trailing count -- the census
+		// is about where the RAY is, not about which iterations paid a fetch.
+		// A resident iteration closes any trailing span (RbSinceResident back
+		// to 0); a non-resident one extends Pre until the walk's first
+		// resident chunk and the trailing candidate after it.
+		if (Chunk.bValid)
+		{
+			bRbSeenResident = true;
+			RbSinceResident = 0u;
+		}
+		else if (!bRbSeenResident) { ++GVoxelMarchRayChunkItersPre; }
+		else                       { ++RbSinceResident; }
+#endif
 		if (!Chunk.bValid)
 		{
 			// 32,768 voxels rejected on one dword. Outside the resident set is
@@ -4068,6 +4191,14 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 				H.THitUU = t;
 				H.HitPosLocalUU = OriginLocalUU + SafeDir * t;
 				H.Steps = Steps;
+#if VOXEL_MARCH_HOLE_STATS
+				// A NON-HIT EXIT, so the trailing span since the last resident
+				// chunk is captured into Post -- one of exactly two such
+				// flushes (the other is the loop's own end below). Zero when
+				// this walk never saw a resident chunk: those iterations are
+				// already in Pre, and Pre/Post stay disjoint.
+				GVoxelMarchRayChunkItersPost += RbSinceResident;
+#endif
 				return H;
 			}
 		}
@@ -4082,6 +4213,19 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 	// ray crosses 16 chunks) and which would look identical to a clean miss in
 	// every counter we have.
 	H.TermReason = (t < TMaxUU) ? VOXEL_MARCH_TERM_CHUNK_CAP : VOXEL_MARCH_TERM_SEGMENT;
+#if VOXEL_MARCH_HOLE_STATS
+	// The second of the two non-hit exits (see the budget return above): the
+	// trailing span becomes Post. The chunk-cap flag reads the TermReason JUST
+	// ASSIGNED rather than re-deriving the condition, so it can never disagree
+	// with what the walk actually reported -- capRays counts rays, not walks:
+	// the static is a 0/1 the kernel folds once, so a ray whose cascade caps
+	// twice still counts once.
+	GVoxelMarchRayChunkItersPost += RbSinceResident;
+	if (H.TermReason == int(VOXEL_MARCH_TERM_CHUNK_CAP))
+	{
+		GVoxelMarchRayTermChunkCap = 1u;
+	}
+#endif
 	H.Steps = Steps;
 	H.THitUU = TMaxUU;
 	H.HitPosLocalUU = OriginLocalUU + SafeDir * TMaxUU;
@@ -4483,6 +4627,120 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 #endif
 			}
 
+#if VOXEL_MARCH_BOUND
+			// ===========================================================
+			// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound)
+			// ===========================================================
+			//
+			// A SECOND SOURCE NARROWING THE SAME WalkIn/WalkOut the Z cut
+			// narrows -- the same socket, the same bias constant, the same
+			// debt fold below. Soundness: the interval [Near, Far] for
+			// WalkL is the convex hull of this ray's intersections with
+			// EVERY live level-WalkL chunk cube (VoxelMarchBound.ush's
+			// doctrine block carries the four-validation-gates proof), so
+			// every t this clamp removes lies outside every cube a hit
+			// could validate against. Removed space is UNREACHABLE BY A
+			// HIT -- not "provably air", and the distinction is what keeps
+			// this outside the residency-is-not-emptiness rule.
+			//
+			// INDEXED BY WalkL, NOT SegL, for exactly the Z cut's reason
+			// (its note above): the bound has to describe the grid the walk
+			// will actually READ, and under the retry ladder that is
+			// WalkL's table population. SegIn/SegOut ARE NEVER TOUCHED --
+			// the segment's ownership of its t-interval is the cascade's
+			// invariant, and the ladder re-derives WalkIn from SegIn on
+			// every rung.
+			//
+			// AFTER THE Z CUT, ON PURPOSE, and the order is load-bearing
+			// twice over. (1) Instrument purity: the Z cut's clipped/
+			// consulted counters compare against SegIn/SegOut, so a bound
+			// that narrowed first would be billed to the Z cut's trio and
+			// both instruments would lie. (2) The empty-collapse proof
+			// below needs the pre-bound WalkIn, whatever the Z cut left it
+			// as.
+			//
+			// THE PRIMARY PAYOFF IS THE EMPTY INTERVAL, SECONDARILY THE
+			// CLIPS. The Stage 0a census (removableUp = 91.08% at the
+			// horizon, dominated by PRE-hit iterations) says the mass is
+			// whole ring segments with ZERO resident chunks at that level;
+			// those read EMPTY here and the walk never runs. The end-trims
+			// on segments that do meet residency are real but smaller.
+			bool bBoundRemoved = false;
+			// Loaded is the pass-through gate: zero-init FALSE, set only by
+			// VoxelMarchBoundLoadRay, so a kernel path that never loaded
+			// the registers marches exactly the control instead of clamping
+			// against zero-initialised statics (whose decode would be the
+			// empty interval -- the one direction this arm may never fail).
+			// The degenerate-interval guard also keeps a Z-cut-emptied
+			// segment (WalkIn == WalkOut == SegIn) out of the counters: a
+			// decision the arm was never asked to make must not inflate its
+			// denominator.
+			if (GVoxelMarchBoundLoaded && WalkOut > WalkIn)
+			{
+#if VOXEL_MARCH_HOLE_STATS
+				GVoxelMarchBndConsulted += 1u;
+#endif
+				// THE OUTWARD BIAS: the identical constant, and the
+				// identical Danskin & Hanrahan argument, as ZCutBiasUU
+				// above -- the producer's tNear/tFar were computed through
+				// float slab math (one rounding per subtract, two more per
+				// divide), and the clamped WalkIn is THE START OF A JUMP:
+				// every chunk between SegIn and it goes unexamined, so a
+				// value even ULPs inside the true entry silently drops a
+				// cell. One full chunk at the WALK's level, outward on both
+				// ends, is the same insurance at the same price.
+				const float BoundBiasUU = 32.0f * VOXEL_FLUID_VOXEL_UU * S;
+				const float BndIn = max(WalkIn, GVoxelMarchBoundNearUU[WalkL] - BoundBiasUU);
+				const float BndOut = min(WalkOut, GVoxelMarchBoundFarUU[WalkL] + BoundBiasUU);
+				const bool bBoundEmpty = (BndOut <= BndIn);
+				// Removal is measured against THIS CLAMP'S OWN INPUT, not
+				// against SegIn/SegOut: what the Z cut already removed is
+				// the Z cut's to report, and the debt fold below only needs
+				// to stand in for chunks THIS clamp deleted.
+				bBoundRemoved = bBoundEmpty || (BndIn > WalkIn) || (BndOut < WalkOut);
+#if VOXEL_MARCH_HOLE_STATS
+				GVoxelMarchBndSegmentsSkipped += bBoundEmpty ? 1u : 0u;
+				GVoxelMarchBndWalkInRaised += (!bBoundEmpty && BndIn > WalkIn) ? 1u : 0u;
+				GVoxelMarchBndWalkOutLowered += (!bBoundEmpty && BndOut < WalkOut) ? 1u : 0u;
+#endif
+				if (bBoundEmpty)
+				{
+					// THE EMPTY-INTERVAL COLLAPSE, the Z cut's shape: the
+					// walk is STILL CALLED on (WalkIn, WalkIn) rather than
+					// replaced by a hand-built miss struct, so the miss
+					// comes back with every field initialised the way every
+					// other miss on this path is -- a synthetic struct here
+					// would be a second spelling of "what a miss looks
+					// like" and would drift from the real one.
+					//
+					// (WalkIn, WalkIn), NOT (SegIn, SegIn), AND THE CHOICE
+					// IS A PROOF OBLIGATION: the flat walk tests its START
+					// VOXEL before its loop and can return a bStartedInside
+					// hit from it. WalkIn is safe: emptiness here means
+					// [WalkIn, WalkOut] sits entirely outside the biased
+					// hull, so in particular the point at WalkIn is at
+					// least one chunk outside the hull of every live
+					// level-WalkL cube -- its chunk has no live record, its
+					// lookup cannot grant bValid, and no voxel there can
+					// read solid. SegIn carries no such guarantee once the
+					// Z cut has raised WalkIn past it: SegIn can sit inside
+					// a RESIDENT chunk the (bound-off) control never
+					// started in, and a start-inside hit there would draw
+					// terrain the control does not draw. WalkIn <= SegOut
+					// holds on every path that reaches here (the Z cut
+					// re-clamps into [SegIn, SegOut] and the degenerate
+					// guard above excluded its collapsed case), so the
+					// start stays inside the ring it was asked about.
+					WalkOut = WalkIn;
+				}
+				else
+				{
+					WalkIn = BndIn;
+					WalkOut = BndOut;
+				}
+			}
+#endif
+
 			// if/else, not a ternary: HLSL's conditional operator takes numeric
 			// scalars, vectors and matrices only, never a struct.
 			// Armed only where the level matches -- see the note on the
@@ -4570,6 +4828,46 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			// again sees exactly what it saw before. `uncovered` in the kernel
 			// reads the same flag and is likewise unchanged.
 			H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || bZCutRemoved;
+#if VOXEL_MARCH_BOUND
+			// ===========================================================
+			// THE BOUND PAYS THE SAME DEBT, WITH ITS OWN FLAG
+			// ===========================================================
+			//
+			// REQUIRED FOR CORRECTNESS, NOT OPTIONAL. Every chunk this
+			// clamp removed lies outside the hull of every LIVE level-WalkL
+			// record, so every removed chunk has no live record -- and the
+			// walk's own site (`if (!Chunk.bValid)` -> bCrossedAbsentChunk
+			// || !Chunk.bResident) would have set the flag on the first one
+			// it reached. The fold therefore reproduces the control's
+			// ladder behaviour EXACTLY, not conservatively: the gate below
+			// reads the same value it read before, and a missing level-0
+			// chunk still takes the coarse-stand-in retry it takes today.
+			// Without this line the ladder silently stops retrying exactly
+			// the rays the clamp touched, and the black arcs at LOD
+			// boundaries come back -- a hole, which outranks every
+			// millisecond this arm is worth.
+			//
+			// A SEPARATE FLAG FROM bZCutRemoved, DELIBERATELY, though they
+			// fold into the same bit: two arms sharing one flag are
+			// un-A/B-able -- the Z cut's own bias note (:4415-4421 region)
+			// makes the argument for two knobs serving two claims, and a
+			// shared removal flag here would let either arm's defect hide
+			// under the other's counter.
+			//
+			// bCrossedShellAbsent IS NOT FOLDED AND CANNOT BE: the Z cut's
+			// exactness argument (removed chunks two chunks clear of
+			// anything resident) does not carry -- this clamp's removals
+			// CAN be face-adjacent to resident ground along the ray. That
+			// is exactly why VOXEL_MARCH_FALLTHROUGH_SHELL is an #error
+			// with this arm (VoxelMarchBound.ush): the one gate that reads
+			// the shell flag is refused, so no compiled combination ever
+			// consults the value this fold cannot supply. The sky gate's
+			// bCrossedNonSkyAbsent fold is absent for the same shape of
+			// reason: VOXEL_MARCH_TRACK_SKY requires VOXEL_MARCH_SKY_LADDER,
+			// which is the other #error, so that text would be dead in
+			// every buildable permutation.
+			H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || bBoundRemoved;
+#endif
 #if VOXEL_MARCH_TRACK_SKY
 			// CONSERVATIVE, for the block skip's reason: the cut removes an
 			// interval without consulting any cell in it, so nothing here has

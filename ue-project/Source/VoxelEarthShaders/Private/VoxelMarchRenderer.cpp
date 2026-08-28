@@ -37,6 +37,7 @@
 #include "ShaderParameterStruct.h"
 #include "ProfilingDebugging/RealtimeGPUProfiler.h"
 #include "VoxelRenderFrame.h" // the render-frame split: anchors A and B live in this file
+#include "VoxelMarchBound.h" // voxel.March.Bound's producer (Stage 0b) -- VoxelMarchBoundProduce
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelMarch, Log, All);
 
@@ -279,6 +280,55 @@ namespace
 		TEXT("WHAT WOULD REFUTE IT: any black arc or missing ground that appears with this at 1 ")
 		TEXT("and is absent at 0 on the same spawn. That is a hole, it outranks every millisecond ")
 		TEXT("here, and the correct response is to turn this off, not to widen the pad."),
+		ECVF_RenderThreadSafe);
+
+	// ---- THE PER-RAY RESIDENT-EXTENT BOUND (Stage 0b) -------------------
+	//
+	// THE GATE THAT AUTHORISED IT, measured by the Stage 0a census on the
+	// shipping kernel at three pitches: removableUp = 91.08% of chunk-loop
+	// iterations at the horizon (the pre-registered gate was 40%), 95.48% at
+	// sky, removableDown = 39.5% looking down, capRays = 0.0000% everywhere.
+	// The removable mass is predominantly PRE-hit iterations on up/horizon
+	// rays -- whole ring segments crossing ZERO resident chunks at their
+	// level -- so the arm's PRIMARY payoff is skipping such segments whole
+	// (boundSegmentsSkipped); the end-trims are secondary. The Z slab could
+	// not reach this mass (it skipped 0.00% at the horizon: a horizontal ray
+	// never leaves a 118 m slab); this bound is PER PIXEL AND PER RAY.
+	TAutoConsoleVariable<int32> CVarVoxelMarchBound(
+		TEXT("voxel.March.Bound"), 0,
+		TEXT("THE PER-RAY RESIDENT-EXTENT BOUND. 0 = off, THE CONTROL, and the default. 1 = ")
+		TEXT("rasterise one cube per chunk record live in the brick pool's own table into a ")
+		TEXT("per-ring-level Texture2DArray under min-blending, giving every pixel the interval ")
+		TEXT("of ray-t its ray spends inside resident level-L space; the ring walk then clamps ")
+		TEXT("each segment's [WalkIn, WalkOut] to that interval, and a segment whose interval ")
+		TEXT("is EMPTY is skipped outright -- the primary payoff, per the Stage 0a census ")
+		TEXT("(removableUp 91.08%% at the horizon, mass in PRE-hit ring segments).\n")
+		TEXT("A PERMUTATION, NOT A UNIFORM -- BlockSkip's argument, not ZCut's: the consumer ")
+		TEXT("adds up to seven texture loads per ray and a runtime branch would leave that ")
+		TEXT("traffic in the control's binary. 0 is byte-identical.\n")
+		TEXT("IT CANNOT MAKE A HOLE, and the argument is validation, not residency-as-air: a ")
+		TEXT("hit requires Chunk.bValid, which VoxelMarchLookupChunk grants only through a ")
+		TEXT("record in the SAME chunk table the producer rasterises (a superset of it -- no ")
+		TEXT("anySolid filter, no index join), so removed space is UNREACHABLE BY A HIT, ")
+		TEXT("whatever the terrain truth. bCrossedAbsentChunk is folded for every removed ")
+		TEXT("interval, so the fallthrough ladder sees exactly the control's value and coarse ")
+		TEXT("stand-ins still fill unstreamed ground. The clamp is biased outward one full ")
+		TEXT("chunk per end at the walk's level (the ZCutBiasUU constant and the Danskin & ")
+		TEXT("Hanrahan argument, restated at the clamp).\n")
+		TEXT("REFUSED PAIRINGS, at compile and here: rings off (no socket), voxel.March.SkyLadder ")
+		TEXT("(its gate reads bWalkTruncated, which this bound eliminates -- the ladder would ")
+		TEXT("close on rays that retry today; SkyLadder wins and this arm is forced 0), and ")
+		TEXT("voxel.March.HalfRes (the sample lattice is not the raster lattice; a bound for a ")
+		TEXT("different ray is no bound).\n")
+		TEXT("PROVE IT ENGAGED BEFORE BELIEVING A TIMING: with voxel.March.HoleStats on, the ")
+		TEXT("bound engagement line prints consulted / segmentsSkipped / walkInRaised / ")
+		TEXT("walkOutLowered plus the producer's own boundMs bracket. consulted == 0 with this ")
+		TEXT("at 1 is the arm ARMED AND INERT and no timing on that leg means anything. Those ")
+		TEXT("counters prove engagement and do NOT estimate the saving -- THE SAVING IS ")
+		TEXT("`VoxelMarch.March` FROM ProfileGPU MINUS THE BOUND BRACKET, AND NOTHING ELSE.\n")
+		TEXT("WHAT WOULD REFUTE IT: any black arc or missing ground at 1 that is absent at 0 on ")
+		TEXT("the same spawn. A hole outranks every millisecond here; turn the arm off, never ")
+		TEXT("widen the bias."),
 		ECVF_RenderThreadSafe);
 
 	// =====================================================================
@@ -1497,6 +1547,20 @@ FVoxelMarchArm VoxelMarchGetArm()
 	// the reported arm can never claim a gate the kernel has no code for.
 	Arm.bSkyLadder = Arm.bRings && Arm.Fallthrough > 0 &&
 	                 (CVarVoxelMarchSkyLadder.GetValueOnAnyThread() != 0);
+	// THE PER-RAY RESIDENT-EXTENT BOUND. Rings only (the clamp lives in the
+	// ring walk's ZCut socket), and FORCED OFF WHILE THE SKY LADDER IS ARMED:
+	// the Bound+SkyLadder permutation is refused at compile (the ladder's
+	// gate reads bWalkTruncated, which the bound eliminates -- see the
+	// #error in VoxelMarchBound.ush), and an arm that asks for a permutation
+	// that does not exist gets whatever TShaderMapRef falls back to. The
+	// ladder wins the conflict because it is the arm that changes what is
+	// drawn; the render site logs the suppression so a leg cannot read a
+	// bound-off frame as a bound null result. HalfRes is the third refused
+	// pairing and is enforced at the render site, where ResShift lives.
+	Arm.Bound = (Arm.bRings && !Arm.bSkyLadder &&
+	             CVarVoxelMarchBound.GetValueOnAnyThread() != 0)
+	                ? 1
+	                : 0;
 	// CLAMPED AND FORCED TO 0 WITHOUT THE PERMUTATION, so the reported mode can
 	// never claim an arm the kernel does not contain -- the same rule
 	// bBlockSkipArmed follows, one layer up.
@@ -4177,6 +4241,39 @@ FVoxelMarchStats VoxelMarchGetStats()
 	return GMarchState->GetStats();
 }
 
+// ---- THE RAY-BOUND CENSUS'S WINDOW (Stage 0a) -----------------------------
+//
+// A file-static beside the state rather than fields on FVoxelMarchHoleStats,
+// deliberately: Stage 0a's edit surface is this file and the two shader files
+// (see VoxelMarchRayBoundWord below the permutation dims), and the census is
+// expected to be promoted into the struct or deleted once its gate is read.
+// Same accumulation discipline as HoleWindow -- event counts SUMMED across
+// landed frames, guarded by GMarchState->Lock at both the landing and the
+// drain -- and drained/reset by VoxelMarchGetAndResetHoleStats on the same
+// 5 s cadence, where its log line prints beside the other hole lines.
+struct FVoxelMarchRayBoundWindow
+{
+	uint64 ProbesUp = 0;    // chunk-loop iterations, DirWorld.z >= 0
+	uint64 ProbesDown = 0;  // chunk-loop iterations, DirWorld.z < 0
+	uint64 PreUp = 0;       // iterations before a walk's first resident chunk
+	uint64 PreDown = 0;
+	uint64 PostUp = 0;      // trailing iterations of hitless walks
+	uint64 PostDown = 0;
+	uint64 CapRays = 0;     // rays with any TERM_CHUNK_CAP walk
+	// The bound arm's engagement group (voxel.March.Bound, Stage 0b) --
+	// words 56-59, appended to the same buffer, landed by the same readback,
+	// printed on this census line's SIBLING (the bound engagement line in
+	// the drain below). Zero on every frame whose kernel was not the bound
+	// permutation, which the sibling line words as such rather than as "cut
+	// nothing".
+	uint64 BoundConsulted = 0;
+	uint64 BoundSegmentsSkipped = 0;
+	uint64 BoundWalkInRaised = 0;
+	uint64 BoundWalkOutLowered = 0;
+	uint64 Frames = 0;      // frames whose readback landed into this window
+};
+static FVoxelMarchRayBoundWindow GVoxelMarchRayBoundWindow;
+
 FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 {
 	FVoxelMarchHoleStats Out;
@@ -4276,6 +4373,215 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// see a random share).
 	GMarchState->LastDrainedHoleWindow = Out;
 	GMarchState->HoleWindow = FVoxelMarchHoleStats();
+
+	// ---- THE RAY-BOUND CENSUS'S DRAIN AND LINE (Stage 0a) ------------------
+	//
+	// Drained here, on the same call the perf line makes every 5 s, so the
+	// window it prints is exactly the window the other hole lines describe.
+	// Logged from THIS file rather than woven into VoxelWorldSubsystem's perf
+	// block because the census's whole plumbing is Stage 0a's three-file edit
+	// surface; the line lands adjacent in the log either way.
+	//
+	// With the arm OFF this prints NOTHING, deliberately: the subsystem's cell
+	// census line already prints NOT MEASURED for the whole hole-stats family
+	// each window, and an absent line cannot be misread as a healthy zero the
+	// way a printed 0 can.
+	//
+	// "probe" IN THIS LINE MEANS A CHUNK-LOOP ITERATION, NOT A LOOKUP -- the
+	// cell census's cellsProbed counts VoxelMarchLookupChunk calls and the two
+	// units differ (the loop caches the lookup within a chunk), so never read
+	// this line's numbers against that one's.
+	{
+		const FVoxelMarchRayBoundWindow Rb = GVoxelMarchRayBoundWindow;
+		GVoxelMarchRayBoundWindow = FVoxelMarchRayBoundWindow();
+		if (Out.bArmed)
+		{
+			const uint64 Probes = Rb.ProbesUp + Rb.ProbesDown;
+			if (Rb.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("Voxel march ray-bound census: armed, no readback landed "
+				            "this window. No-sample, not a healthy zero."));
+			}
+			else if (Probes == 0 && Out.Rays != 0)
+			{
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("Voxel march ray-bound census: ARMED AND INERT -- 0 chunk-loop "
+				            "iterations over %llu measured frames in which the marcher "
+				            "walked %llu rays. A ray that walks cannot loop zero times, so "
+				            "this is the INSTRUMENT and not the world: grep "
+				            "VOXEL_MARCH_HOLE_RB_PROBES in VoxelMarch.usf and "
+				            "GVoxelMarchRayChunkIters in VoxelBrickTraverse.ush before "
+				            "looking anywhere else."),
+				       (unsigned long long)Rb.Frames, (unsigned long long)Out.Rays);
+			}
+			else
+			{
+				// removable = pre + post, per direction; the GO gate is
+				// removable >= 40% of that direction's probes at the horizon,
+				// or capRays >= 5% of rays. Rates are per direction so the
+				// horizon clause reads straight off removableUp.
+				const double Up = double(Rb.ProbesUp);
+				const double Down = double(Rb.ProbesDown);
+				const double Rays = double(Out.Rays);
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("Voxel march ray-bound census (probe = chunk-loop iteration, "
+				            "NOT lookup): probes=%llu over %llu frames | UP/HORIZON "
+				            "probesUpTotal=%llu probesPre=%llu (%.2f%% of up) "
+				            "probesPost=%llu (%.2f%% of up) removableUp=%.2f%% | DOWN "
+				            "probesDownTotal=%llu probesPreDown=%llu (%.2f%% of down) "
+				            "probesPostDown=%llu (%.2f%% of down) removableDown=%.2f%% | "
+				            "capRays=%llu (%.4f%% of %llu rays)"),
+				       (unsigned long long)Probes, (unsigned long long)Rb.Frames,
+				       (unsigned long long)Rb.ProbesUp,
+				       (unsigned long long)Rb.PreUp,
+				       Up > 0.0 ? 100.0 * double(Rb.PreUp) / Up : 0.0,
+				       (unsigned long long)Rb.PostUp,
+				       Up > 0.0 ? 100.0 * double(Rb.PostUp) / Up : 0.0,
+				       Up > 0.0 ? 100.0 * double(Rb.PreUp + Rb.PostUp) / Up : 0.0,
+				       (unsigned long long)Rb.ProbesDown,
+				       (unsigned long long)Rb.PreDown,
+				       Down > 0.0 ? 100.0 * double(Rb.PreDown) / Down : 0.0,
+				       (unsigned long long)Rb.PostDown,
+				       Down > 0.0 ? 100.0 * double(Rb.PostDown) / Down : 0.0,
+				       Down > 0.0 ? 100.0 * double(Rb.PreDown + Rb.PostDown) / Down : 0.0,
+				       (unsigned long long)Rb.CapRays,
+				       Rays > 0.0 ? 100.0 * double(Rb.CapRays) / Rays : 0.0,
+				       (unsigned long long)Out.Rays);
+			}
+		}
+
+		// ---- THE BOUND ENGAGEMENT LINE (voxel.March.Bound, Stage 0b) -----
+		//
+		// THE CENSUS LINE'S SIBLING: same drain, same window, same buffer,
+		// words 56-59. Gated on the RAW CVAR rather than the arm so that a
+		// forced-off frame (sky ladder holding the permutation, or rings
+		// off) prints WHY instead of printing nothing -- an absent line
+		// there would read as "the leg forgot the cvar", which is a
+		// different finding from "the arm yielded".
+		if (CVarVoxelMarchBound.GetValueOnAnyThread() != 0)
+		{
+			const FVoxelMarchArm BndArm = VoxelMarchGetArm();
+			const float BoundMs = GMarchState->Stats.BoundGpuMs;
+			if (BndArm.Bound == 0)
+			{
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("Voxel march bound: voxel.March.Bound is 1 but the arm is FORCED "
+				            "OFF (%s). Every frame in this window ran the CONTROL -- do not "
+				            "read it as a bound result."),
+				       BndArm.bSkyLadder
+				           ? TEXT("voxel.March.SkyLadder holds the refused pairing and wins")
+				           : TEXT("rings are off, and the clamp lives in the ring walk"));
+			}
+			else if (!Out.bArmed)
+			{
+				// The engagement words ride the hole-stats permutation; a
+				// bound leg without it has a working clamp and a mute
+				// instrument, which must never print as zeros.
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("Voxel march bound: armed; engagement NOT MEASURED (the counters "
+				            "ride voxel.March.HoleStats, which is 0). boundMs=%.3f. Turn "
+				            "HoleStats on before believing any timing from this arm."),
+				       BoundMs);
+			}
+			else if (Rb.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("Voxel march bound: armed, no readback landed this window. "
+				            "No-sample, not a healthy zero."));
+			}
+			else if (Rb.BoundConsulted == 0 && Out.Rays != 0)
+			{
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("Voxel march bound: ARMED AND INERT -- 0 consults over %llu "
+				            "measured frames in which the marcher walked %llu rays. The "
+				            "producer declined (pool unflushed?), the texture went unbound, "
+				            "or the loader never ran: check for the 'FORCED OFF' line above, "
+				            "then grep VoxelMarchBoundProduce's decline paths and "
+				            "GVoxelMarchBoundLoaded before looking anywhere else. No timing "
+				            "taken on this leg means anything."),
+				       (unsigned long long)Rb.Frames, (unsigned long long)Out.Rays);
+			}
+			else
+			{
+				// consulted partitions with skipped against the two clip
+				// counters only loosely (a consult can raise AND lower), so
+				// the line prints all four and the untouched remainder is
+				// consulted - skipped - max(raised, lowered) at worst --
+				// left to the reader rather than mis-summed here. DECISIONS,
+				// NOT NANOSECONDS: the saving is VoxelMarch.March from
+				// ProfileGPU net of boundMs, and nothing else.
+				const double C = double(Rb.BoundConsulted);
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("Voxel march bound engagement: consulted=%llu over %llu frames | "
+				            "segmentsSkipped=%llu (%.2f%%) walkInRaised=%llu (%.2f%%) "
+				            "walkOutLowered=%llu (%.2f%%) | producer boundMs=%.3f (its own "
+				            "bracket, NOT inside marchMs). Skipped is the PRIMARY counter -- "
+				            "the census put the removable mass in pre-hit ring segments."),
+				       (unsigned long long)Rb.BoundConsulted, (unsigned long long)Rb.Frames,
+				       (unsigned long long)Rb.BoundSegmentsSkipped,
+				       C > 0.0 ? 100.0 * double(Rb.BoundSegmentsSkipped) / C : 0.0,
+				       (unsigned long long)Rb.BoundWalkInRaised,
+				       C > 0.0 ? 100.0 * double(Rb.BoundWalkInRaised) / C : 0.0,
+				       (unsigned long long)Rb.BoundWalkOutLowered,
+				       C > 0.0 ? 100.0 * double(Rb.BoundWalkOutLowered) / C : 0.0,
+				       BoundMs);
+			}
+
+			// ---- THE CULL'S OWN LINE (2026-08-28, the boundMs mitigation) --
+			//
+			// The frustum cull is the change that has to pay boundMs down
+			// from 5.520, and an arm that cannot show it fired is not an
+			// arm: this line proves engagement (culled > 0) and says what
+			// fraction of the pool the draw no longer pays for. The
+			// identity considered == culled + sum(drawn) is exact because
+			// all three numbers ride one dispatch's two buffers, read back
+			// side by side into one slot; a FAIL indicts the INSTRUMENT (a
+			// return path in the list pass not counted) and the fractions
+			// must not be read on such a window.
+			const FVoxelMarchBoundCullStats Cull = VoxelMarchBoundGetAndResetCullStats();
+			if (BndArm.Bound != 0 && Cull.Frames > 0)
+			{
+				uint64 DrawnTotal = 0;
+				for (int32 L = 0; L < 7; ++L)
+				{
+					DrawnTotal += Cull.DrawnPerLevel[L];
+				}
+				const bool bIdentityOk = (Cull.Considered == Cull.Culled + DrawnTotal);
+				if (Cull.LastEnable == 0)
+				{
+					// Loud, because culled == 0 with the cull DISABLED must
+					// never read as "nothing lay outside the frustum" --
+					// disabled means the CPU refused a degenerate frustum
+					// and every cube was drawn, i.e. BND-eng2's cost.
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("Voxel march bound cull: DISABLED (degenerate frustum on "
+					            "the CPU -- fail-open, every cube drawn). boundMs on this "
+					            "window is the UNCULLED cost; fix the view matrices "
+					            "before reading it as the mitigation's result."));
+				}
+				const double Cons = double(Cull.Considered);
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("Voxel march bound cull: considered=%llu culled=%llu (%.2f%%) "
+				            "drawn=%llu (L0..L6: %llu/%llu/%llu/%llu/%llu/%llu/%llu) over "
+				            "%llu frames | identity considered==culled+drawn: %s"),
+				       (unsigned long long)Cull.Considered, (unsigned long long)Cull.Culled,
+				       Cons > 0.0 ? 100.0 * double(Cull.Culled) / Cons : 0.0,
+				       (unsigned long long)DrawnTotal,
+				       (unsigned long long)Cull.DrawnPerLevel[0],
+				       (unsigned long long)Cull.DrawnPerLevel[1],
+				       (unsigned long long)Cull.DrawnPerLevel[2],
+				       (unsigned long long)Cull.DrawnPerLevel[3],
+				       (unsigned long long)Cull.DrawnPerLevel[4],
+				       (unsigned long long)Cull.DrawnPerLevel[5],
+				       (unsigned long long)Cull.DrawnPerLevel[6],
+				       (unsigned long long)Cull.Frames,
+				       bIdentityOk ? TEXT("PASS")
+				                   : TEXT("FAIL -- a list-pass return path is uncounted; "
+				                          "do not read the fractions on this window"));
+			}
+		}
+	}
 	return Out;
 }
 
@@ -4431,6 +4737,21 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// there is no second place for the pad to be forgotten.
 	SHADER_PARAMETER(int32, MarchZCutEnable)
 	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
+	// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound). The shader-side
+	// globals exist ONLY under VOXEL_MARCH_BOUND (VoxelMarchBound.ush), so on
+	// every other permutation these two entries are simply unused -- the
+	// MarchOutHoleStats rule, not the MarchCoverReachUU one. The texture is
+	// left NULL whenever the producer did not run this frame, and the
+	// permutation is then NOT selected either: the two are decided from the
+	// same local (BoundTex != nullptr) at the dispatch, so an armed cvar with
+	// a declined producer can never hand the bound kernel an unbound texture
+	// -- whose zero reads would decode as EMPTY intervals, i.e. skip the
+	// world, the one failure direction this arm may never have.
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2DArray<float2>, MarchBoundTex)
+	// How many slices the producer rendered; the loader passes levels at or
+	// past it through unclamped rather than loading out of array bounds
+	// (which returns zeros -- see above for what zeros decode as).
+	SHADER_PARAMETER(uint32, MarchBoundSliceCount)
 	// ---- THE TERRAIN HEIGHT PYRAMID (voxel.March.HeightPyramid) ----------
 	//
 	// ON THIS STRUCT ONLY, AND THAT IS THE SAFETY ARGUMENT RATHER THAN A
@@ -4730,6 +5051,86 @@ class FVoxelMarchFallthroughDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_FALLTHROUG
 // walk. Still observation-only at every level, same rule, same static_assert.
 class FVoxelMarchHoleStatsDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_HOLE_STATS", 3);
 
+// ---- THE RAY-BOUND CENSUS'S WORDS (Stage 0a) ------------------------------
+//
+// These three counters exist to gate the rasteriser-bound arm (docs/plan):
+// removable = probesPre + probesPost; the GO gate is removable >= 40% of total
+// chunk probes at the horizon, or capRays >= 5% of rays. The unit is
+// CHUNK-LOOP ITERATIONS, not VoxelMarchLookupChunk calls -- the statics in
+// VoxelBrickTraverse.ush say why, and the log line names its fields to match.
+//
+// APPENDED AFTER VoxelMarchHoleWord::Count, and IN THIS FILE rather than in
+// the header enum, deliberately: Stage 0a's edit surface is the two shader
+// files and this one (the census gates a decision and is expected to be
+// promoted into the enum or deleted once the gate is read), and appending
+// derived-from-Count indices keeps the one-authority discipline anyway --
+// these values are pushed to the shader as defines below and read back at the
+// same expressions, so there is no hand mirror on either side. If a word is
+// ever added to VoxelMarchHoleWord itself these shift with Count on both
+// sides at once, exactly like an append inside the enum, with the same rule:
+// force a shader recompile before trusting any counter.
+namespace VoxelMarchRayBoundWord
+{
+	enum
+	{
+		ProbesUp = VoxelMarchHoleWord::Count,  // chunk-loop iterations, DirWorld.z >= 0 (THE DENOMINATOR, up/horizon)
+		ProbesDown,                            // chunk-loop iterations, DirWorld.z < 0
+		PreUp,                                 // iterations before a walk's first resident chunk, up/horizon
+		PreDown,                               //   ... down
+		PostUp,                                // trailing iterations of hitless walks, up/horizon
+		PostDown,                              //   ... down
+		CapRays,                               // rays with any TERM_CHUNK_CAP walk (not split; its gate is a share of ALL rays)
+
+		// ---- THE BOUND'S ENGAGEMENT GROUP (voxel.March.Bound, Stage 0b) --
+		// APPENDED AFTER THE CENSUS'S OWN WORDS, exactly as the census's
+		// comment above instructs ("extend the word list if you add
+		// counters"): appending renumbers nothing, a stale shader cache
+		// still reads every older word correctly and leaves these four at
+		// zero -- which the reader has to word as NOT MEASURED anyway.
+		// Written only by kernels compiled with VOXEL_MARCH_BOUND 1 (and
+		// hole stats on); see VoxelMarchBound.ush for the per-ray statics
+		// and VoxelMarch.usf for the pre-falsifier snapshot they fold from.
+		//
+		//   BoundConsulted   every (segment, WalkL) pair the clamp was
+		//                    actually asked about -- arm on, registers
+		//                    loaded, interval non-degenerate. THE
+		//                    DENOMINATOR. Zero while voxel.March.Bound reads
+		//                    1 is ARMED AND INERT, the house failure, and
+		//                    must never be spellable as "it cut nothing".
+		//                    The Stage 0b task named only the three words
+		//                    below; this one exists because without it those
+		//                    three read identically for "inert" and for
+		//                    "engaged, changed nothing" -- the ambiguity the
+		//                    ZCut trio's header note refuses.
+		//   BoundSegmentsSkipped  pairs whose interval came back EMPTY: the
+		//                    walk never ran. THE PRIMARY COUNTER -- the
+		//                    census put the removable mass in pre-hit ring
+		//                    segments with zero resident chunks.
+		//   BoundWalkInRaised / BoundWalkOutLowered  pairs the clamp
+		//                    NARROWED without emptying, one per end.
+		//                    Deliberately NOT a partition: one consult can
+		//                    raise AND lower, so the pair can overlap each
+		//                    other (never SegmentsSkipped), and
+		//                    consulted - skipped covers the rest.
+		//
+		// DECISIONS, NOT NANOSECONDS -- every warning the ZCut trio carries
+		// applies unchanged. THE SAVING IS `VoxelMarch.March` FROM ProfileGPU
+		// (net of the producer's own boundMs bracket) AND NOTHING ELSE.
+		BoundConsulted,
+		BoundSegmentsSkipped,
+		BoundWalkInRaised,
+		BoundWalkOutLowered,
+		End                                    // the buffer's word count while the census lives here
+	};
+}
+// The kernel folds the stats buffer with one word per thread of an 8x8 group
+// (`if (GroupIndex < VOXEL_MARCH_HOLE_WORDS)`), so the layout must fit in one
+// group's threads or the tail words are silently never flushed -- plausible
+// zeros, the exact incident VoxelMarchHoleWord's own note records.
+static_assert(int32(VoxelMarchRayBoundWord::End) <=
+                  kVoxelMarchTileSize * kVoxelMarchTileSize,
+              "hole-stats words no longer fit one 8x8 group's flush");
+
 // HALF-RESOLUTION MARCHING (voxel.March.HalfRes). Carried by every shader that
 // touches the VisBuffer -- the march that writes it, BOTH vertex shaders (the
 // emit tile is 16x16 full-res pixels instead of 8x8, and that is a compile-time
@@ -4755,6 +5156,16 @@ class FVoxelMarchBlockSkipDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_BLOCK_SKIP"
 // Only meaningful with rings AND fallthrough > 0; the other combinations are
 // refused in ShouldCompilePermutation rather than built and never selected.
 class FVoxelMarchSkyLadderDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_SKY_LADDER");
+// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound, Stage 0b). A
+// PERMUTATION AND NOT A UNIFORM, on BlockSkip's side of that argument: the
+// consumer adds up to seven Texture2DArray loads per ray, and a runtime
+// branch would leave that traffic in the control's binary and flatter the arm
+// under test. 0 is byte-identical to the pre-bound kernel -- no texture
+// global, no statics, no clamp ("off is not merely unread, the global does
+// not exist"). Rings only; refused against SkyLadder and HalfRes in
+// ShouldCompilePermutation, with matching #errors in VoxelMarchBound.ush for
+// anyone who bypasses the host -- see that file for both arguments.
+class FVoxelMarchBoundDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_BOUND");
 
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
@@ -4790,8 +5201,8 @@ class FVoxelMarchSkyLadderDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_SKY_LADDER"
 // There is no third answer and no way to skip the question.
 //
 // Source, SkipLevels, Rings, Cover, CoverSkip, Fallthrough, BlockSkip,
-// SkyLadder.
-constexpr int32 kVoxelMarchWalkShapeDims = 8;
+// SkyLadder, Bound.
+constexpr int32 kVoxelMarchWalkShapeDims = 9;
 
 // THE COVER REACH, IN ONE PLACE. Both the shader binding and the comparator
 // guard read this; two spellings of "is cover in the picture" is how a guard
@@ -4844,6 +5255,18 @@ struct FVoxelMarchWalkShape
 	// does NOT carry this dimension, so with the arm on the two must be reported
 	// as incomparable rather than compared -- see the check below.
 	int32 SkyLadder = 0;
+	// The per-ray resident-extent bound (VOXEL_MARCH_BOUND). A WALK-SHAPE
+	// DIMENSION, and the classification was checked rather than assumed
+	// against the same test BlockSkip and SkyLadder passed: this CAN change
+	// bHit. Not through the removed space -- nothing there can validate a hit
+	// -- but through the 512-chunk cap and the step budget: a walk that no
+	// longer burns hundreds of steps crossing non-resident space can REACH
+	// AND HIT ground the control's walk capped out before (the safe
+	// direction, more terrain, but "safe" is not "identical"). It also folds
+	// bCrossedAbsentChunk at interval granularity, exactly as BlockSkip's
+	// note describes for blocks. MUST MATCH; the comparator's domain does not
+	// carry it, so with the arm on the two are incomparable -- see the check.
+	int32 Bound = 0;
 };
 static_assert(sizeof(FVoxelMarchWalkShape) == kVoxelMarchWalkShapeDims * sizeof(int32),
               "a walk-shape dimension was added or removed without updating "
@@ -4862,7 +5285,7 @@ class FVoxelMarchCS : public FGlobalShader
 		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchSkipDim, FVoxelMarchRingsDim,
 		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim,
 		                         FVoxelMarchHalfResDim, FVoxelMarchBlockSkipDim,
-		                         FVoxelMarchSkyLadderDim>;
+		                         FVoxelMarchSkyLadderDim, FVoxelMarchBoundDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -4916,6 +5339,22 @@ class FVoxelMarchCS : public FGlobalShader
 		// and by nothing else, so block skip without rings would build, bind and
 		// mean nothing -- refused for the reason the three clauses above are.
 		if (P.Get<FVoxelMarchBlockSkipDim>() && !P.Get<FVoxelMarchRingsDim>())
+		{
+			return false;
+		}
+		// The per-ray resident-extent bound (voxel.March.Bound). Three
+		// refusals, each restated as an #error in VoxelMarchBound.ush:
+		//   * without RINGS the clamp has no socket -- it lives in the ring
+		//     walk's segment loop and nothing else reads the define;
+		//   * with SKY LADDER the ladder's gate reads bWalkTruncated, which
+		//     the bound eliminates on exactly the rays that retry today --
+		//     the ladder would CLOSE on them and drop fills;
+		//   * with HALF RES the march samples a jittered block-centre
+		//     lattice while the producer rasterises pixel centres, so the
+		//     bound would describe a different ray than the one marched.
+		if (P.Get<FVoxelMarchBoundDim>() &&
+		    (!P.Get<FVoxelMarchRingsDim>() || P.Get<FVoxelMarchSkyLadderDim>() ||
+		     P.Get<FVoxelMarchHalfResDim>()))
 		{
 			return false;
 		}
@@ -5052,8 +5491,41 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchHoleWord::CellBrickOOB));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_CELL_REAL"),
 		                         int32(VoxelMarchHoleWord::CellReal));
+		// The ray-bound census (Stage 0a), pushed from VoxelMarchRayBoundWord
+		// -- the one authority for these appended words -- for the same reason
+		// every group above is: a hand mirror here reads a plausible number
+		// out of the wrong slot.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RB_PROBES_UP"),
+		                         int32(VoxelMarchRayBoundWord::ProbesUp));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RB_PROBES_DOWN"),
+		                         int32(VoxelMarchRayBoundWord::ProbesDown));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RB_PRE_UP"),
+		                         int32(VoxelMarchRayBoundWord::PreUp));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RB_PRE_DOWN"),
+		                         int32(VoxelMarchRayBoundWord::PreDown));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RB_POST_UP"),
+		                         int32(VoxelMarchRayBoundWord::PostUp));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RB_POST_DOWN"),
+		                         int32(VoxelMarchRayBoundWord::PostDown));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RB_CAP_RAYS"),
+		                         int32(VoxelMarchRayBoundWord::CapRays));
+		// The bound's engagement group (voxel.March.Bound, Stage 0b), pushed
+		// from the same appended-word namespace for the same reason every
+		// group above is: a hand mirror here reads a plausible number out of
+		// the wrong slot.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BND_CONSULTED"),
+		                         int32(VoxelMarchRayBoundWord::BoundConsulted));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BND_SEGMENTS_SKIPPED"),
+		                         int32(VoxelMarchRayBoundWord::BoundSegmentsSkipped));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BND_WALKIN_RAISED"),
+		                         int32(VoxelMarchRayBoundWord::BoundWalkInRaised));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BND_WALKOUT_LOWERED"),
+		                         int32(VoxelMarchRayBoundWord::BoundWalkOutLowered));
+		// WORDS covers the appended census -- VoxelMarchRayBoundWord::End, not
+		// the enum's Count, while the census lives outside the enum. Every
+		// sizing of the stats buffer (create, copy, lock) reads End too.
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WORDS"),
-		                         int32(VoxelMarchHoleWord::Count));
+		                         int32(VoxelMarchRayBoundWord::End));
 	}
 };
 // The breakdown's group sizes ARE the buffer layout (the shader indexes
@@ -5842,6 +6314,15 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	                      CVarVoxelMarchSkyLadder.GetValueOnRenderThread() != 0)
 	                         ? 1
 	                         : 0;
+	// The same gating VoxelMarchGetArm applies (rings only, sky ladder wins a
+	// conflict), so this reports the arm the march can actually select. The
+	// half-res forcing is deliberately NOT restated here: the comparator
+	// refuses to run at half res on its own grounds already, and a second
+	// spelling of that gate is how two guards drift.
+	Shipping.Bound = (Shipping.Rings != 0 && Shipping.SkyLadder == 0 &&
+	                  CVarVoxelMarchBound.GetValueOnRenderThread() != 0)
+	                     ? 1
+	                     : 0;
 
 	// What the comparator kernel is actually compiled with. Rings rides its
 	// permutation domain; the other two do not exist in it at all, which is
@@ -5859,6 +6340,24 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	// NOT in FVoxelMarchVerifySourceCS's domain either, exactly like Cover and
 	// BlockSkip.
 	Comparator.SkyLadder = 0;
+	// NOT in FVoxelMarchVerifySourceCS's domain either. Both comparator arms
+	// would walk unclamped, so with the bound on it would grade a picture the
+	// marcher is not drawing (the bound arm can HIT where an unclamped walk
+	// caps out) -- false pass, the dangerous direction.
+	Comparator.Bound = 0;
+
+	if (Shipping.Bound != Comparator.Bound)
+	{
+		OutWhy = TEXT("the marcher is running the PER-RAY RESIDENT-EXTENT BOUND "
+		              "(voxel.March.Bound 1) and the comparator is not -- the dimension is not "
+		              "in FVoxelMarchVerifySourceCS's permutation domain. The clamp can let a "
+		              "walk REACH AND HIT ground the unclamped walk's 512-chunk cap never got "
+		              "to, so the two kernels would be grading DIFFERENT PICTURES; both of the "
+		              "comparator's arms would run unclamped equally, which makes it a FALSE "
+		              "PASS about a picture the marcher is not drawing -- not a false fail. Run "
+		              "the comparator with voxel.March.Bound 0.");
+		return false;
+	}
 
 	if (Shipping.SkyLadder != Comparator.SkyLadder)
 	{
@@ -6212,15 +6711,20 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 	float MarchMs = -1.0f;
 	float EmitMs = -1.0f;
 	float ScratchMs = -1.0f;
+	// The bound producer's own bracket (voxel.March.Bound). Polled with the
+	// other three and BEFORE the gate, for the same un-polled-ring reason.
+	float BoundMs = -1.0f;
 	Poll(State->MarchTiming, MarchMs);
 	Poll(State->EmitTiming, EmitMs);
 	Poll(State->ScratchTiming, ScratchMs);
-	if (MarchMs >= 0.0f || EmitMs >= 0.0f || ScratchMs >= 0.0f)
+	Poll(State->BoundTiming, BoundMs);
+	if (MarchMs >= 0.0f || EmitMs >= 0.0f || ScratchMs >= 0.0f || BoundMs >= 0.0f)
 	{
 		FScopeLock Guard(&State->Lock);
 		if (MarchMs >= 0.0f) { State->Stats.MarchGpuMs = MarchMs; }
 		if (EmitMs >= 0.0f) { State->Stats.EmitGpuMs = EmitMs; }
 		if (ScratchMs >= 0.0f) { State->Stats.ScratchGpuMs = ScratchMs; }
+		if (BoundMs >= 0.0f) { State->Stats.BoundGpuMs = BoundMs; }
 	}
 
 	// The hit-tile count. Polled here, beside the timing poll and BEFORE the
@@ -6263,7 +6767,7 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			continue;
 		}
 		const uint32* Src = static_cast<const uint32*>(
-			Slot.Readback->Lock(uint32(VoxelMarchHoleWord::Count) * sizeof(uint32)));
+			Slot.Readback->Lock(uint32(VoxelMarchRayBoundWord::End) * sizeof(uint32)));
 		if (Src != nullptr)
 		{
 			const uint32 Rays = Src[VoxelMarchHoleWord::Rays];
@@ -6311,6 +6815,26 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			const uint32 CellResEmpty = Src[VoxelMarchHoleWord::CellResidentEmpty];
 			const uint32 CellBrickOOB = Src[VoxelMarchHoleWord::CellBrickOOB];
 			const uint32 CellReal = Src[VoxelMarchHoleWord::CellReal];
+			// The ray-bound census (Stage 0a), from the words appended after
+			// the enum (VoxelMarchRayBoundWord). Read on EVERY frame for the
+			// reason the cell census above is: the cheap kernel writes them
+			// too, so gating them behind the level-2 fold would report the
+			// census inert on every level-1 leg.
+			const uint32 RbProbesUp = Src[VoxelMarchRayBoundWord::ProbesUp];
+			const uint32 RbProbesDown = Src[VoxelMarchRayBoundWord::ProbesDown];
+			const uint32 RbPreUp = Src[VoxelMarchRayBoundWord::PreUp];
+			const uint32 RbPreDown = Src[VoxelMarchRayBoundWord::PreDown];
+			const uint32 RbPostUp = Src[VoxelMarchRayBoundWord::PostUp];
+			const uint32 RbPostDown = Src[VoxelMarchRayBoundWord::PostDown];
+			const uint32 RbCapRays = Src[VoxelMarchRayBoundWord::CapRays];
+			// The bound's engagement group (voxel.March.Bound), read on
+			// EVERY frame for the reason every group above is: written only
+			// by the bound permutation, structurally zero on all others, and
+			// the drain's sibling line is what words a zero correctly.
+			const uint32 BndConsulted = Src[VoxelMarchRayBoundWord::BoundConsulted];
+			const uint32 BndSegSkipped = Src[VoxelMarchRayBoundWord::BoundSegmentsSkipped];
+			const uint32 BndInRaised = Src[VoxelMarchRayBoundWord::BoundWalkInRaised];
+			const uint32 BndOutLowered = Src[VoxelMarchRayBoundWord::BoundWalkOutLowered];
 			// The height pyramid's engagement group. Read on EVERY frame for
 			// the reason the three groups above are: the cheap kernel writes
 			// them too, so gating them behind the level-2 fold would report the
@@ -6365,6 +6889,22 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.CellResidentEmpty += CellResEmpty;
 			State->HoleWindow.CellBrickOOB += CellBrickOOB;
 			State->HoleWindow.CellReal += CellReal;
+			// The ray-bound census's window, under the SAME lock as the
+			// HoleWindow fold, summed the same way (event counts across landed
+			// frames), with its own Frames so its per-frame rates divide by
+			// frames that actually carried census words.
+			GVoxelMarchRayBoundWindow.ProbesUp += RbProbesUp;
+			GVoxelMarchRayBoundWindow.ProbesDown += RbProbesDown;
+			GVoxelMarchRayBoundWindow.PreUp += RbPreUp;
+			GVoxelMarchRayBoundWindow.PreDown += RbPreDown;
+			GVoxelMarchRayBoundWindow.PostUp += RbPostUp;
+			GVoxelMarchRayBoundWindow.PostDown += RbPostDown;
+			GVoxelMarchRayBoundWindow.CapRays += RbCapRays;
+			GVoxelMarchRayBoundWindow.BoundConsulted += BndConsulted;
+			GVoxelMarchRayBoundWindow.BoundSegmentsSkipped += BndSegSkipped;
+			GVoxelMarchRayBoundWindow.BoundWalkInRaised += BndInRaised;
+			GVoxelMarchRayBoundWindow.BoundWalkOutLowered += BndOutLowered;
+			GVoxelMarchRayBoundWindow.Frames++;
 			State->HoleWindow.HeightConsulted += HgtConsulted;
 			State->HoleWindow.HeightAdvanced += HgtAdvanced;
 			State->HoleWindow.HeightEmpty += HgtEmpty;
@@ -7837,6 +8377,98 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		MarchView.MarchSampleJitter = Jitter.Offset;
 		MarchView.MarchTileCount = TileCount;
 
+		// ---- THE PER-RAY RESIDENT-EXTENT BOUND'S PRODUCER (voxel.March.Bound)
+		//
+		// Added IMMEDIATELY BEFORE THE MARCH PASS, only when the arm is on,
+		// and OUTSIDE the March timing bracket, in its own (VoxelMarch.
+		// TimeBegin/End(Bound)) -- an arm whose prepass hides inside marchMs
+		// cannot be judged, and marchMs must keep meaning what every archived
+		// leg measured. The producer reads the SAME chunk table the marcher
+		// validates hits against and the SAME MarchView block this dispatch
+		// is about to bind, both copied from the single authorities above so
+		// the bound and the march cannot describe two different frames.
+		//
+		// BoundTex NON-NULL IS THE ONE SIGNAL the permutation below keys on:
+		// cvar armed but producer declined (pool never flushed, rings off
+		// this frame, half res on) means control kernel, not a bound kernel
+		// reading an unbound texture -- whose zeros decode as EMPTY intervals
+		// and would skip the world.
+		FRDGTextureRef BoundTex = nullptr;
+		uint32 BoundSliceCount = 0;
+		if (Arm.Bound != 0 && Arm.bRings)
+		{
+			if (ResShift != 0)
+			{
+				// The third refused pairing, enforced here because ResShift
+				// is resolved per frame on the render thread. Logged once:
+				// a silent suppression would read as a bound null result.
+				static bool bBoundHalfResWarned = false;
+				if (!bBoundHalfResWarned)
+				{
+					bBoundHalfResWarned = true;
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("voxel.March.Bound is FORCED OFF while voxel.March.HalfRes "
+					            "is on: the half-res sample lattice is not the raster "
+					            "pixel-centre lattice, so the produced bound would describe "
+					            "a different ray than the one marched. This frame (and every "
+					            "frame until half res is off) runs the CONTROL -- do not "
+					            "read it as a bound result."));
+				}
+			}
+			else
+			{
+				// The ring count, resolved the way VoxelMarchBindPool
+				// resolves the MarchRingCount uniform (the same
+				// VoxelMarchGetRingSpec, same thread, same frame), so the
+				// consumer's loop and the producer's slice count cannot
+				// disagree about how many levels exist.
+				const FVoxelMarchRingSpec BoundRings = VoxelMarchGetRingSpec();
+				if (BoundRings.bEnabled && BoundRings.Count > 0)
+				{
+					FVoxelMarchState::FTimingPair* BoundTiming =
+						OpenBracket(GraphBuilder, State->BoundTiming, TEXT("Bound"));
+					FVoxelMarchBoundInputs BoundIn;
+					// COPIED FROM MarchView, NOT REDERIVED. These seven are
+					// the exact uniforms VoxelMarchBuildRay reads, and the
+					// producer's PS runs that function verbatim; a second
+					// derivation of any of them is how the bound comes to
+					// describe a ray the march never traced.
+					BoundIn.ViewToTranslatedWorld = MarchView.MarchViewToTranslatedWorld;
+					BoundIn.RayOriginLocalUU = MarchView.MarchRayOriginLocalUU;
+					BoundIn.VolumeExtentUU = MarchView.MarchVolumeExtentUU;
+					BoundIn.ViewRectMin = MarchView.MarchViewRectMin;
+					BoundIn.ViewRectSize = MarchView.MarchViewRectSize;
+					BoundIn.InvProjDiag = MarchView.MarchInvProjDiag;
+					BoundIn.TemporalAAJitter = MarchView.MarchTemporalAAJitter;
+					// The eighth copy, for the half-res dilation: the pixel
+					// half-width cone slope, from the same MarchView block.
+					// The producer declines on a non-positive value rather
+					// than rendering an undilated half-res bound.
+					BoundIn.PixelConeSlope = MarchView.MarchPixelConeSlope;
+					// The march frame origin -- the value the dispatch below
+					// assigns to MarchBrickOriginVoxel, from the same local.
+					BoundIn.FrameOriginVoxel = FrameOriginVoxel;
+					BoundIn.SliceCount = BoundRings.Count;
+					// The march sample grid (== the view rect; half-res
+					// MARCHING is a refused pairing, enforced above). The
+					// producer renders its target at HALF of this per axis
+					// since 2026-08-28 and the loader reads texel
+					// (pixel >> 1) -- the halving lives entirely inside the
+					// producer/consumer pair, so this stays the one
+					// full-res authority.
+					BoundIn.TargetSize = MarchSize;
+					BoundTex = VoxelMarchBoundProduce(GraphBuilder, ShaderMap, BoundIn);
+					CloseBracket(GraphBuilder, BoundTiming, TEXT("Bound"));
+					if (BoundTex != nullptr)
+					{
+						BoundSliceCount = uint32(BoundRings.Count);
+						FScopeLock Guard(&State->Lock);
+						State->Stats.BoundFrames++;
+					}
+				}
+			}
+		}
+
 		FRDGBufferRef TileHit = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateBufferDesc(sizeof(uint32), FMath::Max(TileTotal, 1u)),
 			TEXT("VoxelMarch.TileHit"));
@@ -7931,12 +8563,24 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			{
 				HoleStats = GraphBuilder.CreateBuffer(
 					FRDGBufferDesc::CreateBufferDesc(sizeof(uint32),
-					                                 int32(VoxelMarchHoleWord::Count)),
+					                                 // End, not Count: the ray-bound
+					                                 // census's words are appended
+					                                 // after the enum (Stage 0a).
+					                                 int32(VoxelMarchRayBoundWord::End)),
 					TEXT("VoxelMarch.HoleStats"));
 				FRDGBufferUAVRef HoleStatsUAV =
 					GraphBuilder.CreateUAV(HoleStats, PF_R32_UINT);
 				AddClearUAVPass(GraphBuilder, HoleStatsUAV, 0u);
 				Params->MarchOutHoleStats = HoleStatsUAV;
+			}
+
+			// The per-ray resident-extent bound: texture and slice count,
+			// bound only when the producer actually ran (see the BoundTex
+			// note above -- the permutation keys on the same local).
+			if (BoundTex != nullptr)
+			{
+				Params->MarchBoundTex = BoundTex;
+				Params->MarchBoundSliceCount = BoundSliceCount;
 			}
 
 			FVoxelMarchCS::FPermutationDomain Permutation;
@@ -7959,6 +8603,13 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// kernel that writes it must be the one compiled for MarchSize. The
 			// two are set from the same ResShift, four lines apart, deliberately.
 			Permutation.Set<FVoxelMarchHalfResDim>(ResShift != 0);
+			// FROM THE PRODUCED TEXTURE, NOT FROM THE CVAR OR EVEN THE ARM:
+			// a bound kernel may only be selected when the texture it reads
+			// exists in this graph. Arm on + producer declined = control
+			// kernel, logged by the producer block, never a kernel reading
+			// an unbound Texture2DArray whose zeros decode as EMPTY
+			// intervals (skip the world -- every ray a hole, no error).
+			Permutation.Set<FVoxelMarchBoundDim>(BoundTex != nullptr);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.
@@ -8008,7 +8659,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 							TEXT("VoxelMarch.HoleStatsReadback"));
 					}
 					AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), HoleStats,
-					                   uint32(VoxelMarchHoleWord::Count) * sizeof(uint32));
+					                   uint32(VoxelMarchRayBoundWord::End) * sizeof(uint32));
 					Free->bInFlight = true;
 					// Which permutation filled this slot -- read at landing so
 					// a level-1 frame's structurally zero breakdown words are

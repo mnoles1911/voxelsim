@@ -1334,6 +1334,20 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 
 		if (Ray.bValid)
 		{
+#if VOXEL_MARCH_BOUND
+			// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound): load the
+			// per-level (tNear, tFar) registers ONCE, before any walk, from
+			// the slices the bound producer rasterised for exactly this
+			// pixel's ray. LocalPixel is the producer's raster pixel by
+			// construction -- the half-res lattice, where the two would
+			// differ, is a refused permutation (#error in
+			// VoxelMarchBound.ush). Every walk of this ray -- ring segments,
+			// fallthrough rungs, and the hole-stats falsifier's control walk
+			// -- then clamps against the same registers, which is what makes
+			// the falsifier a fair judge of the clamp rather than of a
+			// second load.
+			VoxelMarchBoundLoadRay(LocalPixel);
+#endif
 			float TMax = Ray.TExitUU;
 
 			// t_max FROM THE PREPASS DEPTH, and this is not a micro-optimisation.
@@ -1591,6 +1605,40 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				}
 
 #if VOXEL_MARCH_HOLE_STATS
+				// ---- THE RAY-BOUND CENSUS, SNAPSHOTTED BEFORE THE FALSIFIER --
+				//
+				// The four statics (VoxelBrickTraverse.ush, beside the cell
+				// census) are tallied by every walk this thread runs -- and the
+				// verify block right below runs a SECOND, full-interval walk
+				// when voxel.March.HeightPyramid.Verify is armed. Folding the
+				// statics directly at the accumulate site would count that
+				// control walk's iterations as if the ray had walked them,
+				// roughly doubling the census on exactly the legs that also
+				// verify. Snapshotting HERE, after the real walk and before the
+				// falsifier can run, keeps the census a statement about the
+				// picture-producing walk alone. (The cell census above does NOT
+				// take this precaution; its readings on verify-armed legs
+				// include the control walk. Do not "fix" one by the other --
+				// compare them only on legs with Verify off.)
+				const uint RbIters = GVoxelMarchRayChunkIters;
+				const uint RbPre = GVoxelMarchRayChunkItersPre;
+				const uint RbPost = GVoxelMarchRayChunkItersPost;
+				const uint RbCap = GVoxelMarchRayTermChunkCap;
+#if VOXEL_MARCH_BOUND
+				// The bound's engagement counters take the SAME pre-falsifier
+				// snapshot, for the census's reason verbatim: the verify block
+				// below runs a second, full-interval walk whose ring loop
+				// consults the same statics, and folding them at the
+				// accumulate site would roughly double every bound counter on
+				// exactly the legs that also verify.
+				const uint BndConsulted = GVoxelMarchBndConsulted;
+				const uint BndSegSkipped = GVoxelMarchBndSegmentsSkipped;
+				const uint BndInRaised = GVoxelMarchBndWalkInRaised;
+				const uint BndOutLowered = GVoxelMarchBndWalkOutLowered;
+#endif
+#endif
+
+#if VOXEL_MARCH_HOLE_STATS
 				// ---- THE FALSIFIER (voxel.March.HeightPyramid.Verify) --------
 				//
 				// COMPILED ONLY WITH THE STATS PERMUTATION, and that is the same
@@ -1756,6 +1804,73 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BLK_SKY_RUNS],
 					               H.BlockSkyRuns);
 				}
+				// ---- THE RAY-BOUND CENSUS (Stage 0a), FOLDED ---------------
+				//
+				// These three counters exist to gate the rasteriser-bound arm
+				// (docs/plan): removable = probesPre + probesPost; the GO gate
+				// is removable >= 40% of total chunk probes at the horizon, or
+				// capRays >= 5% of rays. The unit is CHUNK-LOOP ITERATIONS,
+				// not VoxelMarchLookupChunk calls -- see the statics'
+				// declaration for why the two differ and why iterations are
+				// the honest denominator for a bound that deletes loop trips.
+				//
+				// SPLIT BY DIRECTION AT THE FOLD, not in the traversal: the
+				// walk does not know the ray's world direction and does not
+				// need to -- Ray.DirWorld.z < 0 is the same horizon
+				// discriminator the `uncovered` fold below uses, applied once
+				// here so the up/down split has exactly one authority. The
+				// folded values are the PRE-FALSIFIER SNAPSHOT (see above), so
+				// a verify-armed leg reads the same census as a plain one.
+				//
+				// Guarded on the denominator like every group above: a ray
+				// that never entered the chunk loop contributes to neither
+				// numerator nor denominator and pays no atomics.
+				if (RbIters != 0u)
+				{
+					if (Ray.DirWorld.z < 0.0f)
+					{
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RB_PROBES_DOWN], RbIters);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RB_PRE_DOWN], RbPre);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RB_POST_DOWN], RbPost);
+					}
+					else
+					{
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RB_PROBES_UP], RbIters);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RB_PRE_UP], RbPre);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RB_POST_UP], RbPost);
+					}
+					// Inside the RbIters guard because a ray with no
+					// iterations cannot have capped, and NOT split by
+					// direction: its gate clause is a share of ALL rays.
+					if (RbCap != 0u)
+					{
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RB_CAP_RAYS], 1u);
+					}
+				}
+#if VOXEL_MARCH_BOUND
+				// THE BOUND'S ENGAGEMENT GROUP (voxel.March.Bound, words
+				// 56-59 -- VoxelMarchRayBoundWord's appended slots). Guarded
+				// on the DENOMINATOR like every group above: with the bound
+				// texture never loaded, or the arm consulted on no segment,
+				// this ray pays no atomics and the words stay a structural
+				// zero -- which is exactly what makes "bndConsulted == 0
+				// while voxel.March.Bound reads 1" a verdict on the ARM
+				// (producer declined, texture unbound, loader skipped) and
+				// not on the world. The folded values are the pre-falsifier
+				// snapshot above, so a verify-armed leg reads the same
+				// engagement as a plain one.
+				if (BndConsulted != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BND_CONSULTED],
+					               BndConsulted);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BND_SEGMENTS_SKIPPED],
+					               BndSegSkipped);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BND_WALKIN_RAISED],
+					               BndInRaised);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_BND_WALKOUT_LOWERED],
+					               BndOutLowered);
+				}
+#endif
 				if (H.bHit)
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HITS], 1u);

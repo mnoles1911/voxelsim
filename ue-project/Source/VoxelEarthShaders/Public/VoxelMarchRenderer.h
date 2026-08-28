@@ -358,6 +358,18 @@ struct FVoxelMarchArm
 	// test. Rings only, forced false without them, because it is the ring walk's
 	// chunk loop that consults it.
 	bool bBlockSkip = false;
+	// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound, Stage 0b). A
+	// PERMUTATION, not a uniform -- the consumer adds up to seven texture
+	// loads per ray, which is BlockSkip's argument, not ZCut's. Rings only
+	// (the clamp lives in the ring walk's socket), forced 0 without them;
+	// also forced 0 while voxel.March.SkyLadder is armed, because the
+	// Bound+SkyLadder permutation is refused at compile (the ladder's gate
+	// reads bWalkTruncated, which the bound eliminates -- see
+	// VoxelMarchBound.ush's #error) and an arm must never ask for a kernel
+	// that does not exist. The render site additionally forces it off under
+	// voxel.March.HalfRes, the third refused pairing, because ResShift is
+	// resolved per frame on the render thread and not visible here.
+	int32 Bound = 0;
 	// THE RETRY LADDER GATE (voxel.March.SkyLadder). A permutation, unlike
 	// BlockSkyMode below: it puts a field on the chunk cache and a fold at five
 	// walk sites, so the control must not carry it. Forced false without rings
@@ -990,9 +1002,21 @@ struct FVoxelMarchStats
 	// something is being paid that none of the three brackets contain.
 	float ScratchGpuMs = -1.0f;
 
+	// THE BOUND PRODUCER'S OWN BRACKET (voxel.March.Bound): the list pass
+	// plus the per-level cube rasters, and NOTHING of the march. Its own ring
+	// and its own field because an arm whose prepass hides inside marchMs
+	// cannot be judged -- a leg would read the clamp's saving net of a
+	// producer cost it never itemised, which is how a win gets credited to
+	// the wrong half of a change. Printed on the bound engagement line in
+	// VoxelMarchGetAndResetHoleStats (this workstream's own log line, beside
+	// the ray-bound census's); the external perf printer does not know this
+	// field yet and that is acceptable for Stage 0b.
+	float BoundGpuMs = -1.0f;
+
 	uint64 Frames = 0;          // frames the march pass was added
 	uint64 EmitFrames = 0;      // frames the emit pass was added
 	uint64 ScratchFrames = 0;   // frames the mode-2 scratch set was built
+	uint64 BoundFrames = 0;     // frames the bound producer passes were added
 
 	// voxel.March.HTileProbe was in force for the frame these numbers describe.
 	// Carried WITH the data, not asked of the cvar at print time: the probe
@@ -1669,6 +1693,12 @@ public:
 	FTimingPair MarchTiming[kNumTimingPairs];
 	FTimingPair EmitTiming[kNumTimingPairs];
 	FTimingPair ScratchTiming[kNumTimingPairs];
+	// The fourth ring, exactly as the DepthPreEmit note in the .cpp said a
+	// fourth bracket would mean: the bound producer (voxel.March.Bound) --
+	// list pass + per-level cube rasters, opened before the first producer
+	// pass and closed after the last, OUTSIDE the March bracket so marchMs
+	// keeps meaning what every archived leg measured.
+	FTimingPair BoundTiming[kNumTimingPairs];
 
 	// THE HIT-TILE COUNT, READ BACK.
 	//

@@ -1,0 +1,311 @@
+// VoxelMarchBound.ush -- THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound).
+//
+// Stage 0b of the rasteriser-bound arm. Two halves share this file:
+//
+//   PRODUCER  VoxelMarchBound.usf rasterises one cube per live chunk record
+//             into a Texture2DArray<float2> (one slice per ring level), storing
+//             (tNear, -tFar) under BO_Min blending, so each pixel of slice L
+//             ends up holding the convex hull of the ray's intersections with
+//             every resident level-L chunk cube. It uses the ENCODE half below.
+//   CONSUMER  the march kernel (VoxelMarch.usf -> VoxelBrickTraverse.ush under
+//             VOXEL_MARCH_BOUND) loads the slices once per ray and clamps each
+//             ring walk's [WalkIn, WalkOut] with the DECODE half.
+//
+// ===========================================================================
+// THE SOUNDNESS CLAIM, AND THE DISTINCTION THAT KEEPS IT OUT OF A STANDING RULE
+// ===========================================================================
+//
+// For cascade level L, let U(L) be the union of world AABBs of every chunk
+// record LIVE IN THE BRICK POOL'S CHUNK TABLE at level L. A level-L walk
+// cannot hit outside U(L), because a hit requires Chunk.bValid, and
+// VoxelMarchLookupChunk grants bValid only after FOUR tests pass in sequence:
+//
+//   1. the index dword's resident bit 31         (VoxelBrickTraverse.ush,
+//      ~:2277 before this file landed -- VOXEL_MARCH_INDEX_RESIDENT_BIT)
+//   2. the slot bounds check against the pool    (~:2313, Slot >=
+//      VoxelBrickChunkSlots rejected)
+//   3. the record stride cross-check             (~:2350,
+//      VoxelBrickChunkRecordDwords == VOXEL_MARCH_CHUNK_RECORD_DWORDS)
+//   4. the record's own origin + ring level against the coordinate asked for
+//      (~:2385, RecOrigin/WantOrigin and GVoxelMarchRecordLevel)
+//
+// Every one of those roads leads through a record in VoxelBrickChunkTable
+// whose origin and level SURVIVED validation -- i.e. through a cube that the
+// producer rasterised, because the producer enumerates THE SAME TABLE with a
+// SUPERSET filter (level decode only, no anySolid test, no index join).
+//
+// THIS DOES NOT CLAIM THE REMOVED SPACE IS AIR. It claims the removed space is
+// UNREACHABLE BY A HIT: no record lives there, so bValid can never be granted
+// there, whatever the ground truth of the terrain is. That distinction is why
+// the standing rule "nothing that infers emptiness from residency can work"
+// (the rule that killed the sky-skip family's naive forms) does NOT apply
+// here. That rule forbids treating "not resident" as "provably air" -- which
+// deletes terrain that merely has not streamed. This bound never answers "is
+// it air"; it answers "could the walk have returned a hit", and the debt fold
+// (see the clamp site in VoxelBrickTraverse.ush) hands the fallthrough ladder
+// exactly the bCrossedAbsentChunk value the unclamped walk would have
+// computed, so not-yet-streamed ground still takes the coarse-stand-in path it
+// takes today. The next reader WILL flag this file against that rule; this
+// paragraph is the answer, written before the question.
+//
+// ===========================================================================
+// WHAT THE CENSUS SAID, AND WHICH OF THE THREE CLAMPS IS THE PRIMARY PAYOFF
+// ===========================================================================
+//
+// The Stage 0a ray-bound census (slots 49-55 of the hole-stats buffer),
+// measured at three pitches on the shipping kernel:
+//
+//   removableUp   = 91.08% of chunk-loop iterations at the HORIZON (gate 40%)
+//                   95.48% at sky
+//   removableDown = 39.5%  looking straight down
+//   capRays       = 0.0000% everywhere
+//
+// The removable mass is predominantly PRE-hit iterations on up/horizon rays:
+// whole ring segments in which the walk crosses ZERO resident chunks at that
+// level before ever meeting one. So THE PRIMARY PAYOFF IS THE EMPTY-INTERVAL
+// COLLAPSE -- slice L reads EMPTY for this pixel, the level-L walk of that
+// segment never runs at all, and its hundreds of scattered index loads are
+// deleted whole. The WalkIn raise and WalkOut lower are SECONDARY: they trim
+// the ends of segments that do meet residency. All three come from the same
+// two floats, so all three are built; but a leg should be judged first on
+// boundSegmentsSkipped, and only then on the two clip counters.
+//
+// ===========================================================================
+// THE ENCODING
+// ===========================================================================
+//
+// A slice texel holds float2(tNear, -tFar), both in world-UU ray parameter t
+// along the march ray (DirWorld is normalised, so t IS distance). BO_Min on
+// both channels makes the running blend min(tNear) / min(-tFar) = the CONVEX
+// HULL [min tNear, max tFar] of every cube interval written -- a conservative
+// superset of the true union when the resident intervals are disjoint, which
+// is the safe direction (lost benefit, never a lost chunk).
+//
+// The clear value is +VOXEL_MARCH_BOUND_EMPTY in BOTH channels, so an
+// UNWRITTEN pixel decodes as Near = +BIG, Far = -BIG: an EMPTY interval. That
+// is the whole empty-interval mechanism -- no sentinel test, no flag; the
+// arithmetic of max(WalkIn, Near) > min(WalkOut, Far) does it.
+
+#pragma once
+
+// Large enough to sit beyond any reachable t (the 8.19 km cascade tops out at
+// 819,200 UU) and small enough that float arithmetic on it stays finite.
+// Deliberately NOT +INF: INF - OriginLocalUU.z etc. can manufacture NaNs in
+// the producer's slab math, and a NaN compares false through every branch,
+// which is an unpredictable direction. 1e30 behaves like infinity in every
+// min/max here and like a number everywhere else.
+#define VOXEL_MARCH_BOUND_EMPTY 1e30f
+
+// The largest |t| a LEGITIMATE texel can carry, for the consumer's fail-open
+// decode: the cascade reaches 8.19 km = 819,200 UU and the producer's slab t
+// is bounded by the frame extent plus a cube diagonal, well under 1e6 UU, so
+// 4.19e6 (~42 km, >5x margin) separates every real interval from garbage
+// without ever rejecting one. Anything at or past VOXEL_MARCH_BOUND_EMPTY/10
+// in BOTH channels is the clear/miss identity instead.
+#define VOXEL_MARCH_BOUND_SANE_UU 4.19e6f
+
+float2 VoxelMarchBoundEncode(float TNearUU, float TFarUU)
+{
+	return float2(TNearUU, -TFarUU);
+}
+
+float VoxelMarchBoundDecodeNear(float2 Encoded) { return Encoded.x; }
+float VoxelMarchBoundDecodeFar(float2 Encoded) { return -Encoded.y; }
+
+// ===========================================================================
+// CONSUMER HALF -- compiled only into kernels built with VOXEL_MARCH_BOUND 1
+// ===========================================================================
+//
+// Off is not merely unread: with VOXEL_MARCH_BOUND 0 none of these globals
+// exists, no texture is bound, no static is allocated, and the control kernel
+// is byte-identical -- the same rule Rings / Fallthrough / HoleStats follow.
+#if VOXEL_MARCH_BOUND
+
+// ---------------------------------------------------------------------------
+// REFUSED COMBINATIONS. Both are also refused in
+// FVoxelMarchCS::ShouldCompilePermutation; the #errors are the doctrine
+// statement for anyone who bypasses the host.
+// ---------------------------------------------------------------------------
+//
+// THE SHELL GATE'S EXACTNESS ARGUMENT DOES NOT CARRY TO THIS BOUND. The Z
+// cut could leave bCrossedShellAbsent untouched because its host pad puts
+// every removed chunk at least TWO chunks in Z from anything resident -- no
+// removed chunk can be face-adjacent to the shell. This bound removes chunks
+// ALONG THE RAY, and the chunk one step before the ray enters a resident cube
+// is very often face-adjacent to that very cube: the control's walk WOULD
+// have set bCrossedShellAbsent there, and this arm cannot know it. Under
+// VOXEL_MARCH_FALLTHROUGH_SHELL the retry ladder reads that flag, so the arm
+// would silently retry FEWER rays than the control -- dropped coarse fills,
+// i.e. holes at LOD boundaries. Refused outright rather than approximated.
+#if VOXEL_MARCH_FALLTHROUGH_SHELL
+#error "VOXEL_MARCH_BOUND cannot be compiled with VOXEL_MARCH_FALLTHROUGH_SHELL: the bound cannot reproduce bCrossedShellAbsent for the chunks it removes (its removals CAN be face-adjacent to resident ground, unlike the Z cut's padded slab), so the shell-gated retry ladder would retry fewer rays than the control and drop fills. Run one arm or the other."
+#endif
+//
+// THE SKY LADDER'S GATE READS bWalkTruncated (H.bExhausted ||
+// TERM_CHUNK_CAP), and this bound ELIMINATES truncation on exactly the rays
+// that retry today: a walk clamped to the resident extent no longer burns 512
+// chunk steps through empty space, so it completes, bWalkTruncated reads
+// false, and the ladder CLOSES on a ray the control retries -- a near fill
+// lost, whatever is behind it drawn instead. Refused outright.
+#if VOXEL_MARCH_SKY_LADDER
+#error "VOXEL_MARCH_BOUND cannot be compiled with VOXEL_MARCH_SKY_LADDER: the sky gate keeps the retry ladder open via bWalkTruncated, and the bound removes exactly the truncation that opens it, so the ladder would close on rays that retry today. Run one arm or the other."
+#endif
+//
+// THE HALF-RES LATTICE IS A DIFFERENT RAY PER SAMPLE (block centre plus a
+// per-frame jitter), while the producer rasterises at pixel centres; a bound
+// for a different ray is no bound at all (the same argument that puts
+// MarchTemporalAAJitter inside VoxelMarchBuildRay). Stage 0b refuses the
+// pairing rather than plumbing the sample lattice through the rasteriser.
+#if VOXEL_MARCH_HALFRES
+#error "VOXEL_MARCH_BOUND cannot be compiled with VOXEL_MARCH_HALFRES: the half-res sample lattice is not the raster pixel-centre lattice, so the produced bound would describe a different ray than the one marched. Stage 0b runs full-res only."
+#endif
+
+// The producer's output, one slice per ring level, bound only on this
+// permutation ("off is not merely unread, the global does not exist" -- the
+// MarchOutHoleStats rule).
+Texture2DArray<float2> MarchBoundTex;
+// How many slices the producer ACTUALLY rendered this frame. The loader
+// treats any level at or past this as PASS-THROUGH rather than loading an
+// out-of-bounds slice: an out-of-range Texture2DArray load returns zeros, and
+// zeros decode as the interval [0, -0] = EMPTY, which would delete every hit
+// at that level -- the one failure direction this file may never have.
+uint MarchBoundSliceCount;
+
+// ---------------------------------------------------------------------------
+// The per-ray bound registers.
+// ---------------------------------------------------------------------------
+//
+// PER-THREAD STATICS WITH ONE WRITER, the GVoxelMarchOriginVoxelL pattern:
+// threading a float pair through ten walk signatures is ten chances to thread
+// it wrong somewhere that still compiles, so the kernel loads once and the
+// clamp site reads. Zero-initialised statics decode as Near=0/Far=0, which
+// would clamp everything to empty -- so the clamp is additionally gated on
+// GVoxelMarchBoundLoaded, whose zero-init FALSE makes an unloaded thread
+// PASS-THROUGH (the control walk), never a deleter. The safe default and the
+// honest default are the same value, which is the property every binding in
+// this renderer is chosen for.
+static float GVoxelMarchBoundNearUU[VOXEL_MARCH_MAX_RINGS];
+static float GVoxelMarchBoundFarUU[VOXEL_MARCH_MAX_RINGS];
+static bool GVoxelMarchBoundLoaded = false;
+
+#if VOXEL_MARCH_HOLE_STATS
+// THE ENGAGEMENT COUNTERS (hole-stats words 56-59, VoxelMarchRayBoundWord in
+// VoxelMarchRenderer.cpp -- the census's own slot list, extended as its
+// comment instructs). Statics rather than FVoxelMarchHit fields, following
+// the Stage 0a census and for its reason: they accumulate across every walk
+// of the ray -- one per ring segment, more per fallthrough rung -- and the
+// walk struct is overwritten per rung.
+//
+//   Consulted   every (segment, WalkL) pair where the arm was on, the
+//               interval was non-degenerate and the registers were loaded --
+//               every decision the arm was actually asked to make. THE
+//               DENOMINATOR. Zero while voxel.March.Bound reads 1 is the arm
+//               ARMED AND INERT (producer declined, texture unbound, loader
+//               never ran), which is this project's house failure and must
+//               never be spellable as "it cut nothing". The task named three
+//               counters; this fourth exists because without it those three
+//               all read zero for BOTH "inert" and "engaged, changed
+//               nothing", and the header's ZCut trio documents why that
+//               ambiguity is not acceptable.
+//   SegmentsSkipped  pairs whose interval came back EMPTY -- the walk never
+//               ran. THE PRIMARY COUNTER (see the census block above: the
+//               removable mass is pre-hit segments with zero resident chunks).
+//   WalkInRaised / WalkOutLowered  pairs the clamp NARROWED without emptying,
+//               one per end. NOT a partition with SegmentsSkipped's
+//               complement: one consult can raise AND lower, so the two can
+//               overlap each other (never Skipped).
+//   Consulted - Skipped - (pairs that raised or lowered) >= 0 pairs were left
+//               alone, so "armed, consulted, changed nothing" stays a
+//               readable finding rather than an inference from silence.
+static uint GVoxelMarchBndConsulted = 0u;
+static uint GVoxelMarchBndSegmentsSkipped = 0u;
+static uint GVoxelMarchBndWalkInRaised = 0u;
+static uint GVoxelMarchBndWalkOutLowered = 0u;
+#endif
+
+// Load the per-level bounds for this ray, once, before any walk. SamplePixel
+// is the kernel's LocalPixel (full-res: the march sample grid IS the view
+// rect, half-res marching being a refused permutation).
+//
+// THE BOUND TARGET IS HALF RESOLUTION PER AXIS since 2026-08-28 (BND-eng2:
+// producer fill was the second cost term after the uncull draw). Texel
+// (p >> 1) stands for this pixel's 2x2 block, and ONE load per level stays
+// sound because the conservatism lives in the PRODUCER: every cube is
+// inflated by the block's ray cone before projection and before its slab
+// test (the VS carries the argument), so the texel's interval already
+// brackets every hit-t of every ray in the block -- the same farthest-of-
+// four reasoning the half-res VisBuffer's depth read applies, paid once per
+// CUBE at the producer instead of four loads per RAY per level here. The
+// alternative (min/max over the 2x2 texel neighbourhood) was priced and
+// refused: it quadruples exactly the per-ray traffic this arm's permutation
+// doctrine exists to keep off the control.
+void VoxelMarchBoundLoadRay(int2 SamplePixel)
+{
+	// Compile-time trip count (house rule: loop bounds compile-time); the
+	// uniform only selects pass-through inside it.
+	[unroll]
+	for (uint L = 0u; L < VOXEL_MARCH_MAX_RINGS; ++L)
+	{
+		if (L < MarchRingCount && L < MarchBoundSliceCount)
+		{
+			// p >> 1 < ceil(W/2) for every p < W, so every load is in
+			// bounds of the half-res target by construction.
+			const float2 W = MarchBoundTex.Load(int4(SamplePixel >> 1, int(L), 0));
+			const float NearC = VoxelMarchBoundDecodeNear(W);
+			const float FarC = VoxelMarchBoundDecodeFar(W);
+			// ---- THE FAIL-OPEN DECODE (added 2026-08-28 with the D3D12
+			// per-slice-RTV crash fix). Every texel a HEALTHY producer can
+			// yield lands in exactly one of the first two branches:
+			//   * the clear / miss identity, +EMPTY in BOTH channels -- an
+			//     unwritten pixel, or one only miss-fragments touched;
+			//   * a well-formed interval: 0 <= tNear <= tFar <= SANE (the
+			//     PS clamps tNear to 0 and writes tNear <= tFar; BO_Min of
+			//     any set of such writes with the identity stays one).
+			// The third branch is UNREACHABLE BY CONSTRUCTION -- each slice
+			// is bound once with EClear on its own RTV, which RDG cannot
+			// merge away -- and exists because "unreachable" was also the
+			// belief about slice RTVs until frame 3 of the first leg. It
+			// catches NaN (every comparison below reads false), one-channel
+			// garbage, negative or inverted or absurd intervals, and it
+			// fails toward the CONTROL WALK (no clamp, lost benefit), never
+			// toward a skip -- garbage read as EMPTY would delete terrain,
+			// which is the one direction this arm may never fail.
+			//
+			// ITS FIRING IS SILENT, which is a stated trade rather than an
+			// oversight: there is no per-ray log and no spare word for a
+			// reject counter. A bound leg reading a suspicious null --
+			// bndConsulted high, skipped/raised/lowered near zero, boundMs
+			// non-trivial -- should suspect this branch before the world,
+			// and one RenderDoc capture of VoxelMarch.Bound settles it.
+			if (W.x >= 0.1f * VOXEL_MARCH_BOUND_EMPTY && W.y >= 0.1f * VOXEL_MARCH_BOUND_EMPTY)
+			{
+				// The empty interval, kept as the full sentinels rather than
+				// the raw texel so the clamp arithmetic sees one spelling.
+				GVoxelMarchBoundNearUU[L] = VOXEL_MARCH_BOUND_EMPTY;
+				GVoxelMarchBoundFarUU[L] = -VOXEL_MARCH_BOUND_EMPTY;
+			}
+			else if (NearC >= 0.0f && FarC >= NearC && FarC <= VOXEL_MARCH_BOUND_SANE_UU)
+			{
+				GVoxelMarchBoundNearUU[L] = NearC;
+				GVoxelMarchBoundFarUU[L] = FarC;
+			}
+			else
+			{
+				// PASS-THROUGH: this level clamps nothing on this ray.
+				GVoxelMarchBoundNearUU[L] = -VOXEL_MARCH_BOUND_EMPTY;
+				GVoxelMarchBoundFarUU[L] = VOXEL_MARCH_BOUND_EMPTY;
+			}
+		}
+		else
+		{
+			// PASS-THROUGH, not empty: a level the producer did not render
+			// must march exactly as the control does. (-BIG, +BIG) clamps
+			// nothing through the max/min at the consumer.
+			GVoxelMarchBoundNearUU[L] = -VOXEL_MARCH_BOUND_EMPTY;
+			GVoxelMarchBoundFarUU[L] = VOXEL_MARCH_BOUND_EMPTY;
+		}
+	}
+	GVoxelMarchBoundLoaded = true;
+}
+
+#endif // VOXEL_MARCH_BOUND

@@ -1,0 +1,449 @@
+// VoxelMarchBound.usf -- THE BOUND PRODUCER (voxel.March.Bound, Stage 0b).
+//
+// Two passes, both added by VoxelMarchBoundProduce (VoxelMarchBound.cpp) only
+// when the arm is on, immediately before the march pass:
+//
+//   VoxelMarchBoundListMain   [cs]  one thread per pool CHUNK SLOT over
+//                                   VoxelBrickChunkTable -> per-level slot
+//                                   lists + per-level FRHIDrawIndirectParameters
+//   VoxelMarchBoundVS/PS      [raster, indirect, one draw per ring level]
+//                                   one cube per listed slot into slice L of a
+//                                   Texture2DArray<float2>, BO_Min both
+//                                   channels, storing (tNear, -tFar)
+//
+// ===========================================================================
+// WHY THE PRODUCER READS THE CHUNK TABLE AND NOTHING ELSE
+// ===========================================================================
+//
+// VoxelBrickChunkTable is THE SAME TABLE the marcher validates every hit
+// against (VoxelMarchLookupChunk's origin/level check reads dwords 0-3 of the
+// same records). Building the bound from any CPU shadow of the resident set
+// would be a JOIN COMPUTED INSTEAD OF CHECKED -- the derived-not-verified
+// shape that produced five bugs in three days -- because the shadow and the
+// table can disagree for exactly the frames a bound matters most (mid-flush).
+// Reading the table means the bound and the hit test share one authority by
+// construction.
+//
+// THE LIST PASS FILTERS ON LEVEL DECODE AND (SINCE 2026-08-28) THE VIEW
+// FRUSTUM, AND NOTHING ELSE. No anySolid test, no index-points-at-this-slot
+// join, no origin sanity test. A SUPERSET IS ALWAYS SAFE -- a stale or
+// all-air cube only rasterises a slightly wider bound (lost benefit) --
+// while any filter's bug fails in the direction of a missing cube, and a
+// missing cube is a hole. The two admitted filters each carry a written
+// no-hole argument: a slot decoding past the ring count (the cover level,
+// 7) has no slice and no walk that would consult it, and a cube outside
+// the padded ray frustum can be intersected by no marched ray at all --
+// the argument, and every conservative choice it forced, is at the test
+// in VoxelMarchBoundListMain. Any THIRD filter proposed here must bring
+// the same shape of proof or stay out.
+//
+// ===========================================================================
+// WHY THE PS COMPUTES t ANALYTICALLY, AND FROM WHICH RAY
+// ===========================================================================
+//
+// The PS calls VoxelMarchBuildRay(SV_Position.xy + MarchViewRectMin) -- the
+// EXACT function the march kernel runs (VoxelMarch.usf:866, pulled in by the
+// #include below so there is one spelling in the binary, not a mirrored one;
+// "the instrument must run the engine's binding"). Interpolated raster depth
+// would be wrong twice over: it is the depth of a FACE (not the interval of
+// the box), and it is quantised through the viewport transform. BuildRay also
+// subtracts MarchTemporalAAJitter before constructing the direction -- a
+// bound built for the unjittered ray would be a bound for a DIFFERENT ray
+// than the one marched, off by the sub-pixel phase on exactly the frames TSR
+// scrutinises hardest. And the analytic slab test hands the camera-inside-box
+// case tNear <= 0 for free, with no near-plane special case.
+//
+// THE VS PROJECTS THROUGH THE SAME RAY MODEL, INVERTED. Coverage is what
+// makes rasterisation sound here: a pixel-centre ray that hits INSIDE a cube
+// projects strictly inside that cube's convex screen footprint, so the
+// rasteriser covers the pixel (top-left rules only shave the measure-zero
+// boundary). That argument only holds if the projection is the inverse of
+// VoxelMarchBuildRay -- so the VS builds clip position as
+//     clip.xy = ViewPos.xy / MarchInvProjDiag + MarchTemporalAAJitter * ViewPos.z
+//     clip.z  = 0,  clip.w = ViewPos.z
+// (division-free, so behind-the-camera vertices stay finite and the w=0 clip
+// plane does the near clipping; z = 0 satisfies 0 <= z <= w for every w > 0).
+// Dividing by w gives Ndc = ViewPos.xy / (z * InvProjDiag) + Jitter, and
+// BuildRay's (Ndc - Jitter) * InvProjDiag recovers ViewPos.xy / z exactly:
+// the pixel is covered if and only if THE MARCHED RAY meets the cube, up to
+// float error the consumer's one-chunk BoundBiasUU absorbs in t (the lateral
+// direction is covered by the strict-interior argument above). ViewPos itself
+// comes from the transpose of MarchViewToTranslatedWorld's 3x3 -- that matrix
+// is GetInvTranslatedViewMatrix (VoxelMarchRenderer.cpp:7120), rotation +
+// translation with an orthonormal 3x3, and BuildRay uses it w=0, so the
+// transpose IS the inverse rotation and mul(M, v) is the row-vector transpose
+// trick.
+//
+// CULLING IS OFF AND DEPTH IS OFF. Back faces must rasterise (camera inside a
+// cube sees only back faces; every exit point of every ray lies on one), and
+// the interval written is a property of the BOX carried per-instance, not of
+// the fragment's own face, so double-covered pixels write the same value
+// twice and BO_Min makes that idempotent.
+
+// The whole march shader, for VoxelMarchBuildRay and the uniforms it reads
+// (MarchViewToTranslatedWorld, MarchRayOriginLocalUU, MarchInvProjDiag,
+// MarchTemporalAAJitter, MarchViewRectMin/Size, MarchVolumeExtentUU) plus the
+// pool globals VoxelBrickTraverse.ush declares (VoxelBrickChunkTable,
+// VoxelBrickChunkSlots, VoxelBrickChunkRecordDwords, MarchBrickOriginVoxel).
+// Including the .usf rather than restating BuildRay is deliberate: a second
+// spelling of the ray is how two instruments end up describing two
+// populations, and every unreferenced entry point below it is dead-stripped.
+// The host pushes VOXEL_MARCH_SOURCE=1 (for the pool globals) and
+// VOXEL_MARCH_RINGS=1 (so BuildRay compiles the CENTRED box the ring marcher
+// runs -- the cornered variant is a different ray clip); VOXEL_MARCH_BOUND
+// stays 0 here, so the CONSUMER half of VoxelMarchBound.ush does not compile
+// into the producer and no bound texture global exists to bind.
+#include "/VoxelEarth/VoxelMarch.usf"
+#include "/VoxelEarth/VoxelMarchBound.ush"
+
+// ---------------------------------------------------------------------------
+// Producer-only bindings
+// ---------------------------------------------------------------------------
+
+// How many ring levels get a slice this frame (== MarchRingCount as the host
+// resolved it; passed separately so this file has no read-order dependency on
+// the pool bind).
+uint MarchBoundSlices;
+// The per-level slot lists, SLICE-STRIDED BY THE POOL'S CHUNK CAPACITY:
+// entry (L * VoxelBrickChunkSlots + i) is the i-th slot listed at level L. A
+// slot lives in at most one level, so the flat allocation is Slices x
+// capacity and no prefix sum is needed -- Stage 0b buys simplicity with a few
+// transient megabytes (7 x ~131K x 4 B ~= 3.7 MB) rather than a second pass.
+RWBuffer<uint> MarchBoundOutList;
+Buffer<uint> MarchBoundList;
+// One FRHIDrawIndirectParameters per level: [L*4+0] VertexCountPerInstance
+// (36), [L*4+1] InstanceCount (atomic), [L*4+2] StartVertexLocation (0),
+// [L*4+3] StartInstanceLocation (0). Cleared to zero by the host; field 0 is
+// written by the first MarchBoundSlices threads of the list pass -- different
+// dwords than the atomics, so no race.
+RWBuffer<uint> MarchBoundOutArgs;
+// Which level THIS indirect draw renders. A per-draw uniform, not an
+// instance attribute: StartInstanceLocation cannot re-base SV_InstanceID, so
+// the draw indexes its own stripe of the list with this.
+uint MarchBoundLevel;
+
+// ---- THE FRUSTUM CULL (added 2026-08-28: BND-eng2 measured the producer at
+// boundMs 5.520 against marchMs 4.19 -- it cost more than the marcher it
+// exists to relieve, and the dominant term was every live pool slot drawn
+// with no visibility test).
+//
+// Five planes through the camera, in the LOCAL UU frame: the four sides of
+// the ray pyramid plus the forward plane. DERIVED ON THE CPU FROM THE SAME
+// MarchView QUANTITIES BuildRay reads -- corner rays built with the
+// identical (Ndc - MarchTemporalAAJitter) * MarchInvProjDiag construction
+// and the identical row-vector transform -- one authority, no drift -- and
+// PADDED ONE FULL PIXEL OUTWARD on every side before the planes are taken,
+// so both the jittered ray set and float slop live strictly inside the kept
+// volume. xyz = inward unit normal, w = -dot(n, camera): inside is >= 0.
+float4 MarchBoundCullPlane[5];
+// 0 disables the test outright (the CPU found a degenerate plane -- NaN or
+// a near-zero normal). FAIL-OPEN: disabled keeps every cube, i.e. the exact
+// pre-cull behaviour; never a cull by garbage arithmetic.
+uint MarchBoundCullEnable;
+// The cull's own engagement words:
+//   [0] considered  -- slots that decoded to a sliced level (pre-cull)
+//   [1] culled      -- slots the plane test rejected
+//   [2] enable      -- mirror of MarchBoundCullEnable, written by thread 0,
+//                      so the CPU line can word culled==0 as DISABLED rather
+//                      than as "nothing lay outside the frustum" (an arm
+//                      that cannot show it fired is not an arm).
+// Drawn-per-level is NOT duplicated here: it already exists as the indirect
+// args' InstanceCount, read back beside this buffer from the SAME dispatch,
+// and considered == culled + sum(drawn) is the identity the log line checks.
+RWBuffer<uint> MarchBoundOutCullStats;
+
+// ---- THE HALF-RES DILATION SLOPE (same leg, second mitigation). The bound
+// target is now HALF RESOLUTION PER AXIS (a quarter of the fill) and the
+// conservatism moved into the PRODUCER as geometry: each cube is inflated,
+// before projection AND before the PS slab test, by
+//     R = MarchBoundDilateSlope * (distance to the cube's farthest point).
+// Unitless slope (UU of inflation per UU of distance), set by the host to
+// 4x MarchPixelConeSlope (the full-res pixel HALF-width slope). Why 4x is
+// enough is argued at the VS; the producer DECLINES rather than running
+// with a non-positive slope, because R = 0 at half res is not conservative.
+float MarchBoundDilateSlope;
+
+#ifndef VOXEL_MARCH_BOUND_LIST_GROUP
+#define VOXEL_MARCH_BOUND_LIST_GROUP 64
+#endif
+
+// The chunk record's cube in the local UU frame -- ONE SPELLING, shared by
+// the list pass's cull and the VS's projection. Two derivations of "where
+// is this cube" is how a cull comes to reject a cube the raster would have
+// drawn, and in this file's failure algebra that is a hole, not an
+// artefact. The arithmetic is the one VoxelMarchBeginLevel sets up:
+// RecOrigin is stored in level-L voxels, the frame origin shifts exactly
+// (the 1024-voxel snap), and a chunk is 32 level-L voxels.
+void VoxelMarchBoundChunkBox(uint Slot, uint Level, out float3 OutBoxMinUU,
+                             out float3 OutBoxMaxUU)
+{
+	const uint Base = Slot * VoxelBrickChunkRecordDwords;
+	const int3 RecOrigin = int3(int(VoxelBrickChunkTable[Base + 0u]),
+	                            int(VoxelBrickChunkTable[Base + 1u]),
+	                            int(VoxelBrickChunkTable[Base + 2u]));
+	const float VoxUU = VOXEL_FLUID_VOXEL_UU * float(1u << Level);
+	const int3 OriginL = int3(MarchBrickOriginVoxel.x >> Level,
+	                          MarchBrickOriginVoxel.y >> Level,
+	                          MarchBrickOriginVoxel.z >> Level);
+	OutBoxMinUU = float3(RecOrigin - OriginL) * VoxUU;
+	OutBoxMaxUU = OutBoxMinUU + 32.0f * VoxUU;
+}
+
+// ===========================================================================
+// 1. THE LIST PASS -- pattern: VoxelMarchCompactTilesMain
+// ===========================================================================
+[numthreads(VOXEL_MARCH_BOUND_LIST_GROUP, 1, 1)]
+void VoxelMarchBoundListMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint SlotIndex = DispatchThreadId.x;
+
+	// The non-atomic indirect-args fields, one thread per level. Placed before
+	// the slot guard so a dispatch sized for a tiny pool still initialises
+	// every level's vertex count.
+	if (SlotIndex < MarchBoundSlices)
+	{
+		MarchBoundOutArgs[SlotIndex * 4u + 0u] = 36u; // VertexCountPerInstance: 12 tris
+		MarchBoundOutArgs[SlotIndex * 4u + 2u] = 0u;  // StartVertexLocation
+		MarchBoundOutArgs[SlotIndex * 4u + 3u] = 0u;  // StartInstanceLocation
+		// [L*4+1] InstanceCount stays at the host's clear (0) and is grown by
+		// the atomics below.
+	}
+	if (SlotIndex == 0u)
+	{
+		// The enable mirror -- see the declaration. Written whether or not
+		// the cull is on, so the CPU never reads the buffer's clear as a
+		// state the shader chose.
+		MarchBoundOutCullStats[2] = MarchBoundCullEnable;
+	}
+
+	if (SlotIndex >= VoxelBrickChunkSlots)
+	{
+		return;
+	}
+
+	// Dword 3 of the record is LevelAndFlags; bits [0:3] are the ring level --
+	// the SAME decode VoxelMarchLookupChunk validates hits against ("the level
+	// MASKS to four bits (it does not clamp) -- confirmed against
+	// BuildChunkRecord, which is the writer").
+	const uint Base = SlotIndex * VoxelBrickChunkRecordDwords;
+	const uint LevelAndFlags = VoxelBrickChunkTable[Base + 3u];
+	const uint Level = LevelAndFlags & 0xFu;
+
+	// EVERY slot that decodes at a sliced level is included -- no anySolid
+	// filter, no index join, no origin sanity test. Superset doctrine: see the
+	// header. A free or stale slot rasterises a harmless extra cube; a filter
+	// bug would delete a real one, and that failure direction is a hole.
+	if (Level >= MarchBoundSlices)
+	{
+		return;
+	}
+
+	InterlockedAdd(MarchBoundOutCullStats[0], 1u); // considered (pre-cull)
+
+	// ===================================================================
+	// THE FRUSTUM CULL, AND ITS ONE-WAY FAILURE ALGEBRA
+	// ===================================================================
+	//
+	// A wrongly-DRAWN cube costs microseconds of VS and fill. A wrongly-
+	// CULLED cube is missing from the hull, and a missing contribution
+	// shrinks tFar -- WalkOut then clamps short of real terrain and the
+	// walk never reaches it: A HOLE, this project's report-on-sight
+	// defect. Every choice below therefore leans KEEP:
+	//   * the planes come from the JITTERED corner rays (the same
+	//     (Ndc - MarchTemporalAAJitter) subtraction BuildRay applies),
+	//     padded ONE FULL PIXEL outward on every side, so no ray the march
+	//     can build this frame exits the kept volume;
+	//   * the test is the box's POSITIVE VERTEX (the corner farthest along
+	//     each plane normal): it rejects only boxes whose NEAREST approach
+	//     is strictly outside a padded plane;
+	//   * touch and ambiguity KEEP (`< 0` strict, and a NaN comparison
+	//     reads false, which lands on the keep side);
+	//   * a degenerate frustum disables the cull outright
+	//     (MarchBoundCullEnable 0) rather than culling with garbage.
+	//
+	// SOUNDNESS: a chunk any marched ray HITS contains the hit point, so
+	// it intersects that ray, and that ray lies inside the unpadded
+	// pyramid -- the padded positive-vertex test cannot reject it. The
+	// cubes this removes can contribute to no hit's covering interval;
+	// dropping them narrows the hull toward (never past) the resident
+	// extent, which is lost benefit's direction, not a hole's.
+	//
+	// ON THE UNINFLATED BOX, DELIBERATELY: the VS's half-res dilation
+	// exists for texel-footprint coverage, and the hit-coverage argument
+	// above never needed the inflation -- a cube whose inflation alone
+	// touches the frustum covers no real hit.
+	if (MarchBoundCullEnable != 0u)
+	{
+		float3 CullBoxMinUU;
+		float3 CullBoxMaxUU;
+		VoxelMarchBoundChunkBox(SlotIndex, Level, CullBoxMinUU, CullBoxMaxUU);
+		[unroll]
+		for (int PlaneIdx = 0; PlaneIdx < 5; ++PlaneIdx)
+		{
+			const float4 Pl = MarchBoundCullPlane[PlaneIdx];
+			const float3 PositiveVertex =
+				float3(Pl.x >= 0.0f ? CullBoxMaxUU.x : CullBoxMinUU.x,
+				       Pl.y >= 0.0f ? CullBoxMaxUU.y : CullBoxMinUU.y,
+				       Pl.z >= 0.0f ? CullBoxMaxUU.z : CullBoxMinUU.z);
+			if (dot(Pl.xyz, PositiveVertex) + Pl.w < 0.0f)
+			{
+				InterlockedAdd(MarchBoundOutCullStats[1], 1u); // culled
+				return;
+			}
+		}
+	}
+
+	uint WriteIndex = 0u;
+	InterlockedAdd(MarchBoundOutArgs[Level * 4u + 1u], 1u, WriteIndex);
+	MarchBoundOutList[Level * VoxelBrickChunkSlots + WriteIndex] = SlotIndex;
+}
+
+// ===========================================================================
+// 2. THE RASTER PASS -- pattern: the DepthPreEmit draw (GEmptyVertexDeclaration,
+//    corners from SV_VertexID, one indirect instanced draw per level)
+// ===========================================================================
+
+struct FVoxelMarchBoundInterp
+{
+	float4 Position : SV_Position;
+	// nointerpolation: the interval is a property of the BOX, identical at
+	// every vertex of the instance, and interpolating it would only invite a
+	// precision wobble the PS then bakes into a jump start.
+	nointerpolation float3 BoxMinUU : TEXCOORD0;
+	nointerpolation float3 BoxMaxUU : TEXCOORD1;
+};
+
+// 12 triangles over the 8 corners; corner c decodes to
+// (c & 1, (c >> 1) & 1, (c >> 2) & 1). Winding is irrelevant: CM_None.
+static const uint kVoxelMarchBoundCubeIndex[36] =
+{
+	0u, 4u, 6u,  0u, 6u, 2u,   // -X
+	1u, 3u, 7u,  1u, 7u, 5u,   // +X
+	0u, 1u, 5u,  0u, 5u, 4u,   // -Y
+	2u, 6u, 7u,  2u, 7u, 3u,   // +Y
+	0u, 2u, 3u,  0u, 3u, 1u,   // -Z
+	4u, 5u, 7u,  4u, 7u, 6u    // +Z
+};
+
+FVoxelMarchBoundInterp VoxelMarchBoundVS(uint VertexId : SV_VertexID,
+                                         uint InstanceId : SV_InstanceID)
+{
+	FVoxelMarchBoundInterp Out = (FVoxelMarchBoundInterp)0;
+
+	const uint Slot = MarchBoundList[MarchBoundLevel * VoxelBrickChunkSlots + InstanceId];
+	float3 BoxMinUU;
+	float3 BoxMaxUU;
+	VoxelMarchBoundChunkBox(Slot, MarchBoundLevel, BoxMinUU, BoxMaxUU);
+
+	// ===================================================================
+	// THE HALF-RES DILATION, AND WHY IT IS CONSERVATIVE
+	// ===================================================================
+	//
+	// The target is half resolution per axis, so one texel now stands for
+	// the 2x2 block of full-res rays the consumer will ask it about, while
+	// the PS computes its interval for ONE ray -- the block-centre ray.
+	// Two gaps open, and one inflation closes both (the same farthest-of-
+	// four conservatism the half-res VisBuffer reconstruction argues at
+	// VoxelMarch.usf's depth-read note, moved into the producer where it
+	// is paid once per CUBE instead of four loads per RAY per level):
+	//
+	//   COVERAGE: a full-res ray can hit a cube whose silhouette misses
+	//   the texel centre, so the unwritten texel would read EMPTY over a
+	//   real hit -- a hole. Inflating the cube by more than the block's
+	//   angular radius forces its footprint over the texel centre for
+	//   every cube any of the block's rays can hit.
+	//
+	//   THE t VALUES: the stored interval is the centre ray's. For any
+	//   ray q in the block and any point x of the TRUE cube on q, the
+	//   centre ray passes within (block angular radius) x t of x, so the
+	//   centre ray's point at the same t lies inside the INFLATED cube --
+	//   the stored [tNear, tFar] of the inflated cube brackets every hit
+	//   t of every ray in the block.
+	//
+	// THE RADIUS: worst offset between a block ray and the texel-centre
+	// ray is 0.5 full-res px in each axis = 0.7071 px, and the half-res
+	// raster grid's NDC skew on an odd-sized rect misplaces the centre by
+	// up to ~1 px more; 1.71 px = 3.41 pixel HALF-widths. The host sets
+	// MarchBoundDilateSlope = 4 x MarchPixelConeSlope (the half-width
+	// slope), a ~17% margin on the worst case, and inflation only ever
+	// WIDENS the stored interval -- the failure direction of a too-large
+	// R is lost benefit, never a hole. TAA jitter needs no extra term:
+	// producer and consumer rays subtract the SAME MarchTemporalAAJitter,
+	// so their relative offsets are jitter-free.
+	//
+	// Evaluated at the cube's FARTHEST point from the camera, so R covers
+	// the largest t at which this cube can be hit.
+	{
+		const float3 BoxCentre = 0.5f * (BoxMinUU + BoxMaxUU);
+		const float FarDistUU =
+			length(BoxCentre - MarchRayOriginLocalUU) + length(BoxMaxUU - BoxCentre);
+		const float R = MarchBoundDilateSlope * FarDistUU;
+		BoxMinUU -= R;
+		BoxMaxUU += R;
+	}
+	Out.BoxMinUU = BoxMinUU;
+	Out.BoxMaxUU = BoxMaxUU;
+
+	const uint Corner = kVoxelMarchBoundCubeIndex[VertexId];
+	const float3 CornerUU = float3((Corner & 1u) != 0u ? BoxMaxUU.x : BoxMinUU.x,
+	                               (Corner & 2u) != 0u ? BoxMaxUU.y : BoxMinUU.y,
+	                               (Corner & 4u) != 0u ? BoxMaxUU.z : BoxMinUU.z);
+
+	// Ray-consistent projection -- see the header. LocalDelta is the corner
+	// relative to the CAMERA in the local frame (MarchRayOriginLocalUU is the
+	// camera: it is what BuildRay uses as every ray's origin).
+	const float3 LocalDelta = CornerUU - MarchRayOriginLocalUU;
+	// Inverse of BuildRay's `mul(float4(DirView, 0), MarchViewToTranslatedWorld)`:
+	// the 3x3 is orthonormal (GetInvTranslatedViewMatrix), so the transpose is
+	// the inverse, and mul(M, v) applies the transpose of the row-vector form.
+	const float3 ViewPos = mul(MarchViewToTranslatedWorld, float4(LocalDelta, 0.0f)).xyz;
+
+	// Division-free homogeneous position: xy pre-multiplied by w = ViewPos.z,
+	// z = 0 so 0 <= z <= w clips exactly at the camera plane and nowhere else
+	// (the analytic PS neither needs nor wants a far clip).
+	Out.Position = float4(ViewPos.xy / MarchInvProjDiag + MarchTemporalAAJitter * ViewPos.z,
+	                      0.0f, ViewPos.z);
+	return Out;
+}
+
+void VoxelMarchBoundPS(FVoxelMarchBoundInterp In, out float2 OutInterval : SV_Target0)
+{
+	// HALF-RES TARGET, FULL-RES RAY MODEL. Texel (tx, ty) stands for the
+	// 2x2 full-res block whose shared centre sits at full-res position
+	// (2tx + 1, 2ty + 1) = 2 * In.Position.xy (the rasteriser hands texel
+	// centres, t + 0.5). BuildRay is then the march's own, unmodified --
+	// MarchViewRectSize stays the REAL rect, because feeding it the padded
+	// half-res extent would silently change the camera model (a different
+	// FOV per pixel), which is a different ray, which is no bound at all.
+	// The block's other rays are covered by the VS dilation, not by this
+	// mapping.
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(MarchViewRectMin + 2.0f * In.Position.xy);
+
+	// The slab test, in the same SafeDir discipline BuildRay's box clip uses
+	// (an exact-zero component nudged rather than divided).
+	const float3 SafeDir =
+		Ray.DirWorld + float3(abs(Ray.DirWorld) < VOXEL_MARCH_MIN_DIR_COMPONENT) *
+		                   VOXEL_MARCH_MIN_DIR_COMPONENT;
+	const float3 InvDir = 1.0f / SafeDir;
+	const float3 T0 = (In.BoxMinUU - Ray.OriginLocalUU) * InvDir;
+	const float3 T1 = (In.BoxMaxUU - Ray.OriginLocalUU) * InvDir;
+	const float3 TLo = min(T0, T1);
+	const float3 THi = max(T0, T1);
+	// max(..., 0): behind-the-camera geometry cannot be walked, and a negative
+	// near would only widen the hull below t=0 for nothing. Camera inside the
+	// box lands here as TNear = 0 exactly -- the free case the header names.
+	const float TNear = max(max(TLo.x, TLo.y), max(TLo.z, 0.0f));
+	const float TFar = min(min(THi.x, THi.y), THi.z);
+
+	if (TFar < TNear)
+	{
+		// A covered pixel whose analytic ray misses the box: possible on the
+		// footprint boundary, where coverage (a rounded rasteriser decision)
+		// and the exact slab test disagree by a ULP. Write the identity of
+		// BO_Min -- +BIG in both channels -- so this fragment narrows nothing
+		// and empties nothing.
+		OutInterval = float2(VOXEL_MARCH_BOUND_EMPTY, VOXEL_MARCH_BOUND_EMPTY);
+		return;
+	}
+	OutInterval = VoxelMarchBoundEncode(TNear, TFar);
+}
