@@ -1,0 +1,413 @@
+// VoxelHeightPyramid.ush -- the marcher's empty-space skip, as ONE hierarchical
+// DDA over a max-reduced upper bound on terrain height.
+//
+// ===========================================================================
+// ONE TRAVERSAL, THREE DIRECTIONS. THERE ARE NO SPECIAL CASES HERE.
+// ===========================================================================
+//
+// The field H(x,y) is a PROVABLE upper bound on the terrain surface. If the
+// ray's Z stays strictly above H over the whole of a cell crossing, there is
+// nothing in that cell to hit and the crossing can be jumped. That single test,
+// applied down a mip chain, produces all three behaviours the design asks for
+// without any of them being written separately:
+//
+//   UP          a rising ray is above H and getting further above it, so every
+//               cell it enters skips, and the walk falls out of the far end of
+//               the interval having found no candidate at all. The voxel walk
+//               is then never entered. This is the 5.638 ms pose.
+//   HORIZONTAL  a level ray over a valley is above local H by hundreds of
+//               metres and skips forward in COARSE steps -- 1,638 m at a time
+//               at the top mip -- until the ground rises to meet it. THIS IS
+//               THE HEADLINE. It is 4.45 ms of the frame, and it is precisely
+//               the case voxel.March.ZCut provably cannot touch: a Z slab is
+//               one pair of numbers, so a horizontal ray sits inside it for its
+//               whole length by construction (measured: 0.00% of 3.3e9
+//               decisions skipped at pitch -10).
+//   DOWN        a descending ray finds its first candidate cell almost at once
+//               and hands the walk a short interval. This is the 1.108 ms pose
+//               and it is the one with the least to gain, which is expected.
+//
+// And the MID-RAY skips are the same walk continued: when the voxel walk misses
+// inside a candidate interval, the DDA resumes from the far end of it and skips
+// the next proven-empty stretch. That is what makes this a maximum-mipmap
+// traversal rather than a start-offset, and it is where a grazing horizon ray
+// gets most of its saving.
+//
+// ===========================================================================
+// SOUNDNESS: THE THREE THINGS THAT MAKE A SKIP LEGAL
+// ===========================================================================
+//
+// 1. H IS AN UPPER BOUND, PROVEN, NOT SAMPLED. It comes from the amplifier's
+//    own contract, which is unconditional air above the surface, and every pass
+//    that runs afterwards only ever CARVES -- caves, caverns, karst. Nothing in
+//    the generator can put solid above H. Asset crowns are composed in per
+//    layer with reach dilation on the CPU side.
+//
+// 2. ABSENCE IS +INF, SO THE TEST FAILS SAFE WITH NO SENTINEL BRANCH. An
+//    unbuilt, declined, non-resident or out-of-field cell reads +INF, and
+//    `RayZ > +INF` is false, so the cell is treated as possibly-occupied and
+//    the walk proceeds exactly as the control does. There is no sentinel
+//    comparison anywhere in this file and therefore no way to invert one.
+//
+// 3. THE CELL BOUNDARIES COME FROM WORLD VOXEL INDICES, NOT FROM THE LOCAL
+//    FRAME. `floor(P / CellUU)` in the local frame silently assumes the frame
+//    origin is a multiple of the cell size. It is not. That exact mistake, in
+//    VoxelMarchCellExitT, put every boundary `origin mod 32` voxels away from
+//    the real one, skipped real content, and produced a BETTER skip ratio and a
+//    plausible picture -- 156,031 of 1,354,896 rays disagreeing with the flat
+//    walk. This file derives every boundary from the world voxel index and an
+//    arithmetic shift for the same reason.
+//
+// ===========================================================================
+// WHAT THIS FILE MUST NOT DO
+// ===========================================================================
+//
+// * It must not touch the camera-centred box in VoxelMarch.usf. That box is
+//   symmetric about the frame origin, which is what guarantees the camera is
+//   inside it; an asymmetric Z face gives THi.z < TLo.z for a high camera,
+//   bValid goes false, and because bValid is a DEAD TEST today that is written
+//   out as a miss with zero instrumentation. The frame would go empty when you
+//   fly high, silently.
+// * It must not add a per-step test inside the ring cascade's chunk loop. It
+//   runs BEFORE the walk and hands it t-intervals; the walk is unmodified.
+// * It must not add a margin. The crown composition on the CPU side is per
+//   footprint and is strictly tighter than any global pad.
+
+#pragma once
+
+// ---------------------------------------------------------------------------
+// Bindings. Declared HERE and included ONLY by VoxelMarch.usf, which is the
+// safety argument rather than a convenience: VoxelBrickTraverse.ush is included
+// by four kernels bound through four parameter structs, and a Buffer<float>
+// global with no entry in a struct is an UNBOUND SRV that reads ZEROS. Zero at
+// this datum is SEA LEVEL -- "the terrain tops out at the waterline" -- which
+// over the leg spawn's 2.8 km massif is proven air over real ground, silently,
+// and it would look like a speedup.
+// ---------------------------------------------------------------------------
+Buffer<float> MarchHeightPyramid;
+int   MarchHeightEnable;
+int   MarchHeightDim;              // leaf cells per side, power of two
+int   MarchHeightNumMips;
+int   MarchHeightLeafVoxelShift;   // log2(level-0 voxels per leaf cell edge)
+int2  MarchHeightMinCell;          // leaf-cell coord of the field's min corner
+int4  MarchHeightMipOffset[2];     // element offset of each mip, 8 ints
+float MarchHeightBiasUU;           // >= 0, SUBTRACTED from every bound: the corruption arm
+int   MarchHeightMaxIters;
+int   MarchHeightVerify;
+// THE MARCH FRAME'S ORIGIN, IN LEVEL-0 WORLD VOXELS, AS THIS FILE'S OWN
+// UNIFORM. It carries the same value as MarchBrickOriginVoxel and is filled
+// from it on the very next line of VoxelMarchRenderer.cpp, so the two cannot
+// drift -- the single authority is the CPU-side field, not a shader global.
+//
+// IT IS NOT SPELLED MarchBrickOriginVoxel HERE BECAUSE THAT GLOBAL DOES NOT
+// ALWAYS EXIST. VoxelBrickTraverse.ush declares it inside
+// `#if VOXEL_MARCH_HAS_BRICKPOOL`, so naming it would make this file silently
+// uncompilable on every permutation without the pool -- a fatal at editor boot
+// rather than a build error, which is the failure mode that costs a whole leg
+// to discover.
+int3  MarchHeightOriginVoxel;
+
+// The refusal, as the exact bit pattern the CPU writes. Not 1.0/0.0 and not a
+// literal: both are at the mercy of a fast-math flag, and the two sides have to
+// be the SAME number for the air test to be false on both.
+#define VOXEL_HEIGHT_INF asfloat(0x7F800000)
+
+// The mip offsets are packed as two int4s because the field carries at most 8
+// levels. The static_assert that keeps this spelling honest lives beside the
+// fill in VoxelMarchRenderer.cpp.
+int VoxelHeightMipOffset(int Mip)
+{
+	const int4 Half = MarchHeightMipOffset[Mip >> 2];
+	const int K = Mip & 3;
+	return K == 0 ? Half.x : (K == 1 ? Half.y : (K == 2 ? Half.z : Half.w));
+}
+
+// H for one cell at one mip. ABSOLUTE leaf-cell coordinates in; the mip's own
+// cell is derived here by an arithmetic shift so there is one spelling of the
+// nesting rather than one per caller.
+//
+// THE RANGE TEST IS THE INDEX. There is no toroidal wrap: a wrapped read that
+// escaped the valid rectangle would alias onto ground 13 km away, and a wrong
+// height is proven air over real terrain rather than a blurred texel. Outside
+// the field the answer is +INF, which is also the correct answer -- the field
+// knows nothing there.
+float VoxelHeightFetch(int Mip, int CellX, int CellY)
+{
+	const int D = MarchHeightDim >> Mip;
+	const int Mx = CellX >> Mip;
+	const int My = CellY >> Mip;
+	const int Ox = MarchHeightMinCell.x >> Mip;
+	const int Oy = MarchHeightMinCell.y >> Mip;
+	const int Lx = Mx - Ox;
+	const int Ly = My - Oy;
+	if (Lx < 0 || Ly < 0 || Lx >= D || Ly >= D)
+	{
+		return VOXEL_HEIGHT_INF;
+	}
+	const float H = MarchHeightPyramid[VoxelHeightMipOffset(Mip) + Ly * D + Lx];
+	// THE BIAS IS SUBTRACTED, AND IT EXISTS TO BREAK THIS ON PURPOSE.
+	// voxel.March.HeightPyramid.BiasM lowers every bound, i.e. deliberately
+	// claims air where there is ground, so that the falsifier can be shown able
+	// to fire. It is clamped >= 0 on the CPU side: a NEGATIVE bias would be a
+	// margin, and margins are refused here because the per-footprint crown
+	// composition is already strictly tighter than any global pad.
+	//
+	// INF - finite is still INF, so absence survives the corruption. That is
+	// correct: the corruption must make the field WRONG, not make it forget
+	// what it does not know.
+	return H - MarchHeightBiasUU;
+}
+
+// ---------------------------------------------------------------------------
+// The DDA.
+// ---------------------------------------------------------------------------
+//
+// Everything below works in the march's LOCAL UU frame for positions and in
+// WORLD LEVEL-0 VOXEL INDICES for cell boundaries -- the split that
+// VoxelMarchCellExitT's own comment exists to enforce.
+
+struct FVoxelHeightWalk
+{
+	float3 Origin;      // local UU
+	float3 Dir;         // normalised
+	float2 InvDirXY;    // 1/Dir.xy, saturated away from zero
+	int2   OriginVoxelXY;   // MarchBrickOriginVoxel.xy
+	float  OriginWorldZUU;  // world Z of local Z = 0
+	int    Steps;
+};
+
+// Exit parameter of the mip-Mip cell containing the point at t, along XY only.
+// Z is deliberately not bounded here: the cell is a COLUMN, infinite in Z, and
+// the air test below is what uses Z.
+float VoxelHeightCellExitT(FVoxelHeightWalk W, int Mip, int CellX, int CellY)
+{
+	const int Shift = MarchHeightLeafVoxelShift + Mip;
+	// The cell's world-voxel bounds, exactly. `<<` on the already-shifted cell
+	// index reconstructs the aligned boundary; the subtraction of the frame
+	// origin happens in INTEGERS, so the local-UU boundary is exact even at the
+	// far edge of a 13 km field.
+	const int MinVoxX = (CellX >> Mip) << Shift;
+	const int MinVoxY = (CellY >> Mip) << Shift;
+	const int SpanVox = int(1u << uint(Shift));
+
+	const float MinLocalX = float(MinVoxX - W.OriginVoxelXY.x) * 10.0f;
+	const float MinLocalY = float(MinVoxY - W.OriginVoxelXY.y) * 10.0f;
+	const float SpanUU = float(SpanVox) * 10.0f;
+
+	const float TargetX = (W.Dir.x >= 0.0f) ? (MinLocalX + SpanUU) : MinLocalX;
+	const float TargetY = (W.Dir.y >= 0.0f) ? (MinLocalY + SpanUU) : MinLocalY;
+
+	const float TX = (TargetX - W.Origin.x) * W.InvDirXY.x;
+	const float TY = (TargetY - W.Origin.y) * W.InvDirXY.y;
+	return min(TX, TY);
+}
+
+// Is the ray provably in air over [Ta, Tb] inside the cell whose bound is H?
+//
+// Z IS LINEAR IN t, SO THE MINIMUM OVER THE INTERVAL IS AT ONE END. Taking the
+// minimum is what makes this a proof rather than a sample: if the LOWEST point
+// the ray reaches inside the cell is still above the cell's upper bound, no
+// point of the ray inside the cell can be at or below the surface.
+//
+// STRICTLY GREATER, and the strictness matters at exactly one value: H = +INF
+// makes this false, which is the fail-safe direction and the reason absence
+// needs no branch of its own.
+bool VoxelHeightProvablyAir(FVoxelHeightWalk W, float H, float Ta, float Tb)
+{
+	const float Za = W.Origin.z + W.Dir.z * Ta;
+	const float Zb = W.Origin.z + W.Dir.z * Tb;
+	const float ZLo = min(Za, Zb) + W.OriginWorldZUU;
+	return ZLo > H;
+}
+
+// Walk forward from TIn looking for the first t at which a hit is POSSIBLE, and
+// then for the end of that candidate run.
+//
+// Returns false when the whole of [TIn, TMax] is provably air -- the up case,
+// and also a level ray that clears everything left in the field.
+//
+// THE ASCEND IS UNCONDITIONAL AFTER A SKIP AND THAT IS DELIBERATE. The textbook
+// maximum-mipmap walk only climbs at a parent boundary. Climbing eagerly can
+// re-test space already crossed, which costs iterations; it can never SKIP
+// unproven space, because the cell is recomputed from the position every
+// iteration and every skip is justified by that iteration's own air test. The
+// cheap version is the one that cannot be subtly wrong.
+//
+// bOutRunEndedOnAir IS THE CALLER'S SPLIT DECISION AND IT IS NOT COSMETIC.
+// It says the candidate run ended because PROVABLE AIR was found beyond it --
+// i.e. there is something left for a second consultation to skip. Ending on
+// the step cap, on the far bound, or on a stalled DDA all report FALSE, which
+// tells the caller to hand over the whole remainder and walk it exactly as the
+// control does.
+//
+// WITHOUT THIS THE ARM IS INERT AT GROUND LEVEL, measured: at the pose-split
+// spawn the camera sits 5.00 m above ground and a 12.8 m leaf carries 9.68 m of
+// slack, so the camera's OWN cell bound is ~4.68 m ABOVE the camera and is
+// never provably air. Every ray therefore found its candidate at t = TIn with
+// nothing skipped before it -- advanced 0.00% of 50,131,152 rays -- and a split
+// rule keyed on "did we skip before this walk" refused to look again. The
+// pyramid could see the valley 700 m ahead and was never asked.
+bool VoxelHeightNextCandidate(inout FVoxelHeightWalk W, float TIn, float TMax,
+                              out float TCand0, out float TCand1,
+                              out bool bOutRunEndedOnAir)
+{
+	TCand0 = TIn;
+	TCand1 = TMax;
+	bOutRunEndedOnAir = false;
+
+	const int TopMip = MarchHeightNumMips - 1;
+	int Mip = TopMip;
+	float T = TIn;
+
+	// ---- phase 1: skip forward to the first possible hit -----------------
+	//
+	// Bounded at 128 steps. The bound is not defensive: an unbounded DDA in a
+	// pixel shader is a hang, and the honest behaviour on exhaustion is to give
+	// up and hand the walk everything left, which is the CONTROL. Running out
+	// of steps costs speed and can never make a hole.
+	bool bFound = false;
+	[loop]
+	for (int Iter = 0; Iter < 128; ++Iter)
+	{
+		if (T >= TMax)
+		{
+			// Fell out of the far end with no candidate: provably empty.
+			return false;
+		}
+		++W.Steps;
+
+		// The cell containing the point at t, in ABSOLUTE leaf-cell coords.
+		// Derived from the WORLD voxel, never from a local-frame floor -- see
+		// this file's header note 3.
+		const float3 P = W.Origin + W.Dir * T;
+		const int VoxX = W.OriginVoxelXY.x + int(floor(P.x * 0.1f));
+		const int VoxY = W.OriginVoxelXY.y + int(floor(P.y * 0.1f));
+		const int CellX = VoxX >> MarchHeightLeafVoxelShift;
+		const int CellY = VoxY >> MarchHeightLeafVoxelShift;
+
+		const float H = VoxelHeightFetch(Mip, CellX, CellY);
+		const float TExit = VoxelHeightCellExitT(W, Mip, CellX, CellY);
+		// NON-PROGRESS IS A BAIL-OUT, NOT A NUDGE, AND THAT IS THE SOUND FORM.
+		//
+		// The obvious guard here is `max(TExit, T + eps)` to keep the loop
+		// moving. It is WRONG, quietly: the eps carries t past the cell face, so
+		// the air verdict taken from THIS cell's bound gets applied to a sliver
+		// of the NEXT cell, whose bound may be higher. That is an unproven skip
+		// -- small, and exactly the kind of small that this project has twice
+		// shipped as deleted terrain.
+		//
+		// A ray sitting exactly on a face after float rounding cannot advance,
+		// so the honest answer is to stop skipping and hand the walk everything
+		// from here. That is the CONTROL: it costs the skip and cannot cost a
+		// voxel. Progress is then strictly positive on every surviving
+		// iteration, which is also what makes the loop terminate.
+		if (!(TExit > T))
+		{
+			TCand0 = T;
+			TCand1 = TMax;
+			return true;
+		}
+		const float TSeg = min(TExit, TMax);
+
+		if (VoxelHeightProvablyAir(W, H, T, TSeg))
+		{
+			T = TSeg;
+			Mip = min(Mip + 1, TopMip);
+			continue;
+		}
+
+		if (Mip > 0)
+		{
+			--Mip;
+			continue;
+		}
+
+		// A leaf cell that is not provably air: a hit is possible from here.
+		TCand0 = T;
+		bFound = true;
+		break;
+	}
+
+	if (!bFound)
+	{
+		// Step budget exhausted with no verdict. Hand the walk everything from
+		// here -- the control -- and tell the caller NOT to split: there is no
+		// evidence of air beyond, so a second consultation would only pay
+		// another traversal setup for nothing.
+		TCand0 = T;
+		TCand1 = TMax;
+		bOutRunEndedOnAir = false;
+		return true;
+	}
+
+	// ---- phase 2: how far does the candidate run extend? -----------------
+	//
+	// At the LEAF only. The point is to find the far end of the stretch the
+	// voxel walk has to look at, and a coarse cell would over-extend it: a
+	// 1,638 m parent is not provably air merely because one of its 16,384
+	// leaves is not, so climbing here would hand the walk the whole parent and
+	// throw away the mid-ray skip this phase exists to enable.
+	//
+	// Bounded at 16 leaf cells. On exhaustion the run simply ends there and the
+	// caller re-enters, which is correct: the intervals partition the ray and
+	// the DDA resumes from the far end of each.
+	float TRun = TCand0;
+	[loop]
+	for (int K = 0; K < 16; ++K)
+	{
+		if (TRun >= TMax) { break; }
+		++W.Steps;
+
+		const float3 P = W.Origin + W.Dir * TRun;
+		const int VoxX = W.OriginVoxelXY.x + int(floor(P.x * 0.1f));
+		const int VoxY = W.OriginVoxelXY.y + int(floor(P.y * 0.1f));
+		const int CellX = VoxX >> MarchHeightLeafVoxelShift;
+		const int CellY = VoxY >> MarchHeightLeafVoxelShift;
+
+		const float H = VoxelHeightFetch(0, CellX, CellY);
+		const float TExit = VoxelHeightCellExitT(W, 0, CellX, CellY);
+		// Same bail-out as phase 1, and here it is not even a lost skip: ending
+		// the candidate run early only makes the interval handed to the voxel
+		// walk SHORTER, and the caller resumes the DDA from its far end.
+		if (!(TExit > TRun))
+		{
+			break;
+		}
+		const float TSeg = min(TExit, TMax);
+
+		if (K > 0 && VoxelHeightProvablyAir(W, H, TRun, TSeg))
+		{
+			// The run ended at the start of this cell, ON AIR. THIS is the only
+			// path that earns a split: the caller now knows a second
+			// consultation has something to skip.
+			bOutRunEndedOnAir = true;
+			break;
+		}
+		TRun = TSeg;
+	}
+	TCand1 = min(max(TRun, TCand0), TMax);
+	return true;
+}
+
+// Set up the walk. Separated from the traversal so the caller can decide
+// whether to run it at all without duplicating the frame-origin arithmetic.
+FVoxelHeightWalk VoxelHeightBeginWalk(float3 OriginLocalUU, float3 DirWorld)
+{
+	FVoxelHeightWalk W;
+	W.Origin = OriginLocalUU;
+	W.Dir = DirWorld;
+	// Saturated away from zero rather than branched on. An axis-parallel ray
+	// gets a huge but finite reciprocal, so its exit parameter on that axis is
+	// huge and the OTHER axis wins the min -- which is the correct answer, and
+	// it arrives without a special case.
+	W.InvDirXY = float2(
+		1.0f / ((abs(DirWorld.x) < 1e-6f) ? (DirWorld.x >= 0.0f ? 1e-6f : -1e-6f) : DirWorld.x),
+		1.0f / ((abs(DirWorld.y) < 1e-6f) ? (DirWorld.y >= 0.0f ? 1e-6f : -1e-6f) : DirWorld.y));
+	W.OriginVoxelXY = int2(MarchHeightOriginVoxel.x, MarchHeightOriginVoxel.y);
+	// World Z of local Z = 0. Exact: the frame origin is an integer voxel index
+	// and a voxel is 10 UU, so this is an integer product taken in float where
+	// it is representable to well under a millimetre at planet scale.
+	W.OriginWorldZUU = float(MarchHeightOriginVoxel.z) * 10.0f;
+	W.Steps = 0;
+	return W;
+}

@@ -106,11 +106,16 @@ Copy-Item (Join-Path $Shaders 'VoxelMarchIndexCell.ush') $Stage
     Replace('"/VoxelEarth/VoxelMaterialPalette.ush"', '"VoxelMaterialPalette.ush"').
     Replace('"/VoxelEarth/VoxelMarchIndexCell.ush"', '"VoxelMarchIndexCell.ush"') |
     Out-File (Join-Path $Stage 'VoxelBrickTraverse.ush') -Encoding utf8
+# THE HEIGHT PYRAMID'S WALK. Included by VoxelMarch.usf only -- see that file's
+# note on why a Buffer<float> global must not reach the four-struct bindings --
+# so it is staged here rather than beside VoxelBrickTraverse.ush's includes.
+Copy-Item (Join-Path $Shaders 'VoxelHeightPyramid.ush') $Stage
 (Get-Content (Join-Path $Shaders 'VoxelMarch.usf') -Raw).
     Replace('#include "/Engine/Private/Common.ush"', '#include "engine-stub.ush"').
     Replace('#include "/Engine/Private/DeferredShadingCommon.ush"', '').
     Replace('#include "/Engine/Private/VelocityCommon.ush"', '').
-    Replace('"/VoxelEarth/VoxelBrickTraverse.ush"', '"VoxelBrickTraverse.ush"') |
+    Replace('"/VoxelEarth/VoxelBrickTraverse.ush"', '"VoxelBrickTraverse.ush"').
+    Replace('"/VoxelEarth/VoxelHeightPyramid.ush"', '"VoxelHeightPyramid.ush"') |
     Out-File (Join-Path $Stage 'march.hlsl') -Encoding utf8
 
 # ---------------------------------------------------------------------------

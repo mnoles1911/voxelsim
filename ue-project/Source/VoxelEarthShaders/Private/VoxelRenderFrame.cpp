@@ -6,8 +6,15 @@
 // reconciliation delta so that a drifting instrument is loud rather than
 // silent.
 
-#include <atomic>
+// ITS OWN HEADER FIRST. UnrealBuildTool enforces this and fails the build
+// outright ("Expected VoxelRenderFrame.h to be first header included"); the
+// <atomic> that used to sit above it made the header non-self-contained by
+// accident, which is the whole thing the rule exists to catch. Surfaced when
+// a new file in this module invalidated the makefile and forced a full IWYU
+// re-validation -- it had been latent, not absent.
 #include "VoxelRenderFrame.h"
+
+#include <atomic>
 
 #include "HAL/PlatformProcess.h"
 #include "Misc/CommandLine.h"

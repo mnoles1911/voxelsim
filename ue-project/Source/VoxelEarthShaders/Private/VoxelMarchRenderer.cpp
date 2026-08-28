@@ -14,6 +14,7 @@
 #include "VoxelBrickPool.h"       // the P3-B1 traversal source
 #include "VoxelMarchChunkIndex.h"
 #include "VoxelMarchChunkIndex.h" // and the GPU lookup that makes it walkable
+#include "VoxelHeightPyramid.h"  // the terrain-height upper bound the marcher skips air with
 #include "VoxelGIVolume.h"       // the marcher now samples voxel GI
 #include "SystemTextures.h"       // GetDefaultBuffer, for the emit pass's index fallback
 #include "VoxelFluidOccupancy.h" // the P3 traversal source; see the header, section 5
@@ -531,6 +532,109 @@ TEXT("voxel.March.SkyLadder"), 0,
 		TEXT("that appears at 1 or 2 and is absent at 0 on the same spawn and the same pose. ")
 		TEXT("That is a hole, it outranks every millisecond here, and the response is to turn ")
 		TEXT("the arm off and read skyVerifyBad -- not to shrink the band."),
+		ECVF_RenderThreadSafe);
+
+	// ======================================================================
+	// THE TERRAIN HEIGHT PYRAMID
+	// ======================================================================
+	//
+	// A max-reduced 2D upper bound on terrain height (VoxelHeightPyramid.h),
+	// consulted by a hierarchical DDA before the voxel walk. ONE traversal
+	// answers all three directions: a rising ray terminates once it is above
+	// every bound left along it, a level ray steps over a valley in coarse
+	// jumps, and a descending ray jumps straight to first contact.
+	//
+	// WHY THIS AND NOT voxel.March.ZCut, WHICH ALREADY BOUNDS Z. The Z slab is
+	// ONE PAIR OF NUMBERS PER LEVEL, so a horizontal ray sits inside it for its
+	// whole length BY CONSTRUCTION. Measured: the slab skips 0.00% of decisions
+	// at the flight's pitch -10 across 3.3e9 consultations, 21% at a sky pose,
+	// 93% at 1,200 m altitude. The horizon -- which is where the frame is spent,
+	// 4.45 ms of it -- is precisely the case it cannot touch. A heightfield is a
+	// FUNCTION OF POSITION, so it bounds every direction: a level ray over a
+	// valley 700 m below is provably in air for that whole stretch.
+	//
+	// AND WHY NOT A SINGLE CEILING, WHICH WOULD BE CHEAPER. A ceiling must take
+	// the MAX over the whole reach. At the leg spawn that pins it at ~2,860 m
+	// from one distant massif while local ground drops to 1,489 m -- it throws
+	// away 1,371 m of bound in every direction that does not point at the
+	// massif, and the camera sits 667 m BELOW it. It is not a cheaper first
+	// step here; it is a different and much weaker mechanism.
+	TAutoConsoleVariable<int32> CVarVoxelMarchHeightPyramid(
+		TEXT("voxel.March.HeightPyramid"), 0,
+		TEXT("THE TERRAIN HEIGHT PYRAMID. 0 = off, THE CONTROL, and the default. 1 = before ")
+		TEXT("walking, run a hierarchical DDA over a max-reduced upper bound on terrain height ")
+		TEXT("and hand the voxel walk only the intervals where a hit is POSSIBLE.\n")
+		TEXT("A UNIFORM AND NOT A PERMUTATION, for the reason voxel.March.ZCut is one: the arm ")
+		TEXT("adds no load an off-arm would have to carry, and one build then serves both arms ")
+		TEXT("of a pitch sweep, which is how this is measured.\n")
+		TEXT("IT CANNOT MAKE A HOLE, and that property is built rather than hoped for. Every ")
+		TEXT("cell holds a PROVABLE upper bound from the amplifier's own contract (caves, ")
+		TEXT("caverns and karst only ever CARVE, so they cannot break an upper bound; asset ")
+		TEXT("crowns are composed in per layer with reach dilation). Anything absent, declined, ")
+		TEXT("not yet filled or outside the field holds +INFINITY, which makes the air test ")
+		TEXT("false and the walk proceed exactly as the control does. THE ONE THING THE BOUND ")
+		TEXT("CANNOT SEE IS A PLAYER EDIT, and the builder folds EditedFootprintMaxZ back in ")
+		TEXT("for that.\n")
+		TEXT("WHAT WOULD REFUTE IT: any black arc, missing ground, or sky where terrain belongs ")
+		TEXT("that appears at 1 and is absent at 0 on the same spawn and the same pose. That is ")
+		TEXT("a hole, it outranks every millisecond here, and the response is to turn the arm ")
+		TEXT("off -- not to add a margin.\n")
+		TEXT("READ THE ENGAGEMENT COUNTERS BEFORE ANY TIMING. voxel.March.Stats prints ")
+		TEXT("heightConsulted / heightAdvanced / heightEmpty / heightReentries. heightConsulted ")
+		TEXT("== 0 while this reads 1 is the arm ARMED AND INERT. heightReentries == 0 with ")
+		TEXT("heightAdvanced large means only the tStart half is running and the mid-ray skips ")
+		TEXT("were NOT measured, which is a PARTIAL result and must be reported as one."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<int32> CVarVoxelMarchHeightPyramidVerify(
+		TEXT("voxel.March.HeightPyramid.Verify"), 0,
+		TEXT("THE FALSIFIER, and it is the gate that runs FIRST. 0 = off, the default. 1 = every ")
+		TEXT("ray ALSO walks its full unclamped interval, and any hit found inside space the ")
+		TEXT("pyramid declared empty is counted. Two counters, not one, because they mean ")
+		TEXT("different things: heightMissed is the clamped walk finding NOTHING where the ")
+		TEXT("control found geometry -- an unambiguous hole -- while heightLate is a hit ")
+		TEXT("further along than the control, which may only be a coarser ring answering a ")
+		TEXT("segment after a mid-ray restart. heightMissed MUST be 0; heightLate is judged ")
+		TEXT("on its DISTRIBUTION, which is printed beside it.\n")
+		TEXT("A CONFIRMATION THAT CANNOT COME OUT THE OTHER WAY IS NOT ONE. Before believing a ")
+		TEXT("zero here, set voxel.March.HeightPyramid.BiasM to 50 -- that lowers every bound by ")
+		TEXT("50 m, i.e. deliberately claims air where there is ground -- and confirm ")
+		TEXT("BOTH counters go NON-ZERO. A run that has not done that has not tested ")
+		TEXT("anything.\n")
+		TEXT("COSTS ROUGHLY 2x: the ray is walked twice by construction. Never read timing from ")
+		TEXT("a leg with this on."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelMarchHeightPyramidBiasM(
+		TEXT("voxel.March.HeightPyramid.BiasM"), 0.0f,
+		TEXT("METRES SUBTRACTED FROM EVERY HEIGHT BOUND THE SHADER READS. 0 = the sound field ")
+		TEXT("and the only value that may ever ship.\n")
+		TEXT("THIS EXISTS TO BREAK THE FEATURE ON PURPOSE. A positive value makes the bound too ")
+		TEXT("LOW, which is exactly the failure this design is written to prevent -- proven air ")
+		TEXT("over real ground -- so it is the corruption that proves the falsifier above can ")
+		TEXT("fire. Set it with Verify 1 and watch heightMissed climb; set it with Verify 0 ")
+		TEXT("and watch terrain disappear from the image. Both are the point.\n")
+		TEXT("A NEGATIVE VALUE IS A MARGIN, AND MARGINS ARE REFUSED HERE. Asset crowns are ")
+		TEXT("already composed into the bound per layer with reach dilation; a global pad on top ")
+		TEXT("of that is strictly looser than the per-footprint composition the codebase already ")
+		TEXT("computes. Negative values are clamped to 0."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<int32> CVarVoxelMarchHeightPyramidMaxIters(
+		TEXT("voxel.March.HeightPyramid.MaxIters"), 3,
+		TEXT("How many separate voxel-walk intervals one ray may be split into by the pyramid. ")
+		TEXT("THIS IS THE MID-RAY SKIP KNOB and it is the difference between a tStart advance ")
+		TEXT("and a real maximum-mipmap traversal.\n")
+		TEXT("1 = tStart only: skip forward to the first cell where a hit is possible, then hand ")
+		TEXT("the walk everything from there to the far bound. A ray that grazes a ridge then ")
+		TEXT("pays for all the air beyond it.\n")
+		TEXT("Greater than 1 = the walk is re-entered after a miss, having skipped the next ")
+		TEXT("proven-empty stretch. THIS IS THE HORIZON CASE and it is what the 4.45 ms is ")
+		TEXT("spent on.\n")
+		TEXT("EACH RE-ENTRY COSTS A FULL TRAVERSAL SETUP, so this is not free and is not ")
+		TEXT("monotonic -- measure it, do not raise it on principle. On the LAST permitted ")
+		TEXT("iteration the walk is handed the whole remaining interval, so lowering this can ")
+		TEXT("only cost speed and can never make a hole."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchZCutPadChunks(
@@ -1140,6 +1244,20 @@ TEXT("voxel.March.SkyLadder"), 0,
 	std::atomic<int32> GVoxelMarchZCutRanZMin[8] = {};
 	std::atomic<int32> GVoxelMarchZCutRanZMax[8] = {};
 
+	// THE HEIGHT PYRAMID'S BIND STAMP, for the reason the Z bound has one: the
+	// cvar reads back whatever was typed, and "the cvar says 1" has been
+	// mistaken for "the arm ran" enough times in this project that the bind now
+	// reports itself. -1 means NO BIND HAS HAPPENED YET, which is a different
+	// finding from 0 (bound, and deliberately disabled) and must not print as
+	// the same thing.
+	//
+	// Written render thread, read game thread, relaxed: a report, not a
+	// handshake.
+	std::atomic<int32> GVoxelMarchHeightRanEnable{-1};
+	std::atomic<int32> GVoxelMarchHeightRanDim{0};
+	std::atomic<int32> GVoxelMarchHeightRanLeafLevel{-1};
+	std::atomic<int32> GVoxelMarchHeightRanMips{0};
+
 	// ---- THE HALF-RES LATTICE'S PER-FRAME OFFSET ---------------------------
 	//
 	// ONE TABLE, ONE RESOLVE, READ BY FOUR PASSES. The march, the depth
@@ -1734,6 +1852,213 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 					            "the slabs are wider than the segments. Check the per-slot "
 					            "spans printed above before blaming the traversal."),
 					       (unsigned long long)HW.ZCutConsulted);
+				}
+			}
+		}
+		// ---- THE TERRAIN HEIGHT PYRAMID: ARMED, FILLED, AND WHAT IT SKIPPED
+		//
+		// THREE QUESTIONS, PRINTED SEPARATELY, BECAUSE THEY FAIL SEPARATELY.
+		//
+		//   1. armed    the cvar. This arm is a uniform, so the cvar is the arm.
+		//   2. FILLED   what the FIELD actually holds. A field that is entirely
+		//               +INF is inert by construction -- every air test false,
+		//               every counter a structural zero -- and without this line
+		//               that reads as a clean null result. This is the question
+		//               the Z bound does not have and this one does, because the
+		//               field is BUILT over seconds rather than being a uniform.
+		//   3. used     what the GPU did with it. Needs voxel.March.HoleStats.
+		//               consulted == 0 while armed is ARMED AND INERT.
+		//
+		// and the falsifier, which is printed whenever the arm is on and is NOT
+		// reported as a pass unless it was actually run.
+		{
+			const FVoxelMarchHoleStats HP = VoxelMarchPeekLastHoleWindow();
+			const int32 RanEnable = GVoxelMarchHeightRanEnable.load(std::memory_order_relaxed);
+			const int32 RanDim = GVoxelMarchHeightRanDim.load(std::memory_order_relaxed);
+			const int32 RanLeaf = GVoxelMarchHeightRanLeafLevel.load(std::memory_order_relaxed);
+			const int32 RanMips = GVoxelMarchHeightRanMips.load(std::memory_order_relaxed);
+			// LEAF EDGE FROM THE LEVEL, not from a remembered metre value: a
+			// level-L chunk is 3.2 * 2^L m and that relation is the only place
+			// the two spellings can be made to agree.
+			const double LeafEdgeM = (RanLeaf >= 0) ? 3.2 * double(int64(1) << RanLeaf) : 0.0;
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("  heightPyramid: armed=%d bind=%s leaf=L%d (%.1f m) dim=%d mips=%d"),
+			       HP.bHeightArmed ? 1 : 0,
+			       RanEnable < 0 ? TEXT("NEVER BOUND")
+			                     : (RanEnable != 0 ? TEXT("enabled") : TEXT("bound, disabled")),
+			       RanLeaf, LeafEdgeM, RanDim, RanMips);
+			if (HP.HeightDim > 0)
+			{
+				const int32 LeafTotal = HP.HeightDim * HP.HeightDim;
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    field: %d/%d leaves filled (%.1f%%), %d still +INF (%.1f%%) "
+				            "-- %d declined, %d fine tile not resident, %d raised by edits; "
+				            "finite range %.1f .. %.1f m"),
+				       HP.HeightFilledLeaves, LeafTotal,
+				       LeafTotal > 0 ? 100.0 * double(HP.HeightFilledLeaves) / double(LeafTotal) : 0.0,
+				       HP.HeightInfiniteLeaves,
+				       LeafTotal > 0 ? 100.0 * double(HP.HeightInfiniteLeaves) / double(LeafTotal) : 0.0,
+				       HP.HeightDeclinedLeaves, HP.HeightNotResidentLeaves, HP.HeightEditedLeaves,
+				       HP.HeightMinUU * 0.01f, HP.HeightMaxUU * 0.01f);
+				if (HP.HeightInfiniteLeaves == LeafTotal)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    THE FIELD IS ENTIRELY +INF. That is INERT, not "
+					            "safe-and-working: every air test is false, the walk is "
+					            "byte-for-byte the control, and every counter below is a "
+					            "STRUCTURAL zero. No frame time on this leg describes the "
+					            "height pyramid. Check that the builder ticked at all "
+					            "(voxel.HeightPyramid.Build) before reading anything else."));
+				}
+			}
+			if (!HP.bArmed || HP.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: NOT MEASURED (%s). Only these counters prove the "
+				            "shader consulted the field; the uniform being filled does not."),
+				       !HP.bArmed ? TEXT("voxel.March.HoleStats is 0")
+				                  : TEXT("armed, no readback has landed yet"));
+			}
+			else
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: heightConsulted=%llu, advanced %llu (%.2f%%), "
+				            "fully empty %llu (%.2f%%), reentries %llu; heightLeafCells=%llu, "
+				            "heightSteps=%llu, over %llu frames"),
+				       (unsigned long long)HP.HeightConsulted,
+				       (unsigned long long)HP.HeightAdvanced,
+				       HP.HeightConsulted > 0
+				           ? 100.0 * double(HP.HeightAdvanced) / double(HP.HeightConsulted) : 0.0,
+				       (unsigned long long)HP.HeightEmpty,
+				       HP.HeightConsulted > 0
+				           ? 100.0 * double(HP.HeightEmpty) / double(HP.HeightConsulted) : 0.0,
+				       (unsigned long long)HP.HeightReentries,
+				       (unsigned long long)HP.HeightLeafCells,
+				       (unsigned long long)HP.HeightSteps,
+				       (unsigned long long)HP.Frames);
+				// SAID ON THE LINE ITSELF, the same sentence the other two
+				// engagement groups carry and for the same three published
+				// measurements: iteration counts and wall time move in OPPOSITE
+				// directions often enough that a reader converting a skip
+				// percentage into an expected millisecond saving is doing
+				// something already known to be wrong.
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("      (engagement only -- DECISIONS, not nanoseconds. "
+				            "heightLeafCells is the SKIPPED RAY LENGTH expressed in leaf "
+				            "cells, so it is a LOWER bound on cells avoided. heightSteps is "
+				            "the COST side and must be read next to it: a leg where both are "
+				            "enormous and VoxelMarch.March does not move is a REAL NULL "
+				            "RESULT, not a broken counter. The saving is VoxelMarch.March "
+				            "from ProfileGPU and nothing else.)"));
+				if (HP.bHeightArmed && HP.HeightConsulted == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.HeightPyramid is 1 and the shader consulted "
+					            "the field ZERO times over %llu measured frames. THE ARM IS "
+					            "ARMED AND INERT -- the uniform never reached this "
+					            "permutation, the field was never built, or the walk never "
+					            "asked. No frame time measured on this leg describes the "
+					            "height pyramid."),
+					       (unsigned long long)HP.Frames);
+				}
+				else if (HP.bHeightArmed && HP.HeightAdvanced == 0 && HP.HeightEmpty == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.HeightPyramid is 1, the field WAS consulted "
+					            "%llu times and removed nothing at all. That is a real "
+					            "measured null: every ray had a candidate in its first cell. "
+					            "Read the field line above -- an all-+INF field produces "
+					            "exactly this -- before blaming the traversal."),
+					       (unsigned long long)HP.HeightConsulted);
+				}
+				else if (HP.bHeightArmed && HP.HeightReentries == 0 && HP.HeightAdvanced > 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    heightReentries is 0 while heightAdvanced is %llu. The "
+					            "arm is doing tStart ONLY -- the mid-ray skips the horizon "
+					            "case depends on were never exercised, so this leg is a "
+					            "PARTIAL result and must be written up as one. Check "
+					            "voxel.March.HeightPyramid.MaxIters (1 disables them)."),
+					       (unsigned long long)HP.HeightAdvanced);
+				}
+			}
+			// ---- THE FALSIFIER ------------------------------------------
+			//
+			// PRINTED WHENEVER THE ARM IS ON, INCLUDING WHEN THE VERIFY IS OFF,
+			// because "not tested" and "tested and clean" are different findings
+			// and a suppressed line makes them identical. A zero from an unarmed
+			// verify is not a pass; it is the absence of a test, and this refuses
+			// to word it as anything else.
+			if (HP.bHeightArmed)
+			{
+				if (!HP.bHeightVerifyArmed)
+				{
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("    falsifier: NOT RUN (voxel.March.HeightPyramid.Verify is "
+					            "0). heightMissed=%llu heightLate=%llu here is the absence of "
+					            "a test, NOT a pass -- an unarmed falsifier cannot produce "
+					            "either."),
+					       (unsigned long long)HP.HeightMissed,
+					       (unsigned long long)HP.HeightLate);
+				}
+				else if (HP.HeightMissed == 0 && HP.HeightLate == 0)
+				{
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("    falsifier: 0 missed, 0 late over %llu consulted rays. "
+					            "THIS IS ONLY A PASS IF THE TEST CAN FAIL -- run the same "
+					            "leg with voxel.March.HeightPyramid.BiasM 50 and confirm "
+					            "BOTH go non-zero before quoting it."),
+					       (unsigned long long)HP.HeightConsulted);
+				}
+				else
+				{
+					// MISSED IS PRINTED FIRST, ALONE, AND AS AN ERROR. It is the
+					// only one of the two that decides anything by itself: the
+					// clamped walk found NOTHING where the control found
+					// geometry, which is proven air over real ground.
+					if (HP.HeightMissed > 0)
+					{
+						UE_LOG(LogVoxelMarch, Error,
+						       TEXT("    falsifier: %llu MISSED over %llu consulted rays -- "
+						            "the clamped walk found NOTHING where the full walk "
+						            "found geometry. With BiasM 0 that is a HOLE and the "
+						            "arm must go off. With BiasM non-zero it is the "
+						            "deliberate corruption firing, which is what proves the "
+						            "test can fail."),
+						       (unsigned long long)HP.HeightMissed,
+						       (unsigned long long)HP.HeightConsulted);
+					}
+					else
+					{
+						UE_LOG(LogVoxelMarch, Display,
+						       TEXT("    falsifier: 0 MISSED over %llu consulted rays -- no "
+						            "ray lost its geometry outright."),
+						       (unsigned long long)HP.HeightConsulted);
+					}
+					// LATE, WITH ITS DISTRIBUTION, because the count alone
+					// cannot separate ring substitution from a hole. THE SHAPE
+					// IS THE VERDICT: weight piled in B0 just past the 10 UU
+					// tolerance is float and substitution noise; weight out in
+					// B2..B4 is real geometry being skipped.
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("    falsifier: %llu LATE (hit further than the control by "
+					            ">0.1 m), max %.2f m; distribution 0.1-1m=%llu 1-10m=%llu "
+					            "10-100m=%llu 100-1000m=%llu >1000m=%llu"),
+					       (unsigned long long)HP.HeightLate,
+					       double(HP.HeightLateMaxUU) * 0.01,
+					       (unsigned long long)HP.HeightLateBucket[0],
+					       (unsigned long long)HP.HeightLateBucket[1],
+					       (unsigned long long)HP.HeightLateBucket[2],
+					       (unsigned long long)HP.HeightLateBucket[3],
+					       (unsigned long long)HP.HeightLateBucket[4]);
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("      (LATE IS NOT AUTOMATICALLY A HOLE. Restarting the "
+					            "walk mid-ray can put a segment in a coarser ring, and a "
+					            "coarser level answering it hits at a slightly different t "
+					            "-- that is the `substituted` mechanism and it is visible in "
+					            "the substituted rate, which must be read beside this. A "
+					            "tight pile in 0.1-1m is that. A long tail is geometry the "
+					            "pyramid skipped, and that IS a hole.)"));
 				}
 			}
 		}
@@ -3867,6 +4192,31 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// different findings and a consumer must be able to tell them apart without
 	// inspecting the numbers it is trying to interpret.
 	Out.bZCutArmed = CVarVoxelMarchZCut.GetValueOnAnyThread() != 0;
+	// FROM THE CVAR, like the Z bound's flag and for the same reason: this arm
+	// is a UNIFORM, so the cvar IS the arm. bHeightVerifyArmed is carried
+	// separately because heightMissed == 0 is meaningless without it -- an
+	// unarmed falsifier cannot produce a violation, and a reader must not be
+	// able to mistake that for a falsifier that passed.
+	Out.bHeightArmed = CVarVoxelMarchHeightPyramid.GetValueOnAnyThread() != 0;
+	Out.bHeightVerifyArmed = CVarVoxelMarchHeightPyramidVerify.GetValueOnAnyThread() != 0;
+	// THE FIELD'S OWN STATE, stamped beside the counters rather than left to be
+	// inferred from them. A field that is entirely +INF is INERT: every air test
+	// is false, the walk is exactly the control, and the counters below are all
+	// structurally zero. Without these numbers that reads as a clean null result
+	// -- which is precisely the misreading this project has published before.
+	{
+		const FVoxelHeightPyramid::FCensus HC = GetGlobalVoxelHeightPyramid().GetCensus();
+		const FVoxelHeightPyramid::FGeometry HG = GetGlobalVoxelHeightPyramid().GetGeometry();
+		Out.HeightLeafChunkLevel = HG.LeafChunkLevel;
+		Out.HeightDim = HG.Dim;
+		Out.HeightFilledLeaves = HC.Filled;
+		Out.HeightInfiniteLeaves = HC.Infinite;
+		Out.HeightDeclinedLeaves = HC.Declined;
+		Out.HeightNotResidentLeaves = HC.NotResident;
+		Out.HeightEditedLeaves = HC.Edited;
+		Out.HeightMinUU = HC.MinUU;
+		Out.HeightMaxUU = HC.MaxUU;
+	}
 	// FROM THE ARM, NOT FROM THE CVAR, and that is not a shortcut -- it is the
 	// difference between the two switches. voxel.March.ZCut is a uniform, so the
 	// cvar IS the arm. voxel.March.BlockSkip selects a PERMUTATION, and the arm
@@ -3898,6 +4248,11 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	const bool bBlockSkipArmed = Out.bBlockSkipArmed;
 	const bool bCensusArmed = Out.bCensusArmed;
 	const int32 BlockSkyMode = Out.BlockSkyMode;
+	// The height field's flags and census are NOT part of the accumulated
+	// window -- they describe the field as it stands now, not what the GPU
+	// counted -- so they are saved and restored across the assignment exactly
+	// as the arm flags are.
+	const FVoxelMarchHoleStats HeightSide = Out;
 	Out = GMarchState->HoleWindow;
 	Out.bArmed = bArmed;
 	Out.bBreakdownArmed = bBreakdownArmed;
@@ -3905,6 +4260,17 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	Out.bBlockSkipArmed = bBlockSkipArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
+	Out.bHeightArmed = HeightSide.bHeightArmed;
+	Out.bHeightVerifyArmed = HeightSide.bHeightVerifyArmed;
+	Out.HeightLeafChunkLevel = HeightSide.HeightLeafChunkLevel;
+	Out.HeightDim = HeightSide.HeightDim;
+	Out.HeightFilledLeaves = HeightSide.HeightFilledLeaves;
+	Out.HeightInfiniteLeaves = HeightSide.HeightInfiniteLeaves;
+	Out.HeightDeclinedLeaves = HeightSide.HeightDeclinedLeaves;
+	Out.HeightNotResidentLeaves = HeightSide.HeightNotResidentLeaves;
+	Out.HeightEditedLeaves = HeightSide.HeightEditedLeaves;
+	Out.HeightMinUU = HeightSide.HeightMinUU;
+	Out.HeightMaxUU = HeightSide.HeightMaxUU;
 	// Kept for the HUD's 1 Hz peek -- the panel must show what the log drained
 	// without becoming a second drainer (two drainers of one accumulator each
 	// see a random share).
@@ -3937,7 +4303,9 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	Out = GMarchState->LastDrainedHoleWindow;
 	// The arm flags track the switch NOW, not the switch as it stood when the
 	// stale window was drained -- the panel's off/armed wording follows the
-	// cvar the owner just typed.
+	// cvar the owner just typed. Same rule for the height arm.
+	Out.bHeightArmed = CVarVoxelMarchHeightPyramid.GetValueOnAnyThread() != 0;
+	Out.bHeightVerifyArmed = CVarVoxelMarchHeightPyramidVerify.GetValueOnAnyThread() != 0;
 	Out.bArmed = bArmed;
 	Out.bBreakdownArmed = bBreakdownArmed;
 	Out.bZCutArmed = bZCutArmed;
@@ -4063,6 +4431,54 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// there is no second place for the pad to be forgotten.
 	SHADER_PARAMETER(int32, MarchZCutEnable)
 	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
+	// ---- THE TERRAIN HEIGHT PYRAMID (voxel.March.HeightPyramid) ----------
+	//
+	// ON THIS STRUCT ONLY, AND THAT IS THE SAFETY ARGUMENT RATHER THAN A
+	// CONVENIENCE. The globals these fill are declared in VoxelMarch.usf and
+	// read only by VoxelMarchMain, so the emit and the two verify kernels --
+	// which are bound through the same VoxelMarchBindPool template and would
+	// otherwise all need an entry -- never see them. Declaring them in
+	// VoxelBrickTraverse.ush instead would put a Buffer<float> global into four
+	// parameter structs, and an unbound typed buffer reads as ZEROS. Zero at
+	// this datum is SEA LEVEL, i.e. "the terrain tops out at the waterline",
+	// which over the leg spawn's 2.8 km massif is proven air over real ground.
+	// The failure would be silent, and it would look like a speedup.
+	//
+	// The buffer is NEVER null: when the field has not been built the binding
+	// falls back to a ONE-FLOAT buffer holding +INF, so even a wrongly-enabled
+	// arm reads "the terrain might reach arbitrarily high here" and marches
+	// exactly the control. The safe fallback and the honest fallback are the
+	// same value, which is the property that made +INF the representation.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<float>, MarchHeightPyramid)
+	// 0 = do not consult. Bound on every permutation of this struct; zero is
+	// both the safe value and the honest "arm off" value.
+	SHADER_PARAMETER(int32, MarchHeightEnable)
+	SHADER_PARAMETER(int32, MarchHeightDim)          // leaf cells per side, power of two
+	SHADER_PARAMETER(int32, MarchHeightNumMips)
+	// log2 of the LEVEL-0 VOXELS per leaf cell edge. The DDA derives its cell
+	// boundaries from world voxel indices and an arithmetic shift, exactly as
+	// VoxelMarchCellExitT does -- see the note there about the local-frame
+	// floor() that assumed a cell-aligned frame origin and silently tested the
+	// wrong brick for 11.5% of rays.
+	SHADER_PARAMETER(int32, MarchHeightLeafVoxelShift)
+	// Leaf-cell coordinate of the field's minimum corner. THE RANGE TEST
+	// AGAINST THIS IS WHAT MAKES THE INDEX SAFE: there is no toroidal wrap, so
+	// a cell outside the field is not representable as an in-field index and
+	// reads +INF instead of aliasing onto ground 13 km away.
+	SHADER_PARAMETER(FIntPoint, MarchHeightMinCell)
+	// Element offset of each mip inside the flat buffer, 8 ints as two int4s.
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchHeightMipOffset, [2])
+	// voxel.March.HeightPyramid.BiasM, converted to UU and clamped at >= 0.
+	// SUBTRACTED from every bound the shader reads, to break the field on
+	// purpose so the falsifier can be shown able to fire.
+	SHADER_PARAMETER(float, MarchHeightBiasUU)
+	SHADER_PARAMETER(int32, MarchHeightMaxIters)
+	SHADER_PARAMETER(int32, MarchHeightVerify)
+	// The march frame origin in level-0 world voxels, carried as this feature's
+	// own uniform. Filled from MarchBrickOriginVoxel one line apart at the
+	// dispatch, so there is no second authority -- see VoxelHeightPyramid.ush
+	// for why the height walk cannot simply name that global.
+	SHADER_PARAMETER(FIntVector, MarchHeightOriginVoxel)
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -4080,6 +4496,104 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// inverse of the MarchCoverReachUU note above and equally legal.
 	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchOutHoleStats)
 END_SHADER_PARAMETER_STRUCT()
+
+// ===========================================================================
+// THE TERRAIN HEIGHT PYRAMID: FILLING THE BINDING
+// ===========================================================================
+//
+// ONE PLACE, AND IT ALWAYS WRITES EVERY FIELD. An unset uniform is a silent
+// zero and this file has paid for that more than twice; here a silent zero in
+// MarchHeightDim would make the range test reject every cell, which is inert
+// rather than wrong -- but a silent zero in the BUFFER would be sea level, so
+// the buffer is never left unbound on any path out of this function.
+static void VoxelMarchFillHeightPyramid(FRDGBuilder& GraphBuilder,
+                                        FVoxelMarchCSParameters& Params)
+{
+	const bool bAsked = CVarVoxelMarchHeightPyramid.GetValueOnRenderThread() != 0;
+
+	FVoxelHeightPyramid& Pyramid = GetGlobalVoxelHeightPyramid();
+	const FVoxelHeightPyramid::FBinding B = Pyramid.BindForRender(GraphBuilder);
+
+	// NEGATIVE IS CLAMPED AWAY. A negative bias is a MARGIN, and the crown
+	// composition this bound already performs per layer is strictly tighter
+	// than any global pad -- 89.2% of footprints get the 25 m L1 cap rather
+	// than the 45 m global maximum. A margin here would be looser and would
+	// also hide exactly the error the falsifier is looking for.
+	const float BiasUU =
+		FMath::Max(CVarVoxelMarchHeightPyramidBiasM.GetValueOnRenderThread(), 0.0f) * 100.0f;
+
+	Params.MarchHeightBiasUU = BiasUU;
+	// AT LEAST 1. Zero would mean "split the ray into no intervals", which the
+	// shader would read as "walk nothing" -- a hole from a knob.
+	Params.MarchHeightMaxIters =
+		FMath::Clamp(CVarVoxelMarchHeightPyramidMaxIters.GetValueOnRenderThread(), 1, 8);
+	Params.MarchHeightVerify =
+		CVarVoxelMarchHeightPyramidVerify.GetValueOnRenderThread() != 0 ? 1 : 0;
+
+	if (!B.bValid || B.Buffer == nullptr)
+	{
+		// THE FALLBACK IS ONE FLOAT HOLDING +INF, NOT A NULL SRV AND NOT A
+		// ZERO-FILLED BUFFER. RDG requires the declared SRV to be bound, and
+		// the two obvious ways to satisfy that are both wrong in the same
+		// direction: a null SRV reads zeros and a cleared buffer IS zeros, and
+		// zero at this datum is sea level. +INF makes every air test false, so
+		// a wrongly-enabled arm over an unbuilt field marches EXACTLY the
+		// control instead of deleting the world.
+		const float Inf = VoxelHeightPyramidPositiveInfinity();
+		FRDGBufferRef Absent = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateBufferDesc(sizeof(float), 1),
+			TEXT("VoxelMarch.HeightPyramid.Absent"));
+		GraphBuilder.QueueBufferUpload(Absent, &Inf, sizeof(float), ERDGInitialDataFlags::None);
+		Params.MarchHeightPyramid = GraphBuilder.CreateSRV(Absent, PF_R32_FLOAT);
+		Params.MarchHeightEnable = 0;
+		Params.MarchHeightDim = 0;
+		Params.MarchHeightNumMips = 0;
+		Params.MarchHeightLeafVoxelShift = 0;
+		Params.MarchHeightMinCell = FIntPoint::ZeroValue;
+		Params.MarchHeightMipOffset[0] = FIntVector4(0, 0, 0, 0);
+		Params.MarchHeightMipOffset[1] = FIntVector4(0, 0, 0, 0);
+		GVoxelMarchHeightRanEnable.store(0, std::memory_order_relaxed);
+		return;
+	}
+
+	Params.MarchHeightPyramid = GraphBuilder.CreateSRV(B.Buffer, PF_R32_FLOAT);
+	Params.MarchHeightDim = B.Geom.Dim;
+	Params.MarchHeightNumMips = B.Geom.NumMips;
+	Params.MarchHeightLeafVoxelShift = B.Geom.LeafVoxelShift;
+	Params.MarchHeightMinCell = FIntPoint(B.Geom.MinCellX, B.Geom.MinCellY);
+	// The array is two int4s because the field carries at most kMaxMips = 8
+	// levels. Spelled as [2] in the parameter struct and as int4[2] in
+	// VoxelMarch.usf, so the one authority checks the two spellings HERE rather
+	// than letting a deeper pyramid write past the uniform.
+	static_assert(FVoxelHeightPyramid::kMaxMips == 8,
+	              "MarchHeightMipOffset is declared [2] int4s here and in VoxelMarch.usf. "
+	              "The pyramid grew a level; widen both, or the far mips read another "
+	              "mip's offset and the DDA indexes the wrong level's cells.");
+	// Named components rather than V[K]. FIntVector4's subscript is not the
+	// spelling anything else in this file uses, and an offset written into the
+	// wrong lane would index another MIP's cells -- a plausible height read at
+	// the wrong resolution, which is invisible in review and is exactly the
+	// class of error this feature must not be able to make.
+	auto MipOff = [&B](int32 M) -> int32
+	{
+		return (M >= 0 && M < B.Geom.NumMips) ? B.Geom.MipOffset[M] : 0;
+	};
+	Params.MarchHeightMipOffset[0] = FIntVector4(MipOff(0), MipOff(1), MipOff(2), MipOff(3));
+	Params.MarchHeightMipOffset[1] = FIntVector4(MipOff(4), MipOff(5), MipOff(6), MipOff(7));
+	Params.MarchHeightEnable = (bAsked && B.Geom.Dim > 0 && B.Geom.NumMips > 0) ? 1 : 0;
+
+	// WHAT WAS ACTUALLY UPLOADED, stamped from the values just written rather
+	// than re-read from the cvar, for the reason the Z bound stamps its own: a
+	// cvar reads back whatever was typed, and that reading alone is what let
+	// nine switches in this project sit armed and inert. This proves the
+	// uniform was FILLED -- not that the pass ran, and not that the shader used
+	// it. Only the engagement counters say that.
+	GVoxelMarchHeightRanEnable.store(Params.MarchHeightEnable, std::memory_order_relaxed);
+	GVoxelMarchHeightRanDim.store(B.Geom.Dim, std::memory_order_relaxed);
+	GVoxelMarchHeightRanLeafLevel.store(B.Geom.LeafChunkLevel, std::memory_order_relaxed);
+	GVoxelMarchHeightRanMips.store(B.Geom.NumMips, std::memory_order_relaxed);
+}
+
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCompactParameters, )
 	SHADER_PARAMETER(FIntPoint, MarchTileCount)
@@ -4473,6 +4987,33 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchHoleWord::BlockSkyRuns));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BLK_CELLS"),
 		                         int32(VoxelMarchHoleWord::BlockCellsAvoided));
+		// The height pyramid's engagement group, pushed from the same enum for
+		// the same reason every other word is: a hand mirror here reads a
+		// plausible number out of the wrong slot, which is the incident
+		// VoxelMarchHoleWord's own note records.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_CONSULTED"),
+		                         int32(VoxelMarchHoleWord::HeightConsulted));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_ADVANCED"),
+		                         int32(VoxelMarchHoleWord::HeightAdvanced));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_EMPTY"),
+		                         int32(VoxelMarchHoleWord::HeightEmpty));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_LEAFCELLS"),
+		                         int32(VoxelMarchHoleWord::HeightLeafCells));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_STEPS"),
+		                         int32(VoxelMarchHoleWord::HeightSteps));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_REENTRIES"),
+		                         int32(VoxelMarchHoleWord::HeightReentries));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_MISSED"),
+		                         int32(VoxelMarchHoleWord::HeightMissed));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_LATE"),
+		                         int32(VoxelMarchHoleWord::HeightLate));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_LATE_MAXUU"),
+		                         int32(VoxelMarchHoleWord::HeightLateMaxUU));
+		// The distribution's first bucket; the shader adds 0..4 to this base,
+		// so the group's CONTIGUITY is layout shared with the enum and is
+		// static_asserted below rather than trusted.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HGT_LATE_B0"),
+		                         int32(VoxelMarchHoleWord::HeightLateB0));
 		// The block grid's own shape, pushed rather than written in the .ush,
 		// under exactly the discipline the word layout above follows: the CPU
 		// sizes and fills these bitfields and the shader indexes them, and a
@@ -4564,8 +5105,11 @@ static_assert(int32(VoxelMarchHoleWord::CellsProbed) -
                       int32(VoxelMarchHoleWord::BlockSkyLicensed) == 3,
               "the sky-licence word group is not three words, or something was appended "
               "after it without repointing this assert at the new group's first word");
-// THE CHUNK-CELL CENSUS IS PINNED AGAINST Count, because it is currently last.
-// WHOEVER APPENDS NEXT repoints THIS one at their first word.
+// THE CHUNK-CELL CENSUS IS PINNED AGAINST THE HEIGHT PYRAMID'S FIRST WORD.
+// It used to be pinned against Count, because it used to be last; the height
+// pyramid's group was appended after it, and this assert was repointed at that
+// group's first word AS ITS OWN COMMENT INSTRUCTED. The instruction now lives
+// on the height group's assert below. WHOEVER APPENDS NEXT repoints THAT one.
 //
 // EIGHT WORDS, AND THE COUNT IS LOAD-BEARING IN A WAY THE OTHER GROUPS' ARE
 // NOT: seven of them are outcome buckets that the perf line SUMS and compares
@@ -4573,7 +5117,7 @@ static_assert(int32(VoxelMarchHoleWord::CellsProbed) -
 // it would join neither the sum nor the denominator and the identity would keep
 // printing PASS while the census silently lost a return path -- so the size is
 // asserted here as well as checked at runtime.
-static_assert(int32(VoxelMarchHoleWord::Count) -
+static_assert(int32(VoxelMarchHoleWord::HeightConsulted) -
                       int32(VoxelMarchHoleWord::CellsProbed) == 8,
               "the chunk-cell census word group is not eight words (one denominator plus "
               "seven outcomes, one per return site of VoxelMarchLookupChunk), or "
@@ -4581,6 +5125,46 @@ static_assert(int32(VoxelMarchHoleWord::Count) -
               "group's first word. If you added a return site to that function, it needs "
               "a bucket of its own AND a slot in the perf line's identity sum -- see "
               "VoxelWorldSubsystem.cpp's 'Voxel march cell census' block.");
+// THE HEIGHT PYRAMID'S GROUP IS PINNED AGAINST Count, because it is now last.
+// WHOEVER APPENDS NEXT repoints THIS one at their first word -- and repoints
+// nothing else, because every group above is already pinned to a named word
+// rather than to the end of the enum.
+//
+// SEVEN WORDS, AND THE SHAPE OF THE GROUP IS WHY THE SIZE IS ASSERTED. Three of
+// them are the arm's engagement partition (consulted / advanced / fully empty),
+// two are the cost side (leaf cells skipped, DDA steps), one separates the
+// mid-ray skips from the tStart advance (reentries), and the last is the
+// falsifier. A word appended INSIDE this group rather than after it would be
+// read as one of those by VoxelMarchGetAndResetHoleStats, and the counter it
+// displaced would keep printing a plausible number -- which is the incident
+// VoxelMarchHoleWord's own note records and the reason none of these layouts
+// may be mirrored by hand.
+static_assert(int32(VoxelMarchHoleWord::Count) -
+                      int32(VoxelMarchHoleWord::HeightConsulted) == 14,
+              "the height pyramid's engagement group is not fourteen words, or something "
+              "was appended after it without repointing this assert at the new group's "
+              "first word. If you added a counter to the height walk it needs a word of "
+              "its own here, a define in ModifyCompilationEnvironment, a read in the "
+              "readback and a line in voxel.March.Stats -- all four, or it reports a "
+              "structural zero.");
+
+// THE BUCKET GROUP IS CONTIGUOUS AND THE SHADER INDEXES IT AS A BASE PLUS
+// 0..4. Spelled here rather than trusted, for the reason every other layout in
+// this file is asserted: a reordered enum would send four of the five decades
+// into whatever words happened to follow, and the histogram would still print
+// five plausible numbers.
+static_assert(int32(VoxelMarchHoleWord::HeightLateB1) ==
+                      int32(VoxelMarchHoleWord::HeightLateB0) + 1 &&
+                  int32(VoxelMarchHoleWord::HeightLateB2) ==
+                      int32(VoxelMarchHoleWord::HeightLateB0) + 2 &&
+                  int32(VoxelMarchHoleWord::HeightLateB3) ==
+                      int32(VoxelMarchHoleWord::HeightLateB0) + 3 &&
+                  int32(VoxelMarchHoleWord::HeightLateB4) ==
+                      int32(VoxelMarchHoleWord::HeightLateB0) + 4,
+              "the late-delta histogram buckets are not five contiguous words starting at "
+              "HeightLateB0; the shader indexes them as a base plus 0..4 and would scatter "
+              "four decades into other counters.");
+
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchCS, VOXEL_MARCH_USF, "VoxelMarchMain", SF_Compute);
 
 class FVoxelMarchCompactCS : public FGlobalShader
@@ -5727,6 +6311,25 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			const uint32 CellResEmpty = Src[VoxelMarchHoleWord::CellResidentEmpty];
 			const uint32 CellBrickOOB = Src[VoxelMarchHoleWord::CellBrickOOB];
 			const uint32 CellReal = Src[VoxelMarchHoleWord::CellReal];
+			// The height pyramid's engagement group. Read on EVERY frame for
+			// the reason the three groups above are: the cheap kernel writes
+			// them too, so gating them behind the level-2 fold would report the
+			// arm inert on every level-1 leg -- the exact misreading these
+			// counters exist to make impossible.
+			const uint32 HgtConsulted = Src[VoxelMarchHoleWord::HeightConsulted];
+			const uint32 HgtAdvanced = Src[VoxelMarchHoleWord::HeightAdvanced];
+			const uint32 HgtEmpty = Src[VoxelMarchHoleWord::HeightEmpty];
+			const uint32 HgtLeafCells = Src[VoxelMarchHoleWord::HeightLeafCells];
+			const uint32 HgtSteps = Src[VoxelMarchHoleWord::HeightSteps];
+			const uint32 HgtReentries = Src[VoxelMarchHoleWord::HeightReentries];
+			const uint32 HgtMissed = Src[VoxelMarchHoleWord::HeightMissed];
+			const uint32 HgtLate = Src[VoxelMarchHoleWord::HeightLate];
+			const uint32 HgtLateMax = Src[VoxelMarchHoleWord::HeightLateMaxUU];
+			uint32 HgtLateB[5];
+			for (int32 B = 0; B < 5; ++B)
+			{
+				HgtLateB[B] = Src[int32(VoxelMarchHoleWord::HeightLateB0) + B];
+			}
 			uint32 ByLevel[VoxelMarchHoleWord::kNumLevels];
 			uint32 ByReason[VoxelMarchHoleWord::kNumReasons];
 			for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
@@ -5762,6 +6365,25 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.CellResidentEmpty += CellResEmpty;
 			State->HoleWindow.CellBrickOOB += CellBrickOOB;
 			State->HoleWindow.CellReal += CellReal;
+			State->HoleWindow.HeightConsulted += HgtConsulted;
+			State->HoleWindow.HeightAdvanced += HgtAdvanced;
+			State->HoleWindow.HeightEmpty += HgtEmpty;
+			State->HoleWindow.HeightLeafCells += HgtLeafCells;
+			State->HoleWindow.HeightSteps += HgtSteps;
+			State->HoleWindow.HeightReentries += HgtReentries;
+			State->HoleWindow.HeightMissed += HgtMissed;
+			State->HoleWindow.HeightLate += HgtLate;
+			// MAX, NOT +=. The shader writes this with InterlockedMax within a
+			// frame, so it is already a maximum; summing it across the window
+			// would produce a number that grows with frame count and describes
+			// nothing. This is the one word in the whole readback that does not
+			// accumulate, and it is spelled differently on purpose.
+			State->HoleWindow.HeightLateMaxUU =
+				FMath::Max<uint64>(State->HoleWindow.HeightLateMaxUU, HgtLateMax);
+			for (int32 B = 0; B < 5; ++B)
+			{
+				State->HoleWindow.HeightLateBucket[B] += HgtLateB[B];
+			}
 			State->HoleWindow.Frames++;
 			if (Slot.ArmLevel >= 2)
 			{
@@ -7260,6 +7882,24 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// would break.
 			Params->MarchBrickOriginVoxel = FrameOriginVoxel;
 			Params->MarchPackOriginVoxel = Entry.CameraVoxel;
+			// THE TERRAIN HEIGHT PYRAMID. Filled here rather than in
+			// VoxelMarchBindPool, and the placement is the safety argument:
+			// BindPool is a template over four parameter structs and the other
+			// three would then each need a Buffer<float> entry, where an
+			// unbound typed buffer reads as zeros and zero at this datum is sea
+			// level. Only the march kernel reads the field, so only the march
+			// kernel binds it. Always called, on every arm -- the function
+			// itself decides whether to enable, and it never leaves the buffer
+			// unbound.
+			// FROM THE FIELD JUST WRITTEN, NOT FROM FrameOriginVoxel AGAIN.
+			// Assigning from the parameter itself means the height walk and the
+			// brick walk provably share one origin: there is no second read of
+			// the source to drift, and a change to the line above carries here
+			// for free. The height walk needs its own uniform because
+			// MarchBrickOriginVoxel's shader-side declaration is conditional on
+			// the brick pool permutation.
+			Params->MarchHeightOriginVoxel = Params->MarchBrickOriginVoxel;
+			VoxelMarchFillHeightPyramid(GraphBuilder, *Params);
 			int32 IndexEntries = 0;
 			if (!VoxelMarchBindPool(GraphBuilder, Arm.Source, *Params, IndexEntries))
 			{

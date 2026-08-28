@@ -2293,14 +2293,23 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 		C.bResident = true;
 #endif
 #if VOXEL_MARCH_HOLE_STATS
-		// EXPECTED TO STAY AT EXACTLY ZERO, and counted anyway. All three
-		// writers of the index entry hardcode this bit SET
-		// (VoxelMarchChunkIndex.cpp:867 and :1362, VoxelMarchIndexScatter.usf
-		// :184), so this branch has never fired -- which is the whole reason
-		// the census exists, since the chunks it WOULD reject are instead
-		// paying a record fetch and landing in GVoxelMarchCellResidentEmpty
-		// below. A non-zero here means the bit became real and the headline
-		// ratio is now measuring the remainder rather than the prize.
+		// ZERO UNTIL voxel.March.IndexAnySolid, AND NON-ZERO IS THE PROOF THE
+		// ARM ENGAGED. Every WRITER of the index entry still hardcodes this
+		// bit SET (VoxelMarchChunkIndex.cpp Seed and ApplyDelta,
+		// VoxelMarchIndexScatter.usf's publish addition) -- the CPU cannot
+		// answer the question, see kAnySolidBit's block in
+		// VoxelMarchChunkIndex.h -- so this branch read EXACTLY ZERO on every
+		// leg run before 2026-08-27, and the chunks it WOULD reject were
+		// instead paying a record fetch and landing in
+		// GVoxelMarchCellResidentEmpty below.
+		//
+		// The bit is now made real on the GPU instead, by
+		// VoxelMarchIndexRefineMain, which re-reads the record in the slot and
+		// clears bit 30 only on positive proof of air. So this word leaving
+		// zero is the RAY-SIDE engagement proof for that arm -- the one
+		// measurement that says the cleared bits are on cells rays actually
+		// read -- and the headline ratio below is then measuring the remainder
+		// rather than the prize.
 		++GVoxelMarchCellIndexEmpty;
 #endif
 		return C;

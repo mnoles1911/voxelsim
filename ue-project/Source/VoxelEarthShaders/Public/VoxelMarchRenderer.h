@@ -679,6 +679,98 @@ namespace VoxelMarchHoleWord
 		CellResidentEmpty,
 		CellBrickOOB,
 		CellReal,
+
+		// ---- THE TERRAIN HEIGHT PYRAMID'S ENGAGEMENT GROUP ----------------
+		//                                    (voxel.March.HeightPyramid)
+		// APPENDED, for the reason the Z bound's trio and the block group were:
+		// appending renumbers nothing, so a stale shader cache still reads every
+		// older word correctly and leaves these at zero -- which a reader has to
+		// word as "not measured" anyway.
+		//
+		//   HeightConsulted  rays that ran the pyramid DDA at all. THE
+		//                    DENOMINATOR. Zero while voxel.March.HeightPyramid
+		//                    reads 1 is the arm ARMED AND INERT, which is this
+		//                    project's house failure and is printed as a warning
+		//                    rather than left to be inferred from a silence.
+		//   HeightAdvanced   rays whose walked interval STRICTLY SHRANK. A ray
+		//                    can consult the field, find its first cell already
+		//                    a candidate, and walk exactly what the control
+		//                    walked -- that case must stay visible rather than
+		//                    inflating the engagement rate.
+		//   HeightEmpty      rays the pyramid proved empty over their WHOLE
+		//                    interval, so no voxel walk ran at all. This is the
+		//                    up-direction win and it is counted separately
+		//                    because a leg can move it a great deal while
+		//                    leaving the horizon untouched -- which is a PARTIAL
+		//                    result and has to be reportable as one.
+		//   HeightLeafCells  skipped ray length divided by the leaf cell size,
+		//                    i.e. leaf cells the walk did not enter. A LOWER
+		//                    bound, and deliberately not a count of cells the
+		//                    DDA stepped over: the same choice, for the same
+		//                    two reasons, that BlockCellsAvoided documents --
+		//                    it would carry no information beyond HeightAdvanced
+		//                    and it would wrap a uint32 at this ray count.
+		//   HeightSteps      DDA steps taken across all levels. THE COST SIDE.
+		//                    Without it a null result cannot distinguish "the
+		//                    field skipped nothing" from "the field skipped a
+		//                    lot and the walk cost as much as it saved".
+		//   HeightReentries  extra voxel-walk calls beyond the first, i.e. the
+		//                    mid-ray skips actually taken. Zero here with
+		//                    HeightAdvanced large means the arm is doing tStart
+		//                    only and the maximum-mipmap traversal is NOT what
+		//                    was measured.
+		//
+		//   ---- THE FALSIFIER, AND WHY IT IS TWO WORDS AND NOT ONE ----------
+		//
+		//   It WAS one word, heightViolations, and that word could not decide
+		//   anything. It ORed together two findings with different
+		//   consequences, and a clean leg returned 4,418 of them with no way to
+		//   say which kind they were. The name was honest; the AGGREGATION was
+		//   not, which is a separate failure mode from this project's list of
+		//   counter names that lie and deserves its own entry.
+		//
+		//   HeightMissed     the clamped walk found NOTHING where the full
+		//                    unclamped walk found geometry. UNAMBIGUOUS HOLE.
+		//                    Any non-zero here and the arm is dead as designed:
+		//                    it is proven air over real ground, which is the
+		//                    one failure this whole feature is written to make
+		//                    impossible.
+		//   HeightLate       the clamped walk hit, but more than one voxel
+		//                    FURTHER along than the control. Could be ring
+		//                    substitution from restarting the walk mid-ray --
+		//                    a coarser level answering a segment the control
+		//                    answered finely -- or could be a hole. On its own
+		//                    it decides nothing, which is exactly why the next
+		//                    six words exist.
+		//   HeightLateMaxUU  the largest late delta seen, in UU. READ WITH
+		//                    InterlockedMax AND ACCUMULATED WITH Max, not with
+		//                    +=. Summing a maximum across frames produces a
+		//                    number that grows with frame count and means
+		//                    nothing.
+		//   HeightLateB0..B4 the delta's distribution, decade buckets from the
+		//                    10 UU tolerance upward:
+		//                      B0  0.1 .. 1 m     B1  1 .. 10 m
+		//                      B2  10 .. 100 m    B3  100 .. 1,000 m
+		//                      B4  over 1,000 m
+		//                    THE SHAPE IS THE VERDICT. Deltas piled into B0
+		//                    just past the tolerance are float and substitution
+		//                    noise; weight out in B2..B4 is real geometry being
+		//                    skipped, and no count of violations alone can tell
+		//                    those apart.
+		HeightConsulted,
+		HeightAdvanced,
+		HeightEmpty,
+		HeightLeafCells,
+		HeightSteps,
+		HeightReentries,
+		HeightMissed,
+		HeightLate,
+		HeightLateMaxUU,
+		HeightLateB0,
+		HeightLateB1,
+		HeightLateB2,
+		HeightLateB3,
+		HeightLateB4,
 		Count
 	};
 	// 7 since level 6 (the 8 km ring) landed 2026-08-23. This widens the
@@ -747,6 +839,46 @@ struct FVoxelMarchHoleStats
 	uint64 ZCutSkipped = 0;
 	uint64 ZCutClipped = 0;
 	bool bZCutArmed = false;      // voxel.March.ZCut was on when asked
+
+	// ---- the terrain height pyramid (voxel.March.HeightPyramid) -----------
+	// bHeightArmed IS THE CVAR, like bZCutArmed and unlike bBlockSkipArmed: this
+	// arm is a uniform, not a permutation, so the cvar IS the arm. Zeros with
+	// the flag FALSE are the arm being off and are not a reading at all; zeros
+	// with the flag TRUE are the loud case.
+	//
+	// bHeightVerifyArmed is carried SEPARATELY because HeightMissed == 0 is
+	// meaningless without it -- an unarmed verify cannot produce a violation and
+	// a reader must not be able to mistake that for a passed falsifier.
+	uint64 HeightConsulted = 0;
+	uint64 HeightAdvanced = 0;
+	uint64 HeightEmpty = 0;
+	uint64 HeightLeafCells = 0;
+	uint64 HeightSteps = 0;
+	uint64 HeightReentries = 0;
+	// THE FALSIFIER, SPLIT. HeightMissed is the hole; HeightLate needs its
+	// distribution to mean anything. See the enum for why one word could not
+	// decide this.
+	uint64 HeightMissed = 0;
+	uint64 HeightLate = 0;
+	// A MAXIMUM, NOT A SUM. Accumulated with Max across the window -- see the
+	// readback, where summing it would have produced a number that grows with
+	// frame count.
+	uint64 HeightLateMaxUU = 0;
+	uint64 HeightLateBucket[5] = {};
+	bool bHeightArmed = false;
+	bool bHeightVerifyArmed = false;
+	// The field's own state, stamped at bind time. A leg whose field was all
+	// +INF measured NOTHING however healthy the counters look, and this is what
+	// lets the log say so rather than leaving it to be inferred.
+	int32 HeightLeafChunkLevel = 0;
+	int32 HeightDim = 0;
+	int32 HeightFilledLeaves = 0;
+	int32 HeightInfiniteLeaves = 0;
+	int32 HeightDeclinedLeaves = 0;
+	int32 HeightNotResidentLeaves = 0;
+	int32 HeightEditedLeaves = 0;
+	float HeightMinUU = 0.0f;
+	float HeightMaxUU = 0.0f;
 
 	// ---- the coarse occupancy level (voxel.March.BlockSkip) ----------------
 	// Counted on EVERY hole-stats level, like the Z bound's trio and for the

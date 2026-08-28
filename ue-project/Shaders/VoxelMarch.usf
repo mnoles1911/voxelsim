@@ -588,6 +588,13 @@
 #include "/Engine/Private/VelocityCommon.ush"
 
 #include "/VoxelEarth/VoxelBrickTraverse.ush"
+// AFTER VoxelBrickTraverse.ush, AND THAT ORDER IS LOAD-BEARING: the height
+// walk derives its cell boundaries from MarchBrickOriginVoxel, which that file
+// declares. Included HERE and nowhere else -- the emit and the two verify
+// kernels are bound through the same parameter-struct machinery and a
+// Buffer<float> global they do not bind is an unbound SRV that reads ZEROS,
+// which at this datum is sea level. See the file's own header.
+#include "/VoxelEarth/VoxelHeightPyramid.ush"
 
 #ifndef VOXEL_MARCH_TILE_SIZE
 #define VOXEL_MARCH_TILE_SIZE 8
@@ -1403,8 +1410,242 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				const float TIn = Ray.TEnterUU + Inset;
 				const float TOut = max(TMax - Inset, TIn);
 
-				const FVoxelMarchHit H = VoxelMarchTraverseWithCover(
-					Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, MarchPixelConeSlope);
+				// ===============================================================
+				// THE TERRAIN HEIGHT PYRAMID (voxel.March.HeightPyramid)
+				// ===============================================================
+				//
+				// ONE hierarchical DDA over a proven upper bound on terrain
+				// height, run BEFORE the voxel walk and handing it only the
+				// t-intervals where a hit is possible. Up, horizontal and down
+				// all fall out of the same walk -- see VoxelHeightPyramid.ush
+				// for why there are no special cases and why a Z slab cannot do
+				// the horizontal one.
+				//
+				// AT THE CALLER, NOT INSIDE THE WALK. Every real reader of the
+				// far bound (:3545, :3910, :4269, :4860 in
+				// VoxelBrickTraverse.ush) is downstream of the values passed in,
+				// so bounding the interval here flows into all of them with the
+				// traversal itself unmodified -- the same shape as the existing
+				// `TMax = min(TMax, SceneTUU)` depth clamp above. Nothing here
+				// touches the camera-centred box.
+				FVoxelMarchHit H;
+				uint HgtConsulted = 0u;
+				uint HgtAdvanced = 0u;
+				uint HgtEmpty = 0u;
+				uint HgtLeafCells = 0u;
+				uint HgtSteps = 0u;
+				uint HgtReentries = 0u;
+				uint HgtMissed = 0u;
+				uint HgtLate = 0u;
+				uint HgtLateDeltaUU = 0u;
+				{
+					// ===========================================================
+					// EXACTLY ONE CALL TO THE WALK, AND THAT IS NOT TIDINESS.
+					// ===========================================================
+					//
+					// The obvious shape here is `if (armed) { loop over walks }
+					// else { one walk }`. It would be WRONG in a way that
+					// invalidates the measurement rather than the picture:
+					// VoxelMarchTraverseWithCover is enormous and inlines, so
+					// two textual call sites are two instantiations in the
+					// kernel, and the extra register pressure and instruction
+					// footprint are paid by the CONTROL ARM TOO. That is exactly
+					// the "a runtime branch leaves the other arm's cost in the
+					// binary and RE-BASES THE CONTROL" objection that made
+					// voxel.March.Rings a permutation -- and a re-based control
+					// is how a change gets credited with a win it did not earn.
+					//
+					// So the loop is unconditional and the ARM ONLY CHANGES ITS
+					// BOUNDS. With MarchHeightEnable 0 the iteration count is 1,
+					// the interval is [TIn, TOut] unmodified, and the single
+					// walk that runs is byte-for-byte the one the control ran.
+					FVoxelHeightWalk HW = VoxelHeightBeginWalk(Ray.OriginLocalUU, Ray.DirWorld);
+					const bool bHeightOn = (MarchHeightEnable != 0);
+					HgtConsulted = bHeightOn ? 1u : 0u;
+
+					// A MISS BY CONSTRUCTION IS THE STARTING STATE, so a ray the
+					// pyramid proves empty needs no separate exit path: it simply
+					// never overwrites this. bHIT IS THE HIT FLAG AND FaceAxis IS
+					// NOT -- VoxelBrickTraverse.ush:2805 records that FaceAxis
+					// SURVIVES A MISS and that three consumers have already been
+					// caught reading it as a position on a ray that missed -- so
+					// both are set, and this synthesised miss is
+					// indistinguishable from a walked one.
+					//
+					// TermReason SEGMENT is the honest description: a walk that
+					// reached its far bound without hitting reports exactly that,
+					// so the miss classification is identical to the control's
+					// for the same ray and `substituted` / `uncovered` cannot
+					// move because of the arm's bookkeeping.
+					H = (FVoxelMarchHit)0;
+					H.bHit = false;
+					H.FaceAxis = -1;
+					H.Material = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+					H.TermReason = VOXEL_MARCH_TERM_SEGMENT;
+					H.THitUU = TOut;
+					H.HitPosLocalUU = Ray.OriginLocalUU + Ray.DirWorld * TOut;
+#if VOXEL_MARCH_HOLE_STATS >= 2
+					H.AbsentLevel = 0xFFFFFFFFu;
+#endif
+
+					float TCursor = TIn;
+					float TSkipped = 0.0f;
+					const int MaxIters = bHeightOn ? max(MarchHeightMaxIters, 1) : 1;
+
+					[loop]
+					for (int HIter = 0; HIter < MaxIters; ++HIter)
+					{
+						float C0 = TCursor;
+						float C1 = TOut;
+						bool bRunEndedOnAir = false;
+						if (bHeightOn)
+						{
+							if (!VoxelHeightNextCandidate(HW, TCursor, TOut, C0, C1,
+							                              bRunEndedOnAir))
+							{
+								// Provably air from here to the far bound. The
+								// voxel walk is not entered at all. This is the
+								// whole of the UP case and part of the horizon
+								// one, and it is the only exit that leaves the
+								// synthesised miss standing.
+								TSkipped += max(TOut - TCursor, 0.0f);
+								HgtEmpty = 1u;
+								break;
+							}
+							TSkipped += max(C0 - TCursor, 0.0f);
+						}
+
+						// SPLIT WHEN THERE IS AIR AHEAD TO SKIP -- NOT WHEN
+						// THIS ITERATION HAPPENED TO SKIP SOMETHING ALREADY.
+						//
+						// The distinction cost this arm its entire horizon
+						// result once. The first rule here was "split only if
+						// C0 advanced past TCursor", which sounds equivalent and
+						// is not: at the pose-split spawn the camera sits 5.00 m
+						// above ground while a 12.8 m leaf carries 9.68 m of
+						// slack, so the camera's OWN cell is never provably air
+						// and NO ray advances at t = 0. Measured: advanced 0.00%
+						// of 50,131,152 rays, heightLeafCells 0, and 681M DDA
+						// steps spent finding nothing -- the arm paying full
+						// price for zero skip, which is worse than inert.
+						//
+						// bRunEndedOnAir asks the right question: did the
+						// candidate run END on provable air, i.e. is there
+						// something beyond this walk for a second consultation
+						// to remove? A ray standing on ground with a valley
+						// 700 m ahead answers YES and gets its skip. A ray
+						// crossing a +INF region, or one whose run hit the step
+						// cap, answers NO and is handed the whole remainder --
+						// byte-for-byte the control's interval, which is what
+						// keeps an unbuilt field from costing MaxIters walks
+						// where the control did one.
+						//
+						// ON THE LAST PERMITTED ITERATION, HAND OVER EVERYTHING
+						// LEFT for the same reason: stopping at C1 would leave
+						// the tail of the ray unexamined, which is a hole
+						// produced by a knob. Lowering MaxIters can therefore
+						// only cost speed, never a voxel, and with the arm off
+						// this is what makes the interval exactly [TIn, TOut].
+						const float WalkEnd =
+							(bRunEndedOnAir && HIter + 1 < MaxIters) ? min(C1, TOut) : TOut;
+						if (WalkEnd <= C0)
+						{
+							break;
+						}
+
+						H = VoxelMarchTraverseWithCover(
+							Ray.OriginLocalUU, Ray.DirWorld, C0, WalkEnd, MarchPixelConeSlope);
+						if (HIter > 0)
+						{
+							++HgtReentries;
+						}
+						if (H.bHit)
+						{
+							break;
+						}
+
+						// A miss inside a candidate interval. Resume the DDA
+						// from its far end and skip the next proven-empty
+						// stretch. THIS is the mid-ray skip, and it is where a
+						// grazing horizon ray gets most of its saving.
+						TCursor = WalkEnd;
+						if (TCursor >= TOut)
+						{
+							break;
+						}
+					}
+
+					HgtSteps = uint(max(HW.Steps, 0));
+					if (TSkipped > 0.0f)
+					{
+						HgtAdvanced = 1u;
+						// EXPRESSED IN LEAF CELLS, NOT CENTIMETRES, and the unit
+						// is a wrap argument rather than a taste. At 1.3M rays a
+						// centimetre count reaches ~1e11 in a frame and wraps a
+						// uint32 SILENTLY -- a counter that reads small precisely
+						// when the arm worked hardest, which is the failure the Z
+						// bound's group refused a fourth word over.
+						const float LeafUU = float(1u << uint(MarchHeightLeafVoxelShift)) * 10.0f;
+						HgtLeafCells = uint(TSkipped / max(LeafUU, 1.0f));
+					}
+				}
+
+#if VOXEL_MARCH_HOLE_STATS
+				// ---- THE FALSIFIER (voxel.March.HeightPyramid.Verify) --------
+				//
+				// COMPILED ONLY WITH THE STATS PERMUTATION, and that is the same
+				// re-basing argument the one-call-site note above makes: this is
+				// a SECOND instantiation of the walk, so leaving it in the
+				// shipping kernel would tax every timing leg -- including the
+				// control -- for an instrument no timing leg reads. It also
+				// cannot count without GVoxelMarchHoleStat, so there is nothing
+				// to compile it for.
+				//
+				// WHAT IT ASKS: walk the FULL unclamped interval and compare.
+				// Two ways the pyramid can have removed geometry --
+				//   * it declared the ray empty and the full walk hit;
+				//   * it advanced past a hit the full walk found.
+				// Comparing against THE CONTROL'S OWN WALK rather than against a
+				// reconstructed expectation is what makes this a test the
+				// pyramid can actually FAIL. Set BiasM 50 and it must.
+				if (MarchHeightEnable != 0 && MarchHeightVerify != 0)
+				{
+					const FVoxelMarchHit Full = VoxelMarchTraverseWithCover(
+						Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, MarchPixelConeSlope);
+					if (Full.bHit)
+					{
+						// TWO FINDINGS, TWO COUNTERS, AND THE SPLIT IS THE WHOLE
+						// POINT. These were one word and that word could not
+						// decide anything: a clean leg returned 4,418 of them
+						// with no way to say whether the arm had DELETED
+						// geometry or merely hit it a little later from a
+						// coarser ring.
+						if (!H.bHit)
+						{
+							// The clamped walk found NOTHING where the control
+							// found geometry. Proven air over real ground --
+							// unambiguous, and fatal to the arm at BiasM 0.
+							HgtMissed = 1u;
+						}
+						else if (H.THitUU > Full.THitUU + 10.0f)
+						{
+							// ONE VOXEL OF TOLERANCE. The two walks are handed
+							// different t-intervals, so a hit exactly on an
+							// interval boundary can be reported a hair apart by
+							// float.
+							HgtLate = 1u;
+							// CLAMPED BEFORE THE CAST. The delta is bounded by
+							// the march reach in practice, but a NaN or an
+							// enormous float would wrap the uint silently and
+							// land in the wrong decade -- a histogram that
+							// still prints five plausible numbers.
+							HgtLateDeltaUU =
+								uint(clamp(H.THitUU - Full.THitUU, 0.0f, 1.0e9f));
+						}
+					}
+				}
+#endif
+
 #if VOXEL_MARCH_HOLE_STATS
 				// Counted HERE, on the ray that was actually walked -- not on
 				// bInView -- so `rays` is the true denominator for the two
@@ -1431,6 +1672,52 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				// than a measured one -- which is exactly what makes
 				// "consulted == 0 while the cvar reads 1" a verdict on the arm
 				// and not on the world.
+				// THE HEIGHT PYRAMID'S ENGAGEMENT GROUP. Guarded on Consulted
+				// for the reason the ladder and the Z bound's trio are: with the
+				// arm off nothing is consulted, so the control leg pays no
+				// atomics here and its counters are a STRUCTURAL zero rather
+				// than a measured one -- which is exactly what makes
+				// "heightConsulted == 0 while the cvar reads 1" a verdict on the
+				// arm and not on the world.
+				//
+				// The falsifier's words are added under the SAME guard, so a leg that
+				// never consulted the field reports no violations AND no
+				// consultations, and the two zeros cannot be read as a passed
+				// falsifier. The log refuses to word it as one either.
+				if (HgtConsulted != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_CONSULTED], HgtConsulted);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_ADVANCED], HgtAdvanced);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_EMPTY], HgtEmpty);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LEAFCELLS], HgtLeafCells);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_STEPS], HgtSteps);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_REENTRIES], HgtReentries);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_MISSED], HgtMissed);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LATE], HgtLate);
+					// MAX, NOT ADD, and the CPU accumulates it with Max too.
+					// This is the only word in the group that is not a count.
+					InterlockedMax(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LATE_MAXUU],
+					               HgtLateDeltaUU);
+					// DECADE BUCKETS FROM THE TOLERANCE UPWARD. Written as five
+					// independent adds of a 0/1 rather than an indexed store,
+					// so a delta can land in exactly one bucket and the sum of
+					// the five is an identity against HgtLate -- which is what
+					// makes a dropped bucket visible instead of silent.
+					if (HgtLate != 0u)
+					{
+						const uint D = HgtLateDeltaUU;
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LATE_B0 + 0],
+						               (D < 100u) ? 1u : 0u);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LATE_B0 + 1],
+						               (D >= 100u && D < 1000u) ? 1u : 0u);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LATE_B0 + 2],
+						               (D >= 1000u && D < 10000u) ? 1u : 0u);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LATE_B0 + 3],
+						               (D >= 10000u && D < 100000u) ? 1u : 0u);
+						InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HGT_LATE_B0 + 4],
+						               (D >= 100000u) ? 1u : 0u);
+					}
+				}
 				if (H.ZCutConsulted != 0u)
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZCUT_CONSULTED], H.ZCutConsulted);
