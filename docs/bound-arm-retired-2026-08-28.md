@@ -8,8 +8,12 @@ precedent). Do not build a third version; this page is why.
 
     v1 (as designed):     marchMs 4.519 -> 4.897 (+0.38)   boundMs 5.607
                           net -5.99 ms  (gate >= +0.35: FAIL x17)
-    v2 (cull + half-res): marchMs 4.797 -> 16.650 (+11.85) boundMs 11.7-12.4
-                          net -23.6 ms  (FAIL x68, WORSE)
+    v2 (cull + half-res): marchMs 4.538 -> 4.737 (+0.20)   boundMs 12.368
+                          net -12.57 ms (FAIL ~x130 the 0.02 control spread)
+
+    (CORRECTED: a first read said net -23.6 with marchMs_on=16.65 -- the wrong
+    log line. The figures above are the ProfileGPU rows in Saved/BT2-{ctl,on}
+    .log, read by the box owner. Same verdict on either set.)
 
 Both with engagement PROVEN: 30.9% of segments skipped whole, identity counters
 holding, no crashes, no validation errors. The mechanism worked as specified and
@@ -28,8 +32,11 @@ the frame got slower every time.
 3. **The consult itself is a net loss, twice.** With phantoms in BOTH runs, 30.9%
    real segment skips did not pay for the per-segment slice loads and the
    fallthrough debt (a bound removal opens the ladder exactly as an absent
-   crossing does -- correct for holes, expensive for time). v2's dilation made
-   far boxes bigger and the consult dearer: +0.38 became +11.85.
+   crossing does -- correct for holes, expensive for time). The consult term
+   read +0.38 then +0.20 -- halved by the mitigations, never negative. The
+   producer meanwhile DOUBLED: the dilation inflates with distance across the
+   4.4x phantom population, and walkInRaised fell to exactly 0.00% (from 2.4%)
+   -- the widened intervals stopped raising WalkIn at all.
 
 ## Why not a v3 (the phantom fix is known and cheap)
 
