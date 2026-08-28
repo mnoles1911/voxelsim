@@ -985,9 +985,36 @@ TAutoConsoleVariable<int32> CVarVoxelStreamFrameAttribution(
 	     "lives under that bar."),
 	ECVF_Default);
 
+// ---- 2.0 -> 4.0 AND CLAMP 6000 -> 24000, 2026-08-28 ------------------------
+//
+// THE FIRST 4.0 A/B NEVER RAN 4.0 AND THAT IS THE LESSON HERE. C2-VL4 set
+// LeadSec 4.0 against the OLD 6000 UU clamp: 4 s at 23.4 m/s is 93.6 m against
+// a 60 m ceiling, so the arm effectively ran ~2.6 s -- the clamp bound before
+// the cvar did, exactly the pre-registered failure reading. C2-VL4b lifted the
+// clamp and measured the real thing:
+//
+//   parkedNow      ~850 (2 s)  ->  963 (clamped 4 s)  ->  1,328 (true 4 s)
+//   adoptions      58,815 ctl  ->  63,683              (+8.3%)
+//   waste          evictedUnused=0  dropOvertaken=0  hit 98%   (unchanged)
+//   frame          p50/p95/p99 all marginally BETTER than control
+//
+// Speculation was measured UNDER-supplied (99% adoption hit with zero waste on
+// every leg since T4-1), and this is the one lever that converts mesh
+// dispatches into zero-cost adoptions without shrinking any ring. +8.3% supply
+// for free is not large, but nothing about it can regress: the failure
+// counters that would say otherwise (evictedUnused / dropOvertaken / hit%)
+// are pinned at their healthy values and are printed every window.
+//
+// 24000 UU = 240 m: 4 s of lead clears the clamp up to 60 m/s --3x the flight
+// profile -- so the cvar, not the clamp, is the knob again. The clamp's job
+// (a speed SPIKE must not throw the cone somewhere the camera never goes)
+// survives: a spike is transient and the 0.25 s EMA already damps it.
+//
+// voxel.Stream.VelocityLeadSec 2.0 + VelocityLeadMaxUU 6000 restores every
+// build before this one.
 TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(
 	TEXT("voxel.Stream.VelocityLeadSec"),
-	2.0f,
+	4.0f,
 	TEXT("Seconds of travel ahead of the anchor that speculative generation aims at. 0 = off. Applied to a ")
 	TEXT("0.25s-EMA velocity vector and clamped by voxel.Stream.VelocityLeadMaxUU. Feeds speculation ONLY -- ")
 	TEXT("admission, eviction and retention stay on the true anchor by design."),
@@ -995,9 +1022,10 @@ TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(
 
 TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadMaxUU(
 	TEXT("voxel.Stream.VelocityLeadMaxUU"),
-	6000.0f,
-	TEXT("Hard clamp on the predicted-anchor lead distance (UU). 6000 = 60 m, ~3s at the 20 m/s flight ")
-	TEXT("profile. Stops a speed spike throwing the speculative cone somewhere the camera will never reach."),
+	24000.0f,
+	TEXT("Hard clamp on the predicted-anchor lead distance (UU). 24000 = 240 m -- 4 s of lead at up to ")
+	TEXT("60 m/s before the clamp binds instead of the cvar (it bound FIRST at the old 6000, silently ")
+	TEXT("halving the 4 s A/B). Still guards the speed-spike case; the 0.25s EMA damps the rest."),
 	ECVF_Default);
 
 // Chunks speculation may hold parked-but-unasked-for. SEPARATE from
