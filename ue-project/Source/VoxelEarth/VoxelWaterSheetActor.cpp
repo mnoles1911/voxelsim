@@ -80,6 +80,25 @@ AVoxelWaterSheetActor::AVoxelWaterSheetActor()
 		StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, TEXT("/Game/Voxel/M_WaterVoxel.M_WaterVoxel")));
 }
 
+UProceduralMeshComponent* AVoxelWaterSheetActor::GetOrCreateSheetComp(FSheet& Sheet)
+{
+	if (Sheet.Comp != nullptr)
+	{
+		return Sheet.Comp;
+	}
+	// Named for the log, not for lookup: nothing addresses these by name.
+	UProceduralMeshComponent* C = NewObject<UProceduralMeshComponent>(
+		this, *FString::Printf(TEXT("LakeBasin_%d_%d_%d"), Sheet.TileX, Sheet.TileY, Sheet.BasinId));
+	C->SetupAttachment(Mesh);
+	C->SetMobility(EComponentMobility::Movable);
+	C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	C->bUseAsyncCooking = false;
+	C->SetCastShadow(false);
+	C->RegisterComponent();
+	Sheet.Comp = C;
+	return C;
+}
+
 void AVoxelWaterSheetActor::BeginPlay()
 {
 	Super::BeginPlay();
@@ -504,21 +523,30 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 		Emit(FMath::Max(Hole.Max.X, R.Min.X), MY0, R.Max.X, MY1);         // right
 	}
 
-	// One mesh section per basin; the section index IS the sheet's slot, which
-	// is why the gather re-assigns both together and clears everything when it
-	// does. CreateMeshSection rather than UpdateMeshSection because a hole
-	// re-cut changes the TOPOLOGY (a rectangle becomes up to four), which
+	// One COMPONENT per basin (see FSheet::Comp for the 9 ms measurement that
+	// forced the split). CreateMeshSection rather than UpdateMeshSection because
+	// a hole re-cut changes the TOPOLOGY (a rectangle becomes up to four), which
 	// Update cannot express -- unlike the clipmap, whose vertex layout never
 	// changes and which is right to prefer Update.
+	// Always section 0 OF THIS BASIN'S OWN COMPONENT -- see FSheet::Comp. The
+	// proxy recreate this triggers now converts one basin's vertices, not every
+	// resident basin's.
 	if (Verts.Num() == 0)
 	{
-		Mesh->ClearMeshSection(Sheet.Section);
+		if (Sheet.Comp != nullptr)
+		{
+			Sheet.Comp->ClearAllMeshSections();
+		}
+		// No component yet = nothing ever drew = nothing to clear. Do NOT create
+		// one here: an empty PMC still registers a primitive, and a basin that
+		// decimates to zero rectangles at range would pay it for nothing.
 	}
 	else
 	{
-		Mesh->CreateMeshSection(Sheet.Section, Verts, Tris, Normals, UVs, Colors, Tangents,
-		                        /*bCreateCollision*/ false);
-		Mesh->SetMaterial(Sheet.Section, WaterMaterial);
+		UProceduralMeshComponent* C = GetOrCreateSheetComp(Sheet);
+		C->CreateMeshSection(0, Verts, Tris, Normals, UVs, Colors, Tangents,
+		                     /*bCreateCollision*/ false);
+		C->SetMaterial(0, WaterMaterial);
 	}
 	TotalRects += Emitted - Sheet.RectCount;
 	Sheet.RectCount = Emitted;
@@ -610,11 +638,18 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 				PendingTiles.Add(FIntPoint(Tx, Ty));
 			}
 		}
-		// Every previous section is about to be re-indexed, so clearing them all
-		// is one call and cannot leave an orphan drawing a lake that is no
+		// Every previous basin is about to be re-gathered, so destroying every
+		// per-basin component cannot leave an orphan drawing a lake that is no
 		// longer in range. The alternative -- matching old sheets to new by
 		// basin key -- saves a rebuild the per-tick budget already spreads out.
-		Mesh->ClearAllMeshSections();
+		for (FSheet& Old : Sheets)
+		{
+			if (Old.Comp != nullptr)
+			{
+				Old.Comp->DestroyComponent();
+				Old.Comp = nullptr;
+			}
+		}
 		Sheets.Reset();
 		GatherCenterXY = CamXY;
 		LastGatherXY = CamXY;
@@ -660,7 +695,8 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 			S.MaxXUU = B.MaxXUU;
 			S.MaxYUU = B.MaxYUU;
 			S.StepPx = StepForBasin(FMath::Max(B.MaxXUU - B.MinXUU, B.MaxYUU - B.MinYUU));
-			S.Section = Sheets.Num();
+			// No component yet -- created lazily on first non-empty build, see
+			// GetOrCreateSheetComp.
 			Sheets.Add(S);
 		}
 		UE_LOG(LogVoxelEarth, Log,

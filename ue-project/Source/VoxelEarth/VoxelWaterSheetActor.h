@@ -94,7 +94,28 @@ private:
 	struct FSheet
 	{
 		int32 TileX = 0, TileY = 0, BasinId = 0;
-		int32 Section = INDEX_NONE;
+		// ---- ONE COMPONENT PER BASIN: Section -> Comp, 2026-08-28 -------------
+		//
+		// Every basin used to be a mesh SECTION on the actor's single
+		// UProceduralMeshComponent. The engine recreates the WHOLE scene proxy on
+		// any CreateMeshSection/ClearMeshSection (ProceduralMeshComponent.cpp:635
+		// -- "New section requires recreating scene proxy"), and the proxy ctor
+		// converts every vertex of every section and calls BeginInitResource five
+		// times per section. At the measured 495 resident basins that is ~2,475
+		// BeginInitResource calls to rebuild ONE basin: 3.79 ms of game thread
+		// (Exclusive/GameThread/EndOfFrameUpdates) plus 5.81 ms of render thread
+		// (InitRenderResource) on every rebuild tick -- ~9 ms to change one lake,
+		// on 3.9% of moving frames. The CSV A/B is docs-grade: -VoxelLakeSheets=0
+		// collapses both columns to zero (spikes 352 -> 0 of 9,000 frames).
+		//
+		// With a component per basin the recreate touches ONE basin's vertices.
+		// The component is created lazily on first non-empty build (an empty PMC
+		// has no proxy, so unbuilt basins cost nothing), registered to this actor
+		// (GC-safe: RegisterComponent puts it in OwnedComponents), and destroyed
+		// on re-gather. UpdateMeshSection is NOT the alternative here -- a hole
+		// re-cut changes topology, which Update cannot express (see the comment at
+		// the build site).
+		UProceduralMeshComponent* Comp = nullptr;
 		int32 StepPx = 1;
 		int32 RectCount = 0;
 		// The camera cell this basin's LOD bands were last centred on, and
@@ -125,6 +146,11 @@ private:
 	// resolve (its tile or a block failed to decode) -- which is counted, not
 	// swallowed, because it is indistinguishable from a dry basin on screen.
 	bool RebuildSheet(FSheet& Sheet, const FVector& CamUU);
+
+	// Lazily creates Sheet.Comp -- see FSheet::Comp for why each basin owns a
+	// component. Mirrors the root Mesh's flags exactly (movable, no collision,
+	// no shadow) so a basin cannot behave differently for having been split out.
+	UProceduralMeshComponent* GetOrCreateSheetComp(FSheet& Sheet);
 
 	// Decimation for a basin, in fine pixels per emitted cell. See the .cpp.
 	int32 StepForBasin(double SpanUU) const;
