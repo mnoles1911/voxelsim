@@ -291,6 +291,28 @@ FORCEINLINE void NoteFrame(double VoxelTickMs, int32 AppliesThisFrame, double An
 	}
 }
 
+// THE SEGMENT, READ BACK. One opinion about "settled", not two.
+//
+// EXISTS BECAUSE A SECOND INSTRUMENT NEEDED THE SAME BOUNDARY AND WAS ABOUT TO
+// GUESS IT. voxel.Stream.FrameAttribution samples every frame from process
+// start and had no way to tell a cold-fill frame from a flight frame, so its
+// "slowest 5%" bucket was the SETTLE -- fill frames on the 2026-08-26 TJDL-A
+// leg reach 975 ms against a settled-moving p99 of 19.6 ms, so a pooled p95
+// describes loading and nothing else. That is the same error, in a second
+// place, that the three-state split in this file was written to end: a tail
+// statistic taken over a population that mixes two worlds.
+//
+// Told, not derived, for the reason NoteSettled's comment gives. This returns
+// the flag that hook set; it does not re-decide anything.
+bool IsSettled();
+
+// The moving test, exported for the same reason: so the sampler above applies
+// THE GATE's definition of moving rather than a second one.
+FORCEINLINE bool IsMovingSpeed(double AnchorSpeedUUPerSec)
+{
+	return AnchorSpeedUUPerSec >= MoveThresholdUU();
+}
+
 // HOOK 2, at the cold-settle SETTLED log site, which fires exactly once.
 //
 // THE BOUNDARY IS TOLD, NOT DERIVED, and that is the whole reason this hook

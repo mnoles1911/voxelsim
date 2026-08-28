@@ -599,6 +599,11 @@ void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpee
 	}
 }
 
+bool IsSettled()
+{
+	return bSettled;
+}
+
 void NoteSettledImpl(double InSettleSeconds)
 {
 	if (bSettled)

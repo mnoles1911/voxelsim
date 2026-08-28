@@ -970,9 +970,19 @@ static FAutoConsoleCommand GVoxelDeferExecCmd(
 TAutoConsoleVariable<int32> CVarVoxelStreamFrameAttribution(
 	TEXT("voxel.Stream.FrameAttribution"),
 	0,
-	TEXT("1 = sample frame/thread timings EVERY frame and report the fast-vs-slow component breakdown in "
+	TEXT("Sample frame/thread timings EVERY frame and report the fast-vs-slow component breakdown in "
 	     "the 5s census. Unlike the Hitch frame line this can describe a TYPICAL frame, which is what "
-	     "naming the frame-time floor and the tail both require."),
+	     "naming the frame-time floor and the tail both require. "
+	     "1 = every frame from process start -- WHICH POOLS COLD FILL WITH FLIGHT, so its p95/p99 "
+	     "describe LOADING (TJDL-A: fill max 975 ms against a settled-moving p99 of 19.6 ms) and no "
+	     "GOAL 3 claim may be lifted from a mode-1 row. Kept only so old legs still parse. "
+	     "2 = SETTLED-MOVING frames only, using VoxelFramePhase's own settled flag and 100 UU/s move "
+	     "threshold, so this bucket and the dist row that carries the verdict describe the same frames. "
+	     "3 = SETTLED-PARKED frames only -- exists so the GPU clock's \"~5.8 ms parked\" falsifier can be "
+	     "RUN rather than argued, since mode 2 can never produce a parked number. "
+	     "USE 2. Mode 2 also carries the dispatch/submit/apply subcomponents and their MAXES, which is "
+	     "what the Hitch frame line cannot do below its 33.3 ms bar -- and the whole settled-moving tail "
+	     "lives under that bar."),
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(

@@ -13,10 +13,15 @@
 #include "VoxelBrickCpuPackFromCore.h" // Phase 6: the ONE vxc::ChunkBrickPack -> FVoxelBrickCpuPack copy, shared with the cover producer
 #include "VoxelApplyBatch.h" // apply's per-chunk worldgen sampling, behind -VoxelApplyFast=
 #include "VoxelFramePhase.h" // Goal 3: frame distribution segmented at the cold-settle boundary
+// THE ONLY PER-FRAME GPU CLOCK IN THIS PROJECT, as of 2026-08-27 -- before this
+// there were ZERO RHIGetGPUFrameCycles call sites, which is why "it is the GPU"
+// was unfalsifiable here and ~4 ms of every slow frame sat on no clock at all.
+#include "GPUProfiler.h"          // FRHIGPUFrameTimeHistory / GRHIGPUFrameTimeHistory
 #include "VoxelMarchRenderer.h"    // VoxelMarchPublishStreamingState -- the marcher's convergence signal
 #include "VoxelRenderFrame.h"   // VoxelRenderFrame::NoteSettled -- the render split's settle latch
 #include "VoxelTickBudget.h" // per-frame work budget for the streaming tick, behind -VoxelTickBudgetMs=
 #include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
+#include "VoxelHeightPyramid.h"  // the marcher's terrain-height upper bound; this file is its only builder
 #include "VoxelResidencyGpu.h"     // T4-2: GPU-resident residency shadow (docs/gpu-residency-t42-plan.md)
 #include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
 #include "VoxelRasterAtlas.h"       // A: the persistent GPU raster atlas (-VoxelGpuRasterAtlas)
@@ -214,6 +219,51 @@ static TAutoConsoleVariable<bool> CVarVoxelCollapseEnabled(
 // O(41^2) memoised bound calls per level per log window, on the 5 s cadence
 // only, and the block times itself and prints the cost so the instrument
 // cannot quietly become a share of what it measures.
+// ---- THE MARCHER'S HEIGHT PYRAMID: THE BUILDER'S THREE KNOBS -------------
+//
+// The field itself, and why it is shaped the way it is, is documented in
+// VoxelHeightPyramid.h. These three are the build side only. The CONSUMER is
+// voxel.March.HeightPyramid, which is a separate switch on purpose: building
+// the field and marching against it fail differently and must be separable, so
+// that "the field is fine and the traversal is inert" and "the traversal is
+// fine and the field is empty" are two distinguishable states rather than one.
+static TAutoConsoleVariable<int32> CVarVoxelHeightPyramidBuild(
+	TEXT("voxel.HeightPyramid.Build"), 0,
+	TEXT("Build the marcher's terrain-height upper bound. 0 = off and the default. 1 = fill it ")
+	TEXT("incrementally on the streaming tick.\n")
+	TEXT("SEPARATE FROM voxel.March.HeightPyramid ON PURPOSE. With this 0 the field stays ")
+	TEXT("entirely +INF, so the marcher's arm can be on and is INERT rather than wrong -- ")
+	TEXT("which is the state to be in while measuring the build cost on its own."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelHeightPyramidLeafLevel(
+	TEXT("voxel.HeightPyramid.LeafLevel"), 2,
+	TEXT("The CHUNK LEVEL whose footprint is one leaf cell. A level-L chunk is 3.2 * 2^L m, so ")
+	TEXT("2 = 12.8 m (the default), 3 = 25.6 m, 4 = 51.2 m.\n")
+	TEXT("THIS IS THE SLACK KNOB AND IT IS THE ONE THAT MATTERS. The underlying bound is a ")
+	TEXT("Lipschitz envelope around one centre evaluation, so its slack grows superlinearly ")
+	TEXT("with the footprint asked about: measured on the real fine tier at the leg spawn, ")
+	TEXT("3.84 m at a 3.2 m leaf, 9.68 m at 12.8 m, 22.75 m at 25.6 m, 188.83 m at 102.4 m. ")
+	TEXT("The coarse mips are MAX-REDUCED from the leaf and never queried directly, so the ")
+	TEXT("leaf's slack is carried all the way up -- which is why a 12.8 m leaf beats a direct ")
+	TEXT("level-5 query by 49x.\n")
+	TEXT("IT ALSO SETS THE MEMORY AND THE BUILD COST, both by 4x per level. The field spans a ")
+	TEXT("fixed 13,107.2 m, so level 2 is 1024 leaves a side (5.6 MB, ~1.05M bound queries) ")
+	TEXT("and level 3 is 512 (1.4 MB, ~262k). Raising it is the cheap way out if the fill ")
+	TEXT("cannot be afforded; against 1,371 m of relief in reach, even a 25.6 m leaf clears ")
+	TEXT("the design's R > 4S threshold by 15x."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarVoxelHeightPyramidBudgetMs(
+	TEXT("voxel.HeightPyramid.BudgetMs"), 3.0f,
+	TEXT("Game-thread milliseconds per tick the fill may spend. The field is filled NEAREST ")
+	TEXT("THE CAMERA FIRST and everything unfilled holds +INF, so a partially built field is ")
+	TEXT("always SAFE to march against -- it simply skips less. This is a hitch knob, not a ")
+	TEXT("correctness one.\n")
+	TEXT("A tile is 64x64 leaves and is filled atomically, so the real spend per tick is this ")
+	TEXT("budget rounded up by one tile."),
+	ECVF_Default);
+
 static TAutoConsoleVariable<int32> CVarVoxelZCutHeadroomProbe(
 	TEXT("voxel.March.ZCutHeadroomProbe"), 0,
 	TEXT("MEASUREMENT ONLY, changes no rendering. 1 = print one zcutHeadroom line per periodic "
@@ -6636,8 +6686,23 @@ struct FVoxelWorldImpl
 	TSet<VoxelCoords::FVoxelLevelChunkKey> SpeculativeInFlight;
 
 	int64 SpecDispatchedSinceLog = 0;
-	// One unconditional sample per frame. ~28 B each; the cap bounds a long
-	// session at ~1.1 MB and a standard leg produces ~16,000.
+	// One sample per frame. ~44 B each; the cap bounds a long session at
+	// ~1.8 MB and a standard leg produces ~16,000.
+	//
+	// THE DISPATCH SUBCOMPONENTS ARE HERE BECAUSE THE ONLY INSTRUMENT THAT
+	// CARRIED THEM COULD NOT SEE THE TAIL. `Hitch frame dispatch` prints
+	// submitMs, but only for frames over 33.3 ms -- and on the 2026-08-26
+	// TJDL-A leg the settled-moving tail is p95=15.20 / p99=19.60 ms, both far
+	// under that bar, so the entire population the goal is judged on emits no
+	// dispatch line at all. Reading submitMs off the hitch lines and calling it
+	// "the tail" therefore reads the COLD FILL: every dispatch line on that leg
+	// with submitMs above 4 ms is timestamped before 13:04:14.27, and the
+	// settle boundary is 13:04:17.87. Post-settle the same leg's five dispatch
+	// lines carry submitMs = 0.00 / 0.02 / 0.00 / 0.05 / 0.00.
+	//
+	// So these four fields exist to answer the same question over the RIGHT
+	// population, per frame, with no threshold: what differs between a fast
+	// flight frame and a slow one.
 	struct FFrameSample
 	{
 		float FrameMs = 0.f;
@@ -6646,9 +6711,78 @@ struct FVoxelWorldImpl
 		float RenderWaitMs = 0.f;
 		float RHIMs = 0.f;
 		float GameWaitMs = 0.f;
+		// THE ENGINE'S OWN GAME-THREAD BUSY TIME -- **BUSY, NOT TOTAL**, and
+		// that distinction cost a wrong headline before this field existed.
+		// GGameThreadTime EXCLUDES GGameThreadWaitTime, so `frame - gameWait`
+		// is NOT game-thread busy and `gameMs - gameWait` is a negative number:
+		// the 2026-08-27 TAIL-C leg printed gameBusy=-2.68 on its FAST bucket,
+		// which is what exposed it. Read gameMs directly as busy, and read
+		// gameAcct = gameMs + gameWait against frame to see how much of the
+		// frame the game thread's own two clocks actually account for (FAST
+		// 8.42 of 8.27 = 102%; the p99 bucket only 18.94 of 23.41 = 81%). Sampled because the headline
+		// number is otherwise a SUBTRACTION -- gameBusy = frame - gameWait --
+		// and that subtraction silently assumes the game thread is either busy
+		// or inside the render fence, with nothing else able to block it. This
+		// field is what lets the report CHECK that assumption instead of
+		// resting on it: if gameMs tracks frame, the subtraction is sound.
+		float GameMs = 0.f;
+		// GPU BUSY FOR A FRAME, in ms, or -1 when the history gave us nothing.
+		// NEGATIVE IS NOT ZERO and the distinction is the whole falsifier: a
+		// real 0.0 would mean an idle GPU, while "no sample" means the clock is
+		// not running and every gpu= figure on the line is meaningless. The
+		// report refuses to print a verdict in that case rather than showing a
+		// confident 0.00 -- a statistic that cannot come out the other way is
+		// not a measurement.
+		float GpuMs = -1.f;
+		float DispatchMs = 0.f;   // the whole dispatch loop, game thread
+		float SubmitMs = 0.f;     // ... of which the submit bracket (raster-atlas fills land here)
+		float ApplyMs = 0.f;      // component apply, game thread
+		int32 Applies = 0;        // chunks applied this frame
 	};
 	static constexpr int32 kMaxFrameSamples = 40000;
 	TArray<FFrameSample> FrameSamples;
+
+	// THE OFF-BY-ONE, AND IT IS THE WHOLE REASON THESE FOUR EXIST.
+	//
+	// The sample's FrameMs is DeltaTime, which measures the interval that ENDED
+	// when this tick started -- so the work it contains is the PREVIOUS tick's
+	// dispatch and apply, not this one's. Reading ThisFrameDispatch* at the
+	// sample site pairs a frame duration with work that had not happened yet
+	// when that duration was measured, which does not merely add noise: it
+	// systematically moves a spiky term into the neighbouring bucket, and a
+	// spiky term is exactly what a tail analysis is trying to name. The engine's
+	// per-thread globals (render/rhi/gameWait) already describe a finished
+	// frame, so they need no such carry -- these are the game-thread counters
+	// this subsystem owns and resets itself.
+	// VoxelTickMs BELONGS IN THIS CARRY TOO, and leaving it out was a bug that
+	// shipped into the TAIL-B/C/D legs: those rows pair `tick` (the CURRENT
+	// tick, via TickMsSoFar) against `dispatch` (the PREVIOUS tick), so they
+	// describe different frames and `dispatch` came out LARGER than the tick
+	// that contains it -- 2.88 against 1.19 on TAIL-D's p99 bucket, which is
+	// arithmetically impossible and is what exposed it. Any `tick` figure from
+	// those three legs is diluted the same way `dispatch` was before the carry
+	// existed, and must not be read as "the streaming tick is flat".
+	// THE GPU HISTORY IS A QUEUE, NOT A GAUGE, and that shapes how it is read.
+	// GRHIGPUFrameTimeHistory buffers up to 16 end-of-pipe frame timings and
+	// PopFrameCycles DRAINS them one at a time, so a single pop per tick would
+	// fall progressively further behind the game thread and silently report a
+	// frame from a second ago. This state is drained to EMPTY every tick and the
+	// LAST value kept, which is the freshest GPU frame the RHI has published.
+	//
+	// IT IS STILL NOT THIS FRAME'S GPU TIME. The GPU runs behind the game thread
+	// by a frame or more, so gpu= correlates with the bucket rather than
+	// belonging to it exactly. That is enough to answer "is the residual GPU or
+	// CPU", which is the question, and it is NOT enough to attribute a single
+	// named frame -- do not use it that way.
+	FRHIGPUFrameTimeHistory::FState GpuHistoryState;
+	float LastGpuMs = -1.f;
+	int64 GpuSamplesSeen = 0;
+
+	float PrevTickMs = 0.f;
+	float PrevTickDispatchMs = 0.f;
+	float PrevTickSubmitMs = 0.f;
+	float PrevTickApplyMs = 0.f;
+	int32 PrevTickApplies = 0;
 
 	int64 SpecParkedSinceLog = 0;
 	// Why a DEMAND eviction did not park. Sums with ChunksParkedSinceLog to the
@@ -6901,6 +7035,40 @@ struct FVoxelWorldImpl
 	// walks its ancestors at every level; this map is that same walk's XY->maxZ
 	// reduction. Sized by edited footprints, not by world extent.
 	TMap<FIntPoint, int32> EditedFootprintMaxZ[VoxelCoords::kNumLevels];
+
+	// ---- THE MARCHER'S HEIGHT PYRAMID (voxel.HeightPyramid.Build) ---------
+	//
+	// THE BUILDER LIVES HERE BECAUSE THE BOUND DOES. FootprintSurfaceUpperBoundMm
+	// is a member of this class, the fine-tile residency gate is FineStreamer,
+	// and the one thing the analytic bound cannot see -- player edits -- is
+	// EditedFootprintMaxZ two lines above. Splitting the builder out would mean
+	// exporting all three, and the residency gate is exactly the thing that must
+	// not be reimplemented anywhere else: a bound computed while a fine tile is
+	// still decoding answers from the SEA-LEVEL FALLBACK, and a sea-level answer
+	// published into this field is proven air over real mountain.
+	//
+	// THE STORAGE lives in VoxelEarthShaders (that module cannot depend on this
+	// one, so the global object is the handoff), and everything about how it is
+	// represented -- +INF for absence, max-reduce upward, linear indexing -- is
+	// argued in VoxelHeightPyramid.h.
+	TArray<FIntPoint> HeightPyramidTiles;   // fill order, nearest the centre first
+	int32 HeightPyramidNextTile = 0;
+	// UNCACHED BOUND CALLS, DELIBERATELY. FootprintSurfaceUpperBoundMmCached
+	// memoises per footprint and is right for the streaming path, which asks
+	// about the same few thousand columns over and over. This asks about a
+	// million distinct columns exactly once each, so caching them would grow a
+	// TMap by ~20 MB to serve no second read -- and would evict the entries the
+	// streaming path actually reuses. The residency gate that wrapper performs
+	// is replicated at the call site instead, because THAT part is not an
+	// optimisation.
+	double HeightPyramidLastLogSec = 0.0;
+	int32 HeightPyramidLoggedTiles = -1;
+
+	void TickHeightPyramid(const FVector& AnchorUU);
+	// Folds one edited level-0 chunk into the field immediately. Called from the
+	// same loop that maintains EditedFootprintMaxZ, so an edit cannot be visible
+	// to the streaming layer and invisible to the marcher for even one frame.
+	void NoteHeightPyramidEdit(int32 Level0ChunkX, int32 Level0ChunkY, int32 Level0ChunkZ);
 
 	// LOWEST edited chunk Z per (level, footprint XY) -- the mirror of the map
 	// above, and the correctness crux of the all-solid admission skip (see
@@ -9223,8 +9391,253 @@ private:
 
 // --- streaming tick orchestration -------------------------------------------
 
+// ===========================================================================
+// THE MARCHER'S HEIGHT PYRAMID: THE FILL
+// ===========================================================================
+//
+// One leaf cell per level-LeafChunkLevel chunk column, holding a PROVABLE upper
+// bound on the terrain surface in world UU, or +INF. The coarse levels are
+// max-reduced from this one and are NEVER queried directly -- see
+// VoxelHeightPyramid.h for the 49x that choice is worth.
+//
+// THREE THINGS HERE ARE LOAD-BEARING AND NONE OF THEM IS THE ARITHMETIC:
+//
+//   1. THE RESIDENCY GATE. FootprintSurfaceUpperBoundMm answers from the
+//      SEA-LEVEL FALLBACK when a fine tile has not decoded yet
+//      (tilestore.cpp:1759). Publishing that answer into this field is proven
+//      air over real mountain. So residency is checked FIRST and a non-resident
+//      footprint is written as +INF -- never as the number the bound would have
+//      returned. This is the same gate FootprintSurfaceUpperBoundMmCached
+//      performs before it will memoise, replicated here because this path
+//      deliberately does not use that cache.
+//   2. THE ASSET REACH DILATION on that residency test. The bound composes
+//      crowns from columns OUTSIDE the cell (assetAwareSurfaceUpperBoundMm
+//      dilates by each layer's own reach), so the residency required is the
+//      dilated rectangle's, not the cell's. Requiring more residency only ever
+//      publishes FEWER finite cells; getting it the other way round publishes a
+//      bound derived from columns that were not there.
+//   3. +INF ON DECLINE. kSurfaceBoundDeclined is INT64_MAX and means "the
+//      terrain might reach arbitrarily high here". It maps to +INF and to
+//      nothing else -- not to a large finite number, which would be a ceiling
+//      the ray could rise above.
+void FVoxelWorldImpl::TickHeightPyramid(const FVector& AnchorUU)
+{
+	using namespace VoxelCoords;
+
+	if (CVarVoxelHeightPyramidBuild.GetValueOnGameThread() == 0)
+	{
+		return;
+	}
+
+	FVoxelHeightPyramid& Pyr = GetGlobalVoxelHeightPyramid();
+	const int32 LeafLevel = FMath::Clamp(CVarVoxelHeightPyramidLeafLevel.GetValueOnGameThread(), 0, 6);
+
+	if (Pyr.ShouldReanchor(AnchorUU.X, AnchorUU.Y, LeafLevel))
+	{
+		const FVoxelHeightPyramid::FGeometry NewGeom =
+			FVoxelHeightPyramid::MakeGeometryFor(AnchorUU.X, AnchorUU.Y, LeafLevel);
+		HeightPyramidNextTile = 0;
+		HeightPyramidLoggedTiles = -1;
+		// NOT `Tiles`: FVoxelWorldImpl already has a member of that name (the tile
+		// store), and shadowing it here is a warning this build treats as an error --
+		// correctly, since the two are entirely different things.
+		const int32 TileCount = Pyr.Reanchor(NewGeom, HeightPyramidTiles);
+		UE_LOG(LogVoxelStream, Display,
+		       TEXT("HeightPyramid: re-anchored to leaf L%d (%.1f m), %dx%d cells, %d mips, "
+		            "%.2f MB, origin cell (%d,%d) -- %d tiles to fill, all +INF until they are"),
+		       NewGeom.LeafChunkLevel, NewGeom.LeafEdgeUU() * 0.01, NewGeom.Dim, NewGeom.Dim,
+		       NewGeom.NumMips, double(NewGeom.TotalFloats) * 4.0 / (1024.0 * 1024.0),
+		       NewGeom.MinCellX, NewGeom.MinCellY, TileCount);
+	}
+
+	const FVoxelHeightPyramid::FGeometry Geom = Pyr.GetGeometry();
+	if (!Geom.IsValid())
+	{
+		return;
+	}
+
+	// ---- the analytic fill, on a millisecond budget ----------------------
+	const int32 Tile = int32(FVoxelHeightPyramid::kTileLeafCells);
+	const int64 SpanVox = int64(ChunkEdgeVoxels) << Geom.LeafChunkLevel;
+	const int64 SpanMm = SpanVox * int64(vxc::kVoxelSizeMm);
+	const float Inf = VoxelHeightPyramidPositiveInfinity();
+
+	// THE DILATION, COMPUTED ONCE. Only terrainLattice layers are composed into
+	// the bound, so only their reach widens the residency requirement -- the
+	// same predicate FootprintSurfaceUpperBoundMmCached uses.
+	int64 ReachMm = 0;
+	if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+	{
+		for (const vxc::AssetLayer& L : Field->layers())
+		{
+			if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
+		}
+	}
+
+	const double BudgetSec =
+		double(FMath::Max(CVarVoxelHeightPyramidBudgetMs.GetValueOnGameThread(), 0.1f)) * 0.001;
+	const double StartSec = FPlatformTime::Seconds();
+
+	TArray<float> Scratch;
+	Scratch.SetNumUninitialized(Tile * Tile);
+	int32 TilesThisTick = 0;
+
+	while (HeightPyramidNextTile < HeightPyramidTiles.Num())
+	{
+		const FIntPoint T = HeightPyramidTiles[HeightPyramidNextTile];
+		const int32 Cx0 = Geom.MinCellX + T.X * Tile;
+		const int32 Cy0 = Geom.MinCellY + T.Y * Tile;
+		int32 Declined = 0;
+		int32 NotResident = 0;
+
+		for (int32 j = 0; j < Tile; ++j)
+		{
+			for (int32 i = 0; i < Tile; ++i)
+			{
+				const int32 CellX = Cx0 + i;
+				const int32 CellY = Cy0 + j;
+
+				// RESIDENCY FIRST, AND THE ORDER IS THE POINT. Asking the bound
+				// and then discarding the answer would be equivalent here, but
+				// only by accident: it is one edit away from someone caching the
+				// discarded value. The gate is what decides whether the question
+				// may be asked at all.
+				bool bNotResident = false;
+				if (FineStreamer)
+				{
+					const int64 X0 = int64(CellX) * SpanMm - ReachMm;
+					const int64 Y0 = int64(CellY) * SpanMm - ReachMm;
+					const int64 X1 = int64(CellX) * SpanMm + SpanMm - 1 + ReachMm;
+					const int64 Y1 = int64(CellY) * SpanMm + SpanMm - 1 + ReachMm;
+					bNotResident = !FineStreamer->IsFootprintResident(X0, Y0, X1, Y1);
+				}
+
+				float Value = Inf;
+				if (bNotResident)
+				{
+					++NotResident;
+				}
+				else
+				{
+					const int64 BoundMm = FootprintSurfaceUpperBoundMm(Geom.LeafChunkLevel, CellX, CellY);
+					if (BoundMm == vxc::kSurfaceBoundDeclined)
+					{
+						++Declined;
+					}
+					else
+					{
+						// mm -> UU. Voxel (0,0,0)'s negative corner is the UE
+						// world origin and sea level is 0 mm, so the two datums
+						// coincide and this is a pure unit conversion with no
+						// offset to get backwards.
+						Value = float(double(BoundMm) * 0.1);
+					}
+				}
+				Scratch[j * Tile + i] = Value;
+			}
+		}
+
+		Pyr.WriteLeafBlock(Cx0, Cy0, Tile, Tile, Scratch.GetData(), Declined, NotResident);
+		++HeightPyramidNextTile;
+		++TilesThisTick;
+
+		if (FPlatformTime::Seconds() - StartSec >= BudgetSec)
+		{
+			break;
+		}
+	}
+
+	if (TilesThisTick == 0)
+	{
+		return;
+	}
+
+	// ---- PLAYER EDITS: THE ONE THING THE ANALYTIC BOUND CANNOT SEE --------
+	//
+	// A block set on a hilltop is above the amplifier's surface and the
+	// amplifier does not know. EditedFootprintMaxZ is the streaming layer's
+	// existing record of exactly that, keyed per level and per footprint XY, so
+	// it is replayed into the field after every fill batch.
+	//
+	// REPLAYED, NOT JUST HOOKED ON THE EDIT. NoteHeightPyramidEdit covers the
+	// live edit so no frame can see a raised surface the marcher does not; this
+	// replay covers the two cases that hook cannot -- a world LOADED with edits
+	// already in it, and a cell that was refilled by the loop above AFTER an
+	// edit had already raised it. The refill legitimately lowers a cell back to
+	// the analytic bound, and without this the edit would be lost.
+	{
+		const double ChunkEdgeAtLeafUU = ChunkEdgeUU * double(int64(1) << Geom.LeafChunkLevel);
+		for (const TPair<FIntPoint, int32>& E : EditedFootprintMaxZ[Geom.LeafChunkLevel])
+		{
+			if (E.Value == MIN_int32) { continue; }
+			// The TOP of the edited chunk, not its origin: the record is a chunk
+			// index and the bound is a surface height, so the +1 is what makes
+			// this an upper bound rather than a floor one chunk too low.
+			const double TopUU = double(int64(E.Value) + 1) * ChunkEdgeAtLeafUU;
+			Pyr.MaxLeafEdited(E.Key.X, E.Key.Y, float(TopUU));
+		}
+	}
+
+	// THE REDUCE AND THE VERSION BUMP, ONCE PER TICK RATHER THAN PER TILE. The
+	// reduce is a full rebuild from mip 0 (see RebuildMips for why it is not
+	// incremental) and the bump makes the render thread re-upload, so doing
+	// either per tile would pay both costs 256 times per anchor for no extra
+	// freshness within a frame.
+	Pyr.RebuildMips();
+	Pyr.BumpVersion();
+
+	const double NowSec = FPlatformTime::Seconds();
+	const bool bJustFinished = HeightPyramidNextTile >= HeightPyramidTiles.Num() &&
+	                           HeightPyramidLoggedTiles != HeightPyramidNextTile;
+	if (bJustFinished || NowSec - HeightPyramidLastLogSec > 5.0)
+	{
+		HeightPyramidLastLogSec = NowSec;
+		HeightPyramidLoggedTiles = HeightPyramidNextTile;
+		const FVoxelHeightPyramid::FCensus C = Pyr.GetCensus();
+		UE_LOG(LogVoxelStream, Display,
+		       TEXT("HeightPyramid: %d/%d tiles, %d/%d leaves (%d still +INF: %d declined, "
+		            "%d fine tile not resident), finite range %.1f .. %.1f m%s"),
+		       HeightPyramidNextTile, HeightPyramidTiles.Num(), C.Filled, C.LeafCells,
+		       C.Infinite, C.Declined, C.NotResident, C.MinUU * 0.01f, C.MaxUU * 0.01f,
+		       bJustFinished ? TEXT(" -- COMPLETE") : TEXT(""));
+	}
+}
+
+// Fold one edited level-0 chunk into the field immediately.
+//
+// IMMEDIATE, NOT DEFERRED TO THE NEXT TICK, and the one-frame window is the
+// whole reason. The streaming layer learns about an edit and the marcher must
+// not be able to march a frame against a bound that predates it: a block placed
+// on a ridge is above the analytic surface by construction, so for that one
+// frame the pyramid would prove air exactly where the player just built.
+void FVoxelWorldImpl::NoteHeightPyramidEdit(int32 Level0ChunkX, int32 Level0ChunkY,
+                                            int32 Level0ChunkZ)
+{
+	using namespace VoxelCoords;
+	FVoxelHeightPyramid& Pyr = GetGlobalVoxelHeightPyramid();
+	const FVoxelHeightPyramid::FGeometry Geom = Pyr.GetGeometry();
+	if (!Geom.IsValid()) { return; }
+	// Arithmetic shift, which is floor division for negative indices -- the
+	// property `/ (1 << n)` does NOT have. The leg spawn is at negative world
+	// coordinates, so this is the half of the world the project measures in.
+	const int32 CellX = Level0ChunkX >> Geom.LeafChunkLevel;
+	const int32 CellY = Level0ChunkY >> Geom.LeafChunkLevel;
+	// The top of the edited LEVEL-0 chunk. Tighter than the leaf-level chunk
+	// top, and sound for the same reason: nothing in that chunk reaches above
+	// its own ceiling.
+	const double TopUU = double(int64(Level0ChunkZ) + 1) * ChunkEdgeUU;
+	Pyr.MaxLeafEdited(CellX, CellY, float(TopUU));
+	Pyr.NoteEdited();
+}
+
 void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, USceneComponent& Root, UMaterialInterface* Material, float DeltaTime)
 {
+	// THE MARCHER'S HEIGHT PYRAMID, FILLED FIRST AND ON ITS OWN BUDGET. It is
+	// driven from here because the anchor is here and because the fill must
+	// follow the camera; it is deliberately NOT part of the admission sweep, so
+	// a slow fill cannot delay a chunk. Off by default (voxel.HeightPyramid.Build).
+	TickHeightPyramid(Anchor);
+
 	SCOPE_CYCLE_COUNTER(STAT_VoxelSubsystemTick);
 	const double TickStartSeconds = FPlatformTime::Seconds();
 	VoxelTickBudget::BeginTick(TickStartSeconds);
@@ -10130,16 +10543,70 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// splits it into FAST frames and SLOW frames and prints the per-component
 	// delta. The component that differs most between those two buckets IS the
 	// tail, measured rather than inferred.
-	if (VoxelDebug::GetStreamFrameAttribution() != 0)
+	// --- MODE 2: SETTLED-MOVING ONLY, AND IT IS THE POINT OF THIS PASS -------
+	//
+	// Mode 1 samples from process start. Its p50/p95 are therefore taken over a
+	// population that MIXES COLD FILL WITH FLIGHT, and on this project fill and
+	// flight are not the same world by two orders of magnitude: TJDL-A's fill
+	// segment is n=536 max=975.37 ms, its settled-moving segment n=12638
+	// p99=19.60 ms. Pooled, the "slowest 5%" bucket is ~632 frames of which the
+	// worst are all loading -- so mode 1's SLOW row describes the settle and
+	// says nothing whatever about the tail GOAL 3 is judged on.
+	//
+	// That is the SAME mistake, in a second instrument, that VoxelFramePhase's
+	// three-state split was written to end, and the same one the `Hitch frame`
+	// comment above records for 2026-07-28. Mode 2 refuses the pooled
+	// population: it takes only frames that are SETTLED and MOVING, using
+	// VoxelFramePhase's own two predicates so this bucket and the dist row that
+	// carries the verdict cannot come to describe different frames.
+	//
+	// Mode 1 is kept byte-identical for anyone reading an old leg.
+	//
+	// The mode read comes FIRST and short-circuits, so an off cvar costs one
+	// int compare and never touches the segment predicates -- this file's
+	// standing "keep all debug work zero-cost when the switch is 0" rule.
+	const int32 AttributionMode = VoxelDebug::GetStreamFrameAttribution();
+	// MODE 3 = SETTLED-PARKED, and it exists to make the GPU clock's falsifier
+	// RUNNABLE rather than argued. The gate is "~5.8 ms parked"; mode 2 samples
+	// moving frames only, so it can never produce a parked number and the check
+	// would have to be eyeballed off a different instrument. Mode 3 takes the
+	// same population the parked dist row reports, so the two can be compared
+	// directly and the clock either passes or fails on its own leg.
+	const bool bAttrSettled = AttributionMode >= 2 && VoxelFramePhase::IsSettled();
+	if (AttributionMode != 0
+	    && (AttributionMode == 1
+	        || (bAttrSettled && AttributionMode == 2
+	            && VoxelFramePhase::IsMovingSpeed(SmoothedAnchorSpeedUUPerSec))
+	        || (bAttrSettled && AttributionMode == 3
+	            && !VoxelFramePhase::IsMovingSpeed(SmoothedAnchorSpeedUUPerSec))))
 	{
 		const double CyToMs = FPlatformTime::GetSecondsPerCycle() * 1000.0;
 		FFrameSample Sample;
 		Sample.FrameMs      = FrameMs;
-		Sample.VoxelTickMs  = TickMsSoFar;
+		Sample.VoxelTickMs  = PrevTickMs;   // previous tick -- see PrevTickMs
 		Sample.RenderMs     = float(GRenderThreadTime * CyToMs);
 		Sample.RenderWaitMs = float(GRenderThreadWaitTime * CyToMs);
 		Sample.RHIMs        = float(GRHIThreadTime * CyToMs);
 		Sample.GameWaitMs   = float(GGameThreadWaitTime * CyToMs);
+		Sample.GameMs       = float(GGameThreadTime * CyToMs);
+		// Drain to the freshest published GPU frame. Disjoint means we missed
+		// some, which is expected when the game thread outruns the queue and is
+		// not an error -- both Ok and Disjoint carry a valid timing.
+		{
+			uint64 GpuCycles = 0;
+			while (GpuHistoryState.PopFrameCycles(GpuCycles) != FRHIGPUFrameTimeHistory::EResult::Empty)
+			{
+				LastGpuMs = float(double(GpuCycles) * FPlatformTime::GetSecondsPerCycle64() * 1000.0);
+				++GpuSamplesSeen;
+			}
+		}
+		Sample.GpuMs        = LastGpuMs;
+		// PREVIOUS tick's values -- see PrevTickDispatchMs for why pairing
+		// this frame's duration with this tick's work is wrong.
+		Sample.DispatchMs   = PrevTickDispatchMs;
+		Sample.SubmitMs     = PrevTickSubmitMs;
+		Sample.ApplyMs      = PrevTickApplyMs;
+		Sample.Applies      = PrevTickApplies;
 		// NO DIRECT GPU TIME. It needs FRHIGPUFrameTimeHistory, a pull-based API
 		// with its own state, which is more plumbing than this pass warrants --
 		// and it is not needed to answer the question: a GPU-bound frame shows up
@@ -10151,6 +10618,17 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			FrameSamples.Add(Sample);
 		}
 	}
+
+	// Carry THIS tick's game-thread counters for the NEXT frame's sample, which
+	// is the frame whose DeltaTime will actually contain them. Unconditional and
+	// four stores: gating it on the cvar would leave stale values behind when a
+	// leg turns attribution on mid-run, and staleness in a tail instrument is
+	// the failure this whole pass exists to correct.
+	PrevTickMs         = TickMsSoFar;
+	PrevTickDispatchMs = ThisFrameDispatchMs;
+	PrevTickSubmitMs   = ThisFrameDispatchSubmitMs;
+	PrevTickApplyMs    = ThisFrameApplyMs;
+	PrevTickApplies    = ThisFrameAppliesFromWorker;
 
 	if (FrameMs > 16.6f) // the actual 60fps gate bar (see TotalFramesOver60FpsBar)
 	{
@@ -12104,48 +12582,140 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		Frames.Sort();
 		const float P50 = Frames[Frames.Num() / 2];
 		const float P95 = Frames[int32(Frames.Num() * 0.95f)];
+		// P99 AND MAX ADDED because the gate is p99, and because a bimodal
+		// component is invisible in a mean: `submitMs` on the 2026-08-26 leg is
+		// p50=0.00 with a max of 116.32, and every number that ever mattered
+		// about it was a max. A row that prints only means of means cannot
+		// distinguish "this term is small" from "this term is zero on 99 frames
+		// in 100 and enormous on the hundredth", and those have opposite fixes.
+		const float P99 = Frames[FMath::Min(Frames.Num() - 1, int32(Frames.Num() * 0.99f))];
+		const float MaxMs = Frames.Last();
 
 		// Buckets by FRAME time, then average every component within each --
-		// that is what makes the deltas attributable.
+		// that is what makes the deltas attributable. MAXES ARE CARRIED TOO,
+		// for the bimodality reason above.
 		struct FAccum
 		{
 			double Tick = 0, Render = 0, RenderWait = 0, RHI = 0, GameWait = 0, Frame = 0;
+			double Game = 0;
+			double Gpu = 0; int32 GpuN = 0; float MaxGpu = 0.f;
+			double Dispatch = 0, Submit = 0, Apply = 0, Applies = 0;
+			float MaxSubmit = 0.f, MaxDispatch = 0.f, MaxApply = 0.f;
 			int32 N = 0;
 			void Add(const FFrameSample& F)
 			{
 				Tick += F.VoxelTickMs; Render += F.RenderMs; RenderWait += F.RenderWaitMs;
-				RHI += F.RHIMs; GameWait += F.GameWaitMs; Frame += F.FrameMs; ++N;
+				RHI += F.RHIMs; GameWait += F.GameWaitMs; Frame += F.FrameMs;
+				Game += F.GameMs;
+				// Valid samples only: -1 is "no clock", and averaging it in
+				// would drag every bucket toward a number that means nothing.
+				if (F.GpuMs >= 0.f) { Gpu += F.GpuMs; ++GpuN; MaxGpu = FMath::Max(MaxGpu, F.GpuMs); }
+				Dispatch += F.DispatchMs; Submit += F.SubmitMs; Apply += F.ApplyMs;
+				Applies += double(F.Applies);
+				MaxSubmit = FMath::Max(MaxSubmit, F.SubmitMs);
+				MaxDispatch = FMath::Max(MaxDispatch, F.DispatchMs);
+				MaxApply = FMath::Max(MaxApply, F.ApplyMs);
+				++N;
 			}
 			double M(double V) const { return N > 0 ? V / double(N) : 0.0; }
+			double MGpu() const { return GpuN > 0 ? Gpu / double(GpuN) : -1.0; }
 		};
-		FAccum Fast, Slow;
+		FAccum Fast, Slow, Tail;
 		for (const FFrameSample& F : FrameSamples)
 		{
 			if (F.FrameMs <= P50) { Fast.Add(F); }
 			else if (F.FrameMs >= P95) { Slow.Add(F); }
+			if (F.FrameMs >= P99) { Tail.Add(F); }
 		}
 
+		// THE POPULATION IS NAMED ON THE LINE. mode=1 pools cold fill with
+		// flight and its percentiles describe loading; mode=2 is settled-moving
+		// only. A reader who cannot tell which one produced a row will
+		// eventually quote the wrong one, and on this project that has already
+		// happened twice with this exact statistic.
+		const int32 AttrMode = VoxelDebug::GetStreamFrameAttribution();
+
+		// THE GPU CLOCK'S OWN ARM-CHECK, PRINTED BEFORE ANY gpu= FIGURE.
+		//
+		// A statistic that cannot come out the other way is not a measurement,
+		// and gpu=0.00 from a clock that never ran looks exactly like a GPU
+		// that did no work. So this line says which of the two it is, out loud,
+		// on every window -- and the FALSIFIER is stated with it so the reader
+		// does not have to remember it: the parked GPU frame on this project is
+		// ~5.8 ms (marcher 3.169 of 5.842). A FAST-bucket gpu= far below that,
+		// or samples=0, means this is NOT measuring the GPU and every gpu=
+		// number below must be discarded rather than interpreted.
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel frame attribution (%d frames): p50=%.2f p95=%.2f | "
-		            "FAST(n=%d) frame=%.2f tick=%.2f render=%.2f renderWait=%.2f rhi=%.2f gameWait=%.2f"),
-		       FrameSamples.Num(), P50, P95, Fast.N, Fast.M(Fast.Frame), Fast.M(Fast.Tick),
-		       Fast.M(Fast.Render), Fast.M(Fast.RenderWait), Fast.M(Fast.RHI), Fast.M(Fast.GameWait));
+		       TEXT("Voxel frame attribution GPU-CLOCK samples=%lld %s -- falsifier: FAST gpu= must land near "
+		            "the ~5.8 ms parked GPU frame; samples=0 or a near-zero mean = NOT MEASURING, discard gpu="),
+		       (long long)GpuSamplesSeen,
+		       GpuSamplesSeen > 0 ? TEXT("ARMED (FRHIGPUFrameTimeHistory is publishing)")
+		                          : TEXT("*** DEAD -- no end-of-pipe timing ever arrived ***"));
+
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel frame attribution SLOW(n=%d) frame=%.2f tick=%.2f render=%.2f renderWait=%.2f "
-		            "rhi=%.2f gameWait=%.2f"),
+		       TEXT("Voxel frame attribution mode=%d pop=%s (%d frames): p50=%.2f p95=%.2f p99=%.2f max=%.2f | "
+		            "FAST(n=%d) frame=%.2f tick=%.2f render=%.2f renderWait=%.2f rhi=%.2f gameWait=%.2f "
+		            "gameMs=%.2f gameAcct=%.2f gpu=%.2f dispatch=%.2f submit=%.2f apply=%.2f appl=%.1f"),
+		       AttrMode,
+	       AttrMode == 1 ? TEXT("ALL-FRAMES-INCL-COLD-FILL")
+	                     : (AttrMode == 3 ? TEXT("SETTLED-PARKED") : TEXT("SETTLED-MOVING")),
+		       FrameSamples.Num(), P50, P95, P99, MaxMs,
+		       Fast.N, Fast.M(Fast.Frame), Fast.M(Fast.Tick),
+		       Fast.M(Fast.Render), Fast.M(Fast.RenderWait), Fast.M(Fast.RHI), Fast.M(Fast.GameWait),
+		       Fast.M(Fast.Game), Fast.M(Fast.Game) + Fast.M(Fast.GameWait),
+	       Fast.MGpu(),
+	       Fast.M(Fast.Dispatch), Fast.M(Fast.Submit), Fast.M(Fast.Apply), Fast.M(Fast.Applies));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel frame attribution SLOW(n=%d, >=p95) frame=%.2f tick=%.2f render=%.2f renderWait=%.2f "
+		            "rhi=%.2f gameWait=%.2f gameMs=%.2f gameAcct=%.2f gpu=%.2f dispatch=%.2f submit=%.2f apply=%.2f appl=%.1f | "
+		            "maxDispatch=%.2f maxSubmit=%.2f maxApply=%.2f maxGpu=%.2f"),
 		       Slow.N, Slow.M(Slow.Frame), Slow.M(Slow.Tick), Slow.M(Slow.Render),
-		       Slow.M(Slow.RenderWait), Slow.M(Slow.RHI), Slow.M(Slow.GameWait));
+		       Slow.M(Slow.RenderWait), Slow.M(Slow.RHI), Slow.M(Slow.GameWait),
+		       Slow.M(Slow.Game), Slow.M(Slow.Game) + Slow.M(Slow.GameWait),
+	       Slow.MGpu(),
+	       Slow.M(Slow.Dispatch), Slow.M(Slow.Submit), Slow.M(Slow.Apply), Slow.M(Slow.Applies),
+		       Slow.MaxDispatch, Slow.MaxSubmit, Slow.MaxApply, Slow.MaxGpu);
+		// THE p99 BUCKET IS THE GATE'S OWN POPULATION. Printed separately from
+		// SLOW because ">=p95" is ~5% of frames and ">=p99" is ~1%, and a term
+		// that only fires in the worst 1% is diluted 5x in the p95 row.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel frame attribution TAIL(n=%d, >=p99) frame=%.2f tick=%.2f render=%.2f renderWait=%.2f "
+		            "rhi=%.2f gameWait=%.2f gameMs=%.2f gameAcct=%.2f gpu=%.2f dispatch=%.2f submit=%.2f apply=%.2f appl=%.1f | "
+		            "maxDispatch=%.2f maxSubmit=%.2f maxApply=%.2f maxGpu=%.2f"),
+		       Tail.N, Tail.M(Tail.Frame), Tail.M(Tail.Tick), Tail.M(Tail.Render),
+		       Tail.M(Tail.RenderWait), Tail.M(Tail.RHI), Tail.M(Tail.GameWait),
+		       Tail.M(Tail.Game), Tail.M(Tail.Game) + Tail.M(Tail.GameWait),
+	       Tail.MGpu(),
+	       Tail.M(Tail.Dispatch), Tail.M(Tail.Submit), Tail.M(Tail.Apply), Tail.M(Tail.Applies),
+		       Tail.MaxDispatch, Tail.MaxSubmit, Tail.MaxApply, Tail.MaxGpu);
 		// The deciding line: which component actually differs. A component whose
 		// delta is a small fraction of the frame delta is NOT the tail, however
 		// large it is in absolute terms -- that mistake has already been made
 		// once here with the streaming tick.
+		//
+		// AND THE GAME-THREAD TERMS CARRY A SECOND HURDLE THE RENDER TERMS DO
+		// NOT. On a RENDERBOUND frame the game thread is already idle for most
+		// of it -- TJDL-A's settled-moving mean is gameWait=6.29 ms of a 9.67 ms
+		// frame, 65% -- so a game-thread term must first consume that slack
+		// before it adds one millisecond to frame time. dispatch/submit/apply
+		// rising by less than the FAST bucket's gameWait moves nothing. Read
+		// dGameWait alongside them: if it FALLS as the game-thread terms rise,
+		// the work is being absorbed by slack and is not the tail.
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel frame attribution DELTA (slow-fast): frame=%+.2f | tick=%+.2f render=%+.2f "
-		            "renderWait=%+.2f rhi=%+.2f gameWait=%+.2f"),
+		            "renderWait=%+.2f rhi=%+.2f gameWait=%+.2f gameMs=%+.2f gpu=%+.2f dispatch=%+.2f submit=%+.2f apply=%+.2f "
+		            "appl=%+.1f | fastGameWaitSlackMs=%.2f"),
 		       Slow.M(Slow.Frame) - Fast.M(Fast.Frame), Slow.M(Slow.Tick) - Fast.M(Fast.Tick),
 		       Slow.M(Slow.Render) - Fast.M(Fast.Render),
 		       Slow.M(Slow.RenderWait) - Fast.M(Fast.RenderWait),
-		       Slow.M(Slow.RHI) - Fast.M(Fast.RHI), Slow.M(Slow.GameWait) - Fast.M(Fast.GameWait));
+		       Slow.M(Slow.RHI) - Fast.M(Fast.RHI), Slow.M(Slow.GameWait) - Fast.M(Fast.GameWait),
+		       Slow.M(Slow.Game) - Fast.M(Fast.Game),
+	       (Slow.MGpu() >= 0.0 && Fast.MGpu() >= 0.0) ? Slow.MGpu() - Fast.MGpu() : 0.0,
+	       Slow.M(Slow.Dispatch) - Fast.M(Fast.Dispatch),
+		       Slow.M(Slow.Submit) - Fast.M(Fast.Submit),
+		       Slow.M(Slow.Apply) - Fast.M(Fast.Apply),
+		       Slow.M(Slow.Applies) - Fast.M(Fast.Applies),
+		       Fast.M(Fast.GameWait));
 	}
 
 	UE_LOG(LogVoxelPerf, Log,
@@ -12243,10 +12813,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		const double TimedApplies = double(FMath::Max<int64>(1, AppliesTimedSinceLog));
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel apply stages (window): exit queueEmpty=%lld wallClock=%lld countCap=%lld drainCap=%lld ")
+		       // THE LIVE BUDGET, ON EVERY WINDOW, AND IT EXISTS BECAUSE THE
+		       // ONCE-ONLY `Voxel apply caps:` LINE CANNOT PROVE ENGAGEMENT.
+		       // That line is emitted from the first DrainResults on frame 0,
+		       // BEFORE -ExecCmds has applied anything, so a swept cvar always
+		       // reads as its compiled default there: the 2026-08-27
+		       // ApplyBudgetMs sweep printed "budgetMs=6.00 (cvar 6.00)" on the
+		       // 4.0 and 3.0 arms and looked like a dead switch. Worse, the
+		       // exit counters could not settle it either -- the budget binds
+		       // 0.1% of the time (wallClock 25-34 against queueEmpty ~27,900),
+		       // so "lowering it changed nothing" is what BOTH a non-binding
+		       // budget and an unapplied cvar look like. A sweep whose arms
+		       // cannot be told apart from a no-op is not a measurement.
+		       TEXT("| budgetMs=%.2f (cvar %.2f) maxApplies=%d ")
 		       TEXT("| timedApplies=%lld pack=%.2fms params=%.2fms poolAdd=%.2fms ")
 		       TEXT("| per-apply pack=%.3f params=%.3f poolAdd=%.3f"),
 		       (long long)DrainExitQueueEmptySinceLog, (long long)DrainExitWallClockSinceLog,
 		       (long long)DrainExitCountCapSinceLog, (long long)DrainExitDrainCapSinceLog,
+		       VoxelDebug::GetStreamApplyBudgetMs(), VoxelDebug::GetStreamApplyBudgetMsCvar(),
+		       VoxelDebug::GetStreamMaxAppliesPerFrame(),
 		       (long long)AppliesTimedSinceLog,
 		       ApplyStagePackMs, ApplyStageParamsMs, ApplyStagePoolAddMs,
 		       ApplyStagePackMs / TimedApplies, ApplyStageParamsMs / TimedApplies,
@@ -12709,6 +13294,72 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       (unsigned long long)U.GpuCellsWritten,
 			       (unsigned long long)U.GpuCellsCleared,
 			       U.GpuFellBackPendingCpu, U.GpuLostNoBuffer);
+
+			// THE anySolid REFINE (voxel.March.IndexAnySolid), AND THE TWO
+			// NUMBERS THAT MUST BE READ TOGETHER.
+			//
+			// dispatches=0 with the cvar on is THE PASS NEVER RAN, and every
+			// other word on this line is then an absence rather than a zero.
+			// Same for samples=0: the readback ring never landed one, so
+			// cleared and wrongClear are unmeasured, not clean.
+			//
+			// cleared is the prize -- index cells the GPU proved are air and
+			// downgraded, which is what finally makes VoxelBrickTraverse.ush's
+			// never-taken skip fire. Cross-check it against the marcher's own
+			// census: cellIndexEmpty (voxel.March.HoleStats 1) has read EXACTLY
+			// ZERO on every leg ever run, so its leaving zero is the
+			// independent, ray-side proof of engagement. cleared>0 with
+			// cellIndexEmpty still 0 means the bits are being cleared on cells
+			// no ray reads, and the win is not where this line says it is.
+			//
+			// wrongClear IS A HOLE COUNT AND IT OUTRANKS EVERYTHING ELSE ON
+			// THE LEG. Non-zero means the marcher is skipping chunks the
+			// record proves have solid content -- ground deleted, silently,
+			// and NOT visible in `uncovered` (25% is normal there; it is not
+			// an arc detector). Read it against checked: wrongClear=0 over
+			// checked=0 is an audit that did not run, which is exactly the
+			// confirmation-that-cannot-fail shape this project keeps paying
+			// for. The expected reading is wrongClear=0 over a checked count
+			// in the tens of thousands per flush.
+			//
+			// refused/casLost/inconsistent are the conservative bails and are
+			// EXPECTED to be non-zero; every one of them left the bit SET,
+			// which is the safe direction. inconsistent specifically means a
+			// record whose anySolid flag said air over a NON-empty L1 brick
+			// mask -- a contradiction the storage should not be able to
+			// produce, so a steadily growing count there is a producer bug
+			// worth chasing even though it costs no correctness here.
+			if (U.RefineDispatches != 0 || U.AuditChecked != 0)
+			{
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march index anySolid (cumulative): dispatches=%llu "
+				            "samples=%llu | examined=%llu cleared=%llu alreadyClear=%llu "
+				            "leftSolid=%llu noMatch=%llu refused=%llu casLost=%llu | AUDIT "
+				            "checked=%llu wrongClear=%llu"),
+				       (unsigned long long)U.RefineDispatches,
+				       (unsigned long long)U.RefineStatsSamples,
+				       (unsigned long long)U.RefineExamined,
+				       (unsigned long long)U.RefineCleared,
+				       (unsigned long long)U.RefineAlreadyClear,
+				       (unsigned long long)U.RefineLeftSolid,
+				       (unsigned long long)U.RefineNoMatch,
+				       (unsigned long long)U.RefineRefused,
+				       (unsigned long long)U.RefineCasLost,
+				       (unsigned long long)U.AuditChecked,
+				       (unsigned long long)U.AuditWrongClear);
+				if (U.AuditWrongClear != 0)
+				{
+					UE_LOG(LogVoxelPerf, Error,
+					       TEXT("Voxel march index anySolid: wrongClear=%llu over checked=%llu "
+					            "-- the marcher is skipping chunks whose record says SOLID. "
+					            "This is deleted ground and it outranks every performance "
+					            "number on this leg. Expected ONLY on a "
+					            "voxel.March.IndexAnySolidPoison leg, where it is the red "
+					            "arm passing."),
+					       (unsigned long long)U.AuditWrongClear,
+					       (unsigned long long)U.AuditChecked);
+				}
+			}
 		}
 
 		UE_LOG(LogVoxelPerf, Log,
@@ -25017,6 +25668,14 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 	// extra entry scan of that level on the next tick.
 	for (const FVoxelChunkKey& Level0Chunk : DirtyLevel0Chunks)
 	{
+		// THE MARCHER'S HEIGHT PYRAMID, RAISED IN THE SAME LOOP AND BEFORE THE
+		// CHANGE TEST BELOW. Unconditional on purpose: the test below fires only
+		// when the footprint's max-Z CHANGES, which is the right rule for a
+		// streaming rescan and the wrong one here -- a re-edit at the same chunk
+		// Z after a refill lowered the cell back to the analytic bound would be
+		// skipped, and the marcher would prove air where the player just built.
+		// Raising a cell that is already high enough costs one compare.
+		NoteHeightPyramidEdit(Level0Chunk.X, Level0Chunk.Y, Level0Chunk.Z);
 		int32& MaxZ = EditedFootprintMaxZ[0].FindOrAdd(FIntPoint(Level0Chunk.X, Level0Chunk.Y), MIN_int32);
 		// ...and the mirror, for the all-solid admission skip's edit veto and
 		// the downward escape hatch.

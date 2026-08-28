@@ -155,6 +155,47 @@ namespace
 			// 3957 ms / 58, async 5834 ms / 77. Severity, frames >= 200 ms: baseline 10,
 			// this fix 1, async 4. The game-thread number alone would have sold async;
 			// summing the hitch time is what refuted it.
+			//
+			// WHERE THE RESIDUAL LANDS, AND IT IS NOT THE TAIL (2026-08-26,
+			// TJDL-A-control.log, flag-free shipping default). This budget was
+			// re-opened on the theory that its remaining freeze -- a hitch frame
+			// of dispatchMs=117.18 of which submitMs=116.32 -- was the settled
+			// -MOVING tail. IT IS NOT, and the leg says so three ways:
+			//
+			//   * EVERY dispatch line on that leg with submitMs above 4 ms is
+			//     timestamped 13:04:11.77 .. 13:04:14.27. The settle BOUNDARY is
+			//     13:04:17.87. All of them are FILL frames.
+			//   * The five post-settle dispatch lines carry submitMs = 0.00 /
+			//     0.02 / 0.00 / 0.05 / 0.00.
+			//   * Post-settle this atlas spends 943 ms of game thread TOTAL over
+			//     130 windows (fill 734.3 + demand 209.0), against a settled
+			//     -moving population of 12,638 frames whose excess mass above p50
+			//     is >= 3,850 ms -- and the game thread on those frames is
+			//     already idle 6.29 ms of 9.67 (RENDERBOUND), so a game-thread
+			//     term buys nothing until it exceeds that slack.
+			//
+			// THE READING THAT MISLED, so it is not repeated: `Hitch frame
+			// dispatch` only prints above 33.3 ms, and the settled-moving tail is
+			// p95=15.20 / p99=19.60 -- entirely UNDER that bar. Grepping submitMs
+			// off the hitch lines therefore cannot describe the tail at all; it
+			// can only ever describe the fill. Use
+			// voxel.Stream.FrameAttribution=2, which samples every settled-moving
+			// frame and carries submit with its MAX.
+			//
+			// So the residual here costs COLD START, not frame tail: the atlas
+			// spends ~1,464 ms of game thread (fill 781.3 + demand 682.6) inside
+			// a 6.1 s settle, i.e. ~24% of a settle whose standing target is
+			// < 5 s. That is the project this budget belongs to.
+			//
+			// AND THE CAP IS INERT AT 256: capHit=0 (lifetime 0) across the whole
+			// leg, and the demand path averages 1.29 pages per CALL (450 calls,
+			// 579 pages in its worst window) with a per-call maximum of 3.22. The
+			// freeze is the SUM of many one-page calls inside a single dispatch
+			// loop, not one call filling a column, so 256 is roughly 3x above any
+			// freeze that has occurred and never binds. Lowering it does not
+			// shorten the freeze proportionally -- it pushes chunks to the inline
+			// path, which is the capHit=1070/noAtlas=1070 failure at 64 recorded
+			// above. The lever is exhausted in both directions.
 			int32 V = 256;
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlasDemandPagesPerTick="), V);
 			return FMath::Max(0, V);
