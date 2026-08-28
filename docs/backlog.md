@@ -783,6 +783,21 @@ technique; the work is in doing it without breaking two things:
 2. **Judge it by eye, not by a metric.** This is a colour/appearance defect; the
    owner judges screenshots. Matched captures at a fixed pose across LOD bands.
 
+### 0.0c RESOLVED 2026-08-28 — the triangular LOD-ring gaps are gone; fallthrough default on
+
+**Owner's verdict, 2026-08-28: solved by turning fallthrough on by default.**
+Marcher fallthrough has been default-on since 2026-08-23
+(`VoxelWorldSubsystem.cpp:4098`, "Fallthrough is useless without it"), and the
+owner confirms the wedges are no longer present.
+
+Kept below, struck through in spirit rather than deleted, because the three
+REFUTED streaming hypotheses are still worth not re-running: skirt mask, coarse-
+ring starvation, and hierarchical coverage were each tested with matched legs and
+each came back null. The cause was in the MARCHER, not in streaming -- which is
+why every streaming explanation failed.
+
+<details><summary>Original entry (cause was elsewhere; hypotheses below are refuted)</summary>
+
 ### 0.0c Small black TRIANGULAR gaps at LOD ring boundaries — still open
 
 **Owner-reported 2026-08-23**, after this session's ring fixes: "your recent
@@ -1107,6 +1122,44 @@ Reaching 10 ms needs the primitive count itself down — 17.8M per pass, drawn
 twice — which points back at rendering distant rings as heightfield rather than
 voxel geometry.
 
+### 0.1b ANSWERED IN PART, 2026-08-28 — it is the FLOOR, not the tail; still unsplit by subsystem
+
+**The method this entry asked for has been run.** Its own three steps were: a
+per-frame time series rather than percentiles; establish whether slow frames are
+game-, render- or GPU-bound ("`renderMs` cannot answer this today: it is a HITCH
+field and only exists above the threshold"); then pick a fix. Steps 1 and 2 are
+done -- `voxel.Stream.FrameAttribution 2` samples every frame, and the first
+per-frame GPU clock this project has ever had went in on 2026-08-27.
+
+**The answer to "is it the tail": NO. It is the floor.** Pooled over 1.63M fast
+and 32.9k tail frames on the shipping default, 2560x1440:
+
+    bucket   frame   render  renderWait    rhi  gameWait  gameMs   gpu
+    PARKED    7.99     8.12       0.02    1.97      5.96    2.19   6.79
+    FAST      7.50     7.61       0.23    1.79      4.96    2.60   6.41
+    TAIL     19.70    11.30       3.14    6.11      4.82   16.71   8.39
+
+**Render-thread BUSY barely moves: 7.38 ms fast to 8.16 ms tail, +0.78.** What
+rises is `renderWait` (+2.91) and `rhi` (+4.32) -- the render thread waits more,
+it does not work more. At the tail `gameMs` 16.71 exceeds `render` 11.30 and
+`gpu` 8.39, so **the game thread is the critical path there** and this ~8 ms
+render block is not what makes a bad frame bad.
+
+**It IS the floor, and the floor is what blocks >100 fps.** Parked reads
+frame 7.99 / render 8.12 / gpu 6.79 with a near-idle game thread -- a ~125 fps
+ceiling with zero terrain streaming. Goal 3a (<10 ms p95) cannot be reached by
+tail work alone once the tail is fixed; this block sets the bar.
+
+**WHAT IS STILL OPEN, and it is the original question narrowed:** the block has
+NOT been split by subsystem. The 2026-08-27 GPU split decomposed the RISE to p95
+(streaming 73%, marcher 20%, draw path negative) but was framed against SLOW and
+says nothing about the 6.79 ms parked GPU floor or the 8.12 ms parked render
+thread. **The next step is one leg: the same `-csvGpuStats` + per-pass
+`GPU/<name>` decomposition run on a PARKED leg**, which would name the floor the
+same way the tail was named. `tools/csv-gpu-attrib.py` already reads it.
+
+<details><summary>Original entry</summary>
+
 ### 0.1b NEW P0 — What is the other ~9.5 ms?
 
 The largest single unexplained block in the frame, and **bigger than everything
@@ -1146,7 +1199,36 @@ the difference between the stated goal being met and not.
 
 ---
 
-### 0.2 P1 — Occlusion culling
+### 0.2 RETIRED 2026-08-28 — MOOT under the marcher. Do not build this.
+
+**This was scoped entirely against the QUAD path and that path no longer draws
+the terrain.** The entry's own numbers say so: "17.8M primitives submitted per
+pass, TWICE per frame", "the whole pool is one primitive with one draw call".
+Under `voxel.March 1` the terrain is not primitives at all -- it is a ray march,
+and `quads=0` on every leg. **A ray terminates at the first hit, so occluded
+geometry costs exactly nothing. Occlusion culling is inherent to the renderer
+that replaced the one this was designed for.**
+
+**And the measurement agrees, which is the part that retires it rather than just
+arguing it away.** The 2026-08-27 GPU split (`docs/gpu-tail-split-2026-08-27.md`)
+decomposed every term of the GPU's rise from a typical frame to p95 across two
+legs: streaming 73%, marcher 20%, and **the entire draw path -0.11 / -0.10 ms --
+NEGATIVE.** There is no draw-path cost to reclaim on the frames that are slow.
+
+**What replaced it.** The marcher's analogue of occlusion culling is EMPTY-SPACE
+SKIPPING, and that programme has been run and is largely exhausted: `anySolid`
+shipped (-0.13 ms), the height pyramid was built and RETIRED (479 missed rays),
+ZCut was refuted for the horizon (0.00% of 3.3e9 decisions at pitch -10). See
+[[voxelsim-marcher-cost-is-ray-count]] -- marcher cost is ray-count linear within
+2% and per-ray cost is immovable, so the lever is ray count and geometry
+visibility is not one of its terms.
+
+**The one part that is NOT moot:** `AVoxelClipmapActor` (the 30 km heightfield)
+and water are still real geometry. But the draw path measures negative, so
+culling them would be optimising a term that does not rise. If that ever changes,
+re-open against a measurement rather than against this entry.
+
+<details><summary>Original scoping (kept for the horizon-culling analysis, which was sound for the quad path)</summary>
 
 **Designed, not started. The largest remaining frame-time lever that costs no
 visual quality.**
