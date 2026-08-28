@@ -583,3 +583,21 @@ the worst frame, not the gate; the visual trade is his to judge in flight.
 - `anySolid` (`voxel.March.IndexAnySolid`) still DEFAULTS 0
   (`VoxelMarchChunkIndex.cpp:289`): it was measured parked (-0.13 ms) and
   committed but NEVER ARMED. The backlog line that said "shipped" is corrected.
+
+---
+
+## 2026-08-28 (owner decisions, end of the two-chain day)
+
+**GOAL 2 (50,000 chunks/s) IS RETIRED. Owner decision, in his words: "Retire 50k."**
+Grounds: every knob on the ladder measured (apply cap released and throughput fell;
+pass-free a regression; batch caps worse at every raised value), the producer wall is
+~8-10k/s and reaching 50k means a producer redesign, while the things throughput
+exists to serve are healthy -- cold settle 5.5 s against the <=5 s goal (which STAYS),
+flight supply 99%-hit speculation with zero waste, and `resurrected=0` (no churn).
+docs/throughput-ladder-2026-08-28.md is the evidence file.
+
+**GOAL 3 IS REAFFIRMED AT >100 FPS. Owner decision: "Go over 100 FPS."** With the
+traversal path exhausted (five refuted approaches + the bound arm retired at
+docs/bound-arm-retired-2026-08-28.md), the governing lever is RAY COUNT / internal
+resolution, traded against image quality judged from pinned captures -- the owner is
+judging stills, not editor flights, for now. Programme: docs/hundred-fps-2026-08-28.md.
