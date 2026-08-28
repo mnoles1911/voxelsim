@@ -78,3 +78,68 @@ mountain, and the timing inverted to +3.1% once the image was honest.
 
 Default stays 1. The next two steps, in order: matched captures once the lib
 question is resolved, then `-VoxelGpuBandColdOnly=1` for the band itself.
+
+---
+
+# Part 2: with the band actually removed
+
+The fix above (commit 17f0245) made the band request ask whether a consumer
+exists. Re-run, four legs, alternated, same protocol, on the rebuilt binary.
+
+## ENGAGEMENT, first, because the previous two sweeps failed here
+
+    control      kept=31,650  (band 31,650)
+    skip off     kept=0       (band 0)        <- every mesh-region graph now lean
+
+Both off legs read exactly zero, from 31,650. **This is the first arm in three
+sweeps that actually removed the band.**
+
+## Result
+
+    arm                    p50             p95             p99            max
+    control            9.16 (109.2)   13.51 (74.0)   17.57 (56.9 fps)  139.8
+    -VoxelBuriedSkip=0 8.49 (117.8)   11.96 (83.6)   14.28 (70.1 fps)  123.7
+
+**p99 -3.29 ms, 56.9 -> 70.1 fps. p95 -1.55 ms. p50 -0.67 ms.** Every percentile
+moves, which is what removing real work looks like. Worst frame 139.8 -> 123.7.
+
+Per-leg, within-arm spread 0.11-0.19 ms against a 3.3 ms gap:
+
+    control  p99 17.66 / 17.47      skip off  p99 14.33 / 14.22
+
+**The band was worth ~2.1 ms of p99 on its own.** Part 1 (skip off, band still
+computed) reached 16.41; this reaches 14.28.
+
+## It is a TRADE, and the trade is now visible
+
+    bucket        ctl gpu   off gpu      ctl game   off game    ctl chunks  off chunks
+    TAIL            13.50      8.36         13.41      17.26          52.4        67.9
+
+**GPU -5.14 ms, game thread +3.85 ms.** Removing the band takes a large block off
+the GPU; losing the buried skip puts more chunks through the game thread. The net
+is strongly positive because the GPU was the p95 driver -- but note what it does
+to the shape: at the tail the game thread is now 17.26 ms against 8.36 ms of GPU.
+**This arm does not just make the frame faster, it moves the bottleneck.** Any
+further work should be planned against the new shape, not this table's control.
+
+**The two halves are coupled by design** -- the band IS what the skip consumes --
+so they cannot currently be taken separately. Whether the skip can be served by
+something cheaper than a GPU reduce plus a readback fence is the open question,
+and it is now worth asking: the skip's own value was measured at ~1% of loads.
+
+## The image: still not verified, and the case for it is now stronger
+
+    metric              control    skip off
+    chunks loaded        47,623     61,314    +28.7%
+    chunks tracked       79,246     79,281    +0.04%
+
+**The resident set is the same world.** The off arm churns 28.7% more loads across
+the flight and ends holding the same tracked chunks. That is a good argument and
+it is still an instrument, not a picture.
+
+`tools/voxel-capture.ps1` continues to refuse while `voxelcore.lib` is behind
+another session's `brickpack.h`. **Default stays 1.** A +13 fps p99 is exactly the
+size of result that this project has previously been wrong about -- the "-7.6%
+win" that was the marcher deleting a mountain inverted to +3.1% once the image was
+honest -- and the direction here (more chunks, not fewer) is the safe one but not
+a proof.
