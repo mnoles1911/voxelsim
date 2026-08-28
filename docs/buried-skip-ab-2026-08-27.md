@@ -204,3 +204,39 @@ GPU, the unskipped chunks arrive on the game thread. The tail is now **17.26 ms
 of game thread against 8.36 ms of GPU**. Everything in
 `docs/p99-game-thread-split.md` that pointed at the game thread now points harder
 -- and `submit`, already 86% of the dispatch rise, is the first place to look.
+
+---
+
+# Part 4: the flip verified ON THE DEFAULT, role-reversed
+
+A default that has only ever been tested by passing a flag is a default nobody
+has tested. So the arms were swapped: the control is now the shipped default with
+NO arguments, and `-VoxelBuriedSkip=1` is the arm that restores the old
+behaviour.
+
+    arm                      kept       p50            p95            p99            max
+    new default (no flags)      0   8.47 (118.0)  11.95 (83.7)  14.29 (70.0)    76.3
+    -VoxelBuriedSkip=1     31,600/  9.09 (110.0)  13.52 (74.0)  17.35 (57.7)   122.4
+                           31,673
+
+**The effect followed the FLAG across the swap, not the arm position.** That is
+what rules out a harness-side bias -- a script that made its second arm slower
+for any reason of its own would have produced the opposite table here.
+
+**It reproduces on a different binary to within 0.01 ms at p99** (14.29 against
+the 14.28 measured before the default moved), and the old behaviour reproduces to
+0.22 ms (17.35 against 17.57).
+
+**Worst frame 122.4 -> 76.3 ms**, the lowest max recorded on this flight profile.
+The earlier pair read 139.8 -> 123.7; the max is a single-sample statistic and
+moves around, so read the direction and not the value.
+
+## Standing result
+
+    p50   8.47 ms   118.0 fps
+    p95  11.95 ms    83.7 fps
+    p99  14.29 ms    70.0 fps      owner gate: 1% low >= 50 fps -- MET, +20 fps
+    max  76.3 ms
+
+Against the older ">100 fps steady at 20 m/s" target: p50 passes, p95 and p99 do
+not.
