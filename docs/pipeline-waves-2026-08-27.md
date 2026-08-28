@@ -2,6 +2,57 @@
 
 Owner-accepted. Build against this. Short on purpose.
 
+> **REVISED LATE 2026-08-27, after the GPU clock and the pooled attribution landed.**
+> The premise below ("only Wave 2 moves the goal") was written when the tail was
+> believed to be one thing. It is two. Read this box first; the waves below are kept
+> because their measurements stand, but their framing is superseded.
+>
+> **WHERE THE GOAL ACTUALLY STANDS.** Pooled over 3,059,356 settled-moving frames on
+> five control legs, at 2560x1440:
+>
+>     p50   9.10 ms = 110 fps
+>     p95  13.67 ms =  73 fps
+>     p99  17.57 ms =  57 fps     <- the owner's stated gate is 50 fps 1% low
+>
+> **The 1% low >= 50 fps gate is being MET, by 6.9 fps.** What still fails is the older
+> ">100 fps steady at 20 m/s" target, at p95 and p99. Those are different bars and the
+> difference should be a deliberate decision, not an accident of which doc was open.
+>
+> **THE TAIL HAS TWO REGIMES AND THEY HAVE DIFFERENT OWNERS.**
+>
+>     FAST -> SLOW (p95)   gpu +5.48   game +4.07     GPU-LED
+>     SLOW -> TAIL (p99)   gpu +0.91   game +5.41     GAME THREAD ONLY
+>
+> The GPU saturates near 13 ms and stops. So GPU work buys p95 and cannot buy p99, and
+> a p99-framed GPU claim is attributing a step the GPU does not take.
+> Full tables: `docs/p99-game-thread-split.md`, `docs/gpu-tail-split-2026-08-27.md`.
+> Reproduce with `tools/attribution-pool.sh`.
+>
+> **THE p95 STEP IS FULLY ATTRIBUTED.** Nothing in the GPU frame is unnamed any more:
+> streaming 73%, marcher 20%, unaccounted 5%, draw path NEGATIVE. The largest single
+> block is **the band: +2.51 ms, 43% of the whole GPU rise**, spread across three
+> terms (`RgBand` + `RgColumn` + `RgVoxelize`) that exist for one reason -- mesh-region
+> graphs are kept `because: quads 0, band 31671, noPack 0`. One flag removes all three.
+> **`tools/voxel-buriedskip-ab.ps1` is the A/B and it can come out either way**: the
+> band buys the buried-chunk skip, so turning it off means meshing more chunks.
+>
+> **THE p99 STEP IS 77% THE VOXEL TICK**, and inside it: dispatch +3.09 of which
+> `submit` is 86%, apply +0.23, remesh 0.00, unload +0.15 -- leaving **+3.35 ms of
+> `other` inside the tick that is now measured and still unnamed**. `submit` itself has
+> a six-way split already implemented as window counters (`Voxel gpu submit split`),
+> dominated by `reqHdr` at ~65%; carrying that split per-frame is the open instrument.
+>
+> **RETIRED TONIGHT, with proof, do not re-open:** async raster-atlas fill (moves 85%
+> of fill off the game thread and is WORSE -- it spreads the stall: hitch time 3957 ->
+> 5834 ms, frames >=200 ms 1 -> 4); seed-only band (`dup=0 redundant=0` on BOTH arms --
+> the legacy path already emitted the seed-only population); brick-pool publication as
+> a tail term (<=1.2 ms per 2 s WINDOW).
+>
+> **A COUNTER TRAP WORTH THE LINE:** `wlcols conv=483,014 fb=387` reads as 99.9%
+> converted, but 31,636 kept graphs are called with no column feed, so 6.5% of jobs
+> still run the classic path -- that is the +1.05 ms. The counter is honest about
+> worklist RECORDS and was read as if it covered CALLS.
+
 ## The one thing to know before picking work
 
 **Only Wave 2 moves the frame-rate goal.** Everything else buys headroom.
