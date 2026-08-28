@@ -6819,6 +6819,20 @@ struct FVoxelWorldImpl
 	float SubPoolMs = 0.f;    // direct-to-pool decision incl. GI probe
 	float SubMgrMs = 0.f;     // Manager->Submit + GpuJobsPending insert
 	float SubTotalMs = 0.f;   // whole SubmitGpuMeshJob wall, fn side
+	// THE SIXTH SIBLING, WHICH THE TICK-STAGES SPLIT WAS MISSING. The window
+	// line has always listed recompute alongside dispatch/apply/remesh/unload;
+	// the per-frame split listed only the last five, so RecomputeDesiredSet fell
+	// into `other` -- and `other` is the largest term in the tail tick (4.64 ms
+	// against dispatch's 4.76). A residual that big is a missing field, not a
+	// mystery.
+	float RecomputeMs = 0.f;
+	// ... and its own four, all NESTED INSIDE it: recompute brackets
+	// RecomputeT0..SortT1, which spans every one of these. They are a
+	// subdivision of RecomputeMs and must never be added to it.
+	float FineResidMs = 0.f;
+	float ExitScanMs = 0.f;
+	float QueueFilterMs = 0.f;
+	float SortMs = 0.f;
 		// THE REST OF THE TICK. dispatch + apply accounted for less than half of
 		// the p99 tick rise and the remainder had no field to live in, so it read
 		// as unattributable rather than as remesh/unload/brick-flush. These three
@@ -6901,6 +6915,11 @@ struct FVoxelWorldImpl
 	float PrevTickSubPoolMs = 0.f;
 	float PrevTickSubMgrMs = 0.f;
 	float PrevTickSubTotalMs = 0.f;
+	float PrevTickRecomputeMs = 0.f;
+	float PrevTickFineResidMs = 0.f;
+	float PrevTickExitScanMs = 0.f;
+	float PrevTickQueueFilterMs = 0.f;
+	float PrevTickSortMs = 0.f;
 	int32 PrevTickApplies = 0;
 
 	int64 SpecParkedSinceLog = 0;
@@ -10776,6 +10795,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		Sample.SubPoolMs    = PrevTickSubPoolMs;
 		Sample.SubMgrMs     = PrevTickSubMgrMs;
 		Sample.SubTotalMs   = PrevTickSubTotalMs;
+		Sample.RecomputeMs  = PrevTickRecomputeMs;
+		Sample.FineResidMs  = PrevTickFineResidMs;
+		Sample.ExitScanMs   = PrevTickExitScanMs;
+		Sample.QueueFilterMs= PrevTickQueueFilterMs;
+		Sample.SortMs       = PrevTickSortMs;
 		Sample.Applies      = PrevTickApplies;
 		// NO DIRECT GPU TIME. It needs FRHIGPUFrameTimeHistory, a pull-based API
 		// with its own state, which is more plumbing than this pass warrants --
@@ -10847,6 +10871,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	PrevTickSubPoolMs    = ThisFrameSubPoolMs;
 	PrevTickSubMgrMs     = ThisFrameSubMgrMs;
 	PrevTickSubTotalMs   = ThisFrameSubTotalMs;
+	PrevTickRecomputeMs  = ThisFrameRecomputeMs;
+	PrevTickFineResidMs  = ThisFrameFineResidencyMs;
+	PrevTickExitScanMs   = ThisFrameExitScanMs;
+	PrevTickQueueFilterMs= ThisFrameQueueFilterMs;
+	PrevTickSortMs       = ThisFrameSortMs;
 	PrevTickApplies    = ThisFrameAppliesFromWorker;
 
 	if (FrameMs > 16.6f) // the actual 60fps gate bar (see TotalFramesOver60FpsBar)
@@ -12822,6 +12851,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			double Remesh = 0, Unload = 0, BrickFlush = 0;
 			double DAir = 0, DBand = 0, DPick = 0, DOverlay = 0, DLoop = 0, GpuMgr = 0;
 			double SReq = 0, SBand = 0, SRaster = 0, SAssets = 0, SPool = 0, SMgr = 0, STotal = 0;
+			double Recompute = 0, FineResid = 0, ExitScan = 0, QueueFilter = 0, Sort = 0;
+			float MaxRecompute = 0.f, MaxFineResid = 0.f, MaxExitScan = 0.f;
 			float MaxSRaster = 0.f, MaxSReq = 0.f;
 			float MaxDAir = 0.f, MaxDBand = 0.f, MaxDPick = 0.f, MaxDOverlay = 0.f, MaxGpuMgr = 0.f;
 			float MaxRemesh = 0.f, MaxUnload = 0.f, MaxBrickFlush = 0.f;
@@ -12850,6 +12881,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				SReq += F.SubReqHdrMs; SBand += F.SubBandMs; SRaster += F.SubRasterMs;
 				SAssets += F.SubAssetsMs; SPool += F.SubPoolMs; SMgr += F.SubMgrMs;
 				STotal += F.SubTotalMs;
+				Recompute += F.RecomputeMs; FineResid += F.FineResidMs;
+				ExitScan += F.ExitScanMs; QueueFilter += F.QueueFilterMs; Sort += F.SortMs;
+				MaxRecompute = FMath::Max(MaxRecompute, F.RecomputeMs);
+				MaxFineResid = FMath::Max(MaxFineResid, F.FineResidMs);
+				MaxExitScan = FMath::Max(MaxExitScan, F.ExitScanMs);
 				MaxSRaster = FMath::Max(MaxSRaster, F.SubRasterMs);
 				MaxSReq = FMath::Max(MaxSReq, F.SubReqHdrMs);
 				Applies += double(F.Applies);
@@ -12980,21 +13016,29 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// submit bracket inside the dispatch loop, where the raster-atlas fills
 		// land. It is printed on the rows above; adding it here would double-count.
 		{
+			// RECOMPUTE IS THE SIXTH SIBLING AND WAS MISSING FROM THIS SUM.
+			// The `Voxel tick budget` window line has always listed it beside
+			// dispatch/apply/remesh/unload; this per-frame split listed five, so
+			// RecomputeDesiredSet landed in `other` -- which then read 4.64 ms at
+			// the tail, larger than dispatch. A residual that large is a missing
+			// field, not a mystery. Its own four sub-stages are NESTED inside it
+			// (recompute brackets RecomputeT0..SortT1) and are reported on their
+			// own line below, never added here.
 			auto Other = [](const FAccum& A) -> double
 			{
-				return A.M(A.Tick) - (A.M(A.Dispatch) + A.M(A.Apply) + A.M(A.Remesh)
-				                      + A.M(A.Unload) + A.M(A.BrickFlush));
+				return A.M(A.Tick) - (A.M(A.Recompute) + A.M(A.Dispatch) + A.M(A.Apply)
+				                      + A.M(A.Remesh) + A.M(A.Unload) + A.M(A.BrickFlush));
 			};
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel frame attribution TICK-STAGES (mean ms; other = tick - the five, UNCLAMPED): ")
-			       TEXT("FAST tick=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f | ")
-			       TEXT("SLOW tick=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f | ")
-			       TEXT("TAIL tick=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f"),
-			       Fast.M(Fast.Tick), Fast.M(Fast.Dispatch), Fast.M(Fast.Apply), Fast.M(Fast.Remesh),
+			       TEXT("Voxel frame attribution TICK-STAGES (mean ms; other = tick - the SIX, UNCLAMPED): ")
+			       TEXT("FAST tick=%.2f recompute=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f | ")
+			       TEXT("SLOW tick=%.2f recompute=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f | ")
+			       TEXT("TAIL tick=%.2f recompute=%.2f dispatch=%.2f apply=%.2f remesh=%.2f unload=%.2f brickFlush=%.2f other=%.2f"),
+			       Fast.M(Fast.Tick), Fast.M(Fast.Recompute), Fast.M(Fast.Dispatch), Fast.M(Fast.Apply), Fast.M(Fast.Remesh),
 			       Fast.M(Fast.Unload), Fast.M(Fast.BrickFlush), Other(Fast),
-			       Slow.M(Slow.Tick), Slow.M(Slow.Dispatch), Slow.M(Slow.Apply), Slow.M(Slow.Remesh),
+			       Slow.M(Slow.Tick), Slow.M(Slow.Recompute), Slow.M(Slow.Dispatch), Slow.M(Slow.Apply), Slow.M(Slow.Remesh),
 			       Slow.M(Slow.Unload), Slow.M(Slow.BrickFlush), Other(Slow),
-			       Tail.M(Tail.Tick), Tail.M(Tail.Dispatch), Tail.M(Tail.Apply), Tail.M(Tail.Remesh),
+			       Tail.M(Tail.Tick), Tail.M(Tail.Recompute), Tail.M(Tail.Dispatch), Tail.M(Tail.Apply), Tail.M(Tail.Remesh),
 			       Tail.M(Tail.Unload), Tail.M(Tail.BrickFlush), Other(Tail));
 			// MAXES, for the same reason submitMs needed them: a stage that is zero
 			// on 99 frames in 100 and enormous on the hundredth has a mean that says
@@ -13009,6 +13053,40 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       Tail.M(Tail.BrickFlush) - Fast.M(Fast.BrickFlush), Other(Tail) - Other(Fast),
 			       Slow.MaxRemesh, Tail.MaxRemesh, Slow.MaxUnload, Tail.MaxUnload,
 			       Slow.MaxBrickFlush, Tail.MaxBrickFlush);
+
+			// RECOMPUTE-SPLIT. Its four sub-stages, all NESTED inside recompute
+			// (which brackets RecomputeT0..SortT1) -- so they are a subdivision of
+			// the recompute= field on the line above, NOT additional siblings, and
+			// adding them to the tick sum would double-count every one of them.
+			//
+			// rOther = recompute - the four. UNCLAMPED, same reason as everywhere
+			// else here: negative means the brackets overlap, which is a defect and
+			// should read as a sign rather than as a small positive number.
+			//
+			// MAXES FOR THE BIMODAL ONES. The window line shows recompute swinging
+			// 3.0 -> 406.1 ms between windows on one leg, so its mean is not a
+			// description of it. That is the same shape as submitMs, whose mean hid
+			// it for three separate investigations.
+			auto ROther = [](const FAccum& A) -> double
+			{
+				return A.M(A.Recompute) - (A.M(A.FineResid) + A.M(A.ExitScan)
+				                           + A.M(A.QueueFilter) + A.M(A.Sort));
+			};
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel frame attribution RECOMPUTE-SPLIT (mean ms; the four are NESTED INSIDE recompute, ")
+			       TEXT("not siblings of it; rOther = recompute - the four, UNCLAMPED): ")
+			       TEXT("FAST recompute=%.3f fineResid=%.3f exitScan=%.3f queueFilter=%.3f sort=%.3f rOther=%.3f | ")
+			       TEXT("SLOW recompute=%.3f fineResid=%.3f exitScan=%.3f queueFilter=%.3f sort=%.3f rOther=%.3f | ")
+			       TEXT("TAIL recompute=%.3f fineResid=%.3f exitScan=%.3f queueFilter=%.3f sort=%.3f rOther=%.3f | ")
+			       TEXT("maxRecompute fast=%.2f slow=%.2f tail=%.2f | maxFineResid tail=%.2f | maxExitScan tail=%.2f"),
+			       Fast.M(Fast.Recompute), Fast.M(Fast.FineResid), Fast.M(Fast.ExitScan),
+			       Fast.M(Fast.QueueFilter), Fast.M(Fast.Sort), ROther(Fast),
+			       Slow.M(Slow.Recompute), Slow.M(Slow.FineResid), Slow.M(Slow.ExitScan),
+			       Slow.M(Slow.QueueFilter), Slow.M(Slow.Sort), ROther(Slow),
+			       Tail.M(Tail.Recompute), Tail.M(Tail.FineResid), Tail.M(Tail.ExitScan),
+			       Tail.M(Tail.QueueFilter), Tail.M(Tail.Sort), ROther(Tail),
+			       Fast.MaxRecompute, Slow.MaxRecompute, Tail.MaxRecompute,
+			       Tail.MaxFineResid, Tail.MaxExitScan);
 
 			// ---- INSIDE dispatch, over the population that needed it ---------
 			//
