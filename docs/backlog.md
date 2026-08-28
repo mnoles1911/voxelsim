@@ -266,7 +266,19 @@ than inherit a number meant for buttons), or `TitleFontSize` comes down from 84.
 The first preserves the intended look; the second changes it. Owner's call.
 Nothing here should be tuned by arithmetic alone -- re-capture and look.
 
-### 0.0j Chunks admit LEFT-TO-RIGHT and FAR-BEFORE-NEAR — diagnosed, fix authored, NOT YET IN ANY BINARY
+### 0.0j Chunks admit LEFT-TO-RIGHT and FAR-BEFORE-NEAR — FIXED: `NearestAdmit` default ON since 2026-08-24
+
+**SUPERSEDED 2026-08-28 — the old status ("NOT YET IN ANY BINARY") went stale.**
+The fix IS in every shipping binary: `NearestAdmit` shipped default ON on
+2026-08-24 (`VoxelStreamAdmission::NearestAdmitEnabled`; the SCOREBOARD's
+2026-08-24 legs ran it as the default), and R0 settle improved 15.8 -> 12.7 s
+(**-20%**) at no fps cost. Chunks now admit nearest-first. `ViewBias` remains
+authored, default off, and still never feeds eviction. The standing instruction
+below — "do not treat a sighting of this symptom as the fix failing until a
+binary containing `-VoxelNearestAdmit` has actually been run" — is MOOT: every
+stock binary contains it, so a fresh sighting WOULD now be the fix failing and
+should be measured (`admMeanM R0..R6`, `nearestAdmit` counter), not argued.
+The diagnosis below is kept as history.
 
 Owner-reported twice, most recently 2026-08-23 while the fix was still in merge:
 *"chunks are still streaming and rendering in from a left to right basis in
@@ -1217,7 +1229,10 @@ NEGATIVE.** There is no draw-path cost to reclaim on the frames that are slow.
 
 **What replaced it.** The marcher's analogue of occlusion culling is EMPTY-SPACE
 SKIPPING, and that programme has been run and is largely exhausted: `anySolid`
-shipped (-0.13 ms), the height pyramid was built and RETIRED (479 missed rays),
+measured -0.13 ms parked but NEVER ARMED — `voxel.March.IndexAnySolid` still
+defaults 0 (`VoxelMarchChunkIndex.cpp:289`); the code is committed, the default
+was never flipped (corrected 2026-08-28; this line previously said "shipped") —
+the height pyramid was built and RETIRED (479 missed rays),
 ZCut was refuted for the horizon (0.00% of 3.3e9 decisions at pitch -10). See
 [[voxelsim-marcher-cost-is-ray-count]] -- marcher cost is ray-count linear within
 2% and per-ray cost is immovable, so the lever is ray count and geometry

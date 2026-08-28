@@ -3,8 +3,9 @@
 **One page. Every number here is read from a named log line by a named tool.**
 If a figure cannot be traced to a line below, it does not belong on this page.
 
-Updated 2026-08-24. Baseline column = what the OWNER experiences (stock editor,
-no extra flags). "Armed" = our leg config, which he does not run.
+Updated 2026-08-28. The goal table and the 2026-08-28 section reflect the
+shipping default as measured on the 2026-08-28 legs; "armed" vs "baseline"
+below is HISTORICAL (see the c52b2d2 note).
 
 > ## THE TWO COLUMNS BELOW SWAPPED MEANING AT c52b2d2 — READ THIS FIRST
 >
@@ -148,23 +149,31 @@ confirmation that cannot come out the other way is not a confirmation.
 
 ## THE THREE GOALS
 
-| # | metric | baseline (stock) | armed | TARGET | status |
-|---|---|---|---|---|---|
-| 1 | cold start to settle | **45.5 s** | 18.1 s | **a few seconds (<= 5 s)** | FAIL |
-| 2 | streaming throughput | **3,618/s** | 9,125/s | **50,000/s** | FAIL |
-| 3a | frame p95 while MOVING >= 20 m/s | **44.00 ms (23 fps)** | 37.00 ms (27 fps) | **< 10.00 ms (>100 fps)** | FAIL |
-| 3b | steadiness while MOVING | **31.4% stutters** | 51-58% | **<= 0.10% stutters** | FAIL |
+Re-measured 2026-08-28 on the shipping default (2560x1440, TSR-upscaled from
+`view=1552x873`, line flight 23.4 m/s, spawn `-61440,-61440` — the 2026-08-28
+legs, see that section below). The 2026-08-24 column is kept as history: it was
+taken before the GPU-primary set, the deepened cascade, the worklist chain and
+the buried-skip flip all shipped as defaults.
 
-**Goal 3 has two parts and both must pass.** A stutter is a frame over 20 ms —
-a dropped frame at 100 fps. `hitches` (>= 33.3 ms) is the legacy 30-fps bar and
-is kept only for comparability with historical legs; **it is not the gate.**
+| # | metric | 2026-08-24 (stock / armed, historical) | 2026-08-28 shipping default | TARGET | status |
+|---|---|---|---|---|---|
+| 1 | cold start to settle | 45.5 s / 18.1 s | **5.5 s** | **<= 5 s** | FAIL by 0.5 s |
+| 2 | streaming throughput | 3,618/s / 9,125/s | **9,210/s mean** | **50,000/s** | FAIL — ceiling diagnosed (`MaxAppliesPerFrame=192`, see 2026-08-28) |
+| 3a | frame p95 while MOVING >= 20 m/s | 44.00 ms (23 fps) / 37.00 ms (27 fps) | **11.95 ms (83.7 fps)** | **< 10.00 ms (>100 fps)** | FAIL — p50 8.47 ms (118.0 fps) passes; p95 and p99 (14.29 ms, 70.0 fps) do not |
+| 3b | 1% low (p99) while MOVING >= 20 m/s | 34.00 ms (29 fps) | **14.29 ms (70.0 fps)** | **>= 50 fps** (owner's restated gate, 2026-08-25) | **PASS, +20 fps margin** |
+
+**Goal 3b is the owner's gate** (restated by him 2026-08-25 — see that section;
+the old "<= 0.10% stutters" bar was never his). Stutters (>20 ms) on the
+2026-08-28 legs: **0.60%** — read as texture, never as the gate. `hitches`
+(>= 33.3 ms) is the legacy 30-fps bar, kept only for comparability with
+historical legs.
 
 ## OWNER-VISIBLE DEFECTS (judged by eye, not by counter)
 
 | defect | state | resolution |
 |---|---|---|
 | black arcs / holes at LOD boundaries flying forward | PRESENT | capture pair, stock vs armed; owner judges |
-| chunks load left-to-right, not toward facing | PRESENT | `NearestAdmit` + `ViewBias` are OFF by default |
+| chunks load left-to-right, not toward facing | FIXED 2026-08-24 | `NearestAdmit` has been default ON since 2026-08-24 (R0 -20% at no fps cost, `VoxelStreamAdmission::NearestAdmitEnabled`) — chunks admit nearest-first. `ViewBias` stays authored, default off |
 
 ---
 
@@ -498,3 +507,79 @@ this is a null.
 - **Do NOT shrink the camera-centred box asymmetrically.** `bValid` is a dead test
   today, so an asymmetric box gives it a false population written out as a miss with
   ZERO instrumentation.
+
+---
+
+## 2026-08-28: THE OWNER'S GATE MET WITH 20 FPS OF MARGIN — THE BURIED SKIP WAS THE TAIL
+
+All numbers from the 2026-08-28 legs: shipping default, no extra flags,
+2560x1440 (TSR-upscaled from `view=1552x873`, read from the marcher's own
+line), line flight 23.4 m/s, spawn `-61440,-61440`.
+
+    p50  8.47 ms (118.0 fps) | p95 11.95 (83.7) | p99 14.29 (70.0) | worst 76.3 ms
+    stutters >20 ms: 0.60%
+
+**The owner's stated gate — 1% low >= 50 fps moving — is MET with 20 fps of
+margin** (70.0 vs 50). The older ">100 fps steady" target: p50 passes, p95 and
+p99 fail. Cold start: settle t=5.5 s against <= 5 s; throughput mean 9,210/s
+against 50,000/s.
+
+### What shipped
+
+**`BuriedSkipEnabled()` default 1 -> 0 (commit 178b1a8): p99 56.9 -> 70.0 fps.**
+Verified role-reversed, and the image confirmed against a measured noise floor.
+WHY it pays: the band (`RgBand` + `RgColumn` + `RgVoxelize`), 43% of the whole
+GPU rise to p95, existed only to buy the buried-chunk skip — the skip's price
+exceeded what it saved. With the flip the band is gone: `[gpu-lean] kept=0`.
+This resolves the A/B that `docs/pipeline-waves-2026-08-27.md` said "can come
+out either way" — it came out.
+
+**Lake sheets defect found and fixed (commit 99dd158).** Rebuilding ONE basin
+recreated a 495-section proxy — ~9 ms per rebuild, landing on 3.9% of moving
+frames (EndOfFrameUpdates 3.79 ms + InitRenderResource 5.81 ms). Fix: one
+component per basin. VERIFIED on the fixed binary (LSFIX-a vs LSHEET-ctl, same
+protocol): spikes 352 -> 0, EOFU max 8.66 -> 0.85, InitRR max 11.34 -> 0.53,
+lakes-ON now costs the lakes-OFF floor (mean 0.030 = 0.030), with IDENTICAL
+content -- 495 basins / 16,844 rects / 0 unresolved on both. p99 14.20 -> 13.32
+(70.4 -> 75.1 fps). Image capture with the owner; only that judgement is open.
+
+### What was found
+
+**The parked floor is NAMED** (`docs/parked-floor-2026-08-28.md`): GPU 6.949 ms
+= VoxelMarch 4.186 (60.2%) + TSR 1.385 (19.9%) + everything else 1.378 (19.9%,
+nothing over 0.13 ms). There is no unnamed block left in the parked GPU frame.
+
+**The tail is TWO regimes with different owners**
+(`docs/p99-game-thread-split.md`, `docs/gpu-tail-split-2026-08-27.md`):
+FAST->SLOW is GPU-led (+5.5 ms); SLOW->TAIL is game-thread only (+5.4 game,
++0.9 GPU). The GPU saturates near 13 ms — a p99-framed GPU claim attributes a
+step the GPU does not take.
+
+**The throughput ceiling is a cap ladder, not a mystery.**
+`voxel.Stream.MaxAppliesPerFrame=192` binds on 89-98% of cold-fill ticks, so
+throughput = 192 x tick rate. Per-apply cost is 0.0015-0.0097 ms — the work is
+cheap; the cap is the wall. Rungs behind it, in order: `MeshBatchCap` (64 under
+GPU-primary, quota-bound on 74% of fill ticks, self-computed CEILING 23,526/s)
+-> `ApplyBudgetMs` -> tick rate. Sweep in progress; no rung is a result yet.
+
+**The GPU fork is now the MAJORITY producer**: ~70% of cold fill, ~92% of
+flight (`brickFromGpu=468,785` vs `brickPacks=42,359`). The old "CPU
+power-limited at 10.5k jobs/s" wall is no longer the binding constraint. And
+flight is a different problem from cold fill: ~93% churn (`recordsAdded` 8,720
+vs `evicted` 8,822 per window), limited by ADMISSION, not apply.
+
+### Parked, awaiting the owner
+
+**Outer-ring stagger** built and default 0 (commits e9555a1 / 5407c62): worst
+frame 135 -> 26 ms, hitches -40%, p99 UNCHANGED, tracked chunks -0.37%. It buys
+the worst frame, not the gate; the visual trade is his to judge in flight.
+
+### Corrections to record (each replaces a claim in circulation)
+
+- Workers are NOT `TPri_BelowNormal` by default — that applies only under
+  `-VoxelWorkerPool=N`, which defaults off.
+- The steady-state "650/s" was NET RESIDENCY, not throughput; actual flight
+  throughput is 3,809/s.
+- `anySolid` (`voxel.March.IndexAnySolid`) still DEFAULTS 0
+  (`VoxelMarchChunkIndex.cpp:289`): it was measured parked (-0.13 ms) and
+  committed but NEVER ARMED. The backlog line that said "shipped" is corrected.

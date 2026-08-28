@@ -2,21 +2,25 @@
 
 Owner-accepted. Build against this. Short on purpose.
 
-> **REVISED LATE 2026-08-27, after the GPU clock and the pooled attribution landed.**
-> The premise below ("only Wave 2 moves the goal") was written when the tail was
-> believed to be one thing. It is two. Read this box first; the waves below are kept
-> because their measurements stand, but their framing is superseded.
+> **REVISED LATE 2026-08-27; NUMBERS AND OUTCOMES RE-REVISED 2026-08-28 after the
+> buried-skip flip shipped.** The premise below ("only Wave 2 moves the goal") was
+> written when the tail was believed to be one thing. It is two. Read this box first;
+> the waves below are kept because their measurements stand, but their framing is
+> superseded.
 >
-> **WHERE THE GOAL ACTUALLY STANDS.** Pooled over 3,059,356 settled-moving frames on
-> five control legs, at 2560x1440:
+> **WHERE THE GOAL ACTUALLY STANDS** (2026-08-28 legs, shipping default, 2560x1440
+> TSR-upscaled from `view=1552x873`, line flight 23.4 m/s, spawn `-61440,-61440`):
 >
->     p50   9.10 ms = 110 fps
->     p95  13.67 ms =  73 fps
->     p99  17.57 ms =  57 fps     <- the owner's stated gate is 50 fps 1% low
+>     p50   8.47 ms = 118.0 fps
+>     p95  11.95 ms =  83.7 fps
+>     p99  14.29 ms =  70.0 fps     <- the owner's stated gate is 50 fps 1% low
 >
-> **The 1% low >= 50 fps gate is being MET, by 6.9 fps.** What still fails is the older
-> ">100 fps steady at 20 m/s" target, at p95 and p99. Those are different bars and the
-> difference should be a deliberate decision, not an accident of which doc was open.
+> **The 1% low >= 50 fps gate is being MET, by 20 fps.** What still fails is the older
+> ">100 fps steady at 20 m/s" target: p50 passes it, p95 and p99 do not. Those are
+> different bars and the difference should be a deliberate decision, not an accident of
+> which doc was open. (The 2026-08-27 pooled figures this box previously carried —
+> p50 9.10 / p95 13.67 / p99 17.57 over 3,059,356 frames on five control legs — are
+> superseded by the flip below.)
 >
 > **THE TAIL HAS TWO REGIMES AND THEY HAVE DIFFERENT OWNERS.**
 >
@@ -28,13 +32,15 @@ Owner-accepted. Build against this. Short on purpose.
 > Full tables: `docs/p99-game-thread-split.md`, `docs/gpu-tail-split-2026-08-27.md`.
 > Reproduce with `tools/attribution-pool.sh`.
 >
-> **THE p95 STEP IS FULLY ATTRIBUTED.** Nothing in the GPU frame is unnamed any more:
-> streaming 73%, marcher 20%, unaccounted 5%, draw path NEGATIVE. The largest single
-> block is **the band: +2.51 ms, 43% of the whole GPU rise**, spread across three
-> terms (`RgBand` + `RgColumn` + `RgVoxelize`) that exist for one reason -- mesh-region
-> graphs are kept `because: quads 0, band 31671, noPack 0`. One flag removes all three.
-> **`tools/voxel-buriedskip-ab.ps1` is the A/B and it can come out either way**: the
-> band buys the buried-chunk skip, so turning it off means meshing more chunks.
+> **THE p95 STEP IS FULLY ATTRIBUTED, AND THE BAND IS NOW GONE.** Nothing in the GPU
+> frame is unnamed any more: streaming 73%, marcher 20%, unaccounted 5%, draw path
+> NEGATIVE. The largest single block was **the band: +2.51 ms, 43% of the whole GPU
+> rise**, spread across three terms (`RgBand` + `RgColumn` + `RgVoxelize`) kept for one
+> reason -- to buy the buried-chunk skip (`because: quads 0, band 31671, noPack 0`).
+> **The A/B (`tools/voxel-buriedskip-ab.ps1`) came out: `BuriedSkipEnabled()` default
+> flipped 1 -> 0 and SHIPPED 2026-08-28 (commit 178b1a8)** -- p99 56.9 -> 70.0 fps,
+> verified role-reversed, image confirmed against a measured noise floor, and the band
+> is removed: `[gpu-lean] kept=0`.
 >
 > **THE p99 STEP IS 77% THE VOXEL TICK**, and inside it: dispatch +3.09 of which
 > `submit` is 86%, apply +0.23, remesh 0.00, unload +0.15 -- leaving **+3.35 ms of
