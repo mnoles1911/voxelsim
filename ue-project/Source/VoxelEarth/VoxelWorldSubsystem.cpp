@@ -6803,6 +6803,22 @@ struct FVoxelWorldImpl
 		float DispatchMs = 0.f;   // the whole dispatch loop, game thread
 		float SubmitMs = 0.f;     // ... of which the submit bracket (raster-atlas fills land here)
 		float ApplyMs = 0.f;      // component apply, game thread
+	// THE SUBMIT BRACKET, SUBDIVIDED. submit is 86% of the dispatch rise at p99
+	// and nothing knew what was inside it: the six-way split existed only as
+	// WINDOW accumulators (the `Voxel gpu submit split` line), which cannot
+	// isolate the worst 1% of frames. Same span as SubmitMs, six parts.
+	// SubTotalMs is the FUNCTION-side total (SubmitGpuMeshJob's own wall);
+	// SubmitMs is the LOOP-side bracket. Carrying both means loopMinusFn is
+	// checkable per frame instead of per window -- a positive gap is fork-branch
+	// cost outside the function, a negative one is declined/speculative calls
+	// that the loop bracket never saw.
+	float SubReqHdrMs = 0.f;  // footprint/seed/climate shading/skirt
+	float SubBandMs = 0.f;    // band policy + request build
+	float SubRasterMs = 0.f;  // atlas PrepareRequest / FillRasterWindow
+	float SubAssetsMs = 0.f;  // resolve + span tables + instance marshal
+	float SubPoolMs = 0.f;    // direct-to-pool decision incl. GI probe
+	float SubMgrMs = 0.f;     // Manager->Submit + GpuJobsPending insert
+	float SubTotalMs = 0.f;   // whole SubmitGpuMeshJob wall, fn side
 		// THE REST OF THE TICK. dispatch + apply accounted for less than half of
 		// the p99 tick rise and the remainder had no field to live in, so it read
 		// as unattributable rather than as remesh/unload/brick-flush. These three
@@ -6878,6 +6894,13 @@ struct FVoxelWorldImpl
 	float PrevTickRemeshMs = 0.f;
 	float PrevTickUnloadMs = 0.f;
 	float PrevTickBrickFlushMs = 0.f;
+	float PrevTickSubReqHdrMs = 0.f;
+	float PrevTickSubBandMs = 0.f;
+	float PrevTickSubRasterMs = 0.f;
+	float PrevTickSubAssetsMs = 0.f;
+	float PrevTickSubPoolMs = 0.f;
+	float PrevTickSubMgrMs = 0.f;
+	float PrevTickSubTotalMs = 0.f;
 	int32 PrevTickApplies = 0;
 
 	int64 SpecParkedSinceLog = 0;
@@ -8255,6 +8278,17 @@ struct FVoxelWorldImpl
 	float ThisFrameDispatchAirProofMs = 0.f;  // IsChunkProvablyAllAir: the worldgen-grade bound
 	float ThisFrameDispatchBandMs = 0.f;      // the footprint-band cache consult
 	float ThisFrameDispatchSubmitMs = 0.f;    // building and submitting the job itself
+	// ... and the six parts of it. Per FRAME, alongside the AccumGpuSubmit*
+	// window totals that have existed for a while and cannot answer a tail
+	// question. Incremented at BOTH exits of SubmitGpuMeshJob (the decline path
+	// mirrors the normal one), so an uncounted decline cannot drift them.
+	float ThisFrameSubReqHdrMs = 0.f;
+	float ThisFrameSubBandMs = 0.f;
+	float ThisFrameSubRasterMs = 0.f;
+	float ThisFrameSubAssetsMs = 0.f;
+	float ThisFrameSubPoolMs = 0.f;
+	float ThisFrameSubMgrMs = 0.f;
+	float ThisFrameSubTotalMs = 0.f;
 	// SUBDIVIDING `other`, which the first brackets showed is ~88% of dispatch
 	// (18-19 ms of 21) and is remarkably stable frame to frame -- the signature
 	// of a fixed per-candidate cost paid on every iteration.
@@ -9911,6 +9945,13 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	ThisFrameDispatchAirProofMs = 0.f;
 	ThisFrameDispatchBandMs = 0.f;
 	ThisFrameDispatchSubmitMs = 0.f;
+	ThisFrameSubReqHdrMs = 0.f;
+	ThisFrameSubBandMs = 0.f;
+	ThisFrameSubRasterMs = 0.f;
+	ThisFrameSubAssetsMs = 0.f;
+	ThisFrameSubPoolMs = 0.f;
+	ThisFrameSubMgrMs = 0.f;
+	ThisFrameSubTotalMs = 0.f;
 	ThisFrameDispatchPickMs = 0.f;
 	ThisFrameDispatchOverlayMs = 0.f;
 	ThisFrameDispatchLoopMs = 0.f;
@@ -10728,6 +10769,13 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		Sample.RemeshMs     = PrevTickRemeshMs;
 		Sample.UnloadMs     = PrevTickUnloadMs;
 		Sample.BrickFlushMs = PrevTickBrickFlushMs;
+		Sample.SubReqHdrMs  = PrevTickSubReqHdrMs;
+		Sample.SubBandMs    = PrevTickSubBandMs;
+		Sample.SubRasterMs  = PrevTickSubRasterMs;
+		Sample.SubAssetsMs  = PrevTickSubAssetsMs;
+		Sample.SubPoolMs    = PrevTickSubPoolMs;
+		Sample.SubMgrMs     = PrevTickSubMgrMs;
+		Sample.SubTotalMs   = PrevTickSubTotalMs;
 		Sample.Applies      = PrevTickApplies;
 		// NO DIRECT GPU TIME. It needs FRHIGPUFrameTimeHistory, a pull-based API
 		// with its own state, which is more plumbing than this pass warrants --
@@ -10792,6 +10840,13 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	PrevTickRemeshMs   = ThisFrameRemeshMs;
 	PrevTickUnloadMs   = ThisFrameUnloadMs;
 	PrevTickBrickFlushMs = ThisFrameBrickFlushMs;
+	PrevTickSubReqHdrMs  = ThisFrameSubReqHdrMs;
+	PrevTickSubBandMs    = ThisFrameSubBandMs;
+	PrevTickSubRasterMs  = ThisFrameSubRasterMs;
+	PrevTickSubAssetsMs  = ThisFrameSubAssetsMs;
+	PrevTickSubPoolMs    = ThisFrameSubPoolMs;
+	PrevTickSubMgrMs     = ThisFrameSubMgrMs;
+	PrevTickSubTotalMs   = ThisFrameSubTotalMs;
 	PrevTickApplies    = ThisFrameAppliesFromWorker;
 
 	if (FrameMs > 16.6f) // the actual 60fps gate bar (see TotalFramesOver60FpsBar)
@@ -12766,6 +12821,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			double Dispatch = 0, Submit = 0, Apply = 0, Applies = 0;
 			double Remesh = 0, Unload = 0, BrickFlush = 0;
 			double DAir = 0, DBand = 0, DPick = 0, DOverlay = 0, DLoop = 0, GpuMgr = 0;
+			double SReq = 0, SBand = 0, SRaster = 0, SAssets = 0, SPool = 0, SMgr = 0, STotal = 0;
+			float MaxSRaster = 0.f, MaxSReq = 0.f;
 			float MaxDAir = 0.f, MaxDBand = 0.f, MaxDPick = 0.f, MaxDOverlay = 0.f, MaxGpuMgr = 0.f;
 			float MaxRemesh = 0.f, MaxUnload = 0.f, MaxBrickFlush = 0.f;
 			float MaxSubmit = 0.f, MaxDispatch = 0.f, MaxApply = 0.f;
@@ -12790,6 +12847,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				MaxRemesh = FMath::Max(MaxRemesh, F.RemeshMs);
 				MaxUnload = FMath::Max(MaxUnload, F.UnloadMs);
 				MaxBrickFlush = FMath::Max(MaxBrickFlush, F.BrickFlushMs);
+				SReq += F.SubReqHdrMs; SBand += F.SubBandMs; SRaster += F.SubRasterMs;
+				SAssets += F.SubAssetsMs; SPool += F.SubPoolMs; SMgr += F.SubMgrMs;
+				STotal += F.SubTotalMs;
+				MaxSRaster = FMath::Max(MaxSRaster, F.SubRasterMs);
+				MaxSReq = FMath::Max(MaxSReq, F.SubReqHdrMs);
 				Applies += double(F.Applies);
 				MaxSubmit = FMath::Max(MaxSubmit, F.SubmitMs);
 				MaxDispatch = FMath::Max(MaxDispatch, F.DispatchMs);
@@ -12993,6 +13055,59 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       Tail.M(Tail.GpuMgr)-Fast.M(Fast.GpuMgr),
 			       Slow.MaxDAir, Tail.MaxDAir, Slow.MaxDBand, Tail.MaxDBand,
 			       Slow.MaxDPick, Tail.MaxDPick, Slow.MaxGpuMgr, Tail.MaxGpuMgr);
+
+			// SUBMIT-SPLIT. The dispatch split above says `submit` is ~86% of the
+			// dispatch rise at p99 and stops there; this says what submit IS.
+			//
+			// WHY IT IS A SEPARATE LINE AND NOT MORE FIELDS ON THAT ONE: the six
+			// parts sum to the FUNCTION's wall (subTotal), which is NOT the same
+			// span as the loop-side submit= on the line above. loopMinusFn names
+			// the difference and must be read, not assumed away -- POSITIVE is
+			// fork-branch cost outside SubmitGpuMeshJob, NEGATIVE is declined and
+			// speculative calls that the loop bracket never entered. Printing them
+			// on one line invites adding two spans that are not the same span.
+			//
+			// sDrift = subTotal - the six. The stamps are contiguous, so it must
+			// read ~0.00; anything else means a bracket was moved and the parts no
+			// longer partition the whole. UNCLAMPED, so a defect shows as a sign
+			// rather than as a small number.
+			//
+			// RASTER IS THE ONE TO WATCH AND ITS MEAN WILL UNDERSTATE IT. The
+			// atlas fills on page-column crossings -- one page is 240 m, ~10 s
+			// apart at flight speed -- so it is near zero on most frames and large
+			// on a few. maxRaster is printed for exactly that reason: a bimodal
+			// term characterised by its mean is a term nobody will find.
+			auto SDrift = [](const FAccum& A) -> double
+			{
+				return A.M(A.STotal) - (A.M(A.SReq) + A.M(A.SBand) + A.M(A.SRaster)
+				                        + A.M(A.SAssets) + A.M(A.SPool) + A.M(A.SMgr));
+			};
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel frame attribution SUBMIT-SPLIT (mean ms; the six sum to subTotal, the FUNCTION ")
+			       TEXT("wall; loopSubmit is the LOOP bracket and loopMinusFn = loopSubmit - subTotal): ")
+			       TEXT("FAST subTotal=%.3f reqHdr=%.3f band=%.3f raster=%.3f assets=%.3f pool=%.3f mgr=%.3f sDrift=%.3f loopSubmit=%.3f loopMinusFn=%+.3f | ")
+			       TEXT("SLOW subTotal=%.3f reqHdr=%.3f band=%.3f raster=%.3f assets=%.3f pool=%.3f mgr=%.3f sDrift=%.3f loopSubmit=%.3f loopMinusFn=%+.3f | ")
+			       TEXT("TAIL subTotal=%.3f reqHdr=%.3f band=%.3f raster=%.3f assets=%.3f pool=%.3f mgr=%.3f sDrift=%.3f loopSubmit=%.3f loopMinusFn=%+.3f"),
+			       Fast.M(Fast.STotal), Fast.M(Fast.SReq), Fast.M(Fast.SBand), Fast.M(Fast.SRaster),
+			       Fast.M(Fast.SAssets), Fast.M(Fast.SPool), Fast.M(Fast.SMgr), SDrift(Fast),
+			       Fast.M(Fast.Submit), Fast.M(Fast.Submit) - Fast.M(Fast.STotal),
+			       Slow.M(Slow.STotal), Slow.M(Slow.SReq), Slow.M(Slow.SBand), Slow.M(Slow.SRaster),
+			       Slow.M(Slow.SAssets), Slow.M(Slow.SPool), Slow.M(Slow.SMgr), SDrift(Slow),
+			       Slow.M(Slow.Submit), Slow.M(Slow.Submit) - Slow.M(Slow.STotal),
+			       Tail.M(Tail.STotal), Tail.M(Tail.SReq), Tail.M(Tail.SBand), Tail.M(Tail.SRaster),
+			       Tail.M(Tail.SAssets), Tail.M(Tail.SPool), Tail.M(Tail.SMgr), SDrift(Tail),
+			       Tail.M(Tail.Submit), Tail.M(Tail.Submit) - Tail.M(Tail.STotal));
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel frame attribution SUBMIT-SPLIT DELTA: tail-fast reqHdr=%+.3f band=%+.3f raster=%+.3f ")
+			       TEXT("assets=%+.3f pool=%+.3f mgr=%+.3f sDrift=%+.3f | slow-fast reqHdr=%+.3f raster=%+.3f mgr=%+.3f | ")
+			       TEXT("maxRaster fast=%.2f slow=%.2f tail=%.2f | maxReqHdr slow=%.2f tail=%.2f"),
+			       Tail.M(Tail.SReq)-Fast.M(Fast.SReq), Tail.M(Tail.SBand)-Fast.M(Fast.SBand),
+			       Tail.M(Tail.SRaster)-Fast.M(Fast.SRaster), Tail.M(Tail.SAssets)-Fast.M(Fast.SAssets),
+			       Tail.M(Tail.SPool)-Fast.M(Fast.SPool), Tail.M(Tail.SMgr)-Fast.M(Fast.SMgr),
+			       SDrift(Tail)-SDrift(Fast),
+			       Slow.M(Slow.SReq)-Fast.M(Fast.SReq), Slow.M(Slow.SRaster)-Fast.M(Fast.SRaster),
+			       Slow.M(Slow.SMgr)-Fast.M(Fast.SMgr),
+			       Fast.MaxSRaster, Slow.MaxSRaster, Tail.MaxSRaster, Slow.MaxSReq, Tail.MaxSReq);
 		}
 	}
 
@@ -20923,6 +21038,11 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 						AccumGpuSubmitRasterMs += (SubT3 - SubT2) * 1000.0;
 						AccumGpuSubmitAssetsMs += (SubTAbort - SubT3) * 1000.0;
 						AccumGpuSubmitTotalMs += (SubTAbort - SubT0) * 1000.0;
+						ThisFrameSubReqHdrMs += float((SubT1 - SubT0) * 1000.0);
+						ThisFrameSubBandMs += float((SubT2 - SubT1) * 1000.0);
+						ThisFrameSubRasterMs += float((SubT3 - SubT2) * 1000.0);
+						ThisFrameSubAssetsMs += float((SubTAbort - SubT3) * 1000.0);
+						ThisFrameSubTotalMs += float((SubTAbort - SubT0) * 1000.0);
 						++GpuSubmitCallsSinceLog;
 					}
 					return false;
@@ -21053,6 +21173,13 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		AccumGpuSubmitPoolMs += (SubT5 - SubT4) * 1000.0;
 		AccumGpuSubmitMgrMs += (SubT6 - SubT5) * 1000.0;
 		AccumGpuSubmitTotalMs += (SubT6 - SubT0) * 1000.0;
+		ThisFrameSubReqHdrMs += float((SubT1 - SubT0) * 1000.0);
+		ThisFrameSubBandMs += float((SubT2 - SubT1) * 1000.0);
+		ThisFrameSubRasterMs += float((SubT3 - SubT2) * 1000.0);
+		ThisFrameSubAssetsMs += float((SubT4 - SubT3) * 1000.0);
+		ThisFrameSubPoolMs += float((SubT5 - SubT4) * 1000.0);
+		ThisFrameSubMgrMs += float((SubT6 - SubT5) * 1000.0);
+		ThisFrameSubTotalMs += float((SubT6 - SubT0) * 1000.0);
 		++GpuSubmitCallsSinceLog;
 	}
 	return true;
