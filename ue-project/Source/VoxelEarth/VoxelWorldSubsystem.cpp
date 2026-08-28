@@ -3582,11 +3582,48 @@ int32 BandSeedCpuEnabled()
 	return Value;
 }
 
+// ---- DEFAULT 1 -> 0, 2026-08-28. THE SKIP COSTS MORE THAN IT SAVES. ----
+//
+// It avoids meshing chunks a footprint's band proves are all-air or all-solid.
+// What that is worth, measured over a whole flight: ~1% of loads (47,623 vs
+// 61,314 issued, and a tracked set that matches within 0.04% -- the SAME world
+// is resident either way). What it costs is the band, and the band is 43% of the
+// GPU's entire rise from a typical frame to p95: RgBand + RgColumn + RgVoxelize
+// = +2.51 ms, because a band-carrying job cannot take the lean graph.
+//
+// FOUR LEGS, ALTERNATED A,B,A,B, 2560x1440 line flight from -61440,-61440:
+//
+//     arm       p50            p95            p99             max
+//     1 (was)   9.16 (109.2)   13.51 (74.0)   17.57 (56.9)    139.8
+//     0 (now)   8.49 (117.8)   11.96 (83.6)   14.28 (70.1)    123.7
+//
+// **p99 -3.29 ms, 56.9 -> 70.1 fps**, and every percentile moves, which is what
+// removing work looks like rather than moving it. Within-arm spread 0.11-0.19 ms
+// against a 3.3 ms gap. ENGAGEMENT PROVED: the manager's [gpu-lean] line reads
+// kept=31,650 on arm 1 and kept=0 on arm 0 -- every mesh-region graph lean. Two
+// earlier sweeps moved the timing without moving `kept` and were discarded
+// unread; see docs/buried-skip-ab-2026-08-27.md.
+//
+// THE IMAGE WAS CHECKED FIRST AND THE OWNER JUDGED IT: matched captures at a
+// pinned pose, same ridgeline, same couloirs, same snow line -- "they look the
+// same". Objectively, 0.52% of pixels differ by more than 8/255 and the >32
+// outliers are diffuse speckle across 73 cells of 943, never the contiguous
+// block a hole would make. This project has shipped a "-7.6% win" that was the
+// marcher deleting a mountain, so a renderer speedup is a claim about the image
+// until someone has looked at it.
+//
+// IT IS A TRADE AND THE SHAPE CHANGES. At the tail, GPU -5.14 ms and game thread
+// +3.85 -- the band leaves the GPU, the unskipped chunks arrive on the game
+// thread. Net strongly positive because the GPU was the p95 driver, but the tail
+// is now 17.26 ms of game thread against 8.36 of GPU. Plan against that shape,
+// not against the old control.
+//
+// `-VoxelBuriedSkip=1` restores every build before this one.
 bool BuriedSkipEnabled()
 {
 	static const bool bEnabled = []
 	{
-		int32 Value = 1;
+		int32 Value = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelBuriedSkip="), Value);
 		return Value != 0;
 	}();

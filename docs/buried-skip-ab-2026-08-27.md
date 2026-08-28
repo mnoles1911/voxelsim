@@ -143,3 +143,64 @@ size of result that this project has previously been wrong about -- the "-7.6%
 win" that was the marcher deleting a mountain inverted to +3.1% once the image was
 honest -- and the direction here (more chunks, not fewer) is the safe one but not
 a proof.
+
+---
+
+# Part 3: the image, and SHIPPED
+
+## The owner judged it: "they look the same"
+
+Matched captures at a pinned pose -- column `-61440,-61440`, +60 m above the
+surface, pitch -10, yaw 45, sun frozen 12:00 03-20, 2560x1440, 120 s settle.
+Same ridgeline, same couloirs, same snow line.
+
+    Saved/BANDIMG-ctl-stock.png        stock
+    Saved/BANDIMG-off-bandremoved.png  -VoxelBuriedSkip=0
+    Saved/BANDIMG-ctl2.png             stock again -- THE NOISE FLOOR
+    Saved/BANDIMG-diff-x8.png          difference, amplified 8x
+
+## AND THE NOISE FLOOR IS WHAT MAKES IT A MEASUREMENT
+
+A cross-arm pixel difference means nothing without knowing what two runs of the
+SAME arm produce. So a second control was captured:
+
+    comparison                        any diff   >8/255     >32/255   max
+    SAME CONFIG, two runs              48.604%   0.4855%    0.0106%    99
+    stock vs band-off                  47.259%   0.5240%    0.0135%   163
+    stock (2nd run) vs band-off        43.533%   0.3631%    0.0088%   161
+
+**The cross-arm difference is indistinguishable from the same-arm noise floor,
+and the second control is CLOSER to the band-off arm than to its own twin.** The
+change produces no image difference above run-to-run variation.
+
+The >32 outliers are diffuse speckle -- 73 cells of 943 at 64 px, at most 4
+pixels each -- never the contiguous block a hole or a deleted ridge would make.
+
+## SHIPPED: `BuriedSkipEnabled()` default 1 -> 0
+
+Every gate this project asks for was cleared, in order:
+
+    image first        owner verdict + a noise floor that can fail
+    engagement proved  kept 31,650 -> 0, and TWO earlier sweeps that failed
+                       this test had their timings discarded unread
+    reproducible       within-arm spread 0.11-0.19 ms vs a 3.3 ms gap
+    can fail           the noise floor was capable of showing the opposite
+
+`-VoxelBuriedSkip=1` restores every build before this one.
+
+## What is now true, and what it changes
+
+    p50  9.16 -> 8.49 ms   109.2 -> 117.8 fps
+    p95 13.51 -> 11.96      74.0 ->  83.6
+    p99 17.57 -> 14.28      56.9 ->  70.1 fps
+    max 139.8 -> 123.7
+
+**The owner's 1% low >= 50 fps gate is met with 20 fps of margin, and p50 clears
+the 100 fps steady target.** p95 and p99 do not.
+
+**THE BOTTLENECK MOVED, and the next investigation must start from the new
+shape.** At the tail, GPU -5.14 ms and game thread +3.85: the band leaves the
+GPU, the unskipped chunks arrive on the game thread. The tail is now **17.26 ms
+of game thread against 8.36 ms of GPU**. Everything in
+`docs/p99-game-thread-split.md` that pointed at the game thread now points harder
+-- and `submit`, already 86% of the dispatch rise, is the first place to look.
