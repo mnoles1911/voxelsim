@@ -3619,6 +3619,56 @@ int32 BandSeedCpuEnabled()
 // not against the old control.
 //
 // `-VoxelBuriedSkip=1` restores every build before this one.
+// ---- OUTER-RING SCAN STAGGER (-VoxelAmortizeOuterScans=N, default 0 = off) --
+//
+// THE COINCIDENCE, NOT THE SCAN. A level re-scans when the anchor leaves its
+// level-L chunk. Level chunk boundaries are NESTED -- a level-5 boundary is also
+// a boundary of every finer level -- so the tick that crosses one crosses all
+// seven at once and every ring scans together. Measured: R0 fires 12x per 2 s
+// window and R5 once, so every R5 scan IS one of R0's twelve. That tick pays
+// 406 ms of window recompute and up to 19.07 ms on a single frame, against a
+// 0.11 ms mean on the 89% of frames where nothing is due.
+//
+// So the fix is not to slice a scan -- it is to stop them landing together. With
+// N > 0, at most N levels at or above kAmortizeMinLevel may scan on one tick;
+// the rest keep their claim and take the next one.
+//
+// WHY DEFERRING IS SAFE HERE AND DEFERRING ADMISSION GENERALLY IS NOT. This
+// project has lost this argument once: the harvest cap deferred admission and
+// coverage collapsed to 8,223 of 48,900 chunks. Three things make this
+// different, and all three are load-bearing:
+//
+//   * OUTER RINGS ONLY. Levels below kAmortizeMinLevel are never deferred, so
+//     the near field -- the only part a player can see arrive -- is untouched.
+//     R4 starts at 512 m and R6 ends at 4 km.
+//   * THE CLAIM IS NOT DROPPED, IT IS NOT STAMPED. A deferred level does not
+//     update LastAnchorChunkPerLevel, so its gate still reads `due` next tick.
+//     Nothing is skipped; the work moves by a tick.
+//   * NO STARVATION IS POSSIBLE BY CONSTRUCTION. Three outer levels against a
+//     budget of N>=1 means a level waits at most 3 ticks -- ~27 ms at 110 fps --
+//     before it is the one that runs. There is no queue to grow.
+//
+// The EXIT scan is untouched and runs for every level regardless, so nothing
+// already resident can be stranded by a deferral. This delays chunks ARRIVING,
+// never chunks leaving.
+//
+// A COVERAGE CHECK IS PART OF THIS CHANGE, NOT A FOLLOW-UP. `substituted` and
+// matched captures decide it; a timing table alone must not.
+int32 AmortizeOuterScans()
+{
+	static const int32 Value = []
+	{
+		int32 V = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelAmortizeOuterScans="), V);
+		return V;
+	}();
+	return Value;
+}
+
+// Lowest level the stagger may defer. R4 = 512-1024 m, so everything nearer than
+// half a kilometre always scans on the tick it becomes due.
+constexpr int32 kAmortizeMinLevel = 4;
+
 bool BuriedSkipEnabled()
 {
 	static const bool bEnabled = []
@@ -8416,6 +8466,14 @@ struct FVoxelWorldImpl
 	// warm share was refill rescans -- work the incremental path could carry
 	// -- not first scans. Reset beside LevelEntryScans.
 	int32 LevelIncrScansSinceLog[VoxelCoords::kNumLevels] = {};
+	// Outer-ring stagger: how many level scans were pushed to a later tick, and
+	// the worst number of consecutive ticks any one level waited. PROOF OF
+	// ENGAGEMENT -- with -VoxelAmortizeOuterScans unset both stay 0 and the log
+	// says `stagger=off`, which is a different reading from `armed and deferred
+	// nothing`. An arm that cannot show it fired is not an arm.
+	int64 OuterScanDeferredSinceLog = 0;
+	int32 LevelDeferStreak[VoxelCoords::kNumLevels] = {};
+	int32 MaxDeferStreakSinceLog = 0;
 	int32 IncrFullFirstSinceLog = 0;       // first scan of a level, or an unattributed bHasRecomputedLevel clear
 	int32 IncrFullEditSinceLog = 0;        // edit-forced rescan (bLevelEditRescan): interior Z verdicts moved, full sweep required
 	int32 IncrFullUndergroundSinceLog = 0; // underground now or at the level's last scan
@@ -12542,10 +12600,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		                   && (IncrFullEditSinceLog == 0) && (IncrFullUndergroundSinceLog == 0)
 		                   && (IncrFullConfigSinceLog == 0);
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel incremental admission (window): incr %s | full: first=%d edit=%d underground=%d config=%d%s"),
+		       TEXT("Voxel incremental admission (window): incr %s | full: first=%d edit=%d underground=%d config=%d | stagger=%s deferred=%lld maxStreak=%d%s"),
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelIncrScansSinceLog[L]); }),
 		       IncrFullFirstSinceLog, IncrFullEditSinceLog, IncrFullUndergroundSinceLog,
 		       IncrFullConfigSinceLog,
+		       VoxelStreamAdmission::AmortizeOuterScans() > 0
+		           ? *FString::Printf(TEXT("on(budget=%d,minLevel=%d)"),
+		                              VoxelStreamAdmission::AmortizeOuterScans(),
+		                              VoxelStreamAdmission::kAmortizeMinLevel)
+		           : TEXT("off"),
+		       (long long)OuterScanDeferredSinceLog, MaxDeferStreakSinceLog,
 		       bAllZero
 		           ? TEXT(" -- ALL ZERO, WHICH IS THE EXPECTED READING FOR A PARKED OR LINGER WINDOW "
 		                  "(no motion, nothing to admit). NOT evidence the switch is inert: read a "
@@ -14901,15 +14965,26 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		AccumLevelEntryMs[Level] = 0.0;
 		LevelEntryScans[Level] = 0;
 		LevelIncrScansSinceLog[Level] = 0;
+		// NOT LevelDeferStreak -- that is a LIVE run length, not a window sum. A
+		// level deferred across a window boundary is still waiting, and zeroing it
+		// here would under-report the streak the starvation bound is checked
+		// against. MaxDeferStreakSinceLog IS a window statistic and does reset.
 		LevelRejBudgetSinceLog[Level] = 0;
 		LevelRejCutoffSinceLog[Level] = 0;
 		LevelRejFineSinceLog[Level] = 0;
 		LevelRejNearestSinceLog[Level] = 0;
 		LevelFloorKeptSinceLog[Level] = 0; // -VoxelLeadHorizonSec kept= (flr= is latest-state, not a window sum: no reset)
+		// (scalar stagger counters reset below, outside this per-level loop)
 		LevelClampedScansSinceLog[Level] = 0;
 		LevelClampSkippedCellsSinceLog[Level] = 0;
 	}
 	IncrFullFirstSinceLog = IncrFullEditSinceLog = IncrFullUndergroundSinceLog = IncrFullConfigSinceLog = 0;
+	// Window sums for the outer-ring stagger. LevelDeferStreak is deliberately
+	// NOT reset -- it is a live run length whose whole job is to show a level
+	// waiting, and clearing it at a window edge would hide exactly the starvation
+	// this bound exists to rule out.
+	OuterScanDeferredSinceLog = 0;
+	MaxDeferStreakSinceLog = 0;
 
 	// Track B2 missing-tile telemetry: only meaningful once a real tile grid
 	// is in use (bUsingTileGrid) -- the synthetic sampler has no concept of a
@@ -18743,6 +18818,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 	int32 ScratchBoxRadius = 0; // BoxRadiusChunks out-param, used only for its bool return in the level gate
 
+	// Outer-ring scan stagger budget for THIS tick. See AmortizeOuterScans().
+	const int32 OuterScanBudget = VoxelStreamAdmission::AmortizeOuterScans();
+	int32 OuterScansUsed = 0;
+
 	const int32 MaxRingLevel = UVoxelWorldSubsystem::GetMaxRingLevel();
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
@@ -18788,6 +18867,23 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		    (!bZMatters || AnchorChunk.Z == LastAnchorChunkPerLevel[Level].Z))
 		{
 			continue; // nothing new can have entered this level's annulus
+		}
+		// OUTER-RING STAGGER. This level is DUE. If the tick's outer budget is
+		// spent, hand it to the next tick -- deliberately WITHOUT stamping
+		// LastAnchorChunkPerLevel, so the gate above still reads `due` and the
+		// work is moved rather than lost. See AmortizeOuterScans() for why this
+		// is safe where deferring admission generally is not.
+		if (OuterScanBudget > 0 && Level >= VoxelStreamAdmission::kAmortizeMinLevel)
+		{
+			if (OuterScansUsed >= OuterScanBudget)
+			{
+				++OuterScanDeferredSinceLog;
+				++LevelDeferStreak[Level];
+				MaxDeferStreakSinceLog = FMath::Max(MaxDeferStreakSinceLog, LevelDeferStreak[Level]);
+				continue;
+			}
+			++OuterScansUsed;
+			LevelDeferStreak[Level] = 0;
 		}
 		// Incremental admission: capture the two things the stamps below are
 		// about to overwrite. PrevScanAnchorXY is A0 -- the unquantized anchor
