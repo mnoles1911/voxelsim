@@ -20641,12 +20641,57 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 				FootprintBandRequestInFlight.Remove(BandFootprint);
 			}
 		}
+		// DOES ANYTHING INTEND TO READ THIS BAND? Asked here because until
+		// 2026-08-27 nothing did, and the two halves are gated separately:
+		// bComputeBand (the -VoxelBuriedSkip site further down this file) decides
+		// whether the band will be CONSULTED, while the predicate below decides
+		// whether it is REQUESTED -- and the request side read only cache and
+		// in-flight state. So -VoxelBuriedSkip=0 switched off every consumer and
+		// left the band computed anyway: still a GPU reduce, still a readback
+		// fence, still forcing the full mesh-region graph (the manager's
+		// [gpu-lean] line kept reading `kept because: band 31,671`), with the
+		// result thrown away on arrival.
+		//
+		// MEASURED, which is why this is a fix and not a tidy-up: a four-leg
+		// alternated A/B of -VoxelBuriedSkip=0 moved p99 17.60 -> 16.41 ms
+		// (56.8 -> 60.9 fps) with p50 and p95 unchanged, and `kept` went UP
+		// (31,623 -> 32,091) because the band survived the switch that was meant
+		// to remove it. The band is 43% of the GPU's whole rise to p95 (RgBand +
+		// RgColumn + RgVoxelize = +2.51 ms) and none of it was reachable.
+		// See docs/buried-skip-ab-2026-08-27.md.
+		//
+		// AND REQUESTING FEWER IS NOT AVAILABLE -- both flags that promise it are
+		// measured NULL. -VoxelGpuBandColdOnly=1: kept 31,678 -> 31,578, noise.
+		// -VoxelGpuBandSeedOnly=1: dup=0 and redundant=0 on BOTH arms. The
+		// population is ALREADY minimal (6.5% of jobs, below the 1-in-8.3
+		// one-per-footprint fraction), so the only band that can be removed is one
+		// nobody was going to read.
+		//
+		// BYTE-IDENTICAL ON THE SHIPPING DEFAULT, and that is the whole safety
+		// argument: -VoxelBuriedSkip defaults to 1, so a consumer exists, so this
+		// term is true and bWantBand is exactly what it was. It bites only on the
+		// arm that already asked for no consumers.
+		// THERE ARE TWO CONSUMER FAMILIES, NOT ONE, and missing the second would
+		// have been a latent hole rather than a visible one -- it is off by default,
+		// so no leg would have caught it:
+		//   * the buried-chunk skip -- bComputeBand and bBandSkipActive, both
+		//     -VoxelBuriedSkip;
+		//   * the ADMISSION band skip -- AdmissionBandSkipMode(), which is its own
+		//     switch (voxel.Stream.AdmissionBandSkip / -VoxelAdmissionBandSkip,
+		//     GAdmissionBandSkip default 0) and is NOT derived from -VoxelBuriedSkip.
+		//     It reads the cache at the admission scan and at the zero-record
+		//     verifier, and it also forces level 0 onto full sweeps while it is on.
+		// A runtime cvar, so this is asked per job rather than latched.
+		const bool bBandHasConsumer =
+			VoxelStreamAdmission::BuriedSkipEnabled()
+			|| VoxelStreamAdmission::VerifyBuriedSkipEnabled()
+			|| VoxelStreamAdmission::AdmissionBandSkipMode() != 0;
 		// Seed-only: request iff uncached AND nothing fresh in flight. Legacy
 		// (seed-only off): request unless BandColdOnly has a warm cache entry
 		// to point at -- the shipped behaviour, byte-identical.
-		const bool bWantBand = bBandSeedOnly
+		const bool bWantBand = bBandHasConsumer && (bBandSeedOnly
 			? (!bBandCached && !bBandReqInFlight)
-			: (!bBandColdOnly || !bBandCached);
+			: (!bBandColdOnly || !bBandCached));
 		if (bWantBand)
 		{
 			Req.BandOriginI = kBandApronOffset;
