@@ -129,3 +129,36 @@ top of that.
 
 **Left open deliberately, with the dead hypotheses recorded so nobody re-runs
 them.**
+
+---
+
+# Stage 0a census: GO, by 2.3x, and the mass is not where the design assumed
+
+2026-08-28, three engagement legs (CEN-n90/p0/p30), census counters slots 49-55,
+values window-stable (91.08% identical across 12+ windows at the horizon), zero
+ARMED-AND-INERT warnings.
+
+    pitch          probes    removableUp        removableDown     capRays
+    -90 (down)     2.22e9    n/a (no up rays)   39.5%             0.0000%
+     0  (HORIZON)  6.69e9    91.08% (83.0 pre)  78.4% (70.9 pre)  0.0000%
+    +30 (sky)      7.89e9    95.48% (89.3 pre)  n/a               0.0000%
+
+**GATE: removableUp >= 40% at the horizon -> 91.08%. GO.**
+
+Two redirections the numbers force on Stage 0b:
+
+1. **The mass is PRE-hit probes on up-rays — whole ring segments containing ZERO
+   resident chunks at that level** (a zero-resident walk books all its iterations
+   as pre, by the census's own stated convention). So the primary payoff is the
+   EMPTY-INTERVAL COLLAPSE — skip the segment when the bound proves no resident
+   chunk lies along it — not the WalkOut clamp the design staged first. Same
+   texture carries both; the emphasis changes, the design does not.
+2. **capRays = 0.0000% at every measured pitch.** The near-vertical
+   TERM_CHUNK_CAP population (:4739-4746) did not appear at -90/0/+30 (straight
+   up, +90, was not in the set). The "concentrated structural win" framing for
+   that case is unsupported at these poses; do not lead with it.
+
+Probes are ITERATIONS, not time (the census line says so itself), and the
+literature rule stands: iterations and time have moved in OPPOSITE directions in
+three published systems. 91% removable probes authorizes the BUILD; only the
+Stage 0b timing leg with its own prepass bracket authorizes any claim about ms.
