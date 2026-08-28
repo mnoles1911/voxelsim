@@ -152,6 +152,36 @@ private:
 	// no shadow) so a basin cannot behave differently for having been split out.
 	UProceduralMeshComponent* GetOrCreateSheetComp(FSheet& Sheet);
 
+	// ---- RE-GATHER ADOPTION, 2026-08-28 ------------------------------------
+	//
+	// The re-gather used to wipe every sheet and rebuild all of them from
+	// scratch -- measured on the LSHEET legs as a 485-tick drain in which EVERY
+	// spike frame of the whole flight lived (the 352-spike cluster ends exactly
+	// on the DRAINED tick, both arms). After the per-basin component split the
+	// spikes moved into TickActors instead of vanishing: a ~5.7 ms/frame
+	// plateau across the drain, a 17.7 ms all-at-once destroy hitch, and a
+	// 22.7 ms first-build tick -- the worst single hitch got WORSE while the
+	// spike metric read zero. And the wipe deletes every lake for ~5 s each
+	// kilometre flown, which is a visual, not a counter.
+	//
+	// So the re-gather now ADOPTS: old sheets park here keyed by
+	// (TileX, TileY, BasinId), and a re-gathered basin whose geometry is
+	// unchanged takes its old component, mesh and LOD state back instead of
+	// rebuilding. On the measured legs the tile set was identical across all
+	// three gathers (476/482/495 basins), so ~98% adopt and the drain shrinks
+	// from 482 builds to the handful that actually changed. Leftovers -- basins
+	// no longer in range -- are destroyed a few per tick via PendingDestroy
+	// rather than all in one tick, which is what the 17.7 ms hitch was.
+	TMap<FIntVector, FSheet> AdoptableSheets;
+	TArray<UProceduralMeshComponent*> PendingDestroy;
+
+	// Serial for component names. NewObject with a DETERMINISTIC name collides
+	// with the same-named component destroyed in the same gather (destroyed
+	// objects keep their names until GC), forcing StaticAllocateObject's
+	// displace-existing-object path on every build -- the leading suspect for
+	// the TickActors plateau. A per-actor serial makes every name fresh.
+	uint32 CompNameSerial = 0;
+
 	// Decimation for a basin, in fine pixels per emitted cell. See the .cpp.
 	int32 StepForBasin(double SpanUU) const;
 

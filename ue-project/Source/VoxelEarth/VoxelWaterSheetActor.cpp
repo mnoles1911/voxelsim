@@ -86,9 +86,12 @@ UProceduralMeshComponent* AVoxelWaterSheetActor::GetOrCreateSheetComp(FSheet& Sh
 	{
 		return Sheet.Comp;
 	}
-	// Named for the log, not for lookup: nothing addresses these by name.
+	// Named for the log, not for lookup: nothing addresses these by name. The
+	// serial suffix is load-bearing -- see CompNameSerial's comment in the
+	// header for the displace-on-name-collision cost it avoids.
 	UProceduralMeshComponent* C = NewObject<UProceduralMeshComponent>(
-		this, *FString::Printf(TEXT("LakeBasin_%d_%d_%d"), Sheet.TileX, Sheet.TileY, Sheet.BasinId));
+		this, *FString::Printf(TEXT("LakeBasin_%d_%d_%d_g%u"), Sheet.TileX, Sheet.TileY, Sheet.BasinId,
+		                       ++CompNameSerial));
 	C->SetupAttachment(Mesh);
 	C->SetMobility(EComponentMobility::Movable);
 	C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -562,6 +565,24 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 	{
 		return;
 	}
+
+	// Destroy parked leftovers a few per tick. 32 x ~37 us (the measured
+	// per-component DestroyComponent cost on the LSFIX leg) is ~1.2 ms worst
+	// case -- against the 17.7 ms the old destroy-all-in-one-tick hitch cost.
+	// Drained BEFORE any other work so a teleport's 495 leftovers cannot starve
+	// behind a busy rebuild rotation.
+	{
+		int32 Destroyed = 0;
+		while (PendingDestroy.Num() > 0 && Destroyed < 32)
+		{
+			UProceduralMeshComponent* C = PendingDestroy.Pop(EAllowShrinking::No);
+			if (C != nullptr)
+			{
+				C->DestroyComponent();
+			}
+			++Destroyed;
+		}
+	}
 	UWorld* World = GetWorld();
 	UVoxelWaterSubsystem* Water = World ? World->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
 	if (!Water)
@@ -638,17 +659,17 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 				PendingTiles.Add(FIntPoint(Tx, Ty));
 			}
 		}
-		// Every previous basin is about to be re-gathered, so destroying every
-		// per-basin component cannot leave an orphan drawing a lake that is no
-		// longer in range. The alternative -- matching old sheets to new by
-		// basin key -- saves a rebuild the per-tick budget already spreads out.
+		// PARK, DON'T DESTROY -- see AdoptableSheets in the header. Destroying
+		// everything here cost a measured 17.7 ms single-tick hitch and deleted
+		// every lake for the ~5 s the rebuild drain took; parking lets the
+		// re-gather adopt unchanged basins (~98% on the measured legs) and keeps
+		// them DRAWING throughout. Whatever the new gather does not reclaim is
+		// flushed to PendingDestroy when the last tile lands, and destroyed a few
+		// per tick -- an out-of-range lake therefore lingers a few extra ticks,
+		// which is the deliberate price of never blinking the in-range ones.
 		for (FSheet& Old : Sheets)
 		{
-			if (Old.Comp != nullptr)
-			{
-				Old.Comp->DestroyComponent();
-				Old.Comp = nullptr;
-			}
+			AdoptableSheets.Add(FIntVector(Old.TileX, Old.TileY, Old.BasinId), Old);
 		}
 		Sheets.Reset();
 		GatherCenterXY = CamXY;
@@ -695,14 +716,70 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 			S.MaxXUU = B.MaxXUU;
 			S.MaxYUU = B.MaxYUU;
 			S.StepPx = StepForBasin(FMath::Max(B.MaxXUU - B.MinXUU, B.MaxYUU - B.MinYUU));
-			// No component yet -- created lazily on first non-empty build, see
-			// GetOrCreateSheetComp.
+			// ADOPT the previous gather's component when the basin is unchanged --
+			// same datum, same extent, same decimation -- so it never rebuilds and
+			// never stops drawing. Geometry equality is exact-compare on purpose:
+			// these fields are copied from the basin table, not derived, so an
+			// unchanged basin reproduces them bit-for-bit, and a tolerance would
+			// only invent a class of nearly-adopted basins with stale meshes.
+			// An entry that exists but fails the test is a CHANGED basin: its old
+			// component is queued for destruction and it rebuilds fresh.
+			if (FSheet* Old = AdoptableSheets.Find(FIntVector(S.TileX, S.TileY, S.BasinId)))
+			{
+				const bool bSame = Old->bBuilt && !Old->bUnresolved && Old->Comp != nullptr
+					&& Old->SurfaceZUU == S.SurfaceZUU && Old->StepPx == S.StepPx
+					&& Old->MinXUU == S.MinXUU && Old->MinYUU == S.MinYUU
+					&& Old->MaxXUU == S.MaxXUU && Old->MaxYUU == S.MaxYUU;
+				if (bSame)
+				{
+					S.Comp = Old->Comp;
+					S.bBuilt = true;
+					S.LodKey = Old->LodKey;
+					S.bUniformCoarse = Old->bUniformCoarse;
+					S.bHadHole = Old->bHadHole;
+					S.HoleUU = Old->HoleUU;
+					S.RectCount = Old->RectCount;
+					TotalRects += Old->RectCount;
+				}
+				else if (Old->Comp != nullptr)
+				{
+					PendingDestroy.Add(Old->Comp);
+				}
+				AdoptableSheets.Remove(FIntVector(S.TileX, S.TileY, S.BasinId));
+			}
 			Sheets.Add(S);
 		}
 		UE_LOG(LogVoxelEarth, Log,
 		       TEXT("Lake sheets: tile (%d,%d) contributed %d basin(s) in %.1f ms; %d tile(s) left, %d basin(s) so far"),
 		       T.X, T.Y, Found.Num(), (FPlatformTime::Seconds() - StartSec) * 1000.0, PendingTiles.Num(),
 		       Sheets.Num());
+		if (PendingTiles.Num() == 0 && AdoptableSheets.Num() > 0)
+		{
+			// The gather is complete, so anything still parked is a basin the new
+			// scan does not contain -- out of range, or gone from the table. Flush
+			// to the amortised destroy queue; see the park site for why they were
+			// kept drawing until now.
+			for (TPair<FIntVector, FSheet>& Left : AdoptableSheets)
+			{
+				if (Left.Value.Comp != nullptr)
+				{
+					PendingDestroy.Add(Left.Value.Comp);
+				}
+			}
+			int32 Adopted = 0;
+			for (const FSheet& Sh : Sheets)
+			{
+				if (Sh.bBuilt)
+				{
+					++Adopted; // built at gather-complete = adopted (nothing has rebuilt yet)
+				}
+			}
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: gather complete -- %d of %d basin(s) adopted intact, %d leftover ")
+			       TEXT("component(s) queued for amortised destroy."),
+			       Adopted, Sheets.Num(), AdoptableSheets.Num());
+			AdoptableSheets.Empty();
+		}
 		return; // one unit of work per tick, tile reads included
 	}
 
