@@ -194,6 +194,48 @@ if ($VoxelCoreLib -and (Test-Path $VoxelCoreRoot)) {
     $newest = Get-ChildItem $scanDirs -Recurse -Include *.cpp, *.h, *.hpp, *.inl -File `
               -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending |
               Select-Object -First 1
+    # ASK CMAKE BEFORE REFUSING. The mtime scan above is a PROXY, and it has a
+    # false-positive class this script has already been bitten by once (that is
+    # why tests/ and bench/ are excluded). The remaining case: a header in
+    # include/ that NO translation unit in the lib compiles. voxel-core is
+    # largely header-only from the UE side, so a header can be edited, be the
+    # newest file in include/, and be genuinely irrelevant to voxelcore.lib.
+    #
+    # MEASURED 2026-08-28: brickpack.h (committed 09:00) refused every capture
+    # against a lib from 03:15. A full `cmake --build` then relinked NOTHING and
+    # left the lib mtime untouched -- because brickpack.h is included only by
+    # other HEADERS (covervolume.h, craftlattice.h, craftvolume.h) and by the UE
+    # side, never by a .cpp that goes into the lib. The lib was current the whole
+    # time and the guard was blocking real work with a false alarm.
+    #
+    # CMAKE HAS THE REAL DEPENDENCY GRAPH AND THIS SCRIPT DOES NOT. So when the
+    # proxy trips, hand the question to the authority: build the lib target and
+    # see whether the artefact actually changes. This can only ever turn a
+    # would-be REFUSAL into a pass, and only when the build system itself says
+    # there was nothing to do -- it cannot weaken the guard against a lib that is
+    # genuinely behind, because that lib relinks and its mtime moves.
+    if ($newest -and $newest.LastWriteTimeUtc -gt $libTime) {
+        Write-Host ("  voxelcore.lib looks stale by mtime (newest: $($newest.Name)). " +
+                    'Asking cmake whether it actually is...')
+        $cmakeDir = Split-Path (Split-Path $VoxelCoreLib -Parent) -Parent
+        try {
+            & cmake --build $cmakeDir --config Release --target voxelcore 2>&1 | Out-Null
+        } catch {
+            # cmake missing or the target is named otherwise: fall through to the
+            # refusal below. A guard that cannot check must not pass.
+        }
+        $libTimeAfter = (Get-Item $VoxelCoreLib).LastWriteTimeUtc
+        if ($libTimeAfter -eq $libTime) {
+            Write-Host ("  cmake relinked nothing: voxelcore.lib is CURRENT. " +
+                        "$($newest.Name) does not compile into it. Proceeding.")
+            $newest = $null   # proxy overruled by the authority
+        } else {
+            Write-Host "  cmake rebuilt it ($libTime -> $libTimeAfter UTC)."
+            $libTime = $libTimeAfter
+            $newest = $null   # genuinely stale, and now genuinely fixed
+            # The DLL check below still runs, and WILL refuse until the relink.
+        }
+    }
     if ($newest -and $newest.LastWriteTimeUtc -gt $libTime) {
         throw ("REFUSING TO START: voxelcore.lib is STALE (lib $libTime UTC, newest source " +
                "$($newest.LastWriteTimeUtc) UTC -- $($newest.Name)). This capture would " +
