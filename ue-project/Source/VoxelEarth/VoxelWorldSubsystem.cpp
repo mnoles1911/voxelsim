@@ -8151,9 +8151,35 @@ struct FVoxelWorldImpl
 
 	// Cumulative counters, logged periodically (LogVoxelPerf, every ~5s) --
 	// never per-chunk (docs/m1-plan.md: "log cumulative ... periodically").
+	//
+	// SEMANTIC CHANGE 2026-08-28: TotalChunksLoaded now also counts a demand
+	// chunk's FIRST BRICK-RESIDENT SETTLE (DrainResults / DrainGameThreadMesh,
+	// after VoxelBrickCpuArm::Publish) when terrain quads are retired. Before
+	// this date the only increments were the two quad-pool first-load sites in
+	// ApplyMeshResult -- both dead under voxel.Terrain.RetireQuads, where every
+	// chunk applies with zero quads -- plus park adoption. So on a marcher leg
+	// loaded= counted ADOPTIONS ONLY: GTSPLIT-A.log ended at loaded=60984
+	// EXACTLY == speculation "cumulative adopted=60984" while the brick pool
+	// held ~80k resident chunks (506,603 bricks). (The :17558 adoption
+	// increment was added so adopted chunks would not be invisible to this
+	// counter; by GTSPLIT-A only adopted chunks were visible to it.)
+	// CONSEQUENCE FOR LEG COMPARISONS: every marcher-leg loaded=, chunksPerSec
+	// and per-window rate logged before 2026-08-28 undercounts by the demand
+	// population. Do NOT compare those numbers across this boundary; quad-leg
+	// numbers are unaffected (the new site is gated on retirement).
 	int64 TotalChunksLoaded = 0;
 	int64 TotalChunksUnloaded = 0;
 	int64 TotalQuadsLoaded = 0;
+	// The marcher-path share of TotalChunksLoaded: demand chunks counted at
+	// their first brick-resident settle (never adoptions, never quad-pool
+	// first loads -- disjoint by construction with ChunksAdoptedTotal and the
+	// bWasFirstLoad sites). Exists so a log can PROVE the 2026-08-28 fix
+	// counts the right population: on a marcher leg,
+	//   loaded ~= ChunksAdoptedTotal + brickFirstLoads (+ pre-flip quad loads)
+	// must reconcile, and brickFirstLoads must track the brick pool's own
+	// resident-chunk census rather than the adoption count. Printed at the
+	// END of the "Voxel streaming:" line (old-leg-grep rule).
+	int64 BrickChunksLoadedTotal = 0;
 	float LogTimerAccumSeconds = 0.f;
 	// S0-2: TotalChunksLoaded as of the previous MaybeLogCounters window, so
 	// the periodic log can report a per-window rate (apply rate decaying
@@ -11960,12 +11986,27 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	VoxelMarchPublishStreamingState(JobsInFlightCounter.GetValue(), PendingJobNum(),
 	                                (int64)TotalChunksLoaded);
 
+	// brickFirstLoads= appended 2026-08-28 (END of line, old-leg-grep rule):
+	// the marcher-path share of loaded= (see BrickChunksLoadedTotal's
+	// declaration). The reconciliation a marcher leg must pass:
+	//   loaded ~= brickFirstLoads
+	//             + speculation line's "cumulative adopted=" (SpecAdoptedTotal)
+	//             + parking line's cumulative adopted (demand re-parks)
+	//             + pre-flip quad loads from the -ExecCmds startup window
+	// -- the three right-hand counters are the only OTHER TotalChunksLoaded
+	// increments that can fire on a marcher leg. GTSPLIT-A failed the
+	// equivalent identity by the entire demand population (loaded=60984 ==
+	// spec adopted=60984, ~80k brick-resident chunks). On a quad leg
+	// brickFirstLoads must print 0 for the whole leg -- nonzero there means
+	// the retirement gate on the new increment sites broke.
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel streaming: loaded=%lld unloaded=%lld quads=%lld tracked=%d jobsInFlight=%d pendingJobs=%d ")
-	       TEXT("pendingGameThread=%d pendingUnload=%d underground=%d deepTracked=%d deepWithGeometry=%d residentQuads=%lld"),
+	       TEXT("pendingGameThread=%d pendingUnload=%d underground=%d deepTracked=%d deepWithGeometry=%d residentQuads=%lld ")
+	       TEXT("brickFirstLoads=%lld"),
 	       (long long)TotalChunksLoaded, (long long)TotalChunksUnloaded, (long long)TotalQuadsLoaded, ChunkRecords.Num(),
 	       JobsInFlightCounter.GetValue(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
-	       bAnchorUnderground ? 1 : 0, DeepTracked, DeepWithGeometry, (long long)ResidentQuads);
+	       bAnchorUnderground ? 1 : 0, DeepTracked, DeepWithGeometry, (long long)ResidentQuads,
+	       (long long)BrickChunksLoadedTotal);
 
 	// THE THREE POPULATIONS jobsInFlight= COMPRESSES, published separately so
 	// no future reader has to reverse-engineer them. jobsInFlight above blends
@@ -25547,12 +25588,22 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			++LevelZeroQuadTotal[FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 		}
 		++Applied; // a live result: this IS a render-thread-facing apply
+		// Sampled BEFORE ApplyMeshResult, which sets it: first-settle is the
+		// brick path's only first-load discriminator. A zero-quad chunk never
+		// moves PoolSlot off INDEX_NONE and never acquires a component, so the
+		// quad path's bWasFirstLoad shape does not exist for it.
+		const bool bBrickFirstSettle = !Rec->bMeshSettled;
 		// Both forms are handed over: exactly one of them is populated, and
 		// ApplyMeshResult picks its branch on which. The payload is passed by
 		// const reference and its refcount released when Result goes out of
 		// scope at the top of the next iteration.
-		if (ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads),
-		                    /*bIsGameThreadMesh*/ false, Result.GpuQuads, int32(Result.GpuQuadCount)))
+		// Return value doubles as "the quad path counted this as a first load"
+		// (both bWasFirstLoad increments return true through it) -- the
+		// exclusion the brick-side count below needs.
+		const bool bQuadFirstLoad =
+		    ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads),
+		                    /*bIsGameThreadMesh*/ false, Result.GpuQuads, int32(Result.GpuQuadCount));
+		if (bQuadFirstLoad)
 		{
 			++ProxiesCreated;
 		}
@@ -25578,6 +25629,51 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			// the result would still look like terrain.
 			VoxelApplyFast::ShadingForPublish(Result.Key, Result.BrickPack, Root,
 			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams));
+
+		// THE MARCHER-PATH LOAD COUNT (2026-08-28; see TotalChunksLoaded's
+		// declaration for the dated semantics). Under voxel.Terrain.RetireQuads
+		// every demand chunk applies with zero quads -- bricks went to the pool
+		// either direct on the GPU (AddChunkFromGpu / the worklist claim, done
+		// before OnGpuMeshJobComplete ever enqueued this result) or via the
+		// Publish call just above (CPU arm) -- so ApplyMeshResult exits its
+		// NumQuads==0 branch before either bWasFirstLoad increment and loaded=
+		// saw NONE of them. GTSPLIT-A: loaded=60984 == cumulative adopted=60984
+		// against ~80k brick-resident chunks. THE RULE: a chunk counts as
+		// loaded at the moment it becomes DRAWN. For a demand chunk on a
+		// marcher leg that is HERE, its first settle with the brick volume
+		// holding it; for a parked speculative chunk it is ADOPTION (:17558's
+		// increment -- spec results early-return in OnGpuMeshJobComplete and
+		// never reach this loop, so the two sites are disjoint and a spec
+		// chunk is counted exactly once). A demand chunk later parked and
+		// re-adopted counts again at adoption, exactly as a re-loaded quad
+		// chunk always has -- loaded= is cumulative chunk-loads, not distinct
+		// chunks. Guards, each load-bearing:
+		//   bBrickFirstSettle  -- once per record: a re-delivery cannot happen
+		//                         (workers run only a chunk's first mesh) but a
+		//                         band-settled record that later drains must
+		//                         not count twice;
+		//   !bQuadFirstLoad    -- the startup window: -ExecCmds cvars land
+		//                         AFTER streaming begins, so pre-flip chunks
+		//                         mesh real quads and count at bWasFirstLoad --
+		//                         counting them here too would double-count;
+		//   VoxelTerrainQuadsRetired() -- on a QUAD leg a buried zero-quad
+		//                         chunk also brick-publishes (P2 coverage) but
+		//                         has never counted as loaded; counting it
+		//                         would break every quad-leg comparison;
+		//   HoldsTerrain       -- NOT HoldsGeometry (the trap that has caused
+		//                         every marcher streaming bug): the pool's
+		//                         FindChunkSlot is the engine's own residency
+		//                         binding, and it is what excludes a chunk
+		//                         whose pack was gated off or empty -- nothing
+		//                         marchable arrived, so nothing loaded.
+		if (bBrickFirstSettle && !bQuadFirstLoad && VoxelTerrainQuadsRetired() &&
+		    Rec->HoldsTerrain(Result.Key))
+		{
+			++TotalChunksLoaded;
+			++BrickChunksLoadedTotal;
+			++LevelChunksLoadedTotal[FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+			Rec->LoadedAtSeconds = ElapsedSeconds;
+		}
 
 		// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2):
 		// DeliverToApplyMs, immediately AFTER the apply rather than inside
@@ -25753,7 +25849,13 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			UE_LOG(LogVoxelEdit, Log, TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d"), LevelKey.Level,
 			       LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num());
 		}
-		if (ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true))
+		// Same first-settle sample as DrainResults takes before ITS apply: this
+		// queue carries both FIRST loads (chunks born edited, routed here
+		// instead of the workers) and re-meshes, and only the former may count.
+		const bool bBrickFirstSettle = !Rec->bMeshSettled;
+		const bool bQuadFirstLoad =
+		    ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true);
+		if (bQuadFirstLoad)
 		{
 			++ProxiesCreated;
 		}
@@ -25764,6 +25866,23 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			LevelKey, BrickPack,
 			VoxelApplyFast::ShadingForPublish(LevelKey, BrickPack, Root,
 			                                  &SampleChunkParamsForPool, &ShadingFromChunkParams));
+		// Marcher-path load count, the DrainResults twin (2026-08-28 -- the full
+		// WHY, the rule and every guard's reason live at that site and on
+		// TotalChunksLoaded's declaration). Here it covers the one demand
+		// producer DrainResults never sees: a chunk born inside an edited brick
+		// loads through THIS queue under retirement (PackChunkMaterialising,
+		// zero quads), and on the quad path its bWasFirstLoad counted -- so
+		// without this twin an edited-area marcher chunk would be invisible to
+		// loaded= exactly the way the whole demand population was. Re-meshes
+		// fail bBrickFirstSettle and never count.
+		if (bBrickFirstSettle && !bQuadFirstLoad && VoxelTerrainQuadsRetired() &&
+		    Rec->HoldsTerrain(LevelKey))
+		{
+			++TotalChunksLoaded;
+			++BrickChunksLoadedTotal;
+			++LevelChunksLoadedTotal[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
+			Rec->LoadedAtSeconds = ElapsedSeconds;
+		}
 	}
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);
 	ThisFrameEditRemeshes = Count;
