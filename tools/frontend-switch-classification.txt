@@ -436,6 +436,10 @@ VoxelOceanSurvey = Fixture: drives the run and exits on its own; the naming conv
 VoxelOceanSurveyStepM = Parameter of a self-driving fixture; only meaningful when its fixture switch is also present, so suppressing the menu is correct.
 VoxelOverlayShot = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelPerfFlight = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
+VoxelPerfShotEveryM = Parameter of a self-driving fixture: the moving-capture shutter step, in metres along the -VoxelPerfFlight=line traverse. Only meaningful inside a -VoxelPerfRun= leg -- the engine ABORTS the run if it is present on any other flight -- so suppressing the menu is correct.
+VoxelPerfShotMaxCount = Parameter of a self-driving fixture; only meaningful when -VoxelPerfShotEveryM= is also present, so suppressing the menu is correct.
+VoxelPerfShotName = Parameter of a self-driving fixture; only meaningful when -VoxelPerfShotEveryM= is also present, so suppressing the menu is correct.
+VoxelPerfShotStartM = Parameter of a self-driving fixture; only meaningful when -VoxelPerfShotEveryM= is also present, so suppressing the menu is correct.
 VoxelReadyProbeLog = ACCIDENTAL ('Probe'). Enables a readiness log line; a diagnostic, not a run that drives itself.
 VoxelReplicationSelfTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelSaveWorldAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.

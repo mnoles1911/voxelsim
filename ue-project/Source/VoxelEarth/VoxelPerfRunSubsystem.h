@@ -89,6 +89,15 @@ private:
 	// the pawn (and hence the circle's center) has been captured.
 	void StepFlightPath(float DeltaTime);
 
+	// Fires the shutter if this frame's PLACED pose crossed a distance boundary
+	// along the line flight. Called from StepFlightPath's Line branch with the
+	// pose the pawn was ACTUALLY placed at this tick -- not the pose the path
+	// math wanted -- because the frame about to be drawn is the frame at the
+	// pose the pawn is at now. Disarmed (ShotEveryUU == 0) it is one compare
+	// and a return. See its definition for why the trigger is distance and not
+	// the clock.
+	void MaybeFireMovingShot(const FVector& PlacedLocationUU, const FRotator& PlacedRotation);
+
 	// Computes final stats, writes the JSON summary, logs it, and requests
 	// process exit.
 	void FinishRun();
@@ -202,6 +211,111 @@ private:
 	// Seeded from FixedHeightUU (surface-at-origin + HeightAboveSurfaceUU) on
 	// path init, so frame 1 does not itself pop.
 	double LineLastZUU = 0.0;
+
+	// ========================================================================
+	// MOVING CAPTURES -- -VoxelPerfShotEveryM=<metres>, 0 = off, the default.
+	// ========================================================================
+	//
+	// WHY THIS EXISTS. Every capture this project takes settles first: the
+	// camera is parked, the cascade is allowed to converge for ~120 s, and only
+	// then does the shutter fire. That protocol is what makes two arms
+	// comparable -- and it is also, structurally, why two live decisions cannot
+	// be settled at all:
+	//
+	//   * docs/outer-ring-stagger-2026-08-28.md, "WHAT NO INSTRUMENT HERE CAN
+	//     SHOW": the stagger arm trades a transient far-field lag WHILE MOVING
+	//     for a better worst frame. A settled capture lets both arms converge
+	//     on the same world well before the shutter, so the parked A/B is
+	//     "structurally incapable of showing the thing this change trades
+	//     away". That arm is parked on exactly this.
+	//   * The half-res marcher was rejected for being "grainy at distance while
+	//     moving" -- a verdict nobody could photograph, so nobody could check
+	//     it, argue with it, or measure a cure against it.
+	//
+	// The project's own limitation note reads "no moving-capture capability
+	// exists". This is that capability.
+	//
+	// WHY THE SHUTTER TRIGGERS ON DISTANCE TRAVELLED AND NOT ON THE CLOCK: see
+	// UVoxelPerfRunSubsystem::MaybeFireMovingShot, where the trigger lives. It
+	// is the one design decision that makes these frames evidence rather than
+	// pictures, so the argument is written at the site that acts on it.
+	//
+	// A LEG CARRYING MOVING CAPTURES IS AN IMAGE LEG, AND ITS FRAME TIMES ARE
+	// NOT A TIMING RESULT. A shutter stalls the frame it is serviced on, so a
+	// moving capture perturbs the very timing it is flying through. That is a
+	// rule, not a caveat -- see the arming Warning in Initialize, the
+	// end-of-run restatement in FinishRun, and frameTimingAdmissible in the
+	// summary JSON.
+	//
+	// LINE FLIGHT ONLY. Armed on any other flight this ABORTS the run rather
+	// than flying it unshot; the refusal and its reasoning are in Initialize.
+
+	// The step, in UU. 0 means disarmed, which is the default, and is why every
+	// existing leg is byte-identical: nothing below this line runs.
+	double ShotEveryUU = 0.0;
+
+	// -VoxelPerfShotStartM=<metres>, default 0 -- the distance the FIRST shot
+	// fires at. Exists so a leg can skip the opening stretch, where the pawn is
+	// still flying out of the bubble -VoxelPerfPreflightSec= warmed around the
+	// spawn and the far field is not yet in the regime being judged.
+	double ShotStartUU = 0.0;
+
+	// -VoxelPerfShotMaxCount=<n>, default 32. A 300 s line leg at 20 m/s covers
+	// 6 km; at a 128 m step that is 47 shots, and a 2560x1440 PNG is a few MB.
+	// The cap is here so an over-eager step cannot quietly fill the disk partway
+	// through a leg that then dies for an unrelated-looking reason.
+	int32 ShotMaxCount = 32;
+
+	// -VoxelPerfShotName=<tag>, sanitised at the parse site. Goes in the
+	// filename so two arms' shots can share one directory and still be told
+	// apart by a comparer. Sanitised for the reason
+	// VoxelSkyLadderFixture.cpp:743 sanitises its arm value -- a screenshot
+	// basename with a '.' in it is an extension waiting to be misparsed by
+	// every tool downstream -- and, additionally, because this is the ONE
+	// operator-controlled string that reaches the summary JSON, whose writer
+	// documents itself as having "no user-controlled strings to escape".
+	FString ShotTag;
+
+	// Counted at the site that acts (MaybeFireMovingShot) and reported in
+	// FinishRun. "Armed every 512 m and fired 0" is a loud line there, not
+	// silence: an armed-but-inert image leg that says nothing gets read as
+	// "the change is invisible", which is the most expensive way to be wrong
+	// about a renderer.
+	int32 ShotsFired = 0;
+
+	// Index of the NEXT nominal boundary to shoot; boundary i is at
+	// ShotStartUU + i * ShotEveryUU. Monotone and never rewound, so no boundary
+	// can be shot twice however the path's Z-follower jitters.
+	int32 NextShotIndex = 0;
+
+	// Loud-inertness evidence: how far the anchor actually got from the flight
+	// origin. If shots are armed every 512 m and this says the leg never passed
+	// 300 m, that is the ANSWER to "why did nothing fire", and it belongs in the
+	// log rather than in the head of whoever launched the leg.
+	double MaxDistanceReachedUU = 0.0;
+
+	// Boundaries the path stepped straight over with no frame landing in them.
+	// One frame at 20 m/s covers 0.3-2 m, so this is only reachable with a step
+	// smaller than a frame's travel or with a multi-second hitch. Counted
+	// because a boundary SKIPPED on one arm and HIT on the other is precisely
+	// the asymmetry that makes two shot lists disagree -- and the slower arm is
+	// the one that skips, which is the direction that would flatter it.
+	int32 ShotBoundariesSkipped = 0;
+
+	// THE ONE-FRAME BRACKET.
+	//
+	// FScreenshotRequest only RAISES A FLAG; the viewport services it at the end
+	// of a subsequent draw (VoxelSkyLadderFixture.cpp:115-121). So the pose
+	// logged when the shutter is REQUESTED is a LOWER BOUND on the pose actually
+	// drawn, and the true one lies between it and the pose one frame later.
+	// Rather than assume that gap is zero -- a join computed instead of checked,
+	// which is the shape of a well-worn family of bugs in this tree -- the tick
+	// after a request logs the pose again, so the bracket is on the record and a
+	// reader can see how wide it was on THIS leg instead of trusting that it is
+	// narrow.
+	bool bShotPending = false;
+	int32 PendingShotNominalM = 0;
+	FVector PendingShotLocationUU = FVector::ZeroVector;
 
 	// -VoxelPerfPreflightSec=<seconds>, default 0 (no change from prior
 	// behaviour: the flight starts advancing on the very first tick a pawn

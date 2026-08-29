@@ -22,6 +22,7 @@
 #include "Misc/OutputDeviceRedirector.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
+#include "UnrealClient.h" // FScreenshotRequest -- the ONE shutter this project uses; see MaybeFireMovingShot
 
 namespace
 {
@@ -320,6 +321,159 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfLingerSec="), LingerSecValue) && LingerSecValue > 0.f)
 		{
 			LingerSec = LingerSecValue;
+		}
+
+		// ====================================================================
+		// MOVING CAPTURES: -VoxelPerfShotEveryM= (plus -VoxelPerfShotStartM=,
+		// -VoxelPerfShotMaxCount=, -VoxelPerfShotName=)
+		// ====================================================================
+		//
+		// COMMAND-LINE SWITCHES AND NOT CVARS, for the same reason
+		// -VoxelPerfFlight= above is one and the same reason -VoxelRiverRibbons
+		// is: this has to be live before BeginPlay. An -ExecCmds cvar lands
+		// after streaming has already begun building a desired set, and the
+		// first shot of a line flight can be at distance 0 -- i.e. before any
+		// cvar this run will ever see.
+		//
+		// PARSED AS A STRING AND THEN CONVERTED, not straight into a float.
+		// FParse::Value into a float cannot tell "-VoxelPerfShotEveryM=oops"
+		// from "the switch was absent": both leave the member at 0, i.e.
+		// DISARMED. An image leg that silently took no images is the exact
+		// failure this whole feature exists to make impossible, so the two
+		// cases are told apart here and only one of them is survivable.
+		//
+		// PARSED AFTER the flight has been resolved above, because the refusal
+		// below depends on which flight this is.
+		FString ShotEveryRaw;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfShotEveryM="), ShotEveryRaw))
+		{
+			const double ShotEveryM = FCString::Atod(*ShotEveryRaw);
+			if (ShotEveryM <= 0.0)
+			{
+				// Abort rather than fall back to disarmed -- the same choice the
+				// -VoxelPerfStaticAt branch above makes, for the same reason. A
+				// leg that flew the whole traverse, wrote a perfectly plausible
+				// summary JSON and produced no images at all would be read as
+				// "the change is invisible" rather than as "the camera was never
+				// loaded".
+				UE_LOG(LogVoxelPerf, Error,
+				       TEXT("VoxelPerfRun: -VoxelPerfShotEveryM=%s is not a positive number of metres. Aborting run ")
+				       TEXT("rather than flying an image leg that takes no images."),
+				       *ShotEveryRaw);
+				bRequested = false;
+				return;
+			}
+
+			// ================================================================
+			// LINE FLIGHT ONLY -- AND THIS REFUSES RATHER THAN DEGRADES.
+			// ================================================================
+			//
+			// The trigger is horizontal distance from the flight origin, and
+			// that is a usable path parameter for exactly one of the four
+			// flights:
+			//
+			//   line        -- leaves the origin on a fixed heading and never
+			//                  returns, so distance-from-origin is strictly
+			//                  increasing and indexes the ground one-to-one.
+			//                  This is the case the feature is for.
+			//   surface     -- a CLOSED 100 m circle. Distance-from-origin is
+			//   underground    pinned at the radius from the first frame
+			//                  onward, so a distance trigger fires once and
+			//                  then never again -- or, with a step under 100 m,
+			//                  fires a burst in the first second and labels it
+			//                  a multi-kilometre traverse.
+			//   static      -- never leaves the origin at all.
+			//
+			// Degrading to "shoot every N seconds instead" on those was
+			// considered and rejected: it would hand back frames that LOOK like
+			// a matched pair and are not, which is strictly worse than handing
+			// back no frames. Arc length along the circle would be an honest
+			// parameter, but no decision is waiting on a circling capture, so
+			// it is not built and this refuses instead of guessing.
+			if (Flight != EVoxelPerfFlight::Line)
+			{
+				UE_LOG(LogVoxelPerf, Error,
+				       TEXT("VoxelPerfRun: -VoxelPerfShotEveryM= requires -VoxelPerfFlight=line. The shutter triggers ")
+				       TEXT("on distance from the flight origin, and that only indexes the ground on a straight ")
+				       TEXT("traverse -- the circle flights sit at a constant radius and the static fixture never ")
+				       TEXT("moves. Aborting run rather than producing frames that look like a matched pair and ")
+				       TEXT("are not."));
+				bRequested = false;
+				return;
+			}
+
+			ShotEveryUU = ShotEveryM * 100.0;
+
+			// Same guarded-scalar shape as -VoxelPerfSpeed/-VoxelPerfDepth
+			// above: parse into a local, only overwrite the member on a
+			// present-and-positive value. 0 means "start at the origin", which
+			// is already the default, so there is nothing to abort over.
+			float ShotStartM = 0.f;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfShotStartM="), ShotStartM) && ShotStartM > 0.f)
+			{
+				ShotStartUU = double(ShotStartM) * 100.0;
+			}
+
+			int32 MaxCountValue = 0;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfShotMaxCount="), MaxCountValue) && MaxCountValue > 0)
+			{
+				ShotMaxCount = MaxCountValue;
+			}
+
+			FString TagValue;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfShotName="), TagValue) && !TagValue.IsEmpty())
+			{
+				// SANITISED TO [A-Za-z0-9_], and the whitelist is deliberate
+				// rather than a blacklist of the characters that bit us last
+				// time. This one string reaches three places that each have a
+				// different way of being wrong about it: a screenshot basename
+				// (where a '.' is an extension waiting to be misparsed --
+				// VoxelSkyLadderFixture.cpp:743), the comparer in
+				// tools/voxel-pair-moving-shots.py (which splits these names on
+				// '-'), and the summary JSON, whose writer documents itself as
+				// having "no user-controlled strings to escape". A whitelist is
+				// the only version of this that is still true after the next
+				// person adds a fourth reader.
+				FString Safe;
+				Safe.Reserve(TagValue.Len());
+				for (const TCHAR C : TagValue)
+				{
+					Safe.AppendChar(FChar::IsAlnum(C) ? C : TEXT('_'));
+				}
+				ShotTag = Safe;
+			}
+
+			// ================================================================
+			// THIS IS AN IMAGE LEG. ITS FRAME TIMES ARE NOT A TIMING RESULT.
+			// ================================================================
+			//
+			// A rule, not a caveat, and it is stated at the moment of arming so
+			// nobody can launch this without being told.
+			//
+			// FScreenshotRequest stalls the frame it is serviced on: the
+			// viewport reads back the render target and the PNG encode runs off
+			// it. So a moving capture PERTURBS THE VERY TIMING IT IS FLYING
+			// THROUGH. A 32-shot leg puts 32 stalls into FrameMsSamples, and
+			// they land at p95 and max -- which is exactly where every streaming
+			// verdict in this project is read.
+			//
+			// Worse for an A/B: the stalls are NOT symmetric between arms. They
+			// fire at fixed DISTANCES, so the slower arm takes the same number
+			// of stalls over fewer frames and wears a larger fraction of them.
+			// A timing comparison drawn from two image legs would therefore be
+			// biased against the slower arm by the instrument itself.
+			//
+			// So: shoot images on one leg, take timings on another, and never
+			// quote the two out of the same run. The summary JSON carries
+			// frameTimingAdmissible: 0 for this leg so the rule survives the
+			// walk from this log line to whoever reads the artifact next month.
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("VoxelPerfShots ARMED: every %.0fm from %.0fm, at most %d shot(s), tag='%s'. THIS IS AN ")
+			       TEXT("IMAGE LEG -- the shutter stalls the frame it is serviced on, so THE FRAME-TIME NUMBERS IN ")
+			       TEXT("THIS RUN'S SUMMARY (p50/p95/max/hitches) ARE NOT ADMISSIBLE AS TIMING. Take timings on a ")
+			       TEXT("leg with no -VoxelPerfShotEveryM=."),
+			       ShotEveryUU / 100.0, ShotStartUU / 100.0, ShotMaxCount,
+			       ShotTag.IsEmpty() ? TEXT("<none>") : *ShotTag);
 		}
 
 		// -VoxelPerfLogInterval=, the SAME switch and the SAME 5 s default and
@@ -656,6 +810,16 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 			PC->SetControlRotation(NewRotation);
 		}
 		++TotalPathFrames;
+
+		// MOVING CAPTURES. Called HERE -- at the site that actually places the
+		// pawn, in the same tick as the placement, and handed the pose the pawn
+		// was ACTUALLY placed at rather than the pose the path math wanted --
+		// because the frame that is about to be drawn is the frame at the pose
+		// the pawn is at now. Disarmed by default (ShotEveryUU == 0), in which
+		// case this is one compare and a return, so every existing leg is
+		// byte-identical. See MaybeFireMovingShot for why the shutter triggers
+		// on distance travelled and not on the clock.
+		MaybeFireMovingShot(NewLocation, NewRotation);
 		return;
 	}
 
@@ -724,6 +888,184 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 	if (PC)
 	{
 		PC->SetControlRotation(NewRotation);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// THE SHUTTER TRIGGERS ON DISTANCE TRAVELLED, NOT ON THE CLOCK.
+//
+// This is the single decision that makes these frames evidence instead of
+// pictures, so the argument is written here, at the trigger, rather than in a
+// document that the next person editing this function will not have open.
+//
+// Two arms are compared by putting their frames side by side. That means
+// nothing unless the two frames are OF THE SAME GROUND FROM THE SAME POSE. The
+// line flight is deterministic -- fixed -VoxelSpawnAt, fixed -VoxelPerfHeading,
+// fixed -VoxelPerfSpeed, sun pinned with -VoxelTimeScale=0 -- so the ground in
+// frame is a function of ONE number: how far down the path the anchor is.
+// Trigger on that number and the two arms photograph the same ground by
+// construction.
+//
+// TRIGGER ON WALL-CLOCK TIME INSTEAD AND THE ARMS DIVERGE the moment they
+// differ in frame rate, in exactly the direction that poisons the result: the
+// SLOWER arm -- the one under suspicion, the one an armed change is supposed to
+// be judged on -- would be photographed over different ground, and any
+// difference in the picture could then be blamed on the change when it was
+// really a different hillside. An A/B whose confound points at the hypothesis
+// is worse than no A/B.
+//
+// (Honest note on what is and is not load-bearing TODAY. The line path's
+// position is currently a closed form in flight time --
+// LinearSpeedUUPerSecOverride * FlightSeconds, see StepFlightPath -- so for
+// THIS path, as it stands, a time trigger and a distance trigger would in fact
+// land on the same ground. That is a property of the current path math, not of
+// the method, and it is not something to build an archive on. The distance
+// formulation is the one that stays correct if the path is ever integrated per
+// frame, which any physics-driven, terrain-braked or variable-speed flight
+// would be; it is the one that still pairs two arms flown at different
+// -VoxelPerfSpeed; and it is the one that makes the FILENAME mean the ground
+// rather than the clock, which is what a comparer needs.)
+//
+// AND THE DISTANCE IS MEASURED, NOT RE-DERIVED. It comes from the pose the pawn
+// was actually placed at this frame, not from re-evaluating the path formula.
+// A join computed instead of checked is the shape of a well-worn family of bugs
+// in this tree, and here it would produce a filename stating a distance the
+// camera was never at -- an archive that lies quietly, forever.
+// ---------------------------------------------------------------------------
+void UVoxelPerfRunSubsystem::MaybeFireMovingShot(const FVector& PlacedLocationUU, const FRotator& PlacedRotation)
+{
+	// THE ONE-FRAME BRACKET (see bShotPending's doc comment in the header).
+	// Last frame asked for a shutter; the viewport services the request at the
+	// end of a subsequent draw. Log where the pawn is NOW, so the pose the frame
+	// was actually drawn at is BRACKETED by two logged poses instead of assumed
+	// to equal the first. This is cheap and it is the difference between "the
+	// lag is probably negligible" and a number on the record for this leg.
+	if (bShotPending)
+	{
+		bShotPending = false;
+		const double AdvanceUU = FVector::Dist2D(PlacedLocationUU, PendingShotLocationUU);
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("VoxelPerfShotBracket nominalM=%d advancedSinceRequestM=%.3f -- the drawn frame is somewhere in ")
+		       TEXT("[request pose, this pose]. FScreenshotRequest only raises a flag; the viewport services it at ")
+		       TEXT("the end of a subsequent draw, so this is the width of the uncertainty on that shot's pose."),
+		       PendingShotNominalM, AdvanceUU / 100.0);
+	}
+
+	if (ShotEveryUU <= 0.0)
+	{
+		// Disarmed -- the default, and the reason every existing leg is
+		// byte-identical: this is the whole cost of the feature when off.
+		return;
+	}
+
+	// Measured HORIZONTALLY from the flight origin, because the ground is
+	// indexed by XY: the line flight's Z is a rate-limited ground-follower
+	// (see StepFlightPath) whose vertical wander over a hillside is not
+	// progress along the path and must not count as any.
+	const double DistanceUU = FVector::Dist2D(PlacedLocationUU, CircleCenterUU);
+	MaxDistanceReachedUU = FMath::Max(MaxDistanceReachedUU, DistanceUU);
+
+	if (ShotsFired >= ShotMaxCount)
+	{
+		return; // cap already reached and already announced, once, below
+	}
+	if (DistanceUU < ShotStartUU + double(NextShotIndex) * ShotEveryUU)
+	{
+		return; // not at the next boundary yet
+	}
+
+	// WHICH boundary we are at, not merely that we passed one.
+	//
+	// A frame at 20 m/s covers 0.3-2 m, so normally ReachedIndex ==
+	// NextShotIndex and nothing below the FloorToInt32 does anything. A
+	// multi-second hitch (or a step smaller than one frame's travel) can step
+	// over one or more boundaries entirely. Shoot the NEAREST boundary behind
+	// the current pose -- the one with the smallest residual, i.e. the most
+	// honest filename -- and say out loud which ones were stepped over, because
+	// a boundary skipped on one arm and hit on the other is exactly the
+	// asymmetry that makes two shot lists disagree. Note which arm skips: the
+	// SLOWER one, which is the direction that would quietly flatter it.
+	const int32 ReachedIndex = FMath::FloorToInt32((DistanceUU - ShotStartUU) / ShotEveryUU);
+	const int32 Skipped = FMath::Max(0, ReachedIndex - NextShotIndex);
+	if (Skipped > 0)
+	{
+		ShotBoundariesSkipped += Skipped;
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("VoxelPerfShot: the path stepped over %d boundary/boundaries (nominal %.0fm..%.0fm) with no ")
+		       TEXT("frame landing in them -- those distances will be MISSING from this arm's shot list. If the ")
+		       TEXT("other arm HAS them they are not a comparable pair; drop them rather than pairing across."),
+		       Skipped,
+		       (ShotStartUU + double(NextShotIndex) * ShotEveryUU) / 100.0,
+		       (ShotStartUU + double(ReachedIndex - 1) * ShotEveryUU) / 100.0);
+	}
+
+	const double NominalUU = ShotStartUU + double(ReachedIndex) * ShotEveryUU;
+	const int32 NominalM = FMath::RoundToInt32(NominalUU / 100.0);
+
+	// THE NAME CARRIES THE ARM AND THE NOMINAL DISTANCE, because that is what
+	// makes two arms pairable at all: both arms name their 512 m shot "d00512"
+	// whatever their few-centimetre residuals were, so a comparer pairs by
+	// filename and never has to guess. The residual is NOT thrown away -- it is
+	// in the log line below, and checking that the two arms' ACTUAL distances
+	// agree is the comparer's job before anyone looks at a pixel.
+	//
+	// %05d so a directory listing sorts in flight order out to 99.9 km.
+	//
+	// The trailing '_' is not decoration. RequestScreenshot with
+	// bAddFilenameSuffix=true appends its own %05i uniqueness suffix, and
+	// without a separator "...d00512" + "00000" reads as one ten-digit run --
+	// see this project's own archive, which contains
+	// VoxelSkyLadder_00_00h0000000.png with exactly that problem.
+	const FString ShotName = ShotTag.IsEmpty()
+	                             ? FString::Printf(TEXT("VoxelMove-d%05d_"), NominalM)
+	                             : FString::Printf(TEXT("VoxelMove_%s-d%05d_"), *ShotTag, NominalM);
+
+	// LOGGED BEFORE THE SHUTTER, AND LOGGED IN FULL, so two arms' shot lists can
+	// be checked for agreement BEFORE any pixels are compared -- which is the
+	// order that keeps this an instrument rather than a slideshow. Every field a
+	// comparer needs in order to prove the two frames are of the same ground is
+	// on this one line: nominalM pairs them, actualM/residualM say how closely
+	// they really line up, and pos/yaw/pitch is the pose itself. A mismatch is
+	// therefore loud and mechanical, not a judgement call.
+	//
+	// GREP: "VoxelPerfShot n="
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("VoxelPerfShot n=%d/%d nominalM=%d actualM=%.3f residualM=%+.3f pos=(%.1f, %.1f, %.1f) ")
+	       TEXT("yaw=%.3f pitch=%.3f headingDeg=%.1f speedMPerSec=%.1f pathFrame=%d engineFrame=%llu ")
+	       TEXT("flightSec=%.3f name=%s"),
+	       ShotsFired + 1, ShotMaxCount, NominalM, DistanceUU / 100.0, (DistanceUU - NominalUU) / 100.0,
+	       PlacedLocationUU.X, PlacedLocationUU.Y, PlacedLocationUU.Z,
+	       PlacedRotation.Yaw, PlacedRotation.Pitch, HeadingDeg, LinearSpeedUUPerSecOverride / 100.0,
+	       TotalPathFrames, (unsigned long long)GFrameCounter,
+	       ElapsedSeconds - PreflightSec, *ShotName);
+
+	// THE SAME CALL AS EVERY OTHER FIXTURE IN THIS TREE, deliberately:
+	// FScreenshotRequest and NOT HighResShot, bShowUI=false,
+	// bAddFilenameSuffix=true. HighResShot re-renders through a tiled path with
+	// its own screen-percentage and post-process behaviour, so its output is not
+	// comparable to the rest of this project's capture archive -- and
+	// comparability across frames is the entire product here.
+	// VoxelSkyLadderFixture.cpp:779-786 states the same rule for the same
+	// reason. Lands in ue-project/Saved/Screenshots/WindowsEditor/.
+	FScreenshotRequest::RequestScreenshot(*ShotName, /*bShowUI*/ false, /*bAddFilenameSuffix*/ true);
+
+	++ShotsFired;
+	NextShotIndex = ReachedIndex + 1;
+	bShotPending = true;
+	PendingShotNominalM = NominalM;
+	PendingShotLocationUU = PlacedLocationUU;
+
+	if (ShotsFired >= ShotMaxCount)
+	{
+		// Announced ONCE, at the moment the cap bites, naming the distance it
+		// bit at -- so "the second half of the traverse has no images" is a line
+		// in the log rather than something noticed later from a short directory
+		// listing and mistaken for a crash.
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("VoxelPerfShot: -VoxelPerfShotMaxCount=%d reached at %.0fm from the origin. THE REST OF THIS ")
+		       TEXT("FLIGHT IS UNSHOT -- if the far end of the traverse is what you meant to look at, raise the cap ")
+		       TEXT("or widen -VoxelPerfShotEveryM=."),
+		       ShotMaxCount, DistanceUU / 100.0);
 	}
 }
 
@@ -816,6 +1158,63 @@ void UVoxelPerfRunSubsystem::FinishRun()
 			       TEXT("VoxelPerfRun: underground flight spent %.1f%% of frames ABOVE the surface -- these numbers are not an ")
 			       TEXT("underground measurement."),
 			       100.f * (1.f - UndergroundFraction));
+		}
+	}
+
+	// --- MOVING CAPTURES: THE ARMED-BUT-INERT CASE MUST BE LOUD --------------
+	//
+	// "Shots armed every 512 m and 0 fired" is a line, not silence. An image leg
+	// that produced no images and said nothing about it gets read as "the change
+	// is invisible", and a false null on a renderer is the most expensive way
+	// this tree has been wrong.
+	//
+	// This block only speaks when the feature was ARMED, so a leg that never
+	// asked for shots is byte-identical here too.
+	if (ShotEveryUU > 0.0)
+	{
+		// Named locals rather than inline expressions inside the UE_LOG, for the
+		// reason VoxelSkyLadderFixture.cpp:655 gives for the same choice: one of
+		// these is a temporary FString, and a temporary's `*` inside a log macro
+		// is exactly the kind of lifetime question nobody should have to answer
+		// while reading a report line.
+		const FString TagLabel = ShotTag.IsEmpty() ? FString(TEXT("<none>")) : ShotTag;
+		const FString FilePrefix = ShotTag.IsEmpty() ? FString(TEXT("VoxelMove"))
+		                                            : FString(TEXT("VoxelMove_")) + ShotTag;
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("VoxelPerfShots: armed every %.0fm from %.0fm (cap %d, tag='%s') -- fired=%d ")
+		       TEXT("skippedBoundaries=%d maxDistanceReachedM=%.1f. Images in Saved/Screenshots/WindowsEditor/ ")
+		       TEXT("as %s-d<metres>_*.png."),
+		       ShotEveryUU / 100.0, ShotStartUU / 100.0, ShotMaxCount, *TagLabel,
+		       ShotsFired, ShotBoundariesSkipped, MaxDistanceReachedUU / 100.0, *FilePrefix);
+
+		if (ShotsFired == 0)
+		{
+			// TWO-SIDED BY CONSTRUCTION: this cannot fire on a leg that shot
+			// anything, so it is a statement about THIS leg rather than a
+			// warning that appears in every run and is therefore read by
+			// nobody. And it names the reading that EXPLAINS the zero -- how far
+			// the anchor actually got -- instead of leaving "why did nothing
+			// fire" to be guessed at from a directory listing.
+			UE_LOG(LogVoxelPerf, Error,
+			       TEXT("VoxelPerfShots: ARMED EVERY %.0fm AND FIRED 0. THIS LEG PRODUCED NO IMAGES. The anchor ")
+			       TEXT("reached %.1fm from the flight origin and the first boundary is at %.0fm, so either the ")
+			       TEXT("flight was too short for the step (-VoxelPerfRun= / -VoxelPerfSpeed=) or ")
+			       TEXT("-VoxelPerfShotStartM= is beyond the end of the traverse. DO NOT read this leg as 'no ")
+			       TEXT("visible difference'."),
+			       ShotEveryUU / 100.0, MaxDistanceReachedUU / 100.0, ShotStartUU / 100.0);
+		}
+		else
+		{
+			// Restated at the END of the run as well as at arm time. The arming
+			// Warning is thousands of lines up the log by now, and the numbers
+			// it warns about are printed a few lines BELOW this one -- so this
+			// is where a reader scrolling to the result actually meets it.
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("VoxelPerfShots: %d shutter(s) fired during this flight. THE FRAME-TIME NUMBERS BELOW ARE ")
+			       TEXT("NOT ADMISSIBLE AS TIMING -- a screenshot stalls the frame it is serviced on, and those ")
+			       TEXT("stalls land in p95 and max. This is an IMAGE leg (frameTimingAdmissible: 0 in the ")
+			       TEXT("summary JSON); take timings on a leg with no -VoxelPerfShotEveryM=."),
+			       ShotsFired);
 		}
 	}
 
@@ -1005,7 +1404,28 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		TEXT("  \"giSourceBricks\": %d,\n")
 		TEXT("  \"giMarchBricks\": %d,\n")
 		TEXT("  \"giVolumeAnchored\": %d,\n")
-		TEXT("  \"giPoolIdentityRefusals\": %d\n")
+		TEXT("  \"giPoolIdentityRefusals\": %d,\n")
+		// --- MOVING CAPTURES ------------------------------------------------
+		//
+		// frameTimingAdmissible is the field that survives the walk from this
+		// run's log to whoever reads the artifact next month. A leg that fired
+		// shutters has stalls in its frame samples; EVERY frame-time number
+		// above it in this same file is contaminated by them, and a reader who
+		// was not present when the leg was launched has no other way to know
+		// that. It is 1 on every leg that took no shots, which is every leg
+		// this project has ever run, so no historical artifact changes meaning.
+		//
+		// shotTag is the ONE operator-supplied string in this file; it is
+		// whitelisted to [A-Za-z0-9_] at its parse site precisely so this
+		// hand-rolled writer's "no user-controlled strings to escape" claim
+		// stays true.
+		TEXT("  \"shotEveryM\": %.1f,\n")
+		TEXT("  \"shotStartM\": %.1f,\n")
+		TEXT("  \"shotsFired\": %d,\n")
+		TEXT("  \"shotBoundariesSkipped\": %d,\n")
+		TEXT("  \"shotMaxDistanceReachedM\": %.1f,\n")
+		TEXT("  \"shotTag\": \"%s\",\n")
+		TEXT("  \"frameTimingAdmissible\": %d\n")
 		TEXT("}\n"),
 		DurationSeconds, N, P50, P95, Max, HitchCount, HitchThresholdMs, (long long)ChunksLoaded, AvgChunksPerSec,
 		AvgBudgetSaturationPct, WarmupExcludeSeconds, PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount,
@@ -1017,7 +1437,9 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		UndergroundFraction,
 		SkyHour, SkyMinute, SkyMonth, SkyDay, SkyTimeScale, SkyState.SunAltitudeDeg, SkyState.SunAzimuthDeg,
 		bHaveGI ? 1 : 0, GiEnabled, GiVolume, GiSourceBricks, GiMarchBricks, GiAnchored,
-		GiIdentityRefusals);
+		GiIdentityRefusals,
+		ShotEveryUU / 100.0, ShotStartUU / 100.0, ShotsFired, ShotBoundariesSkipped,
+		MaxDistanceReachedUU / 100.0, *ShotTag, ShotsFired == 0 ? 1 : 0);
 
 	FFileHelper::SaveStringToFile(Json, *OutPath);
 
