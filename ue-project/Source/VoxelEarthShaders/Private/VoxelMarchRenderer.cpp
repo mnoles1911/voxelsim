@@ -456,6 +456,59 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	// =====================================================================
+	// THE RETRY-RUNG RESIDENCY PROBE (voxel.March.RungProbe)
+	// =====================================================================
+	//
+	// THE MEASUREMENT THIS ARM IS BUILT ON (2026-08-29, sky pose, HoleStats
+	// leg ZT-eng): the fallthrough ladder's retry rungs entered 59,003,587
+	// walks per window against ~65M segments -- ~47% OF ALL WALK ENTRIES AT
+	// SKY ARE THE LADDER'S SECOND WALK -- and `substituted` (the hits those
+	// retries produce, i.e. the coarse stand-ins that fixed the owner's
+	// visible ring gaps) was 31,948: A HIT RATE OF 0.054%. The autopsy
+	// (docs/marcher-cost-autopsy-2026-08-29.md) prices each ENTRY at
+	// ~0.67 us of setup and names the ~90% sky retry rate the top remaining
+	// lever; with the wave census reading 99% full waves in the chunk loop,
+	// rung entries removed are wave-time removed, not idle-lane time.
+	TAutoConsoleVariable<int32> CVarVoxelMarchRungProbe(
+		TEXT("voxel.March.RungProbe"), 0,
+		TEXT("THE RETRY-RUNG RESIDENCY PROBE. 0 = off, THE CONTROL, and the default. 1 = at ")
+		TEXT("every fallthrough retry rung's entry (WalkL > SegL), BEFORE any rung setup, walk ")
+		TEXT("the segment's interval at BLOCK stride over MarchBlockOccupied -- the 4^3-chunk ")
+		TEXT("residency bit grid the coarse occupancy level already publishes, bound on every ")
+		TEXT("permutation -- at the retry's own level. Every bit clear => the rung is NEVER ")
+		TEXT("ENTERED; any bit set => the rung walks exactly as the control does. No walked ")
+		TEXT("rung's behaviour changes and the own-level rung is never probed.\n")
+		TEXT("THE SKIP IS EXACT, NOT STATISTICAL, and the proof is a doctrine block at the ")
+		TEXT("probe site (VoxelBrickTraverse.ush): a hit needs Chunk.bValid, bValid needs the ")
+		TEXT("index cell's resident bit, the bit grid is a verified superset union of ")
+		TEXT("residency per block (RefreshBlockBits is the one place a count becomes a bit, ")
+		TEXT("maintained at every residency transition), freshness is the SAME snapshot ")
+		TEXT("contract voxel.March.BlockSkip already ships on (staged under one lock, one ")
+		TEXT("generation, consumed in the same bind; all-ones fallback = inert, never wrong), ")
+		TEXT("and the probe's coverage is an Amanatides DDA with chunk-wide pads and a corner ")
+		TEXT("epsilon, never point sampling. A capped or ambiguous probe WALKS.\n")
+		TEXT("A PERMUTATION, NOT A UNIFORM (the ZTight rule: the term under test is the rung ")
+		TEXT("prologue itself). Requires rings AND voxel.March.Fallthrough > 0; REFUSED with ")
+		TEXT("voxel.March.SkyLadder (the sky gate reads per-chunk sky marks an occupancy bit ")
+		TEXT("cannot reproduce for a rung never walked -- forced off with a warning). ")
+		TEXT("DELIBERATELY NOT REFUSED against Bound, ZTight or HalfRes: different mechanism, ")
+		TEXT("no shared state -- ZTight's skip runs before the probe is consulted and pays its ")
+		TEXT("own debt on its own branch (ztRetry* vs rungProbe counters stay attributable), ")
+		TEXT("the bound narrows only walks that run, and unlike the bound there is no producer ")
+		TEXT("whose raster could describe a different ray at half res.\n")
+		TEXT("PROVE IT ENGAGED BEFORE BELIEVING A TIMING: with voxel.March.HoleStats on, ")
+		TEXT("voxel.March.Stats prints rungProbe: probed/skipped/walked/bits. probed=0 while ")
+		TEXT("this reads 1 is ARMED AND INERT and no timing on that leg means anything.\n")
+		TEXT("THE PRE-REGISTERED VERDICT, written before the first leg: at sky expect ")
+		TEXT("skipped/probed >= ~95%%; the timing gate is VoxelMarch.March from ProfileGPU at ")
+		TEXT("SKY (control ~5.8 ms) falling by a substantial fraction of the retry share, ")
+		TEXT("measured at SKY AND DOWN per the autopsy's standing rule; `substituted` MUST ")
+		TEXT("NOT FALL vs the control (those are the stand-ins the gate exists to keep) and ")
+		TEXT("`uncovered` must not rise. EITHER moving is the refutation, and the response is ")
+		TEXT("the default stays 0."),
+		ECVF_RenderThreadSafe);
+
+	// =====================================================================
 	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip)
 	// =====================================================================
 	//
@@ -1733,6 +1786,38 @@ FVoxelMarchArm VoxelMarchGetArm()
 			            "as a bound result."));
 		}
 	}
+	// THE RETRY-RUNG RESIDENCY PROBE. Rings AND a fallthrough depth (no
+	// ladder, no retry rungs, nothing to probe), and NOT while the sky ladder
+	// is armed -- that permutation is refused at compile (the #error in
+	// VoxelBrickTraverse.ush: the sky gate reads per-chunk sky marks an
+	// occupancy bit cannot reproduce for a rung never walked), and an arm
+	// must never ask for a kernel that does not exist. Bound / ZTight /
+	// HalfRes pairings are deliberately allowed; the cvar text carries the
+	// no-shared-state argument.
+	Arm.RungProbe = (Arm.bRings && Arm.Fallthrough > 0 && !Arm.bSkyLadder &&
+	                 CVarVoxelMarchRungProbe.GetValueOnAnyThread() != 0)
+	                    ? 1
+	                    : 0;
+	// LOGGED ONCE WHEN ASKED FOR AND FORCED OFF, the sky ladder's own rule: a
+	// leg must not read a probe-off frame as a probe null result. Both
+	// suppression causes are named because they have different fixes.
+	if (Arm.RungProbe == 0 && CVarVoxelMarchRungProbe.GetValueOnAnyThread() != 0)
+	{
+		static bool bRungProbeSuppressedWarned = false;
+		if (!bRungProbeSuppressedWarned)
+		{
+			bRungProbeSuppressedWarned = true;
+			UE_LOG(LogVoxelMarch, Warning,
+			       TEXT("voxel.March.RungProbe is FORCED OFF: it needs rings AND "
+			            "voxel.March.Fallthrough > 0 (the probe gates the ladder's retry "
+			            "rungs, and without a ladder there are none), and it is refused "
+			            "while voxel.March.SkyLadder is armed (the pairing is an #error in "
+			            "VoxelBrickTraverse.ush -- the sky gate reads per-chunk sky marks "
+			            "an occupancy bit cannot reproduce for a rung never walked). Every "
+			            "frame until the configuration changes runs WITHOUT the probe -- "
+			            "do not read this leg as a RungProbe result."));
+		}
+	}
 	// CLAMPED AND FORCED TO 0 WITHOUT THE PERMUTATION, so the reported mode can
 	// never claim an arm the kernel does not contain -- the same rule
 	// bBlockSkipArmed follows, one layer up.
@@ -2298,6 +2383,96 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 					            "+2.32 ms consult anomaly needs another owner; "
 					            "meanActive well below it = family A lives and the next "
 					            "step is reordering rays, not skipping cells.)"));
+				}
+			}
+		}
+		// ---- THE RETRY-RUNG RESIDENCY PROBE: ARMED, PROBED, AND ITS PRICE -
+		//
+		// Sibling to the ztight engagement block, with the same three-way
+		// separation its zero demands: arm off (worded by the armed flag),
+		// armed with no landed window (NOT MEASURED), armed and probed=0
+		// (ARMED AND INERT, the loud case). This arm has no producer, so
+		// there is no asked/ran/landed ladder -- the quad IS the whole
+		// engagement story, plus bits as the cost side.
+		{
+			const FVoxelMarchHoleStats RW = VoxelMarchPeekLastHoleWindow();
+			if (RW.bRungProbeArmed || RW.RungProbed != 0)
+			{
+				if (!RW.bArmed || RW.Frames == 0)
+				{
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("  rungProbe: engagement NOT MEASURED (%s). The quad is "
+					            "the only proof the probe ran; no timing reading stands "
+					            "without it."),
+					       !RW.bArmed ? TEXT("voxel.March.HoleStats is 0")
+					                  : TEXT("armed, no readback has landed yet"));
+				}
+				else
+				{
+					const uint64 RpProbed = RW.RungProbed;
+					const uint64 RpPart = RW.RungSkipped + RW.RungWalked;
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("  rungProbe: probed=%llu = skipped %llu (%.2f%%) + walked "
+					            "%llu | bits=%llu (%.2f per probed rung), over %llu frames%s"),
+					       (unsigned long long)RpProbed,
+					       (unsigned long long)RW.RungSkipped,
+					       RpProbed > 0
+					           ? 100.0 * double(RW.RungSkipped) / double(RpProbed)
+					           : 0.0,
+					       (unsigned long long)RW.RungWalked,
+					       (unsigned long long)RW.RungProbeBits,
+					       RpProbed > 0 ? double(RW.RungProbeBits) / double(RpProbed)
+					                    : 0.0,
+					       (unsigned long long)RW.Frames,
+					       // The partition identity is the instrument's own
+					       // self-check, printed only when it fails: probed
+					       // != skipped + walked is a counter defect, and a
+					       // window carrying it must not be read at all.
+					       RpPart == RpProbed ? TEXT("")
+					                          : TEXT("  [PARTITION BROKEN: skipped+walked "
+					                                 "!= probed -- instrument defect, do "
+					                                 "not read this window]"));
+					// THE PRE-REGISTERED VERDICT, restated at the reading so
+					// it cannot drift after the fact: written before the
+					// first leg, from the 59M-retries / 0.054%-hit sky
+					// measurement.
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("      (engagement only -- DECISIONS, not nanoseconds. "
+					            "Pre-registered: at sky expect skipped/probed >= ~95%%; "
+					            "the timing gate is VoxelMarch.March from ProfileGPU at "
+					            "SKY AND DOWN, never the horizon alone; `substituted` "
+					            "MUST NOT FALL vs control and `uncovered` must not rise "
+					            "-- either moving refutes the arm and the default "
+					            "stays 0.)"));
+					if (RW.bRungProbeArmed && RpProbed == 0)
+					{
+						UE_LOG(LogVoxelMarch, Warning,
+						       TEXT("    voxel.March.RungProbe is armed and the shader "
+						            "probed ZERO retry rungs over %llu measured frames. "
+						            "THE ARM IS ARMED AND INERT -- no timing on this leg "
+						            "describes it. Check in order: voxel.March.Fallthrough "
+						            "(0 means no retry rungs exist), the ladder's own "
+						            "traffic (ftConsidered on this leg -- a pose whose "
+						            "rays never cross absence offers no retries), and "
+						            "whether ZTight removed every retry first (ztRetry* "
+						            "on the same window). The C++ half of this change can "
+						            "land WITHOUT the traversal half -- grep "
+						            "VOXEL_MARCH_RUNG_PROBE in VoxelBrickTraverse.ush "
+						            "before looking anywhere else."),
+						       (unsigned long long)RW.Frames);
+					}
+					else if (RW.bRungProbeArmed && RW.RungSkipped == 0)
+					{
+						UE_LOG(LogVoxelMarch, Warning,
+						       TEXT("    voxel.March.RungProbe is armed, %llu rungs were "
+						            "probed and NONE was skipped. That is a real measured "
+						            "null: every probed interval met a resident block (or "
+						            "the shell/cap refusals fired). Check the POSE -- the "
+						            "59M/0.054%% measurement this arm is built on is a "
+						            "SKY reading; down and horizon retries cross the "
+						            "resident shell and are expected to walk."),
+						       (unsigned long long)RpProbed);
+					}
 				}
 			}
 		}
@@ -4709,6 +4884,10 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// does not contain the code -- the inert-arm warning would then fire on a
 	// leg where inertness is correct.
 	Out.bZTightArmed = Arm.ZTight != 0;
+	// FROM THE ARM, the same permutation rule: the arm forces the probe off
+	// without rings, without a fallthrough depth, and under the sky ladder,
+	// so this can never report "armed" for a kernel that contains no probe.
+	Out.bRungProbeArmed = Arm.RungProbe != 0;
 	// FROM THE ARM, for the reason bBlockSkipArmed is: VoxelMarchGetArm already
 	// forces the mode to 0 when the permutation is off, so this can never report
 	// a licence the kernel has no code for.
@@ -4732,6 +4911,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	const bool bZCutArmed = Out.bZCutArmed;
 	const bool bBlockSkipArmed = Out.bBlockSkipArmed;
 	const bool bZTightArmed = Out.bZTightArmed;
+	const bool bRungProbeArmed = Out.bRungProbeArmed;
 	const bool bCensusArmed = Out.bCensusArmed;
 	const int32 BlockSkyMode = Out.BlockSkyMode;
 	// The height field's flags and census are NOT part of the accumulated
@@ -4745,6 +4925,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	Out.bZCutArmed = bZCutArmed;
 	Out.bBlockSkipArmed = bBlockSkipArmed;
 	Out.bZTightArmed = bZTightArmed;
+	Out.bRungProbeArmed = bRungProbeArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	Out.bHeightArmed = HeightSide.bHeightArmed;
@@ -4995,6 +5176,8 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	const bool bBlockSkipArmed = Arm.bBlockSkip;
 	// See the drain: the arm, same permutation rule.
 	const bool bZTightArmed = Arm.ZTight != 0;
+	// See the drain: the arm, same permutation rule.
+	const bool bRungProbeArmed = Arm.RungProbe != 0;
 	// See the drain: the census rides the hole-stats permutation itself.
 	const bool bCensusArmed = Arm.bHoleStats;
 	const int32 BlockSkyMode = Arm.BlockSkyMode;
@@ -5009,6 +5192,7 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	Out.bZCutArmed = bZCutArmed;
 	Out.bBlockSkipArmed = bBlockSkipArmed;
 	Out.bZTightArmed = bZTightArmed;
+	Out.bRungProbeArmed = bRungProbeArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	return Out;
@@ -5575,6 +5759,45 @@ namespace VoxelMarchRayBoundWord
 		WaveCellActiveSum,
 		WaveCellSamples,
 		WaveLaneCount,
+
+		// ---- THE RUNG PROBE'S ENGAGEMENT QUAD (voxel.March.RungProbe) -----
+		// Slots 69-72, appended per the standing rule: appending renumbers
+		// nothing, a stale shader cache reads every older word correctly and
+		// leaves these at zero -- NOT MEASURED, which the rungProbe stats
+		// line words as such. Written only by kernels compiled with
+		// VOXEL_MARCH_RUNG_PROBE 1 (and hole stats on); the per-ray statics
+		// live beside the ZTight quad's in VoxelBrickTraverse.ush and fold
+		// from the same pre-falsifier snapshot in VoxelMarch.usf.
+		//
+		//   RungProbed      every retry rung the probe was actually consulted
+		//                   about -- arm compiled, WalkL > SegL, and (under
+		//                   ZTight) the slab gate had not already removed the
+		//                   rung. THE DENOMINATOR: probed = skipped + walked,
+		//                   an exact partition, and zero while
+		//                   voxel.March.RungProbe reads 1 is ARMED AND INERT,
+		//                   the house failure.
+		//   RungSkipped     rungs proven unreachable-by-a-hit (every block
+		//                   over the padded interval empty) and never
+		//                   entered. THE PRIMARY COUNTER; at sky the
+		//                   pre-registered expectation is >= ~95% of probed
+		//                   (the 59M-retries / 0.054%-hit measurement).
+		//   RungWalked      rungs the probe consulted and walked anyway -- a
+		//                   set bit, a shell-safety refusal, or a capped
+		//                   loop. The walk is the control's, byte for byte.
+		//   RungProbeBits   total occupancy bits tested, THE COST
+		//                   DENOMINATOR: bits/probed is the probe's price as
+		//                   a reading (expected ~1-9 nominal, more only near
+		//                   block corners or under the shell-safety probes).
+		//
+		// DECISIONS, NOT NANOSECONDS -- the ZCut trio's warning unchanged.
+		// The saving is VoxelMarch.March from ProfileGPU at SKY AND DOWN
+		// (the autopsy's gate rule), and the arm's own refutation readings
+		// outrank it: `substituted` falling or `uncovered` rising vs the
+		// control kills the arm whatever the milliseconds say.
+		RungProbed,
+		RungSkipped,
+		RungWalked,
+		RungProbeBits,
 		End                                    // the buffer's word count while the census lives here
 	};
 }
@@ -5591,6 +5814,17 @@ namespace VoxelMarchRayBoundWord
 // which is plausible-zeros -- the exact failure VoxelMarchHoleWord's own note
 // records. Whoever crosses 128 words widens the stride count AND this bound
 // together, deliberately.
+// THE NEWEST APPENDED GROUP IS PINNED, the VoxelMarchHoleWord discipline
+// imported to this namespace: four words, and End sits immediately past them
+// while nothing follows. WHOEVER APPENDS NEXT must repoint this at their
+// first word, exactly as the hole-word asserts have been repointed four
+// times -- each time the build failed loudly rather than a counter silently
+// reading a neighbouring group's value.
+static_assert(int32(VoxelMarchRayBoundWord::End) -
+                      int32(VoxelMarchRayBoundWord::RungProbed) == 4,
+              "the voxel.March.RungProbe word group is not four words, or something was "
+              "appended after it without repointing this assert at its own first word. "
+              "Pinned against End because the group is currently last.");
 static_assert(int32(VoxelMarchRayBoundWord::End) <=
                   2 * kVoxelMarchTileSize * kVoxelMarchTileSize,
               "hole-stats words no longer fit the kernel's two-words-per-thread strided "
@@ -5643,6 +5877,18 @@ class FVoxelMarchBoundDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_BOUND");
 // Bound (two clamps, one debt fold -- the #error in VoxelBrickTraverse.ush
 // restates it for anyone bypassing the host).
 class FVoxelMarchZTightDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_ZTIGHT");
+// THE RETRY-RUNG RESIDENCY PROBE (voxel.March.RungProbe). A PERMUTATION for
+// ZTight's stated reason: the term under test is the rung prologue itself
+// (the ladder's second ~0.67 us entry, ~47% of sky walk entries), and a
+// runtime branch would leave the probe's DDA loop and registers in the
+// control's prologue, re-basing exactly what is being measured. 0 is
+// byte-identical: every token is under the define, including the statics and
+// the widened bitfield-declaration guard (an unread Buffer declaration emits
+// no loads). Rings + fallthrough only; refused against SkyLadder in
+// ShouldCompilePermutation, with a matching #error in VoxelBrickTraverse.ush
+// for anyone who bypasses the host. Deliberately NOT refused against Bound,
+// ZTight or HalfRes -- no shared state, no producer; the cvar text argues it.
+class FVoxelMarchRungProbeDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_RUNG_PROBE");
 
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
@@ -5756,6 +6002,38 @@ struct FVoxelMarchWalkShape
 	// domain does not carry it, so with the arm on the two are incomparable
 	// -- see the check.
 	int32 ZTight = 0;
+
+	// THE RETRY-RUNG RESIDENCY PROBE (VOXEL_MARCH_RUNG_PROBE) IS DELIBERATELY
+	// NOT A MEMBER, and the classification was ARGUED AGAINST THE SAME TEST
+	// the last four passed, not skipped: can it change bHit or THitUU? It
+	// cannot, in any permutation the host can build, and each of the
+	// mechanisms that made BlockSkip / SkyLadder / Bound / ZTight shape
+	// dimensions is closed off by construction:
+	//   * the removed walk cannot hit -- unlike Bound/ZTight's interval
+	//     clamps this is not "unreachable modulo the producer": the probe
+	//     reads the residency bit grid, a hit needs bValid, bValid needs the
+	//     resident bit, and the grid is a verified superset union of exactly
+	//     that bit (the proof block at the probe site);
+	//   * no cap/budget interaction -- Bound's and ZTight's escape hatch --
+	//     because the probe never narrows an interval: walks that run get
+	//     byte-identical arguments, and Steps and the 512-chunk cap are
+	//     per-walk locals, so a skipped rung cannot lend budget to another;
+	//   * no ladder-gate drift -- BlockSkip's escape hatch (block-granular
+	//     bCrossedAbsentChunk opens retries the control would not take) --
+	//     because the skip's flag fold is EXACT, not granular: it fires only
+	//     when EVERY crossed chunk is non-resident, in which case the walked
+	//     control sets the same flag on its first chunk, and the plain gate
+	//     then reads the same value either way (the shell gate's skip is
+	//     refused unless the six-neighbour proof makes its FALSE exact, and
+	//     the sky gate -- the one gate a skip could not answer -- is an
+	//     #error with this arm and refused in ShouldCompilePermutation).
+	// So the image is provably the control's image, the comparator may
+	// DELIBERATELY VARY this dimension (its domain does not carry it and
+	// needs not), and the field count above stays at 10. IF ANY OF THE THREE
+	// CLOSURES IS EVER LOOSENED -- the sky-ladder refusal lifted, the debt
+	// fold weakened, or the skip allowed on a capped probe -- this dimension
+	// becomes MUST MATCH on the spot and owes a field, the assert bump, and
+	// a clause in VoxelMarchComparatorShapeAgrees.
 };
 static_assert(sizeof(FVoxelMarchWalkShape) == kVoxelMarchWalkShapeDims * sizeof(int32),
               "a walk-shape dimension was added or removed without updating "
@@ -5775,7 +6053,7 @@ class FVoxelMarchCS : public FGlobalShader
 		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim,
 		                         FVoxelMarchHalfResDim, FVoxelMarchBlockSkipDim,
 		                         FVoxelMarchSkyLadderDim, FVoxelMarchBoundDim,
-		                         FVoxelMarchZTightDim>;
+		                         FVoxelMarchZTightDim, FVoxelMarchRungProbeDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -5864,6 +6142,29 @@ class FVoxelMarchCS : public FGlobalShader
 		// lattice, unlike the bound's per-pixel raster.
 		if (P.Get<FVoxelMarchZTightDim>() &&
 		    (!P.Get<FVoxelMarchRingsDim>() || P.Get<FVoxelMarchBoundDim>()))
+		{
+			return false;
+		}
+		// The retry-rung residency probe (voxel.March.RungProbe). Two
+		// refusals, the second restated as an #error in
+		// VoxelBrickTraverse.ush for anyone who bypasses the host:
+		//   * without RINGS or without a FALLTHROUGH depth the probe has no
+		//     socket -- it gates the ladder's retry rungs (WalkL > SegL) and
+		//     a ladder of depth 0 has none: the permutation would build,
+		//     bind and mean nothing;
+		//   * with SKY LADDER the retry gate reads per-chunk sky marks
+		//     (bCrossedNonSkyAbsent), which a block occupancy bit cannot
+		//     reproduce for a rung that was never walked -- a synthesized
+		//     gate would either put coarse rock over sky-proven air or drop
+		//     a fill.
+		// Bound, ZTight and HalfRes are deliberately NOT refused: no shared
+		// state (ZTight's skip runs before the probe is consulted and pays
+		// its debt on its own branch; the bound narrows only walks that
+		// run), and no producer whose raster could describe a different ray
+		// at half res. The cvar text carries the full argument.
+		if (P.Get<FVoxelMarchRungProbeDim>() &&
+		    (!P.Get<FVoxelMarchRingsDim>() || P.Get<FVoxelMarchFallthroughDim>() == 0 ||
+		     P.Get<FVoxelMarchSkyLadderDim>()))
 		{
 			return false;
 		}
@@ -6053,6 +6354,18 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchRayBoundWord::WaveCellSamples));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WAVE_LANES"),
 		                         int32(VoxelMarchRayBoundWord::WaveLaneCount));
+		// The rung probe's engagement quad (voxel.March.RungProbe), pushed
+		// from the same appended-word namespace for the same reason every
+		// group above is: a hand mirror here reads a plausible number out of
+		// the wrong slot.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RP_PROBED"),
+		                         int32(VoxelMarchRayBoundWord::RungProbed));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RP_SKIPPED"),
+		                         int32(VoxelMarchRayBoundWord::RungSkipped));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RP_WALKED"),
+		                         int32(VoxelMarchRayBoundWord::RungWalked));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RP_BITS"),
+		                         int32(VoxelMarchRayBoundWord::RungProbeBits));
 		// WORDS covers the appended census -- VoxelMarchRayBoundWord::End, not
 		// the enum's Count, while the census lives outside the enum. Every
 		// sizing of the stats buffer (create, copy, lock) reads End too.
@@ -6940,6 +7253,13 @@ static FVoxelMarchRingReach VoxelMarchCheckRingReach(const FVoxelMarchRingSpec& 
 // both arms would move those counts for a reason unrelated to stepping. That is
 // a measurement-integrity argument and it outranks having one traversal entry
 // point.
+//
+// VOXEL_MARCH_RUNG_PROBE HAS NO CLAUSE HERE AND THAT IS A DECISION, NOT AN
+// OMISSION: it is not a walk-shape dimension -- the skip is image-exact in
+// every buildable permutation (the argument, with its three closed escape
+// hatches and the condition under which it becomes MUST MATCH, lives at the
+// dimension's non-field note inside FVoxelMarchWalkShape above). The
+// comparator deliberately varies it, exactly as it varies hole stats.
 static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 {
 	FVoxelMarchWalkShape Shipping;
@@ -7524,6 +7844,14 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			const uint32 ZtSegEntered = Src[VoxelMarchRayBoundWord::ZTightSegEntered];
 			const uint32 ZtRetrySkipped = Src[VoxelMarchRayBoundWord::ZTightRetrySkipped];
 			const uint32 ZtRetryEntered = Src[VoxelMarchRayBoundWord::ZTightRetryEntered];
+			// The rung probe's quad (voxel.March.RungProbe), read on EVERY
+			// frame for the ZTight group's reason: written only by the probe
+			// permutation, structurally zero on all others, and the rungProbe
+			// stats line is what words a zero correctly.
+			const uint32 RpProbed = Src[VoxelMarchRayBoundWord::RungProbed];
+			const uint32 RpSkipped = Src[VoxelMarchRayBoundWord::RungSkipped];
+			const uint32 RpWalked = Src[VoxelMarchRayBoundWord::RungWalked];
+			const uint32 RpBits = Src[VoxelMarchRayBoundWord::RungProbeBits];
 			// The wave census's five, same rule. WaveLanes is a MAXIMUM.
 			const uint32 WaveChunkSum = Src[VoxelMarchRayBoundWord::WaveChunkActiveSum];
 			const uint32 WaveChunkSamples = Src[VoxelMarchRayBoundWord::WaveChunkSamples];
@@ -7604,6 +7932,10 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.ZTightSegEntered += ZtSegEntered;
 			State->HoleWindow.ZTightRetrySkipped += ZtRetrySkipped;
 			State->HoleWindow.ZTightRetryEntered += ZtRetryEntered;
+			State->HoleWindow.RungProbed += RpProbed;
+			State->HoleWindow.RungSkipped += RpSkipped;
+			State->HoleWindow.RungWalked += RpWalked;
+			State->HoleWindow.RungProbeBits += RpBits;
 			State->HoleWindow.WaveChunkActiveSum += WaveChunkSum;
 			State->HoleWindow.WaveChunkSamples += WaveChunkSamples;
 			State->HoleWindow.WaveCellActiveSum += WaveCellSum;
@@ -9569,6 +9901,11 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// already rings-gated and Bound-exclusive (VoxelMarchGetArm), so
 			// the refused permutations cannot be asked for here.
 			Permutation.Set<FVoxelMarchZTightDim>(Arm.ZTight != 0);
+			// FROM THE ARM, which already forced the probe off without rings,
+			// without a fallthrough depth, and under the sky ladder --
+			// matching the refused permutations, so this can never ask for a
+			// kernel that does not exist.
+			Permutation.Set<FVoxelMarchRungProbeDim>(Arm.RungProbe != 0);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.

@@ -702,6 +702,70 @@
 #error "VOXEL_MARCH_ZTIGHT cannot be compiled with VOXEL_MARCH_BOUND: both arms clamp the same ring segments and fold removals into the same bCrossedAbsentChunk debt, so no counter or timing on a both-armed leg can be attributed to either. The bound is also a retired arm (docs/marcher-cost-autopsy-2026-08-29.md). Run one arm or the other."
 #endif
 
+// THE RETRY-RUNG RESIDENCY PROBE (voxel.March.RungProbe) -- gate the ladder's
+// SECOND WALK on the residency bit grid it is about to walk into.
+//
+// THE MEASUREMENT THIS ARM IS BUILT ON (2026-08-29, sky pose, HoleStats leg
+// ZT-eng): fallthrough retries entered 59,003,587 walks per window against
+// ~65M segments -- THE RETRY RUNGS ARE ~47% OF ALL WALK ENTRIES AT SKY -- and
+// `substituted` (the hits those retries produce) was 31,948: A HIT RATE OF
+// 0.054%. 99.95% of sky retry walks produce nothing, and the autopsy
+// (docs/marcher-cost-autopsy-2026-08-29.md) prices every one of those entries
+// at ~0.67 us of setup -- the x2 half of the 14x entry multiplier. But the
+// 0.054% that DO hit are the coarse stand-ins that fixed the owner's visible
+// ring gaps, so the gate must be SOUND, never statistical: a rung may be
+// skipped only when it is PROVABLY unable to hit.
+//
+// THE PROBE: at a fallthrough rung's entry (WalkL > SegL), BEFORE any of the
+// rung's setup, walk the segment's t-interval at BLOCK stride over
+// MarchBlockOccupied -- the 4^3-chunk residency bit grid the coarse occupancy
+// level already publishes, bound on EVERY permutation -- at the RETRY's own
+// level. Every bit clear over the interval => the rung cannot produce a hit
+// (the exactness proof lives at the probe site in VoxelMarchTraverseRings)
+// and is never entered; any bit set => the rung is walked exactly as the
+// control walks it. NO WALKED RUNG'S BEHAVIOUR CHANGES, and the own-level
+// rung (WalkL == SegL) is never probed at all.
+//
+// A PERMUTATION, NOT A UNIFORM, for ZTight's stated reason: the term under
+// test is the rung prologue itself, and a runtime branch would leave the
+// probe's loop and registers in the control's prologue, re-basing exactly
+// what is being measured. 0 is byte-identical -- every token is under this
+// define.
+//
+// REFUSED AGAINST VOXEL_MARCH_SKY_LADDER (below) AND AGAINST NOTHING ELSE.
+// Not against Bound or ZTight: those clamp intervals and pay their debts on
+// branches this probe never takes (ZTight's skip runs before the probe is
+// consulted, the bound narrows only walks that run), so there is no shared
+// state and a both-armed leg's counters stay attributable -- ztRetry* prices
+// what ZTight removed, RungProbed prices only rungs the probe actually saw.
+// Not against HalfRes either: unlike the bound there is no producer whose
+// raster could describe a different ray -- the probe reads the same grid the
+// walk it gates would read, for the same ray. The sky ladder is different in
+// kind, hence the #error.
+#ifndef VOXEL_MARCH_RUNG_PROBE
+#define VOXEL_MARCH_RUNG_PROBE 0
+#endif
+#if VOXEL_MARCH_RUNG_PROBE && VOXEL_MARCH_SKY_LADDER
+#error "VOXEL_MARCH_RUNG_PROBE cannot be compiled with VOXEL_MARCH_SKY_LADDER: the sky gate decides retries from per-chunk sky marks (bCrossedNonSkyAbsent), which a block occupancy bit cannot reproduce for a rung that was never walked -- a synthesized gate would either open the ladder over sky-proven air (coarse rock where the fine level proved air) or close it over unproven absence (a dropped fill). The host refuses the pairing too (ShouldCompilePermutation). Run one arm or the other."
+#endif
+// THE CAP ON THE PROBE'S BLOCK LOOP, compile-time for the reason the walk's
+// 512-chunk cap is: a bad uniform must not be able to walk off the end of
+// anything. DERIVATION: a retry rung's nominal interval is its ring's span,
+// R0 * 2^(SegL-1) UU, probed at level SegL+1 where a block is 4 chunks = 128
+// level-L voxels, so the along-ray block count is R0 / (4 * 128 voxels) --
+// ~2.5 at the default R0 (128 m of ring against 51.2 m of block at the
+// retry's lattice), level-independent because both halves double per level.
+// A worst-case diagonal crosses one face per axis per block: ~8. What that
+// arithmetic does NOT bound is the cylinder correction -- ring boundaries
+// are HORIZONTAL distances (RingTScale = 1/|Dir.xy|), so a near-vertical ray
+// hands segment 0 the entire reach. 64 = the nominal 8 with an 8x margin,
+// covering rays to ~82 degrees of elevation; past that the loop caps out and
+// the rung is WALKED -- the fail-safe direction, because a capped probe has
+// proved nothing and a skip may only ever follow a proof. (The block grid
+// also wraps at 32 blocks per axis, so a longer probe would mostly re-read
+// the same words.)
+#define VOXEL_MARCH_RUNG_PROBE_MAX_BLOCKS 64u
+
 // THE HOLE METRIC (voxel.March.HoleStats). Counts, per frame, on the shipping
 // kernel: rays marched, rays that hit, hits that came from a level COARSER
 // than the segment that owns that ground (`substituted`), and misses that
@@ -1789,7 +1853,18 @@ float4 MarchZTightSlabUU[8];
 #include "/VoxelEarth/VoxelMarchBound.ush"
 #endif
 
-#if VOXEL_MARCH_BLOCK_SKIP
+// WIDENED, NOT DUPLICATED, FOR THE RUNG PROBE (2026-08-29). The retry-rung
+// residency probe reads MarchBlockOccupied through the same declaration and
+// the same VoxelMarchIndexBlockCompute wrap the block skip uses -- two
+// spellings of one address is how a writer publishes blocks a reader never
+// consults (the skew this project has paid for three times in one night), so
+// the guard grows a second arm rather than the declarations growing a twin.
+// The probe reads ONLY MarchBlockOccupied; AnyAbsent / AllSky / SkyMode below
+// ride along declared-but-unread on that arm, which costs nothing -- an
+// unread Buffer declaration emits no loads (the "off arm must not carry the
+// loads" rule is about LOADS, and the C++ parameter struct already declares
+// all three on every arm).
+#if VOXEL_MARCH_BLOCK_SKIP || VOXEL_MARCH_RUNG_PROBE
 // ---- THE COARSE OCCUPANCY LEVEL'S TWO BITFIELDS ---------------------------
 //
 // One bit per 4x4x4 block of chunk cells, per index grid slot: 32x32x32 = 32,768
@@ -2060,6 +2135,33 @@ static uint GVoxelMarchZtSegSkipped = 0u;
 static uint GVoxelMarchZtSegEntered = 0u;
 static uint GVoxelMarchZtRetrySkipped = 0u;
 static uint GVoxelMarchZtRetryEntered = 0u;
+#endif
+
+#if VOXEL_MARCH_RUNG_PROBE && VOXEL_MARCH_HOLE_STATS
+// ---- THE RUNG PROBE'S ENGAGEMENT COUNTERS (voxel.March.RungProbe) ----------
+//
+// Statics and not FVoxelMarchHit fields, the ZTight group's reason verbatim:
+// they accumulate across every retry rung of every segment and the walk
+// struct is overwritten per rung. Folded in VoxelMarch.usf from the
+// PRE-FALSIFIER SNAPSHOT (the verify walk re-runs the ring loop and would
+// double every counter on verify-armed legs).
+//
+// FOUR WORDS. Probed partitions exactly into Skipped + Walked -- a retry
+// rung the probe was actually consulted about either skipped or walked --
+// and ProbeBits is the COST DENOMINATOR: total occupancy bits tested, so the
+// price of the probe is a reading (bits per probed rung) rather than an
+// assumption. probed == 0 while voxel.March.RungProbe reads 1 is ARMED AND
+// INERT, the house failure, and the stats line words it as such. The
+// PRE-REGISTERED VERDICT (from the 59M-retries / 0.054%-hit measurement this
+// arm is built on): at sky, skipped/probed >= ~95%; `substituted` MUST NOT
+// FALL against the control and `uncovered` must not rise -- either moving is
+// the refutation and the default stays 0. DECISIONS, NOT NANOSECONDS: the
+// saving is VoxelMarch.March from ProfileGPU at SKY AND DOWN, the autopsy's
+// gate rule.
+static uint GVoxelMarchRungProbed = 0u;
+static uint GVoxelMarchRungSkipped = 0u;
+static uint GVoxelMarchRungWalked = 0u;
+static uint GVoxelMarchRungProbeBits = 0u;
 #endif
 
 // ---- THE WAVE-OCCUPANCY CENSUS (family A's falsifier) ----------------------
@@ -4713,6 +4815,330 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			// exist and the control is byte-identical; re-indenting several
 			// hundred lines would make that claim unreviewable.)
 #endif
+#if VOXEL_MARCH_RUNG_PROBE
+			// ===========================================================
+			// THE RETRY-RUNG RESIDENCY PROBE (voxel.March.RungProbe)
+			// ===========================================================
+			//
+			// RETRY RUNGS ONLY (WalkL > SegL) -- the own-level rung is the
+			// segment's first walk and is never probed. WHY HERE: the
+			// measurement this arm is built on (59,003,587 retry entries vs
+			// ~65M segments per sky window, hit rate 0.054% -- the define's
+			// doctrine block) says nearly half of all sky walk entries are
+			// these rungs and 99.95% of them produce nothing; the autopsy
+			// prices each ENTRY, not its iterations, so the probe runs
+			// before every piece of rung setup (the ZTight placement rule)
+			// and a skipped rung pays a handful of bit tests and the debt
+			// fold below, nothing else. Under ZTight this probe sits INSIDE
+			// the slab gate's open branch, deliberately: a rung ZTight
+			// already removed is ZTight's to count, and the probe's
+			// denominator stays "rungs the probe actually saw".
+			//
+			// =============== THE EXACTNESS PROOF, IN FULL ===============
+			//
+			// THE SKIP IS EXACT, NOT CONSERVATIVE: a skipped rung's walk
+			// could not have produced a hit, and every flag the walked rung
+			// would have left behind is synthesized identically below.
+			//
+			//  1. A rung hit requires Chunk.bValid. VoxelMarchLookupChunk
+			//     grants bValid only past the residency test -- an index
+			//     cell without VOXEL_MARCH_INDEX_RESIDENT_BIT returns
+			//     absent before any record validation runs -- so
+			//     bValid => the cell is resident.
+			//  2. MarchBlockOccupied is a SUPERSET UNION of residency per
+			//     4^3-chunk block, VERIFIED IN THE BUILDER, not assumed:
+			//     FVoxelMarchChunkIndex::RefreshBlockBits is the one place
+			//     a count becomes a bit (Occupied set iff BlockResidentCount
+			//     > 0), and that count is maintained at every residency
+			//     transition the index has -- the attach seed loop, the
+			//     delta Add on the index's own became-resident test, and
+			//     the delta Remove in the same slot-equality guard the
+			//     entry counters live in (NoteBlockCellResident /
+			//     NoteBlockCellAbsent, VoxelMarchChunkIndex.cpp). So
+			//     bit clear => NO cell in that block is resident.
+			//  3. FRESHNESS IS THE BLOCK SKIP'S CONTRACT, INHERITED, NOT A
+			//     NEW ASSUMPTION: the bitfields are staged in
+			//     MarkDirtyAndUpload under the same lock as the cell pairs,
+			//     stamped with one generation, and consumed by
+			//     RegisterWithBlocks in the same VoxelMarchBindPool call
+			//     that hands out the index -- "there is no moment at which
+			//     a marcher can hold one and not the other" (the staging
+			//     comment's words). When that cannot be guaranteed the bind
+			//     falls back to ALL ONES, which makes this probe walk every
+			//     rung -- inert, never wrong. voxel.March.BlockSkip already
+			//     skips whole blocks on exactly this contract; a grid that
+			//     could understate residency would already be deleting
+			//     terrain under that shipped arm.
+			//  4. THE PROBE'S COVERAGE IS GEOMETRIC, NOT SAMPLED: an
+			//     Amanatides & Woo block DDA visits every block whose
+			//     intersection with the ray's interval is non-empty --
+			//     integer per-axis stepping, no nudge-past-thin-clips --
+			//     and every chunk the walk can visit is derived by flooring
+			//     a point ON this ray, so its block has non-empty
+			//     intersection and is tested. Float skew between this site
+			//     and the walk (the compiler may contract one site and not
+			//     the other -- VoxelMarchCellExitT's own doctrine, measured
+			//     at 11.5% of rays once) is absorbed by an interval pad of
+			//     ONE FULL CHUNK at each end (the ZCutBiasUU constant and
+			//     the Danskin & Hanrahan argument: ULP noise at reach is
+			//     sub-millimetre, the pad is metres) and by the corner
+			//     epsilon inside the loop (near-tied axis crossings test
+			//     the alternate block too, so an ULP-flipped corner order
+			//     cannot hide a block the true ray grazes).
+			//
+			// So: every bit clear over the padded interval => every chunk
+			// the walked rung could have consulted is non-resident => no
+			// lookup can grant bValid => the walk returns the same MISS the
+			// skip synthesizes. The image cannot change, which is why this
+			// is NOT a walk-shape dimension (argued at FVoxelMarchWalkShape
+			// in VoxelMarchRenderer.cpp).
+			//
+			// WHAT THE SKIP CANNOT KNOW IT DOES NOT CLAIM: a capped-out
+			// probe (interval longer than the loop bound covers) and any
+			// bit set both WALK THE RUNG -- the control's behaviour, paid
+			// in full.
+			bool bRungProbeSkip = false;
+			if (WalkL > SegL)
+			{
+				// THE SINGLE AUTHORITY for the level-L origin and grid
+				// slot, called HERE so the probe cannot grow a second
+				// spelling of MarchBrickOriginVoxel >> L (doctrine 5, the
+				// exact shape that pinned this file to level 0 once). The
+				// walked path calls it again just below -- idempotent, a
+				// few ALU -- which is the price of leaving the control's
+				// call site untouched.
+				VoxelMarchBeginLevel(WalkL);
+				const float PrS = float(1u << WalkL);
+				const float PrInvS = 1.0f / PrS;
+				// The same ray the walk would receive: origin and t bounds
+				// rescaled so one level-L voxel measures VOXEL_FLUID_VOXEL_UU,
+				// direction through the same VoxelMarchSafeDir authority.
+				const float3 PrOrigin = OriginLocalUU * PrInvS;
+				const float3 PrDir = VoxelMarchSafeDir(DirWorld);
+				const float3 PrInvDir = 1.0f / PrDir;
+				// ONE FULL CHUNK OF PAD AT EACH END (32 level-L voxels in
+				// the walk's units) -- the ZCutBiasUU constant, same
+				// argument: the walk's sample t's and this loop's face t's
+				// are float-independent derivations, and the pad dwarfs
+				// their disagreement by four orders of magnitude. Outward
+				// only; extra blocks tested can only refuse a skip.
+				const float PrPadUU = 32.0f * VOXEL_FLUID_VOXEL_UU;
+				const float PrT0 = SegIn * PrInvS - PrPadUU;
+				const float PrT1 = SegOut * PrInvS + PrPadUU;
+				// A block is 4 chunks = 128 level-L voxels: ChunkShift(5)+2,
+				// the walk's own BlockShift derivation. Pinned by the
+				// VOXEL_MARCH_BLOCK_CHUNKS #error above the bitfields.
+				const int PrBlockShift = 5 + 2;
+				const float PrBlockUU = VOXEL_FLUID_VOXEL_UU * float(1 << PrBlockShift);
+				// Start block from a point on the ray, the walk's own
+				// derivation chain: local voxel -> world voxel (the
+				// BeginLevel origin) -> block.
+				const float3 PrP0 = PrOrigin + PrDir * PrT0;
+				const int3 PrWV0 = (int3)floor(PrP0 / VOXEL_FLUID_VOXEL_UU) +
+				                   VoxelMarchOriginVoxel();
+				int3 PrBlk = int3(PrWV0.x >> PrBlockShift, PrWV0.y >> PrBlockShift,
+				                  PrWV0.z >> PrBlockShift);
+				// Amanatides & Woo per-axis state. The step is +/-1 block;
+				// tMax[a] is the ray t (walk units) of the NEXT crossing of
+				// an axis-a block face; tDelta[a] is the t between
+				// consecutive axis-a faces.
+				const int3 PrStep = int3(PrDir.x > 0.0f ? 1 : -1,
+				                         PrDir.y > 0.0f ? 1 : -1,
+				                         PrDir.z > 0.0f ? 1 : -1);
+				float3 PrTMax;
+				{
+					// * 128 AND NOT << 7: block indices are routinely
+					// negative and a left shift of a negative int is the
+					// ZCut slab note's exact hazard. A multiply says what
+					// is meant. (128 = 1 << PrBlockShift, pinned by the
+					// block-size #error above the bitfields.)
+					const int3 PrNextFace =
+						int3((PrBlk.x + (PrStep.x > 0 ? 1 : 0)) * 128,
+						     (PrBlk.y + (PrStep.y > 0 ? 1 : 0)) * 128,
+						     (PrBlk.z + (PrStep.z > 0 ? 1 : 0)) * 128);
+					const float3 PrFaceUU =
+						float3(PrNextFace - VoxelMarchOriginVoxel()) *
+						VOXEL_FLUID_VOXEL_UU;
+					PrTMax = (PrFaceUU - PrOrigin) * PrInvDir;
+				}
+				const float3 PrTDelta = abs(PrBlockUU * PrInvDir);
+				// THE CORNER EPSILON: when two axes cross within this of
+				// each other, the true ray may thread the cell this DDA's
+				// float ordering steps around, so the alternate cell is
+				// TESTED (never stepped into). One level-L voxel of ray
+				// distance -- 1/128 of a block, four orders above the ULP
+				// noise it exists to absorb; a false positive here only
+				// tests an extra bit or refuses a skip.
+				const float PrCornerEps = VOXEL_FLUID_VOXEL_UU;
+				bool bPrMustWalk = false;   // a set bit, a shell hazard, or a capped loop
+				bool bPrCovered = false;    // the DDA reached PrT1 before capping
+				uint PrBitsTested = 0u;
+				[loop]
+				for (uint pi = 0u;
+				     pi < VOXEL_MARCH_RUNG_PROBE_MAX_BLOCKS && !bPrMustWalk && !bPrCovered;
+				     ++pi)
+				{
+					// A representative chunk of the current block: any of
+					// its 64 chunks maps to the same bit, and feeding a
+					// CHUNK coordinate keeps the address on the SHARED
+					// derivation (VoxelMarchIndexBlockCompute -- the same
+					// wrap FVoxelMarchChunkIndex::BlockOf writes through)
+					// rather than growing a block-space spelling of it.
+					// * 4 AND NOT << 2, the ZCut slab note's rule: block
+					// indices are routinely negative.
+					const int3 PrChunk = int3(PrBlk.x * 4, PrBlk.y * 4, PrBlk.z * 4);
+					const uint PrIdx = VoxelMarchIndexBlockCompute(
+						PrChunk, MarchIndexDimChunks, uint(VOXEL_MARCH_BLOCKS_PER_SLOT),
+						GVoxelMarchIndexGrid);
+					++PrBitsTested;
+					// lint-shader-ub: allow VARIABLE_SHIFT - PrIdx & 31 is 0..31 by construction
+					if ((MarchBlockOccupied[PrIdx >> 5u] & (1u << (PrIdx & 31u))) != 0u)
+					{
+						bPrMustWalk = true;
+						break;
+					}
+#if VOXEL_MARCH_TRACK_SHELL
+					// THE SHELL FLAG'S DEBT, REFUSED RATHER THAN GUESSED --
+					// the block skip's discipline verbatim. Wherever
+					// bCrossedShellAbsent has a reader (the level-2
+					// instrument's uncShell, and the shell retry gate when
+					// it is compiled), a skipped rung must reproduce the
+					// walked rung's answer exactly. An empty block CAN
+					// contain an absent chunk face-adjacent to a resident
+					// one in the NEXT block, so the skip is allowed only
+					// when this block and all six face-adjacent blocks are
+					// empty -- then no chunk in it has a resident face
+					// neighbour, VoxelMarchAbsentTouchesShell would have
+					// answered FALSE for every one, and NOT setting the
+					// flag below is the walked control's answer, not an
+					// approximation. The empty slot is refused outright:
+					// AbsentTouchesShell short-circuits to TRUE there, so
+					// the proof does not hold and the rung is walked.
+					// +/-4 chunks moves exactly one block (4 IS the block
+					// size -- the #error above the bitfields pins it), fed
+					// through the SAME shared derivation.
+					if ((MarchIndexLevelPopulated & (1u << GVoxelMarchIndexGrid)) == 0u)
+					{
+						bPrMustWalk = true;
+						break;
+					}
+					{
+						const int3 PrNOffs[6] = {
+							int3(4, 0, 0),  int3(-4, 0, 0), int3(0, 4, 0),
+							int3(0, -4, 0), int3(0, 0, 4),  int3(0, 0, -4)
+						};
+						[unroll]
+						for (int pn = 0; pn < 6; ++pn)
+						{
+							const uint PrNIdx = VoxelMarchIndexBlockCompute(
+								PrChunk + PrNOffs[pn], MarchIndexDimChunks,
+								uint(VOXEL_MARCH_BLOCKS_PER_SLOT), GVoxelMarchIndexGrid);
+							++PrBitsTested;
+							// lint-shader-ub: allow VARIABLE_SHIFT - PrNIdx & 31 is 0..31 by construction
+							if ((MarchBlockOccupied[PrNIdx >> 5u] &
+							     (1u << (PrNIdx & 31u))) != 0u)
+							{
+								bPrMustWalk = true;
+							}
+						}
+					}
+					if (bPrMustWalk)
+					{
+						break;
+					}
+#endif
+					const float PrTNext = min(PrTMax.x, min(PrTMax.y, PrTMax.z));
+					if (PrTNext >= PrT1)
+					{
+						// The interval is covered: every block with a
+						// non-empty intersection has been tested clear.
+						bPrCovered = true;
+						break;
+					}
+					// The winning axis, decided ONCE and before the sidecar
+					// tests so the two cannot disagree about which block is
+					// "the next one anyway". Selected, not indexed --
+					// dynamic component indexing spills to scratch (the
+					// face-axis pick's own note).
+					const int PrAxis = (PrTMax.x <= PrTMax.y && PrTMax.x <= PrTMax.z)
+					                       ? 0
+					                       : ((PrTMax.y <= PrTMax.z) ? 1 : 2);
+					// THE CORNER-EPSILON SIDECAR TESTS: any NON-STEPPED axis
+					// whose crossing ties the winner within eps has its
+					// alternate block's bit tested (never stepped into) --
+					// see the eps note above for the ULP corner case this
+					// closes. The stepped axis's own next block needs no
+					// sidecar: the DDA tests it on the next iteration. At
+					// most two tests, only at near-corners.
+					{
+						int3 PrAltChunk;
+						[unroll]
+						for (int pa = 0; pa < 3; ++pa)
+						{
+							const float PrAxT =
+								(pa == 0) ? PrTMax.x : ((pa == 1) ? PrTMax.y : PrTMax.z);
+							if (pa == PrAxis || (PrAxT - PrTNext) >= PrCornerEps)
+							{
+								continue;
+							}
+							PrAltChunk = PrChunk;
+							if (pa == 0)      { PrAltChunk.x += PrStep.x * 4; }
+							else if (pa == 1) { PrAltChunk.y += PrStep.y * 4; }
+							else              { PrAltChunk.z += PrStep.z * 4; }
+							const uint PrAIdx = VoxelMarchIndexBlockCompute(
+								PrAltChunk, MarchIndexDimChunks,
+								uint(VOXEL_MARCH_BLOCKS_PER_SLOT), GVoxelMarchIndexGrid);
+							++PrBitsTested;
+							// lint-shader-ub: allow VARIABLE_SHIFT - PrAIdx & 31 is 0..31 by construction
+							if ((MarchBlockOccupied[PrAIdx >> 5u] &
+							     (1u << (PrAIdx & 31u))) != 0u)
+							{
+								bPrMustWalk = true;
+							}
+						}
+					}
+					if (bPrMustWalk)
+					{
+						break;
+					}
+					// Step the winning axis.
+					if (PrAxis == 0)
+					{
+						PrBlk.x += PrStep.x;
+						PrTMax.x += PrTDelta.x;
+					}
+					else if (PrAxis == 1)
+					{
+						PrBlk.y += PrStep.y;
+						PrTMax.y += PrTDelta.y;
+					}
+					else
+					{
+						PrBlk.z += PrStep.z;
+						PrTMax.z += PrTDelta.z;
+					}
+				}
+				// A capped-out loop (neither flag set) proves nothing and
+				// walks -- the fail-safe direction, stated at the cap's
+				// derivation.
+				bRungProbeSkip = bPrCovered && !bPrMustWalk;
+#if VOXEL_MARCH_HOLE_STATS
+				// Counted AT THE DECISION, whichever way it went, so
+				// Probed is the exact denominator: Probed = Skipped +
+				// Walked, and ProbeBits is the cost side of the ledger.
+				GVoxelMarchRungProbed += 1u;
+				GVoxelMarchRungProbeBits += PrBitsTested;
+				GVoxelMarchRungSkipped += bRungProbeSkip ? 1u : 0u;
+				GVoxelMarchRungWalked += bRungProbeSkip ? 0u : 1u;
+#endif
+			}
+			if (!bRungProbeSkip)
+			{
+			// (The rung body below is UNTOUCHED and deliberately not
+			// re-indented -- the ZTight wrapper's argument, one wrapper in:
+			// with VOXEL_MARCH_RUNG_PROBE 0 this wrapper does not exist and
+			// the control is byte-identical.)
+#endif
 			VoxelMarchBeginLevel(WalkL);
 			// 2^L. The ray goes in divided; the hit comes back multiplied.
 			const float S = float(1u << WalkL);
@@ -5357,6 +5783,90 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			if (!bGateOpen)
 			{
 				break;
+			}
+#endif
+#if VOXEL_MARCH_RUNG_PROBE
+			}
+			else
+			{
+				// ===================================================
+				// THE SKIPPED RETRY RUNG PAYS ITS DEBT -- WITHOUT THE WALK
+				// ===================================================
+				//
+				// The rung above was never entered: no BeginLevel re-call,
+				// no H, no fold sites ran. Everything the control's walked
+				// rung would have left behind is synthesized here, each
+				// piece with its exactness argument. EVERY MIRRORED FLAG IS
+				// NAMED; anything not named is proven untouched:
+				//
+				// bAnyAbsent (-> Miss.bCrossedAbsentChunk, the `uncovered`
+				// counter's input): EXACT. The skip fired only with every
+				// block over the padded interval empty, so EVERY chunk the
+				// walked rung would have visited -- its first included --
+				// is non-resident, and the walk's own site
+				// (`H.bCrossedAbsentChunk || !Chunk.bResident`) would have
+				// set the flag on that first chunk. (Had the control's
+				// ZCut clipped or emptied the interval first, its
+				// bZCutRemoved fold sets the same bit -- every removed
+				// chunk is non-resident by the slab argument. TRUE on
+				// every control path.)
+				//
+				// bAnyShellAbsent (-> uncShell, and the shell retry gate
+				// where compiled): NOT SET, and that is EXACT, not an
+				// omission -- under VOXEL_MARCH_TRACK_SHELL the probe
+				// refused every skip that was not shell-safe (this block
+				// and all six face-adjacent blocks empty, slot populated),
+				// so VoxelMarchAbsentTouchesShell would have answered
+				// FALSE for every crossed chunk and the walked control
+				// would not have set the flag either. Without TRACK_SHELL
+				// the flag has no reader and nothing is owed.
+				//
+				// The HOLE_STATS >= 2 attribution capture requires
+				// WalkL == SegL and this branch is retry-only (the probe's
+				// own gate): the control captures nothing here either.
+				//
+				// TermReason / bExhausted: the per-rung H's values never
+				// escape a miss rung -- the cascade returns its own Miss
+				// struct -- and their one cross-rung reader is the sky
+				// gate, whose pairing is an #error. Nothing to mirror.
+				// GVoxelMarchRayTermChunkCap and the Stage 0a iteration
+				// census DO read lower on this arm: the skipped rung's
+				// iterations are exactly the work removed, and the census
+				// denominators shrinking WITH the retries is the intended
+				// reading, said here so nobody "fixes" it.
+#if VOXEL_MARCH_TRACK_ABSENT
+				bAnyAbsent = true;
+#endif
+#if VOXEL_MARCH_FALLTHROUGH > 0
+				// THE LADDER'S GATE, SYNTHESIZED PER CONFIGURATION (the
+				// ZTight skip's shape, minus the sky gate its #error
+				// removes from the buildable set):
+				//
+				//   plain gate (the shipping one): the control reads
+				//   bCrossedAbsentChunk, argued TRUE above. OPEN -- fall
+				//   out of the rung body and let the ladder advance, the
+				//   same control flow an open gate takes.
+				//
+				//   shell gate: the control reads bCrossedShellAbsent,
+				//   which the shell-safety refusal made exactly FALSE
+				//   here, so the control BREAKS -- and so does this arm.
+#if VOXEL_MARCH_HOLE_STATS
+				// Proof-of-traffic bookkeeping, the control's guard
+				// exactly (WalkL < LastWalkL: the top rung is offered no
+				// gate and must not pad the denominator; with depth 1
+				// every probed rung IS the top rung and this folds away).
+				if (WalkL < LastWalkL)
+				{
+					RayFtConsidered += 1u;
+#if !VOXEL_MARCH_FALLTHROUGH_SHELL
+					RayFtTaken += 1u;
+#endif
+				}
+#endif
+#if VOXEL_MARCH_FALLTHROUGH_SHELL
+				break;
+#endif
+#endif
 			}
 #endif
 #if VOXEL_MARCH_ZTIGHT

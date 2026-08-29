@@ -1655,6 +1655,16 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				const uint ZtRetrySkipped = GVoxelMarchZtRetrySkipped;
 				const uint ZtRetryEntered = GVoxelMarchZtRetryEntered;
 #endif
+#if VOXEL_MARCH_RUNG_PROBE
+				// The rung probe's snapshot, the bound's discipline verbatim:
+				// the verify walk below re-runs the ring loop, whose retry
+				// rungs would consult the probe and tally these statics a
+				// second time on verify-armed legs.
+				const uint RpProbed = GVoxelMarchRungProbed;
+				const uint RpSkipped = GVoxelMarchRungSkipped;
+				const uint RpWalked = GVoxelMarchRungWalked;
+				const uint RpBits = GVoxelMarchRungProbeBits;
+#endif
 #if VOXEL_MARCH_WAVE_CENSUS
 				// The wave census's snapshot, same reason: the verify walk
 				// samples the same statics.
@@ -1917,6 +1927,29 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 					               ZtRetrySkipped);
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZT_RETRY_ENTERED],
 					               ZtRetryEntered);
+				}
+#endif
+#if VOXEL_MARCH_RUNG_PROBE
+				// THE RUNG PROBE'S ENGAGEMENT QUAD (voxel.March.RungProbe),
+				// guarded on its own denominator like every group above: a
+				// ray whose ladder offered no retry rung (or whose retries
+				// ZTight removed first) pays no atomics and the words stay
+				// a STRUCTURAL zero -- which is what makes "probed == 0
+				// while the cvar reads 1" a verdict on the ARM (fallthrough
+				// off, sky ladder holding it off, permutation not selected)
+				// and not on the world. The folded values are the
+				// pre-falsifier snapshot above, so a verify-armed leg reads
+				// the same engagement as a plain one.
+				if (RpProbed != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RP_PROBED],
+					               RpProbed);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RP_SKIPPED],
+					               RpSkipped);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RP_WALKED],
+					               RpWalked);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RP_BITS],
+					               RpBits);
 				}
 #endif
 #if VOXEL_MARCH_WAVE_CENSUS

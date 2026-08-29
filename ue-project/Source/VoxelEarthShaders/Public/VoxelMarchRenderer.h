@@ -381,6 +381,19 @@ struct FVoxelMarchArm
 	// docs/marcher-cost-autopsy-2026-08-29.md), and VoxelMarchGetArm forces
 	// Bound off with a logged warning when both are asked for.
 	int32 ZTight = 0;
+	// THE RETRY-RUNG RESIDENCY PROBE (voxel.March.RungProbe). A PERMUTATION,
+	// default 0 -- byte-identical control, argued at the define in
+	// VoxelBrickTraverse.ush (the term under test is the rung prologue, the
+	// ZTight rule). Requires rings AND a fallthrough depth (a ladder with no
+	// retry rungs offers the probe nothing to gate), forced 0 without them;
+	// forced 0 while voxel.March.SkyLadder is armed, because that pairing is
+	// refused at compile (the sky gate reads per-chunk sky marks a block
+	// occupancy bit cannot reproduce for a rung never walked -- the #error in
+	// VoxelBrickTraverse.ush) and an arm must never ask for a kernel that
+	// does not exist. DELIBERATELY NOT REFUSED against Bound, ZTight or
+	// HalfRes -- different mechanism, no shared state, no producer; the cvar
+	// text carries the reasoning.
+	int32 RungProbe = 0;
 	// THE RETRY LADDER GATE (voxel.March.SkyLadder). A permutation, unlike
 	// BlockSkyMode below: it puts a field on the chunk cache and a fold at five
 	// walk sites, so the control must not carry it. Forced false without rings
@@ -963,6 +976,25 @@ struct FVoxelMarchHoleStats
 	uint64 ZTightRetrySkipped = 0;
 	uint64 ZTightRetryEntered = 0;
 	bool bZTightArmed = false;
+
+	// ---- the retry-rung residency probe (voxel.March.RungProbe) ------------
+	// Counted on EVERY hole-stats level, the ZTight rule, and bRungProbeArmed
+	// IS NOT THE CVAR for the ZTight reason (the arm is a permutation; the
+	// raw cvar would read "armed" for a kernel that contains no probe --
+	// fallthrough off, or the sky ladder forcing it off). RungProbed
+	// partitions exactly into RungSkipped + RungWalked; RungProbeBits is the
+	// COST DENOMINATOR (occupancy bits tested -- the price of the probe as a
+	// reading, not an assumption). probed == 0 with the flag TRUE is the loud
+	// armed-and-inert case. THE PRE-REGISTERED VERDICT (59M retries/window,
+	// hit rate 0.054%, sky pose): skipped/probed >= ~95% at sky; the timing
+	// gate is VoxelMarch.March at SKY AND DOWN; `substituted` MUST NOT FALL
+	// vs the control and `uncovered` must not rise -- either moving refutes
+	// the arm and the default stays 0.
+	uint64 RungProbed = 0;
+	uint64 RungSkipped = 0;
+	uint64 RungWalked = 0;
+	uint64 RungProbeBits = 0;
+	bool bRungProbeArmed = false;
 
 	// ---- the wave-occupancy census (family A's falsifier) ------------------
 	// Compiled with hole stats wherever the engine's wave-op macros allow
