@@ -639,6 +639,12 @@ now covers per-rung probes. Default 0 permanently; no timing pairs run. The
 last marcher family on the board. What remains: latency/VGPR occupancy stats
 (falsifier, unbuilt) and ray count (owner product decision, taken at 50%).
 
-**Stutter half of Goal 3 (0.35% vs 0.10%):** warming arms built and screened
-null as trickles (dd4ee9e); RungProbe is dead as a stutter candidate too;
-demand-side cold-sample cap scoped, ungated -- now the lead candidate.
+**Stutter half of Goal 3 (0.32% vs 0.10%):** warming arms null as trickles
+(dd4ee9e); RungProbe dead; and the demand-side cold-shading cap is now BUILT
+AND REFUTED on the image gate (docs/coldshadingcap-refuted-2026-08-29.md:
+engagement exact, stutter null, p99 -0.5 ms real, but flight holes 4-5x at
+p90 -- coverage checked at defer time does not survive a divergent backlog).
+Its census (docs/cold-burst-census-2026-08-29.md) bought the attribution:
+the stutter frames are RASTER-ATLAS FILLS, not reqHdr bursts. Lead candidate
+is now dd4ee9e's named shortfall: the atlas prefetch scans rim rings only
+(~98 of ~600 due pages) -- widen to the whole predicted column.
