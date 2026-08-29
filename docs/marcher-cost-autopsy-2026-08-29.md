@@ -119,3 +119,20 @@ cost weighting, argued at the site) — one sanity pass on the counter's math on
 down-pose leg (short walks, expect meanActive high if the metric is honest:
 down-pose deep trips are few). meanActive down-pose reading is the census's own
 falsifier: if it ALSO reads 1.00 there, suspect the instrument, not the machine.
+---
+
+# CORRECTION (minutes later): the 1/64 reading was the INSTRUMENT
+
+The census's own pre-registered falsifier fired: meanActive read 1.00 at the
+DOWN pose too, where short walks should read high. Cause, confirmed in source:
+`WaveActiveCountBits(true)` was evaluated INSIDE `if (WaveIsFirstLane())` -- a
+branch where exactly one lane is active by construction. The counter could
+only ever read 1.00. Fixed (count hoisted outside the predicate), remeasure
+pending.
+
+**Status of the addendum above: the three clamp failures are FACTS; the 1/64
+occupancy story is a HYPOTHESIS awaiting the fixed counter.** The 90% sky
+retry rate stands (it comes from the ZTight engagement partition, a different
+instrument). And the process note owed here: the addendum's headline was
+committed BEFORE its falsifier ran -- the falsifier then fired. The doc you are
+reading is the correction the rule exists to force.

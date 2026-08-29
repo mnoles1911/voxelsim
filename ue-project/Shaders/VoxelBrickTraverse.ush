@@ -3602,9 +3602,11 @@ bool VoxelMarchWalkCellsInBrick(float3 OriginLocalUU, float3 Dir, float TStart, 
 		// dominates, and entry is where in-span divergence would live).
 		// Separate words from the chunk loop's because chunk-loop and
 		// cell-loop divergence are different diagnoses with different fixes.
+		// Same first-lane-predicate fix as the chunk-loop site above.
+		const uint NActiveCell = WaveActiveCountBits(true);
 		if ((uint(i) & 15u) == 0u && WaveIsFirstLane())
 		{
-			GVoxelMarchWaveCellSum += WaveActiveCountBits(true);
+			GVoxelMarchWaveCellSum += NActiveCell;
 			GVoxelMarchWaveCellSamples += 1u;
 		}
 #endif
@@ -3787,9 +3789,18 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 		// iteration -- cheap enough to leave under hole stats, frequent enough
 		// that a 512-cap walk contributes up to 32 samples. First active lane
 		// only, so sum/samples is the exact mean (see the statics' block).
+		// COUNT OUTSIDE THE FIRST-LANE PREDICATE. The first build had
+		// WaveActiveCountBits(true) INSIDE `if (WaveIsFirstLane())` -- a branch
+		// in which exactly one lane is active by construction, so the count read
+		// 1.00 forever. Caught by the census's own pre-registered falsifier (the
+		// down pose, where short walks should read high, ALSO read 1.00 -- an
+		// instrument measuring itself). ci is wave-uniform among live lanes
+		// (every lane enters at 0 and advances in lockstep), so the stride gate
+		// does not fragment the count.
+		const uint NActiveChunk = WaveActiveCountBits(true);
 		if ((uint(ci) & 15u) == 0u && WaveIsFirstLane())
 		{
-			GVoxelMarchWaveChunkSum += WaveActiveCountBits(true);
+			GVoxelMarchWaveChunkSum += NActiveChunk;
 			GVoxelMarchWaveChunkSamples += 1u;
 		}
 #endif
