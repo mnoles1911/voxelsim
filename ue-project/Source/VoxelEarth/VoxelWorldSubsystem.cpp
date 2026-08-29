@@ -9021,6 +9021,14 @@ struct FVoxelWorldImpl
 	// coarser covers this ground; deferring it is a visible black arc.
 	int64 ColdCoverableSinceLog = 0;
 	int64 ColdHoleRiskSinceLog = 0;
+	// WHERE the colds live, by cascade level -- added 2026-08-29 after the
+	// THIRD warm-family arm went null against this population unmeasured
+	// (docs/warmshadingasync-null-2026-08-29.md): the warm walk's candidate
+	// set warms ~180/window while demand pays ~800, so the two sets are
+	// mostly disjoint, and nothing on this line said which levels demand's
+	// colds are at. Indexed by LevelKey.Level, clamped; sums to coldTotal by
+	// construction (incremented at the same ++ site).
+	int64 ColdByLevelSinceLog[VoxelCoords::kNumLevels] = {};
 	// --- THE CAP'S OWN RECEIPTS (voxel.Stream.ColdShadingCapPerTick) --------
 	//
 	// Everything above prices the world the cap was designed against; these are
@@ -14178,7 +14186,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("Voxel cold-burst census (window): coldTotal=%lld coldTicks=%lld/%d maxPerTick=%d ")
 	       TEXT("hist 1/2/3-4/5-8/9-16/17+=%lld/%lld/%lld/%lld/%lld/%lld ")
 	       TEXT("| wouldDefer cap2=%lld cap4=%lld cap8=%lld | coverable=%lld holeRisk=%lld ")
-	       TEXT("| capPerTick=%d deferred=%lld deferredTicks=%lld capExempt=%lld"),
+	       TEXT("| capPerTick=%d deferred=%lld deferredTicks=%lld capExempt=%lld ")
+	       TEXT("| coldByLevel L0..L%d=%lld/%lld/%lld/%lld/%lld/%lld/%lld"),
 	       (long long)ColdTotalSinceLog, (long long)ColdTicksSinceLog, AccumTicks,
 	       ColdMaxPerTickSinceLog,
 	       (long long)ColdBurstHistSinceLog[0], (long long)ColdBurstHistSinceLog[1],
@@ -14189,7 +14198,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)ColdCoverableSinceLog, (long long)ColdHoleRiskSinceLog,
 	       CVarVoxelStreamColdShadingCapPerTick.GetValueOnGameThread(),
 	       (long long)ColdCapDeferredSinceLog, (long long)ColdCapDeferredTicksSinceLog,
-	       (long long)ColdCapExemptSinceLog);
+	       (long long)ColdCapExemptSinceLog,
+	       VoxelCoords::kNumLevels - 1,
+	       (long long)ColdByLevelSinceLog[0], (long long)ColdByLevelSinceLog[1],
+	       (long long)ColdByLevelSinceLog[2], (long long)ColdByLevelSinceLog[3],
+	       (long long)ColdByLevelSinceLog[4], (long long)ColdByLevelSinceLog[5],
+	       (long long)ColdByLevelSinceLog[6]);
+	static_assert(VoxelCoords::kNumLevels == 7,
+	              "the coldByLevel print spells 7 slots; respell it with the level count");
 
 	// The pool's own half of the same question, drained from the component so the
 	// render-thread accumulator is reset in step with the game-thread one.
@@ -15734,6 +15750,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	}
 	ColdDeferCap2SinceLog = ColdDeferCap4SinceLog = ColdDeferCap8SinceLog = 0;
 	ColdCoverableSinceLog = ColdHoleRiskSinceLog = 0;
+	for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+	{
+		ColdByLevelSinceLog[L] = 0;
+	}
 	// The cap's receipts, cleared with the census they print beside.
 	// ColdCapDeferredThisTick is NOT among them, for the same reason
 	// ColdShadingsThisTick is not: it is per-tick working state cleared at the
@@ -22359,6 +22379,8 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// so every ++ here lands in exactly one tick's burst.
 			++ColdShadingsThisTick;
 			++ColdTotalSinceLog;
+			++ColdByLevelSinceLog[FMath::Clamp(LevelKey.Level, 0,
+			                                   VoxelCoords::kNumLevels - 1)];
 			// EXACT PARTITION, BY CONSTRUCTION: one and only one of these two
 			// moves for every cold shading counted above, so
 			// coverable + holeRisk == coldTotal on the census line. If those
