@@ -452,18 +452,28 @@ FORCEINLINE FVoxelBrickChunkShading ShadingForDispatch(const VoxelCoords::FVoxel
 // (5.7 us warm -> 587 us under worker-pool load) and lands as single frames of
 // 43-52 ms in the submit split's reqHdr bucket -- the larger half of the
 // stutter budget (docs/hundred-fps-2026-08-28.md goal 3b). coldGame=0 proved
-// the cost is WORK (four amplifier columns + a climate sample), not I/O, and
-// the sampler is game-thread-only by design (unsynchronised table; offThread
-// is a checked hard zero) -- so the cost cannot move off-thread. What CAN move
-// is WHEN it is paid: early, in small wall-clock pieces, at footprints the
-// T4-1 predicted anchor says are coming. That needs two things this block
-// provides:
+// the cost is WORK (four amplifier columns + a climate sample), not I/O.
+//
+// "SO THE COST CANNOT MOVE OFF-THREAD" IS WHAT THIS BLOCK USED TO SAY, AND IT
+// WAS TOO STRONG. What is game-thread-only is the TABLE (unsynchronised;
+// offThread is a checked hard zero) and the fine tier's RequestFootprint
+// prefetch. The four amplifier columns are pure arithmetic that CPU meshing
+// workers already run 1,156 times per level-0 job. voxel.Stream.WarmShadingAsync
+// splits the two: the columns on a worker, the slot write here, through (c)
+// below. Corrected rather than deleted, because the old sentence is the reason
+// the inline arm was built the way it was. What CAN move
+// is WHEN it is paid: early, at footprints the T4-1 predicted anchor says are
+// coming -- and, once voxel.Stream.WarmShadingAsync was added, on WHICH THREAD
+// the arithmetic runs (the table stays here; only the four amplifier columns
+// move). That needs three things this block provides:
 //   (a) a read-only "is this footprint already cached" probe, so the warm loop
 //       never runs the full sampler just to discover there was nothing to do;
 //   (b) a cache-filling entry point whose traffic does NOT land in
 //       calls/cacheMiss/sampleUs -- the armed leg's verdict is the SUBMIT
 //       population's cacheMiss falling, and warm fills counted there would
 //       relocate the misses into the same counter and erase the reading.
+//   (c) a landing site for a sample computed SOMEWHERE ELSE, so the arithmetic
+//       can run on a worker while the table stays here on the game thread.
 
 // (a) The probe. GAME THREAD ONLY, like everything that touches the table;
 // off-thread it answers "cached" so a misplaced caller warms nothing rather
@@ -484,6 +494,38 @@ void WarmForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
                      const USceneComponent& Root,
                      FSampleParamsFn SampleParams,
                      FShadingFromFn ShadingFrom);
+
+// (c) THE ASYNC WARM'S LANDING SITE -- voxel.Stream.WarmShadingAsync (default
+// 0). GAME THREAD ONLY, like (a) and (b) and for the same reason.
+//
+// WHY THE ASYNC ARM EXISTS AT ALL, since (b) already warms: (b)'s budget is
+// GAME-THREAD WALL CLOCK, 0.25 ms per streaming tick, against a cold sample
+// that costs 5.7 us warm and up to 587 us under worker-pool load. That buys
+// LESS THAN ONE cold fill per tick, and a ring crossing needs ~90 of them
+// (~53 ms of sampling). The inline arm is capacity-starved by construction, not
+// mistuned -- raising its budget just moves the stutter from submit into the
+// warm loop. What is NOT game-thread-bound is the ARITHMETIC: the 587 us is
+// four vxc::Amplifier::column calls plus a climate sample, and CPU meshing
+// workers already run 1,156 column calls per level-0 job over the same
+// footprints. So the async arm moves the arithmetic to a BackgroundLow worker
+// and leaves this table -- which is unsynchronised and must stay
+// game-thread-only -- exactly where it is. This function is the seam: a
+// precomputed FVector4f in, one slot write out, no sampling of any kind.
+//
+// COUNTS AS warmFill=, NEVER AS cacheMiss (see WarmForDispatch above for why
+// that separation is what the A/B is decided on). Returns true iff a slot was
+// written; false means off-thread (offThread=), cache arm off, a live entry
+// already covered the footprint (warmHit=), or a no-surface-gate sentinel
+// sample (sentinel=).
+//
+// THE CALLER OWNS STALENESS. This re-anchors the table against Root's CURRENT
+// transform, but it cannot know the transform the worker sampled under. The
+// caller must compare the root location and world it captured at launch against
+// the current ones and drop the result if either moved -- counted asyncStale=
+// on the `Voxel warm-ahead` line.
+bool FillFromPrecomputed(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                         const USceneComponent& Root,
+                         const FVector4f& Params);
 
 // Can warming persist anything at all? The warm loop checks this once per tick
 // and reports itself INERT-CACHE-OFF on its window line instead of burning its

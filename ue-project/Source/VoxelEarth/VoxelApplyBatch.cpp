@@ -197,6 +197,21 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
                                            bool bAllowGuard,
                                            bool bWarmAhead = false);
 
+// The two halves of ShadingImpl that FillFromPrecomputed (below) also needs,
+// FACTORED RATHER THAN COPIED. FillFromPrecomputed writes the same slot from a
+// sample taken on a worker, so it must do the same anchor test and the same
+// store -- and a second transcription of the anchor rule or the Z rebase is the
+// exact defect shape this module was written to avoid (see the CachedRootLoc
+// block and FSlot::BaseZUU). One definition, two callers, both in this file.
+//
+// The slot is addressed by INDEX rather than by reference so that FSlot -- which
+// lives in the anonymous namespace above -- stays out of a declaration at this
+// scope. Both callers already hold the index from the one SlotIndex() call they
+// make, so nothing is recomputed.
+static FVector AnchorTableToRoot(const USceneComponent& Root);
+static bool StoreSampledSlot(uint32 SlotIdx, const VoxelCoords::FVoxelLevelChunkKey& Key,
+                             const FVector4f& Params, double ChunkWorldZ, bool bWarmFill);
+
 FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChunkKey& Key,
                                               const FVoxelBrickCpuPackRef& Pack,
                                               const USceneComponent& Root,
@@ -343,6 +358,74 @@ void WarmForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
 	            /*bAllowGuard*/ false, /*bWarmAhead*/ true);
 }
 
+// (c) THE ASYNC WARM'S LANDING SITE -- voxel.Stream.WarmShadingAsync.
+//
+// The same slot write WarmForDispatch performs, minus the sampling: the caller
+// already holds a FVector4f that a worker produced from the identical math (see
+// ChunkShadingParamsFromCorners in VoxelWorldSubsystem.cpp, which both the
+// demand sampler and the warm task call). Nothing here samples, so nothing here
+// can touch the fine tier, the amplifier, or any UObject beyond the root's own
+// transform -- which is the whole reason the async arm is legal at all: the
+// TABLE stays game-thread-only, and only the ARITHMETIC moved off-thread.
+//
+// GAME-THREAD ONLY, same as everything that touches Table(). Off-thread this
+// does nothing and counts offThread -- the hard zero.
+//
+// COUNTS AS warmFill=, NEVER AS cacheMiss, for the reason stated at the
+// WarmFills declaration: the armed leg's verdict is the SUBMIT population's
+// cacheMiss falling, and a fill counted there would relocate the miss into the
+// counter the A/B is decided on and erase the reading.
+//
+// THE ANCHOR IS RE-TESTED HERE, and it has to be. AnchorTableToRoot compares
+// the root's location and world against what the table was filled under and
+// flushes on a mismatch -- so a root that moved between the worker's sample and
+// this call flushes the table and then stores an entry that was sampled at the
+// OLD origin. That is why the caller must ALSO compare the root location it
+// captured at launch against the current one and drop the result before calling
+// (asyncStale= on the warm-ahead line); this function cannot see the launch-time
+// value and does not pretend to.
+//
+// Returns true iff a slot was written. False means one of: off the game thread,
+// the cache arm is off, a live entry already covers this footprint (counted
+// warmHit=), or the sample carries the no-surface-gate sentinel (sentinel=).
+bool FillFromPrecomputed(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                         const USceneComponent& Root,
+                         const FVector4f& Params)
+{
+	if (!IsInGameThread())
+	{
+		++OffThread;
+		return false;
+	}
+	if ((Mode() & kModeCache) == 0)
+	{
+		// Nothing can be persisted. Same response as WarmForDispatch: do
+		// nothing, and let the warm loop's INERT-CACHE-OFF suffix say so.
+		return false;
+	}
+
+	const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
+	const FVector RootLoc = AnchorTableToRoot(Root);
+	const double ChunkWorldZ = RootLoc.Z + OriginRelative.Z;
+	const uint32 Mask = uint32(CacheSlots() - 1);
+	const uint32 SlotIdx = SlotIndex(Key.Level, Key.Key.X, Key.Key.Y, Mask);
+
+	if (const FSlot& Slot = Table()[SlotIdx];
+	    Slot.Level == Key.Level && Slot.X == Key.Key.X && Slot.Y == Key.Key.Y)
+	{
+		// A demand sample (or an earlier fill) beat the task home. Keep what is
+		// there: the two are the same function of the same inputs, but the one
+		// already in the table was taken on this thread against residency the
+		// game thread had just checked. Same policy DrainAssetResolveResults
+		// takes for a raced resolve, and the same warmHit= counter
+		// WarmForDispatch uses for the identical state.
+		++WarmHits;
+		return false;
+	}
+
+	return StoreSampledSlot(SlotIdx, Key, Params, ChunkWorldZ, /*bWarmFill*/ true);
+}
+
 void FlushStats(bool bForce)
 {
 	const double Now = FPlatformTime::Seconds();
@@ -410,6 +493,71 @@ void FlushStats(bool bForce)
 	MaxMismatchUU = 0.0;
 	SampleSeconds = 0.0;
 	LastLogSeconds = Now;
+}
+
+// --- the two factored halves (declared beside ShadingImpl's forward decl) ----
+
+// Anchor check (see CachedRootLoc). Exact compare, no tolerance: a moved root
+// means every cached corner height was sampled at the wrong XY, and "nearly the
+// same place" is not a defensible basis for keeping them. Returns the root's
+// CURRENT component location, which is also the Z base every caller rebases
+// against, so the value the table is anchored to and the value the caller
+// computes with cannot drift apart.
+//
+// GAME THREAD ONLY (it can flush the whole table); both callers check first.
+static FVector AnchorTableToRoot(const USceneComponent& Root)
+{
+	const FVector RootLoc = Root.GetComponentLocation();
+	const UWorld* World = Root.GetWorld();
+	if (!bCacheAnchored || RootLoc != CachedRootLoc || World != CachedWorld)
+	{
+		if (bCacheAnchored)
+		{
+			++RootFlushes;
+		}
+		for (FSlot& S : Table())
+		{
+			S.Level = -1;
+		}
+		CachedRootLoc = RootLoc;
+		CachedWorld = World;
+		bCacheAnchored = true;
+	}
+	return RootLoc;
+}
+
+// The slot write, including the sentinel refusal. Returns true iff the slot was
+// actually written. bWarmFill counts the write into warmFill= -- the counter
+// warm traffic uses so it can never be confused with a demand cacheMiss.
+static bool StoreSampledSlot(uint32 SlotIdx, const VoxelCoords::FVoxelLevelChunkKey& Key,
+                             const FVector4f& Params, double ChunkWorldZ, bool bWarmFill)
+{
+	if (Params.Z <= kSurfaceSentinelCeiling)
+	{
+		// "No surface gate" sentinel -- see kSurfaceSentinelCeiling. Not stored,
+		// and the slot is left as it was rather than half-filled.
+		//
+		// EXPECTED HARD ZERO in a normal run: it means SampleChunkParamsForPool
+		// found no UWorld or no UVoxelWorldSubsystem, so every brick published
+		// in that window carries a DISABLED surface gate -- cave floors tinted
+		// as turf, with no error anywhere. If this counter moves, the problem is
+		// upstream of this file.
+		++SentinelUncached;
+		return false;
+	}
+	FSlot& Slot = Table()[SlotIdx];
+	Slot.Level = Key.Level;
+	Slot.X = Key.Key.X;
+	Slot.Y = Key.Key.Y;
+	Slot.Temperature = Params.X;
+	Slot.Precipitation = Params.Y;
+	Slot.GradPacked = Params.W;
+	Slot.BaseZUU = double(Params.Z) + ChunkWorldZ;
+	if (bWarmFill)
+	{
+		++WarmFills; // the slot write IS the product of a warm call
+	}
+	return true;
 }
 
 // The shared body. bAllowGuard is the ONLY difference between the two public
@@ -514,29 +662,12 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 		return ShadingFrom(Sample());
 	}
 
-	// Anchor check (see CachedRootLoc). Exact compare, no tolerance: a moved
-	// root means every cached corner height was sampled at the wrong XY, and
-	// "nearly the same place" is not a defensible basis for keeping them.
-	const FVector RootLoc = Root.GetComponentLocation();
-	const UWorld* World = Root.GetWorld();
-	if (!bCacheAnchored || RootLoc != CachedRootLoc || World != CachedWorld)
-	{
-		if (bCacheAnchored)
-		{
-			++RootFlushes;
-		}
-		for (FSlot& S : Table())
-		{
-			S.Level = -1;
-		}
-		CachedRootLoc = RootLoc;
-		CachedWorld = World;
-		bCacheAnchored = true;
-	}
+	const FVector RootLoc = AnchorTableToRoot(Root);
 
 	const double ChunkWorldZ = RootLoc.Z + OriginRelative.Z;
 	const uint32 Mask = uint32(CacheSlots() - 1);
-	FSlot& Slot = Table()[SlotIndex(Key.Level, Key.Key.X, Key.Key.Y, Mask)];
+	const uint32 SlotIdx = SlotIndex(Key.Level, Key.Key.X, Key.Key.Y, Mask);
+	FSlot& Slot = Table()[SlotIdx];
 
 	if (Slot.Level == Key.Level && Slot.X == Key.Key.X && Slot.Y == Key.Key.Y)
 	{
@@ -610,32 +741,7 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 	const FVector4f Fresh = bWarmAhead ? SampleParams(Root, OriginRelative, Key.Level)
 	                                   : Sample();
 
-	if (Fresh.Z > kSurfaceSentinelCeiling)
-	{
-		Slot.Level = Key.Level;
-		Slot.X = Key.Key.X;
-		Slot.Y = Key.Key.Y;
-		Slot.Temperature = Fresh.X;
-		Slot.Precipitation = Fresh.Y;
-		Slot.GradPacked = Fresh.W;
-		Slot.BaseZUU = double(Fresh.Z) + ChunkWorldZ;
-		if (bWarmAhead)
-		{
-			++WarmFills; // the slot write IS the product of a warm call
-		}
-	}
-	else
-	{
-		// "No surface gate" sentinel -- see kSurfaceSentinelCeiling. Not stored,
-		// and the slot is left as it was rather than half-filled.
-		//
-		// EXPECTED HARD ZERO in a normal run: it means SampleChunkParamsForPool
-		// found no UWorld or no UVoxelWorldSubsystem, so every brick published
-		// in that window carries a DISABLED surface gate -- cave floors tinted
-		// as turf, with no error anywhere. If this counter moves, the problem is
-		// upstream of this file.
-		++SentinelUncached;
-	}
+	StoreSampledSlot(SlotIdx, Key, Fresh, ChunkWorldZ, /*bWarmFill*/ bWarmAhead);
 
 	return ShadingFrom(Fresh);
 }

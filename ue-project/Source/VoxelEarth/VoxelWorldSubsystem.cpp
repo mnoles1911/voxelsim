@@ -334,6 +334,51 @@ static TAutoConsoleVariable<float> CVarVoxelStreamWarmShadingAhead(
 	TEXT("counted separately there as warmFill=) plus maxReqHdr on the submit split falling ")
 	TEXT("out of the tens of ms. Reads `Voxel warm-ahead (window)` for engagement."),
 	ECVF_Default);
+// ARM 1b: THE SAME CANDIDATE WALK, WITH THE SAMPLING MOVED OFF THE GAME THREAD.
+//
+// WHY THE INLINE ARM ABOVE COULD NOT WIN, stated as arithmetic rather than as a
+// tuning opinion: its budget is 0.25 ms of GAME THREAD per streaming tick, and
+// one cold sample costs 5.7 us warm but up to 587 us under worker-pool load.
+// That is LESS THAN ONE cold fill per tick. A ring crossing needs about 90 of
+// them -- ~53 ms of sampling -- so the inline arm is capacity-starved by
+// construction. Raising its budget does not fix that; it relocates the stutter
+// out of submit and into the warm loop, which is the same frame.
+//
+// WHAT ACTUALLY MOVES. The 587 us is four vxc::Amplifier::column calls plus a
+// climate sample -- pure arithmetic over an immutable raster. CPU meshing
+// workers already run 1,156 Amplifier::column calls per level-0 job over these
+// same footprints, so the work is demonstrably worker-safe. What is NOT
+// worker-safe is VoxelApplyFast's shading TABLE (unsynchronised; offThread is a
+// checked hard zero) and the fine tier's RequestFootprint prefetch
+// (game-thread-only). So this arm splits the sample: the arithmetic runs on a
+// BackgroundLow task, and the slot write lands back on the game thread through
+// VoxelApplyFast::FillFromPrecomputed. Same table, same thread, same key.
+//
+// THE FINE-TIER GATE IS THE WHOLE RISK AND IT IS GATED, NOT HOPED. A worker
+// that samples a column whose fine tile is not resident reaches
+// ResolveNonResidentPixel's worker branch, which does not load and reports a
+// gate leak -- FATAL in unattended runs. So a task is launched only for a
+// footprint FVoxelWorldImpl::IsShadingSampleFootprintResident has just certified
+// on the game thread, over exactly the rect the four corners will read.
+// `coldWorker=` on the fine lock line is this arm's KILL SIGNAL: any nonzero
+// value on any leg means the gate has a hole and the arm goes back to 0.
+static TAutoConsoleVariable<int32> CVarVoxelStreamWarmShadingAsync(
+	TEXT("voxel.Stream.WarmShadingAsync"), 0,
+	TEXT("Worker tasks LAUNCHED per streaming tick to pre-sample cold footprint shadings ")
+	TEXT("off the game thread, over the same predicted-anchor annuli voxel.Stream.")
+	TEXT("WarmShadingAhead walks. 0 = off and the default; 32 is the intended arm. A COUNT, ")
+	TEXT("not a wall-clock budget, because what this arm spends is WORKER time -- the ")
+	TEXT("game-thread half of a launch is a residency probe and a task spawn. In-flight is ")
+	TEXT("capped at 4x this value so a stalled background queue cannot grow without bound. ")
+	TEXT("Launches only over footprints the fine tier reports resident (a worker sampling a ")
+	TEXT("non-resident fine tile is a FATAL gate leak, not a wrong number), and re-checks ")
+	TEXT("residency and the root anchor again at drain. SUPERSEDES the inline arm: with both ")
+	TEXT("armed this one runs and WarmShadingAhead's inline sample is skipped. Verdict: the ")
+	TEXT("`Voxel apply fast` line's cacheMiss falling on the SUBMIT population plus maxReqHdr ")
+	TEXT("leaving the tens-of-ms band. Engagement: asyncLaunched=/asyncDrained= on the ")
+	TEXT("`Voxel warm-ahead` line. Kill signals: coldWorker=, offThread= or audit mismatch= ")
+	TEXT("nonzero."),
+	ECVF_Default);
 static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasPrefetchAhead(
 	TEXT("voxel.Stream.AtlasPrefetchAhead"), 0,
 	TEXT("Raster-atlas PAGES per streaming tick pre-filled for the page column the T4-1 ")
@@ -8810,6 +8855,64 @@ struct FVoxelWorldImpl
 	int64 WarmRootNullTicksSinceLog = 0;  // ticks skipped because GpuPoolRoot was null (mirrors the submit-site guard)
 	double WarmMsSinceLog = 0.0;          // wall clock actually spent, the budget's honest bill
 
+	// --- ARM 1b: THE ASYNC HALF (voxel.Stream.WarmShadingAsync, default 0) ---
+	//
+	// The candidate walk above is shared verbatim; only what happens at a COLD
+	// candidate differs. Instead of paying WarmForDispatch inline, the walk
+	// launches a BackgroundLow task that reproduces the sample's arithmetic
+	// (ChunkShadingParamsFromCorners over four SurfaceHeightFromAmplifierUU
+	// reads -- no UObject, no RequestFootprint, no table access) and posts the
+	// FVector4f here. DrainWarmShadingResults re-checks and writes the slot.
+	//
+	// EVERY FIELD HERE IS GAME-THREAD-ONLY EXCEPT THE QUEUE, which is MPSC for
+	// the same reason ResultsQueue and AssetResolveQueue are: many task threads
+	// produce, exactly one consumer drains.
+	struct FWarmShadingResult
+	{
+		VoxelCoords::FVoxelLevelChunkKey Key;
+		FVector4f Params = FVector4f(0.f, 0.f, 0.f, 0.f);
+		// The anchor the worker sampled UNDER, so the drain can tell a fresh
+		// result from one taken against a root that has since moved. The world
+		// pointer is COMPARED AND NEVER DEREFERENCED -- the same rule
+		// VoxelApplyBatch.cpp's CachedWorld follows, and the reason a raw
+		// pointer is sound here: an identity test does not need the object.
+		FVector SampledRootLoc = FVector::ZeroVector;
+		const UWorld* SampledWorld = nullptr;
+	};
+	mutable TQueue<FWarmShadingResult, EQueueMode::Mpsc> WarmShadingQueue;
+
+	// Footprints with a warm-shading task outstanding. Game thread only. Its
+	// job is the one AssetResolveInFlight's is: stop the walk relaunching the
+	// same footprint on every tick until the first task lands, which would make
+	// this a work MULTIPLIER rather than a mover.
+	TSet<VoxelCoords::FVoxelLevelChunkKey> WarmAsyncInFlight;
+
+	// Window counters, all on the `Voxel warm-ahead` line. Counted at their ++
+	// sites, never derived, because an armed-but-inert arm has to be readable:
+	// asyncLaunched large with asyncDrained ~0 is a queue that never lands,
+	// asyncLaunched ~0 with asyncDroppedGate large is the fine tier refusing
+	// everything, and both are failures that a single "it warmed N" number
+	// would have hidden.
+	int64 WarmAsyncLaunchedSinceLog = 0;      // tasks spawned
+	int64 WarmAsyncDrainedSinceLog = 0;       // results dequeued on the game thread
+	int64 WarmAsyncStaleSinceLog = 0;         // ...dropped: root moved or world changed since the sample
+	int64 WarmAsyncNotResidentSinceLog = 0;   // ...dropped: footprint no longer resident at drain
+	int64 WarmAsyncFilledSinceLog = 0;        // ...that wrote a slot (also counted warmFill= by the module)
+	int64 WarmAsyncGateNotResidentSinceLog = 0; // launches refused: fine tier not resident
+	// TICKS the walk stopped early because this tick's launch cap or the
+	// standing in-flight cap bound -- not footprints refused. Named for what it
+	// counts: the walk stops at the FIRST such candidate, so there is no
+	// per-footprint number to report and inventing one would be a lie.
+	// asyncCapStops ~= ticks with asyncLaunched flat is the cap binding and the
+	// arm asking for a bigger one; asyncCapStops=0 means it never bound.
+	int64 WarmAsyncCapStopsSinceLog = 0;
+	// Never reset. "Has this arm EVER launched" is what lets the drain cost one
+	// integer compare on a control leg while still draining a queue left behind
+	// by an arm that was turned on and then off mid-session.
+	int64 WarmAsyncLaunchedTotal = 0;
+	// One-shot: both arms armed at once. Logged once, not per tick.
+	bool bWarmArmConflictLogged = false;
+
 	double AccumDispatchMs = 0.0;
 	// Sub-total of AccumDispatchMs: the speculative half only. See task #21.
 	double AccumSpecDispatchMs = 0.0;
@@ -9761,6 +9864,15 @@ private:
 	// Runs at the END of TickStreaming so demand always goes first; defined
 	// beside SubmitGpuMeshJob, whose reqHdr bucket it exists to flatten.
 	void WarmShadingAheadTick();
+	// ARM 1b (voxel.Stream.WarmShadingAsync): collect the worker-side warm
+	// samples that landed and write their slots. GAME THREAD, and it must run
+	// BEFORE WarmShadingAheadTick launches more -- same drain-then-warm order,
+	// for the same reason, as DispatchJobs' asset-resolve pair.
+	void DrainWarmShadingResults();
+	// The fine-tier gate for a warm-shading task: is every tile the four corner
+	// samples of this footprint will read already resident? GAME THREAD ONLY
+	// (IsFootprintResident takes the streamer's shared lock).
+	bool IsShadingSampleFootprintResident(const FVector& ChunkWorldOrigin, int32 Level) const;
 	void DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainUnloads();
@@ -11209,6 +11321,14 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// off) is the whole cost, and off it is one cvar read and one branch. See
 	// WarmShadingAheadTick's header comment for the reqHdr measurement and the
 	// candidate-set derivation.
+	//
+	// DRAIN FIRST, WARM SECOND (voxel.Stream.WarmShadingAsync). Same order and
+	// same reason as DispatchJobs' asset-resolve pair: a worker result that
+	// landed since the last tick must be in the shading table before the next
+	// tick's submits look at it, and a drain placed after the walk would let the
+	// walk re-probe footprints whose answers were already sitting in the queue.
+	// Off, this is one integer compare (see DrainWarmShadingResults).
+	DrainWarmShadingResults();
 	WarmShadingAheadTick();
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
@@ -13413,17 +13533,59 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// this reading survives) plus maxReqHdr on the submit split leaving the
 	// 43-52 ms band. Budget wording: warmBudgetMs is what was actually SPENT
 	// (wall clock, overshoot included), not the configured cap.
-	if (CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread() > 0.f || WarmedSinceLog > 0 ||
-	    WarmTicksSinceLog > 0)
+	//
+	// THE ASYNC GROUP (voxel.Stream.WarmShadingAsync), with its own ladder --
+	// every reading below has been seen on some arm of this project and each one
+	// needs a different response:
+	//   asyncLaunched=0 with warmSkippedCached>0
+	//                                     -> everything ahead is already warm.
+	//                                        Healthy, and the arm is doing
+	//                                        nothing because there is nothing to
+	//                                        do. NOT a failure.
+	//   asyncLaunched=0, asyncGateNotResident>0
+	//                                     -> the fine tier is refusing the whole
+	//                                        candidate set. The arm is INERT and
+	//                                        the leg measures nothing; check the
+	//                                        fine ring radius and the tile set
+	//                                        before reading any verdict.
+	//   asyncLaunched>0, asyncDrained ~0  -> tasks are launching and not landing.
+	//                                        Worker starvation or a queue that
+	//                                        never drains. DEAD, not null.
+	//   asyncDrained>0, asyncFilled ~0    -> results land and are all thrown
+	//                                        away. asyncStale says the root is
+	//                                        moving (the cache arm is void
+	//                                        anyway, see rootFlush); ELSE the
+	//                                        table already had the entry, which
+	//                                        means demand beat the warm and the
+	//                                        arm is too late to matter.
+	//   asyncCapStops ~= ticks            -> the cap binds every tick. Raise it
+	//                                        only after asyncFilled is shown to
+	//                                        be moving cacheMiss.
+	// The VERDICT is still not on this line: it is the `Voxel apply fast` line's
+	// cacheMiss falling on the SUBMIT population (fills land in warmFill=, never
+	// in cacheMiss, precisely so this survives) plus maxReqHdr on the submit
+	// split leaving the 43-52 ms band. asyncFilled large with cacheMiss FLAT is
+	// the module's standing rule firing: revert, do not tune.
+	if (CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread() > 0.f ||
+	    CVarVoxelStreamWarmShadingAsync.GetValueOnGameThread() > 0 || WarmedSinceLog > 0 ||
+	    WarmTicksSinceLog > 0 || WarmAsyncLaunchedTotal > 0)
 	{
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel warm-ahead (window): budget=%.2fms/tick warmed=%lld ")
 		       TEXT("warmSkippedCached=%lld warmSkippedAir=%lld warmBudgetMs=%.1f ticks=%lld ")
-		       TEXT("rootNullTicks=%lld%s"),
+		       TEXT("rootNullTicks=%lld | async=%d asyncLaunched=%lld asyncDrained=%lld ")
+		       TEXT("asyncFilled=%lld asyncStale=%lld asyncNotResident=%lld ")
+		       TEXT("asyncGateNotResident=%lld asyncCapStops=%lld asyncInFlight=%d%s"),
 		       CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread(),
 		       (long long)WarmedSinceLog, (long long)WarmSkippedCachedSinceLog,
 		       (long long)WarmSkippedAirSinceLog, WarmMsSinceLog,
 		       (long long)WarmTicksSinceLog, (long long)WarmRootNullTicksSinceLog,
+		       CVarVoxelStreamWarmShadingAsync.GetValueOnGameThread(),
+		       (long long)WarmAsyncLaunchedSinceLog, (long long)WarmAsyncDrainedSinceLog,
+		       (long long)WarmAsyncFilledSinceLog, (long long)WarmAsyncStaleSinceLog,
+		       (long long)WarmAsyncNotResidentSinceLog,
+		       (long long)WarmAsyncGateNotResidentSinceLog,
+		       (long long)WarmAsyncCapStopsSinceLog, WarmAsyncInFlight.Num(),
 		       !VoxelApplyFast::CacheArmed()
 		           ? TEXT(" INERT-CACHE-OFF (-VoxelApplyFast cache bit clear; warming can persist nothing)")
 		           : TEXT(""));
@@ -13433,6 +13595,13 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		WarmTicksSinceLog = 0;
 		WarmRootNullTicksSinceLog = 0;
 		WarmMsSinceLog = 0.0;
+		WarmAsyncLaunchedSinceLog = 0;
+		WarmAsyncDrainedSinceLog = 0;
+		WarmAsyncFilledSinceLog = 0;
+		WarmAsyncStaleSinceLog = 0;
+		WarmAsyncNotResidentSinceLog = 0;
+		WarmAsyncGateNotResidentSinceLog = 0;
+		WarmAsyncCapStopsSinceLog = 0;
 	}
 
 	// S2-3 park census. adopted/parked is the hit rate: a park that is never
@@ -21436,6 +21605,138 @@ static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
                                           const FVector& ChunkOriginRelative,
                                           int32 Level);
 static FVoxelBrickChunkShading ShadingFromChunkParams(const FVector4f& Params);
+// The three pieces the async warm arm shares with the demand sampler, declared
+// here for the same reason and defined beside it. NOT re-implemented: a second
+// copy of this arithmetic running on a worker thread is a divergence that would
+// surface as two different grounds in one world, with nothing to catch it.
+static double ChunkShadingSpanUU(int32 Level);
+static FVector4f ChunkShadingParamsFromCorners(const FVector& ChunkWorldOrigin, int32 Level,
+                                               bool bHasSurfaceGate,
+                                               double H00, double H10, double H01, double H11);
+static double SurfaceHeightFromAmplifierUU(const vxc::Amplifier& Amp, double WorldX, double WorldY);
+
+// ---------------------------------------------------------------------------
+// ARM 1b's FINE-TIER GATE. Read this before touching the async warm.
+// ---------------------------------------------------------------------------
+//
+// THE PREDICATE, AND WHAT IT GUARDS. A warm task samples exactly four columns:
+// the chunk's XY origin and three corners one level-voxel in from the far edge
+// (ChunkShadingSpanUU). Each of those goes to SurfaceHeightFromAmplifierUU ->
+// vxc::Amplifier::column -> FVoxelFineTileSamplerProxy::elevationMm. If the tile
+// under any of them is not resident, elevationMm falls into
+// FVoxelFineTileStreamer::ResolveNonResidentPixel, and on a WORKER that branch
+// does not load -- it reports a gate leak, which is FATAL under
+// SetLeakIsFatal (unattended legs). So this must be answered YES before a task
+// is launched, and again before its result is used.
+//
+// WHY THIS RECT AND NOT IsColumnGridFootprintResident'S. That predicate answers
+// the MESHER's question -- the chunk's cell range plus a one-cell apron, keyed
+// off the chunk INDEX with no root offset. The shading sample is taken at
+// Root.GetComponentLocation() + ChunkOriginWorldForLevel(...), and the whole
+// reason VoxelApplyBatch.cpp anchors its table on the root's location is that
+// the root being at the origin is an assumption this project does not make. So
+// the rect checked here is derived from the SAME ChunkWorldOrigin the sample
+// will use. With the root at the origin this rect is a strict SUBSET of the
+// column-grid rect (span is one level-voxel narrower than the chunk, against an
+// apron one cell wider on each side), which is the cross-check that the two
+// agree where they overlap.
+//
+// IsFootprintResident dilates internally by the carrier stencil and
+// kFineReadMarginMm -- the margin every generation query carries -- so callers
+// must NOT pre-dilate. One level-voxel of slack is added on each side anyway,
+// because being generous here can only ever REFUSE a warm (one demand-cold
+// sample, today's behaviour) while being mean would be a fatal leak.
+//
+// WHAT THIS DOES NOT PROVE, stated rather than papered over: it says the tiles
+// were resident when the game thread asked, not that they stay resident while
+// the task runs. Eviction only happens in TickResidencyAndEviction, outside the
+// pinned ring and only when the LRU budget is exceeded -- and this is the SAME
+// exposure the CPU mesher already carries, on a far larger surface: its
+// bColumnGridResident is latched at dispatch and the worker then runs 1,156
+// Amplifier::column calls over the chunk plus apron, against four columns
+// strictly inside one footprint here. The window is also shorter, because the
+// in-flight cap keeps the queue drained within a tick or two. If it is ever
+// wrong, `coldWorker=` on the fine lock line is nonzero and the arm is dead --
+// that is the reading, and it can come out either way.
+bool FVoxelWorldImpl::IsShadingSampleFootprintResident(const FVector& ChunkWorldOrigin,
+                                                       int32 Level) const
+{
+	if (!FineStreamer)
+	{
+		// No fine tier configured: every column answers from always-resident
+		// coarse tiles, so there is no non-resident raster to fault on. The same
+		// conclusion FootprintChunkZRangeCached and AssetResolveFootprintResident
+		// reach, for the same reason.
+		return true;
+	}
+	const double SpanUU = ChunkShadingSpanUU(Level);
+	const double SlackUU = double(VoxelCoords::VoxelSizeUU) * double(int64(1) << Level);
+	const int64 X0Mm = VoxelCoords::WorldToMm(ChunkWorldOrigin.X - SlackUU);
+	const int64 Y0Mm = VoxelCoords::WorldToMm(ChunkWorldOrigin.Y - SlackUU);
+	const int64 X1Mm = VoxelCoords::WorldToMm(ChunkWorldOrigin.X + SpanUU + SlackUU);
+	const int64 Y1Mm = VoxelCoords::WorldToMm(ChunkWorldOrigin.Y + SpanUU + SlackUU);
+	return FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm);
+}
+
+// ARM 1b's landing half. DRAIN FIRST, WARM SECOND, both before anything else in
+// the tick can ask for a shading -- the same order and the same reason as
+// DispatchJobs' DrainAssetResolveResults/WarmAssetResolves pair: a result that
+// landed since the last tick must be in the table before this tick's submits
+// look, or every task arrives exactly one dispatch too late and the counters
+// show launches and landings against a hit rate that never moves.
+//
+// THREE THINGS ARE RE-CHECKED HERE, and each one exists because the task
+// CANNOT check its own inputs -- residency and the root transform are readable
+// only on this thread:
+//   1. the root anchor (location + world) the worker sampled under. A moved
+//      root means the four corners were taken at the wrong XY, and
+//      VoxelApplyFast's table would be flushed and then refilled with them.
+//      Counted asyncStale=.
+//   2. residency, again. The launch-side check said the raster was resident
+//      when the work started; this says it still is. Neither proves it stayed
+//      resident throughout -- the same exposure DrainAssetResolveResults states
+//      for itself. Counted asyncNotResident=.
+//   3. the pool root still exists, and is the SAME component the sample was
+//      taken against -- warming through a different root than dispatch uses
+//      would poison the cache with wrong-origin heights, which is the guard
+//      WarmShadingAheadTick counts as rootNullTicks.
+void FVoxelWorldImpl::DrainWarmShadingResults()
+{
+	check(IsInGameThread());
+	// One integer compare on a control leg. Deliberately NOT a check of the
+	// cvar: an arm that was on and is now off still has results in flight, and
+	// dropping them on the floor would leak the queue for the session.
+	if (WarmAsyncLaunchedTotal == 0)
+	{
+		return;
+	}
+	const USceneComponent* PoolRootForShading = GpuPoolRoot.Get();
+	FWarmShadingResult Landed;
+	while (WarmShadingQueue.Dequeue(Landed))
+	{
+		++WarmAsyncDrainedSinceLog;
+		WarmAsyncInFlight.Remove(Landed.Key);
+		if (PoolRootForShading == nullptr ||
+		    PoolRootForShading->GetComponentLocation() != Landed.SampledRootLoc ||
+		    PoolRootForShading->GetWorld() != Landed.SampledWorld)
+		{
+			++WarmAsyncStaleSinceLog;
+			continue;
+		}
+		const FVector ChunkOriginRelative =
+			VoxelCoords::ChunkOriginWorldForLevel(Landed.Key.Key, Landed.Key.Level);
+		if (!IsShadingSampleFootprintResident(Landed.SampledRootLoc + ChunkOriginRelative,
+		                                      Landed.Key.Level))
+		{
+			++WarmAsyncNotResidentSinceLog;
+			continue;
+		}
+		if (VoxelApplyFast::FillFromPrecomputed(Landed.Key, *PoolRootForShading, Landed.Params))
+		{
+			++WarmAsyncFilledSinceLog;
+		}
+	}
+}
 
 // ---------------------------------------------------------------------------
 // ARM 1 OF THE STUTTER WORK (docs/hundred-fps-2026-08-28.md 3b): warm the
@@ -21484,14 +21785,88 @@ static FVoxelBrickChunkShading ShadingFromChunkParams(const FVector4f& Params);
 // submit-split line falling out of the 43-52 ms band. avoided ~= calls with a
 // FLAT reqHdr means the diagnosis is wrong: revert, do not tune -- the
 // module's own standing rule.
+//
+// ---------------------------------------------------------------------------
+// ARM 1b -- voxel.Stream.WarmShadingAsync (default 0). THE DOCTRINE.
+// ---------------------------------------------------------------------------
+//
+// WHY ARM 1 COULD NOT WIN, AS ARITHMETIC. Its budget is 0.25 ms of GAME THREAD
+// per streaming tick. One cold sample is 5.7 us warm and up to 587 us under
+// worker-pool load. That buys LESS THAN ONE cold fill per tick. A ring crossing
+// needs ~90 fills -- about 53 ms of sampling -- so at 0.25 ms/tick the arm is
+// two hundred-odd ticks behind the crossing it is supposed to precede. It was
+// never mistuned; it was capacity-starved by construction, and raising the
+// budget only relocates the same lump out of submit and into this loop, which is
+// the same frame. Everything ABOVE this paragraph -- the candidate set, the ring
+// cursor, the IsCached probe, the band skip -- was sound and is kept verbatim.
+// Only what happens at a cold candidate changes.
+//
+// WHAT MOVES OFF-THREAD AND WHAT CANNOT. The 587 us is four
+// vxc::Amplifier::column calls plus a climate sample: arithmetic over an
+// immutable raster, already run 1,156 times per level-0 job by every CPU meshing
+// worker. What CANNOT move is VoxelApplyFast's shading table (unsynchronised;
+// its offThread counter is a checked hard zero) and the fine tier's
+// RequestFootprint prefetch (game-thread-only; a worker holding that lock for a
+// 200 MB read stalls the whole pool). So the sample is SPLIT: the arithmetic on
+// a BackgroundLow task through ChunkShadingParamsFromCorners -- the same
+// function the demand sampler calls, not a copy of it -- and the slot write back
+// here through VoxelApplyFast::FillFromPrecomputed.
+//
+// THE FINE-TIER GATE IS THE REAL HAZARD. A worker whose column lands on a
+// non-resident fine tile reaches ResolveNonResidentPixel's WORKER branch, which
+// deliberately does not load and reports a gate leak -- FATAL in unattended
+// runs, because a leaking run does not degrade, it produces terrain no other
+// process reproduces while exiting 0. The guard is
+// IsShadingSampleFootprintResident (see its comment for the exact rect, why it
+// is not IsColumnGridFootprintResident's, and what it does and does not prove),
+// checked on the game thread at LAUNCH and again at DRAIN. A worker never asks a
+// residency question, because it cannot.
+//
+// KILL SIGNALS -- any one of these on any leg and the arm goes back to 0:
+//   coldWorker= nonzero on the fine lock line -> the gate has a hole and a
+//       worker reached the fatal branch. This is the arm's kill signal, and it
+//       outranks every timing on the leg.
+//   offThread= nonzero on `Voxel apply fast` -> something warmed the
+//       unsynchronised table off the game thread. Wrong terrain, not a crash.
+//   mismatch= nonzero under -VoxelApplyColumnCacheAudit=1 -> a filled slot
+//       disagrees with a fresh sample of the same footprint: the worker's
+//       arithmetic and the demand path's have diverged, which is precisely the
+//       failure sharing ChunkShadingParamsFromCorners exists to make impossible.
+//
+// THE GATES, PRE-REGISTERED BEFORE THE LEG: cacheMiss falls hard on the submit
+// population, maxReqHdr leaves the tens-of-ms band, stutterPct falls materially
+// toward 0.10, p95/p99 not worse, flight holes not rising -- any one moving the
+// wrong way refutes, default stays 0.
 // ---------------------------------------------------------------------------
 void FVoxelWorldImpl::WarmShadingAheadTick()
 {
 	const float BudgetMs = CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread();
-	if (BudgetMs <= 0.f)
+	const int32 AsyncPerTick = CVarVoxelStreamWarmShadingAsync.GetValueOnGameThread();
+	const bool bAsync = AsyncPerTick > 0;
+	if (BudgetMs <= 0.f && !bAsync)
 	{
-		return; // control arm: one cvar read and this branch, per tick, total
+		return; // control arm: two cvar reads and this branch, per tick, total
 	}
+
+	// TWO ARMS, ONE WALK, AND THEY MUST NOT BOTH SPEND. The candidate walk below
+	// is shared verbatim; only what happens at a cold candidate differs. With
+	// both armed the async arm wins and the inline sample is skipped -- if they
+	// both ran, the inline arm would warm the nearest candidates before the
+	// async arm could see them, the async launches would collapse to whatever
+	// the 0.25 ms did not reach, and the leg would measure a blend of two
+	// behaviours with no way to attribute the result to either. Said ONCE, not
+	// per tick: a warning that repeats 50 times a second is noise nobody reads.
+	if (bAsync && BudgetMs > 0.f && !bWarmArmConflictLogged)
+	{
+		bWarmArmConflictLogged = true;
+		UE_LOG(LogVoxelStream, Warning,
+		       TEXT("voxel.Stream.WarmShadingAhead=%.2f and voxel.Stream.WarmShadingAsync=%d are "
+		            "BOTH armed. The async arm supersedes: the inline sample is skipped and "
+		            "WarmShadingAhead's value now bounds only the candidate WALK. Set "
+		            "WarmShadingAhead to 0 for a clean A/B."),
+		       BudgetMs, AsyncPerTick);
+	}
+
 	using namespace VoxelCoords;
 	++WarmTicksSinceLog;
 
@@ -21513,8 +21888,32 @@ void FVoxelWorldImpl::WarmShadingAheadTick()
 	}
 
 	const double T0 = FPlatformTime::Seconds();
-	const double Deadline = T0 + double(BudgetMs) / 1000.0;
+	// THE ASYNC ARM'S DEADLINE BOUNDS THE WALK, NOT A SAMPLE. With it on
+	// nothing inside this loop samples, so the wall clock is spent on IsCached
+	// probes, residency probes and task spawns -- cheap, but unbounded in count,
+	// and the budget is still the only thing standing between this loop and the
+	// frame. 0.25 ms is a floor, not the arm's cost: the arm's cost is
+	// AsyncPerTick worker tasks.
+	constexpr double kAsyncWalkBudgetMs = 0.25;
+	const double EffectiveBudgetMs =
+		bAsync ? FMath::Max(double(BudgetMs), kAsyncWalkBudgetMs) : double(BudgetMs);
+	const double Deadline = T0 + EffectiveBudgetMs / 1000.0;
 	ON_SCOPE_EXIT { WarmMsSinceLog += (FPlatformTime::Seconds() - T0) * 1000.0; };
+
+	// The per-tick launch cap, and the standing in-flight ceiling behind it.
+	// 4x is one tick's launches plus three ticks of slack: a BackgroundLow task
+	// that has not been scheduled yet must not let the walk re-launch its
+	// footprint, and an unbounded set here would turn a stalled worker pool into
+	// a memory leak that reads as healthy traffic.
+	const int32 AsyncInFlightCap = bAsync ? 4 * AsyncPerTick : 0;
+	int32 AsyncLaunchedThisTick = 0;
+	// Raw pointers into Impl-owned data, exactly as the mesh job's GenPtr and
+	// B.3's are, and safe for exactly the same reason: every task below goes
+	// into InFlightTasks and Deinitialize waits on it in WaitForInFlightTasks
+	// before Impl is destroyed. A task that is NOT registered there would
+	// outlive Impl and read freed worldgen.
+	const vxc::Amplifier* AmpPtr = bAsync ? &Voxels.amplifier() : nullptr;
+	TQueue<FWarmShadingResult, EQueueMode::Mpsc>* WarmQueuePtr = &WarmShadingQueue;
 
 	const int32 MaxWarmLevel =
 		FMath::Min(UVoxelWorldSubsystem::GetMaxRingLevel(), VoxelStreamAdmission::GpuMeshMaxLevel());
@@ -21633,15 +22032,100 @@ void FVoxelWorldImpl::WarmShadingAheadTick()
 						bRanOut = true;
 						break;
 					}
+					// Z=0 deliberately: the cache key and every cached quantity
+					// are per-(Level,X,Y) -- SampleChunkParamsForPool's Z enters
+					// only as the final rebase, which the cache re-derives per
+					// chunk at hit time, so ANY Z yields the identical slot.
+					const VoxelCoords::FVoxelLevelChunkKey WarmKey{
+						Level, FVoxelChunkKey{Cx, Cy, 0}};
+
+					// --- ARM 1b: LAUNCH, DO NOT SAMPLE -----------------------
+					if (bAsync)
+					{
+						if (AsyncLaunchedThisTick >= AsyncPerTick ||
+						    WarmAsyncInFlight.Num() >= AsyncInFlightCap)
+						{
+							// This tick's capacity is spent. Stop the walk here
+							// rather than continuing to probe: the cursor
+							// resumes at this ring next tick, which is the same
+							// contract the wall-clock stop has.
+							++WarmAsyncCapStopsSinceLog;
+							bRanOut = true;
+							break;
+						}
+						if (WarmAsyncInFlight.Contains(WarmKey))
+						{
+							continue; // already being answered
+						}
+						// The SAME origin the sample will be taken at, computed
+						// once and used for the gate, the task and the drain's
+						// staleness test. Deriving it three times would be the
+						// "join computed instead of checked" shape.
+						const FVector ChunkOriginRelative =
+							VoxelCoords::ChunkOriginWorldForLevel(WarmKey.Key, Level);
+						const FVector RootLoc = PoolRootForShading->GetComponentLocation();
+						const FVector ChunkWorldOrigin = RootLoc + ChunkOriginRelative;
+						// THE FATAL-GATE CHECK. See
+						// IsShadingSampleFootprintResident: a worker sampling a
+						// non-resident fine tile is a gate leak, not a wrong
+						// number, and gate leaks are fatal on unattended legs.
+						if (!IsShadingSampleFootprintResident(ChunkWorldOrigin, Level))
+						{
+							++WarmAsyncGateNotResidentSinceLog;
+							continue;
+						}
+						const UWorld* SampledWorld = PoolRootForShading->GetWorld();
+						WarmAsyncInFlight.Add(WarmKey);
+						++AsyncLaunchedThisTick;
+						++WarmAsyncLaunchedSinceLog;
+						++WarmAsyncLaunchedTotal;
+						UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+							TEXT("VoxelWarmShading"),
+							[AmpPtr, WarmQueuePtr, WarmKey, ChunkWorldOrigin, RootLoc,
+							 SampledWorld, Level]()
+							{
+								// PLAIN VALUES ONLY. No UObject is read here, no
+								// RequestFootprint is issued (it is game-thread
+								// only), and VoxelApplyFast's table is never
+								// touched -- the slot write happens back on the
+								// game thread in DrainWarmShadingResults. What
+								// runs is the arithmetic and nothing else.
+								const double SpanUU = ChunkShadingSpanUU(Level);
+								const double X0 = ChunkWorldOrigin.X;
+								const double Y0 = ChunkWorldOrigin.Y;
+								const double H00 =
+									SurfaceHeightFromAmplifierUU(*AmpPtr, X0, Y0);
+								const double H10 =
+									SurfaceHeightFromAmplifierUU(*AmpPtr, X0 + SpanUU, Y0);
+								const double H01 =
+									SurfaceHeightFromAmplifierUU(*AmpPtr, X0, Y0 + SpanUU);
+								const double H11 =
+									SurfaceHeightFromAmplifierUU(*AmpPtr, X0 + SpanUU,
+									                             Y0 + SpanUU);
+								FWarmShadingResult Out;
+								Out.Key = WarmKey;
+								Out.Params = ChunkShadingParamsFromCorners(
+									ChunkWorldOrigin, Level, /*bHasSurfaceGate*/ true,
+									H00, H10, H01, H11);
+								Out.SampledRootLoc = RootLoc;
+								Out.SampledWorld = SampledWorld;
+								WarmQueuePtr->Enqueue(MoveTemp(Out));
+							},
+							// Below the mesh jobs' band by intent: this is
+							// speculative work whose miss costs a counter, and it
+							// must never take a worker slot from a chunk somebody
+							// is waiting for.
+							UE::Tasks::ETaskPriority::BackgroundLow);
+						InFlightTasks.Add(MoveTemp(Task));
+						continue;
+					}
+
+					// --- ARM 1: SAMPLE INLINE (unchanged) --------------------
 					// The same entry the submit site uses (mirrored from
-					// SubmitGpuMeshJob below, GpuPoolRoot guard included). Z=0
-					// deliberately: the cache key and every cached quantity are
-					// per-(Level,X,Y) -- SampleChunkParamsForPool's Z enters only
-					// as the final rebase, which the cache re-derives per chunk
-					// at hit time, so ANY Z yields the identical slot.
+					// SubmitGpuMeshJob below, GpuPoolRoot guard included).
 					VoxelApplyFast::WarmForDispatch(
-						VoxelCoords::FVoxelLevelChunkKey{Level, FVoxelChunkKey{Cx, Cy, 0}},
-						*PoolRootForShading, &SampleChunkParamsForPool, &ShadingFromChunkParams);
+						WarmKey, *PoolRootForShading,
+						&SampleChunkParamsForPool, &ShadingFromChunkParams);
 					++WarmedSinceLog;
 				}
 			}
@@ -21655,6 +22139,16 @@ void FVoxelWorldImpl::WarmShadingAheadTick()
 		// level (or to nothing, which the window line reports as warmed=0 --
 		// the healthy steady state, distinguishable from OFF because the line
 		// itself only prints while the arm is on).
+		//
+		// ON THE ASYNC ARM "CLEAN" MEANS LAUNCHED, NOT LANDED. A level whose
+		// candidates all have tasks outstanding reaches the rim and is marked
+		// clean while the table is still empty. That is correct and deliberate:
+		// re-walking would only re-probe footprints already in
+		// WarmAsyncInFlight. A task whose result is DROPPED at drain (stale
+		// anchor, residency lost) leaves that footprint cold until the centre
+		// moves, and demand pays it -- the same "a hole opened behind the cursor
+		// is not chased" rule the cursor was built with, and the reason
+		// asyncStale/asyncNotResident are counted rather than retried.
 		bWarmScanClean[Level] = true;
 	}
 }
@@ -25056,89 +25550,146 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 // by the world's height range and is exact in float. This is the same reasoning
 // that puts chunk origins in a rebase frame (docs/gpu-pool-rendering-notes.md
 // invariant 4), applied to the one other absolute coordinate in the table.
-static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
-                                          const FVector& ChunkOriginRelative,
-                                          int32 Level)
+// SPAN, NOT EDGE. GetSurfaceHeightUU floors its argument to a voxel, so a
+// sample at X0 + EdgeUU is the first column of the NEXT chunk -- which on the
+// fine tier can be the first column of the next TILE, and a query for a
+// non-resident fine tile is a fatal residency leak in unattended runs rather
+// than a wrong number. One level-voxel in keeps all four samples inside the
+// chunk whose columns the mesher has already required to be resident.
+//
+// PULLED OUT OF SampleChunkParamsForPool so that the async warm task
+// (voxel.Stream.WarmShadingAsync) places its four corners at exactly the same
+// coordinates the demand sampler does, AND so the residency gate that decides
+// whether that task may run at all can be computed from the same span. Three
+// call sites, one arithmetic.
+static double ChunkShadingSpanUU(int32 Level)
 {
 	const double HalfEdgeUU = 0.5 * VoxelCoords::ChunkEdgeUU * double(int64(1) << Level);
-	const FVector ChunkWorldOrigin = Root.GetComponentLocation() + ChunkOriginRelative;
+	const double LevelVoxelUU = double(VoxelCoords::VoxelSizeUU) * double(int64(1) << Level);
+	return 2.0 * HalfEdgeUU - LevelVoxelUU;
+}
+
+// THE PURE MATH OF THE POOL SHADING SAMPLE, ONE TRANSCRIPTION, TWO THREADS.
+//
+// Everything SampleChunkParamsForPool does that is NOT a UObject read lives
+// here: the climate sample, the plane fit, the gradient quantisation round trip
+// and the double-precision Z rebase. The UObject reads stay at the call sites.
+// voxel.Stream.WarmShadingAsync's worker calls this with heights it took
+// straight off the amplifier, so its FVector4f is bit-identical to the one the
+// demand path would have produced -- FACTORED RATHER THAN TRANSCRIBED, because
+// a second copy of this arithmetic living on a worker thread is a divergence
+// nobody would see until the world was drawn with two different grounds.
+//
+// bHasSurfaceGate == false is the transient/loading-world fallback ("no
+// subsystem -> no gate, always surface", matching BuildChunkVertexData) and the
+// four corner heights are ignored. Unreachable from the warm task, which is
+// only launched once the subsystem, the amplifier and the pool root all exist.
+//
+// FOUR CORNERS, NOT THE CENTRE, and the reason is the whole of task #44: one
+// height for a chunk that is 102.4 m across at L5 is a HORIZONTAL reference
+// plane held against a sloping surface, and cutting a tilted voxel staircase
+// with a horizontal plane draws a chevron. See VoxelClimateProbe.h's
+// "surface-proximity gate's reference height" note for the measurement and for
+// why the band was not simply widened instead.
+//
+// THREAD SAFETY: VoxelClimate::SampleClimateAtWorldUU is already called from
+// meshing workers (see its comment, "A worker beat the game thread to it") --
+// the sampler is built once under GInitLock and never mutated after, so the hot
+// path takes no lock. Nothing else in here touches shared state.
+static FVector4f ChunkShadingParamsFromCorners(const FVector& ChunkWorldOrigin, int32 Level,
+                                               bool bHasSurfaceGate,
+                                               double H00, double H10, double H01, double H11)
+{
+	const double HalfEdgeUU = 0.5 * VoxelCoords::ChunkEdgeUU * double(int64(1) << Level);
 	const FVector Centre = ChunkWorldOrigin + FVector(HalfEdgeUU, HalfEdgeUU, 0.0);
 
 	VoxelClimate::EnsureInitialized();
 	const FVoxelClimateBytes Bytes = VoxelClimate::SampleClimateAtWorldUU(Centre.X, Centre.Y);
 
-	// No subsystem -> no gate, matching BuildChunkVertexData's fallback for
-	// transient/loading worlds ("always surface", how it behaved before the gate
-	// existed).
-	//
-	// FOUR CORNERS, NOT THE CENTRE, and the reason is the whole of task #44: one
-	// height for a chunk that is 102.4 m across at L5 is a HORIZONTAL reference
-	// plane held against a sloping surface, and cutting a tilted voxel staircase
-	// with a horizontal plane draws a chevron. See VoxelClimateProbe.h's
-	// "surface-proximity gate's reference height" note for the measurement and
-	// for why the band was not simply widened instead.
-	//
-	// The extra cost is three more Amplifier::column calls per chunk apply, on
-	// the game thread. SampleChunkParamsForPool was MEASURED at 0.002-0.004 ms
-	// per apply -- 0.2% of an apply, against poolAdd's 98-99% -- when T1-3
-	// proposed caching it away (docs/backlog.md, "T1-3 ... STRUCK"), so 4x it is
-	// still under 1% of an apply, and this is the thread the frame is NOT bound
-	// on (docs: render-thread bound at 2K, game thread ~75% idle). The fine-tier
-	// PREFETCH is not paid four times: RequestFootprint inside GetSurfaceHeightUU
-	// dilates around each query, and the four corners of one chunk fall inside
-	// one dilated footprint after the first.
 	float SurfaceZRelUU = UVoxelGpuPoolComponent::kNoSurfaceGate;
 	float PackedGradients = 0.0f;
-	if (const UWorld* World = Root.GetWorld())
+	if (bHasSurfaceGate)
 	{
-		if (const UVoxelWorldSubsystem* Sub = World->GetSubsystem<UVoxelWorldSubsystem>())
-		{
-			// SPAN, NOT EDGE. GetSurfaceHeightUU floors its argument to a voxel,
-			// so a sample at X0 + EdgeUU is the first column of the NEXT chunk --
-			// which on the fine tier can be the first column of the next TILE,
-			// and a query for a non-resident fine tile is a fatal residency leak
-			// in unattended runs rather than a wrong number. One level-voxel in
-			// keeps all four samples inside the chunk whose columns the mesher
-			// has already required to be resident.
-			const double LevelVoxelUU = double(VoxelCoords::VoxelSizeUU) * double(int64(1) << Level);
-			const double SpanUU = 2.0 * HalfEdgeUU - LevelVoxelUU;
-			const double X0 = ChunkWorldOrigin.X;
-			const double Y0 = ChunkWorldOrigin.Y;
-			const double H00 = Sub->GetSurfaceHeightUU(X0, Y0);
-			const double H10 = Sub->GetSurfaceHeightUU(X0 + SpanUU, Y0);
-			const double H01 = Sub->GetSurfaceHeightUU(X0, Y0 + SpanUU);
-			const double H11 = Sub->GetSurfaceHeightUU(X0 + SpanUU, Y0 + SpanUU);
+		const double SpanUU = ChunkShadingSpanUU(Level);
 
-			// Least-squares plane through the four samples. Written as central
-			// differences of the two pairs so it degenerates to the exact answer
-			// on genuinely planar ground and cannot be skewed by which corner is
-			// sampled first.
-			const double RawDZDX = ((H10 + H11) - (H00 + H01)) / (2.0 * SpanUU);
-			const double RawDZDY = ((H01 + H11) - (H00 + H10)) / (2.0 * SpanUU);
-			PackedGradients = VoxelClimate::PackSurfaceGradients(RawDZDX, RawDZDY);
+		// Least-squares plane through the four samples. Written as central
+		// differences of the two pairs so it degenerates to the exact answer
+		// on genuinely planar ground and cannot be skewed by which corner is
+		// sampled first.
+		const double RawDZDX = ((H10 + H11) - (H00 + H01)) / (2.0 * SpanUU);
+		const double RawDZDY = ((H01 + H11) - (H00 + H10)) / (2.0 * SpanUU);
+		PackedGradients = VoxelClimate::PackSurfaceGradients(RawDZDX, RawDZDY);
 
-			// Re-read the QUANTISED gradients to build the base from, so the
-			// plane this chunk is drawn with is the plane the base was fitted
-			// for. Building the base from the raw values instead would leave the
-			// quantisation error as a constant vertical offset over the whole
-			// chunk -- exactly the error being removed.
-			float DZDX = 0.0f, DZDY = 0.0f;
-			VoxelClimate::UnpackSurfaceGradients(PackedGradients, DZDX, DZDY);
+		// Re-read the QUANTISED gradients to build the base from, so the
+		// plane this chunk is drawn with is the plane the base was fitted
+		// for. Building the base from the raw values instead would leave the
+		// quantisation error as a constant vertical offset over the whole
+		// chunk -- exactly the error being removed.
+		float DZDX = 0.0f, DZDY = 0.0f;
+		VoxelClimate::UnpackSurfaceGradients(PackedGradients, DZDX, DZDY);
 
-			// Value at the chunk's XY ORIGIN, relative to the chunk's origin Z.
-			// Both subtractions are done here in double, for the same reason the
-			// centre height always was: the absolute value is ~8.4M UU and
-			// float32's ULP there is 1 UU against a 10 UU voxel.
-			const double MeanZUU = 0.25 * (H00 + H10 + H01 + H11);
-			const double BaseZUU = MeanZUU - (double(DZDX) + double(DZDY)) * 0.5 * SpanUU;
-			SurfaceZRelUU = float(BaseZUU - ChunkWorldOrigin.Z);
-		}
+		// Value at the chunk's XY ORIGIN, relative to the chunk's origin Z.
+		// Both subtractions are done here in double, for the same reason the
+		// centre height always was: the absolute value is ~8.4M UU and
+		// float32's ULP there is 1 UU against a 10 UU voxel.
+		const double MeanZUU = 0.25 * (H00 + H10 + H01 + H11);
+		const double BaseZUU = MeanZUU - (double(DZDX) + double(DZDY)) * 0.5 * SpanUU;
+		SurfaceZRelUU = float(BaseZUU - ChunkWorldOrigin.Z);
 	}
 
 	return FVector4f(float(Bytes.Temperature) / 255.0f,
 	                 float(Bytes.Precipitation) / 255.0f,
 	                 SurfaceZRelUU,
 	                 PackedGradients);
+}
+
+// THE DEMAND PATH. Three UObject reads (the root's transform, its world, the
+// subsystem) plus four GetSurfaceHeightUU calls, and then the shared math.
+//
+// THE FOUR GetSurfaceHeightUU CALLS ARE NOT INTERCHANGEABLE WITH FOUR RAW
+// AMPLIFIER COLUMNS, AND NOBODY MAY "SIMPLIFY" THEM INTO ONE. Each one performs
+// the fine tier's game-thread RequestFootprint PREFETCH before it samples (see
+// GetSurfaceHeightUU's own comment: "a bulk PREFETCH, not the gate"), which is
+// what makes the amplifier column below it find its tiles resident instead of
+// discovering the same misses one pixel at a time. The async warm task
+// deliberately does NOT get that prefetch -- it cannot, RequestFootprint is
+// game-thread-only -- which is exactly why the task is gated on residency
+// before it is launched. Removing the prefetch from THIS path to make the two
+// look alike would put the disk I/O back inside the funnel.
+//
+// The prefetch is not paid four times: RequestFootprint dilates around each
+// query, and the four corners of one chunk fall inside one dilated footprint
+// after the first.
+//
+// The extra cost is three more Amplifier::column calls per chunk apply, on the
+// game thread. SampleChunkParamsForPool was MEASURED at 0.002-0.004 ms per
+// apply -- 0.2% of an apply, against poolAdd's 98-99% -- when T1-3 proposed
+// caching it away (docs/backlog.md, "T1-3 ... STRUCK"), so 4x it is still under
+// 1% of an apply, and this is the thread the frame is NOT bound on (docs:
+// render-thread bound at 2K, game thread ~75% idle).
+static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
+                                          const FVector& ChunkOriginRelative,
+                                          int32 Level)
+{
+	const FVector ChunkWorldOrigin = Root.GetComponentLocation() + ChunkOriginRelative;
+
+	if (const UWorld* World = Root.GetWorld())
+	{
+		if (const UVoxelWorldSubsystem* Sub = World->GetSubsystem<UVoxelWorldSubsystem>())
+		{
+			const double SpanUU = ChunkShadingSpanUU(Level);
+			const double X0 = ChunkWorldOrigin.X;
+			const double Y0 = ChunkWorldOrigin.Y;
+			const double H00 = Sub->GetSurfaceHeightUU(X0, Y0);
+			const double H10 = Sub->GetSurfaceHeightUU(X0 + SpanUU, Y0);
+			const double H01 = Sub->GetSurfaceHeightUU(X0, Y0 + SpanUU);
+			const double H11 = Sub->GetSurfaceHeightUU(X0 + SpanUU, Y0 + SpanUU);
+			return ChunkShadingParamsFromCorners(ChunkWorldOrigin, Level,
+			                                     /*bHasSurfaceGate*/ true, H00, H10, H01, H11);
+		}
+	}
+	return ChunkShadingParamsFromCorners(ChunkWorldOrigin, Level,
+	                                     /*bHasSurfaceGate*/ false, 0.0, 0.0, 0.0, 0.0);
 }
 
 // The SAME four values, in the brick record's form. Deliberately a conversion of
@@ -30704,6 +31255,28 @@ int64 UVoxelWorldSubsystem::GetSurfaceLowerBoundMm(int64 Vx0, int64 Vy0, int64 V
 	return Bound == vxc::kSurfaceLowerBoundDeclined ? MIN_int64 : int64(Bound);
 }
 
+// GetSurfaceHeightUU's BODY, WITHOUT its game-thread fine-tier prefetch.
+//
+// ONE transcription of the world-UU -> voxel -> amplifier column -> UU
+// conversion, shared by the demand accessor below (which prefetches FIRST) and
+// by voxel.Stream.WarmShadingAsync's worker task (which must not prefetch, and
+// may not: RequestFootprint is game-thread-only and a worker taking that lock
+// for a 200 MB read would stall the whole pool -- which is why the task is
+// launched only over a footprint the game thread has just certified resident).
+//
+// THE ABSENCE OF THE PREFETCH HERE IS THE POINT, NOT AN OVERSIGHT, and nobody
+// may "tidy" it in: the prefetch belongs to the caller because only the caller
+// knows whether it is on the one thread allowed to do disk I/O. Equally, nobody
+// may delete it from GetSurfaceHeightUU below to make the two paths match --
+// see that function's comment for what it costs when the funnel discovers its
+// misses one pixel at a time.
+static double SurfaceHeightFromAmplifierUU(const vxc::Amplifier& Amp, double WorldX, double WorldY)
+{
+	const int64 Vx = (int64)FMath::FloorToDouble(WorldX / VoxelCoords::VoxelSizeUU);
+	const int64 Vy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
+	return double(Amp.column(Vx, Vy).surfaceMm) / 10.0; // mm -> UU (1 UU = 10 mm)
+}
+
 double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) const
 {
 	if (!Impl)
@@ -30746,10 +31319,7 @@ double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) co
 		Impl->FineStreamer->RequestFootprint(MmX, MmY, MmX + 1, MmY + 1);
 	}
 
-	const int64 Vx = (int64)FMath::FloorToDouble(WorldX / VoxelCoords::VoxelSizeUU);
-	const int64 Vy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
-	const vxc::ColumnSample Col = Impl->Voxels.amplifier().column(Vx, Vy);
-	return double(Col.surfaceMm) / 10.0; // mm -> UU (1 UU = 10 mm)
+	return SurfaceHeightFromAmplifierUU(Impl->Voxels.amplifier(), WorldX, WorldY);
 }
 
 bool UVoxelWorldSubsystem::GetWorldgenSurfaceAndCavernFloodMm(int64 Vx, int64 Vy, int32& OutSurfaceMm,
