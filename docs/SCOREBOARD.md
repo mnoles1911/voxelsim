@@ -664,3 +664,13 @@ thread wait/RDG. The one named lever left is architectural: make the cold
 sample cheaper or move it off the game thread ("game-thread-only by design"
 -- dd4ee9e -- deserves a challenge). maxRaster now reads 0.21-0.27 ms on
 every leg -- the atlas metronome class is extinct.
+
+The challenge was then run same-day: voxel.Stream.WarmShadingAsync (b8c36fc,
+docs/warmshadingasync-null-2026-08-29.md) moved the sampling to workers --
+mechanism flawless (launched=drained=filled, no kill signals, holes clean,
+maxMs 40 = best of day) but NULL on its verdict counter: cacheMiss -15-25%
+not hard, burst ticks barely dented. Capacity was not the constraint;
+COVERAGE is -- the warm walk's candidate set and demand's ~800 colds/window
+are mostly disjoint. Default stays 0. Pre-registered next step: add LEVEL
+attribution to the cold-burst census before any warm arm is touched again --
+this family is now three builds against an unmeasured population.
