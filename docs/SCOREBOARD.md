@@ -677,6 +677,13 @@ levels the walk already targets -- and cacheEvict ~400/window against ~900
 colds names the real mechanism: the DIRECT-MAPPED shading table recycles
 warm entries by collision, so much of demand's cold set is the walk's own
 past fills. THE WARM FAMILY IS CLOSED (three arms, one shared wrong
-premise); the successor question is table shape (associativity / victim
-slot / sizing), judged on cacheEvict and cacheMiss falling together under
-audit mismatch=0.
+premise). The table-shape successor then ran same day (9adb6f7,
+docs/shadingcache-ways2-null-2026-08-29.md): 2-way LRU collapsed evictions
+43% -> 9-11% of misses EXACTLY as modelled -- and cacheMiss stayed flat,
+refuting the churn premise too. The colds are COMPULSORY first-touches of
+the admission front; no cache shape or predictor removes them, and the
+queue-ahead variant is refused on the throughput ladder's own evidence
+(flight queue near-empty). THE WHOLE COLD-SHADING CAMPAIGN IS CLOSED: the
+remaining levers are a cheaper sample (a quality/product question) or
+acceptance -- today's end state is hitches 2-7 per leg, maxMs 37-46, stutter
+~0.32% vs the 0.10% goal, remainder diffuse.
