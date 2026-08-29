@@ -38,8 +38,17 @@
 #
 # ALTERNATED A,B,A,B rather than A,A,B,B: this box has thermal and cache drift
 # across a 20-minute sweep, and a block design confounds the arm with the clock.
+#
+# THE ARM IS A PARAMETER because the first run of this script taught the lesson
+# the hard way: -VoxelBuriedSkip=0 turns off the band's CONSUMER and leaves the
+# band still computed, still fenced, still keeping the graph. The request
+# predicate (bWantBand, VoxelWorldSubsystem.cpp:20647) reads only cache and
+# in-flight state and never asks whether a consumer exists. `kept=` went UP.
+# So the flag under test is named at the call site, and the engagement proof is
+# printed before any timing is read.
 param(
     [string]$Prefix = 'BSK',
+    [string[]]$ArmArgs = @('-VoxelBuriedSkip=0'),
     [int]$RunSec = 120
 )
 $ErrorActionPreference = 'Stop'
@@ -49,7 +58,7 @@ $cv  = 'voxel.Stream.CoverageVerify 1,voxel.Stream.FrameAttribution 2'
 # arm name -> extra args. Empty = stock control.
 $arms = [ordered]@{
     'ctl' = @()
-    'off' = @('-VoxelBuriedSkip=0')
+    'off' = $ArmArgs
 }
 
 foreach ($rep in 'a','b') {
