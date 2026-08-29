@@ -3,6 +3,7 @@
 #include "VoxelChunkComponent.h"
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelLightField.h"
 // VoxelEarth -> VoxelEarthShaders, never the reverse (see VoxelEarth.Build.cs).
 // So the encoder and its driver live HERE, in the module that owns the light
@@ -3544,6 +3545,7 @@ void UVoxelGISubsystem::PlaceLocalLightTestAtCamera(double RadiusUU, float Inten
 					Comp->SetIntensityUnits(ELightUnits::Candelas);
 					Comp->SetIntensity(Intensity);
 					Comp->MarkRenderStateDirty();
+					VoxelEofLedger::Count(VoxelEofLedger::ESource::GI);
 				}
 				Spawned = Torch;
 			}
@@ -4066,6 +4068,11 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 				if (bLegacyProxyRebuild || !Comp->UpdateGIVertexColors())
 				{
 					Comp->MarkRenderStateDirty();
+					// The FALLBACK only. UpdateGIVertexColors' fast path pushes
+					// colours to the live proxy and marks nothing, so this counter
+					// separates "GI refreshed N chunks" from "GI queued N chunks
+					// for EndOfFrameUpdates" -- which are very different costs.
+					VoxelEofLedger::Count(VoxelEofLedger::ESource::GI);
 				}
 				++Refreshed;
 			}

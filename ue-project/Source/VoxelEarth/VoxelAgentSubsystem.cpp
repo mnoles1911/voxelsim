@@ -16,6 +16,7 @@
 #include "UnrealClient.h"
 #include "VoxelCoords.h"
 #include "VoxelEarth.h" // LogVoxelEarth
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- one count per whole-ISM proxy rebuild
 #include "VoxelWorldSubsystem.h"
 
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
@@ -536,6 +537,8 @@ void UVoxelAgentSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	AgentISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	AgentISM->SetCanEverAffectNavigation(false);
 	AgentISM->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::AgentISM);
+	VoxelEofLedger::CountRegister();
 
 	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelAgentSubsystem initialized: swarm ISM ready."));
 }
@@ -590,6 +593,7 @@ int32 UVoxelAgentSubsystem::SpawnSwarm(int32 Count)
 	if (AgentISM)
 	{
 		AgentISM->MarkRenderStateDirty();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::AgentISM);
 	}
 
 	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSwarm: spawned %d agents ringed %.0fm-%.0fm around the player at (%.0f,%.0f)."),
@@ -642,6 +646,7 @@ int32 UVoxelAgentSubsystem::SpawnSwarmAtOffset(int32 Count, const FVector& Cente
 	if (AgentISM)
 	{
 		AgentISM->MarkRenderStateDirty();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::AgentISM);
 	}
 
 	UE_LOG(LogVoxelEarth, Log,
@@ -1803,6 +1808,7 @@ void UVoxelAgentSubsystem::Tick(float DeltaTime)
 		// per tick) -- hundreds of agents updating every tick would
 		// otherwise mean hundreds of redundant render-state invalidations.
 		AgentISM->MarkRenderStateDirty();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::AgentISM);
 	}
 
 	LastSnapshot.Tier0Count = Tier0Count;
@@ -2017,6 +2023,7 @@ void UVoxelAgentSubsystem::ApplyReplicatedAgentSnapshot(const FVector& OriginWor
 	if (bAnyHidden && AgentISM)
 	{
 		AgentISM->MarkRenderStateDirty();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::AgentISM);
 	}
 }
 
@@ -2105,5 +2112,6 @@ void UVoxelAgentSubsystem::TickClientReplicatedAgents(float DeltaSeconds)
 	if (bAnyUpdated)
 	{
 		AgentISM->MarkRenderStateDirty();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::AgentISM);
 	}
 }

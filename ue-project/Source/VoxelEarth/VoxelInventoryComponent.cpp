@@ -7,6 +7,7 @@
 #include "HAL/IConsoleManager.h"
 #include "TimerManager.h"
 #include "VoxelEarth.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- global reg= roll-up
 #include "VoxelItem.h"
 
 namespace
@@ -438,6 +439,10 @@ UVoxelInventoryComponent* UVoxelInventoryComponent::EnsureForLocalPlayer(UWorld*
 		return nullptr;
 	}
 	Component->RegisterComponent();
+	// No source column owns this: it is one non-terrain component registration,
+	// counted into the GLOBAL reg= roll-up so a leg with reg= above the sum of
+	// the source columns shows the gap instead of hiding it.
+	VoxelEofLedger::CountRegister();
 
 	// Seeding is called explicitly rather than relying on BeginPlay: a component
 	// registered after its owner has already begun play is supposed to get one,

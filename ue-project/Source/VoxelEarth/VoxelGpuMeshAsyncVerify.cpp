@@ -35,6 +35,7 @@
 #include "VoxelBrickPool.h"
 #include "VoxelChunkMesher.h"
 #include "VoxelCoords.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- global reg= roll-up
 #include "VoxelGpuMeshJobManager.h"
 #include "VoxelGpuPoolComponent.h"
 #include "VoxelGpuRegionBuild.h"
@@ -908,6 +909,10 @@ namespace VoxelGpuMeshAsyncVerify
 			Pool->SetChunkTableCapacity(FMath::Max(64, NumChunks * 4));
 			Owner->SetRootComponent(Pool.Get());
 			Pool->RegisterComponent();
+			// FIXTURE PATH (voxel.GPU.Verify*), never on a perf leg. Global reg= only --
+			// no source column owns it, so a fixture run shows as a gap between reg= and
+			// the sum of the source columns rather than as silence.
+			VoxelEofLedger::CountRegister();
 			// Generous: the whole point is that no chunk is refused for space, so
 			// an alloc failure here is unambiguously a bug rather than capacity.
 			Pool->InitPool(uint32(NumChunks + 1) * 98304u / 8u + 65536u);

@@ -6,6 +6,7 @@
 #include "GameFramework/PlayerController.h"
 #include "ProceduralMeshComponent.h"
 #include "VoxelEarth.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- the adoption-drain hypothesis
 #include "VoxelWaterSubsystem.h"
 
 namespace
@@ -98,6 +99,11 @@ UProceduralMeshComponent* AVoxelWaterSheetActor::GetOrCreateSheetComp(FSheet& Sh
 	C->bUseAsyncCooking = false;
 	C->SetCastShadow(false);
 	C->RegisterComponent();
+	// Global reg column only -- the LakeCreate source column counts the mesh
+	// section that ALWAYS follows in the same frame (RebuildSheet's only caller
+	// of this function), and counting both would report one component dirtied
+	// as two units of EndOfFrameUpdates work.
+	VoxelEofLedger::CountRegister();
 	Sheet.Comp = C;
 	return C;
 }
@@ -539,6 +545,7 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 		if (Sheet.Comp != nullptr)
 		{
 			Sheet.Comp->ClearAllMeshSections();
+			VoxelEofLedger::Count(VoxelEofLedger::ESource::LakeCreate);
 		}
 		// No component yet = nothing ever drew = nothing to clear. Do NOT create
 		// one here: an empty PMC still registers a primitive, and a basin that
@@ -550,6 +557,9 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 		C->CreateMeshSection(0, Verts, Tris, Normals, UVs, Colors, Tangents,
 		                     /*bCreateCollision*/ false);
 		C->SetMaterial(0, WaterMaterial);
+		// One proxy recreate on ONE basin's component (the 2026-08-28 split; it
+		// used to be one recreate of a 495-section proxy).
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::LakeCreate);
 	}
 	TotalRects += Emitted - Sheet.RectCount;
 	Sheet.RectCount = Emitted;
@@ -579,6 +589,10 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 			if (C != nullptr)
 			{
 				C->DestroyComponent();
+				// COUNTED AT THE DRAIN, not where PendingDestroy is appended:
+				// the append is bookkeeping, this is the frame that pays.
+				VoxelEofLedger::Count(VoxelEofLedger::ESource::LakeDestroy);
+				VoxelEofLedger::CountUnregister();
 			}
 			++Destroyed;
 		}
@@ -740,6 +754,13 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 					S.HoleUU = Old->HoleUU;
 					S.RectCount = Old->RectCount;
 					TotalRects += Old->RectCount;
+					// CONTROL TERM: adoption dirties NOTHING -- no register, no
+					// section, no mark. Counted at the ++ site rather than from
+					// the gather-complete log line's `Adopted`, which recomputes
+					// the same population and is skipped entirely when the gather
+					// reclaims every parked basin. The two must agree when both
+					// print. See VoxelEofDirtyLedger.h's reading note.
+					VoxelEofLedger::Count(VoxelEofLedger::ESource::LakeAdopt);
 				}
 				else if (Old->Comp != nullptr)
 				{

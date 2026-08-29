@@ -11,6 +11,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelWorldSubsystem.h"
 // Biome appearance: the SAME climate->vertex-colour encoding
@@ -284,6 +285,8 @@ void AVoxelClipmapActor::EnsureVeilShell()
 	VeilShell = NewObject<UProceduralMeshComponent>(this, TEXT("UndergroundVeilShell"));
 	VeilShell->SetupAttachment(ClipmapRoot);
 	VeilShell->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::Clipmap);
+	VoxelEofLedger::CountRegister();
 	VeilShell->SetMobility(EComponentMobility::Movable);
 	VeilShell->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	VeilShell->bUseAsyncCooking = false;
@@ -335,6 +338,7 @@ void AVoxelClipmapActor::EnsureVeilShell()
 	C.Init(FColor(0, 0, 0, 255), 8);
 
 	VeilShell->CreateMeshSection(0, V, T, N, UV, C, TArray<FProcMeshTangent>(), /*bCreateCollision*/ false);
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::Clipmap);
 
 	if (ClipmapMaterial)
 	{
@@ -395,6 +399,8 @@ void AVoxelClipmapActor::EnsureCaveRig()
 	CaveExposurePP = NewObject<UPostProcessComponent>(this, TEXT("CaveExposurePP"));
 	CaveExposurePP->SetupAttachment(ClipmapRoot);
 	CaveExposurePP->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::Clipmap);
+	VoxelEofLedger::CountRegister();
 	// Unbound: the volume has no shape, it applies everywhere. Correct here
 	// because the gate is "is the camera under rock", which is a property of
 	// the camera and not of a region a designer could author.
@@ -508,6 +514,8 @@ void AVoxelClipmapActor::EnsureCaveRig()
 	CaveLamp = NewObject<UPointLightComponent>(this, TEXT("CaveLamp"));
 	CaveLamp->SetupAttachment(ClipmapRoot);
 	CaveLamp->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::Clipmap);
+	VoxelEofLedger::CountRegister();
 	CaveLamp->SetMobility(EComponentMobility::Movable);
 	CaveLamp->SetIntensityUnits(ELightUnits::Lumens);
 	CaveLamp->SetIntensity(CaveLampLumens);
@@ -1111,6 +1119,7 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 			(LevelIndex == 0) ? SharedTrianglesLevel0 : SharedTriangles;
 		PMC->CreateMeshSection(0, Positions, LevelTriangles, Normals, SharedUV0, VertexColors, TArray<FProcMeshTangent>(),
 		                       /*bCreateCollision*/ false);
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Clipmap);
 		// Through ApplyLevelMaterial, not SetMaterial directly: with a snow
 		// override in play the first build is where the level has to pick up its
 		// MID, and a bare SetMaterial here would give level 0 the plain material
@@ -1121,6 +1130,10 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 	else
 	{
 		PMC->UpdateMeshSection(0, Positions, Normals, SharedUV0, VertexColors, TArray<FProcMeshTangent>());
+		// Counted, and DELIBERATELY not separated from the Create above: Update
+		// is the cheap path (no proxy recreate) but it still enqueues the
+		// component for EndOfFrameUpdates, which is what this ledger measures.
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Clipmap);
 	}
 
 	PMC->SetRelativeLocation(FVector(SnappedOriginUU.X, SnappedOriginUU.Y, 0.0));

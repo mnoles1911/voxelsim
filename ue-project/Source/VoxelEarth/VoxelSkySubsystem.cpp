@@ -3,6 +3,7 @@
 #include "VoxelEarth.h"
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelEarthGameMode.h" // VoxelEarthSpawn::ParseSpawnColumnUU -- see SpawnRig
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelEphemeris.h"
 #include "VoxelSkyDomeActor.h"
 #include "VoxelWorldSubsystem.h"
@@ -2623,6 +2624,7 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 			{
 				SunComp->DynamicShadowCascades = FMath::Clamp(Cascades, 0, 10);
 				SunComp->MarkRenderStateDirty();
+				VoxelEofLedger::Count(VoxelEofLedger::ESource::Sky);
 				UE_LOG(LogVoxelSky, Log,
 				       TEXT("VoxelShadowCascades override: sun DynamicShadowCascades=%d"),
 				       SunComp->DynamicShadowCascades);
@@ -2650,6 +2652,7 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 			{
 				SunComp->DynamicShadowDistanceMovableLight = ShadowDistM * 100.f;
 				SunComp->MarkRenderStateDirty();
+				VoxelEofLedger::Count(VoxelEofLedger::ESource::Sky);
 				UE_LOG(LogVoxelSky, Log,
 				       TEXT("VoxelShadowDistance override: sun DynamicShadowDistanceMovableLight=%.0f UU (%.0f m)"),
 				       SunComp->DynamicShadowDistanceMovableLight,
@@ -2856,6 +2859,8 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		// the spawn column keeps the horizon correct at any spawn offset.
 		AtmosphereComp->TransformMode = ESkyAtmosphereTransformMode::PlanetTopAtComponentTransform;
 		AtmosphereComp->RegisterComponent();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Sky);
+		VoxelEofLedger::CountRegister();
 		SkyRigActor->SetRootComponent(AtmosphereComp);
 		SkyRigActor->SetActorLocation(FVector(SpawnColumnXUU, SpawnColumnYUU, 0.0));
 
@@ -2865,6 +2870,8 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		SkyExposurePP = NewObject<UPostProcessComponent>(SkyRigActor, TEXT("SkyExposurePP"));
 		SkyExposurePP->SetupAttachment(AtmosphereComp);
 		SkyExposurePP->RegisterComponent();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Sky);
+		VoxelEofLedger::CountRegister();
 
 		// Unbound: the volume has no shape and applies everywhere. Correct here
 		// for the same reason it is correct for the cave rig -- the gate is a
@@ -2901,6 +2908,8 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		SkyHeightFog = NewObject<UExponentialHeightFogComponent>(SkyRigActor, TEXT("SkyHeightFog"));
 		SkyHeightFog->SetupAttachment(AtmosphereComp);
 		SkyHeightFog->RegisterComponent();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Sky);
+		VoxelEofLedger::CountRegister();
 		SkyHeightFog->SetRelativeLocation(FVector(0.0, 0.0, SpawnGroundZUU));
 		SkyHeightFog->SetFogInscatteringColor(FLinearColor::Black);
 		SkyHeightFog->SetDirectionalInscatteringColor(FLinearColor::Black);
@@ -4207,6 +4216,7 @@ void UVoxelSkySubsystem::ApplyFogFromState()
 	{
 		SkyHeightFog->bVisibleInRealTimeSkyCaptures = bFogInCapture;
 		SkyHeightFog->MarkRenderStateDirty();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Sky);
 	}
 
 	// --- the read-back line, which is the actual fix for the 0.0g report ------

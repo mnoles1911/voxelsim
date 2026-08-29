@@ -1,6 +1,7 @@
 #include "VoxelWaterChunkComponent.h"
 
 #include "VoxelCoords.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 
 #include "DynamicMeshBuilder.h"
 #include "Engine/CollisionProfile.h"
@@ -453,6 +454,9 @@ void UWaterChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArr
 	// lerp exactly rather than 255/256ths of it.
 	ChunkActivity = uint8(FMath::Clamp(InActivity, 0.0f, 1.0f) * 255.0f + 0.5f);
 	MarkRenderStateDirty();
+	// Near-field water re-meshes MANY components per tick (CA + implicit
+	// cavern), which is the shape EndOfFrameUpdates charges most for.
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterNear);
 	UpdateBounds();
 }
 
@@ -485,6 +489,7 @@ void UWaterChunkComponent::SetMaterial(int32 ElementIndex, UMaterialInterface* N
 	}
 	ChunkMaterial = NewMaterial;
 	MarkRenderStateDirty();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterNear);
 }
 
 int32 UWaterChunkComponent::GetNumMaterials() const

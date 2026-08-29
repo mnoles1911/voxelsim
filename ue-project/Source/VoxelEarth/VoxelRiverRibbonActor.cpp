@@ -13,6 +13,7 @@
 #include "GameFramework/PlayerController.h"
 #include "ProceduralMeshComponent.h"
 #include "VoxelEarth.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelWaterSubsystem.h"
 
 namespace
@@ -398,12 +399,17 @@ bool AVoxelRiverRibbonActor::RebuildPath(FRibbonPath& Path)
 	if (Verts.Num() == 0)
 	{
 		Mesh->ClearMeshSection(Path.Section);
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Ribbon);
 	}
 	else
 	{
 		Mesh->CreateMeshSection(Path.Section, Verts, Tris, Normals, UVs, Colors, Tangents,
 		                        /*bCreateCollision*/ false);
 		Mesh->SetMaterial(Path.Section, WaterMaterial);
+		// One count = one proxy recreate of the ribbon's SHARED PMC. Unlike the
+		// lake sheets this actor was never split per path, so N ribbon rebuilds
+		// in a frame are N recreates of the same (large) component.
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Ribbon);
 	}
 	TotalQuads += Emitted - Path.QuadCount;
 	Path.QuadCount = Emitted;
@@ -423,6 +429,9 @@ void AVoxelRiverRibbonActor::StartGather(const FVector& CamUU)
 	Water->AbandonRiverRibbonWindow();
 
 	Mesh->ClearAllMeshSections();
+	// A re-gather wipes the shared PMC in one go: ONE component dirtied,
+	// however many paths it was carrying.
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::Ribbon);
 	Paths.Reset();
 	TotalQuads = 0;
 	WetPixels = 0;

@@ -2,6 +2,7 @@
 
 #include "VoxelCoords.h"
 #include "VoxelEarth.h" // LogVoxelEarth, for the voxel.GI.Debug 2 per-chunk shading dump
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- the already-EXCLUDED source, counted to prove the instrument is in the path
 // Read-only reference to UVoxelWorldSubsystem::RingPresets (M2 "Transitions"
 // row: the ring cross-fade table is "derived from the ring radii" -- single
 // source of truth rather than a second hardcoded copy of 64/128/256/512/1024m).
@@ -1133,6 +1134,11 @@ void UVoxelChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, int3
 	ChunkEdgeVoxels = InChunkEdgeVoxels;
 
 	MarkRenderStateDirty();
+	// THE VALIDATION TERM. corr(EndOfFrameUpdates, ChunksApplied) = 0.047 already
+	// excluded publication as the tail's owner; this must still read NON-ZERO on
+	// any moving leg, because a chunkPublish= of 0 there means the ledger is not
+	// in the path it claims to measure. See VoxelEofDirtyLedger.h.
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::ChunkPublish);
 	UpdateBounds();
 
 	// M4 voxel GI. This single call is the ENTIRE edit-responsiveness
@@ -1311,6 +1317,7 @@ void UVoxelChunkComponent::SetMaterial(int32 ElementIndex, UMaterialInterface* N
 	ChunkMID = nullptr;
 	ChunkMaterial = NewMaterial;
 	MarkRenderStateDirty();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::ChunkMaterial);
 	ApplyRingFadeParams();
 }
 
@@ -1418,5 +1425,6 @@ void UVoxelChunkComponent::ApplyRingFadeParams()
 	{
 		ChunkMaterial = ChunkMID;
 		MarkRenderStateDirty();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::ChunkMaterial);
 	}
 }

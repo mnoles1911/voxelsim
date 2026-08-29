@@ -95,6 +95,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h" // VoxelDebug::kHitchThresholdMs -- the adaptive budgets' bar
 #include "VoxelEarth.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- one count per HISM dirtied
 #include "VoxelFineTileStreamer.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -1337,6 +1338,8 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		DetailRoot = NewObject<USceneComponent>(DetailOwner, TEXT("VoxelDetailRoot"));
 		DetailOwner->SetRootComponent(DetailRoot);
 		DetailRoot->RegisterComponent();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::Detail);
+		VoxelEofLedger::CountRegister();
 #if WITH_EDITOR
 		DetailOwner->SetActorLabel(TEXT("VoxelDetailAssetOwner"));
 #endif
@@ -1518,6 +1521,9 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			{
 				S.Meshes[A.Key].Hism->AddInstances(A.Value, /*bShouldReturnIndices*/ false,
 				                                   /*bWorldSpace*/ false);
+				// One count per COMPONENT dirtied, not per instance: AddInstances
+				// marks the HISM once for the whole array.
+				VoxelEofLedger::Count(VoxelEofLedger::ESource::Detail);
 			}
 
 			if (!S.bFirstApplyLogged && Rec.Instances.Num() > 0)
@@ -1577,6 +1583,8 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			                       FMath::GridSnap(Anchor.Y, VoxelCoords::VoxelSizeUU), 0.0);
 			Hism->SetWorldLocation(FVector(Origin));
 			Hism->RegisterComponent();
+			VoxelEofLedger::Count(VoxelEofLedger::ESource::Detail);
+			VoxelEofLedger::CountRegister();
 			HismComponents.Add(Hism);
 
 			FVoxelDetailAssetImpl::FMeshEntry& Entry = S.Meshes.Add(Key);
@@ -1703,6 +1711,9 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				Entry.Hism->AddInstances(Transforms, /*bShouldReturnIndices*/ false,
 				                         /*bWorldSpace*/ false);
 			}
+			// The clear and the refill dirty the SAME component in the same
+			// frame, so this rebuild is ONE unit of EndOfFrameUpdates work.
+			VoxelEofLedger::Count(VoxelEofLedger::ESource::Detail);
 			BudgetSpentMs += (FPlatformTime::Seconds() - RebuildStart) * 1000.0;
 		}
 	}

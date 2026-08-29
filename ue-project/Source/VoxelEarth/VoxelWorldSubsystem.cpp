@@ -28,6 +28,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelEofDirtyLedger.h" // whose components EndOfFrameUpdates processes -- see that header
 #include "VoxelFrontEndPolicy.h" // front-end suppression rules; see the header for the invariant
 #include "VoxelSaveLibrary.h"      // autosave-on-shutdown writes back to the active named save
 #include "VoxelSaveGuard.h"        // a file this build could not READ must not be a file it may WRITE
@@ -13225,6 +13226,28 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       AccumGpuManagerTickMs, (long long)JobsDispatchedSinceLog,
 	       JobsDispatchedSinceLog > 0 ? AccumDispatchLoopMs / double(JobsDispatchedSinceLog) : 0.0);
 
+	// WHOSE COMPONENTS IS EndOfFrameUpdates PROCESSING? (2026-08-29)
+	//
+	// docs/game-thread-attribution-2026-08-28.md measured
+	// Exclusive/GameThread/EndOfFrameUpdates at +3.64 ms between the fast and
+	// tail buckets -- an order of magnitude above every other named non-voxel
+	// term -- uncorrelated with chunk publication (r=0.047) and BURSTY, in runs
+	// of consecutive frames. That is components being spawned/registered/marked
+	// across several frames by SOMEONE, and this line names the someones.
+	//
+	// READ IT AGAINST THE CSV PROFILER'S EndOfFrameUpdates COLUMN OVER THE SAME
+	// SECONDS. The source whose count clusters where that column spikes is the
+	// owner; a large but flat source is background traffic, not the cause.
+	// chunkPublish= must be non-zero on any moving leg (it is the already-
+	// excluded source, counted so a broken instrument cannot read as a clean
+	// null), lakeAdopt= dirties nothing and is the control for the lake-sheet
+	// adoption hypothesis, and the list is ENUMERATED -- a spiking column over a
+	// flat ledger means a source outside this module (start with the
+	// `Voxel pool publish (window)` pushes= column, whose component lives in
+	// VoxelEarthShaders). Full doctrine in VoxelEofDirtyLedger.h.
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel EOF-dirty ledger (window): %s"),
+	       *VoxelEofLedger::FormatAndResetWindow());
+
 	// Hook 6 (docs/apply-fast-path-2026-08-23.md §3): flush VoxelApplyFast's
 	// window on THIS line's clock, so apply-us/chunk (its sampleUs over this
 	// window's drained=) divides two numbers from the same window.
@@ -24692,6 +24715,11 @@ UVoxelChunkComponent& FVoxelWorldImpl::AcquireChunkComponent(AActor& Owner, USce
 	UVoxelChunkComponent* Comp = NewObject<UVoxelChunkComponent>(&Owner);
 	Comp->SetupAttachment(&Root);
 	Comp->RegisterComponent();
+	// POOL MISS ONLY -- a reuse above returns before here and registers nothing,
+	// which is the whole point of the pool. So this counter is "components the
+	// terrain path actually handed to EndOfFrameUpdates", not "chunks applied".
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::ChunkPublish);
+	VoxelEofLedger::CountRegister();
 	return *Comp;
 }
 
@@ -24703,6 +24731,8 @@ void FVoxelWorldImpl::ReturnChunkComponentToPool(UVoxelChunkComponent& InComp)
 		// Already at cap: fall back to the pre-pooling path rather than grow
 		// this array unboundedly.
 		InComp.DestroyComponent();
+		VoxelEofLedger::Count(VoxelEofLedger::ESource::ChunkPublish);
+		VoxelEofLedger::CountUnregister();
 		return;
 	}
 
@@ -24732,6 +24762,12 @@ void FVoxelWorldImpl::ReturnChunkComponentToPool(UVoxelChunkComponent& InComp)
 	// constructor already sets PrimaryComponentTick.bCanEverTick = false
 	// unconditionally (this primitive never ticks, pooled or not), so there
 	// is nothing for it to disable.
+	// EOF-dirty ledger: a park is ALREADY counted, exactly once, by the
+	// SetChunkQuads below (chunkPublish=). Deliberately no second increment on
+	// the SetVisibility -- per the coalescing note above, the two calls cost one
+	// end-of-frame recreate, and the ledger counts COMPONENTS DIRTIED rather
+	// than calls made. Same on the unpark side (ApplyMeshResult's
+	// SetVisibility(true) is followed by a real SetChunkQuads).
 	InComp.SetVisibility(false);
 	InComp.SetChunkQuads({}, VoxelCoords::ChunkEdgeVoxels);
 	InComp.ClearDebugTint();
@@ -24808,6 +24844,8 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	Pool->SetChunkTableCapacity(98304);
 	PoolOwner->SetRootComponent(Pool);
 	Pool->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::ChunkPublish);
+	VoxelEofLedger::CountRegister();
 
 	// REBASE. The chunk table is float32 (FVector4f per chunk), and this world
 	// runs at ~8.4 MILLION unreal units from the origin. float32's ULP up there
@@ -29866,6 +29904,8 @@ void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
 	ChunkRoot = NewObject<USceneComponent>(ChunkOwner, TEXT("VoxelChunkRoot"));
 	ChunkOwner->SetRootComponent(ChunkRoot);
 	ChunkRoot->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::ChunkPublish);
+	VoxelEofLedger::CountRegister();
 #if WITH_EDITOR
 	ChunkOwner->SetActorLabel(TEXT("VoxelChunkOwner"));
 #endif

@@ -6,6 +6,7 @@
 #include "Engine/World.h"
 #include "UObject/ConstructorHelpers.h"
 #include "VoxelEarth.h" // LogVoxelEarth
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelWorldSubsystem.h"
 
 AVoxelDebris::AVoxelDebris()
@@ -111,6 +112,9 @@ int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Islan
 		VoxelISM->AddInstance(Xf); // relative to the ISM (= actor origin)
 		++Instances;
 	}
+	// ONE count for the whole fill, not one per instance: this is one debris
+	// body's ISM, dirtied once as far as EndOfFrameUpdates is concerned.
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::Debris);
 
 	// Start the Chaos rigid body falling. Gravity only; ignore every collision
 	// channel (terrain is not a Chaos body, and we do not want the debris

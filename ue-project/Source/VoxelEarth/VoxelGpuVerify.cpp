@@ -31,6 +31,7 @@
 #include "VoxelMeshTypes.h" // PackVoxelChunkQuad / UnpackVoxelChunkQuad, for the D4 round-trip check
 // The SHIPPING footprint-band reduction, lifted out of VoxelWorldSubsystem.cpp
 // so this gate compares BandReduceMain against it rather than a transcription.
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- global reg= roll-up
 #include "VoxelFootprintBand.h"
 
 #include "voxelcore/core.h"
@@ -2430,6 +2431,10 @@ namespace
 			}
 			SM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 			SM->RegisterComponent();
+			// FIXTURE PATH (voxel.GPU.Verify*), never on a perf leg. Global reg= only --
+			// no source column owns it, so a fixture run shows as a gap between reg= and
+			// the sum of the source columns rather than as silence.
+			VoxelEofLedger::CountRegister();
 			// MUST come after RegisterComponent. SetRootComponent on a freshly
 			// NewObject'd component installs it with an IDENTITY transform, and
 			// since the root component is what defines the actor's location,
@@ -2478,6 +2483,10 @@ namespace
 		Comp->SetChunkMaterial(TerrainMaterial);
 		Comp->SetQuads(Rebased);
 		Comp->RegisterComponent();
+		// FIXTURE PATH (voxel.GPU.Verify*), never on a perf leg. Global reg= only --
+		// no source column owns it, so a fixture run shows as a gap between reg= and
+		// the sum of the source columns rather than as silence.
+		VoxelEofLedger::CountRegister();
 		// See the control above: without this the chunk sits at the world
 		// origin regardless of where the actor was spawned.
 		Comp->SetWorldLocation(SpawnLocation);
@@ -2527,6 +2536,10 @@ namespace
 			// 64, not 32: this is a region, not one chunk.
 			CpuComp->SetChunkQuads(MoveTemp(CpuQuads), 64);
 			CpuComp->RegisterComponent();
+			// FIXTURE PATH (voxel.GPU.Verify*), never on a perf leg. Global reg= only --
+			// no source column owns it, so a fixture run shows as a gap between reg= and
+			// the sum of the source columns rather than as silence.
+			VoxelEofLedger::CountRegister();
 			CpuComp->SetWorldLocation(CpuLocation);
 
 			UE_LOG(LogVoxelGpuVerify, Log,
@@ -2726,6 +2739,10 @@ namespace
 		}
 
 		Pool->RegisterComponent();
+		// FIXTURE PATH (voxel.GPU.Verify*), never on a perf leg. Global reg= only --
+		// no source column owns it, so a fixture run shows as a gap between reg= and
+		// the sum of the source columns rather than as silence.
+		VoxelEofLedger::CountRegister();
 		Pool->SetWorldLocation(SpawnLocation);
 
 		UE_LOG(LogVoxelGpuVerify, Log,
