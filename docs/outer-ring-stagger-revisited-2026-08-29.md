@@ -96,3 +96,11 @@ pixels and not chunk counts:
 **The far ring arrives when the camera is about a foot further along.** That is
 the whole trade, and it is why this ships: shipped default 1, revert with
 `-VoxelAmortizeOuterScans=0`.
+
+## Flag-free confirmation (STG2-shipped, no switch passed)
+
+    hitches=0  stutterPct=0.21  p50 7.00  p95 10.80  p99 15.30  maxMs 26.22
+    26 windows with deferred>0 -- the DEFAULT engages on its own.
+
+Matches the armed arm within run-to-run spread. The ini/default path does the
+work; nothing depends on a command line.
