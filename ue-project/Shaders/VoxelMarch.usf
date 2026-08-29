@@ -1304,9 +1304,18 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 		GVoxelMarchGroupHit = 0u;
 	}
 #if VOXEL_MARCH_HOLE_STATS
-	if (GroupIndex < VOXEL_MARCH_HOLE_WORDS)
+	// STRIDED SINCE THE WORD LIST OUTGREW ONE 8x8 GROUP (2026-08-29: the
+	// ZTight quad and the wave census pushed End past 64). The old
+	// one-word-per-thread form silently never touched words >= 64 -- init
+	// AND flush -- which is exactly the plausible-zeros incident the layout's
+	// own static_assert existed to prevent; that assert now checks a 2x
+	// ceiling and THIS loop is what honours it. Same loop shape at the flush
+	// below: the two must stride identically or a word gets flushed that was
+	// never zeroed.
+	for (uint HoleW = GroupIndex; HoleW < VOXEL_MARCH_HOLE_WORDS;
+	     HoleW += uint(VOXEL_MARCH_TILE_SIZE * VOXEL_MARCH_TILE_SIZE))
 	{
-		GVoxelMarchHoleStat[GroupIndex] = 0u;
+		GVoxelMarchHoleStat[HoleW] = 0u;
 	}
 #endif
 	GroupMemoryBarrierWithGroupSync();
@@ -1636,6 +1645,24 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				const uint BndInRaised = GVoxelMarchBndWalkInRaised;
 				const uint BndOutLowered = GVoxelMarchBndWalkOutLowered;
 #endif
+#if VOXEL_MARCH_ZTIGHT
+				// The tight gate's snapshot, the bound's discipline verbatim:
+				// the verify walk below re-runs the ring loop, whose hoisted
+				// test would tally these statics a second time on
+				// verify-armed legs.
+				const uint ZtSegSkipped = GVoxelMarchZtSegSkipped;
+				const uint ZtSegEntered = GVoxelMarchZtSegEntered;
+				const uint ZtRetrySkipped = GVoxelMarchZtRetrySkipped;
+				const uint ZtRetryEntered = GVoxelMarchZtRetryEntered;
+#endif
+#if VOXEL_MARCH_WAVE_CENSUS
+				// The wave census's snapshot, same reason: the verify walk
+				// samples the same statics.
+				const uint WaveChunkSum = GVoxelMarchWaveChunkSum;
+				const uint WaveChunkSamples = GVoxelMarchWaveChunkSamples;
+				const uint WaveCellSum = GVoxelMarchWaveCellSum;
+				const uint WaveCellSamples = GVoxelMarchWaveCellSamples;
+#endif
 #endif
 
 #if VOXEL_MARCH_HOLE_STATS
@@ -1871,6 +1898,50 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 					               BndOutLowered);
 				}
 #endif
+#if VOXEL_MARCH_ZTIGHT
+				// THE TIGHT GATE'S ENGAGEMENT QUAD (voxel.March.ZTight),
+				// guarded on its own denominator like every group above:
+				// consulted = the four words' sum, and a ray that was never
+				// offered a usable slab pays no atomics and stays a
+				// STRUCTURAL zero -- which is what makes "consulted == 0
+				// while the cvar reads 1" a verdict on the ARM (no readback
+				// landed, every level refused, settle gate holding) and not
+				// on the world.
+				if ((ZtSegSkipped | ZtSegEntered | ZtRetrySkipped | ZtRetryEntered) != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZT_SEG_SKIPPED],
+					               ZtSegSkipped);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZT_SEG_ENTERED],
+					               ZtSegEntered);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZT_RETRY_SKIPPED],
+					               ZtRetrySkipped);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZT_RETRY_ENTERED],
+					               ZtRetryEntered);
+				}
+#endif
+#if VOXEL_MARCH_WAVE_CENSUS
+				// THE WAVE-OCCUPANCY CENSUS, guarded on samples: a thread
+				// that sampled nothing (short walk, wave ops absent) adds
+				// nothing to either half of either mean. Only the FIRST
+				// ACTIVE LANE of each sampled wave carries non-zero values
+				// here (the accumulate site's rule), so these sums are
+				// per-wave-sample, not per-lane -- the division on the CPU
+				// is sum/samples exactly.
+				if (WaveChunkSamples != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_WAVE_CHUNK_SUM],
+					               WaveChunkSum);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_WAVE_CHUNK_SAMPLES],
+					               WaveChunkSamples);
+				}
+				if (WaveCellSamples != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_WAVE_CELL_SUM],
+					               WaveCellSum);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_WAVE_CELL_SAMPLES],
+					               WaveCellSamples);
+				}
+#endif
 				if (H.bHit)
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HITS], 1u);
@@ -2030,14 +2101,30 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 	// skipped because substituted and uncovered are zero in a healthy tile),
 	// not 4 * rays (~5.2M). The shadow marcher measured this shape cheap
 	// enough to ship always-on; here it is a permutation anyway.
-	if (GroupIndex < VOXEL_MARCH_HOLE_WORDS)
+	// STRIDED, MATCHING THE INIT LOOP AT THE TOP -- see the note there for
+	// the 64-word ceiling this replaced and the failure shape it prevents.
+	for (uint HoleW = GroupIndex; HoleW < VOXEL_MARCH_HOLE_WORDS;
+	     HoleW += uint(VOXEL_MARCH_TILE_SIZE * VOXEL_MARCH_TILE_SIZE))
 	{
-		const uint V = GVoxelMarchHoleStat[GroupIndex];
+		const uint V = GVoxelMarchHoleStat[HoleW];
 		if (V != 0u)
 		{
-			InterlockedAdd(MarchOutHoleStats[GroupIndex], V);
+			InterlockedAdd(MarchOutHoleStats[HoleW], V);
 		}
 	}
+#if VOXEL_MARCH_WAVE_CENSUS
+	// THE WAVE WIDTH ITSELF, ONE MAX PER GROUP STRAIGHT TO THE GLOBAL WORD --
+	// deliberately NOT through the groupshared add-flush above, which would
+	// SUM a constant across ~32k groups into garbage. Every wave in a
+	// dispatch has one width, so a max is exact, and the CPU divides the
+	// census means by this rather than assuming wave32. The groupshared copy
+	// of this word is never written, so the strided flush adds nothing to it.
+	if (GroupIndex == 0)
+	{
+		InterlockedMax(MarchOutHoleStats[VOXEL_MARCH_HOLE_WAVE_LANES],
+		               WaveGetLaneCount());
+	}
+#endif
 #endif
 }
 

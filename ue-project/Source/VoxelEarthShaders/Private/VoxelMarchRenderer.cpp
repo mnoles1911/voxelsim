@@ -332,6 +332,130 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	// =====================================================================
+	// THE TIGHT RESIDENT-Z GATE (voxel.March.ZTight) -- the repaired ZCut
+	// =====================================================================
+	//
+	// THE CORRECTED COST MODEL THIS SERVES, in one line
+	// (docs/marcher-cost-autopsy-2026-08-29.md): cost(ray) ~= segments
+	// ENTERED x ~0.67us + in-span hit work + small. Iterations were proven
+	// free (the bound's proven interior skips saved +0.11 ms on 5.77 at
+	// sky); the ring line at sky is ~0.9 ms PER RING, linear. So the only
+	// lever that reaches the sky/vertical frame is entering fewer segments,
+	// and the test has to run ABOVE the rung's setup -- the bound's specific
+	// mistake (collapsing inside the walk, "still calls the walk" = still
+	// pays setup) is the one this arm exists to not repeat.
+	//
+	// TWO REPAIRS OVER THE SHIPPED ZCut, whose SOCKET was sound
+	// (docs/SCOREBOARD.md: "the refutation was of its INPUT, not its
+	// structure"):
+	//   (a) the input: a per-frame GPU reduce over VoxelBrickChunkTable
+	//       (VoxelMarchZTight.usf) -- tight, record-validated,
+	//       index-tenancy-joined min/max per level, replacing the
+	//       cumulative-union-with-819m-pads that skipped 0.00% at the
+	//       horizon; read back with 1-3 frames latency and pushed as
+	//       uniforms (14 usable floats), zero registers and zero loads
+	//       in-kernel;
+	//   (b) the placement: the test runs before VoxelMarchBeginLevel /
+	//       rescale / walk call, on rung 1 AND on every fallthrough retry
+	//       rung at its own coarser level.
+	TAutoConsoleVariable<int32> CVarVoxelMarchZTight(
+		TEXT("voxel.March.ZTight"), 0,
+		TEXT("THE TIGHT RESIDENT-Z GATE, the repaired ZCut. 0 = off, THE CONTROL, and the ")
+		TEXT("default. 1 = before ANY setup of a ring-segment rung at level L (BeginLevel, ")
+		TEXT("rescale, ZCut, walk call), test the segment's z-span -- two mads -- against a ")
+		TEXT("TIGHT per-level resident-Z slab; disjoint means the rung is NEVER ENTERED and ")
+		TEXT("its absent-chunk debt is synthesized exactly (the fold's exactness arguments ")
+		TEXT("live at the skip site in VoxelBrickTraverse.ush).\n")
+		TEXT("WHY THIS AND NOT THE SHIPPED ZCut: the autopsy isolated the air cost to SEGMENT ")
+		TEXT("ENTRY (~0.67 us/ray, up to 14x/ray, ~0.9 ms per ring at sky), which ZCut's ")
+		TEXT("post-BeginLevel empty-collapse still pays; and ZCut's input was a cumulative ")
+		TEXT("union that never narrows (819 m pads at L6, 0.00%% skipped at the horizon). The ")
+		TEXT("slab here is reduced FRESH each frame from the chunk table with the marcher's ")
+		TEXT("own record validation plus the index-tenancy join, so freed-slot debris (the ")
+		TEXT("bound producer's 4.4x phantom population) widens nothing.\n")
+		TEXT("A PERMUTATION, NOT A UNIFORM, despite adding no memory traffic: the term under ")
+		TEXT("test IS the rung prologue, and a runtime branch would leave the test's mads and ")
+		TEXT("wrapper branch in the control's prologue -- re-basing exactly what is being ")
+		TEXT("measured. 0 is byte-identical.\n")
+		TEXT("IT CANNOT MAKE A HOLE, BOUNDED AND ARGUED, NOT ABSOLUTE: removed space is ")
+		TEXT("unreachable-by-a-hit (the bound's validation argument -- a hit needs a live ")
+		TEXT("tenant record at the level, and the slab is that population's z-extent plus ")
+		TEXT("outward pads); the pads are outward-only; an unproven slab is refused outright ")
+		TEXT("(no readback, stale, settling, or zero live records); and the debt fold keeps ")
+		TEXT("the retry ladder open over removed spans. THE RESIDUAL WINDOW: a chunk admitted ")
+		TEXT("beyond pad reach within one readback interval can be over-cut for those 1-3 ")
+		TEXT("frames until the discontinuity gate lands and disarms -- coarse stand-ins cover ")
+		TEXT("it where they exist. Watch uncovered/uncShell against the control on the same ")
+		TEXT("pose; any owner-visible arc at 1 absent at 0 kills the arm, not the pad.\n")
+		TEXT("REFUSED WITH voxel.March.Bound (two clamps, one debt fold, un-attributable -- ")
+		TEXT("and the bound is retired); ZTight wins and Bound is forced off with a warning. ")
+		TEXT("Rings only.\n")
+		TEXT("PROVE IT ENGAGED BEFORE BELIEVING A TIMING: voxel.March.Stats prints the ztight ")
+		TEXT("block -- asked/ran/usable slots, the landed bounds with age and settle state, ")
+		TEXT("and with voxel.March.HoleStats on the engagement partition ztSegSkipped / ")
+		TEXT("ztSegEntered / ztRetrySkipped / ztRetryEntered. All four zero while this reads ")
+		TEXT("1 is ARMED AND INERT and no timing on that leg means anything. DECISIONS, NOT ")
+		TEXT("NANOSECONDS: the saving is VoxelMarch.March from ProfileGPU (the reduce is ")
+		TEXT("inside the March bracket and is priced with it) at SKY AND DOWN, never the ")
+		TEXT("horizon alone -- the autopsy's gate rule."),
+		ECVF_RenderThreadSafe);
+
+	// THE OUTWARD PAD, IN CHUNKS AT EACH LEVEL'S OWN LATTICE, and its
+	// composition is the argument the task demanded be stated:
+	//
+	//   +1 chunk  READBACK LATENCY DRIFT. The slab consumed on frame N was
+	//             reduced from frame N-k's table (k = 1-3, the readback
+	//             ring). Admissions between the snapshot and consumption can
+	//             extend a level's true extent; ONE chunk covers every
+	//             admission that grows the shell from its existing edge (a
+	//             chunk admitted adjacent to resident ground extends the
+	//             union by at most its own extent). What one chunk does NOT
+	//             cover is an admission LANDING BEYOND the old extent --
+	//             cold fill, teleport, a cliff first crossed by the ring
+	//             edge -- which is exactly why the pad does not stand alone:
+	//             the settle gate disarms the whole arm on any landing whose
+	//             bounds moved outward past this pad since the previous
+	//             landing, and for VoxelMarchZTightSettleFrames after.
+	//   +1 chunk  THE DANSKIN & HANRAHAN FLOAT MARGIN, the ZCutBiasUU
+	//             argument: the span/slab compare is float on both sides,
+	//             and a skip is a JUMP -- nothing between SegIn and SegOut
+	//             is ever examined -- so the faces must sit a full chunk
+	//             outside anything a rounding could contest. A chunk rather
+	//             than an epsilon because a chunk is the unit being skipped.
+	//
+	// The floor of 2 is ALSO what keeps the shell-flag fold exact: removed
+	// chunks sit >= pad+1 = 3 chunks outside the snapshot extent and >= 2
+	// outside it after one interval's tolerated drift, and face-adjacency
+	// (VoxelMarchAbsentTouchesShell) reaches exactly 1 -- so the skip path's
+	// refusal to set bCrossedShellAbsent reproduces the walked control.
+	// Lowering this below 2 breaks two proofs at once; the clamp refuses it.
+	TAutoConsoleVariable<int32> CVarVoxelMarchZTightPadChunks(
+		TEXT("voxel.March.ZTightPadChunks"), 2,
+		TEXT("Outward pad on the tight resident-Z slabs, in chunks at each level's own ")
+		TEXT("lattice, applied on the host (one place to forget it). Composition: 1 chunk of ")
+		TEXT("readback-latency drift + 1 chunk of Danskin & Hanrahan float-jump margin; the ")
+		TEXT("floor of 2 is also what keeps the skip's bCrossedShellAbsent fold exact. ")
+		TEXT("Clamped to >= 2. Widening only ever costs benefit; NARROWING IS NOT THE FIX ")
+		TEXT("for anything -- a hole reading turns the arm off instead."),
+		ECVF_RenderThreadSafe);
+
+	// THE SETTLE GATE'S LENGTH. Frames of refusing every slab after arming,
+	// after the first landing, and after any DISCONTINUITY (a landing whose
+	// bounds moved outward past the pad since the previous landing -- the
+	// teleport / cold-fill / cliff signature the +1-chunk latency pad cannot
+	// cover). At ~60 fps the default rides out several readback intervals of
+	// churn; a measurement leg that teleports its pose should expect the arm
+	// to sit out this many frames afterwards and must not read them as the
+	// arm's timing.
+	TAutoConsoleVariable<int32> CVarVoxelMarchZTightSettleFrames(
+		TEXT("voxel.March.ZTightSettleFrames"), 15,
+		TEXT("Frames the tight resident-Z gate refuses every slab after arming, first ")
+		TEXT("landing, or a bounds discontinuity (outward motion past the pad between ")
+		TEXT("consecutive landed reduces). Clamped to >= 1. The ztight stats line prints ")
+		TEXT("settle state so an inert-by-settling frame cannot be read as a null result."),
+		ECVF_RenderThreadSafe);
+
+	// =====================================================================
 	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip)
 	// =====================================================================
 	//
@@ -1294,6 +1418,24 @@ TEXT("voxel.March.SkyLadder"), 0,
 	std::atomic<int32> GVoxelMarchZCutRanZMin[8] = {};
 	std::atomic<int32> GVoxelMarchZCutRanZMax[8] = {};
 
+	// ---- THE TIGHT RESIDENT-Z GATE, AS ACTUALLY UPLOADED -------------------
+	//                                             (voxel.March.ZTight)
+	// The ZCut block's ran-flag discipline, verbatim: the cvar reads back
+	// what was typed, the fill stamps what was SENT. -1 enable = the fill has
+	// never run. Enable 1 with UsableMask 0 has THREE spellable causes here,
+	// and the extra stamps split them: no reduce has landed yet (Age < 0),
+	// the settle gate is holding (SettleLeft > 0), or every level's landed
+	// count was zero. Bounds are the PADDED chunk-Z pair actually converted
+	// to UU and uploaded. Written render thread, read game thread, relaxed:
+	// a report, not a handshake.
+	std::atomic<int32> GVoxelMarchZTightRanEnable{-1};
+	std::atomic<int32> GVoxelMarchZTightRanUsableMask{0};
+	std::atomic<int32> GVoxelMarchZTightRanPad{0};
+	std::atomic<int32> GVoxelMarchZTightRanAgeFrames{-1};
+	std::atomic<int32> GVoxelMarchZTightRanSettleLeft{0};
+	std::atomic<int32> GVoxelMarchZTightRanZMin[8] = {};
+	std::atomic<int32> GVoxelMarchZTightRanZMax[8] = {};
+
 	// THE HEIGHT PYRAMID'S BIND STAMP, for the reason the Z bound has one: the
 	// cvar reads back whatever was typed, and "the cvar says 1" has been
 	// mistaken for "the arm ran" enough times in this project that the bind now
@@ -1557,10 +1699,40 @@ FVoxelMarchArm VoxelMarchGetArm()
 	// drawn; the render site logs the suppression so a leg cannot read a
 	// bound-off frame as a bound null result. HalfRes is the third refused
 	// pairing and is enforced at the render site, where ResShift lives.
-	Arm.Bound = (Arm.bRings && !Arm.bSkyLadder &&
+	// THE TIGHT RESIDENT-Z GATE. Rings only (the hoisted test is the ring
+	// walk's rung prologue and nothing else reads the define), matching the
+	// refused permutation.
+	Arm.ZTight =
+		(Arm.bRings && CVarVoxelMarchZTight.GetValueOnAnyThread() != 0) ? 1 : 0;
+	Arm.Bound = (Arm.bRings && !Arm.bSkyLadder && Arm.ZTight == 0 &&
 	             CVarVoxelMarchBound.GetValueOnAnyThread() != 0)
 	                ? 1
 	                : 0;
+	// ZTIGHT WINS THE BOUND CONFLICT, and the suppression is logged once so a
+	// leg cannot read a bound-off frame as a bound null result (the sky
+	// ladder's own rule, one clause over). ZTight wins rather than the
+	// retired arm because the ZTight+Bound permutation is refused at compile
+	// (two clamps folding into one absent-chunk debt are un-attributable --
+	// the #error in VoxelBrickTraverse.ush) and because the autopsy retired
+	// the bound on two independent counts.
+	if (Arm.ZTight != 0 && Arm.bRings && !Arm.bSkyLadder &&
+	    CVarVoxelMarchBound.GetValueOnAnyThread() != 0)
+	{
+		static bool bZTightBoundWarned = false;
+		if (!bZTightBoundWarned)
+		{
+			bZTightBoundWarned = true;
+			UE_LOG(LogVoxelMarch, Warning,
+			       TEXT("voxel.March.Bound is FORCED OFF while voxel.March.ZTight is on: the "
+			            "permutation pairing the two is refused at compile (both clamp the "
+			            "same segments and fold into the same bCrossedAbsentChunk debt, so "
+			            "nothing measured on a both-armed leg could be attributed to either), "
+			            "and the bound is a retired arm besides "
+			            "(docs/marcher-cost-autopsy-2026-08-29.md). Every frame until one "
+			            "cvar changes runs ZTight WITHOUT the bound -- do not read this leg "
+			            "as a bound result."));
+		}
+	}
 	// CLAMPED AND FORCED TO 0 WITHOUT THE PERMUTATION, so the reported mode can
 	// never claim an arm the kernel does not contain -- the same rule
 	// bBlockSkipArmed follows, one layer up.
@@ -1916,6 +2088,216 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 					            "the slabs are wider than the segments. Check the per-slot "
 					            "spans printed above before blaming the traversal."),
 					       (unsigned long long)HW.ZCutConsulted);
+				}
+			}
+		}
+		// ---- THE TIGHT RESIDENT-Z GATE: ASKED, RAN, LANDED, AND USED ------
+		//
+		// The ZCut block's four-question discipline plus one: this arm has a
+		// PRODUCER (the per-frame reduce) between the cvar and the uniform,
+		// so "asked", "landed" (the reduce's readback state and its phantom
+		// census), "ran" (what the fill uploaded, with age and settle state)
+		// and "used" (the engagement quad) fail separately and print
+		// separately. The condemning reading is unchanged: asked=1, usable
+		// non-zero, consulted=0 is armed-and-inert and no timing on such a
+		// leg describes this change.
+		{
+			const int32 ZtAsked =
+				(CVarVoxelMarchZTight.GetValueOnAnyThread() != 0) ? 1 : 0;
+			const int32 ZtRanEnable =
+				GVoxelMarchZTightRanEnable.load(std::memory_order_relaxed);
+			const int32 ZtUsable =
+				GVoxelMarchZTightRanUsableMask.load(std::memory_order_relaxed);
+			const int32 ZtRanPad = GVoxelMarchZTightRanPad.load(std::memory_order_relaxed);
+			const int32 ZtAge =
+				GVoxelMarchZTightRanAgeFrames.load(std::memory_order_relaxed);
+			const int32 ZtSettle =
+				GVoxelMarchZTightRanSettleLeft.load(std::memory_order_relaxed);
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("  ztight: asked=%d | ran=%s usableSlots=0x%02x pad=%d ageFrames=%s "
+			            "settleLeft=%d"),
+			       ZtAsked,
+			       ZtRanEnable < 0 ? TEXT("never-ran")
+			                       : (ZtRanEnable != 0 ? TEXT("1") : TEXT("0")),
+			       uint32(ZtUsable), ZtRanPad,
+			       ZtAge < 0 ? TEXT("no-landing") : *FString::Printf(TEXT("%d"), ZtAge),
+			       ZtSettle);
+			if (ZtRanEnable > 0 && ZtUsable != 0)
+			{
+				// The uploaded bounds, padded, in chunks at each slot's own
+				// lattice -- the ZCut line's shape, and for its reason: "the
+				// gate skipped nothing" and "the gate was handed a slab 1,300
+				// chunks tall" are different diagnoses with different owners.
+				FString ZtBounds;
+				for (uint32 L = 0; L < FVoxelMarchChunkIndex::kRingGrids; ++L)
+				{
+					if ((ZtUsable & (1 << int32(L))) != 0)
+					{
+						const int32 Lo =
+							GVoxelMarchZTightRanZMin[int32(L)].load(std::memory_order_relaxed);
+						const int32 Hi =
+							GVoxelMarchZTightRanZMax[int32(L)].load(std::memory_order_relaxed);
+						ZtBounds += FString::Printf(TEXT(" L%u[%d..%d,%d]"), L, Lo, Hi,
+						                            Hi - Lo + 1);
+					}
+					else
+					{
+						ZtBounds += FString::Printf(TEXT(" L%u[no-slab]"), L);
+					}
+				}
+				UE_LOG(LogVoxelMarch, Display, TEXT("    padded tight chunk-Z slabs:%s"),
+				       *ZtBounds);
+			}
+			// The producer's own health, from the landing state -- phantoms
+			// is the reading that says the bound arm's debris failure is or
+			// is not returning; discontinuities is the reading that says the
+			// latency pad is or is not being outrun.
+			if (GMarchState.IsValid())
+			{
+				uint64 ZtLandings = 0, ZtPhantoms = 0, ZtDiscont = 0;
+				uint32 ZtLive = 0, ZtExamined = 0;
+				{
+					FScopeLock Guard(&GMarchState->Lock);
+					ZtLandings = GMarchState->ZTightLandings;
+					ZtPhantoms = GMarchState->ZTightPhantomsCum;
+					ZtDiscont = GMarchState->ZTightDiscontinuities;
+					ZtLive = GMarchState->ZTightLanded.Live;
+					ZtExamined = GMarchState->ZTightLanded.Examined;
+				}
+				if (ZtAsked != 0 || ZtLandings != 0)
+				{
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("    reduce: landings=%llu (last: live=%u of %u slots), "
+					            "phantoms=%llu cumulative, discontinuities=%llu "
+					            "(all cumulative since boot)"),
+					       (unsigned long long)ZtLandings, ZtLive, ZtExamined,
+					       (unsigned long long)ZtPhantoms,
+					       (unsigned long long)ZtDiscont);
+				}
+			}
+			const FVoxelMarchHoleStats ZW = VoxelMarchPeekLastHoleWindow();
+			if (!ZW.bArmed || ZW.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: NOT MEASURED (%s). The lines above prove the "
+				            "DATA reached the shader; only the quad proves the shader USED "
+				            "it."),
+				       !ZW.bArmed ? TEXT("voxel.March.HoleStats is 0")
+				                  : TEXT("armed, no readback has landed yet"));
+			}
+			else
+			{
+				// consulted = the quad's sum, an exact partition -- own-level
+				// and retry rungs separately, because a slab that never skips
+				// SEGMENTS indicts the slab while retries that never skip
+				// indict the ladder's landing levels, and they have different
+				// fixes.
+				const uint64 ZtConsulted = ZW.ZTightSegSkipped + ZW.ZTightSegEntered +
+				                           ZW.ZTightRetrySkipped + ZW.ZTightRetryEntered;
+				const uint64 ZtSegs = ZW.ZTightSegSkipped + ZW.ZTightSegEntered;
+				const uint64 ZtRetries = ZW.ZTightRetrySkipped + ZW.ZTightRetryEntered;
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("    engagement: consulted=%llu = segments[skipped %llu (%.2f%%) "
+				            "+ entered %llu] + retries[skipped %llu (%.2f%%) + entered "
+				            "%llu], over %llu frames"),
+				       (unsigned long long)ZtConsulted,
+				       (unsigned long long)ZW.ZTightSegSkipped,
+				       ZtSegs > 0 ? 100.0 * double(ZW.ZTightSegSkipped) / double(ZtSegs)
+				                  : 0.0,
+				       (unsigned long long)ZW.ZTightSegEntered,
+				       (unsigned long long)ZW.ZTightRetrySkipped,
+				       ZtRetries > 0
+				           ? 100.0 * double(ZW.ZTightRetrySkipped) / double(ZtRetries)
+				           : 0.0,
+				       (unsigned long long)ZW.ZTightRetryEntered,
+				       (unsigned long long)ZW.Frames);
+				// The ZCut line's sentence, verbatim by policy: decisions are
+				// not nanoseconds, and the autopsy adds the pose rule.
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("      (engagement only -- DECISIONS, not nanoseconds. The "
+				            "saving is VoxelMarch.March from ProfileGPU, measured at SKY "
+				            "AND DOWN, never the horizon alone.)"));
+				if (ZW.bZTightArmed && ZtConsulted == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.ZTight is armed and the shader consulted a "
+					            "slab ZERO times over %llu measured frames. THE ARM IS "
+					            "ARMED AND INERT -- no timing on this leg describes it. "
+					            "Read the lines above in order: ran=0/never-ran means the "
+					            "fill never ran; ageFrames=no-landing means the reduce's "
+					            "readback has not landed (or was refused -- see the reduce "
+					            "line's examined check); settleLeft>0 means the "
+					            "discontinuity gate is holding; usableSlots=0x00 with "
+					            "landings>0 means every level's live count was zero. And "
+					            "the C++ half of this change can land WITHOUT the traversal "
+					            "half -- grep MarchZTightSlabUU in VoxelBrickTraverse.ush "
+					            "before looking anywhere else."),
+					       (unsigned long long)ZW.Frames);
+				}
+				else if (ZW.bZTightArmed && ZW.ZTightSegSkipped == 0 &&
+				         ZW.ZTightRetrySkipped == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("    voxel.March.ZTight is armed, slabs WERE consulted %llu "
+					            "times and no rung was ever skipped. That is a real "
+					            "measured null: every segment's z-span met its level's "
+					            "slab. Check the slab spans above -- and the POSE: at the "
+					            "horizon this is the EXPECTED reading (a horizontal ray "
+					            "never leaves a ~118 m slab; ZCut's own null), and only "
+					            "the sky/down poses price this arm."),
+					       (unsigned long long)ZtConsulted);
+				}
+			}
+		}
+		// ---- THE WAVE-OCCUPANCY CENSUS (family A's falsifier) -------------
+		//
+		// One line, printed whenever hole stats measured anything, because
+		// its zero has three spellings that must not collapse: hole stats
+		// off (the NOT MEASURED above), wave intrinsics compiled out
+		// (samples=0 with frames>0 -- worded below), and a real reading.
+		{
+			const FVoxelMarchHoleStats WW = VoxelMarchPeekLastHoleWindow();
+			if (WW.bArmed && WW.Frames > 0)
+			{
+				if (WW.WaveChunkSamples == 0 && WW.WaveCellSamples == 0)
+				{
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("  waveCensus: NOT MEASURED over %llu hole-stats frames -- "
+					            "zero samples. VOXEL_MARCH_WAVE_CENSUS compiled out (wave "
+					            "intrinsics unavailable on this shader platform) or no "
+					            "walk ran; a zero here is never 'no divergence'."),
+					       (unsigned long long)WW.Frames);
+				}
+				else
+				{
+					// THE READING. Wave width is the landed maximum of
+					// WaveGetLaneCount -- what the kernel actually compiled
+					// to -- and the verdict is the mean AGAINST that width:
+					// near it, divergence is NOT the problem and family A
+					// dies; low, it lives. Chunk loop and leaf DDA
+					// separately, because they indict different loops.
+					const double MeanChunk =
+						WW.WaveChunkSamples > 0
+							? double(WW.WaveChunkActiveSum) / double(WW.WaveChunkSamples)
+							: 0.0;
+					const double MeanCell =
+						WW.WaveCellSamples > 0
+							? double(WW.WaveCellActiveSum) / double(WW.WaveCellSamples)
+							: 0.0;
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("  waveCensus: waveWidth=%llu | chunk loop meanActive=%.2f "
+					            "(%llu samples) | leaf DDA meanActive=%.2f (%llu samples), "
+					            "over %llu frames"),
+					       (unsigned long long)WW.WaveLaneCount, MeanChunk,
+					       (unsigned long long)WW.WaveChunkSamples, MeanCell,
+					       (unsigned long long)WW.WaveCellSamples,
+					       (unsigned long long)WW.Frames);
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("      (family A's verdict line: meanActive near waveWidth "
+					            "= divergence is NOT the residual cost, the down-pose "
+					            "+2.32 ms consult anomaly needs another owner; "
+					            "meanActive well below it = family A lives and the next "
+					            "step is reordering rays, not skipping cells.)"));
 				}
 			}
 		}
@@ -4321,6 +4703,12 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// "armed" for a kernel that does not contain the code, and the inert-arm
 	// warning below would then fire on a leg where inertness is correct.
 	Out.bBlockSkipArmed = Arm.bBlockSkip;
+	// FROM THE ARM, the bBlockSkipArmed rule and not the bZCutArmed one:
+	// voxel.March.ZTight selects a PERMUTATION, the arm forces it off without
+	// rings, and the raw cvar here would report "armed" for a kernel that
+	// does not contain the code -- the inert-arm warning would then fire on a
+	// leg where inertness is correct.
+	Out.bZTightArmed = Arm.ZTight != 0;
 	// FROM THE ARM, for the reason bBlockSkipArmed is: VoxelMarchGetArm already
 	// forces the mode to 0 when the permutation is off, so this can never report
 	// a licence the kernel has no code for.
@@ -4343,6 +4731,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	const bool bBreakdownArmed = Out.bBreakdownArmed;
 	const bool bZCutArmed = Out.bZCutArmed;
 	const bool bBlockSkipArmed = Out.bBlockSkipArmed;
+	const bool bZTightArmed = Out.bZTightArmed;
 	const bool bCensusArmed = Out.bCensusArmed;
 	const int32 BlockSkyMode = Out.BlockSkyMode;
 	// The height field's flags and census are NOT part of the accumulated
@@ -4355,6 +4744,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	Out.bBreakdownArmed = bBreakdownArmed;
 	Out.bZCutArmed = bZCutArmed;
 	Out.bBlockSkipArmed = bBlockSkipArmed;
+	Out.bZTightArmed = bZTightArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	Out.bHeightArmed = HeightSide.bHeightArmed;
@@ -4603,6 +4993,8 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	const bool bZCutArmed = CVarVoxelMarchZCut.GetValueOnAnyThread() != 0;
 	// See the drain: the arm, not the cvar, because this one is a permutation.
 	const bool bBlockSkipArmed = Arm.bBlockSkip;
+	// See the drain: the arm, same permutation rule.
+	const bool bZTightArmed = Arm.ZTight != 0;
 	// See the drain: the census rides the hole-stats permutation itself.
 	const bool bCensusArmed = Arm.bHoleStats;
 	const int32 BlockSkyMode = Arm.BlockSkyMode;
@@ -4616,6 +5008,7 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	Out.bBreakdownArmed = bBreakdownArmed;
 	Out.bZCutArmed = bZCutArmed;
 	Out.bBlockSkipArmed = bBlockSkipArmed;
+	Out.bZTightArmed = bZTightArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	return Out;
@@ -4737,6 +5130,21 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// there is no second place for the pad to be forgotten.
 	SHADER_PARAMETER(int32, MarchZCutEnable)
 	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
+	// THE TIGHT RESIDENT-Z SLABS (voxel.March.ZTight). One float4 per index
+	// grid slot: (.x lo UU, .y hi UU, .z usable, .w 0) -- already padded and
+	// already converted to local UU on the host, so the kernel's hoisted test
+	// is two mads and two compares with no per-level origin math (the
+	// doctrine note at the shader-side declaration in VoxelBrickTraverse.ush
+	// carries the argument). ON THIS STRUCT ONLY: the shader global exists
+	// only under VOXEL_MARCH_ZTIGHT, which only FVoxelMarchCS's domain
+	// carries, so on every other permutation this entry is simply unused --
+	// the MarchOutHoleStats rule, not the MarchCoverReachUU one. Filled at
+	// the march dispatch (AFTER VoxelMarchBindPool, from the SAME
+	// MarchBrickOriginVoxel value the struct will upload) on EVERY arm,
+	// zeros included: an unset uniform is a silent zero, and all-zero slabs
+	// (.z == 0) are also the honest "do not gate" value, so the safe default
+	// and the honest default are the same number.
+	SHADER_PARAMETER_ARRAY(FVector4f, MarchZTightSlabUU, [8])
 	// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound). The shader-side
 	// globals exist ONLY under VOXEL_MARCH_BOUND (VoxelMarchBound.ush), so on
 	// every other permutation these two entries are simply unused -- the
@@ -5120,6 +5528,53 @@ namespace VoxelMarchRayBoundWord
 		BoundSegmentsSkipped,
 		BoundWalkInRaised,
 		BoundWalkOutLowered,
+
+		// ---- THE TIGHT GATE'S ENGAGEMENT QUAD (voxel.March.ZTight) --------
+		// APPENDED after the bound's group, per the standing rule: appending
+		// renumbers nothing, a stale shader cache reads every older word
+		// correctly and leaves these at zero -- NOT MEASURED, which the
+		// ztight stats line words as such. Slots 60-63.
+		//
+		// FOUR WORDS PARTITIONING EVERY CONSULTATION EXACTLY -- a rung where
+		// the arm was on and the level had a usable slab either skipped or
+		// entered, at its own level (Seg*) or as a fallthrough retry
+		// (Retry*). consulted = the sum of all four; zero while
+		// voxel.March.ZTight reads 1 is ARMED AND INERT. Own-level and retry
+		// decisions are separate words because they answer different
+		// questions: Seg* prices removing FIRST entries (the 7x half of the
+		// autopsy's 14x), Retry* prices removing the fallthrough rungs (the
+		// x2 half), and a slab too wide flattens the first while an
+		// open-into-populated-levels ladder flattens the second.
+		// RetryEntered is not in the task's three-word list; without it the
+		// retry rate has no denominator and inert-vs-null on the retry path
+		// is unreadable -- the exact ambiguity the ZCut trio's header
+		// refuses. DECISIONS, NOT NANOSECONDS -- every warning the ZCut trio
+		// carries applies unchanged; the saving is VoxelMarch.March from
+		// ProfileGPU at SKY AND DOWN (the autopsy's gate rule), nothing else.
+		ZTightSegSkipped,
+		ZTightSegEntered,
+		ZTightRetrySkipped,
+		ZTightRetryEntered,
+
+		// ---- THE WAVE-OCCUPANCY CENSUS (family A's falsifier) -------------
+		// Slots 64-68. Written wherever hole stats are compiled AND the
+		// engine's wave-op macros allow (VOXEL_MARCH_WAVE_CENSUS); zero
+		// samples on a hole-stats leg is NOT MEASURED, never "no
+		// divergence". Two sum/samples pairs -- chunk loop and leaf DDA --
+		// because the two loops' divergence are different diagnoses.
+		// meanActiveLanes = sum / samples, exact: only the first active lane
+		// of a sampled wave accumulates, so the sum is per-wave-sample and
+		// never the sum of squares. WaveLaneCount is the width the kernel
+		// actually ran at (wave32 vs wave64 decides what "near full" means)
+		// -- a MAXIMUM, written InterlockedMax straight to the global word,
+		// bypassing the groupshared add-flush that would sum a constant
+		// across 32k groups; the landing accumulates it with Max (the
+		// HeightLateMaxUU spelling).
+		WaveChunkActiveSum,
+		WaveChunkSamples,
+		WaveCellActiveSum,
+		WaveCellSamples,
+		WaveLaneCount,
 		End                                    // the buffer's word count while the census lives here
 	};
 }
@@ -5127,9 +5582,21 @@ namespace VoxelMarchRayBoundWord
 // (`if (GroupIndex < VOXEL_MARCH_HOLE_WORDS)`), so the layout must fit in one
 // group's threads or the tail words are silently never flushed -- plausible
 // zeros, the exact incident VoxelMarchHoleWord's own note records.
+// TWO WORDS PER THREAD SINCE 2026-08-29: the ZTight quad and the wave census
+// pushed End past 64, so the kernel's init and flush are now STRIDED loops
+// (VoxelMarch.usf, both sites) -- each thread owns word GroupIndex and word
+// GroupIndex + 64. The assert stays, repointed at the strided ceiling,
+// because the loop is generic but the incident it guards is not: the
+// one-word-per-thread form silently never zeroed or flushed words >= 64,
+// which is plausible-zeros -- the exact failure VoxelMarchHoleWord's own note
+// records. Whoever crosses 128 words widens the stride count AND this bound
+// together, deliberately.
 static_assert(int32(VoxelMarchRayBoundWord::End) <=
-                  kVoxelMarchTileSize * kVoxelMarchTileSize,
-              "hole-stats words no longer fit one 8x8 group's flush");
+                  2 * kVoxelMarchTileSize * kVoxelMarchTileSize,
+              "hole-stats words no longer fit the kernel's two-words-per-thread strided "
+              "flush (VoxelMarch.usf's init and flush loops). The loops are generic, but "
+              "cross this bound DELIBERATELY: check the LDS cost of the groupshared array "
+              "and re-read the flush-atomics ceiling note before widening.");
 
 // HALF-RESOLUTION MARCHING (voxel.March.HalfRes). Carried by every shader that
 // touches the VisBuffer -- the march that writes it, BOTH vertex shaders (the
@@ -5166,6 +5633,16 @@ class FVoxelMarchSkyLadderDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_SKY_LADDER"
 // ShouldCompilePermutation, with matching #errors in VoxelMarchBound.ush for
 // anyone who bypasses the host -- see that file for both arguments.
 class FVoxelMarchBoundDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_BOUND");
+// THE TIGHT RESIDENT-Z GATE (voxel.March.ZTight). A PERMUTATION and not a
+// uniform, and NOT for the memory-traffic reason BlockSkip and Bound give --
+// this arm adds no load at all. The term under test IS the rung prologue
+// (segment entry, the autopsy's ~0.67 us/ray), and a runtime branch would
+// leave the test's mads and the wrapper branch in the control's prologue,
+// re-basing exactly what is being measured. 0 is byte-identical: every token
+// is under the define, including the statics. Rings only; refused against
+// Bound (two clamps, one debt fold -- the #error in VoxelBrickTraverse.ush
+// restates it for anyone bypassing the host).
+class FVoxelMarchZTightDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_ZTIGHT");
 
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
@@ -5201,8 +5678,8 @@ class FVoxelMarchBoundDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_BOUND");
 // There is no third answer and no way to skip the question.
 //
 // Source, SkipLevels, Rings, Cover, CoverSkip, Fallthrough, BlockSkip,
-// SkyLadder, Bound.
-constexpr int32 kVoxelMarchWalkShapeDims = 9;
+// SkyLadder, Bound, ZTight.
+constexpr int32 kVoxelMarchWalkShapeDims = 10;
 
 // THE COVER REACH, IN ONE PLACE. Both the shader binding and the comparator
 // guard read this; two spellings of "is cover in the picture" is how a guard
@@ -5267,6 +5744,18 @@ struct FVoxelMarchWalkShape
 	// note describes for blocks. MUST MATCH; the comparator's domain does not
 	// carry it, so with the arm on the two are incomparable -- see the check.
 	int32 Bound = 0;
+	// The tight resident-Z gate (VOXEL_MARCH_ZTIGHT). A WALK-SHAPE DIMENSION,
+	// checked against the same test the last three passed: this CAN change
+	// bHit -- not through the removed spans (unreachable by a hit, the
+	// bound's validation argument) but through the 512-chunk cap and the
+	// step budget, exactly as Bound's note argues: a ray that skips whole
+	// empty rungs can REACH AND HIT ground the control capped out before
+	// (the safe direction, more terrain -- but "safe" is not "identical"),
+	// and under the sky gate its unconditional debt fold can retry rungs the
+	// control's sky-proven air would not. MUST MATCH; the comparator's
+	// domain does not carry it, so with the arm on the two are incomparable
+	// -- see the check.
+	int32 ZTight = 0;
 };
 static_assert(sizeof(FVoxelMarchWalkShape) == kVoxelMarchWalkShapeDims * sizeof(int32),
               "a walk-shape dimension was added or removed without updating "
@@ -5285,7 +5774,8 @@ class FVoxelMarchCS : public FGlobalShader
 		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchSkipDim, FVoxelMarchRingsDim,
 		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim,
 		                         FVoxelMarchHalfResDim, FVoxelMarchBlockSkipDim,
-		                         FVoxelMarchSkyLadderDim, FVoxelMarchBoundDim>;
+		                         FVoxelMarchSkyLadderDim, FVoxelMarchBoundDim,
+		                         FVoxelMarchZTightDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -5355,6 +5845,25 @@ class FVoxelMarchCS : public FGlobalShader
 		if (P.Get<FVoxelMarchBoundDim>() &&
 		    (!P.Get<FVoxelMarchRingsDim>() || P.Get<FVoxelMarchSkyLadderDim>() ||
 		     P.Get<FVoxelMarchHalfResDim>()))
+		{
+			return false;
+		}
+		// The tight resident-Z gate (voxel.March.ZTight). Two refusals, the
+		// second restated as an #error in VoxelBrickTraverse.ush for anyone
+		// who bypasses the host:
+		//   * without RINGS the gate has no socket -- it is the ring walk's
+		//     rung prologue and nothing else reads the define;
+		//   * with BOUND, two clamp arms fold removals into the same
+		//     bCrossedAbsentChunk debt, so no counter or timing on the
+		//     combined kernel could be attributed to either -- and the bound
+		//     is retired besides (docs/marcher-cost-autopsy-2026-08-29.md).
+		// SkyLadder and HalfRes are deliberately NOT refused: the skip's
+		// debt fold under the sky gate is the ZCut fold's conservative
+		// direction (more retries, never fewer -- argued at the skip site),
+		// and the slabs are per-level scalars, indifferent to the sample
+		// lattice, unlike the bound's per-pixel raster.
+		if (P.Get<FVoxelMarchZTightDim>() &&
+		    (!P.Get<FVoxelMarchRingsDim>() || P.Get<FVoxelMarchBoundDim>()))
 		{
 			return false;
 		}
@@ -5521,6 +6030,29 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchRayBoundWord::BoundWalkInRaised));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_BND_WALKOUT_LOWERED"),
 		                         int32(VoxelMarchRayBoundWord::BoundWalkOutLowered));
+		// The tight gate's engagement quad (voxel.March.ZTight), pushed from
+		// the same appended-word namespace for the same reason every group
+		// above is: a hand mirror here reads a plausible number out of the
+		// wrong slot.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZT_SEG_SKIPPED"),
+		                         int32(VoxelMarchRayBoundWord::ZTightSegSkipped));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZT_SEG_ENTERED"),
+		                         int32(VoxelMarchRayBoundWord::ZTightSegEntered));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZT_RETRY_SKIPPED"),
+		                         int32(VoxelMarchRayBoundWord::ZTightRetrySkipped));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZT_RETRY_ENTERED"),
+		                         int32(VoxelMarchRayBoundWord::ZTightRetryEntered));
+		// The wave-occupancy census's five words, same rule.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WAVE_CHUNK_SUM"),
+		                         int32(VoxelMarchRayBoundWord::WaveChunkActiveSum));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WAVE_CHUNK_SAMPLES"),
+		                         int32(VoxelMarchRayBoundWord::WaveChunkSamples));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WAVE_CELL_SUM"),
+		                         int32(VoxelMarchRayBoundWord::WaveCellActiveSum));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WAVE_CELL_SAMPLES"),
+		                         int32(VoxelMarchRayBoundWord::WaveCellSamples));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WAVE_LANES"),
+		                         int32(VoxelMarchRayBoundWord::WaveLaneCount));
 		// WORDS covers the appended census -- VoxelMarchRayBoundWord::End, not
 		// the enum's Count, while the census lives outside the enum. Every
 		// sizing of the stats buffer (create, copy, lock) reads End too.
@@ -5638,6 +6170,131 @@ static_assert(int32(VoxelMarchHoleWord::HeightLateB1) ==
               "four decades into other counters.");
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchCS, VOXEL_MARCH_USF, "VoxelMarchMain", SF_Compute);
+
+// ===========================================================================
+// THE TIGHT RESIDENT-Z REDUCE (voxel.March.ZTight's producer)
+// ===========================================================================
+//
+// One thread per chunk-table slot, once per marched frame while the arm is
+// on: validates each record the way the marcher and the refine pass do
+// (stride, zeroed-record, origin-is-a-chunk-origin, level-maps-to-a-slot,
+// INDEX TENANCY) and reduces the survivors to a tight per-level chunk-Z
+// min/max plus the phantom census. Output is 25 words, read back through
+// FVoxelMarchState::ZTightRing and turned into MarchZTightSlabUU uniforms
+// 1-3 frames later. The kernel's doctrine -- encoding, phantom rule, the
+// tenancy-join exactness -- lives in VoxelMarchZTight.usf.
+
+// Macro, not a const TCHAR*: IMPLEMENT_GLOBAL_SHADER stringizes its path
+// argument (VOXEL_MARCH_USF's note).
+#define VOXEL_MARCH_ZTIGHT_USF "/VoxelEarth/VoxelMarchZTight.usf"
+
+// THE REDUCE'S OUTPUT LAYOUT -- the one authority, pushed to the shader as
+// defines below and read back by the landing at the same names, exactly the
+// hole-word discipline and for its recorded reason. Bound words come back in
+// the kernel's max-only encoding (min = ~enc, max = enc, enc = z ^ bit31 --
+// the .usf's block explains why both ends are maximums); the landing decodes
+// them, and ONLY where the level's Count word is non-zero.
+namespace VoxelMarchZTightWord
+{
+	enum
+	{
+		MinInvFirst = 0,             // + level 0..6: max over ~enc(chunkZ)
+		MaxFirst = 7,                // + level 0..6: max over enc(chunkZ)
+		CountFirst = 14,             // + level 0..6: live validated records
+		Phantoms = 21,               // non-zero records failing validation
+		Live = 22,                   // records that widened some level
+		Cover = 23,                  // cover-level records (never gate rings)
+		Examined = 24,               // slots processed -- the dispatch check
+		End
+	};
+}
+
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchZTightReduceParameters, )
+	// The pool bindings, filled by FVoxelBrickPool::BindShaderParameters --
+	// the shader declares only the three it reads (the refine kernel's
+	// precedent); the macro's other members go unbound-but-filled.
+	VOXEL_BRICK_POOL_PARAMETERS()
+	// The march chunk index, READ-ONLY, copied from the march's own filled
+	// parameters at the dispatch so the tenancy join and the march consult
+	// ONE index snapshot -- two Register calls could straddle a flush.
+	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchZTightChunkIndex)
+	SHADER_PARAMETER(FUintVector, MarchZTightDimChunks)
+	SHADER_PARAMETER(uint32, MarchZTightCellsPerLevel)
+	SHADER_PARAMETER(uint32, MarchZTightCellCount)
+	SHADER_PARAMETER(uint32, MarchZTightRingGrids)
+	SHADER_PARAMETER(uint32, MarchZTightCoverLevel)
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchZTightOut)
+END_SHADER_PARAMETER_STRUCT()
+
+class FVoxelMarchZTightReduceCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FVoxelMarchZTightReduceCS);
+	SHADER_USE_PARAMETER_STRUCT(FVoxelMarchZTightReduceCS, FGlobalShader);
+	using FParameters = FVoxelMarchZTightReduceParameters;
+
+	static constexpr int32 kGroupSize = 64;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+	}
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+	                                         FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		// The group size, pushed rather than hand-mirrored in the .usf's
+		// numthreads -- the dispatch divides by THIS constant, and the two
+		// drifting apart under-covers the table, which the landing's
+		// examined check would catch a frame too late.
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_GROUP_SIZE"), kGroupSize);
+		// The ring level count, from the index's own constant -- the reduce
+		// sizes its groupshared arrays and its level test from this, and a
+		// hand mirror against a widened cascade would fold level-6 records
+		// into nothing while the walk still consulted slab 6.
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_RING_LEVELS"),
+		                         int32(FVoxelMarchChunkIndex::kRingGrids));
+		// The word layout, from the one namespace above.
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_WORD_MININV0"),
+		                         int32(VoxelMarchZTightWord::MinInvFirst));
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_WORD_MAX0"),
+		                         int32(VoxelMarchZTightWord::MaxFirst));
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_WORD_COUNT0"),
+		                         int32(VoxelMarchZTightWord::CountFirst));
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_WORD_PHANTOMS"),
+		                         int32(VoxelMarchZTightWord::Phantoms));
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_WORD_LIVE"),
+		                         int32(VoxelMarchZTightWord::Live));
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_WORD_COVER"),
+		                         int32(VoxelMarchZTightWord::Cover));
+		OutEnvironment.SetDefine(TEXT("VOXEL_ZTIGHT_WORD_EXAMINED"),
+		                         int32(VoxelMarchZTightWord::Examined));
+	}
+};
+// The three per-level groups are contiguous [level 0..6] blocks the shader
+// indexes as base + level; spelled as an assert rather than trusted, the
+// histogram-bucket rule.
+static_assert(int32(VoxelMarchZTightWord::MaxFirst) ==
+                      int32(VoxelMarchZTightWord::MinInvFirst) + 7 &&
+                  int32(VoxelMarchZTightWord::CountFirst) ==
+                      int32(VoxelMarchZTightWord::MaxFirst) + 7 &&
+                  int32(VoxelMarchZTightWord::Phantoms) ==
+                      int32(VoxelMarchZTightWord::CountFirst) + 7 &&
+                  int32(VoxelMarchZTightWord::End) == 25,
+              "the ZTight reduce's word groups drifted from base+level indexing, or its "
+              "buffer size changed without every reader (kernel defines, landing decode, "
+              "readback byte count) moving together -- they all read THIS enum.");
+// And the level count itself is pinned to the index's: the snapshot arrays in
+// FVoxelMarchState are sized by VoxelMarchHoleWord::kNumLevels, the reduce by
+// kRingGrids, and the two growing apart would decode level-6 bounds into
+// nothing (or past the array) with every counter healthy.
+static_assert(int32(FVoxelMarchChunkIndex::kRingGrids) ==
+                  int32(VoxelMarchHoleWord::kNumLevels),
+              "the ZTight reduce assumes the ring-grid count and the hole metric's level "
+              "count are the same 7; they diverged, so the reduce's fixed 7-pair layout "
+              "and FVoxelMarchState::kZTightLevels must be re-derived, not patched.");
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelMarchZTightReduceCS, VOXEL_MARCH_ZTIGHT_USF,
+                        "VoxelMarchZTightReduceMain", SF_Compute);
 
 class FVoxelMarchCompactCS : public FGlobalShader
 {
@@ -6319,7 +6976,13 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	// half-res forcing is deliberately NOT restated here: the comparator
 	// refuses to run at half res on its own grounds already, and a second
 	// spelling of that gate is how two guards drift.
+	// The same gating VoxelMarchGetArm applies (rings only), resolved BEFORE
+	// Bound because ZTight winning their conflict is part of the arm's own
+	// resolution and this report must describe the kernel actually selected.
+	Shipping.ZTight =
+		(Shipping.Rings != 0 && CVarVoxelMarchZTight.GetValueOnRenderThread() != 0) ? 1 : 0;
 	Shipping.Bound = (Shipping.Rings != 0 && Shipping.SkyLadder == 0 &&
+	                  Shipping.ZTight == 0 &&
 	                  CVarVoxelMarchBound.GetValueOnRenderThread() != 0)
 	                     ? 1
 	                     : 0;
@@ -6345,6 +7008,24 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	// marcher is not drawing (the bound arm can HIT where an unclamped walk
 	// caps out) -- false pass, the dangerous direction.
 	Comparator.Bound = 0;
+	// NOT in FVoxelMarchVerifySourceCS's domain either, exactly like Bound
+	// and for its reason: both comparator arms would enter every rung
+	// equally, a false PASS about a picture the marcher is not drawing.
+	Comparator.ZTight = 0;
+
+	if (Shipping.ZTight != Comparator.ZTight)
+	{
+		OutWhy = TEXT("the marcher is running the TIGHT RESIDENT-Z GATE (voxel.March.ZTight "
+		              "1) and the comparator is not -- the dimension is not in "
+		              "FVoxelMarchVerifySourceCS's permutation domain. The gate can let a walk "
+		              "REACH AND HIT ground the unclamped walk's 512-chunk cap or step budget "
+		              "never got to, and under the sky gate its debt fold can retry rungs the "
+		              "control would not, so the two kernels would be grading DIFFERENT "
+		              "PICTURES; both of the comparator's arms would run ungated equally, "
+		              "which makes it a FALSE PASS about a picture the marcher is not drawing "
+		              "-- not a false fail. Run the comparator with voxel.March.ZTight 0.");
+		return false;
+	}
 
 	if (Shipping.Bound != Comparator.Bound)
 	{
@@ -6835,6 +7516,20 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			const uint32 BndSegSkipped = Src[VoxelMarchRayBoundWord::BoundSegmentsSkipped];
 			const uint32 BndInRaised = Src[VoxelMarchRayBoundWord::BoundWalkInRaised];
 			const uint32 BndOutLowered = Src[VoxelMarchRayBoundWord::BoundWalkOutLowered];
+			// The tight gate's quad (voxel.March.ZTight), read on EVERY frame
+			// for the bound group's reason: written only by the ZTight
+			// permutation, structurally zero on all others, and the ztight
+			// stats line is what words a zero correctly.
+			const uint32 ZtSegSkipped = Src[VoxelMarchRayBoundWord::ZTightSegSkipped];
+			const uint32 ZtSegEntered = Src[VoxelMarchRayBoundWord::ZTightSegEntered];
+			const uint32 ZtRetrySkipped = Src[VoxelMarchRayBoundWord::ZTightRetrySkipped];
+			const uint32 ZtRetryEntered = Src[VoxelMarchRayBoundWord::ZTightRetryEntered];
+			// The wave census's five, same rule. WaveLanes is a MAXIMUM.
+			const uint32 WaveChunkSum = Src[VoxelMarchRayBoundWord::WaveChunkActiveSum];
+			const uint32 WaveChunkSamples = Src[VoxelMarchRayBoundWord::WaveChunkSamples];
+			const uint32 WaveCellSum = Src[VoxelMarchRayBoundWord::WaveCellActiveSum];
+			const uint32 WaveCellSamples = Src[VoxelMarchRayBoundWord::WaveCellSamples];
+			const uint32 WaveLanes = Src[VoxelMarchRayBoundWord::WaveLaneCount];
 			// The height pyramid's engagement group. Read on EVERY frame for
 			// the reason the three groups above are: the cheap kernel writes
 			// them too, so gating them behind the level-2 fold would report the
@@ -6905,6 +7600,19 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			GVoxelMarchRayBoundWindow.BoundWalkInRaised += BndInRaised;
 			GVoxelMarchRayBoundWindow.BoundWalkOutLowered += BndOutLowered;
 			GVoxelMarchRayBoundWindow.Frames++;
+			State->HoleWindow.ZTightSegSkipped += ZtSegSkipped;
+			State->HoleWindow.ZTightSegEntered += ZtSegEntered;
+			State->HoleWindow.ZTightRetrySkipped += ZtRetrySkipped;
+			State->HoleWindow.ZTightRetryEntered += ZtRetryEntered;
+			State->HoleWindow.WaveChunkActiveSum += WaveChunkSum;
+			State->HoleWindow.WaveChunkSamples += WaveChunkSamples;
+			State->HoleWindow.WaveCellActiveSum += WaveCellSum;
+			State->HoleWindow.WaveCellSamples += WaveCellSamples;
+			// MAX, NOT += -- the HeightLateMaxUU spelling, same reason: the
+			// wave width is a level, and summing a level across landed frames
+			// describes nothing.
+			State->HoleWindow.WaveLaneCount =
+				FMath::Max<uint64>(State->HoleWindow.WaveLaneCount, WaveLanes);
 			State->HoleWindow.HeightConsulted += HgtConsulted;
 			State->HoleWindow.HeightAdvanced += HgtAdvanced;
 			State->HoleWindow.HeightEmpty += HgtEmpty;
@@ -6949,6 +7657,124 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 				State->HoleWindow.UncoveredShell += UncoveredShell;
 				State->HoleWindow.BreakdownFrames++;
 			}
+		}
+		Slot.bInFlight = false;
+	}
+
+	// ---- THE TIGHT RESIDENT-Z REDUCE'S LANDINGS (voxel.March.ZTight) -------
+	//
+	// Decode, then JUDGE, then publish -- in that order, because the landing
+	// is where the arm's one uncoverable window is priced: the drift check
+	// below is the CPU-side discontinuity detector the pad argument leans on
+	// (see voxel.March.ZTightPadChunks). Ring slots can land out of order in
+	// principle; each landing simply replaces ZTightLanded, and a one-frame
+	// inversion is absorbed by the same pad that absorbs the latency.
+	for (FVoxelMarchState::FZTightReadback& Slot : State->ZTightRing)
+	{
+		if (!Slot.bInFlight || !Slot.Readback.IsValid() || !Slot.Readback->IsReady())
+		{
+			continue;
+		}
+		const uint32* Src = static_cast<const uint32*>(
+			Slot.Readback->Lock(uint32(VoxelMarchZTightWord::End) * sizeof(uint32)));
+		if (Src != nullptr)
+		{
+			FVoxelMarchState::FZTightSnapshot Snap;
+			for (int32 L = 0; L < FVoxelMarchState::kZTightLevels; ++L)
+			{
+				Snap.Count[L] = Src[int32(VoxelMarchZTightWord::CountFirst) + L];
+				// The kernel's max-only encoding, inverted: min came back as
+				// max over ~enc, max as max over enc, enc = z ^ bit31. VALID
+				// ONLY WHERE Count != 0 -- a zero count leaves both words at
+				// their cleared 0, which decodes to the (INT_MAX, INT_MIN)
+				// empty sentinels, and every consumer gates on Count first.
+				Snap.MinZ[L] = int32(
+					~Src[int32(VoxelMarchZTightWord::MinInvFirst) + L] ^ 0x80000000u);
+				Snap.MaxZ[L] = int32(
+					Src[int32(VoxelMarchZTightWord::MaxFirst) + L] ^ 0x80000000u);
+			}
+			Snap.Phantoms = Src[VoxelMarchZTightWord::Phantoms];
+			Snap.Live = Src[VoxelMarchZTightWord::Live];
+			Snap.Cover = Src[VoxelMarchZTightWord::Cover];
+			Snap.Examined = Src[VoxelMarchZTightWord::Examined];
+			Snap.LandFrame = GFrameCounterRenderThread;
+			Snap.bValid = true;
+			Slot.Readback->Unlock();
+
+			// THE REDUCE MUST PROVE IT COVERED THE TABLE. `examined` short of
+			// the pool's capacity is a broken dispatch (wrong group count,
+			// early returns) masquerading as a quiet world -- warned once,
+			// and the snapshot is REFUSED: a partial reduce's bounds are
+			// narrower than the truth, which is the one direction this arm
+			// may never take.
+			const uint32 ZtCapacity = GetGlobalVoxelBrickPool().GetConfig().ChunkCapacity;
+			if (Snap.Examined != ZtCapacity)
+			{
+				static bool bZtExaminedWarned = false;
+				if (!bZtExaminedWarned)
+				{
+					bZtExaminedWarned = true;
+					UE_LOG(LogVoxelMarch, Error,
+					       TEXT("voxel.March.ZTight reduce examined %u slots of a %u-slot "
+					            "chunk table. A PARTIAL REDUCE UNDER-STATES THE BOUNDS -- "
+					            "the hole direction -- so this landing (and every landing "
+					            "until the counts agree) is discarded and the arm will read "
+					            "armed-and-inert. The dispatch sizing and the kernel's "
+					            "early-out are the suspects, in that order."),
+					       Snap.Examined, ZtCapacity);
+				}
+				Slot.bInFlight = false;
+				continue;
+			}
+
+			FScopeLock Guard(&State->Lock);
+			State->ZTightLandings++;
+			State->ZTightPhantomsCum += Snap.Phantoms;
+			// THE DISCONTINUITY GATE. Outward motion past the pad between
+			// consecutive landings means the +1-chunk latency allowance was
+			// insufficient over an interval JUST LIKE the one the next slabs
+			// will be consumed across -- so the arm sits out SettleFrames.
+			// Checked only on levels populated in BOTH snapshots: a level
+			// newly appearing carries its own fresh bounds and no stale-pad
+			// exposure. First landing ever also settles (cold fill is the
+			// canonical discontinuity).
+			const int32 ZtPad = FMath::Max(
+				CVarVoxelMarchZTightPadChunks.GetValueOnRenderThread(), 2);
+			const int32 ZtSettle = FMath::Max(
+				CVarVoxelMarchZTightSettleFrames.GetValueOnRenderThread(), 1);
+			bool bDiscontinuity = false;
+			if (!State->ZTightLanded.bValid)
+			{
+				bDiscontinuity = true; // first landing: cold fill
+			}
+			else
+			{
+				for (int32 L = 0; L < FVoxelMarchState::kZTightLevels; ++L)
+				{
+					if (Snap.Count[L] == 0 || State->ZTightLanded.Count[L] == 0)
+					{
+						continue;
+					}
+					if (Snap.MinZ[L] < State->ZTightLanded.MinZ[L] - ZtPad ||
+					    Snap.MaxZ[L] > State->ZTightLanded.MaxZ[L] + ZtPad)
+					{
+						bDiscontinuity = true;
+						break;
+					}
+				}
+			}
+			if (bDiscontinuity)
+			{
+				State->ZTightSettleFramesLeft = ZtSettle;
+				// The first landing is the expected one and not counted; the
+				// counter is for MID-SESSION jumps, which are the reading
+				// that says the pad is being outrun.
+				if (State->ZTightLanded.bValid)
+				{
+					State->ZTightDiscontinuities++;
+				}
+			}
+			State->ZTightLanded = Snap;
 		}
 		Slot.bInFlight = false;
 	}
@@ -8544,6 +9370,127 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				FScopeLock Guard(&State->Lock);
 				State->Stats.IndexEntries = IndexEntries;
 			}
+			// ---- THE TIGHT RESIDENT-Z SLABS, FILLED (voxel.March.ZTight) ---
+			//
+			// AFTER VoxelMarchBindPool AND FROM Params->MarchBrickOriginVoxel
+			// ITSELF, not from a second read of the source: the slabs must be
+			// in the exact local-UU frame the kernel's OriginLocalUU lives
+			// in, and reading the field the struct will upload is the only
+			// arrangement with no join to drift (the MarchHeightOriginVoxel
+			// rule, one screen up). Filled on EVERY arm, zeros included --
+			// an unset uniform is a silent zero, and all-zero .z is also the
+			// honest "do not gate" value.
+			{
+				// The landed snapshot's shelf life, in render-thread frames.
+				// A CONSTANT, not a cvar, on purpose: it exists to catch the
+				// reduce SILENTLY STOPPING (readbacks cease landing -- ring
+				// starved, pass declined), and a knob for "how long may the
+				// input be dead before the arm notices" invites exactly the
+				// tuning that hides it. 6 covers the 3-slot ring's worst
+				// honest latency twice over.
+				constexpr int32 kZtMaxAgeFrames = 6;
+				const bool bZTightOn = Arm.ZTight != 0;
+				// >= 2, LOAD-BEARING TWICE: 1 latency chunk + 1 float-jump
+				// chunk, and the floor is what keeps the skip's shell-flag
+				// fold exact -- the cvar's block carries both arguments.
+				const int32 ZtPad = FMath::Max(
+					CVarVoxelMarchZTightPadChunks.GetValueOnRenderThread(), 2);
+				int32 ZtUsableMask = 0;
+				int32 ZtAgeFrames = -1;
+				int32 ZtSettleLeft = 0;
+				// Every slot written on every arm, cover slot included, so
+				// no path leaves the shader a stale or unset quad (the
+				// MarchLevelChunkZ fill's rule).
+				for (int32 S = 0; S < int32(FVoxelMarchChunkIndex::kGridSlots); ++S)
+				{
+					Params->MarchZTightSlabUU[S] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+					GVoxelMarchZTightRanZMin[S].store(0, std::memory_order_relaxed);
+					GVoxelMarchZTightRanZMax[S].store(0, std::memory_order_relaxed);
+				}
+				if (bZTightOn)
+				{
+					FScopeLock Guard(&State->Lock);
+					// THE SETTLE GATE TICKS HERE -- once per fill while the
+					// arm is on, so a paused game does not silently serve
+					// out the sentence while nothing marches.
+					if (State->ZTightSettleFramesLeft > 0)
+					{
+						State->ZTightSettleFramesLeft--;
+					}
+					ZtSettleLeft = State->ZTightSettleFramesLeft;
+					const FVoxelMarchState::FZTightSnapshot& Snap = State->ZTightLanded;
+					if (Snap.bValid)
+					{
+						ZtAgeFrames = int32(
+							int64(GFrameCounterRenderThread) - int64(Snap.LandFrame));
+						// STALE REFUSES EVERYTHING. A snapshot older than
+						// the readback ring's honest worst case means the
+						// reduce has stopped landing, and a bound whose
+						// producer died is the exact input failure that
+						// killed ZCut's predecessor -- lost benefit here,
+						// never a hole, and the stats line prints the age.
+						if (ZtAgeFrames >= 0 && ZtAgeFrames <= kZtMaxAgeFrames &&
+						    ZtSettleLeft == 0)
+						{
+							const FIntVector ZtOrigin = Params->MarchBrickOriginVoxel;
+							for (int32 L = 0;
+							     L < int32(FVoxelMarchChunkIndex::kRingGrids); ++L)
+							{
+								// COUNT 0 REFUSES THE LEVEL -- the ZCut
+								// rule: an empty slot gets no bound, never
+								// an empty one, and the decoded min/max are
+								// sentinels there besides.
+								if (Snap.Count[L] == 0)
+								{
+									continue;
+								}
+								// OUTWARD ON BOTH ENDS, ALWAYS -- too tight
+								// is a hole, too wide is only slower.
+								const int32 MinC = Snap.MinZ[L] - ZtPad;
+								const int32 MaxC = Snap.MaxZ[L] + ZtPad;
+								// THE SAME ARITHMETIC VoxelMarchBeginLevel
+								// RUNS: the frame origin is snapped to 1024
+								// level-0 voxels, so >> L is an exact
+								// division at every reachable level and the
+								// C++ arithmetic shift matches HLSL's. A
+								// level-L voxel is 10 UU * 2^L (the ring
+								// reach check's own 10.0 -- one more copy of
+								// that literal, flagged as such).
+								const int32 OriginZL = ZtOrigin.Z >> L;
+								const float VoxUU = 10.0f * float(1 << L);
+								// .y + 1 BECAUSE MAX IS INCLUSIVE -- the
+								// ZCut conversion's off-by-one note, kept:
+								// the top face of the last chunk is the
+								// start of the one above it.
+								const float SlabLoUU =
+									float(MinC * 32 - OriginZL) * VoxUU;
+								const float SlabHiUU =
+									float((MaxC + 1) * 32 - OriginZL) * VoxUU;
+								Params->MarchZTightSlabUU[L] =
+									FVector4f(SlabLoUU, SlabHiUU, 1.0f, 0.0f);
+								ZtUsableMask |= (1 << L);
+								GVoxelMarchZTightRanZMin[L].store(
+									MinC, std::memory_order_relaxed);
+								GVoxelMarchZTightRanZMax[L].store(
+									MaxC, std::memory_order_relaxed);
+							}
+						}
+					}
+				}
+				// The bind stamp -- what was SENT, beside what was typed, the
+				// ZCut discipline: this proves the uniforms were FILLED, not
+				// that the pass ran (frames say that) nor that the kernel
+				// used them (only the engagement quad says that).
+				GVoxelMarchZTightRanEnable.store(bZTightOn ? 1 : 0,
+				                                 std::memory_order_relaxed);
+				GVoxelMarchZTightRanUsableMask.store(ZtUsableMask,
+				                                     std::memory_order_relaxed);
+				GVoxelMarchZTightRanPad.store(ZtPad, std::memory_order_relaxed);
+				GVoxelMarchZTightRanAgeFrames.store(ZtAgeFrames,
+				                                    std::memory_order_relaxed);
+				GVoxelMarchZTightRanSettleLeft.store(ZtSettleLeft,
+				                                     std::memory_order_relaxed);
+			}
 			// bDepthBufferIsPopulated is ShouldRenderPrePass() -- with Nanite on
 			// it is always true here, but a project that turns Nanite off gets a
 			// partial or absent prepass and a t_max read from it would be
@@ -8610,6 +9557,18 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// an unbound Texture2DArray whose zeros decode as EMPTY
 			// intervals (skip the world -- every ray a hole, no error).
 			Permutation.Set<FVoxelMarchBoundDim>(BoundTex != nullptr);
+			// FROM THE ARM, NOT FROM BOUNDS-READINESS -- deliberately the
+			// OPPOSITE keying to the bound line above, and the difference is
+			// the failure direction of the missing input. The bound's unbound
+			// texture reads zeros that decode as EMPTY intervals (skip the
+			// world); ZTight's not-yet-usable slabs are .z == 0, the honest
+			// "do not gate" value, so an armed kernel with no landed reduce
+			// marches exactly the control. Keying on the cvar keeps a leg on
+			// ONE kernel throughout -- readiness flapping mid-leg would
+			// otherwise alternate binaries under the timer. Arm.ZTight is
+			// already rings-gated and Bound-exclusive (VoxelMarchGetArm), so
+			// the refused permutations cannot be asked for here.
+			Permutation.Set<FVoxelMarchZTightDim>(Arm.ZTight != 0);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.
@@ -8665,6 +9624,95 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 					// a level-1 frame's structurally zero breakdown words are
 					// never folded in as measurements (see FHoleReadback).
 					Free->ArmLevel = Arm.HoleStatsLevel;
+				}
+			}
+
+			// ---- THE TIGHT RESIDENT-Z REDUCE (voxel.March.ZTight) ----------
+			//
+			// INSIDE THE MARCH PARAMS SCOPE ON PURPOSE: the tenancy join must
+			// consult the exact index snapshot this frame's march binds, and
+			// copying Params->MarchChunkIndex is the only spelling with no
+			// second Register call to straddle a flush. INSIDE THE March
+			// TIMING BRACKET too, deliberately: the reduce is the arm's
+			// producer cost and voxel.March.ZTight's help text prices it
+			// with VoxelMarch.March rather than itemising a bracket the way
+			// the bound did -- at one thread per chunk slot (~50k) it is
+			// orders below the bound's per-pixel rasters, and a separate
+			// bracket would be more instrument than signal. Revisit if
+			// ProfileGPU ever shows this pass above noise.
+			//
+			// GATED ON THE ARM, not on hole stats: the bounds are the arm's
+			// INPUT, not an instrument. A frame with no free ring slot skips
+			// the whole reduce up front (the hole ring's bias-free skip) and
+			// simply serves the previous landed snapshot one frame longer --
+			// which the latency pad already covers, and which the age gate
+			// bounds if it persists. NO NeverCull, also deliberately: the
+			// readback copy is the only consumer, so if the bind below
+			// declines, RDG culls the orphaned clear rather than paying it.
+			if (Arm.ZTight != 0 && Params->MarchChunkIndex != nullptr)
+			{
+				const uint32 ZtChunkSlots =
+					GetGlobalVoxelBrickPool().GetConfig().ChunkCapacity;
+				FVoxelMarchState::FZTightReadback* ZtFree = nullptr;
+				for (FVoxelMarchState::FZTightReadback& Slot : State->ZTightRing)
+				{
+					if (!Slot.bInFlight) { ZtFree = &Slot; break; }
+				}
+				if (ZtChunkSlots > 0 && ZtFree != nullptr)
+				{
+					FRDGBufferRef ZtOut = GraphBuilder.CreateBuffer(
+						FRDGBufferDesc::CreateBufferDesc(
+							sizeof(uint32), int32(VoxelMarchZTightWord::End)),
+						TEXT("VoxelMarch.ZTightBounds"));
+					FRDGBufferUAVRef ZtOutUAV =
+						GraphBuilder.CreateUAV(ZtOut, PF_R32_UINT);
+					// ONE CLEAR VALUE SERVES EVERY WORD -- the kernel's
+					// max-only encoding exists so that 0 is simultaneously
+					// "no record seen" for min, max AND the counters; see
+					// VoxelZTightEncodeZ's block for why a real min word
+					// (needing an all-ones init) was refused.
+					AddClearUAVPass(GraphBuilder, ZtOutUAV, 0u);
+					auto* ZtParams =
+						GraphBuilder.AllocParameters<FVoxelMarchZTightReduceParameters>();
+					// Cannot fail here in practice -- VoxelMarchBindPool just
+					// bound the same pool for the march -- but checked, not
+					// assumed: a declined bind must skip the pass rather than
+					// dispatch against a half-filled struct.
+					if (GetGlobalVoxelBrickPool().BindShaderParameters(GraphBuilder,
+					                                                   *ZtParams))
+					{
+						ZtParams->MarchZTightChunkIndex = Params->MarchChunkIndex;
+						ZtParams->MarchZTightDimChunks = Params->MarchIndexDimChunks;
+						ZtParams->MarchZTightCellsPerLevel =
+							Params->MarchIndexCellsPerLevel;
+						ZtParams->MarchZTightCellCount =
+							uint32(FVoxelMarchChunkIndex::kGridSlots) *
+							Params->MarchIndexCellsPerLevel;
+						ZtParams->MarchZTightRingGrids =
+							uint32(FVoxelMarchChunkIndex::kRingGrids);
+						ZtParams->MarchZTightCoverLevel =
+							uint32(FVoxelMarchChunkIndex::kCoverLevel);
+						ZtParams->MarchZTightOut = ZtOutUAV;
+						TShaderMapRef<FVoxelMarchZTightReduceCS> ZtShader(ShaderMap);
+						FComputeShaderUtils::AddPass(
+							GraphBuilder,
+							RDG_EVENT_NAME("VoxelMarch.ZTightReduce(%u slots)",
+							               ZtChunkSlots),
+							ERDGPassFlags::Compute, ZtShader, ZtParams,
+							FIntVector(FMath::DivideAndRoundUp(
+							               int32(ZtChunkSlots),
+							               FVoxelMarchZTightReduceCS::kGroupSize),
+							           1, 1));
+						if (!ZtFree->Readback.IsValid())
+						{
+							ZtFree->Readback = MakeUnique<FRHIGPUBufferReadback>(
+								TEXT("VoxelMarch.ZTightReadback"));
+						}
+						AddEnqueueCopyPass(GraphBuilder, ZtFree->Readback.Get(), ZtOut,
+						                   uint32(VoxelMarchZTightWord::End) *
+						                       sizeof(uint32));
+						ZtFree->bInFlight = true;
+					}
 				}
 			}
 		}

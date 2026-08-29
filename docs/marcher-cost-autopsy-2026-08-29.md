@@ -68,3 +68,54 @@ bit shows it there. Cvar-only test.
 **GATE RULE, new and mandatory: every marcher timing gate runs at sky AND down,
 never horizon alone.** The bound passed design review against a horizon gate and
 died at poses nobody priced.
+
+---
+
+# ADDENDUM (same day): the disease is 1/64 SIMD occupancy; clamps were symptoms
+
+The ZTight arm — zero per-ray state, uniforms only, hoisted above setup, every
+lesson applied — ALSO failed its gate: sky 5.858 -> 7.071 (+1.21), down 1.216 ->
+1.632 (+0.42), with engagement REAL (8.49% of segments skipped, 0.35% of
+retries). Third clamp arm, third failure, same signature: the permutation is
+slower even where its skips fire.
+
+**The wave census says why, in one number: waveWidth=64, meanActive=1.00.**
+Trip-weighted mean active lanes on the deep iterations is ~1 of 64 — the
+expensive work runs essentially serialized, 1/64 of the machine. That one
+mechanism explains every prior observation at once:
+
+- ~2,000 cycles per "segment entry" = ordinary code x64 serialization;
+- removing iterations per-RAY saves nothing (the WAVE lives as long as its
+  longest lane; a skipped lane just idles);
+- cost linear in ring count (each ring extends the longest lane's lifetime);
+- every clamp permutation regresses (added registers/branches tax an
+  occupancy-marginal kernel by whole percents, and per-lane wins are invisible
+  at 1/64 utilization);
+- the bound's down-pose +2.32 pathology (any extra per-lane work x64).
+
+**And a second monster in the same line: the sky fallthrough-retry rate is ~90%**
+(58.8M retries entered vs 65.4M segments) — nearly every sky segment walks
+TWICE. The 14x entry multiplier is real and is mostly the LADDER, not the rings.
+
+## The programme, restated for the last time tonight
+
+**Per-lane clamp arms are structurally dead in this kernel. Three bodies:
+Bound (-6.0/-12.6), anySolid (null twice), ZTight (+1.2/+0.4).** Do not build a
+fourth. All three stay in the tree, default 0, as instruments.
+
+**Family A — occupancy — is the programme now**, with a theoretical ceiling
+larger than everything tried tonight combined (the deep work runs at 1/64):
+1. Survivor compaction / two-phase march: march N steps, compact live rays into
+   dense waves, continue. Published shape (Aila & Laine; wavefront tracing).
+2. The 90% sky retry rate as a COHERENT target: sky waves retry together, so a
+   wave-coherent ladder gate (not per-lane) could halve sky segment count
+   without per-lane divergence cost. Needs its own falsifier: measure the
+   retry rate's wave-coherence first (are retries taken by whole waves?).
+3. Base-kernel register diet as an enabler (the fatness that makes every
+   permutation regress is itself an occupancy tax).
+
+Verify before building: the wave census metric is trip-weighted (that IS the
+cost weighting, argued at the site) — one sanity pass on the counter's math on a
+down-pose leg (short walks, expect meanActive high if the metric is honest:
+down-pose deep trips are few). meanActive down-pose reading is the census's own
+falsifier: if it ALSO reads 1.00 there, suspect the instrument, not the machine.

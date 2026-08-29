@@ -1,0 +1,364 @@
+// VoxelMarchZTight.usf -- the per-frame TIGHT resident-Z reduce
+// (voxel.March.ZTight's producer).
+//
+// WHY THIS PASS EXISTS. The autopsy (docs/marcher-cost-autopsy-2026-08-29.md)
+// corrected the marcher's cost model: the air cost was never in the
+// iterations, it is SEGMENT ENTRY -- ~0.67 us/ray (~2,000 cycles) of setup
+// paid up to 14 times per ray (7 rings x 2 fallthrough rungs), a perfectly
+// linear ~0.9 ms per ring at the sky pose. The ZCut socket in
+// VoxelBrickTraverse.ush was structurally sound (docs/SCOREBOARD.md: "the
+// refutation was of its INPUT, not its structure"); its input was
+// GetResidentChunkZBound -- a CUMULATIVE union that never narrows, with 2^L
+// pads reaching 819 m at L6, so it skipped 0.00% at the horizon and could
+// only lose value with play time. This kernel is the repaired input: a tight
+// per-level min/max of RecOrigin.z over the LIVE records in
+// VoxelBrickChunkTable -- the marcher's own authority for what a hit can
+// validate against -- reduced fresh every frame.
+//
+// WHERE THE OUTPUT GOES. The CPU reads these 25 words back with 1-3 frames of
+// latency (the hole-stats readback ring's shape) and pushes per-level slabs as
+// SHADER UNIFORMS in local UU (MarchZTightSlabUU), padded outward for the
+// latency -- zero registers and zero loads in the march kernel, which is the
+// lesson the bound arm died teaching (its per-ray register loads and its
+// inside-the-walk collapse both paid the very setup they claimed to remove).
+//
+// THE PHANTOM RULE, and it is the second lesson of the bound autopsy: that
+// producer read freed-slot debris as live cubes -- 4.4x phantoms on a churned
+// session -- so its bounds degraded with play time. Widening is SAFE here
+// (outward is the hole-free direction) but it erodes the whole point, so this
+// kernel applies the marcher's own record validation AND the index-tenancy
+// join the refine pass proved out (VoxelMarchIndexScatter.usf,
+// VoxelMarchIndexRefineMain): a record only widens the bound if the index
+// cell its own coordinate maps to still names THIS slot as resident. Freed
+// debris, stale origins and aliased levels are counted as `phantoms` for the
+// log and fold into NOTHING.
+//
+// THE DIRECTION OF SAFETY, restated from the refine kernel because it is the
+// same job: a record wrongly EXCLUDED narrows the bound -- that is the one
+// direction this pass may never take lightly, and every refusal below is a
+// refusal to WIDEN-BY-DEBRIS, never a refusal to include a genuinely live
+// record. A live record always passes: its origin is a multiple of 32 (the
+// pool writes ChunkCoord * 32), its level maps to a grid slot, and it IS the
+// tenant of its cell (the index add for it ran in the same flush that wrote
+// the record -- see the scatter file's ordering argument). The one live
+// record the join DOES exclude is one whose wrapped cell is currently
+// tenanted by an ALIAS -- and that exclusion is EXACT, not merely
+// acceptable: the marcher's own lookup at that coordinate reads the same
+// cell, fetches the alias's record, fails the origin/level validation (the
+// cellStale bucket) and grants no bValid -- so a chunk that is not the
+// tenant of its cell is UNREACHABLE BY A HIT for the very walk this bound
+// protects. "The z-extent of everything a hit could validate against" IS the
+// tenancy predicate. The one remaining window is a record admitted AFTER
+// this reduce ran; the CPU's latency pad plus the discontinuity gate cover
+// that, and the pad's sizing argument lives at the cvar
+// (voxel.March.ZTightPadChunks).
+//
+// EVERY COUNTER CAN READ ZERO LOUDLY: `examined` is compared against the
+// dispatch size on the CPU (a shortfall is a broken reduce, not a quiet
+// world); per-level `count` zero means the level gets NO usable slab (the
+// ZCut precedent: an empty slot is refused a bound, never given an empty
+// one); `live` summing below `examined` is normal (freed slots); `phantoms`
+// non-zero is the debris rate, printed so the bound-arm failure mode cannot
+// return unnoticed.
+
+#include "/Engine/Public/Platform.ush"
+// The marcher's own coord->cell wrap and the index entry bit layout. SHARED,
+// not restated: the tenancy join below must compute the exact cell the
+// marcher's lookup reads, or it validates records against the wrong tenant.
+#include "/VoxelEarth/VoxelMarchIndexCell.ush"
+
+// The record stride this kernel was compiled against, cross-checked at
+// runtime against the bound uniform -- the refine kernel's own guard, kept
+// for its reason: a stride that moved on one side only reads a NEIGHBOURING
+// record's fields, and enough of them survive validation to look like data.
+#ifndef VOXEL_ZTIGHT_RECORD_DWORDS
+#define VOXEL_ZTIGHT_RECORD_DWORDS 16u
+#endif
+
+// Ring levels reduced (7). Pushed from FVoxelMarchChunkIndex::kRingGrids by
+// the host so the two sides cannot disagree about how many pairs exist.
+#ifndef VOXEL_ZTIGHT_RING_LEVELS
+#define VOXEL_ZTIGHT_RING_LEVELS 7
+#endif
+
+// The group size, pushed from FVoxelMarchZTightReduceCS::kGroupSize -- the
+// dispatch divides by that constant, and a hand mirror here would silently
+// under-cover the table (caught only a frame late by the landing's
+// examined-vs-capacity check).
+#ifndef VOXEL_ZTIGHT_GROUP_SIZE
+#define VOXEL_ZTIGHT_GROUP_SIZE 64
+#endif
+
+// The output word layout, pushed from VoxelMarchZTightWord in
+// VoxelMarchRenderer.cpp -- the one authority, same discipline as the
+// hole-stats words and for the recorded reason (a hand mirror reads a
+// plausible number out of the wrong slot).
+#ifndef VOXEL_ZTIGHT_WORD_MININV0
+#define VOXEL_ZTIGHT_WORD_MININV0 0
+#endif
+#ifndef VOXEL_ZTIGHT_WORD_MAX0
+#define VOXEL_ZTIGHT_WORD_MAX0 7
+#endif
+#ifndef VOXEL_ZTIGHT_WORD_COUNT0
+#define VOXEL_ZTIGHT_WORD_COUNT0 14
+#endif
+#ifndef VOXEL_ZTIGHT_WORD_PHANTOMS
+#define VOXEL_ZTIGHT_WORD_PHANTOMS 21
+#endif
+#ifndef VOXEL_ZTIGHT_WORD_LIVE
+#define VOXEL_ZTIGHT_WORD_LIVE 22
+#endif
+#ifndef VOXEL_ZTIGHT_WORD_COVER
+#define VOXEL_ZTIGHT_WORD_COVER 23
+#endif
+#ifndef VOXEL_ZTIGHT_WORD_EXAMINED
+#define VOXEL_ZTIGHT_WORD_EXAMINED 24
+#endif
+
+// The record's own fields, named as the refine kernel names them (mirrors
+// VoxelBrickPool.h's layout table: [3] LevelAndFlags, [0:3] ring level).
+#define VOXEL_ZTIGHT_REC_LEVEL_MASK 0xFu
+
+// The pool bindings, by the SAME names VOXEL_BRICK_POOL_PARAMETERS() declares
+// and FVoxelBrickPool::BindShaderParameters fills -- only the three this walk
+// needs are declared; the macro's other members go unbound, which is what the
+// macro is for (the refine kernel's precedent, verbatim).
+StructuredBuffer<uint> VoxelBrickChunkTable;
+uint VoxelBrickChunkSlots;
+uint VoxelBrickChunkRecordDwords;
+
+// The march chunk index, READ-ONLY -- the tenancy join consults it and must
+// never write it. Bound from the same RegisterWithBlocks snapshot the march
+// itself binds this frame, so record and index cannot straddle a flush.
+Buffer<uint> MarchZTightChunkIndex;
+// The grid shape, the same values the marcher binds (MarchIndexDimChunks /
+// MarchIndexCellsPerLevel), copied from the march's own filled parameters at
+// the dispatch so there is no second read of the constants to drift.
+uint3 MarchZTightDimChunks;
+uint  MarchZTightCellsPerLevel;
+uint  MarchZTightCellCount;
+// GridSlotForLevel's two halves, bound rather than spelled a second time
+// (the refine kernel's rule).
+uint  MarchZTightRingGrids;
+uint  MarchZTightCoverLevel;
+
+// 25 uints, CLEARED TO ZERO by the host each frame. Bound words use a
+// MAX-ONLY encoding chosen so that zero IS the empty sentinel for both ends
+// -- see VoxelZTightEncodeZ below -- and counters are plain adds, so one
+// clear value serves every word and there is no init pass to forget.
+RWBuffer<uint> MarchZTightOut;
+
+// ---------------------------------------------------------------------------
+// THE ENCODING, AND WHY BOTH BOUNDS ARE MAXIMUMS.
+// ---------------------------------------------------------------------------
+// Chunk Z is a signed int. `asuint(z) ^ 0x80000000u` is the standard
+// order-preserving int->uint map, so InterlockedMax over it computes the
+// signed maximum. The MINIMUM is tracked as InterlockedMax over the BITWISE
+// COMPLEMENT of the same encoding (~enc is strictly decreasing in z), so both
+// words grow monotonically from a cleared 0 -- a single AddClearUAVPass
+// initialises "no record seen" for min, max AND every counter at once. The
+// alternative (a real InterlockedMin word) needs an all-ones init for half
+// the buffer, i.e. a second clear that someone eventually forgets, and a
+// forgotten init here reads as z = INT_MIN -- a bound the cut would trust.
+// Decode on the CPU: min = int((~word) ^ 0x80000000u), max =
+// int(word ^ 0x80000000u), VALID ONLY where the level's count word is
+// non-zero -- a zero count refuses the level a slab entirely, exactly as the
+// ZCut host refuses an empty slot.
+uint VoxelZTightEncodeZ(int Z)
+{
+	return asuint(Z) ^ 0x80000000u;
+}
+
+// PER-GROUP FIRST, GLOBAL ONCE -- the refine kernel's LDS shape, kept for its
+// reason: tens of thousands of threads hammering 25 global addresses would
+// cost more than the reduce saves. 7 min words, 7 max words, 7 counts, 4
+// scalars.
+groupshared uint GZtMinInv[VOXEL_ZTIGHT_RING_LEVELS];
+groupshared uint GZtMaxEnc[VOXEL_ZTIGHT_RING_LEVELS];
+groupshared uint GZtCount[VOXEL_ZTIGHT_RING_LEVELS];
+groupshared uint GZtPhantoms;
+groupshared uint GZtLive;
+groupshared uint GZtCover;
+groupshared uint GZtExamined;
+
+[numthreads(VOXEL_ZTIGHT_GROUP_SIZE, 1, 1)]
+void VoxelMarchZTightReduceMain(uint3 tid : SV_DispatchThreadID, uint LocalId : SV_GroupIndex)
+{
+	if (LocalId < uint(VOXEL_ZTIGHT_RING_LEVELS))
+	{
+		GZtMinInv[LocalId] = 0u;
+		GZtMaxEnc[LocalId] = 0u;
+		GZtCount[LocalId] = 0u;
+	}
+	if (LocalId == 0u)
+	{
+		GZtPhantoms = 0u;
+		GZtLive = 0u;
+		GZtCover = 0u;
+		GZtExamined = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// EVERY EXIT GOES TO THE FLUSH AT THE BOTTOM, never a bare return -- the
+	// refine kernel's one-structured-path-out rule, kept for its reason: a
+	// group whose threads returned early would leave its tally unflushed and
+	// `examined` would under-count exactly the failure it exists to expose.
+	const uint Slot = tid.x;
+	if (Slot < VoxelBrickChunkSlots)
+	{
+		InterlockedAdd(GZtExamined, 1u);
+		// THE STRIDE CROSS-CHECK, first and for the marcher's reason. Also
+		// catches the unbound-uniform case: an unbound loose uint reads 0,
+		// which cannot equal the compiled constant. Counted as a phantom PER
+		// SLOT deliberately -- phantoms == examined is the loudest possible
+		// "this reduce is misconfigured", and no bound word is ever written
+		// on this path, so every level reads count 0 and the CPU refuses
+		// every slab.
+		if (VoxelBrickChunkRecordDwords != VOXEL_ZTIGHT_RECORD_DWORDS)
+		{
+			InterlockedAdd(GZtPhantoms, 1u);
+		}
+		else
+		{
+			const uint Base = Slot * VOXEL_ZTIGHT_RECORD_DWORDS;
+			const uint d0 = VoxelBrickChunkTable[Base + 0u];
+			const uint d1 = VoxelBrickChunkTable[Base + 1u];
+			const uint d2 = VoxelBrickChunkTable[Base + 2u];
+			const uint d3 = VoxelBrickChunkTable[Base + 3u];
+
+			// A ZEROED RECORD IS A FREED SLOT, THE NORMAL CASE, NOT A
+			// PHANTOM. Both free passes zero a retired record (the refine
+			// kernel's note); counting those as phantoms would swamp the
+			// debris signal this counter exists to carry.
+			if ((d0 | d1 | d2 | d3) != 0u)
+			{
+				const int3 RecOrigin = int3(asint(d0), asint(d1), asint(d2));
+				const uint RecLevel = d3 & VOXEL_ZTIGHT_REC_LEVEL_MASK;
+				// The validation ladder, the refine kernel's exactly:
+				//   * origin must be a chunk origin (ChunkCoord * 32);
+				//   * the level must map to a grid slot;
+				//   * the record must be THE TENANT of the cell its own
+				//     coordinate maps to (resident bit set, slot matches).
+				// Anything non-zero that fails any rung is DEBRIS and is
+				// counted, because the bound producer this replaces died of
+				// exactly this population (4.4x phantoms, degrading with
+				// session churn -- the autopsy's second disqualifier).
+				bool bPhantom = false;
+				bool bIsCover = false;
+				uint GridSlot = 0u;
+				if (any((RecOrigin & 31) != 0))
+				{
+					bPhantom = true;
+				}
+				else if (RecLevel < MarchZTightRingGrids)
+				{
+					GridSlot = RecLevel;
+				}
+				else if (RecLevel == MarchZTightCoverLevel)
+				{
+					// Cover has its own walk and the ring cascade never
+					// consults these slabs for it, so cover records fold
+					// into nothing -- counted so `live + cover + phantoms +
+					// zeroed == examined` stays a checkable identity on the
+					// CPU (zeroed by subtraction).
+					bIsCover = true;
+				}
+				else
+				{
+					bPhantom = true;
+				}
+
+				if (bIsCover)
+				{
+					InterlockedAdd(GZtCover, 1u);
+				}
+				else if (!bPhantom)
+				{
+					const uint Cell = VoxelMarchIndexCellCompute(
+						RecOrigin >> 5, MarchZTightDimChunks,
+						MarchZTightCellsPerLevel, GridSlot);
+					if (Cell >= MarchZTightCellCount)
+					{
+						bPhantom = true;
+					}
+					else
+					{
+						// THE TENANCY JOIN. A freed-then-reused slot's stale
+						// record is not the tenant of its cell; a live one
+						// is, by the scatter file's ordering argument (the
+						// index add for a chunk lands in the same flush as
+						// its record write, and this pass binds the same
+						// index snapshot the march binds).
+						const uint Entry = MarchZTightChunkIndex[Cell];
+						const bool bTenant =
+							(Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u &&
+							(Entry & VOXEL_MARCH_INDEX_SLOT_MASK) == Slot;
+						if (!bTenant)
+						{
+							bPhantom = true;
+						}
+						else
+						{
+							// A LIVE RECORD. anySolid is deliberately NOT
+							// consulted: a resident all-air chunk must widen
+							// the bound, because the skip test's debt fold
+							// and the shell-flag exactness argument both
+							// rest on "the removed span contains NOTHING
+							// resident" -- air included. Same semantics as
+							// GetResidentChunkZBound, tight instead of
+							// cumulative.
+							const int ChunkZ = RecOrigin.z >> 5;
+							const uint Enc = VoxelZTightEncodeZ(ChunkZ);
+							InterlockedMax(GZtMinInv[GridSlot], ~Enc);
+							InterlockedMax(GZtMaxEnc[GridSlot], Enc);
+							InterlockedAdd(GZtCount[GridSlot], 1u);
+							InterlockedAdd(GZtLive, 1u);
+						}
+					}
+				}
+
+				if (bPhantom)
+				{
+					InterlockedAdd(GZtPhantoms, 1u);
+				}
+			}
+		}
+	}
+
+	// ONE GLOBAL ATOMIC PER WORD PER GROUP, unconditional for the groups so
+	// "this group counted nothing" and "this group never reported" cannot be
+	// spelled the same way -- guarded per WORD on having seen anything, which
+	// skips the atomic without skipping the group.
+	GroupMemoryBarrierWithGroupSync();
+	if (LocalId < uint(VOXEL_ZTIGHT_RING_LEVELS))
+	{
+		if (GZtCount[LocalId] != 0u)
+		{
+			InterlockedMax(MarchZTightOut[VOXEL_ZTIGHT_WORD_MININV0 + LocalId],
+			               GZtMinInv[LocalId]);
+			InterlockedMax(MarchZTightOut[VOXEL_ZTIGHT_WORD_MAX0 + LocalId],
+			               GZtMaxEnc[LocalId]);
+			InterlockedAdd(MarchZTightOut[VOXEL_ZTIGHT_WORD_COUNT0 + LocalId],
+			               GZtCount[LocalId]);
+		}
+	}
+	if (LocalId == 0u)
+	{
+		if (GZtPhantoms != 0u)
+		{
+			InterlockedAdd(MarchZTightOut[VOXEL_ZTIGHT_WORD_PHANTOMS], GZtPhantoms);
+		}
+		if (GZtLive != 0u)
+		{
+			InterlockedAdd(MarchZTightOut[VOXEL_ZTIGHT_WORD_LIVE], GZtLive);
+		}
+		if (GZtCover != 0u)
+		{
+			InterlockedAdd(MarchZTightOut[VOXEL_ZTIGHT_WORD_COVER], GZtCover);
+		}
+		if (GZtExamined != 0u)
+		{
+			InterlockedAdd(MarchZTightOut[VOXEL_ZTIGHT_WORD_EXAMINED], GZtExamined);
+		}
+	}
+}

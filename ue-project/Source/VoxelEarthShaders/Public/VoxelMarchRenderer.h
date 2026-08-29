@@ -370,6 +370,17 @@ struct FVoxelMarchArm
 	// voxel.March.HalfRes, the third refused pairing, because ResShift is
 	// resolved per frame on the render thread and not visible here.
 	int32 Bound = 0;
+	// THE TIGHT RESIDENT-Z GATE (voxel.March.ZTight, the repaired ZCut). A
+	// PERMUTATION, default 0 -- byte-identical control, argued at the define
+	// in VoxelBrickTraverse.ush (what it removes is segment ENTRY, so a
+	// runtime branch would re-base the very term under test). Rings only
+	// (the gate lives at the top of the ring walk's rung body), forced 0
+	// without them. WINS THE CONFLICT WITH voxel.March.Bound: the pairing is
+	// refused at compile (two clamp arms folding into one absent-chunk debt
+	// are un-attributable, and the bound is retired per
+	// docs/marcher-cost-autopsy-2026-08-29.md), and VoxelMarchGetArm forces
+	// Bound off with a logged warning when both are asked for.
+	int32 ZTight = 0;
 	// THE RETRY LADDER GATE (voxel.March.SkyLadder). A permutation, unlike
 	// BlockSkyMode below: it puts a field on the chunk cache and a fold at five
 	// walk sites, so the control must not carry it. Forced false without rings
@@ -936,6 +947,38 @@ struct FVoxelMarchHoleStats
 	uint64 CellBrickOOB = 0;
 	uint64 CellReal = 0;
 	bool bCensusArmed = false;
+
+	// ---- the tight resident-Z gate (voxel.March.ZTight) --------------------
+	// Counted on EVERY hole-stats level, the Z bound's rule. bZTightArmed IS
+	// NOT THE CVAR (the arm is a permutation -- the block-skip rule, not the
+	// ZCut one): it is refreshed from the arm actually selected, so zeros
+	// with the flag FALSE are the arm being off, and zeros with it TRUE are
+	// the loud armed-and-inert case. The four words partition every
+	// consultation: consulted = SegSkipped + SegEntered + RetrySkipped +
+	// RetryEntered, own-level and retry rungs kept apart because "the
+	// segments never skip" and "the retries never skip" are different
+	// diagnoses (slab too wide vs ladder opening into populated levels).
+	uint64 ZTightSegSkipped = 0;
+	uint64 ZTightSegEntered = 0;
+	uint64 ZTightRetrySkipped = 0;
+	uint64 ZTightRetryEntered = 0;
+	bool bZTightArmed = false;
+
+	// ---- the wave-occupancy census (family A's falsifier) ------------------
+	// Compiled with hole stats wherever the engine's wave-op macros allow
+	// (VOXEL_MARCH_WAVE_CENSUS in VoxelBrickTraverse.ush); there is no
+	// separate arm. Samples == 0 on a hole-stats window is NOT MEASURED
+	// (wave ops unavailable, or no walk sampled), never "no divergence".
+	// WaveLaneCount is a MAXIMUM (the kernel writes it with InterlockedMax,
+	// the landing accumulates it with Max -- the HeightLateMaxUU spelling):
+	// it is the wave width the kernel actually compiled to, and it is the
+	// denominator the two means are judged against -- mean near the width =
+	// divergence is NOT the problem, family A dies; low = it lives.
+	uint64 WaveChunkActiveSum = 0;
+	uint64 WaveChunkSamples = 0;
+	uint64 WaveCellActiveSum = 0;
+	uint64 WaveCellSamples = 0;
+	uint64 WaveLaneCount = 0;
 };
 
 // Drains the accumulated window (the GetAndReset pattern the 5 s perf log
@@ -1746,6 +1789,56 @@ public:
 		int32 ArmLevel = 0;
 	};
 	FHoleReadback HoleRing[kNumHoleReadbacks];
+
+	// THE TIGHT RESIDENT-Z REDUCE'S READBACK RING (voxel.March.ZTight). Its
+	// own ring, not the hole ring, for the standing reason: different cvar,
+	// different buffer, different landing consumer -- and this one is not a
+	// counter window at all, it is the ARM'S INPUT. Three slots absorb the
+	// GPU running 1-3 frames behind; a frame with no free slot simply keeps
+	// consuming the previous landed snapshot, which the staleness gate at the
+	// fill site prices (a snapshot older than the age cap refuses every
+	// slab -- lost benefit, never a hole).
+	static constexpr int32 kNumZTightReadbacks = 3;
+	// 7 ring levels -- the same count VoxelMarchHoleWord::kNumLevels names,
+	// reused rather than respelled so the two move together.
+	static constexpr int32 kZTightLevels = VoxelMarchHoleWord::kNumLevels;
+	struct FZTightReadback
+	{
+		TUniquePtr<FRHIGPUBufferReadback> Readback;
+		bool bInFlight = false;
+	};
+	FZTightReadback ZTightRing[kNumZTightReadbacks];
+	// One landed reduce, decoded. Count[L] == 0 means level L held no live
+	// validated record in that frame's table and MUST be refused a slab --
+	// the min/max fields are then meaningless sentinels, and bValid does not
+	// vouch for them; only Count does, per level. Under Lock.
+	struct FZTightSnapshot
+	{
+		int32 MinZ[kZTightLevels] = {};   // tight chunk-Z, unpadded
+		int32 MaxZ[kZTightLevels] = {};   // inclusive, unpadded
+		uint32 Count[kZTightLevels] = {}; // live validated records at L
+		uint32 Phantoms = 0;              // non-zero records that failed validation
+		uint32 Live = 0;
+		uint32 Cover = 0;
+		uint32 Examined = 0;              // must equal the dispatch's slot count
+		uint64 LandFrame = 0;             // GFrameCounterRenderThread at landing
+		bool bValid = false;
+	};
+	// The newest landed reduce -- ALSO the drift check's baseline: each
+	// landing is compared against this before replacing it, so no second
+	// copy exists to fall out of step with the one being served.
+	FZTightSnapshot ZTightLanded;
+	// THE SETTLE GATE. Non-zero refuses every slab; set to the settle cvar on
+	// arming, on the first landing, and whenever a landing's bounds moved
+	// outward past the pad since the previous landing (a discontinuity: cold
+	// fill, teleport, a cliff crossing the ring edge). Decremented once per
+	// fill while the arm is on. This is the CPU-side gate the pad argument
+	// leans on for everything beyond one interval's ordinary drift.
+	int32 ZTightSettleFramesLeft = 0;
+	uint64 ZTightDiscontinuities = 0; // cumulative since boot, for the log
+	uint64 ZTightLandings = 0;        // cumulative landings, for the log
+	uint64 ZTightPhantomsCum = 0;     // cumulative phantom records, for the log
+
 	// Accumulated under Lock as readbacks land; drained by
 	// VoxelMarchGetAndResetHoleStats (bArmed is filled at drain, from the arm).
 	FVoxelMarchHoleStats HoleWindow;

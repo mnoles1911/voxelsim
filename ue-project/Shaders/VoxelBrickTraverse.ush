@@ -680,6 +680,28 @@
 #define VOXEL_MARCH_BOUND 0
 #endif
 
+// THE TIGHT RESIDENT-Z GATE (voxel.March.ZTight) -- the repaired ZCut. A
+// PERMUTATION, default 0, and 0 is the byte-identical control: every token of
+// the arm below is under this define, so the control carries no statics, no
+// per-segment mads and no branch. It is a permutation and not a uniform
+// DESPITE adding no memory traffic (ZCut's argument for being a uniform),
+// because what it removes is SEGMENT ENTRY itself -- the ~0.67 us/ray setup
+// term the autopsy isolated (docs/marcher-cost-autopsy-2026-08-29.md) -- and
+// a runtime-branched version would leave the test's mads and the wrapper
+// branch in the control's prologue, re-basing the very term under test.
+//
+// REFUSED AGAINST voxel.March.Bound, at compile here and at the cvar site:
+// two clamp arms folding into the same absent-chunk debt are UN-ATTRIBUTABLE
+// -- a hole or a saving on a both-armed leg cannot be billed to either -- and
+// the bound is a retired arm besides (the autopsy's two disqualifiers). The
+// host forces Bound off with a warning when both are asked for.
+#ifndef VOXEL_MARCH_ZTIGHT
+#define VOXEL_MARCH_ZTIGHT 0
+#endif
+#if VOXEL_MARCH_ZTIGHT && VOXEL_MARCH_BOUND
+#error "VOXEL_MARCH_ZTIGHT cannot be compiled with VOXEL_MARCH_BOUND: both arms clamp the same ring segments and fold removals into the same bCrossedAbsentChunk debt, so no counter or timing on a both-armed leg can be attributed to either. The bound is also a retired arm (docs/marcher-cost-autopsy-2026-08-29.md). Run one arm or the other."
+#endif
+
 // THE HOLE METRIC (voxel.March.HoleStats). Counts, per frame, on the shipping
 // kernel: rays marched, rays that hit, hits that came from a level COARSER
 // than the segment that owns that ground (`substituted`), and misses that
@@ -1720,6 +1742,39 @@ int MarchZCutEnable;
 // costs an empty slot nothing it was not already paying.
 int4 MarchLevelChunkZ[8];
 
+#if VOXEL_MARCH_ZTIGHT
+// ---- THE TIGHT RESIDENT-Z SLABS (voxel.March.ZTight) -----------------------
+//
+// One float4 per INDEX GRID SLOT, mirroring MarchLevelChunkZ's [8] shape (the
+// cover slot is never given a usable slab -- its walk is not ring-gated):
+//
+//   .x  slab LOW face, LOCAL UU -- the same space OriginLocalUU lives in
+//   .y  slab HIGH face, LOCAL UU
+//   .z  non-zero = usable; 0 = DO NOT GATE THIS SLOT
+//   .w  unused, 0
+//
+// ALREADY IN UU, ALREADY PADDED, ON THE HOST -- and both choices are the
+// point. UU because the hoisted test below runs BEFORE VoxelMarchBeginLevel,
+// so VoxelMarchOriginVoxel() (the one authority for the level-L origin) is
+// not yet set for this rung and a chunk-space compare here would need a
+// second spelling of the >> L origin -- the exact doctrine-5 shape that
+// pinned this file to level 0 once already. The host instead converts with
+// the SAME arithmetic BeginLevel uses (the frame origin is 1024-voxel
+// snapped, so >> L is exact) and pushes finished faces: the kernel pays two
+// mads and two compares per rung, zero loads, zero registers held across the
+// walk -- the bound arm's per-ray register array is the corpse this design
+// steps over. Padding on the host keeps ONE place the pad can be forgotten
+// (the ZCut rule); its composition -- readback latency, admission drift, the
+// Danskin & Hanrahan float margin -- is argued at the fill site in
+// VoxelMarchRenderer.cpp, not here.
+//
+// .z == 0 FOR AN EMPTY OR UNPROVEN SLOT, and the host writes 0 whenever the
+// reduce's readback is missing, stale, still settling after a bounds
+// discontinuity, or reported zero live records at the level -- refusing to
+// gate is the conservative direction and costs exactly what today costs.
+float4 MarchZTightSlabUU[8];
+#endif
+
 #if VOXEL_MARCH_BOUND
 // ---- THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound) -----------------
 //
@@ -1977,6 +2032,67 @@ static uint GVoxelMarchRayChunkIters = 0u;     // every chunk-loop iteration, al
 static uint GVoxelMarchRayChunkItersPre = 0u;  // iterations before the walk's first resident chunk
 static uint GVoxelMarchRayChunkItersPost = 0u; // trailing iterations of walks that ended without a hit
 static uint GVoxelMarchRayTermChunkCap = 0u;   // 0/1: some walk of this ray ended TERM_CHUNK_CAP
+#endif
+
+#if VOXEL_MARCH_ZTIGHT && VOXEL_MARCH_HOLE_STATS
+// ---- THE TIGHT GATE'S ENGAGEMENT COUNTERS (voxel.March.ZTight) -------------
+//
+// Statics and not FVoxelMarchHit fields, following the Stage 0a census and
+// the bound's group for their shared reason: they accumulate across every
+// rung of every segment and the walk struct is overwritten per rung. Folded
+// in VoxelMarch.usf from the PRE-FALSIFIER SNAPSHOT (the bound's discipline:
+// the verify walk re-runs the ring loop and would double every counter on
+// verify-armed legs).
+//
+// FOUR WORDS, PARTITIONING EVERY CONSULTATION EXACTLY -- a rung where the
+// arm was on and the slot had a usable slab either skipped or entered, at
+// its own level or as a retry:
+//   ztSegSkipped / ztSegEntered      rung 1 (WalkL == SegL) decisions
+//   ztRetrySkipped / ztRetryEntered  retry rungs (WalkL > SegL)
+// consulted = the sum of all four; consulted == 0 while voxel.March.ZTight
+// reads 1 is ARMED AND INERT, the house failure, and the stats line words it
+// as such. ztRetryEntered is not in the task's three-counter list; it exists
+// because without it "retries skipped" has no denominator and inert-vs-null
+// on the retry path would be unreadable -- the same ambiguity ZCut's trio
+// refuses. DECISIONS, NOT NANOSECONDS: the saving is VoxelMarch.March from
+// ProfileGPU and nothing else.
+static uint GVoxelMarchZtSegSkipped = 0u;
+static uint GVoxelMarchZtSegEntered = 0u;
+static uint GVoxelMarchZtRetrySkipped = 0u;
+static uint GVoxelMarchZtRetryEntered = 0u;
+#endif
+
+// ---- THE WAVE-OCCUPANCY CENSUS (family A's falsifier) ----------------------
+//
+// The autopsy's arm A: the down-pose +2.32 ms consult anomaly and the
+// residual in-span cost may be WAVE DIVERGENCE, and this census is the
+// one-day kill test. mean active lanes near the wave width = divergence is
+// NOT the problem and family A dies; low = it lives. Two sample points,
+// because chunk-loop and cell-loop divergence are different diagnoses:
+// GVoxelMarchWaveChunk* sample the chunk loop, GVoxelMarchWaveCell* the leaf
+// DDA.
+//
+// WaveActiveCountBits(true) and WaveIsFirstLane are SM6 wave intrinsics and
+// both are LEGAL IN DIVERGENT CONTROL FLOW -- they answer over the currently
+// active lanes, which is exactly the population being measured. Only the
+// FIRST ACTIVE LANE accumulates (count once per wave-sample, not once per
+// lane), so sum/samples is the exact mean and never the sum of squares.
+// Gated on the engine's wave-capability macros so a platform without them
+// compiles the census out; samples == 0 on a hole-stats leg then reads NOT
+// MEASURED, never "no divergence".
+#ifndef COMPILER_SUPPORTS_WAVE_ONCE
+#define COMPILER_SUPPORTS_WAVE_ONCE 0
+#endif
+#ifndef COMPILER_SUPPORTS_WAVE_VOTE
+#define COMPILER_SUPPORTS_WAVE_VOTE 0
+#endif
+#define VOXEL_MARCH_WAVE_CENSUS \
+	(VOXEL_MARCH_HOLE_STATS && COMPILER_SUPPORTS_WAVE_ONCE && COMPILER_SUPPORTS_WAVE_VOTE)
+#if VOXEL_MARCH_WAVE_CENSUS
+static uint GVoxelMarchWaveChunkSum = 0u;      // sum of active-lane counts, chunk loop
+static uint GVoxelMarchWaveChunkSamples = 0u;  // wave-samples taken there
+static uint GVoxelMarchWaveCellSum = 0u;       // sum of active-lane counts, leaf DDA
+static uint GVoxelMarchWaveCellSamples = 0u;   // wave-samples taken there
 #endif
 
 void VoxelMarchBeginLevel(uint Level)
@@ -3479,6 +3595,19 @@ bool VoxelMarchWalkCellsInBrick(float3 OriginLocalUU, float3 Dir, float TStart, 
 	[loop]
 	for (int i = 0; i < 32; ++i)
 	{
+#if VOXEL_MARCH_WAVE_CENSUS
+		// THE LEAF-DDA HALF OF THE WAVE CENSUS -- the same sample the chunk
+		// loop takes, at the same 16-iteration stride (which, against this
+		// loop's 32-step cap, means the entry step and step 16: entry
+		// dominates, and entry is where in-span divergence would live).
+		// Separate words from the chunk loop's because chunk-loop and
+		// cell-loop divergence are different diagnoses with different fixes.
+		if ((uint(i) & 15u) == 0u && WaveIsFirstLane())
+		{
+			GVoxelMarchWaveCellSum += WaveActiveCountBits(true);
+			GVoxelMarchWaveCellSamples += 1u;
+		}
+#endif
 		int axis;
 		if (tMax[0] <= tMax[1] && tMax[0] <= tMax[2])      { axis = 0; }
 		else if (tMax[1] <= tMax[2])                       { axis = 1; }
@@ -3652,6 +3781,17 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 		// the two sites that know it (the block-skip jump, the post-lookup
 		// branch) each tally their own case below.
 		++GVoxelMarchRayChunkIters;
+#endif
+#if VOXEL_MARCH_WAVE_CENSUS
+		// THE WAVE-OCCUPANCY SAMPLE, at the TOP of the chunk loop, every 16th
+		// iteration -- cheap enough to leave under hole stats, frequent enough
+		// that a 512-cap walk contributes up to 32 samples. First active lane
+		// only, so sum/samples is the exact mean (see the statics' block).
+		if ((uint(ci) & 15u) == 0u && WaveIsFirstLane())
+		{
+			GVoxelMarchWaveChunkSum += WaveActiveCountBits(true);
+			GVoxelMarchWaveChunkSamples += 1u;
+		}
 #endif
 		const float3 P = OriginLocalUU + SafeDir * t;
 		const int3 LocalVoxel = (int3)floor(P / VOXEL_FLUID_VOXEL_UU);
@@ -4415,6 +4555,25 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	uint RayBlockSkyRuns = 0u;
 #endif
 #endif
+	// ---- RESERVE (arm B, NOT IMPLEMENTED -- design note only): temporal ----
+	// tStart from last frame's own MarchHitT. Reproject this pixel into last
+	// frame's MarchOutHitT (the buffer already exists and is one texture
+	// read), take the neighbourhood MINIMUM of the reprojected hit distances
+	// minus a safety margin, and clamp TMinUU up to it -- entering the
+	// cascade at max(TMinUU, tStart) so every segment fully in front of it is
+	// rejected by the existing `SegOut <= SegIn` guard BEFORE any rung runs:
+	// zero producer, zero per-level state, and it removes ENTRIES, which is
+	// the term that matters (cost model above). SAFETY ARGUMENT: a
+	// neighbourhood-min over hits is conservative-early by construction for
+	// any surface visible last frame; disocclusions and misses must decode as
+	// "no bound" (start at TMinUU), never as a large tStart -- absence reads
+	// as air is this project's house hazard and a miss texel here is exactly
+	// an absence. Camera cuts / teleports gate it off for a frame, the
+	// half-res jitter lattice moves the sample point and must be compensated
+	// or refused (the bound's HALFRES refusal argument), and the margin must
+	// absorb one frame of camera translation along the ray. RESERVE PENDING
+	// ZTIGHT RESULTS: it only pays if in-span prefix work still matters after
+	// arm C, per the autopsy's ordering. Do not build it before that reading.
 	[loop]
 	for (uint SegL = 0; SegL < RingCount; ++SegL)
 	{
@@ -4425,6 +4584,21 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			continue;
 		}
 		EnteredMask |= (1u << SegL);
+
+#if VOXEL_MARCH_ZTIGHT
+		// THE SEGMENT'S Z-SPAN, ONCE PER SEGMENT -- two mads, the OLD ZCut
+		// shader's own arithmetic lifted above the rung ladder: the span over
+		// [SegIn, SegOut] is level-independent (SegIn/SegOut are ray
+		// parameters in world UU and the ladder re-derives WalkIn from SegIn
+		// on every rung), so only the per-level SLAB changes per rung, never
+		// this pair. DirWorld is normalised -- the ring scale above depends
+		// on exactly that -- so t and UU are the same unit and no rescale is
+		// owed here.
+		const float ZtSegZA = OriginLocalUU.z + DirWorld.z * SegIn;
+		const float ZtSegZB = OriginLocalUU.z + DirWorld.z * SegOut;
+		const float ZtSegZMinUU = min(ZtSegZA, ZtSegZB);
+		const float ZtSegZMaxUU = max(ZtSegZA, ZtSegZB);
+#endif
 
 #if VOXEL_MARCH_FALLTHROUGH > 0
 		// The retry ladder: this segment at its own level first, then up to
@@ -4441,6 +4615,93 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 		const uint WalkL = SegL;
 #endif
 		{
+#if VOXEL_MARCH_ZTIGHT
+			// ===========================================================
+			// THE TIGHT RESIDENT-Z GATE (voxel.March.ZTight), HOISTED
+			// ABOVE EVERY PIECE OF RUNG SETUP
+			// ===========================================================
+			//
+			// THE PLACEMENT IS THE ENTIRE ARM. The autopsy
+			// (docs/marcher-cost-autopsy-2026-08-29.md) isolated the sky
+			// frame's cost to SEGMENT ENTRY: ~0.67 us/ray (~2,000 cycles)
+			// of setup, paid up to 14 times (7 rings x 2 rungs), a linear
+			// ~0.9 ms per ring -- while proven interior skips saved +0.11
+			// on 5.77 ms, because the bound's collapse ran INSIDE the walk
+			// and "still calls the walk" still pays setup, by its own
+			// design comment. So this test runs BEFORE VoxelMarchBeginLevel,
+			// before the 2^L rescale, before the ZCut block, before the
+			// walk call: a rejected rung executes two compares and the
+			// debt fold below and NOTHING ELSE. The retry rungs pass
+			// through this same test at THEIR level (it is the top of the
+			// rung body, and the ladder's coarser rungs re-enter here), so
+			// a fallthrough retry's setup is skippable too -- the second
+			// half of the 14x multiplier.
+			//
+			// WHY THIS INPUT IS ALLOWED WHERE ZCut's WAS REFUTED: the slab
+			// is the per-frame TIGHT extent of validated, index-tenanted
+			// records (VoxelMarchZTight.usf carries the phantom rule and
+			// the tenancy-exactness argument), not the never-narrowing
+			// cumulative union with 819 m pads that made ZCut skip 0.00%
+			// at the horizon.
+			//
+			// HOLE-SAFETY DOCTRINE. Absence-is-not-air does NOT apply to
+			// this removal, by the bound's own unreachable-by-a-hit
+			// argument: a hit needs Chunk.bValid, which only a live,
+			// index-tenanted record at level WalkL can grant, and the slab
+			// is the z-extent of exactly that population (plus outward
+			// pads). A z-span disjoint from it cannot contain a
+			// validatable chunk, whatever the terrain truth. The pads are
+			// OUTWARD ONLY (readback latency + admission drift + the
+			// Danskin & Hanrahan float margin -- composed and argued at
+			// the host fill site), and the host refuses the slab entirely
+			// (.z == 0) whenever its provenance is in doubt: no readback
+			// yet, stale, settling after a bounds discontinuity, or zero
+			// live records at the level. The one residual window -- a
+			// chunk admitted beyond pad reach inside a single readback
+			// interval -- is bounded to that interval, detected by the
+			// host's discontinuity gate on the next landing, and the debt
+			// fold below keeps the retry ladder open over the removed span
+			// meanwhile, so a coarser resident stand-in still draws where
+			// one exists. `uncovered` / `uncShell` rising against the
+			// control on the same pose is the refutation reading, and it
+			// outranks every millisecond here.
+			//
+			// A HORIZONTAL RAY NEEDS NO SPECIAL CASE, unlike ZCut's
+			// divide: the span above degenerates to the ray's own height
+			// at both ends and the compare answers inside/outside
+			// directly. No divide, no parallel-case sign artefact.
+			bool bZTightRemoved = false;
+			{
+				const float4 ZtSlab = MarchZTightSlabUU[WalkL];
+				if (ZtSlab.z != 0.0f)
+				{
+					bZTightRemoved =
+						(ZtSegZMaxUU < ZtSlab.x) || (ZtSegZMinUU > ZtSlab.y);
+#if VOXEL_MARCH_HOLE_STATS
+					// The engagement partition -- own-level and retry
+					// decisions kept apart (see the statics' block). Counted
+					// AT THE DECISION, whichever way it went, so
+					// skipped + entered is the exact denominator.
+					if (WalkL == SegL)
+					{
+						GVoxelMarchZtSegSkipped += bZTightRemoved ? 1u : 0u;
+						GVoxelMarchZtSegEntered += bZTightRemoved ? 0u : 1u;
+					}
+					else
+					{
+						GVoxelMarchZtRetrySkipped += bZTightRemoved ? 1u : 0u;
+						GVoxelMarchZtRetryEntered += bZTightRemoved ? 0u : 1u;
+					}
+#endif
+				}
+			}
+			if (!bZTightRemoved)
+			{
+			// (The rung body below is UNTOUCHED and deliberately not
+			// re-indented: with VOXEL_MARCH_ZTIGHT 0 this wrapper does not
+			// exist and the control is byte-identical; re-indenting several
+			// hundred lines would make that claim unreviewable.)
+#endif
 			VoxelMarchBeginLevel(WalkL);
 			// 2^L. The ray goes in divided; the hit comes back multiplied.
 			const float S = float(1u << WalkL);
@@ -5085,6 +5346,103 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			if (!bGateOpen)
 			{
 				break;
+			}
+#endif
+#if VOXEL_MARCH_ZTIGHT
+			}
+			else
+			{
+				// ===================================================
+				// THE SKIPPED RUNG PAYS ITS DEBT -- WITHOUT THE WALK
+				// ===================================================
+				//
+				// The rung above was never entered: no BeginLevel, no H,
+				// no fold sites ran. Everything the control's walked rung
+				// would have left behind is synthesized here, and each
+				// piece carries its own exactness argument.
+				//
+				// bAnyAbsent (-> Miss.bCrossedAbsentChunk): EXACT, the
+				// ZCut fold's argument one step stronger. The slab
+				// contains every chunk a hit could validate against at
+				// level WalkL (see the doctrine above), so every chunk in
+				// the removed span is non-resident-or-untenanted, and the
+				// control's walk -- which crosses at least the segment's
+				// start chunk, `SegOut <= SegIn` having already been
+				// excluded -- would have set the flag at its own
+				// `if (!Chunk.bValid)` site on its FIRST iteration.
+				// (Had the control's ZCut emptied the interval first, its
+				// own bZCutRemoved fold sets the same bit. Either way the
+				// control reports TRUE here.)
+				//
+				// bAnyShellAbsent: NOT SET, and that is EXACT, not an
+				// omission. The host pad is clamped >= 2 chunks, so every
+				// removed chunk sits at least pad+1 >= 3 chunks in Z
+				// outside the snapshot's resident extent and >= 2 outside
+				// it even after one interval's tolerated drift --
+				// VoxelMarchAbsentTouchesShell probes face-adjacency,
+				// which reaches exactly 1. The control's walk would have
+				// answered FALSE for every removed chunk (ZCut's own
+				// shell argument, same pad discipline).
+				//
+				// The HOLE_STATS >= 2 attribution capture requires a shell
+				// crossing (H.bCrossedShellAbsent) and so captures nothing
+				// on the control's rung either: nothing to synthesize.
+				//
+				// A SEPARATE FLAG FROM bZCutRemoved / bBoundRemoved by
+				// construction -- this branch IS the flag -- so the arms
+				// stay A/B-able (ZCut's two-knobs-two-claims rule; the
+				// Bound pairing is refused at compile outright).
+				bool bZTightDebt = bZTightRemoved; // named for the grep;
+				                                   // true on this branch
+#if VOXEL_MARCH_TRACK_ABSENT
+				bAnyAbsent = bAnyAbsent || bZTightDebt;
+#endif
+#if VOXEL_MARCH_FALLTHROUGH > 0
+				// THE LADDER'S GATE, SYNTHESIZED PER CONFIGURATION:
+				//
+				//   shell gate: the control reads bCrossedShellAbsent,
+				//   which is exactly FALSE here (above), so the control
+				//   BREAKS -- and so does this arm. Exact.
+				//
+				//   sky gate: the control reads absent && (nonSkyAbsent ||
+				//   truncated). ZCut's precedent folds its removals into
+				//   bCrossedNonSkyAbsent CONSERVATIVELY ("the cut removes
+				//   an interval without consulting any cell in it, so
+				//   nothing here has proved anything about those chunks");
+				//   the same argument applies verbatim, so this arm opens
+				//   the ladder UNCONDITIONALLY on removal -- which can
+				//   only retry MORE than a control whose air was
+				//   sky-proven: more coarse walks, never fewer fills.
+				//   Safe for holes, costs time, and the ztRetry* counters
+				//   price it.
+				//
+				//   plain gate: the control reads bCrossedAbsentChunk,
+				//   argued TRUE above. Open. Exact.
+				//
+				// The retry rung this opens re-enters the hoisted test at
+				// ITS level before ITS setup -- the task's rung-2
+				// requirement -- so a whole ladder of empty levels costs
+				// two compares per rung, total.
+#if VOXEL_MARCH_HOLE_STATS
+				// Proof-of-traffic bookkeeping, the control's guard
+				// exactly (WalkL < LastWalkL: the top rung is offered no
+				// gate and must not pad the denominator).
+				if (WalkL < LastWalkL)
+				{
+					RayFtConsidered += 1u;
+#if !VOXEL_MARCH_FALLTHROUGH_SHELL
+					RayFtTaken += 1u;
+#endif
+				}
+#endif
+#if VOXEL_MARCH_FALLTHROUGH_SHELL
+				break;
+#endif
+				// Non-shell gates: fall out of the rung body; the ladder
+				// advances to the next WalkL (or ends at LastWalkL and the
+				// segment loop moves on) -- the same control flow an open
+				// gate takes.
+#endif
 			}
 #endif
 		}
