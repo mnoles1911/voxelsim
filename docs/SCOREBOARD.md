@@ -609,9 +609,13 @@ judging stills, not editor flights, for now. Programme: docs/hundred-fps-2026-08
 "All 3 of those screen captures look the same" (the resolution stills).
 
 **SHIPPED:**
-- `r.ScreenPercentage=50` (DefaultEngine.ini, commit 62a2ce5): p95 103.6 fps,
-  p50 145, on matched legs; owner-judged stills. Flag-free confirmation leg
-  pending the next box cycle. Standing check: one ordinary flight for shimmer.
+- `r.ScreenPercentage=50` (DefaultEngine.ini, 62a2ce5; CORRECTED
+  docs/res50-correction-2026-08-29.md): ships and stays -- ~2.1 ms at p95 vs
+  auto-61% -- but the 103.6 fps p95 claim is RETRACTED (it came from the one
+  truncated moving sample in the sweep, n=1,497). Full exposure x3: p95
+  ~10.9 ms (92 fps), p50 143. Flag-free confirmation PASSED (ini alone gives
+  view=1280x720; ini vs flag identical). >100 fps p95 needs the game-thread
+  tail, not resolution. Standing check: one ordinary flight for shimmer.
 - VelocityLead 4.0 s / clamp 240 m (1e75c7b): +7% adoption supply, zero waste.
 
 **THE MARCHER DRAWING BOARD, run to completion** (docs/marcher-cost-autopsy-
