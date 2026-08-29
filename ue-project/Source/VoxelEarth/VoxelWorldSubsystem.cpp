@@ -345,6 +345,37 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasPrefetchAhead(
 	TEXT("atlas window line's demand rescued=/capHit= collapsing and the submit split's ")
 	TEXT("maxRaster falling to single digits. Engagement: the same line's prefetch group."),
 	ECVF_Default);
+// ARM 3, AND THE SHAPE THE OTHER TWO NAMED. Both arms above pay EARLY and both
+// came out NULL on stutterPct, for the reason dd4ee9e wrote down at the time:
+// "the worst frames batch MANY cold footprints at once, which a per-tick
+// trickle cannot pre-clear". This one adds no work at all -- it SPREADS the
+// burst, holding the excess cold submits of one tick over into later ticks. It
+// is built only because its own pre-registered coverage proof passed first:
+// docs/cold-burst-census-2026-08-29.md. The arm site is in DispatchJobs, beside
+// the per-ring requeue array it defers into.
+static TAutoConsoleVariable<int32> CVarVoxelStreamColdShadingCapPerTick(
+	TEXT("voxel.Stream.ColdShadingCapPerTick"), 0,
+	TEXT("Maximum COLD dispatch shadings -- four-column amplifier samples paid inline on the ")
+	TEXT("game thread at GPU submit -- that one streaming tick may pay before further cold ")
+	TEXT("submits WAIT for a later tick. 0 = off and the default; 4-8 is the intended arm. ")
+	TEXT("THE CENSUS THAT SIZED IT (docs/cold-burst-census-2026-08-29.md, leg COLDCENSUS-a): ")
+	TEXT("maxPerTick 85-97 in EVERY flight window at 0.33-0.59 ms per cold sample -- that ")
+	TEXT("burst IS the 43-52 ms reqHdr single frame, sized directly rather than inferred. ")
+	TEXT("HOLE-SAFE BY CONSTRUCTION, NOT BY TUNING: only a submit whose chunk already has a ")
+	TEXT("COARSER-level ancestor resident and holding terrain may be deferred, because that ")
+	TEXT("ancestor is exactly what the marcher draws while the fine submit waits; a cold ")
+	TEXT("submit with nothing coarser over it (holeRisk, 0-5 percent of colds) pays its ")
+	TEXT("sample and goes through whatever the cap says, counted as capExempt=. THE HONEST ")
+	TEXT("TRADE at cap 4-8 against a 90-burst is 10-20 ticks of deferral at the tail ")
+	TEXT("(~150-300 ms at flight tick rates) during which the coarser level shows -- bounded ")
+	TEXT("mip-pop in place of a 50 ms hitch, and substituted= is that trade's receipt rather ")
+	TEXT("than a failure. GATES, PRE-REGISTERED: stutterPct falls materially toward 0.10, ")
+	TEXT("maxReqHdr leaves the tens-of-ms band, p95/p99 not worse, uncovered not rising -- ")
+	TEXT("any one moving the wrong way refutes, default stays 0. ENGAGEMENT, readable off ")
+	TEXT("the cold-burst census line alone: deferred= in the hundreds and maxPerTick ")
+	TEXT("collapsing toward the cap. deferred=0 on an armed leg with the 17+ histogram ")
+	TEXT("bucket still non-zero means the arm is INERT and no verdict may be read."),
+	ECVF_Default);
 
 // Forward declaration at GLOBAL scope, deliberately outside the anonymous
 // namespace below: FSharedColumnGridCache (inside it) reads its capacity from
@@ -7493,12 +7524,55 @@ struct FVoxelWorldImpl
 	// Creates the runner on first use and returns it. Null only if the RHI
 	// cannot support it, which is checked once.
 	FVoxelGpuMeshJobManager* EnsureGpuMeshJobs();
+	// --- THE COLD-SHADING VERDICT, ASKED ONCE PER SUBMIT --------------------
+	//
+	// The two predicates that BOTH the cold-burst census tap (inside
+	// SubmitGpuMeshJob) and the demand-side cap (voxel.Stream.ColdShadingCapPerTick,
+	// armed in DispatchJobs) need, carried by value so neither can drift from
+	// the other and neither pays twice for the same probe. Filled by
+	// ProbeColdShading, whose definition sits beside
+	// ColdShadingCoveredByCoarserAncestor -- the coverage doctrine is there.
+	//
+	// ASKING TWICE WOULD BE WORSE THAN WASTEFUL, not merely slower:
+	// WouldSampleForDispatch is exact only BEFORE the sample ("a cold report is
+	// a statement about the state the call FOUND"), so a second ask made after
+	// the first has sampled answers WARM for a call that was cold.
+	struct FColdShadingVerdict
+	{
+		// false = nobody asked. A callee handed an unprobed verdict must probe
+		// for itself; a callee handed a probed one must NOT re-probe. This is
+		// also what keeps a cap of 0 byte-identical: nothing arms, nothing
+		// probes early, and SubmitGpuMeshJob asks exactly the question it
+		// asked before.
+		bool bProbed = false;
+		// VoxelApplyFast::WouldSampleForDispatch: this submit WILL pay the
+		// four-column amplifier sample on the game thread.
+		bool bCold = false;
+		// A COARSER-level ancestor is resident and HoldsTerrain right now, so
+		// the marcher already draws this ground and the fine submit may wait.
+		// Only asked when bCold; false and meaningless otherwise.
+		bool bCoverable = false;
+	};
+	// Const because it only reads: the shading cache's own slot table (through
+	// VoxelApplyFast) and ChunkRecords. An instrument that becomes what it
+	// measures is a recorded failure on this exact path.
+	FColdShadingVerdict ProbeColdShading(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const;
+
 	// Builds the region request for one level-0 chunk and hands it to the
 	// runner. Returns false if the fork could not take the chunk, in which case
 	// the caller MUST fall through to the CPU path -- the counters have already
 	// been incremented and something owes a result.
+	//
+	// THERE IS NO "DEFER" RETURN AND THERE MUST NOT BE. False means fall
+	// through to the CPU worker, which is a producer change, not a delay; the
+	// cold-shading cap therefore decides in the CALLER, before anything is
+	// claimed, and hands its already-taken verdict down through PrecomputedCold
+	// so the census tap here does not re-ask (see FColdShadingVerdict above).
+	// A null or unprobed PrecomputedCold means "ask for yourself", which is
+	// every other call site and every leg with the cap off.
 	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
-	                      uint8 RingSkirtMask, bool bSpeculative = false);
+	                      uint8 RingSkirtMask, bool bSpeculative = false,
+	                      const FColdShadingVerdict* PrecomputedCold = nullptr);
 	// Delivery callback. Game thread, from inside Tick().
 	void OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult);
 
@@ -8679,10 +8753,17 @@ struct FVoxelWorldImpl
 	// THE COLD-BURST CENSUS (docs/hundred-fps-2026-08-28.md goal 3b)
 	// ===================================================================
 	//
-	// MEASUREMENT ONLY. Nothing in this block gates, defers, reorders or caps
-	// anything; every member here is written from a `++` and read from one log
-	// line. See the fold site (beside ++AccumTicks) for the doctrine and the
-	// decision rule these numbers exist to settle.
+	// MEASUREMENT ONLY WITH THE CAP OFF -- which is the default and was the
+	// state of every census leg. Every member here is written from a `++` and
+	// read from one log line, with ONE exception now that the census's verdict
+	// has been acted on: ColdShadingsThisTick is also READ by
+	// voxel.Stream.ColdShadingCapPerTick, which is the tick budget the cap
+	// spends. With that cvar at 0 nothing reads it and this block measures the
+	// uncapped world exactly as it did; with it armed, the census necessarily
+	// describes the CAPPED world (maxPerTick collapses toward the cap by
+	// construction) and the arm's own counters at the bottom of this block are
+	// what carry the cost side. See the fold site (beside ++AccumTicks) for the
+	// doctrine and the decision rule these numbers exist to settle.
 	//
 	// WHAT THEY MEASURE. reqHdr above prices the cold shading in milliseconds;
 	// it cannot say how many cold shadings land in the SAME tick, and that
@@ -8719,6 +8800,41 @@ struct FVoxelWorldImpl
 	// coarser covers this ground; deferring it is a visible black arc.
 	int64 ColdCoverableSinceLog = 0;
 	int64 ColdHoleRiskSinceLog = 0;
+	// --- THE CAP'S OWN RECEIPTS (voxel.Stream.ColdShadingCapPerTick) --------
+	//
+	// Everything above prices the world the cap was designed against; these are
+	// what an ARMED leg is judged on, and they are on the same line so that
+	// engagement is readable without cross-referencing a second one. All three
+	// are counted at the ++ site, in the two dispatch loops, never inferred.
+	//
+	// A submit that WOULD have paid a cold sample this tick, whose chunk was
+	// coverable, and that the cap held over to a later tick instead. It paid NO
+	// sample, so it is deliberately NOT in coldTotal/coverable: those keep
+	// meaning "cold shadings actually paid" under an armed cap, and this is the
+	// measured version of what wouldDefer capN could only estimate.
+	int64 ColdCapDeferredSinceLog = 0;
+	// Ticks on which the cap held back at least one submit -- the denominator
+	// that makes deferred= readable, since 400 deferrals over 4 ticks and over
+	// 100 ticks are different worlds.
+	//
+	// THIS IS NOT deferredTicksMax, AND THAT NUMBER IS NOT HERE. "How many
+	// ticks did the WORST chunk wait" needs per-chunk state (a map from key to
+	// first-deferral tick) that nothing on this path keeps, and an
+	// approximation of it would be read as the real thing. Omitted rather than
+	// guessed. What bounds the wait instead is structural and is argued at the
+	// requeue site: a deferred entry is appended to the BACK of its ring queue
+	// and Pop() takes from the back, so it is re-offered among the first of its
+	// ring on the next tick -- when that tick's cold budget is still whole.
+	int64 ColdCapDeferredTicksSinceLog = 0;
+	// Per-tick working state, folded and cleared beside ColdShadingsThisTick and
+	// for the same reason (a window edge can land mid-tick).
+	int32 ColdCapDeferredThisTick = 0;
+	// A cold submit with NOTHING coarser over it that went through while the cap
+	// was already reached -- the hole-safety exemption firing, counted where it
+	// fires. Expected small (the census put holeRisk at 0-5 percent of colds);
+	// large means the cap is buying much less than deferred= suggests, and that
+	// fact is then ON THE LINE rather than in a theory about it.
+	int64 ColdCapExemptSinceLog = 0;
 	// Loop-side bracket of SUCCESSFUL demand fork iterations (SubmitStart to
 	// the fork branch's continue) -- loopMinusFn = this minus totalMs is the
 	// fork-branch cost OUTSIDE SubmitGpuMeshJob when positive; negative means
@@ -10881,11 +10997,20 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// A cap whose excess is small also kills it, for the opposite reason:
 		// nothing was deferred, so nothing was bought.
 		//
-		// THIS CHANGE IS BEHAVIOUR-NEUTRAL AND MUST STAY THAT WAY. No submit is
-		// delayed, reordered, skipped or gated by anything below; the counters
-		// are read by one log line and by nothing else in the pipeline. The
-		// instant a streaming decision reads one of them, the census stops
-		// measuring the world the cap would be built for.
+		// THE CENSUS WAS BEHAVIOUR-NEUTRAL AND STILL IS WITH THE CAP OFF. That
+		// was the condition it was built under -- "the instant a streaming
+		// decision reads one of them, the census stops measuring the world the
+		// cap would be built for" -- and it held for the whole proof: the leg
+		// that produced the readings below ran with no cap in existence.
+		//
+		// THE PROOF PASSED AND THE CAP IS NOW BUILT
+		// (voxel.Stream.ColdShadingCapPerTick, default 0). Armed, it reads
+		// ColdShadingsThisTick as its per-tick budget and defers submits, so the
+		// census then measures the CAPPED world by construction and may not be
+		// quoted as an uncapped reading. Disarmed -- the default, and the only
+		// state any census leg has ever run in -- nothing reads these counters
+		// but the log line, exactly as before. Re-running the census means
+		// running it at cap 0.
 		//
 		// FAILING READINGS (every counter must be able to come out the other
 		// way): coldTotal ~ 0 with the 'Voxel apply fast' line still reporting
@@ -10909,6 +11034,16 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			ColdDeferCap4SinceLog += FMath::Max(0, N - 4);
 			ColdDeferCap8SinceLog += FMath::Max(0, N - 8);
 		}
+		// The cap's per-tick fold, here rather than at the window edge for the
+		// same reason as ColdShadingsThisTick's: MaybeLogCounters can run
+		// part-way through a tick, and zeroing this there would drop a
+		// deferral burst that was still being counted. Zero when the cap is
+		// off, so this costs a compare and a branch on a control leg.
+		if (ColdCapDeferredThisTick > 0)
+		{
+			++ColdCapDeferredTicksSinceLog;
+		}
+		ColdCapDeferredThisTick = 0;
 		ColdShadingsThisTick = 0;
 
 		++AccumTicks;
@@ -13676,10 +13811,29 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// THE PARTITION IS EXACT AND CHECKABLE ON THE LINE ITSELF:
 	// coverable + holeRisk == coldTotal, always. If it does not, the
 	// classification is broken and no verdict may be read off this line.
+	//
+	// THE ARM'S HALF (voxel.Stream.ColdShadingCapPerTick). capPerTick= is the
+	// cvar's value AT PRINT TIME -- not a per-window average -- so a leg that
+	// flips it mid-window prints the tail's value and its own counters are the
+	// mixture; legs set it once at launch. deferred= is cold+coverable submits
+	// the cap held over to a later tick, deferredTicks= how many ticks did any
+	// holding at all, capExempt= holeRisk colds that went through an already
+	// reached cap. A DEFERRED SUBMIT PAID NO SAMPLE, so it is in NEITHER
+	// coldTotal NOR coverable -- adding it to both would double-count the same
+	// chunk once it lands, and would make the partition above unreadable.
+	//
+	// THE ENGAGEMENT TEST, AND IT CAN FAIL: on an armed leg maxPerTick must
+	// collapse toward capPerTick (overshooting only by that window's holeRisk
+	// exemptions) and deferred= must be non-zero. capPerTick>0 with deferred=0
+	// while the 17+ bucket is still non-zero is an INERT ARM -- the burst is
+	// still arriving and nothing held it -- and no verdict may be read from
+	// such a leg. maxPerTick unchanged at 85-97 with deferred= large says the
+	// deferrals are not the population that makes the burst.
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel cold-burst census (window): coldTotal=%lld coldTicks=%lld/%d maxPerTick=%d ")
 	       TEXT("hist 1/2/3-4/5-8/9-16/17+=%lld/%lld/%lld/%lld/%lld/%lld ")
-	       TEXT("| wouldDefer cap2=%lld cap4=%lld cap8=%lld | coverable=%lld holeRisk=%lld"),
+	       TEXT("| wouldDefer cap2=%lld cap4=%lld cap8=%lld | coverable=%lld holeRisk=%lld ")
+	       TEXT("| capPerTick=%d deferred=%lld deferredTicks=%lld capExempt=%lld"),
 	       (long long)ColdTotalSinceLog, (long long)ColdTicksSinceLog, AccumTicks,
 	       ColdMaxPerTickSinceLog,
 	       (long long)ColdBurstHistSinceLog[0], (long long)ColdBurstHistSinceLog[1],
@@ -13687,7 +13841,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)ColdBurstHistSinceLog[4], (long long)ColdBurstHistSinceLog[5],
 	       (long long)ColdDeferCap2SinceLog, (long long)ColdDeferCap4SinceLog,
 	       (long long)ColdDeferCap8SinceLog,
-	       (long long)ColdCoverableSinceLog, (long long)ColdHoleRiskSinceLog);
+	       (long long)ColdCoverableSinceLog, (long long)ColdHoleRiskSinceLog,
+	       CVarVoxelStreamColdShadingCapPerTick.GetValueOnGameThread(),
+	       (long long)ColdCapDeferredSinceLog, (long long)ColdCapDeferredTicksSinceLog,
+	       (long long)ColdCapExemptSinceLog);
 
 	// The pool's own half of the same question, drained from the component so the
 	// render-thread accumulator is reset in step with the game-thread one.
@@ -15232,6 +15389,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	}
 	ColdDeferCap2SinceLog = ColdDeferCap4SinceLog = ColdDeferCap8SinceLog = 0;
 	ColdCoverableSinceLog = ColdHoleRiskSinceLog = 0;
+	// The cap's receipts, cleared with the census they print beside.
+	// ColdCapDeferredThisTick is NOT among them, for the same reason
+	// ColdShadingsThisTick is not: it is per-tick working state cleared at the
+	// fold, and this function can run part-way through a tick.
+	ColdCapDeferredSinceLog = ColdCapDeferredTicksSinceLog = ColdCapExemptSinceLog = 0;
 	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
@@ -21376,8 +21538,48 @@ static bool ColdShadingCoveredByCoarserAncestor(
 	return false;
 }
 
+// THE PAIR OF PREDICATES, ASKED ONCE PER SUBMIT (see FColdShadingVerdict).
+//
+// Both the census tap below and the demand-side cap in DispatchJobs need
+// exactly "will this submit pay a cold sample, and if it does, is a coarser
+// level already drawing that ground". Asking twice is not merely wasteful:
+// WouldSampleForDispatch's own header says a cold report "is a statement about
+// the state the call FOUND", so an ask made after the sample answers WARM for a
+// call that was cold, and the census would silently under-count exactly the
+// bursts the cap holds back. One ask, carried by value to whoever needs it.
+//
+// A NULL POOL ROOT LEAVES THE VERDICT UNPROBED, deliberately: no shading is
+// paid at all outside `if (const USceneComponent* PoolRootForShading =
+// GpuPoolRoot.Get())` below, so "unprobed" is the honest answer and the cap
+// must not act on one. That is the same guard WarmShadingAheadTick counts as
+// WarmRootNullTicksSinceLog.
+FVoxelWorldImpl::FColdShadingVerdict FVoxelWorldImpl::ProbeColdShading(
+	const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
+{
+	FColdShadingVerdict Verdict;
+	const USceneComponent* PoolRootForShading = GpuPoolRoot.Get();
+	if (PoolRootForShading == nullptr)
+	{
+		return Verdict;
+	}
+	Verdict.bProbed = true;
+	Verdict.bCold = VoxelApplyFast::WouldSampleForDispatch(LevelKey, *PoolRootForShading);
+	if (Verdict.bCold)
+	{
+		// COLD ONLY, and that ordering is the whole cost argument. The ancestor
+		// walk is a TMap lookup per level above the chunk; the census sized it
+		// against cold shadings (~1,000 a window against ~15,000 submits).
+		// Asking it on the warm path would put a walk on every submit to answer
+		// a question no warm submit can use -- the cap never defers a warm
+		// submit, because a warm submit is not what makes the burst.
+		Verdict.bCoverable = ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey);
+	}
+	return Verdict;
+}
+
 bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
-                                       uint8 RingSkirtMask, bool bSpeculative)
+                                       uint8 RingSkirtMask, bool bSpeculative,
+                                       const FColdShadingVerdict* PrecomputedCold)
 {
 	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
 	if (Manager == nullptr)
@@ -21448,17 +21650,35 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		// so mode 3 caches at both. Mode 0 still folds to the raw expression.
 		//
 		// THE COLD-BURST CENSUS TAP (goal 3b; the doctrine and the decision
-		// rule are at the fold site beside ++AccumTicks). bCold comes back true
-		// when THIS call paid the four-column sample -- see
+		// rule are at the fold site beside ++AccumTicks). Verdict.bCold is true
+		// when THIS call pays the four-column sample -- see
 		// VoxelApplyFast::WouldSampleForDispatch for what that covers in each
-		// mode. The out-parameter defaults to nullptr, so no other caller of
-		// ShadingForDispatch is touched and mode 0 still folds to the raw
-		// expression everywhere else.
-		bool bCold = false;
+		// mode. It used to arrive through ShadingForDispatch's bOutCold
+		// out-parameter; it now arrives through ProbeColdShading, because the
+		// cap has to know the answer one step EARLIER than this call, and two
+		// derivations of one predicate is how they drift.
+		// THE VERDICT IS THE CALLER'S IF THE CALLER TOOK ONE. Both dispatch
+		// loops now ask before they call, because the cap has to decide BEFORE
+		// the sample is paid -- and re-asking here would answer warm for a call
+		// the caller correctly classified cold (WouldSampleForDispatch is exact
+		// only before the sample). Nothing between the caller's ask and this
+		// line samples a shading or touches ChunkRecords' ancestors, so the
+		// carried verdict is the same answer this line would have got.
+		//
+		// AN UNPROBED VERDICT IS ASKED FOR HERE -- a null pointer, a caller
+		// with the cap off, or a null pool root -- which is what keeps a cap of
+		// 0 byte-identical to the census-only build: same question, same order,
+		// same counters. The out-parameter form of ShadingForDispatch is no
+		// longer used at this site for that reason; the probe it wrapped is now
+		// called by name, one line earlier, by whoever needs the answer first.
+		const FColdShadingVerdict Verdict =
+			(PrecomputedCold != nullptr && PrecomputedCold->bProbed)
+				? *PrecomputedCold
+				: ProbeColdShading(LevelKey);
 		Req.BrickShading = VoxelApplyFast::ShadingForDispatch(
 			LevelKey, *PoolRootForShading,
-			&SampleChunkParamsForPool, &ShadingFromChunkParams, &bCold);
-		if (bCold)
+			&SampleChunkParamsForPool, &ShadingFromChunkParams);
+		if (Verdict.bCold)
 		{
 			// COUNTED HERE, AT THE SAMPLE, AND NOT AT A LATER SUCCESS TEST. The
 			// game thread has already paid for this shading by the time control
@@ -21474,7 +21694,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// coverable + holeRisk == coldTotal on the census line. If those
 			// three numbers ever disagree, the classification has grown a path
 			// that counts twice or not at all and the line is unreadable.
-			if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))
+			if (Verdict.bCoverable)
 			{
 				++ColdCoverableSinceLog;
 			}
@@ -22378,6 +22598,25 @@ void FVoxelWorldImpl::DispatchJobs()
 		VoxelStreamAdmission::ColdBandThrottleEnabled();
 	TArray<FSortEntry> DeferredColdBand;
 
+	// --- THE DEMAND-SIDE COLD-SHADING CAP (voxel.Stream.ColdShadingCapPerTick)
+	//
+	// Read ONCE per call, hoisted like every other gate in this loop. 0 = off
+	// and the default, and with it 0 not one branch below this line changes
+	// what any chunk does.
+	const int32 ColdShadingCap = CVarVoxelStreamColdShadingCapPerTick.GetValueOnGameThread();
+	// Candidates this pass held back by the cap, ONE ARRAY PER RING.
+	//
+	// Per ring and not one flat array, unlike DeferredColdBand above, for the
+	// reason DeferredColdBand can get away with being flat: the cold-band
+	// throttle is level-0 only and appends to PendingJobKeysByLevel[0]. The cap
+	// fires at every level the fork serves, and an entry put back in the wrong
+	// ring's queue would be dispatched under another ring's floor and sorted
+	// against another ring's distances -- a chunk quietly re-homed, which is
+	// worse than a chunk delayed. Each entry goes back to the queue it was
+	// popped from, carrying the DistSq it was popped with; the requeue and its
+	// priority argument are after the pop loop.
+	TArray<FSortEntry> DeferredColdShadingCap[VoxelCoords::kNumLevels];
+
 	// -VoxelColdBandDeferPark: release parked column-mates whose seeding mark
 	// has cleared or aged out, BEFORE the pop loop so they are dispatchable in
 	// this same tick -- the same latency the default re-queue path has (its
@@ -22904,14 +23143,27 @@ void FVoxelWorldImpl::DispatchJobs()
 			}
 		}
 
-		Rec->bJobInFlight = true;
-		JobsInFlightCounter.Increment();
-		++LevelJobsInFlight[PickLevel];
-		++JobsDispatchedSinceLog;
-		++JobsDispatchedTotalForCap; // -VoxelAdmissionCapDrainSec: monotonic twin, never reset
-		++LevelJobsDispatchedSinceLog[PickLevel];
-		++LevelJobsDispatchedTotal[PickLevel];
-
+		// THE CLAIM USED TO STAND HERE and now stands below the fork
+		// predicates, immediately before the submit bracket -- moved verbatim,
+		// seven lines, no other change.
+		//
+		// WHY: the cold-shading cap has to defer a chunk with the fork decision
+		// already known (a chunk falling to the CPU worker pays no cold shading
+		// at the submit site, so deferring it would buy nothing and delay
+		// refinement for free) AND with nothing yet claimed. Deferring after the
+		// claim would leak an in-flight slot for the life of the session and
+		// leave the record with bJobInFlight set and no job owing a result --
+		// RecomputeDesiredSet will not re-queue a chunk whose record exists, so
+		// that chunk is gone. That is the one failure this arm may not have.
+		//
+		// SAFE BECAUSE NOTHING IN BETWEEN READS IT, checked identifier by
+		// identifier over the span: the only other mentions of bJobInFlight,
+		// JobsInFlightCounter, LevelJobsInFlight and the dispatch tallies are
+		// `&JobsInFlightCounter` taken as a pointer for the worker task (order
+		// independent) and prose in comments. The while condition
+		// (CpuJobsOutstanding) is evaluated at the TOP of the next iteration,
+		// after both the moved claim and the fork's own increment have run, so
+		// it sees exactly what it saw before.
 		const uint64 GenId = Rec->GenerationId;
 		// Worker threading (decisions table): the job touches ONLY
 		// GeneratedWorld (pure function of seed, lock-free) -- never World
@@ -22946,12 +23198,21 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		// --- The GPU fork (Wave D / D4) -------------------------------------
 		//
-		// Everything above this point has already happened for this chunk: the
-		// record is marked in flight, both counters are incremented, and the
-		// dispatch tallies are bumped. So the fork chooses only WHO MESHES IT,
-		// and both branches owe exactly one FJobResult on ResultsQueue plus one
+		// The fork chooses only WHO MESHES IT, and once the chunk is CLAIMED
+		// both branches owe exactly one FJobResult on ResultsQueue plus one
 		// JobsInFlightCounter decrement. That symmetry is the whole safety
 		// argument -- see the invariant quoted in DrainResults.
+		//
+		// THE CLAIM NOW HAPPENS BELOW THESE PREDICATES, NOT ABOVE THEM. It used
+		// to stand just before this block, and the sentence here used to read
+		// "everything above this point has already happened for this chunk".
+		// The cold-shading cap needs the fork decision before it defers (a
+		// CPU-bound chunk pays no cold shading) and needs nothing claimed when
+		// it does, so the claim moved down past this predicate block to sit
+		// immediately before the submit bracket. These predicates read no claim
+		// state, so what they decide is unchanged; what changed is that a
+		// `continue` is still legal between here and the claim, and is illegal
+		// after it.
 		//
 		// THE BAND SEED USED TO BE EXCLUDED HERE, AND IS NOT ANY MORE.
 		//
@@ -23072,6 +23333,100 @@ void FVoxelWorldImpl::DispatchJobs()
 		}
 		const bool bUseGpuMesh = bGpuMeshEligible && bGpuQueueHasRoom;
 
+		// --- THE DEMAND-SIDE COLD-SHADING CAP -------------------------------
+		//
+		// voxel.Stream.ColdShadingCapPerTick, default 0 = off. At most N cold
+		// shadings per streaming tick; the excess WAITS a tick instead of being
+		// paid inline. Everything below is under `if (ColdShadingCap > 0)`, so
+		// a control leg is byte-identical.
+		//
+		// WHAT THE CENSUS MEASURED, and why this shape rather than more warming
+		// (docs/cold-burst-census-2026-08-29.md, leg COLDCENSUS-a): maxPerTick
+		// 85-97 in EVERY flight window, 6-9 ticks per window in the 17+ bucket,
+		// at 0.33-0.59 ms per cold sample. A 90-cold tick IS the 43-52 ms reqHdr
+		// single frame. dd4ee9e's two warming arms both moved cacheMiss (-24%)
+		// and neither moved stutterPct, because a per-tick trickle cannot
+		// pre-clear a burst that arrives all at once. Spreading the burst is the
+		// only shape left that does not add work.
+		//
+		// HOLE-SAFETY IS BY CONSTRUCTION HERE, NOT BY TUNING. A cold submit may
+		// wait only if a COARSER-level ancestor is resident and HoldsTerrain
+		// right now -- that ancestor is precisely what the marcher falls through
+		// to and draws while the fine submit waits, so the ground stays covered
+		// and the visible cost is a bounded mip-pop. A cold submit with nothing
+		// coarser over it (holeRisk; the census put it at 0-5% of colds, and
+		// coverable + holeRisk == coldTotal on every line it printed) is NEVER
+		// deferred: it pays its sample and goes through even with the cap
+		// reached, counted as capExempt=. The cap can therefore overshoot N by
+		// that window's holeRisk share, and that overshoot is the price of the
+		// guarantee, not a leak.
+		//
+		// THE HONEST TRADE. dd4ee9e guessed "1-2 ticks"; the census corrected it
+		// to 10-20 ticks at the TAIL of a 90-burst at cap 4-8 (~150-300 ms at
+		// flight tick rates), during which the coarser level shows. That is
+		// bounded mip-pop in place of a 50 ms hitch, and it is a trade, not a
+		// win -- which is why the A/B gates BOTH sides and why substituted= is
+		// read as the receipt rather than as a failure.
+		//
+		// THE PRE-REGISTERED GATES, VERBATIM: "stutterPct falls materially
+		// toward 0.10, maxReqHdr leaves the tens-of-ms band, p95/p99 not worse,
+		// uncovered not rising -- any one moving the wrong way refutes, default
+		// stays 0."
+		//
+		// GPU ARM ONLY, AND ON PURPOSE: bUseGpuMesh is the condition under
+		// which the cold sample is actually paid (SubmitGpuMeshJob's Hook-4
+		// site is the only place at dispatch that pays one). A chunk falling to
+		// the CPU worker costs the tick no cold shading, so deferring it would
+		// delay refinement and buy nothing -- and would make deferred= a
+		// counter about something other than its name.
+		FColdShadingVerdict ColdVerdict; // unprobed unless armed; SubmitGpuMeshJob then asks for itself
+		if (ColdShadingCap > 0 && bUseGpuMesh)
+		{
+			ColdVerdict = ProbeColdShading(LevelKey);
+			// >= because ColdShadingsThisTick counts shadings ALREADY PAID this
+			// tick: at the moment the Nth has been paid the budget is spent, and
+			// this candidate would be the (N+1)th.
+			if (ColdVerdict.bCold && ColdShadingsThisTick >= ColdShadingCap)
+			{
+				if (ColdVerdict.bCoverable)
+				{
+					// HELD, NOT DROPPED, and held with its own priority: the
+					// popped entry goes back to its own ring's queue after the
+					// pop loop (see the requeue below). Nothing has been
+					// claimed at this point -- the claim is the next statement
+					// -- so there is no counter to unwind and no record to
+					// repair.
+					//
+					// COUNTED AT THE ++ SITE, and counted as a DEFERRAL rather
+					// than as a cold shading, because this chunk paid no
+					// sample: coldTotal and coverable keep meaning "actually
+					// paid" under an armed cap.
+					DeferredColdShadingCap[PickLevel].Add(PoppedEntry);
+					++ColdCapDeferredSinceLog;
+					++ColdCapDeferredThisTick;
+					continue;
+				}
+				// Nothing coarser covers this ground. It goes through and pays,
+				// cap or no cap; counting it here is what makes the exemption
+				// visible instead of an assumption about the census's 0-5%.
+				++ColdCapExemptSinceLog;
+			}
+		}
+
+		// THE CLAIM (moved here from above the fork predicates -- see the note
+		// at its old site for the identifier-by-identifier argument). From this
+		// statement to the end of the iteration there is no `continue`: both
+		// fork branches owe exactly one FJobResult on ResultsQueue and exactly
+		// one JobsInFlightCounter decrement, and any early exit inserted between
+		// here and them breaks that contract.
+		Rec->bJobInFlight = true;
+		JobsInFlightCounter.Increment();
+		++LevelJobsInFlight[PickLevel];
+		++JobsDispatchedSinceLog;
+		++JobsDispatchedTotalForCap; // -VoxelAdmissionCapDrainSec: monotonic twin, never reset
+		++LevelJobsDispatchedSinceLog[PickLevel];
+		++LevelJobsDispatchedTotal[PickLevel];
+
 		// BRACKETED: everything from here to the end of the iteration is the job
 		// actually being built and handed off -- the GPU fork's region request
 		// (which now also samples per-chunk shading) or the worker enqueue.
@@ -23084,7 +23439,8 @@ void FVoxelWorldImpl::DispatchJobs()
 			ThisFrameDispatchSubmitMs += float((FPlatformTime::Seconds() - SubmitStart) * 1000.0);
 		};
 
-		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId, RingSkirtMask))
+		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId, RingSkirtMask,
+		                                    /*bSpeculative*/ false, &ColdVerdict))
 		{
 			// The fork resolved GPU: this ring's in-flight slot is now held by
 			// a round trip (p50 2.3 s), not a worker (p50 <1 ms). The split
@@ -24093,6 +24449,52 @@ void FVoxelWorldImpl::DispatchJobs()
 		ColdBandHeldThisFrame = 0;
 	}
 
+	// Re-queue the chunks the COLD-SHADING CAP held back, by the same rule and
+	// in the same place as the cold-band throttle above: this REORDERS work and
+	// never drops it. Empty and free with the cap off.
+	//
+	// EACH ENTRY GOES BACK TO ITS OWN RING, carrying the DistSq it was popped
+	// with -- the same FSortEntry, not a rebuilt one -- so the next pass's
+	// ring-quota scan and nearest-first comparison see exactly the priority this
+	// chunk had before it was held.
+	//
+	// AND IT IS OFFERED FIRST, NOT LAST, WHICH IS THE POINT. Each queue is
+	// sorted lowest-priority-first and Pop() takes from the BACK, so an entry
+	// appended here sits at the back and is the first thing its ring offers on
+	// the next pass -- when that tick's cold budget is whole and the cap cannot
+	// yet be reached. That is what the census asked for ("the deferred submit
+	// must re-enter NEXT tick ahead of new work of its ring, or a sustained
+	// burst starves it"), and it is also why a deferred chunk cannot ratchet
+	// backwards: waiting can only improve its position within its ring, until
+	// SortPendingQueues re-keys everything on the next recompute.
+	//
+	// A HELD CHUNK CANNOT BE LOST. It was popped and is held in exactly one
+	// place, this array; the append is unconditional and runs on every exit path
+	// of the pop loop (the loop breaks, it does not return); nothing was claimed
+	// for it, so no record carries bJobInFlight and no counter owes a result;
+	// and a key whose record was evicted or re-admitted while held is absorbed
+	// where the queues already absorb that -- the loop's own `!Rec` check,
+	// exactly as the cold-band path above relies on.
+	//
+	// THE KNOWN COST, NAMED RATHER THAN DISCOVERED LATER. This is the same
+	// pop-test-requeue shape the cold-band throttle measured at 13,217 defers
+	// per 5 s before -VoxelColdBandDeferPark was built, and DispatchJobs runs
+	// TWICE per tick, so a saturated tick pays each held candidate one pick
+	// scan, one pop, one cold probe and one append PER PASS. The probe is a few
+	// compares plus one slot index (the ancestor walk only runs when it comes
+	// back cold), so this is far cheaper per candidate than the cold-band case
+	// was -- but if an armed leg shows dispatch= rising while deferred= is
+	// large, the escalation already exists in this file and should be copied
+	// rather than invented: park the held entries off-queue like
+	// ColdBandParkedByFootprint and flush them at the top of the next pass.
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		if (DeferredColdShadingCap[Level].Num() > 0)
+		{
+			PendingJobKeysByLevel[Level].Append(DeferredColdShadingCap[Level]);
+		}
+	}
+
 	// T4-1: demand has now taken everything it wants from this tick's budget.
 	// Speculation gets the remainder, and only the remainder -- submitting here
 	// rather than anywhere earlier is what makes starvation structurally
@@ -24942,6 +25344,14 @@ void FVoxelWorldImpl::DispatchSpeculativeJobs()
 		return;
 	}
 	const int32 SpecCap = VoxelDebug::GetStreamSpeculativeMaxInFlight();
+	// The cold-shading cap applies HERE TOO, and it has to. Speculation pays its
+	// cold samples through the SAME SubmitGpuMeshJob Hook-4 site, on the SAME
+	// game thread, in the SAME tick -- they are already counted in
+	// ColdShadingsThisTick and always were -- and this function runs at the END
+	// of DispatchJobs. An uncapped speculative pass would therefore spend
+	// exactly the burst the cap had just refused demand, and the arm would read
+	// engaged while the frame it exists to fix was unchanged.
+	const int32 ColdShadingCap = CVarVoxelStreamColdShadingCapPerTick.GetValueOnGameThread();
 	int32 SpecOutstanding = 0;
 	for (const auto& Pair : GpuJobsPending)
 	{
@@ -24984,7 +25394,48 @@ void FVoxelWorldImpl::DispatchSpeculativeJobs()
 			SpeculativeInFlight.Remove(Key);
 			continue;
 		}
-		if (!SubmitGpuMeshJob(Key, /*GenId*/ 0, /*RingSkirtMask*/ 0, /*bSpeculative*/ true))
+		// --- The cold-shading cap, speculative side -------------------------
+		//
+		// SAME RULE AS DEMAND'S, deliberately: defer only a cold submit whose
+		// chunk is coverable, never a holeRisk one. Speculation could justify a
+		// harder rule (nothing has admitted this chunk, so holding it cannot
+		// open a hole), but two rules would mean deferred= and capExempt= each
+		// meant two things depending on which loop moved them, and a counter
+		// with two meanings is how this file has been misread before. One rule,
+		// one meaning, and the overshoot is bounded by the same 0-5% holeRisk
+		// share as demand's.
+		//
+		// THE CHEAPEST SAFE DEFERRAL IN THE FILE: Pop() took this key off the
+		// back of SpeculativeKeys and Add() puts it back there, with
+		// SpeculativeInFlight untouched -- precisely the state of one line ago,
+		// which is why nothing here needs the demand loop's carry-over array.
+		// (Contrast the two DROP paths around it, which both Remove from
+		// SpeculativeInFlight: dropping speculation is always safe, but this is
+		// not a drop.)
+		//
+		// AND IT BREAKS RATHER THAN CONTINUING. Walking further down the stack
+		// looking for a warm key would cost a probe per key on the game thread
+		// during exactly the tick the cap is trying to protect, and the next key
+		// is no likelier to be warm. Speculation waits; demand already went
+		// first this tick, by construction.
+		FColdShadingVerdict SpecVerdict; // unprobed with the cap off; the callee then asks for itself
+		if (ColdShadingCap > 0)
+		{
+			SpecVerdict = ProbeColdShading(Key);
+			if (SpecVerdict.bCold && ColdShadingsThisTick >= ColdShadingCap)
+			{
+				if (SpecVerdict.bCoverable)
+				{
+					SpeculativeKeys.Add(Key);
+					++ColdCapDeferredSinceLog;
+					++ColdCapDeferredThisTick;
+					break;
+				}
+				++ColdCapExemptSinceLog;
+			}
+		}
+		if (!SubmitGpuMeshJob(Key, /*GenId*/ 0, /*RingSkirtMask*/ 0, /*bSpeculative*/ true,
+		                      &SpecVerdict))
 		{
 			SpeculativeInFlight.Remove(Key);
 			break; // fork refused (budget) -- stop, do not spin
