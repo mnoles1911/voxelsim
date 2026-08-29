@@ -725,8 +725,17 @@ bool FVoxelRasterAtlasCpu::IsPageInCoverage(int64 PageX, int64 PageY,
 	// (CoverageRadiusPx=2,237 px = 4.19 km, RadiusPages=19) the disc admits
 	// 1,021-1,036 of the square's 1,521 pages depending on where inside its own
 	// page the anchor sits -- the corners are ~32% of the sweep, and the square
-	// reaches 6.45 km at its corner against a 4.19 km circle, so no chunk in
-	// the cascade ever asks for them.
+	// reaches 6.45 km at its corner against a 4.19 km circle.
+	//
+	// "SO NO CHUNK IN THE CASCADE EVER ASKS FOR THEM" USED TO FOLLOW HERE, AND
+	// IT WAS FALSE -- a derived claim standing in for a checked one, the failure
+	// shape this file names elsewhere. Chunks are admitted by their CENTRE out to
+	// AdmitOuterUU, and a chunk's raster window reaches its own half-extent plus
+	// the probed margin PAST that centre, so an admitted chunk can tap pages this
+	// test refuses: 1.02 pages' worth at the shipped geometry. Measured, not
+	// argued -- Saved/OOD-verdict.log, `pages=10 outOfDisc=10 ALL-OUT-OF-DISC`
+	// on every page crossing. voxel.Stream.AtlasCoveragePadChunks closes it at
+	// Init; the derivation and the cost are there.
 	//
 	// The test is the NEAREST pixel of the page against CoverageRadiusPx, which
 	// over-covers on purpose: a page that only clips the circle is filled. And
@@ -743,13 +752,15 @@ bool FVoxelRasterAtlasCpu::IsPageInCoverage(int64 PageX, int64 PageY,
 	return Dx * Dx + Dy * Dy <= CoverageRadiusPx * CoverageRadiusPx;
 }
 
-void FVoxelRasterAtlasCpu::Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int32 MaxCoarseLevel)
+void FVoxelRasterAtlasCpu::Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int32 MaxCoarseLevel,
+                                int64 AdmitCentreReachMm, int32 PadChunks)
 {
 	check(IsInGameThread());
 	check(!IsInitialized());
 	check(InPixelSizeMm > 0 && CoverageRadiusMm > 0);
 	PixelSizeMm = InPixelSizeMm;
 	MaxLevel = MaxCoarseLevel;
+	LatchedCoveragePadChunks = PadChunks;
 
 	// THE MARGIN, DERIVED THROUGH THE ONE RULE, NEVER RESTATED. For each level
 	// the cascade streams, run ComputeRasterWindowPx over the standard chunk
@@ -763,6 +774,7 @@ void FVoxelRasterAtlasCpu::Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int
 	// defect (recorded at FillRasterWindow) warns about: if the rule changes,
 	// this margin changes with it, in the same commit, automatically.
 	int64 MarginPx = 0;
+	int64 MaxLevelChunkSpanMm = 0;
 	for (int32 L = 0; L <= MaxLevel; ++L)
 	{
 		const VoxelGpuRegionBuild::FRasterWindowPx W =
@@ -772,18 +784,92 @@ void FVoxelRasterAtlasCpu::Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int
 		const int64 ChunkSpanMm = int64(32) * (int64(1) << L) * vxc::kVoxelSizeMm;
 		const int64 ChunkSpanPx = vxc::floorDiv(ChunkSpanMm - 1, PixelSizeMm);
 		MarginPx = FMath::Max3(MarginPx, -W.PxMin, W.PxMax - ChunkSpanPx);
+		if (L == MaxLevel)
+		{
+			// Kept from the probe rather than recomputed below: the coverage pad
+			// needs the OUTERMOST ring's chunk edge, and this loop already has it,
+			// from the same voxel-core constants the margin was measured against.
+			MaxLevelChunkSpanMm = ChunkSpanMm;
+		}
 	}
 
-	const int64 RadiusPx = vxc::floorDiv(CoverageRadiusMm, PixelSizeMm) + 1 + MarginPx;
+	const int64 ControlRadiusPx = vxc::floorDiv(CoverageRadiusMm, PixelSizeMm) + 1 + MarginPx;
+
+	// --- THE COVERAGE PAD (voxel.Stream.AtlasCoveragePadChunks) -------------
+	//
+	// THE DEFECT, in arithmetic, at the shipped geometry (pitch 1,875 mm/px,
+	// ring 6 outer 4,096 m, chunk edge 204.8 m, MarginPx 63):
+	//
+	//   disc today        floorDiv(4,096,000, 1875) + 1 + 63 = 2,248 px = 4,215 m
+	//   demandable, axis  AdmitOuterUU 4,240.8 m (Outer + a chunk half-diagonal;
+	//                     admission places a chunk by its CENTRE)
+	//                     + half-edge 102.4 + margin 118.1 = 4,461 m = 2,379 px
+	//   short by          131 px = 246 m ~= 1.02 pages
+	//
+	// A page in that band is tappable by an admitted chunk and unreachable by
+	// every pre-fill path in this class, because both of them filter through
+	// IsPageInCoverage. It therefore arrives as a synchronous demand fill on the
+	// game thread, in a lump, once per page crossing -- 6-10 pages at ~3.2
+	// ms/page = the 33-43 ms band the submit split reads as maxRaster. The
+	// period is the page grid because the disc's page-granular over-cover
+	// shifts with the anchor's phase inside its own 240 m page.
+	//
+	// CONFIRMED BEFORE THIS WAS WRITTEN, not assumed: Saved/OOD-verdict.log
+	// prints ALL-OUT-OF-DISC on every crossing window (pages=10 outOfDisc=10,
+	// 10-36 ms GT, lifetime rescued=535). That also kills the scan-widening fix
+	// dd4ee9e's screening named -- no scan width reaches a page the coverage
+	// rule refuses, so PrefetchAhead's rim-ring bound was never the ceiling.
+	//
+	// THE FIX IS THE RADIUS, composed from two authorities, neither respelled:
+	//   * AdmitCentreReachMm -- the subsystem's own VoxelStreamAdmission::
+	//     AdmitOuterUU (plus any extra whole chunks the pad asked for), plumbed
+	//     in as a VALUE because that namespace lives in VoxelWorldSubsystem.cpp
+	//     and copying its four lines here is the drift that opened this hole.
+	//   * The box-corner term -- this file's OWN probed MarginPx and the chunk
+	//     half-edge the probe loop already computed. The window is an axis-
+	//     aligned BOX around the chunk and coverage is a DISC, so a box of
+	//     half-extent h needs radius h*sqrt(2), not h: half-diagonal + margin
+	//     would leave 49 m -- a fifth of a page -- of the same phase-dependent
+	//     shortfall, which is the shape of the original mistake.
+	// MarginPx + 1, not MarginPx: the probe floor-divided into pixels, so the
+	// true margin is under (MarginPx + 1) pixels and never at it.
+	//
+	// WHAT IT COSTS, armed, at the shipped geometry: radius 2,248 -> 2,430 px,
+	// RadiusPages 19 -> 20, torus 41x41 -> 43x43, payload 210.1 -> 231.2 MiB,
+	// and ~170 more pages of cold-start sweep (~0.5 s of game thread, spread).
+	// Nothing else moves: the extra pages are filled by the SAME nearest-first
+	// sweep under its same 2 ms/tick budget, which is the whole mechanism --
+	// the work does not get smaller, it gets SPREAD, the one shape that beat
+	// async fill (which spread the STALL instead and was refuted).
+	int64 RadiusPx = ControlRadiusPx;
+	if (AdmitCentreReachMm > 0)
+	{
+		const int64 AxisReachMm = MaxLevelChunkSpanMm / 2 + (MarginPx + 1) * PixelSizeMm;
+		const int64 CornerReachMm =
+			int64(FMath::CeilToDouble(1.4142135623730951 * double(AxisReachMm)));
+		RadiusPx = vxc::floorDiv(AdmitCentreReachMm + CornerReachMm, PixelSizeMm) + 1;
+		// A pad that made the disc SMALLER would be a silent regression wearing
+		// the fix's name. The arithmetic above cannot produce one; this says so
+		// rather than trusting it.
+		RadiusPx = FMath::Max(RadiusPx, ControlRadiusPx);
+	}
 	// KEPT, not recomputed: mode 1's disc test is this same radius, so the
 	// prefetch circle and the margin probe can never drift apart.
 	CoverageRadiusPx = RadiusPx;
-	RadiusPages = vxc::floorDiv(RadiusPx + int64(kPagePx) - 1, int64(kPagePx)) + 1;
+	// ONE SPELLING EACH, because the init line now prints the CONTROL torus
+	// beside the armed one and a log that re-derived either would be the second
+	// copy this file keeps warning about.
 	// +3: one page of recentre hysteresis each side plus the centre page. A
 	// desired circle can then never wrap onto itself through the torus, so a
 	// resident page is always the page the coverage rule wanted, and slot
 	// aliasing only ever replaces pages that left coverage.
-	PagesDim = uint32(2 * RadiusPages + 3);
+	const auto PagesForRadius = [](int64 InRadiusPx)
+	{
+		return vxc::floorDiv(InRadiusPx + int64(kPagePx) - 1, int64(kPagePx)) + 1;
+	};
+	const auto DimForPages = [](int64 InPages) { return uint32(2 * InPages + 3); };
+	RadiusPages = PagesForRadius(RadiusPx);
+	PagesDim = DimForPages(RadiusPages);
 
 	// THE CLIMATE RUN LENGTH, from the pitch the host was asked to supply.
 	// Refused rather than rounded when the coarse pitch is not a whole multiple
@@ -812,15 +898,42 @@ void FVoxelRasterAtlasCpu::Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int
 
 	const uint64 PayloadBytes =
 		uint64(PagesDim) * PagesDim * kPagePx * kPagePx * (sizeof(int32) + sizeof(uint32));
+	// THE ARM HAS TO REPORT ITSELF, AND IT HAS TO REPORT THE NUMBER THAT MOVED.
+	// A leg that cannot tell an armed pad from a control one on line one cannot
+	// be read at all, and a pad that is set but produced the SAME radius (a
+	// smaller ring, a level where the admission pad is under a pixel) is an
+	// inert arm wearing an armed name -- so both radii print, always.
+	const uint32 ControlPagesDim = DimForPages(PagesForRadius(ControlRadiusPx));
+	const FString PadNote =
+		(LatchedCoveragePadChunks <= 0)
+			? FString::Printf(
+				  TEXT("coveragePad=0 OFF (voxel.Stream.AtlasCoveragePadChunks=0; disc %lld px, ")
+				  TEXT("the shipped radius -- pages an outer chunk's window can tap past it are ")
+				  TEXT("demand-filled in a lump at each crossing; read `outOfDisc=` on the window line)"),
+				  CoverageRadiusPx)
+		: (RadiusPx == ControlRadiusPx)
+			? FString::Printf(
+				  TEXT("coveragePad=%d ARMED-BUT-INERT: the derived radius equals the control's ")
+				  TEXT("(%lld px) -- this leg measures the CONTROL and any verdict from it is void"),
+				  LatchedCoveragePadChunks, CoverageRadiusPx)
+			: FString::Printf(
+				  TEXT("coveragePad=%d ARMED: disc %lld -> %lld px (+%.0f m; admitCentre %.3f km ")
+				  TEXT("through VoxelStreamAdmission::AdmitOuterUU + box-corner %.0f m), torus ")
+				  TEXT("%ux%u -> %ux%u pages"),
+				  LatchedCoveragePadChunks, ControlRadiusPx, CoverageRadiusPx,
+				  double(CoverageRadiusPx - ControlRadiusPx) * double(PixelSizeMm) / 1000.0,
+				  double(AdmitCentreReachMm) / 1e6,
+				  1.4142135623730951 * double(MaxLevelChunkSpanMm / 2 + (MarginPx + 1) * PixelSizeMm) / 1000.0,
+				  ControlPagesDim, ControlPagesDim, PagesDim, PagesDim);
 	UE_LOG(LogVoxelRasterAtlas, Log,
 	       TEXT("[raster-atlas] init: pitch=%lld mm/px, coverage r=%.2f km, margin=%lld px ")
 	       TEXT("(probed through ComputeRasterWindowPx over levels 0..%d), torus %ux%u pages of ")
-	       TEXT("%u px -> %.1f MiB payload + %.1f KiB tags. Fill budget %.1f ms/tick."),
+	       TEXT("%u px -> %.1f MiB payload + %.1f KiB tags. Fill budget %.1f ms/tick. | %s"),
 	       PixelSizeMm, double(CoverageRadiusMm) / 1e6, MarginPx, MaxLevel,
 	       PagesDim, PagesDim, kPagePx,
 	       double(PayloadBytes) / (1024.0 * 1024.0),
 	       double(PagesDim) * PagesDim * sizeof(uint32) / 1024.0,
-	       FillBudgetMs());
+	       FillBudgetMs(), *PadNote);
 
 	// THE ONE LINE THAT SAYS WHICH LADDER RUNG THIS RUN IS ON. Without it a
 	// leg's log cannot be told apart from the control's, which is how an arm
@@ -839,6 +952,29 @@ void FVoxelRasterAtlasCpu::Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int
 	SlotTags.Init(0xffffffffu, int32(PagesDim * PagesDim));
 	GpuAtlas.Init(kPagePx, PagesDim);
 	LastWindowLogSeconds = FPlatformTime::Seconds();
+}
+
+void FVoxelRasterAtlasCpu::WarnCoveragePadChanged(int32 LiveValue)
+{
+	check(IsInGameThread());
+	if (bLoggedCoveragePadChange)
+	{
+		return;
+	}
+	bLoggedCoveragePadChange = true;
+	// REFUSED, NOT APPLIED, AND SAID ONCE. RadiusPages/PagesDim/SlotTags and the
+	// GPU atlas are sized in Init and never resized; honouring the change would
+	// mean re-allocating the torus mid-flight, which drops every resident page
+	// and hands that frame the whole ~1,500-page warmup -- the exact lump this
+	// arm exists to remove, at the worst possible moment. Warning, not Log: a
+	// leg whose cvar no longer matches its torus is measuring the arm it was
+	// STARTED with, and the reader has to know that before reading anything
+	// else.
+	UE_LOG(LogVoxelRasterAtlas, Warning,
+	       TEXT("[raster-atlas] voxel.Stream.AtlasCoveragePadChunks changed to %d after Init ")
+	       TEXT("latched %d -- REFUSED for this session; the torus is sized once and is not ")
+	       TEXT("rebuilt in flight. This run is still measuring pad=%d; restart to change it."),
+	       LiveValue, LatchedCoveragePadChunks, LatchedCoveragePadChunks);
 }
 
 // ---------------------------------------------------------------------------

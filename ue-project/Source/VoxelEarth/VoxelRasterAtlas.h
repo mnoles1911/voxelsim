@@ -94,7 +94,47 @@ public:
 	// 0..MaxCoarseLevel and keeps the widest reach -- at level 6 the halo and
 	// rep-coordinate terms are 64x wider than level 0's, the 2^L rule).
 	// Logs the torus geometry and the payload MiB before allocating it.
-	void Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int32 MaxCoarseLevel);
+	//
+	// AdmitCentreReachMm ARMS THE COVERAGE FIX (voxel.Stream.AtlasCoveragePadChunks;
+	// 0 = today's radius, byte-identical). It is how far the streaming admission
+	// can put a chunk's CENTRE, computed by the subsystem through
+	// VoxelStreamAdmission::AdmitOuterUU -- the one authority for that radius,
+	// which lives inside VoxelWorldSubsystem.cpp and cannot be called from here.
+	// The VALUE is plumbed rather than the arithmetic copied, which is the whole
+	// point: a second spelling of the admission radius is the failure this class
+	// keeps recording. What this file adds to it is what this file owns -- the
+	// probed MarginPx and the chunk half-edge -- see the derivation at the Init
+	// site.
+	//
+	// WHY IT EXISTS, measured and confirmed. The disc below was Outer + MarginPx,
+	// where MarginPx is how far a window reaches past a chunk's OWN pixels. But
+	// admission places a chunk by its CENTRE at up to AdmitOuterUU = Outer + a
+	// chunk half-diagonal, and that chunk's window then reaches its own half-
+	// extent plus MarginPx past that centre. The disc was short by both terms:
+	// 2,248 px against a demandable 2,379 px in the axis case = 131 px ~= 1.02
+	// pages. Pages in that band can be tapped by an admitted chunk and can NEVER
+	// be pre-filled -- neither the sweep nor PrefetchAhead admits a page
+	// IsPageInCoverage refuses -- so they arrive as a synchronous demand lump,
+	// once per page crossing (the 240 m / ~10 s metronome, because the disc's
+	// page-granular over-cover shifts with the anchor's phase inside its page).
+	// CONFIRMED on Saved/OOD-verdict.log: every crossing window printed
+	// ALL-OUT-OF-DISC, pages=10 outOfDisc=10, 10-36 ms GT.
+	void Init(int64 InPixelSizeMm, int64 CoverageRadiusMm, int32 MaxCoarseLevel,
+	          int64 AdmitCentreReachMm = 0, int32 PadChunks = 0);
+
+	// The pad the torus was SIZED for. RadiusPages, PagesDim, SlotTags and the
+	// GPU atlas are allocated once in Init and never resized, so the cvar is
+	// Init-latched by construction; this is what lets the caller notice a
+	// mid-run change and say so instead of the run silently measuring the arm it
+	// was started with.
+	int32 CoveragePadChunksLatched() const { return LatchedCoveragePadChunks; }
+
+	// One-shot Warning that the live cvar no longer matches what the torus was
+	// built for. Called by the subsystem, which is the only place that reads the
+	// cvar. Refuses rather than rebuilds: re-sizing the torus mid-flight would
+	// drop every resident page and hand the frame the exact 1,500-page warmup
+	// lump this whole line of work exists to remove.
+	void WarnCoveragePadChanged(int32 LiveValue);
 	bool IsInitialized() const { return PagesDim != 0; }
 
 	FVoxelRasterAtlasGpu& Gpu() { return GpuAtlas; }
@@ -503,6 +543,9 @@ private:
 	// The SAME radius RadiusPages was rounded up from, kept in pixels so the
 	// disc test (mode >= 1) IS the coverage rule rather than a restatement.
 	int64 CoverageRadiusPx = 0;
+	// Init-latched: see CoveragePadChunksLatched/WarnCoveragePadChanged above.
+	int32 LatchedCoveragePadChunks = 0;
+	bool bLoggedCoveragePadChange = false;
 
 	// Fine pixels per coarse climate cell, from
 	// -VoxelGpuRasterAtlasClimatePitchMm / PixelSizeMm. 0 = "the host never
@@ -651,6 +694,31 @@ private:
 	//                                        scan.
 	//                                    A mixed reading is a real third answer
 	//                                    and prints as plain numbers.
+	//
+	//                                    SETTLED 2026-08-29 (Saved/OOD-verdict.log):
+	//                                    ALL-OUT-OF-DISC on every crossing window,
+	//                                    pages=10 outOfDisc=10, lifetime rescued=535.
+	//                                    The fix is the RADIUS
+	//                                    (voxel.Stream.AtlasCoveragePadChunks), and
+	//                                    THIS COUNTER IS NOW THAT ARM'S ENGAGEMENT
+	//                                    PROOF, RUN BACKWARDS: with the pad armed
+	//                                    those pages are inside the disc, so the
+	//                                    sweep pre-fills them and `outOfDisc` must
+	//                                    fall to ~0 with `rescued` following it
+	//                                    toward 0. outOfDisc still tracking the
+	//                                    crossings on an armed leg means the radius
+	//                                    did not actually grow -- read the init
+	//                                    line's coveragePad= group before reading
+	//                                    anything else, because that is the arm
+	//                                    reporting itself inert.
+	//
+	//                                    PRE-REGISTERED GATES for the armed leg:
+	//                                    "rescued falls toward 0, outOfDisc ~0, the
+	//                                    demand GT lump leaves the 33-43 ms band,
+	//                                    stutterPct falls materially toward 0.10,
+	//                                    p95/p99 not worse, flight holes not rising
+	//                                    -- any one moving the wrong way refutes,
+	//                                    default stays 0."
 	uint64 DemandCalls = 0;
 	uint64 DemandPagesFilled = 0;
 	uint64 DemandPagesFilledLifetime = 0;

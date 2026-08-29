@@ -345,6 +345,42 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasPrefetchAhead(
 	TEXT("atlas window line's demand rescued=/capHit= collapsing and the submit split's ")
 	TEXT("maxRaster falling to single digits. Engagement: the same line's prefetch group."),
 	ECVF_Default);
+// WHAT THAT ARM WAS ACTUALLY MISSING, and it was not scan width. Its screening
+// caught 98 pages while the demand path still filled 680, and dd4ee9e wrote
+// that down as "the crescent scan covers rim rings only". It does not: the
+// crescent is complete for the set it defines. Both the crescent scan AND the
+// nearest-first sweep admit only pages FVoxelRasterAtlasCpu::IsPageInCoverage
+// accepts, and the pages that fault are OUTSIDE that disc -- so no scan width
+// reaches them. Streaming admits a chunk by its CENTRE out to AdmitOuterUU
+// (Outer + a chunk half-diagonal) and that chunk's raster window reaches its
+// own half-extent plus the probed margin past the centre, while the atlas disc
+// is Outer + the margin alone: 2,248 px against a demandable 2,379 px = 131 px
+// ~= 1.02 pages short. MEASURED, on a counter built to come out either way:
+// Saved/OOD-verdict.log prints ALL-OUT-OF-DISC on every crossing window,
+// pages=10 outOfDisc=10, 10-36 ms GT, lifetime rescued=535.
+static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasCoveragePadChunks(
+	TEXT("voxel.Stream.AtlasCoveragePadChunks"), 0,
+	TEXT("Widens the raster atlas's COVERAGE DISC to everything an admitted chunk's window ")
+	TEXT("can actually tap, so the ordinary nearest-first sweep pre-fills those pages at its ")
+	TEXT("own 2 ms/tick budget instead of the demand path paying them in one 33-43 ms ")
+	TEXT("game-thread lump at each page crossing. 0 = off and the default: the radius is ")
+	TEXT("byte-identical to the shipped one. 1 is the intended arm -- the disc becomes ")
+	TEXT("VoxelStreamAdmission::AdmitOuterUU(maxRing) (CALLED, not respelled, right here at ")
+	TEXT("the Init site) plus the box-corner term the atlas derives from its own probed ")
+	TEXT("margin. N>1 adds N-1 whole chunk edges on top and is margin nobody has needed. ")
+	TEXT("COSTS, armed, at the shipped geometry: disc 2,248 -> 2,430 px, torus 41x41 -> ")
+	TEXT("43x43 pages, payload 210.1 -> 231.2 MiB, and ~170 more pages of cold-start sweep ")
+	TEXT("(~0.5 s of game thread, spread over ticks). It adds NO work per crossing -- the ")
+	TEXT("same pages are sampled either way; they stop arriving all in one frame. ")
+	TEXT("INIT-LATCHED: the torus is sized once, so a change after the atlas exists is ")
+	TEXT("refused with a one-shot Warning naming the value the run is really measuring. ")
+	TEXT("ENGAGEMENT: the init line's coveragePad= group (it prints ARMED-BUT-INERT if the ")
+	TEXT("derived radius equals the control's). VERDICT: the window line's demand group -- ")
+	TEXT("outOfDisc= to ~0 and rescued= following it toward 0. GATES, pre-registered: ")
+	TEXT("rescued falls toward 0, outOfDisc ~0, the demand GT lump leaves the 33-43 ms ")
+	TEXT("band, stutterPct falls materially toward 0.10, p95/p99 not worse, flight holes ")
+	TEXT("not rising -- any one moving the wrong way refutes, default stays 0."),
+	ECVF_Default);
 // ARM 3, AND THE SHAPE THE OTHER TWO NAMED. Both arms above pay EARLY and both
 // came out NULL on stutterPct, for the reason dd4ee9e wrote down at the time:
 // "the worst frames batch MANY cold footprints at once, which a per-tick
@@ -10754,13 +10790,49 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		//     buckets on both arms rather than moving cost somewhere unmetered.
 		if (FVoxelRasterAtlasCpu::Enabled())
 		{
+			const int32 CoveragePadChunks =
+				CVarVoxelStreamAtlasCoveragePadChunks.GetValueOnGameThread();
 			if (!RasterAtlas.IsValid())
 			{
 				RasterAtlas = MakeUnique<FVoxelRasterAtlasCpu>();
 				const int32 MaxRing = UVoxelWorldSubsystem::GetMaxRingLevel();
 				const double OuterMeters = UVoxelWorldSubsystem::GetRingPresets()[MaxRing].OuterMeters;
+				// THE COVERAGE PAD'S ONE MULTIPLICATION, HERE AND NOWHERE ELSE.
+				// The atlas cannot call AdmitOuterUU -- VoxelStreamAdmission is
+				// local to this translation unit -- and a copy of its four lines
+				// over there is precisely the drift that opened the hole this arm
+				// closes (the atlas's disc was Outer + margin, which is a chunk
+				// half-diagonal short of where admission actually puts a chunk
+				// CENTRE, and another half-extent short of where that chunk's
+				// window reaches). So the VALUE crosses the boundary, computed by
+				// the same function the entry scan admits against, and the atlas
+				// adds only what the atlas owns: its probed MarginPx and the
+				// box-corner sqrt(2). One authority per term, no term twice.
+				//
+				// UU is centimetres (AdmitOuterUU builds it as OuterMeters *
+				// 100.0), so x10 to millimetres, which is what the atlas works in.
+				// 0 keeps Init on its shipped expression exactly.
+				int64 AdmitCentreReachMm = 0;
+				if (CoveragePadChunks >= 1)
+				{
+					const double ReachUU =
+						VoxelStreamAdmission::AdmitOuterUU(MaxRing) +
+						double(CoveragePadChunks - 1) *
+							VoxelCoords::ChunkEdgeUUForLevel(MaxRing);
+					AdmitCentreReachMm = int64(ReachUU * 10.0);
+				}
 				RasterAtlas->Init(ActiveTiles().pixelSizeMm(),
-				                  int64(OuterMeters * 1000.0), MaxRing);
+				                  int64(OuterMeters * 1000.0), MaxRing,
+				                  AdmitCentreReachMm, CoveragePadChunks);
+			}
+			else if (CoveragePadChunks != RasterAtlas->CoveragePadChunksLatched())
+			{
+				// The torus is sized once and never resized -- see
+				// WarnCoveragePadChanged for why rebuilding it in flight would hand
+				// the frame the whole warmup lump. Refused, and said once, so a leg
+				// can never quietly report the arm it was not running. Two loads and
+				// a compare per tick with the pad off.
+				RasterAtlas->WarnCoveragePadChanged(CoveragePadChunks);
 			}
 			// ARM 2 of the stutter work (docs/submit-split-2026-08-28.md): the
 			// 240 m page column that comes due every ~10 s of flight fills
