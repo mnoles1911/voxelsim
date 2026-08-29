@@ -624,12 +624,17 @@ recorded). The corrected cost law: cost tracks WALK ENTRIES; the sky
 fallthrough-retry rate is ~90% of segments with a 0.054% hit rate
 (59.0M walks -> 31.9k hits per window).
 
-**IN FLIGHT:** voxel.March.RungProbe -- skip a retry rung only when the
-block-occupancy grid PROVES the coarser level empty along the interval (exact,
-not conservative: a rung hit requires residency). Gates: substituted must not
-fall, uncovered must not rise, timing at sky AND down (the horizon-only gate
-is banned; it is how the bound passed review and died in the field).
+**RungProbe: REFUTED at the engagement gate, 2026-08-29**
+(docs/rungprobe-refuted-2026-08-29.md). Skip a retry rung when block-occupancy
+proves the interval empty -- read 8.43% skippable vs >=95% pre-registered
+(sky air is resident-with-records since the buried-skip retirement; occupancy
+is a residency superset and cannot see air), AND the probe alone ran the leg
+at 175 ms/frame (marchMs 173.7 vs ~5.8; 4.46M probes/frame). The per-step rule
+now covers per-rung probes. Default 0 permanently; no timing pairs run. The
+90% retry rate stands but the residency route to it is CLOSED -- the fifth and
+last marcher family on the board. What remains: latency/VGPR occupancy stats
+(falsifier, unbuilt) and ray count (owner product decision, taken at 50%).
 
 **Stutter half of Goal 3 (0.35% vs 0.10%):** warming arms built and screened
-null as trickles (dd4ee9e); the retry-rung share of worst frames is the next
-candidate via RungProbe; demand-side cold-sample cap scoped, ungated.
+null as trickles (dd4ee9e); RungProbe is dead as a stutter candidate too;
+demand-side cold-sample cap scoped, ungated -- now the lead candidate.
