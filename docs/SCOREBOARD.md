@@ -651,6 +651,16 @@ derives the disc through AdmitOuterUU + a sqrt(2) box-corner term. Two armed
 legs: outOfDisc 0 on all 134 windows, ZERO in-flight demand lumps (control:
 6-10 pages every 10 s), hitches 9-15 -> 6-7, worst moving frame 79-113 ->
 ~46 ms, holes/p95/p99 unchanged; +21 MiB atlas. stutterPct null -- the 20 ms
-bar cannot see the removed 33-43 ms class. The REMAINING 0.3% stutters are
-now triple-attributed as neither cold shadings nor atlas pages: next lead is
-the p99 split's unnamed +4.06 ms in-tick residual and submitMs +3.24.
+bar cannot see the removed 33-43 ms class. THE TAIL LEDGER AFTER THE FULL
+SWEEP (EOFLEDGER-a, CSV + the EOF-dirty ledger, ac7a9a4): the 08-28
+EndOfFrameUpdates +3.64 finding is DEAD on today's binary (mean 0.026 ms,
+max 0.501, zero frames >2 ms in 9,000 -- the lake-sheet adoption fix removed
+what that doc measured but could not name); the frame-sample dispatch split
+already shipped in 7d63732 and the once-unnamed +4.06 is 0.51. What remains
+of the stutter goal (0.22-0.34% vs 0.10) is DIFFUSE: today's 20 stutter
+frames decompose as +2.1 ms voxel tick (the 22 ms max reqHdr cold-burst
+tick, whose deferral fix was refuted on holes today) plus +3.2 ms render-
+thread wait/RDG. The one named lever left is architectural: make the cold
+sample cheaper or move it off the game thread ("game-thread-only by design"
+-- dd4ee9e -- deserves a challenge). maxRaster now reads 0.21-0.27 ms on
+every leg -- the atlas metronome class is extinct.
