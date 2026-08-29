@@ -104,9 +104,31 @@
 //
 //   3 = guard + cache (the shipping candidate).  4 = measurement only.
 //
-//   -VoxelApplyColumnCache=N       column-cache slots, default 8192 (a
-//                                  direct-mapped table, rounded up to a power
-//                                  of two; 40 B/slot, so 8192 = 320 KB).
+//   -VoxelApplyColumnCache=N       column-cache SETS, default 131,072, rounded
+//                                  up to a power of two so the index is a mask.
+//                                  32 B per entry (not the 40 B this line used
+//                                  to claim -- three int32, three float, one
+//                                  double), so 131,072 sets at 1 way = 4.0 MiB.
+//   -VoxelApplyColumnCacheWays=N   1 (default) = the direct-mapped table this
+//                                  file has always had. 2 = two entries per
+//                                  set, evicting the less recently touched of
+//                                  the pair. THE SUCCESSOR TO THE CLOSED WARM
+//                                  FAMILY: cacheEvict ran ~400/window against
+//                                  ~900 cold samples, so much of demand's cold
+//                                  set was its own past fills recycled by
+//                                  collision, and no warmer can pre-fill churn
+//                                  (docs/warmshadingasync-null-2026-08-29.md).
+//                                  Armed: 262,144 entries + a 1.0 MiB stamp
+//                                  array = 9.0 MiB. Mirrored by the cvar
+//                                  voxel.Stream.ShadingCacheWays, which a LEG
+//                                  must not use: -ExecCmds lands after
+//                                  streaming has begun and the table is sized
+//                                  on the first drained chunk, so a cvar-armed
+//                                  leg would measure the control. A change
+//                                  after the latch is refused with a one-shot
+//                                  Warning. The full derivation, the memory
+//                                  table and the pre-registered gates are at
+//                                  CacheWays() in the .cpp.
 //   -VoxelApplyColumnCacheAudit=N  recompute and compare 1 hit in N. 0 = off.
 //                                  Named *Audit and not *Verify on purpose:
 //                                  VoxelFrontEndPolicy's naming rule treats a
@@ -148,6 +170,28 @@
 //                                     means the KEY is wrong -- one entry per
 //                                     chunk instead of one per column -- and
 //                                     the cache is a pure loss.
+//     ways=2 with hitWay2=0        -> THE ASSOCIATIVITY ARM IS INERT. The
+//                                     second way is allocated and nothing has
+//                                     ever been served from it, which at a
+//                                     0.56 load factor cannot happen if the
+//                                     table is really 2-way. Suspect the
+//                                     latch (a cvar-armed leg whose table was
+//                                     sized before the cvar landed -- pass
+//                                     -VoxelApplyColumnCacheWays=2 instead)
+//                                     before suspecting the world. FAIL, not
+//                                     a null result.
+//     ways=2, cacheEvict down, cacheMiss FLAT
+//                                  -> the arm evicts less and the sampler is
+//                                     called just as often. That is not a win;
+//                                     it is the same reading the three warm
+//                                     arms got, one layer down. Default back
+//                                     to 1 way -- the verdict is the PAIR
+//                                     falling, never cacheEvict alone.
+//     ways=1 with hitWay2>0 or evictSpared>0
+//                                  -> impossible by construction (there is no
+//                                     second way to hit or to spare). A
+//                                     way-indexing defect; the audit should be
+//                                     screaming too.
 //
 //   THE FAST PATH IS TAKEN BUT WRONG
 //     mismatch>0 under -VoxelApplyColumnCacheAudit=1

@@ -7,6 +7,7 @@
 
 #include "Components/SceneComponent.h"
 #include "Engine/World.h"
+#include "HAL/IConsoleManager.h" // voxel.Stream.ShadingCacheWays
 
 namespace VoxelApplyFast
 {
@@ -50,6 +51,124 @@ int32 CacheSlots()
 	return Latched;
 }
 
+// --- THE SUCCESSOR TO THE WARM FAMILY, AND IT IS TABLE SHAPE -----------------
+//
+// THREE WARMERS DIED AGAINST THIS TABLE (docs/warmshadingasync-null-2026-08-29
+// .md; SCOREBOARD 2026-08-29). WarmShadingAhead inline, WarmShadingAsync on
+// workers, and the cold-shading cap each passed every mechanism gate they set
+// themselves -- launched == drained == filled, no gate leak, holes clean -- and
+// each was NULL on its verdict counter. The level census (coldByLevel, 4fdd5db)
+// then said why the "the walk and demand are disjoint" reading was wrong: the
+// colds sit at L0 ~55%, L1 ~25%, L2 ~12% -- the levels the walk already targets
+// -- and on the same window line
+//
+//     cacheEvict ~370-490 per window against ~800-1,000 cold samples
+//
+// Collision evictions run at HALF the cold rate. This table has always been
+// DIRECT-MAPPED, so a large share of demand's colds are RE-SAMPLES of ground
+// that was warm and got recycled by a hash collision. No predictive walk can
+// pre-fill a churn population: demand's set is substantially the walk's OWN
+// PAST FILLS, evicted. Nobody should build a fourth warmer.
+//
+// IT IS LOAD FACTOR, NOT ALIASING, AND THE ARITHMETIC SAYS SO. CacheSlots'
+// comment above prices the working set at "roughly 1,400 footprints per level"
+// -- 9,800 keys over 7 levels, a load factor of 0.075, at which a direct-mapped
+// table would evict on ~7% of misses, not 43%. That estimate is STALE: it was
+// written for the six-level world, and the cascade holds Outer/ChunkEdge == 40
+// at every level (VoxelStreamAdmission::AdmitOuterUU), so ONE level's admitted
+// disc alone is pi*40^2 ~= 5,000 distinct XY footprints and the resident
+// (evict) radius is wider still. Take the file's own measured evict/miss of 43%
+// at 131,072 slots and invert the occupancy 1 - exp(-n/m): n ~= 74,000 live
+// keys, a load factor of 0.56. The table is not 15x oversized for its working
+// set; it is a little over half full, which is exactly where a direct-mapped
+// table starts throwing live entries away.
+//
+// THE ARM: voxel.Stream.ShadingCacheWays=2. Each set holds two entries; a miss
+// takes a free way when the set has one, and otherwise evicts the LESS RECENTLY
+// TOUCHED of the two rather than whichever key happened to hash there. The SET
+// COUNT does not move, so the counterfactual is exact for a given key stream: a
+// miss into a set holding exactly one live entry was an eviction at 1 way and
+// is not one at 2. That is counted directly, as evictSpared=.
+//
+// WHY 2 WAYS AND NOT A BIGGER TABLE, in the same model. At n/m = 0.56:
+//
+//     arm                          entries    memory   predicted evict/miss
+//     1 way, 131,072 sets (today)  131,072    4.0 MiB   43%  (the measurement)
+//     1 way, 262,144 sets          262,144    8.0 MiB   25%
+//     2 ways, 131,072 sets (ARM)   262,144    9.0 MiB   11%
+//
+// Associativity is worth ~2.2x more than the extra sets at the same entry
+// count, because a second way ABSORBS the collisions that more sets only
+// dilute. The model is CALIBRATED on the 1-way reading and then PREDICTS the
+// 2-way one, so "cacheEvict lands near 11% of cacheMiss" is a real number this
+// arm can miss. A 2-way set is also 2 x 32 B = one cache line's worth, so
+// probing the second way is usually not a second fetch.
+//
+// PRE-REGISTERED GATES. ANY ONE moving the wrong way refutes the arm and the
+// default stays at 1 way:
+//   * cacheEvict falls HARD *and* cacheMiss falls WITH IT on the submit
+//     population. cacheEvict alone falling is NOT a result: a table that evicts
+//     less while missing as often has not made a single sample cheaper.
+//   * audit mismatch=0 under -VoxelApplyColumnCacheAudit=1. This arm changes
+//     WHICH entry is kept and never what an entry means; a mismatch is a
+//     way-indexing or a keying defect and voids the leg.
+//   * maxReqHdr NOTED BUT NOT TRUSTED. It printed 22.08 to the digit on both
+//     WarmShadingAsync legs and is suspected to be a lifetime max latched at
+//     fill rather than a window max -- read its ++ site before quoting it.
+//   * stutterPct, p95, p99 and flight holes NOT WORSE.
+// ENGAGEMENT, and it cannot read inert: the window line prints ways= and slots=
+// (the real ENTRY count, sets x ways), and hitWay2= counts demand hits served
+// from the second way -- a hard zero at 1 way and impossible to fake at 2.
+static TAutoConsoleVariable<int32> CVarVoxelStreamShadingCacheWays(
+	TEXT("voxel.Stream.ShadingCacheWays"), 1,
+	TEXT("Associativity of the per-column shading table. 1 = the shipped default and ")
+	TEXT("byte-identical to the direct-mapped table this file has always had; 2 = the arm, ")
+	TEXT("which keeps the same SET count and gives each set a second entry, evicting the ")
+	TEXT("less recently touched of the two instead of whichever key hashed there. Exists ")
+	TEXT("because the warm family closed on this table: cacheEvict ~400/window against ")
+	TEXT("~900 cold samples means much of demand's cold set is its own past fills, recycled ")
+	TEXT("by collision, and no warmer can pre-fill churn. INIT-LATCHED: the table is sized ")
+	TEXT("once on the first drained chunk and a change afterwards is REFUSED with a one-shot ")
+	TEXT("Warning naming the value the run is really measuring -- and because -ExecCmds ")
+	TEXT("lands AFTER streaming has begun, a LEG must arm this on the command line as ")
+	TEXT("-VoxelApplyColumnCacheWays=2, not through this cvar. COSTS, armed: 131,072 x 32 B ")
+	TEXT("= 4.0 MiB of table becomes 262,144 x 32 B plus a 1.0 MiB LRU stamp array = 9.0 ")
+	TEXT("MiB. ENGAGEMENT: ways= and hitWay2= on the `Voxel apply fast` line (hitWay2 is a ")
+	TEXT("hard zero at 1 way). VERDICT: cacheEvict falling hard AND cacheMiss falling with ")
+	TEXT("it on the submit population, under audit mismatch=0, with stutterPct/p95/p99/holes ")
+	TEXT("not worse. Predicted evict/miss 43%% -> ~11%%."),
+	ECVF_Default);
+
+// What the cvar read at the moment CacheWays() latched. Kept so the mid-run
+// refusal below can tell a real late change from a leg that armed on the
+// command line and left the cvar at its default -- warning about the latter
+// would fire on every armed leg, which is how a warning stops being read.
+int32 CvarWaysAtLatch = -1;
+
+int32 CacheWays()
+{
+	static const int32 Latched = []
+	{
+		// COMMAND LINE OUTRANKS THE CVAR, AND THAT IS NOT A CONVENIENCE.
+		// -ExecCmds lands AFTER streaming has begun (tools/voxel-capture.ps1
+		// :114) -- the stated reason Mode(), CacheSlots() and AuditEveryN() are
+		// command-line only -- and this table is sized on the first drained
+		// chunk. A leg armed through the cvar alone would size a 1-way table and
+		// then be told to be 2-way: an armed leg measuring the control, which is
+		// the silent-success failure this module documents eleven times over.
+		// The cvar exists so the arm sits beside its siblings in the console and
+		// so an interactive session can set it before the first chunk drains.
+		int32 Value = CVarVoxelStreamShadingCacheWays.GetValueOnGameThread();
+		CvarWaysAtLatch = Value;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelApplyColumnCacheWays="), Value);
+		// 1 and 2 are the only shapes that exist. A clamp rather than a wider
+		// ladder because the model above prices 2 ways as worth more than 2x the
+		// sets, and nothing has yet measured a third.
+		return FMath::Clamp(Value, 1, 2);
+	}();
+	return Latched;
+}
+
 int32 AuditEveryN()
 {
 	static const int32 Latched = []
@@ -59,6 +178,44 @@ int32 AuditEveryN()
 		return FMath::Max(0, Value);
 	}();
 	return Latched;
+}
+
+// THE MID-RUN REFUSAL, and it is the AtlasCoveragePadChunks pattern
+// (VoxelWorldSubsystem.cpp:426ff, FVoxelRasterAtlasCpu::WarnCoveragePadChanged)
+// stated in this file's terms. The table is sized ONCE, on the first drained
+// chunk, and the way count is latched with it; honouring a later change would
+// mean re-shaping the table in flight, which drops every live entry and hands
+// that tick the whole cold fill -- the exact lump this arm exists to remove, at
+// the worst possible moment. So the change is REFUSED and said ONCE.
+//
+// Warning, not Log: a leg whose cvar no longer matches its table is measuring
+// the arm it STARTED with, and a reader has to know that before reading
+// anything else on the window line.
+//
+// Compared against the value the CVAR held at latch, not against the latched
+// ways -- a leg that armed with -VoxelApplyColumnCacheWays=2 leaves the cvar at
+// 1 quite legitimately, and a warning that fired on every armed leg would stop
+// being read, which is worse than not having one.
+void WarnWaysChangedIfLate()
+{
+	static bool bWarned = false;
+	if (bWarned || CvarWaysAtLatch < 0)
+	{
+		return; // not latched yet: nothing has been decided to contradict
+	}
+	const int32 Live = CVarVoxelStreamShadingCacheWays.GetValueOnGameThread();
+	if (Live == CvarWaysAtLatch)
+	{
+		return;
+	}
+	bWarned = true;
+	UE_LOG(LogVoxelPerf, Warning,
+	       TEXT("Voxel apply fast: voxel.Stream.ShadingCacheWays changed to %d after the ")
+	       TEXT("shading table was sized at %d way(s) -- REFUSED for this session; the table ")
+	       TEXT("is sized once and is not re-shaped in flight. This run is still measuring ")
+	       TEXT("ways=%d (slots=%d). Restart with -VoxelApplyColumnCacheWays=%d to change it ")
+	       TEXT("-- -ExecCmds lands after streaming has begun and cannot arm this."),
+	       Live, CacheWays(), CacheWays(), CacheSlots() * CacheWays(), Live);
 }
 
 // --- the table ---------------------------------------------------------------
@@ -95,12 +252,37 @@ struct FSlot
 	double BaseZUU = 0.0;
 };
 
+// THE LRU STAMPS, PARALLEL TO THE TABLE AND ALLOCATED ONLY WHEN ARMED.
+//
+// NOT a field on FSlot, and the reason is the DEFAULT arm rather than the armed
+// one. FSlot is exactly 32 B (three int32, three float, one double -- the "40 B
+// per slot" in CacheSlots' comment and in the header's switch table is stale by
+// one field and is corrected here); a uint32 added to it becomes 40 B once the
+// double's alignment padding is paid, and a 40 B entry no longer divides a 64 B
+// line on a table whose every access is a random probe. Kept outside the struct
+// the 1-way table is unchanged down to its layout, and an armed SET is
+// 2 x 32 B = one cache line's worth.
+//
+// SIZED IN ONE PLACE, beside the table itself, because two independently sized
+// arrays that must agree is the derived-not-verified shape this module keeps
+// paying for. Everything that reads Stamps goes through Table() first.
+TArray<FSlot> Slots;
+TArray<uint32> Stamps;   // EMPTY at 1 way; Slots.Num() entries at 2
+uint32 AccessStamp = 0;  // monotonic; wraps, and is compared as a signed diff
+
 TArray<FSlot>& Table()
 {
-	static TArray<FSlot> Slots;
 	if (Slots.Num() == 0)
 	{
-		Slots.SetNum(CacheSlots());
+		// SETS x WAYS. CacheSlots() is the SET count -- it was the entry count
+		// while the table was direct-mapped and the two were the same number.
+		// The entry count is what `slots=` reports on the window line.
+		const int32 Ways = CacheWays();
+		Slots.SetNum(CacheSlots() * Ways);
+		if (Ways > 1)
+		{
+			Stamps.SetNumZeroed(Slots.Num());
+		}
 	}
 	return Slots;
 }
@@ -115,6 +297,101 @@ FORCEINLINE uint32 SlotIndex(int32 Level, int32 X, int32 Y, uint32 Mask)
 	H = (H ^ uint64(uint32(Y))) * 1099511628211ull;
 	H = (H ^ uint64(uint32(Level))) * 1099511628211ull;
 	return uint32(H ^ (H >> 32)) & Mask;
+}
+
+// THE ONE TRANSCRIPTION OF THE SLOT KEY, and every site that asks "is this
+// footprint cached, and if not, where does its fill go" comes through here:
+// ShadingImpl, FillFromPrecomputed, IsCached and the census probe. A second
+// spelling of the hash, of the exact key compare or of the way choice is the
+// defect shape this module was written to avoid (see StoreSampledSlot), and
+// associativity is exactly the kind of change that invites four copies.
+//
+// PURE: it reads the table and touches nothing. The LRU stamp is refreshed at
+// USE -- a served hit, or a fill -- and never at a probe, because IsCached and
+// WouldSampleForDispatch are CENSUS, and a census that reordered the eviction
+// queue would perturb the arm it exists to measure.
+//
+// AT 1 WAY THIS IS TODAY'S CODE EXACTLY: Index == the hashed slot, bHit == the
+// same three-field compare, bVictimLive == the same Slot.Level >= 0 that
+// cacheEvict has always counted, and neither loop below runs a second
+// iteration.
+struct FLookup
+{
+	uint32 Index = 0;           // hit: the entry to read. miss: the entry a fill takes.
+	int32 Way = 0;              // which way Index is, 0-based (hitWay2= reads this)
+	bool bHit = false;          // Index holds this exact (Level, X, Y)
+	bool bVictimLive = false;   // MISS ONLY: Index holds a DIFFERENT live entry
+	bool bOtherWayLive = false; // MISS ONLY: the way NOT chosen is live
+};
+
+FORCEINLINE FLookup LookupSlot(int32 Level, int32 X, int32 Y)
+{
+	const TArray<FSlot>& T = Table(); // also the lazy sizing, and the ways latch
+	const int32 Ways = CacheWays();
+	const uint32 Base = SlotIndex(Level, X, Y, uint32(CacheSlots() - 1)) * uint32(Ways);
+
+	FLookup Out;
+	for (int32 W = 0; W < Ways; ++W)
+	{
+		const FSlot& S = T[Base + uint32(W)];
+		if (S.Level == Level && S.X == X && S.Y == Y)
+		{
+			Out.Index = Base + uint32(W);
+			Out.Way = W;
+			Out.bHit = true;
+			return Out;
+		}
+	}
+
+	// A miss. Take a free way if the set has one -- nothing live is lost and the
+	// stamps do not enter it -- and otherwise the older stamp. The compare is a
+	// SIGNED DIFFERENCE, not a plain <, so it stays correct across the 32-bit
+	// wrap of AccessStamp. A wrong choice at the wrap would still be a legal
+	// choice, but a comparison that is only usually right is not one this file
+	// will carry.
+	int32 VictimWay = 0;
+	for (int32 W = 1; W < Ways; ++W)
+	{
+		if (T[Base + uint32(VictimWay)].Level < 0)
+		{
+			break;
+		}
+		const bool bCandFree = T[Base + uint32(W)].Level < 0;
+		const bool bCandOlder =
+			int32(Stamps[Base + uint32(W)] - Stamps[Base + uint32(VictimWay)]) < 0;
+		if (bCandFree || bCandOlder)
+		{
+			VictimWay = W;
+		}
+	}
+	Out.Way = VictimWay;
+	Out.Index = Base + uint32(VictimWay);
+	Out.bVictimLive = T[Out.Index].Level >= 0;
+	for (int32 W = 0; W < Ways; ++W)
+	{
+		if (W != VictimWay && T[Base + uint32(W)].Level >= 0)
+		{
+			// The set is in contention but this miss is not evicting: at 1 way,
+			// with the same set index, that live entry WOULD have been thrown
+			// away. evictSpared= is that counterfactual, and it is exact for a
+			// given key stream -- the stream itself of course changes, because
+			// the entries that survive go on to hit.
+			Out.bOtherWayLive = true;
+		}
+	}
+	return Out;
+}
+
+// The LRU touch. ONE place decides that 1 way writes no stamp, so the default
+// arm's hit path stays a pure READ of the entry exactly as it always has been
+// and Stamps stays unallocated.
+FORCEINLINE void TouchSlot(uint32 SlotIdx)
+{
+	if (CacheWays() < 2)
+	{
+		return;
+	}
+	Stamps[SlotIdx] = ++AccessStamp;
 }
 
 // --- invalidation ------------------------------------------------------------
@@ -146,6 +423,22 @@ int64 GuardSkipWithPack = 0; // ...of THOSE that DID hold a valid pack (see belo
 int64 CacheHits = 0;
 int64 CacheMisses = 0;
 int64 CacheEvicts = 0;      // a miss that overwrote a DIFFERENT live entry
+// THE TWO ASSOCIATIVITY COUNTERS. cacheEvict above KEEPS ITS MEANING EXACTLY --
+// "a live entry was overwritten by a different key" -- at both way counts; the
+// arm makes it RARER, it does not redefine it, and renaming or re-scoping it
+// would make every 1-way leg ever logged unreadable against an armed one.
+//   hitWay2=     demand hits served from the SECOND way. A hard zero at 1 way
+//                (there is no second way) and impossible to fake at 2: these
+//                are hits that the direct-mapped table could not have had. THE
+//                ENGAGEMENT COUNTER -- armed with hitWay2=0 is an inert arm.
+//   evictSpared= misses that found a FREE way in a set that still held a live
+//                entry. At 1 way, with the same set index, every one of those
+//                was an eviction -- so this is the exact count of collision
+//                evictions the arm removed from this window's key stream.
+//                cacheEvict + evictSpared at 2 ways is the number cacheEvict
+//                alone would have read at 1, for the same stream.
+int64 HitsWay2 = 0;
+int64 EvictsSpared = 0;
 int64 SentinelUncached = 0; // "no surface gate" results, never cached (see below)
 int64 RootFlushes = 0;
 int64 OffThread = 0;        // HARD ZERO: this path is game-thread only
@@ -279,9 +572,11 @@ bool IsCached(int32 Level, int32 X, int32 Y)
 		// stored and warming is pure loss.
 		return false;
 	}
-	const uint32 Mask = uint32(CacheSlots() - 1);
-	const FSlot& Slot = Table()[SlotIndex(Level, X, Y, Mask)];
-	return Slot.Level == Level && Slot.X == X && Slot.Y == Y;
+	// Through the one lookup, so the probe cannot disagree with the path it is
+	// probing for -- at 2 ways "cached" means EITHER way holds the key, and a
+	// probe that only looked at way 0 would send the warm loop to re-fill
+	// entries that are already there.
+	return LookupSlot(Level, X, Y).bHit;
 }
 
 // --- the cold-burst census probe (header: THE COLD-BURST CENSUS PROBE) -------
@@ -300,7 +595,7 @@ bool IsCached(int32 Level, int32 X, int32 Y)
 //   off game thread    -> ShadingImpl's offThread arm samples unconditionally
 //   cache bit off      -> no table exists: every call samples
 //   anchor mismatch    -> the table is flushed and then sampled
-//   slot miss          -> samples
+//   slot miss          -> samples      (MISS = no WAY of the set holds the key)
 //   slot hit           -> WARM (the audit re-sample is the stated inexactness)
 //
 // The publish guard is not in this list because it cannot fire at the dispatch
@@ -328,9 +623,7 @@ bool WouldSampleForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key, const U
 		// census that missed it would under-report a whole tick's burst.
 		return true;
 	}
-	const uint32 Mask = uint32(CacheSlots() - 1);
-	const FSlot& Slot = Table()[SlotIndex(Key.Level, Key.Key.X, Key.Key.Y, Mask)];
-	return !(Slot.Level == Key.Level && Slot.X == Key.Key.X && Slot.Y == Key.Key.Y);
+	return !LookupSlot(Key.Level, Key.Key.X, Key.Key.Y).bHit;
 }
 
 void WarmForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
@@ -407,11 +700,9 @@ bool FillFromPrecomputed(const VoxelCoords::FVoxelLevelChunkKey& Key,
 	const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
 	const FVector RootLoc = AnchorTableToRoot(Root);
 	const double ChunkWorldZ = RootLoc.Z + OriginRelative.Z;
-	const uint32 Mask = uint32(CacheSlots() - 1);
-	const uint32 SlotIdx = SlotIndex(Key.Level, Key.Key.X, Key.Key.Y, Mask);
+	const FLookup Look = LookupSlot(Key.Level, Key.Key.X, Key.Key.Y);
 
-	if (const FSlot& Slot = Table()[SlotIdx];
-	    Slot.Level == Key.Level && Slot.X == Key.Key.X && Slot.Y == Key.Key.Y)
+	if (Look.bHit)
 	{
 		// A demand sample (or an earlier fill) beat the task home. Keep what is
 		// there: the two are the same function of the same inputs, but the one
@@ -423,7 +714,12 @@ bool FillFromPrecomputed(const VoxelCoords::FVoxelLevelChunkKey& Key,
 		return false;
 	}
 
-	return StoreSampledSlot(SlotIdx, Key, Params, ChunkWorldZ, /*bWarmFill*/ true);
+	// Look.Index is the free way when the set has one and the older of the two
+	// when it does not -- a warm fill evicts under the same LRU rule a demand
+	// fill does. Still uncounted in cacheEvict, for the reason the miss path
+	// below states: warm traffic must not land in the counter the A/B is
+	// decided on.
+	return StoreSampledSlot(Look.Index, Key, Params, ChunkWorldZ, /*bWarmFill*/ true);
 }
 
 void FlushStats(bool bForce)
@@ -442,6 +738,8 @@ void FlushStats(bool bForce)
 	{
 		return; // control arm: this module prints nothing at all
 	}
+
+	WarnWaysChangedIfLate();
 
 	const int32 M = Mode();
 	const double WindowSec = FMath::Max(1e-6, Now - LastLogSeconds);
@@ -467,9 +765,11 @@ void FlushStats(bool bForce)
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel apply fast (window): mode=%d(%s%s%s) calls=%lld avoided=%lld (%.1f%%) ")
 	       TEXT("| guardSkip=%lld (withPack=%lld) cacheHit=%lld cacheMiss=%lld cacheEvict=%lld ")
+	       TEXT("hitWay2=%lld evictSpared=%lld ")
 	       TEXT("sentinel=%lld | sampled=%lld sampleUs/sample=%.2f sampleUs/call=%.2f ")
 	       TEXT("sampleMsWindow=%.1f | audit=%lld mismatch=%lld maxMismatchUU=%.4f ")
-	       TEXT("| warmFill=%lld warmHit=%lld | rootFlush=%lld offThread=%lld slots=%d win=%.1fs"),
+	       TEXT("| warmFill=%lld warmHit=%lld | rootFlush=%lld offThread=%lld ")
+	       TEXT("ways=%d sets=%d slots=%d win=%.1fs"),
 	       M,
 	       (M & kModeGuard) ? TEXT("guard") : TEXT("-"),
 	       (M & kModeCache) ? TEXT("+cache") : TEXT(""),
@@ -478,15 +778,21 @@ void FlushStats(bool bForce)
 	       Calls > 0 ? 100.0 * double(Avoided) / double(Calls) : 0.0,
 	       (long long)GuardSkipped, (long long)GuardSkipWithPack,
 	       (long long)CacheHits, (long long)CacheMisses, (long long)CacheEvicts,
+	       (long long)HitsWay2, (long long)EvictsSpared,
 	       (long long)SentinelUncached,
 	       (long long)Sampled, SampleUsPerSample, SampleUsPerCall, SampleSeconds * 1000.0,
 	       (long long)AuditsRun, (long long)AuditMismatches, MaxMismatchUU,
 	       (long long)WarmFills, (long long)WarmHits,
 	       (long long)RootFlushes, (long long)OffThread,
-	       CacheSlots(), WindowSec);
+	       // slots= IS THE ENTRY COUNT, not the set count, so an armed leg reads
+	       // 262144 where a control leg reads 131072 and cannot be mistaken for
+	       // one. ways= says the same thing without arithmetic; both print
+	       // because an arm that can be read as inert is the house failure.
+	       CacheWays(), CacheSlots(), CacheSlots() * CacheWays(), WindowSec);
 
 	Calls = Sampled = GuardSkipped = GuardSkipWithPack = 0;
 	CacheHits = CacheMisses = CacheEvicts = SentinelUncached = 0;
+	HitsWay2 = EvictsSpared = 0;
 	WarmFills = WarmHits = 0;
 	RootFlushes = OffThread = 0;
 	AuditsRun = AuditMismatches = 0;
@@ -553,6 +859,7 @@ static bool StoreSampledSlot(uint32 SlotIdx, const VoxelCoords::FVoxelLevelChunk
 	Slot.Precipitation = Params.Y;
 	Slot.GradPacked = Params.W;
 	Slot.BaseZUU = double(Params.Z) + ChunkWorldZ;
+	TouchSlot(SlotIdx); // a fill is a use; no-op at 1 way
 	if (bWarmFill)
 	{
 		++WarmFills; // the slot write IS the product of a warm call
@@ -665,12 +972,21 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 	const FVector RootLoc = AnchorTableToRoot(Root);
 
 	const double ChunkWorldZ = RootLoc.Z + OriginRelative.Z;
-	const uint32 Mask = uint32(CacheSlots() - 1);
-	const uint32 SlotIdx = SlotIndex(Key.Level, Key.Key.X, Key.Key.Y, Mask);
-	FSlot& Slot = Table()[SlotIdx];
+	// AFTER AnchorTableToRoot, always: that call can flush every slot, and a
+	// lookup taken before it would name an entry that no longer exists.
+	const FLookup Look = LookupSlot(Key.Level, Key.Key.X, Key.Key.Y);
+	const uint32 SlotIdx = Look.Index;
 
-	if (Slot.Level == Key.Level && Slot.X == Key.Key.X && Slot.Y == Key.Key.Y)
+	if (Look.bHit)
 	{
+		const FSlot& Slot = Table()[SlotIdx];
+		// The LRU refresh, and it is here rather than in LookupSlot because a
+		// PROBE must not reorder the eviction queue (see LookupSlot). No-op at
+		// 1 way. Warm hits refresh too: the warm loop asking for a footprint is
+		// evidence the anchor is walking toward it, which is exactly what the
+		// stamp is for -- and unlike the counters, the stamp is not a
+		// population the A/B is read on.
+		TouchSlot(SlotIdx);
 		if (bWarmAhead)
 		{
 			// The warm loop probes IsCached before calling, so this is ~0 by
@@ -681,6 +997,12 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 			return FVoxelBrickChunkShading::Neutral();
 		}
 		++CacheHits;
+		if (Look.Way > 0)
+		{
+			// A hit the direct-mapped table could not have had. Counted on the
+			// DEMAND population only, so it divides into cacheHit= directly.
+			++HitsWay2;
+		}
 
 		FVector4f Cached;
 		Cached.X = Slot.Temperature;
@@ -720,13 +1042,22 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 	if (!bWarmAhead)
 	{
 		++CacheMisses;
-		if (Slot.Level >= 0)
+		if (Look.bVictimLive)
 		{
-			// A live entry for a DIFFERENT column is being overwritten. cacheEvict
-			// ~= cacheMiss with a low hit rate is the table thrashing and wants
-			// -VoxelApplyColumnCache raised; cacheEvict ~= 0 with a low hit rate
-			// means the KEY is wrong, which is a completely different problem.
+			// A live entry for a DIFFERENT column is being overwritten. THE
+			// MEANING IS UNCHANGED AT BOTH WAY COUNTS -- at 2 ways it means both
+			// ways were live and neither was this key, so the older one goes.
+			// cacheEvict ~= cacheMiss with a low hit rate is the table thrashing
+			// and wants -VoxelApplyColumnCache raised; cacheEvict ~= 0 with a low
+			// hit rate means the KEY is wrong, which is a completely different
+			// problem.
 			++CacheEvicts;
+		}
+		else if (Look.bOtherWayLive)
+		{
+			// 2 ways only, and unreachable at 1 by construction: the set was in
+			// contention and the fill took the free way instead of evicting.
+			++EvictsSpared;
 		}
 	}
 
@@ -734,10 +1065,13 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 	// warm loop's own warmBudgetMs (the `Voxel warm-ahead` window line) and not
 	// in SampleSeconds -- Sampled would not move with it and sampleUs/sample
 	// would read inflated. A warm fill CAN overwrite a live entry for another
-	// column; with 131,072 slots against a working set of a few thousand
-	// footprints that collision is rare enough not to earn its own counter --
-	// and if it ever mattered, the displaced column re-misses through the
-	// counted path, so cacheEvict/cacheMiss still names it.
+	// column and is still not counted in cacheEvict: the displaced column
+	// re-misses through the counted path, so cacheEvict/cacheMiss still names
+	// it, and a warm write landing in the counter the A/B is decided on is the
+	// exact contamination WarmFills exists to prevent. (The "rare enough not to
+	// earn a counter" that used to be written here was WRONG, and the arithmetic
+	// at CacheWays() above says why: at a 0.56 load factor the collision rate is
+	// 43%, not a rounding error. It is uncounted by policy, not by rarity.)
 	const FVector4f Fresh = bWarmAhead ? SampleParams(Root, OriginRelative, Key.Level)
 	                                   : Sample();
 
