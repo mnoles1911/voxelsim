@@ -601,3 +601,35 @@ traversal path exhausted (five refuted approaches + the bound arm retired at
 docs/bound-arm-retired-2026-08-28.md), the governing lever is RAY COUNT / internal
 resolution, traded against image quality judged from pinned captures -- the owner is
 judging stills, not editor flights, for now. Programme: docs/hundred-fps-2026-08-28.md.
+---
+
+## 2026-08-29: 50% INTERNAL RESOLUTION SHIPS -- p95 CROSSES 100 fps
+
+**Owner decisions executed today:** "Go over 100 FPS" / "Retire 50k" /
+"All 3 of those screen captures look the same" (the resolution stills).
+
+**SHIPPED:**
+- `r.ScreenPercentage=50` (DefaultEngine.ini, commit 62a2ce5): p95 103.6 fps,
+  p50 145, on matched legs; owner-judged stills. Flag-free confirmation leg
+  pending the next box cycle. Standing check: one ordinary flight for shimmer.
+- VelocityLead 4.0 s / clamp 240 m (1e75c7b): +7% adoption supply, zero waste.
+
+**THE MARCHER DRAWING BOARD, run to completion** (docs/marcher-cost-autopsy-
+2026-08-29.md): four families killed with proof -- empty-space skips (seven
+arms), per-lane clamps (Bound -6.0/-12.6 ms, anySolid null x2, ZTight
++1.2/+0.4), divergence (fixed wave census: chunk loop 99% lane-full at sky;
+the first 1/64 reading was an instrument bug caught by its own pre-registered
+falsifier -- headline was committed early, corrected within the hour, both
+recorded). The corrected cost law: cost tracks WALK ENTRIES; the sky
+fallthrough-retry rate is ~90% of segments with a 0.054% hit rate
+(59.0M walks -> 31.9k hits per window).
+
+**IN FLIGHT:** voxel.March.RungProbe -- skip a retry rung only when the
+block-occupancy grid PROVES the coarser level empty along the interval (exact,
+not conservative: a rung hit requires residency). Gates: substituted must not
+fall, uncovered must not rise, timing at sky AND down (the horizon-only gate
+is banned; it is how the bound passed review and died in the field).
+
+**Stutter half of Goal 3 (0.35% vs 0.10%):** warming arms built and screened
+null as trickles (dd4ee9e); the retry-rung share of worst frames is the next
+candidate via RungProbe; demand-side cold-sample cap scoped, ungated.
