@@ -671,6 +671,12 @@ mechanism flawless (launched=drained=filled, no kill signals, holes clean,
 maxMs 40 = best of day) but NULL on its verdict counter: cacheMiss -15-25%
 not hard, burst ticks barely dented. Capacity was not the constraint;
 COVERAGE is -- the warm walk's candidate set and demand's ~800 colds/window
-are mostly disjoint. Default stays 0. Pre-registered next step: add LEVEL
-attribution to the cold-burst census before any warm arm is touched again --
-this family is now three builds against an unmeasured population.
+are mostly disjoint. Default stays 0. The level attribution then ran same
+day (4fdd5db, CBL-map): colds are L0-heavy (55/25/12% at L0/L1/L2) -- the
+levels the walk already targets -- and cacheEvict ~400/window against ~900
+colds names the real mechanism: the DIRECT-MAPPED shading table recycles
+warm entries by collision, so much of demand's cold set is the walk's own
+past fills. THE WARM FAMILY IS CLOSED (three arms, one shared wrong
+premise); the successor question is table shape (associativity / victim
+slot / sizing), judged on cacheEvict and cacheMiss falling together under
+audit mismatch=0.

@@ -38,11 +38,26 @@ set, aimed at the wrong set.
   suspect (likely a lifetime max latched during fill, not a window max);
   read the ++ site before ever quoting it again.
 
-## The named next step (before any further warm work)
+## The named next step -- RUN SAME DAY, and the map is decisive
 
-Attribute the census's colds: add level (and ring, if cheap) to the
-cold-burst census so one leg says WHERE demand's ~800 colds/window live.
-If they are coarse-level ring maintenance, the walk needs a coarse-level
-candidate source, not more capacity. No warm arm should be tuned until that
-one leg has been read -- this family has now been built three times against
-an unmeasured population.
+coldByLevel added to the census (4fdd5db) and read on CBL-map:
+
+    L0 ~55%   L1 ~25%   L2 ~12%   L3 ~0   L4-L6 episodic pulses of ~40-50
+
+The colds are NOT coarse-level ring maintenance -- they live at the fine
+levels the walk already targets. The missing column was on the same line
+all along: cacheEvict ~370-490/window against ~800-1,000 colds. The shading
+table is DIRECT-MAPPED (131,072 slots), and collision evictions run at half
+the cold rate -- so a large share of demand's colds are RE-samples of ground
+that was warm and got collision-evicted. No predictive walk can pre-fill a
+churn population; the walk and demand were "disjoint" because demand's set
+is substantially THE WALK'S OWN PAST FILLS, recycled by collisions.
+
+## The warm family is CLOSED. The successor question is cache shape
+
+Fourth-arm candidates are not warmers: (a) set-associativity or a victim
+slot for the table (a collision then evicts the colder of two, not whoever
+hashed there); (b) sizing/keying analysis -- 131,072 slots against how many
+live footprints? Either is a VoxelApplyBatch.cpp table change, gated by the
+audit (mismatch=0) and judged on cacheEvict and cacheMiss falling together
+on the submit population. Nobody should build a fourth warmer.
