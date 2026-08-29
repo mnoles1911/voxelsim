@@ -685,5 +685,20 @@ the admission front; no cache shape or predictor removes them, and the
 queue-ahead variant is refused on the throughput ladder's own evidence
 (flight queue near-empty). THE WHOLE COLD-SHADING CAMPAIGN IS CLOSED: the
 remaining levers are a cheaper sample (a quality/product question) or
-acceptance -- today's end state is hitches 2-7 per leg, maxMs 37-46, stutter
-~0.32% vs the 0.10% goal, remainder diffuse.
+acceptance.
+
+**THEN THE PARKED STAGGER WAS UNPARKED AND SHIPPED** (default 1,
+docs/outer-ring-stagger-revisited-2026-08-29.md): the same code August called
+"a trade worth offering, not one worth taking" now eliminates hitch frames
+outright (4-6 -> 0, both armed legs) and halves stutters (0.34% -> 0.175%,
+against the 0.10% goal) with p50/p95/p99 all slightly better. The arm did not
+change -- its competition did (atlas class extinct + faster frame). Its cost
+is bounded at 0.265 m of far-field arrival lag (2 ticks at 176 Hz, 23.4 m/s)
+against boundaries 512-4096 m out. Moving captures were built to judge it
+(ead5f0b, distance-triggered, pose matched to 2-6 cm) and returned a NEGATIVE
+RESULT worth keeping: a same-config rerun differs from itself by 8-71% of
+pixels because streaming arrival is nondeterministic, so a moving pixel A/B
+cannot resolve effects this small -- the half-res question is in the same trap.
+
+**End state today: hitches 0, stutter ~0.175% vs the 0.10% goal, p50 7.0 ms
+(143 fps), p95 10.8 (92), p99 15.2, worst frame ~26-30 ms.**

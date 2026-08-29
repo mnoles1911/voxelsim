@@ -3831,11 +3831,56 @@ int32 BandSeedCpuEnabled()
 //
 // A COVERAGE CHECK IS PART OF THIS CHANGE, NOT A FOLLOW-UP. `substituted` and
 // matched captures decide it; a timing table alone must not.
+//
+// ---- SHIPPED DEFAULT 1, 2026-08-29 (docs/outer-ring-stagger-revisited-
+// 2026-08-29.md). PARKED AT 0 ON 2026-08-28 AND UNPARKED WITHOUT THE CODE
+// CHANGING -- what changed was its competition. ----------------------------
+//
+// August's verdict was "a better worst frame, and it moves the stated gate by
+// NOTHING". Re-measured on four alternated legs after the atlas coverage-disc
+// fix went in (which made the 33-43 ms atlas metronome extinct) and after 50%
+// resolution landed (typical frame 8.5 -> 7.1 ms), the ring-coincidence spike
+// is now the LARGEST thing left above the stutter bar, and every column moves:
+//
+//     metric        ctl-a   ctl-b  |  on-a   on-b
+//     hitches>=33ms      4       6  |     0      0    ELIMINATED, both legs
+//     stutterPct     0.32    0.36  |  0.15   0.20    -49% (the open goal: 0.10)
+//     worst frame   43.80   45.26  | 25.92  30.32    -37%
+//     p95           11.20   11.00  | 10.90  10.80
+//     p99           15.70   15.60  | 15.20  15.40
+//     tracked      79,889  79,997  | 79,809 79,809   -0.10 to -0.24%
+//
+// Engagement proven both armed legs (25 windows deferred>0, maxStreak 2);
+// control prints `stagger=off`, a different reading from armed-and-idle.
+//
+// THE COST, BOUNDED IN THE UNIT THAT MATTERS. The trade is far-field geometry
+// arriving later, and the honest size of "later" is not a percentage of chunks
+// -- it is DISTANCE. Measured tick rate on the armed leg is 176 Hz (353 ticks
+// per 2 s window) at 23.4 m/s, so one tick is 0.133 m of camera travel and the
+// worst observed streak of 2 ticks is 0.265 m. Against a boundary that sits
+// 512-4096 m away that is 0.05% to 0.007% of the radius. The far ring arrives
+// when the camera is a foot further along.
+//
+// AND THE PICTURE TEST CAME BACK INCONCLUSIVE -- recorded because it is the
+// reason the arithmetic above is doing the work. Moving captures were built for
+// this decision (tools/voxel-moving-capture.ps1, distance-triggered so both arms
+// shoot the same ground; pose matched to 2-6 cm). The pose matching works. What
+// defeats the comparison is that a SAME-CONFIG rerun differs from itself by
+// 8-71% of pixels at these poses: streaming arrival order is not deterministic
+// under load, so a moving frame catches a different in-progress world every run.
+// The cross-arm difference is BELOW that floor at four of five distances. So the
+// pixel A/B cannot resolve an effect this small, and no amount of reruns will
+// fix that -- which is itself worth knowing before anyone spends a day on it
+// again (the half-res question is in the same trap).
+//
+// Set -VoxelAmortizeOuterScans=0 to revert to the pre-2026-08-29 behaviour.
 int32 AmortizeOuterScans()
 {
 	static const int32 Value = []
 	{
-		int32 V = 0;
+		// DEFAULT 1. See the shipping block above for the four-leg table, the
+		// 0.265 m cost bound, and why the image A/B could not decide it.
+		int32 V = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelAmortizeOuterScans="), V);
 		return V;
 	}();

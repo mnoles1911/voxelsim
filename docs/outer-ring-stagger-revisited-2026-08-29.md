@@ -59,3 +59,40 @@ percentile slightly rather than trading them. Default stays 0 only until the
 moving captures answer the far-field question, because a streaming-schedule
 change is a claim about what the world looks like while you fly through it,
 and this project does not take those claims on timing alone.
+
+## The image question: ANSWERED BY ARITHMETIC, because the picture test could not
+
+Moving captures were built for this decision (commit ead5f0b): a shutter that
+fires on distance travelled so both arms photograph the same ground.
+**The pose matching works** -- five matched distances, position gaps 2-6 cm,
+shutter bracket 0.165 m, verified by tools/voxel-pair-moving-shots.py.
+
+**And the comparison still cannot decide it.** A SAME-CONFIG rerun (stgCtl vs
+stgCtl2, identical switches) differs from itself by:
+
+    distance   floor (ctl vs ctl2)   arm (ctl vs on)
+      512 m      70.72% / mean 38.54   68.70% / 36.93   below floor
+     1024 m      18.33% /  5.35        30.25% /  8.86   above floor
+     1536 m       8.10% /  3.11        10.27% /  3.67   below floor
+     2048 m      59.00% / 22.01        20.79% /  5.64   below floor
+     2560 m      16.76% /  5.24         6.43% /  2.75   below floor
+
+Streaming arrival order is not deterministic under load, so a moving frame
+catches a different in-progress world on every run. The cross-arm difference
+is smaller than the same-arm difference at four of five distances. **A moving
+pixel A/B cannot resolve an effect this small, and reruns will not fix it** --
+recorded because the half-res question sits in the same trap, and a day could
+be spent there.
+
+So the cost is bounded in the unit that actually matters -- DISTANCE, not
+pixels and not chunk counts:
+
+    tick rate (armed leg)  353 ticks / 2 s window = 176 Hz -> 5.67 ms
+    camera speed           23.4 m/s
+    one tick               0.133 m of camera travel
+    worst observed streak  2 ticks = 0.265 m
+    against the boundary   512 m -> 0.05%    4096 m -> 0.007%
+
+**The far ring arrives when the camera is about a foot further along.** That is
+the whole trade, and it is why this ships: shipped default 1, revert with
+`-VoxelAmortizeOuterScans=0`.
