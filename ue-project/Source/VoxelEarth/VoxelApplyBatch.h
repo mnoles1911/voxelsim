@@ -370,16 +370,68 @@ FORCEINLINE FVoxelBrickChunkShading ShadingForPublish(const VoxelCoords::FVoxelL
 // -VoxelApplyCap= IS RETIRED. VoxelDebug.cpp warns if it is passed; keep that
 // warning -- it is what stops a doc-driven leg silently measuring nothing.
 
+// --- THE COLD-BURST CENSUS PROBE (docs/hundred-fps-2026-08-28.md goal 3b) ---
+//
+// "Did THIS call pay the slow sample?", answered without sampling anything and
+// without changing ShadingForDispatchSlow's signature. It exists for the
+// pre-registered coverage proof named in dd4ee9e's message: the demand-side cap
+// ("at most N cold shadings per submit tick, excess submits wait a tick")
+// "needs its own coverage proof before anyone builds it", and that proof needs
+// to know, per submit, whether the shading it just built was cold.
+//
+// WHY IT IS NOT `!IsCached(...)`. IsCached answers the WARM LOOP's question --
+// "is there a slot for this footprint" -- and is deliberately blind to two
+// states in which ShadingImpl samples anyway:
+//   * Mode() == 0. The wrapper below folds to the raw expression, the table is
+//     never consulted at all, and EVERY call pays a full four-column sample.
+//   * A moved or re-worlded root. ShadingImpl compares Root's location against
+//     CachedRootLoc exactly and, on a mismatch, flushes the WHOLE table and
+//     then samples -- while the slot IsCached looked at still matches.
+// A census built on IsCached would report both of those calls warm, which
+// under-counts precisely the bursts this instrument exists to size. So this
+// mirrors ShadingImpl's own decision chain instead: same file, same statics,
+// same SlotIndex, no second transcription of the slot key.
+//
+// ONE KNOWN INEXACTNESS, STATED RATHER THAN HIDDEN. An AUDITED cache hit
+// (-VoxelApplyColumnCacheAudit=N; 0 = off, and off is the default on every leg)
+// re-samples to compare, and this reports it WARM. The publish guard cannot
+// make it wrong at the dispatch site -- bAllowGuard is false there, so that arm
+// is unreachable. With the audit off this returns exactly "ShadingImpl will
+// call SampleParams for this key".
+//
+// READ-ONLY BY CONSTRUCTION: no counter moves, no slot is written, no clock is
+// read, and nothing branches on the answer inside this module -- an instrument
+// that becomes what it measures is a recorded failure on this exact path.
+bool WouldSampleForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                            const USceneComponent& Root);
+
 // Dispatch-site twin of ShadingForPublish, and OFF IS FREE HERE FOR THE SAME
 // REASON: with the switch absent this folds to the exact expression it
 // replaced, so no branch survives, no counter moves, and a control leg prints
 // no 'Voxel apply fast' line at all. There is no pack at this site and the
 // result is always consumed, so there is no guard arm to select.
+//
+// bOutCold is the census tap and DEFAULTS TO NULLPTR so that every other call
+// site is byte-identical to before: the pointer is a compile-time constant at
+// each inlined site, so the probe and its branch fold away entirely wherever it
+// is not passed. Where it IS passed, `true` means "this call paid the slow
+// four-column sample" -- see WouldSampleForDispatch above for what that covers
+// in each mode. Writing through it is the ONLY new side effect of this wrapper;
+// no path in the streaming pipeline may branch on it.
 FORCEINLINE FVoxelBrickChunkShading ShadingForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
                                                        const USceneComponent& Root,
                                                        FSampleParamsFn SampleParams,
-                                                       FShadingFromFn ShadingFrom)
+                                                       FShadingFromFn ShadingFrom,
+                                                       bool* bOutCold = nullptr)
 {
+	// ASKED BEFORE THE CALL, NECESSARILY: the slow path fills the slot it was
+	// asked about, so the same question after the fact answers "warm" for every
+	// call ever made. A cold report is a statement about the state the call
+	// FOUND, not the state it left.
+	if (bOutCold != nullptr)
+	{
+		*bOutCold = WouldSampleForDispatch(Key, Root);
+	}
 	if (Mode() == 0)
 	{
 		return ShadingFrom(SampleParams(

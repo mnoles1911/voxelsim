@@ -269,6 +269,55 @@ bool IsCached(int32 Level, int32 X, int32 Y)
 	return Slot.Level == Level && Slot.X == X && Slot.Y == Y;
 }
 
+// --- the cold-burst census probe (header: THE COLD-BURST CENSUS PROBE) -------
+//
+// A MIRROR OF ShadingImpl's DECISION CHAIN, DELIBERATELY IN THIS FILE. Every
+// early exit below is a copy of a decision made a hundred lines down in
+// ShadingImpl, and it is only defensible because it sits beside that function
+// over the same statics and calls the same SlotIndex -- there is no second
+// transcription of the slot key or the anchor test, which is the defect shape
+// this module was written to avoid. If ShadingImpl's chain changes, THIS
+// CHANGES WITH IT; the failing reading that would catch a drift is a census in
+// which cold shadings stop tracking the 'Voxel apply fast' line's cacheMiss.
+//
+// Order matches ShadingImpl exactly:
+//   Mode() == 0        -> the wrapper folded to the raw expression: always samples
+//   off game thread    -> ShadingImpl's offThread arm samples unconditionally
+//   cache bit off      -> no table exists: every call samples
+//   anchor mismatch    -> the table is flushed and then sampled
+//   slot miss          -> samples
+//   slot hit           -> WARM (the audit re-sample is the stated inexactness)
+//
+// The publish guard is not in this list because it cannot fire at the dispatch
+// site: ShadingForDispatchSlow passes bAllowGuard = false.
+bool WouldSampleForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key, const USceneComponent& Root)
+{
+	const int32 M = Mode();
+	if (M == 0)
+	{
+		return true;
+	}
+	if (!IsInGameThread())
+	{
+		return true;
+	}
+	if ((M & kModeCache) == 0)
+	{
+		return true;
+	}
+	if (!bCacheAnchored || Root.GetComponentLocation() != CachedRootLoc || Root.GetWorld() != CachedWorld)
+	{
+		// ShadingImpl clears every slot here and falls through to the sampler,
+		// so this call is cold whatever the slot below happens to hold. Rare
+		// (counted as rootFlushes on the window line) but not zero, and a
+		// census that missed it would under-report a whole tick's burst.
+		return true;
+	}
+	const uint32 Mask = uint32(CacheSlots() - 1);
+	const FSlot& Slot = Table()[SlotIndex(Key.Level, Key.Key.X, Key.Key.Y, Mask)];
+	return !(Slot.Level == Key.Level && Slot.X == Key.Key.X && Slot.Y == Key.Key.Y);
+}
+
 void WarmForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
                      const USceneComponent& Root,
                      FSampleParamsFn SampleParams,

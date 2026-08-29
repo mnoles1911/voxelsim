@@ -8675,6 +8675,50 @@ struct FVoxelWorldImpl
 	double AccumGpuSubmitMgrMs = 0.0;     // Manager->Submit + GpuJobsPending insert
 	double AccumGpuSubmitTotalMs = 0.0;   // whole SubmitGpuMeshJob wall
 	int64 GpuSubmitCallsSinceLog = 0;     // calls entered (success, decline, speculative)
+	// ===================================================================
+	// THE COLD-BURST CENSUS (docs/hundred-fps-2026-08-28.md goal 3b)
+	// ===================================================================
+	//
+	// MEASUREMENT ONLY. Nothing in this block gates, defers, reorders or caps
+	// anything; every member here is written from a `++` and read from one log
+	// line. See the fold site (beside ++AccumTicks) for the doctrine and the
+	// decision rule these numbers exist to settle.
+	//
+	// WHAT THEY MEASURE. reqHdr above prices the cold shading in milliseconds;
+	// it cannot say how many cold shadings land in the SAME tick, and that
+	// count -- not the total -- is what a demand-side cap would have to defer.
+	// A window with 1,000 cold shadings spread one per tick needs no cap at
+	// all; the same 1,000 arriving as 60 bursts of 17 is the stutter. These
+	// separate those two worlds.
+	//
+	// Per-tick working state, folded and cleared at the end of every streaming
+	// tick. NOT reset at the window edge (MaybeLogCounters can run mid-tick and
+	// zeroing it there would silently drop a burst in progress).
+	int32 ColdShadingsThisTick = 0;
+	// Window totals. ColdTotalSinceLog is counted at the ++ site, not summed
+	// from the fold, so it stays honest even if a submit ever happens outside
+	// the folded block -- and coverable + holeRisk is incremented at that SAME
+	// site, which is what makes the partition exact by construction.
+	int64 ColdTotalSinceLog = 0;
+	int64 ColdTicksSinceLog = 0;        // ticks with >= 1 cold shading
+	int32 ColdMaxPerTickSinceLog = 0;   // worst single tick in the window
+	// Burst histogram over ticks, buckets 1 / 2 / 3-4 / 5-8 / 9-16 / 17+.
+	// Ticks with zero cold shadings are NOT a bucket: their count is
+	// (AccumTicks - ColdTicksSinceLog), printed as the coldTicks denominator.
+	int64 ColdBurstHistSinceLog[6] = {0, 0, 0, 0, 0, 0};
+	// The cap arithmetic, per candidate N: sum over ticks of max(0, cold - N).
+	// This is exactly the number of submits the cap would have pushed to a
+	// later tick over the window -- the cost side of the trade.
+	int64 ColdDeferCap2SinceLog = 0;
+	int64 ColdDeferCap4SinceLog = 0;
+	int64 ColdDeferCap8SinceLog = 0;
+	// The safety side of the trade, classified per COLD shading only (~1,000 a
+	// window, so the ancestor walk is cheap). coverable = some coarser-level
+	// ancestor is resident AND HoldsTerrain, so deferring this submit a tick or
+	// two substitutes the coarser level and opens no hole. holeRisk = nothing
+	// coarser covers this ground; deferring it is a visible black arc.
+	int64 ColdCoverableSinceLog = 0;
+	int64 ColdHoleRiskSinceLog = 0;
 	// Loop-side bracket of SUCCESSFUL demand fork iterations (SubmitStart to
 	// the fork branch's continue) -- loopMinusFn = this minus totalMs is the
 	// fork-branch cost OUTSIDE SubmitGpuMeshJob when positive; negative means
@@ -10813,6 +10857,60 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		AccumDispatchLoopMs += ThisFrameDispatchLoopMs;
 		AccumGpuManagerTickMs += ThisFrameGpuManagerTickMs;
 		AccumRecomputeMs += ThisFrameRecomputeMs;
+
+		// --- THE COLD-BURST CENSUS: the per-tick fold ----------------------
+		//
+		// WHAT THIS IS FOR. dd4ee9e shipped two predictive warming arms against
+		// the stutter half of the >100 fps goal (goal 3b) and both came out
+		// NULL: cacheMiss fell 24% and stutterPct did not move, because "the
+		// worst frames batch MANY cold footprints at once, which a per-tick
+		// trickle cannot pre-clear". The shape that fits is a DEMAND-SIDE CAP
+		// -- at most N cold shadings per submit tick, excess submits wait a
+		// tick -- and that commit pre-registered the condition on building it:
+		// it "needs its own coverage proof before anyone builds it". This
+		// census is that proof, and it is the whole of this change.
+		//
+		// THE DECISION RULE, WRITTEN DOWN BEFORE THE NUMBERS ARRIVE. The cap is
+		// buildable only if the BURST EXCESS -- the shadings a cap would push
+		// to a later tick, printed as wouldDefer capN -- is overwhelmingly
+		// `coverable`: a coarser-level ancestor already resident and holding
+		// terrain, so the marcher's fallthrough draws that ground while the
+		// fine submit waits. A material `holeRisk` share of the excess KILLS
+		// the cap: deferring those submits trades a stutter for a black arc,
+		// and `uncovered` is not an arc detector -- this classification is.
+		// A cap whose excess is small also kills it, for the opposite reason:
+		// nothing was deferred, so nothing was bought.
+		//
+		// THIS CHANGE IS BEHAVIOUR-NEUTRAL AND MUST STAY THAT WAY. No submit is
+		// delayed, reordered, skipped or gated by anything below; the counters
+		// are read by one log line and by nothing else in the pipeline. The
+		// instant a streaming decision reads one of them, the census stops
+		// measuring the world the cap would be built for.
+		//
+		// FAILING READINGS (every counter must be able to come out the other
+		// way): coldTotal ~ 0 with the 'Voxel apply fast' line still reporting
+		// cacheMiss in the hundreds means the probe is answering for a
+		// different population and the census is measuring nothing; maxPerTick
+		// ~ 1 with the histogram all in bucket 1 means there are no bursts and
+		// dd4ee9e's diagnosis was wrong; coverable + holeRisk != coldTotal
+		// means the partition is broken and no verdict may be read off the
+		// line at all.
+		if (ColdShadingsThisTick > 0)
+		{
+			++ColdTicksSinceLog;
+			ColdMaxPerTickSinceLog = FMath::Max(ColdMaxPerTickSinceLog, ColdShadingsThisTick);
+			const int32 N = ColdShadingsThisTick;
+			const int32 Bucket = (N == 1) ? 0 : (N == 2) ? 1 : (N <= 4) ? 2 : (N <= 8) ? 3 : (N <= 16) ? 4 : 5;
+			++ColdBurstHistSinceLog[Bucket];
+			// max(0, N - cap), summed. The `> 0` guard above cannot hide a
+			// contribution here: a tick with zero cold shadings defers zero
+			// under every candidate cap.
+			ColdDeferCap2SinceLog += FMath::Max(0, N - 2);
+			ColdDeferCap4SinceLog += FMath::Max(0, N - 4);
+			ColdDeferCap8SinceLog += FMath::Max(0, N - 8);
+		}
+		ColdShadingsThisTick = 0;
+
 		++AccumTicks;
 	}
 
@@ -13562,6 +13660,35 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       ApplyStagePoolAddMs / TimedApplies);
 	}
 
+	// THE COLD-BURST CENSUS (goal 3b; doctrine and decision rule at the fold
+	// site beside ++AccumTicks). UNCONDITIONAL, like its `Voxel apply stages`
+	// sibling above and unlike the stage half of that line: the counters are a
+	// handful of ints incremented on cold shadings only, so there is nothing to
+	// gate and a gate would only produce legs that measured nothing.
+	//
+	// HOW TO READ IT. coldTicks=A/B is "ticks that paid at least one cold
+	// shading, out of ticks in the window"; the histogram bins those A ticks by
+	// how many they paid. wouldDefer capN is the submits a cap of N would have
+	// pushed to a later tick over the whole window -- the cost side. coverable
+	// and holeRisk split every cold shading by whether a coarser resident
+	// ancestor is already drawing that ground -- the safety side.
+	//
+	// THE PARTITION IS EXACT AND CHECKABLE ON THE LINE ITSELF:
+	// coverable + holeRisk == coldTotal, always. If it does not, the
+	// classification is broken and no verdict may be read off this line.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel cold-burst census (window): coldTotal=%lld coldTicks=%lld/%d maxPerTick=%d ")
+	       TEXT("hist 1/2/3-4/5-8/9-16/17+=%lld/%lld/%lld/%lld/%lld/%lld ")
+	       TEXT("| wouldDefer cap2=%lld cap4=%lld cap8=%lld | coverable=%lld holeRisk=%lld"),
+	       (long long)ColdTotalSinceLog, (long long)ColdTicksSinceLog, AccumTicks,
+	       ColdMaxPerTickSinceLog,
+	       (long long)ColdBurstHistSinceLog[0], (long long)ColdBurstHistSinceLog[1],
+	       (long long)ColdBurstHistSinceLog[2], (long long)ColdBurstHistSinceLog[3],
+	       (long long)ColdBurstHistSinceLog[4], (long long)ColdBurstHistSinceLog[5],
+	       (long long)ColdDeferCap2SinceLog, (long long)ColdDeferCap4SinceLog,
+	       (long long)ColdDeferCap8SinceLog,
+	       (long long)ColdCoverableSinceLog, (long long)ColdHoleRiskSinceLog);
+
 	// The pool's own half of the same question, drained from the component so the
 	// render-thread accumulator is reset in step with the game-thread one.
 	//
@@ -15091,6 +15218,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumGpuSubmitAssetsMs = AccumGpuSubmitPoolMs = AccumGpuSubmitMgrMs = AccumGpuSubmitTotalMs = 0.0;
 	AccumDispatchSubmitGpuMs = 0.0;
 	GpuSubmitCallsSinceLog = 0;
+	// The cold-burst census, zeroed with the submit split it belongs to and in
+	// the same place -- every counter the census line prints is cleared here
+	// and nowhere else. ColdShadingsThisTick is deliberately NOT among them: it
+	// is per-tick working state cleared at the fold, and MaybeLogCounters can
+	// run part-way through a tick, so zeroing it here would drop a burst that
+	// was still being counted.
+	ColdTotalSinceLog = ColdTicksSinceLog = 0;
+	ColdMaxPerTickSinceLog = 0;
+	for (int32 B = 0; B < 6; ++B)
+	{
+		ColdBurstHistSinceLog[B] = 0;
+	}
+	ColdDeferCap2SinceLog = ColdDeferCap4SinceLog = ColdDeferCap8SinceLog = 0;
+	ColdCoverableSinceLog = ColdHoleRiskSinceLog = 0;
 	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
@@ -21180,6 +21321,61 @@ void FVoxelWorldImpl::WarmShadingAheadTick()
 	}
 }
 
+// --- the cold-burst census: the coverage half -------------------------------
+//
+// "If this chunk's submit waited a tick or two, would a hole open?" Answered by
+// the only thing that can answer it: whether a COARSER-level ancestor is
+// resident and holding terrain right now, because that is exactly what the
+// marcher falls through to when the fine level has nothing at a key.
+//
+// HoldsTerrain, NOT HoldsGeometry. Under the marcher every drained chunk meshes
+// to zero quads, so HoldsGeometry is false for terrain that is plainly on
+// screen; asking it here would classify nearly every cold shading as holeRisk
+// and kill the cap on a measurement artefact. This is the same predicate, on
+// the same ChunkRecords map, that DrainResults and the edit-remesh path use to
+// decide a chunk is really loaded (see the `Rec->HoldsTerrain(...)` call beside
+// ++TotalChunksLoaded, and the retention comment above it).
+//
+// THE PARENT-KEY ARITHMETIC IS COPIED, NOT INVENTED: `Consult(L + 1, X >> 1,
+// Y >> 1, Z >> 1, ...)` from ReplacementCovered's RetainDir_Coarser branch,
+// including its reason for the shift rather than a divide ("// >> floors for
+// negatives too"). One transcription of a key rule is one too many already.
+//
+// THE CEILING is GetMaxRingLevel(), for ReplacementCovered's stated reason:
+// past the outermost ACTIVE ring nothing coarser will ever stream, whatever
+// kNumLevels says the tables could hold. Walking to kNumLevels would consult
+// keys that can never exist and cost lookups for a guaranteed miss.
+//
+// COST: one TMap lookup per level above the chunk, on COLD shadings only
+// (~1,000 per 5 s window against ~15,000 submits), and it short-circuits on the
+// first covering ancestor -- which, for the common near-camera case, is the
+// first one tried.
+static bool ColdShadingCoveredByCoarserAncestor(
+	const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStreaming::FChunkRecord>& Records,
+	const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
+{
+	const int32 MaxRing = UVoxelWorldSubsystem::GetMaxRingLevel();
+	VoxelCoords::FVoxelLevelChunkKey Ancestor = LevelKey;
+	while (Ancestor.Level < MaxRing)
+	{
+		Ancestor.Key.X >>= 1;
+		Ancestor.Key.Y >>= 1;
+		Ancestor.Key.Z >>= 1;
+		++Ancestor.Level;
+		if (const VoxelStreaming::FChunkRecord* Rec = Records.Find(Ancestor))
+		{
+			// The record existing is not enough and never has been: a record is
+			// created at admission and can sit through an entire dispatch and
+			// mesh without holding anything a ray can hit.
+			if (Rec->HoldsTerrain(Ancestor))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
                                        uint8 RingSkirtMask, bool bSpeculative)
 {
@@ -21250,9 +21446,43 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		// raw four-column expression here -- at the site the reqHdr measurement
 		// says is the expensive one. ShadingForDispatch cannot reach the guard,
 		// so mode 3 caches at both. Mode 0 still folds to the raw expression.
+		//
+		// THE COLD-BURST CENSUS TAP (goal 3b; the doctrine and the decision
+		// rule are at the fold site beside ++AccumTicks). bCold comes back true
+		// when THIS call paid the four-column sample -- see
+		// VoxelApplyFast::WouldSampleForDispatch for what that covers in each
+		// mode. The out-parameter defaults to nullptr, so no other caller of
+		// ShadingForDispatch is touched and mode 0 still folds to the raw
+		// expression everywhere else.
+		bool bCold = false;
 		Req.BrickShading = VoxelApplyFast::ShadingForDispatch(
 			LevelKey, *PoolRootForShading,
-			&SampleChunkParamsForPool, &ShadingFromChunkParams);
+			&SampleChunkParamsForPool, &ShadingFromChunkParams, &bCold);
+		if (bCold)
+		{
+			// COUNTED HERE, AT THE SAMPLE, AND NOT AT A LATER SUCCESS TEST. The
+			// game thread has already paid for this shading by the time control
+			// reaches this line; a submit that is declined below (fork budget)
+			// or that came in speculatively still cost the tick its cold
+			// sample, and a cap would still have had to decide about it. Both
+			// callers of SubmitGpuMeshJob run inside the folded streaming tick,
+			// so every ++ here lands in exactly one tick's burst.
+			++ColdShadingsThisTick;
+			++ColdTotalSinceLog;
+			// EXACT PARTITION, BY CONSTRUCTION: one and only one of these two
+			// moves for every cold shading counted above, so
+			// coverable + holeRisk == coldTotal on the census line. If those
+			// three numbers ever disagree, the classification has grown a path
+			// that counts twice or not at all and the line is unreadable.
+			if (ColdShadingCoveredByCoarserAncestor(ChunkRecords, LevelKey))
+			{
+				++ColdCoverableSinceLog;
+			}
+			else
+			{
+				++ColdHoleRiskSinceLog;
+			}
+		}
 	}
 	// D5.3. Computed on the game thread where the anchor and RingPresets are
 	// live, exactly as the worker job's is, and baked into this dispatch.
