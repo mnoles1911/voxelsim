@@ -89,7 +89,13 @@ SCHEMA = "vxc.lakesurvey.v1"
 #: recorded, because the interesting sweep starts at "a hole a player could
 #: stand in" and a 10 cm dimple would multiply the record count by the noise
 #: floor of the roughness field.
-DUMP_FILTER = bs.BasinFilter(min_depth_m=1.0, min_area_m2=0.0,
+# 2026-08-29: dump floor 1.0 -> 0.2 so sub-metre thresholds become SWEEPABLE.
+# The 1.0 floor meant the dumps recorded nothing but a count for the 9.51M
+# shallower components, so the one question the owner asked ("frequent ponds")
+# could only be answered by a power-law guess. 0.2 is still 2x the flat-ground
+# roughness RMS (~0.09 m; _REF_AMPLITUDE_M 0.35 x 0.25 flat gain), so the dumps
+# do not fill with dimples. Tool-local: rolls no bake identity, ships nothing.
+DUMP_FILTER = bs.BasinFilter(min_depth_m=0.2, min_area_m2=0.0,
                              exclude_spanning=False, require_above_sea=False)
 
 #: Overlay downsample factor. 8192 -> 1024 px per tile.
