@@ -618,6 +618,39 @@ private:
 	//                                    must be SMALL where `raster=` was 241
 	//                                    ms: if demandMs is 241 ms the cost was
 	//                                    renamed, not removed.
+	//   demandOutOfDisc               -- OF `demandPages`, THE ONES NO SWEEP
+	//                                    AND NO COVERAGE-FILTERED PREFETCH
+	//                                    COULD EVER HAVE PRE-FILLED: pages the
+	//                                    demand path filled that IsPageInCoverage
+	//                                    says are OUTSIDE the current anchor's
+	//                                    disc. It exists because the two
+	//                                    candidate explanations for the 33-43 ms
+	//                                    crossing lump have opposite fixes and
+	//                                    nothing on this line could tell them
+	//                                    apart:
+	//                                      * = 0 -- the faulting pages ARE in
+	//                                        the disc, so the sweep and the
+	//                                        crescent scan could have reached
+	//                                        them and did not. The fault is
+	//                                        SCAN REACH / TIMING, and widening
+	//                                        what voxel.Stream.AtlasPrefetchAhead
+	//                                        enumerates is the fix.
+	//                                      * = demandPages -- the faulting pages
+	//                                        are structurally outside the disc.
+	//                                        Admission takes a chunk CENTRE out
+	//                                        to AdmitOuterUU (Outer + a chunk
+	//                                        half-diagonal), and that chunk's
+	//                                        window reaches another half-
+	//                                        diagonal plus Init's probed margin
+	//                                        past its own centre -- while this
+	//                                        class's disc is Outer + the margin
+	//                                        alone. Then NO scan that filters on
+	//                                        IsPageInCoverage can ever reach
+	//                                        them, however many rings it walks,
+	//                                        and the fix is the RADIUS, not the
+	//                                        scan.
+	//                                    A mixed reading is a real third answer
+	//                                    and prints as plain numbers.
 	uint64 DemandCalls = 0;
 	uint64 DemandPagesFilled = 0;
 	uint64 DemandPagesFilledLifetime = 0;
@@ -626,6 +659,8 @@ private:
 	uint64 DemandCapHits = 0;
 	uint64 DemandCapHitsLifetime = 0;
 	uint64 DemandRetryFailLifetime = 0;
+	uint64 DemandOutOfDisc = 0;
+	uint64 DemandOutOfDiscLifetime = 0;
 	uint64 DemandCycles = 0;
 	// Set by FillWindowOnDemand when it filled at least one page, taken and
 	// cleared by the very next PrepareRequest -- which is the caller's retry,

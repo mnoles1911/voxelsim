@@ -1707,6 +1707,7 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	       TEXT("[raster-atlas] window: served=%llu inlineFallback=%llu fills=%llu ")
 	       TEXT("(%.2f MiB, %.1f ms GT) resident=%u/%u pages gpuMiss=%s lifetimeMiss=%llu ")
 	       TEXT("| demand: calls=%llu rescued=%llu (lifetime %llu) pages=%llu (lifetime %llu) ")
+	       TEXT("outOfDisc=%llu (lifetime %llu)%s ")
 	       TEXT("capHit=%llu (lifetime %llu) cap=%d/tick %.1f ms GT retryFail=%llu%s ")
 	       TEXT("| prefetch: cap=%d/tick ticks=%llu filled=%llu (lifetime %llu) ")
 	       TEXT("alreadyResident=%llu %.1f ms GT%s win=%.2fs"),
@@ -1718,6 +1719,21 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	       GpuMissLifetime,
 	       DemandCalls, DemandRescued, DemandRescuedLifetime,
 	       DemandPagesFilled, DemandPagesFilledLifetime,
+	       // The partition of `pages` that decides which fix the crossing lump
+	       // needs. It fails apart in BOTH directions on purpose -- neither
+	       // reading is the one the arm was built expecting, so this cannot
+	       // come out only one way.
+	       DemandOutOfDisc, DemandOutOfDiscLifetime,
+	       (DemandPagesFilled == 0)
+	           ? TEXT("")
+	       : (DemandOutOfDisc == DemandPagesFilled)
+	           ? TEXT(" ALL-OUT-OF-DISC (every page this window's demand path filled was outside ")
+	             TEXT("IsPageInCoverage -- the sweep and any coverage-filtered prefetch can NEVER ")
+	             TEXT("pre-fill them at any scan width; the fix is the coverage RADIUS)")
+	       : (DemandOutOfDisc == 0)
+	           ? TEXT(" ALL-IN-DISC (every page was inside coverage -- the sweep could have reached ")
+	             TEXT("them and did not; the fix is prefetch scan reach/timing)")
+	       : TEXT(""),
 	       DemandCapHits, DemandCapHitsLifetime, DemandPagesPerTick(),
 	       MsFromCycles(DemandCycles), DemandRetryFailLifetime,
 	       (DemandRetryFailLifetime > 0)
@@ -1898,6 +1914,7 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	// happens to open.
 	DemandCalls = 0;
 	DemandPagesFilled = 0;
+	DemandOutOfDisc = 0;
 	DemandRescued = 0;
 	DemandCapHits = 0;
 	DemandCycles = 0;
@@ -2124,6 +2141,23 @@ bool FVoxelRasterAtlasCpu::FillWindowOnDemand(vxc::ITileSampler& Tiles,
 
 	for (const FPagePt& P : DemandPageScratch)
 	{
+		// CLASSIFIED AT THE FILL, THROUGH THE ONE COVERAGE RULE. Was this page
+		// ever going to be pre-filled by anything? The sweep and the predictive
+		// prefetch both admit only pages IsPageInCoverage accepts, so a page
+		// that fails this test here is one neither of them can reach at any
+		// scan width -- see demandOutOfDisc in the header for the two fixes
+		// this tells apart. Not derived later from a page list: the anchor a
+		// page was judged against has to be the anchor it faulted under.
+		//
+		// LastAnchorPx is THIS streaming tick's anchor: Tick() stamps it and
+		// the subsystem calls Tick() earlier in the same tick than DispatchJobs
+		// -- the same ordering the delta flush already rests on. One extra
+		// IsPageInCoverage per demanded page (single digits per crossing).
+		if (!IsPageInCoverage(P.X, P.Y, LastAnchorPxX, LastAnchorPxY))
+		{
+			++DemandOutOfDisc;
+			++DemandOutOfDiscLifetime;
+		}
 		FillPage(Tiles, P.X, P.Y);
 	}
 	DemandPagesThisTick += DemandPageScratch.Num();
@@ -2222,6 +2256,16 @@ void FVoxelRasterAtlasCpu::PrefetchAhead(vxc::ITileSampler& Tiles, int64 AnchorX
 				// business today. A page in CURRENT coverage is skipped even if
 				// missing -- the sweep and the demand queue own it, and racing
 				// them from here would just reorder the same work.
+				//
+				// AND THIS FIRST TEST IS THE SUSPECTED CEILING, not the
+				// rim-ring start bound dd4ee9e blamed. A page a chunk's window
+				// can tap is NOT necessarily a page IsPageInCoverage admits:
+				// admission takes a chunk CENTRE to AdmitOuterUU and the window
+				// reaches past that centre again, while the disc is Outer plus
+				// Init's margin alone. Any such page is refused here at every
+				// scan width. UNCONFIRMED until a leg reads `outOfDisc=` on the
+				// window line -- that counter exists to settle it and can come
+				// out either way.
 				if (!IsPageInCoverage(Px, Py, PredPxX, PredPxY))
 				{
 					continue;
