@@ -136,3 +136,45 @@ retry rate stands (it comes from the ZTight engagement partition, a different
 instrument). And the process note owed here: the addendum's headline was
 committed BEFORE its falsifier ran -- the falsifier then fired. The doc you are
 reading is the correction the rule exists to force.
+---
+
+# FINAL (fixed counter): waves are FULL -- family A is dead too; what remains
+
+    pose   chunk loop meanActive   leaf DDA meanActive     (waveWidth=64)
+    sky         63.21 (99%)             25.42
+    down        63.49                   51.50
+
+The instrument now discriminates (poses and loops differ), so it is believed:
+**the chunk loop runs at 99% lane occupancy at the sky pose. Divergence is not
+the sky cost, and survivor compaction has nothing to compact.** The leaf DDA's
+40% at sky is real but small (sky rays barely enter the leaf).
+
+## The full kill-list, one line each
+
+    empty-space skips (5 arms + Bound + ZTight)  iterations are not the cost
+    ray count (half-res)                          owner-rejected on image
+    divergence (family A)                         waves are 99% full
+    per-lane anything                             three bodies, one pattern
+
+## What is actually left, ranked
+
+1. **The 90% sky retry rate** (58.8M retries vs 65.4M segments, ZTight's
+   engagement partition -- an independent instrument, still standing). Near-
+   universal at sky means waves retry COHERENTLY, so gating retries saves
+   whole-wave time -- unlike every per-lane clamp. The legitimate gate needs
+   design care (a retry is correctness when a coarse stand-in exists), and the
+   first step is a counter: how many sky retries produce a HIT? If ~none, the
+   retry is provably-useless work at that pose and a sound gate exists.
+2. **Latency-bound with full lanes**: lanes-per-wave is NOT waves-per-SIMD.
+   A register-fat kernel runs few waves per SIMD, leaving dependent-load
+   latency (index -> record -> validate, ~2 loads/iteration) unhidden. This is
+   consistent with EVERY observation, including permutations regressing on
+   added registers. Falsifier: compiler stats (VGPR count / theoretical
+   occupancy) from the shader toolchain, or a load-chain-shortening probe.
+3. **The resolution lever** (product decision, already measured: 50% = 103.6
+   fps p95) -- the only lever with a SHIPPED-QUALITY number attached today.
+
+Process note, recorded with the same weight as the findings: tonight's
+instrument shipped with a self-falsifier, the falsifier fired, the instrument
+was fixed within the hour, and the corrected reading REVERSED the headline.
+That is the cheapest reversal this programme has ever bought.
