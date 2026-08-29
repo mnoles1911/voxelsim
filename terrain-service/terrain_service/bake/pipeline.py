@@ -863,7 +863,17 @@ class BakeConstants:
     # tile and a worst case of 266, i.e. 8.5 KB against 26.6 MB of compressed
     # elevation; at 1 m / 0 m2 it is 4,082 rows and mostly puddles.
     #: Minimum depth of a registered basin's deepest cell, metres.
-    basin_min_depth_m: float = 1.0
+    #:
+    #: 1.0 -> 0.5 on 2026-08-29, OWNER DECISION ("Yeah make more water"),
+    #: from the measured ladder in docs/lake-floor-ladder-2026-08-29.md (in
+    #: the game repo): on six alpine tiles the 0.5 m floor registers x1.70
+    #: the lakes (+12% water area, one pond per ~640 m, median new pond
+    #: ~1.2 m deep). 0.25 was measured too and rejected -- median 0.76 m
+    #: approaches the terrain-noise floor and dimples start registering.
+    #: This constant rides bake_identity_payload, so the change re-keys the
+    #: fine namespace; the registry sizing note above (65 rows/tile median
+    #: at 2 m / 2500 m2) predates both this and the 1.0 shipping value.
+    basin_min_depth_m: float = 0.5
     #: Minimum footprint at the spill level, m^2. 2500 m^2 is 50 m across.
     basin_min_area_m2: float = 100.0
     #: FLIPPED TO FALSE AT bake_ver 24 (basin table v2). v1 registered INTERIOR
