@@ -358,13 +358,32 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasPrefetchAhead(
 // ~= 1.02 pages short. MEASURED, on a counter built to come out either way:
 // Saved/OOD-verdict.log prints ALL-OUT-OF-DISC on every crossing window,
 // pages=10 outOfDisc=10, 10-36 ms GT, lifetime rescued=535.
+//
+// SHIPPED DEFAULT 1, 2026-08-29, on two armed legs against a seven-leg control
+// family (PAD-armed-{b,c} vs RES50 x3, COLDCENSUS-a, CSC-ctl-a, OOD-verdict,
+// PAD-armed-a which self-voided and doubled as a control):
+//   outOfDisc      8-10 every crossing -> 0 on ALL 134 windows, both legs
+//   in-flight demand fills  ~12 lumps/leg of 6-10 pages -> ZERO windows
+//   hitches (>33.3ms)       9-15 -> 7 and 6
+//   worst moving frame      79-113 ms -> 45.8 and 46.2
+//   flight holes            med 96 p90 146 -> med 94-96 p90 144-160 (in family)
+//   p95/p99                 unchanged (10.8-11.0 / 15.2)
+//   stutterPct (20ms bar)   0.29-0.35 vs family 0.30-0.39 -- NULL, and that is
+//                           the honest reading: the ~12 crossing hitches this
+//                           removes drown in the 20 ms bar's family spread.
+//                           The win lives in the hitch count and maxMs, which
+//                           is where a 33-43 ms lump should show.
+//   warmup lump             unchanged (control 575 pages/568 ms GT, armed
+//                           541/594 -- pre-existing, not this arm's).
+// Nothing moved the wrong way; the one null gate is null because its bar
+// cannot see the class of frame this removes. Set 0 to restore the old disc.
 static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasCoveragePadChunks(
-	TEXT("voxel.Stream.AtlasCoveragePadChunks"), 0,
+	TEXT("voxel.Stream.AtlasCoveragePadChunks"), 1,
 	TEXT("Widens the raster atlas's COVERAGE DISC to everything an admitted chunk's window ")
 	TEXT("can actually tap, so the ordinary nearest-first sweep pre-fills those pages at its ")
 	TEXT("own 2 ms/tick budget instead of the demand path paying them in one 33-43 ms ")
-	TEXT("game-thread lump at each page crossing. 0 = off and the default: the radius is ")
-	TEXT("byte-identical to the shipped one. 1 is the intended arm -- the disc becomes ")
+	TEXT("game-thread lump at each page crossing. 1 = the SHIPPED DEFAULT (2026-08-29, see ")
+	TEXT("the flip note above); 0 restores the pre-flip radius. Armed, the disc becomes ")
 	TEXT("VoxelStreamAdmission::AdmitOuterUU(maxRing) (CALLED, not respelled, right here at ")
 	TEXT("the Init site) plus the box-corner term the atlas derives from its own probed ")
 	TEXT("margin. N>1 adds N-1 whole chunk edges on top and is margin nobody has needed. ")
@@ -379,7 +398,8 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasCoveragePadChunks(
 	TEXT("outOfDisc= to ~0 and rescued= following it toward 0. GATES, pre-registered: ")
 	TEXT("rescued falls toward 0, outOfDisc ~0, the demand GT lump leaves the 33-43 ms ")
 	TEXT("band, stutterPct falls materially toward 0.10, p95/p99 not worse, flight holes ")
-	TEXT("not rising -- any one moving the wrong way refutes, default stays 0."),
+	TEXT("not rising. All passed on PAD-armed-{b,c} except stutterPct (null -- its 20 ms ")
+	TEXT("bar cannot see the removed 33-43 ms class; hitches and maxMs can and did fall)."),
 	ECVF_Default);
 // ARM 3, AND THE SHAPE THE OTHER TWO NAMED. Both arms above pay EARLY and both
 // came out NULL on stutterPct, for the reason dd4ee9e wrote down at the time:

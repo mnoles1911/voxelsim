@@ -639,12 +639,18 @@ now covers per-rung probes. Default 0 permanently; no timing pairs run. The
 last marcher family on the board. What remains: latency/VGPR occupancy stats
 (falsifier, unbuilt) and ray count (owner product decision, taken at 50%).
 
-**Stutter half of Goal 3 (0.32% vs 0.10%):** warming arms null as trickles
-(dd4ee9e); RungProbe dead; and the demand-side cold-shading cap is now BUILT
-AND REFUTED on the image gate (docs/coldshadingcap-refuted-2026-08-29.md:
-engagement exact, stutter null, p99 -0.5 ms real, but flight holes 4-5x at
-p90 -- coverage checked at defer time does not survive a divergent backlog).
-Its census (docs/cold-burst-census-2026-08-29.md) bought the attribution:
-the stutter frames are RASTER-ATLAS FILLS, not reqHdr bursts. Lead candidate
-is now dd4ee9e's named shortfall: the atlas prefetch scans rim rings only
-(~98 of ~600 due pages) -- widen to the whole predicted column.
+**Stutter half of Goal 3 (0.29-0.35% vs 0.10%):** warming arms null as
+trickles (dd4ee9e); RungProbe dead; cold-shading cap BUILT AND REFUTED on
+the image gate (docs/coldshadingcap-refuted-2026-08-29.md -- but its census
+bought the attribution: stutter frames are not reqHdr bursts). The atlas
+chase then falsified dd4ee9e's own explanation: the prefetch scan was never
+rim-limited -- the COVERAGE DISC was ~1 page smaller than what admission can
+demand (outOfDisc counter: ALL-OUT-OF-DISC on every crossing). SHIPPED:
+voxel.Stream.AtlasCoveragePadChunks default 1 (d2e3ecd + flip commit) --
+derives the disc through AdmitOuterUU + a sqrt(2) box-corner term. Two armed
+legs: outOfDisc 0 on all 134 windows, ZERO in-flight demand lumps (control:
+6-10 pages every 10 s), hitches 9-15 -> 6-7, worst moving frame 79-113 ->
+~46 ms, holes/p95/p99 unchanged; +21 MiB atlas. stutterPct null -- the 20 ms
+bar cannot see the removed 33-43 ms class. The REMAINING 0.3% stutters are
+now triple-attributed as neither cold shadings nor atlas pages: next lead is
+the p99 split's unnamed +4.06 ms in-tick residual and submitMs +3.24.
