@@ -1707,7 +1707,9 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	       TEXT("[raster-atlas] window: served=%llu inlineFallback=%llu fills=%llu ")
 	       TEXT("(%.2f MiB, %.1f ms GT) resident=%u/%u pages gpuMiss=%s lifetimeMiss=%llu ")
 	       TEXT("| demand: calls=%llu rescued=%llu (lifetime %llu) pages=%llu (lifetime %llu) ")
-	       TEXT("capHit=%llu (lifetime %llu) cap=%d/tick %.1f ms GT retryFail=%llu%s win=%.2fs"),
+	       TEXT("capHit=%llu (lifetime %llu) cap=%d/tick %.1f ms GT retryFail=%llu%s ")
+	       TEXT("| prefetch: cap=%d/tick ticks=%llu filled=%llu (lifetime %llu) ")
+	       TEXT("alreadyResident=%llu %.1f ms GT%s win=%.2fs"),
 	       Served, DeclinedCold, PagesFilled,
 	       double(BytesUploaded) / (1024.0 * 1024.0),
 	       MsFromCycles(GtFillCycles),
@@ -1727,6 +1729,21 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	           ? TEXT(" DEAD: chunks took the inline path and the demand path was never called")
 	       : (DemandCalls > 0 && DemandRescued == 0 && DemandPagesFilled > 0)
 	           ? TEXT(" FAIL: pages were filled and NOTHING was rescued")
+	       : TEXT(""),
+	       // The prefetch group (voxel.Stream.AtlasPrefetchAhead). The verdicts
+	       // fail apart on purpose: OFF (never called -- the cvar is 0) can
+	       // never be confused with ARMED-IDLE (called every tick, predicted
+	       // page never differed -- a parked leg), and neither with the healthy
+	       // armed steady state (ticks>0, crescent already resident). The A/B
+	       // verdict does NOT live on this line: it is demand rescued=/capHit=
+	       // collapsing above, and the submit split's maxRaster falling out of
+	       // the tens of milliseconds on the armed leg.
+	       PrefetchCapLast, PrefetchTicks, PrefetchFilled, PrefetchFilledLifetime,
+	       PrefetchAlreadyResident, MsFromCycles(PrefetchCycles),
+	       (PrefetchCapLast == 0)
+	           ? TEXT(" OFF (voxel.Stream.AtlasPrefetchAhead=0)")
+	       : (PrefetchTicks == 0)
+	           ? TEXT(" ARMED-IDLE (predicted page never differed from the current one this window)")
 	       : TEXT(""),
 	       Elapsed);
 
@@ -1884,6 +1901,10 @@ void FVoxelRasterAtlasCpu::LogWindowIfDue()
 	DemandRescued = 0;
 	DemandCapHits = 0;
 	DemandCycles = 0;
+	PrefetchTicks = 0;
+	PrefetchFilled = 0;
+	PrefetchAlreadyResident = 0;
+	PrefetchCycles = 0;
 	PrepareCycles = 0;
 	PrepareCalls = 0;
 	GtFillCycles = 0;
@@ -2124,6 +2145,108 @@ bool FVoxelRasterAtlasCpu::FillWindowOnDemand(vxc::ITileSampler& Tiles,
 	// Arms the retry's accounting; the next PrepareRequest takes and clears it.
 	bDemandRetryPending = true;
 	return true;
+}
+
+// THE PREDICTIVE COLUMN PREFETCH -- the WHY, the geometry bound and the
+// failing readings are on the declaration in the header. Mechanically this is
+// the demand path's fill by a different trigger: same FillPage, same mirror,
+// same delta -- only WHEN differs (before the crossing instead of during it),
+// which is the entire point. It stages into PendingDelta and deliberately does
+// NOT flush: the caller runs it immediately BEFORE Tick() in the same
+// streaming tick, so the pages ride Tick's flush and land on the GPU with the
+// ordering guarantee every other fill already rests on.
+void FVoxelRasterAtlasCpu::PrefetchAhead(vxc::ITileSampler& Tiles, int64 AnchorXMm,
+                                         int64 AnchorYMm, int64 PredXMm, int64 PredYMm,
+                                         int32 MaxPages)
+{
+	check(IsInGameThread());
+	if (!IsInitialized() || MaxPages <= 0)
+	{
+		return;
+	}
+	PrefetchCapLast = MaxPages; // 0-vs-armed on the window line
+	// Same session-fault rule as every other fill entry: after a pitch
+	// mismatch the atlas serves nothing, so filling would be pure cost. Tick
+	// (which runs right after this) owns the loud one-time log.
+	if (bLoggedPitchMismatch || Tiles.pixelSizeMm() != PixelSizeMm)
+	{
+		return;
+	}
+
+	const int64 CurPxX = vxc::floorDiv(AnchorXMm, PixelSizeMm);
+	const int64 CurPxY = vxc::floorDiv(AnchorYMm, PixelSizeMm);
+	const int64 PredPxX = vxc::floorDiv(PredXMm, PixelSizeMm);
+	const int64 PredPxY = vxc::floorDiv(PredYMm, PixelSizeMm);
+	// The cheap idle test: while the predicted anchor sits in the SAME page as
+	// the real one, the two coverage discs admit identical page sets and the
+	// crescent below is empty by construction -- so a parked or slow-moving
+	// leg pays two floorDivs and this compare per tick, nothing else.
+	if (vxc::floorDiv(PredPxX, int64(kPagePx)) == vxc::floorDiv(CurPxX, int64(kPagePx)) &&
+	    vxc::floorDiv(PredPxY, int64(kPagePx)) == vxc::floorDiv(CurPxY, int64(kPagePx)))
+	{
+		return;
+	}
+
+	++PrefetchTicks;
+	const uint64 T0 = FPlatformTime::Cycles64();
+	// Its own bracket, NOT GtFillCycles: that bracket is Tick's sweep and only
+	// that (the registered disproof for fill mode 3 is written against it), and
+	// a new cost hiding inside the number it is meant to relieve could never
+	// show that it failed. Printed as `prefetch ... ms GT` on the window line.
+	ON_SCOPE_EXIT { PrefetchCycles += FPlatformTime::Cycles64() - T0; };
+
+	// Nearest-first Chebyshev rings around the PREDICTED anchor's page, rim
+	// rings only: with the lead clamped under one page (60 m vs 240 m), a page
+	// inside the predicted disc but outside the current one is within ~2 rings
+	// of the rim (dist >= CoverageRadius - lead), so starting at RadiusPages-3
+	// bounds the scan to a few ring perimeters (~hundreds of probes) instead
+	// of the full 39x39 square. Each probe is two IsPageInCoverage tests and a
+	// mirror lookup -- the same reads the sweep makes.
+	const int64 CenterPageX = vxc::floorDiv(PredPxX, int64(kPagePx));
+	const int64 CenterPageY = vxc::floorDiv(PredPxY, int64(kPagePx));
+	int32 Filled = 0;
+	for (int64 R = FMath::Max<int64>(0, RadiusPages - 3); R <= RadiusPages; ++R)
+	{
+		const int64 X0 = CenterPageX - R;
+		const int64 X1 = CenterPageX + R;
+		const int64 Y0 = CenterPageY - R;
+		const int64 Y1 = CenterPageY + R;
+		for (int64 Py = Y0; Py <= Y1; ++Py)
+		{
+			// Ring perimeter only, exactly as NextPageToFill walks it.
+			const int64 StepX = (Py == Y0 || Py == Y1) ? 1 : (X1 - X0 > 0 ? X1 - X0 : 1);
+			for (int64 Px = X0; Px <= X1; Px += StepX)
+			{
+				// THE CRESCENT, both tests through the ONE coverage rule:
+				// needed once the camera arrives, and not already the sweep's
+				// business today. A page in CURRENT coverage is skipped even if
+				// missing -- the sweep and the demand queue own it, and racing
+				// them from here would just reorder the same work.
+				if (!IsPageInCoverage(Px, Py, PredPxX, PredPxY))
+				{
+					continue;
+				}
+				if (IsPageInCoverage(Px, Py, CurPxX, CurPxY))
+				{
+					continue;
+				}
+				if (IsPageResident(Px, Py) || PagesInFlight.Contains(PageKey(Px, Py)))
+				{
+					++PrefetchAlreadyResident;
+					continue;
+				}
+				FillPage(Tiles, Px, Py);
+				++PrefetchFilled;
+				++PrefetchFilledLifetime;
+				if (++Filled >= MaxPages)
+				{
+					// The count IS the budget; the rest of the column is later
+					// ticks' work, by design.
+					return;
+				}
+			}
+		}
+	}
 }
 
 void FVoxelRasterAtlasCpu::DebugDropPage(int64 PageX, int64 PageY)

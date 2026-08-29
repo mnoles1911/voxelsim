@@ -388,6 +388,56 @@ FORCEINLINE FVoxelBrickChunkShading ShadingForDispatch(const VoxelCoords::FVoxel
 	return ShadingForDispatchSlow(Key, Root, SampleParams, ShadingFrom);
 }
 
+// ===========================================================================
+// THE WARM-AHEAD HOOKS (voxel.Stream.WarmShadingAhead; the loop that drives
+// them is FVoxelWorldImpl::WarmShadingAheadTick in VoxelWorldSubsystem.cpp)
+// ===========================================================================
+//
+// WHY THESE EXIST (docs/submit-split-2026-08-28.md): the cache above is at its
+// theoretical hit ceiling (88.7% avoided against an 88.0% bound) and the
+// remaining misses are genuine FIRST TOUCHES -- footprints the camera has
+// never visited, sampled inline at submit time. A cold sample is 100x bimodal
+// (5.7 us warm -> 587 us under worker-pool load) and lands as single frames of
+// 43-52 ms in the submit split's reqHdr bucket -- the larger half of the
+// stutter budget (docs/hundred-fps-2026-08-28.md goal 3b). coldGame=0 proved
+// the cost is WORK (four amplifier columns + a climate sample), not I/O, and
+// the sampler is game-thread-only by design (unsynchronised table; offThread
+// is a checked hard zero) -- so the cost cannot move off-thread. What CAN move
+// is WHEN it is paid: early, in small wall-clock pieces, at footprints the
+// T4-1 predicted anchor says are coming. That needs two things this block
+// provides:
+//   (a) a read-only "is this footprint already cached" probe, so the warm loop
+//       never runs the full sampler just to discover there was nothing to do;
+//   (b) a cache-filling entry point whose traffic does NOT land in
+//       calls/cacheMiss/sampleUs -- the armed leg's verdict is the SUBMIT
+//       population's cacheMiss falling, and warm fills counted there would
+//       relocate the misses into the same counter and erase the reading.
+
+// (a) The probe. GAME THREAD ONLY, like everything that touches the table;
+// off-thread it answers "cached" so a misplaced caller warms nothing rather
+// than racing an unsynchronised structure. Returns false whenever the cache
+// arm is off or not yet anchored -- callers must gate on CacheArmed() below
+// before treating false as "worth sampling".
+bool IsCached(int32 Level, int32 X, int32 Y);
+
+// (b) The warm entry point. Fills the cache for one footprint through the SAME
+// ShadingImpl body the dispatch site uses -- one implementation of the slot
+// key and the Z rebase, because a second transcription of either is the defect
+// shape this module was written to avoid. Counts into warmFill=/warmHit= on
+// the window line, NOT into calls/cacheMiss/sampleUs (see WHY above). Returns
+// nothing on purpose: no caller consumes a warm shading; the slot write is the
+// entire product. No-op off the game thread (counted in offThread, the hard
+// zero) and with the cache bit off (a sample nothing can store is pure loss).
+void WarmForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                     const USceneComponent& Root,
+                     FSampleParamsFn SampleParams,
+                     FShadingFromFn ShadingFrom);
+
+// Can warming persist anything at all? The warm loop checks this once per tick
+// and reports itself INERT-CACHE-OFF on its window line instead of burning its
+// budget invisibly -- the eleven-inert-features rule at the top of this file.
+FORCEINLINE bool CacheArmed() { return (Mode() & kModeCache) != 0; }
+
 // Emit the 5 s window line now and reset it, whatever the clock says.
 //
 // OPTIONAL. ShadingForPublishSlow flushes on its own 5 s clock, so the module

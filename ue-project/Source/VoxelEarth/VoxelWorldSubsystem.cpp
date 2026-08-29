@@ -302,6 +302,50 @@ static TAutoConsoleVariable<int32> CVarVoxelZCutHeadroomProbe(
 	     "swap would actually bind -- not a re-derivation of it."),
 	ECVF_Default);
 
+// --- THE STUTTER HALF OF THE >100 FPS GOAL (docs/hundred-fps-2026-08-28.md 3b;
+// docs/submit-split-2026-08-28.md). Moving-frame stutters are 0.35-0.5% against
+// a 0.10% goal, and the cause is measured: two BIMODAL game-thread costs that
+// land as single-frame spikes at submit time.
+//   * reqHdr -- VoxelApplyFast::ShadingForDispatch pays 4 amplifier columns +
+//     climate per COLD footprint: 5.7 us warm -> 587 us under load, single
+//     frames of 43-52 ms. The cache is at its hit ceiling (88.7% vs the 88.0%
+//     bound); the misses are genuine first touches, and coldGame=0 proved they
+//     are WORK, not I/O -- and the sampler is game-thread-only by design.
+//   * raster-atlas fills -- a 240 m page column comes due every ~10 s of
+//     flight and fills synchronously on the game thread: 33-43 ms single
+//     frames. The demand cap is tuned, and async fill is REFUTED (it spreads
+//     the stall: hitch time 3957 -> 5834 ms, frames >=200 ms 1 -> 4).
+// Both are pay-a-lump-exactly-when-the-camera-arrives costs, so both arms
+// below pay EARLY, IN SMALL PIECES, AT PREDICTED POSITIONS -- reusing the T4-1
+// predicted anchor (voxel.Stream.VelocityLeadSec + the 0.25 s EMA velocity),
+// never a second predictor. Defaults 0: a control leg is byte-identical, at
+// most one branch per tick per arm.
+static TAutoConsoleVariable<float> CVarVoxelStreamWarmShadingAhead(
+	TEXT("voxel.Stream.WarmShadingAhead"), 0.0f,
+	TEXT("Game-thread MILLISECONDS per streaming tick spent pre-filling VoxelApplyFast's ")
+	TEXT("per-column shading cache for footprints AHEAD of the camera (the T4-1 predicted ")
+	TEXT("anchor's admission annuli), so submit finds them warm instead of paying a cold ")
+	TEXT("sample inline -- the reqHdr 43-52 ms single frames. 0 = off and the default; 0.25 ")
+	TEXT("is the intended arm. WALL-CLOCK budget (FPlatformTime), checked before every ")
+	TEXT("sample and every 64 probes, so one bimodal cold sample (up to ~0.6 ms) can ")
+	TEXT("overshoot it -- that overshoot IS the amortisation working, not a leak. Verdict: ")
+	TEXT("the `Voxel apply fast` line's cacheMiss falling on the armed leg (warm fills are ")
+	TEXT("counted separately there as warmFill=) plus maxReqHdr on the submit split falling ")
+	TEXT("out of the tens of ms. Reads `Voxel warm-ahead (window)` for engagement."),
+	ECVF_Default);
+static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasPrefetchAhead(
+	TEXT("voxel.Stream.AtlasPrefetchAhead"), 0,
+	TEXT("Raster-atlas PAGES per streaming tick pre-filled for the page column the T4-1 ")
+	TEXT("predicted anchor is about to enter (pages in coverage of the PREDICTED anchor and ")
+	TEXT("not of the current one -- the crossing crescent), so the 33-43 ms synchronous ")
+	TEXT("column fill never comes due in one frame. 0 = off and the default; 8 is the ")
+	TEXT("intended arm (a ~40-page column against ~180 lead ticks at 20 m/s needs ~1/tick; ")
+	TEXT("8 is margin). A COUNT, not a deadline, for the same reason the demand cap is: ")
+	TEXT("pages are near-equal cost and a count cannot overshoot by a page. Verdict: the ")
+	TEXT("atlas window line's demand rescued=/capHit= collapsing and the submit split's ")
+	TEXT("maxRaster falling to single digits. Engagement: the same line's prefetch group."),
+	ECVF_Default);
+
 // Forward declaration at GLOBAL scope, deliberately outside the anonymous
 // namespace below: FSharedColumnGridCache (inside it) reads its capacity from
 // this accessor, whose definition lives with its siblings in the real
@@ -8547,6 +8591,33 @@ struct FVoxelWorldImpl
 	// is still on screen (docs/speculative-generation-plan.md Wave S3).
 	FVector PredictedAnchorLocation = FVector::ZeroVector;
 
+	// --- WARM-AHEAD SHADING (voxel.Stream.WarmShadingAhead; the loop is
+	// WarmShadingAheadTick, defined beside SubmitGpuMeshJob whose reqHdr cost
+	// it exists to amortise). Per-level scan state, same idea as the raster
+	// atlas's SweepResumeR: cells only ever become MORE cached while a centre
+	// holds (evictions are 173-208 per window against 131,072 slots), so a
+	// cursor that resumes where work last was turns each tick's scan from
+	// O(annulus) into O(ring perimeter). The centre is the PREDICTED anchor's
+	// chunk at that level; when it moves, ring numbering shifts by at most one,
+	// so the cursor steps back one ring instead of rescanning from zero.
+	// A hole OPENED behind the cursor (a cache eviction, or a band that stops
+	// proving a column empty) is deliberately not chased: demand pays it cold,
+	// which is exactly today's behaviour -- this arm only ever removes cost.
+	int32 WarmScanCenterX[VoxelCoords::kNumLevels] = {};
+	int32 WarmScanCenterY[VoxelCoords::kNumLevels] = {};
+	int32 WarmScanResumeR[VoxelCoords::kNumLevels] = {};
+	bool bWarmScanCenterValid[VoxelCoords::kNumLevels] = {};
+	// Scanned to the rim since the centre last moved: nothing uncached left at
+	// this level, skip it for free until the predicted anchor's chunk changes.
+	bool bWarmScanClean[VoxelCoords::kNumLevels] = {};
+	// Window counters for the `Voxel warm-ahead` line in MaybeLogCounters.
+	int64 WarmedSinceLog = 0;             // footprints actually sampled ahead
+	int64 WarmSkippedCachedSinceLog = 0;  // probes that found the cache already warm
+	int64 WarmSkippedAirSinceLog = 0;     // band-proven-empty columns never submitted, so never warmed
+	int64 WarmTicksSinceLog = 0;          // ticks the arm ran at all
+	int64 WarmRootNullTicksSinceLog = 0;  // ticks skipped because GpuPoolRoot was null (mirrors the submit-site guard)
+	double WarmMsSinceLog = 0.0;          // wall clock actually spent, the budget's honest bill
+
 	double AccumDispatchMs = 0.0;
 	// Sub-total of AccumDispatchMs: the speculative half only. See task #21.
 	double AccumSpecDispatchMs = 0.0;
@@ -9407,6 +9478,11 @@ private:
 		return VoxelDebug::GetStreamJobsInFlightPerCore() * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
 	}
 	void DispatchJobs();
+	// ARM 1 of the stutter work (voxel.Stream.WarmShadingAhead): budgeted
+	// pre-sampling of VoxelApplyFast's shading cache at the predicted anchor.
+	// Runs at the END of TickStreaming so demand always goes first; defined
+	// beside SubmitGpuMeshJob, whose reqHdr bucket it exists to flatten.
+	void WarmShadingAheadTick();
 	void DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainUnloads();
@@ -10526,6 +10602,27 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				RasterAtlas->Init(ActiveTiles().pixelSizeMm(),
 				                  int64(OuterMeters * 1000.0), MaxRing);
 			}
+			// ARM 2 of the stutter work (docs/submit-split-2026-08-28.md): the
+			// 240 m page column that comes due every ~10 s of flight fills
+			// synchronously in 33-43 ms single frames, the demand cap is tuned
+			// and async fill is REFUTED -- so fill the UPCOMING column at the
+			// T4-1 predicted anchor, a few pages per tick, before it is due.
+			// BEFORE Tick() ON PURPOSE: the pages this stages ride Tick's own
+			// delta flush, keeping the "deltas flush before dispatches enqueue"
+			// ordering that PrepareRequest's host mirror rests on -- staged
+			// after Tick they would read resident a full tick before the GPU
+			// had them, and a dispatch could tap the gap (gpuMiss = wrong
+			// terrain). Off (0) this costs one cvar read and one branch.
+			const int32 PrefetchPagesPerTick =
+				CVarVoxelStreamAtlasPrefetchAhead.GetValueOnGameThread();
+			if (PrefetchPagesPerTick > 0)
+			{
+				RasterAtlas->PrefetchAhead(ActiveTiles(),
+				                           int64(Anchor.X) * 10, int64(Anchor.Y) * 10,
+				                           int64(PredictedAnchorLocation.X) * 10,
+				                           int64(PredictedAnchorLocation.Y) * 10,
+				                           PrefetchPagesPerTick);
+			}
 			// Anchor is UU (cm); the raster lives in mm.
 			RasterAtlas->Tick(ActiveTiles(), int64(Anchor.X) * 10, int64(Anchor.Y) * 10);
 		}
@@ -10718,6 +10815,14 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		AccumRecomputeMs += ThisFrameRecomputeMs;
 		++AccumTicks;
 	}
+
+	// ARM 1 of the stutter work: warm the dispatch shading cache ahead of the
+	// camera. AFTER dispatch/drain/unload so demand always went first this
+	// tick; the wall-clock budget (voxel.Stream.WarmShadingAhead, default 0 =
+	// off) is the whole cost, and off it is one cvar read and one branch. See
+	// WarmShadingAheadTick's header comment for the reqHdr measurement and the
+	// candidate-set derivation.
+	WarmShadingAheadTick();
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
 	// -VoxelWorkerPool arm: same prune, same reason (WaitForInFlightTasks'
@@ -12876,6 +12981,49 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       (long long)SpecDroppedBrickNotResidentSinceLog, (long long)SpecBrickParkLostSinceLog,
 			       VoxelDebug::GetStreamSpeculativeParkBricks());
 		}
+	}
+
+	// Warm-ahead census (voxel.Stream.WarmShadingAhead). The line prints on
+	// EVERY window while the arm is on, so armed-with-zero-warms -- the healthy
+	// steady state where everything ahead is already cached, or a parked leg --
+	// reads as `warmed=0` WITH the line present, and can never be confused with
+	// OFF (no line at all). The engagement ladder, stated before any leg:
+	//   line absent                       -> arm off (cvar 0). Control.
+	//   warmed=0, warmSkippedCached>0     -> ran, found everything warm. Healthy.
+	//   warmed=0, skipped=0, ticks>0      -> ran and every level was clean (rim
+	//                                        reached earlier). Healthy-parked.
+	//   rootNullTicks ~= ticks            -> the pool root never existed; the
+	//                                        arm never sampled. DEAD, not null.
+	//   INERT-CACHE-OFF suffix            -> -VoxelApplyFast has no cache bit;
+	//                                        warming can persist nothing. The
+	//                                        leg is NOT measuring this arm.
+	// warmHitLater (did a submit later hit a warmed entry) is NOT measurable
+	// cheaply -- the cache keeps no per-entry provenance -- so the A/B verdict
+	// is the `Voxel apply fast` line's cacheMiss falling on the armed leg
+	// (warm fills count there as warmFill=, never as cacheMiss, precisely so
+	// this reading survives) plus maxReqHdr on the submit split leaving the
+	// 43-52 ms band. Budget wording: warmBudgetMs is what was actually SPENT
+	// (wall clock, overshoot included), not the configured cap.
+	if (CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread() > 0.f || WarmedSinceLog > 0 ||
+	    WarmTicksSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel warm-ahead (window): budget=%.2fms/tick warmed=%lld ")
+		       TEXT("warmSkippedCached=%lld warmSkippedAir=%lld warmBudgetMs=%.1f ticks=%lld ")
+		       TEXT("rootNullTicks=%lld%s"),
+		       CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread(),
+		       (long long)WarmedSinceLog, (long long)WarmSkippedCachedSinceLog,
+		       (long long)WarmSkippedAirSinceLog, WarmMsSinceLog,
+		       (long long)WarmTicksSinceLog, (long long)WarmRootNullTicksSinceLog,
+		       !VoxelApplyFast::CacheArmed()
+		           ? TEXT(" INERT-CACHE-OFF (-VoxelApplyFast cache bit clear; warming can persist nothing)")
+		           : TEXT(""));
+		WarmedSinceLog = 0;
+		WarmSkippedCachedSinceLog = 0;
+		WarmSkippedAirSinceLog = 0;
+		WarmTicksSinceLog = 0;
+		WarmRootNullTicksSinceLog = 0;
+		WarmMsSinceLog = 0.0;
 	}
 
 	// S2-3 park census. adopted/parked is the hit rate: a park that is never
@@ -20809,6 +20957,228 @@ static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
                                           const FVector& ChunkOriginRelative,
                                           int32 Level);
 static FVoxelBrickChunkShading ShadingFromChunkParams(const FVector4f& Params);
+
+// ---------------------------------------------------------------------------
+// ARM 1 OF THE STUTTER WORK (docs/hundred-fps-2026-08-28.md 3b): warm the
+// dispatch shading cache AHEAD of the camera, on a wall-clock budget.
+//
+// WHY (docs/submit-split-2026-08-28.md): SubmitGpuMeshJob's reqHdr bucket is
+// ~52% of the tail frame's submit cost, and its body is the shading call below
+// in SubmitGpuMeshJob -- four GetSurfaceHeightUU amplifier columns plus a
+// climate sample per COLD footprint, 5.7 us warm -> 587 us under load, landing
+// as single frames of 43-52 ms. The cache in front of it is at its theoretical
+// hit ceiling (88.7% vs 88.0%), so the misses are genuine FIRST TOUCHES: the
+// question is not WHETHER the sample runs but WHEN. coldGame=0 proved it is
+// WORK, not I/O, and the sampler is GAME-THREAD-ONLY by design (unsynchronised
+// table, offThread a checked hard zero) -- so the only legal move is to run it
+// here, inside the streaming tick, in budgeted pieces, at footprints the T4-1
+// predicted anchor says are coming.
+//
+// CANDIDATE SET, derived not invented: for each level the dispatcher actually
+// submits (the GPU fork takes 0..GpuMeshMaxLevel -- see EnsureGpuMeshJobs'
+// ENABLED line; on the shipped GPU-primary arm the drain site's publish guard
+// skips its sample for every null-pack result, so the dispatch site IS the
+// cold-miss population), the admission CORE annulus around the PREDICTED
+// anchor -- the same centre/inner/outer arithmetic as RecomputeDesiredSet's
+// entry pass, mirrored exactly as the coverage verifier above mirrors it,
+// including the Level>0 inner skip and its -VoxelHierarchicalCoverage arm. The
+// seam-padding band (AdmitOuterUU) is deliberately NOT warmed: it is admitted
+// only where the parent is absent, so warming it would sample footprints the
+// ordinary path mostly would not; under-covering there costs one demand-cold
+// sample, never a wrong value. Candidates are ordered by expanding Chebyshev
+// ring from the predicted anchor's chunk -- nearest predicted ground first.
+//
+// WHAT A WARM COSTS AND WHAT IT CAN NEVER DO: VoxelApplyFast::WarmForDispatch
+// is a pure cache fill through the SAME ShadingImpl body the submit site uses
+// (one spelling of the slot key and the Z rebase); it mutates no world state,
+// so the worst case of any mis-aimed candidate is a wasted sample and a cache
+// slot. The budget is WALL CLOCK, checked before every sample and every 64
+// probes: a cold sample is the lump being amortised (up to ~0.6 ms), so the
+// spend can overshoot by at most one sample -- inherent to paying lumps on a
+// deadline, and the honest price of this arm.
+//
+// warmHitLater -- "did a warmed entry get hit by a real submit" -- is NOT
+// measurable cheaply (the cache keeps no per-entry provenance), and saying so
+// beats pretending: the A/B verdict is the `Voxel apply fast` line's cacheMiss
+// falling on the armed leg (warm fills count separately there as warmFill=,
+// precisely so they cannot bury that reading), together with maxReqHdr on the
+// submit-split line falling out of the 43-52 ms band. avoided ~= calls with a
+// FLAT reqHdr means the diagnosis is wrong: revert, do not tune -- the
+// module's own standing rule.
+// ---------------------------------------------------------------------------
+void FVoxelWorldImpl::WarmShadingAheadTick()
+{
+	const float BudgetMs = CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread();
+	if (BudgetMs <= 0.f)
+	{
+		return; // control arm: one cvar read and this branch, per tick, total
+	}
+	using namespace VoxelCoords;
+	++WarmTicksSinceLog;
+
+	// Mirror of the submit site's null guard below: with no pool root the
+	// submit site does not sample either, and warming through a DIFFERENT root
+	// than dispatch uses would poison the cache with wrong-origin heights.
+	const USceneComponent* PoolRootForShading = GpuPoolRoot.Get();
+	if (PoolRootForShading == nullptr)
+	{
+		++WarmRootNullTicksSinceLog;
+		return;
+	}
+	if (!VoxelApplyFast::CacheArmed())
+	{
+		// A warm sample the cache cannot store is computed-and-discarded work.
+		// The window line prints INERT-CACHE-OFF for this state -- an armed leg
+		// that measures nothing must say so, not read as a null result.
+		return;
+	}
+
+	const double T0 = FPlatformTime::Seconds();
+	const double Deadline = T0 + double(BudgetMs) / 1000.0;
+	ON_SCOPE_EXIT { WarmMsSinceLog += (FPlatformTime::Seconds() - T0) * 1000.0; };
+
+	const int32 MaxWarmLevel =
+		FMath::Min(UVoxelWorldSubsystem::GetMaxRingLevel(), VoxelStreamAdmission::GpuMeshMaxLevel());
+	const bool bBandSkipArmed = VoxelStreamAdmission::AdmissionBandSkipMode() == 1;
+	const bool bHier = VoxelStreamAdmission::HierarchicalCoverageEnabled();
+
+	int32 ProbesSinceClock = 0;
+	for (int32 Level = 0; Level <= MaxWarmLevel; ++Level)
+	{
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
+		const double OuterUU = Preset.OuterMeters * 100.0;
+		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
+		const FVoxelChunkKey PredChunk =
+			ChunkKeyForVoxel(WorldToVoxelForLevel(PredictedAnchorLocation, Level));
+
+		// Cursor validity: ring numbering is relative to the predicted chunk,
+		// and a centre move shifts every cell's ring by at most one -- so step
+		// the cursor back one ring rather than to zero. New ground can only
+		// appear at the rim; a full rescan would spend the whole budget
+		// re-probing footprints the cache already holds.
+		if (!bWarmScanCenterValid[Level] || WarmScanCenterX[Level] != PredChunk.X ||
+		    WarmScanCenterY[Level] != PredChunk.Y)
+		{
+			WarmScanCenterX[Level] = PredChunk.X;
+			WarmScanCenterY[Level] = PredChunk.Y;
+			bWarmScanCenterValid[Level] = true;
+			WarmScanResumeR[Level] = FMath::Max(0, WarmScanResumeR[Level] - 1);
+			bWarmScanClean[Level] = false;
+		}
+		if (bWarmScanClean[Level])
+		{
+			continue; // rim reached since the centre last moved; nothing new here
+		}
+
+		// Same span arithmetic as the entry pass and the coverage verifier.
+		const int32 ChunkSpan = FMath::CeilToInt32(OuterUU / ChunkEdge) + 1;
+		const double InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
+
+		bool bRanOut = false;
+		for (int32 R = WarmScanResumeR[Level]; R <= ChunkSpan && !bRanOut; ++R)
+		{
+			WarmScanResumeR[Level] = R;
+			const int32 X0 = PredChunk.X - R, X1 = PredChunk.X + R;
+			const int32 Y0 = PredChunk.Y - R, Y1 = PredChunk.Y + R;
+			for (int32 Cy = Y0; Cy <= Y1 && !bRanOut; ++Cy)
+			{
+				// Ring perimeter only; interior rings were covered at smaller R.
+				const int32 StepX = (Cy == Y0 || Cy == Y1) ? 1 : FMath::Max(1, X1 - X0);
+				for (int32 Cx = X0; Cx <= X1; Cx += StepX)
+				{
+					// The clock is read every 64 probes as well as before every
+					// sample: probes are cheap but unbounded, and the budget is
+					// the ONLY thing standing between this loop and the frame.
+					if (((++ProbesSinceClock) & 63) == 0 && FPlatformTime::Seconds() >= Deadline)
+					{
+						bRanOut = true;
+						break;
+					}
+					// Identical centre math to the entry pass, against the
+					// PREDICTED anchor -- this annulus is what admission will
+					// want when the camera arrives; footprints it already has
+					// are caught by the IsCached probe two tests later.
+					const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
+					const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
+					const double DistSq =
+						FMath::Square(CenterX - PredictedAnchorLocation.X) +
+						FMath::Square(CenterY - PredictedAnchorLocation.Y);
+					if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU) && !bHier)
+					{
+						continue; // a finer ring owns this footprint, entirely
+					}
+					if (DistSq >= FMath::Square(OuterUU))
+					{
+						continue; // outside the core annulus (padding band not warmed -- see above)
+					}
+					if (VoxelApplyFast::IsCached(Level, Cx, Cy))
+					{
+						++WarmSkippedCachedSinceLog;
+						continue;
+					}
+					// NEVER SAMPLE A FOOTPRINT THE ORDINARY PATH WOULD NOT: a
+					// level-0 column whose cached band proves EVERY chunk empty
+					// is dropped at admission and never reaches SubmitGpuMeshJob,
+					// so its footprint is never shaded -- warming it would be
+					// net-new sampling, not moved sampling. Mirrors the coverage
+					// verifier's band walk exactly, including the non-caching
+					// Z-range call (a warm probe must not write to a memo the
+					// streaming path reads) and the skirt widening.
+					if (bBandSkipArmed && Level == 0)
+					{
+						if (const VoxelStreaming::FFootprintBand* Band =
+						        FootprintBandCache.Find(FIntPoint(Cx, Cy)))
+						{
+							int32 ZMin = 0, ZMax = 0, ZMaxUntrimmed = 0;
+							ComputeFootprintChunkZRange(Cx, Cy, 0, ZMin, ZMax, ZMaxUntrimmed);
+							ZMin -= VoxelUnderground::SkirtDepthChunks(0, DistSq);
+							bool bWholeColumnProvenEmpty = true;
+							for (int32 Cz = ZMin; Cz <= ZMax && bWholeColumnProvenEmpty; ++Cz)
+							{
+								bool bAllAir = false;
+								bWholeColumnProvenEmpty =
+									VoxelStreaming::BandProvesChunkEmpty(*Band, Cz, bAllAir);
+							}
+							if (bWholeColumnProvenEmpty)
+							{
+								++WarmSkippedAirSinceLog;
+								continue;
+							}
+						}
+					}
+					// Budget BEFORE the sample: the sample is the lump being
+					// amortised (5.7-587 us), so this is the check that matters;
+					// the overshoot is bounded by exactly one sample.
+					if (FPlatformTime::Seconds() >= Deadline)
+					{
+						bRanOut = true;
+						break;
+					}
+					// The same entry the submit site uses (mirrored from
+					// SubmitGpuMeshJob below, GpuPoolRoot guard included). Z=0
+					// deliberately: the cache key and every cached quantity are
+					// per-(Level,X,Y) -- SampleChunkParamsForPool's Z enters only
+					// as the final rebase, which the cache re-derives per chunk
+					// at hit time, so ANY Z yields the identical slot.
+					VoxelApplyFast::WarmForDispatch(
+						VoxelCoords::FVoxelLevelChunkKey{Level, FVoxelChunkKey{Cx, Cy, 0}},
+						*PoolRootForShading, &SampleChunkParamsForPool, &ShadingFromChunkParams);
+					++WarmedSinceLog;
+				}
+			}
+		}
+		if (bRanOut)
+		{
+			return; // budget spent; the cursor resumes at this ring next tick
+		}
+		// Reached the rim with budget to spare: this level is clean until the
+		// predicted centre moves, and the rest of the budget goes to the next
+		// level (or to nothing, which the window line reports as warmed=0 --
+		// the healthy steady state, distinguishable from OFF because the line
+		// itself only prints while the arm is on).
+		bWarmScanClean[Level] = true;
+	}
+}
 
 bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
                                        uint8 RingSkirtMask, bool bSpeculative)

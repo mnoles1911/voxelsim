@@ -185,6 +185,58 @@ public:
 	// PrepareRequest's host mirror already rests on.
 	bool FillWindowOnDemand(vxc::ITileSampler& Tiles, const FVoxelGpuRegionRequest& Req);
 
+	// --- THE PREDICTIVE COLUMN PREFETCH (voxel.Stream.AtlasPrefetchAhead) ---
+	//
+	// WHY (docs/submit-split-2026-08-28.md): the demand path above RESCUES a
+	// crossing -- it does not prevent one. When the anchor crosses a page
+	// boundary a whole column comes due AT ONCE, and the measured result is
+	// 33-43 ms single frames of synchronous game-thread fill every ~10 s of
+	// flight (240 m page / ~24 m/s). Both known levers on the demand side are
+	// spent: the per-tick cap is tuned, and ASYNC FILL IS REFUTED -- it moves
+	// 85% of the work off-thread and is WORSE overall because it spreads the
+	// stall (hitch time 3957 -> 5834 ms, frames >=200 ms 1 -> 4). The remaining
+	// shape is to fill the upcoming column BEFORE it is due, a few pages per
+	// tick, at the position the T4-1 predicted anchor
+	// (voxel.Stream.VelocityLeadSec) says the camera is heading for.
+	//
+	// WHAT IT FILLS: pages inside the coverage disc of the PREDICTED anchor
+	// and OUTSIDE the coverage disc of the CURRENT one -- the crossing
+	// crescent, which is exactly the set the demand path would otherwise fill
+	// in a lump when the crossing lands. Geometry bounds the scan: with the
+	// lead clamped to 60 m (< 32 px < a page), every crescent page sits within
+	// ~2 Chebyshev rings of the coverage rim, so the walk starts at
+	// RadiusPages-3 instead of 0. Filling ahead of the CURRENT disc is torus-
+	// safe by Init's own margin: PagesDim = 2*RadiusPages + 3 keeps one page of
+	// recentre hysteresis per side, so a page one column ahead aliases only
+	// onto slots two pages OUTSIDE the current disc -- pages nothing can tap.
+	//
+	// A COUNT PER TICK, NOT A DEADLINE, for the same reason DemandPagesPerTick
+	// is: pages are near-equal cost and a count cannot overshoot by a page. A
+	// PARTIAL column is useful here (unlike the demand path's all-or-nothing
+	// rescue): every page filled early is one page fewer in the lump, so there
+	// is no refusal logic at all.
+	//
+	// MUST BE CALLED BEFORE Tick() IN THE SAME STREAMING TICK. The pages it
+	// stages ride Tick's own delta flush, which is what keeps the ordering
+	// argument (deltas flush before any dispatch this tick enqueues) intact; a
+	// prefetch after Tick would mark pages resident in the host mirror a full
+	// tick before the GPU had them, and a dispatch could tap the gap -- a
+	// gpuMiss, i.e. wrong terrain.
+	//
+	// FAILING READINGS (the window line's prefetch group): ticks=0 across a
+	// whole flight leg with the arm on means the predicted page never differed
+	// from the current one -- lead too short or the leg parked; the arm was
+	// NOT MEASURED. filled=0 with alreadyResident large is the healthy steady
+	// state once the sweep or an earlier crossing got there first. The VERDICT
+	// numbers live elsewhere and must be read together: demand rescued=/capHit=
+	// collapsing and the submit split's maxRaster falling from 33-43 ms to
+	// single digits on the armed leg. Prefetched pages that fall out of
+	// coverage unfetched (a turn) cost their fill and nothing else -- the torus
+	// slot is simply reclaimed later, the same as any page that leaves
+	// coverage.
+	void PrefetchAhead(vxc::ITileSampler& Tiles, int64 AnchorXMm, int64 AnchorYMm,
+	                   int64 PredXMm, int64 PredYMm, int32 MaxPages);
+
 	// PIE teardown: enqueues the GPU-side release. Safe to call once, after
 	// the last Tick.
 	void Shutdown();
@@ -590,6 +642,18 @@ private:
 	// Reused so the hot path does not allocate per declined chunk. Game thread
 	// only, and never live across a call.
 	TArray<FPagePt> DemandPageScratch;
+
+	// --- THE PREDICTIVE PREFETCH'S TRAFFIC (PrefetchAhead above) ------------
+	// Window counters unless named Lifetime; reset in LogWindowIfDue with the
+	// demand group. PrefetchCapLast is the last cap the subsystem passed in --
+	// 0 means the arm has never been called this session (cvar 0 = off), which
+	// the window line prints as OFF so armed-idle can never be read as off.
+	uint64 PrefetchTicks = 0;            // ticks the crescent scan actually ran
+	uint64 PrefetchFilled = 0;
+	uint64 PrefetchFilledLifetime = 0;
+	uint64 PrefetchAlreadyResident = 0;  // crescent pages probed and skipped
+	uint64 PrefetchCycles = 0;           // game-thread bill, printed as ms GT
+	int32 PrefetchCapLast = 0;
 
 	// --- PROOF OF TRAFFIC FOR THE SAFETY PATH -------------------------------
 	//

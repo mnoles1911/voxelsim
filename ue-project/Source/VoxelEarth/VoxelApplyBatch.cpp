@@ -154,6 +154,16 @@ int64 AuditMismatches = 0;
 double MaxMismatchUU = 0.0;
 double SampleSeconds = 0.0; // wall time inside SampleChunkParamsForPool
 int64 AuditTick = 0;
+// Warm-ahead traffic (voxel.Stream.WarmShadingAhead; see the WARM-AHEAD HOOKS
+// block in the header). SEPARATE from Calls/CacheMisses ON PURPOSE: the armed
+// leg's verdict is the SUBMIT population's cacheMiss falling, and warm fills
+// counted there would relocate every first-touch miss into the same counter
+// and erase exactly the reading the A/B is decided on. WarmHits should read
+// ~0: the warm loop probes IsCached before calling, and game-thread code has
+// no one to race -- a nonzero here is a probe/entry disagreement worth a look,
+// not a crash.
+int64 WarmFills = 0;
+int64 WarmHits = 0;
 
 double LastLogSeconds = 0.0;
 
@@ -184,7 +194,8 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
                                            const USceneComponent& Root,
                                            FSampleParamsFn SampleParams,
                                            FShadingFromFn ShadingFrom,
-                                           bool bAllowGuard);
+                                           bool bAllowGuard,
+                                           bool bWarmAhead = false);
 
 FVoxelBrickChunkShading ShadingForPublishSlow(const VoxelCoords::FVoxelLevelChunkKey& Key,
                                               const FVoxelBrickCpuPackRef& Pack,
@@ -234,6 +245,55 @@ FVoxelBrickChunkShading ShadingForDispatchSlow(const VoxelCoords::FVoxelLevelChu
 	                   /*bAllowGuard*/ false);
 }
 
+// --- the warm-ahead hooks (see the header's WARM-AHEAD HOOKS block) ----------
+
+bool IsCached(int32 Level, int32 X, int32 Y)
+{
+	// GAME THREAD ONLY, like every read of Table(). Off-thread the honest
+	// answer is "do not warm this footprint", which reads as cached -- the same
+	// fail-toward-doing-nothing direction the sampler's offThread check takes.
+	if (!IsInGameThread())
+	{
+		return true;
+	}
+	if ((Mode() & kModeCache) == 0 || !bCacheAnchored)
+	{
+		// No table to hit (cache arm off) or nothing anchored yet. "Not cached"
+		// is literally true, but a caller must gate on CacheArmed() before
+		// spending a sample on it -- with the cache off the sample cannot be
+		// stored and warming is pure loss.
+		return false;
+	}
+	const uint32 Mask = uint32(CacheSlots() - 1);
+	const FSlot& Slot = Table()[SlotIndex(Level, X, Y, Mask)];
+	return Slot.Level == Level && Slot.X == X && Slot.Y == Y;
+}
+
+void WarmForDispatch(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                     const USceneComponent& Root,
+                     FSampleParamsFn SampleParams,
+                     FShadingFromFn ShadingFrom)
+{
+	if (!IsInGameThread())
+	{
+		// The hard zero, same rule as ShadingImpl's: the table is unsynchronised
+		// and the fine-tier prefetch is game-thread-gated. Unlike ShadingImpl
+		// there is no consumer to serve, so the right response is to do NOTHING,
+		// loudly countable, rather than sample anyway.
+		++OffThread;
+		return;
+	}
+	if ((Mode() & kModeCache) == 0)
+	{
+		// Nothing can be persisted; the warm loop's window line reports
+		// INERT-CACHE-OFF for this state so a leg cannot silently burn its
+		// budget warming a cache that does not exist.
+		return;
+	}
+	ShadingImpl(Key, FVoxelBrickCpuPackRef(), Root, SampleParams, ShadingFrom,
+	            /*bAllowGuard*/ false, /*bWarmAhead*/ true);
+}
+
 void FlushStats(bool bForce)
 {
 	const double Now = FPlatformTime::Seconds();
@@ -277,7 +337,7 @@ void FlushStats(bool bForce)
 	       TEXT("| guardSkip=%lld (withPack=%lld) cacheHit=%lld cacheMiss=%lld cacheEvict=%lld ")
 	       TEXT("sentinel=%lld | sampled=%lld sampleUs/sample=%.2f sampleUs/call=%.2f ")
 	       TEXT("sampleMsWindow=%.1f | audit=%lld mismatch=%lld maxMismatchUU=%.4f ")
-	       TEXT("| rootFlush=%lld offThread=%lld slots=%d win=%.1fs"),
+	       TEXT("| warmFill=%lld warmHit=%lld | rootFlush=%lld offThread=%lld slots=%d win=%.1fs"),
 	       M,
 	       (M & kModeGuard) ? TEXT("guard") : TEXT("-"),
 	       (M & kModeCache) ? TEXT("+cache") : TEXT(""),
@@ -289,11 +349,13 @@ void FlushStats(bool bForce)
 	       (long long)SentinelUncached,
 	       (long long)Sampled, SampleUsPerSample, SampleUsPerCall, SampleSeconds * 1000.0,
 	       (long long)AuditsRun, (long long)AuditMismatches, MaxMismatchUU,
+	       (long long)WarmFills, (long long)WarmHits,
 	       (long long)RootFlushes, (long long)OffThread,
 	       CacheSlots(), WindowSec);
 
 	Calls = Sampled = GuardSkipped = GuardSkipWithPack = 0;
 	CacheHits = CacheMisses = CacheEvicts = SentinelUncached = 0;
+	WarmFills = WarmHits = 0;
 	RootFlushes = OffThread = 0;
 	AuditsRun = AuditMismatches = 0;
 	MaxMismatchUU = 0.0;
@@ -312,7 +374,8 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
                                            const USceneComponent& Root,
                                            FSampleParamsFn SampleParams,
                                            FShadingFromFn ShadingFrom,
-                                           bool bAllowGuard)
+                                           bool bAllowGuard,
+                                           bool bWarmAhead)
 {
 	const int32 M = Mode();
 	const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
@@ -329,14 +392,20 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 		return ShadingFrom(SampleParams(Root, OriginRelative, Key.Level));
 	}
 
-	++Calls;
-	// The window flush costs one clock read; amortised over 256 drained chunks
-	// it is free, and at 12,700 drains per 5 s window the log still lands within
-	// ~0.1 s of its nominal edge. Pass -- to FlushStats from MaybeLogCounters
-	// (optional hook 3) if exact alignment with `Voxel tick budget` is wanted.
-	if ((Calls & 255) == 0)
+	// Warm-ahead traffic stays OUT of Calls (and out of the flush cadence,
+	// which keys off it) -- see the WarmFills declaration for why.
+	if (!bWarmAhead)
 	{
-		FlushStats(/*bForce*/ false);
+		++Calls;
+		// The window flush costs one clock read; amortised over 256 drained
+		// chunks it is free, and at 12,700 drains per 5 s window the log still
+		// lands within ~0.1 s of its nominal edge. Pass -- to FlushStats from
+		// MaybeLogCounters (optional hook 3) if exact alignment with
+		// `Voxel tick budget` is wanted.
+		if ((Calls & 255) == 0)
+		{
+			FlushStats(/*bForce*/ false);
+		}
 	}
 
 	auto Sample = [&]() -> FVector4f
@@ -422,6 +491,15 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 
 	if (Slot.Level == Key.Level && Slot.X == Key.Key.X && Slot.Y == Key.Key.Y)
 	{
+		if (bWarmAhead)
+		{
+			// The warm loop probes IsCached before calling, so this is ~0 by
+			// construction -- counted rather than assumed, because silent
+			// success is the house failure. No audit either: audits exist to
+			// check what is PUBLISHED, and nothing consumes a warm result.
+			++WarmHits;
+			return FVoxelBrickChunkShading::Neutral();
+		}
 		++CacheHits;
 
 		FVector4f Cached;
@@ -459,17 +537,29 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 		return ShadingFrom(Cached);
 	}
 
-	++CacheMisses;
-	if (Slot.Level >= 0)
+	if (!bWarmAhead)
 	{
-		// A live entry for a DIFFERENT column is being overwritten. cacheEvict
-		// ~= cacheMiss with a low hit rate is the table thrashing and wants
-		// -VoxelApplyColumnCache raised; cacheEvict ~= 0 with a low hit rate
-		// means the KEY is wrong, which is a completely different problem.
-		++CacheEvicts;
+		++CacheMisses;
+		if (Slot.Level >= 0)
+		{
+			// A live entry for a DIFFERENT column is being overwritten. cacheEvict
+			// ~= cacheMiss with a low hit rate is the table thrashing and wants
+			// -VoxelApplyColumnCache raised; cacheEvict ~= 0 with a low hit rate
+			// means the KEY is wrong, which is a completely different problem.
+			++CacheEvicts;
+		}
 	}
 
-	const FVector4f Fresh = Sample();
+	// A warm sample bypasses the Sample() lambda so its wall time lands in the
+	// warm loop's own warmBudgetMs (the `Voxel warm-ahead` window line) and not
+	// in SampleSeconds -- Sampled would not move with it and sampleUs/sample
+	// would read inflated. A warm fill CAN overwrite a live entry for another
+	// column; with 131,072 slots against a working set of a few thousand
+	// footprints that collision is rare enough not to earn its own counter --
+	// and if it ever mattered, the displaced column re-misses through the
+	// counted path, so cacheEvict/cacheMiss still names it.
+	const FVector4f Fresh = bWarmAhead ? SampleParams(Root, OriginRelative, Key.Level)
+	                                   : Sample();
 
 	if (Fresh.Z > kSurfaceSentinelCeiling)
 	{
@@ -480,6 +570,10 @@ static FVoxelBrickChunkShading ShadingImpl(const VoxelCoords::FVoxelLevelChunkKe
 		Slot.Precipitation = Fresh.Y;
 		Slot.GradPacked = Fresh.W;
 		Slot.BaseZUU = double(Fresh.Z) + ChunkWorldZ;
+		if (bWarmAhead)
+		{
+			++WarmFills; // the slot write IS the product of a warm call
+		}
 	}
 	else
 	{
