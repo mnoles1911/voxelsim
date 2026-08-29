@@ -1,0 +1,382 @@
+/* Component styles. Every number here comes from FVoxelMenuLayout or the
+ * StyleBoxFlat it ports; see tokens.css for the generated source of both.
+ */
+
+/* --- MenuButton ----------------------------------------------------------
+ * UIStyles.menu_button_styles(): four states, each a fill + a border colour,
+ * 2px border, 10px content margin, no radius. The label colour tracks the
+ * state too, which the Godot StyleBox does not do -- hence both here.
+ *
+ * Order of the state rules matters: the disabled rules must come last so a
+ * disabled button that still reports hover stays muted.
+ */
+.vm-menu-button {
+  /* Flex-centred rather than block: the label must sit in the middle of the
+   * 56px box, which is what VAlign_Center does in the engine. With `display:
+   * block` the text rides ~4px high whenever min-height exceeds the line box,
+   * which is every full-width menu entry. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: var(--vm-button-min-height);
+  padding: 10px;
+  border: 2px solid #000;
+  background: var(--vm-panel-oak2);
+  color: var(--vm-ink);
+  font-family: var(--vm-font-serif);
+  font-size: var(--vm-button-font-size);
+  line-height: 1.2;
+  text-align: center;
+  cursor: pointer;
+  appearance: none;
+  transition: none;
+}
+
+.vm-menu-button:hover {
+  background: var(--vm-panel-oak1);
+  border-color: var(--vm-gold);
+  color: var(--vm-gold);
+}
+
+.vm-menu-button:active {
+  background: var(--vm-panel-oak2-pressed);
+  border-color: var(--vm-gold-deep);
+  color: var(--vm-gold-deep);
+}
+
+/* Keyboard focus is NEW here, not ported: the Godot build has no keyboard or
+ * gamepad navigation on any menu, and the Slate port added it because a
+ * shipping front end needs it. It reads as the hover state plus an inset mark,
+ * so a gamepad player sees the same affordance a mouse user does. */
+.vm-menu-button:focus-visible {
+  background: var(--vm-panel-oak1);
+  border-color: var(--vm-gold);
+  color: var(--vm-gold);
+  outline: 2px solid var(--vm-gold);
+  outline-offset: -6px;
+}
+
+.vm-menu-button:disabled,
+.vm-menu-button[aria-disabled="true"] {
+  background: var(--vm-panel-oak2-disabled);
+  border-color: var(--vm-iron-deep);
+  color: var(--vm-ink-mute);
+  cursor: default;
+}
+
+/* The DELETE button's resting label. Applied only at rest, matching the
+ * source: a hovered DELETE goes gold like everything else. */
+.vm-menu-button--danger { color: var(--vm-hp-bright); }
+.vm-menu-button--danger:disabled,
+.vm-menu-button--danger[aria-disabled="true"] { color: var(--vm-ink-mute); }
+
+.vm-menu-button--compact {
+  min-height: var(--vm-save-row-button-height);
+  font-size: var(--vm-save-row-button-font);
+  width: var(--vm-save-row-button-width);
+}
+
+.vm-menu-button--dialog {
+  min-height: var(--vm-dialog-button-height);
+  width: var(--vm-dialog-button-width);
+}
+
+/* --- Panel ---------------------------------------------------------------
+ * menu_body_panel(): PANEL_OAK_1 fill, 2px black border, 18px content margin,
+ * and a drop shadow of rgba(0,0,0,0.6) inflated 8px and offset 4px down.
+ *
+ * THE SHADOW IS A HARD RECTANGLE, NOT A BLUR, and that is faithful rather than
+ * lazy: Slate's FSlateBrush has no shadow parameter, so the game draws it as a
+ * second offset box and gets hard edges. Reproducing the hard edge is what
+ * makes a design built here match the shipping screen.
+ */
+.vm-panel {
+  position: relative;
+  background: var(--vm-panel-oak1);
+  border: 2px solid #000;
+  padding: var(--vm-sub-panel-padding);
+}
+
+.vm-panel::before {
+  content: "";
+  position: absolute;
+  /* inflated 8px on every side, then shifted 4px down */
+  inset: -4px -8px -12px -8px;
+  background: var(--vm-shadow-panel);
+  z-index: -1;
+}
+
+.vm-panel--sub {
+  width: calc(var(--vm-sub-panel-half-width) * 2);
+  height: calc(var(--vm-sub-panel-half-height) * 2);
+}
+
+.vm-panel--iron { background: var(--vm-panel-iron); }
+
+.vm-panel__content {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.vm-divider {
+  height: 1px;
+  background: #000;
+  border: 0;
+  margin: 0;
+  flex: none;
+}
+
+/* --- Menu title block ---------------------------------------------------- */
+
+.vm-menu-title {
+  /* The title gets its own width, wider than the button column -- it does not
+   * fit in 520 and must not inherit it. */
+  max-width: var(--vm-title-box-width);
+  margin: 0 auto;
+  font-size: var(--vm-title-font-size);
+  line-height: 1.05;
+  color: var(--vm-gold);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.vm-menu-subtitle {
+  margin: 0;
+  font-size: var(--vm-subtitle-font-size);
+  color: var(--vm-ink-dim);
+  text-align: center;
+}
+
+.vm-version-stamp {
+  position: absolute;
+  left: var(--vm-version-inset-left);
+  bottom: var(--vm-version-inset-bottom);
+  margin: 0;
+  font-size: var(--vm-version-font-size);
+  color: var(--vm-ink-mute);
+}
+
+/* --- MenuColumn ---------------------------------------------------------- */
+
+.vm-menu-column {
+  width: calc(var(--vm-main-panel-half-width) * 2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--vm-main-column-separation);
+}
+
+.vm-menu-column__title-gap { height: var(--vm-title-to-buttons-spacer); flex: none; }
+.vm-menu-column__quit-gap  { height: var(--vm-quit-spacer); flex: none; }
+
+/* --- SaveRow ------------------------------------------------------------- */
+
+.vm-save-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: var(--vm-save-row-min-height);
+  padding: 8px 10px;
+  background: var(--vm-panel-oak2);
+  border: 2px solid #000;
+  font-size: var(--vm-save-row-font-size);
+}
+
+.vm-save-row__text { flex: 1 1 auto; min-width: 0; }
+.vm-save-row__name { display: block; color: var(--vm-ink); }
+.vm-save-row__detail {
+  display: block;
+  color: var(--vm-ink-dim);
+  font-size: calc(var(--vm-save-row-font-size) - 2px);
+}
+.vm-save-row__detail--disabled { color: var(--vm-ink-mute); }
+.vm-save-row__actions { display: flex; gap: 6px; flex: none; }
+.vm-save-row--unloadable { opacity: 0.75; }
+
+.vm-save-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--vm-save-row-separation);
+}
+
+.vm-save-list__empty {
+  color: var(--vm-ink-dim);
+  font-size: var(--vm-sub-panel-body-size);
+  text-align: center;
+  padding: 24px 0;
+}
+
+/* --- MessagePanel -------------------------------------------------------- */
+
+.vm-message-panel__title {
+  font-size: var(--vm-sub-panel-title-size);
+  color: var(--vm-gold);
+  text-align: center;
+  margin: 0 0 var(--vm-sub-panel-separation);
+  flex: none;
+}
+
+.vm-message-panel__body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  font-size: var(--vm-sub-panel-body-size);
+  color: var(--vm-ink);
+  white-space: pre-wrap;
+  margin: 0 0 var(--vm-sub-panel-separation);
+}
+
+.vm-message-panel__footer {
+  flex: none;
+  display: flex;
+  justify-content: center;
+}
+
+/* --- Loading screen ------------------------------------------------------ */
+
+.vm-loading-column {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: var(--vm-loading-column-width);
+  min-height: var(--vm-loading-column-height);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--vm-loading-separation);
+}
+
+.vm-loading-title {
+  margin: 0;
+  font-size: var(--vm-loading-title-size);
+  color: var(--vm-gold);
+  text-align: center;
+  text-shadow: 3px 3px 0 rgba(0, 0, 0, 0.95);
+}
+
+.vm-loading-percent {
+  margin: 0;
+  font-size: var(--vm-loading-pct-size);
+  color: var(--vm-gold);
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.9);
+}
+
+/* Room for two lines, so a long quip wrapping does not shove the bar and
+ * percentage down and back up every 2.5 seconds. */
+.vm-quip {
+  margin: 0;
+  width: var(--vm-loading-column-width);
+  min-height: var(--vm-loading-quip-min-height);
+  font-size: var(--vm-loading-quip-size);
+  color: var(--vm-ink-dim);
+  text-align: center;
+  text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.85);
+}
+
+.vm-quip--cycling { animation: vm-quip-cycle var(--vm-quip-rotate) linear infinite; }
+
+@keyframes vm-quip-cycle {
+  0%   { opacity: 0; }
+  16%  { opacity: 1; }
+  84%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* --- ProgressBar --------------------------------------------------------- */
+
+.vm-progress {
+  width: var(--vm-loading-bar-width);
+  height: var(--vm-loading-bar-height);
+  background: var(--vm-bar-track);
+  position: relative;
+  overflow: hidden;
+}
+
+.vm-progress__fill {
+  height: 100%;
+  background: var(--vm-sand-bright);
+}
+
+/* --- Hourglass ----------------------------------------------------------- */
+
+.vm-hourglass-wrap {
+  width: var(--vm-hourglass-wrap-width);
+  height: var(--vm-hourglass-wrap-height);
+  padding-top: var(--vm-hourglass-offset-y);
+  flex: none;
+}
+
+.vm-hourglass {
+  display: block;
+  width: var(--vm-hourglass-width);
+  height: var(--vm-hourglass-height);
+  /* The caps and pillars overhang the glass on every side, so nothing here
+   * may clip. */
+  overflow: visible;
+}
+
+/* +/-2px on a 5.2s cycle, rising first. */
+.vm-hourglass--bobbing { animation: vm-bob var(--vm-hourglass-bob-period) ease-in-out infinite; }
+
+@keyframes vm-bob {
+  0%   { transform: translateY(0); }
+  25%  { transform: translateY(calc(var(--vm-hourglass-bob-pixels) * -1)); }
+  75%  { transform: translateY(var(--vm-hourglass-bob-pixels)); }
+  100% { transform: translateY(0); }
+}
+
+/* --- TipFooter ----------------------------------------------------------- */
+
+.vm-tip-footer {
+  position: absolute;
+  left: var(--vm-loading-tip-inset-x);
+  right: var(--vm-loading-tip-inset-x);
+  bottom: var(--vm-loading-tip-inset-bottom);
+  display: flex;
+  justify-content: center;
+  align-items: baseline;
+  gap: 12px;
+  font-size: var(--vm-loading-tip-size);
+}
+
+.vm-tip-footer__prefix { color: var(--vm-tip-gold); flex: none; }
+/* INK_DIM at 55% -- the source's Tint(InkDim, 0.55). */
+.vm-tip-footer__text { color: var(--vm-ink-dim); opacity: 0.55; }
+
+/* --- FpsReadout ----------------------------------------------------------
+ * The outline is part of the font in Slate (OutlineSize 4, black at 85%).
+ * paint-order puts the stroke behind the fill so the glyphs stay legible;
+ * the text-shadow is the fallback where paint-order is unsupported.
+ */
+.vm-fps-readout {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  margin: 0;
+  text-align: right;
+  font-size: var(--vm-fps-font-size);
+  line-height: 1.3;
+  color: rgba(255, 255, 255, 0.85);
+  white-space: pre-line;
+  paint-order: stroke fill;
+  -webkit-text-stroke: 2px rgba(0, 0, 0, 0.85);
+  text-shadow: 1px 1px 0 rgba(0, 0, 0, 0.7);
+}
+
+/* The GDScript tints the worst-frame figure red past 33 ms -- the same
+ * threshold the in-game perf HUD calls a hitch, so the two agree. */
+.vm-fps-readout--bad { color: rgba(255, 128, 128, 0.95); }
+
+/* The falling grains. `--vm-grain-drop` is set per grain in SVG user units and
+ * the negative animation-delay staggers them, so the column of sand is already
+ * mid-fall on the first painted frame rather than starting empty. */
+.vm-grain {
+  animation: vm-grain-fall 1.1s linear infinite;
+}
+
+@keyframes vm-grain-fall {
+  from { transform: translateY(0); }
+  to   { transform: translateY(calc(var(--vm-grain-drop) * 1px)); }
+}

@@ -1,0 +1,42 @@
+{
+  "name": "@voxelmark/design-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The VoxelMark front end as a React component library: the main menu, the loading screen, and the medieval token set, ported from the game's Slate implementation.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./styles.css": "./dist/voxelmark.css"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": [
+    "*.css"
+  ],
+  "scripts": {
+    "tokens": "node tools/gen-tokens.mjs",
+    "backgrounds": "python tools/prepare-backgrounds.py && node tools/gen-backgrounds.mjs",
+    "build:js": "esbuild src/index.ts --bundle --format=esm --outfile=dist/index.js --external:react --external:react-dom --external:react/jsx-runtime --jsx=automatic --target=es2020",
+    "build:types": "tsc -p tsconfig.json",
+    "build:css": "node tools/build-css.mjs",
+    "build": "npm run tokens && npm run build:js && npm run build:types && npm run build:css"
+  },
+  "peerDependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.3"
+  }
+}

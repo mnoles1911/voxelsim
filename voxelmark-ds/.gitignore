@@ -1,0 +1,11 @@
+node_modules/
+dist/
+ds-bundle/
+.ds-sync/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
+
+# Generated: web-weight re-encodes of the art in ue-project/Content/UI/Backgrounds.
+# Regenerate with `npm run backgrounds`.
+assets/
