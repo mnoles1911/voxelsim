@@ -40,3 +40,10 @@ is ~1.2 m deep -- standing water, not film.
   after any bump.
 - `lake_survey.py` DUMP_FILTER was lowered 1.0 -> 0.2 for these dumps
   (tool-local; rolls no bake identity, ships nothing).
+
+## OUTCOME (2026-08-29, same day)
+
+Shipped and owner-confirmed ("Water looks good. No issues"). Floor 0.5 m,
+namespace -b5e821e98, all 15 tiles, verification tile matched this survey's
+count to the digit (241). Revert: swap DefaultFineTileProviderId back to
+-b19d281fd. See docs/SCOREBOARD.md and the pond-floor memory for the traps.
