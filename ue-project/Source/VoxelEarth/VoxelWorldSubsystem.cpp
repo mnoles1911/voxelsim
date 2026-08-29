@@ -6933,8 +6933,54 @@ struct FVoxelWorldImpl
 	TSet<VoxelCoords::FVoxelLevelChunkKey> SpeculativeInFlight;
 
 	int64 SpecDispatchedSinceLog = 0;
-	// One sample per frame. ~44 B each; the cap bounds a long session at
-	// ~1.8 MB and a standard leg produces ~16,000.
+	// One sample per frame. 33 fields x 4 B = 132 B each. THE "~44 B" THIS
+	// COMMENT USED TO CLAIM WAS TRUE OF THE ELEVEN-FIELD VERSION and was left
+	// behind by three rounds of subdivision, so it is corrected rather than
+	// quietly widened: the 40,000 cap bounds a long session at ~5.0 MiB, and a
+	// standard leg produces ~16,000 samples, i.e. ~2.0 MiB live. That is not a
+	// cost worth trading a named millisecond for -- the whole ring is smaller
+	// than one raster-atlas page.
+	//
+	// THE IDENTITIES THIS SAMPLE EXISTS TO MAKE COMPUTABLE, per frame, over any
+	// bucketed population. Every term is a FIELD, so a reader SUBTRACTS rather
+	// than infers, and every residual below is printed UNCLAMPED so a bracket
+	// defect shows up as a negative sign instead of as a small positive number:
+	//
+	//   tick     = recompute + dispatch + apply + remesh + unload + brickFlush
+	//              + other                                (`other` IS the gap)
+	//   dispatch = airProof + band + submit + pick + overlay + dOther
+	//   subTotal = reqHdr + band + raster + assets + pool + mgr + sDrift
+	//   recompute = fineResid + exitScan + queueFilter + sort + rOther
+	//
+	// NESTING, because three of those are subdivisions and NOT siblings:
+	// `submit` is INSIDE dispatch; the submit six are INSIDE subTotal; the
+	// recompute four are INSIDE recompute. Adding any of them to the tick sum
+	// double-counts. `gpuMgr` is the opposite case -- it sits OUTSIDE the
+	// dispatch bracket entirely, and is printed beside it only as the next
+	// place to look when dOther is large.
+	//
+	// SUBMIT IS TWO DIFFERENT SPANS AND THEY ARE DELIBERATELY NOT ONE FIELD.
+	// `SubmitMs` is the LOOP-side bracket; `SubTotalMs` is SubmitGpuMeshJob's
+	// OWN wall. loopMinusFn = SubmitMs - SubTotalMs names the difference
+	// instead of assuming it away: POSITIVE is fork-branch cost outside the
+	// function, NEGATIVE is declined and speculative calls the loop bracket
+	// never entered. Reusing one name for both is how they would be summed.
+	//
+	// WHAT THIS WAS BUILT TO SETTLE (docs/p99-game-thread-split.md, 2026-08-27):
+	// `submitMs` read +3.24 ms at p99 with nothing established about what was
+	// inside it, and +4.06 ms of the p99 tick had NO NAME AT ALL because this
+	// struct carried neither remesh nor unload nor recompute. Both questions
+	// already had a decomposition -- `Hitch frame dispatch` -- which prints only
+	// above 33.3 ms while the moving tail sits at 15-23 ms. That was THE THIRD
+	// SEPARATE QUESTION one bar had blocked, and carrying the split onto this
+	// per-frame sample is what removed the bar rather than arguing with it.
+	//
+	// THE READING THAT ENDED IT: the DISPATCH-SPLIT / SUBMIT-SPLIT /
+	// TICK-STAGES / RECOMPUTE-SPLIT lines below, over the >=p99 bucket --
+	// dispatch 4.46 (of which submit 3.50), recompute 3.81, apply 1.00,
+	// unload 0.27, brickFlush 0.07, UNNAMED 0.51. The 4.06 residual is now
+	// 0.51, and the ~95% that is named got there by fields, not by argument.
+	// The residual is the number to watch: it must shrink by NAMED amounts.
 	//
 	// THE DISPATCH SUBCOMPONENTS ARE HERE BECAUSE THE ONLY INSTRUMENT THAT
 	// CARRIED THEM COULD NOT SEE THE TAIL. `Hitch frame dispatch` prints
@@ -6947,9 +6993,11 @@ struct FVoxelWorldImpl
 	// settle boundary is 13:04:17.87. Post-settle the same leg's five dispatch
 	// lines carry submitMs = 0.00 / 0.02 / 0.00 / 0.05 / 0.00.
 	//
-	// So these four fields exist to answer the same question over the RIGHT
+	// So these fields exist to answer the same question over the RIGHT
 	// population, per frame, with no threshold: what differs between a fast
-	// flight frame and a slow one.
+	// flight frame and a slow one. (It said "these four" when there were four;
+	// there are now 33, and the count is left out rather than re-stated so it
+	// cannot go stale a second time.)
 	struct FFrameSample
 	{
 		float FrameMs = 0.f;
@@ -6984,54 +7032,67 @@ struct FVoxelWorldImpl
 		float DispatchMs = 0.f;   // the whole dispatch loop, game thread
 		float SubmitMs = 0.f;     // ... of which the submit bracket (raster-atlas fills land here)
 		float ApplyMs = 0.f;      // component apply, game thread
-	// THE SUBMIT BRACKET, SUBDIVIDED. submit is 86% of the dispatch rise at p99
-	// and nothing knew what was inside it: the six-way split existed only as
-	// WINDOW accumulators (the `Voxel gpu submit split` line), which cannot
-	// isolate the worst 1% of frames. Same span as SubmitMs, six parts.
-	// SubTotalMs is the FUNCTION-side total (SubmitGpuMeshJob's own wall);
-	// SubmitMs is the LOOP-side bracket. Carrying both means loopMinusFn is
-	// checkable per frame instead of per window -- a positive gap is fork-branch
-	// cost outside the function, a negative one is declined/speculative calls
-	// that the loop bracket never saw.
-	float SubReqHdrMs = 0.f;  // footprint/seed/climate shading/skirt
-	float SubBandMs = 0.f;    // band policy + request build
-	float SubRasterMs = 0.f;  // atlas PrepareRequest / FillRasterWindow
-	float SubAssetsMs = 0.f;  // resolve + span tables + instance marshal
-	float SubPoolMs = 0.f;    // direct-to-pool decision incl. GI probe
-	float SubMgrMs = 0.f;     // Manager->Submit + GpuJobsPending insert
-	float SubTotalMs = 0.f;   // whole SubmitGpuMeshJob wall, fn side
-	// THE SIXTH SIBLING, WHICH THE TICK-STAGES SPLIT WAS MISSING. The window
-	// line has always listed recompute alongside dispatch/apply/remesh/unload;
-	// the per-frame split listed only the last five, so RecomputeDesiredSet fell
-	// into `other` -- and `other` is the largest term in the tail tick (4.64 ms
-	// against dispatch's 4.76). A residual that big is a missing field, not a
-	// mystery.
-	float RecomputeMs = 0.f;
-	// ... and its own four, all NESTED INSIDE it: recompute brackets
-	// RecomputeT0..SortT1, which spans every one of these. They are a
-	// subdivision of RecomputeMs and must never be added to it.
-	float FineResidMs = 0.f;
-	float ExitScanMs = 0.f;
-	float QueueFilterMs = 0.f;
-	float SortMs = 0.f;
-		// THE REST OF THE TICK. dispatch + apply accounted for less than half of
-		// the p99 tick rise and the remainder had no field to live in, so it read
-		// as unattributable rather than as remesh/unload/brick-flush. These three
-		// plus dispatch and apply are the five stages the tick is actually made
-		// of; what is STILL left over is printed as `other` and is a real gap,
-		// not a rounding term.
+		// THE SUBMIT BRACKET, SUBDIVIDED. submit is 86% of the dispatch rise at p99
+		// and nothing knew what was inside it: the six-way split existed only as
+		// WINDOW accumulators (the `Voxel gpu submit split` line), which cannot
+		// isolate the worst 1% of frames. Same span as SubmitMs, six parts.
+		// SubTotalMs is the FUNCTION-side total (SubmitGpuMeshJob's own wall);
+		// SubmitMs is the LOOP-side bracket. Carrying both means loopMinusFn is
+		// checkable per frame instead of per window -- a positive gap is fork-branch
+		// cost outside the function, a negative one is declined/speculative calls
+		// that the loop bracket never saw.
+		float SubReqHdrMs = 0.f;  // footprint/seed/climate shading/skirt
+		float SubBandMs = 0.f;    // band policy + request build
+		float SubRasterMs = 0.f;  // atlas PrepareRequest / FillRasterWindow
+		float SubAssetsMs = 0.f;  // resolve + span tables + instance marshal
+		float SubPoolMs = 0.f;    // direct-to-pool decision incl. GI probe
+		float SubMgrMs = 0.f;     // Manager->Submit + GpuJobsPending insert
+		float SubTotalMs = 0.f;   // whole SubmitGpuMeshJob wall, fn side
+		// THE SIXTH SIBLING, WHICH THE TICK-STAGES SPLIT WAS MISSING. The window
+		// line has always listed recompute alongside dispatch/apply/remesh/unload;
+		// the per-frame split listed only the last five, so RecomputeDesiredSet fell
+		// into `other` -- and `other` is the largest term in the tail tick (4.64 ms
+		// against dispatch's 4.76). A residual that big is a missing field, not a
+		// mystery.
+		float RecomputeMs = 0.f;
+		// ... and its own four, all NESTED INSIDE it: recompute brackets
+		// RecomputeT0..SortT1, which spans every one of these. They are a
+		// subdivision of RecomputeMs and must never be added to it.
+		float FineResidMs = 0.f;
+		float ExitScanMs = 0.f;
+		float QueueFilterMs = 0.f;
+		float SortMs = 0.f;
 		// THE DISPATCH LOOP SPLIT, on the frame sample rather than only on the
 		// `Hitch frame dispatch` line. That line prints ONLY above 33.3 ms while
 		// the moving tail sits at 15-23 ms, so this split existed and had never
 		// once been read over the population it was needed for -- the third
 		// separate question that one bar has blocked. `submit` is a SUBSET of
-		// dispatch, not a sibling of it.
+		// dispatch, not a sibling of it, so the five here plus SubmitMs plus
+		// dOther are what dispatch is made of.
+		//
+		// ALL FIVE ARE ACCUMULATED UNCONDITIONALLY at their bracket sites in the
+		// dispatch loop -- they always were; the hitch line only ever PRINTED
+		// conditionally. Nothing had to be moved to get them onto this sample,
+		// which is why carrying the split costs one store each and no branch.
 		float DispAirProofMs = 0.f;
 		float DispBandMs = 0.f;
 		float DispPickMs = 0.f;
 		float DispOverlayMs = 0.f;
+		// The WHOLE dispatch loop's own wall, which is NOT DispatchMs: DispatchMs
+		// is the two tick-side spans (T0..T1 and T3..T3b) that contain the loop.
+		// Carried so loop-vs-tick-side drift is visible instead of assumed.
 		float DispLoopMs = 0.f;
+		// OUTSIDE THE DISPATCH BRACKET, and grouped here only because it is the
+		// next place to look when dOther is large. Never add it to dispatch.
 		float GpuMgrTickMs = 0.f;
+		// THE REST OF THE TICK. dispatch + apply accounted for less than half of
+		// the p99 tick rise and the remainder had no field to live in, so it read
+		// as unattributable rather than as remesh/unload/brick-flush. These three
+		// plus recompute, dispatch and apply are the SIX stages the tick is
+		// actually made of -- it read "five" here until RecomputeMs was added,
+		// and that miscount is exactly why recompute spent a whole investigation
+		// inside `other`. What is STILL left over is printed as `other` and is a
+		// real gap, not a rounding term.
 		float RemeshMs = 0.f;
 		float UnloadMs = 0.f;
 		float BrickFlushMs = 0.f;
