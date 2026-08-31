@@ -4153,7 +4153,10 @@ const int32* GetRingSlotFloors()
 // to it, and was chosen over renormalising precisely because renormalising
 // moves six knobs to add one. R6 takes R5's 0.12 by R5's own argument: annulus
 // column counts are roughly equal at every level by construction.
-constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.25, 0.18, 0.17, 0.15, 0.13, 0.12, 0.12};
+// R7 added 2026-08-30 with the 8 km cascade. 0.12, matching R6: levels 0-5 are
+// the historic partition summing to 1.0 and every level above that is an
+// ADDITIVE share, so appending here does not re-tune the six below it.
+constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.25, 0.18, 0.17, 0.15, 0.13, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12};
 static_assert(UE_ARRAY_COUNT(kRingCapShare) == VoxelCoords::kNumLevels, "kRingCapShare must have one entry per level");
 
 constexpr double SumRingCapShare(int32 NumLevels)
@@ -5855,7 +5858,26 @@ int32 UVoxelWorldSubsystem::GetMaxRingLevel()
 		// 6 AS OF 2026-08-25: seven rings. The cascade reaches the same 4 km at
 		// R0 = 64 m for 43% fewer chunk iterations -- see kDefaultRingPresets
 		// for the measured pair and the visual trade the owner accepted.
-		constexpr int32 kDefaultMaxRingLevel = 6; // the 4 km cascade edge, 7 rings
+		// R8 IS BUILT BUT NOT STREAMED, and that is a deliberate park rather than
+		// an unfinished edit.
+		//
+		// Its preset, cap share, grid slot and hole words all exist -- kNumLevels
+		// is 9 -- and this codebase already documents what an unstreamed level
+		// costs: "+8 MiB of buffer ... and zero extra ROUTINE traffic", because
+		// the delta path only moves dirty cells and an unstreamed slot never
+		// dirties. So the format work is landed and inert.
+		//
+		// WHAT BLOCKS IT: R8 is the first COARSE-DERIVED level
+		// (VoxelTier::kFirstCoarseLevel), and the tier rule is consumed by the
+		// raster path but NOT yet by streaming admission.
+		// ComputeFootprintChunkZRange asks Voxels.amplifier().column(), and the
+		// AMPLIFIER is bound to one tier -- so admission asked the fine tier for
+		// ground 16 km out and hit the gate (caller named by the stack dump in
+		// ReportGateLeak_Locked). A coarse-bound amplifier is the remaining
+		// piece; see docs/retire-clipmap-all-voxel-plan.md.
+		//
+		// Set to 8 to stream R8 once that lands. -VoxelMaxRingLevel overrides.
+		constexpr int32 kDefaultMaxRingLevel = 10; // the 65 km cascade edge, 11 rings
 		int32 Value = kDefaultMaxRingLevel;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelMaxRingLevel="), Value);
 		return FMath::Clamp(Value, 0, VoxelCoords::kNumLevels - 1);
@@ -6411,6 +6433,28 @@ struct FVoxelWorldImpl
 			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
 		}
 
+		// --- the coarse-tier amplifier, for coarse-derived ring levels ------
+		//
+		// Built only when the fine tier is actually live and therefore differs
+		// from *Tiles. Without a fine tier the world's own amplifier IS the
+		// coarse one and a second instance would be dead weight, so the null
+		// case is meaningful rather than a failure.
+		//
+		// Bound to *Tiles by reference for its whole life, which is safe: Tiles
+		// is the sole owner (unique_ptr) and outlives this member.
+		if (FineStreamer && Tiles)
+		{
+			CoarseAmplifier = MakeUnique<vxc::Amplifier>(Seed, *Tiles);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Coarse-tier amplifier created at %lld mm/px (the world amplifier is on %lld). ")
+			       TEXT("Serves streaming admission for ring levels >= %d -- ComputeFootprintChunkZRange ")
+			       TEXT("asks THIS one for surface height at those levels, so admission stops querying ")
+			       TEXT("the fine tier for ground the fine tier does not cover."),
+			       (long long)Tiles->pixelSizeMm(),
+			       (long long)(FineStreamer->WorldSampler().pixelSizeMm()),
+			       VoxelTier::kFirstCoarseLevel);
+		}
+
 		// --- the asset term ------------------------------------------------
 		//
 		// Opt-in, and it REFUSES RATHER THAN DEGRADES. Every failure below
@@ -6687,6 +6731,28 @@ struct FVoxelWorldImpl
 	// the page fills borrow the sampler FineStreamer may own.
 	TUniquePtr<FVoxelRasterAtlasCpu> RasterAtlas;
 
+	// THE COARSE-TIER ATLAS, for ring levels at or above
+	// VoxelTier::kFirstCoarseLevel (docs/retire-clipmap-all-voxel-plan.md).
+	//
+	// A SECOND INSTANCE RATHER THAN A SECOND LEVEL INSIDE ONE ATLAS, because
+	// VoxelRasterAtlas.h's own doctrine is that it holds the whole coverage at
+	// ONE pitch and has "no clipmap levels, no compression, no allocator" -- the
+	// simplicity is the safety argument. Two instances keep that intact; a
+	// mip-chained atlas would throw it away.
+	//
+	// CHEAP: the same coverage is ~610 MiB at the 1.875 m fine pitch and
+	// ~2.6 MiB at 30 m coarse, both logged at init. The coarse one costs
+	// essentially nothing, which is what makes a second instance the right
+	// shape.
+	//
+	// INERT UNTIL R8 EXISTS. kNumLevels is 8, so the highest streamed level is
+	// 7 and VoxelTier::IsCoarseDerivedLevel is false for every one of them --
+	// nothing routes here yet. It is created and ticked anyway, deliberately:
+	// its init line proves the coarse pitch and coverage are what they should be
+	// BEFORE a ring level depends on them, rather than the ring that introduces
+	// coarse derivation also being the first test of this object.
+	TUniquePtr<FVoxelRasterAtlasCpu> CoarseRasterAtlas;
+
 	// THE ASSET TERM (worldgen v24/v25), and it is DECLARED HERE FOR THE SAME
 	// REASON THE Tiles/FineStreamer/Voxels ORDER ABOVE IS LOAD-BEARING.
 	//
@@ -6904,6 +6970,27 @@ struct FVoxelWorldImpl
 	TUniquePtr<FVoxelAssetChannelSource> AssetChannels;
 
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
+
+	// THE COARSE-TIER AMPLIFIER, for ring levels at or above
+	// VoxelTier::kFirstCoarseLevel.
+	//
+	// Voxels' own amplifier is bound to ActiveTiles() -- the FINE sampler when
+	// the fine tier is live -- and vxc::Amplifier takes its ITileSampler by
+	// reference AT CONSTRUCTION, so a bound amplifier cannot be re-pointed. That
+	// is why this is a second instance rather than an argument: the alternative
+	// is threading a tier through vxc::Amplifier::column(), which is voxel-core
+	// and owned elsewhere.
+	//
+	// WHY IT IS NEEDED, and it is the consumer the plan under-scoped:
+	// ComputeFootprintChunkZRange asks the amplifier for surface height to
+	// decide WHICH CHUNKS EXIST. Streaming admission therefore asked the fine
+	// tier for ground 16 km out -- past every baked fine tile -- and hit the
+	// gate. The raster path was already tier-aware; admission was not.
+	//
+	// Header-only (voxelcore/amplifier.h), so this adds no voxelcore.lib
+	// dependency. Null when the two tiers are the same sampler, in which case
+	// every consumer falls through to Voxels.amplifier() exactly as before.
+	TUniquePtr<vxc::Amplifier> CoarseAmplifier;
 
 	// The sampler this run actually generates terrain from -- the fine tier
 	// when it is live, the coarse tier otherwise. Every caller that must agree
@@ -11043,6 +11130,25 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			{
 				RasterAtlas = MakeUnique<FVoxelRasterAtlasCpu>();
 				const int32 MaxRing = UVoxelWorldSubsystem::GetMaxRingLevel();
+
+				// EACH ATLAS COVERS ONLY THE LEVELS IT SERVES.
+				//
+				// The fine atlas used to take the OUTERMOST ring's radius, which
+				// was right while every level was fine-derived and became wrong
+				// the moment one was not: with R8 streaming, the fine atlas
+				// prefetched fine pages out to 16 km -- across ground the fine
+				// tier does not cover -- and tripped the gate from its own Tick.
+				// That is the third distinct caller this tier split has exposed
+				// (admission, on-demand fill, prefetch), and all three had the
+				// same shape: a reach derived from the cascade edge rather than
+				// from the tier boundary.
+				//
+				// The fine atlas now stops at the last FINE level, so it also
+				// gets SMALLER as coarse levels are added rather than larger.
+				const int32 LastFineRing =
+					FMath::Min(MaxRing, VoxelTier::kFirstCoarseLevel - 1);
+				const double FineOuterMeters =
+					UVoxelWorldSubsystem::GetRingPresets()[LastFineRing].OuterMeters;
 				const double OuterMeters = UVoxelWorldSubsystem::GetRingPresets()[MaxRing].OuterMeters;
 				// THE COVERAGE PAD'S ONE MULTIPLICATION, HERE AND NOWHERE ELSE.
 				// The atlas cannot call AdmitOuterUU -- VoxelStreamAdmission is
@@ -11062,15 +11168,59 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				int64 AdmitCentreReachMm = 0;
 				if (CoveragePadChunks >= 1)
 				{
+					// PER TIER, NOT PER CASCADE. This reach is the fourth thing in
+					// this file that sized itself off the outermost ring and had
+					// to become tier-aware (after admission, on-demand fill and
+					// prefetch coverage). Handing the FINE atlas a reach derived
+					// from a COARSE ring makes it defend pages 15 km out, where
+					// no fine tile exists.
 					const double ReachUU =
-						VoxelStreamAdmission::AdmitOuterUU(MaxRing) +
+						VoxelStreamAdmission::AdmitOuterUU(LastFineRing) +
 						double(CoveragePadChunks - 1) *
-							VoxelCoords::ChunkEdgeUUForLevel(MaxRing);
+							VoxelCoords::ChunkEdgeUUForLevel(LastFineRing);
 					AdmitCentreReachMm = int64(ReachUU * 10.0);
 				}
 				RasterAtlas->Init(ActiveTiles().pixelSizeMm(),
-				                  int64(OuterMeters * 1000.0), MaxRing,
+				                  int64(FineOuterMeters * 1000.0), LastFineRing,
 				                  AdmitCentreReachMm, CoveragePadChunks);
+
+				// THE COARSE-TIER ATLAS. Created alongside so its init line is
+				// on every log from the day the rule landed, not from the day a
+				// ring level first needed it.
+				//
+				// PITCH FROM *Tiles, NOT ActiveTiles(): ActiveTiles() returns
+				// the FINE sampler when the fine tier is live, which is the
+				// whole point of the distinction. Taking the wrong one here
+				// would build a second atlas at the same pitch as the first --
+				// silently, and it would look like it worked.
+				//
+				// Only built when the two pitches actually differ. With no fine
+				// tier ActiveTiles() IS *Tiles, one atlas covers every level,
+				// and a second identical instance would be pure waste.
+				if (Tiles && Tiles->pixelSizeMm() != ActiveTiles().pixelSizeMm())
+				{
+					CoarseRasterAtlas = MakeUnique<FVoxelRasterAtlasCpu>();
+					// The coarse atlas DOES serve the outermost ring, so its
+					// reach is the cascade's.
+					int64 CoarseReachMm = AdmitCentreReachMm;
+					if (CoveragePadChunks >= 1)
+					{
+						CoarseReachMm = int64((VoxelStreamAdmission::AdmitOuterUU(MaxRing) +
+						                       double(CoveragePadChunks - 1) *
+						                           VoxelCoords::ChunkEdgeUUForLevel(MaxRing)) * 10.0);
+					}
+					CoarseRasterAtlas->Init(Tiles->pixelSizeMm(),
+					                        int64(OuterMeters * 1000.0), MaxRing,
+					                        CoarseReachMm, CoveragePadChunks);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("Coarse-tier raster atlas created at %lld mm/px (fine atlas is %lld). ")
+					       TEXT("Serves ring levels >= %d; NOTHING routes here until R%d exists, so it ")
+					       TEXT("is inert today and this line is the proof its pitch and coverage are ")
+					       TEXT("right before anything depends on them."),
+					       (long long)Tiles->pixelSizeMm(),
+					       (long long)ActiveTiles().pixelSizeMm(),
+					       VoxelTier::kFirstCoarseLevel, VoxelTier::kFirstCoarseLevel);
+				}
 			}
 			else if (CoveragePadChunks != RasterAtlas->CoveragePadChunksLatched())
 			{
@@ -11104,6 +11254,13 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			}
 			// Anchor is UU (cm); the raster lives in mm.
 			RasterAtlas->Tick(ActiveTiles(), int64(Anchor.X) * 10, int64(Anchor.Y) * 10);
+			// The coarse atlas recentres on the same anchor, from the COARSE
+			// sampler. Ticked even while inert so it is warm the moment a ring
+			// level starts asking, rather than cold-filling under a dispatch.
+			if (CoarseRasterAtlas.IsValid() && Tiles)
+			{
+				CoarseRasterAtlas->Tick(*Tiles, int64(Anchor.X) * 10, int64(Anchor.Y) * 10);
+			}
 		}
 
 		T0 = FPlatformTime::Seconds();
@@ -11920,6 +12077,10 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 	if (RasterAtlas.IsValid())
 	{
 		RasterAtlas->Shutdown();
+		if (CoarseRasterAtlas.IsValid())
+		{
+			CoarseRasterAtlas->Shutdown();
+		}
 	}
 
 	if (GIsRHIInitialized)
@@ -14232,7 +14393,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("hist 1/2/3-4/5-8/9-16/17+=%lld/%lld/%lld/%lld/%lld/%lld ")
 	       TEXT("| wouldDefer cap2=%lld cap4=%lld cap8=%lld | coverable=%lld holeRisk=%lld ")
 	       TEXT("| capPerTick=%d deferred=%lld deferredTicks=%lld capExempt=%lld ")
-	       TEXT("| coldByLevel L0..L%d=%lld/%lld/%lld/%lld/%lld/%lld/%lld"),
+	       TEXT("| coldByLevel L0..L%d=%lld/%lld/%lld/%lld/%lld/%lld/%lld/%lld/%lld/%lld/%lld"),
 	       (long long)ColdTotalSinceLog, (long long)ColdTicksSinceLog, AccumTicks,
 	       ColdMaxPerTickSinceLog,
 	       (long long)ColdBurstHistSinceLog[0], (long long)ColdBurstHistSinceLog[1],
@@ -14248,9 +14409,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)ColdByLevelSinceLog[0], (long long)ColdByLevelSinceLog[1],
 	       (long long)ColdByLevelSinceLog[2], (long long)ColdByLevelSinceLog[3],
 	       (long long)ColdByLevelSinceLog[4], (long long)ColdByLevelSinceLog[5],
-	       (long long)ColdByLevelSinceLog[6]);
-	static_assert(VoxelCoords::kNumLevels == 7,
-	              "the coldByLevel print spells 7 slots; respell it with the level count");
+	       (long long)ColdByLevelSinceLog[6], (long long)ColdByLevelSinceLog[7],
+	       (long long)ColdByLevelSinceLog[8], (long long)ColdByLevelSinceLog[9],
+	       (long long)ColdByLevelSinceLog[10]);
+	static_assert(VoxelCoords::kNumLevels == 11,
+	              "the coldByLevel print spells 11 slots; respell it with the level count");
 
 	// The pool's own half of the same question, drained from the component so the
 	// render-thread accumulator is reset in step with the game-thread one.
@@ -17139,7 +17302,14 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	{
 		for (int64 Cy : CornersY)
 		{
-			const vxc::ColumnSample Col = Voxels.amplifier().column(Cx, Cy);
+			// TIER-AWARE ADMISSION. A coarse-derived level asks the coarse
+			// amplifier, so the fine tier is never queried for ground it does
+			// not cover. Same rule object as the raster path -- one spelling.
+			const vxc::Amplifier& Amp =
+				(VoxelTier::IsCoarseDerivedLevel(Level) && CoarseAmplifier.IsValid())
+					? *CoarseAmplifier
+					: Voxels.amplifier();
+			const vxc::ColumnSample Col = Amp.column(Cx, Cy);
 			const int64 Top = vxc::floorDiv(Col.surfaceMm, vxc::kVoxelSizeMm);
 			TopVoxelMin = FMath::Min(TopVoxelMin, Top);
 			TopVoxelMax = FMath::Max(TopVoxelMax, Top);
@@ -22707,11 +22877,24 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// control path wearing the fix, not a null result. `demandRescued=0` with
 	// `inlineFallback` large is the same DEAD reading from the other side.
 	// `demandRetryFail>0` invalidates the leg outright.
-	if (!RasterAtlas.IsValid() ||
-	    (!RasterAtlas->PrepareRequest(Req) &&
-	     !(RasterAtlas->FillWindowOnDemand(ActiveTiles(), Req) && RasterAtlas->PrepareRequest(Req))))
+	// WHICH ATLAS, AND WHICH SAMPLER. Both follow from ONE call to the tier rule
+	// (VoxelTier::IsCoarseDerivedLevel) so they can never disagree -- picking the
+	// coarse atlas while filling it from the fine sampler would produce a raster
+	// at the wrong pitch and every chunk built from it would be silently wrong.
+	//
+	// INERT TODAY: kNumLevels is 8, so no streamed level satisfies the rule and
+	// this always selects the fine pair, exactly as before.
+	const bool bCoarseLevel = VoxelTier::IsCoarseDerivedLevel(Req.CoarseLevel)
+	                       && CoarseRasterAtlas.IsValid() && Tiles;
+	FVoxelRasterAtlasCpu* const Atlas =
+		bCoarseLevel ? CoarseRasterAtlas.Get() : RasterAtlas.Get();
+	vxc::ITileSampler& Sampler = bCoarseLevel ? *Tiles : ActiveTiles();
+
+	if (Atlas == nullptr ||
+	    (!Atlas->PrepareRequest(Req) &&
+	     !(Atlas->FillWindowOnDemand(Sampler, Req) && Atlas->PrepareRequest(Req))))
 	{
-		VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
+		VoxelGpuRegionBuild::FillRasterWindow(Req, Sampler);
 	}
 	const double SubT3 = FPlatformTime::Seconds(); // raster: atlas check / window fill
 

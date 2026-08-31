@@ -121,7 +121,32 @@ private:
 	// /Engine/BasicShapes/Plane is a 100x100 UU (1m x 1m) quad; scale factor
 	// below reaches PlaneSizeUU on each side.
 	static constexpr double SourcePlaneSizeUU = 100.0;
-	static constexpr double PlaneSizeUU = 4000000.0; // 40 km
+	// DERIVED FROM THE CASCADE, NOT WRITTEN DOWN. Was a flat 4,000,000 UU (40 km,
+	// i.e. +-20 km from the camera), which was ample while the far field was the
+	// clipmap's job -- and became a VISIBLE HARD EDGE the moment the clipmap was
+	// retired and voxels reached 65 km. At 3,000 m over a coastal massif the
+	// ocean simply stopped in a straight diagonal line across open water.
+	//
+	// The ring radii are geometric -- Outer(L) = 64 m * 2^L -- so the outermost
+	// ring's reach follows VoxelCoords::kNumLevels with no include of the
+	// streaming subsystem (which would be circular from here). The plane spans
+	// the full DIAMETER, hence the 2x, and carries 25% margin so a camera near
+	// the edge of its own cascade still sees water to the horizon rather than
+	// to the plane's rim.
+	//
+	// FREE TO OVERSIZE: this is ONE quad on a scaled unit plane. Growing it from
+	// 40 km to ~164 km costs two floats in a transform, which is why the margin
+	// is generous rather than tight.
+	//
+	// This is the fifth thing in this codebase found sizing itself off a reach
+	// that the cascade outgrew (after streaming admission, on-demand raster fill,
+	// atlas prefetch coverage and the admit-centre reach). If you are adding a
+	// ring level, grep for constants in METRES or UU before assuming the sweep is
+	// done.
+	static constexpr double kOutermostRingOuterMetres =
+		64.0 * double(int64(1) << (VoxelCoords::kNumLevels - 1));
+	static constexpr double PlaneSizeUU =
+		2.0 * kOutermostRingOuterMetres * 100.0 * 1.25;
 
 	static constexpr double FollowSnapUU = 100.0; // 1 m
 

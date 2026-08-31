@@ -1804,7 +1804,7 @@ int MarchZCutEnable;
 // below), so cutting an empty slot would have to reproduce that short-circuit to
 // keep the flag's meaning. Refusing to cut it is the conservative answer and
 // costs an empty slot nothing it was not already paying.
-int4 MarchLevelChunkZ[8];
+int4 MarchLevelChunkZ[12];   // 9 = 8 ring levels + the cover slot
 
 #if VOXEL_MARCH_ZTIGHT
 // ---- THE TIGHT RESIDENT-Z SLABS (voxel.March.ZTight) -----------------------
@@ -1836,7 +1836,7 @@ int4 MarchLevelChunkZ[8];
 // reduce's readback is missing, stale, still settling after a bounds
 // discontinuity, or reported zero live records at the level -- refusing to
 // gate is the conservative direction and costs exactly what today costs.
-float4 MarchZTightSlabUU[8];
+float4 MarchZTightSlabUU[12];  // one per INDEX GRID SLOT, see MarchLevelChunkZ
 #endif
 
 #if VOXEL_MARCH_BOUND
@@ -2762,6 +2762,32 @@ float VoxelMarchSurfaceZRelAt(FVoxelMarchChunkCache C, float2 LocalXYUU)
 	const float DZDX = (float((C.SurfaceGradPacked >> 12u) & 0xFFFu) - 2048.0f) / 256.0f;
 	const float DZDY = (float( C.SurfaceGradPacked        & 0xFFFu) - 2048.0f) / 256.0f;
 	return C.SurfaceZRelUU + DZDX * LocalXYUU.x + DZDY * LocalXYUU.y;
+}
+
+// The chunk's FITTED SURFACE NORMAL, from the same two gradients
+// VoxelMarchSurfaceZRelAt uses. Unit length, +Z up.
+//
+// WHAT IT IS FOR. A voxel hit's geometric normal is one of six axes, so distant
+// terrain shades as a staircase of hard-lit and unlit faces while the clipmap
+// beyond it -- a smooth heightfield -- has no unlit faces at all. That contrast
+// IS the seam the owner sees at the cascade edge. Fading the shading normal
+// toward this one with distance makes far voxels shade like the heightfield they
+// are approximating, without touching the geometry, the traversal, or the depth.
+//
+// It is a PER-CHUNK plane, so it is coarse by construction: 102 m across at
+// level 5, 205 m at level 6. That is the right coarseness -- the clipmap it is
+// matching carries one vertex per 256 m.
+//
+// Zero packing means "flat, or no gradient data", which is exactly +Z.
+float3 VoxelMarchSurfaceNormal(FVoxelMarchChunkCache C)
+{
+	if (C.SurfaceGradPacked == 0u)
+	{
+		return float3(0.0f, 0.0f, 1.0f);
+	}
+	const float DZDX = (float((C.SurfaceGradPacked >> 12u) & 0xFFFu) - 2048.0f) / 256.0f;
+	const float DZDY = (float( C.SurfaceGradPacked        & 0xFFFu) - 2048.0f) / 256.0f;
+	return normalize(float3(-DZDX, -DZDY, 1.0f));
 }
 
 // One brick's descriptor, decoded. Format section 2.

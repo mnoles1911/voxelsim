@@ -192,7 +192,23 @@ public:
 		{256.0, 512.0},
 		{512.0, 1024.0},
 		{1024.0, 2048.0},
-		{2048.0, 4096.0}, // R6: the 4 km cascade edge (GetMaxRingLevel stops here)
+		{2048.0, 4096.0}, // R6
+		{4096.0, 8192.0}, // R7
+		{8192.0, 16384.0},  // R8: first coarse-derived ring (12.8 m voxels)
+		{16384.0, 32768.0}, // R9:  25.6 m voxels, coarse-derived
+		{32768.0, 65536.0}, // R10: 51.2 m voxels, coarse-derived. THE CASCADE EDGE,
+		                    // and it matches AVoxelClipmapActor's own 65 km outer
+		                    // half-extent -- voxels now reach as far as the clipmap
+		                    // they were built to replace. GetMaxRingLevel stops here.
+		                   // FIRST COARSE-DERIVED LEVEL -- VoxelTier::kFirstCoarseLevel
+		                   // is 8, so this ring is generated from the 30 m tier, not the
+		                   // 1.875 m one. Its voxels are 12.8 m; sampling a 1.875 m raster
+		                   // to place them would be absurd, and the fine tier does not
+		                   // cover 16 km anyway. See docs/retire-clipmap-all-voxel-plan.md.
+		                  // Added 2026-08-30 by the recipe in the note below, which is
+		                  // why it is an EIGHTH ring rather than a stretched seventh:
+		                  // Outer/ChunkEdge == 40 holds on every entry (8192/204.8),
+		                  // so OuterUU(L) = R0 * 2^L still derives from ONE uniform.
 		// THE OLD DORMANT R6 {4096, 8192} IS GONE, and that is the whole point of
 		// the deepening: the seventh ring is no longer a dormant 8 km extension,
 		// it is the ring that lets the SAME 4 km be reached from R0 = 64 m. The

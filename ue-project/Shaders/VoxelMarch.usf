@@ -681,6 +681,18 @@ float2   MarchSampleJitter;
 float4   MarchInvDeviceZToWorldZ;
 float    MarchPixelConeSlope;
 float    MarchClimateStrength;   // 0 = no climate tint (byte-identical to before)
+// rgb = sky colour * voxel.March.AmbientIntensity, w = the share a DOWN-facing
+// face receives. All-zero rgb is the shipped frame, exactly. Declared HERE as
+// well as in the parameter struct because these are loose globals: an entry in
+// one without the other is the unbound-uniform trap the comment above describes,
+// and it fails at SHADER COMPILE rather than silently reading zero -- which is
+// the good direction for it to fail in.
+float4   MarchAmbientSkyAndGround;
+// x = distance where the shading normal starts bending toward the chunk's fitted
+// surface normal, y = where it is fully bent, both in UU. x >= y disables it,
+// and the default (0,0) is exactly that -- byte-identical to no term. Declared
+// in BOTH places, same as the ambient above.
+float2   MarchNormalFadeUU;
 int2     MarchTileCount;
 
 int MarchHasPrepassDepth;
@@ -810,7 +822,15 @@ uint2 VoxelMarchPackVis(FVoxelMarchHit H, int3 LocalVoxel)
 	      ((uint(max(H.FaceAxis, 0)) & 0x3u) << 30u);
 	P.y = (H.bHit ? 1u : 0u) |
 	      ((H.FaceSign > 0) ? 2u : 0u) |
+	      // LEVEL IS FOUR BITS AS OF 2026-08-30, and it is split rather than
+	      // moved: the low three stay at [2:4] and the fourth rides bit 30,
+	      // which was free. Splitting keeps Material, FaceNeighbourMask and
+	      // the three LocalVoxel high-bit fields at the exact offsets every
+	      // other consumer already reads, so this widening cannot silently
+	      // re-base any of them. Needed because the 8 km cascade gives R7
+	      // level 7, which pushed the cover level to 8.
 	      ((uint(H.Level) & 0x7u) << 2u) |
+	      (((uint(H.Level) >> 3u) & 0x1u) << 30u) |
 	      ((H.Material & 0xFFu) << 5u) |
 	      ((H.FaceNeighbourMask & 0xFFu) << 13u) |
 	      (((uint(LocalVoxel.x) >> 10u) & 0x7u) << 21u) |
@@ -840,7 +860,7 @@ FVoxelMarchVis VoxelMarchUnpackVis(uint2 P)
 	V.FaceAxis = int((P.x >> 30u) & 0x3u);
 	V.bHit = (P.y & 1u) != 0u;
 	V.FaceSign = ((P.y & 2u) != 0u) ? 1 : -1;
-	V.Level = int((P.y >> 2u) & 0x7u);
+	V.Level = int(((P.y >> 2u) & 0x7u) | (((P.y >> 30u) & 0x1u) << 3u));   // 4 bits, split: see the pack
 	V.Material = (P.y >> 5u) & 0xFFu;
 	V.FaceNeighbourMask = (P.y >> 13u) & 0xFFu;
 	return V;
@@ -2685,6 +2705,11 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	float SurfaceBandFade = 1.0f;
 	// 128/128 = neutral, so a miss tints nothing.
 	uint HitClimatePacked = 128u | (128u << 8);
+	// The chunk's fitted surface normal, for the distance fade below. Defaults to
+	// the face normal so a chunk with no record leaves the shading exactly as it
+	// was -- the fade then lerps a value into itself and is a no-op, rather than
+	// snapping distant terrain flat wherever a lookup missed.
+	float3 SurfaceNormalSmooth = WorldNormal;
 #if VOXEL_MARCH_HAS_BRICKPOOL
 	{
 		// WorldVoxel, NOT V.LocalVoxel. THE MUTATION ARM CAUGHT THIS.
@@ -2716,9 +2741,48 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 			// the gate can never darken terrain it has no information about.
 			SurfaceBandFade = (HitChunk.SurfaceZRelUU < -1.0e29f || bNearSurface) ? 1.0f : 0.0f;
 			HitClimatePacked = HitChunk.ClimatePacked;
+			SurfaceNormalSmooth = VoxelMarchSurfaceNormal(HitChunk);
 		}
 	}
 #endif // VOXEL_MARCH_HAS_BRICKPOOL
+
+	// ---- THE NORMAL FADE: SHADE FAR VOXELS LIKE THE HEIGHTFIELD THEY APPROXIMATE
+	//
+	// voxel.March.NormalFadeStartM / EndM. Disabled by default (start >= end),
+	// and disabled it is a lerp by zero -- the shipped frame exactly.
+	//
+	// THE DEFECT. A voxel hit's normal is one of six axes, so a distant mountain
+	// is a staircase of faces that are either lit or, if the sun misses them,
+	// nearly black -- measured at 0.43 of the sunlit value, and 0.183 on
+	// near-field risers. The clipmap past 4 km is a smooth heightfield with NO
+	// unlit faces, so its ratio is effectively 1.0. That contrast is the seam:
+	// blocky-and-dark meeting smooth-and-bright. It is not a colour problem --
+	// the far field already paints from the same palette via the same classifier.
+	//
+	// WHY THIS AND NOT MORE CASCADE. Extending the ring cascade does NOT help:
+	// AVoxelClipmapActor::SpacingUUForLevel derives the clipmap's vertex spacing
+	// as ringEdge/HoleHalfIndex, so doubling the cascade doubles the clipmap's
+	// spacing too and the 40:1 resolution ratio at the join is preserved BY
+	// CONSTRUCTION. That would move the seam outward at full cost and leave it
+	// looking the same.
+	//
+	// WHAT IT DOES NOT TOUCH: geometry, traversal, depth, the visibility buffer,
+	// or which voxel was hit. Only the normal handed to the GBuffer -- so the
+	// silhouette stays cubic and only the SHADING smooths out, which is what the
+	// eye reads as "matching the heightfield" at a range where a voxel is a
+	// couple of pixels.
+	//
+	// AT CLOSE RANGE IT MUST BE OFF, and the ramp is what guarantees that: a
+	// smoothed normal on a voxel you can see the edges of is just wrong lighting
+	// on an obviously cubic object.
+	if (MarchNormalFadeUU.y > MarchNormalFadeUU.x)
+	{
+		const float T = saturate((THitUU - MarchNormalFadeUU.x)
+		                        / max(MarchNormalFadeUU.y - MarchNormalFadeUU.x, 1.0f));
+		// normalize AFTER the lerp: the two normals can be up to 90 degrees
+		// apart, and a lerp between unit vectors is not unit.
+		WorldNormal = normalize(lerp(WorldNormal, SurfaceNormalSmooth, T));
+	}
 
 	// THE TINT FADE. VoxelMaterialColor gives every voxel its own lightness and
 	// hue jitter (invariant 3), which reads as material texture at one voxel per
@@ -2898,7 +2962,41 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	// engine's slot indices. Each line below is the corresponding line of
 	// DeferredShadingCommon.ush's EncodeGBuffer (:995-1030).
 
-	OutSceneColor = float4(0.0f, 0.0f, 0.0f, 0.0f); // no emissive
+	// ---- THE HEMISPHERE AMBIENT -------------------------------------------
+	//
+	// voxel.March.AmbientIntensity. Zero by default, and at zero this is one
+	// multiply by zero and a write of the same float4(0,0,0,0) that shipped --
+	// so the default frame is byte-identical and every archived capture stays
+	// comparable.
+	//
+	// WHY IT IS HERE AND NOT A LIGHT. A face the sun misses receives essentially
+	// nothing on this renderer: measured 22.5% of the sunlit value on near-field
+	// snow risers, where there is no haze to flatter it. The missing term is
+	// INTERREFLECTION, and the marcher has bounce only inside the small
+	// camera-centred GI volume -- beyond its fade VoxelGIAmbient is exactly 1.0,
+	// which contributes no light at all. The SkyLight cannot supply it either:
+	// moving its capture 1.4 km up and out of the fog moved these faces by
+	// nothing, with engagement proven. See VoxelMarchRenderer.cpp's cvar.
+	//
+	// WHAT IT IS, STATED PLAINLY: sky above, ground bounce below, mixed by the
+	// face normal's Z. It is not a bounce solve and must not be described as
+	// one. It is the term that stops an unlit face reading as a hole.
+	//
+	// EMISSIVE, so it is unshadowed -- which is correct for an ambient stand-in
+	// and is also its main risk: it will lift the inside of a cave exactly as
+	// much as the outside of a mountain. The GI volume already darkens enclosed
+	// space near the camera (BaseColor *= VoxelGIAmbient above, applied BEFORE
+	// this), so the two compose the right way round near the viewer and this is
+	// unoccluded only where nothing else knows any better.
+	//
+	// It rides BaseColor, so a dark material stays dark: this adds LIGHT, not a
+	// grey wash toward white.
+	{
+		// WorldNormal.z in [-1,1] -> the sky's share of the hemisphere.
+		const float SkyShare = saturate(WorldNormal.z * 0.5f + 0.5f);
+		const float Hemi = lerp(MarchAmbientSkyAndGround.w, 1.0f, SkyShare);
+		OutSceneColor = float4(BaseColor * MarchAmbientSkyAndGround.rgb * Hemi, 0.0f);
+	}
 
 	// GBufferA.a = PerObjectGBufferData, 2 bits: bit0 cast contact shadow,
 	// bit1 dynamic indirect shadow caster. Zero for both -- terrain has no

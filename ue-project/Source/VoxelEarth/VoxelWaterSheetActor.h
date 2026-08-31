@@ -220,6 +220,45 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> WaterMaterial;
 
+	// -VoxelWaterDepthAuthority=<float>: overrides M_WaterVoxel's
+	// BathyDepthAuthority scalar for SHEETS ONLY, via one shared instance.
+	//
+	// WHAT IT IS FOR, and it is a defect and not a tuning knob. The material
+	// blends two absorption depths (create_water_voxel_material.py, the
+	// BathyDepthAuthority comment): the BAKED vertical depth at weight
+	// a * validity, and the ENGINE's own BehindWaterSceneDepth -
+	// WaterSurfaceSceneDepth -- an ALONG-VIEW-RAY distance -- at weight
+	// 1 - a * validity. The engine half is UNBOUNDED and the material has no
+	// input that can override it.
+	//
+	// The sheet's extent mask over-covers the basin by up to one mask cell
+	// (1.875 m at the finest band, coarser at range) because drawing must
+	// over-cover or it leaves a gap at the shoreline. On those over-covered
+	// cells the bake answers "dry": validity 1, depth 0. So the baked half
+	// contributes NOTHING and the engine half still carries 1 - a = 0.15 of a
+	// ray that, at a grazing view over ground falling away past the shore,
+	// runs for hundreds of metres. That saturates the absorption and paints a
+	// near-black band tracing the mask boundary, leaving only the Fresnel sky
+	// term -- measured at RGB (26, 30, 36) against snow at (205, 201, 197).
+	//
+	// At 1.0 the engine half is zero wherever the bake answered, so an
+	// over-covered dry cell contributes zero optical depth and the sheet is
+	// simply clear there. Where the bake did NOT answer (validity 0, outside
+	// the 960 m BathyField window or a hole) the engine half returns at full
+	// weight and behaviour is unchanged -- so this cannot make anything worse
+	// where there is no data.
+	//
+	// THE COST, stated because the generator's own comment states it: at 1.0
+	// the absorption comes entirely from the baked field, which does not know
+	// about dynamic geometry, so a boat or a player standing in the shallows
+	// no longer displaces the water colour exactly. That is why the material's
+	// own default is 0.85 and not 1.0.
+	//
+	// UNSET = the material asset untouched and NO instance created, so a
+	// control capture is byte-identical to every capture in the archive.
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialInstanceDynamic> SheetMaterialOverride;
+
 	TArray<FSheet> Sheets;
 	int32 TotalRects = 0;
 	int32 UnresolvedBasins = 0;

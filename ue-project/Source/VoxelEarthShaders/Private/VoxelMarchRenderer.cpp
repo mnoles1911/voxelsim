@@ -921,6 +921,133 @@ TEXT("voxel.March.SkyLadder"), 0,
 		     "not a transcription."),
 		ECVF_RenderThreadSafe);
 
+	// ======================================================================
+	// THE AMBIENT TERM THE MARCHER NEVER HAD
+	// ======================================================================
+	//
+	// MEASURED, 2026-08-30. A face the sun does not reach is essentially UNLIT:
+	// near-field snow risers sit at 22.5% of the sunlit snow beside them, and on
+	// distant mountains the shaded/sunlit ratio is 0.43 -- most of which is
+	// atmospheric haze IN FRONT of the surface rather than light on it, which is
+	// why those faces are BLUE (albedo cannot make anything blue; MAT_ROCK is
+	// warm) and why the cast tracked the sky when the sun moved to 08:00.
+	//
+	// Snow next to a snowfield should be far brighter than 22.5%: the missing
+	// term is INTERREFLECTION. The marcher has bounce only inside the small
+	// camera-centred voxel GI volume; beyond its fade VoxelGIAmbient is 1.0 --
+	// neutral, contributing no light at all -- and that is exactly the far field.
+	//
+	// THE SKYLIGHT IS NOT THE ANSWER AND THAT IS MEASURED, NOT ASSUMED.
+	// voxel.Sky.SkyLightAtGroundZ 1 moves its real-time capture 1.4 km up, out of
+	// fog 1960x denser than the player's, and voxel.Sky.FogInSkyCapture 0 takes
+	// the fog out of it. Both arms, and their combination, move the shaded faces
+	// from (60.6, 80.8, 109.8) to (60.1, 81.0, 110.3) -- nothing -- with
+	// engagement proven from the log. Do not re-run that sweep.
+	//
+	// SO THIS IS A HEMISPHERE AMBIENT, injected as EMISSIVE from the marcher's
+	// own pass. It is not physically a bounce solve and does not pretend to be:
+	// it is the term that keeps a face which the sun misses from reading as a
+	// hole. Sky colour above, ground bounce below, mixed by the face normal's
+	// Z -- the standard cheap form, and the one that costs a handful of ALU in a
+	// shader whose cost is ray-count linear and therefore unmoved by it.
+	//
+	// DEFAULT 0 = OFF AND BYTE-IDENTICAL. Every capture in the archive was taken
+	// without it, and this changes the appearance of every voxel surface in the
+	// world, so it ships off until the owner has judged it on a screenshot.
+	TAutoConsoleVariable<float> CVarVoxelMarchAmbientIntensity(
+		// DEFAULT 1.5 SINCE 2026-08-30, the owner's pick after seeing the ladder.
+		// Measured points from that sweep (near-field riser darkness as a fraction
+		// of the sunlit snow beside it, and whole-frame mean):
+		//
+		//     0 (was)   0.183   168.9      1.0   0.240   186.5
+		//     0.30      0.207   176.1      2.0   0.290   195.5
+		//                                  3.0   0.328   201.0
+		//
+		// 1.5 sits between the 1.0 and 2.0 arms and was chosen by eye, not
+		// interpolated -- the trade is "less black-lined terrain" against "a
+		// brighter overall frame", and past ~3 it stops reading as light and
+		// starts washing the terrain flat. 0 restores every capture in the
+		// archive exactly.
+		TEXT("voxel.March.AmbientIntensity"), 1.5f,
+		TEXT("Strength of the marcher's hemisphere ambient. 0 = off, byte-identical to no term "
+		     "(the default, and what every archived capture was shot with). ~0.15-0.35 is the "
+		     "range where an unlit face stops reading as a hole without the terrain going flat. "
+		     "This is EMISSIVE, so it is unshadowed by construction -- it is a stand-in for "
+		     "interreflection, which the marcher has only inside the GI volume."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelMarchAmbientGroundMix(
+		TEXT("voxel.March.AmbientGroundMix"), 0.45f,
+		TEXT("How much of the ambient a DOWN-facing surface receives, relative to an up-facing "
+		     "one. 1 = uniform ambient from every direction, which flattens the terrain and is "
+		     "the classic way this term goes wrong. 0 = sky only, so undersides go black and "
+		     "nothing is gained where it is needed most. The default leans toward the sky while "
+		     "still lighting undersides, because the ground here is high-albedo snow and rock and "
+		     "really does bounce a great deal."),
+		ECVF_RenderThreadSafe);
+
+	// ONE derivation of the ambient uniform, so the three fill sites cannot drift.
+	//
+	// The sky colour is deliberately NOT read from the SkyLight here. That light
+	// is captured at sea level inside dense fog and its arms are a measured null
+	// on these faces (see the cvar comment above); binding it would make this
+	// term inherit the very problem it exists to work around. A neutral, very
+	// slightly cool constant is honest about what it is -- a stand-in -- and the
+	// owner tunes it by eye like every other appearance knob in this project.
+	FVector4f MakeMarchAmbient()
+	{
+		const float Intensity = FMath::Max(CVarVoxelMarchAmbientIntensity.GetValueOnRenderThread(), 0.0f);
+		const float GroundMix = FMath::Clamp(CVarVoxelMarchAmbientGroundMix.GetValueOnRenderThread(), 0.0f, 1.0f);
+		// Slightly cool, because a clear sky is: 1.00/1.04/1.12 normalised so
+		// that intensity means what it says at the zenith rather than being
+		// scaled by whatever tint is chosen.
+		return FVector4f(1.00f * Intensity, 1.04f * Intensity, 1.12f * Intensity, GroundMix);
+	}
+
+	// The distance ramp for the shading-normal fade. See VoxelMarch.usf's block
+	// for the argument; the short form is that the seam at the cascade edge is
+	// blocky-vs-smooth, not colour, and that extending the cascade CANNOT fix it
+	// because AVoxelClipmapActor::SpacingUUForLevel keys the clipmap's spacing
+	// off the ring edge -- so the resolution ratio at the join is invariant.
+	//
+	// BOTH DEFAULT 0, i.e. start >= end, i.e. OFF and byte-identical.
+	//
+	// REFUTED 2026-08-30, KEPT AT 0 WITH ITS EVIDENCE rather than deleted, so it
+	// is not re-proposed. Arm 1500->4000 m against a control at the same ambient:
+	// far band 34.3% of pixels changed, face-contrast std 48.4 -> 46.7 (3.5%),
+	// near field 0.07% (the fade's own falsifier, which passed). **The owner
+	// could not see a difference, and 3.5% is why.**
+	//
+	// The setup was also wrong in a way that cannot be tuned out. At the vista
+	// pose, 1500 m is screen row 352 and 4000 m is row 308 -- the whole ramp is a
+	// 44-row sliver of a 1440-row frame, because perspective compresses 1-4 km
+	// into ~50 rows at a grazing view. AND the cascade doubles voxel size with
+	// distance, so a voxel stays ~3 px across at EVERY range: blockiness never
+	// decreases, so there is no natural axis for a distance fade to ride.
+	// Re-tuning the two numbers does not rescue it; the idea does not fit the
+	// geometry.
+	TAutoConsoleVariable<float> CVarVoxelMarchNormalFadeStartM(
+		TEXT("voxel.March.NormalFadeStartM"), 0.0f,   // REFUTED 2026-08-30 -- see below
+		TEXT("Distance in METRES at which a voxel's shading normal begins bending from its cube "
+		     "face toward the chunk's fitted surface normal. 0 with EndM 0 = off (default). A "
+		     "sensible arm is start ~1500, end ~4000 so the bend completes exactly where the "
+		     "clipmap takes over."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelMarchNormalFadeEndM(
+		TEXT("voxel.March.NormalFadeEndM"), 0.0f,
+		TEXT("Distance in METRES at which the shading normal is fully the fitted surface normal. "
+		     "Must exceed NormalFadeStartM or the fade is disabled. Geometry, depth and "
+		     "silhouette are untouched at every distance -- this changes shading only."),
+		ECVF_RenderThreadSafe);
+
+	FVector2f MakeMarchNormalFade()
+	{
+		const float StartUU = CVarVoxelMarchNormalFadeStartM.GetValueOnRenderThread() * 100.0f;
+		const float EndUU = CVarVoxelMarchNormalFadeEndM.GetValueOnRenderThread() * 100.0f;
+		return FVector2f(StartUU, EndUU);
+	}
+
 	TAutoConsoleVariable<float> CVarVoxelMarchRingOuterM(
 		// 64 AS OF 2026-08-25 -- THIS MUST TRACK kDefaultRingPresets AND THERE IS
 		// NO ASSERT THAT IT DOES. The marcher derives every ring boundary from
@@ -1468,8 +1595,8 @@ TEXT("voxel.March.SkyLadder"), 0,
 	std::atomic<int32> GVoxelMarchZCutRanEnable{-1};
 	std::atomic<int32> GVoxelMarchZCutRanUsableMask{0};
 	std::atomic<int32> GVoxelMarchZCutRanPad{0};
-	std::atomic<int32> GVoxelMarchZCutRanZMin[8] = {};
-	std::atomic<int32> GVoxelMarchZCutRanZMax[8] = {};
+	std::atomic<int32> GVoxelMarchZCutRanZMin[12] = {};
+	std::atomic<int32> GVoxelMarchZCutRanZMax[12] = {};
 
 	// ---- THE TIGHT RESIDENT-Z GATE, AS ACTUALLY UPLOADED -------------------
 	//                                             (voxel.March.ZTight)
@@ -1486,8 +1613,8 @@ TEXT("voxel.March.SkyLadder"), 0,
 	std::atomic<int32> GVoxelMarchZTightRanPad{0};
 	std::atomic<int32> GVoxelMarchZTightRanAgeFrames{-1};
 	std::atomic<int32> GVoxelMarchZTightRanSettleLeft{0};
-	std::atomic<int32> GVoxelMarchZTightRanZMin[8] = {};
-	std::atomic<int32> GVoxelMarchZTightRanZMax[8] = {};
+	std::atomic<int32> GVoxelMarchZTightRanZMin[12] = {};
+	std::atomic<int32> GVoxelMarchZTightRanZMax[12] = {};
 
 	// THE HEIGHT PYRAMID'S BIND STAMP, for the reason the Z bound has one: the
 	// cvar reads back whatever was typed, and "the cvar says 1" has been
@@ -5235,6 +5362,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchViewParameters, )
 	SHADER_PARAMETER(FVector4f, MarchInvDeviceZToWorldZ)
 	SHADER_PARAMETER(float, MarchPixelConeSlope)
 	SHADER_PARAMETER(float, MarchClimateStrength)
+	// The hemisphere ambient. rgb = sky colour * intensity, w = the down-facing
+	// fraction. Packed as one float4 so it is one uniform slot, and so that
+	// "intensity 0" is provably one multiply away from the shipped frame.
+	SHADER_PARAMETER(FVector4f, MarchAmbientSkyAndGround)
+	// x/y = the normal fade's start and end, in UU. x >= y disables it.
+	SHADER_PARAMETER(FVector2f, MarchNormalFadeUU)
 	// NOTE: the volume's origin in TRANSLATED world is deliberately NOT here.
 	// The emit derives it as TranslatedWorldCameraOrigin - MarchRayOriginLocalUU,
 	// which is exact; passing it as a uniform would mean assuming
@@ -5313,7 +5446,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// Padding is applied CPU-side so the shader has one number to trust and
 	// there is no second place for the pad to be forgotten.
 	SHADER_PARAMETER(int32, MarchZCutEnable)
-	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [12])
 	// THE TIGHT RESIDENT-Z SLABS (voxel.March.ZTight). One float4 per index
 	// grid slot: (.x lo UU, .y hi UU, .z usable, .w 0) -- already padded and
 	// already converted to local UU on the host, so the kernel's hoisted test
@@ -5328,7 +5461,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// zeros included: an unset uniform is a silent zero, and all-zero slabs
 	// (.z == 0) are also the honest "do not gate" value, so the safe default
 	// and the honest default are the same number.
-	SHADER_PARAMETER_ARRAY(FVector4f, MarchZTightSlabUU, [8])
+	SHADER_PARAMETER_ARRAY(FVector4f, MarchZTightSlabUU, [12])
 	// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound). The shader-side
 	// globals exist ONLY under VOXEL_MARCH_BOUND (VoxelMarchBound.ush), so on
 	// every other permutation these two entries are simply unused -- the
@@ -5583,7 +5716,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchEmitParameters, )
 	// Padding is applied CPU-side so the shader has one number to trust and
 	// there is no second place for the pad to be forgotten.
 	SHADER_PARAMETER(int32, MarchZCutEnable)
-	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [12])
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -6883,7 +7016,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifySourceParameters, )
 	// Padding is applied CPU-side so the shader has one number to trust and
 	// there is no second place for the pad to be forgotten.
 	SHADER_PARAMETER(int32, MarchZCutEnable)
-	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [12])
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -7035,7 +7168,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchVerifyIndexParameters, )
 	// Padding is applied CPU-side so the shader has one number to trust and
 	// there is no second place for the pad to be forgotten.
 	SHADER_PARAMETER(int32, MarchZCutEnable)
-	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [8])
+	SHADER_PARAMETER_ARRAY(FIntVector4, MarchLevelChunkZ, [12])
 	SHADER_PARAMETER(uint32, MarchRingCount)
 	SHADER_PARAMETER(float, MarchRing0OuterUU)
 	SHADER_PARAMETER(FIntVector, MarchPackOriginVoxel)
@@ -7562,9 +7695,9 @@ static bool VoxelMarchBindPool(FRDGBuilder& GraphBuilder, int32 Source, Paramete
 		// (int4 MarchLevelChunkZ[8]), so the one authority checks the two
 		// spellings HERE rather than letting a widened index silently write
 		// past the uniform.
-		static_assert(FVoxelMarchChunkIndex::kGridSlots == 8,
-		              "MarchLevelChunkZ is declared [8] in FVoxelMarchCSParameters and as "
-		              "int4 MarchLevelChunkZ[8] in VoxelBrickTraverse.ush. The index grew a "
+		static_assert(FVoxelMarchChunkIndex::kGridSlots == 12,
+		              "MarchLevelChunkZ is declared [12] in FVoxelMarchCSParameters and as "
+		              "int4 MarchLevelChunkZ[12] in VoxelBrickTraverse.ush. The index grew a "
 		              "slot; widen both, or the far slots read another slot's Z bound.");
 		int32 UsableMask = 0;
 		for (uint32 S = 0; S < FVoxelMarchChunkIndex::kGridSlots; ++S)
@@ -9529,6 +9662,8 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		MarchView.MarchInvDeviceZToWorldZ = Entry.InvDeviceZToWorldZ;
 		MarchView.MarchPixelConeSlope = Entry.PixelConeSlope;
 		MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
+		MarchView.MarchAmbientSkyAndGround = MakeMarchAmbient();
+		MarchView.MarchNormalFadeUU = MakeMarchNormalFade();
 		// The frame's one lattice, resolved above the loop. The depth pre-emit
 		// and the source comparator copy this whole struct, so they cannot get a
 		// different sample point than the march did.
@@ -10934,6 +11069,8 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 		Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
+		Params->MarchView.MarchAmbientSkyAndGround = MakeMarchAmbient();
+		Params->MarchView.MarchNormalFadeUU = MakeMarchNormalFade();
 		// TAKEN FROM THE MARCH'S OWN STAMP, not re-read from the cvar -- the
 		// same argument bHalfResEmit above makes about the VisBuffer extent,
 		// applied to the sample point inside it. bHalfResEmit gates it, so a
@@ -11186,6 +11323,8 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 				Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 				Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
+		Params->MarchView.MarchAmbientSkyAndGround = MakeMarchAmbient();
+		Params->MarchView.MarchNormalFadeUU = MakeMarchNormalFade();
 				// THE GATE MUST STAND WHERE THE EMIT STANDS. It grades the depth
 				// the emit would have written, so it goes through the same
 				// reconstruction over the same lattice; a gate on a different

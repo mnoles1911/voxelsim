@@ -1,5 +1,7 @@
 #include "VoxelWaterSheetActor.h"
 
+#include "Materials/MaterialInstanceDynamic.h"
+
 #include "Camera/PlayerCameraManager.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
@@ -117,6 +119,118 @@ void AVoxelWaterSheetActor::BeginPlay()
 		UE_LOG(LogVoxelEarth, Warning,
 		       TEXT("M_WaterVoxel not found at /Game/Voxel/M_WaterVoxel -- lake sheets using the engine default "
 		            "material. The frame is NOT comparable to a near-field water capture."));
+	}
+
+	// -VoxelWaterDepthAuthority: see SheetMaterialOverride's declaration for the
+	// defect this exists for and for why the engine's absorption half is the
+	// unbounded one. Created ONCE, here, and only when the switch is passed --
+	// an unpassed switch leaves WaterMaterial itself on every section, which is
+	// what makes the control arm byte-identical.
+	//
+	// LOGGED IN BOTH POSITIONS. A silent switch cannot be told apart from a
+	// mis-spelled one when the image comes back unchanged.
+	// -VoxelWaterFoamGain=<float>: overrides BathyFoamGain for SHEETS ONLY.
+	//
+	// THE DIAGNOSTIC THIS EXISTS FOR. The black band around every lake traces the
+	// SHORELINE, which is exactly where shore foam peaks -- and on a Single Layer
+	// Water material `Opacity` is not transparency, it is "the fraction of the
+	// pixel covered by the OPAQUE MATERIAL SITTING ON the water"
+	// (BasePassPixelShader.usf:1140). This material wires
+	// `Opacity = saturate(foam)` and `BaseColor = lerp(black, foamTint, foam)`,
+	// so the foam term controls BOTH coverage and colour, and create_water_voxel_
+	// material.py records what coverage-without-colour looks like: "a black
+	// BaseColor with Specular 0.5 and Roughness 0.08, i.e. a dark mirror, plus
+	// the emissive sky reflection". That is the band, measured at RGB (26,30,36),
+	// blue-dominant.
+	//
+	// Gain 0 removes the shore foam AND the coverage it drives together -- the
+	// generator's own comment insists they are one mechanism, not two, so a null
+	// result here exonerates the foam path outright rather than leaving it half
+	// suspected.
+	// -VoxelWaterMatScalar=Name:Value[,Name:Value...] -- set ANY scalar parameter
+	// on the sheet material, sheets only.
+	//
+	// A GENERIC PROBE, added after two named switches each cost a rebuild to
+	// answer one question about a graph with dozens of parameters. The lake band
+	// has now survived BathyDepthAuthority=1.0 and BathyFoamGain=0, and the next
+	// candidates are all scalars on the same material -- so the bottleneck was
+	// the build/capture cycle, not the thinking.
+	//
+	// DIAGNOSTIC, NOT A SHIPPING KNOB. It cannot validate a parameter name: a
+	// typo sets nothing and looks exactly like a null result, which is the trap
+	// this session hit four separate times. So it LOGS EVERY ASSIGNMENT -- read
+	// the log, not the command line.
+	{
+		FString ScalarSpec;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMatScalar="), ScalarSpec)
+		    && !ScalarSpec.IsEmpty() && WaterMaterial)
+		{
+			if (!SheetMaterialOverride)
+			{
+				SheetMaterialOverride = UMaterialInstanceDynamic::Create(WaterMaterial, this);
+			}
+			TArray<FString> Pairs;
+			ScalarSpec.ParseIntoArray(Pairs, TEXT(","), true);
+			for (const FString& Pair : Pairs)
+			{
+				FString Name, Value;
+				if (Pair.Split(TEXT(":"), &Name, &Value) && SheetMaterialOverride)
+				{
+					const float V = FCString::Atof(*Value);
+					SheetMaterialOverride->SetScalarParameterValue(FName(*Name), V);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("Lake sheets: material scalar '%s' set to %.4f (diagnostic override)."),
+					       *Name, V);
+				}
+			}
+		}
+	}
+
+	float FoamGain = -1.0f;
+	const bool bFoamOverride =
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterFoamGain="), FoamGain) && WaterMaterial;
+
+	float Authority = -1.0f;
+	if (bFoamOverride)
+	{
+		if (!SheetMaterialOverride)
+		{
+			SheetMaterialOverride = UMaterialInstanceDynamic::Create(WaterMaterial, this);
+		}
+		if (SheetMaterialOverride)
+		{
+			SheetMaterialOverride->SetScalarParameterValue(TEXT("BathyFoamGain"), FoamGain);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: BathyFoamGain OVERRIDDEN to %.3f (material default 0.55). This "
+			            "moves BOTH the shore foam and the water COVERAGE it drives -- on SLW, Opacity "
+			            "is opaque-material coverage, not alpha."),
+			       FoamGain);
+		}
+	}
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterDepthAuthority="), Authority) && WaterMaterial)
+	{
+		Authority = FMath::Clamp(Authority, 0.0f, 1.0f);
+		if (!SheetMaterialOverride)
+		{
+			SheetMaterialOverride = UMaterialInstanceDynamic::Create(WaterMaterial, this);
+		}
+		if (SheetMaterialOverride)
+		{
+			SheetMaterialOverride->SetScalarParameterValue(TEXT("BathyDepthAuthority"), Authority);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: BathyDepthAuthority OVERRIDDEN to %.3f for sheets only (material default "
+			            "is 0.85). At 1.0 the engine's along-view-ray absorption term is switched off wherever "
+			            "the bake answered, which is what removes the near-black band on the over-covered cells "
+			            "outside the basin. Where the bake did NOT answer (validity 0) the engine term is "
+			            "unchanged."),
+			       Authority);
+		}
+	}
+	else
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Lake sheets: BathyDepthAuthority left at the material's own value "
+		            "(-VoxelWaterDepthAuthority not passed). This is the CONTROL arm."));
 	}
 
 	int32 Flag = 1;
@@ -556,7 +670,8 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 		UProceduralMeshComponent* C = GetOrCreateSheetComp(Sheet);
 		C->CreateMeshSection(0, Verts, Tris, Normals, UVs, Colors, Tangents,
 		                     /*bCreateCollision*/ false);
-		C->SetMaterial(0, WaterMaterial);
+		C->SetMaterial(0, SheetMaterialOverride ? static_cast<UMaterialInterface*>(SheetMaterialOverride)
+		                                        : WaterMaterial.Get());
 		// One proxy recreate on ONE basin's component (the 2026-08-28 split; it
 		// used to be one recreate of a 495-section proxy).
 		VoxelEofLedger::Count(VoxelEofLedger::ESource::LakeCreate);

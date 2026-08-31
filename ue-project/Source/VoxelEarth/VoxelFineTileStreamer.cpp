@@ -1,5 +1,7 @@
 #include "VoxelFineTileStreamer.h"
 
+#include "HAL/PlatformStackWalk.h" // the gate-leak caller stack; see ReportGateLeak_Locked
+
 #include "VoxelEarth.h"      // LogVoxelEarth
 #include "VoxelFineLockMeter.h" // FLockScope -- the instrument on Lock_, and the two switches
 #include "VoxelDebug.h"    // LogVoxelPerf -- the probe line rides the perf category
@@ -1184,6 +1186,28 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64_t px, int64_t py)
 {
 	const uint64 LeakCount = GateLeaks_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+	// WHO ASKED. This report already names the pixel, the tile, the distance from
+	// the anchor and whether that distance is too far to be a coverage gap -- and
+	// it tells the reader to "find the caller before baking anything". It could
+	// not, until now, tell them WHO the caller is, which is the one fact that
+	// actually shortens the hunt: on 2026-08-30 the 8 km cascade produced a leak
+	// 42.8 km from the player and it cost three builds to eliminate the clipmap
+	// and the raster atlas by measurement, one candidate at a time.
+	//
+	// ONE STACK, ON THE FIRST LEAK ONLY. A leak can repeat millions of times
+	// (18.7 million in the case this gate exists for), and a symbolicated walk is
+	// expensive enough that dumping it per leak would turn a diagnostic into the
+	// thing being diagnosed.
+	if (LeakCount == 1)
+	{
+		ANSICHAR StackBuf[8192];
+		StackBuf[0] = '\0';
+		FPlatformStackWalk::StackWalkAndDump(StackBuf, UE_ARRAY_COUNT(StackBuf), /*IgnoreCount*/ 2);
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("FINE TIER GATE LEAK -- CALLER STACK (first leak only):\n%s"),
+		       ANSI_TO_TCHAR(StackBuf));
+	}
 
 	// WHY FATAL, AND WHY ONLY WHEN UNATTENDED.
 	//

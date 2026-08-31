@@ -127,9 +127,38 @@ def main():
     debug_tint.set_editor_property("parameter_name", "DebugTint")
     debug_tint.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
 
+    # --- ONE COLOUR AUTHORITY (2026-08-30) ----------------------------------
+    #
+    # VertexAlbedoWeight 1.0 takes BaseColor straight from VertexColor.RGB --
+    # the palette colour the CPU already computed for this vertex's REAL surface
+    # material (AVoxelClipmapActor pass 2, via vxc::classifyBiome ->
+    # vxc::biomeSurfaceMaterial -> vxc::kMaterialPalette) -- and bypasses the
+    # biome LUT, the snow term and the slope-rock term entirely.
+    #
+    # WHY THE COLOUR AND NOT THE ID. The obvious design is to send the material
+    # id and look the palette up here. It was tried and it does not survive the
+    # vertex-colour path: an exposure-proof probe read VertexColor.R * 255 back
+    # as ~6-8 where the CPU wrote 4, so every categorical threshold evaluated to
+    # 0 across the whole frame (see this file's sibling note in
+    # terrain_material_common.py). Only 0 and 255 are exact through that path.
+    # A COLOUR does survive it, because that is what the channel is for.
+    #
+    # WHY THE SNOW AND SLOPE TERMS GO WITH IT. They are the clipmap's own
+    # inventions -- the marcher has neither, and vxc::MAT_SNOW is legacy and
+    # deliberately dead (core.h:487, superseded by PERMAFROST/ROCK). Keeping
+    # them on top of a palette colour would re-introduce the very disagreement
+    # this parameter exists to remove.
+    #
+    # DEFAULT 0.0 = the shipped graph, unchanged, so a control capture needs no
+    # material instance. It is a SCALAR and not a static switch deliberately:
+    # AVoxelClipmapActor already owns a per-level MID, so this can be A/B'd from
+    # a command line without a second shader permutation.
+    vertex_albedo = b.lerp(lerp_snow, "", vertex_color, "",
+                           b.scalar("VertexAlbedoWeight", 0.0), "")
+
     tint_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, 150, 350)
-    if not mel.connect_material_expressions(lerp_snow, "", tint_multiply, "A"):
-        raise RuntimeError("connect lerp_snow -> tint_multiply.A failed")
+    if not mel.connect_material_expressions(vertex_albedo, "", tint_multiply, "A"):
+        raise RuntimeError("connect vertex_albedo -> tint_multiply.A failed")
     if not mel.connect_material_expressions(debug_tint, "", tint_multiply, "B"):
         raise RuntimeError("connect debug_tint -> tint_multiply.B failed")
     if not mel.connect_material_property(tint_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):

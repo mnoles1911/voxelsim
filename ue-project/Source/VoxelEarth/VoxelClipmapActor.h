@@ -103,7 +103,26 @@ public:
 	// Fixed level count (m2-plan.md binding decision: "4 levels"). Public so
 	// the game mode / verification code can reference it without a magic
 	// number if ever needed.
-	static constexpr int32 NumLevels = 4;
+	// THREE SINCE 2026-08-30, down from four, and this SHRINKS the far field on
+	// purpose.
+	//
+	// The extent is forced arithmetic, not a choice: level 0's hole must land on
+	// the ring cascade's outer edge, so spacing0 = ringEdge / HoleHalfIndex, and
+	// L doubling levels then reach 32 * spacing0 * 2^(L-1). At four levels that
+	// is 16 x ringEdge -- which was 65 km at the 4 km cascade and became 131 km
+	// the moment the cascade doubled. Nothing is visible at 131 km: this scene's
+	// fog and aerial perspective take terrain to the sky's own colour tens of
+	// kilometres before that (measured: the far bands read (93,109,125), which is
+	// fog, not ground).
+	//
+	// AND IT IS FREE TO CUT, because the clipmap's cost does NOT scale with its
+	// extent -- every level is a fixed 65x65 grid however far it reaches, so a
+	// wider extent just spreads the same vertices thinner. Dropping a level
+	// halves the reach to 8 x ringEdge (65 km at the 8 km cascade) AND removes a
+	// quarter of the per-rebuild vertex work, which matters more than it used to:
+	// each vertex now costs a climate sample and a vxc::classifyBiome call, on
+	// the GAME THREAD, and the p99 tail here is game-thread-owned.
+	static constexpr int32 NumLevels = 3;
 
 	// Half-extent of the OUTERMOST level's square grid, in world UU, measured
 	// from the shared camera-snapped origin. The farthest drawn point of this
@@ -364,6 +383,18 @@ private:
 	// divergence terrain_material_common.py was written to end. These switches
 	// are for finding the number by eye, not for shipping it.
 	bool bSnowOverrideActive = false;
+
+	// -VoxelClipmapVertexAlbedo / -VoxelClipmapAlbedoSrgb. See the parse site
+	// in BeginPlay for what this changes and why one switch arms both the
+	// vertex encoding and the material parameter.
+	// DEFAULT 1.0 SINCE 2026-08-30 -- ONE COLOUR AUTHORITY IS NOW THE SHIPPING
+	// BEHAVIOUR. The far field paints from vxc::kMaterialPalette via the same
+	// vxc::classifyBiome the voxels use, instead of a biome LUT whose colours
+	// were hand-authored independently. -VoxelClipmapVertexAlbedo=0 is the
+	// control arm and restores the LUT path exactly (no MID is created at 0).
+	float VertexAlbedoWeightOverride = 1.0f;
+	bool bVertexAlbedoActive = false;
+	bool bAlbedoAsSrgb = true;
 	float SnowlineLowMetersOverride = 2700.f;
 	float SnowlineHighMetersOverride = 2900.f;
 	float SnowTempMaxOverride = 0.16f;

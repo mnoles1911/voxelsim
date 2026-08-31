@@ -215,12 +215,19 @@ public:
 	// the ceiling of the record's four-bit and the VisBuffer's three-bit level
 	// fields, and with seven ring grids kCoverLevel == kRingGrids exactly, so
 	// an eighth ring would collide with cover in GridSlotForLevel (the
-	// static_assert in the .cpp fires). The grid exists whether or not the
+	// static_assert in the .cpp fires).
+	//
+	// AND ON 2026-08-30 IT DID, exactly as written: R7 (the 8 km cascade) took
+	// slot 7 and the assert fired, so kCoverLevel moved 7 -> 8 in both of its
+	// spellings and kGridSlots became 9. The paragraph above is kept because its
+	// PREDICTION was right and is the reason the collision was a compile error
+	// rather than cover chunks decoding as ring hits. Note the default it names
+	// (-VoxelMaxRingLevel absent = 5) is stale twice over; it is 7 now. The grid exists whether or not the
 	// ring streams; the default run (-VoxelMaxRingLevel absent = 5) simply
 	// leaves slot 6 empty: +8 MiB of buffer, +8 MiB on the rare FULL uploads
 	// (attach and structural events), and zero extra ROUTINE traffic -- the
 	// delta path only moves dirty cells and an unstreamed slot never dirties.
-	static constexpr uint32 kLevels = 7;
+	static constexpr uint32 kLevels = 11;  // 11 ring levels: R0 64 m .. R10 65536 m
 
 	// ===================================================================
 	// PHASE 6: THE COVER GRID. GRID SLOT IS NOT RING LEVEL.
@@ -256,7 +263,7 @@ public:
 	// behind it is suballocated per chunk with nothing stored for a chunk that
 	// has no cover (vxc::packCoverChunk returns anyCover=false and the publisher
 	// stores nothing at all -- no zeroed pack, no reserved slot).
-	static constexpr int32 kCoverLevel = 7;
+	static constexpr int32 kCoverLevel = 11;  // R9/R10 took slots 9 and 10 at the 65 km cascade
 	static constexpr uint32 kRingGrids = kLevels;
 	static constexpr uint32 kCoverGridSlot = kRingGrids;
 	static constexpr uint32 kGridSlots = kRingGrids + 1u;

@@ -494,8 +494,15 @@ namespace VoxelMarchHoleWord
 		// there, because a zero that means "the code that counts this was
 		// compiled out" must never be printable as "no holes of this kind"
 		// (two retractions this week were exactly that shape).
-		UncLevelFirst,                        // + ring level 0..6 of the miss
-		UncReasonFirst = UncLevelFirst + 7,   // + VOXEL_MARCH_MISS_* 0..3
+		UncLevelFirst,                        // + ring level 0..8 of the miss
+		// THE 8 HERE IS kNumLevels, AND THE STATIC_ASSERT BELOW THE ENUM IS WHAT
+		// KEEPS IT SO. It cannot reference kNumLevels directly -- that constant is
+		// declared after this enum, because the enum is what sizes it -- so the two
+		// spellings are checked instead of trusted. Getting this wrong does not
+		// fail to compile: the level words simply run one past their group and
+		// overwrite the first reason word, and every counter stays healthy while
+		// the miss attribution silently reads garbage.
+		UncReasonFirst = UncLevelFirst + 11,  // + VOXEL_MARCH_MISS_* 0..3
 
 		// ---- THE RESIDENT-Z BOUND'S ENGAGEMENT TRIO (voxel.March.ZCut) -----
 		// APPENDED AFTER EVERY EXISTING WORD, ON PURPOSE. The note on
@@ -809,11 +816,16 @@ namespace VoxelMarchHoleWord
 		HeightLateB4,
 		Count
 	};
-	// 7 since level 6 (the 8 km ring) landed 2026-08-23. This widens the
-	// readback layout by one word; both sides move together because the shader
-	// gets these indices as defines from THIS enum (see the "one enum" note in
+	// 8 since R7 (the 8 km cascade) landed 2026-08-30. This widens the readback
+	// layout by one word; both sides move together because the shader gets these
+	// indices as defines from THIS enum (see the "one enum" note in
 	// VoxelMarch.usf) -- there is no hand mirror to update.
-	constexpr int32 kNumLevels = 7;
+	constexpr int32 kNumLevels = 11;
+	// The one hand-written literal in the layout, checked rather than trusted.
+	static_assert(UncReasonFirst - UncLevelFirst == kNumLevels,
+	              "the level-word group must be exactly kNumLevels wide -- if it is not, the "
+	              "level words overrun into the reason words and miss attribution is silently "
+	              "wrong while every counter still looks healthy.");
 	constexpr int32 kNumReasons = 4;
 	// The reason order, mirrored from VOXEL_MARCH_MISS_* in
 	// VoxelBrickTraverse.ush (never / pending / evicted / unattributed) --

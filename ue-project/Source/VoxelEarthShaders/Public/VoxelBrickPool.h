@@ -646,7 +646,7 @@ public:
 	//
 	// FVoxelMarchChunkIndex spells it too, for its grid-slot mapping; the two are
 	// tied by a static_assert in VoxelMarchChunkIndex.cpp, which includes both.
-	static constexpr int32 kCoverLevel = 7;
+	static constexpr int32 kCoverLevel = 11;  // R9/R10 took slots 9 and 10 at the 65 km cascade
 	// Cover cells per level-0 voxel. 100 mm / 50 mm, and it is checked against
 	// vxc::kVoxelSizeMm on the producer side by vxc::coverVolumeInit, which
 	// refuses a pitch that does not tile the world lattice.

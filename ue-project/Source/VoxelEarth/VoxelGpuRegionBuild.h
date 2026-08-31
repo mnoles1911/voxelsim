@@ -14,10 +14,21 @@
 
 #include "CoreMinimal.h"
 #include "VoxelGpuWorldGen.h"
+#include "VoxelMarchChunkIndex.h" // the SHARED level count, asserted against ours below
 
+#include "VoxelCoords.h"   // VoxelCoords::kNumLevels
 #include "voxelcore/core.h"
 #include "voxelcore/caverns.h"
 #include "voxelcore/tiles.h"   // vxc::ClimateSample, ITileSampler
+
+// THE TWO LEVEL COUNTS ARE ONE NUMBER, AND NOW THE COMPILER ENFORCES IT.
+// VoxelCoords::kNumLevels (this module) and FVoxelMarchChunkIndex::kLevels
+// (VoxelEarthShaders) must agree: the marcher's grid slots, the coarse-scale
+// clamps in both modules and the ring preset table all derive from the same
+// ring-level count. They drifted once, silently, and it cost a gate leak
+// 42.8 km from the player.
+static_assert(int32(VoxelCoords::kNumLevels) == int32(FVoxelMarchChunkIndex::kLevels),
+              "ring-level count disagrees between VoxelEarth and VoxelEarthShaders");
 
 namespace VoxelGpuRegionBuild
 {
@@ -75,11 +86,28 @@ namespace VoxelGpuRegionBuild
 		// and 108,470 cell mismatches. A bug in coarseRep itself would have
 		// failed both equally.
 		//
-		// Clamp ceiling 6 since the 8.19 km ring landed (2026-08-23), matching
-		// FillLooseParameters' CoarseScale clamp -- a level the cascade streams
-		// but this function refused would size a level-6 window as level-5's,
-		// half as wide as the kernel samples: the D5 failure again, one level up.
-		const int64 CoarseScale = int64(1) << FMath::Clamp(CoarseLevel, 0, 6);
+		// Clamp ceiling 7 SINCE R7 (the 8 km cascade) LANDED 2026-08-30, matching
+		// FillLooseParameters' CoarseScale clamp (VoxelGpuWorldGen.cpp) -- a level
+		// the cascade streams but this function refused would size a level-7
+		// window as level-6's, half as wide as the kernel samples: the D5 failure
+		// again, one level up.
+		//
+		// AND IT DID EXACTLY THAT, which is why this comment now names the cost.
+		// R7 shipped with this ceiling still at 6, so every level-7 chunk built
+		// its raster window against a cell-to-world mapping half the true scale.
+		// The symptom was NOT a small window: it was a fine-tier gate leak with
+		// an elevation query 42.8 km from the player, through
+		// FVoxelRasterAtlasCpu::FillWindowOnDemand. Three builds went on
+		// eliminating the clipmap and the atlas sweep by measurement before a
+		// stack trace named the caller.
+		//
+		// THE CEILING IS A HAND-WRITTEN PER-LEVEL CONSTANT IN TWO MODULES.
+		// VoxelEarthShaders may not depend on VoxelEarth, so it cannot read
+		// VoxelCoords::kNumLevels; the two spellings are kept in step by this
+		// comment and its twin, which is weaker than an assert and is the reason
+		// this cost what it did. Anyone adding a ring level must move BOTH.
+		const int64 CoarseScale =
+			int64(1) << FMath::Clamp(CoarseLevel, 0, int32(VoxelCoords::kNumLevels) - 1);
 		const auto CoarseRepMm = [CoarseScale](int64 Cell)
 		{
 			// Same two operations as vxc::coarseRep and worldgen.ush's, then to

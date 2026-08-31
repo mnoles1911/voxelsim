@@ -209,13 +209,41 @@ void AVoxelEarthGameMode::BeginPlay()
 		// command-line switch rather than a cvar, matching -VoxelPendingJobCap
 		// and friends: -ExecCmds cvars land after streaming has begun, and this
 		// one has to be decided before the actor is ever spawned.
-		if (!FParse::Param(FCommandLine::Get(), TEXT("VoxelNoClipmap")))
+		// RETIRED 2026-08-30. The clipmap is no longer spawned by default.
+		//
+		// It existed to carry terrain from the ring cascade's edge out to the
+		// horizon, and the cascade now reaches 65,536 m -- R10's outer edge is
+		// EXACTLY this actor's own former outer half-extent. Voxels cover every
+		// metre it used to, so it is redundant rather than merely outvoted, and
+		// the ordering rule in docs/retire-clipmap-all-voxel-plan.md ("retire it
+		// LAST, once voxels demonstrably cover its range") is satisfied.
+		//
+		// WHAT RETIRING IT RETURNS, beyond one representation to reason about:
+		//   * The seam and the two-colour-authority bug class stop being
+		//     possible. They cost a full session to diagnose.
+		//   * Its GAME-THREAD rebuild goes away -- 65x65 vertices per level,
+		//     each costing a climate sample and a vxc::classifyBiome call, and
+		//     the p99 tail here is game-thread-owned.
+		//
+		// -VoxelClipmap RESTORES IT, and the actor, its material and its
+		// generator are all left intact for that. This is a default flip, not a
+		// deletion: if the outer rings ever regress, one switch brings the far
+		// field back rather than a revert.
+		if (FParse::Param(FCommandLine::Get(), TEXT("VoxelClipmap")))
 		{
 			World->SpawnActor<AVoxelClipmapActor>();
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("Voxel clipmap: RESTORED by -VoxelClipmap. It is retired by default since the "
+			            "cascade reached 65 km; far terrain is normally voxels only."));
 		}
 		else
 		{
-			UE_LOG(LogVoxelEarth, Warning, TEXT("Voxel clipmap: SUPPRESSED by -VoxelNoClipmap (far terrain is voxels only)"));
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Voxel clipmap: RETIRED (default). Far terrain is voxel rings R0..R%d, 64 m to "
+			            "%.0f m -- the cascade now covers the clipmap's entire former range. "
+			            "-VoxelClipmap restores it."),
+			       UVoxelWorldSubsystem::GetMaxRingLevel(),
+			       UVoxelWorldSubsystem::GetRingPresets()[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters);
 		}
 
 		// Watershed work item 5 (docs/watershed-system-plan.md §5.2): baked lake

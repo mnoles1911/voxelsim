@@ -61,7 +61,7 @@ namespace VoxelCoords
 	// the cascade's construction ratio Outer/ChunkEdge == 40 (8192 m / 204.8 m)
 	// so the march index aliasing proof (span 80 < kDimXY 128) holds unchanged
 	// at every level -- see VoxelMarchChunkIndex.cpp's static_asserts.
-	inline constexpr int32 kNumLevels = 7;
+	inline constexpr int32 kNumLevels = 11;  // 2026-08-30: R9/R10 -- the 65 km cascade
 
 	// Floored division matching vxc::floorDiv (C++ integer division truncates
 	// toward zero; voxel/brick/chunk lattice indexing needs floor instead).
