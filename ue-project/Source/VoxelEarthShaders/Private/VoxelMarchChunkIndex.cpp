@@ -722,16 +722,29 @@ void FVoxelMarchChunkIndex::AttachToGlobalPool()
 
 	UE_LOG(LogVoxelMarchIndex, Display,
 	       TEXT("Voxel march chunk index attached: seeded %d chunks of %d offered "
-	            "(INDEXED per level %d/%d/%d/%d/%d/%d; OFFERED per level %d/%d/%d/%d/%d/%d; "
+	            // FULL WIDTH SINCE 2026-09-03: this printer spelled slots 0-5
+	            // from the six-level era and silently hid the outer rings and
+	            // the cover slot for the whole 8-ring investigation (the
+	            // "fourth short printer" -- the pool's perLevel was the only
+	            // number ever quoted for slots 6/7 because this one stopped).
+	            // The static_asserts below pin the spelled-out count to the
+	            // real constants so a cascade resize breaks the build, not
+	            // the reading.
+	            "(INDEXED per slot %d/%d/%d/%d/%d/%d/%d/%d/%d; "
+	            "OFFERED per level %d/%d/%d/%d/%d/%d/%d/%d; "
 	            "%d dropped for being above the %u levels this grid carries; "
 	            "grid %ux%ux%u, %llu MiB)."),
 	       NumEntries, Snapshot.Num(),
 	       PerSlotEntries[0], PerSlotEntries[1], PerSlotEntries[2],
 	       PerSlotEntries[3], PerSlotEntries[4], PerSlotEntries[5],
+	       PerSlotEntries[6], PerSlotEntries[7], PerSlotEntries[8],
 	       OfferedPerLevel[0], OfferedPerLevel[1], OfferedPerLevel[2],
 	       OfferedPerLevel[3], OfferedPerLevel[4], OfferedPerLevel[5],
+	       OfferedPerLevel[6], OfferedPerLevel[7],
 	       DroppedWrongLevel, kLevels, kDimXY, kDimXY, kDimZ,
 	       uint64(kCells) * sizeof(uint32) / (1024ull * 1024ull));
+	static_assert(kGridSlots == 9, "the INDEXED list above spells 9 slots");
+	static_assert(kOfferBuckets == 8, "the OFFERED list above spells 8 levels");
 }
 
 void FVoxelMarchChunkIndex::Detach()

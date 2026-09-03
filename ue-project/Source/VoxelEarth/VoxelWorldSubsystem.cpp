@@ -16021,6 +16021,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			           : 0.0,
 			       (unsigned long long)H.Frames);
 
+			// THE LADDER'S WINDOW LINE (2026-09-03, closing a grep gap). The
+			// ladder-on-truncation counters were readable only through the
+			// voxel.March.Stats console dump, which no headless leg runs --
+			// so every capture leg since the altitude fix shipped had the
+			// numbers on the GPU and nothing in the log. Same cadence and
+			// same source struct as the holes line above; rungs=0 while the
+			// walk is armed is a reading (the ladder was never offered a
+			// truncated rung at this pose), not a failure, and tailLost>0 is
+			// the regression signal the altitude work defined.
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel march zladder (window): rungs=%llu clamped=%llu ")
+			       TEXT("resumed=%llu tailLost=%llu"),
+			       (unsigned long long)H.ZLadderRungs,
+			       (unsigned long long)H.ZLadderClamped,
+			       (unsigned long long)H.ZLadderResumed,
+			       (unsigned long long)H.ZLadderTailLost);
+
 			// Mirror for the streaming HUD's legacy row (registered by
 			// VoxelDebug.cpp; found by name because this module must not link
 			// against a registration that may not exist in a stripped build).
