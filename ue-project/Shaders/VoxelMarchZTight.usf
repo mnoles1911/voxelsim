@@ -75,10 +75,12 @@
 #define VOXEL_ZTIGHT_RECORD_DWORDS 16u
 #endif
 
-// Ring levels reduced (7). Pushed from FVoxelMarchChunkIndex::kRingGrids by
-// the host so the two sides cannot disagree about how many pairs exist.
+// Ring levels reduced (8). Pushed from FVoxelMarchChunkIndex::kRingGrids by
+// the host so the two sides cannot disagree about how many pairs exist. The
+// fallbacks here and in the word-layout block below exist only for offline
+// shader tooling; the live values always come from the host's SetDefines.
 #ifndef VOXEL_ZTIGHT_RING_LEVELS
-#define VOXEL_ZTIGHT_RING_LEVELS 7
+#define VOXEL_ZTIGHT_RING_LEVELS 8
 #endif
 
 // The group size, pushed from FVoxelMarchZTightReduceCS::kGroupSize -- the
@@ -97,22 +99,22 @@
 #define VOXEL_ZTIGHT_WORD_MININV0 0
 #endif
 #ifndef VOXEL_ZTIGHT_WORD_MAX0
-#define VOXEL_ZTIGHT_WORD_MAX0 7
+#define VOXEL_ZTIGHT_WORD_MAX0 8
 #endif
 #ifndef VOXEL_ZTIGHT_WORD_COUNT0
-#define VOXEL_ZTIGHT_WORD_COUNT0 14
+#define VOXEL_ZTIGHT_WORD_COUNT0 16
 #endif
 #ifndef VOXEL_ZTIGHT_WORD_PHANTOMS
-#define VOXEL_ZTIGHT_WORD_PHANTOMS 21
+#define VOXEL_ZTIGHT_WORD_PHANTOMS 24
 #endif
 #ifndef VOXEL_ZTIGHT_WORD_LIVE
-#define VOXEL_ZTIGHT_WORD_LIVE 22
+#define VOXEL_ZTIGHT_WORD_LIVE 25
 #endif
 #ifndef VOXEL_ZTIGHT_WORD_COVER
-#define VOXEL_ZTIGHT_WORD_COVER 23
+#define VOXEL_ZTIGHT_WORD_COVER 26
 #endif
 #ifndef VOXEL_ZTIGHT_WORD_EXAMINED
-#define VOXEL_ZTIGHT_WORD_EXAMINED 24
+#define VOXEL_ZTIGHT_WORD_EXAMINED 27
 #endif
 
 // The record's own fields, named as the refine kernel names them (mirrors

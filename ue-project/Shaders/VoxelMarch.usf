@@ -649,6 +649,10 @@
 float4x4 MarchViewToTranslatedWorld;
 float3   MarchRayOriginLocalUU;
 float    MarchVolumeExtentUU;
+// The Z extent, full height (the altitude fix, 2026-09-02) -- equal to
+// MarchVolumeExtentUU on every non-ring path, the altitude budget under
+// rings. Bound from FVoxelMarchViewParameters like its XY twin.
+float    MarchVolumeExtentZUU;
 float2   MarchViewRectMin;
 float2   MarchViewRectSize;
 float2   MarchInvProjDiag;
@@ -925,9 +929,21 @@ FVoxelMarchRay VoxelMarchBuildRay(float2 SvPositionXY)
 	// exponent, so level 5 loses nothing; the precision risk was never in the
 	// rescale and was never at the coarse end. It was at LEVEL 0, from how far
 	// the frame origin sat from the camera.
+	// Z HAS ITS OWN HALF-EXTENT (the altitude fix, 2026-09-02). XY reach is
+	// the ring cascade's; Z is the altitude budget -- reusing the XY number
+	// put the cube floor at ~8.6 km and CLIPPED the ground out of every
+	// higher pose before any walk ran (the owner's plan-view rim).
+	// Precision at the new size: HalfZ ~ 1.35M UU, where a float32 ulp is
+	// 0.25 UU -- noise against a cube FACE (not geometry: segment ends are
+	// re-biased outward by a full chunk inside the walk), and irrelevant to
+	// walk positions, which the per-rung vertical reach clamp
+	// (VOXEL_MARCH_PACK_ZREACH_VOXELS, VoxelBrickTraverse.ush) bounds to
+	// ~40,880 walk-UU at every level.
 	const float Half = MarchVolumeExtentUU * 0.5f;
-	const float3 T0 = (-Half - R.OriginLocalUU) * InvDir;
-	const float3 T1 = ( Half - R.OriginLocalUU) * InvDir;
+	const float HalfZ = MarchVolumeExtentZUU * 0.5f;
+	const float3 HalfV = float3(Half, Half, HalfZ);
+	const float3 T0 = (-HalfV - R.OriginLocalUU) * InvDir;
+	const float3 T1 = ( HalfV - R.OriginLocalUU) * InvDir;
 #else
 	const float3 T0 = (0.0f - R.OriginLocalUU) * InvDir;
 	const float3 T1 = (MarchVolumeExtentUU - R.OriginLocalUU) * InvDir;
@@ -1675,6 +1691,13 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				const uint ZtRetrySkipped = GVoxelMarchZtRetrySkipped;
 				const uint ZtRetryEntered = GVoxelMarchZtRetryEntered;
 #endif
+				// The Z ladder's snapshot, the same discipline: the verify walk
+				// below re-runs the ring loop, whose clamp and continuation would
+				// tally these statics a second time on verify-armed legs.
+				const uint ZlRungs = GVoxelMarchZlRungs;
+				const uint ZlClamped = GVoxelMarchZlClamped;
+				const uint ZlResumed = GVoxelMarchZlResumed;
+				const uint ZlTailLost = GVoxelMarchZlTailLost;
 #if VOXEL_MARCH_RUNG_PROBE
 				// The rung probe's snapshot, the bound's discipline verbatim:
 				// the verify walk below re-runs the ring loop, whose retry
@@ -1949,6 +1972,23 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 					               ZtRetryEntered);
 				}
 #endif
+				// THE Z LADDER'S ENGAGEMENT QUAD (the altitude fix), guarded on
+				// its own denominator like every group above: a ray whose kernel
+				// compiled no clamp (fallthrough 0, rings off) pays no atomics
+				// and the words stay a STRUCTURAL zero -- which is what makes
+				// "rungs == 0 while the ladder is armed" a verdict on the ARM and
+				// not on the world. TailLost rides the same guard: only a rung
+				// that ran can declare a lost tail.
+				if (ZlRungs != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZL_RUNGS], ZlRungs);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZL_CLAMPED],
+					               ZlClamped);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZL_RESUMED],
+					               ZlResumed);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZL_TAILLOST],
+					               ZlTailLost);
+				}
 #if VOXEL_MARCH_RUNG_PROBE
 				// THE RUNG PROBE'S ENGAGEMENT QUAD (voxel.March.RungProbe),
 				// guarded on its own denominator like every group above: a
@@ -1998,6 +2038,15 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				if (H.bHit)
 				{
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HITS], 1u);
+// HITS-BY-RING-LEVEL WRITE REMOVED 2026-09-02, HOURS AFTER IT LANDED, on an
+// empirical verdict: every leg after the build carrying it counted hits=0 at
+// the vista pose (three legs, ZTight on/off, clipmap on/off all eliminated as
+// variables) while every pre-census build drew there, and the plan pose's
+// counters stayed alive -- a pose-dependent total kill correlated with exactly
+// this build. Mechanism not yet identified (the buffer is sized to the enum's
+// End, the index clamps, the words are appended); correlation was enough to
+// pull the write pending a proper trace. The CPU readback and print remain and
+// read zeros, which the reader must treat as NOT MEASURED.
 					if (H.bSubstituted)
 					{
 						InterlockedAdd(
@@ -2132,6 +2181,27 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 		               GVoxelMarchCellBrickOOB);
 		InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_CELL_REAL],
 		               GVoxelMarchCellReal);
+#ifdef VOXEL_MARCH_HOLE_STALE_GRID0
+		// Per-grid-slot stale/real split (2026-09-02): the vista-kill trace's
+		// discriminator. Folded per ray like every census word; nonzero
+		// slots only, to keep idle cost near zero.
+		[unroll]
+		for (uint SlotW = 0u; SlotW < 12u; ++SlotW)
+		{
+			if (GVoxelMarchCellStaleBySlot[SlotW] != 0u)
+			{
+				InterlockedAdd(
+					GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_STALE_GRID0 + SlotW],
+					GVoxelMarchCellStaleBySlot[SlotW]);
+			}
+			if (GVoxelMarchCellRealBySlot[SlotW] != 0u)
+			{
+				InterlockedAdd(
+					GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_REAL_GRID0 + SlotW],
+					GVoxelMarchCellRealBySlot[SlotW]);
+			}
+		}
+#endif
 	}
 #endif
 

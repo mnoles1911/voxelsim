@@ -1,5 +1,7 @@
 ﻿#include "VoxelGpuPoolComponent.h"
 
+#include "VoxelMarchChunkIndex.h" // kLevels, for the census kMaxLevels tripwire
+
 #include "VoxelGpuWorldGenGraph.h"
 #include "VoxelQuadVertexFactory.h"
 #include "PrimitiveSceneProxy.h"
@@ -1941,6 +1943,12 @@ private:
 		// validates or refutes the uniformity assumption. Visible[] is per gather
 		// and is what a cap would actually remove from THIS cascade.
 		static constexpr int32 kMaxLevels = 8;
+		// Silently clamped during the 11-level period (no assert; L8+ folded
+		// into the top bucket). Exactly right at the 8-ring cascade; asserted
+		// so the next cascade change is loud.
+		static_assert(kMaxLevels >= int32(FVoxelMarchChunkIndex::kLevels),
+		              "per-level quad census caps at kMaxLevels; a wider cascade folds its "
+		              "outer levels into the clamp bucket silently");
 		uint32 PoolQuadsByLevel[kMaxLevels] = {};
 		uint32 VisibleQuadsByLevel[kMaxLevels] = {};
 

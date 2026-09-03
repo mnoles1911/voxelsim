@@ -149,20 +149,132 @@ def main():
     # them on top of a palette colour would re-introduce the very disagreement
     # this parameter exists to remove.
     #
-    # DEFAULT 0.0 = the shipped graph, unchanged, so a control capture needs no
-    # material instance. It is a SCALAR and not a static switch deliberately:
-    # AVoxelClipmapActor already owns a per-level MID, so this can be A/B'd from
-    # a command line without a second shader permutation.
+    # The GRAPH default here is 0.0, but the SHIPPED default is 1.0: the actor
+    # pushes VertexAlbedoWeightOverride (default 1.0 since 2026-08-30) onto the
+    # per-level MID every run. It is a SCALAR and not a static switch
+    # deliberately: AVoxelClipmapActor already owns a per-level MID, so this
+    # can be A/B'd from a command line without a second shader permutation.
     vertex_albedo = b.lerp(lerp_snow, "", vertex_color, "",
                            b.scalar("VertexAlbedoWeight", 0.0), "")
 
+    # --- VIRTUAL RINGS: MATERIAL-SPACE VOXELIZATION (2026-09-02) ------------
+    #
+    # The far field's smoothness is not a colour problem (the palette already
+    # matches) -- it is that a heightfield has no terraces, no axis-quantized
+    # faces, and no unlit risers, while the voxel cascade holds ALL of those at
+    # ~2-3 px apparent cell size at EVERY distance (the refuted normal-fade arm
+    # proved blockiness never diminishes with range; VoxelMarchRenderer.cpp at
+    # NormalFadeStartM). So the clipmap continues the cascade's own law in its
+    # PIXEL shader: cell size 12.8 m at the 8,192 m seam (identical to R7
+    # across the boundary), doubling per distance band -- terraced height
+    # steps, normals snapped to cube axes so the sun lights whole cells the way
+    # it lights real faces, per-cell flattened colour, and the marcher's
+    # hemisphere-ambient formula verbatim for lighting parity (its constants
+    # are restated here from voxel.March.AmbientIntensity's defaults --
+    # materials cannot read cvars; if those defaults move, move these).
+    #
+    # VoxelizeWeight 1.0 is the DEFAULT (owner-accepted direction); 0.0 is the
+    # control arm and must reproduce today's frame exactly -- every output
+    # lerps back to its pre-voxelize input at W=0. AVoxelClipmapActor pushes
+    # -VoxelClipmapVoxelize= onto the per-level MIDs for the A/B.
+    #
+    # The lattice is WORLD-ANCHORED (stable under TSR/camera translation) and
+    # band-doubling (the cone rule), the two defences the marcher's own tint
+    # fade uses against far-field boiling. Honest limit, recorded up front:
+    # the SILHOUETTE stays smooth -- a pixel shader cannot cut the skyline.
+    world_pos = mel.create_material_expression(material, unreal.MaterialExpressionWorldPosition, -500, 800)
+    cam_pos = mel.create_material_expression(material, unreal.MaterialExpressionCameraPositionWS, -500, 900)
+    vert_nrm = mel.create_material_expression(material, unreal.MaterialExpressionVertexNormalWS, -500, 1000)
+
+    vox = mel.create_material_expression(material, unreal.MaterialExpressionCustom, -100, 800)
+    vox.set_editor_property("description", "VirtualRingVoxelize")
+    vox.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    vox.set_editor_property("code", """
+// Virtual-ring voxelization. All distances in UU (cm).
+float2 dxy = WP.xy - CamP.xy;
+float d = length(dxy);
+const float seam = 819200.0;                 // 8,192 m cascade edge
+float band = clamp(floor(log2(max(d, seam) / seam)), 0.0, 3.0);
+float cell = 1280.0 * exp2(band);            // 12.8 m at the seam, doubling per band
+// Terracing: quantize height into cell steps; classify riser by slope share.
+// V2 (owner: "even more blockiness"): stronger riser share, harder steps.
+float zc = WP.z / cell;
+float f = frac(zc);
+float slope = saturate(1.0 - abs(VN.z));
+float riserW = saturate(slope * 3.5);        // share of each step that reads as riser
+float aa = fwidth(zc) * 1.5 + 1e-4;
+float riser = 1.0 - smoothstep(riserW - aa, riserW + aa, f);
+// Axis-quantized normal: up on treads, dominant horizontal axis on risers --
+// near-pure horizontal so risers take the full unlit-face contrast.
+float2 hd = (abs(VN.x) > abs(VN.y)) ? float2(VN.x >= 0.0 ? 1.0 : -1.0, 0.0)
+                                    : float2(0.0, VN.y >= 0.0 ? 1.0 : -1.0);
+float3 nq = normalize(lerp(float3(0, 0, 1), float3(hd, 0.05), riser));
+// XY cell lattice: each world-anchored cell reads as its own block face.
+float2 cid = floor(WP.xy / cell);
+// Per-cell value jitter (world-anchored hash; TSR-stable): the near field's
+// per-voxel variation, continued at cell scale.
+float h = frac(sin(dot(cid + floor(WP.z / cell) * 0.618, float2(12.9898, 78.233))) * 43758.5453);
+float jitter = 1.0 + (h - 0.5) * 0.14;
+// Cell-edge darkening: the face-grid read of voxel terrain, AA'd by fwidth.
+float2 fxy = abs(frac(WP.xy / cell) - 0.5);
+float2 exy = fwidth(WP.xy / cell) * 1.2 + 1e-4;
+float edge = max(smoothstep(0.5 - exy.x, 0.5, fxy.x),
+                 smoothstep(0.5 - exy.y, 0.5, fxy.y));
+float edgeDim = 1.0 - edge * 0.18;
+// Per-cell flattened colour: posterized luminance (4 hard steps), per-cell
+// jitter, edge darkening, risers to the palette side-face ratio.
+float lum = max(dot(VC, float3(0.299, 0.587, 0.114)), 1e-4);
+float lq = (floor(lum * 4.0) + 0.5) / 4.0;
+float3 cq = VC * (lq / lum) * jitter * edgeDim;
+cq = lerp(cq, cq * 0.58, riser);
+// Marcher hemisphere ambient, verbatim: tint * intensity * ground/sky mix.
+float3 amb = cq * float3(1.00, 1.04, 1.12) * 1.5
+           * lerp(0.45, 1.0, saturate(nq.z * 0.5 + 0.5));
+// W = 0 must be byte-identical to the pre-voxelize graph.
+OutNrm = normalize(lerp(VN, nq, W));
+OutAmb = amb * W;
+return lerp(VC, cq, W);
+""")
+    vox_inputs = []
+    for nm in ("WP", "CamP", "VN", "VC", "W"):
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", nm)
+        vox_inputs.append(ci)
+    vox.set_editor_property("inputs", vox_inputs)
+    out_nrm = unreal.CustomOutput()
+    out_nrm.set_editor_property("output_name", "OutNrm")
+    out_nrm.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    out_amb = unreal.CustomOutput()
+    out_amb.set_editor_property("output_name", "OutAmb")
+    out_amb.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    vox.set_editor_property("additional_outputs", [out_nrm, out_amb])
+
+    voxelize_w = b.scalar("VoxelizeWeight", 1.0)
+    b.link(world_pos, "", vox, "WP")
+    b.link(cam_pos, "", vox, "CamP")
+    b.link(vert_nrm, "", vox, "VN")
+    b.link(vertex_albedo, "", vox, "VC")
+    b.link(voxelize_w, "", vox, "W")
+
     tint_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, 150, 350)
-    if not mel.connect_material_expressions(vertex_albedo, "", tint_multiply, "A"):
-        raise RuntimeError("connect vertex_albedo -> tint_multiply.A failed")
+    if not mel.connect_material_expressions(vox, "", tint_multiply, "A"):
+        raise RuntimeError("connect voxelize -> tint_multiply.A failed")
     if not mel.connect_material_expressions(debug_tint, "", tint_multiply, "B"):
         raise RuntimeError("connect debug_tint -> tint_multiply.B failed")
     if not mel.connect_material_property(tint_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
         raise RuntimeError("connect tint_multiply -> BaseColor failed")
+
+    # World-space quantized normal out; the material flips to world-space
+    # normals for it (the vertex normal passthrough at W=0 is world-space too,
+    # so the control arm is unchanged).
+    if not mel.connect_material_property(vox, "OutNrm", unreal.MaterialProperty.MP_NORMAL):
+        raise RuntimeError("connect voxelize -> Normal failed")
+    material.set_editor_property("tangent_space_normal", False)
+
+    # Lighting parity: the marcher's hemisphere ambient rides emissive there,
+    # so it rides emissive here, gated entirely by VoxelizeWeight.
+    if not mel.connect_material_property(vox, "OutAmb", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+        raise RuntimeError("connect voxelize ambient -> Emissive failed")
 
     # Same snow-smooths-roughness term as M_VoxelTerrain, same defaults, so the
     # snow cap on a distant peak and the snow underfoot shade alike.
@@ -172,6 +284,8 @@ def main():
     # the two materials meet along the seam this term is most visible on.
     if wet is not None:
         roughness = b.lerp(roughness, "", b.scalar("WetShoreRoughness", 0.22), "", wet)
+    # Roughness parity with the marcher (0.86) under voxelization.
+    roughness = b.lerp(roughness, "", b.scalar("VoxelizeRoughness", 0.86), "", voxelize_w)
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness failed")
 

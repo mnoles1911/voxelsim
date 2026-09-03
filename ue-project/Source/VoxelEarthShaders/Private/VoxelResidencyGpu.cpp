@@ -17,6 +17,8 @@
 
 #include "VoxelResidencyGpu.h"
 
+#include "VoxelMarchChunkIndex.h" // kLevels, for the kMaxLevels tripwire below
+
 #include "GlobalShader.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -76,6 +78,13 @@ namespace VoxelResidency
 	constexpr uint32 kMask = 127;
 	constexpr uint32 kCellsPerLevel = kDimXY * kDimXY * kDimZ;
 	constexpr uint32 kMaxLevels = 8;
+	// This was a SILENT CAP for the whole 11-level period: the residency scan
+	// clamped NumLevels to 8 with no assert, so rings 8-10 were never scanned
+	// and nothing said so. Exactly right at the 8-ring cascade; the assert
+	// makes the next cascade change a compile error instead of a blind spot.
+	static_assert(kMaxLevels >= FVoxelMarchChunkIndex::kLevels,
+	              "the GPU residency scan caps at kMaxLevels; a cascade wider than that "
+	              "silently stops being residency-scanned above the cap");
 
 	constexpr uint32 kAdmitCap = 65536;
 	constexpr uint32 kEvictCap = 32768;

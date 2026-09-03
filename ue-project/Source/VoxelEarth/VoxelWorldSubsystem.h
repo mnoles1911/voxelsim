@@ -182,9 +182,9 @@ public:
 	// must be passed, the subsystem is Fatal on a malformed cascade.
 	//
 	// THE TORUS ASSERT GETS SAFER, not tighter: R0 now spans 40 chunks against
-	// kDimXY 128 where it spanned 80. And AVoxelClipmapActor is unaffected -- it
-	// reads RingPresets[GetMaxRingLevel()].OuterMeters, which is 4096 m before
-	// and after, so the 30 km heightmap's vertex spacing does not move.
+	// kDimXY 128 where it spanned 80. AVoxelClipmapActor reads
+	// RingPresets[GetMaxRingLevel()].OuterMeters (8,192 m), so its vertex
+	// spacing and 65.5 km outer half-extent derive from this table.
 	static constexpr FRingPreset kDefaultRingPresets[VoxelCoords::kNumLevels] = {
 		{0.0, 64.0},
 		{64.0, 128.0},
@@ -193,41 +193,26 @@ public:
 		{512.0, 1024.0},
 		{1024.0, 2048.0},
 		{2048.0, 4096.0}, // R6
-		{4096.0, 8192.0}, // R7
-		{8192.0, 16384.0},  // R8: first coarse-derived ring (12.8 m voxels)
-		{16384.0, 32768.0}, // R9:  25.6 m voxels, coarse-derived
-		{32768.0, 65536.0}, // R10: 51.2 m voxels, coarse-derived. THE CASCADE EDGE,
-		                    // and it matches AVoxelClipmapActor's own 65 km outer
-		                    // half-extent -- voxels now reach as far as the clipmap
-		                    // they were built to replace. GetMaxRingLevel stops here.
-		                   // FIRST COARSE-DERIVED LEVEL -- VoxelTier::kFirstCoarseLevel
-		                   // is 8, so this ring is generated from the 30 m tier, not the
-		                   // 1.875 m one. Its voxels are 12.8 m; sampling a 1.875 m raster
-		                   // to place them would be absurd, and the fine tier does not
-		                   // cover 16 km anyway. See docs/retire-clipmap-all-voxel-plan.md.
-		                  // Added 2026-08-30 by the recipe in the note below, which is
-		                  // why it is an EIGHTH ring rather than a stretched seventh:
-		                  // Outer/ChunkEdge == 40 holds on every entry (8192/204.8),
-		                  // so OuterUU(L) = R0 * 2^L still derives from ONE uniform.
-		// THE OLD DORMANT R6 {4096, 8192} IS GONE, and that is the whole point of
-		// the deepening: the seventh ring is no longer a dormant 8 km extension,
-		// it is the ring that lets the SAME 4 km be reached from R0 = 64 m. The
-		// construction ratio the old comment protected (Outer/ChunkEdge == 40) is
-		// preserved on every entry above -- 64/1.6, 128/3.2, ... 4096/102.4 -- so
-		// the geometric derivation OuterUU(L) = R0 * 2^L that the marcher computes
-		// from ONE uniform still holds, with R0 now 64 m on both sides.
+		{4096.0, 8192.0}, // R7: THE CASCADE EDGE (2026-09-02). Everything beyond
+		                  // 8,192 m is AVoxelClipmapActor's job again -- its inner
+		                  // hole lands on this edge by construction
+		                  // (SpacingUUForLevel reads this row's OuterMeters).
+		// R8/R9/R10 (16/32/65 km, coarse-derived) EXISTED 2026-08-30..09-02 and
+		// were removed deliberately: the renderer never coherently supported them
+		// (marcher ring clamp, GPU residency scan cap, admission Z-range) and
+		// walking them cost ~219 ms/frame. docs/cascade-cut-to-8-2026-09-02.md.
 		//
-		// TO REACH 8 km, add an EIGHTH ring rather than stretching this one: raise
-		// VoxelCoords::kNumLevels to 8, append {4096, 8192}, give it a cap share,
-		// and set kDefaultMaxRingLevel to 7. That costs 90 chunk iterations against
-		// today's 80 -- still well under the 140 the six-ring 4 km cascade cost --
-		// and it is the reason this deepening is the right shape for 8 km too.
+		// The construction ratio Outer/ChunkEdge == 40 holds on every entry
+		// (64/1.6 ... 8192/204.8), so the geometric derivation
+		// OuterUU(L) = R0 * 2^L that the marcher computes from ONE uniform holds,
+		// and the march index aliasing proof (span 80 < kDimXY 128) is
+		// level-independent.
 	};
 	// A short initializer list here is silently zero-filled by C++, and the
 	// consequences are runtime-silent rather than loud: a {0,0} annulus admits no
 	// chunks at that level, and AVoxelClipmapActor derives its ENTIRE vertex
 	// spacing from RingPresets[kNumLevels-1].OuterMeters, so a zero there
-	// collapses the whole 30 km heightmap to a degenerate zero-extent mesh.
+	// collapses the whole 65 km heightmap to a degenerate zero-extent mesh.
 	static_assert(UE_ARRAY_COUNT(kDefaultRingPresets) == VoxelCoords::kNumLevels, "kDefaultRingPresets must have one entry per level");
 
 	// Outer-edge eviction hysteresis: a chunk leaves its level's desired set
@@ -272,9 +257,8 @@ public:
 	static const FRingPreset* GetRingPresets();
 
 	// Outermost ring level actually streaming this run (-VoxelMaxRingLevel=<N>,
-	// default 5 -- the shipped 4 km cascade; level 6, the 8.19 km ring, is
-	// compiled in but streams only when this says 6, see the .cpp).
-	// GetRingPresets()[GetMaxRingLevel()].OuterMeters is
+	// default 7 -- the full 8,192 m cascade; see kDefaultMaxRingLevel in the
+	// .cpp). GetRingPresets()[GetMaxRingLevel()].OuterMeters is
 	// therefore where the voxel world really ends, which is what
 	// AVoxelClipmapActor has to butt its inner hole against -- see
 	// SpacingUUForLevel. Resolved once from the command line at first use.

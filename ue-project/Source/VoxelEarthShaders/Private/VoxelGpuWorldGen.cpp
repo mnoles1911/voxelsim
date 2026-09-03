@@ -1877,13 +1877,14 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		// the terrain's CoarseScale silently, and a stamp composed at a clamped
 		// scale would sit at the wrong offset inside plausible terrain -- the
 		// exact wrong-but-plausible output this function exists to catch.
-		// 0..6 since the 8 km ring -- must track FillLooseParameters' clamp
-		// above, for the reason stated there.
-		if (Req.CoarseLevel < 0 || Req.CoarseLevel > 6)
+		// Derived from the index's level count -- the same authority
+		// FillLooseParameters' clamp above reads, so the two cannot drift.
+		if (Req.CoarseLevel < 0 ||
+		    Req.CoarseLevel > int32(FVoxelMarchChunkIndex::kLevels) - 1)
 		{
 			OutError = FString::Printf(
 				TEXT("AssetInstances (%d) on a CoarseLevel %d region — the stamp supports levels ")
-				TEXT("0..6 (the range the terrain kernels' CoarseScale is derived over); a clamped ")
+				TEXT("0..kLevels-1 (the range the terrain kernels' CoarseScale is derived over); a clamped ")
 				TEXT("scale would stamp instances at the wrong offset inside plausible terrain."),
 				Req.AssetInstances.Num(), Req.CoarseLevel);
 			return false;

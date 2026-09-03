@@ -306,6 +306,13 @@ namespace VoxelDebug
 	// applies a small floor for progress, then drains while under this budget up
 	// to GetStreamMaxAppliesPerFrame.
 	VOXELEARTH_API float GetStreamApplyBudgetMs();
+	// voxel.Stream.ApplyCruiseCap / voxel.Stream.ApplyStormBacklog: cruise apply-rate
+	// cap for DrainResults (2026-09-02 Goal-3 p95 pass, v2 -- the v1 backlog/N spread
+	// never engaged; see the cvar text). Rate-cap while backlog <= StormBacklog; full
+	// throttle above.
+	VOXELEARTH_API int32 GetStreamApplyCruiseCap();
+	VOXELEARTH_API int32 GetStreamApplyStormBacklog();
+
 	// Shipped cvar values, bypassing the -VoxelApplyPerTick / -VoxelApplyBudgetMs
 	// overrides; for the armed-indicator line only.
 	VOXELEARTH_API int32 GetStreamMaxAppliesPerFrameCvar();

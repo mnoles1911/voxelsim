@@ -25,6 +25,7 @@
 #include "CoreMinimal.h"
 #include "HAL/IConsoleManager.h"
 #include "VoxelGpuWorldGen.h"
+#include "VoxelMarchChunkIndex.h" // kLevels: the gate ceiling tracks the cascade
 #include "VoxelGpuRegionBuild.h"
 #include "VoxelRasterAtlas.h"   // A: voxel.GPU.VerifyRasterAtlas builds scratch atlases
 #include "RenderingThread.h"     // FlushRenderingCommands, for the gate's scratch-atlas teardown
@@ -1493,7 +1494,13 @@ namespace
 		// FillLooseParameters read 0..6 -- a level-6 window sized at scale 32
 		// under a kernel sampling at scale 64, the D5 defect one level up,
 		// clamping silently on every level-6 GPU chunk.
-		const int32 MaxLevel = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 0, 6) : 6;
+		// Ceiling derived from the index's level count (2026-09-02): the stale
+		// literal 6 left level 7 -- a level the fork ships -- unprovable by
+		// this gate, the exact blind spot the comment above warns about.
+		const int32 GateMaxLevel = int32(FVoxelMarchChunkIndex::kLevels) - 1;
+		const int32 MaxLevel = (Args.Num() > 0)
+		    ? FMath::Clamp(FCString::Atoi(*Args[0]), 0, GateMaxLevel)
+		    : GateMaxLevel;
 
 		vxc::SyntheticTileSampler Tiles(kSeed);
 		vxc::SyntheticTileSampler CpuTiles(kSeed);

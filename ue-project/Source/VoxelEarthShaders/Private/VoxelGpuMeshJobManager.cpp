@@ -9,6 +9,7 @@
 #include "RenderingThread.h"
 #include "Misc/ScopeExit.h"
 #include "VoxelRenderFrame.h"
+#include "VoxelMarchChunkIndex.h" // kLevels: the one authority for the level ceiling
 
 #include <atomic>
 #include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
@@ -1340,11 +1341,14 @@ void ApplyBrickRegionShape(FVoxelGpuRegionRequest& OutReq)
 	// by one brick of LEVEL-L cells -- i.e. 8 << CoarseLevel level-0 voxels,
 	// because AnchorRelVx is in level-0 voxel units relative to OriginVx * 2^L.
 	// AnchorVz is absolute and does not move.
-	// Ceiling 6, mirroring FillLooseParameters' CoarseScale clamp: the stale
+	// Ceiling derived from the index's level count, mirroring
+	// FillLooseParameters' CoarseScale clamp (same authority): the stale
 	// literal 5 halved the shift at level 6, displacing every asset anchor in
 	// a ring-6 brick region by 8x32 level-0 voxels -- plausible trees, wrong
 	// places, no error.
-	const int32 AnchorShift = int32(kBrickEdge) << FMath::Clamp(OutReq.CoarseLevel, 0, 6);
+	const int32 AnchorShift = int32(kBrickEdge)
+	                          << FMath::Clamp(OutReq.CoarseLevel, 0,
+	                                          int32(FVoxelMarchChunkIndex::kLevels) - 1);
 	for (FVoxelGpuRegionRequest::FAssetInstance& Inst : OutReq.AssetInstances)
 	{
 		Inst.AnchorRelVx -= AnchorShift;
@@ -2201,11 +2205,20 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 		Job->BrickKey.X = Job->BrickRegion.OriginVx / int32(VoxelGpuChunkRegion::kChunkEdgeVoxels);
 		Job->BrickKey.Y = Job->BrickRegion.OriginVy / int32(VoxelGpuChunkRegion::kChunkEdgeVoxels);
 		Job->BrickKey.Z = Job->BrickRegion.BrickZMin / int32(VoxelGpuChunkRegion::kInteriorBricks);
-		// Ceiling 6 (was a stale literal 5 from the six-level world): a level-6
-		// brick region keyed as level 5 collides with the true level-5 chunk at
-		// the same coordinates -- one overwrites the other in the pool and the
-		// march index, a wrong world with no error anywhere.
-		Job->BrickKey.Level = FMath::Clamp(Job->BrickRegion.CoarseLevel, 0, 6);
+		// DERIVED CEILING, THIRD STRIKE (2026-09-02). This clamp has now shipped
+		// the same bug twice: a stale literal 5 keyed level-6 regions as level
+		// 5 in the six-level world, and the stale literal 6 that replaced it
+		// keyed every LEVEL-7 brick region as level 6 in the 8-ring cascade --
+		// ~3,000 phantom L6 pool entries per vista carrying L7 coordinates,
+		// aliasing onto true L6 index cells 128 chunks away (the owner's grey
+		// slabs: rays drew 26-km-distant content over the near rings), while
+		// the true L7 keys read no-geometry. A mis-keyed level collides in the
+		// pool and the march index with the true chunk at the same coordinates
+		// -- one overwrites the other, a wrong world with no error anywhere.
+		// The ceiling is the INDEX'S OWN level count now, so the next cascade
+		// resize moves it or fails to compile, never silently re-keys.
+		Job->BrickKey.Level = FMath::Clamp(Job->BrickRegion.CoarseLevel, 0,
+		                                   int32(FVoxelMarchChunkIndex::kLevels) - 1);
 		// Latched with the key, from the same region, for the same reason: the
 		// record is written at completion and the game thread that sampled this
 		// is long gone by then.
@@ -2585,6 +2598,32 @@ void FVoxelGpuMeshJobManager::Tick()
 	int32 DemandPromoted = 0;
 	int32 DemandPassFree = 0;
 	int32 LowPriorityPromoted = 0;
+
+	// M10: WHY THE LOOP STOPPED, LATCHED WHERE IT STOPS.
+	//
+	// This used to be reconstructed from the world's state AFTER the loop, and
+	// the reconstruction could not see the difference between the three
+	// allowances -- so it called all of them "quota", printed that under a label
+	// naming MeshBatchCap, and a tick that was really "speculation is switched
+	// off" (SpecBatchCap == 0) came out as a MeshBatchCap wall. There is no
+	// derivation that can recover that distinction from the post-loop state,
+	// because bDemandCanRun/bLowCanRun/bHeadPassFree do not survive the break.
+	// So the break records its own reason and nothing downstream infers one.
+	//
+	// InFlight is the DEFAULT because it is the exit that takes no break: the
+	// while-condition failing (including failing on the very first evaluation,
+	// when the manager was already at depth before this tick) is exactly the
+	// in-flight bound, and leaving the latch alone is the truthful record of it.
+	enum class EPromoteExit : uint8
+	{
+		InFlight,    // the while-condition failed: InFlight+Batch >= MaxInFlight
+		BatchCap,    // demand head queued, DemandPromoted >= BatchCap
+		PassFreeCap, // pass-free demand head, DemandPassFree >= PassFreeCap
+		SpecCap,     // demand dry, low-priority queued, LowPriorityPromoted >= SpecBatchCap
+		Empty,       // both queues empty
+	};
+	EPromoteExit PromoteExit = EPromoteExit::InFlight;
+
 	while (InFlight.Num() + Batch.Num() < MaxInFlight)
 	{
 		// Demand first, always, while it has both work and allowance.
@@ -2615,6 +2654,40 @@ void FVoxelGpuMeshJobManager::Tick()
 		const bool bLowCanRun = QueuedLowPriority.Num() > 0 && LowPriorityPromoted < SpecBatchCap;
 		if (!bDemandCanRun && !bLowCanRun)
 		{
+			// M10: name the allowance that actually ran out, not "quota".
+			//
+			// DEMAND FIRST, because the loop serves demand first: when both a
+			// demand head and a low-priority head are blocked in the same tick,
+			// the demand allowance is the one strict priority would have spent,
+			// so it is the binding one and low-priority is behind it either way.
+			// Reporting both would double-count against ticks= and break the
+			// sum==ticks equality that is this line's engagement proof.
+			//
+			// bHeadPassFree is only ever true with Queued non-empty AND
+			// PassFreeCap > 0 (see the head test above), so passFreeCap= cannot
+			// fire on a leg where the pass-free path is not armed -- it reads 0,
+			// which is "not armed", and batchCap= carries those ticks instead.
+			if (Queued.Num() > 0)
+			{
+				PromoteExit = bHeadPassFree ? EPromoteExit::PassFreeCap
+				                            : EPromoteExit::BatchCap;
+			}
+			else if (QueuedLowPriority.Num() > 0)
+			{
+				// Includes SpecBatchCap == 0. That is "speculation is off", and the
+				// old line called it QUOTA-bound at MeshBatchCap -- the single
+				// worst reading this counter produced.
+				PromoteExit = EPromoteExit::SpecCap;
+			}
+			else
+			{
+				// Unreachable as written (one of the two queues must be non-empty
+				// for both can-run flags to be false without the queues being
+				// empty), and recorded rather than asserted so a future edit that
+				// makes it reachable shows up as starvation on the line instead of
+				// as a crash in a shipping build.
+				PromoteExit = EPromoteExit::Empty;
+			}
 			break;
 		}
 		const bool bTakeLowPriority = !bDemandCanRun;
@@ -2832,23 +2905,30 @@ void FVoxelGpuMeshJobManager::Tick()
 		}
 	}
 
-	// WHY THE PROMOTE LOOP STOPPED. Three counters, evaluated once per tick,
-	// and they are the manager's own version of the streaming side's
-	// exitCap=/exitEmpty= pair -- which the handoff's standing rule says must
-	// be read together with dispatched/drained. Order matters: the cap is
-	// checked first because the loop condition is what enforces it, and a tick
-	// that hit the cap may ALSO have work left queued.
-	if (InFlight.Num() + Batch.Num() >= MaxInFlight)
+	// WHY THE PROMOTE LOOP STOPPED. FIVE counters, exactly one incremented per
+	// tick, and they are the manager's own version of the streaming side's
+	// exitCap=/exitEmpty= pair -- which the handoff's standing rule says must be
+	// read together with dispatched/drained.
+	//
+	// M10: NOTHING IS RE-DERIVED HERE ANY MORE. The old block asked the
+	// post-loop world three questions and answered a fourth: it tested
+	// `InFlight+Batch >= MaxInFlight` and printed the answer as `cap=` (it is
+	// the DEPTH bound, not any per-tick cap), then tested "some queue is
+	// non-empty" and printed THAT as `quota=` under a label naming MeshBatchCap,
+	// which silently absorbed the pass-free budget and the speculation cap --
+	// the latter reading every tick as a MeshBatchCap wall whenever speculation
+	// was simply off. The reason is now latched at the break; this switch only
+	// records it.
+	//
+	// EXACTLY ONE ++ PER TICK, which is what makes the sum==ticks= equality on
+	// the log line a real check rather than a decoration.
+	switch (PromoteExit)
 	{
-		++JobCost.PromoteExitCap;
-	}
-	else if (Queued.Num() > 0 || QueuedLowPriority.Num() > 0)
-	{
-		++JobCost.PromoteExitQuota;
-	}
-	else
-	{
-		++JobCost.PromoteExitEmpty;
+	case EPromoteExit::InFlight:    ++JobCost.PromoteExitInFlight;    break;
+	case EPromoteExit::BatchCap:    ++JobCost.PromoteExitBatchCap;    break;
+	case EPromoteExit::PassFreeCap: ++JobCost.PromoteExitPassFreeCap; break;
+	case EPromoteExit::SpecCap:     ++JobCost.PromoteExitSpecCap;     break;
+	case EPromoteExit::Empty:       ++JobCost.PromoteExitEmpty;       break;
 	}
 
 	// --- Tier B.1: turn the sweeps into fused stack dispatches --------------
@@ -3625,15 +3705,30 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 //  * bytesSaved=0 with assetMove>0: the moves ran and there was nothing to
 //    move (no assets on this leg). The switch is not broken; the leg has no
 //    asset traffic, and this collapse cannot be credited with anything.
-//  * promoteExit all three near zero: the promote loop did not run. Broken
+//  * promoteExit exits= disagreeing with ticks=: the accounting is broken and
+//    the five shares below MUST NOT be read. A Warning is emitted beside it.
+//    (M10 renamed these on 2026-09-02: the old `cap=` counted the IN-FLIGHT
+//    depth bound and the old `quota=` counted THREE different allowances at
+//    once, including "speculation is off". Any note or sweep quoting
+//    `promoteExit cap=`/`quota=` predates the split and is about a number that
+//    did not mean what it said.)
+//  * promoteExit all five near zero: the promote loop did not run. Broken
 //    instrument, not a healthy manager.
-//  * promoteExit cap= dominating: DEPTH-bound. Read `drained` on the streaming
-//    side BEFORE believing it -- the 90,000-deep backlog is what makes a cap
-//    reading a trap, and raising a cap in front of a starved drain makes it
-//    strictly worse.
-//  * promoteExit quota= dominating: QUOTA-bound at MeshBatchCap with work
-//    queued. The per-tick promotion allowance is the limit; neither depth nor
-//    the GPU is.
+//  * promoteExit inflight= dominating: DEPTH-bound at MaxInFlight. Read
+//    `drained` on the streaming side BEFORE believing it -- the 90,000-deep
+//    backlog is what makes a depth reading a trap, and raising a cap in front
+//    of a starved drain makes it strictly worse.
+//  * promoteExit batchCap= dominating: QUOTA-bound at MeshBatchCap with demand
+//    still queued. The per-tick promotion allowance is the limit; neither
+//    depth nor the GPU is. This is the ONLY reading a MeshBatchCap sweep may
+//    be gated on.
+//  * promoteExit passFreeCap= dominating: the WORKLIST consume budget is the
+//    limit, not MeshBatchCap. Read the wlclaim line's per-flush budget; raising
+//    MeshBatchCap cannot move this and never could.
+//  * promoteExit specCap= dominating: demand is dry every tick and speculation
+//    is what is capped. Check voxel.GPU.MeshSpecCap FIRST -- at 0 this reads
+//    100% and means "speculation is switched off", which is a configuration
+//    fact and not a throughput wall.
 //  * promoteExit empty= dominating with inFlight low: STARVED. Nothing in this
 //    manager is the limit; the producer upstream is.
 //  * residSamples=0 while promoted>0: jobs are being promoted and never
@@ -3652,12 +3747,13 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 //  * passFreeOverCap=0 with -VoxelGpuJobLean armed: half four converted
 //    NOTHING -- either no job is claim-fed (check the worklist wlclaim line's
 //    conv=) or MeshBatchCap was never the binding constraint on this leg
-//    (check promoteExit quota=). Both are findings; neither is a green light,
+//    (check promoteExit batchCap=). Both are findings; neither is a green light,
 //    and no throughput difference between arms is attributable until this
 //    number is non-zero.
 //  * passFreeOverCap large while the measured fork rate does not move: the cap
-//    was not the wall. Read promoteExit again -- it will now say which of
-//    depth, quota or starvation replaced it.
+//    was not the wall. Read promoteExit again -- since M10 it names which of
+//    in-flight depth, MeshBatchCap, the worklist budget, the spec cap or
+//    starvation replaced it, rather than folding the middle three into one.
 //  * leanPromoteSkip=0 with -VoxelGpuJobLean armed: half three converted
 //    nothing; same four preconditions as the asset move.
 //  * revalSkip=0 with -VoxelGpuJobLean armed: something LEFT the pool's
@@ -3714,6 +3810,15 @@ void FVoxelGpuMeshJobManager::MaybeLogJobCostWindow()
 		? (double(MaxInFlight) / MeanResidencyTicks) * TicksPerSec
 		: 0.0;
 
+	// M10 ENGAGEMENT PROOF. The five promote-exit reasons are exclusive and
+	// exhaustive and exactly one is charged per Tick(), so this MUST equal
+	// ticks=. Printed as exits=N/ticks so the check is on the line itself and
+	// not something a reader has to do with a calculator -- and it is a check
+	// that CAN come out the other way, which is the only kind worth printing.
+	const int64 PromoteExitSum = JobCost.PromoteExitInFlight + JobCost.PromoteExitBatchCap
+		+ JobCost.PromoteExitPassFreeCap + JobCost.PromoteExitSpecCap
+		+ JobCost.PromoteExitEmpty;
+
 	UE_LOG(LogVoxelGpuMeshJob, Log,
 	       TEXT("[gpu-jobcost] submits=%lld subUs=%.2f (hdr %.2f + brick %.2f + queue %.2f, ")
 	       TEXT("drift %.3fms) | copyPerChunk rasterB=%.0f assetB=%.0f | ticks=%lld ")
@@ -3723,7 +3828,8 @@ void FVoxelGpuMeshJobManager::MaybeLogJobCostWindow()
 	       TEXT("bytesSaved=%lld revalSkip=%lld revalRan=%lld leanPromoteSkip=%lld/%lld ")
 	       TEXT("passFree=%lld overCap=%lld")
 	       TEXT(" || FLOW qDemand=%.0f qLow=%.0f inFlight=%.0f/max %d/cap %d ")
-	       TEXT("promoteExit cap=%lld quota=%lld empty=%lld | residTicks=%.2f n=%lld ")
+	       TEXT("promoteExit inflight=%lld batchCap=%lld passFreeCap=%lld specCap=%lld ")
+	       TEXT("empty=%lld exits=%lld/%lld ticks | residTicks=%.2f n=%lld ")
 	       TEXT("tickHz=%.1f CEILING=%.0f/s | shellsTaken=%lld poolReplaced=%lld (%.1f%%)"),
 	       JobCost.Submits,
 	       (JobCost.SubmitTotalMs * 1000.0) / SubN,
@@ -3750,12 +3856,31 @@ void FVoxelGpuMeshJobManager::MaybeLogJobCostWindow()
 	       double(JobCost.QueueLowSum) / TickN,
 	       double(JobCost.InFlightSum) / TickN,
 	       JobCost.InFlightMax, MaxInFlight,
-	       JobCost.PromoteExitCap, JobCost.PromoteExitQuota, JobCost.PromoteExitEmpty,
+	       JobCost.PromoteExitInFlight, JobCost.PromoteExitBatchCap,
+	       JobCost.PromoteExitPassFreeCap, JobCost.PromoteExitSpecCap,
+	       JobCost.PromoteExitEmpty, PromoteExitSum, JobCost.Ticks,
 	       MeanResidencyTicks, JobCost.ResidencySamples,
 	       TicksPerSec, CeilingPerSec,
 	       JobCost.ShellsTaken, JobCost.PoolReplaced,
 	       JobCost.ShellsTaken > 0
 	           ? 100.0 * double(JobCost.PoolReplaced) / double(JobCost.ShellsTaken) : 0.0);
+
+	// M10's falsifier, and it is the reason the sum is printed at all. If an
+	// exit path is ever added to the promote loop without a counter, or a
+	// counter is charged twice, this fires -- instead of the line quietly
+	// redistributing the missing ticks across the five shares and reading
+	// plausible. Warning, not Log, because every share above is void when it
+	// trips.
+	if (PromoteExitSum != JobCost.Ticks)
+	{
+		UE_LOG(LogVoxelGpuMeshJob, Warning,
+		       TEXT("[gpu-jobcost] promoteExit accounting is BROKEN: the five exit reasons ")
+		       TEXT("sum to %lld over %lld ticks. Exactly one reason is charged per Tick(), ")
+		       TEXT("so a mismatch means the promote loop grew an exit with no counter (or ")
+		       TEXT("charges one twice). EVERY promoteExit share on this line is void until ")
+		       TEXT("this reads equal."),
+		       PromoteExitSum, JobCost.Ticks);
+	}
 
 	if (VoxelGpuJobLeanEnabled() && JobCost.Submits > 0 && JobCost.LeanAssetMoves == 0)
 	{

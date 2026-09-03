@@ -2723,6 +2723,19 @@ int32 FVoxelBrickPool::AddChunkFromCpu(const FVoxelBrickCpuPackRef& Pack,
 	return int32(Chunk.ChunkSlot);
 }
 
+bool FVoxelBrickPool::DebugFindSlotOwner(int32 ChunkSlot, FVoxelBrickChunkKey& OutKey) const
+{
+	for (const auto& Pair : Resident)
+	{
+		if (Pair.Value.ChunkSlot == ChunkSlot)
+		{
+			OutKey = Pair.Key;
+			return true;
+		}
+	}
+	return false;
+}
+
 bool FVoxelBrickPool::RemoveChunk(const FVoxelBrickChunkKey& Key)
 {
 	FResidentChunk* Found = Resident.Find(Key);

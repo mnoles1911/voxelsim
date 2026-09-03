@@ -233,6 +233,13 @@ namespace
 	// TERM_CHUNK_CAP and produces nothing. voxel.March.StepBudget cannot stop
 	// it: its only consumer sits INSIDE the brick loop and an empty ray never
 	// reaches a brick.
+	//
+	// ADDENDUM 2026-09-02 (the altitude fix): the per-rung vertical reach
+	// clamp (VOXEL_MARCH_PACK_ZREACH_VOXELS, VoxelBrickTraverse.ush) now
+	// bounds every rung's vertical walk to ~128 chunks and hands the tail to
+	// a coarser rung, so the cap-and-produce-nothing behaviour this note
+	// describes is structural history; the measurements stand as the record
+	// of why the Z direction needed a bound at all.
 	TAutoConsoleVariable<int32> CVarVoxelMarchZCut(
 		TEXT("voxel.March.ZCut"), 0,
 		TEXT("THE RESIDENT-Z BOUND. 0 = off, THE CONTROL, and the default. 1 = before walking a ")
@@ -359,9 +366,17 @@ namespace
 	//       rescale / walk call, on rung 1 AND on every fallthrough retry
 	//       rung at its own coarser level.
 	TAutoConsoleVariable<int32> CVarVoxelMarchZTight(
-		TEXT("voxel.March.ZTight"), 0,
-		TEXT("THE TIGHT RESIDENT-Z GATE, the repaired ZCut. 0 = off, THE CONTROL, and the ")
-		TEXT("default. 1 = before ANY setup of a ring-segment rung at level L (BeginLevel, ")
+		TEXT("voxel.March.ZTight"), 1,
+		TEXT("THE TIGHT RESIDENT-Z GATE, the repaired ZCut. DEFAULT ON since 2026-09-02: ")
+		TEXT("armed via ExecCmds on the A/B (CAP-Q off vs CAP-S on, same build) it ")
+		TEXT("measured 256 -> 65 ms frame, 15x fewer probes, 4x hits, stale 70.8% -> 0.00%. ")
+		TEXT("The CAP-T/U/V 'wedge' (default-armed legs drew NOTHING) was NOT this gate: it ")
+		TEXT("was the index-corruption pair fixed the same day (the L6/L7 admission sentinel ")
+		TEXT("and the L7-keyed-as-L6 brick jobs) starving the slab of resident Z. On the ")
+		TEXT("fixed binary the same deferred-arm path renders a full correct vista ")
+		TEXT("(CAP-AY-ZTIGHT). The 10 s arm defer below is retained as the proven timing. ")
+		TEXT("0 = off, THE CONTROL. ")
+		TEXT("1 = before ANY setup of a ring-segment rung at level L (BeginLevel, ")
 		TEXT("rescale, ZCut, walk call), test the segment's z-span -- two mads -- against a ")
 		TEXT("TIGHT per-level resident-Z slab; disjoint means the rung is NEVER ENTERED and ")
 		TEXT("its absent-chunk debt is synthesized exactly (the fold's exactness arguments ")
@@ -894,9 +909,9 @@ TEXT("voxel.March.SkyLadder"), 0,
 	TAutoConsoleVariable<int32> CVarVoxelMarchRingCount(
 		TEXT("voxel.March.RingCount"), 0,
 		TEXT("How many rings the cascade walks. 0 (default) = FOLLOW THE STREAMING CASCADE ")
-		TEXT("(GetMaxRingLevel()+1, via FVoxelMarchChunkIndex::GetStreamedRingLevels) -- 6 on a ")
-		TEXT("default run, 7 under -VoxelMaxRingLevel=6, so the 8 km ring cannot stream without ")
-		TEXT("being walked. Explicit 1..7 overrides for measurement; 2 is the B-2b-1 ")
+		TEXT("(GetMaxRingLevel()+1, via FVoxelMarchChunkIndex::GetStreamedRingLevels) -- 8 on a ")
+		TEXT("default run (the full 8,192 m cascade), so a streamed ring cannot stream without ")
+		TEXT("being walked. Explicit 1..8 overrides for measurement; 2 is the B-2b-1 ")
 		TEXT("configuration that proved the mechanism (0-128 / 128-256 m). Clamped to the ")
 		TEXT("levels the chunk index actually carries -- asking for more would walk a level with ")
 		TEXT("no grid behind it, which reads as empty space rather than as an error.\n")
@@ -1882,8 +1897,34 @@ FVoxelMarchArm VoxelMarchGetArm()
 	// THE TIGHT RESIDENT-Z GATE. Rings only (the hoisted test is the ring
 	// walk's rung prologue and nothing else reads the define), matching the
 	// refused permutation.
+	// DEFERRED ARM -- THE COLD-START WEDGE, measured 2026-09-02. With the cvar
+	// defaulted to 1 (armed at frame 0, before the pool/index/reduce state
+	// machine exists) the marcher drew NOTHING for an entire 7-minute leg:
+	// CAP-T-REMEDY, hits=0 of 82.9M rays, image empty of voxels -- while the
+	// IDENTICAL binary with the cvar flipped by -ExecCmds a few seconds after
+	// BeginPlay (CAP-S-ZTIGHT) measured 10.3M hits, stale 0.00%, and the
+	// 256 -> 65 ms frame the arm exists for.
+	//
+	// THE 'LATCH' AUTOPSY (2026-09-02): the earlier boot/deferred-arm wedge
+	// (CAP-T/U/V, hits=0 whole legs) was not a latch in the slab pipeline at
+	// all -- it was the index-corruption pair fixed the same day (the L6/L7
+	// admission decline sentinel, then L7 brick jobs level-clamped into L6
+	// cells) leaving the slab reduction with no valid resident Z to reduce
+	// over. On the fixed binary the SAME deferred-arm path draws a full
+	// correct vista (CAP-AY-ZTIGHT), so the gate ships default-on.
+	//
+	// The ~10 s defer is KEPT: it is the timing every healthy leg actually
+	// exercised, and the fill's first seconds are loading screen anyway, so
+	// it costs nothing visible. Arming at t=0 exactly is the one variant
+	// never proven -- retire the defer only with its own leg as evidence.
+	// Setting the cvar to 0 still disables outright; ExecCmds still works
+	// unchanged (the delay only applies to the compiled default's first 10 s).
+	static const double ZTightArmAtSeconds = FPlatformTime::Seconds() + 10.0;
 	Arm.ZTight =
-		(Arm.bRings && CVarVoxelMarchZTight.GetValueOnAnyThread() != 0) ? 1 : 0;
+		(Arm.bRings && CVarVoxelMarchZTight.GetValueOnAnyThread() != 0 &&
+		 FPlatformTime::Seconds() >= ZTightArmAtSeconds)
+			? 1
+			: 0;
 	Arm.Bound = (Arm.bRings && !Arm.bSkyLadder && Arm.ZTight == 0 &&
 	             CVarVoxelMarchBound.GetValueOnAnyThread() != 0)
 	                ? 1
@@ -2458,6 +2499,57 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 					            "never leaves a ~118 m slab; ZCut's own null), and only "
 					            "the sky/down poses price this arm."),
 					       (unsigned long long)ZtConsulted);
+				}
+			}
+		}
+		// ---- THE Z LADDER (the altitude fix, 2026-09-02) ------------------
+		//
+		// Engagement plus the one FINDING: tailLost must be zero at every
+		// pose inside the frame's Z budget. Printed from the same drained
+		// window as every group above; a zero on an unarmed or unmeasured
+		// window is worded as such, never as "no tails lost".
+		{
+			const FVoxelMarchHoleStats LW = VoxelMarchPeekLastHoleWindow();
+			if (!LW.bArmed || LW.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("  zladder: NOT MEASURED (%s)."),
+				       !LW.bArmed ? TEXT("voxel.March.HoleStats is 0")
+				                  : TEXT("armed, no readback has landed yet"));
+			}
+			else
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("  zladder: rungs=%llu clamped=%llu (%.2f%%) resumed=%llu ")
+				       TEXT("tailLost=%llu over %llu frames"),
+				       (unsigned long long)LW.ZLadderRungs,
+				       (unsigned long long)LW.ZLadderClamped,
+				       LW.ZLadderRungs > 0
+				           ? 100.0 * double(LW.ZLadderClamped) / double(LW.ZLadderRungs)
+				           : 0.0,
+				       (unsigned long long)LW.ZLadderResumed,
+				       (unsigned long long)LW.ZLadderTailLost,
+				       (unsigned long long)LW.Frames);
+				if (LW.bZLadderArmed && LW.ZLadderRungs == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("  zladder: ARMED AND INERT -- rings + fallthrough are ")
+					       TEXT("selected and the clamp was consulted ZERO times over %llu ")
+					       TEXT("measured frames. No altitude reading on this leg means ")
+					       TEXT("anything; grep VOXEL_MARCH_PACK_ZREACH_VOXELS in ")
+					       TEXT("VoxelBrickTraverse.ush before looking anywhere else."),
+					       (unsigned long long)LW.Frames);
+				}
+				if (LW.ZLadderTailLost > 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("  zladder: %llu rays LOST AN UNWALKED TAIL -- the ladder ")
+					       TEXT("ran out of levels with segment left. Inside the frame's Z ")
+					       TEXT("budget this is a REGRESSION FINDING (a hole the image ")
+					       TEXT("gate should also show), not a statistic: expect top-level ")
+					       TEXT("step-budget exhaustion or a -VoxelRingCount override, and ")
+					       TEXT("read the startup Z-budget line before anything else."),
+					       (unsigned long long)LW.ZLadderTailLost);
 				}
 			}
 		}
@@ -5015,6 +5107,11 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// without rings, without a fallthrough depth, and under the sky ladder,
 	// so this can never report "armed" for a kernel that contains no probe.
 	Out.bRungProbeArmed = Arm.RungProbe != 0;
+	// FROM THE ARM, the same permutation rule: the vertical reach clamp and
+	// the structural continuation compile only under rings with a
+	// fallthrough depth, so the raw cvars would read "armed" for a kernel
+	// that contains neither.
+	Out.bZLadderArmed = Arm.bRings && Arm.Fallthrough > 0;
 	// FROM THE ARM, for the reason bBlockSkipArmed is: VoxelMarchGetArm already
 	// forces the mode to 0 when the permutation is off, so this can never report
 	// a licence the kernel has no code for.
@@ -5039,6 +5136,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	const bool bBlockSkipArmed = Out.bBlockSkipArmed;
 	const bool bZTightArmed = Out.bZTightArmed;
 	const bool bRungProbeArmed = Out.bRungProbeArmed;
+	const bool bZLadderArmed = Out.bZLadderArmed;
 	const bool bCensusArmed = Out.bCensusArmed;
 	const int32 BlockSkyMode = Out.BlockSkyMode;
 	// The height field's flags and census are NOT part of the accumulated
@@ -5053,6 +5151,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	Out.bBlockSkipArmed = bBlockSkipArmed;
 	Out.bZTightArmed = bZTightArmed;
 	Out.bRungProbeArmed = bRungProbeArmed;
+	Out.bZLadderArmed = bZLadderArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	Out.bHeightArmed = HeightSide.bHeightArmed;
@@ -5305,6 +5404,8 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	const bool bZTightArmed = Arm.ZTight != 0;
 	// See the drain: the arm, same permutation rule.
 	const bool bRungProbeArmed = Arm.RungProbe != 0;
+	// See the drain: the arm, same permutation rule (rings + fallthrough).
+	const bool bZLadderArmed = Arm.bRings && Arm.Fallthrough > 0;
 	// See the drain: the census rides the hole-stats permutation itself.
 	const bool bCensusArmed = Arm.bHoleStats;
 	const int32 BlockSkyMode = Arm.BlockSkyMode;
@@ -5320,6 +5421,7 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	Out.bBlockSkipArmed = bBlockSkipArmed;
 	Out.bZTightArmed = bZTightArmed;
 	Out.bRungProbeArmed = bRungProbeArmed;
+	Out.bZLadderArmed = bZLadderArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	return Out;
@@ -5338,6 +5440,13 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchViewParameters, )
 	SHADER_PARAMETER(FMatrix44f, MarchViewToTranslatedWorld)
 	SHADER_PARAMETER(FVector3f, MarchRayOriginLocalUU)
 	SHADER_PARAMETER(float, MarchVolumeExtentUU)
+	// The volume's Z EXTENT, full height (the altitude fix, 2026-09-02).
+	// Equal to MarchVolumeExtentUU on every non-ring path; under rings it is
+	// derived from kVoxelMarchAltitudeReachVoxels so a 10 km camera still has
+	// the ground inside its frame. Rides THIS struct for the struct's own
+	// reason: the march and the emit must clip the SAME cube, or the emit
+	// reconstructs rays the march never ran.
+	SHADER_PARAMETER(float, MarchVolumeExtentZUU)
 	SHADER_PARAMETER(FVector2f, MarchViewRectMin)
 	SHADER_PARAMETER(FVector2f, MarchViewRectSize)
 	SHADER_PARAMETER(FVector2f, MarchInvProjDiag)
@@ -6308,6 +6417,14 @@ class FVoxelMarchCS : public FGlobalShader
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_TILE_SIZE"), kVoxelMarchTileSize);
+		// THE COVER LEVEL, PUSHED FROM THE C++ AUTHORITY. This was a hand
+		// mirror in VoxelBrickTraverse.ush and it drifted: the .ush said 7
+		// while both C++ spellings said 11, so an R7 terrain hit took the
+		// cover branch (5 cm voxel size, doubled pack origin) and real cover
+		// records failed level validation. The .ush keeps only an
+		// offline-tooling fallback now; this define is the live value.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_COVER_LEVEL"),
+		                         FVoxelMarchChunkIndex::kCoverLevel);
 		// The hole-stats word layout, pushed from the ONE enum in the header
 		// rather than restated in the .usf -- see VoxelMarchHoleWord for the
 		// incident (silently-discarded out-of-range writes reading back as
@@ -6343,6 +6460,11 @@ class FVoxelMarchCS : public FGlobalShader
 		// class rather than trusted.
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNC_LEVEL0"),
 		                         int32(VoxelMarchHoleWord::UncLevelFirst));
+		// Per-grid-slot stale/real (2026-09-02, the vista-kill discriminator).
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_STALE_GRID0"),
+		                         int32(VoxelMarchHoleWord::StaleGridFirst));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_REAL_GRID0"),
+		                         int32(VoxelMarchHoleWord::RealGridFirst));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNC_REASON0"),
 		                         int32(VoxelMarchHoleWord::UncReasonFirst));
 		// The resident-Z bound's engagement trio (voxel.March.ZCut), pushed
@@ -6499,6 +6621,15 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchRayBoundWord::RungWalked));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RP_BITS"),
 		                         int32(VoxelMarchRayBoundWord::RungProbeBits));
+		// The Z ladder's engagement quad (the altitude fix, 2026-09-02).
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZL_RUNGS"),
+		                         int32(VoxelMarchHoleWord::ZLadderRungs));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZL_CLAMPED"),
+		                         int32(VoxelMarchHoleWord::ZLadderClamped));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZL_RESUMED"),
+		                         int32(VoxelMarchHoleWord::ZLadderResumed));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZL_TAILLOST"),
+		                         int32(VoxelMarchHoleWord::ZLadderTailLost));
 		// WORDS covers the appended census -- VoxelMarchRayBoundWord::End, not
 		// the enum's Count, while the census lives outside the enum. Every
 		// sizing of the stats buffer (create, copy, lock) reads End too.
@@ -6589,8 +6720,11 @@ static_assert(int32(VoxelMarchHoleWord::HeightConsulted) -
 // displaced would keep printing a plausible number -- which is the incident
 // VoxelMarchHoleWord's own note records and the reason none of these layouts
 // may be mirrored by hand.
+// 42 = the height group's 14, the per-grid-slot stale/real groups (12 + 12
+// words, 2026-09-02), and the Z ladder's engagement quad (4 words, appended
+// later on 2026-09-02 with the altitude fix).
 static_assert(int32(VoxelMarchHoleWord::Count) -
-                      int32(VoxelMarchHoleWord::HeightConsulted) == 14,
+                      int32(VoxelMarchHoleWord::HeightConsulted) == 42,
               "the height pyramid's engagement group is not fourteen words, or something "
               "was appended after it without repointing this assert at the new group's "
               "first word. If you added a counter to the height walk it needs a word of "
@@ -6642,15 +6776,23 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelMarchCS, VOXEL_MARCH_USF, "VoxelMarchMain", SF_Com
 // them, and ONLY where the level's Count word is non-zero.
 namespace VoxelMarchZTightWord
 {
+	// GROUP STRIDE IS THE RING COUNT, DERIVED, NOT A LITERAL. This enum
+	// carried hand-written strides of 7 (0/7/14/21) while kRingGrids was 11:
+	// the kernel writes MinInvFirst + L for L up to kRingGrids-1, so levels
+	// 7..10 overran into the NEXT group -- level words corrupting Max words
+	// corrupting Count words, with every readback field individually healthy.
+	// The pinning static_asserts checked the literals against each other, not
+	// against the ring count, so nothing fired. Same drift shape as
+	// VOXEL_MARCH_COVER_LEVEL and the marcher ring clamp; same fix -- derive.
 	enum
 	{
-		MinInvFirst = 0,             // + level 0..6: max over ~enc(chunkZ)
-		MaxFirst = 7,                // + level 0..6: max over enc(chunkZ)
-		CountFirst = 14,             // + level 0..6: live validated records
-		Phantoms = 21,               // non-zero records failing validation
-		Live = 22,                   // records that widened some level
-		Cover = 23,                  // cover-level records (never gate rings)
-		Examined = 24,               // slots processed -- the dispatch check
+		MinInvFirst = 0,                                                // + level: max over ~enc(chunkZ)
+		MaxFirst = int32(FVoxelMarchChunkIndex::kRingGrids),            // + level: max over enc(chunkZ)
+		CountFirst = 2 * int32(FVoxelMarchChunkIndex::kRingGrids),      // + level: live validated records
+		Phantoms = 3 * int32(FVoxelMarchChunkIndex::kRingGrids),        // non-zero records failing validation
+		Live,                        // records that widened some level
+		Cover,                       // cover-level records (never gate rings)
+		Examined,                    // slots processed -- the dispatch check
 		End
 	};
 }
@@ -6716,16 +6858,22 @@ class FVoxelMarchZTightReduceCS : public FGlobalShader
 		                         int32(VoxelMarchZTightWord::Examined));
 	}
 };
-// The three per-level groups are contiguous [level 0..6] blocks the shader
-// indexes as base + level; spelled as an assert rather than trusted, the
-// histogram-bucket rule.
+// The three per-level groups are contiguous [level 0..kRingGrids-1] blocks the
+// shader indexes as base + level; the stride is DERIVED from kRingGrids in the
+// enum itself (it was a hand-written 7 that silently overran when the ring
+// count grew), so this assert now checks the derivation held rather than
+// pinning literals against each other.
 static_assert(int32(VoxelMarchZTightWord::MaxFirst) ==
-                      int32(VoxelMarchZTightWord::MinInvFirst) + 7 &&
+                      int32(VoxelMarchZTightWord::MinInvFirst) +
+                          int32(FVoxelMarchChunkIndex::kRingGrids) &&
                   int32(VoxelMarchZTightWord::CountFirst) ==
-                      int32(VoxelMarchZTightWord::MaxFirst) + 7 &&
+                      int32(VoxelMarchZTightWord::MaxFirst) +
+                          int32(FVoxelMarchChunkIndex::kRingGrids) &&
                   int32(VoxelMarchZTightWord::Phantoms) ==
-                      int32(VoxelMarchZTightWord::CountFirst) + 7 &&
-                  int32(VoxelMarchZTightWord::End) == 25,
+                      int32(VoxelMarchZTightWord::CountFirst) +
+                          int32(FVoxelMarchChunkIndex::kRingGrids) &&
+                  int32(VoxelMarchZTightWord::End) ==
+                      3 * int32(FVoxelMarchChunkIndex::kRingGrids) + 4,
               "the ZTight reduce's word groups drifted from base+level indexing, or its "
               "buffer size changed without every reader (kernel defines, landing decode, "
               "readback byte count) moving together -- they all read THIS enum.");
@@ -6736,7 +6884,7 @@ static_assert(int32(VoxelMarchZTightWord::MaxFirst) ==
 static_assert(int32(FVoxelMarchChunkIndex::kRingGrids) ==
                   int32(VoxelMarchHoleWord::kNumLevels),
               "the ZTight reduce assumes the ring-grid count and the hole metric's level "
-              "count are the same 7; they diverged, so the reduce's fixed 7-pair layout "
+              "count agree; they diverged, so the reduce's derived word layout "
               "and FVoxelMarchState::kZTightLevels must be re-derived, not patched.");
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchZTightReduceCS, VOXEL_MARCH_ZTIGHT_USF,
@@ -7266,11 +7414,28 @@ struct FVoxelMarchRingSpec
 	float OuterUU(int32 L) const { return Ring0OuterUU * float(1 << L); }
 };
 
-// Seven rings to 8.19 km (level 6 landed 2026-08-23). Mirrors
-// VOXEL_MARCH_MAX_RINGS in VoxelBrickTraverse.ush and
+// EIGHT rings to 8,192 m -- the full cascade (owner's 8-ring design,
+// 2026-09-02). Mirrors VOXEL_MARCH_MAX_RINGS in VoxelBrickTraverse.ush and
 // FVoxelMarchChunkIndex::kLevels; all three must agree or the marcher walks a
 // level the index does not carry.
-static constexpr int32 kVoxelMarchMaxRings = 7;
+//
+// TWO LESSONS ARE PRICED INTO THIS CONSTANT:
+// * It sat at 7 while the cascade streamed 11 levels, pinning the marcher's
+//   reach at OuterUU(6) = 4,096 m -- far terrain streamed, resident, and
+//   never walked ("terrain for a few kilometers, then a flat plane"). NINE
+//   data-side fixes measured null before this was found: a renderer that
+//   cannot reach the data makes every data fix invisible. Hence the
+//   static_assert below rather than a comment asking for agreement.
+// * The assert is <=, not ==, deliberately: walking FEWER rings than are
+//   streamed only costs draw distance (a valid measurement arm); walking MORE
+//   than the index carries draws nothing and looks like missing terrain.
+static constexpr int32 kVoxelMarchMaxRings = 8;
+static_assert(kVoxelMarchMaxRings <= int32(FVoxelMarchChunkIndex::kLevels),
+              "Marcher ring count must not exceed the chunk index's level count. If the "
+              "marcher walks a level the index does not carry it draws nothing there; if the "
+              "index carries levels the marcher will not walk, that terrain is streamed and "
+              "paid for and never drawn -- which looks exactly like missing terrain rather "
+              "than a renderer limit, and cost nine falsified arms to find.");
 
 // ===========================================================================
 // CAN A RAY ARITHMETICALLY REACH THE RING WE CLAIM TO BE MEASURING?
@@ -7690,15 +7855,19 @@ static bool VoxelMarchBindPool(FRDGBuilder& GraphBuilder, int32 Source, Paramete
 		// Pad 0 would let a cut chunk sit face-adjacent in Z to a resident one
 		// and drop a bCrossedShellAbsent the retry ladder gates on.
 		const int32 Pad = FMath::Max(CVarVoxelMarchZCutPadChunks.GetValueOnRenderThread(), 1);
-		// The array is 8 int4s because the index carries 8 grid slots. Spelled
-		// as a literal in the parameter struct and in VoxelBrickTraverse.ush
-		// (int4 MarchLevelChunkZ[8]), so the one authority checks the two
-		// spellings HERE rather than letting a widened index silently write
-		// past the uniform.
-		static_assert(FVoxelMarchChunkIndex::kGridSlots == 12,
+		// The uniform arrays are declared [12] in the parameter structs and in
+		// VoxelBrickTraverse.ush -- DELIBERATELY WIDER than the 9 slots the
+		// index carries since the cut to 8 rings. The fill loops write
+		// S < kGridSlots and the shader reads WalkL < RingCount <= 8, so the
+		// tail slots are written-zero and never read; 6 unused vectors per
+		// constant buffer is cheaper than keeping seven array-width spellings
+		// in step. The assert guards the direction that breaks: an index WIDER
+		// than the uniform would silently write past it.
+		static_assert(FVoxelMarchChunkIndex::kGridSlots <= 12,
 		              "MarchLevelChunkZ is declared [12] in FVoxelMarchCSParameters and as "
-		              "int4 MarchLevelChunkZ[12] in VoxelBrickTraverse.ush. The index grew a "
-		              "slot; widen both, or the far slots read another slot's Z bound.");
+		              "int4 MarchLevelChunkZ[12] in VoxelBrickTraverse.ush. The index grew "
+		              "past that; widen every [12] spelling, or the far slots read another "
+		              "slot's Z bound.");
 		int32 UsableMask = 0;
 		for (uint32 S = 0; S < FVoxelMarchChunkIndex::kGridSlots; ++S)
 		{
@@ -7918,6 +8087,12 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			// full-rate numerator by a level-2 denominator and under-report the rate.
 			const uint32 FtConsidered = Src[VoxelMarchHoleWord::FallthroughConsidered];
 			const uint32 FtTaken = Src[VoxelMarchHoleWord::FallthroughTaken];
+			// The Z ladder's engagement quad. Read on EVERY frame, the ladder
+			// pair's rule: the plain kernel writes these too.
+			const uint32 ZlRungs = Src[VoxelMarchHoleWord::ZLadderRungs];
+			const uint32 ZlClamped = Src[VoxelMarchHoleWord::ZLadderClamped];
+			const uint32 ZlResumed = Src[VoxelMarchHoleWord::ZLadderResumed];
+			const uint32 ZlTailLost = Src[VoxelMarchHoleWord::ZLadderTailLost];
 			// The resident-Z bound's engagement trio. Read on EVERY frame for
 			// the reason the ladder's pair is: the plain kernel writes them
 			// too, so gating them behind the level-2 fold would report the
@@ -8012,9 +8187,16 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			}
 			uint32 ByLevel[VoxelMarchHoleWord::kNumLevels];
 			uint32 ByReason[VoxelMarchHoleWord::kNumReasons];
+			uint32 StaleGrid[12];
+			uint32 RealGrid[12];
 			for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
 			{
 				ByLevel[L] = Src[int32(VoxelMarchHoleWord::UncLevelFirst) + L];
+			}
+			for (int32 G = 0; G < 12; ++G)
+			{
+				StaleGrid[G] = Src[int32(VoxelMarchHoleWord::StaleGridFirst) + G];
+				RealGrid[G] = Src[int32(VoxelMarchHoleWord::RealGridFirst) + G];
 			}
 			for (int32 R = 0; R < VoxelMarchHoleWord::kNumReasons; ++R)
 			{
@@ -8028,6 +8210,10 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.Uncovered += Uncovered;
 			State->HoleWindow.FallthroughConsidered += FtConsidered;
 			State->HoleWindow.FallthroughTaken += FtTaken;
+			State->HoleWindow.ZLadderRungs += ZlRungs;
+			State->HoleWindow.ZLadderClamped += ZlClamped;
+			State->HoleWindow.ZLadderResumed += ZlResumed;
+			State->HoleWindow.ZLadderTailLost += ZlTailLost;
 			State->HoleWindow.ZCutConsulted += ZCutConsulted;
 			State->HoleWindow.ZCutSkipped += ZCutSkipped;
 			State->HoleWindow.ZCutClipped += ZCutClipped;
@@ -8109,6 +8295,11 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 				for (int32 L = 0; L < VoxelMarchHoleWord::kNumLevels; ++L)
 				{
 					State->HoleWindow.UncoveredByLevel[L] += ByLevel[L];
+				}
+				for (int32 G = 0; G < 12; ++G)
+				{
+					State->HoleWindow.StaleByGrid[G] += StaleGrid[G];
+					State->HoleWindow.RealByGrid[G] += RealGrid[G];
 				}
 				for (int32 R = 0; R < VoxelMarchHoleWord::kNumReasons; ++R)
 				{
@@ -9510,6 +9701,9 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			Volume.IsValid() ? Volume->GetOriginVoxel() : FIntVector::ZeroValue;
 		FVector3f FrameRayOriginLocalUU = Entry.RayOriginLocalUU;
 		float FrameExtentUU = float(FVoxelFluidOccupancyVolume::DimVoxels) * vxc::kFluidVoxelUU;
+		// Z extent: the same cube by default; its own budget only under rings,
+		// derived below. Every non-ring path keeps the cube it always had.
+		float FrameExtentZUU = FrameExtentUU;
 		// True only while the march frame IS the volume frame -- i.e. source 0.
 		// The comparator's occupancy half is meaningless otherwise and is gated
 		// on this rather than left to produce confident nonsense.
@@ -9531,15 +9725,28 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				? (Rings.ReachUU / 100.0f)
 				: ((Arm.ReachM > 0.0f) ? Arm.ReachM : 25.6f);
 			const int32 ReachVoxels = FMath::CeilToInt(ReachM * 10.0f);
-			// SNAPPED TO 1024 LEVEL-0 VOXELS WHEN RINGS ARE ON, 32 OTHERWISE.
-			// A chunk at level L spans 32 * 2^L level-0 voxels; 1024 is that at
-			// L5, so a 1024-snapped origin is chunk-aligned AT EVERY LEVEL and
-			// `origin >> L` stays exact. Without it every level above 0 needs a
-			// per-level fixup, and a frame origin that is chunk-aligned "only by
-			// luck" is exactly the class of thing this file has been bitten by.
-			// Costs at most 102 m of frame offset, which the box already covers.
+			// SNAPPED TO THE LARGEST CHUNK EDGE WHEN RINGS ARE ON, 32 OTHERWISE.
+			// A chunk at level L spans 32 * 2^L level-0 voxels, so the shift is
+			// 5 + (top level) -- DERIVED, because the hand-written 10 it
+			// replaces was the "chunk-aligned AT EVERY LEVEL" claim frozen at
+			// L5 while the cascade grew past it. A 1024-snapped origin is NOT
+			// aligned at L6 (2048) or L7 (4096); the shader derives each
+			// level's lattice as `origin >> L`, so a misaligned origin shifts
+			// the ENTIRE level's chunk addressing by a fraction of a chunk --
+			// every L6/L7 index lookup landed on the wrong cell (an empty one
+			// reads as a hole, an aliased one fails record validation as
+			// "stale"). Measured at the vista pose: hits=0 of 21.2M rays with
+			// stale=100% of fetches while a ground pose -- whose rays end in
+			// L0-L5 -- was perfect at 11.2M hits, stale=0.00%. This was the
+			// owner's "only a few chunks under the player, then holes".
+			// Costs at most ~410 m of frame offset, which the box slack below
+			// covers at 2x the snap.
 			// Kept at 32 with rings off so the control arm is unchanged.
-			const int32 SnapShift = Rings.bEnabled ? 10 : 5;
+			const int32 SnapShift =
+				Rings.bEnabled ? (5 + int32(FVoxelMarchChunkIndex::kLevels) - 1) : 5;
+			static_assert(5 + int32(FVoxelMarchChunkIndex::kLevels) - 1 == 12,
+			              "snap shift = log2(32 * 2^(top level)); if the level count moved, "
+			              "re-derive the box-slack comment below too");
 			const auto SnapDown = [SnapShift](int32 V) { return (V >> SnapShift) << SnapShift; };
 			// UNDER RINGS THE FRAME ORIGIN IS THE CAMERA, NOT THE BOX CORNER,
 			// and the shader's box is centred on it to match. Cornered, the
@@ -9565,12 +9772,74 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// Twice the snap, so the box covers the worst-case snap slack in
 			// both directions: the origin can sit up to (1 << SnapShift) - 1
 			// voxels further back than reach alone would need. 64 was that at a
-			// 32-snap; the 1024-snap needs 2048 or the outer ring is clipped by
-			// the box before the rings ever get to decide.
+			// 32-snap, 2048 at the old 1024-snap; the term is derived from
+			// SnapShift below so it followed the snap to 4096 automatically --
+			// without the slack, the outer ring is clipped by the box before
+			// the rings ever get to decide.
 			// FULL WIDTH either way. Cornered, the box runs [0, extent]; centred,
 			// it runs [-extent/2, +extent/2] -- the same span, and the shader
 			// picks which under the same permutation that moved the origin.
 			FrameExtentUU = float(2 * ReachVoxels + 2 * (1 << SnapShift)) * 10.0f;
+			// ---- THE Z EXTENT IS ITS OWN BUDGET (the altitude fix, 2026-09-02) --
+			//
+			// XY reach is the ring cascade's job; Z reach is the ALTITUDE budget,
+			// and reusing the XY number for Z is exactly what put the cube floor at
+			// ~8.6 km and deleted the ground under every higher pose (the owner's
+			// plan-view 'terrain stops below the player', the topographic rim).
+			// Same formula shape as the XY extent above -- full width, reach plus
+			// twice the snap slack -- so the slab and snap arguments carry over
+			// unchanged. Rings off keeps Z == XY: the old cube, byte-identical.
+			//
+			// CLAMPED TO WHAT THE TOP RING LEVEL CAN PACK, never merely requested:
+			// a hit's LocalVoxel is camera-relative at the hit's own level in a
+			// biased 13-bit field, and the retry ladder's per-rung vertical reach
+			// clamp (VOXEL_MARCH_PACK_ZREACH_VOXELS, VoxelBrickTraverse.ush)
+			// refuses to walk deeper than kVoxelMarchPackZReachVoxels * 2^L from
+			// the camera. The deepest point the cube can offer -- reach plus the
+			// snap slack the camera can sit above centre -- must therefore fit the
+			// TOP level's reach, or the ladder runs out of levels with tail left
+			// and the deep ground is a structural hole no counter can buy back. At
+			// 8 rings the clamp is a 3.7x-margin no-op (52.3 km vs 13.9 km); it
+			// exists for -VoxelRingCount overrides, and it FLOORS AT the XY reach
+			// so no configuration gets a shallower cube than it had before.
+			FrameExtentZUU = FrameExtentUU;
+			if (Rings.bEnabled)
+			{
+				const int32 TopLevel = Rings.Count - 1;
+				const int64 PackableL0 =
+					(int64(kVoxelMarchPackZReachVoxels) << TopLevel) -
+					int64(2 * (1 << SnapShift));
+				const int32 ZReachVoxels = FMath::Max(
+					ReachVoxels,
+					int32(FMath::Min<int64>(int64(kVoxelMarchAltitudeReachVoxels),
+					                        PackableL0)));
+				FrameExtentZUU = float(2 * ZReachVoxels + 2 * (1 << SnapShift)) * 10.0f;
+				// Printed once, into the log the leg is read from -- the ring-reach
+				// check's rule. The Error below is the -VoxelRingCount trap firing.
+				static bool bZBudgetLogged = false;
+				if (!bZBudgetLogged)
+				{
+					bZBudgetLogged = true;
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("Voxel march Z budget: half-extent %.1f m (XY stays %.1f m); ")
+					       TEXT("camera-to-cube-floor worst case %.1f m; top ring level L%d ")
+					       TEXT("vertical reach %.1f m."),
+					       FrameExtentZUU * 0.5f / 100.0f, FrameExtentUU * 0.5f / 100.0f,
+					       (FrameExtentZUU * 0.5f + float((1 << SnapShift) * 10)) / 100.0f,
+					       TopLevel,
+					       float(double(int64(kVoxelMarchPackZReachVoxels) << TopLevel) * 10.0 /
+					             100.0));
+					if (ZReachVoxels < kVoxelMarchAltitudeReachVoxels)
+					{
+						UE_LOG(LogVoxelMarch, Error,
+						       TEXT("Voxel march Z budget: CLAMPED BELOW THE 10 km ALTITUDE ")
+						       TEXT("BUDGET by the ring count (top level L%d). High poses WILL ")
+						       TEXT("see the cube floor. Raise voxel.March.RingCount rather ")
+						       TEXT("than reading altitude captures on this configuration."),
+						       TopLevel);
+					}
+				}
+			}
 			// THE PACK BOUND IS PER LEVEL NOW, AND CHECKED RATHER THAN TRUSTED.
 			//
 			// The old check compared the whole frame span against 8,192 voxels.
@@ -9645,6 +9914,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		Entry.FrameOriginVoxel = FrameOriginVoxel;
 		Entry.FrameRayOriginLocalUU = FrameRayOriginLocalUU;
 		Entry.FrameExtentUU = FrameExtentUU;
+		Entry.FrameExtentZUU = FrameExtentZUU;
 
 		// THE VIEW BLOCK, BUILT ONCE AND SHARED. The march and the source
 		// comparator must trace THE SAME RAY, and a second construction of "the
@@ -9655,6 +9925,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		MarchView.MarchViewToTranslatedWorld = Entry.ViewToTranslatedWorld;
 		MarchView.MarchRayOriginLocalUU = FrameRayOriginLocalUU;
 		MarchView.MarchVolumeExtentUU = FrameExtentUU;
+		MarchView.MarchVolumeExtentZUU = FrameExtentZUU;
 		MarchView.MarchViewRectMin = FVector2f(Entry.ViewRect.Min);
 		MarchView.MarchViewRectSize = FVector2f(Size);
 		MarchView.MarchInvProjDiag = Entry.InvProjDiag;
@@ -11062,6 +11333,7 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->MarchView.MarchViewToTranslatedWorld = Entry->ViewToTranslatedWorld;
 		Params->MarchView.MarchRayOriginLocalUU = Entry->FrameRayOriginLocalUU;
 		Params->MarchView.MarchVolumeExtentUU = Entry->FrameExtentUU;
+		Params->MarchView.MarchVolumeExtentZUU = Entry->FrameExtentZUU;
 		Params->MarchView.MarchViewRectMin = FVector2f(Entry->ViewRect.Min);
 		Params->MarchView.MarchViewRectSize = FVector2f(Entry->ViewRect.Size());
 		Params->MarchView.MarchInvProjDiag = Entry->InvProjDiag;
@@ -11316,6 +11588,7 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 				Params->MarchView.MarchViewToTranslatedWorld = Entry->ViewToTranslatedWorld;
 				Params->MarchView.MarchRayOriginLocalUU = Entry->FrameRayOriginLocalUU;
 				Params->MarchView.MarchVolumeExtentUU = Entry->FrameExtentUU;
+				Params->MarchView.MarchVolumeExtentZUU = Entry->FrameExtentZUU;
 				Params->MarchView.MarchViewRectMin = FVector2f(Entry->ViewRect.Min);
 				Params->MarchView.MarchViewRectSize = FVector2f(Entry->ViewRect.Size());
 				Params->MarchView.MarchInvProjDiag = Entry->InvProjDiag;

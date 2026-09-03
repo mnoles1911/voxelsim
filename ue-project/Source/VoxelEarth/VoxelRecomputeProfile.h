@@ -127,6 +127,9 @@ namespace VoxelRecomputeProfile
 	};
 
 	constexpr int32_t kNumStages = int32_t(EStage::Count);
+	// Must be >= VoxelCoords::kNumLevels (8 as of the 2026-09-02 cascade cut).
+	// Not asserted here: this header stays plain-compiler testable and cannot
+	// include VoxelCoords.h; whoever wires a consumer should assert it there.
 	constexpr int32_t kMaxLevels = 8;
 
 	inline const char* StageName(EStage S)

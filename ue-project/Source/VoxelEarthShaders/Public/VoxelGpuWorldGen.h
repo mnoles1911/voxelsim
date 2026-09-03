@@ -385,14 +385,25 @@ namespace VoxelTier
 {
 	// The first ring level generated from the COARSE tier. Levels below this
 	// read the fine tier when it is enabled.
+	//
+	// 8 == kNumLevels: NO streamed level is coarse-derived. The owner's 8-ring
+	// design (2026-09-02) is "all rings fine, clipmap beyond", so this equals
+	// the level count and IsCoarseDerivedLevel is false for every ring.
+	//
+	// IT WAS 5 FOR A DAY (2026-08-31..09-02), chasing missing far terrain, and
+	// that experiment is worth its two lessons: (1) moving this was a measured
+	// NULL both alone and paired with real coarse tiles, because the far
+	// terrain was missing for renderer-side reasons (the marcher's ring clamp)
+	// -- routing data differently cannot fix a renderer that never walks there;
+	// (2) absent-fine-tile ground is handled at the right layer now, by the
+	// fine streamer's coarse FALLBACK (ResolveNonResidentPixel), which serves
+	// every consumer through one funnel instead of per-level routing.
 	inline constexpr int32 kFirstCoarseLevel = 8;
 
-	// INERT UNTIL R8 EXISTS. With kNumLevels == 8 the highest level is 7, so
-	// this returns false for every level the cascade currently streams and the
-	// generated world is byte-identical. That is deliberate: the rule lands and
-	// is consumed BEFORE the first level that trips it, so the level which
-	// introduces coarse derivation is not also the change that introduces the
-	// rule.
+	// INERT while kFirstCoarseLevel == kNumLevels: the highest streamed level
+	// is 7, so this returns false for every level the cascade streams. The rule
+	// object and its consumers (admission bound, Z-range, raster routing) are
+	// kept because they are the correct shape if coarse-derived rings return.
 	inline constexpr bool IsCoarseDerivedLevel(int32 Level)
 	{
 		return Level >= kFirstCoarseLevel;

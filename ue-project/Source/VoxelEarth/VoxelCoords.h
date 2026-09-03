@@ -40,28 +40,34 @@ namespace VoxelCoords
 	// is now flat in level (~4 ms at every level) instead of 8x per level, so an
 	// extra ring costs chunks, not exponentially more time per chunk.
 	//
-	// If you change this, note that SIX hand-written per-level tables must grow
+	// If you change this, note that the hand-written per-level tables must grow
 	// with it. C++ silently zero-fills a too-short initializer list, and the
 	// resulting failures are all silent runtime ones (an all-zero ring annulus
 	// admits nothing; an all-zero admission cutoff REJECTS everything; a zero
-	// RingPresets outer radius collapses the clipmap to zero extent). Every one
-	// of those tables now carries a static_assert on its own length so the
-	// mistake is a compile error instead. Search kNumLevels.
+	// RingPresets outer radius collapses the clipmap to zero extent). A
+	// static_assert on the DECLARED length does not catch a short initializer
+	// list -- kRingSlotFloorDefault and kTints both passed theirs with 7 of 11
+	// entries filled during the 11-level period. Grep kNumLevels and check the
+	// INITIALIZER COUNT of every table it sizes.
 	//
-	// 7 SINCE 2026-08-23 (owner: "add additional LOD rings to reach 8-10km").
-	// Level 6 is the LAST ring level this architecture can carry without a
-	// format change: ground cover owns level 7 (FVoxelBrickPool::kCoverLevel),
-	// which is the ceiling of BOTH the chunk record's four-bit
-	// LevelAndFlags[0:3] and the VisBuffer's three-bit level field. An eighth
-	// ring would need a wider level field in two packed formats.
+	// 8 SINCE 2026-09-02, and the story of 11 is the reason it is 8. The
+	// cascade was pushed to 11 levels (65 km) on 2026-08-30 and the renderer
+	// never coherently caught up: the marcher's ring clamp stayed at 7 (4 km --
+	// far terrain streamed, was resident, and was never walked), the GPU
+	// residency scan was silently capped at 8 levels, admission's Z-range came
+	// from four corner samples that miss all interior relief at a 409 m
+	// footprint, and walking all 11 rings measured ~219 ms/frame with holes.
+	// The owner cut it to 8 rings (R7 outer = 8,192 m, double the long-standing
+	// 4 km cascade) with the heightfield clipmap restored beyond -- see
+	// docs/cascade-cut-to-8-2026-09-02.md.
 	//
-	// The new ring is DORMANT BY DEFAULT: GetMaxRingLevel() defaults to 5 (the
-	// shipped 4 km cascade) so a flag-free run is byte-identical to the
-	// six-level build, and -VoxelMaxRingLevel=6 is the 8.19 km arm. L6 keeps
-	// the cascade's construction ratio Outer/ChunkEdge == 40 (8192 m / 204.8 m)
-	// so the march index aliasing proof (span 80 < kDimXY 128) holds unchanged
-	// at every level -- see VoxelMarchChunkIndex.cpp's static_asserts.
-	inline constexpr int32 kNumLevels = 11;  // 2026-08-30: R9/R10 -- the 65 km cascade
+	// Level count and reach: R0 outer 64 m, doubling per ring, R7 = 8,192 m.
+	// Ground cover owns level kNumLevels (== FVoxelBrickPool::kCoverLevel,
+	// asserted equal in VoxelMarchChunkIndex.cpp); the VisBuffer's 4-bit split
+	// level field carries values up to 15, so cover at 8 fits. The cascade's
+	// construction ratio Outer/ChunkEdge == 40 holds at every level, so the
+	// march index aliasing proof (span 80 < kDimXY 128) is level-independent.
+	inline constexpr int32 kNumLevels = 8;  // R0..R7, 8,192 m cascade edge
 
 	// Floored division matching vxc::floorDiv (C++ integer division truncates
 	// toward zero; voxel/brick/chunk lattice indexing needs floor instead).

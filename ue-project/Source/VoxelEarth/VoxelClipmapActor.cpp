@@ -226,6 +226,10 @@ void AVoxelClipmapActor::BeginPlay()
 	// shift rather than a structural error.
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapVertexAlbedo="), VertexAlbedoWeightOverride);
 	bVertexAlbedoActive = VertexAlbedoWeightOverride > 0.0f;
+	// -VoxelClipmapVoxelize=0 restores the smooth far field (control arm for
+	// the virtual-ring voxelization seam A/B); default 1.0 = voxelized, the
+	// owner-accepted direction. See ApplyLevelMaterial's push.
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapVoxelize="), VoxelizeWeightOverride);
 	{
 		int32 SrgbFlag = 1;
 		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapAlbedoSrgb="), SrgbFlag))
@@ -237,7 +241,7 @@ void AVoxelClipmapActor::BeginPlay()
 	       TEXT("Clipmap colour authority: %s (-VoxelClipmapVertexAlbedo=%.2f, bytes %s). ON = the ")
 	       TEXT("palette colour of each vertex's REAL surface material, the same authority the voxel ")
 	       TEXT("terrain uses. OFF = the biome LUT plus the clipmap's own snow and slope-rock terms."),
-	       bVertexAlbedoActive ? TEXT("PALETTE (one authority)") : TEXT("biome LUT (default)"),
+	       bVertexAlbedoActive ? TEXT("PALETTE (one authority, default)") : TEXT("biome LUT (control arm)"),
 	       VertexAlbedoWeightOverride, bAlbedoAsSrgb ? TEXT("as authored sRGB") : TEXT("linearised"));
 
 	bColorCensus = FParse::Param(FCommandLine::Get(), TEXT("VoxelClipmapColorCensus"));
@@ -1359,6 +1363,13 @@ void AVoxelClipmapActor::ApplyLevelMaterial(int32 LevelIndex)
 	{
 		MID->SetScalarParameterValue(TEXT("VertexAlbedoWeight"), VertexAlbedoWeightOverride);
 	}
+	// Virtual-ring voxelization (2026-09-02, owner-accepted): the material's
+	// VoxelizeWeight defaults to 1.0 in the generated asset; this push exists
+	// so -VoxelClipmapVoxelize=0 is the one-flag control arm for the seam A/B
+	// (same doctrine as -VoxelClipmapVertexAlbedo). Pushed unconditionally --
+	// the override's default equals the material's default, so a flag-free run
+	// is unchanged by this call.
+	MID->SetScalarParameterValue(TEXT("VoxelizeWeight"), VoxelizeWeightOverride);
 	if (bSnowOverrideActive)
 	{
 		MID->SetScalarParameterValue(TEXT("SnowlineLowMeters"), SnowlineLowMetersOverride);

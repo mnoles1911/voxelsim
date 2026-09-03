@@ -53,10 +53,15 @@ uint worklistCoarseLevel(GpuChunkWorkRecord R) { return R.LevelFlags & 0xfu; }
 uint worklistCoarseScale(GpuChunkWorkRecord R)
 {
 	// No variable shifts in kernels (lint-shader-ub VARIABLE_SHIFT): 1<<L as
-	// a lookup over the 0..6 range the cascade streams.
+	// a lookup over the 0..7 range the cascade streams. The ladder's tail is
+	// the trap: it ended at "L==5 ? 32 : 64" when the cascade was 7 levels,
+	// and R7 records silently got scale 64 instead of 128 for the whole time
+	// R7 existed -- wrong cell-to-world mapping for every L7 GPU job. Extend
+	// the ladder when the level count grows; the final term must be the TOP
+	// level's scale.
 	const uint L = worklistCoarseLevel(R);
 	return (L == 0u) ? 1u : (L == 1u) ? 2u : (L == 2u) ? 4u : (L == 3u) ? 8u
-	     : (L == 4u) ? 16u : (L == 5u) ? 32u : 64u;
+	     : (L == 4u) ? 16u : (L == 5u) ? 32u : (L == 6u) ? 64u : 128u;
 }
 uint worklistHasAssets(GpuChunkWorkRecord R) { return (R.LevelFlags >> 8) & 1u; }
 uint worklistStampsStaged(GpuChunkWorkRecord R) { return (R.LevelFlags >> 9) & 1u; }

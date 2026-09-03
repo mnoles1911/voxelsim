@@ -874,26 +874,71 @@ private:
 		// Both cannot be the regime, and only these counters say which.
 		//
 		// promoteExit is the decisive one, and it is the manager's own version
-		// of the exitCap=/exitEmpty= pair the streaming side already reads:
-		//   cap=   the loop stopped at MaxInFlight -- DEPTH-bound. Raising the
-		//          cap is on the table (but check drained first: the handoff's
-		//          90,000-deep backlog is what makes a cap reading a trap).
-		//   quota= it stopped at MeshBatchCap with work still queued --
-		//          QUOTA-bound. The per-tick promotion allowance is the limit,
-		//          not depth and not the GPU.
-		//   empty= it ran out of work -- STARVED. Nothing here is the limit;
-		//          the producer upstream is. This is what inFlight=0 pending=512
-		//          would have to read as, and if it does not, that reading was
-		//          about a different queue than this one.
-		// A window where all three are near zero means the promote loop did not
-		// run, which is a broken instrument rather than a healthy manager.
+		// of the exitCap=/exitEmpty= pair the streaming side already reads.
+		//
+		// M10, 2026-09-02: THIS LINE NAMED A CAP IT DOES NOT MEASURE. It printed
+		// three numbers, `cap= quota= empty=`, and only the last one was true.
+		// `cap=` was RECONSTRUCTED after the loop from
+		// `InFlight+Batch >= MaxInFlight`, which is the IN-FLIGHT DEPTH bound and
+		// has nothing to do with any per-tick cap; `quota=` was reconstructed from
+		// "not at depth and some queue is non-empty", which lumps THREE separate
+		// allowances into one number -- and one of them (SpecBatchCap == 0, i.e.
+		// speculation simply switched OFF) then reads every single tick as
+		// "QUOTA-bound at MeshBatchCap". A leg with no speculative traffic
+		// therefore reported the demand cap as its wall, and that is precisely
+		// the reading docs/throughput-ladder-2026-08-28.md gates its rungs on.
+		// The reconstruction is gone: the loop LATCHES the reason at the break it
+		// actually took, and every counter below names the one test its ++ site
+		// gates on -- docs/pipeline-waves-2026-08-27.md, "read the ++ site, never
+		// a counter's name", where this counter is one of the four cited liars.
+		//
+		//   inflight=    the while-condition failed: InFlight+Batch reached
+		//                MaxInFlight -- DEPTH-bound. Raising the depth cap is on
+		//                the table (but check `drained` on the streaming side
+		//                first: the handoff's 90,000-deep backlog is what makes a
+		//                depth reading a trap, and raising a cap in front of a
+		//                starved drain makes it strictly worse).
+		//   batchCap=    a DEMAND head was queued and DemandPromoted had reached
+		//                BatchCap (voxel.GPU.MeshBatchCap / -VoxelGpuMeshBatchCap).
+		//                This, and only this, is the reading the MeshBatchCap
+		//                sweeps and the pass-free item gate on.
+		//   passFreeCap= a demand head was queued, was PREDICTED pass-free, and
+		//                DemandPassFree had reached PassFreeCap (the worklist's
+		//                per-flush consume budget, further capped by the Write
+		//                triple's 442-record group ceiling). Unreachable unless
+		//                lean + worklist + claim + poolalloc are all armed, so it
+		//                is a WORKLIST finding and never a MeshBatchCap one.
+		//   specCap=     demand was EMPTY, low-priority work was queued, and
+		//                LowPriorityPromoted had reached SpecBatchCap. Reads on
+		//                every tick when SpecBatchCap is 0, which means
+		//                "speculation is off", NOT "throughput is walled" -- check
+		//                voxel.GPU.MeshSpecCap before quoting this one.
+		//   empty=       both queues ran dry -- STARVED. Nothing in this manager
+		//                is the limit; the producer upstream is. This is what
+		//                inFlight=0 pending=512 would have to read as, and if it
+		//                does not, that reading was about a different queue than
+		//                this one.
+		//
+		// ENGAGEMENT PROOF, AND IT IS AN EQUALITY THAT CAN FAIL. The five are
+		// mutually exclusive and exhaustive over promote-loop exits; the loop runs
+		// exactly once per Tick(); ++Ticks happens before it with no early return
+		// in between. So their sum MUST equal ticks= on the same line, and the
+		// print derives that sum and shows it as exits=N/ticks. A window where the
+		// two disagree means an exit path was added without a counter and NO share
+		// on this line may be read. A counter that sits at zero on both a healthy
+		// and a broken leg proves nothing; this equality is checkable both ways,
+		// which is the only reason it is worth printing.
 		int64 QueueDemandSum = 0;   // depth at tick start, summed over ticks
 		int64 QueueLowSum = 0;
 		int64 InFlightSum = 0;
 		int32 InFlightMax = 0;
-		int64 PromoteExitCap = 0;
-		int64 PromoteExitQuota = 0;
-		int64 PromoteExitEmpty = 0;
+		// One per Tick(), classified by EPromoteExit AT the site that ended the
+		// loop. Each name states the test, not the intent.
+		int64 PromoteExitInFlight = 0;    // while-cond: InFlight+Batch >= MaxInFlight
+		int64 PromoteExitBatchCap = 0;    // demand head queued, DemandPromoted >= BatchCap
+		int64 PromoteExitPassFreeCap = 0; // pass-free head, DemandPassFree >= PassFreeCap
+		int64 PromoteExitSpecCap = 0;     // demand dry, low queued, LowPriorityPromoted >= SpecBatchCap
+		int64 PromoteExitEmpty = 0;       // both queues empty
 		// Ticks from promotion to delivery, per delivered job. The denominator
 		// of the ceiling; sampled from every delivery, so a population that
 		// never delivers reports samples=0 rather than a flattering small mean.

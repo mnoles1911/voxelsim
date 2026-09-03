@@ -465,7 +465,47 @@
 // here so the traversal loop has a compile-time trip count and so a bad
 // uniform cannot walk off the end of the index. Mirrors kVoxelMarchMaxRings
 // (VoxelMarchRenderer.cpp) and FVoxelMarchChunkIndex::kLevels.
-#define VOXEL_MARCH_MAX_RINGS 7u
+// MUST equal kVoxelMarchMaxRings in VoxelMarchRenderer.cpp, and must not exceed
+// FVoxelMarchChunkIndex::kLevels. 8 rings = 8,192 m reach.
+// Was 7 while the cascade streamed 11, which pinned the marcher at 4,096 m and
+// made every far chunk stream and never draw. 11 reached the horizon but was
+// holed and cost ~219 ms/frame; 8 is the owner's setting.
+#define VOXEL_MARCH_MAX_RINGS 8u
+
+// ---------------------------------------------------------------------------
+// THE PER-RUNG VERTICAL REACH (the altitude fix, 2026-09-02)
+// ---------------------------------------------------------------------------
+//
+// How far from the camera one rung may walk VERTICALLY, in voxels of the
+// rung's own level. Two independent ceilings land on the same number:
+//
+//   * the VisBuffer pack: LocalVoxel is CAMERA-relative at the hit's own
+//     level in a biased 13-bit field (-4096..+4095, VoxelMarchPackVis). The
+//     ring radii bound XY to 1,280 level-L voxels; nothing bounded Z, so a
+//     fine hit deeper than ~409.6 * 2^L m below the camera WRAPPED to a
+//     legal-looking coordinate -- doctrine 5's terrain-in-the-wrong-place,
+//     with no error anywhere.
+//   * float32: walk positions are frame-relative in level-L units. This
+//     clamp bounds them to ~40,880 walk-UU, where one ulp is 0.0049 UU --
+//     under half the 0.01 UU advance nudge. Unclamped, a level-0 walk to the
+//     13.5 km cube floor sits at ~1.35M walk-UU, ulp 0.16 UU, and the nudge
+//     rounds away (the BuildRay centred-frame note's stall/skip failure,
+//     arriving vertically instead of horizontally).
+//
+// 4088 = 4096 minus an 8-voxel margin for the hit's floor() and the walk's
+// one-cell overshoot past its TMax. The C++ twin is
+// kVoxelMarchPackZReachVoxels (VoxelMarchRenderer.h) -- cross-referenced by
+// name, keep them equal; the host clamps the frame's Z extent so the TOP
+// level's reach always covers the deepest point the cube can offer.
+//
+// GROUND PAST ONE RUNG'S REACH IS THE NEXT RUNG'S JOB, NOT LOST: the rung's
+// interval is clipped, the clip point is carried, and the ladder re-enters
+// the tail one level coarser (ladder-on-truncation -- the rung decision in
+// VoxelMarchTraverseRings). Depth below the camera thereby gets the same
+// level-doubling the ring cascade gives XY distance. Compiled only with
+// VOXEL_MARCH_FALLTHROUGH > 0: with no ladder there is no coarser rung to
+// hand the tail to, and the depth-0 control must stay byte-identical.
+#define VOXEL_MARCH_PACK_ZREACH_VOXELS 4088
 
 // The ring cascade arm. 0 = single level over one t interval, which is every
 // leg measured before 2026-08-20 and is the control. 1 = the ring loop.
@@ -967,14 +1007,18 @@ int MarchStepBudget;
 // kCoverChunkEdgeCells == kMarchChunkEdgeVoxels) and it is packed by the SAME
 // vxc::packChunkBricksCanonical the terrain path is packed by.
 //
-// 7. Seven ring levels now exist (VOXEL_MARCH_MAX_RINGS -- level 6, the 8 km
-// ring, took the slot this comment used to hold free). 7 is the largest value
-// that fits BOTH the chunk record's four-bit LevelAndFlags[0:3] and the
-// VisBuffer's three-bit level field, which is what lets a cover hit travel
-// from the march kernel to the emit pixel shader with no new packing -- and it
-// is also why level 6 was the LAST ring this format can take: an eighth ring
-// would collide with cover here.
-#define VOXEL_MARCH_COVER_LEVEL 7
+// 8 -- one past the last ring, PUSHED FROM C++ (FVoxelMarchChunkIndex::
+// kCoverLevel) since 2026-09-02; the define below is only an offline-tooling
+// fallback. It drifted as a hand mirror: it sat at 7 while both C++ spellings
+// were 11 and the marcher walked WalkL = 7, so an R7 TERRAIN hit took the
+// COVER branch -- VoxelMarchVoxelSizeUU returned 5 cm instead of 12.8 m and
+// the pack origin doubled instead of shifting right 7 -- while real cover
+// records (level 11) failed level validation. Both level fields fit 8: the
+// chunk record's four-bit LevelAndFlags[0:3] and the VisBuffer's four-bit
+// SPLIT level field (see VoxelMarch.usf's pack site).
+#ifndef VOXEL_MARCH_COVER_LEVEL
+#define VOXEL_MARCH_COVER_LEVEL 8
+#endif
 
 #ifndef VOXEL_MARCH_COVER
 #define VOXEL_MARCH_COVER 0
@@ -1804,7 +1848,10 @@ int MarchZCutEnable;
 // below), so cutting an empty slot would have to reproduce that short-circuit to
 // keep the flag's meaning. Refusing to cut it is the conservative answer and
 // costs an empty slot nothing it was not already paying.
-int4 MarchLevelChunkZ[12];   // 9 = 8 ring levels + the cover slot
+int4 MarchLevelChunkZ[12];   // declared WIDER than the 9 live slots (8 rings +
+                             // cover) so the width need not move with the ring
+                             // count; the fill writes kGridSlots and reads
+                             // index WalkL < RingCount, tail slots zero/unread
 
 #if VOXEL_MARCH_ZTIGHT
 // ---- THE TIGHT RESIDENT-Z SLABS (voxel.March.ZTight) -----------------------
@@ -2056,6 +2103,14 @@ static uint GVoxelMarchCellIndexEmpty = 0u;     // index anySolid bit clear (nev
 static uint GVoxelMarchCellSlotReject = 0u;     // slot out of bounds, or stride mismatch
 static uint GVoxelMarchCellStale = 0u;          // record fetched, origin/level disagreed
 static uint GVoxelMarchCellResidentEmpty = 0u;  // record fetched, says entirely air
+// BY GRID SLOT (2026-09-02): the one counter the vista-kill trace named. The
+// global stale/real counts cannot say WHICH slot's fetches fail validation --
+// "R6/R7 records fail wholesale" vs "the frame origin is wrong for every slot"
+// are different fixes, and this split picks between them in one leg.
+static uint GVoxelMarchCellStaleBySlot[12] =
+	{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+static uint GVoxelMarchCellRealBySlot[12] =
+	{0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
 static uint GVoxelMarchCellBrickOOB = 0u;       // record fetched, brick base out of pool
 static uint GVoxelMarchCellReal = 0u;           // a real chunk
 #endif
@@ -2137,6 +2192,26 @@ static uint GVoxelMarchZtRetrySkipped = 0u;
 static uint GVoxelMarchZtRetryEntered = 0u;
 #endif
 
+#if VOXEL_MARCH_HOLE_STATS
+// ---- THE Z LADDER'S ENGAGEMENT COUNTERS (the altitude fix) -----------------
+//
+// Statics and not FVoxelMarchHit fields, the ZTight group's reason verbatim:
+// they accumulate across every rung of every segment and the walk struct is
+// overwritten per rung. Written only by rungs compiled with
+// VOXEL_MARCH_FALLTHROUGH > 0 under rings; on every other arm they exist and
+// read a measured zero. Rungs is the denominator (clamp evaluations); Clamped
+// counts intervals actually shortened by the vertical reach; Resumed counts
+// rungs entered as a structural continuation of a clipped/truncated tail;
+// TailLost is 0/1 per ray (the CapRays spelling) and fires only when the
+// ladder ran out of levels with tail still owed -- the one counter here that
+// is a FINDING rather than a rate, and it can still fire (top-level
+// step-budget exhaustion), which is what makes its zero a reading.
+static uint GVoxelMarchZlRungs = 0u;
+static uint GVoxelMarchZlClamped = 0u;
+static uint GVoxelMarchZlResumed = 0u;
+static uint GVoxelMarchZlTailLost = 0u;
+#endif
+
 #if VOXEL_MARCH_RUNG_PROBE && VOXEL_MARCH_HOLE_STATS
 // ---- THE RUNG PROBE'S ENGAGEMENT COUNTERS (voxel.March.RungProbe) ----------
 //
@@ -2202,11 +2277,16 @@ void VoxelMarchBeginLevel(uint Level)
 	GVoxelMarchIndexLevel = Level;
 	GVoxelMarchIndexGrid = Level;
 	GVoxelMarchRecordLevel = Level;
-	// EXACT BECAUSE THE FRAME ORIGIN IS SNAPPED TO 1024 LEVEL-0 VOXELS. A chunk
-	// at level L spans 32 * 2^L level-0 voxels; 1024 is that at L5, so >> L is
-	// an exact division at every level we can reach and the level-L grid stays
-	// chunk-aligned without a per-level fixup. An arithmetic shift is also the
-	// right floor for negative coordinates, which a divide is not.
+	// EXACT BECAUSE THE FRAME ORIGIN IS SNAPPED TO THE LARGEST CHUNK EDGE
+	// (4096 level-0 voxels = the top ring's 32 * 2^7 -- the host derives the
+	// snap from the level count). A chunk at level L spans 32 * 2^L level-0
+	// voxels, so >> L is an exact division at EVERY level only if the snap
+	// covers the TOP level: this comment once said 1024 ("every level we can
+	// reach") and that froze at L5 while the cascade grew -- a misaligned
+	// origin shifts the whole level's chunk lattice and every L6/L7 index
+	// lookup landed on the wrong cell (hits=0 at altitude, stale=100%). An
+	// arithmetic shift is also the right floor for negative coordinates,
+	// which a divide is not.
 	GVoxelMarchOriginVoxelL = int3(MarchBrickOriginVoxel.x >> Level,
 	                               MarchBrickOriginVoxel.y >> Level,
 	                               MarchBrickOriginVoxel.z >> Level);
@@ -2682,6 +2762,7 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 		// staleness was discovered -- so this outcome belongs in the
 		// recordFetches denominator and not with the pre-fetch rejects.
 		++GVoxelMarchCellStale;
+		++GVoxelMarchCellStaleBySlot[min(GVoxelMarchIndexGrid, 11u)];
 #endif
 		return C;
 	}
@@ -2741,6 +2822,9 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// disagree with its parts and a census whose identity cannot fail is not a
 	// census.
 	++GVoxelMarchCellReal;
+#if VOXEL_MARCH_HOLE_STATS
+	++GVoxelMarchCellRealBySlot[min(GVoxelMarchIndexGrid, 11u)];
+#endif
 #endif
 	return C;
 }
@@ -4506,8 +4590,18 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 	}
 #endif
 	H.Steps = Steps;
-	H.THitUU = TMaxUU;
-	H.HitPosLocalUU = OriginLocalUU + SafeDir * TMaxUU;
+	// THE TRUNCATION POINT SURVIVES ONTO THE MISS (2026-09-02, the altitude
+	// fix). The cap exit used to overwrite THitUU with TMaxUU, deleting the
+	// one number the ladder-on-truncation resume needs: where the walk
+	// actually stopped. The budget exit above already returns its own t;
+	// this makes the cap exit agree with it. Miss consumers were audited:
+	// the kernel reads THitUU only off hits, the falsifier compares hits
+	// only, and the ring loop rescales it only inside `if (H.bHit)` -- the
+	// resume site is the one miss reader, and it clamps the value into the
+	// rung's own interval, so a stale field can cost a re-walk, never a
+	// skipped sliver.
+	H.THitUU = (H.TermReason == int(VOXEL_MARCH_TERM_CHUNK_CAP)) ? t : TMaxUU;
+	H.HitPosLocalUU = OriginLocalUU + SafeDir * H.THitUU;
 	return H;
 }
 
@@ -4746,8 +4840,40 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 		// Bounded by the cascade's top -- past RingCount-1 there is nothing
 		// coarser to stand in.
 		const uint LastWalkL = min(SegL + uint(VOXEL_MARCH_FALLTHROUGH), RingCount - 1u);
+		// ---- STRUCTURAL CONTINUATION (ladder-on-truncation, 2026-09-02) ---
+		//
+		// A SECOND WAY UP THE LADDER, beside the absence gate above. A walk
+		// that STOPPED EARLY -- the vertical reach clamp, the 512-chunk cap,
+		// or step-budget exhaustion -- has proved NOTHING about the tail it
+		// never walked, and before this change that tail was silently
+		// abandoned once the gate closed or the depth ran out: a camera
+		// 2.6 km up looking straight down needs ~812 level-0 chunk steps
+		// against the 512 cap, and the one-coarser retry (~406) only squeaked
+		// through below ~3.3 km; the new 13.5 km Z budget makes the worst
+		// column ~4,350 level-0 chunks. The continuation re-enters the
+		// UNWALKED TAIL (not the whole segment) at the next coarser level,
+		// however deep the ladder already is, up to the cascade's top. It is
+		// deliberately NOT bounded by VOXEL_MARCH_FALLTHROUGH: the depth
+		// bounds STAND-IN RE-WALKS of ground a finer level already covered
+		// (absence retries, unchanged), while the continuation is the FIRST
+		// walk of its stretch of ray -- primary coverage, not a retry. The
+		// loop bound below is therefore RingCount, and every non-structural
+		// path re-imposes LastWalkL itself (the rung decision at the bottom,
+		// and the synthesized ZTight/probe skip paths).
+		//
+		// TERMINATION AND COVERAGE, ARGUED ONCE: WalkL strictly increases,
+		// bounded by RingCount. With the clamp, one rung's walk is at most
+		// ~128 vertical + ~40 lateral chunk crossings -- under the 512 cap --
+		// and each level DOUBLES the vertical reach, so the rung at level
+		// ceil(log2(depth / 409.6 m)) reaches any ground the frame's Z budget
+		// admits; the host clamps that budget to the top level's reach, so the
+		// ladder cannot run out of levels with packable ground left. Only
+		// top-level step-budget exhaustion can still lose a tail, and
+		// GVoxelMarchZlTailLost counts exactly that.
+		float ZlResumeUU = SegIn;   // world-UU t from which coverage is owed
+		bool bZlTailOwed = false;   // arms the resume; reset by absence retries
 		[loop]
-		for (uint WalkL = SegL; WalkL <= LastWalkL; ++WalkL)
+		for (uint WalkL = SegL; WalkL < RingCount; ++WalkL)
 #else
 		// Depth 0: WalkL is a const alias of SegL and the block below is the
 		// pre-fallthrough loop body verbatim -- the byte-identical control.
@@ -5351,6 +5477,83 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 #endif
 			}
 
+#if VOXEL_MARCH_FALLTHROUGH > 0
+			// ===========================================================
+			// THE VERTICAL REACH CLAMP + THE CONTINUATION'S RESUME
+			// (the altitude fix, 2026-09-02)
+			// ===========================================================
+			//
+			// AFTER THE Z CUT AND BEFORE THE BOUND, and the order is
+			// instrument purity: the Z cut's consulted/skipped/clipped trio
+			// measures against SegIn/SegOut and must not be billed for this
+			// clamp, while the bound measures against ITS OWN input (its
+			// removal note below) and composes with anything upstream.
+			// Skipped entirely when the interval is already empty -- a
+			// decision this clamp was never asked to make must not move its
+			// counters, and raising WalkIn above a collapsed WalkOut would
+			// invert the interval.
+			//
+			// THE RESUME: a structural continuation re-enters at the previous
+			// rung's stop point, NOT at SegIn -- re-walking the proven prefix
+			// coarser would put coarse rock where the finer level proved air,
+			// the regression the 2026-08-24 gate note names. (Absence retries
+			// keep their full re-walk from SegIn; the decision at the bottom
+			// resets the carried state there.) Biased BACK one chunk at THIS
+			// rung's level -- the ZCutBiasUU constant and the same Danskin &
+			// Hanrahan argument: the stop point is float and the resume is
+			// THE START OF A JUMP; a sliver skipped between stop and resume
+			// is a hole, a chunk re-examined is a bit of work. Clamped to
+			// SegIn so it can never widen the segment.
+			//
+			// THE CLAMP: |dz| along the ray is |Dir.z| * t EXACTLY, because
+			// the ray's origin is the camera and the pack origin is the
+			// camera's voxel -- one divide, no slab. Everything past ZlMaxT
+			// is beyond what this level can PACK (the 13-bit camera-relative
+			// field) and beyond what float32 can WALK (the nudge-vs-ulp
+			// argument at VOXEL_MARCH_PACK_ZREACH_VOXELS), so walking it at
+			// this level could only produce wrong-place terrain or a silent
+			// stall. The tail goes to the next coarser rung, whose reach is
+			// double. CONSERVATIVENESS: the clip only ever SHORTENS the
+			// interval toward the camera, so it hides nothing this level
+			// could have drawn correctly -- what it removes is exactly the
+			// stretch whose hits would wrap or stall.
+			//
+			// A CLAMP-EMPTIED INTERVAL (ZlMaxT below WalkIn: a steep ray
+			// entering an outer segment already deeper than this level's
+			// reach) collapses to (WalkIn, WalkIn) and STILL CALLS THE WALK,
+			// the Z cut's empty-collapse discipline: the hierarchical walk
+			// runs zero iterations and returns the one honestly-initialised
+			// miss. (The FLAT walk's start-voxel test could report a
+			// start-inside hit there whose pack wraps -- that arm is the
+			// VerifySource comparator only, and both of its walks receive
+			// the identical clamp; noted, not guarded.)
+			bool bZlClamped = false;
+			if (WalkOut > WalkIn)
+			{
+				if (bZlTailOwed)
+				{
+					WalkIn = max(WalkIn,
+					             max(SegIn, ZlResumeUU - 32.0f * VOXEL_FLUID_VOXEL_UU * S));
+					// The resume can land past a Z-cut-shortened WalkOut;
+					// collapse to empty at WalkIn rather than hand the walk an
+					// inverted interval.
+					WalkOut = max(WalkOut, WalkIn);
+				}
+				const float ZlReachUU =
+					float(VOXEL_MARCH_PACK_ZREACH_VOXELS) * VOXEL_FLUID_VOXEL_UU * S;
+				const float ZlMaxT = ZlReachUU / max(abs(DirWorld.z), 1e-6f);
+				bZlClamped = ZlMaxT < WalkOut;
+				if (bZlClamped)
+				{
+					WalkOut = max(WalkIn, ZlMaxT);
+				}
+#if VOXEL_MARCH_HOLE_STATS
+				GVoxelMarchZlRungs += 1u;
+				GVoxelMarchZlClamped += bZlClamped ? 1u : 0u;
+#endif
+			}
+#endif
+
 #if VOXEL_MARCH_BOUND
 			// ===========================================================
 			// THE PER-RAY RESIDENT-EXTENT BOUND (voxel.March.Bound)
@@ -5685,6 +5888,17 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			bAnyAbsent = bAnyAbsent || H.bCrossedAbsentChunk;
 #endif
 #if VOXEL_MARCH_FALLTHROUGH > 0
+			// A WALK THAT STOPPED EARLY, whatever stopped it (hoisted 2026-09-02,
+			// the altitude fix): the vertical reach clamp above, the 512-chunk
+			// cap, or step-budget exhaustion. ONE definition above the gate chain
+			// -- the sky gate reads it (its 2026-08-26 addendum), and the
+			// structural-continuation decision at the bottom reads it on EVERY
+			// gate flavour; two spellings of "did the walk finish" is how a
+			// counter ends up certifying a branch it does not describe. The clip
+			// joins the definition because a clipped walk did not finish its
+			// interval either -- the same no-proof-about-the-tail argument.
+			const bool bWalkTruncated = bZlClamped || H.bExhausted ||
+			                            H.TermReason == int(VOXEL_MARCH_TERM_CHUNK_CAP);
 			// THE GATE, AND IT MOVED ON 2026-08-24. A miss that crossed no absent
 			// chunk is a TRUE miss: every chunk on the segment was resident (solid
 			// parts missed, empties genuinely empty), so a coarser retry could only
@@ -5778,8 +5992,11 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 			// than the shipped gate, never more -- the safety property this whole
 			// file is written around. A truncated walk that crossed nothing
 			// absent behaves exactly as the control does: no retry.
-			const bool bWalkTruncated =
-				H.bExhausted || H.TermReason == int(VOXEL_MARCH_TERM_CHUNK_CAP);
+			// bWalkTruncated is the hoisted definition above the gate chain
+			// (2026-09-02); it now also counts a vertical-reach clip as "did
+			// not finish" -- wider in the retry-more direction only, and still
+			// ANDed under bCrossedAbsentChunk, so this arm remains a SUBSET of
+			// the control: fewer retried rays, never more.
 			const bool bGateOpen =
 				H.bCrossedAbsentChunk && (H.bCrossedNonSkyAbsent || bWalkTruncated);
 #else
@@ -5806,10 +6023,81 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				RayFtTaken += bGateOpen ? 1u : 0u;
 			}
 #endif
-			if (!bGateOpen)
+			// =======================================================
+			// THE LADDER DECISION (rewritten 2026-09-02, the altitude
+			// fix). Three exits, in precedence order:
+			//
+			// 1. ABSENCE RETRY -- gate open and depth remains.
+			//    Unchanged semantics: the next rung re-walks the WHOLE
+			//    segment from SegIn as a stand-in for ground streaming
+			//    may be missing, so any owed tail is subsumed and the
+			//    carried state resets. Depth stays bounded by
+			//    VOXEL_MARCH_FALLTHROUGH exactly as before.
+			//
+			// 2. STRUCTURAL CONTINUATION -- no absence retry is due,
+			//    but THIS walk stopped early (clamp / chunk cap /
+			//    budget), so the tail past its stop point is unproven.
+			//    Re-enter it one level coarser, past LastWalkL if need
+			//    be: primary coverage of ray the frame owns, not a
+			//    stand-in, so the depth clamp does not apply (the
+			//    loop's RingCount bound does). The stop point is the
+			//    clip point for a clip, the truncation t for a cap or
+			//    budget stop -- clamped into the rung's own interval so
+			//    a garbage THitUU off an exotic miss path can cost a
+			//    re-walk, never a skipped sliver.
+			//
+			// 3. BREAK -- gate closed and the walk FINISHED its
+			//    interval (every case the old `if (!bGateOpen) break`
+			//    covered, minus the truncated ones it wrongly
+			//    abandoned), or the cascade is out of levels -- in
+			//    which case a still-owed tail is counted LOST: the one
+			//    reading that must stay zero inside the frame's Z
+			//    budget.
+			if (bGateOpen && WalkL < LastWalkL)
 			{
-				break;
+				bZlTailOwed = false;
+				ZlResumeUU = SegIn;
+				continue;
 			}
+			// The ZCut clause: a Z-cut-EMPTIED rung mid-continuation never
+			// walked at all (its interval collapsed to a point), so it can
+			// neither prove nor cover the owed tail -- carry it, exactly as
+			// the ZTight/probe skip paths do. Gated on bZlTailOwed so a
+			// plain (non-continuation) ZCut-emptied segment keeps today's
+			// depth-bounded ladder to the digit.
+			if ((bWalkTruncated || (bZCutEmpty && bZlTailOwed)) &&
+			    WalkL + 1u < RingCount)
+			{
+				bZlTailOwed = true;
+				// MONOTONIC MAX, and the max is a proof: the frontier only
+				// ever advances to the end of walked coverage. A resumed walk
+				// that stops INSIDE its one-chunk resume bias (or a collapsed
+				// interval whose stop reads SegIn) would otherwise drag the
+				// frontier backward over ground the previous rung already
+				// covered -- pure re-work; with max, the stretch behind the
+				// frontier is always covered by some earlier rung and the
+				// stretch past it is always re-entered. Never a skip.
+				ZlResumeUU = max(ZlResumeUU,
+				                 (bZlClamped &&
+				                  !(H.bExhausted ||
+				                    H.TermReason == int(VOXEL_MARCH_TERM_CHUNK_CAP)))
+				                     ? WalkOut
+				                     : clamp(H.THitUU * S, WalkIn, WalkOut));
+#if VOXEL_MARCH_HOLE_STATS
+				GVoxelMarchZlResumed += 1u;
+#endif
+				continue;
+			}
+#if VOXEL_MARCH_HOLE_STATS
+			if (bWalkTruncated || (bZCutEmpty && bZlTailOwed))
+			{
+				// Out of levels with tail owed: the failure counter, 0/1
+				// per ray. See the statics' note for why its zero is a
+				// reading and not a structural silence.
+				GVoxelMarchZlTailLost = 1u;
+			}
+#endif
+			break;
 #endif
 #if VOXEL_MARCH_RUNG_PROBE
 			}
@@ -5890,7 +6178,28 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				}
 #endif
 #if VOXEL_MARCH_FALLTHROUGH_SHELL
-				break;
+				// A still-owed structural tail overrides the shell break
+				// (2026-09-02, the altitude fix): the tail is primary
+				// coverage, not a retry, and no gate flavour may abandon it
+				// while coarser levels remain. Nothing was walked here, so
+				// the carried resume state is untouched.
+				if (!bZlTailOwed)
+				{
+					break;
+				}
+#else
+				// THE WIDENED LOOP BOUND'S GUARD (2026-09-02): the ladder
+				// loop now runs to the cascade top for structural
+				// continuations, so a synthesized rung must impose the depth
+				// clamp itself -- advance past LastWalkL only while a tail
+				// is owed. The skip's exactness argument covers the owed
+				// tail too: a rung this arm removed could not have walked
+				// it, so handing it to the next level is the control's own
+				// behaviour, one rung later.
+				if (WalkL >= LastWalkL && !bZlTailOwed)
+				{
+					break;
+				}
 #endif
 #endif
 			}
@@ -5983,7 +6292,28 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				}
 #endif
 #if VOXEL_MARCH_FALLTHROUGH_SHELL
-				break;
+				// A still-owed structural tail overrides the shell break
+				// (2026-09-02, the altitude fix): the tail is primary
+				// coverage, not a retry, and no gate flavour may abandon it
+				// while coarser levels remain. Nothing was walked here, so
+				// the carried resume state is untouched.
+				if (!bZlTailOwed)
+				{
+					break;
+				}
+#else
+				// THE WIDENED LOOP BOUND'S GUARD (2026-09-02): the ladder
+				// loop now runs to the cascade top for structural
+				// continuations, so a synthesized rung must impose the depth
+				// clamp itself -- advance past LastWalkL only while a tail
+				// is owed. The skip's exactness argument covers the owed
+				// tail too: a rung this arm removed could not have walked
+				// it, so handing it to the next level is the control's own
+				// behaviour, one rung later.
+				if (WalkL >= LastWalkL && !bZlTailOwed)
+				{
+					break;
+				}
 #endif
 				// Non-shell gates: fall out of the rung body; the ladder
 				// advances to the next WalkL (or ends at LastWalkL and the
