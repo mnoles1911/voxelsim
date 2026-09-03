@@ -98,8 +98,8 @@ param(
     # anything pixel-bound. A frame-rate result that does not state its
     # resolution is not a result. Pass -Width/-Height and say which in whatever
     # you write.
-    [int]$Width = 1600,
-    [int]$Height = 900,
+    [int]$Width = 2560,
+    [int]$Height = 1440,
     [int]$TimeoutSec = 480,
     # THE SKY PINS. See "THE SKY PINS, AND WHY THEY DEFAULT TO A FROZEN NOON"
     # in the header for why these three defaults are what they are. Short
@@ -214,7 +214,10 @@ $argList = @(
     # takes exclusive display mode can wedge the box.
     "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:FullscreenMode=1",
     "-ini:GameUserSettings:[/Script/Engine.GameUserSettings]:LastConfirmedFullscreenMode=1",
-    '-ForceRes',
+    # -ForceRes REMOVED 2026-09-03: it pins the command-line size AND blocks
+    # runtime resolution changes -- the -VoxelForceRes/ApplySettings call it
+    # was swallowing is the one channel that works. (OWNERRES-1440B: force
+    # res APPLIED in the log, viewport still 1280x720, with this flag on.)
     "-VoxelSpawnAt=$SpawnAt",
     # Beside the spawn, because they are the same kind of thing: state that
     # decides what the run measures and that nothing downstream can recover if
@@ -232,6 +235,29 @@ $argList = @(
     "-VoxelPerfPreflightSec=$PreflightSec",
     "-VoxelPerfLingerSec=$LingerSec",
     "-VoxelPerfLogInterval=$LogIntervalSec",
+    # -VoxelForceRes IS THE RESOLUTION AUTHORITY NOW (2026-09-03): applied
+    # in AVoxelEarthGameMode::BeginPlay through UGameUserSettings (not
+    # persisted), because every external channel is proven dead. The -ini
+    # GameUserSettings overrides above were proven to move the size on
+    # 2026-08-25 and were observed DEAD by 2026-09-02: legs asking 1600x900
+    # AND 2560x1440 both rendered 1280x720 -- UE's factory-default
+    # GameUserSettings size, i.e. the overrides stopped latching entirely
+    # (and no Saved/Config/Windows/ exists for -game, so nothing persisted
+    # either). Rather than archaeology on the ini path, the resolution rides
+    # -ExecCmds as a console command, which executes after boot and cannot
+    # be ignored ('r.SetRes' via -ExecCmds was ALSO observed inert --
+    # echoed empty, no effect, leg OWNERRES-1440): 'wf' = windowed-
+    # fullscreen, matching the owner's
+    # PreferredFullscreenMode=1 at panel-native size -- which also sidesteps
+    # the 1.25 desktop-DPI scaling that shrank windowed sizes. The ini
+    # overrides above are kept as a harmless belt. VERIFIED, not assumed:
+    # the post-run check reads the engine's own TSR/view lines.
+    "-VoxelForceRes=${Width}x${Height}wf",
+    # The self-correcting half: whatever window the engine actually creates,
+    # screen percentage is set at runtime to reproduce the owner's INTERNAL
+    # resolution (1552x873, from his flown ProfileGPU) -- the ray count is
+    # the frame's dominant term and the number that must match his config.
+    '-VoxelForceInternal=1552x873',
     "-ExecCmds=`"$Cvars`""
 ) + $ExtraArgs
 
@@ -332,18 +358,36 @@ $sun = if ($TimeScale -eq 0) { "frozen $TimeOfDay $Date" } else { "MOVING x$Time
 # 2560x1440 and was quoted that way. Read the ENGINE'S size instead: the
 # marcher prints `view=WxH px` and the renderer prints `SceneColor WxH`. This
 # is the same rule as every other arm here -- prove it engaged, never assume.
-$actualRes = $null
+# TWO SIZES, BOTH READ FROM THE ENGINE (2026-09-03). Under the owner's config
+# (sg.ResolutionQuality=0 -> TSR at ~60.6%), the marcher's view= is the
+# INTERNAL resolution (~1552x873 at 1440p output) and is SUPPOSED to differ
+# from -Width: comparing view= against the window made every correctly-
+# configured leg read as a warning. The OUTPUT size is what the request
+# governs; TSR's own upscale line names both sides, so parse it first and
+# fall back to view= when TSR is off (then internal IS output).
+$internalRes = $null
+$outputRes = $null
 try {
-    $m = Select-String -Path $LogPath -Pattern 'view=(\d+)x(\d+) px' -List -ErrorAction SilentlyContinue
-    if ($m) { $actualRes = "$($m.Matches[0].Groups[1].Value)x$($m.Matches[0].Groups[2].Value)" }
+    # LAST match, not first: the first view= prints before the 2 s
+    # -VoxelForceInternal apply and reads the boot default (OWNERRES-1440D:
+    # first 1280x720, last 1552x873 -- the last is the leg's real size).
+    $m = Select-String -Path $LogPath -Pattern 'view=(\d+)x(\d+) px' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($m) { $internalRes = "$($m.Matches[0].Groups[1].Value)x$($m.Matches[0].Groups[2].Value)" }
 } catch { }
-if (-not $actualRes) {
+try {
+    # The engine's own report of the window it actually created (the TSR
+    # upscale line only exists in ProfileGPU dumps, never plain logs).
+    $t = Select-String -Path $LogPath -Pattern 'Voxel force internal: window (\d+)x(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($t) { $outputRes = "$($t.Matches[0].Groups[1].Value)x$($t.Matches[0].Groups[2].Value)" }
+} catch { }
+if (-not $outputRes) { $outputRes = $internalRes }
+if (-not $internalRes) {
     Write-Host "  ${LogName}: ok (${elapsed}s) at RESOLUTION UNVERIFIED (no view= line in the log -- do not quote an fps number from this leg until you know its size), sun $sun" -ForegroundColor Yellow
 }
-elseif ($actualRes -ne "${Width}x${Height}") {
-    Write-Host "  ${LogName}: ok (${elapsed}s) but RENDERED ${actualRes}, NOT the ${Width}x${Height} requested -- the size came from GameUserSettings/DPI, not the command line. The leg is VALID, but quote ${actualRes}. sun $sun" -ForegroundColor Yellow
+elseif ($outputRes -ne "${Width}x${Height}") {
+    Write-Host "  ${LogName}: ok (${elapsed}s) but OUTPUT ${outputRes} (internal ${internalRes}), NOT the ${Width}x${Height} requested -- r.SetRes did not latch. The leg is VALID, but quote internal ${internalRes} -> output ${outputRes}. sun $sun" -ForegroundColor Yellow
 }
 else {
-    Write-Host "  ${LogName}: ok (${elapsed}s) at ${actualRes} (verified from the engine, not the argument), sun $sun" -ForegroundColor Green
+    Write-Host "  ${LogName}: ok (${elapsed}s) OUTPUT ${outputRes}, internal ${internalRes} (both read from the engine; the gap is the owner's TSR screen percentage), sun $sun" -ForegroundColor Green
 }
 exit 0

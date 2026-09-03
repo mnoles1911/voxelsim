@@ -10,6 +10,9 @@
 #include "Misc/Parse.h"
 #include "TimerManager.h"
 #include "UnrealClient.h"
+#include "GameFramework/GameUserSettings.h"
+#include "Engine/GameViewportClient.h"
+#include "HAL/IConsoleManager.h"
 #include "VoxelDebug.h"
 #include "VoxelAgentReplication.h" // M6 gap closure: AVoxelAgentReplicator spawn below
 #include "VoxelAgentSubsystem.h" // M6 NPC swarm: -VoxelSwarmTest switch below
@@ -161,6 +164,125 @@ void AVoxelEarthGameMode::BeginPlayerSession(const FTransform* SpawnOverride)
 void AVoxelEarthGameMode::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// -VoxelForceRes=WxH[wf] (2026-09-03): the ONE resolution authority for
+	// headless legs. Everything external is proven dead on this box: -ResX
+	// alone is inert (2026-08-25), the -ini:GameUserSettings overrides that
+	// once worked stopped latching by 2026-09-02 (every leg fell to the
+	// 1280x720 factory default), and `r.SetRes` via -ExecCmds echoed back
+	// EMPTY with no effect (OWNERRES-1440). The consequence was not
+	// cosmetic: every frame timing this project has quoted was taken at
+	// 1280x720 while the owner plays 2560x1440. Going through the engine's
+	// own settings object from inside game code is the path that cannot be
+	// dropped on the floor, and it logs its engagement so a silent revert
+	// of this behaviour is visible in any leg's log.
+	{
+		FString ForceRes;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelForceRes="), ForceRes) && !ForceRes.IsEmpty())
+		{
+			const bool bWindowedFullscreen = ForceRes.EndsWith(TEXT("wf"), ESearchCase::IgnoreCase);
+			FString Dims = bWindowedFullscreen ? ForceRes.LeftChop(2) : ForceRes;
+			FString XStr, YStr;
+			if (Dims.Split(TEXT("x"), &XStr, &YStr) &&
+			    FCString::Atoi(*XStr) > 0 && FCString::Atoi(*YStr) > 0)
+			{
+				const FIntPoint Res(FCString::Atoi(*XStr), FCString::Atoi(*YStr));
+				if (UGameUserSettings* Settings = UGameUserSettings::GetGameUserSettings())
+				{
+					Settings->SetScreenResolution(Res);
+					Settings->SetFullscreenMode(bWindowedFullscreen
+					                                ? EWindowMode::WindowedFullscreen
+					                                : EWindowMode::Windowed);
+					// false = do not write the owner's GameUserSettings.ini --
+					// a leg must never edit the settings the owner plays with.
+					Settings->ApplySettings(false);
+					UE_LOG(LogTemp, Log,
+					       TEXT("Voxel force res: APPLIED %dx%d %s via UGameUserSettings ")
+					       TEXT("(-VoxelForceRes; not persisted). The marcher's view= line is ")
+					       TEXT("the internal res and TSR's upscale line names the output -- ")
+					       TEXT("verify there, not here."),
+					       Res.X, Res.Y,
+					       bWindowedFullscreen ? TEXT("windowed-fullscreen") : TEXT("windowed"));
+				}
+			}
+			else
+			{
+				UE_LOG(LogTemp, Error,
+				       TEXT("Voxel force res: could not parse '-VoxelForceRes=%s' (want WxH or ")
+				       TEXT("WxHwf) -- resolution NOT forced; this leg renders at whatever the ")
+				       TEXT("engine defaulted to."),
+				       *ForceRes);
+			}
+		}
+	}
+
+	// -VoxelForceInternal=WxH (2026-09-03): the SELF-CORRECTING half. The
+	// window size under -game -unattended obeys NOTHING on this box -- -ResX,
+	// the ini overrides, r.SetRes AND UGameUserSettings::ApplySettings (the
+	// block above, engagement-logged) all left a 1280x720 swapchain
+	// (SceneColor 1280x720, legs OWNERRES-1440/B/C). But the number a perf
+	// leg must reproduce is the INTERNAL resolution -- the marcher's ray
+	// count, the frame's dominant term; the owner's flown sessions render
+	// internally at 1552x873 (ProfileGPU: TSR 1552x873 -> 2560x1440). So:
+	// read the viewport size the engine ACTUALLY gave us, after it exists,
+	// and set r.ScreenPercentage to hit the requested internal size exactly
+	// -- whatever the window did, including a future engine fix that makes
+	// it 2560x1440 (the percentage then lands BELOW 100 instead of above;
+	// the arithmetic is the guard). The marcher's view= line is the proof.
+	{
+		FString ForceInternal;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelForceInternal="), ForceInternal) &&
+		    !ForceInternal.IsEmpty())
+		{
+			FString XStr, YStr;
+			const bool bParsed = ForceInternal.Split(TEXT("x"), &XStr, &YStr) &&
+			                     FCString::Atoi(*XStr) > 0 && FCString::Atoi(*YStr) > 0;
+			if (!bParsed)
+			{
+				UE_LOG(LogTemp, Error,
+				       TEXT("Voxel force internal: could not parse '-VoxelForceInternal=%s' ")
+				       TEXT("(want WxH) -- screen percentage untouched."),
+				       *ForceInternal);
+			}
+			else
+			{
+				const int32 TargetX = FCString::Atoi(*XStr);
+				// 2 s: past viewport creation and the ApplySettings above, well
+				// inside every leg's preflight. A one-shot, not a tick hook.
+				FTimerHandle ForceInternalTimer;
+				GetWorldTimerManager().SetTimer(
+				    ForceInternalTimer,
+				    FTimerDelegate::CreateWeakLambda(this, [this, TargetX]()
+				    {
+					    const UGameViewportClient* GVC = GetWorld() ? GetWorld()->GetGameViewport() : nullptr;
+					    const FIntPoint WindowPx =
+					        (GVC && GVC->Viewport) ? GVC->Viewport->GetSizeXY() : FIntPoint::ZeroValue;
+					    if (WindowPx.X <= 0)
+					    {
+						    UE_LOG(LogTemp, Error,
+						           TEXT("Voxel force internal: no viewport at apply time -- ")
+						           TEXT("screen percentage untouched; view= will show whatever ")
+						           TEXT("the defaults produced."));
+						    return;
+					    }
+					    const float Pct =
+					        FMath::Clamp(100.0f * float(TargetX) / float(WindowPx.X), 10.0f, 400.0f);
+					    if (IConsoleVariable* SP =
+					            IConsoleManager::Get().FindConsoleVariable(TEXT("r.ScreenPercentage")))
+					    {
+						    SP->Set(Pct, ECVF_SetByConsole);
+						    UE_LOG(LogTemp, Log,
+						           TEXT("Voxel force internal: window %dx%d, r.ScreenPercentage=%.2f ")
+						           TEXT("-> internal ~%dx%d (-VoxelForceInternal). Verify against the ")
+						           TEXT("marcher's view= line, never this one."),
+						           WindowPx.X, WindowPx.Y, Pct, TargetX,
+						           FMath::RoundToInt(float(WindowPx.Y) * Pct / 100.0f));
+					    }
+				    }),
+				    2.0f, false);
+			}
+		}
+	}
 
 	// THE LIGHT RIG NO LONGER LIVES HERE (W4, docs/lighting-weather-plan.md).
 	//
