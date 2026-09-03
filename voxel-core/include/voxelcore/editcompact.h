@@ -40,7 +40,14 @@ inline EditLog compactLog(const EditLog& source) {
     for (const auto& [key, cells] : byBrick) keys.push_back(key);
     std::sort(keys.begin(), keys.end(), BrickKeyLess{});
 
-    EditLog out(source.seed(), source.brickEdge());
+    // providerId AND latticePitchMm carry through. Dropping the pitch would
+    // silently relabel a compacted CRAFT log as a terrain log -- the bytes
+    // stay valid, the replay lands 25 mm diffs on the 10 cm lattice, and it
+    // reads as world corruption rather than as a mixed-up file. Dropping the
+    // providerId would likewise turn a stamped log into an unstamped one,
+    // which downgrades a hard refusal into a warning.
+    EditLog out(source.seed(), source.brickEdge(), source.providerId(),
+                source.latticePitchMm());
     for (const BrickKey& key : keys) {
         // append() normalizes (sorted-unique, last-write-wins) internally
         // and assigns the next contiguous sequence number.

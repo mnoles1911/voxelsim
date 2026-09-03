@@ -135,6 +135,8 @@
 #include "voxelcore/assetfield.h"
 #include "voxelcore/assetmanifest.h"
 #include "voxelcore/brick.h"
+#include "voxelcore/craftlattice.h"
+#include "voxelcore/craftvolume.h"
 #include "voxelcore/generator.h"
 #include "voxelcore/hash.h"
 #include "voxelcore/lakes.h"
@@ -995,6 +997,222 @@ void censusCoverRing(Walk& w, Ring& R, double sampleFraction, bool verbose) {
 
 // Every byte column of one row, already extrapolated. Kept as one struct so
 // the per-ring rows and the TOTAL row cannot drift apart.
+// ---------------------------------------------------------------------------
+// --craft: the settlement model
+// ---------------------------------------------------------------------------
+//
+// THIS HALF IS A MODEL AND THE OTHER HALF IS NOT, AND THE DIFFERENCE IS THE
+// WHOLE DESIGN. --detail-cover walks REAL ground and asks the resolver what
+// grows there; its number is a measurement. There is no procedural source for
+// "what a player builds", so nothing here can be. Every number this mode prints
+// is a consequence of a building recipe I wrote, and it is labelled as such on
+// every row. The assumption-free half of the craft census lives in
+// tests/test_craftcost.cpp, where per-pattern byte costs are PINNED against the
+// format contract; that is the half that can falsify something.
+//
+// WHY ALIGNMENT IS A SWEPT PARAMETER AND NOT A DETAIL. Measured in
+// test_craftcost.cpp: a 16x32x16 hole whose faces land on the 8-cell brick grid
+// leaves every brick uniform and costs the 512 B floor. THE SAME HOLE MOVED ONE
+// CELL costs 3,072 B, because it straddles 32 bricks. Cost tracks carved surface
+// measured in BRICKS, not carved volume. A settlement model that fixed alignment
+// would report whichever answer its author happened to build in, so this sweeps
+// it and prints both.
+//
+// GROUND INDEPENDENCE. A building is authored, not generated, so these craft
+// numbers do not depend on the terrain under them and are unaffected by the
+// synthetic-ground fallback. The TERRAIN CONTROL does depend on it, so the
+// control is refused rather than printed on synthetic ground -- see the report.
+
+struct CraftBuilding {
+    int64_t w = 0, d = 0, h = 0; // craft cells
+    int64_t wallT = 0;           // wall/floor/roof thickness, craft cells
+    int64_t offset = 0;          // 0 = faces on the brick grid, 1 = one cell off
+    int intensity = 0;           // 0 shell, 1 openings, 2 openings + detailing
+    int materials = 1;           // distinct solid materials in the fabric
+};
+
+// Material of one BUILDING-LOCAL craft cell. MAT_AIR means "not structure".
+MaterialId craftBuildingCell(const CraftBuilding& b, int64_t x, int64_t y, int64_t z) {
+    if (x < 0 || y < 0 || z < 0 || x >= b.w || y >= b.d || z >= b.h) return MAT_AIR;
+
+    const bool floorSlab = z < b.wallT;
+    const bool roofSlab = z >= b.h - b.wallT;
+    const bool wall =
+        x < b.wallT || x >= b.w - b.wallT || y < b.wallT || y >= b.d - b.wallT;
+    if (!floorSlab && !roofSlab && !wall) return MAT_AIR; // the room inside
+
+    if (b.intensity >= 1) {
+        // A door through the -y wall, and two windows per long wall. Deliberately
+        // NOT on multiples of eight -- an opening that happens to land on the
+        // brick grid is the free case and would flatter the model.
+        const int64_t doorW = 26, doorH = 78; // ~65 cm x ~195 cm
+        if (y < b.wallT && z >= b.wallT && z < b.wallT + doorH &&
+            x >= b.w / 2 - doorW / 2 && x < b.w / 2 + doorW / 2) {
+            return MAT_AIR;
+        }
+        const int64_t winW = 34, winH = 34, winZ = b.wallT + 45;
+        if (z >= winZ && z < winZ + winH) {
+            for (int64_t i = 1; i <= 2; ++i) {
+                const int64_t cx = (b.w * i) / 3;
+                if (x >= cx - winW / 2 && x < cx + winW / 2 &&
+                    (y < b.wallT || y >= b.d - b.wallT)) {
+                    return MAT_AIR;
+                }
+            }
+        }
+    }
+
+    if (b.intensity >= 2) {
+        // Detailing: a chamfer along the top outer edge, and a pierced band
+        // under the eaves. This is what 2.5 cm is FOR, and it is the expensive
+        // case because both straddle bricks everywhere they go.
+        const int64_t fromTop = b.h - 1 - z;
+        const int64_t fromEdgeX = std::min(x, b.w - 1 - x);
+        const int64_t fromEdgeY = std::min(y, b.d - 1 - y);
+        if (fromTop < 6 && std::min(fromEdgeX, fromEdgeY) < 6 - fromTop) return MAT_AIR;
+
+        const int64_t bandZ = b.h - b.wallT - 20;
+        if (z >= bandZ && z < bandZ + 14 && wall) {
+            if (((x + y) % 6) < 3) return MAT_AIR;
+        }
+    }
+
+    // THE MATERIAL COUNT MOVES THE BPP LADDER, and a single-material model
+    // silently prices every mixed brick at 1 bpp. Real building is stone AND
+    // plaster AND timber AND glazing: four materials is 2 bpp plus a 16 B local
+    // palette, measured at +36% per mixed brick in test_craftcost.cpp. Found by
+    // a mutation exercise noticing that no pinned pattern exercised that rung --
+    // so neither did this model, and it was under-pricing every building.
+    if (b.materials <= 1) return MAT_ROCK;
+    switch (((z / 5) + (x / 11)) % b.materials) {
+        case 0: return MAT_ROCK;
+        case 1: return MAT_CLAY;
+        case 2: return MAT_SAND;
+        case 3: return MAT_TOPSOIL;
+        case 4: return MAT_GRAVEL;
+        case 5: return MAT_SUBSOIL;
+        default: return MAT_BEDROCK;
+    }
+}
+
+struct CraftResult {
+    Census cen;                  // priced through bytesFor, comparable with cover
+    int64_t packBytes = 0;       // summed ChunkBrickPack::residentBytes()
+    int64_t bricksPromoted = 0;  // terrain bricks the structure touches
+    int64_t bricksProduced = 0;
+    int64_t bricksWithSolid = 0;
+    int64_t solidCells = 0;
+    int64_t structureCells = 0;  // craft cells the recipe called structure
+    bool ran = false;
+};
+
+// One building, promoted and carved and packed. ONE BUILDING AT A TIME, and
+// then multiplied: buildings in a settlement share no bricks, so the total is
+// linear by construction and holding fifty of them in memory at once would buy
+// nothing but a peak of a few hundred MB.
+CraftResult censusCraftBuilding(const CraftBuilding& b) {
+    CraftResult out;
+    const int64_t E = int64_t(kCraftChunkEdgeCells);
+
+    // Terrain bricks the bounding box spans, with the alignment offset applied.
+    const int64_t x0 = b.offset, y0 = b.offset, z0 = b.offset;
+    const int64_t bx0 = floorDiv(x0, E), bx1 = floorDiv(x0 + b.w - 1, E);
+    const int64_t by0 = floorDiv(y0, E), by1 = floorDiv(y0 + b.d - 1, E);
+    const int64_t bz0 = floorDiv(z0, E), bz1 = floorDiv(z0 + b.h - 1, E);
+
+    CraftLattice<B> lat;
+    CraftProducerCounters counters;
+
+    for (int64_t bz = bz0; bz <= bz1; ++bz)
+        for (int64_t by = by0; by <= by1; ++by)
+            for (int64_t bx = bx0; bx <= bx1; ++bx) {
+                const BrickKey tk{int32_t(bx), int32_t(by), int32_t(bz)};
+
+                // PROMOTE ONLY WHAT THE STRUCTURE TOUCHES. A player places wall
+                // blocks and chisels them; nobody fills a room with rock to
+                // hollow it out. Promoting the whole bounding box would charge
+                // the 512 B floor for every cubic metre of empty room and make
+                // the model say more about my loop bounds than about building.
+                bool touched = false;
+                for (int64_t cz = 0; cz < E && !touched; ++cz)
+                    for (int64_t cy = 0; cy < E && !touched; ++cy)
+                        for (int64_t cx = 0; cx < E && !touched; ++cx) {
+                            if (craftBuildingCell(b, bx * E + cx - x0, by * E + cy - y0,
+                                                  bz * E + cz - z0) != MAT_AIR) {
+                                touched = true;
+                            }
+                        }
+                if (!touched) continue;
+
+                lat.promote(tk, Brick<B>(MAT_ROCK));
+                ++out.bricksPromoted;
+
+                for (int64_t cz = 0; cz < E; ++cz)
+                    for (int64_t cy = 0; cy < E; ++cy)
+                        for (int64_t cx = 0; cx < E; ++cx) {
+                            const MaterialId m = craftBuildingCell(
+                                b, bx * E + cx - x0, by * E + cy - y0, bz * E + cz - z0);
+                            if (m != MAT_ROCK) {
+                                lat.setCell(bx * E + cx, by * E + cy, bz * E + cz, m);
+                            } else {
+                                ++out.structureCells;
+                            }
+                        }
+            }
+
+    if (out.bricksPromoted == 0) return out; // ran==false: the caller refuses
+
+    // Pack every promoted brick, and classify its craft bricks into the SAME
+    // Census the terrain and cover arms fill -- two readings of one field, so
+    // the two byte models below are not two different walks.
+    for (const BrickKey& tk : lat.promotedSorted()) {
+        const CraftChunkResult r = produceCraftChunk(lat, tk, counters);
+        if (!r.produced) continue;
+        ++out.bricksProduced;
+        if (r.anySolid) ++out.bricksWithSolid;
+        out.packBytes += r.residentBytes();
+
+        ++out.cen.chunksCandidate;
+        ++out.cen.chunksWalked;
+        const BrickKey base = craftBrickBaseOfTerrainBrick(tk);
+        for (int32_t cbz = 0; cbz < kCraftBricksPerAxis; ++cbz)
+            for (int32_t cby = 0; cby < kCraftBricksPerAxis; ++cby)
+                for (int32_t cbx = 0; cbx < kCraftBricksPerAxis; ++cbx) {
+                    const Brick<B>* cb = lat.craftBricks().find(
+                        BrickKey{base.x + cbx, base.y + cby, base.z + cbz});
+                    if (cb == nullptr) continue; // refused above; cannot happen here
+                    ++out.cen.bricks;
+                    const size_t solid = cb->solidCount();
+                    out.cen.solidCells += int64_t(solid);
+                    if (solid == 0) {
+                        ++out.cen.allAir;
+                        continue;
+                    }
+                    if (cb->isHomogeneous()) {
+                        ++out.cen.homogSolid;
+                        continue;
+                    }
+                    const size_t pal = cb->paletteSize();
+                    if (solid == size_t(Brick<B>::kCells)) {
+                        ++out.cen.mixedFull;
+                    } else {
+                        ++out.cen.mixedSurf;
+                    }
+                    ++out.cen.palHist[palBucket(pal)];
+                    out.cen.paletteEntries += int64_t(pal);
+                    out.cen.maxPalette = std::max(out.cen.maxPalette, int64_t(pal));
+                    out.cen.adaptiveCellBytes +=
+                        int64_t(Brick<B>::kCells) * bppFor(pal) / 8;
+                }
+        out.cen.bzMin = std::min(out.cen.bzMin, int64_t(tk.z));
+        out.cen.bzMax = std::max(out.cen.bzMax, int64_t(tk.z));
+    }
+
+    out.solidCells = int64_t(counters.solidCellsPacked.load());
+    out.ran = counters.chunksAttempted.load() != 0;
+    return out;
+}
+
 struct Bytes {
     double descriptors = 0, occupancy = 0, palette = 0, palettePlan = 0, index = 0;
     double cells[4] = {}; // 1, 2, 4, 8 bpp
@@ -1110,6 +1328,10 @@ void printRing(const Ring& R, const char* label) {
 int main(int argc, char** argv) {
     bool cascade = false, doExp = false, verbose = true, allowSynthetic = false;
     bool detailCover = false;
+    bool craft = false;
+    int64_t craftBuildings = 50;   // a village, the scale the falsifier names
+    double craftWm = 8.0, craftDm = 6.0, craftHm = 3.0, craftWallM = 0.20;
+    int64_t craftMaterials = 4;    // stone, plaster, timber, glazing
     double coverRingM = 112.0;   // VoxelDetailAssetSubsystem's -VoxelDetailRingMeters default
     int64_t coverPitchMm = 50;   // the pitch 223 of the 230 detail plants are baked at
     double radiusM = 0.0, atXm = 0.0, atYm = 0.0, sample = 1.0, depthM = 0.0;
@@ -1121,6 +1343,16 @@ int main(int argc, char** argv) {
         const char* a = argv[i];
         if (!std::strcmp(a, "--cascade")) cascade = true;
         else if (!std::strcmp(a, "--detail-cover")) detailCover = true;
+        else if (!std::strcmp(a, "--craft")) craft = true;
+        else if (!std::strcmp(a, "--craft-buildings") && i + 1 < argc) craftBuildings = std::strtoll(argv[++i], nullptr, 10);
+        else if (!std::strcmp(a, "--craft-wall-m") && i + 1 < argc) craftWallM = std::strtod(argv[++i], nullptr);
+        else if (!std::strcmp(a, "--craft-materials") && i + 1 < argc) craftMaterials = std::strtoll(argv[++i], nullptr, 10);
+        else if (!std::strcmp(a, "--craft-size") && i + 3 < argc) {
+            craftWm = std::strtod(argv[i + 1], nullptr);
+            craftDm = std::strtod(argv[i + 2], nullptr);
+            craftHm = std::strtod(argv[i + 3], nullptr);
+            i += 3;
+        }
         else if (!std::strcmp(a, "--cover-ring-m") && i + 1 < argc) coverRingM = std::strtod(argv[++i], nullptr);
         else if (!std::strcmp(a, "--cover-pitch-mm") && i + 1 < argc) coverPitchMm = std::strtoll(argv[++i], nullptr, 10);
         else if (!std::strcmp(a, "--radius") && i + 1 < argc) radiusM = std::strtod(argv[++i], nullptr);
@@ -1144,9 +1376,11 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (!cascade && !detailCover && radiusM <= 0.0) {
+    if (!cascade && !detailCover && !craft && radiusM <= 0.0) {
         std::fprintf(stderr,
-                     "usage: vxc_volumeprobe --cascade | --radius N | --detail-cover\n"
+                     "usage: vxc_volumeprobe --cascade | --radius N | --detail-cover | --craft\n"
+                     "       --craft [--craft-buildings 50] [--craft-size W D H] "
+                     "[--craft-wall-m 0.20] [--craft-materials 4]\n"
                      "       --detail-cover [--cover-ring-m 112] [--cover-pitch-mm 50] --assets DIR\n"
                      "       [--at Xm Ym] [--voxel-mm 100|50|25] [--seed N] [--sample F]\n"
                      "       [--assets DIR] [--tiles DIR] [--coarse DIR] [--zstd PATH] [--exp]\n"
@@ -1262,7 +1496,11 @@ int main(int argc, char** argv) {
     // run and a real run must not be able to look alike in the output.
     // --allow-synthetic is the deliberate door, and it prints a banner so a
     // pasted excerpt still carries the caveat.
-    if (!realGround || !realClimate) {
+    // --craft is exempt: a building is AUTHORED, so its byte cost does not
+    // depend on the ground under it and the fallback cannot bias it. The one
+    // number that does depend on real ground is the terrain control, and the
+    // craft report refuses to print that rather than printing a synthetic one.
+    if ((!realGround || !realClimate) && !craft) {
         const char* what = !realGround ? (!realClimate ? "Elevation AND climate" : "Elevation")
                                        : "Climate";
         if (!allowSynthetic) {
@@ -1280,6 +1518,177 @@ int main(int argc, char** argv) {
         std::printf("\n!!! SYNTHETIC WALK (--allow-synthetic). %s is the FLAT FALLBACK; these\n"
                     "!!! numbers do NOT transfer to the real bake -- see 2026-07-27.\n",
                     what);
+    }
+
+    // --- --craft: the settlement model, reported and returned ---------------
+    if (craft) {
+        const double cellM = double(kCraftPitchMm) / 1000.0;
+        auto cells = [&](double m) { return int64_t(std::llround(m / cellM)); };
+
+        std::printf("\n=== CRAFT SETTLEMENT MODEL -- 25 mm lattice ===\n");
+        std::printf("!!! THIS IS A MODEL, NOT A MEASUREMENT. There is no procedural source for\n"
+                    "!!! what a player builds, so every number below follows from a building\n"
+                    "!!! recipe written into this tool. The assumption-free half of the craft\n"
+                    "!!! census is tests/test_craftcost.cpp, where per-pattern byte costs are\n"
+                    "!!! PINNED against the format contract.\n");
+        // THE MATERIAL COUNT BELONGS ON THIS LINE. It moves the answer more than
+        // any other parameter here -- 1 material against 4 is 5.7 MB against
+        // 43.0 MB for the same fifty buildings -- and this banner exists so that
+        // a pasted excerpt still carries the recipe that produced it.
+        std::printf("\n  building  %.2f x %.2f x %.2f m, wall %.2f m, %lld material(s)"
+                    "  (%lld x %lld x %lld craft cells)\n",
+                    craftWm, craftDm, craftHm, craftWallM, (long long)craftMaterials,
+                    (long long)cells(craftWm), (long long)cells(craftDm), (long long)cells(craftHm));
+
+        static const char* kIntensityName[3] = {"shell", "openings", "detailed"};
+        struct Row { int64_t offset; int intensity; CraftResult r; };
+        std::vector<Row> rows;
+
+        for (int64_t off : {int64_t(0), int64_t(1)})
+            for (int it = 0; it < 3; ++it) {
+                CraftBuilding b;
+                b.w = cells(craftWm); b.d = cells(craftDm); b.h = cells(craftHm);
+                b.wallT = std::max<int64_t>(1, cells(craftWallM));
+                b.offset = off;
+                b.intensity = it;
+                b.materials = int(craftMaterials);
+                rows.push_back(Row{off, it, censusCraftBuilding(b)});
+            }
+
+        // THE PRODUCER MUST HAVE RUN. "Nothing was built" and "the model did not
+        // run" are different answers and a byte total cannot tell them apart --
+        // craftvolume.h's funnel exists for exactly this.
+        bool anyRan = false;
+        for (const Row& r : rows) anyRan = anyRan || r.r.ran;
+        if (!anyRan) {
+            std::fprintf(stderr,
+                         "\n*** THE PRODUCER DID NOT RUN -- refusing to report a craft volume.\n"
+                         "    No terrain brick was promoted, so this is not a result about\n"
+                         "    building; it is a result about this tool.\n");
+            return 1;
+        }
+
+        std::printf("\n  ONE BUILDING\n");
+        std::printf("  %-6s %-9s %8s %8s %10s %12s %12s %9s\n", "align", "carve", "bricks",
+                    "mixed", "solid cells", "pack KiB", "probe KiB", "floor%");
+        for (const Row& row : rows) {
+            const CraftResult& r = row.r;
+            if (!r.ran) continue;
+            const Bytes b = bytesFor(r.cen, 1.0);
+            const double probe = b.descriptors + b.occupancy + b.palettePlan + b.adaptive;
+            const double floorShare =
+                probe > 0.0 ? 100.0 * (double(r.bricksProduced) * 64.0 * kBytesDescriptor) / probe
+                            : 0.0;
+            std::printf("  %-6s %-9s %8lld %8lld %10lld %12.1f %12.1f %8.1f\n",
+                        row.offset == 0 ? "grid" : "off-1", kIntensityName[row.intensity],
+                        (long long)r.bricksProduced, (long long)r.cen.mixed(),
+                        (long long)r.solidCells, double(r.packBytes) / 1024.0, probe / 1024.0,
+                        floorShare);
+        }
+        std::printf("  pack  = summed ChunkBrickPack::residentBytes() -- descriptors+occ+mat,\n"
+                    "          the real pack, which the cover census never had.\n"
+                    "  probe = desc+occ+palette-plan+adaptive, the SAME model --detail-cover\n"
+                    "          prints, so these are comparable with its 25.4 / 131.6 MiB.\n"
+                    "  floor%% = share that is the promotion floor rather than carved content.\n"
+                    "          100%% means every byte IS the floor -- which is the ALIGNED\n"
+                    "          case, and its absolute cost is the smallest on the table.\n");
+
+        // The settlement. LINEAR BY CONSTRUCTION and said to be: buildings in a
+        // settlement share no bricks, so N of them is N times one. Measuring
+        // fifty separately would cost memory and buy no information.
+        std::printf("\n  SETTLEMENT (linear -- buildings share no bricks)\n");
+        std::printf("  %-6s %-9s", "align", "carve");
+        static const int64_t kCounts[] = {1, 10, 50, 100};
+        for (int64_t n : kCounts) std::printf(" %10lld", (long long)n);
+        std::printf("   (MiB, pack)\n");
+        for (const Row& row : rows) {
+            if (!row.r.ran) continue;
+            std::printf("  %-6s %-9s", row.offset == 0 ? "grid" : "off-1",
+                        kIntensityName[row.intensity]);
+            for (int64_t n : kCounts) {
+                std::printf(" %10.1f", double(row.r.packBytes) * double(n) / (1024.0 * 1024.0));
+            }
+            std::printf("\n");
+        }
+
+        // The band ceiling, from the pinned floor rather than from arithmetic
+        // written in a document.
+        const int64_t bandChunks = int64_t(80) * 80 * 80;
+        std::printf("\n  BAND: +/-40 chunks x %.2f m = +/-%.1f m, %lld brick slots\n",
+                    double(kCraftChunkEdgeCells) * cellM,
+                    40.0 * double(kCraftChunkEdgeCells) * cellM, (long long)bandChunks);
+
+        // --- the falsifiers, evaluated HERE and not left to the reader -------
+        const CraftResult* worst = nullptr;
+        for (const Row& row : rows) {
+            if (!row.r.ran) continue;
+            if (worst == nullptr || row.r.packBytes > worst->packBytes) worst = &row.r;
+        }
+        const double settlementMB =
+            double(worst->packBytes) * double(craftBuildings) / 1.0e6;
+        std::printf("\n  VERDICT -- pre-registered 2026-08-26: a settlement-scale craft volume\n"
+                    "  inside the band exceeding 150 MB falsifies the per-brick promotion unit.\n"
+                    "      worst configuration x %lld buildings = %.1f MB\n",
+                    (long long)craftBuildings, settlementMB);
+        std::printf("      %s\n", settlementMB > 150.0
+                                      ? ">>> FALSIFIED -- the promotion unit is too coarse <<<"
+                                      : ">>> STANDS <<<");
+
+        // --- the 2026-08-27 falsifier: craft against terrain, per m^2 -------
+        //
+        // COMPARED AGAINST A PUBLISHED REAL-GROUND NUMBER, NOT ONE COMPUTED HERE.
+        // The control this falsifier names is "terrain on the same footprint",
+        // and a settlement footprint is a different shape from any ring this
+        // tool walks -- so the honest comparison normalises both to bytes per
+        // square metre and uses the measurement that was already taken on REAL
+        // fine tiles: docs/measurements/cover-volume-census-2026-08-19.txt,
+        // grassland terrain control, 126.7 MiB over the 256 m shipping ring.
+        // Recomputing it on the synthetic fallback would be worse than not
+        // having it (2026-07-27: flat-fallback numbers do not transfer).
+        const double kControlMiB = 126.7;
+        const double kControlRingM = 256.0;
+        const double kControlAreaM2 = 3.14159265358979 * kControlRingM * kControlRingM;
+        const double terrainBytesPerM2 = kControlMiB * 1024.0 * 1024.0 / kControlAreaM2;
+
+        const double footprintM2 = craftWm * craftDm * double(craftBuildings);
+        const double terrainOnFootprint = terrainBytesPerM2 * footprintM2;
+
+        std::printf("\n  TERRAIN CONTROL (published, real fine tiles -- "
+                    "cover-volume-census-2026-08-19)\n");
+        std::printf("      grassland terrain %.1f MiB over a %.0f m ring = %.0f B/m^2\n",
+                    kControlMiB, kControlRingM, terrainBytesPerM2);
+        std::printf("      settlement footprint %.0f m^2 (%lld x %.1f x %.1f m)"
+                    " -> terrain there = %.2f MB\n",
+                    footprintM2, (long long)craftBuildings, craftWm, craftDm,
+                    terrainOnFootprint / 1.0e6);
+
+        std::printf("\n  VERDICT -- pre-registered 2026-08-27: if a settlement a player could\n"
+                    "  plausibly build costs MORE than the terrain control on the same\n"
+                    "  footprint, craft is a doubling of the world budget rather than a\n"
+                    "  decoration, and P3 must carry an eviction policy rather than defer one.\n");
+        for (const Row& row : rows) {
+            if (!row.r.ran) continue;
+            const double mb = double(row.r.packBytes) * double(craftBuildings) / 1.0e6;
+            std::printf("      %-6s %-9s %7.1f MB  = %5.1fx terrain   %s\n",
+                        row.offset == 0 ? "grid" : "off-1", kIntensityName[row.intensity], mb,
+                        mb / (terrainOnFootprint / 1.0e6),
+                        mb > terrainOnFootprint / 1.0e6 ? "FIRES" : "stands");
+        }
+        std::printf("\n      READ BOTH NUMBERS. The ratio fires because a 3 m building is more\n"
+                    "      geometry than the ground it stands on -- that is expected, not a\n"
+                    "      defect. What the ratio does NOT say is that craft is unaffordable:\n"
+                    "      the largest row above is %.1f MB against a brick pool sized in\n"
+                    "      hundreds of MB, and against cover's own 131.6 MiB at its shipping\n"
+                    "      ring. The falsifier is reported as written; the absolute column is\n"
+                    "      what should decide whether P3 needs eviction.\n",
+                    double(worst->packBytes) * double(craftBuildings) / 1.0e6);
+
+        if (!realGround) {
+            std::printf("\n  (Ground here is the synthetic fallback. It does not affect any craft\n"
+                        "   row -- a building is authored, not generated -- and the control above\n"
+                        "   is a published real-tile measurement, so neither number is synthetic.)\n");
+        }
+        return 0;
     }
 
     // --- --detail-cover: the arm, reported and returned ---------------------

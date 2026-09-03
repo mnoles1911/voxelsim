@@ -43,7 +43,32 @@ public:
     //       against. parse() still reads version-1 files (providerId reads
     //       as "" -- see checkProvider()'s kUnstamped result) so existing
     //       logs on disk keep loading; only NEW logs are written as v2.
-    static constexpr uint32_t kFormatVersion = 2;
+    //   3 - adds latticePitchMm (u32) right after providerId. There is now
+    //       more than one lattice a diff can be recorded against: the terrain
+    //       lattice at kVoxelSizeMm and the CRAFT lattice at kCraftPitchMm
+    //       (voxelcore/craftlattice.h). Both use 8^3 bricks and uint16 cell
+    //       indices, so brickEdge does NOT distinguish them -- a craft log
+    //       replayed as a terrain log would land 25 mm edits on 10 cm voxels
+    //       at a quarter of their true coordinates and look like corruption
+    //       of the world rather than a mixed-up file. Pre-v3 logs read as
+    //       kVoxelSizeMm, which is what every log written before this was.
+    //
+    // WE WRITE THE LOWEST VERSION THAT CAN REPRESENT THE CONTENT, not
+    // kFormatVersion unconditionally. A terrain log carries pitch
+    // kVoxelSizeMm, which is exactly what a v2 reader already assumes, so its
+    // v3 encoding would be byte-identical to v2 apart from the version number
+    // and a redundant field -- and stamping it v3 would make every existing
+    // build REFUSE a save it could have read perfectly (parse rejects
+    // fmt > kFormatVersion). That is a silent data-loss shape: the world is
+    // fine, the reader is fine, and the version number alone breaks them apart.
+    //
+    // So only a log that actually NEEDS the pitch field -- a craft log -- is
+    // written as v3. Craft logs live in their own file that no older build
+    // looks for, so v3 never reaches a reader that cannot handle it.
+    //
+    // kFormatVersion is therefore "the highest version this build can write",
+    // and formatVersionForContent() is what it actually writes.
+    static constexpr uint32_t kFormatVersion = 3;
     static constexpr uint32_t kMinReadableFormatVersion = 1;
     static constexpr uint32_t kMagic = 0x4C455856; // "VXEL" little-endian
 
@@ -55,11 +80,27 @@ public:
     // checkProvider()).
     enum class ProviderCheck { kMatch, kUnstamped, kMismatch };
 
-    EditLog(uint64_t seed, uint8_t brickEdge, std::string providerId = {})
-        : seed_(seed), brickEdge_(brickEdge), providerId_(std::move(providerId)) {}
+    // `latticePitchMm` defaults to the terrain lattice, so every existing
+    // caller keeps its exact meaning without naming it.
+    EditLog(uint64_t seed, uint8_t brickEdge, std::string providerId = {},
+            uint32_t latticePitchMm = static_cast<uint32_t>(kVoxelSizeMm))
+        : seed_(seed), brickEdge_(brickEdge), providerId_(std::move(providerId)),
+          latticePitchMm_(latticePitchMm) {}
 
     uint64_t seed() const { return seed_; }
     uint8_t brickEdge() const { return brickEdge_; }
+
+    // Which lattice this log's cell indices are addressed in. A brick is 8^3
+    // cells on every lattice, so this is the ONLY field that separates a
+    // terrain diff from a craft diff -- see the format-version note above.
+    uint32_t latticePitchMm() const { return latticePitchMm_; }
+
+    // The version serialize() will actually stamp: the LOWEST that can carry
+    // this log's content. See the note on kFormatVersion for why writing the
+    // newest unconditionally would refuse readable saves to older builds.
+    uint32_t formatVersionForContent() const {
+        return latticePitchMm_ == static_cast<uint32_t>(kVoxelSizeMm) ? 2u : 3u;
+    }
     // Content-addressed identity of the tile provider this log's diffs were
     // recorded against ("" means unstamped: a pre-v2 log, or a caller that
     // never had a provider identity, e.g. tests). See ProviderCheck.
@@ -102,13 +143,18 @@ public:
     }
 
     void serialize(std::vector<uint8_t>& out) const {
+        // The version and the presence of the pitch field move TOGETHER, and
+        // parse() reads the field under the same condition (fmt >= 3). Writing
+        // one without the other shifts every following byte.
+        const uint32_t fmt = formatVersionForContent();
         ByteWriter w(out);
         w.u32(kMagic);
-        w.u32(kFormatVersion);
+        w.u32(fmt);
         w.u32(kWorldGenVersion);
         w.u64(seed_);
         w.u8(brickEdge_);
         writeString(w, providerId_);
+        if (fmt >= 3) w.u32(latticePitchMm_);
         w.u64(entries_.size());
         const uint32_t cellsPerBrick =
             uint32_t(brickEdge_) * brickEdge_ * brickEdge_;
@@ -134,8 +180,13 @@ public:
         if (edge != 8 && edge != 16) return std::nullopt;
         std::string providerId; // stays "" for fmt==1 (pre-provider-stamp logs)
         if (fmt >= 2 && !readString(r, providerId)) return std::nullopt;
+        // Pre-v3 logs predate the craft lattice, so they are terrain diffs by
+        // construction -- there was nothing else to be.
+        uint32_t pitchMm = static_cast<uint32_t>(kVoxelSizeMm);
+        if (fmt >= 3 && !r.u32(pitchMm)) return std::nullopt;
+        if (pitchMm == 0) return std::nullopt;
         if (!r.u64(count)) return std::nullopt;
-        EditLog log(seed, edge, std::move(providerId));
+        EditLog log(seed, edge, std::move(providerId), pitchMm);
         const uint32_t cellsPerBrick = uint32_t(edge) * edge * edge;
         for (uint64_t i = 0; i < count; ++i) {
             EditEntry e;
@@ -179,6 +230,10 @@ public:
         uint64_t seed = 0;
         bool haveBrickEdge = false;
         uint8_t brickEdge = 0;
+        // Reached by SKIPPING providerId rather than materialising it, so
+        // peekHeader keeps its promise to allocate nothing.
+        bool haveLatticePitch = false;
+        uint32_t latticePitchMm = 0;
     };
 
     static HeaderPeek peekHeader(const uint8_t* data, size_t size) {
@@ -189,7 +244,14 @@ public:
         if (!(h.haveFormat = r.u32(h.format))) return h;
         if (!(h.haveWorldGen = r.u32(h.worldGen))) return h;
         if (!(h.haveSeed = r.u64(h.seed))) return h;
-        h.haveBrickEdge = r.u8(h.brickEdge);
+        if (!(h.haveBrickEdge = r.u8(h.brickEdge))) return h;
+        // Everything past here is version-gated, and a peek must stay total:
+        // a v1/v2 file simply has no pitch field and says so via haveLatticePitch.
+        if (h.format < 3) return h;
+        uint16_t providerLen = 0;
+        if (!r.u16(providerLen)) return h;
+        if (!r.skip(providerLen)) return h;
+        h.haveLatticePitch = r.u32(h.latticePitchMm);
         return h;
     }
 
@@ -281,6 +343,7 @@ private:
     uint64_t seed_;
     uint8_t brickEdge_;
     std::string providerId_;
+    uint32_t latticePitchMm_ = static_cast<uint32_t>(kVoxelSizeMm);
     std::vector<EditEntry> entries_;
 };
 
