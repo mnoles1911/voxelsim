@@ -2,6 +2,7 @@
 
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- near-field water component lifetime
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelEditRelay.h"
 #include "VoxelWaterChunkComponent.h"
@@ -1852,6 +1853,8 @@ void UVoxelWaterSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	ChunkRoot = NewObject<USceneComponent>(ChunkOwner, TEXT("VoxelWaterChunkRoot"));
 	ChunkOwner->SetRootComponent(ChunkRoot);
 	ChunkRoot->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+	VoxelEofLedger::CountRegister();
 #if WITH_EDITOR
 	ChunkOwner->SetActorLabel(TEXT("VoxelWaterChunkOwner"));
 #endif
@@ -2061,6 +2064,8 @@ UVoxelGpuPoolComponent* SpawnWaterPoolPrimitive(AActor* ChunkOwner, UMaterialInt
 	Pool->SetChunkMaterial(Material);
 	PoolOwner->SetRootComponent(Pool);
 	Pool->RegisterComponent();
+	VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+	VoxelEofLedger::CountRegister();
 
 	// SetWorldLocation AFTER RegisterComponent, never SetRelativeLocation
 	// before: SetRootComponent on a freshly NewObject'd component installs an
@@ -3130,6 +3135,8 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 				if (*Existing)
 				{
 					(*Existing)->DestroyComponent();
+					VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+					VoxelEofLedger::CountUnregister();
 				}
 				Impl.ChunkComponents.Remove(BrickCoord);
 			}
@@ -3277,6 +3284,8 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 				if (*Existing)
 				{
 					(*Existing)->DestroyComponent();
+					VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+					VoxelEofLedger::CountUnregister();
 				}
 				Impl.ChunkComponents.Remove(BrickCoord);
 			}
@@ -3323,6 +3332,8 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 			Comp->SetRelativeLocation(BrickOriginUU);
 			Comp->SetMaterial(0, Material);
 			Comp->RegisterComponent();
+			VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+			VoxelEofLedger::CountRegister();
 			Impl.ChunkComponents.Add(BrickCoord, Comp);
 		}
 		Comp->SetChunkQuads(MoveTemp(Quads), MoveTemp(CornerHeights), Activity);
@@ -3353,6 +3364,8 @@ void MarkMobilizedBricksDirty(FVoxelWaterImpl& Impl)
 			if (*Existing)
 			{
 				(*Existing)->DestroyComponent();
+				VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+				VoxelEofLedger::CountUnregister();
 			}
 			Impl.ImplicitChunkComponents.Remove(C);
 		}
@@ -4125,6 +4138,8 @@ void DropImplicitWaterDraw(FVoxelWaterImpl& Impl)
 		if (Pair.Value)
 		{
 			Pair.Value->DestroyComponent();
+			VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+			VoxelEofLedger::CountUnregister();
 		}
 	}
 	Impl.ImplicitChunkComponents.Empty();
@@ -4228,6 +4243,8 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 								if (*Existing)
 								{
 									(*Existing)->DestroyComponent();
+									VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+									VoxelEofLedger::CountUnregister();
 								}
 								Impl.ImplicitChunkComponents.Remove(C);
 								++Impl.ImplicitBricksEvicted;
@@ -4593,6 +4610,8 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				if (*Existing)
 				{
 					(*Existing)->DestroyComponent();
+					VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+					VoxelEofLedger::CountUnregister();
 				}
 				Impl.ImplicitChunkComponents.Remove(BrickCoord);
 			}
@@ -4657,6 +4676,8 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			Comp->SetRelativeLocation(BrickOriginUU);
 			Comp->SetMaterial(0, Material);
 			Comp->RegisterComponent();
+			VoxelEofLedger::Count(VoxelEofLedger::ESource::WaterComp);
+			VoxelEofLedger::CountRegister();
 			Impl.ImplicitChunkComponents.Add(BrickCoord, Comp);
 		}
 		Comp->SetChunkQuads(MoveTemp(Quads), MoveTemp(CornerHeights), /*Activity=*/0.0f);

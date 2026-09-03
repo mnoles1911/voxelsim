@@ -58,6 +58,42 @@ ROOT = Path(__file__).resolve().parents[1]
 SPECS = ROOT / "specs"
 
 
+# THE LADDER. Owner decision 2026-08-27: everything in the game divides down
+# from 10 cm through 5 cm to 2.5 cm, and nothing else exists.
+#
+# 100 / 50 / 25 mm, and the reason it is these three and not "anything that
+# divides 100" is that each must be a POWER-OF-TWO step: the marcher rescales a
+# ray by 1/2^k per lattice, addresses it by shifting rather than dividing, needs
+# the chunk and brick nesting to stay integral (chunk 32 / brick 8, so the
+# divisor must divide 32), and derives the coarse projection from mips.h's 2x
+# fold. 20 mm divides 100 mm -- by 5 -- and fails all four.
+LADDER_MM = (100, 50, 25)
+
+
+def check_on_ladder(name: str, grid) -> "str | None":
+    """None if the baked grid sits on the world's lattice ladder, else why not.
+
+    ENFORCED AT EXPORT AND NOT AT AUTHORING, deliberately. `resolution_cm` on a
+    spec is an AUTHORING resolution and is not what ships: 226 specs are
+    authored at 1 cm and over a hundred at 2 cm, while nothing baked has ever
+    come out below 20 mm. Refusing those at authoring time would fail hundreds
+    of specs to catch a handful of real problems. Export is the moment a spec
+    becomes shipping content, so it is the moment the ladder applies.
+
+    This is the authoring-side twin of the engine's own refusal
+    (`vxc::assetCoverPitchRefusals`, `coverVolumeInit`). Without it an
+    off-ladder asset is only caught at load, after a bake, by a different
+    person -- which is exactly how the seven 2 cm corals survived as long as
+    they did."""
+    voxel_mm = int(round(grid.voxel_m * 1000.0))
+    if voxel_mm in LADDER_MM:
+        return None
+    rungs = " / ".join(f"{mm} mm" for mm in LADDER_MM)
+    return (f"{name}: baked at {voxel_mm} mm, which is not on the lattice ladder "
+            f"({rungs}). Author it at one of those -- nothing anywhere resamples, "
+            f"so an off-ladder grid does not degrade, it comes out the wrong SIZE.")
+
+
 def check_against_layer(name: str, grid, layer_index: int) -> "str | None":
     """None if the baked grid fits its layer's declared box, else why not.
 
@@ -206,7 +242,7 @@ def main() -> int:
                 print(f"  {name} seed {seed}: BUILD FAILED: {e}")
                 failed += 1
                 continue
-            why = check_against_layer(name, a.grid, layer)
+            why = check_on_ladder(name, a.grid) or check_against_layer(name, a.grid, layer)
             if why is not None:
                 print(f"  REFUSED {why}")
                 refused += 1
