@@ -1715,6 +1715,21 @@ def main():
     foam_tint.set_editor_property("constant", unreal.LinearColor(0.82, 0.90, 0.94, 1.0))
     water_base = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -190, -360)
     water_base.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 0.0, 1.0))
+    # COVERAGE AND ALBEDO ARE BOTH DRIVEN BY `foam`, AND THAT WAS INVESTIGATED
+    # AND LEFT ALONE ON 2026-08-30. It looks like double-counting -- BaseColor is
+    # lerped from black by foam while MP_Opacity is saturate(foam) from the same
+    # term -- so a half-foam pixel appears to get half-coverage of a half-black
+    # albedo. It was rewired to a constant foam_tint and REGENERATED, and the
+    # measured result was NOTHING: the pond was byte-identical (near-black 11,586
+    # -> 11,602, frame mean 188.4 both), and so was the deliberately saturated
+    # arm (BathyFoamWidthM 400 + BathyFoamGain 5: 219,844 -> 220,037). The
+    # material asset was confirmed rewritten, so that is an engagement-proven
+    # null, not a missed edit.
+    #
+    # Whatever SLW does with BaseColor here, it is not what that reading assumed.
+    # Reverted rather than kept, because an appearance change to a shared
+    # material that fixes nothing measurable is risk without benefit -- it would
+    # ride into every river and PBF surface unverified.
     tinted = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -40, -450)
     if not mel.connect_material_expressions(water_base, "", tinted, "A"):
         raise RuntimeError("connect water_base -> tinted.A failed")

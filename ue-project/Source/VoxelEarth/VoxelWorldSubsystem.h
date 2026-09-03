@@ -182,9 +182,9 @@ public:
 	// must be passed, the subsystem is Fatal on a malformed cascade.
 	//
 	// THE TORUS ASSERT GETS SAFER, not tighter: R0 now spans 40 chunks against
-	// kDimXY 128 where it spanned 80. And AVoxelClipmapActor is unaffected -- it
-	// reads RingPresets[GetMaxRingLevel()].OuterMeters, which is 4096 m before
-	// and after, so the 30 km heightmap's vertex spacing does not move.
+	// kDimXY 128 where it spanned 80. AVoxelClipmapActor reads
+	// RingPresets[GetMaxRingLevel()].OuterMeters (8,192 m), so its vertex
+	// spacing and 65.5 km outer half-extent derive from this table.
 	static constexpr FRingPreset kDefaultRingPresets[VoxelCoords::kNumLevels] = {
 		{0.0, 64.0},
 		{64.0, 128.0},
@@ -192,26 +192,27 @@ public:
 		{256.0, 512.0},
 		{512.0, 1024.0},
 		{1024.0, 2048.0},
-		{2048.0, 4096.0}, // R6: the 4 km cascade edge (GetMaxRingLevel stops here)
-		// THE OLD DORMANT R6 {4096, 8192} IS GONE, and that is the whole point of
-		// the deepening: the seventh ring is no longer a dormant 8 km extension,
-		// it is the ring that lets the SAME 4 km be reached from R0 = 64 m. The
-		// construction ratio the old comment protected (Outer/ChunkEdge == 40) is
-		// preserved on every entry above -- 64/1.6, 128/3.2, ... 4096/102.4 -- so
-		// the geometric derivation OuterUU(L) = R0 * 2^L that the marcher computes
-		// from ONE uniform still holds, with R0 now 64 m on both sides.
+		{2048.0, 4096.0}, // R6
+		{4096.0, 8192.0}, // R7: THE CASCADE EDGE (2026-09-02). Everything beyond
+		                  // 8,192 m is AVoxelClipmapActor's job again -- its inner
+		                  // hole lands on this edge by construction
+		                  // (SpacingUUForLevel reads this row's OuterMeters).
+		// R8/R9/R10 (16/32/65 km, coarse-derived) EXISTED 2026-08-30..09-02 and
+		// were removed deliberately: the renderer never coherently supported them
+		// (marcher ring clamp, GPU residency scan cap, admission Z-range) and
+		// walking them cost ~219 ms/frame. docs/cascade-cut-to-8-2026-09-02.md.
 		//
-		// TO REACH 8 km, add an EIGHTH ring rather than stretching this one: raise
-		// VoxelCoords::kNumLevels to 8, append {4096, 8192}, give it a cap share,
-		// and set kDefaultMaxRingLevel to 7. That costs 90 chunk iterations against
-		// today's 80 -- still well under the 140 the six-ring 4 km cascade cost --
-		// and it is the reason this deepening is the right shape for 8 km too.
+		// The construction ratio Outer/ChunkEdge == 40 holds on every entry
+		// (64/1.6 ... 8192/204.8), so the geometric derivation
+		// OuterUU(L) = R0 * 2^L that the marcher computes from ONE uniform holds,
+		// and the march index aliasing proof (span 80 < kDimXY 128) is
+		// level-independent.
 	};
 	// A short initializer list here is silently zero-filled by C++, and the
 	// consequences are runtime-silent rather than loud: a {0,0} annulus admits no
 	// chunks at that level, and AVoxelClipmapActor derives its ENTIRE vertex
 	// spacing from RingPresets[kNumLevels-1].OuterMeters, so a zero there
-	// collapses the whole 30 km heightmap to a degenerate zero-extent mesh.
+	// collapses the whole 65 km heightmap to a degenerate zero-extent mesh.
 	static_assert(UE_ARRAY_COUNT(kDefaultRingPresets) == VoxelCoords::kNumLevels, "kDefaultRingPresets must have one entry per level");
 
 	// Outer-edge eviction hysteresis: a chunk leaves its level's desired set
@@ -256,9 +257,8 @@ public:
 	static const FRingPreset* GetRingPresets();
 
 	// Outermost ring level actually streaming this run (-VoxelMaxRingLevel=<N>,
-	// default 5 -- the shipped 4 km cascade; level 6, the 8.19 km ring, is
-	// compiled in but streams only when this says 6, see the .cpp).
-	// GetRingPresets()[GetMaxRingLevel()].OuterMeters is
+	// default 7 -- the full 8,192 m cascade; see kDefaultMaxRingLevel in the
+	// .cpp). GetRingPresets()[GetMaxRingLevel()].OuterMeters is
 	// therefore where the voxel world really ends, which is what
 	// AVoxelClipmapActor has to butt its inner hole against -- see
 	// SpacingUUForLevel. Resolved once from the command line at first use.

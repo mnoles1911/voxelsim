@@ -342,7 +342,14 @@ TAutoConsoleVariable<bool> CVarVoxelWaterRivers(
 // docs/measurements/s1-close-2026-07-27.txt.
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
 	TEXT("voxel.Stream.MaxAppliesPerFrame"),
-	192,
+	// 768 SINCE 2026-09-02 (was 192). The owner's requirement is a full 8-ring
+	// fill (~58k chunks) in under 60 s, and this cap is multiplied by the TICK
+	// RATE: at the historic 65 Hz, 192 was plenty (12.5k/s); at the 15 Hz a
+	// heavy scene ticks at, 192 gives 2.9k/s and the fill crawls. 768 restores
+	// >=11k/s at 15 Hz. The 1024/24ms arms (Saved/q-a1024*.log) proved the
+	// apply loop stops being the bound well before this; the 6 ms wall-clock
+	// ApplyBudgetMs below still back-stops a slow frame.
+	768,
 	TEXT("Streaming throughput: HARD CEILING on worker-mesh-result chunk-component applies ")
 	TEXT("(FVoxelWorldImpl::DrainResults) per frame. As of the 2026-07-24 streaming-speed pass this is a safety ")
 	TEXT("ceiling, not the steady-state throttle -- the loop drains until voxel.Stream.ApplyBudgetMs of wall-clock ")
@@ -351,6 +358,36 @@ TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
 	TEXT("fill the ring cascade and leaving 1-2 min bare-terrain lag on every LOD upgrade. Raised + time-budgeted ")
 	TEXT("(Matt directive: prioritize silky/fast streaming, tolerate rare hitches during the initial load storm; ")
 	TEXT("steady state stays smooth because the queue is small so neither cap binds)."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamApplyCruiseCap(
+	TEXT("voxel.Stream.ApplyCruiseCap"),
+	64,
+	TEXT("Cruise apply-RATE cap (2026-09-02, the Goal-3 p95 pass, v2). CSV GPU attribution at the ")
+	TEXT("kept vista flight put the moving p95 on APPLY-BURST frames: ~200-250 chunks applied in ")
+	TEXT("one frame vs ~19 typical, with ~72% of the GPU's p95 step being the worldgen kernels ")
+	TEXT("riding the burst (WlVoxelize/WlColumn/PoolWrite). v1 divided the BACKLOG across frames ")
+	TEXT("(backlog/6) and NEVER ENGAGED -- measured smoothCap=0 over a full flight -- because a ")
+	TEXT("ring-crossing is not a one-shot burst but a standing river: the backlog holds 600-4,000 ")
+	TEXT("while deliveries continue, so depth/6 sits above the natural per-frame drain. A river is ")
+	TEXT("smoothed by capping the RATE: while the backlog is at or below ")
+	TEXT("voxel.Stream.ApplyStormBacklog, at most THIS many render-facing applies land per frame. ")
+	TEXT("64 at ~110 fps is ~7,000 chunks/s -- above the ~5,300/s a 20 m/s flight consumes, so ")
+	TEXT("cruise keeps up; a backlog past the storm threshold gets full throttle (cold fill, ")
+	TEXT("teleport -- the <60 s fill requirement is untouched). <=0 disables."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamApplyStormBacklog(
+	TEXT("voxel.Stream.ApplyStormBacklog"),
+	10000,
+	TEXT("Backlog depth (delivered-but-unapplied results, ResultsBacklogCounter) above which ")
+	TEXT("DrainResults ignores voxel.Stream.ApplyCruiseCap and drains at full throttle. The ")
+	TEXT("2026-07-24 directive stands: prioritize fast fill during a load storm, tolerate hitches ")
+	TEXT("there; the rate cap exists for CRUISE waves, which own the moving p95. 2,000 was the ")
+	TEXT("wrong decade -- measured (GOAL3-RATECAP): ring-crossing waves at 20 m/s run 600-4,100 ")
+	TEXT("deep and took the bypass (smoothCap=0, componentsApplied=768 on hitch frames), while ")
+	TEXT("genuine cold fill runs ~90k (the dispatch-ahead mechanism on ResultsBacklogCounter). ")
+	TEXT("10,000 separates the regimes with a decade of margin each way."),
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelStreamApplyBudgetMs(
@@ -1439,9 +1476,12 @@ FLinearColor VoxelDebug::RingLevelTint(int32 Level)
 		FLinearColor(1.0f, 0.55f, 0.05f, 1.0f), // R2 orange
 		FLinearColor(0.9f, 0.1f, 0.1f, 1.0f),   // R3 red
 		FLinearColor(0.85f, 0.1f, 0.85f, 1.0f), // R4 magenta
-		FLinearColor(0.25f, 0.5f, 1.0f, 1.0f),  // R5 blue (2 km cascade edge)
-		FLinearColor(0.1f, 0.9f, 0.9f, 1.0f),   // R6 cyan (8 km ring, -VoxelMaxRingLevel=6)
+		FLinearColor(0.25f, 0.5f, 1.0f, 1.0f),  // R5 blue
+		FLinearColor(0.1f, 0.9f, 0.9f, 1.0f),   // R6 cyan
+		FLinearColor(0.95f, 0.95f, 0.95f, 1.0f) // R7 white (8 km cascade edge)
 	};
+	// NOTE: the assert checks the DECLARED size; this list ran 7-of-11 during
+	// the 11-level period and R7+ debug rings rendered invisible. Count by hand.
 	static_assert(UE_ARRAY_COUNT(kTints) == VoxelCoords::kNumLevels,
 	              "kTints must have one entry per level (a short list yields invisible transparent-black debug rings)");
 	return kTints[FMath::Clamp(Level, 0, VoxelCoords::kNumLevels - 1)];
@@ -1609,6 +1649,16 @@ float VoxelDebug::GetStreamApplyBudgetMs()
 // caps" armed-indicator line reads these: printing the effective value beside
 // the value it replaced is what makes "armed" distinguishable from "the switch
 // name was misspelled and FParse left it alone".
+int32 VoxelDebug::GetStreamApplyCruiseCap()
+{
+	return CVarVoxelStreamApplyCruiseCap.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamApplyStormBacklog()
+{
+	return FMath::Max(0, CVarVoxelStreamApplyStormBacklog.GetValueOnGameThread());
+}
+
 int32 VoxelDebug::GetStreamMaxAppliesPerFrameCvar()
 {
 	return FMath::Max(1, CVarVoxelStreamMaxAppliesPerFrame.GetValueOnGameThread());

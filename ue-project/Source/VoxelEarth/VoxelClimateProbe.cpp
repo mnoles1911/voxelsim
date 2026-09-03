@@ -265,4 +265,59 @@ FVoxelClimateBytes SampleClimateAtWorldUU(double WorldXUU, double WorldYUU)
 	return Out;
 }
 
+// Raw tile bytes, for vxc::classifyBiome. Same sampler, same bilinear, same
+// world->pixel convention as the remapped one above -- deliberately a sibling of
+// that function rather than a second sampler, because two samplers is how the
+// classifier and the colour come to disagree about where a biome starts.
+//
+// NO REMAP AND NO SENTINEL FLOOR, and both omissions are load-bearing. The
+// window exists to stretch a display axis; the classifier's thresholds are in
+// wire units. The floor exists to stop terrain impersonating a debug marker in a
+// MATERIAL; a classifier that saw a floored byte would misclassify the coldest
+// and driest ground as something warmer and wetter.
+FVoxelRawClimate SampleRawClimateAtWorldUU(double WorldXUU, double WorldYUU)
+{
+	if (!GInitialized)
+	{
+		EnsureInitialized();
+	}
+
+	FVoxelRawClimate Out;
+	vxc::ITileSampler* Sampler = GSampler.get();
+	if (Sampler == nullptr)
+	{
+		return Out; // bValid stays false -- the caller must not classify
+	}
+
+	const double PixelSizeUU = double(Sampler->pixelSizeMm()) / 10.0;
+	const double Px = WorldXUU / PixelSizeUU;
+	const double Py = WorldYUU / PixelSizeUU;
+	const int64 Px0 = (int64)FMath::FloorToDouble(Px);
+	const int64 Py0 = (int64)FMath::FloorToDouble(Py);
+	const double Fx = Px - double(Px0);
+	const double Fy = Py - double(Py0);
+
+	const vxc::ClimateSample C00 = Sampler->climate(Px0, Py0);
+	const vxc::ClimateSample C10 = Sampler->climate(Px0 + 1, Py0);
+	const vxc::ClimateSample C01 = Sampler->climate(Px0, Py0 + 1);
+	const vxc::ClimateSample C11 = Sampler->climate(Px0 + 1, Py0 + 1);
+
+	auto Bilerp = [Fx, Fy](double V00, double V10, double V01, double V11)
+	{
+		return FMath::Lerp(FMath::Lerp(V00, V10, Fx), FMath::Lerp(V01, V11, Fx), Fy);
+	};
+	auto ToByte = [](double V) -> uint8
+	{
+		return (uint8)FMath::Clamp(FMath::RoundToInt(V), 0, 255);
+	};
+
+	Out.Temperature = ToByte(Bilerp(C00.temperature, C10.temperature, C01.temperature, C11.temperature));
+	Out.Precipitation =
+		ToByte(Bilerp(C00.precipitation, C10.precipitation, C01.precipitation, C11.precipitation));
+	Out.PrecipVariability = ToByte(Bilerp(C00.precipVariability, C10.precipVariability,
+	                                      C01.precipVariability, C11.precipVariability));
+	Out.bValid = true;
+	return Out;
+}
+
 } // namespace VoxelClimate

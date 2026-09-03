@@ -82,16 +82,44 @@ namespace VoxelClimate
 	// not a classification: its job is to use the full 8-bit LUT axis for a
 	// region that occupies ~7% of the wire range, and that job does not go away
 	// just because biome.h is now correct.
-	inline constexpr int32 kTempU8Lo = vxc::climateTempU8FromMilliC(-8'600);   // -8.6 C
-	inline constexpr int32 kTempU8Hi = vxc::climateTempU8FromMilliC(19'200);   // +19.2 C
-	inline constexpr int32 kPrecipU8Lo = vxc::climatePrecipU8FromMmPerYr(659);  // 659 mm/yr
-	inline constexpr int32 kPrecipU8Hi = vxc::climatePrecipU8FromMmPerYr(1506); // 1506 mm/yr
+	// RE-FITTED 2026-08-30 TO THE WORLD ACTUALLY CONFIGURED, which is the whole
+	// point of a display stretch and is what backlog 0.0d asked for.
+	//
+	// The old window (-8.6..+19.2 C, 659..1506 mm/yr -> bytes 100..189, 14..32)
+	// was measured on provider 3e11cf157a836c70: 25 tiles, 2897 m of relief.
+	// DefaultGame.ini points at 80b9ca451a23eae4: 289 tiles, 6331 m. Measured
+	// over 33,234,574 land pixels of THIS world (backlog 0.0d), raw tile bytes:
+	//
+	//     temperature   p1  89   p50 181   p99 215   max 230
+	//     precipitation p1   0   p50   6   p99  52   max 104
+	//
+	// So the old precipitation window clamped 72.9% of all land to byte 0, and
+	// the live census confirms the consequence on screen: the LUT's precip axis
+	// is pinned to an end on 49.6% of NEAR clipmap vertices and 80.9% of FAR
+	// ones. Four of five far vertices carry no precipitation information at all,
+	// which is exactly the owner's "dull smooth green" -- the material samples
+	// one corner of the table and paints one colour.
+	//
+	// The new window is this world's p1..p99 on both axes, chosen as round
+	// physical numbers that land on those bytes exactly.
+	//
+	// IT IS STILL A LINEAR STRETCH, and precipitation here is strongly skewed
+	// (median raw 6 against a p99 of 52), so the median lands at ~11% of the
+	// axis rather than the middle. That is honest -- this world IS dry -- but if
+	// the vista still reads flat after this, the next move is a NON-LINEAR axis,
+	// which is a design change to raise and not to make silently.
+	inline constexpr int32 kTempU8Lo = vxc::climateTempU8FromMilliC(-12'000);  // -12.0 C
+	inline constexpr int32 kTempU8Hi = vxc::climateTempU8FromMilliC(27'400);   // +27.4 C
+	inline constexpr int32 kPrecipU8Lo = vxc::climatePrecipU8FromMmPerYr(0);    // 0 mm/yr
+	inline constexpr int32 kPrecipU8Hi = vxc::climatePrecipU8FromMmPerYr(2450); // 2450 mm/yr
 
-	static_assert(kTempU8Lo == 100 && kTempU8Hi == 189,
+	static_assert(kTempU8Lo == 89 && kTempU8Hi == 215,
 	              "the temperature LUT axis must not move -- if this fires, either the "
 	              "climate quantization range changed or someone retuned the window; "
-	              "either way T_VoxelBiomeLUT must be regenerated in the same commit");
-	static_assert(kPrecipU8Lo == 14 && kPrecipU8Hi == 32,
+	              "either way T_VoxelBiomeLUT must be regenerated in the same commit "
+	              "(ue-project/Tools/gen_terrain_textures.py carries the SECOND copy of "
+	              "these four numbers, at TEMP_U8_LO/HI and PRECIP_U8_LO/HI)");
+	static_assert(kPrecipU8Lo == 0 && kPrecipU8Hi == 52,
 	              "the precipitation LUT axis must not move -- see above");
 
 	// --- THE RESERVED SENTINEL BAND ------------------------------------------
@@ -195,6 +223,36 @@ namespace VoxelClimate
 	// changes -- but the numbers in this sentence were never re-derived and are
 	// corrected here rather than left to be quoted again.
 	FVoxelClimateBytes SampleClimateAtWorldUU(double WorldXUU, double WorldYUU);
+
+	// --- THE RAW BYTES, FOR THE CLASSIFIER ------------------------------------
+	//
+	// vxc::classifyBiome's thresholds are RAW WIRE BYTES
+	// (`kBiomeTempColdU8 = climateTempU8FromDegC(5)` and friends, biome.h:131+),
+	// NOT the remapped display bytes FVoxelClimateBytes carries. Handing it a
+	// remapped byte would classify against a window that exists only for the
+	// LUT's axes, and the answer would move every time that window is retuned.
+	//
+	// So this returns the tile's own bytes, bilinear across the raster exactly
+	// as the remapped sampler does, with NO window and NO sentinel floor. It is
+	// the input to a CLASSIFICATION, not to a display.
+	//
+	// It also carries `PrecipVariability`, which the remapped struct has no
+	// field for and which classifyBiome takes as its third argument -- that
+	// argument CHANGED CHANNEL at world version 22 (it was seasonality), and
+	// biome.h:260-265 warns that a caller which missed the change still
+	// compiles. Passing the wrong one here would be exactly that bug.
+	struct FVoxelRawClimate
+	{
+		uint8 Temperature = 128;
+		uint8 Precipitation = 128;
+		uint8 PrecipVariability = 128;
+		// False when there is no sampler at all, so a caller can refuse to
+		// classify rather than classify a default. The defaults above are NOT
+		// vxc::ClimateSample's "bland plausible climate" and must not be read as
+		// one.
+		bool bValid = false;
+	};
+	FVoxelRawClimate SampleRawClimateAtWorldUU(double WorldXUU, double WorldYUU);
 
 	// Called once, early, from the game thread. Reads -VoxelTileDir /
 	// -VoxelTileScale / -VoxelSeed exactly as VoxelWorldSubsystem does and loads

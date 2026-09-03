@@ -59,8 +59,12 @@ from PIL import Image
 from terrain_palette import PALETTE, PALETTE_WIDTH, biome_tinted_runs
 
 # MUST MATCH VoxelClimateProbe.h's kTempU8Lo/Hi and kPrecipU8Lo/Hi exactly.
-TEMP_U8_LO, TEMP_U8_HI = 100, 189
-PRECIP_U8_LO, PRECIP_U8_HI = 14, 32
+# RE-FITTED 2026-08-30 to provider 80b9ca451a23eae4 (this world's p1..p99 on
+# both axes). THE SECOND COPY of VoxelClimateProbe.h's kTempU8Lo/Hi and
+# kPrecipU8Lo/Hi -- its static_asserts fire if these two files disagree, and
+# the LUT must be regenerated in the same commit as any change here.
+TEMP_U8_LO, TEMP_U8_HI = 89, 215
+PRECIP_U8_LO, PRECIP_U8_HI = 0, 52
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Content", "Voxel", "TextureSource")
 

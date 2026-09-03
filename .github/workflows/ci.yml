@@ -314,3 +314,38 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build terrain-service Docker image
         run: docker build terrain-service
+
+  # tools/*.py are the instruments this project's verdicts come out of, and
+  # until now nothing in CI looked at any of them except the four that have
+  # their own job above (the lints and the sfx generator). A broken instrument
+  # is discovered when someone runs it, mid-investigation, on the box.
+  #
+  # WHAT THIS JOB DOES NOT DO, and it is the important half: it does not run a
+  # perf leg. A -VoxelPerfRun leg needs the 30 GB engine install, a GPU and
+  # twenty minutes, none of which a hosted runner has -- see
+  # .github/workflows/ue-build.yml for the measurement behind that. There is no
+  # perf gate in CI and this job does not pretend to be one. It checks the
+  # GATE'S OWN CODE, which is a thing a runner can actually do.
+  #
+  # Step 2 is why this job earns its place. py_compile could not have caught
+  # the defect it was added for: check-perf-run.py used to return 0 -- a green
+  # gate -- when it was given NO thresholds and had therefore tested nothing,
+  # and that code was syntactically perfect for as long as it shipped. The
+  # --selftest flag fabricates summaries in a temp dir and asserts the exit
+  # code for each, including that one. Verified to go red when the vacuous
+  # pass is reintroduced; a check that cannot fail is not a check.
+  #
+  # The glob is deliberately TOP-LEVEL ONLY. tools/vulkan-headers/ is a
+  # vendored upstream registry, not ours to keep compiling.
+  tools-python:
+    name: tools/*.py syntax + perf-gate contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Syntax-check every top-level tools/*.py
+        run: python -m py_compile tools/*.py
+      - name: check-perf-run.py exit-code contract (0 pass / 1 violated / 2 untested)
+        run: python tools/check-perf-run.py --selftest

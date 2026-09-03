@@ -2,6 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+// Self-contained include for the PlaneSizeUU derivation below: this header
+// used VoxelCoords::kNumLevels while riding a unity-build neighbour's include
+// for years; the first adaptive (standalone) compile of the .cpp broke it.
+#include "VoxelCoords.h"
 #include "VoxelOceanActor.generated.h"
 
 class UStaticMeshComponent;
@@ -121,7 +125,33 @@ private:
 	// /Engine/BasicShapes/Plane is a 100x100 UU (1m x 1m) quad; scale factor
 	// below reaches PlaneSizeUU on each side.
 	static constexpr double SourcePlaneSizeUU = 100.0;
-	static constexpr double PlaneSizeUU = 4000000.0; // 40 km
+	// DERIVED FROM THE FAR FIELD, NOT FROM THE CASCADE, AND THE DIFFERENCE HAS
+	// BITTEN TWICE. It was a flat 4,000,000 UU (+-20 km) that became a VISIBLE
+	// HARD EDGE when the far field grew past it; it was then derived from the
+	// CASCADE edge, which was right only while voxels were the farthest thing
+	// drawn. Since 2026-09-02 the farthest ground is the CLIPMAP again (outer
+	// half-extent = 8 x the cascade edge -- AVoxelClipmapActor: HalfIndex(32) /
+	// HoleHalfIndex(16) x 2^(NumLevels-1), i.e. 2 x 2^2 at 3 levels), and an
+	// ocean sized to the cascade alone would end at +-10 km under 65 km of
+	// clipmap terrain: a straight water edge across every coastal vista.
+	//
+	// The ring radii are geometric -- Outer(L) = 64 m * 2^L -- so the reach
+	// follows VoxelCoords::kNumLevels with no include of the streaming
+	// subsystem (which would be circular from here). kClipmapExtentMultiple
+	// restates the clipmap arithmetic for the same reason; the static_assert
+	// in VoxelOceanActor.cpp checks it against the actor's real constants.
+	// The plane spans the full DIAMETER, hence the 2x, with 25% margin so a
+	// camera near the cascade edge still sees water to the horizon.
+	//
+	// FREE TO OVERSIZE: this is ONE quad on a scaled unit plane; the margin is
+	// generous rather than tight. (This constant is the fifth thing in this
+	// codebase found sizing itself off a reach the far field outgrew -- grep
+	// for constants in METRES or UU before assuming any reach sweep is done.)
+	static constexpr double kOutermostRingOuterMetres =
+		64.0 * double(int64(1) << (VoxelCoords::kNumLevels - 1));
+	static constexpr double kClipmapExtentMultiple = 8.0; // 2 * 2^(NumLevels-1), NumLevels 3
+	static constexpr double PlaneSizeUU =
+		2.0 * (kClipmapExtentMultiple * kOutermostRingOuterMetres) * 100.0 * 1.25;
 
 	static constexpr double FollowSnapUU = 100.0; // 1 m
 

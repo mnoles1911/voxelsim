@@ -218,7 +218,13 @@ void UVoxelBathyFieldSubsystem::Tick(float DeltaTime)
 	// fraction is visible. A hole fraction pinned at 1.0 with lakes on screen is
 	// the diagnosis: either there is no fine tier in this run, or the world was
 	// baked before bake_ver 27.
-	UE_LOG(LogVoxelWater, Verbose,
+	// Log, NOT Verbose. This line's own comment calls it "the only place the hole
+	// fraction is visible", and the diagnosis it names -- a hole fraction pinned
+	// at 1.0 with lakes on screen -- is one nobody can reach at Verbose: raising
+	// a category from a leg command line needs a quoted argument with a space in
+	// it, which splits and silently SUPPRESSES the category instead. It fires
+	// once per refill (~240 m of travel), so it is not a per-frame line.
+	UE_LOG(LogVoxelWater, Log,
 	       TEXT("BathyField: window #%llu at px=(%lld,%lld) origin=(%.0f,%.0f)uu holes=%.1f%% fill=%.2fms"),
 	       static_cast<unsigned long long>(PublishedWindows_), static_cast<long long>(OriginPx_),
 	       static_cast<long long>(OriginPy_), static_cast<double>(OriginPx_) * kTexelUU,

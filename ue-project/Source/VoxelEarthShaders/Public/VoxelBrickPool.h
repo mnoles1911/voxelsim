@@ -646,7 +646,7 @@ public:
 	//
 	// FVoxelMarchChunkIndex spells it too, for its grid-slot mapping; the two are
 	// tied by a static_assert in VoxelMarchChunkIndex.cpp, which includes both.
-	static constexpr int32 kCoverLevel = 7;
+	static constexpr int32 kCoverLevel = 8;  // one past R7; follows the ring count
 	// Cover cells per level-0 voxel. 100 mm / 50 mm, and it is checked against
 	// vxc::kVoxelSizeMm on the producer side by vxc::coverVolumeInit, which
 	// refuses a pitch that does not tile the world lattice.
@@ -868,6 +868,12 @@ public:
 	// marcher that walks it, and the resident LevelAndFlags field is what makes
 	// building it a lookup change rather than a format change.
 	int32 FindChunkSlot(const FVoxelBrickChunkKey& Key) const;
+
+	// DEBUG REVERSE LOOKUP (2026-09-02, the stolen-cell hunt): which resident
+	// key owns a chunk slot right now, or false if no resident record names it
+	// (freed, or never granted). O(resident) linear scan -- capture-time
+	// diagnostics only, never on a hot path.
+	bool DebugFindSlotOwner(int32 ChunkSlot, FVoxelBrickChunkKey& OutKey) const;
 
 	// Enqueues every pending write and clear as ONE render command containing
 	// ONE graph. Clears are recorded before writes, so a slot retired and reused

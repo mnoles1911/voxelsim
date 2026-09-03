@@ -1,5 +1,7 @@
 #include "VoxelOceanActor.h"
 
+#include "VoxelClipmapActor.h" // NumLevels, for the plane-extent static_assert
+
 #include "Camera/PlayerCameraManager.h"
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "Components/PostProcessComponent.h"
@@ -62,6 +64,16 @@ AVoxelOceanActor::AVoxelOceanActor()
 	{
 		OceanPlane->SetStaticMesh(PlaneMeshFinder.Object);
 	}
+	// The ocean must reach at least as far as the clipmap draws ground (see
+	// PlaneSizeUU's comment). The multiple restates the clipmap's extent
+	// arithmetic; NumLevels is the term that actually changes, so it is the
+	// term asserted (HalfIndex/HoleHalfIndex are private and their ratio -- the
+	// leading 2 -- has been fixed since the actor existed).
+	static_assert(kClipmapExtentMultiple ==
+	                  2.0 * double(int64(1) << (AVoxelClipmapActor::NumLevels - 1)),
+	              "the ocean plane is sized to the clipmap's outer half-extent (2 * 2^(NumLevels-1) "
+	              "ring edges); AVoxelClipmapActor::NumLevels moved without this multiple -- water "
+	              "will end before the far terrain does");
 	const double Scale = PlaneSizeUU / SourcePlaneSizeUU;
 	OceanPlane->SetRelativeScale3D(FVector(Scale, Scale, 1.0));
 

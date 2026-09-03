@@ -607,9 +607,15 @@ void AVoxelEarthHUD::DrawStreamPanel()
 							               ? 100.0 * double(B.UncoveredShell) / double(B.Uncovered)
 							               : 0.0),
 							       kStreamRowNeutral);
+							// ALL kNumLevels SLOTS, asserted: this row has been
+							// short twice (stopped at L5 while L6 existed, then
+							// at L6 while L7+ did) and the outermost ring is
+							// exactly where holes concentrate.
+							static_assert(VoxelMarchHoleWord::kNumLevels == 8,
+							              "the HUD holes-by-level row spells 8 slots; respell it");
 							AddRow(FString::Printf(
 							           TEXT("Holes by level: L0 %.0f%%  L1 %.0f%%  L2 %.0f%%  ")
-							           TEXT("L3 %.0f%%  L4 %.0f%%  L5 %.0f%%  L6 %.0f%%  (of %s misses)"),
+							           TEXT("L3 %.0f%%  L4 %.0f%%  L5 %.0f%%  L6 %.0f%%  L7 %.0f%%  (of %s misses)"),
 							           double(B.UncoveredByLevel[0]) * Inv,
 							           double(B.UncoveredByLevel[1]) * Inv,
 							           double(B.UncoveredByLevel[2]) * Inv,
@@ -617,6 +623,7 @@ void AVoxelEarthHUD::DrawStreamPanel()
 							           double(B.UncoveredByLevel[4]) * Inv,
 							           double(B.UncoveredByLevel[5]) * Inv,
 							           double(B.UncoveredByLevel[6]) * Inv,
+							           double(B.UncoveredByLevel[7]) * Inv,
 							           *CommaInt(int64(Attributed))),
 							       kStreamRowNeutral);
 							// Reason order is the shader's bucket codes:

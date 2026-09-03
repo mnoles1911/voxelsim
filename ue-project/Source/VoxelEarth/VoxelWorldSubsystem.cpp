@@ -36,6 +36,7 @@
 #include "VoxelTileCodec.h" // GetFineTileDecompressor -- the asset channel source decodes .vxtl v2 tiles
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
 #include "VoxelEvictionIndex.h" // Phase 3: the bucket index the hysteresis-exit scan walks instead of every record
+#include "VoxelRecomputeProfile.h" // -VoxelRecomputeCensus: the per-operation split inside entryMs
 #include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
 // M3 wave 1 (docs/m3-plan.md): role split needs the relay actor (broadcast
@@ -380,7 +381,7 @@ static TAutoConsoleVariable<int32> CVarVoxelStreamWarmShadingAsync(
 	TEXT("nonzero."),
 	ECVF_Default);
 static TAutoConsoleVariable<int32> CVarVoxelStreamAtlasPrefetchAhead(
-	TEXT("voxel.Stream.AtlasPrefetchAhead"), 0,
+	TEXT("voxel.Stream.AtlasPrefetchAhead"), 8,
 	TEXT("Raster-atlas PAGES per streaming tick pre-filled for the page column the T4-1 ")
 	TEXT("predicted anchor is about to enter (pages in coverage of the PREDICTED anchor and ")
 	TEXT("not of the current one -- the crossing crescent), so the 33-43 ms synchronous ")
@@ -2050,6 +2051,31 @@ struct FChunkRecord
 	// fully decayed on the very first tint update.
 	float LoadedAtSeconds = -1000.f;   // set when Component transitions null -> non-null (first apply)
 	float RemeshedAtSeconds = -1000.f; // set on a genuine re-mesh (Component already existed, overlay-aware path)
+
+	// M11 (2026-09-02): ADMISSION -> VISIBLE, the one latency this pipeline has
+	// never measured end to end. Same ElapsedSeconds clock as the two fields
+	// above -- deliberately, not FPlatformTime::Seconds(): the pair is only ever
+	// subtracted from each other and from that clock, and mixing two clocks in
+	// one subtraction is how this file has produced seconds-labelled-as-
+	// milliseconds before (see LevelGpuLatencyMsWindow's declaration).
+	//
+	// WHAT THE STREAMING LINE ALREADY MEASURES IS NOT THIS. submitToDeliver is
+	// the mesher's round trip and deliverToApply is DrainResults' apply budget;
+	// BOTH start after the chunk was admitted, dispatched and had waited in a
+	// queue. A chunk can be admitted and sit undispatched for seconds behind the
+	// per-tick dispatch cap and every existing stage would read healthy. This is
+	// the number a hole in front of the camera actually is.
+	//
+	// -1000 not 0, matching the two above: 0 is a legal ElapsedSeconds value
+	// (the first frames after Initialize), so a zero default would make every
+	// startup record look admitted-at-t0 rather than never-stamped.
+	float AdmittedAtSeconds = -1000.f;
+	// Charged ONCE per record. Every "this chunk is now drawn" site stamps
+	// LoadedAtSeconds, and a record can reach more than one of them across its
+	// life (adopted -> parked -> re-admitted -> settled). Without this the
+	// second visit would push a second sample measured from the SAME admission
+	// stamp and the histogram would grow a tail nothing in the world produced.
+	bool bVisibleLatencyRecorded = false;
 	bool bHasOverlayBricks = false;    // this exact chunk (no border) currently owns >=1 edited brick
 	int32 LastQuadCount = 0;           // for FVoxelWorldImpl::ResidentQuads bookkeeping on replace/unload
 
@@ -4084,9 +4110,16 @@ bool GetRingQuotaEnabled()
 // as reserving one for R1 -- 6 of 24 slots worst case, still far from the
 // 13-slot catastrophe above. In the default run (MaxRingLevel 5) level 6 never
 // queues a chunk, its deficit never fires, and the floor is inert.
-constexpr int32 kRingSlotFloorDefault[VoxelCoords::kNumLevels] = {0, 1, 1, 1, 1, 1, 1};
+// R7's floor of 1 rides the same flat-cost argument: 7 of 24 slots worst case.
+// NOTE: this list carried SEVEN initializers against an ELEVEN-element array
+// for the whole 11-level period, and the static_assert below could not catch it
+// -- UE_ARRAY_COUNT checks the DECLARED size, and C++ zero-fills the tail.
+// R7-R10 ran with floor 0 (starved of guaranteed worker slots) and nothing
+// complained. Count the entries by hand when the level count changes.
+constexpr int32 kRingSlotFloorDefault[VoxelCoords::kNumLevels] = {0, 1, 1, 1, 1, 1, 1, 1};
 static_assert(UE_ARRAY_COUNT(kRingSlotFloorDefault) == VoxelCoords::kNumLevels,
-              "kRingSlotFloorDefault must have one entry per level (a short list zero-fills silently, starving the tail rings)");
+              "kRingSlotFloorDefault must have one entry per level (a short list zero-fills silently, starving the tail rings"
+              " -- and this assert checks the DECLARED size only, it cannot see a short initializer list)");
 
 // Overridable for tuning/measurement: `-VoxelRingFloors=0,1,1,1,1`.
 //
@@ -4153,7 +4186,10 @@ const int32* GetRingSlotFloors()
 // to it, and was chosen over renormalising precisely because renormalising
 // moves six knobs to add one. R6 takes R5's 0.12 by R5's own argument: annulus
 // column counts are roughly equal at every level by construction.
-constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.25, 0.18, 0.17, 0.15, 0.13, 0.12, 0.12};
+// R7 added 2026-08-30 with the 8 km cascade. 0.12, matching R6: levels 0-5 are
+// the historic partition summing to 1.0 and every level above that is an
+// ADDITIVE share, so appending here does not re-tune the six below it.
+constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.25, 0.18, 0.17, 0.15, 0.13, 0.12, 0.12, 0.12};
 static_assert(UE_ARRAY_COUNT(kRingCapShare) == VoxelCoords::kNumLevels, "kRingCapShare must have one entry per level");
 
 constexpr double SumRingCapShare(int32 NumLevels)
@@ -5852,10 +5888,14 @@ int32 UVoxelWorldSubsystem::GetMaxRingLevel()
 	// cover's, see VoxelCoords::kNumLevels).
 	static const int32 MaxLevel = []
 	{
-		// 6 AS OF 2026-08-25: seven rings. The cascade reaches the same 4 km at
-		// R0 = 64 m for 43% fewer chunk iterations -- see kDefaultRingPresets
-		// for the measured pair and the visual trade the owner accepted.
-		constexpr int32 kDefaultMaxRingLevel = 6; // the 4 km cascade edge, 7 rings
+		// 7 AS OF 2026-09-02: the full eight-ring cascade, 8,192 m reach --
+		// every level kNumLevels carries. The 11-level / 65 km configuration
+		// this replaced was cut deliberately (the renderer never coherently
+		// supported R8-R10; see VoxelCoords.h at kNumLevels and
+		// docs/cascade-cut-to-8-2026-09-02.md); the clipmap owns everything
+		// beyond the R7 edge again. -VoxelMaxRingLevel overrides for
+		// measurement arms.
+		constexpr int32 kDefaultMaxRingLevel = VoxelCoords::kNumLevels - 1; // 7
 		int32 Value = kDefaultMaxRingLevel;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelMaxRingLevel="), Value);
 		return FMath::Clamp(Value, 0, VoxelCoords::kNumLevels - 1);
@@ -6411,6 +6451,41 @@ struct FVoxelWorldImpl
 			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
 		}
 
+		// --- the coarse-tier amplifier, for coarse-derived ring levels ------
+		//
+		// Built only when the fine tier is actually live and therefore differs
+		// from *Tiles. Without a fine tier the world's own amplifier IS the
+		// coarse one and a second instance would be dead weight, so the null
+		// case is meaningful rather than a failure.
+		//
+		// Bound to *Tiles by reference for its whole life, which is safe: Tiles
+		// is the sole owner (unique_ptr) and outlives this member.
+		if (FineStreamer && Tiles)
+		{
+			// AN ABSENT FINE TILE ANSWERS FROM COARSE, NOT FROM SEA LEVEL.
+			// Owner decision, kept at the 8-ring cascade: only part of the
+			// world is fine-baked, and flying beyond it should show real
+			// (coarse) ground, not a flat plane at z=0. The full rationale
+			// lives at ResolveNonResidentPixel in VoxelFineTileStreamer.cpp.
+			FineStreamer->SetCoarseFallback(Tiles.get());
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Fine tier COARSE FALLBACK armed: a fine tile known absent on disk now resolves ")
+			       TEXT("through the %lld mm/px coarse sampler instead of the sea-level default. ")
+			       TEXT("Tiles not yet loaded still take the blocking-load path, so a transient miss ")
+			       TEXT("cannot bake coarse ground into a chunk fine data was about to cover."),
+			       (long long)Tiles->pixelSizeMm());
+
+			CoarseAmplifier = MakeUnique<vxc::Amplifier>(Seed, *Tiles);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Coarse-tier amplifier created at %lld mm/px (the world amplifier is on %lld). ")
+			       TEXT("Serves streaming admission for ring levels >= %d -- ComputeFootprintChunkZRange ")
+			       TEXT("asks THIS one for surface height at those levels, so admission stops querying ")
+			       TEXT("the fine tier for ground the fine tier does not cover."),
+			       (long long)Tiles->pixelSizeMm(),
+			       (long long)(FineStreamer->WorldSampler().pixelSizeMm()),
+			       VoxelTier::kFirstCoarseLevel);
+		}
+
 		// --- the asset term ------------------------------------------------
 		//
 		// Opt-in, and it REFUSES RATHER THAN DEGRADES. Every failure below
@@ -6624,6 +6699,10 @@ struct FVoxelWorldImpl
 		GpuDeliverToApplyMsWindow.Init(0.f, WorkerJobMsWindowSize);
 		CpuWorkerEndToEndMsWindow.Init(0.f, WorkerJobMsWindowSize);
 		CpuDeliverToApplyMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		// M11: sized here with the rest, and UNCONDITIONALLY -- PushLatencyMsSample
+		// takes a modulo by Window.Num(), so an un-Init'd window is a divide by
+		// zero on the first visible chunk rather than a quiet no-op.
+		AdmitToVisibleMsWindow.Init(0.f, WorkerJobMsWindowSize);
 	}
 
 	// Track B2: bUsingTileGrid MUST be declared (and default-constructed via
@@ -6686,6 +6765,28 @@ struct FVoxelWorldImpl
 	// for the whole session. Declared after FineStreamer because Tick() and
 	// the page fills borrow the sampler FineStreamer may own.
 	TUniquePtr<FVoxelRasterAtlasCpu> RasterAtlas;
+
+	// THE COARSE-TIER ATLAS, for ring levels at or above
+	// VoxelTier::kFirstCoarseLevel (docs/retire-clipmap-all-voxel-plan.md).
+	//
+	// A SECOND INSTANCE RATHER THAN A SECOND LEVEL INSIDE ONE ATLAS, because
+	// VoxelRasterAtlas.h's own doctrine is that it holds the whole coverage at
+	// ONE pitch and has "no clipmap levels, no compression, no allocator" -- the
+	// simplicity is the safety argument. Two instances keep that intact; a
+	// mip-chained atlas would throw it away.
+	//
+	// CHEAP: the same coverage is ~610 MiB at the 1.875 m fine pitch and
+	// ~2.6 MiB at 30 m coarse, both logged at init. The coarse one costs
+	// essentially nothing, which is what makes a second instance the right
+	// shape.
+	//
+	// INERT UNTIL R8 EXISTS. kNumLevels is 8, so the highest streamed level is
+	// 7 and VoxelTier::IsCoarseDerivedLevel is false for every one of them --
+	// nothing routes here yet. It is created and ticked anyway, deliberately:
+	// its init line proves the coarse pitch and coverage are what they should be
+	// BEFORE a ring level depends on them, rather than the ring that introduces
+	// coarse derivation also being the first test of this object.
+	TUniquePtr<FVoxelRasterAtlasCpu> CoarseRasterAtlas;
 
 	// THE ASSET TERM (worldgen v24/v25), and it is DECLARED HERE FOR THE SAME
 	// REASON THE Tiles/FineStreamer/Voxels ORDER ABOVE IS LOAD-BEARING.
@@ -6904,6 +7005,27 @@ struct FVoxelWorldImpl
 	TUniquePtr<FVoxelAssetChannelSource> AssetChannels;
 
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
+
+	// THE COARSE-TIER AMPLIFIER, for ring levels at or above
+	// VoxelTier::kFirstCoarseLevel.
+	//
+	// Voxels' own amplifier is bound to ActiveTiles() -- the FINE sampler when
+	// the fine tier is live -- and vxc::Amplifier takes its ITileSampler by
+	// reference AT CONSTRUCTION, so a bound amplifier cannot be re-pointed. That
+	// is why this is a second instance rather than an argument: the alternative
+	// is threading a tier through vxc::Amplifier::column(), which is voxel-core
+	// and owned elsewhere.
+	//
+	// WHY IT IS NEEDED, and it is the consumer the plan under-scoped:
+	// ComputeFootprintChunkZRange asks the amplifier for surface height to
+	// decide WHICH CHUNKS EXIST. Streaming admission therefore asked the fine
+	// tier for ground 16 km out -- past every baked fine tile -- and hit the
+	// gate. The raster path was already tier-aware; admission was not.
+	//
+	// Header-only (voxelcore/amplifier.h), so this adds no voxelcore.lib
+	// dependency. Null when the two tiers are the same sampler, in which case
+	// every consumer falls through to Voxels.amplifier() exactly as before.
+	TUniquePtr<vxc::Amplifier> CoarseAmplifier;
 
 	// The sampler this run actually generates terrain from -- the fine tier
 	// when it is live, the coarse tier otherwise. Every caller that must agree
@@ -8444,6 +8566,20 @@ struct FVoxelWorldImpl
 	// single tick forever. Splitting it per level keeps the clear reachable:
 	// each level's deferral is set and cleared by that level's own scan.
 	bool bAdmissionDeferredWork[VoxelCoords::kNumLevels] = {};
+	// THE PARKED-ANCHOR BACKSTOP CLOCK (2026-09-02). The per-level refill
+	// trigger requires the level's queue to read EMPTY, and its
+	// "permanently-undispatchable" discount was only ever wired for level 0 --
+	// so ONE stuck entry at L5+ pins that queue non-zero forever, the refill
+	// never fires, and every candidate the distance cutoff rejected during
+	// fill is never revisited while the anchor stands still. Measured: a
+	// completed fill plus minutes of parked settle still left ~680k
+	// never-admitted ray-crossings at L5+ -- the owner's permanent gap ring
+	// between the outermost voxels and the clipmap, which "healed" only on
+	// movement (an anchor crossing forces the rescan). This clock lets a
+	// deferred level re-enumerate at most once per kDeferredRefillBackstopSec
+	// regardless of queue emptiness; the genuine-room churn guard still
+	// applies, so a full queue still refuses the refill.
+	double LevelDeferredRefillLastSeconds[VoxelCoords::kNumLevels] = {};
 	// Per-RecomputeDesiredSet-call bookkeeping for the flags above (reset at the
 	// top of every call): which levels actually ran their entry scan, and how
 	// many candidates gate (a) declined in each.
@@ -8652,6 +8788,36 @@ struct FVoxelWorldImpl
 	TArray<float> CpuDeliverToApplyMsWindow;
 	int32 CpuDeliverToApplyMsWindowNext = 0;
 	int32 CpuDeliverToApplyMsWindowCount = 0;
+
+	// M11: admission -> visible, in MILLISECONDS in the ring (the helper and the
+	// percentile reader are both ms-typed; the log line converts to seconds
+	// once, at print, because this quantity runs to whole seconds on a cold fill
+	// and a four-digit ms column reads worse than a two-decimal one).
+	//
+	// TWO COUNTS, AND THEY ARE DIFFERENT NUMBERS. The ring holds the last
+	// WorkerJobMsWindowSize samples; AdmitToVisibleSamplesSinceLog is EVERY
+	// sample the window produced. On a cold fill the second is far larger than
+	// the first, and printing only the ring depth would understate the traffic
+	// by an order of magnitude while looking like a population size. Both are
+	// printed, labelled for what they are.
+	//
+	// Reset with the other SinceLog counters (see MaybeLogCounters' reset block)
+	// so `n=` is genuinely per window and not a saturating lifetime total -- a
+	// counter that only ever climbs cannot show a fill stopping.
+	TArray<float> AdmitToVisibleMsWindow;
+	int32 AdmitToVisibleMsWindowNext = 0;
+	int32 AdmitToVisibleMsWindowCount = 0;
+	int64 AdmitToVisibleSamplesSinceLog = 0;
+	// Records that reached a "now drawn" site with no admission stamp on them.
+	// MUST BE 0. Non-zero means a record is being created somewhere that does
+	// not stamp AdmittedAtSeconds, so the histogram is computed over a biased
+	// subset -- the failure this counter exists to make loud instead of silent.
+	int64 AdmitToVisibleUnstampedSinceLog = 0;
+
+	// M11's write side. Called from every site that stamps LoadedAtSeconds --
+	// see the definition for why that set, and only that set, is the honest
+	// answer to "a ray can now hit this chunk".
+	void NoteChunkVisible(VoxelStreaming::FChunkRecord& Rec);
 
 	// Per-level (0..5) quad-count-per-delivered-chunk distribution (S0-3's
 	// other half -- "free here", filled alongside the census just above it in
@@ -9148,6 +9314,41 @@ struct FVoxelWorldImpl
 	double AccumQueueFilterMs = 0.0;
 	double AccumSortMs = 0.0;
 	double AccumLevelEntryMs[VoxelCoords::kNumLevels] = {};
+
+	// ---- -VoxelRecomputeCensus (docs/recompute-cost-census-2026-08-23.md, hook
+	// G) -- THE READER SHIPPED WITHOUT A WRITER.
+	//
+	// tools/recompute-census.py has existed since 2026-08-23 and its pass 2 has
+	// never had a line to parse: it reported "the leg ran without
+	// -VoxelRecomputeCensus" on every leg ever run, because nothing emitted the
+	// line at all. That is the one wrong answer that tool can give -- "the
+	// switch was off" and "the writer does not exist" print identically -- so
+	// the emitter below is written against the reader's CENSUS regex FIELD BY
+	// FIELD. Change either and the tool silently matches nothing and goes back
+	// to reporting a switch that was on as off. They move together.
+	//
+	// COUNTED, NOT TIMED, and that is a measurement decision, not laziness: the
+	// Z loop runs ~2.4 million times per 5 s window and a clock pair per Z cell
+	// would add ~15% to the number being measured. The per-operation costs come
+	// out of a least-squares fit over levels and windows in the reader. The one
+	// in-loop timer is MemoFillMs, safe because a fill is rare and expensive --
+	// memoFill approaching memoHit is the reading that says take it out.
+	VoxelRecomputeProfile::FWindow RecomputeProfile;
+	// The level currently being swept. Scratch, folded into RecomputeProfile at
+	// that level's entry-timer close, so a level's counters and its ms come from
+	// the same bracket and cannot describe different scans.
+	VoxelRecomputeProfile::FEntryCounters LevelCensusScratch;
+	// Non-null ONLY between a level's scan start and its entry-timer close, and
+	// only with the switch armed. Every ++ site in the sweep is
+	// `if (ActiveCensus)`, so with the switch off the whole census is one null
+	// test per site and no counter can be charged to the wrong level -- the
+	// alternative (a per-level index passed down four call layers) would have
+	// touched every signature in the entry path for a diagnostic.
+	//
+	// Read through in a const member (FootprintChunkZRangeCached): the POINTER
+	// is const there, the pointee is not, which is exactly the access this
+	// needs and why it is a pointer rather than an index.
+	VoxelRecomputeProfile::FEntryCounters* ActiveCensus = nullptr;
 	double AccumTickMs = 0.0;
 	int32 AccumTicks = 0;
 	int64 JobsDispatchedSinceLog = 0;   // DispatchJobs: worker jobs actually launched
@@ -9262,6 +9463,7 @@ struct FVoxelWorldImpl
 	int64 DrainExitQueueEmptySinceLog = 0;  // Dequeue returned false -- nothing left to apply
 	int64 DrainExitWallClockSinceLog = 0;   // ApplyBudgetMs elapsed (past the kMinAppliesPerFrame floor)
 	int64 DrainExitCountCapSinceLog = 0;    // Applied hit MaxAppliesPerFrame
+	int64 DrainExitSmoothCapSinceLog = 0;   // Applied hit the SMOOTHED ceiling (cruise-burst spread)
 	int64 DrainExitDrainCapSinceLog = 0;    // Drains hit kMaxResultDrainsPerFrame (stale backlog)
 
 	// WHERE PER-APPLY TIME GOES, per 5s window. §1a prices the table push as the
@@ -10723,11 +10925,24 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				// below its cap by definition.
 				const int32 LevelCap = FMath::Max(
 				    1, FMath::RoundToInt(double(AdmissionCap) * VoxelStreamAdmission::kRingCapShare[Level]));
-				if (PendingJobKeysByLevel[Level].Num() <= Undispatchable &&
+				// THE BACKSTOP (see LevelDeferredRefillLastSeconds): a deferred
+				// level whose queue never drains to empty -- one stuck
+				// non-level-0 entry is enough, the Undispatchable discount
+				// above only counts level 0's cold-band holds -- still gets to
+				// re-enumerate, at most once per backstop period, provided the
+				// genuine-room guard holds. This is what turns "the gap ring
+				// heals when you fly" into "the gap ring heals, full stop."
+				constexpr double kDeferredRefillBackstopSec = 5.0;
+				const double NowSecondsForBackstop = FPlatformTime::Seconds();
+				const bool bBackstopDue =
+				    NowSecondsForBackstop - LevelDeferredRefillLastSeconds[Level] >=
+				    kDeferredRefillBackstopSec;
+				if ((PendingJobKeysByLevel[Level].Num() <= Undispatchable || bBackstopDue) &&
 				    PendingJobKeysByLevel[Level].Num() < LevelCap)
 				{
 					bLevelWantsRefill[Level] = true;
 					bAdmissionRefill = true;
+					LevelDeferredRefillLastSeconds[Level] = NowSecondsForBackstop;
 				}
 			}
 		}
@@ -11043,6 +11258,25 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			{
 				RasterAtlas = MakeUnique<FVoxelRasterAtlasCpu>();
 				const int32 MaxRing = UVoxelWorldSubsystem::GetMaxRingLevel();
+
+				// EACH ATLAS COVERS ONLY THE LEVELS IT SERVES.
+				//
+				// The fine atlas used to take the OUTERMOST ring's radius, which
+				// was right while every level was fine-derived and became wrong
+				// the moment one was not: with R8 streaming, the fine atlas
+				// prefetched fine pages out to 16 km -- across ground the fine
+				// tier does not cover -- and tripped the gate from its own Tick.
+				// That is the third distinct caller this tier split has exposed
+				// (admission, on-demand fill, prefetch), and all three had the
+				// same shape: a reach derived from the cascade edge rather than
+				// from the tier boundary.
+				//
+				// The fine atlas now stops at the last FINE level, so it also
+				// gets SMALLER as coarse levels are added rather than larger.
+				const int32 LastFineRing =
+					FMath::Min(MaxRing, VoxelTier::kFirstCoarseLevel - 1);
+				const double FineOuterMeters =
+					UVoxelWorldSubsystem::GetRingPresets()[LastFineRing].OuterMeters;
 				const double OuterMeters = UVoxelWorldSubsystem::GetRingPresets()[MaxRing].OuterMeters;
 				// THE COVERAGE PAD'S ONE MULTIPLICATION, HERE AND NOWHERE ELSE.
 				// The atlas cannot call AdmitOuterUU -- VoxelStreamAdmission is
@@ -11062,15 +11296,59 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				int64 AdmitCentreReachMm = 0;
 				if (CoveragePadChunks >= 1)
 				{
+					// PER TIER, NOT PER CASCADE. This reach is the fourth thing in
+					// this file that sized itself off the outermost ring and had
+					// to become tier-aware (after admission, on-demand fill and
+					// prefetch coverage). Handing the FINE atlas a reach derived
+					// from a COARSE ring makes it defend pages 15 km out, where
+					// no fine tile exists.
 					const double ReachUU =
-						VoxelStreamAdmission::AdmitOuterUU(MaxRing) +
+						VoxelStreamAdmission::AdmitOuterUU(LastFineRing) +
 						double(CoveragePadChunks - 1) *
-							VoxelCoords::ChunkEdgeUUForLevel(MaxRing);
+							VoxelCoords::ChunkEdgeUUForLevel(LastFineRing);
 					AdmitCentreReachMm = int64(ReachUU * 10.0);
 				}
 				RasterAtlas->Init(ActiveTiles().pixelSizeMm(),
-				                  int64(OuterMeters * 1000.0), MaxRing,
+				                  int64(FineOuterMeters * 1000.0), LastFineRing,
 				                  AdmitCentreReachMm, CoveragePadChunks);
+
+				// THE COARSE-TIER ATLAS. Created alongside so its init line is
+				// on every log from the day the rule landed, not from the day a
+				// ring level first needed it.
+				//
+				// PITCH FROM *Tiles, NOT ActiveTiles(): ActiveTiles() returns
+				// the FINE sampler when the fine tier is live, which is the
+				// whole point of the distinction. Taking the wrong one here
+				// would build a second atlas at the same pitch as the first --
+				// silently, and it would look like it worked.
+				//
+				// Only built when the two pitches actually differ. With no fine
+				// tier ActiveTiles() IS *Tiles, one atlas covers every level,
+				// and a second identical instance would be pure waste.
+				if (Tiles && Tiles->pixelSizeMm() != ActiveTiles().pixelSizeMm())
+				{
+					CoarseRasterAtlas = MakeUnique<FVoxelRasterAtlasCpu>();
+					// The coarse atlas DOES serve the outermost ring, so its
+					// reach is the cascade's.
+					int64 CoarseReachMm = AdmitCentreReachMm;
+					if (CoveragePadChunks >= 1)
+					{
+						CoarseReachMm = int64((VoxelStreamAdmission::AdmitOuterUU(MaxRing) +
+						                       double(CoveragePadChunks - 1) *
+						                           VoxelCoords::ChunkEdgeUUForLevel(MaxRing)) * 10.0);
+					}
+					CoarseRasterAtlas->Init(Tiles->pixelSizeMm(),
+					                        int64(OuterMeters * 1000.0), MaxRing,
+					                        CoarseReachMm, CoveragePadChunks);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("Coarse-tier raster atlas created at %lld mm/px (fine atlas is %lld). ")
+					       TEXT("Serves ring levels >= %d; NOTHING routes here until R%d exists, so it ")
+					       TEXT("is inert today and this line is the proof its pitch and coverage are ")
+					       TEXT("right before anything depends on them."),
+					       (long long)Tiles->pixelSizeMm(),
+					       (long long)ActiveTiles().pixelSizeMm(),
+					       VoxelTier::kFirstCoarseLevel, VoxelTier::kFirstCoarseLevel);
+				}
 			}
 			else if (CoveragePadChunks != RasterAtlas->CoveragePadChunksLatched())
 			{
@@ -11104,6 +11382,13 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			}
 			// Anchor is UU (cm); the raster lives in mm.
 			RasterAtlas->Tick(ActiveTiles(), int64(Anchor.X) * 10, int64(Anchor.Y) * 10);
+			// The coarse atlas recentres on the same anchor, from the COARSE
+			// sampler. Ticked even while inert so it is warm the moment a ring
+			// level starts asking, rather than cold-filling under a dispatch.
+			if (CoarseRasterAtlas.IsValid() && Tiles)
+			{
+				CoarseRasterAtlas->Tick(*Tiles, int64(Anchor.X) * 10, int64(Anchor.Y) * 10);
+			}
 		}
 
 		T0 = FPlatformTime::Seconds();
@@ -11920,6 +12205,10 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 	if (RasterAtlas.IsValid())
 	{
 		RasterAtlas->Shutdown();
+		if (CoarseRasterAtlas.IsValid())
+		{
+			CoarseRasterAtlas->Shutdown();
+		}
 	}
 
 	if (GIsRHIInitialized)
@@ -11965,6 +12254,20 @@ FMsPercentiles ComputeMsPercentiles(const TArray<float>& Window, int32 Count)
 	return Out;
 }
 
+// -VoxelRecomputeCensus. Command-line-latched exactly the way the
+// -VoxelDumpIndexKeys block in MaybeLogCounters latches (a function-local
+// static over FParse::Param), for -VoxelPendingJobCap's reason: a cvar read
+// per cell in a 2.4-million-iteration loop is itself a measurement change, and
+// a switch that can flip MID-WINDOW produces a window whose counters describe
+// two different configurations and whose fit is then over a mixture nobody can
+// name. Latched once per process, so the arm is the leg, not the moment.
+bool VoxelRecomputeCensusEnabled()
+{
+	static const bool bEnabled =
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelRecomputeCensus"));
+	return bEnabled;
+}
+
 // The write side: same overwrite-and-wrap ring buffer WorkerJobMsWindow itself
 // uses inline in DrainResults, pulled into one place because S0-3's writes
 // happen at three different call sites (OnGpuMeshJobComplete, the CPU worker
@@ -11976,6 +12279,69 @@ void PushLatencyMsSample(TArray<float>& Window, int32& Next, int32& Count, float
 	Count = FMath::Min(Count + 1, Window.Num());
 }
 } // namespace
+
+// M11: THE CHUNK IS NOW VISIBLE. One sample, once per record.
+//
+// WHY THIS HOOK AND NOT ANOTHER. The candidates were:
+//
+//   * VoxelBrickCpuArm::Publish -- REJECTED. It is a CPU-side pack handoff;
+//     the pack can be empty, the arm can be gated off, and the pool can refuse
+//     it. Timing to Publish would report chunks visible that a ray never hits,
+//     which is the "silent success" shape this project keeps paying for.
+//   * PoolSlot != INDEX_NONE -- REJECTED. That is the QUAD pool's range. On a
+//     marcher leg under voxel.Terrain.RetireQuads it stays INDEX_NONE for the
+//     entire demand population, so the instrument would read n=0 on exactly
+//     the configuration it exists for.
+//   * The render thread's scatter/upload acknowledgment -- REJECTED. Truthful,
+//     but it is off the game thread, so it needs a lock or an atomic and it
+//     lands one to two frames later than the moment the game thread can prove
+//     residency. The brief asks for the EARLIEST game-thread point that is
+//     true, not the latest point that is provable.
+//
+//   * CHOSEN: every site that already stamps LoadedAtSeconds. That set is not
+//     an approximation of "now drawn", it IS this file's definition of it --
+//     and on the marcher path the site is gated on Rec->HoldsTerrain(Key),
+//     which asks the pool's own FindChunkSlot: the engine's residency binding,
+//     the same one the marcher reads. HoldsGeometry() would have been the
+//     wrong question (see FChunkRecord's own note -- every marcher streaming
+//     bug so far has been that one mistake). So the moment this fires, the
+//     pool provably holds the chunk and a ray provably hits it.
+//
+// FIVE CALL SITES, and the set is closed by construction: grep
+// `LoadedAtSeconds = ElapsedSeconds` and this call sits beside every hit. Two
+// on the quad path inside ApplyMeshResult, two on the marcher path
+// (DrainResults and its edit-remesh twin), one at adoption.
+//
+// ADOPTION PUSHES A NEAR-ZERO SAMPLE ON PURPOSE. A parked speculative chunk is
+// admitted and visible in the same call, so its latency really is ~0 -- that
+// is what speculation BUYS, and excluding it would quietly delete the win from
+// the number. Read it against adopted= on the streaming line: a p50 collapsing
+// while adopted= climbs is speculation working, not streaming getting faster.
+void FVoxelWorldImpl::NoteChunkVisible(VoxelStreaming::FChunkRecord& Rec)
+{
+	if (Rec.bVisibleLatencyRecorded)
+	{
+		return;
+	}
+	if (Rec.AdmittedAtSeconds <= -1000.f)
+	{
+		// A record reached a drawn site without ever being stamped at admission.
+		// Counted, never silently skipped: it means a record-creation path exists
+		// that this instrument does not know about, and every percentile below is
+		// then computed over a subset chosen by that bug.
+		++AdmitToVisibleUnstampedSinceLog;
+		return;
+	}
+	Rec.bVisibleLatencyRecorded = true;
+	// Clamped at 0: ElapsedSeconds is monotonic within a session, but a record
+	// adopted in the same tick it was admitted can produce a -0.0 through float
+	// subtraction, and a negative in a sorted percentile window is worse than
+	// useless -- it becomes the p50 of a healthy leg.
+	const float LatencyMs = FMath::Max(0.f, (ElapsedSeconds - Rec.AdmittedAtSeconds) * 1000.f);
+	PushLatencyMsSample(AdmitToVisibleMsWindow, AdmitToVisibleMsWindowNext,
+	                    AdmitToVisibleMsWindowCount, LatencyMs);
+	++AdmitToVisibleSamplesSinceLog;
+}
 
 // Cold-start settle probe: the one-line time-to-settle instrument. Design,
 // traps, and reading rules at VoxelStreamAdmission::ColdSettleEnabled. Runs
@@ -12196,7 +12562,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// DENOMINATOR BESIDE EVERY COUNT, in the house style, because this project
 	// has now twice read a right number in the wrong units (fallbackBinds=210
 	// read as 60% of frames when it was 15% of binds; `promoteExit cap=` that
-	// turned out to name MaxInFlight rather than the batch cap).
+	// turned out to name MaxInFlight rather than the batch cap -- SPLIT on
+	// 2026-09-02 into inflight=/batchCap=/passFreeCap=/specCap=/empty=, which is
+	// the shape this note was arguing for: one label per ++ site).
 	if (VoxelSkyMark::Enabled())
 	{
 		const uint64 Considered = VoxelSkyMark::GSkyColumnsConsidered.load(std::memory_order_relaxed);
@@ -13027,6 +13395,66 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 	}
 
+	// M11 (2026-09-02): ADMISSION -> VISIBLE. The whole pipeline in one number,
+	// and the only latency on this log that starts where the PLAYER's problem
+	// starts. The two lines above it measure stages that both BEGIN after the
+	// chunk was admitted, dispatched and had queued -- a chunk stuck behind the
+	// per-tick dispatch cap for four seconds leaves every one of them healthy.
+	//
+	// ALWAYS ON, not behind voxel.Stream.LatencyStats like the stage lines: the
+	// cost is one float subtract and one ring store per chunk LOAD (not per
+	// frame, not per tick), against a load that already did a mesh, a pool
+	// allocation and a scatter. Gating it would mean the number nobody thought
+	// to arm the switch for is the number that is missing from the leg.
+	//
+	// ENGAGEMENT PROOF: n= is the count of chunks that became visible in THIS
+	// window. On any fill it is provably > 0 -- it is the same population
+	// loaded= on the streaming line counts, from the same guards -- so n=0 with
+	// loaded= moving is this instrument being broken, not the world being idle.
+	// (n=0 with loaded=0 is a settled camera and means nothing either way; the
+	// line is still printed, because "armed and measuring nothing" and "not
+	// armed" must not look the same.)
+	//
+	// unstamped= MUST BE 0. Non-zero means chunk records are being created on a
+	// path that does not stamp AdmittedAtSeconds, so the percentiles describe
+	// whichever subset that bug happened to leave in -- read nothing until it
+	// is back to 0.
+	//
+	// READING IT:
+	//   * p50 rising while submitToDeliver and deliverToApply are flat -> the
+	//     wait is BEFORE the mesher: admission is outrunning dispatch. Read the
+	//     dispatch loop line's exitCap=/exitEmpty= pair next.
+	//   * max in whole seconds with p50 small -> a tail, not a regime. That is
+	//     the population that shows as a hole in front of a moving camera, and
+	//     an average would have hidden it, which is why max is printed.
+	//   * p50 collapsing while the streaming line's adopted= climbs -> that is
+	//     SPECULATION landing, not streaming speeding up. Adoptions enter this
+	//     histogram at ~0 by construction (see NoteChunkVisible).
+	//   * ring= far below n= -> the percentiles are over the LAST ring= samples
+	//     of n=, which on a cold fill is the tail of the window, not a sample of
+	//     it. Compare windows, never a single one against a target.
+	{
+		const FMsPercentiles AdmitToVisible =
+			ComputeMsPercentiles(AdmitToVisibleMsWindow, AdmitToVisibleMsWindowCount);
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel admit->visible (window): p50=%.2f p95=%.2f max=%.2f s | n=%lld visible ")
+		       TEXT("(ring=%d) | admitted=%lld this window | unstamped=%lld"),
+		       AdmitToVisible.P50 / 1000.f, AdmitToVisible.P95 / 1000.f,
+		       AdmitToVisible.Max / 1000.f,
+		       (long long)AdmitToVisibleSamplesSinceLog, AdmitToVisibleMsWindowCount,
+		       (long long)RecordsAddedSinceLog,
+		       (long long)AdmitToVisibleUnstampedSinceLog);
+		if (AdmitToVisibleUnstampedSinceLog > 0)
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("Voxel admit->visible: %lld chunks became visible with NO admission ")
+			       TEXT("stamp. A ChunkRecords entry is being created on a path that does not ")
+			       TEXT("set AdmittedAtSeconds, so the percentiles on the line above are over ")
+			       TEXT("a subset that bug selected. Do not read them."),
+			       (long long)AdmitToVisibleUnstampedSinceLog);
+		}
+	}
+
 	// -VoxelL0GridVerify running total: level-0 chunks meshed BOTH ways and
 	// compared quad-for-quad. Any level-0 storage change is only legitimate if
 	// MISMATCHES stays 0 -- see VoxelStreamAdmission::L0GridVerifyEnabled.
@@ -13144,6 +13572,80 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.1f"), L, AccumLevelEntryMs[L]); }),
 	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%lld"), L, (long long)AccumLevelFootprints[L]); }));
 	for (int64& V : AccumLevelFootprints) { V = 0; }
+
+	// ---- -VoxelRecomputeCensus: THE PER-OPERATION SPLIT INSIDE entryMs ------
+	//
+	// THE READER SHIPPED 2026-08-23 AND HAS NEVER SEEN A LINE. tools/recompute-
+	// census.py pass 2 parses `Voxel recompute entry census`, and until this
+	// emitter existed every leg made it print "the leg ran without
+	// -VoxelRecomputeCensus, so the per-operation split is unavailable" -- the
+	// ONE wrong answer that tool can give, because "the switch was off" and
+	// "there is no writer" are indistinguishable from the far end. Same shape as
+	// the twelve-instruments-outside-the-path failure, one level up: the
+	// instrument was real, the thing it measured was never emitted.
+	//
+	// THE READER IS THE SPEC. Its CENSUS regex is
+	//   Voxel recompute entry census .*?R(\d)\[ms= cells= incrSkip= geoRej=
+	//   memoHit= memoFill= memoFillMs= zCells= recProbe= parkProbe= admit=
+	//   defer=\]
+	// and it anchors on the literal prefix per match, so ONE LINE PER LEVEL is
+	// required -- a single line carrying R0[..] | R1[..] would give the fit one
+	// observation per window instead of six and silently drop five levels.
+	// Field order is positional in that regex: reorder one column here and the
+	// tool matches NOTHING, which it reports as "switch was off". They move
+	// together, and the docstring at tools/recompute-census.py:46 says so.
+	//
+	// ms= IS AccumLevelEntryMs[L], the timer that already existed. That is
+	// deliberate: the fit regresses a measured time on counted operations, so
+	// inventing a second timer here would mean fitting an instrument against
+	// itself. Every level is printed, including levels that never scanned --
+	// the reader skips ms<=0 and cells==0 rows itself, and a MISSING level and
+	// a level that did no work must not look the same in the log.
+	//
+	// THE T4-2 LIVE ARM IS ABSENT BY CONSTRUCTION, not by omission: mode 2
+	// skips the CPU cell sweep entirely, so its levels arm no census and print
+	// ms=0.0 cells=0 -- which the reader drops. A mode-2 leg therefore has no
+	// per-operation split, and that is the honest state, not a zero cost.
+	if (VoxelRecomputeCensusEnabled())
+	{
+		int64 CensusCellsAllLevels = 0;
+		double CensusEntryMsAllLevels = 0.0;
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			const VoxelRecomputeProfile::FEntryCounters& C = RecomputeProfile.GetEntry(L);
+			CensusCellsAllLevels += int64(C.CellsVisited);
+			CensusEntryMsAllLevels += AccumLevelEntryMs[L];
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel recompute entry census (%.1fs window): ")
+			       TEXT("R%d[ms=%.1f cells=%lld incrSkip=%lld geoRej=%lld memoHit=%lld ")
+			       TEXT("memoFill=%lld memoFillMs=%.1f zCells=%lld recProbe=%lld ")
+			       TEXT("parkProbe=%lld admit=%lld defer=%lld]"),
+			       ThisLogWindowSeconds, L, AccumLevelEntryMs[L],
+			       (long long)C.CellsVisited, (long long)C.IncrSkipped,
+			       (long long)C.GeoRejected, (long long)C.MemoHit,
+			       (long long)C.MemoFill, C.MemoFillMs,
+			       (long long)C.ZCells, (long long)C.RecordProbes,
+			       (long long)C.ParkProbes, (long long)C.Admits,
+			       (long long)C.DeferralOps);
+		}
+		// ENGAGEMENT PROOF, and it is the reader's own named failure moved to the
+		// writer so nobody has to run the tool to find out the leg is void: the
+		// switch is armed, the entry scan burned real milliseconds, and NOT ONE
+		// cell body was counted. That can only mean the ++ sites are outside the
+		// loop they describe. A census that reads all-zero on both a healthy and
+		// a broken leg would prove nothing; this pair cannot both be true unless
+		// something is wrong.
+		if (CensusEntryMsAllLevels > 0.0 && CensusCellsAllLevels == 0)
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("Voxel recompute entry census: ARMED, entryMs=%.1f across the window, ")
+			       TEXT("and cells=0 on EVERY level. The counters are outside the loop they ")
+			       TEXT("describe -- the fit in tools/recompute-census.py will be over an empty ")
+			       TEXT("or biased population. Do not read its shares."),
+			       CensusEntryMsAllLevels);
+		}
+		RecomputeProfile.Reset();
+	}
 	// -VoxelRecomputeDutyPct proof of traffic (see the accessor's READINGS).
 	// Under the switch only, so old-leg greps stay clean -- and an armed leg
 	// with no line here ran no ticks at all.
@@ -14167,7 +14669,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		const double TimedApplies = double(FMath::Max<int64>(1, AppliesTimedSinceLog));
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel apply stages (window): exit queueEmpty=%lld wallClock=%lld countCap=%lld drainCap=%lld ")
+		       TEXT("Voxel apply stages (window): exit queueEmpty=%lld wallClock=%lld countCap=%lld smoothCap=%lld drainCap=%lld ")
 		       // THE LIVE BUDGET, ON EVERY WINDOW, AND IT EXISTS BECAUSE THE
 		       // ONCE-ONLY `Voxel apply caps:` LINE CANNOT PROVE ENGAGEMENT.
 		       // That line is emitted from the first DrainResults on frame 0,
@@ -14184,7 +14686,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       TEXT("| timedApplies=%lld pack=%.2fms params=%.2fms poolAdd=%.2fms ")
 		       TEXT("| per-apply pack=%.3f params=%.3f poolAdd=%.3f"),
 		       (long long)DrainExitQueueEmptySinceLog, (long long)DrainExitWallClockSinceLog,
-		       (long long)DrainExitCountCapSinceLog, (long long)DrainExitDrainCapSinceLog,
+		       (long long)DrainExitCountCapSinceLog, (long long)DrainExitSmoothCapSinceLog,
+		       (long long)DrainExitDrainCapSinceLog,
 		       VoxelDebug::GetStreamApplyBudgetMs(), VoxelDebug::GetStreamApplyBudgetMsCvar(),
 		       VoxelDebug::GetStreamMaxAppliesPerFrame(),
 		       (long long)AppliesTimedSinceLog,
@@ -14232,7 +14735,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("hist 1/2/3-4/5-8/9-16/17+=%lld/%lld/%lld/%lld/%lld/%lld ")
 	       TEXT("| wouldDefer cap2=%lld cap4=%lld cap8=%lld | coverable=%lld holeRisk=%lld ")
 	       TEXT("| capPerTick=%d deferred=%lld deferredTicks=%lld capExempt=%lld ")
-	       TEXT("| coldByLevel L0..L%d=%lld/%lld/%lld/%lld/%lld/%lld/%lld"),
+	       TEXT("| coldByLevel L0..L%d=%lld/%lld/%lld/%lld/%lld/%lld/%lld/%lld"),
 	       (long long)ColdTotalSinceLog, (long long)ColdTicksSinceLog, AccumTicks,
 	       ColdMaxPerTickSinceLog,
 	       (long long)ColdBurstHistSinceLog[0], (long long)ColdBurstHistSinceLog[1],
@@ -14248,9 +14751,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)ColdByLevelSinceLog[0], (long long)ColdByLevelSinceLog[1],
 	       (long long)ColdByLevelSinceLog[2], (long long)ColdByLevelSinceLog[3],
 	       (long long)ColdByLevelSinceLog[4], (long long)ColdByLevelSinceLog[5],
-	       (long long)ColdByLevelSinceLog[6]);
-	static_assert(VoxelCoords::kNumLevels == 7,
-	              "the coldByLevel print spells 7 slots; respell it with the level count");
+	       (long long)ColdByLevelSinceLog[6], (long long)ColdByLevelSinceLog[7]);
+	static_assert(VoxelCoords::kNumLevels == 8,
+	              "the coldByLevel print spells 8 slots; respell it with the level count");
 
 	// The pool's own half of the same question, drained from the component so the
 	// render-thread accumulator is reset in step with the game-thread one.
@@ -15111,6 +15614,281 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	//     maintained on some path, i.e. this instrument is lying. Credit
 	//     neither conclusion until it is fixed.
 	{
+		// THE VISTA-KILL DUMP (2026-09-02, -VoxelDumpIndexKeys): for real
+		// resident L6/L7 chunks, the end-to-end chain check -- streaming key ->
+		// the cell the index writer files it under -> that cell's live mirror
+		// value. Every individual link of the chain "proves" correct in code
+		// while slots 6/7 fetch ZERO in 10^8 walk probes; this reads the chain
+		// composed, on real keys. Note the pool's perLevel and the index's
+		// PerSlotEntries are DIFFERENT counters (the pool's was the one always
+		// quoted; the index's own print stops at slot 5 -- a 7-era printer),
+		// so this also prints the index's slot 6/7 entry counts for the first
+		// time.
+		static const bool bDumpIndexKeys =
+		    FParse::Param(FCommandLine::Get(), TEXT("VoxelDumpIndexKeys"));
+		if (bDumpIndexKeys)
+		{
+			FVoxelMarchChunkIndex& DumpIdx = GetGlobalVoxelMarchChunkIndex();
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel index dump: slot6Entries=%d slot7Entries=%d (INDEX counters, ")
+			       TEXT("not the pool's)"),
+			       DumpIdx.GetNumEntriesAtLevel(6), DumpIdx.GetNumEntriesAtLevel(7));
+			// PRESENCE BITMAPS (2026-09-02, the checkerboard hunt): for a line
+			// of footprints through the annulus, which XY keys hold ANY
+			// resident chunk record. The checkerboard's parity becomes text --
+			// odd/even, diagonal, stride -- and names the iterator that skips
+			// them, instead of a fourth theory.
+			const FVector BmAnchor = LastAnchorLocation;
+			for (int32 BmLevel = 6; BmLevel <= 7; ++BmLevel)
+			{
+				const double BmEdgeUU = VoxelCoords::ChunkEdgeUUForLevel(BmLevel);
+				const int32 AnchorCX = FMath::FloorToInt(BmAnchor.X / BmEdgeUU);
+				const int32 AnchorCY = FMath::FloorToInt(BmAnchor.Y / BmEdgeUU);
+				const int32 HalfSpan = (BmLevel == 6) ? 24 : 14;
+				FString RowX, RowY;
+				for (int32 D = -HalfSpan; D <= HalfSpan; ++D)
+				{
+					bool bAnyX = false, bAnyY = false;
+					for (const auto& Pair : ChunkRecords)
+					{
+						if (Pair.Key.Level != BmLevel)
+						{
+							continue;
+						}
+						if (Pair.Key.Key.X == AnchorCX + D && Pair.Key.Key.Y == AnchorCY)
+						{
+							bAnyX = true;
+						}
+						if (Pair.Key.Key.Y == AnchorCY + D && Pair.Key.Key.X == AnchorCX)
+						{
+							bAnyY = true;
+						}
+					}
+					RowX += bAnyX ? TEXT("#") : TEXT(".");
+					RowY += bAnyY ? TEXT("#") : TEXT(".");
+				}
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel index dump: L%d presence X-row (anchor%+d..%+d, y=%d): %s"),
+				       BmLevel, -HalfSpan, HalfSpan, AnchorCY, *RowX);
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel index dump: L%d presence Y-row (x=%d): %s"),
+				       BmLevel, AnchorCX, *RowY);
+			}
+			// SURFACE-COMPLETENESS AUDIT (2026-09-02, the scattered-squares
+			// hunt). The any-Z bitmaps above came back SOLID on both axes, so
+			// the owner's missing squares are specific Z cells inside admitted
+			// columns -- which the bitmaps cannot see. For every L6/L7 column
+			// holding at least one resident record: recompute the footprint
+			// Z-range FRESH (post-residency truth), read the memo the entry
+			// scan actually uses, and check every in-range Z cell for a
+			// resident record. Three diseases, three signatures:
+			//   * fresh covers the surface, memo == fresh, cells missing ->
+			//     the scan/enqueue path skipped them (parked scan never
+			//     revisits; the 5 s backstop is not engaging);
+			//   * memo != fresh -> a stale range was cached (residency-gate
+			//     leak in FootprintChunkZRangeCached);
+			//   * missing cells sit at fresh's own surface band -> the bound
+			//     itself is still wrong.
+			// Missing cells that IsChunkProvablyAllAir can prove empty are
+			// counted separately (missAir): the streaming skip never admits
+			// those, and that is correct, not a defect.
+			for (int32 AuLevel = 6; AuLevel <= 7; ++AuLevel)
+			{
+				TSet<uint64> AuColumns;
+				for (const auto& Pair : ChunkRecords)
+				{
+					if (Pair.Key.Level == AuLevel)
+					{
+						AuColumns.Add((uint64(uint32(Pair.Key.Key.X)) << 32) |
+						              uint64(uint32(Pair.Key.Key.Y)));
+					}
+				}
+				int32 AuCols = 0, AuColsBad = 0, AuMissSolid = 0, AuMissAir = 0,
+				      AuMemoMismatch = 0, AuSamples = 0;
+				for (uint64 Packed : AuColumns)
+				{
+					const int32 AuCx = int32(uint32(Packed >> 32));
+					const int32 AuCy = int32(uint32(Packed & 0xffffffffu));
+					int32 FreshMin = 0, FreshMax = 0, FreshUnt = 0;
+					ComputeFootprintChunkZRange(AuCx, AuCy, AuLevel, FreshMin, FreshMax, FreshUnt);
+					int32 MemoMin = FreshMin, MemoMax = FreshMax;
+					bool bHasMemo = false;
+					if (const FFootprintZRange* Memo = FootprintZRangeCache.Find(
+					        VoxelCoords::FVoxelLevelChunkKey{
+					            AuLevel, VoxelCoords::FVoxelChunkKey{AuCx, AuCy, 0}}))
+					{
+						MemoMin = Memo->ChunkZMin;
+						MemoMax = Memo->ChunkZMax;
+						bHasMemo = true;
+					}
+					if (bHasMemo && (MemoMin != FreshMin || MemoMax != FreshMax))
+					{
+						++AuMemoMismatch;
+					}
+					++AuCols;
+					FString MissList;
+					int32 MissSolidHere = 0;
+					for (int32 AuCz = FreshMin; AuCz <= FreshMax; ++AuCz)
+					{
+						const VoxelCoords::FVoxelLevelChunkKey CellKey{
+						    AuLevel, VoxelCoords::FVoxelChunkKey{AuCx, AuCy, AuCz}};
+						if (ChunkRecords.Contains(CellKey))
+						{
+							continue;
+						}
+						if (IsChunkProvablyAllAir(CellKey))
+						{
+							++AuMissAir;
+							continue;
+						}
+						++MissSolidHere;
+						++AuMissSolid;
+						if (MissList.Len() < 40)
+						{
+							MissList += FString::Printf(TEXT("%d,"), AuCz);
+						}
+					}
+					if (MissSolidHere > 0)
+					{
+						++AuColsBad;
+						if (AuSamples < 8)
+						{
+							++AuSamples;
+							UE_LOG(LogVoxelPerf, Log,
+							       TEXT("Voxel index dump: L%d AUDIT col(%d,%d) fresh=[%d..%d] ")
+							       TEXT("memo=%s[%d..%d] missSolidZ={%s}"),
+							       AuLevel, AuCx, AuCy, FreshMin, FreshMax,
+							       bHasMemo ? TEXT("") : TEXT("NONE"), MemoMin, MemoMax,
+							       *MissList);
+						}
+					}
+				}
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel index dump: L%d AUDIT cols=%d colsBad=%d missSolid=%d ")
+				       TEXT("missAir=%d memoMismatch=%d"),
+				       AuLevel, AuCols, AuColsBad, AuMissSolid, AuMissAir, AuMemoMismatch);
+			}
+			// RECORD->CELL RECONCILIATION (2026-09-02, the grey slabs). The
+			// surface audit above proved streaming admission COMPLETE at L6/L7
+			// while the image shows chunk-sized flat slabs -- and the pool
+			// said 14,910 L6 chunks where the index said 14,435. Counters have
+			// lied here before (phantom pool slots), so this checks each
+			// STREAMING RECORD's own cell: for every record at L3..L7 that
+			// owns pool geometry, probe the cell the writer files it under
+			// and compare the stored pool slot. Only `ok` is healthy:
+			//   * stolen -> the cell is resident but names ANOTHER pool slot
+			//     (an add overwrote it, or a stale remove + re-add raced);
+			//   * empty  -> cleared bare, or never published;
+			//   * marked -> cleared with an absent annotation (pending or
+			//     evicted) while the record still holds live geometry.
+			{
+				int32 RecTotal[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+				int32 RecOk[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+				int32 RecStolen[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+				int32 RecEmpty[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+				int32 RecMarked[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+				int32 RecNoGeom[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+				int32 RcSamples = 0;
+				for (const auto& Pair : ChunkRecords)
+				{
+					const int32 RcLevel = Pair.Key.Level;
+					if (RcLevel < 3 || RcLevel > 7)
+					{
+						continue;
+					}
+					++RecTotal[RcLevel];
+					// The brick pool's own TMap, not the record's PoolSlot
+					// field -- that one is the QUAD-path geometry pool and is
+					// INDEX_NONE for every chunk on the marcher path (measured:
+					// all ~50k records, CAP-AT-RECON). FindChunkSlot is the
+					// authority the record's own comment names.
+					const int32 RcBrickSlot = GetGlobalVoxelBrickPool().FindChunkSlot(
+					    VoxelBrickCpuArm::MakeKey(Pair.Key));
+					if (RcBrickSlot == INDEX_NONE)
+					{
+						++RecNoGeom[RcLevel];
+						continue;
+					}
+					uint32 RcCell = 0u, RcValue = 0u;
+					DumpIdx.DebugProbeKey(RcLevel, Pair.Key.Key.X, Pair.Key.Key.Y,
+					                      Pair.Key.Key.Z, RcCell, RcValue);
+					bool bRcBad = true;
+					if ((RcValue & FVoxelMarchChunkIndex::kResidentBit) != 0u)
+					{
+						if ((RcValue & FVoxelMarchChunkIndex::kSlotMask) ==
+						    uint32(RcBrickSlot))
+						{
+							++RecOk[RcLevel];
+							bRcBad = false;
+						}
+						else
+						{
+							++RecStolen[RcLevel];
+						}
+					}
+					else if (RcValue == 0u)
+					{
+						++RecEmpty[RcLevel];
+					}
+					else
+					{
+						++RecMarked[RcLevel];
+					}
+					if (bRcBad && RcSamples < 10)
+					{
+						++RcSamples;
+						// Who owns the slot the CELL names? Same key -> two
+						// live copies of one chunk (a remesh that never freed
+						// or never re-indexed); another key -> the cell was
+						// overwritten by an aliasing add; nobody -> the cell
+						// points at freed storage (and only record luck keeps
+						// it from reading as stale).
+						const int32 RcCellSlot = int32(RcValue & FVoxelMarchChunkIndex::kSlotMask);
+						FVoxelBrickChunkKey RcOwnerKey{};
+						const bool bRcOwned = GetGlobalVoxelBrickPool().DebugFindSlotOwner(
+						    RcCellSlot, RcOwnerKey);
+						UE_LOG(LogVoxelPerf, Log,
+						       TEXT("Voxel index dump: RECON L%d key=(%d,%d,%d) poolSlot=%d ")
+						       TEXT("cellValue=0x%08x cellSlot=%d owner=%s(%d,%d,%d)L%d"),
+						       RcLevel, Pair.Key.Key.X, Pair.Key.Key.Y, Pair.Key.Key.Z,
+						       RcBrickSlot, RcValue, RcCellSlot,
+						       bRcOwned ? TEXT("") : TEXT("NONE"),
+						       bRcOwned ? RcOwnerKey.X : 0, bRcOwned ? RcOwnerKey.Y : 0,
+						       bRcOwned ? RcOwnerKey.Z : 0, bRcOwned ? RcOwnerKey.Level : -1);
+					}
+				}
+				for (int32 RcL = 3; RcL <= 7; ++RcL)
+				{
+					UE_LOG(LogVoxelPerf, Log,
+					       TEXT("Voxel index dump: RECON L%d records=%d ok=%d stolen=%d ")
+					       TEXT("empty=%d marked=%d noGeom=%d"),
+					       RcL, RecTotal[RcL], RecOk[RcL], RecStolen[RcL], RecEmpty[RcL],
+					       RecMarked[RcL], RecNoGeom[RcL]);
+				}
+			}
+			int32 DumpedPerLevel[2] = {0, 0};
+			for (const auto& Pair : ChunkRecords)
+			{
+				const int32 KLevel = Pair.Key.Level;
+				if (KLevel != 6 && KLevel != 7)
+				{
+					continue;
+				}
+				int32& Dumped = DumpedPerLevel[KLevel - 6];
+				if (Dumped >= 6)
+				{
+					continue;
+				}
+				++Dumped;
+				uint32 Cell = 0u, Value = 0u;
+				DumpIdx.DebugProbeKey(KLevel, Pair.Key.Key.X, Pair.Key.Key.Y,
+				                      Pair.Key.Key.Z, Cell, Value);
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel index dump: L%d key=(%d,%d,%d) cell=%u value=0x%08x"),
+				       KLevel, Pair.Key.Key.X, Pair.Key.Key.Y, Pair.Key.Key.Z, Cell,
+				       Value);
+			}
+		}
 		FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
 		const FVoxelBrickPoolConfig& PoolCfg = BrickPool.GetConfig();
 		FString PoolPerLevel;
@@ -15331,6 +16109,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				                       H.CellBrickOOB + H.CellReal;
 				const double Fetched = double(Fetches);
 				const bool bIdentity = (Parts == H.CellsProbed);
+				// THE VISTA-KILL DISCRIMINATOR (2026-09-02): fetch verdicts by
+				// grid slot. Stale concentrated in slots 6/7 with 0-5 clean =
+				// the R6/R7 lattice/level kill; stale across all slots = the
+				// frame origin is wrong at this camera Z. Slot 8 is cover.
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march cell census bySlot: stale S0..S8=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu ")
+				       TEXT("| real S0..S8=%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu"),
+				       (unsigned long long)H.StaleByGrid[0], (unsigned long long)H.StaleByGrid[1],
+				       (unsigned long long)H.StaleByGrid[2], (unsigned long long)H.StaleByGrid[3],
+				       (unsigned long long)H.StaleByGrid[4], (unsigned long long)H.StaleByGrid[5],
+				       (unsigned long long)H.StaleByGrid[6], (unsigned long long)H.StaleByGrid[7],
+				       (unsigned long long)H.StaleByGrid[8],
+				       (unsigned long long)H.RealByGrid[0], (unsigned long long)H.RealByGrid[1],
+				       (unsigned long long)H.RealByGrid[2], (unsigned long long)H.RealByGrid[3],
+				       (unsigned long long)H.RealByGrid[4], (unsigned long long)H.RealByGrid[5],
+				       (unsigned long long)H.RealByGrid[6], (unsigned long long)H.RealByGrid[7],
+				       (unsigned long long)H.RealByGrid[8]);
 				UE_LOG(LogVoxelPerf, Log,
 				       TEXT("Voxel march cell census: cellsProbed=%llu over %llu frames "
 				            "| PRE-FETCH nonResident=%llu (%.2f%% of probed) "
@@ -15524,9 +16319,22 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				                             ? H.UncoveredShell - Attributed
 				                             : 0;
 				FVoxelMarchChunkIndex& MarchIndex = GetGlobalVoxelMarchChunkIndex();
+				// EVERY LEVEL WORD IS PRINTED, and this line has been short
+				// TWICE: it stopped at L5 while L6 existed (2026-08-23), then
+				// stopped at L6 while L7-L10 existed (2026-08-30..09-02) -- and
+				// L7 was the very ring whose "never admitted" holes were being
+				// diagnosed, with ~750k of them summed into `attributed` but
+				// invisible here. Keep the assert below in step with the level
+				// count; a histogram that hides its top bucket attributes the
+				// misses to arithmetic noise.
+				static_assert(VoxelMarchHoleWord::kNumLevels == 8,
+				              "the byLevel print spells 8 slots; respell it with the level count");
+				// (A hits-byLevel twin line lived here for a few hours on
+				// 2026-09-02 and was reverted with its word group -- see
+				// VoxelMarchHoleWord's note.)
 				UE_LOG(LogVoxelPerf, Log,
 				       TEXT("Voxel march holes breakdown (window): byLevel L0=%llu L1=%llu ")
-				       TEXT("L2=%llu L3=%llu L4=%llu L5=%llu L6=%llu | byReason never=%llu ")
+				       TEXT("L2=%llu L3=%llu L4=%llu L5=%llu L6=%llu L7=%llu | byReason never=%llu ")
 				       TEXT("pending=%llu evicted=%llu unattrib=%llu | attributed=%llu of ")
 				       TEXT("uncShell=%llu (%.2f%% of uncovered=%llu)%s ")
 				       TEXT("| annotWrites pending=%llu evicted=%llu (lifetime)%s"),
@@ -15536,11 +16344,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				       (unsigned long long)H.UncoveredByLevel[3],
 				       (unsigned long long)H.UncoveredByLevel[4],
 				       (unsigned long long)H.UncoveredByLevel[5],
-				       // L6 EXISTS AND WAS NEVER PRINTED. The 8 km ring took
-				       // the seventh level word on 2026-08-23 and this line
-				       // stopped at L5, so a level-6 hole was invisible in the
-				       // one place the histogram is read.
 				       (unsigned long long)H.UncoveredByLevel[6],
+				       (unsigned long long)H.UncoveredByLevel[7],
 				       (unsigned long long)H.UncoveredByReason[0],
 				       (unsigned long long)H.UncoveredByReason[1],
 				       (unsigned long long)H.UncoveredByReason[2],
@@ -15809,6 +16614,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
 	RecordsAddedSinceLog = RecordsEvictedSinceLog = CandidatesRejectedSinceLog = RecordsDroppedSinceLog = 0;
+	// M11: the RING is deliberately NOT cleared -- it is a last-N buffer like
+	// every other latency window in this file, and clearing it would leave a
+	// window that ended mid-fill with two samples and a meaningless p95. The
+	// two per-window COUNTS are cleared, because they are what makes n= mean
+	// "this window" and a lifetime total cannot show a fill stopping. Count vs
+	// ring depth is exactly the distinction the line labels.
+	AdmitToVisibleSamplesSinceLog = 0;
+	AdmitToVisibleUnstampedSinceLog = 0;
 	// Priority-order evidence counters (the "Voxel admit order" line).
 	NearestAdmitCommitsSinceLog = ViewRescansSinceLog = 0;
 	DispatchDotSumSinceLog = 0.0;
@@ -15834,6 +16647,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	BricksReleasedSinceLog = BricksAbsentSinceLog = 0;   // Wave 1.2; the TOTAL is cumulative and is not reset
 	DrainExitQueueEmptySinceLog = DrainExitWallClockSinceLog = 0;
 	DrainExitCountCapSinceLog = DrainExitDrainCapSinceLog = 0;
+	DrainExitSmoothCapSinceLog = 0;
 	ApplyStagePackMs = ApplyStageParamsMs = ApplyStagePoolAddMs = 0.0;
 	AppliesTimedSinceLog = 0;
 	FMemory::Memzero(LevelRecordsAdded);
@@ -16198,8 +17012,13 @@ static constexpr int32 BoxRadiusChunksL1 = 0; // whole ring (fraction is always 
 // anchor's Z leaves the keep window entirely.
 // Levels 2+ get no deep box at all (BoxRadiusChunks returns false for them), so
 // their entry here is unused and 0 is the correct value for R5 as well.
-static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0, 0, 0};
-static_assert(UE_ARRAY_COUNT(KeepChunks) == VoxelCoords::kNumLevels, "KeepChunks must have one entry per level");
+static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0, 0, 0, 0};
+// NOTE the assert checks the DECLARED size only -- C++ zero-fills a short
+// initializer list silently (this table shipped with 7 of 11 entries during the
+// 11-level period; harmless only because the invented entries were 0). Count
+// the entries by hand when the level count changes.
+static_assert(UE_ARRAY_COUNT(KeepChunks) == VoxelCoords::kNumLevels,
+              "KeepChunks must have one entry per level -- a short list is zero-filled SILENTLY");
 
 // Vertical keep-distance in UU for a deep chunk of this level, used by the
 // exit scan. Level 0 derives it from the sight sphere rather than from the
@@ -16230,6 +17049,17 @@ static double VerticalKeepUU(int32 Level, double ChunkEdgeUU)
 	{
 		return SightRadiusUU() * UVoxelWorldSubsystem::GetUnloadRingMultiplier() + ChunkEdgeUU;
 	}
+	// NOT AN ADMISSION GATE, and that was established the expensive way. During
+	// the "swiss cheese" hunt (2026-09-01) this was widened to the ring's own
+	// reach (up to 7 km of vertical keep per level) on the theory that a
+	// one-chunk band around the anchor's altitude was refusing far terrain.
+	// Engagement was proven and the effect was 19% -- a contributor, not the
+	// cause -- while residency ballooned (243 ms leg). The actual admission
+	// defect was ComputeFootprintChunkZRange sampling only the footprint's four
+	// CORNERS (invisible interior relief at a 409 m L7 chunk); it now takes
+	// conservative rect bounds, which admit a chunk at ANY altitude its terrain
+	// occupies. This function is the exit-scan/eviction band and stays on the
+	// original chunk-count form.
 	return double(KeepChunks[Level] + 1) * ChunkEdgeUU * UVoxelWorldSubsystem::GetUnloadRingMultiplier();
 }
 
@@ -16355,18 +17185,31 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, i
 	//
 	// WITH NO FIELD INSTALLED THIS IS THE OLD LINE, unchanged, which is what
 	// keeps every existing golden and the pinned digest valid.
+	//
+	// TIER-AWARE, AND CURRENTLY DORMANT: with kFirstCoarseLevel == kNumLevels
+	// (no coarse-derived ring since the 2026-09-02 cut to 8 levels) the ternary
+	// always picks the fine-backed amplifier. It is kept because it is the
+	// correct shape if coarse-derived rings ever return -- a bound for a level
+	// the fine tier does not cover must come from the tier that has data there,
+	// or a missing fine tile's sea-level answer becomes "provably air" and
+	// deletes terrain.
+	const vxc::Amplifier& Amp =
+		(VoxelTier::IsCoarseDerivedLevel(Level) && CoarseAmplifier.IsValid())
+			? *CoarseAmplifier
+			: Voxels.amplifier();
+
 	const vxc::AssetField* Field = Voxels.assetField();
 	if (Field == nullptr || Field->empty())
 	{
-		return Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
+		return Amp.surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
 	}
 
 	const vxc::AssetVoxelRect Rect{Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1};
 	return vxc::assetAwareSurfaceUpperBoundMm(
 		Field->seed(), Field->layers().data(), int(Field->layers().size()), Rect,
-		[this](int64_t Ax0, int64_t Ay0, int64_t Ax1, int64_t Ay1) -> int64_t
+		[&Amp](int64_t Ax0, int64_t Ay0, int64_t Ax1, int64_t Ay1) -> int64_t
 		{
-			return Voxels.amplifier().surfaceUpperBoundMm(Ax0, Ay0, Ax1, Ay1);
+			return Amp.surfaceUpperBoundMm(Ax0, Ay0, Ax1, Ay1);
 		});
 }
 
@@ -17116,46 +17959,147 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 
 	// Cheap proxy for stage 1's exhaustive per-brick surfaceBrickRange (which
 	// would cost B*B amplifier samples per candidate -- prohibitive across
-	// ~1300+ candidate footprints per recompute): sample the amplifier
-	// column at this footprint's 4 corners and take a +-1 render-chunk
-	// margin around the resulting elevation range as slope safety. Generous
-	// on purpose; the Z-extent algorithm isn't pinned by the decisions table
-	// (only the XY radius test is), and this keeps recompute cost bounded.
+	// ~1300+ candidate footprints per recompute): take the amplifier's
+	// CONSERVATIVE surface bounds over the whole footprint rect, plus a small
+	// chunk margin. Generous on purpose; the Z-extent algorithm isn't pinned by
+	// the decisions table (only the XY radius test is), and this keeps
+	// recompute cost bounded.
 	//
 	// M2: the amplifier always operates in LEVEL-0 (10cm) voxel units, so a
-	// level-L footprint's corners are converted up to level-0 voxel units
-	// before querying it, and the resulting level-0 top-voxel range is
-	// converted back down to level-L chunk units afterward.
+	// level-L footprint is converted up to level-0 voxel units before querying
+	// it, and the resulting level-0 top-voxel range is converted back down to
+	// level-L chunk units afterward.
 	const int64 LevelScale = int64(1) << Level;
 	const int64 Vx0 = (int64(ChunkX) * ChunkEdgeVoxels) * LevelScale;
 	const int64 Vx1 = Vx0 + ChunkEdgeVoxels * LevelScale - 1;
 	const int64 Vy0 = (int64(ChunkY) * ChunkEdgeVoxels) * LevelScale;
 	const int64 Vy1 = Vy0 + ChunkEdgeVoxels * LevelScale - 1;
 
-	int64 TopVoxelMin = INT64_MAX, TopVoxelMax = INT64_MIN;
-	const int64 CornersX[2] = {Vx0, Vx1};
-	const int64 CornersY[2] = {Vy0, Vy1};
-	for (int64 Cx : CornersX)
+	// RECT BOUNDS, NOT CORNER SAMPLES, since 2026-09-02 -- and the difference
+	// was the owner's "swiss cheese". The old code sampled surfaceMm at the
+	// footprint's four CORNERS and took their min/max as the chunk's Z range.
+	// Harmless at L0 (3.2 m footprint); at L7 (409.6 m) every ridge and valley
+	// BETWEEN the corners was invisible, the range came back too narrow, and
+	// the chunks holding that terrain were NEVER ADMITTED. The census named it:
+	// `byReason never=4,894,444` (80% of attributed holes) with pending=0 and
+	// every admission-skip counter at zero.
+	//
+	// surfaceUpper/LowerBoundMm are CONSERVATIVE over the whole rect (the
+	// header states lower(rect) <= surfaceMm(vx,vy) <= upper(rect) for every
+	// column in it), so no relief inside the footprint can escape them. The
+	// asymmetry is the point: a range too WIDE costs a few chunks that turn out
+	// to be air; a range too NARROW deletes terrain. Only one is recoverable.
+	//
+	// RULED OUT ON THE WAY, each with engagement proven: the all-air skip
+	// (-VoxelSkySkip=0 made `never` WORSE, 3.95M -> 4.57M) and the vertical
+	// keep band (widened; `never` fell only 19%, because VerticalKeepUU is the
+	// EXIT-SCAN distance and not an admission gate at all).
+	//
+	// TIER-AWARE, currently dormant (kFirstCoarseLevel == kNumLevels): a
+	// coarse-derived level, if one ever returns, asks the coarse amplifier so
+	// the fine tier is never queried for ground it does not cover. Same rule
+	// object as the raster path -- one spelling.
+	const vxc::Amplifier& Amp =
+		(VoxelTier::IsCoarseDerivedLevel(Level) && CoarseAmplifier.IsValid())
+			? *CoarseAmplifier
+			: Voxels.amplifier();
+	// THE SENTINEL CHECK THE FIRST VERSION FORGOT, AND IT WAS THE GAP RING.
+	// The bound functions DECLINE oversized footprints (kSurfaceBoundDeclined
+	// = INT64_MAX, lower = INT64_MIN; core.h's own comment warns of "a caller
+	// that forgets to check"). L6/L7 footprints (204.8/409.6 m) are exactly
+	// the rects big enough to decline while L5's 102.4 m stays under -- so
+	// every L6/L7 chunk was admitted with a sentinel-derived Z in the
+	// BILLIONS (measured: key Z = 1,030,792,138 on real resident chunks,
+	// -VoxelDumpIndexKeys), filed in the index torus at (garbage & 127), and
+	// the marcher -- asking at the real altitude -- never found one in 10^8
+	// probes. That was the owner's gap between the voxels and the clipmap.
+	//
+	// ON DECLINE: RECURSE INTO QUADRANTS, NOT CORNERS. The first repair fell
+	// back to four corner samples, and the owner's next screenshot showed the
+	// cost: a CHECKERBOARD of missing chunks across the outer rings --
+	// footprints whose interior relief exceeded corner spread + margins got a
+	// Z-range that missed their own surface, and which footprints those were
+	// followed the decline's alignment parity. Quadrant recursion has no such
+	// blindness: an L6 quadrant is exactly L5-sized (proven never to decline)
+	// and an L7 footprint bottoms out in at most 16 L5-sized rect calls --
+	// exact conservative bounds, once per footprint per recompute.
+	struct FRectBounds
 	{
-		for (int64 Cy : CornersY)
+		static bool Get(const vxc::Amplifier& InAmp, int64 X0, int64 Y0, int64 X1,
+		                int64 Y1, int32 Depth, int64& OutLo, int64& OutHi)
 		{
-			const vxc::ColumnSample Col = Voxels.amplifier().column(Cx, Cy);
-			const int64 Top = vxc::floorDiv(Col.surfaceMm, vxc::kVoxelSizeMm);
-			TopVoxelMin = FMath::Min(TopVoxelMin, Top);
-			TopVoxelMax = FMath::Max(TopVoxelMax, Top);
+			const int64 Lo = InAmp.surfaceLowerBoundMm(X0, Y0, X1, Y1);
+			const int64 Hi = InAmp.surfaceUpperBoundMm(X0, Y0, X1, Y1);
+			if (Lo != vxc::kSurfaceLowerBoundDeclined &&
+			    Hi != vxc::kSurfaceBoundDeclined)
+			{
+				OutLo = Lo;
+				OutHi = Hi;
+				return true;
+			}
+			if (Depth <= 0 || X1 <= X0 || Y1 <= Y0)
+			{
+				return false;
+			}
+			const int64 Mx = X0 + (X1 - X0) / 2;
+			const int64 My = Y0 + (Y1 - Y0) / 2;
+			const int64 QX0[4] = {X0, Mx + 1, X0, Mx + 1};
+			const int64 QX1[4] = {Mx, X1, Mx, X1};
+			const int64 QY0[4] = {Y0, Y0, My + 1, My + 1};
+			const int64 QY1[4] = {My, My, Y1, Y1};
+			OutLo = INT64_MAX;
+			OutHi = INT64_MIN;
+			for (int32 Q = 0; Q < 4; ++Q)
+			{
+				int64 QLo = 0, QHi = 0;
+				if (!Get(InAmp, QX0[Q], QY0[Q], QX1[Q], QY1[Q], Depth - 1, QLo, QHi))
+				{
+					return false;
+				}
+				OutLo = FMath::Min(OutLo, QLo);
+				OutHi = FMath::Max(OutHi, QHi);
+			}
+			return true;
+		}
+	};
+	int64 LoBoundMm = 0;
+	int64 HiBoundMm = 0;
+	if (!FRectBounds::Get(Amp, Vx0, Vy0, Vx1, Vy1, /*Depth*/ 3, LoBoundMm, HiBoundMm))
+	{
+		// Paranoia tail: even L5-sized quadrants declined. Corner proxy plus a
+		// once-per-session warning, so this can never again fail silently.
+		static bool bWarnedDeclineFloor = false;
+		if (!bWarnedDeclineFloor)
+		{
+			bWarnedDeclineFloor = true;
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("ComputeFootprintChunkZRange: quadrant recursion still declined at "
+			            "level %d -- corner-proxy Z ranges in use for some footprints; "
+			            "expect possible admission holes there."),
+			       Level);
+		}
+		LoBoundMm = INT64_MAX;
+		HiBoundMm = INT64_MIN;
+		const int64 CornersX[2] = {Vx0, Vx1};
+		const int64 CornersY[2] = {Vy0, Vy1};
+		for (int64 Cx : CornersX)
+		{
+			for (int64 Cy : CornersY)
+			{
+				const int64 SurfMm = Amp.column(Cx, Cy).surfaceMm;
+				LoBoundMm = FMath::Min(LoBoundMm, SurfMm);
+				HiBoundMm = FMath::Max(HiBoundMm, SurfMm);
+			}
 		}
 	}
+	int64 TopVoxelMin = vxc::floorDiv(LoBoundMm, vxc::kVoxelSizeMm);
+	int64 TopVoxelMax = vxc::floorDiv(HiBoundMm, vxc::kVoxelSizeMm);
 
-	// Corner-only sampling under-estimates interior extremes; the amplifier's
-	// slope-scaled detail can add metres between corners. Missing chunks
-	// BELOW the range are invisible (buried), so -1 suffices; missing chunks
-	// ABOVE the range are holes in peaks, so take +2 headroom (in level-L
-	// chunks -- generous by construction, since a level-L chunk is (1<<L)
-	// times taller than a level-0 one). The exact fix (workers compute their
-	// own z-range per footprint) is a stage 3 refactor.
-	// Qualified: VoxelLightField.cpp declares its own anonymous-namespace
-	// FloorDiv, and in a unity blob that contains both files the unqualified
-	// name is ambiguous against `using namespace VoxelCoords`.
+	// The chunk margins below predate the rect bounds (they were slope safety
+	// for the corner proxy). They are kept: against a conservative bound they
+	// are pure slack -- missing chunks BELOW the range are invisible (buried),
+	// so -1 suffices; missing chunks ABOVE the range are holes in peaks, so +2
+	// headroom (in level-L chunks, generous by construction).
 	// THE SAMPLED CORNER BOUND IS A TERRAIN BOUND, AND ASSETS STAND ON TERRAIN.
 	//
 	// TopVoxelMax above is the highest GROUND of four corner columns. With an
@@ -17343,6 +18287,11 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
 	if (const FFootprintZRange* Hit = FootprintZRangeCache.Find(CacheKey))
 	{
+		// Census G2. memoHit/memoFill is the pair that says whether the memo is
+		// still memoizing; memoFill approaching memoHit is the reading that
+		// retires the fill timer below (it would then be on a hot path and be a
+		// cost of its own).
+		if (ActiveCensus) { ++ActiveCensus->MemoHit; }
 		OutChunkZMin = Hit->ChunkZMin;
 		OutChunkZMax = Hit->ChunkZMax;
 		OutChunkZMaxUntrimmed = Hit->ChunkZMaxUntrimmed;
@@ -17353,7 +18302,24 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 		FVoxelResidencyGpu::Get().NoteFootprintZRange(Level, ChunkX, ChunkY, OutChunkZMin, OutChunkZMax);
 		return;
 	}
+	// Census G2, the fill half. THE ONE TIMER INSIDE THE SWEEP, and it is safe
+	// on its own terms: a fill is an amplifier column -- rare once a level is
+	// warm, hundreds of ns at least -- which is the exact case where a clock
+	// read is negligible. The clock is only read with the switch armed, so an
+	// unarmed leg pays nothing and an armed leg's own perturbation is bounded
+	// by memoFill, printed beside it.
+	//
+	// The bracket covers ONLY the compute. The residency test and the memo
+	// insert below it are the memo's bookkeeping, not the column evaluation the
+	// fit is trying to price, and folding them in would let a fine-tier stall
+	// masquerade as amplifier cost.
+	const double CensusMemoT0 = ActiveCensus ? FPlatformTime::Seconds() : 0.0;
 	ComputeFootprintChunkZRange(ChunkX, ChunkY, Level, OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed);
+	if (ActiveCensus)
+	{
+		++ActiveCensus->MemoFill;
+		ActiveCensus->MemoFillMs += (FPlatformTime::Seconds() - CensusMemoT0) * 1000.0;
+	}
 	// CACHE ONLY WHAT WAS COMPUTED FROM RESIDENT TILES. The memo's charter --
 	// "a pure function of (Level, X, Y) and the immutable tile raster, so an
 	// entry never needs invalidating" -- was written before the fine tier
@@ -18246,6 +19212,7 @@ bool FVoxelWorldImpl::AdmitCandidateCommit(const VoxelCoords::FVoxelLevelChunkKe
 			// that goes unrecorded is a silently lost chunk.
 			if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
 			{
+				if (ActiveCensus) { ++ActiveCensus->DeferralOps; }
 				DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
 			}
 			return false;
@@ -18260,6 +19227,13 @@ bool FVoxelWorldImpl::AdmitCandidateCommit(const VoxelCoords::FVoxelLevelChunkKe
 		bDeepAnchorRelative);
 	++RecordsAddedSinceLog;
 	++LevelRecordsAdded[QueueLevel];
+	// Census G3: admit=. Same ++ site as RecordsAddedSinceLog, so the census
+	// and the streaming line cannot end up describing different admissions.
+	if (ActiveCensus) { ++ActiveCensus->Admits; }
+	// M11: t=0 for admission->visible. Stamped against the SAME ++ that defines
+	// admission for every other counter on this line, so the two can never
+	// describe different populations.
+	NewRecord.AdmittedAtSeconds = ElapsedSeconds;
 	AdmissionsThisLevel += bOverlayAware ? 0 : 1;
 	// Ordering evidence, both arms (see LevelAdmitDistSumUU): the RAW 2D
 	// distance, not the priority key -- the metric must mean the same thing
@@ -18342,6 +19316,10 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 	// as resurrected and skips it -- the stale PendingUnloadKeys
 	// entry is inert) and clear the retention stamp so a future
 	// eviction re-stamps fresh.
+	// Census G3: the record probe. One per candidate, unconditionally -- this
+	// Find is the per-candidate cost the fit prices, so counting it anywhere
+	// but immediately beside the call would price a different loop.
+	if (ActiveCensus) { ++ActiveCensus->RecordProbes; }
 	if (VoxelStreaming::FChunkRecord* Existing = ChunkRecords.Find(LevelKey))
 	{
 		if (PendingUnloadSet.Contains(LevelKey))
@@ -18367,6 +19345,10 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 	// This is also the seam T4-1 lands on (Wave S4): speculatively
 	// generated terrain arrives already parked, and admission
 	// FINDS it here instead of commissioning it.
+	// Census G3: the park probe. Reached only by candidates the record probe
+	// missed, so recProbe > parkProbe always; parkProbe approaching recProbe
+	// means almost nothing is tracked yet, i.e. a cold fill.
+	if (ActiveCensus) { ++ActiveCensus->ParkProbes; }
 	if (FParkedGeometry* Parked = ParkedGeometry.Find(LevelKey))
 	{
 		// Staleness first. A parked chunk has no record, so this
@@ -18417,6 +19399,11 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 				LevelKey.Level,
 				FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
 				bDeepAnchorRelative);
+			// M11: an adoption IS an admission (the record is
+			// created right above), so it gets t=0 like any
+			// other. It will settle at ~0 ms a few lines down --
+			// see NoteChunkVisible on why that sample is kept.
+			Adopted.AdmittedAtSeconds = ElapsedSeconds;
 			Adopted.PoolSlot = Parked->PoolHandle;
 			Adopted.GenerationId = Parked->GenerationId;
 			Adopted.LastQuadCount = Parked->QuadCount;
@@ -18432,6 +19419,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 			// retained stand-in above or below it.
 			Adopted.bMeshSettled = true;
 			Adopted.LoadedAtSeconds = ElapsedSeconds;
+			NoteChunkVisible(Adopted);
 
 			// Brick-backed parks hold no quad-pool range --
 			// PoolHandle is INDEX_NONE and unparking it would
@@ -18512,6 +19500,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 		if (!bCellDeferredRecorded && VoxelStreamAdmission::IncrementalAdmissionEnabled())
 		{
 			bCellDeferredRecorded = true;
+			if (ActiveCensus) { ++ActiveCensus->DeferralOps; }
 			DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
 		}
 		return EAdmitEvalOutcome::RejectedBudget;
@@ -18548,6 +19537,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 		if (!bCellDeferredRecorded && VoxelStreamAdmission::IncrementalAdmissionEnabled())
 		{
 			bCellDeferredRecorded = true;
+			if (ActiveCensus) { ++ActiveCensus->DeferralOps; }
 			DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
 		}
 		return EAdmitEvalOutcome::RejectedCutoff;
@@ -18632,6 +19622,7 @@ void FVoxelWorldImpl::CommitNearestAdmitScratch(int32 Level, const FVector& Anch
 			for (int32 DeclinedIdx = Committed; DeclinedIdx < NearestAdmitScratch.Num(); ++DeclinedIdx)
 			{
 				const VoxelCoords::FVoxelLevelChunkKey& DK = NearestAdmitScratch[DeclinedIdx].Key;
+				if (ActiveCensus) { ++ActiveCensus->DeferralOps; }
 				DeferredFootprints[Level].Add(FIntPoint(DK.Key.X, DK.Key.Y));
 			}
 		}
@@ -18917,6 +19908,10 @@ void FVoxelWorldImpl::EnumerateSurfaceFootprintCandidates(int32 Level, int32 Cx,
 
 	for (int32 Cz = ChunkZMin; Cz <= ChunkZMax; ++Cz)
 	{
+		// Census G3. THE 2.4-MILLION-ITERATION LOOP -- the one this whole census
+		// is counted rather than timed for. zCells/cells collapsing towards 1 is
+		// a failing reading: it means the Z range has stopped being a range.
+		if (ActiveCensus) { ++ActiveCensus->ZCells; }
 		const FVoxelLevelChunkKey CandidateKey{Level, FVoxelChunkKey{Cx, Cy, Cz}};
 		bool bBandEmpty = false;
 		if (AdmitBand)
@@ -19827,6 +20822,17 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		LastEntryScanViewDir[Level] = StreamViewDirXY;
 		bHasRecomputedLevel[Level] = true;
 		++LevelEntryScans[Level];
+		// -VoxelRecomputeCensus: arm THIS level's counters, here and nowhere
+		// else. Past every scan gate, so a level that early-continued above never
+		// arms and contributes nothing -- the same "did no work" reading its
+		// entry ms already gives. Closed at the entry-timer close below, and no
+		// `continue` exists between the two, so a level's counters and its ms
+		// always come from the same bracket.
+		if (VoxelRecomputeCensusEnabled())
+		{
+			LevelCensusScratch = VoxelRecomputeProfile::FEntryCounters();
+			ActiveCensus = &LevelCensusScratch;
+		}
 		++LevelsScannedThisCall;
 		bLevelScannedThisCall[Level] = true;
 		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
@@ -20217,6 +21223,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+				// Census G1: cell-loop bodies ENTERED, counted before any test can
+				// reject one. cells=0 with entryMs>0 is the failing reading the
+				// reader calls out by name -- it means the counters are outside the
+				// loop they claim to describe.
+				if (ActiveCensus) { ++ActiveCensus->CellsVisited; }
 				// INCREMENTAL ADMISSION: skip this cell unless something about
 				// it could have CHANGED since this level's last scan. "Could
 				// have changed" is exactly: (a) the cell crossed one of the
@@ -20313,6 +21324,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 					if (!bRevisit)
 					{
+						// Census G1: skipped by the incremental crossing test. This
+						// is the population -VoxelIncrementalAdmission exists to
+						// remove; incrSkip near cells is the switch working, and
+						// incrSkip=0 on an armed leg is it converting nothing.
+						if (ActiveCensus) { ++ActiveCensus->IncrSkipped; }
 						continue;
 					}
 				}
@@ -20325,6 +21341,12 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				                            LevelInnerAdmitUU, bLevelHierarchicalCoverage,
 				                            RingOverlapChunks, MaxRingLevel, Anchor))
 				{
+					// Census G1: rejected on geometry alone (inner pad, outer edge,
+					// seam parent) before ANY memo or probe work. cells minus
+					// incrSkip minus geoRej is the population that reaches the
+					// expensive body, and it is the denominator every per-footprint
+					// cost in the fit is really per.
+					if (ActiveCensus) { ++ActiveCensus->GeoRejected; }
 					continue;
 				}
 
@@ -20454,6 +21476,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// comment). Gated levels never reach this line, so a level that did
 		// not scan adds nothing -- same rule its max already follows.
 		AccumLevelEntryMs[Level] += ThisFrameLevelEntryMs[Level];
+		// -VoxelRecomputeCensus: fold this level's counters into the window and
+		// DISARM. Folded against the same ms this line just accumulated, which is
+		// the whole point -- the reader's least-squares fit regresses entryMs on
+		// these counters, so a counter charged to a level whose timer did not
+		// cover it would be an observation of a scan that never happened.
+		if (ActiveCensus)
+		{
+			RecomputeProfile.AddEntry(Level, LevelCensusScratch);
+			ActiveCensus = nullptr;
+		}
 	}
 
 	// --- T4-2 LIVE: consume the entry-side delta (replaces the cell sweeps) --
@@ -22707,11 +23739,24 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// control path wearing the fix, not a null result. `demandRescued=0` with
 	// `inlineFallback` large is the same DEAD reading from the other side.
 	// `demandRetryFail>0` invalidates the leg outright.
-	if (!RasterAtlas.IsValid() ||
-	    (!RasterAtlas->PrepareRequest(Req) &&
-	     !(RasterAtlas->FillWindowOnDemand(ActiveTiles(), Req) && RasterAtlas->PrepareRequest(Req))))
+	// WHICH ATLAS, AND WHICH SAMPLER. Both follow from ONE call to the tier rule
+	// (VoxelTier::IsCoarseDerivedLevel) so they can never disagree -- picking the
+	// coarse atlas while filling it from the fine sampler would produce a raster
+	// at the wrong pitch and every chunk built from it would be silently wrong.
+	//
+	// INERT TODAY: kNumLevels is 8, so no streamed level satisfies the rule and
+	// this always selects the fine pair, exactly as before.
+	const bool bCoarseLevel = VoxelTier::IsCoarseDerivedLevel(Req.CoarseLevel)
+	                       && CoarseRasterAtlas.IsValid() && Tiles;
+	FVoxelRasterAtlasCpu* const Atlas =
+		bCoarseLevel ? CoarseRasterAtlas.Get() : RasterAtlas.Get();
+	vxc::ITileSampler& Sampler = bCoarseLevel ? *Tiles : ActiveTiles();
+
+	if (Atlas == nullptr ||
+	    (!Atlas->PrepareRequest(Req) &&
+	     !(Atlas->FillWindowOnDemand(Sampler, Req) && Atlas->PrepareRequest(Req))))
 	{
-		VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
+		VoxelGpuRegionBuild::FillRasterWindow(Req, Sampler);
 	}
 	const double SubT3 = FPlatformTime::Seconds(); // raster: atlas check / window fill
 
@@ -26865,6 +27910,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			++TotalChunksLoaded;
 			++LevelChunksLoadedTotal[FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 			Rec.LoadedAtSeconds = ElapsedSeconds;
+			NoteChunkVisible(Rec);
 		}
 		else if (bIsGameThreadMesh)
 		{
@@ -26964,6 +28010,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	if (bWasFirstLoad)
 	{
 		Rec.LoadedAtSeconds = ElapsedSeconds;
+		NoteChunkVisible(Rec);
 	}
 	else if (bIsGameThreadMesh)
 	{
@@ -27002,6 +28049,38 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	const double ApplyBudgetSeconds = double(VoxelDebug::GetStreamApplyBudgetMs()) / 1000.0;
 	const double ApplyLoopStart = FPlatformTime::Seconds();
 	constexpr int32 kMinAppliesPerFrame = 4; // forward-progress floor, budget-independent
+	// CRUISE-BURST SMOOTHING (2026-09-02, the Goal-3 p95 pass). The CSV GPU
+	// attribution (GOAL3-ATTRIB, tools/csv-gpu-attrib.py) put the moving p95
+	// squarely on APPLY-BURST frames: 247 applies in one frame vs 19 typical,
+	// with ~72% of the GPU's FAST->SLOW step being the worldgen kernels that
+	// ride the burst (WlVoxelize +0.67 ms, WlColumn +0.63, PoolWrite +0.13)
+	// and the game-thread apply cost stepping with it. The marcher's step was
+	// +0.65 ms -- the burst, not the march, owns the p95.
+	//
+	// v2, A RATE CAP, NOT A DEPTH DIVISION. v1 spread the BACKLOG across
+	// frames (backlog / 6) and never engaged -- measured smoothCap=0 across a
+	// full flight (GOAL3-SMOOTH) while hitch frames still applied 199+ -- for
+	// a reason worth keeping: a ring crossing is not a one-shot burst but a
+	// STANDING RIVER. The backlog holds 600-4,000 while workers keep
+	// delivering, so depth/6 floats above the natural per-frame drain and the
+	// clamp binds nothing. A river is smoothed by capping the RATE at which it
+	// lands: while the backlog is CRUISE-sized (<= ApplyStormBacklog), at most
+	// ApplyCruiseCap render-facing applies land per frame. A STORM backlog
+	// (cold fill, teleport: tens of thousands) bypasses the cap entirely, so
+	// the <60 s fill requirement and the 2026-07-24 fast-fill directive are
+	// untouched; the wall-clock budget below still backstops every mode.
+	// Engagement is countable: DrainExitSmoothCapSinceLog.
+	int32 EffectiveMaxApplies = MaxApplies;
+	{
+		const int32 CruiseCap = VoxelDebug::GetStreamApplyCruiseCap();
+		const int32 StormBacklog = VoxelDebug::GetStreamApplyStormBacklog();
+		const int32 Backlog = ResultsBacklogCounter.GetValue();
+		if (CruiseCap > 0 && Backlog > 0 && Backlog <= StormBacklog)
+		{
+			EffectiveMaxApplies =
+				FMath::Clamp(CruiseCap, kMinAppliesPerFrame, MaxApplies);
+		}
+	}
 	// M1 gate (docs/status.md M1 gate row): MaxApplies gates only the
 	// RENDER-THREAD-FACING applies (ApplyMeshResult -> SetChunkQuads ->
 	// MarkRenderStateDirty -> FScene::AddPrimitive + GPU buffer upload). A
@@ -27037,10 +28116,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		{
 			bLoggedApplyCaps = true;
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("Voxel apply caps: maxApplies=%d (cvar %d) budgetMs=%.2f (cvar %.2f) drainCap=%d (shipped 1024)"),
+			       TEXT("Voxel apply caps: maxApplies=%d (cvar %d) budgetMs=%.2f (cvar %.2f) drainCap=%d ")
+			       TEXT("(shipped 1024) cruiseCap=%d stormBacklog=%d"),
 			       MaxApplies, VoxelDebug::GetStreamMaxAppliesPerFrameCvar(),
 			       VoxelDebug::GetStreamApplyBudgetMs(), VoxelDebug::GetStreamApplyBudgetMsCvar(),
-			       kMaxResultDrainsPerFrame);
+			       kMaxResultDrainsPerFrame, VoxelDebug::GetStreamApplyCruiseCap(),
+			       VoxelDebug::GetStreamApplyStormBacklog());
 		}
 	}
 	int32 Applied = 0; // render-thread-facing applies (live results) this frame -- gated by MaxApplies
@@ -27053,7 +28134,7 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	enum class EDrainExit : uint8 { None, QueueEmpty, WallClock };
 	EDrainExit ExitReason = EDrainExit::None;
 	VoxelStreaming::FJobResult Result;
-	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame)
+	while (Applied < EffectiveMaxApplies && Drains < kMaxResultDrainsPerFrame)
 	{
 		// Wall-clock apply budget (see ApplyBudgetSeconds comment). Checked at
 		// the top of each iteration AFTER the min-applies floor: stale discards
@@ -27533,6 +28614,11 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			++BrickChunksLoadedTotal;
 			++LevelChunksLoadedTotal[FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 			Rec->LoadedAtSeconds = ElapsedSeconds;
+			// M11: THE marcher-path visible moment. Inside this guard on purpose --
+			// HoldsTerrain(Result.Key) has just asked the pool's FindChunkSlot, so
+			// the chunk is provably in the volume the marcher reads. A sample
+			// pushed outside it would be timing chunks that never became marchable.
+			NoteChunkVisible(*Rec);
 		}
 
 		// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2):
@@ -27574,6 +28660,7 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// visibly short. The four counters summing to less than the frame count IS
 		// the tell that an exit path exists that nobody has accounted for.
 		if (Applied >= MaxApplies)                   { ++DrainExitCountCapSinceLog; }
+		else if (Applied >= EffectiveMaxApplies)     { ++DrainExitSmoothCapSinceLog; }
 		else if (Drains >= kMaxResultDrainsPerFrame) { ++DrainExitDrainCapSinceLog; }
 		break;
 	}
@@ -27742,6 +28829,8 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			++BrickChunksLoadedTotal;
 			++LevelChunksLoadedTotal[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
 			Rec->LoadedAtSeconds = ElapsedSeconds;
+			// M11: DrainResults' twin, same guard, same reason.
+			NoteChunkVisible(*Rec);
 		}
 	}
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);

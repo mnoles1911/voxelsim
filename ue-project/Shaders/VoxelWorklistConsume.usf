@@ -27,9 +27,12 @@
 //   [0] cumulative records consumed (InterlockedAdd)
 //   [1] cumulative XOR of per-record folds (InterlockedXor) -- see
 //       worklistRecordFold in VoxelWorklist.ush for what a mismatch means
-//   [2] cumulative malformed records (GenId 0 or CoarseLevel > 6) -- a
+//   [2] cumulative malformed records (GenId 0 or CoarseLevel > 7) -- a
 //       nonzero here with a PASSING fold means the HOST staged garbage,
-//       which the fold alone would happily agree with
+//       which the fold alone would happily agree with. The bound is the TOP
+//       ring level; it sat at 6 after R7 landed and flagged every healthy R7
+//       record as "malformed" for days (~940/window of pure noise) -- keep it
+//       in step with the cascade or the counter cries wolf.
 //   [3] the ring tail after this tick's consume, as the args pass left it --
 //       plain store from group 0 only, no race
 //   [4] cumulative mismatching DWORDS, converted columns vs classic (verify)
@@ -64,7 +67,7 @@ void WorklistConsumeMain(uint3 Gid : SV_GroupID)
 	uint Unused;
 	InterlockedAdd(WorklistStats[0], 1u, Unused);
 	InterlockedXor(WorklistStats[1], worklistRecordFold(R), Unused);
-	if (R.GenId == 0u || worklistCoarseLevel(R) > 6u)
+	if (R.GenId == 0u || worklistCoarseLevel(R) > 7u)
 	{
 		InterlockedAdd(WorklistStats[2], 1u, Unused);
 	}

@@ -31,7 +31,10 @@
 #            ~850, spec dispatched share rising above ~17%. FAILURE readings
 #            (revert): evictedUnused lifts off 0, hit% < 90, dropOvertaken > 0.
 #   PF-c/d : [gpu-jobcost] jobLean=ON, passFree > 0, overCap > 0. Gate:
-#            promoteExit quota= falls AND delivered rises. LIKELY NULL per
+#            promoteExit batchCap= falls AND delivered rises (M10 2026-09-02
+#            split the old `quota=`, which also carried the pass-free and spec
+#            allowances; batchCap= is the MeshBatchCap half and the only one
+#            this gate ever meant). LIKELY NULL per
 #            q-armc2 (overCap 0-73 vs passFree 3-6k): a null closes the item.
 #   B256   : [gpu-jobcost] batch cap line reads 256; expected worse than 64.
 param(

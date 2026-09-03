@@ -210,17 +210,16 @@ public:
 	// first version blunt and it applies to its own successor. GetUploadBytes()
 	// is what decides it.
 	//
-	// 7 SINCE 2026-08-23: grid for the 8.19 km ring (VoxelCoords::kNumLevels).
-	// This is the LAST widening this constant can take -- kCoverLevel (7) is
-	// the ceiling of the record's four-bit and the VisBuffer's three-bit level
-	// fields, and with seven ring grids kCoverLevel == kRingGrids exactly, so
-	// an eighth ring would collide with cover in GridSlotForLevel (the
-	// static_assert in the .cpp fires). The grid exists whether or not the
-	// ring streams; the default run (-VoxelMaxRingLevel absent = 5) simply
-	// leaves slot 6 empty: +8 MiB of buffer, +8 MiB on the rare FULL uploads
-	// (attach and structural events), and zero extra ROUTINE traffic -- the
-	// delta path only moves dirty cells and an unstreamed slot never dirties.
-	static constexpr uint32 kLevels = 7;
+	// 8 SINCE 2026-09-02: one grid per ring of the 8,192 m cascade
+	// (VoxelCoords::kNumLevels; cross-module static_assert in
+	// VoxelGpuRegionBuild.h ties the two spellings). Was 11 for the 65 km
+	// experiment, cut back with it -- see VoxelCoords.h at kNumLevels for why.
+	// The ring/cover collision this widening once risked is a compile error,
+	// not a decode bug: GridSlotForLevel's static_assert in the .cpp fires if
+	// kCoverLevel ever lands inside the ring range. Index memory is
+	// kGridSlots x 8 MiB (9 x 8 = 72 MiB); an unstreamed slot costs its buffer
+	// and zero ROUTINE traffic -- the delta path only moves dirty cells.
+	static constexpr uint32 kLevels = 8;  // 8 ring levels: R0 64 m .. R7 8192 m
 
 	// ===================================================================
 	// PHASE 6: THE COVER GRID. GRID SLOT IS NOT RING LEVEL.
@@ -228,9 +227,11 @@ public:
 	//
 	// Ground cover (grass, flowers, reeds, small bush -- 230 species, 223 of them
 	// at 50 mm) is ONE LATTICE FINER than ring 0, not coarser. It is carried in
-	// the same FVoxelBrickPool as terrain, under level 7: the largest value that
-	// fits BOTH the chunk record's four-bit LevelAndFlags[0:3] and the VisBuffer's
-	// three-bit level field, with 6 left free for a seventh ring.
+	// the same FVoxelBrickPool as terrain, under level kCoverLevel (one past the
+	// last ring). Both packed level fields fit it: the chunk record's four-bit
+	// LevelAndFlags[0:3] and the VisBuffer's four-bit SPLIT level field (widened
+	// from three bits on 2026-08-30 -- low three at P.y[2:4], bit 3 on the free
+	// P.y[30] -- see VoxelMarch.usf; do not narrow it back, cover needs bit 3).
 	//
 	// Laying the grids out BY LEVEL would then need eight sub-grids to hold seven
 	// populated ones -- 64 MiB of address space to carry 56 MiB of use -- so the
@@ -256,7 +257,7 @@ public:
 	// behind it is suballocated per chunk with nothing stored for a chunk that
 	// has no cover (vxc::packCoverChunk returns anyCover=false and the publisher
 	// stores nothing at all -- no zeroed pack, no reserved slot).
-	static constexpr int32 kCoverLevel = 7;
+	static constexpr int32 kCoverLevel = 8;  // one past R7; follows the ring count
 	static constexpr uint32 kRingGrids = kLevels;
 	static constexpr uint32 kCoverGridSlot = kRingGrids;
 	static constexpr uint32 kGridSlots = kRingGrids + 1u;
@@ -863,6 +864,29 @@ public:
 	{
 		const int32 Slot = GridSlotForLevel(int32(Level));
 		return (Slot >= 0) ? PerSlotEntries[Slot] : 0;
+	}
+	// DEBUG PROBE (2026-09-02, the vista-kill dump). For a chunk key, the cell
+	// the CPU writer files it under and that cell's current mirror value --
+	// the end-to-end check for one real key when every individual link of the
+	// write/read chain "proves" correct and the composite still fails. The
+	// formula MIRRORS the .cpp's file-local CellOf; keep the two in step (a
+	// probe that drifts from the writer would report the writer's own bug as
+	// healthy).
+	void DebugProbeKey(int32 Level, int32 X, int32 Y, int32 Z,
+	                   uint32& OutCell, uint32& OutValue) const
+	{
+		OutCell = 0u;
+		OutValue = 0xFFFFFFFFu;
+		const int32 Slot = GridSlotForLevel(Level);
+		if (Slot < 0 || Cells.Num() == 0)
+		{
+			return;
+		}
+		const uint32 cx = uint32(X) & (kDimXY - 1u);
+		const uint32 cy = uint32(Y) & (kDimXY - 1u);
+		const uint32 cz = uint32(Z) & (kDimZ - 1u);
+		OutCell = uint32(Slot) * kCellsPerLevel + cx + kDimXY * (cy + kDimXY * cz);
+		OutValue = Cells[int32(OutCell)];
 	}
 	// Uploads performed, and entries dropped for being outside the grid's
 	// vertical band. A non-zero drop count is not an error -- the band is finite

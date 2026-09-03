@@ -1,4 +1,5 @@
 #include "VoxelGpuWorldGen.h"
+#include "VoxelMarchChunkIndex.h" // FVoxelMarchChunkIndex::kLevels -- the SHARED ring-level count
 #include "VoxelGpuWorldGenGraph.h"
 #include "VoxelRasterAtlasGpu.h"   // A: the persistent raster atlas the VXC_RASTER_ATLAS permutation samples
 #include "VoxelGpuWorklist.h"      // P3: the record ring the converted Column stage consumes
@@ -1654,7 +1655,21 @@ namespace
 		// changes. The clamp ceiling mirrors FVoxelMarchChunkIndex::kLevels-1;
 		// a literal here is how the fork silently declines a level the
 		// cascade streams.
-		Out.CoarseScale     = 1u << static_cast<uint32>(FMath::Clamp(Req.CoarseLevel, 0, 6));
+		// CEILING 7 SINCE R7 (the 8 km cascade) LANDED 2026-08-30. TWIN OF THE
+		// CLAMP IN VoxelGpuRegionBuild.h's ComputeRasterWindowPx -- read the long
+		// comment there for what shipping these two out of step actually costs
+		// (a fine-tier gate leak 42.8 km from the player). This module cannot see
+		// VoxelCoords::kNumLevels, so the two are kept in step by comment alone.
+		// DERIVED, NOT SPELLED. This was a hand-written 6, then a hand-written 7,
+		// and the gap between those two cost a fine-tier gate leak 42.8 km from
+		// the player plus three builds of eliminating innocent subsystems --
+		// because its twin in VoxelGpuRegionBuild.h lives in a module that could
+		// not see VoxelCoords::kNumLevels, so the two were kept in step by a
+		// COMMENT. FVoxelMarchChunkIndex::kLevels is visible to BOTH modules
+		// (VoxelEarth depends on VoxelEarthShaders), so both now derive from it
+		// and adding a ring level can no longer leave one behind.
+		Out.CoarseScale     = 1u << static_cast<uint32>(
+			FMath::Clamp(Req.CoarseLevel, 0, int32(FVoxelMarchChunkIndex::kLevels) - 1));
 		Out.RingSkirtMask   = Req.RingSkirtMask & 0xfu;
 		// Backlog 0.0b: one process-wide value, from the single accessor the
 		// CPU samplers and voxel.GPU.VerifyCoarse's reference also read -- so
@@ -1862,13 +1877,14 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		// the terrain's CoarseScale silently, and a stamp composed at a clamped
 		// scale would sit at the wrong offset inside plausible terrain -- the
 		// exact wrong-but-plausible output this function exists to catch.
-		// 0..6 since the 8 km ring -- must track FillLooseParameters' clamp
-		// above, for the reason stated there.
-		if (Req.CoarseLevel < 0 || Req.CoarseLevel > 6)
+		// Derived from the index's level count -- the same authority
+		// FillLooseParameters' clamp above reads, so the two cannot drift.
+		if (Req.CoarseLevel < 0 ||
+		    Req.CoarseLevel > int32(FVoxelMarchChunkIndex::kLevels) - 1)
 		{
 			OutError = FString::Printf(
 				TEXT("AssetInstances (%d) on a CoarseLevel %d region — the stamp supports levels ")
-				TEXT("0..6 (the range the terrain kernels' CoarseScale is derived over); a clamped ")
+				TEXT("0..kLevels-1 (the range the terrain kernels' CoarseScale is derived over); a clamped ")
 				TEXT("scale would stamp instances at the wrong offset inside plausible terrain."),
 				Req.AssetInstances.Num(), Req.CoarseLevel);
 			return false;
@@ -4024,8 +4040,29 @@ bool VoxelGpuWorldGen::SurfaceMipEnabled()
 	// contract and for why this is a command-line switch, not a cvar.
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		// DEFAULT 1 SINCE 2026-08-29, on the owner's verdict from matched
+		// captures at three poses (docs/lod-colour-banding-2026-08-29.md).
+		// REVERT IS `-VoxelSurfaceMip=0` -- nothing else in the project depends
+		// on this, and it does not change occupancy, so a revert needs no
+		// re-bake, no re-key and no worldgen version bump.
+		//
+		// It shipped at 0 for six days after being written, unvalidated, which
+		// is why the log line below exists at all.
+		int32 Value = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelSurfaceMip="), Value);
+		// THE FLAG MUST SAY WHICH WAY IT LATCHED. Without this line the switch
+		// is silent in both positions, so an A/B that comes out at the noise
+		// floor cannot be told apart from an arm that never armed -- and a
+		// mis-spelled switch on a leg command line reads as "the fix does
+		// nothing". Printed once, from the single derivation, so the log line
+		// and every consumer are the same bool by construction.
+		UE_LOG(LogVoxelGpu, Log,
+		       TEXT("Surface-preserving coarse materials (-VoxelSurfaceMip): %s. ")
+		       TEXT("ON resamples the ONE coarse cell per column whose representative span ")
+		       TEXT("contains the level-0 surface voxel AT that voxel, so thin snow/grass caps ")
+		       TEXT("keep their colour ring by ring. Occupancy is byte-identical either way; ")
+		       TEXT("this changes COLOUR only, and is dead at level 0."),
+		       (Value != 0) ? TEXT("ON (default)") : TEXT("OFF -- reverted by -VoxelSurfaceMip=0"));
 		return Value != 0;
 	}();
 	return bEnabled;

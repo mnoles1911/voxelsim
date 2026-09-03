@@ -707,6 +707,39 @@ capture moved.
    picked a number by eye with the runtime switches above. Both must move
    together or the near field and the vista disagree at the snowline.
 
+#### 2026-08-30 -- MEASURED ON THIS WORLD, and two of the entry's assumptions move
+
+**The documented capture site below is DEAD.** `-SpawnAt -9524,-40563` needs fine
+tile (-1,-3), which is not baked -- the leg dies on the fine-tier gate. Only
+**15** fine tiles exist now (`tile-cache/...-b5e821e98/000000000135276f/s16/`).
+Use a spawn inside one of them; `-54233,-68221` is tile (-4,-5) and works.
+
+**The white is driven by TEMPERATURE, not by the snowline.** Census on this
+world, per clipmap level:
+
+    level  spacing   SNOW by temp   SNOW by altitude   precip axis pinned
+      L0     256 m      30.4%             0.0%              49.6%
+      L1     512 m      43.0%             1.9%              61.5%
+      L2    1024 m      30.8%             9.0%              75.5%
+      L3    2048 m      14.4%             3.6%              80.9%
+
+So `-VoxelClipmapSnowlineLowM/HighM` is at best a 9% lever. A ladder at
+2700/3200/3800 m produced **byte-identical frames** while proving engagement
+(`SNOW by altitude` 3.6% -> 0.4% at L3). A properly engaged null result, not a
+missed switch. **`-VoxelClipmapSnowTempMax` is the lever** -- 0.160 -> 0.08 ->
+0.04 moves `SNOW by temp` 43.0% -> 24.6% -> **0.0%**.
+
+**The precip pinning worsens with distance** -- 49.6% at L0 to **80.9% at L3** --
+which is the "dull smooth green further out" in one number: four of five far
+vertices carry no precipitation information, so the material samples one corner
+of the LUT.
+
+**A 2500 m level-camera vista CANNOT judge any of this.** Mean terrain colour
+there is (93, 109, 125), a fog blue-grey: at that altitude the far field is
+buried in aerial perspective, and eliminating snow-by-temp entirely moved the
+white share only 3.88% -> 2.95%. Judge from a LOW vista (80 m, pitch -18) where
+the clipmap starts 4 km out and is not fogged.
+
 #### The capture that shows it
 
 The pose matters more than usual here, because the defect lives on ground above
@@ -759,7 +792,31 @@ deliberately powerful (they suppress whole subsystems to make a control), and
 several read as ordinary settings by name alone.
 
 
-### 0.0b Coarse LOD browns out — the material mip discards thin surface layers
+### 0.0b RESOLVED 2026-08-29 — coarse LOD browning; surface-preserving materials now DEFAULT ON
+
+**Owner's verdict on matched captures at three poses: "Bottom half with fix
+looks great."** `SurfaceMipEnabled()` defaults to 1; the revert is
+`-VoxelSurfaceMip=0`. Write-up: `docs/lod-colour-banding-2026-08-29.md`.
+
+The fix was written 2026-08-23 on all three producer paths and then sat at
+default 0, **unvalidated, for six days** — the switch logged nothing in either
+position, so nobody could tell an inert flag from a null result. It logs its
+latch now, and that is the transferable lesson, not the fix.
+
+Measured: the mid rings lose 82-86% of their brown excess and land on the near
+field's own hue, while the near field — where the switch is dead by construction
+— moves 0.51% against a 0.22% noise floor. **Cost is NOT measured**; one extra
+`materialAt` per straddling cell, coarse levels only, expected to be lost in
+noise and not to be quoted as free.
+
+Backlog item 1 below ("the GPU point-samples rather than votes") is now VERIFIED:
+`worldgen.ush` `voxelizeColumnInto` takes one representative sample per coarse
+cell via `coarseRep`, and the CPU coarse generator does the same. The vote path
+in `mips.h` is a THIRD producer, not the same one. All three honour the switch
+from a single accessor.
+
+<details><summary>Original entry</summary>
+
 
 **Owner-reported 2026-08-23, and present since the ray marcher landed.** The near
 ring renders "full" — every voxel a solid colour. Further rings are progressively
@@ -794,6 +851,8 @@ technique; the work is in doing it without breaking two things:
    finding in itself.
 2. **Judge it by eye, not by a metric.** This is a colour/appearance defect; the
    owner judges screenshots. Matched captures at a fixed pose across LOD bands.
+
+</details>
 
 ### 0.0c RESOLVED 2026-08-28 — the triangular LOD-ring gaps are gone; fallthrough default on
 

@@ -631,12 +631,18 @@ namespace
 	              "the cover band is now tall enough for two cover chunks to alias vertically in "
 	              "the index grid. Narrow kCoverBandRadiusChunks or raise kDimZ (power of two).");
 	// The cover level must survive the record's four-bit LevelAndFlags field AND
-	// the VisBuffer's three-bit level field, or a cover hit decodes as a ring hit
-	// somewhere in the middle of the cascade.
+	// the VisBuffer's level field, or a cover hit decodes as a ring hit somewhere
+	// in the middle of the cascade.
+	//
+	// THE VISBUFFER FIELD IS FOUR BITS AS OF 2026-08-30 (VoxelMarch.usf's
+	// VoxelMarchPackVis): low three at P.y[2:4], the fourth on P.y[30], which was
+	// free. So the binding limit here is now the RECORD's LevelAndFlags[0:3],
+	// which is also four bits -- the two happen to agree, and this bound is 16
+	// because of the record, not because of the VisBuffer.
 	static_assert(FVoxelMarchChunkIndex::kCoverLevel >= 0 &&
-	                  FVoxelMarchChunkIndex::kCoverLevel < 8,
-	              "the cover level must fit the VisBuffer's three-bit level field (0..7) and the "
-	              "chunk record's four-bit LevelAndFlags[0:3].");
+	                  FVoxelMarchChunkIndex::kCoverLevel < 16,
+	              "the cover level must fit the VisBuffer's four-bit level field and the chunk "
+	              "record's four-bit LevelAndFlags[0:3].");
 	// TWO SPELLINGS, ONE COMPILE ERROR. The pool owns the cover level because the
 	// pool owns the key; this class spells it too, for the grid-slot mapping.
 	// This file is the only one that includes both, so it is the only place the

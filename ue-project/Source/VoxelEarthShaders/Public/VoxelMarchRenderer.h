@@ -437,6 +437,60 @@ VOXELEARTHSHADERS_API FVoxelMarchArm VoxelMarchGetArm();
 // VOXEL_MARCH_VIDX_WORDS" against a shader that computed 64, whose
 // out-of-range writes D3D12 silently discarded, producing PLAUSIBLE WRONG
 // VALUES rather than an error. One side only, pushed at compile.
+// ---------------------------------------------------------------------------
+// The march frame's VERTICAL budget (2026-09-02, the altitude fix)
+// ---------------------------------------------------------------------------
+//
+// TWO CONSTANTS, TWO CLAIMS, and they meet in the frame-extent derivation in
+// VoxelMarchRenderer.cpp (search FrameExtentZUU):
+//
+// kVoxelMarchAltitudeReachVoxels -- how far the march CUBE reaches in +/-Z
+// from the snapped camera, in level-0 voxels. The owner flies to ~10 km and
+// looks straight down; the old cube reused the XY reach (~8,601.6 m half
+// extent), so from high poses the ground at Z=0 sat OUTSIDE the frame and the
+// slab test deleted it before any walk ran -- the plan-view 'topographic rim'
+// at altitude. 131,072 voxels = 13,107.2 m: covers 10 km with 3.1 km of
+// margin, and is a power of two so the snap arithmetic stays exact. Z ONLY:
+// the XY reach is the ring cascade's job and is untouched.
+//
+// kVoxelMarchPackZReachVoxels -- how far from the camera a single RUNG may
+// walk vertically, in voxels OF THE RUNG'S OWN LEVEL. This is the per-level
+// ceiling the VisBuffer pack and float32 both impose, and one number serves
+// both claims:
+//   * the pack: LocalVoxel is CAMERA-relative at the hit's own level in a
+//     biased 13-bit field (-4096..+4095 -- VoxelMarchPackVis). The ring radii
+//     bound XY to 1,280 level-L voxels; NOTHING bounded Z, so a fine-level
+//     hit deeper than ~409.6 * 2^L m below the camera wrapped to a
+//     legal-looking coordinate. 4088 leaves an 8-voxel margin for the floor()
+//     at the hit and the walk's one-cell overshoot.
+//   * float32: walk positions are frame-relative in level-L units, so this
+//     clamp bounds them to ~40,880 walk-UU where one ulp is 0.0049 UU --
+//     under half the 0.01 UU advance nudge, and 1/1000 of half a voxel. An
+//     UNCLAMPED level-0 walk to the new 13.5 km cube floor would sit at
+//     ~1.35M walk-UU, ulp 0.16 UU, and the nudge would round away entirely
+//     (the stall/skip failure the centred-frame note in VoxelMarch.usf's
+//     BuildRay documents at 409,600 UU, arriving vertically).
+// The shader's copy is VOXEL_MARCH_PACK_ZREACH_VOXELS in
+// VoxelBrickTraverse.ush; the two are cross-referenced by name because a
+// define cannot be static_asserted across languages. Drift is bounded by the
+// 8-voxel margin, but keep them equal.
+//
+// Ground deeper than one rung's reach is NOT lost: the retry ladder re-enters
+// the segment's unwalked tail at the next coarser level (ladder-on-truncation,
+// VoxelBrickTraverse.ush), and each level doubles the vertical reach -- the Z
+// twin of the XY ring cascade. The deepest packable depth at the top level
+// (4088 * 2^7 voxels = 52.3 km at 8 rings) is what the frame derivation clamps
+// kVoxelMarchAltitudeReachVoxels against, so no cube this code can build
+// outruns the ladder that has to cover it.
+constexpr int32 kVoxelMarchAltitudeReachVoxels = 131072;
+constexpr int32 kVoxelMarchPackZReachVoxels = 4088;
+static_assert(kVoxelMarchAltitudeReachVoxels * 10 >= 10000 * 100,
+              "the altitude budget must cover the owner's 10 km pose: a camera at 10 km "
+              "looking straight down must still march terrain at Z=0.");
+static_assert(kVoxelMarchPackZReachVoxels <= 4096 - 8,
+              "the per-rung vertical reach must leave margin inside the VisBuffer's "
+              "biased 13-bit field (-4096..+4095): the hit's floor() and the walk's "
+              "one-cell overshoot both land past the clamp point.");
 namespace VoxelMarchHoleWord
 {
 	enum
@@ -494,8 +548,15 @@ namespace VoxelMarchHoleWord
 		// there, because a zero that means "the code that counts this was
 		// compiled out" must never be printable as "no holes of this kind"
 		// (two retractions this week were exactly that shape).
-		UncLevelFirst,                        // + ring level 0..6 of the miss
-		UncReasonFirst = UncLevelFirst + 7,   // + VOXEL_MARCH_MISS_* 0..3
+		UncLevelFirst,                        // + ring level 0..7 of the miss
+		// THE 8 HERE IS kNumLevels, AND THE STATIC_ASSERT BELOW THE ENUM IS WHAT
+		// KEEPS IT SO. It cannot reference kNumLevels directly -- that constant is
+		// declared after this enum, because the enum is what sizes it -- so the two
+		// spellings are checked instead of trusted. Getting this wrong does not
+		// fail to compile: the level words simply run one past their group and
+		// overwrite the first reason word, and every counter stays healthy while
+		// the miss attribution silently reads garbage.
+		UncReasonFirst = UncLevelFirst + 8,   // + VOXEL_MARCH_MISS_* 0..3
 
 		// ---- THE RESIDENT-Z BOUND'S ENGAGEMENT TRIO (voxel.March.ZCut) -----
 		// APPENDED AFTER EVERY EXISTING WORD, ON PURPOSE. The note on
@@ -807,13 +868,73 @@ namespace VoxelMarchHoleWord
 		HeightLateB2,
 		HeightLateB3,
 		HeightLateB4,
+		// NOTE 2026-09-02: a hits-by-ring-level word group (8 words) was
+		// appended here and REVERTED within hours on a wrong bracket -- the
+		// vista kill predated it (two zero-diseases were being bisected as
+		// one; see docs/cascade-cut-to-8-2026-09-02.md). The append pattern
+		// itself was EXONERATED by that revert: probe counts were equal to
+		// the digit with and without it.
+		//
+		// PER-GRID-SLOT STALE/REAL (2026-09-02, the vista-kill trace's
+		// discriminator): which index grid slot a fetched record's
+		// validation verdict belongs to. Stale concentrated in slots 6/7
+		// with 0-5 clean = the R6/R7 lattice/level kill; stale spread across
+		// all slots = the frame origin is wrong at that camera Z. One leg
+		// decides. 12 words per group (kGridSlots-wide, cover included).
+		StaleGridFirst,
+		StaleGridLast = StaleGridFirst + 11,
+		RealGridFirst,
+		RealGridLast = RealGridFirst + 11,
+
+		// ---- THE Z LADDER (the altitude fix, 2026-09-02) ------------------
+		// APPENDED, the rule every group since the Z bound has followed:
+		// appending renumbers nothing, a stale shader cache still reads every
+		// older word correctly and leaves these four at zero -- which a reader
+		// must word as NOT MEASURED anyway. (The RayBound census words that
+		// live PAST Count in VoxelMarchRenderer.cpp DO shift with this append
+		// -- both sides move together through the defines, but a stale cache
+		// misreads that group: force a shader recompile before trusting it.)
+		//
+		//   ZLadderRungs    every rung the ring walk entered with the vertical
+		//                   reach clamp compiled in (rings with
+		//                   VOXEL_MARCH_FALLTHROUGH > 0). THE DENOMINATOR.
+		//                   Zero while the ladder is armed is the clamp being
+		//                   INERT, the house failure.
+		//   ZLadderClamped  rungs whose walk interval was shortened by the
+		//                   per-level vertical reach (pack field + float32 --
+		//                   see kVoxelMarchPackZReachVoxels above). Rises with
+		//                   camera altitude; ~zero at ground poses. A counter
+		//                   that cannot fall is not a counter: this one must
+		//                   read ~0 at the vista ground pose.
+		//   ZLadderResumed  rungs ENTERED as a structural continuation -- the
+		//                   previous rung stopped early (vertical clamp, the
+		//                   512-chunk cap, or step-budget exhaustion) and the
+		//                   ladder re-entered the segment's unwalked tail one
+		//                   level coarser. The ladder-on-truncation arm's
+		//                   proof of traffic: zero at a high-altitude down
+		//                   pose means the fix is INERT there.
+		//   ZLadderTailLost rays (0/1 per ray, the CapRays spelling) whose
+		//                   segment still had an unwalked tail when the ladder
+		//                   ran out of levels. THE FAILURE COUNTER: after this
+		//                   change it must read 0 at every pose inside the
+		//                   frame's Z budget; non-zero is a hole the image
+		//                   gate should also be showing.
+		ZLadderRungs,
+		ZLadderClamped,
+		ZLadderResumed,
+		ZLadderTailLost,
 		Count
 	};
-	// 7 since level 6 (the 8 km ring) landed 2026-08-23. This widens the
-	// readback layout by one word; both sides move together because the shader
-	// gets these indices as defines from THIS enum (see the "one enum" note in
+	// 8 since the cascade was cut back to 8 rings (2026-09-02; it was 11 for
+	// the 65 km experiment). Both sides move together because the shader gets
+	// these indices as defines from THIS enum (see the "one enum" note in
 	// VoxelMarch.usf) -- there is no hand mirror to update.
-	constexpr int32 kNumLevels = 7;
+	constexpr int32 kNumLevels = 8;
+	// The one hand-written literal in the layout, checked rather than trusted.
+	static_assert(UncReasonFirst - UncLevelFirst == kNumLevels,
+	              "the level-word group must be exactly kNumLevels wide -- if it is not, the "
+	              "level words overrun into the reason words and miss attribution is silently "
+	              "wrong while every counter still looks healthy.");
 	constexpr int32 kNumReasons = 4;
 	// The reason order, mirrored from VOXEL_MARCH_MISS_* in
 	// VoxelBrickTraverse.ush (never / pending / evicted / unattributed) --
@@ -851,6 +972,9 @@ struct FVoxelMarchHoleStats
 	// loop write ByLevel[6] into UncoveredByReason[0] -- silent counter
 	// corruption, no bounds error.
 	uint64 UncoveredByLevel[VoxelMarchHoleWord::kNumLevels] = {};
+	// Per-grid-slot fetch verdicts (2026-09-02) -- see the enum's note.
+	uint64 StaleByGrid[12] = {};
+	uint64 RealByGrid[12] = {};
 	// Order is the shader's VOXEL_MARCH_MISS_* codes: [0] never admitted,
 	// [1] admitted-pending, [2] evicted, [3] unattributed (the instrument
 	// refused to guess -- stale resident record or reserved code).
@@ -995,6 +1119,20 @@ struct FVoxelMarchHoleStats
 	uint64 RungWalked = 0;
 	uint64 RungProbeBits = 0;
 	bool bRungProbeArmed = false;
+
+	// ---- the Z ladder (the altitude fix, 2026-09-02) -----------------------
+	// Counted on EVERY hole-stats level, the ZTight rule. bZLadderArmed is
+	// FROM THE ARM, the permutation rule: the vertical reach clamp and the
+	// structural continuation compile only under rings with a fallthrough
+	// depth, so the raw cvars would read "armed" for a kernel that contains
+	// neither. Rungs == 0 with the flag TRUE is the loud armed-and-inert
+	// case; TailLost > 0 on ANY pose inside the frame's Z budget is a
+	// regression FINDING, not a statistic -- a segment tail no level walked.
+	uint64 ZLadderRungs = 0;
+	uint64 ZLadderClamped = 0;
+	uint64 ZLadderResumed = 0;
+	uint64 ZLadderTailLost = 0;
+	bool bZLadderArmed = false;
 
 	// ---- the wave-occupancy census (family A's falsifier) ------------------
 	// Compiled with hole stats wherever the engine's wave-op macros allow
@@ -2189,6 +2327,11 @@ private:
 		FIntVector FrameOriginVoxel = FIntVector::ZeroValue;
 		FVector3f FrameRayOriginLocalUU = FVector3f::ZeroVector;
 		float FrameExtentUU = 0.0f;
+		// The frame's Z extent is its own budget (the altitude fix, 2026-09-02):
+		// XY reach belongs to the ring cascade, Z reach to
+		// kVoxelMarchAltitudeReachVoxels. Equal to FrameExtentUU whenever the
+		// rings are off, so every non-ring path keeps its cube.
+		float FrameExtentZUU = 0.0f;
 
 		// The view uniform buffer, carried so the emit's pixel shader can reach
 		// PrevPreViewTranslation / PrevTranslatedWorldToClip for velocity and

@@ -197,25 +197,45 @@ void AVoxelEarthGameMode::BeginPlay()
 		World->SpawnActor<AVoxelOceanActor>();
 
 		// M2 Band 3 first slice (docs/m2-plan.md): same "no authored map,
-		// spawn from code" reasoning -- the heightmap clipmap extends
-		// terrain from the ring cascade's edge (~1km) out to ~30km.
+		// spawn from code" reasoning -- the heightmap clipmap carries terrain
+		// from the ring cascade's edge (8,192 m) out to its own 65.5 km outer
+		// half-extent, sampling the coarse 30 m tile grid.
 		//
-		// -VoxelNoClipmap suppresses it. This is the CONTROL for "is that
-		// distant terrain actually voxels?": the clipmap is a smooth triangle
-		// heightfield covering the same ground the outer voxel rings do, and in
-		// a screenshot the two are easy to confuse. With the clipmap absent,
-		// anything still drawn past the ring cascade's edge is voxel geometry by
-		// construction, and anything that becomes empty sky was clipmap. A
+		// SPAWNED BY DEFAULT AGAIN since 2026-09-02, and the round trip is
+		// worth recording. Retired 2026-08-30 when the cascade reached 65 km
+		// ("voxels cover every metre it used to"); the owner then cut the
+		// cascade back to 8 rings because the renderer never coherently
+		// supported the far rings (docs/cascade-cut-to-8-2026-09-02.md), which
+		// un-satisfies that premise -- beyond 8,192 m the clipmap is once more
+		// the only thing drawing ground. The retire-plan's own ordering rule
+		// ("it is what draws the world if the cascade stalls -- do not delete
+		// the clipmap first") is why this was a default flip and not a
+		// deletion, and why flipping it back is one line.
+		//
+		// -VoxelNoClipmap suppresses it: the CONTROL for "is that distant
+		// terrain actually voxels?" -- with the clipmap absent, anything drawn
+		// past the cascade edge is voxel geometry by construction. A
 		// command-line switch rather than a cvar, matching -VoxelPendingJobCap
-		// and friends: -ExecCmds cvars land after streaming has begun, and this
-		// one has to be decided before the actor is ever spawned.
+		// and friends: -ExecCmds cvars land after streaming has begun, and
+		// this one must be decided before the actor is ever spawned.
 		if (!FParse::Param(FCommandLine::Get(), TEXT("VoxelNoClipmap")))
 		{
 			World->SpawnActor<AVoxelClipmapActor>();
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Voxel clipmap: SPAWNED (default). Voxel rings R0..R%d cover 64 m to %.0f m; "
+			            "the clipmap carries %.0f m to its outer half-extent beyond that. "
+			            "-VoxelNoClipmap suppresses it (the voxels-only control arm)."),
+			       UVoxelWorldSubsystem::GetMaxRingLevel(),
+			       UVoxelWorldSubsystem::GetRingPresets()[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters,
+			       UVoxelWorldSubsystem::GetRingPresets()[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters);
 		}
 		else
 		{
-			UE_LOG(LogVoxelEarth, Warning, TEXT("Voxel clipmap: SUPPRESSED by -VoxelNoClipmap (far terrain is voxels only)"));
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("Voxel clipmap: SUPPRESSED by -VoxelNoClipmap. Nothing draws ground beyond "
+			            "the R%d cascade edge at %.0f m -- far terrain in this run is voxels only."),
+			       UVoxelWorldSubsystem::GetMaxRingLevel(),
+			       UVoxelWorldSubsystem::GetRingPresets()[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters);
 		}
 
 		// Watershed work item 5 (docs/watershed-system-plan.md §5.2): baked lake

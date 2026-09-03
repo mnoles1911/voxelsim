@@ -336,6 +336,80 @@ struct FVoxelGpuRegionResult
 	int32 BandMinDeepestAirVoxel = 0;
 };
 
+// ===========================================================================
+// WHICH TIER GENERATES A RING LEVEL -- ONE SPELLING, EVERY CONSUMER
+// ===========================================================================
+//
+// Lives in VoxelEarthShaders because BOTH modules must read it: the GPU
+// dispatch here, the CPU reference in VoxelEarth, and the raster atlas.
+// VoxelEarth depends on VoxelEarthShaders, never the reverse, so this is the
+// only direction that can be shared. **Two spellings of this rule is exactly
+// the cross-arm divergence VoxelRasterAtlas.h forbids**, and the coarse-scale
+// clamp (docs/cascade-8km-r7-2026-08-30.md) is what a comment-synchronised
+// constant across this boundary actually costs: a fine-tier gate leak 42.8 km
+// from the player and three builds spent eliminating innocent subsystems.
+//
+// --- WHY A TIER RULE EXISTS AT ALL -----------------------------------------
+//
+// VoxelRasterAtlas.h states the constraint: "PITCH IS A WORLD PROPERTY, NOT AN
+// LOD" -- the 1.875 m and 30 m rasters select different octave ladders in the
+// amplifier, so the same ground has a different SHAPE depending on which tier
+// generated it. That is why the atlas holds ONE pitch and why a
+// near-fine/far-coarse split was rejected when it was a clipmap question.
+//
+// It is admissible HERE for two reasons, and both matter:
+//
+//   1. The clipmap ALREADY reads coarse (SampleTerrainHeightUU -> Impl->Tiles,
+//      the 30 m sampler). The world already has coarse-derived far field
+//      meeting fine-derived near field with a shape discontinuity at the
+//      cascade edge. Coarse-derived outer RINGS move that discontinuity; they
+//      do not create one. Retiring the clipmap for voxels is a swap, not a new
+//      class of defect.
+//   2. **The rule is keyed on LEVEL, never on residency.** A residency-keyed
+//      fallback makes two clients disagree about the same ground, which is
+//      precisely what the fine-tier gate refuses sea level to prevent. A level
+//      rule is a deterministic function of the world, so every client computes
+//      the same terrain.
+//
+// --- WHY THE THRESHOLD IS 8 AND NOT LOWER ----------------------------------
+//
+// Levels 0-7 exist today and are fine-derived. Setting the first coarse level
+// ABOVE them means nothing that currently exists changes shape: no re-key, no
+// worldgen version bump, no re-bake. Lowering this is world-breaking and must
+// go through docs/determinism.md, not through this constant.
+//
+// At R8 a voxel is 12.8 m; the coarse tier is 30 m/px. By R10 a voxel is 51.2 m
+// and sampling a 1.875 m raster to place it would be absurd -- so the rule is
+// also the right thing on its own terms, not merely an enabler.
+namespace VoxelTier
+{
+	// The first ring level generated from the COARSE tier. Levels below this
+	// read the fine tier when it is enabled.
+	//
+	// 8 == kNumLevels: NO streamed level is coarse-derived. The owner's 8-ring
+	// design (2026-09-02) is "all rings fine, clipmap beyond", so this equals
+	// the level count and IsCoarseDerivedLevel is false for every ring.
+	//
+	// IT WAS 5 FOR A DAY (2026-08-31..09-02), chasing missing far terrain, and
+	// that experiment is worth its two lessons: (1) moving this was a measured
+	// NULL both alone and paired with real coarse tiles, because the far
+	// terrain was missing for renderer-side reasons (the marcher's ring clamp)
+	// -- routing data differently cannot fix a renderer that never walks there;
+	// (2) absent-fine-tile ground is handled at the right layer now, by the
+	// fine streamer's coarse FALLBACK (ResolveNonResidentPixel), which serves
+	// every consumer through one funnel instead of per-level routing.
+	inline constexpr int32 kFirstCoarseLevel = 8;
+
+	// INERT while kFirstCoarseLevel == kNumLevels: the highest streamed level
+	// is 7, so this returns false for every level the cascade streams. The rule
+	// object and its consumers (admission bound, Z-range, raster routing) are
+	// kept because they are the correct shape if coarse-derived rings return.
+	inline constexpr bool IsCoarseDerivedLevel(int32 Level)
+	{
+		return Level >= kFirstCoarseLevel;
+	}
+}
+
 namespace VoxelGpuWorldGen
 {
 	// Runs ColumnMain -> VoxelizeMain -> MeshCount -> Scan -> MeshEmit and reads
@@ -354,12 +428,21 @@ namespace VoxelGpuWorldGen
 	// needs SM6 with 64-bit integer shader ops.
 	VOXELEARTHSHADERS_API bool IsSupportedOnCurrentRHI();
 
-	// Backlog 0.0b: `-VoxelSurfaceMip=1` on the command line enables
-	// surface-preserving coarse LOD materials -- the topmost solid cell of
-	// each coarse column takes the true level-0 surface voxel's material
-	// instead of the representative sample up to a whole coarse cell below
-	// it, so thin snow/grass caps stop browning out ring by ring. Default 0:
-	// today's behaviour, byte-identical, so a control capture needs no flag.
+	// Backlog 0.0b: surface-preserving coarse LOD materials -- the topmost
+	// solid cell of each coarse column takes the true level-0 surface voxel's
+	// material instead of the representative sample up to a whole coarse cell
+	// below it, so thin snow/grass caps stop browning out ring by ring.
+	//
+	// DEFAULT 1 SINCE 2026-08-29 (owner's verdict on matched captures at three
+	// poses; docs/lod-colour-banding-2026-08-29.md). `-VoxelSurfaceMip=0` is
+	// the CONTROL arm and the one-line revert. Occupancy is byte-identical in
+	// both positions -- this changes colour and nothing else -- so neither
+	// direction needs a re-bake, a re-key or a worldgen version bump.
+	//
+	// The accessor LOGS which way it latched, once. That is not decoration:
+	// the switch was silent in both positions for the six days it sat at 0,
+	// which made an A/B at the noise floor indistinguishable from an arm that
+	// never armed.
 	//
 	// Command-line rather than a cvar for the reason documented on
 	// -VoxelCoarseMinLevel (VoxelWorldSubsystem.cpp): -ExecCmds lands after

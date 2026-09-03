@@ -1,5 +1,7 @@
 #include "VoxelFineTileStreamer.h"
 
+#include "HAL/PlatformStackWalk.h" // the gate-leak caller stack; see ReportGateLeak_Locked
+
 #include "VoxelEarth.h"      // LogVoxelEarth
 #include "VoxelFineLockMeter.h" // FLockScope -- the instrument on Lock_, and the two switches
 #include "VoxelDebug.h"    // LogVoxelPerf -- the probe line rides the perf category
@@ -1110,9 +1112,63 @@ bool FVoxelFineTileStreamer::RequestFootprint(int64 WorldMmX0, int64 WorldMmY0, 
 // The funnel's cold path: this pixel's tile is not resident.
 // ---------------------------------------------------------------------------
 
+int32_t FVoxelFineTileStreamer::CoarseElevationMm(int64_t px, int64_t py) const
+{
+	// Fine pixel -> world mm -> coarse pixel. FLOOR division, not truncation:
+	// this world is entirely at negative tile coords (the baked s1 set spans
+	// x,y in [-16, 0]), so C's round-toward-zero would shift every sample one
+	// coarse pixel toward the origin and put a visible step at every axis.
+	const int64 FinePitchMm = int64(vxc::tilePixelSizeMm(vxc::kFineTileScale));
+	const int64 CoarsePitchMm = int64(CoarseFallback_->pixelSizeMm());
+	if (CoarsePitchMm <= 0)
+	{
+		return 0;
+	}
+
+	// Sample the CENTRE of the fine pixel, so the fine and coarse lattices
+	// agree about which coarse cell a fine pixel belongs to.
+	const int64 WorldXMm = px * FinePitchMm + FinePitchMm / 2;
+	const int64 WorldYMm = py * FinePitchMm + FinePitchMm / 2;
+
+	const auto FloorDiv = [](int64 A, int64 B) -> int64
+	{
+		const int64 Q = A / B;
+		return (A % B != 0 && ((A < 0) != (B < 0))) ? Q - 1 : Q;
+	};
+
+	return CoarseFallback_->elevationMm(FloorDiv(WorldXMm, CoarsePitchMm),
+	                                    FloorDiv(WorldYMm, CoarsePitchMm));
+}
+
 int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 {
 	const vxc::TileCoord Tile = vxc::tileCoordForPixel(px, py, int64(vxc::kFineTileSize));
+
+	// COARSE BEFORE SEA LEVEL. A fine tile that is not on disk is not a reason
+	// to claim the ground is at z=0 -- it is a reason to answer at the
+	// resolution we DO have. Everything downstream (generation, the surface
+	// bound, admission, IsChunkProvablyAllAir) reads through this one funnel,
+	// which is why the fix belongs here and not in per-level routing: the
+	// raster window was already routed per tier and it changed nothing,
+	// because generation still came through here and still got sea level.
+	//
+	// Only for tiles KNOWN to be absent on disk. A tile that merely has not
+	// loaded YET must still take the blocking-load path below, or a transient
+	// miss would bake coarse ground into a chunk that fine data was about to
+	// cover -- the one case where the "never generate from a coarse guess"
+	// rule is protecting something real.
+	if (CoarseFallback_ != nullptr)
+	{
+		bool bKnownAbsent = false;
+		{
+			VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::ElevShared);
+			bKnownAbsent = KnownMissing_.find(TileHash(Tile)) != KnownMissing_.end();
+		}
+		if (bKnownAbsent)
+		{
+			return CoarseElevationMm(px, py);
+		}
+	}
 
 	// BLOCK UNTIL READY, in the literal sense, on the one thread where blocking
 	// is permitted. This is the same synchronous load RequestFootprint performs
@@ -1184,6 +1240,28 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64_t px, int64_t py)
 {
 	const uint64 LeakCount = GateLeaks_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+	// WHO ASKED. This report already names the pixel, the tile, the distance from
+	// the anchor and whether that distance is too far to be a coverage gap -- and
+	// it tells the reader to "find the caller before baking anything". It could
+	// not, until now, tell them WHO the caller is, which is the one fact that
+	// actually shortens the hunt: on 2026-08-30 the 8 km cascade produced a leak
+	// 42.8 km from the player and it cost three builds to eliminate the clipmap
+	// and the raster atlas by measurement, one candidate at a time.
+	//
+	// ONE STACK, ON THE FIRST LEAK ONLY. A leak can repeat millions of times
+	// (18.7 million in the case this gate exists for), and a symbolicated walk is
+	// expensive enough that dumping it per leak would turn a diagnostic into the
+	// thing being diagnosed.
+	if (LeakCount == 1)
+	{
+		ANSICHAR StackBuf[8192];
+		StackBuf[0] = '\0';
+		FPlatformStackWalk::StackWalkAndDump(StackBuf, UE_ARRAY_COUNT(StackBuf), /*IgnoreCount*/ 2);
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("FINE TIER GATE LEAK -- CALLER STACK (first leak only):\n%s"),
+		       ANSI_TO_TCHAR(StackBuf));
+	}
 
 	// WHY FATAL, AND WHY ONLY WHEN UNATTENDED.
 	//

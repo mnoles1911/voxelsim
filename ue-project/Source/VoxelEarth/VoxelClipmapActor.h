@@ -12,8 +12,11 @@ class UMaterialInterface;
 // docs/voxel-earth-implementation-plan.md SS3.3 "Band 3 -- heightmap
 // clipmap"): a CPU-built concentric clipmap that extends terrain from the
 // voxel ring cascade's outer edge (UVoxelWorldSubsystem::RingPresets'
-// R4 outer, ~1km) out to ~30km, so a summit-level or airborne view sees
-// terrain to the horizon instead of the ring cascade's hard edge.
+// last ring, 8,192 m) out to a 65.5 km half-extent, so a summit-level or
+// airborne view sees terrain to the horizon instead of the ring cascade's
+// hard edge. (Retired 2026-08-30 when the cascade briefly reached 65 km;
+// restored as the default far field 2026-09-02 when the cascade was cut
+// back to 8 rings -- see VoxelEarthGameMode.cpp's spawn site.)
 //
 // PRAGMATIC EXCEPTION to the "no ProceduralMeshComponent" doctrine (plan
 // SS3.3 Band 1: custom FPrimitiveSceneProxy, NOT PMC -- see
@@ -30,19 +33,18 @@ class UMaterialInterface;
 // this v1 with a proper clipmap renderer later without touching callers.
 //
 // Geometry (see VoxelClipmapActor.cpp SpacingUUForLevel/RebuildLevel for the
-// derivation): 4 levels, each a fixed 65x65-vertex grid (64x64 quads). Every
-// level uses the SAME local topology (vertex/index layout never changes --
-// only world placement and sampled heights do), doubling vertex spacing
-// per level starting from a spacing derived from the ring cascade's own
-// outer radius, so level 0's inner hole lands exactly on the ring edge and
-// each level's inner hole exactly matches the previous level's outer edge
-// (classic clipmap "hole = quarter area" ratio, held constant across all 4
-// levels by construction). Total coverage: ring edge (~1km) to ~16.4km
-// radius (~32.8km diameter) -- see the .cpp for why this differs from the
-// task spec's illustrative 16m->128m/vertex numbers (they don't reconcile
-// with a fixed 65-vertex grid; this is the corrected, self-consistent
-// version of the same doubling-annulus idea, extending
-// UVoxelWorldSubsystem::RingPresets' own pattern outward).
+// derivation): NumLevels levels (3), each a fixed 65x65-vertex grid (64x64
+// quads). Every level uses the SAME local topology (vertex/index layout never
+// changes -- only world placement and sampled heights do), doubling vertex
+// spacing per level starting from a spacing derived from the ring cascade's
+// own outer radius, so level 0's inner hole lands exactly on the ring edge
+// and each level's inner hole exactly matches the previous level's outer edge
+// (classic clipmap "hole = quarter area" ratio, held by construction). Total
+// coverage: the cascade edge (8,192 m) to an outer half-extent of
+// 2 x ringEdge x 2^(NumLevels-1) = 8 x ringEdge = 65.5 km (92.7 km corner).
+// Everything here derives from GetRingPresets()[GetMaxRingLevel()], so the
+// extent follows the cascade with no code change; the level COUNT is the only
+// lever, and it trades per-rebuild vertex work against far-field spread.
 //
 // Height source (m2-plan.md "Height source" row): TILE elevation directly
 // (30m/px bilinear), NOT the full Amplifier (that is sub-voxel-ring detail,
@@ -103,7 +105,26 @@ public:
 	// Fixed level count (m2-plan.md binding decision: "4 levels"). Public so
 	// the game mode / verification code can reference it without a magic
 	// number if ever needed.
-	static constexpr int32 NumLevels = 4;
+	// THREE SINCE 2026-08-30, down from four, and this SHRINKS the far field on
+	// purpose.
+	//
+	// The extent is forced arithmetic, not a choice: level 0's hole must land on
+	// the ring cascade's outer edge, so spacing0 = ringEdge / HoleHalfIndex, and
+	// L doubling levels then reach 32 * spacing0 * 2^(L-1). At four levels that
+	// is 16 x ringEdge -- which was 65 km at the 4 km cascade and became 131 km
+	// the moment the cascade doubled. Nothing is visible at 131 km: this scene's
+	// fog and aerial perspective take terrain to the sky's own colour tens of
+	// kilometres before that (measured: the far bands read (93,109,125), which is
+	// fog, not ground).
+	//
+	// AND IT IS FREE TO CUT, because the clipmap's cost does NOT scale with its
+	// extent -- every level is a fixed 65x65 grid however far it reaches, so a
+	// wider extent just spreads the same vertices thinner. Dropping a level
+	// halves the reach to 8 x ringEdge (65 km at the 8 km cascade) AND removes a
+	// quarter of the per-rebuild vertex work, which matters more than it used to:
+	// each vertex now costs a climate sample and a vxc::classifyBiome call, on
+	// the GAME THREAD, and the p99 tail here is game-thread-owned.
+	static constexpr int32 NumLevels = 3;
 
 	// Half-extent of the OUTERMOST level's square grid, in world UU, measured
 	// from the shared camera-snapped origin. The farthest drawn point of this
@@ -117,10 +138,11 @@ public:
 	// true the first time -VoxelRingOuterMeters moved.
 	//
 	// NOT constexpr, and that is the whole point: this scales with the ring
-	// cascade's runtime outer radius (see SpacingUUForLevel), so it changes with
-	// -VoxelRingOuterMeters and -VoxelMaxRingLevel. At the shipped defaults
-	// (cascade edge 4096 m) it is 6,553,600 UU = 65.5 km, NOT the "~16.4 km" this
-	// header's class comment still quotes from when the cascade ended at 1 km.
+	// cascade's runtime outer radius (see SpacingUUForLevel), so it changes
+	// with -VoxelRingOuterMeters and -VoxelMaxRingLevel. At the shipped
+	// defaults (cascade edge 8,192 m, NumLevels 3) it is 6,553,600 UU =
+	// 65.5 km. The compile-time restatement AVoxelOceanActor sizes its plane
+	// from is asserted against NumLevels in VoxelOceanActor.cpp.
 	static double OuterHalfExtentUU();
 
 private:
@@ -364,6 +386,25 @@ private:
 	// divergence terrain_material_common.py was written to end. These switches
 	// are for finding the number by eye, not for shipping it.
 	bool bSnowOverrideActive = false;
+
+	// -VoxelClipmapVertexAlbedo / -VoxelClipmapAlbedoSrgb. See the parse site
+	// in BeginPlay for what this changes and why one switch arms both the
+	// vertex encoding and the material parameter.
+	// DEFAULT 1.0 SINCE 2026-08-30 -- ONE COLOUR AUTHORITY IS NOW THE SHIPPING
+	// BEHAVIOUR. The far field paints from vxc::kMaterialPalette via the same
+	// vxc::classifyBiome the voxels use, instead of a biome LUT whose colours
+	// were hand-authored independently. -VoxelClipmapVertexAlbedo=0 is the
+	// control arm and restores the LUT path exactly (no MID is created at 0).
+	float VertexAlbedoWeightOverride = 1.0f;
+	bool bVertexAlbedoActive = false;
+	bool bAlbedoAsSrgb = true;
+	// Virtual-ring voxelization strength (2026-09-02, owner-accepted): the far
+	// field continues the voxel cascade's cell law in the material's pixel
+	// shader -- terraced steps, axis-quantized normals, per-cell colour,
+	// hemisphere-ambient parity. 1.0 = voxelized (default, matches the
+	// generated material's own default); -VoxelClipmapVoxelize=0 is the smooth
+	// control arm for the seam A/B.
+	float VoxelizeWeightOverride = 1.0f;
 	float SnowlineLowMetersOverride = 2700.f;
 	float SnowlineHighMetersOverride = 2900.f;
 	float SnowTempMaxOverride = 0.16f;

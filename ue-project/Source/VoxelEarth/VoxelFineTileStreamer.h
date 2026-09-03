@@ -230,6 +230,16 @@ public:
 	// from meshing worker threads; see the threading note above.
 	vxc::ITileSampler& WorldSampler() { return Proxy_; }
 
+	// THE COARSE FALLBACK -- what an absent fine tile resolves to. Without it,
+	// a pixel whose fine tile is not on disk resolves to SEA LEVEL and the
+	// world generates flat there; with it, unbaked ground renders as real
+	// (coarse, 30 m/px) terrain. Owner decision, kept at the 8-ring cascade
+	// because only part of the world is fine-baked. Rationale and the
+	// known-absent-only gating live at ResolveNonResidentPixel in the .cpp.
+	// Null by default, so behaviour is unchanged until something wires it.
+	void SetCoarseFallback(vxc::ITileSampler* Sampler) { CoarseFallback_ = Sampler; }
+	vxc::ITileSampler* CoarseFallback() const { return CoarseFallback_; }
+
 	// The ONE query gate callers must honor. Footprint is a column's XY
 	// bounds in WORLD MILLIMETRES (VoxelCoords::WorldToMm), half-open like
 	// the rest of this codebase's world-space rects; internally dilated by the
@@ -618,6 +628,14 @@ private:
 	// frontier tiles forever; cleared whenever the ring centre moves, so a
 	// tile that appears on disk mid-session is still picked up.
 	std::unordered_set<uint64> KnownMissing_;
+
+	// Set once at construction time by the world subsystem; read from worker
+	// threads without a lock, which is safe because it never changes after.
+	vxc::ITileSampler* CoarseFallback_ = nullptr;
+
+	// Samples CoarseFallback_ at the world position of a FINE pixel. Caller
+	// must have checked CoarseFallback_ is non-null.
+	int32_t CoarseElevationMm(int64_t px, int64_t py) const;
 	// Tiles that ARE on disk and whose load failed, keyed by tile hash. See the
 	// retry contract above: this is the thing that turns "retry forever at 30
 	// ms" into "attempt, refuse, say why, stop".

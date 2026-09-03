@@ -18,6 +18,13 @@
 // UVoxelChunkComponent uses, so the vista and the near field cannot diverge.
 #include "VoxelClimateProbe.h"
 
+// vxc::classifyBiome / vxc::biomeSurfaceMaterial -- the far field's surface
+// material now comes from the SAME classifier the voxels use, not a constant.
+#include "voxelcore/biome.h"
+// vxc::kMaterialPalette -- the ONE colour table, shared with the marcher via
+// VoxelMaterialPalette.ush, which is generated from this same header.
+#include "voxelcore/materialpalette.h"
+
 // voxelcore/tiles.h ONLY here, in the .cpp -- VoxelClipmapActor.h is
 // UHT-parsed and must stay voxel-core-free (doctrine, see
 // VoxelWorldSubsystem.h's PImpl comment; the class comment above repeats
@@ -197,6 +204,45 @@ void AVoxelClipmapActor::BeginPlay()
 		       TEXT("(shipped material defaults are 2700-2900 m, 0.160, 0.100). This changes what is drawn."),
 		       SnowlineLowMetersOverride, SnowlineHighMetersOverride, SnowTempMaxOverride, SnowTempFeatherOverride);
 	}
+
+	// --- ONE COLOUR AUTHORITY -----------------------------------------------
+	//
+	// -VoxelClipmapVertexAlbedo=1 makes the far field take its colour from the
+	// SAME place the voxels do: vxc::classifyBiome -> vxc::biomeSurfaceMaterial
+	// -> vxc::kMaterialPalette, computed per vertex here and sent as a COLOUR in
+	// VertexColor.RGB. The material's VertexAlbedoWeight then bypasses the biome
+	// LUT, the snow term and the slope-rock term -- all three are the clipmap's
+	// own inventions, and the near field has none of them.
+	//
+	// ONE SWITCH ARMS BOTH HALVES on purpose: the vertex ENCODING and the
+	// material's use of it must move together, and an arm where one moved and
+	// the other did not is a picture nobody can interpret.
+	//
+	// -VoxelClipmapAlbedoSrgb=0 writes the palette bytes LINEARISED instead of
+	// as authored. kMaterialPalette is authored in sRGB; whether UE's vertex
+	// colour path wants sRGB or linear is NOT something to assume here, given
+	// that this exact path is on record turning a written 4 into a read 6-8.
+	// One capture pair settles it, and the wrong choice is a uniform brightness
+	// shift rather than a structural error.
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapVertexAlbedo="), VertexAlbedoWeightOverride);
+	bVertexAlbedoActive = VertexAlbedoWeightOverride > 0.0f;
+	// -VoxelClipmapVoxelize=0 restores the smooth far field (control arm for
+	// the virtual-ring voxelization seam A/B); default 1.0 = voxelized, the
+	// owner-accepted direction. See ApplyLevelMaterial's push.
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapVoxelize="), VoxelizeWeightOverride);
+	{
+		int32 SrgbFlag = 1;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapAlbedoSrgb="), SrgbFlag))
+		{
+			bAlbedoAsSrgb = (SrgbFlag != 0);
+		}
+	}
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Clipmap colour authority: %s (-VoxelClipmapVertexAlbedo=%.2f, bytes %s). ON = the ")
+	       TEXT("palette colour of each vertex's REAL surface material, the same authority the voxel ")
+	       TEXT("terrain uses. OFF = the biome LUT plus the clipmap's own snow and slope-rock terms."),
+	       bVertexAlbedoActive ? TEXT("PALETTE (one authority, default)") : TEXT("biome LUT (control arm)"),
+	       VertexAlbedoWeightOverride, bAlbedoAsSrgb ? TEXT("as authored sRGB") : TEXT("linearised"));
 
 	bColorCensus = FParse::Param(FCommandLine::Get(), TEXT("VoxelClipmapColorCensus"));
 
@@ -845,6 +891,10 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		}
 	}
 
+
+	// Per-level histogram of the surface material this pass computes. See the
+	// print in the census block for why it exists.
+	uint32 MatHistogram[47] = {};
 	// Pass 2: normals (central-difference heightmap gradient, clamped to
 	// forward/backward differences at the grid border) + slope/snow vertex
 	// colors, computed from the UN-skirted heights so shading reflects the
@@ -895,13 +945,63 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 			// precompute, without spending a vertex byte on it.
 			const double HeightMeters = HeightsUU[Idx] / 100.0;
 
-			// Below sea level is ocean floor: MAT_MUD is not biome-tinted in
-			// T_VoxelPalette, so the sea bed reads as dark sediment rather than
-			// taking a grassland colour that would then show through shallow
-			// water. 4 = MAT_SAND is the id voxel-core actually emits for every
-			// land surface voxel on these tiles, so the vista and the near
-			// field index the exact same palette entry.
-			const uint8 MatId = (HeightMeters < 0.0) ? 13 /*MAT_MUD*/ : 4 /*MAT_SAND*/;
+			// THE REAL SURFACE MATERIAL, from voxel-core's own classifier.
+			//
+			// THIS USED TO BE A CONSTANT, and the constant was wrong. It read
+			// `(HeightMeters < 0.0) ? MAT_MUD : MAT_SAND`, justified as "4 =
+			// MAT_SAND is the id voxel-core actually emits for every land
+			// surface voxel on these tiles". **It does not.**
+			// vxc::biomeSurfaceMaterial (biome.h:297-320) emits GRASS, TOPSOIL,
+			// PODZOL, JUNGLE_SOIL, SAVANNA_GRASS, PERMAFROST or ROCK by biome,
+			// and MAT_SAND only for BEACH. So the far field was told every
+			// square metre of land was the same material, and could not paint
+			// the two that make alpine ground white and brown -- MAT_PERMAFROST
+			// below the alpine rock line and MAT_ROCK above it. That is the
+			// owner's "the clipmap is smooth green where the voxels are white
+			// and brown", and it was never a tuning error: the information
+			// never arrived.
+			//
+			// CALL THE CLASSIFIER, DO NOT RE-DERIVE IT. classifyBiome runs
+			// morphology gates (sea level, beach band, treeline) BEFORE the
+			// Whittaker table, and the treeline is temperature-dependent -- a
+			// hand-rolled "cold and high means alpine" here would disagree with
+			// the voxels at exactly the boundary this change exists to close.
+			//
+			// RAW bytes, not FVoxelClimateBytes: the thresholds are in wire
+			// units. See SampleRawClimateAtWorldUU's declaration for why that
+			// distinction is not cosmetic, and note the third argument is
+			// precipitation VARIABILITY (biome.h:260-265 warns that a caller
+			// which passes the old seasonality channel still compiles).
+			const VoxelClimate::FVoxelRawClimate Raw = VoxelClimate::SampleRawClimateAtWorldUU(
+				SnappedOriginUU.X + double(i - HalfIndex) * Spacing,
+				SnappedOriginUU.Y + double(j - HalfIndex) * Spacing);
+
+			// Slope in mm per metre from the heights this pass already has.
+			// Central difference where both neighbours exist, one-sided at the
+			// grid edge. Spacing is in UU (10 mm), so the run in metres is
+			// Spacing/100 and the rise in mm is dHeightUU * 10.
+			const double RunM = FMath::Max(Spacing / 100.0, 1.0);
+			const int32 IPrev = FMath::Max(i - 1, 0), INext = FMath::Min(i + 1, NumVertsPerSide - 1);
+			const int32 JPrev = FMath::Max(j - 1, 0), JNext = FMath::Min(j + 1, NumVertsPerSide - 1);
+			const double DzX = (HeightsUU[j * NumVertsPerSide + INext]
+			                  - HeightsUU[j * NumVertsPerSide + IPrev]) * 10.0
+			                 / (RunM * FMath::Max(INext - IPrev, 1));
+			const double DzY = (HeightsUU[JNext * NumVertsPerSide + i]
+			                  - HeightsUU[JPrev * NumVertsPerSide + i]) * 10.0
+			                 / (RunM * FMath::Max(JNext - JPrev, 1));
+			const int64 SlopeMmPerM = (int64)FMath::Sqrt(DzX * DzX + DzY * DzY);
+
+			const int32 SurfaceMm = (int32)FMath::Clamp(HeightMeters * 1000.0, -2.0e9, 2.0e9);
+			// No sampler = no classification. Falling back to the old constant
+			// is deliberate: it is the behaviour every capture in the archive
+			// was taken under, so a run with no tiles looks like it always did
+			// rather than like a new bug.
+			const uint8 MatId = Raw.bValid
+				? (uint8)vxc::biomeSurfaceMaterial(
+					  vxc::classifyBiome(Raw.Temperature, Raw.Precipitation, Raw.PrecipVariability,
+					                     SurfaceMm, SlopeMmPerM),
+					  SurfaceMm)
+				: (uint8)((HeightMeters < 0.0) ? 13 /*MAT_MUD*/ : 4 /*MAT_SAND*/);
 
 			// Recomputed rather than carried over from pass 1 (which is where
 			// WorldX/WorldY live): this is 2 multiply-adds against 65x65
@@ -910,10 +1010,38 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 				SnappedOriginUU.X + double(i - HalfIndex) * Spacing,
 				SnappedOriginUU.Y + double(j - HalfIndex) * Spacing);
 
+			// THE MATERIAL HISTOGRAM, and it is the proof this change engaged.
+			// The old constant made this a single bar at MAT_SAND; a run whose
+			// far field is still all one material has NOT picked up the
+			// classifier, whatever the picture looks like. Free (one increment
+			// per vertex) and printed only under -VoxelClipmapColorCensus.
+			if (MatId < UE_ARRAY_COUNT(MatHistogram))
+			{
+				++MatHistogram[MatId];
+			}
+
 			// G = 255: a heightfield clipmap has no per-vertex AO to carry, and
 			// 255 is the identity for the material's AO multiply.
-			VertexColors[Idx] = FColor(VoxelClimate::BiomeTintForFace(MatId, 2, HeightMeters >= 0.0), 255,
-			                          Climate.Temperature, Climate.Precipitation);
+			if (bVertexAlbedoActive)
+			{
+				// THE PALETTE COLOUR OF THE REAL SURFACE MATERIAL -- the same
+				// table VoxelMaterialPalette.ush gives the marcher, so both
+				// halves of the terrain now read one authority.
+				//
+				// kFaceTop, because every clipmap vertex is by construction a
+				// sky-facing heightfield sample. There are no side or bottom
+				// faces out here to choose between.
+				const vxc::Rgb Pal = vxc::kMaterialPalette[FMath::Min<int32>(MatId, vxc::kMaterialCount - 1)]
+				                         .face[vxc::kFaceTop];
+				VertexColors[Idx] = bAlbedoAsSrgb
+					? FColor(Pal.r, Pal.g, Pal.b, 255)
+					: FLinearColor(FColor(Pal.r, Pal.g, Pal.b, 255)).ToFColor(/*bSRGB*/ false);
+			}
+			else
+			{
+				VertexColors[Idx] = FColor(VoxelClimate::BiomeTintForFace(MatId, 2, HeightMeters >= 0.0), 255,
+				                          Climate.Temperature, Climate.Precipitation);
+			}
 		}
 	}
 
@@ -985,6 +1113,24 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		       float(TempPinnedLo) * Inv, float(TempPinnedHi) * Inv,
 		       kMarkerLo, kMarkerHi, kMarkerRLo, kMarkerRHi,
 		       SnowTempMax, SnowTempFeather, SnowLowM, SnowHighM);
+
+		// WHAT THE FAR FIELD IS ACTUALLY MADE OF, per vxc::biomeSurfaceMaterial.
+		// Before 2026-08-30 this was a single bar at MAT_SAND (4) for all land
+		// and MAT_MUD (13) below sea level, because the id was a constant. If it
+		// still reads that way, the classifier did not run.
+		FString Hist;
+		for (int32 M = 0; M < (int32)UE_ARRAY_COUNT(MatHistogram); ++M)
+		{
+			if (MatHistogram[M] > 0)
+			{
+				Hist += FString::Printf(TEXT(" mat%d=%.1f%%"), M, float(MatHistogram[M]) * Inv);
+			}
+		}
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelClipmapColorCensus L%d SURFACE MATERIALS (vxc::biomeSurfaceMaterial):%s")
+		       TEXT("  [2=ROCK 4=SAND 6=TOPSOIL 8=GRASS 9=JUNGLE_SOIL 10=SAVANNA 11=PODZOL "
+		            "12=PERMAFROST 13=MUD]"),
+		       LevelIndex, *Hist);
 	}
 
 	// Pass 3: seam treatment at the outer grid edge (position only, after
@@ -1189,7 +1335,7 @@ void AVoxelClipmapActor::ApplyLevelMaterial(int32 LevelIndex)
 		LevelMIDs.SetNum(NumLevels);
 	}
 
-	const bool bNeedsMID = bSnowOverrideActive || bLastRingsEnabled;
+	const bool bNeedsMID = bSnowOverrideActive || bLastRingsEnabled || bVertexAlbedoActive;
 	if (!bNeedsMID)
 	{
 		LevelMIDs[LevelIndex] = nullptr;
@@ -1213,6 +1359,17 @@ void AVoxelClipmapActor::ApplyLevelMaterial(int32 LevelIndex)
 	// per debug toggle; the alternative is tracking which parameter is stale in
 	// which order, which is how the throw-away above got missed in the first
 	// place.
+	if (bVertexAlbedoActive)
+	{
+		MID->SetScalarParameterValue(TEXT("VertexAlbedoWeight"), VertexAlbedoWeightOverride);
+	}
+	// Virtual-ring voxelization (2026-09-02, owner-accepted): the material's
+	// VoxelizeWeight defaults to 1.0 in the generated asset; this push exists
+	// so -VoxelClipmapVoxelize=0 is the one-flag control arm for the seam A/B
+	// (same doctrine as -VoxelClipmapVertexAlbedo). Pushed unconditionally --
+	// the override's default equals the material's default, so a flag-free run
+	// is unchanged by this call.
+	MID->SetScalarParameterValue(TEXT("VoxelizeWeight"), VoxelizeWeightOverride);
 	if (bSnowOverrideActive)
 	{
 		MID->SetScalarParameterValue(TEXT("SnowlineLowMeters"), SnowlineLowMetersOverride);
