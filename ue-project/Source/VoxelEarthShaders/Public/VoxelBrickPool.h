@@ -999,6 +999,71 @@ public:
 	// when nothing is pending.
 	void FlushPendingGpuFrees();
 
+	// --- P2 (voxel.GPU.AsyncGen): one-tick publication deferral -------------
+	//
+	// Under async generation a claim-fed chunk's pool CLAIM runs one flush
+	// later than the shell allocation (the head of the NEXT worklist flush
+	// graph). Two pieces of pool state must stretch with it, and BOTH are
+	// keyed to the same event -- the manager telling us the deferred claim
+	// batch has been ENQUEUED:
+	//
+	//   1. The index Added entry. Delivered same-tick it would name a slot
+	//      whose record the GPU has not written yet -- the P2 hazard class.
+	//      (An index cell naming a ZERO record is the shipped missing-chunk
+	//      state, not corruption -- the marcher's record validation reads it
+	//      as absent -- but a ray racing the claim's record write mid-flight
+	//      could read a TORN record, and that is corruption. Ordering the
+	//      index upload after the claim's enqueue closes it: both ride the
+	//      graphics queue in enqueue order.)
+	//   2. Any GPU free of that slot. A free that lands BEFORE the deferred
+	//      claim would zero the record and release the side entry, and the
+	//      claim would then land ranges on a dead slot -- a permanent arena
+	//      leak plus a ghost record. Held until after the claim's enqueue,
+	//      the free instead releases exactly what the claim landed: the
+	//      shipped free-after-claim order, stretched by the same one flush.
+	//
+	// DeferGpuIndexAddForPendingClaim: GAME THREAD, manager only, for each
+	// claim-fed job right after the conversion loop decides it. Moves the
+	// chunk's pending index add into the deferred list and pins its slot
+	// against FlushPendingGpuFrees.
+	//
+	// PublishDeferredGpuIndexAdds: GAME THREAD, manager only, immediately
+	// after the Worklist.Flush call that enqueued the deferred claim batch.
+	// Releases the held adds into the normal pending list (delivered by this
+	// tick's pool Flush, whose render command is enqueued LATER -- so the
+	// GPU order is claim, then index upload) and unpins the slots (frees
+	// flushed after this point land behind the claim on the queue).
+	//
+	// FreeResident cancels a DEFERRED add exactly like a pending one when the
+	// chunk dies first (evict / same-key replace / unload): the index never
+	// hears of the chunk, the still-queued removal for it is the shipped
+	// remove-of-never-added no-op, and the held free cleans the claim's
+	// writes one flush later.
+	//
+	// WHAT RECON (-VoxelDumpIndexKeys) SEES UNDER THE ARM, stated so nobody
+	// re-diagnoses it: no index entry ever precedes its record on the GPU
+	// timeline, so `stolen` and `marked` remain HARD-ZERO tripwires -- any
+	// nonzero is real corruption exactly as before. `empty` gains a benign
+	// in-flight reading: a chunk whose shell was taken THIS tick has a pool
+	// slot in the resident map while its index add is still held here, so a
+	// dump racing an active promote window can count up to one batch
+	// (~MeshBatchCap) of empty= that is the pipeline, not a defect. It
+	// drains within ONE tick of quiescence (batchless ticks still flush,
+	// claim and publish), so a parked/leg-end dump reconciles to the digit;
+	// only empty= that PERSISTS at quiescence, or any stolen/marked at all,
+	// indicts the pool.
+	void DeferGpuIndexAddForPendingClaim(const FVoxelBrickChunkKey& Key, uint32 ChunkSlot);
+	void PublishDeferredGpuIndexAdds();
+	// Window-line counters. idxDeferred/idxCanceled move with streaming;
+	// freesHeld should be rare (an evict/replace hitting a one-tick-old
+	// chunk); deferMisses MUST stay 0 -- a nonzero value means the manager
+	// deferred a chunk whose add was already gone, i.e. the conversion loop
+	// and the free path disagree about liveness.
+	int64 GetGpuIndexAddsDeferred() const { return GpuIndexAddsDeferred; }
+	int64 GetGpuIndexAddsCanceledDeferred() const { return GpuIndexAddsCanceledDeferred; }
+	int64 GetGpuFreesHeldForClaim() const { return GpuFreesHeldForClaim; }
+	int64 GetGpuIndexAddDeferMisses() const { return GpuIndexAddDeferMisses; }
+
 	// Why a GPU-alloc-armed producer fell back to the readback path for one
 	// chunk. Counted so the window line can say the arm is DECLINING work and
 	// why, instead of the arm silently carrying less than it appears to.
@@ -1367,6 +1432,17 @@ private:
 	// with (and ordered exactly like) the classic delta -- after the render
 	// commands that write the records those slots name.
 	TArray<FVoxelBrickIndexEntry> PendingGpuIndexAdds;
+	// --- P2 (voxel.GPU.AsyncGen) --------------------------------------------
+	// Adds held back one flush because their chunk's claim is deferred (see
+	// the public API block), and the slots FlushPendingGpuFrees must not
+	// free until that claim is enqueued. Batch-sized (tens), reset by
+	// PublishDeferredGpuIndexAdds every tick while armed.
+	TArray<FVoxelBrickIndexEntry> DeferredGpuIndexAdds;
+	TSet<uint32> GpuClaimPendingSlots;
+	int64 GpuIndexAddsDeferred = 0;
+	int64 GpuIndexAddsCanceledDeferred = 0;
+	int64 GpuFreesHeldForClaim = 0;
+	int64 GpuIndexAddDeferMisses = 0;
 	// The CPU producer's packs while armed: uploaded and claimed through the
 	// GPU allocator in Flush's render command -- the one-allocator rule. The
 	// classic FPendingWrite path stays for the UNARMED pool only.

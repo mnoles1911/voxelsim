@@ -782,10 +782,37 @@ private:
 	int64 WorklistFbStack = 0;
 	int64 WorklistFbDeferred = 0;
 	int64 WorklistFbUnarmed = 0;
+	// P2 (voxel.GPU.AsyncGen): records refused conversion because they would
+	// be arena-fed but NOT claim-fed. Under async generation the arenas are
+	// written on the async pipe during the SCENE render -- a same-tick batch
+	// graph read of them (any partial feed) would be the cross-pipe stall
+	// the whole phase exists to avoid, so partial conversions fall back
+	// full-classic and are counted here (folded into the wlcols fbBy split).
+	int64 WorklistFbAsyncGen = 0;
 	// True when DispatchBatch flushed the worklist this tick (column stage:
 	// the flush must precede the batch render command); Tick then skips its
 	// own flush and clears the flag.
 	bool bWorklistFlushedThisTick = false;
+	// --- P2 (voxel.GPU.AsyncGen) --------------------------------------------
+	// The per-tick effective-arm latch. Computed ONCE at the top of Tick and
+	// read everywhere else that tick (worklist arm, free-flush ordering,
+	// conversion gating, index-add deferral) so a mid-tick cvar flip can
+	// never produce a half-deferred tick -- the house rule that the pass
+	// flags and the deferred publication move together or not at all.
+	bool bAsyncGenThisTick = false;
+	// The scene-builder hook: a post-opaque render delegate that hands the
+	// worklist the SCENE renderer's FRDGBuilder (the only builder whose
+	// graphics span covers the frame -- see the worklist header's P2 block
+	// for why a standalone builder cannot overlap). Registered from a render
+	// command on the first effective tick; removed in the destructor from a
+	// render command too, and both the broadcast and the mutation happen on
+	// the render thread, so the multicast list is never raced.
+	FDelegateHandle AsyncGenPostOpaqueHandle;
+	bool bAsyncGenDelegateRegistered = false;
+	// One-time state log so a cvar that reads 1 while a precondition fails
+	// can never be a silent no-op (the T4-1 lesson: three guards silently
+	// disabled a shipped feature).
+	bool bAsyncGenStateLogged = false;
 	void MaybeLogWorklistWindow();
 
 	// --- 50k blocker: this manager's own per-CHUNK and per-TICK cost ---------

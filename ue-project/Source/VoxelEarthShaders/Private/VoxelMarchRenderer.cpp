@@ -524,6 +524,65 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	// =====================================================================
+	// TEMPORAL RAY PRIMING (voxel.March.TemporalPrime) -- perf-redesign
+	// Phase 3, docs/perf-redesign-2026-09-03.md
+	// =====================================================================
+	//
+	// THE COST MODEL IT ATTACKS, restated from the autopsy so the arm can be
+	// judged against it: cost(ray) ~= segments ENTERED x ~0.67us + in-span
+	// hit work; entry is ~0.9 ms per ring at sky and up to 14x per ray, and
+	// ~49% of the horizon frame is empty-space traversal in front of the
+	// first surface. The world is static and only the camera moves, so last
+	// frame's own hit distances are a per-ray oracle for where this frame's
+	// first surface approximately is. Starting the march there -- minus a
+	// conservative margin -- rejects every ring segment fully in front of it
+	// via the existing `SegOut <= SegIn` guard BEFORE any rung setup runs,
+	// which is exactly the term the autopsy priced. This is the arm the
+	// RESERVE note beside that guard in VoxelBrickTraverse.ush designed and
+	// deferred ("arm B"); the graveyard legality check is in the doc: not
+	// per-step, not residency-derived, ladder untouched.
+	TAutoConsoleVariable<int32> CVarVoxelMarchTemporalPrime(
+		TEXT("voxel.March.TemporalPrime"), 1,
+	// DEFAULT ON since 2026-09-04, owner-approved ("I approve all of your
+	// work made this far. Screenshots looked good"). The gate record
+	// (docs/perf-redesign-2026-09-03.md Gate 3): vista primed=7.5M/window
+	// rewalks=0.19%, down pose primed=69.7M rewalks=0 uncovered=0.0000%,
+	// coverage counters unmoved vs control, images owner-judged at both
+	// poses; flight A/B -0.84 p50 / -1.15 p95 on top of AsyncGen. Player
+	// row: "Faster Terrain Drawing" (VoxelGraphicsUserSettings). 0 is the
+	// one-line revert.
+		TEXT("TEMPORAL RAY PRIMING (perf-redesign Phase 3). 0 = off, THE CONTROL, and the ")
+		TEXT("default -- a PERMUTATION, so 0 is byte-identical (the ZTight rule: the term ")
+		TEXT("under test is per-ray setup, and a runtime branch would re-base the control). ")
+		TEXT("1 = the marcher keeps its own previous-frame hit-distance buffer at internal ")
+		TEXT("res (fp32 T per sample, sky writes a far sentinel, ~5.4 MB at 1552x873, ")
+		TEXT("pooled ping-pong). Each frame every ray reprojects its previous hit: T_guess ")
+		TEXT("= prev same-pixel T; project camPos + dir*T_guess through the previous ")
+		TEXT("frame's view-proj; 3x3 MIN gather of prev T there (min is the silhouette ")
+		TEXT("guard -- at depth edges the prime falls back toward the NEARER surface, the ")
+		TEXT("conservative direction); start the march at that T minus the camera's ")
+		TEXT("frame-to-frame travel minus 2 chunks at the owning ring's level. Segments in ")
+		TEXT("front of the start are rejected before any rung setup -- the entries ARE the ")
+		TEXT("saving.\n")
+		TEXT("THE PRIME IS A HINT AND EVERY UNCERTAIN CASE WALKS FULLY: sky sentinel, ")
+		TEXT("off-rect or behind-camera reprojection, frame-origin snap jump, camera ")
+		TEXT("teleport, size/arm change -> unprimed full walk. MANDATORY REWALK: a primed ")
+		TEXT("ray that reaches its far bound without a hit re-walks in full from the true ")
+		TEXT("start, so a wrongly-high prime can only cost time, never a hole (the ")
+		TEXT("false-hit-impossibility argument is a doctrine block at the prime site in ")
+		TEXT("VoxelMarch.usf). Rings only; forced off at half res (the jittered sample ")
+		TEXT("lattice moves the sample point per frame -- the bound's HALFRES refusal).\n")
+		TEXT("PROVE IT ENGAGED BEFORE BELIEVING A TIMING: with voxel.March.HoleStats on, ")
+		TEXT("voxel.March.Stats prints prime: primed/invalid/rewalks. primed=0 while this ")
+		TEXT("reads 1 is ARMED AND INERT. THE PRE-REGISTERED GATES (the doc's Phase 3 ")
+		TEXT("block): DECISIONS NOT NANOSECONDS -- VoxelMarch ms at SKY AND DOWN AND ")
+		TEXT("HORIZON; PrimedRays large and PrimeRewalks small, both moving; ")
+		TEXT("uncovered/substituted must not move against control; the noise-floor ")
+		TEXT("same-pose image A/B and the pose-matched moving captures. A failed image ")
+		TEXT("gate kills the arm, not the margin."),
+		ECVF_RenderThreadSafe);
+
+	// =====================================================================
 	// THE COARSE OCCUPANCY LEVEL (voxel.March.BlockSkip)
 	// =====================================================================
 	//
@@ -1986,6 +2045,14 @@ FVoxelMarchArm VoxelMarchGetArm()
 			            "do not read this leg as a RungProbe result."));
 		}
 	}
+	// TEMPORAL RAY PRIMING. Rings only: the primed start is expressed as a
+	// raised TMinUU into the ring cascade and the win is the ring entries the
+	// raise rejects; the permutation without rings is refused at compile and
+	// must not be asked for here either. The HALF-RES refusal is enforced at
+	// the render site, where ResShift lives (the bound's arrangement,
+	// verbatim) -- this flag alone does not prove the kernel primes.
+	Arm.bTemporalPrime =
+		Arm.bRings && (CVarVoxelMarchTemporalPrime.GetValueOnAnyThread() != 0);
 	// CLAMPED AND FORCED TO 0 WITHOUT THE PERMUTATION, so the reported mode can
 	// never claim an arm the kernel does not contain -- the same rule
 	// bBlockSkipArmed follows, one layer up.
@@ -2550,6 +2617,56 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 					       TEXT("step-budget exhaustion or a -VoxelRingCount override, and ")
 					       TEXT("read the startup Z-budget line before anything else."),
 					       (unsigned long long)LW.ZLadderTailLost);
+				}
+			}
+		}
+		// ---- TEMPORAL RAY PRIMING (voxel.March.TemporalPrime) -------------
+		//
+		// The engagement pair the Phase 3 gate pre-registered: PrimedRays
+		// LARGE and PrimeRewalks SMALL, both moving. Printed from the same
+		// drained window as every group above; a zero on an unarmed or
+		// unmeasured window is worded as such, never as "nothing primed".
+		{
+			const FVoxelMarchHoleStats PW = VoxelMarchPeekLastHoleWindow();
+			if (!PW.bArmed || PW.Frames == 0)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("  prime: NOT MEASURED (%s)."),
+				       !PW.bArmed ? TEXT("voxel.March.HoleStats is 0")
+				                  : TEXT("armed, no readback has landed yet"));
+			}
+			else if (!PW.bPrimeArmed)
+			{
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("  prime: OFF (voxel.March.TemporalPrime 0, or no rings)."));
+			}
+			else
+			{
+				// Rewalks as a share of PRIMED rays (its true denominator),
+				// invalid as a share of ALL rays (every ray consults while
+				// the history is usable).
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("  prime: primed=%llu (%.2f%% of rays) invalid=%llu ")
+				       TEXT("rewalks=%llu (%.4f%% of primed) over %llu frames"),
+				       (unsigned long long)PW.PrimedRays,
+				       PW.Rays > 0 ? 100.0 * double(PW.PrimedRays) / double(PW.Rays) : 0.0,
+				       (unsigned long long)PW.PrimeInvalid,
+				       (unsigned long long)PW.PrimeRewalks,
+				       PW.PrimedRays > 0
+				           ? 100.0 * double(PW.PrimeRewalks) / double(PW.PrimedRays)
+				           : 0.0,
+				       (unsigned long long)PW.Frames);
+				if (PW.PrimedRays == 0)
+				{
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("  prime: ARMED AND INERT -- the arm reads on and not one ")
+					       TEXT("ray primed over %llu measured frames. Expected on the ")
+					       TEXT("FIRST armed frame, after a teleport, and for one frame ")
+					       TEXT("per 4096-voxel origin snap; persistent zero means the ")
+					       TEXT("history never validates (size flapping, half-res forced ")
+					       TEXT("off -- see the startup warning -- or every prev texel is ")
+					       TEXT("the sky sentinel). No timing on this leg prices the arm."),
+					       (unsigned long long)PW.Frames);
 				}
 			}
 		}
@@ -5112,6 +5229,11 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	// fallthrough depth, so the raw cvars would read "armed" for a kernel
 	// that contains neither.
 	Out.bZLadderArmed = Arm.bRings && Arm.Fallthrough > 0;
+	// FROM THE ARM, the same permutation rule. Caveat the render site owns:
+	// the arm is additionally forced off under half res (logged there), so
+	// on a half-res leg this reads armed while the kernel primes nothing --
+	// half res is a rejected configuration and the log line covers it.
+	Out.bPrimeArmed = Arm.bTemporalPrime;
 	// FROM THE ARM, for the reason bBlockSkipArmed is: VoxelMarchGetArm already
 	// forces the mode to 0 when the permutation is off, so this can never report
 	// a licence the kernel has no code for.
@@ -5137,6 +5259,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	const bool bZTightArmed = Out.bZTightArmed;
 	const bool bRungProbeArmed = Out.bRungProbeArmed;
 	const bool bZLadderArmed = Out.bZLadderArmed;
+	const bool bPrimeArmed = Out.bPrimeArmed;
 	const bool bCensusArmed = Out.bCensusArmed;
 	const int32 BlockSkyMode = Out.BlockSkyMode;
 	// The height field's flags and census are NOT part of the accumulated
@@ -5152,6 +5275,7 @@ FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
 	Out.bZTightArmed = bZTightArmed;
 	Out.bRungProbeArmed = bRungProbeArmed;
 	Out.bZLadderArmed = bZLadderArmed;
+	Out.bPrimeArmed = bPrimeArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	Out.bHeightArmed = HeightSide.bHeightArmed;
@@ -5406,6 +5530,8 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	const bool bRungProbeArmed = Arm.RungProbe != 0;
 	// See the drain: the arm, same permutation rule (rings + fallthrough).
 	const bool bZLadderArmed = Arm.bRings && Arm.Fallthrough > 0;
+	// See the drain: the arm, same permutation rule (half-res caveat there).
+	const bool bPrimeArmed = Arm.bTemporalPrime;
 	// See the drain: the census rides the hole-stats permutation itself.
 	const bool bCensusArmed = Arm.bHoleStats;
 	const int32 BlockSkyMode = Arm.BlockSkyMode;
@@ -5422,6 +5548,7 @@ FVoxelMarchHoleStats VoxelMarchPeekLastHoleWindow()
 	Out.bZTightArmed = bZTightArmed;
 	Out.bRungProbeArmed = bRungProbeArmed;
 	Out.bZLadderArmed = bZLadderArmed;
+	Out.bPrimeArmed = bPrimeArmed;
 	Out.bCensusArmed = bCensusArmed;
 	Out.BlockSkyMode = BlockSkyMode;
 	return Out;
@@ -5650,6 +5777,39 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	// no shader-side global, so the entry is simply unused, which is the
 	// inverse of the MarchCoverReachUU note above and equally legal.
 	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchOutHoleStats)
+	// ---- TEMPORAL RAY PRIMING (voxel.March.TemporalPrime) ------------------
+	// The shader-side globals exist ONLY under VOXEL_MARCH_TEMPORAL_PRIME, so
+	// on every other permutation these entries are simply unused -- the
+	// MarchOutHoleStats rule. On the primed permutation the textures are
+	// NEVER null: the first frame (no history yet) binds a 1x1 fallback
+	// CLEARED TO THE FAR SENTINEL with MarchPrimeValid 0, so even a defective
+	// gate that read it would decode "previous pixel was sky" -- unprimed
+	// full walk, the control. The safe default and the honest default are the
+	// same number, which is what earned the sentinel its value.
+	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, MarchPrimePrevT)
+	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, MarchOutPrimeT)
+	// CAMERA-RELATIVE (previous camera) world axes -> previous frame's clip,
+	// jitter-free. Composed on the host in doubles from the stored history so
+	// no planet-scale value ever meets a float; the shader subtracts
+	// MarchPrimePrevCamLocalUU (the previous camera expressed in the CURRENT
+	// march frame's local UU) first, which is also what makes the whole
+	// lookup indifferent to the 4096-voxel origin snap: the stored T is a
+	// distance (snap-invariant), and every frame-dependent term is rebased
+	// here, at bind time, in one place.
+	SHADER_PARAMETER(FMatrix44f, MarchPrimePrevCamRelToClip)
+	SHADER_PARAMETER(FVector3f, MarchPrimePrevCamLocalUU)
+	// The sample grid the history texture covers, for the UV -> texel mapping
+	// and the 3x3-fully-inside border test.
+	SHADER_PARAMETER(FVector2f, MarchPrimePrevSizePx)
+	// |camera now - camera then| in UU. Subtracted from the gathered minimum:
+	// by the reverse triangle inequality a point at distance T from the
+	// previous camera is at distance >= T - camDelta from this one, which is
+	// the exact (not approximate) conversion the conservative start needs.
+	SHADER_PARAMETER(float, MarchPrimeCamDeltaUU)
+	// 0 = no usable history this frame (first frame, size change, origin
+	// snap jump, teleport, second view) -> every ray walks unprimed. Zero is
+	// both the safe and the honest value -- the MarchZCutEnable rule.
+	SHADER_PARAMETER(uint32, MarchPrimeValid)
 END_SHADER_PARAMETER_STRUCT()
 
 // ===========================================================================
@@ -6131,6 +6291,19 @@ class FVoxelMarchZTightDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_ZTIGHT");
 // for anyone who bypasses the host. Deliberately NOT refused against Bound,
 // ZTight or HalfRes -- no shared state, no producer; the cvar text argues it.
 class FVoxelMarchRungProbeDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_RUNG_PROBE");
+// TEMPORAL RAY PRIMING (voxel.March.TemporalPrime, perf-redesign Phase 3). A
+// PERMUTATION for the ZTight reason exactly: the term under test is per-ray
+// SETUP (a texture load, a 3x3 min gather, a matrix multiply and the rewalk
+// loop's control flow, all before or around the walk), and a runtime branch
+// would leave every one of those in the control's prologue -- re-basing the
+// very term the arm is priced against. 0 is byte-identical: every token,
+// including the prev-T globals and the output write, is under the define.
+// Rings only (the primed start is a raised TMinUU into the ring cascade and
+// the saving IS the rejected segment entries); refused at HALF RES because
+// the jittered sample lattice moves the sample point per frame, so the stored
+// T would describe a different ray than the one being primed -- the bound's
+// HALFRES refusal argument, inherited whole.
+class FVoxelMarchTemporalPrimeDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_TEMPORAL_PRIME");
 
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
@@ -6295,7 +6468,8 @@ class FVoxelMarchCS : public FGlobalShader
 		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim,
 		                         FVoxelMarchHalfResDim, FVoxelMarchBlockSkipDim,
 		                         FVoxelMarchSkyLadderDim, FVoxelMarchBoundDim,
-		                         FVoxelMarchZTightDim, FVoxelMarchRungProbeDim>;
+		                         FVoxelMarchZTightDim, FVoxelMarchRungProbeDim,
+		                         FVoxelMarchTemporalPrimeDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -6407,6 +6581,24 @@ class FVoxelMarchCS : public FGlobalShader
 		if (P.Get<FVoxelMarchRungProbeDim>() &&
 		    (!P.Get<FVoxelMarchRingsDim>() || P.Get<FVoxelMarchFallthroughDim>() == 0 ||
 		     P.Get<FVoxelMarchSkyLadderDim>()))
+		{
+			return false;
+		}
+		// Temporal ray priming (voxel.March.TemporalPrime). Two refusals:
+		//   * without RINGS there is no cascade for the raised start to
+		//     reject entries from -- the permutation would build, bind and
+		//     buy nothing while doubling the compiled kernel count;
+		//   * with HALF RES the march samples a jittered block-centre
+		//     lattice, so the previous frame's T at a texel describes a
+		//     DIFFERENT RAY than the one being primed this frame -- the
+		//     bound's refusal argument, inherited whole. Deliberately NOT
+		//     refused against ZTight / BlockSkip / Fallthrough / SkyLadder /
+		//     RungProbe: the prime only raises the walk's starting T, every
+		//     one of those arms derives its decisions from the segment
+		//     bounds downstream of that T, and the mandatory rewalk restores
+		//     the control's full interval on every primed miss.
+		if (P.Get<FVoxelMarchTemporalPrimeDim>() &&
+		    (!P.Get<FVoxelMarchRingsDim>() || P.Get<FVoxelMarchHalfResDim>()))
 		{
 			return false;
 		}
@@ -6630,6 +6822,15 @@ class FVoxelMarchCS : public FGlobalShader
 		                         int32(VoxelMarchHoleWord::ZLadderResumed));
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_ZL_TAILLOST"),
 		                         int32(VoxelMarchHoleWord::ZLadderTailLost));
+		// The temporal prime's engagement trio (voxel.March.TemporalPrime,
+		// perf-redesign Phase 3), pushed from the one enum like every group
+		// above it.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_PRIMED_RAYS"),
+		                         int32(VoxelMarchHoleWord::PrimedRays));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_PRIME_INVALID"),
+		                         int32(VoxelMarchHoleWord::PrimeInvalid));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_PRIME_REWALKS"),
+		                         int32(VoxelMarchHoleWord::PrimeRewalks));
 		// WORDS covers the appended census -- VoxelMarchRayBoundWord::End, not
 		// the enum's Count, while the census lives outside the enum. Every
 		// sizing of the stats buffer (create, copy, lock) reads End too.
@@ -6720,11 +6921,12 @@ static_assert(int32(VoxelMarchHoleWord::HeightConsulted) -
 // displaced would keep printing a plausible number -- which is the incident
 // VoxelMarchHoleWord's own note records and the reason none of these layouts
 // may be mirrored by hand.
-// 42 = the height group's 14, the per-grid-slot stale/real groups (12 + 12
-// words, 2026-09-02), and the Z ladder's engagement quad (4 words, appended
-// later on 2026-09-02 with the altitude fix).
+// 45 = the height group's 14, the per-grid-slot stale/real groups (12 + 12
+// words, 2026-09-02), the Z ladder's engagement quad (4 words, appended
+// later on 2026-09-02 with the altitude fix), and the temporal prime's
+// engagement trio (3 words, 2026-09-03).
 static_assert(int32(VoxelMarchHoleWord::Count) -
-                      int32(VoxelMarchHoleWord::HeightConsulted) == 42,
+                      int32(VoxelMarchHoleWord::HeightConsulted) == 45,
               "the height pyramid's engagement group is not fourteen words, or something "
               "was appended after it without repointing this assert at the new group's "
               "first word. If you added a counter to the height walk it needs a word of "
@@ -8093,6 +8295,13 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			const uint32 ZlClamped = Src[VoxelMarchHoleWord::ZLadderClamped];
 			const uint32 ZlResumed = Src[VoxelMarchHoleWord::ZLadderResumed];
 			const uint32 ZlTailLost = Src[VoxelMarchHoleWord::ZLadderTailLost];
+			// The temporal prime's trio. Read on EVERY frame, the ladder
+			// pair's rule: the words are written by every hole-stats level
+			// (structural zeros on an unprimed kernel, which the armed flag
+			// separates from a measured zero at print time).
+			const uint32 PrimedRays = Src[VoxelMarchHoleWord::PrimedRays];
+			const uint32 PrimeInvalid = Src[VoxelMarchHoleWord::PrimeInvalid];
+			const uint32 PrimeRewalks = Src[VoxelMarchHoleWord::PrimeRewalks];
 			// The resident-Z bound's engagement trio. Read on EVERY frame for
 			// the reason the ladder's pair is: the plain kernel writes them
 			// too, so gating them behind the level-2 fold would report the
@@ -8214,6 +8423,9 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			State->HoleWindow.ZLadderClamped += ZlClamped;
 			State->HoleWindow.ZLadderResumed += ZlResumed;
 			State->HoleWindow.ZLadderTailLost += ZlTailLost;
+			State->HoleWindow.PrimedRays += PrimedRays;
+			State->HoleWindow.PrimeInvalid += PrimeInvalid;
+			State->HoleWindow.PrimeRewalks += PrimeRewalks;
 			State->HoleWindow.ZCutConsulted += ZCutConsulted;
 			State->HoleWindow.ZCutSkipped += ZCutSkipped;
 			State->HoleWindow.ZCutClipped += ZCutClipped;
@@ -9482,6 +9694,15 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 
 	uint32 TotalTiles = 0;
 
+	// THE TEMPORAL PRIME'S HISTORY IS SINGLE-OWNER PER FRAME. One pooled
+	// texture, one camera record: the FIRST primed view claims both sides
+	// (read the old, extract the new); any further view in a family runs the
+	// primed KERNEL with MarchPrimeValid 0 -- unprimed full walks, the
+	// control's picture -- rather than reading a history another view wrote.
+	// The owner's config is one view; this guard is what keeps a split-screen
+	// experiment from silently priming view B off view A's depths.
+	bool bPrimeHistoryClaimed = false;
+
 	for (FViewMarch& Entry : Views)
 	{
 		if (Entry.FrameNumber != GFrameNumberRenderThread)
@@ -10239,6 +10460,125 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			Params->MarchOutHitT = GraphBuilder.CreateUAV(HitT);
 			Params->MarchOutTileHit = TileHitUAV;
 
+			// ---- TEMPORAL RAY PRIMING (voxel.March.TemporalPrime) ----------
+			//
+			// KERNEL SELECTION IS FROM THE ARM PLUS ResShift, the ZTight
+			// keying and for its stated reason: a leg stays on ONE kernel
+			// throughout (history readiness flapping mid-leg must not
+			// alternate binaries under the timer), and the not-yet-usable
+			// history is expressed as MarchPrimeValid 0 -- the honest "do
+			// not prime" value -- so an armed kernel with no history marches
+			// exactly the control while WRITING its first history frame,
+			// which is what breaks the chicken-and-egg an
+			// existence-of-texture keying would create. HALF RES REFUSES THE
+			// ARM here, where ResShift lives (the bound's arrangement): the
+			// permutation does not compile against the jittered lattice.
+			FRDGTextureRef PrimeTex = nullptr;
+			const bool bPrimeOn = Arm.bTemporalPrime && ResShift == 0;
+			if (Arm.bTemporalPrime && ResShift != 0)
+			{
+				// The sky ladder's rule: a leg must not read a forced-off
+				// frame as a prime null result.
+				static bool bPrimeHalfResWarned = false;
+				if (!bPrimeHalfResWarned)
+				{
+					bPrimeHalfResWarned = true;
+					UE_LOG(LogVoxelMarch, Warning,
+					       TEXT("voxel.March.TemporalPrime is FORCED OFF under "
+					            "voxel.March.HalfRes: the jittered half-res sample lattice "
+					            "moves the sample point per frame, so the stored hit "
+					            "distance would describe a different ray than the one being "
+					            "primed (the bound's HALFRES refusal, inherited). Every "
+					            "frame until the configuration changes runs UNPRIMED -- do "
+					            "not read this leg as a TemporalPrime result."));
+				}
+			}
+			if (bPrimeOn)
+			{
+				// This frame's write side, always -- the first armed frame's
+				// whole job is producing the history the second one primes
+				// from.
+				PrimeTex = GraphBuilder.CreateTexture(
+					FRDGTextureDesc::Create2D(MarchSize, PF_R32_FLOAT,
+					                          FClearValueBinding::None,
+					                          TexCreate_ShaderResource | TexCreate_UAV),
+					TEXT("VoxelMarch.PrimeT"));
+				Params->MarchOutPrimeT = GraphBuilder.CreateUAV(PrimeTex);
+
+				// The read side: last frame's extraction, accepted only when
+				// every locked unprime trigger clears. Each refusal is the
+				// design's listed fallback, not an error:
+				//   * no history / size change / arm just flipped -> first
+				//     frame, nothing to prime from;
+				//   * FRAME-ORIGIN SNAP JUMP -> the stored T (a distance) is
+				//     actually snap-invariant, but the locked design spends
+				//     one clean frame per ~40.96 m of travel here anyway --
+				//     a periodic ground-truth resync that bounds how long
+				//     any silhouette-edge prime error can persist;
+				//   * CAMERA TELEPORT (> ~20 m between marched frames) ->
+				//     reprojection error is no longer bounded by the margin.
+				const FVoxelMarchState::FPrimeHistory& PrimeHist = State->PrimeHistory;
+				const FVector CurFrameOriginUU(double(FrameOriginVoxel.X) * 10.0,
+				                               double(FrameOriginVoxel.Y) * 10.0,
+				                               double(FrameOriginVoxel.Z) * 10.0);
+				// 20 m. At the owner's 20 m/s cruise a marched-frame gap
+				// would need a full second before this trips; a real
+				// teleport jumps kilometres. Differenced in DOUBLE, the
+				// precision-seam rule.
+				const double kPrimeTeleportUU = 2000.0;
+				const double CamDeltaUU = (Entry.ViewOriginUU - PrimeHist.CamOriginUU).Size();
+				const bool bPrimeValid = !bPrimeHistoryClaimed && PrimeHist.bValid &&
+				                         PrimeHist.Texture.IsValid() &&
+				                         PrimeHist.SizePx == MarchSize &&
+				                         PrimeHist.FrameOriginVoxel == FrameOriginVoxel &&
+				                         CamDeltaUU <= kPrimeTeleportUU;
+				if (bPrimeValid)
+				{
+					Params->MarchPrimePrevT =
+						GraphBuilder.RegisterExternalTexture(PrimeHist.Texture);
+					// The previous camera, expressed in the CURRENT march
+					// frame's local UU -- the one place every frame-dependent
+					// term is rebased (doubles here, smalls on the GPU; the
+					// stored T itself is a distance and needs nothing).
+					Params->MarchPrimePrevCamLocalUU =
+						FVector3f(PrimeHist.CamOriginUU - CurFrameOriginUU);
+					Params->MarchPrimePrevCamRelToClip =
+						FMatrix44f(PrimeHist.CamRelWorldToClip);
+					Params->MarchPrimePrevSizePx = FVector2f(float(PrimeHist.SizePx.X),
+					                                         float(PrimeHist.SizePx.Y));
+					Params->MarchPrimeCamDeltaUU = float(CamDeltaUU);
+					Params->MarchPrimeValid = 1;
+				}
+				else
+				{
+					// The 1x1 fallback, CLEARED TO THE FAR SENTINEL (1e30f --
+					// cross-referenced by name with VOXEL_MARCH_PRIME_FAR in
+					// VoxelMarch.usf; a define cannot be static_asserted
+					// across languages). MarchPrimeValid 0 already refuses
+					// every read, so the clear defends only against a future
+					// gate defect -- and then it decodes as "previous pixel
+					// was sky", the unprimed full walk. Every uniform is
+					// still written: an unset uniform is a silent zero, and
+					// a zero MATRIX would be the one value that could make a
+					// defective read look plausible.
+					FRDGTextureRef PrimeFallback = GraphBuilder.CreateTexture(
+						FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_R32_FLOAT,
+						                          FClearValueBinding::None,
+						                          TexCreate_ShaderResource | TexCreate_UAV),
+						TEXT("VoxelMarch.PrimePrevT.Absent"));
+					// The single-float overload, the VoxelShadowMarch mask
+					// clear's proven spelling for an R32F texture UAV.
+					AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(PrimeFallback),
+					                1.0e30f);
+					Params->MarchPrimePrevT = PrimeFallback;
+					Params->MarchPrimePrevCamLocalUU = FVector3f::ZeroVector;
+					Params->MarchPrimePrevCamRelToClip = FMatrix44f::Identity;
+					Params->MarchPrimePrevSizePx = FVector2f(1.0f, 1.0f);
+					Params->MarchPrimeCamDeltaUU = 0.0f;
+					Params->MarchPrimeValid = 0;
+				}
+			}
+
 			// The hole metric's stats buffer. Created, cleared and bound ONLY
 			// when the arm is on -- off must be free, and "free" here means no
 			// buffer exists, not a buffer nobody reads. The off permutation has
@@ -10312,6 +10652,12 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// matching the refused permutations, so this can never ask for a
 			// kernel that does not exist.
 			Permutation.Set<FVoxelMarchRungProbeDim>(Arm.RungProbe != 0);
+			// FROM THE ARM PLUS ResShift, the ZTight keying (see the prime
+			// block above): a not-yet-usable history is MarchPrimeValid 0 on
+			// the SAME kernel, never a kernel swap mid-leg -- and the refused
+			// permutations (no rings, half res) cannot be asked for because
+			// bPrimeOn already carries both conditions.
+			Permutation.Set<FVoxelMarchTemporalPrimeDim>(bPrimeOn);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.
@@ -10341,6 +10687,40 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				               MarchSize.X, MarchSize.Y, Size.X, Size.Y, Arm.StepBudget),
 				ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
 				Shader, Params, FIntVector(TileCount.X, TileCount.Y, 1));
+
+			// ---- THE TEMPORAL PRIME'S EXTRACTION (the ping-pong's far end) -
+			//
+			// The extraction replaces the pooled pointer AFTER graph execute,
+			// while the registration above read the OLD pooled target during
+			// it -- RDG cannot alias the new texture over a registered
+			// external one within the same graph, so the pass provably read
+			// prev while writing current and the pool recycles the two
+			// physical textures alternately (the header's ping-pong note).
+			// The camera record is stored beside it, CAMERA-RELATIVE and
+			// JITTER-FREE: the translated view rotation (translation removed
+			// -- a camera-relative point maps through the rotation alone,
+			// exactly) times the no-AA projection, composed in doubles.
+			if (bPrimeOn && !bPrimeHistoryClaimed)
+			{
+				bPrimeHistoryClaimed = true;
+				GraphBuilder.QueueTextureExtraction(PrimeTex, &State->PrimeHistory.Texture);
+				const FViewMatrices& PrimeVM = Entry.ViewKey->ViewMatrices;
+				State->PrimeHistory.CamRelWorldToClip =
+					PrimeVM.GetTranslatedViewMatrix().RemoveTranslation() *
+					PrimeVM.GetProjectionNoAAMatrix();
+				State->PrimeHistory.CamOriginUU = Entry.ViewOriginUU;
+				State->PrimeHistory.FrameOriginVoxel = FrameOriginVoxel;
+				State->PrimeHistory.SizePx = MarchSize;
+				State->PrimeHistory.bValid = true;
+			}
+			else if (!bPrimeOn && State->PrimeHistory.bValid)
+			{
+				// Arm off (or forced off): drop the history rather than let a
+				// later re-arm prime from a stale frame the validity gates
+				// happen not to catch. ~5.4 MB back to the pool.
+				State->PrimeHistory.bValid = false;
+				State->PrimeHistory.Texture.SafeRelease();
+			}
 
 			// The hole metric's readback, straight after the pass that wrote
 			// it -- the VoxelShadowMarch.cpp slot-ring pattern, copied rather

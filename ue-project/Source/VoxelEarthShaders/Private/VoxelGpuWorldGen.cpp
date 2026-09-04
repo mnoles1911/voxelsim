@@ -3075,9 +3075,19 @@ void VoxelGpuWorldGen::AddWorklistColumnPass(FRDGBuilder& GraphBuilder,
 	// THE dispatch shape this whole arm exists for: group count = Take * 16
 	// off the triple the args pass wrote, never seen by the CPU. Recorded
 	// even when Take is 0 -- a constant pass per tick is the property.
+	//
+	// P2 (voxel.GPU.AsyncGen): the pipe is the caller's choice. AsyncCompute
+	// here is only ever correct when the caller ALSO deferred every consumer
+	// of the arena to the next tick's graph -- a same-graph graphics consumer
+	// turns the flag into a cross-pipe stall, and (measured in the engine
+	// source, RenderGraphBuilder.cpp AddLastBufferTransition) a standalone
+	// builder's epilogue transitions every external buffer back to the
+	// graphics pipe anyway, which is why the async form of this pass is
+	// dispatched from the SCENE builder, not the flush builder.
 	FComputeShaderUtils::AddPass(
-		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistColumn(indirect)"), Shader, Params,
-		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
+		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistColumn(indirect)"),
+		Dispatch.bAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute,
+		Shader, Params, Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
 }
 
 void VoxelGpuWorldGen::AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder,
@@ -3132,9 +3142,11 @@ void VoxelGpuWorldGen::AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder,
 	// Group count = Take * 16 off the Voxelize triple the args pass wrote.
 	// Recorded even when Take is 0 -- constant passes per tick is the
 	// property this arm exists for.
+	// P2: pipe is the caller's choice -- see AddWorklistColumnPass's note.
 	FComputeShaderUtils::AddPass(
-		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistVoxelize(indirect)"), Shader, Params,
-		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
+		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistVoxelize(indirect)"),
+		Dispatch.bAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute,
+		Shader, Params, Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
 }
 
 void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
@@ -3181,9 +3193,11 @@ void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
 		Params->IndirectArgs = Dispatch.IndirectArgs;
 
 		TShaderMapRef<FVoxelWorklistClassifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		// P2: pipe is the caller's choice -- see AddWorklistColumnPass's note.
 		FComputeShaderUtils::AddPass(
-			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClassify(indirect)"), Shader, Params,
-			Dispatch.IndirectArgs, Dispatch.ClassifyArgsOffset);
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClassify(indirect)"),
+			Dispatch.bAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute,
+			Shader, Params, Dispatch.IndirectArgs, Dispatch.ClassifyArgsOffset);
 	}
 
 	// Pass 2: the scan + totals half. One group per RECORD; reads what pass 1
@@ -3202,9 +3216,11 @@ void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
 		Params->IndirectArgs = Dispatch.IndirectArgs;
 
 		TShaderMapRef<FVoxelWorklistClassifyTotalsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		// P2: pipe is the caller's choice -- see AddWorklistColumnPass's note.
 		FComputeShaderUtils::AddPass(
-			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClassifyTotals(indirect)"), Shader, Params,
-			Dispatch.IndirectArgs, Dispatch.TotalsArgsOffset);
+			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistClassifyTotals(indirect)"),
+			Dispatch.bAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute,
+			Shader, Params, Dispatch.IndirectArgs, Dispatch.TotalsArgsOffset);
 	}
 }
 
@@ -3238,9 +3254,11 @@ void VoxelGpuWorldGen::AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder,
 	Params->IndirectArgs = Dispatch.IndirectArgs;
 
 	TShaderMapRef<FVoxelWorklistAssetStampCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	// P2: pipe is the caller's choice -- see AddWorklistColumnPass's note.
 	FComputeShaderUtils::AddPass(
-		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistAssetStamp(indirect)"), Shader, Params,
-		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
+		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistAssetStamp(indirect)"),
+		Dispatch.bAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute,
+		Shader, Params, Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
 }
 
 void VoxelGpuWorldGen::AddWorklistPackPass(FRDGBuilder& GraphBuilder,
@@ -3288,9 +3306,11 @@ void VoxelGpuWorldGen::AddWorklistPackPass(FRDGBuilder& GraphBuilder,
 	Params->IndirectArgs = Dispatch.IndirectArgs;
 
 	TShaderMapRef<FVoxelWorklistPackCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	// P2: pipe is the caller's choice -- see AddWorklistColumnPass's note.
 	FComputeShaderUtils::AddPass(
-		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistPack(indirect)"), Shader, Params,
-		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
+		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistPack(indirect)"),
+		Dispatch.bAsyncCompute ? ERDGPassFlags::AsyncCompute : ERDGPassFlags::Compute,
+		Shader, Params, Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
 }
 
 void VoxelGpuWorldGen::AddQuadCompactPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,

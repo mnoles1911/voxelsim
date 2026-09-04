@@ -404,7 +404,33 @@ private:
 	// hemisphere-ambient parity. 1.0 = voxelized (default, matches the
 	// generated material's own default); -VoxelClipmapVoxelize=0 is the smooth
 	// control arm for the seam A/B.
+	//
+	// V3 (2026-09-04, owner: "even more voxelized, with its own LODs"): the
+	// SAME switch now also gates GEOMETRIC voxelization -- RebuildLevel
+	// quantizes every vertex height to the band ladder's cell (real 3D
+	// terraces, so the SILHOUETTE steps too, which the v2 pixel shader could
+	// not do). One switch arms both halves on purpose, same doctrine as
+	// -VoxelClipmapVertexAlbedo: a frame where the mesh terraced but the
+	// shader read smooth cells (or vice versa) is a picture nobody can
+	// interpret. At 0 both halves are byte-identical to the smooth arm.
 	float VoxelizeWeightOverride = 1.0f;
+
+	// ---- THE ONE BAND LADDER (v3, 2026-09-04) ------------------------------
+	// Cell size is VoxelizeBaseCellUU at the cascade seam, doubling per
+	// distance band: cell(b) = base * 2^b for Chebyshev distance in
+	// [seam*2^b, seam*2^(b+1)), clamped at band 3. BOTH consumers -- the
+	// vertex quantization in RebuildLevel and M_VoxelClipmap's pixel shader --
+	// take these two numbers from HERE: RebuildLevel uses them directly, and
+	// ApplyLevelMaterial pushes them onto every level MID as the
+	// VoxelizeSeamUU / VoxelizeBaseCellUU scalar parameters the shader's
+	// ladder is written against. Derived in BeginPlay from the ring cascade
+	// (seam = active outer edge; base cell = the coarsest ring's voxel size,
+	// VoxelCoords::VoxelSizeUU << MaxRingLevel), and checked there against the
+	// generated material asset's fallback defaults (819,200 / 1,280 UU) so a
+	// cascade override cannot silently split the two derivations. Declaration
+	// defaults match the shipped cascade for the pre-BeginPlay window.
+	double VoxelizeSeamUU = 819200.0;    // 8,192 m
+	double VoxelizeBaseCellUU = 1280.0;  // 12.8 m = R7's voxel size
 	float SnowlineLowMetersOverride = 2700.f;
 	float SnowlineHighMetersOverride = 2900.f;
 	float SnowTempMaxOverride = 0.16f;

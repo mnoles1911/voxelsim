@@ -269,6 +269,14 @@ namespace VoxelGpuWorldGen
 		uint32 SeedLo = 0;
 		uint32 SeedHi = 0;
 		int32 PixelSizeMm = 0;
+		// P2 (voxel.GPU.AsyncGen): dispatch this stage on the ASYNC COMPUTE
+		// pipe. Generation-only stages carry this flag; the Claim stage NEVER
+		// does (it writes the live pool the marcher reads and must stay
+		// ordered on the graphics queue). The flag is only ever set together
+		// with the one-tick publication defer -- setting it alone is the trap
+		// the P2 design names: the very next graphics consumer just waits at
+		// the cross-pipe fence and the frame gains nothing.
+		bool bAsyncCompute = false;
 	};
 	void AddWorklistColumnPass(FRDGBuilder& GraphBuilder, const FWorklistColumnDispatch& Dispatch);
 
@@ -289,6 +297,8 @@ namespace VoxelGpuWorldGen
 		uint32 SeedLo = 0;
 		uint32 SeedHi = 0;
 		int32 PixelSizeMm = 0;
+		// P2: async-compute pipe -- see FWorklistColumnDispatch::bAsyncCompute.
+		bool bAsyncCompute = false;
 	};
 	void AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder, const FWorklistVoxelizeDispatch& Dispatch);
 
@@ -311,6 +321,8 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef OccOffsets = nullptr;  // written: the batch graph reads these
 		FRDGBufferRef MatOffsets = nullptr;
 		FRDGBufferRef Totals = nullptr;
+		// P2: async-compute pipe -- see FWorklistColumnDispatch::bAsyncCompute.
+		bool bAsyncCompute = false;
 	};
 	void AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder, const FWorklistClassifyDispatch& Dispatch);
 
@@ -328,6 +340,8 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef Instances = nullptr;     // this flush's GpuAssetStampInstance blob
 		FRDGBufferRef ColStarts = nullptr;     // rebased per-column span starts
 		FRDGBufferRef Spans = nullptr;         // rebased packed spans
+		// P2: async-compute pipe -- see FWorklistColumnDispatch::bAsyncCompute.
+		bool bAsyncCompute = false;
 	};
 	void AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder, const FWorklistAssetStampDispatch& Dispatch);
 
@@ -349,6 +363,8 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef Mat = nullptr;
 		FRDGBufferRef Skip = nullptr;
 		FRDGBufferRef Mask = nullptr;         // caller cleared it this flush
+		// P2: async-compute pipe -- see FWorklistColumnDispatch::bAsyncCompute.
+		bool bAsyncCompute = false;
 	};
 	void AddWorklistPackPass(FRDGBuilder& GraphBuilder, const FWorklistPackDispatch& Dispatch);
 

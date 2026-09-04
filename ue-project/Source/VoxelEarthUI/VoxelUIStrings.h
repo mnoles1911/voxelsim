@@ -51,6 +51,16 @@ VOXELEARTHUI_API FText CreditsPanelBody();
 // shipped, and a missing button would be the more visible divergence.
 VOXELEARTHUI_API FText SettingsPanelTitle();
 VOXELEARTHUI_API FText SettingsPanelBody();
+// The first real settings row (2026-09-04): the panel stopped being a
+// placeholder the day the owner asked for a player-facing toggle. Label and
+// description are plain player language; the cvar mapping lives in
+// VoxelGraphicsUserSettings.cpp, never in a string.
+VOXELEARTHUI_API FText SettingsFineDetailLabel();
+VOXELEARTHUI_API FText SettingsFineDetailDesc();
+VOXELEARTHUI_API FText SettingsToggleOn();
+VOXELEARTHUI_API FText SettingsToggleOff();
+VOXELEARTHUI_API FText SettingsFasterTerrainLabel();
+VOXELEARTHUI_API FText SettingsFasterTerrainDesc();
 
 // --- Loading screen ---------------------------------------------------------
 // "L O A D I N G" -- the spaces are literal. Godot has no letter-spacing

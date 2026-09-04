@@ -290,6 +290,7 @@
 #include "CoreMinimal.h"
 #include "RHI.h"
 #include "RHIGPUReadback.h" // the hit-tile count ring -- see FTileReadback
+#include "RendererInterface.h" // IPooledRenderTarget -- the temporal prime's history
 #include "SceneViewExtension.h"
 #include "Templates/SharedPointer.h"
 
@@ -394,6 +395,18 @@ struct FVoxelMarchArm
 	// HalfRes -- different mechanism, no shared state, no producer; the cvar
 	// text carries the reasoning.
 	int32 RungProbe = 0;
+	// TEMPORAL RAY PRIMING (voxel.March.TemporalPrime, perf-redesign Phase 3).
+	// A PERMUTATION, default 0 -- byte-identical control, the ZTight rule and
+	// for the same reason: the term under test is per-ray SETUP (the prime
+	// lookup is a texture gather plus a projection before any walk), and a
+	// runtime branch would leave that cost in the control's prologue. Rings
+	// only, forced false without them -- the primed start is expressed as a
+	// raised TMinUU into the ring cascade, and the win IS the ring entries
+	// the raise rejects; the render site additionally forces it off under
+	// voxel.March.HalfRes (the jittered sample lattice moves the sample point
+	// per frame, the bound's HALFRES refusal argument -- the stored T would
+	// describe a different ray than the one primed).
+	bool bTemporalPrime = false;
 	// THE RETRY LADDER GATE (voxel.March.SkyLadder). A permutation, unlike
 	// BlockSkyMode below: it puts a field on the chunk cache and a fold at five
 	// walk sites, so the control must not carry it. Forced false without rings
@@ -923,6 +936,40 @@ namespace VoxelMarchHoleWord
 		ZLadderClamped,
 		ZLadderResumed,
 		ZLadderTailLost,
+
+		// ---- TEMPORAL RAY PRIMING (voxel.March.TemporalPrime, 2026-09-03) --
+		// APPENDED, the standing rule: appending renumbers nothing, a stale
+		// shader cache still reads every older word correctly and leaves
+		// these three at zero -- which a reader must word as NOT MEASURED.
+		// (The RayBound census words PAST Count shift with this append, as
+		// the Z ladder's own note says: force a shader recompile before
+		// trusting that group.)
+		//
+		//   PrimedRays   rays whose walk actually STARTED at a reprojected
+		//                previous-frame hit distance instead of the segment's
+		//                true start. THE ENGAGEMENT COUNTER: zero while the
+		//                arm is on is armed-and-inert, the house failure --
+		//                and the gate demands it LARGE at terrain-heavy poses
+		//                (down / horizon), because sky pixels are refused by
+		//                design (a sky-sentinel prev texel never primes).
+		//   PrimeInvalid rays that CONSULTED the previous-frame buffer while
+		//                the host said the history was usable and still fell
+		//                back to a full walk: sky sentinel at the lookup,
+		//                reprojection off the previous view rect, behind the
+		//                previous camera (w <= 0), or a primed start that
+		//                bought nothing (at/before the true start, or past
+		//                the ray's far bound). Diagnostic, not a failure
+		//                count -- disocclusion and sky ARE this word.
+		//   PrimeRewalks rays whose PRIMED walk reached its far bound with no
+		//                hit and were re-walked in full from the true start
+		//                (the mandatory rewalk -- the closure that turns a
+		//                wrongly-high prime into wasted time instead of a
+		//                hole). THE FAILURE-PRESSURE COUNTER: the gate
+		//                demands it SMALL while PrimedRays is large; both
+		//                must move or the leg measured nothing.
+		PrimedRays,
+		PrimeInvalid,
+		PrimeRewalks,
 		Count
 	};
 	// 8 since the cascade was cut back to 8 rings (2026-09-02; it was 11 for
@@ -1133,6 +1180,21 @@ struct FVoxelMarchHoleStats
 	uint64 ZLadderResumed = 0;
 	uint64 ZLadderTailLost = 0;
 	bool bZLadderArmed = false;
+
+	// ---- temporal ray priming (voxel.March.TemporalPrime) ------------------
+	// Counted on EVERY hole-stats level, the ZTight rule. bPrimeArmed is FROM
+	// THE ARM, the permutation rule: the prime compiles only under rings and
+	// the render site forces it off at half res, so the raw cvar would read
+	// "armed" for a kernel that contains no prime. The reading contract (the
+	// Phase 3 gate, pre-registered): PrimedRays LARGE and PrimeRewalks SMALL,
+	// and BOTH must move -- PrimedRays == 0 with the flag TRUE is the loud
+	// armed-and-inert case, and a timing on such a leg means nothing.
+	// PrimeInvalid is the fallback census (sky, disocclusion, off-rect, no
+	// gain); it is a diagnostic rate, not a failure count.
+	uint64 PrimedRays = 0;
+	uint64 PrimeInvalid = 0;
+	uint64 PrimeRewalks = 0;
+	bool bPrimeArmed = false;
 
 	// ---- the wave-occupancy census (family A's falsifier) ------------------
 	// Compiled with hole stats wherever the engine's wave-op macros allow
@@ -1959,6 +2021,48 @@ public:
 		int32 ArmLevel = 0;
 	};
 	FHoleReadback HoleRing[kNumHoleReadbacks];
+
+	// THE TEMPORAL PRIME'S HISTORY (voxel.March.TemporalPrime). Render-thread
+	// only, no lock: written at the march dispatch and consumed at the next
+	// one, both on the render thread.
+	//
+	// WHAT THE TEXTURE HOLDS, AND WHY A SCALAR: one fp32 per march sample --
+	// the winning hit's ray parameter t in world UU (camera distance), or the
+	// far sentinel for a miss (~5.4 MB at 1552x873). A DISTANCE is invariant
+	// under the frame origin's 4096-voxel snap -- the buffer needs NO
+	// rebasing when the origin jumps -- so the world-stable form is the
+	// scalar itself, and the only frame-dependent inputs are the prev camera
+	// data below, which the host re-expresses in the CURRENT frame's local
+	// coordinates at bind time (doubles on the CPU, smalls on the GPU).
+	//
+	// THE PING-PONG IS THE POOL'S: each frame registers this pooled target as
+	// the read side and creates a fresh RDG texture as the write side, then
+	// extraction replaces the pointer. RDG cannot alias the new texture over
+	// a registered external one within the same graph, so the pass provably
+	// reads prev while writing current, and the pool recycles the two
+	// physical textures alternately.
+	struct FPrimeHistory
+	{
+		TRefCountPtr<IPooledRenderTarget> Texture; // prev frame's per-sample hit T
+		// The camera's world-UU position when Texture was written. Doubles,
+		// because it is planet-scale; every consumer differences it first.
+		FVector CamOriginUU = FVector::ZeroVector;
+		// CAMERA-RELATIVE world -> clip for the frame Texture was written
+		// (translated view rotation with the translation removed, times the
+		// NO-AA projection). Camera-relative so no planet-scale number ever
+		// meets a float: the shader subtracts the prev camera (expressed in
+		// current local UU) from its local-frame point and multiplies.
+		FMatrix CamRelWorldToClip = FMatrix::Identity;
+		// The march frame origin the stored T's rays were built in. A SNAP
+		// JUMP between frames unprimes the whole next frame -- not because
+		// the scalar needs it (it does not), but as the locked design's
+		// cheap hard reset: one full clean walk every ~40.96 m of travel
+		// bounds how long any silhouette-edge prime error can persist.
+		FIntVector FrameOriginVoxel = FIntVector::ZeroValue;
+		FIntPoint SizePx = FIntPoint::ZeroValue; // the sample grid Texture covers
+		bool bValid = false;
+	};
+	FPrimeHistory PrimeHistory;
 
 	// THE TIGHT RESIDENT-Z REDUCE'S READBACK RING (voxel.March.ZTight). Its
 	// own ring, not the hole ring, for the standing reason: different cvar,

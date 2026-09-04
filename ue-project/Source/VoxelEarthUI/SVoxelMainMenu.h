@@ -88,6 +88,10 @@ private:
 	// BACK button. One builder rather than three near-identical ones, because
 	// three copies of a panel is how three panels start disagreeing.
 	TSharedRef<class SWidget> BuildMessagePanel(EVoxelMenuPanel Panel, const FText& Title, const FText& Body);
+	// The real SETTINGS panel (2026-09-04) -- message-panel shaped, one row per
+	// entry in VoxelGraphicsUserSettings. Registers its Back button under
+	// EVoxelMenuPanel::Settings in MessagePanelBackButtons like its siblings.
+	TSharedRef<class SWidget> BuildSettingsPanel();
 	// menu_body_panel(): oak fill, 2px black border, 18px content margin, plus
 	// the drop shadow Slate brushes cannot express -- see the .cpp.
 	TSharedRef<class SWidget> WrapInPanelFrame(TSharedRef<class SWidget> Content);

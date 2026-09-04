@@ -2,6 +2,7 @@
 
 #include "SVoxelCoverImage.h"
 #include "SVoxelMenuButton.h"
+#include "VoxelGraphicsUserSettings.h"
 #include "VoxelEarthUI.h"
 #include "VoxelUIAssetLibrary.h"
 #include "VoxelUIStrings.h"
@@ -122,11 +123,12 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 			+ SWidgetSwitcher::Slot()
 			[
 				// SETTINGS is out of scope this pass (docs/front-end-plan.md
-				// R8). It gets the same placeholder treatment HELP and CREDITS
-				// already have in the Godot build rather than being hidden: the
-				// menu a player sees is the menu that shipped, and a missing
-				// button would be the more visible divergence.
-				BuildMessagePanel(EVoxelMenuPanel::Settings, VoxelUIStrings::SettingsPanelTitle(), VoxelUIStrings::SettingsPanelBody())
+				// R8's placeholder era ended 2026-09-04: the owner asked for a
+				// player-facing graphics toggle, so SETTINGS is a real panel
+				// with one row (Fine Detail Smoothing) and room to grow. Rows
+				// arrive only through the A/B-plus-owner-verdict pipeline --
+				// see VoxelGraphicsUserSettings.h for the doctrine.
+				BuildSettingsPanel()
 			]
 		]
 
@@ -603,6 +605,131 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(EVoxelMenuPanel Panel, con
 		]);
 
 	MessagePanelBackButtons.Add(Panel, BackButton);
+	return Frame;
+}
+
+TSharedRef<SWidget> SVoxelMainMenu::BuildSettingsPanel()
+{
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+	const float HalfSep = L.SubPanelSeparation * 0.5f;
+	TSharedPtr<SVoxelMenuButton> BackButton;
+
+	// Shaped like BuildMessagePanel on purpose (same frame, same Back wiring,
+	// same scroll rule) so keyboard focus and the panel switcher treat it as
+	// one more message panel. The one difference is the row area: a settings
+	// row is label + live toggle + description, and the toggle's text is an
+	// ATTRIBUTE reading the persisted value, so the button never holds state
+	// of its own -- VoxelGraphicsUserSettings is the single authority and a
+	// toggle that failed to persist would VISIBLY fail to flip.
+	TSharedRef<SWidget> Frame = WrapInPanelFrame(
+		SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::SettingsPanelTitle())
+			.Font(Style.Serif(L.SubPanelTitleSize))
+			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
+		]
+		+ SVerticalBox::Slot().FillHeight(1.f).Padding(FMargin(0.f, HalfSep))
+		[
+			SNew(SScrollBox)
+			+ SScrollBox::Slot()
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+					[
+						SNew(STextBlock)
+						.Text(VoxelUIStrings::SettingsFineDetailLabel())
+						.Font(Style.Serif(L.SubPanelBodySize))
+						.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+					]
+					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+					[
+						SNew(SVoxelMenuButton)
+						.Text(TAttribute<FText>::CreateLambda([]()
+						{
+							return VoxelGraphicsUserSettings::GetFineDetailSmoothing()
+							           ? VoxelUIStrings::SettingsToggleOn()
+							           : VoxelUIStrings::SettingsToggleOff();
+						}))
+						.FontSize(L.SaveRowButtonFont)
+						.MinHeight(L.DialogButtonHeight)
+						.MinWidth(L.DialogButtonWidth)
+						.OnClicked_Lambda([]()
+						{
+							VoxelGraphicsUserSettings::SetFineDetailSmoothing(
+							    !VoxelGraphicsUserSettings::GetFineDetailSmoothing());
+							return FReply::Handled();
+						})
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep * 0.5f, 0.f, 0.f))
+				[
+					SNew(STextBlock)
+					.Text(VoxelUIStrings::SettingsFineDetailDesc())
+					.Font(Style.Serif(L.SubPanelBodySize - 4))
+					.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+					.AutoWrapText(true)
+				]
+				// Row 2: Faster Terrain Drawing (temporal ray priming),
+				// default ON, owner-approved 2026-09-04. Same shape as row 1;
+				// a third row is another copy of this block -- refactor to a
+				// row builder at three.
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep, 0.f, 0.f))
+				[
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+					[
+						SNew(STextBlock)
+						.Text(VoxelUIStrings::SettingsFasterTerrainLabel())
+						.Font(Style.Serif(L.SubPanelBodySize))
+						.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+					]
+					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+					[
+						SNew(SVoxelMenuButton)
+						.Text(TAttribute<FText>::CreateLambda([]()
+						{
+							return VoxelGraphicsUserSettings::GetFasterTerrainDrawing()
+							           ? VoxelUIStrings::SettingsToggleOn()
+							           : VoxelUIStrings::SettingsToggleOff();
+						}))
+						.FontSize(L.SaveRowButtonFont)
+						.MinHeight(L.DialogButtonHeight)
+						.MinWidth(L.DialogButtonWidth)
+						.OnClicked_Lambda([]()
+						{
+							VoxelGraphicsUserSettings::SetFasterTerrainDrawing(
+							    !VoxelGraphicsUserSettings::GetFasterTerrainDrawing());
+							return FReply::Handled();
+						})
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep * 0.5f, 0.f, 0.f))
+				[
+					SNew(STextBlock)
+					.Text(VoxelUIStrings::SettingsFasterTerrainDesc())
+					.Font(Style.Serif(L.SubPanelBodySize - 4))
+					.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+					.AutoWrapText(true)
+				]
+			]
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
+		[
+			SAssignNew(BackButton, SVoxelMenuButton)
+			.Text(VoxelUIStrings::ButtonBack())
+			.FontSize(L.SaveRowButtonFont)
+			.MinHeight(L.DialogButtonHeight)
+			.MinWidth(L.DialogButtonWidth)
+			.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); return FReply::Handled(); })
+		]);
+
+	MessagePanelBackButtons.Add(EVoxelMenuPanel::Settings, BackButton);
 	return Frame;
 }
 

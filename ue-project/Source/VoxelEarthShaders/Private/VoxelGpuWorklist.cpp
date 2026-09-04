@@ -104,6 +104,17 @@ namespace
 	// FIRST, then the sequence (release); the game thread reads the sequence
 	// (acquire) before the values.
 	std::atomic<uint32> GProofLandedSeq{ 0 };
+	// --- P2 (voxel.GPU.AsyncGen) engagement counters, render thread ---------
+	// File-scope atomics for the GProof reason verbatim (written inside
+	// render commands / the scene delegate, one worklist exists in practice).
+	// sceneWindows: generation windows the SCENE builder consumed (the
+	// overlap actually engaged); serialFallbacks: windows the next flush had
+	// to build on graphics because no scene rendered (correct, no overlap);
+	// windowsDropped: claim-less windows overwritten unconsumed (safe --
+	// nothing ever reads a claim-less window's arena slices).
+	std::atomic<int64> GAsyncGenSceneWindows{ 0 };
+	std::atomic<int64> GAsyncGenSerialFallbacks{ 0 };
+	std::atomic<int64> GAsyncGenWindowsDropped{ 0 };
 	std::atomic<uint32> GProofGpuConsumed{ 0 };
 	std::atomic<uint32> GProofGpuFold{ 0 };
 	std::atomic<uint32> GProofGpuBad{ 0 };
@@ -646,6 +657,50 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 	}
 	CumClaimStaged += ClaimStagedThisFlush;
 
+	// --- P2 (voxel.GPU.AsyncGen): the one-slot deferred-claim pipeline ------
+	//
+	// bAsyncGenArmed is the manager's per-tick latch (it computes the
+	// effective arm ONCE per tick, so a cvar flip can never split a flush
+	// into half-deferred state -- house rule: the pass flags and the deferred
+	// publication move TOGETHER or not at all). Three moves here:
+	//
+	//   * HeadClaim: the claim work flush N-1 stashed. Captured into THIS
+	//     flush's render command unconditionally -- even if the arm dropped
+	//     this tick -- because window N-1's records were uploaded with bit 10
+	//     set and consumed; if their claim never ran they would be chunks the
+	//     host believes published that nothing ever landed.
+	//   * DeferredClaim: THIS window's claim work, stashed for flush N+1.
+	//     Only when the arm is up, the claim stage is armed and something was
+	//     actually staged -- an empty window has nothing to publish and must
+	//     not inflate the engagement counters.
+	//   * The counters: counted at PUBLISH-enqueue time (HeadClaim consumed),
+	//     which is the "batches published deferred" number the window line
+	//     prints. It can FAIL two ways: staying 0 while wlclaim hostStaged
+	//     grows (deferral armed, head never runs), or growing while
+	//     gpuClaimed (stats[16]) stays flat (head enqueued, kernel dark).
+	const bool bAsyncGen = bAsyncGenArmed;
+	const FDeferredClaimStash HeadClaim = DeferredClaim;
+	DeferredClaim = FDeferredClaimStash{};
+	if (bAsyncGen && IsClaimStageArmed() && ClaimStagedThisFlush > 0)
+	{
+		DeferredClaim.bValid = true;
+		// The CLAMPED budget (the cell-budget clamp above already ran), so
+		// the deferred claim buffer is sized by the same number the args
+		// kernel used for this window -- an identity, not a hope.
+		DeferredClaim.BudgetRecords = FMath::Max(SliceBudgetRecords, 1u);
+		DeferredClaim.bVerify = bClaimVerifyArmed;
+		DeferredClaim.StagedRecords = ClaimStagedThisFlush;
+	}
+	// The manager's publish trigger -- set from the STASH being consumed, not
+	// from the arm, so a mid-leg toggle can never strand a published-in-
+	// flight batch (see the accessor's comment).
+	bLastFlushCarriedDeferredClaim = HeadClaim.bValid;
+	if (HeadClaim.bValid)
+	{
+		++CumDeferredClaimBatches;
+		CumDeferredClaimRecords += int64(HeadClaim.StagedRecords);
+	}
+
 	// Slot folds for the records being uploaded this flush -- BEFORE the
 	// consume-fold mirror below, because the args pass sees HeadCursor ==
 	// NewHead and can consume a record the same tick it arrives. AFTER the
@@ -907,12 +962,17 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		 bClaim = IsClaimStageArmed(),
 		 bClaimVerify = IsClaimStageArmed() && bClaimVerifyArmed,
 		 ClaimBinder = ClaimPoolBinder,
+		 // P2: the per-tick arm latch and the PREVIOUS window's claim stash,
+		 // both plain values -- see their staging above for the contract.
+		 bAsyncGen, HeadClaim,
 		 StampInstances = MoveTemp(FlushInstances),
 		 StampColStarts = MoveTemp(FlushColStarts),
 		 StampSpans = MoveTemp(FlushSpans),
 		 Atlas = ColumnAtlas,
 		 ColSeedLo = ColumnSeedLo, ColSeedHi = ColumnSeedHi,
-		 ColPixelSizeMm = ColumnPixelSizeMm](FRHICommandListImmediate& RHICmdList)
+		 // mutable (P2): the stamp blob arrays are MOVED into the pending-gen
+		 // stash on the async path instead of being uploaded here.
+		 ColPixelSizeMm = ColumnPixelSizeMm](FRHICommandListImmediate& RHICmdList) mutable
 	{
 		// Land any outstanding proof copy BEFORE building this tick's graph:
 		// Lock/Unlock want a quiescent readback, and the values must be
@@ -989,6 +1049,53 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		FRDGBufferRef Args = GraphBuilder.RegisterExternalBuffer(PooledArgs, TEXT("Voxel.WorklistArgs"));
 		FRDGBufferRef Control = GraphBuilder.RegisterExternalBuffer(PooledControl, TEXT("Voxel.WorklistControl"));
 
+		// --- P2: PUBLISH WINDOW N-1 AT THE HEAD, before anything below ------
+		//
+		// PASS-ADD ORDER IS THE WHOLE CORRECTNESS ARGUMENT, stated once here:
+		// same-pipe RDG passes execute in add order, so adding the deferred
+		// claim BEFORE this flush's ring-upload copies and args pass means it
+		// reads window N-1 through the ring slots, Control cursor and args
+		// triples EXACTLY as flush N-1 left them -- the copies/args that
+		// overwrite them for window N are later passes. The same ordering
+		// closes the ring-wrap hazard (an upload landing in a just-consumed
+		// slot cannot outrun a claim added before it) and the arena-reuse
+		// hazard (window N's generation, wherever it runs, is ordered after
+		// these reads by RDG's WAR tracking -- and it runs on the async pipe,
+		// so it is the ASYNC side that briefly waits, never graphics).
+		//
+		// The serial fallback: if NO scene rendered between the two flushes,
+		// the stashed generation window was never dispatched -- its arenas
+		// hold stale bytes and the claim below would publish garbage. Build
+		// it HERE instead, graphics pipe, before the claim: one window of the
+		// shipped serialization, counted, correctness independent of a frame
+		// ever being rendered. A still-valid stash WITHOUT a head claim is
+		// left alone -- it is a claim-less window (nothing will ever read its
+		// slices) and the storage site below drops and counts it.
+		if (HeadClaim.bValid)
+		{
+			if (PendingGen.bValid)
+			{
+				GAsyncGenSerialFallbacks.fetch_add(1, std::memory_order_relaxed);
+				static bool bSerialFallbackLogged = false;
+				if (!bSerialFallbackLogged)
+				{
+					bSerialFallbackLogged = true;
+					UE_LOG(LogVoxelGpuWorklist, Warning,
+					       TEXT("[gpu-worklist] asyncGen SERIAL FALLBACK: no scene render consumed ")
+					       TEXT("the deferred generation window, so it is being built on the ")
+					       TEXT("graphics pipe ahead of its claim. Correct, but it buys no ")
+					       TEXT("overlap; frequent fallbacks mean frames are not rendering. ")
+					       TEXT("Logged once; the count is on the wlclaim line."));
+				}
+				FPendingGenWindow FallbackWindow = MoveTemp(PendingGen);
+				PendingGen = FPendingGenWindow{};
+				RenderThread_AddGenStages(GraphBuilder, MoveTemp(FallbackWindow),
+				                          /*bAsyncCompute*/ false);
+			}
+			RenderThread_AddClaimPasses(GraphBuilder, RHICmdList, ClaimBinder,
+			                            HeadClaim.BudgetRecords, HeadClaim.bVerify);
+		}
+
 		if (StagedNow.Num() > 0)
 		{
 			// Upload the new segment as a transient staging buffer, then copy
@@ -1035,348 +1142,62 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistArgs"), Shader, Params,
 			FIntVector(1, 1, 1));
 
-		// --- the CONVERTED Column stage: ONE indirect dispatch per tick -----
+		// --- the CONVERTED generation stages (P3), or their P2 stash --------
 		//
-		// Group count = Take * 16 off the triple the args pass just wrote;
-		// the CPU never sees it. Every consumed record's 1,024 columns land
-		// in the persistent arena at slice (mono - consumeFirst) * 1024; the
-		// batch graph -- whose render command was enqueued AFTER this one, so
-		// it executes after -- reads each chunk's slice through worldgen.ush's
-		// ColumnReadBase instead of running its own ColumnMain pass. This
-		// replaces one pass per CHUNK with one per TICK for this stage: the
-		// measured arithmetic is 15 passes/chunk x 2,108 chunks/s = 31,620
-		// passes/s (1.1x the ~500/tick hitch cliff) on the classic shape,
-		// against ~3 constant spine passes + 14 per chunk with this armed.
-		// The dispatch is recorded even at Take == 0 (zero groups): constant
-		// pass count per tick is the property being bought.
+		// Sync (voxel.GPU.AsyncGen 0 -- the shipped shape): the stage
+		// dispatches are added HERE via RenderThread_AddGenStages, graphics
+		// pipe, claim included -- pass for pass the pre-P2 graph (the
+		// factoring moved the text, not the passes). Async: the window is
+		// STASHED for the scene builder (the manager's post-opaque delegate
+		// -> RenderThread_AddPendingGenToSceneGraph) and the claim was
+		// stashed game-side for the NEXT flush's head; this graph then
+		// carries only the head publication, the uploads, the args pass and
+		// the prover -- all graphics, none of it consuming an async output,
+		// which is what keeps this builder's epilogue join vacuous.
 		if (bColumns && Atlas != nullptr)
 		{
-			if (!PooledColumnArena.IsValid())
+			FPendingGenWindow Window;
+			Window.bValid = true;
+			Window.SliceBudgetRecords = SliceBudgetRecords;
+			Window.bVoxelize = bVoxelize;
+			Window.bClassify = bClassify;
+			Window.bStamp = bStamp;
+			Window.bPack = bPack;
+			Window.Atlas = Atlas;
+			Window.SeedLo = ColSeedLo;
+			Window.SeedHi = ColSeedHi;
+			Window.PixelSizeMm = ColPixelSizeMm;
+			Window.StampInstances = MoveTemp(StampInstances);
+			Window.StampColStarts = MoveTemp(StampColStarts);
+			Window.StampSpans = MoveTemp(StampSpans);
+			if (bAsyncGen)
 			{
-				// Lazy, in the first armed flush's own render command:
-				// AllocatePooledBuffer, NOT an RDG transient, because the
-				// batch graph reads it -- and NOT QueueBufferExtraction from
-				// a graph, because tonight's sibling lesson is that RDG
-				// refuses to extract what no pass wrote. Sized to the latched
-				// slice budget: Take <= SliceBudget by construction.
-				ColumnArenaRecords = FMath::Max(SliceBudgetRecords, 1u);
-				PooledColumnArena = AllocatePooledBuffer(
-					FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelGpuColumnSample),
-					                                     ColumnArenaRecords * kColumnsPerRecord),
-					TEXT("Voxel.WorklistColumnArena"));
-				UE_LOG(LogVoxelGpuWorklist, Log,
-				       TEXT("[gpu-worklist] column arena created: %u slices x %u columns ")
-				       TEXT("(%.1f MiB); Column stage dispatching indirect from this flush on."),
-				       ColumnArenaRecords, kColumnsPerRecord,
-				       double(ColumnArenaRecords * kColumnsPerRecord *
-				              sizeof(FVoxelGpuColumnSample)) / (1024.0 * 1024.0));
+				// A still-valid stash here can only be a CLAIM-LESS window:
+				// a claim-carrying one was serial-built at the head of this
+				// very graph (the head runs first), and under AsyncGen the
+				// manager converts ONLY claim-fed jobs, so nothing -- not
+				// the batch graph, not a claim -- ever reads a claim-less
+				// window's arena slices. Overwriting it abandons bytes with
+				// no readers; counted, never silent.
+				if (PendingGen.bValid)
+				{
+					GAsyncGenWindowsDropped.fetch_add(1, std::memory_order_relaxed);
+				}
+				PendingGen = MoveTemp(Window);
 			}
-			FRDGBufferRef Arena = GraphBuilder.RegisterExternalBuffer(
-				PooledColumnArena, TEXT("Voxel.WorklistColumnArena"));
-
-			VoxelGpuWorldGen::FWorklistColumnDispatch Dispatch;
-			Dispatch.Records = Records;
-			Dispatch.Control = Control;
-			Dispatch.IndirectArgs = Args;
-			Dispatch.IndirectArgsOffset =
-				uint32(EVoxelWorklistStage::Column) * 3u * uint32(sizeof(uint32));
-			Dispatch.RingCapacity = Capacity;
-			Dispatch.ColumnArena = Arena;
-			Dispatch.Atlas = Atlas;
-			Dispatch.SeedLo = ColSeedLo;
-			Dispatch.SeedHi = ColSeedHi;
-			Dispatch.PixelSizeMm = ColPixelSizeMm;
-			VoxelGpuWorldGen::AddWorklistColumnPass(GraphBuilder, Dispatch);
-
-			// --- the CONVERTED Voxelize stage: SECOND indirect dispatch -----
-			//
-			// Reads the column arena the pass above just wrote (RDG orders
-			// the two by that dependency), writes the cell arena the batch
-			// graph's BrickClassify/BrickPack will read through CellReadBase.
-			// One pass per tick for this stage too; asset records early-out
-			// inside the kernel (group-uniform) and keep their classic
-			// Voxelize + AssetStamp. Recorded even at Take == 0 -- the
-			// constant-pass-per-tick property, stage 1's reason verbatim.
-			if (bVoxelize)
+			else
 			{
-				if (!PooledCellArena.IsValid())
+				RenderThread_AddGenStages(GraphBuilder, MoveTemp(Window),
+				                          /*bAsyncCompute*/ false);
+				// The same-tick claim, exactly the pre-P2 nesting: the claim
+				// sources from the pack arenas and sizes from totals, so the
+				// full chain must be armed -- restated by condition what the
+				// old nesting stated by structure.
+				if (bVoxelize && bClassify && bPack && bClaim)
 				{
-					// Lazy, AllocatePooledBuffer, batch-graph-readable: the
-					// column arena's reasons verbatim. Sized to the CLAMPED
-					// budget -- the clamp at the top of Flush is what makes
-					// "Take fits the arena" an identity, not a hope.
-					CellArenaRecords = FMath::Max(SliceBudgetRecords, 1u);
-					PooledCellArena = AllocatePooledBuffer(
-						FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),
-						                                     CellArenaRecords * kCellsPerRecord),
-						TEXT("Voxel.WorklistCellArena"));
-					UE_LOG(LogVoxelGpuWorklist, Log,
-					       TEXT("[gpu-worklist] cell arena created: %u slices x %u cells ")
-					       TEXT("(%.1f MiB); Voxelize stage dispatching indirect from this ")
-					       TEXT("flush on (per-flush consume clamped to %u records)."),
-					       CellArenaRecords, kCellsPerRecord,
-					       double(CellArenaRecords) * double(kCellsPerRecord) *
-					       double(sizeof(uint32)) / (1024.0 * 1024.0),
-					       CellArenaRecords);
-				}
-				FRDGBufferRef CellArena = GraphBuilder.RegisterExternalBuffer(
-					PooledCellArena, TEXT("Voxel.WorklistCellArena"));
-
-				VoxelGpuWorldGen::FWorklistVoxelizeDispatch VDispatch;
-				VDispatch.Records = Records;
-				VDispatch.Control = Control;
-				VDispatch.IndirectArgs = Args;
-				VDispatch.IndirectArgsOffset =
-					uint32(EVoxelWorklistStage::Voxelize) * 3u * uint32(sizeof(uint32));
-				VDispatch.RingCapacity = Capacity;
-				VDispatch.ColumnArena = Arena;
-				VDispatch.CellArena = CellArena;
-				VDispatch.Atlas = Atlas;
-				VDispatch.SeedLo = ColSeedLo;
-				VDispatch.SeedHi = ColSeedHi;
-				VDispatch.PixelSizeMm = ColPixelSizeMm;
-				VoxelGpuWorldGen::AddWorklistVoxelizePass(GraphBuilder, VDispatch);
-
-				// --- AssetStamp gather: between voxelize and classify -------
-				//
-				// Stamps every stamps-staged record's instances into its cell
-				// arena slice, in slice order inside one thread -- the
-				// order-preserving form. BETWEEN the two dispatches because
-				// classify must see the stamped cells, and INSIDE this graph
-				// so the batch graph still only ever reads the arena.
-				// Dispatched whenever armed (constant pass shape); with an
-				// empty blob every record early-outs on bit 9 and the dummy
-				// one-element buffers below are never read.
-				if (bStamp)
-				{
-					const auto MakeBlobBuffer = [&](const TCHAR* Name, const void* Data,
-					                                uint32 Elements, uint32 Stride)
-					{
-						// A zero-element structured buffer is not creatable;
-						// a one-element dummy is never read (bit 9 gates).
-						static const uint32 Zero[12] = { 0 };
-						const bool bEmpty = Elements == 0;
-						return CreateStructuredBuffer(
-							GraphBuilder, Name, Stride,
-							bEmpty ? 1 : int32(Elements),
-							bEmpty ? Zero : Data,
-							(bEmpty ? 1 : Elements) * Stride);
-					};
-					VoxelGpuWorldGen::FWorklistAssetStampDispatch SDispatch;
-					SDispatch.Records = Records;
-					SDispatch.Control = Control;
-					SDispatch.IndirectArgs = Args;
-					SDispatch.IndirectArgsOffset =
-						uint32(EVoxelWorklistStage::AssetStamp) * 3u * uint32(sizeof(uint32));
-					SDispatch.RingCapacity = Capacity;
-					SDispatch.CellArena = CellArena;
-					SDispatch.Instances = MakeBlobBuffer(
-						TEXT("Voxel.WorklistAssetInstances"), StampInstances.GetData(),
-						uint32(StampInstances.Num()), sizeof(FVoxelWorklistAssetInstance));
-					SDispatch.ColStarts = MakeBlobBuffer(
-						TEXT("Voxel.WorklistAssetColStarts"), StampColStarts.GetData(),
-						uint32(StampColStarts.Num()), sizeof(uint32));
-					SDispatch.Spans = MakeBlobBuffer(
-						TEXT("Voxel.WorklistAssetSpans"), StampSpans.GetData(),
-						uint32(StampSpans.Num()), sizeof(uint32));
-					VoxelGpuWorldGen::AddWorklistAssetStampPass(GraphBuilder, SDispatch);
-				}
-
-				// --- fused ClassifyTotals: THIRD and FOURTH indirect --------
-				//
-				// Reads the cell arena the voxelize pass just filled; writes
-				// the five small arenas (~1 KiB per record) the batch graph's
-				// BrickPackMain and claim pass read through their read
-				// bases. Nested under bVoxelize because the cell arena is
-				// this stage's input -- IsClassifyStageArmed() already
-				// implies it, restated by structure.
-				if (bClassify)
-				{
-					if (!PooledOccCountsArena.IsValid())
-					{
-						ClassifyArenaRecords = FMath::Max(SliceBudgetRecords, 1u);
-						const auto MakeArena = [&](uint32 DwordsPerRecord, const TCHAR* Name)
-						{
-							return AllocatePooledBuffer(
-								FRDGBufferDesc::CreateStructuredDesc(
-									sizeof(uint32), ClassifyArenaRecords * DwordsPerRecord),
-								Name);
-						};
-						PooledOccCountsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistOccCounts"));
-						PooledMatCountsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistMatCounts"));
-						PooledOccOffsetsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistOccOffsets"));
-						PooledMatOffsetsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistMatOffsets"));
-						PooledTotalsArena = MakeArena(2, TEXT("Voxel.WorklistTotals"));
-						UE_LOG(LogVoxelGpuWorklist, Log,
-						       TEXT("[gpu-worklist] classify arenas created: %u slices x ")
-						       TEXT("(4 x %u + 2) dwords (%.1f KiB); fused ClassifyTotals ")
-						       TEXT("dispatching indirect from this flush on."),
-						       ClassifyArenaRecords, kBricksPerRecord,
-						       double(ClassifyArenaRecords) * double(4 * kBricksPerRecord + 2)
-						       * double(sizeof(uint32)) / 1024.0);
-					}
-					VoxelGpuWorldGen::FWorklistClassifyDispatch CDispatch;
-					CDispatch.Records = Records;
-					CDispatch.Control = Control;
-					CDispatch.IndirectArgs = Args;
-					CDispatch.ClassifyArgsOffset =
-						uint32(EVoxelWorklistStage::Classify) * 3u * uint32(sizeof(uint32));
-					CDispatch.TotalsArgsOffset =
-						uint32(EVoxelWorklistStage::ClassifyTotals) * 3u * uint32(sizeof(uint32));
-					CDispatch.RingCapacity = Capacity;
-					CDispatch.CellArena = CellArena;
-					CDispatch.OccCounts = GraphBuilder.RegisterExternalBuffer(
-						PooledOccCountsArena, TEXT("Voxel.WorklistOccCounts"));
-					CDispatch.MatCounts = GraphBuilder.RegisterExternalBuffer(
-						PooledMatCountsArena, TEXT("Voxel.WorklistMatCounts"));
-					CDispatch.OccOffsets = GraphBuilder.RegisterExternalBuffer(
-						PooledOccOffsetsArena, TEXT("Voxel.WorklistOccOffsets"));
-					CDispatch.MatOffsets = GraphBuilder.RegisterExternalBuffer(
-						PooledMatOffsetsArena, TEXT("Voxel.WorklistMatOffsets"));
-					CDispatch.Totals = GraphBuilder.RegisterExternalBuffer(
-						PooledTotalsArena, TEXT("Voxel.WorklistTotals"));
-					VoxelGpuWorldGen::AddWorklistClassifyPasses(GraphBuilder, CDispatch);
-
-					// --- Pack: FIFTH indirect (+ the mask-arena clear) ------
-					//
-					// Reads the cell arena and the classify stage's offset
-					// arenas; writes the pack arenas the batch graph's
-					// claim/write passes consume through their read bases.
-					// The chunk-mask arena is InterlockedOr-accumulated, so
-					// it is CLEARED here first, every flush -- the host
-					// precondition brickpack.ush states, kept as one small
-					// constant pass per tick.
-					if (bPack)
-					{
-						if (!PooledPackDescArena.IsValid())
-						{
-							PackArenaRecords = FMath::Max(SliceBudgetRecords, 1u);
-							const auto MakePackArena =
-								[&](uint32 BytesPerElement, uint32 ElementsPerRecord, const TCHAR* Name)
-							{
-								return AllocatePooledBuffer(
-									FRDGBufferDesc::CreateStructuredDesc(
-										BytesPerElement, PackArenaRecords * ElementsPerRecord),
-									Name);
-							};
-							PooledPackDescArena = MakePackArena(sizeof(uint32) * 2, kBricksPerRecord,
-							                                    TEXT("Voxel.WorklistPackDesc"));
-							PooledPackOccArena = MakePackArena(sizeof(uint32), kOccWordsPerRecord,
-							                                   TEXT("Voxel.WorklistPackOcc"));
-							PooledPackMatArena = MakePackArena(sizeof(uint32), kMatWordsPerRecord,
-							                                   TEXT("Voxel.WorklistPackMat"));
-							PooledPackSkipArena = MakePackArena(sizeof(uint32), kSkipWordsPerRecord,
-							                                    TEXT("Voxel.WorklistPackSkip"));
-							PooledPackMaskArena = MakePackArena(sizeof(uint32), kMaskDwordsPerRecord,
-							                                    TEXT("Voxel.WorklistPackMask"));
-							UE_LOG(LogVoxelGpuWorklist, Log,
-							       TEXT("[gpu-worklist] pack arenas created: %u slices ")
-							       TEXT("(desc 64x8B, occ %u, mat %u, skip %u, mask %u dwords ")
-							       TEXT("per record; %.1f MiB total); Pack stage dispatching ")
-							       TEXT("indirect from this flush on."),
-							       PackArenaRecords, kOccWordsPerRecord, kMatWordsPerRecord,
-							       kSkipWordsPerRecord, kMaskDwordsPerRecord,
-							       double(PackArenaRecords) *
-							       double(kBricksPerRecord * 2 + kOccWordsPerRecord +
-							              kMatWordsPerRecord + kSkipWordsPerRecord +
-							              kMaskDwordsPerRecord) * 4.0 / (1024.0 * 1024.0));
-						}
-						FRDGBufferRef PackDesc = GraphBuilder.RegisterExternalBuffer(
-							PooledPackDescArena, TEXT("Voxel.WorklistPackDesc"));
-						FRDGBufferRef PackOcc = GraphBuilder.RegisterExternalBuffer(
-							PooledPackOccArena, TEXT("Voxel.WorklistPackOcc"));
-						FRDGBufferRef PackMat = GraphBuilder.RegisterExternalBuffer(
-							PooledPackMatArena, TEXT("Voxel.WorklistPackMat"));
-						FRDGBufferRef PackSkip = GraphBuilder.RegisterExternalBuffer(
-							PooledPackSkipArena, TEXT("Voxel.WorklistPackSkip"));
-						FRDGBufferRef PackMask = GraphBuilder.RegisterExternalBuffer(
-							PooledPackMaskArena, TEXT("Voxel.WorklistPackMask"));
-						AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(PackMask), 0u);
-
-						VoxelGpuWorldGen::FWorklistPackDispatch PDispatch;
-						PDispatch.Records = Records;
-						PDispatch.Control = Control;
-						PDispatch.IndirectArgs = Args;
-						PDispatch.IndirectArgsOffset =
-							uint32(EVoxelWorklistStage::PackClaim) * 3u * uint32(sizeof(uint32));
-						PDispatch.RingCapacity = Capacity;
-						PDispatch.CellArena = CellArena;
-						PDispatch.OccOffsets = CDispatch.OccOffsets;
-						PDispatch.MatOffsets = CDispatch.MatOffsets;
-						PDispatch.Desc = PackDesc;
-						PDispatch.Occ = PackOcc;
-						PDispatch.Mat = PackMat;
-						PDispatch.Skip = PackSkip;
-						PDispatch.Mask = PackMask;
-						VoxelGpuWorldGen::AddWorklistPackPass(GraphBuilder, PDispatch);
-
-						// --- Claim: SIXTH/SEVENTH/EIGHTH indirect (P3 stage 6)
-						//
-						// The claim + both word copies + desc/record (+ the
-						// byte gate, verify arm), sourcing from the pack
-						// arenas the dispatch above just filled and landing
-						// in the POOL -- whose buffers the manager's binder
-						// registers into THIS graph. A binder failure lands
-						// nothing and logs once: the affected records' slots
-						// stay unwritten (the P1 xcheck's `unwritten`
-						// reading), never corrupted.
-						if (bClaim)
-						{
-							FPoolBindings PoolB;
-							const bool bBound = ClaimBinder
-								&& ClaimBinder(GraphBuilder, RHICmdList, PoolB)
-								&& PoolB.IsValid();
-							if (bBound)
-							{
-								VoxelGpuWorldGen::FWorklistClaimDispatch KDispatch;
-								KDispatch.Records = Records;
-								KDispatch.Control = Control;
-								KDispatch.IndirectArgs = Args;
-								KDispatch.RecordArgsOffset =
-									uint32(EVoxelWorklistStage::Record) * 3u * uint32(sizeof(uint32));
-								KDispatch.WriteArgsOffset =
-									uint32(EVoxelWorklistStage::Write) * 3u * uint32(sizeof(uint32));
-								KDispatch.RingCapacity = Capacity;
-								KDispatch.ClaimBudgetRecords = FMath::Max(SliceBudgetRecords, 1u);
-								KDispatch.Totals = CDispatch.Totals;
-								KDispatch.PackDesc = PackDesc;
-								KDispatch.PackOcc = PackOcc;
-								KDispatch.PackMat = PackMat;
-								KDispatch.PackMask = PackMask;
-								KDispatch.Pool.PoolDesc = PoolB.PoolDesc;
-								KDispatch.Pool.PoolOcc = PoolB.PoolOcc;
-								KDispatch.Pool.PoolMat = PoolB.PoolMat;
-								KDispatch.Pool.PoolTable = PoolB.PoolTable;
-								KDispatch.Pool.AllocState = PoolB.AllocState;
-								KDispatch.Pool.AllocBitmap = PoolB.AllocBitmap;
-								KDispatch.Pool.AllocSide = PoolB.AllocSide;
-								KDispatch.PoolLayout = PoolB.Layout;
-								KDispatch.ChunkRecordDwords = PoolB.ChunkRecordDwords;
-								KDispatch.bVerify = bClaimVerify;
-								// Unconditional: the claim kernel writes its
-								// eligible-record count to stats[16] on every
-								// armed tick. That counter is the one that
-								// would have caught the double claim on the
-								// first leg instead of the fourth.
-								KDispatch.VerifyStats = GraphBuilder.RegisterExternalBuffer(
-									PooledStats, TEXT("Voxel.WorklistStats"));
-								VoxelGpuWorldGen::AddWorklistClaimPasses(GraphBuilder, KDispatch);
-							}
-							else
-							{
-								static bool bBinderFailLogged = false;
-								if (!bBinderFailLogged)
-								{
-									bBinderFailLogged = true;
-									UE_LOG(LogVoxelGpuWorklist, Error,
-									       TEXT("[gpu-worklist] CLAIM STAGE DARK: the pool binder ")
-									       TEXT("failed on an armed flush. Claim-staged records land ")
-									       TEXT("nothing (unwritten slots, missing chunks); the ")
-									       TEXT("classic paths are unaffected. Logged once."));
-								}
-							}
-						}
-					}
+					RenderThread_AddClaimPasses(GraphBuilder, RHICmdList, ClaimBinder,
+					                            FMath::Max(SliceBudgetRecords, 1u),
+					                            bClaimVerify);
 				}
 			}
 		}
@@ -1425,6 +1246,464 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 	Window.Consumed += Take;
 	Window.Pending = Head - Tail;
 	Staged.Reset();
+}
+
+
+// --- P2 (voxel.GPU.AsyncGen): the shared generation-window builder ----------
+//
+// LIFTED VERBATIM from Flush's render lambda (2026-09-03) so the sync path,
+// the scene-builder async path and the no-scene serial fallback build ONE set
+// of passes -- the factoring rule the region graph already lives by ("two
+// graphs that agree today and drift the first time a pass is added"). The
+// only deltas from the lifted text: the captured locals became Window fields,
+// the ring/args/control are (idempotently) registered here, and every
+// dispatch carries the caller's pipe choice.
+//
+// PIPE RULES, stated once: the five stages chain among themselves and read
+// only ring/args/control (graphics-written, earlier), the atlas (graphics-
+// written, earlier command lists) and each other's arenas. On the async pipe
+// they therefore fork at the graph's prologue -- no in-graph graphics
+// producer -- and nothing on the graphics pipe of the SAME graph consumes
+// their outputs (the claim was deferred; the batch graph feeds only
+// claim-fed jobs, which read nothing). The one graphics consumer is next
+// tick's deferred claim, by which time the scene epilogue has already joined
+// the async work and re-fenced the arenas to graphics: the claim pays no
+// fence. That pair of facts -- fork at prologue, first consumer a tick later
+// -- is the entire overlap argument.
+void FVoxelGpuWorklist::RenderThread_AddGenStages(FRDGBuilder& GraphBuilder,
+                                                  FPendingGenWindow&& InWindow,
+                                                  bool bAsyncCompute)
+{
+	check(IsInRenderingThread());
+	check(InWindow.bValid && InWindow.Atlas != nullptr);
+	check(PooledRecords.IsValid() && PooledArgs.IsValid() && PooledControl.IsValid());
+
+	// Idempotent per graph: the flush lambda registered these already on the
+	// sync/fallback paths; in the scene builder this is the first time.
+	FRDGBufferRef Records = GraphBuilder.RegisterExternalBuffer(PooledRecords, TEXT("Voxel.WorklistRecords"));
+	FRDGBufferRef Args = GraphBuilder.RegisterExternalBuffer(PooledArgs, TEXT("Voxel.WorklistArgs"));
+	FRDGBufferRef Control = GraphBuilder.RegisterExternalBuffer(PooledControl, TEXT("Voxel.WorklistControl"));
+
+	// --- the CONVERTED Column stage: ONE indirect dispatch per tick --------
+	//
+	// Group count = Take * 16 off the triple the args pass wrote; the CPU
+	// never sees it. Every consumed record's 1,024 columns land in the
+	// persistent arena at slice (mono - consumeFirst) * 1024. The dispatch
+	// is recorded even at Take == 0 (zero groups): constant pass count per
+	// tick is the property being bought.
+	if (!PooledColumnArena.IsValid())
+	{
+		// Lazy, in the first armed dispatch's own render-thread code path:
+		// AllocatePooledBuffer, NOT an RDG transient, because later graphs
+		// read it -- and NOT QueueBufferExtraction from a graph, because RDG
+		// refuses to extract what no pass wrote. Sized to the latched slice
+		// budget: Take <= SliceBudget by construction.
+		ColumnArenaRecords = FMath::Max(InWindow.SliceBudgetRecords, 1u);
+		PooledColumnArena = AllocatePooledBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelGpuColumnSample),
+			                                     ColumnArenaRecords * kColumnsPerRecord),
+			TEXT("Voxel.WorklistColumnArena"));
+		UE_LOG(LogVoxelGpuWorklist, Log,
+		       TEXT("[gpu-worklist] column arena created: %u slices x %u columns ")
+		       TEXT("(%.1f MiB); Column stage dispatching indirect from this flush on."),
+		       ColumnArenaRecords, kColumnsPerRecord,
+		       double(ColumnArenaRecords * kColumnsPerRecord *
+		              sizeof(FVoxelGpuColumnSample)) / (1024.0 * 1024.0));
+	}
+	FRDGBufferRef Arena = GraphBuilder.RegisterExternalBuffer(
+		PooledColumnArena, TEXT("Voxel.WorklistColumnArena"));
+
+	VoxelGpuWorldGen::FWorklistColumnDispatch Dispatch;
+	Dispatch.Records = Records;
+	Dispatch.Control = Control;
+	Dispatch.IndirectArgs = Args;
+	Dispatch.IndirectArgsOffset =
+		uint32(EVoxelWorklistStage::Column) * 3u * uint32(sizeof(uint32));
+	Dispatch.RingCapacity = Capacity;
+	Dispatch.ColumnArena = Arena;
+	Dispatch.Atlas = InWindow.Atlas;
+	Dispatch.SeedLo = InWindow.SeedLo;
+	Dispatch.SeedHi = InWindow.SeedHi;
+	Dispatch.PixelSizeMm = InWindow.PixelSizeMm;
+	Dispatch.bAsyncCompute = bAsyncCompute;
+	VoxelGpuWorldGen::AddWorklistColumnPass(GraphBuilder, Dispatch);
+
+	// --- the CONVERTED Voxelize stage: SECOND indirect dispatch ------------
+	//
+	// Reads the column arena the pass above just wrote (RDG orders the two by
+	// that dependency), writes the cell arena. Asset records early-out inside
+	// the kernel (group-uniform) and keep their classic Voxelize + AssetStamp.
+	if (InWindow.bVoxelize)
+	{
+		if (!PooledCellArena.IsValid())
+		{
+			// Lazy, AllocatePooledBuffer, batch-graph-readable: the column
+			// arena's reasons verbatim. Sized to the CLAMPED budget -- the
+			// clamp at the top of Flush is what makes "Take fits the arena"
+			// an identity, not a hope.
+			CellArenaRecords = FMath::Max(InWindow.SliceBudgetRecords, 1u);
+			PooledCellArena = AllocatePooledBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),
+				                                     CellArenaRecords * kCellsPerRecord),
+				TEXT("Voxel.WorklistCellArena"));
+			UE_LOG(LogVoxelGpuWorklist, Log,
+			       TEXT("[gpu-worklist] cell arena created: %u slices x %u cells ")
+			       TEXT("(%.1f MiB); Voxelize stage dispatching indirect from this ")
+			       TEXT("flush on (per-flush consume clamped to %u records)."),
+			       CellArenaRecords, kCellsPerRecord,
+			       double(CellArenaRecords) * double(kCellsPerRecord) *
+			       double(sizeof(uint32)) / (1024.0 * 1024.0),
+			       CellArenaRecords);
+		}
+		FRDGBufferRef CellArena = GraphBuilder.RegisterExternalBuffer(
+			PooledCellArena, TEXT("Voxel.WorklistCellArena"));
+
+		VoxelGpuWorldGen::FWorklistVoxelizeDispatch VDispatch;
+		VDispatch.Records = Records;
+		VDispatch.Control = Control;
+		VDispatch.IndirectArgs = Args;
+		VDispatch.IndirectArgsOffset =
+			uint32(EVoxelWorklistStage::Voxelize) * 3u * uint32(sizeof(uint32));
+		VDispatch.RingCapacity = Capacity;
+		VDispatch.ColumnArena = Arena;
+		VDispatch.CellArena = CellArena;
+		VDispatch.Atlas = InWindow.Atlas;
+		VDispatch.SeedLo = InWindow.SeedLo;
+		VDispatch.SeedHi = InWindow.SeedHi;
+		VDispatch.PixelSizeMm = InWindow.PixelSizeMm;
+		VDispatch.bAsyncCompute = bAsyncCompute;
+		VoxelGpuWorldGen::AddWorklistVoxelizePass(GraphBuilder, VDispatch);
+
+		// --- AssetStamp gather: between voxelize and classify ---------------
+		//
+		// Stamps every stamps-staged record's instances into its cell arena
+		// slice, in slice order inside one thread -- the order-preserving
+		// form. BETWEEN the two dispatches because classify must see the
+		// stamped cells. The blob buffers are transient to whichever graph
+		// finally dispatches this window -- which is exactly why the ARRAYS
+		// ride FPendingGenWindow instead of being uploaded at flush time.
+		// With an empty blob every record early-outs on bit 9 and the dummy
+		// one-element buffers below are never read.
+		if (InWindow.bStamp)
+		{
+			const auto MakeBlobBuffer = [&](const TCHAR* Name, const void* Data,
+			                                uint32 Elements, uint32 Stride)
+			{
+				// A zero-element structured buffer is not creatable; a
+				// one-element dummy is never read (bit 9 gates).
+				static const uint32 Zero[12] = { 0 };
+				const bool bEmpty = Elements == 0;
+				return CreateStructuredBuffer(
+					GraphBuilder, Name, Stride,
+					bEmpty ? 1 : int32(Elements),
+					bEmpty ? Zero : Data,
+					(bEmpty ? 1 : Elements) * Stride);
+			};
+			VoxelGpuWorldGen::FWorklistAssetStampDispatch SDispatch;
+			SDispatch.Records = Records;
+			SDispatch.Control = Control;
+			SDispatch.IndirectArgs = Args;
+			SDispatch.IndirectArgsOffset =
+				uint32(EVoxelWorklistStage::AssetStamp) * 3u * uint32(sizeof(uint32));
+			SDispatch.RingCapacity = Capacity;
+			SDispatch.CellArena = CellArena;
+			SDispatch.Instances = MakeBlobBuffer(
+				TEXT("Voxel.WorklistAssetInstances"), InWindow.StampInstances.GetData(),
+				uint32(InWindow.StampInstances.Num()), sizeof(FVoxelWorklistAssetInstance));
+			SDispatch.ColStarts = MakeBlobBuffer(
+				TEXT("Voxel.WorklistAssetColStarts"), InWindow.StampColStarts.GetData(),
+				uint32(InWindow.StampColStarts.Num()), sizeof(uint32));
+			SDispatch.Spans = MakeBlobBuffer(
+				TEXT("Voxel.WorklistAssetSpans"), InWindow.StampSpans.GetData(),
+				uint32(InWindow.StampSpans.Num()), sizeof(uint32));
+			SDispatch.bAsyncCompute = bAsyncCompute;
+			VoxelGpuWorldGen::AddWorklistAssetStampPass(GraphBuilder, SDispatch);
+		}
+
+		// --- fused ClassifyTotals: THIRD and FOURTH indirect ----------------
+		//
+		// Reads the cell arena the voxelize pass just filled; writes the five
+		// small arenas the claim (and, sync only, the batch graph) read
+		// through their read bases. Nested under bVoxelize because the cell
+		// arena is this stage's input -- IsClassifyStageArmed() already
+		// implies it, restated by structure.
+		if (InWindow.bClassify)
+		{
+			if (!PooledOccCountsArena.IsValid())
+			{
+				ClassifyArenaRecords = FMath::Max(InWindow.SliceBudgetRecords, 1u);
+				const auto MakeArena = [&](uint32 DwordsPerRecord, const TCHAR* Name)
+				{
+					return AllocatePooledBuffer(
+						FRDGBufferDesc::CreateStructuredDesc(
+							sizeof(uint32), ClassifyArenaRecords * DwordsPerRecord),
+						Name);
+				};
+				PooledOccCountsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistOccCounts"));
+				PooledMatCountsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistMatCounts"));
+				PooledOccOffsetsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistOccOffsets"));
+				PooledMatOffsetsArena = MakeArena(kBricksPerRecord, TEXT("Voxel.WorklistMatOffsets"));
+				PooledTotalsArena = MakeArena(2, TEXT("Voxel.WorklistTotals"));
+				UE_LOG(LogVoxelGpuWorklist, Log,
+				       TEXT("[gpu-worklist] classify arenas created: %u slices x ")
+				       TEXT("(4 x %u + 2) dwords (%.1f KiB); fused ClassifyTotals ")
+				       TEXT("dispatching indirect from this flush on."),
+				       ClassifyArenaRecords, kBricksPerRecord,
+				       double(ClassifyArenaRecords) * double(4 * kBricksPerRecord + 2)
+				       * double(sizeof(uint32)) / 1024.0);
+			}
+			VoxelGpuWorldGen::FWorklistClassifyDispatch CDispatch;
+			CDispatch.Records = Records;
+			CDispatch.Control = Control;
+			CDispatch.IndirectArgs = Args;
+			CDispatch.ClassifyArgsOffset =
+				uint32(EVoxelWorklistStage::Classify) * 3u * uint32(sizeof(uint32));
+			CDispatch.TotalsArgsOffset =
+				uint32(EVoxelWorklistStage::ClassifyTotals) * 3u * uint32(sizeof(uint32));
+			CDispatch.RingCapacity = Capacity;
+			CDispatch.CellArena = CellArena;
+			CDispatch.OccCounts = GraphBuilder.RegisterExternalBuffer(
+				PooledOccCountsArena, TEXT("Voxel.WorklistOccCounts"));
+			CDispatch.MatCounts = GraphBuilder.RegisterExternalBuffer(
+				PooledMatCountsArena, TEXT("Voxel.WorklistMatCounts"));
+			CDispatch.OccOffsets = GraphBuilder.RegisterExternalBuffer(
+				PooledOccOffsetsArena, TEXT("Voxel.WorklistOccOffsets"));
+			CDispatch.MatOffsets = GraphBuilder.RegisterExternalBuffer(
+				PooledMatOffsetsArena, TEXT("Voxel.WorklistMatOffsets"));
+			CDispatch.Totals = GraphBuilder.RegisterExternalBuffer(
+				PooledTotalsArena, TEXT("Voxel.WorklistTotals"));
+			CDispatch.bAsyncCompute = bAsyncCompute;
+			VoxelGpuWorldGen::AddWorklistClassifyPasses(GraphBuilder, CDispatch);
+
+			// --- Pack: FIFTH indirect (+ the mask-arena clear) --------------
+			//
+			// Reads the cell arena and the classify stage's offset arenas;
+			// writes the pack arenas the claim consumes through its read
+			// bases. The chunk-mask arena is InterlockedOr-accumulated, so it
+			// is CLEARED here first, every window -- the host precondition
+			// brickpack.ush states. The clear rides the SAME pipe as the pack
+			// (async when async): a graphics clear inside the scene builder
+			// would become an in-graph producer and drag the async fork from
+			// the prologue to the clear's position.
+			if (InWindow.bPack)
+			{
+				if (!PooledPackDescArena.IsValid())
+				{
+					PackArenaRecords = FMath::Max(InWindow.SliceBudgetRecords, 1u);
+					const auto MakePackArena =
+						[&](uint32 BytesPerElement, uint32 ElementsPerRecord, const TCHAR* Name)
+					{
+						return AllocatePooledBuffer(
+							FRDGBufferDesc::CreateStructuredDesc(
+								BytesPerElement, PackArenaRecords * ElementsPerRecord),
+							Name);
+					};
+					PooledPackDescArena = MakePackArena(sizeof(uint32) * 2, kBricksPerRecord,
+					                                    TEXT("Voxel.WorklistPackDesc"));
+					PooledPackOccArena = MakePackArena(sizeof(uint32), kOccWordsPerRecord,
+					                                   TEXT("Voxel.WorklistPackOcc"));
+					PooledPackMatArena = MakePackArena(sizeof(uint32), kMatWordsPerRecord,
+					                                   TEXT("Voxel.WorklistPackMat"));
+					PooledPackSkipArena = MakePackArena(sizeof(uint32), kSkipWordsPerRecord,
+					                                    TEXT("Voxel.WorklistPackSkip"));
+					PooledPackMaskArena = MakePackArena(sizeof(uint32), kMaskDwordsPerRecord,
+					                                    TEXT("Voxel.WorklistPackMask"));
+					UE_LOG(LogVoxelGpuWorklist, Log,
+					       TEXT("[gpu-worklist] pack arenas created: %u slices ")
+					       TEXT("(desc 64x8B, occ %u, mat %u, skip %u, mask %u dwords ")
+					       TEXT("per record; %.1f MiB total); Pack stage dispatching ")
+					       TEXT("indirect from this flush on."),
+					       PackArenaRecords, kOccWordsPerRecord, kMatWordsPerRecord,
+					       kSkipWordsPerRecord, kMaskDwordsPerRecord,
+					       double(PackArenaRecords) *
+					       double(kBricksPerRecord * 2 + kOccWordsPerRecord +
+					              kMatWordsPerRecord + kSkipWordsPerRecord +
+					              kMaskDwordsPerRecord) * 4.0 / (1024.0 * 1024.0));
+				}
+				FRDGBufferRef PackDesc = GraphBuilder.RegisterExternalBuffer(
+					PooledPackDescArena, TEXT("Voxel.WorklistPackDesc"));
+				FRDGBufferRef PackOcc = GraphBuilder.RegisterExternalBuffer(
+					PooledPackOccArena, TEXT("Voxel.WorklistPackOcc"));
+				FRDGBufferRef PackMat = GraphBuilder.RegisterExternalBuffer(
+					PooledPackMatArena, TEXT("Voxel.WorklistPackMat"));
+				FRDGBufferRef PackSkip = GraphBuilder.RegisterExternalBuffer(
+					PooledPackSkipArena, TEXT("Voxel.WorklistPackSkip"));
+				FRDGBufferRef PackMask = GraphBuilder.RegisterExternalBuffer(
+					PooledPackMaskArena, TEXT("Voxel.WorklistPackMask"));
+				AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(PackMask), 0u,
+				                bAsyncCompute ? ERDGPassFlags::AsyncCompute
+				                              : ERDGPassFlags::Compute);
+
+				VoxelGpuWorldGen::FWorklistPackDispatch PDispatch;
+				PDispatch.Records = Records;
+				PDispatch.Control = Control;
+				PDispatch.IndirectArgs = Args;
+				PDispatch.IndirectArgsOffset =
+					uint32(EVoxelWorklistStage::PackClaim) * 3u * uint32(sizeof(uint32));
+				PDispatch.RingCapacity = Capacity;
+				PDispatch.CellArena = CellArena;
+				PDispatch.OccOffsets = CDispatch.OccOffsets;
+				PDispatch.MatOffsets = CDispatch.MatOffsets;
+				PDispatch.Desc = PackDesc;
+				PDispatch.Occ = PackOcc;
+				PDispatch.Mat = PackMat;
+				PDispatch.Skip = PackSkip;
+				PDispatch.Mask = PackMask;
+				PDispatch.bAsyncCompute = bAsyncCompute;
+				VoxelGpuWorldGen::AddWorklistPackPass(GraphBuilder, PDispatch);
+
+				// The Claim stage does NOT live here: publication is graphics
+				// work, and under voxel.GPU.AsyncGen it runs one flush later.
+				// Both callers add it through RenderThread_AddClaimPasses.
+			}
+		}
+	}
+}
+
+// --- P2: the shared Claim-stage builder -------------------------------------
+//
+// Registers everything the claim dispatches need from the pooled members and
+// adds them to the given graph. Two callers, one window apart: the sync path
+// adds it right after the generation stages (the shipped, pre-P2 pass order),
+// and the deferred head adds it at the TOP of the next flush's graph, where
+// ring/control/args still hold the PREVIOUS window's state -- which is the
+// entire deferral mechanism (see the head block in Flush).
+void FVoxelGpuWorklist::RenderThread_AddClaimPasses(FRDGBuilder& GraphBuilder,
+                                                    FRHICommandListImmediate& RHICmdList,
+                                                    const FPoolBinder& Binder,
+                                                    uint32 BudgetRecords, bool bVerify)
+{
+	check(IsInRenderingThread());
+	check(BudgetRecords > 0);
+	// The pack arenas + the totals arena are the claim's sources. They are
+	// created by the first pack-armed generation dispatch, and a claim can
+	// only be staged after such a window ran -- so absence here is a real
+	// wiring defect, never a race. Loud, not fatal: the affected records'
+	// slots stay UNWRITTEN (missing chunks, the P1 xcheck's `unwritten`
+	// reading, and the marcher's record validation reads a zero record as
+	// absent), never corrupted.
+	if (!PooledPackDescArena.IsValid() || !PooledPackOccArena.IsValid() ||
+	    !PooledPackMatArena.IsValid() || !PooledPackMaskArena.IsValid() ||
+	    !PooledTotalsArena.IsValid() || !PooledStats.IsValid())
+	{
+		static bool bClaimSourcesMissingLogged = false;
+		if (!bClaimSourcesMissingLogged)
+		{
+			bClaimSourcesMissingLogged = true;
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] CLAIM SOURCES MISSING: a claim dispatch was requested ")
+			       TEXT("before any pack-armed generation window created the arenas. The ")
+			       TEXT("staged records land nothing (unwritten slots, missing chunks). ")
+			       TEXT("Logged once."));
+		}
+		return;
+	}
+	FPoolBindings PoolB;
+	const bool bBound = Binder
+		&& Binder(GraphBuilder, RHICmdList, PoolB)
+		&& PoolB.IsValid();
+	if (!bBound)
+	{
+		static bool bBinderFailLogged = false;
+		if (!bBinderFailLogged)
+		{
+			bBinderFailLogged = true;
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] CLAIM STAGE DARK: the pool binder ")
+			       TEXT("failed on an armed flush. Claim-staged records land ")
+			       TEXT("nothing (unwritten slots, missing chunks); the ")
+			       TEXT("classic paths are unaffected. Logged once."));
+		}
+		return;
+	}
+
+	FRDGBufferRef Records = GraphBuilder.RegisterExternalBuffer(PooledRecords, TEXT("Voxel.WorklistRecords"));
+	FRDGBufferRef Args = GraphBuilder.RegisterExternalBuffer(PooledArgs, TEXT("Voxel.WorklistArgs"));
+	FRDGBufferRef Control = GraphBuilder.RegisterExternalBuffer(PooledControl, TEXT("Voxel.WorklistControl"));
+
+	VoxelGpuWorldGen::FWorklistClaimDispatch KDispatch;
+	KDispatch.Records = Records;
+	KDispatch.Control = Control;
+	KDispatch.IndirectArgs = Args;
+	KDispatch.RecordArgsOffset =
+		uint32(EVoxelWorklistStage::Record) * 3u * uint32(sizeof(uint32));
+	KDispatch.WriteArgsOffset =
+		uint32(EVoxelWorklistStage::Write) * 3u * uint32(sizeof(uint32));
+	KDispatch.RingCapacity = Capacity;
+	KDispatch.ClaimBudgetRecords = BudgetRecords;
+	KDispatch.Totals = GraphBuilder.RegisterExternalBuffer(
+		PooledTotalsArena, TEXT("Voxel.WorklistTotals"));
+	KDispatch.PackDesc = GraphBuilder.RegisterExternalBuffer(
+		PooledPackDescArena, TEXT("Voxel.WorklistPackDesc"));
+	KDispatch.PackOcc = GraphBuilder.RegisterExternalBuffer(
+		PooledPackOccArena, TEXT("Voxel.WorklistPackOcc"));
+	KDispatch.PackMat = GraphBuilder.RegisterExternalBuffer(
+		PooledPackMatArena, TEXT("Voxel.WorklistPackMat"));
+	KDispatch.PackMask = GraphBuilder.RegisterExternalBuffer(
+		PooledPackMaskArena, TEXT("Voxel.WorklistPackMask"));
+	KDispatch.Pool.PoolDesc = PoolB.PoolDesc;
+	KDispatch.Pool.PoolOcc = PoolB.PoolOcc;
+	KDispatch.Pool.PoolMat = PoolB.PoolMat;
+	KDispatch.Pool.PoolTable = PoolB.PoolTable;
+	KDispatch.Pool.AllocState = PoolB.AllocState;
+	KDispatch.Pool.AllocBitmap = PoolB.AllocBitmap;
+	KDispatch.Pool.AllocSide = PoolB.AllocSide;
+	KDispatch.PoolLayout = PoolB.Layout;
+	KDispatch.ChunkRecordDwords = PoolB.ChunkRecordDwords;
+	KDispatch.bVerify = bVerify;
+	// Unconditional: the claim kernel writes its eligible-record count to
+	// stats[16] on every armed tick. That counter is the one that would have
+	// caught the double claim on the first leg instead of the fourth.
+	KDispatch.VerifyStats = GraphBuilder.RegisterExternalBuffer(
+		PooledStats, TEXT("Voxel.WorklistStats"));
+	VoxelGpuWorldGen::AddWorklistClaimPasses(GraphBuilder, KDispatch);
+}
+
+// --- P2: the scene-builder entry point --------------------------------------
+//
+// Called by the manager's post-opaque render delegate with the SCENE
+// renderer's own FRDGBuilder. THE BUILDER CHOICE IS THE WIN, not a
+// convenience: a standalone builder's epilogue finalises every external
+// buffer back to the graphics pipe (RenderGraphBuilder.cpp,
+// AddLastBufferTransition), so async work dispatched from a flush command
+// would be fence-sandwiched between scene N-1 and scene N -- serialized
+// exactly as the shipped graphics-queue version, which is the null result
+// this comment exists to prevent someone re-earning. Inside the scene
+// builder the chain forks at the prologue (no in-graph graphics producer),
+// overlaps the whole frame -- the marcher included -- and the scene
+// epilogue's join waits only max(0, gen - scene).
+//
+// Render thread only, like every touch of PendingGen. Consumes the stash, so
+// a second view family in the same frame (or a second scene of another
+// world) finds it empty and adds nothing -- any scene builder is an
+// acceptable host because the passes depend on no view state.
+bool FVoxelGpuWorklist::RenderThread_AddPendingGenToSceneGraph(FRDGBuilder& GraphBuilder)
+{
+	check(IsInRenderingThread());
+	if (!PendingGen.bValid)
+	{
+		return false;
+	}
+	FPendingGenWindow TakenWindow = MoveTemp(PendingGen);
+	PendingGen = FPendingGenWindow{};
+	RenderThread_AddGenStages(GraphBuilder, MoveTemp(TakenWindow), /*bAsyncCompute*/ true);
+	GAsyncGenSceneWindows.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+int64 FVoxelGpuWorklist::GetAsyncGenSceneWindows()
+{
+	return GAsyncGenSceneWindows.load(std::memory_order_relaxed);
+}
+
+int64 FVoxelGpuWorklist::GetAsyncGenSerialFallbacks()
+{
+	return GAsyncGenSerialFallbacks.load(std::memory_order_relaxed);
+}
+
+int64 FVoxelGpuWorklist::GetAsyncGenWindowsDropped()
+{
+	return GAsyncGenWindowsDropped.load(std::memory_order_relaxed);
 }
 
 FVoxelGpuWorklist::FBindings FVoxelGpuWorklist::Register(FRDGBuilder& GraphBuilder)
