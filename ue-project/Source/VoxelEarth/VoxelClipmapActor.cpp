@@ -77,6 +77,59 @@ double SampleHeightUU(double WorldXUU, double WorldYUU, const UVoxelWorldSubsyst
 	return FMath::Lerp(Hx0, Hx1, Fy);
 }
 
+// ---- V3 GEOMETRIC VOXELIZATION: the band ladder (2026-09-04) ---------------
+//
+// One formula, two consumers. Band b covers Chebyshev distance
+// [seam*2^b, seam*2^(b+1)) from the shared snapped origin, cell(b) =
+// base * 2^b, clamped at kVoxelizeMaxBand. M_VoxelClipmap's Custom node
+// computes the SAME ladder per pixel from the SAME numbers (pushed as the
+// VoxelizeSeamUU/VoxelizeBaseCellUU/VoxelizeOriginUU parameters by
+// ApplyLevelMaterial/RebuildLevel), so painted cells and geometric terraces
+// cannot drift apart. See VoxelClipmapActor.h's ladder block for the
+// derivation-and-assert story.
+//
+// CHEBYSHEV, NOT RADIAL, AND IT IS LOAD-BEARING. The clipmap levels are
+// SQUARES; under max(|dx|,|dy|) each band boundary is a square that lands
+// EXACTLY on a level boundary (band b flips at seam*2^(b+1) = level b's outer
+// edge = level b+1's hole edge, both 32*spacing_b = 16*spacing_{b+1} from the
+// shared origin). Consequences, all deliberate:
+//   * every interior vertex of level L is in band L -- one cell per level;
+//   * both levels' coincident boundary vertices compute the SAME band from
+//     the SAME exact doubles, so the finer level's edge row quantizes at the
+//     COARSER cell -- the standard "snap the finer edge to the coarser grid"
+//     crack fix falls out of the formula instead of being a special case (the
+//     existing T-junction stitch then closes the odd-offset vertices);
+//   * a radial (Euclidean) band circle would cut through level interiors and
+//     put a quantization step mid-level at a level's corners AND let the two
+//     sides of a level seam disagree; Chebyshev cannot.
+// The comparison loop advances on >=, exact for doubles -- no floor(log2())
+// rounding hazard at the power-of-two boundaries the seams sit on.
+constexpr int32 kVoxelizeMaxBand = 3;
+
+double VoxelizeCellUUForChebyshevUU(double ChebUU, double SeamUU, double BaseCellUU)
+{
+	int32 Band = 0;
+	while (Band < kVoxelizeMaxBand && ChebUU >= SeamUU * double(int64(2) << Band))
+	{
+		++Band;
+	}
+	return BaseCellUU * double(int64(1) << Band);
+}
+
+// Round-to-NEAREST lattice plane, and the convention is copied from
+// voxel-core, not chosen: a voxel is solid iff its centre is at or below
+// surfaceMm (amplifier.h, "solid iff its centre (vz*100+50 mm) is at or below
+// surfaceMm"), which puts the visible top face of a voxel column at
+// round(h/cell)*cell. Quantizing the clipmap the same way means that where
+// the clipmap's height sample and the voxel terrain agree to within half a
+// cell, the two surfaces land on the SAME 12.8 m lattice plane at the seam --
+// floor() would hold the clipmap up to a whole cell BELOW the voxel tops and
+// open a step-down ledge along the entire 8,192 m join.
+double QuantizeHeightUU(double HeightUU, double CellUU)
+{
+	return FMath::FloorToDouble(HeightUU / CellUU + 0.5) * CellUU;
+}
+
 // Snow band (m2-plan.md "Material" row: "white above snowline (2800m,
 // matching amplifier constants)") -- a linear ramp centred on the
 // amplifier's 2800m snowline (voxel-core/src/amplifier.cpp,
@@ -228,8 +281,50 @@ void AVoxelClipmapActor::BeginPlay()
 	bVertexAlbedoActive = VertexAlbedoWeightOverride > 0.0f;
 	// -VoxelClipmapVoxelize=0 restores the smooth far field (control arm for
 	// the virtual-ring voxelization seam A/B); default 1.0 = voxelized, the
-	// owner-accepted direction. See ApplyLevelMaterial's push.
+	// owner-accepted direction. See ApplyLevelMaterial's push. V3 (2026-09-04):
+	// the same switch gates the GEOMETRIC quantization in RebuildLevel -- see
+	// the header's doc on VoxelizeWeightOverride for why one switch arms both.
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapVoxelize="), VoxelizeWeightOverride);
+
+	// --- THE ONE BAND LADDER, derived and checked (v3, 2026-09-04) ----------
+	// Seam = the cascade's ACTIVE outer edge (the same accessor
+	// SpacingUUForLevel keys the whole clipmap off, so the ladder moves with
+	// -VoxelRingOuterMeters/-VoxelMaxRingLevel exactly as the mesh does).
+	// Base cell = the coarsest ring's voxel edge: R0 voxels are
+	// VoxelCoords::VoxelSizeUU (10 UU = 10 cm, static_assert'd against
+	// vxc::kVoxelSizeMm in VoxelWorldSubsystem.cpp) and double per ring, so
+	// the ring the clipmap abuts holds cells of VoxelSizeUU << MaxRingLevel --
+	// 12.8 m at the shipped R7 edge. This is what "the innermost band's cell
+	// equals the voxel terrain across the seam" means, held by derivation.
+	{
+		const int32 MaxRing = UVoxelWorldSubsystem::GetMaxRingLevel();
+		VoxelizeSeamUU = UVoxelWorldSubsystem::GetRingPresets()[MaxRing].OuterMeters * 100.0;
+		VoxelizeBaseCellUU = VoxelCoords::VoxelSizeUU * double(int64(1) << MaxRing);
+
+		// The generated M_VoxelClipmap.uasset carries these SAME numbers as the
+		// scalar parameters' fallback defaults (create_clipmap_material.py,
+		// VoxelizeSeamUU/VoxelizeBaseCellUU). ApplyLevelMaterial pushes the
+		// runtime values onto every level MID, so a cascade override still
+		// renders in step -- but a mismatch here means the ASSET is stale for
+		// this cascade and any no-MID fallback path would voxelize on the wrong
+		// ladder, so say so loudly rather than letting two derivations drift.
+		if (!FMath::IsNearlyEqual(VoxelizeSeamUU, 819200.0) ||
+		    !FMath::IsNearlyEqual(VoxelizeBaseCellUU, 1280.0))
+		{
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("VoxelClipmap band ladder: runtime cascade gives seam=%.0f UU base cell=%.0f UU, ")
+			       TEXT("but the generated material's parameter defaults are 819200/1280. The MID pushes ")
+			       TEXT("correct the shader this run; regen create_clipmap_material.py if the cascade ")
+			       TEXT("change is permanent."),
+			       VoxelizeSeamUU, VoxelizeBaseCellUU);
+		}
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelClipmap voxelize ladder: seam %.0f m, cells %.1f/%.1f/%.1f/%.1f m per band, ")
+		       TEXT("weight %.2f (geometry %s)."),
+		       VoxelizeSeamUU / 100.0, VoxelizeBaseCellUU / 100.0, VoxelizeBaseCellUU / 50.0,
+		       VoxelizeBaseCellUU / 25.0, VoxelizeBaseCellUU / 12.5, VoxelizeWeightOverride,
+		       VoxelizeWeightOverride > 0.f ? TEXT("TERRACED") : TEXT("smooth control arm"));
+	}
 	{
 		int32 SrgbFlag = 1;
 		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapAlbedoSrgb="), SrgbFlag))
@@ -891,6 +986,49 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		}
 	}
 
+	// Pass 1.5 (v3, 2026-09-04): GEOMETRIC voxelization. Quantize every vertex
+	// height to its band's cell on the world-anchored lattice -- real 3D
+	// terraces, so the far field's SILHOUETTE steps the way the voxel
+	// cascade's does (the one thing v2's pixel shader could not do; its
+	// docstring records exactly that limit). Cell choice is
+	// VoxelizeCellUUForChebyshevUU on the vertex's Chebyshev distance from the
+	// shared origin -- see that function's comment for why Chebyshev makes the
+	// band boundaries coincide with the level boundaries and closes the
+	// inter-level crack by construction (finer edge rows land in the coarser
+	// band). QUANTIZED heights are a SEPARATE array on purpose:
+	//   * Positions/normals/the pass-3 stitch read QHeightsUU -- lighting and
+	//     seams must follow the geometry actually drawn;
+	//   * biome classification, SlopeMmPerM and the colour census keep reading
+	//     the RAW HeightsUU -- what grows somewhere is a fact about the
+	//     terrain, not about how blockily we render it, and quantizing the
+	//     classifier's inputs would move vegetation lines when the camera
+	//     crosses a band boundary.
+	// Gated by the SAME switch as the shader arm (-VoxelClipmapVoxelize=0
+	// restores smooth geometry AND smooth shading in one flag, so the control
+	// arm stays a one-flag A/B on one binary).
+	TArray<double> QHeightsUU;
+	QHeightsUU.SetNumUninitialized(NumVertsTotal);
+	const bool bGeoVoxelize = (VoxelizeWeightOverride > 0.f);
+	for (int32 i = 0; i < NumVertsPerSide; ++i)
+	{
+		const double AbsX = FMath::Abs(double(i - HalfIndex) * Spacing);
+		for (int32 j = 0; j < NumVertsPerSide; ++j)
+		{
+			const int32 Idx = i * NumVertsPerSide + j;
+			if (bGeoVoxelize)
+			{
+				const double ChebUU = FMath::Max(AbsX, FMath::Abs(double(j - HalfIndex) * Spacing));
+				const double CellUU = VoxelizeCellUUForChebyshevUU(ChebUU, VoxelizeSeamUU, VoxelizeBaseCellUU);
+				QHeightsUU[Idx] = QuantizeHeightUU(HeightsUU[Idx], CellUU);
+			}
+			else
+			{
+				QHeightsUU[Idx] = HeightsUU[Idx];
+			}
+			Positions[Idx].Z = QHeightsUU[Idx];
+		}
+	}
+
 
 	// Per-level histogram of the surface material this pass computes. See the
 	// print in the census block for why it exists.
@@ -915,10 +1053,15 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 			const int32 JD = (j > 0) ? j - 1 : j;
 			const int32 JU = (j < NumVertsPerSide - 1) ? j + 1 : j;
 
-			const double HL = HeightsUU[IL * NumVertsPerSide + j];
-			const double HR = HeightsUU[IR * NumVertsPerSide + j];
-			const double HD = HeightsUU[i * NumVertsPerSide + JD];
-			const double HU = HeightsUU[i * NumVertsPerSide + JU];
+			// V3 (2026-09-04): normals from the QUANTIZED heights -- the
+			// lighting must follow the terraced geometry actually drawn, and
+			// the shader's riser classifier reads this normal (a flat plateau
+			// must arrive as exactly-up or the terrace paint misfires on it).
+			// The RAW heights still feed SlopeMmPerM/classifyBiome below.
+			const double HL = QHeightsUU[IL * NumVertsPerSide + j];
+			const double HR = QHeightsUU[IR * NumVertsPerSide + j];
+			const double HD = QHeightsUU[i * NumVertsPerSide + JD];
+			const double HU = QHeightsUU[i * NumVertsPerSide + JU];
 
 			const double DhDx = (HR - HL) / (Spacing * (bInteriorX ? 2.0 : 1.0));
 			const double DhDy = (HU - HD) / (Spacing * (bInteriorY ? 2.0 : 1.0));
@@ -1199,10 +1342,19 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		// EVEN offsets from HalfIndex (32) and therefore coincide with a coarser
 		// vertex -- so no odd-offset vertex is ever a corner, and each stitched
 		// vertex has both of its along-edge neighbours on the same edge line.
+		// V3 (2026-09-04): averages the QUANTIZED heights, because the coarser
+		// level's boundary polyline is now drawn through ITS quantized values.
+		// The even-offset edge vertices already match the coarser level's
+		// exactly (same world XY -> same raw sample, and the Chebyshev band
+		// formula puts the whole edge row in the COARSER band -- see
+		// VoxelizeCellUUForChebyshevUU's comment), so the midpoint of two
+		// quantized even neighbours is exactly on the coarser level's edge
+		// chord. Averaging RAW heights here would re-open the crack the
+		// quantization created.
 		const auto StitchEdgeZ = [&](int32 i, int32 j, int32 iA, int32 jA, int32 iB, int32 jB)
 		{
 			Positions[i * NumVertsPerSide + j].Z =
-				0.5 * (HeightsUU[iA * NumVertsPerSide + jA] + HeightsUU[iB * NumVertsPerSide + jB]);
+				0.5 * (QHeightsUU[iA * NumVertsPerSide + jA] + QHeightsUU[iB * NumVertsPerSide + jB]);
 		};
 		for (int32 k = 0; k < NumVertsPerSide; ++k)
 		{
@@ -1282,6 +1434,20 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		VoxelEofLedger::Count(VoxelEofLedger::ESource::Clipmap);
 	}
 
+	// V3 (2026-09-04): the shader's band ladder is anchored at the SAME
+	// snapped origin this rebuild laid the vertices around, pushed per rebuild
+	// because the origin moves with the camera. Without this the shader would
+	// measure bands from the actual camera (v2 behaviour) while the geometry
+	// quantized from the snapped origin -- up to half a fine spacing of
+	// disagreement, i.e. painted cells straddling a geometric band boundary.
+	// Per-LEVEL consistency holds even mid-round-robin: a level not yet
+	// rebuilt keeps its old origin in BOTH its vertices and its MID.
+	if (UMaterialInstanceDynamic* MID = LevelMIDs.IsValidIndex(LevelIndex) ? LevelMIDs[LevelIndex].Get() : nullptr)
+	{
+		MID->SetVectorParameterValue(TEXT("VoxelizeOriginUU"),
+		                             FLinearColor((float)SnappedOriginUU.X, (float)SnappedOriginUU.Y, 0.f, 0.f));
+	}
+
 	PMC->SetRelativeLocation(FVector(SnappedOriginUU.X, SnappedOriginUU.Y, 0.0));
 }
 
@@ -1335,13 +1501,17 @@ void AVoxelClipmapActor::ApplyLevelMaterial(int32 LevelIndex)
 		LevelMIDs.SetNum(NumLevels);
 	}
 
-	const bool bNeedsMID = bSnowOverrideActive || bLastRingsEnabled || bVertexAlbedoActive;
-	if (!bNeedsMID)
-	{
-		LevelMIDs[LevelIndex] = nullptr;
-		PMC->SetMaterial(0, ClipmapMaterial);
-		return;
-	}
+	// V3 (2026-09-04): a MID is now UNCONDITIONAL. The voxelize ladder's
+	// runtime parameters (VoxelizeSeamUU/VoxelizeBaseCellUU here,
+	// VoxelizeOriginUU per rebuild in RebuildLevel) must reach the shader in
+	// every configuration: with voxelization on (the default) the shader needs
+	// the origin the mesh was built around, and with -VoxelClipmapVoxelize=0
+	// the asset's baked default of 1.0 must be overridden DOWN -- which the
+	// old bNeedsMID could skip entirely under -VoxelClipmapVertexAlbedo=0,
+	// leaving the control arm voxelized. The old bNeedsMID early-out
+	// (plain shared material, no MID) is deleted rather than parked: a level
+	// with no MID can no longer render correctly in ANY configuration, so
+	// keeping the path would be keeping a bug behind a flag.
 
 	// UProceduralMeshComponent derives from UMeshComponent (unlike
 	// UVoxelChunkComponent's bare UPrimitiveComponent), so the built-in helper
@@ -1370,6 +1540,14 @@ void AVoxelClipmapActor::ApplyLevelMaterial(int32 LevelIndex)
 	// the override's default equals the material's default, so a flag-free run
 	// is unchanged by this call.
 	MID->SetScalarParameterValue(TEXT("VoxelizeWeight"), VoxelizeWeightOverride);
+	// V3 (2026-09-04): the band ladder, from the ONE derivation in BeginPlay
+	// (see the header's ladder block). The asset's parameter defaults restate
+	// the shipped cascade's numbers; these pushes are what keep the shader on
+	// the runtime cascade if it is ever overridden. VoxelizeOriginUU is pushed
+	// per rebuild in RebuildLevel, because it changes with the snapped origin
+	// and this function only runs on transitions.
+	MID->SetScalarParameterValue(TEXT("VoxelizeSeamUU"), (float)VoxelizeSeamUU);
+	MID->SetScalarParameterValue(TEXT("VoxelizeBaseCellUU"), (float)VoxelizeBaseCellUU);
 	if (bSnowOverrideActive)
 	{
 		MID->SetScalarParameterValue(TEXT("SnowlineLowMeters"), SnowlineLowMetersOverride);

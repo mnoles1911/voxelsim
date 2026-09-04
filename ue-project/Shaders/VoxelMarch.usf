@@ -706,6 +706,47 @@ RWTexture2D<uint2> MarchOutVis;
 RWTexture2D<float> MarchOutHitT;
 RWBuffer<uint>     MarchOutTileHit;
 
+#if VOXEL_MARCH_TEMPORAL_PRIME
+// ---------------------------------------------------------------------------
+// TEMPORAL RAY PRIMING (voxel.March.TemporalPrime) -- perf-redesign Phase 3
+// ---------------------------------------------------------------------------
+//
+// The marcher's OWN previous-frame hit distances, at the march sample grid:
+// one fp32 T (ray parameter in world UU, i.e. CAMERA DISTANCE) per sample,
+// VOXEL_MARCH_PRIME_FAR for a miss. A DISTANCE deliberately, not a position:
+// it is invariant under the 4096-voxel frame-origin snap, so the history
+// needs no rebasing -- every frame-dependent term rides the three uniforms
+// below, which the host rebases into the CURRENT frame's local UU at bind
+// time (doubles on the CPU, smalls here). Bound only on this permutation; off
+// is not merely unread, the globals do not exist (the MarchOutHoleStats
+// rule), which is what makes voxel.March.TemporalPrime 0 byte-identical.
+//
+// THE SENTINEL IS CROSS-REFERENCED BY NAME with the 1x1 fallback clear in
+// VoxelMarchRenderer.cpp (a define cannot be static_asserted across
+// languages). It reads as "previous pixel was sky", and sky never primes.
+#define VOXEL_MARCH_PRIME_FAR 1.0e30f
+// The safety margin, in chunks at the owning ring's level (the locked design
+// value). 2 = 1 chunk for reprojection/footprint error + 1 chunk of
+// float-jump margin, the ZTightPadChunks composition at the per-ray scale.
+#define VOXEL_MARCH_PRIME_MARGIN_CHUNKS 2.0f
+Texture2D<float>   MarchPrimePrevT;
+RWTexture2D<float> MarchOutPrimeT;
+// Camera-relative (PREVIOUS camera, world axes) -> previous frame's clip,
+// jitter-free. See the parameter struct's block in VoxelMarchRenderer.cpp.
+float4x4 MarchPrimePrevCamRelToClip;
+// The previous camera, expressed in the CURRENT march frame's local UU.
+float3 MarchPrimePrevCamLocalUU;
+// The sample grid MarchPrimePrevT covers, in texels.
+float2 MarchPrimePrevSizePx;
+// |camera now - camera then| in UU (see the parameter struct: the reverse
+// triangle inequality makes subtracting this the EXACT prev-distance ->
+// min-current-distance conversion).
+float MarchPrimeCamDeltaUU;
+// 0 = no usable history (first frame, snap jump, teleport, size change):
+// every ray walks unprimed and this kernel's only job is writing history.
+uint MarchPrimeValid;
+#endif
+
 #if VOXEL_MARCH_HOLE_STATS
 // The hole metric's output: VOXEL_MARCH_HOLE_WORDS uints, cleared by the CPU
 // each frame, read back through the slot ring in VoxelMarchRenderer.cpp and
@@ -1469,6 +1510,196 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				const float TIn = Ray.TEnterUU + Inset;
 				const float TOut = max(TMax - Inset, TIn);
 
+#if VOXEL_MARCH_TEMPORAL_PRIME
+				// ===============================================================
+				// TEMPORAL RAY PRIMING: THE LOOKUP (voxel.March.TemporalPrime)
+				// ===============================================================
+				//
+				// Start this frame's march at last frame's reprojected hit
+				// minus a safety margin, instead of walking the air column
+				// from the camera. The raised start flows into the ring walk
+				// as TMinUU, where the existing `SegOut <= SegIn` guard
+				// rejects every segment fully in front of it BEFORE any rung
+				// setup runs -- segment ENTRY is the measured cost
+				// (~0.67 us x up to 14 per ray; ~0.9 ms per ring at sky), and
+				// the entries rejected here are the entire intended saving.
+				// This is the RESERVE arm B designed beside that guard in
+				// VoxelBrickTraverse.ush, built per its own safety notes.
+				//
+				// WHY A WRONGLY-HIGH PRIME CANNOT PUT A WRONG SURFACE ON
+				// SCREEN, argued case by case (the construction's whole job):
+				//
+				//  1. The walk reads real bricks. A primed walk can only ever
+				//     find geometry that exists on this ray -- priming can
+				//     SKIP a surface, never fabricate one.
+				//  2. If the current ray's true first hit P was visible last
+				//     frame, its prev-frame distance sits in some texel of
+				//     the reprojected footprint. The 3x3 MIN gather is <=
+				//     that texel's value; subtracting MarchPrimeCamDeltaUU
+				//     converts a prev-camera distance lower bound into a
+				//     current-camera one EXACTLY (reverse triangle
+				//     inequality, no small-angle assumption); the margin --
+				//     VOXEL_MARCH_PRIME_MARGIN_CHUNKS at the owning ring's
+				//     own level -- then puts the start strictly BEFORE P.
+				//  3. If P was OCCLUDED last frame, the occluder was NEARER,
+				//     so the gathered min is smaller still: disocclusion
+				//     fails toward the conservative side by construction.
+				//     A prev texel that was SKY holds the far sentinel and
+				//     LOSES the min against any real hit -- and if the whole
+				//     footprint was sky, the prime is refused outright.
+				//  4. If P reprojects OUTSIDE the previous view (or behind
+				//     the previous camera), the prime is refused: unprimed
+				//     full walk, the control.
+				//  5. The residual case -- reprojection error landing the
+				//     3x3 entirely on strictly-farther geometry, i.e. more
+				//     than one internal-res texel of parallax error net of
+				//     the margin's backoff -- is the one the min-gather +
+				//     margin bound statistically rather than absolutely
+				//     (world static, camera-only motion: overshoot arises
+				//     only from reprojection error). Its NO-HIT outcome is
+				//     closed DETERMINISTICALLY by the mandatory rewalk at
+				//     the walk loop below (counted: PrimeRewalks); its
+				//     hit-a-farther-surface outcome is a one-frame
+				//     silhouette-edge error that the next frame's 3x3 min
+				//     pulls back from neighbouring correct pixels, that the
+				//     4096-voxel origin-snap unprime hard-resets every
+				//     ~41 m of travel, and that the pre-registered image
+				//     gates (noise-floor same-pose A/B, pose-matched moving
+				//     captures) exist to catch: a speedup on a renderer is
+				//     a claim about the image, and the image gate outranks
+				//     every number this file prints.
+				//  6. Stand-in swaps (a coarser level's surface last frame,
+				//     the fine one now) move the surface by at most a
+				//     coarse-voxel scale, which the 2-chunk-at-owning-level
+				//     margin dominates by >1 order of magnitude.
+				//  7. A start INSIDE solid (an overshoot smaller than the
+				//     ground's thickness along the ray) is not a
+				//     see-through: the walk returns a started-inside hit at
+				//     the entry t (same surface, depth too deep by the
+				//     overshoot E), and the error DECAYS DETERMINISTICALLY
+				//     -- next frame's start is storedT minus the margin, so
+				//     E shrinks by a full margin per frame until one frame
+				//     heals it exactly. Only an overshoot that clears the
+				//     ENTIRE thickness of the nearer ground reaches case
+				//     5's wrong-surface residue.
+				//
+				// THE PRIME IS A HINT: every uncertain case above decodes as
+				// "walk fully", never as a larger start -- absence reads as
+				// air is the house hazard, and a miss texel here is exactly
+				// an absence, so the sentinel test is the FIRST gate.
+				float PrimeStartUU = TIn;
+				uint RayPrimed = 0u;
+				uint RayPrimeInvalid = 0u;
+				uint RayPrimeRewalk = 0u;
+				if (MarchPrimeValid != 0u)
+				{
+					// T_guess: the same pixel's previous T. Sub-pixel TSR
+					// jitter (this frame's and last's) moves the effective
+					// sample point under half a pixel each; the 3x3 gather
+					// covers a full texel of slop in every direction, which
+					// dominates both.
+					const float TGuess = MarchPrimePrevT.Load(int3(LocalPixel, 0));
+					float TPrimeMin = VOXEL_MARCH_PRIME_FAR;
+					if (TGuess < VOXEL_MARCH_PRIME_FAR * 0.5f)
+					{
+						// Reproject the guess point through the PREVIOUS
+						// view-proj. Both operands of the subtraction are
+						// current-frame local UU (the host rebased the prev
+						// camera at bind time), so no planet-scale value
+						// ever meets a float here.
+						const float3 GuessLocalUU =
+							Ray.OriginLocalUU + Ray.DirWorld * TGuess;
+						const float3 PrevCamRel = GuessLocalUU - MarchPrimePrevCamLocalUU;
+						const float4 PrevClip =
+							mul(float4(PrevCamRel, 1.0f), MarchPrimePrevCamRelToClip);
+						// Strictly in front of the previous camera; 1 UU
+						// rather than 0 so a grazing w cannot blow the
+						// divide up into an in-rect coordinate.
+						if (PrevClip.w > 1.0f)
+						{
+							const float2 PrevNdc = PrevClip.xy / PrevClip.w;
+							// clip y is up, pixel y is down -- the exact
+							// inverse of VoxelMarchBuildRay's flip.
+							const float2 PrevPix =
+								(float2(PrevNdc.x, -PrevNdc.y) * 0.5f + 0.5f) *
+								MarchPrimePrevSizePx;
+							const int2 PrevC = int2(floor(PrevPix));
+							// The whole 3x3 must sit inside the previous
+							// grid: a clamped gather at the rect edge would
+							// read a repeated border texel as if it were the
+							// neighbourhood, and the border is exactly where
+							// reprojection error is largest.
+							if (all(PrevC >= int2(1, 1)) &&
+							    all(PrevC <= int2(MarchPrimePrevSizePx) - int2(2, 2)))
+							{
+								// THE 3x3 MIN GATHER -- the silhouette
+								// guard. At a depth edge the minimum falls
+								// back toward the NEARER surface, the
+								// conservative direction; a sky texel's
+								// sentinel loses to any real hit.
+								[unroll]
+								for (int PDy = -1; PDy <= 1; ++PDy)
+								{
+									[unroll]
+									for (int PDx = -1; PDx <= 1; ++PDx)
+									{
+										TPrimeMin = min(
+											TPrimeMin,
+											MarchPrimePrevT.Load(int3(
+												PrevC + int2(PDx, PDy), 0)));
+									}
+								}
+							}
+						}
+					}
+					if (TPrimeMin < VOXEL_MARCH_PRIME_FAR * 0.5f)
+					{
+						// Prev-camera distance -> conservative current-camera
+						// distance (exact, case 2 above), then back off the
+						// margin at the ring that OWNS the primed start --
+						// derived from horizontal distance exactly as the
+						// segment bounds are (RingTScale's cylinder rule:
+						// horizontal distance at parameter t is t*|Dir.xy|,
+						// so a near-vertical ray correctly stays ring 0
+						// however far its T is). The cascade doubles, so a
+						// level-L chunk is 320 * 2^L UU -- the ZTight slab
+						// fill's own arithmetic.
+						const float StartGuessUU =
+							max(TPrimeMin - MarchPrimeCamDeltaUU, 0.0f);
+						const float PrimeHorizUU =
+							StartGuessUU * length(Ray.DirWorld.xy);
+						uint PrimeL = 0u;
+						const uint PrimeRings = min(MarchRingCount, VOXEL_MARCH_MAX_RINGS);
+						[loop]
+						while (PrimeL + 1u < PrimeRings &&
+						       PrimeHorizUU > VoxelMarchRingOuterUU(PrimeL))
+						{
+							++PrimeL;
+						}
+						const float PrimeChunkUU = 320.0f * float(1u << PrimeL);
+						const float StartUU =
+							StartGuessUU - VOXEL_MARCH_PRIME_MARGIN_CHUNKS * PrimeChunkUU;
+						// Engage only when the prime BUYS distance and lands
+						// inside the walkable interval; at-or-before TIn is
+						// the control for free, and past TOut means the
+						// prepass depth or the box already ends the ray
+						// nearer than last frame's surface.
+						if (StartUU > TIn && StartUU < TOut)
+						{
+							PrimeStartUU = StartUU;
+							RayPrimed = 1u;
+						}
+					}
+					// One word for every fallback: sky sentinel, off-rect,
+					// behind-camera, and no-gain all decode identically as
+					// "walked fully", and the census needs only the rate.
+					if (RayPrimed == 0u)
+					{
+						RayPrimeInvalid = 1u;
+					}
+				}
+#endif
+
 				// ===============================================================
 				// THE TERRAIN HEIGHT PYRAMID (voxel.March.HeightPyramid)
 				// ===============================================================
@@ -1497,7 +1728,51 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				uint HgtMissed = 0u;
 				uint HgtLate = 0u;
 				uint HgtLateDeltaUU = 0u;
+#if VOXEL_MARCH_TEMPORAL_PRIME
+				// ===========================================================
+				// THE MANDATORY REWALK LOOP (the prime's deterministic
+				// closure). Pass 0 walks from the primed start; if -- and
+				// only if -- that pass was PRIMED and ended with NO HIT,
+				// pass 1 re-walks the ENTIRE interval from the true start,
+				// so the only state a wrongly-high prime can leave behind is
+				// wasted time (counted: PrimeRewalks). Unprimed rays and
+				// primed hits break after pass 0, so the common ray runs the
+				// body exactly once.
+				//
+				// A LOOP AROUND THE ONE CALL SITE, NOT A SECOND CALL SITE --
+				// the "EXACTLY ONE CALL TO THE WALK" note below is
+				// load-bearing: VoxelMarchTraverseWithCover is enormous and
+				// inlines, so a textual rewalk call would be a second
+				// instantiation whose register pressure the CONTROL pays
+				// too. With VOXEL_MARCH_TEMPORAL_PRIME 0 this loop does not
+				// exist and the body is byte-identical to the control.
+				//
+				// Census caveat, stated rather than discovered: on the rare
+				// rewalk, the Hgt* assignments below describe pass 1 (the
+				// picture-producing walk) except HgtReentries, which
+				// accumulates across both passes -- honest, the ray really
+				// did re-enter.
+				[loop]
+				for (uint PrimePass = 0u; PrimePass < 2u; ++PrimePass)
+#endif
 				{
+#if VOXEL_MARCH_TEMPORAL_PRIME
+					// The primed start on pass 0 (== TIn when unprimed), the
+					// TRUE start on the rewalk. Everything downstream --
+					// the height pyramid's cursor, the ring segments'
+					// SegIn = max(inner * RingTScale, TMinUU), ZTight's
+					// per-segment span, the Z ladder's ZlResumeUU -- derives
+					// from this one value, which is what makes priming
+					// COMPOSE with every arm instead of replacing any:
+					// the same quantity the walk stores (H.THitUU, camera-
+					// distance T along the normalised DirWorld) is the
+					// quantity resumed from, and the RingTScale = 1/|Dir.xy|
+					// cylinder conversion happens inside the walk exactly as
+					// it does for an unprimed TIn.
+					const float TWalkIn = (PrimePass == 0u) ? PrimeStartUU : TIn;
+#else
+					const float TWalkIn = TIn;
+#endif
 					// ===========================================================
 					// EXACTLY ONE CALL TO THE WALK, AND THAT IS NOT TIDINESS.
 					// ===========================================================
@@ -1547,7 +1822,7 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 					H.AbsentLevel = 0xFFFFFFFFu;
 #endif
 
-					float TCursor = TIn;
+					float TCursor = TWalkIn;
 					float TSkipped = 0.0f;
 					const int MaxIters = bHeightOn ? max(MarchHeightMaxIters, 1) : 1;
 
@@ -1647,6 +1922,25 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 						const float LeafUU = float(1u << uint(MarchHeightLeafVoxelShift)) * 10.0f;
 						HgtLeafCells = uint(TSkipped / max(LeafUU, 1.0f));
 					}
+
+#if VOXEL_MARCH_TEMPORAL_PRIME
+					// THE REWALK DECISION. A primed pass 0 that found NO hit
+					// proved nothing about [TIn, PrimeStartUU) -- absence of
+					// a hit past the prime is not absence of ground before
+					// it -- so the ray owes a full walk from the true start.
+					// EVERY primed no-hit exit lands here (segment end,
+					// height-pyramid empty verdict, step-budget exhaustion:
+					// all of them fall out of the loop above to this line),
+					// so no termination path can leave the debt unpaid. A
+					// hit is trusted -- it is real geometry (case 1 of the
+					// lookup's doctrine) -- and an unprimed pass 0 IS
+					// already the full walk.
+					if (H.bHit || RayPrimed == 0u || PrimePass != 0u)
+					{
+						break;
+					}
+					RayPrimeRewalk = 1u;
+#endif
 				}
 
 #if VOXEL_MARCH_HOLE_STATS
@@ -1728,6 +2022,21 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 				// control -- for an instrument no timing leg reads. It also
 				// cannot count without GVoxelMarchHoleStat, so there is nothing
 				// to compile it for.
+				//
+				// UNDER VOXEL_MARCH_TEMPORAL_PRIME THIS BLOCK IS ALSO THE
+				// PRIME'S FALSIFIER, for free: H is the primed (and possibly
+				// rewalked) result, Full walks the true interval, so a
+				// wrongly-high prime that survived to a FARTHER hit -- the
+				// one residue the min-gather + margin bound statistically
+				// rather than absolutely -- fires hgtLate with the exact
+				// overshoot in the decade histogram, and a prime that
+				// somehow deleted a hit outright (the rewalk should make
+				// this structurally impossible) fires hgtMissed. A
+				// TemporalPrime certification leg therefore arms
+				// voxel.March.HeightPyramid 1 + .Verify 1 alongside the
+				// prime and reads both words against the prime-off baseline
+				// -- counters only, never timing: the falsifier's second
+				// full walk re-bases any timing on such a leg.
 				//
 				// WHAT IT ASKS: walk the FULL unclamped interval and compare.
 				// Two ways the pyramid can have removed geometry --
@@ -1989,6 +2298,27 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_ZL_TAILLOST],
 					               ZlTailLost);
 				}
+#if VOXEL_MARCH_TEMPORAL_PRIME
+				// THE TEMPORAL PRIME'S ENGAGEMENT TRIO
+				// (voxel.March.TemporalPrime), guarded on its own denominator
+				// like every group above: a ray that never consulted the
+				// history (MarchPrimeValid 0, or the arm compiled out) pays
+				// no atomics and the words stay a STRUCTURAL zero -- which is
+				// what makes "primed == 0 while the cvar reads 1" a verdict
+				// on the ARM (first frame, snap jump, teleport, half-res
+				// forced off, all-sky history) and not on the world. Primed
+				// and Invalid partition the consulting rays exactly; Rewalks
+				// rides the same guard because only a primed ray can rewalk.
+				if ((RayPrimed | RayPrimeInvalid) != 0u)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_PRIMED_RAYS],
+					               RayPrimed);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_PRIME_INVALID],
+					               RayPrimeInvalid);
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_PRIME_REWALKS],
+					               RayPrimeRewalk);
+				}
+#endif
 #if VOXEL_MARCH_RUNG_PROBE
 				// THE RUNG PROBE'S ENGAGEMENT QUAD (voxel.March.RungProbe),
 				// guarded on its own denominator like every group above: a
@@ -2137,6 +2467,19 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 		// GBuffer at a random depth. The clear is the write.
 		MarchOutVis[LocalPixel] = Packed;
 		MarchOutHitT[LocalPixel] = HitT;
+#if VOXEL_MARCH_TEMPORAL_PRIME
+		// The prime history, its OWN texture rather than a reuse of
+		// MarchOutHitT: that one writes 0 on a miss (and the emit depends on
+		// it), while the history must write the FAR SENTINEL -- a 0 would
+		// read next frame as "hit at the camera" and a sentinel-for-miss
+		// MarchOutHitT would break its consumers. Written on EVERY in-view
+		// pixel for the VisBuffer's reason: an unwritten texel holds whatever
+		// was in the pooled allocation, and next frame would prime from it.
+		// Degenerate rays (off-volume, depth-clipped away) write the sentinel
+		// too -- bHit is false there -- which is the honest "nothing known
+		// here" value.
+		MarchOutPrimeT[LocalPixel] = bHit ? HitT : VOXEL_MARCH_PRIME_FAR;
+#endif
 	}
 
 #if VOXEL_MARCH_HOLE_STATS

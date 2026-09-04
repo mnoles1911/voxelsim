@@ -180,30 +180,73 @@ def main():
     #
     # The lattice is WORLD-ANCHORED (stable under TSR/camera translation) and
     # band-doubling (the cone rule), the two defences the marcher's own tint
-    # fade uses against far-field boiling. Honest limit, recorded up front:
-    # the SILHOUETTE stays smooth -- a pixel shader cannot cut the skyline.
+    # fade uses against far-field boiling.
+    #
+    # --- V3 (2026-09-04, owner: "even more voxelized, blend with the cubic
+    # tiles, LODs across distance") -----------------------------------------
+    #
+    # v2's honest limit -- "the SILHOUETTE stays smooth, a pixel shader cannot
+    # cut the skyline" -- is now closed from the other side: AVoxelClipmapActor
+    # ::RebuildLevel quantizes every clipmap VERTEX height to this same band
+    # ladder (real 3D terraces). The shader therefore changes jobs, v2 -> v3:
+    #
+    #   * THE LADDER'S NUMBERS COME FROM THE ACTOR, not from literals here.
+    #     Three new parameters -- VoxelizeSeamUU, VoxelizeBaseCellUU (scalars)
+    #     and VoxelizeOriginUU (vector) -- are pushed onto every level MID
+    #     from the ONE C++ derivation (BeginPlay derives seam/base cell from
+    #     the ring cascade; RebuildLevel pushes the snapped origin each
+    #     rebuild). The asset defaults below restate the shipped cascade
+    #     (819,200 UU seam, 1,280 UU base cell) so a MID-less preview still
+    #     renders sanely, and the actor WARNS at BeginPlay if the runtime
+    #     derivation disagrees with these defaults.
+    #   * CHEBYSHEV distance from the pushed origin, not radial distance from
+    #     the camera: band boundaries become SQUARES that land exactly on the
+    #     clipmap level boundaries, mirroring the mesh quantization (see
+    #     VoxelizeCellUUForChebyshevUU in VoxelClipmapActor.cpp for why this
+    #     is what closes the inter-level cracks).
+    #   * The riser paint gains a SLOPE GATE: the mesh now has genuinely flat
+    #     treads sitting exactly on lattice planes (frac(z/cell) == 0), which
+    #     v2's frac-only classifier would have painted as risers wholesale.
+    #   * Stronger cubic read throughout (owner: "even more voxelized"):
+    #     riser share 3.5 -> 6.0, step AA 1.5 -> 1.0 px, per-cell jitter
+    #     0.14 -> 0.22, plan-view cell-edge darkening 0.18 -> 0.30 (width
+    #     1.2 -> 1.0 px), luminance posterize 4 -> 3 steps, riser dim
+    #     0.58 -> 0.52.
     world_pos = mel.create_material_expression(material, unreal.MaterialExpressionWorldPosition, -500, 800)
-    cam_pos = mel.create_material_expression(material, unreal.MaterialExpressionCameraPositionWS, -500, 900)
+    vox_origin = mel.create_material_expression(material, unreal.MaterialExpressionVectorParameter, -500, 900)
+    vox_origin.set_editor_property("parameter_name", "VoxelizeOriginUU")
+    vox_origin.set_editor_property("default_value", unreal.LinearColor(0.0, 0.0, 0.0, 0.0))
     vert_nrm = mel.create_material_expression(material, unreal.MaterialExpressionVertexNormalWS, -500, 1000)
 
     vox = mel.create_material_expression(material, unreal.MaterialExpressionCustom, -100, 800)
     vox.set_editor_property("description", "VirtualRingVoxelize")
     vox.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
     vox.set_editor_property("code", """
-// Virtual-ring voxelization. All distances in UU (cm).
-float2 dxy = WP.xy - CamP.xy;
-float d = length(dxy);
-const float seam = 819200.0;                 // 8,192 m cascade edge
-float band = clamp(floor(log2(max(d, seam) / seam)), 0.0, 3.0);
-float cell = 1280.0 * exp2(band);            // 12.8 m at the seam, doubling per band
-// Terracing: quantize height into cell steps; classify riser by slope share.
-// V2 (owner: "even more blockiness"): stronger riser share, harder steps.
+// Virtual-ring voxelization, V3 (2026-09-04). All distances in UU (cm).
+// GEOMETRY now carries the terraces: AVoxelClipmapActor::RebuildLevel
+// quantizes every vertex height to this SAME ladder, and SeamUU / CellUU /
+// OriginUU arrive from that one C++ derivation via the level MIDs -- never
+// hardcode the ladder's numbers in this block. The shader's job is the cubic
+// READ on top of the terraced mesh: square plan-view tiles, axis-quantized
+// normals, risers where the mesh actually steps, per-cell flattened colour.
+float2 dxy = WP.xy - OriginUU.xy;
+// Chebyshev distance: band boundaries are SQUARES landing exactly on the
+// clipmap level boundaries, mirroring VoxelizeCellUUForChebyshevUU (see its
+// comment in VoxelClipmapActor.cpp for why radial would crack the levels).
+float cheb = max(abs(dxy.x), abs(dxy.y));
+float band = clamp(floor(log2(max(cheb, SeamUU) / SeamUU)), 0.0, 3.0);
+float cell = CellUU * exp2(band);            // base at the seam, doubling per band
+// Terrace paint. Treads sit exactly ON lattice planes (the mesh is quantized
+// to them, frac ~ 0) and the ramps between plateaus cross them; the slope
+// gate keeps riser paint OFF the flat treads -- a case v2 could not hit
+// because v2 had no geometric treads.
 float zc = WP.z / cell;
 float f = frac(zc);
 float slope = saturate(1.0 - abs(VN.z));
-float riserW = saturate(slope * 3.5);        // share of each step that reads as riser
-float aa = fwidth(zc) * 1.5 + 1e-4;
-float riser = 1.0 - smoothstep(riserW - aa, riserW + aa, f);
+float slopeGate = smoothstep(0.005, 0.02, slope);
+float riserW = saturate(slope * 6.0);        // v2: 3.5 -- stronger riser share
+float aa = fwidth(zc) * 1.0 + 1e-4;          // v2: 1.5 -- harder steps
+float riser = (1.0 - smoothstep(riserW - aa, riserW + aa, f)) * slopeGate;
 // Axis-quantized normal: up on treads, dominant horizontal axis on risers --
 // near-pure horizontal so risers take the full unlit-face contrast.
 float2 hd = (abs(VN.x) > abs(VN.y)) ? float2(VN.x >= 0.0 ? 1.0 : -1.0, 0.0)
@@ -212,31 +255,35 @@ float3 nq = normalize(lerp(float3(0, 0, 1), float3(hd, 0.05), riser));
 // XY cell lattice: each world-anchored cell reads as its own block face.
 float2 cid = floor(WP.xy / cell);
 // Per-cell value jitter (world-anchored hash; TSR-stable): the near field's
-// per-voxel variation, continued at cell scale.
+// per-voxel variation, continued at cell scale. v2: 0.14.
 float h = frac(sin(dot(cid + floor(WP.z / cell) * 0.618, float2(12.9898, 78.233))) * 43758.5453);
-float jitter = 1.0 + (h - 0.5) * 0.14;
+float jitter = 1.0 + (h - 0.5) * 0.22;
 // Cell-edge darkening: the face-grid read of voxel terrain, AA'd by fwidth.
+// v2: width 1.2, strength 0.18 -- v3 crisper and darker so plan views read
+// as a tile grid.
 float2 fxy = abs(frac(WP.xy / cell) - 0.5);
-float2 exy = fwidth(WP.xy / cell) * 1.2 + 1e-4;
+float2 exy = fwidth(WP.xy / cell) * 1.0 + 1e-4;
 float edge = max(smoothstep(0.5 - exy.x, 0.5, fxy.x),
                  smoothstep(0.5 - exy.y, 0.5, fxy.y));
-float edgeDim = 1.0 - edge * 0.18;
-// Per-cell flattened colour: posterized luminance (4 hard steps), per-cell
-// jitter, edge darkening, risers to the palette side-face ratio.
+float edgeDim = 1.0 - edge * 0.30;
+// Per-cell flattened colour: posterized luminance (3 hard steps; v2: 4),
+// per-cell jitter, edge darkening, risers to the palette side-face ratio
+// (0.52; v2: 0.58).
 float lum = max(dot(VC, float3(0.299, 0.587, 0.114)), 1e-4);
-float lq = (floor(lum * 4.0) + 0.5) / 4.0;
+float lq = (floor(lum * 3.0) + 0.5) / 3.0;
 float3 cq = VC * (lq / lum) * jitter * edgeDim;
-cq = lerp(cq, cq * 0.58, riser);
+cq = lerp(cq, cq * 0.52, riser);
 // Marcher hemisphere ambient, verbatim: tint * intensity * ground/sky mix.
 float3 amb = cq * float3(1.00, 1.04, 1.12) * 1.5
            * lerp(0.45, 1.0, saturate(nq.z * 0.5 + 0.5));
-// W = 0 must be byte-identical to the pre-voxelize graph.
+// W = 0 must be byte-identical to the pre-voxelize graph (the actor gates the
+// geometric quantization on the same weight, so the whole arm collapses).
 OutNrm = normalize(lerp(VN, nq, W));
 OutAmb = amb * W;
 return lerp(VC, cq, W);
 """)
     vox_inputs = []
-    for nm in ("WP", "CamP", "VN", "VC", "W"):
+    for nm in ("WP", "OriginUU", "VN", "VC", "W", "SeamUU", "CellUU"):
         ci = unreal.CustomInput()
         ci.set_editor_property("input_name", nm)
         vox_inputs.append(ci)
@@ -250,11 +297,19 @@ return lerp(VC, cq, W);
     vox.set_editor_property("additional_outputs", [out_nrm, out_amb])
 
     voxelize_w = b.scalar("VoxelizeWeight", 1.0)
+    # V3 ladder parameters. Defaults restate the shipped cascade (8,192 m seam,
+    # 12.8 m base cell = R7's voxel size); AVoxelClipmapActor::BeginPlay derives
+    # the runtime values from the ring cascade, WARNS if they disagree with
+    # these defaults, and ApplyLevelMaterial pushes them onto every level MID.
+    voxelize_seam = b.scalar("VoxelizeSeamUU", 819200.0)
+    voxelize_cell = b.scalar("VoxelizeBaseCellUU", 1280.0)
     b.link(world_pos, "", vox, "WP")
-    b.link(cam_pos, "", vox, "CamP")
+    b.link(vox_origin, "", vox, "OriginUU")
     b.link(vert_nrm, "", vox, "VN")
     b.link(vertex_albedo, "", vox, "VC")
     b.link(voxelize_w, "", vox, "W")
+    b.link(voxelize_seam, "", vox, "SeamUU")
+    b.link(voxelize_cell, "", vox, "CellUU")
 
     tint_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, 150, 350)
     if not mel.connect_material_expressions(vox, "", tint_multiply, "A"):

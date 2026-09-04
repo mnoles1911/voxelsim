@@ -2242,6 +2242,22 @@ void FVoxelBrickPool::FreeResident(const FResidentChunk& Chunk)
 				PendingGpuIndexAdds.RemoveAt(I, EAllowShrinking::No);
 			}
 		}
+		// P2 (voxel.GPU.AsyncGen): the DEFERRED list is the same announcement
+		// one flush later, and a dying chunk must be scrubbed from it for the
+		// same reason -- an add surviving its chunk would tell the index
+		// about a slot whose record the held free (below) is about to zero.
+		// The slot's PIN is NOT lifted here: the deferred claim will still
+		// write this slot when its batch runs, and the free must stay held
+		// until after that enqueue so it releases what the claim landed
+		// (free-after-claim, the shipped order, stretched one flush).
+		for (int32 I = DeferredGpuIndexAdds.Num() - 1; I >= 0; --I)
+		{
+			if (DeferredGpuIndexAdds[I].ChunkSlot == Chunk.ChunkSlot)
+			{
+				DeferredGpuIndexAdds.RemoveAt(I, EAllowShrinking::No);
+				++GpuIndexAddsCanceledDeferred;
+			}
+		}
 		PendingGpuFreeSlots.Add(Chunk.ChunkSlot);
 		++GpuFreesQueued;
 		return;
@@ -2831,6 +2847,58 @@ bool FVoxelBrickPool::AllocateGpuChunkShell(const FVoxelBrickChunkKey& Key,
 	return true;
 }
 
+void FVoxelBrickPool::DeferGpuIndexAddForPendingClaim(const FVoxelBrickChunkKey& Key,
+                                                      uint32 ChunkSlot)
+{
+	// P2 (voxel.GPU.AsyncGen) -- see the declaration for the whole contract.
+	// GAME THREAD, called by the manager's conversion loop for each claim-fed
+	// job, in the same tick the shell was taken. The add is MOVED, not
+	// copied: an entry must live in exactly one of the two lists or the
+	// index hears about a chunk twice.
+	check(IsInGameThread());
+	for (int32 I = PendingGpuIndexAdds.Num() - 1; I >= 0; --I)
+	{
+		// Matched on BOTH halves: the slot names the storage, the key names
+		// the chunk, and a defer that moved another chunk's entry would be
+		// the exact aliasing this list exists to prevent.
+		if (PendingGpuIndexAdds[I].ChunkSlot == ChunkSlot &&
+		    PendingGpuIndexAdds[I].Key == Key)
+		{
+			DeferredGpuIndexAdds.Add(PendingGpuIndexAdds[I]);
+			PendingGpuIndexAdds.RemoveAt(I, EAllowShrinking::No);
+			GpuClaimPendingSlots.Add(ChunkSlot);
+			++GpuIndexAddsDeferred;
+			return;
+		}
+	}
+	// FAILING READING (deferMisses on the window line, must stay 0): the
+	// manager marked a job claim-fed whose index add is already gone. The
+	// only writer that removes a pending add is FreeResident, and no free of
+	// this tick's shells can run between the shell loop and the conversion
+	// loop -- so a miss means that invariant broke, and the chunk will claim
+	// with no announcement ever queued (a permanently invisible chunk, not
+	// corruption). Counted loud rather than silently tolerated.
+	++GpuIndexAddDeferMisses;
+}
+
+void FVoxelBrickPool::PublishDeferredGpuIndexAdds()
+{
+	// P2 -- see the declaration. GAME THREAD, immediately after the
+	// Worklist.Flush call whose graph carries the deferred claim batch. The
+	// released adds ride THIS tick's pool Flush, whose render command is
+	// enqueued after the worklist flush command -- so on the graphics queue
+	// the claim writes every record before the index upload names it. The
+	// unpinned slots' held frees are flushed after this call for the same
+	// enqueue-order reason.
+	check(IsInGameThread());
+	if (DeferredGpuIndexAdds.Num() > 0)
+	{
+		PendingGpuIndexAdds.Append(MoveTemp(DeferredGpuIndexAdds));
+		DeferredGpuIndexAdds.Reset();
+	}
+	GpuClaimPendingSlots.Reset();
+}
+
 void FVoxelBrickPool::ReleaseGpuChunkShell(const FVoxelBrickChunkKey& Key, uint32 ExpectSlot)
 {
 	if (const FResidentChunk* Found = Resident.Find(Key))
@@ -2865,6 +2933,43 @@ void FVoxelBrickPool::FlushPendingGpuFrees()
 
 	TArray<uint32> Slots = MoveTemp(PendingGpuFreeSlots);
 	PendingGpuFreeSlots.Reset();
+
+	// --- P2 (voxel.GPU.AsyncGen): hold frees whose claim is still pending ---
+	//
+	// A slot in GpuClaimPendingSlots has a claim STAGED but not yet enqueued
+	// (the deferred batch rides the head of the NEXT worklist flush). A free
+	// dispatched now would land BEFORE that claim on the GPU timeline: the
+	// claim would then write ranges onto a dead slot -- a permanent arena
+	// leak, a ghost record, and a side-table entry the next tenant's claim
+	// overwrites (the claimverify mism signature). Held here -- put straight
+	// back on the pending list -- the free flushes on the first call AFTER
+	// PublishDeferredGpuIndexAdds unpins the batch, which by the manager's
+	// call order is after the claim's enqueue: the free then releases
+	// exactly what the claim landed. Every call site is covered because the
+	// hold lives HERE, not at any caller.
+	//
+	// The dupSlot same-tick case stays correct by the manager's call order,
+	// not by this hold: a same-key replace inside the shell loop queues its
+	// free BEFORE the surviving job is pinned (the conversion loop runs
+	// after the flush), and the manager flushes frees between those two
+	// points -- so that free goes out unheld, ahead of the survivor's claim,
+	// exactly like the shipped path.
+	if (GpuClaimPendingSlots.Num() > 0)
+	{
+		for (int32 I = Slots.Num() - 1; I >= 0; --I)
+		{
+			if (GpuClaimPendingSlots.Contains(Slots[I]))
+			{
+				PendingGpuFreeSlots.Add(Slots[I]);
+				Slots.RemoveAtSwap(I, EAllowShrinking::No);
+				++GpuFreesHeldForClaim;
+			}
+		}
+		if (Slots.Num() == 0)
+		{
+			return;
+		}
+	}
 
 	// --- ONE SLOT, ONE FREE ---------------------------------------------------
 	//
@@ -3234,6 +3339,9 @@ void FVoxelBrickPool::Reset()
 	// this pool no longer owns.
 	PendingGpuFreeSlots.Reset();
 	PendingGpuIndexAdds.Reset();
+	// P2: the deferred half of the same pending work, same reason.
+	DeferredGpuIndexAdds.Reset();
+	GpuClaimPendingSlots.Reset();
 	PendingGpuCpuWrites.Reset();
 	RecentGpuShells.Reset();
 	RecentGpuShellCursor = 0;

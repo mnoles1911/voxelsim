@@ -4788,7 +4788,24 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	uint RayBlockSkyRuns = 0u;
 #endif
 #endif
-	// ---- RESERVE (arm B, NOT IMPLEMENTED -- design note only): temporal ----
+	// ---- ARM B: BUILT 2026-09-03 as voxel.March.TemporalPrime -------------
+	//
+	// The design below is IMPLEMENTED, at the caller exactly as this note
+	// specified: VoxelMarch.usf's kernel raises the walk's starting T to the
+	// reprojected previous-frame hit minus a margin, and the raised TMinUU
+	// flows into this loop where the `SegOut <= SegIn` guard below rejects
+	// every segment fully in front of it before any rung setup runs --
+	// nothing in THIS file changed for it, which is the point of the design.
+	// The safety notes below (neighbourhood-MIN, miss-decodes-as-no-bound,
+	// teleport gate, HALFRES refusal, margin absorbing one frame of camera
+	// translation) are all honoured; the one addition over this note is the
+	// MANDATORY REWALK (a primed miss re-walks the full interval from the
+	// true start, counted as PrimeRewalks), which turns the note's
+	// conservative-start argument from statistical into a deterministic
+	// no-hole closure. The prime site in VoxelMarch.usf carries the full
+	// doctrine; the note is kept verbatim below as the design record.
+	//
+	// ---- (the original reserve note): temporal ----------------------------
 	// tStart from last frame's own MarchHitT. Reproject this pixel into last
 	// frame's MarchOutHitT (the buffer already exists and is one texture
 	// read), take the neighbourhood MINIMUM of the reprojected hit distances

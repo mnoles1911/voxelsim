@@ -16038,6 +16038,18 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       (unsigned long long)H.ZLadderResumed,
 			       (unsigned long long)H.ZLadderTailLost);
 
+			// The priming trio (voxel.March.TemporalPrime), same cadence, only
+			// when armed: primed must be LARGE at terrain poses and rewalks
+			// SMALL -- primed=0 while armed is armed-and-inert, the leg void.
+			if (H.bPrimeArmed)
+			{
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel march priming (window): primed=%llu invalid=%llu rewalks=%llu"),
+				       (unsigned long long)H.PrimedRays,
+				       (unsigned long long)H.PrimeInvalid,
+				       (unsigned long long)H.PrimeRewalks);
+			}
+
 			// Mirror for the streaming HUD's legacy row (registered by
 			// VoxelDebug.cpp; found by name because this module must not link
 			// against a registration that may not exist in a stripped build).

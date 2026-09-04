@@ -400,6 +400,77 @@ public:
 	void SetClaimStageArmed(bool bArmed, FPoolBinder Binder, bool bVerify);
 	bool IsClaimStageArmed() const { return bClaimStageArmed && IsPackStageArmed(); }
 
+	// --- P2 (voxel.GPU.AsyncGen): async generation + one-tick publication ---
+	//
+	// THE TRAP THIS SHAPE EXISTS TO SOLVE, in two halves, both measured in the
+	// engine source rather than assumed:
+	//
+	//   1. Marking the generation dispatches ERDGPassFlags::AsyncCompute wins
+	//      NOTHING while the Claim stage consumes their arenas in the same
+	//      graph -- the graphics pipe just waits at the cross-pipe fence.
+	//   2. Deferring the claim is STILL not enough in a standalone builder:
+	//      FRDGBuilder finalises every external buffer back to the graphics
+	//      pipe at its own epilogue (RenderGraphBuilder.cpp,
+	//      AddLastBufferTransition -- StateAfter->SetPass(ERHIPipeline::
+	//      Graphics, EpiloguePassHandle) unconditionally), so a flush-command
+	//      builder that dispatched gen async would make its OWN epilogue wait
+	//      for it -- and that epilogue sits on the graphics queue BEFORE the
+	//      frame's scene submission. The gen would be fence-sandwiched
+	//      between scene N-1 and scene N: serialized exactly as today, minus
+	//      nothing, plus fence overhead.
+	//
+	// So the armed shape is: flush N uploads records + runs the args pass
+	// (graphics, cheap) and STASHES the generation window instead of
+	// dispatching it; the stages are then added -- AsyncCompute -- into the
+	// SCENE renderer's own graph (the manager's post-opaque render delegate
+	// calls RenderThread_AddPendingGenToSceneGraph). Inside the scene builder
+	// the async chain has no in-graph graphics producer, so it forks at the
+	// prologue and overlaps the whole frame (the marcher included); the
+	// scene epilogue's join then waits only max(0, gen - scene), and it also
+	// re-fences every arena back to graphics -- which is what makes the NEXT
+	// tick's claim read them fence-free. Publication (the Claim stage) rides
+	// the head of flush N+1's graph, BEFORE that flush's uploads and args
+	// pass, so it consumes window N through the ring/control/args state flush
+	// N left behind. "The index learns about the chunk on the next Flush" is
+	// the shipped contract; this stretches it by exactly one flush.
+	//
+	// Armed per tick by the manager (it owns the effective-arm computation
+	// and latches once per tick so cvar flips can never split a tick); a
+	// stashed deferred claim is ALWAYS honoured on the next flush regardless
+	// of the current arm state -- bit-10 records must never be left
+	// half-published by a mid-leg toggle.
+	void SetAsyncGenArmed(bool bArmed) { bAsyncGenArmed = bArmed; }
+	bool IsAsyncGenArmed() const { return bAsyncGenArmed; }
+
+	// Render thread, called from the manager's post-opaque delegate with the
+	// SCENE builder. Adds the stashed generation window's stages (async
+	// compute) and consumes the stash; returns false when nothing was
+	// pending (an empty window, or async unarmed). Fires at most once per
+	// window -- a second view family in the same frame finds the stash
+	// empty. If NO scene renders between two flushes, the next flush's own
+	// render command builds the window serially on graphics before the
+	// deferred claim (counted: GetAsyncGenSerialFallbacks) -- correctness
+	// never depends on a frame actually being rendered.
+	bool RenderThread_AddPendingGenToSceneGraph(FRDGBuilder& GraphBuilder);
+
+	// Engagement counters for the window line -- the pair that can FAIL:
+	// deferred-claim batches flowing while gpuClaimed (stats[16]) stays flat
+	// is the dead-stage reading; sceneWindows flat while defBatches grows
+	// means every window is taking the serial fallback and the overlap is
+	// buying nothing.
+	int64 GetCumDeferredClaimBatches() const { return CumDeferredClaimBatches; }
+	int64 GetCumDeferredClaimRecords() const { return CumDeferredClaimRecords; }
+	// Game thread: did the flush that JUST ran enqueue a deferred claim batch
+	// at its graph head? This -- not the current arm state -- is the
+	// manager's publish trigger (PublishDeferredGpuIndexAdds): a cvar toggled
+	// off between two ticks still leaves one stashed claim to publish, and
+	// keying the publish off the arm would strand its index adds held and
+	// its slots pinned FOREVER (invisible chunks, starved frees).
+	bool LastFlushCarriedDeferredClaim() const { return bLastFlushCarriedDeferredClaim; }
+	static int64 GetAsyncGenSceneWindows();     // gen windows the scene graph consumed
+	static int64 GetAsyncGenSerialFallbacks();  // windows built serially by the next flush
+	static int64 GetAsyncGenWindowsDropped();   // claim-less windows never consumed (safe)
+
 	// Game thread: the consume window the most recent Flush mirrored --
 	// [ConsumeFirst, ConsumeFirst + Take) in monotonic record indices. A
 	// record appended at monotonic index m was consumed by that flush iff
@@ -651,6 +722,66 @@ private:
 	bool bClaimDupLogged = false;
 	int64 GpuClaimEligible = -1;   // GPU stats[16] as of the last landed proof
 	FLastFlush LastFlush;
+
+	// --- P2 (voxel.GPU.AsyncGen) --------------------------------------------
+	// Game-thread half: the one-slot deferred-claim pipeline. Flush N stashes
+	// its claim work here; flush N+1 captures the stash into its render
+	// command and adds the claim passes at the HEAD of its graph, before its
+	// own uploads and args pass overwrite the ring/control/args state the
+	// claim reads window N through. One slot is enough BY CONSTRUCTION: one
+	// Flush per tick (bWorklistFlushedThisTick in the manager), and the stash
+	// is consumed unconditionally at the next Flush.
+	bool bAsyncGenArmed = false;
+	struct FDeferredClaimStash
+	{
+		bool bValid = false;
+		uint32 BudgetRecords = 0;   // flush N's clamped budget (sizes the claim buffer)
+		bool bVerify = false;       // flush N's claim-verify arm, latched with it
+		uint32 StagedRecords = 0;   // flush N's ClaimStagedThisFlush (counters only)
+	};
+	FDeferredClaimStash DeferredClaim;
+	bool bLastFlushCarriedDeferredClaim = false;
+	int64 CumDeferredClaimBatches = 0;
+	int64 CumDeferredClaimRecords = 0;
+
+	// Render-thread half: the stashed generation window. Written by the flush
+	// render command, consumed by the scene delegate (same thread, later the
+	// same frame) or by the NEXT flush command's serial fallback -- render
+	// thread only, so no locking. The stamp blob ARRAYS live here because
+	// their RDG buffers must be created in whichever builder finally
+	// dispatches the window (a transient buffer dies with its graph).
+	struct FPendingGenWindow
+	{
+		bool bValid = false;
+		uint32 SliceBudgetRecords = 0;
+		bool bVoxelize = false;
+		bool bClassify = false;
+		bool bStamp = false;
+		bool bPack = false;
+		FVoxelRasterAtlasGpu* Atlas = nullptr;
+		uint32 SeedLo = 0;
+		uint32 SeedHi = 0;
+		int32 PixelSizeMm = 0;
+		TArray<FVoxelWorklistAssetInstance> StampInstances;
+		TArray<uint32> StampColStarts;
+		TArray<uint32> StampSpans;
+	};
+	FPendingGenWindow PendingGen;
+	// The shared gen-stage builder: lazy arena creation + the five worklist
+	// stage dispatches, on the pipe the caller picks. Three callers: the
+	// synchronous flush path (async off -- byte-identical shipped passes),
+	// the scene delegate (async on), and the serial fallback at the head of
+	// the next flush (async on, but a frame with no scene render -- graphics).
+	void RenderThread_AddGenStages(FRDGBuilder& GraphBuilder, FPendingGenWindow&& Window,
+	                               bool bAsyncCompute);
+	// The shared claim builder: registers ring/args/control, the pack/totals
+	// arenas and the pool (through the binder) into the given graph and adds
+	// the claim dispatches. Used by the synchronous path (current window) and
+	// by the deferred head (previous window, stale args by design).
+	void RenderThread_AddClaimPasses(FRDGBuilder& GraphBuilder,
+	                                 FRHICommandListImmediate& RHICmdList,
+	                                 const FPoolBinder& Binder,
+	                                 uint32 BudgetRecords, bool bVerify);
 
 	// --- the spine proof (game-thread state) --------------------------------
 	// Per-slot record folds, written when a staged record is assigned its ring

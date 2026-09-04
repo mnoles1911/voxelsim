@@ -14,6 +14,9 @@
 #include <atomic>
 #include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
 #include "RHIBreadcrumbs.h"                         // RHI_BREADCRUMB_EVENT_STAT (5.8 spelling)
+#include "RHIGlobals.h"        // P2: GSupportsEfficientAsyncCompute (async-gen arm guard)
+#include "RendererInterface.h" // P2: IRendererModule post-opaque delegate (scene-graph hook)
+#include "Modules/ModuleManager.h" // P2: FModuleManager for the Renderer module lookup
 #include "RenderGraphEvent.h" // RDG_EVENT_SCOPE_STAT, for the nested sub-terms
 
 // ---------------------------------------------------------------------------
@@ -966,6 +969,124 @@ static uint32 VoxelGpuWorklistCellBudget()
 		return uint32(FMath::Max(Parsed, 1));
 	}();
 	return Value;
+}
+
+// --- P2: voxel.GPU.AsyncGen -------------------------------------------------
+//
+// 1 = the worklist GENERATION stages (WlColumn/WlVoxelize/WlStamp/WlClassify/
+// WlPack -- the +0.82 ms of the p95 step at owner res, P0-OWNERMAP) run as
+// ERDGPassFlags::AsyncCompute inside the SCENE renderer's graph, where they
+// fork at the prologue and overlap the frame's graphics work (the 6.83 ms
+// marcher included), and PUBLICATION -- the Claim stage's pool writes, the
+// chunk's index Added entry, and any free of a claim-pending slot -- is
+// DEFERRED EXACTLY ONE FLUSH so no graphics pass ever waits on same-tick
+// async output. 0 (DEFAULT) = the shipped single-queue behaviour,
+// byte-identical.
+//
+// THE FLAG GATES BOTH HALVES TOGETHER, NEVER ONE: async pass flags without
+// the defer just moves the serialization to a cross-pipe fence (and a
+// standalone builder's epilogue re-serializes it even WITH the defer --
+// RenderGraphBuilder.cpp AddLastBufferTransition returns every external
+// buffer to the graphics pipe at its own epilogue, which is why the async
+// dispatch rides the scene builder; the full argument is on the worklist
+// header's P2 block). The defer without async flags is pure added latency.
+// One latch per tick (FVoxelGpuMeshJobManager::bAsyncGenThisTick) feeds
+// every site.
+//
+// Semantics cover: "the index learns about the chunk on the next Flush" is
+// the shipped visibility contract (VoxelBrickPool P3 block); this stretches
+// it by one flush (9-16 ms) against an admit->visible p50 of 0.04 s.
+// DEFAULT ON since 2026-09-04 (owner-approved). Gate record
+// (docs/perf-redesign-2026-09-03.md Gate 2): EFFECTIVE=1, 8,927 windows
+// deferred, serialFb=0, deferMisses=0, RECON digit-identical to shipped,
+// flight p95 -0.20 at zero cost. No image difference -> no Settings row
+// (the 2026-09-04 policy covers visual trades only). 0 is the revert.
+static int32 GVoxelGpuAsyncGen = 1;
+static FAutoConsoleVariableRef CVarVoxelGpuAsyncGen(
+	TEXT("voxel.GPU.AsyncGen"),
+	GVoxelGpuAsyncGen,
+	TEXT("1 = worklist generation kernels run on the async compute queue inside the scene graph ")
+	TEXT("(overlapping the marcher) and their publication (claim + index add + frees of pending ")
+	TEXT("slots) defers one flush. 0 (DEFAULT) = shipped single-queue behaviour, byte-identical. ")
+	TEXT("Requires the full worklist chain armed (columns/voxelize/classify/pack/claim), ")
+	TEXT("voxel.GPU.PoolAlloc, no batch-side worklist verify arms, and RDG async-compute support; ")
+	TEXT("a failed precondition disarms EFFECTIVELY and logs the reason ONCE -- the cvar reading 1 ")
+	TEXT("with [gpu-worklist] asyncGen counters flat is that log's cross-check, never a mystery. ")
+	TEXT("Engagement proof: wlclaim line's asyncGen def=/scene= counters moving while gpuClaimed ")
+	TEXT("keeps growing and RECON stays 0/0/0."),
+	ECVF_Default);
+
+static bool VoxelGpuAsyncGenEnabled()
+{
+	return GVoxelGpuAsyncGen != 0;
+}
+
+// The effective arm, computed ONCE PER TICK by Tick and latched. Every
+// precondition is here because each one, if violated, would not crash -- it
+// would silently re-serialize or corrupt:
+//   * full worklist chain: a partially-armed chain leaves arena-fed jobs
+//     whose BATCH graph reads async output same-tick (the stall trap);
+//   * batch-side verify arms: their compare passes read the arenas in the
+//     batch graph same-tick (same trap; the CLAIM verify is exempt -- it
+//     rides the claim itself, one flush later);
+//   * PoolAlloc: the claim stage's whole reason to exist;
+//   * RDG async support: RDG silently DEMOTES AsyncCompute passes when
+//     unsupported (r.RDG.AsyncCompute 0, immediate mode, or the RHI lacking
+//     efficient async) -- the defer would then be pure latency for zero
+//     overlap. The mirror of RenderGraphPrivate.h IsAsyncComputeSupported's
+//     publicly readable terms.
+static bool VoxelGpuAsyncGenEffective(bool& bOutLoggedReasonOnce)
+{
+	if (!VoxelGpuAsyncGenEnabled())
+	{
+		return false;
+	}
+	const bool bChainArmed = VoxelGpuWorklistEnabled()
+		&& VoxelGpuWorklistColumnsEnabled()
+		&& VoxelGpuWorklistVoxelizeEnabled()
+		&& VoxelGpuWorklistClassifyEnabled()
+		&& VoxelGpuWorklistPackEnabled()
+		&& VoxelGpuWorklistClaimEnabled()
+		&& VoxelGpuPoolAllocEnabled();
+	const bool bBatchVerifyClear = !VoxelGpuWorklistVerifyColsEnabled()
+		&& !VoxelGpuWorklistVerifyVoxEnabled()
+		&& !VoxelGpuWorklistVerifyCtEnabled()
+		&& !VoxelGpuWorklistVerifyStampEnabled()
+		&& !VoxelGpuWorklistVerifyPackEnabled();
+	static const auto* CVarRdgAsync = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RDG.AsyncCompute"));
+	static const auto* CVarRdgImm = IConsoleManager::Get().FindConsoleVariable(TEXT("r.RDG.ImmediateMode"));
+	const bool bRdgAsync = GSupportsEfficientAsyncCompute
+		&& (CVarRdgAsync == nullptr || CVarRdgAsync->GetInt() > 0)
+		&& (CVarRdgImm == nullptr || CVarRdgImm->GetInt() == 0);
+	const bool bEffective = bChainArmed && bBatchVerifyClear && bRdgAsync;
+	if (!bOutLoggedReasonOnce)
+	{
+		bOutLoggedReasonOnce = true;
+		// Error when the cvar is up and a precondition is not: the operator
+		// asked for the arm and is not getting it, and that must never be a
+		// quiet Log line scrolled past (the T4-1 silent-disable shape).
+		if (bEffective)
+		{
+			UE_LOG(LogVoxelGpuMeshJob, Log,
+			       TEXT("[gpu-worklist] voxel.GPU.AsyncGen=1 EFFECTIVE=1 ")
+			       TEXT("(chainArmed=1 batchVerifyClear=1 rdgAsync=1): generation rides the ")
+			       TEXT("async pipe in the scene graph; publication defers one flush."));
+		}
+		else
+		{
+			UE_LOG(LogVoxelGpuMeshJob, Error,
+			       TEXT("[gpu-worklist] voxel.GPU.AsyncGen=1 but EFFECTIVE=0 ")
+			       TEXT("(chainArmed=%d batchVerifyClear=%d rdgAsync=%d ")
+			       TEXT("[efficientAsync=%d rdgAsyncCvar=%d rdgImmediate=%d]). ")
+			       TEXT("A precondition failed: the leg is measuring SHIPPED behaviour, not the ")
+			       TEXT("async arm. Fix the named term or read the leg as a control."),
+			       bChainArmed ? 1 : 0, bBatchVerifyClear ? 1 : 0,
+			       bRdgAsync ? 1 : 0, GSupportsEfficientAsyncCompute ? 1 : 0,
+			       CVarRdgAsync ? CVarRdgAsync->GetInt() : -1,
+			       CVarRdgImm ? CVarRdgImm->GetInt() : -1);
+		}
+	}
+	return bEffective;
 }
 
 namespace VoxelGpuLeanDetail
@@ -2067,6 +2188,34 @@ FVoxelGpuMeshJobManager::FVoxelGpuMeshJobManager(FVoxelGpuMeshJobComplete OnComp
 
 FVoxelGpuMeshJobManager::~FVoxelGpuMeshJobManager()
 {
+	// P2 (voxel.GPU.AsyncGen): unhook the scene-graph delegate BEFORE any
+	// member dies. The delegate is broadcast by SCENE renders -- work this
+	// manager never enqueued -- so the usual "destruction drains the render
+	// queue behind our own commands" argument does not cover it on its own.
+	// The removal is itself a render command (registration, removal and
+	// broadcast all mutate/iterate the multicast list on the render thread,
+	// so it is never raced), and the flush below means no scene render after
+	// this point can reach the dying Worklist member. NOTE: teardown is the
+	// least-exercised path in this project (no level, PIE only, every leg a
+	// fresh process) -- a generation window stashed on the very last tick is
+	// deliberately dropped here, unpublished; its chunks were never
+	// announced to the index, so nothing dangles.
+	if (bAsyncGenDelegateRegistered)
+	{
+		FVoxelGpuMeshJobManager* Self = this;
+		ENQUEUE_RENDER_COMMAND(VoxelAsyncGenUnregisterSceneHook)(
+			[Self](FRHICommandListImmediate&)
+		{
+			if (Self->AsyncGenPostOpaqueHandle.IsValid())
+			{
+				IRendererModule& RendererModule =
+					FModuleManager::GetModuleChecked<IRendererModule>(TEXT("Renderer"));
+				RendererModule.RemovePostOpaqueRenderDelegate(Self->AsyncGenPostOpaqueHandle);
+				Self->AsyncGenPostOpaqueHandle.Reset();
+			}
+		});
+		FlushRenderingCommands();
+	}
 	CancelAll();
 }
 
@@ -2454,6 +2603,48 @@ void FVoxelGpuMeshJobManager::Tick()
 	JobCost.QueueLowSum += int64(QueuedLowPriority.Num());
 	JobCost.InFlightSum += int64(InFlight.Num());
 	JobCost.InFlightMax = FMath::Max(JobCost.InFlightMax, InFlight.Num());
+
+	// --- P2 (voxel.GPU.AsyncGen): the per-tick latch ------------------------
+	//
+	// ONCE, here, before any promote/flush/free decision this tick reads it
+	// -- the flag gates the pass pipe, the claim deferral, the free-flush
+	// ordering, the conversion gating and the index-add deferral TOGETHER,
+	// and a mid-tick cvar read would split them (the house rule this latch
+	// enforces). Worklist.IsInitialized is a term because the first tick
+	// initialises the worklist AFTER this point: that tick runs shipped
+	// behaviour and the arm engages on the next, which costs one tick and
+	// buys "armed implies every downstream precondition already true".
+	bAsyncGenThisTick = Worklist.IsInitialized()
+		&& VoxelGpuAsyncGenEffective(bAsyncGenStateLogged);
+	Worklist.SetAsyncGenArmed(bAsyncGenThisTick);
+	if (bAsyncGenThisTick && !bAsyncGenDelegateRegistered)
+	{
+		// The scene-graph hook, registered from a render command so the
+		// multicast list is only ever touched on the thread that broadcasts
+		// it. `this` outlives the delegate by the destructor's removal+flush.
+		bAsyncGenDelegateRegistered = true;
+		FVoxelGpuMeshJobManager* Self = this;
+		ENQUEUE_RENDER_COMMAND(VoxelAsyncGenRegisterSceneHook)(
+			[Self](FRHICommandListImmediate&)
+		{
+			IRendererModule& RendererModule =
+				FModuleManager::GetModuleChecked<IRendererModule>(TEXT("Renderer"));
+			Self->AsyncGenPostOpaqueHandle = RendererModule.RegisterPostOpaqueRenderDelegate(
+				FPostOpaqueRenderDelegate::CreateLambda(
+					[Self](FPostOpaqueRenderParameters& Parameters)
+			{
+				// Any view family is an acceptable host (the passes carry no
+				// view state); the stash consume-once guard makes a second
+				// family in the same frame a no-op. GraphBuilder is the SCENE
+				// builder -- the one whose graphics span covers the frame,
+				// which is the entire point (worklist header, P2 block).
+				if (Parameters.GraphBuilder != nullptr)
+				{
+					Self->Worklist.RenderThread_AddPendingGenToSceneGraph(*Parameters.GraphBuilder);
+				}
+			}));
+		});
+	}
 
 	// Tier B.1. Latched once per tick so one tick behaves like one tick; safe
 	// to flip mid-run because both paths emit identical bytes (the residue of
@@ -3284,6 +3475,19 @@ void FVoxelGpuMeshJobManager::Tick()
 		if (!bWorklistFlushedThisTick)
 		{
 			Worklist.Flush(VoxelGpuWorklistBudget());
+			// P2: a batchless tick still publishes -- the Flush above just
+			// enqueued the PREVIOUS window's deferred claim at its graph
+			// head, so the held index adds may now ride this tick's pool
+			// Flush (enqueued later this function, therefore behind the
+			// claim on the graphics queue) and the pinned frees unfreeze.
+			// Without this, a quiet moment in flight would stall publication
+			// indefinitely -- late is the contract, never is a hole. Keyed
+			// off the flush actually carrying the claim (not the arm), the
+			// DispatchBatch site's toggle argument verbatim.
+			if (Worklist.LastFlushCarriedDeferredClaim())
+			{
+				GetGlobalVoxelBrickPool().PublishDeferredGpuIndexAdds();
+			}
 		}
 		bWorklistFlushedThisTick = false;
 		// The tick's pass tally folds HERE, not in DispatchBatch, because the
@@ -3525,16 +3729,18 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		// fusion -- that nobody suspected. Every path into fb is named here
 		// and the residual is printed: a nonzero residual means a path was
 		// added without a name and this line is lying by omission again.
-		const int64 FbNamed = WorklistFbStack + WorklistFbDeferred + WorklistFbUnarmed;
+		const int64 FbNamed = WorklistFbStack + WorklistFbDeferred + WorklistFbUnarmed
+		                    + WorklistFbAsyncGen;
 		const int64 FbResidual = WorklistColFallback - FbNamed;
 		const int64 ConvDenom = WorklistColConverted + WorklistColFallback;
 		UE_LOG(LogVoxelGpuMeshJob, Log,
 		       TEXT("[gpu-worklist] wlcols conv=%lld fb=%lld (%.1f%% of records converted) ")
-		       TEXT("fbBy: stack=%lld deferred=%lld unarmed=%lld residual=%lld%s ")
+		       TEXT("fbBy: stack=%lld deferred=%lld unarmed=%lld asyncGen=%lld residual=%lld%s ")
 		       TEXT("arenaMissing=%lld colverify checked=%llu mism=%llu (cumulative)%s%s"),
 		       WorklistColConverted, WorklistColFallback,
 		       ConvDenom > 0 ? 100.0 * double(WorklistColConverted) / double(ConvDenom) : 0.0,
-		       WorklistFbStack, WorklistFbDeferred, WorklistFbUnarmed, FbResidual,
+		       WorklistFbStack, WorklistFbDeferred, WorklistFbUnarmed, WorklistFbAsyncGen,
+		       FbResidual,
 		       FbResidual != 0
 		           ? TEXT(" (UNATTRIBUTED -- a fallback path with no reason counter)")
 		           : TEXT(""),
@@ -3658,6 +3864,40 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		       (VoxelGpuWorklistVerifyClaimEnabled() && WorklistClaimConverted > 0 &&
 		        P.ClaimDwordsChecked == 0)
 			       ? TEXT(" (DEAD GATE: conv>0, checked=0 -- NOT a pass)") : TEXT(""));
+	}
+	// P2 asyncGen line, cvar-gated (a control leg must not gain a line). THE
+	// FAILING READINGS: def= flat while wlclaim hostStaged grows -- the
+	// deferral is armed and publishing nothing (chunks accumulate unwritten);
+	// scene= flat while def= grows -- every window is taking the serial
+	// fallback and the overlap is buying zero (frames not rendering, or the
+	// delegate never registered); def= growing while gpuClaimed (wlclaim
+	// line) stays flat -- the deferred head is enqueued and the kernel is
+	// dark; deferMisses>0 -- chunks claiming with no index announcement ever
+	// queued (permanently invisible); freesHeld growing without bound -- the
+	// unpin is not running (frees starving, pool filling). All cumulative.
+	if (VoxelGpuAsyncGenEnabled())
+	{
+		FVoxelBrickPool& PoolForLine = GetGlobalVoxelBrickPool();
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-worklist] asyncGen def=%lld defRecs=%lld scene=%lld serialFb=%lld ")
+		       TEXT("dropped=%lld idxDef=%lld idxCan=%lld freesHeld=%lld deferMisses=%lld ")
+		       TEXT("(cumulative)%s%s"),
+		       Worklist.GetCumDeferredClaimBatches(), Worklist.GetCumDeferredClaimRecords(),
+		       FVoxelGpuWorklist::GetAsyncGenSceneWindows(),
+		       FVoxelGpuWorklist::GetAsyncGenSerialFallbacks(),
+		       FVoxelGpuWorklist::GetAsyncGenWindowsDropped(),
+		       PoolForLine.GetGpuIndexAddsDeferred(),
+		       PoolForLine.GetGpuIndexAddsCanceledDeferred(),
+		       PoolForLine.GetGpuFreesHeldForClaim(),
+		       PoolForLine.GetGpuIndexAddDeferMisses(),
+		       !bAsyncGenThisTick
+		           ? TEXT(" (EFFECTIVE OFF -- see the one-time arm log; this leg measures ")
+		             TEXT("SHIPPED behaviour)")
+		           : TEXT(""),
+		       PoolForLine.GetGpuIndexAddDeferMisses() > 0
+		           ? TEXT(" (DEFER MISSES: chunks claiming with no index announcement -- ")
+		             TEXT("invisible chunks, see DeferGpuIndexAddForPendingClaim)")
+		           : TEXT(""));
 	}
 	WorklistWinTicks = 0;
 	WorklistWinChunks = 0;
@@ -4058,7 +4298,24 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			}
 		}
 		// Rule 3: frees before claims, always.
-		Pool.FlushPendingGpuFrees();
+		//
+		// P2 (voxel.GPU.AsyncGen): "claims" now includes the PREVIOUS batch's
+		// deferred claim, which rides the head of the worklist flush enqueued
+		// below -- and rule 3 must hold against THAT claim's slots in the
+		// opposite direction (a free of a claim-pending slot must land AFTER
+		// its claim, or the claim writes ranges onto a dead slot). So under
+		// the async arm this call moves to right after Worklist.Flush +
+		// PublishDeferredGpuIndexAdds: deferred-claim(N-1) -> frees(N) ->
+		// batch graph's classic claims(N), which satisfies rule 3 for the
+		// classic claims AND free-after-claim for the deferred one. The
+		// pool-side pin (FlushPendingGpuFrees's hold) covers every OTHER call
+		// site; this reorder is what lets THIS tick's frees -- including the
+		// same-key-replace dupSlot free, which must precede its survivor's
+		// claim -- go out unheld and in the right order.
+		if (!bAsyncGenThisTick)
+		{
+			Pool.FlushPendingGpuFrees();
+		}
 	}
 
 	// --- P3 spine: records + the passes-per-tick tally ----------------------
@@ -4315,6 +4572,35 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			Worklist.Flush(VoxelGpuWorklistBudget());
 			bWorklistFlushedThisTick = true;
 
+			// P2: the flush above enqueued batch N-1's deferred claim at its
+			// graph head. THE NEXT THREE STEPS ARE ORDER-LOCKED:
+			//   1. Publish: batch N-1's held index adds move to the normal
+			//      pending list (delivered by this tick's pool Flush, whose
+			//      command is enqueued later => index upload lands AFTER the
+			//      claim on the graphics queue) and its slots unpin.
+			//   2. Frees: everything queued so far -- evictions from this
+			//      tick's shell loop, and the same-key-replace dupSlot frees
+			//      that MUST precede their surviving job's claim -- flushes
+			//      now: after claim N-1 (heals an evicted-while-pending
+			//      chunk: the free releases exactly what the claim landed),
+			//      before batch N's classic claims (rule 3), and before
+			//      batch N's pins exist (so a dupSlot free is never held
+			//      behind the claim it must precede).
+			//   3. The conversion loop below then pins batch N's claim-fed
+			//      slots and defers their index adds.
+			// Publish keys off "the flush I just called carried the deferred
+			// claim" -- NOT the current arm -- so a cvar toggled off between
+			// ticks still publishes the batch already in flight instead of
+			// stranding its adds held and its slots pinned forever.
+			if (Worklist.LastFlushCarriedDeferredClaim())
+			{
+				GetGlobalVoxelBrickPool().PublishDeferredGpuIndexAdds();
+			}
+			if (bAsyncGenThisTick && VoxelGpuPoolAllocEnabled())
+			{
+				GetGlobalVoxelBrickPool().FlushPendingGpuFrees();
+			}
+
 			// Hand each record's job its arena slice -- or count WHY not.
 			// THE FAILING READINGS: fallback growing while converted stays 0
 			// means the stage is armed and converting nothing (ring refusing,
@@ -4345,6 +4631,46 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				const uint32 Mono = RecordMono.IsValidIndex(RIdx) ? RecordMono[RIdx] : MAX_uint32;
 				const bool bConsumedThisFlush =
 					Mono != MAX_uint32 && (Mono - LF.ConsumeFirst) < LF.Take;
+				// P2 (voxel.GPU.AsyncGen): CLAIM-FED OR FULLY CLASSIC, nothing
+				// between. Under the async arm the arenas are written on the
+				// async pipe during the SCENE render -- AFTER the batch graph
+				// executes -- so ANY partial feed (a job that would read an
+				// arena in the batch graph without being claim-fed: the
+				// fedNoBit set, assets without the stamp stage, a stage
+				// mid-chain unarmed) would read bytes that are not there yet.
+				// Not a stall: WRONG DATA. The gate below mirrors the
+				// cascade's claim-fed conjunction exactly; a record that
+				// fails any term falls back to the full classic chain --
+				// which reads nothing from the arenas -- and is counted
+				// (fbBy asyncGen= on the wlcols line). Effective-arm already
+				// guarantees the five stages are on, so in practice this
+				// catches only the bit-11-less records (the constant-56 set)
+				// and asset records if the stamp stage is off.
+				if (bAsyncGenThisTick && bConsumedThisFlush && Worklist.IsColumnStageArmed())
+				{
+					const bool bJobAssetsAsync =
+						RecordJobs[RIdx]->BrickRegion.AssetInstances.Num() > 0;
+					const bool bWillClaimFeed = Worklist.IsVoxelizeStageArmed()
+						&& (!bJobAssetsAsync || bStampArmed)
+						&& Worklist.IsClassifyStageArmed()
+						&& Worklist.IsPackStageArmed()
+						&& Worklist.IsClaimStageArmed()
+						&& (NewRecords[RIdx].LevelFlags & (1u << 11)) != 0u;
+					if (!bWillClaimFeed)
+					{
+						++WorklistColFallback;
+						++WorklistFbAsyncGen;
+						if (Worklist.IsVoxelizeStageArmed())
+						{
+							++WorklistVoxFallback;
+						}
+						if (Worklist.IsClassifyStageArmed())
+						{
+							++WorklistCtFallback;
+						}
+						continue;
+					}
+				}
 				if (bConsumedThisFlush && Worklist.IsColumnStageArmed())
 				{
 					RecordJobs[RIdx]->WorklistColumnSlice = Mono - LF.ConsumeFirst;
@@ -4446,6 +4772,18 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 										RecordJobs[RIdx]->bWorklistClaimFed = true;
 										++WorklistClaimConverted;
 										PassesThisTick += -5;
+										// P2: this chunk's claim now runs at
+										// the head of the NEXT flush -- hold
+										// its index announcement and pin its
+										// slot against frees for exactly
+										// that long (the pool API's comment
+										// carries the two-hazard argument).
+										if (bAsyncGenThisTick)
+										{
+											GetGlobalVoxelBrickPool().DeferGpuIndexAddForPendingClaim(
+												RecordJobs[RIdx]->BrickKey,
+												RecordJobs[RIdx]->GpuChunkSlot);
+										}
 									}
 								}
 							}

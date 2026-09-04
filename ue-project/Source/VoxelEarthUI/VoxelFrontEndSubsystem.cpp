@@ -1,4 +1,5 @@
 #include "VoxelFrontEndSubsystem.h"
+#include "VoxelGraphicsUserSettings.h"
 
 #include "SVoxelHourglass.h"
 #include "SVoxelLoadingScreen.h"
@@ -54,6 +55,12 @@ bool UVoxelFrontEndSubsystem::DoesSupportWorldType(const EWorldType::Type WorldT
 void UVoxelFrontEndSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+
+	// Player graphics settings latch here, BEFORE the front-end suppression
+	// branch: a -game run with the menu suppressed is precisely the run where
+	// the player is playing, and their persisted choices must land before the
+	// first marched frame either way. Idempotent per world.
+	VoxelGraphicsUserSettings::ApplyAll();
 
 	if (!VoxelFrontEnd::IsEnabledThisRun())
 	{

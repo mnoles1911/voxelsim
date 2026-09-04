@@ -75,6 +75,22 @@ FText CreditsPanelBody()
 }
 FText SettingsPanelTitle() { return LOCTEXT("SettingsPanelTitle", "SETTINGS"); }
 FText SettingsPanelBody() { return LOCTEXT("SettingsPanelBody", "Settings coming soon."); }
+FText SettingsFineDetailLabel() { return LOCTEXT("SettingsFineDetailLabel", "Fine Detail Smoothing"); }
+FText SettingsFineDetailDesc()
+{
+	return LOCTEXT("SettingsFineDetailDesc",
+	               "Extra anti-aliasing for very fine silhouettes. Off runs faster; most "
+	               "scenes look identical either way.");
+}
+FText SettingsToggleOn() { return LOCTEXT("SettingsToggleOn", "ON"); }
+FText SettingsFasterTerrainLabel() { return LOCTEXT("SettingsFasterTerrainLabel", "Faster Terrain Drawing"); }
+FText SettingsFasterTerrainDesc()
+{
+	return LOCTEXT("SettingsFasterTerrainDesc",
+	               "Speeds up terrain rendering by reusing the previous frame's view. "
+	               "No known visual difference; turn off to compare.");
+}
+FText SettingsToggleOff() { return LOCTEXT("SettingsToggleOff", "OFF"); }
 
 FText LoadingTitle() { return LOCTEXT("LoadingTitle", "L O A D I N G"); }
 FText TipPrefix() { return LOCTEXT("TipPrefix", "TIP"); }

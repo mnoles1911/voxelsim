@@ -283,16 +283,34 @@ namespace
 	// expect is ~0.2-0.4 ms, not anything proportional to 73%. A measured small
 	// win is still a win; a 73% headline attached to a 5% result is not.
 	//
-	// DEFAULT 0, like every switch in this file, so a control leg is
-	// byte-identical and the A/B lives in one binary.
+	// DEFAULT 1 -- SHIPPED 2026-09-03 (Phase 1 arm 1 of the P0-OWNERMAP
+	// portfolio; docs/perf-redesign-2026-09-03.md Phase 1 log). The full
+	// protocol ran before the flip, in order, each leg able to fail:
+	//   * POISON (P1-ANYSOLID-POISON): wrongClear=24,322,128 == checked
+	//     exactly, cellIndexEmpty fired 239M (first nonzero ever), uncovered
+	//     39.8% -> 56.2% with a visibly broken capture -- the audit CAN fail
+	//     and the image agrees. RED ARM PASSES.
+	//   * AUDIT (P1-ANYSOLID-AUDIT): checked=24,183,522 wrongClear=0;
+	//     cellIndexEmpty=169M (engaged); uncovered 39.83% == pose baseline.
+	//     The refine kernel stayed conservative as documented (cleared
+	//     16,899 proven-air cells, refused 291M uncertain). GREEN ARM PASSES.
+	//   * FLIGHT A/B (P1-ANYSOLID-FLIGHT vs control OWNERRES-1440D, same
+	//     binary+pose+harness): p50 10.807 -> 10.635 (-0.17), p95 14.225 ->
+	//     13.995 (-0.23) -- inside the predicted 0.2-0.4 band, consistent at
+	//     both percentiles. SHIP.
+	// The band prediction held BECAUSE the 73%-wasted-fetch headline was
+	// discounted for MALL (see the expectation note above): quote the ms,
+	// never the percentage. 0 remains the one-line revert and restores the
+	// pre-flip binary behaviour byte-for-byte.
 	TAutoConsoleVariable<int32> CVarVoxelMarchIndexAnySolid(
-		TEXT("voxel.March.IndexAnySolid"), 0,
+		TEXT("voxel.March.IndexAnySolid"), 1,
 		TEXT("1 = after each index write, a compute pass re-reads the chunk RECORD for every "
 		     "pool slot, re-runs the marcher's own origin+level validation against the index "
 		     "cell that names it, and CLEARS the entry's anySolid bit (bit 30) on positive "
 		     "proof that the chunk is entirely air -- turning VoxelBrickTraverse.ush's "
-		     "never-taken cheapest skip on. 0 (DEFAULT) = the bit stays the hardcoded 1 it has "
-		     "always been. ENGAGEMENT PROOF is the census word cellIndexEmpty "
+		     "never-taken cheapest skip on. Default 1 (SHIPPED 2026-09-03, poison+audit+flight "
+		     "verified -- see the ship record above); 0 = the bit stays the hardcoded 1 it had "
+		     "always been (the control / one-line revert). ENGAGEMENT PROOF is the census word cellIndexEmpty "
 		     "(voxel.March.HoleStats 1) leaving zero for the first time; CORRECTNESS PROOF is "
 		     "voxel.March.IndexAnySolidAudit reading wrongClear=0 over a non-zero checked "
 		     "count. The bit is a HINT and the record is truth: every uncertain case in the "
