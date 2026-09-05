@@ -126,7 +126,16 @@ namespace
 	// but the parity gate would not catch a wrong u8 there. Same fixture-gap
 	// shape v22 documented; a semi-band region in kBandOnlyRegions is the
 	// close, if anyone needs it proven.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 28;
+	//
+	// v29 (keep-driven publish re-export, 2026-09-05): the v25/v26/v28 shape
+	// again -- species.vxm bytes moved (exported seed sets now derived from
+	// the library's kept seeds; core.h's v29 entry), which is asset input,
+	// not terrain, and this path installs no AssetField, so the asset term
+	// is absent here entirely. Version mirror moves, digest stays
+	// structurally. Re-run voxel.GPU.VerifyRegion at the next editor
+	// session to confirm the pin (this bump landed from a session that
+	// cannot hold the editor slot).
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 29;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "

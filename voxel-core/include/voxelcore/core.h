@@ -413,7 +413,22 @@ namespace vxc {
 // savanna 143 -> 25 trees/ha with its grass untouched at ~3,200/ha, while
 // taiga keeps 279 trees/ha -- cross-biome tree spread 5x -> 15.5x, grass
 // 2.1x -> 10x (per-site tables in the tuning commit).
-inline constexpr uint32_t kWorldGenVersion = 28;
+//
+// --- v29: KEEP-DRIVEN PUBLISH RE-EXPORT (curation change, 2026-09-05) ------
+//
+// No code change anywhere in this library -- species.vxm BYTES moved, and
+// manifest bytes are worldgen input (the v24 contract: assetmanifest.h;
+// docs/asset-placement-architecture.md section 9). Today's keep-driven
+// publish (asset-forge plan P2, commit 0b6f822;
+// docs/asset-forge-app-plan-2026-09-05.md) re-derives every reviewed
+// species' exported seed set from the library's KEPT seeds instead of the
+// fixed 1..4, prunes banks to match, and holds rejected species back by
+// name -- so which seeds of which species exist to place is what moved.
+// Terrain math is untouched: the v24..v26/v28 pattern, so terrain-only
+// digests must not move and the worldgen.ush mirror moves as a version
+// lock only (its v29 note). tools/publish.py printed the bump obligation
+// this entry discharges.
+inline constexpr uint32_t kWorldGenVersion = 29;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
 

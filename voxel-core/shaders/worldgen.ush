@@ -156,7 +156,16 @@
 // harness is broken", not "somebody skipped a step". 38bc780 recorded exactly
 // this at v26. The mirror version moves so the skew check keeps meaning "the
 // math disagrees" rather than "somebody forgot the dance."
-#define VXC_WORLDGEN_VERSION_USH 28
+//
+// v29 (keep-driven publish re-export, 2026-09-05): version lock only, NO
+// MATH -- the v24..v26/v28 pattern once more. species.vxm bytes moved
+// because the keep-driven publish derives each reviewed species' exported
+// seeds from the library's kept set (core.h's v29 entry has the full
+// story); manifest bytes are worldgen input, placement is not terrain
+// math, and not one constant below changes, so the prebuilt SPIR-V is NOT
+// respun. The C++ bump and this line land in the same commit, per the v26
+// and v28 lessons above.
+#define VXC_WORLDGEN_VERSION_USH 29
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
