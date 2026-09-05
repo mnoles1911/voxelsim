@@ -1200,8 +1200,14 @@ function SeedDetail({
      * so resizing the panel IS resizing the viewport; orbit/zoom stay bound
      * to the canvas alone (the panel only drags by header and corner). */
     <FloatingPanel
-      storageKey="af-panel-seed-detail"
-      defaultSize={{ w: 1536, h: 1100 }}
+      /* -v2: the owner asked for HALF THE SCREEN as the default; the key
+       * bump makes that default beat any earlier persisted box. */
+      storageKey="af-panel-seed-detail-v2"
+      defaultSize={{
+        w: Math.max(700, Math.round(window.innerWidth * 0.5)),
+        h: Math.round(window.innerHeight * 0.92),
+      }}
+      defaultPosition="right"
       onClose={onClose}
       title={
         <span className="flex items-center gap-2">

@@ -68,8 +68,13 @@ export function LibraryInspector({
      * bar to move, the corner to resize, remembered in localStorage under
      * its own key. The canvas fills the panel's height. */
     <FloatingPanel
-      storageKey="af-panel-library-inspector"
-      defaultSize={{ w: 2048, h: 1280 }}
+      /* -v2: viewport-relative default per the half-the-screen directive;
+       * the key bump makes it beat any earlier persisted box. */
+      storageKey="af-panel-library-inspector-v2"
+      defaultSize={{
+        w: Math.max(900, Math.round(window.innerWidth * 0.6)),
+        h: Math.round(window.innerHeight * 0.92),
+      }}
       onClose={() => onOpenChange(null)}
       title={
         <span className="flex items-center gap-2 pr-6">

@@ -55,24 +55,36 @@ function loadBox(key: string, fallback: () => PanelBox): PanelBox {
 }
 
 export function FloatingPanel({
-  storageKey, defaultSize, title, onClose, children, className,
+  storageKey, defaultSize, defaultPosition = "center", title, onClose, children, className,
 }: {
-  /** localStorage key: the user's size/position survive across sessions. */
+  /** localStorage key: the user's size/position survive across sessions.
+   *  VERSION IT (-v2, -v3...) whenever the default changes on an owner
+   *  directive, so the new default beats any previously-persisted box. */
   storageKey: string;
-  /** Requested default (already the doubled size); clamped to the viewport. */
+  /** Default box; compute it from window.* at the call site for
+   *  viewport-relative sizing ("half the screen"). Clamped either way. */
   defaultSize: { w: number; h: number };
+  /** "right" parks the default against the right edge (the gallery stays
+   *  visible beside it); "center" centres it. Only the DEFAULT -- the
+   *  user's own dragging wins once persisted. */
+  defaultPosition?: "center" | "right";
   title: React.ReactNode;
   onClose: () => void;
   children: React.ReactNode;
   className?: string;
 }) {
   const [box, setBox] = React.useState<PanelBox>(() =>
-    loadBox(storageKey, () => ({
-      w: defaultSize.w,
-      h: defaultSize.h,
-      x: (window.innerWidth - Math.min(defaultSize.w, window.innerWidth - 24)) / 2,
-      y: Math.max(24, (window.innerHeight - Math.min(defaultSize.h, window.innerHeight - 24)) / 2),
-    })),
+    loadBox(storageKey, () => {
+      const w = Math.min(defaultSize.w, window.innerWidth - 24);
+      const h = Math.min(defaultSize.h, window.innerHeight - 24);
+      return {
+        w: defaultSize.w,
+        h: defaultSize.h,
+        x: defaultPosition === "right" ? window.innerWidth - w - 12
+          : (window.innerWidth - w) / 2,
+        y: Math.max(12, (window.innerHeight - h) / 2),
+      };
+    }),
   );
   const boxRef = React.useRef(box);
   boxRef.current = box;
