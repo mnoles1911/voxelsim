@@ -24,11 +24,44 @@ voxels every time. That is what makes "hundreds of variants" cheap.
 
 ## Status
 
-**828 species across ten kinds** — tree 78, bush 57, grass 89, flower 87,
-reed 33, rock 102, and the 382 animals (bird 127, quadruped 131, fish 106,
+**830 species across eleven kinds, in three categories** — tree 78, bush 57, grass 89, flower 87,
+reed 33, rock 102, the 382 animals (bird 127, quadruped 131, fish 106,
 cetacean 18) that are authored and deliberately not rendered until animation
-exists. Plants and rocks **are in the world**: the engine composes them into
-terrain chunks on both the CPU and GPU paths.
+exists, and 2 artifacts (`canoe`, `glider`). Plants and rocks **are in the
+world**: the engine composes them into terrain chunks on both the CPU and GPU
+paths.
+
+## Categories: what an asset IS
+
+`kind` answers "which generator drew it". **`category` answers "what is this
+thing in the game"**, and until the eleventh kind arrived the two had the same
+answer for every asset here, which is why the difference had never been written
+down. `forge/categories.py` is the whole taxonomy:
+
+| category | kinds | what it means |
+|---|---|---|
+| **environment** | tree, bush, rock, grass, reed, flower | Static world content. Composed into terrain chunks and placed by the deterministic per-chunk scatter. |
+| **creature** | fish, cetacean, bird, quadruped | Spawned living things. In the manifest with biome weights so a spawner can find them; authored and deliberately not rendered until animation exists. |
+| **craftable** | artifact | Objects a player can make, carry and use. Own pitch, own transform, no bank, no biome, no manifest record. `canoe` and `glider` are the first two. |
+
+**Not one of those boundaries is new information** — each is a line the code
+already drew and never named, and `manifest.py` asserts at import that
+`environment` still *is* `KINDS_ON_SCATTER` and `craftable` still *is*
+`KINDS_ENTITY`, so the two cannot drift into disagreeing.
+
+**The kind carries the default; a spec may override it.** Category is a
+statement about the OBJECT and kind is a statement about the GENERATOR, and
+those diverge the moment a torch and a canoe share `artifact` while a rope and a
+vine share a tuft. One resolver — `categories.of(spec)` — so the app, the
+library index, the build check and the game get the same answer. The override is
+**not a parameter and must never become one**: it rides beside `curation` and
+`biome_allow`, out of both hashes, because a row in `spec.PARAMS` puts a new key
+in all 830 canonical JSONs and re-identifies every species in the library.
+
+**The query seam** — "list the craftable items" — is
+`library/categories.json` (`tools/export_categories.py`), with
+`categories.members("craftable", specs)` and `/api/categories` as the Python and
+live equivalents. See `library/README.md`.
 
 **Lattice is decided by how a species lives in the world** (owner, 2026-08-13).
 *Terrain lattice*: every tree (78) and rock (102) plus the body-scale bushes (33)
@@ -39,6 +72,12 @@ finer lattice (1-5 cm), never enter the terrain grid, and are drawn as instances
 in the detail ring. `tools/all_to_5cm.py` is reversed and must stay that way -
 nothing in voxel-core resamples, so a 5 cm rock read through `AssetGrid::at`
 comes out at twice its size.
+*Entity* (ADR-0010, `docs/adr/0010-two-lattice-jurisdictions.md`): the
+`artifact` kind. Spawned craft carry their own pitch under their own transform,
+are never indexed by chunk coordinate, hold no biome weight and produce no bank
+— `forge.manifest.species_record` refuses them BY NAME rather than as an
+"unknown kind", so the exclusion reads as deliberate in the export report.
+See `docs/artifact-craft.md` for what the engine loads and from where.
 
 Both former engine blockers are retired. The **streaming bound** now admits the
 chunks an asset reaches (exact per-footprint admission), and the **material
@@ -86,6 +125,17 @@ parameter group and one entry there; it is not a second application.
 | Fish | lofted body + thin fin plates — see **Fish** | 17 | landed |
 | Whales & dolphins | the same generator; horizontal fluke, flippers, blowhole | 7 | landed |
 | Birds | jointed layout: body, neck, head, bill, tail, wings — see **Birds** | 20 | yes (eleven plumage colours) |
+| Craft & artifacts | lofted hull, or thin panel on spars — see **Artifacts** | 2 | no |
+
+**Artifacts are the first kind that was never alive, and the first ENTITY
+kind.** A canoe does not grow, erode or branch: it was drawn once, out of two
+curves, and what makes it read as a canoe is that those curves are fair.
+So the generator is the simplest one here — two closed-form families evaluated
+as FIELDS over the whole grid (a lofted closed hull, and a thin swept panel on
+spars), no recursion and no habit model — and every drawing step reports a
+voxel delta so a gunwale that drew nothing is an error and not a shrug. They
+are ENTITIES under ADR-0010: own pitch (2.5 cm), own transform, no biome, no
+bank. See **Artifacts** in `docs/artifact-craft.md`.
 
 **Fish are the first animal here, and the first asset that does not stand on
 the ground.** They are placed IN water, they face a direction, and they are not

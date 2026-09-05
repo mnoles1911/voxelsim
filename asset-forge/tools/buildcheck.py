@@ -54,7 +54,7 @@ from collections import Counter
 from pathlib import Path
 
 import _path  # noqa: F401  (sys.path bootstrap)
-from forge import cli, pipeline, spec as sm
+from forge import categories as catlib, cli, pipeline, spec as sm
 
 SPECS = Path(__file__).resolve().parents[1] / "specs"
 
@@ -66,6 +66,13 @@ def main() -> int:
                     help="which individuals to build of each species (default: 1)")
     ap.add_argument("--kind", action="append",
                     help="only these kinds (repeatable), e.g. --kind rock")
+    ap.add_argument("--category", action="append",
+                    help="only these categories (repeatable), e.g. --category "
+                         "craftable. WHAT a species is rather than which "
+                         "generator drew it -- see forge/categories.py. A "
+                         "category may span kinds, so this is not a synonym "
+                         "for --kind and will stop being close to one the "
+                         "first time a craftable is not an `artifact`.")
     ap.add_argument("--spec", action="append",
                     help="only these species by name (repeatable)")
     ap.add_argument("--no-allow", action="store_true",
@@ -115,11 +122,32 @@ def main() -> int:
     built = 0
     t0 = time.perf_counter()
 
+    for name in args.category or ():
+        if name not in catlib.BY_KEY:
+            raise SystemExit(f"buildcheck: no such category {name!r}; known: "
+                             f"{catlib.KEYS}. A filter that matches nothing "
+                             f"would exit 0 having checked nothing.")
+
     for fp in paths:
         s, rep = sm.load(fp)
         kind = sm.get(s, "kind")
         if args.kind and kind not in args.kind:
             continue
+        if args.category:
+            # A species that resolves to NO category is not silently skipped by
+            # a category filter -- it is reported, because "it did not match"
+            # and "nothing can classify it" are different answers and only one
+            # of them is somebody's problem.
+            got = catlib.of(s)
+            if got is None:
+                failures.append(f"{fp.stem}: category resolves to nothing "
+                                f"({catlib.source_of(s)}) -- it is in no "
+                                f"category and no index will list it")
+                print(f"{fp.stem:<26} {kind:<6}       FAIL  no category",
+                      flush=True)
+                continue
+            if got not in args.category:
+                continue
         seen_kind[kind] += 1
         allowed = None if args.no_allow else cli.KNOWN_MULTIPIECE.get(fp.stem)
         spec_failed = False

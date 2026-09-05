@@ -587,6 +587,24 @@ def camera_for(spec: dict) -> str:
         return "broadhigh"
     if kind == "rock":
         return "side"
+    if kind == "artifact":
+        # THE TWO FORMS WANT OPPOSITE CAMERAS, and this is the second case after
+        # `bird.pose` where the kind alone does not decide it.
+        #
+        # A HULL IS A PROFILE. Sheer, rocker and the two stems are all drawn in
+        # elevation and nothing else in the asset competes with them, which is
+        # the same argument the rocks make for `side`. But a canoe has an inside
+        # that a person sits in, and the elevation camera cannot see into it at
+        # all -- so it is the broadside camera LIFTED, the same 30 degrees the
+        # cetaceans take for a flat fluke, which keeps screen-x equal to the
+        # boat's length while showing the thwarts and the floor.
+        #
+        # A WING IS A PLANFORM. Sweep, taper and span are the whole subject, and
+        # every one of them is invisible from the side: a broadside view of a
+        # delta wing is a body with two edges sticking out of it, which is
+        # exactly what `bird.pose == "flying"` says about a spread wing. The
+        # isometric looks down at it and shows the plan.
+        return "iso" if get(spec, "artifact.form") == "wing" else "broadhigh"
     return "iso"
 
 
@@ -854,6 +872,35 @@ def predicted_extent(spec: dict, voxel_m: float = 0.10) -> tuple[int, int, int]:
                    (length * float(get(spec, "quad.shoulder_h")) * 3.4
                     if get(spec, "quad.stance") == "sprawling" else 0.0)) + 0.08
         return (max(1, int(span / voxel_m)), max(1, int(wide / voxel_m)),
+                max(1, int(tall / voxel_m)))
+
+    if kind == "artifact":
+        # Same warning as the animals above, and it bites here too: this is what
+        # `server.preview_resolution` reads, and a 4 m canoe that looks like a
+        # 12 m crown to the estimator is previewed at the coarsest tier there
+        # is. Both forms are drawn from their own numbers rather than from
+        # `height_m`, which an artifact never authors.
+        if get(spec, "artifact.form") == "wing":
+            c0 = float(get(spec, "artifact.length_m"))
+            span = float(get(spec, "artifact.beam_m"))
+            half = span * 0.5
+            # Fore-and-aft reach is the TIP's trailing edge or the keel's
+            # overhang, whichever is further back -- on a swept delta the tip is
+            # usually the answer and the root chord alone under-reads by half.
+            fore = max(half * float(get(spec, "artifact.sweep"))
+                       + c0 * float(get(spec, "artifact.taper")),
+                       c0 + float(get(spec, "artifact.keel_m"))) + 0.1
+            tall = (float(get(spec, "artifact.frame_drop_m"))
+                    + abs(float(get(spec, "artifact.droop_m")))
+                    + abs(float(get(spec, "artifact.billow_m"))) + 0.2)
+            return (max(1, int(fore / voxel_m)), max(1, int((span + 0.1) / voxel_m)),
+                    max(1, int(tall / voxel_m)))
+        length = float(get(spec, "artifact.length_m"))
+        beam = float(get(spec, "artifact.beam_m"))
+        depth = float(get(spec, "artifact.depth_m"))
+        tall = depth * (1.0 + float(get(spec, "artifact.sheer"))) + 0.1
+        return (max(1, int((length + 0.1) / voxel_m)),
+                max(1, int((beam + 0.2) / voxel_m)),
                 max(1, int(tall / voxel_m)))
 
     if kind == "rock":

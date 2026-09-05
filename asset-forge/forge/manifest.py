@@ -155,6 +155,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import biomes as biomelib
+from . import categories as _catlib
+from . import kinds as _kindlib
 from . import spec as sm
 
 MAGIC = b"VXM1"
@@ -229,6 +231,51 @@ WATER_KIND_TO_MASK = {
 
 KINDS_ON_SCATTER = ("tree", "bush", "rock", "grass", "reed", "flower")
 KINDS_TERRAIN = ("tree", "rock")
+
+# ENTITY KINDS ARE NOT WORLD CONTENT AND ARE REFUSED BY NAME (ADR-0010).
+#
+# Derived from `forge/kinds.py`, not typed here, because a second copy of the
+# list is exactly the drift this file's own header warns about.
+#
+# WHY IT IS NOT ENOUGH TO LEAVE THEM OUT OF `KIND_ORDER`. They already are out
+# of it -- that tuple mirrors `assetmanifest.h` and is the ENGINE's append-only
+# contract, so adding a row to it is an engine change and not an authoring one
+# -- and `species_record` would therefore refuse a canoe anyway, as "unknown
+# kind 'artifact'". That refusal is correct and its REASON is wrong, and a wrong
+# reason in an export report is how a deliberate exclusion gets "fixed" by
+# somebody appending the row. Refusing it by name says the thing that is true:
+# an entity has its own pitch and its own transform, it is never indexed by
+# chunk coordinate, and there is nothing for the scatter to place.
+KINDS_ENTITY = tuple(k.key for k in _kindlib.KINDS if k.lattice == "entity")
+
+# THE TAXONOMY AND THIS FILE'S TUPLES ARE THE SAME TWO LINES, AND THIS IS WHERE
+# THAT IS CHECKED.
+#
+# `forge/categories.py` claims that "environment" IS the scatter set and
+# "craftable" IS the entity set. If that claim is only true in a docstring then
+# the day somebody adds a kind to one of these tuples, the app's grouping, the
+# library index and the game's craftable list all keep the old answer with
+# nothing anywhere reporting it -- a derived fact in two places, which is this
+# repo's documented failure mode and the reason `ground.py` asserts on the plant
+# menus and `envelope.py` on the crown shapes.
+#
+# It lives HERE and not in categories.py because the import runs one way:
+# categories imports `kinds` and nothing else, manifest imports both.
+assert set(_catlib.BY_KEY["environment"].kinds) == set(KINDS_ON_SCATTER), (
+    "forge/categories.py 'environment' and manifest.KINDS_ON_SCATTER disagree "
+    f"about which kinds the per-chunk scatter places: "
+    f"{sorted(set(_catlib.BY_KEY['environment'].kinds) ^ set(KINDS_ON_SCATTER))}")
+assert set(_catlib.BY_KEY["craftable"].kinds) == set(KINDS_ENTITY), (
+    "forge/categories.py 'craftable' and manifest.KINDS_ENTITY disagree about "
+    f"which kinds are entities: "
+    f"{sorted(set(_catlib.BY_KEY['craftable'].kinds) ^ set(KINDS_ENTITY))}")
+# And the manifest's own append-only KIND_ORDER must cover exactly the kinds
+# whose category says they get a species record. This is the check that fires
+# if a future category is added without deciding whether it is published.
+assert set(KIND_ORDER) == {k for c in _catlib.CATEGORIES if c.in_manifest
+                           for k in c.kinds}, (
+    "forge/categories.py's `in_manifest` flags and manifest.KIND_ORDER "
+    "disagree about which kinds are published to the engine")
 LAYER_NOT_SCATTERED = 255
 
 
@@ -882,6 +929,13 @@ def folded_top_per_mille(spec: dict, layer: int, top_weight_pm: "int | None" = N
 def species_record(spec: dict, name: str, seeds_baked: int,
                    report: ExportReport) -> bytes | None:
     kind = sm.get(spec, "kind")
+    if kind in KINDS_ENTITY:
+        report.unplaceable.append(
+            (name, f"{kind} is an ENTITY kind (ADR-0010) in category "
+                   f"{_catlib.BY_KIND.get(kind)!r}: own pitch, own transform, "
+                   f"never composed into the world. Not a gap in this table -- "
+                   f"do not add it to KIND_ORDER."))
+        return None
     if kind not in KIND_ORDER:
         report.unplaceable.append((name, f"unknown kind {kind!r}"))
         return None

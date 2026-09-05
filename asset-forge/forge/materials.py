@@ -352,6 +352,38 @@ BIRD_NAMES = CREATURE_NAMES
 # rejected once in the other direction.
 FISH_NAMES = CREATURE_NAMES
 
+
+# WHAT A HUMAN-MADE OBJECT MAY BE MADE OF. Nothing new is proposed here: every
+# entry already exists in the engine, because a boat and a glider are built out
+# of wood, cloth and metal and the palette already carries all three under names
+# that were chosen for something else.
+#
+#   wood     the four `WOOD_NAMES`. `heartwood` (146,112,76) is the planked
+#            hull, `bark` (88,66,48) the darker trim and gunwale, `deadwood`
+#            (134,122,104) the weathered strake.
+#   cloth    the plumage neutrals. `plume_buff` (208,176,118) is canvas,
+#            `plume_white` (246,246,242) is a modern sail, and the saturated
+#            entries are there because a hang-glider sail is a deliberately
+#            bright object and the library has no other bright flat colour.
+#   metal    `beak_horn` (96,88,76) is grey keratin, which is the only neutral
+#            mid-grey in the palette that is not a terrain material carrying a
+#            terrain's patch mottle. `plume_slate` and `plume_grey` are the
+#            cooler and lighter alternatives.
+#   stone    `rock` and `sand`, for anything built out of the ground.
+#
+# ONE MENU FOR ALL FIVE SLOTS, deliberately, and this is the lesson from
+# `_PLANT_MATERIALS` in spec.py: a hull menu and a fabric menu that differ by
+# four entries is how a value falls off one of them and gets SILENTLY REPLACED
+# with that row's default. There is nothing a hull may be made of that a
+# gunwale may not.
+ARTIFACT_NAMES = WOOD_NAMES + (
+    "rock", "sand", "gravel",
+    "skin_dark", "skin_pale", "skin_red", "skin_blue", "skin_yellow",
+    "skin_orange", "skin_green",
+    "plume_white", "plume_grey", "plume_slate", "plume_buff", "plume_rufous",
+    "plume_crimson", "plume_lime", "plume_cyan", "beak_horn",
+)
+
 # Preview colours. These drive the thumbnails and the .vox palette; they are a
 # stand-in for the engine's real shading, not a claim about it.
 COLORS = {

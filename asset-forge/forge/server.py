@@ -30,7 +30,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import parts as partslib
-from . import (biomes as biomelib, contact, kinds as kindlib, materials, pipeline,
+from . import (biomes as biomelib, categories as catlib, contact,
+               kinds as kindlib, materials, pipeline,
                render, spec as specmod, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -341,6 +342,7 @@ def keep(spec: dict, seed: int) -> dict:
         "id": entry_id,
         "species": name,
         "kind": specmod.get(spec, "kind"),
+        "category": catlib.of(spec),
         "seed": seed,
         "spec_hash": specmod.spec_hash(spec),
         "stats": tree.stats,
@@ -372,6 +374,12 @@ def _size_m(spec: dict, kind: str) -> float:
         # bison reading "1.8" next to a trout reading "0.3" would be comparing
         # two different measurements in one column.
         return specmod.get(spec, "quad.length_m")
+    if kind == "artifact":
+        # LENGTH OVERALL for a hull, ROOT CHORD for a wing -- both of which are
+        # `artifact.length_m`, and neither of which is `height_m`, which an
+        # artifact never authors and which would read as 12 m for every craft in
+        # the library.
+        return specmod.get(spec, "artifact.length_m")
     return specmod.get(spec, "height_m")
 
 
@@ -393,6 +401,11 @@ def _shape_word(spec: dict, kind: str) -> str:
         # standing / sprawling / bipedal splits it into three groups that mean
         # something, and it is the row that decides the limb geometry.
         return specmod.get(spec, "quad.stance")
+    if kind == "artifact":
+        # THE FORM, which is the row that decides the entire parameter set, the
+        # camera, the grid and which of two generators runs. Same reasoning as
+        # the bird's pose above.
+        return specmod.get(spec, "artifact.form")
     return specmod.get(spec, "crown.shape")
 
 
@@ -724,9 +737,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/kinds":
             return self._json([
                 {"key": k.key, "label": k.label, "blurb": k.blurb, "ready": k.ready,
+                 # The kind's DEFAULT category. A spec may override it, so the
+                 # per-species answer is on /api/specs and both come from
+                 # `forge.categories.of` -- one resolver, so the kind bar and
+                 # the species list cannot disagree.
+                 "category": catlib.BY_KIND.get(k.key),
                  "species": sum(1 for _, s in self._all_specs()
                                 if specmod.get(s, "kind") == k.key)}
                 for k in kindlib.KINDS
+            ])
+
+        if path == "/api/categories":
+            # THE QUERY SEAM, over HTTP. Same answer as
+            # `library/categories.json` (tools/export_categories.py) and the
+            # same resolver behind it; this one is live and that one is what a
+            # game reads without running Python.
+            loaded = [(specmod.get(s, "name"), s) for _p, s in self._all_specs()]
+            return self._json([
+                {"key": c.key, "label": c.label, "blurb": c.blurb,
+                 "kinds": list(c.kinds), "scattered": c.scattered,
+                 "in_manifest": c.in_manifest,
+                 "species": catlib.members(c.key, loaded)}
+                for c in catlib.CATEGORIES
             ])
 
         if path == "/api/vocabulary":
@@ -767,7 +799,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "kept": kept.get(name, 0),
                                 "size_m": _size_m(s, kind),
                                 "model": (kind if kind in ("rock", "fish", "cetacean", "bird",
-                                                   "quadruped")
+                                                   "quadruped", "artifact")
                                           else specmod.get(s, "growth.model")),
                             })
                     members.sort(key=lambda m: -m["weight"])
@@ -783,16 +815,25 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/specs":
             want = q.get("kind") or None
+            want_cat = q.get("category") or None
             out = []
             for p, s in self._all_specs():
                 kind = specmod.get(s, "kind")
                 if want and kind != want:
+                    continue
+                if want_cat and catlib.of(s) != want_cat:
                     continue
                 out.append(
                     {
                         "name": specmod.get(s, "name"),
                         "file": p.name,
                         "kind": kind,
+                        # WHAT it is, and whether a human said so or the kind
+                        # decided -- two different facts, printed as two, the
+                        # same way `curation` distinguishes an approved species
+                        # from a grandfathered one.
+                        "category": catlib.of(s),
+                        "category_via": catlib.source_of(s),
                         "hash": specmod.spec_hash(s),
                         "size_m": _size_m(s, kind),
                         "height_m": specmod.get(s, "height_m"),
