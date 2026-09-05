@@ -27,12 +27,43 @@ export interface Biome {
   hosts: string[]; // kind keys this biome hosts
 }
 
+/* --- categories (mirrors forge/categories.py) ----------------------------
+ *
+ * WHAT an asset is, as opposed to which generator drew it. `kind` answers the
+ * second question; a canoe and a torch would share a kind and not a category,
+ * a rope and a vine could share a kind and not a category. The kind carries
+ * the DEFAULT and a spec may override it, so the per-species answer is on
+ * SpeciesRow and the kind's default is on Kind -- both resolved server-side by
+ * `forge.categories.of`, never re-derived here. Two copies of one rule is the
+ * failure this repo repeats. */
+export const CATEGORIES = ["environment", "creature", "craftable"] as const;
+export type CategoryKey = (typeof CATEGORIES)[number];
+
+export const CATEGORY_LABEL: Record<string, string> = {
+  environment: "Environment",
+  creature: "Creatures",
+  craftable: "Craftable items",
+};
+
 export interface Kind {
   key: string;
   label: string;
   blurb: string;
   ready: boolean;
   species: number;
+  /** The kind's DEFAULT category. A spec may override it -- read
+   *  SpeciesRow.category for the per-species answer. */
+  category?: string;
+}
+
+export interface Category {
+  key: string;
+  label: string;
+  blurb: string;
+  kinds: string[];
+  scattered: boolean;
+  in_manifest: boolean;
+  species: string[];
 }
 
 /* --- curation (mirrors forge/spec.py curation block) -------------------- */
@@ -217,6 +248,12 @@ export interface SpeciesRow {
   name: string;
   file: string;
   kind: string;
+  /** Resolved server-side. `null` means nothing can classify it -- an
+   *  illegible `category` block -- and such a species appears in no index. */
+  category?: string | null;
+  /** "kind" | "spec" | "illegible" | "unknown": whether a human said so or the
+   *  kind decided. Two different facts, shown as two. */
+  category_via?: string;
   hash: string;
   size_m: number;
   resolution_cm: number;

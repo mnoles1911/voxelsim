@@ -3,6 +3,7 @@ import { Check, FileBox, Rotate3d, Stamp, X } from "lucide-react";
 import type { World } from "../App";
 import { api } from "../lib/api";
 import type { CurationStatus, SpeciesRow } from "../lib/schema";
+import { CATEGORY_LABEL } from "../lib/schema";
 import { CURATION_SEEDS } from "../lib/schema";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
@@ -32,6 +33,13 @@ export function SpeciesPanel({
   const toast = useToast();
 
   const kindLabel = world.kinds.find((k) => k.key === row.kind)?.label ?? row.kind;
+  /* WHAT it is, beside WHICH GENERATOR drew it. Resolved server-side; `null`
+   * means nothing can classify it, and that is worth reading as an alarm
+   * rather than as a blank -- such a species appears in no index anywhere. */
+  const categoryLabel = row.category
+    ? (CATEGORY_LABEL[row.category] ?? row.category)
+      + (row.category_via === "spec" ? " (per spec)" : "")
+    : "NO CATEGORY";
 
   return (
     <div className="flex flex-col gap-4 p-4">
@@ -40,7 +48,10 @@ export function SpeciesPanel({
         <div className="min-w-0">
           <h2 className="truncate font-display text-2xl tracking-wide text-parch-100">{row.name}</h2>
           <div className="font-mono text-xs text-parch-500">
-            {kindLabel} · {row.size_m.toFixed(1)} m · {row.shape} · authored at {row.resolution_cm} cm · spec {row.hash}
+            <span className={row.category ? "text-parch-400" : "text-rust-400"}>
+              {categoryLabel}
+            </span>
+            {" · "}{kindLabel} · {row.size_m.toFixed(1)} m · {row.shape} · authored at {row.resolution_cm} cm · spec {row.hash}
           </div>
         </div>
         <div className="ml-auto">

@@ -2,7 +2,8 @@
  * lib/schema.ts (the seam); no route is called anywhere else in the app. */
 
 import type {
-  Biome, Curation, CurationStatus, Kind, LibraryEntry, PlacementRule, RulesDoc, SpeciesRow,
+  Biome, Category, Curation, CurationStatus, Kind, LibraryEntry, PlacementRule, RulesDoc,
+  SpeciesRow,
 } from "./schema";
 
 async function j<T>(r: Response): Promise<T> {
@@ -19,6 +20,10 @@ const post = (url: string, body: unknown) =>
 export const api = {
   biomes: () => fetch("/api/biomes").then((r) => j<Biome[]>(r)),
   kinds: () => fetch("/api/kinds").then((r) => j<Kind[]>(r)),
+  /* THE QUERY SEAM, live. Same answer as library/categories.json and the same
+   * resolver behind it (forge.categories.of); that file is what a game reads
+   * without running Python. */
+  categories: () => fetch("/api/categories").then((r) => j<Category[]>(r)),
   specs: () => fetch("/api/specs").then((r) => j<SpeciesRow[]>(r)),
   library: () => fetch("/api/library").then((r) => j<LibraryEntry[]>(r)),
   rules: () => fetch("/api/rules").then((r) => j<RulesDoc>(r)),

@@ -4,7 +4,8 @@ import {
 } from "lucide-react";
 import type { World } from "../App";
 import { api, forgeApi } from "../lib/api";
-import type { JobProgress, TileState, UiParam, UiSchema } from "../lib/schema";
+import type { JobProgress, Kind, TileState, UiParam, UiSchema } from "../lib/schema";
+import { CATEGORIES, CATEGORY_LABEL } from "../lib/schema";
 import { getPath, setPath } from "../lib/schema";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
@@ -12,7 +13,9 @@ import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Input, Textarea } from "./ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import {
+  Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
+} from "./ui/select";
 import { useToast } from "./ui/toast";
 import { VoxelCanvas } from "./VariantViewer";
 import { cn } from "../lib/cn";
@@ -37,11 +40,12 @@ const DEFAULT_SPECIES: Record<string, string> = {
   tree: "temperate-oak", bush: "bramble-thicket", rock: "granite-boulder",
   grass: "meadow-grass", reed: "water-reed", flower: "meadow-daisy",
   fish: "brown-trout", cetacean: "bottlenose-dolphin", bird: "european-robin",
-  quadruped: "red-fox",
+  quadruped: "red-fox", artifact: "canoe",
 };
 
 /** Groups worth opening by default; the rest start folded. */
-const OPEN_GROUPS = new Set(["general", "crown", "trunk", "rock", "tuft", "fish", "bird", "quad"]);
+const OPEN_GROUPS = new Set(["general", "crown", "trunk", "rock", "tuft", "fish", "bird", "quad",
+                             "artifact"]);
 
 type Spec = Record<string, unknown>;
 
@@ -60,6 +64,24 @@ export function ForgeView({
 }) {
   const toast = useToast();
   const readyKinds = world.kinds.filter((k) => k.ready);
+  /* The kind menu, grouped by CATEGORY. Eleven kinds flat gave a reader no way
+   * to see that the newest one is neither scenery nor an animal. Order follows
+   * `CATEGORIES` (the server's own order) and anything the server hands back
+   * with an unknown category still appears, under "other" -- a kind that
+   * vanished from the menu because its category was mistyped would be a far
+   * worse failure than an ugly heading. */
+  const kindsByCategory = React.useMemo(() => {
+    const seen = new Set<string>();
+    const groups: { key: string; label: string; kinds: Kind[] }[] = [];
+    for (const c of CATEGORIES) {
+      const members = readyKinds.filter((k) => k.category === c);
+      members.forEach((k) => seen.add(k.key));
+      if (members.length) groups.push({ key: c, label: CATEGORY_LABEL[c] ?? c, kinds: members });
+    }
+    const rest = readyKinds.filter((k) => !seen.has(k.key));
+    if (rest.length) groups.push({ key: "other", label: "Other", kinds: rest });
+    return groups;
+  }, [readyKinds]);
   const [kind, setKind] = React.useState<string>(readyKinds[0]?.key ?? "tree");
   const [schema, setSchema] = React.useState<UiSchema | null>(null);
   const [spec, setSpec] = React.useState<Spec | null>(null);
@@ -279,10 +301,15 @@ export function ForgeView({
             <Select value={kind} onValueChange={(k) => void loadKind(k)}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                {readyKinds.map((k) => (
-                  <SelectItem key={k.key} value={k.key}>
-                    {k.label} ({k.species})
-                  </SelectItem>
+                {kindsByCategory.map((g) => (
+                  <SelectGroup key={g.key}>
+                    <SelectLabel>{g.label}</SelectLabel>
+                    {g.kinds.map((k) => (
+                      <SelectItem key={k.key} value={k.key}>
+                        {k.label} ({k.species})
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
                 ))}
               </SelectContent>
             </Select>
@@ -298,7 +325,24 @@ export function ForgeView({
               </SelectContent>
             </Select>
           </div>
-          {kindMeta && <p className="text-xs text-parch-500">{kindMeta.blurb}</p>}
+          {kindMeta && (
+            <p className="flex flex-wrap items-center gap-1.5 text-xs text-parch-500">
+              {/* WHAT the loaded species is, and WHO said so. `via: "spec"`
+                * means a human overrode the kind's default and that is worth
+                * seeing; `via: "illegible"` means nothing can classify it and
+                * no index will list it, which is worth seeing loudly. */}
+              {specRow?.category && (
+                <Badge variant={specRow.category === "craftable" ? "gold" : "outline"}>
+                  {CATEGORY_LABEL[specRow.category] ?? specRow.category}
+                  {specRow.category_via === "spec" ? " (per spec)" : ""}
+                </Badge>
+              )}
+              {specRow && !specRow.category && (
+                <Badge variant="rust">no category — listed nowhere</Badge>
+              )}
+              <span>{kindMeta.blurb}</span>
+            </p>
+          )}
           <div className="flex items-center gap-2">
             <Input
               className="h-7 font-mono text-xs"
@@ -792,7 +836,8 @@ function SeedTile({
 
 /* --- the seed detail dialog: big 3D preview + stats + keep ----------------- */
 
-const BRANCHLESS = new Set(["rock", "grass", "reed", "flower", "fish", "cetacean", "bird", "quadruped"]);
+const BRANCHLESS = new Set(["rock", "grass", "reed", "flower", "fish", "cetacean", "bird", "quadruped",
+                            "artifact"]);
 
 function SeedDetail({
   world, job, seed, species, tile, kept, onKeep, onPlace, onClose,

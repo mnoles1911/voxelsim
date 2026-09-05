@@ -2,11 +2,14 @@ import * as React from "react";
 import { Search } from "lucide-react";
 import type { World } from "../App";
 import type { SpeciesRow } from "../lib/schema";
+import { CATEGORIES, CATEGORY_LABEL } from "../lib/schema";
 import { allowedBiomes } from "../lib/schema";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
 import { Input } from "./ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import {
+  Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
+} from "./ui/select";
 import { SpeciesPanel } from "./SpeciesPanel";
 import { cn } from "../lib/cn";
 
@@ -49,7 +52,16 @@ export function LibraryView({
   const rows = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     return world.specs.filter((s) => {
-      if (kind !== "all" && s.kind !== kind) return false;
+      // ONE control, two axes. "cat:craftable" is a question a person actually
+      // asks -- "show me the things a player can make" -- and it is not the
+      // same question as "show me artifacts": the two coincide today and will
+      // stop coinciding the first time a craftable is not an `artifact`.
+      // Matching on the SERVER's resolved `category`, never re-derived here.
+      if (kind !== "all") {
+        if (kind.startsWith("cat:")) {
+          if (s.category !== kind.slice(4)) return false;
+        } else if (s.kind !== kind) return false;
+      }
       if (status !== "all") {
         if (status === "unreviewed" ? s.curation.curated : s.curation.status !== status) return false;
       }
@@ -83,9 +95,40 @@ export function LibraryView({
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All kinds</SelectItem>
-                {world.kinds.map((k) => (
-                  <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
-                ))}
+                <SelectGroup>
+                  <SelectLabel>Category</SelectLabel>
+                  {CATEGORIES.map((c) => (
+                    <SelectItem key={c} value={`cat:${c}`}>
+                      All {(CATEGORY_LABEL[c] ?? c).toLowerCase()}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+                {CATEGORIES.map((c) => {
+                  const members = world.kinds.filter((k) => k.category === c);
+                  if (!members.length) return null;
+                  return (
+                    <SelectGroup key={c}>
+                      <SelectLabel>{CATEGORY_LABEL[c] ?? c}</SelectLabel>
+                      {members.map((k) => (
+                        <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                  );
+                })}
+                {/* A kind the server hands back with an unknown category still
+                  * appears. A kind that vanished from the filter because its
+                  * category was mistyped would be far worse than an untidy
+                  * menu. */}
+                {world.kinds.some((k) => !k.category || !CATEGORIES.includes(k.category as never)) && (
+                  <SelectGroup>
+                    <SelectLabel>Other</SelectLabel>
+                    {world.kinds
+                      .filter((k) => !k.category || !CATEGORIES.includes(k.category as never))
+                      .map((k) => (
+                        <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
+                      ))}
+                  </SelectGroup>
+                )}
               </SelectContent>
             </Select>
             <Select value={biome} onValueChange={setBiome}>
