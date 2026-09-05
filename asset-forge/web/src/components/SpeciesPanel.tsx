@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, FileBox, Rotate3d, Stamp, X } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, FileBox, Rotate3d, Stamp, X } from "lucide-react";
 import type { World } from "../App";
 import { api } from "../lib/api";
 import type { CurationStatus, SpeciesRow } from "../lib/schema";
@@ -12,6 +12,7 @@ import { Input } from "./ui/input";
 import { useToast } from "./ui/toast";
 import { CurationBadge } from "./LibraryView";
 import { LibraryInspector } from "./LibraryInspector";
+import { VoxelCanvas } from "./VariantViewer";
 import { PlacementPanel } from "./PlacementPanel";
 import { cn } from "../lib/cn";
 
@@ -58,6 +59,8 @@ export function SpeciesPanel({
           <CurationBadge row={row} />
         </div>
       </header>
+
+      <JudgmentViewport row={row} world={world} />
 
       <CurationBar row={row} world={world} />
 
@@ -120,6 +123,71 @@ export function SpeciesPanel({
         />
       )}
     </div>
+  );
+}
+
+/* --- the judgment viewport (owner directive, 2026-09-05) -----------------
+ *
+ * "Visually this will be the viewport used to make judgements." The 3D orbit
+ * view of each seed variant sits DIRECTLY ABOVE the verdict buttons, so the
+ * review loop is look -> orbit -> verdict -> next -- with no kept entry
+ * required: the address is (species, seed), regenerated deterministically
+ * server-side, which is what lets the 828-species never-reviewed queue be
+ * judged at all. Same viewer as the Forge detail and the library inspector
+ * (one instanced WebGL2 draw, lib/viewer.ts); switching seeds keeps the
+ * camera, so variants are compared from one viewpoint. The seed chips here
+ * SWITCH THE VIEW only -- the bank toggles in the verdict bar below keep
+ * their own meaning, untouched. */
+
+function JudgmentViewport({ row, world }: { row: SpeciesRow; world: World }) {
+  const seeds = React.useMemo(
+    () => [...new Set([...CURATION_SEEDS, ...row.curation.seeds])].sort((a, b) => a - b),
+    [row.curation.seeds],
+  );
+  const [seed, setSeed] = React.useState<number>(row.curation.seeds[0] ?? seeds[0] ?? 1);
+  const idx = seeds.indexOf(seed);
+  const step = (d: number) => setSeed(seeds[(idx + d + seeds.length) % seeds.length] ?? seed);
+
+  return (
+    <section className="chamfer bevel-up bg-stone-800 p-3">
+      <h3 className="mb-2 flex items-center gap-2 font-display text-sm uppercase tracking-widest text-parch-400">
+        <Rotate3d className="h-4 w-4" /> Judgment viewport
+        <span className="font-mono text-[11px] normal-case tracking-normal text-parch-500">
+          seed {seed}
+          {row.curation.seeds.includes(seed) ? " · in the published bank" : " · not in the bank"}
+        </span>
+      </h3>
+      <VoxelCanvas
+        src={api.voxelsBySeedUrl(row.name, seed, row.hash)}
+        palette={world.palette}
+        className="h-96"
+      />
+      <div className="mt-2 flex items-center gap-1.5">
+        <Button variant="ghost" size="icon" className="h-7 w-7" title="Previous seed" onClick={() => step(-1)}>
+          <ChevronLeft className="h-4 w-4" />
+        </Button>
+        <div className="flex flex-1 flex-wrap gap-1.5">
+          {seeds.map((s) => (
+            <button
+              key={s}
+              onClick={() => setSeed(s)}
+              className={cn(
+                "chamfer-sm px-2.5 py-0.5 font-mono text-xs transition-colors",
+                s === seed
+                  ? "bevel-up bg-gold-600 text-parch-100"
+                  : "bevel-down bg-stone-850 text-parch-400 hover:text-parch-200",
+              )}
+              title={"View seed " + s + " (camera stays put)"}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+        <Button variant="ghost" size="icon" className="h-7 w-7" title="Next seed" onClick={() => step(1)}>
+          <ChevronRight className="h-4 w-4" />
+        </Button>
+      </div>
+    </section>
   );
 }
 

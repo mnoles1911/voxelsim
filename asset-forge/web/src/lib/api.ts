@@ -79,6 +79,14 @@ export const api = {
   thumbUrl: (id: string) => "/api/library/thumb?id=" + encodeURIComponent(id),
   voxelsUrl: (id: string, budget?: number) =>
     "/api/voxels?id=" + encodeURIComponent(id) + (budget ? "&max=" + budget : ""),
+  /* The judgment viewport's address: any (species, bank seed), regenerated
+   * deterministically from specs/ -- no kept entry required, so the whole
+   * never-reviewed queue can be orbited before a verdict. `hash` rides as a
+   * cache-buster (?v=) because the response is immutable-cached and the spec
+   * file can change under the same name. */
+  voxelsBySeedUrl: (name: string, seed: number, hash: string, budget?: number) =>
+    "/api/voxels?name=" + encodeURIComponent(name) + "&seed=" + seed +
+    "&v=" + encodeURIComponent(hash) + (budget ? "&max=" + budget : ""),
   downloadUrl: (id: string, fmt: "vox" | "vxa" | "spec") =>
     "/api/download?id=" + encodeURIComponent(id) + "&fmt=" + fmt,
 };

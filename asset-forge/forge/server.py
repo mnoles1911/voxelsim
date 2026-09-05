@@ -904,11 +904,29 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/voxels":
             # Binary surface voxels for the 3D viewer. Regenerated from
             # (spec, seed) like the detail render -- deterministic build means
-            # this is exactly the tree the thumbnail showed.
+            # this is exactly the tree the thumbnail showed. Three addresses:
+            #   ?job=&seed=   a generate-job's variant (the Forge detail view)
+            #   ?id=          a KEPT library entry (the library inspector)
+            #   ?name=&seed=  any (species, bank seed), regenerated from
+            #                 specs/ -- the judgment viewport's address, so a
+            #                 species with NOTHING kept (the whole
+            #                 never-reviewed queue) can still be orbited
+            #                 before its verdict. Callers append the spec
+            #                 hash as ?v= so the immutable cache below stays
+            #                 honest across spec edits; the server ignores it.
             job = FORGE.get(q.get("job", ""))
             grid = None
             if job:
                 spec, seed = job.spec, int(q["seed"])
+            elif q.get("name"):
+                p = SPECS / f"{Path(q['name']).name}.json"
+                if not p.is_file():
+                    return self._json({"error": "no such spec"}, 404)
+                spec, _ = specmod.load(p)
+                try:
+                    seed = int(q.get("seed", 1))
+                except ValueError:
+                    return self._json({"error": "seed must be a whole number"}, 400)
             else:
                 d = library_dir(Path(q.get("id", "")).name)
                 if not d:
