@@ -86,6 +86,13 @@ export function ForgeView({
     return groups;
   }, [readyKinds]);
   const [kind, setKind] = React.useState<string>(readyKinds[0]?.key ?? "tree");
+  /* THE ENTRY PATH (owner directive 2026-09-05): category -> kind -> species,
+   * three explicit selects, so the left panel is for EXISTING content --
+   * tweak it with sliders and the local vocabulary. Net-new types have their
+   * own dedicated flow (CreateWizard). */
+  const [category, setCategory] = React.useState<string>(
+    readyKinds[0]?.category ?? "environment");
+  const [wizardOpen, setWizardOpen] = React.useState(false);
   const [schema, setSchema] = React.useState<UiSchema | null>(null);
   const [spec, setSpec] = React.useState<Spec | null>(null);
   const [saved, setSaved] = React.useState<Spec | null>(null);
@@ -163,6 +170,7 @@ export function ForgeView({
   const loadKind = React.useCallback(
     async (k: string, { gen = true } = {}) => {
       setKind(k);
+      setCategory(world.kinds.find((x) => x.key === k)?.category ?? "other");
       const sch = await forgeApi.schema(k);
       setSchema(sch);
       const of = world.specs.filter((s) => s.kind === k);
@@ -174,7 +182,21 @@ export function ForgeView({
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [loadSpec, world.specs],
+    [loadSpec, world.specs, world.kinds],
+  );
+
+  /* Load a kind's schema and adopt an already-built spec (the creation
+   * flow's landing: the server saved the draft; the gallery reviews it). */
+  const loadKindShellFor = React.useCallback(
+    async (k: string, created: Spec) => {
+      setKind(k);
+      setCategory(world.kinds.find((x) => x.key === k)?.category ?? "other");
+      setSchema(await forgeApi.schema(k));
+      setSpec(created);
+      setSaved(JSON.parse(JSON.stringify(created)));
+      setRev((v) => v + 1);
+    },
+    [world.kinds],
   );
 
   /* boot once */
@@ -300,34 +322,60 @@ export function ForgeView({
       {/* parameter rail (stage 2 lives here) */}
       <aside className="flex min-h-0 w-[380px] shrink-0 flex-col border-r-2 border-stone-950 bg-stone-850">
         <div className="mortar-b flex flex-col gap-2 p-3">
+          {/* Existing content: category -> kind -> species. */}
           <div className="grid grid-cols-2 gap-2">
-            <Select value={kind} onValueChange={(k) => void loadKind(k)}>
+            <Select
+              value={category}
+              onValueChange={(c) => {
+                setCategory(c);
+                const first = kindsByCategory.find((g) => g.key === c)?.kinds[0];
+                if (first && first.key !== kind) void loadKind(first.key);
+              }}
+            >
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 {kindsByCategory.map((g) => (
-                  <SelectGroup key={g.key}>
-                    <SelectLabel>{g.label}</SelectLabel>
-                    {g.kinds.map((k) => (
-                      <SelectItem key={k.key} value={k.key}>
-                        {k.label} ({k.species})
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
+                  <SelectItem key={g.key} value={g.key}>{g.label}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
-            <Select
-              value={specsOfKind.some((s) => s.name === speciesName) ? speciesName : undefined}
-              onValueChange={(n) => void loadSpec(n)}
-            >
-              <SelectTrigger><SelectValue placeholder="species…" /></SelectTrigger>
+            <Select value={kind} onValueChange={(k) => void loadKind(k)}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
-                {specsOfKind.map((s) => (
-                  <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>
+                {(kindsByCategory.find((g) => g.key === category)?.kinds ?? readyKinds).map((k) => (
+                  <SelectItem key={k.key} value={k.key}>
+                    {k.label} ({k.species})
+                  </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </div>
+          <Select
+            value={specsOfKind.some((s) => s.name === speciesName) ? speciesName : undefined}
+            onValueChange={(n) => void loadSpec(n)}
+          >
+            <SelectTrigger><SelectValue placeholder="species…" /></SelectTrigger>
+            <SelectContent>
+              {/* Grouped by sub-category label when authored; a label is a
+                * grouping over the kind's generator, never a generator. */}
+              {[...new Set(specsOfKind.map((s) => s.subcategory ?? ""))].sort().map((sub) => {
+                const members = specsOfKind.filter((s) => (s.subcategory ?? "") === sub);
+                if (!sub) {
+                  return members.map((s) => (
+                    <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>
+                  ));
+                }
+                return (
+                  <SelectGroup key={sub}>
+                    <SelectLabel>{sub}</SelectLabel>
+                    {members.map((s) => (
+                      <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                );
+              })}
+            </SelectContent>
+          </Select>
           {kindMeta && (
             <p className="flex flex-wrap items-center gap-1.5 text-xs text-parch-500">
               {/* WHAT the loaded species is, and WHO said so. `via: "spec"`
@@ -362,6 +410,15 @@ export function ForgeView({
             <Button size="sm" variant="ghost" onClick={revert} disabled={!spec}>
               <Undo2 className="h-3.5 w-3.5" /> Revert
             </Button>
+            <Button
+              size="sm"
+              variant="moss"
+              className="ml-auto"
+              onClick={() => setWizardOpen(true)}
+              title="Create a net-new asset type from a description (guided; routed to Claude)"
+            >
+              <Plus className="h-3.5 w-3.5" /> New asset type
+            </Button>
           </div>
         </div>
 
@@ -375,17 +432,19 @@ export function ForgeView({
           )}
         </div>
 
-        <CreatePanel
-          onCreated={async (k, created, name) => {
-            setKind(k);
-            setSchema(await forgeApi.schema(k));
-            setSpec(created);
-            setSaved(JSON.parse(JSON.stringify(created)));
-            setRev((v) => v + 1);
-            toast.ok("New " + k + " species '" + name + "' (draft; Save spec to keep it)");
-            void generate(created, seedStart, count);
-          }}
-        />
+        {wizardOpen && (
+          <CreateWizard
+            world={world}
+            onClose={() => setWizardOpen(false)}
+            onCreated={async (k, created, name, summary) => {
+              setWizardOpen(false);
+              await world.refreshSpecs();          // the server saved the draft spec
+              await loadKindShellFor(k, created);
+              toast.ok(summary ?? "New " + k + " species '" + name + "' (draft; keep seeds to publish)");
+              void generate(created, seedStart, count);
+            }}
+          />
+        )}
         <AskPanel
           spec={spec}
           onApplied={(next, summary) => {
@@ -687,29 +746,91 @@ function ParamControl({
   );
 }
 
-/* --- plain-language creation (LOCAL: forge/language.py) ------------------- */
+/* --- the creation wizard (owner directive 2026-09-05) ----------------------
+ *
+ * The dedicated flow for NET-NEW asset types, four steps in order:
+ *   1. describe it   2. pick the taxonomy (category)   3. pick or create a
+ *   sub-category   4. name it -- then the description routes to CLAUDE (the
+ * subscription lane; the local grammar answers if claude is missing,
+ * labelled) and the seed variants generate for review.
+ *
+ * THE HONESTY RULE ON STEP 3: kinds are procedural GENERATOR CODE; creating
+ * a sub-category cannot conjure a generator. A new sub-category is a
+ * GROUPING LABEL over an existing generator ("based on"), stored in the
+ * spec's hash-excluded `subcategory` field, and a truly-new-generator wish
+ * is recorded as a TODO in the spec's notes -- never pretended. */
 
-function CreatePanel({
-  onCreated,
+function CreateWizard({
+  world, onClose, onCreated,
 }: {
-  onCreated: (kind: string, spec: Spec, name: string) => void | Promise<void>;
+  world: World;
+  onClose: () => void;
+  onCreated: (kind: string, spec: Spec, name: string, summary?: string) => void | Promise<void>;
 }) {
-  const [text, setText] = React.useState("");
+  const [desc, setDesc] = React.useState("");
+  const [category, setCategory] = React.useState<string>("creature");
+  const [pick, setPick] = React.useState<string>("");     // kind key | "sub:<label>:<kind>" | "new"
+  const [newSub, setNewSub] = React.useState("");
+  const [basedOn, setBasedOn] = React.useState<string>("");
+  const [name, setName] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [lines, setLines] = React.useState<{ text: string; miss?: boolean }[]>([]);
 
+  const kindsOfCat = world.kinds.filter((k) => k.ready && k.category === category);
+  const subsOfCat = React.useMemo(() => {
+    const m = new Map<string, string>(); // label -> kind
+    for (const s of world.specs) {
+      if (s.subcategory && s.category === category) m.set(s.subcategory, s.kind);
+    }
+    return [...m.entries()].sort();
+  }, [world.specs, category]);
+
+  // resolve step 3 into (kind, subcategory, wants_new_generator)
+  const resolved = React.useMemo(() => {
+    if (pick === "new") {
+      return basedOn
+        ? { kind: basedOn, subcategory: newSub.trim() || undefined, isNew: true }
+        : null;
+    }
+    if (pick.startsWith("sub:")) {
+      const [, label, k] = pick.split(":");
+      return { kind: k, subcategory: label, isNew: false };
+    }
+    return pick ? { kind: pick, subcategory: undefined, isNew: false } : null;
+  }, [pick, basedOn, newSub]);
+
+  const ready = desc.trim().length > 0 && resolved != null && name.trim().length > 0
+    && (pick !== "new" || newSub.trim().length > 0);
+
   const go = async () => {
-    if (!text.trim()) return;
+    if (!ready || !resolved) return;
     setBusy(true);
     setLines([]);
     try {
-      const r = await forgeApi.create(text.trim());
-      const out: { text: string; miss?: boolean }[] = r.understood.map((u) => ({ text: u }));
+      const r = await forgeApi.createLlm({
+        request: desc.trim(),
+        kind: resolved.kind,
+        name: name.trim(),
+        subcategory: resolved.subcategory,
+        new_subcategory: resolved.isNew,
+      });
+      const out: { text: string; miss?: boolean }[] = [];
+      if (r.error) {
+        out.push({ text: "Claude lane failed: " + r.error, miss: true });
+        out.push({ text: "the local grammar answered instead (offline fallback):" });
+      } else if (r.source === "llm") {
+        out.push({ text: "Claude (" + (r.model ?? "?") + ") translated the description" });
+      }
+      out.push(...r.understood.map((u) => ({ text: u })));
       for (const w of r.warnings ?? []) out.push({ text: w, miss: true });
-      if (r.ignored.length) out.push({ text: "didn't understand: " + r.ignored.join(", "), miss: true });
       for (const e of r.edits) out.push({ text: e.label + ": " + fmtVal(e.from) + " -> " + fmtVal(e.to) });
       setLines(out);
-      if (r.spec && r.kind && r.name) await onCreated(r.kind, r.spec, r.name);
+      if (r.spec && r.kind && r.name) {
+        await onCreated(r.kind, r.spec, r.name,
+          "New " + r.kind + " species '" + r.name + "' saved as draft"
+          + (r.subcategory ? " (sub-category: " + r.subcategory + ")" : "")
+          + " — generating seeds");
+      }
     } catch (e) {
       setLines([{ text: String(e), miss: true }]);
     } finally {
@@ -717,40 +838,123 @@ function CreatePanel({
     }
   };
 
-  return (
-    <div className="mortar-b border-t border-stone-950 bg-stone-800 p-2.5">
-      <div className="mb-1 flex items-center gap-1.5 font-display text-xs uppercase tracking-widest text-parch-400">
-        <Plus className="h-3.5 w-3.5" /> New from description
-        <span className="ml-auto font-mono text-[10px] normal-case tracking-normal text-parch-500">
-          local · nothing leaves this machine
-        </span>
-      </div>
-      <div className="flex gap-2">
-        <Textarea
-          rows={2}
-          className="text-xs"
-          placeholder='e.g. "a gnarled dead willow for tundra"'
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void go();
-            }
-          }}
-        />
-        <Button variant="default" size="icon" disabled={busy || !text.trim()} onClick={() => void go()} title="Create a draft species from this description (local)">
-          <Hammer className="h-4 w-4" />
-        </Button>
-      </div>
-      {lines.length > 0 && (
-        <div className="mt-1.5 max-h-24 overflow-y-auto font-mono text-[11px]">
-          {lines.map((l, i) => (
-            <div key={i} className={l.miss ? "text-rust-400" : "text-parch-400"}>{l.text}</div>
-          ))}
-        </div>
-      )}
+  const Step = ({ n, label }: { n: number; label: string }) => (
+    <div className="flex items-center gap-2 font-display text-xs uppercase tracking-widest text-parch-400">
+      <span className="chamfer-sm bevel-up flex h-5 w-5 items-center justify-center bg-gold-600 font-mono text-[11px] text-parch-100">{n}</span>
+      {label}
     </div>
+  );
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent className="max-w-2xl">
+        <DialogTitle className="flex items-center gap-2">
+          <Plus className="h-5 w-5 text-gold-400" /> New asset type
+        </DialogTitle>
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-1.5">
+            <Step n={1} label="Describe what should be generated" />
+            <Textarea
+              rows={3}
+              className="text-xs"
+              placeholder='e.g. "a long slender eel with mottled olive skin, ribbon fins, lives in reeds"'
+              value={desc}
+              onChange={(e) => setDesc(e.target.value)}
+            />
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <Step n={2} label="Assign a taxonomy" />
+            <Select value={category} onValueChange={(c) => { setCategory(c); setPick(""); setBasedOn(""); }}>
+              <SelectTrigger><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {CATEGORIES.map((c) => (
+                  <SelectItem key={c} value={c}>{CATEGORY_LABEL[c] ?? c}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <Step n={3} label="Sub-category (or create one)" />
+            <Select value={pick || undefined} onValueChange={setPick}>
+              <SelectTrigger><SelectValue placeholder="pick a sub-category…" /></SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectLabel>Existing kinds (generators)</SelectLabel>
+                  {kindsOfCat.map((k) => (
+                    <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
+                  ))}
+                </SelectGroup>
+                {subsOfCat.length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel>Groupings</SelectLabel>
+                    {subsOfCat.map(([label, k]) => (
+                      <SelectItem key={label} value={"sub:" + label + ":" + k}>
+                        {label} (over {k})
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
+                <SelectItem value="new">+ Create a new sub-category…</SelectItem>
+              </SelectContent>
+            </Select>
+            {pick === "new" && (
+              <div className="flex flex-col gap-1.5 pl-7">
+                <div className="flex gap-2">
+                  <Input
+                    className="h-8 text-xs"
+                    placeholder="new sub-category name (e.g. eels)"
+                    value={newSub}
+                    onChange={(e) => setNewSub(e.target.value)}
+                  />
+                  <Select value={basedOn || undefined} onValueChange={setBasedOn}>
+                    <SelectTrigger className="w-44"><SelectValue placeholder="based on…" /></SelectTrigger>
+                    <SelectContent>
+                      {kindsOfCat.map((k) => (
+                        <SelectItem key={k.key} value={k.key}>based on: {k.label}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <p className="text-[11px] text-parch-500">
+                  A sub-category is a grouping label. Its geometry comes from the generator it is based on
+                  — a truly new generator is code, and this wish is recorded as a TODO in the spec's notes,
+                  not pretended.
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-1.5">
+            <Step n={4} label="Name the species" />
+            <Input
+              className="h-8 font-mono text-xs"
+              placeholder="species name (e.g. reed-eel)"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Button variant="gold" disabled={!ready || busy} onClick={() => void go()}>
+              <Sparkles className="h-4 w-4" /> {busy ? "Creating…" : "Create with Claude"}
+            </Button>
+            <span className="font-mono text-[10px] text-parch-500">
+              sends the description to Claude on your subscription · local grammar if offline
+            </span>
+          </div>
+
+          {lines.length > 0 && (
+            <div className="max-h-32 overflow-y-auto font-mono text-[11px]">
+              {lines.map((l, i) => (
+                <div key={i} className={l.miss ? "text-rust-400" : "text-parch-400"}>{l.text}</div>
+              ))}
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

@@ -100,6 +100,34 @@ def main() -> int:
     else:
         print("  fires: unknown descriptors are reported, not swallowed")
 
+    # 6. THE SUB-CATEGORY ARMS (owner directive 2026-09-05): the grouping
+    #    label must move NEITHER hash (it is a statement about what the
+    #    species IS), must survive revalidation, and an unreadable label
+    #    must warn with the consequence and drop -- never half-store.
+    base, _ = sm.load(
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "specs" / "brown-trout.json")
+    tag = dict(base); tag["subcategory"] = "Eels "
+    tag, trep = sm.validate(tag)
+    neutral = (tag.get("subcategory") == "eels" and not trep.warnings
+               and sm.spec_hash(tag) == sm.spec_hash(base)
+               and sm.seed_hash(tag) == sm.seed_hash(base))
+    print(("  fires" if neutral else "  ! SILENT")
+          + ": a subcategory label cleans to a slug and moves NEITHER hash")
+    ok &= neutral
+    again, _ = sm.validate(tag)
+    survives = again.get("subcategory") == "eels"
+    print(("  fires" if survives else "  ! SILENT")
+          + ": the label survives revalidation")
+    ok &= survives
+    bad = dict(base); bad["subcategory"] = "Not A Slug!!"
+    bad, brep = sm.validate(bad)
+    refused = ("subcategory" not in bad
+               and any("subcategory" in w for w in brep.warnings))
+    print(("  fires" if refused else "  ! SILENT")
+          + ": an unreadable label is DROPPED with the consequence named")
+    ok &= refused
+
     print("creationprobe:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

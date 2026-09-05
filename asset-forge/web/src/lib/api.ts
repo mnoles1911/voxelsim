@@ -132,9 +132,24 @@ export const forgeApi = {
     post("/api/interpret", { spec, request }).then((r) => j<InterpretResult>(r)),
 
   /* A new species from a sentence: LOCAL (forge/language.py), same doctrine
-   * as interpret. */
+   * as interpret. Kept as the offline/CLI path; the app's creation flow is
+   * createLlm below. */
   create: (request: string) =>
     post("/api/create", { request }).then((r) => j<CreateResult>(r)),
+
+  /* THE GUIDED CREATION FLOW (owner directive 2026-09-05): the human fixed
+   * category -> kind/sub-category -> name; the description routes to Claude
+   * on the owner's subscription (local grammar answers if claude is
+   * missing, labelled by `source`). The server saves the draft spec so the
+   * new species is in the ledger immediately. */
+  createLlm: (payload: {
+    request: string;
+    kind: string;
+    name: string;
+    subcategory?: string;
+    new_subcategory?: boolean;
+  }) => post("/api/create-llm", payload).then((r) =>
+    j<CreateResult & { saved?: string; subcategory?: string }>(r)),
 
   /* THE CLAUDE LANE -- the one call that leaves this machine. Runs on the
    * owner's Claude subscription via the claude CLI (no API key); opt-in per

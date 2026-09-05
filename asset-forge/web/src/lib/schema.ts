@@ -254,6 +254,9 @@ export interface SpeciesRow {
   /** "kind" | "spec" | "illegible" | "unknown": whether a human said so or the
    *  kind decided. Two different facts, shown as two. */
   category_via?: string;
+  /** Grouping label over the kind's generator ("eels" over `fish`), when
+   *  authored. Hash-excluded like `category`; absent = groups under kind. */
+  subcategory?: string | null;
   hash: string;
   size_m: number;
   resolution_cm: number;

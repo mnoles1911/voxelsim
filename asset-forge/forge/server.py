@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import mimetypes
+import re
 import struct
 import threading
 import traceback
@@ -894,6 +895,10 @@ class Handler(BaseHTTPRequestHandler):
                         # from a grandfathered one.
                         "category": catlib.of(s),
                         "category_via": catlib.source_of(s),
+                        # The grouping label, when authored: "eels" over kind
+                        # `fish`. Absent means the species groups under its
+                        # kind. A label, never a generator.
+                        "subcategory": s.get("subcategory"),
                         "hash": specmod.spec_hash(s),
                         "size_m": _size_m(s, kind),
                         "height_m": specmod.get(s, "height_m"),
@@ -1113,6 +1118,41 @@ class Handler(BaseHTTPRequestHandler):
                     out["name"] = name
                     out["understood"].append(
                         f"named '{name}' ('{base_name}' already exists)")
+            return self._json(out)
+
+        if path == "/api/create-llm":
+            # The guided creation flow (owner directive 2026-09-05): the
+            # human fixed category -> kind/sub-category -> name in the UI;
+            # the description routes through the Claude lane against the
+            # kind's defaults (local grammar as the offline fallback,
+            # labelled by `source`). The server owns the name collision and
+            # SAVES the draft spec so the new species is in the ledger
+            # immediately -- review then runs keep-driven like everything
+            # else.
+            from . import llm
+
+            request = str(body.get("request", "")).strip()
+            kind = str(body.get("kind", "")).strip()
+            name = Path(str(body.get("name", "new-species"))).name.strip().lower()
+            name = re.sub(r"[^a-z0-9\-]+", "-", name).strip("-") or "new-species"
+            if not request:
+                return self._json({"error": "describe what to generate"}, 400)
+            base_name, n = name, 2
+            while (SPECS / f"{name}.json").exists():
+                name = f"{base_name}-{n}"
+                n += 1
+            out = llm.create_llm(
+                kind, name, request,
+                subcategory=(str(body["subcategory"]).strip()
+                             if body.get("subcategory") else None),
+                wants_new_generator=bool(body.get("new_subcategory")))
+            if out.get("spec") is None:
+                return self._json(out, 400)
+            specmod.save(out["spec"], SPECS / f"{name}.json")
+            out["saved"] = f"{name}.json"
+            if name != base_name:
+                out["understood"] = [f"named '{name}' ('{base_name}' already "
+                                     f"exists)"] + out["understood"]
             return self._json(out)
 
         if path == "/api/interpret-llm":

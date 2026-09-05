@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -3020,7 +3021,7 @@ def validate(spec: dict) -> tuple[dict, Report]:
         # that draws it. See forge/categories.py for why it is deliberately not
         # a PARAMS row: a row there puts a new key in all 830 canonical JSONs
         # and re-identifies every species in the library.
-        if path == "category":
+        if path in ("category", "subcategory"):
             continue
         if path not in known:
             rep.warnings.append(f"ignored unknown parameter {path!r}")
@@ -3096,6 +3097,16 @@ def validate(spec: dict) -> tuple[dict, Report]:
     # every spec in the library means today (see forge.categories.of).
     if "category" in spec:
         out["category"] = catlib.clean(spec["category"], rep)
+    # The sub-category GROUPING (owner directive 2026-09-05), same rule again:
+    # carried whole, cleaned, only when present. It is a LABEL over an
+    # existing generator -- the spec's `kind` is still what draws the asset
+    # ("eels" is a grouping of kind `fish`, not a new generator) -- so like
+    # `category` it is a statement about what the thing IS and is excluded
+    # from both hashes: naming a group must not redraw or reseed anything.
+    if "subcategory" in spec:
+        cleaned = _clean_subcategory(spec["subcategory"], rep)
+        if cleaned is not None:
+            out["subcategory"] = cleaned
     # Cross-checks with the consequence named: these are the two ways an
     # authored block quietly does less than it reads as doing.
     if "biome_allow" in out:
@@ -3155,6 +3166,28 @@ def validate(spec: dict) -> tuple[dict, Report]:
 
 
 _MISSING = object()
+
+
+_SUBCATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,39}$")
+
+
+def _clean_subcategory(raw, rep: "Report") -> "str | None":
+    """Validate an authored `subcategory` grouping label. None means drop it.
+
+    The label is a slug so it can live in filenames, query strings and menus
+    without escaping. Case is folded rather than refused; anything else warns
+    WITH THE CONSEQUENCE and drops -- the species then groups under its kind,
+    which is the default meaning of an absent label.
+    """
+    if isinstance(raw, str):
+        slug = raw.strip().lower()
+        if _SUBCATEGORY_RE.match(slug):
+            return slug
+    rep.warnings.append(
+        f"subcategory: {raw!r} is not a readable grouping label (lowercase "
+        f"letters, digits and dashes, up to 40 chars), so it is DROPPED and "
+        f"this species groups under its kind instead")
+    return None
 
 
 # --- curation ----------------------------------------------------------------
@@ -3459,15 +3492,16 @@ def _hash_body(spec: dict) -> dict:
     """The part of a spec that decides what it IS.
 
     `notes` is free text for a person. `curation` is a verdict ON the species,
-    `biome_allow`/`biome_rules` are placement metadata ON it, and `category` is
-    a CLASSIFICATION of it; every one of them would re-bake banks whose voxels
-    are unchanged, and `category` would additionally reseed the individual --
-    a statement about what a thing IS must not redraw it. And the kind-scoped
+    `biome_allow`/`biome_rules` are placement metadata ON it, and `category`
+    and `subcategory` are CLASSIFICATIONS of it; every one of them would
+    re-bake banks whose voxels are unchanged, and the classifications would
+    additionally reseed the individual -- a statement about what a thing IS
+    must not redraw it. And the kind-scoped
     rows of OTHER kinds are dropped per `KIND_SCOPED_PARAMS`.
     """
     body = {k: v for k, v in spec.items()
             if k not in ("notes", "curation", "biome_allow", "biome_rules",
-                         "category")}
+                         "category", "subcategory")}
     kind = body.get("kind")
     foreign = [path for k, paths in KIND_SCOPED_PARAMS.items() if k != kind
                for path in paths]

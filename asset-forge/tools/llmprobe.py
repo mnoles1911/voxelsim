@@ -137,11 +137,40 @@ def main() -> int:
             finally:
                 llm.TIMEOUT_S = was
 
+            os.environ[FIXTURE_ENV] = "good"
+            # THE CREATION-FLOW ARMS (owner directive 2026-09-05): the human
+            # fixed kind/sub-category/name; the model must not move them.
+            r = llm.create_llm("fish", "reed-eel", "long and slender",
+                               subcategory="Eels ", wants_new_generator=True)
+            cur = sm.curation(r["spec"])
+            arm(sm.get(r["spec"], "kind") == "fish"
+                and sm.get(r["spec"], "name") == "reed-eel"
+                and r["spec"].get("subcategory") == "eels"
+                and cur["status"] == "draft"
+                and "TODO(owner)" in str(r["spec"].get("notes", ""))
+                and any(e["path"] == "height_m" for e in r["edits"]),
+                "create_llm: human choices forced, label cleaned, DRAFT, "
+                "new-generator wish recorded as a TODO -- and the patch landed",
+                json.dumps({"kind": sm.get(r["spec"], "kind"),
+                            "sub": r["spec"].get("subcategory"),
+                            "cur": cur, "notes": r["spec"].get("notes")}))
+            r = llm.create_llm("not-a-kind", "x", "anything")
+            arm(r.get("spec") is None and "unknown kind" in str(r.get("error")),
+                "create_llm refuses an unknown kind by name")
+
             os.environ[llm.CMD_ENV] = str(Path(td) / "does-not-exist.cmd")
             r = llm.interpret_llm(body, "anything")
             arm(r.get("source") == "local-fallback"
                 and "could not run" in str(r.get("error")),
                 "a missing stub path fails in plain English")
+            # Creation still works offline: the LOCAL grammar answers,
+            # labelled, and the draft spec is still built.
+            r = llm.create_llm("fish", "reed-eel", "much longer")
+            arm(r.get("source") == "local-fallback" and r.get("spec") is not None
+                and sm.get(r["spec"], "name") == "reed-eel"
+                and sm.curation(r["spec"])["status"] == "draft",
+                "create_llm with no claude falls back to the local grammar "
+                "and still creates the draft")
         finally:
             os.environ.pop(llm.CMD_ENV, None)
             os.environ.pop(FIXTURE_ENV, None)

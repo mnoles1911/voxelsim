@@ -209,3 +209,56 @@ def interpret_llm(spec: dict, text: str) -> dict:
         "source": "llm",
         "model": MODEL,
     }
+
+
+def create_llm(kind: str, name: str, text: str,
+               subcategory: "str | None" = None,
+               wants_new_generator: bool = False) -> dict:
+    """The guided creation flow's engine (owner directive 2026-09-05).
+
+    The click path fixed everything but the geometry before this runs: the
+    description (1), the category (2, implied by the kind), the sub-category
+    or kind (3) and the name (4) are decided by the human; this routes the
+    DESCRIPTION through the Claude lane against the chosen kind's defaults.
+    Same guardrails as `interpret_llm` (it IS `interpret_llm`, on a default
+    spec): patch-dict only, clamped through `spec.patch`, local grammar as
+    the offline fallback, provenance in `notes`.
+
+    THE HONESTY RULE ON SUB-CATEGORIES: kinds are generator CODE; a new
+    sub-category cannot conjure a generator. `subcategory` is a grouping
+    label OVER the chosen kind (hash-excluded, like `category`), and when
+    the flow asked for a truly new generator (`wants_new_generator`), that
+    is recorded as a flagged TODO in the spec's notes -- never pretended.
+    """
+    base, rep = specmod.validate({"kind": kind, "name": name})
+    if specmod.get(base, "kind") != kind:
+        return {"error": f"unknown kind {kind!r}", "spec": None, "edits": [],
+                "understood": [], "ignored": [], "warnings": rep.warnings}
+
+    out = interpret_llm(base, text)
+    spec = out["spec"]
+    # The human's choices are not the model's to move.
+    specmod.set_(spec, "kind", kind)
+    specmod.set_(spec, "name", name)
+    if subcategory:
+        cleaned = specmod._clean_subcategory(subcategory, rep)
+        if cleaned is not None:
+            spec["subcategory"] = cleaned
+        out["warnings"] = list(out.get("warnings") or []) + rep.warnings
+    if wants_new_generator:
+        todo = (f"TODO(owner): '{subcategory or name}' was requested as a NEW "
+                f"asset type; it is currently a grouping over the {kind} "
+                f"generator -- a dedicated generator does not exist and was "
+                f"not pretended.")
+        prior = str(spec.get("notes") or "").strip()
+        spec["notes"] = f"{prior}\n{todo}".strip()
+    # A brand-new species has never been looked at: DRAFT (the /api/import
+    # law); the first KEEP converts it per the keep-driven model.
+    spec["curation"] = {"status": "draft", "seeds": [1, 2, 3, 4],
+                        "notes": "created from a description; keep seeds to publish"}
+    out["spec"] = spec
+    out["kind"] = kind
+    out["name"] = name
+    if spec.get("subcategory"):
+        out["subcategory"] = spec["subcategory"]
+    return out

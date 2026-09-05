@@ -52,7 +52,7 @@ export function SpeciesPanel({
             <span className={row.category ? "text-parch-400" : "text-rust-400"}>
               {categoryLabel}
             </span>
-            {" · "}{kindLabel} · {row.size_m.toFixed(1)} m · {row.shape} · authored at {row.resolution_cm} cm · spec {row.hash}
+            {" · "}{kindLabel}{row.subcategory ? " · " + row.subcategory + " (grouping)" : ""} · {row.size_m.toFixed(1)} m · {row.shape} · authored at {row.resolution_cm} cm · spec {row.hash}
           </div>
         </div>
         <div className="ml-auto">
