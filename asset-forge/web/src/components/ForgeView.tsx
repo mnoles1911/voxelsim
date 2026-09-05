@@ -111,6 +111,17 @@ export function ForgeView({
 
   const speciesName = String(getPath(spec, "name") ?? "");
   const specRow = world.specs.find((s) => s.name === speciesName);
+  /* Owner directive 2026-09-05: placement applies to environment and
+   * creature assets ONLY. Vehicles (category craftable) get no placement
+   * UI at all -- absent, not disabled. CATEGORY-driven (the server's
+   * resolved category; the kind's default for an unsaved spec), never a
+   * hard-coded kind list, so a future vehicles member inherits it. This
+   * mirrors an engine truth, not a UI preference: ADR-0010 puts entity
+   * kinds outside world composition and manifest.species_record refuses
+   * them from species.vxm by name. */
+  const isVehicleCat = specRow?.category
+    ? specRow.category === "craftable"
+    : world.kinds.find((k) => k.key === kind)?.category === "craftable";
   const keptIds = React.useMemo(() => new Set(world.library.map((e) => e.id)), [world.library]);
   const specsOfKind = world.specs.filter((s) => s.kind === kind);
 
@@ -460,9 +471,10 @@ export function ForgeView({
       {/* gallery (stage 1's output) */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <WorkflowStrip
-          canPlace={!!specRow}
+          canPlace={!!specRow && !isVehicleCat}
           species={speciesName}
           onPlace={() => specRow && onOpenPlacement(specRow.name)}
+          noPlacement={isVehicleCat}
         />
 
         <div className="mortar-b flex flex-wrap items-center gap-2 bg-stone-850 px-3 py-2">
@@ -569,7 +581,7 @@ export function ForgeView({
           tile={progress?.tiles[String(detailSeed)]}
           kept={isKept(detailSeed)}
           onKeep={() => void keep(detailSeed)}
-          onPlace={specRow ? () => onOpenPlacement(specRow.name) : undefined}
+          onPlace={specRow && !isVehicleCat ? () => onOpenPlacement(specRow.name) : undefined}
           onClose={() => setDetailSeed(null)}
         />
       )}
@@ -580,11 +592,16 @@ export function ForgeView({
 /* --- the four-stage strip ------------------------------------------------ */
 
 function WorkflowStrip({
-  canPlace, species, onPlace,
+  canPlace, species, onPlace, noPlacement = false,
 }: {
   canPlace: boolean;
   species: string;
   onPlace: () => void;
+  /** Vehicles (category craftable) end at stage 3: ADR-0010 puts entity
+   *  kinds outside world composition -- no bank, no biome weight, no
+   *  manifest row (manifest.species_record refuses them by name) -- so
+   *  placement is not greyed out here, it does not exist. */
+  noPlacement?: boolean;
 }) {
   const Step = ({ n, label }: { n: number; label: string }) => (
     <span className="flex items-center gap-1.5 text-parch-400">
@@ -601,6 +618,11 @@ function WorkflowStrip({
       <Step n={2} label="Fine-tune" />
       <ArrowRight className="h-3.5 w-3.5 text-parch-600" />
       <Step n={3} label="Keep to library" />
+      {noPlacement ? (
+        <span className="font-mono text-[11px] text-parch-600">
+          · vehicles spawn as entities — no placement (ADR-0010)
+        </span>
+      ) : (<>
       <ArrowRight className="h-3.5 w-3.5 text-parch-600" />
       <button
         onClick={onPlace}
@@ -615,6 +637,7 @@ function WorkflowStrip({
         <span className="font-display text-xs uppercase tracking-widest">Placement</span>
         <ArrowRight className="h-3.5 w-3.5" />
       </button>
+      </>)}
     </div>
   );
 }

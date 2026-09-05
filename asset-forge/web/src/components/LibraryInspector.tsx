@@ -172,7 +172,11 @@ export function LibraryInspector({
               </div>
             </div>
 
-            {/* the tie to the app's other half: where this asset places */}
+            {/* the tie to the app's other half: where this asset places.
+              * ABSENT for vehicles (owner directive 2026-09-05): entity
+              * kinds are outside world composition per ADR-0010, so there
+              * is nothing here to tie to. */}
+            {row.category !== "craftable" && (
             <div>
               <div className="mb-1 flex items-center gap-1.5 font-display text-xs uppercase tracking-widest text-parch-400">
                 <MapIcon className="h-3.5 w-3.5" /> Placed under
@@ -198,6 +202,7 @@ export function LibraryInspector({
                 Edit placement in the panel below
               </Button>
             </div>
+            )}
 
             <div className="mt-auto flex flex-col gap-2">
               <div className="flex gap-2">

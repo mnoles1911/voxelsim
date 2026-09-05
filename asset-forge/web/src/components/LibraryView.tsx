@@ -278,9 +278,13 @@ function SpeciesLine({
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm text-parch-100">{row.name}</div>
         <div className="truncate font-mono text-[11px] text-parch-500">
-          {row.size_m.toFixed(1)} m · {allowed.length === 0 ? "nowhere" : allowed.length + " biome" + (allowed.length > 1 ? "s" : "")}
+          {row.size_m.toFixed(1)} m
+          {/* biome text is placement-derived: absent for vehicles (owner
+            * directive 2026-09-05) -- 'nowhere' on a canoe reads as a bug */}
+          {row.category !== "craftable" &&
+            " · " + (allowed.length === 0 ? "nowhere" : allowed.length + " biome" + (allowed.length > 1 ? "s" : ""))}
           {variants > 0 && " · " + variants + " kept"}
-          {Object.keys(row.biome_rules).length > 0 && " · ruled"}
+          {row.category !== "craftable" && Object.keys(row.biome_rules).length > 0 && " · ruled"}
         </div>
       </div>
       <CurationBadge row={row} />

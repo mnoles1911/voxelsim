@@ -104,7 +104,17 @@ export function SpeciesPanel({
         )}
       </section>
 
-      <PlacementPanel row={row} world={world} />
+      {/* Owner directive 2026-09-05: placement rules apply to environment
+        * and creature assets ONLY -- for vehicles (category craftable) the
+        * placement UI is ABSENT, not disabled. Category-driven so a future
+        * vehicles member inherits it. Mirrors the engine truth, not taste:
+        * ADR-0010 puts entity kinds outside world composition, and
+        * manifest.species_record refuses them from species.vxm by name --
+        * a placement row on a vehicle could never reach the world anyway
+        * (verified: all three vehicles carry zero weights and no blocks,
+        * and the manifest refusal fires before any placement field is
+        * read). */}
+      {row.category !== "craftable" && <PlacementPanel row={row} world={world} />}
 
       {inspecting && (
         <LibraryInspector
