@@ -973,6 +973,44 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "say what you want changed"}, 400)
             return self._json(language.interpret(spec, request))
 
+        if path == "/api/create":
+            # A species from a sentence -- LOCAL (forge/language.py), same
+            # doctrine as /api/interpret. The server owns the one thing the
+            # grammar cannot know: name collisions against specs/ on disk.
+            from . import language
+
+            request = str(body.get("request", "")).strip()
+            if not request:
+                return self._json({"error": "describe the species to create"}, 400)
+            out = language.create(request)
+            if out["spec"] is not None:
+                name = base_name = Path(out["name"]).name
+                n = 2
+                while (SPECS / f"{name}.json").exists():
+                    name = f"{base_name}-{n}"
+                    n += 1
+                if name != base_name:
+                    specmod.set_(out["spec"], "name", name)
+                    out["name"] = name
+                    out["understood"].append(
+                        f"named '{name}' ('{base_name}' already exists)")
+            return self._json(out)
+
+        if path == "/api/interpret-llm":
+            # The Claude lane (forge/llm.py): the ONE route that sends text
+            # off this machine, on the owner's subscription via the claude
+            # CLI -- opt-in per use and labelled in the UI. The reply is
+            # post-validated and lands only through spec.patch; on any
+            # failure the local grammar answers instead, and the response
+            # says which lane answered (`source`).
+            from . import llm
+
+            spec, _ = specmod.validate(body.get("spec") or {})
+            request = str(body.get("request", "")).strip()
+            if not request:
+                return self._json({"error": "say what you want changed"}, 400)
+            return self._json(llm.interpret_llm(spec, request))
+
         if path == "/api/save-spec":
             spec, rep = specmod.validate(body.get("spec") or {})
             name = Path(str(specmod.get(spec, "name") or "unnamed")).name

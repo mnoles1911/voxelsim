@@ -339,13 +339,31 @@ export interface JobProgress {
   tiles: Record<string, TileState>;
 }
 
-/** /api/interpret: the LOCAL plain-language spec editor (forge/language.py).
- * No model callbacks, by standing constraint -- the vocabulary is authored
- * in the repo and the route never leaves the machine. */
+/** /api/interpret: the LOCAL plain-language spec editor (forge/language.py)
+ * -- the vocabulary is authored in the repo and the route never leaves the
+ * machine. The privacy promise is PER PANEL (owner ruling 2026-09-05):
+ * /api/interpret-llm is the one route that leaves the machine, on the
+ * owner's Claude subscription, opt-in per use and labelled; it returns the
+ * same shape plus `source`/`model`/`error` so the UI can say which lane
+ * answered (a failed Claude call falls back to the local grammar, with
+ * `source: "local-fallback"` and the reason in `error`). */
 export interface InterpretResult {
   spec: Record<string, unknown>;
   understood: string[];
   ignored: string[];
-  edits: { label: string; from: unknown; to: unknown }[];
+  edits: { path?: string; label: string; from: unknown; to: unknown }[];
   warnings?: string[];
+  source?: "llm" | "local-fallback";
+  model?: string;
+  error?: string;
+}
+
+/** /api/create: a species from a sentence -- LOCAL (forge/language.py).
+ * `spec` is null when no kind word was recognised; the failure is said in
+ * `warnings` and every unknown word is in `ignored` -- never a silent
+ * default species. */
+export interface CreateResult extends Omit<InterpretResult, "spec"> {
+  spec: Record<string, unknown> | null;
+  kind: string | null;
+  name: string | null;
 }

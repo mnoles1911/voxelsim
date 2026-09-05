@@ -454,6 +454,25 @@ the only one likely to touch `PARAMS`.
    > subscription-auth question is being researched separately). The local
    > creation grammar (C1) remains the future Phase 4 step; neither lane is in
    > the current implementation task's scope.
+   >
+   > **RE-RULED 2026-09-05, later the same day (owner):** the subscription
+   > research resolved — "Proceed with Claude subscription support for Asset
+   > Forge natural language generation instructions." Both Phase 4 steps
+   > built: (1) the local creation grammar (`language.create`, "New from
+   > description", same `{understood, ignored, edits}` contract); (2) the
+   > Claude lane (`forge/llm.py`, `/api/interpret-llm`): the **Claude Code
+   > CLI in print mode (`claude -p`) as a subprocess** on the owner's
+   > existing subscription login — no API key, no SDK, no new dependency
+   > (the Agent SDK is API-key-only and is out). One call per user action;
+   > sonnet-class model in one config constant (`llm.MODEL`); the reply is
+   > post-validated (the CLI cannot enforce schemas) and lands **only as a
+   > patch dict through `spec.patch`** — reject-and-report on invalid, local
+   > grammar as the fallback; plain-English errors naming `claude login`.
+   > The "nothing leaves this machine" banner became a **per-panel
+   > distinction**: the Claude button is opt-in per use and labelled as
+   > sending text on the owner's subscription; the local lanes keep the
+   > private label. Prompts are recorded into spec `notes` (model + date)
+   > for provenance.
 4. **Where approval state lives.** This plan keeps it where it is — in the
    spec file, hashed out of identity (`spec.py:3458-3474`) — and extends
    enforcement-by-omission to Path B. The alternative (a game-side

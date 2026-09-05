@@ -1678,3 +1678,141 @@ def _direction_word(strength: float) -> str:
     if strength <= -1.8:
         return "much less"
     return "less" if strength <= -0.9 else "slightly less"
+
+
+# --- creation: a species from a sentence (plan P4 step 1) --------------------
+#
+# The Plain speech panel EDITS the loaded spec; this creates one. Same
+# doctrine: local, deterministic, instant, and an unknown word is REPORTED,
+# never swallowed. The ceiling is the same too -- it will not handle
+# open-ended phrasing; the Claude lane (forge/llm.py) exists for that and is
+# opt-in per use.
+#
+# A creation sentence needs exactly one thing the edit vocabulary does not
+# carry: a KIND. "a gnarled dead willow for tundra" says tree by the word
+# "willow", so the table below maps kind nouns AND common species nouns onto
+# registered kind keys. Everything else in the sentence is handed to
+# `interpret` against the kind's defaults, so every descriptor recipe in the
+# edit vocabulary works at creation time for free -- and stays probed by the
+# same probe suites that already own it.
+
+KIND_WORDS: dict[str, str] = {
+    # kind nouns
+    "tree": "tree", "bush": "bush", "shrub": "bush", "hedge": "bush",
+    "rock": "rock", "boulder": "rock", "stone": "rock", "outcrop": "rock",
+    "grass": "grass", "tuft": "grass",
+    "reed": "reed", "reeds": "reed", "cattail": "reed", "bulrush": "reed",
+    "flower": "flower", "wildflower": "flower",
+    "fish": "fish",
+    "whale": "cetacean", "dolphin": "cetacean", "porpoise": "cetacean",
+    "cetacean": "cetacean", "orca": "cetacean",
+    "bird": "bird",
+    "quadruped": "quadruped", "animal": "quadruped", "beast": "quadruped",
+    "artifact": "artifact", "craft": "artifact",
+    # species nouns that imply their kind (the plan's own example is "a
+    # gnarled dead willow for tundra" -- no "tree" in the sentence)
+    "willow": "tree", "oak": "tree", "birch": "tree", "pine": "tree",
+    "spruce": "tree", "fir": "tree", "maple": "tree", "ash": "tree",
+    "elm": "tree", "poplar": "tree", "aspen": "tree", "cedar": "tree",
+    "cypress": "tree", "palm": "tree", "beech": "tree", "yew": "tree",
+    "bramble": "bush", "gorse": "bush", "juniper": "bush",
+    "daisy": "flower", "poppy": "flower", "tulip": "flower",
+    "orchid": "flower", "iris": "flower", "lupin": "flower",
+    "trout": "fish", "salmon": "fish", "cod": "fish", "bass": "fish",
+    "pike": "fish", "perch": "fish", "carp": "fish", "herring": "fish",
+    "mackerel": "fish", "tuna": "fish", "shark": "fish", "eel": "fish",
+    "robin": "bird", "gull": "bird", "eagle": "bird", "hawk": "bird",
+    "owl": "bird", "crow": "bird", "raven": "bird", "heron": "bird",
+    "sparrow": "bird", "finch": "bird", "wren": "bird", "duck": "bird",
+    "goose": "bird", "swan": "bird",
+    "fox": "quadruped", "deer": "quadruped", "wolf": "quadruped",
+    "boar": "quadruped", "bear": "quadruped", "rabbit": "quadruped",
+    "hare": "quadruped", "goat": "quadruped", "sheep": "quadruped",
+    "horse": "quadruped", "badger": "quadruped", "elk": "quadruped",
+    "moose": "quadruped", "bison": "quadruped", "otter": "quadruped",
+}
+
+# Words that carry no identity worth keeping in a species name.
+_NAME_STOP = {
+    "a", "an", "the", "for", "with", "and", "of", "in", "on", "make",
+    "makes", "create", "creates", "new", "me", "please", "i", "want",
+    "would", "like", "some", "kind", "sort", "species", "asset", "that",
+    "lives", "grows", "found",
+}
+
+
+def _creation_name(text: str, kind_word: str) -> str:
+    """A deterministic slug from the sentence's own words, kind word kept.
+
+    "a gnarled dead willow for tundra" -> "gnarled-dead-willow-tundra".
+    Capped at four tokens so a paragraph does not become a filename.
+    """
+    tokens = [t for t in re.findall(r"[a-z][a-z\-]{1,}", text.lower())
+              if t not in _NAME_STOP]
+    picked: list[str] = []
+    for t in tokens:
+        if t not in picked:
+            picked.append(t)
+        if len(picked) == 4:
+            break
+    if kind_word not in picked:
+        picked = picked[:3] + [kind_word]
+    return "-".join(picked) if picked else f"new-{kind_word}"
+
+
+def create(text: str) -> dict:
+    """A species from a sentence: kind from a keyword, descriptors through
+    `interpret` against the kind's defaults, a generated name, DRAFT curation.
+
+    Same contract as `interpret` ({spec, edits, understood, ignored,
+    warnings}) plus `kind` and `name`. No kind word -> `spec` is None and the
+    failure is said in `warnings` -- never a silent default species.
+    """
+    raw = text.strip()
+    low = " " + re.sub(r"\s+", " ",
+                       re.sub(r"[^a-z0-9.,\- ]+", " ", raw.lower())).strip() + " "
+
+    # Longest-first so "bulrush" is not read as nothing because "rush" isn't
+    # a word here; whole-word so "oakum" never reads as "oak".
+    kind_word = kind = None
+    for word in sorted(KIND_WORDS, key=len, reverse=True):
+        if f" {word} " in low:
+            kind_word, kind = word, KIND_WORDS[word]
+            break
+
+    if kind is None:
+        ignored = sorted({t for t in re.findall(r"[a-z][a-z\-]{2,}", low)
+                          if t not in STOPWORDS and t not in _NAME_STOP})
+        return {
+            "kind": None, "name": None, "spec": None, "edits": [],
+            "understood": [], "ignored": ignored,
+            "warnings": ["no kind word recognised -- say what it IS "
+                         "(a tree, bush, rock, grass, reed, flower, fish, "
+                         "whale, bird, animal or craft, or a species word "
+                         "like 'willow' or 'trout')"],
+        }
+
+    name = _creation_name(raw, kind_word)
+    base, _rep = specmod.validate({"kind": kind, "name": name})
+
+    # If the kind word is ALSO an edit phrase (fish species bundles and the
+    # like), leave it for `interpret` to apply as a recipe; otherwise excise
+    # it so it cannot land in `ignored` as an unknown word.
+    known_phrase = any(kind_word == p for p, _k, _v in _ALL_PHRASES)
+    edit_text = raw if known_phrase else re.sub(
+        rf"\b{re.escape(kind_word)}\b", " ", raw, flags=re.IGNORECASE)
+
+    out = interpret(base, edit_text)
+    spec = out["spec"]
+    specmod.set_(spec, "name", name)
+    # A brand-new species has by definition never been looked at (the same
+    # law as /api/import): DRAFT, not grandfathered-approved.
+    spec["curation"] = {"status": "draft", "seeds": [1, 2, 3, 4],
+                        "notes": "created from a description; approve to publish"}
+    out["spec"] = spec
+    out["kind"] = kind
+    out["name"] = name
+    out["understood"] = [f"new {kind} species '{name}' from its defaults"] \
+        + out["understood"]
+    out["ignored"] = [w for w in out["ignored"] if w != kind_word]
+    return out

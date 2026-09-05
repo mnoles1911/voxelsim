@@ -85,7 +85,7 @@ export const api = {
 
 /* --- authoring: generation, adjustment, keeping (stages 1-3) ------------- */
 
-import type { InterpretResult, JobProgress, UiSchema } from "./schema";
+import type { CreateResult, InterpretResult, JobProgress, UiSchema } from "./schema";
 
 export const forgeApi = {
   schema: (kind: string) => fetch("/api/schema?kind=" + encodeURIComponent(kind)).then((r) => j<UiSchema>(r)),
@@ -115,6 +115,19 @@ export const forgeApi = {
    * to the forge server on this machine and nowhere else. */
   interpret: (spec: Record<string, unknown>, request: string) =>
     post("/api/interpret", { spec, request }).then((r) => j<InterpretResult>(r)),
+
+  /* A new species from a sentence: LOCAL (forge/language.py), same doctrine
+   * as interpret. */
+  create: (request: string) =>
+    post("/api/create", { request }).then((r) => j<CreateResult>(r)),
+
+  /* THE CLAUDE LANE -- the one call that leaves this machine. Runs on the
+   * owner's Claude subscription via the claude CLI (no API key); opt-in per
+   * use and labelled in the UI. The server post-validates the reply and
+   * applies it only through spec.patch; on failure the local grammar
+   * answers (source: "local-fallback", reason in `error`). */
+  interpretLlm: (spec: Record<string, unknown>, request: string) =>
+    post("/api/interpret-llm", { spec, request }).then((r) => j<InterpretResult>(r)),
 
   vocabulary: () =>
     fetch("/api/vocabulary").then((r) => j<{ concepts: unknown[] }>(r)),

@@ -1,6 +1,6 @@
 import * as React from "react";
 import {
-  Archive, ArrowRight, Dices, Flag, Hammer, MessageSquareText, Plus, RefreshCw, Save, Undo2, Wand2,
+  Archive, ArrowRight, Dices, Flag, Hammer, MessageSquareText, Plus, RefreshCw, Save, Sparkles, Undo2, Wand2,
 } from "lucide-react";
 import type { World } from "../App";
 import { api, forgeApi } from "../lib/api";
@@ -32,8 +32,11 @@ import { cn } from "../lib/cn";
  *     be regenerated on demand);
  *   - "Keep to library" (/api/keep) is the hinge into stage 3, and the strip
  *     at the top hands off to stage 4 (placement) for the current species;
- *   - the plain-language box is forge/language.py via /api/interpret --
- *     fully LOCAL, no model callbacks, by standing constraint.
+ *   - the plain-language box is forge/language.py via /api/interpret, and
+ *     "new from description" is /api/create -- both fully LOCAL. The privacy
+ *     promise is PER PANEL (owner ruling 2026-09-05): the one exception is
+ *     the labelled, per-use "Ask Claude" button (/api/interpret-llm), which
+ *     sends that text to Claude on the owner's subscription.
  */
 
 const DEFAULT_SPECIES: Record<string, string> = {
@@ -372,6 +375,17 @@ export function ForgeView({
           )}
         </div>
 
+        <CreatePanel
+          onCreated={async (k, created, name) => {
+            setKind(k);
+            setSchema(await forgeApi.schema(k));
+            setSpec(created);
+            setSaved(JSON.parse(JSON.stringify(created)));
+            setRev((v) => v + 1);
+            toast.ok("New " + k + " species '" + name + "' (draft; Save spec to keep it)");
+            void generate(created, seedStart, count);
+          }}
+        />
         <AskPanel
           spec={spec}
           onApplied={(next, summary) => {
@@ -673,7 +687,79 @@ function ParamControl({
   );
 }
 
-/* --- plain-language edits (LOCAL: forge/language.py) ---------------------- */
+/* --- plain-language creation (LOCAL: forge/language.py) ------------------- */
+
+function CreatePanel({
+  onCreated,
+}: {
+  onCreated: (kind: string, spec: Spec, name: string) => void | Promise<void>;
+}) {
+  const [text, setText] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [lines, setLines] = React.useState<{ text: string; miss?: boolean }[]>([]);
+
+  const go = async () => {
+    if (!text.trim()) return;
+    setBusy(true);
+    setLines([]);
+    try {
+      const r = await forgeApi.create(text.trim());
+      const out: { text: string; miss?: boolean }[] = r.understood.map((u) => ({ text: u }));
+      for (const w of r.warnings ?? []) out.push({ text: w, miss: true });
+      if (r.ignored.length) out.push({ text: "didn't understand: " + r.ignored.join(", "), miss: true });
+      for (const e of r.edits) out.push({ text: e.label + ": " + fmtVal(e.from) + " -> " + fmtVal(e.to) });
+      setLines(out);
+      if (r.spec && r.kind && r.name) await onCreated(r.kind, r.spec, r.name);
+    } catch (e) {
+      setLines([{ text: String(e), miss: true }]);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mortar-b border-t border-stone-950 bg-stone-800 p-2.5">
+      <div className="mb-1 flex items-center gap-1.5 font-display text-xs uppercase tracking-widest text-parch-400">
+        <Plus className="h-3.5 w-3.5" /> New from description
+        <span className="ml-auto font-mono text-[10px] normal-case tracking-normal text-parch-500">
+          local · nothing leaves this machine
+        </span>
+      </div>
+      <div className="flex gap-2">
+        <Textarea
+          rows={2}
+          className="text-xs"
+          placeholder='e.g. "a gnarled dead willow for tundra"'
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void go();
+            }
+          }}
+        />
+        <Button variant="default" size="icon" disabled={busy || !text.trim()} onClick={() => void go()} title="Create a draft species from this description (local)">
+          <Hammer className="h-4 w-4" />
+        </Button>
+      </div>
+      {lines.length > 0 && (
+        <div className="mt-1.5 max-h-24 overflow-y-auto font-mono text-[11px]">
+          {lines.map((l, i) => (
+            <div key={i} className={l.miss ? "text-rust-400" : "text-parch-400"}>{l.text}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* --- plain-language edits ---------------------------------------------------
+ * Two lanes, one box. The wand button is forge/language.py -- LOCAL, and the
+ * label says so. The Sparkles button is the ONE thing in this app that sends
+ * text off the machine: /api/interpret-llm -> the claude CLI on the owner's
+ * subscription (owner ruling 2026-09-05). Opt-in per press, never a default,
+ * and a failed Claude call reports itself and answers with the local lane. */
 
 function AskPanel({
   spec, onApplied,
@@ -690,13 +776,23 @@ function AskPanel({
     forgeApi.vocabulary().then((v) => setConceptCount(v.concepts.length)).catch(() => {});
   }, []);
 
-  const go = async () => {
+  const go = async (viaClaude: boolean) => {
     if (!spec || !text.trim()) return;
     setBusy(true);
     setLines([]);
     try {
-      const r = await forgeApi.interpret(spec, text.trim());
-      const out: { text: string; miss?: boolean }[] = r.understood.map((u) => ({ text: u }));
+      const r = viaClaude
+        ? await forgeApi.interpretLlm(spec, text.trim())
+        : await forgeApi.interpret(spec, text.trim());
+      const out: { text: string; miss?: boolean }[] = [];
+      if (viaClaude && r.error) {
+        out.push({ text: "Claude lane failed: " + r.error, miss: true });
+        out.push({ text: "the local grammar answered instead:" });
+      } else if (viaClaude && r.source === "llm") {
+        out.push({ text: "Claude (" + (r.model ?? "?") + ") answered; request recorded in the spec's notes" });
+      }
+      out.push(...r.understood.map((u) => ({ text: u })));
+      for (const w of r.warnings ?? []) out.push({ text: w, miss: true });
       if (r.ignored.length) out.push({ text: "didn't understand: " + r.ignored.join(", "), miss: true });
       for (const e of r.edits) out.push({ text: e.label + ": " + fmtVal(e.from) + " -> " + fmtVal(e.to) });
       setLines(out);
@@ -716,7 +812,7 @@ function AskPanel({
         <MessageSquareText className="h-3.5 w-3.5" /> Plain speech
         {conceptCount != null && (
           <span className="ml-auto font-mono text-[10px] normal-case tracking-normal text-parch-500">
-            {conceptCount} local concepts · nothing leaves this machine
+            {conceptCount} local concepts · wand stays on this machine
           </span>
         )}
       </div>
@@ -730,13 +826,30 @@ function AskPanel({
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
-              void go();
+              void go(false);
             }
           }}
         />
-        <Button variant="default" size="icon" disabled={busy || !spec} onClick={() => void go()} title="Apply">
-          <Wand2 className="h-4 w-4" />
-        </Button>
+        <div className="flex flex-col gap-1">
+          <Button
+            variant="default"
+            size="icon"
+            disabled={busy || !spec}
+            onClick={() => void go(false)}
+            title="Apply locally -- nothing leaves this machine"
+          >
+            <Wand2 className="h-4 w-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled={busy || !spec}
+            onClick={() => void go(true)}
+            title="Ask Claude -- SENDS this text to Claude on your subscription (claude CLI)"
+          >
+            <Sparkles className="h-4 w-4" />
+          </Button>
+        </div>
       </div>
       {lines.length > 0 && (
         <div className="mt-1.5 max-h-24 overflow-y-auto font-mono text-[11px]">
