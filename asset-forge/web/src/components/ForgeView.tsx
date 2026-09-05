@@ -12,6 +12,7 @@ import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { Checkbox } from "./ui/checkbox";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import { FloatingPanel } from "./ui/floating-panel";
 import { Input, Textarea } from "./ui/input";
 import {
   Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
@@ -1191,16 +1192,33 @@ function SeedDetail({
   ];
 
   return (
-    <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent className="max-w-3xl">
-        <DialogTitle className="flex items-center gap-2">
+    /* THE VARIANT PANEL (owner directive 2026-09-05): floating, draggable by
+     * its title bar, resizable at the corner, twice the old dialog's size by
+     * default, and it remembers where you put it. Floating rather than a
+     * docked splitter because this view was already an overlay -- it opens
+     * over the gallery and closes back into it. The canvas fills the panel,
+     * so resizing the panel IS resizing the viewport; orbit/zoom stay bound
+     * to the canvas alone (the panel only drags by header and corner). */
+    <FloatingPanel
+      storageKey="af-panel-seed-detail"
+      defaultSize={{ w: 1536, h: 1100 }}
+      onClose={onClose}
+      title={
+        <span className="flex items-center gap-2">
           <Icon className="h-5 w-5 text-gold-400" />
           {species} · seed {seed}
           {kept && <Badge variant="moss">in library</Badge>}
-        </DialogTitle>
-        <div className="grid gap-4 md:grid-cols-[1fr_240px]">
-          <VoxelCanvas src={forgeApi.jobVoxelsUrl(job, seed)} palette={world.palette} className="h-96" />
-          <div>
+        </span>
+      }
+    >
+      <div className="grid h-full gap-4 md:grid-cols-[1fr_240px]">
+          <VoxelCanvas
+            src={forgeApi.jobVoxelsUrl(job, seed)}
+            palette={world.palette}
+            wrapperClassName="h-full min-h-0"
+            className="h-full"
+          />
+          <div className="overflow-y-auto">
             <table className="w-full border-collapse font-mono text-xs">
               <tbody>
                 {rows.map(([k, v]) => (
@@ -1227,8 +1245,7 @@ function SeedDetail({
               )}
             </div>
           </div>
-        </div>
-      </DialogContent>
-    </Dialog>
+      </div>
+    </FloatingPanel>
   );
 }

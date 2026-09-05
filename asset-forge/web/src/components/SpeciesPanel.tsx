@@ -159,6 +159,38 @@ function JudgmentViewport({ row, world }: { row: SpeciesRow; world: World }) {
   const step = (d: number) => setSeed(seeds[(idx + d + seeds.length) % seeds.length] ?? seed);
   const kept = keptSeeds.has(seed);
 
+  /* Owner directive 2026-09-05: the variant view defaults to TWICE its old
+   * size and the user resizes it. This viewport is DOCKED in the species
+   * panel's flow (the verdict bar reads directly under it -- floating it
+   * would detach the judgment from its verdict), so "resizable + draggable"
+   * here is a splitter: drag the bar under the canvas to set its height,
+   * remembered across sessions. Old default was 384 px; now 768. */
+  const [viewH, setViewH] = React.useState<number>(() => {
+    try {
+      const n = Number(localStorage.getItem("af-judgment-viewport-h"));
+      if (Number.isFinite(n) && n >= 240) return Math.min(n, 1600);
+    } catch { /* blocked storage: default is fine */ }
+    return 768;
+  });
+  const viewHRef = React.useRef(viewH);
+  viewHRef.current = viewH;
+  const dragH = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const sy = e.clientY;
+    const start = viewHRef.current;
+    const move = (ev: PointerEvent) =>
+      setViewH(Math.min(1600, Math.max(240, start + ev.clientY - sy)));
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      try {
+        localStorage.setItem("af-judgment-viewport-h", String(viewHRef.current));
+      } catch { /* forgettable */ }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
   const toggleKeep = async () => {
     setBusy(true);
     try {
@@ -187,10 +219,20 @@ function JudgmentViewport({ row, world }: { row: SpeciesRow; world: World }) {
           {kept ? " · KEPT — in the game" : " · not kept"}
         </span>
       </h3>
-      <VoxelCanvas
-        src={api.voxelsBySeedUrl(row.name, seed, row.hash)}
-        palette={world.palette}
-        className="h-96"
+      <div style={{ height: viewH }}>
+        <VoxelCanvas
+          src={api.voxelsBySeedUrl(row.name, seed, row.hash)}
+          palette={world.palette}
+          wrapperClassName="h-full"
+          className="h-full"
+        />
+      </div>
+      {/* the splitter: its own element under the canvas, so it can never
+        * steal the orbit drag */}
+      <div
+        onPointerDown={dragH}
+        className="mx-auto mt-1 h-2 w-24 cursor-ns-resize rounded bg-stone-600 hover:bg-stone-500"
+        title="Drag to resize the viewport (remembered)"
       />
       <div className="mt-2 flex items-center gap-1.5">
         <Button variant="ghost" size="icon" className="h-7 w-7" title="Previous seed" onClick={() => step(-1)}>
