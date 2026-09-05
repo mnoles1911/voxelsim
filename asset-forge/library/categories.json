@@ -2,7 +2,7 @@
  "categories": {
   "craftable": {
    "blurb": "Human-made objects a player can make, carry and use. Rigid, spawned, on their own pitch under their own transform, and outside world composition entirely: no bank, no biome weight, no manifest record. The boat and the glider are the first two.",
-   "count": 2,
+   "count": 3,
    "in_manifest": false,
    "kinds": [
     "artifact"
@@ -47,6 +47,13 @@
      ],
      "kind": "artifact",
      "name": "glider",
+     "via": "kind",
+     "voxel_mm": 25
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "raft",
      "via": "kind",
      "voxel_mm": 25
     }
