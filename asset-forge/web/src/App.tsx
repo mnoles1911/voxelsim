@@ -115,7 +115,7 @@ export default function App() {
             <BookOpen className="h-4 w-4" /> Asset Library
           </TabButton>
           <TabButton active={tab === "rules"} onClick={() => setTab("rules")}>
-            <ScrollText className="h-4 w-4" /> Placement rules
+            <ScrollText className="h-4 w-4" /> Placement Rules
           </TabButton>
         </nav>
         <div className="ml-auto flex items-center gap-3">
