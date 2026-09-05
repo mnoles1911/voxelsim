@@ -28,10 +28,11 @@ export function LibraryView({
 }) {
   const [kind, setKind] = React.useState("all");
   const [biome, setBiome] = React.useState("all");
-  // "What is actually in my library" defaults to the exporting set: approved
-  // verdicts (the grandfathered majority included). Switch to "Any verdict"
-  // to see drafts and rejections.
-  const [status, setStatus] = React.useState("approved");
+  // THE BURN-DOWN DEFAULT (owner ruling, 2026-09-05): every one of the
+  // grandfathered species is to be reviewed and approved explicitly, so the
+  // ledger opens on "Never reviewed" -- the work remaining -- and keeps doing
+  // so until that set is empty. Switch to "Approved" for the exporting set.
+  const [status, setStatus] = React.useState("unreviewed");
   const [query, setQuery] = React.useState("");
   const [selected, setSelected] = React.useState<string | null>(null);
 
@@ -75,6 +76,7 @@ export function LibraryView({
   }, [world.specs, world.biomes, kind, biome, status, query]);
 
   const selectedRow = world.specs.find((s) => s.name === selected) ?? null;
+  const unreviewed = world.specs.filter((s) => !s.curation.curated).length;
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -152,7 +154,17 @@ export function LibraryView({
               </SelectContent>
             </Select>
           </div>
-          <div className="font-mono text-xs text-parch-500">{rows.length} species shown</div>
+          <div className="flex items-center justify-between font-mono text-xs text-parch-500">
+            <span>{rows.length} species shown</span>
+            {/* The burn-down counter: visible whatever filter is active, gone
+              * only when it reaches zero. Counted from the server's resolved
+              * curation, never re-derived here. */}
+            {unreviewed > 0 && (
+              <span className="font-semibold text-gold-400">
+                {unreviewed} never reviewed
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -168,7 +180,9 @@ export function LibraryView({
           ))}
           {rows.length === 0 && (
             <div className="p-6 text-center font-display text-sm text-parch-500">
-              Nothing in the ledger matches.
+              {status === "unreviewed" && unreviewed === 0
+                ? "Every species has been reviewed — the burn-down is done."
+                : "Nothing in the ledger matches."}
             </div>
           )}
         </div>
