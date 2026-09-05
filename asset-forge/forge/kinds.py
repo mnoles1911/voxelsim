@@ -184,10 +184,18 @@ KINDS: tuple[Kind, ...] = (
     # no biome weight and produces no bank; the .vxa is loaded by the engine's
     # entity path at its own pitch. See `forge/artifact.py` and
     # `forge/manifest.py:species_record`.
-    Kind("artifact", "Craft & artifacts",
-         "Rigid human-made objects: boats and aircraft. A lofted closed hull "
-         "with a sheer line, or a thin swept panel on spars. Spawned "
-         "entities — own pitch, no biome, no bank.", True,
+    # DISPLAY LABEL "Vehicles" (owner directive 2026-09-05: "'craft and
+    # artifacts' group is renamed to 'vehicles'. Raft, canoe, and glider
+    # specs all belong to this"). The KEY stays `artifact` -- it is spec
+    # identity, cvar names (voxel.Boat.Asset resolves under it) and the
+    # category mapping; the label is what a person reads and is the only
+    # thing the directive names. The `craftable` category slug and its
+    # ruling stand untouched.
+    Kind("artifact", "Vehicles",
+         "Rigid human-made craft: boats, rafts and aircraft. A lofted "
+         "closed hull with a sheer line, lashed logs on a levelled deck, or "
+         "a thin swept panel on spars. Spawned entities — own pitch, no "
+         "biome, no bank.", True,
          ("artifact",), lattice="entity"),
 )
 
