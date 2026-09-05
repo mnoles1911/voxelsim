@@ -488,6 +488,23 @@ the only one likely to touch `PARAMS`.
    surface that publish must then reconcile.
    > **RULED 2026-09-05 (owner):** The verdict model stays species+seed. No
    > per-variant verdicts.
+   >
+   > **SUPERSEDED, 2026-09-05, later the same day (owner, verbatim):** "Keep
+   > should be only human action in the Forge phase of the process. Once it's
+   > 'kept' it goes to the library and then the library contents are used in
+   > our game world." The KEEP-DRIVEN model replaces the approve+seed-list
+   > surface: keeping a (species, seed) puts it in the library, the library
+   > IS the game content, and publish derives each species' bank from its
+   > kept seeds (`manifest.kept_seeds`, one derivation; the curation block's
+   > seed list becomes a derived record the server re-syncs on every
+   > keep/unkeep and publish re-syncs again, library wins). The reconciliation
+   > this decision warned about is resolved by construction: no human edits a
+   > seed list anywhere. Species-level REJECT ("none of these belong") and
+   > the empty-bank refusal stand. Migration: nothing auto-demotes — the 828
+   > grandfathered species keep exporting at seeds 1-4 untouched until first
+   > review; keeping seeds converts a species to keep-driven; a rejected
+   > species with kept entries left behind is a printed publish CONFLICT
+   > (rejection wins), never silently resolved.
 6. **Grandfather burn-down.** Leave 828 species grandfathered-approved
    indefinitely, or set a policy (e.g., LibraryView defaults to the
    "Never reviewed" filter; publish prints the count until zero)? Nothing

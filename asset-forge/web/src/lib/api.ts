@@ -74,7 +74,14 @@ export const api = {
     voxel_mm?: number;
   }) => post("/api/import", payload).then((r) => j<LibraryEntry>(r)),
 
-  deleteLibrary: (id: string) => post("/api/library/delete", { id }).then((r) => j<{ deleted: string }>(r)),
+  deleteLibrary: (id: string) =>
+    post("/api/library/delete", { id }).then((r) => j<{ deleted: string; curation?: Curation }>(r)),
+
+  /* ONE publish verb (plan P2, keep-driven): shells tools/publish.py -- the
+   * same publisher the CLI runs -- and returns its full report. Blocking;
+   * bank bakes are hash-skipped so a no-op publish is quick, a real one is
+   * minutes. */
+  publish: () => post("/api/publish", {}).then((r) => j<{ ok: boolean; report: string }>(r)),
 
   thumbUrl: (id: string) => "/api/library/thumb?id=" + encodeURIComponent(id),
   voxelsUrl: (id: string, budget?: number) =>

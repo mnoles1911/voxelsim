@@ -120,10 +120,7 @@
   "curation": {
     "notes": "Approved 2026-09-05 by owner session ruling: 'Fine in the canoe and glider.' The in-engine capture still happens later as the water plan's D-gate; this verdict is the owner's ruling, not that capture.",
     "seeds": [
-      1,
-      2,
-      3,
-      4
+      1
     ],
     "status": "approved"
   },

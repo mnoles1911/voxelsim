@@ -20,6 +20,13 @@
     "shape": "sphere",
     "squash": 1.0
   },
+  "curation": {
+    "notes": "",
+    "seeds": [
+      1
+    ],
+    "status": "approved"
+  },
   "foliage": {
     "clump_jitter": 0.35,
     "clump_radius_m": 0.65,

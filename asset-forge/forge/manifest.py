@@ -697,6 +697,44 @@ class ExportReport:
 # A bank seed file is <name>-NNNN.vxa; the NNNN is the seed.
 SEED_FILE_RE = re.compile(r"-(\d{4})\.vxa$")
 
+# A kept library entry is library/<species>/<species>-NNNN/; NNNN is the seed.
+KEPT_DIR_RE = re.compile(r"-(\d{4})$")
+
+
+def kept_seeds(library_root, name: str) -> list[int]:
+    """The seeds the owner KEPT for a species -- the game set, off the disk.
+
+    THE KEEP-DRIVEN MODEL (owner ruling 2026-09-05): keep is the one human
+    gesture; the library's kept entries ARE the species' published bank, and
+    the curation block's seed list is a derived record of this set, never a
+    surface a person edits. This function is the one derivation, shared by
+    the server (which re-syncs the block on every keep/unkeep) and by
+    tools/publish.py (which re-syncs before exporting, library wins) --
+    the same one-function-two-callers law as `curated_inputs` above.
+
+    Counted off the disk like every bank number in this file: an entry needs
+    its tree.vxa present (a half-written keep is not content), and IMPORTED
+    entries are excluded -- no (spec, seed) regenerates an import, so it can
+    never be a bank seed the exporter could bake."""
+    d = Path(library_root) / name
+    out: set[int] = set()
+    if not d.is_dir():
+        return []
+    for sub in sorted(d.iterdir()):
+        m = KEPT_DIR_RE.search(sub.name)
+        if not m or not sub.name.startswith(name + "-"):
+            continue
+        if not (sub / "tree.vxa").is_file():
+            continue
+        try:
+            meta = json.loads((sub / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        if meta.get("imported"):
+            continue
+        out.add(int(m.group(1)))
+    return sorted(out)
+
 
 @dataclass
 class CurationSummary:

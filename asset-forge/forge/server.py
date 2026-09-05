@@ -350,7 +350,67 @@ def keep(spec: dict, seed: int) -> dict:
         "vox_models": models,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # THE KEEP-DRIVEN VERDICT (owner ruling 2026-09-05): keeping IS the
+    # approval gesture, so the spec file's curation block is re-derived from
+    # the library on every keep. See sync_curation_from_library.
+    cur = sync_curation_from_library(str(name), gesture="keep")
+    if cur is not None:
+        meta["curation"] = cur
     return meta
+
+
+def sync_curation_from_library(name: str, gesture: str) -> "dict | None":
+    """Re-derive a species' curation block from its KEPT library entries.
+
+    Owner ruling 2026-09-05 (supersedes the species+seed verdict model):
+    "Keep should be only human action in the Forge phase ... once it's kept
+    it goes to the library and then the library contents are used in our
+    game world." So the bank seed list is DERIVED -- `manifest.kept_seeds`
+    is the one derivation -- and this is its writer. Nobody hand-edits
+    seeds any more; the exporters keep reading the block exactly as before
+    (the block is now a derived record with the same bytes-on-disk law:
+    RAW file, curation block only, same dump format as /api/curation).
+
+    `gesture` says which human act triggered the sync, because the acts
+    differ on status:
+      * "keep":   the newest gesture is an approval -- status becomes
+                  approved even over an earlier rejection.
+      * "unkeep": removing a variant updates the seed list; it never
+                  UPGRADES a status. Removing the LAST kept seed of an
+                  approved species sets it back to draft (a species with no
+                  chosen content has nothing to publish -- and that was a
+                  human's deletion, not an auto-demotion); a rejected
+                  species stays rejected.
+
+    A grandfathered species (no block, no keeps) is returned untouched with
+    None: its bytes must not move -- that is the standing no-unpublish rule.
+    """
+    p = SPECS / f"{Path(name).name}.json"
+    if not name or not p.is_file():
+        return None
+    from . import manifest as manifestmod
+
+    kept = manifestmod.kept_seeds(LIBRARY, name)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    prior = raw.get("curation") or {}
+    if kept:
+        status = "approved" if (gesture == "keep" or not prior) \
+            else ("approved" if prior.get("status") != "rejected" else "rejected")
+        block = {"status": status, "seeds": kept,
+                 "notes": str(prior.get("notes", "") or "")}
+    elif prior:
+        status = "rejected" if prior.get("status") == "rejected" else "draft"
+        block = {"status": status,
+                 "seeds": prior.get("seeds") or [1],
+                 "notes": str(prior.get("notes", "") or "")}
+    else:
+        return None
+    if prior == block:
+        return specmod.curation(raw)     # already in sync: zero byte churn
+    raw["curation"] = block
+    p.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
+                 encoding="utf-8")
+    return specmod.curation(raw)
 
 
 def _size_m(spec: dict, kind: str) -> float:
@@ -1117,6 +1177,23 @@ class Handler(BaseHTTPRequestHandler):
             meta = keep(spec, int(body["seed"]))
             return self._json(meta)
 
+        if path == "/api/publish":
+            # ONE publisher, two callers (the plan-P2 law): this shells the
+            # same tools/publish.py the CLI runs and returns its full report.
+            # Blocking on purpose -- publish is minutes at worst (bank bakes
+            # are hash-skipped), and a fake-async publish whose report nobody
+            # reads is how a failed export ships.
+            import subprocess
+            import sys as _sys
+
+            proc = subprocess.run(
+                [_sys.executable, str(ROOT / "tools" / "publish.py")],
+                cwd=str(ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=1800)
+            report = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+            return self._json({"ok": proc.returncode == 0,
+                               "report": report})
+
         if path == "/api/library/delete":
             d = library_dir(Path(str(body.get("id", ""))).name)
             if not d:
@@ -1128,9 +1205,18 @@ class Handler(BaseHTTPRequestHandler):
             # Drop the species folder too once its last entry is gone, so the
             # library does not accumulate empty directories.
             parent = d.parent
+            species = parent.name
             if parent != LIBRARY and not any(parent.iterdir()):
                 parent.rmdir()
-            return self._json({"deleted": d.name})
+            # Keep-driven model: the bank IS the kept set, so removing a
+            # variant re-derives the verdict's seed list (and the last one
+            # going sets an approved species back to draft -- a human's
+            # deletion, not an auto-demotion).
+            cur = sync_curation_from_library(species, gesture="unkeep")
+            out = {"deleted": d.name}
+            if cur is not None:
+                out["curation"] = cur
+            return self._json(out)
 
         if path == "/api/sheet":
             # Contact sheet of the current job, written to out/.

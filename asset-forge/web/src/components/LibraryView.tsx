@@ -1,12 +1,16 @@
 import * as React from "react";
-import { Search } from "lucide-react";
+import { Rocket, Search } from "lucide-react";
 import type { World } from "../App";
 import type { SpeciesRow } from "../lib/schema";
 import { CATEGORIES, CATEGORY_LABEL } from "../lib/schema";
 import { allowedBiomes } from "../lib/schema";
+import { api } from "../lib/api";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Input } from "./ui/input";
+import { useToast } from "./ui/toast";
 import {
   Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
 } from "./ui/select";
@@ -77,6 +81,30 @@ export function LibraryView({
 
   const selectedRow = world.specs.find((s) => s.name === selected) ?? null;
   const unreviewed = world.specs.filter((s) => !s.curation.curated).length;
+  const counts = React.useMemo(() => {
+    const c = { approved: 0, draft: 0, rejected: 0 };
+    for (const s of world.specs) if (s.curation.curated) c[s.curation.status] = (c[s.curation.status] ?? 0) + 1;
+    return c;
+  }, [world.specs]);
+
+  /* ONE publish verb (plan P2): the same tools/publish.py the CLI runs,
+   * shelled by the server; the full report lands in a dialog. */
+  const toast = useToast();
+  const [publishing, setPublishing] = React.useState(false);
+  const [report, setReport] = React.useState<{ ok: boolean; text: string } | null>(null);
+  const doPublish = async () => {
+    setPublishing(true);
+    try {
+      const r = await api.publish();
+      setReport({ ok: r.ok, text: r.report });
+      if (!r.ok) toast.error("Publish FAILED — read the report");
+      await world.refreshSpecs();
+    } catch (e) {
+      toast.error("Publish failed: " + String(e));
+    } finally {
+      setPublishing(false);
+    }
+  };
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -165,6 +193,15 @@ export function LibraryView({
               </span>
             )}
           </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-mono text-[11px] text-parch-500">
+              {counts.approved} approved · {counts.draft} draft · {counts.rejected} rejected
+            </span>
+            <Button variant="gold" size="sm" disabled={publishing} onClick={() => void doPublish()}
+              title="Publish the library to the game: banks derived from kept seeds, manifest + categories re-exported, checks run">
+              <Rocket className="h-3.5 w-3.5" /> {publishing ? "Publishing…" : "Publish"}
+            </Button>
+          </div>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -187,6 +224,20 @@ export function LibraryView({
           )}
         </div>
       </div>
+
+      {/* the publish report, verbatim -- the same text the CLI prints */}
+      {report && (
+        <Dialog open onOpenChange={(o) => !o && setReport(null)}>
+          <DialogContent className="max-w-4xl">
+            <DialogTitle className={report.ok ? "text-moss-400" : "text-rust-400"}>
+              Publish {report.ok ? "PASS" : "FAILED"}
+            </DialogTitle>
+            <pre className="max-h-[65vh] overflow-auto whitespace-pre-wrap font-mono text-[11px] text-parch-300">
+              {report.text}
+            </pre>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {/* detail side */}
       <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
