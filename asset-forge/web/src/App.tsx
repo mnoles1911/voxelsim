@@ -1,6 +1,6 @@
 import * as React from "react";
 import { Anvil, BookOpen, Hammer, Import, ScrollText } from "lucide-react";
-import { api } from "./lib/api";
+import { api, retryServer, serverDown } from "./lib/api";
 import type { Biome, Kind, LibraryEntry, RulesDoc, SpeciesRow } from "./lib/schema";
 import { Button } from "./components/ui/button";
 import { useToast } from "./components/ui/toast";
@@ -33,6 +33,42 @@ export interface World {
 }
 
 type Tab = "forge" | "library" | "rules";
+
+/* The server-down banner (owner bug 2026-09-05): every api.ts call funnels
+ * network-level failure into ONE `serverDown` broadcast, and this is its one
+ * reader. A dead server (killed console, replaced port) used to surface as
+ * raw 'TypeError: failed to fetch' out of whatever button was pressed. */
+function ServerDownBanner() {
+  const [down, setDown] = React.useState(serverDown.current);
+  const [checking, setChecking] = React.useState(false);
+  React.useEffect(() => serverDown.subscribe(setDown), []);
+  if (!down) return null;
+  return (
+    <div className="flex items-center justify-center gap-3 bg-rust-600 px-3 py-2 text-sm text-parch-100">
+      <span className="font-display uppercase tracking-widest">
+        Asset Forge server is not running
+      </span>
+      <span className="font-mono text-xs">
+        — relaunch it from the Desktop shortcut, then
+      </span>
+      <Button
+        size="sm"
+        variant="default"
+        disabled={checking}
+        onClick={async () => {
+          setChecking(true);
+          try {
+            if (await retryServer()) window.location.reload();
+          } finally {
+            setChecking(false);
+          }
+        }}
+      >
+        {checking ? "Checking…" : "Retry"}
+      </Button>
+    </div>
+  );
+}
 
 export default function App() {
   const toast = useToast();
@@ -102,6 +138,7 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
+      <ServerDownBanner />
       <header className="mortar-b flex items-center gap-4 bg-stone-850 px-4 py-2">
         <div className="flex items-center gap-2 font-display text-xl tracking-widest text-gold-400">
           <Anvil className="h-6 w-6" />

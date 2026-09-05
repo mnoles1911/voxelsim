@@ -186,6 +186,72 @@ def main() -> int:
     finally:
         os.environ["PATH"] = old_path
 
+    # --- THE HTTP-LAYER ARMS (owner bug 2026-09-05) -------------------------
+    # "TypeError: failed to fetch" is a connection that never got an answer.
+    # These arms drive the REAL route through a REAL local HTTP server --
+    # forge.server's own Handler on an ephemeral port -- with a slow CLI, a
+    # crashing CLI and a missing CLI, and assert the wire property the
+    # browser depends on: the route ALWAYS answers valid JSON over HTTP,
+    # never resets the connection, whatever the subprocess does. (The
+    # owner's actual failure was operational -- his tab outlived a killed
+    # server -- but this is the half a probe can hold.)
+    import json as _json
+    import threading
+    import urllib.request
+
+    from forge import server as srv
+
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        (tdir / "crash.py").write_text(
+            "import sys; sys.stdin.read(); sys.stderr.write('kaboom');"
+            " sys.exit(3)\n", encoding="utf-8")
+        crash_cmd = tdir / "crash.cmd"
+        crash_cmd.write_text(f'@"{sys.executable}" "{tdir / "crash.py"}" %*\n',
+                             encoding="utf-8")
+        slow_cmd = make_stub(tdir)          # the good stub, made slow via env
+
+        httpd = srv.Server(("127.0.0.1", 0), srv.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        spec_body = _json.dumps({"spec": body, "request": "taller"}).encode()
+
+        def post_llm(label: str, want_source: str) -> None:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/interpret-llm", data=spec_body,
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    out = _json.loads(r.read().decode("utf-8"))
+                arm(r.status == 200 and out.get("source") == want_source
+                    and isinstance(out.get("edits"), list),
+                    f"HTTP route with {label}: status 200, valid JSON, "
+                    f"source={want_source} -- no reset",
+                    _json.dumps(out)[:200])
+            except Exception as e:  # noqa: BLE001 -- a reset IS the failure
+                arm(False, f"HTTP route with {label}: connection-level "
+                           f"failure ({type(e).__name__}: {e})")
+
+        try:
+            os.environ[llm.CMD_ENV] = str(slow_cmd)
+            os.environ[FIXTURE_ENV] = "good"
+            post_llm("a working stub CLI", "llm")
+            os.environ[FIXTURE_ENV] = "slow"   # stub sleeps 10 s, under TIMEOUT_S
+            was = llm.TIMEOUT_S
+            llm.TIMEOUT_S = 4                  # force the timeout path over HTTP
+            post_llm("a CLI slower than the route's timeout", "local-fallback")
+            llm.TIMEOUT_S = was
+            os.environ[llm.CMD_ENV] = str(crash_cmd)
+            post_llm("a CLI that crashes (exit 3, stderr)", "local-fallback")
+            os.environ[llm.CMD_ENV] = str(tdir / "gone.cmd")
+            post_llm("a missing CLI", "local-fallback")
+        finally:
+            os.environ.pop(llm.CMD_ENV, None)
+            os.environ.pop(FIXTURE_ENV, None)
+            httpd.shutdown()
+            httpd.server_close()
+
     if args.live:
         exe = shutil.which("claude")
         if not exe:

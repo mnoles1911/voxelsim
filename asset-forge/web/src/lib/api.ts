@@ -14,20 +14,74 @@ async function j<T>(r: Response): Promise<T> {
   return body as T;
 }
 
+/* --- the ONE fetch wrapper (owner bug 2026-09-05) --------------------------
+ * "TypeError: failed to fetch" is a NETWORK-level failure: the request never
+ * got an answer, because the forge server is gone or this tab's server was
+ * killed/replaced under it (a second launch steals the port on Windows).
+ * Every route in this file goes through `hit`, so the failure is detected in
+ * exactly one place: callers get a readable error instead of the raw
+ * TypeError, and the app-level banner (App.tsx, subscribed via
+ * `serverDown`) tells the owner to relaunch from the Desktop shortcut. The
+ * server side is separately proven to always answer JSON while alive
+ * (llmprobe --http drives the real HTTP route with slow/crashing CLIs). */
+
+let _down = false;
+const _listeners = new Set<(down: boolean) => void>();
+
+export const serverDown = {
+  get current(): boolean { return _down; },
+  subscribe(fn: (down: boolean) => void): () => void {
+    _listeners.add(fn);
+    return () => _listeners.delete(fn);
+  },
+};
+
+function _setDown(d: boolean): void {
+  if (_down !== d) {
+    _down = d;
+    _listeners.forEach((fn) => fn(d));
+  }
+}
+
+/** Probe whether the server is back; flips the banner off on success. */
+export async function retryServer(): Promise<boolean> {
+  try {
+    const r = await hit("/api/biomes");
+    if (r.ok) _setDown(false);
+    return r.ok;
+  } catch {
+    _setDown(true);
+    return false;
+  }
+}
+
+async function hit(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    const r = await fetch(url, init);
+    _setDown(false);
+    return r;
+  } catch (e) {
+    _setDown(true);
+    throw new Error(
+      "the Asset Forge server did not answer (" + String((e as Error)?.message ?? e) + "). "
+      + "Relaunch it from the Desktop shortcut, then retry.");
+  }
+}
+
 const post = (url: string, body: unknown) =>
-  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  hit(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 export const api = {
-  biomes: () => fetch("/api/biomes").then((r) => j<Biome[]>(r)),
-  kinds: () => fetch("/api/kinds").then((r) => j<Kind[]>(r)),
+  biomes: () => hit("/api/biomes").then((r) => j<Biome[]>(r)),
+  kinds: () => hit("/api/kinds").then((r) => j<Kind[]>(r)),
   /* THE QUERY SEAM, live. Same answer as library/categories.json and the same
    * resolver behind it (forge.categories.of); that file is what a game reads
    * without running Python. */
-  categories: () => fetch("/api/categories").then((r) => j<Category[]>(r)),
-  specs: () => fetch("/api/specs").then((r) => j<SpeciesRow[]>(r)),
-  library: () => fetch("/api/library").then((r) => j<LibraryEntry[]>(r)),
-  rules: () => fetch("/api/rules").then((r) => j<RulesDoc>(r)),
-  palette: () => fetch("/api/palette").then((r) => j<Record<string, [number, number, number]>>(r)),
+  categories: () => hit("/api/categories").then((r) => j<Category[]>(r)),
+  specs: () => hit("/api/specs").then((r) => j<SpeciesRow[]>(r)),
+  library: () => hit("/api/library").then((r) => j<LibraryEntry[]>(r)),
+  rules: () => hit("/api/rules").then((r) => j<RulesDoc>(r)),
+  palette: () => hit("/api/palette").then((r) => j<Record<string, [number, number, number]>>(r)),
 
   /* Curation writes mirror the server contract: the spec FILE is the record,
    * and only the curation block moves. */
@@ -103,21 +157,21 @@ export const api = {
 import type { CreateResult, InterpretResult, JobProgress, UiSchema } from "./schema";
 
 export const forgeApi = {
-  schema: (kind: string) => fetch("/api/schema?kind=" + encodeURIComponent(kind)).then((r) => j<UiSchema>(r)),
+  schema: (kind: string) => hit("/api/schema?kind=" + encodeURIComponent(kind)).then((r) => j<UiSchema>(r)),
 
   spec: (name: string) =>
-    fetch("/api/spec?name=" + encodeURIComponent(name)).then((r) =>
+    hit("/api/spec?name=" + encodeURIComponent(name)).then((r) =>
       j<{ spec: Record<string, unknown>; warnings: string[]; hash: string }>(r)),
 
   librarySpec: (id: string) =>
-    fetch("/api/library/spec?id=" + encodeURIComponent(id)).then((r) =>
+    hit("/api/library/spec?id=" + encodeURIComponent(id)).then((r) =>
       j<{ spec: Record<string, unknown>; seed: number; hash: string }>(r)),
 
   generate: (spec: Record<string, unknown>, seed_start: number, count: number) =>
     post("/api/generate", { spec, seed_start, count }).then((r) =>
       j<{ job: string; seeds: number[]; warnings: string[]; hash: string }>(r)),
 
-  job: (id: string) => fetch("/api/job?job=" + encodeURIComponent(id)).then((r) => j<JobProgress>(r)),
+  job: (id: string) => hit("/api/job?job=" + encodeURIComponent(id)).then((r) => j<JobProgress>(r)),
 
   keep: (spec: Record<string, unknown>, seed: number) =>
     post("/api/keep", { spec, seed }).then((r) =>
@@ -160,7 +214,7 @@ export const forgeApi = {
     post("/api/interpret-llm", { spec, request }).then((r) => j<InterpretResult>(r)),
 
   vocabulary: () =>
-    fetch("/api/vocabulary").then((r) => j<{ concepts: unknown[] }>(r)),
+    hit("/api/vocabulary").then((r) => j<{ concepts: unknown[] }>(r)),
 
   tileUrl: (job: string, seed: number) => "/api/tile?job=" + encodeURIComponent(job) + "&seed=" + seed,
   detailUrl: (job: string, seed: number) => "/api/detail?job=" + encodeURIComponent(job) + "&seed=" + seed,
