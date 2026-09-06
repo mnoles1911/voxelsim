@@ -102,8 +102,12 @@ private:
 	void StartWorldAndPawn();
 	void TickLoading(float DeltaSeconds);
 	void TickHandOff(float DeltaSeconds);
-	// The monotone, time-floored progress model. See the .cpp.
-	float ComputeProgress() const;
+
+	// The loading-screen streaming cap: lowers voxel.Stream.ApplyBudgetMs for
+	// the duration of the load theatre and restores it at reveal, so the screen
+	// the player is actually watching stays smooth. See the .cpp.
+	void CapStreamingForTheatre();
+	void RestoreStreamingBudget();
 
 	// Removes the menu from the viewport and hands input back to the game.
 	void TeardownMenu();
@@ -120,11 +124,27 @@ private:
 	FString PendingEditLogPath;
 	TOptional<FTransform> PendingSpawnTransform;
 	float LoadElapsedSeconds = 0.f;
-	// Never allowed to decrease -- see ComputeProgress.
+	// Never allowed to decrease -- see ComputeTheatreProgress.
 	float LastProgress = 0.f;
 	float HandOffSeconds = 0.f;
 	// Offsets from -VoxelLoadingShotAt that have not been captured yet.
 	int32 NextLoadingShotIndex = 0;
+
+	// --- Load theatre (owner directive, 2026-09-05) -------------------------
+	// The rolled artificial duration the bar plays out against. Rolled fresh in
+	// BeginLoad; see the comment there for the seeding.
+	float TheatreDurationSeconds = 0.f;
+	// When the world's gate first opened (ready or timed out), in loading
+	// seconds; negative until it has. Feeds the reveal log line, which is the
+	// engagement evidence a gate can grep for.
+	float WorldReadyAtSeconds = -1.f;
+
+	// --- Loading-screen streaming cap ---------------------------------------
+	// Whether CapStreamingForTheatre changed voxel.Stream.ApplyBudgetMs, and
+	// the value to put back. Restored at reveal, with TeardownMenu as the
+	// backstop for every path that never reaches one.
+	bool bStreamBudgetCapped = false;
+	float SavedApplyBudgetMs = 0.f;
 
 	TUniquePtr<class FVoxelWorldReadyProbe> ReadyProbe;
 

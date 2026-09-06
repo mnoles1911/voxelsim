@@ -4,8 +4,10 @@
 //
 // Layered bottom-up: a crossfading pair of background images, a 62% black
 // tint, a centred column (hourglass, "L O A D I N G", rotating quip, progress
-// bar, percentage), a TIP footer pinned to the bottom, and an FPS readout in
-// the top-right corner.
+// bar, percentage), and a TIP footer pinned to the bottom. The Godot build's
+// top-right FPS readout is DEBUG-ONLY now (owner directive, 2026-09-05):
+// absent by default, restored by voxel.UI.LoadingFps -- see the flag's
+// comment in the .cpp.
 //
 // TWO PERFORMANCE SIMPLIFICATIONS ARE CARRIED FORWARD AS DECISIONS, and they
 // are the reason this screen looks slightly plainer than the HTML mock:
@@ -50,8 +52,10 @@ public:
 	// a player rarely sees the same opener twice.
 	void OnShown();
 
-	// 0..1. The caller is responsible for the monotone clamp and the
-	// elapsed-time floor; this widget just draws what it is given.
+	// 0..1. The caller owns the progress model (ComputeTheatreProgress: the
+	// eased artificial timer, the monotone clamp, the ~97% hold while the
+	// world is slower than the theatre); this widget just draws what it is
+	// given.
 	void SetProgress(float InProgress) { Progress = FMath::Clamp(InProgress, 0.f, 1.f); }
 
 	// Drives the fade in and out of the whole curtain.
@@ -105,9 +109,13 @@ private:
 	// --- Hourglass bob ------------------------------------------------------
 	float BobTime = 0.f;
 
-	// --- FPS readout --------------------------------------------------------
-	// A fixed 60-sample ring, sized once, so the per-frame write never
-	// allocates -- the same reason the GDScript pre-sizes its array.
+	// --- FPS readout (debug-only; voxel.UI.LoadingFps) ----------------------
+	// Latched at Construct, so the widget tree and the tick agree for the
+	// whole show whatever the flag does mid-load.
+	bool bFpsReadoutEnabled = false;
+	// A fixed 60-sample ring, sized once (and only when the readout is on), so
+	// the per-frame write never allocates -- the same reason the GDScript
+	// pre-sizes its array.
 	TArray<float> FrameTimesMs;
 	int32 FrameCursor = 0;
 	float FpsRefreshTimer = 0.f;

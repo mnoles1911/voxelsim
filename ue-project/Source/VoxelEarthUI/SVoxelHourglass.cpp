@@ -167,6 +167,14 @@ void SVoxelHourglass::PhysicsTick()
 
 	// Spawn cadence, bursty through the middle of the drain -- the mock's
 	// `progress > 0.2 && progress < 0.8 && Math.random() < 0.5` double-spawn.
+	//
+	// THE 0.995 CUT-OFF ONCE KILLED THIS WHOLE ANIMATION, and the coupling is
+	// worth pinning: the old work-driven progress model CAPPED at exactly
+	// 0.995, so any warm-ish load pinned Progress there within its first poll
+	// and this strict `<` never passed again -- no grains, top sand hidden
+	// (>0.97), a completely static hourglass for the whole screen. The theatre
+	// model holds at kVoxelTheatreHoldProgress = 0.97 PRECISELY to stay inside
+	// this window; whoever moves either constant must keep hold < cut-off.
 	if (Progress > 0.005f && Progress < 0.995f && Grains.Num() < kMaxGrains)
 	{
 		SpawnAccumulator += kPhysicsTickS;

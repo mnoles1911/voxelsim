@@ -99,6 +99,23 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	float LoadMinHoldSeconds = 2.0f;
 	float LoadMaxHoldSeconds = 60.0f; // the value both menu call sites pass
 
+	// ---- THE ARTIFICIAL LOAD DURATION (owner directive, 2026-09-05) --------
+	//
+	// On entering the loading screen the front end rolls a uniform random
+	// duration in [Min, Max] seconds and plays the progress bar out against it
+	// as THEATRE -- see ComputeTheatreProgress. The reveal is
+	// max(timer, world ready), so this range, not LoadMinHoldSeconds, is what
+	// ordinarily sets how long a player watches the screen; the minimum hold
+	// still matters only when the theatre is overridden shorter than it.
+	//
+	// -VoxelLoadTheatre=<min>[,<max>] overrides both ends. One value pins the
+	// duration exactly; 0 disables the theatre entirely and restores the
+	// pre-directive reveal-on-ready timing, which is the arm the unattended
+	// -VoxelMenuAutoStart parity legs should pass so a hand-off capture does
+	// not grow 30-60 s of curtain time.
+	float LoadTheatreMinSeconds = 30.0f;
+	float LoadTheatreMaxSeconds = 60.0f;
+
 	// -VoxelMenuWatchdog=<seconds>: under -unattended, refuse to sit on the
 	// menu past N seconds and exit with an error. Same shape as
 	// -VoxelPerfExitWatchdog, and for the same reason: a mis-flagged headless

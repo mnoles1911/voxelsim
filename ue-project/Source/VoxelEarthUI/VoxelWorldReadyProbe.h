@@ -85,28 +85,47 @@ struct VOXELEARTHUI_API FVoxelReadyProbeStatus
 	bool bTimedOut = false;
 };
 
-// The loading bar's progress model, as a pure function of its four inputs.
+// Where the bar eases to and HOLDS while the artificial timer has run out but
+// the world has not reported ready. Part of the reveal contract below, and
+// deliberately under the hourglass grain emitter's 0.995 cut-off, so the sand
+// keeps falling through the hold instead of freezing with the bar.
+inline constexpr float kVoxelTheatreHoldProgress = 0.97f;
+
+// The loading bar's progress model, as a pure function of its three inputs.
 //
-// FREE AND PURE SO IT CAN BE TESTED. It has three invariants that are easy to
-// state, easy to break, and invisible in a screenshot -- monotone, floored by
-// elapsed time, and never 1.0 -- and each of them exists because the Godot
-// original's bar lied in a specific way. See VoxelFrontEndTests.cpp.
+// THE BAR IS THEATRE, BY OWNER DIRECTIVE (2026-09-05). It no longer reports
+// streaming work at all: on entering the loading screen the front end rolls an
+// artificial 30-60 s duration, and the bar plays that duration out as a show
+// -- SMOOTHLY, which the honest work-driven bar it replaces could not be,
+// because ring fill moves in lurches and a warm cache pinned it at 99% for the
+// whole hold. The world's actual readiness enters this model as exactly one
+// bit, and only to gate the ending.
 //
-//   TimeFraction   elapsed / MaxHold, clamped. The floor: a work-only bar can
-//                  sit on one number for tens of seconds while an R3 tail
-//                  drains, and a bar that never moves reads as a hang.
-//   SpatialFraction probe hits / probe total.
-//   RingFillFraction weighted loaded/(loaded+outstanding) over the gated rings.
-//   PreviousProgress the last value returned. The monotone clamp: the desired
-//                  set GROWS as the anchor settles, so the raw ratio genuinely
-//                  decreases, and a bar going backwards reads worse than one
-//                  standing still.
+// THE REVEAL SEMANTICS, stated honestly: the world is revealed at
+// max(artificial timer elapsed, world actually ready). A world that beats the
+// timer waits behind the curtain while the theatre plays out -- the owner's
+// explicit intent. A world SLOWER than the timer holds the bar at
+// kVoxelTheatreHoldProgress (~97%) with the hourglass still animating, then
+// completes when the gate opens. The bar never sits frozen at 100% and never
+// moves backwards.
 //
-// Returns at most 0.995. Reaching 1.0 is the caller's job, and only when the
-// gate actually passes -- "100% because a timer expired" is the one lie this
-// whole model exists to avoid.
-VOXELEARTHUI_API float ComputeLoadProgress(float TimeFraction, float SpatialFraction, float RingFillFraction,
-                                           float PreviousProgress);
+//   TheatreFraction  elapsed / rolled duration, clamped.
+//   bWorldGateOpen   the ready probe passed (or timed out and the curtain is
+//                    lifting anyway). While false, the return is capped at the
+//                    hold value; 1.0 is reachable only once this is true --
+//                    "100% while the world is still landing" stays the one lie
+//                    this model refuses to tell, same as its predecessor.
+//   PreviousProgress the last value returned. The monotone clamp, kept from
+//                    the old model: a bar going backwards reads worse than one
+//                    standing still.
+//
+// THE EASING IS SMOOTHSTEP (3t^2 - 2t^3), and the choice is load-bearing: its
+// slope is ZERO at both ends, so the bar leaves 0% gently, lands on the ~97%
+// hold with no visible speed discontinuity, and finishes without a snap --
+// an eased curve reads better than linear, and this one makes the hold
+// invisible as a transition. FREE AND PURE SO IT CAN BE TESTED; see
+// VoxelFrontEndTests.cpp.
+VOXELEARTHUI_API float ComputeTheatreProgress(float TheatreFraction, bool bWorldGateOpen, float PreviousProgress);
 
 class VOXELEARTHUI_API FVoxelWorldReadyProbe
 {
