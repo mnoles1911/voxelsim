@@ -988,3 +988,40 @@ second ends box 0.92L x 0.26B inside the taper.
 NEXT: owner closes editor -> build + water-only regen -> relaunch -> owner
 judges: wake wedge, wading rings, dry ends. Backlog §13 charge collapse is
 with an Opus agent in parallel.
+
+## Wake hunt state at 2026-09-06 17:30 (blocked on the box; Codex holds the editor)
+
+WHAT IS PROVEN, and none of it depends on framing or timing:
+- Injection: 20,778 with zero drops (owner's own Ripple.Stat).
+- Deposit: voxel.Water.Ripple.Dump reads the whole 512x512 back and finds the
+  ring at the EXACT world position dropped (within 1 cm), 6.72% of texels
+  non-zero, and PER CHANNEL maxR=1.666 maxG=1.666 (gradient, what the material
+  consumes) maxB=1.872 (height). The simulation is healthy end to end.
+- Binding: TestFill writes a constant into the same UObject the subsystem draws
+  into; the material renders it saturated. Same texture, and the gain/edge-fade
+  chain amplifies correctly.
+- Emissive pin: a constant renders blazing red. SLW shows our emissive.
+- UV is LIVE: differencing the uv arm against the same-pose gradient arm gives
+  R +0.471, G +0.318, B +0.035 -- exactly the shape of emissive=(u,v,0). Units
+  check out too (kWindowUU = 5120 UU, published InvSize = 1/5120).
+- Shore mask: CLEARED by a two-arm control (mask on/off both deposit 0.4998).
+- Altitude/mip: cleared (blank at 2 m as well as 35 m).
+
+WHAT IS NOT PROVEN: that a correctly framed ripple is invisible. Several
+"blank" captures were MY framing errors (DropHere puts the splat under the
+camera, which sits in the blind spot below a pitched-down view), and two of my
+own debug arms turned out miswired -- fixeduv rendered nothing even against a
+guaranteed uniform fill, and the first marker was 51 cm wide and unfindable.
+Discard conclusions built on those.
+
+NEXT, when the box frees, in order:
+1. Marker arm at the WIDENED 0.08 uv falloff -- does this material's uv reach
+   0.583 where the ring is? An offset shows as a displaced patch and is then
+   measured rather than inferred.
+2. If uv lands right: the sample reads the right texel and the ring must
+   render, so re-run the gradient arm with a 120-step burst (the only drop form
+   proven to leave 1.67 in the gradient) at a pose with the drop 6 m ahead.
+3. Owner's near-water complaint is a SEPARATE, well-understood lever:
+   water_optics.ABSORPTION_DISTANCE_M = 5.5 and SCATTERING_PER_M. Ladder
+   -VoxelWaterMatScalar=AbsorptionDistanceM:5.5/3.0/2.0 at a low near-shore
+   pose. No rebuild, no regen.

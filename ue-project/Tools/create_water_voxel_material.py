@@ -2654,6 +2654,34 @@ def main():
             "M_WaterVoxel EMISSIVE PIN TEST: ON -- emissive is a CONSTANT (10,0,0). "
             "If the water is not blazing red, Single Layer Water is not showing this "
             "material's emissive at all. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "foamviz":
+        # IS ANY FOAM ALIVE AT ALL? (2026-09-06)
+        #
+        # The owner reports no wake foam, no shoreline foam and no whitecaps --
+        # and docs/water-realism-analysis-2026-09-06.md R8 records that
+        # VOXEL_SHORE_FX's shoreline foam and wet-sand darkening have NEVER been
+        # confirmed in a capture. Those three signals come from three unrelated
+        # sources (the ripple field, the bathy field, the wind-wave field) and
+        # meet in exactly one place: this material's foam composite, which
+        # drives BaseColor and MP_Opacity. Three independent inputs all invisible
+        # is far better explained by one dead composite than by three
+        # coincidences, and it would make the wake hunt a symptom rather than
+        # the disease.
+        #
+        # So paint the composite itself. `foam` here is post-top-face-mask,
+        # i.e. exactly the value BaseColor and Opacity receive.
+        #   ANY WHITE -> the composite is alive and the foam family works; the
+        #       wake's problem really is its own.
+        #   UNIFORM BLACK, at a shoreline, in wind -> every foam signal is
+        #       arriving as zero, and that single fault explains all of it.
+        fv_out = bathy_b.mul(foam, bathy_b.const(5.0))
+        if not mel.connect_material_property(
+                fv_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect foamviz debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel FOAM VIZ ARM: ON -- emissive is the foam composite (the exact "
+            "value BaseColor and MP_Opacity receive) x5. Black everywhere at a shoreline "
+            "means every foam signal is zero. NOT A SHIPPING MATERIAL.")
     elif _ripple_debug_mode == "marker":
         # WHERE DOES THIS MATERIAL THINK uv 0.583 IS? (2026-09-06)
         #
@@ -2677,9 +2705,15 @@ def main():
         mk_du = bathy_b.abs_(bathy_b.sub(mk_u, bathy_b.const(0.583)))
         mk_dv = bathy_b.abs_(bathy_b.sub(mk_v, bathy_b.const(0.583)))
         mk_d = bathy_b.maximum(mk_du, mk_dv)
-        # 1 at the coordinate, falling to 0 within ~0.01 uv (half a metre), and
-        # going NEGATIVE beyond -- which the frame clamps to black for free.
-        mk_hit = bathy_b.one_minus(bathy_b.mul(mk_d, bathy_b.const(100.0)))
+        # WIDTH MATTERS AND THE FIRST VERSION GOT IT WRONG. At a falloff of 100
+        # the marker is 0.01 uv wide -- a 51 cm square -- and the first run found
+        # nothing, which a numeric search of the frame later showed was because
+        # the only near-white pixels in it were the HUD text in the corner. A
+        # marker that small is indistinguishable from a marker that is absent,
+        # which makes the test useless in exactly the direction that looks like
+        # a finding. 12.5 gives 0.08 uv, a ~4 m patch, unmissable at any pose
+        # these captures use.
+        mk_hit = bathy_b.one_minus(bathy_b.mul(mk_d, bathy_b.const(12.5)))
         mk_out = bathy_b.mul(mk_hit, bathy_b.const(5.0))
         if not mel.connect_material_property(
                 mk_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
