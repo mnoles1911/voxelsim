@@ -2623,8 +2623,140 @@ def main():
     #   FLAT BLACK -> the sample itself is zero, so it is the derive draw or
     #       the UV mapping, and the gain is irrelevant.
     # Green/red tint reads the two gradient channels; blue reads height.
-    if os.environ.get("VOXEL_WATER_RIPPLE_DEBUG", "0").strip().lower() not in (
-            "0", "off", "false", "no", ""):
+    _ripple_debug_mode = os.environ.get("VOXEL_WATER_RIPPLE_DEBUG", "0").strip().lower()
+    # TWO MODES ADDED 2026-09-06, because the original arm answered its question
+    # and the answer moved the search upstream. The gradient arm above ran with
+    # an 8 m / 0.5 m drop four seconds before the shutter and produced NOTHING
+    # (VoxelVerify00756) -- its own table calls that "the sample itself is zero".
+    # But the same frame is evidence about something larger: this arm REPLACES
+    # emissive, so it also deleted the sky reflection, and the water looked
+    # identical to the shipping capture. A pin whose contents can be swapped for
+    # a 50x-gained field with no visible change may not be reaching the frame at
+    # all, and that would explain the missing wake foam AND the missing sky
+    # reflection/sun glint the owner reports as "the water looks unrealistic".
+    #
+    #   VOXEL_WATER_RIPPLE_DEBUG=const -> emissive is a CONSTANT bright red.
+    #       Tests THE PIN, not the data. Water not red == Single Layer Water is
+    #       not showing our emissive, which is a root cause several symptoms
+    #       deep. This is the cheapest decisive test in the whole search.
+    #   VOXEL_WATER_RIPPLE_DEBUG=uv -> emissive is the ripple UV (R=u, G=v).
+    #       Tests THE MAPPING. A smooth red/green ramp centred on the player
+    #       means the UV lands and the fault is the texture binding; flat or
+    #       wild values mean the UV is wrong.
+    if _ripple_debug_mode == "const":
+        dbg_const = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 3000)
+        dbg_const.set_editor_property("constant", unreal.LinearColor(10.0, 0.0, 0.0, 1.0))
+        if not mel.connect_material_property(
+                dbg_const, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect const debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel EMISSIVE PIN TEST: ON -- emissive is a CONSTANT (10,0,0). "
+            "If the water is not blazing red, Single Layer Water is not showing this "
+            "material's emissive at all. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "marker":
+        # WHERE DOES THIS MATERIAL THINK uv 0.583 IS? (2026-09-06)
+        #
+        # The dump proves the ring sits at uv (0.583, 0.583), gradient 1.67 over
+        # 13,293 texels, at the exact world position it was dropped. The shipping
+        # sample multiplies that by 50 in the debug arm and renders NOTHING. The
+        # only mechanism left that fits every result is that this material's
+        # per-pixel uv lands outside the data and CLAMPS to the texture edge:
+        # edge texels are 0 for a localised ring (invisible) but 0.5 for the
+        # uniform test fill (blazing), which is exactly the asymmetry that has
+        # survived every other explanation.
+        #
+        # So stop sampling and just ASK WHERE. This paints a bright square where
+        # this material computes uv == (0.583, 0.583) -- the ring's own
+        # coordinate. The square must land on the drop. If it lands somewhere
+        # else, the offset between the two IS the bug, measured rather than
+        # inferred; if it does not appear at all, uv never reaches 0.583 on any
+        # visible pixel and the mapping's scale is wrong.
+        mk_u = bathy_b.mask(ripple["uv"], "", r=True)
+        mk_v = bathy_b.mask(ripple["uv"], "", g=True)
+        mk_du = bathy_b.abs_(bathy_b.sub(mk_u, bathy_b.const(0.583)))
+        mk_dv = bathy_b.abs_(bathy_b.sub(mk_v, bathy_b.const(0.583)))
+        mk_d = bathy_b.maximum(mk_du, mk_dv)
+        # 1 at the coordinate, falling to 0 within ~0.01 uv (half a metre), and
+        # going NEGATIVE beyond -- which the frame clamps to black for free.
+        mk_hit = bathy_b.one_minus(bathy_b.mul(mk_d, bathy_b.const(100.0)))
+        mk_out = bathy_b.mul(mk_hit, bathy_b.const(5.0))
+        if not mel.connect_material_property(
+                mk_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect marker debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel UV MARKER ARM: ON -- emissive is a bright square where this "
+            "material computes uv == (0.583, 0.583), the dump's own peak coordinate. "
+            "NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "fixeduv":
+        # THE LAST FORK (2026-09-06). voxel.Water.Ripple.Dump proved the ring is
+        # written to the texture at EXACTLY the world position it was dropped
+        # (peak texel (298,298), uv 0.583, 1 cm from the requested point, 6.72%
+        # of texels non-zero). The write is correct and the binding is correct,
+        # so the only way the shipping sample can return nothing is that the
+        # per-pixel UV this material computes is not the UV the data lives at.
+        #
+        # This samples the field at a HARDCODED uv -- the dump's own peak -- and
+        # paints it over the whole surface. It removes the per-pixel UV from the
+        # question entirely:
+        #   WHOLE LAKE GLOWS -> the texture read is fine at that coordinate, so
+        #       the per-pixel UV chain (world position, MPC origin, inv size) is
+        #       the defect.
+        #   STILL NOTHING -> the sampler itself cannot read this texture from
+        #       this material, and the uniform test fill passed for some reason
+        #       other than a working read.
+        import ripple_field_graph as _rfg  # noqa: E402
+        fx_tex = mel.create_material_expression(
+            material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, 3200)
+        fx_tex.set_editor_property("parameter_name", _rfg.FIELD_TEXTURE_PARAM)
+        fx_texture = unreal.load_object(None, _rfg.FIELD_TEXTURE)
+        if fx_texture is None:
+            raise RuntimeError("fixeduv debug: could not load %s" % _rfg.FIELD_TEXTURE)
+        fx_tex.set_editor_property("texture", fx_texture)
+        fx_tex.set_editor_property(
+            "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        fx_uv = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant2Vector, -1700, 3200)
+        fx_uv.set_editor_property("r", 0.583)
+        fx_uv.set_editor_property("g", 0.583)
+        if not mel.connect_material_expressions(fx_uv, "", fx_tex, "UVs"):
+            raise RuntimeError("connect fixed uv -> texture failed")
+        fx_gain = scalar_param("RippleDebugGain", 20.0, -1300, 3000)
+        fx_dbg = bathy_b.mul(fx_tex, fx_gain)
+        if not mel.connect_material_property(
+                fx_dbg, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect fixeduv debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel FIXED-UV ARM: ON -- emissive is the field sampled at a CONSTANT "
+            "uv (0.583, 0.583) x RippleDebugGain, with no per-pixel UV involved at all. "
+            "NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "height":
+        # THE CHANNEL SPLIT (2026-09-06). The gradient arm renders nothing for a
+        # 0.9 m drop that the field's own readback measures at 0.8228, while a
+        # uniform 0.5 test fill through the IDENTICAL chain saturates the frame.
+        # The test fill wrote every channel; the readback reports ONE number. So
+        # "the field has data" may only ever have been a statement about B
+        # (height), and R,G (gradient) -- the only channels the shipping graph
+        # consumes for normals, and the only ones the gradient arm shows -- may
+        # be empty. This routes HEIGHT to emissive instead. Height visible while
+        # gradient is not convicts the derive's gradient write.
+        dbg_h_gain = scalar_param("RippleDebugGain", 20.0, -1300, 3000)
+        dbg_h = bathy_b.mul(ripple["height_m"], dbg_h_gain)
+        if not mel.connect_material_property(
+                dbg_h, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect height debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel RIPPLE HEIGHT ARM: ON -- emissive is the field's HEIGHT "
+            "channel x RippleDebugGain. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "uv":
+        if not mel.connect_material_property(
+                ripple["uv"], "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect uv debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel RIPPLE UV TEST: ON -- emissive is the ripple UV (R=u, G=v). "
+            "A smooth red/green ramp centred on the player means the mapping lands. "
+            "NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode not in ("0", "off", "false", "no", ""):
         # The GRADIENT only, not the height: a float2 wired to emissive
         # reads as (R, G, 0), which is all that is needed to answer "is
         # there anything in this texture". Assembling a float3 would need an

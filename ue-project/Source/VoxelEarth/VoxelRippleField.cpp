@@ -108,6 +108,15 @@ TAutoConsoleVariable<float> CVarVoxelWaterRippleGain(
 	TEXT("an A/B at a pinned pose."),
 	ECVF_Default);
 
+// See THE BINDING TEST in RunDerive for what this is for and why it exists.
+TAutoConsoleVariable<float> CVarVoxelWaterRippleTestFill(
+	TEXT("voxel.Water.Ripple.TestFill"), 0.0f,
+	TEXT("DIAGNOSTIC. Above 0, overwrites the ripple FIELD render target with this constant every "
+	     "frame, right after the derive. Answers exactly one question -- does the material sample "
+	     "the same render-target object this subsystem draws into -- and makes every other reading "
+	     "in the run meaningless while it is on. 0 (default) touches nothing."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelWaterRippleSpeed(
 	TEXT("voxel.Water.Ripple.SpeedMPS"), 1.6f,
 	TEXT("Ripple propagation speed in metres per second. 1.6 is roughly right for the ")
@@ -254,6 +263,34 @@ FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDropCmd(
 			       X, Y, RadiusM, StrengthM, Steps,
 			       Steps * UVoxelRippleFieldSubsystem::kFixedDt,
 			       Ripple->WindowOriginUU().X, Ripple->WindowOriginUU().Y);
+		}));
+
+// LOOK AT THE TEXTURE ITSELF (2026-09-06). Nine captures narrowed this bug by
+// elimination -- injection, deposit, binding, gain, edge fade, emissive pin,
+// shore mask, altitude/mip and framing are all cleared -- and left exactly one
+// asymmetry: a UNIFORM value written into the field renders, and a LOCALISED
+// one does not. Uniform data survives any UV error; localised data does not.
+// Every instrument so far reads the texture through the CPU or paints it
+// through the material, and neither can say WHERE in the 512x512 image the
+// ripple sits. This writes the image out so that question stops being an
+// inference. Compare the ring's position here against the material's UV arm.
+FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDumpCmd(
+	TEXT("voxel.Water.Ripple.Dump"),
+	TEXT("voxel.Water.Ripple.Dump [name] -- export the ripple FIELD render target to "
+	     "<ProjectSaved>/RippleDumps as an image, and log the window origin beside it so the "
+	     "image's texels can be mapped back to world UU."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			UVoxelRippleFieldSubsystem* Ripple = FindRippleSubsystem(World);
+			if (!Ripple)
+			{
+				UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Dump: no subsystem."));
+				return;
+			}
+			const FString Name = (Args.Num() > 0) ? Args[0] : TEXT("field");
+			const FString Dir = FPaths::ProjectSavedDir() / TEXT("RippleDumps");
+			Ripple->DumpFieldToDisk(Dir, Name);
 		}));
 
 FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDropHereCmd(
@@ -1019,6 +1056,99 @@ void UVoxelRippleFieldSubsystem::StepOnce(double ShiftUvX, double ShiftUvY)
 	}
 }
 
+void UVoxelRippleFieldSubsystem::DumpFieldToDisk(const FString& Dir, const FString& Name)
+{
+	// WHERE IS THE RING, IN WORLD UNITS. Not "is there data" -- SampleFieldHealth
+	// already answers that and has answered it nine times today while the screen
+	// stayed empty. This answers the question that separates the last two
+	// suspects: the texel the peak sits in, converted back through the SAME
+	// origin the material is handed, so its uv can be compared directly against
+	// what the material samples at that world position. If the peak's uv is not
+	// where the caller dropped it, the write is misplaced; if it IS, then the
+	// material's uv is reading somewhere else and the mapping is the bug.
+	if (!Field_)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Dump: no field render target."));
+		return;
+	}
+	FTextureRenderTargetResource* Res = Field_->GameThread_GetRenderTargetResource();
+	TArray<FLinearColor> Px;
+	if (!Res || !Res->ReadLinearColorPixels(Px, FReadSurfaceDataFlags(RCM_MinMax),
+	                                        FIntRect(0, 0, kSize, kSize))
+	    || Px.Num() < kSize * kSize)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Dump: readback failed."));
+		return;
+	}
+
+	int32 PeakX = -1, PeakY = -1;
+	float PeakV = 0.0f;
+	int32 NonZero = 0;
+	// PER CHANNEL, because "the field has data" stopped being a useful sentence.
+	// R,G are the GRADIENT -- the only thing the shipping graph turns into a
+	// normal, and the only thing the wake art reads. B is HEIGHT. A max taken
+	// across all three cannot tell those apart, and the uniform test fill that
+	// "proved" the sampler works wrote all three at once, so it could not
+	// either. If R,G are flat while B carries the ring, the derive's gradient
+	// write is the defect and every symptom in this hunt follows from it.
+	float MaxR = 0.0f, MaxG = 0.0f, MaxB = 0.0f;
+	int32 NonZeroRG = 0, NonZeroB = 0;
+	for (int32 Y = 0; Y < kSize; ++Y)
+	{
+		for (int32 X = 0; X < kSize; ++X)
+		{
+			const FLinearColor& C = Px[Y * kSize + X];
+			MaxR = FMath::Max(MaxR, FMath::Abs(C.R));
+			MaxG = FMath::Max(MaxG, FMath::Abs(C.G));
+			MaxB = FMath::Max(MaxB, FMath::Abs(C.B));
+			if (FMath::Abs(C.R) > 1e-4f || FMath::Abs(C.G) > 1e-4f)
+			{
+				++NonZeroRG;
+			}
+			if (FMath::Abs(C.B) > 1e-4f)
+			{
+				++NonZeroB;
+			}
+			const float V = FMath::Max3(FMath::Abs(C.R), FMath::Abs(C.G), FMath::Abs(C.B));
+			if (V > 1e-4f)
+			{
+				++NonZero;
+			}
+			if (V > PeakV)
+			{
+				PeakV = V;
+				PeakX = X;
+				PeakY = Y;
+			}
+		}
+	}
+	UE_LOG(LogVoxelWater, Warning,
+	       TEXT("Ripple.Dump[%s] CHANNELS: maxR=%.5f maxG=%.5f (GRADIENT -- what the water "
+	            "material actually consumes) maxB=%.5f (height). Non-zero: gradient %d texels, "
+	            "height %d texels. Gradient flat while height is not means the DERIVE's gradient "
+	            "write is the bug."),
+	       *Name, MaxR, MaxG, MaxB, NonZeroRG, NonZeroB);
+
+	const double OriginXUU = static_cast<double>(OriginPx_) * kTexelUU;
+	const double OriginYUU = static_cast<double>(OriginPy_) * kTexelUU;
+	const double PeakWorldX = OriginXUU + (PeakX + 0.5) * kTexelUU;
+	const double PeakWorldY = OriginYUU + (PeakY + 0.5) * kTexelUU;
+	UE_LOG(LogVoxelWater, Warning,
+	       TEXT("Ripple.Dump[%s]: peak %.4f at texel (%d,%d) = uv (%.4f,%.4f) = world "
+	            "(%.0f,%.0f) UU. Non-zero texels %d of %d (%.2f%%). Window origin (%.0f,%.0f) UU, "
+	            "%.1f m across. A peak whose world position is NOT where the caller dropped it "
+	            "means the WRITE is misplaced; a peak that IS there means the material's uv reads "
+	            "elsewhere."),
+	       *Name, PeakV, PeakX, PeakY,
+	       (PeakX + 0.5) / double(kSize), (PeakY + 0.5) / double(kSize),
+	       PeakWorldX, PeakWorldY, NonZero, kSize * kSize,
+	       100.0 * double(NonZero) / double(kSize * kSize),
+	       OriginXUU, OriginYUU, kWindowUU / 100.0);
+
+	IFileManager::Get().MakeDirectory(*Dir, /*Tree=*/true);
+	UKismetRenderingLibrary::ExportRenderTarget(GetWorld(), Field_, Dir, Name + TEXT(".png"));
+}
+
 void UVoxelRippleFieldSubsystem::RunDerive()
 {
 	UWorld* World = GetWorld();
@@ -1028,6 +1158,44 @@ void UVoxelRippleFieldSubsystem::RunDerive()
 	}
 	DeriveMid_->SetTextureParameterValue(TEXT("State"), Front());
 	UKismetRenderingLibrary::DrawMaterialToRenderTarget(World, Field_, DeriveMid_);
+
+	// THE BINDING TEST (voxel.Water.Ripple.TestFill, default 0 = untouched).
+	//
+	// 2026-09-06: three captures eliminated everything AROUND the sample. The
+	// emissive pin works (a constant wrote blazing red over the whole lake),
+	// the UV mapping lands (the UV painted straight to emissive is a smooth
+	// two-channel ramp centred on the player), the field's own readback finds
+	// real data, and the counters show 20,778 injections with zero drops --
+	// and yet gradient x50 on emissive renders NOTHING. The one thing none of
+	// those tests can separate is whether the texture THIS CODE writes is the
+	// texture the MATERIAL reads: both resolve /Game/Voxel/RT_VoxelRippleField
+	// by path, so a mismatch cannot be seen from either side alone.
+	//
+	// This overwrites Field_ -- the exact UObject this subsystem holds and
+	// draws into -- with a known constant, immediately after the derive that
+	// is supposed to fill it. Then the debug arm's gradient x50 is a direct
+	// question with only two answers:
+	//   THE LAKE LIGHTS UP -> same object. The binding is fine and the fault
+	//       is upstream: the derive is not depositing what we think it is.
+	//   STILL NOTHING -> the material samples a DIFFERENT object, and the
+	//       baked texture reference is the bug.
+	// Costs one clear per frame while armed and nothing at all at 0.
+	const float TestFill = CVarVoxelWaterRippleTestFill.GetValueOnGameThread();
+	if (TestFill > 0.0f)
+	{
+		UKismetRenderingLibrary::ClearRenderTarget2D(
+			World, Field_, FLinearColor(TestFill, TestFill, TestFill, 1.0f));
+		static bool bLoggedTestFill = false;
+		if (!bLoggedTestFill)
+		{
+			bLoggedTestFill = true;
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("RippleField: TEST FILL ACTIVE at %.3f -- the field render target is being "
+			            "overwritten with a constant every frame, so NOTHING in this run is a "
+			            "statement about the simulation. This is the material-binding test."),
+			       TestFill);
+		}
+	}
 }
 
 double UVoxelRippleFieldSubsystem::FieldHealthAgeSec() const

@@ -5,6 +5,7 @@
 #include "GameFramework/Actor.h"
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
+#include "VoxelEarth.h" // LogVoxelEarth, for the player-ripple witness below
 #include "VoxelRippleField.h"
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
@@ -911,9 +912,37 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 		const FVector FeetProbe(NewPos.X, NewPos.Y, NewPos.Z - GetHalfExtentZ() + 5.0);
 		const FVector HeadProbe(NewPos.X, NewPos.Y, NewPos.Z + GetHalfExtentZ() + 50.0);
 		const bool bAtWaterSurface = IsInWaterAt(FeetProbe) && !IsInWaterAt(HeadProbe);
+		// PLAYER-RIPPLE WITNESS (2026-09-06), same reason as the boat's: the
+		// owner reports no rings, and "feet never read wet", "head reads wet
+		// too", and "too slow" are indistinguishable from outside. Throttled
+		// to 1 Hz and only while actually in contact with water, so walking
+		// around on dry land says nothing.
+		{
+			static double LastRippleReportSeconds = 0.0;
+			const double NowSeconds = FPlatformTime::Seconds();
+			const bool bFeetWet = IsInWaterAt(FeetProbe);
+			if (bFeetWet && !bAtWaterSurface && NowSeconds - LastRippleReportSeconds >= 1.0)
+			{
+				LastRippleReportSeconds = NowSeconds;
+				UE_LOG(LogVoxelEarth, Display,
+				       TEXT("[player-ripple] DECLINED: feet wet but head ALSO wet (fully "
+				            "submerged), so no surface ring. Speed %.2f m/s."),
+				       HorizontalVelocity.Size() / 100.0);
+			}
+		}
 		if (bAtWaterSurface && bHaveLastRipplePos)
 		{
 			const double SpeedMPS = HorizontalVelocity.Size() / 100.0;
+			static double LastSlowReportSeconds = 0.0;
+			const double NowSlow = FPlatformTime::Seconds();
+			if (SpeedMPS <= 0.15 && NowSlow - LastSlowReportSeconds >= 1.0)
+			{
+				LastSlowReportSeconds = NowSlow;
+				UE_LOG(LogVoxelEarth, Display,
+				       TEXT("[player-ripple] at the surface but too slow to ring: %.2f m/s "
+				            "(needs > 0.15)."),
+				       SpeedMPS);
+			}
 			if (SpeedMPS > 0.15)
 			{
 				const double Frac = FMath::Max(

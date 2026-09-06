@@ -274,6 +274,13 @@ public:
 	static void AddDisturbanceAt(const UWorld* World, const FVector& WorldPos,
 	                             float RadiusM, float StrengthM);
 
+	// WHERE the field's peak is, in world UU, plus an image on disk.
+	// voxel.Water.Ripple.Dump. Public because the console command is a free
+	// function; see the implementation for why a "where" instrument became
+	// necessary after nine separate "is there data" answers all said yes while
+	// the screen stayed empty.
+	void DumpFieldToDisk(const FString& Dir, const FString& Name);
+
 	// ------------------------------------------------------------------------
 	// A WAKE: THE SAME RIPPLE, DRAGGED ALONG A LINE
 	// ------------------------------------------------------------------------

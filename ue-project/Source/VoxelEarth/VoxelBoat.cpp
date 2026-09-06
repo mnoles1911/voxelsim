@@ -312,28 +312,31 @@ void AVoxelBoat::BeginPlay()
 		const double InnerHalfL = HalfLengthUU * 0.62;
 		const double InnerHalfB = HalfBeamUU * 0.55;
 		const double BottomZ = KeelOffsetUU + 4.0; // just inside the shell
-		// TOP RAISED waterline+10 -> gunwale-6 (2026-09-06, owner: "water is
-		// clipping through the front and back ends of the cockpit... because
-		// of the more drastic bobbing"). The mechanism: WaveBobGain 6.0 moves
-		// the BOAT six times the rendered surface's WPO, so in a trough the
-		// water stands up to ~5/6 of the visible bob above the hull's rest
-		// waterline -- past the old +10 lid. Gunwale-6 is the geometric
-		// ceiling that CANNOT re-create the +50-era beside-hull artefact
-		// ("clear, see through, white transparent box... switches sides based
-		// on camera angle", fixed earlier today): a sightline that reaches
-		// water OUTSIDE the hull must clear both gunwales, and a straight
-		// line over two points at gunwale height never dips below it over the
-		// interior, so it clears any lid below the gunwale. A sightline over
-		// ONE gunwale only reaches the cockpit interior, which is exactly
-		// what the mask is for.
+		// THE LID STAYS AT WATERLINE+10, AND THE 2026-09-06 ATTEMPT TO RAISE IT
+		// IS RECORDED HERE SO IT IS NOT REPEATED. Raising it to gunwale-6 (34 UU
+		// above the waterline on the shipped canoe) brought the beside-hull
+		// artefact straight back: the owner's grazing-angle screenshot shows
+		// water carved away BEYOND the far gunwale. The geometric argument the
+		// raise was made on was WRONG -- it assumed a sightline reaching water
+		// outside the hull must clear BOTH gunwales, but a near-horizontal ray
+		// enters above the NEAR gunwale, crosses the box's above-water slab, and
+		// exits past the FAR one onto open water, which the mask then kills. The
+		// taller the slab, the wider the band of angles that do this.
 		//
-		// The gunwale is the ADOPTED one: AdoptHullFromBody centres the hull
-		// on the actor origin and sets KeelOffsetUU = -Ext.Z, so the top of
-		// the real hull sits at -KeelOffsetUU. The old waterline+10 lid stays
-		// as a floor for a degenerate adoption (a flat asset whose gunwale-6
-		// would land under its own waterline).
-		const double TopZ = FMath::Max(KeelOffsetUU + VoxelBoatTuning::RestDraftUU + 10.0,
-		                               -KeelOffsetUU - 6.0);
+		// The ends-clipping the raise was meant to fix was never a height
+		// problem: it was COVERAGE. The midship box reaches 0.62 of the hull
+		// length, so the bow and stern thirds had no exclusion at all, and 6x
+		// bobbing simply made the gap visible. The ends box below supplies that
+		// coverage at this same lid height, which is the fix that does not trade
+		// one artefact for the other.
+		//
+		// The remaining honest limit: a crest taller than 10 UU above the rest
+		// waterline can still wash the shell for a frame. A hull-shaped mesh --
+		// or the camera-independent version of this test, an oriented-box
+		// containment test done in the water material against the boat's
+		// published transform instead of a screen-space stencil -- is the v2
+		// that removes the trade entirely.
+		const double TopZ = KeelOffsetUU + VoxelBoatTuning::RestDraftUU + 10.0;
 		const double HalfH = FMath::Max(1.0, 0.5 * (TopZ - BottomZ));
 		ExclusionVolume->SetRelativeLocation(FVector(0.0, 0.0, 0.5 * (TopZ + BottomZ)));
 		// The engine cube is 100 UU on a side, so scale = half-extent / 50.
@@ -356,8 +359,7 @@ void AVoxelBoat::BeginPlay()
 		const double EndsHalfL = HalfLengthUU * 0.92;
 		const double EndsHalfB = HalfBeamUU * 0.26;
 		const double BottomZ = KeelOffsetUU + 4.0;
-		const double TopZ = FMath::Max(KeelOffsetUU + VoxelBoatTuning::RestDraftUU + 10.0,
-		                               -KeelOffsetUU - 6.0);
+		const double TopZ = KeelOffsetUU + VoxelBoatTuning::RestDraftUU + 10.0;
 		const double HalfH = FMath::Max(1.0, 0.5 * (TopZ - BottomZ));
 		ExclusionVolumeEnds->SetRelativeLocation(FVector(0.0, 0.0, 0.5 * (TopZ + BottomZ)));
 		ExclusionVolumeEnds->SetRelativeScale3D(
@@ -887,6 +889,28 @@ void AVoxelBoat::TickWake(float DeltaSeconds)
 
 	const FVector V = PhysicsBody->GetPhysicsLinearVelocity();
 	const double SpeedXY = FVector(V.X, V.Y, 0.0).Size();
+
+	// WAKE ENGAGEMENT WITNESS (2026-09-06). The owner drove this boat for
+	// minutes and the ripple field recorded ONE injection in 14,162 steps --
+	// so the wake was never reaching the field, and every material-side theory
+	// about why the wake is invisible was chasing the wrong half. Three gates
+	// can swallow it silently and they are indistinguishable from outside, so
+	// this says which, once a second, only while the player is aboard a boat
+	// that is declining. Silent when the wake is actually injecting.
+	{
+		static double LastWakeReportSeconds = 0.0;
+		const double NowSeconds = FPlatformTime::Seconds();
+		const bool bWouldInject = bHaveLastWake && bAnyWet && SpeedXY > WakeMinSpeedUU;
+		if (!bWouldInject && NowSeconds - LastWakeReportSeconds >= 1.0)
+		{
+			LastWakeReportSeconds = NowSeconds;
+			UE_LOG(LogVoxelEarth, Display,
+			       TEXT("[boat-wake] DECLINED: haveLastSweep=%d anyProbeWet=%d speed=%.1f UU/s "
+			            "(needs > %.1f). Lifetime probe-wet ticks=%llu, wake splats=%llu."),
+			       bHaveLastWake ? 1 : 0, bAnyWet ? 1 : 0, SpeedXY, WakeMinSpeedUU,
+			       ProbesWet, WakeSplats);
+		}
+	}
 
 	if (bHaveLastWake && bAnyWet && SpeedXY > WakeMinSpeedUU)
 	{

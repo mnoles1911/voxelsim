@@ -10110,11 +10110,48 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 	// experiment from silently priming view B off view A's depths.
 	bool bPrimeHistoryClaimed = false;
 
+	// L3 ENGAGEMENT TRACE, STAGE 2 (2026-09-06). Stage 1 proved the light
+	// volume's call site -- deep in this loop, after VoxelMarchBindPool -- is
+	// NEVER reached in a -game leg, while the marcher plainly renders terrain.
+	// So the loop is exited before it gets there, and these one-time lines say
+	// WHERE: an empty view set, a frame-number mismatch, or a missing scene
+	// depth each look identical from outside. One branch, once per process.
+	{
+		static bool bLoggedMarchLoopEntry = false;
+		if (!bLoggedMarchLoopEntry)
+		{
+			bLoggedMarchLoopEntry = true;
+			int32 FrameMatched = 0;
+			for (const FViewMarch& Probe : Views)
+			{
+				if (Probe.FrameNumber == GFrameNumberRenderThread)
+				{
+					++FrameMatched;
+				}
+			}
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("[voxel-light] STAGE2 PreRenderBasePass_RenderThread entered: Views=%d, ")
+			       TEXT("frameMatched=%d (rt frame %u). A frameMatched of 0 means this hook is not ")
+			       TEXT("where the live march dispatch happens for this configuration."),
+			       Views.Num(), FrameMatched, GFrameNumberRenderThread);
+		}
+	}
 	for (FViewMarch& Entry : Views)
 	{
 		if (Entry.FrameNumber != GFrameNumberRenderThread)
 		{
 			continue;
+		}
+		{
+			static bool bLoggedFramePassed = false;
+			if (!bLoggedFramePassed)
+			{
+				bLoggedFramePassed = true;
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("[voxel-light] STAGE2 view passed the frame gate -- the loop body runs. ")
+				       TEXT("If STAGE2 'pool bound' never follows, the exit is the scene-texture or ")
+				       TEXT("depth gate below."));
+			}
 		}
 
 		// Scene textures, via the public accessor. SceneDepth here is the
@@ -10741,6 +10778,17 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				FScopeLock Guard(&State->Lock);
 				State->Stats.IndexEntries = IndexEntries;
 			}
+			{
+				static bool bLoggedPoolBound = false;
+				if (!bLoggedPoolBound)
+				{
+					bLoggedPoolBound = true;
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("[voxel-light] STAGE2 pool bound (%d index entries) -- the light ")
+					       TEXT("volume call site is one statement away."),
+					       IndexEntries);
+				}
+			}
 
 			// ---- PHASE L3: THE PROPAGATED SUNLIGHT VOLUME ------------------
 			//
@@ -10793,6 +10841,25 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// OFF ARM: the call returns immediately at voxel.Light.Propagated 0
 			// with nothing allocated and no pass added.
 			{
+				// L3 ENGAGEMENT TRACE (2026-09-06). The first leg with
+				// voxel.Light.Propagated 1 produced NO output from the light
+				// volume at all -- not the census, not even EnsureAllocated's
+				// one-time line -- so "never called" and "called but reads 0 on
+				// the render thread" were indistinguishable from the log. This
+				// one-time line separates them and stays: it is the witness that
+				// the call site is live, and it costs one branch on one frame.
+				static bool bLoggedLightVolumeCallSite = false;
+				if (!bLoggedLightVolumeCallSite)
+				{
+					bLoggedLightVolumeCallSite = true;
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("[voxel-light] CALL SITE REACHED in PreRenderBasePass_RenderThread ")
+					       TEXT("(frame %u, source %d). voxel.Light.Propagated reads %d here. If the ")
+					       TEXT("volume prints nothing after this line, the fault is INSIDE the ")
+					       TEXT("update, not in reaching it."),
+					       GFrameNumberRenderThread, Arm.Source,
+					       VoxelLightVolume::IsEnabled() ? 1 : 0);
+				}
 				static uint32 LastLightVolumeFrame = 0xFFFFFFFFu;
 				if (LastLightVolumeFrame != GFrameNumberRenderThread)
 				{
