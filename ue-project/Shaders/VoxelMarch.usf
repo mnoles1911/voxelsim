@@ -692,6 +692,19 @@ float    MarchClimateStrength;   // 0 = no climate tint (byte-identical to befor
 // and it fails at SHADER COMPILE rather than silently reading zero -- which is
 // the good direction for it to fail in.
 float4   MarchAmbientSkyAndGround;
+// THE VINTAGE-STORY SUN WRAP (voxel.March.VSLighting) -- see the emissive
+// compose beside the GBuffer write. xyz = the world-space direction TO the
+// sun, unit length; w = voxel.March.SunWrapFloor, or -1 as the OFF sentinel,
+// under which the compose is skipped and the emissive is the exact shipped
+// expression -- byte-identical, the A/B arm. Declared in BOTH places, same as
+// the ambient above.
+float4   MarchVSSunDirAndWrapFloor;
+// rgb = the wrap term's emissive colour: voxel.March.SunWrapGain x the host's
+// dusk fade, in the SAME units as MarchAmbientSkyAndGround.rgb (the
+// AmbientIntensity ladder's axis). w = voxel.March.SkyBoost. All-zero rgb
+// with w >= 0 is a legal armed-but-dark state (night). Declared in BOTH
+// places, same as the ambient above.
+float4   MarchVSWrapColorAndSkyBoost;
 // x = distance where the shading normal starts bending toward the chunk's fitted
 // surface normal, y = where it is fully bent, both in UU. x >= y disables it,
 // and the default (0,0) is exactly that -- byte-identical to no term. Declared
@@ -3405,10 +3418,138 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	// It rides BaseColor, so a dark material stays dark: this adds LIGHT, not a
 	// grey wash toward white.
 	{
+		// ---- PHASE L3: THE PROPAGATED SUNLIGHT VOLUME (voxel.Light.Propagated)
+		//
+		// docs/vs-lighting-implementation-plan-2026-09-06.md phase L3. THE FIX
+		// FOR THE DEFECT THE AMBIENT'S OWN COMMENT ADMITS TWENTY LINES ABOVE:
+		// "it will lift the inside of a cave exactly as much as the outside of a
+		// mountain". A flat constant cannot know the difference; a propagated
+		// sky-visibility field can, and this is where it is consulted.
+		//
+		// ONE TRILINEAR SAMPLE IS ALSO THE SMOOTHING. Vintage Story writes its
+		// flood-filled level PER VERTEX so the GPU interpolates it across a face
+		// (research doc section 1.3, "AO+Smoothlight"); we have no vertices, but
+		// hardware filtering of a 3D texture gives the same within-face gradient
+		// for free -- so the per-face lighting step that section 2 item 3 names
+		// as one of our harshness sources disappears from this term without any
+		// per-face work at all.
+		//
+		// PUSHED OFF THE SURFACE BY HALF A CELL along the normal, for the reason
+		// the GI probe above pushes out: a sample taken exactly on a face lands
+		// half inside the solid cell the face belongs to, whose level is 0 by
+		// construction, and every wall in the world would read unlit.
+		//
+		// OUT OF RANGE IS 1.0, i.e. today's flat ambient, and that is the
+		// designed fallback rather than a failure: beyond the volume the picture
+		// is L1+L2's bounded response, which is distance-independent, so the
+		// boundary is a change of GRADIENT and not of level. Same for a sample
+		// that lands in solid (air mask 0) -- that is not a statement about the
+		// light here, it is the absence of one.
+		//
+		// OFF ARM: Enabled == 0 leaves the scale at exactly 1.0 and every use
+		// below is a multiply by one, which is bit-exact for every finite float.
+		// Byte-identical, the standing rule.
+		// COMPILE GUARD (2026-09-06): VoxelLightVol is a global uniform buffer
+		// that exists only when the NEW VoxelEarthShaders binary (Phase L3)
+		// registered it. This .usf is read from disk by WHATEVER binary is
+		// running -- an older binary compiling this file must get the
+		// pre-L3 shader verbatim, so the whole block compiles out unless the
+		// C++ that binds the buffer also sets VOXEL_LIGHTVOL_BOUND=1 in
+		// ModifyCompilationEnvironment. Default 0 == today's picture.
+	#ifndef VOXEL_LIGHTVOL_BOUND
+	#define VOXEL_LIGHTVOL_BOUND 0
+	#endif
+		float VoxelSkyScale = 1.0f;
+	#if VOXEL_LIGHTVOL_BOUND
+		if (VoxelLightVol.Enabled != 0u)
+		{
+			const float3 SkyProbeRelCam = HitTWS + WorldNormal * (VoxelLightVol.CellSizeUU * 0.5f)
+			                            - VoxelLightVol.OriginRelCameraUU;
+			const float3 SkyUVW = SkyProbeRelCam * VoxelLightVol.InvSizeUU;
+			if (all(SkyUVW > 0.0f) && all(SkyUVW < 1.0f))
+			{
+				const float4 SkySample = Texture3DSampleLevel(VoxelLightVol.Volume,
+				                                              VoxelLightVol.VolumeSampler,
+				                                              SkyUVW, 0);
+				// G is the seed pass's AIR MASK, filtered: 1 in open air, 0 deep
+				// inside rock, and a fraction at a surface. The 0.5 test is
+				// "this sample is mostly about air", which is the population the
+				// R channel means anything for.
+				if (SkySample.g > 0.5f)
+				{
+					// THE FLOOR IS VS's MINBRIGHT ("Light up all caves"), and it
+					// is what makes a volume that has not finished settling
+					// acceptable to look at: a cell the relax has not reached
+					// yet reads 0 and would otherwise flash black for the few
+					// frames it takes to fill.
+					const float SkyLevel = max(saturate(SkySample.r), VoxelLightVol.Floor);
+					VoxelSkyScale = lerp(1.0f, SkyLevel, VoxelLightVol.Strength);
+				}
+			}
+		}
+	#endif // VOXEL_LIGHTVOL_BOUND
+
 		// WorldNormal.z in [-1,1] -> the sky's share of the hemisphere.
 		const float SkyShare = saturate(WorldNormal.z * 0.5f + 0.5f);
 		const float Hemi = lerp(MarchAmbientSkyAndGround.w, 1.0f, SkyShare);
-		OutSceneColor = float4(BaseColor * MarchAmbientSkyAndGround.rgb * Hemi, 0.0f);
+		float3 Emissive = BaseColor * MarchAmbientSkyAndGround.rgb * Hemi * VoxelSkyScale;
+
+		// ---- THE VINTAGE-STORY SUN WRAP (voxel.March.VSLighting) ----------
+		//
+		// docs/vintage-story-lighting-research-2026-09-05.md section 1.4: VS
+		// bounds the face-orientation response as
+		//
+		//     nb = max(max(floor, 0.5 + 0.5*dot(N, L)), up * 0.95)
+		//
+		// -- half-Lambert wrap, hard floor, up-facing sky boost -- so that
+		// orientation alone can never open more than ~3:1 lit:shaded contrast.
+		// That bound is the mechanism that kills the owner's black-beside-
+		// white face pairs (shaded snow measured at 22.5% of the sunlit snow
+		// beside it; the true saturate(N.L) term for an anti-sun face is ZERO).
+		//
+		// UE'S DEFERRED N.L CANNOT BE REWRITTEN FROM THIS PASS, AND NEED NOT
+		// BE: the sun light will add saturate(NdotSun) against this GBuffer's
+		// normal, so the marcher emits the DEFICIT between the VS response and
+		// UE's own. Total directional response = saturate(NdotSun) + Deficit
+		// = SunTerm exactly -- VS's bounded shape, converging to UE's own term
+		// on sun-facing faces where the deficit reaches zero. The deficit is
+		// >= 0 by algebra (0.5 + 0.5x >= saturate(x) for every x <= 1, and the
+		// two maxes only raise it); the max() below is belt and braces.
+		// WorldNormal.z stands in for VS's normal.y * 0.95: our up is +Z.
+		//
+		// COMPOSE ORDER, and why the existing terms keep their jobs: BaseColor
+		// already carries VoxelGIAmbient and the corner AO (both applied
+		// above), so enclosure and creases darken this term exactly as they
+		// darken the hemisphere ambient -- VS's own rule that AO composes
+		// against a FLOORED light term. The hemisphere ambient itself is
+		// scaled DOWN by (1 - SunWrapFloor) host-side while the wrap is
+		// engaged (MakeMarchAmbient's coupling comment), because the floor
+		// takes over that share of its keep-faces-from-black job. The shadow
+		// march does not cut this term (emissive is unshadowed), which is
+		// VS's layering too: shadows attenuate only the direct sun -- and
+		// that mask has its own floor, voxel.March.ShadowFloor.
+		//
+		// OFF ARM: w < 0 (voxel.March.VSLighting 0, or no sun published). The
+		// branch is not taken and Emissive is the exact expression the shipped
+		// line computed -- byte-identical, the A/B arm. NOTE: the stale
+		// 1.5-era help text on voxel.March.AmbientIntensity and the clipmap's
+		// baked ambient are KNOWN issues handled elsewhere; neither is
+		// addressed by this block and the clipmap generator is not touched.
+		if (MarchVSSunDirAndWrapFloor.w >= 0.0f)
+		{
+			const float NdotSun = dot(WorldNormal, MarchVSSunDirAndWrapFloor.xyz);
+			const float SunTerm = max(max(MarchVSSunDirAndWrapFloor.w, 0.5f + 0.5f * NdotSun),
+			                          WorldNormal.z * MarchVSWrapColorAndSkyBoost.w);
+			const float Deficit = max(SunTerm - saturate(NdotSun), 0.0f);
+			// SCALED BY THE PROPAGATED SKY LEVEL TOO (Phase L3), and it must be:
+			// the wrap is the term that lifts an anti-sun face toward a third of
+			// full, and inside a cave there IS no sky to wrap. Leaving the wrap
+			// unscaled while scaling the ambient would make a sealed tunnel
+			// darker in its ambient and just as bright in its orientation term --
+			// which reads as a cave lit from nowhere. 1.0 with the volume off.
+			Emissive += BaseColor * MarchVSWrapColorAndSkyBoost.rgb * Deficit * VoxelSkyScale;
+		}
+		OutSceneColor = float4(Emissive, 0.0f);
 	}
 
 	// GBufferA.a = PerObjectGBufferData, 2 bits: bit0 cast contact shadow,

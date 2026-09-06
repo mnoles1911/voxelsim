@@ -13,6 +13,12 @@
 
 #include "VoxelBrickPool.h"       // the traversal source (public seam)
 #include "VoxelMarchChunkIndex.h" // and the GPU lookup that makes it walkable
+#include "VoxelMarchRenderer.h"   // VoxelMarchPublishSunDirection + the shadow-mask
+                                  // floor (voxel.March.VSLighting). A one-way seam:
+                                  // this pass still has NO dependency on the primary
+                                  // march RUNNING -- with voxel.March 0 both calls
+                                  // are harmless -- which is the independence the
+                                  // header's design note actually promises.
 
 #include "Components/DirectionalLightComponent.h"
 #include "Engine/DirectionalLight.h"
@@ -96,12 +102,19 @@ namespace
 	// ---- the arm ----------------------------------------------------------
 
 	TAutoConsoleVariable<int32> CVarVoxelShadowMarch(
-		TEXT("voxel.Shadow.March"), 1,
-		TEXT("DEFAULT 1 SINCE 2026-09-05, BY OWNER DECISION ('Ship voxel.shadow.March on so I can ")
-		TEXT("evaluate and judge') -- made with the 2026-08-23 cost figure below surfaced to the ")
-		TEXT("owner at the time of the ruling. The lighting dossier of the same day identified the ")
-		TEXT("missing terrain self-shadowing as half of the owner's 'bright in places, hard shadows ")
-		TEXT("in other spots' report. If the owner rejects the cost, flip this back to 0. ")
+		TEXT("voxel.Shadow.March"), 0,
+		TEXT("DEFAULT 0 AGAIN SINCE 2026-09-05, SAME-DAY OWNER EVALUATION: shipped 1 in the ")
+		TEXT("morning ruling, judged live in the evening -- the measured ~13 ms cost reproduced ")
+		TEXT("exactly (105 -> ~50 fps) while the owner saw NO visible difference at a frozen-noon ")
+		TEXT("open-terrain pose ('the game looks almost exactly the same if not completely the ")
+		TEXT("same'). Ruling: 'Turn shadow marching off by default.' OPEN QUESTION, recorded ")
+		TEXT("rather than lost: cost-without-visible-product is also the signature of a pass that ")
+		TEXT("no longer lands pixels after the renderer redesign (never visually re-verified since; ")
+		TEXT("compare the ripple deposit defect found the same night). Discriminator before any ")
+		TEXT("re-tuning: low sun (voxel.Sky.TimeScale to advance the clock) + this cvar 1 -- long ")
+		TEXT("raking shadows appear if the pass works. The VS-style bounded lighting ")
+		TEXT("(voxel.March.VSLighting, docs/vintage-story-lighting-research-2026-09-05.md) is the ")
+		TEXT("shipped answer to face harshness without cast shadows. ")
 		TEXT("HISTORY: DEFAULT 0 SINCE 2026-08-23, BY OWNER DECISION -- terrain has no sun ")
 		TEXT("shadows until this is revisited. It is the largest single frame-time item ")
 		TEXT("in the renderer: matched 30 m/s legs, mode 2 vs mode 0, changed ONLY this ")
@@ -366,6 +379,12 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelShadowMarchParameters, )
 	SHADER_PARAMETER(uint32, ShadowVerifyStride)
 	SHADER_PARAMETER(uint32, ShadowDiagEnabled)
 	SHADER_PARAMETER(uint32, ShadowInsideDumpCap)
+	// voxel.March.ShadowFloor under the voxel.March.VSLighting master (both
+	// live in VoxelMarchRenderer.cpp; read through
+	// VoxelMarchGetShadowMaskFloor_RenderThread so the master gates every
+	// VS-lighting term from one place). 0.0 under the off arm = the
+	// byte-identical 0/1 mask.
+	SHADER_PARAMETER(float, ShadowMaskFloor)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, ShadowSceneDepthTexture)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, ShadowGBufferATexture)
 	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, ShadowOutMask)
@@ -856,6 +875,11 @@ void FVoxelShadowMarchExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->ShadowVerifyStride = uint32(Arm.VerifyStride);
 		Params->ShadowDiagEnabled = Arm.bDiag ? 1u : 0u;
 		Params->ShadowInsideDumpCap = uint32(FVoxelShadowMarchState::kDumpRecords);
+		// ONE fetch, reused by the verify bindings below: the verify kernel's
+		// threshold must describe the mask THIS dispatch wrote, so the two may
+		// not read the cvar separately.
+		const float ShadowMaskFloor = VoxelMarchGetShadowMaskFloor_RenderThread();
+		Params->ShadowMaskFloor = ShadowMaskFloor;
 		Params->ShadowOutInsideDump = InsideDumpUAV;
 		Params->ShadowSceneDepthTexture = SceneDepth;
 		Params->ShadowGBufferATexture = GBufferA;
@@ -971,6 +995,7 @@ void FVoxelShadowMarchExtension::PostRenderBasePassDeferred_RenderThread(
 				VParams->ShadowVerifyStride = uint32(Arm.VerifyStride);
 				VParams->ShadowDiagEnabled = 0u;
 				VParams->ShadowInsideDumpCap = 0u;
+				VParams->ShadowMaskFloor = ShadowMaskFloor; // the value the mask was written with
 				VParams->ShadowOutInsideDump = InsideDumpUAV;
 				VParams->ShadowSceneDepthTexture = SceneDepth;
 				VParams->ShadowGBufferATexture = GBufferA;
@@ -1424,20 +1449,20 @@ void UVoxelShadowMarchSubsystem::Tick(float DeltaTime)
 		return;
 	}
 	const int32 Mode = CVarVoxelShadowMarch.GetValueOnGameThread();
-	if (Mode == 0)
-	{
-		// STILL unwire before returning: a session that drops 2 -> 0 must not
-		// leave the light function on the sun -- an early return here was the
-		// one path that could strand it, wired forever with a stale mask.
-		UpdateInjection(0);
-		return;
-	}
 
 	// Find the sun: the directional light flagged as atmosphere sun index 0 --
 	// what VoxelSkySubsystem::SpawnRig configures -- else the first directional
 	// light. Re-found automatically if the actor is respawned (weak ptr goes
 	// stale); the choice is logged once so two suns cannot be a silent
 	// ambiguity.
+	//
+	// MOVED ABOVE THE Mode == 0 EARLY-OUT (2026-09-05): the primary marcher's
+	// sun wrap (voxel.March.VSLighting) reads the direction published from this
+	// tick, and it must keep arriving with the shadow march off -- the wrap is
+	// not a shadow feature. This subsystem stays the ONE sun-finder; the "no
+	// directional light" warning below stays gated on Mode != 0 because its
+	// text names this cvar, and the marcher's own once-only warning covers the
+	// wrap's side of the silence.
 	if (!SunComponent.IsValid())
 	{
 		// A stale sun (respawned actor) also invalidates the light-function
@@ -1483,7 +1508,7 @@ void UVoxelShadowMarchSubsystem::Tick(float DeltaTime)
 			}
 			bLoggedNoSun = false;
 		}
-		else if (!bLoggedNoSun)
+		else if (Mode != 0 && !bLoggedNoSun)
 		{
 			bLoggedNoSun = true;
 			UE_LOG(LogVoxelShadowMarch, Warning,
@@ -1499,14 +1524,30 @@ void UVoxelShadowMarchSubsystem::Tick(float DeltaTime)
 	if (SunComponent.IsValid())
 	{
 		const FVector DirToSun = -SunComponent->GetDirection();
-		FScopeLock Guard(&State->Lock);
-		State->SunDirToSunWorld = FVector3f(DirToSun.GetSafeNormal());
-		State->bSunValid = true;
+		const FVector3f DirToSunF(DirToSun.GetSafeNormal());
+		{
+			FScopeLock Guard(&State->Lock);
+			State->SunDirToSunWorld = DirToSunF;
+			State->bSunValid = true;
+		}
+		// The marcher's copy, for the VS sun wrap -- the same derived value,
+		// published beside the shadow march's own feed so the two consumers
+		// cannot disagree about which sun this frame shaded with.
+		VoxelMarchPublishSunDirection(DirToSunF);
 	}
 	else
 	{
 		FScopeLock Guard(&State->Lock);
 		State->bSunValid = false;
+	}
+
+	if (Mode == 0)
+	{
+		// STILL unwire before returning: a session that drops 2 -> 0 must not
+		// leave the light function on the sun -- an early return here was the
+		// one path that could strand it, wired forever with a stale mask.
+		UpdateInjection(0);
+		return;
 	}
 
 	UpdateInjection(Mode);

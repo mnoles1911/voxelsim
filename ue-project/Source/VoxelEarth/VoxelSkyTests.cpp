@@ -20,6 +20,9 @@
 //     -ExecCmds="Automation RunTests VoxelEarth.Sky; Quit"
 
 #include "VoxelEphemeris.h"
+// Phase L2's colour ramp lives beside the subsystem that samples it, and is a
+// free function in namespace VoxelSky so this file can reach it without a world.
+#include "VoxelSkySubsystem.h"
 #include "Misc/AutomationTest.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -610,6 +613,168 @@ bool FVoxelSkyMoonPhaseTest::RunTest(const FString& Parameters)
 		const VoxelSky::FMoonState Moon = VoxelSky::ComputeMoon(JulianDay, Geo, VoxelSky::FSunState());
 		TestTrue(TEXT("full moon is still full when no sun state is supplied"),
 			Moon.IlluminatedFraction > 0.98);
+	}
+
+	return true;
+}
+
+// ===========================================================================
+// THE DAY-NIGHT LIGHT COLOUR RAMP (Phase L2)
+// ===========================================================================
+//
+// docs/vs-lighting-implementation-plan-2026-09-06.md phase L2 names this gate:
+// "colour ramp table test (pure function of epoch)". VoxelSky::SampleLightColours
+// is a pure function of (sun elevation, moon fraction) and nothing else, which is
+// exactly what makes it gateable here rather than only by screenshot.
+//
+// WHAT THIS TEST IS FOR, AND IT IS NOT "the colours are pretty". Three of the
+// four assertions below pin PROPERTIES the rest of the lighting stack depends on
+// and which a plausible-looking wrong table would break silently:
+//
+//   1. THE NOON ROW IS THE MARCHER'S SHIPPED CONSTANT. If it drifts, every
+//      archived noon capture stops being comparable and the owner's dawn/noon/
+//      dusk judgement loses its control plate. A colour is a colour; this one is
+//      also a promise made in VoxelMarchRenderer.cpp's MakeMarchAmbient.
+//   2. WARM SUN / COOL AMBIENT AT THE HORIZON. That separation IS mechanism 6 of
+//      the research doc -- contrast expressed as colour rather than only as
+//      luminance -- and a table that warmed both would produce a sunset that
+//      reads as "everything is orange" instead.
+//   3. CONTINUITY. The ramp is sampled every frame through a moving sun; a step
+//      between rows shows up as a visible flash on every surface at once.
+//   4. NOTHING IS NEGATIVE OR NON-FINITE ANYWHERE. VoxelMarchPublishSunColour
+//      refuses such a value, so a bad row would not paint a NaN -- it would
+//      SILENTLY STOP UPDATING, which is the harder failure to see.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelSkyLightColourRampTest,
+	"VoxelEarth.Sky.LightColourRamp", kTestFlags)
+
+bool FVoxelSkyLightColourRampTest::RunTest(const FString& Parameters)
+{
+	auto ExpectNear = [this](const TCHAR* Label, double Actual, double Expected, double Tolerance)
+	{
+		if (!(FMath::Abs(Actual - Expected) <= Tolerance))
+		{
+			AddError(FString::Printf(TEXT("%s: got %.9f, expected %.9f +/- %g"),
+				Label, Actual, Expected, Tolerance));
+		}
+	};
+
+	// 1. THE CONTROL ROW. Exact, not near: these six numbers are copied from
+	//    MakeMarchAmbient's shipped tint and from the neutral wrap gain, and the
+	//    whole value of the property is that it is EXACT (a noon frame is
+	//    byte-identical with the ramp live). Any tolerance at all would let the
+	//    table drift by an invisible amount every time somebody re-tunes, which
+	//    over a few passes is how a control stops being one.
+	{
+		const FVoxelSkyLightColours Noon = VoxelSky::SampleLightColours(60.0, 0.0f);
+		ExpectNear(TEXT("noon sun tint R"), Noon.Sun.R, 1.00, 0.0);
+		ExpectNear(TEXT("noon sun tint G"), Noon.Sun.G, 1.00, 0.0);
+		ExpectNear(TEXT("noon sun tint B"), Noon.Sun.B, 1.00, 0.0);
+		// FLOAT literals promoted to double, not double literals: the ramp and
+		// MakeMarchAmbient both hold FLOATS (FVector3f(1.00f, 1.04f, 1.12f)),
+		// and float(1.04) != double(1.04). "Exact" means exact at the precision
+		// the renderer consumes -- a double-literal compare at zero tolerance
+		// fails on a table that IS the shipped constant (first run, 2026-09-06:
+		// got 1.039999962 vs 1.040000000). Tolerance stays 0.
+		ExpectNear(TEXT("noon ambient tint R (MakeMarchAmbient's 1.00)"), Noon.Ambient.R, double(1.00f), 0.0);
+		ExpectNear(TEXT("noon ambient tint G (MakeMarchAmbient's 1.04)"), Noon.Ambient.G, double(1.04f), 0.0);
+		ExpectNear(TEXT("noon ambient tint B (MakeMarchAmbient's 1.12)"), Noon.Ambient.B, double(1.12f), 0.0);
+
+		// And it must STAY the control above the top row -- the sun reaches 61.4
+		// degrees at the June solstice at 52N (this file's own kSummerNoonAltitudeDeg)
+		// and 90 at the tropics, so "clamped, not extrapolated" is a case the game
+		// reaches rather than a defensive one.
+		const FVoxelSkyLightColours High = VoxelSky::SampleLightColours(90.0, 0.0f);
+		ExpectNear(TEXT("zenith sun clamps to the noon row"), High.Sun.B, Noon.Sun.B, 0.0);
+		ExpectNear(TEXT("zenith ambient clamps to the noon row"), High.Ambient.B, Noon.Ambient.B, 0.0);
+	}
+
+	// 2. WARM SUN, COOL AMBIENT, at the horizon -- research doc mechanism 6.
+	{
+		const FVoxelSkyLightColours Horizon = VoxelSky::SampleLightColours(0.0, 0.0f);
+		TestTrue(TEXT("horizon sun tint is WARM (R > B by a clear margin)"),
+			Horizon.Sun.R > Horizon.Sun.B + 0.4f);
+		TestTrue(TEXT("horizon ambient is COOL while the sun is warm (B > R)"),
+			Horizon.Ambient.B > Horizon.Ambient.R + 0.2f);
+
+		// Night is cooler still, and dimmer than noon. Both halves matter: a
+		// night row that only went blue without dropping level would leave a
+		// full daylight ambient lifting every shaded face at midnight.
+		const FVoxelSkyLightColours Night = VoxelSky::SampleLightColours(-18.0, 0.0f);
+		const FVoxelSkyLightColours Noon = VoxelSky::SampleLightColours(60.0, 0.0f);
+		TestTrue(TEXT("night ambient is blue (B > R)"), Night.Ambient.B > Night.Ambient.R + 0.3f);
+		const float NightMean = (Night.Ambient.R + Night.Ambient.G + Night.Ambient.B) / 3.0f;
+		const float NoonMean = (Noon.Ambient.R + Noon.Ambient.G + Noon.Ambient.B) / 3.0f;
+		TestTrue(TEXT("night ambient is dimmer than noon"), NightMean < NoonMean);
+		// ...but NOT so dim that it reopens the black-face problem L1 closed.
+		// Half of noon is the line drawn here; the ramp ships at ~0.72.
+		TestTrue(TEXT("night ambient is not a blackout (>= half the noon mean)"),
+			NightMean >= 0.5f * NoonMean);
+
+		// THE MOON LIFTS AND NEUTRALISES THE NIGHT, and does neither by day.
+		const FVoxelSkyLightColours FullMoon = VoxelSky::SampleLightColours(-18.0, 0.01067f);
+		const float FullMean = (FullMoon.Ambient.R + FullMoon.Ambient.G + FullMoon.Ambient.B) / 3.0f;
+		TestTrue(TEXT("a full moon brightens the night ambient"), FullMean > NightMean);
+		TestTrue(TEXT("a full moon neutralises the night ambient (less blue-vs-red spread)"),
+			(FullMoon.Ambient.B - FullMoon.Ambient.R) < (Night.Ambient.B - Night.Ambient.R));
+		// A moon in a daylit sky must change NOTHING. The moon is up in daylight
+		// roughly half the time, so this is the common case, not the edge one.
+		const FVoxelSkyLightColours NoonMoon = VoxelSky::SampleLightColours(60.0, 0.01067f);
+		ExpectNear(TEXT("a daylight moon does not touch the noon ambient"),
+			NoonMoon.Ambient.G, Noon.Ambient.G, 0.0);
+	}
+
+	// 3. CONTINUITY AND FINITENESS across the whole reachable range, sampled at
+	//    a quarter of a degree -- finer than the sun moves in one frame at any
+	//    voxel.Sky.TimeScale anyone has run.
+	{
+		FVoxelSkyLightColours Prev = VoxelSky::SampleLightColours(-90.0, 0.0f);
+		double WorstStep = 0.0;
+		double WorstAt = -90.0;
+		for (int32 Step = 1; Step <= 720; ++Step)
+		{
+			const double Elev = -90.0 + 0.25 * double(Step);
+			const FVoxelSkyLightColours C = VoxelSky::SampleLightColours(Elev, 0.0f);
+			const float Components[6] = { C.Sun.R, C.Sun.G, C.Sun.B,
+			                              C.Ambient.R, C.Ambient.G, C.Ambient.B };
+			const float PrevComponents[6] = { Prev.Sun.R, Prev.Sun.G, Prev.Sun.B,
+			                                  Prev.Ambient.R, Prev.Ambient.G, Prev.Ambient.B };
+			for (int32 i = 0; i < 6; ++i)
+			{
+				if (!FMath::IsFinite(Components[i]) || Components[i] < 0.0f)
+				{
+					AddError(FString::Printf(
+						TEXT("ramp component %d at elevation %.2f is %f -- VoxelMarchPublishSunColour "
+						     "REFUSES such a value, so the marcher would silently keep the last good "
+						     "colour rather than showing anything wrong"),
+						i, Elev, Components[i]));
+					return false;
+				}
+				const double Step6 = FMath::Abs(double(Components[i]) - double(PrevComponents[i]));
+				if (Step6 > WorstStep)
+				{
+					WorstStep = Step6;
+					WorstAt = Elev;
+				}
+			}
+			Prev = C;
+		}
+		// THE BOUND, DERIVED RATHER THAN GUESSED. The table's steepest authored
+		// segment is the sun's red between the civil-twilight and horizon rows:
+		// 0.70 -> 1.25 across 6 degrees = 0.0917 per degree = 0.0229 per sample
+		// at this quarter-degree stride. 0.05 is a shade over 2x that -- loose
+		// enough that a legitimate re-tune of one row does not fail the gate,
+		// tight enough to catch the realistic breakages: a DUPLICATED elevation
+		// (which collapses a segment to a step of the full row difference, ~0.55
+		// here) or a MISORDERED row (which makes the search pick the wrong pair
+		// and jump twice).
+		if (WorstStep > 0.05)
+		{
+			AddError(FString::Printf(
+				TEXT("the ramp steps by %.4f in a quarter of a degree near elevation %.2f -- that is a "
+				     "discontinuity, and it appears on every surface in the frame at once. Check the "
+				     "row order and for a duplicated elevation in kSkyRamp."),
+				WorstStep, WorstAt));
+		}
 	}
 
 	return true;

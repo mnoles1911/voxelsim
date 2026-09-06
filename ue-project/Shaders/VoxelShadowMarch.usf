@@ -196,6 +196,18 @@ uint     ShadowDiagEnabled;        // voxel.Shadow.MarchDiag: burial probes,
                                    // material split and the example dump.
                                    // NEVER on in a timing leg
 uint     ShadowInsideDumpCap;      // max example records this frame
+float    ShadowMaskFloor;          // voxel.March.ShadowFloor under the
+                                   // voxel.March.VSLighting master: what a
+                                   // SHADOWED pixel writes instead of 0, so
+                                   // shadows deepen the sun to this fraction
+                                   // rather than blacken it -- Vintage Story's
+                                   // "shadows remove at most half" rule
+                                   // (docs/vintage-story-lighting-research-
+                                   // 2026-09-05.md section 1.4). 0.0 under the
+                                   // master's OFF arm = the byte-identical 0/1
+                                   // mask every archived capture was shot with.
+                                   // Host-clamped to [0, 0.95], which keeps the
+                                   // verify kernel's midpoint threshold below 1.
 
 Texture2D<float>  ShadowSceneDepthTexture;
 Texture2D<float4> ShadowGBufferATexture;
@@ -496,7 +508,11 @@ void VoxelShadowMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 			const bool bShadowed =
 				VoxelShadowWalkShadowed(S.OriginLocalUU, ShadowDirToSun, S.TMaxUU, H);
 #endif
-			Visibility = bShadowed ? 0.0f : 1.0f;
+			// FLOORED, not zeroed: the light function multiplies the sun by
+			// this value verbatim, so the floor is applied at the one write
+			// the whole mask flows from. 0.0 under the master's off arm --
+			// see ShadowMaskFloor's declaration.
+			Visibility = bShadowed ? ShadowMaskFloor : 1.0f;
 
 			if (H.bHit)
 			{
@@ -664,7 +680,14 @@ void VoxelShadowVerifyMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 		VoxelShadowWalkShadowed(S.OriginLocalUU, ShadowVerifyDirToSun, S.TMaxUU, HA);
 
 	const int2 AbsPixel = int2(ShadowViewRectMin) + LocalPixel;
-	const bool bMaskShadowed = ShadowMaskTexture.Load(int3(AbsPixel, 0)).r < 0.5f;
+	// The threshold is the MIDPOINT between the shadowed write (ShadowMaskFloor)
+	// and the lit write (1.0), so the verdict tracks whatever floor the mask was
+	// written with. At floor 0 this is the historical 0.5 exactly; at the 0.4
+	// default it is 0.7, still cleanly between the two written values (the host
+	// clamps the floor to 0.95, and PF_G8 quantisation moves a written value by
+	// at most 1/510 -- orders of magnitude inside the margin).
+	const bool bMaskShadowed =
+		ShadowMaskTexture.Load(int3(AbsPixel, 0)).r < (ShadowMaskFloor + 1.0f) * 0.5f;
 
 	InterlockedAdd(ShadowOutStats[VOXEL_SHADOW_STAT_V_COMPARED], 1u);
 	if (bWalkShadowed != bMaskShadowed)

@@ -175,6 +175,38 @@ struct FVoxelSkyState
 	bool bClockRunning = false; // voxel.Sky.Enabled && TimeScale != 0
 };
 
+// ---------------------------------------------------------------------------
+// THE DAY-NIGHT LIGHT COLOUR RAMP (Phase L2,
+// docs/vs-lighting-implementation-plan-2026-09-06.md)
+// ---------------------------------------------------------------------------
+//
+// WHY AN AUTHORED TABLE AND NOT A MEASUREMENT OF THE SKY. The rig paints
+// day-night with the SkyAtmosphere's GPU transmittance and holds the sun at a
+// constant 5778 K (FVoxelSkyState::SunTemperatureK's own comment: "the sunset
+// red comes from the atmosphere"), so there is NO CPU-readable colour anywhere
+// in this subsystem to hand the marcher -- which is exactly what the research
+// doc recorded as the reason recommendation 2 was skipped. Vintage Story does
+// not measure its sky either: SunLightLevels[] and SunColor are hand-shaped
+// tables the engine never argues with (research doc section 2, mechanism 7).
+// So this is a table, it is small, every row says what it is for, and the owner
+// tunes it by eye like every other appearance knob in this project.
+//
+// PURE FUNCTION OF ELEVATION, deliberately: it takes no world, no clock and no
+// subsystem state, which is what lets VoxelSkyTests.cpp pin it as arithmetic
+// rather than as a rendering outcome.
+struct FVoxelSkyLightColours
+{
+	// Tints, NOT brightnesses -- multiplied into terms that already carry their
+	// own intensity knob (voxel.March.SunWrapGain and voxel.March.AmbientIntensity
+	// respectively). White is the neutral, shipped answer for both.
+	FLinearColor Sun = FLinearColor::White;
+	FLinearColor Ambient = FLinearColor::White;
+	// The moon's illuminance as a fraction of the sun's -- passed straight
+	// through from the caller so the marcher and MPC_VoxelSky's MoonLightFraction
+	// scalar provably carry the same number.
+	float MoonFraction = 0.0f;
+};
+
 UCLASS()
 class VOXELEARTH_API UVoxelSkySubsystem : public UTickableWorldSubsystem
 {
@@ -591,6 +623,30 @@ namespace VoxelSky
 	// and this accessor never returns a negative number whatever the cvar holds.
 	// Always report what this returns, never the cvar: the cvar reads -1 on every
 	// shipped run.
+	// --- the day-night light colour ramp (Phase L2) --------------------------
+	//
+	// (sun elevation in degrees, moon illuminance as a fraction of the sun's)
+	// -> the tints the marcher's VS-lighting terms are multiplied by. PURE: the
+	// same two inputs always give the same answer, on any thread, with no world
+	// and no subsystem. That is what makes it testable (VoxelSkyTests.cpp,
+	// VoxelEarth.Sky.LightColourRamp) and it is the reason the function is here
+	// rather than a private method on the subsystem.
+	//
+	// SunAltitudeDeg is the APPARENT altitude the ephemeris reports (refraction
+	// already folded in), clamped internally to [-90, +90]; anything outside is
+	// a caller bug and is clamped rather than extrapolated, because the table's
+	// end rows are the answers for "below the horizon" and "high", not the start
+	// of a trend to continue.
+	//
+	// MoonFraction is FVoxelSkyState::MoonIntensity / VoxelSky::GetSunIntensity()
+	// -- the SAME quantity ApplySkyMaterialParams writes into MPC_VoxelSky's
+	// MoonLightFraction, carrying the horizon gate, the illuminated fraction, the
+	// daylight suppression and voxel.Sky.MoonIntensity with it. It only ever
+	// scales the NIGHT rows: a full moon lifts and neutralises the night tint, a
+	// new moon leaves it at its dim cool floor.
+	VOXELEARTH_API FVoxelSkyLightColours SampleLightColours(double SunAltitudeDeg,
+	                                                        float MoonFraction);
+
 	VOXELEARTH_API float GetStarAmbientGain();
 	// Whether GetStarAmbientGain() came from the calibration constant or from an
 	// explicit override. Exists so the log can say WHICH -- an override and the

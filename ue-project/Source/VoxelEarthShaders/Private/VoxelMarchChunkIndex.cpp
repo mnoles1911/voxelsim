@@ -21,6 +21,8 @@
 #include "RHICommandList.h"
 
 #include "VoxelBrickPool.h"
+#include "VoxelLightVolume.h"   // Phase L3: the propagated volume's dirty channel rides THIS
+                                // delta rather than a second sink on the pool -- see ApplyDelta
 #include "VoxelMarchRenderer.h" // VoxelMarchGetArm -- the absent-annotation writer's arming gate
 
 #include "RenderGraphBuilder.h"
@@ -1491,6 +1493,29 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 	{
 		return;
 	}
+
+	// ---- PHASE L3: THE LIGHT VOLUME'S DIRTY CHANNEL ------------------------
+	//
+	// docs/vs-lighting-implementation-plan-2026-09-06.md phase L3 requires the
+	// propagated sunlight volume's dirty tracking to ride "the brick upload
+	// path's existing dirty knowledge -- reuse, do not invent a parallel
+	// channel". THIS DELTA IS THAT KNOWLEDGE: it is what FVoxelBrickPool::Flush
+	// publishes at the end of every batch, and it is what this class already
+	// consumes to keep the marcher's lookup grid current.
+	//
+	// WHY THE CALL IS HERE AND NOT A SECOND SINK ON THE POOL.
+	// FVoxelBrickPool::SetIndexSink holds exactly ONE sink and this class owns
+	// it (AttachToGlobalPool). Chaining a second subscriber onto that seam would
+	// make the pool's ordering guarantee -- "the delta is delivered AFTER the
+	// pool's own render command was enqueued", which is what stops a consumer
+	// from indexing a slot the pool has not written -- depend on subscriber
+	// order. One call site inside the existing consumer has no such question,
+	// and it inherits that guarantee unchanged.
+	//
+	// IT COSTS NOTHING WHEN THE FEATURE IS OFF: the hook's first line is a cvar
+	// test and it returns. It is placed BEFORE this function's own work so that
+	// an early return added below can never silently unhook it.
+	VoxelLightVolumeNoteBrickIndexDelta_GameThread(Delta);
 
 	// Wave 1.3: remember WHICH cells this flush writes, so MarkDirtyAndUpload
 	// can stage just those instead of the whole 56 MiB grid. Tracked only
