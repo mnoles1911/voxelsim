@@ -1,19 +1,19 @@
 {
   "artifact": {
-    "asym_vox": 6.0,
+    "asym_vox": 5,
     "beam_m": 2.0,
     "bilge": 2.6,
     "billow_m": 0.16,
     "crossbar_at": 0.42,
-    "deck_frac": 0.12,
-    "depth_m": 0.3,
+    "deck_frac": 0.18,
+    "depth_m": 0.13,
     "droop_m": 0.3,
     "entry": 0.62,
-    "form": "raft",
+    "form": "bamboo_raft",
     "frame_at": 0.34,
     "frame_base_m": 0.95,
-    "frame_drop_m": 1.15,
-    "frame_r_m": 0.03,
+    "frame_drop_m": 1.3,
+    "frame_r_m": 0.065,
     "fullness": 2.4,
     "gunwale_m": 0.06,
     "gunwale_vox": 1,
@@ -30,7 +30,7 @@
     "strake_share": 0.3,
     "sweep": 0.85,
     "taper": 0.3,
-    "thwart_t_m": 0.11,
+    "thwart_t_m": 0.15,
     "thwart_w_m": 0.1,
     "thwarts": 2
   },
@@ -118,7 +118,7 @@
     "squash": 1.0
   },
   "curation": {
-    "notes": "Authored 2026-09-05, never seen by a person. DRAFT on purpose (the same law as canoe/glider at authoring): an owner verdict in the judgment viewport promotes it -- keep the winning seeds.",
+    "notes": "New reference-inspired bamboo raft; no human keep verdict yet.",
     "seeds": [
       1,
       2,
@@ -290,7 +290,7 @@
     "fish_pattern": "skin_dark",
     "frame": "heartwood",
     "head": "leaf_blossom",
-    "hull": "skin_brown",
+    "hull": "plume_buff",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -303,10 +303,10 @@
     "rock": "rock",
     "stem": "grass",
     "strake": "deadwood",
-    "trim": "plume_buff"
+    "trim": "deadwood"
   },
-  "name": "raft",
-  "notes": "Reference-informed rough timber raft, revised 2026-09-05: nominal 4 x 2 m at 25 mm cubic pitch. Seven logs with independent diameters, alternating taper, bowed centrelines, oval sections, raised branch scars and staggered chopped/split ends. Uneven bark islands expose warm sapwood and grey weathered wood; each log has a different bark-loss history. Existing skin_brown colour slot provides bark without the upright-tree palette's false horizontal end-grain stripes. Two partly peeled cross-poles near the ends, with three rope turns and a knot at each crossing. References and measurements: docs/raft-2026-09-05.md. Player support/movement remains an engine responsibility.",
+  "name": "bushcraft-bamboo-raft",
+  "notes": "Based on owner-supplied lake-raft photograph: close-packed pale bamboo with staggered nodes, hollow cut ends, paired transverse bearers and lashed crossbars, two upright outboard posts and short side pegs. Nominal deck 4 x 2 m. All geometry uses 25 mm cubic voxels.",
   "placement": {
     "abundance": 0.5,
     "cluster": 0.3,

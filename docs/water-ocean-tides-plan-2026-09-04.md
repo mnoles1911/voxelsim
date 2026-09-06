@@ -898,6 +898,37 @@ hitches 305 -> 21. uwperf-under/above/fixed legs on record.
 2026-09-05 | F1 | OWNER VERDICT on first caustics-era lake frame | "00734 looks good" -- the full-chain regen (caustics + WaveTimeScale collection), slant-path water, and the appearance-MPC push land owner-approved at the signed-off pose | VoxelVerify00734
 2026-09-05 | lighting | voxel.Shadow.March default 0 -> 1 by owner ruling ("Ship voxel.shadow.March on so I can evaluate and judge"), with the 2026-08-23 ~13 ms cost figure re-surfaced at ruling time | VoxelShadowMarch.cpp; rides next build
 
+2026-09-05 | F8.1 | OWNER VERDICT: wave speed at pinned wind | PASS -- "Step 1 passes": WaveTimeScale 1.0 reads correctly once direction drift is dead; the earlier "too fast" was the racing contamination. WaveTimeScale default STAYS 1.0 | live session
+2026-09-05 | D | OWNER VERDICT on the boat, live session | FAIL x3 -- (1) no wake ripples at all; (2) no bobbing ("does not seem affected by buoyancy dynamics at all") -- overrules D2's flat-datum v1 decision, activating the recorded CPU-wave-mirror stretch; (3) water clips through the hull interior -- new work item: water exclusion masking (hull interior stencil -> all water materials discard). voxel.Boat.Stat output pending to split (1)/(2) between dry-probes bug vs designed-flat | live session; fixes in flight
+
+2026-09-05 | E | OWNER VERDICT on the glider, live session | FAIL/RESPEC -- spawn produces an autonomous glider sailing down in a straight line; E cannot board it (v1 shipped X-deploy-while-falling as the only interaction, boarding never wired); on touchdown it despawns or falls through the ground. OWNER SPEC: walk-up E boarding of a parked/landed glider (the boat's interaction model), and landed gliders REST ON THE SURFACE persistently | live session; vehicles fixes in flight
+
+### Late-session verdicts and closures (2026-09-06, owner live loop)
+
+- **F8.1+speed-bin: racing CLOSED.** Owner: "Racing is not present. Only slow
+  wave / surface effect that looks good." Both wind channels (direction AND
+  wavelength/speed) proven piecewise-constant into the phase; PinMps
+  discriminator confirmed the speed channel before the fix shipped.
+- **Ripple deposit fix: PROVEN in-engine.** Debug-material frame shows wake
+  wavefront arcs; 'field verified LIVE' in every session since. The 08-13
+  shore-mask annihilation (splat added before the mask multiply, mask exactly
+  0 at the waterline) is dead; MaskFloor absorbs instead of deleting.
+- **Hull exclusion: owner-confirmed fixed** after two fits (box inside the
+  taper; top dropped to gunwale+10 after the camera-dependent side-box
+  report). Cockpit dry; bow/stern sliver deliberate; hull-shaped mesh = v2.
+- **Wake visibility: root cause is MISSING ART, not physics.** All gains
+  ineffective because the composite spends the field only on ~degrees of
+  normal tilt + cm of WPO. Disturbance-foam term (whitewater from |ripple
+  grad|+|height| into the existing foam stacks, both waters) in flight.
+- **WaveBobGain default 6.0** (owner), WakeGain 3.0, exaggerated by design.
+- **Leg doctrine correction (owner ruling): the canoe/wake/ripple loop is
+  owner-tested in-editor from here** — no more scripted legs/screenshots for
+  this feature family; the night's mistimed-shutter legs (wake half-life 5 s
+  vs shutters ~40 s late, beachings) are the recorded reason.
+- Boarding UX note for the vehicles backlog: the 4 m interact range measured
+  in 3D from the pawn is tight at water level (failed by 11 cm with the pawn
+  4 m underwater at a terrain-relative spawn); consider 2D distance or 6 m.
+
 ### Craftable-items category (2026-09-05, owner request)
 
 asset-forge gained an explicit taxonomy: environment / creature / CRAFTABLE
@@ -923,3 +954,37 @@ sky-epoch prerequisite's current state (implemented via AVoxelEditRelay, see
 VoxelSkySubsystem.h:35-61).
 
 2026-09-05 | F7 | whole-sweep determinism pins (tests/test_waterdeterminism.cpp): tideOffsetMm/quantiseTideMm/tideVelocityUmPerS over 4 specs x epochs to +-4e15 ms + oceanConnectivityFill bits+stats over 3 fixture families x 6 tide levels, double-evaluated in-process (independently-constructed state, byte-compared) and pinned to golden FNV-1a-64 literals (cross-process contract, same sense as test_tide.cpp's pinned table values) | PASS -- suite green; red arms: libm-sin tide rewrite and 8-connected fill both moved the goldens and failed the pins in scratch builds | vxc_tests
+
+## Session 9 verdicts + THE FOAM CHANNEL FINDING (2026-09-06)
+
+Owner, session 9 (owner-water-session9.log): bobbing GOOD, white-box artefact
+GONE, but NO wake, NO player rings, and NEW clipping at the cockpit ENDS
+("because of the more drastic bobbing").
+
+**The foam finding.** His own session log shows the ripple field LIVE (max
+field 0.1901, height 0.044 m, 6 injections, publish on) while he saw nothing —
+so the break is in the material's last hop, and the 2026-08-30 note in
+create_water_voxel_material.py already measured it: a BaseColor rewire on this
+SLW material is a byte-identical NULL on the pond. EVERY foam signal lands
+only on BaseColor. The art has been painted onto a dead channel all along.
+Fix: disturbance foam now ALSO rides EMISSIVE (owner-verified visible channel
+— he judges sky reflections there every session) in both waters, tinted like
+the BaseColor foam, behind a new baked scalar DisturbanceFoamEmissive (0.6),
+inheriting every upstream gate so all off arms hold. The BaseColor path stays
+(harmless, and right if SLW ever honours it).
+
+**Player rings.** Nothing ever injected for the player — VoxelRipple's own
+tuning comment ("wading in still makes something rather than nothing") was
+written for a caller that didn't exist. Wired: VoxelCharacterMovement sweeps a
+disturbance (0.45 m, 0.020 m × the standard speed ramp) whenever the waterline
+crosses the body (feet wet, head+0.5 m dry — deep divers excluded).
+
+**Ends clipping.** WaveBobGain 6.0 moves the boat 6x the rendered surface, so
+troughs push water past the waterline+10 lid, and the ends past 0.62L had no
+box at all. Fix: both exclusion lids raised to adopted-gunwale-6 (geometric
+proof in VoxelBoat.cpp that this cannot re-create the beside-hull box), plus a
+second ends box 0.92L x 0.26B inside the taper.
+
+NEXT: owner closes editor -> build + water-only regen -> relaunch -> owner
+judges: wake wedge, wading rings, dry ends. Backlog §13 charge collapse is
+with an Opus agent in parallel.

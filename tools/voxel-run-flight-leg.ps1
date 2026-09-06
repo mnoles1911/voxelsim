@@ -257,7 +257,11 @@ $argList = @(
     # screen percentage is set at runtime to reproduce the owner's INTERNAL
     # resolution (1552x873, from his flown ProfileGPU) -- the ray count is
     # the frame's dominant term and the number that must match his config.
-    '-VoxelForceInternal=1552x873',
+    # 65% of 2560x1440 -- the owner's shipped r.ScreenPercentage as of
+    # 2026-09-05 ("I like the value of 65", live session). Was 1552x873 (the
+    # pre-08-29 automatic ~61%), which meant no published number was ever
+    # taken at what the owner actually played. Legs measure the real config.
+    '-VoxelForceInternal=1664x936',
     "-ExecCmds=`"$Cvars`""
 ) + $ExtraArgs
 

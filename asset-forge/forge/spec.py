@@ -2737,7 +2737,7 @@ PARAMS: tuple[Param, ...] = (
     # for the same reason on the same day, and the ten rows they share -- size,
     # shell thickness, seed asymmetry, the materials -- are most of the table.
     P("artifact.form", "Form", "hull", kind="choice", group="artifact",
-      kinds=("artifact",), choices=("hull", "wing", "raft"),
+      kinds=("artifact",), choices=("hull", "wing", "raft", "bamboo_raft"),
       help="Which family of shape this is.\n\n"
            "'hull' is a lofted closed watercraft: a plan curve and a section "
            "curve swept along the length, hollowed by re-evaluating the same "
@@ -2745,7 +2745,9 @@ PARAMS: tuple[Param, ...] = (
            "spars with a frame hung below it. 'raft' is parallel logs lashed "
            "into a platform: length is the log length, beam the footprint "
            "width, depth the LOG DIAMETER; thwarts become the cross-poles and "
-           "deck_frac places the lashing stations in from each end.\n\n"
+           "deck_frac places the lashing stations in from each end. "
+           "'bamboo_raft' uses hollow, jointed bamboo poles, crossbars and "
+           "two posts; frame_drop_m sets post height above the deck.\n\n"
            "THIS IS A MENU. A value that is not on it is not refused, it is "
            "replaced with 'hull' -- so a glider spec with a typo here builds a "
            "boat out of a glider's numbers and nothing downstream says so."),

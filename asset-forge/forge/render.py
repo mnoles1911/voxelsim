@@ -604,7 +604,8 @@ def camera_for(spec: dict) -> str:
         # delta wing is a body with two edges sticking out of it, which is
         # exactly what `bird.pose == "flying"` says about a spread wing. The
         # isometric looks down at it and shows the plan.
-        return "iso" if get(spec, "artifact.form") == "wing" else "broadhigh"
+        # The raft needs both its log ends and deck visible to read as timber.
+        return "iso" if get(spec, "artifact.form") in ("wing", "raft", "bamboo_raft") else "broadhigh"
     return "iso"
 
 

@@ -2616,6 +2616,41 @@ that DO run in CI pass. Treat the first item as blocking.
   Roland, Lethe's Draught and the Aelorin. That was the explicit 1:1 brief; all
   of it is in `VoxelUIStrings.cpp` so re-authoring is a single-file edit.
 
+**Load-screen theatre — owner directive 2026-09-05, landed.** Verbatim: remove
+the FPS/worst-ms counter top right; put the load screen on a random artificial
+30–60 s timer; make the bar advance smoothly and the hourglass actually
+animate; keep the screen smooth and high-FPS while voxels stream behind it.
+What landed:
+
+- **FPS counter**: removed from the default screen, kept as a debug instrument
+  behind `voxel.UI.LoadingFps` (default 0, same shape as `voxel.UI.HoverSlide`).
+  Off, the screen no longer pays for the sample ring or text relayout at all.
+- **Theatre timer**: `BeginLoad` rolls uniform [30, 60] s via
+  `MakeVoxelUIRandomStream` (wall-clock seeded interactively, never the world
+  seed; deterministic under `-unattended` so capture strips stay diffable).
+  `-VoxelLoadTheatre=<min>[,<max>]` overrides; `=0` restores pre-directive
+  reveal-on-ready timing — **unattended `-VoxelMenuAutoStart` parity legs
+  should pass it** or they grow 30–60 s of curtain time.
+- **Progress model**: `ComputeLoadProgress` (time floor + probe work terms)
+  replaced by `ComputeTheatreProgress` (smoothstep of elapsed/rolled duration;
+  zero slope at both ends so the hold reads as a landing). Reveal =
+  max(timer, world ready). World faster: theatre plays out. World slower: bar
+  holds at 0.97 (strictly under the hourglass grain emitter's 0.995 cut-off —
+  the old model's 0.995 cap pinned warm loads past that strict `<` and froze
+  the sand entirely) until the gate opens, then completes; 100% shows only
+  during the fade. Invariants re-pinned in `VoxelEarth.FrontEnd.LoadProgress`.
+- **Smoothness**: the loading screen hitches because streaming owns the game
+  thread; the existing lever is `voxel.Stream.ApplyBudgetMs` (its help text
+  names the trade). The front end caps it 6.0 → 2.0 for the theatre and
+  restores at reveal (TeardownMenu backstops), both directions logged.
+  `voxel.Stream.MaxAppliesPerFrame` deliberately untouched (safety ceiling,
+  not the throttle).
+- **Log contract**, greppable, gate-able: `LoadScreen: theatre duration N.N s
+  rolled.` at roll; `LoadScreen: world ready at N.N s (before|after timer),
+  revealing at N.N s.` at reveal (timeout arm says `world NOT ready (gate
+  timed out)` instead — the probe's warning stays the honest witness).
+  `tools/voxel-ui-capture.ps1` now includes `LoadScreen:` in its verdict grep.
+
 ## 12. WATER CA SIM REWORK — owner ruling 2026-09-05
 
 **Owner, verbatim: "CA sim is terrible and needs to be reworked."** Ruled during
@@ -2634,3 +2669,156 @@ stacking above it), and the standing CA-vs-PBF direction question (the
 should not fork that decision without re-opening it explicitly). Related:
 §9's playtest water bugs; the underground caves/cavern-lakes rework (its own
 backlog memory) which any CA rework should coordinate with.
+
+## 13. EXPLOSIVE CHARGE PERF COLLAPSE — owner report 2026-09-06
+
+**Owner, during the 2026-09-06 water-judgment session: accidentally hit F
+(explosive charge throw, `VoxelEarthPlayerController.cpp` OnChargeStart/
+OnChargeRelease binds) near the judged lake. The blast tanked FPS and the
+frame rate NEVER recovered — the session stayed stuck/hanging and had to be
+killed.** Same shape as the §12 CA pour collapse (an interactive edit path
+whose settling cost reads as a hang), but this one did not recover at all,
+which suggests more than slow settling: candidates to investigate are the
+blast's voxel-edit fan-out (BlastRadiusUU=300 sphere through the edit path →
+brick re-uploads, light-volume dirty flood once L3 lands, fluid/CA wake-up if
+the crater intersects water), a leaked per-frame cost that persists after the
+edit (dirty queue that never drains, CA activated and never settling), or an
+unbounded loop. TO INVESTIGATE with a fixture leg: throw one charge at the
+lake shore pose, capture per-frame ms + the subsystem stat lines before/
+during/after, and identify which cost fails to decay. Fix bar: a single
+charge must cost a bounded, decaying spike (no permanent FPS loss), same
+interactive-rate discipline §12 demands of the CA. Until fixed: F near water
+bodies is a known session-killer during owner judgment sessions.
+
+### MECHANISM FOUND (2026-09-06, by inspection — no editor run, owner held a live session)
+
+**It is the water CA, and the non-recovery is a MOBILIZATION FRONT that has no
+length bound feeding a step that has no cost bound.** The full path, traced from
+the keypress:
+
+1. `VoxelEarthPlayerController.cpp:703` `OnChargeRelease` spawns
+   `AVoxelExplosive`; `VoxelExplosive.cpp:174` `Detonate` calls
+   `UVoxelWorldSubsystem::CarveSphere` (r=200 UU ±50 jitter,
+   `VoxelExplosive.h:65`) — about 33k voxels through the edit-log authority path.
+2. `VoxelWorldSubsystem.cpp:32774-32782`: the carve notifies water twice —
+   `NotifyTerrainVoxelsCleared` (diagnostic only since §6.4) and
+   `NotifyTerrainRegionEdited(EditMin, EditMax)`.
+3. `VoxelWaterSubsystem.cpp:7472` `NotifyTerrainRegionEdited` →
+   `WaterMobilizer::mobilizeEditRegion`. **A crater beside a lake is a DRAIN**,
+   so the water it releases does not stop moving.
+4. `VoxelWaterSubsystem.cpp:6208` `StepFixed` calls `Mob.advanceFront(CA)` before
+   every `ca.step()`. `waterca.h:1286-1295` states the defect in its own words:
+   *"`advanceFront` has NO LENGTH BOUND ... while the water it releases keeps
+   MOVING the front keeps advancing ... It is DRAINAGE, not disturbance, that
+   runs away"*, bounded only by `setFrontGate` / `setMobilizedCeiling`. **The
+   engine never called `setFrontGate`** (`VoxelWaterSubsystem.cpp:1018` was an
+   explicit comment saying so), and the ceiling default is 65,536 bricks — three
+   orders of magnitude above the scale at which the frame is already dead.
+5. Every freshly mobilized brick is filled and woken, so the ACTIVE set grows
+   monotonically. `WaterCA::step()` is atomic over that whole set and
+   `voxel.Water.MaxActiveBricks` was **only ever a log-throttled warning**
+   (`VoxelWaterSubsystem.cpp:6567-6580`: *"tick ran in full — no safe mid-step
+   cutoff exists"*).
+6. The dominant per-step cost is **Phase C**, the hydrostatic level pass. Its
+   flood seeds from stepped bricks but then follows WATER anywhere
+   (`voxel-core/src/waterca.cpp:1188` — an air neighbour needs `nBrick.touched`,
+   a water neighbour never does), so one seed anywhere in a mobilized lake costs
+   a flood over the whole lake, every step.
+7. Amplifier: `FVoxelWaterImpl::TickAccumSeconds` had no clamp, only
+   `MaxStepsPerFrame`. Once a tick costs more than 0.4 s the accumulator's debt
+   grows every frame and the sim is pinned at maximum catch-up forever.
+
+**This is already measured, on the same shape** —
+`docs/water-map/ocean-captures.md:211-225`, a breach into the open sea:
+`activeBricks 19,636 → 41,613` (monotone), `volume 501.0M → 884.4M` (monotone),
+`water tickMs 2,000 → 2,547 ms` against a 10 Hz fixed step. 2.5 s of game thread
+per water tick IS the owner's "never recovered". Nothing in that loop decays.
+
+Ruled out by inspection: debris/islands (`VoxelWorldSubsystem.cpp:29655-29658`,
+`MinIslandVoxels=16` + `MaxIslandsPerEdit=16`, and a blast-sized region SKIPS
+detection entirely as clamped); `VoxelFluidSubsystem` (queue capped at 4096,
+drained FIFO under a count + ms budget, `VoxelFluidSubsystem.cpp:1147-1159`);
+`VoxelRippleField` / `VoxelBathyField` (no terrain-edit entry point at all).
+
+### FIX SHIPPED (containment, engine-side only — voxel-core untouched)
+
+`ue-project/Source/VoxelEarth/VoxelWaterSubsystem.cpp` only. Four new cvars, all
+pure policy: nothing persisted, digested, replicated or version-bumped; set all
+four to 0 and behaviour is the pre-§13 build. The safety argument is voxel-core's
+own — every lever REFUSES TO SCHEDULE, none writes or drops a fill unit, and
+`waterca.h` says a brick that is not scheduled is *"frozen, not duplicated and
+not lost"*. Every predicate reads authority state (brick counts, a step counter),
+never the wall clock.
+
+* **`voxel.Water.FrontActiveBudgetBricks` (256) — stops the growth.** Installs
+  the `setFrontGate` seam `waterca.h` §9a always documented. While ≥256 bricks
+  are already active the activity-driven front converts nothing more. Unlike the
+  demote-cooldown that was measured and rejected, a cost budget is monotone.
+  `mobilizeEditRegion` stays exempt by construction, so digging into water always
+  releases it.
+* **`voxel.Water.ActiveCeilingBricks` (2048) — the hard bound.** An active set
+  over the ceiling is settled by force instead of stepped. This exists because
+  the step budget *cannot* bound Phase C (see 6 above); refusing to step a body
+  the frame cannot afford is the only Phase-C lever outside voxel-core.
+  PROVISIONAL: half the old `MaxActiveBricks` advisory, 20x below the measured
+  runaway — the verify leg should retune it against real frame times.
+* **`voxel.Water.StepBudgetBricks` (512) — bounds phases A/B.** Over budget,
+  `StepFixed` steps a ROTATING window of that many keys through
+  `stepWithOrder` (whose contract is that any key set is a legal, complete,
+  atomic tick) and re-arms the remainder with `markActive`, which writes no
+  fill. **It drains**: a brick that settles inside its window leaves the active
+  set for good, and the rotation starves nothing.
+* **`voxel.Water.SettleForceSteps` (300) — the plateau backstop.** 300
+  consecutive over-budget steps (30 s at 10 Hz) without the active set falling
+  1/16 below its own mark forces a settle. Any real progress re-arms it, so a
+  draining pour never reaches it.
+* Forced settle = `stepWithOrder({})`: voxel-core's own settled-tick path.
+  Clears the active set, writes nothing, ledger unmoved, next edit wakes it.
+  Logged as an Error, 5 s-throttled.
+* Two independent leaks fixed alongside: `TickAccumSeconds` is now clamped after
+  the catch-up loop (the other half of the spiral-of-death guard), and the
+  per-step `DirtySinceLastBroadcast` fill is gated on `bReplicating` — only
+  `BroadcastWaterDiffs` drains it and standalone never calls it, so a five-figure
+  set was being re-inserted 40x/second in the configuration the owner plays.
+
+**GREP CONTRACT: `WaterContain:`.** A 1 Hz line on `LogVoxelPerf`, silent when
+the CA is idle:
+`WaterContain: active=N deferred=N budget=N ceiling=N budgetedSteps=N forced=N plateauSteps=N frontRefused=N mobilized=N tickMs=N`.
+The verify question is answered by `active=` alone: it must FALL back toward 0
+after the charge. `active=` plateauing while `deferred=` stays non-zero is a
+failed leg — that is the exact shape of the collapse. `WaterContain: FORCED
+SETTLE` (Error) is the backstop firing.
+
+**SUGGESTED VERIFY LEG** (not run — owner held a live editor session; author was
+inspection-only): capture at the judged lake shore, throw one charge at the
+waterline, and grep `WaterContain:` + `WaterPerf:` across the run. Pass = a
+bounded spike in `tickMs` that decays and `active=` returning to 0 with no
+`FORCED SETTLE`; a `FORCED SETTLE` is a pass on the §13 bar (no permanent loss)
+but a fail on quality and should be reported. Control arm: the same leg with all
+four cvars at 0 must reproduce the monotone climb. **Fixtures that deliberately
+measure breach flooding (`-VoxelOceanDig=breach`, `VoxelSweBreachFixture`) should
+set `voxel.Water.FrontActiveBudgetBricks 0` and `voxel.Water.ActiveCeilingBricks
+0`, or they will now measure the containment instead of the front.**
+
+### FOUND AND DELIBERATELY NOT FIXED
+
+**The edit overlay's one-way latch on the admission hot path.**
+`FVoxelWorldImpl::ChunkHasEditedBrick` (`VoxelWorldSubsystem.cpp:18858`) has a
+fast path `if (Overlay.size() == 0) return false;` at `:18869`; `overlay_`
+(`voxel-core/include/voxelcore/world.h:419`) is insert-only, never pruned. So the
+session's FIRST edit — any dig, not just a charge — permanently turns
+`NeedsOverlayAwarePath` (`:19547`, called ahead of both the budget and cutoff
+gates in `AdmitCandidateEvaluate`, and again per popped candidate in
+`DispatchJobs:24810`) from one integer compare into 216 hash probes, on a path
+this file measures at ~2.4M proposals/5 s and ~237,600 rejections/s. It is a
+permanent step-function tax on every edit, world-wide and distance-independent —
+but it is NOT the §13 collapse (the owner digs constantly without a hang), it
+sits in the middle of a hot path the 2026-09-04 perf-redesign lane just retuned,
+and fixing it blind without a measurement is how a perf regression ships.
+Its own timer already exists (`ThisFrameDispatchOverlayMs`, `:24811`). Wants its
+own leg. Related and adjacent: the mode-2 EDITED lane (`:21673-21708`) re-walks
+the whole never-pruned `EditedFootprintMaxZ/MinZ` per live consume, unbudgeted,
+and `VoxelEditedLaneGate.h` — the designed fix for exactly that — is dead code
+(never included, `FLevelGate` never instantiated) while
+`VoxelResidencyGpu.h:195-207` carries counters wired to a gate that does not
+exist.

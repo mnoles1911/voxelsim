@@ -61,6 +61,8 @@ looks like a boat, and is missing a part.
 
 SEED VARIATION IS SUBTLE AND IS NOT STRUCTURAL
 ----------------------------------------------
+A raft is the exception: its separate timber generator varies each log's
+diameter, taper, bow and bark-loss history. The description below is the hull.
 A canoe is a manufactured object; two of them are the same object. So a seed
 moves three things and no more: the size, slightly, through the shared
 `variation.*` sliders; which planking runs carry the second material; and how
@@ -117,7 +119,7 @@ assert all(n in materials.BY_NAME for n in materials.ARTIFACT_NAMES), (
 
 # The choice menu, mirrored, and checked the same way for the same reason: a
 # form that falls through to a default is indistinguishable from one that works.
-_FORMS = ("hull", "wing", "raft")
+_FORMS = ("hull", "wing", "raft", "bamboo_raft")
 assert set(BY_PATH["artifact.form"].choices) == set(_FORMS), (
     "forge/spec.py: artifact.form offers a form this generator does not build")
 
@@ -619,158 +621,10 @@ def _build_wing(spec: dict, rng, voxel_m: float, steps: _Steps) -> VoxelGrid:
 
 
 # --- the raft family ---------------------------------------------------------
-#
-# Parallel logs lashed into a platform. Everything here is the same field
-# doctrine as the hull: each log is one axis-aligned analytic cylinder
-# (y - y_i)^2 + (z - z_i)^2 <= r_i^2 over [x0_i, x1_i], evaluated over the
-# whole grid -- no stations, nothing rotated, nothing thinned per-voxel. The
-# lashings are analytic shells around the same axes (a band of x, a ring of
-# radius), not a morphological dilation of the quantised surface.
-#
-# WHAT MAKES IT READ AS LASHED-TOGETHER RATHER THAN EXTRUDED:
-#  * every log draws its own radius (a few per cent either way) and its own
-#    end stagger (up to `asym_vox` voxels per end) -- felled trees, not stock;
-#  * the TOPS align and the bottoms do not: a builder levels the deck he
-#    stands on, and the waterline sorts itself out;
-#  * neighbouring logs are SQUEEZED a fraction of a radius into each other,
-#    which is what real lashings do to green logs, and what guarantees the
-#    raft is one face-connected piece by construction rather than a row of
-#    tangent circles touching at corners;
-#  * cross-poles sink half a radius into the log tops for the same reason.
-#
-# PARAMETER REUSE, NOT NEW ROWS. The raft reads the artifact table it found:
-# length_m is the log length, beam_m the footprint width, depth_m the LOG
-# DIAMETER (a raft is one log deep by definition), thwarts/thwart_t_m the
-# cross-poles, deck_frac the lashing stations, strake_share the share of
-# weathered logs, asym_vox the end stagger. Zero new PARAMS rows means zero
-# hash movement anywhere in the library -- including canoe and glider, whose
-# canonical bodies would gain a key from any new artifact-scoped row.
-
 
 def _build_raft(spec: dict, rng, voxel_m: float, steps: _Steps) -> VoxelGrid:
-    L = float(get(spec, "artifact.length_m"))
-    B = float(get(spec, "artifact.beam_m"))
-    D = float(get(spec, "artifact.depth_m"))          # log diameter
-    n_poles = int(get(spec, "artifact.thwarts"))
-    pole_d = float(get(spec, "artifact.thwart_t_m"))
-    lash_frac = float(get(spec, "artifact.deck_frac"))
-    share = float(get(spec, "artifact.strake_share"))
-    asym_vox = float(get(spec, "artifact.asym_vox"))
-
-    mat_log = materials.resolve(get(spec, "materials.hull"))
-    mat_weathered = materials.resolve(get(spec, "materials.strake"))
-    mat_rope = materials.resolve(get(spec, "materials.trim"))
-    mat_pole = materials.resolve(get(spec, "materials.frame"))
-
-    r0 = D * 0.5
-    n_logs = max(3, int(round(B / max(D, 1e-9))))
-    # Each log's own radius and end stagger, drawn once per individual.
-    radii = r0 * (1.0 + 0.08 * (rng.random(n_logs) * 2.0 - 1.0))
-    stagger = asym_vox * voxel_m * (rng.random((n_logs, 2)) * 2.0 - 1.0)
-    # Cumulative centres with a 12% squeeze: neighbours genuinely overlap.
-    ys = [0.0]
-    for i in range(1, n_logs):
-        ys.append(ys[-1] + (radii[i - 1] + radii[i]) * 0.88)
-    ys = np.asarray(ys) - (ys[-1] * 0.5)              # centred on y = 0
-    z_top = D                                          # levelled deck
-    zc = z_top - radii                                 # tops align, bottoms don't
-
-    r_pole = pole_d * 0.5
-    rope_t = 2.0 * voxel_m
-    pad = 2.0 * voxel_m
-    half_y = float(np.max(np.abs(ys) + radii)) + pad
-    z_hi = z_top + (2.0 * r_pole if n_poles > 0 else 0.0) + 2.0 * voxel_m + pad
-    x_pad = asym_vox * voxel_m + pad
-    # Fat logs bottom out below z=0 (tops are levelled, radii vary) and the
-    # lashings pass UNDER them; the grid reaches down far enough to hold both.
-    z_lo = float(np.min(zc - radii)) - rope_t - pad
-    lo = np.array([-x_pad, -half_y, z_lo])
-    hi = np.array([L + x_pad, half_y, z_hi])
-    shape = _shape_for(lo, hi, voxel_m)
-    grid = VoxelGrid(shape, (0, 0, 0), voxel_m)
-    X, Y, Z = _axes(lo, shape, voxel_m)
-
-    log_masks = []
-    for i in range(n_logs):
-        d2 = (Y - ys[i]) ** 2 + (Z - zc[i]) ** 2
-        log_masks.append((d2 <= radii[i] ** 2)
-                         & (X >= 0.0 + stagger[i, 0])
-                         & (X <= L + stagger[i, 1]))
-    all_logs = np.logical_or.reduce(log_masks)
-    steps.run("logs", grid, lambda: _paint(grid, all_logs, mat_log),
-              note=f"{n_logs} logs, {D * 100:.0f} cm nominal, tops levelled")
-
-    # --- weathered logs ------------------------------------------------------
-    # PER-LOG contrast, the strake rule one more time: bands that follow the
-    # long axis of the object (whole logs), never bands that ring it. Which
-    # logs, by voxel budget, so the slider means what it says.
-    counts = [int(np.count_nonzero(m)) for m in log_masks]
-    chosen = _bands(rng, counts, share)
-    if chosen:
-        pick = np.logical_or.reduce([log_masks[i] for i in sorted(chosen)])
-        took = sum(counts[i] for i in chosen) / max(sum(counts), 1)
-        steps.run("weathered logs", grid,
-                  lambda: _paint(grid, pick, mat_weathered),
-                  note=f"{len(chosen)} of {n_logs} logs, {took:.0%} of the wood")
-    else:
-        steps.note("weathered logs", f"strake_share is {share:g}: none selected")
-
-    # --- cross-poles ---------------------------------------------------------
-    # Debarked poles laid across the deck at the lashing stations, sunk half
-    # a radius into the log tops so pole and deck share faces, not corners.
-    lash_x: list[float] = []
-    if n_poles == 1:
-        lash_x = [0.5 * L]
-    elif n_poles > 1:
-        lash_x = [L * (lash_frac + (1.0 - 2.0 * lash_frac) * k / (n_poles - 1))
-                  for k in range(n_poles)]
-    z_pole = z_top + 0.5 * r_pole
-    y_deck_half = float(np.max(np.abs(ys) + radii))
-    if lash_x:
-        def draw_poles():
-            m = np.zeros(shape, dtype=bool)
-            for xk in lash_x:
-                m |= (((X - xk) ** 2 + (Z - z_pole) ** 2 <= r_pole ** 2)
-                      & (np.abs(Y) <= y_deck_half))
-            _paint(grid, m, mat_pole)
-        steps.run("cross-poles", grid, draw_poles,
-                  note=f"{len(lash_x)} x {pole_d * 100:.0f} cm, sunk half a "
-                       f"radius into the deck")
-    else:
-        steps.note("cross-poles", "thwarts is 0")
-
-    # --- lashings ------------------------------------------------------------
-    # ONE STRAP PER LOG-POLE CROSSING, and only there. Each strap is clipped
-    # to ITS log's centre (|y - y_i| <= 0.55 r_i), so the pole keeps its own
-    # wood between straps and the deck keeps its own wood between stations --
-    # the first draft clipped to the full log span, and with contiguous logs
-    # that is everywhere: the poles came out 100% rope and the heartwood
-    # vanished from the material tally. A strap is two analytic shells: an
-    # annulus around the log's girth (the wood inside stays wood) and a solid
-    # sleeve over the pole, both as wide as the pole they bind.
-    if lash_x:
-        def draw_lash():
-            m = np.zeros(shape, dtype=bool)
-            wrap_half = r_pole + rope_t
-            for xk in lash_x:
-                in_band = np.abs(X - xk) <= wrap_half
-                pole_d2 = (X - xk) ** 2 + (Z - z_pole) ** 2
-                for i in range(n_logs):
-                    window = np.abs(Y - ys[i]) <= 0.55 * radii[i]
-                    log_d2 = (Y - ys[i]) ** 2 + (Z - zc[i]) ** 2
-                    around_log = (in_band & window
-                                  & (log_d2 <= (radii[i] + rope_t) ** 2)
-                                  & (log_d2 >= (radii[i] - voxel_m) ** 2))
-                    over_pole = window & (pole_d2 <= (r_pole + rope_t) ** 2)
-                    m |= around_log | over_pole
-            _paint(grid, m, mat_rope)
-        steps.run("lashings", grid, draw_lash,
-                  note=f"{len(lash_x)} stations x {n_logs} straps, "
-                       f"{rope_t * 100:.0f} cm rope")
-    else:
-        steps.note("lashings", "no stations: thwarts is 0")
-
-    return grid
+    from .raft import build as build_raft
+    return build_raft(spec, rng, voxel_m, steps)
 
 
 # --- entry point -------------------------------------------------------------
@@ -789,6 +643,9 @@ def build(spec: dict, rng, voxel_m: float, out: dict | None = None) -> VoxelGrid
         grid = _build_wing(spec, rng, voxel_m, steps)
     elif form == "raft":
         grid = _build_raft(spec, rng, voxel_m, steps)
+    elif form == "bamboo_raft":
+        from .bamboo_raft import build as build_bamboo_raft
+        grid = build_bamboo_raft(spec, rng, voxel_m, steps)
     else:
         grid = _build_hull(spec, rng, voxel_m, steps)
     if out is not None:

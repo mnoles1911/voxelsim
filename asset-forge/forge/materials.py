@@ -379,7 +379,7 @@ FISH_NAMES = CREATURE_NAMES
 ARTIFACT_NAMES = WOOD_NAMES + (
     "rock", "sand", "gravel",
     "skin_dark", "skin_pale", "skin_red", "skin_blue", "skin_yellow",
-    "skin_orange", "skin_green",
+    "skin_orange", "skin_green", "skin_brown",  # muted brown, consistent across faces
     "plume_white", "plume_grey", "plume_slate", "plume_buff", "plume_rufous",
     "plume_crimson", "plume_lime", "plume_cyan", "beak_horn",
 )
