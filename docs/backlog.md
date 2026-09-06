@@ -2346,10 +2346,15 @@ five files — and is **permanently unmergeable**. The other session touched
 `amplifier.cpp` ×8, `worldgen.ush` ×5 and the **binary** `.spv` prebuilts ×4 in
 24 hours; binary conflicts do not merge. Coordinate before entering worldgen.
 
-**Also parked:** the `swe.h` §5 lateral-spill gap (an SWE-owned pool cannot
-spill into a lower CA-owned neighbour) and ADR-0007's depth term. Both need
-`kSweVersion` 1→2 and a re-pin of `0x61523E585CF7B782`; ADR-0007 argues for
-deciding them together.
+**DORMANT WITH SWE (reclassified 2026-09-05, ADR-0007 closed as
+rejected-obsolete by owner ruling):** the `swe.h` §5 lateral-spill gap (an
+SWE-owned pool cannot spill into a lower CA-owned neighbour) and ADR-0007's
+depth term. NOT live parked work: SWE is the shelved fallback (ADR-0004
+superseded 2026-08-09; PBF is the single flowing-water solver) and the tide
+wave delivered rock pools/boats without it. Revive these two — together, they
+still share the `kSweVersion` 1→2 / `0x61523E585CF7B782` re-pin cost — only if
+ADR-0004 is ever re-opened. Warning comments now sit at swe.h §5 and the
+`voxel.Water.SWE` cvar so the spill defect is discovered by reading.
 
 ---
 
@@ -2610,3 +2615,22 @@ that DO run in CI pass. Treat the first item as blocking.
 - **The Mira-Thal branding.** The menu says VOXELMARK and its tips describe
   Roland, Lethe's Draught and the Aelorin. That was the explicit 1:1 brief; all
   of it is in `VoxelUIStrings.cpp` so re-authoring is a single-file edit.
+
+## 12. WATER CA SIM REWORK — owner ruling 2026-09-05
+
+**Owner, verbatim: "CA sim is terrible and needs to be reworked."** Ruled during
+the 2026-09-05 live water-judgment session, triggered by an accidental
+water-bucket pour onto the judged lake (the since-disabled '1' hotkey): the CA
+spent long enough settling one bucket that the frame rate collapsed, and the
+poured mass sat on top of the lake hiding the sheet surface. The July 4.7x CA
+optimisation (402-489 ms on a 1M-unit pour) made the batch case tolerable for
+fixtures but interactive pours still read as a hang, and the CA-vs-sheet
+interplay (poured CA water occluding the implicit surface it lands on) reads
+as a bug to the player. Scope of a rework, to be planned when scheduled:
+interactive-rate settling (budgeted/amortised, never a frame collapse),
+sane pour-onto-existing-body behaviour (merge into the datum/ledger instead of
+stacking above it), and the standing CA-vs-PBF direction question (the
+2026-08-09 rearchitecture kept PBF as the flowing-water solver; a CA rework
+should not fork that decision without re-opening it explicitly). Related:
+§9's playtest water bugs; the underground caves/cavern-lakes rework (its own
+backlog memory) which any CA rework should coordinate with.

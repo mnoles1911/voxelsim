@@ -8,12 +8,15 @@
 #include "GameFramework/PlayerController.h"
 #include "Kismet/KismetMaterialLibrary.h"
 #include "Materials/MaterialParameterCollection.h"
+#include "Misc/CommandLine.h" // -VoxelBathyOcean; explicit rather than via a neighbour's include
+#include "Misc/Parse.h"
 #include "PixelFormat.h"
 #include "RenderUtils.h"
 #include "UObject/ConstructorHelpers.h"
 
 #include "VoxelDebug.h"           // LogVoxelWater
 #include "VoxelFineTileStreamer.h" // pulls voxelcore/tilestore.h -- NOT UHT-parsed, so this is legal
+#include "VoxelWaterSubsystem.h" // Phase C: quantised sea datum + connectivity window
 #include "VoxelWorldSubsystem.h"
 
 namespace
@@ -96,14 +99,32 @@ void UVoxelBathyFieldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Pixels_.SetNumUninitialized(kSize * kSize);
 	bArmed_ = true;
 
+	// -VoxelBathyOcean=0 is the CONTROL ARM for the ocean-depth derivation: with
+	// it the packed texture is bit-for-bit what it was before plan B5, because
+	// the branch it removes is the only thing that writes an ocean texel.
+	// Announced in both positions -- an unpassed switch and a mis-spelled one
+	// produce the same unchanged image, which is the trap this project has hit
+	// four times in one session before.
+	{
+		int32 Flag = 1;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelBathyOcean="), Flag))
+		{
+			bOceanDepth_ = (Flag != 0);
+		}
+	}
+
 	// Published as invalid until the first window actually lands. The material
 	// must never read a texture whose contents predate this run.
 	PublishInvalid();
 	UE_LOG(LogVoxelWater, Log,
 	       TEXT("BathyField: armed. %dx%d texels at %.3f m -> a %.0f m window, refilled every %.0f m of camera ")
-	       TEXT("travel."),
+	       TEXT("travel. Ocean depth derivation %s."),
 	       kSize, kSize, kTexelUU / 100.0, kSize * kTexelUU / 100.0,
-	       kRecentreFraction * kSize * kTexelUU / 100.0);
+	       kRecentreFraction * kSize * kTexelUU / 100.0,
+	       bOceanDepth_ ? TEXT("ON (dry texels over sub-sea ground become seabed depth; oceanTexels below is "
+	                           "its engagement proof)")
+	                    : TEXT("OFF (-VoxelBathyOcean=0) -- this is the CONTROL arm, the texture is what it was "
+	                           "before plan B5"));
 }
 
 void UVoxelBathyFieldSubsystem::Deinitialize()
@@ -171,6 +192,24 @@ void UVoxelBathyFieldSubsystem::Tick(float DeltaTime)
 		return; // no pawn yet; nothing to centre on and nothing streamed either
 	}
 
+	// Phase C: a tide DATUM STEP moves the ocean-depth reference and the
+	// connectivity mask under a perfectly stationary camera, which the travel
+	// rule below would never notice -- so a step forces one refill. Polled off
+	// the tide's own engagement counter rather than a new event wire: the
+	// counter is the step, by definition, and it is already public.
+	if (const UWorld* World = GetWorld())
+	{
+		if (const UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
+		{
+			const int32 Steps = Water->GetTideState().DatumSteps;
+			if (Steps != LastTideDatumSteps_)
+			{
+				LastTideDatumSteps_ = Steps;
+				bForceRefill_ = true;
+			}
+		}
+	}
+
 	// Camera position in FINE PIXELS, then the window's minimum corner, then the
 	// snap. floor rather than truncate: pixel indices run negative and a
 	// truncating divide mirrors them across the origin, which is the aliasing
@@ -186,7 +225,7 @@ void UVoxelBathyFieldSubsystem::Tick(float DeltaTime)
 	const int64 WantPx = SnapDown(CamPx - kSize / 2);
 	const int64 WantPy = SnapDown(CamPy - kSize / 2);
 
-	if (bPublished_)
+	if (bPublished_ && !bForceRefill_)
 	{
 		// Has the camera left the central band of the published window? Measured
 		// in texels against the window we ACTUALLY published, not against the
@@ -208,6 +247,7 @@ void UVoxelBathyFieldSubsystem::Tick(float DeltaTime)
 	}
 
 	const double T0 = FPlatformTime::Seconds();
+	bForceRefill_ = false;
 	LastHoleFraction_ = FillWindow(WantPx, WantPy);
 	PublishWindow(WantPx, WantPy);
 	LastFillMs_ = (FPlatformTime::Seconds() - T0) * 1000.0;
@@ -225,10 +265,13 @@ void UVoxelBathyFieldSubsystem::Tick(float DeltaTime)
 	// it, which splits and silently SUPPRESSES the category instead. It fires
 	// once per refill (~240 m of travel), so it is not a per-frame line.
 	UE_LOG(LogVoxelWater, Log,
-	       TEXT("BathyField: window #%llu at px=(%lld,%lld) origin=(%.0f,%.0f)uu holes=%.1f%% fill=%.2fms"),
+	       TEXT("BathyField: window #%llu at px=(%lld,%lld) origin=(%.0f,%.0f)uu holes=%.1f%% oceanTexels=%llu ")
+	       TEXT("(%.1f%%) fill=%.2fms"),
 	       static_cast<unsigned long long>(PublishedWindows_), static_cast<long long>(OriginPx_),
 	       static_cast<long long>(OriginPy_), static_cast<double>(OriginPx_) * kTexelUU,
-	       static_cast<double>(OriginPy_) * kTexelUU, LastHoleFraction_ * 100.0, LastFillMs_);
+	       static_cast<double>(OriginPy_) * kTexelUU, LastHoleFraction_ * 100.0,
+	       static_cast<unsigned long long>(LastOceanTexels_),
+	       100.0 * static_cast<double>(LastOceanTexels_) / static_cast<double>(kSize * kSize), LastFillMs_);
 }
 
 double UVoxelBathyFieldSubsystem::FillWindow(int64 Px0, int64 Py0)
@@ -276,39 +319,152 @@ double UVoxelBathyFieldSubsystem::FillWindow(int64 Px0, int64 Py0)
 		}
 	}
 
+	// --- THE GROUND SAMPLER FOR OCEAN DEPTH, AND THE RULE THAT MAKES IT SAFE --
+	//
+	// Elevation comes from the SAME fine tier the bathymetry does, through the
+	// streamer's own world sampler -- the one choke point every terrain client
+	// reads through, so the seabed this grades against is the same data the
+	// world is built from. It is the tile's PIXEL elevation (1.875 m/px), not
+	// the amplified surface vxc::carrierHeightAt reconstructs between pixels:
+	// this field is a 1.875 m raster in the first place (one texel per source
+	// pixel, see the header), the baked lake planes are quantised to the same
+	// raster, and a 4x4 tap plus a spline per texel would be ~16x the reads for
+	// sub-texel detail the texture cannot carry.
+	//
+	// THE COST IS VISIBLE, NOT ASSUMED: an all-dry window is up to kSize^2
+	// elevation queries, and every refill already prints fill=%.2fms. If that
+	// number moves, the fix is a coarse pre-pass (ground is spatially coherent,
+	// so whole rows can be rejected) rather than dropping the derivation -- but
+	// it is not written speculatively.
+	//
+	// IT IS ONLY EVER ASKED FOR A TEXEL THE BATHY READ ANSWERED, and that is
+	// load-bearing rather than tidy. FVoxelFineTileSamplerProxy::elevationMm on
+	// a NON-resident tile does not return a hole: on the game thread it takes
+	// the cold path and BLOCKS on a synchronous whole-tile load (a second or
+	// more, tens of MB), and if the tile is absent it reports a GATE LEAK --
+	// which is UE_LOG(Fatal) under -unattended, i.e. it kills headless legs.
+	// ReadBathyRect above, by design, never loads and reports a hole instead.
+	// So: a texel whose depth plane came back != kBathyMissing had its tile
+	// loaded and decoded, whole-tile decode at load makes residency a per-TILE
+	// fact, and the elevation query for that same texel is therefore a
+	// shared-locked hash lookup that cannot block and cannot leak. Nothing else
+	// in this loop may query elevation.
+	vxc::ITileSampler* Ground = (bOceanDepth_ && Streamer != nullptr) ? &Streamer->WorldSampler() : nullptr;
+	uint64 OceanTexels = 0;
+
+	// Phase C: the QUANTISED sea datum and the connectivity window, both from
+	// the water subsystem (the seam the Phase-B comment reserved: "the
+	// quantised sea level lands here in Phase C"). No subsystem => the static
+	// geological datum and no connectivity -- exactly the Phase-B bytes.
+	const UVoxelWaterSubsystem* Water = nullptr;
+	if (const UWorld* World = GetWorld())
+	{
+		Water = World->GetSubsystem<UVoxelWaterSubsystem>();
+	}
+	const int32 SeaNowMm = Water ? Water->GetSeaLevelNowMm() : vxc::kSeaLevelMm;
+	// The whole A channel keys on the window being ARMED: unarmed (cvar off,
+	// no camera, no Impl) writes 0 everywhere -- the control arm's
+	// byte-identical texture -- instead of per-texel guesses.
+	const bool bConnArmed = Water != nullptr && Water->IsOceanConnectivityArmed();
+	// One texel = one fine pixel; its centre in UU for the connectivity probe.
+	const auto ConnectedAlpha = [&](int32 Col, int32 Row, bool bOceanTexel) -> float
+	{
+		if (!bConnArmed)
+		{
+			return 0.0f;
+		}
+		bool bKnown = false;
+		const bool bConn = Water->IsOceanConnectedAtWorld(
+			(static_cast<double>(Px0 + Col) + 0.5) * kTexelUU,
+			(static_cast<double>(Py0 + Row) + 0.5) * kTexelUU, &bKnown);
+		if (bKnown)
+		{
+			return bConn ? 1.0f : 0.0f;
+		}
+		// Outside the window: fall back by KIND. An ocean-derived texel IS the
+		// open sea by the ground test that produced it; a lake texel must not
+		// wave on an unproven connection.
+		return bOceanTexel ? 1.0f : 0.0f;
+	};
+
 	// Pack to the wire the material reads. The conversions live HERE and only
 	// here: nothing downstream multiplies by 10 or 100, and the shader sees
 	// metres in both channels.
-	for (int32 i = 0; i < Cells; ++i)
+	for (int32 Row = 0; Row < kSize; ++Row)
 	{
-		const int16 D = DepthUnits_[i];
-		const int16 S = ShoreUnits_[i];
-		FFloat16Color& Out = Pixels_[i];
-		if (D == vxc::kBathyMissing || S == vxc::kBathyMissing)
+		for (int32 Col = 0; Col < kSize; ++Col)
 		{
-			// A HOLE, and it must be shaded as dry land a long way from water --
-			// see kShoreClampM above. Validity 0 is what tells the material to
-			// use its fallback; the other two channels exist so that a BILINEAR
-			// tap straddling the edge of a hole still degrades toward "nothing
-			// here" rather than toward "waterline here".
-			Out.R = FFloat16(0.0f);
-			Out.G = FFloat16(-kShoreClampM);
-			Out.B = FFloat16(0.0f);
-			Out.A = FFloat16(0.0f);
-			continue;
+			const int32 i = Row * kSize + Col;
+			const int16 D = DepthUnits_[i];
+			const int16 S = ShoreUnits_[i];
+			FFloat16Color& Out = Pixels_[i];
+			if (D == vxc::kBathyMissing || S == vxc::kBathyMissing)
+			{
+				// A HOLE, and it must be shaded as dry land a long way from
+				// water -- see kShoreClampM above. Validity 0 is what tells the
+				// material to use its fallback; the other two channels exist so
+				// that a BILINEAR tap straddling the edge of a hole still
+				// degrades toward "nothing here" rather than toward "waterline
+				// here".
+				Out.R = FFloat16(0.0f);
+				Out.G = FFloat16(-kShoreClampM);
+				Out.B = FFloat16(0.0f);
+				Out.A = FFloat16(0.0f);
+				continue;
+			}
+
+			// --- OCEAN DEPTH (plan B5) -------------------------------------
+			//
+			// Only where the bake said DRY, so a texel carrying a real lake
+			// depth is never touched and the -VoxelBathyOcean=0 arm is
+			// byte-identical over every lake.
+			if (Ground != nullptr && vxc::bathyDepthIsDry(D))
+			{
+				const int32 GroundMm = Ground->elevationMm(Px0 + Col, Py0 + Row);
+				// THE QUANTISED SEA DATUM (Phase C, the seam Phase B reserved
+				// here): SeaLevelNowMm -- kSeaLevelMm plus the stepped tide --
+				// so the derived seabed depth and the exposed foreshore both
+				// move with the water they describe. The cadence half is
+				// solved where Phase B said it belonged: a datum step forces a
+				// refill (see Tick), so the field never grades against a tide
+				// that has moved on. Tide dark => SeaNowMm == kSeaLevelMm and
+				// this is the Phase-B branch to the bit.
+				if (GroundMm < SeaNowMm)
+				{
+					const float SeaDepthM = static_cast<float>(SeaNowMm - GroundMm) * 0.001f;
+					Out.R = FFloat16(SeaDepthM);
+					// THE PROXY (see the header). Clamped to the same
+					// saturation the real shore plane has, so a consumer that
+					// assumes the documented +/-100 m range still holds -- the
+					// clamp costs nothing the break math uses, which needs zero
+					// at the waterline and monotone going out.
+					Out.G = FFloat16(FMath::Min(SeaDepthM, kShoreClampM));
+					Out.B = FFloat16(1.0f);
+					Out.A = FFloat16(ConnectedAlpha(Col, Row, /*bOceanTexel=*/true));
+					++OceanTexels;
+					continue;
+				}
+			}
+
+			// vxc::bathyDepthIsDry, not `D <= 0`: a stored depth of exactly 0 is
+			// WET at exactly the bed, and the extent's outermost ring quantises
+			// there. Treating it as dry punches a one-pixel dry ring around
+			// every lake -- exactly at the shoreline, where it is most visible.
+			const float DepthM = vxc::bathyDepthIsDry(D) ? 0.0f
+			                                             : static_cast<float>(vxc::bathyDepthMm(D)) * 0.001f;
+			const float ShoreM = static_cast<float>(vxc::bathyShoreMm(S)) * 0.001f;
+			Out.R = FFloat16(DepthM);
+			Out.G = FFloat16(ShoreM);
+			Out.B = FFloat16(1.0f);
+			// Phase C connectivity: only WET lake texels ask the window (a dry
+			// texel's alpha is 0 by meaning -- no water, no wave heights); a
+			// tidal pool's texels read 1 at high water through the same probe
+			// the ocean branch uses.
+			Out.A = FFloat16(DepthM > 0.0f ? ConnectedAlpha(Col, Row, /*bOceanTexel=*/false)
+			                               : 0.0f);
 		}
-		// vxc::bathyDepthIsDry, not `D <= 0`: a stored depth of exactly 0 is WET
-		// at exactly the bed, and the extent's outermost ring quantises there.
-		// Treating it as dry punches a one-pixel dry ring around every lake --
-		// exactly at the shoreline, where it is most visible.
-		const float DepthM = vxc::bathyDepthIsDry(D) ? 0.0f
-		                                             : static_cast<float>(vxc::bathyDepthMm(D)) * 0.001f;
-		const float ShoreM = static_cast<float>(vxc::bathyShoreMm(S)) * 0.001f;
-		Out.R = FFloat16(DepthM);
-		Out.G = FFloat16(ShoreM);
-		Out.B = FFloat16(1.0f);
-		Out.A = FFloat16(0.0f);
 	}
+	LastOceanTexels_ = OceanTexels;
 
 	const uint64 Holes = Stats.cells - Stats.filled;
 	return Stats.cells ? static_cast<double>(Holes) / static_cast<double>(Stats.cells) : 1.0;

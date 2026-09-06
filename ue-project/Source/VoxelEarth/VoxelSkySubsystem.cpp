@@ -1,12 +1,15 @@
 #include "VoxelSkySubsystem.h"
 
 #include "VoxelEarth.h"
+#include "VoxelEditRelay.h" // F7 sky-epoch replication -- the clock's transport; see TickReplicatedClock
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelEarthGameMode.h" // VoxelEarthSpawn::ParseSpawnColumnUU -- see SpawnRig
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelEphemeris.h"
 #include "VoxelSkyDomeActor.h"
 #include "VoxelWorldSubsystem.h"
+
+#include "EngineUtils.h" // TActorIterator (locating the world's single AVoxelEditRelay, same as VoxelWaterSubsystem.cpp)
 
 #include "Camera/PlayerCameraManager.h"
 #include "Components/DirectionalLightComponent.h"
@@ -2113,6 +2116,52 @@ namespace
 	}
 } // namespace
 
+// --- F7 sky-epoch replication constants -------------------------------------
+//
+// CONSTANTS, NOT CVARS, deliberately. The module's cvar doctrine exists for
+// A/B arms and capture-leg knobs; nothing gates on sweeping these, and a
+// client-side correction rate that PLAYERS could each set differently would
+// manufacture exactly the per-client divergence this feature removes. Each
+// value states its argument; move one only with a better argument.
+namespace
+{
+	// Authority push cadence, real seconds. At the default 3600 s day the sun
+	// moves 0.5 deg (one sun-disc) between pushes, so a push is a fine-grained
+	// clock check, not a frame driver -- the client dead-reckons in between.
+	// Two scalars per push (~12 bytes on the wire): cadence is a smoothness
+	// choice, not a bandwidth one, and 5 s bounds how long a client can drift
+	// against a stale time scale before the next correction target arrives.
+	constexpr double kSkyEpochPushPeriodSeconds = 5.0;
+
+	// The correction's VISUAL budget: at most this many degrees per real second
+	// of sun motion added on top of the sun's own. Stated in degrees, not epoch
+	// seconds, so the bound survives any voxel.Sky.DayLengthSeconds -- the
+	// epoch-space rate is derived per use as DayLength * this / 360 (2.5
+	// epoch-s per real s at the default day, i.e. a correcting sky runs at up
+	// to 3.5x). 0.25 deg/s is half a sun-disc per second: it closes a 5 s
+	// clock skew in ~2 s, and a viewer tracking the sun sees ease, never a
+	// mid-frame teleport.
+	constexpr double kSkyEpochMaxCorrectionSunDegPerSec = 0.25;
+
+	// Exponential gain on small errors, per second (~4 s time constant). The
+	// last fraction of a correction eases out instead of holding the rate cap
+	// all the way to zero error and stopping dead.
+	constexpr double kSkyEpochCorrectionGainPerSec = 0.25;
+
+	// A received delta the bounded rate could not close within this many real
+	// seconds SNAPS instead (Warning-logged). Rationale at
+	// UVoxelSkySubsystem::AdoptReplicatedEpoch's declaration: one visible cut
+	// beats minutes of a racing sun, and the tide's quantised datum tracks a
+	// snap exactly as it tracks any other epoch jump. At defaults this puts
+	// the snap threshold at 75 epoch seconds.
+	constexpr double kSkyEpochSnapRealSeconds = 30.0;
+
+	// Receipts with |clientDelta| at or above this many epoch seconds print at
+	// Log ("once + on large deltas" -- the gate contract); the healthy steady
+	// state prints Verbose so a session log is not one line per 5 s.
+	constexpr double kSkyEpochLogDeltaS = 1.0;
+} // namespace
+
 // --- impl ------------------------------------------------------------------
 
 struct FVoxelSkyImpl
@@ -2123,6 +2172,31 @@ struct FVoxelSkyImpl
 	// pausable (TimeScale 0) without either of those meaning anything to the
 	// engine's own timekeeping.
 	double EpochSeconds = 0.0;
+
+	// --- F7 sky-epoch replication (header's clock-replication block) ---------
+	//
+	// AUTHORITY side. The accumulator starts AT the period so the FIRST
+	// authority tick pushes immediately: the relay's initial replication to a
+	// joining client carries whatever was last pushed, and "nothing yet" for
+	// the first five seconds of a session would hand early joiners a zero
+	// epoch to snap to.
+	double EpochPushAccumSeconds = kSkyEpochPushPeriodSeconds;
+	// Resolved lazily at push cadence (TActorIterator once, then cached) --
+	// weak, because the relay is a world-owned actor this subsystem must not
+	// keep alive or dangle against on travel.
+	TWeakObjectPtr<AVoxelEditRelay> SkyClockRelay;
+	bool bLoggedFirstEpochPush = false;
+	bool bWarnedNoRelayForEpoch = false;
+
+	// CLIENT side: the dead-reckoned server clock (the correction TARGET) and
+	// the rate it advances at, both replaced wholesale on every receipt.
+	bool bHasReplicatedEpochTarget = false;
+	double ReplicatedEpochTargetSeconds = 0.0;
+	double ReplicatedEpochTargetTimeScale = 1.0;
+	// Mirrored into FVoxelSkyState each tick -- proof of traffic, per the
+	// state fields' own comment.
+	int64 EpochReplicationReceipts = 0;
+	double EpochCorrectionRemainingS = 0.0;
 
 	// Cadence accumulator for voxel.Sky.ShadowUpdateHz.
 	double LightUpdateAccumulator = 0.0;
@@ -3212,6 +3286,13 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 
 	Impl->EpochSeconds += (double)DeltaTime * TimeScale;
 
+	// F7: the replicated clock -- authority push / client bounded correction.
+	// Between the local accumulation above and the ephemeris reads below, so a
+	// correction is part of THIS frame's clock rather than a retroactive nudge
+	// the sun catches up to a frame late. Standalone pays one NetMode enum test
+	// and nothing else (the off arm).
+	TickReplicatedClock(DeltaTime, TimeScale);
+
 	// The observer's own position, because latitude is a function of it
 	// (GeoFromWorldUU). Held over from the previous frame when there is no
 	// controller: snapping to the world origin would move the observer by
@@ -3272,6 +3353,10 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	S.bSunUp = Sun.AltitudeDeg > 0.0;
 	S.bMoonUp = Moon.AltitudeDeg > 0.0;
 	S.bClockRunning = TimeScale != 0.0;
+	// F7 proof of traffic (the fields' own comment in the header): client-only
+	// counters, forever 0/0.0 in standalone and on any server.
+	S.EpochReplicationReceipts = Impl->EpochReplicationReceipts;
+	S.EpochCorrectionRemainingS = Impl->EpochCorrectionRemainingS;
 
 	// The vectors themselves, for M_NightSky. NOT NEGATED -- see
 	// ApplySkyMaterialParams, and see the negation two blocks down that exists
@@ -4806,4 +4891,183 @@ void UVoxelSkySubsystem::SetTimeOfDay(double LocalHours)
 	UE_LOG(LogVoxelSky, Log,
 	       TEXT("VoxelSky::SetTimeOfDay RESOLVED: %05.2f h, day-of-year %d (was %d) at epoch %.3f s."),
 	       FMath::Frac(NewEpoch / DayLength) * 24.0, ResolvedDayOfYear, CurrentDayOfYear, NewEpoch);
+}
+
+// --- F7 sky-epoch replication ------------------------------------------------
+//
+// Policy and log contract at the two declarations in the header; constants and
+// their arguments above FVoxelSkyImpl. What lives HERE is only the mechanism.
+
+void UVoxelSkySubsystem::TickReplicatedClock(float DeltaTime, double TimeScale)
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	const ENetMode NetMode = World->GetNetMode();
+	if (NetMode == NM_Standalone)
+	{
+		// THE OFF ARM. Single-player reaches this enum test and nothing else:
+		// no relay lookup, no state written, no log line -- today's behavior,
+		// byte for byte.
+		return;
+	}
+
+	if (NetMode == NM_Client)
+	{
+		if (!Impl->bHasReplicatedEpochTarget)
+		{
+			// Connected, but nothing adopted yet -- either the first push has
+			// not arrived, or the server runs with voxel.Sky.Enabled 0 and
+			// will never push (its clock is not advancing, so there is no
+			// authoritative time to converge on). The local clock stands.
+			return;
+		}
+
+		// Dead-reckon the target forward with the SAME DeltaTime the local
+		// accumulation just used, at the SERVER'S advance rate. Sharing the
+		// DeltaTime makes frame timing cancel out of the error signal: with
+		// agreeing time scales the error holds still between receipts instead
+		// of breathing with the frame rate. Deliberately NO RTT compensation:
+		// a receipt is ~half an RTT stale, a constant ~0.05 epoch-s at typical
+		// latency -- 0.005 deg of sun, noise against the tide's 25 mm quantum.
+		Impl->ReplicatedEpochTargetSeconds += (double)DeltaTime * Impl->ReplicatedEpochTargetTimeScale;
+
+		const double Error = Impl->ReplicatedEpochTargetSeconds - Impl->EpochSeconds;
+		const double MaxRateEpochPerSec =
+			VoxelSky::GetDayLengthSeconds() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
+		// Exponential toward the target, clamped to the visual rate budget,
+		// never overshooting. Four lines of pure math; if this ever grows
+		// shape (drift filters, RTT terms) it moves to voxel-core beside the
+		// tide LUT where a golden test can pin it -- stated at the header
+		// declaration too, so nobody grows it here.
+		double Step = FMath::Clamp(Error * kSkyEpochCorrectionGainPerSec,
+		                           -MaxRateEpochPerSec, MaxRateEpochPerSec) * (double)DeltaTime;
+		if (FMath::Abs(Step) > FMath::Abs(Error))
+		{
+			Step = Error;
+		}
+		Impl->EpochSeconds += Step;
+		Impl->EpochCorrectionRemainingS = Error - Step;
+		return;
+	}
+
+	// Authority (listen or dedicated server): push the clock pair at cadence.
+	// The push itself renders nothing and steps nothing -- a listen server with
+	// no client connected writes two fields on an actor and that is all.
+	Impl->EpochPushAccumSeconds += (double)DeltaTime;
+	if (Impl->EpochPushAccumSeconds < kSkyEpochPushPeriodSeconds)
+	{
+		return;
+	}
+	Impl->EpochPushAccumSeconds = 0.0;
+
+	AVoxelEditRelay* Relay = Impl->SkyClockRelay.Get();
+	if (!Relay)
+	{
+		for (TActorIterator<AVoxelEditRelay> It(World); It; ++It)
+		{
+			Relay = *It;
+			break;
+		}
+		Impl->SkyClockRelay = Relay;
+	}
+	if (!Relay)
+	{
+		// The same broken configuration BroadcastWaterDiffs warns about (a
+		// networked world with no relay), warned ONCE here because the water
+		// side already repeats it per broadcast.
+		if (!Impl->bWarnedNoRelayForEpoch)
+		{
+			Impl->bWarnedNoRelayForEpoch = true;
+			UE_LOG(LogVoxelSky, Warning,
+			       TEXT("SkyEpoch AUTHORITY: no AVoxelEditRelay in this networked world -- the clock is NOT ")
+			       TEXT("replicating and every client runs its own locally-started epoch (skewed seas)."));
+		}
+		return;
+	}
+
+	Relay->AuthoritySetSkyClock(Impl->EpochSeconds, (float)TimeScale);
+	if (!Impl->bLoggedFirstEpochPush)
+	{
+		Impl->bLoggedFirstEpochPush = true;
+		// Once, on the first push -- the authority half of the gate evidence.
+		// Later pushes are silent (they differ only in the number); the RECEIPT
+		// side ('SkyEpoch REPLICATED') is where per-event evidence lives,
+		// because the receipt is the half that can silently fail.
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("SkyEpoch AUTHORITY: first push epoch=%.3f timeScale=%.3f period=%.1f s via AVoxelEditRelay. ")
+		       TEXT("Clients log 'SkyEpoch REPLICATED' on receipt; a connected client without that line did not ")
+		       TEXT("engage the replicated clock."),
+		       Impl->EpochSeconds, (float)TimeScale, kSkyEpochPushPeriodSeconds);
+	}
+}
+
+void UVoxelSkySubsystem::AdoptReplicatedEpoch(double ServerEpochSeconds, float ServerTimeScale)
+{
+	if (!Impl)
+	{
+		return;
+	}
+	Impl->EpochReplicationReceipts++;
+
+	const double LocalBefore = Impl->EpochSeconds;
+	const double Delta = ServerEpochSeconds - LocalBefore;
+	const double MaxRateEpochPerSec =
+		VoxelSky::GetDayLengthSeconds() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
+
+	const bool bFirst = !Impl->bHasReplicatedEpochTarget;
+	const bool bTooLargeToBlend = FMath::Abs(Delta) > MaxRateEpochPerSec * kSkyEpochSnapRealSeconds;
+
+	Impl->bHasReplicatedEpochTarget = true;
+	Impl->ReplicatedEpochTargetSeconds = ServerEpochSeconds;
+	Impl->ReplicatedEpochTargetTimeScale = (double)ServerTimeScale;
+
+	const TCHAR* Action = TEXT("BLEND");
+	if (bFirst || bTooLargeToBlend)
+	{
+		// The two snap cases argued at the header declaration: join adoption,
+		// and a delta the bounded rate could not close within
+		// kSkyEpochSnapRealSeconds. SetEpochSeconds is the funnel entry point
+		// and already forces the light rig to re-orient on the next tick.
+		Action = bFirst ? TEXT("SNAP-JOIN") : TEXT("SNAP-LARGE");
+		SetEpochSeconds(ServerEpochSeconds);
+		Impl->EpochCorrectionRemainingS = 0.0;
+	}
+	else
+	{
+		Impl->EpochCorrectionRemainingS = Delta;
+	}
+
+	// THE GATE LINE. Contract at the header declaration: first receipt and
+	// large deltas at Log (a mid-session SNAP-LARGE at Warning -- it means the
+	// server clock jumped or this client hitched hard), steady state at
+	// Verbose. One format string shape for all three so one grep finds every
+	// receipt a leg captured.
+	if (!bFirst && bTooLargeToBlend)
+	{
+		UE_LOG(LogVoxelSky, Warning,
+		       TEXT("SkyEpoch REPLICATED: serverEpoch=%.3f serverTimeScale=%.3f clientEpoch=%.3f ")
+		       TEXT("clientDelta=%+.3f s action=%s correctionRate=%.3f eps/s receipts=%lld -- delta exceeds ")
+		       TEXT("what the bounded rate closes in %.0f s; snapped."),
+		       ServerEpochSeconds, ServerTimeScale, LocalBefore, Delta, Action, MaxRateEpochPerSec,
+		       (long long)Impl->EpochReplicationReceipts, kSkyEpochSnapRealSeconds);
+	}
+	else if (bFirst || FMath::Abs(Delta) >= kSkyEpochLogDeltaS)
+	{
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("SkyEpoch REPLICATED: serverEpoch=%.3f serverTimeScale=%.3f clientEpoch=%.3f ")
+		       TEXT("clientDelta=%+.3f s action=%s correctionRate=%.3f eps/s receipts=%lld"),
+		       ServerEpochSeconds, ServerTimeScale, LocalBefore, Delta, Action, MaxRateEpochPerSec,
+		       (long long)Impl->EpochReplicationReceipts);
+	}
+	else
+	{
+		UE_LOG(LogVoxelSky, Verbose,
+		       TEXT("SkyEpoch REPLICATED: serverEpoch=%.3f serverTimeScale=%.3f clientEpoch=%.3f ")
+		       TEXT("clientDelta=%+.3f s action=%s correctionRate=%.3f eps/s receipts=%lld"),
+		       ServerEpochSeconds, ServerTimeScale, LocalBefore, Delta, Action, MaxRateEpochPerSec,
+		       (long long)Impl->EpochReplicationReceipts);
+	}
 }

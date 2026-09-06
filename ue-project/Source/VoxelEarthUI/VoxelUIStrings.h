@@ -61,6 +61,16 @@ VOXELEARTHUI_API FText SettingsToggleOn();
 VOXELEARTHUI_API FText SettingsToggleOff();
 VOXELEARTHUI_API FText SettingsFasterTerrainLabel();
 VOXELEARTHUI_API FText SettingsFasterTerrainDesc();
+// Rows three and four (2026-09-05), both about water. Written in what the
+// PLAYER sees -- whether the swell has shape, how finely the sea is built --
+// with no cvar, no metres, and no mention of how long a change takes to sweep
+// the resident lake basins. That latency is real and it is under a second; a
+// description that named it would read as a defect notice for something no
+// player would otherwise notice. See VoxelWaterSheetActor.cpp's cvar note.
+VOXELEARTHUI_API FText SettingsWaterWaveLabel();
+VOXELEARTHUI_API FText SettingsWaterWaveDesc();
+VOXELEARTHUI_API FText SettingsOceanDetailLabel();
+VOXELEARTHUI_API FText SettingsOceanDetailDesc();
 
 // --- Loading screen ---------------------------------------------------------
 // "L O A D I N G" -- the spaces are literal. Godot has no letter-spacing

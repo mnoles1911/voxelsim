@@ -112,6 +112,17 @@ private:
 	void OnDig();
 	void OnPlace();
 
+	// --- vehicles (docs/water-ocean-tides-plan-2026-09-04.md D3 / E) --------
+	//
+	// Bound on the CONTROLLER, not on a pawn, because the controller's input
+	// component is the only one that survives a possession change -- see the
+	// binding site in SetupInputComponent for the full argument. Both are pure
+	// dispatch: E leaves the vehicle you are in or boards the nearest boat, X
+	// opens or stows a glider, and everything either of them actually does lives
+	// in AVoxelBoat / AVoxelGlider.
+	void OnVehicleInteract();
+	void OnGliderDeploy();
+
 	// Dig/place cube size selection (m1-plan.md "Dig sizes" row): mouse
 	// wheel cycles 1<->2<->4, number keys 1/2/3 select directly.
 	void CycleDigSizeUp();

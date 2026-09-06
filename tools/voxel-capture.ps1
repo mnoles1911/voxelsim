@@ -491,7 +491,7 @@ if (Test-Path $LogPath) {
     $peak = if ($loaded) { ($loaded | Measure-Object -Maximum).Maximum } else { 0 }
     $final = if ($loaded) { $loaded[-1] } else { 0 }
     Write-Host ("  streaming: peak loaded={0}, final={1}, samples={2}" -f
-                $peak, $final, $loaded.Count)
+                $peak, $final, @($loaded).Count)
     if (-not $loaded) {
         Write-Warning ("no 'Voxel streaming: loaded=' line in the log -- the streaming counters " +
                        "could not be read at all, so this capture has NO evidence either way " +

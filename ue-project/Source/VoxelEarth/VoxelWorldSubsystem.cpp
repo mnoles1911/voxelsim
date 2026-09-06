@@ -8202,6 +8202,17 @@ struct FVoxelWorldImpl
 		// correctness argument is untouched: nothing anchor- or edit-dependent
 		// lives in here.
 		int32 ChunkZMaxUntrimmed = 0;
+		// 0 = derived entirely from resident tiles: permanent, the original
+		// charter. Nonzero = derived while some covered ground was
+		// NON-resident, stamped with FVoxelFineTileStreamer::ResidencyEpoch()
+		// at compute time; valid only while the streamer still reports that
+		// epoch, i.e. until any tile arrives or the missing-memo resets.
+		// Added 2026-09-05: the compute-without-caching rule for non-resident
+		// footprints assumed non-residency is transient (a tile mid-decode).
+		// Over tiles ABSENT ON DISK it is permanent, and R7's 8 km reach put
+		// 82 such footprints in the entry scan at ~5 ms each, every frame --
+		// 430 ms/frame at any coast near the baked set's edge.
+		uint64 ResidencyEpoch = 0;
 	};
 	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, FFootprintZRange> FootprintZRangeCache;
 
@@ -18316,20 +18327,37 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
 	if (const FFootprintZRange* Hit = FootprintZRangeCache.Find(CacheKey))
 	{
-		// Census G2. memoHit/memoFill is the pair that says whether the memo is
-		// still memoizing; memoFill approaching memoHit is the reading that
-		// retires the fill timer below (it would then be on a hot path and be a
-		// cost of its own).
-		if (ActiveCensus) { ++ActiveCensus->MemoHit; }
-		OutChunkZMin = Hit->ChunkZMin;
-		OutChunkZMax = Hit->ChunkZMax;
-		OutChunkZMaxUntrimmed = Hit->ChunkZMaxUntrimmed;
-		// T4-2 shadow: mirror the memo into the GPU Z-range texels (the
-		// manager dedups, so a hit is normally a no-op). Only MEMOIZED values
-		// are mirrored -- the non-resident fallback below deliberately never
-		// reaches a Note, for the memo's own resident-tiles reason.
-		FVoxelResidencyGpu::Get().NoteFootprintZRange(Level, ChunkX, ChunkY, OutChunkZMin, OutChunkZMax);
-		return;
+		// An epoch-stamped entry (derived over non-resident ground) is valid
+		// only while the streamer's answer set has not changed since it was
+		// computed. On mismatch it is dropped and recomputed below -- which is
+		// the whole point of the stamp: re-derive exactly when re-asking could
+		// answer differently, instead of every frame.
+		if (Hit->ResidencyEpoch != 0
+		    && (!FineStreamer || Hit->ResidencyEpoch != FineStreamer->ResidencyEpoch()))
+		{
+			FootprintZRangeCache.Remove(CacheKey);
+		}
+		else
+		{
+			// Census G2. memoHit/memoFill is the pair that says whether the memo is
+			// still memoizing; memoFill approaching memoHit is the reading that
+			// retires the fill timer below (it would then be on a hot path and be a
+			// cost of its own).
+			if (ActiveCensus) { ++ActiveCensus->MemoHit; }
+			OutChunkZMin = Hit->ChunkZMin;
+			OutChunkZMax = Hit->ChunkZMax;
+			OutChunkZMaxUntrimmed = Hit->ChunkZMaxUntrimmed;
+			// T4-2 shadow: mirror the memo into the GPU Z-range texels (the
+			// manager dedups, so a hit is normally a no-op). Only PERMANENT
+			// (resident-derived, epoch 0) values are mirrored -- non-resident
+			// answers deliberately never reach a Note, for the memo's own
+			// resident-tiles reason.
+			if (Hit->ResidencyEpoch == 0)
+			{
+				FVoxelResidencyGpu::Get().NoteFootprintZRange(Level, ChunkX, ChunkY, OutChunkZMin, OutChunkZMax);
+			}
+			return;
+		}
 	}
 	// Census G2, the fill half. THE ONE TIMER INSIDE THE SWEEP, and it is safe
 	// on its own terms: a fill is an amplifier column -- rare once a level is
@@ -18391,7 +18419,19 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 		}
 		if (!FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm))
 		{
-			return; // honest answer for THIS pass; not yet a fact worth memoizing
+			// Memoize WITH the residency epoch rather than not at all. The
+			// old `return` here assumed non-residency is a decode-in-flight
+			// moment; over tiles absent on disk it is permanent, and R7's
+			// entry scan re-derived the same 82 footprints every frame (~430
+			// ms/frame -- the 2026-09-05 2.5 fps coast regression). The stamp
+			// preserves the charter's real requirement: the entry dies the
+			// moment ANY tile arrives or the missing-memo resets, so the first
+			// post-residency answer is still computed fresh and cached
+			// permanently. No GPU Note -- non-resident answers never mirror.
+			FootprintZRangeCache.Add(
+				CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed,
+			                               FineStreamer->ResidencyEpoch()});
+			return;
 		}
 	}
 	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed});

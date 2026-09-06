@@ -36,6 +36,38 @@ VOXELEARTHUI_API void SetFineDetailSmoothing(bool bEnabled);
 VOXELEARTHUI_API bool GetFasterTerrainDrawing();
 VOXELEARTHUI_API void SetFasterTerrainDrawing(bool bEnabled);
 
+// "Water Wave Detail" -- fronts voxel.Water.WaveTessRadiusM. ON is the shipped
+// default: lake sheets subdivide their greedy rectangles to one fine pixel
+// inside an 80 m disc around the camera so the water material's World Position
+// Offset has vertices to push, and the swell is real geometry. OFF sets the
+// radius to 0: the sheet is flat rectangles again and the waves survive only in
+// the normal, which is byte-identical to every capture taken before the feature
+// existed and is therefore the honest A arm of any A/B on it.
+//
+// THE PERSISTED VALUE IS THE BOOL, NOT THE RADIUS. A player toggle that stored
+// 80 would become a second authority on a number that belongs with the feature,
+// and it would pin a stale radius into every save the day the feature is
+// retuned -- so ON restores whatever the cvar's own default currently is.
+VOXELEARTHUI_API bool GetWaterWaveDetail();
+VOXELEARTHUI_API void SetWaterWaveDetail(bool bEnabled);
+
+// "Ocean Mesh Detail" -- fronts voxel.Ocean.HalfDetail, AND IT IS THE ONE ROW
+// HERE WHOSE POLARITY IS INVERTED. The setting is named for what the player
+// gets (more mesh detail), the cvar is named for what the renderer does (build
+// half of it), so ON = 0 and OFF = 1. That inversion is the mistake this file's
+// header warns about, which is why it is written down in three places -- here,
+// at the apply site, and in the cvar's own help text -- rather than being
+// obvious from the names.
+//
+// ON is the shipped default: a 1.5 m finest cell on the ocean's centre patch,
+// matching the lake sheet's fine band so ocean and lake carry wave displacement
+// at the same density. OFF doubles the seed cell, which quarters the centre
+// patch's vertices; only the centre patch carries visible waves (the material
+// fades displacement to zero by 72 m), so what it trades is swell resolution
+// underfoot, not the horizon.
+VOXELEARTHUI_API bool GetOceanMeshDetail();
+VOXELEARTHUI_API void SetOceanMeshDetail(bool bEnabled);
+
 // Push every persisted setting into its cvar. Idempotent; called from
 // UVoxelFrontEndSubsystem::Initialize so a fresh process honours the player's
 // saved choices before the first marched frame, and from every Set* so a

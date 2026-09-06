@@ -409,6 +409,42 @@ module regen) → F5 (pure leg) → F7 (voxel-core tests + epoch replication).
 Each lands behind its cvar default-off until owner verdicts, per the standing
 doctrine. Material changes ride the regen chain (sky first — new MPC params).
 
+## Phase F8 — Weather-water cohesion (owner directive, 2026-09-05 late)
+
+Owner: "How if at all is the weather system wired into this session's water
+work? We need to connect it cohesively in a way that makes sense." Ruled after
+the racing-surface hunt landed on weather wind-direction drift.
+
+**F8.1 (the found bug, first): wind-direction drift must not race the waves.**
+Wave phase is wind-direction dotted with ABSOLUTE world position; slow synoptic
+rotation sweeps phase at |pos| x dOmega -- tens of m/s of pattern motion at the
+world's playable radii, present since live wind landed (~08-27), immune to
+every time knob by construction. Fix is material-side in water_wave_graph
+(direction quantisation with hysteresis + crossfade between direction bins, or
+local phase anchoring -- designer's call, must kill the lever arm), possibly
+plus an engine-side direction tau. Owner's interim state: the wind pins.
+
+**F8.2 Gust channel -> foam/spray.** The unsmoothed gust channel was published
+"for spray and foam, which SHOULD twitch, and nothing reads it yet". Foam v2's
+coverage should read sustained+gust while the wave field keeps smoothed
+sustained only -- the twitchy channel feeding the thing designed to twitch.
+
+**F8.3 Rain (weather has NO rain model yet -- the gap is weather-side).** The
+water stack is already rain-ready downstream: basin ledger rain credits exist
+and the tidal datum max()es against them by design. When weather grows rain:
+credit basins through the existing ledger rain path; splat raindrop rings into
+the ripple field inside its window; a rain-streak surface/underwater material
+term behind the quality row. Coordinate with the CA rework (backlog §12).
+
+**F8.4 Wind felt at sea (small):** light lateral wind force on floating hulls
+(boat drifts downwind at rest); glider already flies the shared wind.
+
+**F8.5 Storm surge (optional, powerful):** a weather low-pressure term as a
+SECOND datum overlay through the same TidalDatumSource seam -- architecture
+already supports it ("tide is a datum overlay, never a credit"); surge is just
+another overlay, inheriting determinism from the weather epoch. Decide scope
+when weather grows storms.
+
 ## What does NOT change
 
 `kSeaLevelMm`/`kSeaLevelVoxelZ` + derived gates (caves.h:165, karst.h:116,

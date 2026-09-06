@@ -150,14 +150,21 @@ bool UVoxelCharacterMovementComponent::IsInWaterAt(const FVector& Pos) const
 		return false;
 	}
 	// The water subsystem owns the full predicate (simulated water, the
-	// implicit field, and the open-sea datum). Without it -- a world with no
-	// water simulation -- fall back to the datum half alone, which still needs
-	// the terrain: "below sea level" on its own is what this replaced.
+	// implicit field, and the open-sea datum -- which, since Phase A of the
+	// tides plan, is the TIDAL datum: IsUnderwaterAtWorld routes through
+	// IsOpenSeaNowAtWorld, so swimming follows the waterline as it rises and
+	// falls with no code here). Without the subsystem -- a world with no water
+	// simulation -- fall back to the datum half alone, which still needs the
+	// terrain: "below sea level" on its own is what this replaced.
 	if (UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
 	{
 		return Water->IsUnderwaterAtWorld(Pos);
 	}
 	UVoxelWorldSubsystem* Terrain = GetVoxelWorldSubsystem();
+	// STILL THE STATIC, GEOLOGICAL FORM, deliberately: this branch only runs
+	// when there is no water subsystem, and the tide lives on the subsystem
+	// (its state IS the instance -- no instance, no tide anywhere in this
+	// world, so kSeaLevelMm is not an approximation here, it is the answer).
 	return Terrain && UVoxelWaterSubsystem::IsOpenSeaAtWorld(
 	                      Pos.Z, Terrain->GetSurfaceHeightUU(Pos.X, Pos.Y));
 }

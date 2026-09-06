@@ -96,8 +96,13 @@ namespace
 	// ---- the arm ----------------------------------------------------------
 
 	TAutoConsoleVariable<int32> CVarVoxelShadowMarch(
-		TEXT("voxel.Shadow.March"), 0,
-		TEXT("DEFAULT 0 SINCE 2026-08-23, BY OWNER DECISION -- terrain has no sun ")
+		TEXT("voxel.Shadow.March"), 1,
+		TEXT("DEFAULT 1 SINCE 2026-09-05, BY OWNER DECISION ('Ship voxel.shadow.March on so I can ")
+		TEXT("evaluate and judge') -- made with the 2026-08-23 cost figure below surfaced to the ")
+		TEXT("owner at the time of the ruling. The lighting dossier of the same day identified the ")
+		TEXT("missing terrain self-shadowing as half of the owner's 'bright in places, hard shadows ")
+		TEXT("in other spots' report. If the owner rejects the cost, flip this back to 0. ")
+		TEXT("HISTORY: DEFAULT 0 SINCE 2026-08-23, BY OWNER DECISION -- terrain has no sun ")
 		TEXT("shadows until this is revisited. It is the largest single frame-time item ")
 		TEXT("in the renderer: matched 30 m/s legs, mode 2 vs mode 0, changed ONLY this ")
 		TEXT("cvar -- frames 10,832 -> 20,811 and p50 20.90 ms -> 7.76 ms. The frame rate ")

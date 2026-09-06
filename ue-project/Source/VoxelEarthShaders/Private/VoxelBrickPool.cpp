@@ -669,7 +669,9 @@ namespace VoxelBrickPoolDetail
 	FAutoConsoleVariableRef CVarVoxelTerrainRetireQuads(
 		TEXT("voxel.Terrain.RetireQuads"),
 		GVoxelTerrainRetireQuads,
-		TEXT("MEASUREMENT AND READINESS ONLY, default 0 -- 1 retires terrain quad PRODUCTION on both ")
+		TEXT("Default 1 (terrain is marched -- the shipping state since the ray-marching plan; ")
+		TEXT("ADR-0006 closure 2026-09-05 fixed this text, which stale-claimed 'default 0'). ")
+		TEXT("1 retires terrain quad PRODUCTION on both ")
 		TEXT("the CPU worker and the GPU fork, leaving the brick volume as the only terrain producer. ")
 		TEXT("The world then renders nearly empty beyond the near field until the marcher can skip ")
 		TEXT("empty space and cross rings, so this is not a product switch. Water is unaffected: it ")

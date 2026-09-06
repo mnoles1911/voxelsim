@@ -606,6 +606,14 @@ struct FVoxelFluidLifecycle
 	double SinkMinXUU = 0.0, SinkMinYUU = 0.0, SinkMaxXUU = 0.0, SinkMaxYUU = 0.0;
 	double SinkDatumZUU = 0.0;
 	double NextSinkRefreshSeconds = 0.0;
+	// Phase C (tides): the tide's DatumSteps counter as of the last sink
+	// refresh. A datum step moves a tidal basin's surface AND its extent mask
+	// (extentMaskAtDatum, routed inside BuildBasinExtentBits), and a despawn
+	// grid from the previous datum would stop deleting at the old shoreline --
+	// so a step zeroes NextSinkRefreshSeconds and the next tick rebuilds,
+	// instead of waiting out the 1 s cadence. Polled, not evented: the counter
+	// IS the step, and it is already public on the water subsystem.
+	int32 LastSeenTideDatumSteps = 0;
 	// The lake's TRUE extent over the active window, as a bit grid (contract
 	// item 6, amended -- vxc::basinExtentBits). The box above is only the
 	// bounding box, and testing it alone deleted every particle in the window
@@ -1361,7 +1369,10 @@ void UVoxelFluidSubsystem::RefreshBasinSink(double NowSeconds)
 		C.minYMm = VoxelCoords::WorldToMm(B.MinYUU);
 		C.maxXMm = VoxelCoords::WorldToMm(B.MaxXUU);
 		C.maxYMm = VoxelCoords::WorldToMm(B.MaxYUU);
-		C.holdsWater = true; // GatherLakeSheetBasinsInTile only returns holders
+		// GatherLakeSheetBasinsInTile returns holders -- plus, since Phase C,
+		// oracle-tidal rows, which hold water NOW by construction (the tide
+		// overlay fills them to at least their sill), so the flag stays honest.
+		C.holdsWater = true;
 		Candidates.Add(C);
 	}
 	const int32 Pick = vxc::fluidPickBasinSink(Candidates.GetData(), Candidates.Num(),
@@ -1812,6 +1823,19 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	// ---- lifecycle refreshes ----------------------------------------------
 	if (bOriginLatched && bFaucets)
 	{
+		// Phase C: a tide datum step invalidates the sink's despawn mask (the
+		// extent follows the datum for tidal basins) -- force the refresh
+		// forward rather than despawning against last quantum's shoreline.
+		if (UVoxelWaterSubsystem* TideWater =
+		        GetWorld() ? GetWorld()->GetSubsystem<UVoxelWaterSubsystem>() : nullptr)
+		{
+			const int32 TideSteps = TideWater->GetTideState().DatumSteps;
+			if (TideSteps != Lifecycle->LastSeenTideDatumSteps)
+			{
+				Lifecycle->LastSeenTideDatumSteps = TideSteps;
+				Lifecycle->NextSinkRefreshSeconds = 0.0;
+			}
+		}
 		RefreshHeadwaterFaucets(Now);
 		RefreshBasinSink(Now);
 		DrainSillSpills();

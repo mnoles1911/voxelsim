@@ -693,6 +693,90 @@ void UVoxelRippleFieldSubsystem::AddDisturbanceAt(const UWorld* World, const FVe
 	}
 }
 
+void UVoxelRippleFieldSubsystem::AddSweptDisturbance(const FVector& StartWorld,
+                                                     const FVector& EndWorld, float WidthM,
+                                                     float StrengthM)
+{
+	// NON-FINITE INPUT LEAVES BY THE COUNTED DOOR, not by an early return. One
+	// call through AddDisturbance puts it in DroppedInert with everything else a
+	// caller's arithmetic got wrong, which keeps the identity in the header
+	// intact and keeps "the wake hook fires and its numbers are NaN"
+	// distinguishable from "the wake hook never fires". Checked BEFORE the
+	// subdivision because a NaN length is also how this function would loop
+	// forever.
+	if (StartWorld.ContainsNaN() || EndWorld.ContainsNaN() || !FMath::IsFinite(WidthM)
+	    || !FMath::IsFinite(StrengthM))
+	{
+		AddDisturbance(StartWorld, WidthM, StrengthM);
+		return;
+	}
+
+	// A ring of half the wake's width, laid at a spacing of at most that same
+	// half-width, so consecutive rings overlap by construction instead of
+	// beading into a dotted line. The floor is the field's own honesty limit:
+	// below kMinDisturbanceRadiusM AddDisturbance widens the ring anyway, and a
+	// spacing finer than the ring it is spacing would only queue more splats for
+	// the same wake.
+	const double RadiusM = FMath::Max(0.5 * double(WidthM), kMinDisturbanceRadiusM);
+	const double SpacingUU = RadiusM * 100.0;
+
+	const FVector Segment = EndWorld - StartWorld;
+	// XY only. The field is a 2D sheet and AddDisturbance discards Z at the
+	// door; counting a boat's vertical bob as arc length would subdivide a
+	// stationary rocking hull into a queue full of splats at one point.
+	const double LengthUU = FMath::Sqrt(Segment.X * Segment.X + Segment.Y * Segment.Y);
+
+	int32 NumSplats = 1 + int32(FMath::FloorToDouble(LengthUU / SpacingUU));
+	if (NumSplats > kMaxSweptSplats)
+	{
+		// Said once. The clamp bounds the LOOP; it does not pretend the request
+		// was served -- a caller asking for more than four full queues in one
+		// call is asking for something the queue could not have carried anyway,
+		// and the sub-splats past kMaxPending are already landing in
+		// DroppedFull, which is that counter's documented "this is a bug".
+		if (!bLoggedSweptClamp_)
+		{
+			bLoggedSweptClamp_ = true;
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("RippleField: a swept disturbance of %.1f m at %.2f m spacing asked for %d ")
+			       TEXT("sub-splats and was clamped to %d. The queue holds %d, so this request was ")
+			       TEXT("already overflowing it -- read voxel.Water.Ripple.Stat's dropped(full=N). ")
+			       TEXT("Said once."),
+			       LengthUU / 100.0, RadiusM, NumSplats, kMaxSweptSplats, kMaxPending);
+		}
+		NumSplats = kMaxSweptSplats;
+	}
+
+	// N == 1 is the zero-length case and is not a special case: the loop below
+	// runs once at t = 0, i.e. exactly AddDisturbance(StartWorld, ...). A boat
+	// that is not moving still leaves the ring it displaces.
+	const double InvSteps = (NumSplats > 1) ? 1.0 / double(NumSplats - 1) : 0.0;
+	for (int32 I = 0; I < NumSplats; ++I)
+	{
+		const double T = double(I) * InvSteps;
+		AddDisturbance(StartWorld + Segment * T, static_cast<float>(RadiusM), StrengthM);
+	}
+}
+
+void UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt(const UWorld* World,
+                                                       const FVector& StartWorld,
+                                                       const FVector& EndWorld, float WidthM,
+                                                       float StrengthM)
+{
+	if (!World)
+	{
+		return;
+	}
+	// const_cast for AddDisturbanceAt's reason: fetching a subsystem does not
+	// modify the world, and a caller holding a const world should need no
+	// ceremony at the call site.
+	if (UVoxelRippleFieldSubsystem* Ripple =
+	        const_cast<UWorld*>(World)->GetSubsystem<UVoxelRippleFieldSubsystem>())
+	{
+		Ripple->AddSweptDisturbance(StartWorld, EndWorld, WidthM, StrengthM);
+	}
+}
+
 void UVoxelRippleFieldSubsystem::FillSplatSlots()
 {
 	if (!StepMid_)

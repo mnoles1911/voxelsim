@@ -28,6 +28,7 @@
 // the CA's SolidFn bridges to UVoxelWorldSubsystem::IsSolidAtVoxel (already
 // public, overlay-aware) rather than duplicating terrain access.
 struct FVoxelWaterImpl;
+class UMaterialParameterCollection; // MPC_VoxelSky, held for the tide's per-tick parameter writes
 
 // --- W4 SWE diagnostics (read-only) -----------------------------------------
 //
@@ -141,6 +142,65 @@ struct FVoxelSweBedAudit
 	// names a column rather than just counting.
 	int64 WorstVx = 0, WorstVy = 0;
 	int32 WorstStoredBed = 0, WorstReseatedBed = 0;
+};
+
+// --- Phase A tide state + the water-surface contract -------------------------
+// (docs/water-ocean-tides-plan-2026-09-04.md A2/A5.)
+//
+// Same POD doctrine as the SWE probes above: plain structs, plain scalar
+// members, no voxel-core type crosses this UHT-parsed header. The arithmetic
+// behind these numbers lives in voxelcore/tide.h (integer phase + sine LUT,
+// unit-tested engine-free); what this header carries is the REPORT.
+
+// The tide's answer for one frame. Everything here is read-only diagnosis and
+// material fodder; the AUTHORITY the rest of the water tier consumes is the
+// quantised half only, via SeaSurfaceZNowUU() and the subsystem's internal
+// datum (which the ImplicitFn, the depth query and the surface contract all
+// share). The continuous OffsetUU exists for material parameters and may
+// never touch geometry -- that split is the plan's two-cadence rule, and it is
+// what bounds waterline-through-voxel churn.
+struct FVoxelTideState
+{
+	double OffsetUU = 0.0;          // continuous tide offset, UU -- MPC/materials ONLY
+	double OffsetQuantisedUU = 0.0; // the datum's offset: steps by QuantumMm, rate-limited
+	int32 OffsetQuantisedMm = 0;    // same number in mm, exact (what SeaLevelNowMm carries)
+	double VelocityUUPerS = 0.0;    // analytic rate of the continuous offset; cosmetic
+	double NormPhase = 0.0;         // primary (first) component's phase in [0,1); cosmetic
+	int32 DatumSteps = 0;           // times the datum actually moved this session -- the
+	                                // engagement counter: an armed leg where this stays 0
+	                                // is a leg where the tide did nothing, visibly
+	bool bEnabled = false;          // voxel.Water.Tide latched AND the spec parsed clean
+};
+
+// What kind of surface a column query resolved. Phase A resolves None, Ocean
+// and Lake; the rest are declared now so the contract does not re-shape under
+// its consumers when later phases start returning them: TidalLake is Phase
+// C's rock-pool/tidal-basin answer, Cavern is for a future Z-aware variant
+// (an open-sky column query cannot honestly claim the aquifer under it), and
+// CAOnly names the water this contract structurally cannot see -- see
+// WaterSurfaceZAtWorld's doc comment.
+enum class EWaterSurfaceKind : uint8
+{
+	None,
+	Ocean,
+	Lake,
+	TidalLake,
+	Cavern,
+	CAOnly,
+};
+
+// One column's water surface, as one struct, so a consumer cannot pair this
+// frame's surface with last frame's ground. SurfaceZUU is the DATUM -- no wave
+// displacement, ever: waves are render-side (the material's WPO), and a
+// physics consumer that read a displaced surface would disagree with the
+// swimmer's depth query by exactly the wave height.
+struct FWaterSurfaceSample
+{
+	double SurfaceZUU = 0.0; // absolute Z of the water surface (valid iff bHasWater)
+	double GroundZUU = 0.0;  // worldgen amplified ground for the column (always valid)
+	bool bHasWater = false;
+	bool bOceanConnected = false; // ALWAYS false in Phase A; Phase C's BFS fills it
+	EWaterSurfaceKind Kind = EWaterSurfaceKind::None;
 };
 
 UCLASS()
@@ -407,7 +467,97 @@ public:
 	// short of a real water datum can tell that apart from a bay, and supplying
 	// one is exactly what plan items 3-4 do. Until then this is strictly less
 	// wrong than the camera test, and the failure is rarer and diagnosable.
+	//
+	// STATIC ON PURPOSE, AND IT STAYS GEOLOGICAL (tides plan A4): this form
+	// answers against kSeaLevelMm forever, because its meaning is "is this a
+	// seabed place" -- the same fixed fact the caves/karst gates and the biome
+	// beach band are derived from -- and a caller with no subsystem instance
+	// (a world with no water sim at all) has no tide to consult anyway. A
+	// caller asking about the sea AS IT STANDS RIGHT NOW wants the instance
+	// method below.
 	static bool IsOpenSeaAtWorld(double WorldZUU, double WorldgenGroundZUU);
+
+	// --- Phase A: the tide (docs/water-ocean-tides-plan-2026-09-04.md) -------
+
+	// THE SAME TEST AGAINST TODAY'S SEA. Identical rule to the static form --
+	// below the surface, over a seabed, above the ground -- with the datum at
+	// kSeaLevelMm + the quantised tide offset. With voxel.Water.Tide 0 (the
+	// shipped default) the offset is exactly 0 and this is bit-identical to
+	// the static form, which is the OFF arm's whole contract. Swimming,
+	// submersion and the underwater post read THIS one; only derived
+	// geological facts read the static.
+	bool IsOpenSeaNowAtWorld(double WorldZUU, double WorldgenGroundZUU) const;
+
+	// Sea surface right now, in UU: SeaLevelZUU() plus the QUANTISED tide
+	// offset. This is the number geometry follows (AVoxelOceanActor's plane
+	// Z), deliberately the stepped datum rather than the continuous offset:
+	// the plane and the ImplicitFn must agree to the millimetre on where the
+	// water stands, and the continuous offset exists only for materials.
+	double SeaSurfaceZNowUU() const;
+
+	// The tide's full report for this frame (HUD, legs, materials' CPU side).
+	// A copy; zero-initialised (bEnabled false, offsets 0) when the subsystem
+	// has no Impl or the tide is dark.
+	FVoxelTideState GetTideState() const;
+
+	// THE SURFACE CONTRACT (plan A5) -- the one column query a boat, a
+	// swimmer's effects, or a render consumer asks. Datum only: the surface a
+	// buoyancy probe should settle to, with wave displacement deliberately
+	// absent (waves are render-side WPO; physics riding a drawn wave would
+	// disagree with SubmergedDepthUUAtWorld by the wave height).
+	//
+	// ONE IMPLEMENTATION with SubmergedDepthUUAtWorld -- both resolve the
+	// column through the same private helper, same ground accessor, same
+	// lakes.h composition, same tide datum -- so a boat and a swimmer cannot
+	// disagree about where the water is. Returns true iff the column holds
+	// datum water; OutSample.GroundZUU is valid either way.
+	//
+	// WHAT IT CANNOT ANSWER, stated rather than papered over (the same limit,
+	// for the same reason, as SubmergedDepthUUAtWorld above): water that
+	// exists only in the CA -- a player-poured pool, a PBF body, a flooded pit
+	// dug below worldgen ground -- has no datum anywhere, because the CA
+	// stores fill per cell and never a surface height. Those columns return
+	// false with Kind == None; EWaterSurfaceKind::CAOnly is the name reserved
+	// for them so a later phase that CAN resolve a per-body surface (the PBF
+	// presentation layer is the only candidate) has a slot that does not
+	// re-shape this struct. GAME THREAD ONLY, and it can touch disk -- same
+	// fine-tile-sampler rule as SubmergedDepthUUAtWorld.
+	bool WaterSurfaceZAtWorld(double WorldXUU, double WorldYUU, FWaterSurfaceSample& OutSample) const;
+
+	// --- Phase C: ocean connectivity + rock pools (tides plan C2/C3) ---------
+
+	// Is this XY column's water CONNECTED to the open sea at the tide standing
+	// right now -- the pixel-level "which water receives wave heights", and the
+	// per-column half of what fills FWaterSurfaceSample::bOceanConnected.
+	// Answered from the 128x128 @7.5 m connectivity window that follows the
+	// camera (vxc::oceanConnectivityFill over the SAME worldgen ground the
+	// ImplicitFn reads). Outside the window -- or before it has armed --
+	// *bOutKnown is set false and the return is false: the caller must fall
+	// back to its geological answer (IsOpenSeaNowAtWorld) rather than believe
+	// a "no" the grid never computed. Game thread only.
+	bool IsOceanConnectedAtWorld(double WorldXUU, double WorldYUU, bool* bOutKnown = nullptr) const;
+
+	// True while the connectivity window holds a computed grid (armed, cvar
+	// on, camera found). BathyField keys its whole A channel on this: an
+	// unarmed run writes 0 everywhere -- the byte-identical control arm --
+	// rather than guessing per texel.
+	bool IsOceanConnectivityArmed() const;
+
+	// The sea's datum RIGHT NOW in millimetres: kSeaLevelMm plus the QUANTISED
+	// tide offset -- the exact number the ImplicitFn's ocean term composes
+	// with. Exposed so the BathyField's ocean-depth fill grades against the
+	// datum the water actually stands at instead of the static constant
+	// (its Phase B seam comment: "the quantised sea level lands here in Phase
+	// C"). kSeaLevelMm whenever the tide is dark or there is no Impl.
+	int32 GetSeaLevelNowMm() const;
+
+	// One basin's surface RIGHT NOW, through THE datum seam (ledger, and in
+	// Phase C the vxc::TidalDatumSource tidal decorator wrapping it) -- the
+	// per-basin accessor the sheet actor's B3 placeholder lacked. False when
+	// the tile/basin does not resolve (caller keeps its gathered value). With
+	// the tide dark this is bit-identical to the gather's own SurfaceZUU.
+	// Game thread only (may touch the fine tier).
+	bool GetBasinDatumNowZUU(int32 TileX, int32 TileY, int32 BasinId, double& OutZUU) const;
 
 	// C8 ledger, for verification logging. Shortfall MUST be 0 forever: it
 	// counts units the implicit field gave up that the CA did not accept,
@@ -484,6 +634,12 @@ public:
 		int32 BasinId = 0;
 		double MinXUU = 0.0, MinYUU = 0.0, MaxXUU = 0.0, MaxYUU = 0.0;
 		double SurfaceZUU = 0.0;
+		// Phase C: is this basin's water presently one body with the sea --
+		// sampled from the connectivity window at the basin's baked v2
+		// worldOutlet at gather time. False for v1 rows and outside the
+		// window (unknown collapses to false here on purpose: a consumer
+		// gating WAVES must not wave water the grid never certified).
+		bool bOceanConnected = false;
 	};
 
 	// Which fine tile a world point falls in. Exposed so a caller can walk the
@@ -815,6 +971,18 @@ public:
 
 private:
 	TUniquePtr<FVoxelWaterImpl> Impl;
+
+	// Phase A tide: latch/arm, evaluate f(sky epoch), step the datum, publish
+	// the MPC params. Called once per Tick, beside the other latches, BEFORE
+	// the fixed-step loop -- a datum step must land on a step boundary for the
+	// same reason MaybeArmSwe/MaybeRelatchImplicitOcean do.
+	void TickTide(UWorld* World);
+
+	// MPC_VoxelSky, resolved once at tide arm (existence-check-and-log-loudly,
+	// the VoxelRippleField.cpp pattern). A UPROPERTY rather than a raw pointer
+	// in Impl because the collection is a UObject the GC must see referenced.
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialParameterCollection> TideSkyCollection;
 
 	// M3-wave-2-style autosave gate, mirroring UVoxelWorldSubsystem's own
 	// bWorldBegunPlay: set true once OnWorldBeginPlay runs its genuine

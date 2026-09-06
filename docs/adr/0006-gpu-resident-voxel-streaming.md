@@ -1,6 +1,22 @@
 # ADR-0006: GPU-resident voxel streaming (display geometry off the render-thread apply funnel)
 
-- **Status:** accepted
+> **STATUS 2026-09-05: CLOSED — superseded in MECHANISM, invariants 3-5 REMAIN
+> IN FORCE (Matt Noles, in session: "Close both ADRs per recommendation").**
+> Terrain is no longer drawn from meshed quads at all: it is ray-marched from a
+> GPU brick volume (`docs/ray-marching-plan-2026-08-19.md`; `voxel.March`
+> default 1; `voxel.Terrain.RetireQuads` default 1). The greedy mesher this ADR
+> specced was built, gated, measured, and is off by default. Invariant 2's goal
+> (O(1) primitives) is exceeded — a screen-space marcher submits zero terrain
+> primitives. **The owner explicitly RE-AFFIRMS invariant 3's fourth bullet —
+> "no gameplay system may read display geometry" — as surviving the mechanism
+> change**: it was signed against meshes, and it binds identically against the
+> marched brick volume. That rule is load-bearing today: it is why karst's carve
+> table waits for its HLSL mirror (docs/karst-handoff-2026-08-22.md:123) and why
+> erosion-v7 stays parked (docs/backlog.md, "5.6 m of solid-looking ground you
+> fall through"). Do not build anything from this ADR's mechanism sections;
+> do not relax invariants 3-5 without a new ADR.
+
+- **Status:** closed — mechanism superseded; invariants 3-5 in force
 - **Date:** 2026-07-24
 - **Doctrine sections affected:** additive. Implements ADR-0001's GPU-compute
   posture at *runtime* (not just CI), and **clarifies** the §2 determinism

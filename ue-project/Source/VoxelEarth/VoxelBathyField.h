@@ -38,7 +38,56 @@
 //   R = water depth, metres, 0 where dry
 //   G = signed distance to shore, metres, + in water, - on land
 //   B = validity, 1 where the bake answered and 0 where it did not
-//   A = reserved
+//   A = OCEAN CONNECTIVITY (Phase C), 1 where this texel's water is one body
+//       with the open sea at the tide standing right now, 0 otherwise. THE
+//       pixel-level "which water receives wave heights": the sea and its
+//       reaches read 1, an inland lake reads 0, a rock pool reads 1 at high
+//       water and 0 the quantum step after its sill stands proud. Sampled
+//       from UVoxelWaterSubsystem's connectivity window (128x128 @7.5 m, same
+//       +-480 m footprint as this field); where that window has no answer the
+//       fallback is by KIND -- an ocean-derived texel keeps 1 (it is open sea
+//       by the ground test that produced it), a lake texel keeps 0 (waves
+//       must not reach water the grid never certified). 0 everywhere when
+//       voxel.Water.OceanConnect=0 -- the byte-identical control arm.
+//
+// --- THE SEA IS NOT IN THE BAKE (plan B5, 2026-09-04) ----------------------
+//
+// The two baked planes are LAKE planes: bathy_depth is -1 (dry) everywhere
+// outside a basin, and the ocean is not a basin -- it is the implicit datum
+// composed in lakes.h, with no registry entry and no extent mask. So every
+// ocean texel came back "dry, validity 1", and the water material's depth-aware
+// terms -- McCowan shore break, absorption grading, foam from depth -- had
+// literally no depth to work with AT SEA, which is the one place waves break on
+// a beach.
+//
+// Rather than bake anything (the plan is zero-bake: any bake output change
+// re-keys the fine namespace, ~47 CPU-h with no backup), the fill DERIVES ocean
+// depth from ground the fine tier already carries:
+//
+//   a texel with NO lake depth, over ground BELOW sea level, is seabed
+//   R = sea level - ground, metres      (same units and meaning as lake depth)
+//   G = the same number, as a SHORE-DISTANCE PROXY -- see below
+//   B = 1
+//
+// G IS A PROXY AND IS LABELLED ONE. The real plane is a signed distance to the
+// shoreline; this is a depth. They are not the same quantity and the difference
+// is a slope factor that varies with the beach. What the consumers actually
+// need of G is that it be ZERO at the waterline and MONOTONE going out, which
+// depth over a beach is -- so the break line lands in the right place and moves
+// the right way, and the number it is derived from is honest about being
+// derived. A real sea shore-distance would need either a bake or a search over
+// the ground field, and both are out of scope for this wave.
+//
+// WHAT IT STILL GETS WRONG, stated rather than hidden: a natural inland
+// depression whose baked floor lies below sea level reads as seabed here, for
+// exactly the same reason and with exactly the same bound as
+// UVoxelWaterSubsystem::IsOpenSeaAtWorld's documented limit. It is the same
+// class of error, not a new one, and Phase C's ocean-connectivity BFS is what
+// narrows it.
+//
+// LAKE TEXELS ARE BYTE-IDENTICAL. The ocean branch is reachable only where the
+// bake answered "dry", so no texel that carries a baked lake depth is touched;
+// -VoxelBathyOcean=0 removes the branch entirely for a control arm.
 //
 // ONE TEXEL PER SOURCE PIXEL, exactly. The source is 1.875 m/px and nothing
 // downstream may pretend otherwise; the sub-pixel precision the material needs
@@ -171,6 +220,13 @@ public:
 	// be 1.0 in a run with no fine tier.
 	uint64 PublishedWindows() const { return PublishedWindows_; }
 	double LastHoleFraction() const { return LastHoleFraction_; }
+	// Texels of the last window filled from the OCEAN branch rather than from a
+	// baked lake plane. THE ENGAGEMENT PROOF, and it can fail: a coastal window
+	// with oceanTexels 0 means the derivation did not run (flag off, no ground
+	// sampler, or every texel read as land) and the material is back to having
+	// no depth at sea -- which looks, in an image, exactly like a material that
+	// simply does not break waves.
+	uint64 LastOceanTexels() const { return LastOceanTexels_; }
 	double LastFillMs() const { return LastFillMs_; }
 	bool IsArmed() const { return bArmed_; }
 
@@ -205,15 +261,30 @@ private:
 	uint64 PublishedWindows_ = 0;
 	double LastHoleFraction_ = 1.0;
 	double LastFillMs_ = 0.0;
+	uint64 LastOceanTexels_ = 0;
+
+	// -VoxelBathyOcean=0: skip the ocean-depth derivation entirely, so the
+	// texture is bit-for-bit what it was before plan B5. Default ON. It is a
+	// switch and not a cvar for the same reason every other water switch is:
+	// -ExecCmds lands after Initialize.
+	bool bOceanDepth_ = true;
 	// Refill accounting is per-world and cheap; this only exists so the "no fine
 	// tier in this run" message is logged once rather than every tick.
 	bool bLoggedNoStreamer_ = false;
+
+	// Phase C: the tide's DatumSteps counter as of the last refill, and the
+	// step-forced-refill latch it arms (see Tick). A step moves the sea's
+	// reference under a stationary camera; the travel rule alone would leave
+	// the field grading against yesterday's tide.
+	int32 LastTideDatumSteps_ = 0;
+	bool bForceRefill_ = false;
 
 	// Camera XY in UU for this frame, or false when there is no view to follow
 	// (no player controller yet, or a world type we do not run in).
 	bool GetCameraXY(double& OutX, double& OutY) const;
 	// Fills Pixels_ for a window whose minimum corner is the given fine pixel,
-	// and returns the fraction of cells that had no baked answer.
+	// and returns the fraction of cells that had no baked answer. Also sets
+	// LastOceanTexels_ -- see the ocean note in the header comment.
 	double FillWindow(int64 Px0, int64 Py0);
 	// Uploads Pixels_ and writes the three MPC parameters. Same tick, always.
 	void PublishWindow(int64 Px0, int64 Py0);

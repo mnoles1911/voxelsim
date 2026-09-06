@@ -399,6 +399,18 @@ public:
 	// time, and it is the number that explains a stuttering game thread.
 	uint64 BlockingLoadsSinceStart() const { return BlockingLoads_.load(std::memory_order_relaxed); }
 
+	// Monotonic counter that advances whenever the set of answers this
+	// streamer can give CHANGES: a tile finishes decoding into the sampler, or
+	// the known-missing memo is reset (ring move; a bake landing mid-session).
+	// Exists so a consumer may CACHE an answer derived from non-resident
+	// ground and know exactly when that answer stops being current --
+	// 2026-09-05: RecomputeDesiredSet's R7 entry pass was re-deriving 82
+	// permanently-non-resident footprints at ~5 ms each, EVERY FRAME (~430
+	// ms/frame, 2.5 fps) near any coast within the cascade's 8 km reach of
+	// unbaked tiles, precisely because the z-range memo refused to store
+	// non-resident answers and nothing told it when re-asking could differ.
+	uint64 ResidencyEpoch() const { return ResidencyEpoch_.load(std::memory_order_relaxed); }
+
 	// --- THE LOCK FAST PATH'S TRAFFIC (-VoxelFineLockFast) ------------------
 	//
 	// TRAFFIC BEFORE TIMING. These four are ALWAYS counted, at every mode
@@ -668,6 +680,9 @@ private:
 	// their own previous value.
 	std::atomic<uint64> GateLeaks_{0};
 	std::atomic<uint64> BlockingLoads_{0};
+	// See ResidencyEpoch(). Starts at 1 so an uninitialised consumer stamp of
+	// 0 can never accidentally validate against it.
+	std::atomic<uint64> ResidencyEpoch_{1};
 
 	// --- THE GAME-THREAD RESIDENCY MIRROR (-VoxelFineLockFast=2 and 3) -------
 	//

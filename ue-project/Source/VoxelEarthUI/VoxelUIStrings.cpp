@@ -91,6 +91,20 @@ FText SettingsFasterTerrainDesc()
 	               "No known visual difference; turn off to compare.");
 }
 FText SettingsToggleOff() { return LOCTEXT("SettingsToggleOff", "OFF"); }
+FText SettingsWaterWaveLabel() { return LOCTEXT("SettingsWaterWaveLabel", "Water Wave Detail"); }
+FText SettingsWaterWaveDesc()
+{
+	return LOCTEXT("SettingsWaterWaveDesc",
+	               "Lets waves on nearby lakes and rivers rise and fall as real shapes. Off "
+	               "keeps those surfaces flat and only shades the waves onto them.");
+}
+FText SettingsOceanDetailLabel() { return LOCTEXT("SettingsOceanDetailLabel", "Ocean Mesh Detail"); }
+FText SettingsOceanDetailDesc()
+{
+	return LOCTEXT("SettingsOceanDetailDesc",
+	               "How finely the open sea is built around you. Off uses a coarser surface "
+	               "close to the camera; the horizon reaches just as far either way.");
+}
 
 FText LoadingTitle() { return LOCTEXT("LoadingTitle", "L O A D I N G"); }
 FText TipPrefix() { return LOCTEXT("TipPrefix", "TIP"); }

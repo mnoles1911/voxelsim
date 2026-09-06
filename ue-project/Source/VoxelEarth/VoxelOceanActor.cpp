@@ -5,19 +5,46 @@
 #include "Camera/PlayerCameraManager.h"
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "Components/PostProcessComponent.h"
-#include "Components/StaticMeshComponent.h"
 #include "Engine/Scene.h" // FWeightedBlendable -- the post-process blendable list entry
-#include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
-#include "UObject/ConstructorHelpers.h"
+#include "ProceduralMeshComponent.h" // the ring grid; see the header's 2026-09-04 note
 #include "VoxelCoords.h" // VoxelSizeUU -- the one UU-per-voxel constant, for the UU -> m conversion
 #include "VoxelEarth.h"
 #include "VoxelSkySubsystem.h" // SetUnderwaterFogSuppression -- see the blend push below
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
+
+#include "HAL/IConsoleManager.h"
+
+// ---------------------------------------------------------------------------
+// CONSOLE VARIABLES
+// ---------------------------------------------------------------------------
+//
+// The player-facing "Ocean Mesh Detail" row fronts this
+// (VoxelGraphicsUserSettings). It is an int rather than a bool because the
+// detail ladder is a seed CELL SIZE and there is an obvious third rung
+// (quarter detail) if one is ever wanted; a bool would have to be replaced
+// rather than extended, and the persisted key would then mean two things.
+//
+// READ AT BUILD TIME, and the build is what Tick triggers when this no longer
+// matches what is on screen. It is deliberately not read anywhere else: every
+// other use of the cell size goes through BuiltCellUU, so a cvar changed
+// mid-frame cannot make the follow-snap disagree with the geometry it is
+// snapping.
+TAutoConsoleVariable<int32> CVarVoxelOceanHalfDetail(
+	TEXT("voxel.Ocean.HalfDetail"), 0,
+	TEXT("Ocean surface mesh detail. 0 (default) builds the ring grid on a 1.5 m finest cell -- ")
+	TEXT("~40 k vertices, matching the lake sheet's fine band so ocean and lake carry wave ")
+	TEXT("displacement at the same density. 1 doubles the seed cell to 3.0 m and derives the whole ")
+	TEXT("ring ladder from there: about a quarter of the centre patch's vertices, one ring fewer, ")
+	TEXT("and the same reach (the reach is asserted for BOTH levels in VoxelOceanActor.h). Only ")
+	TEXT("the centre patch carries visible waves -- the material fades World Position Offset to ")
+	TEXT("zero by 72 m -- so this trades wave resolution underfoot, not horizon quality. Changing ")
+	TEXT("it rebuilds the grid once, on the next tick."),
+	ECVF_Default);
 
 // The one spelling of the material parameter name; see the header for why it is
 // a named constant rather than a literal at the SetScalarParameterValue call.
@@ -52,41 +79,40 @@ AVoxelOceanActor::AVoxelOceanActor()
 {
 	PrimaryActorTick.bCanEverTick = true;
 
-	OceanPlane = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("OceanPlane"));
-	SetRootComponent(OceanPlane);
-	OceanPlane->SetMobility(EComponentMobility::Movable); // recentred every tick, see UpdateFollowPlane
-	OceanPlane->SetCollisionEnabled(ECollisionEnabled::NoCollision); // cosmetic only -- no gameplay forces yet (W1)
-	OceanPlane->SetCastShadow(false);
-	OceanPlane->SetReceivesDecals(false);
+	OceanMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("OceanPlane"));
+	SetRootComponent(OceanMesh);
+	OceanMesh->SetMobility(EComponentMobility::Movable); // recentred every tick, see UpdateFollowPlane
+	OceanMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision); // cosmetic only -- no gameplay forces yet (W1)
+	OceanMesh->bUseAsyncCooking = false;
+	OceanMesh->SetCastShadow(false);
+	OceanMesh->SetReceivesDecals(false);
+	// SUBOBJECT NAME KEPT AS "OceanPlane" ON PURPOSE, even though the member is
+	// now OceanMesh and the mesh is not a plane. A CreateDefaultSubobject name
+	// is serialized identity, and renaming it orphans the subobject in anything
+	// that already holds a reference by name. The name is not documentation.
 
-	static ConstructorHelpers::FObjectFinder<UStaticMesh> PlaneMeshFinder(TEXT("/Engine/BasicShapes/Plane.Plane"));
-	if (PlaneMeshFinder.Succeeded())
-	{
-		OceanPlane->SetStaticMesh(PlaneMeshFinder.Object);
-	}
 	// The ocean must reach at least as far as the clipmap draws ground (see
-	// PlaneSizeUU's comment). The multiple restates the clipmap's extent
+	// VoxelOcean::kReachDiameterUU). The multiple restates the clipmap's extent
 	// arithmetic; NumLevels is the term that actually changes, so it is the
 	// term asserted (HalfIndex/HoleHalfIndex are private and their ratio -- the
 	// leading 2 -- has been fixed since the actor existed).
-	static_assert(kClipmapExtentMultiple ==
+	static_assert(VoxelOcean::kClipmapExtentMultiple ==
 	                  2.0 * double(int64(1) << (AVoxelClipmapActor::NumLevels - 1)),
-	              "the ocean plane is sized to the clipmap's outer half-extent (2 * 2^(NumLevels-1) "
+	              "the ocean grid is sized to the clipmap's outer half-extent (2 * 2^(NumLevels-1) "
 	              "ring edges); AVoxelClipmapActor::NumLevels moved without this multiple -- water "
 	              "will end before the far terrain does");
-	const double Scale = PlaneSizeUU / SourcePlaneSizeUU;
-	OceanPlane->SetRelativeScale3D(FVector(Scale, Scale, 1.0));
 
 	// Loaded by path in BeginPlay-adjacent code below is the terrain
 	// material's pattern; the ocean material is instead resolved here in the
 	// constructor (StaticLoadObject works fine at CDO construction time too)
-	// so OceanPlane never renders with the engine default material even for
-	// one frame.
+	// so the mesh never renders with the engine default material even for
+	// one frame. ONE MATERIAL SLOT, index 0, on every section -- the sections
+	// are LOD rings of one surface, not different surfaces.
 	UMaterialInterface* OceanMaterial = Cast<UMaterialInterface>(
 		StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, TEXT("/Game/Voxel/M_Ocean.M_Ocean")));
 	if (OceanMaterial)
 	{
-		OceanPlane->SetMaterial(0, OceanMaterial);
+		OceanMesh->SetMaterial(0, OceanMaterial);
 	}
 	// else: engine default material (visible, if untinted) -- matches the
 	// terrain material's "never crash, just warn" fallback; warning logged in
@@ -129,11 +155,16 @@ void AVoxelOceanActor::BeginPlay()
 {
 	Super::BeginPlay();
 
-	if (OceanPlane && OceanPlane->GetMaterial(0) == nullptr)
+	if (OceanMesh && OceanMesh->GetMaterial(0) == nullptr)
 	{
 		UE_LOG(LogVoxelEarth, Warning,
-		       TEXT("M_Ocean not found at /Game/Voxel/M_Ocean -- ocean plane using the engine default material."));
+		       TEXT("M_Ocean not found at /Game/Voxel/M_Ocean -- ocean surface using the engine default material."));
 	}
+
+	// THE GRID, ONCE. Before UpdateFollowPlane at the end of this function, so
+	// the first frame draws real geometry at the right place rather than an
+	// empty component that pops in on tick 2.
+	BuildOceanGrid();
 
 	// --- THE UNDERWATER HEIGHT FOG IS GONE, ON PURPOSE ------------------------
 	//
@@ -257,8 +288,352 @@ void AVoxelOceanActor::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	// ---- THE DETAIL TOGGLE, CHECKED AGAINST THE MESH AND NOT AGAINST A FLAG --
+	//
+	// One integer compare per tick, and it is the whole rebuild trigger. The
+	// question asked is "is what is on screen made of what the cvar says?", so
+	// there is no way for a writer of the cvar (the settings row, the console,
+	// an -ExecCmds line) to forget to announce itself -- a state that cannot be
+	// forgotten is worth a compare a frame.
+	//
+	// BEFORE UpdateFollowPlane, so the transform applied this tick snaps to the
+	// cell size of the grid that is about to be drawn rather than the one that
+	// has just been thrown away.
+	const int32 WantHalfDetail = CVarVoxelOceanHalfDetail.GetValueOnGameThread() != 0 ? 1 : 0;
+	if (WantHalfDetail != BuiltHalfDetail)
+	{
+		BuildOceanGrid();
+	}
+
 	UpdateFollowPlane();
 	UpdateUnderwaterState(DeltaTime);
+}
+
+namespace
+{
+// ============================================================================
+// ONE LEVEL OF THE RING GRID
+// ============================================================================
+//
+// A square annulus of cells, all the same size, with a square hole in the
+// middle -- or, when HoleAcrossCells is 0, a solid patch (the centre).
+// Everything is in MESH-LOCAL UU around (0,0); the actor's transform puts it
+// under the camera.
+//
+// --- THE STITCH, WHICH IS THE ONLY SUBTLE PART ------------------------------
+//
+// This level's hole is exactly filled by the level inside it, whose cells are
+// HALF the size. So along the hole's boundary the fine side has a vertex at the
+// midpoint of every coarse edge, and the coarse side does not: that is a
+// T-junction, and a T-junction is invisible until the two sides are displaced
+// by different amounts -- which is precisely what World Position Offset waves
+// do. The crack opens exactly where the eye is already looking, at the LOD
+// change, and it opens and closes with the swell.
+//
+// The fix is COARSE-SIDE INDEXING: this level adds the midpoint vertex itself
+// on every edge it shares with the hole, and triangulates those boundary cells
+// as a five-vertex fan instead of two triangles. The fine side is then untouched
+// -- it emits its ordinary grid and never has to know it is being stitched to,
+// which is what keeps every level's code the same code.
+//
+// The fan apex is always a corner NOT on the split edge. Fanning from an
+// endpoint of the split edge produces a degenerate triangle (the midpoint is
+// collinear with it), which the RHI will happily accept and which shows up as a
+// missing sliver rather than as an error.
+//
+// --- WHAT THE VERTICES CARRY ------------------------------------------------
+//
+// The lake sheet's convention, deliberately identical (see
+// VoxelWaterSheetActor.h): colour (255,255,255,0) = full fill, no AO, on the
+// +Z boundary, no foam; up normal; (1,0,0) tangent; and UVs in METRES.
+//
+// THE UV IS MESH-LOCAL METRES, AND THAT IS A CONTRACT WITH THE MATERIAL. The
+// sheet can anchor its UV at a fixed world corner because a sheet never moves;
+// this mesh is recentred under the camera every tick, so a world-anchored UV
+// cannot be baked into its vertices at all. TexCoord0 here therefore slides by
+// whole finest cells (1.5 m) as the grid recentres. A wave module that reads
+// TexCoord0 as a world position WILL swim; the shared module must derive its
+// world anchor from absolute WorldPosition (which is what M_Ocean already does
+// for its ripple term) and use TexCoord0 only for things that are legitimately
+// mesh-relative.
+void AppendOceanLevel(double CellUU, int32 HalfCells, int32 HoleAcrossCells, TArray<FVector>& Verts,
+                      TArray<int32>& Tris, TArray<FVector>& Normals, TArray<FVector2D>& UVs,
+                      TArray<FColor>& Colors, TArray<FProcMeshTangent>& Tangents)
+{
+	const int32 Side = 2 * HalfCells;      // cells across
+	const int32 Stride = Side + 1;         // vertices across
+	const int32 H0 = HalfCells - HoleAcrossCells / 2; // first hole cell index
+	const int32 H1 = HalfCells + HoleAcrossCells / 2 - 1; // last hole cell index (inclusive)
+
+	// Lazy vertex allocation. The frame of a ring uses well under half of its
+	// bounding grid's vertices, and the hole's interior uses none at all; a map
+	// of slots means only the ones an emitted triangle actually references get
+	// built, with no second pass and no per-vertex search.
+	TArray<int32> Slots;
+	Slots.Init(INDEX_NONE, Stride * Stride);
+
+	auto AddVertAt = [&](double X, double Y) -> int32
+	{
+		const int32 Index = Verts.Num();
+		Verts.Add(FVector(X, Y, 0.0));
+		Normals.Add(FVector::UpVector);
+		Tangents.Add(FProcMeshTangent(1.f, 0.f, 0.f));
+		UVs.Add(FVector2D(X / 100.0, Y / 100.0)); // METRES, mesh-local -- see above
+		Colors.Add(FColor(255, 255, 255, 0));
+		return Index;
+	};
+
+	auto Corner = [&](int32 i, int32 j) -> int32
+	{
+		int32& Slot = Slots[i + Stride * j];
+		if (Slot == INDEX_NONE)
+		{
+			Slot = AddVertAt((double(i) - double(HalfCells)) * CellUU, (double(j) - double(HalfCells)) * CellUU);
+		}
+		return Slot;
+	};
+
+	for (int32 cj = 0; cj < Side; ++cj)
+	{
+		for (int32 ci = 0; ci < Side; ++ci)
+		{
+			if (HoleAcrossCells > 0 && ci >= H0 && ci <= H1 && cj >= H0 && cj <= H1)
+			{
+				continue; // the hole: the finer level inside fills it
+			}
+
+			// CCW in XY, matching AppendRectQuad's winding exactly so the ocean
+			// and the lake sheets cannot end up with opposite facing.
+			const int32 A = Corner(ci, cj);         // -x -y
+			const int32 B = Corner(ci + 1, cj);     // +x -y
+			const int32 C = Corner(ci + 1, cj + 1); // +x +y
+			const int32 D = Corner(ci, cj + 1);     // -x +y
+
+			// Which edge, if any, this cell shares with the hole. At most one:
+			// the hole is convex, so the cell diagonally off a hole corner
+			// touches it at a POINT (a shared corner vertex, no T-junction) and
+			// needs no split.
+			const bool bInSpan = (ci >= H0 && ci <= H1);
+			const bool bJnSpan = (cj >= H0 && cj <= H1);
+			const bool bSplitTop = HoleAcrossCells > 0 && bInSpan && cj == H0 - 1;    // D-C
+			const bool bSplitBottom = HoleAcrossCells > 0 && bInSpan && cj == H1 + 1; // A-B
+			const bool bSplitRight = HoleAcrossCells > 0 && bJnSpan && ci == H0 - 1;  // B-C
+			const bool bSplitLeft = HoleAcrossCells > 0 && bJnSpan && ci == H1 + 1;   // D-A
+
+			if (!bSplitTop && !bSplitBottom && !bSplitRight && !bSplitLeft)
+			{
+				Tris.Add(A); Tris.Add(B); Tris.Add(C);
+				Tris.Add(A); Tris.Add(C); Tris.Add(D);
+				continue;
+			}
+
+			const FVector PA = Verts[A], PB = Verts[B], PC = Verts[C], PD = Verts[D];
+			int32 Poly[5];
+			int32 Apex = 0;
+			if (bSplitTop)
+			{
+				const int32 M = AddVertAt(0.5 * (PD.X + PC.X), 0.5 * (PD.Y + PC.Y));
+				Poly[0] = A; Poly[1] = B; Poly[2] = C; Poly[3] = M; Poly[4] = D;
+				Apex = 0; // A, not on D-C
+			}
+			else if (bSplitRight)
+			{
+				const int32 M = AddVertAt(0.5 * (PB.X + PC.X), 0.5 * (PB.Y + PC.Y));
+				Poly[0] = A; Poly[1] = B; Poly[2] = M; Poly[3] = C; Poly[4] = D;
+				Apex = 0; // A, not on B-C
+			}
+			else if (bSplitBottom)
+			{
+				const int32 M = AddVertAt(0.5 * (PA.X + PB.X), 0.5 * (PA.Y + PB.Y));
+				Poly[0] = A; Poly[1] = M; Poly[2] = B; Poly[3] = C; Poly[4] = D;
+				Apex = 3; // C, not on A-B
+			}
+			else // bSplitLeft
+			{
+				const int32 M = AddVertAt(0.5 * (PD.X + PA.X), 0.5 * (PD.Y + PA.Y));
+				Poly[0] = A; Poly[1] = B; Poly[2] = C; Poly[3] = D; Poly[4] = M;
+				Apex = 1; // B, not on D-A
+			}
+			for (int32 t = 0; t < 3; ++t)
+			{
+				Tris.Add(Poly[Apex]);
+				Tris.Add(Poly[(Apex + t + 1) % 5]);
+				Tris.Add(Poly[(Apex + t + 2) % 5]);
+			}
+		}
+	}
+}
+} // namespace
+
+void AVoxelOceanActor::BuildOceanGrid()
+{
+	if (!OceanMesh)
+	{
+		return;
+	}
+
+	// ---- THE DETAIL LEVEL, LATCHED ONCE FOR THE WHOLE BUILD -----------------
+	//
+	// Read exactly here and nowhere else in the function. Reading the cvar again
+	// partway through would let a console write between two rings build a grid
+	// whose inner half and outer half disagree about the cell size -- a seam
+	// that would be geometrically wrong and would still log a healthy vertex
+	// count, which is the shape of failure this file's log line exists to catch.
+	const int32 HalfDetail = CVarVoxelOceanHalfDetail.GetValueOnGameThread() != 0 ? 1 : 0;
+	const double SeedCellUU = VoxelOcean::CellUUForHalfDetail(HalfDetail != 0);
+	const int32 RingCount = VoxelOcean::RingCountForReach(SeedCellUU);
+
+	// What was on screen before this call, for the rebuild line below. Captured
+	// before the counters are reset, because "40,017 -> 40,017" and
+	// "40,017 -> 0" are the two answers the line has to be able to tell apart.
+	const int32 PrevVertexCount = BuiltVertexCount;
+	const int32 PrevSectionCount = BuiltSectionCount;
+	const bool bRebuild = BuiltHalfDetail >= 0;
+
+	// ---- THE ARITHMETIC, WRITTEN DOWN SO THE LOG LINE CAN BE JUDGED ---------
+	//
+	// At the shipped FULL-DETAIL constants (kCellUU 150, kCentreHalfUU 9600, min
+	// ring half 22 cells, min width 10 cells, VoxelCoords::kNumLevels 8):
+	//
+	//   centre  128 x 128 cells   16,641 verts   32,768 tris   +-96 m
+	//   ring 1  hole 64, half 42   3,512 verts    6,176 tris   +-126 m
+	//   ring 2  hole 42, half 32   2,712 verts    4,832 tris   +-192 m
+	//   ring 3  hole 32, half 26   1,976 verts    3,488 tris   +-312 m
+	//   ring 4  hole 26, half 24   1,880 verts    3,360 tris   +-576 m
+	//   ring 5  hole 24, half 22   1,592 verts    2,816 tris   +-1,056 m
+	//   rings 6-12 (steady state)  1,672 verts    2,992 tris each, doubling
+	//                                                           out to +-135 km
+	//   TOTAL  40,017 verts, 74,384 tris, 13 sections
+	//
+	// Required reach is VoxelOcean::kRequiredHalfExtentUU = 81.92 km, so the
+	// derived 135 km clears it with the whole of ring 12 to spare. The budget
+	// this was designed against is the plan's 40-60 k vertices.
+	//
+	// AT HALF DETAIL (voxel.Ocean.HalfDetail=1, seed cell 300 UU) the same
+	// derivation runs on a 64 x 64 centre patch and needs ONE RING FEWER for the
+	// same reach -- which is exactly why the clear below is not optional. Every
+	// number above is derived, so none of them is restated for that case: the
+	// log line prints what was actually built and that is the thing to read.
+	//
+	// ONE SECTION PER LEVEL rather than one section for the lot: each level has
+	// its own tight bounds, so a camera at sea level looking at the horizon can
+	// cull the levels behind it, and a level that failed to build shows up as a
+	// missing section in the log instead of as a silently short vertex count.
+	// The cost is 13 draws for the ocean, all with the same material.
+	TArray<FVector> Verts;
+	TArray<int32> Tris;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	TArray<FColor> Colors;
+	TArray<FProcMeshTangent> Tangents;
+
+	BuiltVertexCount = 0;
+	BuiltTriangleCount = 0;
+	BuiltSectionCount = 0;
+
+	// Captured ONCE, and BEFORE the clear: PMC grows its material array with the
+	// sections, and reading slot 0 back mid-loop would make the material
+	// assignment depend on that growth behaviour. Before the clear rather than
+	// merely before the loop because slot 0 is the one thing being read out of
+	// the component that the clear could plausibly disturb -- and a rebuild that
+	// silently dropped the ocean material would look like a lighting bug.
+	UMaterialInterface* const OceanMaterial = OceanMesh->GetMaterial(0);
+
+	// EVERY SECTION GOES, and the reason is in the header: the two detail levels
+	// build a different NUMBER of sections, so overwriting by index would leave
+	// the last ring of the previous grid drawn at its old cell size -- a stale
+	// annulus of water at the horizon, z-fighting nothing and matching nothing.
+	// Harmless on the BeginPlay call (there is nothing to clear), which is what
+	// makes this function safe to call twice.
+	OceanMesh->ClearAllMeshSections();
+
+	int32 HalfCells = int32(VoxelOcean::kCentreHalfUU / SeedCellUU);
+	double CellUU = SeedCellUU;
+	double HalfUU = VoxelOcean::kCentreHalfUU;
+
+	for (int32 Level = 0; Level <= RingCount; ++Level)
+	{
+		int32 HoleAcross = 0;
+		if (Level > 0)
+		{
+			// The hole is the previous level's outer extent measured in THIS
+			// level's cells, which -- because the cells doubled -- is exactly
+			// the previous level's half-extent in cells. Recomputed from the
+			// running HalfUU rather than carried, so the hole and the geometry
+			// it must meet cannot drift apart.
+			CellUU *= 2.0;
+			HoleAcross = int32(FMath::RoundToDouble((2.0 * HalfUU) / CellUU));
+			HalfCells = VoxelOcean::NextRingHalfCells(HoleAcross);
+			HalfUU = double(HalfCells) * CellUU;
+		}
+
+		Verts.Reset();
+		Tris.Reset();
+		Normals.Reset();
+		UVs.Reset();
+		Colors.Reset();
+		Tangents.Reset();
+		AppendOceanLevel(CellUU, HalfCells, HoleAcross, Verts, Tris, Normals, UVs, Colors, Tangents);
+		if (Verts.Num() == 0 || Tris.Num() == 0)
+		{
+			// Cannot happen with the derivation above, which is exactly why it
+			// is checked: an empty level is the silent failure that would leave
+			// a square hole in the sea and nothing in the log.
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("Ocean: level %d built NOTHING (cell %.1f UU, half %d cells, hole %d cells). There will "
+			            "be a hole in the ocean at that range."),
+			       Level, CellUU, HalfCells, HoleAcross);
+			continue;
+		}
+		OceanMesh->CreateMeshSection(BuiltSectionCount, Verts, Tris, Normals, UVs, Colors, Tangents,
+		                             /*bCreateCollision*/ false);
+		if (OceanMaterial)
+		{
+			OceanMesh->SetMaterial(BuiltSectionCount, OceanMaterial);
+		}
+		BuiltVertexCount += Verts.Num();
+		BuiltTriangleCount += Tris.Num() / 3;
+		++BuiltSectionCount;
+	}
+
+	// THE STATE THE REBUILD TRIGGER READS, set only after the mesh actually
+	// exists. Set it before the loop and a build that threw out halfway would
+	// leave Tick agreeing with a grid that was never finished.
+	BuiltHalfDetail = HalfDetail;
+	BuiltCellUU = SeedCellUU;
+
+	// THE BUILD IS THE ONLY THING THAT CAN FAIL SILENTLY HERE -- it happens at
+	// BeginPlay and then only on a detail change, so a wrong grid is a wrong
+	// ocean for the whole session with no second chance to notice. The line
+	// prints what was built AND what it reaches, so it can be read against the
+	// table above.
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Ocean: ring grid built -- %d section(s) (1 centre + %d ring(s)), %d vertices, %d triangles, "
+	            "finest cell %.2f m over +-%.0f m, reach +-%.1f km (clipmap needs +-%.1f km). Detail: %s "
+	            "(voxel.Ocean.HalfDetail=%d). The camera is followed by transform."),
+	       BuiltSectionCount, RingCount, BuiltVertexCount, BuiltTriangleCount, SeedCellUU / kUUPerMetre,
+	       VoxelOcean::kCentreHalfUU / kUUPerMetre,
+	       VoxelOcean::ReachHalfExtentUU(SeedCellUU) / (kUUPerMetre * 1000.0),
+	       VoxelOcean::kRequiredHalfExtentUU / (kUUPerMetre * 1000.0),
+	       HalfDetail != 0 ? TEXT("HALF") : TEXT("FULL"), HalfDetail);
+
+	// ---- THE REBUILD'S ENGAGEMENT PROOF -------------------------------------
+	//
+	// A SECOND LINE, only on a rebuild, and it prints the vertex count BEFORE
+	// and AFTER. That pair is the only thing that can distinguish "the toggle
+	// rebuilt the ocean" from "the toggle was clicked, the cvar moved, and the
+	// mesh is exactly what it was" -- which is what a rebuild that read the
+	// wrong cvar, or that ran before the setting was applied, would look like
+	// from every other symptom, including this function's own build line above.
+	if (bRebuild)
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Ocean: ring grid REBUILT for a detail change -- %s, %d -> %d vertices in %d -> %d "
+		            "section(s), finest cell %.2f m. Rebuilt on the tick the cvar changed; nothing else "
+		            "about the ocean moved."),
+		       HalfDetail != 0 ? TEXT("FULL -> HALF") : TEXT("HALF -> FULL"), PrevVertexCount,
+		       BuiltVertexCount, PrevSectionCount, BuiltSectionCount, SeedCellUU / kUUPerMetre);
+	}
 }
 
 void AVoxelOceanActor::UpdateFollowPlane()
@@ -284,12 +659,60 @@ void AVoxelOceanActor::UpdateFollowPlane()
 		return; // nothing to follow yet
 	}
 
-	const double SnappedX = FMath::GridSnap(CameraLoc.X, FollowSnapUU);
-	const double SnappedY = FMath::GridSnap(CameraLoc.Y, FollowSnapUU);
-	// The visual plane sits ON the datum, by name (voxelcore/core.h
-	// kSeaLevelMm via UVoxelWaterSubsystem::SeaLevelZUU) rather than on a
-	// literal 0 that happened to agree with it.
-	SetActorLocation(FVector(SnappedX, SnappedY, UVoxelWaterSubsystem::SeaLevelZUU()));
+	// SNAPPED TO THE FINEST CELL, not to a round metre -- see the header. The
+	// ring boundaries are mesh-space, so the mesh's world alignment has to move
+	// in whole cells of the finest level or every LOD seam sweeps across the
+	// world at a different sub-cell phase each frame.
+	//
+	// BuiltCellUU, NOT VoxelOcean::kCellUU: the finest cell is now whichever one
+	// the grid on screen was built with. Snapping to the constant while a half
+	// detail grid was drawn would put every ring boundary on a half-cell phase
+	// -- the exact defect this snap exists to prevent, reintroduced by the
+	// toggle that was supposed to be free.
+	const double SnappedX = FMath::GridSnap(CameraLoc.X, BuiltCellUU);
+	const double SnappedY = FMath::GridSnap(CameraLoc.Y, BuiltCellUU);
+
+	// THE SEA SURFACE, NOW. SeaSurfaceZNowUU() is the geological datum
+	// (voxelcore/core.h kSeaLevelMm) plus the QUANTISED tide offset; it returns
+	// SeaLevelZUU() unchanged when the tide is disarmed, which is what makes a
+	// no-tide run byte-identical to every capture in the archive. The static
+	// SeaLevelZUU() is the fallback for a world with no water subsystem at all
+	// (the transient loading world, or a stripped configuration) -- there is no
+	// tide state there to ask.
+	double SeaZUU = UVoxelWaterSubsystem::SeaLevelZUU();
+	if (const UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
+	{
+		SeaZUU = Water->SeaSurfaceZNowUU();
+	}
+	// Skip the no-op move: an unchanged SetActorLocation still dirties the
+	// transform of a 13-section, 40k-vertex PMC every frame (this is the
+	// optimisation the header's LastSeaSurfaceZUU members promised and the
+	// first cut only applied to the LOG line -- review finding #7).
+	const FVector NewLoc(SnappedX, SnappedY, SeaZUU);
+	if (!NewLoc.Equals(GetActorLocation(), 0.01))
+	{
+		SetActorLocation(NewLoc);
+	}
+
+	// ONE LINE PER DATUM STEP, and it is the ocean half of the tide's
+	// engagement proof. The datum is quantised and rate-limited, so this fires
+	// at most every couple of seconds; a tide leg where the subsystem logs
+	// steps and this never does means the water surface did not follow them.
+	// Exact != on purpose: the value compared is a quantised datum, so it
+	// either stepped or it did not.
+	if (!bHaveSeaSurfaceZ || SeaZUU != LastSeaSurfaceZUU)
+	{
+		if (bHaveSeaSurfaceZ)
+		{
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Ocean: sea surface moved %.1f -> %.1f UU (%.3f m of tide off the %.1f UU geological "
+			            "datum). The grid follows by transform -- nothing re-meshes."),
+			       LastSeaSurfaceZUU, SeaZUU, (SeaZUU - UVoxelWaterSubsystem::SeaLevelZUU()) / kUUPerMetre,
+			       UVoxelWaterSubsystem::SeaLevelZUU());
+		}
+		LastSeaSurfaceZUU = SeaZUU;
+		bHaveSeaSurfaceZ = true;
+	}
 }
 
 void AVoxelOceanActor::UpdateUnderwaterState(float DeltaTime)
@@ -341,13 +764,26 @@ void AVoxelOceanActor::UpdateUnderwaterState(float DeltaTime)
 	bool bNowUnderwater;
 	if (Water)
 	{
+		// THE FULL PREDICATE, AND IT IS ALREADY THE TIDED ONE. IsUnderwaterAtWorld
+		// composes simulated water, the implicit field and the ocean datum, and
+		// plan A4 threads the tide through the ocean half of that composition --
+		// so the waterline this test uses is the same one the mesh above is
+		// standing at, by construction rather than by two agreeing constants.
 		bNowUnderwater = Water->IsUnderwaterAtWorld(CameraPos);
 	}
 	else if (UVoxelWorldSubsystem* Terrain = World->GetSubsystem<UVoxelWorldSubsystem>())
 	{
-		// No water simulation in this world (the transient loading world, or a
-		// stripped configuration): the ocean datum alone, which is still the
-		// terrain-aware test rather than the camera one.
+		// THE STATIC, AND ONLY BECAUSE THERE IS NO INSTANCE TO ASK.
+		//
+		// Plan A4 adds an INSTANCE UVoxelWaterSubsystem::IsOpenSeaNowAtWorld
+		// that carries the tide, and keeps the STATIC IsOpenSeaAtWorld meaning
+		// the geological datum. This branch is reachable only when the water
+		// subsystem does not exist (the transient loading world, or a stripped
+		// configuration) -- which is precisely the case where there is no tide
+		// state to consult and the geological datum IS the whole answer. So the
+		// static is not a leftover here, it is the correct half of the pair; it
+		// is named and explained so a later sweep does not "convert" it into a
+		// call that has no object to make it on.
 		bNowUnderwater = UVoxelWaterSubsystem::IsOpenSeaAtWorld(
 			CameraZ, Terrain->GetSurfaceHeightUU(CameraPos.X, CameraPos.Y));
 	}

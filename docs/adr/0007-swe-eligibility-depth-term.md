@@ -6,7 +6,22 @@
 > itself now the shelved SWE fallback rather than the active direction. The
 > thin-film/eligibility problem it diagnoses only matters if SWE is revived.
 
-- **Status:** proposed
+> **STATUS 2026-09-05: REJECTED — OBSOLETE (Matt Noles, in session: "Close both
+> ADRs per recommendation").** Three independent grounds: (1) the owner rejected
+> reviving SWE on 2026-08-09 (PBF is the single flowing-water solver; SWE's
+> integer dead zone below ~3% slope vs a 0.94% median river gradient); (2) the
+> code has not moved — kSweVersion is still 1, `voxel.Water.SWE` still defaults
+> false, standalone-only; (3) the 2026-09-04 ocean/tides wave delivered the
+> headline use cases (rock pools holding water; boats floating and waking) with
+> stateless datum arithmetic — no solver, no version bump — removing the last
+> reason to revive the layer this term belongs to. The "free re-pin window
+> closes at M3" urgency argument is discharged: SWE is a documented fallback,
+> not on a path to replication. The analysis below (no tuning knob can make a
+> mass-conserving sheet pool instead of spread) is kept for history and remains
+> correct. The §5 lateral-spill defect is now warned about at swe.h §5 and at
+> the cvar, so it is discovered by reading, not by playing.
+
+- **Status:** rejected — obsolete (2026-09-05); analysis kept for history
 - **Date:** 2026-07-29
 - **Doctrine sections affected:** NONE. §2.3's integer-only rule is kept; no
   float appears, no waiver is requested. What this asks Matt to approve is a
@@ -159,7 +174,9 @@ paying them twice.
 
 ## Decision
 
-**Pending Matt's sign-off.** Nothing implemented. Recommended sequence:
+**RESOLVED 2026-09-05: rejected as obsolete — see the status banner.** The
+sequence below is kept for history; do not run it unless ADR-0004 is re-opened.
+Original text: **Pending Matt's sign-off.** Nothing implemented. Recommended sequence:
 
 1. Run `-VoxelSweBreachTest=25` with `-VoxelSweBreachSwe=1` and `0`.
    — done 2026-07-29, see above.

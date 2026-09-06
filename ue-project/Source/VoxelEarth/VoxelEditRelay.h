@@ -59,6 +59,48 @@ public:
 	UPROPERTY(Replicated)
 	uint64 ServerProbeDigest = 0;
 
+	// F7 sky-epoch replication (docs/water-ocean-tides-plan-2026-09-04.md
+	// Phase F): the server's world clock, as TWO scalars -- the epoch itself and
+	// the rate it is advancing at. This is the reuse this class's header comment
+	// promised ("the relay generalizes to non-edit authoritative streams later")
+	// and the exact design VoxelSkySubsystem.h's old TODO named: two fields on
+	// the actor that already exists, already replicates, and is already
+	// bAlwaysRelevant -- NOT a second replicated actor, which would be a channel,
+	// a relevancy question and a spawn-ordering race bought for two numbers.
+	//
+	// WHY THE RATE RIDES ALONG: the epoch is pushed at a low fixed cadence
+	// (UVoxelSkySubsystem's kSkyEpochPushPeriodSeconds, ~5 s), so between pushes
+	// the client dead-reckons the server clock forward at this rate. Without it
+	// a client whose local voxel.Sky.TimeScale disagreed with the server's would
+	// saw-tooth: drift for 5 s, get yanked back, drift again.
+	//
+	// WRITER: UVoxelSkySubsystem::Tick on the authority, via AuthoritySetSkyClock
+	// below -- the relay itself never computes a clock, exactly as it never
+	// computes an edit. READER: OnRep_SkyClock forwards both scalars to the
+	// client's UVoxelSkySubsystem, which owns the smooth-correction policy
+	// (AdoptReplicatedEpoch -- rate bound, snap threshold, and the gate log line
+	// all live there, beside the clock they correct).
+	//
+	// RepNotify rides on the EPOCH only. Both fields are written together by
+	// AuthoritySetSkyClock and the epoch changes on every push while the clock
+	// runs, so one notify per push is the normal case. The one theoretical miss
+	// -- a time-scale change landing while the epoch is frozen at an identical
+	// value (TimeScale 0) -- self-heals on the next push and is bounded-corrected
+	// meanwhile; a second notify on the scale would instead double-invoke the
+	// adopt path (UE fires one RepNotify per changed property) and double-count
+	// its receipt evidence.
+	UPROPERTY(ReplicatedUsing = OnRep_SkyClock)
+	double ServerSkyEpochSeconds = 0.0;
+	UPROPERTY(Replicated)
+	float ServerSkyTimeScale = 1.0f;
+
+	// Authority-side setter for the pair above; no-op on non-authority instances
+	// so a confused caller cannot fork a client's proxy from the server's truth.
+	void AuthoritySetSkyClock(double EpochSeconds, float TimeScale);
+
+	UFUNCTION()
+	void OnRep_SkyClock();
+
 	// Server -> every client: reliable broadcast of newly-applied edit-log
 	// entries (wire format: UVoxelWorldSubsystem::SerializeLogEntriesFrom /
 	// ApplyReplicatedEntries), called by UVoxelWorldSubsystem's

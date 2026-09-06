@@ -267,6 +267,59 @@ public:
 	static void AddDisturbanceAt(const UWorld* World, const FVector& WorldPos,
 	                             float RadiusM, float StrengthM);
 
+	// ------------------------------------------------------------------------
+	// A WAKE: THE SAME RIPPLE, DRAGGED ALONG A LINE
+	// ------------------------------------------------------------------------
+	//
+	// Phase D4 of docs/water-ocean-tides-plan-2026-09-04.md. A boat is a source
+	// that MOVES, and the one thing the field already does perfectly is turn a
+	// moving source into a wedge: the step is a constant-c wave equation, so
+	// rings laid down along a track interfere into the V a Kelvin wake actually
+	// is. Nothing new is simulated to get that -- it falls out of the sim that
+	// is already running, which is why this is a helper and not a feature.
+	//
+	// THIS ADDS NO BUDGET AND NO STATE. It subdivides the segment and calls
+	// AddDisturbance once per sub-splat, so every sub-splat lands in the SAME
+	// kMaxPending queue, competes for the SAME kSplatSlots per step, and is
+	// counted by the SAME four Dropped counters. There is deliberately no
+	// "swept" counter: Injected + the four drops must stay exactly the number of
+	// AddDisturbance calls (the identity stated above), and a fifth counter here
+	// would be a second place for that identity to be wrong.
+	//
+	// AND IT STAYS COSMETIC. The rule at the top of this file (:16-20) is that
+	// this field is a material input and nothing else -- it moves no water, owns
+	// no datum, and a boat's buoyancy reads
+	// UVoxelWaterSubsystem::WaterSurfaceZAtWorld, never this. A wake that pushed
+	// the boat would be the exact change that rule exists to stop.
+	//
+	// WidthM is the wake's full width; each sub-splat is a ring of HALF that
+	// radius, laid at a spacing of at most half the width so consecutive rings
+	// overlap rather than beading. StrengthM is passed to every sub-splat
+	// UNCHANGED, which means a swept line is genuinely stronger than one splash
+	// of the same strength -- overlapping raised cosines sum. That is the
+	// correct physics for a continuous source and it is stated here because it
+	// is the number a caller will otherwise tune twice: a boat wants a per-tick
+	// StrengthM well BELOW the one-off splash figures quoted above.
+	//
+	// Same total safety as AddDisturbance: safe before the first frame, with the
+	// subsystem disabled, with a zero-length segment (one splat at Start) and
+	// with non-finite input (one call, counted DroppedInert, never a loop).
+	void AddSweptDisturbance(const FVector& StartWorld, const FVector& EndWorld,
+	                         float WidthM, float StrengthM);
+
+	// The UWorld form, for the same reason AddDisturbanceAt has one: a hook into
+	// a file this feature does not own should be one line that cannot fail.
+	static void AddSweptDisturbanceAt(const UWorld* World, const FVector& StartWorld,
+	                                  const FVector& EndWorld, float WidthM, float StrengthM);
+
+	// Hard ceiling on sub-splats from ONE swept call. Four full queues: enough
+	// that no boat at any plausible speed and frame time reaches it, small
+	// enough that a caller handing this a kilometre-long segment cannot spin.
+	// The excess is not silently dropped -- see the .cpp, where the ceiling logs
+	// once and the sub-splats past kMaxPending are counted DroppedFull by
+	// AddDisturbance itself, which is that counter's documented meaning.
+	static constexpr int32 kMaxSweptSplats = kMaxPending * 4;
+
 	// Run N simulation steps RIGHT NOW, outside the frame's own stepping. Exists
 	// for one reason: a screenshot at a pinned pose has to photograph the same
 	// water every time it is taken, and a ripple that has been settling for
@@ -340,6 +393,8 @@ private:
 	bool bLoggedFirstStep_ = false;
 	bool bLoggedRadiusClamp_ = false;
 	bool bLoggedCourantClamp_ = false;
+	// ...and a swept disturbance long enough to hit kMaxSweptSplats.
+	bool bLoggedSweptClamp_ = false;
 	// Whether MPC_VoxelSky actually carries the three ripple parameters. Checked
 	// ONCE, in Initialize, and never again: UKismetMaterialLibrary's setters log a
 	// warning and do nothing for a name that is not on the collection, and doing
