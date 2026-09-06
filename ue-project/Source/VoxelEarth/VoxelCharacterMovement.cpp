@@ -5,6 +5,7 @@
 #include "GameFramework/Actor.h"
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
+#include "VoxelRippleField.h"
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -890,6 +891,42 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	}
 
 	Owner->SetActorLocation(NewPos);
+
+	// --- Player surface ripples (2026-09-06, owner session 9: "No player
+	// ripples either") -----------------------------------------------------
+	//
+	// The ripple field's own tuning block (VoxelRipple::kMinImpactFraction,
+	// "wading in still makes something rather than nothing") was written for
+	// exactly this caller, and until today nothing called it: only the boat
+	// and the glider ditch injected. The gate is "the waterline crosses the
+	// body" -- feet in water, head (plus half a metre) out -- so wading and
+	// surface swimming stir the field while a deep diver does not paint
+	// surface rings from the bottom of a lake. Strength rides the same
+	// saturating speed ramp as every other injector, on the boat's bow-wake
+	// scale (a torso is narrower than a hull, so width sits below
+	// BowWakeWidthM and strength below BowWakeStrengthM). A swept splat, not
+	// a per-tick drop, for the reason AddSweptDisturbance exists: sub-splats
+	// share one frame's slots, so a fast wader cannot outrun their own rings.
+	{
+		const FVector FeetProbe(NewPos.X, NewPos.Y, NewPos.Z - GetHalfExtentZ() + 5.0);
+		const FVector HeadProbe(NewPos.X, NewPos.Y, NewPos.Z + GetHalfExtentZ() + 50.0);
+		const bool bAtWaterSurface = IsInWaterAt(FeetProbe) && !IsInWaterAt(HeadProbe);
+		if (bAtWaterSurface && bHaveLastRipplePos)
+		{
+			const double SpeedMPS = HorizontalVelocity.Size() / 100.0;
+			if (SpeedMPS > 0.15)
+			{
+				const double Frac = FMath::Max(
+					VoxelRipple::kMinImpactFraction,
+					FMath::Min(1.0, SpeedMPS / VoxelRipple::kFullImpactSpeedMPS));
+				UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt(
+					GetWorld(), LastRipplePos, NewPos,
+					/*RadiusM=*/0.45f, /*StrengthM=*/float(0.020 * Frac));
+			}
+		}
+		LastRipplePos = NewPos;
+		bHaveLastRipplePos = bAtWaterSurface;
+	}
 
 	// Gait phase advances with DISTANCE travelled, not time, so the limb swing
 	// and camera bob speed up with the character rather than running at a fixed

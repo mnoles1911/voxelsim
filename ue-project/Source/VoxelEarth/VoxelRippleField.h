@@ -120,10 +120,17 @@
 // --- WHERE RIPPLES ARE ALLOWED ----------------------------------------------
 //
 // The bake already knows. bake_ver 27's bathy_shore plane is a SIGNED DISTANCE
-// to the nearest shoreline, and the step multiplies the field by
-// saturate(shore_m / kShoreMaskM) every step: zero on land, zero at the
-// waterline, one 25 cm inside the water. That is both "no ripples on dry ground"
-// and "a shore for a ripple to die against", from one number.
+// to the nearest shoreline, and the step multiplies the PROPAGATING field by
+// max(saturate(shore_m / kShoreMaskM), MaskFloor) every step: MaskFloor (0.98,
+// a ~0.6 s half-life) on land and at the waterline, one 25 cm inside the
+// water. That is "a shore for a ripple to die against" WITHOUT a kill switch:
+// until 2026-09-06 the mask reached zero and was applied to the freshly
+// injected splat too, so anywhere the bake disagreed with the live water that
+// validated the injector -- including the waterline itself, where wading
+// entries splash -- the splat was erased in the very draw that counted it as
+// injected, with every counter green. The splat is now injected AFTER the
+// attenuation (see STEP_CODE in Tools/create_ripple_field_materials.py), so a
+// splash is always born and the mask governs how it dies.
 //
 // Where the bake has no answer there is no mask -- the same lerp-back-to-1 on
 // validity the wave field's shore damping uses
@@ -333,6 +340,25 @@ public:
 	// all of them passed and nothing rendered.
 	void ProbeTextures();
 
+	// --- field health: the counter that cannot lie ---------------------------
+	//
+	// 2026-09-06: the second time this system reported perfect counters over
+	// empty textures (armed=1 published=1 steps=115889 injected=26240, boat
+	// wake invisible at gain 20). Every counter above measures the PROCESS --
+	// injected counts splat slots WRITTEN, steps counts draws SCHEDULED -- and
+	// none of them touches the DATA, so "the sim is healthy" could mean "the
+	// draws were merely scheduled". These read the data: a small centre patch
+	// of the front state and the derived field is read back every few seconds
+	// UNTIL the field first proves non-zero, then sampling stops for the
+	// session (re-arming on ClearState). Stat prints the result, and a field
+	// that stays dark while injections accrue logs a warning that names the
+	// triage. Cost: two 64x64 readbacks per sample, only while unverified.
+	bool FieldHealthSampled() const { return LastFieldMaxAbs_ >= 0.0f; }
+	float FieldMaxAbs() const { return LastFieldMaxAbs_; }   // -1 = never sampled
+	float StateMaxAbs() const { return LastStateMaxAbs_; }   // metres, bias removed
+	double FieldHealthAgeSec() const;
+	bool FieldVerifiedLive() const { return bFieldVerifiedLive_; }
+
 	// Both state targets back to flat water. Also called on arm and disarm -- a
 	// field left over from a previous world would otherwise be the first thing
 	// the next one shows.
@@ -439,6 +465,17 @@ private:
 	FVector LastPawnPos_ = FVector::ZeroVector;
 	bool bHaveLastPawnPos_ = false;
 
+	// --- field health state (see the public block above) ---------------------
+	// Sampled max|value| in the centre patch: field = max of |R|,|G|,|B| (the
+	// gradient/height the water actually reads), state = max of |R-bias|,
+	// |G-bias| in metres. -1 until the first sample.
+	float LastFieldMaxAbs_ = -1.0f;
+	float LastStateMaxAbs_ = -1.0f;
+	double LastHealthSampleAt_ = -1.0e18;
+	int32 DarkHealthSamples_ = 0;
+	bool bFieldVerifiedLive_ = false;
+	bool bWarnedFieldDark_ = false;
+
 	uint64 TotalSteps_ = 0;
 	uint64 Injected_ = 0;
 	uint64 DroppedOutside_ = 0;
@@ -451,6 +488,11 @@ private:
 	// camera-following windows centred on different things would disagree about
 	// where the world is, and the step samples the bathymetry window.
 	bool GetCameraXY(double& OutX, double& OutY) const;
+
+	// Read a 64x64 centre patch of the front state and the field back to the
+	// CPU and judge it. Throttled, and self-disarming on the first non-zero
+	// field -- see the public field-health block for the contract.
+	void SampleFieldHealth();
 
 	// One simulation step: scroll by ShiftUv (zero on every substep after the
 	// first of a frame), inject up to kSplatSlots queued disturbances, draw.

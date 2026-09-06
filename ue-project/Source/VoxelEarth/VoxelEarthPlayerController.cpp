@@ -897,10 +897,56 @@ void AVoxelEarthPlayerController::OnVehicleInteract()
 	}
 	if (AVoxelGlider* Glider = Cast<AVoxelGlider>(GetPawn()))
 	{
-		Glider->ReturnPilot(Glider->GetActorLocation());
+		// Parked: dismount and LEAVE the glider parked (owner respec
+		// 2026-09-05). Airborne: bail out, the v1 behaviour. The glider knows
+		// which; this file does not need to.
+		Glider->ExitToStoredPawn();
 		return;
 	}
+
+	// Walk-up boarding, generalized (owner respec 2026-09-05): E boards the
+	// NEAREST boardable vehicle -- an uncrewed boat or a parked, uncrewed
+	// glider -- each within its own interact range. THE TIE RULE: on an exact
+	// distance tie the boat wins, by construction of the comparison below (the
+	// glider must be STRICTLY nearer to take the key); arbitrary, but stated,
+	// deterministic, and cheap to remember.
+	// Named to dodge C4458: 'Pawn' is AController's own member.
+	APawn* InteractPawn = GetPawn();
+	if (!InteractPawn)
+	{
+		return;
+	}
+	const FVector From = InteractPawn->GetActorLocation();
+	AVoxelBoat* Boat = AVoxelBoat::FindNearest(GetWorld(), From, VoxelBoatTuning::InteractRangeUU);
+	AVoxelGlider* Glider =
+		AVoxelGlider::FindNearestParked(GetWorld(), From, VoxelGliderTuning::InteractRangeUU);
+	if (Boat && Glider)
+	{
+		if (FVector::DistSquared(From, Glider->GetActorLocation())
+		    < FVector::DistSquared(From, Boat->GetActorLocation()))
+		{
+			Boat = nullptr;
+		}
+		else
+		{
+			Glider = nullptr;
+		}
+	}
+	if (Boat)
+	{
+		Boat->Enter(this);
+		return;
+	}
+	if (Glider)
+	{
+		Glider->Board(this);
+		return;
+	}
+	// Nothing in range. Each class logs its own say-why line (counts and a
+	// spawn hint) -- two lines, but "I pressed E and nothing happened" is the
+	// report that costs an evening, and the two halves have different answers.
 	AVoxelBoat::TryEnterNearest(this);
+	AVoxelGlider::TryBoardNearest(this);
 }
 
 void AVoxelEarthPlayerController::OnGliderDeploy()

@@ -79,6 +79,7 @@
 
 #include <memory>
 #include <algorithm>
+#include <utility> // std::move -- the §13 step window is handed to stepWithOrder by move
 #include <vector>
 
 // ADR-0003 item 2/4 (docs/adr/0003-hydrostatic-persistent-body.md): toggles
@@ -369,6 +370,104 @@ static TAutoConsoleVariable<int32> CVarVoxelWaterCeilingReliefBudget(
 	TEXT("advanceFront and only while at the ceiling, so a world under its ceiling never pays for it. ")
 	TEXT("'Reclaim, then refuse' -- whatever this frees is visible to the rest of that same call. ")
 	TEXT("0 = refuse without reclaiming first (the ceiling still holds, it just holds by refusing)."),
+	ECVF_Default);
+
+// --- backlog §13 CONTAINMENT: the interactive-rate bound ---------------------
+//
+// THE BUG THESE THREE EXIST FOR. One explosive charge thrown near the judged
+// lake collapsed the frame rate PERMANENTLY (backlog §13, owner 2026-09-06).
+// The mechanism is not the carve -- that is a one-shot edit -- it is what the
+// carve starts:
+//
+//   1. CarveSphere -> NotifyTerrainRegionEdited -> mobilizeEditRegion. The
+//      crater is a DRAIN below the lake surface, so the water it releases keeps
+//      moving.
+//   2. StepFixed calls WaterMobilizer::advanceFront before every ca.step(), and
+//      waterca.h says in its own words that it "has NO LENGTH BOUND ... it is
+//      DRAINAGE, not disturbance, that runs away". Every freshly mobilized
+//      brick is filled and woken, so it is active next tick and the front has
+//      more neighbours to eat. The active set grows monotonically.
+//   3. WaterCA::step() is ATOMIC over its whole active set -- there is no safe
+//      mid-step cutoff -- and voxel.Water.MaxActiveBricks was only ever a
+//      LOG-THROTTLED WARNING. So the per-frame cost tracked the runaway with
+//      nothing bounding it.
+//
+// Measured, on the same shape (a breach into the open sea, from
+// docs/water-map/ocean-captures.md "Two defects this turned up" #2):
+//
+//     activeBricks   19,636 -> 41,613      (monotone)
+//     volume        501.0M -> 884.4M units (monotone)
+//     water tickMs   2,000 -> 2,547 ms     (against a 10 Hz fixed step)
+//
+// 2.5 SECONDS of game thread per water tick is the owner's "never recovered"
+// exactly. Nothing in that loop decays, so nothing ever gave it back.
+//
+// THIS IS CONTAINMENT, NOT THE REWORK. The CA rework is backlog §12 (owner
+// ruling: "CA sim is terrible and needs to be reworked"); §13's bar is only
+// that a single charge cost a BOUNDED, DECAYING spike. All four knobs below
+// are pure POLICY on the ENGINE side of voxel-core: no tick rule changes, no
+// kWaterCAVersion bump, nothing persisted, nothing digested, nothing
+// replicated. Set all four to 0 and this file is byte-identical in behaviour
+// to the pre-§13 build, which is the off-arm the doctrine demands.
+//
+// THE SAFETY ARGUMENT IS voxel-core's OWN, not a new one. Both the front gate
+// and the per-tick step budget refuse to SCHEDULE work; neither writes or drops
+// a single fill unit. waterca.h: "a brick the front does not mobilize is STILL
+// A WALL, so its water is frozen, not duplicated and not lost", and "waking is
+// purely a SCHEDULING act, never a source or sink". Frozen is a visual lag; the
+// conservation ledger cannot tell a deferral from a gate.
+//
+// DETERMINISM: every predicate below reads AUTHORITY STATE ONLY (active-brick
+// counts and a step counter). No wall clock, no frame time, no local frame
+// rate -- the same purity waterca.h demands of the front gate itself.
+static TAutoConsoleVariable<int32> CVarVoxelWaterFrontActiveBudget(
+	TEXT("voxel.Water.FrontActiveBudgetBricks"), 256,
+	TEXT("Backlog §13 containment, STOP THE GROWTH: while the CA already has at least this ")
+	TEXT("many ACTIVE bricks, WaterMobilizer's activity-driven front stops converting implicit water. This ")
+	TEXT("is the one-line `setFrontGate` seam waterca.h §9a always documented and this file deliberately ")
+	TEXT("left empty until a freeze owner appeared -- §13 is that owner, and unlike the demote-cooldown ")
+	TEXT("policy that was measured and rejected, a cost budget is MONOTONE by construction (refuse over the ")
+	TEXT("line, allow under it), so it has no knife-edge to tune. EDITS ARE EXEMPT BY CONSTRUCTION: ")
+	TEXT("mobilizeEditRegion is never gated, so digging into a lake always releases its water. 0 = no gate ")
+	TEXT("(the pre-§13 runaway)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterStepBudgetBricks(
+	TEXT("voxel.Water.StepBudgetBricks"), 512,
+	TEXT("Backlog §13 containment, BOUND PHASES A/B: the most bricks ONE fixed step may advance. Over ")
+	TEXT("budget, StepFixed steps a ROTATING WINDOW of exactly this many through WaterCA::stepWithOrder -- ")
+	TEXT("whose contract is that any key set is a legal tick -- and re-arms the remainder with markActive(), ")
+	TEXT("which writes no fill. Every brick therefore still gets stepped, just over several ticks instead of ")
+	TEXT("one, and a brick that settles inside its window leaves the active set for good: the set DRAINS. ")
+	TEXT("Bounds the two-phase read/apply only -- Phase C's hydrostatic flood follows water past any window, ")
+	TEXT("which is what ActiveCeilingBricks below is for. Costs one std::set insert per deferred brick per ")
+	TEXT("step. 0 = step the whole active set atomically (the pre-§13 behaviour)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterActiveCeilingBricks(
+	TEXT("voxel.Water.ActiveCeilingBricks"), 2048,
+	TEXT("Backlog §13 containment, THE HARD BOUND: an active set larger than this is settled by force ")
+	TEXT("(stepWithOrder({}) -- the set is cleared, no fill is written, nothing is lost) instead of stepped. ")
+	TEXT("It exists because the step budget CANNOT bound Phase C: the hydrostatic flood seeds from the ")
+	TEXT("stepped bricks but then follows water anywhere, so one seed in a mobilized lake floods the whole ")
+	TEXT("lake every step however few bricks were stepped -- which is where the measured 2,547 ms tick went. ")
+	TEXT("Refusing to step such a body is the only lever this side of voxel-core has on that cost. ")
+	TEXT("PROVISIONAL VALUE: half the long-standing voxel.Water.MaxActiveBricks advisory (4096) and 20x ")
+	TEXT("below the measured runaway (41,613); the §13 verify leg should retune it against real frame times. ")
+	TEXT("0 = no ceiling (the pre-§13 behaviour, and what hung the 2026-09-06 session)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterSettleForceSteps(
+	TEXT("voxel.Water.SettleForceSteps"), 300,
+	TEXT("Backlog §13 containment, the PLATEAU BACKSTOP: consecutive over-budget fixed steps during which ")
+	TEXT("the active set never falls at least 1/16 below its own high-water mark before the containment ")
+	TEXT("FORCES a settle. 300 = 30 s at the 10 Hz fixed step. It catches what the ceiling does not: a body ")
+	TEXT("small enough to step and still never converging (a front feeding itself, a component that cannot ")
+	TEXT("level), which would otherwise be a permanently smaller frame rate for the rest of the session. Any ")
+	TEXT("real progress re-arms the counter, so a draining pour never reaches it. The water freezes exactly ")
+	TEXT("where it stands -- no fill written, ledger unmoved, next edit wakes it. Logged as an Error because ")
+	TEXT("a world that reaches this is degraded and wants the §12 rework, not a bigger budget. 0 = never ")
+	TEXT("force on a plateau (the ceiling above still holds)."),
 	ECVF_Default);
 
 namespace
@@ -1015,28 +1114,68 @@ struct FVoxelWaterImpl
 				}
 			});
 
-		// THE FRONT GATE (work item 9a) IS DELIBERATELY LEFT UNINSTALLED, and
-		// that is a measured decision rather than an omission -- see this
-		// change's commit message and the four C8e tests in voxel-core.
+		// THE FRONT GATE (work item 9a) USED TO BE DELIBERATELY UNINSTALLED, and
+		// the argument for that is kept here in full because it is still true of
+		// the policy it was written about:
 		//
-		// The gate is a predicate that freezes a reach the AUTHORITY has decided
-		// to dry out by changing the datum (§6.3.3). Nothing in this engine
-		// drives such a decision yet: there is no datum-override registry and no
-		// caller that would populate one. The obvious candidate policy -- a
-		// cooldown that refuses to re-mobilize a brick just demoted, to stop the
-		// return path thrashing against the front -- was built and measured, and
-		// it is NOT shippable: its effect is non-monotonic in the cooldown length
-		// (on the reference breach, 8 steps left the runaway untouched, 10 steps
-		// made peak mobilization roughly DOUBLE the ungated run, and 16 steps
-		// fixed it) and it collapsed to no effect at all on a breach four times
-		// the size. That is a knife-edge in a chaotic response surface, not a
-		// policy, and layering it over the primitive would have hidden the real
-		// finding: what breaks a large breach is kMaxHydrostaticComponentCells,
-		// which sits upstream of every lever 9a/9b/9c provide.
+		//   The gate is a predicate that freezes a reach the AUTHORITY has
+		//   decided to dry out by changing the datum (§6.3.3). Nothing in this
+		//   engine drives such a decision yet: there is no datum-override
+		//   registry and no caller that would populate one. The obvious
+		//   candidate policy -- a cooldown that refuses to re-mobilize a brick
+		//   just demoted, to stop the return path thrashing against the front --
+		//   was built and measured, and it is NOT shippable: its effect is
+		//   non-monotonic in the cooldown length (on the reference breach, 8
+		//   steps left the runaway untouched, 10 steps made peak mobilization
+		//   roughly DOUBLE the ungated run, and 16 steps fixed it) and it
+		//   collapsed to no effect at all on a breach four times the size. That
+		//   is a knife-edge in a chaotic response surface, not a policy.
 		//
-		// The seam is one line (`Mob.setFrontGate(...)`) whenever a real freeze
-		// owner appears. Until then the mechanism stays proven and unused rather
-		// than used and unjustified.
+		//   The seam is one line (`Mob.setFrontGate(...)`) whenever a real freeze
+		//   owner appears.
+		//
+		// BACKLOG §13 IS THAT OWNER, and the gate it installs is a different
+		// animal from the rejected cooldown in the one way that matters: it is
+		// MONOTONE. "Refuse while the sim already has more work than it can
+		// afford, allow when it does not" has no cooldown length to sit on the
+		// wrong side of, cannot double the peak it is bounding, and does not
+		// scale with the breach -- a bigger breach simply hits the line sooner.
+		// It is a COST bound and makes no claim to be a correctness one; what
+		// actually makes a large body level is kMaxHydrostaticComponentCells and
+		// its streaming path, upstream of every lever 9a/9b/9c provide, and this
+		// gate does not pretend otherwise.
+		//
+		// WHY IT HAS TO BE THE FRONT and not just the step budget below: without
+		// it the mobilized set keeps growing even while the step budget holds the
+		// frame together, so a single charge would still convert an entire lake
+		// from implicit (free, zero storage, re-derivable from the seed) to CA
+		// (stored, replicated, persisted) -- permanent damage to the world, paid
+		// for in memory and save size long after the frame recovered.
+		//
+		// `this` is safe to capture for the same reason the relief hook above is.
+		Mob.setFrontGate(
+			[this](const vxc::BrickKey&)
+			{
+				const int32 Budget = CVarVoxelWaterFrontActiveBudget.GetValueOnGameThread();
+				if (Budget <= 0)
+				{
+					return true; // gate disarmed: the pre-§13 path, byte for byte
+				}
+				// AUTHORITY ONLY, exactly as the relief hook is: advanceFront is
+				// only reached from StepFixed, but a client's CA is a replication
+				// mirror whose active set lags, so a gate answering off it would
+				// refuse where the authority accepted.
+				if (!bAuthority)
+				{
+					return true;
+				}
+				// The predicate is per-CALL, not per-brick: every candidate in
+				// one advanceFront sees the same answer, so the gate cannot
+				// smear a partial shell across the world. Deliberately reads the
+				// ACTIVE set (the thing that costs) rather than the mobilized set
+				// (which the §6.5.5 ceiling already bounds).
+				return CA.activeBrickCount() < size_t(Budget);
+			});
 	}
 
 	UVoxelWorldSubsystem& Terrain;
@@ -1646,6 +1785,34 @@ struct FVoxelWaterImpl
 	// step() to fold it into the CA's own active set, so a fresh pour is
 	// visible the same frame it's placed.
 	TSet<VoxelCoords::FVoxelCoord> DirtyBricks;
+
+	// --- backlog §13 containment bookkeeping --------------------------------
+	//
+	// All authority-side POLICY state: never persisted, never digested, never
+	// replicated, and reset to these values by a fresh world. Nothing here can
+	// move a fill unit -- see the cvar block for the whole argument.
+	//
+	// The cursor is what makes the step budget a ROTATION rather than a prefix.
+	// A prefix of a BrickKeyLess-ordered snapshot is spatially biased (it is the
+	// world's -x/-y/-z corner), so the near corner of a lake would step forever
+	// while the far corner never ticked at all. Rotating spends the same budget
+	// and starves nothing. Monotone uint64: it indexes modulo the CURRENT active
+	// count, so it stays valid as the set shrinks.
+	uint64 CaStepCursor = 0;
+	// The active-brick count the plateau detector is measuring progress against,
+	// and how many consecutive over-budget steps have failed to beat it. Both 0
+	// whenever the sim is inside its budget, so a healthy world never arms the
+	// backstop.
+	size_t CaPlateauRefBricks = 0;
+	int32 CaPlateauSteps = 0;
+	// Engagement counters for the `WaterContain:` line (§13's grep contract).
+	// Honest counters: bricks the LAST step deferred, steps that deferred
+	// anything at all this session, and forced settles this session.
+	int32 CaDeferredLastStep = 0;
+	int64 CaBudgetedSteps = 0;
+	int64 CaForcedSettles = 0;
+	// 5 s log throttle for the forced settle, matching the two alarms above it.
+	double LastForcedSettleWarnWorldSeconds = -1000.0;
 
 	// --- Perf / HUD bookkeeping (task item 3) -------------------------------
 	float PerfRefreshAccumSeconds = 0.f;
@@ -6150,6 +6317,46 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	       (FPlatformTime::Seconds() - ArmStartSeconds) * 1000.0);
 }
 
+// --- backlog §13 containment: the forced settle ------------------------------
+//
+// WHAT IT DOES, EXACTLY: hands WaterCA an EMPTY key set. That is voxel-core's
+// own settled-tick path (`stepWithOrder` early-returns on an empty order), it
+// clears the active set, and it writes NOTHING -- no fill moves, totalVolume()
+// does not change by a unit, no edit-log entry, no digest change. The water
+// stops where it stands and any later terrain edit wakes it again through
+// NotifyTerrainRegionEdited -> wakeRegion, exactly as a settled pond does.
+//
+// WHY THAT IS SOUND rather than a fudge: it is the same trade the front budget
+// and the front gate already rest on, and waterca.h states it for both -- a
+// brick that is not scheduled is "frozen, not duplicated and not lost", and
+// "frozen is a visual lag measured in tenths of a second; duplicated is a
+// broken world". Freezing is the ONLY containment lever that cannot corrupt.
+//
+// The log is an Error and 5 s-throttled: reaching this means the world is
+// degraded and wants the §12 CA rework, and a per-step transcript of a stall is
+// how a genuinely useful line gets ignored.
+void ForceWaterSettle(FVoxelWaterImpl& Impl, double NowWorldSeconds, const TCHAR* Why)
+{
+	const size_t Frozen = Impl.CA.activeBrickCount();
+	Impl.CA.stepWithOrder(std::vector<vxc::BrickKey>{});
+	++Impl.CaForcedSettles;
+	Impl.CaPlateauRefBricks = 0;
+	Impl.CaPlateauSteps = 0;
+
+	if (NowWorldSeconds - Impl.LastForcedSettleWarnWorldSeconds <= 5.0)
+	{
+		return;
+	}
+	Impl.LastForcedSettleWarnWorldSeconds = NowWorldSeconds;
+	UE_LOG(LogVoxelWater, Error,
+	       TEXT("WaterContain: FORCED SETTLE of %llu active brick(s) -- %s. No fill was written: volume=%llu, ")
+	       TEXT("mobilized=%llu, both unchanged by this. The water is FROZEN where it stands, not lost, and the ")
+	       TEXT("next terrain edit wakes it. This is backlog §13 containment firing, which means the world wants ")
+	       TEXT("the §12 CA rework rather than a bigger budget. Forced settles this session: %lld."),
+	       (unsigned long long)Frozen, Why, (unsigned long long)Impl.CA.totalVolume(),
+	       (unsigned long long)Impl.Mob.mobilizedBricks().size(), (long long)Impl.CaForcedSettles);
+}
+
 void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 {
 	// ADR-0003 item 4: re-check the cvar every fixed step (cheap -- a bool
@@ -6367,9 +6574,131 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 		MarkSweDepthChangesDirty(Impl);
 	}
 
-	Impl.CA.step();
+	// --- backlog §13 containment: THE CEILING, THEN THE BUDGET --------------
+	//
+	// TWO SEPARATE BOUNDS BECAUSE THE STEP HAS TWO SEPARATE COSTS, and only one
+	// of them can be bounded by stepping fewer bricks. Stated plainly because
+	// getting this wrong is exactly how a containment ships that does not
+	// contain:
+	//
+	//   PHASES A/B (the two-phase read/apply) cost O(`touched`), and `touched`
+	//   is derived from the key set handed to the step. A smaller set is a
+	//   cheaper -- and complete, and atomic -- tick: `stepWithOrder`'s contract
+	//   is that "any permutation of the same key set is accepted and ... produces
+	//   byte-identical resulting WaterMap contents". So the budget below is a
+	//   SMALLER STEP, never a cutoff inside one.
+	//
+	//   PHASE C (the hydrostatic level pass) is NOT bounded by that, and no
+	//   budget here can bound it. Its flood seeds from water cells in `touched`
+	//   but then follows WATER in any direction whether or not the brick is
+	//   touched (waterca.cpp: "a neighbour that HOLDS WATER (fill > 0) is always
+	//   explorable ... whether or not its brick is `touched`"), so one seed
+	//   anywhere in a mobilized lake costs a flood over the WHOLE lake, every
+	//   step, however few bricks were stepped. That is where the measured
+	//   2,547 ms went.
+	//
+	// Hence the ceiling: the only bound on Phase C available from this side of
+	// voxel-core is to REFUSE TO STEP a body the frame cannot afford at all. It
+	// is the hard guarantee -- an active set over the ceiling is settled by
+	// force, immediately, and the next step over an empty set is free. Together
+	// with the front gate (which stops such a body forming in the first place)
+	// that is §13's "bounded, decaying spike" in two lines.
+	const int32 StepBudgetBricks = CVarVoxelWaterStepBudgetBricks.GetValueOnGameThread();
+	const int32 ActiveCeilingBricks = CVarVoxelWaterActiveCeilingBricks.GetValueOnGameThread();
+	const size_t ActiveBeforeStep = Impl.CA.activeBrickCount();
+	Impl.CaDeferredLastStep = 0;
+
+	if (ActiveCeilingBricks > 0 && ActiveBeforeStep > size_t(ActiveCeilingBricks))
+	{
+		ForceWaterSettle(Impl, NowWorldSeconds,
+		                 TEXT("the active set is over voxel.Water.ActiveCeilingBricks, and Phase C's ")
+		                 TEXT("hydrostatic flood over a body that size cannot be made to fit in a frame"));
+	}
+	else if (StepBudgetBricks > 0 && ActiveBeforeStep > size_t(StepBudgetBricks))
+	{
+		// THE ROTATING WINDOW. It DRAINS, which is the property §13 demands:
+		// stepWithOrder rebuilds the active set from the bricks its own window
+		// CHANGED (plus their face neighbours), so a brick that settles inside
+		// its window is gone from the set for good. The deferred remainder is
+		// put straight back with markActive -- "waking is purely a SCHEDULING
+		// act, never a source or sink" -- so nothing is dropped and every brick
+		// is stepped within ceil(active/budget) ticks.
+		const std::vector<vxc::BrickKey> Snapshot = Impl.CA.activeSetSnapshot();
+		const size_t Count = Snapshot.size();
+		const size_t Window = FMath::Min(size_t(StepBudgetBricks), Count);
+		const size_t Start = size_t(Impl.CaStepCursor % uint64(Count));
+
+		std::vector<vxc::BrickKey> Order;
+		Order.reserve(Window);
+		for (size_t I = 0; I < Window; ++I)
+		{
+			Order.push_back(Snapshot[(Start + I) % Count]);
+		}
+		// Advance by exactly the window so consecutive over-budget steps sweep
+		// the whole set and then wrap -- no brick can be starved.
+		Impl.CaStepCursor += uint64(Window);
+
+		Impl.CA.stepWithOrder(std::move(Order));
+
+		// RE-ARM THE REMAINDER, AND IT MUST BE AFTER THE STEP: stepWithOrder
+		// REPLACES the active set with its own result, so re-arming beforehand
+		// would be overwritten and the deferred bricks really would freeze.
+		for (size_t I = Window; I < Count; ++I)
+		{
+			Impl.CA.markActive(Snapshot[(Start + I) % Count]);
+		}
+		Impl.CaDeferredLastStep = int32(Count - Window);
+		++Impl.CaBudgetedSteps;
+	}
+	else
+	{
+		Impl.CA.step();
+	}
 	++Impl.StepsThisWindow;
 	Impl.LastSteppedBrickCount = int32(Impl.CA.steppedBrickCount());
+
+	// --- backlog §13 containment: THE PLATEAU BACKSTOP ----------------------
+	//
+	// The ceiling catches the body that is too big to step at all; this catches
+	// the one that is small enough to step and still never converges -- a front
+	// feeding itself, a component that cannot level -- which would otherwise sit
+	// at the budget for the rest of the session. That is a permanently smaller
+	// frame rate, and §13's bar is "no permanent FPS loss", so it has to end.
+	//
+	// Progress is "the active set fell at least 1/16 below the mark it was
+	// measured against", and any such fall re-arms the whole counter. 1/16
+	// rather than "fell at all" because a set that jitters by a brick or two is
+	// not converging, it is idling at cost. A genuinely draining pour resets
+	// this repeatedly and never reaches the limit.
+	//
+	// Counted in STEPS, not seconds, so the predicate stays a pure function of
+	// authority state -- the same purity waterca.h demands of the front gate.
+	if (ActiveBeforeStep > size_t(FMath::Max(StepBudgetBricks, 1)))
+	{
+		const size_t ActiveAfterStep = Impl.CA.activeBrickCount();
+		if (Impl.CaPlateauRefBricks == 0 || ActiveAfterStep * 16 < Impl.CaPlateauRefBricks * 15)
+		{
+			Impl.CaPlateauRefBricks = ActiveAfterStep;
+			Impl.CaPlateauSteps = 0;
+		}
+		else
+		{
+			++Impl.CaPlateauSteps;
+		}
+
+		const int32 ForceSteps = CVarVoxelWaterSettleForceSteps.GetValueOnGameThread();
+		if (ForceSteps > 0 && Impl.CaPlateauSteps >= ForceSteps)
+		{
+			ForceWaterSettle(Impl, NowWorldSeconds,
+			                 TEXT("the active set held above voxel.Water.StepBudgetBricks for ")
+			                 TEXT("voxel.Water.SettleForceSteps consecutive steps without converging"));
+		}
+	}
+	else
+	{
+		Impl.CaPlateauRefBricks = 0;
+		Impl.CaPlateauSteps = 0;
+	}
 
 	if (bSweArmed)
 	{
@@ -6450,6 +6779,15 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	//
 	// Deliberately NOT added to DirtySinceLastBroadcast: a settle carries no fill
 	// change, so replicating it would spend bandwidth on a diff that is empty.
+	//
+	// THE BROADCAST SET IS GATED ON bReplicating, and that is the same argument
+	// PendingRemovals below already makes for itself: BroadcastWaterDiffs is the
+	// only thing that ever drains this set and Tick only calls it when
+	// NetMode != NM_Standalone. Filling it in a standalone session was inserting
+	// every active brick, every fixed step, into a set nobody would ever read --
+	// free while water is a puddle, and during the backlog §13 runaway a
+	// five-figure set re-inserted forty times a second in the one configuration
+	// the owner actually plays.
 	TSet<VoxelCoords::FVoxelCoord> NowActive;
 	NowActive.Reserve(int32(Impl.CA.activeBricks().size()));
 	for (const vxc::BrickKey& K : Impl.CA.activeBricks())
@@ -6457,7 +6795,10 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 		const VoxelCoords::FVoxelCoord C = ToCoord(K);
 		NowActive.Add(C);
 		Impl.DirtyBricks.Add(C);
-		Impl.DirtySinceLastBroadcast.Add(C);
+		if (Impl.bReplicating)
+		{
+			Impl.DirtySinceLastBroadcast.Add(C);
+		}
 	}
 	for (const VoxelCoords::FVoxelCoord& C : Impl.ActiveBricks)
 	{
@@ -6565,18 +6906,23 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	}
 
 	// Task item 3: "if steppedBrickCount exceeds a cvar cap ... log-throttle
-	// warning (do not explode)". The CA's tick contract (waterca.h) is
-	// atomic over its whole active-set snapshot -- there is no safe mid-step
-	// cutoff that wouldn't break volume conservation/determinism -- so this
-	// is purely a monitoring signal, not a clamp.
+	// warning (do not explode)". Still a MONITORING signal and not a clamp --
+	// but it is no longer the only thing standing between the CA and a runaway.
+	// Backlog §13 added voxel.Water.StepBudgetBricks, which bounds what one step
+	// may advance by handing WaterCA a smaller (complete, atomic) key set rather
+	// than by cutting a step in half; this line now reports what actually ran,
+	// so with the budget armed it fires only when the budget itself is set above
+	// this cap. The two are deliberately separate: this one is "the world got
+	// bigger than we planned for", §13's is "and the frame must survive it".
 	const int32 Cap = VoxelDebug::GetWaterMaxActiveBricks();
 	if (Cap > 0 && Impl.LastSteppedBrickCount > Cap && (NowWorldSeconds - Impl.LastBudgetWarnWorldSeconds) > 5.0)
 	{
 		Impl.LastBudgetWarnWorldSeconds = NowWorldSeconds;
 		UE_LOG(LogVoxelWater, Warning,
-		       TEXT("WaterCA over budget: steppedBrickCount=%d > voxel.Water.MaxActiveBricks=%d (tick ran in full -- ")
-		       TEXT("no safe mid-step cutoff exists; raise the cap or investigate runaway spread)."),
-		       Impl.LastSteppedBrickCount, Cap);
+		       TEXT("WaterCA over budget: steppedBrickCount=%d > voxel.Water.MaxActiveBricks=%d (active=%llu; the ")
+		       TEXT("step ran in full over the set it was given -- lower voxel.Water.StepBudgetBricks to bound it, ")
+		       TEXT("or investigate runaway spread)."),
+		       Impl.LastSteppedBrickCount, Cap, (unsigned long long)Impl.CA.activeBrickCount());
 	}
 }
 
@@ -7109,6 +7455,28 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 			StepFixed(*Impl, NowWorldSeconds);
 			++StepsThisFrame;
 		}
+		// DROP THE DEBT THE STEP CAP REFUSED TO PAY (backlog §13).
+		//
+		// MaxStepsPerFrame was called a "spiral-of-death guard" and it is only
+		// half of one: it bounds the steps taken in a frame but nothing bounded
+		// the ACCUMULATOR, so a frame slower than MaxStepsPerFrame * FixedStep
+		// (0.4 s) left more debt behind than it paid off. Once the water tick
+		// itself is what makes frames that slow -- which is precisely the §13
+		// collapse, measured at 2.5 s per tick -- the accumulator grows without
+		// bound and the sim is pinned at the maximum catch-up rate FOREVER,
+		// including long after the water would otherwise have gone quiet. A
+		// spiral needs both ends closed.
+		//
+		// Dropping the debt is the standard, and the honest, resolution: the
+		// simulation runs slower than wall-clock during a hitch instead of
+		// trying to make it up, which for a water sim is invisible (its clock is
+		// not the player's) and is already what MaxStepsPerFrame was choosing on
+		// that frame anyway. Costs one compare per tick and is a no-op in every
+		// frame that keeps up.
+		if (Impl->TickAccumSeconds > FVoxelWaterImpl::FixedStepSeconds)
+		{
+			Impl->TickAccumSeconds = FVoxelWaterImpl::FixedStepSeconds;
+		}
 
 		if (World && NetMode != NM_Standalone)
 		{
@@ -7268,6 +7636,43 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 			       TEXT("WaterPerf: activeBricks=%lld stored=%lld volume=%llu steps/s=%.1f tickMs=%.3f replKB/s=%.2f"),
 			       Snap.ActiveBricks, Snap.StoredBricks, (unsigned long long)Snap.TotalVolume, Snap.StepsPerSec, Snap.TickMs,
 			       Snap.ReplicatedBytesPerSec / 1024.0);
+		}
+
+		// --- backlog §13 ENGAGEMENT LINE, 1 Hz ------------------------------
+		//
+		// THE GREP CONTRACT: `WaterContain:`. This is the line that answers the
+		// only question §13's verify leg has to ask -- does the spike DECAY --
+		// and it answers it without a profiler: throw one charge at the lake
+		// shore and watch `active=` fall back to 0 over a handful of lines. A
+		// leg where `active=` plateaus while `deferred=` stays non-zero is a
+		// failed leg, and it is the exact shape the collapse had (the ocean
+		// breach capture logged activeBricks 19,636 -> 41,613, MONOTONE).
+		//
+		// SILENT WHEN IDLE, and deliberately not merged into WaterPerf above:
+		// WaterPerf prints whenever any water is STORED, which is most of the
+		// time on a coastal world, and a containment counter that prints zeros
+		// forever is a counter nobody reads. This prints only while the
+		// containment is actually engaged or the CA is actually busy.
+		//
+		// Honest counters, all of them: `active` is the live set, `deferred` is
+		// what the LAST step put back rather than a running total, `steps` and
+		// `forced` are session lifetime, `frontRefused` is the mobilizer's own
+		// per-consideration count (a rate signal, not an inventory -- waterca.h
+		// says so at the accessor), and `mobilized` is the set the front gate
+		// exists to stop growing.
+		const bool bContainEngaged = Impl->CaDeferredLastStep > 0 || Impl->CaBudgetedSteps > 0 ||
+		                             Impl->CaForcedSettles > 0 || Snap.ActiveBricks > 0;
+		if (bContainEngaged)
+		{
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("WaterContain: active=%lld deferred=%d budget=%d ceiling=%d budgetedSteps=%lld ")
+			       TEXT("forced=%lld plateauSteps=%d frontRefused=%llu mobilized=%llu tickMs=%.3f"),
+			       Snap.ActiveBricks, Impl->CaDeferredLastStep,
+			       CVarVoxelWaterStepBudgetBricks.GetValueOnGameThread(),
+			       CVarVoxelWaterActiveCeilingBricks.GetValueOnGameThread(), (long long)Impl->CaBudgetedSteps,
+			       (long long)Impl->CaForcedSettles, Impl->CaPlateauSteps,
+			       (unsigned long long)Impl->Mob.frontGateRefusals(),
+			       (unsigned long long)Impl->Mob.mobilizedBricks().size(), Snap.TickMs);
 		}
 
 		// Phase A tide engagement, on the same 1Hz cadence, ONLY while armed

@@ -507,6 +507,32 @@ namespace VoxelGliderTuning
 	inline constexpr double DitchSplashRadiusM = 1.6;
 	inline constexpr double DitchSplashStrengthM = 0.11;
 
+	// --- parking + boarding (owner respec 2026-09-05) -------------------------
+	//
+	// The owner's live-session verdict overruled v1's "a glider never outlives
+	// its flight": landed gliders now PERSIST, resting on the surface, and are
+	// boarded with the interact key exactly like a boat. UNJUDGED, like the
+	// rest of this block -- sized to match VoxelBoatTuning's equivalents.
+
+	// How close the player must be for the interact key to find a parked
+	// glider. Same figure as the boat's on purpose: one reach for one key.
+	inline constexpr double InteractRangeUU = 400.0; // 4 m
+
+	// Dismounting puts the pilot off the wingtip (clear of the span), feet on
+	// the ground found by raycast; the lift is the fallback when the column
+	// under the exit point has not streamed.
+	inline constexpr double ExitSideClearanceUU = 90.0;
+	inline constexpr double ExitLiftUU = 100.0;
+
+	// Ground launch from a parked glider: no takeoff run in v2 (out of scope,
+	// stated in the plan's execution log) -- the first W or Space aboard a
+	// parked glider is an impulse along the wing's forward at this pitch and
+	// speed. The speed clears MinAirspeedMS + AeroFadeBandMS (6 m/s) with
+	// margin, so the wing is fully aerodynamic from the first tick and does
+	// not drop back onto the ground it just left.
+	inline constexpr double LaunchSpeedMS = 15.0;
+	inline constexpr double LaunchPitchDeg = 12.0;
+
 	// --- launch ---------------------------------------------------------------
 
 	// Deploy gives this much airspeed along the view direction, so a glider

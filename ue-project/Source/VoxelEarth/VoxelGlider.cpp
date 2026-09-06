@@ -135,6 +135,11 @@ void AVoxelGlider::BeginPlay()
 		{
 			Body->SetRelativeLocation(-B.GetCenter());
 			NoseOffsetUU = B.GetExtent().X;
+			// Belly and span follow the thing on screen, the boat's
+			// AdoptHullFromBody discipline: a parked glider whose belly constant
+			// disagreed with its drawn underside would hover or sink visibly.
+			BellyOffsetUU = -B.GetExtent().Z;
+			HalfSpanUU = B.GetExtent().Y;
 		}
 	}
 
@@ -175,6 +180,31 @@ void AVoxelGlider::Tick(float DeltaSeconds)
 	{
 		return;
 	}
+
+	// --- parked: inert on purpose --------------------------------------------
+	//
+	// No aero, no integration, no terrain probes -- a parked glider is scenery
+	// that can be boarded, and Ticks stays a FLIGHT counter (ParkTicks counts
+	// this state, so voxel.Glider.Stat can tell "parked all along" from "never
+	// ticked"). The only live inputs are the launch keys and the look camera.
+	if (bParked)
+	{
+		++ParkTicks;
+		if (StoredPawn.IsValid() && (bLaunchPressed || PitchInput < -0.5f))
+		{
+			// W is the pitch axis at -1 (nose down, the "push forward" key) and
+			// Space is the bound launch action; either reads as "go".
+			Launch(bLaunchPressed ? TEXT("Space") : TEXT("W"));
+		}
+		bLaunchPressed = false;
+		if (CameraArm)
+		{
+			CameraArm->SetRelativeRotation(
+				FRotator(float(CameraPitchDeg), float(CameraYawDeg), 0.f));
+		}
+		return;
+	}
+
 	++Ticks;
 
 	using namespace VoxelGliderTuning;
@@ -338,12 +368,21 @@ bool AVoxelGlider::CheckTerrain(float DeltaSeconds)
 
 	if (Clearance <= TouchdownClearanceUU)
 	{
+		// PARK, do not destroy (owner respec 2026-09-05). v1 funnelled this
+		// into ReturnPilot, whose unconditional Destroy() is exactly the
+		// "despawned or fell through the surface" the owner reported on the
+		// spawned glider: with no StoredPawn there was nobody to repossess and
+		// the actor simply vanished at ground contact. Now the glider settles
+		// onto the raycast surface and STAYS; a pilot aboard stays aboard,
+		// with the launch keys live and E to dismount.
+		SettleParked(SurfaceTopZ);
 		UE_LOG(LogVoxelEarth, Log,
-		       TEXT("VoxelGlider: LANDED at (%.0f,%.0f,%.0f) after %llu ticks (%llu with aero). ")
-		       TEXT("Airspeed %.1f m/s, alpha %.1f deg, instantaneous L/D %.2f, wind %.1f m/s."),
+		       TEXT("VoxelGlider: LANDED and parked at (%.0f,%.0f,%.0f) after %llu ticks (%llu with ")
+		       TEXT("aero). Airspeed was %.1f m/s, alpha %.1f deg, L/D %.2f, wind %.1f m/s. %s"),
 		       Loc.X, Loc.Y, SurfaceTopZ, (unsigned long long)Ticks, (unsigned long long)AeroTicks,
-		       LastAirspeedMS, LastAlphaDeg, LastGlideRatio, LastWindMS);
-		ReturnPilot(FVector(Loc.X, Loc.Y, SurfaceTopZ + VoxelMovementTuning::StandHalfExtentZ));
+		       LastAirspeedMS, LastAlphaDeg, LastGlideRatio, LastWindMS,
+		       IsCrewed() ? TEXT("Pilot aboard: W or Space relaunches, E dismounts.")
+		                  : TEXT("Unpossessed: walk up and press E to board."));
 		return true;
 	}
 
@@ -361,6 +400,12 @@ bool AVoxelGlider::CheckTerrain(float DeltaSeconds)
 
 bool AVoxelGlider::CheckWater()
 {
+	// NO HULL WATER-EXCLUSION VOLUME HERE, deliberately (2026-09-05, same
+	// session that gave AVoxelBoat one): a glider never floats -- ditching
+	// destroys it in this function, and it parks on LAND -- so there is no
+	// sustained hull-below-waterline frame for water to clip through. The
+	// stencil-bit-0 contract (Tools/water_hull_mask_graph.py) is ready if a
+	// floating glider ever exists.
 	using namespace VoxelGliderTuning;
 	UWorld* World = GetWorld();
 	UVoxelWaterSubsystem* Water = World ? World->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -422,9 +467,195 @@ void AVoxelGlider::ReturnPilot(const FVector& PilotWorldPos)
 		PC->Possess(Pawn);
 	}
 
-	// A GLIDER IS NEVER LEFT IN THE WORLD. An unpossessed kinematic actor with a
-	// velocity integrates forever and nothing would ever look at it again.
+	// This path DESTROYS: it is the stow, the mid-air bail and the water ditch.
+	// A terrain landing does not come here any more -- it parks (SettleParked),
+	// per the owner's 2026-09-05 respec, and a parked glider is inert rather
+	// than "integrating forever", which was v1's reason for destroying on
+	// every ending.
 	Destroy();
+}
+
+// ---------------------------------------------------------------------------
+// Parking, boarding, launching (owner respec 2026-09-05)
+// ---------------------------------------------------------------------------
+
+void AVoxelGlider::SettleParked(double SurfaceTopZ)
+{
+	// Level pose at the current heading -- a wing at rest sits flat -- with the
+	// BELLY on the voxel top. Setting Z absolutely (rather than nudging by the
+	// clearance) also repairs any penetration a fast final tick stepped into.
+	VelocityUU = FVector::ZeroVector;
+	PitchDeg = 0.0;
+	RollDeg = 0.0;
+	PitchInput = 0.f;
+	RollInput = 0.f;
+	bLaunchPressed = false;
+	SetActorRotation(FRotator(0.f, float(YawDeg), 0.f));
+	FVector Loc = GetActorLocation();
+	Loc.Z = SurfaceTopZ - BellyOffsetUU; // BellyOffsetUU is negative: belly below origin
+	SetActorLocation(Loc, false, nullptr, ETeleportType::TeleportPhysics);
+	bParked = true;
+}
+
+void AVoxelGlider::Launch(const TCHAR* TriggerDesc)
+{
+	using namespace VoxelGliderTuning;
+	if (!bParked || !StoredPawn.IsValid())
+	{
+		return;
+	}
+	bParked = false;
+	bLaunchPressed = false;
+
+	// The simplest honest v2 (logged as such in the plan): an impulse, not a
+	// ground run. Nose up at LaunchPitchDeg, velocity along the wing's own
+	// forward at LaunchSpeedMS -- above the aero fade band, so the wing flies
+	// from its first airborne tick instead of pancaking back onto the ground.
+	PitchDeg = LaunchPitchDeg;
+	RollDeg = 0.0;
+	const FRotator Attitude(float(PitchDeg), float(YawDeg), 0.f);
+	SetActorRotation(Attitude);
+	VelocityUU = Attitude.Vector() * (LaunchSpeedMS * 100.0);
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelGlider: LAUNCHED from park via %s at (%.0f,%.0f,%.0f): %.1f m/s along heading ")
+	       TEXT("%.0f deg, pitch %.0f deg (impulse launch -- no ground run in v2)."),
+	       TriggerDesc, GetActorLocation().X, GetActorLocation().Y, GetActorLocation().Z,
+	       LaunchSpeedMS, YawDeg, LaunchPitchDeg);
+}
+
+AVoxelGlider* AVoxelGlider::FindNearestParked(const UWorld* World, const FVector& From,
+                                              double MaxRangeUU)
+{
+	if (!World)
+	{
+		return nullptr;
+	}
+	AVoxelGlider* Best = nullptr;
+	double BestSq = MaxRangeUU * MaxRangeUU;
+	for (TActorIterator<AVoxelGlider> It(const_cast<UWorld*>(World)); It; ++It)
+	{
+		AVoxelGlider* G = *It;
+		// Parked AND uncrewed: a glider in flight is not a thing to walk up to,
+		// and one with a pilot already aboard is taken.
+		if (!G || !G->IsParked() || G->IsCrewed())
+		{
+			continue;
+		}
+		const double DSq = FVector::DistSquared(From, G->GetActorLocation());
+		if (DSq <= BestSq)
+		{
+			BestSq = DSq;
+			Best = G;
+		}
+	}
+	return Best;
+}
+
+bool AVoxelGlider::TryBoardNearest(APlayerController* PC)
+{
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn)
+	{
+		return false;
+	}
+	AVoxelGlider* G = FindNearestParked(PC->GetWorld(), Pawn->GetActorLocation(),
+	                                    VoxelGliderTuning::InteractRangeUU);
+	if (!G)
+	{
+		// SAY WHY, the boat's rule: no glider at all, a glider too far, and a
+		// glider still airborne want different answers.
+		int32 Total = 0, Parked = 0;
+		for (TActorIterator<AVoxelGlider> It(PC->GetWorld()); It; ++It)
+		{
+			++Total;
+			Parked += (It->IsParked() && !It->IsCrewed()) ? 1 : 0;
+		}
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelGlider: nothing to board within %.1f m. %d glider(s) exist, %d parked and ")
+		       TEXT("free. voxel.Glider.Spawn parks one in front of you."),
+		       VoxelGliderTuning::InteractRangeUU / 100.0, Total, Parked);
+		return false;
+	}
+	return G->Board(PC);
+}
+
+bool AVoxelGlider::Board(APlayerController* PC)
+{
+	APawn* Previous = PC ? PC->GetPawn() : nullptr;
+	if (!PC || !Previous || Previous == this || StoredPawn.IsValid() || !bParked)
+	{
+		return false;
+	}
+
+	StoredPawn = Previous;
+	Driver = PC;
+
+	// The outgoing pawn is PARKED, not destroyed -- AVoxelBoat::Enter's rule,
+	// for AVoxelBoat::Enter's reasons (camera mode, speed dial, crouch state
+	// all live on it).
+	Previous->SetActorHiddenInGame(true);
+	Previous->SetActorEnableCollision(false);
+	Previous->SetActorTickEnabled(false);
+
+	PC->Possess(this);
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Glider: boarded via E at (%.0f,%.0f,%.0f). Stored pawn '%s' parked. W or Space ")
+	       TEXT("launches; E dismounts and leaves the glider parked; X stows it."),
+	       GetActorLocation().X, GetActorLocation().Y, GetActorLocation().Z,
+	       *Previous->GetName());
+	return true;
+}
+
+void AVoxelGlider::ExitToStoredPawn()
+{
+	using namespace VoxelGliderTuning;
+
+	if (!bParked)
+	{
+		// Airborne E: bail out where it is, exactly the v1 behaviour. The wing
+		// is stowed (destroyed), the pilot falls.
+		ReturnPilot(GetActorLocation());
+		return;
+	}
+
+	APawn* Pawn = StoredPawn.Get();
+	APlayerController* PC = Driver.Get();
+	StoredPawn = nullptr;
+	Driver = nullptr;
+	if (!Pawn || !PC)
+	{
+		return;
+	}
+
+	// Off the WINGTIP, clear of the span -- stepping out of a 9 m wing at the
+	// beam would put the pilot inside it. Feet on the raycast ground when the
+	// column has streamed; the lift above the glider's own origin when it has
+	// not (never "absence reads as air").
+	const FTransform Xf = GetActorTransform();
+	FVector Out = Xf.TransformPosition(FVector(0.0, HalfSpanUU + ExitSideClearanceUU, 0.0));
+	double Clearance = 0.0, SurfaceTopZ = 0.0;
+	if (VoxelGliderLocal::ClearanceAboveGround(GetWorld(), Out, Clearance, SurfaceTopZ))
+	{
+		Out.Z = SurfaceTopZ + VoxelMovementTuning::StandHalfExtentZ;
+	}
+	else
+	{
+		Out.Z = GetActorLocation().Z + ExitLiftUU;
+	}
+
+	Pawn->SetActorHiddenInGame(false);
+	Pawn->SetActorEnableCollision(true);
+	Pawn->SetActorTickEnabled(true);
+	Pawn->SetActorLocation(Out, false, nullptr, ETeleportType::TeleportPhysics);
+	PC->Possess(Pawn);
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelGlider: DISMOUNTED to (%.0f,%.0f,%.0f). Pawn '%s' repossessed; the glider ")
+	       TEXT("stays parked at (%.0f,%.0f,%.0f)."),
+	       Out.X, Out.Y, Out.Z, *Pawn->GetName(), GetActorLocation().X, GetActorLocation().Y,
+	       GetActorLocation().Z);
 }
 
 bool AVoxelGlider::TryDeploy(APlayerController* PC)
@@ -534,8 +765,74 @@ AVoxelGlider* AVoxelGlider::SpawnAhead(UWorld* World, double AheadUU, double Alt
 	{
 		G->VelocityUU = ViewRot.Vector() * (VoxelGliderTuning::DeployMinSpeedMS * 100.0);
 	}
-	UE_LOG(LogVoxelEarth, Log, TEXT("voxel.Glider.Spawn: %s at (%.0f,%.0f,%.0f)."),
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("voxel.Glider.Spawn: %s AIRBORNE at (%.0f,%.0f,%.0f). It will glide until it lands, ")
+	       TEXT("then park on the surface."),
 	       G ? TEXT("spawned") : TEXT("FAILED"), Spawn.X, Spawn.Y, Spawn.Z);
+	return G;
+}
+
+AVoxelGlider* AVoxelGlider::SpawnParkedAhead(UWorld* World, double AheadUU)
+{
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn)
+	{
+		UE_LOG(LogVoxelEarth, Warning, TEXT("voxel.Glider.Spawn: no player pawn to spawn near."));
+		return nullptr;
+	}
+	FRotator ViewRot = PC->GetControlRotation();
+	ViewRot.Pitch = 0.f;
+	ViewRot.Roll = 0.f;
+
+	// Probe from a few metres above the player's own height, so ground ahead
+	// that rises moderately is still found from above rather than from inside.
+	FVector Probe = Pawn->GetActorLocation() + ViewRot.Vector() * AheadUU;
+	Probe.Z += 400.0;
+
+	// A HIT IS REQUIRED, the house rule: a raycast miss means the column has
+	// not streamed, and a glider parked on guessed ground is the fell-through
+	// bug wearing a different hat.
+	double Clearance = 0.0, SurfaceTopZ = 0.0;
+	if (!VoxelGliderLocal::ClearanceAboveGround(World, Probe, Clearance, SurfaceTopZ))
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("voxel.Glider.Spawn: no ground found ahead -- the column has not streamed, so ")
+		       TEXT("there is no surface to park on. Refusing rather than guessing; move, or use ")
+		       TEXT("the airborne form (add an AltitudeM argument)."));
+		return nullptr;
+	}
+	// A glider does not park on a lake bed. Refuse over water and say which
+	// form to use instead.
+	if (UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
+	{
+		if (Water->IsUnderwaterAtWorld(FVector(Probe.X, Probe.Y, SurfaceTopZ + 1.0)))
+		{
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("voxel.Glider.Spawn: the ground ahead is underwater; a glider does not park ")
+			       TEXT("on a lake. Face dry land, or use the airborne form (add an AltitudeM ")
+			       TEXT("argument)."));
+			return nullptr;
+		}
+	}
+
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AVoxelGlider* G = World->SpawnActor<AVoxelGlider>(
+		AVoxelGlider::StaticClass(), FVector(Probe.X, Probe.Y, SurfaceTopZ + 200.0), ViewRot, Params);
+	if (!G)
+	{
+		UE_LOG(LogVoxelEarth, Warning, TEXT("voxel.Glider.Spawn: SpawnActor failed."));
+		return nullptr;
+	}
+	// Settle applied POST-spawn because BellyOffsetUU is measured from the
+	// asset body's bounds in BeginPlay, which SpawnActor has run by the time it
+	// returns (the boat's KeelOffsetUU discipline).
+	G->SettleParked(SurfaceTopZ);
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("voxel.Glider.Spawn: PARKED glider at (%.0f,%.0f,%.0f), resting on the surface. ")
+	       TEXT("Walk up and press E to board it."),
+	       G->GetActorLocation().X, G->GetActorLocation().Y, G->GetActorLocation().Z);
 	return G;
 }
 
@@ -571,6 +868,14 @@ void AVoxelGlider::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 	PlayerInputComponent->BindAxis(TEXT("VoxelGlider_Roll"), this, &AVoxelGlider::InputRoll);
 	PlayerInputComponent->BindAxisKey(EKeys::MouseX, this, &AVoxelGlider::InputLookYaw);
 	PlayerInputComponent->BindAxisKey(EKeys::MouseY, this, &AVoxelGlider::InputLookPitch);
+
+	// Space = launch from park (with W as the equivalent, read straight off the
+	// pitch axis in the parked tick). Bound on THIS pawn's input component, so
+	// it only exists while a glider is possessed -- the fly pawn's own Space
+	// binding is inactive then and there is no collision. A plain action-style
+	// BindKey, not an axis: digital, edge-triggered, no IsAxis1D concern.
+	PlayerInputComponent->BindKey(EKeys::SpaceBar, IE_Pressed, this,
+	                              &AVoxelGlider::InputLaunchPressed);
 }
 
 void AVoxelGlider::InputPitch(float Value)
@@ -595,6 +900,16 @@ void AVoxelGlider::InputLookPitch(float Value)
 	CameraPitchDeg = FMath::Clamp(CameraPitchDeg - double(Value) * 2.5, -70.0, 30.0);
 }
 
+void AVoxelGlider::InputLaunchPressed()
+{
+	// Only ever SET while parked: a mid-air Space press must not queue a
+	// phantom relaunch for the first tick after touchdown.
+	if (bParked)
+	{
+		bLaunchPressed = true;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -610,19 +925,43 @@ FAutoConsoleCommandWithWorld GVoxelGliderDeployCmd(
 
 FAutoConsoleCommandWithWorldAndArgs GVoxelGliderSpawnCmd(
 	TEXT("voxel.Glider.Spawn"),
-	TEXT("voxel.Glider.Spawn [AheadM=20] [AltitudeM=40] -- put an UNPOSSESSED glider ahead of and ")
-	TEXT("above the camera, already moving. For photographing one in the air without having to fly ")
-	TEXT("it; press nothing and it will glide until it lands, at which point it destroys itself."),
+	TEXT("voxel.Glider.Spawn [AheadM=8] [AltitudeM] -- with NO AltitudeM (the default since the ")
+	TEXT("2026-09-05 respec): a PARKED glider resting on the ground ahead of the player, like ")
+	TEXT("voxel.Boat.Spawn on water; walk up and press E to board it. Refuses (and says so) over ")
+	TEXT("unstreamed columns and over water. WITH AltitudeM: the old AIRBORNE autonomous spawn, ")
+	TEXT("ahead of and above the camera, already moving -- for photographing one in the air; it ")
+	TEXT("glides until it lands, then parks on the surface."),
 	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 		[](const TArray<FString>& Args, UWorld* World)
 		{
-			const double AheadM = (Args.Num() > 0) ? FCString::Atod(*Args[0]) : 20.0;
-			const double AltM = (Args.Num() > 1) ? FCString::Atod(*Args[1]) : 40.0;
-			AVoxelGlider::SpawnAhead(World, AheadM * 100.0, AltM * 100.0);
+			const double AheadM = (Args.Num() > 0) ? FCString::Atod(*Args[0]) : 8.0;
+			if (Args.Num() > 1)
+			{
+				AVoxelGlider::SpawnAhead(World, AheadM * 100.0, FCString::Atod(*Args[1]) * 100.0);
+			}
+			else
+			{
+				AVoxelGlider::SpawnParkedAhead(World, AheadM * 100.0);
+			}
+		}));
+
+FAutoConsoleCommandWithWorld GVoxelGliderBoardCmd(
+	TEXT("voxel.Glider.Board"),
+	TEXT("Board the nearest PARKED glider, exactly as the interact key does (E dispatches to the ")
+	TEXT("nearest boardable vehicle -- see the controller for the boat-vs-glider tie rule). Exists ")
+	TEXT("so an unattended leg can board with no keyboard; W/Space then launch, or ")
+	TEXT("voxel.Glider.Stow packs it away."),
+	FConsoleCommandWithWorldDelegate::CreateStatic(
+		[](UWorld* World)
+		{
+			AVoxelGlider::TryBoardNearest(World ? World->GetFirstPlayerController() : nullptr);
 		}));
 
 FAutoConsoleCommandWithWorld GVoxelGliderStowCmd(
-	TEXT("voxel.Glider.Stow"), TEXT("Land the glider being flown right now, wherever it is."),
+	TEXT("voxel.Glider.Stow"),
+	TEXT("Stow the glider being possessed right now, wherever it is: the pilot is put back on their ")
+	TEXT("feet and the glider is DESTROYED (this is the pack-it-away path -- a landed glider left ")
+	TEXT("alone parks and persists instead; E dismounts without stowing)."),
 	FConsoleCommandWithWorldDelegate::CreateStatic(
 		[](UWorld* World)
 		{
@@ -638,7 +977,9 @@ FAutoConsoleCommandWithWorld GVoxelGliderStatCmd(
 	TEXT("One line per glider. ticks vs aero is the engagement proof and the two are separate on ")
 	TEXT("purpose: a glider integrating gravity with the aero faded out is a ROCK, and a rock and a ")
 	TEXT("wing produce the same line if only one counter exists. ground=0 with ticks>0 means every ")
-	TEXT("terrain probe missed -- unstreamed columns, not clear air."),
+	TEXT("terrain probe missed -- unstreamed columns, not clear air. parked/crewed and park (the ")
+	TEXT("parked-tick counter) are the persistence proof: a landed glider shows parked=1 with park ")
+	TEXT("climbing, and a vanished one shows nothing at all."),
 	FConsoleCommandWithWorldDelegate::CreateStatic(
 		[](UWorld* World)
 		{
@@ -652,12 +993,14 @@ FAutoConsoleCommandWithWorld GVoxelGliderStatCmd(
 				const AVoxelGlider* G = *It;
 				const FVector L = G->GetActorLocation();
 				UE_LOG(LogVoxelEarth, Log,
-				       TEXT("Glider[%d] at (%.0f,%.0f,%.0f) ticks=%llu aero=%llu ground=%llu ")
-				       TEXT("flare=%llu airspeed=%.1f m/s alpha=%.1f deg L/D=%.2f wind=%.1f m/s ")
-				       TEXT("visual=%s(%d inst)"),
-				       N++, L.X, L.Y, L.Z, (unsigned long long)G->GetTicks(),
+				       TEXT("Glider[%d] at (%.0f,%.0f,%.0f) parked=%d crewed=%d ticks=%llu aero=%llu ")
+				       TEXT("ground=%llu flare=%llu park=%llu airspeed=%.1f m/s alpha=%.1f deg ")
+				       TEXT("L/D=%.2f wind=%.1f m/s visual=%s(%d inst)"),
+				       N++, L.X, L.Y, L.Z, G->IsParked() ? 1 : 0, G->IsCrewed() ? 1 : 0,
+				       (unsigned long long)G->GetTicks(),
 				       (unsigned long long)G->GetAeroTicks(), (unsigned long long)G->GetGroundHits(),
-				       (unsigned long long)G->GetFlareTicks(), G->GetLastAirspeedMS(),
+				       (unsigned long long)G->GetFlareTicks(), (unsigned long long)G->GetParkTicks(),
+				       G->GetLastAirspeedMS(),
 				       G->GetLastAlphaDeg(), G->GetLastGlideRatio(), G->GetLastWindMS(),
 				       (G->GetBody() && !G->GetBody()->IsPlaceholder()) ? TEXT("asset")
 				                                                        : TEXT("PLACEHOLDER"),

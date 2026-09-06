@@ -42,17 +42,23 @@ class UStaticMeshComponent;
 // pitch and roll ARE what a boat on water looks like. Writing that kinematically
 // means writing a rigid-body integrator, and there is one in the box.
 //
-// --- BUOYANCY READS THE DATUM, NOT THE WAVES --------------------------------
+// --- BUOYANCY: DATUM PLUS THE WAVE MIRROR (owner overrule, 2026-09-05) ------
 //
-// Every probe asks UVoxelWaterSubsystem::WaterSurfaceZAtWorld, which is the
-// plan's A5 contract and is DATUM ONLY: the tide moves it, the drawn wind waves
-// do not. That is the v1 decision recorded in plan D2 and it is quantified
-// there -- drawn WPO is about +-2 cm at reference wind, below the threshold at
-// which anyone in a boat could see the hull failing to follow it, while a CPU
-// mirror of the wave field would phase-drift against MaterialExpressionTime and
-// have the boat riding a crest the water is not on. The same call also backs
-// SubmergedDepthUUAtWorld, so a boat and a swimmer cannot disagree about where
-// the water is.
+// Every probe asks UVoxelWaterSubsystem::WaterSurfaceZAtWorld -- the plan's A5
+// contract, datum + tide -- and then ADDS the CPU mirror of the drawn
+// wind-wave field (VoxelWaveMirror.generated.h) scaled by kWaveWpoFraction.
+// D2's v1 shipped flat-datum only and quantified why; the owner's live
+// verdict ("does not seem affected by buoyancy dynamics at all") overruled
+// it, activating the recorded CPU-wave-mirror stretch. The phase-drift
+// objection D2 recorded is answered by the mirror's contract rather than
+// waved away: same clock (GetTimeSeconds * voxel.Water.WaveTimeScale), same
+// published wind, same math, re-emitted by the same regen chain and
+// FINGERPRINT-GUARDED -- a mismatch (or an un-regenerated material with no
+// fingerprint parameter at all) drops the term with a log line and the boat
+// rides the flat datum again; voxel.Boat.WaveBob 0 is the same fallback as
+// an explicit A/B arm. The datum call also backs SubmergedDepthUUAtWorld, so
+// a boat and a swimmer cannot disagree about where the water body IS; the
+// wave term is centimetres, hull-only, cosmetic-scale bobbing.
 //
 // THE RIPPLE FIELD IS NOT AN INPUT EITHER, in either direction. VoxelRippleField.h
 // :16-20 makes it a material layer and nothing else; this actor WRITES a wake
@@ -186,6 +192,27 @@ private:
 	// collision source (see UVoxelAssetBodyComponent).
 	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Boat")
 	TObjectPtr<UVoxelAssetBodyComponent> Body;
+
+	// The hull WATER-EXCLUSION volume (owner directive 2026-09-05: "the water
+	// should be masked and not filling the boat"). A closed, outward-facing
+	// box enclosing the water-free interior, rendered into CUSTOM DEPTH +
+	// CUSTOM STENCIL only (never the main pass, never the scene depth prepass,
+	// no collision, no shadow); the water materials discard pixels behind its
+	// near shell within a bounded band. THE CONTRACT IS PINNED in
+	// Tools/water_hull_mask_graph.py's docstring, which is also the registry
+	// of stencil bit 0 = "water exclusion" -- this component writes stencil
+	// value 1 and nothing else. Sized in BeginPlay from the adopted hull
+	// geometry. Inert (safe direction) until r.CustomDepth=3 is set in config
+	// and the regenerated materials carry the mask term.
+	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Boat")
+	TObjectPtr<UStaticMeshComponent> ExclusionVolume;
+
+	// Second exclusion box for the bow/stern (2026-09-06, owner: water clipping
+	// through the cockpit ENDS once WaveBobGain 6.0 landed). Long and narrow so
+	// it stays inside the hull taper where the midship box cannot reach; same
+	// stencil bit, same render flags, sized beside the first in BeginPlay.
+	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Boat")
+	TObjectPtr<UStaticMeshComponent> ExclusionVolumeEnds;
 
 	// Camera arm: yaw/pitch relative to the HULL, not to the world. Looking
 	// around does not steer, and steering does not swing the camera -- the two
