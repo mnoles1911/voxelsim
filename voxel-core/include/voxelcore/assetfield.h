@@ -242,7 +242,7 @@ public:
         out.reserve(sites.size());
         for (const AssetSite& s : sites) {
             if (terrainOnly && (size_t(s.layer) >= layers_.size() ||
-                                !layers_[s.layer].terrainLattice))
+                                !layers_[size_t(s.layer)].terrainLattice))
                 continue;
             const int64_t avx = floorDiv(s.anchorXMm, int64_t(kVoxelSizeMm));
             const int64_t avy = floorDiv(s.anchorYMm, int64_t(kVoxelSizeMm));
