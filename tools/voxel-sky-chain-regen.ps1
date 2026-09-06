@@ -121,6 +121,52 @@ if ($live.Count -gt 0) {
     throw "REFUSING TO START: an editor is already running -- $detail."
 }
 
+# --- AFTER THE NEXT FULL CHAIN: THE BOAT-WAKE CHECKLIST (2026-09-05) ---------
+#
+# The invisible-boat-wake bug (Ripple.Stat healthy, gain 20 changed nothing)
+# was audited offline against the 23:2x-UTC-baked materials: every
+# material<->C++ contract link verifies CONSISTENT (names, units, origin,
+# window, channels, bias, texture identity, gain path -- see the audit
+# report), so the break is on the sim/draw side, not in the generators. Two
+# things for the first session after this chain runs:
+#
+#   1. IF ANY WAKE DOUBT REMAINS, run the isolation instrument FIRST:
+#      a WATER-ONLY regen with VOXEL_WATER_RIPPLE_DEBUG=1 (the arm at
+#      create_water_voxel_material.py's ripple section). COLOUR around the
+#      player = the field has data and the break is downstream; FLAT BLACK =
+#      the field itself is empty and the fix is C++-side (the audit's
+#      prediction). Rebuild without the variable afterwards.
+#
+#   2. THE CHAIN'S WATERS NOW GATE THE RIPPLE CONTRIBUTION BY WaveTimeScale
+#      (the racing-fix amplitude gate -- NOT in the 23:2x bake, IS in this
+#      batch). Any wake test after this chain must run with
+#      voxel.Water.WaveTimeScale > 0, or the gate zeroes the wake and the
+#      old bug appears to persist while being a different, deliberate zero.
+#
+#   3. THE 2026-09-06 DESK HUNT'S ANSWER RIDES THIS BATCH, in two halves.
+#      (a) M_VoxelRippleStep (create_ripple_field_materials.py): the baked
+#      shore mask could multiply a freshly injected splat to EXACTLY the clear
+#      value in the same draw that counted it as injected -- the one mechanism
+#      that produces "every counter green, every texture empty" -- wherever
+#      the bake's shore plane disagrees with the live water the injectors
+#      trust (and by design at the waterline itself, where every wading entry
+#      splashes into a mask of 0). The step now injects the splat AFTER the
+#      attenuation and floors the mask at MaskFloor=0.98/step, so a splash is
+#      always BORN and a bake-dry one dies in ~0.6 s instead of never having
+#      existed. (b) C++ (VoxelRippleField.cpp, needs the module rebuilt): the
+#      counters can no longer lie -- once anything is injected, a 64x64
+#      centre patch of the state and field is read back every 5 s until the
+#      field first proves non-zero ("RippleField: field verified LIVE" in the
+#      log, then sampling stops; ClearState re-arms); three dark samples log
+#      a WARNING that names the triage. voxel.Water.Ripple.Stat now prints
+#      fieldMaxAbs/stateMaxAbs plus the enable/freeze/mask/speed knobs -- the
+#      2026-09-05 session ran its whole wake test with SpeedMPS at 0 and no
+#      instrument said so. Wake re-test after this chain: WaveTimeScale > 0
+#      (item 2), SpeedMPS > 0, drive the boat, then Ripple.Stat -- the
+#      verdict is one line. If it still reads DARK with state ~0, run item
+#      1's VOXEL_WATER_RIPPLE_DEBUG regen and voxel.Water.Ripple.Probe, and
+#      suspect the deposit draw itself (the audit's remaining branch).
+#
 # --- THE ORDER, AND THE RULE THAT KEEPS IT COMPLETE --------------------------
 #
 # create_sky_material.py is the SOLE author of MPC_VoxelSky and DELETES it on

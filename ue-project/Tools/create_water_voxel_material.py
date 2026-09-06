@@ -1,8 +1,19 @@
 """Author M_WaterVoxel (W2 task spec item 4 "Rendering v0"): the active-water
 voxel material UWaterChunkComponent/FWaterChunkSceneProxy render with
 (VoxelWaterChunkComponent.h/.cpp), distinct from M_Ocean's implicit static
-surface plane (AVoxelOceanActor -- that one keeps existing unchanged; active
-water renders ON TOP of it per the task spec, overlap acceptable v0).
+surface plane (AVoxelOceanActor). Active water renders ON TOP of it per the task
+spec, overlap acceptable v0.
+
+  AMENDED 2026-09-04: "that one keeps existing unchanged" is no longer true and
+  the sentence is corrected rather than left to mislead. create_ocean_material.py
+  was rewritten onto the SAME shared modules this file uses -- water_optics,
+  water_wave_graph, bathy_field_graph, ripple_field_graph -- so the two surfaces
+  are now two materials built from one derivation, not two derivations. They are
+  still two ASSETS, deliberately: the vertex-colour contract differs (this one
+  reads a fill fraction, a top-face flag and a foam-activity channel off the
+  mesher; the ocean's grid carries none of them). Shared modules, separate
+  materials, one set of numbers -- the same split sky_star_graph.py and
+  terrain_material_common.py already use.
 
 Same headless-Python pattern as create_voxel_material.py / create_ocean_material.py
 (checked connections throughout -- see create_voxel_material.py's comment on
@@ -129,15 +140,35 @@ against an MPC authored by an older create_sky_material.py now RAISES, by name,
 in collection_param() -- see that helper for why the check was added here at all
 (it is the one binding read-back the sky generators had and this one did not).
 
+THE SURFACE-LIGHT CHAIN IS A SHARED MODULE NOW (2026-09-05): everything the two
+notes above describe -- the sun glint, the moon glint, the Fresnel sky
+reflection with its night branch, and the star reflection arm -- moved verbatim
+into Tools/water_sky_reflection_graph.py, the same promotion the wave field and
+the optics already had, so M_Ocean can consume the same derivation instead of a
+copy (docs/water-ocean-tides-plan-2026-09-04.md, Materials OPEN item 1; the sea
+consumes it since the owner's same-day ruling on the first ocean review --
+"Sea should not be flat"). NOTHING ABOUT THE CHAIN CHANGED BY MOVING IT: same nodes, same
+links, same parameter names and defaults, same editor positions, proven by
+regenerating this material to identical expression and link counts against the
+offline mock harness on both sides of the move. Every word of the reasoning --
+the area-light glint, the 2.4-degree drawn moon, the retired
+LegacySkyReflectGain measurement table, the star arm's mip note -- moved WITH
+the nodes it documents; read it there. What stays here: the emissive connect,
+the foam and top-face suppressions' SIGNALS (they are this mesher's vertex
+contract; the module takes them as optional inputs), and the
+VOXEL_WATER_STAR_REFLECT arm decision, passed in as a bool.
+
 =============================================================================
 SINGLE LAYER WATER PORT (2026-08-11, Phase 1 of the lake plan)
 =============================================================================
 
 THE SHADING MODEL CHANGED, AND WITH IT THE BLEND MODE. This material was
 MSM_DefaultLit + BLEND_TRANSLUCENT + TLM_SURFACE_PER_PIXEL_LIGHTING. It is now
-MSM_SingleLayerWater + BLEND_OPAQUE. That is not a tweak, it is a different
-renderer pass, and three consequences follow that the rest of this file has been
-rewritten around:
+MSM_SingleLayerWater + BLEND_OPAQUE (BLEND_MASKED since 2026-09-04 -- the shore
+clip; see "OCEAN/TIDES PLAN, PHASE B" at the end of this docstring. The engine's
+sentence quoted below is why masked was available at all). That is not a tweak,
+it is a different renderer pass, and three consequences follow that the rest of
+this file has been rewritten around:
 
   * OPACITY-AS-ALPHA IS GONE, and had to be. The engine refuses to compile a
     translucent Single Layer Water material outright -- MaterialShared.cpp:6425,
@@ -444,6 +475,28 @@ of the change -- the owner asked to play-test wind-driven waves at different
 wind speeds. VOXEL_WATER_LEGACY_WAVES=1 rebuilds the previous field exactly; see
 that arm's note below for the A/B.
 
+OCEAN/TIDES PLAN, PHASE B (2026-09-04). Two changes to this file, both of them
+fixes to a defect rather than new looks, and each argued at its own site:
+
+  B2, THE WPO DISTANCE FADE (at the wave+ripple summing site). The displacement
+  half of the field -- and only that half; the pixel normal is untouched -- is
+  multiplied by a 55 m -> 72 m fade to zero. IT IS NOT A LEVEL-OF-DETAIL SAVING
+  AND MUST NOT BE READ AS ONE. The lake sheet now tessellates a camera disc and
+  does not stitch its boundary; the fade is what makes every T-junction join two
+  UNDISPLACED surfaces, which is the entire crack-prevention mechanism. It also
+  heals the latent seam where near-field voxel quads meet a flat far sheet. The
+  derivation, the three-radius ordering it depends on, and the NaN guard live in
+  water_wave_graph.build_wpo_distance_fade.
+
+  B4, THE SHORE-SDF CLIP (blend mode at the top of main(), mask beside Opacity).
+  BLEND_OPAQUE -> BLEND_MASKED, and an OpacityMask that declines to draw sheet
+  more than BathyShoreClipSlackM past the baked waterline. This is the recorded
+  candidate fix for docs/lake-sheet-black-band-2026-08-29.md -- the black rim
+  around every basin -- and that document also records FOUR REFUTED mechanisms
+  and one engagement-proven null. Read it before re-theorising any of them.
+  `-VoxelWaterMatScalar=WaterShoreClipEnabled:0` is the control arm for the clip;
+  it is NOT a control arm for the blend mode, which stays masked in both.
+
 Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
 
@@ -458,26 +511,32 @@ import time
 
 import unreal
 
-# The star subgraph is SHARED, not re-derived. Tools/sky_star_graph.py owns the
-# one horizon->equatorial rotation, the one equirect UV and the one seam fix, and
-# its module docstring says at length why a second copy is the failure mode to
-# fear: two samplers of the same map that disagree produce a sky that is still
-# sharp, still rotating at the right rate, and still wrong, with nothing in a
-# frame to say so. A reflection of the stars that drifted from the stars would be
-# exactly that defect, and the water is the surface most likely to show it (the
-# real sky and its mirror image are in the same frame, a few hundred pixels
-# apart).
+# SkyGraphBuilder is the checked-connect, checked-collection-binding builder
+# every shared subgraph in this toolchain is written against; this file hands
+# one to bathy_field_graph, to ripple_field_graph and to the surface-light
+# chain below. The star lookup itself (build_star_uv / sample_starmap /
+# build_horizon_fade) is no longer imported HERE: the one consumer of it in
+# this material -- the reflected-stars arm -- moved into
+# water_sky_reflection_graph.py, and the import moved with it, so there is
+# exactly one file that can wire a star sample into a water surface.
 #
 # A -run=pythonscript commandlet does not put the script's own directory on
 # sys.path, hence the explicit insert -- same as create_sky_material.py:417-420.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sky_star_graph import (  # noqa: E402
-    SkyGraphBuilder,
-    build_horizon_fade,
-    build_star_uv,
-    sample_starmap,
-)
+from sky_star_graph import SkyGraphBuilder  # noqa: E402
 from bathy_field_graph import build_slant_depth, sample_bathy_field  # noqa: E402
+
+# THE SURFACE-LIGHT CHAIN -- sun glint, moon glint, sky reflection, reflected
+# stars -- imported like the wave field and for the same reason: M_Ocean is the
+# second surface that wants it, and two copies of one derivation do not fail
+# loudly, they drift. Everything the chain computes, and every word of why, is
+# in that module now; this file's job shrinks to handing it the two
+# M_WaterVoxel-specific suppression signals (foam, top-face mask) and wiring
+# the result to EmissiveColor.
+from water_sky_reflection_graph import build_sky_reflection  # noqa: E402
+# The hull water-exclusion mask (owner boat-session directive) -- shared with
+# M_Ocean; binds nothing on the MPC, reads CustomDepth/Stencil directly.
+from water_hull_mask_graph import build_hull_mask  # noqa: E402
 
 # THE OTHER TWO SHARED SUBGRAPHS, same directory, same sys.path.insert above.
 #
@@ -490,7 +549,7 @@ from bathy_field_graph import build_slant_depth, sample_bathy_field  # noqa: E40
 #
 # ripple_field_graph is imported by name because there is one entry point and it
 # returns everything.
-from ripple_field_graph import sample_ripple_field  # noqa: E402
+from ripple_field_graph import build_disturbance_foam, sample_ripple_field  # noqa: E402
 import ripple_field_graph  # noqa: E402
 import water_wave_graph  # noqa: E402
 
@@ -699,7 +758,7 @@ def main():
     if material is None:
         raise RuntimeError("Failed to create material asset at " + FULL_PATH)
 
-    # --- SINGLE LAYER WATER: OPAQUE, TWO-SIDED, ONE SHADING MODEL ----------
+    # --- SINGLE LAYER WATER: MASKED, TWO-SIDED, ONE SHADING MODEL ----------
     #
     # BLEND_OPAQUE, and there is no choice about it. The engine rejects a
     # translucent SLW material by name -- MaterialShared.cpp:6425,
@@ -715,7 +774,72 @@ def main():
     # SLW has no sort key. Two overlapping water surfaces at one pixel are
     # resolved by the depth test in the SLW depth prepass, so the nearest wins
     # and there is no ordering left to get wrong.
-    material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    # AMENDED 2026-09-04, B4 OF THE OCEAN/TIDES PLAN: MASKED, NOT OPAQUE.
+    #
+    # The paragraph above is still the argument and it is unchanged in substance
+    # -- the engine's rule is "SingleLayerWater materials must be opaque OR
+    # MASKED" (MaterialShared.cpp:6425), and it is the TRANSLUCENT half of that
+    # sentence that was never available. Masked was always the other legal
+    # choice; nothing needed it until now. Everything the paragraph says about
+    # the sort key is unaffected: a masked surface writes depth exactly like an
+    # opaque one, so there is still no ordering to get wrong.
+    #
+    # WHY IT MOVES: docs/lake-sheet-black-band-2026-08-29.md, and this is the
+    # fix that document names. Read it before touching this, because it also
+    # records THREE REFUTED MECHANISMS and one engagement-proven null, and
+    # re-theorising any of them costs a night:
+    #
+    #   * NOT the terrain, NOT the lighting, NOT the LOD colour fix -- proven by
+    #     subtraction (-VoxelLakeSheets=0 takes the dark pixels from 14,644 to
+    #     49, with the LOD fix armed in both arms).
+    #   * NOT a re-weighting problem. -VoxelWaterDepthAuthority=1.0 was built,
+    #     shipped, and measured at two poses: 14,644 -> 14,651 dark pixels. The
+    #     switch is NOT inert (it moved the lake's pale-water pixel count
+    #     166,485 -> 129,965 at the same pose), it simply cannot reach the band.
+    #   * NOT the baked half. bathy_field_graph's slant was provably bounded in
+    #     [d, 1.52 d] for every view direction when this was measured (the Snell
+    #     default). Since 2026-09-05 the default is the straight secant and the
+    #     bound is the clamp's 20x instead -- still BOUNDED, which is the
+    #     property this refutation actually rests on: a capped multiple of the
+    #     LOCAL depth goes to zero with the depth at the waterline, where the
+    #     band lives, so it still cannot be the band.
+    #   * NOT a bathymetry hole either -- holes measured 0.0%.
+    #
+    # WHAT IT ACTUALLY IS: the sheet is a flat plane over ground that is very
+    # nearly COPLANAR with it, and MSM_SingleLayerWater's absorption depth is the
+    # engine's own `BehindWaterSceneDepth - WaterSurfaceSceneDepth`, measured
+    # ALONG THE VIEW RAY, which diverges without bound as the view goes grazing.
+    # The material's only hook is ColorScaleBehindWater, a MULTIPLY applied
+    # before the engine's transmittance -- and a multiply cannot recover a value
+    # exp() has already flushed to zero. The band scales with grazing-ness
+    # exactly as that predicts: 14.0% of the lake's pixels near-black at pitch
+    # -18, 8.6% at -45.
+    #
+    # SO THE FIX CANNOT BE IN THE BLEND. It is "do not draw sheet where the bake
+    # says there is no water column", which needs an OpacityMask, which needs a
+    # masked blend mode. The mask itself is built further down, at
+    # "B4: THE SHORE-SDF CLIP"; this line is the half of it that has to happen
+    # before the graph exists.
+    #
+    # WHAT THIS COSTS, STATED BEFORE ANY TIMING LEG RUNS: a masked material is
+    # excluded from early-Z / depth-prepass optimisations that an opaque one gets
+    # for free, and it takes a different mesh-pass path. That can move the frame
+    # in EITHER direction here, because the water is also drawing FEWER pixels
+    # now. Measure it; do not predict it. -VoxelWaterMatScalar=WaterShoreClipEnabled:0
+    # is the control arm for the CLIP, and it is deliberately NOT a control arm
+    # for this line -- see the note at WaterShoreClipEnabled for the difference.
+    material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+
+    # THE CLIP THRESHOLD, STATED RATHER THAN INHERITED. The engine default is
+    # 0.3333, which is a number chosen for dithered and textured masks and means
+    # nothing for this one: the mask below is a step() lerped against 1, so it is
+    # 0 or 1 everywhere the bathymetry field is confident and takes intermediate
+    # values only inside the field's own 12 m edge-fade band, 460 m from the
+    # camera. Any threshold strictly inside (0, 1) gives the same picture in the
+    # confident region; 0.5 is written down so that the fade band's behaviour is
+    # a stated choice (it clips once validity passes one half) rather than an
+    # accident of an engine default that could move between versions.
+    material.set_editor_property("opacity_mask_clip_value", 0.5)
 
     # TWO-SIDED IS UNCHANGED AND IS STILL LOAD-BEARING. A meshed water brick's
     # faces can be viewed from inside a flooding cavity before the player has
@@ -756,10 +880,19 @@ def main():
     # sees them. So the property is moved rather than the guard weakened.
 
     blend_after = material.get_editor_property("blend_mode")
-    if blend_after != unreal.BlendMode.BLEND_OPAQUE:
+    if blend_after != unreal.BlendMode.BLEND_MASKED:
         raise RuntimeError(
-            "blend mode did not take: %r, expected BLEND_OPAQUE. A translucent SingleLayerWater "
-            "material does not compile at all (MaterialShared.cpp:6425)." % (blend_after,))
+            "blend mode did not take: %r, expected BLEND_MASKED. A translucent SingleLayerWater "
+            "material does not compile at all (MaterialShared.cpp:6425), and an OPAQUE one "
+            "silently ignores MP_OPACITY_MASK -- which would leave the shore clip in the graph, "
+            "in the asset, in the log, and doing nothing to a single pixel. That is precisely "
+            "the silent-success failure this project keeps paying for, so it raises here."
+            % (blend_after,))
+
+    clip_after = float(material.get_editor_property("opacity_mask_clip_value"))
+    if abs(clip_after - 0.5) > 1.0e-6:
+        raise RuntimeError(
+            "opacity_mask_clip_value did not take: %r, expected 0.5." % (clip_after,))
 
     # NOTE ON THE LINE THAT IS NO LONGER HERE: translucency_lighting_mode was
     # set to TLM_SURFACE_PER_PIXEL_LIGHTING, and it had to be, because the
@@ -774,45 +907,14 @@ def main():
 
     mel = unreal.MaterialEditingLibrary
 
-    # --- Custom-node helper -------------------------------------------------
-    #
-    # WHY THERE ARE CUSTOM (HLSL) NODES IN A FILE THAT IS OTHERWISE ALL CHECKED
-    # PIN CONNECTIONS. Two of the things below are loops: an eight-octave wave
-    # sum with a domain warp that feeds each octave's output into the next
-    # octave's input, and a closest-point-on-sphere solve. Expressed as material
-    # nodes those are roughly 130 and 20 nodes respectively, hand-wired, with
-    # every intermediate needing its own checked connect. The node graph's whole
-    # advantage -- that a wrong pin raises at authoring time -- inverts at that
-    # size: nothing in 130 correct-looking connects tells you the drag term went
-    # into the wrong octave. The HLSL is fifteen lines and reads as the
-    # mathematics it is.
-    #
-    # The BOUNDARY is still checked the same way: every input to a Custom node
-    # is wired with the same raise-on-failure connect as everything else, and
-    # the input NAMES are what the HLSL reads, so a rename that misses one end
-    # fails to compile loudly rather than reading a stale value.
-    def custom_node(name, code, inputs, x, y, output_type=None):
-        """A MaterialExpressionCustom with named inputs and no wiring yet.
-
-        `inputs` is a list of input names; the caller connects them by name
-        afterwards with the usual checked mel.connect_material_expressions.
-        Returns the node.
-        """
-        node = mel.create_material_expression(material, unreal.MaterialExpressionCustom, x, y)
-        node.set_editor_property("description", name)
-        node.set_editor_property("code", code)
-        if output_type is not None:
-            node.set_editor_property("output_type", output_type)
-        # FCustomInput carries an FName and an FExpressionInput. Only the name is
-        # settable from Python; the FExpressionInput is filled in by the connect
-        # calls that follow, which is why the array is built name-only here.
-        ins = []
-        for nm in inputs:
-            ci = unreal.CustomInput()
-            ci.set_editor_property("input_name", nm)
-            ins.append(ci)
-        node.set_editor_property("inputs", ins)
-        return node
+    # NOTE ON THE HELPER THAT IS NO LONGER HERE: custom_node (the HLSL Custom
+    # node factory) left with its last two callers, the glint pair, when the
+    # surface-light chain moved to water_sky_reflection_graph.py -- the wave
+    # loop, the other Custom node this file once built, had already gone to
+    # water_wave_graph the same way. Both modules carry their own copy of the
+    # helper AND of the argument for using HLSL at all (a loop or a solve
+    # expressed as ~20-130 hand-wired nodes inverts the node graph's
+    # wrong-pin-raises advantage); this file now builds nothing that needs one.
 
     def scalar_param(name, default, x, y):
         """A named ScalarParameter, so it is tunable from a material instance
@@ -1686,6 +1788,126 @@ def main():
     # second bug when the shoreline goes light.
     foam_raw = bathy_b.maximum(foam_raw, wave_breaking)
 
+    # --- THE RIPPLE FIELD, SAMPLED HERE BECAUSE FOAM READS IT (2026-09-05) --
+    #
+    # This block lived beside the normal/WPO it also feeds and moved up for
+    # the wave field's own reason (see "BUILT HERE BECAUSE FOAM READS IT"):
+    # SIGNAL 6 below derives DISTURBANCE FOAM from these taps. Nothing about
+    # the sampling, the guard, or the WaveTimeScale gate changed by moving.
+    # --- AND WHY THIS IS GUARDED RATHER THAN CALLED STRAIGHT -----------------
+    #
+    # sample_ripple_field RAISES if the three RippleField* names are not on
+    # MPC_VoxelSky, or if /Game/Voxel/RT_VoxelRippleField does not exist, and it
+    # is right to: an unresolved CollectionParameter compiles to a CONSTANT
+    # rather than failing (MaterialExpressions.cpp:17179-17193), so a constant
+    # origin would sample one fixed texel for the entire world, and an unbound
+    # texture parameter would add whatever image the engine picks to the water's
+    # normal on every pixel. Both are silent. Raising is the correct default for
+    # a module that cannot know who is calling it.
+    #
+    # IT IS THE WRONG BEHAVIOUR *HERE*, TODAY, AND THAT IS A SCHEDULING FACT
+    # RATHER THAN A DISAGREEMENT. Those two prerequisites are landing with the
+    # ripple subsystem, in files this change does not own
+    # (create_sky_material.py's parameter tables, create_ripple_field_materials.
+    # py's render target). Until they do, calling straight through would make
+    # M_WaterVoxel UNGENERATABLE -- and the wind waves above, which have no such
+    # dependency and which the owner is waiting to play-test, would go down with
+    # them. Whole feature blocked on an unrelated one.
+    #
+    # So this probes and degrades, LOUDLY, which is exactly the shape
+    # water_wave_graph.build_wind_input already uses for the same situation
+    # (water_wave_graph.py:961-968: "IF THE COLLECTION HAS NO WIND PARAMETERS
+    # THIS DOES NOT RAISE ... It logs, loudly, and takes the fallback"). The
+    # degraded arm is not an approximation of the ripple, it is its exact
+    # absence: the sums become the wave field alone, which is what
+    # RippleFieldGain = 0 would produce anyway, minus the texture fetch.
+    #
+    # THE PROBE IS THE SAME TWO CHECKS THE MODULE ITSELF WOULD MAKE, so it
+    # cannot pass here and fail there: name membership read back off the
+    # collection (SkyGraphBuilder.mpc_names), and a load of the render target.
+    # WHEN THE PREREQUISITES LAND THIS ARM DISAPPEARS ON ITS OWN -- there is no
+    # environment variable and no default to remember to flip.
+    ripple_missing = sorted(
+        n for n in (ripple_field_graph.MPC_ORIGIN,
+                    ripple_field_graph.MPC_INV_SIZE,
+                    ripple_field_graph.MPC_GAIN)
+        if n not in bathy_b.mpc_names())
+    try:
+        # try/except and not a bare None check: unreal.load_object's failure
+        # mode for a package that does not exist on disk is not guaranteed to be
+        # a None return on every engine build, and the entire point of this
+        # block is that a missing ripple field must not take the water material
+        # down with it.
+        ripple_rt = unreal.load_object(None, ripple_field_graph.FIELD_TEXTURE)
+    except Exception:  # noqa: BLE001 -- absence is the thing being tested for
+        ripple_rt = None
+
+    if ripple_missing or ripple_rt is None:
+        unreal.log_warning(
+            "M_WaterVoxel RIPPLE FIELD ARM: ABSENT -- building the water WITHOUT interactive "
+            "ripples. Missing MPC_VoxelSky parameters: %s. Render target %s: %s. This is the "
+            "expected state until the ripple subsystem's two authoring steps land; the wind "
+            "wave field above is unaffected and the water is exactly the water it would be "
+            "with RippleFieldGain at 0. TO FIX: apply docs/water-interactive-ripples.md 8.1 to "
+            "create_sky_material.py, then re-run create_sky_material.py, "
+            "create_sky_atmosphere_dome_material.py, create_ripple_field_materials.py and this "
+            "script, in that order."
+            % (ripple_missing or "none",
+               ripple_field_graph.FIELD_TEXTURE,
+               "missing" if ripple_rt is None else "present"))
+        wave_grad_total = wave_grad_raw
+        wave_height_total = wave_height_m
+        ripple = None
+        disturbance_foam = None
+    else:
+        ripple = sample_ripple_field(bathy_b)
+        unreal.log(
+            "M_WaterVoxel RIPPLE FIELD ARM: PRESENT (%s bound, RippleFieldGain gates it at "
+            "runtime and the subsystem holds it at 0 until the first simulated frame exists)"
+            % ripple_field_graph.FIELD_TEXTURE)
+        # GATED BY WaveTimeScale (2026-09-05 live finding, the whole argument
+        # at water_wave_graph.WAVE_TIME_SCALE_PARAM): with the octave field
+        # frozen at scale 0, the ripple RT was the one thing still moving --
+        # "very fast racing wave effect" -- because its animation lives in
+        # the C++ sim, not in this graph. The material cannot slow it, so it
+        # gates its AMPLITUDE by the same knob: scale 0 = provably still
+        # surface. Same CollectionParameter NODE the field's own T multiply
+        # uses (returned by build_wave_field), not a second binding. The
+        # debug instrument below stays UNGATED on purpose -- it is a picture
+        # of the field's content, and gating it would make the instrument
+        # lie at exactly the scale value used to isolate the field.
+        ripple_grad_gated = bathy_b.mul(ripple["grad_xy"], wave_field["time_scale"])
+        ripple_height_gated = bathy_b.mul(ripple["height_m"], wave_field["time_scale"])
+        wave_grad_total = bathy_b.add(wave_grad_raw, ripple_grad_gated)
+        wave_height_total = bathy_b.add(wave_height_m, ripple_height_gated)
+        # The wake's ART channel (SIGNAL 6 below) -- built from the GATED
+        # taps, so foam and displacement are one channel on one knob.
+        disturbance_foam = build_disturbance_foam(
+            bathy_b, ripple_grad_gated, ripple_height_gated)
+
+    # SIGNAL 5 (Phase F2, 2026-09-05): WIND-DRIVEN WHITECAPS, the fifth
+    # direction on the same physical thing, maxed in like the other four.
+    # build_whitecap_foam reads the wave field's OWN gradient and wind (no
+    # second field) and carries the reasoning: crest steepness TIMES wind
+    # coverage (a product, not a max -- speed sets how many crests carry
+    # caps, steepness sets where), zero whitecaps at published-calm wind by
+    # construction, and the FoamV2Gain(MPC, cvar-driven)/FoamV2Enabled
+    # control pair -- both pixel-identical offs. It rides opacity with it,
+    # exactly as SIGNAL 4's note above says any foam signal does.
+    whitecap = water_wave_graph.build_whitecap_foam(bathy_b, wave_field)
+    foam_raw = bathy_b.maximum(foam_raw, whitecap["whitecap"])
+
+    # SIGNAL 6 (2026-09-05, the wake-art verdict): DISTURBANCE FOAM -- white
+    # water wherever the ripple field says the water is disturbed, so a boat
+    # trails a visible wedge and a splash flashes white. The debug arm proved
+    # the field carried the wake while the composite spent it only on normal
+    # tilt and centimetre WPO; this is the missing VISUAL channel. The
+    # derivation, the vivid-by-request default, and the frozen-arm semantics
+    # are ripple_field_graph.build_disturbance_foam's; maxed in like every
+    # other signal, absent (None) exactly when the ripple arm is absent.
+    if disturbance_foam is not None:
+        foam_raw = bathy_b.maximum(foam_raw, disturbance_foam["foam"])
+
     foam = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -190, -60)
     if not mel.connect_material_expressions(foam_raw, "", foam, "A"):
         raise RuntimeError("connect foam_raw -> foam.A failed")
@@ -1789,639 +2011,97 @@ def main():
     # them the SAME value, where SceneDepth deliberately gives them different
     # ones. It introduces no ordering sensitivity the buckets do not already
     # carry.
-    # sky_collection was loaded at the top of this function, where the Phase 3
-    # bathymetry block first binds to it. ONE LOAD, deliberately: two would be two
-    # objects that could in principle disagree about which parameters exist, and
-    # the check below is only as good as the object it reads back from.
-
-    # EVERY COLLECTION BINDING IN THIS FILE GOES THROUGH HERE, AND IT CHECKS THE
-    # NAME AGAINST THE ASSET AS READ BACK.
     #
-    # This closes the one gap create_sky_material.py's ordering note left open. That
-    # file says an unresolved CollectionParameter does not fail to compile, it
-    # compiles to a CONSTANT (MaterialExpressions.cpp:17179-17193), and that both
-    # sky generators re-check every binding by name for exactly that reason. THIS
-    # generator never did -- it set parameter_name and hoped -- which is why the
-    # 2026-08-10 failure had to be diagnosed from the owner's "I don't see any lake
-    # basins" rather than from a raised exception at authoring time.
+    # THE CHAIN THAT ANSWERS IT -- the Fresnel sky reflection with its
+    # MoonLightFraction night branch, the analytic sun glint, the moon glint
+    # that mirrors it node for node, and the reflected-stars arm -- used to be
+    # ~640 lines HERE and is now water_sky_reflection_graph.build_sky_reflection,
+    # promoted verbatim on 2026-09-05 so M_Ocean can consume the same derivation
+    # instead of a copy (docs/water-ocean-tides-plan-2026-09-04.md, Materials
+    # OPEN item 1). NOTHING ABOUT THE CHAIN CHANGED BY MOVING IT: same nodes,
+    # same links, same MPC bindings (SunDirection, MoonDirection,
+    # MoonLightFraction, StarBrightness -- all still name-checked against the
+    # collection as read back), same parameter names and defaults, same editor
+    # positions, and the whole of the reasoning -- the area-light glint
+    # derivation, the 2.4-degree drawn moon, the retired-LegacySkyReflectGain
+    # measurement table, the cavern-pool limitation, the star arm's mip
+    # behaviour -- moved WITH the nodes it documents. Read it there.
     #
-    # A typo or a stale MPC now raises HERE, naming the parameter and listing what
-    # the collection actually has, which is a thirty-second fix instead of a
-    # debugging session. Note the two failure shapes it catches are different: a
-    # DELETED parameter raises, and so does a parameter this script expects that a
-    # not-yet-regenerated MPC does not have -- which is precisely the ordering
-    # mistake documented at the top of create_sky_material.py.
-    def collection_param(name, x, y):
-        have = [str(p.get_editor_property("parameter_name"))
-                for p in sky_collection.get_editor_property("scalar_parameters")]
-        have += [str(p.get_editor_property("parameter_name"))
-                 for p in sky_collection.get_editor_property("vector_parameters")]
-        if name not in have:
-            raise RuntimeError(
-                "MPC_VoxelSky has no parameter %r -- it has %s. If you just added it to "
-                "create_sky_material.py's SCALAR_PARAMS/VECTOR_PARAMS, you have to RE-RUN that "
-                "script (and then the dome, then this one, in that order -- see the ordering note "
-                "at the top of create_sky_material.py). An unresolved CollectionParameter does not "
-                "fail to compile, it compiles to a constant, so this check is the only thing "
-                "between a typo and a silently dead term."
-                % (name, sorted(have)))
-        node = mel.create_material_expression(
-            material, unreal.MaterialExpressionCollectionParameter, x, y)
-        node.set_editor_property("collection", sky_collection)
-        node.set_editor_property("parameter_name", name)
-        return node
-
-    # SunDirection is written every frame by VoxelSkySubsystem (ApplySkyMaterial
-    # parameters). Reusing it rather than a constant is what keeps the glint on
-    # the actual sun: the water tracks sunrise and sunset for free, and a frozen
-    # -TimeScale 0 capture gets the sun the rest of the frame was lit by.
-    sun_dir_param = collection_param("SunDirection", -1300, 1300)
-
-    sun_dir3 = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 1300)
-    sun_dir3.set_editor_property("r", True)
-    sun_dir3.set_editor_property("g", True)
-    sun_dir3.set_editor_property("b", True)
-    sun_dir3.set_editor_property("a", False)
-    if not mel.connect_material_expressions(sun_dir_param, "", sun_dir3, ""):
-        raise RuntimeError("connect sun_dir_param -> sun_dir3 failed")
-
-    # SUN GLINT, computed analytically instead of left to the engine's specular.
-    # The material already sets Specular 0.5 / Roughness 0.08 and that survives
-    # unchanged, but a translucent surface's specular response is the part of
-    # translucent lighting that is least reliable to author against -- the W3
-    # note above records the same lesson from the other side, where the
-    # volumetric lighting mode ignored the material normal outright. reflect(V)
-    # dot SunDirection is not subject to any of that: it is the mirror direction
-    # against this material's own rippled normal, so the glint lands exactly
-    # where the wave that produced it is.
-    refl_vec = mel.create_material_expression(material, unreal.MaterialExpressionReflectionVectorWS, -1120, 1450)
-
-    # ======================================================================
-    # THE GLINT IS A REPRESENTATIVE-POINT AREA LIGHT (2026-08-11), NOT A DOT
-    # PRODUCT RAISED TO A LARGE POWER.
+    # WHAT THIS CALL SITE STILL OWNS, because it is this material's business and
+    # not the chain's:
     #
-    # WHAT WAS WRONG WITH THE OLD ONE, in the terms the old comment set for
-    # itself. It computed pow(saturate(dot(R, SunDirection)), 900) and justified
-    # the 900 as "the sun subtends about half a degree", which is true and is
-    # also not what that expression does. A Phong lobe of exponent 900 has a
-    # half-width of roughly acos(0.5^(1/900)) ~= 2 degrees, but it is a smooth
-    # peak with no flat top, so the highlight it returns is a fading point, and
-    # it never returns the sun's actual angular SIZE. Against the old ripple --
-    # whose maximum surface tilt was about 4 degrees -- the mirror ray barely
-    # moved, so the result was a single small dot rather than the streak the
-    # moon-glint note below assumes.
+    #   * A FRESH SkyGraphBuilder, not bathy_b. The named-position nodes never
+    #     touch the builder's auto-placement lane, but the star arm auto-places
+    #     through it, and a fresh builder puts those nodes exactly where the
+    #     pre-move graph put them -- the regenerated asset diffs clean. (One
+    #     collection object either way: it is the same sky_collection loaded
+    #     once at the top of this function, so there are not two objects that
+    #     could disagree about which parameters exist.)
+    #   * foam -- this mesher's four-signal composite. Froth must suppress the
+    #     mirror (a scattering layer does not reflect the sky), and the module
+    #     takes the SIGNAL rather than assuming one because the ocean's foam is
+    #     a different (single-signal) quantity.
+    #   * top_face_mask -- the normal-test mask the foam section built (not
+    #     VertexColor.B; see that section for why B would ring every body with
+    #     a stripe). A submerged side wall is not a sky-facing surface and must
+    #     not reflect one; the ocean grid has no side walls and passes None.
+    #   * STAR_REFLECTION -- the VOXEL_WATER_STAR_REFLECT build-time arm,
+    #     unchanged in meaning: the OFF arm genuinely does not contain the
+    #     star fetch, which is what makes the perf A/B honest. The read-back
+    #     at the bottom of this file still counts StarmapTex parameters on the
+    #     SAVED asset and still cross-checks this flag against it.
     #
-    # THE FIX, which is what Sea of Thieves ships. Treat the light as a SPHERE
-    # of angular radius alpha instead of a point. For each pixel, find the point
-    # on that sphere closest to the mirror ray and evaluate the lobe against
-    # THAT direction:
-    #
-    #     centerToRay = dot(L, R) * R - L        (perpendicular from L to the ray)
-    #     closest     = L + centerToRay * saturate(sinAlpha / |centerToRay|)
-    #
-    # When the mirror ray already points inside the disc the clamp does nothing
-    # and the result is exactly 1, so the highlight gets a FLAT TOP of the
-    # light's real angular size with the old lobe as its falloff skirt. That is
-    # the shape a real specular return off water has, and it is what lets the
-    # wave slope distribution smear it into a path instead of scattering a field
-    # of dots.
-    #
-    # ENERGY IS NOT INVENTED. Widening a light without renormalising makes the
-    # highlight brighter as well as bigger, which is how this technique usually
-    # goes wrong. Karis's sphere normalisation (a / (a + sinAlpha))^2, with the
-    # Phong exponent mapped to a roughness-like a = 2/(exp+2), is applied so the
-    # integral is preserved: at the shipped 0.55 deg the factor is ~0.98, so the
-    # sun highlight is essentially unchanged in total energy and only changed in
-    # shape. It matters much more for the moon at 2.4 deg, where it is ~0.72.
-    #
-    # ONE NODE, TWO CALLERS. The sun and the moon differ by the light direction
-    # and the angular radius and by nothing else, so this is written once and
-    # instantiated twice -- the same discipline the reused glint_tint below
-    # already applies to the colour.
-    GLINT_CODE = """
-// Representative-point (closest-point-on-sphere) area specular.
-// R is the mirror direction about this material's own rippled normal, so the
-// highlight lands on the wave that produced it. L is the light direction.
-float3 Rn = normalize(R);
-float3 Ln = normalize(L);
-float  sinAlpha = sin(radians(max(AngularRadiusDeg, 0.0)));
-float3 centerToRay = dot(Ln, Rn) * Rn - Ln;
-float  ctrLen = length(centerToRay);
-float3 closest = Ln + centerToRay * saturate(sinAlpha / max(ctrLen, 1e-5));
-float  d = saturate(dot(Rn, normalize(closest)));
-// Karis sphere normalisation: widening the source must not add energy.
-float  a = 2.0 / max(SpecExponent + 2.0, 2.0);
-float  n = a / max(a + sinAlpha, 1e-5);
-return pow(d, max(SpecExponent, 1.0)) * n * n;
-"""
-
-    # The exponent is SHARED by both glints and is a parameter now rather than a
-    # baked 900. It sets the width of the falloff skirt around the flat top; the
-    # flat top itself is the angular radius. 900 is kept as the default so a
-    # regeneration with no instance overrides changes the skirt by nothing.
-    glint_exponent = scalar_param("GlintSpecularExponent", 900.0, -1300, 1240)
-    sun_glint_radius = scalar_param("SunGlintAngularRadiusDeg", 0.55, -1300, 1180)
-
-    glint_pow = custom_node(
-        "SunGlint", GLINT_CODE, ["R", "L", "AngularRadiusDeg", "SpecExponent"],
-        -800, 1380, unreal.CustomMaterialOutputType.CMOT_FLOAT1)
-    if not mel.connect_material_expressions(refl_vec, "", glint_pow, "R"):
-        raise RuntimeError("connect refl_vec -> sun glint.R failed")
-    if not mel.connect_material_expressions(sun_dir3, "", glint_pow, "L"):
-        raise RuntimeError("connect sun_dir3 -> sun glint.L failed")
-    if not mel.connect_material_expressions(sun_glint_radius, "", glint_pow, "AngularRadiusDeg"):
-        raise RuntimeError("connect sun_glint_radius -> sun glint.AngularRadiusDeg failed")
-    if not mel.connect_material_expressions(glint_exponent, "", glint_pow, "SpecExponent"):
-        raise RuntimeError("connect glint_exponent -> sun glint.SpecExponent failed")
-
-    # Slightly over 1 and slightly warm: a specular sun return is brighter than
-    # the sky it sits in, and clamping it to 1 is what makes a highlight read as
-    # a painted white dot rather than as light.
-    glint_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -650, 1520)
-    glint_tint.set_editor_property("constant", unreal.LinearColor(2.6, 2.45, 2.15, 1.0))
-    glint = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, 1440)
-    if not mel.connect_material_expressions(glint_pow, "", glint, "A"):
-        raise RuntimeError("connect glint_pow -> glint.A failed")
-    if not mel.connect_material_expressions(glint_tint, "", glint, "B"):
-        raise RuntimeError("connect glint_tint -> glint.B failed")
-
-    # ======================================================================
-    # MOON GLINT -- the moon path on the water. Added 2026-08-11 because the
-    # owner asked why the moon does not reflect off the lake.
-    #
-    # THERE WERE TWO REASONS IT DID NOT, and this material was only one of them.
-    # The other was in C++ and is the bigger one: both directional lights sat at
-    # ForwardShadingPriority 0, so the renderer picked the single forward /
-    # translucent light by raw brightness and handed it to the SUN at midnight
-    # (LightGridInjection.cpp:1500-1520). This material is BLEND_TRANSLUCENT with
-    # TLM_SURFACE_PER_PIXEL_LIGHTING, so its direct lighting comes from exactly
-    # that one light -- a sun below the horizon, N.L clamped to zero, no direct
-    # light on the lake all night from either body. That half is fixed in
-    # UVoxelSkySubsystem::ApplyLightsFromState; see kForwardMoonPrimarySunBelowDeg.
-    # This half is the SPECULAR half, and neither alone is enough.
-    #
-    # STRUCTURALLY IDENTICAL TO THE SUN GLINT ABOVE, deliberately, down to the
-    # exponent and the tint. Every difference between them is one multiply. The
-    # things it therefore inherits for free: the same reflect(V) mirror direction
-    # against this material's own rippled normal, so the moon path breaks up over
-    # waves exactly as the sun's does; and the same reason for computing it
-    # analytically rather than trusting translucent specular.
-    #
-    # THE ANGULAR RADIUS IS 2.4 DEGREES, WHICH REVERSES AN EARLIER DECISION HERE,
-    # AND THE REASON IT CAN BE REVERSED IS THAT THE MECHANISM CHANGED.
-    #
-    # What this comment used to say: the exponent stays at the sun's 900, because
-    # the real moon subtends the same ~0.5 deg the sun does, and because widening
-    # a Phong LOBE is the way to turn a highlight into a plate of wet plastic
-    # across the whole basin. Both halves of that were right about a Phong lobe.
-    #
-    # The glint is no longer a Phong lobe. It is a representative-point area light
-    # (see the sun glint above), which separates two things the exponent used to
-    # conflate: the light's angular SIZE, which is now the flat top, and the
-    # falloff SKIRT, which is still the exponent and is still 900 and is still
-    # shared with the sun. Widening the size no longer widens the skirt, so the
-    # wet-plastic failure mode is not on the table -- the highlight gets a 2.4 deg
-    # core and the same tight edge it always had, and Karis normalisation takes
-    # its peak brightness down by ~28% to pay for the extra area.
-    #
-    # 2.4 deg is deliberately the project's DRAWN moon, not the real one. The moon
-    # in this sky is enlarged about nine times (kMoonDrawnAngularRadiusDeg), and a
-    # path on the water whose source is 0.5 deg while the disc above it is 2.4 deg
-    # is two different moons in the same frame. The disc is the one the owner sees,
-    # so the water agrees with the disc. That is the enlarged-disc cheat being
-    # applied consistently rather than a second cheat.
-    #
-    # THE TINT IS THE SUN'S TINT SCALED BY MoonLightFraction, and that one multiply
-    # is the whole physical content of this block. MoonLightFraction is written every
-    # frame by UVoxelSkySubsystem::ApplySkyMaterialParams as
-    # S.MoonIntensity / GetSunIntensity() -- "how much dimmer than the sun the moon
-    # is, right now". So the moon's highlight is the sun's calibrated highlight,
-    # dimmed by exactly the ratio the two LIGHTS are dimmed by. Nothing here needs
-    # tuning and nothing here can drift from the lighting rig.
-    #
-    # WHAT THAT ONE SCALAR CARRIES, all of it from the C++ side with no logic here:
-    #   * moonset      -- MoonHorizonGate is already inside S.MoonIntensity, so the
-    #                     path fades out as the moon sets and is gone once it is down
-    #   * new moon     -- MoonIlluminatedFraction is in there too, so a new moon
-    #                     lays no path at all
-    #   * daylight     -- the sun-suppression term zeroes it before sunrise
-    #   * the owner's knob -- voxel.Sky.MoonIntensity scales it, so dialling the
-    #                     moonlight moves the water and the ground by the same stops
-    # Reconstructing any of those from MoonDirection and MoonPhaseFraction in this
-    # graph was the alternative, and it would have been a second copy of
-    # ApplyLightsFromState living in a Python asset generator, unable to see the
-    # cvar, and wrong in a way no log line would report.
-    moon_dir_param = collection_param("MoonDirection", -1300, 1900)
-
-    moon_dir3 = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 1900)
-    moon_dir3.set_editor_property("r", True)
-    moon_dir3.set_editor_property("g", True)
-    moon_dir3.set_editor_property("b", True)
-    moon_dir3.set_editor_property("a", False)
-    if not mel.connect_material_expressions(moon_dir_param, "", moon_dir3, ""):
-        raise RuntimeError("connect moon_dir_param -> moon_dir3 failed")
-
-    # Scalar. NOT masked -- a CollectionParameter bound to a SCALAR compiles as a
-    # float and a ComponentMask on it is both unnecessary and a pin-type mismatch
-    # waiting to happen. The vector ones above are masked only to drop the unused
-    # .a that FLinearColor forces on them.
-    moon_light_fraction = collection_param("MoonLightFraction", -1300, 2060)
-
-    # SAME Custom node source as the sun glint, instantiated a second time. The
-    # only two differences are the light direction and the angular radius, which
-    # is what "structurally identical, every difference is one multiply" was
-    # always meant to mean -- and now the two cannot drift apart in their MATH
-    # either, only in their two inputs, because there is one GLINT_CODE string.
-    moon_glint_radius = scalar_param("MoonGlintAngularRadiusDeg", 2.4, -1300, 2120)
-
-    moon_glint_pow = custom_node(
-        "MoonGlint", GLINT_CODE, ["R", "L", "AngularRadiusDeg", "SpecExponent"],
-        -800, 1900, unreal.CustomMaterialOutputType.CMOT_FLOAT1)
-    if not mel.connect_material_expressions(refl_vec, "", moon_glint_pow, "R"):
-        raise RuntimeError("connect refl_vec -> moon glint.R failed")
-    if not mel.connect_material_expressions(moon_dir3, "", moon_glint_pow, "L"):
-        raise RuntimeError("connect moon_dir3 -> moon glint.L failed")
-    if not mel.connect_material_expressions(moon_glint_radius, "", moon_glint_pow, "AngularRadiusDeg"):
-        raise RuntimeError("connect moon_glint_radius -> moon glint.AngularRadiusDeg failed")
-    if not mel.connect_material_expressions(glint_exponent, "", moon_glint_pow, "SpecExponent"):
-        raise RuntimeError("connect glint_exponent -> moon glint.SpecExponent failed")
-
-    moon_glint_scaled = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, 1960)
-    if not mel.connect_material_expressions(moon_glint_pow, "", moon_glint_scaled, "A"):
-        raise RuntimeError("connect moon_glint_pow -> moon_glint_scaled.A failed")
-    if not mel.connect_material_expressions(moon_light_fraction, "", moon_glint_scaled, "B"):
-        raise RuntimeError("connect moon_light_fraction -> moon_glint_scaled.B failed")
-
-    # glint_tint REUSED, not copied. One node, one calibration, and the moon glint
-    # cannot acquire a different colour balance from the sun glint by an edit that
-    # only remembers to change one of them.
-    moon_glint = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -380, 1900)
-    if not mel.connect_material_expressions(moon_glint_scaled, "", moon_glint, "A"):
-        raise RuntimeError("connect moon_glint_scaled -> moon_glint.A failed")
-    if not mel.connect_material_expressions(glint_tint, "", moon_glint, "B"):
-        raise RuntimeError("connect glint_tint -> moon_glint.B failed")
-
-    # SKY REFLECTION. A constant sky colour gated by sun altitude, NOT a scene
-    # capture and NOT a reflection probe: the ban in the module docstring is on
-    # reading scene COLOUR, and a probe read is the same hazard wearing a
-    # different name. SunDirection.z is the sine of the sun's altitude, so
-    # saturate() of it is 0 from dusk to dawn and the lake stops reflecting a
-    # blue sky it cannot see -- the one piece of time-of-day behaviour this term
-    # genuinely needs, and it costs one node.
-    sun_alt = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 1600)
-    sun_alt.set_editor_property("r", False)
-    sun_alt.set_editor_property("g", False)
-    sun_alt.set_editor_property("b", True)
-    sun_alt.set_editor_property("a", False)
-    if not mel.connect_material_expressions(sun_dir_param, "", sun_alt, ""):
-        raise RuntimeError("connect sun_dir_param -> sun_alt failed")
-
-    day_gate = mel.create_material_expression(material, unreal.MaterialExpressionSaturate, -950, 1600)
-    if not mel.connect_material_expressions(sun_alt, "", day_gate, ""):
-        raise RuntimeError("connect sun_alt -> day_gate failed")
-
-    # KNOWN LIMITATION, stated rather than left to be discovered, and the exact
-    # counterpart of the SceneDepth-against-sky note in the depth section above.
-    # saturate(SunDirection.z) is "is the sun up", which is not the same question
-    # as "can THIS surface see the sky". A static cavern pool a hundred metres
-    # underground at noon therefore still gets a sky-blue reflection at grazing
-    # angles, from a sky it has no line of sight to. It is Fresnel-weighted, so
-    # looking down into the pool -- how a cavern pool is normally met -- it is
-    # near zero, and it is the same magnitude a surface lake gets. Fixing it
-    # properly needs a sky-visibility signal that does not exist on this vertex
-    # format: VertexColor.G is the greedy mesher's local AO, which is ~1 in the
-    # middle of any chamber large enough to hold a pool and so cannot express it.
-    # NOT VERIFIED IN A CAPTURE: -VoxelFloodTest found no flooded cavern at the
-    # lake site, and the default cavern site's fine tiles are absent from this
-    # box's cache (tile (-6,3) at s16, absentOnDisk=1). Downgrading the fine-tier
-    # gate to get a frame would have made that frame unreproducible, which is the
-    # one thing the gate exists to prevent.
-    sky_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -950, 1700)
-    sky_tint.set_editor_property("constant", unreal.LinearColor(0.30, 0.46, 0.72, 1.0))
-    sky_lit = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -800, 1650)
-    if not mel.connect_material_expressions(sky_tint, "", sky_lit, "A"):
-        raise RuntimeError("connect sky_tint -> sky_lit.A failed")
-    if not mel.connect_material_expressions(day_gate, "", sky_lit, "B"):
-        raise RuntimeError("connect day_gate -> sky_lit.B failed")
-
-    # THE NIGHT HALF OF THE SAME REFLECTION, and the second reason the lake looked
-    # dead after dark.
-    #
-    # saturate(SunDirection.z) above is EXACTLY ZERO from dusk to dawn. That was
-    # correct as far as it went -- the lake should not mirror a blue daytime sky it
-    # cannot see -- but the consequence was that the Fresnel reflection, the term
-    # the comment above calls "what the eye reads as a liquid surface before any
-    # wave or glint registers", switched off completely every night. A surface with
-    # no reflection at a grazing angle does not read as water at any hour. Note this
-    # is INDEPENDENT of the moon glint added above: the glint is a specular
-    # highlight a few degrees wide, and this is the broad sheen across the whole
-    # basin. Fixing only one of them leaves the lake looking wrong in the other way.
-    #
-    # THE NIGHT SKY IS THE DAY SKY TIMES MoonLightFraction, with no new constant.
-    # sky_tint is the daylit sky's reflected colour; the night sky is lit by the
-    # moon exactly as the day sky is lit by the sun, so scaling by
-    # (moon light / sun light) is not an approximation of convenience, it is the
-    # same ratio the two skies actually stand in -- inside this project's chosen
-    # moon cheat, which is the only frame of reference that matters here. At the
-    # current defaults that puts the reflected sky ~1.8 stops below its daytime
-    # self once the exposure curve's night lift is counted, which sits alongside the
-    # ground's -2.0 stops rather than fighting it. Re-using the SAME scalar the moon
-    # glint uses means the broad sheen and the highlight can never be tuned into
-    # disagreement, and both vanish together at moonset and at new moon.
-    #
-    # THE COLOUR IS DELIBERATELY NOT SHIFTED BLUE. It is tempting to hand the night
-    # branch its own cooler tint, and this file will not: the moon's colour is
-    # settled in C++ from a measurement of T_MoonColor (kMoonAlbedoTint) and is
-    # deliberately NOT the old 12000 K blue, with voxel.Sky.MoonTintStrength as the
-    # A/B. A blue invented here would be a second, unreachable opinion about the
-    # same question, and it would win in the one place the owner is most likely to
-    # be looking at when he forms a view about the night's colour.
-    #
-    # WHAT THIS DOES NOT DO: a moonless but starlit night still gets no sheen from
-    # this term, because MoonLightFraction is 0. That is a real gap and it is left
-    # open rather than papered over with an invented starlight floor -- the honest
-    # value for one is a measurement nobody has taken. Starlight is NOT absent from
-    # the water in that case: the SkyLight's real-time capture carries the star term
-    # (voxel.Sky.StarAmbientGain, routed into the capture through
-    # M_SkyAtmosphereDome's ReflectionCapturePassSwitch) and reaches this surface as
-    # DIFFUSE ambient on BaseColor. What it cannot do is produce a mirrored sky at a
-    # grazing angle. Giving the lake literal reflected STARS -- individual points,
-    # moving with the sidereal rotation -- means sampling T_SkyStarmap along the
-    # reflection vector via Tools/sky_star_graph.py's sample_starmap, which is
-    # allowed (it is a texture read, not a scene-colour read, so no ban is engaged)
-    # but adds the whole star subgraph to a TRANSLUCENT material drawn over very
-    # large screen areas by the far-field sheets. That is a perf decision on a frame
-    # already measured as render-thread bound, so it is a deliberate non-goal here
-    # rather than an oversight.
-    night_sky = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -800, 1780)
-    if not mel.connect_material_expressions(sky_tint, "", night_sky, "A"):
-        raise RuntimeError("connect sky_tint -> night_sky.A failed")
-    if not mel.connect_material_expressions(moon_light_fraction, "", night_sky, "B"):
-        raise RuntimeError("connect moon_light_fraction -> night_sky.B failed")
-
-    # ADD, not LERP. The two branches are already mutually exclusive in practice --
-    # the day gate is 0 whenever the sun is down and MoonLightFraction is 0 whenever
-    # the sun is up (ApplyLightsFromState's sun-suppression term is what guarantees
-    # the second one) -- so a lerp would need a third gate to express something the
-    # inputs already express, and would be a place for the two to disagree.
-    sky_total = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -680, 1700)
-    if not mel.connect_material_expressions(sky_lit, "", sky_total, "A"):
-        raise RuntimeError("connect sky_lit -> sky_total.A failed")
-    if not mel.connect_material_expressions(night_sky, "", sky_total, "B"):
-        raise RuntimeError("connect night_sky -> sky_total.B failed")
-
-    # ======================================================================
-    # REFLECTED STARS (2026-08-11) -- the gap the block above names, closed.
-    #
-    # The night branch immediately above stops at a flat scaled sky colour, and
-    # its own comment says why that is not the whole answer: a moonless night
-    # gets no sheen at all, because MoonLightFraction is 0, and even a moonlit
-    # one gets a featureless wash where the eye expects points of light. The
-    # comment then names the fix and calls it a deliberate non-goal on perf
-    # grounds. This block does it, and the perf question is now answered with a
-    # measurement instead of an estimate rather than left as an assumption --
-    # which is the whole reason STAR_REFLECTION above is a build-time arm.
-    #
-    # WHAT IS ALLOWED HERE AND WHAT IS NOT. The standing ban in the module
-    # docstring is on reading scene COLOUR: refraction, planar reflections, an
-    # SSR probe. All three are banned because the value they read IS the
-    # partially composed translucent stack, so the answer depends on draw order
-    # and two water fragments at one pixel disagree. A TEXTURE fetch along the
-    # reflection vector has none of that: T_SkyStarmap is the same texture
-    # whatever else has been drawn, so every fragment computes the same answer in
-    # any order. The sort-key argument the Fresnel block makes a few lines up
-    # applies here word for word.
-    #
-    # THE DIRECTION IS refl_vec, THE SAME NODE THE TWO GLINTS USE. That is not a
-    # saving of one node, it is the guarantee that the mirrored sky and the two
-    # mirrored light sources are all mirrored about the SAME rippled normal. If
-    # the stars used their own reflection the moon path could sit in one place
-    # and the reflected star field in another, on the same wave.
-    #
-    # THE HORIZON FADE IS DOING REAL WORK HERE, not carried along from the dome.
-    # build_horizon_fade smoothsteps on the Z of the direction it is handed, and
-    # the direction handed to it here is the MIRROR ray, not the gaze. So it
-    # asks "does the mirror ray point at the sky or into the ground", and kills
-    # the term when the answer is the ground: on the underside of a surface seen
-    # from below (this material is two_sided), and on the far face of a ripple
-    # steep enough to turn the mirror ray downward. Without it those pixels would
-    # sample the star map's southern rows and show stars coming out of the lake
-    # bed.
-    #
-    # THE NIGHT GATE IS StarBrightness, AND IT IS NOT MoonLightFraction.
-    # StarBrightness is the MPC scalar C++ already writes every frame as the
-    # sunrise fade (1 below about -12 deg solar altitude, 0 above 0 deg,
-    # smoothstepped between -- VoxelSkySubsystem StarBrightnessForSunAltitude,
-    # times voxel.Sky.StarGain). Using it means:
-    #   * the reflected stars appear and fade at EXACTLY the moment the real ones
-    #     do, because it is the same scalar M_NightSky's own gain uses, and
-    #   * they survive a new moon and a moonset, which is the precise gap the
-    #     block above documents and could not close with MoonLightFraction --
-    #     that scalar is 0 on a moonless night, and a moonless night is when
-    #     stars are most visible, not least.
-    # Scaling this by MoonLightFraction as well would have been "consistent with
-    # the night sky term" in wording and backwards in physics.
-    #
-    # BRIGHTNESS IS FRESNEL AND NOTHING ELSE. This term is added into sky_total,
-    # so the multiply by `fresnel` a few lines below is the only scaling it gets:
-    # about 0.02 looking straight down, rising toward 1 at a grazing angle. That
-    # IS the reflectance of water, so no invented constant is needed and the
-    # still-water grazing view the owner asked about -- where Fresnel is near 1 --
-    # is exactly the case that shows the most stars. StarReflectGain is a plain
-    # material scalar (default 1.0, i.e. physically neutral) left in as the one
-    # knob, so the term can be dimmed or brightened from a material instance
-    # without another regeneration.
-    #
-    # WHAT THIS WILL AND WILL NOT LOOK LIKE, stated now so a capture is not read
-    # as a bug. The star map is sampled with EXPLICIT derivatives, so the mip is
-    # chosen from how fast the reflection vector varies across the screen. On
-    # STILL water the normal barely changes, the derivatives are tiny and the
-    # stars are near-point sharp. On chop the mirror ray swings by degrees per
-    # pixel, a low mip is selected, and the star field correctly degrades to a
-    # broad glow rather than to a field of aliasing sparkle. Both are right; only
-    # the first is the picture anyone imagines when they ask for this.
-    #
-    # THE ONE KNOWN ARTEFACT. sky_star_graph's seam fix subtracts round(du/dx),
-    # which assumes a real derivative is far below 0.5 turns per pixel. On a
-    # steep ripple near the celestial poles that assumption can fail and the mip
-    # comes out one or two levels too sharp for a few pixels. On the DOME that
-    # case cannot arise (the gaze direction is smooth); here it can. The visible
-    # consequence is a little shimmer in the reflection of the polar sky on
-    # rough water, and it is bounded by the same star field being dim there.
-    sky_reflected = sky_total
-    if STAR_REFLECTION:
-        # SkyGraphBuilder rather than raw mel calls, because build_star_uv and
-        # sample_starmap are written against it. It brings its own checked
-        # connects and its own checked CollectionParameter binding, which is the
-        # same guarantee collection_param() above gives this file's own nodes.
-        b = SkyGraphBuilder(material, sky_collection)
-
-        # Normalized explicitly. ReflectionVectorWS is unit length in practice,
-        # but build_star_uv's arcsine reads this vector's Z as sin(dec) directly
-        # and a length that is 1.001 is a declination error, not a brightness
-        # error -- it would move stars, silently.
-        refl_dir = b.normalize(refl_vec)
-        refl_z = b.mask(refl_dir, "", b=True)
-
-        star_uv, star_ddx, star_ddy = build_star_uv(b, refl_dir, refl_z)
-        starmap = sample_starmap(b, star_uv, star_ddx, star_ddy)
-
-        star_gain = b.mul(b.collection_param("StarBrightness"),
-                          build_horizon_fade(b, refl_z))
-        star_gain = b.mul(star_gain, b.scalar("StarReflectGain", 1.0))
-
-        # "RGB" explicitly: a TextureSample's DEFAULT output is RGBA, and
-        # multiplying a float4 into this chain would carry an alpha nobody wants
-        # into the emissive sum. sky_star_graph's own docstring for
-        # sample_starmap says to read RGB and not the default, for this reason.
-        star_reflection = b.mul(starmap, star_gain, "RGB", "")
-
-        # ADDED to sky_total, and therefore UPSTREAM of Fresnel, of the foam
-        # suppression and of the top-face mask below. All three are wanted:
-        # stars are a reflection so they must obey Fresnel; whitewater scatters
-        # and must not mirror a star field; and a submerged side wall is not a
-        # sky-facing surface. Attaching this after the Fresnel multiply would
-        # have quietly opted out of all three.
-        sky_reflected = b.add(sky_total, star_reflection)
-
-    # Fresnel with water's real normal-incidence reflectance, 0.02. The Normal
-    # input is deliberately LEFT UNCONNECTED so the node uses this material's own
-    # shading normal -- which is the panning ripple authored in the W3 section
-    # below. Connecting `normal_xyz` here instead would be a bug that compiles:
-    # that value is TANGENT space and this pin wants world space.
-    fresnel = mel.create_material_expression(material, unreal.MaterialExpressionFresnel, -650, 1650)
-    fresnel.set_editor_property("exponent", 5.0)
-    fresnel.set_editor_property("base_reflect_fraction", 0.02)
-
-    reflection_fresnel = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, 1650)
-    if not mel.connect_material_expressions(sky_reflected, "", reflection_fresnel, "A"):
-        raise RuntimeError("connect sky_reflected -> reflection_fresnel.A failed")
-    if not mel.connect_material_expressions(fresnel, "", reflection_fresnel, "B"):
-        raise RuntimeError("connect fresnel -> reflection_fresnel.B failed")
-
-    # THE ONE KNOB THE SLW PORT ADDS TO THIS BLOCK, AND WHY IT IS 1.0.
-    #
-    # Everything above -- the constant sky tint, the day gate, the
-    # MoonLightFraction night branch, the reflected stars, the Fresnel weight --
-    # was authored for a TRANSLUCENT surface, whose environment specular is the
-    # part of translucent lighting the W6 note above calls "least reliable to
-    # author against". A Single Layer Water surface is not in that position: it
-    # goes through the deferred path and receives the engine's own reflection
-    # from reflection captures and the skylight, and this project's skylight is a
-    # real-time capture of its own sky and moon. So there is now a SECOND source
-    # of reflected sky on this surface, and the two may double up.
-    #
-    # IT IS NOW MEASURED, AND THEY DO DOUBLE UP. 2026-08-12, the lake at
-    # (-65102,-51084), camera 12 m up at pitch -30, noon, same exposure in every
-    # arm (a land patch reads 0.1491-0.1494 display-linear in all five). Mid-lake
-    # water, display-linear RGB:
-    #
-    #   both reflections (shipped)        0.245 / 0.388 / 0.510
-    #   r.Water.SingleLayer.Reflection 0  0.084 / 0.169 / 0.265   (this term only)
-    #   LegacySkyReflectGain 0            0.106 / 0.203 / 0.287   (engine term only)
-    #   both off                          0.000 / 0.008 / 0.005   (the volume alone)
-    #   the lake bed with no water at all 0.041 / 0.044 / 0.021
-    #
-    # So each sky reflection is on its own worth about two thirds of the water's
-    # brightness, the two together are ~98% of it, and BOTH of them are several
-    # times brighter than the lake bed they sit on top of. With both removed the
-    # bed is plainly visible through the water and grades with depth exactly as
-    # the coefficients above intend -- transmittance measured from the waterline
-    # outward is (0.84,0.92,0.89) in the first few centimetres, (0.20,0.51,0.54)
-    # a metre or two out, and red-dead-blue-alive beyond that.
-    #
-    # THE DEFAULT IS 0.0: THE OWNER RETIRED THIS TERM ON 2026-08-12, on the
-    # measurements above. It is kept as a parameter rather than deleted so the
-    # old look is one instance value away and the arms stay reproducible.
-    #
-    # WHY THIS ONE AND NOT THE ENGINE'S, since either would remove the double.
-    # They are not equivalent, and the difference is exactly the defect:
-    #
-    #   * The ENGINE'S reflection participates in the energy split. The shader
-    #     does ScatteredLuminance *= (1 - EnvBrdf) and Reflection *= EnvBrdf, so
-    #     reflection and volume TRADE OFF and sum to <= 1. Turn the water's
-    #     depth grading up and the reflection makes room for it.
-    #   * THIS term is added to Emissive, which is outside that split -- pure
-    #     addition on top of everything else. That is why it did not merely
-    #     brighten the water, it BURIED the volume: measured mid-lake the volume
-    #     alone reads 0.000/0.008/0.005 against this term's 0.106/0.203/0.287.
-    #
-    # And the engine's tracks the real sky -- this project's skylight is a
-    # real-time capture, so it follows time of day, the moon and cloud, where a
-    # constant-sky Fresnel cannot. Removing this term moved the relative
-    # structure in the water (SD/mean of luma) from 0.127 to 0.304.
-    #
-    # THE HISTORY, so nobody re-adds it: this term was written when the water
-    # was BLEND_TRANSLUCENT + MSM_DefaultLit, under this project's own ban
-    # ("reflections stay constant-sky Fresnel, no dynamic reflection capture").
-    # With captures off the table the material had to fake a sky reflection
-    # itself. The Single Layer Water port put the water on the deferred path
-    # where the engine composites captures and the skylight unconditionally --
-    # so the port added the real thing without removing the stand-in. This is
-    # the removal.
-    #
-    # The star reflection rides this gain too, which is correct: the engine's
-    # skylight capture already contains the stars via M_SkyAtmosphereDome's
-    # ReflectionCapturePassSwitch, so if one is redundant both are.
-    legacy_sky_gain = scalar_param("LegacySkyReflectGain", 0.0, -650, 1760)
-    reflection = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -420, 1650)
-    if not mel.connect_material_expressions(reflection_fresnel, "", reflection, "A"):
-        raise RuntimeError("connect reflection_fresnel -> reflection.A failed")
-    if not mel.connect_material_expressions(legacy_sky_gain, "", reflection, "B"):
-        raise RuntimeError("connect legacy_sky_gain -> reflection.B failed")
-
-    # BOTH GLINTS ARE FRESNEL-FREE, day and night alike. The reflection above is
-    # Fresnel-weighted and these are not, and that asymmetry is correct rather than
-    # an oversight: Fresnel governs how much of the SKY a surface mirrors, while a
-    # specular return off a rippled surface is dominated by the slope distribution
-    # -- which the normal already supplies. Weighting the glint by Fresnel too would
-    # delete the sun's own reflection when looking straight down at a calm lake at
-    # noon, which is the one place everyone has seen it.
-    glints = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -340, 1440)
-    if not mel.connect_material_expressions(glint, "", glints, "A"):
-        raise RuntimeError("connect glint -> glints.A failed")
-    if not mel.connect_material_expressions(moon_glint, "", glints, "B"):
-        raise RuntimeError("connect moon_glint -> glints.B failed")
-
-    surface_light = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -220, 1540)
-    if not mel.connect_material_expressions(reflection, "", surface_light, "A"):
-        raise RuntimeError("connect reflection -> surface_light.A failed")
-    if not mel.connect_material_expressions(glints, "", surface_light, "B"):
-        raise RuntimeError("connect glints -> surface_light.B failed")
-
-    # FOAM IS ADDITIVE ON TOP OF THIS, and this is the pin that makes that true
-    # in the direction that matters. Froth is a scattering medium: it is the one
-    # part of a water surface that does NOT mirror the sky, and letting the
-    # reflection survive underneath it would put a sky sheen on whitewater. The
-    # existing foam lerps on colour, opacity and roughness are unchanged and
-    # still run after this, so foam continues to win where it is present and
-    # contributes nothing at all where it is zero -- which is every still lake
-    # and every static cavern pool.
-    one_minus_foam = mel.create_material_expression(material, unreal.MaterialExpressionOneMinus, -340, 1660)
-    if not mel.connect_material_expressions(foam, "", one_minus_foam, ""):
-        raise RuntimeError("connect foam -> one_minus_foam failed")
-
-    surface_unfoamed = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -190, 1600)
-    if not mel.connect_material_expressions(surface_light, "", surface_unfoamed, "A"):
-        raise RuntimeError("connect surface_light -> surface_unfoamed.A failed")
-    if not mel.connect_material_expressions(one_minus_foam, "", surface_unfoamed, "B"):
-        raise RuntimeError("connect one_minus_foam -> surface_unfoamed.B failed")
-
-    # Masked to top faces by the SAME top_face_mask the foam uses, for the same
-    # reason given there: a submerged side wall is not a sky-facing surface and
-    # must not reflect one. This is a normal test, not VertexColor.B -- see the
-    # foam section for why B would ring every body with a stripe.
-    surface_emissive = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -40, 1600)
-    if not mel.connect_material_expressions(surface_unfoamed, "", surface_emissive, "A"):
-        raise RuntimeError("connect surface_unfoamed -> surface_emissive.A failed")
-    if not mel.connect_material_expressions(top_face_mask, "", surface_emissive, "B"):
-        raise RuntimeError("connect top_face_mask -> surface_emissive.B failed")
+    # AND ONE THING THE CHAIN GAINED AFTER THE MOVE (2026-09-05, owner
+    # directive "Water is too transparent... should clearly have a surface
+    # ...from distance"): SurfacePresence, the grazing-only sky sheen, one
+    # scalar. SHIPPED AT 0.0 (OFF) BY OWNER VERDICT the same day -- the 1.0
+    # frames washed the deep teal toward sky and read as MORE transparent to
+    # him. The surface-presence job now belongs to the ANGLE-TRUE ABSORPTION
+    # PATH instead (bathy_field_graph.build_slant_depth, BathyRefractInvN2 =
+    # 1.0 secant default -- grazing shallows saturate toward the water's own
+    # body colour). The sheen term stays in the graph at zero gain as the
+    # documented next ladder (0.15-0.3 on top of the slant path); mechanism,
+    # verdict and ladder discipline are at SURFACE PRESENCE in the module
+    # docstring. Both knobs move both waters at once.
+    sky_light = build_sky_reflection(
+        SkyGraphBuilder(material, sky_collection),
+        star_reflection=STAR_REFLECTION,
+        foam=foam,
+        top_face_mask=top_face_mask)
 
     # EMISSIVE, not BaseColor. A reflection is light leaving the surface, not
     # albedo: routing it through BaseColor would make it get multiplied by AO and
     # by the diffuse lighting term, so a reflected sky would darken in an
     # occluded corner, which is backwards.
-    if not mel.connect_material_property(surface_emissive, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+    #
+    # --- DISTURBANCE FOAM RIDES EMISSIVE TOO (2026-09-06, owner session 9) ---
+    #
+    # The owner's own session log proved the ripple field LIVE (max field value
+    # 0.1901, publish on) while he saw NO wake and NO rings -- with SIGNAL 6
+    # foam already baked. The only place every foam signal lands is BaseColor,
+    # and the 2026-08-30 experiment above (W5 composite note) already measured a
+    # BaseColor rewire as a byte-identical NULL on the pond. Whatever SLW does
+    # with BaseColor on this water, it is not delivering foam to the screen. The
+    # sky reflection on EMISSIVE, by contrast, is owner-verified visible every
+    # session. So the wake/ripple ART additionally rides emissive, which cannot
+    # be nulled by the SLW albedo path. Additive, tinted like the BaseColor
+    # foam, scaled by its own baked scalar (DisturbanceFoamEmissive) so a regen
+    # ladder can tune it; 0 restores exactly the sky_light emissive -- and the
+    # whole term inherits every upstream gate (ripple arm, WaveTimeScale,
+    # RippleFieldGain), so every existing off arm stays an off arm.
+    surface_emissive = sky_light["emissive"]
+    if disturbance_foam is not None:
+        dist_emiss_gain = bathy_b.scalar("DisturbanceFoamEmissive", 0.6)
+        dist_emiss_masked = bathy_b.mul(disturbance_foam["foam"], top_face_mask)
+        dist_emiss = bathy_b.mul(dist_emiss_masked, dist_emiss_gain)
+        foam_emiss_tint = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -190, -520)
+        foam_emiss_tint.set_editor_property(
+            "constant", unreal.LinearColor(0.82, 0.90, 0.94, 1.0))
+        dist_emiss_rgb = bathy_b.mul(foam_emiss_tint, dist_emiss)
+        surface_emissive = bathy_b.add(surface_emissive, dist_emiss_rgb)
+    if not mel.connect_material_property(
+            surface_emissive, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
         raise RuntimeError("connect surface_emissive -> EmissiveColor failed")
 
     # --- OPACITY IS THE SWITCH THAT TURNS THE WHOLE WATER VOLUME ON ---------
@@ -2486,6 +2166,164 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
             "unwired the engine reads coverage 1 / WaterVisibility 0 and skips the entire "
             "water volume, so the material ships with no absorption, no scattering and no "
             "transmitted scene behind it.")
+
+    # --- B4: THE SHORE-SDF CLIP --------------------------------------------
+    #
+    # OPACITY AND OPACITY MASK ARE TWO COMPLETELY DIFFERENT INPUTS AND THEY SIT
+    # NEXT TO EACH OTHER HERE PRECISELY SO NOBODY CONFLATES THEM AGAIN.
+    #
+    #   MP_Opacity      on an SLW material is NOT alpha. It is
+    #                   BaseMaterialCoverageOverWater -- the fraction of the
+    #                   pixel covered by opaque stuff sitting ON the water, i.e.
+    #                   foam. Read the long note immediately above; unwiring it
+    #                   once cost the entire depth grading.
+    #   MP_OpacityMask  is the masked blend mode's KILL SWITCH. Below the clip
+    #                   value the pixel is discarded and nothing about this
+    #                   material runs there at all.
+    #
+    # WHAT IT IS FOR, and the whole argument is in
+    # docs/lake-sheet-black-band-2026-08-29.md (see the blend-mode note at the
+    # top of main() for the four refuted mechanisms -- do not re-theorise them).
+    # In one line: the sheet's extent mask is quantised to 1.875 m and
+    # deliberately OVER-COVERS the basin, the engine's own absorption depth is
+    # measured along the view ray and is unbounded, and where an over-covered
+    # sheet lies nearly coplanar with dry ground that depth runs to hundreds of
+    # metres, absorption saturates, and all that survives is the Fresnel sky
+    # term -- a black rim, RGB (26, 30, 36), around every basin in the world.
+    #
+    # THE OVER-COVER IS NOT A BUG AND IS NOT BEING FIXED. Drawing over-covers and
+    # despawning under-covers, on purpose, in opposite directions
+    # (water-architecture.md:231-242, lakes.h): an under-covered sheet leaves
+    # visible air between a lake and its shore, which is the owner's 2026-08-10
+    # screenshot. So the geometry keeps reaching past the waterline and the
+    # SHADER declines to draw the part that is past it -- which is what the baked
+    # signed distance was baked for. It is the same field, at sub-pixel
+    # precision, that has been driving foam and nothing else since Phase 3.
+    #
+    # THE SAME READ AS THE FOAM'S, DELIBERATELY. `bathy["shore_m"]` is the G
+    # channel of the one bathymetry sample this material takes -- metres, signed,
+    # POSITIVE INSIDE WATER. The foam term perturbs its own copy with noise
+    # before thresholding (a straight isoline reads as a contour line); the clip
+    # must NOT, because a noisy clip would make the waterline crawl. So this
+    # reads the unperturbed value and the foam keeps its own perturbed one. Two
+    # uses, one sample, one authority for where the shore is.
+    #
+    # SLACK, AND WHICH DIRECTION IT ERRS IN. -BathyShoreClipSlackM, i.e. the clip
+    # keeps drawing for 90 cm PAST the waterline onto the land side before it
+    # cuts. That is deliberately the over-covering direction, for the same reason
+    # the extent mask over-covers: too much sheet is hidden by the opaque bank
+    # standing above it, too little is a visible gap between a lake and its
+    # shore. 0.9 m is about half the 1.875 m raster the field is baked on, so the
+    # clip cannot cut inside a cell the bake called wet.
+    #
+    # AND IT IS GATED ON VALIDITY, WHICH IS THE PART THAT MAKES IT SAFE. Where
+    # the field has no answer -- no fine tier, an unstreamed tile, outside the
+    # 960 m window -- `validity` is 0, the lerp returns 1, and the mask is
+    # inactive. Water with no baked bathymetry draws exactly as it does today.
+    # The failure mode of getting this backwards is deleting every lake in an
+    # unbaked region, so the gate is the lerp's alpha and not a multiply.
+    # DEFAULT 0.0 (2026-09-04 review finding #1): validity is NOT a wet test.
+    # bathy_shore is LAKE-only (basins.py:474 skips non-lakes; :518 fills a
+    # lake-free tile with -inf -> -100 m), and VoxelBathyField publishes B=1 for
+    # a DRY baked texel (kBathyDryDepth = -1); only kBathyMissing clears it. So
+    # with the asset default ON, every river ribbon, poured/CA/PBF pool and
+    # near-field voxel column that is not inside a baked lake basin sits at
+    # shore_m = -100 with validity 1 and is CLIPPED TO NOTHING inside the 960 m
+    # window -- all three consumers load this material as a bare asset with no
+    # MID. The clip is therefore OPT-IN: the one consumer that over-covers (the
+    # lake sheet) turns it on through a MID; everything else keeps 0 and draws
+    # exactly as before B4.
+    shore_clip_enabled = scalar_param("WaterShoreClipEnabled", 0.0, -1300, 3060)
+    shore_clip_slack = scalar_param("BathyShoreClipSlackM", 0.9, -1300, 3120)
+    shore_clip_threshold = bathy_b.mul(shore_clip_slack, bathy_b.const(-1.0))
+
+    # step(Y, X) is `X >= Y ? 1 : 0` -- UMaterialExpressionStep::Compile calls
+    # Compiler->Step(Y, X) and the HLSL intrinsic has the threshold FIRST
+    # (MaterialExpressionStep.h, UE 5.8). Wired by name so the argument order is
+    # visible; both pins are optional in the header (they fall back to ConstY/
+    # ConstX = 0 and 1), which means a failed connect here would NOT error -- it
+    # would silently compile to step(0, 1) = 1 and the clip would be a no-op
+    # everywhere. Hence the checked link, as everywhere else in this file.
+    # MaterialExpressionStep IS THE ONE ENGINE BINDING THIS CHANGE ADDS THAT
+    # NOTHING ELSE IN THIS TOOLCHAIN HAS EVER EXERCISED, so it is looked up by
+    # name and raised on rather than assumed. If a future engine build drops it,
+    # the exact replacement is saturate(ceil(shore_m + BathyShoreClipSlackM)) --
+    # identical for every value except an exact tie at the threshold, which is a
+    # measure-zero case on a float distance field.
+    if not hasattr(unreal, "MaterialExpressionStep"):
+        raise RuntimeError(
+            "unreal.MaterialExpressionStep does not exist on this engine build. The shore "
+            "clip needs a hard threshold; substitute saturate(ceil(shore_m + slack)) here "
+            "(one Add, one Ceil, one Saturate) rather than softening the clip -- a smooth "
+            "clip against a 0.5 mask threshold moves the waterline instead of placing it.")
+    shore_step = mel.create_material_expression(material, unreal.MaterialExpressionStep, -1120, 3090)
+    if not mel.connect_material_expressions(shore_clip_threshold, "", shore_step, "Y"):
+        raise RuntimeError("connect shore_clip_threshold -> shore_step.Y failed")
+    if not mel.connect_material_expressions(bathy["shore_m"], "", shore_step, "X"):
+        raise RuntimeError("connect bathy.shore_m -> shore_step.X failed")
+
+    # THE OFF ARM, AND WHAT IT IS AND IS NOT AN ARM FOR.
+    #
+    # `-VoxelWaterMatScalar=WaterShoreClipEnabled:0` multiplies the lerp's alpha
+    # to zero, the mask becomes a constant 1, and every pixel that used to be
+    # clipped is drawn again -- with no regeneration, from the console, on the
+    # same asset. That is the control arm for the CLIP and it is exact.
+    #
+    # IT IS NOT A CONTROL ARM FOR THE BLEND MODE, and saying so is the honest
+    # half. The material stays BLEND_MASKED in both arms, so the OFF arm is not
+    # byte-identical to the pre-B4 opaque material -- it is the masked material
+    # with the clip neutralised. Whatever masked costs in the mesh pass and in
+    # early-Z is paid in both arms and therefore CANCELS in the A/B, which is
+    # exactly what an A/B is for; but it does not cancel against last week's
+    # captures. A timing comparison against a pre-B4 leg is measuring two changes
+    # at once. The only way to get the opaque arm back is a regeneration.
+    clip_active = bathy_b.mul(bathy["validity"], shore_clip_enabled)
+    one_const = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -1120, 3150)
+    one_const.set_editor_property("r", 1.0)
+    opacity_mask = mel.create_material_expression(
+        material, unreal.MaterialExpressionLinearInterpolate, -960, 3090)
+    if not mel.connect_material_expressions(one_const, "", opacity_mask, "A"):
+        raise RuntimeError("connect one_const -> opacity_mask.A failed")
+    if not mel.connect_material_expressions(shore_step, "", opacity_mask, "B"):
+        raise RuntimeError("connect shore_step -> opacity_mask.B failed")
+    if not mel.connect_material_expressions(clip_active, "", opacity_mask, "Alpha"):
+        raise RuntimeError("connect clip_active -> opacity_mask.Alpha failed")
+
+    # --- THE HULL EXCLUSION MASK (owner boat-session directive, 2026-09-05) --
+    #
+    # water_hull_mask_graph carries the whole thing: the pinned stencil
+    # contract (bit 0 = water exclusion; the boat renders an invisible
+    # interior volume to CustomDepth+Stencil), the bounded behind-the-shell
+    # test, and the inert default (no writers in the world -> keep = 1
+    # everywhere -> pixel-identical water). One multiply composes it with the
+    # B4 shore clip: both are hard 0/1 where they act, so the 0.5 mask
+    # threshold reads the product exactly as it read each alone.
+    hull = build_hull_mask(bathy_b)
+    opacity_mask_final = mel.create_material_expression(
+        material, unreal.MaterialExpressionMultiply, -800, 3090)
+    if not mel.connect_material_expressions(opacity_mask, "", opacity_mask_final, "A"):
+        raise RuntimeError("connect opacity_mask -> opacity_mask_final.A failed")
+    if not mel.connect_material_expressions(hull["keep"], "", opacity_mask_final, "B"):
+        raise RuntimeError("connect hull keep-mask -> opacity_mask_final.B failed")
+
+    if not mel.connect_material_property(
+            opacity_mask_final, "", unreal.MaterialProperty.MP_OPACITY_MASK):
+        raise RuntimeError(
+            "connect opacity_mask -> OpacityMask failed. With this pin unwired a masked "
+            "material reads the default 1.0 and draws every pixel, so the black band would "
+            "survive the whole change while every log line reported success.")
+
+    # WHAT IS DELIBERATELY UNTOUCHED HERE, because both were considered and both
+    # would confound the gate:
+    #   * BathyDepthAuthority stays 0.85. The engine's half of the absorption has
+    #     to stay alive -- it is the only term that sees real geometry, which a
+    #     boat hull and a player standing in the shallows both are (plan D2).
+    #     Moving it was tried, measured, and refuted anyway (see the blend-mode
+    #     note); moving it now would only make this change unreadable.
+    #   * The foam chain. shore_gain, the noise, the shelf gate and the 8x
+    #     waterline cutoff are all as they were. The clip removes PIXELS the foam
+    #     was already ~0 on; if the shoreline foam visibly changes, that is a
+    #     symptom worth chasing, not an expected consequence.
 
     # Roughness tightened slightly (0.1 -> 0.08) and Specular made explicit
     # (0.5 -- the engine's own unconnected-pin default, stated rather than
@@ -2745,126 +2583,62 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
     # the fix is a depth CLAMP on the ripple's WPO half only,
     # min(ripple_h, 0.5 * depth), which leaves the shading ring intact.
     #
-    # --- AND WHY THIS IS GUARDED RATHER THAN CALLED STRAIGHT -----------------
+    # THE RIPPLE SAMPLING IS NO LONGER HERE. It moved up beside the foam
+    # composite on 2026-09-05, for exactly the reason the wave field made the
+    # same move ("THE WAVE FIELD, BUILT HERE BECAUSE FOAM READS IT"): the
+    # DISTURBANCE FOAM signal reads the ripple taps, and foam is composed
+    # ~700 lines above this point. The guard, the sampling, the WaveTimeScale
+    # gate and the totals are all at that site, unchanged in content; only
+    # THE INSTRUMENT stays here, because its emissive connect must run AFTER
+    # the surface-light chain's so the debug picture wins the pin.
+    # --- THE INSTRUMENT: VOXEL_WATER_RIPPLE_DEBUG=1 ---------------------
     #
-    # sample_ripple_field RAISES if the three RippleField* names are not on
-    # MPC_VoxelSky, or if /Game/Voxel/RT_VoxelRippleField does not exist, and it
-    # is right to: an unresolved CollectionParameter compiles to a CONSTANT
-    # rather than failing (MaterialExpressions.cpp:17179-17193), so a constant
-    # origin would sample one fixed texel for the entire world, and an unbound
-    # texture parameter would add whatever image the engine picks to the water's
-    # normal on every pixel. Both are silent. Raising is the correct default for
-    # a module that cannot know who is calling it.
+    # Routes the ripple field straight to EMISSIVE and nothing else, so the
+    # water surface becomes a picture of the field instead of a surface lit
+    # by it. Built because static reading had run out of road.
     #
-    # IT IS THE WRONG BEHAVIOUR *HERE*, TODAY, AND THAT IS A SCHEDULING FACT
-    # RATHER THAN A DISAGREEMENT. Those two prerequisites are landing with the
-    # ripple subsystem, in files this change does not own
-    # (create_sky_material.py's parameter tables, create_ripple_field_materials.
-    # py's render target). Until they do, calling straight through would make
-    # M_WaterVoxel UNGENERATABLE -- and the wind waves above, which have no such
-    # dependency and which the owner is waiting to play-test, would go down with
-    # them. Whole feature blocked on an unrelated one.
+    # THE STATE THAT FORCED THIS, recorded because every single check passed
+    # and the feature still did not work. The simulation reported
+    # `armed=1 published=1 steps=26585 injected=4 dropped(outside=0 full=0
+    # unarmed=0 inert=0)` -- four disturbances accepted, none rejected. The
+    # derive pass correctly removes the storage bias (h = HC - StateBias).
+    # M_WaterVoxel's package names RT_VoxelRippleField, RippleFieldGain,
+    # RippleFieldOrigin and RippleFieldInvSize, so the sampler and all three
+    # collection parameters are really in the graph. The subsystem publishes
+    # all three every frame and `published=1` proves the gain it published
+    # was above zero. There is not one warning in the log. And no ripple is
+    # visible on the water.
     #
-    # So this probes and degrades, LOUDLY, which is exactly the shape
-    # water_wave_graph.build_wind_input already uses for the same situation
-    # (water_wave_graph.py:961-968: "IF THE COLLECTION HAS NO WIND PARAMETERS
-    # THIS DOES NOT RAISE ... It logs, loudly, and takes the fallback"). The
-    # degraded arm is not an approximation of the ripple, it is its exact
-    # absence: the sums become the wave field alone, which is what
-    # RippleFieldGain = 0 would produce anyway, minus the texture fetch.
+    # When every report is healthy and the picture disagrees, the reports are
+    # measuring the wrong thing, and the only way forward is to look at the
+    # data itself. That is the same conclusion this project reached about
+    # material regeneration -- the pinned-pose screenshot is the check that
+    # works -- arrived at again one layer down.
     #
-    # THE PROBE IS THE SAME TWO CHECKS THE MODULE ITSELF WOULD MAKE, so it
-    # cannot pass here and fail there: name membership read back off the
-    # collection (SkyGraphBuilder.mpc_names), and a load of the render target.
-    # WHEN THE PREREQUISITES LAND THIS ARM DISAPPEARS ON ITS OWN -- there is no
-    # environment variable and no default to remember to flip.
-    ripple_missing = sorted(
-        n for n in (ripple_field_graph.MPC_ORIGIN,
-                    ripple_field_graph.MPC_INV_SIZE,
-                    ripple_field_graph.MPC_GAIN)
-        if n not in bathy_b.mpc_names())
-    try:
-        # try/except and not a bare None check: unreal.load_object's failure
-        # mode for a package that does not exist on disk is not guaranteed to be
-        # a None return on every engine build, and the entire point of this
-        # block is that a missing ripple field must not take the water material
-        # down with it.
-        ripple_rt = unreal.load_object(None, ripple_field_graph.FIELD_TEXTURE)
-    except Exception:  # noqa: BLE001 -- absence is the thing being tested for
-        ripple_rt = None
-
-    if ripple_missing or ripple_rt is None:
-        unreal.log_warning(
-            "M_WaterVoxel RIPPLE FIELD ARM: ABSENT -- building the water WITHOUT interactive "
-            "ripples. Missing MPC_VoxelSky parameters: %s. Render target %s: %s. This is the "
-            "expected state until the ripple subsystem's two authoring steps land; the wind "
-            "wave field above is unaffected and the water is exactly the water it would be "
-            "with RippleFieldGain at 0. TO FIX: apply docs/water-interactive-ripples.md 8.1 to "
-            "create_sky_material.py, then re-run create_sky_material.py, "
-            "create_sky_atmosphere_dome_material.py, create_ripple_field_materials.py and this "
-            "script, in that order."
-            % (ripple_missing or "none",
-               ripple_field_graph.FIELD_TEXTURE,
-               "missing" if ripple_rt is None else "present"))
-        wave_grad_total = wave_grad_raw
-        wave_height_total = wave_height_m
-    else:
-        ripple = sample_ripple_field(bathy_b)
+    # WHAT THE TWO OUTCOMES MEAN, so the next run is decisive:
+    #   COLOUR appears around the player  -> the texture holds data and the
+    #       UV lands, so the fault is downstream: the ripple's contribution
+    #       to the NORMAL is real but too small to see against the wind
+    #       waves, and the fix is a gain or a strength.
+    #   FLAT BLACK -> the sample itself is zero, so it is the derive draw or
+    #       the UV mapping, and the gain is irrelevant.
+    # Green/red tint reads the two gradient channels; blue reads height.
+    if os.environ.get("VOXEL_WATER_RIPPLE_DEBUG", "0").strip().lower() not in (
+            "0", "off", "false", "no", ""):
+        # The GRADIENT only, not the height: a float2 wired to emissive
+        # reads as (R, G, 0), which is all that is needed to answer "is
+        # there anything in this texture". Assembling a float3 would need an
+        # AppendVector this builder does not expose, and the extra channel
+        # would tell us nothing the first two do not.
+        dbg_gain = scalar_param("RippleDebugGain", 20.0, -1300, 3000)
+        dbg = bathy_b.mul(ripple["grad_xy"], dbg_gain)
+        if not mel.connect_material_property(
+                dbg, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect ripple debug -> emissive failed")
         unreal.log(
-            "M_WaterVoxel RIPPLE FIELD ARM: PRESENT (%s bound, RippleFieldGain gates it at "
-            "runtime and the subsystem holds it at 0 until the first simulated frame exists)"
-            % ripple_field_graph.FIELD_TEXTURE)
-        wave_grad_total = bathy_b.add(wave_grad_raw, ripple["grad_xy"])
-        wave_height_total = bathy_b.add(wave_height_m, ripple["height_m"])
-
-        # --- THE INSTRUMENT: VOXEL_WATER_RIPPLE_DEBUG=1 ---------------------
-        #
-        # Routes the ripple field straight to EMISSIVE and nothing else, so the
-        # water surface becomes a picture of the field instead of a surface lit
-        # by it. Built because static reading had run out of road.
-        #
-        # THE STATE THAT FORCED THIS, recorded because every single check passed
-        # and the feature still did not work. The simulation reported
-        # `armed=1 published=1 steps=26585 injected=4 dropped(outside=0 full=0
-        # unarmed=0 inert=0)` -- four disturbances accepted, none rejected. The
-        # derive pass correctly removes the storage bias (h = HC - StateBias).
-        # M_WaterVoxel's package names RT_VoxelRippleField, RippleFieldGain,
-        # RippleFieldOrigin and RippleFieldInvSize, so the sampler and all three
-        # collection parameters are really in the graph. The subsystem publishes
-        # all three every frame and `published=1` proves the gain it published
-        # was above zero. There is not one warning in the log. And no ripple is
-        # visible on the water.
-        #
-        # When every report is healthy and the picture disagrees, the reports are
-        # measuring the wrong thing, and the only way forward is to look at the
-        # data itself. That is the same conclusion this project reached about
-        # material regeneration -- the pinned-pose screenshot is the check that
-        # works -- arrived at again one layer down.
-        #
-        # WHAT THE TWO OUTCOMES MEAN, so the next run is decisive:
-        #   COLOUR appears around the player  -> the texture holds data and the
-        #       UV lands, so the fault is downstream: the ripple's contribution
-        #       to the NORMAL is real but too small to see against the wind
-        #       waves, and the fix is a gain or a strength.
-        #   FLAT BLACK -> the sample itself is zero, so it is the derive draw or
-        #       the UV mapping, and the gain is irrelevant.
-        # Green/red tint reads the two gradient channels; blue reads height.
-        if os.environ.get("VOXEL_WATER_RIPPLE_DEBUG", "0").strip().lower() not in (
-                "0", "off", "false", "no", ""):
-            # The GRADIENT only, not the height: a float2 wired to emissive
-            # reads as (R, G, 0), which is all that is needed to answer "is
-            # there anything in this texture". Assembling a float3 would need an
-            # AppendVector this builder does not expose, and the extra channel
-            # would tell us nothing the first two do not.
-            dbg_gain = scalar_param("RippleDebugGain", 20.0, -1300, 3000)
-            dbg = bathy_b.mul(ripple["grad_xy"], dbg_gain)
-            if not mel.connect_material_property(
-                    dbg, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
-                raise RuntimeError("connect ripple debug -> emissive failed")
-            unreal.log(
-                "M_WaterVoxel RIPPLE DEBUG ARM: ON -- emissive is the ripple field "
-                "(R,G = gradient, B = height) x RippleDebugGain. THIS IS NOT A SHIPPING "
-                "MATERIAL; rebuild without VOXEL_WATER_RIPPLE_DEBUG to restore it.")
+            "M_WaterVoxel RIPPLE DEBUG ARM: ON -- emissive is the ripple field "
+            "(R,G = gradient, B = height) x RippleDebugGain. THIS IS NOT A SHIPPING "
+            "MATERIAL; rebuild without VOXEL_WATER_RIPPLE_DEBUG to restore it.")
 
     # --- NORMAL -------------------------------------------------------------
     #
@@ -2940,11 +2714,58 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
     #
     # metres -> UU, and take the displacement fraction. 100.0 is the engine's
     # cm-per-metre, the same constant the UU->m conversion above inverts.
+    # --- B2: THE WPO DISTANCE FADE, AND IT IS A CRACK FIX -------------------
+    #
+    # NOT AN LOD SAVING. water_wave_graph.build_wpo_distance_fade carries the
+    # full argument and it is the one to read; the short form is that the lake
+    # sheet now tessellates only the rects inside an 80 m camera disc (plan B1)
+    # and DOES NOT STITCH the boundary. A T-junction between two UNDISPLACED
+    # surfaces is not a crack -- the dense edge's extra vertices lie exactly on
+    # the line between the sparse edge's two, because nothing has moved them. So
+    # the seam is closed by making the displacement provably zero on BOTH SIDES
+    # of every one of them, which is what this multiply does, and the ordering
+    # WaveWpoFadeEndM (72) < WaveTessRadiusM (80) is what makes it provable.
+    #
+    # IT SITS HERE, AND THE POSITION IS THE FOUR-BULLET LIST AT THE RIPPLE SUM
+    # ABOVE, HONOURED ITEM BY ITEM:
+    #
+    #   * DOWNSTREAM OF THE SUM, so it fades the wave AND the ripple with one
+    #     node. The ripple is a ninth octave from another source and there is no
+    #     version of "the geometry stops moving out there" that moves one and not
+    #     the other -- a ring that kept displacing past the fade would crack the
+    #     seam exactly as a wave would.
+    #   * UPSTREAM OF THE metres->UU CONVERSION, so this is a dimensionless
+    #     weight applied while the field is still in metres and the 100.0 below
+    #     is still applied exactly once.
+    #   * UPSTREAM OF WaveWpoFraction, so the two geometry weights compose as one
+    #     product rather than one of them being smuggled in after the other.
+    #   * AND ON THE WPO HALF ONLY. wave_grad_total -- the normal -- is not
+    #     touched and must not be: two surfaces meeting at a seam may SHADE
+    #     differently without tearing, they may only not MOVE differently, and
+    #     fading the normal would put a visible "the water goes glassy at 70 m"
+    #     ring into every wide shot in exchange for nothing.
+    #
+    # THE ONE-EVALUATION INVARIANT IS INTACT. The normal and the displacement
+    # still come off ONE evaluation of ONE field; this scales the displacement
+    # half of that shared value by a smooth function of position, exactly as
+    # WaveWpoFraction already does. Crests do not move to a different place near
+    # the fade -- they get shorter, in a coordinate both halves share.
+    #
+    # AND IT READS wave_pos_m, THE SAME EXPRESSION build_wave_field WAS GIVEN.
+    # Not a fresh WorldPosition node: this value reaches World Position Offset,
+    # so it must carry WPT_EXCLUDE_ALL_SHADER_OFFSETS like every other position
+    # on this path, and two bricks sharing a physical vertex must compute it
+    # bit-identically or the fade itself becomes the tear it was added to
+    # prevent. Passing the one expression is what guarantees both.
+    wpo_fade = water_wave_graph.build_wpo_distance_fade(
+        bathy_b, wave_pos_m, defaults=WAVE_DEFAULTS)
+    wave_height_faded = bathy_b.mul(wave_height_total, wpo_fade)
+
     m_to_uu = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -540, 1100)
     m_to_uu.set_editor_property("r", 100.0)
     wave_height_uu = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -380, 1040)
-    if not mel.connect_material_expressions(wave_height_total, "", wave_height_uu, "A"):
-        raise RuntimeError("connect wave_height_total -> wave_height_uu.A failed")
+    if not mel.connect_material_expressions(wave_height_faded, "", wave_height_uu, "A"):
+        raise RuntimeError("connect wave_height_faded -> wave_height_uu.A failed")
     if not mel.connect_material_expressions(m_to_uu, "", wave_height_uu, "B"):
         raise RuntimeError("connect m_to_uu -> wave_height_uu.B failed")
 
@@ -3021,17 +2842,31 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
         with open(os.path.join(
                 unreal.Paths.project_content_dir(), "Voxel", "M_WaterVoxel.uasset"), "rb") as fh:
             blob = fh.read().decode("latin-1")
+        # BLEND_Masked SINCE B4, and MaterialExpressionStep is here for the same
+        # reason the SLW output node is: a saved UMaterial names every expression
+        # CLASS it uses, so the presence of that string is proof the shore clip
+        # survived into the artefact. A masked material whose mask node went
+        # missing draws everything, which is indistinguishable in a log from a
+        # masked material that is working on water the bake has no answer for.
+        #
+        # BLEND_Opaque is reported but NOT asserted on. It is the enum's default
+        # value and whether a defaulted enum name survives into a package's name
+        # table is an engine serialisation detail, not a claim about this asset;
+        # asserting its absence would be a check that can fail for a reason that
+        # is not the failure being looked for.
         found = {name: (name in blob) for name in (
             "MSM_SingleLayerWater", "MSM_DefaultLit",
-            "BLEND_Opaque", "BLEND_Translucent",
+            "BLEND_Masked", "BLEND_Opaque", "BLEND_Translucent",
+            "MaterialExpressionStep",
             "MaterialExpressionSingleLayerWaterMaterialOutput")}
         package_ok = (found["MSM_SingleLayerWater"]
                       and not found["MSM_DefaultLit"]
-                      and found["BLEND_Opaque"]
+                      and found["BLEND_Masked"]
                       and not found["BLEND_Translucent"]
+                      and found["MaterialExpressionStep"]
                       and found["MaterialExpressionSingleLayerWaterMaterialOutput"])
         unreal.log("M_WaterVoxel PACKAGE READ-BACK: %s -- %s"
-                   % ("SINGLE LAYER WATER, OPAQUE" if package_ok else "WRONG",
+                   % ("SINGLE LAYER WATER, MASKED, SHORE CLIP PRESENT" if package_ok else "WRONG",
                       ", ".join("%s=%s" % (k, v) for k, v in sorted(found.items()))))
     except Exception as exc:  # noqa: BLE001
         unreal.log_warning(
@@ -3040,10 +2875,11 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
             "port is live." % (exc,))
     if package_ok is False:
         raise RuntimeError(
-            "the saved M_WaterVoxel.uasset is NOT a Single Layer Water opaque material. The "
-            "renderer would draw it as an opaque DefaultLit surface with a black base colour "
-            "(BaseColor is foam-only now), i.e. a black lake, and nothing else in this run "
-            "would have said so.")
+            "the saved M_WaterVoxel.uasset is NOT a Single Layer Water MASKED material with a "
+            "Step node in it. The renderer would draw it as an opaque DefaultLit surface with "
+            "a black base colour (BaseColor is foam-only now), i.e. a black lake -- or, if only "
+            "the Step is missing, as water with no shore clip and the 2026-08-29 black band "
+            "still around every basin. Nothing else in this run would have said so.")
 
     # THE RAN-FLAG, and it is deliberately not "success".
     #
@@ -3221,6 +3057,12 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
                 % waited)
     except Exception as exc:  # noqa: BLE001 -- diagnostics only, never fatal
         unreal.log_warning("M_WaterVoxel material statistics unavailable: %r" % (exc,))
+
+    # The CPU wave mirror header (plan D2 stretch): re-emitted by every water
+    # regeneration so it cannot go stale silently against the field this run
+    # just baked. Both water generators call this; the write is byte-
+    # deterministic and skipped when unchanged, so double emission is inert.
+    water_wave_graph.write_cpu_mirror_header(log=unreal.log)
 
     unreal.log("M_WaterVoxel created and saved at " + FULL_PATH)
 

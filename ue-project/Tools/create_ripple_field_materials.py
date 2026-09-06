@@ -123,10 +123,17 @@ WHERE RIPPLES ARE ALLOWED
 =============================================================================
 
 The baked bathymetry (bake_ver 27) already says where water is and how far the
-nearest shore is, to a decimetre, and this pass masks by it: the field is
-multiplied every step by saturate(shore_m / ShoreMaskM), which is 0 on land, 0 at
-the waterline and 1 once you are ShoreMaskM inside the water. That both keeps
-ripples off dry ground and gives them a shore to die against.
+nearest shore is, to a decimetre, and this pass masks by it: the PROPAGATING
+field is multiplied every step by max(saturate(shore_m / ShoreMaskM), MaskFloor)
+-- MaskFloor (0.98) on land and at the waterline, rising to 1 once you are
+ShoreMaskM inside the water. That gives ripples a shore to die against (~0.6 s
+half-life at the floor) without giving the bake a kill switch: the mask used to
+reach 0, and 0 per step is not an absorber but a DELETE -- a splat injected
+where the bake and the live water disagree was erased in the same draw that
+counted it, which is the exact healthy-counters/empty-textures signature of
+2026-08-13 and 2026-09-06. For the same reason the splat itself is injected
+AFTER the attenuation (see STEP_CODE): its birth step answers to the live water
+that validated the caller, and the bake governs every step after.
 
 THE SIGNED DISTANCE IS WHY THIS IS POSSIBLE AT 10 cm WHEN THE SOURCE IS 1.875 m.
 bathy_field_graph.py:43-48 makes the point: the bake ships a signed distance
@@ -186,6 +193,19 @@ DEFAULT_COURANT_SQ = 0.2667 * 0.2667              # (kWaveSpeedMPS * kFixedDt / 
 DEFAULT_DAMP_PER_STEP = 0.99360
 DEFAULT_SHORE_MASK_M = 0.25                       # kShoreMaskM
 DEFAULT_TEXEL_M = TEXEL_UU / 100.0                # 0.1 m, the gradient's denominator
+
+# THE MASK FLOOR (2026-09-06). The shore mask's per-step factor may never reach
+# 0: at 0 it is not an absorber but a DELETE -- a splat injected where the bake
+# calls the water dry was multiplied to the clear value in the same draw that
+# counted it as injected, with every CPU counter green, which is the exact
+# signature of both invisible-ripple incidents this system has produced
+# (RIPPLE_DEBUG's 2026-08-13 note in create_water_voxel_material.py, and the
+# 2026-09-06 boat wake at gain 20). 0.98/step at 60 Hz is a ~0.6 s half-life:
+# short enough that a shore still eats an incoming ring in about a second --
+# the job the mask exists for -- and long enough that a ripple in bake-dry
+# water is born and visibly rings instead of never existing. Authoring default
+# only, like SpongeStart/SpongeFloor; C++ does not override it.
+DEFAULT_MASK_FLOOR = 0.98
 
 # THE SPONGE. The outer band of the window absorbs instead of reflecting.
 #
@@ -250,6 +270,64 @@ def enum_member(enum_type_name, candidates, why):
         % (candidates, enum_type_name, available, why))
 
 
+def delete_existing_asset(name):
+    """Delete PACKAGE_PATH/name if it exists, then VERIFY the delete took.
+
+    DELETE, THEN VERIFY THE DELETE. The first re-run of this script failed and
+    the error pointed at the wrong thing.
+
+    The original code called delete_asset and moved on. When the delete does
+    not take, create_asset returns None and the caller's raise reads "Failed to
+    create ...", which looks like a factory or an RHI problem -- and cost a
+    round trip chasing exactly that. The engine's real explanation sits one
+    line earlier in the log and is easy to miss:
+
+      LogAssetTools: Error: The asset 'RT_VoxelRippleStateA' already exists in
+      package '/Game/Voxel/RT_VoxelRippleStateA'. CanCreateAsset cannot ask the
+      user as the application is running unattended and will return false.
+
+    So this script was not idempotent: it worked on a clean tree and failed on
+    every re-run. That is the worst way round -- the first run of a new
+    generator is the one somebody watches, and the re-runs are the ones fired
+    and forgotten.
+
+    Both delete calls return a bool that the original discarded, and a plain
+    delete_asset declines QUIETLY when the package is still loaded or
+    referenced, which is why the retry evicts the loaded object.
+
+    THE RETRY IS NOT ENOUGH ON ITS OWN, and that is the second lesson
+    (2026-09-05): delete_loaded_asset evicts the asset ITSELF from memory, but
+    the engine still declines to delete an asset that some OTHER loaded object
+    references. Which asset is loaded when this runs is not this function's to
+    decide -- it is an ORDERING problem, and main() owns it: anything that
+    references an asset must be deleted before the asset it references. See
+    main()'s materials-before-targets note for the failure that taught this.
+    And when the referencer is NOT this script's to delete at all (M_WaterVoxel
+    and M_Ocean pin RT_VoxelRippleField), no ordering can save a delete --
+    make_render_target's reuse-in-place path exists so that this function is
+    simply not called in the common case.
+    """
+    path = PACKAGE_PATH + "/" + name
+    if not unreal.EditorAssetLibrary.does_asset_exist(path):
+        return
+    if not unreal.EditorAssetLibrary.delete_asset(path):
+        loaded = unreal.EditorAssetLibrary.load_asset(path)
+        if loaded is not None:
+            unreal.EditorAssetLibrary.delete_loaded_asset(loaded)
+    if unreal.EditorAssetLibrary.does_asset_exist(path):
+        raise RuntimeError(
+            "%s already exists and could NOT be deleted, so it cannot be recreated. "
+            "Whatever is reported below about creation failing is a consequence of "
+            "this, not a factory or RHI fault. This script deletes its OWN referencing "
+            "materials before the render targets they pin (see main()), so what holds "
+            "the package is outside this script's assets. For RT_VoxelRippleField after "
+            "an INTENTIONAL spec change this is expected, not broken: M_WaterVoxel and "
+            "M_Ocean sample it by name, load with the commandlet, and are other "
+            "generators' assets this script must never delete. Close any editor holding "
+            "the asset, or use the last-resort remedy that has always worked: delete "
+            "ue-project/Content/Voxel/%s.uasset by hand, then re-run." % (path, name))
+
+
 def make_render_target(name, format_candidates, filter_candidates, clear_color, why):
     """Author one UTextureRenderTarget2D and VERIFY every property took.
 
@@ -263,38 +341,112 @@ def make_render_target(name, format_candidates, filter_candidates, clear_color, 
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
     path = PACKAGE_PATH + "/" + name
 
-    # DELETE, THEN VERIFY THE DELETE. The first re-run of this script failed and
-    # the error pointed at the wrong thing.
+    # Enum spellings resolve BEFORE anything is touched: the reuse check below
+    # compares against them, and an engine-upgrade enum raise should fire with
+    # every asset still intact, not after one has been deleted.
+    fmt_name, fmt_value = enum_member("TextureRenderTargetFormat", format_candidates, why)
+    filt_name, filt_value = enum_member(
+        "TextureFilter", filter_candidates,
+        "The filter decides whether a scroll is lossless (nearest) or a low-pass (bilinear); "
+        "see this file's format section item 3.")
+    addr_name, addr_value = enum_member(
+        "TextureAddress", ["TA_CLAMP"],
+        "Wrap addressing on a world-space window would make a disturbance at one edge appear "
+        "at the opposite edge, 51.2 m away.")
+
+    def spec_mismatches(rt):
+        """Every property the creation path SETS, read back and compared.
+
+        ONE list for both callers -- the reuse decision below and the
+        post-creation verification -- so the two cannot drift: a property added
+        to the setters without a line here would let a stale asset pass the
+        reuse check while a fresh one got verified more strictly. Each entry
+        carries its failure's consequence, because this string is the only
+        diagnosis the chain log gets.
+        """
+        out = []
+        got_x = int(rt.get_editor_property("size_x"))
+        got_y = int(rt.get_editor_property("size_y"))
+        if got_x != FIELD_TEXELS or got_y != FIELD_TEXELS:
+            out.append(
+                "size %dx%d, want %dx%d (UVoxelRippleFieldSubsystem refuses to run against "
+                "a wrong-size target -- the same guard VoxelBathyField.cpp:76 applies -- so "
+                "this would disable the whole feature with one log line)"
+                % (got_x, got_y, FIELD_TEXELS, FIELD_TEXELS))
+        got_fmt = rt.get_editor_property("render_target_format")
+        if got_fmt != fmt_value:
+            out.append("format %r, want %s (%s)" % (got_fmt, fmt_name, why))
+        got_filt = rt.get_editor_property("filter")
+        if got_filt != filt_value:
+            out.append(
+                "filter %r, want %s (nearest is what makes a whole-texel scroll lossless; "
+                "bilinear on a state target would low-pass the whole field 60 times a "
+                "second -- format section item 3)" % (got_filt, filt_name))
+        for prop in ("address_x", "address_y"):
+            got_addr = rt.get_editor_property(prop)
+            if got_addr != addr_value:
+                out.append(
+                    "%s %r, want %s (wrap would make a disturbance at one window edge "
+                    "appear at the opposite edge, 51.2 m away)" % (prop, got_addr, addr_name))
+        got_gamma = float(rt.get_editor_property("target_gamma"))
+        if abs(got_gamma - 1.0) > 1e-6:
+            out.append(
+                "target_gamma %.6f, want 1.0 (a gamma curve on a signed, biased height "
+                "field inside a feedback loop compounds every step)" % got_gamma)
+        got_clear = rt.get_editor_property("clear_color")
+        if any(abs(float(getattr(got_clear, ch)) - float(getattr(clear_color, ch))) > 1e-6
+               for ch in ("r", "g", "b", "a")):
+            out.append(
+                "clear_color (%.3f %.3f %.3f %.3f), want (%.3f %.3f %.3f %.3f) (the state "
+                "targets clear to (bias, bias), not black -- see main(): a zero clear is "
+                "the largest disturbance the simulation can express)"
+                % (got_clear.r, got_clear.g, got_clear.b, got_clear.a,
+                   clear_color.r, clear_color.g, clear_color.b, clear_color.a))
+        return out
+
+    # REUSE-IN-PLACE WHEN THE SPEC MATCHES, because for one of these targets a
+    # delete CANNOT work and the referencers are not ours to remove. This is the
+    # second half of 2026-09-05's lesson (main() has the first): deleting the
+    # materials THIS script authors unpinned StateA and StateB -- and the raise
+    # then MOVED to RT_VoxelRippleField, because M_WaterVoxel and M_Ocean also
+    # sample that target BY NAME (voxel-sky-chain-regen.ps1's $ORDER notes: the
+    # water generator raises if it is absent; M_Ocean joined the chain
+    # 2026-09-04) and both are loaded and shader-compiling in the commandlet at
+    # boot, pinning the Field target's package exactly the way
+    # M_VoxelRippleStep pinned the state targets. Those two are OTHER
+    # generators' assets, and deleting another generator's material to free a
+    # texture would invert the chain's whole ordering discipline -- so delete is
+    # simply not available for that target while anything downstream exists.
     #
-    # The original code called delete_asset and moved on. When the delete does
-    # not take, create_asset returns None and the raise below reads "Failed to
-    # create ...", which looks like a factory or an RHI problem -- and cost a
-    # round trip chasing exactly that. The engine's real explanation sits one
-    # line earlier in the log and is easy to miss:
-    #
-    #   LogAssetTools: Error: The asset 'RT_VoxelRippleStateA' already exists in
-    #   package '/Game/Voxel/RT_VoxelRippleStateA'. CanCreateAsset cannot ask the
-    #   user as the application is running unattended and will return false.
-    #
-    # So this script was not idempotent: it worked on a clean tree and failed on
-    # every re-run. That is the worst way round -- the first run of a new
-    # generator is the one somebody watches, and the re-runs are the ones fired
-    # and forgotten.
-    #
-    # Both delete calls return a bool that the original discarded, and a plain
-    # delete_asset declines QUIETLY when the package is still loaded or
-    # referenced, which is why the retry evicts the loaded object.
+    # Verification-in-place is what makes the script idempotent in the common
+    # no-spec-change case: every property the creation path would set is read
+    # back and compared (the same "everything here is read back" doctrine as
+    # the creation path), a match keeps the asset untouched, and only a
+    # MISMATCH -- an intentional spec change -- falls through to
+    # delete-and-recreate, where the raise names the by-hand remedy that case
+    # is expected to need.
     if unreal.EditorAssetLibrary.does_asset_exist(path):
-        if not unreal.EditorAssetLibrary.delete_asset(path):
-            loaded = unreal.EditorAssetLibrary.load_asset(path)
-            if loaded is not None:
-                unreal.EditorAssetLibrary.delete_loaded_asset(loaded)
-        if unreal.EditorAssetLibrary.does_asset_exist(path):
-            raise RuntimeError(
-                "%s already exists and could NOT be deleted, so it cannot be recreated. "
-                "Whatever is reported below about creation failing is a consequence of "
-                "this, not a factory or RHI fault. Close any editor holding it, or delete "
-                "ue-project/Content/Voxel/%s.uasset by hand, then re-run." % (path, name))
+        existing = unreal.EditorAssetLibrary.load_asset(path)
+        bad = None if existing is None else spec_mismatches(existing)
+        if existing is not None and not bad:
+            unreal.log(
+                "RippleField: %s verified IN PLACE (%dx%d %s, filter %s, %s, gamma 1.0, "
+                "clear (%.3f %.3f %.3f %.3f)) -- spec unchanged, existing asset reused, "
+                "nothing deleted."
+                % (path, FIELD_TEXELS, FIELD_TEXELS, fmt_name, filt_name, addr_name,
+                   clear_color.r, clear_color.g, clear_color.b, clear_color.a))
+            return existing
+        if existing is None:
+            unreal.log_warning(
+                "RippleField: %s exists on disk but did not load -- deleting and "
+                "recreating." % path)
+        else:
+            unreal.log_warning(
+                "RippleField: %s exists but MISMATCHES the requested spec -- %s -- "
+                "deleting and recreating. If the delete raises below, read that raise: "
+                "an intentional spec change on the Field target is expected to need the "
+                "by-hand remedy." % (path, "; ".join(bad)))
+        delete_existing_asset(name)
 
     factory_cls = getattr(unreal, "TextureRenderTargetFactoryNew", None)
     if factory_cls is None:
@@ -309,16 +461,6 @@ def make_render_target(name, format_candidates, filter_candidates, clear_color, 
     if rt is None:
         raise RuntimeError("Failed to create render target asset at " + path)
 
-    fmt_name, fmt_value = enum_member("TextureRenderTargetFormat", format_candidates, why)
-    filt_name, filt_value = enum_member(
-        "TextureFilter", filter_candidates,
-        "The filter decides whether a scroll is lossless (nearest) or a low-pass (bilinear); "
-        "see this file's format section item 3.")
-    addr_name, addr_value = enum_member(
-        "TextureAddress", ["TA_CLAMP"],
-        "Wrap addressing on a world-space window would make a disturbance at one edge appear "
-        "at the opposite edge, 51.2 m away.")
-
     rt.set_editor_property("size_x", FIELD_TEXELS)
     rt.set_editor_property("size_y", FIELD_TEXELS)
     rt.set_editor_property("render_target_format", fmt_value)
@@ -330,27 +472,20 @@ def make_render_target(name, format_candidates, filter_candidates, clear_color, 
     # float format; it is set and read back so it stays 1.0 tomorrow.
     rt.set_editor_property("target_gamma", 1.0)
 
-    got_x = int(rt.get_editor_property("size_x"))
-    got_y = int(rt.get_editor_property("size_y"))
-    got_fmt = rt.get_editor_property("render_target_format")
-    got_gamma = float(rt.get_editor_property("target_gamma"))
-    if got_x != FIELD_TEXELS or got_y != FIELD_TEXELS:
+    # The SAME check the reuse path ran, on the fresh asset. A mismatch here is
+    # a different failure class -- an engine or binding fault, not a stale asset
+    # -- but the properties that matter and the consequences of each are
+    # identical, which is why the list is shared rather than written twice.
+    bad = spec_mismatches(rt)
+    if bad:
         raise RuntimeError(
-            "%s came out %dx%d, not %dx%d. UVoxelRippleFieldSubsystem refuses to run against a "
-            "render target of the wrong size (the same guard VoxelBathyField.cpp:76 applies to "
-            "its texture), so this would disable the whole feature with one log line."
-            % (path, got_x, got_y, FIELD_TEXELS, FIELD_TEXELS))
-    if got_fmt != fmt_value:
-        raise RuntimeError(
-            "%s came out format %r, not %s. %s" % (path, got_fmt, fmt_name, why))
-    if abs(got_gamma - 1.0) > 1e-6:
-        raise RuntimeError(
-            "%s has target_gamma %.6f, not 1.0. A gamma curve applied to a signed, biased "
-            "height field inside a feedback loop compounds every step." % (path, got_gamma))
+            "%s was created but came out wrong: %s. This is a FRESH asset, so a stale "
+            "spec is not the explanation -- the setters did not take on this engine "
+            "build." % (path, "; ".join(bad)))
 
     unreal.EditorAssetLibrary.save_loaded_asset(rt)
     unreal.log("RippleField: %s = %dx%d %s, filter %s, %s, gamma 1.0, clear (%.3f %.3f %.3f %.3f)"
-               % (path, got_x, got_y, fmt_name, filt_name, addr_name,
+               % (path, FIELD_TEXELS, FIELD_TEXELS, fmt_name, filt_name, addr_name,
                   clear_color.r, clear_color.g, clear_color.b, clear_color.a))
     return rt
 
@@ -515,38 +650,11 @@ def finish_material(material, name):
 def new_material(name):
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
     path = PACKAGE_PATH + "/" + name
-    # DELETE, THEN VERIFY THE DELETE. The first re-run of this script failed and
-    # the error pointed at the wrong thing.
-    #
-    # The original code called delete_asset and moved on. When the delete does
-    # not take, create_asset returns None and the raise below reads "Failed to
-    # create ...", which looks like a factory or an RHI problem -- and cost a
-    # round trip chasing exactly that. The engine's real explanation sits one
-    # line earlier in the log and is easy to miss:
-    #
-    #   LogAssetTools: Error: The asset 'RT_VoxelRippleStateA' already exists in
-    #   package '/Game/Voxel/RT_VoxelRippleStateA'. CanCreateAsset cannot ask the
-    #   user as the application is running unattended and will return false.
-    #
-    # So this script was not idempotent: it worked on a clean tree and failed on
-    # every re-run. That is the worst way round -- the first run of a new
-    # generator is the one somebody watches, and the re-runs are the ones fired
-    # and forgotten.
-    #
-    # Both delete calls return a bool that the original discarded, and a plain
-    # delete_asset declines QUIETLY when the package is still loaded or
-    # referenced, which is why the retry evicts the loaded object.
-    if unreal.EditorAssetLibrary.does_asset_exist(path):
-        if not unreal.EditorAssetLibrary.delete_asset(path):
-            loaded = unreal.EditorAssetLibrary.load_asset(path)
-            if loaded is not None:
-                unreal.EditorAssetLibrary.delete_loaded_asset(loaded)
-        if unreal.EditorAssetLibrary.does_asset_exist(path):
-            raise RuntimeError(
-                "%s already exists and could NOT be deleted, so it cannot be recreated. "
-                "Whatever is reported below about creation failing is a consequence of "
-                "this, not a factory or RHI fault. Close any editor holding it, or delete "
-                "ue-project/Content/Voxel/%s.uasset by hand, then re-run." % (path, name))
+    # Delete-verify-raise doctrine lives in delete_existing_asset. main() has
+    # already deleted this material once (before the render targets), so on the
+    # normal path this is a no-op; it stays because new_material must not depend
+    # on its caller having pre-cleaned, and a no-op delete costs nothing.
+    delete_existing_asset(name)
     material = asset_tools.create_asset(name, PACKAGE_PATH, unreal.Material,
                                         unreal.MaterialFactoryNew())
     if material is None:
@@ -594,37 +702,32 @@ float hu = (HU - StateBias) * inWindow;
 float lap = (hl + hr + hd + hu) - 4.0 * hc;
 float hn  = 2.0 * hc - hp + Courant2 * lap;
 
-// --- DISTURBANCES --------------------------------------------------------
-//
-// Each slot is (uv.x, uv.y, radius in UV, strength in metres); strength 0 is an
-// empty slot and costs one multiply. C++ fills them from AddDisturbance().
-//
-// A RAISED COSINE, not a step and not a linear cone: its VALUE and its SLOPE
-// both reach zero at the edge. A shape with a kink in it injects energy at every
-// spatial frequency the grid can carry, including the two-texel checkerboard,
-// which does not propagate -- it sits at the impact point and sparkles.
-//
-// ADDED TO h(t) ONLY, deliberately leaving h(t-dt) alone. That makes the
-// disturbance a displacement AND an upward velocity in the same gesture (the
-// scheme's velocity is h(t) - h(t-dt)), so it collapses into an outgoing ring
-// within a few steps instead of sitting there and sagging.
-float4 SP[%(slots)d] = { %(slotlist)s };
-[unroll]
-for (int i = 0; i < %(slots)d; ++i)
-{
-    float2 dxy = Uv - SP[i].xy;
-    float  r   = length(dxy) / max(SP[i].z, 1e-6);
-    float  bump = (r < 1.0) ? (0.5 * (1.0 + cos(kPi * r))) : 0.0;
-    hn += bump * SP[i].w;
-}
-
 // --- WHERE RIPPLES ARE ALLOWED -------------------------------------------
 //
 // ShoreM is the baked SIGNED distance to the nearest shoreline in metres,
 // positive in water. Valid is 0 where the bake had no answer, and where there is
 // no answer there is no mask -- see the module docstring.
+//
+// THE FLOOR, added 2026-09-06, and it converts this term from a delete into an
+// absorber. Without it, mask = 0 anywhere the bake disagrees with the live
+// water is a PER-STEP MULTIPLY BY ZERO: a splat injected there is annihilated
+// in the same draw that was counted, every CPU counter stays green, and the
+// signature is exactly the one this system has now produced twice ("armed=1
+// published=1 steps=N injected=M ... and no ripple is visible" -- 2026-08-13's
+// RIPPLE_DEBUG note, and 2026-09-06's boat wake at gain 20). The bake is the
+// only authority this shader consults, but the INJECTORS are validated by the
+// LIVE water subsystem (AutoWatch, the boat's wet probes), so a disagreement
+// between bake and live -- moved datum, un-baked water, stale planes -- used
+// to mean total silent deletion. Floored at MaskFloor (0.98/step, ~0.6 s
+// half-life at 60 Hz), a bake-dry ripple is born, visibly rings for a beat,
+// and dies -- and a shore still eats an incoming wave in about a second, which
+// is the absorber this term was for. MaskEnable 0 still removes the bake's
+// opinion entirely, and the module docstring's argument still holds: the field
+// is only ever READ by the water material, so whatever the sim believes about
+// dry land is invisible there.
 float wet  = saturate(ShoreM / max(ShoreMaskM, 0.01));
 float mask = lerp(1.0, wet, saturate(Valid));
+mask = max(mask, MaskFloor);
 mask = lerp(1.0, mask, saturate(MaskEnable));
 
 // --- THE SPONGE ----------------------------------------------------------
@@ -689,6 +792,43 @@ float  sponge = lerp(1.0, SpongeFloor, t);
 // line does is give Damp and the sponge the treatment the mask had.
 float AttenPerStep = Damp * mask * sponge;
 hn = hn * AttenPerStep;
+
+// --- DISTURBANCES, injected AFTER the attenuation ------------------------
+//
+// Each slot is (uv.x, uv.y, radius in UV, strength in metres); strength 0 is an
+// empty slot and costs one multiply. C++ fills them from AddDisturbance().
+//
+// A RAISED COSINE, not a step and not a linear cone: its VALUE and its SLOPE
+// both reach zero at the edge. A shape with a kink in it injects energy at every
+// spatial frequency the grid can carry, including the two-texel checkerboard,
+// which does not propagate -- it sits at the impact point and sparkles.
+//
+// ADDED TO h(t) ONLY, deliberately leaving h(t-dt) alone. That makes the
+// disturbance a displacement AND an upward velocity in the same gesture (the
+// scheme's velocity is h(t) - h(t-dt)), so it collapses into an outgoing ring
+// within a few steps instead of sitting there and sagging.
+//
+// AFTER AttenPerStep, not before (moved 2026-09-06, same finding as MaskFloor
+// above): a splat's birth step must not be multiplied by the mask, because the
+// caller was validated by the LIVE water and the mask by the BAKE, and their
+// disagreement used to delete the splat in the very draw that counted it as
+// injected. The mask still governs every subsequent step -- a splat somewhere
+// ripples genuinely must not live decays at mask-rate from its second step --
+// and in open water the only difference is one absent factor of ~0.994 on the
+// birth step, which is nothing. It also repairs the case that was silently
+// half-broken all along: a WADING entry splashes exactly AT the waterline,
+// where this mask is 0-to-0.5 BY DESIGN, so the most common player splash was
+// being halved-to-deleted at birth. The poison guard below still runs after
+// this add, so a non-finite strength that slips the C++ door is still healed.
+float4 SP[%(slots)d] = { %(slotlist)s };
+[unroll]
+for (int i = 0; i < %(slots)d; ++i)
+{
+    float2 dxy = Uv - SP[i].xy;
+    float  r   = length(dxy) / max(SP[i].z, 1e-6);
+    float  bump = (r < 1.0) ? (0.5 * (1.0 + cos(kPi * r))) : 0.0;
+    hn += bump * SP[i].w;
+}
 
 // THE POISON GUARD, AND IT IS min/max RATHER THAN clamp() ON PURPOSE. An
 // explicit integrator that diverges writes inf, and the NEXT step reads that
@@ -852,6 +992,7 @@ def build_step_material():
     damp = b.scalar("Damp", DEFAULT_DAMP_PER_STEP)
     mask_enable = b.scalar("MaskEnable", 1.0)
     shore_mask_m = b.scalar("ShoreMaskM", DEFAULT_SHORE_MASK_M)
+    mask_floor = b.scalar("MaskFloor", DEFAULT_MASK_FLOOR)
     sponge_start = b.scalar("SpongeStart", DEFAULT_SPONGE_START)
     sponge_floor = b.scalar("SpongeFloor", DEFAULT_SPONGE_FLOOR)
     ceiling = b.scalar("Ceiling", DEFAULT_HEIGHT_CEILING_M)
@@ -870,7 +1011,7 @@ def build_step_material():
     step = b.custom(
         "RippleStep", code,
         ["HC", "HL", "HR", "HD", "HU", "Uv", "SrcUv", "Courant2", "Damp",
-         "ShoreM", "Valid", "MaskEnable", "ShoreMaskM",
+         "ShoreM", "Valid", "MaskEnable", "ShoreMaskM", "MaskFloor",
          "SpongeStart", "SpongeFloor", "Ceiling"] + slot_names,
         unreal.CustomMaterialOutputType.CMOT_FLOAT3)
 
@@ -878,8 +1019,8 @@ def build_step_material():
         (centre_rg, "HC"), (left_r, "HL"), (right_r, "HR"), (down_r, "HD"), (up_r, "HU"),
         (uv, "Uv"), (src_uv, "SrcUv"), (courant2, "Courant2"), (damp, "Damp"),
         (shore_m, "ShoreM"), (validity, "Valid"), (mask_enable, "MaskEnable"),
-        (shore_mask_m, "ShoreMaskM"), (sponge_start, "SpongeStart"),
-        (sponge_floor, "SpongeFloor"), (ceiling, "Ceiling"),
+        (shore_mask_m, "ShoreMaskM"), (mask_floor, "MaskFloor"),
+        (sponge_start, "SpongeStart"), (sponge_floor, "SpongeFloor"), (ceiling, "Ceiling"),
     ] + list(zip(slots, slot_names))
     for src, pin in wiring:
         b.link(src, "", step, pin)
@@ -952,10 +1093,62 @@ def build_derive_material():
 
 
 def main():
-    # ORDER IS LOAD-BEARING: the materials sample the render targets by asset
-    # reference, so the targets have to exist first. Within the targets, order is
+    # ORDER IS LOAD-BEARING, in BOTH directions: the materials sample the render
+    # targets by asset reference, so the targets have to exist before the
+    # materials are BUILT -- and for exactly the same reference, the materials
+    # have to be DELETED before the targets are. Within the targets, order is
     # free.
     #
+    # THE DELETE ORDER WAS A LIVE FAILURE, found 2026-09-05, and it is the same
+    # failure class as the delete_existing_asset lesson one level down: a delete
+    # that declines quietly and an error that points at the wrong thing. The
+    # commandlet loads M_VoxelRippleStep and starts compiling its shaders BEFORE
+    # this script's first line runs (the editor log shows the compile queued
+    # ahead of the Python delete), because a saved material that references a
+    # render target pulls that asset in as a dependency of whatever touched the
+    # material. A LOADED material that references an RT pins the RT's package:
+    # the engine declines to delete an asset with in-memory referencers, and it
+    # declines BOTH ways delete_existing_asset knows how to ask -- delete_asset
+    # and the delete_loaded_asset retry alike -- because evicting the RT does
+    # nothing about the material still pointing at it. So every run with the RT
+    # files on disk raised "already exists and could NOT be deleted" on
+    # RT_VoxelRippleStateA, deterministically, warm boot or cold; the workaround
+    # that day was hand-deleting the three RT .uasset files, which worked
+    # precisely because it removed the RTs without ever loading the materials.
+    #
+    # Deleting the two materials FIRST removes the only referencers this script
+    # authors, and the delete-verify-raise discipline is delete_existing_asset's,
+    # same as everywhere else. new_material will delete them again (a no-op by
+    # then) before recreating them.
+    #
+    # THIS WAS HALF THE FIX. On the verification rerun StateA/B deleted cleanly
+    # -- and the raise MOVED to RT_VoxelRippleField, which M_WaterVoxel and
+    # M_Ocean ALSO sample by name and pin at commandlet boot. Those are other
+    # generators' assets, not this script's to delete, so no delete ordering can
+    # ever free that target; make_render_target answers with reuse-in-place (an
+    # existing target whose spec verifies is kept, not recreated), and its
+    # comment carries that half of the story.
+    delete_existing_asset(STEP_NAME)
+    delete_existing_asset(DERIVE_NAME)
+
+    # GARBAGE COLLECT BETWEEN THE MATERIAL DELETES AND THE RT DELETES. Deleting
+    # the materials drops the references, but a dropped UObject reference is not
+    # RELEASED until the garbage collector runs, and the engine's referencer
+    # check reads what is in memory NOW -- so without this, the RT deletes below
+    # could still see the dead materials as referencers and decline, and the
+    # raise would blame a hold that no longer exists. Best-effort on purpose:
+    # if the binding is missing on some engine build, the deletes below are the
+    # real check and will raise loudly on their own, so a warning is the honest
+    # response rather than a hard stop.
+    try:
+        unreal.SystemLibrary.collect_garbage()
+    except AttributeError:
+        unreal.log_warning(
+            "RippleField: unreal.SystemLibrary.collect_garbage is not exposed on this "
+            "engine build's Python bindings; proceeding without an explicit GC. If the "
+            "render-target deletes below raise, this is the first suspect -- find this "
+            "build's GC spelling and add it here.")
+
     # THE STATE TARGETS CLEAR TO (BIAS, BIAS) AND NOT TO BLACK. Clearing to zero
     # would mean h = -0.5 m everywhere -- the entire lake half a metre below
     # itself, released at rest, which is the largest disturbance this simulation
