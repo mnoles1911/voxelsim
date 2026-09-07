@@ -15,8 +15,10 @@ honest list of what is open. Everything below is either committed or named as un
 | `cf6dc9a` | Threaded loading curtain behind `-VoxelLoadingScreenThread`; `-VoxelLoadGateMaxWait` 60 -> 300; PSO config + `tools/voxel-pso-cache-record.ps1`; all doc corrections | `seg=LOADING` p99 23.9 ms through 7.6 s world stalls |
 
 Uncommitted at time of writing: the scale-tolerant UI pass (~25 files in `VoxelEarthUI`,
-compiled, being photographed and committed by an agent), and the water-look work in
-`ue-project/Tools/*.py` (in progress, Fable agent). Everything under `asset-forge/` belongs to a
+compiled, being photographed and committed by an agent). The water-look work is NOT in the
+tree: the owner paused wake/ripple tuning for live iteration, and the night pass is
+preserved verbatim in `docs/patches/water-look-2026-09-07-night.patch` (commit 9288355),
+with the four water files restored to `fe51c15`. Everything under `asset-forge/` belongs to a
 Codex session and was never staged.
 
 ## Where the detail is
@@ -54,7 +56,11 @@ Codex session and was never staged.
 ## Open, grouped by who can close it
 
 ### Owner judgment (frames exist or are being produced)
-- The boat wake look, after the saturating-foam fix (Fable agent; current arms in the water doc).
+- The boat wake: PAUSED for live iteration. The real mechanism is over-injection
+  (`VoxelRippleField.cpp:895`, one full ring per station per tick, ~9x per metre), not the
+  foam curve; the surface is displaced 0.4-0.6 m up, which is also the "water inside the
+  boat". Start the live session by applying the patch, building, and reading the
+  `injected=` count per metre (must fall ~9x) BEFORE looking at any picture.
 - Shore foam: never had a version the owner accepted; confounded by saturated foam in every
   frame so far. Note the lake site is a snow shoreline; a darker-shore site may be needed.
 - Three 2 px promotions flagged as possibly too heavy: HUD bar ticks, HUD vitals bars, the
