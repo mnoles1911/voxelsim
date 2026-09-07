@@ -1,0 +1,17 @@
+{
+  "review_date": "2026-09-07",
+  "reviewer": "Codex visual inspection; not a biological expert certification",
+  "verdict": "reject_for_library_replacement",
+  "reason": "The anatomical-parts experiment does not yet satisfy the owner's visual realism requirement. Technical export success is not acceptance.",
+  "findings": {
+    "grey-wolf": "Better rib cage and limbs than baseline, but face/coat need stronger evidence and existing engine palette materially changes intended colors.",
+    "bengal-tiger": "Head/neck reads too much like a generic canid; white belly and stripe field still look synthetic.",
+    "red-deer-stag": "Neck and head proportions unconvincing; antler geometry includes two disconnected sections. Reject.",
+    "common-raven": "Recognizable but simplified; folded feather anatomy not yet convincingly resolved.",
+    "golden-eagle": "Not independently reviewed in detail yet; no visual approval.",
+    "rainbow-trout": "Body/fin and color pattern remain diagrammatic at this scale; no approval.",
+    "great-white-shark": "Not independently reviewed in detail yet; no visual approval.",
+    "orca": "Saddle patch is rectangular and body/fluke shapes insufficiently grounded. Reject despite successful 12.5 mm tiled export."
+  },
+  "next_action": "Evaluate complete, licensed animal surfaces and photographic references before further procedural expansion. Keep initial output as experiment evidence only."
+}

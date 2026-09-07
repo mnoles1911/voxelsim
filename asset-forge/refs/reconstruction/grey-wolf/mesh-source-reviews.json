@@ -1,0 +1,38 @@
+[
+  {
+    "uid": "c89f01b2d4bc4a27981d26ddb9b0e49d",
+    "title": "Wolf",
+    "url": "https://sketchfab.com/3d-models/wolf-c89f01b2d4bc4a27981d26ddb9b0e49d",
+    "author": "Thomas",
+    "author_url": "https://sketchfab.com/ZedixMaster",
+    "license": {
+      "uri": "https://api.sketchfab.com/v3/licenses/322a749bcfa841b29dff1e8a1bb74b0b",
+      "label": "CC Attribution",
+      "fullName": "Creative Commons Attribution",
+      "requirements": "Author must be credited. Commercial use is allowed.",
+      "url": "http://creativecommons.org/licenses/by/4.0/",
+      "slug": "by"
+    },
+    "description": "A wolf I made in ZBrush as a side project.",
+    "visual_review": "Rejected: stylized carved neck fur; source is an artist sculpt, not anatomical evidence.",
+    "visual_approved": false
+  },
+  {
+    "uid": "56de4df672654ed599777d2980bf0f53",
+    "title": "Grey Wolf (Rigged and Animated)",
+    "url": "https://sketchfab.com/3d-models/grey-wolf-rigged-and-animated-56de4df672654ed599777d2980bf0f53",
+    "author": "rhcreations",
+    "author_url": "https://sketchfab.com/rhcreations",
+    "license": {
+      "uri": "https://api.sketchfab.com/v3/licenses/322a749bcfa841b29dff1e8a1bb74b0b",
+      "label": "CC Attribution",
+      "fullName": "Creative Commons Attribution",
+      "requirements": "Author must be credited. Commercial use is allowed.",
+      "url": "http://creativecommons.org/licenses/by/4.0/",
+      "slug": "by"
+    },
+    "description": "A Wolf with animations made using Blender 2.79 and the cycles render engine.\n\nCheck out my blog at: https://rhcreations.tumblr.com/",
+    "visual_review": "Rejected: oversized bright eyes, weak paws and excessively noisy coat survive voxelization.",
+    "visual_approved": false
+  }
+]
