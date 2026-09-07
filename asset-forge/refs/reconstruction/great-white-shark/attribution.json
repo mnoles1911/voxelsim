@@ -5,6 +5,5 @@
   "license_url": "https://creativecommons.org/licenses/by/4.0/",
   "source_sha256": "483126888ae2a0bc0fdeef3c44a59dfd300ea2a133e95f49bd08590c70c39146",
   "retrieved": "2026-09-07",
-  "modifications": "Static geometry baked and heading normalized; scaled uniformly to 4.2 m; 12.5 mm cubic voxelization; authored blue-grey dorsal surface and pale underside with restrained variation and preserved local gill detail.",
-  "visual_approved": false
+  "modifications": "Static geometry baked and heading normalized; scaled uniformly to 4.2 m; 12.5 mm cubic voxelization; authored blue-grey dorsal surface and pale underside with restrained variation and preserved local gill detail."
 }

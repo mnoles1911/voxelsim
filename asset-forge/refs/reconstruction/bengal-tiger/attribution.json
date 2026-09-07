@@ -6,6 +6,5 @@
   "source_sha256": "be6c23fda6017fdc47eb66cd5b5e35f374bcd1cc5eb2b41f1061648c8d20a7bc",
   "retrieved": "2026-09-07",
   "modifications": "Baked evaluated walking pose and normalized heading; uniform scale to 2.7 m original bounding length; removed 32 sub-voxel whisker strands; 12.5 mm cubic voxelization with filtered source texture.",
-  "species_caveat": "Source identifies tiger without subspecies or individual measurements. Bengal-specific proportions remain under review.",
-  "visual_approved": false
+  "species_caveat": "Source identifies tiger without subspecies or individual measurements. Bengal-specific proportions remain under review."
 }

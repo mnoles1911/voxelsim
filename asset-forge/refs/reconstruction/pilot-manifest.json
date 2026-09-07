@@ -16,13 +16,15 @@
         0.9500000000000001
       ],
       "limitations": "User accepted the static appearance; no rig or animation is included.",
-      "study": "grey-wolf-finished"
+      "study": "grey-wolf-finished",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     },
     {
       "id": "bengal-tiger",
       "scientific_name": "Panthera tigris tigris",
-      "status": "static_model_ready_for_set_review",
-      "visual_approved": false,
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
       "library_entry": "bengal_tiger_anatomy_pilot-0001",
       "runtime_ready": false,
       "dimensions_m": [
@@ -31,13 +33,15 @@
         1.3875000000000002
       ],
       "limitations": "The source identifies a tiger, not a verified Bengal specimen. Pose bounds include a raised head and lifted paws; they are not shoulder height.",
-      "study": "bengal-tiger-refined"
+      "study": "bengal-tiger-refined",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     },
     {
       "id": "red-deer-stag",
       "scientific_name": "Cervus elaphus",
-      "status": "static_model_ready_for_set_review",
-      "visual_approved": false,
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
       "library_entry": "red_deer_stag_anatomy_pilot-0001",
       "runtime_ready": false,
       "dimensions_m": [
@@ -46,13 +50,15 @@
         2.4625000000000004
       ],
       "limitations": "Generic deer sculpt interpreted as a red stag. Antler age and individual measurements are unverified; this is not a mature crown-antler study.",
-      "study": "red-deer-refined"
+      "study": "red-deer-refined",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     },
     {
       "id": "common-raven",
       "scientific_name": "Corvus corax",
-      "status": "static_model_ready_for_set_review",
-      "visual_approved": false,
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
       "library_entry": "common_raven_anatomy_pilot-0001",
       "runtime_ready": false,
       "dimensions_m": [
@@ -61,13 +67,15 @@
         0.5
       ],
       "limitations": "Perch and fused feet removed. Bent legs and three forward toes plus hallux reconstructed; toe detail is simplified at 12.5 mm.",
-      "study": "common-raven-cleanup-study"
+      "study": "common-raven-cleanup-study",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     },
     {
       "id": "golden-eagle",
       "scientific_name": "Aquila chrysaetos",
-      "status": "static_model_ready_for_set_review",
-      "visual_approved": false,
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
       "library_entry": "golden_eagle_anatomy_pilot-0001",
       "runtime_ready": false,
       "dimensions_m": [
@@ -76,13 +84,15 @@
         0.7375
       ],
       "limitations": "Perch and fused feet replaced. Retained white wing/tail patches are interpreted as immature plumage; reconstructed feet are not scan measurements.",
-      "study": "golden-eagle-cleanup-study"
+      "study": "golden-eagle-cleanup-study",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     },
     {
       "id": "rainbow-trout",
       "scientific_name": "Oncorhynchus mykiss",
-      "status": "static_model_ready_for_set_review",
-      "visual_approved": false,
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
       "library_entry": "rainbow_trout_anatomy_pilot-0001",
       "runtime_ready": false,
       "dimensions_m": [
@@ -91,13 +101,15 @@
         0.225
       ],
       "limitations": "Scaled uniformly to a large 0.65 m game fish, not the original specimen size. At about 52 voxels long, spots and eye details are deliberately simplified.",
-      "study": "rainbow-trout-refined"
+      "study": "rainbow-trout-refined",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     },
     {
       "id": "great-white-shark",
       "scientific_name": "Carcharodon carcharias",
-      "status": "static_model_ready_for_set_review",
-      "visual_approved": false,
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
       "library_entry": "great_white_shark_anatomy_pilot-0001",
       "runtime_ready": false,
       "dimensions_m": [
@@ -106,13 +118,15 @@
         1.625
       ],
       "limitations": "Source proportions retained; sex and individual morphometrics are unverified. Fin edges retain the cubic lattice.",
-      "study": "great-white-shark-refined"
+      "study": "great-white-shark-refined",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     },
     {
       "id": "orca",
       "scientific_name": "Orcinus orca",
-      "status": "static_model_ready_for_set_review",
-      "visual_approved": false,
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
       "library_entry": "orca_anatomy_pilot-0001",
       "runtime_ready": false,
       "dimensions_m": [
@@ -121,10 +135,14 @@
         3.5500000000000003
       ],
       "limitations": "Tall dorsal fin is male-like; sex and ecotype were not documented by the source. Dense geometry needs a separate runtime budget and rigging pass.",
-      "study": "orca-refined"
+      "study": "orca-refined",
+      "approval_date": "2026-09-07",
+      "approval_basis": "User: all pilot assets look great."
     }
   ],
   "static_pilot_complete": true,
   "review_url": "http://127.0.0.1:8731/static/pilot-review.html",
-  "completion_boundary": "Eight static candidates delivered; user appearance review precedes any broader animal rollout. Runtime integration not complete."
+  "completion_boundary": "All eight static appearances accepted by the user. Runtime integration is not complete; further modeling work requires a new task scope.",
+  "pilot_appearance_approved": true,
+  "approval_date": "2026-09-07"
 }
