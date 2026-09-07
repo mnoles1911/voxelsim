@@ -13,6 +13,7 @@ param(
     [string]$LogPath = '',
     [switch]$SurfaceLightingDiagnostic,
     [switch]$CaptureBuffers,
+    [switch]$AssetResolveCacheOnly,
     [switch]$AllowOtherProjectEditors
 )
 $ErrorActionPreference = 'Stop'
@@ -74,12 +75,23 @@ $testArgs = @(
     ('-abslog="' + $LogPath + '"')
 )
 if ($Mode -eq 'VisualPilot') { $testArgs += '-VoxelGpuPoolAlloc=0' }
+if ($AssetResolveCacheOnly) { $testArgs += @('-VoxelAsyncAssetResolve','-VoxelAsyncAssetResolveWarm=0') }
 $testProcess = Start-Process 'D:/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe' -ArgumentList $testArgs -WindowStyle Hidden -PassThru
 Write-Output "Owned environment verification PID $($testProcess.Id); log $LogPath"
 try {
     if (!$testProcess.WaitForExit($TimeoutSeconds * 1000)) { throw "Environment verification timed out: $LogPath" }
     if ($testProcess.ExitCode -ne 0) { throw "Environment verification exited $($testProcess.ExitCode): $LogPath" }
     $testText = Get-Content -LiteralPath $LogPath -Raw
+    if ($testText -notmatch 'Authority identity READY providerBound=1' -or $testText -match 'Authority identity unavailable:') {
+        throw 'Canonical catalog and active provider identity binding was not confirmed.'
+    }
+    if ($AssetResolveCacheOnly) {
+        $cacheReceipts = [regex]::Matches($testText,'assets RESOLVE \(B\.3\): hits=([0-9]+) inline=([0-9]+) uncached=([0-9]+) \| warm launched=([0-9]+)')
+        if (!$cacheReceipts.Count) { throw 'Cache-only resolve instrumentation did not run.' }
+        foreach ($receipt in $cacheReceipts) {
+            if ($receipt.Groups[4].Value -ne '0') { throw 'Cache-only test unexpectedly launched warm workers.' }
+        }
+    }
     if ($SurfaceLightingDiagnostic -and ($testText -notmatch 'SurfaceLightingDiagnostic APPLIED enabled=1 volumesOff=1' -or $testText -match 'SurfaceLightingDiagnostic REFUSED')) {
         throw 'Surface lighting diagnostic application with both volume paths disabled was not confirmed.'
     }

@@ -99,3 +99,32 @@ competing prepared publications, cross-coordinator rejection, failed-capture cre
 rollback, repeatedly retained cancelled tickets, and coordinator destruction with
 an outstanding immutable reader. Production still needs to bind this coordinator
 to actual world epochs, canonical identity adapter, edit/replay and render publication.
+
+## UE identity adapter prerequisite (source written; UE validation pending)
+
+`VoxelEnvironmentAuthority::FIdentity` registers one actual session field against
+its loaded manifest bytes. It independently parses the manifest, derives the
+placement species table and tightened layers, and compares explicit member values
+(no padding-dependent struct hash). Unknown field addresses, changed seed/tables,
+invalid manifests and bounded-size failures return no identity. Catalog identity
+is the exact loaded manifest MD5 used by the existing production candidate path;
+source identity delegates the existing canonical GridContentHash MD5, with terrain
+format/size admission before hashing. Registration is immutable and owned by World
+after its field, so destruction precedes field teardown. Calls require a frozen
+field; this adapter does not implement concurrent hot-reload synchronization.
+
+World now stamps terrain/craft edit logs from the actual created fine streamer's
+ProviderId accessor. A configured ID whose streamer failed to construct does not
+become a false authority identity. The production provider string is derived from
+that same World stamp. Terrain replay passes the current stamp explicitly: legacy
+unstamped logs remain accepted; stamped mismatches are refused and preserved by
+the existing save guard. Existing seed/worldgen parser checks remain intact.
+Without a live fine streamer, the World stamp stays empty and the authority capture
+continues to refuse. Coarse-only provider identity is not invented by this patch.
+
+Two source-only UE tests are EnvironmentAuthorityIdentity (including independent
+known canonical MD5 and compression-insensitive hash) and EnvironmentAuthorityProviderReplay
+(legacy accepted, wrong provider refused without mutation, matching accepted,
+seed/worldgen mismatch refused). No UE build/runtime has run for these additions.
+The adapter is registered but no authority coordinator/capture is created in game.
+Production promotion, epoch binding, replay of ownership and publication remain off.

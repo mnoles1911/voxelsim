@@ -37,3 +37,38 @@ request's sampled cells before constructing/copying span tables. Preserve the
 relative order of retained instances, first-winner suppression, coarse sample
 coordinates and apron. Require boundary/negative-coordinate tests and same-site
 comparison before accepting the change.
+
+The existing resolve cache is startup opt-in, not enabled in the baseline above.
+`verify-environment-handoff.ps1 -AssetResolveCacheOnly` supplies
+`-VoxelAsyncAssetResolve -VoxelAsyncAssetResolveWarm=0` and verifies no warm
+workers launched. Use a fresh identical process for each comparison. This is
+diagnostic only; defaults remain unchanged. Existing cache keys lack explicit
+provider/catalog/residency epochs, pruning is not a strict retained-memory cap,
+and the asynchronous worker path has separate lifetime/admission risks. A
+stationary cache-only speedup would not resolve those production requirements.
+
+## Completed conservative culling and cache-only comparison
+
+All three runs used the same seed/site and visual pilot, with normal exit and
+reviewed green first-after/steady captures. They have different streaming request
+mixes; these are measured preparation counters, not controlled FPS benchmarks.
+
+| Run | Requests | Asset us/request | Resolve us/request | Copy us/request | Copied bytes/request |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline private-gpu-no-buffer | 47607 | 314.075 | 216.439 | 92.455 | 520399 |
+| Culling visual | 51092 | 319.377 | 293.656 | 23.797 | 148589 |
+| Culling cache-only | 43959 | 78.887 | 40.131 | 36.259 | 155410 |
+
+Logs are D:/voxelsim/Saved/environment-private-gpu-no-buffer-probe.log,
+environment-culling-visual-probe.log and environment-culling-cache-only-probe.log.
+Culling alone cut bytes/request71.45% and copy time74.26%, but total asset
+preparation slightly worsened as resolution grew. Cache-only is promising for
+resolution cost, with warm launched=0 verified throughout; it remains diagnostic.
+Culling25windows: resolve15003.464ms, lookup31.726ms, copy1215.856ms,
+other66.547ms, copied7591707460bytes, zCulled1508271/submitted250839.
+Cache-only26windows: resolve1764.102ms, lookup34.009ms, copy1593.928ms,
+other75.734ms, copied6831657560bytes, zCulled875219/submitted176353.
+
+Validation:14-action Unreal build,49DX12 tests, real20/20 held-GPU page parity
+against unculled CPU output, and both visual probes. No production handoff,
+continuous-frame shadow/depth or ordinary frame-tail acceptance is implied.
