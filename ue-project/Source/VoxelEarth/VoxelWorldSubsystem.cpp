@@ -4,6 +4,7 @@
 #include "VoxelSaveJobs.h"
 #include "VoxelCheckpointStore.h"
 #include "VoxelSessionCheckpoint.h"
+#include "VoxelSessionTravel.h"
 #include "VoxelEnvironmentLODPrototype.h"
 #include "VoxelProductionCandidatePreparation.h"
 #include "VoxelEnvironmentRenderContext.h"
@@ -31375,6 +31376,8 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSeed override: using seed %llu (default %llu)"),
 		       (unsigned long long)ParsedSeed, (unsigned long long)DefaultSeed);
 	}
+	VoxelSessionTravel::FRequest LaunchRequest;
+	if (VoxelSessionTravel::Peek(GetWorld(),LaunchRequest)) ParsedSeed=LaunchRequest.Seed;
 	Seed = ParsedSeed;
 
 	// Track B2 ("real .vxtl terrain tiles as a selectable tile source"):
@@ -31653,7 +31656,7 @@ void UVoxelWorldSubsystem::Deinitialize()
 			// A session with no named save behind it -- NEW GAME, or any
 			// headless run -- keeps writing to the seed-derived default, which
 			// is byte-identical to the behaviour that predates named saves.
-			const FString& ActiveSlug = VoxelSave::GetActiveSlug();
+			const FString& ActiveSlug = VoxelSave::GetActiveSlug(GetWorld());
 			if (!ActiveSlug.IsEmpty())
 			{
 				SaveWorldToPath(VoxelSave::WorldLogPath(ActiveSlug));
@@ -31818,10 +31821,9 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// usable via TryDig/TryPlace/CarveSphere regardless.
 	if (InWorld.GetNetMode() == NM_DedicatedServer)
 	{
-		UE_LOG(LogVoxelStream, Log,
-		       TEXT("Voxel streaming DISABLED (seed %llu): NM_DedicatedServer has no viewport -- only the authoritative ")
-		       TEXT("World + edit log run here."),
-		       (unsigned long long)Seed);
+		// Restore authority before skipping rendering. The front-end split must
+		// not leave a headless server permanently outside session admission.
+		StartWorldSession(GetWorldSaveFilePath(Seed));
 		return;
 	}
 
@@ -31899,7 +31901,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if(FParse::Param(FCommandLine::Get(),TEXT("VoxelDetachedRestoreProbe")))
 	{
 		// Keep the verification run's shutdown autosave out of the player's save.
-		VoxelSave::SetActiveSlug(TEXT("detached-restore-probe"));
+		VoxelSave::SetActiveSlug(GetWorld(), TEXT("detached-restore-probe"));
 		const FString ProbePath=FParse::Param(FCommandLine::Get(),TEXT("VoxelAsyncRestoreProbe"))
 			?VoxelSave::WorldLogPath(TEXT("async_save_verification")):FPaths::ProjectSavedDir()/TEXT("Tests/detached-roundtrip.vxlog");
 		StartWorldSession(ProbePath);
@@ -32591,6 +32593,7 @@ bool FVoxelWorldImpl::GetDigPreview(const FVector& CameraLocation, const FVector
 
 bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return false;
 	if (!Impl)
 	{
 		return false;
@@ -32649,6 +32652,7 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels,
                                      uint8 MaterialId, const FVector& PlayerActorLocation)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return false;
 	if (!Impl)
 	{
 		return false;
@@ -33062,6 +33066,7 @@ bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVect
 
 int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return 0;
 	if (!Impl)
 	{
 		return 0;

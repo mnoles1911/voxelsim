@@ -3389,7 +3389,7 @@ bool UVoxelSkySubsystem::IsTickable() const
 	// exactly as long as it takes to put the rig back to its static pose after a
 	// runtime toggle-off -- the same shape as UVoxelGISubsystem::IsTickable
 	// (VoxelGI.cpp:349-354).
-	return VoxelSky::IsEnabled() || bHasState;
+    return VoxelSky::IsEnabled() || bHasState || (GetWorld() && VoxelSessionCheckpoint::Ready(GetWorld()));
 }
 
 TStatId UVoxelSkySubsystem::GetStatId() const
@@ -3454,9 +3454,16 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 		}
 	}
 
+    // Simulation time is authoritative even when the sky rendering feature is disabled.
+    const double TimeScale = Impl->ClockRate();
+    const double DayLength = Impl->ClockDay();
+    const double DaysPerYear = Impl->ClockYear();
+    Impl->EpochSeconds += (double)DeltaTime * TimeScale;
+    TickReplicatedClock(DeltaTime, TimeScale);
+
 	if (!VoxelSky::IsEnabled())
 	{
-		// One frame of work to undo the feature, then IsTickable goes false.
+		// Undo rendering once, but keep the public simulation clock available to water and weather.
 		if (bHasState)
 		{
 			ApplyStaticRigPose();
@@ -3464,21 +3471,16 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 			bHasState = false;
 			UE_LOG(LogVoxelSky, Log, TEXT("voxel.Sky.Enabled 0: rig returned to the static pre-W4 pose."));
 		}
+		Impl->State.EpochSeconds=Impl->EpochSeconds;
+		Impl->State.bClockRunning=TimeScale!=0;
 		return;
 	}
-
-	const double TimeScale = Impl->ClockRate();
-	const double DayLength = Impl->ClockDay();
-	const double DaysPerYear = Impl->ClockYear();
-
-	Impl->EpochSeconds += (double)DeltaTime * TimeScale;
 
 	// F7: the replicated clock -- authority push / client bounded correction.
 	// Between the local accumulation above and the ephemeris reads below, so a
 	// correction is part of THIS frame's clock rather than a retroactive nudge
 	// the sun catches up to a frame late. Standalone pays one NetMode enum test
 	// and nothing else (the off arm).
-	TickReplicatedClock(DeltaTime, TimeScale);
 
 	// The observer's own position, because latitude is a function of it
 	// (GeoFromWorldUU). Held over from the previous frame when there is no

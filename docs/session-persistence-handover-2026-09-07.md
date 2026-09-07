@@ -2,7 +2,19 @@
 
 ## Immediate instruction
 
-The user interrupted implementation to request: commit and merge all progress made thus far and prepare a handover now. This supersedes continuing overnight implementation in this session. The overall P0â€“P6 persistence plan remains unfinished; resume from `docs/session-persistence-execution.md` and `docs/session-persistence-plan-2026-09-07.md` in a new session.
+The current user instruction is to finish every remaining planned phase without waiting for feedback. Work is active. This document preserves an earlier handover plus the verified continuation below; it is not a completion claim. Continue from `docs/session-persistence-execution.md` in `.scratch/persistence-integration`, branch `codex/session-persistence-integration`. Preserve the original dirty parent worktree.
+
+## Verified continuation through secure transport
+
+- `326b45e` adds world-local slots, periodic saves, agent/player/actor adapters and selected-seed travel. `0aeba2c` merges main through PR234.
+- The subsequent secure batch adds per-client AES-GCM invites, isolated persistent client profiles, dedicated-server initialization, Windows long-path atomic publication, hidden-sky simulation, offline vehicle destruction handling, capture relationship validation and one deferred manual save.
+- Full160-action Unreal build passed (`Saved/persistence-lifecycle-queue-build.log`). Five persistence/object tests passed with zero errors (`Saved/persistence-lifecycle-queue-report/index.json`). Python checkpoint11 and transport3 tests pass; unity-collision lint passes.
+- Dedicated server + two DX12 clients passed a complete encrypted process restart, preserving world/player IDs, inventory, selection, position and flight mode (`Saved/Tests/session-net-8bec4b53653943de974a303ff291dce9/result.json`). All six processes exited0.
+- Rendered asynchronous queue + real worker failure + pre-teardown save passed (`Saved/persistence-manual-queue-runtime.log`), process exit0. Two small captures were1.046/5.942ms; this is not a large-world benchmark.
+- Generated credentials are private runtime files. Never print or commit them. Use the invite generator and documented harness options in `docs/session-transport.md`.
+- Remaining gates include shared domain join baseline/ack, streamed safe spawn, live vehicle physics/network controls, actual selected-seed travel, five-generation retention/read leases, river rearm/transaction fences, crash/lifetime matrices and16-player/large-world budgets. Do not mark P0–P6 complete.
+
+The sections below describe the earlier checkpoint and are historical where they differ from this continuation.
 
 This task worked in `C:/Users/Matt Noles/.codex/worktrees/5aaf/voxelsim`, initially detached at `1d1005a`. The shared primary checkout is `D:/voxelsim`. Other tasks have concurrently evolved environment/object/core and Asset Forge code there. The persistence commit deliberately excludes unrelated asset/model changes. Its integration depends on the shared primary checkpoint's existing object/geometry/streaming implementation, which was uncommitted at this task's start. Read the final Git history for actual merge IDs.
 

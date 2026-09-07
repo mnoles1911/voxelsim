@@ -24,6 +24,8 @@ public:
 protected:
 	virtual void SetupInputComponent() override;
 	virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+    virtual void PawnLeavingGame() override;
 
 public:
 	// --- HUD queries (AVoxelEarthHUD) --------------------------------------
@@ -52,6 +54,26 @@ public:
 	// "I pressed the key and nothing happened" is the one report that costs an
 	// evening to diagnose.
 	void UseHotbarSlot(int32 SlotIndex);
+    UFUNCTION(Server,Reliable)
+    void ServerUseHotbarSlot(int32 SlotIndex);
+private:
+    double NextHotbarUseSeconds=0;
+    FTimerHandle PersistentIdentityTimer;
+    FGuid CredentialWorld;
+    FString CredentialToken;
+    bool bPersistentJoinDeferred=false;
+    void BeginPersistentIdentity();
+    UFUNCTION(Client,Reliable)
+    void ClientRequestPersistentIdentity(FGuid WorldId);
+    UFUNCTION(Server,Reliable)
+    void ServerAuthenticatePersistentIdentity(const FString& Token);
+    UFUNCTION(Client,Reliable)
+    void ClientStorePersistentIdentity(FGuid Id,const FString& Token);
+    UFUNCTION(Server,Reliable)
+    void ServerConfirmPersistentIdentity(FGuid Id);
+    UFUNCTION(Client,Reliable)
+    void ClientPersistentIdentityReady();
+public:
 
 	// Raw vxc::MaterialId value (this header stays voxel-core-free by
 	// doctrine, so the type is uint8, not vxc::MaterialId).

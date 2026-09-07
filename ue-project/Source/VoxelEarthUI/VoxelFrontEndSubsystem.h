@@ -92,6 +92,7 @@ private:
 	void RequestLoad(const FString& Slug);
 	void RequestDelete(const FString& Slug);
 	void RequestQuit();
+	void RequestReturnToMenu();
 
 	// Raises the curtain and arms the world start. EditLogPath is empty for
 	// NEW GAME; SpawnOverride is null unless a save is restoring a position.

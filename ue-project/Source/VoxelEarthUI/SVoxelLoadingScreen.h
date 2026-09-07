@@ -39,6 +39,7 @@ class VOXELEARTHUI_API SVoxelLoadingScreen : public SCompoundWidget
 {
 public:
 	SLATE_BEGIN_ARGS(SVoxelLoadingScreen) {}
+		SLATE_EVENT(FSimpleDelegate,OnReturnToMenu)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
@@ -85,6 +86,7 @@ private:
 	FSlateColor GetFpsColour() const;
 
 	bool bLoadFailed=false;
+	FSimpleDelegate ReturnToMenu;
 	float Progress = 0.f;
 	float CurtainOpacity = 1.f;
 

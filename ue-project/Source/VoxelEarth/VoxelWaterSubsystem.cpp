@@ -9946,7 +9946,7 @@ bool UVoxelWaterSubsystem::SaveWaterState() const
 {
     auto Terrain=GetWorld()?GetWorld()->GetSubsystem<UVoxelWorldSubsystem>():nullptr;
     if (!Terrain) return false;
-    const FString Slug=VoxelSave::GetActiveSlug();
+    const FString Slug=VoxelSave::GetActiveSlug(GetWorld());
     return Slug.IsEmpty()?Terrain->SaveWorld():Terrain->SaveWorldToPath(VoxelSave::WorldLogPath(Slug));
 }
 
@@ -10001,7 +10001,7 @@ bool UVoxelWaterSubsystem::RestoreCheckpoint(const TArray<uint8>& Water,const TA
         !Reader.skip(LedgerSize) || !Reader.u32(GraphSize) || uint64(LedgerSize)+16+GraphSize>uint64(Hydrology.Num())) return false;
     const uint8* GraphAt=Hydrology.GetData()+16+LedgerSize;
     if (!Reader.skip(GraphSize)) return false;
-    vxc::RegionBounds Bounds{}; uint8 HasRegion=0,Enabled=0; double Delay=0;
+    vxc::RegionBounds Bounds{}; uint8 HasRegion=0,Enabled=VoxelDebug::GetWaterRivers()?1:0; double Delay=0;
     if (Version==2)
     {
         uint64 X0=0,Y0=0,X1=0,Y1=0,Bits=0;
@@ -10077,7 +10077,7 @@ bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint6
 	// over the same implicit-flood / terrain-solidity callbacks the live pair
 	// uses (FVoxelWaterImpl's constructor) -- this is the load path a genuine
 	// reload runs, isolated so it never touches live state.
-	const FString Slug=VoxelSave::GetActiveSlug();
+	const FString Slug=VoxelSave::GetActiveSlug(GetWorld());
     const FString Logical=Slug.IsEmpty()?GetTerrainSaveFilePath(Impl->Terrain.GetSeed()):VoxelSave::WorldLogPath(Slug);
     VoxelCheckpointStore::FResolved Checkpoint;
     if (!VoxelCheckpointStore::Resolve(Logical,Checkpoint) || !Checkpoint.bSimulation) return false;

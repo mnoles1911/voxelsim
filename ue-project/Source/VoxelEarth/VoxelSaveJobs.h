@@ -16,6 +16,8 @@ struct FSnapshot
 };
 // Game-thread admission and completion. One active job bounds snapshot memory.
 bool IsBusy();
+// One deferred manual request; capture happens after the active write finishes.
+bool Defer(TFunction<void()> Request);
 bool Submit(FSnapshot&& Snapshot,TFunction<void(bool)> Completion);
 // Synchronous writers and world teardown must drain before publishing new data.
 void Drain();
