@@ -1664,7 +1664,13 @@ def test_terrain_version_bump_rerolls_the_world_and_product_does_not():
     # moved a terrain constant or the province table without re-blessing this
     # pin. Flagged in the bv28 landing report; the bv28 work itself touches
     # only the PRODUCT half, which this fingerprint deliberately excludes.
-    assert pipeline.bake_fingerprint().startswith("3b026df59fe0dbf9")
+    # Commit 660f041 intentionally lowered the basin floor from 1.0 m to 0.5 m
+    # following the owner's measured pond decision. Only that constant explains
+    # this namespace change: restoring it reproduces the previous pinned hash.
+    assert pipeline.bake_fingerprint(
+        consts=dataclasses.replace(pipeline.CONSTANTS, basin_min_depth_m=1.0)
+    ).startswith("3b026df59fe0dbf9")
+    assert pipeline.bake_fingerprint().startswith("07c042a0eb9888a1")
 
 
 def test_every_bake_constant_rolls_the_fingerprint():

@@ -1,0 +1,5 @@
+-r requirements.txt
+# Bake tests exercise carrier filtering, basin distances and compiled flow.
+# Keep these test/bake dependencies out of the lightweight service image.
+scipy
+numba

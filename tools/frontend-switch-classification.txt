@@ -372,6 +372,44 @@ VoxelRenderFrame
 VoxelRenderFrameMutate
 VoxelRenderFrameMutateMs
 
+# --- 2026-08-24: the streaming tick per-frame work budget -------------------
+# ue-project/Source/VoxelEarth/VoxelTickBudget.h. Defers whole stages at their
+# existing loop boundaries so a burst becomes several ordinary frames instead
+# of one long one. Tuning: they change how much of a frame the streaming tick
+# may spend, and none of them drives, poses or ends a run. 0 = off = the
+# shipped behaviour byte for byte.
+VoxelTickBudgetMs
+VoxelTickBudgetMaxDefer
+VoxelTickBudgetReserveMs
+
+# --- 2026-09-07: source-reviewed environment, renderer and streaming flags ---
+# Cache sizing, scheduling, rendering/material overrides and fixture inputs.
+# None independently drives a camera, capture sequence or timed exit.
+VoxelAmortizeOuterScans
+VoxelApplyColumnCacheWays
+VoxelBathyOcean
+VoxelBrickUploadCoalesce
+VoxelClipmapAlbedoSrgb
+VoxelClipmapVertexAlbedo
+VoxelClipmapVoxelize
+VoxelForceInternal
+VoxelForceRes
+VoxelGpuRasterAtlasDemandPagesPerTick
+VoxelGpuRasterAtlasFillSafety
+VoxelRenderFrameFakeFamilies
+VoxelSyntheticTerrain
+VoxelWaterDepthAuthority
+VoxelWaterFoamGain
+VoxelWaterMatScalar
+VoxelWaterShoreClip
+VoxelWaveTessM
+# Interactive prototype opt-ins; capture drivers are runtime policy extras.
+# Validate adds assertions after edits; KeepOpen only changes capture completion.
+VoxelEnvironmentLOD
+VoxelEnvironmentLODKeepOpen
+VoxelEnvironmentLODValidate
+VoxelTreeFelling
+
 ## SUBSTRING-MATCHED -- ACKNOWLEDGED
 #
 # Everything below is a switch whose NAME contains one of rule 5's substrings,
@@ -474,12 +512,12 @@ VoxelWaterPersistTest = Fixture: drives the run and exits on its own; the naming
 VoxelWaterWakeTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelWindingCheck = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 
-# --- 2026-08-24: the streaming tick per-frame work budget -------------------
-# ue-project/Source/VoxelEarth/VoxelTickBudget.h. Defers whole stages at their
-# existing loop boundaries so a burst becomes several ordinary frames instead
-# of one long one. Tuning: they change how much of a frame the streaming tick
-# may spend, and none of them drives, poses or ends a run. 0 = off = the
-# shipped behaviour byte for byte.
-VoxelTickBudgetMs
-VoxelTickBudgetMaxDefer
-VoxelTickBudgetReserveMs
+
+# --- 2026-09-07: restoration/network fixtures and passive diagnostics ---
+VoxelAsyncRestoreProbe = Restore fixture input: selects the async-save verification snapshot for the detached restart probe.
+VoxelDetachedRestoreProbe = Fixture: checks restored timber, plants and resources on a timer, reports and exits.
+VoxelObjectsNetVerify = Fixture: spawns server test objects, observes client replication at checkpoints and exits on a timer.
+VoxelDumpIndexKeys = ACCIDENTAL ('Dump'): passive resident index-key logging inside MaybeLogCounters; does not drive or end a run.
+VoxelSkyMarkVerify = ACCIDENTAL ('Verify'): runtime sky-band correctness sampling during normal streaming; does not drive or end a run.
+VoxelSkyMarkVerifyGrid = ACCIDENTAL ('Verify'): sample-grid size for the passive sky-band correctness check.
+VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive sky-band correctness check.
