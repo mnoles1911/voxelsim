@@ -915,6 +915,79 @@ pair is the remaining work before this can be judged safe to default.
   far field will disagree. For a clean whole-water arm, either regenerate both
   ways or shoot a pose where only sheet water is visible.
 
+#### BUILT AND MEASURED 2026-09-07 (session: R2/R3/R5). VERDICT PENDING OWNER.
+
+**Built as specified**, in `create_water_voxel_material.py` at the roughness
+block: four new `scalar_param`s — `WaterRoughnessFar` (0.30),
+`WaterRoughnessFadeStartM` (60), `WaterRoughnessFadeEndM` (400),
+`WaterRoughnessFarGain` (**0.0**) — lerping the calm arm from 0.08 toward the far
+value over a camera-distance ramp, reusing `water_caustics_graph.py:405-432`'s
+idiom (the one deliberate difference is that this is a ramp that GROWS with
+distance, so it has no closing `OneMinus`). The foam lerp is untouched
+downstream. Regenerated water-only through
+`tools/voxel-sky-chain-regen.ps1 -Only create_water_voxel_material.py`.
+
+**THE OFF ARM IS PROVEN IDENTICAL, not asserted.** Pre-change shipping baseline
+`VoxelVerify00874` against post-regen `WaterRoughnessFarGain:0`
+`VoxelVerify00902`: **mid water dRGB 0.00/0.00/0.00, near water 0.00, sky 0.00,
+land 0.00**, far 0.10. The gate multiplies the ramp by the gain, so at gain 0 the
+alpha is identically zero and `lerp(a, b, 0) == a` exactly; the frame confirms
+it. The material left on disk is therefore safe for every other agent using it.
+
+**The A/B as this section specifies it is a NULL — and the reason is a scale
+error in this section, not in the mechanism.**
+
+| arm | frame | far dRGB | mid dRGB | near dRGB |
+|---|---|---|---|---|
+| `FarGain:1` (ramp 60->400 m, as specified) | `00904` | -0.26/-0.16/-0.13 | -0.01 | 0.00 |
+| ramp rescaled to 10->120 m | `00912` | -4.19/-2.51/-2.27 | -0.01 | 0.00 |
+| ramp collapsed, roughness 0.30 everywhere | `00908` | slab -60.8 | -16.0/-10.5/-16.6 | -11.6/-8.1/-14.0 |
+| ramp collapsed, roughness 0.90 everywhere | `00910` | slab -68.7 | -46.1/-25.5/-43.3 | -45.0/-30.3/-47.1 |
+
+Engagement is proven on every arm by the probe's own log line, and the collapsed
+arms show **roughness is nowhere near inert on this water** — it moves the mid
+band by up to 46/255. So the null of the specified arm is not "roughness does
+nothing"; it is **"the 60 m dead zone contains the entire visible lake."**
+
+**Why: the shipping lake pose is 0.7 m above the surface, so the water in frame
+spans metres, not hundreds of metres.** At `+6 m / -18 deg` the camera sits 0.7 m
+above the lake (the harness measures altitude from the lakebed at 1644.2 m; the
+surface is 5.32 m above that). For a camera height *h* the ground distance at
+depression θ is *h*/tan θ, so with h = 0.7 m the near band (~39° depression) is
+about **0.9 m** away, the mid band about **2 m**, and even the far band just
+below the waterline about **7 m**. Ramping from 60 m to 400 m on a scene whose
+visible water ends inside ~30 m is why nothing moved. This section's instruction
+to "ramp over hundreds of metres, not tens" is right about avoiding a visible
+matte ring, but it was written without a number for how far this pose can
+actually see.
+
+**So R3 is not refuted and not confirmed. It has not yet been tested at a pose
+where its premise holds.** Either judge it from an aerial pose with hundreds of
+metres of water in frame, or rescale the defaults to this pose (roughly
+2 m -> 30 m). The defaults are left at 60/400 and the gain at 0.0, so nothing
+ships either way.
+
+**A REAL WARNING FOR THE OWNER'S JUDGEMENT, from the saturated arms: R3 fights
+R1.** At roughness 0.90 across the whole sheet (`VoxelVerify00910`) the bright
+white SSR reflections of the dunes — the thing R1 was shipped to add, and the
+thing that currently makes this water read as a surface — are **gone**, and the
+lake becomes a flat deep-teal field. Every collapsed arm moves the water
+*darker*, not brighter (mid -16 at roughness 0.30, -46 at 0.90), which is the
+opposite of this section's predicted "keep more of its own colour AND start to
+sparkle". Whatever far-field roughness eventually ships has to be small enough
+to keep the reflections R1 bought.
+
+**Tooling defect found and fixed while running this, and it invalidates other
+people's arms.** `-VoxelWaterMatScalar` applied **only its first `Name:Value`
+pair**: `FParse::Value`'s `bShouldStopOnSeparator` defaults to true and stops at
+the comma, so multi-pair specs were silently truncated while the log printed one
+healthy-looking assignment line. Fixed at `VoxelWaterSheetActor.cpp:325`
+(`bShouldStopOnSeparator=false`), built clean, and proven: the same command line
+that produced one `material scalar ... set` line now produces four, and its frame
+moves 20x further. The whole "collapsed ramp" row above is only measurable
+because of that fix. See `docs/water-ocean-tides-plan-2026-09-04.md`'s 06:00
+entry for which earlier ladder arms this voids.
+
 ---
 
 ### R4 — A reflection capture. **RANKED AND NOT RECOMMENDED. Kept so nobody spends a day on it.**

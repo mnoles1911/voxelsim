@@ -2337,8 +2337,122 @@ def main():
     # Froth is the one part of a water surface that is NOT a mirror, and leaving
     # the tight 0.08 lobe on it would put a sharp specular highlight on top of
     # whitewater, which reads as wet plastic. Specular stays flat.
-    calm_roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -180)
-    calm_roughness.set_editor_property("r", 0.08)
+    # ------------------------------------------------------------------
+    # R3 (2026-09-07): THE CALM ARM IS NO LONGER A CONSTANT EITHER.
+    # It ramps from 0.08 toward WaterRoughnessFar with CAMERA DISTANCE,
+    # behind WaterRoughnessFarGain, DEFAULT 0.0 -- and at 0.0 the lerp
+    # below returns its A pin exactly (a + (b - a) * 0 == a in float), so
+    # the shipped material is unchanged until someone passes the gain.
+    #
+    # WHY DISTANCE HAS ANY BUSINESS IN A ROUGHNESS. Two separate defects,
+    # both of which 0.08-everywhere causes, from
+    # docs/water-realism-analysis-2026-09-06.md's R3:
+    #
+    #   * EnvBrdf at roughness 0.08 rises almost to 1 at grazing incidence
+    #     (SingleLayerWaterShading.ush:234) and that factor DELETES the
+    #     volume term -- so the far water, which is all grazing, loses the
+    #     water's own colour and goes flat navy. A higher roughness out
+    #     there keeps more of it.
+    #   * A pixel at 300 m covers hundreds of wave facets. Their normals
+    #     average to flat, and shading a many-facet pixel with a 0.08
+    #     MIRROR lobe is the textbook way to get no glitter at all: the
+    #     correctly FILTERED roughness rises with the sub-pixel normal
+    #     variance. Toksvig/LEAN is the principled version; a distance
+    #     ramp is the cheap proxy for it, and it is the proxy because the
+    #     facet count per pixel genuinely does grow with distance.
+    #
+    # THE IDIOM IS BORROWED, NOT INVENTED. This is the same
+    # WorldPosition/CameraPositionWS -> Distance -> (d - start)/(end -
+    # start) -> saturate chain water_caustics_graph.py:405-432 already
+    # uses, spelled the same way so the two cannot drift, and LWC-safe for
+    # the reason stated there (both operands are LWC-typed, so the
+    # compiler subtracts in emulated doubles). ONE DELIBERATE DIFFERENCE:
+    # the caustics chain ends in a OneMinus because it is a FADE that dies
+    # with distance. This one is a RAMP that grows with distance, so the
+    # OneMinus is absent -- that is the whole difference and it is easy to
+    # copy by mistake.
+    #
+    # THE NUMBERS ARE FIRST GUESSES AND ARE LABELLED AS SUCH. 0.30 far,
+    # 60 m -> 400 m, are R3's own suggested starting values and nothing
+    # has been measured against them yet; the A/B that settles them is
+    # WaterRoughnessFarGain 0 vs 1 at the lake pose. The one thing that IS
+    # reasoned rather than guessed is the LENGTH of the ramp: a short fade
+    # puts a visible "the water goes matte out there" ring on the lake, so
+    # it is hundreds of metres, not tens.
+    #
+    # WHAT THIS DOES NOT TOUCH. The analytic sun/moon glint is
+    # roughness-free by design (water_sky_reflection_graph.py:80-84), so
+    # raising roughness cannot blunt it; it blurs the glint's ENVIRONMENT
+    # companion only. The foam lerp stays downstream and unchanged -- foam
+    # still overrides to 0.62 wherever there is froth, near or far.
+    far_roughness = scalar_param("WaterRoughnessFar", 0.30, -1300, -1340)
+    rough_fade_start = scalar_param("WaterRoughnessFadeStartM", 60.0, -1300, -1280)
+    rough_fade_end = scalar_param("WaterRoughnessFadeEndM", 400.0, -1300, -1220)
+    rough_far_gain = scalar_param("WaterRoughnessFarGain", 0.0, -1300, -1160)
+
+    rough_wp = mel.create_material_expression(material, unreal.MaterialExpressionWorldPosition, -1150, -1340)
+    rough_cam = mel.create_material_expression(material, unreal.MaterialExpressionCameraPositionWS, -1150, -1280)
+    rough_dist_uu = mel.create_material_expression(material, unreal.MaterialExpressionDistance, -1000, -1310)
+    if not mel.connect_material_expressions(rough_wp, "", rough_dist_uu, "A"):
+        raise RuntimeError("connect rough_wp -> rough_dist_uu.A failed")
+    if not mel.connect_material_expressions(rough_cam, "", rough_dist_uu, "B"):
+        raise RuntimeError("connect rough_cam -> rough_dist_uu.B failed")
+
+    # The two fade scalars are authored in METRES, like every other
+    # distance the owner tunes in this file, and converted here. 100 is
+    # unreal units per metre.
+    rough_m_to_uu = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -1000, -1250)
+    rough_m_to_uu.set_editor_property("r", 100.0)
+    rough_start_uu = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -870, -1290)
+    if not mel.connect_material_expressions(rough_fade_start, "", rough_start_uu, "A"):
+        raise RuntimeError("connect WaterRoughnessFadeStartM -> rough_start_uu.A failed")
+    if not mel.connect_material_expressions(rough_m_to_uu, "", rough_start_uu, "B"):
+        raise RuntimeError("connect 100 -> rough_start_uu.B failed")
+    rough_end_uu = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -870, -1230)
+    if not mel.connect_material_expressions(rough_fade_end, "", rough_end_uu, "A"):
+        raise RuntimeError("connect WaterRoughnessFadeEndM -> rough_end_uu.A failed")
+    if not mel.connect_material_expressions(rough_m_to_uu, "", rough_end_uu, "B"):
+        raise RuntimeError("connect 100 -> rough_end_uu.B failed")
+
+    rough_num = mel.create_material_expression(material, unreal.MaterialExpressionSubtract, -740, -1300)
+    if not mel.connect_material_expressions(rough_dist_uu, "", rough_num, "A"):
+        raise RuntimeError("connect rough_dist_uu -> rough_num.A failed")
+    if not mel.connect_material_expressions(rough_start_uu, "", rough_num, "B"):
+        raise RuntimeError("connect rough_start_uu -> rough_num.B failed")
+    rough_den = mel.create_material_expression(material, unreal.MaterialExpressionSubtract, -740, -1240)
+    if not mel.connect_material_expressions(rough_end_uu, "", rough_den, "A"):
+        raise RuntimeError("connect rough_end_uu -> rough_den.A failed")
+    if not mel.connect_material_expressions(rough_start_uu, "", rough_den, "B"):
+        raise RuntimeError("connect rough_start_uu -> rough_den.B failed")
+    rough_div = mel.create_material_expression(material, unreal.MaterialExpressionDivide, -620, -1270)
+    if not mel.connect_material_expressions(rough_num, "", rough_div, "A"):
+        raise RuntimeError("connect rough_num -> rough_div.A failed")
+    if not mel.connect_material_expressions(rough_den, "", rough_div, "B"):
+        raise RuntimeError("connect rough_den -> rough_div.B failed")
+    rough_ramp = mel.create_material_expression(material, unreal.MaterialExpressionSaturate, -510, -1270)
+    if not mel.connect_material_expressions(rough_div, "", rough_ramp, ""):
+        raise RuntimeError("connect rough_div -> rough_ramp (saturate) failed")
+
+    # THE GATE. Multiplying the ramp by the gain rather than lerping to it
+    # keeps the OFF arm exact: at gain 0 the alpha is identically 0, not
+    # "0 to within a rounding error of a saturate".
+    rough_alpha = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -400, -1270)
+    if not mel.connect_material_expressions(rough_ramp, "", rough_alpha, "A"):
+        raise RuntimeError("connect rough_ramp -> rough_alpha.A failed")
+    if not mel.connect_material_expressions(rough_far_gain, "", rough_alpha, "B"):
+        raise RuntimeError("connect WaterRoughnessFarGain -> rough_alpha.B failed")
+
+    calm_near_roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -180)
+    calm_near_roughness.set_editor_property("r", 0.08)
+    calm_roughness = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -300, -1270)
+    if not mel.connect_material_expressions(calm_near_roughness, "", calm_roughness, "A"):
+        raise RuntimeError("connect calm_near_roughness -> calm_roughness.A failed")
+    if not mel.connect_material_expressions(far_roughness, "", calm_roughness, "B"):
+        raise RuntimeError("connect WaterRoughnessFar -> calm_roughness.B failed")
+    if not mel.connect_material_expressions(rough_alpha, "", calm_roughness, "Alpha"):
+        raise RuntimeError("connect rough_alpha -> calm_roughness.Alpha failed")
+    # ------------------------------------------------------------------
+
     foam_roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -130)
     foam_roughness.set_editor_property("r", 0.62)
     roughness = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -40, -170)
@@ -2654,6 +2768,197 @@ def main():
             "M_WaterVoxel EMISSIVE PIN TEST: ON -- emissive is a CONSTANT (10,0,0). "
             "If the water is not blazing red, Single Layer Water is not showing this "
             "material's emissive at all. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "params":
+        # WHAT DOES THIS MATERIAL RECEIVE FROM THE COLLECTION? (2026-09-07)
+        #
+        # The uvstep T=0 control on a HEALTHY session (refused=0, 4 tiles, a
+        # rendered lake) painted zero pixels. At threshold 0 the lake must light
+        # wherever u > 0.001, so the per-pixel uv is <= 0 everywhere in view.
+        # uv = (world - RippleFieldOrigin) * RippleFieldInvSize; for it to be
+        # <= 0 with world ~ -6.5e6 UU the origin the material reads must be
+        # ~0 (uv = world/5120 = -1271) or the inverse size must be 0. Both are
+        # what an UNPUBLISHED collection parameter reads as. So paint the
+        # parameters themselves, scaled into 0..1:
+        #   R = origin.x / -1e7   -> 0.65 if the published -6.5e6 arrives, 0 if default
+        #   G = inv_size * 5120   -> 1.0 if the published 1/5120 arrives, 0 if default
+        #   B = gain / 2.5        -> 1.0 if the published 2.5 arrives, 0 if default
+        # A black lake means the material is NOT reading the runtime collection
+        # values -- bound to a different collection object, or the publish is
+        # landing on a different instance -- and that is the wake bug.
+        import ripple_field_graph as _rfg2  # noqa: E402
+        pr_origin = bathy_b.collection_param(_rfg2.MPC_ORIGIN)
+        pr_inv = bathy_b.collection_param(_rfg2.MPC_INV_SIZE)
+        pr_gain = bathy_b.collection_param(_rfg2.MPC_GAIN)
+        pr_r = bathy_b.mul(bathy_b.mask(pr_origin, "", r=True), bathy_b.const(-1.0e-7))
+        pr_g = bathy_b.mul(pr_inv, bathy_b.const(5120.0))
+        pr_b = bathy_b.mul(pr_gain, bathy_b.const(0.4))
+        pr_red = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3420)
+        pr_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        pr_green = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3480)
+        pr_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        pr_blue = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3540)
+        pr_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        pr_out = bathy_b.add(bathy_b.add(bathy_b.mul(pr_r, pr_red), bathy_b.mul(pr_g, pr_green)),
+                             bathy_b.mul(pr_b, pr_blue))
+        if not mel.connect_material_property(
+                pr_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect params debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel PARAMS ARM: ON -- emissive R=origin.x/-1e7, G=invSize*5120, "
+            "B=gain/2.5, straight from the collection. Black lake = the material is not "
+            "receiving the runtime collection values. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "shorefoam":
+        # WHICH INPUT OF THE SHORE FOAM IS ZERO? (2026-09-07)
+        #
+        # Four runtime arms on the lake at (-65102,-51084) -- shipping,
+        # BathyFoamShelfHi 2.0, shelf gate open (Lo 50 / Hi 100), and
+        # BathyFoamWidthM 6.0, every override confirmed applied by the sheet's
+        # own log line -- produced four frames the eye cannot tell apart
+        # (VoxelVerify00834/836/838/842). shore_foam = band * shelf * gain *
+        # validity, and a 6 m band at gain 0.55 through an open gate is not
+        # invisible if it exists, so one of the FACTORS is zero along that
+        # shore. Paint them: R = shore_band, G = shelf_gate, B = validity.
+        # Black shoreline = validity 0 (no baked depth on this sheet); no red
+        # near the waterline = the band never lands (shore_m is not the
+        # distance to THIS lake's edge); no green = the shelf gate.
+        sf_red = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3620)
+        sf_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        sf_green = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3680)
+        sf_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        sf_blue = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3740)
+        sf_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        sf_out = bathy_b.add(bathy_b.add(bathy_b.mul(shore_band, sf_red), bathy_b.mul(shelf_gate, sf_green)),
+                             bathy_b.mul(bathy["validity"], sf_blue))
+        if not mel.connect_material_property(
+                sf_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect shorefoam debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel SHOREFOAM ARM: ON -- emissive R=shore_band, G=shelf_gate, "
+            "B=bathy validity. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "shoredist":
+        # WHICH WAY IS shore_band ZERO? (2026-09-07)
+        #
+        # The shorefoam arm above measured shore_band = 0 on every water pixel
+        # and that is where the search stopped, because shore_band is a PRODUCT
+        # of two terms that fail in OPPOSITE directions and both paint black:
+        #
+        #     shore_band = (1 - ramp(shore_m + noise, 0, width))   <- zero when
+        #                                        shore_m is BEYOND the band
+        #                * saturate(8 * shore_m)                   <- zero when
+        #                                        shore_m is <= 0 (the sign test)
+        #
+        # "No red" is therefore consistent with the visible water being FAR from
+        # the baked shoreline AND with the baked field calling every visible
+        # water pixel dry land. Those have different fixes -- one is a framing
+        # or clip problem, the other is a bake alignment problem -- so an
+        # instrument that cannot separate them cannot end this search.
+        #
+        # THE PAINT IS BINARY, AND THAT IS THE LESSON FROM THE uvstep ARM BELOW:
+        # "the tonemapper defeats reading absolute uv values off a PNG". A ramp
+        # of shore_m would be unreadable for the same reason, so each channel is
+        # a hard 0/1 threshold and the measurement is WHERE THE EDGE IS, not what
+        # shade the pixel is.
+        #
+        #   R = 1 where shore_m > 0            -- the field says "water here"
+        #   G = 1 where 0 < shore_m < width    -- the foam band, i.e. exactly the
+        #                                         set shore_band is nonzero on
+        #   B = 1 where shore_m > 6 m          -- open water, well past any band
+        #
+        # HOW TO READ THE FRAME:
+        #   red + blue, no green   -> shore_m > 6 everywhere in view. The band
+        #                             exists but is off-screen or clipped away;
+        #                             chase the sheet edge and the shore clip.
+        #   no red at all          -> shore_m <= 0 on all visible water. The
+        #                             sign test is what kills the foam, the bake
+        #                             is misaligned with the drawn sheet, and no
+        #                             width or shelf ladder can ever help.
+        #   a green ribbon         -> the band DOES land, and the fault is
+        #                             downstream of shore_band (shelf gate, gain,
+        #                             or foam's route to the screen).
+        #
+        # THE GREEN CHANNEL READS THE LIVE BathyFoamWidthM, deliberately: it is
+        # a ScalarParameter, so -VoxelWaterMatScalar=BathyFoamWidthM:6 widens the
+        # green ribbon on THIS material at runtime. That turns "is the band
+        # merely too narrow?" into a ladder on one baked material instead of a
+        # regen per rung.
+        #
+        # x1000 rather than a step node: saturate(k*x) is a step for any k that
+        # makes the transition narrower than a source texel, the 1.875 m raster
+        # here is nine orders of magnitude wider than 1/1000 m, and it reuses the
+        # helpers every other term in this file is built from.
+        sd_red = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3800)
+        sd_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        sd_green = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3860)
+        sd_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        sd_blue = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -1500, 3920)
+        sd_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        sd_k = bathy_b.const(1000.0)
+        sd_in_water = bathy_b.saturate(bathy_b.mul(bathy["shore_m"], sd_k))
+        sd_past_band = bathy_b.saturate(
+            bathy_b.mul(bathy_b.sub(bathy["shore_m"], shore_width), sd_k))
+        sd_in_band = bathy_b.mul(sd_in_water, bathy_b.one_minus(sd_past_band))
+        sd_far = bathy_b.saturate(
+            bathy_b.mul(bathy_b.sub(bathy["shore_m"], bathy_b.const(6.0)), sd_k))
+        sd_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(sd_in_water, sd_red), bathy_b.mul(sd_in_band, sd_green)),
+            bathy_b.mul(sd_far, sd_blue))
+        if not mel.connect_material_property(
+                sd_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect shoredist debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel SHOREDIST ARM: ON -- emissive R=(shore_m>0), "
+            "G=(0<shore_m<BathyFoamWidthM), B=(shore_m>6m). NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "uvstep":
+        # THE MARKER THAT CANNOT BE MISREAD (2026-09-07). Two previous uv
+        # instruments failed in the direction that looks like a finding: the
+        # 51 cm marker was unfindable, and the 4 m one at uv (0.583,0.583) also
+        # showed nothing in a frame that provably contains that world position
+        # 6 m ahead of the camera -- while the uv-to-emissive diff proved uv is
+        # live and roughly in range. Either the per-pixel uv is offset from the
+        # simulation's, or the marker arithmetic itself was wrong; a marker
+        # cannot distinguish those, and the tonemapper defeats reading absolute
+        # uv values off a PNG.
+        #
+        # So paint a BINARY threshold instead: R = 1 where u > 0.55, G = 1 where
+        # v > 0.55, else 0. Binary survives tonemapping as bright-vs-dark, so
+        # the frame shows two HARD EDGES whose screen position is the
+        # measurement. At this pose (camera at uv 0.5, yaw 45) both edges must
+        # cross ~2.5 m ahead of the camera, diagonally. An edge elsewhere is the
+        # uv error measured in metres; no edge at all means uv never crosses
+        # 0.55 in view, i.e. the scale is wrong; edges in the right place mean
+        # uv is CORRECT and the earlier markers were the broken instrument.
+        # THE THRESHOLD IS A LADDER, NOT A CONSTANT (VOXEL_WATER_UVSTEP_T). The
+        # first run at 0.55 painted NOTHING in either channel across the whole
+        # visible lake (the only "yellow" pixels were the dig-preview wireframe
+        # at screen centre). Water 2.5 m ahead of a camera at uv 0.5 must read
+        # 0.55 if the scale is right, so either uv barely moves across the lake
+        # (scale error) or this instrument is broken too. A ladder separates
+        # them: T=0.0 is the CONTROL and must paint the entire lake yellow
+        # (uv>0 everywhere) or the instrument is wrong; T=0.51 / 0.52 then
+        # place the edge at a distance that MEASURES the scale --
+        # correct scale puts the 0.51 edge 0.5 m ahead, a 100x-too-small scale
+        # puts it 50 m ahead.
+        _uvstep_t = float(os.environ.get("VOXEL_WATER_UVSTEP_T", "0.55"))
+        us_u = bathy_b.mask(ripple["uv"], "", r=True)
+        us_v = bathy_b.mask(ripple["uv"], "", g=True)
+        us_r = bathy_b.saturate(bathy_b.mul(bathy_b.sub(us_u, bathy_b.const(_uvstep_t)),
+                                            bathy_b.const(1000.0)))
+        us_g = bathy_b.saturate(bathy_b.mul(bathy_b.sub(us_v, bathy_b.const(_uvstep_t)),
+                                            bathy_b.const(1000.0)))
+        us_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1500, 3300)
+        us_red.set_editor_property("constant", unreal.LinearColor(3.0, 0.0, 0.0, 1.0))
+        us_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1500, 3360)
+        us_green.set_editor_property("constant", unreal.LinearColor(0.0, 3.0, 0.0, 1.0))
+        us_out = bathy_b.add(bathy_b.mul(us_r, us_red), bathy_b.mul(us_g, us_green))
+        if not mel.connect_material_property(
+                us_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect uvstep debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel UV STEP ARM: ON -- emissive R=1 where ripple u>0.55, G=1 where "
+            "v>0.55. Hard edges; their screen position measures the uv mapping. "
+            "NOT A SHIPPING MATERIAL.")
     elif _ripple_debug_mode == "foamviz":
         # IS ANY FOAM ALIVE AT ALL? (2026-09-06)
         #

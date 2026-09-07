@@ -1243,3 +1243,110 @@ must be shot from above the surface (+6 m / -18 deg, or a pose computed against
 the surface height) and the capture log must carry no "camera entered water"
 line before the shutter. Handed to the material-owning agent with the arm
 order const -> params -> texture-sample-with-disturbance.
+
+## 05:35 SHORE FOAM: SOLVED AT THE MECHANISM LEVEL. The band is not too narrow — the baked shoreline is 6-40 m from the drawn water's edge
+
+Material-owning agent, 2026-09-07. **New instrument, new arm:
+`VOXEL_WATER_RIPPLE_DEBUG=shoredist`** in `create_water_voxel_material.py`
+(log marker `SHOREDIST ARM: ON` — add it to the contamination list).
+
+**Why a new arm was needed.** The 03:10 factor paint established
+`shore_band == 0` and the search stopped there, but `shore_band` is a product of
+two terms that fail in *opposite* directions and both paint black:
+
+    shore_band = (1 - ramp(shore_m + noise, 0, width))   <- 0 when shore_m is BEYOND the band
+               * saturate(8 * shore_m)                   <- 0 when shore_m <= 0 (sign test)
+
+"No red" was therefore consistent with the visible water being far from the
+shoreline *and* with the bake calling every visible water pixel dry land. Those
+have opposite fixes. The new arm paints `shore_m` itself, in **binary** (the
+lesson recorded on the `uvstep` arm: the tonemapper defeats reading a ramp off a
+PNG), so the measurement is where an EDGE is, not what shade a pixel is:
+
+* R = 1 where `shore_m > 0`
+* G = 1 where `0 < shore_m < BathyFoamWidthM` — the live scalar, so the green
+  ribbon is a **runtime ladder on one baked material**
+* B = 1 where `shore_m > 6 m`
+
+**Frames** (all `+6 m / -18 deg`, above the surface, `camera entered water` count
+**0** in all three logs): `VoxelVerify00896` (width 1.6, shipping),
+`VoxelVerify00898` (width 6), `VoxelVerify00900` (width 40). Compared per band
+against each other — 00900 minus 00896 isolates the green channel exactly,
+because that is the only term the width changes.
+
+| band | mean G, width 1.6 | width 6 | width 40 |
+|---|---|---|---|
+| strip at the visible waterline | 177.3 | 177.8 | 206.5 |
+| far water | 174.8 | 174.9 | 217.4 |
+| mid | 98.4 | 98.4 | 201.8 |
+| near | 98.0 | 98.0 | 201.4 |
+
+**The result, and it is unambiguous:**
+
+1. **R is on over 100% of the water. `shore_m > 0` everywhere — the sign test is
+   NOT the failure**, and the bake is not calling the lake dry land.
+2. **B is on over 100% of the water. `shore_m > 6 m` everywhere — including the
+   strip immediately below the visibly drawn waterline.**
+3. **Green does not move at all between width 1.6 and width 6** (177.3 -> 177.8,
+   98.4 -> 98.4: noise). It lights up everywhere only at **width 40**.
+
+So on every rendered water pixel, **6 m < `shore_m` < 40 m**, and the field never
+approaches zero anywhere in the drawn sheet — *not even at the drawn water's
+edge*. The 1.6 m foam band is therefore evaluated on a set that contains no
+rendered pixels. That is why all five runtime ladders were pixel-identical and
+why `BathyFoamWidthM:6` in particular changed nothing: **6 m is still short of
+the actual distance.** No width, shelf or gain value can fix this.
+
+It also explains the shelf gate independently, which is a consistency check the
+factor paint could not do: `bed_slope = depth_m / max(shore_m, 0.5)`, and with
+`shore_m` in 6-40 m against a ~5 m depth the ratio sits right on `shelf_hi`
+(0.25), which is exactly the "closed almost everywhere, open in one far patch"
+the 03:10 frame showed.
+
+**The defect is therefore upstream of the material: the baked lake-shore SDF and
+the rendered water sheet disagree about where this lake ends, by at least 6 m
+and less than 40 m.** The material is behaving correctly given its input. The
+next step belongs in `bathy_field_graph.py` / `VoxelBathyField.cpp` /
+`basins.py` — compare the baked lake polygon's edge against the sheet's drawn
+extent at this shore (candidates in the coordinator's own list: the bake's
+polygon inset, the sheet's water level vs the basin datum, or the shore-clip
+tolerance trimming the sheet inward). **NOT YET DONE** — this session establishes
+the mechanism and hands over a bounded number.
+
+**Refinement available cheaply:** the width scalar is a runtime override, so one
+more `shoredist` regen plus a 10/20/30 m ladder pins the offset to a few metres
+rather than the 6-40 m bracket. Not run here (the material was restored to
+shipping so the R3 arm could be shot on a clean asset).
+
+### 06:00 `-VoxelWaterMatScalar` SILENTLY APPLIED ONLY ITS FIRST PAIR. Fixed. Two ladder arms are void.
+
+Found while running R3, fixed in `VoxelWaterSheetActor.cpp:325`, built clean.
+
+`FParse::Value`'s fourth parameter, `bShouldStopOnSeparator`, **defaults to
+true**, and a separator includes the comma. So the documented multi-pair form
+`-VoxelWaterMatScalar=Name:Value,Name:Value` parsed as **only the first pair**
+for as long as the switch has existed. Everything after the first comma was
+dropped with no warning — and because the loop logs each assignment it *did*
+make, the log looked healthy: one correct line, and no mention of the rest.
+
+Proof, before and after, same command line both times:
+
+* before — `...FarGain:1,FadeStartM:0,FadeEndM:1,Far:0.30` reached the command
+  line verbatim (it is in `capture-r3-all030.log`) and produced exactly **one**
+  `material scalar ... set` line, for `WaterRoughnessFarGain`. The frame was
+  consequently identical to the plain `FarGain:1` arm.
+* after — the same argument produces **four** lines (`FadeEndM 1.0000`,
+  `FadeStartM 0.0000`, `Far 0.3000`, `FarGain 1.0000`), and the frame moves by a
+  whole-frame mean |diff| of 20.2 where it previously moved 1.0.
+
+**Consequences for this document's own ladders — please re-read the affected
+rows.** Any arm that passed more than one pair set only its first:
+
+* shore-foam **arm C** (`BathyFoamShelfLo:50 + BathyFoamShelfHi:100`) actually
+  set **ShelfLo only**; `ShelfHi` stayed at the shipping 0.25.
+* shore-foam **arm F** ("all three together") actually set **one** of the three.
+
+Neither is evidence for what its label claims. **Single-pair arms are
+unaffected**, which covers arms A, B and D, and covers the whole `shoredist`
+ladder above — so the shore-foam conclusion stands on its own. But the null of
+arms C and F was never a test of the thing they were named for.
