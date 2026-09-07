@@ -1208,3 +1208,21 @@ same settle do not reproduce the bob phase exactly (dt varies), so the arms are
 the same pose, not the same instant. And these are scripted frames for a
 feature family the owner ruled is owner-tested in-editor from 09-06: they are
 evidence the mechanism engages, not a substitute for his judgement.
+
+### 04:30 addendum: uv arm landed (VoxelVerify00866) -- not discriminating
+
+Third attempt (the first two were overwritten/refused by other launches; frames
+00846 and 00856 are SHIPPING water and void). Regen log marker for this arm is
+"RIPPLE UV TEST: ON" (not "UV ARM"). Read-back at +2 m / -25 deg: bottom band
+R 134/153/163/165/163/159/150/127 across eight x-bins, G 201-215 -- symmetric
+left-right, falling only with distance; centre column R 0 -> 164 top to bottom.
+That is a constant emissive under the volume's absorption, indistinguishable
+from a correct uv (0.5,0.5) because the near field spans ~3 m of a 51.2 m window
+(delta-u ~0.06 = 8 levels, under the absorption gradient). Consistent with the
+params arm; does NOT locate the fault. Handed to the material-owning agent with
+the remaining hypotheses (texture-parameter binding on the sheet MID, V
+orientation between derive and sample, WaveTimeScale gate at runtime), each to
+get one discriminating instrument with framing that provably contains the
+disturbance. Shipping material restored 04:24:31, proven by the regen log.
+Combined shore arm F (00864) is identical to shipping: shore foam is also with
+that agent.
