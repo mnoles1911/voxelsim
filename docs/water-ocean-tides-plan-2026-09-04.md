@@ -1226,3 +1226,20 @@ get one discriminating instrument with framing that provably contains the
 disturbance. Shipping material restored 04:24:31, proven by the regen log.
 Combined shore arm F (00864) is identical to shipping: shore foam is also with
 that agent.
+
+### 05:20 CORRECTION: the "+2 m / -25 deg" lake pose is UNDER WATER
+
+The R6/R7 agent read it off the log: "Ocean: camera entered water ...
+submerged depth 3.32 m, treatment=M_Underwater". The harness's altitude is
+measured from ground top (the lakebed, 1644.2 m); the lake surface stands
+5.32 m above that, so +2 m is 3.3 m below the surface and +6 m is 0.7 m above
+it. Every ripple debug frame taken at +2 m -- params (00840), uv (00866), and
+the earlier uvstep / marker / height / gradient arms -- was drawn by the
+underwater post-process and never contained M_WaterVoxel's emissive.
+WITHDRAWN: "the material receives the published collection values" (the pale
+cyan was underwater fog) and "the uv arm is non-discriminating". The read side
+of the wake is UNTESTED, not exonerated. Rule from here: a water-surface arm
+must be shot from above the surface (+6 m / -18 deg, or a pose computed against
+the surface height) and the capture log must carry no "camera entered water"
+line before the shutter. Handed to the material-owning agent with the arm
+order const -> params -> texture-sample-with-disturbance.
