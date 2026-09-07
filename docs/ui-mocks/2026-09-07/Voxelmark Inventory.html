@@ -1,0 +1,417 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Inventory" subtitle="Inventory + crafting on one screen — 8×8 pack, toggle between craft grid and character" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Inventory &amp; Crafting</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Press+Start+2P&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  /* shell hugs the pack + side panel instead of filling the screen */
+  /* shell hugs the pack + craft panels instead of filling the screen */
+  .menu-shell{position:fixed;inset:auto;left:50%;top:50%;transform:translate(-50%,-50%);transform-origin:center center;width:max-content;height:max-content;padding:14px 18px 18px}
+  .menu-body{flex:none;min-height:0}
+  .inv-grid{flex:none;min-width:0;min-height:0;display:flex;justify-content:center;align-items:flex-start}
+  .fit-inner{width:max-content;display:flex;gap:22px;align-items:flex-start}
+  .side-box{min-height:0}
+  .col{display:flex;flex-direction:column;gap:10px;min-height:0}
+
+  /* ---------- shared head row ---------- */
+  .panel-head{display:flex;align-items:center;gap:12px;min-height:30px}
+  .panel-head .name{font-family:var(--serif);font-weight:700;font-size:15px;letter-spacing:4px;color:var(--gold);text-shadow:1px 1px 0 #000}
+  .panel-head .spacer{flex:1}
+  .weight{font-family:var(--mono);font-size:17px;color:var(--ink-dim);display:flex;align-items:center;gap:6px}
+  .weight i{width:11px;height:11px;background:var(--bronze);clip-path:polygon(20% 0,80% 0,100% 30%,90% 100%,10% 100%,0 30%)}
+
+  /* mode toggle */
+  .mode-toggle{display:flex;border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge)}
+  .mode-toggle button{font-family:var(--serif);font-weight:700;font-size:12px;letter-spacing:2px;color:var(--ink-mute);background:linear-gradient(180deg,var(--panel-iron),#14100a);border:0;padding:7px 16px;cursor:pointer;text-shadow:1px 1px 0 #000}
+  .mode-toggle button:hover{color:var(--ink)}
+  .mode-toggle button.on{color:var(--gold);background:linear-gradient(180deg,var(--bronze),var(--bronze-deep));box-shadow:inset 0 0 0 1px var(--gold)}
+
+  /* ---------- PACK ---------- */
+  .search{flex:1;max-width:280px;display:flex;align-items:center;gap:6px;background:#14100a;border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);padding:3px 8px}
+  .search svg{width:13px;height:13px;flex:none;opacity:.7}
+  .search input{flex:1;background:transparent;border:0;outline:0;font-family:var(--mono);font-size:17px;color:var(--ink)}
+  .search input::placeholder{color:var(--ink-mute)}
+
+  .pack-box{background:#0a0805;border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);padding:6px}
+  .pack{display:grid;grid-template-columns:repeat(8,58px);grid-auto-rows:58px;gap:2px}
+  .pack .slot{width:58px;height:58px}
+  .hotbar-rule{height:2px;background:var(--panel-oak-edge);opacity:.5;margin:5px 1px}
+  .hotbar{display:grid;grid-template-columns:repeat(8,58px);gap:2px}
+  .hotbar .slot{width:58px;height:58px;box-shadow:inset 0 0 0 1px var(--bronze-deep),inset 0 0 0 2px rgba(0,0,0,0.5)}
+  .hotbar .slot .key{position:absolute;left:4px;top:2px;font-family:var(--pixel);font-size:8px;color:var(--ink-mute);text-shadow:1px 1px 0 #000}
+
+  .filter-row{display:flex;flex-wrap:nowrap}
+  .filter-tab{font-family:var(--serif);font-weight:700;font-size:11px;letter-spacing:2px;color:var(--ink-mute);padding:5px 10px;cursor:pointer;border:2px solid #000;background:var(--panel-iron);box-shadow:inset 0 0 0 1px var(--panel-iron-edge);margin-right:-2px;text-shadow:1px 1px 0 #000;display:flex;align-items:center;gap:6px}
+  .filter-tab:hover{color:var(--ink)}
+  .filter-tab.active{color:var(--gold);background:var(--panel-oak-2);box-shadow:inset 0 0 0 1px var(--panel-oak-edge),inset 0 -3px 0 var(--gold)}
+  .filter-tab .n{font-family:var(--mono);font-size:15px;color:var(--ink-mute)}
+  .filter-tab.active .n{color:var(--gold)}
+
+  /* ---------- SIDE PANEL (craft / character) ---------- */
+  .side{width:430px;flex:none;display:flex;flex-direction:column;gap:10px}
+  .side-box{background:#0a0805;border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);padding:16px;display:flex;flex-direction:column;align-items:center;gap:12px}
+  .mode{display:none;flex-direction:column;align-items:center;gap:12px;width:100%}
+  .mode.on{display:flex}
+
+  /* craft grid: 3×3 with one output square centred below */
+  .craft-3{display:grid;grid-template-columns:repeat(3,66px);grid-auto-rows:66px;gap:3px}
+  .craft-3 .slot{width:66px;height:66px}
+  .craft-out{position:relative;display:flex;flex-direction:column;align-items:center;gap:6px}
+  .craft-arrow{width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-top:11px solid var(--bronze-deep)}
+  .craft-out .slot{width:66px;height:66px;box-shadow:inset 0 0 0 1px var(--gold-deep),inset 0 0 0 2px rgba(0,0,0,0.5),inset 0 0 0 3px var(--bronze)}
+  .craft-note{font-family:var(--mono);font-size:16px;color:var(--ink-mute);text-align:center}
+  .craft-recipe{font-family:var(--serif);font-weight:700;font-size:13px;letter-spacing:3px;color:var(--gold);text-shadow:1px 1px 0 #000;min-height:16px}
+  .craft-act{font-family:var(--serif);font-weight:700;font-size:13px;letter-spacing:3px;color:var(--parchment);background:linear-gradient(180deg,var(--panel-oak-1),var(--panel-oak-2));border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-oak-edge);padding:9px 26px;cursor:pointer;text-shadow:1px 1px 0 #000}
+  .craft-act:hover{color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold)}
+
+  /* character mode */
+  .doll-row{display:grid;grid-template-columns:58px 1fr 58px;gap:10px;align-items:center;width:100%}
+  .gear-col{display:flex;flex-direction:column;gap:14px}
+  .eq{width:58px;height:58px;position:relative;background:linear-gradient(180deg,#1a1410 0%,#0a0805 100%);border:2px solid #000;box-shadow:inset 0 0 0 1px var(--iron),inset 0 0 0 2px var(--iron-deep);image-rendering:pixelated;cursor:pointer;transition:box-shadow .12s}
+  .eq:hover{box-shadow:inset 0 0 0 1px var(--gold),inset 0 0 0 2px var(--gold-deep)}
+  .eq.empty::after{content:attr(data-empty);position:absolute;inset:0;display:grid;place-items:center;font-family:var(--mono);font-size:14px;color:var(--ink-mute);text-align:center;line-height:1.1;pointer-events:none}
+  .eq .lab{position:absolute;bottom:-13px;left:0;right:0;font-family:var(--mono);font-size:13px;letter-spacing:1px;color:var(--ink-mute);text-align:center;text-shadow:1px 1px 0 #000;pointer-events:none}
+  .eq .it{inset:8px}
+  .eq.rare-uncommon{box-shadow:inset 0 0 0 1px var(--rare-uncommon),inset 0 0 0 2px var(--iron-deep)}
+  .eq.rare-rare{box-shadow:inset 0 0 0 1px var(--rare-rare),inset 0 0 0 2px var(--iron-deep)}
+
+  .render-frame{height:300px;background:radial-gradient(ellipse 60% 30% at 50% 92%, rgba(0,0,0,0.7), transparent 60%),radial-gradient(ellipse at 50% 30%, rgba(232,217,176,0.12), transparent 70%),linear-gradient(180deg,#1a1410 0%,#0a0805 100%);border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);position:relative;overflow:hidden;display:grid;place-items:center;perspective:700px}
+  .render-stage{transform-style:preserve-3d;animation:turntable 14s linear infinite}
+  @keyframes turntable{0%{transform:rotateY(-22deg)}50%{transform:rotateY(22deg)}100%{transform:rotateY(-22deg)}}
+  .voxel-char{width:96px;height:168px;image-rendering:pixelated;position:relative;transform-style:preserve-3d}
+  .vc{position:absolute}
+  .vc.head{left:32px;top:0;width:32px;height:32px;background:linear-gradient(180deg,#c8c0b0 0 24%,#8a8378 24% 100%);box-shadow:inset 0 0 0 2px #2a241f,inset -3px 0 0 rgba(0,0,0,0.45)}
+  .vc.face{left:36px;top:14px;width:24px;height:14px;background:linear-gradient(180deg,#8a6a4a 0 50%,#6b4a2a 50% 100%);box-shadow:inset 0 0 0 1px #2a241f}
+  .vc.eye-l,.vc.eye-r{width:3px;height:3px;background:#f0e0a8;top:18px}
+  .vc.eye-l{left:42px}
+  .vc.eye-r{left:51px}
+  .vc.shoulder-l,.vc.shoulder-r{top:32px;width:20px;height:18px;background:linear-gradient(180deg,#8a8378 0 40%,#4a4038 40% 100%);box-shadow:inset 0 0 0 2px #2a241f}
+  .vc.shoulder-l{left:12px}
+  .vc.shoulder-r{left:64px}
+  .vc.chest{left:24px;top:34px;width:48px;height:50px;background:radial-gradient(circle at 50% 30%, var(--bronze) 0 8%, transparent 8%),linear-gradient(180deg,#6a5a4a 0 30%,#4a4038 30% 100%);box-shadow:inset 0 0 0 2px #2a241f,inset -4px 0 0 rgba(0,0,0,0.4)}
+  .vc.belt{left:24px;top:84px;width:48px;height:8px;background:linear-gradient(180deg,#6b4520 0 50%,#4a2f1a 50% 100%);box-shadow:inset 0 0 0 1px #2a241f}
+  .vc.leg-l,.vc.leg-r{top:92px;width:20px;height:48px;background:linear-gradient(180deg,#4a4038 0 70%,#2a241f 70% 100%);box-shadow:inset 0 0 0 2px #14100a}
+  .vc.leg-l{left:28px}
+  .vc.leg-r{left:48px}
+  .vc.boot-l,.vc.boot-r{top:140px;width:22px;height:14px;background:linear-gradient(180deg,#6b4520 0 50%,#2a1a0c 50% 100%);box-shadow:inset 0 0 0 2px #14100a}
+  .vc.boot-l{left:27px}
+  .vc.boot-r{left:47px}
+  .vc.weapon{left:0;top:60px;width:8px;height:78px;background:linear-gradient(180deg,#6b4520 0 8%,#b07a3a 8% 12%,#6b4520 12% 16%,#d8d4c8 16% 88%,#8a8378 88% 92%,transparent 92%);box-shadow:0 0 0 1px #2a241f}
+  .vc.shield{left:80px;top:48px;width:18px;height:32px;background:radial-gradient(circle at 50% 30%, var(--bronze) 0 22%, transparent 22%),linear-gradient(180deg,#6b4520 0 14%,#4a2f1a 14% 100%);clip-path:polygon(0 0,100% 0,100% 60%,50% 100%,0 60%);box-shadow:inset 0 0 0 1px #14100a}
+  .vc.shadow{left:14px;top:152px;width:68px;height:8px;background:radial-gradient(ellipse at 50% 50%, rgba(0,0,0,0.6) 0 50%, transparent 70%);transform:translateZ(-1px)}
+  .render-plinth{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);width:140px;height:6px;background:linear-gradient(180deg,#3a342d,#14100a);border:1px solid #000;box-shadow:0 0 16px rgba(240,193,75,0.15)}
+
+  .stats{width:100%;border-top:2px solid #000;box-shadow:0 -1px 0 var(--panel-oak-edge);padding-top:10px;display:grid;grid-template-columns:1fr auto 1fr auto;gap:3px 14px;font-family:var(--mono);font-size:17px}
+  .stats .k{color:var(--ink-dim)}
+  .stats .v{color:var(--gold);text-align:right}
+
+  .slot.drag-over,.eq.drag-over{box-shadow:inset 0 0 0 2px var(--gold),inset 0 0 0 3px var(--gold-deep),0 0 8px rgba(240,193,75,0.6) !important}
+  .slot.dragging{opacity:.35}
+  a{color:var(--gold)}a:hover{color:var(--ink)}
+</style>
+</head>
+<body>
+  <div class="bg-scene"></div>
+  <div class="bg-vignette"></div>
+  <div class="bg-grain"></div>
+
+  <div class="menu-shell">
+    <nav class="menu-tabs">
+      <a href="Voxelmark Map.html" class="menu-tab">MAP</a>
+      <a href="Voxelmark Journal.html" class="menu-tab">JOURNAL</a>
+      <a href="Voxelmark Inventory.html" class="menu-tab active">INVENTORY</a>
+      <a href="Voxelmark Player.html" class="menu-tab">PLAYER</a>
+      <a href="Voxelmark Codex.html" class="menu-tab">CODEX</a>
+    </nav>
+
+    <div class="menu-body">
+      <div class="inv-grid">
+        <div class="fit-inner" id="fitInner">
+        <!-- PACK: 8 wide × 8 deep, tight -->
+        <div class="col">
+          <div class="panel-head">
+            <span class="name">PACK</span>
+            <div class="search">
+              <svg viewBox="0 0 16 16" fill="none" stroke="#b4a07a" stroke-width="2"><circle cx="7" cy="7" r="5"/><path d="M11 11 L15 15"/></svg>
+              <input id="invSearch" type="text" placeholder="Search…" autocomplete="off" />
+            </div>
+            <span class="weight"><i></i> 112 / 180</span>
+          </div>
+
+          <div class="filter-row" id="filters">
+            <div class="filter-tab active" data-filter="all">All <span class="n" data-count="all">0</span></div>
+            <div class="filter-tab" data-filter="weapons">Weapons <span class="n" data-count="weapons">0</span></div>
+            <div class="filter-tab" data-filter="armor">Armor <span class="n" data-count="armor">0</span></div>
+            <div class="filter-tab" data-filter="tools">Tools <span class="n" data-count="tools">0</span></div>
+            <div class="filter-tab" data-filter="food">Food <span class="n" data-count="food">0</span></div>
+            <div class="filter-tab" data-filter="materials">Materials <span class="n" data-count="materials">0</span></div>
+            <div class="filter-tab" data-filter="quest">Quest <span class="n" data-count="quest">0</span></div>
+          </div>
+
+          <div class="pack-box">
+            <div class="pack" id="invGrid"></div>
+            <div class="hotbar-rule"></div>
+            <div class="hotbar" id="hotbar"></div>
+          </div>
+        </div>
+
+        <!-- SIDE: one toggle swaps craft grid ⇄ character -->
+        <div class="side">
+          <div class="panel-head">
+            <span class="name" id="sideName">CRAFTING</span>
+            <span class="spacer"></span>
+            <div class="mode-toggle" id="modeToggle">
+              <button class="on" data-mode="craft">CRAFT</button>
+              <button data-mode="char">CHARACTER</button>
+            </div>
+          </div>
+
+          <div class="side-box">
+            <!-- CRAFT MODE -->
+            <div class="mode on" id="modeCraft">
+              <div class="craft-3" id="craft3"></div>
+              <div class="craft-out">
+                <div class="craft-arrow"></div>
+                <div class="slot" id="craftOut"></div>
+              </div>
+              <div class="craft-recipe" id="craftRecipe">&nbsp;</div>
+              <button class="craft-act" id="craftBtn">CRAFT</button>
+              <div class="craft-note">Drag from the pack into the grid.</div>
+            </div>
+
+            <!-- CHARACTER MODE -->
+            <div class="mode" id="modeChar">
+              <div class="doll-row">
+                <div class="gear-col">
+                  <div class="eq rare-uncommon" title="Iron Helm"><div class="it helm"></div><div class="lab">HEAD</div></div>
+                  <div class="eq empty" data-empty="—"><div class="lab">NECK</div></div>
+                  <div class="eq rare-rare" title="Chain Hauberk"><div class="it armor"></div><div class="lab">CHEST</div></div>
+                  <div class="eq empty" data-empty="—"><div class="lab">HANDS</div></div>
+                </div>
+                <div class="render-frame">
+                  <div class="render-stage">
+                    <div class="voxel-char">
+                      <div class="vc shadow"></div><div class="vc head"></div><div class="vc face"></div>
+                      <div class="vc eye-l"></div><div class="vc eye-r"></div>
+                      <div class="vc shoulder-l"></div><div class="vc shoulder-r"></div>
+                      <div class="vc chest"></div><div class="vc belt"></div>
+                      <div class="vc leg-l"></div><div class="vc leg-r"></div>
+                      <div class="vc boot-l"></div><div class="vc boot-r"></div>
+                      <div class="vc weapon"></div><div class="vc shield"></div>
+                    </div>
+                  </div>
+                  <div class="render-plinth"></div>
+                </div>
+                <div class="gear-col">
+                  <div class="eq" title="Iron Longsword"><div class="it sword"></div><div class="lab">MAIN</div></div>
+                  <div class="eq rare-uncommon" title="Oaken Shield"><div class="it shield-i"></div><div class="lab">OFF</div></div>
+                  <div class="eq rare-rare" title="Ring of Vigor"><div class="it ring"></div><div class="lab">RING</div></div>
+                  <div class="eq" title="Leather Boots"><div class="it boots"></div><div class="lab">FEET</div></div>
+                </div>
+              </div>
+              <div class="stats">
+                <div class="k">Armor</div><div class="v">42</div>
+                <div class="k">Strength</div><div class="v">14</div>
+                <div class="k">Damage</div><div class="v">28-34</div>
+                <div class="k">Dexterity</div><div class="v">11</div>
+                <div class="k">Block</div><div class="v">12</div>
+                <div class="k">Endurance</div><div class="v">16</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const PACK = [
+  { glyph:'sword', name:'Old Iron Sword',   cat:'weapons',   rarity:'rare-common',  dura:0.20 },
+  { glyph:'axe',   name:'Battle Axe',       cat:'weapons',   rarity:'rare-uncommon',dura:0.55 },
+  { glyph:'bow',   name:"Hunter's Bow",     cat:'weapons',   rarity:'rare-uncommon',dura:0.62 },
+  { glyph:'arrow', name:'Steel Arrow',      cat:'weapons',   rarity:'rare-uncommon',qty:64 },
+  { glyph:'arrow', name:'Iron Arrow',       cat:'weapons',   rarity:'rare-common',  qty:128 },
+  { glyph:'helm',  name:'Iron Helm',        cat:'armor',     rarity:'rare-uncommon',dura:0.70 },
+  { glyph:'armor', name:'Chain Hauberk',    cat:'armor',     rarity:'rare-rare',    dura:0.65 },
+  { glyph:'shield-i', name:'Oaken Shield',  cat:'armor',     rarity:'rare-uncommon',dura:0.42 },
+  { glyph:'boots', name:'Leather Boots',    cat:'armor',     rarity:'rare-common',  dura:0.88 },
+  { glyph:'ring',  name:'Ring of Vigor',    cat:'armor',     rarity:'rare-rare' },
+  { glyph:'pick',  name:"Miner's Pickaxe",  cat:'tools',     rarity:'rare-common',  dura:0.34 },
+  { glyph:'axe',   name:'Woodaxe',          cat:'tools',     rarity:'rare-common',  dura:0.78 },
+  { glyph:'torch', name:'Long Torch',       cat:'tools',     rarity:'rare-common',  qty:11 },
+  { glyph:'scroll',name:'Recall Scroll',    cat:'tools',     rarity:'rare-rare',    qty:2 },
+  { glyph:'bread', name:'Honey Loaf',       cat:'food',      rarity:'rare-common',  qty:4 },
+  { glyph:'meat',  name:'Smoked Venison',   cat:'food',      rarity:'rare-uncommon',qty:2 },
+  { glyph:'meat',  name:'Roast Boar',       cat:'food',      rarity:'rare-common',  qty:5 },
+  { glyph:'potion-hp', name:'Greater Healing', cat:'food',   rarity:'rare-rare',    qty:1 },
+  { glyph:'potion-mn', name:'Mana Draught', cat:'food',      rarity:'rare-rare',    qty:2 },
+  { glyph:'iron',  name:'Iron Ingot',       cat:'materials', rarity:'rare-common',  qty:14 },
+  { glyph:'goldb', name:'Gold Ingot',       cat:'materials', rarity:'rare-uncommon',qty:3 },
+  { glyph:'log',   name:'Oak Log',          cat:'materials', rarity:'rare-common',  qty:48 },
+  { glyph:'stone', name:'Cobblestone',      cat:'materials', rarity:'rare-common',  qty:96 },
+  { glyph:'gem',   name:'Bloodstone',       cat:'materials', rarity:'rare-epic',    qty:2 },
+  { glyph:'log',   name:'Birch Log',        cat:'materials', rarity:'rare-common',  qty:22 },
+  { glyph:'stone', name:'Granite Block',    cat:'materials', rarity:'rare-common',  qty:64 },
+  { glyph:'iron',  name:'Iron Nails',       cat:'materials', rarity:'rare-common',  qty:36 },
+  { glyph:'scroll',name:"Halren's Letter",  cat:'quest',     rarity:'rare-rare' },
+  { glyph:'gem',   name:'Iron Key',         cat:'quest',     rarity:'rare-epic' },
+  { glyph:'coin',  name:'Silver Mark',      cat:'misc',      rarity:'rare-uncommon',qty:284 },
+  { glyph:'coin',  name:'Gold Crown',       cat:'misc',      rarity:'rare-legendary',qty:7 },
+];
+
+const PACK_COLS = 8, PACK_ROWS = 8, HOTBAR = 8;
+const grid = document.getElementById('invGrid');
+const search = document.getElementById('invSearch');
+let activeFilter = 'all', query = '';
+
+function makeSlot(it){
+  const s = document.createElement('div');
+  s.className = 'slot' + (it ? ' ' + it.rarity : '');
+  if (!it) return s;
+  s.title = it.name;
+  s.draggable = true;
+  const g = document.createElement('div'); g.className = 'it ' + it.glyph; s.appendChild(g);
+  if (it.qty){ const q = document.createElement('div'); q.className = 'qty'; q.textContent = '×' + it.qty; s.appendChild(q); }
+  if (it.dura != null){
+    const d = document.createElement('div'); d.className = 'dura';
+    if (it.dura < 0.4) d.classList.add('warn');
+    if (it.dura < 0.2) d.classList.add('crit');
+    const i = document.createElement('i'); i.style.width = (it.dura*100) + '%';
+    d.appendChild(i); s.appendChild(d);
+  }
+  return s;
+}
+
+function render(){
+  grid.innerHTML = '';
+  const shown = PACK.filter(it =>
+    (activeFilter === 'all' || it.cat === activeFilter) &&
+    (!query || it.name.toLowerCase().includes(query)));
+  const cells = PACK_COLS * PACK_ROWS;
+  for (let i = 0; i < cells; i++) grid.appendChild(makeSlot(shown[i]));
+}
+function renderHotbar(){
+  const hb = document.getElementById('hotbar');
+  const picks = [PACK[0], PACK[10], PACK[12], PACK[14], PACK[17], PACK[21], PACK[22], null];
+  hb.innerHTML = '';
+  picks.forEach((it, i) => {
+    const s = makeSlot(it || undefined);
+    const k = document.createElement('div'); k.className = 'key'; k.textContent = i + 1;
+    s.appendChild(k);
+    hb.appendChild(s);
+  });
+}
+function refreshCounts(){
+  const counts = { all: PACK.length };
+  PACK.forEach(it => counts[it.cat] = (counts[it.cat] || 0) + 1);
+  document.querySelectorAll('[data-count]').forEach(el => el.textContent = counts[el.dataset.count] || 0);
+}
+
+// craft grid: 3×3 + centred output
+const craft3 = document.getElementById('craft3');
+for (let i = 0; i < 9; i++) craft3.appendChild(makeSlot());
+
+refreshCounts(); render(); renderHotbar();
+
+document.querySelectorAll('.filter-tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.filter-tab').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  activeFilter = t.dataset.filter;
+  render();
+}));
+search.addEventListener('input', e => { query = e.target.value.trim().toLowerCase(); render(); });
+
+// ---- one toggle swaps the side panel between craft and character ----
+const sideName = document.getElementById('sideName');
+document.querySelectorAll('#modeToggle button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#modeToggle button').forEach(x => x.classList.toggle('on', x === b));
+  const craft = b.dataset.mode === 'craft';
+  document.getElementById('modeCraft').classList.toggle('on', craft);
+  document.getElementById('modeChar').classList.toggle('on', !craft);
+  sideName.textContent = craft ? 'CRAFTING' : 'CHARACTER';
+}));
+
+// ---- drag + drop between pack, craft grid, hotbar and gear ----
+let dragSrc = null;
+const clearHover = () => document.querySelectorAll('.drag-over').forEach(e => e.classList.remove('drag-over'));
+document.addEventListener('dragstart', e => {
+  const slot = e.target.closest('.slot, .eq');
+  if (!slot || !slot.querySelector('.it')){ if (slot) e.preventDefault(); return; }
+  dragSrc = slot;
+  slot.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', slot.title || ''); } catch(_){}
+});
+document.addEventListener('dragend', () => {
+  if (dragSrc) dragSrc.classList.remove('dragging');
+  clearHover(); dragSrc = null;
+});
+document.addEventListener('dragover', e => {
+  const t = e.target.closest('.slot, .eq');
+  if (!t || t === dragSrc) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  clearHover(); t.classList.add('drag-over');
+});
+document.addEventListener('drop', e => {
+  const t = e.target.closest('.slot, .eq');
+  if (!t || !dragSrc || t === dragSrc){ clearHover(); return; }
+  e.preventDefault();
+  const grab = el => [...el.querySelectorAll('.it, .qty, .dura')];
+  const a = grab(dragSrc), b = grab(t);
+  a.forEach(n => n.remove()); b.forEach(n => n.remove());
+  b.forEach(n => dragSrc.appendChild(n)); a.forEach(n => t.appendChild(n));
+  const at = dragSrc.title, bt = t.title;
+  dragSrc.title = bt || ''; t.title = at || '';
+  [dragSrc, t].forEach(s => {
+    s.draggable = !!s.querySelector('.it');
+    if (s.classList.contains('eq')) s.classList.toggle('empty', !s.querySelector('.it'));
+  });
+  clearHover();
+  updateCraft();
+});
+
+// ---- craft preview: a filled grid yields a placeholder result ----
+const craftOut = document.getElementById('craftOut');
+const craftRecipe = document.getElementById('craftRecipe');
+function updateCraft(){
+  const filled = [...craft3.children].filter(s => s.querySelector('.it'));
+  craftOut.innerHTML = '';
+  craftOut.className = 'slot';
+  if (!filled.length){ craftRecipe.innerHTML = '&nbsp;'; return; }
+  craftRecipe.textContent = filled.length >= 3 ? 'KNOWN RECIPE' : 'NO MATCH';
+  if (filled.length >= 3){
+    craftOut.classList.add('rare-uncommon');
+    const g = document.createElement('div'); g.className = 'it sword'; craftOut.appendChild(g);
+  }
+}
+document.getElementById('craftBtn').addEventListener('click', () => {
+  if (!craftOut.querySelector('.it')) return;
+  [...craft3.children].forEach(s => { s.querySelectorAll('.it,.qty,.dura').forEach(n => n.remove()); s.title = ''; s.draggable = false; });
+  updateCraft();
+});
+// keep the shrink-wrapped shell fully on screen at any viewport size
+(function fitShell(){
+  const shell = document.querySelector('.menu-shell');
+  function fit(){
+    shell.style.transform = 'translate(-50%,-50%)';
+    const s = Math.min(1, (window.innerWidth - 24) / shell.offsetWidth, (window.innerHeight - 24) / shell.offsetHeight);
+    shell.style.transform = `translate(-50%,-50%) scale(${s})`;
+  }
+  window.addEventListener('resize', fit, { passive:true });
+  document.querySelectorAll('#modeToggle button').forEach(b =>
+    b.addEventListener('click', () => requestAnimationFrame(fit)));
+  fit();
+})();
+</script>
+</body>
+</html>

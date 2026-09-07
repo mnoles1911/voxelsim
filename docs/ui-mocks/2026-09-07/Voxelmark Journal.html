@@ -1,0 +1,340 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Journal" subtitle="Player's entries (written, dated) + tracked / untracked goals" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Journal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Press+Start+2P&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  .jr-grid{flex:1;min-height:0;display:grid;grid-template-columns:300px 1fr;gap:18px}
+  .jr-col{display:flex;flex-direction:column;min-height:0;gap:8px}
+
+  /* ---------- section switch: Survivor Journal | Objectives ---------- */
+  .sect-switch{display:flex;flex:none}
+  .sect{font-family:var(--serif);font-weight:700;font-size:11px;letter-spacing:2px;color:var(--ink-mute);padding:7px 12px;cursor:pointer;border:2px solid #000;background:var(--panel-iron);box-shadow:inset 0 0 0 1px var(--panel-iron-edge);margin-right:-2px;text-shadow:1px 1px 0 #000}
+  .sect:hover{color:var(--ink)}
+  .sect.on{color:var(--gold);background:var(--panel-oak-2);box-shadow:inset 0 0 0 1px var(--panel-oak-edge),inset 0 -3px 0 var(--gold)}
+
+  /* sub-tabs (Tracked / Untracked) */
+  .subtabs{display:flex;flex:none}
+  .subtab{font-family:var(--mono);font-size:16px;color:var(--ink-mute);padding:4px 12px;cursor:pointer;border:1px solid #000;background:#14100a;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);margin-right:-1px}
+  .subtab:hover{color:var(--ink)}
+  .subtab.on{color:var(--gold);background:var(--panel-oak-2);box-shadow:inset 0 0 0 1px var(--panel-oak-edge)}
+  .subtab .n{color:var(--ink-mute);margin-left:6px}
+  .subtab.on .n{color:var(--gold)}
+
+  .listbox{flex:1;min-height:0;overflow-y:auto;padding-right:4px}
+  .listbox::-webkit-scrollbar{width:8px}
+  .listbox::-webkit-scrollbar-track{background:rgba(0,0,0,0.3)}
+  .listbox::-webkit-scrollbar-thumb{background:var(--panel-oak-edge);border:1px solid #000}
+
+  /* ---------- diary entry rows ---------- */
+  .card{border:2px solid #000;background:linear-gradient(180deg,rgba(46,27,13,0.85),rgba(20,12,6,0.85));box-shadow:inset 0 0 0 1px var(--panel-oak-edge);padding:9px 12px;cursor:pointer;margin-bottom:4px}
+  .card:hover{box-shadow:inset 0 0 0 1px var(--gold)}
+  .card.on{box-shadow:inset 0 0 0 1px var(--gold),inset 0 -3px 0 var(--gold),0 0 12px rgba(240,193,75,0.2)}
+  .card .stamp{font-family:var(--pixel);font-size:8px;letter-spacing:1px;color:var(--gold);text-shadow:1px 1px 0 #000}
+  .card .head{font-family:var(--serif);font-weight:700;font-size:15px;letter-spacing:1px;color:var(--ink);margin-top:3px;text-shadow:1px 1px 0 #000}
+  .card .snip{font-family:var(--mono);font-size:15px;color:var(--ink-dim);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card.obj .stamp{color:var(--rare-uncommon)}
+  .card.obj.hidden-o .stamp{color:var(--ink-mute)}
+  .card .row{display:flex;align-items:center;gap:6px;margin-top:7px}
+  .mini{font-family:var(--mono);font-size:14px;letter-spacing:1px;color:var(--ink-dim);background:#14100a;border:1px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);padding:2px 8px;cursor:pointer}
+  .mini:hover{color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold)}
+  .mini.act{color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold)}
+  .empty{font-family:var(--mono);font-size:17px;font-style:italic;color:var(--ink-mute);padding:22px 10px;text-align:center}
+
+  /* ---------- parchment page ---------- */
+  .page{border:2px solid #000;background:linear-gradient(180deg,var(--parchment) 0%,var(--parchment-2) 100%);box-shadow:inset 0 0 0 2px var(--parchment-edge),inset 0 0 60px rgba(120,80,30,0.4);color:var(--parchment-ink);padding:24px 28px;overflow-y:auto;min-height:0;font-family:var(--hand);position:relative;display:flex;flex-direction:column}
+  .page::before{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(ellipse at 18% 22%, rgba(80,40,10,0.18), transparent 40%),radial-gradient(ellipse at 82% 78%, rgba(80,40,10,0.18), transparent 40%)}
+  .p-kind{font-family:var(--pixel);font-size:9px;letter-spacing:2px;color:#a04a14;position:relative}
+  .p-title{font-family:var(--serif);font-weight:700;font-size:30px;letter-spacing:2px;color:var(--parchment-ink);margin:4px 0 6px;border-bottom:1px solid rgba(60,40,20,0.4);padding-bottom:8px;position:relative}
+  .p-stamp{font-family:var(--mono);font-size:16px;font-style:italic;color:#5a3a1c;margin-bottom:14px;position:relative}
+  .p-body{font-size:18px;line-height:1.55;color:#3a2a14;white-space:pre-wrap;position:relative;flex:1}
+  .p-body .first{float:left;font-family:var(--serif);font-size:48px;line-height:0.85;padding:6px 8px 0 0;color:#5a2a14}
+  .p-sect{font-family:var(--serif);font-weight:700;font-size:13px;letter-spacing:3px;color:#5a2a14;border-bottom:1px solid rgba(60,40,20,0.4);padding-bottom:4px;margin:16px 0 8px;text-transform:uppercase;position:relative}
+  .p-steps{list-style:none;position:relative}
+  .p-steps li{font-family:var(--mono);font-size:17px;color:var(--parchment-ink);display:flex;gap:10px;padding:3px 0}
+  .p-steps li::before{content:"";width:10px;height:10px;flex:none;margin-top:5px;background:#a8895a;border:1px solid #3a2a14}
+  .p-steps li.done::before{background:#5fa84a}
+  .p-steps li.now::before{background:#a04a14;box-shadow:0 0 4px rgba(160,74,20,0.6)}
+  .p-steps li.done{text-decoration:line-through;color:#7a6a4e}
+
+  /* ---------- composer ---------- */
+  .compose{display:flex;flex-direction:column;gap:10px;position:relative;flex:1;min-height:0}
+  .c-stamp{font-family:var(--mono);font-size:16px;font-style:italic;color:#5a3a1c}
+  .c-title{font-family:var(--serif);font-weight:700;font-size:22px;letter-spacing:1px;color:var(--parchment-ink);background:transparent;border:0;border-bottom:1px solid rgba(60,40,20,0.4);padding:4px 0;outline:none;width:100%}
+  .c-title::placeholder{color:rgba(90,58,28,0.45)}
+  .c-body{flex:1;min-height:180px;resize:none;font-family:var(--hand);font-size:18px;line-height:1.55;color:#3a2a14;background:repeating-linear-gradient(180deg,transparent 0 27px,rgba(60,40,20,0.16) 27px 28px);border:0;outline:none;padding:2px 0}
+  .c-body::placeholder{color:rgba(90,58,28,0.4);font-style:italic}
+  .c-row{display:flex;align-items:center;gap:10px}
+  .c-btn{font-family:var(--serif);font-weight:700;font-size:12px;letter-spacing:3px;color:#f2e2b8;background:linear-gradient(180deg,#7a4a1e,#4a2a10);border:2px solid #2a1808;box-shadow:inset 0 0 0 1px rgba(240,200,120,0.35);padding:8px 20px;cursor:pointer;text-shadow:1px 1px 0 rgba(0,0,0,0.6)}
+  .c-btn:hover{background:linear-gradient(180deg,#96601f,#5a3212)}
+  .c-btn.ghost{color:#5a3a1c;background:transparent;border-color:rgba(60,40,20,0.45);box-shadow:none;text-shadow:none}
+  .c-btn.ghost:hover{background:rgba(60,40,20,0.08)}
+  .c-count{margin-left:auto;font-family:var(--mono);font-size:15px;color:#7a5a30}
+  a{color:var(--gold)}a:hover{color:var(--ink)}
+</style>
+</head>
+<body>
+  <div class="bg-scene"></div>
+  <div class="bg-vignette"></div>
+  <div class="bg-grain"></div>
+
+  <div class="menu-shell compact">
+    <nav class="menu-tabs">
+      <a href="Voxelmark Map.html" class="menu-tab">MAP</a>
+      <a href="Voxelmark Journal.html" class="menu-tab active">JOURNAL</a>
+      <a href="Voxelmark Inventory.html" class="menu-tab">INVENTORY</a>
+      <a href="Voxelmark Player.html" class="menu-tab">PLAYER</a>
+      <a href="Voxelmark Codex.html" class="menu-tab">CODEX</a>
+    </nav>
+
+    <div class="menu-body">
+      <div class="jr-grid">
+        <div class="jr-col">
+          <div class="sect-switch">
+            <div class="sect on" data-sect="journal">PLAYER'S ENTRIES</div>
+            <div class="sect" data-sect="objectives">GOALS</div>
+          </div>
+          <div class="subtabs" id="subtabs"></div>
+          <div class="listbox" id="list"></div>
+        </div>
+        <div class="page" id="page"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ---------------------------------------------------------------
+// In-world date. Day counts up; each season is 20 days.
+// ---------------------------------------------------------------
+const SEASONS = ['Spring','Summer','Autumn','Winter'];
+const WORLD = { day: 12, season: 'Summer', year: 18, age: 'Second Age' };
+const stampOf = d => `Day ${d.day} · ${d.season}, ${ordinal(d.year)} Year of the ${d.age}`;
+function ordinal(n){
+  const s = ['th','st','nd','rd'], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
+// ---------------------------------------------------------------
+// Player-written diary entries (persisted locally)
+// ---------------------------------------------------------------
+const ENTRY_KEY = 'voxelmark.journal.entries.v1';
+const SEED_ENTRIES = [
+  { id:'e3', day:12, season:'Summer', year:18, age:'Second Age',
+    title:'The wolves came back',
+    body:"Three of them at the treeline before dusk. They did not come closer than the fire, but they did not leave either.\n\nI have started a stone wall on the north side. Two courses laid. It will not stop anything yet but it makes me feel better to have put something between us and the dark." },
+  { id:'e2', day:9, season:'Summer', year:18, age:'Second Age',
+    title:'Copper in the cliff face',
+    body:"Found a green streak in the rock above the creek. Chipped out eleven lumps before the pick gave out.\n\nIf I can find tin I can make bronze, and then I can stop breaking a tool every second day." },
+  { id:'e1', day:1, season:'Summer', year:18, age:'Second Age',
+    title:'First night',
+    body:"No shelter, no fire, nothing but what I could carry. Slept in a hole I dug into the hillside with my hands.\n\nIt rained. Of course it rained." }
+];
+let entries = load(ENTRY_KEY, SEED_ENTRIES);
+
+// ---------------------------------------------------------------
+// Game-issued goals. Every one is either tracked or untracked.
+// ---------------------------------------------------------------
+const OBJ_KEY = 'voxelmark.journal.goals.v2';
+const SEED_OBJS = [
+  { id:'o1', name:'Survive the first winter', source:'World', place:'Anywhere', tracked:true,
+    flavor:'The cold does not negotiate. Food stores, a sealed roof and a fuel pile are the whole of the argument.',
+    steps:[{t:'Build a shelter with a door',s:'done'},{t:'Stockpile 40 units of food',s:'now'},{t:'Cut 200 logs for fuel',s:''},{t:'Survive to the first thaw',s:''}] },
+  { id:'o2', name:'Smelt your first bronze', source:'Metalsmithing', place:'Any bloomery', tracked:true,
+    flavor:'Copper is soft and tin is scarce. Together they hold an edge long enough to be worth the walk.',
+    steps:[{t:'Mine 12 copper ore',s:'done'},{t:'Find a tin vein',s:'now'},{t:'Build a bloomery',s:''},{t:'Pour a bronze ingot',s:''}] },
+  { id:'o3', name:'Clear the wolf den', source:'Threat', place:'North ridge', tracked:true,
+    flavor:'The pack has a hole in the ridge they return to at dawn. Whatever is in there, they are feeding it.',
+    steps:[{t:'Track the pack to the ridge',s:'done'},{t:'Destroy the den',s:'now'}] },
+  { id:'o4', name:'Raise a stone wall around camp', source:'Building', place:'Camp', tracked:true,
+    flavor:'Wood burns and rots. Stone does neither, and there is a great deal of it under the hill.',
+    steps:[{t:'Quarry 120 stone',s:'now'},{t:'Enclose the camp perimeter',s:''},{t:'Fit a gate',s:''}] },
+  { id:'o5', name:'Map the cave system', source:'Exploration', place:'Hollow under the creek', tracked:false,
+    flavor:'The draught coming out of the creek mouth is cold and steady, which means it goes a long way back.',
+    steps:[{t:'Enter the cave mouth',s:'done'},{t:'Reach the second chamber',s:''},{t:'Find where the draught comes from',s:''}] },
+  { id:'o6', name:'Tame a pack animal', source:'Husbandry', place:'Open moor', tracked:false,
+    flavor:'Carrying ore up a hill on your back is a decision, not a fate.',
+    steps:[{t:'Craft a rope halter',s:''},{t:'Feed a wild ox three times',s:''},{t:'Lead it back to camp',s:''}] }
+];
+let objs = load(OBJ_KEY, SEED_OBJS);
+
+function load(key, seed){
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw) return JSON.parse(raw);
+  } catch(_){}
+  return JSON.parse(JSON.stringify(seed));
+}
+function save(key, val){
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch(_){}
+}
+
+// ---------------------------------------------------------------
+// View state
+// ---------------------------------------------------------------
+let section = 'journal';      // journal | objectives
+let objTab  = 'tracked';      // tracked | untracked
+let selEntry = entries.length ? entries[0].id : null;
+let selObj   = objs.find(o => o.tracked) ? objs.find(o => o.tracked).id : (objs[0] && objs[0].id);
+let composing = false;
+
+const listEl = document.getElementById('list');
+const pageEl = document.getElementById('page');
+const subtabsEl = document.getElementById('subtabs');
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function renderSubtabs(){
+  if (section === 'journal'){
+    subtabsEl.innerHTML = `<div class="subtab on">Entries <span class="n">${entries.length}</span></div>`;
+    return;
+  }
+  const t = objs.filter(o => o.tracked).length, u = objs.length - t;
+  subtabsEl.innerHTML =
+    `<div class="subtab${objTab === 'tracked' ? ' on' : ''}" data-tab="tracked">Tracked <span class="n">${t}</span></div>` +
+    `<div class="subtab${objTab === 'untracked' ? ' on' : ''}" data-tab="untracked">Untracked <span class="n">${u}</span></div>`;
+  subtabsEl.querySelectorAll('.subtab').forEach(el => el.addEventListener('click', () => {
+    objTab = el.dataset.tab;
+    const first = visibleObjs()[0];
+    if (first) selObj = first.id;
+    renderAll();
+  }));
+}
+
+function visibleObjs(){
+  const want = objTab === 'tracked';
+  return objs.filter(o => o.tracked === want);
+}
+
+function renderList(){
+  if (section === 'journal'){
+    const rows = entries.map(e => `
+      <div class="card${!composing && e.id === selEntry ? ' on' : ''}" data-id="${e.id}">
+        <div class="stamp">✦ DAY ${e.day} · ${e.season.toUpperCase()}</div>
+        <div class="head">${esc(e.title)}</div>
+        <div class="snip">${esc(e.body.split('\n')[0])}</div>
+      </div>`).join('');
+    listEl.innerHTML =
+      `<div class="card${composing ? ' on' : ''}" id="newEntry">
+         <div class="stamp">✦ NEW ENTRY</div>
+         <div class="head">Write in the journal</div>
+         <div class="snip">${stampOf(WORLD)}</div>
+       </div>` + (rows || '<div class="empty">Nothing written yet.</div>');
+    document.getElementById('newEntry').addEventListener('click', () => { composing = true; renderAll(); });
+    listEl.querySelectorAll('.card[data-id]').forEach(el => el.addEventListener('click', () => {
+      selEntry = el.dataset.id; composing = false; renderAll();
+    }));
+    return;
+  }
+
+  const rows = visibleObjs();
+  if (!rows.length){
+    listEl.innerHTML = `<div class="empty">${objTab === 'tracked' ? 'Nothing tracked.' : 'Nothing hidden.'}</div>`;
+    return;
+  }
+  listEl.innerHTML = rows.map(o => {
+    const done = o.steps.filter(s => s.s === 'done').length;
+    return `<div class="card obj${o.tracked ? '' : ' hidden-o'}${o.id === selObj ? ' on' : ''}" data-id="${o.id}">
+      <div class="stamp">${o.tracked ? '◆ TRACKED' : '· UNTRACKED'}</div>
+      <div class="head">${esc(o.name)}</div>
+      <div class="snip">${done} of ${o.steps.length} steps · ${esc(o.place)}</div>
+      <div class="row">
+        ${o.tracked
+          ? `<span class="mini" data-act="hide">UNTRACK</span>`
+          : `<span class="mini" data-act="show">TRACK</span>`}
+      </div>
+    </div>`;
+  }).join('');
+  listEl.querySelectorAll('.card[data-id]').forEach(el => {
+    el.addEventListener('click', e => {
+      const act = e.target.dataset.act;
+      const o = objs.find(x => x.id === el.dataset.id);
+      if (act === 'hide'){ o.tracked = false; }
+      else if (act === 'show'){ o.tracked = true; }
+      else { selObj = o.id; renderAll(); return; }
+      save(OBJ_KEY, objs);
+      if (!visibleObjs().some(x => x.id === selObj)){
+        const first = visibleObjs()[0];
+        selObj = first ? first.id : selObj;
+      }
+      renderAll();
+    });
+  });
+}
+
+function renderPage(){
+  if (section === 'journal'){
+    if (composing){
+      pageEl.innerHTML = `
+        <div class="p-kind">✦ NEW ENTRY</div>
+        <div class="compose">
+          <div class="c-stamp">${stampOf(WORLD)}</div>
+          <input class="c-title" id="cTitle" maxlength="60" placeholder="Give the day a name" />
+          <textarea class="c-body" id="cBody" placeholder="What happened, what you built, what you are afraid of…"></textarea>
+          <div class="c-row">
+            <button class="c-btn" id="cSave">SAVE ENTRY</button>
+            <button class="c-btn ghost" id="cCancel">DISCARD</button>
+            <span class="c-count" id="cCount">0 words</span>
+          </div>
+        </div>`;
+      const body = document.getElementById('cBody');
+      const count = document.getElementById('cCount');
+      body.addEventListener('input', () => {
+        const w = body.value.trim() ? body.value.trim().split(/\s+/).length : 0;
+        count.textContent = w + (w === 1 ? ' word' : ' words');
+      });
+      document.getElementById('cCancel').addEventListener('click', () => { composing = false; renderAll(); });
+      document.getElementById('cSave').addEventListener('click', () => {
+        const t = document.getElementById('cTitle').value.trim();
+        const b = body.value.trim();
+        if (!t && !b) return;
+        const e = { id:'e' + Date.now(), day:WORLD.day, season:WORLD.season, year:WORLD.year, age:WORLD.age,
+                    title: t || `Day ${WORLD.day}`, body: b || '—' };
+        entries.unshift(e);
+        save(ENTRY_KEY, entries);
+        selEntry = e.id; composing = false; renderAll();
+      });
+      document.getElementById('cTitle').focus();
+      return;
+    }
+    const e = entries.find(x => x.id === selEntry) || entries[0];
+    if (!e){ pageEl.innerHTML = '<div class="p-kind">✦ PLAYER&rsquo;S ENTRIES</div><div class="p-body">The journal is empty.</div>'; return; }
+    const [first, ...rest] = e.body;
+    pageEl.innerHTML = `
+      <div class="p-kind">✦ PLAYER'S ENTRIES</div>
+      <div class="p-title">${esc(e.title)}</div>
+      <div class="p-stamp">${stampOf(e)}</div>
+      <div class="p-body"><span class="first">${esc(first || '·')}</span>${esc(rest.join(''))}</div>`;
+    return;
+  }
+
+  const o = objs.find(x => x.id === selObj) || visibleObjs()[0];
+  if (!o){ pageEl.innerHTML = '<div class="p-kind">◆ GOALS</div><div class="p-body">Nothing here.</div>'; return; }
+  pageEl.innerHTML = `
+    <div class="p-kind">${o.tracked ? '◆ TRACKED GOAL' : '· UNTRACKED GOAL'}</div>
+    <div class="p-title">${esc(o.name)}</div>
+    <div class="p-stamp">— ${esc(o.source)} · ${esc(o.place)}</div>
+    <div class="p-body">${esc(o.flavor)}</div>
+    <div class="p-sect">Steps</div>
+    <ul class="p-steps">
+      ${o.steps.map(s => `<li class="${s.s === 'done' ? 'done' : s.s === 'now' ? 'now' : ''}">${esc(s.t)}</li>`).join('')}
+    </ul>`;
+}
+
+function renderAll(){ renderSubtabs(); renderList(); renderPage(); }
+
+document.querySelectorAll('.sect').forEach(el => el.addEventListener('click', () => {
+  document.querySelectorAll('.sect').forEach(x => x.classList.toggle('on', x === el));
+  section = el.dataset.sect;
+  composing = false;
+  renderAll();
+}));
+
+renderAll();
+</script>
+</body>
+</html>

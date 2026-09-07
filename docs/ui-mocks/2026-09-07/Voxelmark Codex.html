@@ -1,0 +1,617 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Codex" subtitle="Codex — recipe dictionary, saved places from the map, and lore entries" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Codex</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Press+Start+2P&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  .cd-grid{
+    flex:1; min-height:0;
+    display:grid;
+    grid-template-columns: 220px 240px 1fr;
+    gap:14px;
+  }
+  .cat-list, .ent-list{
+    display:flex; flex-direction:column;
+    overflow-y:auto; min-height:0;
+  }
+  .cat-list::-webkit-scrollbar, .ent-list::-webkit-scrollbar{ width:8px }
+  .cat-list::-webkit-scrollbar-thumb,
+  .ent-list::-webkit-scrollbar-thumb{ background:var(--panel-oak-edge); border:1px solid #000 }
+
+  .cat{
+    font-family:var(--serif); font-weight:700; font-size:13px;
+    letter-spacing:2px; color:var(--ink-mute);
+    padding:8px 10px; cursor:pointer; text-shadow:1px 1px 0 #000;
+    border-bottom: 1px solid rgba(107,68,34,0.35);
+    display:flex; justify-content:space-between; align-items:baseline;
+  }
+  .cat:hover{ color:var(--ink); }
+  .cat.active{ color:var(--gold); background: var(--panel-oak-2);
+    box-shadow: inset 3px 0 0 var(--gold);
+  }
+  .cat .n{ font-family:var(--pixel); font-size:8px; color:var(--ink-mute); }
+
+  .ent{
+    font-family:var(--mono); font-size:16px; color:var(--ink-dim);
+    padding:6px 10px; cursor:pointer;
+    border-bottom: 1px solid rgba(107,68,34,0.25);
+    display:flex; align-items:center; gap:8px;
+  }
+  .ent::before{
+    content:""; width:8px; height:8px; flex:none;
+    background:var(--ink-mute); border:1px solid #000;
+  }
+  .ent.read::before{ background:var(--rare-uncommon); }
+  .ent.new::before{ background:var(--gold); box-shadow: 0 0 4px var(--gold); }
+  .ent.locked{ color:var(--ink-mute); font-style:italic; }
+  .ent.locked::before{ background: transparent; }
+  .ent:hover{ color:var(--ink); }
+  .ent.active{ color:var(--gold); background:var(--panel-oak-2); }
+
+  .entry{
+    border:2px solid #000;
+    background: linear-gradient(180deg, var(--parchment) 0%, var(--parchment-2) 100%);
+    box-shadow: inset 0 0 0 2px var(--parchment-edge), inset 0 0 60px rgba(120,80,30,0.4);
+    color:var(--parchment-ink);
+    padding:26px 32px; overflow-y:auto;
+    font-family:var(--hand);
+    position:relative;
+  }
+  .entry::before{
+    content:""; position:absolute; inset:0; pointer-events:none;
+    background:
+      radial-gradient(ellipse at 18% 22%, rgba(80,40,10,0.18), transparent 40%),
+      radial-gradient(ellipse at 82% 78%, rgba(80,40,10,0.18), transparent 40%);
+  }
+  .e-kind{
+    font-family:var(--pixel); font-size:9px; letter-spacing:2px; color:#a04a14;
+  }
+  .e-title{
+    font-family:var(--serif); font-weight:700; font-size:32px;
+    letter-spacing:2px; color:var(--parchment-ink);
+    margin:4px 0 4px;
+    border-bottom:1px solid rgba(60,40,20,0.4);
+    padding-bottom:8px;
+  }
+  .e-sub{
+    font-family:var(--mono); font-size:15px; font-style:italic;
+    color:#5a3a1c; margin-bottom:14px;
+  }
+  .e-body{
+    font-size:18px; line-height:1.55; color:#3a2a14;
+  }
+  .e-body p{ margin-bottom:14px; text-indent:1.4em; }
+  .e-body p:first-child{ text-indent:0; }
+  .e-body .first{
+    float:left; font-family:var(--serif); font-size:54px;
+    line-height:0.85; padding:6px 10px 0 0; color:#5a2a14;
+  }
+  .e-body em{ color:#5a2a14; }
+  .e-body blockquote{
+    margin:14px 24px; padding:10px 16px;
+    border-left: 3px solid #5a2a14;
+    background: rgba(60,40,20,0.06);
+    font-style:italic; color:#3a2a14;
+  }
+  .e-stats{
+    display:grid; grid-template-columns: 1fr 1fr; gap:4px 14px;
+    background: rgba(60,40,20,0.08);
+    border:1px solid rgba(60,40,20,0.4);
+    padding:10px 14px; margin:14px 0;
+    font-family:var(--mono); font-size:15px;
+  }
+  .e-stats .k{ color:#7a4a1c; }
+  .e-stats .v{ color:#3a2a14; text-align:right; font-weight:600; }
+
+  /* place entries carry the symbol chosen on the map */
+  .ent .sym{width:16px;height:16px;flex:none;display:block}
+  .ent .sym *{stroke:#7a5c30;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .ent.active .sym *{stroke:var(--gold)}
+  .ent .sym .fill{fill:#7a5c30;stroke:none}
+  .ent.active .sym .fill{fill:var(--gold);stroke:none}
+  .e-sym{width:44px;height:44px;float:right;margin:0 0 8px 12px}
+  .e-sym *{stroke:#7a2a12;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .e-sym .fill{fill:#7a2a12;stroke:none}
+  .pl-empty{font-family:var(--mono);font-size:17px;font-style:italic;color:var(--ink-mute);padding:20px 10px;text-align:center}
+
+  /* ---------- RECIPE DICTIONARY (Codex section) ---------- */
+  .cd-grid.recipes{ grid-template-columns: 220px 300px 1fr; }
+  .rc-mid{display:flex;flex-direction:column;min-height:0;gap:8px}
+  .rc-search{display:flex;align-items:center;gap:6px;background:#14100a;border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);padding:4px 8px;flex:none}
+  .rc-search svg{width:13px;height:13px;flex:none;opacity:.7}
+  .rc-search input{flex:1;min-width:0;background:transparent;border:0;outline:0;font-family:var(--mono);font-size:18px;color:var(--ink)}
+  .rc-search input::placeholder{color:var(--ink-mute)}
+  .rc-search .clear{font-family:var(--mono);font-size:15px;color:var(--ink-mute);cursor:pointer;padding:0 3px}
+  .rc-search .clear:hover{color:var(--hp-bright)}
+  .rc-dir{flex:1;min-height:0;overflow-y:auto;background:#0a0805;border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge)}
+  .rc-dir::-webkit-scrollbar{width:8px}
+  .rc-dir::-webkit-scrollbar-thumb{background:var(--panel-oak-edge);border:1px solid #000}
+  .grp{border-bottom:1px solid rgba(107,68,34,0.35)}
+  .grp-head{display:flex;align-items:center;gap:8px;padding:7px 12px;cursor:pointer;background:linear-gradient(180deg,rgba(74,47,26,0.55),rgba(26,20,16,0.55));font-family:var(--serif);font-weight:700;font-size:12px;letter-spacing:3px;color:var(--ink-dim);text-shadow:1px 1px 0 #000}
+  .grp-head:hover{color:var(--gold)}
+  .grp-head .caret{font-family:var(--mono);font-size:16px;color:var(--bronze);transition:transform .12s}
+  .grp.open .grp-head .caret{transform:rotate(90deg)}
+  .grp-head .n{margin-left:auto;font-family:var(--mono);font-size:15px;color:var(--ink-mute)}
+  .grp-list{display:none}
+  .grp.open .grp-list{display:block}
+  .rec{display:flex;align-items:center;gap:10px;padding:5px 12px 5px 24px;cursor:pointer;border-left:3px solid transparent}
+  .rec:hover{background:rgba(107,68,34,0.22)}
+  .rec.on{background:linear-gradient(90deg,rgba(176,122,58,0.32),transparent);border-left-color:var(--gold)}
+  .rec .ico{position:relative;width:26px;height:26px;flex:none;background:#14100a;border:1px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge)}
+  .rec .ico .it{inset:4px}
+  .rec .t{font-family:var(--mono);font-size:18px;line-height:1.1;color:var(--ink)}
+  .rec.on .t{color:var(--gold)}
+  .rc-empty{font-family:var(--mono);font-size:18px;color:var(--ink-mute);padding:26px 14px;text-align:center;font-style:italic}
+
+  .rc-detail{min-height:0;overflow-y:auto;background:#0a0805;border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge);padding:22px 26px;display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start;align-content:flex-start}
+  .rc-detail::-webkit-scrollbar{width:8px}
+  .rc-detail::-webkit-scrollbar-thumb{background:var(--panel-oak-edge);border:1px solid #000}
+  .rc-detail > .info{flex:1 1 280px;min-width:0}
+  .rc-title{font-family:var(--serif);font-weight:700;font-size:26px;letter-spacing:4px;color:var(--gold);text-shadow:1px 1px 0 #000}
+  .rc-sub{font-family:var(--mono);font-size:18px;color:var(--ink-dim);margin-top:2px}
+  .rc-desc{font-family:var(--mono);font-size:18px;color:var(--ink-mute);line-height:1.35;margin-top:12px}
+  .craft-area{flex:none;display:flex;align-items:center;gap:16px}
+  .craft-3{display:grid;grid-template-columns:repeat(3,64px);grid-auto-rows:64px;gap:3px}
+  .craft-3 .slot{width:64px;height:64px}
+  .craft-3 .slot.blank{background:#0f0b07;box-shadow:inset 0 0 0 1px var(--iron-deep)}
+  .craft-arrow{width:0;height:0;border-top:12px solid transparent;border-bottom:12px solid transparent;border-left:16px solid var(--bronze)}
+  .out-wrap{display:flex;flex-direction:column;align-items:center;gap:6px}
+  .out-wrap .slot{width:72px;height:72px;box-shadow:inset 0 0 0 1px var(--gold-deep),inset 0 0 0 2px rgba(0,0,0,0.5),inset 0 0 0 3px var(--bronze)}
+  .out-wrap .slot .qty{font-family:var(--mono);font-size:18px}
+  .out-lab{font-family:var(--mono);font-size:16px;color:var(--ink-mute)}
+  .needs{display:flex;flex-direction:column;gap:6px;margin-top:18px}
+  .needs-lab{font-family:var(--serif);font-weight:700;font-size:12px;letter-spacing:3px;color:var(--bronze);text-shadow:1px 1px 0 #000}
+  .need{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:18px;color:var(--ink);white-space:nowrap}
+  .need .ico{position:relative;width:24px;height:24px;flex:none;background:#14100a;border:1px solid #000;box-shadow:inset 0 0 0 1px var(--panel-iron-edge)}
+  .need .ico .it{inset:4px}
+  .need .have{margin-left:6px;font-size:17px;color:var(--rare-uncommon)}
+  .need .have.short{color:var(--hp-bright)}
+  .station{margin-top:16px;font-family:var(--mono);font-size:18px;color:var(--ink-dim)}
+  .station b{color:var(--gold);font-weight:400}
+  /* local glyphs the shared sheet doesn't carry */
+  .it.plank{background:repeating-linear-gradient(180deg,#a06a30 0 26%,#6b4520 26% 32%,#8a5a28 32% 68%,#6b4520 68% 74%,#a06a30 74% 100%);clip-path:polygon(0 18%,100% 18%,100% 82%,0 82%)}
+  .it.stick{background:linear-gradient(160deg,transparent 44%,#8a5a28 44% 56%,transparent 56%)}
+  .it.cobble{background:conic-gradient(from 20deg at 50% 50%,#8a8378 0deg,#6e6358 120deg,#a09888 240deg,#6e6358 360deg);clip-path:polygon(12% 14%,88% 14%,96% 50%,88% 88%,12% 88%,4% 50%)}
+  .it.string{background:radial-gradient(circle at 50% 50%,transparent 34%,#d8d4c8 34% 42%,transparent 42%),linear-gradient(90deg,transparent 46%,#d8d4c8 46% 54%,transparent 54%)}
+  .it.feather{background:linear-gradient(140deg,transparent 40%,#e8e2d0 40% 52%,#a8a294 52% 60%,transparent 60%)}
+  .it.leather{background:linear-gradient(180deg,#a06a3a 0 45%,#6b4520 45% 100%);clip-path:polygon(14% 8%,86% 8%,100% 50%,86% 92%,14% 92%,0 50%)}
+  .it.clay{background:radial-gradient(ellipse at 50% 40%,#b07a5a 0 55%,#7a4a30 55% 100%);clip-path:polygon(24% 14%,76% 14%,92% 52%,76% 92%,24% 92%,8% 52%)}
+  .it.wool{background:radial-gradient(circle at 38% 38%,#e8e2d0 0 26%,transparent 26%),radial-gradient(circle at 66% 44%,#d8d2c0 0 24%,transparent 24%),radial-gradient(circle at 50% 70%,#e8e2d0 0 28%,transparent 28%)}
+  .it.glass{background:linear-gradient(150deg,rgba(200,230,240,0.85) 0 40%,rgba(140,180,200,0.6) 40% 100%);box-shadow:inset 0 0 0 1px rgba(255,255,255,0.35)}
+  .it.door{background:linear-gradient(180deg,#8a5a28 0 100%);clip-path:polygon(16% 4%,84% 4%,84% 96%,16% 96%);box-shadow:inset -6px 0 0 rgba(0,0,0,0.25)}
+  .it.chest{background:linear-gradient(180deg,#a06a30 0 34%,#6b4520 34% 42%,#8a5a28 42% 100%);clip-path:polygon(8% 22%,92% 22%,92% 88%,8% 88%)}
+  .it.ladder{background:linear-gradient(90deg,transparent 16%,#8a5a28 16% 26%,transparent 26% 74%,#8a5a28 74% 84%,transparent 84%),repeating-linear-gradient(180deg,transparent 0 22%,#a06a30 22% 32%,transparent 32% 100%)}
+  .it.torchi{background:radial-gradient(circle at 50% 20%,#f0c14b 0 16%,#e84a3a 16% 26%,transparent 26%),linear-gradient(160deg,transparent 44%,#8a5a28 44% 56%,transparent 56%)}
+  .it.table{background:linear-gradient(180deg,#a06a30 0 26%,#6b4520 26% 34%,#8a5a28 34% 100%);clip-path:polygon(6% 18%,94% 18%,94% 34%,80% 34%,80% 92%,64% 92%,64% 34%,36% 34%,36% 92%,20% 92%,20% 34%,6% 34%)}
+  .it.furnace{background:linear-gradient(180deg,#6e6358 0 40%,#4a4038 40% 100%),radial-gradient(circle at 50% 70%,#e8873a 0 18%,transparent 18%);clip-path:polygon(10% 10%,90% 10%,90% 90%,10% 90%)}
+  .it.anvil{background:linear-gradient(180deg,#8a8378 0 30%,#4a4038 30% 62%,#6e6358 62% 100%);clip-path:polygon(6% 16%,94% 16%,80% 36%,64% 36%,64% 66%,84% 66%,84% 88%,16% 88%,16% 66%,36% 66%,36% 36%,20% 36%)}
+  .it.bucket{background:linear-gradient(180deg,#c8c0b0 0 24%,#8a8378 24% 100%);clip-path:polygon(20% 22%,80% 22%,68% 90%,32% 90%)}
+
+</style>
+</head>
+<body>
+  <div class="bg-scene"></div>
+  <div class="bg-vignette"></div>
+  <div class="bg-grain"></div>
+
+  <div class="menu-shell compact">
+    <nav class="menu-tabs">
+      <a href="Voxelmark Map.html" class="menu-tab">MAP</a>
+      <a href="Voxelmark Journal.html" class="menu-tab">JOURNAL</a>
+      <a href="Voxelmark Inventory.html" class="menu-tab">INVENTORY</a>
+      <a href="Voxelmark Player.html" class="menu-tab">PLAYER</a>
+      <a href="Voxelmark Codex.html" class="menu-tab active">CODEX</a>
+    </nav>
+
+    <div class="menu-body">
+      <div class="cd-grid" id="cdGrid">
+        <div class="cat-list">
+          <div class="cat rc-cat active" data-section="recipes">Recipes <span class="n" id="rcTally">23</span></div>
+          <div class="cat" data-section="places" data-cat="places">Places <span class="n" id="plTally">0</span></div>
+          <div class="cat" data-section="lore" data-cat="people">People <span class="n">4/12</span></div>
+          <div class="cat" data-section="lore" data-cat="factions">Factions <span class="n">2/4</span></div>
+          <div class="cat" data-section="lore" data-cat="lore">Lore <span class="n">5/14</span></div>
+        </div>
+
+        <div class="ent-list" id="entList"></div>
+
+        <div class="entry" id="loreEntry"></div>
+
+        <div class="rc-mid" id="rcMid" style="display:none">
+          <div class="rc-search">
+            <svg viewBox="0 0 16 16" fill="none" stroke="#b4a07a" stroke-width="2"><circle cx="7" cy="7" r="5"/><path d="M11 11 L15 15"/></svg>
+            <input id="rcSearch" type="text" placeholder="Search recipes or ingredients…" autocomplete="off" />
+            <span class="clear" id="rcClear">×</span>
+          </div>
+          <div class="rc-dir" id="rcDir"></div>
+        </div>
+
+        <div class="rc-detail" id="rcDetail" style="display:none"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ---------------------------------------------------------------
+// Ingredient table — id → label + glyph class
+// ---------------------------------------------------------------
+const ING = {
+  log:      { name:'Oak Log',       glyph:'log',     have:48 },
+  plank:    { name:'Oak Plank',     glyph:'plank',   have:96 },
+  stick:    { name:'Stick',         glyph:'stick',   have:34 },
+  cobble:   { name:'Cobblestone',   glyph:'cobble',  have:96 },
+  stone:    { name:'Stone Block',   glyph:'stone',   have:41 },
+  iron:     { name:'Iron Ingot',    glyph:'iron',    have:14 },
+  gold:     { name:'Gold Ingot',    glyph:'goldb',   have:3  },
+  gem:      { name:'Bloodstone',    glyph:'gem',     have:2  },
+  string:   { name:'Flax Twine',    glyph:'string',  have:12 },
+  feather:  { name:'Feather',       glyph:'feather', have:19 },
+  leather:  { name:'Cured Hide',    glyph:'leather', have:7  },
+  clay:     { name:'Clay Lump',     glyph:'clay',    have:0  },
+  wool:     { name:'Wool',          glyph:'wool',    have:5  },
+  glass:    { name:'Glass Pane',    glyph:'glass',   have:0  },
+  meat:     { name:'Raw Venison',   glyph:'meat',    have:2  },
+  bread:    { name:'Honey Loaf',    glyph:'bread',   have:4  },
+  coal:     { name:'Charcoal',      glyph:'stone',   have:28 },
+};
+
+// pattern = 9 cells, row-major, null = empty
+const RECIPES = [
+  { cat:'Building', name:'Wooden Door', glyph:'door', out:3, station:'Crafting grid',
+    desc:'A plank door on iron pins. Opens with a shove; bars from the inside.',
+    p:['plank','plank',null,'plank','plank',null,'plank','plank',null] },
+  { cat:'Building', name:'Oak Plank', glyph:'plank', out:4, station:'Crafting grid',
+    desc:'Split a log four ways. The base of nearly every wooden recipe.',
+    p:[null,null,null,null,'log',null,null,null,null] },
+  { cat:'Building', name:'Stick', glyph:'stick', out:4, station:'Crafting grid',
+    desc:'Two planks, quartered lengthwise.',
+    p:[null,'plank',null,null,'plank',null,null,null,null] },
+  { cat:'Building', name:'Ladder', glyph:'ladder', out:3, station:'Crafting grid',
+    desc:'Rungs lashed between two rails. Climbs one voxel per rung.',
+    p:['stick',null,'stick','stick','stick','stick','stick',null,'stick'] },
+  { cat:'Building', name:'Storage Chest', glyph:'chest', out:1, station:'Crafting grid',
+    desc:'Twenty-seven slots. Contents survive a cave-in.',
+    p:['plank','plank','plank','plank',null,'plank','plank','plank','plank'] },
+  { cat:'Building', name:'Crafting Table', glyph:'table', out:1, station:'Crafting grid',
+    desc:'Unlocks the full 3×3 grid away from a settlement.',
+    p:['plank','plank',null,'plank','plank',null,null,null,null] },
+  { cat:'Building', name:'Stone Furnace', glyph:'furnace', out:1, station:'Crafting grid',
+    desc:'Smelts ore and fires clay. Burns charcoal or coal.',
+    p:['cobble','cobble','cobble','cobble',null,'cobble','cobble','cobble','cobble'] },
+  { cat:'Building', name:'Iron Anvil', glyph:'anvil', out:1, station:'Crafting grid',
+    desc:'Required for every armour recipe and for weapon repair.',
+    p:['iron','iron','iron',null,'iron',null,'iron','iron','iron'] },
+  { cat:'Building', name:'Glass Pane', glyph:'glass', out:16, station:'Crafting grid',
+    desc:'Six panes from three blocks of glass. Fragile; no fall damage either way.',
+    p:['glass','glass','glass','glass','glass','glass',null,null,null] },
+
+  { cat:'Tools', name:'Iron Pickaxe', glyph:'pick', out:1, station:'Crafting grid',
+    desc:'Cuts stone at three voxels a swing. Tier gate for iron and deeper ores.',
+    p:['iron','iron','iron',null,'stick',null,null,'stick',null] },
+  { cat:'Tools', name:'Iron Axe', glyph:'axe', out:1, station:'Crafting grid',
+    desc:'Fells trees whole. Doubles as a poor man\'s war axe.',
+    p:['iron','iron',null,'iron','stick',null,null,'stick',null] },
+  { cat:'Tools', name:'Long Torch', glyph:'torchi', out:4, station:'Crafting grid',
+    desc:'Burns nine minutes. Placed torches keep spawns off a corridor.',
+    p:[null,'coal',null,null,'stick',null,null,null,null] },
+  { cat:'Tools', name:'Iron Bucket', glyph:'bucket', out:1, station:'Crafting grid',
+    desc:'Carries water, milk or lamp oil.',
+    p:[null,null,null,'iron',null,'iron',null,'iron',null] },
+
+  { cat:'Weapons', name:'Iron Longsword', glyph:'sword', out:1, station:'Anvil',
+    desc:'Two ingots to the blade, one to the tang. Roland\'s standing sidearm.',
+    p:[null,'iron',null,null,'iron',null,null,'stick',null] },
+  { cat:'Weapons', name:'Hunter\'s Bow', glyph:'bow', out:1, station:'Crafting grid',
+    desc:'Yew stave, flax string. Draw weight scales with Strength.',
+    p:[null,'stick','string','stick',null,'string',null,'stick','string'] },
+  { cat:'Weapons', name:'Steel Arrow', glyph:'arrow', out:4, station:'Crafting grid',
+    desc:'Iron head, oak shaft, goose fletching.',
+    p:[null,'iron',null,null,'stick',null,null,'feather',null] },
+  { cat:'Weapons', name:'Oaken Shield', glyph:'shield-i', out:1, station:'Crafting grid',
+    desc:'Plank face over an iron boss. Blocks arrows outright at full stamina.',
+    p:['plank','iron','plank','plank','plank','plank',null,'plank',null] },
+
+  { cat:'Armor', name:'Iron Helm', glyph:'helm', out:1, station:'Anvil',
+    desc:'Five ingots. Halves head-shot damage; muffles hearing.',
+    p:['iron','iron','iron','iron',null,'iron',null,null,null] },
+  { cat:'Armor', name:'Chain Hauberk', glyph:'armor', out:1, station:'Anvil',
+    desc:'Eight ingots drawn to wire. The heaviest thing Roland can run in.',
+    p:['iron',null,'iron','iron','iron','iron','iron','iron','iron'] },
+  { cat:'Armor', name:'Leather Boots', glyph:'boots', out:1, station:'Crafting grid',
+    desc:'Quiet on stone. Negates the first two voxels of fall damage.',
+    p:[null,null,null,'leather',null,'leather','leather',null,'leather'] },
+
+  { cat:'Provisions', name:'Honey Loaf', glyph:'bread', out:1, station:'Crafting grid',
+    desc:'Keeps eight days in a pack. Restores endurance faster than meat.',
+    p:['bread','bread','bread',null,null,null,null,null,null] },
+  { cat:'Provisions', name:'Wool Bedroll', glyph:'wool', out:1, station:'Crafting grid',
+    desc:'Sets a respawn point and passes the night in one action.',
+    p:['wool','wool','wool','plank','plank','plank',null,null,null] },
+  { cat:'Provisions', name:'Clay Flask', glyph:'clay', out:2, station:'Crafting grid',
+    desc:'Holds one draught. Fired in a furnace before use.',
+    p:[null,'clay',null,'clay',null,'clay',null,'clay',null] },
+];
+
+
+const CATS = ['Building','Tools','Weapons','Armor','Provisions'];
+const rcDir = document.getElementById('rcDir');
+const rcDetail = document.getElementById('rcDetail');
+const rcSearch = document.getElementById('rcSearch');
+let rcSel = 0, rcQuery = '';
+document.getElementById('rcTally').textContent = RECIPES.length;
+
+function rcMatches(r){
+  if (!rcQuery) return true;
+  const q = rcQuery;
+  if (r.name.toLowerCase().includes(q)) return true;
+  if (r.cat.toLowerCase().includes(q)) return true;
+  return r.p.some(id => id && ING[id].name.toLowerCase().includes(q));
+}
+function renderRcDir(){
+  const hits = RECIPES.map((r,i)=>({r,i})).filter(({r})=>rcMatches(r));
+  if (!hits.length){ rcDir.innerHTML = '<div class="rc-empty">No recipe matches that.</div>'; return; }
+  rcDir.innerHTML = CATS.map(cat => {
+    const rows = hits.filter(({r}) => r.cat === cat);
+    if (!rows.length) return '';
+    const open = rcQuery || rows.some(({i}) => i === rcSel) ? ' open' : '';
+    return `<div class="grp${open}">
+      <div class="grp-head"><span class="caret">▸</span>${cat.toUpperCase()}<span class="n">${rows.length}</span></div>
+      <div class="grp-list">${rows.map(({r,i}) => `
+        <div class="rec${i === rcSel ? ' on' : ''}" data-i="${i}">
+          <span class="ico"><span class="it ${r.glyph}"></span></span>
+          <span class="t">${r.name}</span>
+        </div>`).join('')}</div>
+    </div>`;
+  }).join('');
+  rcDir.querySelectorAll('.grp-head').forEach(h =>
+    h.addEventListener('click', () => h.parentElement.classList.toggle('open')));
+  rcDir.querySelectorAll('.rec').forEach(el =>
+    el.addEventListener('click', () => { rcSel = +el.dataset.i; renderRcDir(); renderRcDetail(); }));
+}
+function rcTally(r){ const t={}; r.p.forEach(id=>{ if(id) t[id]=(t[id]||0)+1; }); return t; }
+function renderRcDetail(){
+  const r = RECIPES[rcSel];
+  const cells = r.p.map(id => id
+    ? `<div class="slot" title="${ING[id].name}"><div class="it ${ING[id].glyph}"></div></div>`
+    : '<div class="slot blank"></div>').join('');
+  const needs = Object.entries(rcTally(r)).map(([id,n]) => {
+    const ing = ING[id], short = ing.have < n;
+    return `<div class="need">
+      <span class="ico"><span class="it ${ing.glyph}"></span></span>
+      ${n} × ${ing.name}
+      <span class="have${short ? ' short' : ''}">${ing.have} in pack</span>
+    </div>`;
+  }).join('');
+  rcDetail.innerHTML = `
+    <div class="info">
+      <div class="rc-title">${r.name}</div>
+      <div class="rc-sub">${r.cat} · yields ${r.out}</div>
+      <div class="rc-desc">${r.desc}</div>
+      <div class="needs"><div class="needs-lab">INGREDIENTS</div>${needs}</div>
+      <div class="station">Made at <b>${r.station}</b></div>
+    </div>
+    <div class="craft-area">
+      <div class="craft-3">${cells}</div>
+      <div class="craft-arrow"></div>
+      <div class="out-wrap">
+        <div class="slot" title="${r.name}"><div class="it ${r.glyph}"></div>${r.out > 1 ? `<div class="qty">×${r.out}</div>` : ''}</div>
+        <div class="out-lab">YIELD</div>
+      </div>
+    </div>`;
+}
+rcSearch.addEventListener('input', e => { rcQuery = e.target.value.trim().toLowerCase(); renderRcDir(); });
+document.getElementById('rcClear').addEventListener('click', () => {
+  rcSearch.value = ''; rcQuery = ''; renderRcDir(); rcSearch.focus();
+});
+renderRcDir(); renderRcDetail();
+
+// ---------------------------------------------------------------
+// Lore categories. Each owns its own entry list and pages, so a
+// category never shows another category's content.
+// ---------------------------------------------------------------
+const LORE = {
+  people: { kind:'PERSON', entries:[
+    { n:'Maren Kolt', st:'read', sub:'— a smith, met on the coast road',
+      stats:[['Trade','Metalsmithing'],['Last seen','The coast road'],['Disposition','Wary'],['Teaches','Bronze casting']],
+      body:['She travels with a hand cart and a bellows strapped to it, and she will not say where she is going.','For the price of six copper lumps she showed me how to bank a bloomery so it holds heat overnight. She would not take food. She said food makes people follow you.'],
+      quote:'"Stone breaks. Copper bends. Bronze does neither, if you get the mix right — and you will not, the first four times."' },
+    { n:'The Woodcutter', st:'read', sub:'— name unknown, north of the ridge',
+      stats:[['Trade','Unclear'],['Last seen','North ridge'],['Disposition','Silent'],['Trades','Rope for meat']],
+      body:['I have seen him three times and he has never spoken. He fells trees far from any camp and leaves the logs where they land.','He left a coil of rope on my wall the morning after the wolves came. I left him a haunch of venison. It was gone by dusk.'] },
+    { n:'Old Bregga', st:'read', sub:'— keeps goats on the moor',
+      stats:[['Trade','Husbandry'],['Last seen','Open moor'],['Disposition','Friendly'],['Teaches','Taming']],
+      body:['Bregga has survived eleven winters out here, which makes her the foremost authority on everything.','Her advice, given freely and at length: build the roof before the walls, never sleep facing the door, and an ox is worth more than a sword.'] },
+    { n:'The Man in the Cave', st:'new', sub:'— found below the creek',
+      stats:[['Trade','Unknown'],['Last seen','Second chamber'],['Disposition','Unknown'],['Notable','Left a map']],
+      body:['A firepit long cold, a bedroll rotted to threads, and charcoal marks on the wall counting something to two hundred and forty.','No body. Whoever kept that count either walked out or went deeper.'] },
+    { n:'??? — the voice on the ridge', st:'locked' },
+    { n:'??? — the trader', st:'locked' },
+    { n:'??? — the other survivor', st:'locked' }
+  ]},
+  factions: { kind:'FACTION', entries:[
+    { n:'The Ashfallen', st:'read', sub:'— they come with the cold',
+      stats:[['Territory','The high passes'],['Strength','Unknown'],['Hostility','Total'],['Active','Winter']],
+      body:['They do not raid for food. They raid for tools, and they burn what they cannot carry.','Every account agrees on one detail: they travel at night and they never come twice by the same road.'],
+      quote:'"They took the anvil and left the grain. Think about what that means." — Bregga' },
+    { n:'The Hollow Pack', st:'read', sub:'— wolves, but organised',
+      stats:[['Territory','North ridge'],['Strength','9-12'],['Hostility','Opportunistic'],['Active','Dusk to dawn']],
+      body:['A pack this size should have split by now. It has not, and something in the den is the reason.','They test a camp for three nights before they commit. Fire buys the first two nights. The third night you need a wall.'] },
+    { n:'??? — the ones who left the markers', st:'locked' },
+    { n:'??? — the deep', st:'locked' }
+  ]},
+  lore: { kind:'LORE', entries:[
+    { n:'The Second Age', st:'read', sub:'— by the reckoning of the stone markers',
+      stats:[['Current year','18th'],['Season length','20 days'],['Reckoning','Stone markers'],['Age began','Unknown']],
+      body:['Every valley has a marker stone with a count scratched into it, and every count agrees: this is the eighteenth year of the second age.','Nobody living knows what ended the first one. The markers do not say, and the people who cut them are not here to ask.'] },
+    { n:'On bronze', st:'read', sub:'— copper and tin, in the right measure',
+      stats:[['Copper','Surface veins'],['Tin','Scarce, deep'],['Ratio','9 to 1'],['Yield','4× stone life']],
+      body:['Copper alone is nearly useless — it holds no edge and folds under load. Tin alone is worse.','Together, in roughly nine parts to one, they make a metal that will mine stone all day and still take an edge in the evening. This is the whole reason to dig.'] },
+    { n:'The long winter', st:'read', sub:'— sixty days of it, at least',
+      stats:[['Duration','60+ days'],['Ground','Frozen day 8'],['Water','Iced day 12'],['Survival','Fuel + stores']],
+      body:['The cold arrives before the snow. The ground freezes first, so anything you meant to dig, dig it now.','Forty units of food and two hundred logs is the figure Bregga gives, and she has been right eleven times.'] },
+    { n:'Why the caves are warm', st:'new', sub:'— the draught from the creek mouth',
+      stats:[['Source','Unknown'],['Depth','Unmeasured'],['Air','Steady, cold'],['Note','It does not vary']],
+      body:['A cave breathes with the weather. This one does not — the draught is the same at noon and at midnight, in rain and in frost.','That means it is not connected to the surface anywhere near here.'] },
+    { n:'??? — the markers before the first', st:'locked' },
+    { n:'??? — what the count reached', st:'locked' }
+  ]}
+};
+
+// ---------------------------------------------------------------
+// Places: the running list of marks the player saved on the map.
+// Written by Voxelmark Map.html, read here.
+// ---------------------------------------------------------------
+const MARK_KEY = 'voxelmark.map.marks.v1';
+const MARK_ICONS = {
+  x:        '<path d="M5 5 L19 19 M19 5 L5 19"/>',
+  circle:   '<circle cx="12" cy="12" r="7"/>',
+  triangle: '<path d="M12 4 L20 19 L4 19 Z"/>',
+  square:   '<rect x="5" y="5" width="14" height="14"/>',
+  diamond:  '<path d="M12 3 L21 12 L12 21 L3 12 Z"/>',
+  star:     '<path d="M12 3 L14.3 9.5 L21 9.8 L15.7 14 L17.6 21 L12 17 L6.4 21 L8.3 14 L3 9.8 L9.7 9.5 Z"/>',
+  arrowUp:  '<path d="M12 20 V5 M6 11 L12 4 L18 11"/>',
+  arrowDown:'<path d="M12 4 V19 M6 13 L12 20 L18 13"/>',
+  arrowL:   '<path d="M20 12 H5 M11 6 L4 12 L11 18"/>',
+  arrowR:   '<path d="M4 12 H19 M13 6 L20 12 L13 18"/>',
+  paw:      '<circle class="fill" cx="7" cy="9" r="2"/><circle class="fill" cx="11" cy="6.5" r="2"/><circle class="fill" cx="15.5" cy="7.5" r="2"/><circle class="fill" cx="18" cy="11.5" r="2"/><path class="fill" d="M12.5 11 C16 11 18 13.5 18 16 C18 18.5 15.5 19.5 12.5 19.5 C9.5 19.5 7 18.5 7 16 C7 13.5 9 11 12.5 11 Z"/>',
+  skull:    '<path d="M12 3 C7.6 3 4.5 6.2 4.5 10.5 C4.5 13 5.7 14.6 6.8 15.6 L7 20 H17 L17.2 15.6 C18.3 14.6 19.5 13 19.5 10.5 C19.5 6.2 16.4 3 12 3 Z"/><circle class="fill" cx="9" cy="10.5" r="1.7"/><circle class="fill" cx="15" cy="10.5" r="1.7"/>',
+  tree:     '<path d="M12 3 L17 11 H7 Z M12 8 L18 16 H6 Z M12 16 V21"/>',
+  water:    '<path d="M12 3 C12 3 5.5 10.5 5.5 14.5 C5.5 18 8.4 20.5 12 20.5 C15.6 20.5 18.5 18 18.5 14.5 C18.5 10.5 12 3 12 3 Z"/>',
+  pick:     '<path d="M4 8 C8 4.5 16 4.5 20 8"/><path d="M12 6.5 L12 20"/>',
+  tent:     '<path d="M12 4 L21 20 H3 Z M12 4 V20 M8 20 L12 12 L16 20"/>',
+  ore:      '<path d="M12 4 L19 9 L16.5 19 H7.5 L5 9 Z M9 9 L12 4 L15 9 M9 9 L11 19 M15 9 L13 19"/>',
+  flag:     '<path d="M7 21 V3 L18 6 L7 9"/>'
+};
+const ICON_NAME = { x:'Cross', circle:'Ring', triangle:'Peak', square:'Block', diamond:'Cache',
+  star:'Landmark', arrowUp:'Way north', arrowDown:'Way south', arrowL:'Way west', arrowR:'Way east',
+  paw:'Beasts', skull:'Danger', tree:'Timber', water:'Water', pick:'Dig site', tent:'Camp',
+  ore:'Ore vein', flag:'Claim' };
+// the sheet is 4200 × 2800 with the spawn point at its centre
+const ORIGIN = { x: 2100, y: 1400 };
+
+function loadPlaces(){
+  try { return JSON.parse(localStorage.getItem(MARK_KEY) || '[]'); } catch(_){ return []; }
+}
+let places = [], plSel = 0;
+
+function renderPlaces(){
+  places = loadPlaces();
+  document.getElementById('plTally').textContent = places.length;
+  if (!places.length){
+    entList.innerHTML = '<div class="pl-empty">No places saved yet.</div>';
+    loreEntry.innerHTML = `<div class="e-kind">◆ PLACES</div>
+      <div class="e-title">Nothing recorded</div>
+      <div class="e-sub">— open the map and right-click to mark a place</div>
+      <div class="e-body"><p>Every place you mark on the map is written here, with the symbol you gave it and how far it lies from where you first woke.</p></div>`;
+    return;
+  }
+  if (plSel >= places.length) plSel = 0;
+  entList.innerHTML = places.map((p, i) => `
+    <div class="ent read${i === plSel ? ' active' : ''}" data-i="${i}">
+      <svg class="sym" viewBox="0 0 24 24">${MARK_ICONS[p.icon] || MARK_ICONS.x}</svg>
+      ${p.name ? esc(p.name) : '<em>unnamed</em>'}
+    </div>`).join('');
+  entList.querySelectorAll('.ent').forEach(el => el.addEventListener('click', () => {
+    plSel = +el.dataset.i; renderPlaces();
+  }));
+
+  const p = places[plSel];
+  const dx = p.x - ORIGIN.x, dy = p.y - ORIGIN.y;
+  const dist = Math.round(Math.hypot(dx, dy));
+  const bearing = ['N','NE','E','SE','S','SW','W','NW'][Math.round(((Math.atan2(dx, -dy) * 180 / Math.PI) + 360) % 360 / 45) % 8];
+  loreEntry.innerHTML = `
+    <div class="e-kind">◆ PLACE · MARKED DAY ${p.day || 12}</div>
+    <svg class="e-sym" viewBox="0 0 24 24">${MARK_ICONS[p.icon] || MARK_ICONS.x}</svg>
+    <div class="e-title">${p.name ? esc(p.name) : 'Unnamed mark'}</div>
+    <div class="e-sub">— ${ICON_NAME[p.icon] || 'Mark'}, ${dist} paces ${bearing} of the waking place</div>
+    <div class="e-stats">
+      <div class="k">Symbol</div><div class="v">${ICON_NAME[p.icon] || 'Mark'}</div>
+      <div class="k">Bearing</div><div class="v">${bearing}</div>
+      <div class="k">Distance</div><div class="v">${dist} paces</div>
+      <div class="k">Marked</div><div class="v">Day ${p.day || 12}</div>
+    </div>
+    <div class="e-body"><p>Saved from the map. Rename it, change its symbol or remove it from the map screen — this list follows.</p></div>`;
+}
+
+function esc(v){ return String(v).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+const entList = document.getElementById('entList');
+const loreEntry = document.getElementById('loreEntry');
+let loreCat = 'people', loreSel = 0;
+
+function renderLore(){
+  const set = LORE[loreCat];
+  entList.innerHTML = set.entries.map((e, i) => {
+    const cls = e.st === 'locked' ? 'locked' : e.st === 'new' ? 'new' : 'read';
+    return `<div class="ent ${cls}${i === loreSel ? ' active' : ''}" data-i="${i}">${e.n}</div>`;
+  }).join('');
+  entList.querySelectorAll('.ent').forEach(el => el.addEventListener('click', () => {
+    if (el.classList.contains('locked')) return;
+    loreSel = +el.dataset.i; renderLore();
+  }));
+
+  const e = set.entries[loreSel];
+  if (!e || e.st === 'locked'){
+    loreEntry.innerHTML = '<div class="e-kind">◆ SEALED</div><div class="e-body"><p>Not yet discovered.</p></div>';
+    return;
+  }
+  const [first, ...rest] = e.body[0];
+  loreEntry.innerHTML = `
+    <div class="e-kind">◆ ${set.kind}${e.st === 'new' ? ' · NEW' : ''}</div>
+    <div class="e-title">${e.n}</div>
+    <div class="e-sub">${e.sub || ''}</div>
+    ${e.stats ? `<div class="e-stats">${e.stats.map(([k,v]) => `<div class="k">${k}</div><div class="v">${v}</div>`).join('')}</div>` : ''}
+    <div class="e-body">
+      <p><span class="first">${first}</span>${rest.join('')}</p>
+      ${e.body.slice(1).map(p => `<p>${p}</p>`).join('')}
+      ${e.quote ? `<blockquote>${e.quote}</blockquote>` : ''}
+    </div>`;
+}
+
+// the Recipes category swaps the middle + right panes for the recipe dictionary
+const grid = document.getElementById('cdGrid');
+const lorePanes = [document.getElementById('entList'), document.getElementById('loreEntry')];
+const rcPanes = [document.getElementById('rcMid'), rcDetail];
+function showSection(name){
+  if (name === 'places') renderPlaces();
+  const rc = name === 'recipes';
+  grid.classList.toggle('recipes', rc);
+  lorePanes.forEach(p => p.style.display = rc ? 'none' : '');
+  rcPanes.forEach(p => p.style.display = rc ? '' : 'none');
+}
+
+  document.querySelectorAll('.cat').forEach(c=>{
+    c.addEventListener('click',()=>{
+      document.querySelectorAll('.cat').forEach(x=>x.classList.remove('active'));
+      c.classList.add('active');
+      if (c.dataset.section === 'lore' && c.dataset.cat !== loreCat){
+        loreCat = c.dataset.cat; loreSel = 0; renderLore();
+      }
+      showSection(c.dataset.section);
+    });
+  });
+  // Recipes is the default category
+  renderLore();
+  document.getElementById('plTally').textContent = loadPlaces().length;
+  showSection('recipes');
+  // pick up places saved on the map while this screen was open
+  window.addEventListener('focus', () => {
+    document.getElementById('plTally').textContent = loadPlaces().length;
+    if (document.querySelector('.cat.active').dataset.section === 'places') renderPlaces();
+  });
+  document.querySelectorAll('.ent').forEach(e=>{
+    e.addEventListener('click',()=>{
+      if(e.classList.contains('locked')) return;
+      document.querySelectorAll('.ent').forEach(x=>x.classList.remove('active'));
+      e.classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>

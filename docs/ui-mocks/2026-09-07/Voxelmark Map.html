@@ -1,0 +1,598 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Map" subtitle="Pannable map — drag to move, Q/E to rotate, right-click to mark" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Press+Start+2P&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  .map-wrap{flex:1;min-height:0;display:flex}
+  .parchment-frame{flex:1;position:relative;overflow:hidden;background:linear-gradient(180deg,#e8d3a0 0%,#d2b87a 50%,#c8a868 100%);border:2px solid #000;box-shadow:inset 0 0 0 1px var(--bronze-deep),inset 0 0 140px rgba(80,40,10,0.4);cursor:grab}
+  .parchment-frame.dragging{cursor:grabbing}
+
+  /* rotor fills the frame, so rotating it orbits the map about the frame centre */
+  .rotor{position:absolute;inset:0;--rot:0deg;transform:rotate(var(--rot));will-change:transform}
+  .rotor.settle{transition:transform .3s cubic-bezier(.22,.7,.25,1)}
+
+  /* the pannable sheet — much larger than the frame */
+  /* Parked so the player (2100,1400) is dead centre with no JS measurement.
+     tx/ty are then pure deltas from that resting position. */
+  .sheet{position:absolute;left:50%;top:50%;margin-left:-2100px;margin-top:-1400px;width:4200px;height:2800px;will-change:transform;transform:translate3d(0,0,0)}
+  .sheet.settle{transition:transform .28s cubic-bezier(.22,.7,.25,1)}
+  .sheet-paper{position:absolute;inset:0;background:radial-gradient(ellipse at 22% 18%, rgba(120,80,30,0.22), transparent 45%),radial-gradient(ellipse at 78% 82%, rgba(80,40,10,0.26), transparent 45%),linear-gradient(180deg,#ecd8a8 0%,#ddc48c 45%,#cfb478 100%)}
+  .sheet-grain{position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(37deg, rgba(60,40,20,0.035) 0 1px, transparent 1px 5px),repeating-linear-gradient(-53deg, rgba(60,40,20,0.02) 0 1px, transparent 1px 7px);mix-blend-mode:multiply}
+  .topo{position:absolute;inset:0;width:100%;height:100%}
+
+
+  /* you-are-here */
+  .you{position:absolute;width:16px;height:16px;transform:translate(-50%,-50%);z-index:6}
+  .you::before{content:"";position:absolute;inset:0;background:var(--hp-bright);border:2px solid #1a0a05;border-radius:50%;box-shadow:0 0 0 3px rgba(240,193,75,0.5),0 0 16px rgba(232,74,58,0.6);animation:youPulse 1.6s ease-in-out infinite}
+  @keyframes youPulse{0%,100%{box-shadow:0 0 0 3px rgba(240,193,75,0.5),0 0 8px rgba(232,74,58,0.5)}50%{box-shadow:0 0 0 6px rgba(240,193,75,0.7),0 0 22px rgba(232,74,58,0.9)}}
+
+  /* player-made marks */
+  .mark{position:absolute;transform:translate(-50%,-100%);z-index:5;display:flex;flex-direction:column;align-items:center;cursor:pointer;padding:2px 4px}
+  .mark:hover svg{filter:drop-shadow(0 0 7px rgba(240,193,75,0.95))}
+  .mark:hover .cap{color:#7a3a12;text-decoration:underline}
+  .mark.editing svg{filter:drop-shadow(0 0 9px rgba(240,193,75,1))}
+  .mark svg{transform:rotate(calc(-1 * var(--rot)));width:26px;height:26px;display:block;filter:drop-shadow(0 0 6px rgba(236,216,168,0.85))}
+  .mark .cap{transform:rotate(calc(-1 * var(--rot)));margin-top:1px;font-family:var(--hand);font-style:italic;font-size:19px;letter-spacing:2px;color:#5a2a12;text-shadow:0 0 7px rgba(236,216,168,0.9);white-space:nowrap}
+
+  /* fixed overlays */
+
+  .compass-card{position:absolute;right:26px;bottom:26px;width:72px;height:72px;z-index:7;transition:transform .3s cubic-bezier(.22,.7,.25,1);filter:drop-shadow(0 1px 2px rgba(60,40,20,0.45))}
+  .compass-card svg{width:100%;height:100%;display:block}
+
+  /* saved-places drawer */
+  .pl-drawer{position:absolute;right:0;top:0;z-index:9;width:max-content}
+  .pl-toggle{display:flex;align-items:center;gap:8px;font-family:var(--serif);font-weight:700;font-size:11px;letter-spacing:2px;color:var(--parchment);background:linear-gradient(180deg,rgba(40,26,14,0.95),rgba(20,12,6,0.96));border:2px solid #000;border-top:0;border-right:0;box-shadow:inset 0 0 0 1px var(--panel-oak-edge),0 3px 10px rgba(0,0,0,0.5);padding:6px 12px;cursor:pointer;text-shadow:1px 1px 0 #000}
+  .pl-toggle:hover{color:var(--gold);box-shadow:inset 0 0 0 1px var(--gold),0 3px 12px rgba(0,0,0,0.5)}
+  .pl-toggle .n{font-family:var(--mono);font-size:15px;color:var(--gold)}
+  .pl-toggle .car{font-family:var(--mono);font-size:14px;color:var(--bronze);transition:transform .14s}
+  .pl-toggle.open{color:var(--gold)}
+  .pl-toggle.open .car{transform:rotate(180deg)}
+
+  .pl-panel{width:100%;max-height:430px;display:none;flex-direction:column;background:linear-gradient(180deg,rgba(28,18,10,0.97),rgba(14,8,4,0.98));border:2px solid #000;border-right:0;box-shadow:inset 0 0 0 1px var(--panel-oak-edge),0 8px 24px rgba(0,0,0,0.75)}
+  .pl-panel.open{display:flex}
+  .pl-search{display:flex;align-items:center;gap:6px;background:#0a0805;border-bottom:1px solid rgba(107,68,34,0.45);padding:4px 9px}
+  .pl-search svg{width:12px;height:12px;flex:none;opacity:.7}
+  .pl-search input{flex:1;min-width:0;background:transparent;border:0;outline:0;font-family:var(--mono);font-size:17px;color:var(--ink)}
+  .pl-search input::placeholder{color:var(--ink-mute)}
+  .pl-search .clr{font-family:var(--mono);font-size:15px;color:var(--ink-mute);cursor:pointer;padding:0 2px}
+  .pl-search .clr:hover{color:var(--hp-bright)}
+  .pl-list{overflow-y:auto;min-height:0}
+  .pl-list::-webkit-scrollbar{width:7px}
+  .pl-list::-webkit-scrollbar-thumb{background:var(--panel-oak-edge);border:1px solid #000}
+  .pl-row{display:flex;align-items:center;gap:9px;padding:6px 11px;cursor:pointer;border-bottom:1px solid rgba(107,68,34,0.3)}
+  .pl-row:hover{background:rgba(176,122,58,0.24)}
+  .pl-row svg{width:16px;height:16px;flex:none}
+  .pl-row svg *{stroke:var(--bronze);fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .pl-row svg .fill{fill:var(--bronze);stroke:none}
+  .pl-row:hover svg *{stroke:var(--gold)}
+  .pl-row:hover svg .fill{fill:var(--gold);stroke:none}
+  .pl-row .nm{font-family:var(--mono);font-size:18px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pl-row .nm em{color:var(--ink-mute)}
+  .pl-row .dd{margin-left:auto;font-family:var(--mono);font-size:14px;color:var(--ink-mute)}
+  .pl-none{font-family:var(--mono);font-size:17px;font-style:italic;color:var(--ink-mute);padding:16px 12px;text-align:center}
+
+  /* right-click annotation dialog */
+  .mk-dialog{position:absolute;z-index:20;width:236px;background:linear-gradient(180deg,rgba(28,18,10,0.97),rgba(14,8,4,0.98));border:2px solid #000;box-shadow:inset 0 0 0 1px var(--panel-oak-edge),inset 0 0 0 3px var(--panel-oak-2),0 8px 24px rgba(0,0,0,0.8);padding:12px;display:none;flex-direction:column;gap:8px}
+  .mk-dialog.open{display:flex}
+  .mk-title{font-family:var(--serif);font-weight:700;font-size:13px;letter-spacing:3px;color:var(--gold);text-shadow:1px 1px 0 #000}
+  .mk-input{font-family:var(--mono);font-size:19px;color:var(--ink);background:#0a0805;border:1px solid #000;box-shadow:inset 0 0 0 1px var(--bronze-deep);padding:5px 8px;outline:none;width:100%}
+  .mk-input:focus{box-shadow:inset 0 0 0 1px var(--gold)}
+  .mk-lab{font-family:var(--mono);font-size:15px;letter-spacing:1px;color:var(--ink-mute)}
+  .mk-icons{display:grid;grid-template-columns:repeat(6,1fr);gap:3px}
+  .mk-ico{aspect-ratio:1;display:grid;place-items:center;background:#0a0805;border:1px solid #000;box-shadow:inset 0 0 0 1px var(--bronze-deep);cursor:pointer}
+  .mk-ico:hover{box-shadow:inset 0 0 0 1px var(--gold)}
+  .mk-ico.on{background:linear-gradient(180deg,#3a2410,#1a1008);box-shadow:inset 0 0 0 1px var(--gold),0 0 8px rgba(240,193,75,0.35)}
+  .mk-ico svg{width:16px;height:16px;display:block}
+  .mk-ico svg *{stroke:var(--bronze);fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+  .mk-ico.on svg *{stroke:var(--gold)}
+  .mk-ico svg .fill{fill:var(--bronze);stroke:none}
+  .mk-ico.on svg .fill{fill:var(--gold)}
+  .mk-row{display:flex;gap:8px;justify-content:flex-end;margin-top:2px}
+  .mk-btn{font-family:var(--serif);font-weight:700;font-size:8px;letter-spacing:1.5px;background:linear-gradient(180deg,var(--panel-oak-1),var(--panel-oak-2));color:var(--parchment);border:1px solid var(--panel-oak-edge);padding:4px 10px;cursor:pointer;text-shadow:1px 1px 0 #000}
+  .mk-btn:hover{border-color:var(--gold);color:var(--gold)}
+  .mk-btn.primary{background:linear-gradient(180deg,var(--bronze),var(--bronze-deep));color:#fff8e0;border-color:#000}
+  .mk-btn.primary:hover{background:linear-gradient(180deg,var(--gold),var(--gold-deep));color:#2a1810}
+  .mk-btn.danger{background:linear-gradient(180deg,#6a2018,#3a0f0a);color:#f0c8be;border-color:#000}
+  .mk-btn.danger:hover{background:linear-gradient(180deg,#9a2c1e,#5a170e);color:#fff0ea}
+  .mk-row .grow{flex:1}
+</style>
+</head>
+<body>
+  <div class="bg-scene"></div>
+  <div class="bg-vignette"></div>
+  <div class="bg-grain"></div>
+
+  <div class="menu-shell compact">
+    <nav class="menu-tabs">
+      <a href="Voxelmark Map.html" class="menu-tab active">MAP</a>
+      <a href="Voxelmark Journal.html" class="menu-tab">JOURNAL</a>
+      <a href="Voxelmark Inventory.html" class="menu-tab">INVENTORY</a>
+      <a href="Voxelmark Player.html" class="menu-tab">PLAYER</a>
+      <a href="Voxelmark Codex.html" class="menu-tab">CODEX</a>
+    </nav>
+
+    <div class="menu-body">
+      <div class="map-wrap">
+        <div class="parchment-frame" id="frame">
+
+          <div class="rotor" id="rotor">
+          <div class="sheet" id="sheet">
+            <div class="sheet-paper"></div>
+            <!-- terrain layer: filled from the procedural heightmap -->
+            <svg class="topo" id="topo" viewBox="0 0 4200 2800" preserveAspectRatio="none"></svg>
+            <div class="sheet-grain"></div>
+
+            <div class="you" id="you" style="left:2100px;top:1400px"></div>
+            <div id="marks"></div>
+          </div>
+          </div>
+
+          <div class="pl-drawer">
+            <div class="pl-toggle" id="plToggle">SAVED PLACES <span class="n" id="plCount">0</span><span class="car">▾</span></div>
+            <div class="pl-panel" id="plPanel">
+              <div class="pl-search">
+                <svg viewBox="0 0 16 16" fill="none" stroke="#b4a07a" stroke-width="2"><circle cx="7" cy="7" r="5"/><path d="M11 11 L15 15"/></svg>
+                <input id="plSearch" type="text" placeholder="Filter places…" autocomplete="off" />
+                <span class="clr" id="plClear">×</span>
+              </div>
+              <div class="pl-list" id="plList"></div>
+            </div>
+          </div>
+
+          <div class="compass-card">
+            <svg viewBox="0 0 100 100">
+              <defs>
+                <!-- engraved facets: each rose point is split light / dark -->
+                <g id="ticks10">
+                  <line x1="50" y1="5.5" x2="50" y2="8.5" stroke="#4a3418" stroke-width="0.7"/>
+                </g>
+              </defs>
+
+              <!-- graduated limb -->
+              <circle cx="50" cy="50" r="47" fill="rgba(236,216,168,0.35)" stroke="#3a2a14" stroke-width="1"/>
+              <circle cx="50" cy="50" r="41.5" fill="none" stroke="#5a4020" stroke-width="0.6"/>
+              <g id="grad"></g>
+              <circle cx="50" cy="50" r="33" fill="none" stroke="#3a2a14" stroke-width="0.8"/>
+              <circle cx="50" cy="50" r="31.6" fill="none" stroke="#8a6a3a" stroke-width="0.4"/>
+
+              <!-- diagonal (intercardinal) points, shorter -->
+              <g stroke="#3a2a14" stroke-width="0.4">
+                <polygon points="50,50 63.5,36.5 55.5,44.5" fill="#e6d3a6"/>
+                <polygon points="50,50 63.5,36.5 44.5,44.5" fill="#7a5c30" opacity="0"/>
+                <polygon points="50,50 63.5,36.5 55.5,55.5" fill="#8a6836"/>
+                <polygon points="50,50 63.5,63.5 55.5,55.5" fill="#e6d3a6"/>
+                <polygon points="50,50 63.5,63.5 44.5,55.5" fill="#8a6836"/>
+                <polygon points="50,50 36.5,63.5 44.5,55.5" fill="#e6d3a6"/>
+                <polygon points="50,50 36.5,63.5 44.5,44.5" fill="#8a6836"/>
+                <polygon points="50,50 36.5,36.5 44.5,44.5" fill="#e6d3a6"/>
+                <polygon points="50,50 36.5,36.5 55.5,44.5" fill="#8a6836"/>
+              </g>
+
+              <!-- cardinal points: long spearheads, light face left, shadow face right -->
+              <g stroke="#2a1c0c" stroke-width="0.45">
+                <polygon points="50,6 47,46 50,50" fill="#f0e2bd"/>
+                <polygon points="50,6 53,46 50,50" fill="#5a4020"/>
+                <polygon points="50,94 47,54 50,50" fill="#c9b287"/>
+                <polygon points="50,94 53,54 50,50" fill="#4a3418"/>
+                <polygon points="94,50 54,47 50,50" fill="#e2d0a4"/>
+                <polygon points="94,50 54,53 50,50" fill="#4a3418"/>
+                <polygon points="6,50 46,47 50,50" fill="#f0e2bd"/>
+                <polygon points="6,50 46,53 50,50" fill="#5a4020"/>
+              </g>
+
+              <!-- hub -->
+              <circle cx="50" cy="50" r="3.4" fill="#d8c092" stroke="#2a1c0c" stroke-width="0.7"/>
+              <circle cx="50" cy="50" r="1.2" fill="#3a2a14"/>
+
+              <!-- lettering -->
+              <g font-family="Georgia,'Times New Roman',serif" fill="#2a1c0c" text-anchor="middle">
+                <text x="50" y="14.5" font-size="9" font-weight="700">N</text>
+                <text x="50" y="92" font-size="7">S</text>
+                <text x="88.5" y="53" font-size="7">E</text>
+                <text x="11.5" y="53" font-size="7">W</text>
+              </g>
+            </svg>
+          </div>
+
+          <div class="mk-dialog" id="mkDialog">
+            <div class="mk-title" id="mkTitle">MARK THIS PLACE</div>
+            <input class="mk-input" id="mkInput" type="text" maxlength="28" placeholder="Name of the place" />
+            <div class="mk-lab">Symbol</div>
+            <div class="mk-icons" id="mkIcons"></div>
+            <div class="mk-row">
+              <button class="mk-btn danger" id="mkDelete" style="display:none">DELETE</button>
+              <span class="grow"></span>
+              <button class="mk-btn" id="mkCancel">CANCEL</button>
+              <button class="mk-btn primary" id="mkSave">SAVE</button>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <div class="action-bar">
+        <span class="action"><kbd>LMB</kbd>Drag to move</span>
+        <span class="action"><kbd>RMB</kbd>Place a named mark</span>
+        <span class="action"><kbd>LMB</kbd>Edit a mark</span>
+        <span class="action">Saved places list snaps the map</span>
+        <span class="action"><kbd>Q</kbd><kbd>E</kbd>Rotate the map</span>
+        <span class="action"><kbd>F</kbd>Reset view</span>
+        <span class="spacer"></span>
+        <span class="action"><kbd>ESC</kbd>Exit</span>
+      </div>
+    </div>
+  </div>
+
+<script>
+// Terrain layer is intentionally empty — the sheet will be drawn from the
+// procedural heightmap. #topo is the target SVG (viewBox 4200 × 2800).
+
+// graduated limb on the compass rose: a tick every 5°, longer every 30°
+(function graduate(){
+  const g = document.getElementById('grad');
+  if (!g) return;
+  let out = '';
+  for (let a = 0; a < 360; a += 5){
+    const long = a % 30 === 0;
+    const r1 = 41.5, r2 = long ? 35.5 : 38.5;
+    const rad = (a - 90) * Math.PI / 180;
+    out += `<line x1="${(50 + Math.cos(rad) * r1).toFixed(2)}" y1="${(50 + Math.sin(rad) * r1).toFixed(2)}" x2="${(50 + Math.cos(rad) * r2).toFixed(2)}" y2="${(50 + Math.sin(rad) * r2).toFixed(2)}" stroke="#4a3418" stroke-width="${long ? 0.8 : 0.45}"/>`;
+  }
+  g.innerHTML = out;
+})();
+
+// ---------------------------------------------------------------
+// Pan: left-drag moves the sheet, release settles it there.
+// Starts centred on the player.
+// ---------------------------------------------------------------
+const frame = document.getElementById('frame');
+const sheet = document.getElementById('sheet');
+const SHEET_W = 4200, SHEET_H = 2800;
+const PLAYER = { x: 2100, y: 1400 };
+const rotor = document.getElementById('rotor');
+let tx = 0, ty = 0;
+let rot = 0;                     // map heading in degrees
+const ROT_STEP = 15;
+
+function applyRot(){
+  rotor.style.setProperty('--rot', rot + 'deg');
+  const card = document.querySelector('.compass-card');
+  if (card) card.style.transform = 'rotate(' + rot + 'deg)';
+}
+function rotateBy(d){
+  rot = (rot + d) % 360;
+  rotor.classList.add('settle');
+  applyRot();
+}
+
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+// The page is rendered under a document zoom for 2K, so pointer coordinates
+// come back scaled. Convert them into the frame's own coordinate space.
+function zoom(){
+  const r = frame.getBoundingClientRect();
+  return frame.offsetWidth ? r.width / frame.offsetWidth : 1;
+}
+// pointer position in frame-local, unzoomed px
+function local(e){
+  const r = frame.getBoundingClientRect(), z = zoom();
+  return { x: (e.clientX - r.left) / z, y: (e.clientY - r.top) / z };
+}
+// pointer position in sheet coordinates, undoing the map rotation
+function sheetPos(e){
+  const p = local(e);
+  const cx = frame.offsetWidth / 2, cy = frame.offsetHeight / 2;
+  const a = -rot * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+  const dx = p.x - cx, dy = p.y - cy;
+  const ux = cx + dx * ca - dy * sa;      // un-rotated frame position
+  const uy = cy + dx * sa + dy * ca;
+  return { x: ux - (cx - PLAYER.x + tx), y: uy - (cy - PLAYER.y + ty) };
+}
+// sheet coordinates → on-screen frame position (for placing the dialog)
+function framePos(sx, sy){
+  const cx = frame.offsetWidth / 2, cy = frame.offsetHeight / 2;
+  const ux = sx + (cx - PLAYER.x + tx), uy = sy + (cy - PLAYER.y + ty);
+  const a = rot * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+  const dx = ux - cx, dy = uy - cy;
+  return { x: cx + dx * ca - dy * sa, y: cy + dx * sa + dy * ca };
+}
+function apply(){
+  // keep the sheet covering the frame; the sheet rests centred on the player,
+  // so its top-left sits at frame/2 - PLAYER + t
+  const fw = frame.offsetWidth, fh = frame.offsetHeight;
+  if (fw && fh){
+    tx = clamp(tx, fw / 2 - SHEET_W + PLAYER.x, PLAYER.x - fw / 2);
+    ty = clamp(ty, fh / 2 - SHEET_H + PLAYER.y, PLAYER.y - fh / 2);
+  }
+  sheet.style.transform = `translate3d(${tx}px,${ty}px,0)`;
+}
+// The sheet rests centred on the player, so centring on any point is just the
+// offset between them — no viewport measurement needed.
+function centerOn(x, y){
+  tx = PLAYER.x - x;
+  ty = PLAYER.y - y;
+  apply();
+}
+
+let drag = null;
+frame.addEventListener('mousedown', e => {
+  if (e.button !== 0 || e.target.closest('.mk-dialog') || e.target.closest('.mark') ||
+      e.target.closest('.pl-drawer')) return;
+  e.preventDefault();
+  sheet.classList.remove('settle');
+  frame.classList.add('dragging');
+  drag = { sx: e.clientX, sy: e.clientY, ox: tx, oy: ty };
+});
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  const z = zoom();
+  const mx = (e.clientX - drag.sx) / z, my = (e.clientY - drag.sy) / z;
+  const a = -rot * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+  tx = drag.ox + (mx * ca - my * sa);
+  ty = drag.oy + (mx * sa + my * ca);
+  apply();
+});
+window.addEventListener('mouseup', () => {
+  if (!drag) return;
+  drag = null;
+  frame.classList.remove('dragging');
+  sheet.classList.add('settle');   // eases into the released position
+  apply();
+});
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 'f'){ sheet.classList.add('settle'); centerOn(PLAYER.x, PLAYER.y); rot = 0; rotor.classList.add('settle'); applyRot(); }
+  if (k === 'q'){ rotateBy(-ROT_STEP); }
+  if (k === 'e'){ rotateBy(ROT_STEP); }
+});
+applyRot();
+window.addEventListener('resize', apply, { passive: true });
+// The CSS resting position already centres the player; tx/ty start at 0.
+
+// ---------------------------------------------------------------
+// Right-click: annotate a spot with a title.
+// ---------------------------------------------------------------
+const dlg = document.getElementById('mkDialog');
+const input = document.getElementById('mkInput');
+const marksLayer = document.getElementById('marks');
+const iconsEl = document.getElementById('mkIcons');
+let pending = null;
+
+// Saved places. This is the record the Codex "Places" list reads from.
+const MARK_KEY = 'voxelmark.map.marks.v1';
+function loadMarks(){
+  try { return JSON.parse(localStorage.getItem(MARK_KEY) || '[]'); } catch(_){ return []; }
+}
+function storeMarks(){
+  if (typeof renderPlaceList === 'function' && plPanel.classList.contains('open')) setTimeout(renderPlaceList, 0);
+  const out = [...marksLayer.querySelectorAll('.mark')].map(el => ({
+    id: el.dataset.id,
+    name: el.dataset.name || '',
+    icon: el.dataset.icon || 'x',
+    x: Math.round(parseFloat(el.style.left)),
+    y: Math.round(parseFloat(el.style.top)),
+    day: +(el.dataset.day || 12)
+  }));
+  try { localStorage.setItem(MARK_KEY, JSON.stringify(out)); } catch(_){}
+}
+
+// Simple map symbols, drawn in a 24×24 box.
+const ICONS = {
+  x:        '<path d="M5 5 L19 19 M19 5 L5 19"/>',
+  circle:   '<circle cx="12" cy="12" r="7"/>',
+  triangle: '<path d="M12 4 L20 19 L4 19 Z"/>',
+  square:   '<rect x="5" y="5" width="14" height="14"/>',
+  diamond:  '<path d="M12 3 L21 12 L12 21 L3 12 Z"/>',
+  star:     '<path d="M12 3 L14.3 9.5 L21 9.8 L15.7 14 L17.6 21 L12 17 L6.4 21 L8.3 14 L3 9.8 L9.7 9.5 Z"/>',
+  arrowUp:  '<path d="M12 20 V5 M6 11 L12 4 L18 11"/>',
+  arrowDown:'<path d="M12 4 V19 M6 13 L12 20 L18 13"/>',
+  arrowL:   '<path d="M20 12 H5 M11 6 L4 12 L11 18"/>',
+  arrowR:   '<path d="M4 12 H19 M13 6 L20 12 L13 18"/>',
+  paw:      '<circle class="fill" cx="7" cy="9" r="2"/><circle class="fill" cx="11" cy="6.5" r="2"/><circle class="fill" cx="15.5" cy="7.5" r="2"/><circle class="fill" cx="18" cy="11.5" r="2"/><path class="fill" d="M12.5 11 C16 11 18 13.5 18 16 C18 18.5 15.5 19.5 12.5 19.5 C9.5 19.5 7 18.5 7 16 C7 13.5 9 11 12.5 11 Z"/>',
+  skull:    '<path d="M12 3 C7.6 3 4.5 6.2 4.5 10.5 C4.5 13 5.7 14.6 6.8 15.6 L7 20 H17 L17.2 15.6 C18.3 14.6 19.5 13 19.5 10.5 C19.5 6.2 16.4 3 12 3 Z"/><circle class="fill" cx="9" cy="10.5" r="1.7"/><circle class="fill" cx="15" cy="10.5" r="1.7"/>',
+  tree:     '<path d="M12 3 L17 11 H7 Z M12 8 L18 16 H6 Z M12 16 V21"/>',
+  water:    '<path d="M12 3 C12 3 5.5 10.5 5.5 14.5 C5.5 18 8.4 20.5 12 20.5 C15.6 20.5 18.5 18 18.5 14.5 C18.5 10.5 12 3 12 3 Z"/>',
+  pick:     '<path d="M4 8 C8 4.5 16 4.5 20 8"/><path d="M12 6.5 L12 20"/>',
+  tent:     '<path d="M12 4 L21 20 H3 Z M12 4 V20 M8 20 L12 12 L16 20"/>',
+  ore:      '<path d="M12 4 L19 9 L16.5 19 H7.5 L5 9 Z M9 9 L12 4 L15 9 M9 9 L11 19 M15 9 L13 19"/>',
+  flag:     '<path d="M7 21 V3 L18 6 L7 9"/>'
+};
+const ICON_ORDER = ['x','circle','triangle','square','diamond','star','arrowUp','arrowDown','arrowL','arrowR','flag','tent','tree','water','ore','pick','paw','skull'];
+let icon = 'x';
+const ICON_LABEL = { x:'cross', circle:'ring', triangle:'peak', square:'block', diamond:'cache',
+  star:'landmark', arrowUp:'way north', arrowDown:'way south', arrowL:'way west', arrowR:'way east',
+  paw:'beasts', skull:'danger', tree:'timber', water:'water', pick:'dig site', tent:'camp',
+  ore:'ore vein', flag:'claim' };
+
+iconsEl.innerHTML = ICON_ORDER.map(k =>
+  `<div class="mk-ico${k === icon ? ' on' : ''}" data-k="${k}" title="${k}"><svg viewBox="0 0 24 24">${ICONS[k]}</svg></div>`).join('');
+iconsEl.querySelectorAll('.mk-ico').forEach(el => el.addEventListener('click', () => {
+  icon = el.dataset.k;
+  iconsEl.querySelectorAll('.mk-ico').forEach(x => x.classList.toggle('on', x === el));
+  input.focus();
+}));
+
+frame.addEventListener('contextmenu', e => {
+  e.preventDefault();
+  const p = local(e);
+  closeDlg();
+  pending = sheetPos(e);
+  titleEl.textContent = 'MARK THIS PLACE';
+  delBtn.style.display = 'none';
+  input.value = '';
+  placeDlg(p.x, p.y);
+  input.focus();
+});
+const titleEl = document.getElementById('mkTitle');
+const delBtn = document.getElementById('mkDelete');
+let editing = null;   // the .mark element being edited, if any
+
+function selectIcon(k){
+  icon = k;
+  iconsEl.querySelectorAll('.mk-ico').forEach(x => x.classList.toggle('on', x.dataset.k === k));
+}
+function paint(el, name, k){
+  if (!el.dataset.id) el.dataset.id = 'm' + Date.now() + Math.floor(Math.random()*1e3);
+  if (!el.dataset.day) el.dataset.day = '12';
+  el.dataset.icon = k;
+  el.dataset.name = name;
+  el.innerHTML = `<svg viewBox="0 0 24 24" stroke="#7a2a12" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICONS[k]}</svg>${name ? `<div class="cap">${name.replace(/[<>&]/g, '')}</div>` : ''}`;
+  el.querySelectorAll('.fill').forEach(n => { n.setAttribute('fill', '#7a2a12'); n.setAttribute('stroke', 'none'); });
+}
+function placeDlg(x, y){
+  dlg.classList.add('open');
+  dlg.style.left = clamp(x, 6, Math.max(6, frame.offsetWidth - dlg.offsetWidth - 6)) + 'px';
+  dlg.style.top  = clamp(y, 6, Math.max(6, frame.offsetHeight - dlg.offsetHeight - 6)) + 'px';
+}
+function closeDlg(){
+  dlg.classList.remove('open');
+  if (editing) editing.classList.remove('editing');
+  pending = null; editing = null;
+}
+function saveMark(){
+  const name = input.value.trim();
+  if (editing){
+    paint(editing, name, icon);
+    storeMarks();
+    closeDlg();
+    return;
+  }
+  if (!pending) return;
+  const el = document.createElement('div');
+  el.className = 'mark';
+  el.style.left = pending.x + 'px';
+  el.style.top = pending.y + 'px';
+  paint(el, name, icon);
+  marksLayer.appendChild(el);
+  storeMarks();
+  closeDlg();
+}
+function deleteMark(){
+  if (!editing) return;
+  editing.remove();
+  editing = null;
+  storeMarks();
+  closeDlg();
+}
+
+// left-click an existing mark to rename, re-symbol or delete it
+marksLayer.addEventListener('click', e => {
+  const el = e.target.closest('.mark');
+  if (!el) return;
+  e.stopPropagation();
+  closeDlg();
+  editing = el;
+  el.classList.add('editing');
+  titleEl.textContent = 'EDIT THIS MARK';
+  delBtn.style.display = '';
+  input.value = el.dataset.name || '';
+  selectIcon(el.dataset.icon || 'x');
+  const fp = framePos(parseFloat(el.style.left), parseFloat(el.style.top));
+  placeDlg(fp.x, fp.y);
+  input.focus();
+  input.select();
+});
+
+// ---------------------------------------------------------------
+// Saved-places drawer: click a row to snap the map onto that mark.
+// ---------------------------------------------------------------
+const plToggle = document.getElementById('plToggle');
+const plPanel = document.getElementById('plPanel');
+const plList = document.getElementById('plList');
+
+let plQuery = '';
+function renderPlaceList(){
+  const all = [...marksLayer.querySelectorAll('.mark')].map(el => ({
+    el,
+    name: el.dataset.name || '',
+    icon: el.dataset.icon || 'x',
+    x: parseFloat(el.style.left),
+    y: parseFloat(el.style.top)
+  })).sort((a, b) => (a.name || '~').localeCompare(b.name || '~'));
+
+  document.getElementById('plCount').textContent = all.length;
+  const rows = plQuery
+    ? all.filter(r => (r.name || '').toLowerCase().includes(plQuery) ||
+                      (ICON_LABEL[r.icon] || '').toLowerCase().includes(plQuery))
+    : all;
+  if (!all.length){
+    plList.innerHTML = '<div class="pl-none">No places saved yet.<br>Right-click the map to mark one.</div>';
+    return;
+  }
+  if (!rows.length){
+    plList.innerHTML = '<div class="pl-none">Nothing matches that.</div>';
+    return;
+  }
+  plList.innerHTML = rows.map((r, i) => {
+    const d = Math.round(Math.hypot(r.x - PLAYER.x, r.y - PLAYER.y));
+    return `<div class="pl-row" data-i="${i}">
+      <svg viewBox="0 0 24 24">${ICONS[r.icon] || ICONS.x}</svg>
+      <span class="nm">${r.name ? r.name.replace(/[<>&]/g, '') : '<em>unnamed</em>'}</span>
+      <span class="dd">${d}</span>
+    </div>`;
+  }).join('');
+  plList.querySelectorAll('.pl-row').forEach(el => el.addEventListener('click', () => {
+    const r = rows[+el.dataset.i];
+    sheet.classList.add('settle');
+    centerOn(r.x, r.y);
+    r.el.classList.add('editing');
+    setTimeout(() => r.el.classList.remove('editing'), 900);
+  }));
+}
+plToggle.addEventListener('click', () => {
+  const open = !plPanel.classList.contains('open');
+  plPanel.classList.toggle('open', open);
+  plToggle.classList.toggle('open', open);
+  if (open){ renderPlaceList(); document.getElementById('plSearch').focus(); }
+});
+document.getElementById('plSearch').addEventListener('input', e => {
+  plQuery = e.target.value.trim().toLowerCase();
+  renderPlaceList();
+});
+document.getElementById('plClear').addEventListener('click', () => {
+  const f = document.getElementById('plSearch');
+  f.value = ''; plQuery = ''; renderPlaceList(); f.focus();
+});
+
+// restore previously saved places
+loadMarks().forEach(m => {
+  const el = document.createElement('div');
+  el.className = 'mark';
+  el.style.left = m.x + 'px';
+  el.style.top = m.y + 'px';
+  el.dataset.id = m.id;
+  el.dataset.day = m.day || 12;
+  paint(el, m.name, m.icon || 'x');
+  marksLayer.appendChild(el);
+});
+
+renderPlaceList();
+
+// left-clicking the map elsewhere dismisses an open mark dialog
+frame.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  if (e.target.closest('.mk-dialog') || e.target.closest('.mark') || e.target.closest('.pl-drawer')) return;
+  if (dlg.classList.contains('open')) closeDlg();
+});
+
+document.getElementById('mkSave').addEventListener('click', saveMark);
+document.getElementById('mkCancel').addEventListener('click', closeDlg);
+delBtn.addEventListener('click', deleteMark);
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter') saveMark();
+  if (e.key === 'Escape') closeDlg();
+});
+window.addEventListener('keydown', e => {
+  if (e.key === 'Delete' && editing) deleteMark();
+});
+</script>
+</body>
+</html>
