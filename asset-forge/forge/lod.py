@@ -134,17 +134,16 @@ def reduce_origin(origin, factor: int):
     return tuple(int(np.floor(v / f)) for v in origin)
 
 
-def ladder(voxel_mm: int, levels=(2, 5, 10, 25)) -> list:
+def ladder(voxel_mm: float, levels=(2, 4, 8, 16)) -> list:
     """(factor, coarse_voxel_mm) for each level coarser than the base.
 
-    `levels` are multiples of the BASE voxel, so a 2 cm asset yields 4, 10, 20
-    and 50 cm. Levels that do not divide evenly are skipped rather than
-    approximated: a non-integer factor is a resample, not a reduction, and this
-    module only claims to do the latter.
+    `levels` are integer multiples of the base voxel. The default binary
+    ladder preserves exact 12.5 mm pitch through 25, 50, 100 and 200 mm LODs.
+    These are display reductions, not additional authoring tiers.
     """
     out = []
     for f in levels:
-        if f < 2:
+        if f < 2 or int(f) != f:
             continue
-        out.append((int(f), int(voxel_mm * f)))
+        out.append((int(f), voxel_mm * f))
     return out

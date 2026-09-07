@@ -500,7 +500,7 @@ bool UVoxelAssetBodyComponent::Build()
 					          FIntVector(Grid.originX(), Grid.originY(), Grid.originZ()), GridPitchUU,
 					          nullptr);
 					UE_LOG(LogVoxelEarth, Log,
-					       TEXT("VoxelAssetBody '%s': LOADED %s (%dx%dx%d at %u mm, origin %d,%d,%d)."),
+					       TEXT("VoxelAssetBody '%s': LOADED %s (%dx%dx%d at %.3f mm, origin %d,%d,%d)."),
 					       *AssetName, *Path, SX, SY, SZ, Grid.voxelSizeMm(), Grid.originX(),
 					       Grid.originY(), Grid.originZ());
 					return true;
@@ -520,7 +520,7 @@ bool UVoxelAssetBodyComponent::Build()
 		}
 		UE_LOG(LogVoxelEarth, Warning,
 		       TEXT("VoxelAssetBody '%s': NO .vxa FOUND. Rendering a placeholder of the same gross ")
-		       TEXT("size at %d mm so the vehicle is still flyable/floatable and photographable. ")
+		       TEXT("size at %.3f mm so the vehicle is still flyable/floatable and photographable. ")
 		       TEXT("Set voxel.AssetBody.LibraryRoot, or the actor's AssetFilePath, to point at the ")
 		       TEXT("real file. Tried:%s"),
 		       *AssetName, FallbackPitchMm, TriedList.IsEmpty() ? TEXT(" (nothing -- no name and no path set)")
@@ -535,7 +535,7 @@ bool UVoxelAssetBodyComponent::Build()
 	// differently from the asset would make every buoyancy constant tuned
 	// against it wrong twice.
 	{
-		const int32 Pitch = FMath::Max(1, FallbackPitchMm);
+		const double Pitch = FMath::Max(1.0, FallbackPitchMm);
 		const double PitchUUFallback = double(Pitch) * 0.1;
 		const double CellM = double(Pitch) * 0.001;
 		const int32 NX = FMath::Clamp(FMath::RoundToInt(FallbackSizeM.X / CellM), 2, 4096);

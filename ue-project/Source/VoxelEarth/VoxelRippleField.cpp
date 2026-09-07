@@ -1,3 +1,5 @@
+#include "VoxelWorldSubsystem.h"
+#include "VoxelFineTileStreamer.h"
 #include "VoxelRippleField.h"
 
 #include "VoxelSkySubsystem.h" // VoxelSky::kSkyCollectionPath
@@ -1582,6 +1584,10 @@ void UVoxelRippleFieldSubsystem::AutoWatch(float DeltaTime)
 			return;
 		}
 		const FVector P = Actor->GetActorLocation();
+        if(auto Terrain=World->GetSubsystem<UVoxelWorldSubsystem>())if(auto Fine=Terrain->GetFineTileStreamer()){
+            const int64 X=FMath::FloorToInt64(P.X*10.),Y=FMath::FloorToInt64(P.Y*10.);
+            if(!Fine->IsFootprintResident(X,Y,X+1,Y+1)){Watched_.Remove(Actor);return;}
+        }
 		const bool bNow = Water->IsUnderwaterAtWorld(P);
 		FWatchedActor& W = Watched_.FindOrAdd(Actor);
 		if (W.bSeen && bNow && !W.bWasSubmerged && !bFrozen)

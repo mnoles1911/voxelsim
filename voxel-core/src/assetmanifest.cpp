@@ -86,7 +86,8 @@ AssetManifestError AssetManifest::parse(const uint8_t* blob, size_t bytes) {
     clear();
     if (blob == nullptr || bytes < kVxmHeaderBytes) return AssetManifestError::kTooSmall;
     if (readU32(blob) != kVxmMagic) return AssetManifestError::kBadMagic;
-    if (readU32(blob + 4) != kVxmVersion) return AssetManifestError::kBadVersion;
+    const uint32_t version = readU32(blob + 4);
+    if (version != 2u && version != 3u) return AssetManifestError::kBadVersion;
     const uint32_t biomes = readU32(blob + 8);
     const uint32_t layers = readU32(blob + 12);
     const uint32_t count = readU32(blob + 16);
@@ -245,7 +246,7 @@ AssetManifestError AssetManifest::parse(const uint8_t* blob, size_t bytes) {
         s.waterMask = p[68];
         // p[69] is pad.
         s.seedsBaked = readU16(p + 70);
-        s.voxelSizeMm = readU32(p + 72);
+        s.voxelSizeMm = double(readU32(p + 72)) / (version == 3 ? 1000.0 : 1.0);
         for (uint32_t b = 0; b < kBiomeCount; ++b)
             s.biomeWeightPerMille[b] = readU16(p + 76 + 2 * b);
         s.abundanceQ10 = readU16(p + 96);

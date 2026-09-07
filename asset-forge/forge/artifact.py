@@ -119,7 +119,8 @@ assert all(n in materials.BY_NAME for n in materials.ARTIFACT_NAMES), (
 
 # The choice menu, mirrored, and checked the same way for the same reason: a
 # form that falls through to a default is indistinguishable from one that works.
-_FORMS = ("hull", "wing", "raft", "bamboo_raft")
+from .survival_tools import FORMS as _TOOL_FORMS
+_FORMS = ("hull", "wing", "raft", "bamboo_raft") + _TOOL_FORMS
 assert set(BY_PATH["artifact.form"].choices) == set(_FORMS), (
     "forge/spec.py: artifact.form offers a form this generator does not build")
 
@@ -646,6 +647,9 @@ def build(spec: dict, rng, voxel_m: float, out: dict | None = None) -> VoxelGrid
     elif form == "bamboo_raft":
         from .bamboo_raft import build as build_bamboo_raft
         grid = build_bamboo_raft(spec, rng, voxel_m, steps)
+    elif form in _TOOL_FORMS:
+        from .survival_tools import build as build_tool
+        grid = build_tool(spec, rng, voxel_m, steps)
     else:
         grid = _build_hull(spec, rng, voxel_m, steps)
     if out is not None:

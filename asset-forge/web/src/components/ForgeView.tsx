@@ -7,6 +7,7 @@ import { api, forgeApi } from "../lib/api";
 import type { JobProgress, Kind, TileState, UiParam, UiSchema } from "../lib/schema";
 import { CATEGORIES, CATEGORY_LABEL } from "../lib/schema";
 import { getPath, setPath } from "../lib/schema";
+import { groupLabel } from "../lib/taxonomy";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -123,7 +124,12 @@ export function ForgeView({
     ? specRow.category === "craftable"
     : world.kinds.find((k) => k.key === kind)?.category === "craftable";
   const keptIds = React.useMemo(() => new Set(world.library.map((e) => e.id)), [world.library]);
-  const specsOfKind = world.specs.filter((s) => s.kind === kind);
+  const craftGroups = [...new Set(world.specs.filter((s) => s.category === "craftable")
+    .map((s) => s.subcategory ?? "ungrouped"))].sort();
+  const craftGroup = String(spec?.subcategory ?? "ungrouped");
+  const specsOfKind = world.specs.filter((s) => category === "craftable"
+    ? s.category === category && (s.subcategory ?? "ungrouped") === craftGroup
+    : s.kind === kind && s.category === category);
 
   /* --- loading ----------------------------------------------------------- */
 
@@ -351,6 +357,26 @@ export function ForgeView({
                 ))}
               </SelectContent>
             </Select>
+            {category === "craftable" ? (
+              <Select value={craftGroup} onValueChange={async (group) => {
+                const first = world.specs.find((s) => s.category === "craftable"
+                  && (s.subcategory ?? "ungrouped") === group);
+                if (!first) return;
+                setKind(first.kind);
+                setSchema(await forgeApi.schema(first.kind));
+                await loadSpec(first.name);
+              }}>
+                <SelectTrigger aria-label="Craftable subcategory"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {craftGroups.map((group) => (
+                    <SelectItem key={group} value={group}>
+                      {groupLabel(group)} ({world.specs.filter((s) => s.category === "craftable"
+                        && (s.subcategory ?? "ungrouped") === group).length})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            ) : (
             <Select value={kind} onValueChange={(k) => void loadKind(k)}>
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -361,6 +387,7 @@ export function ForgeView({
                 ))}
               </SelectContent>
             </Select>
+            )}
           </div>
           <Select
             value={specsOfKind.some((s) => s.name === speciesName) ? speciesName : undefined}
@@ -379,7 +406,7 @@ export function ForgeView({
                 }
                 return (
                   <SelectGroup key={sub}>
-                    <SelectLabel>{sub}</SelectLabel>
+                    <SelectLabel>{groupLabel(sub)}</SelectLabel>
                     {members.map((s) => (
                       <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>
                     ))}
@@ -620,7 +647,7 @@ function WorkflowStrip({
       <Step n={3} label="Keep to library" />
       {noPlacement ? (
         <span className="font-mono text-[11px] text-parch-600">
-          · vehicles spawn as entities — no placement (ADR-0010)
+          · craftable items spawn as entities
         </span>
       ) : (<>
       <ArrowRight className="h-3.5 w-3.5 text-parch-600" />
@@ -671,7 +698,7 @@ function ParamPanel({
             {params.map((p) => (
               <ParamControl
                 key={p.path}
-                p={p}
+                p={p.choices_by_category ? {...p, choices:p.choices_by_category[String(spec.category ?? p.default_category)] ?? p.choices} : p}
                 value={getPath(spec, p.path)}
                 changed={saved != null && JSON.stringify(getPath(spec, p.path)) !== JSON.stringify(getPath(saved, p.path))}
                 onEdit={(v) => onEdit(p, v)}
@@ -728,7 +755,7 @@ function ParamControl({
           <SelectTrigger className="h-7 text-xs"><SelectValue /></SelectTrigger>
           <SelectContent>
             {p.choices.map((c) => (
-              <SelectItem key={c} value={c}>{c}</SelectItem>
+              <SelectItem key={c} value={c}>{p.path === "resolution_cm" ? `${Number(c)*10} mm` : c}</SelectItem>
             ))}
           </SelectContent>
         </Select>

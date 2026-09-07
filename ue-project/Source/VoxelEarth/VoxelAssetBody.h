@@ -168,7 +168,7 @@ public:
 	// entity pitch for the canoe and glider (D0), so the fallback has the same
 	// visual grain as the asset it stands in for.
 	UPROPERTY(EditAnywhere, Category = "Voxel Earth|Asset Body")
-	int32 FallbackPitchMm = 25;
+	double FallbackPitchMm = 25.0;
 
 	UPROPERTY(EditAnywhere, Category = "Voxel Earth|Asset Body")
 	FLinearColor PlaceholderTint = FLinearColor(0.42f, 0.28f, 0.16f, 1.f);

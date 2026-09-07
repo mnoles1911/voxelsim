@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import resolution as resolutionlib
 from . import (biomes as biomelib, categories as catlib,
                kinds as kindlib, materials)
 
@@ -249,25 +250,11 @@ PARAMS: tuple[Param, ...] = (
     # `forge.cli selftest` now trips a bogus value through EVERY choice
     # parameter in this table, this one included, every run.
     P("resolution_cm", "Voxel size", "5", kind="choice", group="general",
-      choices=("10", "5", "2.5", "2", "1"),
-      help="Edge length of one voxel, and the size the asset EXPORTS at.\n\n"
-           "THIS IS A MENU, NOT A NUMBER. A value that is not on it is not "
-           "refused — it is silently replaced with 5 and the asset builds "
-           "anyway, roughly 4.6x lighter than a 3 cm author expects. There is "
-           "no 3 cm and no 4 cm.\n\n"
-           "WHICH SIZE IS NOT A MATTER OF TASTE, it follows from the kind "
-           "(owner, 2026-08-14; see forge/kinds.py). A tree or a rock JOINS THE "
-           "WORLD'S OWN VOXEL GRID and is destructible as terrain is, so it is "
-           "authored at the terrain's 10 cm and nothing else is legal — the "
-           "selftest refuses one that is not. Everything else — bushes, ground "
-           "cover, fish, birds and land animals — is a DETAIL asset carrying "
-           "its own grid and its own transform, so its lattice is free.\n\n"
-           "For those, the rule is measured rather than chosen: the COARSEST "
-           "voxel at which the species' smallest identifying feature is still "
-           "about three voxels across. That is why the library sits where it "
-           "does — 5 cm for ground cover, 1 cm for a bird whose eye stripe is a "
-           "centimetre, 2 cm for most land animals. Previews pick their own "
-           "size to stay cheap and say so when it differs from this."),
+      choices=resolutionlib.TIERS_CM,
+      help="Supported pitches: 100, 50, 25 and 12.5 mm. Only creatures and "
+           "craftables may use 12.5 mm. Terrain-stamped trees and rocks remain "
+           "at 100 mm; other environment assets may use 100, 50 or 25 mm. "
+           "Previews may select a coarser supported tier to fit their budget."),
 
     P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.01, 12.0, 0.01, group="trunk"),
     # THE STEM HAD NO d(z) AT ALL, AND THE LIBRARY MEASURED IT.
@@ -2737,7 +2724,9 @@ PARAMS: tuple[Param, ...] = (
     # for the same reason on the same day, and the ten rows they share -- size,
     # shell thickness, seed asymmetry, the materials -- are most of the table.
     P("artifact.form", "Form", "hull", kind="choice", group="artifact",
-      kinds=("artifact",), choices=("hull", "wing", "raft", "bamboo_raft"),
+      kinds=("artifact",), choices=("hull", "wing", "raft", "bamboo_raft",
+      "flake_blade", "stone_knife", "fiber_bundle", "cordage_coil", "hammerstone",
+      "wooden_haft", "stone_axe_head", "stone_axe"),
       help="Which family of shape this is.\n\n"
            "'hull' is a lofted closed watercraft: a plan curve and a section "
            "curve swept along the length, hollowed by re-evaluating the same "
@@ -2747,11 +2736,14 @@ PARAMS: tuple[Param, ...] = (
            "width, depth the LOG DIAMETER; thwarts become the cross-poles and "
            "deck_frac places the lashing stations in from each end. "
            "'bamboo_raft' uses hollow, jointed bamboo poles, crossbars and "
-           "two posts; frame_drop_m sets post height above the deck.\n\n"
+           "two posts; frame_drop_m sets post height above the deck. "
+           "Survival tool forms use length, beam and depth as their authoring "
+           "bounds; hull/frame/trim/strake materials control stone, wood, "
+           "cordage and weathering. Boat-specific settings do not apply.\n\n"
            "THIS IS A MENU. A value that is not on it is not refused, it is "
            "replaced with 'hull' -- so a glider spec with a typo here builds a "
            "boat out of a glider's numbers and nothing downstream says so."),
-    P("artifact.length_m", "Length (m)", 4.0, 0.3, 30.0, 0.05, group="artifact",
+    P("artifact.length_m", "Length (m)", 4.0, 0.1, 30.0, 0.05, group="artifact",
       kinds=("artifact",),
       help="Fore-and-aft size. For a hull this is length overall, stem to "
            "stern. For a wing it is the ROOT CHORD -- nose to the trailing "
@@ -3035,6 +3027,9 @@ def validate(spec: dict) -> tuple[dict, Report]:
         raw = get(spec, p.path, _MISSING)
         if raw is _MISSING:
             continue
+        if p.path == "resolution_cm":
+            set_(out,p.path,raw)
+            continue
         try:
             val = _coerce(p, raw)
         except (TypeError, ValueError):
@@ -3112,6 +3107,11 @@ def validate(spec: dict) -> tuple[dict, Report]:
         cleaned = _clean_subcategory(spec["subcategory"], rep)
         if cleaned is not None:
             out["subcategory"] = cleaned
+    prior_pitch = get(out,"resolution_cm")
+    pitch = resolutionlib.normalize(out,prior_pitch)
+    if str(prior_pitch) != pitch and "resolution_cm" in spec:
+        rep.warnings.append(f"resolution_cm: {prior_pitch!r} changed to {pitch} cm under the supported pitch policy")
+    set_(out,"resolution_cm",pitch)
     # Cross-checks with the consequence named: these are the two ways an
     # authored block quietly does less than it reads as doing.
     if "biome_allow" in out:
@@ -3831,7 +3831,10 @@ def ui_schema(kind: str | None = None) -> list[dict]:
             "lo": p.lo,
             "hi": p.hi,
             "step": p.step,
-            "choices": list(p.choices),
+            "choices": list(resolutionlib.allowed({"kind":kind})) if p.path=="resolution_cm" and kind else list(p.choices),
+            **({"default_category":catlib.BY_KIND.get(kind or "tree"),
+                "choices_by_category":{c:list(resolutionlib.allowed({"kind":kind or "tree","category":c})) for c in ("environment","creature","craftable")}}
+               if p.path=="resolution_cm" else {}),
             "group": p.group,
             "help": p.help,
         }

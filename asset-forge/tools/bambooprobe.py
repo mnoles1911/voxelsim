@@ -43,7 +43,7 @@ def export_obj(grid, path):
             f.write(f'newmtl voxel_{mat}\nKd {rgb[0]:.5f} {rgb[1]:.5f} {rgb[2]:.5f}\nKs 0 0 0\nd 1\nillum 1\n\n')
     count = 0
     with path.open('w', encoding='utf-8') as f:
-        f.write(f'# 25 mm cubic voxel surface, metres, Z up\nmtllib {mtl.name}\ns off\n')
+        f.write(f'# {grid.voxel_m*1000:g} mm cubic voxel surface, metres, Z up\nmtllib {mtl.name}\ns off\n')
         for mat, quads in sorted(groups.items()):
             f.write(f'usemtl voxel_{mat}\n')
             for quad in quads:

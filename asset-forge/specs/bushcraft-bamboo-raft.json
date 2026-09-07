@@ -118,14 +118,11 @@
     "squash": 1.0
   },
   "curation": {
-    "notes": "New reference-inspired bamboo raft; no human keep verdict yet.",
+    "notes": "Reference-inspired bamboo raft seed 1 approved by Matt and kept in the library on 2026-09-06.",
     "seeds": [
-      1,
-      2,
-      3,
-      4
+      1
     ],
-    "status": "draft"
+    "status": "approved"
   },
   "detail": {
     "depth_max_m": 6.0,
@@ -448,6 +445,7 @@
     "outer": 0.7,
     "spread": 0.18
   },
+  "subcategory": "vehicles",
   "trunk": {
     "buttress": 0.0,
     "clear_frac": 0.35,

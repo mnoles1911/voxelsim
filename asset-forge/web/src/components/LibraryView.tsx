@@ -5,6 +5,7 @@ import type { SpeciesRow } from "../lib/schema";
 import { CATEGORIES, CATEGORY_LABEL } from "../lib/schema";
 import { allowedBiomes } from "../lib/schema";
 import { api } from "../lib/api";
+import { groupLabel } from "../lib/taxonomy";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -65,6 +66,8 @@ export function LibraryView({
       if (kind !== "all") {
         if (kind.startsWith("cat:")) {
           if (s.category !== kind.slice(4)) return false;
+        } else if (kind.startsWith("craft:")) {
+          if (s.category !== "craftable" || (s.subcategory ?? "ungrouped") !== kind.slice(6)) return false;
         } else if (s.kind !== kind) return false;
       }
       if (status !== "all") {
@@ -139,7 +142,11 @@ export function LibraryView({
                   return (
                     <SelectGroup key={c}>
                       <SelectLabel>{CATEGORY_LABEL[c] ?? c}</SelectLabel>
-                      {members.map((k) => (
+                      {c === "craftable" ? [...new Set(world.specs
+                        .filter((s) => s.category === c).map((s) => s.subcategory ?? "ungrouped"))]
+                        .sort().map((sub) => (
+                          <SelectItem key={sub} value={"craft:" + sub}>{groupLabel(sub)}</SelectItem>
+                        )) : members.map((k) => (
                         <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
                       ))}
                     </SelectGroup>
@@ -278,7 +285,7 @@ function SpeciesLine({
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm text-parch-100">{row.name}</div>
         <div className="truncate font-mono text-[11px] text-parch-500">
-          {row.size_m.toFixed(1)} m
+          {row.subcategory && groupLabel(row.subcategory) + " · "}{row.size_m.toFixed(1)} m
           {/* biome text is placement-derived: absent for vehicles (owner
             * directive 2026-09-05) -- 'nowhere' on a canoe reads as a bug */}
           {row.category !== "craftable" &&

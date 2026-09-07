@@ -588,7 +588,7 @@ def cmd_selftest(args) -> int:
             off.append(f"{p.stem}: unreadable ({e})")
             continue
         k = kinds.BY_KEY.get(specmod.get(s, "kind"))
-        if k is None or k.lattice != "terrain":
+        if k is None or k.lattice != "terrain" or specmod.resolutionlib.categories.of(s) != "environment":
             continue
         cm = float(specmod.get(s, "resolution_cm"))
         if cm != kinds.TERRAIN_LATTICE_CM:
@@ -805,7 +805,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--out")
     g.add_argument("--px", type=int, default=640)
-    g.add_argument("--res", help="voxel size in cm; overrides the spec (e.g. --res 2)")
+    g.add_argument("--res", help="voxel size in cm; overrides the spec (e.g. --res 1.25)")
     g.set_defaults(fn=cmd_gen)
 
     b = sub.add_parser("batch", help="generate many seeds and a contact sheet")

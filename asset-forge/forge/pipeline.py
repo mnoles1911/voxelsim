@@ -23,6 +23,7 @@ import numpy as np
 from . import (artifact as artifactlib, bird as birdlib, envelope,
                fish as fishlib, ground as groundlib, materials,
                quadruped as quadlib, rasterize, rock as rocklib)
+from . import resolution as resolutionlib
 from . import parts as partslib
 from .grid import VoxelGrid, dense_bytes, ground_band
 from .skeleton import Skeleton, add_roots, add_strands, grow, grow_frond, grow_whorl
@@ -116,7 +117,7 @@ class GridTooLarge(RuntimeError):
 
 def resolution_m(spec: dict, override=None) -> float:
     """Metres per voxel for this build. `override` wins, for coarse previews."""
-    cm = float(override) if override else float(get(spec, "resolution_cm"))
+    cm = resolutionlib.require(spec, override if override is not None else get(spec, "resolution_cm"))
     return cm / 100.0
 
 
@@ -363,9 +364,16 @@ def rng_for(spec: dict, seed: int) -> np.random.Generator:
 
 
 def build(spec: dict, seed: int, *, connectivity: bool = True,
-          resolution_cm=None) -> Tree:
+          resolution_cm=None, environment_lod_prototype: bool = False) -> Tree:
     t0 = time.perf_counter()
-    voxel_m = resolution_m(spec, resolution_cm)
+    if environment_lod_prototype:
+        # Offline experimental sources only. Production admission and the UI
+        # retain the terrain pitch contract; do not reclassify a tree as an item.
+        if spec.get('kind') not in ('tree', 'rock', 'bush', 'flower') or resolution_cm not in (2.5, 5):
+            raise ValueError('Environment LOD prototype requires an environment kind at 25 or 50 mm')
+        voxel_m = float(resolution_cm) / 100
+    else:
+        voxel_m = resolution_m(spec, resolution_cm)
     rng = rng_for(spec, seed)
 
     # Pick this individual out of the species before growing it, so two seeds

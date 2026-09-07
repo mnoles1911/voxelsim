@@ -155,4 +155,46 @@ CraftChunkResult produceCraftChunk(const CraftLattice<B>& lattice, const BrickKe
     return out;
 }
 
+// A region owns one (25 mm) or eight (12.5 mm) canonical GPU pages.
+// Publish this complete result atomically with the terrain supersede record.
+struct CraftPage {
+    BrickKey pageKey; // GLOBAL 32-cell page coordinates, distinct from owner key
+    ChunkBrickPack pack;
+};
+struct CraftRegionPages {
+    bool produced = false;
+    uint32_t pitchUm = 0;
+    BrickKey owner;
+    std::vector<CraftPage> pages; // includes all-air pages; absence is not air
+};
+template<int B, int Refinement>
+CraftRegionPages produceCraftRegionPages(const CraftLattice<B,Refinement>& lattice,
+                                         const BrickKey& owner, CraftProducerCounters& counters) {
+    using L=CraftLayout<Refinement>;
+    CraftRegionPages result;
+    result.owner=owner; result.pitchUm=L::kCraftPitchUm;
+    if(!lattice.isPromoted(owner)) { ++counters.refusedNotPromoted; return result; }
+    const auto base=L::craftBrickBaseOfTerrainBrick(owner);
+    std::vector<const Brick<8>*> bricks;
+    for(int z=0;z<L::kCraftBricksPerAxis;++z) for(int y=0;y<L::kCraftBricksPerAxis;++y) for(int x=0;x<L::kCraftBricksPerAxis;++x) {
+        const auto* b=lattice.craftBricks().find({base.x+x,base.y+y,base.z+z});
+        if(!b) { ++counters.refusedMissingBrick; return result; }
+        bricks.push_back(b);
+    }
+    for(int pz=0;pz<L::kPagesPerAxis;++pz) for(int py=0;py<L::kPagesPerAxis;++py) for(int px=0;px<L::kPagesPerAxis;++px) {
+        ++counters.chunksAttempted;
+        auto pack=packChunkBricksCanonical([&](int x,int y,int z) {
+            x+=px*32;y+=py*32;z+=pz*32;
+            const int e=L::kCraftBricksPerAxis;
+            return bricks[x/8+e*(y/8+e*(z/8))]->get(x%8,y%8,z%8);
+        });
+        if(pack.anySolid) ++counters.chunksWithSolid;
+        ++counters.chunksProduced;
+        result.pages.push_back({{owner.x*L::kPagesPerAxis+px,owner.y*L::kPagesPerAxis+py,owner.z*L::kPagesPerAxis+pz},std::move(pack)});
+    }
+    for(const auto* b:bricks) counters.solidCellsPacked.fetch_add(b->solidCount());
+    result.produced=true;
+    return result;
+}
+
 } // namespace vxc

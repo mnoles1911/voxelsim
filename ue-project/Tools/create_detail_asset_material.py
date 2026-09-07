@@ -21,8 +21,10 @@ precision trade: sRGB spends its code points perceptually, so dark foliage
 greens survive quantisation.
 
 Everything else follows M_VoxelTerrain's conventions where they transfer:
-Roughness constant 0.9, one-sided (absolute quad winding is the same proven
-convention FVoxelChunkSceneProxy uses -- the subsystem copies it), Opaque.
+Roughness constant 0.9, now masked and two-sided (absolute quad winding is the same proven
+convention FVoxelChunkSceneProxy uses -- the subsystem copies it).
+UV1 and vertex alpha now carry wind metadata; the shared vegetation helper
+adds weather-driven motion and cutout leaves.
 No DebugTint, no ring fades, no biome graph: a 5 cm tuft is drawn only inside
 a ~112 m ring, entirely within R0, so there is no LOD seam to dither across.
 
@@ -36,6 +38,7 @@ Run via (one editor per box -- do not run while another editor is up):
 """
 
 import unreal
+from vegetation_material_common import add_vegetation
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelDetailAsset"
@@ -45,15 +48,16 @@ FULL_PATH = PACKAGE_PATH + "/" + MATERIAL_NAME
 def main():
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 
-    if unreal.EditorAssetLibrary.does_asset_exist(FULL_PATH):
-        unreal.EditorAssetLibrary.delete_asset(FULL_PATH)
-
-    factory = unreal.MaterialFactoryNew()
-    material = asset_tools.create_asset(MATERIAL_NAME, PACKAGE_PATH, unreal.Material, factory)
+    material = unreal.load_asset(FULL_PATH)
+    if material is None:
+        material = asset_tools.create_asset(MATERIAL_NAME, PACKAGE_PATH, unreal.Material, unreal.MaterialFactoryNew())
+    else:
+        unreal.MaterialEditingLibrary.delete_all_material_expressions(material)
     if material is None:
         raise RuntimeError("Failed to create material asset at " + FULL_PATH)
 
     mel = unreal.MaterialEditingLibrary
+    material.set_editor_property("used_with_instanced_static_meshes", True)
 
     vertex_color = mel.create_material_expression(
         material, unreal.MaterialExpressionVertexColor, -500, -50)
@@ -77,6 +81,7 @@ def main():
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness failed")
 
+    add_vegetation(material, vertex_color)
     mel.layout_material_expressions(material)
     mel.recompile_material(material)
 

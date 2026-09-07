@@ -448,6 +448,7 @@
     "outer": 0.7,
     "spread": 0.18
   },
+  "subcategory": "vehicles",
   "trunk": {
     "buttress": 0.0,
     "clear_frac": 0.35,

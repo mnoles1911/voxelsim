@@ -56,24 +56,25 @@ def build(spec, rng, voxel_m, steps):
     dark = materials.MAT_BEAK_HORN
     pale = materials.MAT_PLUME_BUFF
 
-    count = max(3, int(round(B / D)))
+    count = max(3, int(round(B / (D * 0.9))))
     radii = D / 2 * rng.uniform(0.76, 1.24, count)
     ys = np.zeros(count)
     for i in range(1, count):
-        ys[i] = ys[i - 1] + 0.85 * (radii[i - 1] + radii[i])
+        ys[i] = ys[i - 1] + 0.97 * (radii[i - 1] + radii[i])
     scale = B / (ys[-1] + radii[0] + radii[-1])
     radii *= scale
     ys *= scale
     ys -= (ys[-1] + radii[-1] - radii[0]) / 2
     # Per-log histories: mostly debarked, bark-rich, and older silvered wood.
-    histories = rng.permutation(np.linspace(0.23, 0.77, count))
+    histories = rng.permutation(np.linspace(0.25, 0.53, count))
+    histories[2 % count] = 0.68
     logs = []
     for i in range(count):
         logs.append(dict(y=ys[i], r=radii[i],
-                         z=D - radii[i] + rng.uniform(-0.01, 0.01),
-                         taper=rng.uniform(0.065, 0.14) * (-1 if i % 2 else 1),
+                         z=D * 0.49 + rng.uniform(-0.014, 0.014),
+                         taper=rng.uniform(0.04, 0.085) * (-1 if i % 2 else 1),
                          bow=rng.uniform(-0.025, 0.025),
-                         oval=rng.uniform(0.92, 1.06),
+                         oval=rng.uniform(0.98, 1.10),
                          phase=rng.uniform(0, 6.28),
                          x0=rng.uniform(-stagger, stagger),
                          x1=L + rng.uniform(-stagger, stagger),
@@ -124,11 +125,15 @@ def build(spec, rng, voxel_m, steps):
             salt = log['salt']
             # Long but finite patches, broken by a second scale. The field is
             # sampled on a cylinder in 3D, avoiding a stripe at theta=+-pi.
-            patches = _noise(xg / 0.48, u * 2.6, v * 2.6, salt)
-            flakes = _noise(xg / 0.14, u * 6, v * 6, salt + 31)
+            patches = _noise(xg / 0.78, u * 2.6, v * 2.6, salt)
+            flakes = _noise(xg / 0.23, u * 6, v * 6, salt + 31)
             boundary = 0.73 * patches + 0.27 * flakes
             bark_on = boundary > log['history']
-            rough = (flakes - 0.5) * voxel_m * 1.1
+            # Spruce-like bark plates run with the trunk; narrow furrows are
+            # interrupted by finite axial patches, rather than zebra bands.
+            furrows = np.sin(theta * 17 + 0.7 * np.sin(xg * 2.2 + log['phase']))
+            rough = (flakes - 0.5) * voxel_m * 0.65
+            rough = rough - bark_on * (furrows > 0.82) * voxel_m * 0.30
             radius = r + rough + bark_on * voxel_m * 0.42
             knot_masks = []
             for kx, angle, kr in log['knots']:
@@ -154,9 +159,9 @@ def build(spec, rng, voxel_m, steps):
             _paint(local_grid, mask, wood)
             silver = patches + 0.16 * v > 0.69 - 0.35 * age
             _paint(local_grid, mask & surface & silver, weathered)
-            _paint(local_grid, mask & surface & ~bark_on & (patches < 0.39), pale)
+            _paint(local_grid, mask & surface & ~bark_on & (patches < 0.33), pale)
             _paint(local_grid, mask & surface & bark_on, bark)
-            _paint(local_grid, mask & surface & bark_on & (flakes < 0.38), dark)
+            _paint(local_grid, mask & surface & bark_on & (furrows > 0.74) & (flakes < 0.62), dark)
             # Fresh scrapes at the ragged boundary, not outlines round every patch.
             peel_edge = (np.abs(boundary - log['history']) < 0.035) & (flakes > 0.67)
             _paint(local_grid, mask & surface & peel_edge, wood)
@@ -178,7 +183,7 @@ def build(spec, rng, voxel_m, steps):
               note=f"{count} independently tapered, bowed logs; ragged bark islands, branch collars, split ends")
 
     # Crosspieces follow gently wandering centre fields, seated into the timber.
-    pole_z = D + 0.015
+    pole_z = D - 0.005
     def pole_x(xk, y):
         return xk + 0.018 * np.sin(y * 2.8 + xk)
 
@@ -188,10 +193,10 @@ def build(spec, rng, voxel_m, steps):
                 xp = pole_x(xk, Y)
                 rr = pole_r * (1 + 0.14 * Y / B)
                 tube = ((X - xp) ** 2 + (Z - pole_z) ** 2 <= rr ** 2) & (np.abs(Y) <= B / 2 + voxel_m)
-                _paint(grid, tube, wood)
+                _paint(grid, tube, weathered)
                 patch = _noise(X * 8, Y * 4, Z * 8, 711 + k)
-                _paint(grid, tube & (patch > 0.59), bark)
-                _paint(grid, tube & (patch < 0.30), pale)
+                _paint(grid, tube & (patch > 0.47), bark)
+                _paint(grid, tube & (patch < 0.26), wood)
         steps.run("cross-poles", grid, draw_poles, note="two irregular partly peeled poles" if n_poles == 2 else f"{n_poles} poles")
 
         def vx(x, y, z):
@@ -216,6 +221,13 @@ def build(spec, rng, voxel_m, steps):
                     pts = [vx(xp - 2.5 * voxel_m, cy, z),
                            vx(xp + 2.5 * voxel_m, cy + voxel_m, z),
                            vx(xp + 4 * voxel_m, cy + 2 * voxel_m, D)]
+                    _polyline(grid, pts, rope_r / voxel_m, rope)
+                    # A second binding across the three load-bearing turns
+                    # reads as a compact tightened knot, with its tail laid
+                    # down against the pole rather than floating above it.
+                    pts = [vx(xp - 2.6 * voxel_m, cy - voxel_m, z),
+                           vx(xp, cy - 1.5 * voxel_m, z + voxel_m * 0.55),
+                           vx(xp + 2.6 * voxel_m, cy - voxel_m, z)]
                     _polyline(grid, pts, rope_r / voxel_m, rope)
         steps.run("rope turns and knots", grid, draw_rope,
                   note=f"{len(stations) * count} crossings, three turns and a short tied tail")

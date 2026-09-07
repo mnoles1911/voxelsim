@@ -188,7 +188,7 @@ struct AssetLayer {
 //
 // `voxelSizeMm` is AssetGrid::voxelSizeMm() -- the size the asset was actually
 // baked at, read out of the VXA header, not the size anybody believes it was.
-inline bool assetLayerAdmitsVoxelSize(const AssetLayer& layer, uint32_t voxelSizeMm) {
+inline bool assetLayerAdmitsVoxelSize(const AssetLayer& layer, double voxelSizeMm) {
     if (voxelSizeMm == 0) return false;
     return layer.terrainLattice ? (voxelSizeMm == uint32_t(kVoxelSizeMm))
                                 : (voxelSizeMm != uint32_t(kVoxelSizeMm));

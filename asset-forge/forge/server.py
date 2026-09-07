@@ -67,7 +67,7 @@ PREVIEW_CM = float(os.environ.get("ASSET_FORGE_PREVIEW_CM", "10"))   # coarsest 
 
 # The tiers a preview may land on, finest first. Authored resolutions coarser
 # than a tier are never refined up to it.
-PREVIEW_TIERS = (1.0, 2.0, 2.5, 5.0, 10.0)
+PREVIEW_TIERS = (1.25, 2.5, 5.0, 10.0)
 
 # Ceiling on instances sent to the browser's 3D viewer. Above this the voxels
 # are thinned by a fixed stride -- a 2 cm emergent has tens of millions of
@@ -264,13 +264,16 @@ def _finest_within(spec: dict, budget: float, weight: float) -> float:
     the browser has to draw.
     """
     authored = float(specmod.get(spec, "resolution_cm"))
+    from . import resolution as resolutionlib
     for cm in PREVIEW_TIERS:
+        if cm not in map(float,resolutionlib.allowed(spec)):
+            continue
         if cm < authored:
             continue
         nx, ny, nz = render.predicted_extent(spec, cm / 100.0)
         if nx * ny * nz * weight <= budget:
             return cm
-    return max(PREVIEW_CM, authored)
+    return 10.0
 
 
 def preview_resolution(spec: dict) -> float:
@@ -606,8 +609,10 @@ def import_asset(name: str, kind: str, grid, source_format: str) -> dict:
     is no (spec, seed) that regenerates it, so routes that rebuild from the
     spec serve the stored files instead.
     """
+    specmod.resolutionlib.require({"kind":kind},grid.voxel_m*100)
     spec, _ = specmod.validate({
         "name": name, "kind": kind,
+        "resolution_cm": f"{grid.voxel_m*100:g}",
         "notes": f"imported from an outside 3D source ({source_format})",
     })
     entry_id = f"{name}-0001"
@@ -649,7 +654,7 @@ def import_asset(name: str, kind: str, grid, source_format: str) -> dict:
     return meta
 
 
-def grid_from_vox(blob: bytes, voxel_mm: int):
+def grid_from_vox(blob: bytes, voxel_mm: float):
     """A MagicaVoxel .vox (first model) as a VoxelGrid.
 
     Colours snap to the nearest forge material colour -- imports keep their
@@ -803,6 +808,7 @@ class Handler(BaseHTTPRequestHandler):
                  # `forge.categories.of` -- one resolver, so the kind bar and
                  # the species list cannot disagree.
                  "category": catlib.BY_KIND.get(k.key),
+                 "voxel_pitches_mm": [float(c)*10 for c in specmod.resolutionlib.allowed({"kind":k.key})],
                  "species": sum(1 for _, s in self._all_specs()
                                 if specmod.get(s, "kind") == k.key)}
                 for k in kindlib.KINDS
@@ -1474,15 +1480,18 @@ class Handler(BaseHTTPRequestHandler):
                         if tmp:
                             os.unlink(tmp)
                 elif fmt == "vox":
-                    voxel_mm = int(body.get("voxel_mm", 100))
-                    if not (10 <= voxel_mm <= 1000):
-                        return self._json({"error": "voxel_mm must be 10-1000"}, 400)
+                    voxel_mm = float(body.get("voxel_mm", 100))
+                    if voxel_mm not in [float(c)*10 for c in specmod.resolutionlib.allowed({"kind":kind})]:
+                        return self._json({"error": "voxel_mm must be one of the supported pitches for this kind"}, 400)
                     grid = grid_from_vox(blob, voxel_mm)
                 else:
                     return self._json({"error": "format must be 'vox' or 'vxa'"}, 400)
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
-            return self._json(import_asset(name, kind, grid, fmt))
+            try:
+                return self._json(import_asset(name, kind, grid, fmt))
+            except ValueError as e:
+                return self._json({"error":str(e)},400)
 
         return self._json({"error": "no such route"}, 404)
 

@@ -1,4 +1,7 @@
 #include "VoxelWorldSubsystem.h"
+#include "VoxelDetachedPersistence.h"
+#include "VoxelSaveJobs.h"
+#include "VoxelEnvironmentLODPrototype.h"
 
 #include "VoxelChunkComponent.h"
 // MeshChunkBricks + ERingSkirtFace used to live in this file's anonymous
@@ -9957,6 +9960,7 @@ struct FVoxelWorldImpl
 	// out of the local EditsByBrick map, so it reflects exactly what this
 	// call wrote to the overlay.
 	bool TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, FEditsByBrick* OutPredicted = nullptr);
+	bool GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const;
 	bool TryPlace(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, uint8 MaterialId,
 	              const FVector& PlayerActorLocation, FEditsByBrick* OutPredicted = nullptr);
 
@@ -30814,14 +30818,8 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 		}
 	}
 
-	// Cosmetic debris bodies: only where there is something to look at. A
-	// dedicated server has already done the authoritative half above (the
-	// voxels ARE gone from the grid and those removals replicate); it just
-	// spawns no Chaos body, so there is nothing here that could desync.
-	if (World.GetNetMode() == NM_DedicatedServer)
-	{
-		return;
-	}
+	// Persistent detached bodies now live on the authority, including dedicated
+	// servers; the object replication subsystem publishes their geometry/motion.
 
 	// --- Debris caps (docs/status.md "Structural collapse (M5, large-edit)") -
 	// A chop detaches one canopy; a large collapse can shatter into dozens of
@@ -30945,8 +30943,9 @@ bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
 // default location, and UVoxelWorldSubsystem::SaveWorld still writes there, so
 // the autosave-on-shutdown and voxel.SaveWorld behaviour that predates the
 // front end is untouched.
-bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
+bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path, UWorld* World)
 {
+	VoxelSaveJobs::Drain();
 	const vxc::EditLog& Log = Impl.Voxels.log();
 	const vxc::EditLog Compacted = vxc::compactLog(Log);
 	const bool bUseCompacted = Log.size() > 2 * Compacted.size();
@@ -30962,6 +30961,7 @@ bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
 	}
 
 	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), /*Tree*/ true);
+	if (!VoxelDetachedPersistence::Save(World, Path, OutBytes)) return false;
 
 	if (!WriteBytesAtomic(Path, OutBytes))
 	{
@@ -30991,7 +30991,7 @@ bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
 // rather than at the seed-derived location. GetWorldSaveFilePath(Seed) is
 // still that default location and is what the suppressed-front-end arm
 // passes, so the pre-front-end behaviour is unchanged.
-void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
+void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path, UWorld* World)
 {
 	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelNoLoad")))
 	{
@@ -31070,6 +31070,7 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 	// from edits has to be rebuilt explicitly, or a reloaded world streams as
 	// if it had never been dug.
 	Impl.RebuildEditedFootprintsFromOverlay();
+	VoxelDetachedPersistence::LoadAsync(World, Path, Bytes);
 }
 } // namespace
 
@@ -31245,6 +31246,12 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	int32 FineRingRadius = -1; // <0 => leave the streamer's own default
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), FineRingRadius);
 
+    // Explicit transport/automation fixture; avoids depending on baked tiles
+    // for an intentionally unique test seed. Ordinary launches keep their tier.
+    if(FParse::Param(FCommandLine::Get(),TEXT("VoxelSyntheticTerrain"))){
+        TileDir.Reset();FineTileDir.Reset();
+        UE_LOG(LogVoxelEarth,Log,TEXT("VoxelSyntheticTerrain: explicit synthetic test world (no tile caches)"));
+    }
 	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes,
 	                                   FineRingRadius);
 }
@@ -31612,7 +31619,15 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// Suppressed-front-end arm: identical order and identical point to the
 	// behaviour that predates the front end. The ~40 self-driving verification
 	// switches all land here.
-	StartWorldSession(GetWorldSaveFilePath(Seed));
+	if(FParse::Param(FCommandLine::Get(),TEXT("VoxelDetachedRestoreProbe")))
+	{
+		// Keep the verification run's shutdown autosave out of the player's save.
+		VoxelSave::SetActiveSlug(TEXT("detached-restore-probe"));
+		const FString ProbePath=FParse::Param(FCommandLine::Get(),TEXT("VoxelAsyncRestoreProbe"))
+			?VoxelSave::WorldLogPath(TEXT("async_save_verification")):FPaths::ProjectSavedDir()/TEXT("Tests/detached-roundtrip.vxlog");
+		StartWorldSession(ProbePath);
+	}
+	else StartWorldSession(GetWorldSaveFilePath(Seed));
 }
 
 void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
@@ -31643,7 +31658,7 @@ void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
 	// reply instead (see AVoxelEarthPlayerController::ServerRequestJoinSync).
 	if (World->GetNetMode() != NM_Client && !EditLogPathOrEmpty.IsEmpty())
 	{
-		LoadEditLogFromPath(*Impl, EditLogPathOrEmpty);
+		LoadEditLogFromPath(*Impl, EditLogPathOrEmpty, World);
 	}
 
 	// M3 wave 1 (docs/m3-plan.md): a dedicated server has no viewport and never
@@ -32268,6 +32283,25 @@ TStatId UVoxelWorldSubsystem::GetStatId() const
 // whatever the edit newly appended to every client. NM_Client predicts
 // locally and forwards the intent to the server instead of applying
 // authoritatively (see TryDigReplica above).
+bool UVoxelWorldSubsystem::GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const
+{
+	if (!Impl || CameraDirection.IsNearlyZero()) return false;
+	if (VoxelEnvironmentLODPrototype::GetDigPreview(GetWorld(), CameraLocation, CameraDirection.GetSafeNormal(), SizeVoxels, OutBounds)) return true;
+	return Impl->GetDigPreview(CameraLocation, CameraDirection, SizeVoxels, OutBounds);
+}
+
+bool FVoxelWorldImpl::GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const
+{
+	const auto Hit = CastFromCamera(CameraLocation, CameraDirection.GetSafeNormal());
+	if (!Hit.hit) return false;
+	const int32 N = FMath::Clamp(SizeVoxels, UVoxelWorldSubsystem::MinCubeSizeVoxels, UVoxelWorldSubsystem::MaxCubeSizeVoxels);
+	int64 X, Y, Z;
+	ComputeCubeMinCorner(Hit.vx, Hit.vy, Hit.vz, Hit.faceAxis, Hit.faceSign, N, X, Y, Z);
+	const FVector Min = FVector(double(X), double(Y), double(Z)) * VoxelCoords::VoxelSizeUU;
+	OutBounds = FBox(Min, Min + FVector(N * VoxelCoords::VoxelSizeUU));
+	return true;
+}
+
 bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels)
 {
 	if (!Impl)
@@ -32281,6 +32315,8 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 	{
 		return World ? TryDigReplica(*Impl, *World, CameraWorldLocation, CameraWorldDirection, SizeVoxels) : false;
 	}
+
+	if (VoxelEnvironmentLODPrototype::TryDig(World, CameraWorldLocation, CameraWorldDirection, SizeVoxels)) return true;
 
 	FEditsByBrick DugCells;
 	const bool bApplied = Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels, &DugCells);
@@ -32687,7 +32723,8 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 	// Overlay-aware (World::materialAt, not GeneratedWorld::materialAt): a
 	// dug voxel must read back as non-solid immediately, and a placed one as
 	// solid, for walk-mode collision to agree with what dig/place just did.
-	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR;
+	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR ||
+        VoxelEnvironmentLODPrototype::IsSolid(GetWorld(), FVector((Vx+.5)*10.,(Vy+.5)*10.,(Vz+.5)*10.));
 }
 
 void UVoxelWorldSubsystem::SetFluidTerrainDirtyListener(
@@ -33112,7 +33149,7 @@ bool UVoxelWorldSubsystem::SaveWorld() const
 		       TEXT("SaveWorld: refused on NM_Client -- only the authority (server/listen/standalone) has a log to save."));
 		return false;
 	}
-	return SaveEditLogToPath(*Impl, GetWorldSaveFilePath(Seed));
+	return SaveEditLogToPath(*Impl, GetWorldSaveFilePath(Seed), GetWorld());
 }
 
 bool UVoxelWorldSubsystem::SaveWorldToPath(const FString& Path) const
@@ -33133,7 +33170,23 @@ bool UVoxelWorldSubsystem::SaveWorldToPath(const FString& Path) const
 			return false;
 		}
 	}
-	return SaveEditLogToPath(*Impl, Path);
+	return SaveEditLogToPath(*Impl, Path, GetWorld());
+}
+
+bool UVoxelWorldSubsystem::CaptureSaveSnapshot(TArray<uint8>& Terrain,TArray<uint8>& Detached) const
+{
+    return CaptureTerrainSnapshot(Terrain)&&VoxelDetachedPersistence::CapturePayload(GetWorld(),Detached);
+}
+bool UVoxelWorldSubsystem::CaptureTerrainSnapshot(TArray<uint8>& Terrain) const
+{
+	check(IsInGameThread());
+	if(!Impl||!GetWorld()||GetWorld()->GetNetMode()==NM_Client)return false;
+	const auto& Log=Impl->Voxels.log();const auto Compacted=vxc::compactLog(Log);
+	std::vector<uint8_t> Bytes;(Log.size()>2*Compacted.size()?Compacted:Log).serialize(Bytes);
+	if(Bytes.size()>MAX_int32)return false;
+	Terrain.SetNumUninitialized(int32(Bytes.size()));
+	if(!Bytes.empty())FMemory::Memcpy(Terrain.GetData(),Bytes.data(),Bytes.size());
+	return true;
 }
 
 namespace

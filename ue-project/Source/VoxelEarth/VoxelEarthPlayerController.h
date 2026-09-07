@@ -94,6 +94,18 @@ public:
 	UFUNCTION(Client, Reliable)
 	void ClientReceiveJoinSyncChunk(const TArray<uint8>& Bytes, bool bFinal);
 
+	// Detached geometry is paced by the world replication subsystem on this
+	// connection's owned channel, including a complete snapshot on late join.
+	UFUNCTION(Client, Reliable)
+	void ClientReceiveDetachedPacket(const TArray<uint8>& Bytes);
+	UFUNCTION(Client, Unreliable)
+	void ClientReceiveDetachedMotion(const TArray<uint8>& Bytes);
+	UFUNCTION(Server, Reliable)
+	void ServerAcknowledgeDetachedPacket(uint32 Sequence, bool Accepted);
+	bool RequestChop(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels);
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerSubmitChopIntent(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels);
+
 private:
 	// M3 wave 2 "Validation hardening" (docs/m3-plan.md): per-connection
 	// token-bucket rate cap shared by every ServerSubmit*Intent handler
@@ -108,6 +120,7 @@ private:
 	bool TryConsumeIntentToken(const TCHAR* IntentName);
 	double IntentTokens = 0.0;
 	double LastIntentTokenRefillSeconds = -1.0;
+	double LastChopSeconds = -1.0;
 
 	void OnDig();
 	void OnPlace();
@@ -135,7 +148,7 @@ private:
 
 	void SelectDigSize1();
 	void SelectDigSize2();
-	void SelectDigSize4();
+	void SelectDigSize3();
 
 	// Creative placement palette cycle (m1-plan.md "Place" row): rock -> soil
 	// -> sand -> rock ...
@@ -186,7 +199,7 @@ private:
 	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Items")
 	TObjectPtr<class UVoxelInventoryComponent> Inventory;
 
-	int32 DigSizeVoxels = 1;
+	int32 DigSizeVoxels = 3;
 
 	// vxc::MAT_ROCK == 2 (voxelcore/core.h); kept as a numeric literal here
 	// since this UHT-parsed header must stay voxel-core-free by doctrine.

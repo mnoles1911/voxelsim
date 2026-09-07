@@ -50,6 +50,7 @@ export interface Kind {
   label: string;
   blurb: string;
   ready: boolean;
+  voxel_pitches_mm: number[];
   species: number;
   /** The kind's DEFAULT category. A spec may override it -- read
    *  SpeciesRow.category for the per-species answer. */
@@ -292,6 +293,8 @@ export interface RulesDoc {
  * GENERATED from these -- never hand-written per kind -- so a new kind's
  * sliders appear the moment its generator lands server-side. */
 export interface UiParam {
+  choices_by_category?: Record<string, string[]>;
+  default_category?: string;
   path: string; // dotted path into the spec
   label: string;
   kind: "float" | "int" | "bool" | "choice" | "text";
@@ -329,6 +332,7 @@ export function setPath(obj: Record<string, unknown>, path: string, value: unkno
 
 export interface TileState {
   ready: boolean;
+  voxel_pitches_mm: number[];
   error: string | null;
   stats: Record<string, unknown> | null;
   problems: string[];

@@ -286,7 +286,7 @@ struct AssetSpecies {
 
     // The lattice this species' baked grid is on, in mm -- AssetGrid::voxelSizeMm().
     // Checked against its layer by assetLayerAdmitsVoxelSize.
-    uint32_t voxelSizeMm = uint32_t(kVoxelSizeMm);
+    double voxelSizeMm = kVoxelSizeMm;
 };
 
 // The occupancy default above spells out ten 1000s because an NSDMI cannot

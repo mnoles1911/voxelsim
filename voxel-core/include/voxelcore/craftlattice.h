@@ -1,6 +1,10 @@
 #pragma once
-// THE CRAFT LATTICE -- player-authored sub-voxel detail at 25 mm, bounded to
+// THE CRAFT LATTICE -- player-authored detail at 25 or 12.5 mm, bounded to
 // deliberately PROMOTED terrain bricks.
+// World defaults to CraftLayout<3> (12.5 mm). The historical discussion and
+// free helpers below describe refinement 2; use Layout helpers for new code.
+// At refinement 3, one owned region is 64^3 cells / 512 bricks / eight 32^3
+// render pages. See docs/binary-voxel-pitches.md for the current contract.
 //
 // The design document is the plan "The craft lattice -- 2.5 cm sub-voxel
 // building". This header is the STATE and the PROJECTION; craftvolume.h is the
@@ -195,8 +199,55 @@ struct CraftLatticeCounters {
 // unrelated lattice size to protect an invariant that world never uses. Member
 // functions of a class template instantiate only when called, so the check
 // lands on the first actual use of the mapping instead.
-template <int B>
-class CraftLattice {
+
+// The 25 mm layout remains readable; new world edits use three binary folds.
+inline constexpr uint32_t kFinestCraftPitchUm = 12500;
+template<int Refinement>
+struct CraftLayout {
+    static_assert(Refinement == 2 || Refinement == 3, "supported craft pitches: 25 and 12.5 mm");
+    static constexpr int kCraftCellsPerVoxel = 1 << Refinement;
+    static constexpr uint32_t kCraftPitchUm = 100000u / kCraftCellsPerVoxel;
+    static constexpr double kCraftPitchMm = double(kCraftPitchUm) / 1000.0;
+    // Ownership region, deliberately distinct from a 32-cell render page.
+    static constexpr int kCraftChunkEdgeCells = 8 * kCraftCellsPerVoxel;
+    static constexpr int kCraftBricksPerAxis = kCraftCellsPerVoxel;
+    static constexpr int kCraftBricksPerChunk = kCraftBricksPerAxis*kCraftBricksPerAxis*kCraftBricksPerAxis;
+    static constexpr int kVoxelsPerCraftBrick = 8 / kCraftCellsPerVoxel;
+    static constexpr int kCraftProjectionFolds = Refinement;
+    static constexpr int kPagesPerAxis = kCraftChunkEdgeCells / kMarchChunkEdgeVoxels;
+    static constexpr int kPageCount = kPagesPerAxis*kPagesPerAxis*kPagesPerAxis;
+    static constexpr int64_t craftCellOfVoxelMin(int64_t v) { return v*kCraftCellsPerVoxel; }
+    static constexpr int64_t voxelOfCraftCell(int64_t c) { return floorDiv(c,int64_t(kCraftCellsPerVoxel)); }
+    static BrickKey craftBrickKeyOfCell(int64_t x,int64_t y,int64_t z) { return ChunkMap<8>::keyForVoxel(x,y,z); }
+    static BrickKey craftChunkKeyOfCell(int64_t x,int64_t y,int64_t z) {
+        return {int32_t(floorDiv(x,int64_t(kCraftChunkEdgeCells))),int32_t(floorDiv(y,int64_t(kCraftChunkEdgeCells))),int32_t(floorDiv(z,int64_t(kCraftChunkEdgeCells)))};
+    }
+    static BrickKey craftBrickBaseOfTerrainBrick(const BrickKey& k) {
+        return {k.x*kCraftBricksPerAxis,k.y*kCraftBricksPerAxis,k.z*kCraftBricksPerAxis};
+    }
+    static BrickKey terrainBrickOfCraftBrick(const BrickKey& k) {
+        return {int32_t(floorDiv(int64_t(k.x),int64_t(kCraftBricksPerAxis))),int32_t(floorDiv(int64_t(k.y),int64_t(kCraftBricksPerAxis))),int32_t(floorDiv(int64_t(k.z),int64_t(kCraftBricksPerAxis)))};
+    }
+};
+
+template <int B, int Refinement = 2>
+class CraftLattice : public CraftLayout<Refinement> {
+public:
+    using Layout = CraftLayout<Refinement>;
+    using Layout::kCraftCellsPerVoxel;
+    using Layout::kCraftChunkEdgeCells;
+    using Layout::kCraftBricksPerAxis;
+    using Layout::kCraftBricksPerChunk;
+    using Layout::kVoxelsPerCraftBrick;
+    using Layout::kCraftProjectionFolds;
+    using Layout::kCraftPitchUm;
+    using Layout::kCraftPitchMm;
+    using Layout::craftCellOfVoxelMin;
+    using Layout::voxelOfCraftCell;
+    using Layout::craftBrickKeyOfCell;
+    using Layout::craftChunkKeyOfCell;
+    using Layout::craftBrickBaseOfTerrainBrick;
+    using Layout::terrainBrickOfCraftBrick;
     // A craft chunk is one terrain brick only when 4 * B == 32.
     static constexpr bool kChunkIsOneTerrainBrick = (kCraftCellsPerVoxel * B == kCraftChunkEdgeCells);
 
@@ -296,32 +347,26 @@ public:
         }
         const BrickKey base = craftBrickBaseOfTerrainBrick(terrainBrick);
 
-        // Round 1: 64 craft bricks (4x4x4, 25 mm cells) -> 8 bricks (5 cm cells).
-        CraftBrick mid[8];
-        for (int32_t gz = 0; gz < 2; ++gz)
-            for (int32_t gy = 0; gy < 2; ++gy)
-                for (int32_t gx = 0; gx < 2; ++gx) {
-                    const CraftBrick* children[8] = {};
-                    for (int32_t dz = 0; dz < 2; ++dz)
-                        for (int32_t dy = 0; dy < 2; ++dy)
-                            for (int32_t dx = 0; dx < 2; ++dx) {
-                                const BrickKey k{base.x + 2 * gx + dx, base.y + 2 * gy + dy,
-                                                 base.z + 2 * gz + dz};
-                                const CraftBrick* c = cells_.find(k);
-                                if (c == nullptr) {
-                                    ++counters.projectRefusedMissingBrick;
-                                    return false;
-                                }
-                                children[dx + 2 * dy + 4 * dz] = c;
-                            }
-                    mid[gx + 2 * gy + 4 * gz] = downsampleBricks<kMarchBrickEdge>(children);
-                }
-
-        // Round 2: 8 bricks (5 cm cells) -> one brick (10 cm cells), which is
-        // exactly the terrain brick's own lattice.
-        const CraftBrick* second[8];
-        for (int i = 0; i < 8; ++i) second[i] = &mid[i];
-        out = downsampleBricks<kMarchBrickEdge>(second);
+        int edge = kCraftBricksPerAxis;
+        std::vector<CraftBrick> current;
+        current.reserve(edge*edge*edge);
+        for (int z=0;z<edge;++z) for(int y=0;y<edge;++y) for(int x=0;x<edge;++x) {
+            const auto* brick=cells_.find({base.x+x,base.y+y,base.z+z});
+            if (!brick) { ++counters.projectRefusedMissingBrick; return false; }
+            current.push_back(*brick);
+        }
+        while(edge>1) {
+            const int nextEdge=edge/2;
+            std::vector<CraftBrick> next; next.reserve(nextEdge*nextEdge*nextEdge);
+            for(int z=0;z<nextEdge;++z) for(int y=0;y<nextEdge;++y) for(int x=0;x<nextEdge;++x) {
+                const CraftBrick* children[8];
+                for(int dz=0;dz<2;++dz) for(int dy=0;dy<2;++dy) for(int dx=0;dx<2;++dx)
+                    children[dx+2*dy+4*dz]=&current[(2*x+dx)+edge*((2*y+dy)+edge*(2*z+dz))];
+                next.push_back(downsampleBricks<kMarchBrickEdge>(children));
+            }
+            current=std::move(next); edge=nextEdge;
+        }
+        out=std::move(current.front());
         out.tryCollapse();
         ++counters.projections;
         return true;

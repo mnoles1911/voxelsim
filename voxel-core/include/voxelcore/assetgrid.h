@@ -155,12 +155,13 @@ public:
     // it: local coordinates are indices into the baked box, and what a caller
     // does with a box of 10 mm voxels is a placement decision, not a decode
     // one.
-    uint32_t voxelSizeMm() const { return voxelSizeMm_; }
+    uint32_t voxelSizeUm() const { return voxelSizeUm_; }
+    double voxelSizeMm() const { return double(voxelSizeUm_) / 1000.0; }
 
     // True when this asset is on the world's own lattice and so can be stamped
     // into terrain. A detail entity answers false and must be placed as its
     // own object.
-    bool onTerrainLattice() const { return voxelSizeMm_ == uint32_t(kVoxelSizeMm); }
+    bool onTerrainLattice() const { return voxelSizeUm_ == uint32_t(kVoxelSizeMm) * 1000u; }
 
     // WHICH PART OWNS A VOXEL, and where the parts turn.
     //
@@ -291,7 +292,7 @@ private:
     // one cache line per column instead of straddling.
     int32_t sizeX_ = 0, sizeY_ = 0, sizeZ_ = 0;
     int32_t originX_ = 0, originY_ = 0, originZ_ = 0;
-    uint32_t voxelSizeMm_ = 0;   // 0 until a successful parse; see voxelSizeMm()
+    uint32_t voxelSizeUm_ = 0;   // 0 until a successful parse; see voxelSizeMm()
     std::vector<uint8_t> partMat_;
     std::vector<uint32_t> partLen_;
     std::vector<uint32_t> partColRun_, partColOff_;

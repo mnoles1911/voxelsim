@@ -1,0 +1,1047 @@
+{
+  "schema_version": 1,
+  "status": "design_proposal_not_runtime_recipes",
+  "date": "2026-09-06",
+  "endpoint": "steel_water_wind_advanced_workshops",
+  "voxel_edge_m": 0.025,
+  "semantics": {
+    "requires_all": "AND of node availability",
+    "requires_any_groups": "AND across groups; OR within each nonempty group",
+    "rules": "Alternative rules granting the same capability are OR routes.",
+    "availability": "Existential reachability, not inventory consumption or permanent entitlement.",
+    "limits": "Assumes sufficient accessible resources; does not validate quantities, geography, process physics or balance."
+  },
+  "resources": [
+    {
+      "id": "stone_flaking",
+      "label": "Accessible knappable stone"
+    },
+    {
+      "id": "stone_tough",
+      "label": "Accessible tough stone"
+    },
+    {
+      "id": "wood",
+      "label": "Gatherable branches and standing timber"
+    },
+    {
+      "id": "fiber",
+      "label": "Accessible plant fiber"
+    },
+    {
+      "id": "tinder",
+      "label": "Gatherable tinder"
+    },
+    {
+      "id": "clay",
+      "label": "Accessible pottery clay"
+    },
+    {
+      "id": "refractory",
+      "label": "Suitable accessible refractory material"
+    },
+    {
+      "id": "hide",
+      "label": "Obtainable raw hide"
+    },
+    {
+      "id": "bone",
+      "label": "Obtainable bone or antler"
+    },
+    {
+      "id": "bamboo",
+      "label": "Accessible bamboo stand"
+    },
+    {
+      "id": "native_copper",
+      "label": "Accessible native copper pieces"
+    },
+    {
+      "id": "tin_ore",
+      "label": "Tin deposit"
+    },
+    {
+      "id": "surface_iron",
+      "label": "Accessible iron-bearing material suitable for the designed process"
+    },
+    {
+      "id": "deep_iron",
+      "label": "Hard-rock iron deposit"
+    },
+    {
+      "id": "abrasive",
+      "label": "Suitable abrasive stone"
+    },
+    {
+      "id": "grain",
+      "label": "Harvestable grain or seeds"
+    },
+    {
+      "id": "water_site",
+      "label": "Usable flowing-water site"
+    },
+    {
+      "id": "wind_site",
+      "label": "Usable exposed wind site"
+    },
+    {
+      "id": "water",
+      "label": "Accessible water"
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "knap",
+      "family": "shaping",
+      "label": "Shape flaked stone"
+    },
+    {
+      "id": "cut",
+      "family": "cutting",
+      "label": "Cut and scrape soft material"
+    },
+    {
+      "id": "pound",
+      "family": "shaping",
+      "label": "Pound and crush"
+    },
+    {
+      "id": "cordage",
+      "family": "textiles",
+      "label": "Make cordage and lashings"
+    },
+    {
+      "id": "dig",
+      "family": "extraction",
+      "label": "Dig soil and soft deposits"
+    },
+    {
+      "id": "fire",
+      "family": "thermal",
+      "label": "Maintain a controlled fire"
+    },
+    {
+      "id": "chop",
+      "family": "woodworking",
+      "label": "Chop timber with a hafted tool"
+    },
+    {
+      "id": "adze",
+      "family": "woodworking",
+      "label": "Shape wood with an adze"
+    },
+    {
+      "id": "pierce",
+      "family": "textiles",
+      "label": "Pierce and sew"
+    },
+    {
+      "id": "basketry",
+      "family": "storage",
+      "label": "Make woven containers"
+    },
+    {
+      "id": "paddle",
+      "family": "transport",
+      "label": "Shape a paddle"
+    },
+    {
+      "id": "bamboo_raft",
+      "family": "transport",
+      "label": "Assemble a bamboo raft"
+    },
+    {
+      "id": "log_raft",
+      "family": "transport",
+      "label": "Assemble a log raft"
+    },
+    {
+      "id": "rough_stock",
+      "family": "woodworking",
+      "label": "Split and dress rough stock"
+    },
+    {
+      "id": "pottery",
+      "family": "thermal",
+      "label": "Form and fire basic pottery"
+    },
+    {
+      "id": "food_storage",
+      "family": "storage",
+      "label": "Use ceramic food storage"
+    },
+    {
+      "id": "charcoal",
+      "family": "thermal",
+      "label": "Produce charcoal"
+    },
+    {
+      "id": "leather",
+      "family": "textiles",
+      "label": "Prepare leather"
+    },
+    {
+      "id": "bellows",
+      "family": "thermal",
+      "label": "Supply controlled air with bellows"
+    },
+    {
+      "id": "casting_ceramics",
+      "family": "thermal",
+      "label": "Make suitable crucibles and molds"
+    },
+    {
+      "id": "copper_cast",
+      "family": "metallurgy",
+      "label": "Cast copper"
+    },
+    {
+      "id": "copper_tools",
+      "family": "metallurgy",
+      "label": "Assemble copper tools"
+    },
+    {
+      "id": "mining",
+      "family": "extraction",
+      "label": "Work hard mineral deposits"
+    },
+    {
+      "id": "tin_supply",
+      "family": "metallurgy",
+      "label": "Prepare tin supply"
+    },
+    {
+      "id": "bronze_cast",
+      "family": "metallurgy",
+      "label": "Produce and cast tin bronze"
+    },
+    {
+      "id": "bronze_tools",
+      "family": "metallurgy",
+      "label": "Assemble bronze tools"
+    },
+    {
+      "id": "working_surface",
+      "family": "shaping",
+      "label": "Prepare a basic anvil surface"
+    },
+    {
+      "id": "forge",
+      "family": "thermal",
+      "label": "Reheat metal for working"
+    },
+    {
+      "id": "iron_bloom",
+      "family": "metallurgy",
+      "label": "Produce an iron bloom"
+    },
+    {
+      "id": "iron_billet",
+      "family": "metallurgy",
+      "label": "Consolidate bloom manually"
+    },
+    {
+      "id": "iron_tools",
+      "family": "metallurgy",
+      "label": "Forge and assemble iron tools"
+    },
+    {
+      "id": "saw_chisel",
+      "family": "woodworking",
+      "label": "Make serviceable saw and chisel tools"
+    },
+    {
+      "id": "joinery",
+      "family": "woodworking",
+      "label": "Make fitted wooden assemblies"
+    },
+    {
+      "id": "barrel",
+      "family": "storage",
+      "label": "Make a coopered liquid container"
+    },
+    {
+      "id": "cart",
+      "family": "transport",
+      "label": "Make a cargo cart"
+    },
+    {
+      "id": "textiles",
+      "family": "textiles",
+      "label": "Spin and weave cloth"
+    },
+    {
+      "id": "sail_rig",
+      "family": "transport",
+      "label": "Build a working sail rig"
+    },
+    {
+      "id": "fittings",
+      "family": "metallurgy",
+      "label": "Make suitable metal fittings"
+    },
+    {
+      "id": "hand_mill",
+      "family": "food",
+      "label": "Grind grain manually"
+    },
+    {
+      "id": "farming",
+      "family": "food",
+      "label": "Cultivate and harvest crops"
+    },
+    {
+      "id": "power_train",
+      "family": "power",
+      "label": "Build shafts, bearings, and gearing"
+    },
+    {
+      "id": "water_power",
+      "family": "power",
+      "label": "Capture water power"
+    },
+    {
+      "id": "wind_power",
+      "family": "power",
+      "label": "Capture wind power"
+    },
+    {
+      "id": "powered_mill",
+      "family": "power",
+      "label": "Drive a grain mill"
+    },
+    {
+      "id": "helve_hammer",
+      "family": "power",
+      "label": "Mechanize hammer work"
+    },
+    {
+      "id": "steel_control",
+      "family": "metallurgy",
+      "label": "Make and treat steel repeatably by hand"
+    },
+    {
+      "id": "precision_tools",
+      "family": "woodworking",
+      "label": "Make files and augers"
+    },
+    {
+      "id": "hand_pump",
+      "family": "power",
+      "label": "Build a manually driven drainage pump"
+    },
+    {
+      "id": "powered_pump",
+      "family": "power",
+      "label": "Power the drainage pump"
+    },
+    {
+      "id": "plank_boat",
+      "family": "transport",
+      "label": "Build an advanced plank boat"
+    }
+  ],
+  "rules": [
+    {
+      "id": "shape_flakes",
+      "grants": [
+        "knap"
+      ],
+      "requires_all": [
+        "stone_flaking",
+        "stone_tough"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "flake_edge",
+      "grants": [
+        "cut"
+      ],
+      "requires_all": [
+        "knap"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "hammerstone",
+      "grants": [
+        "pound"
+      ],
+      "requires_all": [
+        "stone_tough"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "twist_fiber",
+      "grants": [
+        "cordage"
+      ],
+      "requires_all": [
+        "fiber",
+        "cut"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "digging_stick",
+      "grants": [
+        "dig"
+      ],
+      "requires_all": [
+        "wood",
+        "cut"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "friction_fire",
+      "grants": [
+        "fire"
+      ],
+      "requires_all": [
+        "wood",
+        "tinder",
+        "cordage",
+        "cut"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "ground_stone_axe",
+      "grants": [
+        "chop"
+      ],
+      "requires_all": [
+        "stone_tough",
+        "abrasive",
+        "wood",
+        "cordage",
+        "pound"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "stone_adze",
+      "grants": [
+        "adze"
+      ],
+      "requires_all": [
+        "stone_tough",
+        "abrasive",
+        "wood",
+        "cordage",
+        "pound"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "bone_awl",
+      "grants": [
+        "pierce"
+      ],
+      "requires_all": [
+        "bone",
+        "abrasive",
+        "cut"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "weave_basket",
+      "grants": [
+        "basketry"
+      ],
+      "requires_all": [
+        "fiber",
+        "cut"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "shape_paddle",
+      "grants": [
+        "paddle"
+      ],
+      "requires_all": [
+        "wood",
+        "adze"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "lash_bamboo_raft",
+      "grants": [
+        "bamboo_raft"
+      ],
+      "requires_all": [
+        "bamboo",
+        "chop",
+        "cordage",
+        "paddle"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "lash_log_raft",
+      "grants": [
+        "log_raft"
+      ],
+      "requires_all": [
+        "wood",
+        "chop",
+        "cordage",
+        "paddle"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "split_and_dress",
+      "grants": [
+        "rough_stock"
+      ],
+      "requires_all": [
+        "wood",
+        "chop",
+        "adze",
+        "pound"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "form_fire_pots",
+      "grants": [
+        "pottery"
+      ],
+      "requires_all": [
+        "clay",
+        "water",
+        "dig",
+        "fire"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "lidded_crock",
+      "grants": [
+        "food_storage"
+      ],
+      "requires_all": [
+        "pottery"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "charcoal_burn",
+      "grants": [
+        "charcoal"
+      ],
+      "requires_all": [
+        "wood",
+        "chop",
+        "fire"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "prepare_hide",
+      "grants": [
+        "leather"
+      ],
+      "requires_all": [
+        "hide",
+        "cut",
+        "water"
+      ],
+      "requires_any_groups": [],
+      "note": "Preparation agents and quantities belong in detailed recipes."
+    },
+    {
+      "id": "sew_bellows",
+      "grants": [
+        "bellows"
+      ],
+      "requires_all": [
+        "leather",
+        "pierce",
+        "rough_stock",
+        "cordage"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "fire_casting_equipment",
+      "grants": [
+        "casting_ceramics"
+      ],
+      "requires_all": [
+        "pottery",
+        "refractory"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "native_copper_cast",
+      "grants": [
+        "copper_cast"
+      ],
+      "requires_all": [
+        "native_copper",
+        "casting_ceramics",
+        "charcoal",
+        "bellows"
+      ],
+      "requires_any_groups": [],
+      "note": "Native copper bootstrap; ore smelting is a separate future recipe."
+    },
+    {
+      "id": "haft_copper_heads",
+      "grants": [
+        "copper_tools"
+      ],
+      "requires_all": [
+        "copper_cast",
+        "wood",
+        "cordage"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "metal_pick",
+      "grants": [
+        "mining"
+      ],
+      "requires_all": [],
+      "requires_any_groups": [
+        [
+          "copper_tools",
+          "bronze_tools",
+          "iron_tools"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "id": "prepare_tin",
+      "grants": [
+        "tin_supply"
+      ],
+      "requires_all": [
+        "tin_ore",
+        "mining",
+        "casting_ceramics",
+        "charcoal",
+        "bellows"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "alloy_bronze",
+      "grants": [
+        "bronze_cast"
+      ],
+      "requires_all": [
+        "tin_supply",
+        "copper_cast"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "haft_bronze_heads",
+      "grants": [
+        "bronze_tools"
+      ],
+      "requires_all": [
+        "bronze_cast",
+        "wood",
+        "cordage"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "stone_anvil",
+      "grants": [
+        "working_surface"
+      ],
+      "requires_all": [
+        "stone_tough",
+        "pound"
+      ],
+      "requires_any_groups": [],
+      "note": "Bootstrap working surface; limited throughput and wear compared with later anvils."
+    },
+    {
+      "id": "build_forge",
+      "grants": [
+        "forge"
+      ],
+      "requires_all": [
+        "clay",
+        "charcoal",
+        "bellows"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "surface_iron_bloom",
+      "grants": [
+        "iron_bloom"
+      ],
+      "requires_all": [
+        "surface_iron",
+        "refractory",
+        "pottery",
+        "charcoal",
+        "bellows",
+        "pound"
+      ],
+      "requires_any_groups": [],
+      "note": "Resource-specific surface route; deliberately does not require bronze or a metal pick."
+    },
+    {
+      "id": "mined_iron_bloom",
+      "grants": [
+        "iron_bloom"
+      ],
+      "requires_all": [
+        "deep_iron",
+        "mining",
+        "refractory",
+        "pottery",
+        "charcoal",
+        "bellows",
+        "pound"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "hand_consolidate",
+      "grants": [
+        "iron_billet"
+      ],
+      "requires_all": [
+        "iron_bloom",
+        "working_surface",
+        "forge",
+        "pound"
+      ],
+      "requires_any_groups": [],
+      "note": "Detailed process must model tongs/handling; these can bootstrap with suitable wooden handling tools."
+    },
+    {
+      "id": "forge_iron_tools",
+      "grants": [
+        "iron_tools"
+      ],
+      "requires_all": [
+        "iron_billet",
+        "working_surface",
+        "forge",
+        "wood",
+        "cordage"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "make_joinery_tools",
+      "grants": [
+        "saw_chisel"
+      ],
+      "requires_all": [
+        "abrasive"
+      ],
+      "requires_any_groups": [
+        [
+          "bronze_tools",
+          "iron_tools"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "id": "fit_wood",
+      "grants": [
+        "joinery"
+      ],
+      "requires_all": [
+        "saw_chisel",
+        "rough_stock"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "cooper_barrel",
+      "grants": [
+        "barrel"
+      ],
+      "requires_all": [
+        "joinery",
+        "cordage"
+      ],
+      "requires_any_groups": [],
+      "note": "Wooden hoops provide an early option; metal hoops are an upgrade."
+    },
+    {
+      "id": "build_cart",
+      "grants": [
+        "cart"
+      ],
+      "requires_all": [
+        "joinery",
+        "fittings"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "spin_weave",
+      "grants": [
+        "textiles"
+      ],
+      "requires_all": [
+        "fiber",
+        "rough_stock",
+        "cordage"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "rig_sail",
+      "grants": [
+        "sail_rig"
+      ],
+      "requires_all": [
+        "textiles",
+        "joinery",
+        "cordage"
+      ],
+      "requires_any_groups": [
+        [
+          "bamboo_raft",
+          "log_raft",
+          "plank_boat"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "id": "cast_fittings",
+      "grants": [
+        "fittings"
+      ],
+      "requires_all": [
+        "bronze_cast"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "forge_fittings",
+      "grants": [
+        "fittings"
+      ],
+      "requires_all": [
+        "iron_tools"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "grind_grain",
+      "grants": [
+        "hand_mill"
+      ],
+      "requires_all": [
+        "stone_tough",
+        "pound",
+        "grain"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "cultivate",
+      "grants": [
+        "farming"
+      ],
+      "requires_all": [
+        "dig",
+        "grain",
+        "water"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "fit_transmission",
+      "grants": [
+        "power_train"
+      ],
+      "requires_all": [
+        "joinery",
+        "fittings"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "waterwheel",
+      "grants": [
+        "water_power"
+      ],
+      "requires_all": [
+        "power_train",
+        "water_site"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "windmill",
+      "grants": [
+        "wind_power"
+      ],
+      "requires_all": [
+        "power_train",
+        "wind_site",
+        "textiles"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "drive_mill",
+      "grants": [
+        "powered_mill"
+      ],
+      "requires_all": [
+        "hand_mill"
+      ],
+      "requires_any_groups": [
+        [
+          "water_power",
+          "wind_power"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "id": "drive_hammer",
+      "grants": [
+        "helve_hammer"
+      ],
+      "requires_all": [
+        "iron_tools",
+        "forge"
+      ],
+      "requires_any_groups": [
+        [
+          "water_power",
+          "wind_power"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "id": "manual_controlled_steel",
+      "grants": [
+        "steel_control"
+      ],
+      "requires_all": [
+        "iron_billet",
+        "iron_tools",
+        "refractory",
+        "charcoal",
+        "forge",
+        "abrasive"
+      ],
+      "requires_any_groups": [],
+      "note": "Reliable carburizing/refining and heat-treatment process; powered hammer optional."
+    },
+    {
+      "id": "make_files_augers",
+      "grants": [
+        "precision_tools"
+      ],
+      "requires_all": [
+        "steel_control",
+        "joinery"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "piston_pump",
+      "grants": [
+        "hand_pump"
+      ],
+      "requires_all": [
+        "precision_tools",
+        "leather",
+        "fittings",
+        "joinery"
+      ],
+      "requires_any_groups": [],
+      "note": ""
+    },
+    {
+      "id": "drive_pump",
+      "grants": [
+        "powered_pump"
+      ],
+      "requires_all": [
+        "hand_pump"
+      ],
+      "requires_any_groups": [
+        [
+          "water_power",
+          "wind_power"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "id": "fit_plank_hull",
+      "grants": [
+        "plank_boat"
+      ],
+      "requires_all": [
+        "precision_tools",
+        "joinery",
+        "fittings",
+        "cordage"
+      ],
+      "requires_any_groups": [],
+      "note": "Caulking/sealing and displacement require detailed vehicle recipes and simulation."
+    }
+  ]
+}
