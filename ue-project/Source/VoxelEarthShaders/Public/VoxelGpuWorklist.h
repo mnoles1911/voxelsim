@@ -143,7 +143,7 @@ struct FVoxelWorklistAssetInstance
 	uint32 SizeY = 0;
 	uint32 SizeZ = 0;
 	uint32 ColStartsBase = 0;
-	uint32 Pad0 = 0;
+	uint32 SuppressTerrainRender = 0;
 };
 static_assert(sizeof(FVoxelWorklistAssetInstance) == 48, "the 48-byte instance IS the contract");
 

@@ -157,7 +157,7 @@ namespace VoxelGpuChunkRegion
 	// every array the request carries. Per chunk that is
 	//
 	//     4 * (ElevationMm.Num() + ClimatePacked.Num())        raster window
-	//   + 44 * AssetInstances.Num()                            instances
+	//   + 48 * AssetInstances.Num()                            instances
 	//   +  4 * (AssetColStarts.Num() + AssetSpans.Num())       span tables
 	//
 	// bytes of malloc + memcpy on the GAME THREAD, once per chunk routed to the

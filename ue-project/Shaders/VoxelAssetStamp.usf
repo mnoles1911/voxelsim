@@ -15,7 +15,10 @@
 // (AssetField::materialAtResolved). This kernel is dispatched ONCE PER
 // INSTANCE, in that same order, and only ever writes cells whose material is
 // AIR -- so instance i+1 sees instance i's writes through the pass barrier and
-// the same winner is picked for every overlapped cell. One thread owns one
+// the same winner is picked for every overlapped cell. Optional render
+// suppression keeps an owned winner in separate transient claims while leaving
+// its material air; later instances still cannot occupy that cell.
+// One thread owns one
 // baked column, so there are no intra-dispatch races either.
 //
 // The transform mirrors AssetGrid::atYaw's INVERSE map, inverted back to a
@@ -71,6 +74,26 @@ StructuredBuffer<uint> ColStarts;
 StructuredBuffer<uint> Spans;
 
 RWStructuredBuffer<uint> OutCells;
+// Optional transient claim buffer, separate from terrain/material packing.
+uint HasRenderSuppression;
+uint SuppressTerrainRender;
+RWStructuredBuffer<uint> OwnedWinnerClaims;
+
+void assetStampWinner(uint CellIndex, uint Mat)
+{
+    const uint Cell = OutCells[CellIndex];
+    if ((Cell & 0xffu) != 0u) return;
+    if (HasRenderSuppression != 0u)
+    {
+        if (OwnedWinnerClaims[CellIndex] != 0u) return;
+        if (SuppressTerrainRender != 0u)
+        {
+            OwnedWinnerClaims[CellIndex] = 1u;
+            return;
+        }
+    }
+    OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+}
 
 [numthreads(8, 8, 1)]
 void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
@@ -87,9 +110,9 @@ void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
     switch (YawQuarter & 3u)
     {
         case 0u: Rx = Bx;                  Ry = By;                  break;
-        case 1u: Rx = int(SizeY) - 1 - By; Ry = Bx;                  break;
-        case 2u: Rx = int(SizeX) - 1 - Bx; Ry = int(SizeY) - 1 - By; break;
-        default: Rx = By;                  Ry = int(SizeX) - 1 - Bx; break;
+        case 1u: Rx = int(SizeY) - 1 - By; Ry = Bx;                  break; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - subtraction operands are explicitly signed int
+        case 2u: Rx = int(SizeX) - 1 - Bx; Ry = int(SizeY) - 1 - By; break; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - subtraction operands are explicitly signed int
+        default: Rx = By;                  Ry = int(SizeX) - 1 - Bx; break; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - subtraction operands are explicitly signed int
     }
 
     const int Rvx = AnchorRel.x + RotOriginX + Rx;
@@ -136,10 +159,7 @@ void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
             // instance), same monotone rule as every CPU compose site. The
             // upper bits are preserved -- the low byte is the material and the
             // rest is the mirror's packing headroom, not this kernel's to own.
-            if ((Cell & 0xffu) == 0u)
-            {
-                OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
-            }
+            assetStampWinner(CellIndex, Mat);
         }
     }
 }
@@ -196,9 +216,9 @@ void assetYawInverse(uint YawQ, uint SzX, uint SzY, int Rx, int Ry,
     switch (YawQ & 3u)
     {
         case 0u: Bx = Rx;                By = Ry;                break;
-        case 1u: Bx = Ry;                By = int(SzY) - 1 - Rx; break;
-        case 2u: Bx = int(SzX) - 1 - Rx; By = int(SzY) - 1 - Ry; break;
-        default: Bx = int(SzX) - 1 - Ry; By = Rx;                break;
+        case 1u: Bx = Ry;                By = int(SzY) - 1 - Rx; break; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - subtraction operands are explicitly signed int
+        case 2u: Bx = int(SzX) - 1 - Rx; By = int(SzY) - 1 - Ry; break; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - subtraction operands are explicitly signed int
+        default: Bx = int(SzX) - 1 - Ry; By = Rx;                break; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - subtraction operands are explicitly signed int
     }
 }
 
@@ -305,9 +325,6 @@ void AssetStampCoarseMain(uint3 Tid : SV_DispatchThreadID)
         const uint Cell = OutCells[CellIndex];
         // AIR ONLY -- same monotone rule, same upper-bit preservation, as the
         // level-0 kernel above.
-        if ((Cell & 0xffu) == 0u)
-        {
-            OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
-        }
+        assetStampWinner(CellIndex, Mat);
     }
 }

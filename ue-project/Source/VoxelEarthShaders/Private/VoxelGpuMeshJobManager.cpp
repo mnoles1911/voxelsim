@@ -4541,6 +4541,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 						// Payload-relative for now; Flush rebases into the
 						// flush blob as it concatenates.
 						W.ColStartsBase = Inst.ColStartsBase;
+						W.SuppressTerrainRender = Inst.SuppressTerrainRender;
 					}
 					P.ColStarts = Reg.AssetColStarts;
 					P.Spans = Reg.AssetSpans;

@@ -27,4 +27,3 @@ Verification: the focused Release target built successfully and all four core te
 7. Add provenance-preserving local edits and a saved coarse projection before admitting modified trees. Distance demotion must use the latest edited projection, never regenerate the original tree. Integrate registry stable IDs and source provenance into the versioned persistence schema. Rendering wind remains presentation-only; collision and cut coordinates stay in the authoritative local grid.
 
 This is a renderer publication refactor, not a safe two-site filtering patch. Enabling actor overlays before steps 2–6 would create duplicate geometry, holes or stale tree resurrection. Acceptance must include an isolated cross-chunk tree moving near/far, CPU and GPU production, cancellation during upload, parked-chunk adoption, an edit followed by demotion/reload, and multiplayer ownership synchronization.
-

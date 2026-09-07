@@ -38,3 +38,31 @@ VXC_TEST(asset_candidate_page_aprons_cover_negative_boundaries) {
     CHECK(!assetPageTouches(b,{1,0,0,0,AssetCpu}));
     CHECK(assetPageTouches(b,{0,0,0,3,AssetGpu}));
 }
+
+VXC_TEST(asset_render_request_marker_preserves_authoritative_composition) {
+    auto first=block(MAT_ROCK),second=block(MaterialId(16));
+    for(uint8_t yaw=0;yaw<4;++yaw) {
+        AssetField::ResolvedAssetInstance a;
+        a.grid=&first;a.anchorVx=-100;a.anchorVy=-50;a.anchorVz=100;a.yawQuarter=yaw;
+        auto b=a;b.grid=&second;
+        std::vector<AssetField::ResolvedAssetInstance> ordered{a,b};
+        AssetCandidateBounds bounds;CHECK(assetCandidateBounds(a,bounds));
+        for(int64_t x=bounds.x0-1;x<=bounds.x1+1;++x)
+        for(int64_t y=bounds.y0-1;y<=bounds.y1+1;++y) {
+            const auto original=AssetField::materialAtResolved(ordered,x,y,100);
+            CHECK_EQ(AssetField::materialAtResolvedForRender(ordered,x,y,100),original);
+            ordered[0].suppressTerrainRender=true;
+            CHECK_EQ(AssetField::materialAtResolved(ordered,x,y,100),original);
+            CHECK_EQ(AssetField::materialAtResolvedForRender(ordered,x,y,100),MAT_AIR);
+            // Suppressing only the later instance cannot erase the earlier winner.
+            ordered[0].suppressTerrainRender=false;ordered[1].suppressTerrainRender=true;
+            CHECK_EQ(AssetField::materialAtResolvedForRender(ordered,x,y,100),original);
+            ordered[1].suppressTerrainRender=false;
+        }
+        // A later instance remains visible where the owned earlier box is air.
+        ordered[0].suppressTerrainRender=true;
+        ordered[1].anchorVx+=10;
+        CHECK(assetCandidateBounds(ordered[1],bounds));
+        CHECK_EQ(AssetField::materialAtResolvedForRender(ordered,bounds.x0,bounds.y0,100),16);
+    }
+}

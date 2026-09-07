@@ -63,6 +63,7 @@ VXC_TEST(asset_resolved_instances_preserve_bank_provenance) {
     AssetInstance instance;instance.anchorXMm=-101;instance.anchorYMm=201;instance.anchorVz=8;
     instance.bankId=12;instance.seedIndex=3;instance.speciesIndex=25;instance.yawQuarter=2;
     auto resolved=field.resolveForCompose({instance});CHECK_EQ(resolved.size(),1u);
+    if(resolved.size()!=1)return;
     CHECK_EQ(resolved[0].bankId,12);CHECK_EQ(resolved[0].seedIndex,3);CHECK_EQ(resolved[0].speciesIndex,25);
     CHECK_EQ(resolved[0].anchorVx,-2);CHECK_EQ(resolved[0].anchorVy,2);
     CHECK_EQ(AssetField::materialAtResolved(resolved,-2+grid.rotatedOriginX(2),2+grid.rotatedOriginY(2),8),MAT_ROCK);
