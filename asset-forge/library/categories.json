@@ -149,7 +149,7 @@
   },
   "creature": {
    "blurb": "Living things that are spawned rather than composed. They carry their own pitch under their own transform (ADR-0010), they are published in the manifest with biome weights so a spawner can find them, and they are authored and deliberately not rendered until animation exists.",
-   "count": 382,
+   "count": 390,
    "in_manifest": true,
    "kinds": [
     "fish",
@@ -997,6 +997,22 @@
      ],
      "kind": "quadruped",
      "name": "bengal-tiger",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 315158,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 210538,
+       "vxa": "library/bengal_tiger_anatomy_pilot/bengal_tiger_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "quadruped",
+     "name": "bengal_tiger_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },
@@ -2277,6 +2293,22 @@
      ],
      "kind": "bird",
      "name": "common-tern",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 7163,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 6062,
+       "vxa": "library/common_raven_anatomy_pilot/common_raven_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "bird",
+     "name": "common_raven_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },
@@ -3721,6 +3753,22 @@
      "voxel_mm": 12.5
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 44723,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 24305,
+       "vxa": "library/golden_eagle_anatomy_pilot/golden_eagle_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "bird",
+     "name": "golden_eagle_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -3921,6 +3969,22 @@
      "voxel_mm": 25.0
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 227123,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 399955,
+       "vxa": "library/great_white_shark_anatomy_pilot/great_white_shark_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "fish",
+     "name": "great_white_shark_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -4057,6 +4121,22 @@
      ],
      "kind": "quadruped",
      "name": "grey-wolf",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 68718,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 69525,
+       "vxa": "library/grey_wolf_anatomy_pilot/grey_wolf_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "quadruped",
+     "name": "grey_wolf_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },
@@ -5361,6 +5441,22 @@
      "voxel_mm": 25.0
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 627488,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 2379896,
+       "vxa": "library/orca_anatomy_pilot/orca_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "cetacean",
+     "name": "orca_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -5721,6 +5817,22 @@
      "voxel_mm": 12.5
     },
     {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 6148,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 2334,
+       "vxa": "library/rainbow_trout_anatomy_pilot/rainbow_trout_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "fish",
+     "name": "rainbow_trout_anatomy_pilot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
      "curation": "approved",
      "grids": [
       {
@@ -5917,6 +6029,22 @@
      ],
      "kind": "quadruped",
      "name": "red-squirrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "grids": [
+      {
+       "bytes": 92963,
+       "extent_vox": null,
+       "seed": 1,
+       "voxels": 205448,
+       "vxa": "library/red_deer_stag_anatomy_pilot/red_deer_stag_anatomy_pilot-0001/tree.vxa"
+      }
+     ],
+     "kind": "quadruped",
+     "name": "red_deer_stag_anatomy_pilot",
      "via": "kind",
      "voxel_mm": 12.5
     },

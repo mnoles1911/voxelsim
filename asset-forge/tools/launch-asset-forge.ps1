@@ -4,9 +4,8 @@
 #   1. PREFLIGHT: checks python and the three packages the forge needs
 #      (numpy, scipy, pillow) and fails in plain English naming the fix --
 #      a missing scipy must not surface as a traceback mid-use.
-#   2. SINGLE INSTANCE: probes http://127.0.0.1:8731/api/kinds. If the forge
-#      already answers, this launch just opens your browser and exits --
-#      a second launch must never die on a port bind error.
+#   2. SINGLE INSTANCE: compares the running server's startup fingerprint to
+#      the current checkout. Reuses the latest server, restarts stale Forge.
 #   3. Otherwise starts `python -m forge.cli serve`, which opens the browser
 #      itself. The console window stays visible ON PURPOSE: ctrl-c in it is
 #      how you stop the forge.
@@ -21,6 +20,11 @@ $url = "http://127.0.0.1:$Port/"
 
 # --- 1. preflight ------------------------------------------------------------
 $python = Get-Command python -ErrorAction SilentlyContinue
+if ($null -eq $python) {
+    $installedPython = Get-ChildItem "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe" -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    if ($installedPython) { $python = @{ Source = $installedPython.FullName } }
+}
 if ($null -eq $python) {
     Write-Host ""
     Write-Host "Asset Forge cannot start: Python was not found on this machine's PATH." -ForegroundColor Red
@@ -43,7 +47,16 @@ if ($missing) {
     exit 1
 }
 
-# --- 2. already running? -----------------------------------------------------
+# --- 2. already running, and current? ----------------------------------------
+Push-Location $forgeDir
+try {
+    $expected = (& $python.Source -m forge.server_version) | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$expected.fingerprint) { throw 'Cannot identify current Forge code.' }
+} finally { Pop-Location }
+$running = $null
+try {
+    $running = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/server-version" -TimeoutSec 5
+} catch { }
 # The probe timeout is GENEROUS on purpose: /api/kinds re-reads every spec and
 # measures ~10 s on this library, while a forge that is NOT running refuses the
 # connection instantly -- so the long timeout costs nothing in the cold case
@@ -57,9 +70,35 @@ try {
 } catch { }
 
 if ($alive) {
-    Write-Host "Asset Forge is already running at $url -- opening your browser."
-    Start-Process $url
-    exit 0
+    if ($running.application -eq 'asset-forge' -and
+        $running.root -eq $expected.root -and
+        $running.fingerprint -eq $expected.fingerprint) {
+        Write-Host "Asset Forge is current at $url -- opening your browser."
+        Start-Process $url
+        exit 0
+    }
+    # A legacy server has no version endpoint. Verify its actual listener and
+    # command line before restarting; never stop another app using this port.
+    $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen)
+    $forgeProcesses = @()
+    foreach ($ownerId in @($listeners.OwningProcess | Sort-Object -Unique)) {
+        $ownerProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $ownerId"
+        $command = $ownerProcess.CommandLine
+        $isForge = $command -match '-m\s+forge\.cli\s+serve(?:\s|$)'
+        $rightPort = $command -match "--port(?:\s+|=)$Port(?:\s|$)" -or
+            ($Port -eq 8731 -and $command -notmatch '--port')
+        if (!$isForge -or !$rightPort) {
+            throw "Port $Port belongs to another command; it was not stopped."
+        }
+        $forgeProcesses += $ownerProcess
+    }
+    Write-Host "Restarting Asset Forge to load the latest code. Saved library entries are preserved."
+    foreach ($ownerProcess in $forgeProcesses) { Stop-Process -Id $ownerProcess.ProcessId -ErrorAction Stop }
+    $deadline = (Get-Date).AddSeconds(10)
+    while (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
+        if ((Get-Date) -gt $deadline) { throw "Port $Port did not close after stopping the old Forge server." }
+        Start-Sleep -Milliseconds 100
+    }
 }
 
 # A listener that did NOT answer the probe is either a hung forge or another

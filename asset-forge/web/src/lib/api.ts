@@ -136,6 +136,8 @@ export const api = {
    * bank bakes are hash-skipped so a no-op publish is quick, a real one is
    * minutes. */
   publish: () => post("/api/publish", {}).then((r) => j<{ ok: boolean; report: string }>(r)),
+  reviewAppearance: (id: string, approved: boolean) =>
+    post("/api/library/appearance-review", { id, approved }).then((r) => j<LibraryEntry>(r)),
 
   thumbUrl: (id: string) => "/api/library/thumb?id=" + encodeURIComponent(id),
   voxelsUrl: (id: string, budget?: number) =>

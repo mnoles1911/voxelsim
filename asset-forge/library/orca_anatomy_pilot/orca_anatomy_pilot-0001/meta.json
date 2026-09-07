@@ -1,0 +1,33 @@
+{
+  "id": "orca_anatomy_pilot-0001",
+  "species": "orca_anatomy_pilot",
+  "kind": "cetacean",
+  "seed": 1,
+  "imported": true,
+  "source_format": "reviewed reference mesh; RGB voxel study",
+  "spec_hash": "b11c9e3158a4980e",
+  "stats": {
+    "height_m": 3.55,
+    "voxels": 2379896
+  },
+  "problems": [],
+  "vox_models": 4,
+  "static_model_complete": true,
+  "review_status": "ready_for_set_review",
+  "visual_approved": false,
+  "runtime_ready": false,
+  "animation": "not rigged",
+  "appearance": "RGB surface sidecar",
+  "voxel_mm": 12.5,
+  "dimensions_m": [
+    6.5125,
+    2.275,
+    3.5500000000000003
+  ],
+  "validation": [
+    "one connected component",
+    "VXA roundtrip",
+    "RGB payload byte equality"
+  ],
+  "review_limitations": "Tall dorsal fin is male-like; sex and ecotype were not documented by the source. Dense geometry needs a separate runtime budget and rigging pass."
+}

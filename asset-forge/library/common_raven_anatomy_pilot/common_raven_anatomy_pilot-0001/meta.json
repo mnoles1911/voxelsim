@@ -1,0 +1,33 @@
+{
+  "id": "common_raven_anatomy_pilot-0001",
+  "species": "common_raven_anatomy_pilot",
+  "kind": "bird",
+  "seed": 1,
+  "imported": true,
+  "source_format": "reviewed reference mesh; RGB voxel study",
+  "spec_hash": "0fe2d7915f866546",
+  "stats": {
+    "height_m": 0.5,
+    "voxels": 6062
+  },
+  "problems": [],
+  "vox_models": 1,
+  "static_model_complete": true,
+  "review_status": "ready_for_set_review",
+  "visual_approved": false,
+  "runtime_ready": false,
+  "animation": "not rigged",
+  "appearance": "RGB surface sidecar",
+  "voxel_mm": 12.5,
+  "dimensions_m": [
+    0.6625000000000001,
+    0.225,
+    0.5
+  ],
+  "validation": [
+    "one connected component",
+    "VXA roundtrip",
+    "RGB payload byte equality"
+  ],
+  "review_limitations": "Perch and fused feet removed. Bent legs and three forward toes plus hallux reconstructed; toe detail is simplified at 12.5 mm."
+}

@@ -5,50 +5,126 @@
     {
       "id": "grey-wolf",
       "scientific_name": "Canis lupus",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
+      "library_entry": "grey_wolf_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "commit": "2befc8f",
+      "dimensions_m": [
+        1.675,
+        0.3375,
+        0.9500000000000001
+      ],
+      "limitations": "User accepted the static appearance; no rig or animation is included.",
+      "study": "grey-wolf-finished"
     },
     {
       "id": "bengal-tiger",
       "scientific_name": "Panthera tigris tigris",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_ready_for_set_review",
+      "visual_approved": false,
+      "library_entry": "bengal_tiger_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "dimensions_m": [
+        2.6750000000000003,
+        0.5125000000000001,
+        1.3875000000000002
+      ],
+      "limitations": "The source identifies a tiger, not a verified Bengal specimen. Pose bounds include a raised head and lifted paws; they are not shoulder height.",
+      "study": "bengal-tiger-refined"
     },
     {
       "id": "red-deer-stag",
       "scientific_name": "Cervus elaphus",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_ready_for_set_review",
+      "visual_approved": false,
+      "library_entry": "red_deer_stag_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "dimensions_m": [
+        2.0125,
+        0.6125,
+        2.4625000000000004
+      ],
+      "limitations": "Generic deer sculpt interpreted as a red stag. Antler age and individual measurements are unverified; this is not a mature crown-antler study.",
+      "study": "red-deer-refined"
     },
     {
       "id": "common-raven",
       "scientific_name": "Corvus corax",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_ready_for_set_review",
+      "visual_approved": false,
+      "library_entry": "common_raven_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "dimensions_m": [
+        0.6625000000000001,
+        0.225,
+        0.5
+      ],
+      "limitations": "Perch and fused feet removed. Bent legs and three forward toes plus hallux reconstructed; toe detail is simplified at 12.5 mm.",
+      "study": "common-raven-cleanup-study"
     },
     {
       "id": "golden-eagle",
       "scientific_name": "Aquila chrysaetos",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_ready_for_set_review",
+      "visual_approved": false,
+      "library_entry": "golden_eagle_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "dimensions_m": [
+        0.8125,
+        0.41250000000000003,
+        0.7375
+      ],
+      "limitations": "Perch and fused feet replaced. Retained white wing/tail patches are interpreted as immature plumage; reconstructed feet are not scan measurements.",
+      "study": "golden-eagle-cleanup-study"
     },
     {
       "id": "rainbow-trout",
       "scientific_name": "Oncorhynchus mykiss",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_ready_for_set_review",
+      "visual_approved": false,
+      "library_entry": "rainbow_trout_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "dimensions_m": [
+        0.6625000000000001,
+        0.15000000000000002,
+        0.225
+      ],
+      "limitations": "Scaled uniformly to a large 0.65 m game fish, not the original specimen size. At about 52 voxels long, spots and eye details are deliberately simplified.",
+      "study": "rainbow-trout-refined"
     },
     {
       "id": "great-white-shark",
       "scientific_name": "Carcharodon carcharias",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_ready_for_set_review",
+      "visual_approved": false,
+      "library_entry": "great_white_shark_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "dimensions_m": [
+        4.2125,
+        2.1375,
+        1.625
+      ],
+      "limitations": "Source proportions retained; sex and individual morphometrics are unverified. Fin edges retain the cubic lattice.",
+      "study": "great-white-shark-refined"
     },
     {
       "id": "orca",
       "scientific_name": "Orcinus orca",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_ready_for_set_review",
+      "visual_approved": false,
+      "library_entry": "orca_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "dimensions_m": [
+        6.5125,
+        2.275,
+        3.5500000000000003
+      ],
+      "limitations": "Tall dorsal fin is male-like; sex and ecotype were not documented by the source. Dense geometry needs a separate runtime budget and rigging pass.",
+      "study": "orca-refined"
     }
-  ]
+  ],
+  "static_pilot_complete": true,
+  "review_url": "http://127.0.0.1:8731/static/pilot-review.html",
+  "completion_boundary": "Eight static candidates delivered; user appearance review precedes any broader animal rollout. Runtime integration not complete."
 }

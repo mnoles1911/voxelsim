@@ -1,0 +1,10 @@
+{
+  "source_url": "https://sketchfab.com/3d-models/dd0552b1f93b441cbdd626a5b2abebbf",
+  "author": "Virtual Museums of Malopolska, Tomek Natural Science Museum, specimen MP 407",
+  "license": "CC0",
+  "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "source_sha256": "97b74fa54a0e43624022202ad429ff7a5e82b6d48007985e1b475e0abc77a9ae",
+  "retrieved": "2026-09-07",
+  "modifications": "Removed integral display support; reconstructed feathered tarsi, toes and curved talons; moderated pale head feather values; 12.5 mm cubic voxelization at 0.8 m source length. Immature plumage interpretation.",
+  "visual_approved": false
+}

@@ -31,11 +31,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import parts as partslib
+from .server_version import snapshot as server_snapshot
 from . import (biomes as biomelib, categories as catlib, contact,
                kinds as kindlib, materials, pipeline,
                render, spec as specmod, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
+RUNNING_VERSION = server_snapshot()
 # The React frontend (web/dist, built by `npm run build` in web/) took over
 # from the hand-written page in forge/web on 2026-08-18. The old page is kept
 # as a fallback ONLY for a checkout that has never built the app, so the
@@ -233,7 +235,7 @@ FORGE = Forge()
 # --- library ----------------------------------------------------------------
 
 
-def encode_voxels(grid) -> bytes:
+def encode_voxels(grid, appearance=None) -> bytes:
     """Surface voxels as a compact binary blob for the 3D viewer.
 
         uint32 nx, ny, nz          grid dimensions
@@ -253,7 +255,18 @@ def encode_voxels(grid) -> bytes:
     pos = np.empty((xs.size, 3), dtype=np.int16)
     pos[:, 0], pos[:, 1], pos[:, 2] = xs, ys, zs
     header = struct.pack("<IIII", *(int(v) for v in grid.shape), int(xs.size))
-    return header + pos.tobytes() + mats.tobytes()
+    body = header + pos.tobytes() + mats.tobytes()
+    if appearance is not None:
+        # Optional RGB1 trailer preserves an imported model's authored coat.
+        # Material IDs remain intact for inspection and VXA export.
+        with np.load(appearance, allow_pickle=False) as data:
+            if not np.array_equal(data['cells'], pos):
+                raise ValueError('appearance cells do not match stored voxel surface')
+            rgb = data['rgb']
+            if rgb.shape != (len(pos), 3) or rgb.dtype != np.uint8:
+                raise ValueError('invalid surface RGB data')
+            body += b'RGB1' + rgb.tobytes()
+    return body
 
 
 def _finest_within(spec: dict, budget: float, weight: float) -> float:
@@ -759,6 +772,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": traceback.format_exc(limit=4)}, 500)
 
     def _route_get(self, path: str, q: dict) -> None:
+        if path == "/api/server-version":
+            return self._json(RUNNING_VERSION)
         if path == "/":
             return self._static("index.html")
         if path.startswith("/static/"):
@@ -987,6 +1002,7 @@ class Handler(BaseHTTPRequestHandler):
             #                 honest across spec edits; the server ignores it.
             job = FORGE.get(q.get("job", ""))
             grid = None
+            appearance = None
             if job:
                 spec, seed = job.spec, int(q["seed"])
             elif q.get("name"):
@@ -1009,6 +1025,8 @@ class Handler(BaseHTTPRequestHandler):
                     # No (spec, seed) regenerates an import -- the stored
                     # voxels ARE the asset, so serve those.
                     grid = vxa.read(d / "tree.vxa")
+                    if (d / "appearance.npz").is_file():
+                        appearance = d / "appearance.npz"
             try:
                 cap = int(q["max"]) if q.get("max") else None
             except ValueError:
@@ -1019,7 +1037,7 @@ class Handler(BaseHTTPRequestHandler):
                                       resolution_cm=cm).grid
             else:
                 cm = grid.voxel_m * 100.0
-            body = encode_voxels(grid)
+            body = encode_voxels(grid, appearance)
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
@@ -1081,6 +1099,8 @@ class Handler(BaseHTTPRequestHandler):
     def _route_post(self, path: str, body: dict) -> None:
         if path == "/api/generate":
             spec, rep = specmod.validate(body.get("spec") or {})
+            if any(e.get("imported") and e.get("species") == spec.get("name") for e in library_list()):
+                return self._json({"error": "This is a saved imported model. Open its library geometry; procedural generation cannot edit it."}, 400)
             start = int(body.get("seed_start", 1))
             count = max(1, min(int(body.get("count", 12)), 200))
             job = FORGE.start(spec, list(range(start, start + count)))
@@ -1184,6 +1204,27 @@ class Handler(BaseHTTPRequestHandler):
             specmod.save(spec, SPECS / f"{name}.json")
             return self._json({"saved": f"{name}.json", "warnings": rep.warnings})
 
+        if path == "/api/library/appearance-review":
+            entry_id = str(body.get("id", ""))
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", entry_id):
+                return self._json({"error": "invalid entry id"}, 400)
+            approved = body.get("approved")
+            if not isinstance(approved, bool):
+                return self._json({"error": "approved must be true or false"}, 400)
+            directory = library_dir(entry_id)
+            if directory is None:
+                return self._json({"error": "saved model not found"}, 404)
+            path_meta = directory / "meta.json"
+            meta = json.loads(path_meta.read_text(encoding="utf8"))
+            if not meta.get("imported"):
+                return self._json({"error": "Use Keep for generated variants"}, 400)
+            meta["visual_approved"] = approved
+            meta["review_status"] = "appearance_approved" if approved else "pilot_candidate"
+            # Appearance approval must not claim animation or runtime readiness,
+            # nor cause the bank exporter to regenerate a procedural substitute.
+            path_meta.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf8")
+            return self._json(meta)
+
         if path == "/api/curation":
             # The publish verdict, written into the spec FILE and nowhere
             # else. The exporters read the gate from specs/, so a verdict
@@ -1220,6 +1261,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/keep":
             spec, _ = specmod.validate(body.get("spec") or {})
+            if any(e.get("imported") and e.get("species") == spec.get("name") for e in library_list()):
+                return self._json({"error": "Cannot overwrite an imported model with a procedural seed."}, 400)
             meta = keep(spec, int(body["seed"]))
             return self._json(meta)
 
@@ -1232,13 +1275,25 @@ class Handler(BaseHTTPRequestHandler):
             import subprocess
             import sys as _sys
 
-            proc = subprocess.run(
-                [_sys.executable, str(ROOT / "tools" / "publish.py")],
-                cwd=str(ROOT), capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=1800)
-            report = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-            return self._json({"ok": proc.returncode == 0,
-                               "report": report})
+            try:
+                proc = subprocess.run(
+                    [_sys.executable, str(ROOT / "tools" / "publish.py")],
+                    cwd=str(ROOT), capture_output=True, text=True,
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                    encoding="utf-8", errors="replace", timeout=1800)
+                report = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+                ok = proc.returncode == 0
+            except subprocess.TimeoutExpired as exc:
+                def decoded(value):
+                    return value.decode("utf8", errors="replace") if isinstance(value, bytes) else (value or "")
+                report = decoded(exc.stdout) + "\n" + decoded(exc.stderr)
+                report += "\nExport exceeded 30 minutes. Inspect the partial report before retrying."
+                ok = False
+            except OSError as exc:
+                report, ok = f"Could not start the game exporter: {exc}", False
+            (ROOT / "out").mkdir(exist_ok=True)
+            (ROOT / "out" / "last-publish-report.txt").write_text(report, encoding="utf8")
+            return self._json({"ok": ok, "report": report})
 
         if path == "/api/library/delete":
             d = library_dir(Path(str(body.get("id", ""))).name)

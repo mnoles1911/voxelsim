@@ -1,4 +1,112 @@
+# Creature reconstruction pilot handover
+
+## Current checkpoint: all eight static pilots delivered
+
+Review: http://127.0.0.1:8731/static/pilot-review.html (also linked from the Forge header).
+All eight are saved in the library and exposed in the Forge dropdown as imported models.
+The desktop shortcut targets port 8731 and refreshes a verified stale Forge server.
+Use the launcher to inspect the current fingerprint; historical PIDs below are obsolete.
+
+Wolf appearance is user accepted. Tiger, red deer stag, common raven, golden eagle,
+rainbow trout, great white shark and orca are complete static candidates awaiting set review.
+Do not expand to other animals before review. No Tripo work or goblins.
+
+`asset-forge/refs/reconstruction/pilot-manifest.json` is the authoritative model list.
+`pilot-validation.json` records all eight exact RGB payload / surface / connected-component
+checks. Each species has attribution and a review note with biological references,
+interpretations and limits. Models are 12.5 mm cubes; not rigged or runtime-ready.
+
+Important interpretation limits: generic tiger/deer source taxonomy is not measured;
+bird feet were reconstructed after removing fused specimen perches; eagle plumage
+is immature; trout was scaled to a large game fish and markings are simplified.
+The source meshes are visual foundations, not certified anatomical measurements.
+
+New reusable steps: explicit scale and heading; both-hemisphere source inspection;
+optional combined-shell fill; texture-footprint sampling or constant-material fast path;
+authored RGB; six orthographic and six oblique views; validated draft installation.
+Tools and per-species review notes retain study names for reproduction. Source hashes
+and CC BY/CC0 licenses live beside each saved asset. Cached original GLBs remain in
+ignored out/creature-reconstruction/source-meshes, retrievable by source ID.
+
+UI fixes: appearance approval is separate from Export to game. Imported assets cannot
+be procedurally regenerated/overwritten. The original reported Publish error was not
+captured; game export has four stale environment banks in the last read-only diagnostic
+(black-coral-tree, bramble-thicket, carnation-soft-coral, cold-water-coral). This is not
+an appearance-review failure. Do not bulk publish or change other sessions' environment
+assets. Hundreds of baseline spec approvals and UE water/UI edits belong to other work.
+
+## Historical checkpoints (superseded)
+
 # Creature reconstruction pilot checkpoint
+
+## Active checkpoint: accepted wolf, seven remaining pilots
+
+LATEST: the desktop shortcut now checks a server startup source fingerprint and
+restarts verified stale Forge listeners. Port 8731 is current (PID 7324 at test);
+use this standard port for review, not the temporary 8747 server. Direct links:
+`http://127.0.0.1:8731/?species=grey_wolf_anatomy_pilot` and
+`http://127.0.0.1:8731/?species=bengal_tiger_anatomy_pilot`.
+The Library defaults to Never reviewed, hiding draft imports; direct links
+select the model and Any verdict. User requested this access fix while pilot
+work continues. Second launcher run reused the same current PID.
+
+Tiger candidate is installed with 210,538 voxels and RGB, one component, at
+12.5 mm. Whisker cleanup removes 32 specific source strands. See new tiger
+review and attribution under `refs/reconstruction/bengal-tiger`. Remaining
+Bengal-specific proportion checks are explicit; do not claim set approval.
+
+Bird checkpoint: read `refs/reconstruction/bird-source-review.md`.
+CC0 raven MP 040 and eagle MP 407 are downloaded and prepared. Raven perch
+removal remains experimental with visible support fragments; not installed.
+Alternative Korppi raven was rejected for an incomplete back confirmed in
+expanded original-source views 4/5. The preparation transform is not the cause.
+Inspection now covers both hemispheres. Combined-shell fill is opt-in and passed
+a split-cube test (729 occupied, 386 surface); it cannot close missing anatomy.
+Source discovery stops on HTTP 429 and reports incomplete results. Prior shark
+zero shortlist was rate limiting, not absence of sources.
+
+The user approved the finished static wolf in Asset Forge (commit `2befc8f`)
+and requests independent overnight completion of the other seven animals.
+The latest direction explicitly sets Tripo/AI 3D services aside. Continue the
+wolf method, using `asset-forge/refs/reconstruction/PIPELINE.md`.
+An hourly thread heartbeat `finish-creature-anatomy-pilot` is active.
+Do not wait for creative feedback; present the complete set for review.
+
+Wolf entry `grey_wolf_anatomy_pilot-0001` is saved with full RGB sidecar and
+CC BY attribution. Forge on port 8747 was visually verified. Shared-palette
+VXA runtime appearance and rigging remain separate. The user's acceptance is
+visual, not permission to label runtime work complete.
+
+Tiger discovery has cached 66 source records and three license-filtered sheets
+under `out/creature-reconstruction/research/tiger-*`. Deer discovery likewise
+has 58 records and three sheets. `tools/find_creature_sources.py` reproduces
+discovery; it does not approve sources. Three tiger GLBs downloaded: `10cf9935...`
+(daniel.jibi, walking pose, promising), `fc2c7fd...` (Amil, running pose), and
+`9488609...` (Jai.Gupta, not yet rendered). First two have four-view Blender
+renders under `source-meshes/tiger-10cf-review` and `tiger-fc2-review`.
+Avoid `ac718cd...`: description says 2D-to-3D Monster Mash. Other thumbnails
+include toy scans and game characters, which are unsuitable starting masters.
+
+Scene transforms and skin evaluation differ between raw trimesh and Blender
+on these sources. `tools/prepare_creature_master.py` bakes evaluated static
+geometry, retains UV/materials and normalizes heading; inspect its PCA heading
+before using the resulting GLB with the existing voxelizer.
+
+## Historical checkpoint: wolf coat study (superseded by accepted wolf above)
+
+The user explicitly supported the process and requested continuing the wolf.
+`asset-forge/tools/refine_wolf_pilot.py` now generates a separate reference-informed
+coat candidate from the previous source study. See
+`asset-forge/refs/reconstruction/grey-wolf/coat-study-review.md` for visual findings
+and the newly identified shoulder-height discrepancy. The comparison lives at
+`asset-forge/out/creature-reconstruction/grey-wolf-coat-study/before-after.png`.
+This is an appearance improvement candidate; anatomical approval remains open.
+
+Exact occupied cells and surface indices match the prior study; six projections
+from the refactored exporter are pixel-identical to the baseline, and exterior
+triangle count/winding checks pass. The inspection studio now uses fixed -1.5 EV
+exposure to avoid washing out the coat. Re-render older oblique images under the
+same exposure for a fair comparison. Orthographic RGB images remain unlit.
 
 The user accepted the anatomy-first eight-species pilot and explicitly made
 anatomical and visual realism the primary acceptance criterion. Continue
@@ -35,7 +143,7 @@ The most recent full-color wolf comparison is in
 `grey-wolf-source-study/six-views.png`; actual cubic oblique renders are in
 `grey-wolf-source-study/oblique/view-*.png`.
 
-## Outstanding work
+## Historical outstanding work (superseded by active checkpoint above)
 
 No pilot model is visually approved or ready to replace the wildlife library.
 The next meaningful step is a better evidence-based wolf master, correcting
