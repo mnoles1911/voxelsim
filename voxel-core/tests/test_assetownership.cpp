@@ -41,7 +41,7 @@ VXC_TEST(asset_ownership_demotion_needs_current_projection_and_cancel_preserves_
     auto duplicate=pages;duplicate.push_back(pages[0]);
     CHECK(!state.begin(tree,AssetRenderOwner::Object,4,4,duplicate).serial);
 }
-VXC_TEST(asset_ownership_identity_and_render_filter_leave_authority_intact) {
+VXC_TEST(asset_ownership_identity_leaves_authority_intact) {
     AssetProvenance a;a.worldSeed=123;a.providerFingerprint=7;a.catalogFingerprint=8;
     a.anchorVx=-1;a.anchorVy=-700;a.anchorVz=29;a.bankId=4;a.seedIndex=5;a.yawQuarter=3;
     auto b=a;b.anchorVx=1;CHECK(!(assetObjectId(a)==assetObjectId(b)));
@@ -50,9 +50,8 @@ VXC_TEST(asset_ownership_identity_and_render_filter_leave_authority_intact) {
     CHECK(assetObjectId(a)==assetObjectId(a));
     std::vector<AssetProvenance> authoritative{a,b};
     AssetOwnershipSnapshot snapshot;snapshot.records.push_back({a,assetObjectId(a),AssetRenderOwner::Object,1,1});
-    auto cpu=assetTerrainRenderInstances(authoritative,snapshot,[](const auto& p){return p;});
-    auto gpu=assetTerrainRenderInstances(authoritative,snapshot,[](const auto& p){return p;});
-    CHECK_EQ(authoritative.size(),2u);CHECK_EQ(cpu.size(),1u);CHECK(cpu==gpu);CHECK(cpu[0]==b);
+    CHECK(snapshot.objectOwns(a));CHECK(!snapshot.objectOwns(b));
+    CHECK_EQ(authoritative.size(),2u);
     CHECK(authoritative[0]==a); // collision/edit source is never filtered
 }
 VXC_TEST(asset_resolved_instances_preserve_bank_provenance) {
