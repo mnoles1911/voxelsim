@@ -110,6 +110,14 @@
 //   no "Voxel frame phase" line, with -VoxelFramePhase=1
 //                       -> the hook was not applied. Nothing here ran.
 //   frames=0            -> the hook is present but not called.
+//   seg=MENU n=0, on a -Shot Menu leg
+//                       -> HOOK 0 (NoteMenuFrame) is not being called from the
+//                          front end's Menu-state tick. This is the ONE
+//                          segment a menu-only leg can populate -- FILL and
+//                          both SETTLED rows read n=0 there by construction,
+//                          since HOOK 1 never runs before NEW GAME -- so
+//                          seg=MENU n=0 on such a leg is not a quiet corner
+//                          case, it is the whole leg saying nothing.
 //   seg=SETTLED-MOVING n=0
 //                       -> THE LEG NEVER FLEW AFTER SETTLE, or hook 1 is not
 //                          receiving anchor speed. NO >100 FPS CLAIM MAY BE
@@ -268,6 +276,35 @@ inline double SteadyPct()
 
 // The out-of-line body. Never called with Mode() == 0.
 void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpeedUUPerSec);
+
+// HOOK 0, from the front end's Menu-state tick -- the ONLY place this file's
+// data reaches before NEW GAME.
+//
+// WHY THIS HOOK HAD TO BE ADDED, NOT FOUND. HOOK 1 below is called from the
+// end of the streaming tick (VoxelWorldSubsystem.cpp), which returns before
+// doing anything while UVoxelWorldSubsystem::ChunkOwner is null -- exactly the
+// state the front end leaves it in for as long as the menu holds the world.
+// So the menu was a total blind spot: no "Voxel frame dist" line, ever, said
+// anything about it, and this file's own FAILING READINGS could not tell an
+// untouched hook from a mute menu. seg=MENU below is that fourth segment,
+// fed independently of FILL/SETTLED-PARKED/SETTLED-MOVING (those three stay
+// exactly as printed; see the reading rule at the end of this list).
+//
+// FrameMs is passed in ALREADY COMPUTED (DeltaTime*1000 from the front end's
+// own Tick), unlike HOOK 1 which diffs its own clock. The front end's
+// DeltaTime is already a trustworthy per-call value; a second clock here
+// diffing FPlatformTime::Seconds() a second time could disagree with it for
+// no reason, which is exactly the kind of second opinion this project keeps
+// getting bitten by.
+VOXELEARTH_API void NoteMenuFrameImpl(double FrameMs);
+
+FORCEINLINE void NoteMenuFrame(double FrameMs)
+{
+	if (Mode() != 0)
+	{
+		NoteMenuFrameImpl(FrameMs);
+	}
+}
 
 // HOOK 1, at the end of the streaming tick, with three values the caller has
 // already computed.

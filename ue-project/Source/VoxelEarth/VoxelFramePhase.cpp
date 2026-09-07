@@ -150,6 +150,12 @@ struct FDist
 FDist FillWindow, FillTotal;
 FDist ParkWindow, ParkTotal;      // SETTLED, anchor speed below the threshold
 FDist MoveWindow, MoveTotal;      // SETTLED, anchor speed at or above it -- THE GATE
+// THE FOURTH SEGMENT, HOOK 0's own. Fed from the front end's Menu-state tick,
+// which runs before FILL/PARKED/MOVING can exist at all (HOOK 1 never fires
+// pre-NEW-GAME) -- so this is not a fourth slice of the same population, it is
+// the only population a menu-only leg can ever have. No gate: GOAL 3 is a
+// gameplay statement and the menu makes no >100 FPS claim.
+FDist MenuWindow, MenuTotal;
 bool bSettled = false;
 double SettleSeconds = -1.0;
 int64 SelfCheckFailures = 0;      // hitches > n, ever. See EmitDist.
@@ -438,8 +444,13 @@ void Flush(double Now)
 		EmitDist(TEXT("FILL"),           TEXT("total"),  FillTotal,  false);
 		EmitDist(TEXT("SETTLED-PARKED"), TEXT("total"),  ParkTotal,  false);
 		EmitDist(TEXT("SETTLED-MOVING"), TEXT("total"),  MoveTotal,  true);
+		// MENU, appended rather than interleaved so every row above is
+		// byte-identical to before this segment existed. No gate (bGate=false):
+		// GOAL 3 is a settled-moving gameplay statement and does not apply here.
+		EmitDist(TEXT("MENU"),           TEXT("window"), MenuWindow, false);
+		EmitDist(TEXT("MENU"),           TEXT("total"),  MenuTotal,  false);
 
-		FillWindow = ParkWindow = MoveWindow = FDist{};
+		FillWindow = ParkWindow = MoveWindow = MenuWindow = FDist{};
 	}
 
 	if (Mode() & kModeReconcile)
@@ -591,6 +602,41 @@ void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpee
 	if (FrameMs - VoxelTickMs - FMath::Max(0.0, GameMs - VoxelTickMs) - GameWaitMs < -1.0)
 	{
 		++NegativeResidualFrames;
+	}
+
+	if (Now - LastLogSeconds >= 5.0)
+	{
+		Flush(Now);
+	}
+}
+
+void NoteMenuFrameImpl(double FrameMs)
+{
+	const double Now = FPlatformTime::Seconds();
+
+	// SAME FIRST-CALL SHAPE AS NoteFrameImpl, AND FOR THE SAME REASON: the
+	// menu is (almost always) the very first caller into this file for the
+	// whole process, so LastLogSeconds is still its zero-init default here.
+	// Without this guard the first-ever call would see Now - 0.0 as a huge
+	// elapsed time and flush an instant, one-frame "5 s" window. Seed the
+	// clock only; record nothing.
+	if (LastLogSeconds <= 0.0)
+	{
+		LastLogSeconds = Now;
+		return;
+	}
+
+	// THE DISTRIBUTION ONLY -- there is no reconciliation counterpart for the
+	// menu. kModeReconcile reads GRenderThreadTime/GGameThreadTime, which are
+	// FViewport::Draw globals with no defined relationship to a Slate-only
+	// frame that never calls FViewport::Draw for a game view; extending that
+	// half of the file to the menu would be inventing a second, unverified
+	// instrument rather than reusing this one, and Task 1's ask is the
+	// distribution row only ("seg=MENU in the Voxel frame dist... lines").
+	if (Mode() & kModeDistribution)
+	{
+		MenuWindow.Add(FrameMs, 0.0); // no anchor on the menu; speed fields read 0, unused (bGate=false)
+		MenuTotal.Add(FrameMs, 0.0);
 	}
 
 	if (Now - LastLogSeconds >= 5.0)

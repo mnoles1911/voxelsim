@@ -17,6 +17,7 @@
 #include "VoxelFrontEndSwitches.h"
 
 #include "VoxelFrontEndPolicy.h"
+#include "VoxelFramePhase.h" // NoteMenuFrame -- HOOK 0, the menu's own frame-dist row
 #include "VoxelEarthGameMode.h"
 #include "VoxelSaveLibrary.h"
 #include "VoxelWorldSubsystem.h"
@@ -110,6 +111,11 @@ void UVoxelFrontEndSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 	State = EVoxelFrontEndState::Pending;
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: active (%s)."), VoxelFrontEnd::WhyThisAnswer());
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): the latched
+	// A/B value, printed once so a leg's own log proves which arm ran rather
+	// than relying on the command line the leg was launched with.
+	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: menu tick gates=%d."),
+	       VoxelFrontEnd::MenuTickGatesEnabled() ? 1 : 0);
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: menu font %s."),
 	       FVoxelUIStyle::Get().IsProjectFontAvailable() ? TEXT("loaded") : TEXT("FALLBACK (engine default face)"));
 }
@@ -587,6 +593,7 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 	FVoxelReadyProbeConfig ProbeConfig;
 	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
 	ProbeConfig.GateMaxRingLevel = Switches.LoadGateMaxRing;
+	ProbeConfig.bRequireFineRing = Switches.bLoadGateFineRing;
 	ProbeConfig.MaxWaitSeconds = Switches.LoadMaxHoldSeconds;
 
 	FVector Anchor = FVector::ZeroVector;
@@ -925,6 +932,13 @@ void UVoxelFrontEndSubsystem::Tick(float DeltaTime)
 
 	if (State == EVoxelFrontEndState::Menu)
 	{
+		// HOOK 0 (VoxelFramePhase.h): the menu's own "Voxel frame dist"
+		// row, seg=MENU. First in the block, ahead of every branch below
+		// (settle-then-capture, autostart, the watchdog) so a leg that quits
+		// early via -VoxelMenuShot still banks every Menu-state frame it was
+		// actually ticked, not just the ones before the first early return.
+		VoxelFramePhase::NoteMenuFrame(double(DeltaTime) * 1000.0);
+
 		if (!bMenuInputApplied)
 		{
 			ApplyMenuInputMode();

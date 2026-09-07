@@ -288,6 +288,18 @@ void AVoxelOceanActor::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): BuildOceanGrid
+	// and UpdateFollowPlane below are real per-frame mesh rebuild / transform
+	// work with no camera-relative water surface to follow while the front
+	// end holds the world (UpdateUnderwaterState already gates itself at
+	// :733-ish below; this early return makes that redundant but harmless).
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
+	{
+		return;
+	}
+
 	// ---- THE DETAIL TOGGLE, CHECKED AGAINST THE MESH AND NOT AGAINST A FLAG --
 	//
 	// One integer compare per tick, and it is the whole rebuild trigger. The

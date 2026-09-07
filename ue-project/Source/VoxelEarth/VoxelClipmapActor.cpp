@@ -1608,6 +1608,19 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 		}
 	}
 
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): everything
+	// from here down is real per-frame terrain-mesh work (recenter snapping
+	// plus round-robin RebuildLevel) with no vista to build while the front
+	// end holds the world. The veil block above stays: IsCameraUnderRock
+	// already fails open under IsWorldHeldForMenu (see its own gate at
+	// :722-ish above) and is cheap either way.
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
+	{
+		return;
+	}
+
 	// CONCENTRIC recenter (the ring-seam fix). ALL levels share ONE
 	// camera-snapped origin, so every level's outer boundary lands on exactly
 	// the same world-space square as the next-coarser level's inner hole

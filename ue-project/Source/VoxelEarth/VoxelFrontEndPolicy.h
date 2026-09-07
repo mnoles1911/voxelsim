@@ -86,6 +86,21 @@ VOXELEARTH_API const TCHAR* WhyThisAnswer();
 // at the top of this file holds: with no menu, no caller behaves differently.
 VOXELEARTH_API bool IsWorldHeldForMenu(const UWorld* World);
 
+// -VoxelMenuTickGates=0|1, default 1, latched once and clamped 0..1. The A/B
+// switch for the menu tick gate 2026-09-07 backlog item (docs/backlog.md
+// §0.0o-adjacent): at 1 (default) every gated site added by that item skips
+// its per-frame work while IsWorldHeldForMenu(); at 0 every one of those sites
+// runs exactly as it did before the item existed, on the SAME build, so a leg
+// can A/B the change without a rebuild. Logged once at front-end init
+// ("VoxelFrontEnd: menu tick gates=%d") so a leg's log proves which arm ran.
+//
+// Unlike IsWorldHeldForMenu, this is not gated on IsEnabledThisRun(): a
+// -VoxelMenuTickGates=0 leg with no front end this run has nothing to turn
+// off in the first place (every caller ANDs this with IsWorldHeldForMenu,
+// which already returns false with no front end), so the invariant at the
+// top of this file still holds without a second guard here.
+VOXELEARTH_API bool MenuTickGatesEnabled();
+
 // Exposed for tools/lint-frontend-switch-coverage.py's counterpart test and
 // for -VoxelFrontEndExplain: classify one switch NAME (no leading dash, no
 // trailing '='), e.g. "VoxelGICaveTest" -> true, "VoxelSeed" -> false.

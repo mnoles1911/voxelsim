@@ -4,6 +4,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
+#include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelLightField.h"
 // VoxelEarth -> VoxelEarthShaders, never the reverse (see VoxelEarth.Build.cs).
 // So the encoder and its driver live HERE, in the module that owns the light
@@ -1948,6 +1949,18 @@ void UVoxelGISubsystem::TickVolume()
 					GVoxelGIVolume.UpdateParameters_RenderThread(Off);
 				});
 		}
+		return;
+	}
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): EnsureVolumeOrigin
+	// below retries every tick until a terrain GPU pool exists, and none does
+	// while the front end holds the world -- this is the anchor retry that
+	// logged an Error after 1,801 refusals on the menu. Arm verification and
+	// the IsEnabled()/bMarchArm accounting above this function's caller are
+	// untouched; only the retry and the upload work it gates are skipped.
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
+	{
 		return;
 	}
 	if (!EnsureVolumeOrigin())

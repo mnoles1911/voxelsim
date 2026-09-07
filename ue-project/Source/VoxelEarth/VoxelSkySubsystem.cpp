@@ -3457,6 +3457,24 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 		}
 	}
 
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): the
+	// ephemeris computation and MPC writes below have no visible sky to feed
+	// -- the menu background is SVoxelCoverImage, a plain 2D Slate brush over
+	// SVoxelMainMenu, never a scene capture of the world -- and every reader
+	// found for GetSkyState() (VoxelEarthHUD, VoxelPauseUISubsystem's and
+	// VoxelScreensUISubsystem's day counters, VoxelFluidSubsystem,
+	// VoxelWaterSubsystem, VoxelWeatherSubsystem [gated separately, above])
+	// is gameplay-only and cannot run while the front end holds the world.
+	// This is placed AFTER the deferred-rig check on purpose: that block's
+	// own job is to notice the moment IsWorldHeldForMenu goes false and stop
+	// deferring, so it must keep running while held.
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
+	{
+		return;
+	}
+
 	if (!VoxelSky::IsEnabled())
 	{
 		// One frame of work to undo the feature, then IsTickable goes false.

@@ -240,6 +240,21 @@ private:
 	TWeakObjectPtr<UDirectionalLightComponent> SunComponent;
 	bool bLoggedSunChoice = false;
 	bool bLoggedNoSun = false;
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): while no sun
+	// is found, Tick() reran the TActorIterator<ADirectionalLight> scan below
+	// EVERY frame -- which on the menu is forever, since the sky rig is
+	// deferred there. This module cannot ask VoxelFrontEnd::IsWorldHeldForMenu
+	// (VoxelEarth -> VoxelEarthShaders is the only allowed dependency
+	// direction; the reverse is circular -- see this module's own Build.cs and
+	// VoxelGI.cpp's "VoxelEarth -> VoxelEarthShaders, never the reverse"), so
+	// the fix throttles the scan itself: at most once a second. Starts at 1.0
+	// (not 0) so the FIRST tick after BeginPlay scans immediately rather than
+	// waiting a full second for a sun that may already exist. A later
+	// invalidation (sun actor respawned) resets this to 0.0 on the scan that
+	// noticed it, same as any other scan, so re-acquiring the new component
+	// can take up to a second -- the same "up to 1 s" latency accepted for the
+	// deferred sky rig, not a special case.
+	float SunRetryAccumSec = 1.0f;
 
 	// S2 injection state. UPROPERTY so the GC cannot collect the target or the
 	// MID out from under the sun's light function.
