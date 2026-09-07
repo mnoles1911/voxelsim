@@ -135,8 +135,11 @@ if ($wantGame) {
     # applies it to any -game process without focus, unattended included, so a
     # project-wide setting would freeze every headless capture and Codex leg
     # the moment its window was not in front.
+    # Set as a console command, not -dpcvars: the variable is ECVF_Cheat and the
+    # device-profile path refuses it ("only allowed in console"), which the log
+    # says out loud and the window then ignores.
     $argList += '-game'
-    $argList += '-dpcvars=t.IdleWhenNotForeground=1'
+    $argList += '-ExecCmds="t.IdleWhenNotForeground 1"'
 } elseif (-not $NoAutoPIE) {
     $argList += '-VoxelAutoPIE'
 }
