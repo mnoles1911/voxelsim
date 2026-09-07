@@ -72,12 +72,15 @@ function ServerDownBanner() {
 
 export default function App() {
   const toast = useToast();
-  const [tab, setTab] = React.useState<Tab>("forge");
+  const [initialSpecies] = React.useState(() => new URLSearchParams(window.location.search).get("species"));
+  const [tab, setTab] = React.useState<Tab>(initialSpecies ? "library" : "forge");
   const [importOpen, setImportOpen] = React.useState(false);
   const [world, setWorld] = React.useState<World | null>(null);
   const [bootError, setBootError] = React.useState<string | null>(null);
   /* stage-4 handoff: which species the library should open on arrival */
-  const [libraryFocus, setLibraryFocus] = React.useState<{ name: string; n: number } | null>(null);
+  const [libraryFocus, setLibraryFocus] = React.useState<{ name: string; n: number } | null>(
+    initialSpecies ? { name: initialSpecies, n: 0 } : null,
+  );
   /* library -> forge handoff: "more like this" re-opens a kept spec at stage 1 */
   const [forgeRequest, setForgeRequest] = React.useState<ForgeRequest | null>(null);
 
