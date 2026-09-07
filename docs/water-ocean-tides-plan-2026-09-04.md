@@ -1926,9 +1926,21 @@ zero debug markers).
 
 ## 2026-09-07 afternoon: wake fix shipped into the assets
 
-The fix is now IN BOTH SHIPPING ASSETS and proven at the byte level. **It has not
-been photographed**: the box lost its ability to run a capture partway through the
-pass (see the BLOCKED rows), so every image gate in Phase 1 is still open.
+The fix is now IN BOTH SHIPPING ASSETS, proven at the byte level, **and
+photographed**. Committed as `fe51c15`.
+
+The pass was interrupted partway through: the capture harness rebuilt
+`voxelcore.lib` from another agent's in-flight edits and left the module DLLs
+incoherent, so steps 1.2-1.4 were blocked until a build landed. After the build
+they all ran and all passed -- frames `VoxelVerify00964` (legible pose),
+`00966` (owner pose), `00974` (boat under way), `00978` (glider parked). The
+scoreboard below is the record; where an earlier draft of this section said the
+frames did not exist, it was written during the block and is superseded.
+
+What remains open is not the mechanism but the LOOK: the wake injection is a
+2.0 m debug-magnitude displacement, roughly 100x the shipped player ripple of
+0.020 m, so at the owner's +6 m pose it swamps the frame. That is an owner call
+on injection strength for future captures, not a defect in the tap.
 
 ### Scoreboard
 
@@ -1943,11 +1955,14 @@ pass (see the BLOCKED rows), so every image gate in Phase 1 is still open.
 | 2026-09-07 | 1.2 | Wake capture, shipping default, legible pose | **PASS** | `VoxelVerify00964.png` (+12 m, pitch -35, yaw 45). Engagement: `CAPTURE WAKE FIRED ... injected=5 dropped(outside=0 full=0 unarmed=0 inert=0) steps=9703 fieldMaxAbs=2.0000 stateMaxAbs=2.0000. FROZEN.` and `field verified LIVE -- centre patch max field value 2.0000`. All 5 rings on valid water (`baked depth=5.10-5.95 m valid=1`). `Ocean: camera entered water` x0, `Failed to compile Material` x0, gate leaks 0. A large concentric disturbance fills the near field |
 | 2026-09-07 | 1.2 | Wake capture, owner pose | **PASS (engagement); frame swamped** | `VoxelVerify00966.png` (+6 m, pitch -18). Same counters (`injected=5 ... fieldMaxAbs=2.0000`), `camera entered water` x0. The 2.0 m displacement seen almost edge-on from 6 m fills nearly the whole frame; the lake is not legible in it |
 | 2026-09-07 | 1.3 | Boat under way | **PASS** | `VoxelVerify00974.png` (+6 m, pitch -12). `VoxelBoat: BOARDED at (-6509900,-5108400,165038). ... The ripple window now follows the boat.` then `voxel.Boat.Throttle 1 12`; camera travelled ~22 m from spawn by the shutter, `unloaded=280`. Hull and wake arcs visible. Gate leaks 0 |
+| 2026-09-07 | 1.2 | Wake IMAGE, owner verdict | **FAIL (owner)** | Owner on the boat frame: "The boat wake looks like a hard grey blob on the surface and it makes no sense what so ever. I see no shore foam at all in the screenshot." On `VoxelVerify00966`: "a grey plane covering almost the entire world map - that's really weird and not expected." **The PASS rows above are ENGAGEMENT passes and were wrongly presented as settling the image.** Code retained, defect assigned; not a rollback |
+| 2026-09-07 | 1.3 | Boat wake IMAGE, owner verdict | **FAIL (owner)** | Same verdict, same frame set. Diagnosis to be tested, not assumed: `build_disturbance_foam` computes `saturate((|grad| + |height_m| * 4.0) * 8.0)`, so any texel above raw 0.125 pins to full white and the wake becomes a binary mask of "where the field has been touched" rather than a wake. The hard edge is the ripple window boundary, where a ~3.3 m edge fade cuts saturated foam against undisturbed water |
+| 2026-09-07 | 1.2/1.3 | Shore foam | **NOT ANSWERABLE from these frames** | Saturated disturbance foam sits on top of the shoreline, so "I see no shore foam" is confounded and is not evidence about shore foam. The two features must be separated before either gets a verdict |
 | 2026-09-07 | 1.4 | Glider parked spawn | **PASS** | `VoxelVerify00978.png` at column -65059,-51042 (+3 m, pitch -12). `voxel.Glider.Spawn: PARKED glider at (-6505100,-5104200,165161), resting on the surface.` Both required strings present, gate leaks 0 |
 | 2026-09-07 | 1.5 | `voxel.Water.Caustics` help text says the real default | **DONE** | `VoxelWaterSubsystem.cpp:262` help string `Default 1.` -> `Default 0.5.`; the cvar's value `0.5f` is unchanged. String-only edit, not built |
 | 2026-09-07 | 1.6 | UI divergences vs the 2026-09-07 mocks | **DONE, 14 screens** | 8 pre-existing captures (Inventory, Journal, Map, Player, Codex, Death, Dialogue, HUD v2) plus 6 taken this pass (`VoxelMenu00015`/`00016`/`00018`, `VoxelLoading00004`, `VoxelPause00005`/`00006`). List below, with 7 cross-cutting causes called out |
 | 2026-09-07 | 1.6 | Capture set is real (silent-failure check) | **CAUGHT ONE** | `VoxelMenu00017.png` was byte-identical to the main menu (md5 `e9d094f9…` on both) -- `-Shot Panel -Panel save` opened nothing. Re-taken as `-Shot Pause -Panel save -DemoSaves` -> `VoxelPause00006.png`, log `6 save(s) listed`; all three pause captures now hash differently |
-| 2026-09-07 | 1.7 | Commit the water files | **NOT DONE -- correctly withheld** | The commit is conditioned on 1.2 passing and 1.2 never ran. Files are staged-ready but uncommitted |
+| 2026-09-07 | 1.7 | Commit the water files | **DONE** | `fe51c15`, staged by explicit path list (no `git add -A`; 388 unrelated asset-forge files left alone). Gated on 1.2 passing, which it did |
 
 ### How the box blocked itself, and why no build was run
 
@@ -2479,6 +2494,331 @@ requested — 42 px short, presumably window chrome. Bottom-anchored elements ab
 were judged against the 1398 frame, so bottom-offset figures carry that
 uncertainty.
 
+### UI polish pass, 2026-09-07 (VoxelEarthUI only)
+
+Worked from the list above. No build, no editor, no capture -- every claim below
+is a source-level or file-level measurement, and every visual claim needs the
+box owner's re-capture at the new 1.0 DPI step to confirm.
+
+#### THE FONT: what the owner has to supply, and where
+
+**Press Start 2P is not in the repository and this pass did not add it.** A
+listing of `ue-project/Content/UI/Fonts/` on 2026-09-07 holds exactly four
+faces -- `MacondoSwashCaps-Regular.ttf`, `VT323-Regular.ttf`, `IMFeENrm28P.ttf`
+and `IMFeENit28P.ttf` -- and `docs/ui-mocks/2026-09-07/README.md` already
+records `--pixel` as "not shipped". What shipped instead is the wiring:
+`FVoxelUIStyle::Pixel(int32)` loads
+
+> **`ue-project/Content/UI/Fonts/PressStart2P-Regular.ttf`**
+
+by path if it is there -- the same `FStandaloneCompositeFont` route the other
+four use, so **dropping that one file at that one path is the entire change: no
+.uasset, no import, no editor, no code edit and no rebuild of this module.** The
+file is the OFL "Press Start 2P" regular from Google Fonts (the same source as
+the four already committed; its OFL text belongs beside them in
+`Content/UI/Fonts/OFL.txt`). Until it arrives, `Pixel()` returns **VT323**, not
+the engine default and not Macondo: VT323 is the only fixed-pitch,
+bitmap-derived face in the shipped set, so the `--pixel` sites read as small
+caps rather than as the serif swash the 2026-09-07 journal capture shows.
+`FVoxelUIStyle::IsPixelFontAvailable()` reports which face is in use, and the
+missing-file warning is printed once at startup by the same helper that reports
+the other three.
+
+The `--pixel` sites now routed through it: the journal card stamps, the journal
+NEW ENTRY card, and the journal page's `.p-kind` line.
+
+#### Four items in the list above that are wrong, with the receipts
+
+1. **The hunger bar's colour is correct as shipped.** The list reads
+   `.bar.stam .fill` against `menus_shared.css`'s `--stam:#c8a04a` and concludes
+   the port picked the pale-blue stop of an amber ramp. **"Voxelmark HUD v2.html"
+   carries its own `:root` and overrides `--stam:#6fb8d8; --stam-deep:#2a5a78`**
+   (line 20 of that file), and the port follows the screen it is cloning --
+   which `VoxelUITheme.h` says out loud at the `HudHungerFill` declaration. The
+   bar is meant to be blue. Do not "fix" it to gold.
+2. **The Codex ingredient line already uses U+00D7, not an ASCII X.**
+   `VoxelUIStrings.cpp`'s `CodexIngredientLine` is `"{0} x {1}"` with a real
+   U+00D7, stored as UTF-8 (`c3 97`), and UnrealBuildTool passes `/utf-8`
+   unconditionally on MSVC (`VCToolChain.cs:708`), so a BOM-less UTF-8 source is
+   read correctly. There is no encoding bug and no substitution to make.
+3. **Every absolute pixel figure in the list above is a DEVICE-pixel figure.**
+   They were measured on 2560-wide captures at a 1.333 scale. ADR-0011 keeps
+   that scale, so the numbers are still what the screen shows -- but they are
+   not comparable to the mocks' authored px or to anything in `VoxelUITheme.h`
+   without dividing by 1.333 first. Several entries in the list above compare
+   the two spaces directly; `LogoRight` is the one that was acted on, and it is
+   re-derived below.
+4. **The `.title-menu__item.active` cartouche was built and is not missing** --
+   `SVoxelMenuButton`'s Cartouche variant draws the gold fill and both 1 px
+   rules. What was wrong is *when*: it keyed only off `IsLit()`, i.e. hover or
+   keyboard focus on the inner `SButton`. See the next section.
+
+#### The selection indicator, on two screens, was one bug
+
+The title screen and the dialogue overlay both lost their only "which item am I
+on" affordance in the captures, and it is the same cause: the Cartouche
+variant's band was drawn only when the inner `SButton` held keyboard focus, so
+anything that takes focus elsewhere -- a viewport click, the capture harness, a
+panel focusing its own default -- erases it. `SVoxelMenuButton::IsCartoucheOn()`
+now ORs the existing `Active` attribute into that predicate (kept out of
+`IsLit()` so a selected Leather filter chip does not also take the hover plate).
+The dialogue binds it to `Selected == I`; the title screen binds it to
+"no title item holds focus", so NEW GAME carries the resting `.active` band and
+yields the instant any item is actually focused.
+
+#### One mechanism worth keeping: CSS line-height does not port
+
+`STextBlock::LineHeightPercentage(N)` is **N x the face's own line height**
+(`TextLayout.cpp:451`, `LineSize.Y = UnscaleLineHeight * LineHeightPercentage`),
+where CSS `line-height:N` is **N x the font size**. IM Fell English -- the
+`--hand` face every wrapped body block here uses -- has a natural line height of
+**1.269 em** (hhea 1638 / -961 / 0 over 2048 upm, read from both .ttf files), so
+the nine sites that passed the mock's CSS number straight through were laying
+out at 1.27x the intended leading. That is most of the list's "callout body too
+large and loose" (mock 16px / 1.45; capture measured a ~54 device px pitch
+against ~31 predicted). `VoxelUITheme::HandLineHeight(Css)` now does the
+conversion and the call sites still write the mock's own number.
+
+#### Left deliberately, and why
+
+* **Weight readout `112 / 180`.** The mock shows carried-over-capacity; the
+  product has no carry capacity at all (`FVoxelInventoryScreenData` carries
+  `CarriedKg` and nothing else). Printing a denominator would invent a game
+  rule. The 11 px `.weight i` swatch WAS added; it is the rotated square this
+  front end already uses for missing ornaments, because a cmap dump of all four
+  shipped faces found **none** of U+2B22, U+2B21, U+2726 or U+2205.
+* **The right-pointing caret on the Codex group header and the four-pointed star
+  on the journal card stamps.** Same cmap dump: U+25B8, U+25BE, U+25BC and
+  U+2726 are in none of the four faces. The group header took the half that does
+  not need a glyph -- upper case, tracking, and the right-aligned tally. Drawing
+  the carets needs either the pixel font above or hand-built geometry, and
+  neither is worth doing blind.
+* **RESPAWN's warm plate on the death screen.** The mock gives RESPAWN and QUIT
+  the identical leather gradient; the port makes RESPAWN primary. That is an
+  affordance the mock does without, not a porting error -- an owner call.
+* **`TitleFontSize = 84` against the mock's 108, and `PausePanelWidth = 380`
+  unscaled against the mock's own `scale(0.7)`.** Both are recorded deviations
+  with reasons in `VoxelUITheme.h`. At the new 1:1 step they now land at 84 and
+  380 *physical* pixels on a 2560-wide screen, which is materially smaller than
+  they looked at 1.333. Worth an owner look on the re-capture; not changed
+  blind.
+* **The Map screen.** The list itself says it is a different design, not a
+  divergent rendering. Out of scope for a polish pass.
+* **The Journal drop cap, the Player COMBAT matrix, the Codex 3x3 grid.** Real
+  divergences, all structural rather than cosmetic, and none of them cheap. Left
+  for a pass that can capture what it changes.
+
+#### The five suspect constants, re-derived (ADR-0011 consequence 5)
+
+| constant | verdict | why |
+|---|---|---|
+| `LogoRight` | **120 -> 100** | The mock states the number: `.stage .title-logo{right:100px}`. The +20 was added to "restore the ink margin" after a capture measured 34 px against an expected ~60 -- 34 device px is 25 units, and the ~60 was authored px, so the two were never in the same space. The Macondo swash-K overhang is real but a browser right-aligns on the box too, so the mock carries the same overhang and the port should not be compensating for it. If a capture shows the K crowding the frame, the fix is right padding on the logo text block, not a bigger inset on everything. |
+| `TitleFontSize` (84 vs mock 108) | **left, and it is moot** | **The constant is dead.** A grep of every .cpp in the module on 2026-09-07 found no reader: the 2026-09-07 title screen draws its wordmark from `LogoFontSize = 132` (`.title-logo__name`), and the only surviving references to `TitleFontSize` are its own ini registration. It cannot be re-derived because it does not reach a pixel. |
+| `TitleBoxWidth` | **left, and it is moot** | Same: dead, only its ini registration remains. It was also never a mock figure -- it is a Slate text-clipping workaround measured off a render, which is why its own comment forbids recomputing it from font metrics. |
+| `DlgDimAlpha` (0.55) | **left** | The mock states no single number for this layer: it stacks `rgba(0,0,0,0.25)` on a radial `.dlg-stage` wash reaching 0.6, and the port flattens both into one flat layer because Slate has no radial brush. There is no mock px value to re-derive from. Alpha, so scale plays no part either way. |
+| `PausePanelWidth` (380) | **left, it IS the mock value** | `.pa-panel{width:380px}`. The deviation is that the port drops the mock's own `scale(0.7)`, which the existing note argues is the author shrinking one card to sit beside two sibling states in one file. That is an owner judgement about the mock, not a constant to re-derive. |
+
+`SettingsPanelHeight = 660` was a sixth suspect and is **deleted** -- see below.
+
+#### Every 1 px border promoted to 2 (ADR-0011 decision 3)
+
+`VoxelUITheme::RulePx = 2.f` is the new floor, as a `constexpr` in the theme
+rather than an `FVoxelMenuLayout` field: it is a rendering constraint, not a
+design choice, and nothing should be able to tune it back to 1 from an ini.
+After the pass a scan of every `SOverlay` ring stack in the module finds **no
+band narrower than two units**, and no `HeightOverride(1.f)` /
+`WidthOverride(1.f)` / `FMargin(1.f)` anywhere in `SVoxel*.cpp`.
+
+Two shapes needed fixing, and the second is the one that is easy to miss:
+
+* a **hairline** drawn as a 1-unit `SBox`, and
+* a **band inside a ring stack**, whose width is the *difference* between two
+  consecutive `SOverlay` insets. `2` then `3` looks like two healthy numbers and
+  is a one-unit band. Six stacks were of that shape.
+
+| screen / helper | what it was | now |
+|---|---|---|
+| `VoxelOverlayChrome::Rule` (pause, settings, save, load titles + footers) | 1 u | 2 u |
+| `VoxelOverlayChrome::Panel` ring stack (all four overlay dialogs) | border 2 / edge 1 / leather 2 | 2 / 2 / 2 — `OverlayEdgeRingPx` 1→2, `OverlayInnerRingPx` 3→4 |
+| `VoxelOverlayChrome::KeyCap` (every `<kbd>` in the dialogs) | 1 u rule | 2 u |
+| `VoxelScreenChrome::CardRule` (hairlines inside every oak card) | 1 u | 2 u |
+| `VoxelScreenChrome` `kRingPx` — OakCard, IronWell, **ItemSlot's rarity ring** | 1 u | 2 u |
+| `VoxelScreenChrome::ParchmentPanel` | already asked for `kRingPx * 2` | now plain `kRingPx`, so it stays 2 rather than becoming 4 |
+| `VoxelScreenChrome::Track` ×2 (level bar, reputation bar, **HUD vitals**) | 1 u surround | 2 u |
+| Main menu — callout left rule, callout right rule, `.callout-news__glyph` plate | 1 u | 2 u |
+| Menu button — Cartouche top + bottom gold rules; `.pa-btn` bottom hairline | 1 u | 2 u |
+| Settings — slider track well, checkbox well (and the value fill's inset, which had to move with the ring or the warm bar paints over its own border) | black 1 / edge 1 | 2 / 2 |
+| Settings — `CheckboxMarkSize` | 14 u | **10 u** — the well's interior fell from 18 to 14, so the old mark exactly filled it |
+| Journal — page rule, goal rule, step marker dot | 1 u | 2 u |
+| Codex — page rule | 1 u | 2 u |
+| Player — perk plate edge (2/3), reputation bar (edge 1) | 1 u | 2 u |
+| Map — parchment frame's bronze ring (2/3) | 1 u | 2 u |
+| Dialogue — skill-cell divider; option key plate; portrait ring (2/3/5); skill strip ring (2/3/3) | 1 u | 2 u throughout (portrait now 2/2/2) |
+| Screen shell — tab plate (1/2) | 1 u | 2 u |
+| Save dialog — context band, context icon, `.sv-input` plate | 1 u | 2 u |
+| Load dialog — search plate, row plate, `.ld-tag` chip, `.ld-thumb` badge | 1 u | 2 u |
+| HUD — compass frame bronze band (2/3), interact key ring, **bar tick rules** | 1 u | 2 u |
+
+**Three to judge on a capture, flagged rather than exempted.** Each is a place
+where two units is a large fraction of a small control, and none of them can be
+settled without a picture:
+
+1. **The HUD bar ticks.** Nine 2-unit black rules across an 11-unit bar, where
+   the CSS asks for 1 px. This is the promotion most likely to read as too much
+   black. If it does, the honest fix is a lower tick alpha, not a 1-unit rule.
+2. **The HUD vitals bars.** `Track`'s black surround went 1→2 per side, so the
+   coloured fill inside an 11-unit bar drops from 9 units to 7.
+3. **The settings checkbox.** The well's chrome doubled and the mark had to
+   shrink 14→10 to keep a gap around it, so a ticked box reads smaller.
+
+Everything else lands on a surface at least 40 units across, where one extra
+unit of chrome per side is not a proportion anyone will notice.
+
+#### Icon and ornament audit (ADR-0011 decision 3, third bullet)
+
+**One violation, and it is art rather than code.**
+
+* **The six menu backdrops are authored at 1920x1071 and drawn full-bleed.**
+  `battle/castle_feast/cave/forest_fight/fortress_battles/sailing.jpg` are all
+  1920 wide (measured from their JPEG SOF markers). On the owner's 2560-wide
+  screen that is a **1.33x upscale**; on a 4K screen it is 2x. ADR-0011 asks for
+  at least 2x the largest displayed size, so these are short by a factor of
+  ~2.7 at 1440p. They are photographic rather than line art, so the failure mode
+  is softness and not aliasing -- which is why nobody has filed it -- but a
+  full-screen 1.33x upscale is exactly the class the ADR names. **Recommendation:
+  re-source at 3840 wide** (2x of 1920, and 1x at 4K); `SVoxelCoverImage` needs
+  no change, it computes its cover scale from the brush at paint time.
+* **The map hillshade is fine.** `world-maps/seed*/01-heightmap-hillshade.png`
+  is 1950x2085 and is drawn into a frame of roughly 800x930 device px, i.e.
+  **downscaled ~2.2x** -- comfortably inside the rule.
+* **Everything else in the front end is geometry, not bitmap.** Every rule,
+  ring, plate, well, track, item glyph and ornament is `FVoxelUIStyle::SolidWhite()`
+  -- a 1x1 white brush stretched under a tint -- so it is resolution-independent
+  by construction. `VoxelOverlayChrome::Diamond` is an `SBox` under a render
+  transform; `VoxelScreenChrome::ItemGlyph` and `VerticalRamp` are stacked boxes.
+  There is no icon texture anywhere in `Content/UI` and `FVoxelItemDef` has no
+  image field, so there is no icon art to audit.
+* **Text is already compliant.** All four shipped faces are TrueType outline
+  fonts (`unitsPerEm` 1000-2048, real `glyf` outlines), rasterised per size by
+  FreeType. The fifth, Press Start 2P, is a pixel-styled face but is still a
+  TrueType outline; when it is supplied it will scale like the rest.
+
+#### Whole-pixel audit (kept, but no longer load-bearing)
+
+ADR-0011 makes the scale continuous, so nothing lands on a device pixel at any
+setting and rounding buys no alignment. It is kept because a fractional
+*authored* value still buys nothing either, and because one of the five buys
+something real that survives the doctrine change: rounding the compass tape's
+offset gives the strip a STABLE subpixel phase, which is what stops its letters
+shimmering as the player turns. Five fractional edges found and rounded:
+
+| where | was | now |
+|---|---|---|
+| `SVoxelScreenChrome.cpp` `ItemSlot` glyph inset | `Size * (6/56)` = 6.214 at the 58 px pack cell | rounded to a whole unit |
+| `SVoxelGameHud.cpp` interact key ring | `FMargin(1.5f)` | `2.f`, matching the compass frame's band in the same file |
+| `SVoxelDialogueOverlay.cpp` option key ring | `FMargin(1.5f)` | `2.f` |
+| `SVoxelInventoryScreen.cpp` craft grid | `InvCraftSlotGap(3) * 0.5` = 1.5 | asymmetric 2/1 halves -- the gap is still exactly 3, every edge whole |
+| `SVoxelGameHud.cpp` compass tape offset | continuous, from the heading | rounded; the tape steps 1 unit per half a degree, below what a turning player sees |
+
+Every other `Gap * 0.5f` in the module divides an even token. The remaining
+fractional literals are alphas and line-height ratios, which are not pixel
+edges.
+
+#### The Settings panel: the fold, and the new row
+
+* **The fixed panel height is gone.** `SettingsPanelHeight = 660` hid OCEAN MESH
+  DETAIL below a scrollbar -- one of only two player-facing water rows. The
+  panel is now content-sized (`VoxelOverlayChrome::Panel`'s documented
+  `Height <= 0`) and capped by `MaxDesiredHeight` bound to the panel widget's
+  own geometry, which is the whole overlay area in both hosts and therefore
+  cannot feed back on the panel's desired size. That is the mock's own
+  `max-height:calc(100vh - 24px)`. The `SScrollBox` stays as a backstop for a
+  window shorter than the content, and its bar is now 12 units thick with 6 of
+  padding so that if it ever does engage it is not mistaken for a border.
+* **New row: INTERFACE / INTERFACE SIZE.** ADR-0011 decision 5, and the
+  settings-panel policy: a manual multiplier on top of the engine's own
+  ShortestSide curve, so the owner can settle framing without a rebuild:
+  `VoxelGraphicsUserSettings::Get/SetUIScale`, persisted at
+  `[VoxelGraphics] UIScale` in `GGameUserSettingsIni`, applied live through
+  `FSlateApplication::SetApplicationScale`, **default 1.00**, 0.75-1.50 in 0.05
+  steps, snapped and clamped in one place on both the read and the write path.
+  `ApplyAll()` applies it at boot alongside the cvar rows and names it in the
+  engagement log. `BuildSliderRow` grew a readout and a step parameter so the
+  row could map a non-0..1 range without a second copy of the track. Its hint
+  no longer claims pixel-exactness at 100% -- under continuous scaling nothing
+  is pixel-exact at any setting, and the earlier wording promised something the
+  policy does not deliver.
+
+#### Needs a file outside this pass's scope
+
+**The journal shows two different day numbers at once**, and the fix needs one
+line in `VoxelScreensUISubsystem.cpp`, which this pass did not own. The cause is
+not the day derivation -- `VoxelPauseUISubsystem.cpp:56` is correct -- it is that
+`VoxelScreenData::SeedJournal`'s newest placeholder entry is hard-coded to
+**day 12** while the NEW ENTRY card prints the live `TodayStamp` (day 11 in the
+capture). The seed entry is therefore dated *tomorrow*. The smallest honest fix
+is to date the seeds relative to the live day:
+
+    --- a/ue-project/Source/VoxelEarthUI/VoxelScreenData.h
+    +++ b/ue-project/Source/VoxelEarthUI/VoxelScreenData.h
+    -VOXELEARTHUI_API FVoxelJournalData SeedJournal(const FText& TodayStamp);
+    +// TodayDay: the live day number the NEW ENTRY card's stamp is showing. The
+    +// placeholder entries are dated relative to it so the screen cannot print
+    +// two different "todays" at once. 0 keeps the mock's own 12/9/1 seed.
+    +VOXELEARTHUI_API FVoxelJournalData SeedJournal(const FText& TodayStamp, int32 TodayDay = 0);
+
+    --- a/ue-project/Source/VoxelEarthUI/VoxelScreensUISubsystem.cpp
+    +++ b/ue-project/Source/VoxelEarthUI/VoxelScreensUISubsystem.cpp
+    @@ around line 398
+    -    Body = SNew(SVoxelJournalScreen).Data(VoxelScreenData::SeedJournal(DayStamp()));
+    +    Body = SNew(SVoxelJournalScreen).Data(VoxelScreenData::SeedJournal(DayStamp(), CurrentDayNumber()));
+
+with `SeedJournal` mapping its three seed days `(12, 9, 1)` onto
+`(TodayDay, TodayDay - 3, 1)` when `TodayDay > 0`. Whoever owns
+`VoxelScreensUISubsystem.cpp` should decide whether the day number is reachable
+there directly or has to come through the same route `DayStamp()` does.
+
+Two smaller ones, both outside VoxelEarthUI's polish surface:
+
+* **The death screen's stamp is `"Day 11"`, not the mock's full
+  `"DAY 12 . SUMMER, 18TH YEAR OF THE SECOND AGE"`.** The screen prints
+  `FVoxelDeathScreenData::Stamp` verbatim; the missing season/year/age and the
+  casing belong to whatever produces that string, not to the widget.
+* **Pause, Settings, Save and Load are drawn with the HUD still lit behind
+  them.** `SVoxelPauseMenu` does draw `VoxelOverlayChrome::Scrim()`, so this is
+  a z-order question in whatever adds the HUD and the pause overlay to the
+  viewport, not a missing scrim.
+
+### Is the white terrain in VoxelVerify00974 real, or a colour-authority fault?
+
+Asked because a fully white world is also what a broken colour authority looks
+like, and the water is being judged against that terrain.
+
+**On the evidence available it is the genuine surface, not a colour fault.** Two
+independent reasons:
+
+1. The capture log carries the healthy authority line, not the broken one:
+   `Clipmap colour authority: PALETTE (one authority, default)
+   (-VoxelClipmapVertexAlbedo=1.00, bytes as authored sRGB)`. PALETTE is the
+   single-authority mode -- "the palette colour of each vertex's REAL surface
+   material". The known fault (`voxelsim-one-colour-authority`) is the clipmap
+   being told every land vertex is one material; that is not this line.
+2. **Non-white materials do render in the same frames.** Both `VoxelVerify00962`
+   and `VoxelVerify00974` show distinct tan/orange voxels scattered along the
+   shoreline against the white. A broken colour authority paints everything one
+   colour; two colours in one frame falsifies it directly.
+
+Plausibility: the spawn column's ground top is 1644.2 m, and the frames show peaks
+well above it, so alpine snow cover is expected at this site.
+
+**What this does NOT establish**: the log does not name the biome or the material
+ids, so this is an argument from the authority line plus a falsifier, not a
+positive identification. A definitive answer needs the real classifier at column
+-65102,-51084 (`vxc_terrainprobe`), which was not run -- the box was serialised
+behind other legs. If the water work needs certainty about the ground it is being
+judged against, that probe is the cheap next step, and per the standing rule it
+must be the real classifier rather than a reimplementation.
+
 ### Open owner verdicts, unchanged by this pass
 
 Still open, and none of them can be asked yet because no shipping-default wake
@@ -2486,3 +2826,218 @@ frame exists: sky-light pair (`voxel.Sky.SkyLightAtGroundZ`, `voxel.Sky.FogInSky
 caustics default (the help text is now honest; the 0.5 value itself is still the
 owner's call), shore-foam look, hull mask (commit c038f99), glider parked spawn.
 Refraction and boat bobbing remain CLOSED.
+
+## 2026-09-07 (water-look agent, night): the grey rings diagnosed and fixed in the generator; Single Layer Water research; shore/surface foam re-keyed on depth with a procedural breakup
+
+Owner verdicts this section answers: *"The boat wake looks like a hard grey
+blob on the surface and it makes no sense what so ever. I see no shore foam at
+all"*; *"a grey plane covering almost the entire world map"*; *"Keep the ripple
+and wake related work and code but fix this issue with the grey rings"*; and
+*"tuning the Single Layer Water in UE5 to look better and have good surface and
+shore foam effects ... do research for how other UE5 games with realistic water
+have configured and setup their single layer water systems."*
+
+### 1. What the three frames actually photograph (read before the diagnosis)
+
+| frame | pose | what was injected | what it is a picture of |
+|---|---|---|---|
+| `VoxelVerify00964` | +12 m, pitch -35, yaw 45 | `-VoxelRippleWakeRadiusM=8 -VoxelRippleWakeStrengthM=0.9`, five discs at 4/6/8/10/12 m ahead, one step, frozen (`CAPTURE WAKE ARMED ... r=8.00 m s=0.900 m`) | Five 8 m discs of 0.9 m each, overlapping, clamped at the sim's 2.0 m ceiling (`fieldMaxAbs=2.0000 stateMaxAbs=2.0000`). A 2 m mound 16 m across. **Not a wake; a stress pattern.** The rounded-square grey region with a soft edge and blue water outside it is the ripple WINDOW (51.2 m, Chebyshev fade 0.42-0.485) seen in perspective; the faint darker disc inside it is the mound's WPO. |
+| `VoxelVerify00966` | +6 m, pitch -18 | same injection | The same 2 m mound seen almost edge-on from 6 m: it occludes the lake. The "grey plane covering the world" is that mound wearing full foam. |
+| `VoxelVerify00974` | +6 m, pitch -12, boat under way (`voxel.Boat.Throttle 1 12`, ~22 m travelled) | nothing injected; the boat's own bow/transom swept splats plus the boarding slam | The only frame that photographs a WAKE. Log at t+0.25 s: `field verified LIVE -- centre patch max field value 0.1919, max state height 0.0436 m`. |
+
+Pixel measurements on `00974` (PIL, 4-px stride box means, original 2560x1398):
+the grey region reads (148-182, 155-187, 158-187) everywhere in the window --
+far ahead of the boat (182,186,187), mid-left (158,164,167), at the wake rings
+(151,158,162), near-bottom (148,155,158). A vertical transect at x=2432 goes
+snow (237,238,238) -> water OUTSIDE the window (62,142,181) at y=760-784 ->
+grey (150,156,158) from y=808 down. So the grey is the whole window, it is
+uniform to +/-15, and it stops at the window's fade start (21.5 m from the
+boat; from +6 m at pitch -12 that lands ~2.8 deg below frame centre, which is
+where it lands). The blue water beyond it is the control: same lake, same
+light, no ripple window.
+
+### 2. The diagnosis, and the two mechanisms it has to choose between
+
+The shipped response was `saturate((|grad| + |h| * 4.0) * 8.0)`. Its knee is at
+raw 0.125: 3 cm of ripple, or a slope of 1:8, is FULL foam. The hull in `00974`
+is at raw ~0.36 (grad 0.19 + 0.044 * 4), 2.9x past the knee before the gain
+does anything. That much is arithmetic and is the coordinator's diagnosis.
+
+What the arithmetic does NOT explain on its own is the window being grey 20 m
+AHEAD of the bow: the boat covered ~22 m in ~11 s (about 1.9-2.5 m/s) and the
+sim's wave speed is 1.60 m/s (`RippleField: armed ... speed 1.60 m/s`), so
+physically the water ahead of the bow is undisturbed. Two mechanisms fit the
+frame:
+
+* **(A) saturation of a faint, everywhere-non-zero field** -- the sim's
+  spread-out remainder (millimetres; slopes ~0.01) after eight seconds under
+  way, plus grid-speed numerical leakage (the stencil carries information at
+  dx/dt = 6 m/s regardless of c), is above the 0.125 knee across the whole
+  window; or
+* **(B) a DC value in undisturbed texels** -- a bias-handling or fresh-texel
+  error putting a constant non-zero into the field wherever it has never been
+  stepped, which the gain then paints as foam.
+
+They are told apart by a GAIN ladder on the shipping asset, no regen: under
+(A) the grey resolves into arcs near the boat as the gain drops (a 4 mm
+remainder is 0.13 foam at gain 8 and 0.016 at gain 1); under (B) a constant
+raw >= 0.5 survives gain 1 and gain 0.25 as a uniform tone. Both ladders are
+preceded by `DisturbanceFoamEnabled:0`, which is simultaneously the reach test
+the coordinator asked for (the lake at the boat is the SHEET --
+`voxel.Water.MeshImplicitLakes` defaults to 0, "the far-field sheet owns lake
+basins at every range", and the 00974 command line did not pass it -- and the
+sheet is where `-VoxelWaterMatScalar` builds its MID) and the answer to "is the
+grey the foam at all". Verdict rows are in section 6.
+
+### 3. The fix (authored; regen pending the box)
+
+`ue-project/Tools/ripple_field_graph.py`, `build_disturbance_foam`:
+
+    x    = |grad| + |height_m| * DisturbanceFoamHeightWeight     (was a baked 4.0; now a scalar, 1.0)
+    foam = saturate((x - DisturbanceFoamThreshold) * DisturbanceFoamGain * DisturbanceFoamEnabled)
+
+A dead band below `Threshold` (provisional 0.05: a 1:20 slope or 5 cm) and a
+linear knee above it -- the same family the wind whitecaps already use
+(`build_whitecap_foam`: `saturate((|gradient| - SlopeThresh) / (SlopeFull -
+SlopeThresh))`). Texels the field has merely touched draw NOTHING, so the
+window edge is invisible on undisturbed water by construction and the 3.3 m
+fade is left alone (widening it would also soften the ripple NORMAL for no
+reason). Gradient leads (HeightWeight 1.0: the hull's 0.044 m counts as 0.044
+against a gradient of 0.19), because a wake is steep before it is tall. All
+four numbers are ScalarParameters, so the entire ladder runs on
+`-VoxelWaterMatScalar` against one regenerated asset; `Enabled:0` remains a
+pixel-identical off. The ocean consumes the same helper and takes the baked
+defaults (no MID path there).
+
+### 4. Single Layer Water: what is documented, what is source, what is folklore, and what applies here
+
+**Documented by Epic** ([Single Layer Water Shading Model](https://dev.epicgames.com/documentation/en-us/unreal-engine/single-layer-water-shading-model-in-unreal-engine)):
+the SLW output node takes *Scattering Coefficients* ("the rate at which light
+scatters on particles within a medium"), *Absorption Coefficients* ("how easily
+light penetrates the volume of water"; per-channel, the doc's example is R
+0.0033 G 0.0016 B 0.0011), *PhaseG* (positive = forward toward the sun,
+negative = back, 0 isotropic) and *Color Scale Behind Water* ("multiplies the
+luminance of the surfaces below the water", above-water only). **Opacity on
+the main node "controls the ratio between the volume's BSDF and the surface's
+BRDF"** -- i.e. it is COVERAGE of the surface layer over the volume, which is
+exactly what this project's `MP_Opacity = saturate(foam)` wiring uses it for.
+Reflections: "generated screen tiles are used for an indirect draw SSR pass"
+and then "a full screen pass to composite reflection captures, sky, and newly
+computed screen space reflections". Blend mode Opaque/Masked; the pass runs
+after the base pass and deferred lighting, before translucency.
+
+**From the 5.8 engine source on this box** (`D:\UE_5.8\Engine`), which
+outranks any forum:
+
+* `Renderer/Private/SingleLayerWaterRendering.cpp:69-71`:
+  `r.Water.SingleLayer.Reflection` -- "0: Disabled, 1: Enabled (same as rest
+  of scene), 2: Force Reflection Captures and Sky, 3: Force SSR". Companions:
+  `.Reflection.DownsampleFactor` (noise; pair with `.Reflection.Denoising`),
+  `.Reflection.ScreenSpaceReconstruction` ("usually not needed, as water has
+  mostly mirror reflections"), `.SSRTAA` (default 1), `.TiledComposite`,
+  `.DistanceFieldShadow` (default 1), `.VSMFiltering` /
+  `.ShadersSupportVSMFiltering` (default 0), `.DepthPrepass` (default 1,
+  "necessary for proper Virtual Shadow Maps support"),
+  `.RefractionDownsampleFactor`, and the `.Refraction.*Culling` family.
+  **This project already ships `r.Water.SingleLayer.Reflection=1`**
+  (`DefaultEngine.ini:226`, switched from 2 on 2026-09-06 with the reasoning
+  recorded there; `LogConfig: Set CVar [[r.Water.SingleLayer.Reflection:1]]`
+  in the 00974 log). Lumen on water is moot here: no mesh distance fields
+  exist for voxel terrain, so Lumen has nothing to trace -- the ini says so
+  and it is right.
+* `Shaders/Private/BasePassPixelShader.usf:1140-1141, 1379-1384`:
+  `BaseMaterialCoverageOverWater = Opacity; WaterVisibility = 1 - coverage;
+  GBuffer.DiffuseColor *= coverage; DiffuseColor *= coverage`. The surface
+  layer's diffuse IS lit -- forward, in the water pass, by
+  `GetForwardDirectLightingSplit` (`:1480-1492`) plus the sky/indirect term
+  gathered just above it. So a BaseColor foam at coverage 1 should be a lit
+  albedo. The record on this water says it renders BLACK
+  (`VoxelVerify00936`, the "black band"), which is why every foam here rides
+  EMISSIVE. That contradiction is measured in this pass with
+  `DisturbanceFoamEmissive:0` at full coverage (section 6): if the window goes
+  black with emissive off, the forward-lit surface layer is dead on this
+  water and foam can only ever be emissive paint until that is found; if it
+  goes lit-white, the grey was simply the 0.6 emissive and the fix for "flat
+  grey" is to let BaseColor carry the foam and reduce the emissive.
+* `Shaders/Private/SingleLayerWaterShading.ush:234-238`: the volume's
+  scattered luminance is multiplied by `(1 - EnvBrdf)` above water and the
+  whole output by `WaterVisibility` -- the mechanism
+  `docs/water-realism-analysis-2026-09-06.md` section 0 already documents for
+  "far water goes dark".
+* `Shaders/Private/Common.ush:1797-1800`: `MaterialExpressionNoise(Position,
+  Scale, ...)` does `Position *= Scale` with an unconnected Position = world
+  UU. **Consequence for this project: the shipped shore-band noise
+  (`scale 0.35`) had ~3 cm features, not the "~3 m and ~1.4 m" its comment
+  claims; the +/-0.9 m waterline perturbation was per-pixel speckle.** Fixed
+  to 0.0035 in this regen (section 5).
+
+**Epic's own Water plugin material, read from the asset itself**
+(`Engine/Plugins/Experimental/Water/Content/Materials/WaterSurface/Water_Material.uasset`,
+parameter and function names): foam is a TEXTURE product, not a scalar --
+`T_WaterFlow_01_Foam_Tiled` + `_N`, with "Foam Texture Blend Min/Width", "Foam
+MacroScale", "FoamContrast", "Foam powr", "Front Foam Scale"; it is gated by
+DEPTH ("Depth for DF Foam", "Foam Dpeth Min" [sic], "Foam Distance", function
+`WaterOpacityMaskFromDepth`) and, for oceans, by wave attenuation in shallows
+("Beach Foam", "Enable Ocean Foam", "Wave Foam", functions `WaveDepthFalloff`,
+`ComputeWavesAttenuationFactor`); and foam changes MORE than colour -- "Foam
+Opacity", "Foam Roughness", "Foam Scattering", "Foam Scatter Bias", "Foam
+Emissive" are all parameters, so Epic pushes coverage, roughness, the volume's
+scattering coefficient AND an emissive term together. Normals flatten with
+distance ("Default Near/Distant Normal Strength", "Far Normal Fresnel Power");
+refraction is distance-faded ("Refraction Far", "Refraction Bottom Amount");
+"Wetness" is a function. Rivers add velocity/flowmap foam; lakes are the same
+material with switches.
+
+**Named titles and community practice** (secondary sources; treated as
+practice, not specification): Still Wakes the Deep used SLW with a Niagara
+shallow-water simulation and Gerstner waves, foam "driven by the wave
+Jacobian -- where the surface folds, foam increases", persisting seconds and
+dissipating ([80.lv summary of the Epic spotlight](https://80.lv/articles/learn-how-still-wakes-the-deep-used-unreal-engine-5-to-create-water-mechanics);
+the unrealengine.com spotlight itself returned 403 to the fetch). Depth-based
+shore foam is universally SceneDepth - PixelDepth or DistanceToNearestSurface
+([80.lv Nimue breakdown](https://80.lv/articles/how-to-build-stylized-water-shader-design-implementation-for-nimue);
+[StraySpark guide](https://www.strayspark.studio/blog/ocean-water-simulation-ue5-guide)),
+layered at multiple texture scales with an advance/retreat animation; SSR for
+near water with a capture/sky fallback far, planar reflections only for hero
+lakes; "one Gerstner layer looks like a swimming pool, use 4-6". A typical
+tutorial SLW setup ([worldofleveldesign pool](https://www.worldofleveldesign.com/categories/ue5/single-layer-water-pool-still.php))
+runs BaseColor 0, Roughness 0, Opacity 0.5, Refraction 1.05 with PixelNormal
+Offset, absorption = colour * intensity / 1000, scattering = colour / 1000.
+The "r.Water.SingleLayer.SSR" / ".LumenReflections" names that circulate in
+game-mod ini files do NOT exist in the 5.8 source (the list above is
+exhaustive for `r.Water.SingleLayer*` in `SingleLayerWaterRendering.cpp`) --
+folklore.
+
+**What applies here, and what does not.**
+
+| practice | here |
+|---|---|
+| Opacity = surface coverage; BaseColor = foam albedo; volume from coefficients | already the design (`create_water_voxel_material.py` W5). The open question is why the lit surface layer reads black on this water -- measured this pass. |
+| SSR on water (mode 1) | already shipped 2026-09-06. Lumen: not applicable (no distance fields). Planar: rejected -- a full scene re-render on a render-thread-bound frame for a lake. |
+| Depth-keyed shore foam | ADOPTED: new `ShallowFoam*` term on the baked depth field (section 5). DistanceToNearestSurface is dead here (no distance fields); SceneDepth - PixelDepth is available but the baked depth is the same quantity without the marcher's late-depth caveats. |
+| Foam as a texture product with contrast/macro scale | ADOPTED procedurally: `FoamBreakup*` (section 5). A real foam texture + normal is a follow-up if the owner likes the shape. |
+| Foam moves roughness, opacity, scattering and emissive together | roughness/opacity/emissive already ride `foam`; scattering does not -- follow-up (backlog). |
+| Jacobian whitecaps | not applicable: the wind whitecap term (`FoamV2`) is the steepness-times-coverage equivalent for a spectral field, and the lake is calm by design. |
+| Distance-flattened normals / far roughness | `WaterRoughnessFarGain` exists (default 0.0, R3 of the realism doc) -- unchanged here, owner ladder pending. |
+| Refraction distance fade | not touched. |
+
+### 5. Objective-2 authoring in the lake generator (`create_water_voxel_material.py`), all dark by default
+
+1. **Shore-noise scale 0.35 -> 0.0035** (see Common.ush above). A shipped-image
+   change with its own zero arm (`BathyFoamNoiseM:0`).
+2. **`FoamBreakupGain` (0.0), `FoamBreakupScaleM` (0.6), `FoamBreakupDriftMPS`
+   (0.15), `FoamBreakupContrast` (2.2)**: a 3-level turbulent gradient noise
+   on world XY drifting on the one Time node, shaped and lerped from 1.0 by
+   the gain, multiplied into shore, shallow and disturbance foam. Gain 0 is a
+   multiply by exactly 1.0.
+3. **`ShallowFoamDepthM` (0.6), `ShallowFoamGain` (0.0)**: `(1 - ramp(depth_m,
+   0, DepthM)) * sign(shore_m) * validity * gain * breakup`, max()ed into
+   `shore_foam` so it inherits the emissive route, `ShoreFoamEmissive`, the
+   SHORE FX arm and every existing off arm. Gain 0 is bit-identical.
+
+The ocean generator is untouched this pass (its disturbance foam takes the new
+helper's baked defaults; no breakup, no shallow term) -- backlog.
+
+### 6. Arms and verdicts
+
+(filled in below as each leg lands; every row names its engagement echo)

@@ -3,6 +3,7 @@
 #include "SVoxelCoverImage.h"
 #include "SVoxelHourglass.h"
 #include "VoxelEarthUI.h"
+#include "VoxelLoadingCurtainThread.h" // the curtain's paint clock -- seg=LOADING
 #include "VoxelUIAssetLibrary.h"
 #include "VoxelUIStrings.h"
 #include "VoxelUIStyle.h"
@@ -57,6 +58,36 @@ TArray<int32> ShuffledIndices(int32 Count, FRandomStream& Stream)
 		Order.Swap(i, Stream.RandRange(0, i));
 	}
 	return Order;
+}
+
+// Reshuffles an existing order in place and guarantees the entry that is
+// currently on screen does not come back as the very next one.
+//
+// THE GUARANTEE IS THE POINT, not the shuffle. A plain reshuffle at a wrap has
+// a 1-in-N chance of showing the same line twice in a row, and that is the one
+// artefact a player would actually notice -- it reads as the screen being stuck
+// rather than as a rotation. With N < 3 there is nothing to promise and the
+// order is left alone.
+void ReshuffleAvoidingRepeat(TArray<int32>& Order, int32 CurrentValue, FRandomStream& Stream)
+{
+	if (Order.Num() < 3)
+	{
+		return;
+	}
+	for (int32 Attempt = 0; Attempt < 8; ++Attempt)
+	{
+		for (int32 i = Order.Num() - 1; i > 0; --i)
+		{
+			Order.Swap(i, Stream.RandRange(0, i));
+		}
+		if (Order[0] != CurrentValue)
+		{
+			return;
+		}
+	}
+	// Eight shuffles in a row put the same line first. Astronomically unlikely,
+	// but a bounded loop beats an unbounded one and one swap settles it.
+	Order.Swap(0, 1);
 }
 } // namespace SVoxelLoadingDetail
 
@@ -304,6 +335,8 @@ void SVoxelLoadingScreen::OnShown()
 	// sharing one would make them drift into lockstep.
 	QuipOrder = SVoxelLoadingDetail::ShuffledIndices(VoxelUIStrings::LoadingQuips().Num(), Stream);
 	TipOrder = SVoxelLoadingDetail::ShuffledIndices(VoxelUIStrings::GameplayTips().Num(), Stream);
+	// A COPY of the show's stream, kept and advanced -- see the member's comment.
+	RotationStream = Stream;
 	QuipCursor = 0;
 	TipCursor = 0;
 	QuipPhase = EQuipPhase::Idle;
@@ -316,6 +349,15 @@ void SVoxelLoadingScreen::OnShown()
 void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
 {
 	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+
+	// THE CURTAIN'S OWN CLOCK (2026-09-07, Phase 4). Called from Tick rather
+	// than from OnPaint because SWidget::Paint invokes Tick for any widget with
+	// bCanTick, INCLUDING on the engine's Slate loading thread -- so this one
+	// line records the paint cadence on both arms with no second hook. Any
+	// thread; the recorder locks. Drained on the game thread by the front end's
+	// loading tick into VoxelFramePhase's seg=LOADING row.
+	VoxelLoadingCurtain::NotePaint();
+
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 
 	// The curtain fade. Applied through SWidget::SetRenderOpacity rather than
@@ -373,7 +415,15 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 			QuipFadeAlpha = FMath::Max(0.f, 1.f - QuipTimer / Fade);
 			if (QuipTimer >= Fade)
 			{
+				const int32 PreviousQuip = QuipOrder.Num() > 0 ? QuipOrder[QuipCursor % QuipOrder.Num()] : -1;
 				QuipCursor = QuipOrder.Num() > 0 ? (QuipCursor + 1) % QuipOrder.Num() : 0;
+				// Wrapped: reshuffle rather than replay the same order. 26 quips
+				// at one per turn of the glass (~7.8 s) is ~203 s, and the load
+				// gate now waits up to 300.
+				if (QuipCursor == 0)
+				{
+					SVoxelLoadingDetail::ReshuffleAvoidingRepeat(QuipOrder, PreviousQuip, RotationStream);
+				}
 				QuipPhase = EQuipPhase::FadingIn;
 				QuipTimer = 0.f;
 			}
@@ -399,7 +449,15 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 	if (TipTimer >= L.TipRotate)
 	{
 		TipTimer = 0.f;
+		const int32 PreviousTip = TipOrder.Num() > 0 ? TipOrder[TipCursor % TipOrder.Num()] : -1;
 		TipCursor = TipOrder.Num() > 0 ? (TipCursor + 1) % TipOrder.Num() : 0;
+		// Wrapped: 15 tips on an 8 s timer is 120 s, and a player may now sit
+		// here for up to 300. Replaying the identical order is what made a long
+		// load read as a loop.
+		if (TipCursor == 0)
+		{
+			SVoxelLoadingDetail::ReshuffleAvoidingRepeat(TipOrder, PreviousTip, RotationStream);
+		}
 	}
 
 	// --- FPS readout (debug-only; see GLoadingFpsReadout) -------------------

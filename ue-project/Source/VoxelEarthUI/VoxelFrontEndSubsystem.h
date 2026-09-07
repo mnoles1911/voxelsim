@@ -10,6 +10,10 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+// By value, not TUniquePtr: a complete type here costs nothing (the header
+// pulls in no MoviePlayer type -- see it) and avoids repeating the incomplete-
+// type destructor dance ReadyProbe needed below.
+#include "VoxelLoadingCurtainThread.h"
 #include "VoxelFrontEndSubsystem.generated.h"
 
 UENUM()
@@ -147,6 +151,12 @@ private:
 	float SavedApplyBudgetMs = 0.f;
 
 	TUniquePtr<class FVoxelWorldReadyProbe> ReadyProbe;
+
+	// --- The threaded loading curtain, 2026-09-07 (Phase 4) -----------------
+	// Live only between BeginLoad and TeardownMenu. Inert unless
+	// -VoxelLoadingScreenThread=1 AND the process can honour it (it cannot in
+	// PIE); see VoxelLoadingCurtainThread.h.
+	FVoxelLoadingCurtainThread CurtainThread;
 
 	// The player controller may not exist on the tick OnWorldBeginPlay runs,
 	// so cursor/input-mode/HUD setup is deferred to the first tick that finds

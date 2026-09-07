@@ -220,7 +220,17 @@ FVoxelFrontEndSwitches Parse()
 	}
 	FParse::Value(Cmd, TEXT("VoxelLoadMinHold="), S.LoadMinHoldSeconds);
 	FParse::Value(Cmd, TEXT("VoxelLoadMaxHold="), S.LoadMaxHoldSeconds);
+	FParse::Value(Cmd, TEXT("VoxelLoadGateMaxWait="), S.LoadGateMaxWaitSeconds);
 	FParse::Value(Cmd, TEXT("VoxelMenuWatchdog="), S.MenuWatchdogSeconds);
+
+	// -VoxelLoadingScreenThread=0|1. Int-valued rather than a bare Param
+	// because the DEFAULT IS ON, so the useful form is the one that turns it
+	// off, and FParse::Param has no "off".
+	{
+		int32 CurtainThread = 1;
+		FParse::Value(Cmd, TEXT("VoxelLoadingScreenThread="), CurtainThread);
+		S.bLoadingScreenThread = (CurtainThread != 0);
+	}
 
 	// -VoxelLoadTheatre=<min>[,<max>]: the artificial load duration's range.
 	// One value pins the duration; 0 disables the theatre (the arm unattended

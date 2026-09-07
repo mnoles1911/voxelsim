@@ -186,7 +186,41 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// -VoxelLoadMinHold= overrides it; set 15 to reproduce every build before
 	// this change.
 	float LoadMinHoldSeconds = 2.0f;
+	// NO LONGER THE READINESS GATE'S CEILING (2026-09-07). Until Phase 4 this
+	// one number did two jobs: it was the curtain's maximum hold AND it was
+	// passed straight into FVoxelReadyProbeConfig::MaxWaitSeconds. Those are
+	// different questions and the owner's directive separates them; the gate's
+	// patience is LoadGateMaxWaitSeconds below.
 	float LoadMaxHoldSeconds = 60.0f; // the value both menu call sites pass
+
+	// -VoxelLoadGateMaxWait=<s>: how long the readiness probe waits before it
+	// gives up and lets the curtain lift on a world that is not ready.
+	//
+	// 60 -> 300, OWNER DIRECTIVE 2026-09-07: "Happy to have player sit on
+	// loading screen for more than a minute if that time is needed to load the
+	// tiles and game world in." At 60 s a cold 8-ring cascade took the TIMEOUT
+	// path -- the curtain lifted on a world that was still landing, which is
+	// the one thing the gate exists to prevent, and the probe's own Warning was
+	// the only trace of it.
+	//
+	// 300 RATHER THAN NO CEILING. A gate with no ceiling is a hang, and the
+	// timeout arm has to stay distinguishable from a pass: FVoxelWorldReadyProbe
+	// logs a Warning and the front end prints "world NOT ready (gate timed
+	// out)", so a run that took it can be told from one that did not.
+	float LoadGateMaxWaitSeconds = 300.0f;
+
+	// -VoxelLoadingScreenThread=0|1 (default 1): paint the loading curtain on
+	// the engine's Slate loading thread across long world ticks, so a 6.3 s
+	// fill frame no longer freezes the hourglass. 0 is the CONTROL ARM -- the
+	// curtain stays a plain viewport widget on the game thread, exactly as it
+	// was before 2026-09-07, and the seg=LOADING row then reads seconds instead
+	// of milliseconds.
+	//
+	// The mechanism, and the four engine facts that rule out the more obvious
+	// versions of it, are in VoxelLoadingCurtainThread.h. Short version: UE 5.8
+	// has no persistent loading thread while the game thread ticks a world, so
+	// this arms the supported per-blocking-section path around each world tick.
+	bool bLoadingScreenThread = true;
 
 	// ---- THE ARTIFICIAL LOAD DURATION (owner directive, 2026-09-05) --------
 	//

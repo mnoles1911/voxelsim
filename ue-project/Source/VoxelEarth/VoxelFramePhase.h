@@ -306,6 +306,51 @@ FORCEINLINE void NoteMenuFrame(double FrameMs)
 	}
 }
 
+// HOOK 0b, from the front end's LOADING-state tick -- and it does NOT measure a
+// frame.
+//
+// IT MEASURES THE INTERVAL BETWEEN TWO PAINTS OF THE LOADING CURTAIN, and the
+// distinction is the whole reason the row exists. Owner, 2026-09-07: "Happy to
+// have player sit on loading screen for more than a minute ... However, the
+// loading screen should not feel chunky or hitching." That is two statements:
+// the GAME thread may take as long as it likes behind the curtain, and the
+// CURTAIN must keep moving anyway. A game-frame row could not express it --
+// under FILL those frames are seconds long by design and always will be.
+//
+// So the value passed in is the wall-clock gap between successive
+// SVoxelLoadingScreen paints, recorded by VoxelLoadingCurtain::NotePaint from
+// whichever thread painted (the game thread on ordinary frames; the engine's
+// Slate loading thread inside an armed block, where SWidget::Paint ticks the
+// widget for us) and drained on the game thread by the front end. Two rows in
+// ONE log then answer the Phase 4 gate:
+//
+//     seg=LOADING p99 < 33 ms   AND   seg=FILL still showing multi-second frames
+//
+// If they do not diverge, the thread move did nothing -- and with
+// -VoxelLoadingScreenThread=0 the same instrument reads seconds, which is what
+// makes this a test that can fail rather than a confirmation that cannot.
+//
+// FAILING READINGS:
+//   seg=LOADING n=0   -> this hook is not being called. The leg says nothing
+//                        about the loading screen, and no smoothness claim may
+//                        be made from it.
+//   seg=LOADING n>0 but the run never showed a curtain
+//                     -> stale intervals from a previous show; the front end
+//                        resets the paint clock at BeginLoad, so this means the
+//                        reset did not run.
+//   paintOverflow>0 on the "LoadScreen: curtain thread" line
+//                     -> samples were DROPPED between two drains, from exactly
+//                        the worst window. Do not quote a p99 over it.
+VOXELEARTH_API void NoteLoadingFrameImpl(double PaintIntervalMs);
+
+FORCEINLINE void NoteLoadingFrame(double PaintIntervalMs)
+{
+	if (Mode() != 0)
+	{
+		NoteLoadingFrameImpl(PaintIntervalMs);
+	}
+}
+
 // HOOK 1, at the end of the streaming tick, with three values the caller has
 // already computed.
 //

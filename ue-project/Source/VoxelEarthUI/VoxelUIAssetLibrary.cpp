@@ -172,6 +172,24 @@ void FVoxelUIAssetLibrary::ShuffleOrder(FRandomStream& Stream)
 
 const FSlateBrush* FVoxelUIAssetLibrary::RequestBackground(int32 Index)
 {
+	// GAME THREAD ONLY (2026-09-07, Phase 4). The loading curtain may now be
+	// PAINTED on the engine's Slate loading thread across a long world tick
+	// (VoxelLoadingCurtainThread.h), so this accessor has a second caller
+	// thread -- and bDecodeStarted / bDecodeFailed are, as FEntry's own comment
+	// says, game-thread-only flags; Entries and ExtraByPath are game-thread
+	// containers; and the decode's completion lands through an AsyncTask that
+	// assumes it is racing nothing. Starting or registering a decode from the
+	// loading thread would race all three.
+	//
+	// Refusing costs nothing, because the caller's contract for a nullptr is
+	// ALREADY "draw nothing this frame and ask again" -- stated in this
+	// function's own tail comment. The only visible consequence is that an
+	// image whose turn comes up during a blocked frame fades in a few frames
+	// later than it would have.
+	if (!IsInGameThread())
+	{
+		return nullptr;
+	}
 	if (Order.Num() == 0)
 	{
 		return nullptr;
@@ -202,6 +220,12 @@ const FSlateBrush* FVoxelUIAssetLibrary::RequestBackground(int32 Index)
 
 const FSlateBrush* FVoxelUIAssetLibrary::RequestImageFile(const FString& AbsolutePath)
 {
+	// See RequestBackground: same reason, and this one also MUTATES Entries and
+	// ExtraByPath on a miss.
+	if (!IsInGameThread())
+	{
+		return nullptr;
+	}
 	if (AbsolutePath.IsEmpty() || FVoxelFrontEndSwitches::Get().bNoAssets)
 	{
 		return nullptr;

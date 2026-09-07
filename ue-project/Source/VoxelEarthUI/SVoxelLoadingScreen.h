@@ -33,6 +33,7 @@
 // fact a decision somebody already paid for once.
 
 #include "CoreMinimal.h"
+#include "Math/RandomStream.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
 
@@ -115,6 +116,19 @@ private:
 	TArray<int32> TipOrder;
 	int32 TipCursor = 0;
 	float TipTimer = 0.f;
+
+	// RESHUFFLE ON WRAP (2026-09-07, Phase 4). Seeded once per show from
+	// MakeVoxelUIRandomStream -- so it is clock-seeded interactively and FIXED
+	// under -unattended, which is what keeps the capture strips diffable -- and
+	// then ADVANCED rather than re-created, so the second pass through a list
+	// is not the first pass again. Held here rather than made locally for
+	// exactly that reason: a fresh MakeVoxelUIRandomStream() at every wrap
+	// would produce the same "shuffle" every time under -unattended.
+	//
+	// Why it matters now: 15 tips on an 8 s timer is 120 s per cycle, and the
+	// load gate's ceiling is now 300 s. Before this, a player waiting out a
+	// cold cascade saw the tip list twice and a half IN THE SAME ORDER.
+	FRandomStream RotationStream;
 
 	// --- Hourglass bob ------------------------------------------------------
 	float BobTime = 0.f;

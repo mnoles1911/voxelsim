@@ -64,7 +64,12 @@ struct VOXELEARTHUI_API FVoxelReadyProbeConfig
 	// a bare "is it zero right now" test would trip over.
 	int32 RequiredGoodSamples = 3;
 	float PollIntervalSeconds = 0.4f;
-	float MaxWaitSeconds = 60.0f;
+	// 60 -> 300, 2026-09-07 (Phase 4). Set by the front end from
+	// -VoxelLoadGateMaxWait; see that switch's comment for the owner directive
+	// and for why the ceiling is no longer -VoxelLoadMaxHold. A gate that
+	// always times out is not a gate, and at 60 s against a cold 8-ring
+	// cascade this one always did.
+	float MaxWaitSeconds = 300.0f;
 
 	// GATE 3 (2026-09-07): "the fine tier's prefetch ring has settled". With
 	// the async tile loader (-VoxelFineTileAsync=1) the ring's tiles arrive on

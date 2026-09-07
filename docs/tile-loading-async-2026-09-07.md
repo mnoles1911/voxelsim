@@ -424,8 +424,19 @@ md5 `4ad4ec1ba2a7cc8edc45b9f5721ac82c`.
 
 **What this does NOT show.** 3.2 ms is ~310 fps. The seg=MENU CPU number was never
 what the owner felt on the title screen; the reported ~11 ms GPU and busy render
-workers are untouched and this instrument cannot see them, because Lumen and TSR
-history render every menu frame with nothing to light. That remains unmeasured.
+workers are untouched and this instrument cannot see them. That remains unmeasured.
+
+**CORRECTION (do not repeat the earlier claim).** An earlier draft of this section,
+and the body of commit `d2965c2`, blamed Lumen for the menu GPU cost. **That is
+wrong.** Lumen is not armed by this project: the `DefaultEngine.ini:717-730` lines
+the plan's F2 cited do not exist in the project file (they are engine
+BaseScalability lines selected by this box's scalability level), and they are inert
+because `r.DynamicGlobalIlluminationMethod` defaults to None and nothing sets it --
+the project's own config says so at `DefaultEngine.ini:647`. Fog, sky and shadows
+are also absent on the menu because the sky rig is deferred while the world is
+held. What actually draws on the menu is the **ocean actor and the clipmap**. The
+commit body is left as written rather than rewriting history; this is the
+correction of record.
 
 ### UI scale (same commit)
 
@@ -568,6 +579,28 @@ in-game screen capture on this build logged
 4526.3 ms of worker wall time was moved off the game thread on leg B, against
 0.24 ms of total game-thread publish cost for six publishes.
 
+### Image row: VOID, and why
+
+`python tools/capture-pixdiff.py` on the 18 km distance-triggered shots, changed
+pixels at threshold 64:
+
+| pair | changed @64 | region |
+|---|---|---|
+| **A vs A2 (the control floor)** | **95.47%** | whole frame |
+| B vs A | 0.10% | one 565x265 box at top-left (the debug text overlay) |
+| C vs A | 2.02% | 84% of frame |
+
+**The control floor exceeds every arm comparison, so the image row is VOID and no
+image claim may be made in either direction.** Two identical legs produced almost
+completely different 18 km frames: the distance trigger catches whichever frame
+happens to be current, and at 246 m/s the pose and streaming state differ enough to
+change nearly every pixel. This is the known moving-capture floor.
+
+The one thing worth noting, without claiming it: B vs A differs only inside the
+overlay text box and not on terrain at all, which is what "the async arm did not
+change the image" would look like -- but a single pair cannot establish that
+against a 95% floor.
+
 ### A fifth arm was considered and skipped
 
 A sync + ring-1 arm would cleanly isolate prefetch from async. It was not run: it
@@ -596,3 +629,100 @@ throughout) and it **removes the worst frame** (`maxMs` -56% against a floor it
 clears). It is **not** demonstrated to improve typical frame time: no percentile
 delta in either direction clears the A/A noise floor of this rig. It ships behind
 `-VoxelFineTileAsync` defaulting to 0.
+
+## Phase 2b: menu scalability A/B
+
+Three arms, `-Shot Menu -SettleSec 30 -VoxelFramePhase=1 -VoxelMenuScalability=N`.
+SettleSec 30 rather than 2 because `seg=MENU` needs at least one five-second flush.
+
+**Engagement, quoted in full, and every gate can fail:**
+
+```
+arm 0: MenuScalability: OFF (-VoxelMenuScalability=0). The menu renders at the
+       shipped configuration; this is the control arm.
+arm 1: MenuScalability: APPLIED changed=3 unchanged=0 missing=0 of 3 candidates
+       | r.ScreenPercentage 65 -> 25 | r.TSR.History.ScreenPercentage 200 -> 100
+       | r.BloomQuality 4 -> 0
+arm 1: MenuScalability: RESTORED restored=3 mismatched=0
+       | r.ScreenPercentage 25 -> 65 (released) | ... (released) | ... (released)
+arm 2: MenuScalability: DRY RUN (-VoxelMenuScalability=2), nothing was set.
+       wouldChange=3 unchanged=0 missing=0 of 3 candidates
+       | r.ScreenPercentage 65 -> 25 | r.TSR.History.ScreenPercentage 200 -> 100
+       | r.BloomQuality 4 -> 0
+```
+
+Never `APPLIED NOTHING`; `mismatched=0` on restore; and the dry run's
+`wouldChange` list is **character-identical** to the arm's `changed` list.
+
+| arm | n | meanMs | p50Ms | p95Ms | p99Ms |
+|---|---|---|---|---|---|
+| 0 control | 10175 | 2.95 | 2.90 | 3.30 | 3.50 |
+| **1 applied** | **13166** | **1.90** | **1.80** | 3.00 | 3.70 |
+| 2 dry run | 10080 | 2.98 | 3.00 | 3.40 | 3.80 |
+
+**Noise floor is the dry run**, which is the better control here than a second
+OFF arm: it walks the same code, computes the same candidate list, and sets
+nothing. Control vs dry run is 0.03 ms on mean and 0.10 ms on p50. The applied
+arm moves mean by **-1.05 ms (-36%)** and p50 by **-1.10 ms (-38%)**, i.e. 35x
+and 11x the floor. Frame count over the same 30 s rises 10175 -> 13166 (+29%).
+
+**Image gate PASS, and this is the one that had to be checked.** All three menu
+PNGs are byte-identical: `VoxelMenu00026/00027/00028`, md5
+`904e23666ea2275f0f91e667cdc520eb`. Dropping `r.ScreenPercentage` from 65 to 25
+does not touch the menu image because the title screen is Slate over a UI
+texture, not a 3D scene render -- so the scene the screen percentage governs has
+nothing in it to shrink. That is exactly why this is affordable.
+
+**A VOID attempt is on record.** The first run of this A/B produced no
+`MenuScalability:` line in any of the three logs, because
+`VoxelMenuScalability.h/.cpp` (15:54/15:57) postdated the binary under test
+(15:21). All three arms still produced plausible seg=MENU numbers (2.95 / 2.92 /
+2.93) and would have read as a clean null. **The engagement gate is the only
+reason that was caught**, and the numbers were discarded rather than reported.
+
+## Phase 4: threaded loading curtain
+
+`tools\voxel-ui-capture.ps1 -Shot GateSweep -GateRing 3 -MaxHold 300
+-TimeoutSec 900 -VoxelFramePhase=1 -VoxelLoadGateMaxWait=300 -VoxelLoadTheatre=0
+-VoxelSpawnAt=-56940,-56610`, arm `-VoxelLoadingScreenThread=1`, control `=0`.
+
+`seg=LOADING` measures the **curtain's paint interval**, not the game frame. That
+is deliberate: the owner said the game thread may take as long as it needs, so
+the question is whether the screen keeps painting while it does.
+
+**Engagement:**
+
+```
+arm:     curtain thread requested=1 available=yes
+         curtain thread ARMED (armMs=40 coolDownFrames=30 primeFrames=6)
+         curtain thread blocks=70 refusals=0 coveredSec=12.65
+           longestBlockMs=7597.4 longestUncoveredFrameMs=39.2
+           paints=1478 paintOverflow=0
+control: curtain thread requested=0 available=switched off (-VoxelLoadingScreenThread=0)
+```
+
+`refusals=0`, so this is not the `GIsEditor` VOID case.
+
+| arm | seg=LOADING p99 | seg=LOADING max | seg=LOADING mean | seg=FILL max |
+|---|---|---|---|---|
+| thread=1 | **23.90 ms** | **203.75 ms** | 13.02 | 7986.67 ms |
+| thread=0 | 219.00 ms | **7633.41 ms** | 25.22 | 8305.02 ms |
+
+**PASS on both halves.** The arm's curtain paints at 23.90 ms p99 (42 fps) while
+`seg=FILL` in the *same log* still carries a 7986.67 ms game frame -- the world
+tick was not made faster, it was made invisible. The control's curtain reads
+seconds: a **7633.41 ms** worst paint gap, which is the freeze the owner reported.
+
+The curtain covered 12.65 s across 70 blocks, the longest single block being
+7597.4 ms, and the longest frame it failed to cover was **39.2 ms**.
+`paintOverflow=0`.
+
+Note the control's `seg=LOADING` p50 is *lower* (5.90 vs 16.30 ms): with no
+curtain thread the widget only paints on the frames the game thread hands it, so
+its median interval is short and its tail is catastrophic. The p99 and max are
+the numbers that describe what a player sees; the p50 is an artefact of only
+sampling when unblocked.
+
+The PSO recording script (`tools/voxel-pso-cache-record.ps1`) was **not run**:
+the bundled cache is unreachable from an editor binary and the script correctly
+refuses without a packaged build.
