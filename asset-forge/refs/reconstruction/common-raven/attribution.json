@@ -5,6 +5,5 @@
   "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
   "source_sha256": "0ba4e1166a4909bb993b990ee98ad3dde52ae859211c0f2109d7d2a4d7663b11",
   "retrieved": "2026-09-07",
-  "modifications": "Removed integral display support; reconstructed two articulated legs with three forward digits and one hallux each; restored black plumage and eye contrast; 12.5 mm cubic voxelization at 0.65 m source length.",
-  "visual_approved": false
+  "modifications": "Removed integral display support; reconstructed two articulated legs with three forward digits and one hallux each; restored black plumage and eye contrast; 12.5 mm cubic voxelization at 0.65 m source length."
 }

@@ -12,7 +12,7 @@ from scipy.spatial import cKDTree
 from PIL import Image, ImageDraw
 from voxelize_reference_mesh import write_views
 from refine_wolf_pilot import smoothstep
-from reconstruct_pilot import ortho
+from creature_review_views import ortho
 
 ROOT = Path(__file__).resolve().parents[1]
 PITCH = .0125

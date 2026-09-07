@@ -5,6 +5,5 @@
   "license_url": "https://creativecommons.org/licenses/by/4.0/",
   "source_sha256": "1734aeee61157743f95ad6d49c9d48a21282ebbbaa313aecd611b4aceaa3cf1e",
   "retrieved": "2026-09-07",
-  "modifications": "Baked scan and normalized heading; combined-shell voxelization at 12.5 mm; scaled to a large 0.65 m game specimen rather than claiming measured specimen size; authored live countershading, pink lateral band, black spots, fin coloring and eyes.",
-  "visual_approved": false
+  "modifications": "Baked scan and normalized heading; combined-shell voxelization at 12.5 mm; scaled to a large 0.65 m game specimen rather than claiming measured specimen size; authored live countershading, pink lateral band, black spots, fin coloring and eyes."
 }

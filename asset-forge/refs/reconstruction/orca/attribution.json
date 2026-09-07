@@ -5,6 +5,5 @@
   "license_url": "https://creativecommons.org/licenses/by/4.0/",
   "source_sha256": "6a76c269c0adaff940c591748e8079b0b0dc7b93ad3e8245995fdb2592f83f2a",
   "retrieved": "2026-09-07",
-  "modifications": "Baked static geometry, normalized heading and scaled uniformly to 6.5 m; voxelized at 12.5 mm; restored restrained black and white skin and grey saddle patch.",
-  "visual_approved": false
+  "modifications": "Baked static geometry, normalized heading and scaled uniformly to 6.5 m; voxelized at 12.5 mm; restored restrained black and white skin and grey saddle patch."
 }
