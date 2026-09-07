@@ -68,3 +68,8 @@ The corrected `environment-material-readiness-probe.log` completed normally with
 nine EXRs and four views. First-after and settled BaseColor use intended green.
 Preparation now waits for matching complete GT/RT shader maps and the intended
 render proxy before publication. Continuous-frame and shadow proof remain open.
+
+The follow-up `environment-private-gpu-no-buffer-probe.log` passed normalexit0
+without `-CaptureBuffers`. First-after and settled views were inspected and green
+with no fallback/glow. This removes the EXR readback overhead from that color
+comparison; the visual publication boundary itself remains explicitly blocking.

@@ -623,6 +623,18 @@ struct FVoxelBrickPreparedReplacement
 };
 
 struct FVoxelBrickPreparedPoolLifetime;
+enum class EVoxelPrivateGpuReservationStatus : uint8 { Pending, ReadyPrivate, Failed, Cancelled };
+// Diagnostic prerequisite only: private claims are NEVER published to the index.
+class VOXELEARTHSHADERS_API FVoxelPrivateGpuReservation {
+public:
+    FVoxelPrivateGpuReservation()=default;
+    ~FVoxelPrivateGpuReservation();
+private:
+    friend class FVoxelBrickPool;
+    struct FState;
+    TSharedPtr<FState,ESPMode::ThreadSafe> State;
+};
+using FVoxelPrivateGpuReservationRef=TSharedPtr<FVoxelPrivateGpuReservation,ESPMode::ThreadSafe>;
 class VOXELEARTHSHADERS_API FVoxelBrickPreparedBatch
 {
 public:
@@ -966,6 +978,17 @@ public:
     // remains after this boundary. Does not itself reveal an actor.
     void CommitPreparedBatch(const FVoxelBrickPreparedBatchRef& Token);
     bool CancelPreparedBatch(const FVoxelBrickPreparedBatchRef& Token);
+    // Explicit diagnostic, CPU packs only, <=64 pages / 8MiB / 30 seconds.
+    // Reserves descriptors and claims GPU words without touching Resident/index.
+    // No publication API exists until GPU reservation acceptance is complete.
+    FVoxelPrivateGpuReservationRef BeginPrivateGpuReservation(const TArray<FVoxelBrickPreparedReplacement>& Pages,
+        FVoxelBrickEvictionPinTicket Pins,FString& OutError,uint64 MaxBytes=8ull*1024*1024);
+    EVoxelPrivateGpuReservationStatus PollPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token,FString& OutError);
+    bool CancelPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token);
+#if WITH_DEV_AUTOMATION_TESTS
+    void InitPrivateGpuReservationTestPool(const FVoxelBrickPoolConfig& InConfig);
+#endif
+
     // GT only, bounded to 8192 total unique keys and 16 live tickets. Absent
     // keys are protected on subsequent insertion. Overlap is refused atomically.
     FVoxelBrickEvictionPinTicket AcquireEvictionPins(TConstArrayView<FVoxelBrickChunkKey> Keys);
@@ -1515,6 +1538,12 @@ private:
     friend class FVoxelBrickPreparedBatch;
     TSharedPtr<FVoxelBrickPreparedPoolLifetime, ESPMode::ThreadSafe> PreparedLifetime;
     TWeakPtr<FVoxelBrickPreparedBatch, ESPMode::ThreadSafe> ActivePreparedBatch;
+    FVoxelPrivateGpuReservationRef ActivePrivateGpuReservation;
+    void RetirePrivateGpuReservation(bool Shutdown);
+#if WITH_DEV_AUTOMATION_TESTS
+    bool bPrivateGpuReservationTestPool=false;
+#endif
+
     void ReleasePreparedBatchState(FVoxelBrickPreparedBatch::FState& State);
     uint64 IndexMutationSequence=0;
     void FlushWithPreparedIndex(FVoxelBrickPreparedIndexDeliveryRef Delivery);

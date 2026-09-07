@@ -50,3 +50,10 @@ revisions to agree.
 
 This is remaining implementation work. The visual pilot, immutable render context,
 prepared commit tokens and existing detached-object saves do not implement it.
+
+The bounded core facade and retained-generation coordinator now implement isolated
+stationary sampling/edit semantics; see `stationary-asset-authority-core.md`.
+They have no World/UE activation yet. The current UE World constructor leaves its
+edit-log provider identity empty while the visual pilot separately records the
+fine provider ID. A production adapter must establish and verify that binding
+before capture; bypassing the core provider refusal would defeat its contract.
