@@ -1,5 +1,6 @@
 """Independently validate detached snapshot formats 1 through 4."""
 from pathlib import Path
+from checkpoint_store import resolve_checkpoint
 import hashlib, json, math, struct, zlib
 root = Path(__file__).resolve().parents[1]
 LIMIT = 512 * 1024**2
@@ -59,6 +60,7 @@ def plant_record(record):
     return name,hashlib.sha256(record).hexdigest(),hashlib.sha256(grid).hexdigest()
 
 def snapshot(terrain_path, expected_kinds=(1,2,2,3,3,3,3)):
+    terrain_path = resolve_checkpoint(terrain_path)
     terrain_path=Path(terrain_path)
     sidecar=Path(str(terrain_path)+'.detached-'+hashlib.md5(terrain_path.read_bytes()).hexdigest()+'.bin')
     blob=sidecar.read_bytes(); f=Reader(blob); magic,version,crc=f.unpack('III')

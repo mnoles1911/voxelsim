@@ -1,4 +1,5 @@
 #include "VoxelEarthGameMode.h"
+#include "VoxelSessionCheckpoint.h"
 #include "VoxelEnvironmentLODPrototype.h"
 
 // The five light/sky includes that used to be here went with the rig (W4):
@@ -126,6 +127,7 @@ AVoxelEarthGameMode::AVoxelEarthGameMode()
 
 void AVoxelEarthGameMode::BeginPlayerSession(const FTransform* SpawnOverride)
 {
+	if (VoxelSessionCheckpoint::Failed(GetWorld())) return;
 	if (bPlayerSessionBegun)
 	{
 		UE_LOG(LogVoxelEarth, Warning, TEXT("BeginPlayerSession called twice; ignoring the second call."));
@@ -4460,6 +4462,7 @@ FRotator AVoxelEarthGameMode::UndergroundTestCameraRotation() const
 
 void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 {
+	if (VoxelSessionCheckpoint::Failed(GetWorld())) return;
 	// docs/m1-plan.md Stage 2 decisions table item 3: spawn above the
 	// terrain surface (Amplifier column at 0,0), +5m -- rather than via
 	// FindPlayerStart/APlayerStart, since no level in this repo places one

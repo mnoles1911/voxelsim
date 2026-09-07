@@ -599,6 +599,9 @@ public:
 	// on a write failure. Also invoked directly by the voxel.SaveWater console
 	// command and the -VoxelWaterPersistTest fixture.
 	bool SaveWaterState() const;
+	bool CaptureCheckpoint(TArray<uint8>& Water,TArray<uint8>& Hydrology,double& Remainder,bool& ImplicitOcean) const;
+	bool RestoreCheckpoint(const TArray<uint8>& Water,const TArray<uint8>& Hydrology,double Remainder,bool ImplicitOcean);
+	bool RestoreLegacyCheckpoint();
 
 	// Diagnostic (task item: prove the drain->save->reload round trip in-engine):
 	// serializes the LIVE CA+mobilizer to the exact bytes SaveWaterState writes,

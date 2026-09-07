@@ -1,5 +1,6 @@
 """Check async completion/failure/exit behavior and the resulting save files."""
 from pathlib import Path
+from checkpoint_store import resolve_checkpoint
 import hashlib
 import json
 import re
@@ -39,7 +40,7 @@ source = read_snapshot(root/'ue-project/Saved/Tests/detached-roundtrip.vxlog')
 results = {}
 for slug in ('async_save_verification', 'async_exit_verification'):
     directory = root/'ue-project/Saved/SaveGames'/slug
-    meta_path = directory/'meta.json'
+    meta_path = resolve_checkpoint(directory/'world.vxlog').parent/'meta.json'
     if not meta_path.exists():  # Metadata moved out of the player's save list after verification.
         meta_path = root/'ue-project/Saved/Tests'/(slug+'.meta.json')
     metadata = json.loads(meta_path.read_text(encoding='utf-8-sig'))

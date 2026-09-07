@@ -67,6 +67,13 @@ public:
 	UVoxelInventoryComponent();
 
 	virtual void BeginPlay() override;
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+    bool IsInitialized() const { return bSeeded; }
+    const TArray<FVoxelInventorySlot>& CaptureSlots() const { return Slots; }
+    static bool ValidateSnapshot(const TArray<FVoxelInventorySlot>& InSlots,int32 Selection);
+    bool RestoreSlots(const TArray<FVoxelInventorySlot>& InSlots,int32 Selection);
+    UFUNCTION(Server,Reliable)
+    void ServerSelectSlot(int32 SlotIndex);
 
 	// --- The contract other code is written against -------------------------
 	//
@@ -169,11 +176,13 @@ public:
 	static UVoxelInventoryComponent* EnsureForLocalPlayer(UWorld* World);
 
 private:
-	UPROPERTY()
+	UPROPERTY(Replicated)
 	TArray<FVoxelInventorySlot> Slots;
 
+	UPROPERTY(Replicated)
 	int32 SelectedSlot = 0;
 
+	UPROPERTY(Replicated)
 	bool bSeeded = false;
 	int32 SeededCount = 0;
 

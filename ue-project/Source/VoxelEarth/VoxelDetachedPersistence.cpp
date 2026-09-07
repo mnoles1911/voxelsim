@@ -1,4 +1,6 @@
 #include "VoxelDetachedPersistence.h"
+#include "VoxelCheckpointStore.h"
+#include "VoxelSessionCheckpoint.h"
 #include "VoxelDebris.h"
 #include "VoxelDebrisLifecycle.h"
 #include "VoxelTreeFellingPrototype.h"
@@ -60,6 +62,7 @@ void SnapshotBeforeTearDown(UWorld* W)
     if(!W||W->GetNetMode()==NM_Client)return;
     DrainLoads(W);VoxelObjectPages::Drain(W);VoxelSaveJobs::Drain();
     RefreshObjects(W);
+    VoxelSessionCheckpoint::SaveBeforeTearDown(W);
     UE_LOG(LogVoxelEarth,Log,TEXT("ObjectSave teardown snapshot records=%d"),VoxelObjects::Get(W).Num());
 }
 struct FTeardownHook
@@ -210,7 +213,7 @@ FAutoConsoleCommandWithWorld Probe(TEXT("voxel.DetachedPersistence.Probe"),TEXT(
         if(!W||W->GetNetMode()!=NM_Standalone)return;
         FTimerHandle Handle;
         W->GetTimerManager().SetTimer(Handle,FTimerDelegate::CreateLambda([W](){
-            const FString Path=FPaths::ProjectSavedDir()/TEXT("Tests/detached-roundtrip.vxlog");
+            FString Path=FPaths::ProjectSavedDir()/TEXT("Tests/detached-roundtrip.vxlog");
             auto Resource=W->SpawnActor<AVoxelDebris>();TArray<VoxelCoords::FVoxelCoord> Cells;
             for(int32 I=0;I<9;++I)Cells.Add(VoxelCoords::FVoxelCoord{I,0,100000});Resource->InitFromIsland(Cells);
             auto Life=Resource->FindComponentByClass<UVoxelDebrisLifecycle>();FVoxelDebrisLifetimeState TestState;
@@ -219,7 +222,9 @@ FAutoConsoleCommandWithWorld Probe(TEXT("voxel.DetachedPersistence.Probe"),TEXT(
             TArray<AActor*> Before;TArray<FVector> Locations;TArray<FRecord> Originals;
             for(TActorIterator<AActor> It(W);It;++It){FRecord R;if(Capture(*It,R)){Before.Add(*It);Locations.Add(It->GetActorLocation());Originals.Add(MoveTemp(R));}}
             auto Sub=W->GetSubsystem<UVoxelWorldSubsystem>();
-            if(Before.IsEmpty()||!Sub||!Sub->SaveWorldToPath(Path)||!FFileHelper::LoadFileToArray(Terrain,*Path)){UE_LOG(LogVoxelEarth,Error,TEXT("DetachedSave PROBE FAIL save"));return;}
+            VoxelCheckpointStore::FResolved Checkpoint;
+            if(Before.IsEmpty()||!Sub||!Sub->SaveWorldToPath(Path)||!VoxelCheckpointStore::Resolve(Path,Checkpoint)||!FFileHelper::LoadFileToArray(Terrain,*Checkpoint.TerrainPath)){UE_LOG(LogVoxelEarth,Error,TEXT("DetachedSave PROBE FAIL save"));return;}
+            Path=Checkpoint.TerrainPath;
             for(auto A:Before)A->Destroy();
             if(!Load(W,Path,Terrain)){UE_LOG(LogVoxelEarth,Error,TEXT("DetachedSave PROBE FAIL load"));return;}
             int32 Count=0,Timber=0,Plants=0;bool Pass=true,TimerMatched=false;

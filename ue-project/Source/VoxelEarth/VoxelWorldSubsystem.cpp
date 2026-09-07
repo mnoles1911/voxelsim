@@ -2,6 +2,8 @@
 #include "VoxelTreeFellingPrototype.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelSaveJobs.h"
+#include "VoxelCheckpointStore.h"
+#include "VoxelSessionCheckpoint.h"
 #include "VoxelEnvironmentLODPrototype.h"
 
 #include "VoxelChunkComponent.h"
@@ -30908,36 +30910,6 @@ FString GetWorldSaveFilePath(uint64 Seed)
 	return FPaths::ProjectSavedDir() / TEXT("VoxelWorlds") / FString::Printf(TEXT("%llu.vxlog"), (unsigned long long)Seed);
 }
 
-// Atomic tmp+rename write (mirrors voxel-core/bench/editlog_tool.cpp's own
-// writeFileAtomic, UE-side: FFileHelper for the write, IFileManager::Move for
-// the rename-over-destination) -- a process dying mid-write leaves only the
-// .tmp file behind, never a truncated/corrupt Path.
-bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
-{
-	// THE REFUSAL GATE, and it is here rather than at each call site so that a
-	// writer added later inherits it instead of having to remember it. If this
-	// session could not READ the file at Path, writing it now is not a save, it
-	// is a deletion. See VoxelSaveGuard.h.
-	if (VoxelSaveGuard::RefuseWrite(Path, TEXT("SaveWorld")))
-	{
-		return false;
-	}
-
-	const FString TmpPath = Path + TEXT(".tmp");
-	if (!FFileHelper::SaveArrayToFile(Bytes, *TmpPath))
-	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("SaveWorld: failed to write temp file %s"), *TmpPath);
-		return false;
-	}
-	if (!IFileManager::Get().Move(*Path, *TmpPath, /*Replace*/ true))
-	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("SaveWorld: failed to rename %s -> %s"), *TmpPath, *Path);
-		IFileManager::Get().Delete(*TmpPath);
-		return false;
-	}
-	return true;
-}
-
 // UVoxelWorldSubsystem::SaveWorld's real body (kept as a free function so it
 // only needs FVoxelWorldImpl&, matching this file's existing role-split
 // convention -- see TryDigReplica et al above). Compacts the outgoing copy
@@ -30953,6 +30925,8 @@ bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
 bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path, UWorld* World)
 {
 	VoxelSaveJobs::Drain();
+	VoxelCheckpointStore::FSimulationPayload Simulation;
+	if (!VoxelSessionCheckpoint::Capture(World,Simulation)) return false;
 	const vxc::EditLog& Log = Impl.Voxels.log();
 	const vxc::EditLog Compacted = vxc::compactLog(Log);
 	const bool bUseCompacted = Log.size() > 2 * Compacted.size();
@@ -30967,10 +30941,9 @@ bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path, UWorld*
 		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
 	}
 
-	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), /*Tree*/ true);
-	if (!VoxelDetachedPersistence::Save(World, Path, OutBytes)) return false;
-
-	if (!WriteBytesAtomic(Path, OutBytes))
+	TArray<uint8> Detached;
+	if (!VoxelDetachedPersistence::CapturePayload(World, Detached)) return false;
+	if (!VoxelCheckpointStore::Commit(Path, OutBytes, Detached,FString(),-1,&Simulation))
 	{
 		return false;
 	}
@@ -30998,13 +30971,21 @@ bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path, UWorld*
 // rather than at the seed-derived location. GetWorldSaveFilePath(Seed) is
 // still that default location and is what the suppressed-front-end arm
 // passes, so the pre-front-end behaviour is unchanged.
-void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path, UWorld* World)
+bool LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& LogicalPath, UWorld* World)
 {
 	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelNoLoad")))
 	{
 		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: -VoxelNoLoad passed -- skipping saved-world load, starting fresh."));
-		return;
+		return VoxelSessionCheckpoint::Restore(World,LogicalPath,nullptr);
 	}
+
+	VoxelCheckpointStore::FResolved Checkpoint;
+	if (!VoxelCheckpointStore::Resolve(LogicalPath, Checkpoint))
+	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("No complete supported checkpoint generation could be loaded."));
+		return false;
+	}
+    const FString& Path = Checkpoint.TerrainPath;
 
 	// ABSENCE IS NOT REFUSAL, and this test is what makes the two different
 	// BRANCHES rather than different shades of the same one. A world with no
@@ -31015,12 +30996,13 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path, UWorld* Wor
 	if (!FPaths::FileExists(Path))
 	{
 		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: no saved world at %s -- starting fresh."), *Path);
-		return;
+		return VoxelSessionCheckpoint::Restore(World,LogicalPath,nullptr);
 	}
 
 	TArray<uint8> Bytes;
 	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
 	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("Checkpoint terrain could not be read."));
 		// The file EXISTS and we could not open it -- a lock, a permission, a
 		// failing disk. Quarantine (we must not overwrite bytes we never saw)
 		// but do NOT move it aside: we have no evidence it is malformed, and a
@@ -31031,12 +31013,13 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path, UWorld* Wor
 		       *Path);
 		VoxelSaveGuard::Quarantine(
 			Path, TEXT("the file exists but this session could not open it (locked, permissions, or failing disk)."));
-		return;
+		return false;
 	}
 
 	const std::optional<vxc::EditLog> ParsedLog = vxc::EditLog::parse(Bytes.GetData(), (size_t)Bytes.Num());
 	if (!ParsedLog)
 	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("Checkpoint terrain format was refused."));
 		// WAS: one Error line saying "corrupt or unrecognized", then a plain
 		// return -- after which Deinitialize's autosave wrote an empty log over
 		// this exact path. A kWorldGenVersion bump lands here for EVERY save on
@@ -31044,15 +31027,18 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path, UWorld* Wor
 		// every player's world at once. ClassifyEditLog says which of the two it
 		// actually was; RefuseFile latches the path unwritable and moves the
 		// bytes aside. See VoxelSaveGuard.h.
-		VoxelSaveGuard::RefuseFile(Path, VoxelSaveGuard::ClassifyEditLog(Bytes.GetData(), Bytes.Num()),
-		                           TEXT("saved world"));
+		if (Checkpoint.bCheckpoint)
+			VoxelSaveGuard::Quarantine(Path, TEXT("Committed terrain format refused; immutable bytes preserved."));
+		else
+			VoxelSaveGuard::RefuseFile(Path, VoxelSaveGuard::ClassifyEditLog(Bytes.GetData(), Bytes.Num()), TEXT("saved world"));
 		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: starting fresh; %s will NOT be overwritten by this session."),
 		       *Path);
-		return;
+		return false;
 	}
 
 	if (!Impl.Voxels.replay(*ParsedLog))
 	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("Checkpoint terrain identity was refused."));
 		// Same class, different door: the file parsed, so the bytes are fine,
 		// but they describe a different world than the one running. Replaying
 		// would be wrong and overwriting would be worse.
@@ -31064,10 +31050,11 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path, UWorld* Wor
 			     "bytes are intact; they belong to a different world."),
 			(unsigned long long)ParsedLog->seed(), uint32(ParsedLog->brickEdge()),
 			(unsigned long long)Impl.Voxels.amplifier().seed());
-		VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("saved world"));
+		if (Checkpoint.bCheckpoint) VoxelSaveGuard::Quarantine(Path, Refusal.Detail);
+		else VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("saved world"));
 		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: starting fresh; %s will NOT be overwritten by this session."),
 		       *Path);
-		return;
+		return false;
 	}
 
 	UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: restored %llu entries from %s -- editedDigest=0x%016llX"),
@@ -31077,7 +31064,13 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path, UWorld* Wor
 	// from edits has to be rebuilt explicitly, or a reloaded world streams as
 	// if it had never been dug.
 	Impl.RebuildEditedFootprintsFromOverlay();
+	if (!VoxelSessionCheckpoint::Restore(World,LogicalPath,&Checkpoint))
+    {
+        VoxelSaveGuard::Quarantine(LogicalPath,TEXT("Simulation payload or configuration refused; checkpoint preserved."));
+        return false;
+    }
 	VoxelDetachedPersistence::LoadAsync(World, Path, Bytes);
+	return true;
 }
 } // namespace
 
@@ -31375,7 +31368,7 @@ void UVoxelWorldSubsystem::Deinitialize()
 		// <seed>.vxlog and silently destroy the player's world -- the exact
 		// failure bWorldBegunPlay was introduced to prevent, arriving through a
 		// second door. bWorldSessionStartAttempted is that second door's lock.
-		if (bWorldBegunPlay && bWorldSessionStartAttempted)
+		if (bWorldBegunPlay && bWorldSessionStartAttempted && !VoxelSessionCheckpoint::FinalSaveAttempted(GetWorld()))
 		{
 			// WHERE the autosave lands depends on where this session came
 			// from. A session opened from a named save writes back INTO that
@@ -31666,8 +31659,17 @@ void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
 	// reply instead (see AVoxelEarthPlayerController::ServerRequestJoinSync).
 	if (World->GetNetMode() != NM_Client && !EditLogPathOrEmpty.IsEmpty())
 	{
-		LoadEditLogFromPath(*Impl, EditLogPathOrEmpty, World);
-	}
+        if (!LoadEditLogFromPath(*Impl, EditLogPathOrEmpty, World))
+        {
+            VoxelSessionCheckpoint::Fail(World);
+            UE_LOG(LogVoxelEdit,Error,TEXT("Session load refused; simulation and checkpoint writes are disabled. Restart to retry."));
+            return;
+        }
+    }
+    else if (World->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Restore(World,FString(),nullptr))
+    {
+        VoxelSessionCheckpoint::Fail(World); return;
+    }
 
 	// M3 wave 1 (docs/m3-plan.md): a dedicated server has no viewport and never
 	// renders -- render-chunk streaming is pure client/listen-server concern

@@ -15,6 +15,7 @@
 namespace VoxelObjectPages
 {
 using namespace VoxelObjects;
+using FGeometry = VoxelObjects::FGeometry;
 namespace {
 constexpr int32 MaxBytes=512*1024*1024;
 struct FResult { bool Ok=false,Loading=false;FGuid Id;uint64 Revision=0;VoxelObjects::FGeometry Original,Loaded;FGeometryPage Page; };
@@ -53,6 +54,7 @@ bool Write(const FString& Directory,const VoxelObjects::FGeometry& Geometry,FGeo
 bool Hydrate(FEntry& E)
 {
     if(E.Geometry||E.Residency==EResidency::Tombstone)return true;
+    // Reject missing backing data before entering the worker-only disk reader.
     if(!E.Page.IsValid())return false;
     VoxelObjects::FGeometry Loaded;if(!Read(E.Page,Loaded))return false;E.Geometry=MoveTemp(Loaded);return true;
 }

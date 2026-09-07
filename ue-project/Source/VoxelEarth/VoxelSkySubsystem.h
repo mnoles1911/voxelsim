@@ -269,6 +269,9 @@ public:
 	// Absolute clock set, in game seconds since world start. The one entry
 	// point everything else funnels through.
 	void SetEpochSeconds(double NewEpochSeconds);
+	bool CaptureEpochSeconds(double& Out) const;
+    bool CaptureClock(double& Epoch,double& Rate,double& Day,double& Year) const;
+    bool RestoreClock(double Epoch,double Rate,double Day,double Year);
 
 	// F7 sky-epoch replication, client-side receive half. Called by
 	// AVoxelEditRelay::OnRep_SkyClock (and by nothing else) with the server's

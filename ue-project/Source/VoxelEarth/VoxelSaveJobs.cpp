@@ -1,4 +1,5 @@
 #include "VoxelSaveJobs.h"
+#include "VoxelCheckpointStore.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelSaveGuard.h"
 #include "VoxelEarth.h"
@@ -21,27 +22,13 @@ struct FActive
 TUniquePtr<FActive> Active;
 FTSTicker::FDelegateHandle PollHandle;
 
-bool WriteAtomic(const FString& Path,const TArray<uint8>& Bytes)
-{
-    if(VoxelSaveGuard::RefuseWrite(Path,TEXT("SaveAsync")))return false;
-    IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path),true);
-    const FString Temp=Path+TEXT(".tmp");
-    if(!FFileHelper::SaveArrayToFile(Bytes,*Temp))return false;
-    return IFileManager::Get().Move(*Path,*Temp,true);
-}
 FResult Write(FSnapshot&& Snapshot)
 {
     check(!IsInGameThread());const double Start=FPlatformTime::Seconds();
     FResult Result;
     if(VoxelSaveGuard::RefuseWrite(Snapshot.TerrainPath,TEXT("SaveAsync")))return Result;
     if(Snapshot.bObjectSnapshot&&!VoxelDetachedPersistence::EncodeSnapshot(Snapshot.Objects,Snapshot.Detached))return Result;
-    Result.Success=VoxelDetachedPersistence::WritePayload(Snapshot.TerrainPath,Snapshot.Terrain,Snapshot.Detached)
-        &&WriteAtomic(Snapshot.TerrainPath,Snapshot.Terrain);
-    if(Result.Success&&!Snapshot.MetadataJson.IsEmpty())
-    {
-        FTCHARToUTF8 Utf8(*Snapshot.MetadataJson);TArray<uint8> Data;Data.Append(reinterpret_cast<const uint8*>(Utf8.Get()),Utf8.Length());
-        Result.Success=WriteAtomic(FPaths::GetPath(Snapshot.TerrainPath)/TEXT("meta.json"),Data);
-    }
+    Result.Success=VoxelCheckpointStore::Commit(Snapshot.TerrainPath,Snapshot.Terrain,Snapshot.Detached,Snapshot.MetadataJson,-1,&Snapshot.Simulation);
     Result.WorkerMs=(FPlatformTime::Seconds()-Start)*1000.;return Result;
 }
 void Complete()
