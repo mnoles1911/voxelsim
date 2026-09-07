@@ -1,5 +1,6 @@
 #pragma once
-// Named saves: Saved/SaveGames/<slug>/{meta.json, world.vxlog}.
+// Named saves: immutable generations under Saved/SaveGames/<slug>/world.vxlog.checkpoints/.
+// Legacy sibling meta.json/world.vxlog files remain readable and are never overwritten.
 //
 // WHAT THIS IS AND IS NOT. The project already had world persistence -- one
 // .vxlog per seed at Saved/VoxelWorlds/<seed>.vxlog, written on shutdown and
@@ -91,11 +92,15 @@ VOXELEARTH_API FString WorldLogPath(const FString& Slug);
 // (the front end or the console command) because this layer deliberately knows
 // nothing about pawns.
 //
-// Returns false and writes NOTHING if the edit log could not be serialised --
+// Returns false and publishes NOTHING if the edit log could not be serialised --
 // a meta.json without its world beside it would show up in the menu as a
 // loadable save that opens an empty world.
 VOXELEARTH_API bool Write(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool bIsAutosave,
                           const FTransform& PlayerTransform, int32 PlayTimeSeconds);
+// True means admitted, not finished. Completion runs on the game thread after
+// terrain, debris and metadata have been written. A busy writer rejects admission.
+VOXELEARTH_API bool WriteAsync(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIsAutosave,
+                              const FTransform& PlayerTransform,int32 PlayTimeSeconds,TFunction<void(bool)> Completion = {});
 
 // Removes the whole directory. Returns false if it did not exist.
 VOXELEARTH_API bool Delete(const FString& Slug);

@@ -428,6 +428,7 @@ float SVoxelLoadingScreen::GetBackgroundBOpacity() const
 
 FText SVoxelLoadingScreen::GetQuipText() const
 {
+	if (bLoadFailed) return FText::FromString(TEXT("This save could not be restored."));
 	const TArray<FText>& Quips = VoxelUIStrings::LoadingQuips();
 	if (QuipOrder.Num() == 0 || Quips.Num() == 0)
 	{
@@ -443,6 +444,7 @@ FSlateColor SVoxelLoadingScreen::GetQuipColour() const
 
 FText SVoxelLoadingScreen::GetTipText() const
 {
+	if (bLoadFailed) return FText::FromString(TEXT("Your checkpoint has been preserved. Restart the game before trying another save."));
 	const TArray<FText>& Tips = VoxelUIStrings::GameplayTips();
 	if (TipOrder.Num() == 0 || Tips.Num() == 0)
 	{
@@ -453,6 +455,7 @@ FText SVoxelLoadingScreen::GetTipText() const
 
 FText SVoxelLoadingScreen::GetPercentText() const
 {
+	if (bLoadFailed) return FText::FromString(TEXT("Load failed"));
 	// floor, not round: 99.6% should read 99%, because a bar that says 100%
 	// while the world is still landing is the specific lie this whole progress
 	// model exists to avoid.

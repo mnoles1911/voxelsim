@@ -1,4 +1,9 @@
 #include "VoxelWorldSubsystem.h"
+#include "VoxelDetachedPersistence.h"
+#include "VoxelSaveJobs.h"
+#include "VoxelCheckpointStore.h"
+#include "VoxelSessionCheckpoint.h"
+#include "VoxelEnvironmentLODPrototype.h"
 
 #include "VoxelChunkComponent.h"
 // MeshChunkBricks + ERingSkirtFace used to live in this file's anonymous
@@ -9957,6 +9962,7 @@ struct FVoxelWorldImpl
 	// out of the local EditsByBrick map, so it reflects exactly what this
 	// call wrote to the overlay.
 	bool TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, FEditsByBrick* OutPredicted = nullptr);
+	bool GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const;
 	bool TryPlace(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, uint8 MaterialId,
 	              const FVector& PlayerActorLocation, FEditsByBrick* OutPredicted = nullptr);
 
@@ -30814,14 +30820,8 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 		}
 	}
 
-	// Cosmetic debris bodies: only where there is something to look at. A
-	// dedicated server has already done the authoritative half above (the
-	// voxels ARE gone from the grid and those removals replicate); it just
-	// spawns no Chaos body, so there is nothing here that could desync.
-	if (World.GetNetMode() == NM_DedicatedServer)
-	{
-		return;
-	}
+	// Persistent detached bodies now live on the authority, including dedicated
+	// servers; the object replication subsystem publishes their geometry/motion.
 
 	// --- Debris caps (docs/status.md "Structural collapse (M5, large-edit)") -
 	// A chop detaches one canopy; a large collapse can shatter into dozens of
@@ -30903,36 +30903,6 @@ FString GetWorldSaveFilePath(uint64 Seed)
 	return FPaths::ProjectSavedDir() / TEXT("VoxelWorlds") / FString::Printf(TEXT("%llu.vxlog"), (unsigned long long)Seed);
 }
 
-// Atomic tmp+rename write (mirrors voxel-core/bench/editlog_tool.cpp's own
-// writeFileAtomic, UE-side: FFileHelper for the write, IFileManager::Move for
-// the rename-over-destination) -- a process dying mid-write leaves only the
-// .tmp file behind, never a truncated/corrupt Path.
-bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
-{
-	// THE REFUSAL GATE, and it is here rather than at each call site so that a
-	// writer added later inherits it instead of having to remember it. If this
-	// session could not READ the file at Path, writing it now is not a save, it
-	// is a deletion. See VoxelSaveGuard.h.
-	if (VoxelSaveGuard::RefuseWrite(Path, TEXT("SaveWorld")))
-	{
-		return false;
-	}
-
-	const FString TmpPath = Path + TEXT(".tmp");
-	if (!FFileHelper::SaveArrayToFile(Bytes, *TmpPath))
-	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("SaveWorld: failed to write temp file %s"), *TmpPath);
-		return false;
-	}
-	if (!IFileManager::Get().Move(*Path, *TmpPath, /*Replace*/ true))
-	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("SaveWorld: failed to rename %s -> %s"), *TmpPath, *Path);
-		IFileManager::Get().Delete(*TmpPath);
-		return false;
-	}
-	return true;
-}
-
 // UVoxelWorldSubsystem::SaveWorld's real body (kept as a free function so it
 // only needs FVoxelWorldImpl&, matching this file's existing role-split
 // convention -- see TryDigReplica et al above). Compacts the outgoing copy
@@ -30945,8 +30915,11 @@ bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
 // default location, and UVoxelWorldSubsystem::SaveWorld still writes there, so
 // the autosave-on-shutdown and voxel.SaveWorld behaviour that predates the
 // front end is untouched.
-bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
+bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path, UWorld* World)
 {
+	VoxelSaveJobs::Drain();
+	VoxelCheckpointStore::FSimulationPayload Simulation;
+	if (!VoxelSessionCheckpoint::Capture(World,Simulation)) return false;
 	const vxc::EditLog& Log = Impl.Voxels.log();
 	const vxc::EditLog Compacted = vxc::compactLog(Log);
 	const bool bUseCompacted = Log.size() > 2 * Compacted.size();
@@ -30961,9 +30934,9 @@ bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
 		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
 	}
 
-	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), /*Tree*/ true);
-
-	if (!WriteBytesAtomic(Path, OutBytes))
+	TArray<uint8> Detached;
+	if (!VoxelDetachedPersistence::CapturePayload(World, Detached)) return false;
+	if (!VoxelCheckpointStore::Commit(Path, OutBytes, Detached,FString(),-1,&Simulation))
 	{
 		return false;
 	}
@@ -30991,13 +30964,21 @@ bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
 // rather than at the seed-derived location. GetWorldSaveFilePath(Seed) is
 // still that default location and is what the suppressed-front-end arm
 // passes, so the pre-front-end behaviour is unchanged.
-void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
+bool LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& LogicalPath, UWorld* World)
 {
 	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelNoLoad")))
 	{
 		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: -VoxelNoLoad passed -- skipping saved-world load, starting fresh."));
-		return;
+		return VoxelSessionCheckpoint::Restore(World,LogicalPath,nullptr);
 	}
+
+	VoxelCheckpointStore::FResolved Checkpoint;
+	if (!VoxelCheckpointStore::Resolve(LogicalPath, Checkpoint))
+	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("No complete supported checkpoint generation could be loaded."));
+		return false;
+	}
+    const FString& Path = Checkpoint.TerrainPath;
 
 	// ABSENCE IS NOT REFUSAL, and this test is what makes the two different
 	// BRANCHES rather than different shades of the same one. A world with no
@@ -31008,12 +30989,13 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 	if (!FPaths::FileExists(Path))
 	{
 		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: no saved world at %s -- starting fresh."), *Path);
-		return;
+		return VoxelSessionCheckpoint::Restore(World,LogicalPath,nullptr);
 	}
 
 	TArray<uint8> Bytes;
 	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
 	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("Checkpoint terrain could not be read."));
 		// The file EXISTS and we could not open it -- a lock, a permission, a
 		// failing disk. Quarantine (we must not overwrite bytes we never saw)
 		// but do NOT move it aside: we have no evidence it is malformed, and a
@@ -31024,12 +31006,13 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 		       *Path);
 		VoxelSaveGuard::Quarantine(
 			Path, TEXT("the file exists but this session could not open it (locked, permissions, or failing disk)."));
-		return;
+		return false;
 	}
 
 	const std::optional<vxc::EditLog> ParsedLog = vxc::EditLog::parse(Bytes.GetData(), (size_t)Bytes.Num());
 	if (!ParsedLog)
 	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("Checkpoint terrain format was refused."));
 		// WAS: one Error line saying "corrupt or unrecognized", then a plain
 		// return -- after which Deinitialize's autosave wrote an empty log over
 		// this exact path. A kWorldGenVersion bump lands here for EVERY save on
@@ -31037,15 +31020,18 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 		// every player's world at once. ClassifyEditLog says which of the two it
 		// actually was; RefuseFile latches the path unwritable and moves the
 		// bytes aside. See VoxelSaveGuard.h.
-		VoxelSaveGuard::RefuseFile(Path, VoxelSaveGuard::ClassifyEditLog(Bytes.GetData(), Bytes.Num()),
-		                           TEXT("saved world"));
+		if (Checkpoint.bCheckpoint)
+			VoxelSaveGuard::Quarantine(Path, TEXT("Committed terrain format refused; immutable bytes preserved."));
+		else
+			VoxelSaveGuard::RefuseFile(Path, VoxelSaveGuard::ClassifyEditLog(Bytes.GetData(), Bytes.Num()), TEXT("saved world"));
 		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: starting fresh; %s will NOT be overwritten by this session."),
 		       *Path);
-		return;
+		return false;
 	}
 
 	if (!Impl.Voxels.replay(*ParsedLog))
 	{
+		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("Checkpoint terrain identity was refused."));
 		// Same class, different door: the file parsed, so the bytes are fine,
 		// but they describe a different world than the one running. Replaying
 		// would be wrong and overwriting would be worse.
@@ -31057,10 +31043,11 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 			     "bytes are intact; they belong to a different world."),
 			(unsigned long long)ParsedLog->seed(), uint32(ParsedLog->brickEdge()),
 			(unsigned long long)Impl.Voxels.amplifier().seed());
-		VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("saved world"));
+		if (Checkpoint.bCheckpoint) VoxelSaveGuard::Quarantine(Path, Refusal.Detail);
+		else VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("saved world"));
 		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: starting fresh; %s will NOT be overwritten by this session."),
 		       *Path);
-		return;
+		return false;
 	}
 
 	UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: restored %llu entries from %s -- editedDigest=0x%016llX"),
@@ -31070,6 +31057,13 @@ void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 	// from edits has to be rebuilt explicitly, or a reloaded world streams as
 	// if it had never been dug.
 	Impl.RebuildEditedFootprintsFromOverlay();
+	if (!VoxelSessionCheckpoint::Restore(World,LogicalPath,&Checkpoint))
+    {
+        VoxelSaveGuard::Quarantine(LogicalPath,TEXT("Simulation payload or configuration refused; checkpoint preserved."));
+        return false;
+    }
+	VoxelDetachedPersistence::LoadAsync(World, Path, Bytes);
+	return true;
 }
 } // namespace
 
@@ -31245,6 +31239,12 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	int32 FineRingRadius = -1; // <0 => leave the streamer's own default
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), FineRingRadius);
 
+    // Explicit transport/automation fixture; avoids depending on baked tiles
+    // for an intentionally unique test seed. Ordinary launches keep their tier.
+    if(FParse::Param(FCommandLine::Get(),TEXT("VoxelSyntheticTerrain"))){
+        TileDir.Reset();FineTileDir.Reset();
+        UE_LOG(LogVoxelEarth,Log,TEXT("VoxelSyntheticTerrain: explicit synthetic test world (no tile caches)"));
+    }
 	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes,
 	                                   FineRingRadius);
 }
@@ -31360,7 +31360,7 @@ void UVoxelWorldSubsystem::Deinitialize()
 		// <seed>.vxlog and silently destroy the player's world -- the exact
 		// failure bWorldBegunPlay was introduced to prevent, arriving through a
 		// second door. bWorldSessionStartAttempted is that second door's lock.
-		if (bWorldBegunPlay && bWorldSessionStartAttempted)
+		if (bWorldBegunPlay && bWorldSessionStartAttempted && !VoxelSessionCheckpoint::FinalSaveAttempted(GetWorld()))
 		{
 			// WHERE the autosave lands depends on where this session came
 			// from. A session opened from a named save writes back INTO that
@@ -31612,7 +31612,15 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// Suppressed-front-end arm: identical order and identical point to the
 	// behaviour that predates the front end. The ~40 self-driving verification
 	// switches all land here.
-	StartWorldSession(GetWorldSaveFilePath(Seed));
+	if(FParse::Param(FCommandLine::Get(),TEXT("VoxelDetachedRestoreProbe")))
+	{
+		// Keep the verification run's shutdown autosave out of the player's save.
+		VoxelSave::SetActiveSlug(TEXT("detached-restore-probe"));
+		const FString ProbePath=FParse::Param(FCommandLine::Get(),TEXT("VoxelAsyncRestoreProbe"))
+			?VoxelSave::WorldLogPath(TEXT("async_save_verification")):FPaths::ProjectSavedDir()/TEXT("Tests/detached-roundtrip.vxlog");
+		StartWorldSession(ProbePath);
+	}
+	else StartWorldSession(GetWorldSaveFilePath(Seed));
 }
 
 void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
@@ -31643,8 +31651,17 @@ void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
 	// reply instead (see AVoxelEarthPlayerController::ServerRequestJoinSync).
 	if (World->GetNetMode() != NM_Client && !EditLogPathOrEmpty.IsEmpty())
 	{
-		LoadEditLogFromPath(*Impl, EditLogPathOrEmpty);
-	}
+        if (!LoadEditLogFromPath(*Impl, EditLogPathOrEmpty, World))
+        {
+            VoxelSessionCheckpoint::Fail(World);
+            UE_LOG(LogVoxelEdit,Error,TEXT("Session load refused; simulation and checkpoint writes are disabled. Restart to retry."));
+            return;
+        }
+    }
+    else if (World->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Restore(World,FString(),nullptr))
+    {
+        VoxelSessionCheckpoint::Fail(World); return;
+    }
 
 	// M3 wave 1 (docs/m3-plan.md): a dedicated server has no viewport and never
 	// renders -- render-chunk streaming is pure client/listen-server concern
@@ -32268,6 +32285,25 @@ TStatId UVoxelWorldSubsystem::GetStatId() const
 // whatever the edit newly appended to every client. NM_Client predicts
 // locally and forwards the intent to the server instead of applying
 // authoritatively (see TryDigReplica above).
+bool UVoxelWorldSubsystem::GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const
+{
+	if (!Impl || CameraDirection.IsNearlyZero()) return false;
+	if (VoxelEnvironmentLODPrototype::GetDigPreview(GetWorld(), CameraLocation, CameraDirection.GetSafeNormal(), SizeVoxels, OutBounds)) return true;
+	return Impl->GetDigPreview(CameraLocation, CameraDirection, SizeVoxels, OutBounds);
+}
+
+bool FVoxelWorldImpl::GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const
+{
+	const auto Hit = CastFromCamera(CameraLocation, CameraDirection.GetSafeNormal());
+	if (!Hit.hit) return false;
+	const int32 N = FMath::Clamp(SizeVoxels, UVoxelWorldSubsystem::MinCubeSizeVoxels, UVoxelWorldSubsystem::MaxCubeSizeVoxels);
+	int64 X, Y, Z;
+	ComputeCubeMinCorner(Hit.vx, Hit.vy, Hit.vz, Hit.faceAxis, Hit.faceSign, N, X, Y, Z);
+	const FVector Min = FVector(double(X), double(Y), double(Z)) * VoxelCoords::VoxelSizeUU;
+	OutBounds = FBox(Min, Min + FVector(N * VoxelCoords::VoxelSizeUU));
+	return true;
+}
+
 bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels)
 {
 	if (!Impl)
@@ -32281,6 +32317,8 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 	{
 		return World ? TryDigReplica(*Impl, *World, CameraWorldLocation, CameraWorldDirection, SizeVoxels) : false;
 	}
+
+	if (VoxelEnvironmentLODPrototype::TryDig(World, CameraWorldLocation, CameraWorldDirection, SizeVoxels)) return true;
 
 	FEditsByBrick DugCells;
 	const bool bApplied = Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels, &DugCells);
@@ -32687,7 +32725,8 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 	// Overlay-aware (World::materialAt, not GeneratedWorld::materialAt): a
 	// dug voxel must read back as non-solid immediately, and a placed one as
 	// solid, for walk-mode collision to agree with what dig/place just did.
-	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR;
+	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR ||
+        VoxelEnvironmentLODPrototype::IsSolid(GetWorld(), FVector((Vx+.5)*10.,(Vy+.5)*10.,(Vz+.5)*10.));
 }
 
 void UVoxelWorldSubsystem::SetFluidTerrainDirtyListener(
@@ -33112,7 +33151,7 @@ bool UVoxelWorldSubsystem::SaveWorld() const
 		       TEXT("SaveWorld: refused on NM_Client -- only the authority (server/listen/standalone) has a log to save."));
 		return false;
 	}
-	return SaveEditLogToPath(*Impl, GetWorldSaveFilePath(Seed));
+	return SaveEditLogToPath(*Impl, GetWorldSaveFilePath(Seed), GetWorld());
 }
 
 bool UVoxelWorldSubsystem::SaveWorldToPath(const FString& Path) const
@@ -33133,7 +33172,23 @@ bool UVoxelWorldSubsystem::SaveWorldToPath(const FString& Path) const
 			return false;
 		}
 	}
-	return SaveEditLogToPath(*Impl, Path);
+	return SaveEditLogToPath(*Impl, Path, GetWorld());
+}
+
+bool UVoxelWorldSubsystem::CaptureSaveSnapshot(TArray<uint8>& Terrain,TArray<uint8>& Detached) const
+{
+    return CaptureTerrainSnapshot(Terrain)&&VoxelDetachedPersistence::CapturePayload(GetWorld(),Detached);
+}
+bool UVoxelWorldSubsystem::CaptureTerrainSnapshot(TArray<uint8>& Terrain) const
+{
+	check(IsInGameThread());
+	if(!Impl||!GetWorld()||GetWorld()->GetNetMode()==NM_Client)return false;
+	const auto& Log=Impl->Voxels.log();const auto Compacted=vxc::compactLog(Log);
+	std::vector<uint8_t> Bytes;(Log.size()>2*Compacted.size()?Compacted:Log).serialize(Bytes);
+	if(Bytes.size()>MAX_int32)return false;
+	Terrain.SetNumUninitialized(int32(Bytes.size()));
+	if(!Bytes.empty())FMemory::Memcpy(Terrain.GetData(),Bytes.data(),Bytes.size());
+	return true;
 }
 
 namespace
