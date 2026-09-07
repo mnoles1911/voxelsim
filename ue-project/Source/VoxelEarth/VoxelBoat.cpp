@@ -87,6 +87,28 @@ TAutoConsoleVariable<bool> CVarVoxelBoatDrive(
 	TEXT("that separates 'the hull is unstable' from 'the drive is fighting the hull'."),
 	ECVF_Default);
 
+TAutoConsoleVariable<bool> CVarVoxelBoatHullMask(
+	TEXT("voxel.Boat.HullMask"), true,
+	TEXT("The hull water-exclusion mask (AVoxelBoat::UpdateWaterExclusion). 0 hides every station, ")
+	TEXT("which is the contract's own off arm (Tools/water_hull_mask_graph.py): with no stencil ")
+	TEXT("writer in the world the water term multiplies by 1 and the frame is pixel-identical to a ")
+	TEXT("world with no boat in it. That is the A arm for 'is the cockpit dry because of the mask' ")
+	TEXT("and the only way to photograph the water this mask is removing."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelBoatHullMaskLidUU(
+	TEXT("voxel.Boat.HullMaskLidUU"), 6.0f,
+	TEXT("How far the exclusion mask stands above the DRAWN water surface, in UU. This is the ")
+	TEXT("artefact knob and it trades in both directions: the band of water the mask kills OUTSIDE ")
+	TEXT("the hull is lid/tan(view depression) wide, so a taller lid carves a wider ring of open ")
+	TEXT("water beside the planking, while a shorter one lets ripples and the mirror-vs-pixel ")
+	TEXT("mismatch (a few cm, VoxelWaveMirror.generated.h's stated band) wash back into the ")
+	TEXT("cockpit. At the pond pose 2026-09-07 BOTH 10 UU (VoxelVerify00854) and 6 UU ")
+	TEXT("(VoxelVerify00860) left the cockpit dry end to end and showed no ring at that camera ")
+	TEXT("depression; 6 is the default because the ring is the failure that reaches the owner's ")
+	TEXT("grazing shots and 6 UU still clears the few-cm mismatch and the 4 UU wake."),
+	ECVF_Default);
+
 TAutoConsoleVariable<bool> CVarVoxelBoatDebugDraw(
 	TEXT("voxel.Boat.DebugDraw"), false,
 	TEXT("Draw the four buoyancy probes, the water surface they found and the bow probe. Costs a ")
@@ -115,6 +137,17 @@ bool CameraLocation(const UWorld* World, FVector& Out)
 	Out = Pawn->GetActorLocation();
 	return true;
 }
+
+// --- the water-exclusion mask's geometry constants -------------------------
+//
+// Numbers, not tuning: every one of them is an argument in
+// AVoxelBoat::UpdateWaterExclusion, which is where they are justified.
+constexpr int32 NumExclusionStations = 7;
+constexpr double kExclusionPlanFraction = 0.96;    // of the hull half-length, per end
+constexpr double kExclusionInboardFraction = 0.85; // of the local elliptic half-beam
+constexpr double kExclusionMinHalfBeamUU = 4.0;
+constexpr double kExclusionSkirtUU = 60.0;    // how far it reaches below it
+constexpr double kExclusionKeelSlackUU = 2.0; // "the water has reached the planking here"
 
 // Impact speed -> ripple strength fraction. The SAME curve the ripple field's
 // own auto-watcher uses, from the same two constants, for the reason those
@@ -225,46 +258,43 @@ AVoxelBoat::AVoxelBoat()
 	Body->FallbackSizeM = FVector(4.0, 0.9, 0.45);
 	Body->PlaceholderTint = FLinearColor(0.42f, 0.28f, 0.16f, 1.f);
 
-	// The water-exclusion volume (contract: Tools/water_hull_mask_graph.py; see
-	// the member comment). CUSTOM DEPTH ONLY: main pass off AND scene depth
-	// prepass off -- a volume that wrote scene depth would occlude the very
-	// water pixels the mask is supposed to test, not just the ones inside the
-	// hull. The engine cube is closed and outward-facing, which is all the
-	// contract's near-shell test needs; sized in BeginPlay once the hull
-	// geometry is adopted from the asset.
-	ExclusionVolume = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("WaterExclusionVolume"));
-	ExclusionVolume->SetupAttachment(PhysicsBody);
-	if (CubeFinder.Succeeded())
+	// The water-exclusion stations (contract: Tools/water_hull_mask_graph.py;
+	// mechanism in UpdateWaterExclusion). CUSTOM DEPTH ONLY: main pass off AND
+	// scene depth prepass off -- a volume that wrote scene depth would occlude
+	// the very water pixels the mask is supposed to test, not just the ones
+	// inside the hull. The engine cube is closed and outward-facing, which is
+	// all the contract's near-shell test needs.
+	//
+	// ABSOLUTE LOCATION AND ROTATION, which is the one surprising flag here: a
+	// station's lid has to stay HORIZONTAL and sit on the drawn water surface,
+	// and a component that inherited the hull's pitch, roll and heave cannot do
+	// either. The per-tick solve writes the whole world transform, and every
+	// path that does not solve a station HIDES it (SetRenderCustomDepth(false))
+	// -- an absolute-placed mask left behind by a moving boat would carve a
+	// hole in open water.
+	ExclusionStations.Reserve(VoxelBoatLocal::NumExclusionStations);
+	for (int32 StationIdx = 0; StationIdx < VoxelBoatLocal::NumExclusionStations; ++StationIdx)
 	{
-		ExclusionVolume->SetStaticMesh(CubeFinder.Object);
+		UStaticMeshComponent* Station = CreateDefaultSubobject<UStaticMeshComponent>(
+			FName(*FString::Printf(TEXT("WaterExclusionStation%d"), StationIdx)));
+		Station->SetupAttachment(PhysicsBody);
+		if (CubeFinder.Succeeded())
+		{
+			Station->SetStaticMesh(CubeFinder.Object);
+		}
+		Station->SetRenderInMainPass(false);
+		Station->SetRenderInDepthPass(false);
+		// Bit 0 = water exclusion. The registry of stencil bits lives in
+		// Tools/water_hull_mask_graph.py's docstring; claim new bits there.
+		Station->SetCustomDepthStencilValue(1);
+		Station->SetRenderCustomDepth(false); // armed only by a solved tick
+		Station->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Station->SetCastShadow(false);
+		Station->SetMobility(EComponentMobility::Movable);
+		Station->SetUsingAbsoluteLocation(true);
+		Station->SetUsingAbsoluteRotation(true);
+		ExclusionStations.Add(Station);
 	}
-	ExclusionVolume->SetRenderInMainPass(false);
-	ExclusionVolume->SetRenderInDepthPass(false);
-	ExclusionVolume->SetRenderCustomDepth(true);
-	// Bit 0 = water exclusion. The registry of stencil bits lives in
-	// Tools/water_hull_mask_graph.py's docstring; claim new bits there.
-	ExclusionVolume->SetCustomDepthStencilValue(1);
-	ExclusionVolume->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	ExclusionVolume->SetCastShadow(false);
-	ExclusionVolume->SetMobility(EComponentMobility::Movable);
-
-	// The ends box: identical contract, second footprint (see the header
-	// comment). Two boxes because ONE box can only fit the midsection of a
-	// tapering hull -- the 2026-09-06 "TIGHTENED" note below records the
-	// rectangle artefact an oversized single box paints.
-	ExclusionVolumeEnds = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("WaterExclusionVolumeEnds"));
-	ExclusionVolumeEnds->SetupAttachment(PhysicsBody);
-	if (CubeFinder.Succeeded())
-	{
-		ExclusionVolumeEnds->SetStaticMesh(CubeFinder.Object);
-	}
-	ExclusionVolumeEnds->SetRenderInMainPass(false);
-	ExclusionVolumeEnds->SetRenderInDepthPass(false);
-	ExclusionVolumeEnds->SetRenderCustomDepth(true);
-	ExclusionVolumeEnds->SetCustomDepthStencilValue(1);
-	ExclusionVolumeEnds->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	ExclusionVolumeEnds->SetCastShadow(false);
-	ExclusionVolumeEnds->SetMobility(EComponentMobility::Movable);
 
 	CameraArm = CreateDefaultSubobject<USceneComponent>(TEXT("CameraArm"));
 	CameraArm->SetupAttachment(PhysicsBody);
@@ -289,82 +319,52 @@ void AVoxelBoat::BeginPlay()
 		AdoptHullFromBody();
 	}
 
-	// --- the water-exclusion volume, sized against the adopted hull -----------
+	// --- the water-exclusion mask's plan footprint, from the adopted hull -----
 	//
-	// A v1 box (the contract's stated v1; the fitted cockpit bathtub is a later
-	// refinement): slightly inboard of the hull bounds in plan, so the volume's
-	// near shell stays behind the drawn planking, and vertically from the inner
-	// hull bottom to ~0.5 m above the at-rest waterline (keel + rest draft) --
-	// the contract's "above the highest wave crest that can cross the gunwale".
-	// The material tests the near shell within a 3 m band; the whole term is
-	// inert until r.CustomDepth=3 (config, owned by the coordinator) and the
-	// regenerated materials land, and inert is the safe direction.
-	if (ExclusionVolume)
+	// PLAN ONLY: where each station sits along the keel line and how wide it is
+	// allowed to be. The heights are re-solved every tick against the DRAWN water
+	// surface, and UpdateWaterExclusion carries that argument.
+	//
+	// The hull is cut into NumExclusionStations equal slices out to
+	// kExclusionPlanFraction of the half-length, and each slice takes the
+	// half-beam an ELLIPTIC canoe plan carries at the slice's OUTER edge, times
+	// kExclusionInboardFraction. Reading the beam at the outer edge and not at
+	// the slice centre is what keeps planking between every station and the water
+	// everywhere the station reaches: a slice can only be as wide as its narrow
+	// end. That is the whole of the "hull-shaped mask", as a staircase.
+	//
+	// It replaces the 2026-09-06 pair of boxes (a 0.62L x 0.55B midship box and a
+	// 0.92L x 0.26B ends box). Two rectangles could fit the midsection or reach
+	// the ends, not both -- the ends box's 0.26 beam was the price of reaching
+	// 0.92L with a rectangle, and the corners past it kept a sliver anyway. The
+	// mask term itself is inert (the safe direction) until r.CustomDepth=3 is set
+	// in config and the regenerated materials carry it.
+	ExclusionPlan.Reset();
 	{
-		// TIGHTENED 2026-09-06 after the first in-water frame: at 0.90/0.85 the
-		// box was wider than the tapering hull at bow and stern, and the mask
-		// carved a visible RECTANGLE of water beyond the gunwales. A box can
-		// only ever fit the hull's midsection, so it stays strictly inside the
-		// taper: the bow/stern thirds keep a sliver of water against the shell
-		// (correct-looking -- a canoe's ends sit low), and the cockpit stays
-		// dry, which is the owner-visible requirement. A hull-shaped exclusion
-		// mesh is the v2 upgrade if the sliver ever bothers anyone.
-		const double InnerHalfL = HalfLengthUU * 0.62;
-		const double InnerHalfB = HalfBeamUU * 0.55;
-		const double BottomZ = KeelOffsetUU + 4.0; // just inside the shell
-		// THE LID STAYS AT WATERLINE+10, AND THE 2026-09-06 ATTEMPT TO RAISE IT
-		// IS RECORDED HERE SO IT IS NOT REPEATED. Raising it to gunwale-6 (34 UU
-		// above the waterline on the shipped canoe) brought the beside-hull
-		// artefact straight back: the owner's grazing-angle screenshot shows
-		// water carved away BEYOND the far gunwale. The geometric argument the
-		// raise was made on was WRONG -- it assumed a sightline reaching water
-		// outside the hull must clear BOTH gunwales, but a near-horizontal ray
-		// enters above the NEAR gunwale, crosses the box's above-water slab, and
-		// exits past the FAR one onto open water, which the mask then kills. The
-		// taller the slab, the wider the band of angles that do this.
-		//
-		// The ends-clipping the raise was meant to fix was never a height
-		// problem: it was COVERAGE. The midship box reaches 0.62 of the hull
-		// length, so the bow and stern thirds had no exclusion at all, and 6x
-		// bobbing simply made the gap visible. The ends box below supplies that
-		// coverage at this same lid height, which is the fix that does not trade
-		// one artefact for the other.
-		//
-		// The remaining honest limit: a crest taller than 10 UU above the rest
-		// waterline can still wash the shell for a frame. A hull-shaped mesh --
-		// or the camera-independent version of this test, an oriented-box
-		// containment test done in the water material against the boat's
-		// published transform instead of a screen-space stencil -- is the v2
-		// that removes the trade entirely.
-		const double TopZ = KeelOffsetUU + VoxelBoatTuning::RestDraftUU + 10.0;
-		const double HalfH = FMath::Max(1.0, 0.5 * (TopZ - BottomZ));
-		ExclusionVolume->SetRelativeLocation(FVector(0.0, 0.0, 0.5 * (TopZ + BottomZ)));
-		// The engine cube is 100 UU on a side, so scale = half-extent / 50.
-		ExclusionVolume->SetRelativeScale3D(
-			FVector(InnerHalfL / 50.0, InnerHalfB / 50.0, HalfH / 50.0));
-		UE_LOG(LogVoxelEarth, Log,
-		       TEXT("Boat: hull water-exclusion volume %.2f x %.2f x %.2f m, top %.0f UU above the ")
-		       TEXT("at-rest waterline (custom stencil bit 0)."),
-		       2.0 * InnerHalfL / 100.0, 2.0 * InnerHalfB / 100.0, 2.0 * HalfH / 100.0,
-		       TopZ - (KeelOffsetUU + VoxelBoatTuning::RestDraftUU));
+		const double PlanHalfL = HalfLengthUU * VoxelBoatLocal::kExclusionPlanFraction;
+		const double SliceLenUU = 2.0 * PlanHalfL / double(VoxelBoatLocal::NumExclusionStations);
+		for (int32 I = 0; I < VoxelBoatLocal::NumExclusionStations; ++I)
+		{
+			FVoxelBoatExclusionStation Plan;
+			Plan.LocalX = -PlanHalfL + (double(I) + 0.5) * SliceLenUU;
+			Plan.HalfLenUU = 0.5 * SliceLenUU;
+			const double EdgeT =
+				FMath::Min(1.0, (FMath::Abs(Plan.LocalX) + Plan.HalfLenUU) / FMath::Max(1.0, HalfLengthUU));
+			Plan.HalfBeamUU =
+				FMath::Max(VoxelBoatLocal::kExclusionMinHalfBeamUU,
+				           HalfBeamUU * FMath::Sqrt(FMath::Max(0.0, 1.0 - EdgeT * EdgeT))
+				               * VoxelBoatLocal::kExclusionInboardFraction);
+			ExclusionPlan.Add(Plan);
+		}
 	}
-	if (ExclusionVolumeEnds)
-	{
-		// The ends box, same lid and floor, covering the bow/stern the midship
-		// box leaves bare. Narrow enough (0.26 beam) to sit inside the taper
-		// out to 0.92 of the length: an elliptic canoe plan at 0.92L still
-		// carries ~0.39 of max beam, so 0.26 keeps planking between the box
-		// shell and the water everywhere it reaches. The corners past 0.92L
-		// keep their sliver, now inches wide instead of a third of the hull.
-		const double EndsHalfL = HalfLengthUU * 0.92;
-		const double EndsHalfB = HalfBeamUU * 0.26;
-		const double BottomZ = KeelOffsetUU + 4.0;
-		const double TopZ = KeelOffsetUU + VoxelBoatTuning::RestDraftUU + 10.0;
-		const double HalfH = FMath::Max(1.0, 0.5 * (TopZ - BottomZ));
-		ExclusionVolumeEnds->SetRelativeLocation(FVector(0.0, 0.0, 0.5 * (TopZ + BottomZ)));
-		ExclusionVolumeEnds->SetRelativeScale3D(
-			FVector(EndsHalfL / 50.0, EndsHalfB / 50.0, HalfH / 50.0));
-	}
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Boat: water-exclusion mask = %d stations over %.2f m of hull, half-beam %.0f UU ")
+	       TEXT("amidships to %.0f UU at the ends, lid %.0f UU above the DRAWN surface (custom ")
+	       TEXT("stencil bit 0)."),
+	       ExclusionPlan.Num(), 2.0 * HalfLengthUU * VoxelBoatLocal::kExclusionPlanFraction / 100.0,
+	       ExclusionPlan.Num() ? ExclusionPlan[ExclusionPlan.Num() / 2].HalfBeamUU : 0.0,
+	       ExclusionPlan.Num() ? ExclusionPlan[0].HalfBeamUU : 0.0,
+	       double(CVarVoxelBoatHullMaskLidUU.GetValueOnGameThread()));
 
 	// The WaveMirror staleness guard, once per process (see the helper): logs
 	// 'WaveMirror: fingerprint OK/MISMATCH' and latches which datum the wave
@@ -494,6 +494,11 @@ void AVoxelBoat::Tick(float DeltaSeconds)
 		       bAsleep ? TEXT("ASLEEP") : TEXT("awake"),
 		       bHaveCam ? FVector::Dist(CamLoc, GetActorLocation()) / 100.0 : 0.0);
 	}
+	// The exclusion mask is solved on EVERY path, asleep included: it is placed
+	// in absolute world space, so a sleeping boat has to HIDE its stations
+	// rather than leave them behind in the lake (see the function).
+	UpdateWaterExclusion();
+
 	if (bAsleep)
 	{
 		++SleepTicks;
@@ -508,6 +513,192 @@ void AVoxelBoat::Tick(float DeltaSeconds)
 	TickGround(DeltaSeconds);
 	TickWake(DeltaSeconds);
 	TickCamera(DeltaSeconds);
+}
+
+// ---------------------------------------------------------------------------
+// THE WATER-EXCLUSION MASK, PLACED AGAINST THE WATER AND NOT AGAINST THE HULL
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS A PER-TICK SOLVE AT ALL. voxel.Boat.WaveBobGain is 6.0 by owner
+// directive, which means the buoyancy probes ride a surface six times as tall
+// as the one the pixels draw (TickBuoyancy's wave term) and the hull therefore
+// heaves and pitches several times further than the water it sits in. A mask
+// bolted to the hull is then wrong by up to (gain-1) x the drawn amplitude --
+// tens of UU at shipped defaults, against a canoe with 33 UU of freeboard. That
+// is the 2026-09-06 owner report ("water is clipping through the front and back
+// ends of the cockpit ... because of the more drastic bobbing"), and no lid
+// height expressed in the hull's frame answers it: too low and every trough
+// puts water over it, too high and the beside-hull artefact comes back.
+//
+// THE INVARIANT THAT REPLACES A FIXED LID HEIGHT: a station stands exactly
+// voxel.Boat.HullMaskLidUU above the LOCAL DRAWN SURFACE, always, wherever the
+// hull is.
+//
+// The lid is the ONLY thing the beside-hull artefact depends on, and the
+// 2026-09-06 note that blamed the gunwale had it wrong: a ray that reaches
+// water beyond the hull stays above the water surface for its whole crossing,
+// so it can only pick this mask up where the mask rises into that band, and the
+// ring of open water it then kills is lid/tan(view depression) wide. What the
+// gunwale is doing at the time does not enter. That is why gunwale-6 (34 UU)
+// carved water outside the hull and why the fix is to hold the lid a few
+// centimetres over the water rather than anywhere over the boat.
+//
+// The floor under the lid is the mirror-vs-pixel mismatch (a few cm, the
+// mirror header's own stated band) plus ripple height (the wake measured 4 UU),
+// so the knob is a real trade in both directions and is a cvar for that reason.
+//
+// WHY THE STATIONS ARE WORLD-HORIZONTAL (absolute rotation, yaw only). A lid
+// that inherited the hull's pitch is a ramp: to clear the water at its low end
+// it has to stand tens of UU above it at the high end, which spends the
+// invariant above to buy nothing. Level lids, with the hull's shape carried by
+// SEVEN of them along the keel line instead, is the trade the other way.
+// Foreshortening is not ignored -- a pitched hull covers less ground and a
+// rolled one covers less width, so each station's footprint is scaled by the
+// XY projection of the hull's own axes.
+//
+// WHY THE SURFACE IS SAMPLED AT GAIN 1, WITH THE WPO FADE. The mask has to sit
+// on the surface the PIXELS draw, which is the mirror times kWaveWpoFraction
+// faded out over kWpoFadeStartM..kWpoFadeEndM of camera distance -- NOT the
+// exaggerated one the probes ride. Same mirror, same clock, same published wind
+// as TickBuoyancy, and gated by the same fingerprint guard: on stale mirror
+// math the boat and this mask fall back to the flat datum together, which is
+// the one way they cannot disagree.
+//
+// WHEN A STATION IS HIDDEN, AND WHY HIDDEN IS THE SAFE DIRECTION. No writer
+// means the water is pixel-identical to a world with no boat in it (the
+// contract's own off arm), so every case this solve cannot answer hides:
+//   * the drawn surface is below the hull bottom at that station -- a bow
+//     thrown clear of the water by the exaggerated bob has no water inside it
+//     to cull, and a mask left down at the surface would carve the water the
+//     hull is flying over;
+//   * the column has no datum, or is CA-only (a player-poured pool): the same
+//     blind spot the buoyancy documents, and a boat does not float there either;
+//   * the boat is asleep past SleepRadiusUU. The components are placed in
+//     ABSOLUTE world space, so a stale station is not merely wrong, it is a
+//     hole in the lake somewhere the boat used to be.
+//
+// COST: NumExclusionStations custom-depth boxes per boat, no main pass, no
+// shadow, no collision.
+void AVoxelBoat::UpdateWaterExclusion()
+{
+	auto HideAll = [this]()
+	{
+		for (UStaticMeshComponent* Station : ExclusionStations)
+		{
+			if (Station)
+			{
+				Station->SetRenderCustomDepth(false);
+			}
+		}
+	};
+
+	UWorld* World = GetWorld();
+	UVoxelWaterSubsystem* Water = World ? World->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+	if (!Water || bAsleep || !CVarVoxelBoatHullMask.GetValueOnGameThread()
+	    || ExclusionPlan.Num() != ExclusionStations.Num())
+	{
+		HideAll();
+		return;
+	}
+
+	// The drawn-surface wave term: TickBuoyancy's inputs exactly, minus the gain.
+	const bool bWave = CVarVoxelBoatWaveBob.GetValueOnGameThread()
+	                   && VoxelBoatLocal::WaveMirrorFingerprintOK();
+	float ScaledTimeS = 0.f;
+	float WindNorthMS = 0.f, WindEastMS = 0.f;
+	if (bWave)
+	{
+		static IConsoleVariable* WaveTimeScaleCVar =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Water.WaveTimeScale"));
+		const float TimeScale = WaveTimeScaleCVar ? WaveTimeScaleCVar->GetFloat() : 1.0f;
+		ScaledTimeS = float(World->GetTimeSeconds()) * TimeScale;
+		if (const UVoxelWeatherSubsystem* Weather = World->GetSubsystem<UVoxelWeatherSubsystem>())
+		{
+			const FVoxelWindSample& W = Weather->GetWeatherState().Wind;
+			WindNorthMS = float(W.NorthMps);
+			WindEastMS = float(W.EastMps);
+		}
+	}
+	FVector CamLoc = FVector::ZeroVector;
+	const bool bHaveCam = VoxelBoatLocal::CameraLocation(World, CamLoc);
+
+	const FTransform Xf = GetActorTransform();
+	const FVector FwdW = Xf.GetUnitAxis(EAxis::X);
+	const FVector RightW = Xf.GetUnitAxis(EAxis::Y);
+	// cos(pitch) and cos(roll) as the LENGTH OF THE XY PROJECTION of the hull's
+	// own axes -- no rotator decomposition, no gimbal cases. Floored so a
+	// capsized hull produces a thin mask rather than a zero-scale component.
+	const double CosPitch = FMath::Clamp(double(FVector2D(FwdW.X, FwdW.Y).Size()), 0.25, 1.0);
+	const double CosRoll = FMath::Clamp(double(FVector2D(RightW.X, RightW.Y).Size()), 0.25, 1.0);
+	const FRotator YawOnly(0.0, FMath::RadiansToDegrees(FMath::Atan2(FwdW.Y, FwdW.X)), 0.0);
+	const bool bDebugDraw = CVarVoxelBoatDebugDraw.GetValueOnGameThread();
+	const double LidUU =
+		FMath::Max(0.0, double(CVarVoxelBoatHullMaskLidUU.GetValueOnGameThread()));
+
+	for (int32 I = 0; I < ExclusionStations.Num(); ++I)
+	{
+		UStaticMeshComponent* Station = ExclusionStations[I];
+		if (!Station)
+		{
+			continue;
+		}
+		const FVoxelBoatExclusionStation& Plan = ExclusionPlan[I];
+		const FVector CentreW = Xf.TransformPosition(FVector(Plan.LocalX, 0.0, 0.0));
+		// The hull bottom AT THIS STATION, through the hull's real orientation --
+		// this is the number a pitched bow rises on.
+		const double KeelZ = Xf.TransformPosition(FVector(Plan.LocalX, 0.0, KeelOffsetUU)).Z;
+
+		FWaterSurfaceSample S;
+		if (!Water->WaterSurfaceZAtWorld(CentreW.X, CentreW.Y, S)
+		    || S.Kind == EWaterSurfaceKind::CAOnly)
+		{
+			Station->SetRenderCustomDepth(false);
+			continue;
+		}
+		double SurfaceZ = S.SurfaceZUU;
+		if (bWave)
+		{
+			double Fade = 1.0;
+			if (bHaveCam)
+			{
+				const double DistM = FVector::Dist(CamLoc, CentreW) / 100.0;
+				Fade = 1.0
+				       - FMath::Clamp((DistM - double(VoxelWaveMirror::kWpoFadeStartM))
+				                          / double(VoxelWaveMirror::kWpoFadeEndM
+				                                   - VoxelWaveMirror::kWpoFadeStartM),
+				                      0.0, 1.0);
+			}
+			SurfaceZ += double(VoxelWaveMirror::FieldHeightM(
+				            float(CentreW.X / 100.0), float(CentreW.Y / 100.0), ScaledTimeS,
+				            WindNorthMS, WindEastMS))
+			            * VoxelWaveMirror::kWaveWpoFraction * 100.0 * Fade;
+		}
+
+		if (SurfaceZ < KeelZ - VoxelBoatLocal::kExclusionKeelSlackUU)
+		{
+			Station->SetRenderCustomDepth(false);
+			continue;
+		}
+
+		const double TopZ = SurfaceZ + LidUU;
+		const double BottomZ = FMath::Min(KeelZ, SurfaceZ) - VoxelBoatLocal::kExclusionSkirtUU;
+		const double HalfH = FMath::Max(1.0, 0.5 * (TopZ - BottomZ));
+		Station->SetWorldLocationAndRotation(
+			FVector(CentreW.X, CentreW.Y, 0.5 * (TopZ + BottomZ)), YawOnly);
+		// The engine cube is 100 UU on a side, so scale = half-extent / 50.
+		Station->SetWorldScale3D(FVector(Plan.HalfLenUU * CosPitch / 50.0,
+		                                 Plan.HalfBeamUU * CosRoll / 50.0, HalfH / 50.0));
+		Station->SetRenderCustomDepth(true);
+
+		if (bDebugDraw)
+		{
+			// The mask is invisible by construction, so the only way to see a
+			// station in the wrong place is to draw it.
+			DrawDebugBox(World, FVector(CentreW.X, CentreW.Y, 0.5 * (TopZ + BottomZ)),
+			             FVector(Plan.HalfLenUU * CosPitch, Plan.HalfBeamUU * CosRoll, HalfH),
+			             YawOnly.Quaternion(), FColor::Yellow, false, 0.f, 0, 1.0f);
+		}
+	}
 }
 
 void AVoxelBoat::TickBuoyancy(float DeltaSeconds)
