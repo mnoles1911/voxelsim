@@ -41,6 +41,16 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0p 2026-09-07 evening: five commits, and the open list is in one place
+
+Water wake tap (fe51c15, image FAILED owner judgment, code kept), menu instrument +
+tick gates (d2965c2), async fine-tile loader default OFF (ab24732; only the worst
+frame clears the A/A floor; the PREFETCH RING is the win), menu scalability (668c96a,
+-36%), threaded loading curtain (cf6dc9a; seg=LOADING p99 23.9 ms through 7.6 s world
+stalls). UI scaling doctrine is ADR-0011 (scale-tolerant, owner-directed). **Everything
+open, grouped by who can close it, is in `docs/HANDOVER-2026-09-07-evening.md`** --
+read that before adding items here, several of today's findings are already listed.
+
 ### 0.0o CORRECTION 2026-09-07 -- the lake-session hitches were NOT synchronous tile loads (warm cache)
 
 The 2026-09-07 12:57 session closed by telling the owner that "each 1 to 6 second
@@ -2999,3 +3009,35 @@ game thread could peek that same cache, but at 2.0-4.8 ms per chunk across both
 legs the resolve is visibly not the term that matters. No `Voxel.*` automation test covers
 distant-edit propagation — the evidence is the log line, as it has been since M2
 wave 2.
+
+
+## 15. WATER LOOK — after the 2026-09-07 grey-rings fix (water-look agent)
+
+Context: `docs/water-ocean-tides-plan-2026-09-04.md`, the 2026-09-07 night
+section. Left undone there:
+
+* **The SLW surface layer reads black at full coverage on this water** (the
+  "black band"; `BasePassPixelShader.usf:1480-1492` says it is forward-lit, the
+  frames say it is not). Until it is found, every foam here is emissive paint
+  with no sun/shadow on it. Instrument: a coverage-1 pixel with
+  `DisturbanceFoamEmissive:0` / `ShoreFoamEmissive:0`; suspects are the
+  forward light grid / screen-space shadow mask the water pass reads against
+  a depth buffer the marcher writes late, and the SkyLight capture at z=0.
+* **Foam does not move the scattering coefficient.** Epic's Water_Material
+  drives "Foam Scattering" / "Foam Scatter Bias" alongside opacity, roughness
+  and emissive. Cheap to add as `lerp(scatter, scatter*k, foam)` in
+  `water_optics`; needs an owner frame.
+* **Ocean parity.** `create_ocean_material.py` takes the new disturbance-foam
+  defaults but has neither the foam breakup nor a depth-keyed shore term, and
+  has no `-VoxelWaterMatScalar` reach (the MID probe is sheet-only). Extend the
+  probe to `AVoxelOceanActor` before laddering ocean foam.
+* **A live owner dial.** There is no console path to any water material scalar
+  today; design a cvar that pokes the live MIDs on both the sheet and the
+  ocean once the look is settled, not before.
+* **A real foam texture + normal** in place of the procedural breakup, if the
+  owner likes the breakup's shape.
+* **A darker-shore capture site** for judging shore foam: the vista lake at
+  `-65102,-51084` is snow-rimmed alpine ground (1644 m, PALETTE authority,
+  tan/orange voxels along the line), which is a poor backdrop for white foam;
+  the surveyed coastal sites in the tides doc need their fine tiles baked
+  first.
