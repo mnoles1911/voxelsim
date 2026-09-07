@@ -126,7 +126,17 @@ $argList = @("`"$Uproject`"")
 if ($wantGame) {
     # Game-only window. Resolution and window mode come from the owner's own
     # GameUserSettings.ini; nothing here forces them.
+    #
+    # t.IdleWhenNotForeground=1: when the owner tabs away, the game stops
+    # taking CPU and GPU. Without it a -game window keeps rendering flat out
+    # in the background (title screen: ~4 cores and 75% of the GPU on
+    # 2026-09-07), which made the desktop, and tabbing back in, crawl.
+    # COMMAND LINE ONLY, never DefaultEngine.ini: FEngineLoop::ShouldUseIdleMode
+    # applies it to any -game process without focus, unattended included, so a
+    # project-wide setting would freeze every headless capture and Codex leg
+    # the moment its window was not in front.
     $argList += '-game'
+    $argList += '-dpcvars=t.IdleWhenNotForeground=1'
 } elseif (-not $NoAutoPIE) {
     $argList += '-VoxelAutoPIE'
 }
