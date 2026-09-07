@@ -748,6 +748,42 @@ def main():
     for _line in water_optics.summary_lines():
         unreal.log("M_WaterVoxel " + _line)
 
+    # --- OPTIONAL: DUMP THE TRANSLATED HLSL (VOXEL_WATER_DUMP_HLSL=1) --------
+    #
+    # WHY THIS EXISTS, AND WHY IT IS NOT A DEBUG ARM. The 2026-09-07 wake hunt
+    # reduced itself to a sentence no photograph can settle: the graph's
+    # per-pixel ripple UV measures (0.615, 0.605) -- two 1.5 m-wide bands cross
+    # exactly there (`bandprobe`, VoxelVerify00952) -- and a fetch of
+    # RT_VoxelRippleField AT THAT EXPRESSION returns nothing, while a fetch at
+    # the LITERAL (0.615, 0.605) on the same texture parameter in the same frame
+    # returns the injected data (`constprobe`, VoxelVerify00954). A sampler
+    # cannot return two answers for one coordinate, so that is a statement about
+    # what the MATERIAL COMPILER EMITS, and the only instrument that reads it is
+    # the generated shader source.
+    #
+    # r.DumpShaderDebugInfo writes the preprocessed HLSL of every shader the run
+    # compiles under Saved/ShaderDebugInfo/<platform>/... This script DELETES
+    # and recreates the material, so a changed graph is never a DDC hit and the
+    # dump really contains this build's own translated source.
+    #
+    # IT IS NOT AN ARM: it sets console variables and nothing else. The asset it
+    # produces is byte-for-byte the asset the same environment produces without
+    # it, so a dump run does not have to be followed by a restore.
+    if os.environ.get("VOXEL_WATER_DUMP_HLSL", "0").strip().lower() not in (
+            "0", "off", "false", "no", ""):
+        for _cmd in ("r.DumpShaderDebugInfo 1",
+                     "r.DumpShaderDebugShortNames 0",
+                     "r.ShaderDevelopmentMode 1"):
+            try:
+                unreal.SystemLibrary.execute_console_command(None, _cmd)
+            except Exception as _e:  # noqa: BLE001 -- diagnostics only, never fatal
+                unreal.log_warning(
+                    "M_WaterVoxel HLSL DUMP: console command %r failed: %s" % (_cmd, _e))
+        unreal.log(
+            "M_WaterVoxel HLSL DUMP: ON -- r.DumpShaderDebugInfo=1. The translated "
+            "shader source lands under ue-project/Saved/ShaderDebugInfo. THE ASSET IS "
+            "UNCHANGED by this switch; it needs no restore.")
+
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 
     if unreal.EditorAssetLibrary.does_asset_exist(FULL_PATH):
@@ -3013,6 +3049,139 @@ def main():
             "M_WaterVoxel FIELDPIC ARM: ON -- emissive R=(|field.B at SCREEN uv|>0.05), "
             "G=(screen u>0.5), B=0.2 constant. The field sampled with no world-space UV "
             "at all. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "customtap":
+        # THE COMPILER, OR THE COORDINATE? (2026-09-07 evening, after fixprobe.)
+        #
+        # Eight frames have reduced the wake to one sentence that cannot be true
+        # of a sampler: a fetch of RT_VoxelRippleField at the CONSTANT uv
+        # (0.615,0.605) returns the injected discs, and a fetch of the SAME
+        # texture parameter in the SAME frame at a PER-PIXEL uv whose value at
+        # those very pixels is pinned to (0.615,0.605) by two 1.5 m-wide bands
+        # (`bandprobe`, VoxelVerify00952) returns nothing -- through fresh
+        # sampler nodes, a plain WorldPosition, LOD forced to mip 0, and the
+        # LWC-safe camera-relative rewrite (`fixprobe`, VoxelVerify00956).
+        #
+        # A sampler cannot return two answers for one coordinate. So the value
+        # the ARITHMETIC produces (which the threshold chains read, and which is
+        # provably 0.615) and the value the FETCH receives are not the same
+        # value -- i.e. the defect is in what the MATERIAL COMPILER emits for
+        # this sample's coordinate, not in anything this graph can be asked for.
+        # Everything else has a frame that killed it (see the table in
+        # docs/water-ocean-tides-plan-2026-09-04.md, 2026-09-07 afternoon).
+        #
+        # THIS ARM TESTS THAT HYPOTHESIS BY BYPASSING THE EMITTER, and the test
+        # IS the candidate fix -- a Custom HLSL node, where the coordinate
+        # arrives as an ordinary float2 local the translator has already
+        # materialised (it is the same chunk the threshold arms read) and the
+        # fetch is one line of hand-written HLSL with no coordinate derivation,
+        # no derivative autogen and no LOD chain of the compiler's choosing:
+        #
+        #   R = Texture2DSampleLevel(RippleFieldTex, RippleFieldTexSampler,
+        #       UV, 0).b at the SHIPPING per-pixel world uv -- THE FIX CANDIDATE.
+        #   G = the ordinary TextureSampleParameter2D at that SAME uv --
+        #       the defect, reproduced in the same pixels of the same frame, so
+        #       R is never compared across runs.
+        #   B = the ordinary sampler at the CONSTANT uv (0.615,0.605) -- the
+        #       must-fire control this hunt has repeatedly lacked. Whole lake.
+        #
+        # R WHITE, G BLACK  -> the coordinate is fine and the compiler's emitted
+        #   sample is not; ship the Custom fetch.
+        # R AND G BOTH BLACK, B WHITE -> a Custom node does not help either, the
+        #   coordinate genuinely does not survive into ANY fetch, and the next
+        #   frame is `crosstex` re-gated on bathy depth_m/shore_m.
+        # R AND G BOTH WHITE -> the defect is not reproducible in this build and
+        #   nothing below may be believed.
+        import ripple_field_graph as _rfgt  # noqa: E402
+        ct_k = bathy_b.const(1000.0)
+        ct_texture = unreal.load_object(None, _rfgt.FIELD_TEXTURE)
+        if ct_texture is None:
+            raise RuntimeError("customtap debug: could not load %s" % _rfgt.FIELD_TEXTURE)
+
+        def _ct_sampler(y):
+            n = mel.create_material_expression(
+                material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, y)
+            n.set_editor_property("parameter_name", _rfgt.FIELD_TEXTURE_PARAM)
+            n.set_editor_property("texture", ct_texture)
+            n.set_editor_property(
+                "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+            return n
+
+        def _ct_gate(expr):
+            return bathy_b.saturate(
+                bathy_b.mul(bathy_b.sub(bathy_b.abs_(expr), bathy_b.const(0.05)), ct_k))
+
+        # --- R: the Custom-HLSL fetch, at the shipping uv -----------------------
+        # The texture arrives as a TextureObjectParameter under the SAME
+        # parameter name the sampler nodes use, so this is the same binding and
+        # the same asset -- create_sunshadow_lf_material.py:106-131 is the
+        # working precedent in this project for the object -> Custom -> named
+        # `<Input>Sampler` convention.
+        ct_obj = mel.create_material_expression(
+            material, unreal.MaterialExpressionTextureObjectParameter, -1900, 7100)
+        ct_obj.set_editor_property("parameter_name", _rfgt.FIELD_TEXTURE_PARAM)
+        ct_obj.set_editor_property("texture", ct_texture)
+        ct_obj.set_editor_property(
+            "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        ct_custom = mel.create_material_expression(
+            material, unreal.MaterialExpressionCustom, -1650, 7100)
+        ct_custom.set_editor_property("description", "RippleCustomTap")
+        ct_custom.set_editor_property(
+            "code",
+            "// The ripple field's HEIGHT (.B), fetched with the coordinate the\n"
+            "// graph computed and nothing else. UV arrives as an ordinary float2\n"
+            "// local; mip 0 is explicit, so there is no derivative chain.\n"
+            "return Texture2DSampleLevel(RippleFieldTex, RippleFieldTexSampler, UV, 0).b;")
+        ct_custom.set_editor_property(
+            "output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+        ct_inputs = []
+        for _ct_nm in ("RippleFieldTex", "UV"):
+            _ct_ci = unreal.CustomInput()
+            _ct_ci.set_editor_property("input_name", _ct_nm)
+            ct_inputs.append(_ct_ci)
+        ct_custom.set_editor_property("inputs", ct_inputs)
+        if not mel.connect_material_expressions(
+                ct_obj, "", ct_custom, "RippleFieldTex"):
+            raise RuntimeError("connect texture object -> customtap.RippleFieldTex failed")
+        if not mel.connect_material_expressions(ripple["uv"], "", ct_custom, "UV"):
+            raise RuntimeError("connect ripple uv -> customtap.UV failed")
+        ct_r = _ct_gate(ct_custom)
+
+        # --- G: the ordinary sampler at the SAME uv -- the defect, in-frame -----
+        ct_g_tex = _ct_sampler(7220)
+        if not mel.connect_material_expressions(ripple["uv"], "", ct_g_tex, "UVs"):
+            raise RuntimeError("connect ripple uv -> customtap G failed")
+        ct_g = _ct_gate(bathy_b.mask(ct_g_tex, "", b=True))
+
+        # --- B: the constant-uv control ----------------------------------------
+        ct_const = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant2Vector, -1900, 7340)
+        ct_const.set_editor_property("r", 0.615)
+        ct_const.set_editor_property("g", 0.605)
+        ct_b_tex = _ct_sampler(7340)
+        if not mel.connect_material_expressions(ct_const, "", ct_b_tex, "UVs"):
+            raise RuntimeError("connect const uv -> customtap B failed")
+        ct_b = _ct_gate(bathy_b.mask(ct_b_tex, "", b=True))
+
+        ct_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1400, 7100)
+        ct_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        ct_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1400, 7220)
+        ct_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        ct_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1400, 7340)
+        ct_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        ct_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(ct_r, ct_red), bathy_b.mul(ct_g, ct_green)),
+            bathy_b.mul(ct_b, ct_blue))
+        if not mel.connect_material_property(
+                ct_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect customtap debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel CUSTOMTAP ARM: ON -- emissive R=(Custom-HLSL "
+            "Texture2DSampleLevel at the shipping world uv), G=(the ORDINARY "
+            "sampler at that same uv), B=(the ordinary sampler at CONST uv "
+            "0.615,0.605). NOT A SHIPPING MATERIAL.")
     elif _ripple_debug_mode == "crosstex":
         # THE UV CHAIN OR THE RENDER TARGET? (2026-09-07, the last fork.)
         #
@@ -3030,19 +3199,28 @@ def main():
         # arithmetically identical world uv and is proven per-pixel correct at
         # this very pose (the shoredist ribbon). So:
         #
-        #   R = bathy validity > 0.5 at the BATHY uv    -- Texture2D + world uv,
-        #       the known-good cell. Whole lake.
-        #   G = bathy validity > 0.5 at the RIPPLE uv   -- Texture2D + the
+        #   R = |bathy shore_m| < 6 at the BATHY uv     -- Texture2D + world uv,
+        #       the known-good cell. The SHORELINE RIBBON, measured 4.0-4.8 m
+        #       wide in VoxelVerify00934.
+        #   G = |bathy shore_m| < 6 at the RIPPLE uv    -- Texture2D + the
         #       SUSPECT uv chain. The ripple uv is in [0,1] only within 51.2 m of
-        #       the camera, so a sound chain paints a WINDOW-SHAPED patch there
-        #       and nothing beyond it -- a signature no other outcome produces.
+        #       the camera, so a sound chain paints the whole 960 m bathy window's
+        #       shoreline squeezed into a 51.2 m SQUARE around the camera, with a
+        #       hard square edge and a flat clamp beyond it -- a signature no
+        #       other outcome produces.
         #   B = ripple field.B > 0.05 at a CONSTANT uv  -- RenderTarget + no world
         #       uv, the other known-good cell. Whole lake.
         #
-        # G PAINTS THE PATCH -> the ripple uv chain hands correct in-range
-        #   coordinates to a sampler, and the defect is the RENDER TARGET being
-        #   sampled through a world-derived coordinate.
-        # G DARK -> the ripple uv chain does not reach a sampler as the value its
+        # RE-GATED 2026-09-07 EVENING, and the first firing of this arm
+        # (VoxelVerify00958) is VOID because of it: R and G were gated on bathy
+        # VALIDITY, which is 1 across the whole baked window AND at its clamped
+        # border, so the frame came back white whatever the uv did. `shore_m` has
+        # structure everywhere, which is the property the fork needs.
+        #
+        # G PAINTS THE SQUEEZED SHORELINE -> the ripple uv chain hands correct
+        #   in-range coordinates to a sampler, and the defect is the RENDER TARGET
+        #   being sampled through a world-derived coordinate.
+        # G FLAT -> the ripple uv chain does not reach a sampler as the value its
         #   arithmetic provably produces, and the defect is that chain -- whatever
         #   the texture on the other end.
         import ripple_field_graph as _rfgx  # noqa: E402
@@ -3050,8 +3228,11 @@ def main():
         cx_k = bathy_b.const(1000.0)
 
         def _cx_gate(expr):
+            # |shore_m| < 6 m: a band, not a half-plane, so its ON set is a
+            # CURVE whose shape and position are the measurement.
             return bathy_b.saturate(
-                bathy_b.mul(bathy_b.sub(expr, bathy_b.const(0.5)), cx_k))
+                bathy_b.mul(
+                    bathy_b.sub(bathy_b.const(6.0), bathy_b.abs_(expr)), cx_k))
 
         cx_bathy_texture = unreal.load_object(None, _bfgx.BATHY_TEXTURE)
         if cx_bathy_texture is None:
@@ -3078,13 +3259,13 @@ def main():
         cx_r_tex = _cx_bathy_sampler(6700)
         if not mel.connect_material_expressions(cx_bathy_uv, "", cx_r_tex, "UVs"):
             raise RuntimeError("connect bathy uv -> crosstex R failed")
-        cx_r = _cx_gate(bathy_b.mask(cx_r_tex, "", b=True))
+        cx_r = _cx_gate(bathy_b.mask(cx_r_tex, "", g=True))
 
         # G: THE CROSS. Same bathy texture, fed the RIPPLE's uv.
         cx_g_tex = _cx_bathy_sampler(6820)
         if not mel.connect_material_expressions(ripple["uv"], "", cx_g_tex, "UVs"):
             raise RuntimeError("connect ripple uv -> crosstex G failed")
-        cx_g = _cx_gate(bathy_b.mask(cx_g_tex, "", b=True))
+        cx_g = _cx_gate(bathy_b.mask(cx_g_tex, "", g=True))
 
         # B: the render target at a constant uv, the other known-good cell.
         cx_rt_texture = unreal.load_object(None, _rfgx.FIELD_TEXTURE)
@@ -3123,8 +3304,8 @@ def main():
                 cx_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
             raise RuntimeError("connect crosstex debug -> emissive failed")
         unreal.log(
-            "M_WaterVoxel CROSSTEX ARM: ON -- emissive R=(bathy validity at BATHY uv), "
-            "G=(bathy validity at the RIPPLE uv), B=(ripple field at a CONST uv). "
+            "M_WaterVoxel CROSSTEX ARM: ON -- emissive R=(|bathy shore_m|<6 at BATHY uv), "
+            "G=(|bathy shore_m|<6 at the RIPPLE uv), B=(ripple field at a CONST uv). "
             "NOT A SHIPPING MATERIAL.")
     elif _ripple_debug_mode == "fixprobe":
         # TWO CANDIDATE FIXES AND A CONTROL (2026-09-07, after constprobe).

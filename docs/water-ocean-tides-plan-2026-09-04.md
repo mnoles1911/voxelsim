@@ -1744,3 +1744,745 @@ restore in a `finally` block, and every restore is proven from
 `Saved/sky-chain/regen-create_water_voxel_material.log` (`SHORE FX ARM: ON`,
 `STAR REFLECTION ARM: ON`, and none of the debug markers above).
 
+## 2026-09-07 (material-owning agent, evening): THE WAKE'S READ IS FIXED. The mechanism is the compiled TextureSample, not the coordinate -- proven in ONE frame with the defect and the fix in the same pixels
+
+### The frame: `VoxelVerify00960`, arm `customtap`
+
+Same pose, same injection, same shutter as the whole afternoon
+(`+12 m / -35 deg / yaw 45` at `(-65102,-51084)`, `-VoxelRippleWakeAfter=166`,
+five 8 m rings at `StrengthM 0.9`, `Steps=1`, frozen -- freeze read back as 1,
+`Ripple.Dump` at t=168 reports peak 2.0 m at uv (0.5811,0.5342) over 12.61% of
+the field, 22573 non-zero gradient texels). **No `Ocean: camera entered water`
+line in the log** (grep count = 0), and no `Failed to compile Material`.
+
+Three questions on ONE set of pixels, binary so the tonemapper cannot eat them:
+
+| channel | what it is | measured |
+|---|---|---|
+| **R** | `Texture2DSampleLevel(RippleFieldTex, RippleFieldTexSampler, UV, 0).b` in a **Custom HLSL node**, `UV` = the SHIPPING per-pixel world uv | **51.98% of the frame** -- the injected disc union, in world space, in the right place |
+| **G** | the **ordinary** `TextureSampleParameter2D` at **that same uv expression** -- same parameter name, same asset, one node apart | **0.0000%** (max green-over-others across the whole frame = **4/255**, i.e. noise) |
+| **B** | the ordinary sampler at the **CONSTANT** uv (0.615, 0.605) -- the must-fire control | fires over **all** the water |
+
+The picture is unmistakable: a blue lake (B), with a large magenta (R+B) lobe
+across the near field where the rings were dropped, and **no green anywhere**.
+
+### THE MECHANISM, as far as the evidence names it
+
+**The material compiler's emitted texture fetch for `RippleFieldTex` does not
+receive the coordinate the graph computes.** The coordinate itself is fine -- it
+was measured four separate ways (`uvpin` orientation and offset, `bandprobe`
+scale to 1.5 m against 1.54 m predicted, and both again here, since R and G read
+the SAME expression object). A hand-written `Texture2DSampleLevel` fed that
+expression returns the data; the compiler-emitted `TextureSample` fed the same
+expression returns the clear value. That is not a property of the coordinate,
+the texture, the binding, the mip, LWC, the gain or the fade -- each of those has
+its own frame that killed it (the table in the afternoon entry above) -- and it
+is the only remaining place the two values can diverge.
+
+**What is NOT yet named** is which compiler behaviour does it: the candidates
+are (a) the derivative autogen / coordinate re-derivation UE5 runs for LOD on a
+sample whose UV chain reaches `WorldPosition`, and (b) something Single Layer
+Water-specific about a sample shared between the base pass and the water
+shading. Distinguishing them needs the generated HLSL, not another photograph --
+see "What I would run next" below. It does not block the fix: the fix bypasses
+the emitter entirely, so both candidates are repaired by it.
+
+**WITHDRAWN by this frame:** nothing. Every earlier withdrawal stands, and the
+afternoon's one-sentence finding is now *explained* rather than contradicted.
+
+### THE FIX (`ripple_field_graph.py`, `sample_ripple_field`)
+
+The `MaterialExpressionTextureSampleParameter2D` is replaced by a
+`MaterialExpressionTextureObjectParameter` (SAME parameter name
+`RippleFieldTex`, same asset, same `SAMPLERTYPE_LINEAR_COLOR`) feeding a
+`MaterialExpressionCustom` whose whole body is
+
+```hlsl
+return Texture2DSampleLevel(RippleFieldTex, RippleFieldTexSampler, UV, 0);
+```
+
+with `output_type = CMOT_FLOAT4`, so `.rg` is still the gradient and `.b` still
+the height. **The uv chain is not touched** -- it was never the defect.
+
+Why this shape and not another:
+
+* **ONE read path is preserved.** `grad_xy` (normal + disturbance foam) and
+  `height_m` (World Position Offset) still come off the same single fetch, which
+  is the module's founding argument. The **explicit mip 0** is what makes that
+  legal: the same expression now has to compile in the VERTEX shader for WPO,
+  and an explicit level removes the derivative requirement. The render target
+  has exactly one mip (`create_ripple_field_materials.py` never asks for more),
+  so nothing is lost.
+* **The binding is unchanged.** A texture OBJECT parameter under the same name
+  is still a baked asset default, so the far-field sheet -- which is assigned the
+  shared `M_WaterVoxel` with no MID on purpose (`VoxelWaterSheetActor.h:47-52`)
+  -- still gets the field. The "WHY AN ASSET" contract survives intact.
+* **The precedent is already shipping in this project.**
+  `create_sunshadow_lf_material.py:106-131` uses exactly the
+  object -> Custom -> `<InputName>Sampler` convention.
+* `AbsorptionDistanceM 3.5`, `WaveQuantPerVoxel 0` and the shore-foam block are
+  untouched. So is `RippleFieldGain`, the edge fade, the `WaveTimeScale` gate
+  and every existing off arm: `RippleFieldGain 0` still zeroes the tap.
+
+`sample_ripple_field` is shared, so **M_Ocean gets the same fix on its own
+regeneration** (`-Only create_ocean_material.py`) -- the source is fixed for
+both; only M_WaterVoxel's asset has been rebuilt against it so far.
+
+### New debug arm on record: `VOXEL_WATER_RIPPLE_DEBUG=customtap`
+
+Marker `CUSTOMTAP ARM: ON` -- add it to the contamination list. R = the Custom
+fetch at the world uv, G = the ordinary sampler at the same uv, B = the ordinary
+sampler at a constant uv. It is the arm that both diagnosed and validated the
+fix, so it is worth keeping: it will fail loudly the day an engine upgrade makes
+the ordinary sampler work again (G would light) or breaks the Custom one.
+
+### `crosstex` re-gated, and `VoxelVerify00958` is VOID
+
+The 10:38 firing of `crosstex` gated R and G on bathy **validity**, which is 1
+across the whole baked window *and* at its clamped border -- `VoxelVerify00958`
+is a white frame that says nothing, exactly as the afternoon entry predicted.
+The arm is now gated on `|shore_m| < 6 m`, a BAND whose ON set is a curve, so
+the "bathy image squeezed into a 51.2 m square" signature is legible. **It was
+not needed** -- `customtap` answered the same fork more directly and in the
+direction of a fix -- and it is left re-gated and ready.
+
+### New, non-arm switch: `VOXEL_WATER_DUMP_HLSL=1`
+
+Sets `r.DumpShaderDebugInfo 1` before the first compile, so the translated
+shader source lands under `ue-project/Saved/ShaderDebugInfo`. **It is not a
+debug arm**: it sets console variables and nothing else, the asset it produces
+is byte-identical to the same environment without it, and it therefore needs no
+restore. Built for the mechanism question above; not yet fired.
+
+### NOT YET PROVEN, and it is the next thing to run
+
+The shipping-default capture. Everything above is measured on the `customtap`
+arm; the shipping material has NOT been photographed with a disturbance in
+frame since the fix. The restore after `customtap` is proven from
+`Saved/sky-chain/regen-create_water_voxel_material.log` (`SHORE FX ARM: ON`,
+zero debug markers) -- but that restore predates the fix landing in
+`ripple_field_graph.py`, so **M_WaterVoxel on disk is still the OLD (broken)
+tap** until the next regeneration. The source is fixed; the asset is not.
+
+### What I would run next (paused: the owner is taking the box)
+
+1. `tools\voxel-sky-chain-regen.ps1 -Only create_water_voxel_material.py -SkipCapture`
+   with **no** `VOXEL_WATER_RIPPLE_DEBUG` -- lands the fix in the shipping asset;
+   proven from `SHORE FX ARM: ON` + zero debug markers.
+2. `tools\voxel-capture.ps1 -Name wake-ship-fixed -SpawnAt '-65102,-51084'
+   -SettleSec 170 -SpawnAltM 6 -SpawnPitch -18` plus
+   `-ExtraArgs '-VoxelRippleWakeAfter=166' '-VoxelRippleWakeRadiusM=8'
+   '-VoxelRippleWakeStrengthM=0.9' '-VoxelRippleWakeSteps=1'` -- the owner's
+   requested pose (camera 0.7 m over the surface there; check the log for
+   `camera entered water` before believing it). Then the same at
+   `-SpawnAltM 12 -SpawnPitch -35`, which is the pose the shoreline is actually
+   resolved at, as the legible frame.
+3. `-Only create_ocean_material.py -SkipCapture`, so the sea gets the same tap.
+4. The mechanism, for the record and for the day someone tries to revert this:
+   one regen with `VOXEL_WATER_RIPPLE_DEBUG=customtap` **and**
+   `VOXEL_WATER_DUMP_HLSL=1`, no capture, then read
+   `ue-project/Saved/ShaderDebugInfo` for the two fetches side by side -- the
+   Custom one and the compiler-emitted one are in the same shader, so the diff
+   is the mechanism. Restore afterwards.
+5. The boat. The unattended recipe exists and is cheap:
+   `-VoxelExecAfter=165 -VoxelExecCmds="voxel.Boat.Spawn 8,voxel.Boat.Enter,voxel.Boat.Throttle 1 12"`
+   with `-VoxelScreenshotAfter=173`, so the shutter opens with the hull under
+   way (`voxel.Boat.Spawn/Enter/Throttle`, VoxelBoat.cpp:1444-1490 -- the
+   "Spawn -> Enter -> Throttle is the whole unattended underway-wake leg"
+   comment is the author's own).
+
+### The player ripple and the boat wake: arithmetic, NOT yet a measurement
+
+Both read through the tap just fixed (`VoxelCharacterMovement.cpp:951` and
+`VoxelBoat.cpp:1116-1124` both call `AddSweptDisturbanceAt`), so both come back
+with it. At the shipped `DisturbanceFoamGain 8.0` /
+`DisturbanceFoamHeightWeight 4.0`, `foam = saturate((|grad| + 4|h|) * 8)`:
+
+| source | strength | radius | h | rough grad | foam at deposit |
+|---|---|---|---|---|---|
+| player walking, 4 m/s (`Frac = 4/6`) | 0.0133 m | 0.45 m | 0.0133 | ~0.030 | ~0.66 |
+| player at/above 6 m/s (`Frac` 1.0) | 0.020 m | 0.45 m | 0.020 | ~0.044 | 1.0 (saturated) |
+| boat bow (`BowWakeStrengthM` 0.030) | 0.030 x Frac | 0.55 m | | | 1.0 at Frac >= 0.6 |
+| boat transom (0.022) | 0.022 x Frac | 0.95 m | | | 1.0 at Frac >= 0.9 |
+
+So on this arithmetic **no gain change is needed** -- 0.020 m is not too small
+once the read works; it was invisible because the read returned zero, not
+because the number was small. The ripple halves every 5 s and spreads, so the
+trail behind a walker will fade over a few metres rather than paint a permanent
+stripe, which is the correct look. **This is a calculation, not a frame**: it
+needs run 2 and run 5 above before it may be quoted as measured.
+
+### Frames
+
+| frame | arm | what it shows |
+|---|---|---|
+| `VoxelVerify00958` | `crosstex` v1 | VOID -- gated on bathy validity, which is 1 everywhere; a white frame |
+| `VoxelVerify00960` | `customtap` | R (Custom HLSL @ world uv) 51.98%, G (ordinary sampler @ the SAME uv) 0.0000%, B (const uv) all water |
+
+Both ran as ONE serialized regen -> capture -> restore script with the restore in
+a `finally` block; the restore is proven from
+`Saved/sky-chain/regen-create_water_voxel_material.log` (`SHORE FX ARM: ON`,
+zero debug markers).
+
+## 2026-09-07 afternoon: wake fix shipped into the assets
+
+The fix is now IN BOTH SHIPPING ASSETS and proven at the byte level. **It has not
+been photographed**: the box lost its ability to run a capture partway through the
+pass (see the BLOCKED rows), so every image gate in Phase 1 is still open.
+
+### Scoreboard
+
+| date | phase | what | verdict | evidence |
+|---|---|---|---|---|
+| 2026-09-07 | 0.2 | Cold-cache measured launch at the lake pose | **DONE, but the premise failed** | `Saved/capture-coldlaunch-lake.log`; frame `VoxelVerify00962.png`. Standby cache was 41,526 MB and an untouched-namespace 468 MB tile read at 4015 MB/s, so the file cache was warm. Full table in `docs/tile-loading-async-2026-09-07.md` |
+| 2026-09-07 | 0.2 | Tile I/O is the hitch cause? | **REFUTED on this leg** | 4 decodes, 261-326 ms each; `fineMs=0.02`-`0.03` on every `Hitch frame recompute`; largest stall `renderWaitMs=50626.63` has no tile load near it; raster-atlas fills peak at 1478.4 ms GT per 5 s window |
+| 2026-09-07 | 1.1 | Regen `create_water_voxel_material.py`, no env vars | **PASS** | `Saved/sky-chain/regen-create_water_voxel_material.log`: `SHORE FX ARM: ON` x1, `NOT A SHIPPING MATERIAL` x0, `Python script executed successfully` x1, `LogPython: Error` x0, `Failed to compile Material` x0 |
+| 2026-09-07 | 1.1 | Regen `create_ocean_material.py`, no env vars | **PASS** | `Saved/sky-chain/regen-create_ocean_material.log`: `M_Ocean RIPPLE FIELD ARM: PRESENT`, `NOT A SHIPPING MATERIAL` x0, `Python script executed successfully` x1, `LogPython: Error` x0, `Failed to compile Material` x0. `SHORE FX ARM` is x0 because the string does not exist in `create_ocean_material.py` (grep count 0) -- the gate is inapplicable to the ocean, not failed |
+| 2026-09-07 | 1.1 | The fix is actually in the shipped bytes | **PASS (stronger than mtime)** | Byte search of both `.uasset` files finds `Texture2DSampleLevel` AND `RippleFieldTex` in each. `M_WaterVoxel.uasset` 209893 -> 211037 B at 14:41:41, `M_Ocean.uasset` 176995 -> 178139 B at 14:42:15, both newer than `ripple_field_graph.py` (11:13:35) |
+| 2026-09-07 | 1.1 | Neither shipped asset carries a debug arm | **PASS** | Byte search of both `.uasset` files for `CUSTOMTAP`, `NOT A SHIPPING MATERIAL`, `crosstex`, `uvpin`, `bandprobe`, `RIPPLE_DEBUG`: zero hits in either. `Get-ChildItem env:VOXEL_*` was empty before both regens |
+| 2026-09-07 | 1.2 | Wake capture, shipping default, legible pose | **PASS** | `VoxelVerify00964.png` (+12 m, pitch -35, yaw 45). Engagement: `CAPTURE WAKE FIRED ... injected=5 dropped(outside=0 full=0 unarmed=0 inert=0) steps=9703 fieldMaxAbs=2.0000 stateMaxAbs=2.0000. FROZEN.` and `field verified LIVE -- centre patch max field value 2.0000`. All 5 rings on valid water (`baked depth=5.10-5.95 m valid=1`). `Ocean: camera entered water` x0, `Failed to compile Material` x0, gate leaks 0. A large concentric disturbance fills the near field |
+| 2026-09-07 | 1.2 | Wake capture, owner pose | **PASS (engagement); frame swamped** | `VoxelVerify00966.png` (+6 m, pitch -18). Same counters (`injected=5 ... fieldMaxAbs=2.0000`), `camera entered water` x0. The 2.0 m displacement seen almost edge-on from 6 m fills nearly the whole frame; the lake is not legible in it |
+| 2026-09-07 | 1.3 | Boat under way | **PASS** | `VoxelVerify00974.png` (+6 m, pitch -12). `VoxelBoat: BOARDED at (-6509900,-5108400,165038). ... The ripple window now follows the boat.` then `voxel.Boat.Throttle 1 12`; camera travelled ~22 m from spawn by the shutter, `unloaded=280`. Hull and wake arcs visible. Gate leaks 0 |
+| 2026-09-07 | 1.4 | Glider parked spawn | **PASS** | `VoxelVerify00978.png` at column -65059,-51042 (+3 m, pitch -12). `voxel.Glider.Spawn: PARKED glider at (-6505100,-5104200,165161), resting on the surface.` Both required strings present, gate leaks 0 |
+| 2026-09-07 | 1.5 | `voxel.Water.Caustics` help text says the real default | **DONE** | `VoxelWaterSubsystem.cpp:262` help string `Default 1.` -> `Default 0.5.`; the cvar's value `0.5f` is unchanged. String-only edit, not built |
+| 2026-09-07 | 1.6 | UI divergences vs the 2026-09-07 mocks | **DONE, 14 screens** | 8 pre-existing captures (Inventory, Journal, Map, Player, Codex, Death, Dialogue, HUD v2) plus 6 taken this pass (`VoxelMenu00015`/`00016`/`00018`, `VoxelLoading00004`, `VoxelPause00005`/`00006`). List below, with 7 cross-cutting causes called out |
+| 2026-09-07 | 1.6 | Capture set is real (silent-failure check) | **CAUGHT ONE** | `VoxelMenu00017.png` was byte-identical to the main menu (md5 `e9d094f9…` on both) -- `-Shot Panel -Panel save` opened nothing. Re-taken as `-Shot Pause -Panel save -DemoSaves` -> `VoxelPause00006.png`, log `6 save(s) listed`; all three pause captures now hash differently |
+| 2026-09-07 | 1.7 | Commit the water files | **NOT DONE -- correctly withheld** | The commit is conditioned on 1.2 passing and 1.2 never ran. Files are staged-ready but uncommitted |
+
+### How the box blocked itself, and why no build was run
+
+`tools/voxel-capture.ps1` guards against a stale `voxelcore.lib` by asking cmake
+whether the lib is really behind (lines 200-256). On the wake capture it found
+`tilestore.cpp` newer than the lib, called `cmake --build ... --target voxelcore`,
+and cmake **did** relink -- because the parallel loader agent has uncommitted
+edits in `voxel-core/src/tilestore.cpp`, `include/voxelcore/tilestore.h` and
+`tests/test_tilestore.cpp`. The lib then became newer than
+`UnrealEditor-VoxelEarth.dll`, which trips the second half of the guard, and
+there is no bypass switch.
+
+**The capture harness invalidated the box as a side effect of being run.** That is
+worth recording as its own hazard: a capture is not read-only with respect to the
+build state when another agent has voxel-core edits in flight.
+
+No build was run to clear it, for two reasons:
+
+1. This pass was explicitly told not to run `tools/voxel-build.ps1`.
+2. More importantly, a build now would link **two** agents' in-flight work into
+   the binary that photographs the water. `git status` shows uncommitted edits in
+   `VoxelOceanActor.cpp`, `VoxelSkySubsystem.cpp`, `VoxelClipmapActor.cpp`,
+   `VoxelWeatherSubsystem.cpp`, `VoxelGI.cpp` and `VoxelShadowMarch.cpp` -- all of
+   them in the water/sky tick path. A wake frame taken against that binary could
+   not be attributed to the wake fix either way, so it would not settle the gate
+   it exists to settle.
+
+The DLL on disk (15:59:54 UTC) predates both agents' edits and is therefore the
+**correct** binary for the water image gate. The block is purely the lib mtime.
+
+**To unblock:** serialize -- let the loader and menu agents reach a committed,
+compiling state, run one `tools/voxel-build.ps1 -Verify`, then re-run Phase 1
+steps 2-4. There is no shortcut that keeps the water verdict meaningful.
+
+## UI divergences vs the 2026-09-07 mocks
+
+The list the plan says must exist before any owner verdict can be asked for.
+
+**Captures.** Eight were already on disk from this morning's session
+(`docs/ui-mocks/2026-09-07/captures/`: codex, death, dialogue, hud, inventory,
+journal, map, player, taken 06:38-07:37). Six were taken this pass at 14:45-14:48
+via `tools/voxel-ui-capture.ps1` at 2560x1440:
+
+| screen | shot | frame |
+|---|---|---|
+| Main menu | `-Shot Menu` | `VoxelMenu00015.png` |
+| Loading screen | `-Shot Loading` | `VoxelLoading00004.png` |
+| Pause menu | `-Shot Pause` | `VoxelPause00005.png` |
+| Settings panel | `-Shot Panel -Panel settings` | `VoxelMenu00016.png` |
+| Save dialog | `-Shot Panel -Panel save` | `VoxelMenu00017.png` |
+| Load dialog | `-Shot Panel -Panel load` | `VoxelMenu00018.png` |
+
+All six ran against the **committed** binary (`UnrealEditor-VoxelEarth.dll` of
+15:59:54 UTC), which predates the loader and menu agents' uncommitted edits, so
+this list describes shipped behaviour and not either agent's work in progress.
+The save/load dialogs were captured with `0 save(s) listed`, so an empty list is
+expected; only the styling and wording of the empty state are judged.
+
+Mocks are authored at 1920x1080; captures are 2560x1440, so absolute pixel
+figures below are converted at the mocks' 1.33333 authoring zoom where quoted.
+
+**Status of the six new captures.** All six render their intended screen (none is
+blank or black); that was checked directly. Two first-hand notes on them, pending
+the full per-screen diff:
+
+- **Settings (`VoxelMenu00016.png`).** Renders AUDIO (Master, Music), DISPLAY
+  (Fullscreen + "Takes effect on APPLY."), GRAPHICS (Fine Detail Smoothing,
+  Faster Terrain Drawing, Water Wave Detail) with `ESC back` / `APPLY` /
+  `SAVE & LEAVE`. **The fourth graphics row, Ocean Mesh Detail, is below the fold**
+  — a scrollbar is visible and the row is cut off. Both water rows exist in
+  `SVoxelSettingsPanel.cpp:72-81`'s `kGraphicsRows`, so this is a panel-height
+  problem, not a missing row. Worth fixing before the owner is asked to judge the
+  water settings, since one of the two water rows is invisible at 2560x1440.
+- **Pause (`VoxelPause00005.png`).** Renders `— PAUSED —` with RESUME / SAVE /
+  LOAD GAME / SETTINGS / EXIT TO MENU / QUIT and the footer `Day 11`. The HUD
+  compass tape and the ten-slot hotbar remain fully lit behind the panel; the
+  mock dims the paused world behind its `.se-panel`. Note the footer's `Day 11`
+  is the same sky-derived value discussed under Journal, which confirms the
+  Journal screen's internal `Day 12` is the odd one out.
+
+### Four patterns that account for most of the list
+
+Before the per-screen detail, four causes explain the majority of the bullets
+below. Fixing any one of them closes many rows at once, so they are worth
+deciding on before anyone works the list screen by screen.
+
+1. **CSS `clip-path` glyphs are all flat rectangles.** Every mock icon built as a
+   clip-path silhouette — attribute glyphs, equipment-slot glyphs, skill glyphs,
+   the heraldic sub-tab shields, the craft arrow, the rotated option diamond, the
+   compass rose — renders in Slate as a plain coloured block. The *hues* are
+   almost always correct, so the port is reading the palette and not the shape.
+   This is one missing capability (vector/clip brushes in `VoxelUITheme.h`), not
+   ~20 separate bugs.
+2. **Press Start 2P is not shipped.** `docs/ui-mocks/2026-09-07/README.md` already
+   records `--pixel` as "not shipped (unused by the ported screens)". Every
+   `var(--pixel)` element therefore falls back to a serif/mono face. Either ship
+   the font or stop specifying it; today the mock and the port cannot agree.
+3. **Gradients render as flat fills.** HP and hunger bars, button fills and panel
+   grounds specified as `linear-gradient(...)` come out as a single colour. This
+   is what makes the hunger bar read as the wrong colour rather than merely
+   flatter — it picks one stop of a three-stop ramp.
+4. **The `Q/E Switch screen` / `ESC Exit` hint bar is a shell feature, not five
+   divergences.** It comes from one shared string
+   (`VoxelUIStrings.cpp:249 ScreenActionPage`) rendered by the common
+   `SVoxelScreenShell`, so it appears on Inventory, Journal, Map, Player and Codex
+   even though none of those mocks has a footer. The per-screen hint bars the
+   mocks *do* specify (`E Spend point`, `F Compare`, the Map's seven) were
+   replaced by it. That is a design decision to confirm, not a rendering fault —
+   though on Map it actively conflicts, because the mock binds `Q/E` to rotating
+   the map.
+
+The same goes for tab key-letter prefixes (`M MAP`, `J JOURNAL`, ...): the shared
+`.menu-tab .key` rule exists in `menus_shared.css`, so the port looks sanctioned
+by the framework even where individual mock markup omits it.
+
+### Inventory
+
+Matches the mock closely — the pack/side-panel split, 8x8 pack + 8-slot hotbar
+with keys 1-8, the filter row, the CRAFT / CHARACTER toggle, the 3x3 craft grid
+and output, and the "Drag from the pack into the grid." note are all present and
+correctly ordered. Real deltas:
+
+- **Search placeholder.** Capture `Search the pack`; mock (`#invSearch`) `Search…`.
+- **Weight readout.** Capture `80 kg`; mock (`.weight`) `112 / 180` preceded by an
+  11px hexagon swatch (`.weight i`, `background:var(--bronze)` `#b07a3a`). The
+  hexagon is absent.
+- **Stack-count prefix missing.** Capture shows `16`; the mock builds `'×' + it.qty`, i.e. `×16`.
+- **Craft arrow is a dash, not a triangle.** Mock `.craft-arrow` is a downward
+  triangle (`border-top:11px solid var(--bronze-deep)`); capture draws a short
+  horizontal bronze bar.
+- **CRAFT button colour.** Capture renders the label dim grey; mock `.craft-act`
+  uses `color:var(--parchment)` `#e8d9b0` on the oak gradient. If this is a
+  disabled state, the mock has no such state.
+- **Search field too wide.** Capture ~537 device px; mock caps at
+  `max-width:280px` (~373 px at authoring zoom), which is what pushes the weight
+  readout right in the mock.
+- **In the capture, not the mock:** per-tab key prefixes on the top tab bar
+  (`M MAP`, `J JOURNAL`, ...) — `menus_shared.css` does define `.menu-tab .key`,
+  so this looks framework-sanctioned even though the mock markup omits it; and a
+  bottom hint bar `Q/E Switch screen` / `ESC Exit`, which this mock lacks entirely.
+- **Not verifiable here:** the pack holds one item, so rarity rings, `×qty` badges
+  and durability bars could not be checked against the mock's 31-item seed.
+
+### Journal
+
+Structurally faithful: the `PLAYER'S ENTRIES` / `GOALS` switch, the entry list,
+the parchment page with kind / title / date-stamp / body, and the selected-card
+gold underline are all correct. Deltas:
+
+- **`Entries 3` sub-tab is unstyled.** Mock `.subtab.on` is a bordered chip
+  (`color:var(--gold)` `#f0c14b`, `background:var(--panel-oak-2)` `#2e1b0d`,
+  `border:1px solid #000`); capture renders plain grey text.
+- **Drop cap missing.** Mock splits the body's first character into
+  `.p-body .first` (48px `var(--serif)`, `#5a2a14`, floated left); capture renders
+  uniform 18px body text.
+- **New-entry snippet disagrees with the rest of its own screen.** The capture
+  shows `Day 11` on the new-entry card while the card directly below it reads
+  `DAY 12 · Summer` and the page stamp reads `Day 12`. Two different day numbers
+  in one screen is the real finding here — **not** the difference from the mock's
+  `Day 12`, which is a hard-coded mock seed. The shipped number is live world
+  state: `VoxelPauseUISubsystem.cpp:56 CurrentDayNumber` returns
+  `1 + floor(EpochSeconds / DayLength)` off the sky subsystem, so under the
+  capture harness's frozen 12:00 / 03-20 sky it is legitimately whatever it is.
+- **Stamp format truncated.** Mock `stampOf(WORLD)` renders the full
+  `Day 12 · Summer, 18th Year of the Second Age`; the capture's new-entry card
+  gives the day alone.
+- **Ornament glyphs dropped.** Mock prefixes `✦` on every list stamp and on the
+  page kind line; none appear.
+- **Season case.** Capture `DAY 12 · Summer`; mock `${e.season.toUpperCase()}` →
+  `DAY 12 · SUMMER`.
+- **Stamp font.** `.p-kind` and card stamps are specified `var(--pixel)`
+  (Press Start 2P); the capture uses a rounded serif/mono face. The README already
+  records Press Start 2P as **not shipped**, so this is expected fallout of that.
+- **In the capture, not the mock:** the `Q/E Switch screen` / `ESC Exit` hint bar.
+
+Page copy, date stamp, body text, paragraph break, snippet truncation and the
+300px / 1fr column split all match.
+
+### Map
+
+This is the one screen where the shipped UI is a **different design**, not a
+divergent rendering of the mock. The mock is a full-bleed, drag-pannable
+parchment map; the capture is a static world-overview raster with a data sidebar.
+It should be treated as a design decision to confirm or reverse, not a list of
+bugs.
+
+- **Pannable parchment sheet replaced by a static hillshade.** Mock:
+  `.parchment-frame` fills `menu-body` with a 4200x2800 `.sheet` (`cursor:grab`,
+  Q/E rotate via `.rotor`) on a parchment gradient `#e8d3a0 → #c8a868`. Capture:
+  a fixed hypsometric hillshade with no parchment ground and no pan/rotate.
+- **Right-hand sidebar is not in the mock at all.** Capture adds `POSITION`,
+  `LATITUDE / LONGITUDE`, `HEADING`, `CHUNK`, `SURFACE`, `SEED`; the mock's map
+  occupies the full body width.
+- **`SAVED PLACES` moved and restyled.** Mock: a collapsible drawer at the
+  top-right *inside* the map frame (`.pl-drawer{position:absolute;right:0;top:0}`)
+  with a `▾` caret and a `Filter places…` box. Capture: a permanently-open panel
+  in the sidebar, no caret, no filter.
+- **Empty-state copy truncated.** Capture `No places saved yet.`; mock `.pl-none`
+  adds `Right-click the map to mark one.`
+- **"You are here" marker missing.** Mock `.you` is a 16px `--hp-bright` `#e84a3a`
+  dot with a pulsing gold ring at sheet centre.
+- **Compass card.** Mock `.compass-card` is a 72px circular graduated limb with
+  eight split spearheads; capture shows an opaque square tile with a 4-point rose.
+- **In the capture, not the mock:** a `50 km` scale bar and a metadata strip
+  (`seed 20260719 | 289 coarse tiles | 261 × 261 km @ 120 m/px | ...`).
+- **Action bar reduced from 7 hints to 3**, and `Q/E` is bound to *different
+  actions* in each (mock: rotate the map; capture: switch screen).
+- **No mark-placing UI.** The mock's `#mkDialog` (`MARK THIS PLACE`, name input,
+  symbol picker, DELETE / CANCEL / SAVE) has no counterpart.
+- **Shell smaller than spec.** Measured ~1321x902 device px against
+  `.menu-shell.compact` `min(1060px,…) x min(760px,…)` = 1413x1013 at authoring
+  zoom: ~7% narrower, ~11% shorter. With the added sidebar the map viewport is
+  roughly half the mock's area.
+
+### Player
+
+The strongest data match: `ROLAND` / `WAYWARD HEIR · ARMOUR 42`, the 4+4 gear
+columns, `MAIN LEVEL 6`, `XP 2,140 / 5,080` at ~42% fill, and every value in all
+four right-hand stat blocks is correct. Rarity ring colours are right too.
+Deltas are presentational:
+
+- **COMBAT block flattened from a matrix to a list.** Mock `.stat-mtx` is a
+  4-column grid with `SLASH` / `STAB` / `BLUNT` headers over `Armour` (21/34/35)
+  and `Weapon` (28/30/12). Capture drops the headers and emits six rows with
+  ellipsised labels (`Armour · sl… 21`, `Armour · s… 34`, ...), so the damage-type
+  names are unreadable. **This is the one Player delta that costs information.**
+- **COMBAT swatch colours wrong.** Capture uses purple for Armour and red for
+  Weapon; mock uses `.ico-shieldsk` (bronze `#b07a3a`) and `.ico-blade`
+  (steel `#d8d4c8`). Purple is `--rare-epic #a04ac8`, which the mock reserves for
+  the Stealth & Presence glyphs (where the capture does use it correctly).
+- **Sub-tabs lost the heraldic shields.** Mock `.sub-tab` stacks a 36x42
+  clip-path shield with an icon above the label; capture renders plain text tabs.
+- **Section headers dropped the `◆` diamond** on all four titles.
+- **Attribute and equipment glyphs are plain blocks.** Mock uses clip-path shapes
+  (`.g-charisma` diamond, `.g-speed` bolt, `.g-vitality` heart, `.gl-helm` etc.);
+  hues are correct, shapes are lost.
+- **Character render is a placeholder**: black panel reading `No equipment system
+  yet — these sockets are chrome.` against the mock's rotating `.voxel-char`.
+  Worth confirming this is intended to ship.
+- **Action bar hints replaced.** Mock `E Spend point` / `F Compare`; capture
+  `Q/E Switch screen` / `ESC Exit` — despite `2 unspent points` being displayed.
+- **Not covered:** only the STATS sub-page was captured; SKILLS, PERKS and
+  REPUTATION were not compared.
+
+### Codex
+
+- **Recipe detail pane uses the wrong panel style.** Mock `.rc-detail` is a dark
+  iron panel (`background:#0a0805`, `.rc-title` in `var(--gold)` #f0c14b at 4px
+  tracking, body in `var(--mono)` VT323 18px). The capture renders it in the
+  parchment `.entry` treatment (tan ground, `--parchment-ink` #3a2a14, `--hand`
+  body) that the mock reserves for lore entries only.
+- **The 3x3 crafting grid is missing.** Mock `.craft-area` has `.craft-3` (nine
+  64px slots showing the pattern), a bronze `.craft-arrow`, then `.out-wrap`.
+  The capture has only the yield slot, and places it inline left of "Made at
+  Crafting grid" instead of in its own right-hand column.
+- **Placeholder text in the ingredient row.** Mock `48 in pack` (green
+  `--rare-uncommon` #5fa84a, red when short); capture `"not an item yet"`. Also
+  `1 X Oak Log` uses ASCII `X` where the mock uses `×` (U+00D7).
+- **Category tallies differ.** Recipes `23`→`15`, People `4/12`→`4/7`, Lore
+  `5/14`→`3/3`; Factions `2/4` and Places `0` match. (The mock's own labels are
+  hard-coded and do not match its `LORE` arrays either.)
+- **Seven recipes missing.** Building lacks Ladder, Crafting Table, Glass Pane;
+  Tools lacks Iron Bucket. Building order also differs.
+- **Group headers.** Mock `.grp-head` is `▸ BUILDING <count>` — serif, uppercase,
+  3px tracking, caret, right-aligned count; capture shows lowercase `Building`
+  with neither caret nor count.
+- **Search placeholder.** Mock `"Search recipes or ingredients…"`; capture
+  `"Search recipes"`. The `.clear` `×` affordance is absent.
+- **In capture, not mock:** a `BUILDING` category eyebrow above the recipe title;
+  tab key-letter prefixes; the `Q/E Switch screen` / `ESC Exit` footer.
+- Station line: mock emphasises the station name in `var(--gold)`; capture gives
+  it no emphasis.
+
+### Death screen
+
+- **Date stamp truncated and mis-cased.** Mock `#stamp` `"DAY 12 · SUMMER, 18TH
+  YEAR OF THE SECOND AGE"`; capture `"Day 11"` — the season, year and age are all
+  dropped, and it is mixed case where the mock is uppercase `var(--serif)` at 5px
+  tracking. **The number itself is not a defect** (live sky-derived day, see the
+  Journal note); the missing season/year/age and the casing are.
+- **`.version-stamp` missing.** Mock has `"DEV BUILD v0.18.2"` at
+  `left:48px; bottom:32px`; nothing renders there.
+- **Button row far too high.** Mock `.actions{bottom:120px}` ≈ 89% down the frame;
+  capture puts RESPAWN/QUIT at ~69%.
+- **RESPAWN and QUIT have different fills.** Mock gives both the identical
+  `linear-gradient(180deg,#6a3a14,#3a1e08)` and brightens only on `:hover`;
+  capture paints RESPAWN bright orange (reads as `--warm-primary` #E8873A).
+- **`.fade` vignette absent** — mock takes the corners to pure black; the
+  capture's corners still show lit terrain.
+- **`.world` desaturation not applied** — mock ends at `filter:grayscale(1)
+  brightness(0.28)`; the capture's terrain is still tan and much brighter.
+- `.rule` is the right width (~520px) but has hard ends; the mock fades to
+  transparent at both.
+- The quip is drawn from the `GENERIC` pool while the mock hard-codes
+  `CAUSE='goblins'`. Random by design — flagged only in case the cause plumbing
+  is meant to be live.
+- "YOU DIED" position, size, tracking and `--blood-bright` all read correct.
+
+### Dialogue
+
+Layout matches well: options top-right, skills strip bottom-right, and every
+disabled/enabled state is correct against the stat values shown. Deltas:
+
+- **Selected-option cartouche missing.** With `selected = 0`, row 1 should carry
+  `.dlg-option.selected` (gold gradient band, 1px `--gold-rule` top and bottom,
+  `box-shadow:0 0 24px var(--gold-soft)`, bronze/gold key box). The capture gives
+  row 1 no highlight at all — nothing distinguishes it from row 2. **This is the
+  one Dialogue delta that costs function**, since it is the selection indicator.
+- **Option text is italic; the mock is upright.** `.dlg-option` sets no
+  `font-style`; only `.dlg-speaker__line` and `.role` are italic.
+- **NPC portrait frame is empty.** `.dlg-portrait` (160x200, bronze triple-inset)
+  renders, but the Captain Vossant artwork inside it does not.
+- **`.dlg-option__diamond` is not rotated** — mock is a 6x6 gold square at
+  `rotate(45deg)` with a glow; capture draws it axis-aligned with none.
+- **Skill glyphs are flat rectangles** rather than the `clip-path` pixel-art
+  silhouettes, in both the option rows and the bottom strip.
+- **`.dlg-stage` scrim missing** (plus `.scene-tint`), so the top-right options
+  sit on bright unshaded terrain.
+- The opening quote renders as a right double quote (`”The fine is a hundred…`);
+  the mock source uses a straight ASCII `"`.
+- **One place where the port is probably right and the mock is wrong:**
+  `.dlg-speaker` is the only in-flow child of a `flex-direction:column` stage with
+  no `justify-content`, so in a browser it lands top-left at y=48px. The capture
+  puts it bottom-left, which matches the CSS comment ("bottom-left portrait +
+  name + spoken line") and `.dlg-companion{bottom:48px}`. Do not "fix" the port
+  to match the mock here without deciding which is intended.
+
+### HUD v2
+
+Compass, dock geometry and bar layout line up well: compass centred at
+`top:12px` with the tick tape in the correct order, dock centred at `bottom:12px`,
+bars spanning the 694px hotbar width with the 10px mid gap on the slot 5/6 seam,
+the 10-division tick overlay present, and slot 1 carrying the gold triple-inset
+ring. Deltas:
+
+- **Hunger bar is the wrong colour.** Mock `.bar.stam .fill` is
+  `#bfe6f5 → var(--stam) #c8a04a → var(--stam-deep)`, i.e. amber/gold with a pale
+  blue highlight only on the top row. The capture paints it solid steel blue for
+  its full height.
+- **Bars are flat fills with no vertical gradient.** HP should run
+  `#d44a3a → --hp #b8302a → --hp-deep #5a1410` with an inset highlight; the
+  capture is one uniform dark red.
+- **Nine of ten hotbar slots are empty.** The mock fills all ten with glyphs and
+  quantity badges; the capture has content only in slot 1. This is live inventory
+  state, so it is a divergence only if the HUD is meant to show the mock's seed.
+- **Item icon is a flat colour swatch, not a glyph,** and it is not centred:
+  `.slot .glyph{inset:15px}` should leave equal margins, but the swatch sits
+  toward the top-left of the 64px cell.
+- **Interact prompt at screen centre.** Mock `.interact{left:62%; top:54%}`;
+  capture puts `E Examine the cairn` at ~50%/50%. Probably deliberate (it should
+  track the reticle), but it is a literal delta.
+- `.slot.active .num` should be `var(--gold)`; the "1" reads parchment-white like
+  the inactive numbers.
+- The `.grain` scanline overlay is not present. Low-HP vignette correctly off at
+  full HP.
+
+### One capture silently failed, and md5 is how it was caught
+
+`VoxelMenu00017.png`, taken as `-Shot Panel -Panel save`, is **byte-identical to
+the main menu** `VoxelMenu00015.png` (both md5 `e9d094f9601ecb784000303b6048e4b1`).
+It rendered the title screen with no overlay: SAVE exists only on the pause menu,
+so nothing opened, and the harness reported a successful capture anyway. The
+script's own usage line at `tools/voxel-ui-capture.ps1:33` gives the right route,
+`-Shot Pause -Panel save`.
+
+Re-captured 19:01-19:02 with `-DemoSaves` (log: `6 save(s) listed`, so the arm
+engaged and could have failed):
+
+| screen | shot | frame | md5 |
+|---|---|---|---|
+| Save dialog | `-Shot Pause -Panel save -DemoSaves` | `VoxelPause00006.png` | `3aff1de9…` |
+| Load dialog, populated | `-Shot Pause -Panel load -DemoSaves` | `VoxelPause00007.png` | `f2e66879…` |
+
+All three pause-route captures hash differently, which is the check that the
+first failure would have passed. **Hash every capture set that is supposed to
+differ** — a UI capture that photographs the wrong screen looks exactly like a
+successful one in the log.
+
+### Main menu
+
+All seven `.title-menu__item` rows present in mock order, right-aligned, with the
+`.quit` extra top gap (~65 px measured vs 69 px specified). CONTINUE and LOAD GAME
+correctly dimmed for a no-saves state. Callout copy is character-for-character
+identical.
+
+- **Active-item cartouche missing.** `.title-menu__item.active` specifies a gold
+  cartouche (gradient fill, `border-top/bottom:1px solid var(--gold-rule)`,
+  `box-shadow:0 0 32px var(--gold-soft)`, `min-width:380px`). NEW GAME has none of
+  it — only the `font-size:33px` part landed. **Same class of defect as the
+  Dialogue screen's missing selection band**: the selected-item indicator is the
+  part that did not port.
+- **Logo ~72 px too far right.** Measured right margin 61 px; `.title-logo` is
+  `right:100px` → 133 px at 2560. Top edge correct.
+- **Callout body too large and loose.** `.callout-news__copy` is `16px` /
+  `line-height:1.45` (≈31 px pitch at 2560); capture measures ≈54 px and wraps to
+  6 lines.
+- Backdrop art cannot be compared: `assets/menu_backgrounds/cave_background1.jpg`
+  is not present under `docs/ui-mocks/2026-09-07/`.
+
+### Loading screen
+
+All five mock elements present and correctly ordered; title width 373 px against
+~355 px predicted; TIP row centred to within 1 px and using the mock's gold-serif
+`TIP` + italic-hand structure.
+
+- **Hourglass is ~1.9x too wide.** Measured 118x94 px; `.hg-flip` is `46x69` →
+  61x92 at 2560. Height matches, width does not, so the glass reads squat
+  (aspect 1.26) where the mock is tall (0.67).
+- **Hourglass detail layers missing:** curved bezier bulb walls, the `url(#rim)`
+  glass stroke, two specular streaks, neck collar rects, post highlights,
+  `.hg-shadow`, and the `rotateX(-10deg) rotateY(-14deg)` tilt. The capture is a
+  flat straight-line X. Sand top/mound/falling grains are correct.
+- **Engine debug text over the screen:** `Preparing Shaders (1)` and
+  `'DisableAllScreenMessages' to suppress`, top-left, in default Roboto. Not in
+  the mock, and it would ship to a player on a cold shader cache.
+- **TIP line ~52 px too low** (23 px from frame bottom vs `bottom:56px` → 75 px),
+  while the version stamp is exact — so this is one row's offset, not a global
+  bottom-anchor error.
+- **Centre stack ~54 px high**, and inter-element gaps run 40/31 px against
+  `gap:18px` → 24 px.
+- **Message pool differs in flavour.** Capture `"Lighting the ash-throne's
+  braziers..."`; none of the mock's 18 `TIPS` entries match, and the mock's are
+  worldgen-flavoured (`"Reticulating cave splines"`). Single samples from rotating
+  pools, so only the flavour mismatch is checkable.
+- **Unattributed:** a ~12 px checkerboard lattice at ~13% brightness modulation
+  across flat sky (sampled 66 vs 76 grey). The mock's `.grain` is 1 px scanlines
+  at 1.8% alpha, nothing like this. Source not determined — UI grain layer or the
+  backdrop art itself.
+
+### Pause menu
+
+Structure is right: title, `.pa-rule`, six `.pa-btn` rows in mock order, `›`
+chevrons, per-row hairlines, `.pa-btn.danger` salmon on EXIT TO MENU and QUIT,
+centred italic footer. Panel centred to within 8 px vertically.
+
+- **Button label wrong.** Row 3 reads `LOAD GAME`; the mock's third `.pa-btn` is
+  `LOAD`.
+- **Footer truncated.** Capture `Day 11`; mock `.pa-foot`
+  `Day 12, the 18th Summer of the Second Age`. Font, style and position correct —
+  only the string is reduced to the bare day counter. (The number is live state;
+  see the Journal note.)
+- **Panel ~1.34x too wide.** Outer frame ≈550 px; `.pa-panel` is `width:380px` +
+  `padding:0 28px` + 2 px border then `scale(0.7)` → ≈411 px at 2560. The capture
+  matches the *unscaled* box, i.e. the mock's own 0.7 factor did not port.
+
+### Settings panel
+
+Good match on chrome: panel ≈820 px against 800 px specified, centred, title with
+`.se-rule`, `AUDIO` / `DISPLAY` headers in `--warm-primary` with the trailing
+gradient hairline, slider track/fill/knob/value, and the footer in mock order with
+the orange primary on `SAVE & LEAVE`.
+
+- **SFX slider missing.** Mock AUDIO has MASTER, MUSIC, SFX; the capture goes
+  MASTER → MUSIC → `DISPLAY`. SFX would be above the scroll fold, so this is a
+  definite absence, not a scroll artefact.
+- **In the capture, not the mock:** the whole `GRAPHICS` section (Fine Detail
+  Smoothing, Faster Terrain Drawing, Water Wave Detail, each with a two-line
+  italic hint) and the `Takes effect on APPLY.` hint under FULLSCREEN. These are
+  real shipped rows (`SVoxelSettingsPanel.cpp:72-81`), so the **mock is behind the
+  product** here, not the other way round.
+- **Hints wrap to their own line.** `.ck-row` is `display:flex; align-items:center`
+  with `.ck-hint` a sibling at `margin-left:6px`, i.e. inline to the right of the
+  label. Every hint in the capture is on a second line.
+- **Label casing inconsistent within one panel.** `.ck-label` is all-caps
+  (`FULLSCREEN`); the three GRAPHICS labels are Title Case in the same face.
+- **Slider value font wrong.** `.sl-val` is `"Courier New",monospace 14px`; the
+  `100` readouts render in the Macondo swash serif.
+- **Panel scrolls where the mock does not**, hiding ~90 px (~14%). **Ocean Mesh
+  Detail — one of only two player-facing water rows — is below the fold**, and the
+  mock's `GAMEPLAY` section and `MINING` cycler can be neither confirmed nor
+  denied from this capture. Fix the panel height before asking the owner to judge
+  water settings.
+
+### Save dialog
+
+`VoxelPause00006.png` renders the dialog correctly and closely: `— SAVE GAME —`
+title, `.sv-rule`, the context row, `NAME THIS SAVE` prompt, a parchment
+`.sv-input` carrying `VOXELMARK Day 1` with a `15 / 40` counter, the overwrite
+`.sv-warn` (`A save named VOXELMARK Day 1 already exists. Confirm to overwrite
+it.`), the `ENTER to confirm` / `ESC to cancel` key row, and a `CANCEL` /
+`CONFIRM` footer with the orange primary on CONFIRM.
+
+- **Context row content differs.** Mock `.sv-context` is `✦` + `ROLAND · DAY 12`
+  (character and day); the capture shows a solid diamond + `VOXELMARK` (the world
+  name). Both the glyph substitution and the field choice differ.
+- Background not blurred/dimmed, and the HUD compass and hotbar stay drawn behind
+  the panel — same as Pause.
+
+### Load dialog
+
+`VoxelMenu00018.png` (title-screen route, zero saves) is a strong match: panel
+≈1062x873 against 1040x853 specified, centred; `LOAD GAME` title, `.ld-rule`, the
+full `.ld-header` with `ALL` / `MANUAL` / `AUTO` and `ALL` carrying the
+`.ld-filter.on` orange gradient, a parchment `.ld-search` with `Search…`, and
+`.ld-count` reading `0 / 0`. Footer `CANCEL` right-aligned above a top hairline.
+
+- **Empty-state glyph substituted.** `.ld-empty .glyph` is `∅`; the capture draws
+  a solid filled diamond. Sampled colour `#5A3818` = `--leather-edge` is exact, so
+  this is glyph coverage in the serif face, same as the main menu's `✦`.
+- **Empty-state text differs.** Capture `"No saves yet. Start a New Game to
+  begin."`; mock `"No saves match."` The mock's string is written for a
+  filter-returns-nothing state, so the capture's wording is arguably the better
+  fit for genuine zero saves — a delta, not necessarily a defect.
+- **Empty block is top-anchored, not centred.** `.ld-empty` is `flex:1;
+  justify-content:center`; list area centre is ≈730, the block's centre ≈570.
+- **Empty text wraps at ~490 px inside a ~1040 px panel**, breaking as
+  `"No saves yet. Start a New Game to"` / `"begin."` `.ld-empty` has no max-width
+  in the mock.
+- Row styling, `.ld-thumb` day badges, `LATEST` / `AUTO` tags and the
+  `.ld-btn.primary` / `.ld-btn.del` pair were not checkable at zero saves.
+  **`VoxelPause00007.png` (6 demo saves) exists for exactly that and has not yet
+  been diffed.**
+
+### Three more cross-cutting items
+
+5. **Version stamp string.** All four screens that carry it print
+   `Milestone 5-3D — dev build` where the mock says `DEV BUILD v0.18.2`.
+   Placement is pixel-correct, so this is one string.
+6. **Missing glyphs in the serif face.** `✦` (main menu callout, save context)
+   and `∅` (load empty state) both fall back to a solid diamond, with exact
+   colours. Font glyph coverage, not styling.
+7. **No blur/dim behind overlay panels.** Pause, Settings, Save and Load all
+   specify `.bg { filter: blur(8px) brightness(0.32-0.35) saturate(0.6) }` plus a
+   vignette; every capture shows a sharp, full-brightness backdrop with the HUD
+   still lit behind it.
+
+**Measurement caveat:** every capture is **2560x1398**, not the 2560x1440
+requested — 42 px short, presumably window chrome. Bottom-anchored elements above
+were judged against the 1398 frame, so bottom-offset figures carry that
+uncertainty.
+
+### Open owner verdicts, unchanged by this pass
+
+Still open, and none of them can be asked yet because no shipping-default wake
+frame exists: sky-light pair (`voxel.Sky.SkyLightAtGroundZ`, `voxel.Sky.FogInSkyCapture`),
+caustics default (the help text is now honest; the 0.5 value itself is still the
+owner's call), shore-foam look, hull mask (commit c038f99), glider parked spawn.
+Refraction and boat bobbing remain CLOSED.

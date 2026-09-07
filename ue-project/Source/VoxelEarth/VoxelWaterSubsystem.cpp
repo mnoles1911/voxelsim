@@ -259,7 +259,7 @@ static TAutoConsoleVariable<float> CVarVoxelWaterCaustics(
 	TEXT("voxel.Water.Caustics"), 0.5f,
 	TEXT("F1 caustic intensity, pushed to MPC_VoxelSky.CausticIntensity each tick. 0 zeroes the caustic ")
 	TEXT("term in every consumer (terrain, clipmap, underwater) -- one switch, pixel-identical off (a ")
-	TEXT("zeroed uniform, not a shader permutation). Default 1."),
+	TEXT("zeroed uniform, not a shader permutation). Default 0.5."),
 	ECVF_Default);
 static TAutoConsoleVariable<float> CVarVoxelWaterFoamV2(
 	TEXT("voxel.Water.FoamV2"), 1.0f,

@@ -41,6 +41,51 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0o CORRECTION 2026-09-07 -- the lake-session hitches were NOT synchronous tile loads (warm cache)
+
+The 2026-09-07 12:57 session closed by telling the owner that "each 1 to 6 second
+freeze lines up with a fine tile being read: 200 to 300 MB per tile, decoded on
+the game thread". Its own log says otherwise. The log is preserved at
+`docs/evidence/2026-09-07-lake-session-VoxelEarth.log` (md5
+010a9300e3efaa10d1810515e1e355c8; the "copy" that session announced was never
+made, and the next launch rotates the original).
+
+- **Four** `Fine tile (x,y) resident ... full decode` lines in the whole session,
+  all inside a 10 s window after NEW GAME, **262-277 ms each**, `blockingLoads=3`,
+  `ringMoves=0`. No tile loaded again afterwards.
+- The multi-second stalls are **render-thread waits**: `renderWaitMs=6319.56` at
+  16:50:26 with `fineMs=0.05`; 1931 ms at 16:50:20; 1255 ms at 16:50:16.
+  `frameMs=400.00` is the instrument's clamp.
+- One ring-5 entry recompute of 512 ms (`entryMs R5=512.54 footprints R5=1285`).
+- Raster-atlas fills at 1,460-1,552 ms of game thread per 5 s window during the
+  fill phase (the known stutter owner), settling to ~35 ms.
+- Steady state after ~15 s: p50 8.1 ms, p95 13.6 ms, p99 27.1 ms.
+
+What was supposed to keep the async-loader recommendation alive: that run had the
+tiles in the Windows file cache, so off a cold SATA HDD a 200-340 MB read should
+be ~2 s per tile on the game thread, four tiles at the lake spawn.
+
+**That prediction is still untested, and the leg meant to test it did not.** The
+post-reboot measured launch (2026-09-07 14:23, first editor launch after the
+13:03 boot) reproduced the warm session tile for tile -- 7.49 s of bounded
+tile-load time against the warm run's 7.12 s -- because the file cache was not
+cold: the standby list held 41.5 GB, and a 468 MB tile file in a namespace that
+leg never opened read back at 4015 MB/s. Three of the four implied per-tile read
+rates exceed the SATA link, so no clean cold number exists. Worse for the
+recommendation, `fineMs` is 0.02-0.03 ms on **every** `Hitch frame recompute` in
+that run, and the largest stall (`renderWaitMs=50626.63`) has no tile load
+anywhere near it. Full table, bracket arithmetic and the stall-vs-load timeline
+are in `docs/tile-loading-async-2026-09-07.md`.
+
+So the async loader is **not** currently justified by a measurement. The live
+tile-side anomaly worth chasing first is tile (-5,-3): ~4.8 s unattributed, in
+both sessions, on the *smallest* of the four reads -- a cost that scales with
+neither bytes nor disk. Instrument the streamer's read separately from its parse
+before building the async arm on top of it.
+
+The SSD-move recommendation is dropped: the tile cache is 17 GB (not 6.5) and C:
+has 25.8 GB free.
+
 ### 0.0n A capture run that finishes its work never exits -- symptom bounded, cause open
 
 `-VoxelLoadingShotAt` does not quit after its last shot when that shot lands

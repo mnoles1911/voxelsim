@@ -139,6 +139,18 @@ MPC_GAIN = "RippleFieldGain"
 FADE_START = 0.42
 FADE_END = 0.485
 
+# THE FETCH ITSELF. Kept at module scope so the exact HLSL the water and the
+# ocean run is greppable and diffable without reading a graph. The argument for
+# hand-writing it at all is at the call site in sample_ripple_field.
+#
+# .rg = (dH/dx, dH/dy); .b = H in metres. .a is NOT read -- the canvas draw path
+# only guarantees the three emissive channels (see the module docstring).
+RIPPLE_FETCH_HLSL = """// The interactive ripple field, fetched at the coordinate the graph computed
+// and nothing else. UV arrives as an ordinary float2 local; mip 0 is explicit,
+// so there is no derivative chain and this is legal in the vertex shader too
+// (height feeds World Position Offset). RGBA16f render target, 1 mip.
+return Texture2DSampleLevel(RippleFieldTex, RippleFieldTexSampler, UV, 0);"""
+
 
 def sample_ripple_field(b):
     """Sample the ripple field at this pixel's world XY. Returns a dict.
@@ -179,11 +191,60 @@ def sample_ripple_field(b):
     origin_xy = b.mask(origin, "", r=True, g=True)
     uv = b.mul(b.sub(world_xy, origin_xy), inv_size)
 
+    # --- THE FETCH IS HAND-WRITTEN HLSL, AND THAT IS THE WHOLE BUG FIX -------
+    #
+    # THE DEFECT (2026-09-07, eight instrumented frames, every one carrying a
+    # must-fire control in its own pixels -- the table is in
+    # docs/water-ocean-tides-plan-2026-09-04.md):
+    #
+    #   A MaterialExpressionTextureSampleParameter2D bound to
+    #   /Game/Voxel/RT_VoxelRippleField returned the injected data when its UVs
+    #   input was a CONSTANT (`constprobe`, VoxelVerify00954 -- the whole lake
+    #   lights at the literal (0.615, 0.605)) or the SCREEN's uv (`fieldpic`,
+    #   VoxelVerify00942 -- the five discs, right place, right 1.85:1 aspect),
+    #   and returned NOTHING when its UVs input was the expression built two
+    #   lines above -- whose per-pixel VALUE at those very pixels is pinned to
+    #   (0.615, 0.605) by two 1.5 m-wide bands (`bandprobe`, VoxelVerify00952)
+    #   and whose orientation, offset and scale are each separately measured
+    #   (`uvpin`, VoxelVerify00946). Fresh sampler nodes, a plain WorldPosition
+    #   in place of the no-offsets one, LOD forced to mip 0, and the LWC-safe
+    #   camera-relative rewrite all reproduced the failure
+    #   (`bothtap`/`mipprobe`/`fixprobe`, VoxelVerify00948/950/956).
+    #
+    # A sampler cannot return two answers for one coordinate. So the value the
+    # ARITHMETIC produces and the value the compiled FETCH receives were not the
+    # same value: the defect is in the texture-sample the MATERIAL COMPILER
+    # EMITS for this parameter, not in anything this graph can be asked for.
+    #
+    # THE PROOF THAT THIS IS THE FIX, in ONE frame with the defect and the
+    # control in the same pixels (`customtap`, VoxelVerify00960, shipping-pose
+    # capture with five 8 m rings injected and frozen):
+    #   R = this Custom-HLSL fetch at the uv below ......... 51.98% of the frame
+    #   G = the ordinary sampler at THE SAME uv expression .  0.0000%
+    #   B = the ordinary sampler at a CONSTANT uv .......... all water
+    # One node apart, one frame, one set of pixels.
+    #
+    # WHY THIS FORM AND NOT ANOTHER. The Custom node's UV arrives as an ordinary
+    # float2 local -- the same chunk the threshold instruments read, which is
+    # exactly the value that was proven correct -- and the fetch is one line of
+    # HLSL with no coordinate re-derivation, no derivative autogen and no LOD
+    # chain of the compiler's choosing. Mip 0 is explicit: the render target has
+    # a single mip (create_ripple_field_materials.py never asks for more), so
+    # nothing is lost, and an explicit level is what makes this same expression
+    # legal in the VERTEX shader -- which matters, because height_m below feeds
+    # World Position Offset while grad_xy feeds the normal, and BOTH must come
+    # off ONE read (see the module docstring's "ONE tap" argument).
+    #
+    # THE BINDING IS UNCHANGED. A MaterialExpressionTextureObjectParameter under
+    # the SAME parameter name, with the same asset and the same sampler type, is
+    # the same baked default the "WHY AN ASSET" section above requires -- the
+    # far-field sheet still gets the field with no MID. The precedent for the
+    # object -> Custom -> `<InputName>Sampler` convention in this project is
+    # create_sunshadow_lf_material.py:106-131, which ships on it.
+    #
     # SAMPLERTYPE_LINEAR_COLOR: these are metres and slopes, not colours, and a
     # colour sampler would apply a gamma curve to a signed height field. Same
     # argument, same sampler type, as the bathy texture.
-    tex = b.node(unreal.MaterialExpressionTextureSampleParameter2D)
-    tex.set_editor_property("parameter_name", FIELD_TEXTURE_PARAM)
     texture = unreal.load_object(None, FIELD_TEXTURE)
     if texture is None:
         raise RuntimeError(
@@ -192,9 +253,27 @@ def sample_ripple_field(b):
             "either fail to compile or silently default its texture parameter to whatever "
             "the engine picks, which would add an unrelated image to the water's normal "
             "on every pixel." % FIELD_TEXTURE)
-    tex.set_editor_property("texture", texture)
-    tex.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
-    b.link(uv, "", tex, "UVs")
+    tex_obj = b.node(unreal.MaterialExpressionTextureObjectParameter)
+    tex_obj.set_editor_property("parameter_name", FIELD_TEXTURE_PARAM)
+    tex_obj.set_editor_property("texture", texture)
+    tex_obj.set_editor_property(
+        "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+
+    tex = b.node(unreal.MaterialExpressionCustom)
+    tex.set_editor_property("description", "SampleRippleField")
+    tex.set_editor_property("code", RIPPLE_FETCH_HLSL)
+    tex.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT4)
+    _inputs = []
+    for _name in ("RippleFieldTex", "UV"):
+        _ci = unreal.CustomInput()
+        _ci.set_editor_property("input_name", _name)
+        _inputs.append(_ci)
+    tex.set_editor_property("inputs", _inputs)
+    # b.link raises on a failed connect, which is the behaviour this needs: the
+    # input NAMES are what the HLSL above reads, so a rename that misses one end
+    # must fail loudly rather than compile against a stale local.
+    b.link(tex_obj, "", tex, "RippleFieldTex")
+    b.link(uv, "", tex, "UV")
 
     # Chebyshev distance from the window centre, so the fade follows the SQUARE
     # window rather than a circle inscribed in it -- bathy_field_graph.py:120-123
