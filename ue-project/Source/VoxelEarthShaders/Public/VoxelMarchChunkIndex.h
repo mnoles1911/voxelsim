@@ -132,6 +132,7 @@
 #include "CoreMinimal.h"
 #include "RenderGraphFwd.h"
 #include "Templates/SharedPointer.h"
+#include "Templates/Function.h"
 
 #include <atomic>
 
@@ -154,6 +155,8 @@ class FRHIGPUBufferReadback;
 	SHADER_PARAMETER(FUintVector, MarchIndexWrapChunk)
 
 struct FVoxelMarchOrderedLifetime;
+struct FVoxelMarchPreparedDelivery;
+class FVoxelBrickPreparedIndexDelivery;
 namespace VoxelMarchOrdered { struct FPacket; }
 
 class VOXELEARTHSHADERS_API FVoxelMarchChunkIndex
@@ -162,6 +165,9 @@ public:
     #if WITH_DEV_AUTOMATION_TESTS
     void DebugSeedOrderedForTest(const TArray<struct FVoxelBrickIndexEntry>& Snapshot);
     void DebugResetOrderedForTest();
+    TSharedPtr<FVoxelBrickPreparedIndexDelivery,ESPMode::ThreadSafe> DebugPrepareIndexForTest(const struct FVoxelBrickIndexDelta& Delta);
+    void DebugSetPilotBudgetForTest(uint64 Bytes);
+    TFunction<uint64()> DebugPilotCreditProbeForTest() const;
     void DebugApplyOrderedForTest(const struct FVoxelBrickIndexDelta& Delta);
     void DebugReadOrderedForTest(uint32 Cell, uint64& Generation, uint32& Value, uint32& OccupiedWord) const;
     #endif
@@ -910,6 +916,7 @@ public:
 	// required: ~10 GB per 5 s window staged to move ~0.065% of the grid.
 	uint64 GetUploadBytes() const { return UploadBytes.load(); }
     uint64 GetQueuedIndexPacketBytes() const;
+    uint64 GetReservedPilotIndexBytes() const;
 	// See BlockFallbackBinds. Non-zero while a block-skip leg is running means
 	// some binds marched against an all-ones coarse level, i.e. against the
 	// control, and their timings are not the arm's. READ IT AGAINST
@@ -1269,6 +1276,10 @@ private:
 	// cost look 14x cheaper than it was.
 	TArray<uint32> Cells;
     TSharedPtr<FVoxelMarchOrderedLifetime, ESPMode::ThreadSafe> Ordered;
+    friend struct FVoxelMarchPreparedDelivery;
+    FVoxelMarchPreparedDelivery* ActivePreparedDelivery=nullptr;
+    TSharedPtr<FVoxelBrickPreparedIndexDelivery,ESPMode::ThreadSafe> PrepareIndexDelivery(const struct FVoxelBrickIndexDelta& Delta);
+    uint64 OrderedCaptureRevision=0;
     uint64 OrderedEpoch=1, OrderedGeneration=0;
     bool bOrderedGpuCompatible=true;
 	// Render-visible image/staging lives exclusively in Ordered->State.

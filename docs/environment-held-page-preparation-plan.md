@@ -1,5 +1,11 @@
 # Held environment page preparation
 
+Implementation update: the CPU-only diagnostic `voxel.Environment.PrepareHeldCpuPages` now implements the bounded freeze/pin/private-context/preflight/pack/discard sequence below. The ordinary level-zero worker and diagnostic share `FLevelZeroRenderSampler`. Keyed `FPreparedPage` results retain page identity and generation. Stale pool tickets cancel without asserting, while existing tracked tasks keep cancelled CPU work alive through drainage. GPU preparation remains planned.
+
+Build `build-environment-held-preflight.log` passed19actions85.61s; all35DX12objecttests passed with normalexit0, including `Voxel.Objects.HeldPageSampler`. The real site emitted CPU PASSED for27completepages,18allocated/9absent,18packs,58640allocated-arraybytes,1.058s fromfreeze; allprivatepacks were discarded and pins/freeze released. Normal process shutdown is still pending in `environment-held-cpu-probe.log` at this documentation checkpoint.
+
+Shutdown update: `environment-held-cpu-probe.log` completed with normal process exit0; the harness reported full HeldCpu PASS.
+
 Design checkpoint: September 7, 2026. This is the next proposed implementation
 after `voxel.Environment.RehearseHandoff`, not evidence that held preparation or
 ownership publication has passed in the game. The next stage should prepare

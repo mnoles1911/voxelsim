@@ -1,5 +1,6 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "VoxelProductionEnvironmentAdapter.h"
+#include "VoxelPreparedIndexTestSupport.h"
 #include "Misc/AutomationTest.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelProductionPageBatchTest,"Voxel.Objects.ProductionPageBatch",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
@@ -9,7 +10,7 @@ bool FVoxelProductionPageBatchTest::RunTest(const FString&)
     for(uint32 Capacity:{3u,4u}){
         int32 Publications=0;FVoxelBrickIndexDelta Published;
         FVoxelBrickPool Pool;FVoxelBrickPoolConfig Config;Config.ChunkCapacity=Capacity;Config.OccWordCapacity=1024;Config.MatWordCapacity=1024;Pool.Init(Config);
-        TArray<FVoxelBrickIndexEntry> Initial;Pool.SetIndexSink([&](const auto& Delta){++Publications;Published=Delta;},Initial);
+        TArray<FVoxelBrickIndexEntry> Initial;VoxelPreparedIndexTestSupport::SetSink(Pool,[&](const auto& Delta){++Publications;Published=Delta;},Initial);
         TArray<FVoxelBrickPreparedReplacement> Pages;
         for(int32 I=0;I<2;++I){FVoxelBrickChunkKey Key{I,0,0,0};Pool.AddChunkFromCpu(Air,Key,FVoxelBrickChunkShading{});FVoxelBrickPool::FResidentChunk Old;
             if(!Pool.DebugGetResidentChunk(Key,Old)){AddError(TEXT("Failed fixture allocation"));return false;}
