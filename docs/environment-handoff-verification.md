@@ -16,4 +16,6 @@ Example from the validated site (PowerShell):
 
 `Prepare` verifies hidden candidate preparation only; `Rehearse` also freezes/drains and revalidates affected pages. Neither publishes ownership. The harness checks the exact fine provider directory before launching, so a mistyped provider cannot silently test a different cache. It does not generate missing terrain.
 
+`-Mode HeldCpu -ExitAfterSeconds 90` exercises bounded private CPU page preparation. It additionally requires `ProductionHeldCpu PASSED` with CPU-only/no-readiness/no-publication flags and the successful private-pack discard/release marker. Use the same existing-cache parameters as the example.
+
 Validated against commit96286a7 in `D:/voxelsim/Saved/environment-rehearsal-harness-retry.log`:27pages,18visibleResident,3pending,6absent, successful release and normal exit0. The first launch used a mistyped provider and was stopped as an invalid run; it is not pass evidence. A missing-provider invocation then verified refusal before process creation. PowerShell syntax validation passed. This is functional correctness evidence, not a frame-performance or visible handoff acceptance test.

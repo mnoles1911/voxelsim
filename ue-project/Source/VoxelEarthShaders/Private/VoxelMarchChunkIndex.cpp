@@ -684,6 +684,76 @@ struct FVoxelMarchOrderedLifetime
     FVoxelMarchChunkIndex* Owner=nullptr;
     VoxelMarchOrdered::FState State;
     std::atomic<uint64> QueuedBytes{0};
+    std::atomic<uint64> ReservedPilotBytes{0};
+    uint64 PilotBudgetBytes=128ull*1024*1024;
+};
+
+struct FVoxelMarchPreparedCredit
+{
+    TSharedPtr<FVoxelMarchOrderedLifetime,ESPMode::ThreadSafe> Lifetime;
+    uint64 Bytes=0;
+    ~FVoxelMarchPreparedCredit(){if(Lifetime)Lifetime->ReservedPilotBytes.fetch_sub(Bytes);}
+};
+
+struct FVoxelMarchPreparedDelivery : FVoxelBrickPreparedIndexDelivery
+{
+    TSharedPtr<FVoxelMarchOrderedLifetime,ESPMode::ThreadSafe> Lifetime;
+    uint64 Epoch=0,Generation=0,Revision=0;
+    bool ForceFull=false,Consumed=false;
+    FVoxelBrickIndexDelta Expected;
+    VoxelMarchOrdered::FPacket Packet;
+    ~FVoxelMarchPreparedDelivery() override {ReleaseLocalStorage();}
+    void ReleaseLocalStorage()
+    {
+        auto Credit=MoveTemp(Packet.PreparedCredit);
+        Packet=VoxelMarchOrdered::FPacket{};
+        Expected.Added.Empty();Expected.Removed.Empty();
+        Credit.Reset();
+    }
+    bool ValidateForCommit() const override
+    {
+        check(IsInGameThread());
+        const auto* Owner=Lifetime->Owner;
+        return !Consumed && Owner && Owner->OrderedEpoch==Epoch &&
+            Owner->OrderedGeneration==Generation && Owner->OrderedCaptureRevision==Revision &&
+            !Owner->ActivePreparedDelivery;
+    }
+#if WITH_DEV_AUTOMATION_TESTS
+    uint64 DebugRetainedArrayBytes() const override
+    {
+        return Packet.Full.GetAllocatedSize()+Packet.Pairs.GetAllocatedSize()+Packet.Occupied.GetAllocatedSize()+
+            Packet.AnyAbsent.GetAllocatedSize()+Packet.AllSky.GetAllocatedSize()+Packet.GpuEntries.GetAllocatedSize()+
+            Expected.Added.GetAllocatedSize()+Expected.Removed.GetAllocatedSize();
+    }
+#endif
+    static bool SameEntries(const TArray<FVoxelBrickIndexEntry>& A,const TArray<FVoxelBrickIndexEntry>& B)
+    {
+        if(A.Num()!=B.Num())return false;
+        for(int32 I=0;I<A.Num();++I)if(!(A[I].Key==B[I].Key)||A[I].ChunkSlot!=B[I].ChunkSlot)return false;
+        return true;
+    }
+    void Commit(const FVoxelBrickIndexDelta& Delta) override
+    {
+        check(IsInGameThread());
+        // Invariants only: every rejectable check already happened before pool
+        // mutation. No post-mutation retry/drop branch is permitted here.
+        checkf(ValidateForCommit(),TEXT("Prepared index delivery changed after admission"));
+        checkf(SameEntries(Expected.Added,Delta.Added)&&SameEntries(Expected.Removed,Delta.Removed),TEXT("Prepared Flush delta differs from admitted delta"));
+        auto* Owner=Lifetime->Owner;
+        Consumed=true;
+        // Keep the credit alive even if the RT executes the moved packet before
+        // this GT call releases its expected-delta copy and unused capacities.
+        auto Credit=Packet.PreparedCredit;
+        // Non-owning synchronous injection. The pool retains this reservation
+        // until Commit returns; MarkDirty moves its packet into the command.
+        Owner->ActivePreparedDelivery=this;
+        Owner->ApplyDelta(Delta);
+        Owner->ActivePreparedDelivery=nullptr;
+        // Externally retained consumed tokens must not retain uncharged arrays.
+        // A real capture moved the packet; a no-op still owns its capacities.
+        ReleaseLocalStorage();
+        Credit.Reset();
+    }
 };
 
 FVoxelMarchChunkIndex& GetGlobalVoxelMarchChunkIndex()
@@ -756,7 +826,8 @@ void FVoxelMarchChunkIndex::AttachToGlobalPool()
 	// snapshot is the bulk of the work and the deltas are the tail.
 	TArray<FVoxelBrickIndexEntry> Snapshot;
 	GetGlobalVoxelBrickPool().SetIndexSink(
-		[this](const FVoxelBrickIndexDelta& Delta) { ApplyDelta(Delta); }, Snapshot);
+		[this](const FVoxelBrickIndexDelta& Delta) { ApplyDelta(Delta); }, Snapshot,
+        [this](const FVoxelBrickIndexDelta& Delta){return PrepareIndexDelivery(Delta);});
 	Seed(Snapshot);
 
 	UE_LOG(LogVoxelMarchIndex, Display,
@@ -1080,6 +1151,7 @@ void FVoxelMarchChunkIndex::NoteCellOwner(uint32 Cell, const FIntVector& Coord, 
 
 void FVoxelMarchChunkIndex::Seed(const TArray<FVoxelBrickIndexEntry>& Snapshot)
 {
+    ++OrderedCaptureRevision;
 	NumEntries = 0;
 	DroppedWrongLevel = 0;
 	CoverOffered = 0;
@@ -1446,6 +1518,7 @@ void FVoxelMarchChunkIndex::NoteBlockCellAbsent(const FIntVector& Coord, int32 S
 
 void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 {
+    ++OrderedCaptureRevision;
 	check(IsInGameThread());
 	if (Cells.Num() == 0 || Delta.IsEmpty())
 	{
@@ -1762,7 +1835,7 @@ void FVoxelMarchChunkIndex::NoteChunkAdmitted(const FIntVector& Coord, int32 Lev
 	ClearBlockCellSkyIfMarked(Existing, Coord, Slot);
 	Cells[int32(Cell)] = Value;
 	{
-        bOrderedGpuCompatible=false;
+        bOrderedGpuCompatible=false; ++OrderedCaptureRevision;
 		DeltaPendingCells.Add(Cell);
 	}
 	bAbsentMarksPending = true;
@@ -1804,7 +1877,7 @@ void FVoxelMarchChunkIndex::NoteChunkNoLongerAdmitted(const FIntVector& Coord, i
 	ClearBlockCellSkyIfMarked(Existing, Coord, Slot);
 	Cells[int32(Cell)] = 0u;
 	{
-        bOrderedGpuCompatible=false;
+        bOrderedGpuCompatible=false; ++OrderedCaptureRevision;
 		DeltaPendingCells.Add(Cell);
 	}
 	bAbsentMarksPending = true;
@@ -1935,7 +2008,7 @@ FVoxelMarchChunkIndex::EOpenSkyMark FVoxelMarchChunkIndex::NoteChunkOpenSky(cons
 	// at which a block claims all-sky over a cell that does not carry the mark.
 	NoteBlockCellSky(Coord, Slot);
 	{
-        bOrderedGpuCompatible=false;
+        bOrderedGpuCompatible=false; ++OrderedCaptureRevision;
 		DeltaPendingCells.Add(Cell);
 	}
 	bAbsentMarksPending = true;
@@ -2029,7 +2102,8 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 	}
 
 
-    VoxelMarchOrdered::FPacket Packet;
+    const bool ReservedFull=ActivePreparedDelivery && ActivePreparedDelivery->ForceFull;
+    VoxelMarchOrdered::FPacket Packet=ActivePreparedDelivery?MoveTemp(ActivePreparedDelivery->Packet):VoxelMarchOrdered::FPacket{};
     Packet.Epoch=OrderedEpoch; Packet.BaseGeneration=OrderedGeneration;
     Packet.Generation=++OrderedGeneration;
     Packet.Delta=bDeltaSwitch;
@@ -2039,19 +2113,19 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
     Packet.GpuCompatible=bOrderedGpuCompatible;
     // Full only for seed/reseed or a patch larger than the image itself.
     // Default full GPU upload policy does NOT force another full GT copy.
-    if(bForceFullUpload || Packet.BaseGeneration==0 || DeltaPendingCells.Num()>Cells.Num()/2)
-        Packet.Full=Cells;
+    if(ReservedFull || bForceFullUpload || Packet.BaseGeneration==0 || DeltaPendingCells.Num()>Cells.Num()/2)
+        Packet.Full.Append(Cells);
     else
     {
         Packet.Pairs.Reserve(DeltaPendingCells.Num()*2);
         for(uint32 C:DeltaPendingCells){Packet.Pairs.Add(C);Packet.Pairs.Add(Cells[C]);}
     }
-    Packet.Occupied=BlockOccupiedWords;
-    Packet.AnyAbsent=BlockAnyAbsentWords;
-    Packet.AllSky=BlockAllSkyWords;
+    Packet.Occupied.Append(BlockOccupiedWords);
+    Packet.AnyAbsent.Append(BlockAnyAbsentWords);
+    Packet.AllSky.Append(BlockAllSkyWords);
     Packet.GpuRemoves=GpuPublishRemoves.Num()/kPublishEntryDwords;
     Packet.GpuAdds=GpuPublishAdds.Num();
-    Packet.GpuEntries=MoveTemp(GpuPublishRemoves);
+    Packet.GpuEntries.Append(GpuPublishRemoves);
     for(const auto& P:GpuPublishAdds)
     {
         Packet.GpuEntries.Add(uint32(P.Value.Coord.X));Packet.GpuEntries.Add(uint32(P.Value.Coord.Y));
@@ -3044,7 +3118,20 @@ void FVoxelMarchChunkIndex::DebugSeedOrderedForTest(const TArray<FVoxelBrickInde
 {
     check(IsInGameThread());
     Cells.SetNumZeroed(int32(kCells));
+    FMemory::Memzero(Cells.GetData(),SIZE_T(Cells.Num())*sizeof(uint32));
     Seed(Snapshot);
+}
+TSharedPtr<FVoxelBrickPreparedIndexDelivery,ESPMode::ThreadSafe> FVoxelMarchChunkIndex::DebugPrepareIndexForTest(const FVoxelBrickIndexDelta& Delta)
+{
+    return PrepareIndexDelivery(Delta);
+}
+TFunction<uint64()> FVoxelMarchChunkIndex::DebugPilotCreditProbeForTest() const
+{
+    const auto Lifetime=Ordered;return [Lifetime](){return Lifetime->ReservedPilotBytes.load();};
+}
+void FVoxelMarchChunkIndex::DebugSetPilotBudgetForTest(uint64 Bytes)
+{
+    check(IsInGameThread());Ordered->PilotBudgetBytes=Bytes;
 }
 void FVoxelMarchChunkIndex::DebugResetOrderedForTest()
 {
@@ -3068,4 +3155,47 @@ FVoxelMarchChunkIndex::FUploadStats FVoxelMarchChunkIndex::GetUploadStats() cons
 {
     FScopeLock StatsLock(&UploadStatsMutex);
     return UploadStats;
+}
+
+TSharedPtr<FVoxelBrickPreparedIndexDelivery,ESPMode::ThreadSafe> FVoxelMarchChunkIndex::PrepareIndexDelivery(const FVoxelBrickIndexDelta& Delta)
+{
+    check(IsInGameThread());
+    if(ActivePreparedDelivery || Cells.Num()!=int32(kCells))return {};
+    static_assert(uint64(kCells)*2<=uint64(MAX_int32),"Prepared pair count must fit TArray");
+    static_assert(uint64(kBlockWords)<=uint64(MAX_int32),"Coarse word count must fit TArray");
+    const uint64 Entries=uint64(Delta.Added.Num())+uint64(Delta.Removed.Num());
+    if(Entries>uint64(MAX_int32/5))return {};
+    const uint64 Changed=FMath::Min<uint64>(kCells,uint64(DeltaPendingCells.Num())+Entries);
+    const bool Full=bForceFullUpload || OrderedGeneration==0 || Changed>kCells/2;
+    const uint64 ImageBytes=Full?uint64(kCells)*4:Changed*8;
+    // Both prospective-delta copies and maximum GPU entries are included.
+    // Container/map bookkeeping and ordinary queue traffic are not a global cap.
+    const uint64 Estimate=ImageBytes+uint64(kBlockWords)*12+Entries*(sizeof(FVoxelBrickIndexEntry)+20);
+    if(Estimate>Ordered->PilotBudgetBytes)return {};
+    uint64 Current=Ordered->ReservedPilotBytes.load();
+    do {if(Current>Ordered->PilotBudgetBytes-Estimate)return {};}
+    while(!Ordered->ReservedPilotBytes.compare_exchange_weak(Current,Current+Estimate));
+    auto Credit=MakeShared<FVoxelMarchPreparedCredit,ESPMode::ThreadSafe>();Credit->Lifetime=Ordered;Credit->Bytes=Estimate;
+    auto Delivery=MakeShared<FVoxelMarchPreparedDelivery,ESPMode::ThreadSafe>();
+    Delivery->Lifetime=Ordered;Delivery->Epoch=OrderedEpoch;Delivery->Generation=OrderedGeneration;
+    Delivery->Revision=OrderedCaptureRevision;Delivery->ForceFull=Full;Delivery->Expected=Delta;
+    auto& Packet=Delivery->Packet;Packet.PreparedCredit=Credit;
+    if(Full)Packet.Full.Reserve(int32(kCells));else Packet.Pairs.Reserve(int32(Changed*2));
+    Packet.Occupied.Reserve(int32(kBlockWords));Packet.AnyAbsent.Reserve(int32(kBlockWords));Packet.AllSky.Reserve(int32(kBlockWords));
+    Packet.GpuEntries.Reserve(int32(Entries*5));
+    const uint64 Actual=Packet.Full.GetAllocatedSize()+Packet.Pairs.GetAllocatedSize()+Packet.Occupied.GetAllocatedSize()+
+        Packet.AnyAbsent.GetAllocatedSize()+Packet.AllSky.GetAllocatedSize()+Packet.GpuEntries.GetAllocatedSize()+
+        Delivery->Expected.Added.GetAllocatedSize()+Delivery->Expected.Removed.GetAllocatedSize();
+    if(Actual>Estimate)
+    {
+        const uint64 Extra=Actual-Estimate;Current=Ordered->ReservedPilotBytes.load();
+        do {if(Extra>Ordered->PilotBudgetBytes || Current>Ordered->PilotBudgetBytes-Extra)return {};}
+        while(!Ordered->ReservedPilotBytes.compare_exchange_weak(Current,Current+Extra));
+        Credit->Bytes=Actual;
+    }
+    return Delivery;
+}
+uint64 FVoxelMarchChunkIndex::GetReservedPilotIndexBytes() const
+{
+    return Ordered->ReservedPilotBytes.load();
 }

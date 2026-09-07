@@ -9,6 +9,7 @@
 #include "VoxelProductionCandidatePreparation.h"
 #include "VoxelEnvironmentRenderContext.h"
 #include "VoxelEnvironmentPageBarrier.h"
+#include "VoxelEnvironmentPageSampler.h"
 #include "Misc/SecureHash.h"
 
 #include "VoxelChunkComponent.h"
@@ -6845,6 +6846,14 @@ struct FVoxelWorldImpl
     bool ProductionRenderAffects(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const;
     bool ProductionRenderSupported(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const;
     VoxelProductionCandidate::FWorkRef ProductionCandidate;
+    struct FHeldCpuPageJob {
+        TAtomic<bool> Cancelled{false},Ready{false};
+        VoxelCoords::FVoxelLevelChunkKey Key;
+        FVoxelBrickCpuPackRef Pack;
+        VoxelEnvironmentRender::FContextRef Context;
+        FString Error;
+    };
+    using FHeldCpuJobRef=TSharedPtr<FHeldCpuPageJob,ESPMode::ThreadSafe>;
     struct FProductionPageRehearsal {
         VoxelEnvironmentPages::FTicket Ticket;
         TArray<VoxelCoords::FVoxelLevelChunkKey> Keys;
@@ -6854,11 +6863,21 @@ struct FVoxelWorldImpl
         int32 MaxRing=0,WaitTicks=0;
         double Inner[VoxelCoords::kNumLevels]={},Outer[VoxelCoords::kNumLevels]={};
         bool Captured=false;
+        FVoxelBrickEvictionPinTicket PressurePins;
+        FHeldCpuJobRef ContextJob;
+        VoxelEnvironmentRender::FContextRef CpuContext;
+        TArray<int32> AllocatedPages;
+        TArray<FHeldCpuJobRef> CpuJobs;
+        TArray<VoxelProductionEnvironment::FPreparedPage> CpuPacks;
+        uint64 CpuBytes=0;
+        int32 NextCpuPage=0;
+        bool CpuPreflightDone=false;
     };
     TUniquePtr<FProductionPageRehearsal> ProductionRehearsal;
     void EndProductionRehearsal(const TCHAR* Reason);
     void CancelProductionCandidate(const TCHAR* Reason);
     void TickProductionRehearsal(const FVector& Anchor);
+    void TickHeldCpuPreparation();
 	std::atomic<int32> ProductionCandidateWorkers{0};
 	void TickProductionCandidate(UWorld* World,const FVector& Anchor);
 	bool ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const;
@@ -18100,6 +18119,15 @@ void FVoxelWorldImpl::EndProductionRehearsal(const TCHAR* Reason)
 {
     check(IsInGameThread());
     if(!ProductionRehearsal)return;
+    if(ProductionRehearsal->ContextJob)ProductionRehearsal->ContextJob->Cancelled.Store(true);
+    for(const auto& Job:ProductionRehearsal->CpuJobs)Job->Cancelled.Store(true);
+    if(ProductionRehearsal->PressurePins.IsValid()){
+        // Pool Reset retires tickets independently of this private diagnostic.
+        // A stale/already-retired ticket must not prevent cancellation from
+        // releasing the World freeze; no held pack has been published.
+        if(!GetGlobalVoxelBrickPool().ReleaseEvictionPins(ProductionRehearsal->PressurePins))
+            UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldCpu pressure-pin ticket already retired; discarding private work and releasing World freeze"));
+    }
     const bool Released=PageBarrier.Release(ProductionRehearsal->Ticket);check(Released);
     UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL RELEASED reason=%s; allocatorPinned=0 publicationReady=0"),Reason);
     ProductionRehearsal.Reset();
@@ -18115,8 +18143,9 @@ void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
     auto Work=ProductionCandidate;
     if(!Work||!Work->RehearseHandoff||Work->Phase!=5)return;
     const auto Refuse=[&](const TCHAR* Why){
-        UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHandoff REHEARSAL REFUSED: %s; allocatorPinned=0 publicationReady=0"),Why);
-        Work->RehearseHandoff=false;EndProductionRehearsal(Why);
+        UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHandoff REHEARSAL REFUSED: %s; publicationReady=0"),Why);
+        if(Work->PrepareHeldCpuPages)UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldCpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);
+        Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;EndProductionRehearsal(Why);
     };
     if(!ProductionRehearsal){
         auto State=MakeUnique<FProductionPageRehearsal>();
@@ -18137,7 +18166,7 @@ void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
             ProductionRehearsal->Keys.Num(),PageBarrier.ActiveLeases());
     }
     auto& State=*ProductionRehearsal;
-    if(FPlatformTime::Seconds()-State.Started>30.){Refuse(TEXT("30-second quiescence/validation timeout"));return;}
+    if(FPlatformTime::Seconds()-State.Started>(Work->PrepareHeldCpuPages?60.:30.)){Refuse(Work->PrepareHeldCpuPages?TEXT("60-second CPU preparation timeout"):TEXT("30-second quiescence/validation timeout"));return;}
     // Conservative fixed-anchor rehearsal: ring movement invalidates the evidence.
     // Real transactions need a versioned desired-ring set, not this diagnostic hold.
     if(!Anchor.Equals(State.Anchor,0.01)||State.MaxRing!=UVoxelWorldSubsystem::GetMaxRingLevel()){Refuse(TEXT("streaming anchor/ring extent changed"));return;}
@@ -18149,17 +18178,28 @@ void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
         // Observe only AFTER old ordinary CPU/GPU producers and queued results drain.
         // These tokens are not allocator pins. External pool pressure may invalidate
         // them, which the following tick must reject rather than call a successful handoff.
+        if(Work->PrepareHeldCpuPages){
+            if(!ProductionOwnership.Visible()->records.empty()){Refuse(TEXT("CPU pilot requires empty visible ownership"));return;}
+            TArray<FVoxelBrickChunkKey> PinKeys;PinKeys.Reserve(State.Keys.Num());
+            for(const auto& Key:State.Keys)PinKeys.Add(VoxelBrickCpuArm::MakeKey(Key));
+            State.PressurePins=Pool.AcquireEvictionPins(PinKeys);
+            if(!State.PressurePins.IsValid()){Refuse(TEXT("complete eviction-pressure pin request refused"));return;}
+        }
         State.Tokens.Reserve(State.Keys.Num());
-        for(const auto& Key:State.Keys)State.Tokens.Add(Pool.SnapshotAllocation(VoxelBrickCpuArm::MakeKey(Key)));
+        for(int32 I=0;I<State.Keys.Num();++I){
+            const auto Token=Pool.SnapshotAllocation(VoxelBrickCpuArm::MakeKey(State.Keys[I]));State.Tokens.Add(Token);
+            if(Token.bPresent)State.AllocatedPages.Add(I);
+        }
+        if(Work->PrepareHeldCpuPages&&(State.AllocatedPages.IsEmpty()||State.AllocatedPages.Num()>1024)){Refuse(TEXT("CPU allocated-page budget requires 1..1024 pages"));return;}
         State.Captured=true;
-        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL QUIESCENT pages=%d; validating allocation observations on next tick; allocatorPinned=0 publicationReady=0"),State.Keys.Num());
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL QUIESCENT pages=%d; validating allocation observations on next tick; pressurePinned=%d publicationReady=0"),State.Keys.Num(),State.PressurePins.IsValid()?1:0);
         return;
     }
     int32 Visible=0,Pending=0,Parked=0,Absent=0;
     for(int32 I=0;I<State.Keys.Num();++I){
         const auto& Key=State.Keys[I];const auto& Before=State.Tokens[I];
         const auto Now=Pool.SnapshotAllocation(VoxelBrickCpuArm::MakeKey(Key));
-        if(Before.bPresent!=Now.bPresent||Before.Slot!=Now.Slot||Before.AddSequence!=Now.AddSequence){Refuse(TEXT("unpinned allocation token changed after quiescence"));return;}
+        if(Before.bPresent!=Now.bPresent||Before.Slot!=Now.Slot||Before.AddSequence!=Now.AddSequence){Refuse(TEXT("allocation token changed after quiescence (pressure pins do not seal explicit replacement/removal)"));return;}
         const auto* Record=ChunkRecords.Find(Key);
         // Exclusive categories, including pages outside currently loaded rings.
         if(ParkedGeometry.Contains(Key))++Parked;
@@ -18167,9 +18207,122 @@ void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
         else if(Record||SpeculativeInFlight.Contains(Key)||PendingGameThreadKeys.Contains(Key))++Pending;
         else ++Absent;
     }
+    if(Work->PrepareHeldCpuPages){TickHeldCpuPreparation();return;}
     UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL PASSED spec=%s pages=%d visibleResident=%d pending=%d parked=%d absent=%d affectedLeaseWaitTicks=%d; allocation observations stable for one tick; allocatorPinned=0 publicationReady=0"),
         *Work->Descriptor.SpecId,State.Keys.Num(),Visible,Pending,Parked,Absent,State.WaitTicks);
     Work->RehearseHandoff=false;EndProductionRehearsal(TEXT("successful observation-only rehearsal"));
+}
+
+// Same footprint used by ordinary CPU/GPU composition; defined below.
+static vxc::AssetVoxelRect VoxelAssetRectForFootprint(int32 Level,int32 ChunkX,int32 ChunkY);
+
+void FVoxelWorldImpl::TickHeldCpuPreparation()
+{
+    auto Work=ProductionCandidate;if(!Work||!ProductionRehearsal)return;
+    auto& State=*ProductionRehearsal;
+    constexpr uint64 MaxBytes=128ull*1024*1024;
+    constexpr uint64 MaxPageBytes=64ull*1024; // includes array slack; reserve before launch
+    const auto Refuse=[&](const TCHAR* Why){
+        UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldCpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);
+        Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;EndProductionRehearsal(Why);
+    };
+    if(!ProductionOwnership.Visible()->records.empty()){Refuse(TEXT("visible ownership changed"));return;}
+    if(!State.CpuContext){
+        if(!State.ContextJob){
+            auto Job=MakeShared<FHeldCpuPageJob,ESPMode::ThreadSafe>();State.ContextJob=Job;
+            const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
+            const uint64 Generation=ProductionOwnership.Visible()->generation;
+            if(Generation==MAX_uint64){Refuse(TEXT("ownership generation exhausted"));return;}
+            ProductionCandidateWorkers.fetch_add(1);
+            auto Task=UE::Tasks::Launch(TEXT("HeldCpuTargetContext"),[this,Job,Work,Provider,Catalog,Generation](){
+                ON_SCOPE_EXIT {Job->Ready.Store(true);ProductionCandidateWorkers.fetch_sub(1);};
+                if(Job->Cancelled.Load())return;
+                // Draft only: no publication callback or backend readiness exists.
+                vxc::AssetRenderOwnership Draft;
+                const auto Ticket=Draft.begin(Work->Provenance,vxc::AssetRenderOwner::Object,1,1,Work->Pages);
+                const auto* Target=Draft.target(Ticket);
+                if(!Target){Job->Error=TEXT("private target snapshot refused");return;}
+                auto Snapshot=*Target;Snapshot.generation=Generation+1;
+                TArray<VoxelEnvironmentRender::FSourceBinding> Bindings;
+                Bindings.Add({Work->Candidate.bankId,Work->Candidate.seedIndex,Work->Candidate.grid,Work->CanonicalSourceHash});
+                Job->Context=VoxelEnvironmentRender::Build(
+                    MakeShared<const vxc::AssetOwnershipSnapshot,ESPMode::ThreadSafe>(MoveTemp(Snapshot)),
+                    Work->Provenance.worldSeed,Provider,Catalog,Bindings,Job->Error);
+            });
+            InFlightTasks.Add(MoveTemp(Task));return;
+        }
+        if(!State.ContextJob->Ready.Load())return;
+        if(!State.ContextJob->Context){Refuse(*State.ContextJob->Error);return;}
+        State.CpuContext=State.ContextJob->Context;State.ContextJob.Reset();
+    }
+    if(State.CpuContext->Generation()!=ProductionOwnership.Visible()->generation+1){Refuse(TEXT("visible ownership generation changed"));return;}
+    if(!State.CpuPreflightDone){
+        // Preflight EVERY allocated page before any pack dispatch. No fallback
+        // to overlay-aware or unsuppressed representative sampling is permitted.
+        for(int32 Index:State.AllocatedPages){const auto& Key=State.Keys[Index];
+            const TCHAR* Reason=nullptr;
+            if(NeedsOverlayAwarePath(Key))Reason=TEXT("edited page");
+            else if(!ProductionRenderSupported(Key,State.CpuContext)||(Key.Level>0&&
+                !(VoxelStreamAdmission::GetCoarseMinLevel()==1&&VoxelStreamAdmission::CoarseGridEnabled()&&!VoxelStreamAdmission::CoarseGridVerifyEnabled())))Reason=TEXT("unsupported CPU composition mode");
+            else if(!IsColumnGridFootprintResident(Key.Level,Key.Key.X,Key.Key.Y))Reason=TEXT("column footprint not resident");
+            else if(!AssetResolveFootprintResident(Key.Level,Key.Key.X,Key.Key.Y))Reason=TEXT("asset resolve footprint not resident");
+            if(Reason){
+                const FString Detail=FString::Printf(TEXT("page L%d (%d,%d,%d): %s"),Key.Level,Key.Key.X,Key.Key.Y,Key.Key.Z,Reason);
+                Refuse(*Detail);return;
+            }
+        }
+        State.CpuPreflightDone=true;State.CpuPacks.Reserve(State.AllocatedPages.Num());
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldCpu START allocated=%d absent=%d maxWorkers=2 maxBytes=%llu pressurePinned=1; backendReady=0 publicationReady=0"),
+            State.AllocatedPages.Num(),State.Keys.Num()-State.AllocatedPages.Num(),MaxBytes);
+    }
+    for(int32 I=State.CpuJobs.Num()-1;I>=0;--I){
+        const auto Job=State.CpuJobs[I];if(!Job->Ready.Load())continue;
+        if(!Job->Pack){Refuse(*Job->Error);return;}
+        const uint64 Bytes=uint64(Job->Pack->Desc.GetAllocatedSize())+Job->Pack->Occ.GetAllocatedSize()+Job->Pack->Mat.GetAllocatedSize();
+        if(Job->Pack->Desc.Num()!=128||Job->Pack->OccWords()>1024||Job->Pack->MatWords()>8448||Bytes>MaxPageBytes||Bytes>MaxBytes-State.CpuBytes){Refuse(TEXT("CPU pack shape or aggregate byte budget exceeded"));return;}
+        State.CpuBytes+=Bytes;
+        VoxelProductionEnvironment::FPreparedPage Prepared;
+        const int32 PageIndex=State.Keys.IndexOfByKey(Job->Key);check(PageIndex!=INDEX_NONE);
+        Prepared.Page=Work->Pages[size_t(PageIndex)];Prepared.Generation=State.CpuContext->Generation();Prepared.CpuBricks=Job->Pack;
+        State.CpuPacks.Add(MoveTemp(Prepared));State.CpuJobs.RemoveAtSwap(I,1,EAllowShrinking::No);
+    }
+    if(State.CpuPacks.Num()==State.AllocatedPages.Num()){
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldCpu PASSED spec=%s completePages=%d allocated=%d absent=%d completed=%d bytes=%llu elapsed=%.3f pressurePinned=1; cpuOnly=1 backendReady=0 publicationReady=0"),
+            *Work->Descriptor.SpecId,State.Keys.Num(),State.AllocatedPages.Num(),State.Keys.Num()-State.AllocatedPages.Num(),State.CpuPacks.Num(),State.CpuBytes,FPlatformTime::Seconds()-State.Started);
+        Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;EndProductionRehearsal(TEXT("CPU-only private packs validated and discarded"));return;
+    }
+    while(State.CpuJobs.Num()<2&&State.NextCpuPage<State.AllocatedPages.Num()){
+        if(State.CpuBytes+(uint64(State.CpuJobs.Num())+1)*MaxPageBytes>MaxBytes){Refuse(TEXT("CPU in-flight byte reservation exceeded"));return;}
+        const auto Key=State.Keys[State.AllocatedPages[State.NextCpuPage++]];
+        auto Job=MakeShared<FHeldCpuPageJob,ESPMode::ThreadSafe>();Job->Key=Key;State.CpuJobs.Add(Job);
+        const auto Context=State.CpuContext;const auto* Gen=&Voxels.generated();
+        ProductionCandidateWorkers.fetch_add(1);
+        auto Task=UE::Tasks::Launch(TEXT("HeldCpuPagePack"),[this,Job,Context,Gen,Key](){
+            ON_SCOPE_EXIT {Job->Ready.Store(true);ProductionCandidateWorkers.fetch_sub(1);};
+            if(Job->Cancelled.Load())return;
+            auto Resolved=VoxelResolveTerrainInstances(*Gen,VoxelAssetRectForFootprint(Key.Level,Key.Key.X,Key.Key.Y));
+            if(Resolved.size()>VoxelProductionCandidate::MaxResolved){Job->Error=TEXT("resolved instance work budget exceeded");return;}
+            if(Job->Cancelled.Load())return;
+            if(Key.Level==0){
+                if(!Context->MarkPrivate(Resolved)){Job->Error=TEXT("private canonical markers refused");return;}
+                constexpr int32 Edge=34;const int64 X=int64(Key.Key.X)*32,Y=int64(Key.Key.Y)*32;
+                TArray<vxc::ColumnSample> Columns;Columns.SetNumUninitialized(Edge*Edge);
+                for(int32 LY=0;LY<Edge;++LY){
+                    if(Job->Cancelled.Load())return;
+                    for(int32 LX=0;LX<Edge;++LX)Columns[LX+Edge*LY]=Gen->amplifier().column(X+LX-1,Y+LY-1);
+                }
+                const VoxelEnvironmentPages::FLevelZeroRenderSampler Sampler{Columns.GetData(),X,Y,Edge,&Resolved};
+                Job->Pack=VoxelBrickCpuArm::PackChunk(Key,Sampler);
+            }else{
+                const FCoarseChunkGridSampler Sampler(*Gen,Key.Level,Key.Key,nullptr,nullptr,false,&Resolved,Context);
+                if(!Sampler.bRenderContextValid){Job->Error=TEXT("private coarse composition refused");return;}
+                if(Job->Cancelled.Load())return;
+                Job->Pack=VoxelBrickCpuArm::PackChunk(Key,Sampler);
+            }
+            if(Job->Cancelled.Load())Job->Pack.Reset();
+        });
+        InFlightTasks.Add(MoveTemp(Task));
+    }
 }
 
 void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Anchor)
@@ -18178,7 +18331,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
     check(IsInGameThread());
     const int32 Request=ConsumeRequest(World);
     if(Request==2){CancelProductionCandidate(TEXT("explicit cancellation"));UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate CANCELLED"));return;}
-    if(Request==1||Request==3)
+    if(Request==1||Request==3||Request==4)
     {
         if((ProductionCandidate&&ProductionCandidate->Phase<5)||ProductionCandidateWorkers.load()>0)
         {
@@ -18197,7 +18350,8 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
                 UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: requires resident fine terrain, provider identity and catalog"));return;
             }
             auto Work=MakeShared<FWork,ESPMode::ThreadSafe>();ProductionCandidate=Work;
-            Work->RehearseHandoff=Request==3;
+            Work->RehearseHandoff=Request==3||Request==4;
+            Work->PrepareHeldCpuPages=Request==4;
             Work->Started=FPlatformTime::Seconds();Work->EditEpoch=EditEpoch.load();Work->ResidencyEpoch=FineStreamer->ResidencyEpoch();
             const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
             ProductionCandidateWorkers.fetch_add(1);
@@ -18245,7 +18399,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
     auto Work=ProductionCandidate;if(!Work)return;
     const auto Refuse=[&](const TCHAR* Why){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: %s"),Why);CancelProductionCandidate(Why);};
     if(!FineStreamer||!IsCurrent(*Work,EditEpoch.load(),FineStreamer->ResidencyEpoch())){Refuse(TEXT("cancelled or edit/residency epoch changed"));return;}
-    if(FPlatformTime::Seconds()-Work->Started>90.){Refuse(TEXT("90-second preparation/retention limit"));return;}
+    if(!ProductionRehearsal&&FPlatformTime::Seconds()-Work->Started>90.){Refuse(TEXT("90-second preparation/retention limit"));return;}
     if(Work->Phase==0)
     {
         if(!Work->WorkerReady.Load())return;
@@ -26256,25 +26410,7 @@ void FVoxelWorldImpl::DispatchJobs()
 						Result.Band = VoxelStreaming::MakeFootprintBand(MaxTop, MinAir);
 						Result.bBandValid = true;
 					}
-					const auto GridSampler = [Columns, BaseVX, BaseVY, AResolvedPtr](int64 X, int64 Y, int64 Z)
-					{
-						const int32 LX = int32(X - BaseVX) + 1;
-						const int32 LY = int32(Y - BaseVY) + 1;
-						checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
-						vxc::MaterialId M =
-							vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], Z);
-						// AIR ONLY, matching makeBrick exactly: an asset never
-						// replaces terrain, so the composition stays monotone and
-						// the bound's "assets are solid ABOVE the surface"
-						// assumption holds. materialAtResolved preserves
-						// instancesForRect order, so first-non-air-wins picks the
-						// same winner as the bank-source path did, byte for byte.
-						if (M == vxc::MAT_AIR && !AResolvedPtr->empty())
-						{
-							M = vxc::AssetField::materialAtResolvedForRender<true>(*AResolvedPtr, X, Y, Z);
-						}
-						return M;
-					};
+					const VoxelEnvironmentPages::FLevelZeroRenderSampler GridSampler{Columns,BaseVX,BaseVY,GridEdge,AResolvedPtr};
 					// docs/debug-tooling-plan.md P1 "vxc::Counters": columnEvals
 					// counts the explicit Amp.column() calls this cache-build loop
 					// makes -- the ~100x-cheaper number the doc comment above

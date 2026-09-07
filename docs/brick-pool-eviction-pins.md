@@ -4,7 +4,7 @@
 
 Existing same-key replacements, explicit removals and GPU shell cancellation remain legal while old jobs drain. Capture slot/AddSequence tokens after draining and revalidate immediately before publication. Pins are **not an immutable seal**, do not reserve arena capacity, and do not establish GPU completion. Same-key allocation still frees its previous allocation first and may fail to replace it under capacity pressure.
 
-Protected prepared-batch publication requires its matching ticket. All pages in a ticketed batch must belong to that ticket. Existing unticketed publication remains available for unprotected pages. Publication retains its no-eviction reservation phase and its refusal of GPU arena allocator mode. Failure retains pins; success also retains pins until the controller releases them. The controller must release on every abort and successful completion.
+Protected prepared-batch publication requires its matching ticket. All pages in a ticketed batch must belong to that ticket. Existing unticketed publication remains available for unprotected pages when an index preflight contract is installed. Publication retains its no-eviction reservation phase and its refusal of GPU arena allocator mode. Failure retains pins; success also retains pins until the controller releases them. The controller must release on every abort and successful completion.
 
 Eviction skips protected residents using bounded scanning, including when every resident is pinned. Unpin invalidates the eviction traversal lazily so skipped keys can become victims again. GPU shell descriptor allocation shares this path; queued GPU claims/frees and GPU word-arena capacity are separate concerns.
 

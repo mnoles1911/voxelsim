@@ -2074,12 +2074,14 @@ void FVoxelBrickPool::SnapshotResidentIndex(TArray<FVoxelBrickIndexEntry>& Out) 
 	}
 }
 
-void FVoxelBrickPool::SetIndexSink(FVoxelBrickIndexSink InSink, TArray<FVoxelBrickIndexEntry>& OutSnapshot)
+void FVoxelBrickPool::SetIndexSink(FVoxelBrickIndexSink InSink, TArray<FVoxelBrickIndexEntry>& OutSnapshot, FVoxelBrickIndexPreflight InPreflight)
 {
 	// Snapshot and registration in one call, under the game thread, with no
 	// Flush able to run between them -- see the declaration for why the two-call
 	// form is a window and not a style preference.
 	IndexSink = MoveTemp(InSink);
+    IndexPreflight=MoveTemp(InPreflight);
+    ++IndexSinkGeneration;
 	SnapshotResidentIndex(OutSnapshot);
 }
 
@@ -2402,6 +2404,7 @@ void FVoxelBrickPool::RebuildEvictionOrder()
 
 bool FVoxelBrickPool::EvictOne()
 {
+    ++IndexMutationSequence;
 	if (Resident.Num() == 0)
 	{
 		return false;
@@ -2512,6 +2515,7 @@ bool FVoxelBrickPool::EvictOne()
 bool FVoxelBrickPool::AllocateForChunk(const FVoxelBrickChunkKey& Key, uint32 OccWords,
                                       uint32 MatWords, FResidentChunk& OutChunk)
 {
+    ++IndexMutationSequence;
 	// A re-mesh of a resident chunk is a REPLACEMENT. Freeing first means the
 	// arenas see the old ranges back before the new ones are asked for, which is
 	// also what keeps a churning chunk from ratcheting the high-water mark.
@@ -2641,7 +2645,7 @@ bool FVoxelBrickPool::ReleaseEvictionPins(FVoxelBrickEvictionPinTicket Ticket)
 bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages, FVoxelBrickEvictionPinTicket Ticket)
 {
 	check(IsInGameThread());
-	if(!bInitialised||bGpuAllocArmed||!IndexSink||Pages.IsEmpty()||Pages.Num()>8192)return false;
+	if(!bInitialised||bGpuAllocArmed||!IndexSink||!IndexPreflight||Pages.IsEmpty()||Pages.Num()>8192)return false;
 	const bool HasTicket = Ticket.IsValid();
     if (HasTicket && (Ticket.PoolNonce != EvictionPinNonce || !EvictionPinTickets.Contains(Ticket.Serial))) return false;
     TSet<FVoxelBrickChunkKey> Keys;
@@ -2662,6 +2666,35 @@ bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedRepla
 		auto& R=Reserved.AddDefaulted_GetRef();R.Desc=DescArena.Alloc(64);if(Occ)R.Occ=OccArena.Alloc(Occ);if(Mat)R.Mat=MatArena.Alloc(Mat);
 		if(!R.Desc.IsValid()||(Occ&&!R.Occ.IsValid())||(Mat&&!R.Mat.IsValid())){Rollback();return false;}
 	}
+    // Mirror Flush's complete delta, including pending ordinary writes. A
+    // replacement drops pending writes naming its old slot before adding its
+    // new write; removals already pending remain in their original order.
+    FVoxelBrickIndexDelta Prospective;
+    Prospective.Removed=PendingIndexRemovals;
+    TSet<uint32> ReplacedSlots;
+    for(const auto& Page:Pages)if(const auto* Old=Resident.Find(Page.Key))
+    {
+        ReplacedSlots.Add(Old->ChunkSlot);
+        Prospective.Removed.Add(FVoxelBrickIndexEntry{Page.Key,Old->ChunkSlot});
+    }
+    for(const auto& Write:PendingWrites)if(!ReplacedSlots.Contains(Write.ChunkSlot))
+        Prospective.Added.Add(FVoxelBrickIndexEntry{Write.Key,Write.ChunkSlot});
+    for(int32 I=0;I<Pages.Num();++I)
+        Prospective.Added.Add(FVoxelBrickIndexEntry{Pages[I].Key,Reserved[I].Desc.Offset/64});
+    Prospective.Added.Append(PendingGpuIndexAdds);
+    const uint64 SinkGeneration=IndexSinkGeneration;
+    const uint64 MutationSequence=IndexMutationSequence;
+    const FGuid PoolEpoch=EvictionPinNonce;
+    // Copy callback: replacing the sink from within preparation must not
+    // destroy the callable currently executing. Such replacement is rejected.
+    const auto Prepare=IndexPreflight;
+    auto Delivery=Prepare(Prospective);
+    const bool DeliveryValid=Delivery && Delivery->ValidateForCommit();
+    if(!DeliveryValid || SinkGeneration!=IndexSinkGeneration || MutationSequence!=IndexMutationSequence || PoolEpoch!=EvictionPinNonce)
+    {
+        if(PoolEpoch==EvictionPinNonce)Rollback(); // Reset already freed old arenas.
+        return false;
+    }
 	// Admission and every allocation succeeded before touching resident keys.
 	// No callback or asynchronous operation can interleave this GT commit.
 	for(int32 I=0;I<Pages.Num();++I){
@@ -2676,7 +2709,7 @@ bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedRepla
 		Write.Shading=Page.Shading;Write.OriginVoxel=Page.CpuPack?Page.CpuPack->OriginVoxel:Page.GpuPack->OriginVoxel;
 		PendingWrites.Add(MoveTemp(Write));
 	}
-	Flush();return true;
+	FlushWithPreparedIndex(MoveTemp(Delivery));return true;
 }
 
 int32 FVoxelBrickPool::AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload,
@@ -2841,6 +2874,7 @@ bool FVoxelBrickPool::DebugFindSlotOwner(int32 ChunkSlot, FVoxelBrickChunkKey& O
 
 bool FVoxelBrickPool::RemoveChunk(const FVoxelBrickChunkKey& Key)
 {
+    ++IndexMutationSequence;
 	FResidentChunk* Found = Resident.Find(Key);
 	if (Found == nullptr)
 	{
@@ -4420,6 +4454,12 @@ void FVoxelBrickPool::UploadCpuWrites_RenderThread(FRHICommandListImmediate& RHI
 
 void FVoxelBrickPool::Flush()
 {
+    FlushWithPreparedIndex({});
+}
+
+void FVoxelBrickPool::FlushWithPreparedIndex(FVoxelBrickPreparedIndexDeliveryRef Delivery)
+{
+    ++IndexMutationSequence;
 	// P1: pending GPU-side frees go out FIRST, before anything below could
 	// enqueue a claim that reuses a freed slot -- the ordering rule on
 	// FlushPendingGpuFrees's declaration. No-op unarmed and when empty.
@@ -4663,7 +4703,8 @@ void FVoxelBrickPool::Flush()
 	// FVoxelBrickIndexSink.
 	if (IndexSink && !IndexDelta.IsEmpty())
 	{
-		IndexSink(IndexDelta);
+		if(Delivery)Delivery->Commit(IndexDelta);
+        else IndexSink(IndexDelta);
 	}
 	FlushStageMs.SinkMs += (FPlatformTime::Seconds() - FlushSinkStart) * 1000.0;
 

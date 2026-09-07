@@ -1,5 +1,6 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "VoxelBrickPool.h"
+#include "VoxelPreparedIndexTestSupport.h"
 #include "Misc/AutomationTest.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelBrickEvictionPinsTest,
@@ -9,7 +10,7 @@ bool FVoxelBrickEvictionPinsTest::RunTest(const FString&)
     FVoxelBrickPool Pool, Other;
     FVoxelBrickPoolConfig Config; Config.ChunkCapacity=3; Config.OccWordCapacity=1024; Config.MatWordCapacity=1024;
     Pool.Init(Config); Other.Init(Config);
-    TArray<FVoxelBrickIndexEntry> Initial; Pool.SetIndexSink([](const auto&){},Initial);
+    TArray<FVoxelBrickIndexEntry> Initial; VoxelPreparedIndexTestSupport::SetSink(Pool,[](const auto&){},Initial);
     auto Air=MakeShared<FVoxelBrickCpuPack,ESPMode::ThreadSafe>(); Air->Desc.SetNumZeroed(128);
     const FVoxelBrickChunkKey A{100,0,0,0}, B{50,0,0,0}, C{1,0,0,0}, D{2,0,0,0};
     auto Add=[&](const auto& Key){return Pool.AddChunkFromCpu(Air,Key,FVoxelBrickChunkShading{});};

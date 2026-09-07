@@ -19,6 +19,10 @@ FAutoConsoleCommandWithWorld RehearseProductionHandoffCommand(
     TEXT("voxel.Environment.RehearseHandoff"),
     TEXT("Prepare a hidden canonical candidate, then rehearse bounded page quiescence and allocation-token validation. No ownership publication or allocator pin guarantee."),
     FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,3);}));
+FAutoConsoleCommandWithWorld PrepareHeldCpuPagesCommand(
+    TEXT("voxel.Environment.PrepareHeldCpuPages"),
+    TEXT("Prepare private CPU replacement packs for all allocated candidate pages under a bounded freeze and eviction-pressure pins. No GPU readiness or ownership publication."),
+    FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,4);}));
 }
 namespace VoxelProductionCandidate
 {

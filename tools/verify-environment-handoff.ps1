@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory)][long]$Seed,
     [Parameter(Mandatory)][double]$SpawnX,
     [Parameter(Mandatory)][double]$SpawnY,
-    [ValidateSet('Prepare','Rehearse')][string]$Mode = 'Rehearse',
+    [ValidateSet('Prepare','Rehearse','HeldCpu')][string]$Mode = 'Rehearse',
     [ValidateRange(1,120)][int]$StartAfterSeconds = 45,
     [ValidateRange(35,120)][int]$ExitAfterSeconds = 60,
     [ValidateRange(60,900)][int]$TimeoutSeconds = 300,
@@ -43,7 +43,11 @@ if ($AllowOtherProjectEditors) {
 if ($busy.Count) { throw 'An editor or compiler is active. Leave that session alone.' }
 $buildTools = @(Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe'" | Where-Object { $_.CommandLine -match 'UnrealBuildTool' })
 if ($buildTools.Count) { throw 'UnrealBuildTool is active. Retry after the build completes.' }
-$command = if ($Mode -eq 'Rehearse') { 'voxel.Environment.RehearseHandoff' } else { 'voxel.Environment.PrepareCandidate' }
+$command = switch ($Mode) {
+    'Rehearse' { 'voxel.Environment.RehearseHandoff' }
+    'HeldCpu' { 'voxel.Environment.PrepareHeldCpuPages' }
+    default { 'voxel.Environment.PrepareCandidate' }
+}
 $culture = [Globalization.CultureInfo]::InvariantCulture
 $testArgs = @(
     ('"' + $projectPath + '"'), '-game','-dx12','-sm6','-Multiprocess','-unattended','-nosplash','-nosound','-VoxelNoMenu',
@@ -70,6 +74,11 @@ try {
         if ($testText -notmatch 'ProductionHandoff REHEARSAL PASSED .*allocatorPinned=0 publicationReady=0' -or
             $testText -notmatch 'REHEARSAL RELEASED reason=successful observation-only rehearsal') { throw 'Successful rehearsal/release evidence is missing.' }
         if ($testText -match 'REHEARSAL REFUSED') { throw 'Rehearsal reported a refusal.' }
+    }
+    if ($Mode -eq 'HeldCpu') {
+        if ($testText -notmatch 'ProductionHeldCpu PASSED .*cpuOnly=1 backendReady=0 publicationReady=0' -or
+            $testText -notmatch 'REHEARSAL RELEASED reason=CPU-only private packs validated and discarded') { throw 'Successful CPU preparation/release evidence is missing.' }
+        if ($testText -match 'ProductionHeldCpu REFUSED|REHEARSAL REFUSED') { throw 'CPU preparation reported a refusal.' }
     }
     Write-Output "PASS: $Mode completed with normal process exit0."
 }

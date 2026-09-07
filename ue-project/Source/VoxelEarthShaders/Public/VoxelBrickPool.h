@@ -357,6 +357,21 @@ struct FVoxelBrickIndexDelta
 // skipped.
 using FVoxelBrickIndexSink = TFunction<void(const FVoxelBrickIndexDelta&)>;
 
+// Optional prepared-publication contract. Preparation may refuse; Commit is
+// non-failing and consumes storage reserved before any resident mutation.
+class FVoxelBrickPreparedIndexDelivery
+{
+public:
+    virtual ~FVoxelBrickPreparedIndexDelivery() = default;
+    virtual bool ValidateForCommit() const = 0;
+    virtual void Commit(const FVoxelBrickIndexDelta& Delta) = 0;
+#if WITH_DEV_AUTOMATION_TESTS
+    virtual uint64 DebugRetainedArrayBytes() const {return 0;}
+#endif
+};
+using FVoxelBrickPreparedIndexDeliveryRef = TSharedPtr<FVoxelBrickPreparedIndexDelivery, ESPMode::ThreadSafe>;
+using FVoxelBrickIndexPreflight = TFunction<FVoxelBrickPreparedIndexDeliveryRef(const FVoxelBrickIndexDelta&)>;
+
 // --- P1 (voxel.GPU.PoolAlloc): the GPU allocator's layout --------------------
 //
 // Computed ONCE by FVoxelBrickPool::Init when the switch is armed, then bound to
@@ -778,7 +793,8 @@ public:
 	// and the deltas are the tail.
 	//
 	// Pass a null sink to detach. The snapshot is filled either way.
-	void SetIndexSink(FVoxelBrickIndexSink InSink, TArray<FVoxelBrickIndexEntry>& OutSnapshot);
+	void SetIndexSink(FVoxelBrickIndexSink InSink, TArray<FVoxelBrickIndexEntry>& OutSnapshot,
+        FVoxelBrickIndexPreflight InPreflight = {});
 
 	// The resident set, as index entries. GAME THREAD ONLY. O(resident).
 	void SnapshotResidentIndex(TArray<FVoxelBrickIndexEntry>& Out) const;
@@ -918,6 +934,7 @@ public:
 	// Reserves the complete batch without eviction, then replaces it in one
 	// Flush. False changes no visible pages. Currently the CPU arena allocator
 	// is required; GPU-allocator reservation needs its own verified batch path.
+    // Requires an installed index preflight contract; legacy-only sinks refuse.
 	bool PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages,
         FVoxelBrickEvictionPinTicket Ticket = {});
     // GT only, bounded to 8192 total unique keys and 16 live tickets. Absent
@@ -1464,6 +1481,10 @@ private:
 	// you land on against the key you looked up -- the record carries its own
 	// OriginVoxel and ring level, in the cache line the lookup already fetched.
 	FVoxelBrickIndexSink IndexSink;
+    FVoxelBrickIndexPreflight IndexPreflight;
+    uint64 IndexSinkGeneration=0;
+    uint64 IndexMutationSequence=0;
+    void FlushWithPreparedIndex(FVoxelBrickPreparedIndexDeliveryRef Delivery);
 	// Retirements queued since the last flush, in lockstep with PendingClears.
 	// Kept as its own array rather than by widening PendingClears because that
 	// array is handed to the render thread as a plain slot list and the index

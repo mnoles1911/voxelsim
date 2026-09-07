@@ -1,5 +1,6 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "VoxelBrickPool.h"
+#include "VoxelPreparedIndexTestSupport.h"
 #include "Misc/AutomationTest.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelBrickAllocationTokenTest,
@@ -17,7 +18,7 @@ bool FVoxelBrickAllocationTokenTest::RunTest(const FString&)
     FVoxelBrickPoolConfig Config;Config.ChunkCapacity=3;Config.OccWordCapacity=1024;Config.MatWordCapacity=1024;Pool.Init(Config);
     int32 Publications=0;
     TArray<FVoxelBrickIndexEntry> Initial;
-    Pool.SetIndexSink([&](const auto&){++Publications;},Initial);
+    VoxelPreparedIndexTestSupport::SetSink(Pool,[&](const auto&){++Publications;},Initial);
     auto Air=MakeShared<FVoxelBrickCpuPack,ESPMode::ThreadSafe>();Air->Desc.SetNumZeroed(128);
     auto Replacement=[&](const FVoxelBrickAllocationToken& Token){
         FVoxelBrickPreparedReplacement Page;Page.Key=Key;Page.ExpectedSlot=Token.Slot;Page.ExpectedSequence=Token.AddSequence;Page.CpuPack=Air;
