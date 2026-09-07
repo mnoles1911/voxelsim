@@ -72,6 +72,8 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--length-m', type=float, required=True)
     parser.add_argument('--long-axis', type=int, choices=(0, 2), required=True)
+    parser.add_argument('--fill-union', action='store_true',
+                        help='Fill the combined shell of scans split across mesh chunks')
     args = parser.parse_args()
     if args.length_m <= 0:
         parser.error('length must be positive')
@@ -83,6 +85,10 @@ def main():
         transform, name = scene.graph[node]
         mesh = scene.geometry[name].copy()
         mesh.apply_transform(transform)
+        mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.remove_unreferenced_vertices()
+        if not len(mesh.faces):
+            continue
         meshes.append(mesh)
     vertices = np.vstack([m.vertices for m in meshes])
     lo, hi = vertices.min(0), vertices.max(0)
@@ -99,6 +105,9 @@ def main():
         raise ValueError('Research allocation exceeds 32 million cells')
     occupied = np.zeros(shape, bool)
     occupied[tuple((cells-lower).T)] = True
+    if args.fill_union:
+        occupied = ndimage.binary_fill_holes(occupied)
+        cells = np.argwhere(occupied).astype(np.int32) + lower
     labels, _ = ndimage.label(occupied)
     components = sorted(np.bincount(labels.ravel())[1:].tolist(), reverse=True)
     surface = occupied & ~ndimage.binary_erosion(occupied)
@@ -140,7 +149,7 @@ def main():
     np.savez_compressed(args.output/'surface-appearance.npz', cells=indices+lower,
                         rgb=rgb, occupied_cells=cells, voxel_m=pitch)
     write_views(args.output, cells, indices+lower, rgb, pitch)
-    report = dict(source=args.source.name,
+    report = dict(source=args.source.name, fill_union=args.fill_union,
         source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
         scale_assumption='Total source bounding length, including tail; not a measured specimen',
         length_m=args.length_m, pitch_m=pitch, occupied_voxels=len(cells),

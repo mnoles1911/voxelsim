@@ -5,14 +5,19 @@
     {
       "id": "grey-wolf",
       "scientific_name": "Canis lupus",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "static_model_accepted_by_user",
+      "visual_approved": true,
+      "library_entry": "grey_wolf_anatomy_pilot-0001",
+      "runtime_ready": false,
+      "commit": "2befc8f"
     },
     {
       "id": "bengal-tiger",
       "scientific_name": "Panthera tigris tigris",
-      "status": "reference_and_candidate_work",
-      "visual_approved": false
+      "status": "saved_static_candidate_remaining_anatomy_review",
+      "visual_approved": false,
+      "library_entry": "bengal_tiger_anatomy_pilot-0001",
+      "runtime_ready": false
     },
     {
       "id": "red-deer-stag",
@@ -23,13 +28,13 @@
     {
       "id": "common-raven",
       "scientific_name": "Corvus corax",
-      "status": "reference_and_candidate_work",
+      "status": "museum_master_perch_removal_study",
       "visual_approved": false
     },
     {
       "id": "golden-eagle",
       "scientific_name": "Aquila chrysaetos",
-      "status": "reference_and_candidate_work",
+      "status": "museum_master_inspection",
       "visual_approved": false
     },
     {
