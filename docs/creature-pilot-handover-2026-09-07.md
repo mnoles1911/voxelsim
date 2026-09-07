@@ -1,3 +1,42 @@
+# Creature reconstruction pilot handover
+
+## Current checkpoint: all eight static pilots delivered
+
+Review: http://127.0.0.1:8731/static/pilot-review.html (also linked from the Forge header).
+All eight are saved in the library and exposed in the Forge dropdown as imported models.
+The desktop shortcut targets port 8731 and refreshes a verified stale Forge server.
+Use the launcher to inspect the current fingerprint; historical PIDs below are obsolete.
+
+Wolf appearance is user accepted. Tiger, red deer stag, common raven, golden eagle,
+rainbow trout, great white shark and orca are complete static candidates awaiting set review.
+Do not expand to other animals before review. No Tripo work or goblins.
+
+`asset-forge/refs/reconstruction/pilot-manifest.json` is the authoritative model list.
+`pilot-validation.json` records all eight exact RGB payload / surface / connected-component
+checks. Each species has attribution and a review note with biological references,
+interpretations and limits. Models are 12.5 mm cubes; not rigged or runtime-ready.
+
+Important interpretation limits: generic tiger/deer source taxonomy is not measured;
+bird feet were reconstructed after removing fused specimen perches; eagle plumage
+is immature; trout was scaled to a large game fish and markings are simplified.
+The source meshes are visual foundations, not certified anatomical measurements.
+
+New reusable steps: explicit scale and heading; both-hemisphere source inspection;
+optional combined-shell fill; texture-footprint sampling or constant-material fast path;
+authored RGB; six orthographic and six oblique views; validated draft installation.
+Tools and per-species review notes retain study names for reproduction. Source hashes
+and CC BY/CC0 licenses live beside each saved asset. Cached original GLBs remain in
+ignored out/creature-reconstruction/source-meshes, retrievable by source ID.
+
+UI fixes: appearance approval is separate from Export to game. Imported assets cannot
+be procedurally regenerated/overwritten. The original reported Publish error was not
+captured; game export has four stale environment banks in the last read-only diagnostic
+(black-coral-tree, bramble-thicket, carnation-soft-coral, cold-water-coral). This is not
+an appearance-review failure. Do not bulk publish or change other sessions' environment
+assets. Hundreds of baseline spec approvals and UE water/UI edits belong to other work.
+
+## Historical checkpoints (superseded)
+
 # Creature reconstruction pilot checkpoint
 
 ## Active checkpoint: accepted wolf, seven remaining pilots

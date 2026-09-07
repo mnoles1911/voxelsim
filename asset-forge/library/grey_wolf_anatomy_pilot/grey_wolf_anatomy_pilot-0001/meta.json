@@ -5,7 +5,7 @@
   "seed": 1,
   "imported": true,
   "source_format": "reference mesh; authored coat",
-  "spec_hash": "3038041071b74645",
+  "spec_hash": "d310c1233aabc9a9",
   "stats": {
     "height_m": 0.95,
     "voxels": 69525
@@ -16,5 +16,13 @@
   "static_model_complete": true,
   "runtime_ready": false,
   "animation": "not rigged",
-  "voxel_mm": 12.5
+  "voxel_mm": 12.5,
+  "review_status": "appearance_approved",
+  "visual_approved": true,
+  "dimensions_m": [
+    1.675,
+    0.3375,
+    0.9500000000000001
+  ],
+  "review_limitations": "User accepted the static appearance; no rig or animation is included."
 }

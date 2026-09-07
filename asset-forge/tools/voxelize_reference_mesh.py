@@ -116,11 +116,27 @@ def main():
     rgb = np.full((len(points), 3), 127, np.uint8)
     best = np.full(len(points), np.inf)
     textured = []
+    constant_colors = []
     for mesh in meshes:
+        if mesh.visual.kind != 'texture':
+            break
+        color = np.asarray(mesh.visual.material.to_color(np.zeros((1, 2))))
+        if color.ndim != 1:
+            break
+        constant_colors.append(color[:3])
+    uniform_color = (len(constant_colors) == len(meshes) and
+                     all(np.array_equal(c, constant_colors[0]) for c in constant_colors))
+    if uniform_color:
+        rgb[:] = constant_colors[0]
+        textured = [False] * len(meshes)
+    for mesh in ([] if uniform_color else meshes):
         visual = mesh.visual
         textured.append(visual.kind == 'texture')
-        for begin in range(0, len(points), 2048):
-            end = min(begin + 2048, len(points))
+        # Dense sculpt meshes produce many candidate triangles per query;
+        # keep proximity batches bounded to avoid multi-gigabyte temporaries.
+        batch_size = 128 if len(mesh.faces) > 50000 else 2048
+        for begin in range(0, len(points), batch_size):
+            end = min(begin + batch_size, len(points))
             closest, distance, triangles = trimesh.proximity.closest_point(mesh, points[begin:end])
             replace = distance < best[begin:end]
             if not np.any(replace):
@@ -136,7 +152,12 @@ def main():
                     bary = np.clip(bary, 0, 1)
                     bary /= np.maximum(bary.sum(1, keepdims=True), 1e-12)
                     uv = (visual.uv[mesh.faces[triangles]] * bary[:, :, None]).sum(1)
-                    color = visual.material.to_color(uv)[:, :3].astype(float)/255
+                    material_color = np.asarray(visual.material.to_color(uv))
+                    # Untextured PBR materials with UVs return one constant
+                    # RGBA value rather than one value per requested sample.
+                    if material_color.ndim == 1:
+                        material_color = np.broadcast_to(material_color, (len(uv), len(material_color)))
+                    color = material_color[:, :3].astype(float)/255
                     samples.append(np.where(color <= .04045, color/12.92, ((color+.055)/1.055)**2.4))
                 linear = np.mean(samples, axis=0)
                 sampled = np.clip(np.where(linear <= .0031308, linear*12.92,
@@ -154,7 +175,8 @@ def main():
         scale_assumption='Total source bounding length, including tail; not a measured specimen',
         length_m=args.length_m, pitch_m=pitch, occupied_voxels=len(cells),
         surface_voxels=len(indices), components=components, textured_meshes=textured,
-        color_sampling='Seven-point linear-light texture footprint approximation',
+        color_sampling=('Constant material RGB' if uniform_color else
+                        'Seven-point linear-light texture footprint approximation'),
         visual_approved=False, runtime_ready=False,
         limitations=['Static bind-pose geometry; no animation or skinning transfer',
                     'All source objects included; inspect for context objects and alpha cards',

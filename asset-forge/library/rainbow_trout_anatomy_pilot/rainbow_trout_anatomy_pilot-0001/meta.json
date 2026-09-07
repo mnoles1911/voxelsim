@@ -1,0 +1,33 @@
+{
+  "id": "rainbow_trout_anatomy_pilot-0001",
+  "species": "rainbow_trout_anatomy_pilot",
+  "kind": "fish",
+  "seed": 1,
+  "imported": true,
+  "source_format": "reviewed reference mesh; RGB voxel study",
+  "spec_hash": "5bedd9a2cb9469fa",
+  "stats": {
+    "height_m": 0.225,
+    "voxels": 2334
+  },
+  "problems": [],
+  "vox_models": 1,
+  "static_model_complete": true,
+  "review_status": "ready_for_set_review",
+  "visual_approved": false,
+  "runtime_ready": false,
+  "animation": "not rigged",
+  "appearance": "RGB surface sidecar",
+  "voxel_mm": 12.5,
+  "dimensions_m": [
+    0.6625000000000001,
+    0.15000000000000002,
+    0.225
+  ],
+  "validation": [
+    "one connected component",
+    "VXA roundtrip",
+    "RGB payload byte equality"
+  ],
+  "review_limitations": "Scaled uniformly to a large 0.65 m game fish, not the original specimen size. At about 52 voxels long, spots and eye details are deliberately simplified."
+}

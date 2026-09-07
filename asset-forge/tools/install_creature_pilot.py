@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('study', type=Path)
     parser.add_argument('name')
-    parser.add_argument('kind', choices=['quadruped', 'bird', 'fish'])
+    parser.add_argument('kind', choices=['quadruped', 'bird', 'fish', 'cetacean'])
     parser.add_argument('attribution', type=Path)
     args = parser.parse_args()
     if not args.name.replace('_', '').isalnum():
@@ -66,7 +66,7 @@ def main():
     # Imported geometry supplies the dimensions; procedural defaults do not.
     for path in [dest / 'spec.json', server.SPECS / (args.name + '.json')]:
         spec = json.loads(path.read_text(encoding='utf8'))
-        key = {'quadruped': 'quad', 'bird': 'bird', 'fish': 'fish'}[args.kind]
+        key = {'quadruped': 'quad', 'bird': 'bird', 'fish': 'fish', 'cetacean': 'fish'}[args.kind]
         spec[key]['length_m'] = float(grid.shape[0]*pitch)
         spec['curation'] = dict(status='draft', seeds=[1], notes='Pilot candidate awaiting set review')
         specmod.save(spec, path)

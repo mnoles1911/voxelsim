@@ -1,3 +1,15 @@
+# Bird pilot completed checkpoint
+
+Both CC0 museum birds are now saved as 12.5 mm static candidates. See common-raven/review.md
+and golden-eagle/review.md for final limits. The fused perches and damaged foot regions
+were removed explicitly. New tools refine_raven_voxels.py and refine_eagle_pilot.py
+reconstruct articulated feet with three forward digits and one hallux. Eagle lower
+legs are feathered to the toes. These are authored reconstructions, not scan-exact feet.
+Expanded oblique review confirms both body hemispheres. No remaining perch fragments
+were accepted. Both saved models pass one-component and exact RGB surface checks.
+
+## Historical source experiments (superseded)
+
 # Bird source checkpoint
 
 ## Common raven: selected study source

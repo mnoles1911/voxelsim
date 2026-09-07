@@ -12,8 +12,8 @@
   },
   "problems": [],
   "vox_models": 1,
-  "static_model_complete": false,
-  "review_status": "pilot_candidate",
+  "static_model_complete": true,
+  "review_status": "ready_for_set_review",
   "visual_approved": false,
   "runtime_ready": false,
   "animation": "not rigged",
@@ -28,5 +28,6 @@
     "one connected component",
     "VXA roundtrip",
     "RGB payload byte equality"
-  ]
+  ],
+  "review_limitations": "The source identifies a tiger, not a verified Bengal specimen. Pose bounds include a raised head and lifted paws; they are not shoulder height."
 }

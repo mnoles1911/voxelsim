@@ -159,6 +159,7 @@ export default function App() {
           </TabButton>
         </nav>
         <div className="ml-auto flex items-center gap-3">
+          <a href="/static/pilot-review.html" className="text-sm text-gold-400 underline">Creature pilot review</a>
           {world && (
             <span className="font-mono text-xs text-parch-500">
               {world.specs.length} species · {world.library.length} kept variants ·{" "}
