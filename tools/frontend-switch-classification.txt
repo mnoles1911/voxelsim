@@ -410,6 +410,10 @@ VoxelEnvironmentLODKeepOpen
 VoxelEnvironmentLODValidate
 VoxelTreeFelling
 
+# Input to VoxelObjectsNetVerify: test-driver barriers for deletion/server exit.
+# Ignored without that fixture driver; this path alone must not skip the menu.
+VoxelObjectsNetGateFile
+
 ## SUBSTRING-MATCHED -- ACKNOWLEDGED
 #
 # Everything below is a switch whose NAME contains one of rule 5's substrings,

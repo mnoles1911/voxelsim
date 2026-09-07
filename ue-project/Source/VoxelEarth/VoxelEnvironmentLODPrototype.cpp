@@ -535,9 +535,13 @@ bool AVoxelEnvironmentLODPrototype::AdvanceStagedObjectRestore(){
     // revision check. An actor remains hidden until Completion accepts it.
     auto Done=MoveTemp(Job->Completion);if(Done)Done(true);return true;
 }
+void AVoxelEnvironmentLODPrototype::MarkUnpublishedPreparation(){
+    check(IsInGameThread());bUnpublishedPreparation=true;
+    SetActorHiddenInGame(true);SetActorEnableCollision(false);SetActorTickEnabled(false);
+}
 bool AVoxelEnvironmentLODPrototype::PublishStagedObjectRestore(){
     check(IsInGameThread());if(!PreparedRestore)return false;
-    PreparedRestore.Reset();Actors.AddUnique(this);SetActorHiddenInGame(false);SetActorEnableCollision(true);SetActorTickEnabled(true);return true;
+    PreparedRestore.Reset();bUnpublishedPreparation=false;Actors.AddUnique(this);SetActorHiddenInGame(false);SetActorEnableCollision(true);SetActorTickEnabled(true);return true;
 }
 void AVoxelEnvironmentLODPrototype::Rebuild() {
     GeometrySnapshot.Reset();

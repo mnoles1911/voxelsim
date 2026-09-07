@@ -5,6 +5,8 @@
 #include "VoxelCheckpointStore.h"
 #include "VoxelSessionCheckpoint.h"
 #include "VoxelEnvironmentLODPrototype.h"
+#include "VoxelProductionCandidatePreparation.h"
+#include "Misc/SecureHash.h"
 
 #include "VoxelChunkComponent.h"
 // MeshChunkBricks + ERingSkirtFace used to live in this file's anonymous
@@ -6443,6 +6445,7 @@ struct FVoxelWorldImpl
 		                                    Tiles.get()))
 		, Voxels(Seed, FineStreamer ? FineStreamer->WorldSampler() : *Tiles)
 	{
+		ProductionProviderHash=FineProviderId;
 		// bUsingTileGrid (declared, and thus constructed via its NSDMI, BEFORE
 		// Tiles below -- member init order follows DECLARATION order, not this
 		// list's order) is already valid by the time MakeTileSampler's
@@ -6523,6 +6526,7 @@ struct FVoxelWorldImpl
 					}
 					else
 					{
+						ProductionCatalogHash=FMD5::HashBytes(Blob.GetData(),Blob.Num());
 						// The fold counts everything it drops, and those counts
 						// are logged rather than summed away: "438 kept" means
 						// nothing without the 382 detail entities beside it.
@@ -6814,6 +6818,11 @@ struct FVoxelWorldImpl
 	// as TileDir and FineTileDir above, deliberately.
 	vxc::AssetManifest AssetManifestData;
 	TWeakObjectPtr<UWorld> EnvironmentObjectWorld;
+	FString ProductionProviderHash,ProductionCatalogHash;
+	VoxelProductionCandidate::FWorkRef ProductionCandidate;
+	std::atomic<int32> ProductionCandidateWorkers{0};
+	void TickProductionCandidate(UWorld* World,const FVector& Anchor);
+	bool ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const;
 	vxc::AssetBankLibrary AssetBanks;
 
 	// THE TALLEST ASSET THAT ACTUALLY EXISTS, in level-0 voxels above its anchor,
@@ -17975,6 +17984,171 @@ static std::vector<vxc::AssetField::ResolvedAssetInstance> VoxelResolveTerrainIn
 		},
 		/*terrainOnly*/ true);
 	return Field->resolveForCompose(Insts);
+}
+
+// Preparation only: no page filtering, registry admission or actor reveal.
+// The two workers borrow Impl inputs and are tracked by InFlightTasks, so the
+// existing teardown barrier outlives every bank/manifest/sampler access.
+bool FVoxelWorldImpl::ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const
+{
+    if(!FineStreamer||ProductionProviderHash.IsEmpty()||ProductionCatalogHash.IsEmpty())return false;
+    int64 Reach=0;
+    for(const auto& Layer:AssetFieldObj.layers())if(Layer.terrainLattice)Reach=FMath::Max(Reach,int64(Layer.maxRadiusMm));
+    if(Reach>64000)return false; // bounded first-pilot resolver footprint
+    return FineStreamer->IsFootprintResident(Rect.vx0*100-Reach,Rect.vy0*100-Reach,Rect.vx1*100+Reach+100,Rect.vy1*100+Reach+100);
+}
+
+void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Anchor)
+{
+    using namespace VoxelProductionCandidate;
+    check(IsInGameThread());
+    const int32 Request=ConsumeRequest(World);
+    if(Request==2){Cancel(ProductionCandidate);UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate CANCELLED"));return;}
+    if(Request==1)
+    {
+        if((ProductionCandidate&&ProductionCandidate->Phase<5)||ProductionCandidateWorkers.load()>0)
+        {
+            UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate busy; preparation remains bounded to one candidate per world"));
+        }
+        else
+        {
+            Cancel(ProductionCandidate);
+            if(!FMath::IsFinite(Anchor.X)||!FMath::IsFinite(Anchor.Y)||FMath::Abs(Anchor.X)>double(int64(1)<<30)*10.||FMath::Abs(Anchor.Y)>double(int64(1)<<30)*10.)return;
+            const int64 X=FMath::FloorToInt64(Anchor.X/10.),Y=FMath::FloorToInt64(Anchor.Y/10.);
+            constexpr int64 MaxAnchor=int64(1)<<30;
+            if(!World||FMath::Abs(X)>MaxAnchor||FMath::Abs(Y)>MaxAnchor)return;
+            const vxc::AssetVoxelRect Rect{X-160,Y-160,X+160,Y+160};
+            if(!ProductionCandidateResident(Rect))
+            {
+                UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: requires resident fine terrain, provider identity and catalog"));return;
+            }
+            auto Work=MakeShared<FWork,ESPMode::ThreadSafe>();ProductionCandidate=Work;
+            Work->Started=FPlatformTime::Seconds();Work->EditEpoch=EditEpoch.load();Work->ResidencyEpoch=FineStreamer->ResidencyEpoch();
+            const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
+            ProductionCandidateWorkers.fetch_add(1);
+            auto Task=UE::Tasks::Launch(TEXT("ProductionCandidateSelect"),[this,Work,Rect,X,Y,Provider,Catalog]()
+            {
+                const auto Resolved=VoxelResolveTerrainInstances(Voxels.generated(),Rect);
+                int64 Best=MAX_int64;
+                if(Resolved.size()<=MaxResolved)for(const auto& Candidate:Resolved)
+                {
+                    if(Work->Cancelled.Load())break;
+                    if(Candidate.bankId>=AssetManifestData.species().size())continue;
+                    const auto& Species=AssetManifestData.species()[Candidate.bankId];
+                    if(!Species.terrainLattice||Species.voxelSizeMm!=100||Candidate.seedIndex>=Species.seedsBaked||uint8(Species.kind)>uint8(vxc::AssetKind::kFlower))continue;
+                    vxc::AssetCandidateBounds Bounds;if(!vxc::assetCandidateBounds(Candidate,Bounds))continue;
+                    const uint64 Cells=uint64(Bounds.x1-Bounds.x0+1)*uint64(Bounds.y1-Bounds.y0+1)*uint64(Bounds.z1-Bounds.z0+1);
+                    const uint64 Columns=uint64(Bounds.x1-Bounds.x0+1)*uint64(Bounds.y1-Bounds.y0+1);
+                    if(Cells>MaxCells||Columns>65536)continue;
+                    const int64 DX=Candidate.anchorVx-X,DY=Candidate.anchorVy-Y;
+                    if(FMath::Abs(DX)>160||FMath::Abs(DY)>160)continue;
+                    const int64 Distance=DX*DX+DY*DY;if(Distance>=Best)continue;
+                    Best=Distance;Work->Candidate=Candidate;Work->Bounds=Bounds;
+                }
+                if(Best!=MAX_int64&&!Work->Cancelled.Load())
+                {
+                    const auto& Candidate=Work->Candidate;const auto& Species=AssetManifestData.species()[Candidate.bankId];
+                    static const TCHAR* Kinds[]={TEXT("tree"),TEXT("bush"),TEXT("rock"),TEXT("grass"),TEXT("reed"),TEXT("flower")};
+                    Work->Descriptor.SpecId=UTF8_TO_TCHAR(Species.name.c_str());Work->Descriptor.Kind=Kinds[uint8(Species.kind)];
+                    Work->Descriptor.Category=TEXT("environment");Work->Descriptor.ProviderHash=Provider;Work->Descriptor.CatalogHash=Catalog;
+                    Work->Descriptor.SeedIndex=Candidate.seedIndex;Work->Descriptor.Fellable=Species.kind==vxc::AssetKind::kTree;
+                    Work->CanonicalSourceHash=GridContentHash(*Candidate.grid);
+                    // Bind both manifest and canonical bank content; a bank-only
+                    // replacement must not inherit ownership of the old source.
+                    Work->Provenance={Voxels.amplifier().seed(),Fingerprint(Provider+FString::Printf(TEXT(":worldgen:%u"),vxc::kWorldGenVersion)),Fingerprint(Catalog+TEXT(":")+Work->CanonicalSourceHash),
+                        Candidate.anchorVx,Candidate.anchorVy,Candidate.anchorVz,Candidate.bankId,Candidate.seedIndex,Candidate.layer,Candidate.yawQuarter};
+                    Work->Success=EnumeratePages(Work->Bounds,VoxelCoords::kNumLevels,Work->Pages);
+                }
+                if(!Work->Success)Work->Error=TEXT("no bounded canonical 100 mm environment candidate within 16 m");
+                Work->WorkerReady.Store(true);
+                ProductionCandidateWorkers.fetch_sub(1);
+            },UE::Tasks::ETaskPriority::BackgroundLow);
+            InFlightTasks.Add(MoveTemp(Task));
+            UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate selecting canonical source near player (preparation only)"));
+        }
+    }
+    auto Work=ProductionCandidate;if(!Work)return;
+    const auto Refuse=[&](const TCHAR* Why){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: %s"),Why);Cancel(ProductionCandidate);};
+    if(!FineStreamer||!IsCurrent(*Work,EditEpoch.load(),FineStreamer->ResidencyEpoch())){Refuse(TEXT("cancelled or edit/residency epoch changed"));return;}
+    if(FPlatformTime::Seconds()-Work->Started>90.){Refuse(TEXT("90-second preparation/retention limit"));return;}
+    if(Work->Phase==0)
+    {
+        if(!Work->WorkerReady.Load())return;
+        if(!Work->Success){Refuse(*Work->Error);return;}
+        Work->Phase=1;Work->PageCursor=0;
+    }
+    const vxc::AssetVoxelRect FullRect{Work->Bounds.x0,Work->Bounds.y0,Work->Bounds.x1,Work->Bounds.y1};
+    if(!ProductionCandidateResident(FullRect)){Refuse(TEXT("complete canonical source footprint is not resident"));return;}
+    if(Work->Phase==1||Work->Phase==3)
+    {
+        // Complete geometric page superset, not just pages visible this frame.
+        // Inspect at most 64 keys per tick; current state is diagnostic only.
+        const int32 Stop=FMath::Min(Work->PageCursor+64,int32(Work->Pages.size()));
+        for(;Work->PageCursor<Stop;++Work->PageCursor)
+        {
+            const auto& P=Work->Pages[Work->PageCursor];
+            const VoxelCoords::FVoxelLevelChunkKey Key{int32(P.level),{int32(P.x),int32(P.y),int32(P.z)}};
+            if(P.level==0&&ChunkHasEditedBrick(Key.Key)){Refuse(TEXT("edited/crafted terrain overlaps candidate or apron"));return;}
+            if(Work->Phase==3)
+            {
+                if(const auto* Record=ChunkRecords.Find(Key)){if(Record->HoldsTerrain(Key))++Work->VisiblePages;else ++Work->PendingPages;}
+                if(ParkedGeometry.Contains(Key))++Work->ParkedPages;
+                if(SpeculativeInFlight.Contains(Key))++Work->PendingPages;
+            }
+        }
+        if(Work->PageCursor<int32(Work->Pages.size()))return;
+        if(Work->Phase==1)
+        {
+            Work->Phase=2;Work->WorkerReady.Store(false);Work->Success=false;
+            ProductionCandidateWorkers.fetch_add(1);
+            auto Task=UE::Tasks::Launch(TEXT("ProductionCandidateClip"),[this,Work,FullRect]()
+            {
+                const auto Ordered=VoxelResolveTerrainInstances(Voxels.generated(),FullRect);
+                size_t Selected=Ordered.size();
+                if(Ordered.size()<=MaxResolved)for(size_t I=0;I<Ordered.size();++I)
+                {
+                    const auto& A=Ordered[I];const auto& B=Work->Candidate;
+                    if(A.grid==B.grid&&A.anchorVx==B.anchorVx&&A.anchorVy==B.anchorVy&&A.anchorVz==B.anchorVz&&A.yawQuarter==B.yawQuarter&&A.layer==B.layer&&A.bankId==B.bankId&&A.seedIndex==B.seedIndex){Selected=I;break;}
+                }
+                std::vector<uint8> Vxa;
+                if(Selected<Ordered.size()&&!Work->Cancelled.Load())
+                    Work->Success=vxc::assetBuildCandidateVxa(Ordered,Selected,[this](int64 X,int64 Y){return Voxels.amplifier().column(X,Y);},Vxa,MaxCells,32u*1024*1024)
+                        &&BuildImmutableSnapshot(*Work,Vxa);
+                if(!Work->Success)Work->Error=TEXT("full-footprint composition clipping or bounded immutable snapshot failed");
+                Work->WorkerReady.Store(true);
+                ProductionCandidateWorkers.fetch_sub(1);
+            },UE::Tasks::ETaskPriority::BackgroundLow);
+            InFlightTasks.Add(MoveTemp(Task));return;
+        }
+        // Explicit preparation status excludes this actor from persistence
+        // discovery before any staged component is uploaded. Publication
+        // clears that status, but this preparation path never publishes.
+        auto Actor=World->SpawnActor<AVoxelEnvironmentLODPrototype>();
+        if(!Actor){Refuse(TEXT("hidden actor spawn failed"));return;}
+        Actor->MarkUnpublishedPreparation();
+        Work->Actor=Actor;Work->Phase=4;
+        Actor->BeginStagedObjectRestore(Work->Geometry,MoveTemp(Work->Dynamic),[Work](bool Valid){Work->ActorDone=true;Work->ActorValid=Valid;});
+    }
+    if(Work->Phase==2)
+    {
+        if(!Work->WorkerReady.Load())return;
+        if(!Work->Success){Refuse(*Work->Error);return;}
+        Work->Phase=3;Work->PageCursor=0;return;
+    }
+    if(Work->Phase>=4&&!Work->Actor.IsValid()){Refuse(TEXT("prepared actor was destroyed"));return;}
+    if(Work->Phase==4)
+    {
+        auto Actor=Work->Actor.Get();if(!Actor){Refuse(TEXT("prepared actor was destroyed"));return;}
+        Actor->AdvanceStagedObjectRestore(); // at most one component upload per tick
+        if(Work->ActorDone)
+        {
+            if(!Work->ActorValid){Refuse(TEXT("staged actor preparation failed"));return;}
+            Work->Phase=5;
+            const auto Id=vxc::assetObjectId(Work->Provenance);
+            UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate PREPARED HIDDEN spec=%s id=%016llx%016llx yaw=%u source=%s clipped=%s pages=%d visible=%d pending=%d parked=%d; publicationReady=0"),
+                *Work->Descriptor.SpecId,Id.high,Id.low,uint32(Work->Provenance.yawQuarter),*Work->CanonicalSourceHash,*Work->ClippedGeometryHash,int32(Work->Pages.size()),Work->VisiblePages,Work->PendingPages,Work->ParkedPages);
+        }
+    }
 }
 
 // The rect a (Level, ChunkX, ChunkY) footprint resolves over. ONE derivation,
@@ -31347,6 +31521,8 @@ void UVoxelWorldSubsystem::Deinitialize()
 	{
 		// Worker jobs hold raw pointers into Impl-owned data (DispatchJobs);
 		// block until every in-flight job has finished before freeing it.
+		VoxelProductionCandidate::Cancel(Impl->ProductionCandidate);
+		VoxelProductionCandidate::ForgetWorld(GetWorld());
 		Impl->WaitForInFlightTasks();
 
 		// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): autosave-on-
@@ -31830,6 +32006,7 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 	Impl->SetStreamViewDir(ViewDirXY);
 
 	Impl->TickStreaming(Anchor, *ChunkOwner, *ChunkRoot, ChunkMaterial, DeltaTime);
+	Impl->TickProductionCandidate(GetWorld(),Anchor);
 
 	TickCavernShot(DeltaTime);
 }

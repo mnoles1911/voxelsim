@@ -28,6 +28,11 @@ public:
     void BeginStagedObjectRestore(FVoxelImmutableGeometry Geometry,TArray<uint8> Dynamic,TFunction<void(bool)> Completion);
     bool AdvanceStagedObjectRestore();
     bool PublishStagedObjectRestore();
+    // Explicit production preparation status, independent of rendering visibility.
+    // Retained on cancellation; only publication clears it. Persistence discovery
+    // must not bind actors that are not yet authoritative world objects.
+    void MarkUnpublishedPreparation();
+    bool IsUnpublishedPreparation() const { return bUnpublishedPreparation; }
     void CancelStagedObjectRestore();
     bool RestoreObjectState(const TSharedPtr<const TArray<uint8>,ESPMode::ThreadSafe>& Geometry,const TArray<uint8>& Dynamic) {
         if(!Geometry||!RestoreObjectState(*Geometry,Dynamic))return false;
@@ -51,6 +56,7 @@ public:
     UPROPERTY(Transient) TArray<TObjectPtr<UStaticMeshComponent>> Levels;
     UPROPERTY(Transient) TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
 private:
+    bool bUnpublishedPreparation=false;
     FVoxelEnvironmentAssetDescriptor SourceDescriptor;
     bool RefreshGeometrySnapshot();
     FVoxelImmutableGeometry GeometrySnapshot;
