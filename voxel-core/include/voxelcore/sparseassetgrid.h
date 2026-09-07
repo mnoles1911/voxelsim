@@ -188,4 +188,9 @@ private:
             auto node=staged.extract(staged.begin());auto old=chunks_.find(node.key());
             if(empty(node.mapped())){if(old!=chunks_.end())chunks_.erase(old);}
             else if(old!=chunks_.end())old->second=node.mapped();
-            else chunks_.insert(std::m
+            else chunks_.insert(std::move(node));
+        }
+        return Result::Ok;
+    }
+};
+} // namespace vxc

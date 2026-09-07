@@ -30,11 +30,32 @@ def plant_record(record):
     transform=r.unpack('10d')
     size=r.unpack('3i'); origin=r.unpack('3i'); mm,max_z,collision,severed=r.unpack('diII')
     assert all(map(math.isfinite,transform))
-    assert all(0<n<=4096 for n in size) and math.prod(size)<=64*1024**2
+    assert all(0<n<=16384 for n in size)
     assert all(abs(n)<=1000000 for n in origin) and mm in (25,50,100)
     assert 0<=max_z<=size[2] or max_z==2147483647
     assert collision in (0,1) and severed in (0,1)
-    grid=r.bytes(64*1024**2); assert len(grid)==math.prod(size); r.done()
+    grid_start=r.offset
+    marker,=r.unpack('i')
+    if marker>=0:
+        assert all(n<=4096 for n in size) and marker==math.prod(size) and marker<=64*1024**2
+        grid=r.take(marker)
+    else:
+        assert marker==-1, 'Unknown sparse grid marker'
+        schema,count=r.unpack('Ii'); assert schema==1 and 0<=count<=131072
+        previous=None
+        for _ in range(count):
+            key=r.unpack('3i')
+            assert all(0<=key[a]<(size[a]+7)//8 for a in range(3))
+            assert previous is None or previous<key, 'Duplicate or unsorted sparse chunk'
+            previous=key
+            cells=r.take(512); assert any(cells), 'Empty sparse chunk'
+            for i,material in enumerate(cells):
+                if material:
+                    assert key[0]*8+i%8<size[0] and key[1]*8+(i//8)%8<size[1] and key[2]*8+i//64<size[2], 'Non-air sparse padding'
+        # Hash encoded sparse storage; this is a byte-preservation check, not
+        # a semantic equality comparison against a re-encoded legacy grid.
+        grid=record[grid_start:r.offset]
+    r.done()
     return name,hashlib.sha256(record).hexdigest(),hashlib.sha256(grid).hexdigest()
 
 def snapshot(terrain_path, expected_kinds=(1,2,2,3,3,3,3)):

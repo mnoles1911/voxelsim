@@ -1,4 +1,5 @@
 #include "VoxelWorldSubsystem.h"
+#include "VoxelTreeFellingPrototype.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelSaveJobs.h"
 #include "VoxelEnvironmentLODPrototype.h"
@@ -6810,6 +6811,7 @@ struct FVoxelWorldImpl
 	// cannot move a single voxel on any existing run -- the same opt-in shape
 	// as TileDir and FineTileDir above, deliberately.
 	vxc::AssetManifest AssetManifestData;
+	TWeakObjectPtr<UWorld> EnvironmentObjectWorld;
 	vxc::AssetBankLibrary AssetBanks;
 
 	// THE TALLEST ASSET THAT ACTUALLY EXISTS, in level-0 voxels above its anchor,
@@ -29276,6 +29278,11 @@ bool FVoxelWorldImpl::NeedsOverlayAwarePath(const VoxelCoords::FVoxelLevelChunkK
 
 void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
 {
+	if(LevelKey.Level==0)if(auto World=EnvironmentObjectWorld.Get()){
+		const FVector Min=VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key,0);
+		const double Edge=VoxelCoords::ChunkEdgeVoxels*10.;
+		VoxelTreeFelling::NotifyTerrainEdited(World,FBox(Min,Min+FVector(Edge)));
+	}
 	// M2 wave 2: generalized from a level-0-only helper (wave 1) to any
 	// level -- see the doc comment on the declaration. Level-0 callers
 	// (ApplyGroupedEdits, below) and level>=1 callers (PropagateEditToMips)
@@ -31254,6 +31261,7 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     }
 	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes,
 	                                   FineRingRadius);
+	Impl->EnvironmentObjectWorld=GetWorld();
 }
 
 bool UVoxelWorldSubsystem::InstallWaterMarker(vxc::IWaterSampler* Sampler, bool bIncludeOcean)

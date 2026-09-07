@@ -27,4 +27,9 @@ bool FVoxelTimberGroundBounds::RunTest(const FString&){
         TestFalse(TEXT("repeated terrain invalidation keeps unsupported body frozen"),Timber->Body->IsSimulatingPhysics());
         const FVector Before=Timber->GetActorLocation();Timber->Tick(1);
         TestTrue(TEXT("waiting does not move body"),Timber->GetActorLocation().Equals(Before));
-        TestFalse(TEXT("invalid box rejected"),VoxelTreeFelling::AdvanceRestoreGround(Wo
+        TestFalse(TEXT("invalid box rejected"),VoxelTreeFelling::AdvanceRestoreGround(World,FBox(ForceInit)));
+        TestFalse(TEXT("excessive footprint rejected without allocation"),VoxelTreeFelling::AdvanceRestoreGround(World,FBox(FVector(-1e7),FVector(1e7))));
+    }
+    VoxelObjects::Forget(World);World->DestroyWorld(false);return true;
+}
+#endif

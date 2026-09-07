@@ -23,4 +23,10 @@ Outer split geometry/dynamic snapshot version remains 1. Dynamic metadata still 
 1. `int32 -1`, `uint32 schema = 1`, `int32 chunkCount`.
 2. For each chunk in strict lexicographic X/Y/Z order: three `int32` local chunk coordinates followed by 512 material bytes indexed `x + 8*y + 64*z`.
 
-The decoder rejects unsupported versions, count/budget overflow, truncation, duplicate or unordered chunks, empty chunks, unknown material IDs, and occupied padding outside the logical shape. Reads are transactional. A nonnegative initial int32 is the old d
+The decoder rejects unsupported versions, count/budget overflow, truncation, duplicate or unordered chunks, empty chunks, unknown material IDs, and occupied padding outside the logical shape. Reads are transactional. A nonnegative initial int32 is the old dense byte count; that legacy body retains the 64 MiB limit and Z-fastest indexing `(x*sizeY+y)*sizeZ+z`. Legacy dense bytes are streamed through a 512-byte buffer into sparse storage, then checked against the current sparse admission budgets. No dense allocation is required. New saves use only sparse bodies and omit derived LODs.
+
+## Validation and remaining checks
+
+Both focused core targets (`vxc_sparseassetgrid_tests` and `vxc_sparseassetgrid_noexceptions_tests`) pass, covering huge logical bounds, negative/limit origins, box/runs/reclamation, atomic budget failure, and reduction against dense reference policies. The no-exception target explicitly compiles with exception handling disabled. Log: `Saved/sparse-asset-grid-core-tests.log`.
+
+`Voxel.Objects.EnvironmentSparseCodec` adds UE automation coverage for a 1,200-cubed logical grid, compact wire size, exact sparse roundtrip, signed origin lookup, upper reclamation, failed decode preserving data, and legacy dense compatibility. Its UE build/runtime verification is coordinated separately. Current VXA import still visits the source's XY column directory; cancellation is checked between staging phases/sections, not every chunk. The dedicated actor remains the integration surface; ordinary generated terrain assets are not automatically migrated.
