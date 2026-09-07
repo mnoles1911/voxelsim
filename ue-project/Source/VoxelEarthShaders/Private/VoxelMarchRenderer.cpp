@@ -8,6 +8,7 @@
 // built by hand rather than through a mesh pass.
 
 #include "VoxelMarchRenderer.h"
+#include "VoxelSurfaceLighting.h"
 
 #include <atomic>
 
@@ -1213,10 +1214,7 @@ TEXT("voxel.March.SkyLadder"), 0,
 	// would keep day-lighting the terrain all night. This is the marcher-side
 	// analog of VS driving shadowIntensity down at low sun.
 	float VoxelMarchVSDuskFade(float DirToSunZ)
-	{
-		const float T = FMath::Clamp((DirToSunZ + 0.02f) / 0.17f, 0.0f, 1.0f);
-		return T * T * (3.0f - 2.0f * T);
-	}
+	{ return VoxelSurfaceLighting::DuskFade(DirToSunZ); }
 
 	// How engaged the wrap is right now, [0..1]: 0 when the master is off or
 	// no sun was ever published, else the dusk fade. ONE derivation, because
@@ -1284,48 +1282,10 @@ TEXT("voxel.March.SkyLadder"), 0,
 	// owner tunes it by eye like every other appearance knob in this project.
 	FVector4f MakeMarchAmbient()
 	{
-		float Intensity = FMath::Max(CVarVoxelMarchAmbientIntensity.GetValueOnRenderThread(), 0.0f);
-		// THE COUPLING TO THE SUN WRAP, stated because two knobs that secretly
-		// sum are how a ladder stops meaning anything: the 1.5 default exists
-		// partly BECAUSE an anti-sun face otherwise read as a hole, and the
-		// wrap floor now delivers sun-proportional light to every face -- so
-		// the flat ambient hands exactly that share of its job over:
-		//
-		//     Intensity *= 1 - SunWrapFloor * engagement
-		//
-		// At the defaults that is 1.5 * (1 - 0.34) ~= 1.0 -- the ambient back
-		// at its honest interreflection scale while the wrap carries the
-		// directional lift. Engagement is 0 with the arm off, with no sun
-		// published, and at night (dusk fade), so the off arm and the night
-		// frame keep the owner's tuned 1.5 EXACTLY.
-		{
-			const float WrapFloor =
-				FMath::Clamp(CVarVoxelMarchSunWrapFloor.GetValueOnRenderThread(), 0.0f, 0.95f);
-			Intensity *= 1.0f - WrapFloor * VoxelMarchVSWrapEngagement();
-		}
-		const float GroundMix = FMath::Clamp(CVarVoxelMarchAmbientGroundMix.GetValueOnRenderThread(), 0.0f, 1.0f);
-		// THE SKY TINT. Slightly cool, because a clear sky is: 1.00/1.04/1.12
-		// normalised so that intensity means what it says at the zenith rather
-		// than being scaled by whatever tint is chosen.
-		//
-		// SINCE PHASE L2 IT IS NO LONGER A CONSTANT WHEN A SKY IS DRIVING IT.
-		// The comment above this function still stands about WHY it is not the
-		// SkyLight -- that light is captured in fog and its arms are a measured
-		// null -- but "a neutral constant is honest about being a stand-in" was
-		// only ever true while nothing better existed. UVoxelSkySubsystem now
-		// samples an authored day-night ramp off the sun's elevation and
-		// publishes the result (VoxelMarchPublishSunColour), so the stand-in is
-		// replaced rather than multiplied: this is one tint, from one place.
-		//
-		// MULTIPLYING would double-count, and visibly -- the ramp's noon row IS
-		// 1.00/1.04/1.12, so a product would square the coolness at exactly the
-		// hour every archived capture was taken at. Replacement also makes the
-		// noon frame byte-identical to the pre-L2 renderer, which is a property
-		// worth having when the owner judges dawn/noon/dusk side by side: the
-		// noon plate is the control.
-		const FVoxelMarchVSColours Colours = MakeMarchVSColours();
-		return FVector4f(Colours.Ambient.X * Intensity, Colours.Ambient.Y * Intensity,
-		                 Colours.Ambient.Z * Intensity, GroundMix);
+		const auto Colours=MakeMarchVSColours();
+		return VoxelSurfaceLighting::Ambient(CVarVoxelMarchAmbientIntensity.GetValueOnRenderThread(),
+		    CVarVoxelMarchAmbientGroundMix.GetValueOnRenderThread(),CVarVoxelMarchSunWrapFloor.GetValueOnRenderThread(),
+		    VoxelMarchVSWrapEngagement(),Colours.Ambient);
 	}
 
 	// The wrap's two uniforms, derived in ONE place for the same reason the
@@ -1373,21 +1333,14 @@ TEXT("voxel.March.SkyLadder"), 0,
 			}
 			return Off;
 		}
-		const FVector3f DirToSun(GVSSunDirX.load(), GVSSunDirY.load(), GVSSunDirZ.load());
-		const float WrapFloor =
-			FMath::Clamp(CVarVoxelMarchSunWrapFloor.GetValueOnRenderThread(), 0.0f, 0.95f);
-		const float SkyBoost =
-			FMath::Clamp(CVarVoxelMarchSkyBoost.GetValueOnRenderThread(), 0.0f, 2.0f);
-		const float Gain =
-			FMath::Max(CVarVoxelMarchSunWrapGain.GetValueOnRenderThread(), 0.0f) *
-			VoxelMarchVSDuskFade(DirToSun.Z);
-		// THE SUN TINT (Phase L2). White until the sky publishes, so this line
-		// is `Gain * 1` -- the shipped grey triple -- on an undriven build.
-		const FVoxelMarchVSColours Colours = MakeMarchVSColours();
+		const FVector3f DirToSun(GVSSunDirX.load(),GVSSunDirY.load(),GVSSunDirZ.load());
+		const auto Colours=MakeMarchVSColours();
+		const auto Shared=VoxelSurfaceLighting::Wrap(true,true,DirToSun,
+		    CVarVoxelMarchSunWrapFloor.GetValueOnRenderThread(),CVarVoxelMarchSkyBoost.GetValueOnRenderThread(),
+		    CVarVoxelMarchSunWrapGain.GetValueOnRenderThread(),Colours.Sun);
 		FVoxelMarchVSLightingUniforms U;
-		U.SunDirAndWrapFloor = FVector4f(DirToSun.X, DirToSun.Y, DirToSun.Z, WrapFloor);
-		U.WrapColorAndSkyBoost = FVector4f(Gain * Colours.Sun.X, Gain * Colours.Sun.Y,
-		                                   Gain * Colours.Sun.Z, SkyBoost);
+		U.SunDirAndWrapFloor=Shared.SunDirAndWrapFloor;
+		U.WrapColorAndSkyBoost=Shared.WrapColorAndSkyBoost;
 		return U;
 	}
 
@@ -12591,4 +12544,35 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 	// Carried with the data, not asked of the cvar at print time: the probe
 	// changes what EmitGpuMs and the frame time mean.
 	State->Stats.bHTileProbe = bHTileProbe;
+}
+
+
+namespace {
+TAutoConsoleVariable<int32> CVarVoxelAssetSurfaceLightingDiagnostic(
+    TEXT("voxel.Environment.SurfaceLightingDiagnostic"),0,
+    TEXT("Opt-in L1/L2 actor material lighting probe. Requires voxel.GI.Volume=0 and voxel.Light.Propagated=0; no volume parity claim."));
+}
+VoxelSurfaceLighting::FVectors VoxelSurfaceLightingSnapshot_GameThread()
+{
+    check(IsInGameThread());
+    const bool Enabled=CVarVoxelMarchVSLighting.GetValueOnGameThread()!=0;
+    const bool SunPublished=GVSSunPublished.load()!=0;
+    const FVector3f Direction(GVSSunDirX.load(),GVSSunDirY.load(),GVSSunDirZ.load());
+    FVector3f Sun(1,1,1),Ambient(1.00f,1.04f,1.12f);
+    if(Enabled&&GVSColourPublished.load()!=0)
+    {
+        Sun=FVector3f(GVSSunColR.load(),GVSSunColG.load(),GVSSunColB.load());
+        Ambient=FVector3f(GVSAmbColR.load(),GVSAmbColG.load(),GVSAmbColB.load());
+    }
+    auto Out=VoxelSurfaceLighting::Wrap(Enabled,SunPublished,Direction,
+        CVarVoxelMarchSunWrapFloor.GetValueOnGameThread(),CVarVoxelMarchSkyBoost.GetValueOnGameThread(),
+        CVarVoxelMarchSunWrapGain.GetValueOnGameThread(),Sun);
+    const float Engagement=Enabled&&SunPublished?VoxelSurfaceLighting::DuskFade(Direction.Z):0.0f;
+    Out.AmbientSkyAndGround=VoxelSurfaceLighting::Ambient(CVarVoxelMarchAmbientIntensity.GetValueOnGameThread(),
+        CVarVoxelMarchAmbientGroundMix.GetValueOnGameThread(),CVarVoxelMarchSunWrapFloor.GetValueOnGameThread(),Engagement,Ambient);
+    const auto* GI=IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Volume"));
+    const auto* Propagated=IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Light.Propagated"));
+    const bool VolumesOff=GI&&Propagated&&GI->GetInt()==0&&Propagated->GetInt()==0;
+    Out.AssetDiagnosticEnabled=CVarVoxelAssetSurfaceLightingDiagnostic.GetValueOnGameThread()!=0&&VolumesOff;
+    return Out;
 }

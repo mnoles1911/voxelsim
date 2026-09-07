@@ -11,6 +11,17 @@
 #include "VoxelEnvironmentPageBarrier.h"
 #include "VoxelEnvironmentPageSampler.h"
 #include "VoxelHeldBrickParity.h"
+#include "VoxelObjectRegistry.h"
+#include "Engine/Engine.h"
+#include "Engine/GameViewportClient.h"
+#include "GameFramework/PlayerController.h"
+#include "Camera/PlayerCameraManager.h"
+#include "UnrealClient.h"
+#include "BufferVisualizationData.h"
+#include "HighResScreenshot.h"
+#include "ImageWriteQueue.h"
+#include "Materials/MaterialInterface.h"
+
 #include "Misc/SecureHash.h"
 
 #include "VoxelChunkComponent.h"
@@ -6841,7 +6852,39 @@ struct FVoxelWorldImpl
 	FString ProductionProviderHash,ProductionCatalogHash;
 	// No callback: this adapter cannot publish ownership. A future transaction
     // must install its worker-validated context together with the visible snapshot.
-    VoxelProductionEnvironment::FAdapter ProductionOwnership;
+    bool CommitVisualPublication(const vxc::AssetOwnershipSnapshot& Before,const vxc::AssetOwnershipSnapshot& After,const std::vector<vxc::AssetRenderPage>& Pages);
+    VoxelProductionEnvironment::FAdapter ProductionOwnership{[this](const auto& Before,const auto& After,const auto& Pages){return CommitVisualPublication(Before,After,Pages);}};
+    TUniquePtr<VoxelObjects::FRegistry> VisualPilotRegistry=MakeUnique<VoxelObjects::FRegistry>();
+    bool VisualPublished=false,VisualBoundary=false;
+    FString VisualBeforePath,VisualAfterPath;
+    bool VisualCapturePending=false,VisualAfterRequested=false;
+    double VisualCaptureStarted=0;
+    FString VisualSteadyPath;
+    bool VisualSteadyPending=false,VisualSteadyRequested=false;
+    double VisualSteadyStarted=0,VisualSteadyRequestedAt=0;
+    uint64 VisualPublishFrame=0,VisualSteadyFrame=0;
+    FString VisualUnlitPath;
+    TWeakObjectPtr<UGameViewportClient> VisualUnlitViewport;
+    int32 VisualOriginalViewMode=VMI_Lit;
+    bool VisualUnlitPending=false,VisualUnlitSwitched=false,VisualUnlitRequested=false;
+    double VisualUnlitStarted=0;
+    uint64 VisualUnlitFrame=0;
+    void RestoreVisualViewMode();
+    bool VisualBuffersEnabled=false,VisualBufferSettingsSaved=false;
+    int32 VisualBufferRequests=0;
+    FString VisualBufferOriginalDump,VisualBufferOriginalTargets,VisualBufferOriginalHdr;
+    FString VisualBufferOriginalDirectory,VisualBufferRawDirectory,VisualBufferDestination;
+    double VisualBufferRequestStarted=0;
+    bool VisualBufferFailed=false;
+    TFuture<void> VisualBufferWriteFence;
+    TArray<FString> VisualBufferMaterialNames;
+    TSet<FString> VisualBuffersVerified;
+    void RestoreVisualBufferSettings();
+    bool RequestVisualScreenshot(const FString& Path);
+    bool VerifyVisualBuffers(const FString& Path);
+
+
+
     VoxelEnvironmentRender::FContextRef ProductionRenderContext;
     VoxelEnvironmentRender::FContextRef CaptureProductionRenderContext();
     bool ProductionRenderAffects(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const;
@@ -6885,13 +6928,25 @@ struct FVoxelWorldImpl
         TUniquePtr<FVoxelHeldBrickParity> Parity;
         int32 NextGpuPage=0;
         uint64 GpuBytes=0;
+        vxc::AssetOwnershipTicket OwnershipTicket;
+        FVoxelBrickPreparedBatchRef PoolBatch;
+        VoxelObjects::FProductionReservation RegistryReservation;
+        VoxelObjects::FPreparedProductionCommitRef RegistryCommit;
+        bool RegistryBound=false;
+        int32 VisualCaptureStage=0;
+        uint64 VisualCameraFrame=0;
+        TWeakObjectPtr<APawn> VisualPawn;
+        FVector VisualPawnLocation=FVector::ZeroVector;
+
     };
     TUniquePtr<FProductionPageRehearsal> ProductionRehearsal;
     void EndProductionRehearsal(const TCHAR* Reason);
-    void CancelProductionCandidate(const TCHAR* Reason);
+    void CancelProductionCandidate(const TCHAR* Reason,bool WorldTeardown=false);
     void TickProductionRehearsal(const FVector& Anchor);
     void TickHeldCpuPreparation();
     void TickHeldGpuPreparation();
+    void TickVisualPublication();
+    bool ValidateVisualPublication();
 	std::atomic<int32> ProductionCandidateWorkers{0};
 	void TickProductionCandidate(UWorld* World,const FVector& Anchor);
 	bool ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const;
@@ -10708,6 +10763,7 @@ void FVoxelWorldImpl::NoteHeightPyramidEdit(int32 Level0ChunkX, int32 Level0Chun
 
 void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, USceneComponent& Root, UMaterialInterface* Material, float DeltaTime)
 {
+    if(VisualBoundary)return; // render flush may pump GT work; no reentrant generation
 	// THE MARCHER'S HEIGHT PYRAMID, FILLED FIRST AND ON ITS OWN BUDGET. It is
 	// driven from here because the anchor is here and because the fill must
 	// follow the camera; it is deliberately NOT part of the admission sweep, so
@@ -12136,6 +12192,8 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 
 void FVoxelWorldImpl::WaitForInFlightTasks()
 {
+    RestoreVisualBufferSettings();
+    RestoreVisualViewMode();
 	// Called from Deinitialize before Impl is torn down: worker jobs capture
 	// raw pointers into Voxels.generated() and the results queue (see
 	// DispatchJobs) rather than a ref-counted handle, on the assumption that
@@ -18111,7 +18169,7 @@ static std::vector<vxc::AssetField::ResolvedAssetInstance> VoxelResolveTerrainIn
 // existing teardown barrier outlives every bank/manifest/sampler access.
 VoxelEnvironmentRender::FContextRef FVoxelWorldImpl::CaptureProductionRenderContext()
 {
-    check(IsInGameThread());const auto Snapshot=ProductionOwnership.Visible();
+    check(IsInGameThread());if(VisualBoundary)return ProductionRenderContext;const auto Snapshot=ProductionOwnership.Visible();
     if(ProductionRenderContext&&ProductionRenderContext->Generation()==Snapshot->generation)return ProductionRenderContext;
     // Nonempty snapshots require an already validated context from the future
     // bounded publication worker. Never build/hash canonical grids per dispatch.
@@ -18145,6 +18203,10 @@ void FVoxelWorldImpl::EndProductionRehearsal(const TCHAR* Reason)
 {
     check(IsInGameThread());
     if(!ProductionRehearsal)return;
+    if(ProductionRehearsal->PoolBatch)GetGlobalVoxelBrickPool().CancelPreparedBatch(ProductionRehearsal->PoolBatch);
+    if(ProductionRehearsal->RegistryReservation.IsValid())VisualPilotRegistry->RollbackProduction(ProductionRehearsal->RegistryReservation);
+    if(ProductionRehearsal->RegistryBound&&!VisualPublished)VisualPilotRegistry=MakeUnique<VoxelObjects::FRegistry>();
+    if(ProductionRehearsal->OwnershipTicket.serial&&!VisualPublished)ProductionOwnership.Cancel(ProductionRehearsal->OwnershipTicket);
     if(ProductionRehearsal->ContextJob)ProductionRehearsal->ContextJob->Cancelled.Store(true);
     for(const auto& Job:ProductionRehearsal->CpuJobs)Job->Cancelled.Store(true);
     if(ProductionRehearsal->GpuJob)ProductionRehearsal->GpuJob->Cancelled=true;
@@ -18160,8 +18222,12 @@ void FVoxelWorldImpl::EndProductionRehearsal(const TCHAR* Reason)
     UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL RELEASED reason=%s; allocatorPinned=0 publicationReady=0"),Reason);
     ProductionRehearsal.Reset();
 }
-void FVoxelWorldImpl::CancelProductionCandidate(const TCHAR* Reason)
+void FVoxelWorldImpl::CancelProductionCandidate(const TCHAR* Reason,bool WorldTeardown)
 {
+    if(WorldTeardown||!VisualPublished){RestoreVisualBufferSettings();RestoreVisualViewMode();}
+    if(VisualBoundary||(VisualPublished&&!WorldTeardown)){
+        UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: published visual ownership requires world teardown; no demotion supported"));return;
+    }
     EndProductionRehearsal(Reason);
     VoxelProductionCandidate::Cancel(ProductionCandidate);
 }
@@ -18172,7 +18238,8 @@ void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
     if(!Work||!Work->RehearseHandoff||Work->Phase!=5)return;
     const auto Refuse=[&](const TCHAR* Why){
         UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHandoff REHEARSAL REFUSED: %s; publicationReady=0"),Why);
-        if(Work->PrepareHeldGpuPages){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldGpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);}
+        if(Work->PublishVisualPilot){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: %s; gameplay=0"),Why);}
+        else if(Work->PrepareHeldGpuPages){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldGpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);}
         else if(Work->PrepareHeldCpuPages){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldCpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);}
         Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;EndProductionRehearsal(Why);
     };
@@ -18263,8 +18330,18 @@ void FVoxelWorldImpl::TickHeldCpuPreparation()
             const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
             const uint64 Generation=ProductionOwnership.Visible()->generation;
             if(Generation==MAX_uint64){Refuse(TEXT("ownership generation exhausted"));return;}
+            VoxelProductionEnvironment::FSnapshot PilotSnapshot;
+            if(Work->PublishVisualPilot){
+                VoxelProductionEnvironment::FSource Source;Source.Provenance=Work->Provenance;
+                Source.Admission.Canonical100MmSource=true;Source.Admission.VisibleCellsMatchCanonicalComposition=true;
+                Source.Admission.CompleteTouchedPageSet=true;Source.Admission.HasEditedTerrainCells=false;
+                for(const auto& Key:State.Keys)if(NeedsOverlayAwarePath(Key)){Refuse(TEXT("visual footprint includes edits"));return;}
+                State.OwnershipTicket=ProductionOwnership.Prepare(Source,vxc::AssetRenderOwner::Object,Work->Pages);
+                PilotSnapshot=ProductionOwnership.Prepared(State.OwnershipTicket);
+                if(!PilotSnapshot){Refuse(TEXT("real ownership preparation refused"));return;}
+            }
             ProductionCandidateWorkers.fetch_add(1);
-            auto Task=UE::Tasks::Launch(TEXT("HeldCpuTargetContext"),[this,Job,Work,Provider,Catalog,Generation](){
+            auto Task=UE::Tasks::Launch(TEXT("HeldCpuTargetContext"),[this,Job,Work,Provider,Catalog,Generation,PilotSnapshot](){
                 ON_SCOPE_EXIT {Job->Ready.Store(true);ProductionCandidateWorkers.fetch_sub(1);};
                 if(Job->Cancelled.Load())return;
                 // Draft only: no publication callback or backend readiness exists.
@@ -18273,10 +18350,11 @@ void FVoxelWorldImpl::TickHeldCpuPreparation()
                 const auto* Target=Draft.target(Ticket);
                 if(!Target){Job->Error=TEXT("private target snapshot refused");return;}
                 auto Snapshot=*Target;Snapshot.generation=Generation+1;
+                const auto SnapshotRef=PilotSnapshot?PilotSnapshot:MakeShared<const vxc::AssetOwnershipSnapshot,ESPMode::ThreadSafe>(MoveTemp(Snapshot));
                 TArray<VoxelEnvironmentRender::FSourceBinding> Bindings;
                 Bindings.Add({Work->Candidate.bankId,Work->Candidate.seedIndex,Work->Candidate.grid,Work->CanonicalSourceHash});
                 Job->Context=VoxelEnvironmentRender::Build(
-                    MakeShared<const vxc::AssetOwnershipSnapshot,ESPMode::ThreadSafe>(MoveTemp(Snapshot)),
+                    SnapshotRef,
                     Work->Provenance.worldSeed,Provider,Catalog,Bindings,Job->Error);
             });
             InFlightTasks.Add(MoveTemp(Task));return;
@@ -18314,6 +18392,9 @@ void FVoxelWorldImpl::TickHeldCpuPreparation()
         VoxelProductionEnvironment::FPreparedPage Prepared;
         const int32 PageIndex=State.Keys.IndexOfByKey(Job->Key);check(PageIndex!=INDEX_NONE);
         Prepared.Page=Work->Pages[size_t(PageIndex)];Prepared.Generation=State.CpuContext->Generation();Prepared.CpuBricks=Job->Pack;
+        if(Work->PublishVisualPilot&&!ProductionOwnership.StageCpuPage(State.OwnershipTicket,Prepared.Page,Prepared.Generation,Prepared.CpuBricks,{})){
+            Refuse(TEXT("CPU ownership staging refused"));return;
+        }
         State.CpuPacks.Add(MoveTemp(Prepared));State.CpuJobs.RemoveAtSwap(I,1,EAllowShrinking::No);
     }
     if(State.CpuPacks.Num()==State.AllocatedPages.Num()){
@@ -18381,6 +18462,7 @@ void FVoxelWorldImpl::TickHeldGpuPreparation()
         State.Parity.Reset();++State.NextGpuPage;
     }
     if(State.NextGpuPage==State.CpuPacks.Num()){
+        if(Work->PublishVisualPilot){TickVisualPublication();return;}
         UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldGpu PASSED spec=%s completePages=%d allocated=%d completed=%d cpuBytes=%llu gpuAccountedBytes=%llu elapsed=%.3f; parity=all-pages pressurePinned=1 backendReady=0 publicationReady=0"),
             *Work->Descriptor.SpecId,State.Keys.Num(),State.AllocatedPages.Num(),State.NextGpuPage,
             State.CpuBytes,State.GpuBytes,FPlatformTime::Seconds()-State.Started);
@@ -18402,9 +18484,10 @@ void FVoxelWorldImpl::TickHeldGpuPreparation()
         }
         if(State.CpuBytes>MaxBytes||State.GpuBytes>MaxBytes-State.CpuBytes||
            Job->Budget.RetainedAndReadbackBytes>MaxBytes-State.CpuBytes-State.GpuBytes){Refuse(TEXT("GPU retained budget exceeded"));return;}
-        Page.GpuBricks=MoveTemp(Result.BrickVolume);
+        Page.GpuBricks=Result.BrickVolume;
         State.Parity=MakeUnique<FVoxelHeldBrickParity>();FString Error;
         if(!State.Parity->Begin(Page.CpuBricks,Page.GpuBricks,Origin,Page.Generation,Error)){Refuse(Error);return;}
+        if(Work->PublishVisualPilot&&!ProductionOwnership.StageGpuPage(State.OwnershipTicket,Page.Page,MoveTemp(Result))){Refuse(TEXT("real held GPU receipt staging refused"));return;}
         State.GpuBytes+=Job->Budget.RetainedAndReadbackBytes;State.GpuJob.Reset();return;
     }
     // A cancelled predecessor still owns its manager delivery; do not start
@@ -18426,13 +18509,307 @@ void FVoxelWorldImpl::TickHeldGpuPreparation()
     if(State.NextGpuPage==0)UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldGpu START allocated=%d maxJobs=1 maxBytes=%llu; brickOnly=1 backendReady=0 publicationReady=0"),State.CpuPacks.Num(),MaxBytes);
 }
 
+static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,const FVector& ChunkOriginRelative,int32 Level);
+static FVoxelBrickChunkShading ShadingFromChunkParams(const FVector4f& Params);
+
+bool FVoxelWorldImpl::ValidateVisualPublication()
+{
+    auto Work=ProductionCandidate;if(!Work||!ProductionRehearsal||VisualPublished)return false;
+    auto& S=*ProductionRehearsal;auto* Actor=Work->Actor.Get();auto* World=Actor?Actor->GetWorld():nullptr;
+    auto& Pool=GetGlobalVoxelBrickPool();
+    int32 Worlds=0;if(GEngine)for(const auto& C:GEngine->GetWorldContexts())if(C.World()&&C.World()->IsGameWorld())++Worlds;
+    if(!World||World->GetNetMode()!=NM_Standalone||Worlds!=1||Pool.IsGpuAllocArmed()||
+       !Actor||!Actor->IsVisualOnlyPreparation()||!Actor->ValidatePreparedVisualReveal()||
+       !S.RegistryBound||!VisualPilotRegistry->Find(Actor)||!S.CpuContext||
+       !VoxelProductionCandidate::IsCurrent(*Work,EditEpoch.load(),FineStreamer?FineStreamer->ResidencyEpoch():0)||
+       !PageBarrier.IsQuiescent(S.Ticket)||!Pool.ValidatePreparedBatch(S.PoolBatch)||
+       S.MaxRing!=UVoxelWorldSubsystem::GetMaxRingLevel()||!S.VisualPawn.IsValid()||
+       !S.VisualPawn->GetActorLocation().Equals(S.VisualPawnLocation,0.01))return false;
+    const auto Snapshot=ProductionOwnership.Prepared(S.OwnershipTicket);
+    if(!Snapshot||Snapshot->generation!=S.CpuContext->Generation()||!ProductionOwnership.Visible()->records.empty())return false;
+    const auto* Rings=UVoxelWorldSubsystem::GetRingPresets();
+    for(int32 L=0;L<VoxelCoords::kNumLevels;++L)if(S.Inner[L]!=Rings[L].InnerMeters||S.Outer[L]!=Rings[L].OuterMeters)return false;
+    for(const auto& K:S.Keys){
+        const auto* Record=ChunkRecords.Find(K);const auto* Parked=ParkedGeometry.Find(K);
+        if((Record&&Record->HoldsGeometry())||(Parked&&!Parked->bBrickBacked)||NeedsOverlayAwarePath(K)||
+           !ProductionRenderSupported(K,S.CpuContext)||!IsColumnGridFootprintResident(K.Level,K.Key.X,K.Key.Y)||
+           !AssetResolveFootprintResident(K.Level,K.Key.X,K.Key.Y))return false;
+    }
+    return true;
+}
+bool FVoxelWorldImpl::CommitVisualPublication(const vxc::AssetOwnershipSnapshot& Before,const vxc::AssetOwnershipSnapshot& After,const std::vector<vxc::AssetRenderPage>& Pages)
+{
+    // Called only from FAdapter::Commit, after every expensive/fallible check.
+    if(!VisualBoundary||!ValidateVisualPublication())return false;
+    auto Work=ProductionCandidate;auto& S=*ProductionRehearsal;
+    if(Before.generation+1!=After.generation||After.generation!=S.CpuContext->Generation()||Pages.size()!=Work->Pages.size())return false;
+    // Single-world GT boundary: no view family can be submitted between these
+    // ordered renderer commands and the final flush. Not an asynchronous path.
+    ProductionRenderContext=S.CpuContext;
+    GetGlobalVoxelBrickPool().CommitPreparedBatch(S.PoolBatch);
+    Work->Actor->PublishPreparedVisualOnly();
+    for(const auto& Key:S.Keys){
+        if(auto* R=ChunkRecords.Find(Key))R->OwnershipGeneration=After.generation;
+        if(auto* P=ParkedGeometry.Find(Key))P->OwnershipGeneration=After.generation;
+    }
+    FlushRenderingCommands();
+    VisualPublished=true;
+    return true;
+}
+void FVoxelWorldImpl::TickVisualPublication()
+{
+    auto Work=ProductionCandidate;if(!Work||!ProductionRehearsal)return;
+    auto& S=*ProductionRehearsal;auto* Actor=Work->Actor.Get();auto* World=Actor?Actor->GetWorld():nullptr;
+    const auto Refuse=[&](const TCHAR* Why){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: %s; gameplay=0"),Why);CancelProductionCandidate(Why);};
+    auto* PC=World?World->GetFirstPlayerController():nullptr;
+    if(!Actor||!PC||!PC->GetPawn()||!PC->PlayerCameraManager||!GEngine||!GEngine->GameViewport){Refuse(TEXT("live standalone viewport/camera required"));return;}
+    if(S.VisualCaptureStage==0){
+        RestoreVisualBufferSettings();
+        VisualBufferRequests=0;VisualBuffersVerified.Reset();VisualBufferMaterialNames.Reset();
+        VisualBuffersEnabled=false;VisualBufferFailed=false;VisualBufferRawDirectory.Reset();VisualBufferDestination.Reset();
+        if(auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Environment.CaptureBuffers")))VisualBuffersEnabled=C->GetInt()!=0;
+        FVector Center,Extent;Actor->GetActorBounds(false,Center,Extent);
+        S.VisualPawn=PC->GetPawn();S.VisualPawnLocation=PC->GetPawn()->GetActorLocation();
+        PC->SetControlRotation((Center-PC->PlayerCameraManager->GetCameraLocation()).Rotation());
+        const FString Dir=FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(),TEXT("Screenshots/ProductionVisualPilot"),FGuid::NewGuid().ToString(EGuidFormats::Digits)));
+        if(!IFileManager::Get().MakeDirectory(*Dir,true)){Refuse(TEXT("screenshot directory creation failed"));return;}
+        VisualBeforePath=FPaths::Combine(Dir,TEXT("before.png"));VisualAfterPath=FPaths::Combine(Dir,TEXT("after.png"));
+        S.VisualCameraFrame=GFrameCounter;S.VisualCaptureStage=1;
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot READY center=(%.3f,%.3f,%.3f) extent=(%.3f,%.3f,%.3f) allocated=%d absent=%d; awaiting before screenshot"),Center.X,Center.Y,Center.Z,Extent.X,Extent.Y,Extent.Z,S.CpuPacks.Num(),S.Keys.Num()-S.CpuPacks.Num());return;
+    }
+    if(S.VisualCaptureStage==1){
+        if(GFrameCounter<=S.VisualCameraFrame+1||FScreenshotRequest::IsScreenshotRequested())return;
+        if(!RequestVisualScreenshot(VisualBeforePath)){Refuse(TEXT("before buffer request refused"));return;}S.VisualCaptureStage=2;return;
+    }
+    if(S.VisualCaptureStage==2){
+        if(VisualBuffersEnabled&&FPlatformTime::Seconds()-VisualBufferRequestStarted>32.){Refuse(TEXT("before buffer capture timed out after 32 seconds"));return;}
+        if(FScreenshotRequest::IsScreenshotRequested()||!VerifyVisualBuffers(VisualBeforePath)||!IFileManager::Get().FileExists(*VisualBeforePath))return;
+        // Private logical registration can still refuse here, before any terrain
+        // or visibility mutation. Its registry is never saved or replicated.
+        VoxelObjects::FEntry Entry;Entry.Kind=3;Entry.GeometryRevision=1;Entry.Geometry=Work->Geometry;Entry.Dynamic=Work->Dynamic;
+        Entry.Transform=Actor->GetActorTransform();Entry.Actor=Actor;Entry.bRetained=true;Entry.Lifetime.Kind=EVoxelDebrisLifetime::Retained;
+        S.RegistryReservation=VisualPilotRegistry->ReserveProduction(Work->Descriptor,MoveTemp(Entry));
+        S.RegistryCommit=VisualPilotRegistry->PrepareProductionCommit(S.RegistryReservation);
+        if(!VisualPilotRegistry->ValidatePreparedProduction(S.RegistryCommit)){Refuse(TEXT("private registry preparation refused"));return;}
+        VisualPilotRegistry->CommitPreparedProduction(S.RegistryCommit);S.RegistryBound=true;
+        if(!Actor->ValidatePreparedVisualReveal()){Refuse(TEXT("visual latch validation refused"));return;}
+        TArray<FVoxelBrickPreparedReplacement> Replacements;TArray<FVoxelBrickChunkKey> Absent;
+        for(int32 I=0;I<S.Keys.Num();++I){
+            const auto& K=S.Keys[I];const auto* R=ChunkRecords.Find(K);const auto* P=ParkedGeometry.Find(K);
+            if((R&&R->HoldsGeometry())||(P&&!P->bBrickBacked)){Refuse(TEXT("component or quad-owned terrain page unsupported"));return;}
+            if(!S.Tokens[I].bPresent)Absent.Add(VoxelBrickCpuArm::MakeKey(K));
+        }
+        auto* Root=GpuPoolRoot.Get();if(!Root){Refuse(TEXT("terrain shading root unavailable"));return;}
+        for(const auto& P:S.CpuPacks){
+            const VoxelCoords::FVoxelLevelChunkKey K{int32(P.Page.level),{int32(P.Page.x),int32(P.Page.y),int32(P.Page.z)}};
+            const int32 I=S.Keys.IndexOfByKey(K);if(I==INDEX_NONE){Refuse(TEXT("prepared page identity mismatch"));return;}
+            auto& Replacement=Replacements.AddDefaulted_GetRef();Replacement.Key=VoxelBrickCpuArm::MakeKey(K);
+            Replacement.ExpectedSlot=S.Tokens[I].Slot;Replacement.ExpectedSequence=S.Tokens[I].AddSequence;Replacement.CpuPack=P.CpuBricks;
+            Replacement.Shading=ShadingFromChunkParams(SampleChunkParamsForPool(*Root,VoxelCoords::ChunkOriginWorldForLevel(K.Key,K.Level),K.Level));
+        }
+        constexpr uint64 MaxBytes=128ull*1024*1024;
+        if(S.CpuBytes>MaxBytes||S.GpuBytes>MaxBytes-S.CpuBytes){Refuse(TEXT("publication budget exhausted"));return;}
+        S.PoolBatch=GetGlobalVoxelBrickPool().PreparePreparedBatch(Replacements,S.PressurePins,Absent,MaxBytes-S.CpuBytes-S.GpuBytes);
+        if(!S.PoolBatch){Refuse(TEXT("pool/index batch reservation refused"));return;}
+        for(int32 I=0;I<S.Keys.Num();++I)if(!S.Tokens[I].bPresent&&!ProductionOwnership.StageAbsentPage(S.OwnershipTicket,Work->Pages[size_t(I)],S.CpuContext->Generation(),GetGlobalVoxelBrickPool(),S.PoolBatch)){
+            Refuse(TEXT("validated absence staging refused"));return;
+        }
+        if(!ProductionOwnership.MarkObjectReady(S.OwnershipTicket,1)){Refuse(TEXT("object readiness rejected"));return;}
+        S.VisualCaptureStage=3;
+    }
+    if(!ValidateVisualPublication()){Refuse(TEXT("prepared transaction validation refused"));return;}
+    const double Start=FPlatformTime::Seconds();
+    VisualBoundary=true;
+    // FlushRenderingCommands alone does not submit deferred UObject collection
+    // updates. Include pending material uniforms in this diagnostic boundary.
+    World->FlushDeferredParameterCollectionInstanceUpdates();
+    FlushRenderingCommands();
+    // Flush may pump GT work; validate again after it, before visible mutation.
+    if(!ValidateVisualPublication()){VisualBoundary=false;Refuse(TEXT("transaction changed during renderer drain"));return;}
+    const int32 Allocated=S.CpuPacks.Num(),Complete=S.Keys.Num();const uint64 Generation=S.CpuContext->Generation();
+    if(!ProductionOwnership.Commit(S.OwnershipTicket)){VisualBoundary=false;Refuse(TEXT("ownership publication callback refused"));return;}
+    VisualBoundary=false;
+    Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;Work->PrepareHeldGpuPages=false;
+    EndProductionRehearsal(TEXT("visual renderer boundary completed"));
+    UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot PUBLISHED complete=%d allocated=%d absent=%d generation=%llu blockingMs=%.3f registry=isolated gameplay=0"),Complete,Allocated,Complete-Allocated,Generation,(FPlatformTime::Seconds()-Start)*1000.);
+    // Request only after the complete first boundary; save occurs in a later
+    // viewport frame, never by replacing the pending before request.
+    VisualCapturePending=true;VisualCaptureStarted=FPlatformTime::Seconds();VisualPublishFrame=GFrameCounter;
+    if(!FScreenshotRequest::IsScreenshotRequested()){VisualAfterRequested=RequestVisualScreenshot(VisualAfterPath);}
+}
+
+void FVoxelWorldImpl::RestoreVisualBufferSettings()
+{
+    if(!VisualBufferSettingsSaved)return;
+    // Flush may pump cancellation. Consume restoration before yielding so a
+    // nested cleanup cannot recurse into another render flush.
+    VisualBufferSettingsSaved=false;
+    TGuardValue<bool> BoundaryGuard(VisualBoundary,true);
+    // Image task format is selected inside the RT readback pass. Drain that
+    // pass before restoring HDR, while asynchronous file writes may continue.
+    FlushRenderingCommands();
+    if(auto* Queue=GetHighResScreenshotConfig().ImageWriteQueue)VisualBufferWriteFence=Queue->CreateFence();
+    auto& CM=IConsoleManager::Get();
+    const TCHAR* Names[]={TEXT("r.BufferVisualizationDumpFrames"),TEXT("r.BufferVisualizationOverviewTargets"),TEXT("r.BufferVisualizationDumpFramesAsHDR")};
+    const FString Values[]={VisualBufferOriginalDump,VisualBufferOriginalTargets,VisualBufferOriginalHdr};
+    for(int32 I=0;I<3;++I){auto* V=CM.FindConsoleVariable(Names[I]);if(V){V->SetWithCurrentPriority(*Values[I]);if(V->GetString()!=Values[I])UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: buffer setting restoration failed %s"),Names[I]);}}
+    GetMutableDefault<UEngine>()->GameScreenshotSaveDirectory.Path=VisualBufferOriginalDirectory;
+}
+bool FVoxelWorldImpl::RequestVisualScreenshot(const FString& Path)
+{
+    if(FScreenshotRequest::IsScreenshotRequested())return false;
+    if(VisualBuffersEnabled){
+        auto* Viewport=GEngine?GEngine->GameViewport.Get():nullptr;
+        auto& CM=IConsoleManager::Get();
+        auto* Dump=CM.FindConsoleVariable(TEXT("r.BufferVisualizationDumpFrames"));
+        auto* Targets=CM.FindConsoleVariable(TEXT("r.BufferVisualizationOverviewTargets"));
+        auto* Hdr=CM.FindConsoleVariable(TEXT("r.BufferVisualizationDumpFramesAsHDR"));
+        if(!Viewport||!Viewport->Viewport||Viewport->Viewport->GetSizeXY()!=FIntPoint(960,540)||VisualBufferRequests>=3||!GetHighResScreenshotConfig().ImageWriteQueue||!Dump||!Targets||!Hdr||!GetBufferVisualizationData().IsInitialized()){
+            UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: buffer capture requires initialized materials, three bounded requests and 960x540 viewport"));return false;
+        }
+        VisualBufferMaterialNames.Reset();
+        for(const TCHAR* Name:{TEXT("BaseColor"),TEXT("WorldNormal"),TEXT("SceneDepthWorldUnits")}){
+            auto* Material=GetBufferVisualizationData().GetMaterial(FName(Name));
+            if(!Material){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: buffer material unavailable %s"),Name);return false;}
+            VisualBufferMaterialNames.Add(Material->GetName());
+        }
+        // FViewport::Draw replaces named screenshot requests when dumping buffers.
+        // Isolate its automatic filename in a new directory; never guess its counter.
+        VisualBufferRawDirectory=FPaths::Combine(FPaths::GetPath(Path),TEXT("raw_")+FPaths::GetBaseFilename(Path)+TEXT("_")+FGuid::NewGuid().ToString(EGuidFormats::Digits));
+        if(!IFileManager::Get().MakeDirectory(*VisualBufferRawDirectory,true)){
+            UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: raw buffer directory creation failed"));return false;
+        }
+        VisualBufferDestination=Path;VisualBufferRequestStarted=FPlatformTime::Seconds();VisualBufferFailed=false;
+        VisualBufferOriginalDirectory=GetDefault<UEngine>()->GameScreenshotSaveDirectory.Path;
+        VisualBufferOriginalDump=Dump->GetString();VisualBufferOriginalTargets=Targets->GetString();VisualBufferOriginalHdr=Hdr->GetString();VisualBufferSettingsSaved=true;
+        GetMutableDefault<UEngine>()->GameScreenshotSaveDirectory.Path=VisualBufferRawDirectory; // transient only; never SaveConfig
+        Targets->SetWithCurrentPriority(TEXT("BaseColor,WorldNormal,SceneDepthWorldUnits"));Hdr->SetWithCurrentPriority(TEXT("1"));Dump->SetWithCurrentPriority(TEXT("1"));
+        if(Dump->GetInt()!=1||Hdr->GetInt()!=1||Targets->GetString()!=TEXT("BaseColor,WorldNormal,SceneDepthWorldUnits")){
+            RestoreVisualBufferSettings();UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: buffer settings rejected"));return false;
+        }
+        ++VisualBufferRequests;
+    }
+    FScreenshotRequest::RequestScreenshot(Path,false,false);return true;
+}
+bool FVoxelWorldImpl::VerifyVisualBuffers(const FString& Path)
+{
+    if(!VisualBuffersEnabled)return true;
+    if(FScreenshotRequest::IsScreenshotRequested())return false;
+    // Rendering has consumed the request; asynchronous image tasks retain their
+    // chosen EXR format. Restore globals before waiting for disk completion.
+    RestoreVisualBufferSettings();
+    if(VisualBuffersVerified.Contains(Path))return true;
+    if(VisualBufferFailed)return false;
+    const auto Fail=[&](const TCHAR* Why){VisualBufferFailed=true;UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: buffer association %s raw=\"%s\""),Why,*VisualBufferRawDirectory);return false;};
+    if(Path!=VisualBufferDestination)return Fail(TEXT("stage identity mismatch"));
+    if(FPlatformTime::Seconds()-VisualBufferRequestStarted>32.)return Fail(TEXT("timed out after 32 seconds"));
+    if(!VisualBufferWriteFence.IsValid()||!VisualBufferWriteFence.IsReady())return false;
+    TArray<FString> Files;IFileManager::Get().FindFiles(Files,*(VisualBufferRawDirectory/TEXT("*")),true,false);
+    if(Files.Num()>4)return Fail(TEXT("unexpected extra files"));
+    TArray<FString> Pngs;
+    for(const FString& File:Files)if(FPaths::GetExtension(File).Equals(TEXT("png"),ESearchCase::IgnoreCase))Pngs.Add(File);
+    if(Pngs.Num()>1)return Fail(TEXT("ambiguous screenshot names"));
+    if(Files.Num()!=4||Pngs.Num()!=1)return false;
+    const FString RawBase=FPaths::GetBaseFilename(Pngs[0]);
+    TArray<FString> Sources,Destinations;
+    Sources.Add(VisualBufferRawDirectory/Pngs[0]);Destinations.Add(Path);
+    for(const FString& Name:VisualBufferMaterialNames){
+        const FString Filename=RawBase+TEXT("_")+Name+TEXT(".exr");
+        if(!Files.Contains(Filename))return Fail(TEXT("unexpected sidecar name"));
+        Sources.Add(VisualBufferRawDirectory/Filename);
+        Destinations.Add(FPaths::GetBaseFilename(Path,false)+TEXT("_")+Name+TEXT(".exr"));
+    }
+    for(const FString& Source:Sources)if(IFileManager::Get().FileSize(*Source)<=0)return false;
+    // Preserve raw evidence. Copy only after exact membership and sizes validate.
+    for(int32 I=0;I<Sources.Num();++I){
+        if(IFileManager::Get().Copy(*Destinations[I],*Sources[I],false)!=COPY_OK||IFileManager::Get().FileSize(*Destinations[I])!=IFileManager::Get().FileSize(*Sources[I]))return Fail(TEXT("verified output copy failed"));
+    }
+    for(int32 I=0;I<VisualBufferMaterialNames.Num();++I){
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot BUFFER_CAPTURED stage=%s target=%s path=\"%s\"; format=EXR viewportWidth=960 viewportHeight=540 continuousFrames=0 shadowProof=0"),*FPaths::GetBaseFilename(Path),*VisualBufferMaterialNames[I],*Destinations[I+1]);
+    }
+    VisualBuffersVerified.Add(Path);return true;
+}
+
+void FVoxelWorldImpl::RestoreVisualViewMode()
+{
+    check(IsInGameThread());
+    if(VisualUnlitSwitched)if(auto* Viewport=VisualUnlitViewport.Get()){
+        Viewport->SetViewMode(EViewModeIndex(VisualOriginalViewMode));
+        if(Viewport->ViewModeIndex!=VisualOriginalViewMode)UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: original viewport mode could not be restored"));
+    }
+    VisualUnlitSwitched=false;VisualUnlitPending=false;VisualUnlitViewport.Reset();
+}
+
 void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Anchor)
 {
     using namespace VoxelProductionCandidate;
     check(IsInGameThread());
     const int32 Request=ConsumeRequest(World);
+    if(VisualBoundary)return;
+    if(VisualBufferSettingsSaved&&!FScreenshotRequest::IsScreenshotRequested())RestoreVisualBufferSettings();
+    if(VisualPublished){
+        if(Request)UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: second promotion/demotion unsupported; published visual retained until world teardown"));
+        if(VisualCapturePending&&FPlatformTime::Seconds()-VisualCaptureStarted>30.){
+            RestoreVisualBufferSettings();VisualCapturePending=false;UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: after capture timed out; published visual retained, screenshot acceptance incomplete"));
+        }
+        if(VisualCapturePending&&!VisualAfterRequested&&!FScreenshotRequest::IsScreenshotRequested()){
+            VisualAfterRequested=RequestVisualScreenshot(VisualAfterPath);
+        }
+        if(VisualCapturePending&&VisualAfterRequested&&IFileManager::Get().FileExists(*VisualBeforePath)&&!FScreenshotRequest::IsScreenshotRequested()&&VerifyVisualBuffers(VisualAfterPath)&&IFileManager::Get().FileExists(*VisualAfterPath)){
+            VisualCapturePending=false;UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot CAPTURED before=\"%s\" after=\"%s\"; colorOnly=1 depthShadowVerified=0"),*VisualBeforePath,*VisualAfterPath);
+            VisualSteadyPath=FPaths::Combine(FPaths::GetPath(VisualAfterPath),TEXT("steady.png"));
+            VisualSteadyStarted=FPlatformTime::Seconds();VisualSteadyPending=true;
+        }
+        if(VisualSteadyPending){
+            const double Now=FPlatformTime::Seconds();
+            if(Now-VisualSteadyStarted>30.){
+                RestoreVisualBufferSettings();VisualSteadyPending=false;
+                UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: steady capture timed out; first-postcommit evidence retained"));
+            }else{
+                // Preserve the first-postcommit image and camera. Require both
+                // wall time and later frames before asking for a distinct file.
+                if(!VisualSteadyRequested&&Now-VisualCaptureStarted>=10.&&GFrameCounter-VisualPublishFrame>=16&&!FScreenshotRequest::IsScreenshotRequested()){
+                    VisualSteadyFrame=GFrameCounter;VisualSteadyRequestedAt=Now;
+                    VisualSteadyRequested=RequestVisualScreenshot(VisualSteadyPath);
+                }
+                if(VisualSteadyRequested&&!FScreenshotRequest::IsScreenshotRequested()&&VerifyVisualBuffers(VisualSteadyPath)&&IFileManager::Get().FileExists(*VisualSteadyPath)){
+                    VisualSteadyPending=false;
+                    UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot STEADY_CAPTURED path=\"%s\" frame=%llu elapsed=%.3f verifiedFrame=%llu; colorOnly=1 depthShadowVerified=0"),
+                        *VisualSteadyPath,VisualSteadyFrame,VisualSteadyRequestedAt-VisualCaptureStarted,GFrameCounter);
+                    VisualUnlitPath=FPaths::Combine(FPaths::GetPath(VisualAfterPath),TEXT("unlit.png"));
+                    VisualUnlitStarted=FPlatformTime::Seconds();VisualUnlitPending=true;
+                }
+            }
+        }
+        if(VisualUnlitPending){
+            const auto Fail=[&](const TCHAR* Why){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: unlit diagnostic %s"),Why);RestoreVisualViewMode();};
+            if(FPlatformTime::Seconds()-VisualUnlitStarted>30.)Fail(TEXT("capture timed out"));
+            else if(!VisualUnlitSwitched){
+                auto* Viewport=GEngine?GEngine->GameViewport.Get():nullptr;
+                if(!Viewport||Viewport->GetWorld()!=World)Fail(TEXT("viewport unavailable"));
+                else if(!FScreenshotRequest::IsScreenshotRequested()){
+                    VisualUnlitViewport=Viewport;VisualOriginalViewMode=Viewport->ViewModeIndex;
+                    VisualUnlitSwitched=true;Viewport->SetViewMode(VMI_Unlit);VisualUnlitFrame=GFrameCounter;
+                    if(Viewport->ViewModeIndex!=VMI_Unlit)Fail(TEXT("view mode unsupported"));
+                }
+            }else{
+                auto* Viewport=VisualUnlitViewport.Get();
+                if(!Viewport||Viewport->ViewModeIndex!=VMI_Unlit)Fail(TEXT("view mode changed before capture"));
+                else{
+                    if(!VisualUnlitRequested&&GFrameCounter-VisualUnlitFrame>=2&&!FScreenshotRequest::IsScreenshotRequested()){
+                        FScreenshotRequest::RequestScreenshot(VisualUnlitPath,false,false);VisualUnlitRequested=true;
+                    }
+                    if(VisualUnlitRequested&&!FScreenshotRequest::IsScreenshotRequested()&&IFileManager::Get().FileExists(*VisualUnlitPath)){
+                        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot UNLIT_CAPTURED path=\"%s\"; actualViewMode=Unlit gameplay=0"),*VisualUnlitPath);
+                        RestoreVisualViewMode();
+                    }
+                }
+            }
+        }
+        return;
+    }
     if(Request==2){CancelProductionCandidate(TEXT("explicit cancellation"));UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate CANCELLED"));return;}
-    if(Request==1||Request==3||Request==4||Request==5)
+    if(Request==1||Request==3||Request==4||Request==5||Request==6)
     {
         if((ProductionCandidate&&ProductionCandidate->Phase<5)||ProductionCandidateWorkers.load()>0||!HeldGpuPending.IsEmpty()||FVoxelHeldBrickParity::IsRetirementPending())
         {
@@ -18441,6 +18818,12 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
         else
         {
             CancelProductionCandidate(TEXT("replacement request"));
+            if(Request==6){
+                int32 Worlds=0;if(GEngine)for(const auto& C:GEngine->GetWorldContexts())if(C.World()&&C.World()->IsGameWorld())++Worlds;
+                if(!World||World->GetNetMode()!=NM_Standalone||Worlds!=1||GetGlobalVoxelBrickPool().IsGpuAllocArmed()||!GIsRHIInitialized){
+                    UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: requires exactly one standalone game world, initialized renderer and CPU arena allocator"));return;
+                }
+            }
             if(!FMath::IsFinite(Anchor.X)||!FMath::IsFinite(Anchor.Y)||FMath::Abs(Anchor.X)>double(int64(1)<<30)*10.||FMath::Abs(Anchor.Y)>double(int64(1)<<30)*10.)return;
             const int64 X=FMath::FloorToInt64(Anchor.X/10.),Y=FMath::FloorToInt64(Anchor.Y/10.);
             constexpr int64 MaxAnchor=int64(1)<<30;
@@ -18451,9 +18834,10 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
                 UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: requires resident fine terrain, provider identity and catalog"));return;
             }
             auto Work=MakeShared<FWork,ESPMode::ThreadSafe>();ProductionCandidate=Work;
-            Work->RehearseHandoff=Request==3||Request==4||Request==5;
-            Work->PrepareHeldCpuPages=Request==4||Request==5;
-            Work->PrepareHeldGpuPages=Request==5;
+            Work->RehearseHandoff=Request>=3;
+            Work->PrepareHeldCpuPages=Request>=4;
+            Work->PrepareHeldGpuPages=Request>=5;
+            Work->PublishVisualPilot=Request==6;
             Work->Started=FPlatformTime::Seconds();Work->EditEpoch=EditEpoch.load();Work->ResidencyEpoch=FineStreamer->ResidencyEpoch();
             const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
             ProductionCandidateWorkers.fetch_add(1);
@@ -18556,9 +18940,9 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
         // clears that status, but this preparation path never publishes.
         auto Actor=World->SpawnActor<AVoxelEnvironmentLODPrototype>();
         if(!Actor){Refuse(TEXT("hidden actor spawn failed"));return;}
-        Actor->MarkUnpublishedPreparation();
+        if(Work->PublishVisualPilot)Actor->MarkVisualOnlyPreparation();else Actor->MarkUnpublishedPreparation();
         Work->Actor=Actor;Work->Phase=4;
-        Actor->BeginStagedObjectRestore(Work->Geometry,MoveTemp(Work->Dynamic),[Work](bool Valid){Work->ActorDone=true;Work->ActorValid=Valid;});
+        Actor->BeginStagedObjectRestore(Work->Geometry,Work->PublishVisualPilot?TArray<uint8>(Work->Dynamic):MoveTemp(Work->Dynamic),[Work](bool Valid){Work->ActorDone=true;Work->ActorValid=Valid;});
     }
     if(Work->Phase==2)
     {
@@ -32072,7 +32456,7 @@ void UVoxelWorldSubsystem::Deinitialize()
 	{
 		// Worker jobs hold raw pointers into Impl-owned data (DispatchJobs);
 		// block until every in-flight job has finished before freeing it.
-		Impl->CancelProductionCandidate(TEXT("world teardown"));
+		Impl->CancelProductionCandidate(TEXT("world teardown"),true);
 		VoxelProductionCandidate::ForgetWorld(GetWorld());
 		Impl->WaitForInFlightTasks();
 
@@ -32512,6 +32896,7 @@ bool UVoxelWorldSubsystem::IsChunkPresentableAt(const FVector& WorldPos) const
 
 void UVoxelWorldSubsystem::Tick(float DeltaTime)
 {
+    if(Impl&&Impl->VisualBoundary)return;
 	if (!Impl || !ChunkOwner || !ChunkRoot)
 	{
 		return;

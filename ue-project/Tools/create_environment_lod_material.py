@@ -1,6 +1,7 @@
 """Dedicated masked material for the opt-in environment LOD prototype."""
 import unreal
 from vegetation_material_common import add_vegetation
+from voxel_surface_lighting_common import add_surface_lighting
 path='/Game/Voxel/M_VoxelEnvironmentLOD'
 m=unreal.load_asset(path)
 if not m:
@@ -33,6 +34,8 @@ assert mel.connect_material_expressions(pixel,'PixelPosition',noise,'Pixel')
 assert mel.connect_material_expressions(fade,'',noise,'Fade')
 assert mel.connect_material_expressions(reverse,'',noise,'Reverse')
 add_vegetation(m,color,noise)
+add_surface_lighting(m,power)
 mel.recompile_material(m)
-unreal.EditorAssetLibrary.save_loaded_asset(m)
+if not unreal.EditorAssetLibrary.save_loaded_asset(m):
+    raise RuntimeError('Failed to save environment LOD material')
 unreal.log('EnvironmentLOD dither material saved')
