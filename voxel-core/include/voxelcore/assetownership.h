@@ -101,7 +101,8 @@ public:
         for(size_t i=0;i<pages_.size();++i)if(pages_[i].x==page.x&&pages_[i].y==page.y&&pages_[i].z==page.z&&pages_[i].level==page.level){
             if(!(pages_[i].backends&backend))return false;
             ready_[i]|=backend;return true;
-        }return false;
+        }
+        return false;
     }
     bool ready(AssetOwnershipTicket t) const {
         if(!matches(t)||!objectReady_)return false;

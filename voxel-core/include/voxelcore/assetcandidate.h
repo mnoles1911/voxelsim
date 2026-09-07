@@ -56,7 +56,8 @@ template<class Column> bool assetBuildCandidateVxa(const std::vector<AssetField:
         }
     }
     if(!solid||!flush())return false;
-    for(int i=0;i<4;++i)bytes[36+i]=uint8_t(count>>(8*i));output=std::move(bytes);return true;
+    for(int i=0;i<4;++i)bytes[36+i]=uint8_t(count>>(8*i));
+    output=std::move(bytes);return true;
 }
 // Includes the mesher's apron at every level. Caller passes visible, parked and
 // pending keys; future requests must also carry the committed generation.
