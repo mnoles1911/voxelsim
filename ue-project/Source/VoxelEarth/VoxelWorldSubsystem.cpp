@@ -7007,12 +7007,14 @@ struct FVoxelWorldImpl
 	};
 	TMap<const vxc::AssetGrid*, FGpuAssetGridSpans> GpuAssetSpanCache;
 
-	const FGpuAssetGridSpans& GpuSpansForGrid(const vxc::AssetGrid* Grid)
+	const FGpuAssetGridSpans& GpuSpansForGrid(const vxc::AssetGrid* Grid, bool* OutCacheHit = nullptr)
 	{
 		if (FGpuAssetGridSpans* Hit = GpuAssetSpanCache.Find(Grid))
 		{
+			if(OutCacheHit)*OutCacheHit=true;
 			return *Hit;
 		}
+		if(OutCacheHit)*OutCacheHit=false;
 		FGpuAssetGridSpans& S = GpuAssetSpanCache.Add(Grid);
 		S.SizeX = Grid->sizeX();
 		S.SizeY = Grid->sizeY();
@@ -9348,6 +9350,10 @@ struct FVoxelWorldImpl
 	double AccumGpuSubmitBandMs = 0.0;    // band policy + request build
 	double AccumGpuSubmitRasterMs = 0.0;  // atlas PrepareRequest / FillRasterWindow
 	double AccumGpuSubmitAssetsMs = 0.0;  // resolve + span tables + instance marshal
+	double AccumGpuAssetResolveMs = 0.0;
+	double AccumGpuAssetSpanLookupMs = 0.0;
+	double AccumGpuAssetTableCopyMs = 0.0;
+	uint64 GpuAssetSpanHits = 0, GpuAssetSpanMisses = 0, GpuAssetCopiedBytes = 0;
 	double AccumGpuSubmitPoolMs = 0.0;    // direct-to-pool decision incl. GI probe
 	double AccumGpuSubmitMgrMs = 0.0;     // Manager->Submit + GpuJobsPending insert
 	double AccumGpuSubmitTotalMs = 0.0;   // whole SubmitGpuMeshJob wall
@@ -14156,6 +14162,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       AccumGpuSubmitTotalMs * 1000.0 / double(GpuSubmitCallsSinceLog),
 		       AccumDispatchSubmitGpuMs,
 		       AccumDispatchSubmitGpuMs - AccumGpuSubmitTotalMs);
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel gpu asset preparation (window): resolveMs=%.3f spanLookupBuildMs=%.3f tableCopyRebaseMs=%.3f otherMs=%.3f spanHits=%llu spanMisses=%llu copiedBytes=%llu"),
+		       AccumGpuAssetResolveMs, AccumGpuAssetSpanLookupMs, AccumGpuAssetTableCopyMs,
+		       AccumGpuSubmitAssetsMs-AccumGpuAssetResolveMs-AccumGpuAssetSpanLookupMs-AccumGpuAssetTableCopyMs,
+		       (unsigned long long)GpuAssetSpanHits, (unsigned long long)GpuAssetSpanMisses,
+		       (unsigned long long)GpuAssetCopiedBytes);
 	}
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
@@ -16819,6 +16831,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumDispatchOverlayMs = AccumDispatchLoopMs = AccumGpuManagerTickMs = 0.0;
 	AccumGpuSubmitReqHdrMs = AccumGpuSubmitBandMs = AccumGpuSubmitRasterMs = 0.0;
 	AccumGpuSubmitAssetsMs = AccumGpuSubmitPoolMs = AccumGpuSubmitMgrMs = AccumGpuSubmitTotalMs = 0.0;
+	AccumGpuAssetResolveMs = AccumGpuAssetSpanLookupMs = AccumGpuAssetTableCopyMs = 0.0;
+	GpuAssetSpanHits = GpuAssetSpanMisses = GpuAssetCopiedBytes = 0;
 	AccumDispatchSubmitGpuMs = 0.0;
 	GpuSubmitCallsSinceLog = 0;
 	// The cold-burst census, zeroed with the submit split it belongs to and in
@@ -24860,7 +24874,9 @@ bool FVoxelWorldImpl::BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey
 			// returns resolveForCompose's own vector unmodified, so the order is
 			// resolveForCompose's, which is instancesForRect's -- unchanged.
 			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
+			const double AssetResolveStarted = bOrdinary ? FPlatformTime::Seconds() : 0.0;
 			const auto& CanonicalResolved=*ResolvedAssetsForFootprint(LevelKey.Level,LevelKey.Key.X,LevelKey.Key.Y,ResolveScratch);
+			if(bOrdinary)AccumGpuAssetResolveMs += (FPlatformTime::Seconds()-AssetResolveStarted)*1000.0;
             if(!bOrdinary&&CanonicalResolved.size()>VoxelProductionCandidate::MaxResolved)return false;
             std::vector<vxc::AssetField::ResolvedAssetInstance> MarkedResolved;
             const auto* RenderResolved=&CanonicalResolved;
@@ -24913,7 +24929,13 @@ bool FVoxelWorldImpl::BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey
 			TMap<const vxc::AssetGrid*, uint32> BaseForGrid;
 			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
 			{
-				const FGpuAssetGridSpans& S = GpuSpansForGrid(R.grid);
+				const double SpanLookupStarted = bOrdinary ? FPlatformTime::Seconds() : 0.0;
+				bool SpanCacheHit=false;
+				const FGpuAssetGridSpans& S = GpuSpansForGrid(R.grid,bOrdinary?&SpanCacheHit:nullptr);
+				if(bOrdinary){
+					AccumGpuAssetSpanLookupMs += (FPlatformTime::Seconds()-SpanLookupStarted)*1000.0;
+					if(SpanCacheHit)++GpuAssetSpanHits;else ++GpuAssetSpanMisses;
+				}
 				if (S.bTooTall)
 				{
 					// One un-stampable instance and the whole chunk goes to
@@ -24970,6 +24992,7 @@ bool FVoxelWorldImpl::BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey
 					Inst.ColStartsBase = uint32(Req.AssetColStarts.Num());
 					BaseForGrid.Add(R.grid, Inst.ColStartsBase);
 					const uint32 SpanBase = uint32(Req.AssetSpans.Num());
+					const double TableCopyStarted = bOrdinary ? FPlatformTime::Seconds() : 0.0;
 					Req.AssetColStarts.Append(S.ColStarts);
 					Req.AssetSpans.Append(S.Spans);
 					// The per-instance prefix table indexes the JOB buffer, so
@@ -24981,6 +25004,10 @@ bool FVoxelWorldImpl::BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey
 						{
 							Req.AssetColStarts[int32(Inst.ColStartsBase) + I] += SpanBase;
 						}
+					}
+					if(bOrdinary){
+						AccumGpuAssetTableCopyMs += (FPlatformTime::Seconds()-TableCopyStarted)*1000.0;
+						GpuAssetCopiedBytes += (uint64(S.ColStarts.Num())+uint64(S.Spans.Num()))*sizeof(uint32);
 					}
 				}
 				Req.AssetInstances.Add(Inst);

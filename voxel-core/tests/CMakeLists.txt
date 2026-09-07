@@ -181,3 +181,12 @@ else()
   target_compile_options(vxc_sparseassetgrid_noexceptions_tests PRIVATE -fno-exceptions -Wall -Wextra -Werror)
 endif()
 add_test(NAME vxc_sparseassetgrid_noexceptions_tests COMMAND vxc_sparseassetgrid_noexceptions_tests)
+
+# Bounded authority foundation, independently runnable without UE.
+add_executable(vxc_authority_tests test_main.cpp test_assetauthority.cpp)
+target_link_libraries(vxc_authority_tests PRIVATE voxelcore Threads::Threads)
+target_include_directories(vxc_authority_tests PRIVATE .)
+add_test(NAME vxc_authority_tests COMMAND vxc_authority_tests)
+if(NOT MSVC)
+  target_compile_options(vxc_authority_tests PRIVATE -Wall -Wextra -Werror)
+endif()
