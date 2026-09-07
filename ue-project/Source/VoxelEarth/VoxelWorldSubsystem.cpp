@@ -8,6 +8,7 @@
 #include "VoxelEnvironmentLODPrototype.h"
 #include "VoxelProductionCandidatePreparation.h"
 #include "VoxelEnvironmentRenderContext.h"
+#include "VoxelEnvironmentPageBarrier.h"
 #include "Misc/SecureHash.h"
 
 #include "VoxelChunkComponent.h"
@@ -2189,6 +2190,7 @@ struct FChunkRecord
 
 struct FJobResult
 {
+	VoxelEnvironmentPages::FLease PageLease;
 	bool bRenderContextValid = true;
 	VoxelCoords::FVoxelLevelChunkKey Key;
 	uint64 GenerationId = 0;
@@ -7739,6 +7741,10 @@ struct FVoxelWorldImpl
 	int64 LevelSkySkippedTotal[VoxelCoords::kNumLevels] = {};
 
 	TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc> ResultsQueue;
+	// Independent of ChunkRecords and worker counters: leases survive unload
+	// and worker completion until the queued result is finally consumed.
+	// No page freezes/publication changes are activated by this ledger yet.
+	VoxelEnvironmentPages::FBarrier PageBarrier;
 	// Current ResultsQueue depth: delivered-but-not-yet-applied results.
 	// Incremented immediately before BOTH Enqueue sites (the CPU worker task
 	// and OnGpuMeshJobComplete's demand path -- speculative results never
@@ -7889,6 +7895,7 @@ struct FVoxelWorldImpl
 		// T4-1: a speculative result is PARKED on arrival, not applied -- nothing
 		// has asked for it, so it must not create a record or become visible.
 		bool bSpeculative = false;
+		VoxelEnvironmentPages::FLease PageLease;
 	};
 	TMap<uint64, FGpuPendingJob> GpuJobsPending;
 
@@ -7934,8 +7941,10 @@ struct FVoxelWorldImpl
 	// the caller MUST fall through to the CPU path -- the counters have already
 	// been incremented and something owes a result.
 	//
-	// THERE IS NO "DEFER" RETURN AND THERE MUST NOT BE. False means fall
-	// through to the CPU worker, which is a producer change, not a delay; the
+	// False normally falls through to the CPU worker. If the independent page
+	// ledger also refuses CPU admission, demand rolls back its claim and retries.
+	// OutPageLeaseRefused lets speculation preserve its queued key on that bound.
+	// The cold-shading decision remains a producer change, not a delay; the
 	// cold-shading cap therefore decides in the CALLER, before anything is
 	// claimed, and hands its already-taken verdict down through PrecomputedCold
 	// so the census tap here does not re-ask (see FColdShadingVerdict above).
@@ -7944,7 +7953,8 @@ struct FVoxelWorldImpl
 	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
 	                      uint8 RingSkirtMask, bool bSpeculative = false,
 	                      const FColdShadingVerdict* PrecomputedCold = nullptr,
-                          VoxelEnvironmentRender::FContextRef RenderContext = {});
+                          VoxelEnvironmentRender::FContextRef RenderContext = {},
+                          bool* OutPageLeaseRefused = nullptr);
 	// Delivery callback. Game thread, from inside Tick().
 	void OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult);
 
@@ -12265,6 +12275,24 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		}
 	}
 
+	// The bounded worker waits and manager cancellation are complete. Existing
+	// timeout diagnostics above still apply: a timed-out worker is NOT joined.
+	// Discard queued payloads before the final render flush because their
+	// destructors may enqueue render-resource releases, including the last item.
+	for (const auto& Entry : GpuJobsPending) {
+		const bool bRetired = PageBarrier.Retire(Entry.Value.PageLease); check(bRetired);
+	}
+	GpuJobsPending.Reset();
+	{
+		VoxelStreaming::FJobResult Discarded;
+		while (ResultsQueue.Dequeue(Discarded)) {
+			ResultsBacklogCounter.Decrement();
+			if (Discarded.PageLease.IsValid()) {
+				const bool bRetired = PageBarrier.Retire(Discarded.PageLease); check(bRetired);
+			}
+		}
+	}
+
 	if (GIsRHIInitialized)
 	{
 		const double FlushT0 = FPlatformTime::Seconds();
@@ -12272,6 +12300,8 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		UE_LOG(LogVoxelStream, Log, TEXT("WaitForInFlightTasks: flushed rendering commands at teardown in %.0f ms."),
 		       (FPlatformTime::Seconds() - FlushT0) * 1000.0);
 	}
+
+	check(PageBarrier.ActiveLeases() == 0);
 }
 
 namespace
@@ -23653,8 +23683,10 @@ FVoxelWorldImpl::FColdShadingVerdict FVoxelWorldImpl::ProbeColdShading(
 bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
                                        uint8 RingSkirtMask, bool bSpeculative,
                                        const FColdShadingVerdict* PrecomputedCold,
-                                       VoxelEnvironmentRender::FContextRef RenderContext)
+                                       VoxelEnvironmentRender::FContextRef RenderContext,
+                                       bool* OutPageLeaseRefused)
 {
+    if (OutPageLeaseRefused) *OutPageLeaseRefused = false;
     if(!RenderContext)RenderContext=CaptureProductionRenderContext();
     if(!ProductionRenderSupported(LevelKey,RenderContext))return false;
 	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
@@ -23664,6 +23696,14 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		// dead fork, not a submit cost, and it would dilute perCallUs.
 		return false;
 	}
+
+	const auto PageLease = PageBarrier.TryAcquire(LevelKey, VoxelEnvironmentPages::EProducer::Gpu);
+	if (!PageLease.IsValid()) {
+		if (OutPageLeaseRefused) *OutPageLeaseRefused = true;
+		return false;
+	}
+	bool bLeaseSubmitted = false;
+	ON_SCOPE_EXIT { if (!bLeaseSubmitted) { const bool bRetired = PageBarrier.Retire(PageLease); check(bRetired); } };
 
 	// The gpu-submit split (see the AccumGpuSubmit* members for the 1,547 ms
 	// finding these exist to name). CONTIGUOUS sequential stamps: each bucket
@@ -24295,7 +24335,8 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 
 	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool,
 	                                     /*bLowPriority*/ bSpeculative, /*bHoldBrickPublication*/ false, RenderContext->Generation());
-	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, RenderContext->Generation(), bSpeculative });
+	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, RenderContext->Generation(), bSpeculative, PageLease });
+	bLeaseSubmitted = true;
 
 	// The gpu-submit split's normal exit (the decline path above mirrors it).
 	{
@@ -24326,7 +24367,7 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	if (!bAcceptingGpuResults)
 	{
 		++GpuResultsAbsorbedAtTeardown;
-		GpuJobsPending.Remove(GpuResult.JobId);
+		// Keep the lease until teardown has drained the manager/render commands.
 		return;
 	}
 
@@ -24344,6 +24385,8 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 		return;
 	}
 
+	bool bLeaseQueued = false;
+	ON_SCOPE_EXIT { if (!bLeaseQueued) { const bool bRetired = PageBarrier.Retire(Pending.PageLease); check(bRetired); } };
 	++GpuMeshJobsDeliveredSinceLog;
 	GpuMeshSubmitToDeliverMsSinceLog += GpuResult.SubmitToDeliverMs;
 	GpuMeshSubmitToDeliverMaxMs = FMath::Max(GpuMeshSubmitToDeliverMaxMs, GpuResult.SubmitToDeliverMs);
@@ -24471,6 +24514,7 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 
 	VoxelStreaming::FJobResult Result;
 	Result.Key = Pending.Key;
+	Result.PageLease = Pending.PageLease;
 	Result.GenerationId = Pending.GenerationId;
     Result.OwnershipGeneration=Pending.OwnershipGeneration;
     Result.bRenderContextValid=ProductionOwnership.AcceptsVisibleJob(Pending.OwnershipGeneration)&&GpuResult.OwnershipGeneration==Pending.OwnershipGeneration;
@@ -24629,6 +24673,7 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	// direction. Counting after would under-read and let dispatch overshoot.
 	ResultsBacklogCounter.Increment();
 	ResultsQueue.Enqueue(MoveTemp(Result));
+	bLeaseQueued = true;
 	JobsInFlightCounter.Decrement();
 }
 
@@ -25524,10 +25569,9 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		// THE CLAIM (moved here from above the fork predicates -- see the note
 		// at its old site for the identifier-by-identifier argument). From this
-		// statement to the end of the iteration there is no `continue`: both
-		// fork branches owe exactly one FJobResult on ResultsQueue and exactly
-		// one JobsInFlightCounter decrement, and any early exit inserted between
-		// here and them breaks that contract.
+		// statement onward a successful producer owes exactly one queued result
+		// and counter decrement. The bounded page-lease refusal below is the
+		// sole non-producing exit: it explicitly rolls this entire claim back.
 		Rec->bJobInFlight = true;
 		JobsInFlightCounter.Increment();
 		++LevelJobsInFlight[PickLevel];
@@ -25691,6 +25735,22 @@ void FVoxelWorldImpl::DispatchJobs()
 			}
 		}
 
+		const auto CpuPageLease = PageBarrier.TryAcquire(LevelKey, VoxelEnvironmentPages::EProducer::Cpu);
+		if (!CpuPageLease.IsValid())
+		{
+			// Undo the shared dispatch claim; no producer owns this key yet.
+			// Retry next tick, rather than repeatedly popping it in this loop.
+			Rec->bJobInFlight = false;
+			JobsInFlightCounter.Decrement();
+			--LevelJobsInFlight[PickLevel];
+			--JobsDispatchedSinceLog;
+			--JobsDispatchedTotalForCap;
+			--LevelJobsDispatchedSinceLog[PickLevel];
+			--LevelJobsDispatchedTotal[PickLevel];
+			DeferredOwnership[PickLevel].Add(PoppedEntry);
+			continue;
+		}
+
 		// The fork resolved CPU (GPU declined, failed to submit, or was
 		// excluded). Split bookkeeping mirrors the GPU branch above; the
 		// atomic is the exact-CPU instrument (see its doc comment) and is
@@ -25705,7 +25765,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// spelling (-VoxelWorkerPool routes it to a dedicated pool; default
 		// is UE::Tasks exactly as before). Captures unchanged.
 		auto JobBody =
-			[GenPtr, LevelKey, GenId, RenderContext, QueuePtr, CounterPtr, BacklogPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
+			[GenPtr, LevelKey, GenId, RenderContext, CpuPageLease, QueuePtr, CounterPtr, BacklogPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
 			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident,
@@ -25723,6 +25783,7 @@ void FVoxelWorldImpl::DispatchJobs()
 				VoxelStreaming::FJobResult Result;
 				Result.Key = LevelKey;
 				Result.GenerationId = GenId;
+				Result.PageLease = CpuPageLease;
                 Result.OwnershipGeneration=RenderContext->Generation();
 				Result.bPredictedEmpty = bPredictedEmpty;
 
@@ -27620,10 +27681,12 @@ void FVoxelWorldImpl::DispatchSpeculativeJobs()
 				++ColdCapExemptSinceLog;
 			}
 		}
+		bool bPageLeaseRefused = false;
 		if (!SubmitGpuMeshJob(Key, /*GenId*/ 0, /*RingSkirtMask*/ 0, /*bSpeculative*/ true,
-		                      &SpecVerdict))
+		                      &SpecVerdict, {}, &bPageLeaseRefused))
 		{
-			SpeculativeInFlight.Remove(Key);
+			if (bPageLeaseRefused) SpeculativeKeys.Add(Key); // bounded retry, no lost candidate
+			else SpeculativeInFlight.Remove(Key);
 			break; // fork refused (budget) -- stop, do not spin
 		}
 		++SpecOutstanding;
@@ -28505,6 +28568,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			ExitReason = EDrainExit::QueueEmpty;
 			break;
 		}
+		// Capture independently of Result: application may move its payload.
+		// All continue/discard paths (including absent records) retire exactly once.
+		const auto ConsumedPageLease = Result.PageLease;
+		ON_SCOPE_EXIT {
+			if (ConsumedPageLease.IsValid()) { const bool bRetired = PageBarrier.Retire(ConsumedPageLease); check(bRetired); }
+		};
 		// Dispatch-ahead depth: one dequeue, one decrement -- stale discards
 		// included, because the counter measures QUEUE DEPTH (what the
 		// dispatch loop's gate must not let grow), not live results.
@@ -32070,12 +32139,13 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 	}
 
 	// Streaming anchor (decisions table: "Track a streaming anchor each
-	// tick"): the first local player's possessed pawn, falling back to the
-	// world origin if there is none yet (e.g. before RestartPlayer runs).
+	// tick"): the first local player's possessed pawn or an explicit preview
+	// anchor while possession is pending.
 	// A possessed pawn always wins. The override below only fills the gap
 	// before one exists -- see SetStreamingAnchorOverride for the two ways the
 	// world-origin fallback misleads the front end.
 	FVector Anchor = StreamingAnchorOverride.Get(FVector::ZeroVector);
+	bool bHasStreamingAnchor = StreamingAnchorOverride.IsSet();
 	// The camera's forward (XY, unit), captured here on the game thread and
 	// handed to streaming BY VALUE -- the view-direction half of the priority
 	// key (-VoxelViewBias) and the dispatchDot metric both read it. The PAWN
@@ -32091,6 +32161,7 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 			if (APawn* Pawn = PC->GetPawn())
 			{
 				Anchor = Pawn->GetActorLocation();
+				bHasStreamingAnchor = true;
 			}
 			if (PC->PlayerCameraManager)
 			{
@@ -32105,6 +32176,9 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 			}
 		}
 	}
+	// Session restoration can defer possession. Origin is not a substitute:
+	// it may be outside the resident terrain provider's coverage.
+	if (!bHasStreamingAnchor) return;
 	Impl->SetStreamViewDir(ViewDirXY);
 
 	Impl->TickStreaming(Anchor, *ChunkOwner, *ChunkRoot, ChunkMaterial, DeltaTime);

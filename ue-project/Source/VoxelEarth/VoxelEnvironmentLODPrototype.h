@@ -26,7 +26,10 @@ public:
     bool CaptureObjectState(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic);
     bool RestoreObjectState(const TArray<uint8>& Geometry,const TArray<uint8>& Dynamic);
     void BeginStagedObjectRestore(FVoxelImmutableGeometry Geometry,TArray<uint8> Dynamic,TFunction<void(bool)> Completion);
+    // Success callback waits asynchronously for queued render-resource commands.
+    // Advance never waits/flushes the rendering thread; actor stays hidden.
     bool AdvanceStagedObjectRestore();
+    bool IsStagedRenderResourcesPending() const;
     bool PublishStagedObjectRestore();
     // Explicit production preparation status, independent of rendering visibility.
     // Retained on cancellation; only publication clears it. Persistence discovery

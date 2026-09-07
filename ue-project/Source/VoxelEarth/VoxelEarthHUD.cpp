@@ -130,7 +130,7 @@ void AVoxelEarthHUD::DrawHUD()
 	}
 
 	const AVoxelEarthPlayerController* VoxelPC = Cast<AVoxelEarthPlayerController>(PlayerOwner);
-	if (!VoxelPC)
+	if (!VoxelPC || !VoxelPC->GetPawn())
 	{
 		return;
 	}

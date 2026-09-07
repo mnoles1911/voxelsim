@@ -1,4 +1,5 @@
 #include "VoxelEnvironmentLODPrototype.h"
+#include "RenderCommandFence.h"
 #include "Async/Async.h"
 #include "VoxelPlantMeshComponent.h"
 #include "VoxelVegetationRender.h"
@@ -351,7 +352,9 @@ struct FEnvironmentStagedRestore {
     TArray<FSection> Meshes;
     FTransform Transform;
     FVoxelEnvironmentAssetDescriptor Descriptor;
-    int32 Next=0;
+    int32 Next=0,RenderNext=0;
+    bool RenderUpdatesStarted=false,RenderFenceBegun=false;
+    FRenderCommandFence RenderFence;
     bool Collision=false,Severed=false,Ready=false,Valid=false,Adopted=false;
 };
 AVoxelEnvironmentLODPrototype::AVoxelEnvironmentLODPrototype() {
@@ -529,11 +532,37 @@ bool AVoxelEnvironmentLODPrototype::AdvanceStagedObjectRestore(){
         auto& S=Job->Meshes[Job->Next++];auto C=NewObject<UVoxelPlantMeshComponent>(this);C->SetupAttachment(Levels[S.Level]);C->SetMobility(EComponentMobility::Movable);C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetMaterial(0,Materials[S.Level]);C->SetVisibility(false);C->RegisterComponent();
         ApplyGeometry(C,S.Mesh);Sections.Add(C);State->SectionMaps[S.Level].Add(S.Key,C);S.Mesh=FEnvironmentLodMeshGeometry();return true;
     }
-    GeometrySnapshot=Job->Geometry;ActiveLOD=0;PreviousLOD=-1;SetLevelVisible(0,true);
+    if(!Job->RenderUpdatesStarted){
+        GeometrySnapshot=Job->Geometry;ActiveLOD=0;PreviousLOD=-1;
+        // Do not propagate visibility across every section in one frame.
+        Levels[0]->SetVisibility(true,false);
+        Job->RenderUpdatesStarted=true;return true;
+    }
+    // CreateMeshSection/visibility can leave deferred render-state work queued
+    // for end of frame. A fence inserted before that work would acknowledge
+    // nothing. Submit one component's pending update per call, while hidden.
+    const int32 ComponentCount=1+Levels.Num()+Sections.Num();
+    if(Job->RenderNext<ComponentCount){
+        const int32 Index=Job->RenderNext++;
+        UActorComponent* Component=Index==0?GetRootComponent():Index<=Levels.Num()?static_cast<UActorComponent*>(Levels[Index-1]):static_cast<UActorComponent*>(Sections[Index-1-Levels.Num()]);
+        if(!IsValid(Component)||!Component->IsRegistered()){CancelStagedObjectRestore();return true;}
+        if(Index>Levels.Num()){auto Section=Sections[Index-1-Levels.Num()];Section->SetVisibility(Section->GetAttachParent()==Levels[0],false);}
+        Component->DoDeferredRenderUpdates_Concurrent();return true;
+    }
+    if(!Job->RenderFenceBegun){
+        Job->RenderFence.BeginFence(FRenderCommandFence::ESyncDepth::RHIThread);
+        Job->RenderFenceBegun=true;return true;
+    }
+    if(!Job->RenderFence.IsFenceComplete())return false;
     PreparedRestore=Job;StagedRestore.Reset();
     // Visibility/collision publication belongs to the bridge after its final
-    // revision check. An actor remains hidden until Completion accepts it.
+    // revision check. The fence acknowledges preceding resource commands,
+    // not GPU completion or a joint terrain/object rendered-frame boundary.
+    // The actor remains hidden until explicit PublishStagedObjectRestore.
     auto Done=MoveTemp(Job->Completion);if(Done)Done(true);return true;
+}
+bool AVoxelEnvironmentLODPrototype::IsStagedRenderResourcesPending() const {
+    check(IsInGameThread());return StagedRestore&&StagedRestore->RenderFenceBegun;
 }
 void AVoxelEnvironmentLODPrototype::MarkUnpublishedPreparation(){
     check(IsInGameThread());bUnpublishedPreparation=true;
