@@ -9,6 +9,7 @@
 #include "Kismet/KismetMaterialLibrary.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "Misc/CommandLine.h" // -VoxelBathyOcean; explicit rather than via a neighbour's include
+#include "HAL/IConsoleManager.h"
 #include "Misc/Parse.h"
 #include "PixelFormat.h"
 #include "RenderUtils.h"
@@ -550,3 +551,254 @@ void UVoxelBathyFieldSubsystem::PublishInvalid()
 	}
 	bPublished_ = false;
 }
+
+bool UVoxelBathyFieldSubsystem::SampleWindowAtWorld(double WorldXUU, double WorldYUU,
+                                                    float& OutDepthM, float& OutShoreM,
+                                                    float& OutValid) const
+{
+	if (!bArmed_ || !bPublished_ || Pixels_.Num() != kSize * kSize)
+	{
+		return false;
+	}
+	// FLOOR, not a cast: a cast truncates toward zero and this world is entirely
+	// at negative coordinates, so a truncating index would land one texel the
+	// wrong side of every boundary -- 1.875 m of error in exactly the quantity
+	// being measured.
+	const int64 Px = static_cast<int64>(FMath::FloorToDouble(WorldXUU / kTexelUU));
+	const int64 Py = static_cast<int64>(FMath::FloorToDouble(WorldYUU / kTexelUU));
+	const int64 Col = Px - OriginPx_;
+	const int64 Row = Py - OriginPy_;
+	if (Col < 0 || Col >= kSize || Row < 0 || Row >= kSize)
+	{
+		return false;
+	}
+	const FFloat16Color& P = Pixels_[static_cast<int32>(Row * kSize + Col)];
+	OutDepthM = P.R.GetFloat();
+	OutShoreM = P.G.GetFloat();
+	OutValid = P.B.GetFloat();
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// voxel.Water.Shore.Audit -- DOES THE BAKED SHORELINE SIT WHERE THE DRAWN WATER
+// ENDS? (2026-09-07)
+// ---------------------------------------------------------------------------
+//
+// THE CLAIM THIS EXISTS TO SETTLE. The `shoredist` material arm measured, off a
+// PNG, that every rendered water pixel carries 6 m < shore_m < 40 m, and read
+// that as "the baked lake polygon and the drawn sheet disagree by at least 6 m".
+// The alternative reading is a resolution one: a camera 0.7 m over the surface
+// looking 18 degrees down compresses the last ten metres of water before a shore
+// into a handful of screen rows, so a screen strip labelled "the waterline"
+// spans tens of metres of world and a 1.6 m band inside it cannot be seen at
+// all. Those two readings have completely different fixes -- a re-bake versus a
+// capture pose -- and no frame can separate them.
+//
+// So ask in metres instead of pixels, and ask BOTH halves at the same XY in the
+// same frame:
+//   * the baked field, through SampleWindowAtWorld -- literally the texel the
+//     material samples, after holes and after the ocean branch;
+//   * the drawn extent, through UVoxelWaterSubsystem::WaterSurfaceZAtWorld --
+//     the same datum+extent authority AVoxelWaterSheetActor gathers its rects
+//     from, so "is water DRAWN here" is answered by the thing that draws it.
+//
+// The number this prints and nothing else matters is `gapM` per ray: the
+// distance between where the drawn water ends and where the baked signed
+// distance crosses zero. By construction of the bake (basins.py runs an exact
+// Euclidean distance transform over the SAME lake_extent_mask the client's
+// sampler fills) those two should differ by at most one source pixel, 1.875 m.
+// A gap of tens of metres is the alleged defect, measured; a gap under ~2 m
+// says the material's input is correct and the foam hunt belongs at the pose.
+//
+// It also prints the surface and ground Z of the origin column, because every
+// water capture at this lake for two days was framed from an altitude measured
+// off the LAKEBED and half of them were shot from under the water.
+namespace
+{
+FAutoConsoleCommandWithWorldAndArgs GVoxelWaterShoreAuditCmd(
+	TEXT("voxel.Water.Shore.Audit"),
+	TEXT("voxel.Water.Shore.Audit [ReachM=120] [Rays=8] [StepM=0.25] -- walk rays out from the ")
+	TEXT("player pawn and report, per ray, where the DRAWN water ends (the sheet's own extent ")
+	TEXT("authority) against where the BAKED shore distance crosses zero (the texel the water ")
+	TEXT("material samples). The two are the same shoreline and the gap between them is the ")
+	TEXT("shore-foam mechanism number."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			UVoxelBathyFieldSubsystem* Bathy =
+				World ? World->GetSubsystem<UVoxelBathyFieldSubsystem>() : nullptr;
+			const UVoxelWaterSubsystem* Water =
+				World ? World->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+			APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+			APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+			if (!Bathy || !Water || !Pawn)
+			{
+				UE_LOG(LogVoxelWater, Warning,
+				       TEXT("Shore.Audit: need a bathy field, a water subsystem and a pawn ")
+				       TEXT("(bathy=%d water=%d pawn=%d)."),
+				       Bathy != nullptr, Water != nullptr, Pawn != nullptr);
+				return;
+			}
+			const double ReachM = (Args.Num() > 0) ? FMath::Clamp(FCString::Atod(*Args[0]), 1.0, 400.0) : 120.0;
+			const int32 Rays = (Args.Num() > 1) ? FMath::Clamp(FCString::Atoi(*Args[1]), 1, 64) : 8;
+			const double StepM = (Args.Num() > 2) ? FMath::Clamp(FCString::Atod(*Args[2]), 0.05, 10.0) : 0.25;
+
+			const FVector Origin = Pawn->GetActorLocation();
+			FWaterSurfaceSample OriginSample;
+			const bool bOriginWet = Water->WaterSurfaceZAtWorld(Origin.X, Origin.Y, OriginSample);
+			float D0 = 0.f, S0 = 0.f, V0 = 0.f;
+			const bool bOriginBathy = Bathy->SampleWindowAtWorld(Origin.X, Origin.Y, D0, S0, V0);
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("Shore.Audit: origin (%.0f, %.0f) UU  pawnZ=%.0f  water=%d surfaceZ=%.1f ")
+			       TEXT("groundZ=%.1f (pawn is %.2f m above the surface)  bathy=%d depth=%.2fm ")
+			       TEXT("shore=%.2fm valid=%.0f  window origin (%.0f, %.0f) UU published=%d"),
+			       Origin.X, Origin.Y, Origin.Z, bOriginWet ? 1 : 0,
+			       OriginSample.SurfaceZUU, OriginSample.GroundZUU,
+			       (Origin.Z - OriginSample.SurfaceZUU) * 0.01,
+			       bOriginBathy ? 1 : 0, D0, S0, V0,
+			       Bathy->WindowOriginXUU(), Bathy->WindowOriginYUU(),
+			       Bathy->IsPublished() ? 1 : 0);
+
+			const int32 Steps = FMath::Max(1, FMath::RoundToInt(ReachM / StepM));
+			for (int32 R = 0; R < Rays; ++R)
+			{
+				const double Yaw = 360.0 * static_cast<double>(R) / static_cast<double>(Rays);
+				const double DX = FMath::Cos(FMath::DegreesToRadians(Yaw));
+				const double DY = FMath::Sin(FMath::DegreesToRadians(Yaw));
+				// -1 means "not found inside ReachM", printed as such rather than
+				// folded into 0 -- a ray that never leaves the lake is a real and
+				// different answer from a ray whose shore is at the pawn's feet.
+				double DrawnEdgeM = -1.0, BakedZeroM = -1.0;
+				float ShoreAtDrawnEdge = 0.f, ShoreAtReach = 0.f;
+				bool bPrevWet = bOriginWet;
+				float PrevShore = S0;
+				bool bAnyBathy = bOriginBathy;
+				for (int32 i = 1; i <= Steps; ++i)
+				{
+					const double RM = i * StepM;
+					const double X = Origin.X + DX * RM * 100.0;
+					const double Y = Origin.Y + DY * RM * 100.0;
+					FWaterSurfaceSample S;
+					const bool bWet = Water->WaterSurfaceZAtWorld(X, Y, S);
+					float Dm = 0.f, Sm = 0.f, Vm = 0.f;
+					const bool bHave = Bathy->SampleWindowAtWorld(X, Y, Dm, Sm, Vm);
+					bAnyBathy |= bHave;
+					if (bHave)
+					{
+						ShoreAtReach = Sm;
+					}
+					if (DrawnEdgeM < 0.0 && bPrevWet && !bWet)
+					{
+						DrawnEdgeM = RM - StepM * 0.5;
+						ShoreAtDrawnEdge = bHave ? Sm : PrevShore;
+					}
+					if (BakedZeroM < 0.0 && bHave && PrevShore > 0.f && Sm <= 0.f)
+					{
+						// Linear crossing between two texel samples; the field is
+						// a distance, so this is the right interpolation and it is
+						// the decimetre precision the 100 mm LSB was baked for.
+						const double Frac = static_cast<double>(PrevShore) /
+						                    FMath::Max(1e-6, static_cast<double>(PrevShore - Sm));
+						BakedZeroM = (RM - StepM) + Frac * StepM;
+					}
+					bPrevWet = bWet;
+					if (bHave)
+					{
+						PrevShore = Sm;
+					}
+				}
+
+				// --- THE MATERIAL'S OWN SHORE-FOAM TERM, EVALUATED ON THE CPU ----
+				//
+				// Reconstructed from create_water_voxel_material.py:1676-1750 with
+				// the SHIPPING defaults and the noise left out (BathyFoamNoiseM only
+				// wiggles the isoline; it cannot turn the term on or off):
+				//
+				//   band  = (1 - smoothstep(0, width, shore_m)) * saturate(8*shore_m)
+				//   slope = depth_m / max(shore_m, 0.5)
+				//   gate  = 1 - smoothstep(shelfLo, shelfHi, slope)
+				//   foam  = band * gate * gain * validity
+				//
+				// WHY IT IS WORTH DUPLICATING FOUR LINES OF SHADER MATH HERE. Five
+				// runtime ladders and two debug arms have now been spent asking
+				// whether this term is alive at a given shore, each costing a regen
+				// or a capture and each answered by eye off a tonemapped PNG at a
+				// grazing angle. The inputs are two numbers per texel that the game
+				// thread can read directly, so the answer -- IS there a foam ribbon
+				// at this shore, and HOW WIDE IS IT IN METRES -- is arithmetic, and
+				// arithmetic can be printed. A frame is then needed only to confirm
+				// what the number already says, at a pose chosen to resolve it.
+				//
+				// IT IS A MIRROR AND CAN DRIFT, like every mirror in this tree. The
+				// four constants are the material's defaults; a runtime
+				// -VoxelWaterMatScalar override or a regen with different defaults
+				// is NOT reflected here, and the line says which numbers it used so
+				// a reader can tell.
+				constexpr float kFoamWidthM = 1.6f;
+				constexpr float kFoamShelfLo = 0.05f;
+				constexpr float kFoamShelfHi = 0.25f;
+				constexpr float kFoamGain = 0.55f;
+				double FoamMax = 0.0, FoamRibbonM = 0.0, BandMax = 0.0, GateMax = 0.0;
+				double SlopeAtShore = -1.0;
+				if (BakedZeroM >= 0.0)
+				{
+					// Inward from the baked waterline, at the finest step the caller
+					// asked for, far enough to leave any plausible band behind.
+					const int32 InSteps = FMath::Max(1, FMath::RoundToInt(24.0 / StepM));
+					for (int32 j = 0; j <= InSteps; ++j)
+					{
+						const double RM = BakedZeroM - j * StepM;
+						if (RM < 0.0)
+						{
+							break;
+						}
+						const double X = Origin.X + DX * RM * 100.0;
+						const double Y = Origin.Y + DY * RM * 100.0;
+						float Dm = 0.f, Sm = 0.f, Vm = 0.f;
+						if (!Bathy->SampleWindowAtWorld(X, Y, Dm, Sm, Vm) || Sm <= 0.f)
+						{
+							continue;
+						}
+						// Hermite, spelled out rather than taken from FMath: the
+						// material's node is UE's SmoothStep and this must match it
+						// exactly, and a helper whose overload set differs between
+						// engine versions is not the place to find that out.
+						const auto Smooth = [](double E0, double E1, double X) -> double
+						{
+							const double T = FMath::Clamp((X - E0) / FMath::Max(1e-6, E1 - E0), 0.0, 1.0);
+							return T * T * (3.0 - 2.0 * T);
+						};
+						const double Band = (1.0 - Smooth(0.0, kFoamWidthM, Sm)) *
+						                    FMath::Clamp(8.0 * static_cast<double>(Sm), 0.0, 1.0);
+						const double Slope = static_cast<double>(Dm) /
+						                     FMath::Max(0.5, static_cast<double>(Sm));
+						const double Gate = 1.0 - Smooth(kFoamShelfLo, kFoamShelfHi, Slope);
+						const double Foam = Band * Gate * kFoamGain * static_cast<double>(Vm);
+						BandMax = FMath::Max(BandMax, Band);
+						GateMax = FMath::Max(GateMax, Gate);
+						FoamMax = FMath::Max(FoamMax, Foam);
+						if (Foam > 0.05)
+						{
+							FoamRibbonM += StepM;
+						}
+						if (SlopeAtShore < 0.0 && Sm > 0.f)
+						{
+							SlopeAtShore = Slope;
+						}
+					}
+				}
+				const double GapM = (DrawnEdgeM >= 0.0 && BakedZeroM >= 0.0)
+					                    ? (BakedZeroM - DrawnEdgeM)
+					                    : -999.0;
+				UE_LOG(LogVoxelWater, Log,
+				       TEXT("Shore.Audit: yaw %5.1f  drawnEdge=%7.2fm  bakedZero=%7.2fm  ")
+				       TEXT("gap=%8.2fm  shore@drawnEdge=%7.2fm  shore@%.0fm=%7.2fm  bathy=%d  ")
+				       TEXT("|| foamMax=%.3f ribbon=%.2fm bandMax=%.3f gateMax=%.3f bedSlopeAtShore=%.3f ")
+				       TEXT("(width %.2f, shelf %.2f-%.2f, gain %.2f)"),
+				       Yaw, DrawnEdgeM, BakedZeroM, GapM, ShoreAtDrawnEdge, ReachM, ShoreAtReach,
+				       bAnyBathy ? 1 : 0,
+				       FoamMax, FoamRibbonM, BandMax, GateMax, SlopeAtShore,
+				       kFoamWidthM, kFoamShelfLo, kFoamShelfHi, kFoamGain);
+			}
+		}));
+} // namespace

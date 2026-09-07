@@ -230,6 +230,36 @@ public:
 	double LastFillMs() const { return LastFillMs_; }
 	bool IsArmed() const { return bArmed_; }
 
+	// READ BACK EXACTLY WHAT THE MATERIAL READS, at one world column.
+	//
+	// WHY THIS EXISTS (2026-09-07, the shore-foam hunt). The foam band is
+	// evaluated on `shore_m` and five runtime ladders on the material moved no
+	// pixels; the `shoredist` debug arm then measured 6 m < shore_m < 40 m on
+	// every water pixel of a frame, INCLUDING the strip the eye reads as the
+	// waterline, and concluded the bake and the drawn sheet disagree. That
+	// conclusion is an inference off a PNG: at a grazing shoreline the last few
+	// metres of water are a couple of screen rows, so a screen strip cannot
+	// resolve a 1.6 m band and CANNOT tell "the band is absent" from "the band
+	// is two pixels tall". This is the same measurement in NUMBERS, on the game
+	// thread, against the same buffer the upload sends -- and paired (see
+	// voxel.Water.Shore.Audit) with the water subsystem's own extent answer, so
+	// the two halves of the alleged disagreement are read at the SAME world XY
+	// in the same frame instead of being compared across two instruments.
+	//
+	// Reads Pixels_, not the raw planes: Pixels_ is post-hole-fill and
+	// post-ocean-branch, i.e. the numbers the texture actually carries. Returns
+	// false (outputs untouched) when the window is unarmed, unpublished, or
+	// this column is outside it -- which is itself an answer, and the caller
+	// must say so rather than print a zero.
+	bool SampleWindowAtWorld(double WorldXUU, double WorldYUU,
+	                         float& OutDepthM, float& OutShoreM, float& OutValid) const;
+
+	// The published window's minimum corner in world UU, for a caller that wants
+	// to report where the numbers above came from.
+	double WindowOriginXUU() const { return static_cast<double>(OriginPx_) * kTexelUU; }
+	double WindowOriginYUU() const { return static_cast<double>(OriginPy_) * kTexelUU; }
+	bool IsPublished() const { return bPublished_; }
+
 private:
 	// True once the asset has been found and PASSED the size/format/mip guard.
 	// False disables everything, permanently, for this world.

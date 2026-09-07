@@ -1673,7 +1673,38 @@ def main():
     # world-locked and does not swim when the camera moves.
     #
     # SMOOTHSTEP, NEVER STEP -- one aliased pixel-wide line is worse than no foam.
-    shore_width = scalar_param("BathyFoamWidthM", 1.6, -1300, 60)
+    # 6.0 m, RAISED FROM 1.6 ON 2026-09-07, AND THE OLD VALUE WAS BELOW THE
+    # FIELD'S OWN QUANTUM -- so the band was empty at every lake in the world
+    # from the day it was chosen.
+    #
+    # `shore_m` is an EXACT Euclidean distance transform run on the fine tile's
+    # 1.875 m raster (basins.bathymetry_planes: inside = edt(wet),
+    # outside = edt(~wet), signed_px = inside - outside). A transform measures to
+    # the nearest cell of the OPPOSITE class, so the nearest a water cell can
+    # ever be to land is ONE PIXEL: on texel centres the plane's positive values
+    # are 1.90, 3.80, 5.70 m ... and (0, 1.6) is a range it cannot take.
+    # tilestore.h:597-601 states this ("the nearest any cell gets to the
+    # shoreline is one pixel, 1.875 m == 19 stored units"); it had never been
+    # read against this number. The material samples bilinearly, so the band is
+    # not literally empty -- it lives inside the ~0.42 of a texel where the
+    # interpolant climbs from -1.90 to +1.90 through (0, 1.6), i.e. a ribbon
+    # under a metre wide pinned to the outermost half-texel of drawn water.
+    #
+    # MEASURED, in one frame with its own positive control (VoxelVerify00934,
+    # the `shoredist` arm at the pond, camera 6.6 m over the surface pitched
+    # 35 deg down, so the shoreline is resolved rather than grazing): the arm's
+    # B channel (shore_m > 6 m) leaves a red-only ribbon along the waterline
+    # measured at 4.0-4.8 m of world width, while its G channel -- the LIVE
+    # BathyFoamWidthM, i.e. exactly the set shore_foam is nonzero on -- paints
+    # ZERO pixels in the whole frame. Same pixels, same instant, same texture
+    # fetch: the 6 m threshold lands and the 1.6 m one does not.
+    #
+    # 6.0 is 3.2 source texels, which is the smallest value that is robustly
+    # several samples wide after the bilinear ramp and the +/-0.9 m noise below.
+    # It is a LOOK change and the owner judges looks; the number is derived from
+    # the raster rather than chosen, and the ladder that produced it is on
+    # record in docs/water-ocean-tides-plan-2026-09-04.md.
+    shore_width = scalar_param("BathyFoamWidthM", 6.0, -1300, 60)
     shore_noise_m = scalar_param("BathyFoamNoiseM", 0.9, -1300, 120)
     shore_noise = mel.create_material_expression(material, unreal.MaterialExpressionNoise, -1300, 180)
     # Texture-based gradient noise: the cheap one. 2 levels at 0.35 (i.e. ~3 m
@@ -2089,7 +2120,39 @@ def main():
     # ladder can tune it; 0 restores exactly the sky_light emissive -- and the
     # whole term inherits every upstream gate (ripple arm, WaveTimeScale,
     # RippleFieldGain), so every existing off arm stays an off arm.
+    # --- AND SO DOES THE SHORE FOAM, FOR THE SAME REASON (2026-09-07) --------
+    #
+    # The 09-06 note above says "EVERY foam signal lands only on BaseColor" and
+    # then routes only the DISTURBANCE half onto emissive. The shore half was
+    # left on the dead channel, and a measurement finished the argument:
+    # `-VoxelWaterMatScalar=BathyFoamWidthM:6,BathyFoamGain:5` (both echoed by
+    # the sheet's own log line, so this is not the pre-06:00 single-pair trap)
+    # moves 1.17% of the frame at the pond pose -- so the shore term IS alive
+    # and IS reaching the pixel -- and what it draws is a BLACK band at the
+    # waterline, not whitewater (VoxelVerify00936 against the shipping
+    # VoxelVerify00922). That is the two halves of the composite disagreeing:
+    # MP_Opacity is saturate(foam) and it responds (the volume is removed,
+    # which is what makes the band dark), while the BaseColor half -- the same
+    # `foam`, lerped from black to foam_tint -- does not arrive. It is the same
+    # null the 2026-08-30 experiment measured on this shading model from the
+    # other direction, and it is also the shipped "lake sheet black band"
+    # (docs/lake-sheet-black-band-2026-08-29.md) seen with the foam turned up.
+    #
+    # So the shore foam rides emissive too, exactly as the wake does: additive,
+    # the same tint, its own baked scalar so a ladder can tune it, 0 restoring
+    # the previous emissive bit for bit, and inheriting every upstream gate
+    # (SHORE FX arm, BathyFoamGain, the shelf gate, bathy validity, the
+    # top-face mask) so every existing off arm stays an off arm. It does NOT
+    # remove the BaseColor path -- that stays, harmless, and right the day SLW
+    # honours it.
     surface_emissive = sky_light["emissive"]
+    shore_emiss_gain = bathy_b.scalar("ShoreFoamEmissive", 0.6)
+    shore_emiss_masked = bathy_b.mul(shore_foam, top_face_mask)
+    shore_emiss = bathy_b.mul(shore_emiss_masked, shore_emiss_gain)
+    shore_emiss_tint = mel.create_material_expression(
+        material, unreal.MaterialExpressionConstant3Vector, -190, -580)
+    shore_emiss_tint.set_editor_property("constant", unreal.LinearColor(0.82, 0.90, 0.94, 1.0))
+    surface_emissive = bathy_b.add(surface_emissive, bathy_b.mul(shore_emiss_tint, shore_emiss))
     if disturbance_foam is not None:
         dist_emiss_gain = bathy_b.scalar("DisturbanceFoamEmissive", 0.6)
         dist_emiss_masked = bathy_b.mul(disturbance_foam["foam"], top_face_mask)
@@ -2807,6 +2870,62 @@ def main():
             "M_WaterVoxel PARAMS ARM: ON -- emissive R=origin.x/-1e7, G=invSize*5120, "
             "B=gain/2.5, straight from the collection. Black lake = the material is not "
             "receiving the runtime collection values. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "wakeprobe":
+        # THREE QUESTIONS, ONE FRAME (2026-09-07). The wake hunt has now spent
+        # eleven captures asking them one at a time, and two of the answers
+        # contradict each other, so they are asked together on the same pixels:
+        #
+        #   B = 0.2 CONSTANT      -- does THIS material's emissive reach THIS
+        #                            pixel at THIS pose? (the `const` arm, folded
+        #                            in, because an arm that paints nothing is
+        #                            worthless unless something in it must paint)
+        #   G = 1 where u > 0.5   -- a HARD EDGE that must run through the
+        #                            camera's own column, north-south. Its screen
+        #                            position measures the per-pixel uv in metres.
+        #   R = 1 where the SAMPLED |height_m| > 0.05 -- where the material
+        #                            actually sees ripple data, at the same
+        #                            instant, through the same tap the shipping
+        #                            foam reads.
+        #
+        # WHY IT HAD TO BE ONE ARM. The contradiction it exists to resolve:
+        # `voxel.Water.Ripple.TestFill 0.5` (a UNIFORM field) moves the whole
+        # 51.2 m window to a pale mirror whose boundary measures, off the frame,
+        # to camera +23.7 m in X and Y -- i.e. the edge fade, and therefore the
+        # uv it is computed from, is CORRECT to a metre at 6.5e6 UU from the
+        # world origin. But a LOCALISED field -- five 8 m discs whose peak
+        # voxel.Water.Ripple.Dump puts at uv (0.581, 0.534), 4 m in front of the
+        # camera and provably inside the frustum -- renders nothing, and the
+        # `height` arm over the same discs is pixel-identical to shipping
+        # (mean |diff| 0.45 over the frame). A correct uv and an empty sample
+        # cannot both be true of the same texture fetch, so one of the two
+        # measurements is measuring something other than what it is named after,
+        # and only a frame that carries all three channels can say which.
+        #
+        # BINARY, for the uvstep arm's recorded reason: the tonemapper defeats
+        # reading a ramp off a PNG, so every channel is a hard threshold and the
+        # measurement is where an EDGE is, not what shade a pixel is.
+        wp_u = bathy_b.mask(ripple["uv"], "", r=True)
+        wp_k = bathy_b.const(1000.0)
+        wp_g = bathy_b.saturate(bathy_b.mul(bathy_b.sub(wp_u, bathy_b.const(0.5)), wp_k))
+        wp_r = bathy_b.saturate(
+            bathy_b.mul(bathy_b.sub(bathy_b.abs_(ripple["height_m"]), bathy_b.const(0.05)), wp_k))
+        wp_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1500, 3980)
+        wp_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        wp_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1500, 4040)
+        wp_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        wp_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1500, 4100)
+        wp_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 0.2, 1.0))
+        wp_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(wp_r, wp_red), bathy_b.mul(wp_g, wp_green)), wp_blue)
+        if not mel.connect_material_property(
+                wp_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect wakeprobe debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel WAKEPROBE ARM: ON -- emissive R=(|ripple height|>0.05), "
+            "G=(ripple u>0.5), B=0.2 constant. NOT A SHIPPING MATERIAL.")
     elif _ripple_debug_mode == "shorefoam":
         # WHICH INPUT OF THE SHORE FOAM IS ZERO? (2026-09-07)
         #

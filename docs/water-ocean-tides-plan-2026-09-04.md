@@ -1350,3 +1350,242 @@ Neither is evidence for what its label claims. **Single-pair arms are
 unaffected**, which covers arms A, B and D, and covers the whole `shoredist`
 ladder above — so the shore-foam conclusion stands on its own. But the null of
 arms C and F was never a test of the thing they were named for.
+
+## 2026-09-07 (material-owning agent): the "bake vs sheet disagree by 6-40 m" claim is REFUTED with numbers; shore foam has TWO defects, both measured; the wake's read side is narrowed to ONE fetch
+
+Two new instruments were built first, because both hunts had been running on
+inference off tonemapped PNGs and both had already produced a withdrawn
+conclusion.
+
+### Instrument 1 -- `voxel.Water.Shore.Audit [ReachM=120] [Rays=8] [StepM=0.25]`
+
+`VoxelBathyField.cpp`, plus `UVoxelBathyFieldSubsystem::SampleWindowAtWorld`.
+Walks rays out from the pawn and prints, per ray and in METRES:
+
+* where the DRAWN water ends -- `UVoxelWaterSubsystem::WaterSurfaceZAtWorld`,
+  the same datum+extent authority `AVoxelWaterSheetActor` gathers its rects
+  from, so "is water drawn here" is answered by the thing that draws it;
+* where the BAKED signed distance crosses zero -- read out of `Pixels_`, i.e.
+  the exact texel the material samples, post-hole-fill and post-ocean-branch;
+* a CPU mirror of the material's own `shore_band * shelf_gate * gain * validity`
+  at the shipping constants, so "is there a foam ribbon at this shore and how
+  wide is it in metres" stops being a question a photograph has to answer.
+
+It also prints the origin column's surface and ground Z, because every water
+capture at this lake for two days was framed from an altitude measured off the
+LAKEBED and half of them were shot from under the water.
+
+### Instrument 2 -- `-VoxelRippleWakeAfter=<sec>` (+ `Steps` / `RadiusM` / `StrengthM` / `Yaw` / `Freeze`)
+
+`VoxelRippleField.cpp`. A headless capture has no swimmer and no boat under way,
+and a ripple halves every 5 s, so EVERY "no wake" frame this project has shot
+photographed an undisturbed field -- including the ones that concluded the wake
+was invisible. This injects five rings on the camera's own axis at 4/6/8/10/12 m
+ahead, runs N steps, then FREEZES (read back, not asserted), and logs each ring's
+world XY with the baked depth and shore distance under it.
+
+**It must use the SHUTTER's yaw, not the live camera's.** `-VoxelScreenshotAfter`
+re-poses the camera inside the shutter callback (VoxelEarthGameMode.cpp:1992-2016
+-- pitch from `-VoxelSpawnPitch`, yaw from `-VoxelSpawnYaw` DEFAULTING TO 45,
+which is not the spawn path's 0). `VoxelVerify00914` is the frame that cost:
+"yaw 0.0" at the drop, "yaw 45.0" at the shutter, rings 47 deg off a 45-deg
+half-frustum.
+
+### THE POSE, CORRECTED AND MEASURED
+
+`-VoxelSpawnAltM` is measured from ground top (the lakebed, 1644.2 m). The audit
+reads the surface at **1650.235 m**, i.e. **6.04 m** above the bed -- not the
+5.32 m the 05:20 correction assumed. So `+6 m` puts the PAWN 1.5 cm UNDER the
+surface and the camera (eye +0.72 m) 0.7 m over it: grazing, with every shore in
+frame 21-40 m away. Captures from there can only ever see the shoreline as a few
+screen rows. **The pose used for everything below is `+12 m / -35 deg / yaw 45`**
+-- camera 6.6 m over the water, shoreline resolved, and no "camera entered water"
+line in any of the logs.
+
+### TASK 2, PART 1: the bake and the sheet AGREE. `gap = 0.00 m`.
+
+`voxel.Water.Shore.Audit` at the pond column (-65102,-51084), 8 rays, 0.25 m
+steps (`Saved/capture-wake-ship-drop2.log`, 11:50):
+
+| yaw | drawn edge | baked zero | gap | shore at the drawn edge |
+|---|---|---|---|---|
+| 0   | 28.38 m | 28.12 m | **-0.25 m** | -1.90 m |
+| 45  | 31.38 m | 31.38 m | **0.00 m** | -1.90 m |
+| 90  | no shore inside 120 m | | | |
+| 135 | 39.62 m | 39.62 m | **0.00 m** | -1.90 m |
+| 180 | 35.62 m | 35.62 m | **0.00 m** | -1.90 m |
+| 225 | 21.62 m | 21.62 m | **0.00 m** | -1.90 m |
+| 270 | 22.88 m | 22.88 m | **0.00 m** | -1.90 m |
+| 315 | 29.62 m | 29.62 m | **0.00 m** | -1.90 m |
+
+Seven of eight rays agree EXACTLY; the eighth by one sample step. **WITHDRAWN:
+"the baked lake polygon and the drawn water sheet disagree about where this lake
+ends, by at least 6 m and less than 40 m"** (05:35). There is no bake-side
+defect, no tile/seed misalignment, no window-origin offset, and NOTHING TO
+RE-BAKE. The 05:35 measurement was a screen strip at a shoreline 22-40 m away
+seen from 0.7 m above the water, where the last six metres of water are under ten
+pixels tall: it measured open water and called it the waterline.
+
+### TASK 2, PART 2: `BathyFoamWidthM` 1.6 m was BELOW THE FIELD'S OWN QUANTUM
+
+`shore@drawnEdge = -1.90 m` on every single ray is the finding. The baked plane
+is an exact Euclidean distance transform on the 1.875 m fine raster
+(`basins.bathymetry_planes`), and a transform measures to the nearest cell of the
+OPPOSITE class -- so on texel centres its positive values are 1.90, 3.80,
+5.70 m ..., and **(0, 1.6) is a range the plane cannot take**. `tilestore.h:597-601`
+says exactly this in words; nobody had read it against `BathyFoamWidthM`. The
+material samples bilinearly, so the band is not literally empty -- it lives in
+the ~0.42 of a texel where the interpolant climbs from -1.90 to +1.90 through
+(0, 1.6): a ribbon under a metre wide, pinned to the outermost half-texel of
+drawn water. The CPU mirror agrees: `bandMax = 0.000` on all 8 rays at width 1.6.
+
+**Proven in one frame with its own positive control in the same pixels**
+(`VoxelVerify00934`, the `shoredist` arm at the corrected pose): the B channel
+(`shore_m > 6 m`) leaves a red-only ribbon along the waterline measured at
+**4.0-4.8 m of world width**, while the G channel -- the LIVE `BathyFoamWidthM`,
+i.e. exactly the set `shore_band` is nonzero on -- paints **ZERO pixels in the
+whole frame**. Same fetch, same instant, same shore. The bathy sample is
+per-pixel and correct; the threshold is the defect.
+
+Settled by the same run: the shelf gate is NOT the limiter here. The audit
+reports the bed slope at the outermost water texel per ray -- 0.026 (yaw 45,
+dead ahead), 0.000, 0.089, 0.100, 0.153, 0.310, 0.342 -- so `shelf_gate` is 1.0
+on the shore the camera faces.
+
+### TASK 2, PART 3: with the band open, the foam draws BLACK, not white
+
+`-VoxelWaterMatScalar=BathyFoamWidthM:6,BathyFoamGain:5` (BOTH echoed by the
+sheet -- a post-06:00 multi-pair run, not the silently-dropped kind) moves
+**1.17%** of the frame against shipping (`VoxelVerify00936` vs `VoxelVerify00922`),
+and what it draws is a **dark band at the waterline**. That is the composite's
+two halves disagreeing: `MP_Opacity = saturate(foam)` responds -- the volume is
+removed, which is what makes the band dark -- while the BaseColor half, the SAME
+`foam` lerped from black to the foam tint and multiplied by a vertex AO that is
+255 on the sheet (`AppendRectQuad` writes `FColor(255,255,255,0)`), does not
+arrive. It is the 2026-08-30 "a BaseColor rewire on this SLW material is a
+byte-identical NULL" measurement seen from the other side, and it is the shipped
+`docs/lake-sheet-black-band-2026-08-29.md` band with the foam turned up.
+
+Width 6 at the SHIPPED gain (0.55) is consequently a null too
+(`VoxelVerify00932` vs `00922`: mean |diff| 0.51, 0.15% of pixels over 10) --
+foam ~0.42 through a dead channel is nothing.
+
+### THE FIX (both halves, one regen, `create_water_voxel_material.py`)
+
+1. `BathyFoamWidthM` **1.6 -> 6.0** (3.2 source texels), with the raster
+   derivation written at the parameter.
+2. **Shore foam now rides EMISSIVE as well**, exactly as the disturbance foam
+   was routed on 09-06 and for the same reason: new baked scalar
+   `ShoreFoamEmissive` (0.6), same tint, additive, 0 restores the previous
+   emissive bit for bit, and it inherits every upstream gate (SHORE FX arm,
+   `BathyFoamGain`, the shelf gate, bathy validity, the top-face mask) so every
+   existing off arm stays an off arm. The BaseColor path is kept, harmless, and
+   right the day SLW honours it.
+
+Both are LOOK changes and the owner judges looks; the width is derived from the
+raster rather than chosen.
+
+### TASK 1: the wake's read side, narrowed to ONE step
+
+Everything upstream is now proven ON THE SHIPPING MATERIAL, AT AN ABOVE-WATER
+POSE, IN FRAMES THAT PROVABLY CONTAIN THE DISTURBANCE:
+
+* **The emissive pin reaches these pixels.** The `wakeprobe` arm's B channel is a
+  0.2 constant and it is on over the whole lake (`VoxelVerify00926`).
+* **The per-pixel ripple UV is CORRECT to 0.2 m at 6.5 million UU from the world
+  origin.** Same frame, G = `ripple u > 0.5`, a hard edge: projected back through
+  the camera it lands at world **X = -65101.8 m** against a predicted
+  **X = -65102.00 m**. Independently `voxel.Water.Ripple.TestFill 0.5`
+  (`VoxelVerify00918`) paints the window's own edge fade, and its boundary
+  measures to **camera +23.7 m in X and +23.6 m in Y** -- an axis-aligned square
+  of the right size in the right place (fade reaches zero at 24.8 m).
+* **The field really holds localised data at the shutter.** Five 8 m discs;
+  `voxel.Water.Ripple.Dump` at t=168 reports height max **2.0 m over 12.6% of the
+  512x512**, peak at uv (0.5811, 0.5342) = 4 m in front of the camera, inside the
+  frustum by projection. Freeze read back as 1.
+* **The instrument can fire.** `wakeprobe` R = `|sampled ripple height| > 0.05`
+  goes to **100% of the water** under `TestFill 0.5` (`VoxelVerify00930`) -- the
+  must-fail control this hunt has repeatedly lacked.
+
+And with all of that true, `wakeprobe` R is **0% of the water** over the discs,
+frozen (`VoxelVerify00926`) and with the simulation still running
+(`VoxelVerify00928`, `-VoxelRippleWakeFreeze=0`); the two frames are identical in
+the R channel (water-region R max 102 vs 101, `R>100` on 0.0000 of pixels in
+both). The shipping arm agrees: the `height` arm over the same discs is
+pixel-identical to shipping (mean |diff| 0.45 over the whole frame).
+
+**So the broken step is the FETCH of `RT_VoxelRippleField` in M_WaterVoxel: it
+returns the render target's clear value for content written by the derive's
+`DrawMaterialToRenderTarget`, while returning content written by
+`ClearRenderTarget2D` (TestFill) through the same parameter, the same UV and the
+same frame.** Uniform-renders / localised-does-not is not a coincidence of
+magnitudes; it is the difference between the two WRITE paths. Note that the
+simulation's own step material samples the STATE targets, also canvas-drawn, and
+those propagate correctly -- the difference there is that the step binds its
+texture through `SetTextureParameterValue` on a MID, while the water material
+reads the asset through a baked default parameter (the deliberate "WHY AN ASSET"
+choice, ripple_field_graph.py:40-46).
+
+NOT YET FIXED. The next instrument is the existing `fixeduv` arm at this pose
+(sample the field at a CONSTANT uv inside the disc and paint it everywhere): it
+separates "this material cannot read derived content from this render target at
+all" from "it can, and something in the per-pixel path is still wrong", and the
+two have completely different fixes. Everything else about the wake -- injection,
+deposit, freeze, framing, the collection values, the uv, the emissive pin, the
+foam art's route -- is exonerated by the frames above.
+
+### Frames (all `+12 m / -35 deg / yaw 45` at `-65102,-51084` unless noted)
+
+| frame | arm | what it shows |
+|---|---|---|
+| `VoxelVerify00914` | shipping, +6 m / -18 deg | the yaw trap: rings dropped on yaw 0, shutter at yaw 45 |
+| `VoxelVerify00916` | shipping, rings frozen 20 s | no wake |
+| `VoxelVerify00918` | shipping, `TestFill 0.5` | the ripple window; boundary at camera +23.7 m |
+| `VoxelVerify00920` | shipping, rings frozen 4 s | no wake |
+| `VoxelVerify00922` | shipping, five 8 m discs | no wake -- and the shore-foam baseline |
+| `VoxelVerify00924` | `height` arm, same discs | pixel-identical to 00922 |
+| `VoxelVerify00926` | `wakeprobe`, same discs | pin ON, uv edge correct, sample EMPTY |
+| `VoxelVerify00928` | `wakeprobe`, `WakeFreeze=0` | identical to 00926 |
+| `VoxelVerify00930` | `wakeprobe` + `TestFill 0.5` | R fires on 100% of the water (must-fail control) |
+| `VoxelVerify00932` | shipping + `BathyFoamWidthM:6` | null (0.15% of pixels over 10) |
+| `VoxelVerify00934` | `shoredist` arm | 6 m ribbon 4.0-4.8 m wide; the 1.6 m band is ZERO pixels |
+| `VoxelVerify00936` | shipping + `WidthM:6,Gain:5` | the band is BLACK, not white |
+
+Every debug arm ran as ONE serialized regen -> capture -> restore script with the
+restore in a `finally` block, and every regen is proven from
+`Saved/sky-chain/regen-create_water_voxel_material.log` (a debug arm prints its
+own `ARM: ON` marker; the restores print `SHORE FX ARM: ON` and none of the debug
+markers).
+
+### New debug arm on record: `VOXEL_WATER_RIPPLE_DEBUG=wakeprobe`
+
+Log marker `WAKEPROBE ARM: ON` -- add it to the contamination list. R =
+`|sampled ripple height| > 0.05`, G = `ripple u > 0.5`, B = 0.2 constant. Three
+questions on the same pixels, binary so the tonemapper cannot eat them, and B
+guarantees the frame cannot be confused with a dead pin.
+
+### Addendum: the fix is LANDED and the band is now non-empty, but at this shore it still does not read as surf
+
+The fixed material is on disk and proven from the regen log (`SHORE FX ARM: ON`,
+no debug markers, 08:40); `ShoreFoamEmissive` is present in the saved
+`M_WaterVoxel.uasset` by a byte scan, so the regen took.
+
+| frame | arm | result vs the frame before it |
+|---|---|---|
+| `VoxelVerify00938` | **shipping default, FIXED** (width 6, shore foam on emissive) | vs old shipping `00922`: mean 0.46, 0.039% of pixels over 10 |
+| `VoxelVerify00940` | fixed + `-VoxelWaterMatScalar=BathyFoamGain:2.0` (echoed) | vs `00938`: mean 0.57, 0.41% over 10, max 85 |
+
+So the term is now ALIVE on a live channel -- 6,328 pixels move by more than 15
+when the gain goes 0.55 -> 2 -- and it is still not surf you would notice: the
+ribbon that carries it is essentially the OUTERMOST TEXEL of drawn water
+(`shore_band` is 0.76 at shore_m = 1.90 m, 0.35 at 3.80 m, 0.007 at 5.70 m), and
+at this pond that texel is already the brightest water in the frame because the
+shallow-depth grading has taken it nearly white. The remaining lever is the
+band's SHAPE rather than its width or gain -- `shore_band` decays from the
+waterline outward and the shelf gate closes as depth grows, so the two multiply
+to a one-texel ribbon on any shore steeper than about 1:20.
+
+That is a look question and the owner judges looks. What is settled is that the
+band is no longer evaluated on an empty set and no longer painted onto a dead
+channel; the ladder from here is `BathyFoamGain` / `ShoreFoamEmissive` at a pose
+with a genuinely shallow shelf, not another hunt for plumbing.

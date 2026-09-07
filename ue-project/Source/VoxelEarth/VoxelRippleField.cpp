@@ -17,6 +17,12 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialParameterCollection.h"
 
+#include "Camera/PlayerCameraManager.h" // capture wake: the rings ride the CAMERA yaw
+#include "HAL/IConsoleManager.h"
+#include "Misc/CommandLine.h"          // -VoxelRippleWakeAfter
+#include "Misc/Parse.h"
+
+#include "VoxelBathyField.h"       // capture wake: baked depth/shore under each ring
 #include "VoxelDebris.h"          // AVoxelDebris  -- one of the two watched classes
 #include "VoxelDebug.h"           // LogVoxelWater
 #include "VoxelExplosive.h"       // AVoxelExplosive -- the thing the player throws
@@ -598,6 +604,38 @@ void UVoxelRippleFieldSubsystem::Initialize(FSubsystemCollectionBase& Collection
 	Pending_.Reserve(kMaxPending);
 	bArmed_ = true;
 	ClearState();
+
+	// --- the capture wake (see the header) -----------------------------------
+	//
+	// Parsed here rather than read per tick so a typo is visible in the boot log
+	// instead of being an unexplained blank frame two minutes later. Announced in
+	// BOTH positions for the reason every switch in this tree is: an unpassed
+	// switch and a mis-spelled one produce the same picture.
+	{
+		float AfterSec = 0.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRippleWakeAfter="), AfterSec) && AfterSec > 0.f)
+		{
+			WakeAfterSec_ = static_cast<double>(AfterSec);
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelRippleWakeSteps="), WakeSteps_);
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelRippleWakeRadiusM="), WakeRadiusM_);
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelRippleWakeStrengthM="), WakeStrengthM_);
+			WakeSteps_ = FMath::Clamp(WakeSteps_, 1, 4096);
+			WakeRadiusM_ = FMath::Clamp(WakeRadiusM_, 0.1f, 10.0f);
+			WakeStrengthM_ = FMath::Clamp(WakeStrengthM_, 0.001f, 2.0f);
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("RippleField: CAPTURE WAKE ARMED -- at t=%.1fs, %d rings on the camera's own ")
+			       TEXT("yaw at 4/6/8/10/12 m ahead, r=%.2f m s=%.3f m, then %d step(s), then FREEZE. ")
+			       TEXT("NOT a shipping behaviour; it exists so a headless shutter has something to ")
+			       TEXT("photograph."),
+			       WakeAfterSec_, 5, WakeRadiusM_, WakeStrengthM_, WakeSteps_);
+		}
+		else
+		{
+			UE_LOG(LogVoxelWater, Verbose,
+			       TEXT("RippleField: capture wake NOT armed (-VoxelRippleWakeAfter absent or <= 0). ")
+			       TEXT("A headless capture will photograph an undisturbed field."));
+		}
+	}
 
 	UE_LOG(LogVoxelWater, Log,
 	       TEXT("RippleField: armed. %dx%d texels at %.2f m -> a %.1f m window (+/-%.1f m). ")
@@ -1362,12 +1400,166 @@ void UVoxelRippleFieldSubsystem::RunSteps(int32 NumSteps)
 	SampleFieldHealth();
 }
 
+void UVoxelRippleFieldSubsystem::FireCaptureWake()
+{
+	bWakeFired_ = true;
+	const UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn)
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("RippleField: CAPTURE WAKE: no pawn at t=%.1fs, so there is no camera to place ")
+		       TEXT("rings in front of. Nothing injected; the frame will show undisturbed water."),
+		       WakeAfterSec_);
+		return;
+	}
+
+	// THE SHUTTER'S YAW, NOT THIS INSTANT'S, and the first run of this
+	// instrument was thrown away learning it. -VoxelScreenshotAfter re-poses the
+	// camera IN THE SHUTTER CALLBACK (VoxelEarthGameMode.cpp:1992-2016: pitch
+	// from -VoxelSpawnPitch, yaw from -VoxelSpawnYaw DEFAULTING TO 45, which is
+	// not the spawn path's 0). So at t=WakeAfterSec the camera still faces the
+	// spawn yaw -- 0 in the run that found this -- and rings placed on it land
+	// 45 degrees off the axis the photograph is taken along, i.e. exactly at the
+	// edge of a 90-degree horizontal frustum. Measured: VoxelVerify00914 logged
+	// "yaw 0.0" at the drop and "yaw 45.0" at the shutter, and the rings are not
+	// in the frame.
+	//
+	// So mirror the shutter's own rule rather than sampling the camera: when a
+	// screenshot is scheduled, the yaw that matters is the one it will set.
+	// -VoxelRippleWakeYaw overrides both, for a pose this rule does not cover.
+	const FVector Cam = (PC->PlayerCameraManager != nullptr)
+		                    ? PC->PlayerCameraManager->GetCameraLocation()
+		                    : Pawn->GetActorLocation();
+	double Yaw = (PC->PlayerCameraManager != nullptr)
+		             ? PC->PlayerCameraManager->GetCameraRotation().Yaw
+		             : PC->GetControlRotation().Yaw;
+	const TCHAR* YawSource = TEXT("live camera");
+	float ShutterAfter = 0.f;
+	float ExplicitYaw = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRippleWakeYaw="), ExplicitYaw))
+	{
+		Yaw = static_cast<double>(ExplicitYaw);
+		YawSource = TEXT("-VoxelRippleWakeYaw");
+	}
+	else if (FParse::Value(FCommandLine::Get(), TEXT("VoxelScreenshotAfter="), ShutterAfter) &&
+	         ShutterAfter > 0.f)
+	{
+		float ShotYaw = 45.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnYaw="), ShotYaw);
+		Yaw = static_cast<double>(ShotYaw);
+		YawSource = TEXT("the shutter's yaw (-VoxelSpawnYaw, default 45)");
+	}
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("RippleField: CAPTURE WAKE will use yaw %.1f from %s (camera is at yaw %.1f now)."),
+	       Yaw, YawSource,
+	       (PC->PlayerCameraManager != nullptr) ? PC->PlayerCameraManager->GetCameraRotation().Yaw
+	                                            : PC->GetControlRotation().Yaw);
+	const double DX = FMath::Cos(FMath::DegreesToRadians(Yaw));
+	const double DY = FMath::Sin(FMath::DegreesToRadians(Yaw));
+
+	const UVoxelBathyFieldSubsystem* Bathy =
+		World ? World->GetSubsystem<UVoxelBathyFieldSubsystem>() : nullptr;
+
+	// FIVE, and five is not arbitrary: kSplatSlots is 8, so all of them are
+	// injected in ONE step and the rings share a birthday -- which is what makes
+	// the pattern a chain of concentric circles receding down the view axis
+	// rather than five rings of five different ages.
+	static constexpr double kAheadM[5] = {4.0, 6.0, 8.0, 10.0, 12.0};
+	for (double AheadM : kAheadM)
+	{
+		const FVector P(Cam.X + DX * AheadM * 100.0, Cam.Y + DY * AheadM * 100.0, Cam.Z);
+		AddDisturbance(P, WakeRadiusM_, WakeStrengthM_);
+		float DepthM = 0.f, ShoreM = 0.f, ValidV = 0.f;
+		const bool bHaveBathy = Bathy && Bathy->SampleWindowAtWorld(P.X, P.Y, DepthM, ShoreM, ValidV);
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RippleField: CAPTURE WAKE ring at %.0f m ahead -> (%.0f, %.0f) UU  ")
+		       TEXT("baked depth=%.2f m shore=%.2f m valid=%.0f (bathy%s)"),
+		       AheadM, P.X, P.Y, DepthM, ShoreM, ValidV,
+		       bHaveBathy ? TEXT("") : TEXT(" UNAVAILABLE -- values are placeholders"));
+	}
+
+	RunSteps(WakeSteps_);
+
+	// FREEZE LAST. RunSteps has to run first (it is what publishes the field and
+	// sets bPublished_, which is the flag the frozen branch of Tick republishes
+	// under), and freezing also suppresses AutoWatch -- so from here the field is
+	// a constant and any shutter delay is safe.
+	//
+	// AND IT IS READ BACK, because "FROZEN" in a log line is an assertion and
+	// this instrument's whole value is that it makes assertions checkable. If
+	// the freeze does not stick, the sim keeps running to the shutter: at the
+	// shipped 5 s half-life and 1.6 m/s a 20 s gap costs 4 halvings AND drags
+	// every ring 32 m -- past the 25.6 m window, into the sponge -- which is
+	// indistinguishable in a photograph from a wake that was never drawn.
+	//
+	// -VoxelRippleWakeFreeze=0 KEEPS THE SIM RUNNING, and it is the control arm
+	// for one specific question: does a field written ONCE and then left alone
+	// still reach the shader N seconds later? Frozen, the derive runs once and
+	// the render target is never touched again; unfrozen, it is redrawn every
+	// frame. If a wake is visible only in the second arm, the fault is in the
+	// persistence of that draw and not in the material at all. Pair it with a
+	// WakeAfter close to the shutter so decay and drift stay small.
+	int32 FreezeFlag = 1;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelRippleWakeFreeze="), FreezeFlag);
+	bool bFrozen = false;
+	if (IConsoleVariable* FreezeVar =
+	        IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Water.Ripple.Freeze")))
+	{
+		if (FreezeFlag != 0)
+		{
+			FreezeVar->Set(true, ECVF_SetByCode);
+		}
+		bFrozen = FreezeVar->GetBool();
+	}
+	if (FreezeFlag == 0)
+	{
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RippleField: CAPTURE WAKE -VoxelRippleWakeFreeze=0 -- the simulation keeps ")
+		       TEXT("running and the derive redraws the field every frame. CONTROL ARM."));
+	}
+	if (bFrozen || FreezeFlag == 0)
+	{
+		UE_LOG(LogVoxelWater, Log, TEXT("RippleField: CAPTURE WAKE freeze read back as %d (asked %d)."),
+		       bFrozen ? 1 : 0, FreezeFlag);
+	}
+	else
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("RippleField: CAPTURE WAKE freeze read back as 0 -- the field keeps stepping ")
+		       TEXT("to the shutter, so the rings will have decayed and left the window. Every ")
+		       TEXT("frame from this run is void as wake evidence."));
+	}
+
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("RippleField: CAPTURE WAKE FIRED at cam (%.0f, %.0f, %.0f) yaw %.1f. ")
+	       TEXT("injected=%llu dropped(outside=%llu full=%llu unarmed=%llu inert=%llu) steps=%llu ")
+	       TEXT("window origin (%.0f, %.0f) UU  fieldMaxAbs=%.4f stateMaxAbs=%.4f. FROZEN."),
+	       Cam.X, Cam.Y, Cam.Z, Yaw,
+	       static_cast<unsigned long long>(Injected_),
+	       static_cast<unsigned long long>(DroppedOutside_),
+	       static_cast<unsigned long long>(DroppedFull_),
+	       static_cast<unsigned long long>(DroppedUnarmed_),
+	       static_cast<unsigned long long>(DroppedInert_),
+	       static_cast<unsigned long long>(TotalSteps_),
+	       WindowOriginUU().X, WindowOriginUU().Y, LastFieldMaxAbs_, LastStateMaxAbs_);
+}
+
 void UVoxelRippleFieldSubsystem::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 	if (!bArmed_)
 	{
 		return;
+	}
+
+	// BEFORE the enable/freeze branches below, because this one SETS Freeze and
+	// must not be gated by it. Once per run, by the flag.
+	if (WakeAfterSec_ > 0.0 && !bWakeFired_ && GetWorld() != nullptr &&
+	    GetWorld()->GetTimeSeconds() >= WakeAfterSec_)
+	{
+		FireCaptureWake();
 	}
 
 	if (!CVarVoxelWaterRippleEnable.GetValueOnGameThread())

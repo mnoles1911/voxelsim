@@ -483,6 +483,36 @@ private:
 	bool bFieldVerifiedLive_ = false;
 	bool bWarnedFieldDark_ = false;
 
+	// --- THE CAPTURE WAKE (-VoxelRippleWakeAfter=<sec>), 2026-09-07 ----------
+	//
+	// A headless capture has no player who jumps in and no boat under way, so
+	// EVERY "the wake is invisible" frame this project has shot was a photograph
+	// of a field with nothing in it -- and a ripple decays by half every 5 s, so
+	// even a drop scripted at engine init is gone long before a 170 s shutter.
+	// The console already has voxel.Water.Ripple.Drop for this, but reaching it
+	// needs -VoxelExecCmds with SPACES in the value, which is the argument shape
+	// that has silently mangled itself twice on this box (FParse's
+	// stop-on-separator, and the shell's re-quoting). So the drop becomes a
+	// switch, like every other capture-critical control here, and it FRAMES
+	// ITSELF: the rings are placed along the camera's own yaw at fixed distances
+	// ahead of it, so the pattern cannot land behind the shutter no matter what
+	// pose the harness was given.
+	//
+	// It fires once, then FREEZES the simulation (voxel.Water.Ripple.Freeze),
+	// which is what makes the frame reproducible: from that instant the field is
+	// a constant and the shutter can be any number of seconds later.
+	//
+	// The engagement proof is the log line it prints -- camera XY, every ring's
+	// world XY, the window origin, and the BAKED DEPTH AND SHORE DISTANCE under
+	// each ring, because a ring dropped where the bake calls the water dry is
+	// attenuated on the GPU and no CPU counter can see it.
+	double WakeAfterSec_ = 0.0;      // <= 0 disarms the whole thing
+	int32 WakeSteps_ = 60;           // 1 s of simulated time at the fixed dt
+	float WakeRadiusM_ = 1.5f;
+	float WakeStrengthM_ = 0.25f;
+	bool bWakeFired_ = false;
+	void FireCaptureWake();
+
 	uint64 TotalSteps_ = 0;
 	uint64 Injected_ = 0;
 	uint64 DroppedOutside_ = 0;
