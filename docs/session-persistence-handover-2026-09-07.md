@@ -53,3 +53,15 @@ The initial full 143-action build in `Saved/persistence-handover-build.log` foun
 Final runtime evidence: `Saved/session-handover-final-report/index.json` reports all four tests Success with zero errors: `Voxel.Persistence.SessionDomains`, `Voxel.Persistence.CheckpointTransaction`, `Voxel.Objects.Pages`, and `Voxel.Objects.Snapshot`. The transaction fault test emitted six warnings. `tools/test_checkpoint_store.py` passed all six tests. These tests exercised the corrected binaries, including the latest clock/hydrology extension; they do not replace the outstanding river graph, multiplayer, rendered gameplay, or scale validation listed above.
 
 The user authorized publishing and merging a PR after finishing this session checkpoint. Use the repository PR history for the final remote merge commit. The broader P0-P6 implementation remains incomplete and is explicitly handed over above; no unattended continuation or scheduling is active.
+
+## Remote checkpoint CI
+
+PR #232: https://github.com/mnoles1911/voxelsim/pull/232. CI run `34082724414` is not green. This PR includes previously unpublished ancestor work, so these are real integration follow-ups even though the persistence diff against `fa56da9` does not change their files:
+
+- GCC and Clang: `voxel-core/bench/riverribbonprobe.cpp` uses `std::sqrt` without its own `<cmath>` include.
+- Asset Forge: selftest uses a 50 mm environment tree where resolution policy requires 100 mm; generated palette is out of sync.
+- Terrain service: missing SciPy/Numba bake dependencies and a stale bake-fingerprint expectation (13 failures, 518 passes, 125 skips).
+- Unity lint: DetailAssetSubsystem and EnvironmentLODPrototype collide on `FMeshGeometry`, `FPaletteLinear`, `PaletteLinear`, and `kMaxGridCells`.
+- Front-end switch classification has unclassified switches; float-ban reports asset pitch/slope and fluid helpers; shader vendor lint reports brickpack bounds and signed arithmetic in karst/worldgen.
+
+Shader compilation, Docker build, SFX parity and Python syntax/perf-gate checks passed. Unreal CI is skipped; use the local build/runtime evidence above. Do not describe this checkpoint as having passed the complete repository CI suite. Coordinate fixes with the environment session, which is integrating newer versions of several affected files.
