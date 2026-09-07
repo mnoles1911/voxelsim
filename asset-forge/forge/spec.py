@@ -2723,19 +2723,6 @@ PARAMS: tuple[Param, ...] = (
     # form families because a boat and a glider are authored by the same person
     # for the same reason on the same day, and the ten rows they share -- size,
     # shell thickness, seed asymmetry, the materials -- are most of the table.
-    # Fantasy bipeds use a dedicated anatomical generator while retaining the
-    # existing land-creature manifest contract. Disabled defaults do not reseed wildlife.
-    P("goblin.role", "Goblin archetype", "none", kind="choice", group="goblin",
-      kinds=("quadruped",), choices=("none", "raider", "spearhunter", "stalker", "hexer", "brute")),
-    P("goblin.height_m", "Goblin height", 1.25, 0.7, 2.2, 0.025,
-      group="goblin", kinds=("quadruped",)),
-    P("goblin.bulk", "Muscular build", 1.0, 0.65, 1.5, 0.05,
-      group="goblin", kinds=("quadruped",)),
-    P("goblin.skin", "Goblin skin", "skin_olive", kind="choice", group="goblin",
-      kinds=("quadruped",), choices=materials.CREATURE_NAMES),
-    P("goblin.cloth", "Goblin clothing", "skin_brown", kind="choice", group="goblin",
-      kinds=("quadruped",), choices=materials.CREATURE_NAMES),
-
     P("artifact.form", "Form", "hull", kind="choice", group="artifact",
       kinds=("artifact",), choices=("hull", "wing", "raft", "bamboo_raft",
       "flake_blade", "stone_knife", "fiber_bundle", "cordage_coil", "hammerstone",
@@ -3521,8 +3508,6 @@ def _hash_body(spec: dict) -> dict:
             if k not in ("notes", "curation", "biome_allow", "biome_rules",
                          "category", "subcategory")}
     kind = body.get("kind")
-    if kind != "quadruped" or body.get("goblin", {}).get("role", "none") == "none":
-        body.pop("goblin", None)
     foreign = [path for k, paths in KIND_SCOPED_PARAMS.items() if k != kind
                for path in paths]
     return _drop_paths(body, foreign)

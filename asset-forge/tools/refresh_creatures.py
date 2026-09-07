@@ -123,7 +123,7 @@ def main():
     jobs = []
     for path in sorted((ROOT / 'specs').glob('*.json')):
         raw = json.loads(path.read_text(encoding='utf-8'))
-        if raw.get('kind') not in KINDS or raw.get('goblin', {}).get('role', 'none') != 'none':
+        if raw.get('kind') not in KINDS:
             continue
         if args.only and raw['name'] not in args.only:
             continue

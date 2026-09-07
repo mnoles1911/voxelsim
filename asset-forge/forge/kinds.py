@@ -164,7 +164,7 @@ KINDS: tuple[Kind, ...] = (
          "its own angle, a muzzle, ears, optional horns or antlers and a rod "
          "tail. Three stances — standing, sprawling and bipedal. Voxel size is "
          "per species: 1 cm for a squirrel, 5 cm for a bison.", True,
-         ("quad", "goblin", "herd")),
+         ("quad", "herd")),
     # THE FIRST KIND THAT WAS NEVER ALIVE, and the first ENTITY kind
     # (ADR-0010). A canoe and a hang glider are rigid human-made objects: they
     # do not grow, they have no habit, no allometry and no species variation to

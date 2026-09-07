@@ -226,13 +226,6 @@
     "rise": 0.85,
     "width_m": 0.55
   },
-  "goblin": {
-    "bulk": 1.0,
-    "cloth": "skin_brown",
-    "height_m": 1.25,
-    "role": "none",
-    "skin": "skin_olive"
-  },
   "growth": {
     "gravity": -0.23688794452055256,
     "inertia": 0.45,

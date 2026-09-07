@@ -1,18 +1,20 @@
 # Creature model refresh — 2026-09-06
 
-382 wildlife species regenerated, plus five goblin mob models. All 387 are
+382 wildlife species regenerated. All 382 are
 saved in `library/<species>/<species>-<seed>/`, with VOX, VXA, thumbnails,
-specifications, realized individuals and measurements. Wildlife uses seed 7;
-goblins use seed 1. The existing saved raven variant was preserved as the
+specifications, realized individuals and measurements. Wildlife uses seed 7. The existing saved raven variant was preserved as the
 parameter source and refreshed. Original specifications and pre-existing
 library files are backed up under `out/creature-refresh/originals/`.
+
+The owner rejected the visual realism on 2026-09-07. These are technically
+validated baseline assets, not an accepted realism result. See
+[the reconstruction strategy](../../docs/creature-reconstruction-strategy-2026-09-07.md).
+All five goblin characters were subsequently removed.
 
 ## Review
 
 - [Searchable gallery](../out/creature-refresh/index.html)
-- [Five goblins](../out/goblin-review/goblin-lineup.png)
 - [Machine report](creature-refresh-2026-09-06.json)
-- [Goblin design and integration](goblin-mobs-2026-09-06.md)
 
 ## Changes
 
@@ -31,13 +33,9 @@ fennec fox ear roots had severed the skull's attachment, and tiny neck remnants
 on wood thrush/yellowhammer did not touch their parent. All three now export real
 face-contact joints. Their geometry and materials were preserved by that repair.
 
-Goblins: raider (axe/shield), spearhunter (spear), stalker (paired blades), hexer
-(staff), brute (heavy weapon/shield). Each uses 12.5 mm voxels and carries
-articulated body, arm, hand, leg, foot and equipment parts.
-
 ## Resolution
 
-368 wildlife models and all five goblins use the finest supported 12.5 mm tier.
+368 wildlife models use the finest supported 12.5 mm tier.
 The remaining 14 wildlife models use the finest supported tier whose realized
 export envelope fits 16 million cells. This bounds the dense generator's large
 temporary fields; it is a batch resource policy, not an engine restriction.
@@ -63,19 +61,16 @@ contract, so the budget measures each candidate pitch with its actual seed.
 
 ## Validation and limits
 
-- All 387 saved assets pass scale, voxel count, material ID, complete part-tag,
+- All 382 saved assets pass scale, voxel count, material ID, complete part-tag,
   acyclic joint hierarchy, VOX chunk-size and VXA checks.
-- 17 representative wildlife/goblin exports were rebuilt and compared exactly
+- 12 representative wildlife exports were rebuilt and compared exactly
   against saved material and part arrays.
 - A curved-surface eye regression verifies symmetry and surface-only painting.
-- All five goblins pass deterministic rebuilds, face connectivity and joint tests.
 - The three repaired wildlife rigs also pass at seeds 1, 7 and 19.
-- The web TypeScript/Vite build passes. The running service was restarted and
-  its goblin controls and all 387 creature library records were verified.
-- `export_categories.py --check` passes, with 387 creatures in the catalog.
-- The general `selftest --quick` still fails on four unrelated existing plant
-  tip-radius warnings: black-coral-tree, bramble-thicket, carnation-soft-coral,
-  cold-water-coral. Its full-library environment build pass was not run.
+- The web TypeScript/Vite build passes after removal of goblin controls.
+- `export_categories.py --check` passes, with 382 creatures in the catalog.
+- `selftest --quick` passes after correcting four plant tip radii. Its full-library
+  environment build pass was not run.
 
 These are voxel models with improved anatomy, not smooth photorealistic meshes.
 Very small animals still have only a few cells across their identifying details.
@@ -89,7 +84,6 @@ From `asset-forge`:
 
 ```powershell
 python tools/refresh_creatures.py --workers 2
-python tools/goblinprobe.py --write
 python tools/export_categories.py
 python tools/creatureprobe.py
 python tools/creature_review.py

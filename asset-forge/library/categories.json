@@ -149,7 +149,7 @@
   },
   "creature": {
    "blurb": "Living things that are spawned rather than composed. They carry their own pitch under their own transform (ADR-0010), they are published in the manifest with biome weights so a spawner can find them, and they are authored and deliberately not rendered until animation exists.",
-   "count": 387,
+   "count": 382,
    "in_manifest": true,
    "kinds": [
     "fish",
@@ -3638,111 +3638,6 @@
      "kind": "fish",
      "name": "giant-trevally",
      "via": "kind",
-     "voxel_mm": 12.5
-    },
-    {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 150100,
-       "extent_vox": [
-        51,
-        110,
-        134
-       ],
-       "seed": 1,
-       "voxels": 121736,
-       "vxa": "library/goblin-brute/goblin-brute-0001/tree.vxa"
-      }
-     ],
-     "kind": "quadruped",
-     "name": "goblin-brute",
-     "subcategory": "goblin-mobs",
-     "via": "spec",
-     "voxel_mm": 12.5
-    },
-    {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 52765,
-       "extent_vox": [
-        34,
-        51,
-        116
-       ],
-       "seed": 1,
-       "voxels": 33844,
-       "vxa": "library/goblin-hexer/goblin-hexer-0001/tree.vxa"
-      }
-     ],
-     "kind": "quadruped",
-     "name": "goblin-hexer",
-     "subcategory": "goblin-mobs",
-     "via": "spec",
-     "voxel_mm": 12.5
-    },
-    {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 67989,
-       "extent_vox": [
-        42,
-        68,
-        100
-       ],
-       "seed": 1,
-       "voxels": 41804,
-       "vxa": "library/goblin-raider/goblin-raider-0001/tree.vxa"
-      }
-     ],
-     "kind": "quadruped",
-     "name": "goblin-raider",
-     "subcategory": "goblin-mobs",
-     "via": "spec",
-     "voxel_mm": 12.5
-    },
-    {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 49965,
-       "extent_vox": [
-        40,
-        46,
-        125
-       ],
-       "seed": 1,
-       "voxels": 28246,
-       "vxa": "library/goblin-spearhunter/goblin-spearhunter-0001/tree.vxa"
-      }
-     ],
-     "kind": "quadruped",
-     "name": "goblin-spearhunter",
-     "subcategory": "goblin-mobs",
-     "via": "spec",
-     "voxel_mm": 12.5
-    },
-    {
-     "curation": "approved",
-     "grids": [
-      {
-       "bytes": 42354,
-       "extent_vox": [
-        37,
-        40,
-        88
-       ],
-       "seed": 1,
-       "voxels": 21186,
-       "vxa": "library/goblin-stalker/goblin-stalker-0001/tree.vxa"
-      }
-     ],
-     "kind": "quadruped",
-     "name": "goblin-stalker",
-     "subcategory": "goblin-mobs",
-     "via": "spec",
      "voxel_mm": 12.5
     },
     {
@@ -8227,14 +8122,14 @@
      "curation": "approved",
      "grids": [
       {
-       "bytes": 23108,
+       "bytes": 30033,
        "extent_vox": [
-        43,
-        43,
+        52,
+        55,
         29
        ],
        "seed": 1,
-       "voxels": 6983,
+       "voxels": 9453,
        "vxa": "library/bramble-thicket/bramble-thicket-0001/tree.vxa"
       }
      ],

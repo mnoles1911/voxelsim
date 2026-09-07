@@ -17,7 +17,7 @@ def main():
         if meta.get('category') != 'creature':
             continue
         body = json.loads((path.parent / 'spec.json').read_text())
-        rows.append(dict(name=meta['species'], kind='goblin' if body.get('goblin', {}).get('role', 'none') != 'none' else meta['kind'],
+        rows.append(dict(name=meta['species'], kind=meta['kind'],
                          seed=meta['seed'], pitch=float(body['resolution_cm'])*10,
                          directory=path.parent, voxels=meta['stats']['voxels']))
     cards = []
@@ -36,16 +36,16 @@ nav{display:flex;flex-wrap:wrap;gap:12px;margin:24px 0}input,select{font:inherit
 #models{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px}article{border:1px solid #3e4853;border-radius:10px;overflow:hidden;background:#252c34}
 article img{width:100%;height:220px;object-fit:contain;background:#6c747c}h2{font-size:18px;margin:16px 16px 6px}article p{margin:0 16px 16px;color:#bac6d1;font-size:14px}
 footer{display:flex;gap:20px;padding:0 16px 20px}a{color:#8dd4ef}article[hidden]{display:none}#count{color:#a7b9c7}
-</style><header><h1>Creature model review</h1><p>Refreshed wildlife and five evil goblin mobs. Models use 12.5 mm voxels where their size allows; the largest animals retain a coarser tier. Select a model image for a closer look.</p>
+</style><header><h1>Creature model review</h1><p>Refreshed wildlife models. Models use 12.5 mm voxels where their size allows; the largest animals retain a coarser tier. Select a model image for a closer look.</p>
 <nav><input id="search" type="search" placeholder="Find a creature" aria-label="Find a creature">
-<select id="kind" aria-label="Creature family"><option value="">All families</option><option>goblin</option><option>quadruped</option><option>bird</option><option>fish</option><option>cetacean</option></select>
+<select id="kind" aria-label="Creature family"><option value="">All families</option><option>quadruped</option><option>bird</option><option>fish</option><option>cetacean</option></select>
 <select id="pitch" aria-label="Voxel size"><option value="">All voxel sizes</option><option value="12.5">12.5 mm</option><option value="25">25 mm</option><option value="50">50 mm</option><option value="100">100 mm</option></select></nav><p id="count"></p></header><main id="models">'''
     document += '\n'.join(cards) + '''</main><script>
 const search=document.querySelector('#search'),kind=document.querySelector('#kind'),pitch=document.querySelector('#pitch');
 function filter(){let count=0;for(const card of document.querySelectorAll('article')){card.hidden=!(card.dataset.name.includes(search.value.toLowerCase().trim().replaceAll(' ','-'))&&(!kind.value||card.dataset.kind===kind.value)&&(!pitch.value||Number(card.dataset.pitch)===Number(pitch.value)));if(!card.hidden)count++;}document.querySelector('#count').textContent=`${count} models`;}
 for(const input of [search,kind,pitch])input.addEventListener('input',filter);filter();</script></html>'''
     (OUT / 'index.html').write_text(document, encoding='utf-8')
-    for kind in ('bird', 'quadruped', 'fish', 'cetacean', 'goblin'):
+    for kind in ('bird', 'quadruped', 'fish', 'cetacean'):
         group = [r for r in rows if r['kind'] == kind]
         for page, start in enumerate(range(0, len(group), 30), 1):
             batch = group[start:start+30]
