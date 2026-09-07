@@ -61,6 +61,20 @@ inline size_t assetAuthorityWinner(const std::vector<AssetField::ResolvedAssetIn
 }
 struct AssetAuthorityTerrainEdit {int64_t x=0,y=0,z=0;MaterialId material=MAT_AIR;};
 struct AssetAuthoritySample {MaterialId material=MAT_AIR;AssetObjectId owner{};uint64_t generation=0,objectRevision=0;};
+// Host implementation must pin the actual generated instance, its amplifier,
+// tile/water/channel providers, field banks and identity adapter until release.
+// The pinned generated configuration and identity service must be immutable
+// and safe for concurrent sampling; mere object lifetime is insufficient.
+// No default-configuration World clone is substituted.
+template<int B> struct IAssetAuthorityCaptureLifetime {
+    virtual ~IAssetAuthorityCaptureLifetime()=default;
+    virtual const GeneratedWorld<B>& generated() const=0;
+    virtual const IAssetAuthorityIdentity& identity() const=0;
+};
+struct AssetAuthorityCaptureEpoch {
+    uint64_t edits=0,residency=0,configuration=0,objectRevision=0;
+    friend bool operator==(const AssetAuthorityCaptureEpoch&,const AssetAuthorityCaptureEpoch&)=default;
+};
 template<int B> class StationaryAssetAuthorityCoordinator;
 // A coordinated view must reserve a sibling credit before any edit array copy.
 // Last-view destruction releases arrays before this lease.
@@ -120,6 +134,77 @@ public:
     Ref editTerrain(uint64_t expectedGeneration,int64_t x,int64_t y,int64_t z,MaterialId m) const {
         const AssetAuthorityTerrainEdit cell{x,y,z,m};
         return editTerrainBatch(expectedGeneration,std::span<const AssetAuthorityTerrainEdit>(&cell,1));
+    }
+    using CaptureLifetime=std::shared_ptr<const IAssetAuthorityCaptureLifetime<B>>;
+    class Admission {
+        friend class StationaryAssetAuthority;
+        CaptureLifetime lifetime;
+        const World<B>* worldAddress=nullptr; // identity only, NEVER dereferenced by worker
+        const AssetField* fieldAddress=nullptr;
+        std::string provider;
+        AssetAuthorityCaptureEpoch epoch{};
+        uint64_t terrainEntries=0,craftEntries=0,generation=0;
+        AssetProvenance provenance{};
+        std::shared_ptr<const AssetGrid> source,current;
+        AssetCandidateBounds domain{};
+    public:
+        Admission()=default;Admission(const Admission&)=delete;Admission& operator=(const Admission&)=delete;
+    };
+    using AdmissionRef=std::shared_ptr<const Admission>;
+    class Completed {
+        friend class StationaryAssetAuthority;
+        AdmissionRef admission;Ref view;std::string catalog;
+    public:
+        Completed()=default;Completed(const Completed&)=delete;Completed& operator=(const Completed&)=delete;
+    };
+    using CompletedRef=std::shared_ptr<const Completed>;
+    // Owner/GT only. Immutable grid inputs must have no mutable aliases.
+    static AdmissionRef admitCapture(const World<B>& world,const AssetProvenance& p,
+        std::shared_ptr<const AssetGrid> source,std::shared_ptr<const AssetGrid> current,
+        uint64_t generation,AssetAuthorityCaptureEpoch epoch,CaptureLifetime lifetime,std::string& error) {
+        error.clear();auto fail=[&](const char* why)->AdmissionRef{error=why;return {};};
+        if(!lifetime||&lifetime->generated()!=&world.generated()||!source||!current||!generation||!epoch.objectRevision)
+            return fail("capture lifetime/revision missing");
+        if(world.amplifier().seed()!=p.worldSeed||!world.assetField()||world.log().providerId().empty())return fail("capture world binding");
+        AssetField::ResolvedAssetInstance r;r.grid=source.get();r.anchorVx=p.anchorVx;r.anchorVy=p.anchorVy;r.anchorVz=p.anchorVz;r.yawQuarter=p.yawQuarter;
+        AssetCandidateBounds box;if(!assetCandidateBounds(r,box)||source->sizeX()>64||source->sizeY()>64||source->sizeZ()>128)return fail("capture source bound");
+        if(!current->valid()||!current->onTerrainLattice()||source->hasParts()||current->hasParts()||
+           current->sizeX()!=source->rotatedSizeX(p.yawQuarter)||current->sizeY()!=source->rotatedSizeY(p.yawQuarter)||current->sizeZ()!=source->sizeZ()||
+           current->originX()!=source->rotatedOriginX(p.yawQuarter)||current->originY()!=source->rotatedOriginY(p.yawQuarter)||current->originZ()!=source->originZ())return fail("capture projection format/transform");
+        AssetCandidateBounds d{(floorDiv(box.x0,B)-1)*B,(floorDiv(box.y0,B)-1)*B,(floorDiv(box.z0,B)-1)*B,
+            (floorDiv(box.x1,B)+2)*B-1,(floorDiv(box.y1,B)+2)*B-1,(floorDiv(box.z1,B)+2)*B-1};
+        const uint64_t nx=uint64_t(d.x1-d.x0+1),ny=uint64_t(d.y1-d.y0+1),nz=uint64_t(d.z1-d.z0+1),cap=1024*1024;
+        if(nx>cap||ny>cap||nz>cap||nx*ny>cap||nx*ny*nz>cap||!captureDomainClear(world,d))return fail("capture domain edited/unbounded");
+        std::shared_ptr<Admission> a(new Admission);a->lifetime=std::move(lifetime);a->worldAddress=&world;a->fieldAddress=world.assetField();
+        a->provider=world.log().providerId();a->epoch=epoch;a->terrainEntries=world.log().size();a->craftEntries=world.craftLog().size();
+        a->generation=generation;a->provenance=p;a->source=std::move(source);a->current=std::move(current);a->domain=d;return a;
+    }
+    // Worker-safe with the pinned immutable generated configuration. No World
+    // overlay/craft map or mutable actor is inspected anywhere in this path.
+    static CompletedRef sampleCapture(AdmissionRef a,std::string& error) {
+        if(!a){error="missing capture admission";return {};}
+        auto result=captureGenerated(a->lifetime->generated(),a->provider,a->provenance,*a->source,*a->current,
+            a->generation,a->epoch.objectRevision,a->epoch.objectRevision,a->lifetime->identity(),error);
+        if(!result)return {};
+        std::shared_ptr<Completed> out(new Completed);out->catalog=a->lifetime->identity().catalogIdentity(*a->lifetime->generated().assetField());
+        out->admission=std::move(a);out->view=std::move(result);return out;
+    }
+    // Owner/GT only. Return no view if session/config/edit/residency/object facts
+    // changed; epoch-after-read is NOT used as a substitute for map synchronization.
+    static Ref acceptCapture(const World<B>& world,const CompletedRef& result,const CaptureLifetime& lifetime,
+        AssetAuthorityCaptureEpoch now) {
+        if(!result||!result->admission||!lifetime)return {};
+        const auto& a=*result->admission;
+        if(a.lifetime!=lifetime||a.worldAddress!=&world||a.fieldAddress!=world.assetField()||a.epoch!=now||
+           &lifetime->generated()!=&world.generated()||a.provider!=world.log().providerId()||
+           a.terrainEntries!=world.log().size()||a.craftEntries!=world.craftLog().size()||!captureDomainClear(world,a.domain))return {};
+        if(result->catalog.empty()||lifetime->identity().catalogIdentity(*world.assetField())!=result->catalog)return {};
+        // Identity adapters are callbacks. Repeat owner facts after they return:
+        // a callback cannot authorize a view after modifying the live World.
+        if(a.lifetime!=lifetime||a.worldAddress!=&world||a.fieldAddress!=world.assetField()||a.epoch!=now||
+           &lifetime->generated()!=&world.generated()||a.provider!=world.log().providerId()||
+           a.terrainEntries!=world.log().size()||a.craftEntries!=world.craftLog().size()||!captureDomainClear(world,a.domain))return {};
+        return result->view;
     }
     // Construction synchronously borrows a frozen World only here. No provider,
     // bank, World, grid or UObject pointer survives the capture.
@@ -200,6 +285,86 @@ public:
         out->terrain_=terrain;out->source_=source;out->projection_=projection;out->edits_=std::make_shared<std::vector<Override>>(count);return out;
     }
 private:
+
+    static bool captureDomainClear(const World<B>& world,const AssetCandidateBounds& domain) {
+        for(int64_t z=floorDiv(domain.z0,B);z<=floorDiv(domain.z1,B);++z)
+        for(int64_t y=floorDiv(domain.y0,B);y<=floorDiv(domain.y1,B);++y)
+        for(int64_t x=floorDiv(domain.x0,B);x<=floorDiv(domain.x1,B);++x) {
+            if(x<INT32_MIN||x>INT32_MAX||y<INT32_MIN||y>INT32_MAX||z<INT32_MIN||z>INT32_MAX)return false;
+            const BrickKey key{int32_t(x),int32_t(y),int32_t(z)};
+            if(world.editedBricks().find(key))return false;
+            if constexpr(World<B>::kCraftSupported)if(world.isPromoted(key))return false;
+        }
+        return true;
+    }
+    static Ref captureGenerated(const GeneratedWorld<B>& generated,const std::string& provider,const AssetProvenance& p,const AssetGrid& canonical,
+        const AssetGrid& current,uint64_t generation,uint64_t objectRevision,uint64_t projectionRevision,
+        const IAssetAuthorityIdentity& identity,std::string& error) {
+        error.clear();auto fail=[&](const char* why)->Ref{error=why;return {};};
+        const auto* field=generated.assetField();
+        if(!field||field->empty()||generated.amplifier().seed()!=p.worldSeed||field->seed()!=p.worldSeed||provider.empty()||
+           !generation||!objectRevision||objectRevision!=projectionRevision||p.yawQuarter>3)return fail("world/identity/revision");
+        const auto catalog=identity.catalogIdentity(*field);
+        if(catalog.empty()||p.providerFingerprint!=assetAuthorityFingerprint(provider+":worldgen:"+std::to_string(kWorldGenVersion)))return fail("provider/catalog binding");
+        AssetField::ResolvedAssetInstance wanted;wanted.grid=&canonical;wanted.anchorVx=p.anchorVx;wanted.anchorVy=p.anchorVy;wanted.anchorVz=p.anchorVz;wanted.yawQuarter=p.yawQuarter;
+        AssetCandidateBounds b;if(!assetCandidateBounds(wanted,b)||!current.valid()||!current.onTerrainLattice()||canonical.hasParts()||current.hasParts())return fail("source format");
+        if(canonical.sizeX()>64||canonical.sizeY()>64||canonical.sizeZ()>128)return fail("source extent budget");
+        if(current.sizeX()!=canonical.rotatedSizeX(p.yawQuarter)||current.sizeY()!=canonical.rotatedSizeY(p.yawQuarter)||current.sizeZ()!=canonical.sizeZ()||
+           current.originX()!=canonical.rotatedOriginX(p.yawQuarter)||current.originY()!=canonical.rotatedOriginY(p.yawQuarter)||current.originZ()!=canonical.originZ())return fail("projection transform");
+        const auto hash=identity.contentHash(canonical);
+        if(hash.size()!=32)return fail("source digest format");
+        for(char c:hash)if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')))return fail("source digest format");
+        if(p.catalogFingerprint!=assetAuthorityFingerprint(catalog+":"+hash))return fail("catalog/source mismatch");
+        // Brick-align and include one neighboring brick on every side for edits.
+        AssetCandidateBounds domain{(floorDiv(b.x0,B)-1)*B,(floorDiv(b.y0,B)-1)*B,(floorDiv(b.z0,B)-1)*B,
+            (floorDiv(b.x1,B)+2)*B-1,(floorDiv(b.y1,B)+2)*B-1,(floorDiv(b.z1,B)+2)*B-1};
+        const uint64_t nx=uint64_t(domain.x1-domain.x0+1),ny=uint64_t(domain.y1-domain.y0+1),nz=uint64_t(domain.z1-domain.z0+1);
+        constexpr uint64_t MaxCells=1024*1024;
+        if(nx>MaxCells||ny>MaxCells||nz>MaxCells||nx*ny>MaxCells||nx*ny*nz>MaxCells)return fail("capture cell budget");
+        std::vector<AssetInstance> instances;
+        if(!assetAuthorityInstances(*field,{domain.x0,domain.y0,domain.x1,domain.y1},[&](int64_t x,int64_t y){
+            return assetColumnFactsFromSample(generated.amplifier().columnCached(x,y),generated.assetChannelsAt(x,y));},instances))return fail("site preflight budget");
+        const auto ordered=field->resolveForCompose(instances);std::vector<AssetCandidateBounds> boxes;boxes.reserve(ordered.size());
+        size_t selected=ordered.size();
+        // Bound worst-case composition BEFORE voxel iteration and dense allocation.
+        if(ordered.size()>64||nx*ny*nz>64ull*1024*1024/(ordered.size()+1))return fail("composition work budget");
+        for(size_t i=0;i<ordered.size();++i) {
+            const auto& r=ordered[i];AssetCandidateBounds box;if(!assetCandidateBounds(r,box))return fail("resolved bounds");boxes.push_back(box);
+            if(r.anchorVx==p.anchorVx&&r.anchorVy==p.anchorVy&&r.anchorVz==p.anchorVz&&r.yawQuarter==p.yawQuarter&&r.layer==p.layer&&r.bankId==p.bankId&&r.seedIndex==p.seedIndex) {
+                if(selected!=ordered.size()||r.grid->sizeX()!=canonical.sizeX()||r.grid->sizeY()!=canonical.sizeY()||r.grid->sizeZ()!=canonical.sizeZ()||identity.contentHash(*r.grid)!=hash)return fail("canonical source changed");
+                selected=i;
+            }
+        }
+        if(selected==ordered.size())return fail("canonical source missing");
+        const size_t count=size_t(nx*ny*nz);
+        auto terrain=std::make_shared<std::vector<MaterialId>>(count,MAT_AIR);
+        auto source=std::make_shared<std::vector<MaterialId>>(count,MAT_AIR);
+        auto projection=std::make_shared<std::vector<MaterialId>>(count,MAT_AIR);
+        for(int64_t y=domain.y0;y<=domain.y1;++y)for(int64_t x=domain.x0;x<=domain.x1;++x) {
+            const auto col=generated.amplifier().columnCached(x,y);
+            for(int64_t z=domain.z0;z<=domain.z1;++z) {
+                const size_t j=size_t(x-domain.x0)+size_t(nx)*(size_t(y-domain.y0)+size_t(ny)*size_t(z-domain.z0));
+                auto m=Amplifier::materialAt(col,z);MaterialId owned=MAT_AIR;
+                if(m==MAT_AIR) {
+                    const auto i=assetAuthorityWinner(ordered,boxes,x,y,z);
+                    if(i<ordered.size()) {
+                        const auto a=assetCandidateMaterial(ordered[i],boxes[i],x,y,z);
+                        if(i==selected)owned=a;else m=a;
+                    }
+                }
+                (*terrain)[j]=m;(*source)[j]=owned;
+                const auto px=x-b.x0,py=y-b.y0,pz=z-b.z0;
+                if(px>=0&&py>=0&&pz>=0&&px<current.sizeX()&&py<current.sizeY()&&pz<current.sizeZ()) {
+                    const auto a=current.at(int32_t(px),int32_t(py),int32_t(pz));
+                    if(a!=MAT_AIR&&a!=owned)return fail("projection outside owned winner");
+                    (*projection)[j]=a;
+                }
+            }
+        }
+        std::shared_ptr<StationaryAssetAuthority> out(new StationaryAssetAuthority);
+        out->domain_=domain;out->nx_=size_t(nx);out->ny_=size_t(ny);out->provenance_=p;out->generation_=generation;out->revision_=objectRevision;
+        out->terrain_=terrain;out->source_=source;out->projection_=projection;out->edits_=std::make_shared<std::vector<Override>>(count);return out;
+    }
     friend class StationaryAssetAuthorityCoordinator<B>;
     struct Override {bool present=false;MaterialId material=MAT_AIR;};
     StationaryAssetAuthority()=default;
