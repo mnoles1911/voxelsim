@@ -20,9 +20,9 @@
 //
 // -- THE MIRROR HAZARDS IN THIS PARTICULAR CARVE, NAMED -------------------
 //
-// A. INTEGER DIVISION DIRECTION. C++ and HLSL both truncate toward zero for
-//    signed integer division, so `a / b` agrees. That is why this file uses
-//    plain `/` and NOT the floorDiv the rest of worldgen.ush uses: floorDiv
+// A. INTEGER DIVISION DIRECTION. Match C++ truncation toward zero using
+//    unsigned-magnitude division so mixed signs are portable across GPUs.
+//    This file uses karstTruncDiv, NOT floorDiv: floorDiv
 //    exists for LATTICE indexing, where truncation and floor genuinely differ
 //    and floor is the correct answer. Here every division is either by a
 //    positive denominator with the numerator's sign preserved (karstLerp,
@@ -55,6 +55,19 @@
 #define KARST_ENTRANCE    6
 
 #define kMaxKarstSegs 8
+
+// Preserve C++ truncation toward zero using unsigned magnitudes, as in
+// worldgen.ush's truncDiv. Bare signed division is not portable across GPUs.
+uint64_t karstMagnitude(int64_t v) {
+    const uint64_t u = (uint64_t)v;
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - defined unsigned negation recovers the magnitude, including INT64_MIN
+    return v < 0 ? (uint64_t)0 - u : u;
+}
+int64_t karstTruncDiv(int64_t a, int64_t b) {
+    const uint64_t q = karstMagnitude(a) / karstMagnitude(b);
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - defined unsigned negation restores the quotient sign without signed remainder
+    return ((a < 0) != (b < 0)) ? (int64_t)((uint64_t)0 - q) : (int64_t)q;
+}
 
 static const int kKarstRoofMinMm = 4000;
 static const int kKarstBedrockMarginMm = 2000;
@@ -121,13 +134,15 @@ void karstFoot(int64_t px, int64_t py, int64_t ax, int64_t ay,
     if (num > den) num = den;
     const int64_t fx = apx * den - abx * num;
     const int64_t fy = apy * den - aby * num;
-    distSq = (fx / den) * (fx / den) + (fy / den) * (fy / den);
+    const int64_t dx = karstTruncDiv(fx, den);
+    const int64_t dy = karstTruncDiv(fy, den);
+    distSq = dx * dx + dy * dy;
     tNum = num;
     tDen = den;
 }
 
 int64_t karstLerp(int64_t a, int64_t b, int64_t num, int64_t den) {
-    return a + ((b - a) * num) / den;
+    return a + karstTruncDiv((b - a) * num, den);
 }
 
 int karstClamp32(int64_t v, int lo, int hi) {
@@ -139,8 +154,8 @@ bool karstSegForColumn(GpuKarstNode a, GpuKarstNode b, int64_t vx, int64_t vy,
                        int voxelSizeMm, out GpuKarstSeg outSeg) {
     outSeg = (GpuKarstSeg)0;
 
-    const int64_t px = vx * (int64_t)voxelSizeMm + (int64_t)voxelSizeMm / 2;
-    const int64_t py = vy * (int64_t)voxelSizeMm + (int64_t)voxelSizeMm / 2;
+    const int64_t px = vx * (int64_t)voxelSizeMm + karstTruncDiv((int64_t)voxelSizeMm, 2);
+    const int64_t py = vy * (int64_t)voxelSizeMm + karstTruncDiv((int64_t)voxelSizeMm, 2);
 
     int64_t distSq, tNum, tDen;
     karstFoot(px, py, a.xMm, a.yMm, b.xMm, b.yMm, distSq, tNum, tDen);
@@ -156,7 +171,7 @@ bool karstSegForColumn(GpuKarstNode a, GpuKarstNode b, int64_t vx, int64_t vy,
     if (rV <= 0) return false;
 
     // Hazard B: this product needs 64 bits. See the header note.
-    const int64_t marginSq = (rV * rV) * (rH * rH - distSq) / (rH * rH);
+    const int64_t marginSq = karstTruncDiv((rV * rV) * (rH * rH - distSq), rH * rH);
     if (marginSq <= 0) return false;
 
     const uint kind = a.kindTier & 0xFF;
@@ -165,7 +180,7 @@ bool karstSegForColumn(GpuKarstNode a, GpuKarstNode b, int64_t vx, int64_t vy,
     outSeg.axisZMm = karstClamp32(karstLerp((int64_t)a.zMm, (int64_t)b.zMm, tNum, tDen),
                                   -2147483647 - 1, 0x7FFFFFFF);
     outSeg.kind = kind;
-    outSeg.floorDropMm = (kind == KARST_KEYHOLE) ? karstClamp32(rV * 3 / 2, 0, 0x7FFFFFFF) : 0;
+    outSeg.floorDropMm = (kind == KARST_KEYHOLE) ? karstClamp32(karstTruncDiv(rV * 3, 2), 0, 0x7FFFFFFF) : 0;
     return true;
 }
 
@@ -208,7 +223,7 @@ bool karstCarveAt(GpuKarstColumn col, int surfaceMm, int bedrockDepthMm,
                   int64_t vz, int voxelSizeMm) {
     if (col.count == 0) return false;
 
-    const int64_t centreMm = vz * (int64_t)voxelSizeMm + (int64_t)voxelSizeMm / 2;
+    const int64_t centreMm = vz * (int64_t)voxelSizeMm + karstTruncDiv((int64_t)voxelSizeMm, 2);
 
     if (centreMm < (int64_t)col.minZMm || centreMm > (int64_t)col.maxZMm) return false;
     if (vz < kKarstMinVoxelZ) return false;
@@ -226,7 +241,7 @@ bool karstCarveAt(GpuKarstColumn col, int surfaceMm, int bedrockDepthMm,
         if (dz * dz < (int64_t)s.marginSq) return true;
 
         if (s.floorDropMm > 0 && dz < 0 && -dz <= (int64_t)s.floorDropMm) {
-            if (s.marginSq > 0 && (dz * dz) / 16 < (int64_t)s.marginSq) return true;
+            if (s.marginSq > 0 && karstTruncDiv(dz * dz, 16) < (int64_t)s.marginSq) return true;
         }
     }
     return false;

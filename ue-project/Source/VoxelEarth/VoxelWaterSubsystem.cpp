@@ -2378,7 +2378,6 @@ UVoxelWaterSubsystem::~UVoxelWaterSubsystem() = default;
 UVoxelWaterSubsystem::UVoxelWaterSubsystem(FVTableHelper& Helper)
 	: Super(Helper)
 {
-    if (Impl.bImplicitOceanPinned) return;
 }
 
 void UVoxelWaterSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -5796,6 +5795,8 @@ void FlushSweIntoCA(FVoxelWaterImpl& Impl, const TCHAR* Reason)
 
 void MaybeRelatchImplicitOcean(FVoxelWaterImpl& Impl)
 {
+	// A restored session owns this setting; process defaults cannot relatch it.
+	if (Impl.bImplicitOceanPinned) return;
 	const bool bWant = CVarVoxelWaterImplicitOcean.GetValueOnGameThread();
 	if (bWant == Impl.bImplicitOcean)
 	{

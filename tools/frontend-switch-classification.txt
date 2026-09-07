@@ -33,6 +33,31 @@
 # leading dash and without a trailing '='.
 
 VoxelAdmissionBandSkip
+VoxelAmortizeOuterScans
+VoxelApplyColumnCacheWays
+VoxelBathyOcean
+VoxelBrickUploadCoalesce
+VoxelClipmapAlbedoSrgb
+VoxelClipmapVertexAlbedo
+VoxelClipmapVoxelize
+VoxelEnvironmentLOD
+VoxelEnvironmentLODKeepOpen
+VoxelEnvironmentLODValidate
+VoxelForceInternal
+VoxelForceRes
+VoxelGpuRasterAtlasDemandPagesPerTick
+VoxelGpuRasterAtlasFillSafety
+VoxelRenderFrameFakeFamilies
+VoxelSyntheticTerrain
+VoxelTickBudgetMaxDefer
+VoxelTickBudgetMs
+VoxelTickBudgetReserveMs
+VoxelTreeFelling
+VoxelWaterDepthAuthority
+VoxelWaterFoamGain
+VoxelWaterMatScalar
+VoxelWaterShoreClip
+VoxelWaveTessM
 VoxelAssetDir
 VoxelBuriedSkip
 VoxelCameraHigh
@@ -442,6 +467,13 @@ VoxelPerfShotMaxCount = Parameter of a self-driving fixture; only meaningful whe
 VoxelPerfShotName = Parameter of a self-driving fixture; only meaningful when -VoxelPerfShotEveryM= is also present, so suppressing the menu is correct.
 VoxelPerfShotStartM = Parameter of a self-driving fixture; only meaningful when -VoxelPerfShotEveryM= is also present, so suppressing the menu is correct.
 VoxelReadyProbeLog = ACCIDENTAL ('Probe'). Enables a readiness log line; a diagnostic, not a run that drives itself.
+VoxelAsyncRestoreProbe = Restore fixture: selects the async verification save during an unattended restore run.
+VoxelDetachedRestoreProbe = Restore fixture: loads the detached snapshot and verifies restored objects on a timer.
+VoxelObjectsNetVerify = Multiplayer fixture: observes object motion, retention and deletion at fixed times, then exits.
+VoxelDumpIndexKeys = ACCIDENTAL ('Dump'). Logs resident index keys during normal streaming without driving or ending the run.
+VoxelSkyMarkVerify = ACCIDENTAL ('Verify'). Samples generated terrain during normal streaming to validate sky marks.
+VoxelSkyMarkVerifyGrid = ACCIDENTAL ('Verify'). Configures the sample grid of the streaming sky-mark diagnostic.
+VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'). Configures the sampling stride of the streaming sky-mark diagnostic.
 VoxelReplicationSelfTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelSaveWorldAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
 VoxelScreenshotAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
