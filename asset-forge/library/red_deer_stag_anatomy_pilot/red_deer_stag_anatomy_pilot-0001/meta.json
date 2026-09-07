@@ -13,8 +13,8 @@
   "problems": [],
   "vox_models": 1,
   "static_model_complete": true,
-  "review_status": "ready_for_set_review",
-  "visual_approved": false,
+  "review_status": "appearance_approved",
+  "visual_approved": true,
   "runtime_ready": false,
   "animation": "not rigged",
   "appearance": "RGB surface sidecar",
@@ -29,5 +29,7 @@
     "VXA roundtrip",
     "RGB payload byte equality"
   ],
-  "review_limitations": "Generic deer sculpt interpreted as a red stag. Antler age and individual measurements are unverified; this is not a mature crown-antler study."
+  "review_limitations": "Generic deer sculpt interpreted as a red stag. Antler age and individual measurements are unverified; this is not a mature crown-antler study.",
+  "approval_date": "2026-09-07",
+  "approval_basis": "User: all pilot assets look great."
 }

@@ -13,7 +13,7 @@ import trimesh
 from PIL import Image, ImageDraw
 from scipy import ndimage
 
-from reconstruct_pilot import ortho
+from creature_review_views import ortho
 
 
 def write_views(output, cells, surface_cells, rgb, pitch):

@@ -1,6 +1,6 @@
 # Golden eagle: static pilot review
 
-Status: ready for user set review. All cubes are 12.5 mm.
+Status: user accepted the static appearance on 2026-09-07. All cubes are 12.5 mm.
 
 Museum body, hooked bill, brown plumage, golden nape, feathered legs and curved dark talons.
 
@@ -10,6 +10,6 @@ Biological reference: [Golden eagle species account](https://www.allaboutbirds.o
 
 Orthographic and oblique reviews: `out/creature-reconstruction/golden-eagle-cleanup-study`. Saved model: `golden_eagle_anatomy_pilot/golden_eagle_anatomy_pilot-0001`.
 
-Validation: one connected component; exact surface/RGB alignment; 12.5 mm VXA; RGB payload byte equality. Bounds (including pose, fins or antlers): 0.8125 × 0.4125 × 0.7375 m. Occupied cubes: 24,305.
+Validation: one connected component; exact surface/RGB alignment; 12.5 mm VXA; RGB payload byte equality. Bounds (including pose, fins or antlers): 0.8125 Ã— 0.4125 Ã— 0.7375 m. Occupied cubes: 24,305.
 
 Static appearance only. Rigging, animation, collisions, LODs and game integration remain separate. Technical checks do not confer visual approval.

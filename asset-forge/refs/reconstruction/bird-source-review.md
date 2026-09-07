@@ -1,6 +1,6 @@
 # Bird pilot completed checkpoint
 
-Both CC0 museum birds are now saved as 12.5 mm static candidates. See common-raven/review.md
+Both CC0 museum birds are saved at 12.5 mm and user accepted on 2026-09-07. See common-raven/review.md
 and golden-eagle/review.md for final limits. The fused perches and damaged foot regions
 were removed explicitly. New tools refine_raven_voxels.py and refine_eagle_pilot.py
 reconstruct articulated feet with three forward digits and one hallux. Eagle lower
@@ -28,7 +28,7 @@ The reference photographs are not redistributed.
 `common-raven-museum-study` has 6,956 voxels including the branch. A first
 location-and-color perch removal study has 6,348 voxels and five components.
 It still visibly contains support fragments and is NOT ready to install.
-`refine_raven_master.py` records this experiment. Continue explicit perch
+The retired `refine_raven_master.py` recorded this failed experiment (available in Git history). The historical next step was explicit perch
 segmentation and toe review; do not discard fragments indiscriminately or
 label the current study anatomically complete. Darken faded specimen coloration
 with reference-informed feather, bill and foot regions after geometry review.
