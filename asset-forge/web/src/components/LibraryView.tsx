@@ -206,7 +206,7 @@ export function LibraryView({
             </span>
             <Button variant="gold" size="sm" disabled={publishing} onClick={() => void doPublish()}
               title="Publish the library to the game: banks derived from kept seeds, manifest + categories re-exported, checks run">
-              <Rocket className="h-3.5 w-3.5" /> {publishing ? "Publishing…" : "Publish"}
+              <Rocket className="h-3.5 w-3.5" /> {publishing ? "Exporting…" : "Export to game"}
             </Button>
           </div>
         </div>

@@ -277,6 +277,7 @@ export interface LibraryEntry {
   seed: number;
   spec_hash?: string;
   imported?: boolean;
+  visual_approved?: boolean;
   stats?: Record<string, number>;
   problems?: string[];
 }

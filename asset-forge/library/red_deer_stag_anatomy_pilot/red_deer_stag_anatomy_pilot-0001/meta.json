@@ -1,0 +1,33 @@
+{
+  "id": "red_deer_stag_anatomy_pilot-0001",
+  "species": "red_deer_stag_anatomy_pilot",
+  "kind": "quadruped",
+  "seed": 1,
+  "imported": true,
+  "source_format": "reviewed reference mesh; RGB voxel study",
+  "spec_hash": "80df84d6fe149c95",
+  "stats": {
+    "height_m": 2.463,
+    "voxels": 205448
+  },
+  "problems": [],
+  "vox_models": 1,
+  "static_model_complete": true,
+  "review_status": "ready_for_set_review",
+  "visual_approved": false,
+  "runtime_ready": false,
+  "animation": "not rigged",
+  "appearance": "RGB surface sidecar",
+  "voxel_mm": 12.5,
+  "dimensions_m": [
+    2.0125,
+    0.6125,
+    2.4625000000000004
+  ],
+  "validation": [
+    "one connected component",
+    "VXA roundtrip",
+    "RGB payload byte equality"
+  ],
+  "review_limitations": "Generic deer sculpt interpreted as a red stag. Antler age and individual measurements are unverified; this is not a mature crown-antler study."
+}

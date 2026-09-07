@@ -1,0 +1,33 @@
+{
+  "id": "golden_eagle_anatomy_pilot-0001",
+  "species": "golden_eagle_anatomy_pilot",
+  "kind": "bird",
+  "seed": 1,
+  "imported": true,
+  "source_format": "reviewed reference mesh; RGB voxel study",
+  "spec_hash": "8f8c1ea989e9f146",
+  "stats": {
+    "height_m": 0.738,
+    "voxels": 24305
+  },
+  "problems": [],
+  "vox_models": 1,
+  "static_model_complete": true,
+  "review_status": "ready_for_set_review",
+  "visual_approved": false,
+  "runtime_ready": false,
+  "animation": "not rigged",
+  "appearance": "RGB surface sidecar",
+  "voxel_mm": 12.5,
+  "dimensions_m": [
+    0.8125,
+    0.41250000000000003,
+    0.7375
+  ],
+  "validation": [
+    "one connected component",
+    "VXA roundtrip",
+    "RGB payload byte equality"
+  ],
+  "review_limitations": "Perch and fused feet replaced. Retained white wing/tail patches are interpreted as immature plumage; reconstructed feet are not scan measurements."
+}

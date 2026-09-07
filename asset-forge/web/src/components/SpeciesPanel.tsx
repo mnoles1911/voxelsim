@@ -61,7 +61,12 @@ export function SpeciesPanel({
         </div>
       </header>
 
-      <JudgmentViewport row={row} world={world} />
+      {variants.some((e) => e.imported) ? (
+        <section className="chamfer bevel-up bg-stone-800 p-3">
+          <h3 className="mb-2 font-display text-sm uppercase tracking-widest text-parch-400">Imported model</h3>
+          <VoxelCanvas src={api.voxelsUrl(variants.find((e) => e.imported)!.id)} palette={world.palette} />
+        </section>
+      ) : <JudgmentViewport row={row} world={world} />}
 
       <CurationBar row={row} world={world} />
 
@@ -300,6 +305,7 @@ function JudgmentViewport({ row, world }: { row: SpeciesRow; world: World }) {
 
 function CurationBar({ row, world }: { row: SpeciesRow; world: World }) {
   const toast = useToast();
+  const imported = world.library.find((e) => e.species === row.name && e.imported);
   const c = row.curation;
   const [notes, setNotes] = React.useState(c.notes);
   const [busy, setBusy] = React.useState(false);
@@ -327,7 +333,9 @@ function CurationBar({ row, world }: { row: SpeciesRow; world: World }) {
     }
   };
 
-  const bankLine = keptSeeds.length
+  const bankLine = imported
+    ? (imported.visual_approved ? "appearance approved · game integration separate" : "saved model awaiting appearance review")
+    : keptSeeds.length
     ? "bank = kept seeds " + keptSeeds.join(", ") + " (keep-driven)"
     : !c.curated
       ? "grandfathered: exports at seeds " + c.seeds.join(", ") + " until reviewed — keep the good seeds above to convert"
@@ -340,10 +348,19 @@ function CurationBar({ row, world }: { row: SpeciesRow; world: World }) {
   return (
     <section className="chamfer bevel-up bg-stone-800 p-3">
       <h3 className="mb-2 flex items-center gap-2 font-display text-sm uppercase tracking-widest text-parch-400">
-        <Stamp className="h-4 w-4" /> Publish verdict
+        <Stamp className="h-4 w-4" /> {imported ? "Appearance review" : "Publish verdict"}
         <span className="font-mono text-[11px] normal-case tracking-normal text-parch-500">{bankLine}</span>
       </h3>
       <div className="flex flex-wrap items-center gap-2">
+        {imported && <Button size="sm" variant="moss" disabled={busy} onClick={async () => {
+          setBusy(true);
+          try {
+            await api.reviewAppearance(imported.id, !imported.visual_approved);
+            await world.refreshLibrary();
+            toast.ok(imported.visual_approved ? "Appearance approval removed" : "Appearance approved");
+          } catch (e) { toast.error(String(e)); }
+          finally { setBusy(false); }
+        }}>{imported.visual_approved ? "Undo appearance approval" : "Approve appearance"}</Button>}
         {c.status !== "rejected" ? (
           <Button variant="rust" size="sm" disabled={busy} onClick={() => write("rejected")}
             title="None of these belong in the game — holds the species out of every export">

@@ -16,79 +16,13 @@ from scipy import ndimage
 from reconstruct_pilot import ortho
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('source', type=Path)
-    parser.add_argument('output', type=Path)
-    parser.add_argument('--length-m', type=float, required=True)
-    parser.add_argument('--long-axis', type=int, choices=(0, 2), required=True)
-    args = parser.parse_args()
-    if args.length_m <= 0:
-        parser.error('length must be positive')
-    pitch = .0125
-    scene = trimesh.load(args.source, force='scene')
-    meshes = []
-    # Preserve each instantiated geometry and its world transform.
-    for node in scene.graph.nodes_geometry:
-        transform, name = scene.graph[node]
-        mesh = scene.geometry[name].copy()
-        mesh.apply_transform(transform)
-        meshes.append(mesh)
-    vertices = np.vstack([m.vertices for m in meshes])
-    lo, hi = vertices.min(0), vertices.max(0)
-    scale = args.length_m / (hi[args.long_axis] - lo[args.long_axis])
-    order = [args.long_axis, 2 if args.long_axis == 0 else 0, 1]
-    for mesh in meshes:
-        mesh.vertices = (mesh.vertices - lo)[:, order] * scale
-    cells = np.unique(np.vstack([
-        np.rint(m.voxelized(pitch).fill().points / pitch).astype(np.int32)
-        for m in meshes]), axis=0)
+def write_views(output, cells, surface_cells, rgb, pitch):
+    """Export matched sRGB orthographic images and linear-color cubic GLB."""
     lower = cells.min(0) - 1
     shape = cells.max(0) - lower + 2
-    if np.prod(shape) > 32_000_000:
-        raise ValueError('Research allocation exceeds 32 million cells')
     occupied = np.zeros(shape, bool)
     occupied[tuple((cells-lower).T)] = True
-    labels, _ = ndimage.label(occupied)
-    components = sorted(np.bincount(labels.ravel())[1:].tolist(), reverse=True)
-    surface = occupied & ~ndimage.binary_erosion(occupied)
-    indices = np.argwhere(surface)
-    points = (indices + lower) * pitch
-    rgb = np.full((len(points), 3), 127, np.uint8)
-    best = np.full(len(points), np.inf)
-    textured = []
-    for mesh in meshes:
-        visual = mesh.visual
-        textured.append(visual.kind == 'texture')
-        for begin in range(0, len(points), 2048):
-            end = min(begin + 2048, len(points))
-            closest, distance, triangles = trimesh.proximity.closest_point(mesh, points[begin:end])
-            replace = distance < best[begin:end]
-            if not np.any(replace):
-                continue
-            if visual.kind == 'texture' and visual.uv is not None:
-                # Integrate a small footprint instead of aliasing detailed fur
-                # textures to a single point per 12.5 mm cube. Clamp samples
-                # within the selected triangle so UV seams never interpolate.
-                samples = []
-                offsets = np.vstack([np.zeros(3), np.eye(3)*pitch*.35, -np.eye(3)*pitch*.35])
-                for offset in offsets:
-                    bary = trimesh.triangles.points_to_barycentric(mesh.triangles[triangles], closest+offset)
-                    bary = np.clip(bary, 0, 1)
-                    bary /= np.maximum(bary.sum(1, keepdims=True), 1e-12)
-                    uv = (visual.uv[mesh.faces[triangles]] * bary[:, :, None]).sum(1)
-                    color = visual.material.to_color(uv)[:, :3].astype(float)/255
-                    samples.append(np.where(color <= .04045, color/12.92, ((color+.055)/1.055)**2.4))
-                linear = np.mean(samples, axis=0)
-                sampled = np.clip(np.where(linear <= .0031308, linear*12.92,
-                    1.055*linear**(1/2.4)-.055)*255, 0, 255).astype(np.uint8)
-            else:
-                sampled = visual.to_color().face_colors[triangles, :3] if visual.kind == 'texture' else visual.face_colors[triangles, :3]
-            rgb[begin:end][replace] = sampled[replace]
-            best[begin:end][replace] = distance[replace]
-    args.output.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(args.output/'surface-appearance.npz', cells=indices+lower,
-                        rgb=rgb, occupied_cells=cells, voxel_m=pitch)
+    indices = surface_cells - lower
     full = np.zeros((*shape, 3), np.uint8)
     full[tuple(indices.T)] = rgb
     # Exposed cube faces preserve the actual cubic surface in oblique renders.
@@ -118,24 +52,131 @@ def main():
     voxel_mesh = trimesh.Trimesh(vertices=vertices, faces=faces,
         vertex_colors=np.c_[np.rint(linear*255).astype(np.uint8), np.full(len(colors), 255)], process=False)
     voxel_mesh.apply_transform(np.array([[1,0,0,0],[0,0,1,0],[0,-1,0,0],[0,0,0,1]]))
-    voxel_mesh.export(args.output/'colored-voxels.glb')
+    voxel_mesh.export(output/'colored-voxels.glb')
     sheet = Image.new('RGB', (2100, 1460), (223, 226, 229))
     draw = ImageDraw.Draw(sheet)
     for i, (name, axis, reverse) in enumerate([
         ('side A', 1, False), ('side B', 1, True), ('end A', 0, True),
         ('end B', 0, False), ('top', 2, True), ('bottom', 2, False)]):
         view = ortho(full, occupied, axis, reverse)
-        view.save(args.output/f'view-{i}.png')
+        view.save(output/f'view-{i}.png')
         x, y = i % 3 * 700, i // 3 * 730
         sheet.paste(view, (x, y + 30))
         draw.text((x + 20, y + 8), name, fill='black')
-    sheet.save(args.output/'six-views.png')
-    report = dict(source=args.source.name,
+    sheet.save(output/'six-views.png')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('source', type=Path)
+    parser.add_argument('output', type=Path)
+    parser.add_argument('--length-m', type=float, required=True)
+    parser.add_argument('--long-axis', type=int, choices=(0, 2), required=True)
+    parser.add_argument('--fill-union', action='store_true',
+                        help='Fill the combined shell of scans split across mesh chunks')
+    args = parser.parse_args()
+    if args.length_m <= 0:
+        parser.error('length must be positive')
+    pitch = .0125
+    scene = trimesh.load(args.source, force='scene')
+    meshes = []
+    # Preserve each instantiated geometry and its world transform.
+    for node in scene.graph.nodes_geometry:
+        transform, name = scene.graph[node]
+        mesh = scene.geometry[name].copy()
+        mesh.apply_transform(transform)
+        mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.remove_unreferenced_vertices()
+        if not len(mesh.faces):
+            continue
+        meshes.append(mesh)
+    vertices = np.vstack([m.vertices for m in meshes])
+    lo, hi = vertices.min(0), vertices.max(0)
+    scale = args.length_m / (hi[args.long_axis] - lo[args.long_axis])
+    order = [args.long_axis, 2 if args.long_axis == 0 else 0, 1]
+    for mesh in meshes:
+        mesh.vertices = (mesh.vertices - lo)[:, order] * scale
+    cells = np.unique(np.vstack([
+        np.rint(m.voxelized(pitch).fill().points / pitch).astype(np.int32)
+        for m in meshes]), axis=0)
+    lower = cells.min(0) - 1
+    shape = cells.max(0) - lower + 2
+    if np.prod(shape) > 32_000_000:
+        raise ValueError('Research allocation exceeds 32 million cells')
+    occupied = np.zeros(shape, bool)
+    occupied[tuple((cells-lower).T)] = True
+    if args.fill_union:
+        occupied = ndimage.binary_fill_holes(occupied)
+        cells = np.argwhere(occupied).astype(np.int32) + lower
+    labels, _ = ndimage.label(occupied)
+    components = sorted(np.bincount(labels.ravel())[1:].tolist(), reverse=True)
+    surface = occupied & ~ndimage.binary_erosion(occupied)
+    indices = np.argwhere(surface)
+    points = (indices + lower) * pitch
+    rgb = np.full((len(points), 3), 127, np.uint8)
+    best = np.full(len(points), np.inf)
+    textured = []
+    constant_colors = []
+    for mesh in meshes:
+        if mesh.visual.kind != 'texture':
+            break
+        color = np.asarray(mesh.visual.material.to_color(np.zeros((1, 2))))
+        if color.ndim != 1:
+            break
+        constant_colors.append(color[:3])
+    uniform_color = (len(constant_colors) == len(meshes) and
+                     all(np.array_equal(c, constant_colors[0]) for c in constant_colors))
+    if uniform_color:
+        rgb[:] = constant_colors[0]
+        textured = [False] * len(meshes)
+    for mesh in ([] if uniform_color else meshes):
+        visual = mesh.visual
+        textured.append(visual.kind == 'texture')
+        # Dense sculpt meshes produce many candidate triangles per query;
+        # keep proximity batches bounded to avoid multi-gigabyte temporaries.
+        batch_size = 128 if len(mesh.faces) > 50000 else 2048
+        for begin in range(0, len(points), batch_size):
+            end = min(begin + batch_size, len(points))
+            closest, distance, triangles = trimesh.proximity.closest_point(mesh, points[begin:end])
+            replace = distance < best[begin:end]
+            if not np.any(replace):
+                continue
+            if visual.kind == 'texture' and visual.uv is not None:
+                # Integrate a small footprint instead of aliasing detailed fur
+                # textures to a single point per 12.5 mm cube. Clamp samples
+                # within the selected triangle so UV seams never interpolate.
+                samples = []
+                offsets = np.vstack([np.zeros(3), np.eye(3)*pitch*.35, -np.eye(3)*pitch*.35])
+                for offset in offsets:
+                    bary = trimesh.triangles.points_to_barycentric(mesh.triangles[triangles], closest+offset)
+                    bary = np.clip(bary, 0, 1)
+                    bary /= np.maximum(bary.sum(1, keepdims=True), 1e-12)
+                    uv = (visual.uv[mesh.faces[triangles]] * bary[:, :, None]).sum(1)
+                    material_color = np.asarray(visual.material.to_color(uv))
+                    # Untextured PBR materials with UVs return one constant
+                    # RGBA value rather than one value per requested sample.
+                    if material_color.ndim == 1:
+                        material_color = np.broadcast_to(material_color, (len(uv), len(material_color)))
+                    color = material_color[:, :3].astype(float)/255
+                    samples.append(np.where(color <= .04045, color/12.92, ((color+.055)/1.055)**2.4))
+                linear = np.mean(samples, axis=0)
+                sampled = np.clip(np.where(linear <= .0031308, linear*12.92,
+                    1.055*linear**(1/2.4)-.055)*255, 0, 255).astype(np.uint8)
+            else:
+                sampled = visual.to_color().face_colors[triangles, :3] if visual.kind == 'texture' else visual.face_colors[triangles, :3]
+            rgb[begin:end][replace] = sampled[replace]
+            best[begin:end][replace] = distance[replace]
+    args.output.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(args.output/'surface-appearance.npz', cells=indices+lower,
+                        rgb=rgb, occupied_cells=cells, voxel_m=pitch)
+    write_views(args.output, cells, indices+lower, rgb, pitch)
+    report = dict(source=args.source.name, fill_union=args.fill_union,
         source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
         scale_assumption='Total source bounding length, including tail; not a measured specimen',
         length_m=args.length_m, pitch_m=pitch, occupied_voxels=len(cells),
         surface_voxels=len(indices), components=components, textured_meshes=textured,
-        color_sampling='Seven-point linear-light texture footprint approximation',
+        color_sampling=('Constant material RGB' if uniform_color else
+                        'Seven-point linear-light texture footprint approximation'),
         visual_approved=False, runtime_ready=False,
         limitations=['Static bind-pose geometry; no animation or skinning transfer',
                     'All source objects included; inspect for context objects and alpha cards',

@@ -348,6 +348,10 @@ export function decodeVoxels(buffer: ArrayBuffer, palette: Record<string, [numbe
 
   const offsets = new Float32Array(count * 3);
   const colors = new Uint8Array(count * 3);
+  const trailer = 16 + count * 7;
+  const authored = buffer.byteLength === trailer + 4 + count * 3 &&
+    new DataView(buffer).getUint32(trailer, false) === 0x52474231
+    ? new Uint8Array(buffer, trailer + 4, count * 3) : null;
   const materialCounts: Record<number, number> = {};
   for (let i = 0; i < count; i++) {
     offsets[i * 3] = pos[i * 3];
@@ -355,7 +359,7 @@ export function decodeVoxels(buffer: ArrayBuffer, palette: Record<string, [numbe
     offsets[i * 3 + 2] = pos[i * 3 + 2];
     const m = mats[i];
     materialCounts[m] = (materialCounts[m] ?? 0) + 1;
-    const c = palette[String(m)] || [255, 0, 255];
+    const c = authored ? authored.subarray(i * 3, i * 3 + 3) : palette[String(m)] || [255, 0, 255];
     colors[i * 3] = c[0];
     colors[i * 3 + 1] = c[1];
     colors[i * 3 + 2] = c[2];
