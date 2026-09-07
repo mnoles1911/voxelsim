@@ -462,6 +462,26 @@ VoxelEnvironmentLODKeepOpen
 VoxelEnvironmentLODValidate
 VoxelTreeFelling
 
+# --- 2026-09-07: the threaded loading curtain and the load gate's ceiling ---
+# -VoxelLoadingScreenThread=0|1 chooses which thread paints the loading screen
+# (1, the default: the engine's Slate loading thread across long world ticks;
+# 0: the game-thread viewport widget, i.e. the control arm). It changes nothing
+# about what a run does -- only where the curtain is drawn -- and an unattended
+# capture that passes it still needs -VoxelMenuAutoStart to reach the curtain
+# at all.
+#
+# CHECK THE NAME BEFORE YOU WORRY ABOUT IT: rule 5's needle is "Screenshot",
+# not "Screen", so this does NOT match and does not suppress the menu. That is
+# the intended outcome, not a near miss -- an interactive launch tuning it must
+# still get a main menu. The same trap in the other direction is recorded above
+# for -VoxelFineTileAsyncCap.
+#
+# -VoxelLoadGateMaxWait=<s> is the readiness probe's ceiling (default 300, was
+# 60 and was borrowed from -VoxelLoadMaxHold). Configuration; it makes a run
+# WAIT longer, it never ends one.
+VoxelLoadingScreenThread
+VoxelLoadGateMaxWait
+
 ## SUBSTRING-MATCHED -- ACKNOWLEDGED
 #
 # Everything below is a switch whose NAME contains one of rule 5's substrings,

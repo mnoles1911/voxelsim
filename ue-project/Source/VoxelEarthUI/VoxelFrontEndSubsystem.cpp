@@ -18,6 +18,7 @@
 
 #include "VoxelFrontEndPolicy.h"
 #include "VoxelFramePhase.h" // NoteMenuFrame -- HOOK 0, the menu's own frame-dist row
+#include "VoxelMenuScalability.h" // the menu-state render drop, applied and released below
 #include "VoxelEarthGameMode.h"
 #include "VoxelSaveLibrary.h"
 #include "VoxelWorldSubsystem.h"
@@ -118,6 +119,15 @@ void UVoxelFrontEndSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	       VoxelFrontEnd::MenuTickGatesEnabled() ? 1 : 0);
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: menu font %s."),
 	       FVoxelUIStyle::Get().IsProjectFontAvailable() ? TEXT("loaded") : TEXT("FALLBACK (engine default face)"));
+	// Phase 4, 2026-09-07: which thread will paint the loading curtain. The
+	// LATCHED SWITCH VALUE, printed at init beside the other arms, so a leg's
+	// own log proves which arm ran rather than relying on the command line it
+	// was launched with. The second half -- whether this process can actually
+	// honour it -- is printed by FVoxelLoadingCurtainThread::Begin as
+	// "LoadScreen: curtain thread requested=N available=...", because the
+	// answer is not known until there is a viewport.
+	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: loading screen thread=%d"),
+	       FVoxelFrontEndSwitches::Get().bLoadingScreenThread ? 1 : 0);
 }
 
 // Out of line, and this is not a formality. ReadyProbe is a
@@ -266,6 +276,15 @@ void UVoxelFrontEndSubsystem::EnterMenu()
 		.OnDeleteSave_UObject(this, &UVoxelFrontEndSubsystem::RequestDelete);
 
 	Viewport->AddViewportWidgetContent(MenuWidget.ToSharedRef(), VoxelFrontEndDetail::kMenuZOrder);
+
+	// AFTER THE CURTAIN IS UP, NOT BEFORE IT. SVoxelMainMenu's bottom overlay
+	// slot is an opaque full-viewport fill, and viewport widgets composite
+	// after the scene render, so from this line on every pixel the renderer
+	// produces is painted over. The drop makes those pixels cheap and cannot
+	// change what is on screen. Released at the reveal, beside
+	// RestoreStreamingBudget in TickLoading, with TeardownMenu as the backstop
+	// for every path that never reaches one -- see VoxelMenuScalability.h.
+	VoxelMenuScalability::Apply();
 
 	RefreshSaveRows();
 
@@ -514,6 +533,17 @@ void UVoxelFrontEndSubsystem::BeginLoad(const FString& EditLogPath, const FTrans
 	LoadingWidget = SNew(SVoxelLoadingScreen);
 	Viewport->AddViewportWidgetContent(LoadingWidget.ToSharedRef(), VoxelFrontEndDetail::kLoadingZOrder);
 
+	// Phase 4: from here the curtain may also be painted on the engine's Slate
+	// loading thread while the game thread is inside a long world tick. THE
+	// SAME WIDGET INSTANCE, moved out of the viewport and back per armed frame
+	// -- a second instance would shuffle its own backgrounds and tips and the
+	// picture would jump every time a block started. See
+	// VoxelLoadingCurtainThread.h for the mechanism, and for why the answer is
+	// not "keep a loading thread up for the whole load".
+	CurtainThread.Begin(World, Viewport, LoadingWidget.ToSharedRef(),
+	                    VoxelFrontEndDetail::kLoadingZOrder,
+	                    FVoxelFrontEndSwitches::Get().bLoadingScreenThread);
+
 	// The menu goes away now, not at hand-off: it is behind an opaque curtain
 	// either way, and leaving it alive would keep its background texture
 	// resident for the whole load.
@@ -594,7 +624,10 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
 	ProbeConfig.GateMaxRingLevel = Switches.LoadGateMaxRing;
 	ProbeConfig.bRequireFineRing = Switches.bLoadGateFineRing;
-	ProbeConfig.MaxWaitSeconds = Switches.LoadMaxHoldSeconds;
+	// THE GATE'S OWN CEILING, not the curtain's hold (2026-09-07). These were
+	// the same number until Phase 4 and are two different questions; see
+	// FVoxelFrontEndSwitches::LoadGateMaxWaitSeconds.
+	ProbeConfig.MaxWaitSeconds = Switches.LoadGateMaxWaitSeconds;
 
 	FVector Anchor = FVector::ZeroVector;
 	if (PendingSpawnTransform.IsSet())
@@ -677,6 +710,22 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
         if (!VoxelSessionCheckpoint::Ready(GetWorld())) return;
     }
 	LoadElapsedSeconds += DeltaSeconds;
+
+	// HOOK 0b (Phase 4, 2026-09-07): the CURTAIN'S OWN PAINT CADENCE into
+	// VoxelFramePhase's seg=LOADING row -- not this tick's DeltaSeconds.
+	//
+	// THE DIFFERENCE IS THE ENTIRE POINT. The owner has said the game thread may
+	// take as long as it needs behind the curtain; what must stay smooth is how
+	// often the hourglass is redrawn. Under -VoxelLoadingScreenThread=1 those
+	// are different numbers, because the Slate loading thread paints across a
+	// long world tick; under =0 they are the same number and the row reads
+	// seconds. Drained here rather than pushed from the widget because
+	// VoxelFramePhase's buckets and its 5 s flush are game-thread state and the
+	// loading thread is one of the painters.
+	VoxelLoadingCurtain::DrainPaintIntervals([](double IntervalMs)
+	{
+		VoxelFramePhase::NoteLoadingFrame(IntervalMs);
+	});
 
 	UWorld* World = GetWorld();
 	const UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -763,6 +812,11 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 		// The world is about to be on screen and wants its full apply budget
 		// back before the fade starts, not after it finishes.
 		RestoreStreamingBudget();
+		// And its full RENDER quality, for the same reason and at the same
+		// instant: the curtain is about to lift, so the fade must reveal the
+		// world the player will play rather than the cheap one that was
+		// hiding behind it.
+		VoxelMenuScalability::Restore();
 
 		// 100% is claimed exactly here -- the gate has passed and the curtain
 		// is starting to lift, so the bar shows full only during the fade,
@@ -825,6 +879,12 @@ void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
 
 void UVoxelFrontEndSubsystem::TeardownMenu()
 {
+	// FIRST, and before the loading widget is removed below: End() disarms any
+	// in-flight block and puts the curtain back in the viewport, so the removal
+	// that follows is removing a widget that is actually there. Idempotent, and
+	// this is the backstop for every path that never reaches hand-off.
+	CurtainThread.End();
+
 	// Every path out of the front end passes through here, including the
 	// ones that never reach hand-off -- a quit from the menu, or a run that
 	// ends while the loading screen is still up. Stop() is idempotent and
@@ -837,6 +897,11 @@ void UVoxelFrontEndSubsystem::TeardownMenu()
 	// throttled for the next session in the same process. No-op when the
 	// reveal already restored it.
 	RestoreStreamingBudget();
+	// The scalability drop is process-wide for exactly the same reason and
+	// gets exactly the same backstop: a quit from the menu, a PIE stop or a
+	// Deinitialize must not leave r.ScreenPercentage at 25 for whatever runs
+	// next in this process. No-op when the reveal already released it.
+	VoxelMenuScalability::Restore();
 
 	UWorld* World = GetWorld();
 	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
