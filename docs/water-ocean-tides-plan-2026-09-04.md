@@ -1056,3 +1056,155 @@ echo its second scalar and is not trusted).
 Also: Codex is running automation in a scratch checkout
 (.scratch/environment-verification) that occupies the box; two of my captures
 overlapped it. Visual validity holds (fixed pose, frozen sun); timing does not.
+
+## 2026-09-07 02:00-02:40: params arm POSITIVE, shore ladder NULL, arm-B hang
+
+**Wake -- the collection IS read.** The uvstep T=0 control did run on a healthy
+session and painted nothing, which sent the search to "the material never sees
+the published RippleFieldOrigin/InvSize/Gain". The `params` arm (emissive
+R=origin.x/-1e7, G=invSize*5120, B=gain/2.5, frame VoxelVerify00840, pose
++2 m / -25 deg) measures near-water R/G = 0.72, mid 0.45, far 0.00 -- the far
+red loss is the volume's absorption, the near ratio is the published
+-6.5e6 UU origin arriving (0 would be pure cyan). Origin, inverse size and gain
+all reach the pixel. WITHDRAWN: "unpublished collection". The ripple graph
+(`ripple_field_graph.py:161-197`) builds uv = (AbsoluteWorldPosition.xy -
+origin.xy) * invSize with WPT_EXCLUDE_ALL_SHADER_OFFSETS and samples
+/Game/Voxel/RT_VoxelRippleField, the same asset the C++ derives into
+(`VoxelRippleField.cpp:32,498`). Both remaining "uv is wrong" observations
+(marker at 0.583 unfindable, uvstep T=0 blank) are my own instruments, three of
+which have already been miswired, so the next arm is the plainest one: `uv`
+(R=u, G=v) with a pixel read-back at the camera column, expected ~(0.5,0.5).
+Running as this is written.
+
+**Shore foam -- a genuine null, overrides confirmed.** Same lake, +6 m / -18 deg,
+yaw 45, four arms, every override echoed by the sheet's own
+"Lake sheets: material scalar '<name>' set to <v>" line:
+
+| arm | override | frame |
+|---|---|---|
+| A ship | none | 00834 |
+| B shelf2 | BathyFoamShelfHi 2.0 | 00836 |
+| C gateoff | BathyFoamShelfLo 50, ShelfHi 100 | 00838 |
+| D width6 | BathyFoamWidthM 6.0 | 00842 |
+
+The four frames are indistinguishable. The white streaks in all of them are
+SSR of the snow slope (they were there with SSR on and absent with it off on
+2026-09-06), not foam. shore_foam = shore_band * shelf_gate * gain(0.55, SHORE
+FX ON per the regen log) * bathy validity, and the bathy field was live
+(window #1, holes 0.0%). A 6 m band at 0.55 through an open gate is not
+invisible if it exists, so a FACTOR is zero along this shore -- most likely
+shore_band (shore_m not measuring distance to THIS lake's edge) or validity.
+WITHDRAWN: "the shelf gate structurally cannot pass on a 10 cm beach" -- the
+gate was not the limiter. New `shorefoam` debug arm (R=shore_band,
+G=shelf_gate, B=validity) queued behind the uv arm; frame will be shore-E-viz.
+
+**Arm B hung once (frame counter stuck at 710 for 90 s), then re-ran clean.**
+Not the harness: a silent 27-voxel edit at the pawn's column mobilised cavern
+water into the CA and the level>=4 distant-edit mip re-mesh ran synchronously
+on the game thread (L4 10 s, L5 79 s, L6 never). Written up as backlog §14 with
+the timing table; it is the other half of §13.
+
+**Harness note.** The origin has no fine tiles: any loading/in-game shot that
+starts at (0,0) trips the FINE TIER GATE LEAK fatal. `-Shot Loading` needs
+`-ExtraArgs '-VoxelSpawnAt=-61440,-61440'` (the 2026-08-25 runs had it).
+
+### 03:10 addendum: the shore-foam factor paint (VoxelVerify00844)
+
+`shorefoam` arm at the +6 m / -18 deg pose, R=shore_band, G=shelf_gate,
+B=validity: the lake is flat blue. Measured: validity 1 everywhere on the sheet;
+shelf_gate open (cyan) ONLY in one far patch at x>1518, y 300-610 (the gentle
+bed at the far end); shore_band ZERO on every water pixel below the horizon at
+the shipping 1.6 m width (0 magenta pixels, exhaustive scan). Reading: the
+sheet's own shore-SDF clip hides the sheet where shore_m<0 and the opaque bank
+stands above the first metres of water, so the 1.6 m band is entirely behind
+terrain at this shore; the 6 m band (arm D) would have emerged but the shelf
+gate was CLOSED there (bed steeper than 1:4 -- it is a stepped snow bank), and
+the gate-open arm (C) still had the 1.6 m band. The two gates were never opened
+together. Arm F (ShelfLo 50 / ShelfHi 100 / WidthM 6.0 in one override) is
+queued behind the uv re-run; if it foams, the shore-foam term is alive and the
+question becomes the owner's taste on width/shelf, not plumbing.
+
+Interleaving lesson: two background chains that each idle-wait can interleave
+inside each other's regen->capture->restore window. 02:42 uv regen was
+overwritten by the 02:45 shorefoam regen; frame 00846 ("wake-uv") is SHIPPING
+water, not a uv paint, and is void. Debug chains must be ONE serialized script.
+
+## The cockpit-ends clipping: the mask now rides the WATER (2026-09-07)
+
+Owner, 2026-09-06: *"water is clipping through the front and back ends of the
+cockpit - this seems to be happening now because of the more drastic bobbing
+and buoyancy."* The bobbing is approved and was not touched.
+
+**The diagnosis the 09-06 fix missed.** v1's exclusion boxes were bolted to the
+hull, with the lid at `keel + RestDraft + 10 UU` -- the hull's OWN rest
+waterline. `voxel.Boat.WaveBobGain` is 6.0, so the probes ride a surface six
+times the drawn one and the hull heaves and pitches several times further than
+the water it floats in: at shipped defaults the drawn surface moves ~6 UU and
+the hull ~36 UU, against 33 UU of freeboard. A lid measured from the hull is
+therefore off by tens of UU at every trough, worst at the ends, where pitch
+adds the most travel. Adding a second box (09-06) bought coverage in PLAN and
+left the height wrong; raising the lid to gunwale-6 (also 09-06) was reverted
+because it carved water outside the hull.
+
+**Also corrected: the 09-06 explanation of that beside-hull artefact.** It
+blamed the gunwale (a ray entering above the near rim, crossing the slab,
+exiting past the far one). The gunwale does not enter it. A ray that reaches
+water beyond the hull is above the water surface for its whole crossing, so it
+can only pick the mask up where the mask rises ABOVE THE WATER, and the ring of
+open water it then kills is `lid / tan(view depression)` wide. The lid's height
+over the WATER is the whole artefact; where the boat is has nothing to do with
+it. That is why gunwale-6 carved and why the fix is to hold a few centimetres
+over the surface rather than anywhere over the boat.
+
+**The fix (the plan's "hull-shaped mesh = v2", as a staircase).**
+`AVoxelBoat::UpdateWaterExclusion`, solved every tick:
+
+* SEVEN stations along the keel line out to 0.96 L, each taking the half-beam
+  an elliptic canoe plan carries at its OUTER edge x0.85 -- so every station
+  keeps planking between itself and the water, and the ends are covered instead
+  of being left to a 0.26-beam rectangle.
+* Each station is placed in ABSOLUTE world space with YAW ONLY, so its lid
+  stays horizontal (a lid that inherits pitch is a ramp: clearing the water at
+  its low end means standing tens of UU over it at the high end), and its
+  footprint is scaled by the XY projection of the hull's axes, which is the
+  foreshortening a pitched or rolled hull actually has.
+* The lid sits `voxel.Boat.HullMaskLidUU` (6) above the DRAWN surface at that
+  station -- the mirror at gain 1 WITH the WPO camera fade, i.e. the surface
+  the pixels show, not the exaggerated one the probes ride. Same mirror, same
+  clock, same published wind, same fingerprint guard as the buoyancy, so a
+  stale mirror drops both to the flat datum together.
+* A station HIDES (no stencil writer, water pixel-identical to no boat) when
+  the drawn surface is below the hull bottom there -- a bow thrown clear by the
+  bob has no water in it to cull and an absolute-placed mask left at the
+  surface would carve the water the hull is flying over -- and when the column
+  is CA-only/datum-less (the buoyancy's own documented blind spot), and when
+  the boat is asleep past SleepRadiusUU.
+
+Arms, per the house rule: `voxel.Boat.HullMask` 0 hides every station (the
+contract's own off arm) and `voxel.Boat.HullMaskLidUU` dials the one number the
+artefact scales with. `voxel.Boat.DebugDraw` now also draws the stations.
+
+**Frames** (pond pose `-65102,-51084`, +8 m, pitch -20, yaw 0, wind pinned
+8 m/s from 240, boat spawned 5 m ahead, 120 s settle, same build):
+
+| arm | frame |
+|---|---|
+| `HullMask 0` (control: no writer) | `VoxelVerify00852.png` |
+| `HullMask 1`, lid 10 UU | `VoxelVerify00854.png` |
+| `HullMask 1`, lid 6 UU (shipped) | `VoxelVerify00860.png` |
+
+Read: in the control the bow interior is a flat violet-grey sheet and the stern
+is hazed over -- the lake drawn inside the hull at both ends, the owner's
+report. In both mask arms the planking, ribs and floor are crisp from stem to
+stern and no water is drawn inside the hull; no ring of missing water appears
+outside it at either lid. (First reading of 00854 called the bright voxels off
+the stern quarter "carved bed"; the zoom shows they are inboard of the sheer --
+the boat's own sunlit interior, which the water film had been hiding.)
+
+Stated limits: the frames are shot at ONE camera depression (~21 deg) and the
+ring the lid can cause grows as the camera goes grazing, which is exactly the
+owner's own screenshot angle -- the lid knob exists for that. Two runs at the
+same settle do not reproduce the bob phase exactly (dt varies), so the arms are
+the same pose, not the same instant. And these are scripted frames for a
+feature family the owner ruled is owner-tested in-editor from 09-06: they are
+evidence the mechanism engages, not a substitute for his judgement.
