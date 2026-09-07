@@ -32,6 +32,7 @@ FAutoConsoleCommandWithWorldAndArgs Probe(TEXT("voxel.SaveAsync.Probe"),TEXT("As
                 const FString Blocker=FPaths::ProjectSavedDir()/TEXT("Tests")/(TEXT("async-blocker-")+FGuid::NewGuid().ToString(EGuidFormats::Digits));
                 if(!FFileHelper::SaveStringToFile(TEXT("test"),*Blocker)){UE_LOG(LogVoxelEarth,Error,TEXT("SaveAsync FAILURE_PROBE setup failed"));FPlatformMisc::RequestExit(false);return;}
                 VoxelSaveJobs::FSnapshot Job;Job.TerrainPath=Blocker/TEXT("world.vxlog");Job.Terrain={1};
+                Job.Simulation.Water={1};Job.Simulation.Hydrology={1};Job.Simulation.Clock={1};
                 const bool Accepted=VoxelSaveJobs::Submit(MoveTemp(Job),[](bool Ok){
                     UE_LOG(LogVoxelEarth,Log,TEXT("SaveAsync FAILURE_PROBE %s"),!Ok?TEXT("PASS"):TEXT("FAIL"));FPlatformMisc::RequestExit(false);
                 });

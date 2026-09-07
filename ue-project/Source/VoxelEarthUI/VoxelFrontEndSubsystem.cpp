@@ -1,4 +1,5 @@
 #include "VoxelFrontEndSubsystem.h"
+#include "VoxelSessionCheckpoint.h"
 #include "VoxelGraphicsUserSettings.h"
 
 #include "SVoxelHourglass.h"
@@ -581,6 +582,7 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 	}
 
 	WorldSub->StartWorldSession(PendingEditLogPath);
+	if (VoxelSessionCheckpoint::Failed(World)) return;
 	if (AVoxelEarthGameMode* GameMode = World->GetAuthGameMode<AVoxelEarthGameMode>())
 	{
 		GameMode->BeginPlayerSession(PendingSpawnTransform.IsSet() ? &PendingSpawnTransform.GetValue() : nullptr);
@@ -662,6 +664,15 @@ void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
 
 void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client)
+    {
+        if (VoxelSessionCheckpoint::Failed(GetWorld()))
+        {
+            if (LoadingWidget.IsValid()) LoadingWidget->SetLoadFailed();
+            return;
+        }
+        if (!VoxelSessionCheckpoint::Ready(GetWorld())) return;
+    }
 	LoadElapsedSeconds += DeltaSeconds;
 
 	UWorld* World = GetWorld();

@@ -9,6 +9,7 @@
 #include "VoxelEarth.h"
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- global reg= roll-up
 #include "VoxelItem.h"
+#include "Net/UnrealNetwork.h"
 
 namespace
 {
@@ -77,6 +78,7 @@ UVoxelInventoryComponent::UVoxelInventoryComponent()
 	// No tick. An inventory changes only when something calls into it; a tick
 	// here would be pure cost and an invitation to put polling in it.
 	PrimaryComponentTick.bCanEverTick = false;
+    SetIsReplicatedByDefault(true);
 
 	// Sized again from the cvar in SeedDefaultsOnce (the cvar cannot be trusted
 	// to be at its final value while the CDO is being constructed during module
@@ -88,11 +90,14 @@ UVoxelInventoryComponent::UVoxelInventoryComponent()
 void UVoxelInventoryComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	SeedDefaultsOnce();
+    // Keep server-side initialization usable until player-record admission is
+    // connected. That admission must replace this call with restore-or-seed.
+    SeedDefaultsOnce();
 }
 
 void UVoxelInventoryComponent::SeedDefaultsOnce()
 {
+    if (!GetOwner() || !GetOwner()->HasAuthority()) return;
 	if (bSeeded)
 	{
 		return;
@@ -154,6 +159,7 @@ void UVoxelInventoryComponent::SeedDefaultsOnce()
 
 int32 UVoxelInventoryComponent::TryAddItem(FName ItemId, int32 Count)
 {
+    if (!GetOwner() || !GetOwner()->HasAuthority() || !bSeeded) return 0;
 	++AddCalls;
 
 	if (ItemId.IsNone() || Count <= 0)
@@ -233,6 +239,7 @@ int32 UVoxelInventoryComponent::TryAddItem(FName ItemId, int32 Count)
 
 bool UVoxelInventoryComponent::TryRemoveFromSlot(int32 SlotIndex, int32 Count)
 {
+    if (!GetOwner() || !GetOwner()->HasAuthority() || !bSeeded) return false;
 	++RemoveCalls;
 
 	if (!Slots.IsValidIndex(SlotIndex) || Count <= 0)
@@ -276,6 +283,8 @@ FVoxelInventorySlot UVoxelInventoryComponent::GetSlot(int32 SlotIndex) const
 
 void UVoxelInventoryComponent::SetSelectedSlot(int32 SlotIndex)
 {
+    if (!GetOwner() || !bSeeded) return;
+    if (!GetOwner()->HasAuthority()) { ServerSelectSlot(SlotIndex); return; }
 	++SelectCalls;
 	if (Slots.Num() <= 0)
 	{
@@ -290,22 +299,35 @@ void UVoxelInventoryComponent::SetSelectedSlot(int32 SlotIndex)
 	SelectedSlot = Clamped;
 }
 
-void UVoxelInventoryComponent::SelectNextSlot()
+void UVoxelInventoryComponent::SelectNextSlot() { if (Slots.Num()) SetSelectedSlot((SelectedSlot+1)%Slots.Num()); }
+void UVoxelInventoryComponent::SelectPrevSlot() { if (Slots.Num()) SetSelectedSlot((SelectedSlot+Slots.Num()-1)%Slots.Num()); }
+void UVoxelInventoryComponent::ServerSelectSlot_Implementation(int32 Index)
 {
-	if (Slots.Num() > 0)
-	{
-		++SelectCalls;
-		SelectedSlot = (SelectedSlot + 1) % Slots.Num();
-	}
+    if (Slots.IsValidIndex(Index)) SetSelectedSlot(Index);
 }
-
-void UVoxelInventoryComponent::SelectPrevSlot()
+void UVoxelInventoryComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out) const
 {
-	if (Slots.Num() > 0)
-	{
-		++SelectCalls;
-		SelectedSlot = (SelectedSlot + Slots.Num() - 1) % Slots.Num();
-	}
+    Super::GetLifetimeReplicatedProps(Out);
+    DOREPLIFETIME_CONDITION(UVoxelInventoryComponent,Slots,COND_OwnerOnly);
+    DOREPLIFETIME_CONDITION(UVoxelInventoryComponent,SelectedSlot,COND_OwnerOnly);
+    DOREPLIFETIME_CONDITION(UVoxelInventoryComponent,bSeeded,COND_OwnerOnly);
+}
+bool UVoxelInventoryComponent::ValidateSnapshot(const TArray<FVoxelInventorySlot>& Values,int32 Selection)
+{
+    if (Values.Num()<1 || Values.Num()>64 || !Values.IsValidIndex(Selection)) return false;
+    for (const auto& Slot:Values)
+    {
+        if (Slot.Count==0) { if (!Slot.ItemId.IsNone()) return false; continue; }
+        const auto Def=FVoxelItemRegistry::Find(Slot.ItemId);
+        if (!Def || Slot.Count<0 || Slot.Count>Def->MaxStack) return false;
+    }
+    return true;
+}
+bool UVoxelInventoryComponent::RestoreSlots(const TArray<FVoxelInventorySlot>& Values,int32 Selection)
+{
+    if (!GetOwner() || !GetOwner()->HasAuthority() || !ValidateSnapshot(Values,Selection)) return false;
+    Slots=Values; SelectedSlot=Selection; bSeeded=true;
+    GetOwner()->ForceNetUpdate(); return true;
 }
 
 FName UVoxelInventoryComponent::GetSelectedItemId() const

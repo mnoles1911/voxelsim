@@ -1,4 +1,6 @@
 #include "VoxelWaterSubsystem.h"
+#include "VoxelSessionCheckpoint.h"
+#include "VoxelSaveLibrary.h"
 
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
@@ -1554,6 +1556,12 @@ struct FVoxelWaterImpl
 	// would refuse it, and the refusal would be logged every time the player
 	// toggled the cvar.
 	std::vector<uint8_t> PendingHydroGraphBlob;
+    vxc::RegionBounds PersistentRiverBounds{};
+    bool bHasPersistentRiverBounds=false;
+    double PendingRiverDelay=0;
+    TOptional<bool> RestoredRiverEnabled;
+    bool RiverCVarAtRestore=false;
+    bool bImplicitOceanPinned=false;
 
 	// voxel.Water.ImplicitOcean, LATCHED (watershed plan §6.4). Declared before
 	// Mob for the same reason Water is: the ImplicitFn reads it on every voxel
@@ -2370,6 +2378,7 @@ UVoxelWaterSubsystem::~UVoxelWaterSubsystem() = default;
 UVoxelWaterSubsystem::UVoxelWaterSubsystem(FVTableHelper& Helper)
 	: Super(Helper)
 {
+    if (Impl.bImplicitOceanPinned) return;
 }
 
 void UVoxelWaterSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -2457,34 +2466,7 @@ void UVoxelWaterSubsystem::Deinitialize()
 			Terrain->InstallWaterMarker(nullptr);
 		}
 	}
-	// ADR-0005: autosave the water blob on shutdown, mirroring
-	// UVoxelWorldSubsystem::Deinitialize's edit-log autosave lifetime exactly --
-	// authority only, and only for a world that genuinely began play (see
-	// bWorldBegunPlay). Additionally gated on there being real water state to
-	// persist (stored or mobilized bricks) so a run that never disturbed
-	// underground water leaves no sibling .vxwater to shadow a later same-seed
-	// session -- the edit log has no such gate because every world has a log,
-	// but an all-implicit world has nothing to serialize and an empty blob would
-	// only add a spurious file.
-	if (Impl && bWorldBegunPlay)
-	{
-		UWorld* World = GetWorld();
-		const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
-		// W4 (ADR-0004): the sheet counts as "real water state to persist" too,
-		// and it has to be named explicitly here. Promotion MOVES units out of
-		// CA cells, so a session whose whole pour has been promoted can have
-		// storedBrickCount() == 0 with a full sheet -- and the pre-W4 gate would
-		// then skip the autosave, drop the grid with Impl.Reset() below, and
-		// lose the lot on shutdown. SaveWaterState flushes the sheet back into
-		// the CA before serialising, so once we decide to save, the blob is
-		// complete.
-		const bool bHaveSheetWater = Impl->SweSheet && Impl->SweSheet->totalVolume() > 0;
-		if (NetMode != NM_Client &&
-		    (Impl->CA.storedBrickCount() > 0 || !Impl->Mob.mobilizedBricks().empty() || bHaveSheetWater))
-		{
-			SaveWaterState();
-		}
-	}
+	// The world teardown hook captures all domains before subsystem destruction.
 
 	ChunkRoot = nullptr;
 	ChunkOwner = nullptr;
@@ -2513,27 +2495,7 @@ void UVoxelWaterSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// UVoxelWorldSubsystem's bWorldBegunPlay) -- gates Deinitialize's autosave.
 	bWorldBegunPlay = true;
 
-	// ADR-0005 water persistence: the authority (server/listen/standalone) loads
-	// Saved/VoxelWorlds/<seed>.vxwater, if present, before the first fixed step
-	// ever runs (Tick() below). This is the earliest point OnWorldBeginPlay
-	// reaches after the game-world/Impl guard, and it runs BEFORE the
-	// dedicated-server early-return below so it applies to every authority role,
-	// exactly mirroring UVoxelWorldSubsystem's LoadEditLogFromDisk placement. The
-	// live CA/mob are still fresh here (no addWater/mobilize has run yet), which
-	// is vxc::WaterState::applyTo's precondition. Fills-first load, three
-	// failure modes handled loudly -- see LoadWaterStateFromDisk. NM_Client never
-	// loads its own file: a joining client mirrors state via replication instead.
-	if (InWorld.GetNetMode() != NM_Client)
-	{
-		LoadWaterStateFromDisk(*Impl, Impl->Terrain.GetSeed());
-		// Phase 2's blob, from its OWN file and with its OWN failure handling --
-		// a separate call rather than a tail of the one above because
-		// LoadWaterStateFromDisk returns early on all three of its failure modes,
-		// and "the CA blob was missing" must not silently also mean "every lake
-		// forgot where it stood". Same NM_Client rule: a joining client mirrors
-		// the scalars through the diff channel, it does not load them.
-		LoadHydroStateFromDisk(*Impl, Impl->Terrain.GetSeed());
-	}
+	// Session selection owns water restoration; BeginPlay must not read seed files.
 
 	// Dedicated server: no viewport, so no render chunks -- but the CA still
 	// ticks authoritatively regardless (Tick() below doesn't check
@@ -4631,6 +4593,12 @@ bool SaveHydroStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed)
 	{
 		vxc::RiverNetState::serialize(*Impl.Rivers, Graph);
 	}
+	else
+	{
+		// A loaded graph may still be waiting for its terrain region to arm.
+		// Saving during that interval must retain the exact loaded routing state.
+		Graph = Impl.PendingHydroGraphBlob;
+	}
 
 	std::vector<uint8_t> Bytes;
 	vxc::ByteWriter W(Bytes);
@@ -5956,7 +5924,7 @@ void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World)
 		AnchorVy = Vc.Y;
 		bHaveAnchor = true;
 	}
-	if (!bHaveAnchor)
+	if (!bHaveAnchor && !Impl.bHasPersistentRiverBounds)
 	{
 		if (!Impl.bSweRefusalLogged)
 		{
@@ -6124,7 +6092,9 @@ constexpr int64 kRiverBaseflowMax = 65536;
 // same reason MaybeArmSwe is: an arm/disarm lands on a clean step boundary.
 void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 {
-	const bool bWant = VoxelDebug::GetWaterRivers();
+	if (Impl.RestoredRiverEnabled.IsSet() && VoxelDebug::GetWaterRivers()!=Impl.RiverCVarAtRestore)
+        Impl.RestoredRiverEnabled.Reset();
+    const bool bWant=Impl.RestoredRiverEnabled.Get(VoxelDebug::GetWaterRivers());
 	const bool bArmed = Impl.RiverCoupler != nullptr;
 
 	if (!bWant)
@@ -6132,22 +6102,13 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 		Impl.bRiverRefusalLogged = false;
 		if (bArmed)
 		{
-			// DISARM IS A PLAIN DELETE HERE, unlike voxel.Water.SWE's disarm,
-			// which has to flush the sheet back into the CA first. The
-			// difference is the coupling's direction: every unit this coupler
-			// ever took out of the graph is ALREADY in the CA (or ledgered as
-			// gone to sea), and what remains in the graph is segment storage --
-			// a routing state variable at tile scale, not water anybody can see
-			// or swim in. Dropping it destroys no visible water. What it does
-			// destroy is the routing history and any promotions, which is
-			// exactly what "the graph is not persisted yet" already means.
-			UE_LOG(LogVoxelWater, Log,
-			       TEXT("voxel.Water.Rivers 0: river graph disarmed (%u segments, %lld promotions, %lld graph units ")
-			       TEXT("delivered to the CA, %lld to the ocean). Water already handed to the CA stays; the graph's ")
-			       TEXT("own routing state does not persist."),
-			       Impl.Rivers ? Impl.Rivers->segmentCount() : 0u, (long long)Impl.RiverPromotions,
-			       (long long)Impl.RiverCoupler->graphUnitsToCA(),
-			       (long long)Impl.RiverCoupler->graphUnitsToOcean());
+            if (Impl.Rivers)
+            {
+                Impl.PendingHydroGraphBlob.clear();
+                vxc::RiverNetState::serialize(*Impl.Rivers,Impl.PendingHydroGraphBlob);
+                Impl.PendingRiverDelay=FMath::Clamp(Impl.RiverStepSeconds-(World->GetTimeSeconds()-Impl.RiverLastTickWorldSeconds),0.0,Impl.RiverStepSeconds);
+            }
+            UE_LOG(LogVoxelWater,Log,TEXT("River graph suspended; routing state retained for rearm/checkpoint."));
 			Impl.RiverCoupler.reset();
 			Impl.Rivers.reset();
 			Impl.RiverBaseflow.clear();
@@ -6223,6 +6184,8 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	Bounds.py0 = AnchorPy - kRiverRegionPixels / 2;
 	Bounds.px1 = Bounds.px0 + kRiverRegionPixels - 1;
 	Bounds.py1 = Bounds.py0 + kRiverRegionPixels - 1;
+    if (Impl.bHasPersistentRiverBounds) Bounds=Impl.PersistentRiverBounds;
+    Impl.PersistentRiverBounds=Bounds; Impl.bHasPersistentRiverBounds=true;
 
 	Impl.Rivers = std::make_unique<vxc::RiverNetwork>();
 	Impl.Rivers->buildFromFlowAccumulation(Impl.Tiles, Impl.Terrain.GetSeed(), Bounds);
@@ -6262,7 +6225,7 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	// numbers whose derivations are written down in exactly one place.
 	Impl.RiverCoupler = std::make_unique<vxc::RiverCaCoupler>(*Impl.Rivers, Impl.CA, Impl.Tiles,
 	                                                          Impl.Mob.makeSolidFn(), Cfg);
-	Impl.RiverLastTickWorldSeconds = -1000.0;
+	Impl.RiverLastTickWorldSeconds = World->GetTimeSeconds()-Impl.RiverStepSeconds+Impl.PendingRiverDelay;
 	Impl.RiverLastStatusWorldSeconds = -1000.0;
 	Impl.RiverPromotions = 0;
 	Impl.bRiverRefusalLogged = false;
@@ -6272,41 +6235,16 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	// Recording FIRST, so a dam placed one tick after the arm is in the log.
 	Impl.Rivers->setDiffRecording(true);
 
-	// Then the held blob, if this session loaded one. CONSUMED EXACTLY ONCE
-	// (see PendingHydroGraphBlob): a second arm over different bounds builds a
-	// different graph, restoreRoutingState would refuse it, and re-offering the
-	// bytes every toggle would turn one honest refusal into a log spam.
-	if (!Impl.PendingHydroGraphBlob.empty())
-	{
-		std::vector<uint8_t> Blob;
-		Blob.swap(Impl.PendingHydroGraphBlob);
-		if (vxc::RiverNetState::load(Blob.data(), Blob.size(), *Impl.Rivers))
-		{
-			UE_LOG(LogVoxelWater, Log,
-			       TEXT("voxel.Water.Rivers: restored the saved graph state -- %llu diff(s) replayed, %lld storage ")
-			       TEXT("units back in the reaches (injected %lld, out to outlets %lld)."),
-			       (unsigned long long)Impl.Rivers->diffLog().size(), (long long)Impl.Rivers->totalStorage(),
-			       (long long)Impl.Rivers->totalInjected(), (long long)Impl.Rivers->totalOutflowToOutlets());
-		}
-		else
-		{
-			// LOUD, and specifically about WHY: the overwhelmingly likely cause
-			// is that the graph was saved anchored somewhere else, because the
-			// region is centred on the player's viewpoint at arm time.
-			UE_LOG(LogVoxelWater, Warning,
-			       TEXT("voxel.Water.Rivers: the saved graph state was REFUSED (%d bytes, this graph has %u ")
-			       TEXT("segments). Most likely it was recorded over DIFFERENT REGION BOUNDS -- the region is ")
-			       TEXT("centred on the player's viewpoint at arm time -- or by a different kRiverNetVersion ")
-			       TEXT("(engine is now v%u). Dams and in-flight water from that session are gone; the graph ")
-			       TEXT("itself is fine and starts empty."),
-			       int32(Blob.size()), Impl.Rivers->segmentCount(), vxc::kRiverNetVersion);
-			// A partial diff replay may have landed (RiverNetState::load says
-			// so). Rebuild from scratch so the graph is not a half-replayed
-			// hybrid of two sessions.
-			Impl.Rivers->buildFromFlowAccumulation(Impl.Tiles, Impl.Terrain.GetSeed(), Bounds);
-			Impl.Rivers->setDiffRecording(true);
-		}
-	}
+    if (!Impl.PendingHydroGraphBlob.empty())
+    {
+        if (!vxc::RiverNetState::load(Impl.PendingHydroGraphBlob.data(),Impl.PendingHydroGraphBlob.size(),*Impl.Rivers))
+        {
+            VoxelSessionCheckpoint::Fail(World);
+            UE_LOG(LogVoxelWater,Error,TEXT("Saved river topology was refused; session stopped and source checkpoint preserved."));
+            Impl.RiverCoupler.reset(); Impl.Rivers.reset(); return;
+        }
+        Impl.PendingHydroGraphBlob.clear();
+    }
 
 	UE_LOG(LogVoxelWater, Log,
 	       TEXT("voxel.Water.Rivers 1: built a %lldx%lld-pixel (%lld m) river graph around voxel (%lld,%lld): ")
@@ -7318,6 +7256,7 @@ void UVoxelWaterSubsystem::TickTide(UWorld* World)
 
 void UVoxelWaterSubsystem::Tick(float DeltaTime)
 {
+	if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	if (!Impl)
 	{
 		return;
@@ -10004,40 +9943,112 @@ bool UVoxelWaterSubsystem::ApplyReplicatedWaterDiffs(const TArray<uint8>& Bytes)
 
 bool UVoxelWaterSubsystem::SaveWaterState() const
 {
-	if (!Impl)
-	{
-		UE_LOG(LogVoxelWater, Warning, TEXT("SaveWaterState: no water Impl -- nothing to save."));
-		return false;
-	}
-	UWorld* World = GetWorld();
-	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
-	if (NetMode == NM_Client)
-	{
-		UE_LOG(LogVoxelWater, Warning,
-		       TEXT("SaveWaterState: refused on NM_Client -- only the authority (server/listen/standalone) has an authoritative CA to persist."));
-		return false;
-	}
+    auto Terrain=GetWorld()?GetWorld()->GetSubsystem<UVoxelWorldSubsystem>():nullptr;
+    if (!Terrain) return false;
+    const FString Slug=VoxelSave::GetActiveSlug();
+    return Slug.IsEmpty()?Terrain->SaveWorld():Terrain->SaveWorldToPath(VoxelSave::WorldLogPath(Slug));
+}
 
-	// W4 (ADR-0004): flush the shallow-water sheet back into the CA BEFORE the
-	// serializer looks at it. Sheet depth is real volume in the same fill units
-	// (swe.h S2, "255 fill units == one full voxel"), and vxc::WaterState::
-	// serialize walks the CA's bricks and the mobilizer's key set -- it has
-	// never heard of an SweGrid and must not have to. Flushing here is what
-	// keeps ADR-0005's blob format, kWaterCAVersion and the whole load path
-	// completely untouched by this feature: a save written with voxel.Water.SWE
-	// armed is byte-comparable with one written without it, because by the time
-	// the bytes are produced the sheet is empty and every unit is back in a CA
-	// cell. No-op (and silent) when nothing is armed. Total no-op cost on the
-	// untouched path: one null pointer test.
-	//
-	// A const method mutating simulation state deserves a word: TUniquePtr's
-	// constness is shallow, so *Impl is a mutable FVoxelWaterImpl& here, and the
-	// flush is genuinely part of "produce a correct save" rather than a side
-	// effect of it. The alternative -- serialising and losing the sheet -- is
-	// silent data loss, which is not a trade const-correctness wins.
-	FlushSweIntoCA(*Impl, TEXT("SaveWaterState"));
+bool UVoxelWaterSubsystem::CaptureCheckpoint(TArray<uint8>& Water,TArray<uint8>& Hydrology,double& Remainder,bool& ImplicitOcean) const
+{
+    check(IsInGameThread()); Water.Empty(); Hydrology.Empty();
+    if (!Impl || !GetWorld() || GetWorld()->GetNetMode()==NM_Client) return false;
+    if ((Impl->Rivers || !Impl->PendingHydroGraphBlob.empty()) && !Impl->bHasPersistentRiverBounds) return false;
+    FlushSweIntoCA(*Impl,TEXT("Checkpoint"));
+    if (Impl->SweSheet && Impl->SweSheet->totalVolume()!=0) return false;
+    // Return unconsumed spill transfers to their scalar owner before capture.
+    const bool Intercept=Impl->bFluidSpillInterceptEnabled;
+    Impl->bFluidSpillInterceptEnabled=false;
+    RouteBasinSpills(*Impl);
+    Impl->bFluidSpillInterceptEnabled=Intercept;
+    std::vector<uint8_t> Bytes,Ledger;
+    vxc::WaterState::serialize(Impl->CA,Impl->Mob,Bytes);
+    Water.Append(Bytes.data(),int32(Bytes.size()));
+    vxc::BasinLedger Empty;
+    vxc::BasinLedgerState::serialize(Impl->Basins?*Impl->Basins:Empty,Ledger);
+    std::vector<uint8_t> Graph=Impl->PendingHydroGraphBlob;
+    if (Impl->Rivers) { Graph.clear(); vxc::RiverNetState::serialize(*Impl->Rivers,Graph); }
+    Bytes.clear(); vxc::ByteWriter Writer(Bytes);
+    Writer.u32(kHydroMagic); Writer.u32(2); Writer.u32(uint32(Ledger.size()));
+    Bytes.insert(Bytes.end(),Ledger.begin(),Ledger.end()); Writer.u32(uint32(Graph.size()));
+    Bytes.insert(Bytes.end(),Graph.begin(),Graph.end());
+    Writer.u8(Impl->bHasPersistentRiverBounds?1:0);
+    Writer.u64(uint64(Impl->PersistentRiverBounds.px0)); Writer.u64(uint64(Impl->PersistentRiverBounds.py0));
+    Writer.u64(uint64(Impl->PersistentRiverBounds.px1)); Writer.u64(uint64(Impl->PersistentRiverBounds.py1));
+    const double Delay=Impl->Rivers?FMath::Clamp(Impl->RiverStepSeconds-(GetWorld()->GetTimeSeconds()-Impl->RiverLastTickWorldSeconds),0.0,Impl->RiverStepSeconds):Impl->PendingRiverDelay;
+    uint64 Bits=0; FMemory::Memcpy(&Bits,&Delay,8); Writer.u64(Bits);
+    Writer.u8(Impl->RestoredRiverEnabled.Get(VoxelDebug::GetWaterRivers())?1:0);
+    Hydrology.Append(Bytes.data(),int32(Bytes.size()));
+    Remainder=Impl->TickAccumSeconds; ImplicitOcean=Impl->bImplicitOcean;
+    return FMath::IsFinite(Remainder) && Remainder>=0 && Remainder<=double(FVoxelWaterImpl::FixedStepSeconds);
+}
 
-	return SaveWaterStateToDisk(*Impl, Impl->Terrain.GetSeed());
+bool UVoxelWaterSubsystem::RestoreCheckpoint(const TArray<uint8>& Water,const TArray<uint8>& Hydrology,double Remainder,bool ImplicitOcean)
+{
+    check(IsInGameThread());
+    if (!Impl || !GetWorld() || GetWorld()->GetNetMode()==NM_Client ||
+        !FMath::IsFinite(Remainder) || Remainder<0 || Remainder>double(FVoxelWaterImpl::FixedStepSeconds) ||
+        Water.IsEmpty() || Hydrology.Num()<16 ||
+        Impl->Rivers || !Impl->PendingHydroGraphBlob.empty() ||
+        (Impl->Basins && Impl->Basins->basinCount()!=0)) return false;
+    auto Parsed=vxc::WaterState::parse(Water.GetData(),size_t(Water.Num()));
+    if (!Parsed) return false;
+    uint32_t Magic=0,Version=0,LedgerSize=0,GraphSize=0;
+    vxc::ByteReader Reader(Hydrology.GetData(),size_t(Hydrology.Num()));
+    if (!Reader.u32(Magic) || Magic!=kHydroMagic || !Reader.u32(Version) || (Version!=1 && Version!=2) ||
+        !Reader.u32(LedgerSize) || LedgerSize==0 || uint64(LedgerSize)+16>uint64(Hydrology.Num()) ||
+        !Reader.skip(LedgerSize) || !Reader.u32(GraphSize) || uint64(LedgerSize)+16+GraphSize>uint64(Hydrology.Num())) return false;
+    const uint8* GraphAt=Hydrology.GetData()+16+LedgerSize;
+    if (!Reader.skip(GraphSize)) return false;
+    vxc::RegionBounds Bounds{}; uint8 HasRegion=0,Enabled=0; double Delay=0;
+    if (Version==2)
+    {
+        uint64 X0=0,Y0=0,X1=0,Y1=0,Bits=0;
+        if (!Reader.u8(HasRegion) || HasRegion>1 || !Reader.u64(X0) || !Reader.u64(Y0) ||
+            !Reader.u64(X1) || !Reader.u64(Y1) || !Reader.u64(Bits) || !Reader.u8(Enabled) || Enabled>1) return false;
+        Bounds.px0=int64(X0); Bounds.py0=int64(Y0); Bounds.px1=int64(X1); Bounds.py1=int64(Y1);
+        FMemory::Memcpy(&Delay,&Bits,8);
+        if (!FMath::IsFinite(Delay) || Delay<0 || Delay>Impl->RiverStepSeconds) return false;
+        if (HasRegion && (Bounds.px0< -1000000000000ll || Bounds.px0>1000000000000ll || Bounds.py0< -1000000000000ll || Bounds.py0>1000000000000ll ||
+            Bounds.px1!=Bounds.px0+kRiverRegionPixels-1 || Bounds.py1!=Bounds.py0+kRiverRegionPixels-1)) return false;
+    }
+    if (!Reader.atEnd() || (GraphSize && !HasRegion)) return false;
+    if (GraphSize)
+    {
+        vxc::RiverNetwork StagedGraph;
+        StagedGraph.buildFromFlowAccumulation(Impl->Tiles,Impl->Terrain.GetSeed(),Bounds);
+        if (!vxc::RiverNetState::load(GraphAt,GraphSize,StagedGraph)) return false;
+    }
+    // Validate the complete ledger before applying either domain to the live world.
+    vxc::BasinLedger Staged;
+    if (!vxc::BasinLedgerState::load(Hydrology.GetData()+12,LedgerSize,Staged) ||
+        (!Impl->Basins && Staged.basinCount()!=0)) return false;
+    const bool PreviousImplicit=Impl->bImplicitOcean;
+    Impl->bImplicitOcean=ImplicitOcean;
+    if (!Parsed->applyTo(Impl->CA,Impl->Mob)) { Impl->bImplicitOcean=PreviousImplicit; return false; }
+    Impl->bImplicitOceanPinned=true;
+    Impl->PersistentRiverBounds=Bounds; Impl->bHasPersistentRiverBounds=HasRegion!=0;
+    Impl->PendingHydroGraphBlob.assign(GraphAt,GraphAt+GraphSize);
+    Impl->PendingRiverDelay=Delay; Impl->RestoredRiverEnabled=Enabled!=0;
+    Impl->RiverCVarAtRestore=VoxelDebug::GetWaterRivers();
+    if (Impl->Basins && !vxc::BasinLedgerState::load(Hydrology.GetData()+12,LedgerSize,*Impl->Basins)) return false;
+    Impl->TickAccumSeconds=float(Remainder);
+    if (Impl->Water) Impl->Water->invalidateBasinDatumMemo();
+    MarkMobilizedBricksDirty(*Impl);
+    for (const auto& Entry:Impl->CA.bricks()) Impl->DirtyBricks.Add(ToCoord(Entry.first));
+    return true;
+}
+
+bool UVoxelWaterSubsystem::RestoreLegacyCheckpoint()
+{
+    if (!Impl) return false;
+    TArray<uint8> Water,Hydrology; double Remainder=0; bool Implicit=false;
+    if (!CaptureCheckpoint(Water,Hydrology,Remainder,Implicit)) return false;
+    const FString WaterPath=GetWaterSaveFilePath(Impl->Terrain.GetSeed());
+    const FString HydroPath=GetHydroSaveFilePath(Impl->Terrain.GetSeed());
+    if (FPaths::FileExists(WaterPath) && !FFileHelper::LoadFileToArray(Water,*WaterPath)) return false;
+    if (FPaths::FileExists(HydroPath) && !FFileHelper::LoadFileToArray(Hydrology,*HydroPath)) return false;
+    return RestoreCheckpoint(Water,Hydrology,0,Implicit);
 }
 
 bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint64& OutReloadedDigest, uint64& OutLiveVolume,
@@ -10065,7 +10076,11 @@ bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint6
 	// over the same implicit-flood / terrain-solidity callbacks the live pair
 	// uses (FVoxelWaterImpl's constructor) -- this is the load path a genuine
 	// reload runs, isolated so it never touches live state.
-	const FString Path = GetWaterSaveFilePath(Impl->Terrain.GetSeed());
+	const FString Slug=VoxelSave::GetActiveSlug();
+    const FString Logical=Slug.IsEmpty()?GetTerrainSaveFilePath(Impl->Terrain.GetSeed()):VoxelSave::WorldLogPath(Slug);
+    VoxelCheckpointStore::FResolved Checkpoint;
+    if (!VoxelCheckpointStore::Resolve(Logical,Checkpoint) || !Checkpoint.bSimulation) return false;
+    const FString Path=Checkpoint.WaterPath;
 	TArray<uint8> Bytes;
 	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
 	{

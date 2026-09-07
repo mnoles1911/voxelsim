@@ -1,6 +1,7 @@
 #pragma once
 #include "CoreMinimal.h"
 #include "VoxelDetachedPersistence.h"
+#include "VoxelCheckpointStore.h"
 namespace VoxelSaveJobs
 {
 struct FSnapshot
@@ -10,6 +11,7 @@ struct FSnapshot
     VoxelDetachedPersistence::FSnapshot Objects;
     bool bObjectSnapshot=false;
     FString MetadataJson;
+    VoxelCheckpointStore::FSimulationPayload Simulation;
     double CaptureMs=0;
 };
 // Game-thread admission and completion. One active job bounds snapshot memory.

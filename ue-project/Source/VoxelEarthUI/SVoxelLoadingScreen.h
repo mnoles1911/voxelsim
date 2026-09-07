@@ -56,6 +56,7 @@ public:
 	// eased artificial timer, the monotone clamp, the ~97% hold while the
 	// world is slower than the theatre); this widget just draws what it is
 	// given.
+	void SetLoadFailed() { bLoadFailed=true; }
 	void SetProgress(float InProgress) { Progress = FMath::Clamp(InProgress, 0.f, 1.f); }
 
 	// Drives the fade in and out of the whole curtain.
@@ -83,6 +84,7 @@ private:
 	FText GetFpsText() const;
 	FSlateColor GetFpsColour() const;
 
+	bool bLoadFailed=false;
 	float Progress = 0.f;
 	float CurtainOpacity = 1.f;
 

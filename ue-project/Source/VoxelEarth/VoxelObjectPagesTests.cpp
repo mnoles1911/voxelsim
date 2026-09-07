@@ -30,7 +30,7 @@ bool FVoxelObjectPagesTest::RunTest(const FString&)
     auto CorruptJob=Async(EAsyncExecution::ThreadPool,[Page](){
         TArray<uint8> File;if(!FFileHelper::LoadFileToArray(File,*Page.Path)||File.Num()<16)return false;File[12]^=1;
         if(!FFileHelper::SaveArrayToFile(File,*Page.Path))return false;
-        FGeometry Value;return !Read(Page,Value)&&!Value;
+        VoxelObjects::FGeometry Value;return !Read(Page,Value)&&!Value;
     });TestTrue(TEXT("Corrupt page rejected before materialization"),CorruptJob.Get());
     auto FailureJob=Async(EAsyncExecution::ThreadPool,[Directory,E](){
         const FString Blocker=Directory/TEXT("not-a-directory");TArray<uint8> B;B.Add(1);

@@ -1,4 +1,5 @@
 #include "VoxelSkySubsystem.h"
+#include "VoxelSessionCheckpoint.h"
 
 #include "VoxelEarth.h"
 #include "VoxelEditRelay.h" // F7 sky-epoch replication -- the clock's transport; see TickReplicatedClock
@@ -2353,6 +2354,10 @@ struct FVoxelSkyImpl
 	// pausable (TimeScale 0) without either of those meaning anything to the
 	// engine's own timekeeping.
 	double EpochSeconds = 0.0;
+    TOptional<double> SavedRate,SavedDay,SavedYear;
+    double ClockRate() const { return SavedRate.Get(double(VoxelSky::GetTimeScale())); }
+    double ClockDay() const { return SavedDay.Get(VoxelSky::GetDayLengthSeconds()); }
+    double ClockYear() const { return SavedYear.Get(VoxelSky::GetDaysPerYear()); }
 
 	// --- F7 sky-epoch replication (header's clock-replication block) ---------
 	//
@@ -3422,6 +3427,7 @@ bool UVoxelSkySubsystem::ResolveObserverXYUU(double& OutXUU, double& OutYUU) con
 
 void UVoxelSkySubsystem::Tick(float DeltaTime)
 {
+	if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaTime);
 
 	if (!Impl)
@@ -3461,9 +3467,9 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 		return;
 	}
 
-	const double TimeScale = (double)VoxelSky::GetTimeScale();
-	const double DayLength = VoxelSky::GetDayLengthSeconds();
-	const double DaysPerYear = VoxelSky::GetDaysPerYear();
+	const double TimeScale = Impl->ClockRate();
+	const double DayLength = Impl->ClockDay();
+	const double DaysPerYear = Impl->ClockYear();
 
 	Impl->EpochSeconds += (double)DeltaTime * TimeScale;
 
@@ -5113,6 +5119,27 @@ const FVoxelSkyState& UVoxelSkySubsystem::GetSkyState() const
 	return Impl ? Impl->State : Empty;
 }
 
+bool UVoxelSkySubsystem::CaptureClock(double& Epoch,double& Rate,double& Day,double& Year) const
+{
+    if (!CaptureEpochSeconds(Epoch)) return false;
+    Rate=Impl->ClockRate(); Day=Impl->ClockDay(); Year=Impl->ClockYear();
+    return FMath::IsFinite(Rate) && FMath::Abs(Rate)<=1000000 && FMath::IsFinite(Day) && Day>=1 &&
+        Day<=1000000000 && FMath::IsFinite(Year) && Year>=1 && Year<=1000000;
+}
+bool UVoxelSkySubsystem::RestoreClock(double Epoch,double Rate,double Day,double Year)
+{
+    if (!Impl || !FMath::IsFinite(Epoch) || FMath::Abs(Epoch)>1e15 || !FMath::IsFinite(Rate) || FMath::Abs(Rate)>1000000 ||
+        !FMath::IsFinite(Day) || Day<1 || Day>1000000000 || !FMath::IsFinite(Year) || Year<1 || Year>1000000) return false;
+    Impl->SavedRate=Rate; Impl->SavedDay=Day; Impl->SavedYear=Year;
+    SetEpochSeconds(Epoch); return true;
+}
+
+bool UVoxelSkySubsystem::CaptureEpochSeconds(double& Out) const
+{
+    if (!Impl || !FMath::IsFinite(Impl->EpochSeconds)) return false;
+    Out=Impl->EpochSeconds; return true;
+}
+
 void UVoxelSkySubsystem::SetEpochSeconds(double NewEpochSeconds)
 {
 	if (!Impl)
@@ -5134,8 +5161,8 @@ void UVoxelSkySubsystem::SetTimeOfDay(double LocalHours)
 	{
 		return;
 	}
-	const double DayLength = VoxelSky::GetDayLengthSeconds();
-	const double DaysPerYear = VoxelSky::GetDaysPerYear();
+	const double DayLength = Impl->ClockDay();
+	const double DaysPerYear = Impl->ClockYear();
 	const int32 CurrentDayOfYear = DayOfYearFromEpoch(Impl->EpochSeconds, DayLength, DaysPerYear);
 
 	int32 ResolvedDayOfYear = CurrentDayOfYear;
@@ -5193,7 +5220,7 @@ void UVoxelSkySubsystem::TickReplicatedClock(float DeltaTime, double TimeScale)
 
 		const double Error = Impl->ReplicatedEpochTargetSeconds - Impl->EpochSeconds;
 		const double MaxRateEpochPerSec =
-			VoxelSky::GetDayLengthSeconds() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
+			Impl->ClockDay() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
 		// Exponential toward the target, clamped to the visual rate budget,
 		// never overshooting. Four lines of pure math; if this ever grows
 		// shape (drift filters, RTT terms) it moves to voxel-core beside the
@@ -5272,7 +5299,7 @@ void UVoxelSkySubsystem::AdoptReplicatedEpoch(double ServerEpochSeconds, float S
 	const double LocalBefore = Impl->EpochSeconds;
 	const double Delta = ServerEpochSeconds - LocalBefore;
 	const double MaxRateEpochPerSec =
-		VoxelSky::GetDayLengthSeconds() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
+		Impl->ClockDay() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
 
 	const bool bFirst = !Impl->bHasReplicatedEpochTarget;
 	const bool bTooLargeToBlend = FMath::Abs(Delta) > MaxRateEpochPerSec * kSkyEpochSnapRealSeconds;

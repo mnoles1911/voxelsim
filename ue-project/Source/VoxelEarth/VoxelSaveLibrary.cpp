@@ -1,4 +1,6 @@
 #include "VoxelSaveLibrary.h"
+#include "VoxelCheckpointStore.h"
+#include "VoxelSessionCheckpoint.h"
 #include "VoxelSaveJobs.h"
 #include "VoxelSaveGuard.h"
 
@@ -47,7 +49,9 @@ FString GActiveSlug;
 // world that will not open.
 bool ReadMeta(const FString& Slug, VoxelSave::FSaveInfo& Out)
 {
-	const FString Path = VoxelSave::SaveDirectory(Slug) / kMetaFile;
+	VoxelCheckpointStore::FResolved Resolved;
+	if (!VoxelCheckpointStore::Resolve(VoxelSave::WorldLogPath(Slug), Resolved)) return false;
+	const FString Path = Resolved.MetadataPath;
 	FString Json;
 	if (!FFileHelper::LoadFileToString(Json, *Path))
 	{
@@ -247,9 +251,10 @@ bool Write(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIs
 {
 	VoxelSaveJobs::Drain();FNamedSnapshot Snapshot;
 	if(!PrepareNamed(World,DisplayName,bIsAutosave,PlayerTransform,PlayTimeSeconds,Snapshot))return false;
-	const FString Meta=SaveDirectory(Snapshot.Slug)/VoxelSaveDetail::kMetaFile;
-	const bool Success=World.SaveWorldToPath(WorldLogPath(Snapshot.Slug))
-		&&FFileHelper::SaveStringToFile(Snapshot.Json,*(Meta+TEXT(".tmp")))&&IFileManager::Get().Move(*Meta,*(Meta+TEXT(".tmp")),true);
+	TArray<uint8> Terrain, Detached;
+	VoxelCheckpointStore::FSimulationPayload Simulation;
+	const bool Success=VoxelSessionCheckpoint::Capture(World.GetWorld(),Simulation)&&World.CaptureSaveSnapshot(Terrain,Detached)
+		&&VoxelCheckpointStore::Commit(WorldLogPath(Snapshot.Slug),Terrain,Detached,Snapshot.Json,-1,&Simulation);
 	FinishNamed(Snapshot,Success);return Success;
 }
 bool WriteAsync(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIsAutosave,const FTransform& PlayerTransform,int32 PlayTimeSeconds,TFunction<void(bool)> Completion)
@@ -258,7 +263,7 @@ bool WriteAsync(const UVoxelWorldSubsystem& World,const FString& DisplayName,boo
 	const double Start=FPlatformTime::Seconds();FNamedSnapshot Named;
 	if(!PrepareNamed(World,DisplayName,bIsAutosave,PlayerTransform,PlayTimeSeconds,Named))return false;
 	VoxelSaveJobs::FSnapshot Snapshot;Snapshot.TerrainPath=WorldLogPath(Named.Slug);
-	if(VoxelSaveGuard::RefuseWrite(Snapshot.TerrainPath,TEXT("SaveAsync"))||!World.CaptureTerrainSnapshot(Snapshot.Terrain)||!VoxelDetachedPersistence::CaptureSnapshot(World.GetWorld(),Snapshot.Objects))return false;
+	if(VoxelSaveGuard::RefuseWrite(Snapshot.TerrainPath,TEXT("SaveAsync"))||!VoxelSessionCheckpoint::Capture(World.GetWorld(),Snapshot.Simulation)||!World.CaptureTerrainSnapshot(Snapshot.Terrain)||!VoxelDetachedPersistence::CaptureSnapshot(World.GetWorld(),Snapshot.Objects))return false;
 	Snapshot.bObjectSnapshot=true;Snapshot.MetadataJson=Named.Json;Snapshot.CaptureMs=(FPlatformTime::Seconds()-Start)*1000.;
 	return VoxelSaveJobs::Submit(MoveTemp(Snapshot),[Named=MoveTemp(Named),Completion=MoveTemp(Completion)](bool Success){
 		FinishNamed(Named,Success);if(Completion)Completion(Success);
