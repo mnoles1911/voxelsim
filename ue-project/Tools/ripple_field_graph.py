@@ -216,12 +216,20 @@ def sample_ripple_field(b):
     # way to zero anyway. The wave field's patch term omits its own derivative
     # for the same kind of reason (create_water_voxel_material.py:2526-2529) and
     # quotes its own number; this is that number for this term.
+    height_raw = b.mask(tex, "", b=True)
     grad_xy = b.mul(b.mask(tex, "", r=True, g=True), weight)
-    height_m = b.mul(b.mask(tex, "", b=True), weight)
+    height_m = b.mul(height_raw, weight)
 
+    # height_raw / weight are the two HALVES of height_m, returned so an
+    # instrument can ask which of them is zero without building a second
+    # sampler that would not be the same fetch. Nothing shipping reads them --
+    # a consumer that wants the ripple wants it gained and faded -- and adding
+    # them changes not one node in the graph.
     return {
         "grad_xy": grad_xy,
         "height_m": height_m,
+        "height_raw": height_raw,
+        "weight": weight,
         "uv": uv,
     }
 

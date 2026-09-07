@@ -127,6 +127,29 @@ TAutoConsoleVariable<float> CVarVoxelWaterRippleTestFill(
 	     "in the run meaningless while it is on. 0 (default) touches nothing."),
 	ECVF_Default);
 
+// THE OTHER HALF OF THE BINDING TEST, and it exists because TestFill answers a
+// narrower question than it looks like it does. TestFill writes the field with
+// ClearRenderTarget2D; the derive writes it with DrawMaterialToRenderTarget. On
+// 2026-09-07 the material read the first and not the second, so "the write path"
+// became a live suspect that TestFill cannot arbitrate -- it only ever exercises
+// the clear. This fills the STATE targets with a constant instead, so the normal
+// derive draw runs and deposits a UNIFORM field THROUGH THE CANVAS. Uniform, so
+// nothing about geometry or per-pixel UV can be the difference; canvas-written,
+// so the write path is the only thing left that changed.
+//   MATERIAL LIGHTS UP -> the canvas draw is readable and the fault is spatial
+//       (the per-pixel UV the material computes, not the texture).
+//   MATERIAL STAYS DARK while ClearRenderTarget2D's constant renders -> the
+//       material cannot read canvas-written content from this target at all.
+// It DESTROYS the simulation state every frame it is on, like TestFill.
+TAutoConsoleVariable<float> CVarVoxelWaterRippleStateFill(
+	TEXT("voxel.Water.Ripple.StateFill"), 0.0f,
+	TEXT("DIAGNOSTIC. Above 0, overwrites both ripple STATE render targets with this height "
+	     "every frame, immediately before the derive, so the derive's canvas draw deposits a "
+	     "UNIFORM field of that height. Pairs with voxel.Water.Ripple.TestFill: same uniform "
+	     "field, the other write path. Nothing in a run with this on is a statement about the "
+	     "simulation. 0 (default) touches nothing."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelWaterRippleSpeed(
 	TEXT("voxel.Water.Ripple.SpeedMPS"), 1.6f,
 	TEXT("Ripple propagation speed in metres per second. 1.6 is roughly right for the ")
@@ -1198,6 +1221,27 @@ void UVoxelRippleFieldSubsystem::RunDerive()
 	{
 		return;
 	}
+	// BEFORE the draw, so the draw below is the thing that deposits the constant
+	// -- see the CVar's own note. Both targets, because Front() flips.
+	const float StateFill = CVarVoxelWaterRippleStateFill.GetValueOnGameThread();
+	if (StateFill > 0.0f && StateA_ && StateB_)
+	{
+		const FLinearColor Flat(kStateBias + StateFill, kStateBias + StateFill, 0.0f, 0.0f);
+		UKismetRenderingLibrary::ClearRenderTarget2D(World, StateA_, Flat);
+		UKismetRenderingLibrary::ClearRenderTarget2D(World, StateB_, Flat);
+		static bool bLoggedStateFill = false;
+		if (!bLoggedStateFill)
+		{
+			bLoggedStateFill = true;
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("RippleField: STATE FILL ACTIVE at %.3f m -- both state targets are being "
+			            "overwritten with a constant every frame, so the derive draws a UNIFORM "
+			            "field through the canvas path. NOTHING in this run is a statement about "
+			            "the simulation. This is the write-path half of the binding test."),
+			       StateFill);
+		}
+	}
+
 	DeriveMid_->SetTextureParameterValue(TEXT("State"), Front());
 	UKismetRenderingLibrary::DrawMaterialToRenderTarget(World, Field_, DeriveMid_);
 

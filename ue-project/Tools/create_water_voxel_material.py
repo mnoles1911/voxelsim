@@ -2926,6 +2926,738 @@ def main():
         unreal.log(
             "M_WaterVoxel WAKEPROBE ARM: ON -- emissive R=(|ripple height|>0.05), "
             "G=(ripple u>0.5), B=0.2 constant. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "fieldpic":
+        # A PHOTOGRAPH OF THE TEXTURE, TAKEN WITHOUT THE WORLD-SPACE UV
+        # (2026-09-07). Every arm before this one sampled the field through the
+        # per-pixel chain `uv = (worldXY - RippleFieldOrigin) * RippleFieldInvSize`,
+        # so a dark frame has always had two readings and no way to separate them:
+        # the texture is unreadable, or the coordinate is wrong. The wakeprobe
+        # frame narrowed it and could not close it -- its G channel proved `u` is
+        # correct to 0.2 m, but `u` alone is half a coordinate, and a wrong `v`
+        # reproduces every symptom on record: a UNIFORM field (TestFill,
+        # VoxelVerify00930) reads correctly at any coordinate, and a LOCALISED one
+        # (five 8 m discs, VoxelVerify00926) reads as empty whenever the row it is
+        # read from is not the row it was written to.
+        #
+        # So sample the field at the SCREEN's own UV instead. The result is not
+        # water: it is the render target itself, stretched over whatever water is
+        # on screen, with the world, the collection and the mapping removed from
+        # the question entirely.
+        #
+        #   R = 1 where |field.B(screen uv)| > 0.05 -- THE PICTURE. A blob means
+        #       the material can read derived (canvas-written) content, and the
+        #       only remaining defect is the per-pixel coordinate. Flat dark means
+        #       it cannot read this content at all, whatever coordinate is used,
+        #       and the write path is the defect.
+        #   G = 1 where screen u > 0.5 -- the instrument's OWN control, a hard
+        #       edge that must run down the middle of the frame. Without it a dark
+        #       R could just as well be a screen-position node that resolved to
+        #       something constant, which is the failure mode this whole hunt
+        #       keeps rediscovering under new names.
+        #   B = 0.2 constant -- the emissive pin, folded in for the reason the
+        #       wakeprobe arm folds it in: an arm that paints nothing is worthless
+        #       unless something in it must paint.
+        #
+        # Binary, per the uvstep arm's recorded lesson: the tonemapper defeats
+        # reading a ramp off a PNG, so measure where an EDGE is, not what shade a
+        # pixel is.
+        import ripple_field_graph as _rfgp  # noqa: E402
+        fp_screen = mel.create_material_expression(
+            material, unreal.MaterialExpressionScreenPosition, -1700, 4200)
+        # ViewportUV where the engine build exposes the choice; the default
+        # (SceneTextureUV) differs from it only under dynamic resolution or a
+        # viewport with an offset, and this capture has neither -- so a build
+        # without the property is not a different measurement.
+        try:
+            fp_screen.set_editor_property(
+                "mapping",
+                unreal.MaterialExpressionScreenPositionMapping.MESP_VIEWPORT_UV)
+        except Exception:  # noqa: BLE001 -- see above; the default is equivalent here
+            unreal.log_warning(
+                "M_WaterVoxel FIELDPIC ARM: ScreenPosition has no 'mapping' property on this "
+                "engine build; using its default. Equivalent at a fixed-resolution capture.")
+        fp_tex = mel.create_material_expression(
+            material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, 4200)
+        fp_tex.set_editor_property("parameter_name", _rfgp.FIELD_TEXTURE_PARAM)
+        fp_texture = unreal.load_object(None, _rfgp.FIELD_TEXTURE)
+        if fp_texture is None:
+            raise RuntimeError("fieldpic debug: could not load %s" % _rfgp.FIELD_TEXTURE)
+        fp_tex.set_editor_property("texture", fp_texture)
+        fp_tex.set_editor_property(
+            "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        if not mel.connect_material_expressions(fp_screen, "", fp_tex, "UVs"):
+            raise RuntimeError("connect screen uv -> fieldpic texture failed")
+        fp_k = bathy_b.const(1000.0)
+        fp_r = bathy_b.saturate(
+            bathy_b.mul(
+                bathy_b.sub(bathy_b.abs_(bathy_b.mask(fp_tex, "", b=True)), bathy_b.const(0.05)),
+                fp_k))
+        fp_g = bathy_b.saturate(
+            bathy_b.mul(
+                bathy_b.sub(bathy_b.mask(fp_screen, "", r=True), bathy_b.const(0.5)), fp_k))
+        fp_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4200)
+        fp_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        fp_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4260)
+        fp_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        fp_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4320)
+        fp_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 0.2, 1.0))
+        fp_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(fp_r, fp_red), bathy_b.mul(fp_g, fp_green)), fp_blue)
+        if not mel.connect_material_property(
+                fp_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect fieldpic debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel FIELDPIC ARM: ON -- emissive R=(|field.B at SCREEN uv|>0.05), "
+            "G=(screen u>0.5), B=0.2 constant. The field sampled with no world-space UV "
+            "at all. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "crosstex":
+        # THE UV CHAIN OR THE RENDER TARGET? (2026-09-07, the last fork.)
+        #
+        # Six frames have reduced the wake to one sentence that should not be
+        # possible: a fetch of RT_VoxelRippleField at a CONSTANT uv, or at the
+        # SCREEN's uv, returns the injected discs, while a fetch of the SAME
+        # texture parameter in the SAME frame at the material's PER-PIXEL WORLD uv
+        # -- whose value at those very pixels is pinned to (0.615,0.605) by two
+        # 1.5 m bands -- returns nothing. Fresh sampler nodes, a plain
+        # WorldPosition instead of the no-offsets one, LOD forced to mip 0, and
+        # the LWC-safe camera-relative rewrite all reproduce the failure.
+        #
+        # There are exactly two variables left, and this frame separates them by
+        # CROSSING them. bathy_field_graph samples a plain UTexture2D through an
+        # arithmetically identical world uv and is proven per-pixel correct at
+        # this very pose (the shoredist ribbon). So:
+        #
+        #   R = bathy validity > 0.5 at the BATHY uv    -- Texture2D + world uv,
+        #       the known-good cell. Whole lake.
+        #   G = bathy validity > 0.5 at the RIPPLE uv   -- Texture2D + the
+        #       SUSPECT uv chain. The ripple uv is in [0,1] only within 51.2 m of
+        #       the camera, so a sound chain paints a WINDOW-SHAPED patch there
+        #       and nothing beyond it -- a signature no other outcome produces.
+        #   B = ripple field.B > 0.05 at a CONSTANT uv  -- RenderTarget + no world
+        #       uv, the other known-good cell. Whole lake.
+        #
+        # G PAINTS THE PATCH -> the ripple uv chain hands correct in-range
+        #   coordinates to a sampler, and the defect is the RENDER TARGET being
+        #   sampled through a world-derived coordinate.
+        # G DARK -> the ripple uv chain does not reach a sampler as the value its
+        #   arithmetic provably produces, and the defect is that chain -- whatever
+        #   the texture on the other end.
+        import ripple_field_graph as _rfgx  # noqa: E402
+        import bathy_field_graph as _bfgx  # noqa: E402
+        cx_k = bathy_b.const(1000.0)
+
+        def _cx_gate(expr):
+            return bathy_b.saturate(
+                bathy_b.mul(bathy_b.sub(expr, bathy_b.const(0.5)), cx_k))
+
+        cx_bathy_texture = unreal.load_object(None, _bfgx.BATHY_TEXTURE)
+        if cx_bathy_texture is None:
+            raise RuntimeError("crosstex debug: could not load %s" % _bfgx.BATHY_TEXTURE)
+
+        def _cx_bathy_sampler(y):
+            n = mel.create_material_expression(
+                material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, y)
+            n.set_editor_property("parameter_name", _bfgx.BATHY_TEXTURE_PARAM)
+            n.set_editor_property("texture", cx_bathy_texture)
+            n.set_editor_property(
+                "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+            return n
+
+        # R: the bathy texture at the bathy uv, rebuilt here so both bathy taps
+        # are the same shape of expression and differ only in which uv feeds them.
+        cx_b_origin = bathy_b.collection_param("BathyFieldOrigin")
+        cx_b_inv = bathy_b.collection_param("BathyFieldInvSize")
+        cx_wp = bathy_b.node(unreal.MaterialExpressionWorldPosition)
+        cx_bathy_uv = bathy_b.mul(
+            bathy_b.sub(bathy_b.mask(cx_wp, "", r=True, g=True),
+                        bathy_b.mask(cx_b_origin, "", r=True, g=True)),
+            cx_b_inv)
+        cx_r_tex = _cx_bathy_sampler(6700)
+        if not mel.connect_material_expressions(cx_bathy_uv, "", cx_r_tex, "UVs"):
+            raise RuntimeError("connect bathy uv -> crosstex R failed")
+        cx_r = _cx_gate(bathy_b.mask(cx_r_tex, "", b=True))
+
+        # G: THE CROSS. Same bathy texture, fed the RIPPLE's uv.
+        cx_g_tex = _cx_bathy_sampler(6820)
+        if not mel.connect_material_expressions(ripple["uv"], "", cx_g_tex, "UVs"):
+            raise RuntimeError("connect ripple uv -> crosstex G failed")
+        cx_g = _cx_gate(bathy_b.mask(cx_g_tex, "", b=True))
+
+        # B: the render target at a constant uv, the other known-good cell.
+        cx_rt_texture = unreal.load_object(None, _rfgx.FIELD_TEXTURE)
+        if cx_rt_texture is None:
+            raise RuntimeError("crosstex debug: could not load %s" % _rfgx.FIELD_TEXTURE)
+        cx_const = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant2Vector, -1700, 6940)
+        cx_const.set_editor_property("r", 0.615)
+        cx_const.set_editor_property("g", 0.605)
+        cx_b_tex = mel.create_material_expression(
+            material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, 6940)
+        cx_b_tex.set_editor_property("parameter_name", _rfgx.FIELD_TEXTURE_PARAM)
+        cx_b_tex.set_editor_property("texture", cx_rt_texture)
+        cx_b_tex.set_editor_property(
+            "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        if not mel.connect_material_expressions(cx_const, "", cx_b_tex, "UVs"):
+            raise RuntimeError("connect const uv -> crosstex B failed")
+        cx_b = bathy_b.saturate(
+            bathy_b.mul(
+                bathy_b.sub(bathy_b.abs_(bathy_b.mask(cx_b_tex, "", b=True)),
+                            bathy_b.const(0.05)), cx_k))
+
+        cx_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6700)
+        cx_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        cx_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6820)
+        cx_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        cx_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6940)
+        cx_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        cx_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(cx_r, cx_red), bathy_b.mul(cx_g, cx_green)),
+            bathy_b.mul(cx_b, cx_blue))
+        if not mel.connect_material_property(
+                cx_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect crosstex debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel CROSSTEX ARM: ON -- emissive R=(bathy validity at BATHY uv), "
+            "G=(bathy validity at the RIPPLE uv), B=(ripple field at a CONST uv). "
+            "NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "fixprobe":
+        # TWO CANDIDATE FIXES AND A CONTROL (2026-09-07, after constprobe).
+        #
+        # The state of the evidence, all of it now from single frames rather than
+        # cross-run inference:
+        #   * the render target HOLDS the discs at uv (0.615,0.605) and
+        #     (0.583,0.583) at the shutter -- two CONSTANT-uv fetches light the
+        #     whole lake (VoxelVerify00954);
+        #   * the material's per-pixel world uv AT THOSE PIXELS IS (0.615,0.605),
+        #     offset and scale both measured -- two 1.5 m bands cross exactly
+        #     there (VoxelVerify00952);
+        #   * and the fetch at that per-pixel uv is black, in three separate
+        #     sampler nodes, through two separate WorldPosition constructions,
+        #     with automatic LOD and with LOD forced to 0 (VoxelVerify00948/950/952).
+        #
+        # A sampler cannot return two answers for one coordinate, so the value the
+        # ARITHMETIC produces and the value the FETCH receives are not the same
+        # value -- and the only thing that can make those differ is the
+        # large-world path. `uv = (AbsoluteWorldPosition.xy - Origin.xy) * InvSize`
+        # subtracts two ~6.5e6 UU quantities PER PIXEL, and both operands are LWC.
+        # The threshold chains that measured the uv are ordinary float maths on
+        # that result; the texture fetch is not, and UE5 re-derives a UV chain
+        # through its own path to produce screen-space derivatives for LOD.
+        #
+        # So the fix candidates are both "stop doing large-number arithmetic per
+        # pixel", and they are tested against each other and against a control:
+        #
+        #   R = a FRESH world-uv chain with LOD forced to 0. The one combination
+        #       not yet shot: mipprobe forced the mip on the SHARED chain, and
+        #       used a fresh chain only with automatic LOD.
+        #   G = THE LWC-SAFE FORM. uv = (W - O) * s is rewritten as
+        #       ((W - C) - (O - C)) * s, where W - C is the engine's own
+        #       TRANSLATED world position (small floats, no LWC) and O - C is a
+        #       difference of two UNIFORM values, so it folds on the CPU and never
+        #       appears per pixel. This is the canonical way to build a
+        #       world-space UV far from the origin.
+        #   B = the CONSTANT-uv fetch at (0.615,0.605), the must-fire control.
+        import ripple_field_graph as _rfgf  # noqa: E402
+        fx_k = bathy_b.const(1000.0)
+        fx_texture = unreal.load_object(None, _rfgf.FIELD_TEXTURE)
+        if fx_texture is None:
+            raise RuntimeError("fixprobe debug: could not load %s" % _rfgf.FIELD_TEXTURE)
+
+        def _fx_sampler(y):
+            n = mel.create_material_expression(
+                material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, y)
+            n.set_editor_property("parameter_name", _rfgf.FIELD_TEXTURE_PARAM)
+            n.set_editor_property("texture", fx_texture)
+            n.set_editor_property(
+                "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+            return n
+
+        def _fx_gate(expr):
+            return bathy_b.saturate(
+                bathy_b.mul(bathy_b.sub(bathy_b.abs_(expr), bathy_b.const(0.05)), fx_k))
+
+        fx_origin = bathy_b.collection_param(_rfgf.MPC_ORIGIN)
+        fx_inv = bathy_b.collection_param(_rfgf.MPC_INV_SIZE)
+        fx_origin_xy = bathy_b.mask(fx_origin, "", r=True, g=True)
+
+        # --- R: fresh absolute chain, LOD forced to 0 ---------------------------
+        fx_abs_wp = bathy_b.node(unreal.MaterialExpressionWorldPosition)
+        fx_abs_uv = bathy_b.mul(
+            bathy_b.sub(bathy_b.mask(fx_abs_wp, "", r=True, g=True), fx_origin_xy), fx_inv)
+        fx_r_tex = _fx_sampler(6300)
+        fx_r_tex.set_editor_property(
+            "mip_value_mode", unreal.TextureMipValueMode.TMVM_MIP_LEVEL)
+        if not mel.connect_material_expressions(fx_abs_uv, "", fx_r_tex, "UVs"):
+            raise RuntimeError("connect fresh absolute uv -> fixprobe R failed")
+        if not mel.connect_material_expressions(bathy_b.const(0.0), "", fx_r_tex, "Level"):
+            raise RuntimeError("connect mip level 0 -> fixprobe R failed")
+        fx_r = _fx_gate(bathy_b.mask(fx_r_tex, "", b=True))
+
+        # --- G: the LWC-safe rewrite -------------------------------------------
+        # W - C, straight from the engine: no large numbers reach this at all.
+        fx_twp = bathy_b.node(unreal.MaterialExpressionWorldPosition)
+        fx_twp.set_editor_property(
+            "world_position_shader_offset",
+            unreal.WorldPositionIncludedOffsets.WPT_CAMERA_RELATIVE)
+        # O - C: BOTH operands are uniform (a collection vector and the view's own
+        # camera position), so this whole subtraction is folded once per frame on
+        # the CPU rather than evaluated per pixel in float.
+        fx_cam = bathy_b.node(unreal.MaterialExpressionCameraPositionWS)
+        fx_origin_rel = bathy_b.sub(fx_origin_xy, bathy_b.mask(fx_cam, "", r=True, g=True))
+        fx_safe_uv = bathy_b.mul(
+            bathy_b.sub(bathy_b.mask(fx_twp, "", r=True, g=True), fx_origin_rel), fx_inv)
+        fx_g_tex = _fx_sampler(6420)
+        if not mel.connect_material_expressions(fx_safe_uv, "", fx_g_tex, "UVs"):
+            raise RuntimeError("connect lwc-safe uv -> fixprobe G failed")
+        fx_g = _fx_gate(bathy_b.mask(fx_g_tex, "", b=True))
+
+        # --- B: the constant-uv control ----------------------------------------
+        fx_const = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant2Vector, -1700, 6540)
+        fx_const.set_editor_property("r", 0.615)
+        fx_const.set_editor_property("g", 0.605)
+        fx_b_tex = _fx_sampler(6540)
+        if not mel.connect_material_expressions(fx_const, "", fx_b_tex, "UVs"):
+            raise RuntimeError("connect const uv -> fixprobe B failed")
+        fx_b = _fx_gate(bathy_b.mask(fx_b_tex, "", b=True))
+
+        fx_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6300)
+        fx_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        fx_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6420)
+        fx_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        fx_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6540)
+        fx_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        fx_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(fx_r, fx_red), bathy_b.mul(fx_g, fx_green)),
+            bathy_b.mul(fx_b, fx_blue))
+        if not mel.connect_material_property(
+                fx_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect fixprobe debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel FIXPROBE ARM: ON -- emissive R=(fresh absolute uv, MIP 0), "
+            "G=(LWC-safe camera-relative uv), B=(CONST uv control). "
+            "NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "constprobe":
+        # DOES THE TEXTURE HOLD DATA AT THE COORDINATE THE PICTURE SAYS IT DOES?
+        # (2026-09-07, the disambiguation the whole hunt turns on.)
+        #
+        # Two frames now make claims that cannot both be true:
+        #   * `fieldpic`/`bothtap`/`mipprobe` sample the field at the SCREEN's uv
+        #     and draw the discs as a blob spanning roughly u 0.44-0.81,
+        #     v 0.42-0.79 -- which READ AS TEXTURE COORDINATES says the data sits
+        #     around (0.62, 0.60).
+        #   * `uvpin` and `bandprobe` pin the material's per-pixel world uv: two
+        #     1.5 m-wide bands cross at exactly (0.615, 0.605), 7.5 m ahead of the
+        #     camera, offset AND scale confirmed -- and the fetch at that uv, in
+        #     that very intersection, is black.
+        # A sampler cannot return two different values for one coordinate, so one
+        # of those two readings is not measuring what it is named after. The
+        # untested link is the SCREEN one: it assumes MaterialExpressionScreenPosition
+        # hands out a 0..1 viewport uv, and every conclusion about WHERE the data
+        # lives rests on that assumption alone.
+        #
+        # A CONSTANT uv removes both per-pixel chains at once. It paints the whole
+        # water surface one flat answer, so there is nothing to mis-project:
+        #   R = |field.B at (0.615, 0.605)| > 0.05 -- the blob centre the screen
+        #       picture reports, and the exact uv bandprobe's bands cross at.
+        #   G = |field.B at (0.583, 0.583)| > 0.05 -- the 09-06 fixeduv point,
+        #       independently inside the injected disc union by the injector's own
+        #       logged ring coordinates.
+        #   B = the SCREEN tap, unchanged, as the must-fire control.
+        # WHOLE LAKE RED/GREEN -> the texture does hold the discs at those
+        #   coordinates, and a per-pixel expression proven equal to them still
+        #   fetches nothing, which puts the defect in the sampled uv the COMPILER
+        #   emits rather than in any value this graph can be asked for.
+        # LAKE DARK IN R AND G while B still draws the blob -> the data is NOT at
+        #   those coordinates, the screen picture was never a texture-space map,
+        #   and the write is misplaced after all.
+        import ripple_field_graph as _rfgc  # noqa: E402
+        cp_k = bathy_b.const(1000.0)
+        cp_texture = unreal.load_object(None, _rfgc.FIELD_TEXTURE)
+        if cp_texture is None:
+            raise RuntimeError("constprobe debug: could not load %s" % _rfgc.FIELD_TEXTURE)
+
+        def _cp_sampler(y):
+            n = mel.create_material_expression(
+                material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, y)
+            n.set_editor_property("parameter_name", _rfgc.FIELD_TEXTURE_PARAM)
+            n.set_editor_property("texture", cp_texture)
+            n.set_editor_property(
+                "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+            return n
+
+        def _cp_const_uv(x, y, py):
+            n = mel.create_material_expression(
+                material, unreal.MaterialExpressionConstant2Vector, -1700, py)
+            n.set_editor_property("r", float(x))
+            n.set_editor_property("g", float(y))
+            return n
+
+        def _cp_gate(expr):
+            return bathy_b.saturate(
+                bathy_b.mul(bathy_b.sub(bathy_b.abs_(expr), bathy_b.const(0.05)), cp_k))
+
+        cp_r_tex = _cp_sampler(5900)
+        if not mel.connect_material_expressions(
+                _cp_const_uv(0.615, 0.605, 5900), "", cp_r_tex, "UVs"):
+            raise RuntimeError("connect const uv (0.615,0.605) -> texture failed")
+        cp_g_tex = _cp_sampler(6020)
+        if not mel.connect_material_expressions(
+                _cp_const_uv(0.583, 0.583, 6020), "", cp_g_tex, "UVs"):
+            raise RuntimeError("connect const uv (0.583,0.583) -> texture failed")
+        cp_screen = mel.create_material_expression(
+            material, unreal.MaterialExpressionScreenPosition, -1700, 6140)
+        cp_b_tex = _cp_sampler(6140)
+        if not mel.connect_material_expressions(cp_screen, "", cp_b_tex, "UVs"):
+            raise RuntimeError("connect screen uv -> constprobe control texture failed")
+
+        cp_r = _cp_gate(bathy_b.mask(cp_r_tex, "", b=True))
+        cp_g = _cp_gate(bathy_b.mask(cp_g_tex, "", b=True))
+        cp_b = _cp_gate(bathy_b.mask(cp_b_tex, "", b=True))
+        cp_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 5900)
+        cp_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        cp_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6020)
+        cp_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        cp_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 6140)
+        cp_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        cp_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(cp_r, cp_red), bathy_b.mul(cp_g, cp_green)),
+            bathy_b.mul(cp_b, cp_blue))
+        if not mel.connect_material_property(
+                cp_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect constprobe debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel CONSTPROBE ARM: ON -- emissive R=(|field.B at CONST uv "
+            "0.615,0.605|>0.05), G=(|field.B at CONST uv 0.583,0.583|>0.05), "
+            "B=(SCREEN uv control). NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "bandprobe":
+        # HOW WIDE IS A UV STEP, IN METRES? (2026-09-07, after mipprobe)
+        #
+        # Everything to here has measured the ripple uv with HALF-PLANES -- the
+        # 09-06 `u > 0.5` edge and `uvpin`'s `u > 0.615` / `v > 0.604` quadrants --
+        # and a half-plane boundary locates ONE ISOLINE. Two isolines fix the two
+        # offsets. NOTHING SO FAR CONSTRAINS THE SCALE: multiply RippleFieldInvSize
+        # by any factor and shift the origin to keep those isolines where they are,
+        # and every frame in this hunt reproduces, because a straight boundary
+        # stays straight and a uniform TestFill is invariant under any coordinate
+        # at all. That is also the one shape of error that leaves the fetch
+        # correct-looking and still empty: if a screen pixel's uv sweeps past the
+        # blob in centimetres, no pixel ever samples inside it.
+        #
+        # So paint a BAND instead of an edge, and let its width on the water be
+        # the ruler:
+        #   R = 1 where 0.600 < u < 0.630   -- 0.03 of the window
+        #   G = 1 where 0.590 < v < 0.620   -- crossing it
+        # At the shipped mapping 0.03 of a 51.2 m window is 1.54 m, which at the
+        # 7.5 m the bands cross in front of this camera is a stripe hundreds of
+        # pixels wide. A hairline, or nothing at all, says the scale is wrong and
+        # by how much.
+        #   B = 1 where |field.B at the WORLD uv| > 0.05 -- the failing fetch,
+        #     kept in frame so the ruler and the thing it explains are one picture.
+        bp_k = bathy_b.const(1000.0)
+        bp_u = bathy_b.mask(ripple["uv"], "", r=True)
+        bp_v = bathy_b.mask(ripple["uv"], "", g=True)
+
+        def _bp_band(expr, lo, hi):
+            # saturate((x-lo)*k) * saturate((hi-x)*k): 1 strictly inside, 0 out.
+            return bathy_b.mul(
+                bathy_b.saturate(bathy_b.mul(bathy_b.sub(expr, bathy_b.const(lo)), bp_k)),
+                bathy_b.saturate(bathy_b.mul(bathy_b.sub(bathy_b.const(hi), expr), bp_k)))
+
+        bp_r = _bp_band(bp_u, 0.600, 0.630)
+        bp_g = _bp_band(bp_v, 0.590, 0.620)
+        bp_b = bathy_b.saturate(
+            bathy_b.mul(
+                bathy_b.sub(bathy_b.abs_(ripple["height_raw"]), bathy_b.const(0.05)), bp_k))
+        bp_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 5600)
+        bp_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        bp_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 5660)
+        bp_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        bp_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 5720)
+        bp_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        bp_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(bp_r, bp_red), bathy_b.mul(bp_g, bp_green)),
+            bathy_b.mul(bp_b, bp_blue))
+        if not mel.connect_material_property(
+                bp_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect bandprobe debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel BANDPROBE ARM: ON -- emissive R=(0.600<u<0.630), "
+            "G=(0.590<v<0.620), B=(|field.B at WORLD uv|>0.05). A stripe ~1.5 m wide "
+            "means the uv SCALE is right. NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "mipprobe":
+        # WHY DOES A CORRECT COORDINATE FETCH NOTHING? (2026-09-07, after bothtap)
+        #
+        # `bothtap` (VoxelVerify00948) put both taps on the same pixels of the
+        # same frame: the field sampled at the SCREEN's uv draws the discs, and
+        # the field sampled at the material's PER-PIXEL WORLD uv -- raw, no gain,
+        # no edge fade, same texture parameter, same 0.05 threshold, one node
+        # apart -- is black. `uvpin` (VoxelVerify00946) had already pinned that
+        # world uv at two independent isolines (u=0.5 and u=0.615, v=0.604), so
+        # its VALUE is right to well under a texel. A fetch at a right coordinate
+        # into a texture that provably holds the data leaves exactly two things
+        # that differ between the two taps, and both are one-line fixes:
+        #
+        #   R = the world uv sampled at an EXPLICIT MIP LEVEL 0. The screen tap's
+        #       uv derivative is a flat 1/2560 of the texture per pixel; the
+        #       water's is whatever a near-grazing plane at 6.5e6 UU from the
+        #       origin produces, and LOD is the only part of a sample that reads
+        #       somewhere other than where the coordinate points.
+        #   G = the world uv rebuilt from a PLAIN WorldPosition. The ripple tap
+        #       is the only field sample in this material that sets
+        #       WPT_EXCLUDE_ALL_SHADER_OFFSETS; bathy_field_graph's, which is
+        #       proven per-pixel correct in these same frames (the shoredist
+        #       ribbon), does not. That is the only structural difference between
+        #       the sample that works and the sample that does not.
+        #   B = the SCREEN uv tap, unchanged, as the must-fire control -- without
+        #       it a dark frame says nothing, which is how three arms in this
+        #       hunt were wasted.
+        import ripple_field_graph as _rfgm  # noqa: E402
+        mp_k = bathy_b.const(1000.0)
+        mp_texture = unreal.load_object(None, _rfgm.FIELD_TEXTURE)
+        if mp_texture is None:
+            raise RuntimeError("mipprobe debug: could not load %s" % _rfgm.FIELD_TEXTURE)
+
+        def _mp_sampler(y):
+            n = mel.create_material_expression(
+                material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, y)
+            n.set_editor_property("parameter_name", _rfgm.FIELD_TEXTURE_PARAM)
+            n.set_editor_property("texture", mp_texture)
+            n.set_editor_property(
+                "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+            return n
+
+        def _mp_gate(expr):
+            return bathy_b.saturate(
+                bathy_b.mul(bathy_b.sub(bathy_b.abs_(expr), bathy_b.const(0.05)), mp_k))
+
+        # --- R: the shipping uv, forced to mip 0 --------------------------------
+        mp_r_tex = _mp_sampler(5200)
+        mp_r_tex.set_editor_property(
+            "mip_value_mode", unreal.TextureMipValueMode.TMVM_MIP_LEVEL)
+        if not mel.connect_material_expressions(ripple["uv"], "", mp_r_tex, "UVs"):
+            raise RuntimeError("connect world uv -> mip0 texture failed")
+        mp_zero = bathy_b.const(0.0)
+        # The MipValue pin's NAME depends on the engine build and on
+        # MipValueMode (UMaterialExpressionTextureSample::GetInputName). Try the
+        # ones this engine family has used and fail loudly rather than silently
+        # leaving the pin unconnected, which would make the arm a duplicate of
+        # the tap it exists to differ from.
+        _mp_pin = None
+        for _cand in ("MipLevel", "Level", "MipValue", "Mip Level"):
+            if mel.connect_material_expressions(mp_zero, "", mp_r_tex, _cand):
+                _mp_pin = _cand
+                break
+        if _mp_pin is None:
+            raise RuntimeError(
+                "mipprobe: could not connect a mip-level input on the texture sample; "
+                "tried MipLevel/Level/MipValue. The arm would silently duplicate the "
+                "automatic-LOD tap, so it refuses instead.")
+        mp_r = _mp_gate(bathy_b.mask(mp_r_tex, "", b=True))
+
+        # --- G: the same uv, rebuilt from a PLAIN WorldPosition -----------------
+        mp_origin = bathy_b.collection_param(_rfgm.MPC_ORIGIN)
+        mp_inv = bathy_b.collection_param(_rfgm.MPC_INV_SIZE)
+        mp_wp = bathy_b.node(unreal.MaterialExpressionWorldPosition)
+        mp_uv = bathy_b.mul(
+            bathy_b.sub(bathy_b.mask(mp_wp, "", r=True, g=True),
+                        bathy_b.mask(mp_origin, "", r=True, g=True)),
+            mp_inv)
+        mp_g_tex = _mp_sampler(5320)
+        if not mel.connect_material_expressions(mp_uv, "", mp_g_tex, "UVs"):
+            raise RuntimeError("connect plain-worldpos uv -> texture failed")
+        mp_g = _mp_gate(bathy_b.mask(mp_g_tex, "", b=True))
+
+        # --- B: the screen tap, the must-fire control ---------------------------
+        mp_screen = mel.create_material_expression(
+            material, unreal.MaterialExpressionScreenPosition, -1700, 5440)
+        mp_b_tex = _mp_sampler(5440)
+        if not mel.connect_material_expressions(mp_screen, "", mp_b_tex, "UVs"):
+            raise RuntimeError("connect screen uv -> mipprobe control texture failed")
+        mp_b = _mp_gate(bathy_b.mask(mp_b_tex, "", b=True))
+
+        mp_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 5200)
+        mp_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        mp_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 5320)
+        mp_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        mp_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 5440)
+        mp_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        mp_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(mp_r, mp_red), bathy_b.mul(mp_g, mp_green)),
+            bathy_b.mul(mp_b, mp_blue))
+        if not mel.connect_material_property(
+                mp_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect mipprobe debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel MIPPROBE ARM: ON -- emissive R=(world uv at MIP 0, pin '%s'), "
+            "G=(world uv from PLAIN WorldPosition), B=(SCREEN uv control). "
+            "NOT A SHIPPING MATERIAL." % _mp_pin)
+    elif _ripple_debug_mode == "bothtap":
+        # THE TWO TAPS, ON THE SAME PIXELS, IN THE SAME FRAME (2026-09-07).
+        #
+        # Three frames now disagree in a way no pair of them can settle, because
+        # each was shot in its own run:
+        #   * `fieldpic` (VoxelVerify00942) -- the field sampled at the SCREEN's uv
+        #     draws the five discs as a clean blob at texture uv (0.62, 0.60).
+        #   * `uvpin` (VoxelVerify00946) -- the material's own per-pixel uv is
+        #     CORRECT: the (u>0.615, v>0.604) quadrant corner lands 7.5 m dead
+        #     ahead of the camera, which is inside that blob, and the mirrored
+        #     read is empty, so it is not a flip either.
+        #   * `wakeprobe` (VoxelVerify00926) -- the shipping tap over those same
+        #     discs is black, while the same tap under a uniform TestFill
+        #     (VoxelVerify00930) fires over the whole window.
+        # Every one of those is a statement about a different run. So put all
+        # three questions on ONE set of pixels and let the frame arbitrate:
+        #
+        #   R = |field.B at SCREEN uv| > 0.05   -- the known-positive control.
+        #   G = |field.B at the PER-PIXEL WORLD uv| > 0.05 -- the SAME fetch the
+        #       shipping foam uses, RAW: no gain, no edge fade.
+        #   B = |ripple height_m| > 0.05 -- that same fetch TIMES the weight
+        #       (RippleFieldGain x edge fade), i.e. exactly what the shipping
+        #       disturbance foam reads.
+        #
+        # G and B differ by ONE multiply and nothing else, so:
+        #   R,G,B all on the blob -> the read path works and 00926 is void.
+        #   R,G on, B off        -> the WEIGHT is zero; the fetch was never the
+        #                           defect and RippleFieldGain is.
+        #   R on, G off          -> the world-uv fetch itself fails with a
+        #                           provably correct coordinate, which leaves the
+        #                           sampler/derivative on that path.
+        import ripple_field_graph as _rfgb  # noqa: E402
+        bt_k = bathy_b.const(1000.0)
+        bt_screen = mel.create_material_expression(
+            material, unreal.MaterialExpressionScreenPosition, -1700, 4800)
+        bt_tex = mel.create_material_expression(
+            material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, 4800)
+        bt_tex.set_editor_property("parameter_name", _rfgb.FIELD_TEXTURE_PARAM)
+        bt_texture = unreal.load_object(None, _rfgb.FIELD_TEXTURE)
+        if bt_texture is None:
+            raise RuntimeError("bothtap debug: could not load %s" % _rfgb.FIELD_TEXTURE)
+        bt_tex.set_editor_property("texture", bt_texture)
+        bt_tex.set_editor_property(
+            "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        if not mel.connect_material_expressions(bt_screen, "", bt_tex, "UVs"):
+            raise RuntimeError("connect screen uv -> bothtap texture failed")
+
+        def _bt_gate(expr):
+            return bathy_b.saturate(
+                bathy_b.mul(bathy_b.sub(bathy_b.abs_(expr), bathy_b.const(0.05)), bt_k))
+
+        bt_r = _bt_gate(bathy_b.mask(bt_tex, "", b=True))
+        bt_g = _bt_gate(ripple["height_raw"])
+        bt_b = _bt_gate(ripple["height_m"])
+        bt_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4800)
+        bt_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        bt_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4860)
+        bt_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        bt_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4920)
+        bt_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        bt_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(bt_r, bt_red), bathy_b.mul(bt_g, bt_green)),
+            bathy_b.mul(bt_b, bt_blue))
+        if not mel.connect_material_property(
+                bt_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect bothtap debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel BOTHTAP ARM: ON -- emissive R=(|field.B at SCREEN uv|>0.05), "
+            "G=(|field.B at WORLD uv, RAW|>0.05), B=(|height_m, weighted|>0.05). "
+            "NOT A SHIPPING MATERIAL.")
+    elif _ripple_debug_mode == "uvpin":
+        # WHERE DOES THE PER-PIXEL UV ACTUALLY POINT? (2026-09-07, after fieldpic)
+        #
+        # `fieldpic` settled the half of the question that had been open for two
+        # days: sampled at the SCREEN's uv, the same texture parameter renders the
+        # five injected discs as a clean blob centred at texture uv (0.615, 0.604)
+        # -- exactly where both the injector's own world->uv arithmetic and
+        # Ripple.Dump put it -- while the same material's WORLD-space tap over the
+        # same discs is black. The render target is readable, the derive's canvas
+        # write is readable, the binding is right. What is left is the coordinate.
+        #
+        # And the coordinate has never actually been MEASURED. Every check so far
+        # was a symmetric one, and the two symmetric checks on record are both
+        # blind to the failure they were used to rule out:
+        #   * `u > 0.5` puts its edge on the window's own centre line, which is
+        #     the FIXED POINT of a u-flip -- a mirrored uv reproduces that edge
+        #     exactly.
+        #   * the TestFill window boundary is `edge_fade`, a Chebyshev distance
+        #     from the centre, which is invariant under a flip in either axis.
+        # A uniform field is invariant under any wrong coordinate at all, which is
+        # why every "the uv is correct" frame in this hunt is a uniform-field
+        # frame.
+        #
+        # So put the edges ON THE DATA instead of on the centre line:
+        #   R = 1 where per-pixel u > 0.615   -- the blob's own u
+        #   G = 1 where per-pixel v > 0.604   -- the blob's own v
+        # The R/G corner is then a direct read of where this material believes
+        # texture uv (0.615, 0.604) lies in the world. It must land on the discs,
+        # i.e. ~8 m ahead of the camera on the shutter's yaw-45 axis. Anywhere
+        # else and the offset is measured off the frame in metres rather than
+        # argued about.
+        #   B = 1 where |field.B sampled at (1-u, 1-v)| > 0.05 -- the mirrored
+        #     read, because the flip is the one family of errors that survives
+        #     every check already run. Blue over the discs convicts it outright.
+        import ripple_field_graph as _rfgu  # noqa: E402
+        up_u = bathy_b.mask(ripple["uv"], "", r=True)
+        up_v = bathy_b.mask(ripple["uv"], "", g=True)
+        up_k = bathy_b.const(1000.0)
+        up_r = bathy_b.saturate(bathy_b.mul(bathy_b.sub(up_u, bathy_b.const(0.615)), up_k))
+        up_g = bathy_b.saturate(bathy_b.mul(bathy_b.sub(up_v, bathy_b.const(0.604)), up_k))
+        up_flip_uv = bathy_b.one_minus(ripple["uv"])
+        up_tex = mel.create_material_expression(
+            material, unreal.MaterialExpressionTextureSampleParameter2D, -1500, 4500)
+        up_tex.set_editor_property("parameter_name", _rfgu.FIELD_TEXTURE_PARAM)
+        up_texture = unreal.load_object(None, _rfgu.FIELD_TEXTURE)
+        if up_texture is None:
+            raise RuntimeError("uvpin debug: could not load %s" % _rfgu.FIELD_TEXTURE)
+        up_tex.set_editor_property("texture", up_texture)
+        up_tex.set_editor_property(
+            "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        if not mel.connect_material_expressions(up_flip_uv, "", up_tex, "UVs"):
+            raise RuntimeError("connect mirrored uv -> uvpin texture failed")
+        up_b = bathy_b.saturate(
+            bathy_b.mul(
+                bathy_b.sub(bathy_b.abs_(bathy_b.mask(up_tex, "", b=True)), bathy_b.const(0.05)),
+                up_k))
+        up_red = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4500)
+        up_red.set_editor_property("constant", unreal.LinearColor(1.0, 0.0, 0.0, 1.0))
+        up_green = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4560)
+        up_green.set_editor_property("constant", unreal.LinearColor(0.0, 1.0, 0.0, 1.0))
+        up_blue = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant3Vector, -1300, 4620)
+        up_blue.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, 1.0, 1.0))
+        up_out = bathy_b.add(
+            bathy_b.add(bathy_b.mul(up_r, up_red), bathy_b.mul(up_g, up_green)),
+            bathy_b.mul(up_b, up_blue))
+        if not mel.connect_material_property(
+                up_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+            raise RuntimeError("connect uvpin debug -> emissive failed")
+        unreal.log(
+            "M_WaterVoxel UVPIN ARM: ON -- emissive R=(per-pixel u>0.615), "
+            "G=(per-pixel v>0.604), B=(|field.B at the MIRRORED uv 1-u,1-v|>0.05). "
+            "NOT A SHIPPING MATERIAL.")
     elif _ripple_debug_mode == "shorefoam":
         # WHICH INPUT OF THE SHORE FOAM IS ZERO? (2026-09-07)
         #

@@ -1589,3 +1589,158 @@ That is a look question and the owner judges looks. What is settled is that the
 band is no longer evaluated on an empty set and no longer painted onto a dead
 channel; the ladder from here is `BathyFoamGain` / `ShoreFoamEmissive` at a pose
 with a genuinely shallow shelf, not another hunt for plumbing.
+
+## 2026-09-07 (material-owning agent, afternoon): the derive's WRITE is exonerated; the wake's read is now one reproducible sentence that should not be possible
+
+Eight frames, every one carrying a must-fire control in the same frame, all at
+`+12 m / -35 deg / yaw 45` at `(-65102,-51084)` with `-VoxelRippleWakeAfter=166`
+(five 8 m rings, `StrengthM 0.9`, frozen) and `voxel.Water.Ripple.Dump` at
+t=168. No `Ocean: camera entered water` line in any of the logs.
+
+### WITHDRAWN: "the broken step is the FETCH ... for content written by the derive"
+
+The 11:50 conclusion -- *"the broken step is the FETCH of
+`RT_VoxelRippleField` in M_WaterVoxel: it returns the render target's clear
+value for content written by the derive's `DrawMaterialToRenderTarget`, while
+returning content written by `ClearRenderTarget2D` through the same parameter,
+the same UV and the same frame"* -- **is refuted.**
+
+New arm **`VOXEL_WATER_RIPPLE_DEBUG=fieldpic`** (marker `FIELDPIC ARM: ON`; add
+it to the contamination list) samples the field at the SCREEN's own uv --
+`MaterialExpressionScreenPosition` -- so the frame IS the render target,
+stretched over whatever water is on screen, with the world, the collection and
+the mapping removed from the question. `VoxelVerify00942` draws the five
+injected discs as a hard-edged blob spanning texture uv **0.44-0.81 in u,
+0.42-0.79 in v, centred (0.62, 0.60)**. That is where the injector's own logged
+ring world positions put them (the ring line runs (0.564,0.555) to
+(0.674,0.666)), where `Ripple.Dump` puts them, and it carries the **1.85:1**
+on-screen aspect a round uv shape must take when stretched over a 2560x1398
+frame (measured 960x518 px; the frame's own aspect is 1.83). Its must-fire
+control `VoxelVerify00944` (`TestFill 0.5`) fills the frame.
+
+**So M_WaterVoxel reads canvas / `DrawMaterialToRenderTarget`-written content
+perfectly well.** There is no write-path defect, nothing to re-plumb in
+`RunDerive`, and no reason to move the derive to RDG or to a compute pass. The
+diagnostic built for that branch -- **`voxel.Water.Ripple.StateFill <h>`**
+(`VoxelRippleField.cpp`: clears both STATE targets to a constant immediately
+before the derive, so the canvas draw deposits a UNIFORM field -- the write-path
+half of `TestFill`) -- is on record, costs nothing at its 0 default, and was
+never needed: the branch closed before it was fired.
+
+### The per-pixel uv is CORRECT -- offset, scale, sign AND orientation
+
+Every "the uv is correct" measurement before today was a HALF-PLANE (the 09-06
+`u > 0.5` edge) or the TestFill window boundary. **Both are blind to the two
+error families that reproduce this bug exactly:** a flip about the window centre
+leaves the `u = 0.5` isoline exactly where it was and leaves the Chebyshev edge
+fade exactly square, and a wrong SCALE with a compensating origin leaves a
+straight boundary straight. A uniform TestFill is invariant under *any* wrong
+coordinate at all, which is why every positive uv frame in this hunt so far is a
+uniform-field frame.
+
+* **`uvpin`** (`UVPIN ARM: ON`, `VoxelVerify00946`) -- R = `u > 0.615`,
+  G = `v > 0.604`, B = the MIRRORED read `|field.B at (1-u, 1-v)| > 0.05`. Four
+  clean quadrants meeting at screen **(0.4875, 0.600)**; predicted for the
+  shipped mapping **(0.473, 0.603)**, i.e. the world point **7.5 m dead ahead**
+  of the camera on the shutter's yaw-45 axis -- inside the disc union. The `u`
+  isoline runs along +/-Y (up-right on screen) and the `v` isoline along +/-X
+  (up-left), which is the correct orientation for `(X-Ox, Y-Oy)*s` at yaw 45.
+  **The mirrored read painted ZERO pixels: it is not a flip.**
+* **`bandprobe`** (`BANDPROBE ARM: ON`, `VoxelVerify00952`) -- R =
+  `0.600 < u < 0.630`, G = `0.590 < v < 0.620`: BANDS, not edges, so their
+  on-screen width is a ruler. They render as two stripes crossing at
+  (0.615, 0.605) and measuring **~1.5 m of world width** against
+  `0.03 x 51.2 m = 1.54 m`. **The scale is right.**
+
+### And the fetch at that uv is still empty
+
+* **`bothtap`** (`BOTHTAP ARM: ON`, `VoxelVerify00948`) -- the three questions on
+  ONE set of pixels: R = `|field.B at SCREEN uv| > 0.05` draws the blob;
+  G = `|field.B at the PER-PIXEL WORLD uv| > 0.05`, **RAW** (no gain, no edge
+  fade, same texture parameter, same threshold, one node apart) is **BLACK**;
+  B = the weighted `height_m` the shipping foam reads is **BLACK**.
+* **`mipprobe`** (`MIPPROBE ARM: ON`, `VoxelVerify00950`) -- the world uv with
+  **LOD forced to mip 0**: black. The world uv rebuilt from a **plain
+  `WorldPosition`**, dropping `WPT_EXCLUDE_ALL_SHADER_OFFSETS` (the only
+  structural difference from `bathy_field_graph`'s proven-good tap): black.
+  Screen-uv control: fires. *(The mip pin is called `Level`, not `MipLevel`:
+  `UMaterialGraphNode::GetShortenPinName` shortens it, which is also why `UVs`
+  reaches the input the engine calls `Coordinates`. The arm refuses to build if
+  it cannot connect that pin, so mip 0 provably took.)*
+* **`constprobe`** (`CONSTPROBE ARM: ON`, `VoxelVerify00954`) -- the SAME texture
+  parameter at CONSTANT uv **(0.615, 0.605)** and **(0.583, 0.583)** lights the
+  **entire lake**. The render target really does hold the discs at those
+  coordinates at the shutter.
+* **`fixprobe`** (`FIXPROBE ARM: ON`, `VoxelVerify00956`) -- a fresh absolute-uv
+  chain at mip 0: black. The LWC-safe rewrite `uv = ((W - C) - (O - C)) * s`,
+  with `W - C` the engine's own translated world position (small floats, no LWC)
+  and `O - C` a difference of two UNIFORMS that folds on the CPU and never
+  appears per pixel: black. Const-uv control: fires.
+
+### THE FINDING, IN ONE SENTENCE
+
+**A fetch of `/Game/Voxel/RT_VoxelRippleField` from M_WaterVoxel returns the
+injected data when its UV is a CONSTANT or the SCREEN's uv, and returns nothing
+when its UV is derived from `WorldPosition` -- in the same frame, on the same
+pixels, through the same texture parameter, at a UV whose value is pinned to
+(0.615, 0.605) by two 1.5 m bands.** The arithmetically identical world-uv
+construction against `bathy_field_graph`'s plain `UTexture2D` is per-pixel
+correct in these very frames (the shoredist ribbon). A sampler cannot return two
+answers for one coordinate, so the value the ARITHMETIC produces and the value
+the FETCH receives are not the same value.
+
+### What it is NOT, each with the frame that killed it
+
+| suspect | killed by |
+|---|---|
+| the derive's `DrawMaterialToRenderTarget` write | 00942 -- the discs render through the screen tap |
+| the object binding / a second render target | 00954 -- a const uv on the same parameter reads the discs |
+| the field being empty or decayed at the shutter | 00954, and `Ripple.Dump` at t=168 |
+| a uv flip about the window centre | 00946 -- the mirrored read is zero pixels |
+| a wrong uv offset | 00946 -- the quadrant corner lands 7.5 m dead ahead |
+| a wrong uv scale | 00952 -- the bands measure 1.5 m against 1.54 m predicted |
+| mip / LOD selection | 00950, 00956 -- mip 0 forced, still black |
+| `WPT_EXCLUDE_ALL_SHADER_OFFSETS` | 00950 -- a plain `WorldPosition` is black too |
+| large-world (LWC) precision in the subtraction | 00956 -- the camera-relative rewrite is black too |
+| `RippleFieldGain` / the edge fade | 00948 -- the RAW, unweighted tap is black as well |
+
+### Not settled, and how to settle it next
+
+`crosstex` (`CROSSTEX ARM: ON`, `VoxelVerify00958`) crossed the two remaining
+variables -- the BATHY `UTexture2D` sampled at the RIPPLE's uv -- and **is
+non-discriminating as built**: it gated on bathy *validity*, which is 1 across
+the whole baked window AND at its clamped border, so the frame comes back white
+either way. Re-run that arm against `depth_m` or `shore_m`, which have
+structure, and it becomes the fork it was meant to be:
+
+* bathy's image squeezed into a **51.2 m square around the camera** -> the
+  ripple uv chain hands correct in-range coordinates to a sampler, and the defect
+  is this render target sampled through a world-derived coordinate;
+* bathy's normal full-window image -> the ripple uv chain does not reach a
+  sampler as the value its arithmetic provably produces, whatever texture is on
+  the other end.
+
+**NOT FIXED.** The wake, the player ripples and the boat wake all read through
+this one tap -- `VoxelCharacterMovement.cpp:951` and `VoxelBoat.cpp:1116-1124`
+both call `UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt`, so they share the
+pending queue, the step, the derive, the field and `sample_ripple_field` -- so
+all three are dark for the same reason and all three come back together. Worth
+recording for when they do: the player's walking ripple is injected at
+**StrengthM 0.020** against this capture's 0.9, so it will be far subtler than
+these frames even once the read works.
+
+### New debug arms on record (add all to the contamination list)
+
+`FIELDPIC ARM: ON`, `UVPIN ARM: ON`, `BOTHTAP ARM: ON`, `MIPPROBE ARM: ON`,
+`BANDPROBE ARM: ON`, `CONSTPROBE ARM: ON`, `FIXPROBE ARM: ON`,
+`CROSSTEX ARM: ON`. `ripple_field_graph.sample_ripple_field` now also returns
+`height_raw` and `weight` -- the two halves of `height_m`, so an instrument can
+ask which of them is zero without building a second sampler that would not be
+the same fetch. Nothing shipping reads them and not one node of the graph
+changed.
+
+Every arm ran as ONE serialized regen -> capture -> restore script with the
+restore in a `finally` block, and every restore is proven from
+`Saved/sky-chain/regen-create_water_voxel_material.log` (`SHORE FX ARM: ON`,
+`STAR REFLECTION ARM: ON`, and none of the debug markers above).
+
