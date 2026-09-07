@@ -19,15 +19,17 @@ namespace VoxelReadyProbeDetail
 const float kRingWeights[] = {0.35f, 0.25f, 0.20f, 0.20f, 0.10f, 0.10f};
 } // namespace VoxelReadyProbeDetail
 
-float ComputeLoadProgress(float TimeFraction, float SpatialFraction, float RingFillFraction, float PreviousProgress)
+float ComputeTheatreProgress(float TheatreFraction, bool bWorldGateOpen, float PreviousProgress)
 {
-	// Ring fill dominates the work term: it keeps moving through the long tail,
-	// whereas the spatial term saturates as soon as the ground under the spawn
-	// exists and then says nothing more.
-	const float Work = 0.25f * FMath::Clamp(SpatialFraction, 0.f, 1.f)
-	                   + 0.75f * FMath::Clamp(RingFillFraction, 0.f, 1.f);
-	const float Raw = FMath::Max(FMath::Clamp(TimeFraction, 0.f, 1.f), Work);
-	return FMath::Clamp(FMath::Max(PreviousProgress, Raw), 0.f, 0.995f);
+	// See the header for the contract. Smoothstep, not FMath::SmoothStep --
+	// that overload interpolates between bounds, and writing the polynomial out
+	// keeps the zero-slope-at-both-ends property visible where it is relied on.
+	const float T = FMath::Clamp(TheatreFraction, 0.f, 1.f);
+	const float Eased = T * T * (3.f - 2.f * T);
+	// While the world's gate is closed the bar may approach the hold but never
+	// claim completion; once it opens, the same curve is allowed to finish.
+	const float Cap = bWorldGateOpen ? 1.f : kVoxelTheatreHoldProgress;
+	return FMath::Clamp(FMath::Max(PreviousProgress, FMath::Min(Eased, Cap)), 0.f, 1.f);
 }
 
 void FVoxelWorldReadyProbe::Start(const FVector& AnchorUU, const FVoxelReadyProbeConfig& InConfig)

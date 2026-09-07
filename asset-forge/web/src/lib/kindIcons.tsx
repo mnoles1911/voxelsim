@@ -1,5 +1,6 @@
 import {
-  Bird, Box, Fish, Flower2, Mountain, PawPrint, Shell, Sprout, TreePine, Wheat, type LucideIcon,
+  Bird, Box, Fish, Flower2, Mountain, PawPrint, Sailboat, Shell, Sprout, TreePine, Wheat,
+  type LucideIcon,
 } from "lucide-react";
 
 /* One icon per asset kind. Lucide only -- no emoji, no raw-text glyphs
@@ -16,6 +17,7 @@ const ICONS: Record<string, LucideIcon> = {
   cetacean: Shell,
   bird: Bird,
   quadruped: PawPrint,
+  artifact: Sailboat,
 };
 
 export const kindIcon = (kind: string): LucideIcon => ICONS[kind] ?? Box;

@@ -1,0 +1,94 @@
+{
+  "id": "canoe-0001",
+  "species": "canoe",
+  "kind": "artifact",
+  "seed": 1,
+  "spec_hash": "2d9d37cca08a9697",
+  "stats": {
+    "seed": 1,
+    "spec_hash": "2d9d37cca08a9697",
+    "kind": "artifact",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 2.5,
+    "height_m": 0.53,
+    "length_m": 3.9,
+    "footprint_m": [
+      3.9,
+      0.9
+    ],
+    "grid_mb": 0.2,
+    "extent_vox": [
+      156,
+      36,
+      21
+    ],
+    "vox_models_needed": 1,
+    "voxels": 16998,
+    "by_material": {
+      "16": 3556,
+      "17": 11762,
+      "18": 1680
+    },
+    "ground_contact": 722,
+    "ms_grow": 1.8,
+    "ms_raster": 65.2,
+    "steps": [
+      {
+        "step": "hull shell",
+        "added": 15274,
+        "repainted": 0,
+        "must_change": true,
+        "note": "2 voxel (5.0 cm) planking",
+        "voxels_after": 15274
+      },
+      {
+        "step": "contrast strakes",
+        "added": 0,
+        "repainted": 1902,
+        "must_change": true,
+        "note": "1 of 6 runs, 12% of the planking",
+        "voxels_after": 15274
+      },
+      {
+        "step": "gunwale",
+        "added": 888,
+        "repainted": 1832,
+        "must_change": true,
+        "note": "7 cm deep, 1 voxel overhang",
+        "voxels_after": 16162
+      },
+      {
+        "step": "end decks",
+        "added": 388,
+        "repainted": 0,
+        "must_change": true,
+        "note": "7% of the length at each end",
+        "voxels_after": 16550
+      },
+      {
+        "step": "thwarts",
+        "added": 448,
+        "repainted": 0,
+        "must_change": true,
+        "note": "2 x 10 cm",
+        "voxels_after": 16998
+      }
+    ],
+    "silent_steps": [],
+    "hollow_frac": 0.6677,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 74.4
+  },
+  "problems": [],
+  "vox_models": 1
+}

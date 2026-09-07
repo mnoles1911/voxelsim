@@ -58,6 +58,24 @@ export const SelectContent = React.forwardRef<
 ));
 SelectContent.displayName = "SelectContent";
 
+/* A heading over a run of items. Added for the CATEGORY grouping in the kind
+ * menu: the eleventh kind was the first one that is not scenery or an animal,
+ * and a flat list of eleven gives a reader no way to see that. */
+export const SelectGroup = SelectPrimitive.Group;
+
+export const SelectLabel = React.forwardRef<
+  React.ElementRef<typeof SelectPrimitive.Label>,
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Label>
+>(({ className, ...props }, ref) => (
+  <SelectPrimitive.Label
+    ref={ref}
+    className={cn("px-2 pb-1 pt-2 text-[11px] uppercase tracking-wide text-parch-500",
+                  className)}
+    {...props}
+  />
+));
+SelectLabel.displayName = "SelectLabel";
+
 export const SelectItem = React.forwardRef<
   React.ElementRef<typeof SelectPrimitive.Item>,
   React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>

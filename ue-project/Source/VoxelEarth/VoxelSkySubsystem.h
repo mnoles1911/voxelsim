@@ -30,29 +30,29 @@
 // the pre-W4 static rig used, so turning the feature off cannot turn the
 // lights off.
 //
-// SCOPE: STANDALONE AND LISTEN SERVER ONLY, TODAY.
+// THE CLOCK REPLICATES (F7, docs/water-ocean-tides-plan-2026-09-04.md Phase F).
 //
-// The clock lives in a UWorldSubsystem and UWorldSubsystems do not replicate.
-// The rig used to be spawned from AVoxelEarthGameMode::BeginPlay, which is
-// server-only, and it now spawns from this subsystem's OnWorldBeginPlay, which
-// runs on every instance -- so a dedicated-server CLIENT does get a rig, but it
-// gets one driven by its OWN locally-started epoch, which begins at whatever
-// moment that client joined. Every client would therefore render a different
-// (and, relative to the server's world, stale) sky. Nothing about the game is
-// WRONG in that state -- the sky is not simulation -- but two players standing
-// next to each other would disagree about whether it is night, which is worse
-// than either being wrong alone.
+// The clock lives in a UWorldSubsystem and UWorldSubsystems do not replicate,
+// so it rides the EXISTING AVoxelEditRelay as two scalars -- the epoch and the
+// time scale -- exactly the design this header's old TODO named and exactly
+// VoxelEditRelay.h's ServerSeed pattern (NOT a second actor: a second
+// replicated actor for two scalars is a channel, a relevancy question and a
+// spawn-ordering race bought for nothing). This matters because the clock is
+// not only the sky's: the TIDE is pure f(epoch) (VoxelWaterSubsystem's tide
+// block reads GetSkyState().EpochSeconds, plan A2), so two clients with skewed
+// clocks get skewed SEAS, not just skewed sunsets.
 //
-// TODO (not built today, deliberately): replicate the clock as TWO scalars --
-// the world epoch in seconds and the time scale -- as UPROPERTY(Replicated)
-// fields on the EXISTING AVoxelEditRelay, following VoxelEditRelay.h:55-60's
-// ServerSeed/ServerWorldGenVersion pattern exactly. Two floats on an actor
-// that already exists, already replicates, and whose header comment already
-// anticipates exactly this kind of reuse ("the relay generalizes to non-edit
-// authoritative streams later"). NOT a second actor: a second replicated actor
-// for two scalars is a channel, a relevancy question and a spawn-ordering race
-// bought for nothing. The client-side half is then "adopt the replicated epoch
-// instead of accumulating locally", i.e. one branch in Tick.
+// Division of labour: the authority's Tick pushes the pair into the relay at a
+// low fixed cadence (TickReplicatedClock); the relay's OnRep_SkyClock forwards
+// them here (AdoptReplicatedEpoch); the client blends its local epoch toward
+// the dead-reckoned server value under a bounded correction rate -- the whole
+// policy, with its constants argued, sits above AdoptReplicatedEpoch's
+// declaration below. Standalone touches none of this beyond one NetMode enum
+// test per tick: no relay exists there (VoxelEarthGameMode.cpp only spawns one
+// when networked), nothing is pushed, nothing is adopted, and the epoch
+// accumulates exactly as it always has. A listen server with no client
+// connected additionally writes two fields on its own relay per push, which
+// replicates to nobody and changes no frame.
 //
 // NO PERSISTENCE TODAY, also deliberately. The command-line pins below
 // (-VoxelTimeOfDay / -VoxelDate / -VoxelTimeScale) cover every current need,
@@ -155,9 +155,56 @@ struct FVoxelSkyState
 	// could report an armed capture the renderer had already ignored.
 	int32 RealTimeCaptureActive = -1;
 
+	// --- sky-epoch replication (F7) ------------------------------------------
+	// Proof of traffic, same doctrine as the measurement arms above: a log line
+	// proves a receipt printed once; these prove the path kept running. Exactly
+	// 0 / 0.0 forever in standalone and on every server -- both are CLIENT-side
+	// counters, and that zero is itself the off-arm evidence.
+	//
+	// Receipts: AdoptReplicatedEpoch invocations landed on this client (one per
+	// relay push received, ~1/5s while connected; a stall here with a live
+	// connection means the server stopped pushing or the relay is gone).
+	int64 EpochReplicationReceipts = 0;
+	// The signed epoch error (dead-reckoned server clock minus local clock, in
+	// epoch seconds) still being blended away by the bounded correction. Decays
+	// toward 0 between receipts; pinned at 0 when no target has ever arrived.
+	double EpochCorrectionRemainingS = 0.0;
+
 	bool bSunUp = false;   // apparent altitude > 0 (refraction already folded in)
 	bool bMoonUp = false;
 	bool bClockRunning = false; // voxel.Sky.Enabled && TimeScale != 0
+};
+
+// ---------------------------------------------------------------------------
+// THE DAY-NIGHT LIGHT COLOUR RAMP (Phase L2,
+// docs/vs-lighting-implementation-plan-2026-09-06.md)
+// ---------------------------------------------------------------------------
+//
+// WHY AN AUTHORED TABLE AND NOT A MEASUREMENT OF THE SKY. The rig paints
+// day-night with the SkyAtmosphere's GPU transmittance and holds the sun at a
+// constant 5778 K (FVoxelSkyState::SunTemperatureK's own comment: "the sunset
+// red comes from the atmosphere"), so there is NO CPU-readable colour anywhere
+// in this subsystem to hand the marcher -- which is exactly what the research
+// doc recorded as the reason recommendation 2 was skipped. Vintage Story does
+// not measure its sky either: SunLightLevels[] and SunColor are hand-shaped
+// tables the engine never argues with (research doc section 2, mechanism 7).
+// So this is a table, it is small, every row says what it is for, and the owner
+// tunes it by eye like every other appearance knob in this project.
+//
+// PURE FUNCTION OF ELEVATION, deliberately: it takes no world, no clock and no
+// subsystem state, which is what lets VoxelSkyTests.cpp pin it as arithmetic
+// rather than as a rendering outcome.
+struct FVoxelSkyLightColours
+{
+	// Tints, NOT brightnesses -- multiplied into terms that already carry their
+	// own intensity knob (voxel.March.SunWrapGain and voxel.March.AmbientIntensity
+	// respectively). White is the neutral, shipped answer for both.
+	FLinearColor Sun = FLinearColor::White;
+	FLinearColor Ambient = FLinearColor::White;
+	// The moon's illuminance as a fraction of the sun's -- passed straight
+	// through from the caller so the marcher and MPC_VoxelSky's MoonLightFraction
+	// scalar provably carry the same number.
+	float MoonFraction = 0.0f;
 };
 
 UCLASS()
@@ -222,6 +269,51 @@ public:
 	// Absolute clock set, in game seconds since world start. The one entry
 	// point everything else funnels through.
 	void SetEpochSeconds(double NewEpochSeconds);
+	bool CaptureEpochSeconds(double& Out) const;
+    bool CaptureClock(double& Epoch,double& Rate,double& Day,double& Year) const;
+    bool RestoreClock(double Epoch,double Rate,double Day,double Year);
+
+	// F7 sky-epoch replication, client-side receive half. Called by
+	// AVoxelEditRelay::OnRep_SkyClock (and by nothing else) with the server's
+	// epoch and the rate it is advancing at, once per relay push received.
+	//
+	// POLICY, in full, because this is where a mid-frame sun teleport would come
+	// from if it were wrong:
+	//   * FIRST receipt SNAPS (SetEpochSeconds). It is the join handshake: the
+	//     client's locally-started clock is arbitrarily far from the server's
+	//     (hours, for a late joiner) and "blend" across that gap at any honest
+	//     rate is a sun that races across the sky for minutes. One discontinuity
+	//     at join, before the player has any invested sense of the time of day,
+	//     is the cheapest moment this correction will ever be.
+	//   * Later receipts only update the TARGET; Tick blends the local epoch
+	//     toward it (dead-reckoned forward at the server's time scale between
+	//     pushes) at a rate bounded so the CORRECTION adds at most
+	//     kSkyEpochMaxCorrectionSunDegPerSec of sun motion on top of the sun's
+	//     own -- degrees per second, not epoch seconds, so the visual bound
+	//     survives any voxel.Sky.DayLengthSeconds. Small errors decay
+	//     exponentially (kSkyEpochCorrectionGainPerSec) so the sun eases out of
+	//     a correction rather than hitting a rate cliff at zero.
+	//   * A late delta too large for the bounded rate to close within
+	//     kSkyEpochSnapRealSeconds (server clock jumped: SetTimeOfDay, a pin, a
+	//     long client hitch) SNAPS with a Warning -- crawling the sun across the
+	//     sky for minutes to avoid one visible cut is the worse artifact, and
+	//     the tide (25 mm datum quanta, rate-limited steps) tracks a snap
+	//     exactly as it tracks any other epoch jump.
+	//
+	// GATE LOG CONTRACT ("SkyEpoch REPLICATED: ..."): printed on the first
+	// receipt and on any receipt whose |clientDelta| >= kSkyEpochLogDeltaS;
+	// Verbose otherwise. Carries serverEpoch, clientDelta, the action taken
+	// (SNAP-JOIN / SNAP-LARGE / BLEND) and the resolved correctionRate bound. A
+	// connected client whose log lacks the first-receipt line did not engage
+	// this path -- that absence is the gate's failure signal. A FULL MP gate
+	// needs a two-process harness this project does not have (stated in the
+	// plan's F7, not hidden); until one exists the evidence is this contract
+	// plus FVoxelSkyState's receipt counters above. The correction arithmetic
+	// itself deliberately stays inline in TickReplicatedClock -- it is four
+	// lines against UE math; if it ever grows shape (drift filters, RTT
+	// compensation) it should move to voxel-core as a pure function beside the
+	// tide LUT, where a golden test can pin it.
+	void AdoptReplicatedEpoch(double ServerEpochSeconds, float ServerTimeScale);
 
 private:
 	TUniquePtr<FVoxelSkyImpl> Impl;
@@ -381,6 +473,16 @@ private:
 	// chooses 0 on its own.
 	void ApplySkyLightRealTimeCapture();
 
+	// F7 sky-epoch replication, the per-tick half. Called from Tick right after
+	// the local epoch accumulates and BEFORE the ephemeris reads it, so a
+	// correction is part of the frame's clock rather than a retroactive nudge.
+	// Branches on NetMode once: standalone returns immediately (the off arm --
+	// no relay exists, nothing else runs); a server pushes the epoch + time
+	// scale into the relay at kSkyEpochPushPeriodSeconds; a client dead-reckons
+	// the replicated target and applies the bounded correction documented at
+	// AdoptReplicatedEpoch.
+	void TickReplicatedClock(float DeltaTime, double TimeScale);
+
 	void SpawnRig(UWorld& World);
 	void ApplyStaticRigPose();
 	void ApplyLightsFromState();
@@ -524,6 +626,30 @@ namespace VoxelSky
 	// and this accessor never returns a negative number whatever the cvar holds.
 	// Always report what this returns, never the cvar: the cvar reads -1 on every
 	// shipped run.
+	// --- the day-night light colour ramp (Phase L2) --------------------------
+	//
+	// (sun elevation in degrees, moon illuminance as a fraction of the sun's)
+	// -> the tints the marcher's VS-lighting terms are multiplied by. PURE: the
+	// same two inputs always give the same answer, on any thread, with no world
+	// and no subsystem. That is what makes it testable (VoxelSkyTests.cpp,
+	// VoxelEarth.Sky.LightColourRamp) and it is the reason the function is here
+	// rather than a private method on the subsystem.
+	//
+	// SunAltitudeDeg is the APPARENT altitude the ephemeris reports (refraction
+	// already folded in), clamped internally to [-90, +90]; anything outside is
+	// a caller bug and is clamped rather than extrapolated, because the table's
+	// end rows are the answers for "below the horizon" and "high", not the start
+	// of a trend to continue.
+	//
+	// MoonFraction is FVoxelSkyState::MoonIntensity / VoxelSky::GetSunIntensity()
+	// -- the SAME quantity ApplySkyMaterialParams writes into MPC_VoxelSky's
+	// MoonLightFraction, carrying the horizon gate, the illuminated fraction, the
+	// daylight suppression and voxel.Sky.MoonIntensity with it. It only ever
+	// scales the NIGHT rows: a full moon lifts and neutralises the night tint, a
+	// new moon leaves it at its dim cool floor.
+	VOXELEARTH_API FVoxelSkyLightColours SampleLightColours(double SunAltitudeDeg,
+	                                                        float MoonFraction);
+
 	VOXELEARTH_API float GetStarAmbientGain();
 	// Whether GetStarAmbientGain() came from the calibration constant or from an
 	// explicit override. Exists so the log can say WHICH -- an override and the

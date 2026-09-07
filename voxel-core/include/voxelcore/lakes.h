@@ -270,16 +270,19 @@ size_t lakeExtentFillRescued(const BasinEntry& b, ElevFn&& latticeElev, GroundFn
 // deferred until basin table v2 ships an extent the client does not have to
 // reconstruct.
 //
-// SECOND KNOWN v0 LIMIT: a DRY basin credited water does not draw. `indexFor`
-// skips every row where `holdsWater()` is false, so a playa or a salt flat is
-// not in the bucket index at all and `surfaceAtPixel` never reaches its datum.
-// The LEDGER still tracks it correctly -- the volume is real, it spills at the
-// right level, and it persists -- it simply is not rendered. Admitting dry rows
-// to the index would build an extent mask for every playa in every tile whether
-// or not one ever fills, which is the cost the index exists to avoid; the right
-// fix is to admit a row when the ledger reports a non-zero delta for it, and it
-// needs the index to be invalidated on the first credit rather than only on a
-// tile change.
+// SECOND KNOWN v0 LIMIT, NARROWED BY PHASE C (tides plan C4): a DRY basin
+// credited water does not draw. `indexFor` skips every row where
+// `holdsWater()` is false, so a playa or a salt flat is not in the bucket
+// index at all and `surfaceAtPixel` never reaches its datum. The LEDGER still
+// tracks it correctly -- the volume is real, it spills at the right level, and
+// it persists -- it simply is not rendered. Admitting EVERY dry row would
+// build an extent mask for every playa in every tile whether or not one ever
+// fills, which is the cost the index exists to avoid. Phase C admits exactly
+// the rows that provably DO fill on a clock: a dry basin the tidal oracle
+// below vouches for joins the index (see `indexFor`), because a tidal pool
+// re-floods every cycle by qualification and a pool that renders nothing at
+// high water is a hole in the sea. General ledger-credited playas remain the
+// deferred case, with the same admit-on-first-credit fix as before.
 class IBasinDatumSource {
 public:
     virtual ~IBasinDatumSource() = default;
@@ -287,6 +290,29 @@ public:
     // as shipped; returning `baked.surfaceMm` is the correct answer for a basin
     // this source knows nothing about.
     virtual int32_t basinDatumMm(int32_t tx, int32_t ty, const BasinEntry& baked) = 0;
+};
+
+// IS THIS BASIN TIDAL -- does the sea reach over its sill often enough that
+// its datum should ride the tide (connected) or hold at its sill
+// (disconnected), rather than stand at the ledger's answer?
+//
+// AN INTERFACE FOR THE SAME REASON IBasinDatumSource is one: the QUALIFICATION
+// (sill below astronomical high water, floor below sill, connected to the
+// open sea at high water) needs a connectivity grid over live terrain that
+// only the engine owns, while the consumers -- `TidalDatumSource` (tidal.h)
+// and this file's bucket-index admission -- are engine-free and unit-tested
+// against a fixture oracle. The engine implementation caches per basin per
+// window recentre; this seam just asks.
+//
+// MUST BE STABLE BETWEEN INVALIDATIONS: `LakeSampler` bakes the answer into
+// its bucket index (a dry tidal row is admitted, a dry non-tidal one is not),
+// so an oracle whose answer changes must be followed by
+// `invalidateTidalAdmissions()` or the index and the oracle disagree about
+// which rows exist. The engine calls that on every window recentre.
+class ITidalBasinOracle {
+public:
+    virtual ~ITidalBasinOracle() = default;
+    virtual bool isTidal(int32_t tx, int32_t ty, const BasinEntry& baked) = 0;
 };
 
 // An interface rather than a concrete class because two implementations
@@ -362,6 +388,45 @@ public:
     // ignores a ledger it could not use anyway.
     virtual void setBasinDatumSource(IBasinDatumSource* /*source*/) {}
     virtual void invalidateBasinDatumMemo() {}
+
+    // ---- THE TIDAL HALF (tides plan Phase C) -------------------------------
+    //
+    // Same interface-not-cast reasoning as the ledger seam above; all four are
+    // defaulted so NullWaterSampler and every pre-tide caller behave exactly
+    // as before -- with no oracle bound, nothing in this file changes by a bit.
+
+    // Binds the tidal oracle. LakeSampler admits oracle-vouched DRY rows into
+    // its bucket index (see the narrowed v0 limit above), so binding -- and
+    // every later change of the oracle's mind -- must invalidate admissions.
+    virtual void setTidalOracle(ITidalBasinOracle* /*oracle*/) {}
+    // Drops the bucket indexes (and the masks that hang off them), so the next
+    // query re-asks the oracle which rows exist. The engine calls this on every
+    // connectivity-window recentre; it is a rebuild-lazily invalidation, not a
+    // per-frame cost.
+    virtual void invalidateTidalAdmissions() {}
+
+    // The basin's wet extent AT AN ARBITRARY DATUM (tides plan C4) -- the same
+    // fill rule as `extentMaskFor`, with one number changed. For a tidal basin
+    // the drawn outline must follow the tide: at high water the sheet reaches
+    // the high-water line, at low water it retreats to the sill's pool, and
+    // the baked mask (taken at equilibrium `surfaceMm`) is wrong in both
+    // directions. Memoised ONE entry per basin keyed by the datum, which the
+    // caller passes QUANTISED (the tide steps by quantum, the sill is a
+    // constant) so the memo actually hits. nullptr means "could not resolve",
+    // never "dry" -- same contract as extentMaskFor.
+    virtual const std::vector<uint8_t>* extentMaskAtDatum(int32_t /*tx*/, int32_t /*ty*/,
+                                                          uint16_t /*id*/, int32_t /*datumMm*/) {
+        return nullptr;
+    }
+
+    // Which basin answers for this voxel column, so an engine consumer (the
+    // surface contract's Kind field) can ask the oracle about the SAME row the
+    // datum came from rather than re-deriving one. False when no basin's mask
+    // covers the column. Same highest-wins rule as surfaceAtPixel.
+    virtual bool basinAtVoxel(int64_t /*vx*/, int64_t /*vy*/, int32_t& /*outTx*/,
+                              int32_t& /*outTy*/, uint16_t& /*outId*/) {
+        return false;
+    }
 
     // ---- THE RIBBON HALF (far-field FLOWING water, riverribbon.h) ----------
     //
@@ -479,6 +544,25 @@ public:
         return datum_ == nullptr ? baked.surfaceMm : datum_->basinDatumMm(tx, ty, baked);
     }
 
+    // --- the tidal hook (tides plan Phase C; see ITidalBasinOracle) ---------
+    //
+    // Borrowed and optional, exactly like the datum source above. The oracle
+    // decides which DRY rows join the bucket index (a tidal pool re-floods
+    // every cycle and must draw at high water), so binding or re-deciding it
+    // drops the indexes -- they baked the old answer in.
+    void setTidalOracle(ITidalBasinOracle* oracle) override {
+        tidal_ = oracle;
+        invalidateTidalAdmissions();
+    }
+    void invalidateTidalAdmissions() override {
+        // The indexes cached which rows EXIST under the old oracle, and the
+        // masks (baked and at-datum) hang off them. Rebuilt lazily on the next
+        // query; this runs on window recentres, not per frame.
+        index_.clear();
+        memoValid_ = false;
+    }
+    ITidalBasinOracle* tidalOracle() const { return tidal_; }
+
     // Decodes and indexes the tile's registry. Optional -- queries do it on
     // demand -- but doing it up front is what makes the query path a pure
     // read. False when the tile is not loaded.
@@ -501,6 +585,18 @@ public:
     // Same question in tile-pixel space, for tests and for the clipmap band
     // (work item 5), which walks pixels rather than voxels.
     int32_t surfaceAtPixel(int64_t px, int64_t py) {
+        uint16_t unusedId = 0;
+        int32_t unusedTx = 0, unusedTy = 0;
+        return surfaceAtPixelPick(px, py, unusedTx, unusedTy, unusedId);
+    }
+
+    // The winner-reporting form (tides plan Phase C): the same query, also
+    // naming WHICH row won, so the surface contract's Kind field can ask the
+    // tidal oracle about the exact basin its datum came from. One loop, two
+    // callers -- a second copy of the candidate walk is how the two would
+    // drift.
+    int32_t surfaceAtPixelPick(int64_t px, int64_t py, int32_t& outTx, int32_t& outTy,
+                               uint16_t& outId) {
         const uint32_t size = tiles_.tileSize();
         if (size == 0) return kNoWaterMm;
         const int32_t tx = int32_t(floorDiv(px, size)), ty = int32_t(floorDiv(py, size));
@@ -529,9 +625,26 @@ public:
             // higher here and therefore in the implicit fill, the marker and
             // every test that reads through this sampler, all at once.
             const int32_t datumMm = basinDatumMm(tx, ty, b);
-            if (datumMm > best) best = datumMm;
+            if (datumMm > best) {
+                best = datumMm;
+                outTx = tx;
+                outTy = ty;
+                outId = id;
+            }
         }
         return best;
+    }
+
+    bool basinAtVoxel(int64_t vx, int64_t vy, int32_t& outTx, int32_t& outTy,
+                      uint16_t& outId) override {
+        const int32_t pxMm = tiles_.pixelSizeMm();
+        if (pxMm <= 0) return false;
+        const int64_t px = floorDiv(vx * kVoxelSizeMm, pxMm);
+        const int64_t py = floorDiv(vy * kVoxelSizeMm, pxMm);
+        // Deliberately NOT through the one-entry column memo: the memo caches a
+        // datum, not an identity, and this query is off the hot path (surface
+        // contract consumers, a handful per tick).
+        return surfaceAtPixelPick(px, py, outTx, outTy, outId) != kNoWaterMm;
     }
 
     // ---- IWaterSampler's sheet half, over the index this class already builds.
@@ -547,6 +660,50 @@ public:
         // an unresolved basin), not a dry one -- a dry basin has a mask full of
         // zeroes, not no mask. Collapsing the two here would let the sheet draw
         // nothing for a tile that failed to decode and call it a shoreline.
+        return m.empty() ? nullptr : &m;
+    }
+
+    // THE EXTENT AT AN ARBITRARY DATUM (tides plan C4). THE FILL RULE IS
+    // SHARED, NOT RE-DERIVED -- this is `maskFor`'s exact pipeline (prewarm,
+    // lattice, spline rescue, v2 floor re-seed) with ONE number changed: the
+    // datum the fill tests against. The plan sketched a bare per-pixel
+    // `ground < datum` threshold here; the seeded component fill is used
+    // instead, deliberately, because two basins can share a bbox and the
+    // threshold would flood the neighbour's side of the ridge -- the very
+    // first paragraph of this file's extent doctrine. For any datum at or
+    // above the baked one (the only datums the tide hands in: sill or higher)
+    // the component containing the seed is a superset of the baked mask, so
+    // nothing the baked rule kept is ever lost.
+    //
+    // MEMO: one entry per basin, keyed by the datum, replaced when the datum
+    // moves. The caller passes a QUANTISED datum (tide quantum or the sill
+    // constant), so a tidal cycle costs ~one refill per basin per datum step
+    // and a pinned tide costs one, ever. Lives inside the TileIndex so tile
+    // eviction/revalidation drops it with everything else that borrowed from
+    // the tile.
+    const std::vector<uint8_t>* extentMaskAtDatum(int32_t tx, int32_t ty, uint16_t id,
+                                                  int32_t datumMm) override {
+        TileIndex* idx = indexFor(tx, ty);
+        if (idx == nullptr || idx->basins == nullptr || id >= idx->basins->size()) return nullptr;
+        const BasinEntry& b = (*idx->basins)[id];
+        if (datumMm == b.surfaceMm) {
+            // At the baked datum the baked mask IS the answer; sharing it keeps
+            // the tide-dark path on the shipped bytes and the memo unoccupied.
+            const std::vector<uint8_t>& m = maskFor(*idx, id, tx, ty);
+            return m.empty() ? nullptr : &m;
+        }
+        auto it = idx->datumMasks.find(id);
+        if (it != idx->datumMasks.end() && it->second.datumMm == datumMm) {
+            return it->second.mask.empty() ? nullptr : &it->second.mask;
+        }
+        DatumMask dm;
+        dm.datumMm = datumMm;
+        buildMaskAtDatum(*idx, id, tx, ty, datumMm, dm.mask);
+        // A failed build caches EMPTY against this datum -- same never-retry-
+        // until-invalidated discipline as maskFor, same "empty means could not
+        // resolve, not dry" contract at the return.
+        auto ins = idx->datumMasks.insert_or_assign(id, std::move(dm));
+        const std::vector<uint8_t>& m = ins.first->second.mask;
         return m.empty() ? nullptr : &m;
     }
     uint32_t tilePixels() const override { return tiles_.tileSize(); }
@@ -565,7 +722,18 @@ private:
         size_t bucketsPerAxis = 0;
         std::vector<std::vector<uint16_t>> buckets;
         std::unordered_map<uint16_t, std::vector<uint8_t>> masks;
+        // Phase C: the extent at the CURRENT tidal datum, one entry per basin,
+        // replaced when the datum steps (see extentMaskAtDatum). Inside the
+        // TileIndex so eviction and revalidation drop it with the masks --
+        // these vectors are owned, but they were built from a tile that may be
+        // gone.
+        struct DatumMask {
+            int32_t datumMm = kNoWaterMm;
+            std::vector<uint8_t> mask;
+        };
+        std::unordered_map<uint16_t, DatumMask> datumMasks;
     };
+    using DatumMask = TileIndex::DatumMask;
 
     static uint64_t key(int32_t tx, int32_t ty) {
         return (uint64_t(uint32_t(tx)) << 32) | uint64_t(uint32_t(ty));
@@ -623,7 +791,15 @@ private:
             idx.buckets.resize(idx.bucketsPerAxis * idx.bucketsPerAxis);
             for (size_t i = 0; i < idx.basins->size(); ++i) {
                 const BasinEntry& b = (*idx.basins)[i];
-                if (!b.holdsWater()) continue;  // a dry playa has no surface
+                // A dry playa has no surface -- UNLESS the tidal oracle vouches
+                // that the sea provably floods it every cycle (tides plan C4's
+                // admit-on-demand: the narrowed second v0 limit above). The
+                // oracle's answer is baked into this index, which is why
+                // setTidalOracle/invalidateTidalAdmissions drop it.
+                if (!b.holdsWater() &&
+                    (tidal_ == nullptr || !tidal_->isTidal(tx, ty, b))) {
+                    continue;
+                }
                 for (int32_t byi = b.bboxY0 / kBucketPx; byi <= b.bboxY1 / kBucketPx; ++byi)
                     for (int32_t bxi = b.bboxX0 / kBucketPx; bxi <= b.bboxX1 / kBucketPx; ++bxi)
                         idx.buckets[size_t(byi) * idx.bucketsPerAxis + size_t(bxi)]
@@ -638,14 +814,33 @@ private:
         auto it = idx.masks.find(id);
         if (it != idx.masks.end()) return it->second;
         const BasinEntry& b = (*idx.basins)[id];
+        std::vector<uint8_t> mask;
+        if (buildMaskAtDatum(idx, id, tx, ty, b.surfaceMm, mask)) {
+            ++maskCount_;
+        }
+        auto ins = idx.masks.emplace(id, std::move(mask));
+        return ins.first->second;
+    }
+
+    // The one mask pipeline, at a caller-chosen datum (tides plan C4). This IS
+    // the body maskFor always had -- prewarm, lattice accessor, spline-rescue
+    // ground, v2 floor re-seed -- factored so the baked mask and the at-datum
+    // mask cannot express different rules. `datumMm == b.surfaceMm` reproduces
+    // the shipped behaviour byte for byte; any other datum runs the identical
+    // fill against a BasinEntry copy whose surfaceMm is the one changed field.
+    // False (out cleared) when the tile's blocks would not decode -- counted in
+    // unresolved_, because missing water must be a number, not a shrug.
+    bool buildMaskAtDatum(TileIndex& idx, uint16_t id, int32_t tx, int32_t ty, int32_t datumMm,
+                          std::vector<uint8_t>& out) {
+        const BasinEntry& b = (*idx.basins)[id];
         const uint32_t size = tiles_.tileSize();
         const int64_t ox = int64_t(tx) * size, oy = int64_t(ty) * size;
         // Every cell of the bbox is about to be read, so decode the blocks
         // once here instead of block-faulting inside the fill.
         if (!tiles_.prewarm(ox + b.bboxX0, oy + b.bboxY0, ox + b.bboxX1, oy + b.bboxY1)) {
             ++unresolved_;
-            auto ins = idx.masks.emplace(id, std::vector<uint8_t>{});
-            return ins.first->second;
+            out.clear();
+            return false;
         }
         auto lattice = [&](int32_t lx, int32_t ly) {
             return tiles_.elevationMm(ox + lx, oy + ly);
@@ -685,15 +880,18 @@ private:
                 fLy = int32_t(wy);
             }
         }
-        std::vector<uint8_t> mask;
-        lakeExtentFillRescued(b, lattice, ground, fLx, fLy, mask);
-        ++maskCount_;
-        auto ins = idx.masks.emplace(id, std::move(mask));
-        return ins.first->second;
+        // THE ONE CHANGED NUMBER: the fill's rules all read b.surfaceMm, so the
+        // at-datum fill hands them a copy with that field moved. At the baked
+        // datum the copy is bit-identical to the row and so is the mask.
+        BasinEntry atDatum = b;
+        atDatum.surfaceMm = datumMm;
+        lakeExtentFillRescued(atDatum, lattice, ground, fLx, fLy, out);
+        return true;
     }
 
     FineTileSampler& tiles_;
     IBasinDatumSource* datum_ = nullptr;
+    ITidalBasinOracle* tidal_ = nullptr;
     std::unordered_map<uint64_t, TileIndex> index_;
     size_t maskCount_ = 0;
     uint64_t unresolved_ = 0;
@@ -1311,6 +1509,19 @@ public:
     const std::vector<uint8_t>* extentMaskFor(int32_t tx, int32_t ty, uint16_t id) override {
         return lakes_.extentMaskFor(tx, ty, id);
     }
+    // The tidal half belongs to the lakes wholesale, exactly like the sheet
+    // half above and for the same reason: a river reach has no basin row for
+    // an oracle to qualify or a datum-following extent to describe.
+    const std::vector<uint8_t>* extentMaskAtDatum(int32_t tx, int32_t ty, uint16_t id,
+                                                  int32_t datumMm) override {
+        return lakes_.extentMaskAtDatum(tx, ty, id, datumMm);
+    }
+    bool basinAtVoxel(int64_t vx, int64_t vy, int32_t& outTx, int32_t& outTy,
+                      uint16_t& outId) override {
+        return lakes_.basinAtVoxel(vx, vy, outTx, outTy, outId);
+    }
+    void setTidalOracle(ITidalBasinOracle* oracle) override { lakes_.setTidalOracle(oracle); }
+    void invalidateTidalAdmissions() override { lakes_.invalidateTidalAdmissions(); }
     uint32_t tilePixels() const override { return lakes_.tilePixels(); }
     int32_t pixelSizeMm() const override { return lakes_.pixelSizeMm(); }
     // The ledger datum belongs to the lakes for the same reason the registry
@@ -1388,8 +1599,23 @@ private:
 // datum is a beach with zero depth of water over it, and answering
 // kSeaLevelMm there would ask `waterFillUnits` for a zero remainder it already
 // documents as unreachable.
+//
+// THE TIDE ARRIVES AS AN ARGUMENT, NEVER AS A CHANGE TO kSeaLevelMm
+// (docs/water-ocean-tides-plan-2026-09-04.md Phase A4). `seaLevelNowMm` is
+// the datum standing RIGHT NOW — kSeaLevelMm plus the engine's quantised
+// tide.h offset — and every rule above holds against it verbatim: the ground
+// is still the worldgen amplified surface (a dug pit stays dry at every state
+// of the tide), and strictly-below still makes the exact-on-the-datum column
+// a zero-depth beach — which at low water is precisely the exposed foreshore.
+// kSeaLevelMm itself, with its constexpr derived gates (caves.h, karst.h, the
+// biome beach band) and the bake it keys, never moves; the one-argument form
+// below IS the geological datum, as a forwarder, so every shipped caller and
+// pinned test stays bit-identical.
+constexpr int32_t oceanSurfaceMmAt(int32_t groundMm, int32_t seaLevelNowMm) {
+    return groundMm < seaLevelNowMm ? seaLevelNowMm : kNoWaterMm;
+}
 constexpr int32_t oceanSurfaceMmAt(int32_t groundMm) {
-    return groundMm < kSeaLevelMm ? kSeaLevelMm : kNoWaterMm;
+    return oceanSurfaceMmAt(groundMm, kSeaLevelMm);
 }
 
 // The one datum for a column: the highest of what the bake put there (a lake
@@ -1408,11 +1634,23 @@ constexpr int32_t oceanSurfaceMmAt(int32_t groundMm) {
 // column"; the sea is not baked, it is the datum itself, and a second sampler
 // would have to be merged with the first by exactly this max() anyway — one
 // mechanism, expressed once.
-constexpr int32_t implicitWaterDatumMm(int32_t bakedSurfaceMm, int32_t groundMm) {
-    const int32_t sea = oceanSurfaceMmAt(groundMm);
+//
+// AND IT IS WHY THE TIDE THREADS THROUGH HERE AND NOWHERE ELSE: the
+// three-argument form takes the same `seaLevelNowMm` as `oceanSurfaceMmAt`,
+// so a client that moves the sea's datum moves it for the ImplicitFn, the
+// depth query and the surface contract in ONE argument — there is no second
+// spelling of "where the sea stands" for the cadences to disagree over. The
+// two-argument form is the geological datum, as a forwarder, bit-identical
+// for every shipped caller and test.
+constexpr int32_t implicitWaterDatumMm(int32_t bakedSurfaceMm, int32_t groundMm,
+                                       int32_t seaLevelNowMm) {
+    const int32_t sea = oceanSurfaceMmAt(groundMm, seaLevelNowMm);
     if (bakedSurfaceMm == kNoWaterMm) return sea;
     if (sea == kNoWaterMm) return bakedSurfaceMm;
     return bakedSurfaceMm > sea ? bakedSurfaceMm : sea;
+}
+constexpr int32_t implicitWaterDatumMm(int32_t bakedSurfaceMm, int32_t groundMm) {
+    return implicitWaterDatumMm(bakedSurfaceMm, groundMm, kSeaLevelMm);
 }
 
 // The composed predicate of §5.1, as one function so the client's binding site

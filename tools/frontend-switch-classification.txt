@@ -217,6 +217,7 @@ VoxelUINoAssets
 VoxelLoadGateMaxRing
 VoxelLoadMinHold
 VoxelLoadMaxHold
+VoxelLoadTheatre
 
 # --- 2026-08-23: far-clipmap appearance (docs/backlog.md 0.0d) ---------------
 # All tuning, diagnosis or configuration; none of them drives the run, so all of

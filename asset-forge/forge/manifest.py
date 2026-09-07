@@ -155,6 +155,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import biomes as biomelib
+from . import categories as _catlib
+from . import kinds as _kindlib
 from . import spec as sm
 
 MAGIC = b"VXM1"
@@ -229,6 +231,51 @@ WATER_KIND_TO_MASK = {
 
 KINDS_ON_SCATTER = ("tree", "bush", "rock", "grass", "reed", "flower")
 KINDS_TERRAIN = ("tree", "rock")
+
+# ENTITY KINDS ARE NOT WORLD CONTENT AND ARE REFUSED BY NAME (ADR-0010).
+#
+# Derived from `forge/kinds.py`, not typed here, because a second copy of the
+# list is exactly the drift this file's own header warns about.
+#
+# WHY IT IS NOT ENOUGH TO LEAVE THEM OUT OF `KIND_ORDER`. They already are out
+# of it -- that tuple mirrors `assetmanifest.h` and is the ENGINE's append-only
+# contract, so adding a row to it is an engine change and not an authoring one
+# -- and `species_record` would therefore refuse a canoe anyway, as "unknown
+# kind 'artifact'". That refusal is correct and its REASON is wrong, and a wrong
+# reason in an export report is how a deliberate exclusion gets "fixed" by
+# somebody appending the row. Refusing it by name says the thing that is true:
+# an entity has its own pitch and its own transform, it is never indexed by
+# chunk coordinate, and there is nothing for the scatter to place.
+KINDS_ENTITY = tuple(k.key for k in _kindlib.KINDS if k.lattice == "entity")
+
+# THE TAXONOMY AND THIS FILE'S TUPLES ARE THE SAME TWO LINES, AND THIS IS WHERE
+# THAT IS CHECKED.
+#
+# `forge/categories.py` claims that "environment" IS the scatter set and
+# "craftable" IS the entity set. If that claim is only true in a docstring then
+# the day somebody adds a kind to one of these tuples, the app's grouping, the
+# library index and the game's craftable list all keep the old answer with
+# nothing anywhere reporting it -- a derived fact in two places, which is this
+# repo's documented failure mode and the reason `ground.py` asserts on the plant
+# menus and `envelope.py` on the crown shapes.
+#
+# It lives HERE and not in categories.py because the import runs one way:
+# categories imports `kinds` and nothing else, manifest imports both.
+assert set(_catlib.BY_KEY["environment"].kinds) == set(KINDS_ON_SCATTER), (
+    "forge/categories.py 'environment' and manifest.KINDS_ON_SCATTER disagree "
+    f"about which kinds the per-chunk scatter places: "
+    f"{sorted(set(_catlib.BY_KEY['environment'].kinds) ^ set(KINDS_ON_SCATTER))}")
+assert set(_catlib.BY_KEY["craftable"].kinds) == set(KINDS_ENTITY), (
+    "forge/categories.py 'craftable' and manifest.KINDS_ENTITY disagree about "
+    f"which kinds are entities: "
+    f"{sorted(set(_catlib.BY_KEY['craftable'].kinds) ^ set(KINDS_ENTITY))}")
+# And the manifest's own append-only KIND_ORDER must cover exactly the kinds
+# whose category says they get a species record. This is the check that fires
+# if a future category is added without deciding whether it is published.
+assert set(KIND_ORDER) == {k for c in _catlib.CATEGORIES if c.in_manifest
+                           for k in c.kinds}, (
+    "forge/categories.py's `in_manifest` flags and manifest.KIND_ORDER "
+    "disagree about which kinds are published to the engine")
 LAYER_NOT_SCATTERED = 255
 
 
@@ -650,6 +697,44 @@ class ExportReport:
 # A bank seed file is <name>-NNNN.vxa; the NNNN is the seed.
 SEED_FILE_RE = re.compile(r"-(\d{4})\.vxa$")
 
+# A kept library entry is library/<species>/<species>-NNNN/; NNNN is the seed.
+KEPT_DIR_RE = re.compile(r"-(\d{4})$")
+
+
+def kept_seeds(library_root, name: str) -> list[int]:
+    """The seeds the owner KEPT for a species -- the game set, off the disk.
+
+    THE KEEP-DRIVEN MODEL (owner ruling 2026-09-05): keep is the one human
+    gesture; the library's kept entries ARE the species' published bank, and
+    the curation block's seed list is a derived record of this set, never a
+    surface a person edits. This function is the one derivation, shared by
+    the server (which re-syncs the block on every keep/unkeep) and by
+    tools/publish.py (which re-syncs before exporting, library wins) --
+    the same one-function-two-callers law as `curated_inputs` above.
+
+    Counted off the disk like every bank number in this file: an entry needs
+    its tree.vxa present (a half-written keep is not content), and IMPORTED
+    entries are excluded -- no (spec, seed) regenerates an import, so it can
+    never be a bank seed the exporter could bake."""
+    d = Path(library_root) / name
+    out: set[int] = set()
+    if not d.is_dir():
+        return []
+    for sub in sorted(d.iterdir()):
+        m = KEPT_DIR_RE.search(sub.name)
+        if not m or not sub.name.startswith(name + "-"):
+            continue
+        if not (sub / "tree.vxa").is_file():
+            continue
+        try:
+            meta = json.loads((sub / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        if meta.get("imported"):
+            continue
+        out.add(int(m.group(1)))
+    return sorted(out)
+
 
 @dataclass
 class CurationSummary:
@@ -880,8 +965,15 @@ def folded_top_per_mille(spec: dict, layer: int, top_weight_pm: "int | None" = N
 
 
 def species_record(spec: dict, name: str, seeds_baked: int,
-                   report: ExportReport) -> bytes | None:
+                   report: ExportReport, pitch_um: bool = False) -> bytes | None:
     kind = sm.get(spec, "kind")
+    if kind in KINDS_ENTITY:
+        report.unplaceable.append(
+            (name, f"{kind} is an ENTITY kind (ADR-0010) in category "
+                   f"{_catlib.BY_KIND.get(kind)!r}: own pitch, own transform, "
+                   f"never composed into the world. Not a gap in this table -- "
+                   f"do not add it to KIND_ORDER."))
+        return None
     if kind not in KIND_ORDER:
         report.unplaceable.append((name, f"unknown kind {kind!r}"))
         return None
@@ -928,7 +1020,9 @@ def species_record(spec: dict, name: str, seeds_baked: int,
         return None
 
     res_cm = float(sm.get(spec, "resolution_cm"))
-    voxel_mm = int(round(res_cm * 10.0))
+    if not pitch_um and not float(res_cm * 10.0).is_integer():
+        raise ValueError("Fractional species pitch requires a VXM v3 micrometre record")
+    voxel_mm = int(round(res_cm * (10000.0 if pitch_um else 10.0)))
     lo, hi, radius_mm = _kind_group_params(spec, kind)
 
     encoded_name = name.encode("ascii")
@@ -1026,11 +1120,13 @@ def encode(specs: "list[tuple[str, dict]]",
     rule_names = sorted(rules)
     rule_index = {n: i for i, n in enumerate(rule_names)}
 
+    pitch_um = any(not float(float(sm.get(s,"resolution_cm"))*10).is_integer() for _,s in specs)
+    version = 3 if pitch_um else 2
     records = []
     attachments: list[tuple[int, int, int]] = []  # (species_idx, biome_id, rule_idx)
     problems: list[str] = []
     for name, spec in sorted(specs, key=lambda t: t[0]):
-        rec = species_record(spec, name, int(seeds_baked.get(name, 0)), report)
+        rec = species_record(spec, name, int(seeds_baked.get(name, 0)), report, pitch_um=pitch_um)
         if rec is None:
             continue
         idx = len(records)
@@ -1072,7 +1168,7 @@ def encode(specs: "list[tuple[str, dict]]",
     report.attachments = len(attachments)
 
     header = MAGIC + struct.pack(
-        "<IIIIIII", MANIFEST_VERSION, len(BIOME_ORDER), len(LAYERS),
+        "<IIIIIII", version, len(BIOME_ORDER), len(LAYERS),
         len(records), SPECIES_RECORD_BYTES, len(rule_names), len(attachments))
     assert len(header) == HEADER_BYTES
 
@@ -1115,7 +1211,7 @@ def decode(blob: bytes) -> dict:
         raise ValueError("bad magic")
     version, biomes, layers, count, rec_bytes, rule_count, attach_count = \
         struct.unpack_from("<IIIIIII", blob, 4)
-    if version != MANIFEST_VERSION:
+    if version not in (2,3):
         raise ValueError(f"version {version}")
     off = HEADER_BYTES
     names = []
@@ -1161,7 +1257,7 @@ def decode(blob: bytes) -> dict:
             "water_kind": WATER_ORDER[rec[4]],
             "water_mask": rec[5],
             "seeds_baked": rec[6],
-            "voxel_size_mm": rec[7],
+            "voxel_size_mm": rec[7] / 1000.0 if version == 3 else rec[7],
             "weights": rec[8:18],
             "abundance_q10": rec[18],
             "cluster_q10": rec[19],

@@ -89,6 +89,24 @@ public:
 	// that is not about water. See Tick() and GetCameraLocationUU().
 	int32 GetDeferredGatherTicks() const { return DeferredGatherTicks; }
 
+	// B1 WAVE TESSELLATION, as a number a leg can read. The greedy rectangles a
+	// sheet is made of span hundreds of metres, so a material's World Position
+	// Offset moves FOUR vertices and the surface stays flat -- the wave is
+	// authored, computed, and invisible. Tessellation inside the camera disc is
+	// what gives WPO somewhere to push. That is a claim about the IMAGE, so it
+	// gets a counter that can fail: zero here with the disc over a lake means
+	// the waves are not being drawn no matter what the material graph says.
+	int32 GetTessellatedVertCount() const { return TotalTessVerts; }
+
+	// B3 TIDE x SHEETS. TideNudgedSheets counts component transform updates
+	// (the cheap path -- the mesh does not change, it moves); TideRebuilds
+	// counts basins whose datum drifted past kTideRebuildDriftUU and had to be
+	// re-meshed at the new surface. Both are cumulative. A tide leg with
+	// TideNudgedSheets stuck at 0 while the subsystem reports datum steps is
+	// the sheet half of the feature silently not engaging.
+	int32 GetTideNudgedSheets() const { return TideNudgedSheets; }
+	int32 GetTideRebuilds() const { return TideRebuilds; }
+
 private:
 	// One basin's mesh and the state that says whether it is still current.
 	struct FSheet
@@ -134,7 +152,33 @@ private:
 		// Set once the basin's tile refused to decode. Retried never, counted
 		// always -- see the .cpp.
 		bool bUnresolved = false;
+		// THE GATHER'S DATUM. Written once by GatherLakeSheetBasinsInTile and
+		// NEVER mutated afterwards, because the re-gather's adoption test
+		// compares it field-for-field against a freshly gathered basin (see
+		// AdoptableSheets). A tide that moved this would fail that compare on
+		// every basin and turn a 98%-adopting gather into a full rebuild drain
+		// -- the 22.7 ms first-build hitch, back, once per tide step.
 		double SurfaceZUU = 0.0;
+		// THE DATUM THE MESH WAS ACTUALLY BUILT AT, which is SurfaceZUU plus
+		// whatever the tide was at build time. The per-tick nudge is measured
+		// from THIS, so a basin that has been re-meshed at high water does not
+		// then get the whole tide offset applied a second time as a transform.
+		double BuiltSurfaceZUU = 0.0;
+		// Vertices this basin contributed to the tessellated (fine-cell) total.
+		// Held per basin so the actor-wide count survives one basin rebuilding:
+		// the same delta bookkeeping RectCount uses.
+		int32 TessVerts = 0;
+		// THE TESS RADIUS THIS MESH WAS ACTUALLY BUILT AT, and it exists because
+		// the radius stopped being a launch constant. Every other staleness term
+		// in the rebuild trigger is a function of the camera CELL, so a parked
+		// camera correctly rebuilds nothing -- which would have made "Water Wave
+		// Detail" do nothing at all until the player walked 30 m. Comparing this
+		// against the live radius is what makes the toggle a toggle.
+		//
+		// -1 IS "NEVER BUILT", distinct from 0 ("built with the disc off"): a
+		// basin whose mesh really was built at radius 0 must not be counted
+		// stale forever.
+		double TessRadiusM = -1.0;
 		double MinXUU = 0.0, MinYUU = 0.0, MaxXUU = 0.0, MaxYUU = 0.0;
 		// The near-field hole this mesh was cut with, so a moving camera only
 		// rebuilds the one basin whose water it is standing in.
@@ -212,6 +256,64 @@ private:
 	// water at this datum (too far above or below it) and no hole is owed.
 	bool HoleForDatum(double SurfaceZUU, FBox2D& OutHoleUU) const;
 
+	// ---- B1: THE WAVE TESSELLATION DISC ------------------------------------
+	//
+	// The square, in world UU, inside which the finest band emits fine cells
+	// instead of greedy rectangles; false when tessellation is off for this
+	// camera (radius 0, or no camera).
+	//
+	// A SQUARE, AND THE PLAN CALLS IT A DISC. Every range test in this actor is
+	// already L-infinity -- IsBandedAtCamera takes FMath::Max(DX, DY) against
+	// the band radius, and the LOD bands themselves are square annuli, because
+	// the rectangles being decimated are axis-aligned and a circular boundary
+	// through them cannot be expressed as rectangles. A round disc would have
+	// to be approximated per cell, and a per-cell radius test that rejects a
+	// cell leaves a HOLE in the sheet -- the one defect class this actor exists
+	// to remove. So the disc is the SQUARE of the same radius: it over-covers
+	// the circle and can never under-cover it.
+	//
+	// CENTRED ON THE SNAPPED CAMERA CELL, not the camera (SnappedCamXY), so the
+	// tessellated geometry is a pure function of LodKey exactly like the bands
+	// are. Centre it on the raw camera and every basin in the disc re-meshes on
+	// every frame the camera moves -- 1-per-tick round robin or not, that is a
+	// permanent rebuild treadmill, and the cell phase would flap under a
+	// stationary-but-jittering camera.
+	bool TessBoxForCamera(const FVector& CamUU, FBox2D& OutBoxUU) const;
+
+	// THE TESSELLATION RADIUS, IN METRES, AS OF RIGHT NOW -- read from
+	// voxel.Water.WaveTessRadiusM every time it is asked rather than latched
+	// into a member at BeginPlay. It is a function and not a field because the
+	// setting behind it ("Water Wave Detail") is a runtime toggle: latching
+	// would make a mid-session flip do nothing, which is the silent kind of
+	// nothing this file has been bitten by repeatedly.
+	//
+	// IT ALSO OWNS THE CLAMP. Past FineBandRadiusM the sheet is no longer
+	// meshing at one fine pixel, so cells emitted out there would not be the
+	// finest band's; clamping here rather than at the parse site means the
+	// invariant holds for a value set from the console or the settings panel
+	// too, not only for one set from the command line.
+	double WaveTessRadiusMNow() const;
+
+	// ---- B3/C3: WHERE THIS BASIN'S SURFACE IS *NOW* ------------------------
+	//
+	// Phase C DID replace the body, exactly as the Phase-B note here promised:
+	// this is now a forwarder to UVoxelWaterSubsystem::GetBasinDatumNowZUU --
+	// the per-basin query through the ONE datum seam (basin ledger wrapped by
+	// vxc::TidalDatumSource) -- so an oracle-qualified rock pool rides the
+	// tide while connected and holds at its sill when cut off, and an inland
+	// lake answers its ledger datum untouched. Phase B's "standing at the sea
+	// datum +-5 UU" placeholder is gone. Everything here that consumes a
+	// surface height goes through this one function, which is what makes the
+	// sheet structurally unable to disagree with the near field about where a
+	// pool stands.
+	double CurrentSurfaceZUUForBasin(const FSheet& Sheet, const UVoxelWaterSubsystem* Water) const;
+
+	// Applies the tide to every resident sheet as a component transform, and
+	// flags the ones whose drift has outgrown a transform for a real rebuild.
+	// Does NOTHING -- not even a walk of Sheets -- on a tick where the datum
+	// has not moved, which is every tick outside a tide quantum crossing.
+	void ApplyTideNudge(const UVoxelWaterSubsystem* Water);
+
 	bool GetCameraLocationUU(FVector& Out) const;
 
 	UPROPERTY(Transient)
@@ -254,14 +356,36 @@ private:
 	// no longer displaces the water colour exactly. That is why the material's
 	// own default is 0.85 and not 1.0.
 	//
-	// UNSET = the material asset untouched and NO instance created, so a
-	// control capture is byte-identical to every capture in the archive.
+	// SINCE THE B4 SHORE CLIP LANDED, THIS INSTANCE ALWAYS EXISTS: BeginPlay
+	// creates the one shared sheet MID unconditionally to arm
+	// WaterShoreClipEnabled=1 (the asset ships it 0 -- bathy validity is not a
+	// wet test, and the sheet is the clip's sole legitimate consumer; see the
+	// BeginPlay block). The diagnostic switches write onto that same instance,
+	// so their control arms are VALUE-identical to the material defaults
+	// rather than instance-free -- judge an arm by its logged parameter
+	// values, never by whether a MID exists. (-VoxelWaterShoreClip=0 is the
+	// clip's own control arm; captures from before 2026-09-04 predate the MID
+	// and stay comparable because clip 0 equals the bare asset.)
 	UPROPERTY(Transient)
 	TObjectPtr<class UMaterialInstanceDynamic> SheetMaterialOverride;
 
 	TArray<FSheet> Sheets;
 	int32 TotalRects = 0;
 	int32 UnresolvedBasins = 0;
+	// Sum of FSheet::TessVerts over the resident set. See
+	// GetTessellatedVertCount for why this is an instrument and not a stat.
+	int32 TotalTessVerts = 0;
+	int32 TideNudgedSheets = 0;
+	int32 TideRebuilds = 0;
+
+	// The tide offset (SeaSurfaceZNowUU - SeaLevelZUU) the sheets are currently
+	// standing at. Held so ApplyTideNudge can return in three instructions on
+	// the overwhelming majority of ticks: the subsystem's DATUM is quantised
+	// (25 mm) and rate-limited (2 s), so it is unchanged on essentially every
+	// frame, and walking ~500 basins to write an unchanged SetRelativeLocation
+	// would dirty ~500 render transforms per tick for no visual change at all.
+	double AppliedTideOffsetUU = 0.0;
+	bool bTideOffsetApplied = false;
 
 	// Basin scan radius in UU. Defaults to the clipmap's own outer half-extent so
 	// the sheet covers exactly the ground the far terrain draws -- water stops
@@ -317,6 +441,39 @@ private:
 	// never drops the fine band below ~81 m, i.e. always more than three times
 	// the coverage the voxel path had. -VoxelLakeSheetFineM moves it.
 	double FineBandRadiusM = 96.0;
+
+	// ---- B1: HOW FAR THE WAVES REACH, IN METRES -----------------------------
+	//
+	// The half-extent of the tessellation square (TessBoxForCamera). Inside it
+	// the finest band emits ~1.875 m cells so the material's WPO has vertices
+	// to move; outside it the greedy rectangles are unchanged and the surface
+	// is flat, which is correct because the material fades WPO to ZERO before
+	// this edge.
+	//
+	// 80 m, AND THE NUMBER IS NOT FREE. It is bounded above by two things that
+	// are not ours: the material's WPO distance fade (B2, 55 -> 72 m -- past 72
+	// m the displacement is identically zero, so tessellation past it buys
+	// vertices that cannot move), and FineBandRadiusM (96 m -- past that the
+	// sheet is not meshing at one fine pixel any more and the cells would not
+	// be the finest band's). 80 m sits between them: comfortably outside the
+	// fade so the fade never lands on the tessellation boundary, comfortably
+	// inside the fine band so the finest-band invariant holds by construction.
+	// WaveTessRadiusMNow() CLAMPS to FineBandRadiusM and BeginPlay says so when
+	// the command line asked for more -- a silently clamped switch is
+	// indistinguishable from a mis-spelled one.
+	//
+	// THERE IS NO MEMBER HERE ANY MORE (2026-09-05). The radius lives in
+	// voxel.Water.WaveTessRadiusM, default 80, because the player-facing "Water
+	// Wave Detail" row has to be able to move it mid-session; a member latched
+	// at BeginPlay could only ever be moved by relaunching. -VoxelWaveTessM
+	// still works and still means the same thing -- it now SETS that cvar at
+	// BeginPlay instead of being read into a field -- and 0 is still the honest
+	// OFF control (no tessellated vertex is emitted at all, and the sheet is
+	// byte-identical to every capture taken before this feature).
+
+	// Rate limit for the tessellation census line: one line per camera cell,
+	// not one per rebuild. See the log site.
+	FIntPoint LastTessLogKey = FIntPoint(MIN_int32, MIN_int32);
 
 	// Camera hysteresis for the band centre, in fine pixels. The bands re-centre
 	// when the camera crosses a cell of this size, not when it moves -- the same

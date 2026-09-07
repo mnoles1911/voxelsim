@@ -1,0 +1,111 @@
+{
+  "id": "glider-0001",
+  "species": "glider",
+  "kind": "artifact",
+  "seed": 1,
+  "spec_hash": "a4fb49eb98013bdd",
+  "stats": {
+    "seed": 1,
+    "spec_hash": "a4fb49eb98013bdd",
+    "kind": "artifact",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 2.5,
+    "height_m": 1.23,
+    "length_m": 3.3,
+    "footprint_m": [
+      3.3,
+      5.68
+    ],
+    "grid_mb": 2.8,
+    "extent_vox": [
+      132,
+      227,
+      49
+    ],
+    "vox_models_needed": 1,
+    "voxels": 35701,
+    "by_material": {
+      "16": 1344,
+      "36": 7127,
+      "39": 21477,
+      "46": 5753
+    },
+    "ground_contact": 39,
+    "ms_grow": 1.6,
+    "ms_raster": 157.5,
+    "steps": [
+      {
+        "step": "sail panel",
+        "added": 30288,
+        "repainted": 0,
+        "must_change": true,
+        "note": "2 voxel fabric",
+        "voxels_after": 30288
+      },
+      {
+        "step": "sail panels",
+        "added": 0,
+        "repainted": 7328,
+        "must_change": true,
+        "note": "2 of 7 panels, 24% of the sail",
+        "voxels_after": 30288
+      },
+      {
+        "step": "leading-edge spars",
+        "added": 2779,
+        "repainted": 748,
+        "must_change": true,
+        "note": "2 x 4.5 cm radius",
+        "voxels_after": 33067
+      },
+      {
+        "step": "keel spar",
+        "added": 510,
+        "repainted": 598,
+        "must_change": true,
+        "note": "3.05 m, 45 cm aft of the sail",
+        "voxels_after": 33577
+      },
+      {
+        "step": "cross-bar",
+        "added": 94,
+        "repainted": 338,
+        "must_change": true,
+        "note": "at 42% of the half-span",
+        "voxels_after": 33671
+      },
+      {
+        "step": "control frame",
+        "added": 662,
+        "repainted": 0,
+        "must_change": true,
+        "note": "1.15 m drop, 0.95 m base bar",
+        "voxels_after": 34333
+      },
+      {
+        "step": "seat",
+        "added": 1368,
+        "repainted": 0,
+        "must_change": true,
+        "note": "0.80 m on a strap",
+        "voxels_after": 35701
+      }
+    ],
+    "silent_steps": [],
+    "hollow_frac": 0.4625,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 258.9
+  },
+  "problems": [],
+  "vox_models": 1
+}

@@ -335,6 +335,8 @@ public:
 	// budgeted on subsequent ticks. Game thread only. Returns true if
 	// anything was edited.
 	bool TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels);
+	// Non-mutating target, using the same ray and grid anchoring as TryDig.
+	bool GetDigPreview(const FVector& CameraLocation, const FVector& CameraDirection, int32 SizeVoxels, FBox& OutBounds) const;
 
 	// Places a grid-aligned SizeVoxels^3 cube of MaterialId, grid-snapped
 	// against the face of the first solid voxel hit by the same ray (biased
@@ -771,6 +773,10 @@ public:
 	// atomic tmp+rename write, same authority-only refusal on NM_Client; the
 	// only difference is where the bytes land. Creates the parent directory.
 	bool SaveWorldToPath(const FString& Path) const;
+	// Immutable, matching terrain/debris snapshot for background save IO.
+	// Must run on the game thread; does not report a completed save.
+	bool CaptureSaveSnapshot(TArray<uint8>& Terrain,TArray<uint8>& Detached) const;
+	bool CaptureTerrainSnapshot(TArray<uint8>& Terrain) const;
 
 	// P7-a: THE TERRAIN GPU POOL, BY IDENTITY, NOT BY ORDINAL.
 	//

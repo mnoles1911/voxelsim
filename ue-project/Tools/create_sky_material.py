@@ -546,6 +546,152 @@ SCALAR_PARAMS = [
     # The subsystem writes it LAST, after the values it vouches for, so a
     # consumer can never see the flag raised over stale wind.
     ("WindFieldValid", 0.0),
+    # --- THE TIDE (ocean/tides plan Phase A3) -------------------------------
+    #
+    # Written EVERY TICK by UVoxelWaterSubsystem's tide state
+    # (docs/water-ocean-tides-plan-2026-09-04.md A2/A3), existence-checked at the
+    # write site the way VoxelRippleField.cpp:477-494 does it, so a collection
+    # regenerated from a revision older than this block fails LOUDLY in C++
+    # rather than writing into nothing.
+    #
+    # THE FOUR NAMES ARE AN INTERFACE AND THE SPELLING IS THE WHOLE CONTRACT.
+    # They are consumed by a different lane than the one that writes them; there
+    # is no compiler between the two halves, only these strings. A typo on either
+    # side does not fail -- an unresolved CollectionParameter compiles to a
+    # CONSTANT (MaterialExpressions.cpp:17179-17193) and a C++ set on a name the
+    # collection does not have is a no-op unless the existence check catches it.
+    #
+    #   TideOffsetUU        the CONTINUOUS tide offset, UE units, signed. This is
+    #                       the presentation half: it moves every tick and is
+    #                       deliberately NOT the quantised datum the meshing side
+    #                       steps on (25 mm quantum, 2 s rate limit -- plan A2).
+    #                       A material that displaces water by this gets a smooth
+    #                       waterline; a material that keyed off the quantised
+    #                       datum instead would visibly stair-step.
+    #   SeaSurfaceZUU       the ocean's CURRENT surface Z in world UU, i.e.
+    #                       sea level + TideOffsetUU, published so a material
+    #                       never has to reconstruct a datum from a constant it
+    #                       cannot see (kSeaLevelMm is a C++ constexpr).
+    #   TideNormPhase       0..1 through the dominant oscillator's cycle. For
+    #                       cosmetics that want to know flood from ebb without
+    #                       differentiating an offset in a shader.
+    #   TideVelocityUUPerS  d(offset)/dt, UU per second, signed. Positive is a
+    #                       rising tide.
+    #
+    # ALL FOUR DEFAULT TO 0.0, which is the same discipline as BathyFieldValid,
+    # RippleFieldGain and WindFieldValid above: an undriven collection must fail
+    # to a KNOWN-GOOD picture, not to a plausible wrong one. For three of them 0
+    # is also the physically correct neutral -- no offset, no phase, no velocity,
+    # i.e. exactly today's static sea.
+    #
+    # SeaSurfaceZUU IS THE ONE THAT IS NOT NEUTRAL AT 0, AND IT IS STILL 0.
+    # The real sea surface is at kSeaLevelMm converted to UU, which is not zero,
+    # so an undriven SeaSurfaceZUU is a WRONG plane rather than an absent one.
+    # It is left at 0 anyway and the rule is stated instead: NO MATERIAL MAY USE
+    # SeaSurfaceZUU AS A DATUM. It is a transport for the C++ ocean/mesh lanes
+    # (AVoxelOceanActor's plane Z, the sheet's per-basin nudge), which have the
+    # real datum in scope and only need this to agree with the shader about what
+    # they published. If a future material genuinely needs the sea plane in a
+    # shader, this table needs a fifth parameter -- a TideValid flag -- so that
+    # "not published" is distinguishable from "published as zero". Adding one
+    # silently in a shader by testing `SeaSurfaceZUU != 0` would be a guess.
+    ("TideOffsetUU", 0.0),
+    ("SeaSurfaceZUU", 0.0),
+    ("TideNormPhase", 0.0),
+    ("TideVelocityUUPerS", 0.0),
+    # --- CAUSTICS (ocean/tides plan Phase F1) -------------------------------
+    #
+    # The global caustic gain, read by water_caustics_graph's consumers
+    # (M_VoxelTerrain, M_VoxelClipmap, M_Underwater). THE ENGINE-SIDE
+    # CONTRACT: UVoxelWaterSubsystem pushes the float cvar
+    # `voxel.Water.Caustics` into this parameter every tick, alongside the
+    # tide parameters above and with the same existence-checked write, so the
+    # cvar is one switch for every floor at once and 0 is a pixel-identical
+    # off. (That push is the F1 engine half; until it lands, this default
+    # holds.)
+    #
+    # DEFAULT 1.0, WHICH IS A DELIBERATE DEPARTURE from the Valid/Gain = 0
+    # discipline every block above follows, and the difference is what those
+    # zeros protect against. BathyFieldInvSize 0 and RippleFieldGain 0 guard
+    # WINDOW MAPPINGS -- an undriven nonzero would shade the world from one
+    # smeared texel, a plausible-looking wrong picture. This is a bounded
+    # cosmetic gain on a term that is already gated by sun altitude,
+    # submersion, depth absorption and a 64 m distance fade: undriven-at-1 is
+    # instantly VISIBLE (caustics on every sunlit floor), which is the
+    # fails-visibly-not-plausibly half of the same rule -- and it is what
+    # lets the F1 gate captures ("pattern on the floor at noon") be taken
+    # before the engine half exists. If the owner's verdict wants the
+    # doctrine-strict default-off arm instead, this one number goes to 0.0
+    # and the cvar becomes the only way in.
+    ("CausticIntensity", 1.0),
+    # --- WAVE TIME SCALE (owner live-play verdict, 2026-09-05) --------------
+    #
+    # "The surface wave effects are moving way too fast still." Speed cannot
+    # be judged from stills, so this is a LIVE knob: a multiplier on the time
+    # driving the wave field, applied INSIDE water_wave_graph.build_wave_field
+    # so both consumers of the field (M_WaterVoxel and M_Ocean) slow together
+    # from one number -- two water surfaces meeting at a coastline with two
+    # different clock rates would shear at the seam.
+    #
+    # THE ENGINE-SIDE CONTRACT: UVoxelWaterSubsystem pushes the float cvar
+    # `voxel.Water.WaveTimeScale` (default 1.0) into this parameter every
+    # tick, same existence-checked pattern as CausticIntensity above. The
+    # owner turns the CVAR in his console and reports the number he likes;
+    # that number then becomes the cvar's default in C++. THIS default stays
+    # 1.0 -- the neutral multiplier, i.e. exactly today's speed -- so an
+    # undriven collection fails to the known-current picture, and the tuned
+    # value lives in one place (the cvar) rather than two.
+    #
+    # THE MAP (full version at water_wave_graph.WAVE_TIME_SCALE_PARAM, amended
+    # same-day by the owner's "even value of 0 still leaves this very fast
+    # racing wave effect" finding): the octave field is scaled IN TIME; the
+    # interactive RIPPLE field's contribution is GATED IN AMPLITUDE by the
+    # same parameter (its animation lives in the C++ sim's render target,
+    # which a material cannot slow -- so scale 0 is a provably still surface,
+    # and the ripple's true SPEED knob is the sim's step cadence, engine
+    # side); the CAUSTIC pan stays independent (its own CausticSpeed
+    # material parameter).
+    ("WaveTimeScale", 1.0),
+    # --- 2026-09-05 LATE BLOCK: marcher ambient + foam v2 -------------------
+    #
+    # THE REGEN CONSEQUENCE, STATED FIRST AND PROMINENTLY: a full chain ran
+    # tonight WITHOUT these three, so the LIVE collection does not have them.
+    # They land on the NEXT full chain (never an -Only: this file deletes and
+    # recreates the collection). Until that chain runs, the interim state is
+    # LOUD BY CONSTRUCTION, at authoring time only: create_clipmap_material.py
+    # (the two March params) and both water generators (FoamV2Gain, via
+    # water_wave_graph.build_whitecap_foam) bind these through CHECKED
+    # collection_params that RAISE BY NAME against a collection that lacks
+    # them -- so a stray -Only regen fails with a message naming this block,
+    # instead of compiling the new terms to silent constants. Materials
+    # already on disk are untouched until they are regenerated.
+    #
+    # MarchAmbientIntensity / MarchAmbientGroundMix: the far-field clipmap's
+    # Custom node used to HARDCODE the marcher's hemisphere-ambient constants
+    # (1.5 and 0.45 -- these defaults ARE those values, so an undriven
+    # collection reproduces today's picture exactly). They match
+    # voxel.March.AmbientIntensity / voxel.March.AmbientGroundMix only until
+    # somebody retunes those cvars live -- an owner lighting session's first
+    # move -- at which point the near terrain moves and everything past the
+    # 8.2 km cascade edge stays baked: a brightness seam at the seam radius.
+    # ENGINE CONTRACT: the engine pushes voxel.March.AmbientIntensity and
+    # voxel.March.AmbientGroundMix into these two params each tick, FROM
+    # WHERE THE MARCHER LIVES (not UVoxelWaterSubsystem -- these are the
+    # marcher's numbers and the push belongs beside their cvars), with the
+    # same existence-checked write as the tide block.
+    ("MarchAmbientIntensity", 1.5),
+    ("MarchAmbientGroundMix", 0.45),
+    # FoamV2Gain: the global gain on Phase F2's crest/energy whitecap foam
+    # (water_wave_graph.build_whitecap_foam, consumed by both waters).
+    # ENGINE CONTRACT: UVoxelWaterSubsystem pushes the float cvar
+    # `voxel.Water.FoamV2` into this each tick -- the CausticIntensity /
+    # WaveTimeScale pattern, same existence-checked write; cvar 0 is a
+    # pixel-identical off. DEFAULT 1.0 for CausticIntensity's stated reason
+    # (a bounded cosmetic gain, already gated by wind speed and crest slope
+    # -- calm wind shows zero whitecaps regardless of this number -- and
+    # undriven-at-1 fails VISIBLY and lets the F2 gate captures happen before
+    # the engine push lands).
+    ("FoamV2Gain", 1.0),
 ]
 
 # (name, r, g, b, a)

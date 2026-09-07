@@ -224,3 +224,64 @@ def sample_ripple_field(b):
         "height_m": height_m,
         "uv": uv,
     }
+
+
+# F8/wake follow-up (owner, 2026-09-05 late: "Do we actually have a wake art
+# effect...?"): the ripple field provably carried the boat's wake (debug-arm
+# arcs on record) while the shipping composite spent it only on normal tilt
+# and centimetre WPO -- imperceptible on dark water. DISTURBANCE FOAM is the
+# missing visual channel: whitewater wherever the water is disturbed, driven
+# by the field itself, so a moving boat trails a white wedge, rings read as
+# white circles, and a splash flashes white and fades with the field's own
+# decay -- no new state, no new timing, the sim already animates it.
+DISTURBANCE_FOAM_DEFAULTS = {
+    # saturate((|grad| + |height_m| * HeightWeight) * Gain * Enabled).
+    # THE GAIN DEFAULT IS DERIVED, NOT GUESSED: the debug frames measured the
+    # field's wake values at ~0.06-0.3 (gradient units, RippleFieldGain in the
+    # loop). 8.0 puts the wedge's faint tail (0.06) at 0.48 foam and anything
+    # over 0.125 at FULL white -- deliberately vivid, per the owner's brief
+    # ("he wants to SEE it"); he dials it live via the MID probe
+    # (-VoxelWaterMatScalar=DisturbanceFoamGain:<v>).
+    "DisturbanceFoamGain": 8.0,
+    # Metres of ripple height that count like slope 1.0 (1/0.25 m). Baked, not
+    # a parameter: the gain above is the one knob, and gradient is the
+    # dominant term for a wake anyway (a wake is steep before it is tall).
+    "DisturbanceFoamHeightWeight": 4.0,
+    # The arm's off switch, FoamV2Enabled-style: a pixel-identical off for
+    # A/Bs without a regeneration. The real inert default is upstream --
+    # RippleFieldGain 0 on an undriven collection zeroes the taps themselves.
+    "DisturbanceFoamEnabled": 1.0,
+}
+
+
+def build_disturbance_foam(b, grad_xy, height_m, defaults=None):
+    """Whitewater from the disturbance the ripple field is already carrying.
+
+    `grad_xy` / `height_m` are the CONSUMER'S ripple tap expressions -- pass
+    the WaveTimeScale-GATED ones (both waters gate the ripple contribution by
+    that knob since the racing fix), so the foam and the displacement it
+    explains are one channel: scale 0 stills the surface AND blanks the foam
+    together, never one without the other. Under VOXEL_WATER_FREEZE_TIME the
+    opposite holds and is correct: material time freezes but the ripple RT is
+    the C++ sim's, so a frozen-arm capture shows the wake foam still moving
+    -- the arm freezes the material's own animation, which this is not.
+
+    Returns {"foam": expr} -- max() it into the existing foam composite (the
+    lake's signal stack, the ocean's chain), per the standing max-not-add
+    doctrine there: disturbed water breaking over an already-foamy crest is
+    one patch of white, not two whites summed past 1. Riding the composite
+    also buys the full foam contract for free: colour, opacity AND roughness
+    move together, which is what makes the wedge read as whitewater rather
+    than as paint.
+    """
+    d = dict(DISTURBANCE_FOAM_DEFAULTS)
+    if defaults:
+        d.update(defaults)
+    g2 = b.binary(unreal.MaterialExpressionDotProduct, grad_xy, "", grad_xy, "")
+    gmag = b.unary(unreal.MaterialExpressionSquareRoot, g2)
+    hterm = b.mul(b.abs_(height_m), b.const(d["DisturbanceFoamHeightWeight"]))
+    raw = b.add(gmag, hterm)
+    gain = b.scalar("DisturbanceFoamGain", d["DisturbanceFoamGain"])
+    enabled = b.scalar("DisturbanceFoamEnabled", d["DisturbanceFoamEnabled"])
+    foam = b.saturate(b.mul(b.mul(raw, gain), enabled))
+    return {"foam": foam}

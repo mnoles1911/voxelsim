@@ -64,11 +64,11 @@ AssetBankError validateGrid(const AssetGrid& g, const AssetManifestSpecies& sp,
     // read them: height above the anchor is originZ + sizeZ, depth below it is
     // -originZ, and horizontal reach is the furthest box corner on either axis
     // in either sign.
-    const int64_t vs = int64_t(g.voxelSizeMm());
+    const int64_t vs = g.voxelSizeUm(); // exact micrometres, including 12.5 mm
     const int64_t heightMm = (int64_t(g.originZ()) + int64_t(g.sizeZ())) * vs;
     const int64_t depthMm = -int64_t(g.originZ()) * vs;
-    if (heightMm > int64_t(layer.maxHeightMm)) return AssetBankError::kTooTall;
-    if (depthMm > int64_t(layer.maxDepthMm)) return AssetBankError::kTooDeep;
+    if (heightMm > int64_t(layer.maxHeightMm)*1000) return AssetBankError::kTooTall;
+    if (depthMm > int64_t(layer.maxDepthMm)*1000) return AssetBankError::kTooDeep;
     const int64_t ox = int64_t(g.originX()), oy = int64_t(g.originY());
     int64_t reach = 0;
     const int64_t corners[4] = {ox < 0 ? -ox : ox, oy < 0 ? -oy : oy,
@@ -77,7 +77,7 @@ AssetBankError validateGrid(const AssetGrid& g, const AssetManifestSpecies& sp,
                                 oy + int64_t(g.sizeY()) < 0 ? -(oy + int64_t(g.sizeY()))
                                                             : oy + int64_t(g.sizeY())};
     for (int i = 0; i < 4; ++i) reach = corners[i] > reach ? corners[i] : reach;
-    if (reach * vs > int64_t(layer.maxRadiusMm)) return AssetBankError::kTooWide;
+    if (reach * vs > int64_t(layer.maxRadiusMm)*1000) return AssetBankError::kTooWide;
     return AssetBankError::kOk;
 }
 

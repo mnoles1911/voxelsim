@@ -118,6 +118,29 @@ FVoxelFrontEndSwitches Parse()
 	FParse::Value(Cmd, TEXT("VoxelLoadMaxHold="), S.LoadMaxHoldSeconds);
 	FParse::Value(Cmd, TEXT("VoxelMenuWatchdog="), S.MenuWatchdogSeconds);
 
+	// -VoxelLoadTheatre=<min>[,<max>]: the artificial load duration's range.
+	// One value pins the duration; 0 disables the theatre (the arm unattended
+	// hand-off parity legs should pass). Through ParseFloatList for the same
+	// comma-terminator reason as -VoxelLoadingShotAt above.
+	{
+		TArray<float> Theatre;
+		if (ParseFloatList(TEXT("VoxelLoadTheatre="), Theatre) && Theatre.Num() > 0)
+		{
+			S.LoadTheatreMinSeconds = FMath::Max(Theatre[0], 0.f);
+			S.LoadTheatreMaxSeconds = Theatre.Num() > 1 ? FMath::Max(Theatre[1], 0.f)
+			                                            : S.LoadTheatreMinSeconds;
+		}
+		// An inverted range is a typo. FRandRange would quietly interpolate
+		// between the two anyway, but a warned clamp says which end wins.
+		if (S.LoadTheatreMinSeconds > S.LoadTheatreMaxSeconds)
+		{
+			UE_LOG(LogVoxelUI, Warning,
+			       TEXT("-VoxelLoadTheatre min %.1f exceeds max %.1f; clamping the maximum up."),
+			       S.LoadTheatreMinSeconds, S.LoadTheatreMaxSeconds);
+			S.LoadTheatreMaxSeconds = S.LoadTheatreMinSeconds;
+		}
+	}
+
 	// A min hold longer than the max hold is a typo that would otherwise show
 	// up as "the loading screen never closes early", which reads like a bug in
 	// the gate rather than in the flags.

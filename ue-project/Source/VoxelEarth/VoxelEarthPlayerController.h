@@ -94,6 +94,18 @@ public:
 	UFUNCTION(Client, Reliable)
 	void ClientReceiveJoinSyncChunk(const TArray<uint8>& Bytes, bool bFinal);
 
+	// Detached geometry is paced by the world replication subsystem on this
+	// connection's owned channel, including a complete snapshot on late join.
+	UFUNCTION(Client, Reliable)
+	void ClientReceiveDetachedPacket(const TArray<uint8>& Bytes);
+	UFUNCTION(Client, Unreliable)
+	void ClientReceiveDetachedMotion(const TArray<uint8>& Bytes);
+	UFUNCTION(Server, Reliable)
+	void ServerAcknowledgeDetachedPacket(uint32 Sequence, bool Accepted);
+	bool RequestChop(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels);
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerSubmitChopIntent(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels);
+
 private:
 	// M3 wave 2 "Validation hardening" (docs/m3-plan.md): per-connection
 	// token-bucket rate cap shared by every ServerSubmit*Intent handler
@@ -108,9 +120,21 @@ private:
 	bool TryConsumeIntentToken(const TCHAR* IntentName);
 	double IntentTokens = 0.0;
 	double LastIntentTokenRefillSeconds = -1.0;
+	double LastChopSeconds = -1.0;
 
 	void OnDig();
 	void OnPlace();
+
+	// --- vehicles (docs/water-ocean-tides-plan-2026-09-04.md D3 / E) --------
+	//
+	// Bound on the CONTROLLER, not on a pawn, because the controller's input
+	// component is the only one that survives a possession change -- see the
+	// binding site in SetupInputComponent for the full argument. Both are pure
+	// dispatch: E leaves the vehicle you are in or boards the nearest boat, X
+	// opens or stows a glider, and everything either of them actually does lives
+	// in AVoxelBoat / AVoxelGlider.
+	void OnVehicleInteract();
+	void OnGliderDeploy();
 
 	// Dig/place cube size selection (m1-plan.md "Dig sizes" row): mouse
 	// wheel cycles 1<->2<->4, number keys 1/2/3 select directly.
@@ -124,7 +148,7 @@ private:
 
 	void SelectDigSize1();
 	void SelectDigSize2();
-	void SelectDigSize4();
+	void SelectDigSize3();
 
 	// Creative placement palette cycle (m1-plan.md "Place" row): rock -> soil
 	// -> sand -> rock ...
@@ -175,7 +199,7 @@ private:
 	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Items")
 	TObjectPtr<class UVoxelInventoryComponent> Inventory;
 
-	int32 DigSizeVoxels = 1;
+	int32 DigSizeVoxels = 3;
 
 	// vxc::MAT_ROCK == 2 (voxelcore/core.h); kept as a numeric literal here
 	// since this UHT-parsed header must stay voxel-core-free by doctrine.

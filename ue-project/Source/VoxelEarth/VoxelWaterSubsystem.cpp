@@ -1,4 +1,6 @@
 #include "VoxelWaterSubsystem.h"
+#include "VoxelSessionCheckpoint.h"
+#include "VoxelSaveLibrary.h"
 
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
@@ -50,6 +52,9 @@
 // unreferenced by the engine -- which is exactly why rivers were invisible
 // past the 52 m implicit disc. This file is where that stops being true.
 #include "voxelcore/riverribbon.h"
+#include "voxelcore/tide.h" // Phase A: the tide as arithmetic -- integer phase + sine LUT, engine-free
+#include "voxelcore/oceanconnect.h" // Phase C: 4-connected BFS over ground vs the tide's datum
+#include "voxelcore/tidal.h"        // Phase C: TidalDatumSource -- the rock-pool datum decorator
 #include "voxelcore/tiles.h"
 #include "voxelcore/waterca.h"
 #include "voxelcore/waterwindow.h"
@@ -63,8 +68,11 @@
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
 #include "MaterialDomain.h"
+#include "Kismet/KismetMaterialLibrary.h" // tide MPC writes (RippleField's publish pattern)
 #include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/MaterialParameterCollection.h" // MPC_VoxelSky existence check at tide arm
+#include "VoxelSkySubsystem.h" // FVoxelSkyState::EpochSeconds -- the tide's one clock; VoxelSky::kSkyCollectionPath
 #include "Misc/CommandLine.h"
 #include "Misc/FileHelper.h" // ADR-0005 water persistence: FFileHelper (blob read/write)
 #include "Misc/Paths.h"      // ADR-0005 water persistence: FPaths::ProjectSavedDir (mirror the .vxlog path)
@@ -73,6 +81,7 @@
 
 #include <memory>
 #include <algorithm>
+#include <utility> // std::move -- the §13 step window is handed to stepWithOrder by move
 #include <vector>
 
 // ADR-0003 item 2/4 (docs/adr/0003-hydrostatic-persistent-body.md): toggles
@@ -185,6 +194,114 @@ static TAutoConsoleVariable<bool> CVarVoxelWaterImplicitOcean(
 	TEXT("implicit ocean at all (NOT the retired Reservoir v0, which does not come back)."),
 	ECVF_Default);
 
+// --- THE TIDE (docs/water-ocean-tides-plan-2026-09-04.md Phase A2) -----------
+//
+// A RUNTIME OFFSET ON THE SEA'S DATUM, never a change to kSeaLevelMm: the
+// geological constant keeps its constexpr derived gates and the bake it keys,
+// and the tide arrives as the `seaLevelNowMm` argument lakes.h's composition
+// functions grew for exactly this. Arithmetic is voxelcore/tide.h -- integer
+// phase + a compile-time sine LUT, pure f(sky epoch) -- so two machines that
+// agree on the clock agree on the waterline by construction, and nothing is
+// added to save games.
+//
+// TWO CADENCES, and the split is the churn bound: the CONTINUOUS offset feeds
+// MPC parameters every tick and never re-meshes anything; the DATUM (what the
+// ImplicitFn, swimming, depth and the surface contract read) steps only when
+// the quantised offset crosses QuantumMm AND MinStepIntervalS has elapsed.
+// Ocean re-meshes nothing on a step anyway -- it is deliberately absent from
+// the near-field sweep (lakes.h, implicitWaterCeilingMm's ocean note).
+static TAutoConsoleVariable<int32> CVarVoxelWaterTide(
+	TEXT("voxel.Water.Tide"), 0,
+	TEXT("Phase A tide authority. 0 (default) = dark: the sea's datum is the geological kSeaLevelMm, ")
+	TEXT("bit-identical to a build without tide code. 1 = the datum rides voxel.Water.Tide.Spec on the ")
+	TEXT("sky clock: continuous offset to MPC_VoxelSky each tick, quantised datum steps gated by ")
+	TEXT(".QuantumMm/.MinStepIntervalS. Arm logs 'Tide ENABLED', engagement logs 'Tide: steps=N' at the ")
+	TEXT("1Hz water cadence -- an armed leg where steps stays 0 is a leg where the tide did nothing."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<FString> CVarVoxelWaterTideSpec(
+	TEXT("voxel.Water.Tide.Spec"), TEXT("720:800:0,360:250:250"),
+	TEXT("Tide oscillators, 'periodS:amplitudeMm:phaseMilliTurns' comma-separated, up to 4. The default ")
+	TEXT("is a 12-minute 0.8 m principal plus a 6-minute 0.25 m beat (game-scale periods, matching the ")
+	TEXT("compressed sky day): range +-1.05 m, springs when they align. A spec that fails to parse ")
+	TEXT("REFUSES to arm, loudly -- a half-understood tide would be worse than none."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterTideQuantumMm(
+	TEXT("voxel.Water.Tide.QuantumMm"), 25,
+	TEXT("Datum step size in mm (floor-to-quantum, sign-stable -- vxc::quantiseTideMm). 25 mm is a ")
+	TEXT("quarter voxel: fine enough that the waterline creeps rather than jumps, coarse enough that a ")
+	TEXT("full default cycle is ~84 steps, each one memo-invalidation and zero ocean re-mesh. <=0 = no ")
+	TEXT("quantisation (every mm moves the datum; measurement arms only)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarVoxelWaterTideMinStepIntervalS(
+	TEXT("voxel.Water.Tide.MinStepIntervalS"), 2.0f,
+	TEXT("Rate limit between datum steps, seconds. The second half of the churn bound: QuantumMm bounds ")
+	TEXT("the SIZE of a step, this bounds the RATE, so a spring-tide zero crossing (~7 mm/s) still steps ")
+	TEXT("at most every 2 s. The continuous MPC offset is never rate-limited."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterTideForceOffsetMm(
+	TEXT("voxel.Water.Tide.ForceOffsetMm"), INT32_MIN,
+	TEXT("Pin the tide's continuous offset to this many mm (velocity reads 0), for capture legs and the ")
+	TEXT("Phase A functional gate (+1500 vs -1500 must flip a coastal IsUnderwaterAtWorld probe). The ")
+	TEXT("quantiser and step gates still apply, so a pinned leg settles onto the datum through the same ")
+	TEXT("machinery a live tide uses. INT32_MIN (default) = off."),
+	ECVF_Default);
+
+// --- Phase F appearance knobs, pushed to MPC_VoxelSky every tick -------------
+//
+// Both are LIVE-TUNING gains on material-side terms whose MPC defaults are the
+// neutral value, so an unset cvar pushes exactly what the collection already
+// holds. Cosmetic-only by construction: nothing engine-side reads either one.
+static TAutoConsoleVariable<float> CVarVoxelWaterCaustics(
+	TEXT("voxel.Water.Caustics"), 0.5f,
+	TEXT("F1 caustic intensity, pushed to MPC_VoxelSky.CausticIntensity each tick. 0 zeroes the caustic ")
+	TEXT("term in every consumer (terrain, clipmap, underwater) -- one switch, pixel-identical off (a ")
+	TEXT("zeroed uniform, not a shader permutation). Default 1."),
+	ECVF_Default);
+static TAutoConsoleVariable<float> CVarVoxelWaterFoamV2(
+	TEXT("voxel.Water.FoamV2"), 1.0f,
+	TEXT("F2 whitecap foam gain, pushed to MPC_VoxelSky.FoamV2Gain each tick. 0 removes wind/crest ")
+	TEXT("whitecaps in both water materials (shore/CA/slope foam untouched). Default 1."),
+	ECVF_Default);
+static TAutoConsoleVariable<float> CVarVoxelWaterWaveTimeScale(
+	TEXT("voxel.Water.WaveTimeScale"), 1.0f,
+	TEXT("Wave animation speed multiplier, pushed to MPC_VoxelSky.WaveTimeScale each tick. Scales the ")
+	TEXT("time driving the wind-wave octave field in BOTH water materials (lake and ocean) -- the ")
+	TEXT("owner's live knob for 'the surface waves move too fast'. Ripples and caustics keep their own ")
+	TEXT("clocks by design. Default 1."),
+	ECVF_Default);
+
+// --- Phase C: ocean connectivity (tides plan C2) -----------------------------
+//
+// The window is PRESENTATION-AND-QUALIFICATION state, not datum authority: it
+// decides which water gets wave heights (BathyField's A channel, the surface
+// contract's bOceanConnected) and which basins the tidal oracle may qualify.
+// The DATUM overlay itself (TidalDatumSource) additionally requires the tide
+// to be armed -- with voxel.Water.Tide 0 the oracle refuses everything and
+// every datum is bit-identical to the pre-C build, which is the OFF arm the
+// doctrine demands. This cvar's own 0 removes the window (and the A channel)
+// entirely for a byte-identical-texture control arm.
+static TAutoConsoleVariable<int32> CVarVoxelWaterOceanConnect(
+	TEXT("voxel.Water.OceanConnect"), 1,
+	TEXT("Phase C ocean-connectivity window (128x128 @7.5 m, +-480 m, camera-following). 1 (default) = ")
+	TEXT("BFS wet-connectivity over the ImplicitFn's own worldgen ground, recomputed per recentre and per ")
+	TEXT("tide datum step; feeds BathyField alpha, FWaterSurfaceSample.bOceanConnected and the rock-pool ")
+	TEXT("oracle. 0 = no window: connectivity reads UNKNOWN everywhere, callers fall back to the ")
+	TEXT("geological IsOpenSea answer, and no tidal basin qualifies. Engagement logs 'OceanConnect: ...' ")
+	TEXT("at the 1 Hz water cadence -- zero seeds or recomputes on a coastal leg is a failed leg."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterOceanConnectSeedMarginMm(
+	TEXT("voxel.Water.OceanConnect.SeedMarginMm"), 1000,
+	TEXT("Deep-margin seed guard, mm. BFS seeds must be border cells whose ground lies below ")
+	TEXT("kSeaLevelMm - tideMax - THIS, so a seed is wet at every state of the tide and an inland ")
+	TEXT("below-sea playa touching the window edge cannot certify itself as ocean ")
+	TEXT("(vxc::oceanConnectivityFill's guard; the residual is the documented IsOpenSea class, narrowed)."),
+	ECVF_Default);
+
 // --- Watershed §6.5, work items 9b/9c: the mobilized ceiling and the return
 // --- path (docs/water-handover-2026-08-04.md Phase 2) ------------------------
 //
@@ -255,6 +372,104 @@ static TAutoConsoleVariable<int32> CVarVoxelWaterCeilingReliefBudget(
 	TEXT("advanceFront and only while at the ceiling, so a world under its ceiling never pays for it. ")
 	TEXT("'Reclaim, then refuse' -- whatever this frees is visible to the rest of that same call. ")
 	TEXT("0 = refuse without reclaiming first (the ceiling still holds, it just holds by refusing)."),
+	ECVF_Default);
+
+// --- backlog §13 CONTAINMENT: the interactive-rate bound ---------------------
+//
+// THE BUG THESE THREE EXIST FOR. One explosive charge thrown near the judged
+// lake collapsed the frame rate PERMANENTLY (backlog §13, owner 2026-09-06).
+// The mechanism is not the carve -- that is a one-shot edit -- it is what the
+// carve starts:
+//
+//   1. CarveSphere -> NotifyTerrainRegionEdited -> mobilizeEditRegion. The
+//      crater is a DRAIN below the lake surface, so the water it releases keeps
+//      moving.
+//   2. StepFixed calls WaterMobilizer::advanceFront before every ca.step(), and
+//      waterca.h says in its own words that it "has NO LENGTH BOUND ... it is
+//      DRAINAGE, not disturbance, that runs away". Every freshly mobilized
+//      brick is filled and woken, so it is active next tick and the front has
+//      more neighbours to eat. The active set grows monotonically.
+//   3. WaterCA::step() is ATOMIC over its whole active set -- there is no safe
+//      mid-step cutoff -- and voxel.Water.MaxActiveBricks was only ever a
+//      LOG-THROTTLED WARNING. So the per-frame cost tracked the runaway with
+//      nothing bounding it.
+//
+// Measured, on the same shape (a breach into the open sea, from
+// docs/water-map/ocean-captures.md "Two defects this turned up" #2):
+//
+//     activeBricks   19,636 -> 41,613      (monotone)
+//     volume        501.0M -> 884.4M units (monotone)
+//     water tickMs   2,000 -> 2,547 ms     (against a 10 Hz fixed step)
+//
+// 2.5 SECONDS of game thread per water tick is the owner's "never recovered"
+// exactly. Nothing in that loop decays, so nothing ever gave it back.
+//
+// THIS IS CONTAINMENT, NOT THE REWORK. The CA rework is backlog §12 (owner
+// ruling: "CA sim is terrible and needs to be reworked"); §13's bar is only
+// that a single charge cost a BOUNDED, DECAYING spike. All four knobs below
+// are pure POLICY on the ENGINE side of voxel-core: no tick rule changes, no
+// kWaterCAVersion bump, nothing persisted, nothing digested, nothing
+// replicated. Set all four to 0 and this file is byte-identical in behaviour
+// to the pre-§13 build, which is the off-arm the doctrine demands.
+//
+// THE SAFETY ARGUMENT IS voxel-core's OWN, not a new one. Both the front gate
+// and the per-tick step budget refuse to SCHEDULE work; neither writes or drops
+// a single fill unit. waterca.h: "a brick the front does not mobilize is STILL
+// A WALL, so its water is frozen, not duplicated and not lost", and "waking is
+// purely a SCHEDULING act, never a source or sink". Frozen is a visual lag; the
+// conservation ledger cannot tell a deferral from a gate.
+//
+// DETERMINISM: every predicate below reads AUTHORITY STATE ONLY (active-brick
+// counts and a step counter). No wall clock, no frame time, no local frame
+// rate -- the same purity waterca.h demands of the front gate itself.
+static TAutoConsoleVariable<int32> CVarVoxelWaterFrontActiveBudget(
+	TEXT("voxel.Water.FrontActiveBudgetBricks"), 256,
+	TEXT("Backlog §13 containment, STOP THE GROWTH: while the CA already has at least this ")
+	TEXT("many ACTIVE bricks, WaterMobilizer's activity-driven front stops converting implicit water. This ")
+	TEXT("is the one-line `setFrontGate` seam waterca.h §9a always documented and this file deliberately ")
+	TEXT("left empty until a freeze owner appeared -- §13 is that owner, and unlike the demote-cooldown ")
+	TEXT("policy that was measured and rejected, a cost budget is MONOTONE by construction (refuse over the ")
+	TEXT("line, allow under it), so it has no knife-edge to tune. EDITS ARE EXEMPT BY CONSTRUCTION: ")
+	TEXT("mobilizeEditRegion is never gated, so digging into a lake always releases its water. 0 = no gate ")
+	TEXT("(the pre-§13 runaway)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterStepBudgetBricks(
+	TEXT("voxel.Water.StepBudgetBricks"), 512,
+	TEXT("Backlog §13 containment, BOUND PHASES A/B: the most bricks ONE fixed step may advance. Over ")
+	TEXT("budget, StepFixed steps a ROTATING WINDOW of exactly this many through WaterCA::stepWithOrder -- ")
+	TEXT("whose contract is that any key set is a legal tick -- and re-arms the remainder with markActive(), ")
+	TEXT("which writes no fill. Every brick therefore still gets stepped, just over several ticks instead of ")
+	TEXT("one, and a brick that settles inside its window leaves the active set for good: the set DRAINS. ")
+	TEXT("Bounds the two-phase read/apply only -- Phase C's hydrostatic flood follows water past any window, ")
+	TEXT("which is what ActiveCeilingBricks below is for. Costs one std::set insert per deferred brick per ")
+	TEXT("step. 0 = step the whole active set atomically (the pre-§13 behaviour)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterActiveCeilingBricks(
+	TEXT("voxel.Water.ActiveCeilingBricks"), 2048,
+	TEXT("Backlog §13 containment, THE HARD BOUND: an active set larger than this is settled by force ")
+	TEXT("(stepWithOrder({}) -- the set is cleared, no fill is written, nothing is lost) instead of stepped. ")
+	TEXT("It exists because the step budget CANNOT bound Phase C: the hydrostatic flood seeds from the ")
+	TEXT("stepped bricks but then follows water anywhere, so one seed in a mobilized lake floods the whole ")
+	TEXT("lake every step however few bricks were stepped -- which is where the measured 2,547 ms tick went. ")
+	TEXT("Refusing to step such a body is the only lever this side of voxel-core has on that cost. ")
+	TEXT("PROVISIONAL VALUE: half the long-standing voxel.Water.MaxActiveBricks advisory (4096) and 20x ")
+	TEXT("below the measured runaway (41,613); the §13 verify leg should retune it against real frame times. ")
+	TEXT("0 = no ceiling (the pre-§13 behaviour, and what hung the 2026-09-06 session)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterSettleForceSteps(
+	TEXT("voxel.Water.SettleForceSteps"), 300,
+	TEXT("Backlog §13 containment, the PLATEAU BACKSTOP: consecutive over-budget fixed steps during which ")
+	TEXT("the active set never falls at least 1/16 below its own high-water mark before the containment ")
+	TEXT("FORCES a settle. 300 = 30 s at the 10 Hz fixed step. It catches what the ceiling does not: a body ")
+	TEXT("small enough to step and still never converging (a front feeding itself, a component that cannot ")
+	TEXT("level), which would otherwise be a permanently smaller frame rate for the rest of the session. Any ")
+	TEXT("real progress re-arms the counter, so a draining pour never reaches it. The water freezes exactly ")
+	TEXT("where it stands -- no fill written, ledger unmoved, next edit wakes it. Logged as an Error because ")
+	TEXT("a world that reaches this is degraded and wants the §12 rework, not a bigger budget. 0 = never ")
+	TEXT("force on a plateau (the ceiling above still holds)."),
 	ECVF_Default);
 
 namespace
@@ -617,6 +832,28 @@ public:
 	}
 	void invalidateBasinDatumMemo() override { Both.invalidateBasinDatumMemo(); }
 
+	// --- the Phase C tidal seam, same forwarding shape -----------------------
+	//
+	// FORWARDED EXPLICITLY BECAUSE THE DEFAULTS ARE NO-OPS: IWaterSampler
+	// defaults these four so Null/pre-tide samplers stay untouched, which
+	// means a missing forward here is not a compile error, it is a tidal
+	// system that silently does nothing -- the house failure. Load-then-ask
+	// like every other method on this class.
+	void setTidalOracle(vxc::ITidalBasinOracle* Oracle) override { Both.setTidalOracle(Oracle); }
+	void invalidateTidalAdmissions() override { Both.invalidateTidalAdmissions(); }
+	const std::vector<uint8_t>* extentMaskAtDatum(int32_t tx, int32_t ty, uint16_t id,
+	                                              int32_t datumMm) override
+	{
+		EnsureTile(tx, ty);
+		return Both.extentMaskAtDatum(tx, ty, id, datumMm);
+	}
+	bool basinAtVoxel(int64_t vx, int64_t vy, int32_t& outTx, int32_t& outTy,
+	                  uint16_t& outId) override
+	{
+		EnsureTileFor(vx, vy);
+		return Both.basinAtVoxel(vx, vy, outTx, outTy, outId);
+	}
+
 private:
 	// Loads the fine tile under this voxel column if it is not already
 	// resident. A tile that is absent or refused is remembered, so a world
@@ -721,6 +958,62 @@ std::unique_ptr<vxc::IWaterSampler> MakeWaterSampler(uint64 Seed)
 // FVoxelWaterImpl -- the voxel-core side of the subsystem, defined only here
 // so VoxelWaterSubsystem.h (UHT-parsed) never sees a voxel-core header (same
 // pattern as FVoxelWorldImpl in VoxelWorldSubsystem.cpp).
+struct FVoxelWaterImpl;
+
+// THE TIDAL QUALIFICATION ORACLE (tides plan C3), engine half. voxel-core's
+// TidalDatumSource and LakeSampler ask ONE question -- "is this basin tidal"
+// -- and this class answers it from three facts, cached per basin per window
+// recentre:
+//
+//   1. spillMm <= kSeaLevelMm + tideMax   (the sill goes under at high water)
+//   2. floorMm  < spillMm                 (there is a pool to hold)
+//   3. connected to the open sea AT HIGH WATER, read from the connectivity
+//      window's high-water BFS at the basin's baked v2 worldOutlet -- the
+//      spill saddle, the one cell the sea provably crosses when it crosses.
+//
+// V1 ROWS ARE NEVER TIDAL: they carry no floorMm and no world outlet, so the
+// qualification cannot even be asked; the current world is bv26 (v2
+// everywhere), and a stale v1 tile simply keeps its Phase-B behaviour.
+//
+// TIDE DARK => NOTHING IS TIDAL, and that is the OFF arm's whole proof: with
+// voxel.Water.Tide 0 this returns false unconditionally, TidalDatumSource
+// passes every basin through bit-exact, no dry row is admitted anywhere, and
+// the water tier is byte-identical to the pre-Phase-C build.
+//
+// COUNTERS THAT CAN FAIL: `Flagged` (qualified basins in the current cache)
+// proves engagement -- a coastal leg with rock pools where it stays 0 is the
+// oracle silently disengaged; `BypassedInland` counts basins that pass the
+// sill/floor arithmetic but fail high-water connectivity -- the inland
+// below-sea depressions the deep-margin guard exists for, visible instead of
+// silently absorbed.
+class FVoxelTidalBasinOracle final : public vxc::ITidalBasinOracle
+{
+public:
+	explicit FVoxelTidalBasinOracle(FVoxelWaterImpl& InImpl) : Impl(InImpl) {}
+	bool isTidal(int32_t tx, int32_t ty, const vxc::BasinEntry& baked) override; // after FVoxelWaterImpl
+
+	// Drops every cached verdict. Called on window recentre, tide arm/disarm
+	// -- anything that can change a qualification. The caller must ALSO
+	// invalidate the sampler's tidal admissions; ResetTidalQualification (the
+	// one wrapper below FVoxelWaterImpl) does both so they cannot drift apart.
+	void ResetCache()
+	{
+		Cache.Empty();
+		Flagged = 0;
+		BypassedInland = 0;
+	}
+
+	// Verdicts keyed by (tileX, tileY, basinId); recomputed lazily after a
+	// reset. FIntVector rather than a hand-packed uint64: engine hash, no
+	// packing arithmetic to get subtly wrong at negative tiles.
+	TMap<FIntVector, bool> Cache;
+	int32 Flagged = 0;
+	int32 BypassedInland = 0;
+
+private:
+	FVoxelWaterImpl& Impl;
+};
+
 struct FVoxelWaterImpl
 {
 	explicit FVoxelWaterImpl(UVoxelWorldSubsystem& InTerrain)
@@ -823,28 +1116,68 @@ struct FVoxelWaterImpl
 				}
 			});
 
-		// THE FRONT GATE (work item 9a) IS DELIBERATELY LEFT UNINSTALLED, and
-		// that is a measured decision rather than an omission -- see this
-		// change's commit message and the four C8e tests in voxel-core.
+		// THE FRONT GATE (work item 9a) USED TO BE DELIBERATELY UNINSTALLED, and
+		// the argument for that is kept here in full because it is still true of
+		// the policy it was written about:
 		//
-		// The gate is a predicate that freezes a reach the AUTHORITY has decided
-		// to dry out by changing the datum (§6.3.3). Nothing in this engine
-		// drives such a decision yet: there is no datum-override registry and no
-		// caller that would populate one. The obvious candidate policy -- a
-		// cooldown that refuses to re-mobilize a brick just demoted, to stop the
-		// return path thrashing against the front -- was built and measured, and
-		// it is NOT shippable: its effect is non-monotonic in the cooldown length
-		// (on the reference breach, 8 steps left the runaway untouched, 10 steps
-		// made peak mobilization roughly DOUBLE the ungated run, and 16 steps
-		// fixed it) and it collapsed to no effect at all on a breach four times
-		// the size. That is a knife-edge in a chaotic response surface, not a
-		// policy, and layering it over the primitive would have hidden the real
-		// finding: what breaks a large breach is kMaxHydrostaticComponentCells,
-		// which sits upstream of every lever 9a/9b/9c provide.
+		//   The gate is a predicate that freezes a reach the AUTHORITY has
+		//   decided to dry out by changing the datum (§6.3.3). Nothing in this
+		//   engine drives such a decision yet: there is no datum-override
+		//   registry and no caller that would populate one. The obvious
+		//   candidate policy -- a cooldown that refuses to re-mobilize a brick
+		//   just demoted, to stop the return path thrashing against the front --
+		//   was built and measured, and it is NOT shippable: its effect is
+		//   non-monotonic in the cooldown length (on the reference breach, 8
+		//   steps left the runaway untouched, 10 steps made peak mobilization
+		//   roughly DOUBLE the ungated run, and 16 steps fixed it) and it
+		//   collapsed to no effect at all on a breach four times the size. That
+		//   is a knife-edge in a chaotic response surface, not a policy.
 		//
-		// The seam is one line (`Mob.setFrontGate(...)`) whenever a real freeze
-		// owner appears. Until then the mechanism stays proven and unused rather
-		// than used and unjustified.
+		//   The seam is one line (`Mob.setFrontGate(...)`) whenever a real freeze
+		//   owner appears.
+		//
+		// BACKLOG §13 IS THAT OWNER, and the gate it installs is a different
+		// animal from the rejected cooldown in the one way that matters: it is
+		// MONOTONE. "Refuse while the sim already has more work than it can
+		// afford, allow when it does not" has no cooldown length to sit on the
+		// wrong side of, cannot double the peak it is bounding, and does not
+		// scale with the breach -- a bigger breach simply hits the line sooner.
+		// It is a COST bound and makes no claim to be a correctness one; what
+		// actually makes a large body level is kMaxHydrostaticComponentCells and
+		// its streaming path, upstream of every lever 9a/9b/9c provide, and this
+		// gate does not pretend otherwise.
+		//
+		// WHY IT HAS TO BE THE FRONT and not just the step budget below: without
+		// it the mobilized set keeps growing even while the step budget holds the
+		// frame together, so a single charge would still convert an entire lake
+		// from implicit (free, zero storage, re-derivable from the seed) to CA
+		// (stored, replicated, persisted) -- permanent damage to the world, paid
+		// for in memory and save size long after the frame recovered.
+		//
+		// `this` is safe to capture for the same reason the relief hook above is.
+		Mob.setFrontGate(
+			[this](const vxc::BrickKey&)
+			{
+				const int32 Budget = CVarVoxelWaterFrontActiveBudget.GetValueOnGameThread();
+				if (Budget <= 0)
+				{
+					return true; // gate disarmed: the pre-§13 path, byte for byte
+				}
+				// AUTHORITY ONLY, exactly as the relief hook is: advanceFront is
+				// only reached from StepFixed, but a client's CA is a replication
+				// mirror whose active set lags, so a gate answering off it would
+				// refuse where the authority accepted.
+				if (!bAuthority)
+				{
+					return true;
+				}
+				// The predicate is per-CALL, not per-brick: every candidate in
+				// one advanceFront sees the same answer, so the gate cannot
+				// smear a partial shell across the world. Deliberately reads the
+				// ACTIVE set (the thing that costs) rather than the mobilized set
+				// (which the §6.5.5 ceiling already bounds).
+				return CA.activeBrickCount() < size_t(Budget);
+			});
 	}
 
 	UVoxelWorldSubsystem& Terrain;
@@ -1034,10 +1367,12 @@ struct FVoxelWaterImpl
 		// genuinely-open-air cell the CA touches.
 		//
 		// The guard is exact, not a heuristic: the ocean's datum is
-		// kSeaLevelMm, and waterFillUnits' remainder for a voxel whose BOTTOM
-		// is at or above the datum is <= 0. So at or above kSeaLevelVoxelZ the
-		// ocean term provably contributes nothing.
-		const bool bOceanPossible = bImplicitOcean && vz < vxc::kSeaLevelVoxelZ;
+		// SeaLevelNowMm (kSeaLevelMm plus the quantised tide, Phase A), and
+		// waterFillUnits' remainder for a voxel whose BOTTOM is at or above
+		// the datum is <= 0. So at or above SeaNowCeilVoxelZ -- the ceiling
+		// PRECOMPUTED at each datum step, see its declaration -- the ocean
+		// term provably contributes nothing, at every state of the tide.
+		const bool bOceanPossible = bImplicitOcean && vz < SeaNowCeilVoxelZ;
 		if (CavernFloodMm == INT32_MIN && BakedMm == vxc::kNoWaterMm && !bOceanPossible)
 		{
 			return 0;
@@ -1056,8 +1391,11 @@ struct FVoxelWaterImpl
 		{
 			return 255;
 		}
+		// The 3-argument composition: the sea's half of the max() stands at
+		// SeaLevelNowMm. With the tide dark this is the 2-argument form to the
+		// bit (the forwarder in lakes.h IS this call at kSeaLevelMm).
 		const int32_t SurfMm =
-			bOceanPossible ? vxc::implicitWaterDatumMm(BakedMm, GroundMm) : BakedMm;
+			bOceanPossible ? vxc::implicitWaterDatumMm(BakedMm, GroundMm, SeaLevelNowMm) : BakedMm;
 		if (SurfMm == vxc::kNoWaterMm)
 		{
 			return 0;
@@ -1160,6 +1498,16 @@ struct FVoxelWaterImpl
 	std::unique_ptr<vxc::BasinCapacityRouter> BasinRouter;
 	std::unique_ptr<vxc::BasinLedger> Basins;
 	std::unique_ptr<vxc::BasinLedgerDatumSource> BasinDatum;
+	// Phase C (tides plan C3): the rock-pool decorator AROUND BasinDatum, and
+	// the oracle it consults. Declared after BasinDatum -- destroyed first --
+	// because TidalDatum borrows both BasinDatum and TidalOracle (the same
+	// one-directional chain discipline as everything above). When these exist
+	// the sampler's datum seam is bound to TidalDatum, not BasinDatum; every
+	// consumer of a basin height therefore moves at once when the tide steps,
+	// by construction of the seam. With the tide dark the oracle refuses all
+	// qualification and TidalDatum is a bit-exact passthrough of BasinDatum.
+	std::unique_ptr<FVoxelTidalBasinOracle> TidalOracle;
+	std::unique_ptr<vxc::TidalDatumSource> TidalDatum;
 
 	// Basins whose delta has moved since the last ~5 Hz broadcast, as packed
 	// BasinId keys. A TSet, so a basin credited ten times in one window costs
@@ -1208,6 +1556,12 @@ struct FVoxelWaterImpl
 	// would refuse it, and the refusal would be logged every time the player
 	// toggled the cvar.
 	std::vector<uint8_t> PendingHydroGraphBlob;
+    vxc::RegionBounds PersistentRiverBounds{};
+    bool bHasPersistentRiverBounds=false;
+    double PendingRiverDelay=0;
+    TOptional<bool> RestoredRiverEnabled;
+    bool RiverCVarAtRestore=false;
+    bool bImplicitOceanPinned=false;
 
 	// voxel.Water.ImplicitOcean, LATCHED (watershed plan §6.4). Declared before
 	// Mob for the same reason Water is: the ImplicitFn reads it on every voxel
@@ -1221,6 +1575,25 @@ struct FVoxelWaterImpl
 	// one thing the wall exists to forbid, and the symptom would be a ledger
 	// shortfall rather than a crash. Tick re-reads it on a step boundary.
 	bool bImplicitOcean = true;
+
+	// --- THE TIDE'S DATUM (Phase A2), declared before Mob for the same reason
+	// bImplicitOcean is: the ImplicitFn reads both on every voxel it is asked
+	// about. SeaLevelNowMm is kSeaLevelMm + the QUANTISED tide offset -- the
+	// one number that says where the sea stands, stepped only by TickTide on a
+	// tick boundary (never mid-CA-step, same latch doctrine as above) and only
+	// through the quantum/rate gates. With voxel.Water.Tide 0 it IS
+	// kSeaLevelMm forever, and every composition below is bit-identical to the
+	// pre-tide build.
+	int32_t SeaLevelNowMm = vxc::kSeaLevelMm;
+	// The ImplicitFn's perf guard, PRECOMPUTED PER DATUM STEP rather than
+	// derived per voxel (this is the CA's hottest query). Exact, not a
+	// heuristic, same argument as the guard's own comment at the read site: a
+	// voxel whose BOTTOM sits at or above the datum gets a <=0 remainder from
+	// waterFillUnits, so ceil(SeaLevelNowMm / kVoxelSizeMm) is the first vz
+	// the ocean term provably cannot touch. Equals kSeaLevelVoxelZ while the
+	// tide is dark (kSeaLevelMm is voxel-aligned; the static_assert beside it
+	// in core.h pins that).
+	int64_t SeaNowCeilVoxelZ = vxc::kSeaLevelVoxelZ;
 
 	// MUST be declared before CA: makeSolidFn() hands the CA a callable that
 	// captures the mobilizer, so the mobilizer has to outlive it.
@@ -1421,12 +1794,123 @@ struct FVoxelWaterImpl
 	// visible the same frame it's placed.
 	TSet<VoxelCoords::FVoxelCoord> DirtyBricks;
 
+	// --- backlog §13 containment bookkeeping --------------------------------
+	//
+	// All authority-side POLICY state: never persisted, never digested, never
+	// replicated, and reset to these values by a fresh world. Nothing here can
+	// move a fill unit -- see the cvar block for the whole argument.
+	//
+	// The cursor is what makes the step budget a ROTATION rather than a prefix.
+	// A prefix of a BrickKeyLess-ordered snapshot is spatially biased (it is the
+	// world's -x/-y/-z corner), so the near corner of a lake would step forever
+	// while the far corner never ticked at all. Rotating spends the same budget
+	// and starves nothing. Monotone uint64: it indexes modulo the CURRENT active
+	// count, so it stays valid as the set shrinks.
+	uint64 CaStepCursor = 0;
+	// The active-brick count the plateau detector is measuring progress against,
+	// and how many consecutive over-budget steps have failed to beat it. Both 0
+	// whenever the sim is inside its budget, so a healthy world never arms the
+	// backstop.
+	size_t CaPlateauRefBricks = 0;
+	int32 CaPlateauSteps = 0;
+	// Engagement counters for the `WaterContain:` line (§13's grep contract).
+	// Honest counters: bricks the LAST step deferred, steps that deferred
+	// anything at all this session, and forced settles this session.
+	int32 CaDeferredLastStep = 0;
+	int64 CaBudgetedSteps = 0;
+	int64 CaForcedSettles = 0;
+	// 5 s log throttle for the forced settle, matching the two alarms above it.
+	double LastForcedSettleWarnWorldSeconds = -1000.0;
+
 	// --- Perf / HUD bookkeeping (task item 3) -------------------------------
 	float PerfRefreshAccumSeconds = 0.f;
 	int32 StepsThisWindow = 0;
 	int32 LastSteppedBrickCount = 0;
 	int32 ReplicatedBytesThisWindow = 0;
 	FVoxelWaterPerfSnapshot LastSnapshot;
+
+	// --- Phase A tide bookkeeping (the datum halves live above, before Mob) --
+	//
+	// Everything here is TickTide's working state: the parsed spec, the report
+	// struct the header exposes, and the gates. bTideEnabled is the LATCH (arm
+	// happened, spec parsed clean); the raw cvar is re-read each tick so a
+	// disarm mid-session returns the datum to kSeaLevelMm through the same
+	// step machinery.
+	bool bTideEnabled = false;
+	vxc::TideSpec Tide;
+	FString TideSpecLatched;      // the string Tide was parsed from; re-parse only on change
+	bool bTideSpecRefused = false; // TideSpecLatched failed to parse and was warned about, once
+	FVoxelTideState TideState;
+	// Sky-epoch second of the last datum step, for MinStepIntervalS. Seeded
+	// far negative so the FIRST quantum crossing after arm steps immediately
+	// -- an armed leg must show steps=1 within one quantum of movement, not
+	// after an arbitrary warmup.
+	double TideLastStepEpochS = -1.0e18;
+	// One-shot log/MPC-check gates (RippleField's checked-once discipline).
+	bool bTideMpcChecked = false;
+	bool bTideMpcHasParams = false;
+	// Same discipline for the Phase F appearance knobs (caustics, wave time
+	// scale). Checked separately from the tide because the tide ships dark and
+	// these push regardless of it.
+	bool bAppearanceMpcChecked = false;
+	bool bAppearanceMpcHasCaustics = false;
+	bool bAppearanceMpcHasWaveTime = false;
+	bool bAppearanceMpcHasFoamV2 = false;
+
+	// --- Phase C: the ocean-connectivity window (tides plan C2) --------------
+	//
+	// A camera-following square of ground heights and two BFS verdict grids
+	// over it, at 7.5 m per cell -- coarse enough that a recentre's ground
+	// fill is 16,384 amplifier columns (measured per recentre in the census
+	// line's groundFillMs), fine enough that a rock-pool sill two cells wide
+	// still reads. GROUND IS CACHED PER RECENTRE and the BFS reruns per tide
+	// quantum step over the cached grid (sub-ms: 16k cells, integer compares);
+	// the recentre discipline is BathyField's (same footprint, +-480 m, same
+	// leave-the-central-fraction trigger) so the two windows cover the same
+	// world and a bathy texel asking this grid is almost never outside it.
+	//
+	// TWO GRIDS, NOT ONE: `NowBits` answers "which water is the sea RIGHT NOW"
+	// (waves, bOceanConnected); `HighBits` answers it at astronomical high
+	// water (kSeaLevelMm + tideMax) and exists solely for the oracle's
+	// clause 3 -- a pool qualifies as tidal by what the sea does at high
+	// water, not by where the tide happens to stand when the window fills.
+	// HighBits is static per recentre; NowBits moves with the datum.
+	//
+	// THE GROUND IS THE IMPLICITFN'S OWN (one ground truth): every cell is
+	// UVoxelWorldSubsystem::GetWorldgenSurfaceAndCavernFloodMm at the cell's
+	// centre voxel -- the same accessor, so the connectivity grid can never
+	// disagree with the water the implicit fill actually places over which
+	// ground is below the sea.
+	struct FOceanConnectivityWindow
+	{
+		static constexpr int32 kN = 128;
+		static constexpr int64 kCellMm = 7500; // 7.5 m
+		static constexpr double kRecentreFraction = 0.25; // BathyField's discipline
+		bool bValid = false;
+		int64 OriginXMm = 0, OriginYMm = 0; // min corner, snapped to the cell grid
+		std::vector<int32_t> GroundMm;      // kN*kN, cached per recentre
+		std::vector<uint8_t> NowBits;       // connected at SeaLevelNowMm
+		std::vector<uint8_t> HighBits;      // connected at kSeaLevelMm + tideMax
+		vxc::OceanConnectStats NowStats;
+		vxc::OceanConnectStats HighStats;
+		// What NowBits/HighBits were computed against, so TickOceanConnectivity
+		// can rerun exactly when an input moved and never otherwise.
+		int32 NowSeaMm = vxc::kSeaLevelMm;
+		int32 TideMaxUsedMm = 0;
+		// Counters for the census line -- each one can fail. Recomputes is the
+		// leg gate's ("zero recomputes on a coastal tide leg FAILS": an armed
+		// tide steps, and every step must rerun the grid).
+		int32 Recentres = 0;
+		int32 Recomputes = 0;
+		double LastGroundFillMs = 0.0;
+	};
+	FOceanConnectivityWindow OceanConnect;
+
+	// The inland red gate (plan C gates): worst |seam datum - ledger datum|
+	// seen on any NON-tidal basin in the sheet gather. The decorator's
+	// passthrough makes this structurally 0; a nonzero here means the tidal
+	// overlay leaked onto an inland lake, and the leg fails.
+	int32 InlandDatumDeltaMm = 0;
 
 	// Log-throttle for the voxel.Water.MaxActiveBricks budget warning (task
 	// item 3: "log-throttle warning (do not explode)").
@@ -1586,6 +2070,246 @@ struct FVoxelWaterImpl
 	bool bRiverRefusalLogged = false;
 };
 
+// --- Phase C: connectivity window + tidal qualification ----------------------
+
+namespace
+{
+// Connectivity RIGHT NOW at a world point, from the window. bOutKnown false
+// outside it (or before it arms): the caller falls back to geology, never to a
+// "no" the grid did not compute.
+bool OceanConnectedAtMm(const FVoxelWaterImpl& Impl, int64 XMm, int64 YMm, bool* bOutKnown)
+{
+	using FW = FVoxelWaterImpl::FOceanConnectivityWindow;
+	const FW& W = Impl.OceanConnect;
+	if (bOutKnown != nullptr)
+	{
+		*bOutKnown = false;
+	}
+	if (!W.bValid || W.NowBits.empty())
+	{
+		return false;
+	}
+	const int64 Cx = vxc::floorDiv(XMm - W.OriginXMm, FW::kCellMm);
+	const int64 Cy = vxc::floorDiv(YMm - W.OriginYMm, FW::kCellMm);
+	if (Cx < 0 || Cx >= FW::kN || Cy < 0 || Cy >= FW::kN)
+	{
+		return false;
+	}
+	if (bOutKnown != nullptr)
+	{
+		*bOutKnown = true;
+	}
+	return W.NowBits[size_t(Cy) * size_t(FW::kN) + size_t(Cx)] != 0;
+}
+
+// The one wrapper for "a qualification input moved": the oracle's verdict
+// cache and the sampler's dry-row admissions drop TOGETHER. Dropping only one
+// leaves the bucket index holding rows the oracle now refuses (or missing
+// rows it now vouches for) -- the exact drift the pairing forbids.
+void ResetTidalQualification(FVoxelWaterImpl& Impl)
+{
+	if (Impl.TidalOracle)
+	{
+		Impl.TidalOracle->ResetCache();
+	}
+	if (Impl.Water)
+	{
+		Impl.Water->invalidateTidalAdmissions();
+	}
+}
+
+// Recentre-and-recompute, called once per Tick right after TickTide (the
+// datum it reads is that tick's). Ground fills per RECENTRE (16,384 amplifier
+// columns through the terrain's own accessor -- the ImplicitFn's ground, one
+// truth); the BFS rerurns per tide QUANTUM STEP over the cached ground, which
+// is 16k integer compares and sub-ms. All costs are numbers in the census
+// line, not impressions.
+void TickOceanConnectivity(FVoxelWaterImpl& Impl, UWorld* World)
+{
+	using FW = FVoxelWaterImpl::FOceanConnectivityWindow;
+	FW& W = Impl.OceanConnect;
+
+	if (CVarVoxelWaterOceanConnect.GetValueOnGameThread() == 0)
+	{
+		if (W.bValid)
+		{
+			// The OFF arm mid-session: connectivity reads unknown everywhere
+			// again, and no basin may stay qualified on a grid that no longer
+			// exists.
+			W.bValid = false;
+			ResetTidalQualification(Impl);
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("OceanConnect DISABLED: window dropped, connectivity reads unknown, no basin ")
+			       TEXT("qualifies as tidal. Callers fall back to the geological IsOpenSea answer."));
+		}
+		return;
+	}
+
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (PC == nullptr)
+	{
+		return; // nothing to centre on; same rule as the implicit sweep
+	}
+	FVector CamUU = FVector::ZeroVector;
+	FRotator UnusedRot = FRotator::ZeroRotator;
+	PC->GetPlayerViewPoint(CamUU, UnusedRot);
+	const int64 CamXMm = VoxelCoords::WorldToMm(CamUU.X);
+	const int64 CamYMm = VoxelCoords::WorldToMm(CamUU.Y);
+	const int64 HalfMm = FW::kCellMm * int64(FW::kN) / 2;
+	// Min corner snapped DOWN to the cell grid (floorDiv, the one idiom), so a
+	// cell's world footprint never shifts sub-cell between recentres.
+	const int64 WantX = vxc::floorDiv(CamXMm - HalfMm, FW::kCellMm) * FW::kCellMm;
+	const int64 WantY = vxc::floorDiv(CamYMm - HalfMm, FW::kCellMm) * FW::kCellMm;
+
+	bool bRecentre = !W.bValid;
+	if (W.bValid)
+	{
+		// BathyField's leave-the-central-fraction rule, measured against the
+		// window we PUBLISHED (drift against the snapped want would refill on
+		// snap jitter alone).
+		const double SlackMm = FW::kRecentreFraction * 0.5 * double(FW::kN) * double(FW::kCellMm);
+		const double CtrX = double(W.OriginXMm) + double(HalfMm);
+		const double CtrY = double(W.OriginYMm) + double(HalfMm);
+		if ((FMath::Abs(double(CamXMm) - CtrX) > SlackMm ||
+		     FMath::Abs(double(CamYMm) - CtrY) > SlackMm) &&
+		    (WantX != W.OriginXMm || WantY != W.OriginYMm))
+		{
+			bRecentre = true;
+		}
+	}
+
+	if (bRecentre)
+	{
+		const double T0 = FPlatformTime::Seconds();
+		W.GroundMm.assign(size_t(FW::kN) * size_t(FW::kN), 0);
+		for (int32 Cy = 0; Cy < FW::kN; ++Cy)
+		{
+			for (int32 Cx = 0; Cx < FW::kN; ++Cx)
+			{
+				const int64 XMm = WantX + int64(Cx) * FW::kCellMm + FW::kCellMm / 2;
+				const int64 YMm = WantY + int64(Cy) * FW::kCellMm + FW::kCellMm / 2;
+				const int64 Vx = vxc::floorDiv(XMm, int64(vxc::kVoxelSizeMm));
+				const int64 Vy = vxc::floorDiv(YMm, int64(vxc::kVoxelSizeMm));
+				int32 SurfaceMm = 0;
+				int32 UnusedFloodMm = INT32_MIN;
+				// THE IMPLICITFN'S OWN GROUND (one ground truth): the same
+				// terrain accessor ImplicitFillAtVoxel reads, so this grid and
+				// the water the fill places can never disagree about which
+				// ground lies below the sea. False return = "no world yet",
+				// outputs already the safe pair.
+				Impl.Terrain.GetWorldgenSurfaceAndCavernFloodMm(Vx, Vy, SurfaceMm, UnusedFloodMm);
+				W.GroundMm[size_t(Cy) * size_t(FW::kN) + size_t(Cx)] = SurfaceMm;
+			}
+		}
+		W.OriginXMm = WantX;
+		W.OriginYMm = WantY;
+		W.LastGroundFillMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+		W.bValid = true;
+		++W.Recentres;
+		// Force BOTH grids below to recompute against the new ground.
+		W.NowSeaMm = INT32_MIN;
+		W.TideMaxUsedMm = INT32_MIN;
+	}
+
+	const int32 TideMaxNow = Impl.bTideEnabled ? vxc::tideMaxMm(Impl.Tide) : 0;
+	const int32 SeedMarginMm =
+		FMath::Max(0, CVarVoxelWaterOceanConnectSeedMarginMm.GetValueOnGameThread());
+	// Seeds must stay wet at DEAD LOW water: below sea minus the full tide
+	// range minus the margin (oceanconnect.h's guard arithmetic).
+	const int32 SeedLevelMm = vxc::kSeaLevelMm - TideMaxNow - SeedMarginMm;
+
+	if (W.TideMaxUsedMm != TideMaxNow)
+	{
+		// The QUALIFICATION grid: connectivity at astronomical high water.
+		// Static per recentre (and per spec change) -- a pool qualifies by
+		// what the sea does at high water, not by where the tide stands now.
+		W.HighBits.assign(size_t(FW::kN) * size_t(FW::kN), 0);
+		W.HighStats = vxc::oceanConnectivityFill(W.GroundMm.data(), FW::kN,
+		                                         vxc::kSeaLevelMm + TideMaxNow, SeedLevelMm,
+		                                         W.HighBits.data());
+		W.TideMaxUsedMm = TideMaxNow;
+		ResetTidalQualification(Impl);
+	}
+
+	if (W.NowSeaMm != Impl.SeaLevelNowMm)
+	{
+		// The LIVE grid: reruns exactly when the datum stepped (or the window
+		// moved), never otherwise. This is the "recomputes" the leg gate reads.
+		W.NowBits.assign(size_t(FW::kN) * size_t(FW::kN), 0);
+		W.NowStats = vxc::oceanConnectivityFill(W.GroundMm.data(), FW::kN, Impl.SeaLevelNowMm,
+		                                        SeedLevelMm, W.NowBits.data());
+		W.NowSeaMm = Impl.SeaLevelNowMm;
+		++W.Recomputes;
+	}
+}
+} // namespace
+
+bool FVoxelTidalBasinOracle::isTidal(int32_t tx, int32_t ty, const vxc::BasinEntry& baked)
+{
+	// TIDE DARK => NOTHING IS TIDAL: the OFF arm's bit-exactness, enforced at
+	// the front of the qualification rather than at every consumer.
+	if (!Impl.bTideEnabled)
+	{
+		return false;
+	}
+	// V1 rows carry no floorMm and no world outlet; the qualification cannot
+	// be asked, so the honest answer is the Phase-B one.
+	if (!baked.hasV2())
+	{
+		return false;
+	}
+	// Clause 2: there must be a pool to hold when the sea leaves.
+	if (!(baked.floorMm < baked.spillMm))
+	{
+		return false;
+	}
+	// Clause 1: the sill goes under at astronomical high water. int64 so a
+	// pathological spill cannot wrap the sum.
+	if (int64(baked.spillMm) > int64(vxc::kSeaLevelMm) + int64(vxc::tideMaxMm(Impl.Tide)))
+	{
+		return false;
+	}
+	// Clause 3: connected to the open sea at HIGH water, sampled at the baked
+	// v2 world outlet (the spill saddle -- the one cell the sea provably
+	// crosses when it crosses). Cached per basin until the window recentres.
+	const FIntVector Key(tx, ty, int32(baked.basinId));
+	if (const bool* Hit = Cache.Find(Key))
+	{
+		return *Hit;
+	}
+	bool bTidal = false;
+	using FW = FVoxelWaterImpl::FOceanConnectivityWindow;
+	const FW& W = Impl.OceanConnect;
+	const int32 PxMm = Impl.Water ? Impl.Water->pixelSizeMm() : 0;
+	if (W.bValid && !W.HighBits.empty() && PxMm > 0)
+	{
+		const int64 OxMm = int64(baked.worldOutletX) * PxMm + PxMm / 2;
+		const int64 OyMm = int64(baked.worldOutletY) * PxMm + PxMm / 2;
+		const int64 Cx = vxc::floorDiv(OxMm - W.OriginXMm, FW::kCellMm);
+		const int64 Cy = vxc::floorDiv(OyMm - W.OriginYMm, FW::kCellMm);
+		if (Cx >= 0 && Cx < FW::kN && Cy >= 0 && Cy < FW::kN)
+		{
+			bTidal = W.HighBits[size_t(Cy) * size_t(FW::kN) + size_t(Cx)] != 0;
+			if (!bTidal)
+			{
+				// Passed the sill/floor arithmetic, failed connectivity: the
+				// inland below-sea class, BYPASSED and counted rather than
+				// silently absorbed -- this is TidalBasinsBypassedInland.
+				++BypassedInland;
+			}
+		}
+		// Outside the window: UNKNOWN, which resolves to not-tidal (the
+		// geological fallback) and is deliberately NOT counted as inland --
+		// the window did not rule, it just was not looking.
+	}
+	Cache.Add(Key, bTidal);
+	if (bTidal)
+	{
+		++Flagged;
+	}
+	return bTidal;
+}
+
 namespace
 {
 // Marks every water brick spanning [VzStart, VzStart + ceil(PlacedAmount/255)]
@@ -1741,34 +2465,7 @@ void UVoxelWaterSubsystem::Deinitialize()
 			Terrain->InstallWaterMarker(nullptr);
 		}
 	}
-	// ADR-0005: autosave the water blob on shutdown, mirroring
-	// UVoxelWorldSubsystem::Deinitialize's edit-log autosave lifetime exactly --
-	// authority only, and only for a world that genuinely began play (see
-	// bWorldBegunPlay). Additionally gated on there being real water state to
-	// persist (stored or mobilized bricks) so a run that never disturbed
-	// underground water leaves no sibling .vxwater to shadow a later same-seed
-	// session -- the edit log has no such gate because every world has a log,
-	// but an all-implicit world has nothing to serialize and an empty blob would
-	// only add a spurious file.
-	if (Impl && bWorldBegunPlay)
-	{
-		UWorld* World = GetWorld();
-		const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
-		// W4 (ADR-0004): the sheet counts as "real water state to persist" too,
-		// and it has to be named explicitly here. Promotion MOVES units out of
-		// CA cells, so a session whose whole pour has been promoted can have
-		// storedBrickCount() == 0 with a full sheet -- and the pre-W4 gate would
-		// then skip the autosave, drop the grid with Impl.Reset() below, and
-		// lose the lot on shutdown. SaveWaterState flushes the sheet back into
-		// the CA before serialising, so once we decide to save, the blob is
-		// complete.
-		const bool bHaveSheetWater = Impl->SweSheet && Impl->SweSheet->totalVolume() > 0;
-		if (NetMode != NM_Client &&
-		    (Impl->CA.storedBrickCount() > 0 || !Impl->Mob.mobilizedBricks().empty() || bHaveSheetWater))
-		{
-			SaveWaterState();
-		}
-	}
+	// The world teardown hook captures all domains before subsystem destruction.
 
 	ChunkRoot = nullptr;
 	ChunkOwner = nullptr;
@@ -1797,27 +2494,7 @@ void UVoxelWaterSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// UVoxelWorldSubsystem's bWorldBegunPlay) -- gates Deinitialize's autosave.
 	bWorldBegunPlay = true;
 
-	// ADR-0005 water persistence: the authority (server/listen/standalone) loads
-	// Saved/VoxelWorlds/<seed>.vxwater, if present, before the first fixed step
-	// ever runs (Tick() below). This is the earliest point OnWorldBeginPlay
-	// reaches after the game-world/Impl guard, and it runs BEFORE the
-	// dedicated-server early-return below so it applies to every authority role,
-	// exactly mirroring UVoxelWorldSubsystem's LoadEditLogFromDisk placement. The
-	// live CA/mob are still fresh here (no addWater/mobilize has run yet), which
-	// is vxc::WaterState::applyTo's precondition. Fills-first load, three
-	// failure modes handled loudly -- see LoadWaterStateFromDisk. NM_Client never
-	// loads its own file: a joining client mirrors state via replication instead.
-	if (InWorld.GetNetMode() != NM_Client)
-	{
-		LoadWaterStateFromDisk(*Impl, Impl->Terrain.GetSeed());
-		// Phase 2's blob, from its OWN file and with its OWN failure handling --
-		// a separate call rather than a tail of the one above because
-		// LoadWaterStateFromDisk returns early on all three of its failure modes,
-		// and "the CA blob was missing" must not silently also mean "every lake
-		// forgot where it stood". Same NM_Client rule: a joining client mirrors
-		// the scalars through the diff channel, it does not load them.
-		LoadHydroStateFromDisk(*Impl, Impl->Terrain.GetSeed());
-	}
+	// Session selection owns water restoration; BeginPlay must not read seed files.
 
 	// Dedicated server: no viewport, so no render chunks -- but the CA still
 	// ticks authoritatively regardless (Tick() below doesn't check
@@ -3435,7 +4112,17 @@ void EnsureBasinLedger(FVoxelWaterImpl& Impl)
 	// it, a lake crossing a tile edge would get one account per tile, each
 	// holding half its water and each drawn at its own height.
 	Impl.BasinDatum = std::make_unique<vxc::BasinLedgerDatumSource>(*Impl.Basins, Impl.BasinTable.get());
-	Impl.Water->setBasinDatumSource(Impl.BasinDatum.get());
+	// Phase C (tides plan C3): the rock-pool decorator wraps the ledger source
+	// and BECOMES the bound seam, so every consumer of a basin height -- the
+	// near-field fill, the sheet gather, SubmergedDepth, the surface contract
+	// -- rides the tide together the moment a basin qualifies. With the tide
+	// dark the oracle refuses everything and the decorator is a bit-exact
+	// passthrough of the ledger: the pre-C build, byte for byte.
+	Impl.TidalOracle = std::make_unique<FVoxelTidalBasinOracle>(Impl);
+	Impl.TidalDatum = std::make_unique<vxc::TidalDatumSource>(*Impl.BasinDatum, *Impl.TidalOracle);
+	Impl.TidalDatum->setTideNowMm(Impl.SeaLevelNowMm);
+	Impl.Water->setBasinDatumSource(Impl.TidalDatum.get());
+	Impl.Water->setTidalOracle(Impl.TidalOracle.get());
 
 	UE_LOG(LogVoxelWater, Log,
 	       TEXT("Basin ledger ENABLED (kBasinLedgerVersion %u): lake datums now read surfaceMm + h(volume delta). ")
@@ -3904,6 +4591,12 @@ bool SaveHydroStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed)
 	if (Impl.Rivers)
 	{
 		vxc::RiverNetState::serialize(*Impl.Rivers, Graph);
+	}
+	else
+	{
+		// A loaded graph may still be waiting for its terrain region to arm.
+		// Saving during that interval must retain the exact loaded routing state.
+		Graph = Impl.PendingHydroGraphBlob;
 	}
 
 	std::vector<uint8_t> Bytes;
@@ -5102,6 +5795,7 @@ void FlushSweIntoCA(FVoxelWaterImpl& Impl, const TCHAR* Reason)
 
 void MaybeRelatchImplicitOcean(FVoxelWaterImpl& Impl)
 {
+    if (Impl.bImplicitOceanPinned) return;
 	const bool bWant = CVarVoxelWaterImplicitOcean.GetValueOnGameThread();
 	if (bWant == Impl.bImplicitOcean)
 	{
@@ -5230,7 +5924,7 @@ void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World)
 		AnchorVy = Vc.Y;
 		bHaveAnchor = true;
 	}
-	if (!bHaveAnchor)
+	if (!bHaveAnchor && !Impl.bHasPersistentRiverBounds)
 	{
 		if (!Impl.bSweRefusalLogged)
 		{
@@ -5398,7 +6092,9 @@ constexpr int64 kRiverBaseflowMax = 65536;
 // same reason MaybeArmSwe is: an arm/disarm lands on a clean step boundary.
 void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 {
-	const bool bWant = VoxelDebug::GetWaterRivers();
+	if (Impl.RestoredRiverEnabled.IsSet() && VoxelDebug::GetWaterRivers()!=Impl.RiverCVarAtRestore)
+        Impl.RestoredRiverEnabled.Reset();
+    const bool bWant=Impl.RestoredRiverEnabled.Get(VoxelDebug::GetWaterRivers());
 	const bool bArmed = Impl.RiverCoupler != nullptr;
 
 	if (!bWant)
@@ -5406,22 +6102,13 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 		Impl.bRiverRefusalLogged = false;
 		if (bArmed)
 		{
-			// DISARM IS A PLAIN DELETE HERE, unlike voxel.Water.SWE's disarm,
-			// which has to flush the sheet back into the CA first. The
-			// difference is the coupling's direction: every unit this coupler
-			// ever took out of the graph is ALREADY in the CA (or ledgered as
-			// gone to sea), and what remains in the graph is segment storage --
-			// a routing state variable at tile scale, not water anybody can see
-			// or swim in. Dropping it destroys no visible water. What it does
-			// destroy is the routing history and any promotions, which is
-			// exactly what "the graph is not persisted yet" already means.
-			UE_LOG(LogVoxelWater, Log,
-			       TEXT("voxel.Water.Rivers 0: river graph disarmed (%u segments, %lld promotions, %lld graph units ")
-			       TEXT("delivered to the CA, %lld to the ocean). Water already handed to the CA stays; the graph's ")
-			       TEXT("own routing state does not persist."),
-			       Impl.Rivers ? Impl.Rivers->segmentCount() : 0u, (long long)Impl.RiverPromotions,
-			       (long long)Impl.RiverCoupler->graphUnitsToCA(),
-			       (long long)Impl.RiverCoupler->graphUnitsToOcean());
+            if (Impl.Rivers)
+            {
+                Impl.PendingHydroGraphBlob.clear();
+                vxc::RiverNetState::serialize(*Impl.Rivers,Impl.PendingHydroGraphBlob);
+                Impl.PendingRiverDelay=FMath::Clamp(Impl.RiverStepSeconds-(World->GetTimeSeconds()-Impl.RiverLastTickWorldSeconds),0.0,Impl.RiverStepSeconds);
+            }
+            UE_LOG(LogVoxelWater,Log,TEXT("River graph suspended; routing state retained for rearm/checkpoint."));
 			Impl.RiverCoupler.reset();
 			Impl.Rivers.reset();
 			Impl.RiverBaseflow.clear();
@@ -5497,6 +6184,8 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	Bounds.py0 = AnchorPy - kRiverRegionPixels / 2;
 	Bounds.px1 = Bounds.px0 + kRiverRegionPixels - 1;
 	Bounds.py1 = Bounds.py0 + kRiverRegionPixels - 1;
+    if (Impl.bHasPersistentRiverBounds) Bounds=Impl.PersistentRiverBounds;
+    Impl.PersistentRiverBounds=Bounds; Impl.bHasPersistentRiverBounds=true;
 
 	Impl.Rivers = std::make_unique<vxc::RiverNetwork>();
 	Impl.Rivers->buildFromFlowAccumulation(Impl.Tiles, Impl.Terrain.GetSeed(), Bounds);
@@ -5536,7 +6225,7 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	// numbers whose derivations are written down in exactly one place.
 	Impl.RiverCoupler = std::make_unique<vxc::RiverCaCoupler>(*Impl.Rivers, Impl.CA, Impl.Tiles,
 	                                                          Impl.Mob.makeSolidFn(), Cfg);
-	Impl.RiverLastTickWorldSeconds = -1000.0;
+	Impl.RiverLastTickWorldSeconds = World->GetTimeSeconds()-Impl.RiverStepSeconds+Impl.PendingRiverDelay;
 	Impl.RiverLastStatusWorldSeconds = -1000.0;
 	Impl.RiverPromotions = 0;
 	Impl.bRiverRefusalLogged = false;
@@ -5546,41 +6235,16 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	// Recording FIRST, so a dam placed one tick after the arm is in the log.
 	Impl.Rivers->setDiffRecording(true);
 
-	// Then the held blob, if this session loaded one. CONSUMED EXACTLY ONCE
-	// (see PendingHydroGraphBlob): a second arm over different bounds builds a
-	// different graph, restoreRoutingState would refuse it, and re-offering the
-	// bytes every toggle would turn one honest refusal into a log spam.
-	if (!Impl.PendingHydroGraphBlob.empty())
-	{
-		std::vector<uint8_t> Blob;
-		Blob.swap(Impl.PendingHydroGraphBlob);
-		if (vxc::RiverNetState::load(Blob.data(), Blob.size(), *Impl.Rivers))
-		{
-			UE_LOG(LogVoxelWater, Log,
-			       TEXT("voxel.Water.Rivers: restored the saved graph state -- %llu diff(s) replayed, %lld storage ")
-			       TEXT("units back in the reaches (injected %lld, out to outlets %lld)."),
-			       (unsigned long long)Impl.Rivers->diffLog().size(), (long long)Impl.Rivers->totalStorage(),
-			       (long long)Impl.Rivers->totalInjected(), (long long)Impl.Rivers->totalOutflowToOutlets());
-		}
-		else
-		{
-			// LOUD, and specifically about WHY: the overwhelmingly likely cause
-			// is that the graph was saved anchored somewhere else, because the
-			// region is centred on the player's viewpoint at arm time.
-			UE_LOG(LogVoxelWater, Warning,
-			       TEXT("voxel.Water.Rivers: the saved graph state was REFUSED (%d bytes, this graph has %u ")
-			       TEXT("segments). Most likely it was recorded over DIFFERENT REGION BOUNDS -- the region is ")
-			       TEXT("centred on the player's viewpoint at arm time -- or by a different kRiverNetVersion ")
-			       TEXT("(engine is now v%u). Dams and in-flight water from that session are gone; the graph ")
-			       TEXT("itself is fine and starts empty."),
-			       int32(Blob.size()), Impl.Rivers->segmentCount(), vxc::kRiverNetVersion);
-			// A partial diff replay may have landed (RiverNetState::load says
-			// so). Rebuild from scratch so the graph is not a half-replayed
-			// hybrid of two sessions.
-			Impl.Rivers->buildFromFlowAccumulation(Impl.Tiles, Impl.Terrain.GetSeed(), Bounds);
-			Impl.Rivers->setDiffRecording(true);
-		}
-	}
+    if (!Impl.PendingHydroGraphBlob.empty())
+    {
+        if (!vxc::RiverNetState::load(Impl.PendingHydroGraphBlob.data(),Impl.PendingHydroGraphBlob.size(),*Impl.Rivers))
+        {
+            VoxelSessionCheckpoint::Fail(World);
+            UE_LOG(LogVoxelWater,Error,TEXT("Saved river topology was refused; session stopped and source checkpoint preserved."));
+            Impl.RiverCoupler.reset(); Impl.Rivers.reset(); return;
+        }
+        Impl.PendingHydroGraphBlob.clear();
+    }
 
 	UE_LOG(LogVoxelWater, Log,
 	       TEXT("voxel.Water.Rivers 1: built a %lldx%lld-pixel (%lld m) river graph around voxel (%lld,%lld): ")
@@ -5589,6 +6253,46 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	       (long long)(kRiverRegionPixels * PixelSizeMm / 1000), (long long)AnchorVx, (long long)AnchorVy,
 	       int32(Impl.Rivers->nodes().size()), SegCount,
 	       (FPlatformTime::Seconds() - ArmStartSeconds) * 1000.0);
+}
+
+// --- backlog §13 containment: the forced settle ------------------------------
+//
+// WHAT IT DOES, EXACTLY: hands WaterCA an EMPTY key set. That is voxel-core's
+// own settled-tick path (`stepWithOrder` early-returns on an empty order), it
+// clears the active set, and it writes NOTHING -- no fill moves, totalVolume()
+// does not change by a unit, no edit-log entry, no digest change. The water
+// stops where it stands and any later terrain edit wakes it again through
+// NotifyTerrainRegionEdited -> wakeRegion, exactly as a settled pond does.
+//
+// WHY THAT IS SOUND rather than a fudge: it is the same trade the front budget
+// and the front gate already rest on, and waterca.h states it for both -- a
+// brick that is not scheduled is "frozen, not duplicated and not lost", and
+// "frozen is a visual lag measured in tenths of a second; duplicated is a
+// broken world". Freezing is the ONLY containment lever that cannot corrupt.
+//
+// The log is an Error and 5 s-throttled: reaching this means the world is
+// degraded and wants the §12 CA rework, and a per-step transcript of a stall is
+// how a genuinely useful line gets ignored.
+void ForceWaterSettle(FVoxelWaterImpl& Impl, double NowWorldSeconds, const TCHAR* Why)
+{
+	const size_t Frozen = Impl.CA.activeBrickCount();
+	Impl.CA.stepWithOrder(std::vector<vxc::BrickKey>{});
+	++Impl.CaForcedSettles;
+	Impl.CaPlateauRefBricks = 0;
+	Impl.CaPlateauSteps = 0;
+
+	if (NowWorldSeconds - Impl.LastForcedSettleWarnWorldSeconds <= 5.0)
+	{
+		return;
+	}
+	Impl.LastForcedSettleWarnWorldSeconds = NowWorldSeconds;
+	UE_LOG(LogVoxelWater, Error,
+	       TEXT("WaterContain: FORCED SETTLE of %llu active brick(s) -- %s. No fill was written: volume=%llu, ")
+	       TEXT("mobilized=%llu, both unchanged by this. The water is FROZEN where it stands, not lost, and the ")
+	       TEXT("next terrain edit wakes it. This is backlog §13 containment firing, which means the world wants ")
+	       TEXT("the §12 CA rework rather than a bigger budget. Forced settles this session: %lld."),
+	       (unsigned long long)Frozen, Why, (unsigned long long)Impl.CA.totalVolume(),
+	       (unsigned long long)Impl.Mob.mobilizedBricks().size(), (long long)Impl.CaForcedSettles);
 }
 
 void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
@@ -5808,9 +6512,131 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 		MarkSweDepthChangesDirty(Impl);
 	}
 
-	Impl.CA.step();
+	// --- backlog §13 containment: THE CEILING, THEN THE BUDGET --------------
+	//
+	// TWO SEPARATE BOUNDS BECAUSE THE STEP HAS TWO SEPARATE COSTS, and only one
+	// of them can be bounded by stepping fewer bricks. Stated plainly because
+	// getting this wrong is exactly how a containment ships that does not
+	// contain:
+	//
+	//   PHASES A/B (the two-phase read/apply) cost O(`touched`), and `touched`
+	//   is derived from the key set handed to the step. A smaller set is a
+	//   cheaper -- and complete, and atomic -- tick: `stepWithOrder`'s contract
+	//   is that "any permutation of the same key set is accepted and ... produces
+	//   byte-identical resulting WaterMap contents". So the budget below is a
+	//   SMALLER STEP, never a cutoff inside one.
+	//
+	//   PHASE C (the hydrostatic level pass) is NOT bounded by that, and no
+	//   budget here can bound it. Its flood seeds from water cells in `touched`
+	//   but then follows WATER in any direction whether or not the brick is
+	//   touched (waterca.cpp: "a neighbour that HOLDS WATER (fill > 0) is always
+	//   explorable ... whether or not its brick is `touched`"), so one seed
+	//   anywhere in a mobilized lake costs a flood over the WHOLE lake, every
+	//   step, however few bricks were stepped. That is where the measured
+	//   2,547 ms went.
+	//
+	// Hence the ceiling: the only bound on Phase C available from this side of
+	// voxel-core is to REFUSE TO STEP a body the frame cannot afford at all. It
+	// is the hard guarantee -- an active set over the ceiling is settled by
+	// force, immediately, and the next step over an empty set is free. Together
+	// with the front gate (which stops such a body forming in the first place)
+	// that is §13's "bounded, decaying spike" in two lines.
+	const int32 StepBudgetBricks = CVarVoxelWaterStepBudgetBricks.GetValueOnGameThread();
+	const int32 ActiveCeilingBricks = CVarVoxelWaterActiveCeilingBricks.GetValueOnGameThread();
+	const size_t ActiveBeforeStep = Impl.CA.activeBrickCount();
+	Impl.CaDeferredLastStep = 0;
+
+	if (ActiveCeilingBricks > 0 && ActiveBeforeStep > size_t(ActiveCeilingBricks))
+	{
+		ForceWaterSettle(Impl, NowWorldSeconds,
+		                 TEXT("the active set is over voxel.Water.ActiveCeilingBricks, and Phase C's ")
+		                 TEXT("hydrostatic flood over a body that size cannot be made to fit in a frame"));
+	}
+	else if (StepBudgetBricks > 0 && ActiveBeforeStep > size_t(StepBudgetBricks))
+	{
+		// THE ROTATING WINDOW. It DRAINS, which is the property §13 demands:
+		// stepWithOrder rebuilds the active set from the bricks its own window
+		// CHANGED (plus their face neighbours), so a brick that settles inside
+		// its window is gone from the set for good. The deferred remainder is
+		// put straight back with markActive -- "waking is purely a SCHEDULING
+		// act, never a source or sink" -- so nothing is dropped and every brick
+		// is stepped within ceil(active/budget) ticks.
+		const std::vector<vxc::BrickKey> Snapshot = Impl.CA.activeSetSnapshot();
+		const size_t Count = Snapshot.size();
+		const size_t Window = FMath::Min(size_t(StepBudgetBricks), Count);
+		const size_t Start = size_t(Impl.CaStepCursor % uint64(Count));
+
+		std::vector<vxc::BrickKey> Order;
+		Order.reserve(Window);
+		for (size_t I = 0; I < Window; ++I)
+		{
+			Order.push_back(Snapshot[(Start + I) % Count]);
+		}
+		// Advance by exactly the window so consecutive over-budget steps sweep
+		// the whole set and then wrap -- no brick can be starved.
+		Impl.CaStepCursor += uint64(Window);
+
+		Impl.CA.stepWithOrder(std::move(Order));
+
+		// RE-ARM THE REMAINDER, AND IT MUST BE AFTER THE STEP: stepWithOrder
+		// REPLACES the active set with its own result, so re-arming beforehand
+		// would be overwritten and the deferred bricks really would freeze.
+		for (size_t I = Window; I < Count; ++I)
+		{
+			Impl.CA.markActive(Snapshot[(Start + I) % Count]);
+		}
+		Impl.CaDeferredLastStep = int32(Count - Window);
+		++Impl.CaBudgetedSteps;
+	}
+	else
+	{
+		Impl.CA.step();
+	}
 	++Impl.StepsThisWindow;
 	Impl.LastSteppedBrickCount = int32(Impl.CA.steppedBrickCount());
+
+	// --- backlog §13 containment: THE PLATEAU BACKSTOP ----------------------
+	//
+	// The ceiling catches the body that is too big to step at all; this catches
+	// the one that is small enough to step and still never converges -- a front
+	// feeding itself, a component that cannot level -- which would otherwise sit
+	// at the budget for the rest of the session. That is a permanently smaller
+	// frame rate, and §13's bar is "no permanent FPS loss", so it has to end.
+	//
+	// Progress is "the active set fell at least 1/16 below the mark it was
+	// measured against", and any such fall re-arms the whole counter. 1/16
+	// rather than "fell at all" because a set that jitters by a brick or two is
+	// not converging, it is idling at cost. A genuinely draining pour resets
+	// this repeatedly and never reaches the limit.
+	//
+	// Counted in STEPS, not seconds, so the predicate stays a pure function of
+	// authority state -- the same purity waterca.h demands of the front gate.
+	if (ActiveBeforeStep > size_t(FMath::Max(StepBudgetBricks, 1)))
+	{
+		const size_t ActiveAfterStep = Impl.CA.activeBrickCount();
+		if (Impl.CaPlateauRefBricks == 0 || ActiveAfterStep * 16 < Impl.CaPlateauRefBricks * 15)
+		{
+			Impl.CaPlateauRefBricks = ActiveAfterStep;
+			Impl.CaPlateauSteps = 0;
+		}
+		else
+		{
+			++Impl.CaPlateauSteps;
+		}
+
+		const int32 ForceSteps = CVarVoxelWaterSettleForceSteps.GetValueOnGameThread();
+		if (ForceSteps > 0 && Impl.CaPlateauSteps >= ForceSteps)
+		{
+			ForceWaterSettle(Impl, NowWorldSeconds,
+			                 TEXT("the active set held above voxel.Water.StepBudgetBricks for ")
+			                 TEXT("voxel.Water.SettleForceSteps consecutive steps without converging"));
+		}
+	}
+	else
+	{
+		Impl.CaPlateauRefBricks = 0;
+		Impl.CaPlateauSteps = 0;
+	}
 
 	if (bSweArmed)
 	{
@@ -5891,6 +6717,15 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	//
 	// Deliberately NOT added to DirtySinceLastBroadcast: a settle carries no fill
 	// change, so replicating it would spend bandwidth on a diff that is empty.
+	//
+	// THE BROADCAST SET IS GATED ON bReplicating, and that is the same argument
+	// PendingRemovals below already makes for itself: BroadcastWaterDiffs is the
+	// only thing that ever drains this set and Tick only calls it when
+	// NetMode != NM_Standalone. Filling it in a standalone session was inserting
+	// every active brick, every fixed step, into a set nobody would ever read --
+	// free while water is a puddle, and during the backlog §13 runaway a
+	// five-figure set re-inserted forty times a second in the one configuration
+	// the owner actually plays.
 	TSet<VoxelCoords::FVoxelCoord> NowActive;
 	NowActive.Reserve(int32(Impl.CA.activeBricks().size()));
 	for (const vxc::BrickKey& K : Impl.CA.activeBricks())
@@ -5898,7 +6733,10 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 		const VoxelCoords::FVoxelCoord C = ToCoord(K);
 		NowActive.Add(C);
 		Impl.DirtyBricks.Add(C);
-		Impl.DirtySinceLastBroadcast.Add(C);
+		if (Impl.bReplicating)
+		{
+			Impl.DirtySinceLastBroadcast.Add(C);
+		}
 	}
 	for (const VoxelCoords::FVoxelCoord& C : Impl.ActiveBricks)
 	{
@@ -6006,18 +6844,23 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	}
 
 	// Task item 3: "if steppedBrickCount exceeds a cvar cap ... log-throttle
-	// warning (do not explode)". The CA's tick contract (waterca.h) is
-	// atomic over its whole active-set snapshot -- there is no safe mid-step
-	// cutoff that wouldn't break volume conservation/determinism -- so this
-	// is purely a monitoring signal, not a clamp.
+	// warning (do not explode)". Still a MONITORING signal and not a clamp --
+	// but it is no longer the only thing standing between the CA and a runaway.
+	// Backlog §13 added voxel.Water.StepBudgetBricks, which bounds what one step
+	// may advance by handing WaterCA a smaller (complete, atomic) key set rather
+	// than by cutting a step in half; this line now reports what actually ran,
+	// so with the budget armed it fires only when the budget itself is set above
+	// this cap. The two are deliberately separate: this one is "the world got
+	// bigger than we planned for", §13's is "and the frame must survive it".
 	const int32 Cap = VoxelDebug::GetWaterMaxActiveBricks();
 	if (Cap > 0 && Impl.LastSteppedBrickCount > Cap && (NowWorldSeconds - Impl.LastBudgetWarnWorldSeconds) > 5.0)
 	{
 		Impl.LastBudgetWarnWorldSeconds = NowWorldSeconds;
 		UE_LOG(LogVoxelWater, Warning,
-		       TEXT("WaterCA over budget: steppedBrickCount=%d > voxel.Water.MaxActiveBricks=%d (tick ran in full -- ")
-		       TEXT("no safe mid-step cutoff exists; raise the cap or investigate runaway spread)."),
-		       Impl.LastSteppedBrickCount, Cap);
+		       TEXT("WaterCA over budget: steppedBrickCount=%d > voxel.Water.MaxActiveBricks=%d (active=%llu; the ")
+		       TEXT("step ran in full over the set it was given -- lower voxel.Water.StepBudgetBricks to bound it, ")
+		       TEXT("or investigate runaway spread)."),
+		       Impl.LastSteppedBrickCount, Cap, (unsigned long long)Impl.CA.activeBrickCount());
 	}
 }
 
@@ -6148,8 +6991,272 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 }
 } // namespace
 
+// --- Phase A tide (docs/water-ocean-tides-plan-2026-09-04.md A2/A3) ----------
+
+// The four MPC_VoxelSky parameters the tide publishes (plan A3). The NAMES are
+// the contract with create_sky_material.py's authoritative parameter table --
+// the material lane adds them there; this side existence-checks and logs
+// loudly rather than assuming (the VoxelRippleField.cpp:477-494 pattern).
+static const TCHAR* kTideParamOffsetUU = TEXT("TideOffsetUU");
+static const TCHAR* kTideParamSeaSurfaceZUU = TEXT("SeaSurfaceZUU");
+static const TCHAR* kTideParamNormPhase = TEXT("TideNormPhase");
+static const TCHAR* kTideParamVelocityUUPerS = TEXT("TideVelocityUUPerS");
+
+namespace
+{
+// "periodS:amplitudeMm:phaseMilliTurns,..." -> vxc::TideSpec. Strict on
+// purpose: a component count over 4, a non-positive period or a negative
+// amplitude REFUSES the whole string rather than salvaging the valid prefix --
+// a tide running on half the spec somebody typed is the classic silent
+// success, and the refusal is logged at the arm site where it can fail a leg.
+bool ParseTideSpec(const FString& Text, vxc::TideSpec& Out)
+{
+	Out = vxc::TideSpec{};
+	TArray<FString> Parts;
+	Text.ParseIntoArray(Parts, TEXT(","), /*CullEmpty*/ true);
+	if (Parts.Num() == 0 || Parts.Num() > vxc::kMaxTideComponents)
+	{
+		return false;
+	}
+	for (const FString& Part : Parts)
+	{
+		TArray<FString> Fields;
+		Part.ParseIntoArray(Fields, TEXT(":"), /*CullEmpty*/ false);
+		if (Fields.Num() != 3)
+		{
+			return false;
+		}
+		const int32 PeriodS = FCString::Atoi(*Fields[0]);
+		const int32 AmpMm = FCString::Atoi(*Fields[1]);
+		const int32 PhaseMt = FCString::Atoi(*Fields[2]);
+		if (PeriodS <= 0 || AmpMm < 0)
+		{
+			return false;
+		}
+		Out.comp[Out.count] = {PeriodS, AmpMm, PhaseMt};
+		++Out.count;
+	}
+	return true;
+}
+} // namespace
+
+void UVoxelWaterSubsystem::TickTide(UWorld* World)
+{
+	FVoxelWaterImpl& I = *Impl;
+	// mm -> UU, spelled once, off the same two constants SeaLevelZUU uses.
+	const double UUPerMm = VoxelCoords::VoxelSizeUU / double(vxc::kVoxelSizeMm);
+
+	const bool bWant = CVarVoxelWaterTide.GetValueOnGameThread() != 0;
+	if (!bWant)
+	{
+		if (I.bTideEnabled)
+		{
+			// DISARM RETURNS THE DATUM TO GEOLOGY, immediately and through the
+			// same seam a step uses -- leaving SeaLevelNowMm stranded at the
+			// last quantum would be a tide the cvar says is off.
+			const int32 Steps = I.TideState.DatumSteps;
+			I.bTideEnabled = false;
+			I.TideState = FVoxelTideState{};
+			I.TideSpecLatched.Reset();
+			I.bTideSpecRefused = false;
+			I.TideLastStepEpochS = -1.0e18;
+			if (I.SeaLevelNowMm != vxc::kSeaLevelMm)
+			{
+				I.SeaLevelNowMm = vxc::kSeaLevelMm;
+				I.SeaNowCeilVoxelZ = vxc::kSeaLevelVoxelZ;
+				if (I.Water)
+				{
+					I.Water->invalidateBasinDatumMemo();
+				}
+			}
+			// Phase C: the decorator's datum returns to geology with the
+			// subsystem's, and every tidal qualification dies with the arm --
+			// the oracle now refuses everything (bTideEnabled false), so the
+			// admissions the index baked in must go too.
+			if (I.TidalDatum)
+			{
+				I.TidalDatum->setTideNowMm(I.SeaLevelNowMm);
+			}
+			ResetTidalQualification(I);
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("Tide DISABLED: datum returned to kSeaLevelMm; %d datum step(s) had run."),
+			       Steps);
+		}
+		return; // the shipped default: dark, zero work, zero state
+	}
+
+	// --- arm / re-arm on a spec change --------------------------------------
+	const FString SpecText = CVarVoxelWaterTideSpec.GetValueOnGameThread();
+	if (!I.bTideEnabled && I.bTideSpecRefused && I.TideSpecLatched.Equals(SpecText))
+	{
+		// This exact string was already refused, once, loudly. Not re-parsed
+		// per tick; a changed string re-enters the arm path below.
+		return;
+	}
+	if (!I.bTideEnabled || !I.TideSpecLatched.Equals(SpecText))
+	{
+		vxc::TideSpec Parsed;
+		if (!ParseTideSpec(SpecText, Parsed))
+		{
+			// Warned ONCE per attempted string (the refused-latch above is the
+			// ImplicitOcean-refusal discipline). The tide STAYS dark: no "Tide
+			// ENABLED" line, so an armed leg with a typoed spec fails its grep
+			// visibly rather than running a half-understood tide.
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("Tide REFUSED to arm: spec '%s' does not parse as up to %d ")
+			       TEXT("'periodS:amplitudeMm:phaseMilliTurns' components (periods must be > 0, ")
+			       TEXT("amplitudes >= 0). The datum stays at kSeaLevelMm."),
+			       *SpecText, vxc::kMaxTideComponents);
+			I.TideSpecLatched = SpecText;
+			I.bTideSpecRefused = true;
+			return;
+		}
+		I.Tide = Parsed;
+		I.TideSpecLatched = SpecText;
+		I.bTideSpecRefused = false;
+		I.bTideEnabled = true;
+		I.TideState.bEnabled = true;
+
+		// MPC existence check, ONCE (VoxelRippleField.cpp:477-494 verbatim in
+		// spirit): the setters warn-per-call for a missing parameter, which at
+		// four params a tick would bury every other diagnostic; the honest
+		// failure is one line naming the patch that has not been applied.
+		if (!I.bTideMpcChecked)
+		{
+			I.bTideMpcChecked = true;
+			TideSkyCollection =
+				LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath);
+			bool bHasOffset = false, bHasSurface = false, bHasPhase = false, bHasVel = false;
+			if (const UMaterialParameterCollection* Sky = TideSkyCollection)
+			{
+				for (const FCollectionScalarParameter& P : Sky->ScalarParameters)
+				{
+					bHasOffset |= (P.ParameterName == FName(kTideParamOffsetUU));
+					bHasSurface |= (P.ParameterName == FName(kTideParamSeaSurfaceZUU));
+					bHasPhase |= (P.ParameterName == FName(kTideParamNormPhase));
+					bHasVel |= (P.ParameterName == FName(kTideParamVelocityUUPerS));
+				}
+			}
+			I.bTideMpcHasParams = bHasOffset && bHasSurface && bHasPhase && bHasVel;
+			if (!I.bTideMpcHasParams)
+			{
+				UE_LOG(LogVoxelWater, Warning,
+				       TEXT("Tide: MPC_VoxelSky is missing %s/%s/%s/%s, so no material can see the ")
+				       TEXT("tide. The AUTHORITY still runs -- the datum, swimming, depth and the ")
+				       TEXT("surface contract all move -- only shading is blind. Add the four ")
+				       TEXT("parameters through create_sky_material.py's table, then regenerate via ")
+				       TEXT("tools/voxel-sky-chain-regen.ps1 (sky -> dome -> water, in that order)."),
+				       kTideParamOffsetUU, kTideParamSeaSurfaceZUU, kTideParamNormPhase,
+				       kTideParamVelocityUUPerS);
+			}
+		}
+
+		const UVoxelSkySubsystem* SkyForLog =
+			World ? World->GetSubsystem<UVoxelSkySubsystem>() : nullptr;
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("Tide ENABLED: spec=%s comps=%d maxMm=%d quantumMm=%d minStepS=%.1f clock=%s ")
+		       TEXT("mpcParams=%d. Pure f(epoch): nothing saved, nothing accumulated; the datum ")
+		       TEXT("steps only on quantum crossings and 'Tide: steps=N' reports each one at the ")
+		       TEXT("1Hz cadence."),
+		       *SpecText, I.Tide.count, vxc::tideMaxMm(I.Tide),
+		       CVarVoxelWaterTideQuantumMm.GetValueOnGameThread(),
+		       CVarVoxelWaterTideMinStepIntervalS.GetValueOnGameThread(),
+		       SkyForLog ? TEXT("sky-epoch") : TEXT("world-seconds (no sky subsystem)"),
+		       I.bTideMpcHasParams ? 1 : 0);
+	}
+
+	// --- evaluate f(epoch) ---------------------------------------------------
+	//
+	// THE SKY'S CLOCK, not the world's, whenever it exists: the tide must ride
+	// the same epoch as the sun and the moon (plan A2 -- a moonrise and its
+	// tide arriving on different clocks would be visibly wrong). Milliseconds
+	// into voxel-core so the continuous offset is smooth at tick rate; the
+	// datum path quantises far above millisecond residue.
+	double EpochS = World ? World->GetTimeSeconds() : 0.0;
+	if (const UVoxelSkySubsystem* Sky = World ? World->GetSubsystem<UVoxelSkySubsystem>() : nullptr)
+	{
+		EpochS = Sky->GetSkyState().EpochSeconds;
+	}
+	const int64 EpochMs = int64(FMath::RoundToDouble(EpochS * 1000.0));
+
+	const int32 ForceMm = CVarVoxelWaterTideForceOffsetMm.GetValueOnGameThread();
+	const bool bForced = (ForceMm != INT32_MIN);
+	const int32 OffsetMm = bForced ? ForceMm : vxc::tideOffsetMm(I.Tide, EpochMs);
+	const int64 VelUmPerS = bForced ? 0 : vxc::tideVelocityUmPerS(I.Tide, EpochMs);
+	double NormPhase = 0.0;
+	if (I.Tide.count > 0 && I.Tide.comp[0].periodS > 0)
+	{
+		const int64 PeriodMs = int64(I.Tide.comp[0].periodS) * 1000;
+		NormPhase = double(vxc::floorMod(EpochMs, PeriodMs)) / double(PeriodMs);
+	}
+
+	// --- the datum cadence: step only on a quantum crossing, rate-limited ----
+	const int32 QuantumMm = CVarVoxelWaterTideQuantumMm.GetValueOnGameThread();
+	const int32 QuantMm = vxc::quantiseTideMm(OffsetMm, QuantumMm);
+	const double MinStepS = double(CVarVoxelWaterTideMinStepIntervalS.GetValueOnGameThread());
+	if (QuantMm != I.TideState.OffsetQuantisedMm && (EpochS - I.TideLastStepEpochS) >= MinStepS)
+	{
+		I.SeaLevelNowMm = vxc::kSeaLevelMm + QuantMm;
+		// The ImplicitFn's exact guard ceiling, recomputed here and ONLY here
+		// (one writer, per the member's comment): first vz whose voxel bottom
+		// is at or above the datum.
+		I.SeaNowCeilVoxelZ =
+			vxc::floorDiv(int64(I.SeaLevelNowMm) + vxc::kVoxelSizeMm - 1, vxc::kVoxelSizeMm);
+		I.TideState.OffsetQuantisedMm = QuantMm;
+		I.TideState.OffsetQuantisedUU = double(QuantMm) * UUPerMm;
+		I.TideState.DatumSteps++;
+		I.TideLastStepEpochS = EpochS;
+		// The lakes.h datum-memo hook: the sampler's one-entry column memo
+		// caches a DATUM, and the datum just moved (same call every ledger
+		// credit makes). KNOWN Phase A LIMIT, stated: WaterMobilizer's
+		// noImplicit_ negative memo is NOT dropped here -- a brick scanned dry
+		// before a rise keeps reading dry to the MOBILIZATION front until an
+		// edit invalidates it. That affects only breach-mobilization cost/
+		// reach near the moving line, never the predicates or the draw, and
+		// waterca.h owns the memo (another lane's file).
+		if (I.Water)
+		{
+			I.Water->invalidateBasinDatumMemo();
+		}
+		// Phase C: the rock-pool decorator steps WITH the datum -- same tick,
+		// same quantised number -- so a connected pool's surface and the sea's
+		// are one value by construction. (The connectivity grid reruns in
+		// TickOceanConnectivity right after this returns; qualification does
+		// NOT change on a step, only on recentre/arm, so no admissions churn.)
+		if (I.TidalDatum)
+		{
+			I.TidalDatum->setTideNowMm(I.SeaLevelNowMm);
+		}
+	}
+
+	// --- the continuous cadence: state + MPC, every tick, meshing nothing ----
+	I.TideState.OffsetUU = double(OffsetMm) * UUPerMm;
+	I.TideState.VelocityUUPerS = double(VelUmPerS) * UUPerMm / 1000.0; // um/s -> UU/s
+	I.TideState.NormPhase = NormPhase;
+	if (I.bTideMpcHasParams && World && TideSkyCollection)
+	{
+		// SeaSurfaceZUU is the CONTINUOUS surface on purpose -- shading may
+		// ride the smooth curve; GEOMETRY (the ocean plane, the ImplicitFn)
+		// reads the quantised SeaSurfaceZNowUU()/SeaLevelNowMm and the two
+		// never differ by more than one quantum.
+		UKismetMaterialLibrary::SetScalarParameterValue(World, TideSkyCollection,
+		                                                FName(kTideParamOffsetUU),
+		                                                float(I.TideState.OffsetUU));
+		UKismetMaterialLibrary::SetScalarParameterValue(
+			World, TideSkyCollection, FName(kTideParamSeaSurfaceZUU),
+			float(SeaLevelZUU() + I.TideState.OffsetUU));
+		UKismetMaterialLibrary::SetScalarParameterValue(World, TideSkyCollection,
+		                                                FName(kTideParamNormPhase),
+		                                                float(I.TideState.NormPhase));
+		UKismetMaterialLibrary::SetScalarParameterValue(World, TideSkyCollection,
+		                                                FName(kTideParamVelocityUUPerS),
+		                                                float(I.TideState.VelocityUUPerS));
+	}
+}
+
 void UVoxelWaterSubsystem::Tick(float DeltaTime)
 {
+	if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	if (!Impl)
 	{
 		return;
@@ -6210,6 +7317,74 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 		// disarm must not land between the river tick and the CA step.
 		MaybeArmRivers(*Impl, World);
 
+		// Phase A tide: latch, evaluate f(sky epoch), maybe step the datum.
+		// Same placement, same reason -- a datum step is a change to the
+		// implicit field's shape and must land on a step boundary, never
+		// between the coupler and the CA.
+		TickTide(World);
+
+		// --- Phase F appearance knobs -> MPC_VoxelSky --------------------
+		// Pushed every tick regardless of the tide arm (the tide ships dark;
+		// these are live-tuning gains whose MPC defaults are neutral). The
+		// existence check runs ONCE and logs the missing-param case a single
+		// time (the RippleField pattern): a param absent simply means the
+		// full material chain has not been regenerated with it yet, and the
+		// push resumes the session after the regen that adds it.
+		{
+			FVoxelWaterImpl& I = *Impl;
+			if (!I.bAppearanceMpcChecked)
+			{
+				I.bAppearanceMpcChecked = true;
+				if (!TideSkyCollection)
+				{
+					TideSkyCollection = LoadObject<UMaterialParameterCollection>(
+						nullptr, VoxelSky::kSkyCollectionPath);
+				}
+				if (const UMaterialParameterCollection* Sky = TideSkyCollection)
+				{
+					for (const FCollectionScalarParameter& P : Sky->ScalarParameters)
+					{
+						I.bAppearanceMpcHasCaustics |=
+							(P.ParameterName == FName(TEXT("CausticIntensity")));
+						I.bAppearanceMpcHasWaveTime |=
+							(P.ParameterName == FName(TEXT("WaveTimeScale")));
+						I.bAppearanceMpcHasFoamV2 |=
+							(P.ParameterName == FName(TEXT("FoamV2Gain")));
+					}
+				}
+				UE_LOG(LogVoxelWater, Log,
+				       TEXT("Appearance MPC push: CausticIntensity=%d WaveTimeScale=%d (0 = the ")
+				       TEXT("collection predates the param; regen the sky chain to enable that knob)."),
+				       I.bAppearanceMpcHasCaustics ? 1 : 0, I.bAppearanceMpcHasWaveTime ? 1 : 0);
+			}
+			if (World && TideSkyCollection)
+			{
+				if (I.bAppearanceMpcHasCaustics)
+				{
+					UKismetMaterialLibrary::SetScalarParameterValue(
+						World, TideSkyCollection, FName(TEXT("CausticIntensity")),
+						CVarVoxelWaterCaustics.GetValueOnGameThread());
+				}
+				if (I.bAppearanceMpcHasWaveTime)
+				{
+					UKismetMaterialLibrary::SetScalarParameterValue(
+						World, TideSkyCollection, FName(TEXT("WaveTimeScale")),
+						CVarVoxelWaterWaveTimeScale.GetValueOnGameThread());
+				}
+				if (I.bAppearanceMpcHasFoamV2)
+				{
+					UKismetMaterialLibrary::SetScalarParameterValue(
+						World, TideSkyCollection, FName(TEXT("FoamV2Gain")),
+						CVarVoxelWaterFoamV2.GetValueOnGameThread());
+				}
+			}
+		}
+
+		// Phase C: the connectivity window, DIRECTLY after the tide so the
+		// grid it (re)computes is against the datum this tick's steps landed
+		// on -- never a frame behind the water it describes.
+		TickOceanConnectivity(*Impl, World);
+
 		Impl->TickAccumSeconds += DeltaTime;
 		const double NowWorldSeconds = World ? World->GetTimeSeconds() : 0.0;
 		int32 StepsThisFrame = 0;
@@ -6218,6 +7393,28 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 			Impl->TickAccumSeconds -= FVoxelWaterImpl::FixedStepSeconds;
 			StepFixed(*Impl, NowWorldSeconds);
 			++StepsThisFrame;
+		}
+		// DROP THE DEBT THE STEP CAP REFUSED TO PAY (backlog §13).
+		//
+		// MaxStepsPerFrame was called a "spiral-of-death guard" and it is only
+		// half of one: it bounds the steps taken in a frame but nothing bounded
+		// the ACCUMULATOR, so a frame slower than MaxStepsPerFrame * FixedStep
+		// (0.4 s) left more debt behind than it paid off. Once the water tick
+		// itself is what makes frames that slow -- which is precisely the §13
+		// collapse, measured at 2.5 s per tick -- the accumulator grows without
+		// bound and the sim is pinned at the maximum catch-up rate FOREVER,
+		// including long after the water would otherwise have gone quiet. A
+		// spiral needs both ends closed.
+		//
+		// Dropping the debt is the standard, and the honest, resolution: the
+		// simulation runs slower than wall-clock during a hitch instead of
+		// trying to make it up, which for a water sim is invisible (its clock is
+		// not the player's) and is already what MaxStepsPerFrame was choosing on
+		// that frame anyway. Costs one compare per tick and is a no-op in every
+		// frame that keeps up.
+		if (Impl->TickAccumSeconds > FVoxelWaterImpl::FixedStepSeconds)
+		{
+			Impl->TickAccumSeconds = FVoxelWaterImpl::FixedStepSeconds;
 		}
 
 		if (World && NetMode != NM_Standalone)
@@ -6378,6 +7575,79 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 			       TEXT("WaterPerf: activeBricks=%lld stored=%lld volume=%llu steps/s=%.1f tickMs=%.3f replKB/s=%.2f"),
 			       Snap.ActiveBricks, Snap.StoredBricks, (unsigned long long)Snap.TotalVolume, Snap.StepsPerSec, Snap.TickMs,
 			       Snap.ReplicatedBytesPerSec / 1024.0);
+		}
+
+		// --- backlog §13 ENGAGEMENT LINE, 1 Hz ------------------------------
+		//
+		// THE GREP CONTRACT: `WaterContain:`. This is the line that answers the
+		// only question §13's verify leg has to ask -- does the spike DECAY --
+		// and it answers it without a profiler: throw one charge at the lake
+		// shore and watch `active=` fall back to 0 over a handful of lines. A
+		// leg where `active=` plateaus while `deferred=` stays non-zero is a
+		// failed leg, and it is the exact shape the collapse had (the ocean
+		// breach capture logged activeBricks 19,636 -> 41,613, MONOTONE).
+		//
+		// SILENT WHEN IDLE, and deliberately not merged into WaterPerf above:
+		// WaterPerf prints whenever any water is STORED, which is most of the
+		// time on a coastal world, and a containment counter that prints zeros
+		// forever is a counter nobody reads. This prints only while the
+		// containment is actually engaged or the CA is actually busy.
+		//
+		// Honest counters, all of them: `active` is the live set, `deferred` is
+		// what the LAST step put back rather than a running total, `steps` and
+		// `forced` are session lifetime, `frontRefused` is the mobilizer's own
+		// per-consideration count (a rate signal, not an inventory -- waterca.h
+		// says so at the accessor), and `mobilized` is the set the front gate
+		// exists to stop growing.
+		const bool bContainEngaged = Impl->CaDeferredLastStep > 0 || Impl->CaBudgetedSteps > 0 ||
+		                             Impl->CaForcedSettles > 0 || Snap.ActiveBricks > 0;
+		if (bContainEngaged)
+		{
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("WaterContain: active=%lld deferred=%d budget=%d ceiling=%d budgetedSteps=%lld ")
+			       TEXT("forced=%lld plateauSteps=%d frontRefused=%llu mobilized=%llu tickMs=%.3f"),
+			       Snap.ActiveBricks, Impl->CaDeferredLastStep,
+			       CVarVoxelWaterStepBudgetBricks.GetValueOnGameThread(),
+			       CVarVoxelWaterActiveCeilingBricks.GetValueOnGameThread(), (long long)Impl->CaBudgetedSteps,
+			       (long long)Impl->CaForcedSettles, Impl->CaPlateauSteps,
+			       (unsigned long long)Impl->Mob.frontGateRefusals(),
+			       (unsigned long long)Impl->Mob.mobilizedBricks().size(), Snap.TickMs);
+		}
+
+		// Phase A tide engagement, on the same 1Hz cadence, ONLY while armed
+		// (a Tide=0 run stays byte-identical in its log too). This line is the
+		// leg gate: `steps` climbing proves the datum machinery is live, and
+		// an armed leg where steps stays 0 for a whole cycle is visibly wrong
+		// -- the counter can fail, which is what makes it a counter.
+		if (Impl->TideState.bEnabled)
+		{
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("Tide: steps=%d offsetMm=%d datumMm=%d seaNowMm=%d velUUPerS=%.4f phase=%.3f"),
+			       Impl->TideState.DatumSteps,
+			       int32(FMath::RoundToDouble(Impl->TideState.OffsetUU * double(vxc::kVoxelSizeMm) /
+			                                  VoxelCoords::VoxelSizeUU)),
+			       Impl->TideState.OffsetQuantisedMm, Impl->SeaLevelNowMm,
+			       Impl->TideState.VelocityUUPerS, Impl->TideState.NormPhase);
+		}
+
+		// Phase C engagement, same 1 Hz cadence, ONLY while the window is
+		// armed (an OceanConnect=0 run stays byte-identical in its log too).
+		// The leg gates read: seeds==0 or recomputes==0 on a coastal leg
+		// FAILS; inlandDeltaMm != 0 on any leg FAILS (the tidal overlay
+		// leaked onto an inland lake); bypassedInland is the deep-margin
+		// guard visibly doing its job.
+		if (Impl->OceanConnect.bValid)
+		{
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("OceanConnect: n=%d seeds=%u wet=%u connected=%u basinsFlagged=%d recomputes=%d ")
+			       TEXT("bypassedInland=%d inlandDeltaMm=%d recentres=%d groundFillMs=%.2f highSeeds=%u ")
+			       TEXT("highConnected=%u"),
+			       FVoxelWaterImpl::FOceanConnectivityWindow::kN, Impl->OceanConnect.NowStats.seedCells,
+			       Impl->OceanConnect.NowStats.wetCells, Impl->OceanConnect.NowStats.connectedCells,
+			       Impl->TidalOracle ? Impl->TidalOracle->Flagged : 0, Impl->OceanConnect.Recomputes,
+			       Impl->TidalOracle ? Impl->TidalOracle->BypassedInland : 0, Impl->InlandDatumDeltaMm,
+			       Impl->OceanConnect.Recentres, Impl->OceanConnect.LastGroundFillMs,
+			       Impl->OceanConnect.HighStats.seedCells, Impl->OceanConnect.HighStats.connectedCells);
 		}
 	}
 
@@ -7064,6 +8334,79 @@ bool UVoxelWaterSubsystem::IsOpenSeaAtWorld(double WorldZUU, double WorldgenGrou
 	return WorldZUU < SeaZ && WorldgenGroundZUU < SeaZ && WorldZUU >= WorldgenGroundZUU;
 }
 
+bool UVoxelWaterSubsystem::IsOpenSeaNowAtWorld(double WorldZUU, double WorldgenGroundZUU) const
+{
+	// The static rule verbatim, at today's datum. BOTH terms move with the
+	// tide, deliberately: at low water a seabed column whose ground now stands
+	// above the surface is exposed foreshore, not sea -- which is exactly what
+	// the 3-argument oceanSurfaceMmAt composition says (ground < seaLevelNow),
+	// so this predicate and the ImplicitFn keep telling one story.
+	const double SeaZ = SeaSurfaceZNowUU();
+	return WorldZUU < SeaZ && WorldgenGroundZUU < SeaZ && WorldZUU >= WorldgenGroundZUU;
+}
+
+double UVoxelWaterSubsystem::SeaSurfaceZNowUU() const
+{
+	// The QUANTISED offset, per the header's contract: geometry and predicates
+	// follow the stepped datum. Impl-less (or tide-dark) worlds read exactly
+	// SeaLevelZUU().
+	return SeaLevelZUU() + (Impl ? Impl->TideState.OffsetQuantisedUU : 0.0);
+}
+
+FVoxelTideState UVoxelWaterSubsystem::GetTideState() const
+{
+	return Impl ? Impl->TideState : FVoxelTideState{};
+}
+
+bool UVoxelWaterSubsystem::IsOceanConnectedAtWorld(double WorldXUU, double WorldYUU,
+                                                   bool* bOutKnown) const
+{
+	if (bOutKnown != nullptr)
+	{
+		*bOutKnown = false;
+	}
+	if (!Impl)
+	{
+		return false;
+	}
+	return OceanConnectedAtMm(*Impl, VoxelCoords::WorldToMm(WorldXUU),
+	                          VoxelCoords::WorldToMm(WorldYUU), bOutKnown);
+}
+
+bool UVoxelWaterSubsystem::IsOceanConnectivityArmed() const
+{
+	return Impl && Impl->OceanConnect.bValid;
+}
+
+int32 UVoxelWaterSubsystem::GetSeaLevelNowMm() const
+{
+	return Impl ? Impl->SeaLevelNowMm : vxc::kSeaLevelMm;
+}
+
+bool UVoxelWaterSubsystem::GetBasinDatumNowZUU(int32 TileX, int32 TileY, int32 BasinId,
+                                               double& OutZUU) const
+{
+	if (!Impl || !Impl->Water)
+	{
+		return false;
+	}
+	check(IsInGameThread()); // basinsForTile can decode; same rule as the gather
+	const std::vector<vxc::BasinEntry>* Basins = Impl->Water->basinsForTile(TileX, TileY);
+	if (Basins == nullptr || BasinId < 0 || size_t(BasinId) >= Basins->size())
+	{
+		return false;
+	}
+	// THROUGH THE SEAM (ledger + tidal decorator), never the wire field -- the
+	// same number the near field fills to and the gather reports.
+	const int32 DatumMm = Impl->Water->basinDatumMm(TileX, TileY, (*Basins)[size_t(BasinId)]);
+	if (DatumMm == vxc::kNoWaterMm)
+	{
+		return false;
+	}
+	OutZUU = VoxelCoords::MmToWorld(int64(DatumMm));
+	return true;
+}
+
 bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 {
 	if (GetWaterFillAtWorld(WorldUU) > 0)
@@ -7077,7 +8420,115 @@ bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 	// GetSurfaceHeightUU is the AMPLIFIER column surface -- worldgen, not the
 	// edited overlay -- which is exactly what the seabed test needs: a pit a
 	// player dug into land is not an ocean, and its edited ground is.
-	return IsOpenSeaAtWorld(WorldUU.Z, Impl->Terrain.GetSurfaceHeightUU(WorldUU.X, WorldUU.Y));
+	//
+	// The NOW form (Phase A): swimming and submersion follow the tide. With
+	// voxel.Water.Tide 0 the quantised offset is exactly 0 and this is the
+	// static IsOpenSeaAtWorld to the bit.
+	return IsOpenSeaNowAtWorld(WorldUU.Z, Impl->Terrain.GetSurfaceHeightUU(WorldUU.X, WorldUU.Y));
+}
+
+// THE ONE COLUMN RESOLUTION (tides plan A5): worldgen ground + cavern flood
+// from the terrain's own accessor, the baked datum through the ledger seam,
+// the sea composed at SeaLevelNowMm by lakes.h's 3-argument max(). BOTH
+// SubmergedDepthUUAtWorld and WaterSurfaceZAtWorld run THIS and only this, so
+// a boat's float height and a swimmer's depth are the same number by
+// construction rather than by two functions agreeing today.
+//
+// BOTH WORLDGEN FACTS COME FROM THE TERRAIN'S OWN AMPLIFIER, in one call, for
+// the reason spelled out at length at the Impl amplifier's declaration:
+// `Impl->Amp` is built over a SyntheticTileSampler and under -VoxelTileDir it
+// is amplifying a DIFFERENT PLANET from the one on screen (measured: 638.451 m
+// of ground here against 77.6 m on screen). A surface taken against the wrong
+// ground is that defect restated, so this reads the accessor the implicit
+// field itself reads and never `Amp`. The accessor's bool return is ignored
+// for the same reason EnsureWorldgenColumn ignores it: false means "no world
+// yet" and the outputs are already the safe pair (ground 0, no cavern).
+//
+// THE LAKE HALF IS LEDGER-ADJUSTED AND THERE IS NO CODE HERE THAT SAYS SO,
+// which is the point -- exactly as in ImplicitFillAtVoxel:
+// waterSurfaceMmAtVoxel reaches LakeSampler::surfaceAtPixel, which asks
+// basinDatumMm, which is the seam the basin ledger (and, in Phase C, the
+// tidal decorator) binds to. A credited basin deepens here by the same number
+// the sheet raises its surface by.
+//
+// Out.Kind ties: where the baked surface and the sea stand EQUAL -- the river
+// mouth / coastal-lake coplanar case implicitWaterDatumMm's comment walks
+// through -- the answer is Ocean, the wider body, so a consumer branching on
+// kind treats the join as the sea it is continuous with.
+static void ResolveWaterSurfaceColumn(FVoxelWaterImpl& Impl, double WorldXUU, double WorldYUU,
+                                      FWaterSurfaceSample& Out, int32& OutGroundMm,
+                                      int32& OutCavernFloodMm, int32& OutDatumMm)
+{
+	const int64 Vx = int64(FMath::FloorToDouble(WorldXUU / VoxelCoords::VoxelSizeUU));
+	const int64 Vy = int64(FMath::FloorToDouble(WorldYUU / VoxelCoords::VoxelSizeUU));
+
+	int32 GroundMm = 0;
+	int32 CavernFloodMm = INT32_MIN;
+	Impl.Terrain.GetWorldgenSurfaceAndCavernFloodMm(Vx, Vy, GroundMm, CavernFloodMm);
+
+	const int32 BakedMm =
+		Impl.Water ? Impl.Water->waterSurfaceMmAtVoxel(Vx, Vy) : vxc::kNoWaterMm;
+	const int32 DatumMm = vxc::implicitWaterDatumMm(BakedMm, GroundMm, Impl.SeaLevelNowMm);
+
+	Out = FWaterSurfaceSample{};
+	Out.GroundZUU = VoxelCoords::MmToWorld(GroundMm);
+	if (DatumMm != vxc::kNoWaterMm)
+	{
+		Out.bHasWater = true;
+		Out.SurfaceZUU = VoxelCoords::MmToWorld(DatumMm);
+		const int32 SeaMm = vxc::oceanSurfaceMmAt(GroundMm, Impl.SeaLevelNowMm);
+		Out.Kind = (SeaMm != vxc::kNoWaterMm && SeaMm >= DatumMm) ? EWaterSurfaceKind::Ocean
+		                                                          : EWaterSurfaceKind::Lake;
+
+		// Phase C: connectivity from the BFS window -- the only honest source.
+		// Outside the window the answer is UNKNOWN, which resolves by KIND: an
+		// Ocean column falls back to its own geological fact (it IS the open
+		// sea by the datum test that just named it Ocean), a Lake column to
+		// false (waves must not reach water the grid never certified).
+		bool bKnown = false;
+		const bool bConnected = OceanConnectedAtMm(Impl, VoxelCoords::WorldToMm(WorldXUU),
+		                                           VoxelCoords::WorldToMm(WorldYUU), &bKnown);
+		Out.bOceanConnected = bKnown ? bConnected : (Out.Kind == EWaterSurfaceKind::Ocean);
+
+		// And the tidal kind: if the winning row is oracle-tidal, this column
+		// is a rock pool / tidal reach, not an inland lake. Asked of the SAME
+		// row the datum came from (basinAtVoxel reruns the winner pick), so
+		// Kind and height cannot name two different basins.
+		if (Out.Kind == EWaterSurfaceKind::Lake && Impl.TidalOracle && Impl.Water)
+		{
+			int32_t BTx = 0, BTy = 0;
+			uint16_t BId = 0;
+			if (Impl.Water->basinAtVoxel(Vx, Vy, BTx, BTy, BId))
+			{
+				const std::vector<vxc::BasinEntry>* Rows = Impl.Water->basinsForTile(BTx, BTy);
+				if (Rows != nullptr && size_t(BId) < Rows->size() &&
+				    Impl.TidalOracle->isTidal(BTx, BTy, (*Rows)[BId]))
+				{
+					Out.Kind = EWaterSurfaceKind::TidalLake;
+				}
+			}
+		}
+	}
+	OutGroundMm = GroundMm;
+	OutCavernFloodMm = CavernFloodMm;
+	OutDatumMm = DatumMm;
+}
+
+bool UVoxelWaterSubsystem::WaterSurfaceZAtWorld(double WorldXUU, double WorldYUU,
+                                                FWaterSurfaceSample& OutSample) const
+{
+	OutSample = FWaterSurfaceSample{};
+	if (!Impl)
+	{
+		return false;
+	}
+	// Fine-tile sampler: game thread only, may touch disk -- the same rule,
+	// for the same reason, as SubmergedDepthUUAtWorld below.
+	check(IsInGameThread());
+	int32 GroundMm = 0, CavernFloodMm = INT32_MIN, DatumMm = vxc::kNoWaterMm;
+	ResolveWaterSurfaceColumn(*Impl, WorldXUU, WorldYUU, OutSample, GroundMm, CavernFloodMm,
+	                          DatumMm);
+	return OutSample.bHasWater;
 }
 
 double UVoxelWaterSubsystem::SubmergedDepthUUAtWorld(const FVector& WorldUU) const
@@ -7107,44 +8558,16 @@ double UVoxelWaterSubsystem::SubmergedDepthUUAtWorld(const FVector& WorldUU) con
 		return 0.0;
 	}
 
-	const int64 Vx = int64(FMath::FloorToDouble(WorldUU.X / VoxelCoords::VoxelSizeUU));
-	const int64 Vy = int64(FMath::FloorToDouble(WorldUU.Y / VoxelCoords::VoxelSizeUU));
-
-	// BOTH WORLDGEN FACTS FROM THE TERRAIN'S OWN AMPLIFIER, in one call, for the
-	// reason spelled out at length at :849-891: `Impl->Amp` is built over a
-	// SyntheticTileSampler and under -VoxelTileDir it is amplifying a DIFFERENT
-	// PLANET from the one on screen. That was measured at 638.451 m of ground
-	// here against 77.6 m on screen. A depth taken against the wrong ground is
-	// the same defect restated in a new place, so this reads the accessor the
-	// implicit field itself reads and never `Amp`.
-	//
-	// The bool return is ignored for the same reason EnsureWorldgenColumn (:907)
-	// ignores it: false means "no world yet" (the transient Entry map), and the
-	// outputs are ALREADY the safe pair -- ground 0, no cavern -- so there is
-	// nothing to branch on. A ground of 0 mm sends a point below the datum down
-	// the underground branch, which then finds no cavern site and falls through
-	// to the conservative 0.0 below. That is the correct behaviour for a world
-	// that does not exist yet; inventing water either way is not.
-	int32 GroundMm = 0;
-	int32 CavernFloodMm = INT32_MIN;
-	Impl->Terrain.GetWorldgenSurfaceAndCavernFloodMm(Vx, Vy, GroundMm, CavernFloodMm);
-
-	// THE LAKE HALF IS LEDGER-ADJUSTED AND THERE IS NO CODE HERE THAT SAYS SO,
-	// which is the point -- exactly as in ImplicitFillAtVoxel (:960).
-	// waterSurfaceMmAtVoxel reaches LakeSampler::surfaceAtPixel, which asks
-	// basinDatumMm, which is the seam the basin ledger binds to. So a credited
-	// basin deepens here by the same number the sheet raises its surface by,
-	// because both went through that seam instead of each applying its own delta.
-	//
-	// This is ALSO why there is no basin lookup in this function even though the
-	// brief mentioned basinsForTile: GatherLakeSheetBasinsInTile is the RECTANGLE
-	// query -- it wants a bbox and a tile id to build geometry from. A point
-	// query wants the column, and the column query already resolves the basin
-	// internally (extent mask -> basin id -> datum) with a per-tile memo the CA
-	// keeps hot. Going through the basin registry here would mean re-implementing
-	// point-in-extent against the bbox list, which is both slower and a second
-	// spelling of a rule voxel-core already owns.
-	const int32 BakedMm = Impl->Water ? Impl->Water->waterSurfaceMmAtVoxel(Vx, Vy) : vxc::kNoWaterMm;
+	// THE COLUMN, THROUGH THE ONE RESOLUTION (tides plan A5). Ground, cavern
+	// flood, ledger-adjusted baked datum and the sea at SeaLevelNowMm all come
+	// from ResolveWaterSurfaceColumn above -- the same call, comment for
+	// comment, that WaterSurfaceZAtWorld makes, which is what makes a boat and
+	// a swimmer structurally unable to disagree. This function keeps only what
+	// is Z-dependent: the underground/overwater branch and the depth subtract.
+	FWaterSurfaceSample Sample;
+	int32 GroundMm = 0, CavernFloodMm = INT32_MIN, DatumMm = vxc::kNoWaterMm;
+	ResolveWaterSurfaceColumn(*Impl, WorldUU.X, WorldUU.Y, Sample, GroundMm, CavernFloodMm,
+	                          DatumMm);
 
 	// mm, and rounded the same way every other mm<->UU conversion in the client
 	// is (VoxelCoords::WorldToMm) so a depth of exactly zero means exactly the
@@ -7174,12 +8597,12 @@ double UVoxelWaterSubsystem::SubmergedDepthUUAtWorld(const FVector& WorldUU) con
 	else
 	{
 		// ABOVE THE WORLDGEN GROUND: lake-or-sea, composed by lakes.h's own
-		// implicitWaterDatumMm (max of the baked surface and oceanSurfaceMmAt,
-		// with the kNoWaterMm cases handled) rather than by a max written here.
-		// That is the identical call the near-field sweep makes at :1057, so the
-		// depth this returns is measured to the very surface the near field
-		// meshes and the far-field sheet draws -- not to a third opinion.
-		const int32 DatumMm = vxc::implicitWaterDatumMm(BakedMm, GroundMm);
+		// implicitWaterDatumMm (max of the baked surface and oceanSurfaceMmAt
+		// at SeaLevelNowMm, with the kNoWaterMm cases handled) rather than by
+		// a max written here -- already done inside ResolveWaterSurfaceColumn.
+		// That is the identical composition the near-field ImplicitFn makes,
+		// so the depth this returns is measured to the very surface the near
+		// field meshes and the far-field sheet draws -- not to a third opinion.
 		if (DatumMm != vxc::kNoWaterMm)
 		{
 			SurfaceMm = int64(DatumMm);
@@ -7269,9 +8692,15 @@ int32 UVoxelWaterSubsystem::GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY
 	for (size_t i = 0; i < Basins->size(); ++i)
 	{
 		const vxc::BasinEntry& B = (*Basins)[i];
-		if (!B.holdsWater())
+		const bool bTidal =
+			Impl->TidalOracle != nullptr && Impl->TidalOracle->isTidal(TileX, TileY, B);
+		if (!B.holdsWater() && !bTidal)
 		{
-			continue; // a dry playa has no sheet, by the same rule the sampler uses
+			// A dry playa has no sheet, by the same rule the sampler uses --
+			// UNLESS the oracle vouches it re-floods on the tide (Phase C's
+			// admit-on-demand: a rock pool that rendered nothing at high
+			// water would be a hole in the sea).
+			continue;
 		}
 		// Inclusive pixel bbox -> world UU, taking the OUTER edge of the last
 		// pixel so the rectangle covers the pixels rather than their centres
@@ -7284,14 +8713,45 @@ int32 UVoxelWaterSubsystem::GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY
 		Info.MinYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY0) * PixelMm);
 		Info.MaxXUU = VoxelCoords::MmToWorld((OxPx + B.bboxX1 + 1) * PixelMm);
 		Info.MaxYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY1 + 1) * PixelMm);
-		// THE LEDGER-ADJUSTED DATUM, not the bare wire field (Phase 2). The near
-		// field already reads it -- ImplicitFillAtVoxel goes through
-		// waterSurfaceMmAtVoxel, which goes through LakeSampler::surfaceAtPixel,
-		// which asks the same seam -- so if the sheet kept reading surfaceMm a
-		// credited lake would render at two different heights depending on
-		// whether you were inside the 52 m disc. That seam was closed once
-		// already when the sheet shipped and this is what keeps it closed.
-		Info.SurfaceZUU = VoxelCoords::MmToWorld(int64(Impl->Water->basinDatumMm(TileX, TileY, B)));
+		// THE LEDGER-ADJUSTED DATUM, not the bare wire field (Phase 2) -- and
+		// since Phase C the seam is the TIDAL decorator wrapping the ledger,
+		// so a qualified pool's SurfaceZUU rides the tide here with no code
+		// saying so. The near field already reads it -- ImplicitFillAtVoxel
+		// goes through waterSurfaceMmAtVoxel, which goes through
+		// LakeSampler::surfaceAtPixel, which asks the same seam -- so if the
+		// sheet kept reading surfaceMm a credited lake would render at two
+		// different heights depending on whether you were inside the 52 m
+		// disc. That seam was closed once already when the sheet shipped and
+		// this is what keeps it closed.
+		const int32 SeamMm = Impl->Water->basinDatumMm(TileX, TileY, B);
+		Info.SurfaceZUU = VoxelCoords::MmToWorld(int64(SeamMm));
+
+		// THE INLAND RED GATE (plan C): a NON-tidal basin's seam answer must
+		// be the ledger's, exactly -- the decorator's passthrough is bit-exact
+		// by construction, and this counter is what catches the construction
+		// being bent. Nonzero on any leg is a failed leg.
+		if (!bTidal && Impl->TidalDatum && Impl->BasinDatum)
+		{
+			const int32 InnerMm = Impl->BasinDatum->basinDatumMm(TileX, TileY, B);
+			const int32 Delta = FMath::Abs(SeamMm - InnerMm);
+			if (Delta > Impl->InlandDatumDeltaMm)
+			{
+				Impl->InlandDatumDeltaMm = Delta;
+			}
+		}
+
+		// Phase C: is this basin's water one body with the sea right now --
+		// sampled at the baked v2 worldOutlet (the spill saddle), the one cell
+		// the sea provably crosses when it crosses. v1 rows and columns
+		// outside the window read false (unknown must not wave water).
+		if (B.hasV2() && PixelMm > 0)
+		{
+			bool bKnown = false;
+			const bool bConn = OceanConnectedAtMm(
+				*Impl, int64(B.worldOutletX) * PixelMm + PixelMm / 2,
+				int64(B.worldOutletY) * PixelMm + PixelMm / 2, &bKnown);
+			Info.bOceanConnected = bKnown && bConn;
+		}
 		if (Info.MaxXUU < CenterXUU - RadiusUU || Info.MinXUU > CenterXUU + RadiusUU ||
 		    Info.MaxYUU < CenterYUU - RadiusUU || Info.MinYUU > CenterYUU + RadiusUU)
 		{
@@ -7301,6 +8761,34 @@ int32 UVoxelWaterSubsystem::GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY
 	}
 	return Out.Num() - Before;
 }
+
+namespace
+{
+// PHASE C4 ROUTING, in one place for all three extent consumers (both rect
+// builders and the despawn bit grid): an oracle-tidal basin's extent follows
+// its CURRENT datum -- at high water the sheet reaches the high-water line,
+// at low water it retreats to the pool -- while every other basin keeps the
+// baked mask, byte for byte. The datum comes through the SAME seam the
+// heights do (ledger + tidal decorator), so the outline and the surface can
+// never describe two different tides; it is quantised by construction (tide
+// quantum / sill constant), which is what makes extentMaskAtDatum's per-basin
+// memo actually hit. Rounding doctrine untouched: the mask changes, the
+// over-cover draw rule and under-cover despawn rule still read it from their
+// opposite sides.
+const std::vector<uint8_t>* ResolveExtentMask(FVoxelWaterImpl& Impl, int32 TileX, int32 TileY,
+                                              uint16 Id, const vxc::BasinEntry& B)
+{
+	if (Impl.TidalOracle != nullptr && Impl.TidalOracle->isTidal(TileX, TileY, B))
+	{
+		const int32 DatumMm = Impl.Water->basinDatumMm(TileX, TileY, B);
+		if (DatumMm != vxc::kNoWaterMm)
+		{
+			return Impl.Water->extentMaskAtDatum(TileX, TileY, Id, DatumMm);
+		}
+	}
+	return Impl.Water->extentMaskFor(TileX, TileY, Id);
+}
+} // namespace
 
 int32 UVoxelWaterSubsystem::BuildLakeSheetRects(const FLakeSheetBasin& Basin, int32 StepPx,
                                                  TArray<FBox2D>& OutRectsUU, bool& bOutResolved) const
@@ -7319,7 +8807,7 @@ int32 UVoxelWaterSubsystem::BuildLakeSheetRects(const FLakeSheetBasin& Basin, in
 	}
 	const vxc::BasinEntry& B = (*Basins)[size_t(Basin.BasinId)];
 	const std::vector<uint8_t>* Mask =
-		Impl->Water->extentMaskFor(Basin.TileX, Basin.TileY, uint16(Basin.BasinId));
+		ResolveExtentMask(*Impl, Basin.TileX, Basin.TileY, uint16(Basin.BasinId), B);
 	if (Mask == nullptr)
 	{
 		// The tile or one of its elevation blocks would not decode. Reporting
@@ -7372,7 +8860,7 @@ int32 UVoxelWaterSubsystem::BuildLakeSheetRectsBanded(const FLakeSheetBasin& Bas
 	}
 	const vxc::BasinEntry& B = (*Basins)[size_t(Basin.BasinId)];
 	const std::vector<uint8_t>* Mask =
-		Impl->Water->extentMaskFor(Basin.TileX, Basin.TileY, uint16(Basin.BasinId));
+		ResolveExtentMask(*Impl, Basin.TileX, Basin.TileY, uint16(Basin.BasinId), B);
 	if (Mask == nullptr)
 	{
 		return 0; // decode failure, reported apart from "no water" -- see the single-step build
@@ -7478,8 +8966,11 @@ bool UVoxelWaterSubsystem::BuildBasinExtentBits(const FLakeSheetBasin& Basin, do
 		return false;
 	}
 	const vxc::BasinEntry& B = (*Basins)[size_t(Basin.BasinId)];
+	// Phase C4: the despawn grid follows the tidal datum through the same
+	// routing as the draw -- the mask moves, the centre-sample UNDER-cover
+	// rounding stays (do not "make them consistent"; see basinExtentBits).
 	const std::vector<uint8_t>* Mask =
-		Impl->Water->extentMaskFor(Basin.TileX, Basin.TileY, uint16(Basin.BasinId));
+		ResolveExtentMask(*Impl, Basin.TileX, Basin.TileY, uint16(Basin.BasinId), B);
 	if (Mask == nullptr)
 	{
 		return false; // would not decode -- the caller must disable the sink
@@ -8452,40 +9943,112 @@ bool UVoxelWaterSubsystem::ApplyReplicatedWaterDiffs(const TArray<uint8>& Bytes)
 
 bool UVoxelWaterSubsystem::SaveWaterState() const
 {
-	if (!Impl)
-	{
-		UE_LOG(LogVoxelWater, Warning, TEXT("SaveWaterState: no water Impl -- nothing to save."));
-		return false;
-	}
-	UWorld* World = GetWorld();
-	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
-	if (NetMode == NM_Client)
-	{
-		UE_LOG(LogVoxelWater, Warning,
-		       TEXT("SaveWaterState: refused on NM_Client -- only the authority (server/listen/standalone) has an authoritative CA to persist."));
-		return false;
-	}
+    auto Terrain=GetWorld()?GetWorld()->GetSubsystem<UVoxelWorldSubsystem>():nullptr;
+    if (!Terrain) return false;
+    const FString Slug=VoxelSave::GetActiveSlug();
+    return Slug.IsEmpty()?Terrain->SaveWorld():Terrain->SaveWorldToPath(VoxelSave::WorldLogPath(Slug));
+}
 
-	// W4 (ADR-0004): flush the shallow-water sheet back into the CA BEFORE the
-	// serializer looks at it. Sheet depth is real volume in the same fill units
-	// (swe.h S2, "255 fill units == one full voxel"), and vxc::WaterState::
-	// serialize walks the CA's bricks and the mobilizer's key set -- it has
-	// never heard of an SweGrid and must not have to. Flushing here is what
-	// keeps ADR-0005's blob format, kWaterCAVersion and the whole load path
-	// completely untouched by this feature: a save written with voxel.Water.SWE
-	// armed is byte-comparable with one written without it, because by the time
-	// the bytes are produced the sheet is empty and every unit is back in a CA
-	// cell. No-op (and silent) when nothing is armed. Total no-op cost on the
-	// untouched path: one null pointer test.
-	//
-	// A const method mutating simulation state deserves a word: TUniquePtr's
-	// constness is shallow, so *Impl is a mutable FVoxelWaterImpl& here, and the
-	// flush is genuinely part of "produce a correct save" rather than a side
-	// effect of it. The alternative -- serialising and losing the sheet -- is
-	// silent data loss, which is not a trade const-correctness wins.
-	FlushSweIntoCA(*Impl, TEXT("SaveWaterState"));
+bool UVoxelWaterSubsystem::CaptureCheckpoint(TArray<uint8>& Water,TArray<uint8>& Hydrology,double& Remainder,bool& ImplicitOcean) const
+{
+    check(IsInGameThread()); Water.Empty(); Hydrology.Empty();
+    if (!Impl || !GetWorld() || GetWorld()->GetNetMode()==NM_Client) return false;
+    if ((Impl->Rivers || !Impl->PendingHydroGraphBlob.empty()) && !Impl->bHasPersistentRiverBounds) return false;
+    FlushSweIntoCA(*Impl,TEXT("Checkpoint"));
+    if (Impl->SweSheet && Impl->SweSheet->totalVolume()!=0) return false;
+    // Return unconsumed spill transfers to their scalar owner before capture.
+    const bool Intercept=Impl->bFluidSpillInterceptEnabled;
+    Impl->bFluidSpillInterceptEnabled=false;
+    RouteBasinSpills(*Impl);
+    Impl->bFluidSpillInterceptEnabled=Intercept;
+    std::vector<uint8_t> Bytes,Ledger;
+    vxc::WaterState::serialize(Impl->CA,Impl->Mob,Bytes);
+    Water.Append(Bytes.data(),int32(Bytes.size()));
+    vxc::BasinLedger Empty;
+    vxc::BasinLedgerState::serialize(Impl->Basins?*Impl->Basins:Empty,Ledger);
+    std::vector<uint8_t> Graph=Impl->PendingHydroGraphBlob;
+    if (Impl->Rivers) { Graph.clear(); vxc::RiverNetState::serialize(*Impl->Rivers,Graph); }
+    Bytes.clear(); vxc::ByteWriter Writer(Bytes);
+    Writer.u32(kHydroMagic); Writer.u32(2); Writer.u32(uint32(Ledger.size()));
+    Bytes.insert(Bytes.end(),Ledger.begin(),Ledger.end()); Writer.u32(uint32(Graph.size()));
+    Bytes.insert(Bytes.end(),Graph.begin(),Graph.end());
+    Writer.u8(Impl->bHasPersistentRiverBounds?1:0);
+    Writer.u64(uint64(Impl->PersistentRiverBounds.px0)); Writer.u64(uint64(Impl->PersistentRiverBounds.py0));
+    Writer.u64(uint64(Impl->PersistentRiverBounds.px1)); Writer.u64(uint64(Impl->PersistentRiverBounds.py1));
+    const double Delay=Impl->Rivers?FMath::Clamp(Impl->RiverStepSeconds-(GetWorld()->GetTimeSeconds()-Impl->RiverLastTickWorldSeconds),0.0,Impl->RiverStepSeconds):Impl->PendingRiverDelay;
+    uint64 Bits=0; FMemory::Memcpy(&Bits,&Delay,8); Writer.u64(Bits);
+    Writer.u8(Impl->RestoredRiverEnabled.Get(VoxelDebug::GetWaterRivers())?1:0);
+    Hydrology.Append(Bytes.data(),int32(Bytes.size()));
+    Remainder=Impl->TickAccumSeconds; ImplicitOcean=Impl->bImplicitOcean;
+    return FMath::IsFinite(Remainder) && Remainder>=0 && Remainder<=double(FVoxelWaterImpl::FixedStepSeconds);
+}
 
-	return SaveWaterStateToDisk(*Impl, Impl->Terrain.GetSeed());
+bool UVoxelWaterSubsystem::RestoreCheckpoint(const TArray<uint8>& Water,const TArray<uint8>& Hydrology,double Remainder,bool ImplicitOcean)
+{
+    check(IsInGameThread());
+    if (!Impl || !GetWorld() || GetWorld()->GetNetMode()==NM_Client ||
+        !FMath::IsFinite(Remainder) || Remainder<0 || Remainder>double(FVoxelWaterImpl::FixedStepSeconds) ||
+        Water.IsEmpty() || Hydrology.Num()<16 ||
+        Impl->Rivers || !Impl->PendingHydroGraphBlob.empty() ||
+        (Impl->Basins && Impl->Basins->basinCount()!=0)) return false;
+    auto Parsed=vxc::WaterState::parse(Water.GetData(),size_t(Water.Num()));
+    if (!Parsed) return false;
+    uint32_t Magic=0,Version=0,LedgerSize=0,GraphSize=0;
+    vxc::ByteReader Reader(Hydrology.GetData(),size_t(Hydrology.Num()));
+    if (!Reader.u32(Magic) || Magic!=kHydroMagic || !Reader.u32(Version) || (Version!=1 && Version!=2) ||
+        !Reader.u32(LedgerSize) || LedgerSize==0 || uint64(LedgerSize)+16>uint64(Hydrology.Num()) ||
+        !Reader.skip(LedgerSize) || !Reader.u32(GraphSize) || uint64(LedgerSize)+16+GraphSize>uint64(Hydrology.Num())) return false;
+    const uint8* GraphAt=Hydrology.GetData()+16+LedgerSize;
+    if (!Reader.skip(GraphSize)) return false;
+    vxc::RegionBounds Bounds{}; uint8 HasRegion=0,Enabled=0; double Delay=0;
+    if (Version==2)
+    {
+        uint64 X0=0,Y0=0,X1=0,Y1=0,Bits=0;
+        if (!Reader.u8(HasRegion) || HasRegion>1 || !Reader.u64(X0) || !Reader.u64(Y0) ||
+            !Reader.u64(X1) || !Reader.u64(Y1) || !Reader.u64(Bits) || !Reader.u8(Enabled) || Enabled>1) return false;
+        Bounds.px0=int64(X0); Bounds.py0=int64(Y0); Bounds.px1=int64(X1); Bounds.py1=int64(Y1);
+        FMemory::Memcpy(&Delay,&Bits,8);
+        if (!FMath::IsFinite(Delay) || Delay<0 || Delay>Impl->RiverStepSeconds) return false;
+        if (HasRegion && (Bounds.px0< -1000000000000ll || Bounds.px0>1000000000000ll || Bounds.py0< -1000000000000ll || Bounds.py0>1000000000000ll ||
+            Bounds.px1!=Bounds.px0+kRiverRegionPixels-1 || Bounds.py1!=Bounds.py0+kRiverRegionPixels-1)) return false;
+    }
+    if (!Reader.atEnd() || (GraphSize && !HasRegion)) return false;
+    if (GraphSize)
+    {
+        vxc::RiverNetwork StagedGraph;
+        StagedGraph.buildFromFlowAccumulation(Impl->Tiles,Impl->Terrain.GetSeed(),Bounds);
+        if (!vxc::RiverNetState::load(GraphAt,GraphSize,StagedGraph)) return false;
+    }
+    // Validate the complete ledger before applying either domain to the live world.
+    vxc::BasinLedger Staged;
+    if (!vxc::BasinLedgerState::load(Hydrology.GetData()+12,LedgerSize,Staged) ||
+        (!Impl->Basins && Staged.basinCount()!=0)) return false;
+    const bool PreviousImplicit=Impl->bImplicitOcean;
+    Impl->bImplicitOcean=ImplicitOcean;
+    if (!Parsed->applyTo(Impl->CA,Impl->Mob)) { Impl->bImplicitOcean=PreviousImplicit; return false; }
+    Impl->bImplicitOceanPinned=true;
+    Impl->PersistentRiverBounds=Bounds; Impl->bHasPersistentRiverBounds=HasRegion!=0;
+    Impl->PendingHydroGraphBlob.assign(GraphAt,GraphAt+GraphSize);
+    Impl->PendingRiverDelay=Delay; Impl->RestoredRiverEnabled=Enabled!=0;
+    Impl->RiverCVarAtRestore=VoxelDebug::GetWaterRivers();
+    if (Impl->Basins && !vxc::BasinLedgerState::load(Hydrology.GetData()+12,LedgerSize,*Impl->Basins)) return false;
+    Impl->TickAccumSeconds=float(Remainder);
+    if (Impl->Water) Impl->Water->invalidateBasinDatumMemo();
+    MarkMobilizedBricksDirty(*Impl);
+    for (const auto& Entry:Impl->CA.bricks()) Impl->DirtyBricks.Add(ToCoord(Entry.first));
+    return true;
+}
+
+bool UVoxelWaterSubsystem::RestoreLegacyCheckpoint()
+{
+    if (!Impl) return false;
+    TArray<uint8> Water,Hydrology; double Remainder=0; bool Implicit=false;
+    if (!CaptureCheckpoint(Water,Hydrology,Remainder,Implicit)) return false;
+    const FString WaterPath=GetWaterSaveFilePath(Impl->Terrain.GetSeed());
+    const FString HydroPath=GetHydroSaveFilePath(Impl->Terrain.GetSeed());
+    if (FPaths::FileExists(WaterPath) && !FFileHelper::LoadFileToArray(Water,*WaterPath)) return false;
+    if (FPaths::FileExists(HydroPath) && !FFileHelper::LoadFileToArray(Hydrology,*HydroPath)) return false;
+    return RestoreCheckpoint(Water,Hydrology,0,Implicit);
 }
 
 bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint64& OutReloadedDigest, uint64& OutLiveVolume,
@@ -8513,7 +10076,11 @@ bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint6
 	// over the same implicit-flood / terrain-solidity callbacks the live pair
 	// uses (FVoxelWaterImpl's constructor) -- this is the load path a genuine
 	// reload runs, isolated so it never touches live state.
-	const FString Path = GetWaterSaveFilePath(Impl->Terrain.GetSeed());
+	const FString Slug=VoxelSave::GetActiveSlug();
+    const FString Logical=Slug.IsEmpty()?GetTerrainSaveFilePath(Impl->Terrain.GetSeed()):VoxelSave::WorldLogPath(Slug);
+    VoxelCheckpointStore::FResolved Checkpoint;
+    if (!VoxelCheckpointStore::Resolve(Logical,Checkpoint) || !Checkpoint.bSimulation) return false;
+    const FString Path=Checkpoint.WaterPath;
 	TArray<uint8> Bytes;
 	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
 	{

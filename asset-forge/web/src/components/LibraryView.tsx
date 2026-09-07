@@ -1,12 +1,20 @@
 import * as React from "react";
-import { Search } from "lucide-react";
+import { Rocket, Search } from "lucide-react";
 import type { World } from "../App";
 import type { SpeciesRow } from "../lib/schema";
+import { CATEGORIES, CATEGORY_LABEL } from "../lib/schema";
 import { allowedBiomes } from "../lib/schema";
+import { api } from "../lib/api";
+import { groupLabel } from "../lib/taxonomy";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import { Input } from "./ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import { useToast } from "./ui/toast";
+import {
+  Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
+} from "./ui/select";
 import { SpeciesPanel } from "./SpeciesPanel";
 import { cn } from "../lib/cn";
 
@@ -25,10 +33,11 @@ export function LibraryView({
 }) {
   const [kind, setKind] = React.useState("all");
   const [biome, setBiome] = React.useState("all");
-  // "What is actually in my library" defaults to the exporting set: approved
-  // verdicts (the grandfathered majority included). Switch to "Any verdict"
-  // to see drafts and rejections.
-  const [status, setStatus] = React.useState("approved");
+  // THE BURN-DOWN DEFAULT (owner ruling, 2026-09-05): every one of the
+  // grandfathered species is to be reviewed and approved explicitly, so the
+  // ledger opens on "Never reviewed" -- the work remaining -- and keeps doing
+  // so until that set is empty. Switch to "Approved" for the exporting set.
+  const [status, setStatus] = React.useState("unreviewed");
   const [query, setQuery] = React.useState("");
   const [selected, setSelected] = React.useState<string | null>(null);
 
@@ -49,7 +58,18 @@ export function LibraryView({
   const rows = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     return world.specs.filter((s) => {
-      if (kind !== "all" && s.kind !== kind) return false;
+      // ONE control, two axes. "cat:craftable" is a question a person actually
+      // asks -- "show me the things a player can make" -- and it is not the
+      // same question as "show me artifacts": the two coincide today and will
+      // stop coinciding the first time a craftable is not an `artifact`.
+      // Matching on the SERVER's resolved `category`, never re-derived here.
+      if (kind !== "all") {
+        if (kind.startsWith("cat:")) {
+          if (s.category !== kind.slice(4)) return false;
+        } else if (kind.startsWith("craft:")) {
+          if (s.category !== "craftable" || (s.subcategory ?? "ungrouped") !== kind.slice(6)) return false;
+        } else if (s.kind !== kind) return false;
+      }
       if (status !== "all") {
         if (status === "unreviewed" ? s.curation.curated : s.curation.status !== status) return false;
       }
@@ -63,6 +83,31 @@ export function LibraryView({
   }, [world.specs, world.biomes, kind, biome, status, query]);
 
   const selectedRow = world.specs.find((s) => s.name === selected) ?? null;
+  const unreviewed = world.specs.filter((s) => !s.curation.curated).length;
+  const counts = React.useMemo(() => {
+    const c = { approved: 0, draft: 0, rejected: 0 };
+    for (const s of world.specs) if (s.curation.curated) c[s.curation.status] = (c[s.curation.status] ?? 0) + 1;
+    return c;
+  }, [world.specs]);
+
+  /* ONE publish verb (plan P2): the same tools/publish.py the CLI runs,
+   * shelled by the server; the full report lands in a dialog. */
+  const toast = useToast();
+  const [publishing, setPublishing] = React.useState(false);
+  const [report, setReport] = React.useState<{ ok: boolean; text: string } | null>(null);
+  const doPublish = async () => {
+    setPublishing(true);
+    try {
+      const r = await api.publish();
+      setReport({ ok: r.ok, text: r.report });
+      if (!r.ok) toast.error("Publish FAILED — read the report");
+      await world.refreshSpecs();
+    } catch (e) {
+      toast.error("Publish failed: " + String(e));
+    } finally {
+      setPublishing(false);
+    }
+  };
 
   return (
     <div className="flex min-h-0 flex-1">
@@ -83,9 +128,44 @@ export function LibraryView({
               <SelectTrigger><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All kinds</SelectItem>
-                {world.kinds.map((k) => (
-                  <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
-                ))}
+                <SelectGroup>
+                  <SelectLabel>Category</SelectLabel>
+                  {CATEGORIES.map((c) => (
+                    <SelectItem key={c} value={`cat:${c}`}>
+                      All {(CATEGORY_LABEL[c] ?? c).toLowerCase()}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+                {CATEGORIES.map((c) => {
+                  const members = world.kinds.filter((k) => k.category === c);
+                  if (!members.length) return null;
+                  return (
+                    <SelectGroup key={c}>
+                      <SelectLabel>{CATEGORY_LABEL[c] ?? c}</SelectLabel>
+                      {c === "craftable" ? [...new Set(world.specs
+                        .filter((s) => s.category === c).map((s) => s.subcategory ?? "ungrouped"))]
+                        .sort().map((sub) => (
+                          <SelectItem key={sub} value={"craft:" + sub}>{groupLabel(sub)}</SelectItem>
+                        )) : members.map((k) => (
+                        <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
+                      ))}
+                    </SelectGroup>
+                  );
+                })}
+                {/* A kind the server hands back with an unknown category still
+                  * appears. A kind that vanished from the filter because its
+                  * category was mistyped would be far worse than an untidy
+                  * menu. */}
+                {world.kinds.some((k) => !k.category || !CATEGORIES.includes(k.category as never)) && (
+                  <SelectGroup>
+                    <SelectLabel>Other</SelectLabel>
+                    {world.kinds
+                      .filter((k) => !k.category || !CATEGORIES.includes(k.category as never))
+                      .map((k) => (
+                        <SelectItem key={k.key} value={k.key}>{k.label}</SelectItem>
+                      ))}
+                  </SelectGroup>
+                )}
               </SelectContent>
             </Select>
             <Select value={biome} onValueChange={setBiome}>
@@ -109,7 +189,26 @@ export function LibraryView({
               </SelectContent>
             </Select>
           </div>
-          <div className="font-mono text-xs text-parch-500">{rows.length} species shown</div>
+          <div className="flex items-center justify-between font-mono text-xs text-parch-500">
+            <span>{rows.length} species shown</span>
+            {/* The burn-down counter: visible whatever filter is active, gone
+              * only when it reaches zero. Counted from the server's resolved
+              * curation, never re-derived here. */}
+            {unreviewed > 0 && (
+              <span className="font-semibold text-gold-400">
+                {unreviewed} never reviewed
+              </span>
+            )}
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-mono text-[11px] text-parch-500">
+              {counts.approved} approved · {counts.draft} draft · {counts.rejected} rejected
+            </span>
+            <Button variant="gold" size="sm" disabled={publishing} onClick={() => void doPublish()}
+              title="Publish the library to the game: banks derived from kept seeds, manifest + categories re-exported, checks run">
+              <Rocket className="h-3.5 w-3.5" /> {publishing ? "Publishing…" : "Publish"}
+            </Button>
+          </div>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
@@ -125,11 +224,27 @@ export function LibraryView({
           ))}
           {rows.length === 0 && (
             <div className="p-6 text-center font-display text-sm text-parch-500">
-              Nothing in the ledger matches.
+              {status === "unreviewed" && unreviewed === 0
+                ? "Every species has been reviewed — the burn-down is done."
+                : "Nothing in the ledger matches."}
             </div>
           )}
         </div>
       </div>
+
+      {/* the publish report, verbatim -- the same text the CLI prints */}
+      {report && (
+        <Dialog open onOpenChange={(o) => !o && setReport(null)}>
+          <DialogContent className="max-w-4xl">
+            <DialogTitle className={report.ok ? "text-moss-400" : "text-rust-400"}>
+              Publish {report.ok ? "PASS" : "FAILED"}
+            </DialogTitle>
+            <pre className="max-h-[65vh] overflow-auto whitespace-pre-wrap font-mono text-[11px] text-parch-300">
+              {report.text}
+            </pre>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {/* detail side */}
       <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
@@ -170,9 +285,13 @@ function SpeciesLine({
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm text-parch-100">{row.name}</div>
         <div className="truncate font-mono text-[11px] text-parch-500">
-          {row.size_m.toFixed(1)} m · {allowed.length === 0 ? "nowhere" : allowed.length + " biome" + (allowed.length > 1 ? "s" : "")}
+          {row.subcategory && groupLabel(row.subcategory) + " · "}{row.size_m.toFixed(1)} m
+          {/* biome text is placement-derived: absent for vehicles (owner
+            * directive 2026-09-05) -- 'nowhere' on a canoe reads as a bug */}
+          {row.category !== "craftable" &&
+            " · " + (allowed.length === 0 ? "nowhere" : allowed.length + " biome" + (allowed.length > 1 ? "s" : ""))}
           {variants > 0 && " · " + variants + " kept"}
-          {Object.keys(row.biome_rules).length > 0 && " · ruled"}
+          {row.category !== "craftable" && Object.keys(row.biome_rules).length > 0 && " · ruled"}
         </div>
       </div>
       <CurationBadge row={row} />

@@ -44,41 +44,51 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFrontEndProgressTest, "VoxelEarth.FrontEn
 
 bool FVoxelFrontEndProgressTest::RunTest(const FString& Parameters)
 {
-	// 1. THE TIME FLOOR. With no work reported at all, the bar still advances,
-	// because a bar that never moves reads as a hang. This is the term the
-	// Godot original had, and the only one it had.
-	TestEqual(TEXT("time floor with no work"), ComputeLoadProgress(0.5f, 0.f, 0.f, 0.f), 0.5f, 0.001f);
+	// The theatre model (owner directive, 2026-09-05): the bar plays an
+	// artificial 30-60 s roll out on a smoothstep, and the world's readiness
+	// is one bit that only gates the ending. The invariants below are the
+	// reveal contract, restated as assertions -- each is easy to break in a
+	// refactor and invisible in a still frame.
 
-	// 2. WORK OVERTAKES TIME. Two seconds in on a warm cache, the world is
-	// nearly there and the bar should say so rather than crawling to a 60 s
-	// schedule -- the failure the original had in the other direction, reading
-	// 30% at the moment the world was ready.
-	const float WarmCache = ComputeLoadProgress(0.03f, 1.0f, 1.0f, 0.f);
-	TestTrue(TEXT("work overtakes the time floor"), WarmCache > 0.9f);
+	// 1. THE EASING IS SMOOTHSTEP. Fixed points at 0, 1/2 and 1, and a slow
+	// start (below linear at t=0.25) -- the property the curve was chosen for,
+	// along with its zero slope at both ends, which is what makes the ~97%
+	// hold read as a landing rather than a stop.
+	TestEqual(TEXT("starts at zero"), ComputeTheatreProgress(0.f, false, 0.f), 0.f, 0.0001f);
+	TestEqual(TEXT("midpoint of the ease"), ComputeTheatreProgress(0.5f, true, 0.f), 0.5f, 0.001f);
+	TestTrue(TEXT("eases in below linear"), ComputeTheatreProgress(0.25f, true, 0.f) < 0.25f);
 
-	// 3. MONOTONE. RecomputeDesiredSet GROWS the desired set as the anchor
-	// settles, so loaded/(loaded+outstanding) genuinely decreases mid-load.
-	// The bar must not follow it down.
-	const float High = ComputeLoadProgress(0.1f, 1.0f, 0.8f, 0.f);
-	const float ThenWorse = ComputeLoadProgress(0.1f, 1.0f, 0.2f, High);
-	TestEqual(TEXT("progress never decreases"), ThenWorse, High, 0.0001f);
+	// 2. 100% IS THE GATE'S PRIVILEGE. A finished theatre with the world ready
+	// completes exactly; with the world NOT ready it holds at the shelf --
+	// "100% while the world is still landing" stays the one lie this model
+	// refuses to tell, same as its predecessor.
+	TestEqual(TEXT("gate open completes"), ComputeTheatreProgress(1.f, true, 0.f), 1.f, 0.0001f);
+	const float Held = ComputeTheatreProgress(1.f, false, 0.f);
+	TestEqual(TEXT("gate closed holds at the shelf"), Held, kVoxelTheatreHoldProgress, 0.0001f);
 
-	// 4. NEVER 1.0, however good the inputs look. Reaching 100% is the gate's
-	// privilege; a timer expiring must not be able to claim it.
-	TestTrue(TEXT("capped below one"), ComputeLoadProgress(1.0f, 1.0f, 1.0f, 1.0f) <= 0.995f);
-	TestTrue(TEXT("capped below one, and near it"), ComputeLoadProgress(1.0f, 1.0f, 1.0f, 1.0f) > 0.99f);
+	// 3. THE SHELF KEEPS THE HOURGLASS ALIVE. SVoxelHourglass stops spawning
+	// grains at 0.995; the hold must sit strictly under it or a slow world
+	// freezes the sand again -- the exact defect the old model had.
+	TestTrue(TEXT("hold is under the grain emitter's cut-off"), Held < 0.995f);
 
-	// 5. Out-of-range inputs are clamped rather than propagated. A caller
-	// dividing by a zero denominator should produce a wrong-but-bounded bar,
-	// not a NaN that paints a full-width fill.
-	TestTrue(TEXT("negative inputs clamp"), ComputeLoadProgress(-1.f, -1.f, -1.f, 0.f) >= 0.f);
-	TestTrue(TEXT("over-unity inputs clamp"), ComputeLoadProgress(5.f, 5.f, 5.f, 0.f) <= 0.995f);
+	// 4. MONOTONE, including across the cap. A bar going backwards reads worse
+	// than one standing still, and the elapsed fraction can only grow -- so
+	// the previous value must dominate a smaller recomputation.
+	const float High = ComputeTheatreProgress(0.9f, false, 0.f);
+	TestEqual(TEXT("progress never decreases"), ComputeTheatreProgress(0.5f, false, High), High, 0.0001f);
 
-	// 6. Ring fill dominates the work term. The spatial probe saturates as soon
-	// as the ground under the spawn exists and then says nothing more, so a
-	// full spatial term with an empty ring must NOT read as nearly done.
-	const float SpatialOnly = ComputeLoadProgress(0.f, 1.0f, 0.f, 0.f);
-	TestTrue(TEXT("spatial alone is not nearly-done"), SpatialOnly < 0.3f);
+	// 5. THE GATE OPENING AFTER A HOLD RESUMES FORWARD ONLY: the shelf lifts
+	// to completion, never dips first.
+	const float Resumed = ComputeTheatreProgress(1.f, true, Held);
+	TestEqual(TEXT("completes after the hold"), Resumed, 1.f, 0.0001f);
+	TestTrue(TEXT("no dip when the cap lifts"), Resumed >= Held);
+
+	// 6. Out-of-range fractions are clamped rather than propagated. A caller
+	// dividing by a zero duration should produce a full-but-bounded bar, not a
+	// NaN that paints garbage.
+	TestTrue(TEXT("negative fraction clamps"), ComputeTheatreProgress(-1.f, false, 0.f) >= 0.f);
+	TestTrue(TEXT("over-unity fraction clamps"),
+	         ComputeTheatreProgress(5.f, false, 0.f) <= kVoxelTheatreHoldProgress + 0.0001f);
 
 	return true;
 }

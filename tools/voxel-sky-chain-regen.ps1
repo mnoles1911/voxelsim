@@ -121,6 +121,52 @@ if ($live.Count -gt 0) {
     throw "REFUSING TO START: an editor is already running -- $detail."
 }
 
+# --- AFTER THE NEXT FULL CHAIN: THE BOAT-WAKE CHECKLIST (2026-09-05) ---------
+#
+# The invisible-boat-wake bug (Ripple.Stat healthy, gain 20 changed nothing)
+# was audited offline against the 23:2x-UTC-baked materials: every
+# material<->C++ contract link verifies CONSISTENT (names, units, origin,
+# window, channels, bias, texture identity, gain path -- see the audit
+# report), so the break is on the sim/draw side, not in the generators. Two
+# things for the first session after this chain runs:
+#
+#   1. IF ANY WAKE DOUBT REMAINS, run the isolation instrument FIRST:
+#      a WATER-ONLY regen with VOXEL_WATER_RIPPLE_DEBUG=1 (the arm at
+#      create_water_voxel_material.py's ripple section). COLOUR around the
+#      player = the field has data and the break is downstream; FLAT BLACK =
+#      the field itself is empty and the fix is C++-side (the audit's
+#      prediction). Rebuild without the variable afterwards.
+#
+#   2. THE CHAIN'S WATERS NOW GATE THE RIPPLE CONTRIBUTION BY WaveTimeScale
+#      (the racing-fix amplitude gate -- NOT in the 23:2x bake, IS in this
+#      batch). Any wake test after this chain must run with
+#      voxel.Water.WaveTimeScale > 0, or the gate zeroes the wake and the
+#      old bug appears to persist while being a different, deliberate zero.
+#
+#   3. THE 2026-09-06 DESK HUNT'S ANSWER RIDES THIS BATCH, in two halves.
+#      (a) M_VoxelRippleStep (create_ripple_field_materials.py): the baked
+#      shore mask could multiply a freshly injected splat to EXACTLY the clear
+#      value in the same draw that counted it as injected -- the one mechanism
+#      that produces "every counter green, every texture empty" -- wherever
+#      the bake's shore plane disagrees with the live water the injectors
+#      trust (and by design at the waterline itself, where every wading entry
+#      splashes into a mask of 0). The step now injects the splat AFTER the
+#      attenuation and floors the mask at MaskFloor=0.98/step, so a splash is
+#      always BORN and a bake-dry one dies in ~0.6 s instead of never having
+#      existed. (b) C++ (VoxelRippleField.cpp, needs the module rebuilt): the
+#      counters can no longer lie -- once anything is injected, a 64x64
+#      centre patch of the state and field is read back every 5 s until the
+#      field first proves non-zero ("RippleField: field verified LIVE" in the
+#      log, then sampling stops; ClearState re-arms); three dark samples log
+#      a WARNING that names the triage. voxel.Water.Ripple.Stat now prints
+#      fieldMaxAbs/stateMaxAbs plus the enable/freeze/mask/speed knobs -- the
+#      2026-09-05 session ran its whole wake test with SpeedMPS at 0 and no
+#      instrument said so. Wake re-test after this chain: WaveTimeScale > 0
+#      (item 2), SpeedMPS > 0, drive the boat, then Ripple.Stat -- the
+#      verdict is one line. If it still reads DARK with state ~0, run item
+#      1's VOXEL_WATER_RIPPLE_DEBUG regen and voxel.Water.Ripple.Probe, and
+#      suspect the deposit draw itself (the audit's remaining branch).
+#
 # --- THE ORDER, AND THE RULE THAT KEEPS IT COMPLETE --------------------------
 #
 # create_sky_material.py is the SOLE author of MPC_VoxelSky and DELETES it on
@@ -142,6 +188,30 @@ $ORDER = @(
     # ripple assets exist.
     'create_ripple_field_materials.py',
     'create_water_voxel_material.py',
+    # M_Ocean JOINED THIS CHAIN ON 2026-09-04 AND IT IS NOT OPTIONAL ANY MORE.
+    #
+    # It used to be a standalone generator nobody had to sequence: the old
+    # M_Ocean bound no collection at all -- it was two panning sine waves and
+    # four typed constants -- so recreating MPC_VoxelSky could not hurt it. The
+    # B5 rewrite (docs/water-ocean-tides-plan-2026-09-04.md) converged it onto
+    # the same shared modules M_WaterVoxel uses, and it now binds EIGHT
+    # parameters on the collection: the three bathymetry ones, the three ripple
+    # ones and both wind ones. That makes it a dependent, with exactly the
+    # 2026-08-10 failure mode if it is rebuilt before the collection or not
+    # rebuilt after it -- drawing as UE's DEFAULT MATERIAL while every log line
+    # reports success. In this case that would be a grey plastic sea.
+    #
+    # It could not have been forgotten, and that is the point of the discovery
+    # scan above rather than luck: the rewrite added
+    # `from bathy_field_graph import ...`, which is one of $BINDING_PATTERNS, so
+    # leaving it out of $ORDER would have thrown at minute zero.
+    #
+    # AFTER THE RIPPLE STEP, because it samples RT_VoxelRippleField by name and
+    # degrades (loudly) to a rippleless sea if the render target is absent -- a
+    # silent-ish capability loss rather than a failure, which is worse, so the
+    # ordering is what prevents it. AFTER THE WATER MATERIAL only for
+    # comparability of two runs; they bind the collection, not each other.
+    'create_ocean_material.py',
     'create_underwater_material.py',
     # THE TWO TERRAIN MATERIALS ARE SKY DEPENDENTS, WHICH IS NOT OBVIOUS AND WAS
     # MISSED ON THE FIRST RUN OF THIS SCRIPT.
@@ -170,7 +240,36 @@ $NOT_A_GENERATOR = @(
     'bathy_field_graph.py',     # module, imported by the terrain and water generators
     'ripple_field_graph.py',    # module, imported by create_water_voxel_material.py (once wired)
     'water_wave_graph.py',      # module, imported by create_water_voxel_material.py (once wired)
-    'terrain_material_common.py' # module, imported by both terrain generators
+    'terrain_material_common.py', # module, imported by both terrain generators
+    # module: the sun/moon/star surface-light chain, promoted out of
+    # create_water_voxel_material.py on 2026-09-05 and consumed by BOTH water
+    # generators since the owner's same-day ruling ("Sea should not be flat").
+    # It binds SunDirection, MoonDirection and MoonLightFraction THROUGH the
+    # builder handed in by its caller, so it matches every one of
+    # $BINDING_PATTERNS -- which is the scan working, not a false positive.
+    'water_sky_reflection_graph.py',
+    # module: masked cubic foliage + weather-driven vertex motion, imported by
+    # create_detail_asset_material.py and create_environment_lod_material.py.
+    # Classified here on 2026-09-06 because it is objectively a module and not
+    # a chain step -- one `add_vegetation` function, no entry point, no asset
+    # of its own -- exactly the shape of every other entry above. It matches
+    # $BINDING_PATTERNS because it binds the wind parameters THROUGH its
+    # caller's builder, which is the scan working, not a false positive.
+    #
+    # NOTE FOR WHOEVER WIRES THE VEGETATION LANE: its two CONSUMERS are
+    # generators, and if they ship they belong in $ORDER so a sky rebuild
+    # rebuilds them too. That is the 2026-08-10 hazard this guard exists for,
+    # and classifying the module does not discharge it for them.
+    'vegetation_material_common.py',
+    # module: the Phase F1 caustic field, imported by BOTH terrain generators
+    # and create_underwater_material.py. Binds SunDirection and the F1-new
+    # CausticIntensity against the collection handed in by its caller, so it
+    # matches the binding patterns -- expected, it is a module, not a
+    # generator. (F1 also ADDED CausticIntensity to create_sky_material.py's
+    # SCALAR_PARAMS: the first regen after that lands must be this FULL chain,
+    # never an -Only, because the sky recreates the collection and every
+    # dependent must rebuild against the one that has the new name.)
+    'water_caustics_graph.py'
 )
 # Generators that bind the collection but are NOT yet wired into the game. They
 # are skipped rather than silently ignored, and the skip is printed -- an
@@ -266,8 +365,21 @@ foreach ($s in ($(if ($CaptureOnly) { @() } else { $toRun }))) {
     #
     # The rest are left on the cheaper path deliberately: the flag costs real
     # startup time, and a generator that does not need it should not pay it.
+    #
+    # create_ocean_material.py JOINS THE FLAGGED SET, and the reason is a
+    # not-knowing rather than a measurement. It loads /Game/Voxel/
+    # RT_VoxelRippleField by name; nothing has ever exercised loading a render
+    # TARGET asset under a null RHI in this project, because the only other
+    # script that touches that asset (create_water_voxel_material.py) has always
+    # had this flag for its own reason. If the load fails on NullDrv the ocean
+    # does not crash -- it takes its documented degrade path and builds a sea
+    # with no interactive ripples, logging a warning that reads exactly like the
+    # expected pre-ripple-subsystem state. That is a capability quietly lost in a
+    # line that looks normal, which is the failure class this project keeps
+    # paying for. Startup time is the cheaper side of that trade.
     $extra = @()
-    if ($s -eq 'create_ripple_field_materials.py' -or $s -eq 'create_water_voxel_material.py') {
+    if ($s -eq 'create_ripple_field_materials.py' -or $s -eq 'create_water_voxel_material.py' -or
+        $s -eq 'create_ocean_material.py') {
         $extra += '-AllowCommandletRendering'
     }
     $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList (@(
@@ -426,4 +538,10 @@ if ($pct -gt $MaxDiffPct) {
 Write-Host "PICTURE HELD: $pct% differ vs the reference (limit $MaxDiffPct%)." -ForegroundColor Green
 Write-Host "  reference $ReferencePng"
 Write-Host "  this run  $shot"
-Write-Host 'MPC_VoxelSky rebuilt with WindVectorMS + WindFieldValid; all 4 dependents rebuilt and photographed.' -ForegroundColor Green
+# COUNTED FROM $ORDER RATHER THAN TYPED. This line said "all 4 dependents" while
+# the chain was rebuilding six, which is a small lie in the one place a reader
+# looks to find out whether the chain was complete -- and "the list is now longer
+# than the hard-coded number" is the exact failure this whole script exists to
+# prevent, reappearing in its own summary.
+$deps = $ORDER.Count - 1
+Write-Host "MPC_VoxelSky rebuilt; all $deps dependents rebuilt and photographed." -ForegroundColor Green

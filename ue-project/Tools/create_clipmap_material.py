@@ -54,6 +54,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from terrain_material_common import build_terrain_base_color  # noqa: E402
 from sky_star_graph import SkyGraphBuilder  # noqa: E402
 from bathy_field_graph import sample_bathy_field  # noqa: E402
+# Phase F1: the shared caustic field -- same module, same term, same defaults
+# as M_VoxelTerrain, because the two materials meet along the ring seam and a
+# caustic pattern that changed phase or strength across it would draw the seam.
+from water_caustics_graph import build_caustics  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelClipmap"
@@ -273,9 +277,15 @@ float lum = max(dot(VC, float3(0.299, 0.587, 0.114)), 1e-4);
 float lq = (floor(lum * 3.0) + 0.5) / 3.0;
 float3 cq = VC * (lq / lum) * jitter * edgeDim;
 cq = lerp(cq, cq * 0.52, riser);
-// Marcher hemisphere ambient, verbatim: tint * intensity * ground/sky mix.
-float3 amb = cq * float3(1.00, 1.04, 1.12) * 1.5
-           * lerp(0.45, 1.0, saturate(nq.z * 0.5 + 0.5));
+// Marcher hemisphere ambient: tint * intensity * ground/sky mix. AmbI and
+// AmbG arrive from MPC_VoxelSky (MarchAmbientIntensity/MarchAmbientGroundMix,
+// pushed each tick from the marcher's own cvars) -- they were literals 1.5
+// and 0.45 here until 2026-09-05, which matched voxel.March.AmbientIntensity
+// / AmbientGroundMix only until a live retune: near terrain would move while
+// everything past the 8.2 km cascade edge stayed baked, a brightness seam at
+// the seam radius. The sky tint stays baked: it has no cvar to drift from.
+float3 amb = cq * float3(1.00, 1.04, 1.12) * AmbI
+           * lerp(AmbG, 1.0, saturate(nq.z * 0.5 + 0.5));
 // W = 0 must be byte-identical to the pre-voxelize graph (the actor gates the
 // geometric quantization on the same weight, so the whole arm collapses).
 OutNrm = normalize(lerp(VN, nq, W));
@@ -283,7 +293,8 @@ OutAmb = amb * W;
 return lerp(VC, cq, W);
 """)
     vox_inputs = []
-    for nm in ("WP", "OriginUU", "VN", "VC", "W", "SeamUU", "CellUU"):
+    for nm in ("WP", "OriginUU", "VN", "VC", "W", "SeamUU", "CellUU",
+               "AmbI", "AmbG"):
         ci = unreal.CustomInput()
         ci.set_editor_property("input_name", nm)
         vox_inputs.append(ci)
@@ -310,6 +321,15 @@ return lerp(VC, cq, W);
     b.link(voxelize_w, "", vox, "W")
     b.link(voxelize_seam, "", vox, "SeamUU")
     b.link(voxelize_cell, "", vox, "CellUU")
+    # The marcher ambient pair -- CHECKED bindings, so a regeneration against
+    # a collection that predates create_sky_material.py's 2026-09-05 late
+    # block RAISES here by name (loud, at authoring only) instead of
+    # compiling the ambient to a constant that would put the very seam this
+    # exists to remove back into the frame. Defaults on the collection are
+    # today's literals (1.5 / 0.45), so an undriven-but-present collection
+    # is byte-equivalent to the pre-fix picture.
+    b.link(b.collection_param("MarchAmbientIntensity"), "", vox, "AmbI")
+    b.link(b.collection_param("MarchAmbientGroundMix"), "", vox, "AmbG")
 
     tint_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, 150, 350)
     if not mel.connect_material_expressions(vox, "", tint_multiply, "A"):
@@ -328,8 +348,28 @@ return lerp(VC, cq, W);
 
     # Lighting parity: the marcher's hemisphere ambient rides emissive there,
     # so it rides emissive here, gated entirely by VoxelizeWeight.
-    if not mel.connect_material_property(vox, "OutAmb", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
-        raise RuntimeError("connect voxelize ambient -> Emissive failed")
+    #
+    # PHASE F1: SUMMED with the caustic term rather than connected alone --
+    # this material's emissive pin was already taken, and the two terms are
+    # independent added light (the voxelize ambient is zero unless the
+    # voxelize arm is weighted in; the caustic is zero unless the texel is
+    # submerged and the sun is up), so an Add is the whole composition.
+    # Everything about the caustic term is water_caustics_graph's; the
+    # depth_m = bathy R * validity contract (one channel covers lake AND
+    # ocean via the B5 fill) is argued at M_VoxelTerrain's call site and not
+    # repeated here. Same module, same parameter names and defaults as the
+    # near-field terrain, because the two meet along the ring seam.
+    caustic_time = mel.create_material_expression(
+        material, unreal.MaterialExpressionTime, -1300, 2340)
+    caustic_wp = mel.create_material_expression(
+        material, unreal.MaterialExpressionWorldPosition, -1300, 2260)
+    caustic_pos_m = b.mul(b.mask(caustic_wp, "", r=True, g=True), b.const(0.01))
+    caustic_depth_m = b.mul(bathy["depth_m"], bathy["validity"])
+    caustics = build_caustics(
+        b, sky_collection, caustic_pos_m, caustic_time, caustic_depth_m)
+    emissive_sum = b.add(vox, caustics["light"], "OutAmb", "")
+    if not mel.connect_material_property(emissive_sum, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+        raise RuntimeError("connect voxelize ambient + caustics -> Emissive failed")
 
     # Same snow-smooths-roughness term as M_VoxelTerrain, same defaults, so the
     # snow cap on a distant peak and the snow underfoot shade alike.

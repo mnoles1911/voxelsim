@@ -11,6 +11,41 @@
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- the adoption-drain hypothesis
 #include "VoxelWaterSubsystem.h"
 
+#include "HAL/IConsoleManager.h"
+
+// ---------------------------------------------------------------------------
+// CONSOLE VARIABLES
+// ---------------------------------------------------------------------------
+//
+// B1's tessellation radius, AND THE REASON IT IS A CVAR AND NOT STILL A MEMBER.
+// It was parsed once out of -VoxelWaveTessM at BeginPlay, which was the right
+// shape while the only thing that ever set it was a leg command line. It is now
+// also the player-facing "Water Wave Detail" row (VoxelGraphicsUserSettings),
+// and a setting a player flips in the menu has to be readable AFTER BeginPlay
+// or the toggle is decoration.
+//
+// READ AT REBUILD TIME, which is what makes a mid-session change take effect at
+// all: the sheet rebuilds one basin per tick on a round robin, so a flip is
+// visible on the basins nearest the camera within a few frames and on the whole
+// resident set within a rotation. That latency is a property of the rebuild
+// schedule, not of this variable, and it is deliberately NOT mentioned in the
+// player-facing description -- a player does not need to be told that water
+// updates over the next second, and the row would read as a defect if they were.
+//
+// -VoxelWaveTessM= still works and now SETS this at BeginPlay; see there.
+TAutoConsoleVariable<float> CVarVoxelWaterWaveTessRadiusM(
+	TEXT("voxel.Water.WaveTessRadiusM"), 80.0f,
+	TEXT("Radius in METRES of the wave-tessellation disc on lake sheets: inside it the greedy ")
+	TEXT("rectangles are subdivided to one fine pixel so the material's World Position Offset has ")
+	TEXT("vertices to push; outside it the sheet stays flat rectangles and the waves are ")
+	TEXT("normal-only. 0 is the honest OFF control -- no tessellated vertex is emitted at all and ")
+	TEXT("the sheet is byte-identical to every capture taken before B1. CLAMPED at read time to ")
+	TEXT("the finest LOD band (AVoxelWaterSheetActor::FineBandRadiusM, 96 m by default): past that ")
+	TEXT("the sheet is not meshing at one fine pixel, so cells emitted out there would not be the ")
+	TEXT("finest band's. Read on every rebuild, so a change lands as the round robin revisits ")
+	TEXT("basins rather than at the next launch."),
+	ECVF_Default);
+
 namespace
 {
 // Rectangles come out of vxc::lakeSheetRects as tile-local pixel spans and
@@ -58,6 +93,96 @@ void AppendRectQuad(const FBox2D& RectUU, double ZUU, const FVector2D& UVOriginU
 	Tris.Add(Base + 0);
 	Tris.Add(Base + 2);
 	Tris.Add(Base + 3);
+}
+
+// ---- B1: THE SAME RECTANGLE, AS A GRID OF CELLS ---------------------------
+//
+// THE DEFECT THIS EXISTS FOR, and it is a geometry defect wearing a shading
+// costume. A greedy rectangle out of vxc::lakeSheetRects can be a KILOMETRE
+// long, and it arrives here as FOUR vertices. World Position Offset is a
+// per-VERTEX displacement, so a wave field the material computes perfectly
+// moves those four corners and interpolates a plane between them: the crests
+// are authored, evaluated, and invisible. Every wind-wave and ripple term in
+// M_WaterVoxel has been shipping into a surface with no vertices to push since
+// the sheet existed. This function is the vertices.
+//
+// SAME CONVENTION, DELIBERATELY BY REUSE. It calls AppendRectQuad per cell
+// rather than restating the vertex layout, so the colour (255,255,255,0), the
+// world-planar metre UVs anchored at the basin bbox corner, the up normal, the
+// (1,0,0) tangent and the NO-WELDING rule are the same by construction and
+// cannot drift. Four verts per cell is therefore the cost, and it is the right
+// cost here: welding a shared grid would save ~3x the vertices and reintroduce
+// exactly the T-junction class the no-weld rule exists to refuse -- against a
+// neighbouring rectangle that is NOT tessellated, which is every rectangle at
+// the disc boundary.
+//
+// NO STITCHING AGAINST THE GREEDY RECTANGLES AROUND IT, AND THAT IS A
+// DEPENDENCY, NOT AN OVERSIGHT. A tessellated cell edge meets a greedy
+// rectangle's long edge at a T-junction, and a T-junction cracks the moment
+// the two sides are displaced by different amounts. It does not crack here
+// because Tools/create_water_voxel_material.py fades WPO to IDENTICALLY ZERO
+// between WaveWpoFadeStartM (55 m) and WaveWpoFadeEndM (72 m), and the
+// tessellation disc's radius (voxel.Water.WaveTessRadiusM, 80 m) is strictly outside
+// fade end -- so displacement is zero on BOTH sides of every seam this
+// function creates. IF THAT FADE IS EVER REMOVED, RAISED PAST THE TESS RADIUS,
+// OR THE TESS RADIUS IS DROPPED BELOW IT, THE SHEET CRACKS AT THE DISC EDGE.
+// The two numbers are checked against each other in BeginPlay's log line, which
+// is the only place a capture can be told which regime it was taken in.
+//
+// Cells are sized by COUNT, not by stepping a cursor: ceil(span / MaxCellUU)
+// cells of span/N each, so the last cell lands exactly on the rectangle's own
+// edge instead of accumulating a sliver, and no cell is ever larger than
+// MaxCellUU. Returns the number of vertices appended -- the diagnostic the
+// header's GetTessellatedVertCount reports.
+int32 AppendRectQuadTessellated(const FBox2D& RectUU, double ZUU, const FVector2D& UVOriginUU, double MaxCellUU,
+                                TArray<FVector>& Verts, TArray<int32>& Tris, TArray<FVector>& Normals,
+                                TArray<FVector2D>& UVs, TArray<FColor>& Colors,
+                                TArray<FProcMeshTangent>& Tangents)
+{
+	const double SpanX = RectUU.Max.X - RectUU.Min.X;
+	const double SpanY = RectUU.Max.Y - RectUU.Min.Y;
+	if (SpanX <= 0.0 || SpanY <= 0.0 || MaxCellUU <= 0.0)
+	{
+		return 0;
+	}
+
+	const int64 NX = FMath::Max<int64>(1, int64(FMath::CeilToDouble(SpanX / MaxCellUU)));
+	const int64 NY = FMath::Max<int64>(1, int64(FMath::CeilToDouble(SpanY / MaxCellUU)));
+
+	// A CEILING WITH A FALLBACK, not a check(). The caller only ever passes the
+	// intersection of a rectangle with the tessellation square, whose side is
+	// 2 * the tess radius (160 m at the default) -- 86 x 86 cells, ~30 k verts,
+	// which is the plan's stated worst case. This bound therefore cannot be hit
+	// by the shipped path; it exists so that a future caller passing a
+	// kilometre-long rectangle degrades to the flat greedy quad (a wave that
+	// does not move) instead of allocating a million vertices on the game
+	// thread (a hitch that does).
+	constexpr int64 kMaxCellsPerRect = 16384;
+	if (NX * NY > kMaxCellsPerRect)
+	{
+		const int32 Before = Verts.Num();
+		AppendRectQuad(RectUU, ZUU, UVOriginUU, Verts, Tris, Normals, UVs, Colors, Tangents);
+		return Verts.Num() - Before;
+	}
+
+	const int32 Before = Verts.Num();
+	for (int64 j = 0; j < NY; ++j)
+	{
+		// The last row/column takes the rectangle's own edge, so the cover is
+		// exact rather than exact-to-rounding: a sliver here is a gap in the
+		// water at the waterline, which is the one place the sheet is looked at
+		// from a metre away.
+		const double Y0 = RectUU.Min.Y + (SpanY * double(j)) / double(NY);
+		const double Y1 = (j + 1 == NY) ? RectUU.Max.Y : RectUU.Min.Y + (SpanY * double(j + 1)) / double(NY);
+		for (int64 i = 0; i < NX; ++i)
+		{
+			const double X0 = RectUU.Min.X + (SpanX * double(i)) / double(NX);
+			const double X1 = (i + 1 == NX) ? RectUU.Max.X : RectUU.Min.X + (SpanX * double(i + 1)) / double(NX);
+			AppendRectQuad(FBox2D(FVector2D(X0, Y0), FVector2D(X1, Y1)), ZUU, UVOriginUU, Verts, Tris, Normals,
+			               UVs, Colors, Tangents);
+		}
+	}
+	return Verts.Num() - Before;
 }
 } // namespace
 
@@ -121,11 +246,46 @@ void AVoxelWaterSheetActor::BeginPlay()
 		            "material. The frame is NOT comparable to a near-field water capture."));
 	}
 
+	// THE SHORE CLIP IS OPT-IN AND THE SHEET IS THE ONE OPTER-IN. The material
+	// asset ships WaterShoreClipEnabled=0 because bathy validity is not a wet
+	// test: the shore plane is LAKE-only, so every river ribbon, poured pool and
+	// near-field column outside a baked basin reads shore_m=-100 with validity 1
+	// and would be clipped to nothing (2026-09-04 review finding #1 -- the fix
+	// that deleted the water it was fixing). Those consumers stay on the bare
+	// asset. The SHEET over-covers its basin by up to a mask cell, and that
+	// over-cover at grazing angles IS the black band (RGB 26,30,36 tracing the
+	// mask boundary; docs/lake-sheet-black-band-2026-08-29.md), so the sheet
+	// alone turns the clip on -- through the same MID the diagnostic switches
+	// use, created here unconditionally so they compose. `-VoxelWaterShoreClip=0`
+	// is the control arm (MID with clip 0 == the asset default). Logged in both
+	// positions: this fix sat authored-but-inert once already, and a silent arm
+	// cannot be told apart from a mis-spelled one.
+	if (WaterMaterial)
+	{
+		int32 ShoreClip = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterShoreClip="), ShoreClip);
+		if (!SheetMaterialOverride)
+		{
+			SheetMaterialOverride = UMaterialInstanceDynamic::Create(WaterMaterial, this);
+		}
+		if (SheetMaterialOverride)
+		{
+			SheetMaterialOverride->SetScalarParameterValue(
+				TEXT("WaterShoreClipEnabled"), ShoreClip != 0 ? 1.0f : 0.0f);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: shore-SDF clip %s on the sheet MID (asset default is OFF; "
+			            "ribbons and near-field water deliberately keep it off)."),
+			       ShoreClip != 0 ? TEXT("ARMED") : TEXT("DISARMED by -VoxelWaterShoreClip=0"));
+		}
+	}
+
 	// -VoxelWaterDepthAuthority: see SheetMaterialOverride's declaration for the
 	// defect this exists for and for why the engine's absorption half is the
-	// unbounded one. Created ONCE, here, and only when the switch is passed --
-	// an unpassed switch leaves WaterMaterial itself on every section, which is
-	// what makes the control arm byte-identical.
+	// unbounded one. Since the shore clip above landed, the ONE sheet MID
+	// always exists and these switches write onto it rather than deciding
+	// whether it exists; an unpassed switch leaves its parameter at the
+	// material's own default, so the control arm is VALUE-identical to the
+	// bare asset rather than instance-free -- judge arms by the logged values.
 	//
 	// LOGGED IN BOTH POSITIONS. A silent switch cannot be told apart from a
 	// mis-spelled one when the image comes back unchanged.
@@ -280,6 +440,48 @@ void AVoxelWaterSheetActor::BeginPlay()
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelLakeSheetBands="), MaxBands);
 	MaxBands = FMath::Clamp(MaxBands, 1, int32(UVoxelWaterSubsystem::FLakeSheetLod::kMaxBands));
 
+	// -VoxelWaveTessM=<metres>: B1's tessellation radius, and 0 is the OFF
+	// control. IT NO LONGER OWNS THE VALUE -- it SETS voxel.Water.WaveTessRadiusM
+	// and the cvar is read at every rebuild. The flag is kept, spelled and
+	// logged exactly as before, because live leg commands and docs pass it; what
+	// changed is only who the authority is.
+	//
+	// SET BY GAME SETTING, NOT BY COMMANDLINE, and the choice is not cosmetic.
+	// SetByCommandline outranks SetByGameSetting, so a leg that passed the flag
+	// would leave the "Water Wave Detail" row SILENTLY INERT for the rest of
+	// that session -- clicks that persist a value and change nothing. At equal
+	// priority the last writer wins, and this runs after
+	// UVoxelFrontEndSubsystem::Initialize's ApplyAll(), so the flag still beats
+	// the persisted setting at boot exactly as a leg expects.
+	{
+		double TessM = 0.0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaveTessM="), TessM))
+		{
+			CVarVoxelWaterWaveTessRadiusM->Set(float(FMath::Max(0.0, TessM)), ECVF_SetByGameSetting);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: -VoxelWaveTessM=%.0f applied to voxel.Water.WaveTessRadiusM (the flag "
+			            "sets the cvar; the cvar is what every rebuild reads)."),
+			       FMath::Max(0.0, TessM));
+		}
+		// CLAMPED OUT LOUD. Past FineBandRadiusM the sheet is no longer meshing
+		// at one fine pixel, so cells emitted out there would not be the finest
+		// band's -- and a switch that silently did half of what it was asked is
+		// the trap this file has already been bitten by four times (see
+		// -VoxelWaterMatScalar's note above). The clamp itself now lives in
+		// WaveTessRadiusMNow() so it also covers a value set from the console or
+		// the settings panel; this says so once, for the value present at boot.
+		const double RequestedM = double(CVarVoxelWaterWaveTessRadiusM.GetValueOnGameThread());
+		if (RequestedM > FineBandRadiusM)
+		{
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("Lake sheets: voxel.Water.WaveTessRadiusM=%.0f is beyond the finest band (%.0f m) and "
+			            "is CLAMPED to it on every read. Tessellating past the fine band would emit cells at a "
+			            "decimation the extent mask does not express there; raise -VoxelLakeSheetFineM first if "
+			            "you want more."),
+			       RequestedM, FineBandRadiusM);
+		}
+	}
+
 	const bool bOnePath = !UVoxelWaterSubsystem::ShouldMeshImplicitLakes();
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("Lake sheets: %s, scan radius %.0f m, %d cells/basin side, up to %d LOD band(s), finest %.0f m at "
@@ -289,6 +491,31 @@ void AVoxelWaterSheetActor::BeginPlay()
 	       bOnePath ? TEXT("ONE rendering path -- the sheet owns them at every range, no near-field hole")
 	                : TEXT("TWO rendering paths (voxel.Water.MeshImplicitLakes=1) -- a hole is cut for the "
 	                       "near-field disc"));
+
+	// THE WAVE LINE, SEPARATE FROM THE LINE ABOVE because it is the one a wave
+	// capture has to be read against. It names the tessellation radius, the
+	// cell size, and -- explicitly -- the material fade window the no-stitching
+	// argument depends on, so a capture with cracks at the disc edge can be
+	// diagnosed from the log instead of from the material graph.
+	const double TessNowM = WaveTessRadiusMNow();
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Lake sheets: wave tessellation %s -- radius %.0f m, cells <= 1.875 m (one fine pixel), "
+	            "finest band only. NO stitching against the greedy rectangles outside the disc: that seam "
+	            "is safe ONLY because M_WaterVoxel fades WPO to zero by ~72 m, i.e. INSIDE this radius. "
+	            "voxel.Water.WaveTessRadiusM=0 (or -VoxelWaveTessM=0) is the OFF control, and the \"Water "
+	            "Wave Detail\" settings row moves the same cvar mid-session."),
+	       TessNowM > 0.0 ? TEXT("ENABLED") : TEXT("DISABLED (radius 0)"), TessNowM);
+}
+
+double AVoxelWaterSheetActor::WaveTessRadiusMNow() const
+{
+	// GetValueOnGameThread, and every caller is on the game thread: the sheet's
+	// rebuild, its LOD arithmetic and its census line all run in Tick. If a
+	// render-thread caller ever appears it must NOT reach for the render-thread
+	// accessor here -- it must be handed the value the rebuild used, or the
+	// geometry and the value describing it come from different frames.
+	const double RequestedM = FMath::Max(0.0, double(CVarVoxelWaterWaveTessRadiusM.GetValueOnGameThread()));
+	return FMath::Min(RequestedM, FineBandRadiusM);
 }
 
 namespace
@@ -432,6 +659,26 @@ FVector2D AVoxelWaterSheetActor::SnappedCamXY(const FVector& CamUU) const
 	return FVector2D((double(Key.X) + 0.5) * CellUU, (double(Key.Y) + 0.5) * CellUU);
 }
 
+bool AVoxelWaterSheetActor::TessBoxForCamera(const FVector& CamUU, FBox2D& OutBoxUU) const
+{
+	OutBoxUU = FBox2D(ForceInit);
+	const double TessRadiusM = WaveTessRadiusMNow();
+	if (TessRadiusM <= 0.0)
+	{
+		return false; // radius 0 -- the OFF control ("Water Wave Detail" off, or -VoxelWaveTessM=0)
+	}
+	// THE SNAPPED CELL CENTRE, exactly the one the LOD bands are built around
+	// (SnappedCamXY). Sharing the centre is what makes the tessellated geometry
+	// a pure function of LodKey: the box moves only when the key does, so the
+	// existing "rebuild when the key changes" trigger is necessary and
+	// sufficient for the tessellation too and no second trigger is needed.
+	const FVector2D Snap = SnappedCamXY(CamUU);
+	const double RadiusUU = TessRadiusM * 100.0;
+	OutBoxUU = FBox2D(FVector2D(Snap.X - RadiusUU, Snap.Y - RadiusUU),
+	                  FVector2D(Snap.X + RadiusUU, Snap.Y + RadiusUU));
+	return true;
+}
+
 bool AVoxelWaterSheetActor::IsBandedAtCamera(const FSheet& Sheet, const FVector& CamUU) const
 {
 	if (Sheet.StepPx <= 1)
@@ -560,6 +807,116 @@ bool AVoxelWaterSheetActor::HoleForDatum(double SurfaceZUU, FBox2D& OutHoleUU) c
 	return true;
 }
 
+namespace
+{
+// HOW FAR A SHEET MAY BE MOVED BY A TRANSFORM BEFORE IT HAS TO BE RE-MESHED.
+// 50 UU = 0.5 m, the plan's B3 number.
+//
+// WHY A TRANSFORM IS NOT ENOUGH FOREVER, since a flat sheet translated in z is
+// geometrically exact at any offset. Two things about a sheet are functions of
+// its DATUM and not of its height: the near-field hole (HoleForDatum tests the
+// implicit disc's z span against the surface -- move the surface far enough and
+// the basin owes a hole it does not have, or carries one it no longer owes),
+// and, from Phase C4, the EXTENT itself (a falling tide uncovers the shallows,
+// and a translated sheet would draw water over dry ground rather than
+// retreating from it). Half a metre is well inside both tolerances at the
+// 1.875 m raster the extent is quantised to.
+constexpr double kTideRebuildDriftUU = 50.0;
+} // namespace
+
+double AVoxelWaterSheetActor::CurrentSurfaceZUUForBasin(const FSheet& Sheet,
+                                                        const UVoxelWaterSubsystem* Water) const
+{
+	if (Water == nullptr)
+	{
+		return Sheet.SurfaceZUU;
+	}
+	// PHASE C REPLACED THE BODY, NOT THE CALL SITES (exactly as the header
+	// promised): the honest answer is now a PER-BASIN query through the one
+	// datum seam -- the basin ledger wrapped by vxc::TidalDatumSource -- so
+	// the sheet rides whatever the near field fills to, by construction. An
+	// oracle-qualified rock pool rides the tide while connected and holds
+	// full at its sill when cut off; an inland lake (and everything else the
+	// oracle refuses, which with the tide dark is everything) answers its
+	// ledger datum, which is exactly the number the gather wrote into
+	// Sheet.SurfaceZUU -- so the drift below is 0.0 there, not a rounding
+	// error there. Phase B's "any basin standing AT the sea datum rides"
+	// epsilon test is gone WITH ITS FALSE POSITIVES: a coastal lagoon parked
+	// a few centimetres off the sea no longer moves unless the oracle proves
+	// the sea actually reaches it.
+	double NowZUU = 0.0;
+	if (Water->GetBasinDatumNowZUU(Sheet.TileX, Sheet.TileY, Sheet.BasinId, NowZUU))
+	{
+		return NowZUU;
+	}
+	// Tile/basin not resolvable this tick: keep the gathered height rather
+	// than inventing one -- the same "could not resolve is not dry" doctrine
+	// as the extent masks.
+	return Sheet.SurfaceZUU;
+}
+
+void AVoxelWaterSheetActor::ApplyTideNudge(const UVoxelWaterSubsystem* Water)
+{
+	// THE EARLY OUT IS THE FEATURE. The subsystem's datum is quantised (25 mm)
+	// and rate-limited (2 s), so on the order of 99.9% of ticks it has not
+	// moved -- and on those ticks this function must not touch a single
+	// component. Walking ~500 basins to write an unchanged SetRelativeLocation
+	// would dirty ~500 render transforms every frame, which is the same shape
+	// of cost as the 9 ms proxy recreate this actor was restructured to remove.
+	//
+	// EXACT ==, ON PURPOSE. The value being compared is a QUANTISED datum, so
+	// it either stepped or it did not; a tolerance here would be a second,
+	// disagreeing quantum bolted onto the first one.
+	const double TideUU =
+		Water ? (Water->SeaSurfaceZNowUU() - UVoxelWaterSubsystem::SeaLevelZUU()) : 0.0;
+	if (bTideOffsetApplied && TideUU == AppliedTideOffsetUU)
+	{
+		return;
+	}
+	AppliedTideOffsetUU = TideUU;
+	bTideOffsetApplied = true;
+
+	int32 Nudged = 0;
+	int32 Flagged = 0;
+	for (FSheet& S : Sheets)
+	{
+		if (!S.bBuilt || S.Comp == nullptr)
+		{
+			continue; // nothing drawn yet; it will be built at the current datum
+		}
+		const double Drift = CurrentSurfaceZUUForBasin(S, Water) - S.BuiltSurfaceZUU;
+		// NUDGE FIRST, FLAG SECOND. The rebuild is queued into the existing
+		// one-basin-per-tick rotation, so a tide step that drifts N basins takes
+		// N ticks to re-mesh them; the transform keeps every one of them at the
+		// right height for the whole of that drain instead of leaving them at
+		// the old waterline until their turn comes.
+		S.Comp->SetRelativeLocation(FVector(0.0, 0.0, Drift));
+		++Nudged;
+		if (FMath::Abs(Drift) > kTideRebuildDriftUU)
+		{
+			// bBuilt = false is the ONE enqueue mechanism this actor has (see
+			// the round-robin's trigger). Deliberately not a second queue: a
+			// basin that is also LOD-stale must rebuild once, not twice.
+			S.bBuilt = false;
+			++Flagged;
+		}
+	}
+	TideNudgedSheets += Nudged;
+	TideRebuilds += Flagged;
+
+	if (Nudged > 0 || Flagged > 0)
+	{
+		// ONE LINE PER DATUM STEP, which is at most one per MinStepIntervalS
+		// (2 s). This is the sheet half of the tide's engagement proof: the
+		// subsystem can log datum steps all day and the water still not move if
+		// this never fires.
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Lake sheets: tide datum step -- offset %.1f UU, %d sheet(s) nudged, %d queued for rebuild "
+		            "(drift > %.0f UU). Cumulative: nudged=%d rebuilds=%d."),
+		       TideUU, Nudged, Flagged, kTideRebuildDriftUU, TideNudgedSheets, TideRebuilds);
+	}
+}
+
 bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 {
 	UWorld* World = GetWorld();
@@ -573,7 +930,23 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 	Basin.TileX = Sheet.TileX;
 	Basin.TileY = Sheet.TileY;
 	Basin.BasinId = Sheet.BasinId;
+	// PHASE C4 LANDED AND THIS LINE DID NOT HAVE TO CHANGE, which is the
+	// seam doing its job: the subsystem's rect builder routes an oracle-tidal
+	// basin's extent through extentMaskAtDatum at the CURRENT seam datum
+	// internally (ResolveExtentMask), keyed by tile/basin id -- the SurfaceZUU
+	// on this struct is identification-and-height for the gather compare, not
+	// the extent's input. The geometry below still meshes at SurfaceNowZUU,
+	// the same seam number, so a tidal pool's outline and height move together.
 	Basin.SurfaceZUU = Sheet.SurfaceZUU;
+
+	// ---- B3: THE SURFACE THIS BUILD IS FOR ---------------------------------
+	//
+	// Everything below meshes at SurfaceNowZUU, and BuiltSurfaceZUU records it
+	// so the per-tick nudge measures its drift from what was actually built
+	// rather than from the baked datum. On a run with no tide the two are the
+	// same number and this is a rename.
+	const double SurfaceNowZUU = CurrentSurfaceZUUForBasin(Sheet, Water);
+	Sheet.BuiltSurfaceZUU = SurfaceNowZUU;
 
 	UVoxelWaterSubsystem::FLakeSheetLod Lod;
 	bool bUniform = true;
@@ -590,7 +963,10 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 	}
 
 	FBox2D Hole(ForceInit);
-	Sheet.bHadHole = HoleForDatum(Sheet.SurfaceZUU, Hole);
+	// The CURRENT surface: the implicit disc is bounded in z, so whether this
+	// basin owes a hole is a question about where its water is NOW, not about
+	// where the bake put it.
+	Sheet.bHadHole = HoleForDatum(SurfaceNowZUU, Hole);
 	Sheet.HoleUU = Hole;
 
 	TArray<FVector> Verts;
@@ -608,13 +984,110 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 	// thousands with no wrap seam inside any quad.
 	const FVector2D UVOrigin(Sheet.MinXUU, Sheet.MinYUU);
 
+	// ---- B1: WHERE THE FINE CELLS GO, AND WHY ONLY THERE --------------------
+	//
+	// The tessellation square (TessBoxForCamera), clipped to the FINEST BAND.
+	// Two conditions, and both have to hold or the cells emitted are not the
+	// finest band's:
+	//
+	//   * StepPx[0] == 1 -- the first band actually meshes at ONE FINE PIXEL. A
+	//     basin far enough out that even its first band is decimated has no
+	//     finest band to tessellate, and subdividing its coarse rectangles
+	//     would draw water at a resolution the extent mask never answered at.
+	//   * inside RadiusPx[0] -- band 0's own bound. vxc::lakeSheetRectsBanded
+	//     PARTITIONS space between the bands (they must not overlap or the
+	//     sheet z-fights, and must not gap or the lake has a hole), so a
+	//     rectangle meeting this clipped box IS a band-0 rectangle and nothing
+	//     else can be. WaveTessRadiusMNow() clamps to FineBandRadiusM, so the
+	//     clip is normally a no-op -- it is here so the invariant is ENFORCED
+	//     rather than argued from two constants that could drift. That matters
+	//     more now than it did: the radius is a cvar the settings panel can move
+	//     mid-session, so "the two constants" are no longer both constants.
+	FBox2D TessBox(ForceInit);
+	bool bTess = TessBoxForCamera(CamUU, TessBox) && Lod.StepPx[0] == 1;
+	if (bTess && Lod.NumBands > 1)
+	{
+		const double R0 = double(Lod.RadiusPx[0]) * kFinePixelUU;
+		TessBox.Min.X = FMath::Max(TessBox.Min.X, Lod.CamXUU - R0);
+		TessBox.Min.Y = FMath::Max(TessBox.Min.Y, Lod.CamYUU - R0);
+		TessBox.Max.X = FMath::Min(TessBox.Max.X, Lod.CamXUU + R0);
+		TessBox.Max.Y = FMath::Min(TessBox.Max.Y, Lod.CamYUU + R0);
+		bTess = TessBox.Min.X < TessBox.Max.X && TessBox.Min.Y < TessBox.Max.Y;
+	}
+
+	if (bTess)
+	{
+		// RESERVED FOR THE WORST CASE THIS BASIN CAN REACH: the whole
+		// tessellation square, at four verts per cell. Without it a lake
+		// underfoot grows a ~30 k-element array from a few hundred, which is a
+		// dozen reallocations and copies of a megabyte on the game thread, once
+		// per camera cell. The estimate is an upper bound, so it never
+		// under-reserves and never reallocates.
+		const double CellsX = (TessBox.Max.X - TessBox.Min.X) / kFinePixelUU;
+		const double CellsY = (TessBox.Max.Y - TessBox.Min.Y) / kFinePixelUU;
+		const int32 WorstVerts = int32(FMath::Min(4.0 * (CellsX + 1.0) * (CellsY + 1.0), 200000.0));
+		Verts.Reserve(Verts.Max() + WorstVerts);
+		Tris.Reserve(Tris.Max() + (WorstVerts * 3) / 2);
+		Normals.Reserve(Verts.Max());
+		UVs.Reserve(Verts.Max());
+		Colors.Reserve(Verts.Max());
+		Tangents.Reserve(Verts.Max());
+	}
+
 	int32 Emitted = 0;
+	int32 TessVerts = 0;
+
+	// The four-vertex quad the sheet has always emitted.
+	auto Greedy = [&](double X0, double Y0, double X1, double Y1)
+	{
+		if (X1 <= X0 || Y1 <= Y0)
+		{
+			return;
+		}
+		AppendRectQuad(FBox2D(FVector2D(X0, Y0), FVector2D(X1, Y1)), SurfaceNowZUU, UVOrigin, Verts, Tris,
+		               Normals, UVs, Colors, Tangents);
+		++Emitted;
+	};
+
+	// One rectangle, split against the tessellation square: the part inside
+	// becomes fine cells, the four parts outside stay greedy. The SAME four-way
+	// decomposition the near-field hole cut below uses -- deliberately the same
+	// shape, because that one has already been read for correctness once.
+	auto EmitPiece = [&](double X0, double Y0, double X1, double Y1)
+	{
+		if (X1 <= X0 || Y1 <= Y0)
+		{
+			return;
+		}
+		if (!bTess || TessBox.Max.X <= X0 || TessBox.Min.X >= X1 || TessBox.Max.Y <= Y0 || TessBox.Min.Y >= Y1)
+		{
+			Greedy(X0, Y0, X1, Y1);
+			return;
+		}
+		const double IX0 = FMath::Max(X0, TessBox.Min.X);
+		const double IX1 = FMath::Min(X1, TessBox.Max.X);
+		const double IY0 = FMath::Max(Y0, TessBox.Min.Y);
+		const double IY1 = FMath::Min(Y1, TessBox.Max.Y);
+		Greedy(X0, Y0, X1, IY0);   // below the square
+		Greedy(X0, IY1, X1, Y1);   // above it
+		Greedy(X0, IY0, IX0, IY1); // left of it
+		Greedy(IX1, IY0, X1, IY1); // right of it
+		TessVerts += AppendRectQuadTessellated(FBox2D(FVector2D(IX0, IY0), FVector2D(IX1, IY1)), SurfaceNowZUU,
+		                                       UVOrigin, kFinePixelUU, Verts, Tris, Normals, UVs, Colors,
+		                                       Tangents);
+		// ONE rectangle in the census, not one per cell. TotalRects measures the
+		// DECOMPOSITION -- what the extent mask produced -- and burying it under
+		// ~7,000 cells would destroy the only number that says whether the
+		// greedy mesher is behaving. The cells have their own counter
+		// (GetTessellatedVertCount) for exactly that reason.
+		++Emitted;
+	};
+
 	for (const FBox2D& R : Rects)
 	{
 		if (!Sheet.bHadHole)
 		{
-			AppendRectQuad(R, Sheet.SurfaceZUU, UVOrigin, Verts, Tris, Normals, UVs, Colors, Tangents);
-			++Emitted;
+			EmitPiece(R.Min.X, R.Min.Y, R.Max.X, R.Max.Y);
 			continue;
 		}
 		// Rectangle minus rectangle, in UU. The pixel-space helper in lakes.h is
@@ -624,26 +1097,15 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 		// the voxel water it is supposed to meet exactly.
 		if (Hole.Max.X <= R.Min.X || Hole.Min.X >= R.Max.X || Hole.Max.Y <= R.Min.Y || Hole.Min.Y >= R.Max.Y)
 		{
-			AppendRectQuad(R, Sheet.SurfaceZUU, UVOrigin, Verts, Tris, Normals, UVs, Colors, Tangents);
-			++Emitted;
+			EmitPiece(R.Min.X, R.Min.Y, R.Max.X, R.Max.Y);
 			continue;
 		}
-		auto Emit = [&](double X0, double Y0, double X1, double Y1)
-		{
-			if (X1 <= X0 || Y1 <= Y0)
-			{
-				return;
-			}
-			AppendRectQuad(FBox2D(FVector2D(X0, Y0), FVector2D(X1, Y1)), Sheet.SurfaceZUU, UVOrigin, Verts, Tris,
-			               Normals, UVs, Colors, Tangents);
-			++Emitted;
-		};
 		const double MY0 = FMath::Max(R.Min.Y, Hole.Min.Y);
 		const double MY1 = FMath::Min(R.Max.Y, Hole.Max.Y);
-		Emit(R.Min.X, R.Min.Y, R.Max.X, FMath::Min(Hole.Min.Y, R.Max.Y)); // below
-		Emit(R.Min.X, FMath::Max(Hole.Max.Y, R.Min.Y), R.Max.X, R.Max.Y); // above
-		Emit(R.Min.X, MY0, FMath::Min(Hole.Min.X, R.Max.X), MY1);         // left
-		Emit(FMath::Max(Hole.Max.X, R.Min.X), MY0, R.Max.X, MY1);         // right
+		EmitPiece(R.Min.X, R.Min.Y, R.Max.X, FMath::Min(Hole.Min.Y, R.Max.Y)); // below
+		EmitPiece(R.Min.X, FMath::Max(Hole.Max.Y, R.Min.Y), R.Max.X, R.Max.Y); // above
+		EmitPiece(R.Min.X, MY0, FMath::Min(Hole.Min.X, R.Max.X), MY1);         // left
+		EmitPiece(FMath::Max(Hole.Max.X, R.Min.X), MY0, R.Max.X, MY1);         // right
 	}
 
 	// One COMPONENT per basin (see FSheet::Comp for the 9 ms measurement that
@@ -676,8 +1138,24 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 		// used to be one recreate of a 495-section proxy).
 		VoxelEofLedger::Count(VoxelEofLedger::ESource::LakeCreate);
 	}
+	// The mesh now stands AT BuiltSurfaceZUU in world space, so whatever tide
+	// nudge this component was carrying has been absorbed into its vertices and
+	// the transform goes back to identity. Tested before writing: an unchanged
+	// SetRelativeLocation still dirties the render transform, and this runs on
+	// every rebuild, tide or not.
+	if (Sheet.Comp != nullptr && !Sheet.Comp->GetRelativeLocation().IsNearlyZero())
+	{
+		Sheet.Comp->SetRelativeLocation(FVector::ZeroVector);
+	}
+
 	TotalRects += Emitted - Sheet.RectCount;
 	Sheet.RectCount = Emitted;
+	TotalTessVerts += TessVerts - Sheet.TessVerts;
+	Sheet.TessVerts = TessVerts;
+	// The radius this mesh now stands at. Recorded from the same accessor the
+	// build above went through, so the record cannot describe a different radius
+	// from the geometry -- which is the whole point of recording it.
+	Sheet.TessRadiusM = WaveTessRadiusMNow();
 	Sheet.bBuilt = true;
 	return true;
 }
@@ -765,6 +1243,15 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		return;
 	}
 
+	// ---- B3: the tide, as a transform ---------------------------------------
+	//
+	// Runs on every tick that has a camera, INCLUDING the gather ticks below
+	// that return early -- a tile gather can span several ticks and the water
+	// must not sit at the old waterline for the whole of one. It costs a
+	// subsystem call and a double compare on the ticks where the datum has not
+	// stepped, which is all but a handful of them.
+	ApplyTideNudge(Water);
+
 	// ---- Gather: which basins are in range at all ---------------------------
 	//
 	// Not every tick, and not all at once. A gather LOADS FINE TILES -- tens of
@@ -806,6 +1293,7 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		bGathered = true;
 		UnresolvedBasins = 0;
 		TotalRects = 0;
+		TotalTessVerts = 0;
 		RoundRobinCursor = 0;
 		bLoggedFirstBuild = false;
 		UE_LOG(LogVoxelEarth, Log, TEXT("Lake sheets: scanning %d fine tile(s) within %.0f m of (%.0f, %.0f)"),
@@ -869,6 +1357,24 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 					S.HoleUU = Old->HoleUU;
 					S.RectCount = Old->RectCount;
 					TotalRects += Old->RectCount;
+					// The adopted mesh is the OLD one, so it still stands at the
+					// datum it was built at and still carries whatever tide
+					// nudge that component was given. Carrying both across is
+					// what makes adoption invisible to B1 and B3: drop
+					// BuiltSurfaceZUU and the next nudge measures drift from
+					// the baked datum and double-applies the tide; drop
+					// TessVerts and the actor-wide vertex count silently decays
+					// toward zero over a session of re-gathers.
+					S.BuiltSurfaceZUU = Old->BuiltSurfaceZUU;
+					S.TessVerts = Old->TessVerts;
+					// AND THE RADIUS IT WAS BUILT AT, for the same reason as
+					// TessVerts one line up: an adopted mesh that reported "never
+					// built at any radius" would be flagged tess-stale on the
+					// next tick and every adopted basin would rebuild -- turning
+					// the adoption path, whose whole purpose is to dirty nothing,
+					// into a full re-mesh after every gather.
+					S.TessRadiusM = Old->TessRadiusM;
+					TotalTessVerts += Old->TessVerts;
 					// CONTROL TERM: adoption dirties NOTHING -- no register, no
 					// section, no mark. Counted at the ++ site rather than from
 					// the gather-complete log line's `Adopted`, which recomputes
@@ -927,6 +1433,15 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 	// basins: with lake basins on one rendering path a hole is only owed where
 	// the CA has actually taken water over.
 	const FIntPoint LodKey = LodKeyForCamera(CamUU);
+	// B1: the tessellation square for THIS camera cell, hoisted out of the walk.
+	// It is a pure function of LodKey (TessBoxForCamera), which is what lets the
+	// staleness test below be a box overlap rather than a rebuild.
+	FBox2D TessBoxNow(ForceInit);
+	const bool bTessNow = TessBoxForCamera(CamUU, TessBoxNow);
+	// ONE READ OF THE RADIUS FOR THE WHOLE TICK, used by the staleness test
+	// below and by the census line at the bottom. Reading it twice would let a
+	// console write between them gate on one value and print another.
+	const double TessRadiusNowM = WaveTessRadiusMNow();
 	const int32 Num = Sheets.Num();
 	for (int32 Step = 0; Step < Num; ++Step)
 	{
@@ -948,8 +1463,51 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		const bool bBandedNow = IsBandedAtCamera(S, CamUU);
 		const bool bLodStale = (bBandedNow == S.bUniformCoarse) || (bBandedNow && S.LodKey != LodKey);
 
+		// ---- B1's OWN staleness term, and it is not covered by the two above --
+		//
+		// The tessellation square is a function of the camera CELL, so a basin
+		// that meets it -- or that still carries cells from a cell it no longer
+		// meets -- is stale the moment LodKey changes. That is NOT the same
+		// question the LOD terms ask, and the difference is a real defect: a
+		// pond (StepPx 1) is never "banded", so bBandedNow is false and
+		// bUniformCoarse is true forever, both LOD terms stay false, and the
+		// pond leaves the rebuild rotation permanently. Without this term it
+		// would keep whatever cells it was built with the first time it came
+		// into range: flat greedy quads on the pond you are standing beside,
+		// and fine cells on one you have walked half a kilometre away from.
+		//
+		// Gated on LodKey having actually moved, so a settled camera does no box
+		// tests at all, and on "touches OR already tessellated", so a basin far
+		// from the disc with nothing to lose is never woken.
+		//
+		// SECOND GATE, ADDED WITH THE PLAYER-FACING TOGGLE: the radius itself
+		// can now change without the camera moving. Every other term here is a
+		// function of the camera CELL, so a player who flips "Water Wave Detail"
+		// standing still would have changed a cvar, persisted a setting, logged
+		// an apply -- and seen nothing until they walked 30 m. The comparison is
+		// against the radius the MESH was built at, not against a flag someone
+		// has to remember to set, so it is true exactly while the geometry
+		// disagrees with the setting and false the moment it stops.
+		//
+		// It settles: a basin the rebuild decides needs nothing has its record
+		// updated in the skip path below, so a toggle costs one sweep of box
+		// tests and not one per tick forever.
+		bool bTessStale = false;
+		if (S.LodKey != LodKey || S.TessRadiusM != TessRadiusNowM)
+		{
+			const bool bTouches = bTessNow && !(TessBoxNow.Max.X <= S.MinXUU || TessBoxNow.Min.X >= S.MaxXUU
+			                                    || TessBoxNow.Max.Y <= S.MinYUU || TessBoxNow.Min.Y >= S.MaxYUU);
+			bTessStale = bTouches || S.TessVerts > 0;
+		}
+
 		FBox2D WantHole(ForceInit);
-		const bool bWantHole = HoleForDatum(S.SurfaceZUU, WantHole);
+		// AT THE CURRENT SURFACE, not the baked one, because that is what
+		// RebuildSheet will build against (its HoleForDatum call takes
+		// SurfaceNowZUU). Ask this question at a different datum from the one
+		// the build answers it at and the two never agree: the trigger fires
+		// every tick and the rebuild never satisfies it, or it never fires and a
+		// basin keeps a hole for water that has moved out from under it.
+		const bool bWantHole = HoleForDatum(CurrentSurfaceZUUForBasin(S, Water), WantHole);
 		const bool bHoleChanged = (bWantHole != S.bHadHole) || (bWantHole && WantHole != S.HoleUU);
 		// A hole only matters where it actually meets this basin -- and BOTH the
 		// old and the new one have to be tested. Testing only the new one is a
@@ -962,8 +1520,15 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 			return !(H.Max.X <= S.MinXUU || H.Min.X >= S.MaxXUU || H.Max.Y <= S.MinYUU || H.Min.Y >= S.MaxYUU);
 		};
 		const bool bHoleTouches = (bWantHole && Touches(WantHole)) || (S.bHadHole && Touches(S.HoleUU));
-		if (S.bUnresolved || (S.bBuilt && !bLodStale && !(bHoleChanged && bHoleTouches)))
+		if (S.bUnresolved || (S.bBuilt && !bLodStale && !bTessStale && !(bHoleChanged && bHoleTouches)))
 		{
+			// EVALUATED AT THIS RADIUS AND FOUND TO NEED NOTHING, which is a
+			// real answer and has to be recorded as one -- a basin outside the
+			// disc with no tessellated vertices is already exactly what the new
+			// radius asks for. Without this the radius test above would stay
+			// true for those basins for the rest of the session and re-run its
+			// box tests every tick.
+			S.TessRadiusM = TessRadiusNowM;
 			continue;
 		}
 
@@ -983,6 +1548,38 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		break;
 	}
 
+	// ---- B1's engagement proof ----------------------------------------------
+	//
+	// ONE LINE PER CAMERA CELL (LodSnapPx, 30 m of travel), not one per rebuild:
+	// the rebuild rotation touches one basin a tick and would otherwise write a
+	// line a tick. The number that matters is the ACTOR-WIDE vertex count,
+	// because that is the one that can be zero while every other sheet counter
+	// looks healthy -- which is exactly what "the waves are computed and
+	// invisible" looks like from a log.
+	// Read ONCE for both the gate and the line: the radius is a cvar now, and a
+	// line that gated on one read and printed another could claim a disc size
+	// the census was not taken at.
+	const double TessLogRadiusM = WaveTessRadiusMNow();
+	if (TessLogRadiusM > 0.0 && LodKey != LastTessLogKey)
+	{
+		int32 TessBasins = 0;
+		for (const FSheet& S : Sheets)
+		{
+			if (S.TessVerts > 0)
+			{
+				++TessBasins;
+			}
+		}
+		if (TessBasins > 0 || TotalTessVerts > 0)
+		{
+			LastTessLogKey = LodKey;
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: wave tessellation -- %d of %d basin(s) tessellated, %d vertex(es) inside "
+			            "the %.0f m disc at cell (%d,%d)."),
+			       TessBasins, Num, TotalTessVerts, TessLogRadiusM, LodKey.X, LodKey.Y);
+		}
+	}
+
 	if (!bLoggedFirstBuild && Num > 0)
 	{
 		int32 Settled = 0;
@@ -1000,9 +1597,11 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		{
 			bLoggedFirstBuild = true;
 			UE_LOG(LogVoxelEarth, Log,
-			       TEXT("Lake sheets: DRAINED build -- %d basin(s), %d rectangle(s), %d unresolved. The far field "
-			            "now has water; a capture taken before this line has not."),
-			       Num, TotalRects, UnresolvedBasins);
+			       TEXT("Lake sheets: DRAINED build -- %d basin(s), %d rectangle(s), %d tessellated vertex(es), "
+			            "%d unresolved. The far field now has water; a capture taken before this line has not. "
+			            "Zero tessellated vertices with the camera over a lake means WAVES CANNOT BE DRAWN, "
+			            "whatever the material graph is doing."),
+			       Num, TotalRects, TotalTessVerts, UnresolvedBasins);
 		}
 	}
 }

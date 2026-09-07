@@ -331,7 +331,7 @@
     "waist": 0.96,
     "width": 0.48
   },
-  "resolution_cm": "1",
+  "resolution_cm": "1.25",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,

@@ -1,12 +1,20 @@
 #include "VoxelSkySubsystem.h"
+#include "VoxelSessionCheckpoint.h"
 
 #include "VoxelEarth.h"
+#include "VoxelEditRelay.h" // F7 sky-epoch replication -- the clock's transport; see TickReplicatedClock
 #include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelEarthGameMode.h" // VoxelEarthSpawn::ParseSpawnColumnUU -- see SpawnRig
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelEphemeris.h"
+#include "VoxelMarchRenderer.h" // VoxelMarchPublishSunColour -- Phase L2's only hookup, the
+                                // same one-way seam VoxelFluidSubsystem.cpp uses for
+                                // VoxelMarchPublishSource: this subsystem publishes and never
+                                // asks the renderer anything back.
 #include "VoxelSkyDomeActor.h"
 #include "VoxelWorldSubsystem.h"
+
+#include "EngineUtils.h" // TActorIterator (locating the world's single AVoxelEditRelay, same as VoxelWaterSubsystem.cpp)
 
 #include "Camera/PlayerCameraManager.h"
 #include "Components/DirectionalLightComponent.h"
@@ -1316,6 +1324,183 @@ namespace VoxelSky
 		}
 		OutDay = Doy - kDaysBeforeMonth[11] + 1;
 	}
+
+	// =======================================================================
+	// THE DAY-NIGHT LIGHT COLOUR RAMP (Phase L2)
+	// =======================================================================
+	//
+	// docs/vs-lighting-implementation-plan-2026-09-06.md, phase L2. The header's
+	// declaration carries the contract; this carries the TABLE and the argument
+	// for every row in it.
+	//
+	// SIX ROWS. That is the whole table, and it is small on purpose: a ramp with
+	// twenty rows is a ramp nobody dares re-tune, and the thing this exists to
+	// produce is a warm/cool separation the owner can judge on four screenshots.
+	// Rows are keyed on APPARENT SUN ELEVATION -- not on the hour -- because the
+	// hour means different things at different latitudes and dates, and elevation
+	// is what the light actually does.
+	//
+	// LINEAR INTERPOLATION BETWEEN ROWS, and no smoothing on top. The rows are
+	// close enough near the horizon (the band where the colour moves fastest is
+	// covered by three of the six) that the kink at a row boundary is far below
+	// what a frame can show, and a spline would make the table's authored values
+	// stop being the values that appear on screen -- which is the property that
+	// makes a hand-tuned table tunable at all.
+	//
+	// THE NOON ROW IS THE MARCHER'S SHIPPED CONSTANT, EXACTLY. Ambient
+	// 1.00/1.04/1.12 is MakeMarchAmbient's own "slightly cool, because a clear
+	// sky is" triple (VoxelMarchRenderer.cpp), and sun 1/1/1 is the neutral gain.
+	// So a frozen-noon capture with this ramp live is byte-identical to one taken
+	// before L2 existed, and the noon plate is therefore a CONTROL in the owner's
+	// dawn/noon/dusk comparison rather than a fourth variable.
+	//
+	// THE AMBIENT ROWS ARE TINTS WITH A MODEST LEVEL IN THEM, and that is a
+	// deliberate departure from "pure hue". Shaded ground at midnight really is
+	// dimmer than shaded ground at noon, and voxel.March.AmbientIntensity is ONE
+	// number for the whole day -- so if the ramp carried no level at all, the
+	// night frame would keep a full daylight ambient and nothing but the sun's
+	// own extinction would make it night. The night row's mean is ~0.72 of the
+	// noon row's: enough to read as night against a moonlit sky, nowhere near
+	// enough to reopen the black-face problem L1 exists to close.
+	namespace
+	{
+		struct FSkyRampRow
+		{
+			float ElevationDeg;
+			float SunR, SunG, SunB;
+			float AmbR, AmbG, AmbB;
+		};
+
+		// ROW INTENT, one line each. Elevation ascending; the reader below relies
+		// on that order and the static_assert-shaped check in the test pins it.
+		constexpr FSkyRampRow kSkyRamp[] =
+		{
+			// NIGHT (-18 deg, the end of astronomical twilight and below). No sun
+			// term survives here at all -- voxel.March.VSLighting's dusk fade has
+			// been zero since the sun passed -0.02 -- so the sun triple is the
+			// moon's own cool cast, kept non-zero only so a reader sees a colour
+			// rather than a sentinel. The ambient is the frame's night floor:
+			// strongly blue (the eye's own Purkinje shift plus a real Rayleigh sky)
+			// and dimmed to ~0.72 mean. Scaled by the moon below.
+			{ -18.0f,  0.52f, 0.64f, 1.00f,   0.55f, 0.68f, 1.00f },
+			// CIVIL TWILIGHT (-6 deg). The sky is still lit and is at its bluest;
+			// the sun itself is gone. This row is why the ambient goes COOLER as
+			// the sun sets before it goes darker -- the warm/cool separation VS
+			// gets for free and we have to author (research doc mechanism 6).
+			{  -6.0f,  0.70f, 0.72f, 0.95f,   0.62f, 0.76f, 1.06f },
+			// HORIZON (0 deg). The warmest point of the day: a sun seen through
+			// the most air it will ever be seen through. The AMBIENT stays cool
+			// while the SUN goes orange, which is the whole effect -- lit faces
+			// warm, shaded faces blue, at a contrast ratio L1 already bounds.
+			{   0.0f,  1.25f, 0.72f, 0.42f,   0.78f, 0.86f, 1.10f },
+			// LOW SUN (+10 deg). Golden hour's far end. Still clearly warm; the
+			// ambient has begun to neutralise as the sky whitens.
+			{  10.0f,  1.14f, 0.94f, 0.76f,   0.90f, 0.96f, 1.12f },
+			// MID (+30 deg). Nearly neutral; the last row before the control.
+			{  30.0f,  1.04f, 1.01f, 0.96f,   0.97f, 1.02f, 1.12f },
+			// NOON (+60 deg and above). THE CONTROL ROW -- see the block comment:
+			// these two triples are the marcher's shipped constants, so a noon
+			// frame with the ramp live is the noon frame without it.
+			{  60.0f,  1.00f, 1.00f, 1.00f,   1.00f, 1.04f, 1.12f },
+		};
+		constexpr int32 kSkyRampRows = int32(UE_ARRAY_COUNT(kSkyRamp));
+
+		// THE MOON'S REFERENCE FRACTION, i.e. what MoonLightFraction reads at a
+		// full moon on the shipped defaults: voxel.Sky.MoonIntensity 0.16 over
+		// voxel.Sky.SunIntensity 15.0 = 0.01067.
+		//
+		// A SHAPING CONSTANT, NOT A JOIN, and it is written down rather than
+		// derived from the two cvars ON PURPOSE. Deriving it would make "how blue
+		// is a moonless night" move every time the owner dials the moon's
+		// brightness -- two knobs secretly coupled, which is the failure
+		// MakeMarchAmbient's own coupling comment exists to prevent. Dialling
+		// voxel.Sky.MoonIntensity above the shipped value simply saturates this
+		// term, which is the correct behaviour for "the moon is at least full".
+		constexpr float kMoonFractionAtFullMoon = 0.01067f;
+	}
+
+	FVoxelSkyLightColours SampleLightColours(double SunAltitudeDeg, float MoonFraction)
+	{
+		FVoxelSkyLightColours Out;
+		Out.MoonFraction = FMath::Max(MoonFraction, 0.0f);
+
+		// CLAMPED, NOT EXTRAPOLATED. The end rows are answers ("below the
+		// horizon", "high sun"), not the start of a trend, and a sun at -90 is a
+		// midnight sun's antipode rather than a colour four times as blue.
+		const float Elev = float(FMath::Clamp(SunAltitudeDeg, -90.0, 90.0));
+
+		int32 Hi = kSkyRampRows - 1;
+		for (int32 R = 0; R < kSkyRampRows; ++R)
+		{
+			if (Elev <= kSkyRamp[R].ElevationDeg)
+			{
+				Hi = R;
+				break;
+			}
+		}
+		const int32 Lo = FMath::Max(Hi - 1, 0);
+		float T = 0.0f;
+		if (Hi != Lo)
+		{
+			const float Span = kSkyRamp[Hi].ElevationDeg - kSkyRamp[Lo].ElevationDeg;
+			// Span is positive by construction (rows ascend and Hi > Lo); the
+			// guard is against a future edit that duplicates an elevation, which
+			// would otherwise divide by zero and paint every frame with a NaN.
+			T = (Span > 0.0f)
+				? FMath::Clamp((Elev - kSkyRamp[Lo].ElevationDeg) / Span, 0.0f, 1.0f)
+				: 0.0f;
+		}
+
+		// EXACT AT THE ROW ITSELF, and that is not fussiness -- it is the noon
+		// row's whole promise. FMath::Lerp(A, B, 1.0f) computes A + 1*(B - A),
+		// and in float that is NOT guaranteed to reproduce B bit-for-bit: at
+		// T == 1 the noon row's 1.04 could come back as 1.0400001, and the
+		// "a noon frame is byte-identical to the pre-L2 renderer" claim would be
+		// false by one ulp, in a way no capture would ever reveal and no comment
+		// would explain. The two endpoint branches make the table's authored
+		// numbers the numbers that actually leave this function.
+		auto Mix = [](float A, float B, float Alpha)
+		{
+			return (Alpha <= 0.0f) ? A : ((Alpha >= 1.0f) ? B : FMath::Lerp(A, B, Alpha));
+		};
+		Out.Sun = FLinearColor(Mix(kSkyRamp[Lo].SunR, kSkyRamp[Hi].SunR, T),
+		                       Mix(kSkyRamp[Lo].SunG, kSkyRamp[Hi].SunG, T),
+		                       Mix(kSkyRamp[Lo].SunB, kSkyRamp[Hi].SunB, T));
+		Out.Ambient = FLinearColor(Mix(kSkyRamp[Lo].AmbR, kSkyRamp[Hi].AmbR, T),
+		                           Mix(kSkyRamp[Lo].AmbG, kSkyRamp[Hi].AmbG, T),
+		                           Mix(kSkyRamp[Lo].AmbB, kSkyRamp[Hi].AmbB, T));
+
+		// ---- THE MOON'S SHARE OF THE NIGHT ---------------------------------
+		//
+		// Applied to the AMBIENT only, and only where the sun has stopped
+		// contributing: NightWeight is 1 below the civil-twilight row and 0 at
+		// the horizon, so a moonlit noon (which happens -- the moon is up in
+		// daylight half the time) cannot brighten the day by a single bit.
+		//
+		// A FULL MOON LIFTS AND NEUTRALISES; a new moon leaves the floor alone.
+		// Both directions are the same lerp because moonlight IS sunlight off a
+		// grey rock -- it reads blue because the eye is dark-adapted, not because
+		// the light is blue, so more of it means less blue as well as more of it.
+		{
+			const float NightWeight = 1.0f - FMath::Clamp((Elev + 6.0f) / 6.0f, 0.0f, 1.0f);
+			const float Moon01 =
+				FMath::Clamp(Out.MoonFraction / kMoonFractionAtFullMoon, 0.0f, 1.0f);
+			// 1.30x at full moon on the mean, and a pull of 0.35 toward neutral
+			// grey. Both numbers are eye-tuned starting points and are expected to
+			// move once the owner has seen a full-moon capture beside a new-moon
+			// one; they are here rather than on cvars because the ramp is one
+			// table and a table with four knobs hanging off it is not a table.
+			const float Gain = FMath::Lerp(1.0f, 1.30f, Moon01);
+			const float Neutralise = 0.35f * Moon01;
+			const float Mean = (Out.Ambient.R + Out.Ambient.G + Out.Ambient.B) / 3.0f;
+			const FLinearColor Moonlit(
+				FMath::Lerp(Out.Ambient.R, Mean, Neutralise) * Gain,
+				FMath::Lerp(Out.Ambient.G, Mean, Neutralise) * Gain,
+				FMath::Lerp(Out.Ambient.B, Mean, Neutralise) * Gain);
+			Out.Ambient = FMath::Lerp(Out.Ambient, Moonlit, NightWeight);
+		}
+		return Out;
+	}
 } // namespace VoxelSky
 
 // --- tuning constants ------------------------------------------------------
@@ -2113,6 +2298,52 @@ namespace
 	}
 } // namespace
 
+// --- F7 sky-epoch replication constants -------------------------------------
+//
+// CONSTANTS, NOT CVARS, deliberately. The module's cvar doctrine exists for
+// A/B arms and capture-leg knobs; nothing gates on sweeping these, and a
+// client-side correction rate that PLAYERS could each set differently would
+// manufacture exactly the per-client divergence this feature removes. Each
+// value states its argument; move one only with a better argument.
+namespace
+{
+	// Authority push cadence, real seconds. At the default 3600 s day the sun
+	// moves 0.5 deg (one sun-disc) between pushes, so a push is a fine-grained
+	// clock check, not a frame driver -- the client dead-reckons in between.
+	// Two scalars per push (~12 bytes on the wire): cadence is a smoothness
+	// choice, not a bandwidth one, and 5 s bounds how long a client can drift
+	// against a stale time scale before the next correction target arrives.
+	constexpr double kSkyEpochPushPeriodSeconds = 5.0;
+
+	// The correction's VISUAL budget: at most this many degrees per real second
+	// of sun motion added on top of the sun's own. Stated in degrees, not epoch
+	// seconds, so the bound survives any voxel.Sky.DayLengthSeconds -- the
+	// epoch-space rate is derived per use as DayLength * this / 360 (2.5
+	// epoch-s per real s at the default day, i.e. a correcting sky runs at up
+	// to 3.5x). 0.25 deg/s is half a sun-disc per second: it closes a 5 s
+	// clock skew in ~2 s, and a viewer tracking the sun sees ease, never a
+	// mid-frame teleport.
+	constexpr double kSkyEpochMaxCorrectionSunDegPerSec = 0.25;
+
+	// Exponential gain on small errors, per second (~4 s time constant). The
+	// last fraction of a correction eases out instead of holding the rate cap
+	// all the way to zero error and stopping dead.
+	constexpr double kSkyEpochCorrectionGainPerSec = 0.25;
+
+	// A received delta the bounded rate could not close within this many real
+	// seconds SNAPS instead (Warning-logged). Rationale at
+	// UVoxelSkySubsystem::AdoptReplicatedEpoch's declaration: one visible cut
+	// beats minutes of a racing sun, and the tide's quantised datum tracks a
+	// snap exactly as it tracks any other epoch jump. At defaults this puts
+	// the snap threshold at 75 epoch seconds.
+	constexpr double kSkyEpochSnapRealSeconds = 30.0;
+
+	// Receipts with |clientDelta| at or above this many epoch seconds print at
+	// Log ("once + on large deltas" -- the gate contract); the healthy steady
+	// state prints Verbose so a session log is not one line per 5 s.
+	constexpr double kSkyEpochLogDeltaS = 1.0;
+} // namespace
+
 // --- impl ------------------------------------------------------------------
 
 struct FVoxelSkyImpl
@@ -2123,6 +2354,35 @@ struct FVoxelSkyImpl
 	// pausable (TimeScale 0) without either of those meaning anything to the
 	// engine's own timekeeping.
 	double EpochSeconds = 0.0;
+    TOptional<double> SavedRate,SavedDay,SavedYear;
+    double ClockRate() const { return SavedRate.Get(double(VoxelSky::GetTimeScale())); }
+    double ClockDay() const { return SavedDay.Get(VoxelSky::GetDayLengthSeconds()); }
+    double ClockYear() const { return SavedYear.Get(VoxelSky::GetDaysPerYear()); }
+
+	// --- F7 sky-epoch replication (header's clock-replication block) ---------
+	//
+	// AUTHORITY side. The accumulator starts AT the period so the FIRST
+	// authority tick pushes immediately: the relay's initial replication to a
+	// joining client carries whatever was last pushed, and "nothing yet" for
+	// the first five seconds of a session would hand early joiners a zero
+	// epoch to snap to.
+	double EpochPushAccumSeconds = kSkyEpochPushPeriodSeconds;
+	// Resolved lazily at push cadence (TActorIterator once, then cached) --
+	// weak, because the relay is a world-owned actor this subsystem must not
+	// keep alive or dangle against on travel.
+	TWeakObjectPtr<AVoxelEditRelay> SkyClockRelay;
+	bool bLoggedFirstEpochPush = false;
+	bool bWarnedNoRelayForEpoch = false;
+
+	// CLIENT side: the dead-reckoned server clock (the correction TARGET) and
+	// the rate it advances at, both replaced wholesale on every receipt.
+	bool bHasReplicatedEpochTarget = false;
+	double ReplicatedEpochTargetSeconds = 0.0;
+	double ReplicatedEpochTargetTimeScale = 1.0;
+	// Mirrored into FVoxelSkyState each tick -- proof of traffic, per the
+	// state fields' own comment.
+	int64 EpochReplicationReceipts = 0;
+	double EpochCorrectionRemainingS = 0.0;
 
 	// Cadence accumulator for voxel.Sky.ShadowUpdateHz.
 	double LightUpdateAccumulator = 0.0;
@@ -3167,6 +3427,7 @@ bool UVoxelSkySubsystem::ResolveObserverXYUU(double& OutXUU, double& OutYUU) con
 
 void UVoxelSkySubsystem::Tick(float DeltaTime)
 {
+	if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaTime);
 
 	if (!Impl)
@@ -3206,11 +3467,18 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 		return;
 	}
 
-	const double TimeScale = (double)VoxelSky::GetTimeScale();
-	const double DayLength = VoxelSky::GetDayLengthSeconds();
-	const double DaysPerYear = VoxelSky::GetDaysPerYear();
+	const double TimeScale = Impl->ClockRate();
+	const double DayLength = Impl->ClockDay();
+	const double DaysPerYear = Impl->ClockYear();
 
 	Impl->EpochSeconds += (double)DeltaTime * TimeScale;
+
+	// F7: the replicated clock -- authority push / client bounded correction.
+	// Between the local accumulation above and the ephemeris reads below, so a
+	// correction is part of THIS frame's clock rather than a retroactive nudge
+	// the sun catches up to a frame late. Standalone pays one NetMode enum test
+	// and nothing else (the off arm).
+	TickReplicatedClock(DeltaTime, TimeScale);
 
 	// The observer's own position, because latitude is a function of it
 	// (GeoFromWorldUU). Held over from the previous frame when there is no
@@ -3272,6 +3540,10 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	S.bSunUp = Sun.AltitudeDeg > 0.0;
 	S.bMoonUp = Moon.AltitudeDeg > 0.0;
 	S.bClockRunning = TimeScale != 0.0;
+	// F7 proof of traffic (the fields' own comment in the header): client-only
+	// counters, forever 0/0.0 in standalone and on any server.
+	S.EpochReplicationReceipts = Impl->EpochReplicationReceipts;
+	S.EpochCorrectionRemainingS = Impl->EpochCorrectionRemainingS;
 
 	// The vectors themselves, for M_NightSky. NOT NEGATED -- see
 	// ApplySkyMaterialParams, and see the negation two blocks down that exists
@@ -4470,6 +4742,82 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	UKismetMaterialLibrary::SetScalarParameterValue(
 		World, Collection, TEXT("MoonLightFraction"), MoonLightFraction);
 
+	// =======================================================================
+	// PHASE L2: THE MARCHER'S DAY-NIGHT COLOURS
+	// =======================================================================
+	//
+	// docs/vs-lighting-implementation-plan-2026-09-06.md phase L2. The ramp is
+	// sampled and published HERE, inside the MPC push, for one reason: this is
+	// where MoonLightFraction is derived, and the marcher and MPC_VoxelSky must
+	// provably carry the SAME number for it. Deriving it twice -- once here for
+	// the material and once in Tick for the renderer -- is the two-copies defect
+	// this file already carries three separate notes about.
+	//
+	// NO NEW MPC PARAMETER, AND THAT IS A DELIBERATE REFUSAL. The marcher path
+	// needs none: it reads the colours off the publisher below, which is a
+	// C++-to-C++ seam. Adding SunColour/AmbientColour to MPC_VoxelSky would mean
+	// a full Tools/create_sky_material.py chain regeneration (that script DELETES
+	// and recreates the collection, so it cannot be done with an -Only run), and
+	// it would buy nothing until a material actually reads them. MoonLightFraction
+	// is the one existing parameter that fits any part of this contract and it is
+	// already written, one line up. When a material needs the colours, the param
+	// pair lands with the chain that regenerates for something else.
+	//
+	// EVERY FRAME, outside the voxel.Sky.ShadowUpdateHz gate, for this function's
+	// own stated reason: these are uniform writes that bust no shadow cache, and
+	// a 10 Hz staircase across a sunset is exactly the artefact the colour ramp
+	// exists to smooth.
+	{
+		const FVoxelSkyLightColours Colours =
+			VoxelSky::SampleLightColours(S.SunAltitudeDeg, MoonLightFraction);
+		VoxelMarchPublishSunColour(Colours.Sun, Colours.Ambient, Colours.MoonFraction);
+
+		// ---- THE GREPPABLE ENGAGEMENT LINE ---------------------------------
+		//
+		// ONCE, on the first publish, and it prints the ramp SAMPLED AT FIXED
+		// ELEVATIONS rather than the current frame's colour. That is the whole
+		// point of it: a line printing "the colour right now" proves only that a
+		// float was formatted, and at the hour most legs start (whatever the
+		// clock happens to hold) it cannot distinguish a working table from a
+		// table that returns its first row for every input. Four named
+		// elevations, in one line, make the RAMP itself readable from the log --
+		// warm at the horizon, neutral at noon, blue at night -- and a leg can
+		// grep this one string to prove the publisher ran at all.
+		//
+		// The live frame's own sample is on the line too, last, so a reader can
+		// place the run inside the ramp it just printed.
+		//
+		// GREP: "VoxelSky light ramp"
+		static bool bLoggedRamp = false;
+		if (!bLoggedRamp)
+		{
+			bLoggedRamp = true;
+			const FVoxelSkyLightColours Dawn  = VoxelSky::SampleLightColours(0.0, 0.0f);
+			const FVoxelSkyLightColours Noon  = VoxelSky::SampleLightColours(60.0, 0.0f);
+			const FVoxelSkyLightColours Dusk  = VoxelSky::SampleLightColours(-6.0, 0.0f);
+			const FVoxelSkyLightColours Night = VoxelSky::SampleLightColours(-18.0, 0.0f);
+			const FVoxelSkyLightColours Full  = VoxelSky::SampleLightColours(-18.0, 0.01067f);
+			UE_LOG(LogVoxelSky, Log,
+			       TEXT("VoxelSky light ramp PUBLISHING to the marcher (Phase L2). ")
+			       TEXT("sun/ambient tints by elevation: ")
+			       TEXT("horizon(0) sun=%.2f/%.2f/%.2f amb=%.2f/%.2f/%.2f | ")
+			       TEXT("noon(+60) sun=%.2f/%.2f/%.2f amb=%.2f/%.2f/%.2f | ")
+			       TEXT("civil(-6) sun=%.2f/%.2f/%.2f amb=%.2f/%.2f/%.2f | ")
+			       TEXT("night(-18, new moon) amb=%.2f/%.2f/%.2f, full moon amb=%.2f/%.2f/%.2f | ")
+			       TEXT("THIS FRAME alt=%.2f deg moonFrac=%.5f sun=%.2f/%.2f/%.2f amb=%.2f/%.2f/%.2f. ")
+			       TEXT("Consumed only while voxel.March.VSLighting is 1; the noon row IS the ")
+			       TEXT("marcher's shipped 1.00/1.04/1.12 ambient, so a noon frame is unchanged."),
+			       Dawn.Sun.R, Dawn.Sun.G, Dawn.Sun.B, Dawn.Ambient.R, Dawn.Ambient.G, Dawn.Ambient.B,
+			       Noon.Sun.R, Noon.Sun.G, Noon.Sun.B, Noon.Ambient.R, Noon.Ambient.G, Noon.Ambient.B,
+			       Dusk.Sun.R, Dusk.Sun.G, Dusk.Sun.B, Dusk.Ambient.R, Dusk.Ambient.G, Dusk.Ambient.B,
+			       Night.Ambient.R, Night.Ambient.G, Night.Ambient.B,
+			       Full.Ambient.R, Full.Ambient.G, Full.Ambient.B,
+			       S.SunAltitudeDeg, MoonLightFraction,
+			       Colours.Sun.R, Colours.Sun.G, Colours.Sun.B,
+			       Colours.Ambient.R, Colours.Ambient.G, Colours.Ambient.B);
+		}
+	}
+
 	// --- how big the moon is drawn -------------------------------------------
 	//
 	// DEGREES, and a RADIUS -- build_moon multiplies by DEG2RAD and takes the sine
@@ -4771,6 +5119,27 @@ const FVoxelSkyState& UVoxelSkySubsystem::GetSkyState() const
 	return Impl ? Impl->State : Empty;
 }
 
+bool UVoxelSkySubsystem::CaptureClock(double& Epoch,double& Rate,double& Day,double& Year) const
+{
+    if (!CaptureEpochSeconds(Epoch)) return false;
+    Rate=Impl->ClockRate(); Day=Impl->ClockDay(); Year=Impl->ClockYear();
+    return FMath::IsFinite(Rate) && FMath::Abs(Rate)<=1000000 && FMath::IsFinite(Day) && Day>=1 &&
+        Day<=1000000000 && FMath::IsFinite(Year) && Year>=1 && Year<=1000000;
+}
+bool UVoxelSkySubsystem::RestoreClock(double Epoch,double Rate,double Day,double Year)
+{
+    if (!Impl || !FMath::IsFinite(Epoch) || FMath::Abs(Epoch)>1e15 || !FMath::IsFinite(Rate) || FMath::Abs(Rate)>1000000 ||
+        !FMath::IsFinite(Day) || Day<1 || Day>1000000000 || !FMath::IsFinite(Year) || Year<1 || Year>1000000) return false;
+    Impl->SavedRate=Rate; Impl->SavedDay=Day; Impl->SavedYear=Year;
+    SetEpochSeconds(Epoch); return true;
+}
+
+bool UVoxelSkySubsystem::CaptureEpochSeconds(double& Out) const
+{
+    if (!Impl || !FMath::IsFinite(Impl->EpochSeconds)) return false;
+    Out=Impl->EpochSeconds; return true;
+}
+
 void UVoxelSkySubsystem::SetEpochSeconds(double NewEpochSeconds)
 {
 	if (!Impl)
@@ -4792,8 +5161,8 @@ void UVoxelSkySubsystem::SetTimeOfDay(double LocalHours)
 	{
 		return;
 	}
-	const double DayLength = VoxelSky::GetDayLengthSeconds();
-	const double DaysPerYear = VoxelSky::GetDaysPerYear();
+	const double DayLength = Impl->ClockDay();
+	const double DaysPerYear = Impl->ClockYear();
 	const int32 CurrentDayOfYear = DayOfYearFromEpoch(Impl->EpochSeconds, DayLength, DaysPerYear);
 
 	int32 ResolvedDayOfYear = CurrentDayOfYear;
@@ -4806,4 +5175,183 @@ void UVoxelSkySubsystem::SetTimeOfDay(double LocalHours)
 	UE_LOG(LogVoxelSky, Log,
 	       TEXT("VoxelSky::SetTimeOfDay RESOLVED: %05.2f h, day-of-year %d (was %d) at epoch %.3f s."),
 	       FMath::Frac(NewEpoch / DayLength) * 24.0, ResolvedDayOfYear, CurrentDayOfYear, NewEpoch);
+}
+
+// --- F7 sky-epoch replication ------------------------------------------------
+//
+// Policy and log contract at the two declarations in the header; constants and
+// their arguments above FVoxelSkyImpl. What lives HERE is only the mechanism.
+
+void UVoxelSkySubsystem::TickReplicatedClock(float DeltaTime, double TimeScale)
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	const ENetMode NetMode = World->GetNetMode();
+	if (NetMode == NM_Standalone)
+	{
+		// THE OFF ARM. Single-player reaches this enum test and nothing else:
+		// no relay lookup, no state written, no log line -- today's behavior,
+		// byte for byte.
+		return;
+	}
+
+	if (NetMode == NM_Client)
+	{
+		if (!Impl->bHasReplicatedEpochTarget)
+		{
+			// Connected, but nothing adopted yet -- either the first push has
+			// not arrived, or the server runs with voxel.Sky.Enabled 0 and
+			// will never push (its clock is not advancing, so there is no
+			// authoritative time to converge on). The local clock stands.
+			return;
+		}
+
+		// Dead-reckon the target forward with the SAME DeltaTime the local
+		// accumulation just used, at the SERVER'S advance rate. Sharing the
+		// DeltaTime makes frame timing cancel out of the error signal: with
+		// agreeing time scales the error holds still between receipts instead
+		// of breathing with the frame rate. Deliberately NO RTT compensation:
+		// a receipt is ~half an RTT stale, a constant ~0.05 epoch-s at typical
+		// latency -- 0.005 deg of sun, noise against the tide's 25 mm quantum.
+		Impl->ReplicatedEpochTargetSeconds += (double)DeltaTime * Impl->ReplicatedEpochTargetTimeScale;
+
+		const double Error = Impl->ReplicatedEpochTargetSeconds - Impl->EpochSeconds;
+		const double MaxRateEpochPerSec =
+			Impl->ClockDay() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
+		// Exponential toward the target, clamped to the visual rate budget,
+		// never overshooting. Four lines of pure math; if this ever grows
+		// shape (drift filters, RTT terms) it moves to voxel-core beside the
+		// tide LUT where a golden test can pin it -- stated at the header
+		// declaration too, so nobody grows it here.
+		double Step = FMath::Clamp(Error * kSkyEpochCorrectionGainPerSec,
+		                           -MaxRateEpochPerSec, MaxRateEpochPerSec) * (double)DeltaTime;
+		if (FMath::Abs(Step) > FMath::Abs(Error))
+		{
+			Step = Error;
+		}
+		Impl->EpochSeconds += Step;
+		Impl->EpochCorrectionRemainingS = Error - Step;
+		return;
+	}
+
+	// Authority (listen or dedicated server): push the clock pair at cadence.
+	// The push itself renders nothing and steps nothing -- a listen server with
+	// no client connected writes two fields on an actor and that is all.
+	Impl->EpochPushAccumSeconds += (double)DeltaTime;
+	if (Impl->EpochPushAccumSeconds < kSkyEpochPushPeriodSeconds)
+	{
+		return;
+	}
+	Impl->EpochPushAccumSeconds = 0.0;
+
+	AVoxelEditRelay* Relay = Impl->SkyClockRelay.Get();
+	if (!Relay)
+	{
+		for (TActorIterator<AVoxelEditRelay> It(World); It; ++It)
+		{
+			Relay = *It;
+			break;
+		}
+		Impl->SkyClockRelay = Relay;
+	}
+	if (!Relay)
+	{
+		// The same broken configuration BroadcastWaterDiffs warns about (a
+		// networked world with no relay), warned ONCE here because the water
+		// side already repeats it per broadcast.
+		if (!Impl->bWarnedNoRelayForEpoch)
+		{
+			Impl->bWarnedNoRelayForEpoch = true;
+			UE_LOG(LogVoxelSky, Warning,
+			       TEXT("SkyEpoch AUTHORITY: no AVoxelEditRelay in this networked world -- the clock is NOT ")
+			       TEXT("replicating and every client runs its own locally-started epoch (skewed seas)."));
+		}
+		return;
+	}
+
+	Relay->AuthoritySetSkyClock(Impl->EpochSeconds, (float)TimeScale);
+	if (!Impl->bLoggedFirstEpochPush)
+	{
+		Impl->bLoggedFirstEpochPush = true;
+		// Once, on the first push -- the authority half of the gate evidence.
+		// Later pushes are silent (they differ only in the number); the RECEIPT
+		// side ('SkyEpoch REPLICATED') is where per-event evidence lives,
+		// because the receipt is the half that can silently fail.
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("SkyEpoch AUTHORITY: first push epoch=%.3f timeScale=%.3f period=%.1f s via AVoxelEditRelay. ")
+		       TEXT("Clients log 'SkyEpoch REPLICATED' on receipt; a connected client without that line did not ")
+		       TEXT("engage the replicated clock."),
+		       Impl->EpochSeconds, (float)TimeScale, kSkyEpochPushPeriodSeconds);
+	}
+}
+
+void UVoxelSkySubsystem::AdoptReplicatedEpoch(double ServerEpochSeconds, float ServerTimeScale)
+{
+	if (!Impl)
+	{
+		return;
+	}
+	Impl->EpochReplicationReceipts++;
+
+	const double LocalBefore = Impl->EpochSeconds;
+	const double Delta = ServerEpochSeconds - LocalBefore;
+	const double MaxRateEpochPerSec =
+		Impl->ClockDay() * kSkyEpochMaxCorrectionSunDegPerSec / 360.0;
+
+	const bool bFirst = !Impl->bHasReplicatedEpochTarget;
+	const bool bTooLargeToBlend = FMath::Abs(Delta) > MaxRateEpochPerSec * kSkyEpochSnapRealSeconds;
+
+	Impl->bHasReplicatedEpochTarget = true;
+	Impl->ReplicatedEpochTargetSeconds = ServerEpochSeconds;
+	Impl->ReplicatedEpochTargetTimeScale = (double)ServerTimeScale;
+
+	const TCHAR* Action = TEXT("BLEND");
+	if (bFirst || bTooLargeToBlend)
+	{
+		// The two snap cases argued at the header declaration: join adoption,
+		// and a delta the bounded rate could not close within
+		// kSkyEpochSnapRealSeconds. SetEpochSeconds is the funnel entry point
+		// and already forces the light rig to re-orient on the next tick.
+		Action = bFirst ? TEXT("SNAP-JOIN") : TEXT("SNAP-LARGE");
+		SetEpochSeconds(ServerEpochSeconds);
+		Impl->EpochCorrectionRemainingS = 0.0;
+	}
+	else
+	{
+		Impl->EpochCorrectionRemainingS = Delta;
+	}
+
+	// THE GATE LINE. Contract at the header declaration: first receipt and
+	// large deltas at Log (a mid-session SNAP-LARGE at Warning -- it means the
+	// server clock jumped or this client hitched hard), steady state at
+	// Verbose. One format string shape for all three so one grep finds every
+	// receipt a leg captured.
+	if (!bFirst && bTooLargeToBlend)
+	{
+		UE_LOG(LogVoxelSky, Warning,
+		       TEXT("SkyEpoch REPLICATED: serverEpoch=%.3f serverTimeScale=%.3f clientEpoch=%.3f ")
+		       TEXT("clientDelta=%+.3f s action=%s correctionRate=%.3f eps/s receipts=%lld -- delta exceeds ")
+		       TEXT("what the bounded rate closes in %.0f s; snapped."),
+		       ServerEpochSeconds, ServerTimeScale, LocalBefore, Delta, Action, MaxRateEpochPerSec,
+		       (long long)Impl->EpochReplicationReceipts, kSkyEpochSnapRealSeconds);
+	}
+	else if (bFirst || FMath::Abs(Delta) >= kSkyEpochLogDeltaS)
+	{
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("SkyEpoch REPLICATED: serverEpoch=%.3f serverTimeScale=%.3f clientEpoch=%.3f ")
+		       TEXT("clientDelta=%+.3f s action=%s correctionRate=%.3f eps/s receipts=%lld"),
+		       ServerEpochSeconds, ServerTimeScale, LocalBefore, Delta, Action, MaxRateEpochPerSec,
+		       (long long)Impl->EpochReplicationReceipts);
+	}
+	else
+	{
+		UE_LOG(LogVoxelSky, Verbose,
+		       TEXT("SkyEpoch REPLICATED: serverEpoch=%.3f serverTimeScale=%.3f clientEpoch=%.3f ")
+		       TEXT("clientDelta=%+.3f s action=%s correctionRate=%.3f eps/s receipts=%lld"),
+		       ServerEpochSeconds, ServerTimeScale, LocalBefore, Delta, Action, MaxRateEpochPerSec,
+		       (long long)Impl->EpochReplicationReceipts);
+	}
 }

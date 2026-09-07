@@ -297,7 +297,10 @@ TAutoConsoleVariable<bool> CVarVoxelWaterSwe(
 	TEXT("any net mode except NM_Standalone -- ADR-0004 item 3 defers enablement until the coupler's membership/dwell/")
 	TEXT("depth state is replicated, and a standalone world is the one case that deferral does not cover. ")
 	TEXT("NOTE: the renderer does not yet draw sheet depth (ADR-0004 'Renderer'), so promoted water is currently ")
-	TEXT("SIMULATED BUT INVISIBLE."),
+	TEXT("SIMULATED BUT INVISIBLE. WARNING (ADR-0007 closure, 2026-09-05): SWE is the shelved fallback and has a ")
+	TEXT("known unfixed defect -- no lateral spill channel, so a sheet-owned pool cannot drain into a lower ")
+	TEXT("CA-owned neighbour (measured: 0.5% drained over 200 ticks through a breach 3 voxels below the ")
+	TEXT("waterline). See swe.h section 5. Arm this expecting that wall."),
 	ECVF_Default);
 
 // W3 (plan S3.7 Layer R): the coarse river-network sim and its coupling to the

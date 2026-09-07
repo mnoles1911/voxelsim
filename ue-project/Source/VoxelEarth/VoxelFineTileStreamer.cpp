@@ -636,6 +636,10 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	// (the transient-with-attempts-left path is the only way to get here with
 	// an entry still present). Dropping it also frees the stored explanation.
 	LoadFailures_.erase(TileHash(Tile));
+	// The answer set changed: epoch-stamped consumer caches (see
+	// ResidencyEpoch() in the header) must re-derive anything computed while
+	// this tile was absent.
+	ResidencyEpoch_.fetch_add(1, std::memory_order_relaxed);
 
 	// Charge the LRU BOTH the file bytes and the decoded lattice. The decoded
 	// half is ~2/3 of the total for a production tile (134 MB of int16 lattice
@@ -1426,6 +1430,10 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 			// What DOES earn a fresh attempt is the file itself changing; see
 			// EnsureTileResident_Locked.
 			KnownMissing_.clear();
+			// Missing-memo reset = the answer set may change (a tile baked
+			// mid-session becomes loadable): advance the epoch so stamped
+			// consumer caches re-derive. See ResidencyEpoch() in the header.
+			ResidencyEpoch_.fetch_add(1, std::memory_order_relaxed);
 			// Counted BEFORE the assignment and only when a centre already existed,
 			// so ringMoves==0 reads as "the anchor has not crossed a tile boundary"
 			// and not as "the tick has never run" -- the sentinel centre says the

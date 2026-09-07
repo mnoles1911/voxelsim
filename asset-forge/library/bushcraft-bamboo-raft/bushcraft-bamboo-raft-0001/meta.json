@@ -1,0 +1,242 @@
+{
+  "id": "bushcraft-bamboo-raft-0001",
+  "species": "bushcraft-bamboo-raft",
+  "kind": "artifact",
+  "category": "craftable",
+  "seed": 1,
+  "spec_hash": "0569d361f6c04b41",
+  "stats": {
+    "seed": 1,
+    "spec_hash": "0569d361f6c04b41",
+    "kind": "artifact",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 2.5,
+    "height_m": 1.5,
+    "length_m": 4.225,
+    "footprint_m": [
+      4.23,
+      2.45
+    ],
+    "grid_mb": 1.5,
+    "extent_vox": [
+      169,
+      98,
+      60
+    ],
+    "vox_models_needed": 1,
+    "voxels": 52214,
+    "by_material": {
+      "17": 10525,
+      "18": 18168,
+      "39": 23521
+    },
+    "ground_contact": 15,
+    "ms_grow": 1.6,
+    "ms_raster": 399.5,
+    "steps": [
+      {
+        "step": "bamboo deck",
+        "added": 41786,
+        "repainted": 0,
+        "must_change": true,
+        "note": "16 hollow culms, independent nodes and uneven ends",
+        "voxels_after": 41786,
+        "culms": [
+          {
+            "axis": 0,
+            "length_m": 4.030752469375312,
+            "diameter_m": 0.1216380155651653,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 4.009957192973305,
+            "diameter_m": 0.13569923580786455,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 3.963027247744235,
+            "diameter_m": 0.14278984529792318,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 4.003712389854652,
+            "diameter_m": 0.13068110677454323,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 3.8916058746965154,
+            "diameter_m": 0.14044017464346947,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 4.088500101751336,
+            "diameter_m": 0.14696808822856744,
+            "nodes": 9
+          },
+          {
+            "axis": 0,
+            "length_m": 4.032218963038751,
+            "diameter_m": 0.13636248489971642,
+            "nodes": 9
+          },
+          {
+            "axis": 0,
+            "length_m": 3.987538385124582,
+            "diameter_m": 0.13048168511756203,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 4.089633260426973,
+            "diameter_m": 0.11910811937001836,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 3.956087112663923,
+            "diameter_m": 0.13694777570837952,
+            "nodes": 9
+          },
+          {
+            "axis": 0,
+            "length_m": 4.011885225337348,
+            "diameter_m": 0.12517359196022002,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 3.928237095264368,
+            "diameter_m": 0.13665207872972818,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 4.000442300209812,
+            "diameter_m": 0.1208727990870229,
+            "nodes": 10
+          },
+          {
+            "axis": 0,
+            "length_m": 3.8480243989552183,
+            "diameter_m": 0.11979582368329317,
+            "nodes": 9
+          },
+          {
+            "axis": 0,
+            "length_m": 3.936126058089086,
+            "diameter_m": 0.13411543360769712,
+            "nodes": 9
+          },
+          {
+            "axis": 0,
+            "length_m": 3.8653072383153377,
+            "diameter_m": 0.14153420263994304,
+            "nodes": 9
+          },
+          {
+            "axis": 1,
+            "length_m": 2.2800000000000002,
+            "diameter_m": 0.15,
+            "nodes": 5
+          },
+          {
+            "axis": 1,
+            "length_m": 2.2800000000000002,
+            "diameter_m": 0.15,
+            "nodes": 5
+          },
+          {
+            "axis": 1,
+            "length_m": 2.46,
+            "diameter_m": 0.15,
+            "nodes": 7
+          },
+          {
+            "axis": 1,
+            "length_m": 2.46,
+            "diameter_m": 0.15,
+            "nodes": 6
+          },
+          {
+            "axis": 2,
+            "length_m": 1.455,
+            "diameter_m": 0.13,
+            "nodes": 4
+          },
+          {
+            "axis": 0,
+            "length_m": 0.5800000000000001,
+            "diameter_m": 0.065,
+            "nodes": 1
+          },
+          {
+            "axis": 2,
+            "length_m": 1.455,
+            "diameter_m": 0.13,
+            "nodes": 3
+          },
+          {
+            "axis": 0,
+            "length_m": 0.5800000000000001,
+            "diameter_m": 0.065,
+            "nodes": 1
+          }
+        ],
+        "deck_culms": 16
+      },
+      {
+        "step": "under-deck bearers",
+        "added": 4574,
+        "repainted": 540,
+        "must_change": true,
+        "note": "two transverse supports below the deck",
+        "voxels_after": 46360
+      },
+      {
+        "step": "lashed crossbars",
+        "added": 3544,
+        "repainted": 349,
+        "must_change": true,
+        "note": "two substantial bamboo crossbars above the deck",
+        "voxels_after": 49904
+      },
+      {
+        "step": "upright posts and pegs",
+        "added": 1911,
+        "repainted": 154,
+        "must_change": true,
+        "note": "two outboard posts at the far crossbar",
+        "voxels_after": 51815
+      },
+      {
+        "step": "rope lashings",
+        "added": 399,
+        "repainted": 695,
+        "must_change": true,
+        "note": "paired rope turns, tightening knots and short tails",
+        "voxels_after": 52214
+      }
+    ],
+    "silent_steps": [],
+    "hollow_frac": 0.2988,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 467.8
+  },
+  "problems": [],
+  "vox_models": 1
+}

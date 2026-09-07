@@ -16,7 +16,9 @@ import sys
 import time
 from pathlib import Path
 
-from . import biomes as biomelib, contact, kinds, parts as partslib, materials, pipeline, render, spec as specmod, vox, vxa
+from . import (biomes as biomelib, categories as catlib, contact, kinds,
+               parts as partslib, materials, pipeline, render,
+               spec as specmod, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
 SPECS = ROOT / "specs"
@@ -586,7 +588,7 @@ def cmd_selftest(args) -> int:
             off.append(f"{p.stem}: unreadable ({e})")
             continue
         k = kinds.BY_KEY.get(specmod.get(s, "kind"))
-        if k is None or k.lattice != "terrain":
+        if k is None or k.lattice != "terrain" or specmod.resolutionlib.categories.of(s) != "environment":
             continue
         cm = float(specmod.get(s, "resolution_cm"))
         if cm != kinds.TERRAIN_LATTICE_CM:
@@ -696,6 +698,60 @@ def cmd_selftest(args) -> int:
         print(f"    ! ...and {len(drifted) - 10} more")
     ok &= not typed and not drifted
 
+    # EVERY SPECIES RESOLVES TO A CATEGORY.
+    #
+    # `category` is not a PARAMS row -- deliberately, because a row there
+    # re-identifies all 830 specs -- so `validate`'s clamping machinery does not
+    # cover it and this is the only place that does. An unreadable block
+    # resolves to NOTHING rather than falling back to the kind's default
+    # (`forge.categories.clean`), which is correct and is also silent from
+    # outside: the species simply stops appearing in library/categories.json,
+    # in the app's grouping and in the game's list of craftables, with nothing
+    # anywhere saying why. So it is named here.
+    #
+    # Cheap, so it runs under --quick.
+    unclassified = []
+    for path in spec_paths():
+        try:
+            body, _ = specmod.load(path)
+        except (OSError, ValueError):
+            continue        # the lattice check above already reports these
+        if catlib.of(body) is None:
+            unclassified.append(
+                f"{path.stem} ({specmod.get(body, 'kind')}): category resolves "
+                f"to nothing ({catlib.source_of(body)}) -- it will appear in NO "
+                f"index and in no category in the app or the game")
+    print(f"  every species resolves to a category: "
+          f"{'pass' if not unclassified else 'FAIL'} "
+          f"({len(spec_paths())} specs, {len(catlib.KEYS)} categories)")
+    for line in unclassified:
+        print(f"    ! {line}")
+    ok &= not unclassified
+
+    # AND THE GENERATED INDEX IS NOT STALE.
+    #
+    # `library/categories.json` is the seam a crafting system reads, and nothing
+    # regenerates it automatically. A stale index is the worst kind of wrong
+    # here: it is valid JSON, it parses, it lists real species, and it is a
+    # picture of the library as it was some commits ago. Same failure shape as
+    # the generated palette this command already checks, and checked the same
+    # way -- by rebuilding it and comparing, never by a timestamp.
+    import subprocess
+    stale = ""
+    try:
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "export_categories.py"), "--check"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            stale = (r.stdout.strip().splitlines() or ["--check failed"])[-1]
+    except OSError as e:                      # pragma: no cover
+        stale = f"could not run tools/export_categories.py ({e})"
+    print(f"  library/categories.json is current: {'pass' if not stale else 'FAIL'}")
+    if stale:
+        print(f"    ! {stale}")
+        print("    run python tools/export_categories.py")
+    ok &= not stale
+
     # A SPECIES MAY ONLY BE WEIGHTED INTO A BIOME THAT HOSTS ITS KIND.
     #
     # `spec.py` gates the app's sliders with `kinds=b.hosts`, which is a UI
@@ -749,7 +805,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--out")
     g.add_argument("--px", type=int, default=640)
-    g.add_argument("--res", help="voxel size in cm; overrides the spec (e.g. --res 2)")
+    g.add_argument("--res", help="voxel size in cm; overrides the spec (e.g. --res 1.25)")
     g.set_defaults(fn=cmd_gen)
 
     b = sub.add_parser("batch", help="generate many seeds and a contact sheet")

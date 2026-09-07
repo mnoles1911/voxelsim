@@ -1524,3 +1524,249 @@ VXC_TEST(lake_sampler_index_does_not_outlive_its_tile) {
     CHECK(lakes.surfaceAtPixel(sx, sy) != kNoWaterMm);
     CHECK(lakes.basinsForTile(tx, ty) != nullptr);
 }
+
+// ---------------------------------------------------------------------------
+// EXTENTS FOLLOW THE DATUM (tides plan Phase C4)
+// ---------------------------------------------------------------------------
+
+#include "voxelcore/tidal.h"
+
+namespace {
+
+// A fixture oracle for the admission and routing tests: vouches for an
+// explicit (tile, id) set and nothing else.
+struct PickyOracle final : ITidalBasinOracle {
+    int32_t tx = 0, ty = 0;
+    int32_t id = -1; // matched against BasinEntry::basinId
+    bool isTidal(int32_t inTx, int32_t inTy, const BasinEntry& b) override {
+        return inTx == tx && inTy == ty && int32_t(b.basinId) == id;
+    }
+};
+
+} // namespace
+
+// THE ROUNDING DOCTRINE PIN (water-architecture.md:231-242, restated by the
+// plan: "a test asserting them equal must FAIL"). The draw decimation
+// (lakeSheetRects: any-wet-in-block plus a shore margin) OVER-covers, and the
+// despawn grid (basinExtentBits: centre-sample) UNDER-covers, on the SAME
+// mask -- deliberately opposed roundings, each erring toward its own harmless
+// side. This test asserts they DISAGREE on a shoreline fixture; anyone who
+// "unifies" the two rules trips it, which is the entire point of its
+// existence. (Interior open water agrees by construction; the shore is where
+// the doctrine lives.)
+VXC_TEST(draw_overcovers_and_despawn_undercovers_are_deliberately_unequal) {
+    const int32_t pixelMm = 1875;
+    const int32_t w = 16, h = 16;
+    BasinEntry b = sheetBasin(w, h);
+    // A half-wet basin with a ragged diagonal shoreline, so decimation blocks
+    // straddle wet and dry.
+    std::vector<uint8_t> mask(size_t(w) * size_t(h), 0);
+    for (int32_t y = 0; y < h; ++y)
+        for (int32_t x = 0; x < w; ++x)
+            if (x + y < 14) mask[size_t(y) * size_t(w) + size_t(x)] = 1;
+
+    // DRAW at step 4: any-wet blocks, dilated by the shore margin.
+    std::vector<LakeSheetRect> rects;
+    lakeSheetRects(b, mask, 4, rects);
+    const auto drawnCovers = [&](int32_t px, int32_t py) {
+        for (const LakeSheetRect& r : rects)
+            if (px >= r.x0 && px <= r.x1 && py >= r.y0 && py <= r.y1) return true;
+        return false;
+    };
+
+    // DESPAWN over the same footprint, one cell per 4 pixels (cell centres at
+    // pixel 1, 5, 9, 13 of each axis).
+    const int32_t n = 4;
+    const int64_t cellMm = int64_t(pixelMm) * 4;
+    uint32_t rows[32];
+    basinExtentBits(b, mask, 0, 0, pixelMm, 0, 0, cellMm, n, rows);
+
+    int32_t drawnNotSunk = 0, sunkNotDrawn = 0;
+    for (int32_t cy = 0; cy < n; ++cy) {
+        for (int32_t cx = 0; cx < n; ++cx) {
+            const bool sunk = ((rows[cy] >> uint32_t(cx)) & 1u) != 0;
+            // The despawn cell's own centre pixel, through the draw's cover:
+            const bool drawn = drawnCovers(cx * 4 + 2, cy * 4 + 2);
+            if (drawn && !sunk) ++drawnNotSunk;
+            if (sunk && !drawn) ++sunkNotDrawn;
+        }
+    }
+    // The doctrine, as inequalities that can fail: the draw reaches cells the
+    // sink refuses (over-cover vs under-cover) -- and NEVER the reverse, which
+    // would be a sink eating water the player cannot even see.
+    CHECK(drawnNotSunk > 0);
+    CHECK_EQ(sunkNotDrawn, 0);
+}
+
+// THE NEAR-FIELD PIN (plan C4 first bullet: "already correct -- pin with a
+// test, change nothing"): the per-voxel ground bound serves a TIDAL datum
+// exactly as it serves a baked one. Raise the datum and the fill grows
+// downward-bounded by the same amplified ground; no voxel below ground ever
+// fills, and the top voxel carries the datum's sub-voxel remainder.
+VXC_TEST(near_field_fill_serves_a_tidal_datum_through_the_same_ground_bound) {
+    const int32_t ground = 460; // amplified ground, mm
+    const int32_t lowDatum = 650, highDatum = 1250;
+    // Below ground: never water, at either datum.
+    CHECK_EQ(int(implicitWaterFill(3, ground, lowDatum, false)), 0);   // voxel [300,400)
+    CHECK_EQ(int(implicitWaterFill(3, ground, highDatum, false)), 0);
+    // Between ground and the datum: full where fully submerged.
+    CHECK_EQ(int(implicitWaterFill(5, ground, lowDatum, false)), 255); // [500,600)
+    CHECK_EQ(int(implicitWaterFill(5, ground, highDatum, false)), 255);
+    // The top voxel: the datum's own remainder, so the surface sits AT the
+    // datum -- the rising tide grows the column by partial voxels, not pops.
+    CHECK_EQ(int(implicitWaterFill(6, ground, lowDatum, false)),
+             int(waterFillUnits(600, lowDatum)));
+    CHECK_EQ(int(implicitWaterFill(12, ground, highDatum, false)),
+             int(waterFillUnits(1200, highDatum)));
+    // Above the datum: dry air, at either datum.
+    CHECK_EQ(int(implicitWaterFill(7, ground, lowDatum, false)), 0);
+    CHECK_EQ(int(implicitWaterFill(13, ground, highDatum, false)), 0);
+}
+
+// extentMaskAtDatum over the golden tile: at the baked datum it IS the baked
+// mask (same object -- the tide-dark path stays on the shipped bytes); at a
+// raised datum it is a superset built by the same fill; and the one-entry
+// memo returns the identical object until the datum steps.
+VXC_TEST(extent_mask_at_datum_is_the_baked_mask_shared_and_a_superset_raised) {
+    const std::filesystem::path p =
+        std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
+    if (!std::filesystem::exists(p)) {
+        std::printf("  (skip: %s absent)\n", p.string().c_str());
+        return;
+    }
+    FineError err = FineError::kNone;
+    std::ifstream in(p, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    std::optional<FineTile> probe = FineTile::parse(bytes.data(), bytes.size(), {}, &err);
+    CHECK(probe.has_value());
+    if (!probe) return;
+    FineTileSampler s(probe->seed());
+    CHECK(s.loadTile(bytes, &err));
+    LakeSampler lakes(s);
+    const int32_t tx = probe->tileX(), ty = probe->tileY();
+    CHECK(lakes.prewarmTile(tx, ty));
+
+    size_t tested = 0;
+    for (size_t i = 0; i < probe->basins().size() && tested < 4; ++i) {
+        const BasinEntry& b = probe->basins()[i];
+        if (!b.holdsWater()) continue;
+        const std::vector<uint8_t>* baked = lakes.extentMaskFor(tx, ty, uint16_t(i));
+        if (baked == nullptr) continue;
+        size_t bakedWet = 0;
+        for (uint8_t v : *baked) bakedWet += v;
+        if (bakedWet == 0) continue;
+        ++tested;
+
+        // At the baked datum: the SAME mask object, not a copy.
+        CHECK(lakes.extentMaskAtDatum(tx, ty, uint16_t(i), b.surfaceMm) == baked);
+
+        // Two metres up: a superset (the seeded component at a higher datum
+        // contains the component at the lower one), and the memo is one object
+        // until the datum moves.
+        const int32_t upMm = b.surfaceMm + 2000;
+        const std::vector<uint8_t>* up = lakes.extentMaskAtDatum(tx, ty, uint16_t(i), upMm);
+        CHECK(up != nullptr);
+        if (up == nullptr) continue;
+        CHECK_EQ(up->size(), baked->size());
+        size_t upWet = 0;
+        bool superset = true;
+        for (size_t k = 0; k < up->size(); ++k) {
+            upWet += (*up)[k];
+            if ((*baked)[k] && !(*up)[k]) superset = false;
+        }
+        CHECK(superset);
+        CHECK(upWet >= bakedWet);
+        CHECK(lakes.extentMaskAtDatum(tx, ty, uint16_t(i), upMm) == up); // memo hit
+        // A different datum replaces the entry (one entry per basin, keyed by
+        // the datum) -- and the baked mask is untouched throughout.
+        const std::vector<uint8_t>* down = lakes.extentMaskAtDatum(tx, ty, uint16_t(i), upMm + 25);
+        CHECK(down != nullptr);
+        CHECK(lakes.extentMaskFor(tx, ty, uint16_t(i)) == baked);
+    }
+    if (tested == 0) std::printf("  (skip: no resolvable wet basin in golden)\n");
+}
+
+// THE DRY-ROW ADMISSION (blocker 2, the lakes.h "second v0 limit" hook): a
+// holdsWater()==false row joins the bucket index IFF the oracle vouches for
+// it, and through TidalDatumSource its seed column then answers the tidal
+// datum. Without the oracle the same column answers kNoWaterMm -- the shipped
+// behaviour, asserted first so the admission is proven to be the difference.
+VXC_TEST(dry_tidal_row_is_admitted_and_answers_the_tidal_datum) {
+    const std::filesystem::path p =
+        std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
+    if (!std::filesystem::exists(p)) {
+        std::printf("  (skip: %s absent)\n", p.string().c_str());
+        return;
+    }
+    FineError err = FineError::kNone;
+    std::ifstream in(p, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    std::optional<FineTile> probe = FineTile::parse(bytes.data(), bytes.size(), {}, &err);
+    CHECK(probe.has_value());
+    if (!probe) return;
+    FineTileSampler s(probe->seed());
+    CHECK(s.loadTile(bytes, &err));
+    const int32_t tx = probe->tileX(), ty = probe->tileY();
+    const uint32_t size = probe->size();
+    const int64_t ox = int64_t(tx) * size, oy = int64_t(ty) * size;
+
+    LakeSampler lakes(s);
+    CHECK(lakes.prewarmTile(tx, ty));
+
+    // A dry row whose seed control point sits at or under its own recorded
+    // surface (so the fill can wet the seed once a datum exists above it), and
+    // whose seed no OTHER basin's water already covers -- the pre-state must
+    // be the shipped kNoWaterMm or the admission proves nothing.
+    const BasinEntry* dry = nullptr;
+    size_t dryIdx = 0;
+    for (size_t i = 0; i < probe->basins().size(); ++i) {
+        const BasinEntry& b = probe->basins()[i];
+        if (b.holdsWater()) continue;
+        if (b.surfaceMm == kNoWaterMm) continue;
+        if (s.elevationMm(ox + b.seedX, oy + b.seedY) > b.surfaceMm) continue;
+        if (lakes.surfaceAtPixel(ox + b.seedX, oy + b.seedY) != kNoWaterMm) continue;
+        dry = &b;
+        dryIdx = i;
+        break;
+    }
+    if (dry == nullptr) {
+        std::printf("  (skip: golden has no wettable dry row)\n");
+        return;
+    }
+    const int64_t px = ox + dry->seedX, py = oy + dry->seedY;
+
+    // SHIPPED BEHAVIOUR FIRST: no oracle, the dry row does not exist.
+    CHECK_EQ(lakes.surfaceAtPixel(px, py), kNoWaterMm);
+
+    // Now vouch for it and bind the tidal datum over a passthrough inner.
+    PickyOracle oracle;
+    oracle.tx = tx;
+    oracle.ty = ty;
+    oracle.id = int32_t(dry->basinId);
+    struct Passthrough final : IBasinDatumSource {
+        int32_t basinDatumMm(int32_t, int32_t, const BasinEntry& baked) override {
+            return baked.surfaceMm;
+        }
+    } inner;
+    TidalDatumSource tidal(inner, oracle);
+    const int32_t tideNow = dry->spillMm + 500; // sea standing over the sill
+    tidal.setTideNowMm(tideNow);
+    lakes.setTidalOracle(&oracle);
+    lakes.setBasinDatumSource(&tidal);
+
+    // Admitted: the seed column now answers the CONNECTED tidal datum. (The
+    // baked mask for a dry row wets exactly the cells at or under surfaceMm,
+    // which the fixture guaranteed includes the seed.)
+    const int32_t got = lakes.surfaceAtPixel(px, py);
+    CHECK(got >= tideNow); // >= not ==: an overlapping wetter basin may outbid it
+    // And the datum-following extent exists at the tidal datum.
+    CHECK(lakes.extentMaskAtDatum(tx, ty, uint16_t(dryIdx), tideNow) != nullptr);
+
+    // Un-vouch (oracle now refuses): admissions invalidate, the row vanishes
+    // again -- the admission is the oracle's, not a ratchet.
+    oracle.id = -1;
+    lakes.invalidateTidalAdmissions();
+    CHECK_EQ(lakes.surfaceAtPixel(px, py), kNoWaterMm);
+}

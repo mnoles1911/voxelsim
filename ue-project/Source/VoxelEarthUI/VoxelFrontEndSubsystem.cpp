@@ -1,4 +1,5 @@
 #include "VoxelFrontEndSubsystem.h"
+#include "VoxelSessionCheckpoint.h"
 #include "VoxelGraphicsUserSettings.h"
 
 #include "SVoxelHourglass.h"
@@ -27,6 +28,7 @@
 #include "GameFramework/HUD.h"
 #include "GameFramework/PlayerController.h"
 #include "UnrealClient.h"                // FScreenshotRequest
+#include "HAL/IConsoleManager.h"        // the loading-screen streaming cap
 #include "Kismet/KismetSystemLibrary.h" // QuitGame / EQuitPreference
 #include "Misc/App.h"                    // FApp::IsUnattended for the watchdog
 #include "Misc/DateTime.h"               // the NEW GAME world backup stamp
@@ -43,6 +45,34 @@ namespace VoxelFrontEndDetail
 // a partially faded curtain.
 constexpr int32 kMenuZOrder = 100;
 constexpr int32 kLoadingZOrder = 110;
+
+// --- The loading-screen streaming cap ---------------------------------------
+//
+// WHAT MAKES THE LOADING SCREEN HITCH. Slate ticks and paints on the game
+// thread, so the hourglass can only be as smooth as the frame, and during the
+// initial cascade the frame belongs to streaming: DrainResults applies
+// finished chunk meshes until voxel.Stream.ApplyBudgetMs (default 6.0) of
+// wall clock is spent EVERY tick, and that cvar's own help text names the
+// trade -- "a large budget during a load storm can hitch... Lower it to
+// protect frame pacing at the cost of slower fill." That is precisely the
+// lever wanted here, already built and already safe, so the front end sets it
+// rather than inventing streaming machinery of its own.
+//
+// WHY THE TRADE IS FREE *HERE* AND ONLY HERE. The pre-directive screen
+// revealed as soon as the world was ready (~6 s), so every ms of fill mattered
+// and 6.0 was the right budget. Under the 30-60 s load theatre the world only
+// has to beat a timer five times that long; a third of the fill rate still
+// gets the R0-R3 gate open with tens of seconds to spare, and the player is
+// watching the hourglass, not the fill. Restored at reveal -- the curtain
+// starts lifting on a world that wants its full budget back -- with
+// TeardownMenu as the backstop, and logged both ways so a leg's log shows
+// exactly when the cap was on.
+//
+// voxel.Stream.MaxAppliesPerFrame is deliberately NOT touched: it is a count
+// ceiling, not the steady-state throttle (VoxelDebug.cpp says so), and the
+// apply-exit census depends on it staying put.
+constexpr float kTheatreApplyBudgetMs = 2.0f;
+const TCHAR* const kApplyBudgetCVarName = TEXT("voxel.Stream.ApplyBudgetMs");
 } // namespace VoxelFrontEndDetail
 
 bool UVoxelFrontEndSubsystem::DoesSupportWorldType(const EWorldType::Type WorldType) const
@@ -507,6 +537,25 @@ void UVoxelFrontEndSubsystem::BeginLoad(const FString& EditLogPath, const FTrans
 	LoadElapsedSeconds = 0.f;
 	LastProgress = 0.f;
 	NextLoadingShotIndex = 0;
+	WorldReadyAtSeconds = -1.f;
+
+	// THE ARTIFICIAL LOAD DURATION (owner directive, 2026-09-05). A uniform
+	// roll in [LoadTheatreMin, LoadTheatreMax] -- 30-60 s by default, random so
+	// consecutive loads feel different. Seeded from the WALL CLOCK, never the
+	// world seed: this is theatre, not simulation, and two players on the same
+	// seed deserve different shows. MakeVoxelUIRandomStream is exactly that
+	// contract already (clock-seeded interactively, fixed under -unattended so
+	// the capture strips stay diffable), so the roll shares it with the
+	// backgrounds rather than inventing a second seeding rule.
+	{
+		FRandomStream TheatreStream = MakeVoxelUIRandomStream();
+		const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
+		TheatreDurationSeconds = TheatreStream.FRandRange(Switches.LoadTheatreMinSeconds,
+		                                                  Switches.LoadTheatreMaxSeconds);
+		// The engagement evidence, greppable, first of the pair TickLoading's
+		// reveal line completes. A gate can fail on its absence.
+		UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: theatre duration %.1f s rolled."), TheatreDurationSeconds);
+	}
 
 	// Normally a no-op: the menu started a track and this is the same session,
 	// so the loading screen inherits it rather than restarting -- which is the
@@ -533,6 +582,7 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 	}
 
 	WorldSub->StartWorldSession(PendingEditLogPath);
+	if (VoxelSessionCheckpoint::Failed(World)) return;
 	if (AVoxelEarthGameMode* GameMode = World->GetAuthGameMode<AVoxelEarthGameMode>())
 	{
 		GameMode->BeginPlayerSession(PendingSpawnTransform.IsSet() ? &PendingSpawnTransform.GetValue() : nullptr);
@@ -561,29 +611,68 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 
 	ReadyProbe = MakeUnique<FVoxelWorldReadyProbe>();
 	ReadyProbe->Start(Anchor, ProbeConfig);
+
+	// The streaming session is live as of StartWorldSession above, so this is
+	// the first moment the cap has anything to cap.
+	CapStreamingForTheatre();
 }
 
-float UVoxelFrontEndSubsystem::ComputeProgress() const
+void UVoxelFrontEndSubsystem::CapStreamingForTheatre()
 {
-	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
-	const float TimeTerm = Switches.LoadMaxHoldSeconds > 0.f
-	                           ? LoadElapsedSeconds / Switches.LoadMaxHoldSeconds
-	                           : 0.f;
-	float Spatial = 0.f;
-	float RingFill = 0.f;
-	if (ReadyProbe.IsValid())
+	// The rationale, the lever, and the trade all live on the constants -- see
+	// VoxelFrontEndDetail at the top of this file.
+	IConsoleVariable* BudgetVar = IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kApplyBudgetCVarName);
+	if (BudgetVar == nullptr)
 	{
-		const FVoxelReadyProbeStatus& Probe = ReadyProbe->GetStatus();
-		Spatial = Probe.ProbeTotal > 0 ? float(Probe.ProbeHits) / float(Probe.ProbeTotal) : 0.f;
-		RingFill = Probe.RingFillFraction;
+		// The cvar is owned by VoxelEarth and looked up by NAME, so a rename
+		// there must degrade to "no cap" here, loudly, not to a crash.
+		UE_LOG(LogVoxelUI, Warning, TEXT("LoadScreen: %s not found; loading runs uncapped."),
+		       VoxelFrontEndDetail::kApplyBudgetCVarName);
+		return;
 	}
-	// The model itself is a pure function, in VoxelWorldReadyProbe.h, so its
-	// three invariants can be tested without a world.
-	return ComputeLoadProgress(TimeTerm, Spatial, RingFill, LastProgress);
+	const float Current = BudgetVar->GetFloat();
+	if (Current <= VoxelFrontEndDetail::kTheatreApplyBudgetMs)
+	{
+		// Somebody already runs tighter than the theatre cap; capping would
+		// RAISE their budget on restore-order mishaps. Leave it alone.
+		return;
+	}
+	SavedApplyBudgetMs = Current;
+	bStreamBudgetCapped = true;
+	BudgetVar->Set(VoxelFrontEndDetail::kTheatreApplyBudgetMs, ECVF_SetByCode);
+	UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: capped %s %.1f -> %.1f for the load theatre."),
+	       VoxelFrontEndDetail::kApplyBudgetCVarName, SavedApplyBudgetMs, VoxelFrontEndDetail::kTheatreApplyBudgetMs);
+}
+
+void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
+{
+	// Idempotent, because it has two callers by design: the reveal (the normal
+	// path) and TeardownMenu (the backstop for a quit or world teardown while
+	// the screen is still up).
+	if (!bStreamBudgetCapped)
+	{
+		return;
+	}
+	bStreamBudgetCapped = false;
+	if (IConsoleVariable* BudgetVar = IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kApplyBudgetCVarName))
+	{
+		BudgetVar->Set(SavedApplyBudgetMs, ECVF_SetByCode);
+		UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.1f."),
+		       VoxelFrontEndDetail::kApplyBudgetCVarName, SavedApplyBudgetMs);
+	}
 }
 
 void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client)
+    {
+        if (VoxelSessionCheckpoint::Failed(GetWorld()))
+        {
+            if (LoadingWidget.IsValid()) LoadingWidget->SetLoadFailed();
+            return;
+        }
+        if (!VoxelSessionCheckpoint::Ready(GetWorld())) return;
+    }
 	LoadElapsedSeconds += DeltaSeconds;
 
 	UWorld* World = GetWorld();
@@ -593,7 +682,25 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 		ReadyProbe->Tick(DeltaSeconds, *WorldSub);
 	}
 
-	LastProgress = ComputeProgress();
+	// The world's gate: genuinely ready, or the probe's own MaxWait expired
+	// and the curtain lifts anyway (the probe logged that arm as a Warning).
+	// One bit is all the bar gets to know about streaming -- the model and its
+	// reveal semantics are documented on ComputeTheatreProgress.
+	const bool bReady = ReadyProbe.IsValid() && ReadyProbe->IsReady();
+	const bool bTimedOut = ReadyProbe.IsValid() && ReadyProbe->HasTimedOut();
+	const bool bGateOpen = bReady || bTimedOut;
+	if (bGateOpen && WorldReadyAtSeconds < 0.f)
+	{
+		WorldReadyAtSeconds = LoadElapsedSeconds;
+	}
+
+	// The bar plays the rolled theatre duration out, eased. A zero duration
+	// (-VoxelLoadTheatre=0) degenerates to "full as soon as the gate opens",
+	// which is the pre-directive timing.
+	const float TheatreFraction = TheatreDurationSeconds > 0.f
+	                                  ? LoadElapsedSeconds / TheatreDurationSeconds
+	                                  : 1.f;
+	LastProgress = ComputeTheatreProgress(TheatreFraction, bGateOpen, LastProgress);
 	if (LoadingWidget.IsValid())
 	{
 		LoadingWidget->SetProgress(LastProgress);
@@ -620,17 +727,43 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 		return;
 	}
 
-	// THE HOLD CONTRACT, ported from TransitionManager._do_transition:
-	// wait at least MinHold, then leave as soon as the world reports ready;
-	// leave regardless at MaxHold. The minimum exists so a warm cache does not
-	// flash the loading screen for a third of a second, which reads as a
-	// glitch rather than as speed.
-	const bool bReady = ReadyProbe.IsValid() && ReadyProbe->IsReady();
-	const bool bTimedOut = ReadyProbe.IsValid() && ReadyProbe->HasTimedOut();
-	if ((LoadElapsedSeconds >= Switches.LoadMinHoldSeconds && bReady) || bTimedOut)
+	// THE REVEAL CONTRACT (owner directive, 2026-09-05), which supersedes the
+	// ported TransitionManager hold: the world is revealed at
+	// max(artificial timer elapsed, world actually ready). A world that beats
+	// the timer waits behind the curtain while the theatre plays out -- the
+	// owner's explicit intent. A world slower than the timer holds the bar at
+	// ~97% (the model's cap above) with the hourglass still animating until
+	// the gate opens. LoadMinHoldSeconds still backstops the warm-cache flash
+	// when the theatre is overridden shorter than it (-VoxelLoadTheatre=0).
+	const float MinimumSeconds = FMath::Max(TheatreDurationSeconds, Switches.LoadMinHoldSeconds);
+	if (LoadElapsedSeconds >= MinimumSeconds && bGateOpen)
 	{
+		// The second half of the engagement evidence; BeginLoad logged the
+		// roll. Greppable, and a gate can fail on either line's absence.
+		if (bReady)
+		{
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: world ready at %.1f s (%s timer), revealing at %.1f s."),
+			       WorldReadyAtSeconds, WorldReadyAtSeconds <= TheatreDurationSeconds ? TEXT("before") : TEXT("after"),
+			       LoadElapsedSeconds);
+		}
+		else
+		{
+			// The timeout arm gets its own wording rather than borrowing the
+			// contract line: "world ready" would be the exact lie the probe
+			// just warned about.
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: world NOT ready (gate timed out) at %.1f s, revealing at %.1f s."),
+			       WorldReadyAtSeconds, LoadElapsedSeconds);
+		}
 		UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: closing the curtain after %.2fs (%s)."), LoadElapsedSeconds,
 		       bReady ? TEXT("world ready") : TEXT("timed out"));
+
+		// The world is about to be on screen and wants its full apply budget
+		// back before the fade starts, not after it finishes.
+		RestoreStreamingBudget();
+
+		// 100% is claimed exactly here -- the gate has passed and the curtain
+		// is starting to lift, so the bar shows full only during the fade,
+		// never frozen.
 		LastProgress = 1.f;
 		if (LoadingWidget.IsValid())
 		{
@@ -695,6 +828,12 @@ void UVoxelFrontEndSubsystem::TeardownMenu()
 	// silent when nothing is playing, so this is the backstop rather than a
 	// second owner of the decision.
 	FVoxelUIMusic::Get().Stop();
+
+	// Same backstop shape for the streaming cap: the cvar is process-wide, so
+	// a quit or PIE teardown mid-theatre must not leave the apply budget
+	// throttled for the next session in the same process. No-op when the
+	// reveal already restored it.
+	RestoreStreamingBudget();
 
 	UWorld* World = GetWorld();
 	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;

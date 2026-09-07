@@ -2278,6 +2278,74 @@ VOXELEARTHSHADERS_API FVoxelMarchStats VoxelMarchGetStats();
 VOXELEARTHSHADERS_API void VoxelMarchPublishStreamingState(int32 JobsInFlight, int32 PendingJobs,
                                                            int64 ChunksLoaded);
 
+// ---------------------------------------------------------------------------
+// THE SUN DIRECTION SEAM (voxel.March.VSLighting)
+// ---------------------------------------------------------------------------
+//
+// The Vintage-Story sun wrap (docs/vintage-story-lighting-research-2026-09-05.md,
+// recommendation 1) needs the direction TO the sun on the render thread, and the
+// marcher must not find lights itself -- UVoxelShadowMarchSubsystem already does
+// that every tick for the shadow march, so its tick calls this beside the feed
+// it already performs. GAME THREAD; idempotent; atomics inside (the streaming
+// publisher's pattern). Never called => the wrap declines to its byte-identical
+// OFF path and says so once -- fail-off, never a made-up sun. A degenerate
+// (near-zero) direction is refused rather than stored.
+VOXELEARTHSHADERS_API void VoxelMarchPublishSunDirection(const FVector3f& DirToSunWorld);
+
+// ---------------------------------------------------------------------------
+// THE DAY-NIGHT COLOUR SEAM (Phase L2 of docs/vs-lighting-implementation-plan-2026-09-06.md)
+// ---------------------------------------------------------------------------
+//
+// THE SAME SEAM AS THE DIRECTION ABOVE, WIDENED -- one wire, two publishers,
+// and they are deliberately separate FUNCTIONS rather than one call with five
+// arguments. The direction is fed by UVoxelShadowMarchSubsystem, which already
+// finds the sun every tick; the COLOURS are a property of the sky rig's clock
+// and are fed by UVoxelSkySubsystem, which is the only thing that owns an
+// ephemeris. Folding them into one entry point would force one of those two to
+// carry a quantity it does not own and to invent a value for it -- and an
+// invented sun colour published beside a real sun direction is exactly the
+// plausible-looking wrong frame this project keeps paying for.
+//
+// WHAT THE COLOURS ARE. TINTS, not brightnesses, and the distinction is the
+// whole contract:
+//
+//   SunColour      multiplies voxel.March.SunWrapGain, i.e. it tints the VS
+//                  wrap term's emissive. (1,1,1) is exactly today's picture.
+//   AmbientColour  REPLACES the marcher's hardcoded 1.00/1.04/1.12 sky tint
+//                  (MakeMarchAmbient's "a stand-in, tuned by eye" constant --
+//                  this is the plumbing that comment was waiting for). It is
+//                  multiplied by voxel.March.AmbientIntensity exactly as that
+//                  constant was, so this colour is a HUE plus a modest
+//                  day-night level, never a second intensity knob.
+//   MoonFraction   the moon's illuminance as a fraction of the sun's, i.e.
+//                  UVoxelSkySubsystem's own MoonLightFraction. Carried so the
+//                  marcher can say WHY the night frame is the colour it is,
+//                  and so L4's block light has the night floor to sit against.
+//                  Not consumed by the L1 compose today; published now so the
+//                  contract does not have to change again for it.
+//
+// GAME THREAD; idempotent; plain atomics, the streaming publisher's pattern.
+// NEVER CALLED => every colour reads WHITE and the frame is byte-identical to
+// the pre-L2 renderer, which is the off arm and the fail-off direction. Under
+// voxel.March.VSLighting 0 the colours are ignored entirely, for the same
+// reason the wrap is: one master gates every VS-lighting term.
+//
+// Non-finite or negative components are refused (the whole call is dropped)
+// rather than stored -- a NaN here would propagate into the emissive of every
+// voxel on screen, which is a black or white frame with no other symptom.
+VOXELEARTHSHADERS_API void VoxelMarchPublishSunColour(const FLinearColor& SunColour,
+                                                      const FLinearColor& AmbientColour,
+                                                      float MoonFraction);
+
+// The shadow-mask floor the shadow march composes with (voxel.March.ShadowFloor
+// under the voxel.March.VSLighting master -- both cvars live in
+// VoxelMarchRenderer.cpp so the master can gate every VS-lighting term from one
+// place). RENDER THREAD. Returns 0.0 exactly when the master is off, which
+// keeps the mask write byte-identical to the pre-change 0/1; else the clamped
+// floor: shadows deepen to this fraction of full sun instead of blackening --
+// VS's 'shadows remove at most half' rule, section 1.4 of the research doc.
+VOXELEARTHSHADERS_API float VoxelMarchGetShadowMaskFloor_RenderThread();
+
 // The convergence counter the line above maintains, readable from any thread.
 //
 // EXPOSED RATHER THAN RE-DERIVED. The render-frame split needs to know where

@@ -1,4 +1,8 @@
+#include "VoxelWorldSubsystem.h"
+#include "VoxelFineTileStreamer.h"
 #include "VoxelRippleField.h"
+#include "VoxelWorldSubsystem.h"
+#include "VoxelFineTileStreamer.h"
 
 #include "VoxelSkySubsystem.h" // VoxelSky::kSkyCollectionPath
 
@@ -41,6 +45,24 @@ const TCHAR* kDeriveMaterialPath = TEXT("/Game/Voxel/M_VoxelRippleDerive.M_Voxel
 const TCHAR* kRippleParamOrigin = TEXT("RippleFieldOrigin");
 const TCHAR* kRippleParamInvSize = TEXT("RippleFieldInvSize");
 const TCHAR* kRippleParamGain = TEXT("RippleFieldGain");
+
+// --- field health sampling (SampleFieldHealth) -------------------------------
+//
+// A 64x64 patch at the window's CENTRE -- 6.4 m around the pawn, which is where
+// every AutoWatch entry and every boat-wake splat lands, and which every
+// travelling ring crosses while SpeedMPS > 0. Small on purpose: the cost of a
+// sample is the render-thread flush the readback forces, not the bytes, but
+// 4096 texels per target keeps even the bytes trivial, and the sampling stops
+// for the session the moment the field first proves non-zero.
+constexpr int32 kHealthRectHalf = 32;
+constexpr double kHealthSamplePeriodSec = 5.0;
+// A ripple is centimetres of height and 0.1+ of gradient; float dust from a
+// clear is ~1e-7. Three orders between them.
+constexpr float kHealthMinSignal = 1e-4f;
+// Three dark samples = 15+ seconds of injections landing in an empty field.
+// Not one, because a single Drop far from the centre with SpeedMPS 0 can
+// legitimately read dark once.
+constexpr int32 kDarkSamplesBeforeWarn = 3;
 
 // ---------------------------------------------------------------------------
 // CONSOLE VARIABLES
@@ -90,6 +112,15 @@ TAutoConsoleVariable<float> CVarVoxelWaterRippleGain(
 	TEXT("an A/B at a pinned pose."),
 	ECVF_Default);
 
+// See THE BINDING TEST in RunDerive for what this is for and why it exists.
+TAutoConsoleVariable<float> CVarVoxelWaterRippleTestFill(
+	TEXT("voxel.Water.Ripple.TestFill"), 0.0f,
+	TEXT("DIAGNOSTIC. Above 0, overwrites the ripple FIELD render target with this constant every "
+	     "frame, right after the derive. Answers exactly one question -- does the material sample "
+	     "the same render-target object this subsystem draws into -- and makes every other reading "
+	     "in the run meaningless while it is on. 0 (default) touches nothing."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelWaterRippleSpeed(
 	TEXT("voxel.Water.Ripple.SpeedMPS"), 1.6f,
 	TEXT("Ripple propagation speed in metres per second. 1.6 is roughly right for the ")
@@ -128,10 +159,14 @@ TAutoConsoleVariable<bool> CVarVoxelWaterRippleFreeze(
 
 TAutoConsoleVariable<bool> CVarVoxelWaterRippleMaskEnable(
 	TEXT("voxel.Water.Ripple.MaskEnable"), true,
-	TEXT("Mask the simulation by the baked shoreline distance so ripples exist only in water. ")
+	TEXT("Mask the simulation by the baked shoreline distance so ripples die against the shore. ")
 	TEXT("Set 0 to let them propagate everywhere. THAT IS THE DIAGNOSTIC FOR 'my test drop did ")
-	TEXT("nothing': a drop on a spot the bake calls dry is silently deleted, and this separates ")
-	TEXT("that from the field not running at all."),
+	TEXT("nothing': with step materials from before the 2026-09-06 MaskFloor regen, a drop on a ")
+	TEXT("spot the bake calls dry is deleted the same step it lands -- with every counter still ")
+	TEXT("green -- and this separates that from the field not running at all. Since that regen ")
+	TEXT("the splat is injected after the mask and the mask has a floor, so a bake-dry drop ")
+	TEXT("rings briefly and dies instead of never existing; this switch remains the way to ")
+	TEXT("remove the bake's opinion entirely."),
 	ECVF_Default);
 
 TAutoConsoleVariable<bool> CVarVoxelWaterRippleAutoWatch(
@@ -193,10 +228,11 @@ FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDropCmd(
 	TEXT("one deterministic ripple at a world position (UE UNITS, the same numbers ")
 	TEXT("GetActorLocation prints). Steps>0 advances the simulation that many fixed 1/60 s steps ")
 	TEXT("immediately, so the field is in an exactly reproducible state for the next frame's ")
-	TEXT("screenshot; follow it with voxel.Water.Ripple.Freeze 1 to hold it there. The drop is ")
-	TEXT("dropped if it lands outside the 51.2 m window or on ground the bake calls dry -- ")
-	TEXT("voxel.Water.Ripple.Stat counts both, and voxel.Water.Ripple.MaskEnable 0 removes the ")
-	TEXT("second cause."),
+	TEXT("screenshot; follow it with voxel.Water.Ripple.Freeze 1 to hold it there. A drop ")
+	TEXT("outside the 51.2 m window is dropped and counted by voxel.Water.Ripple.Stat; a drop ")
+	TEXT("on ground the bake calls dry is attenuated ON THE GPU, which no CPU counter can see ")
+	TEXT("-- Stat's fieldMaxAbs line and voxel.Water.Ripple.MaskEnable 0 are the instruments ")
+	TEXT("for that case."),
 	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
 		[](const TArray<FString>& Args, UWorld* World)
 		{
@@ -231,6 +267,34 @@ FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDropCmd(
 			       X, Y, RadiusM, StrengthM, Steps,
 			       Steps * UVoxelRippleFieldSubsystem::kFixedDt,
 			       Ripple->WindowOriginUU().X, Ripple->WindowOriginUU().Y);
+		}));
+
+// LOOK AT THE TEXTURE ITSELF (2026-09-06). Nine captures narrowed this bug by
+// elimination -- injection, deposit, binding, gain, edge fade, emissive pin,
+// shore mask, altitude/mip and framing are all cleared -- and left exactly one
+// asymmetry: a UNIFORM value written into the field renders, and a LOCALISED
+// one does not. Uniform data survives any UV error; localised data does not.
+// Every instrument so far reads the texture through the CPU or paints it
+// through the material, and neither can say WHERE in the 512x512 image the
+// ripple sits. This writes the image out so that question stops being an
+// inference. Compare the ring's position here against the material's UV arm.
+FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDumpCmd(
+	TEXT("voxel.Water.Ripple.Dump"),
+	TEXT("voxel.Water.Ripple.Dump [name] -- export the ripple FIELD render target to "
+	     "<ProjectSaved>/RippleDumps as an image, and log the window origin beside it so the "
+	     "image's texels can be mapped back to world UU."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			UVoxelRippleFieldSubsystem* Ripple = FindRippleSubsystem(World);
+			if (!Ripple)
+			{
+				UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Dump: no subsystem."));
+				return;
+			}
+			const FString Name = (Args.Num() > 0) ? Args[0] : TEXT("field");
+			const FString Dir = FPaths::ProjectSavedDir() / TEXT("RippleDumps");
+			Ripple->DumpFieldToDisk(Dir, Name);
 		}));
 
 FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDropHereCmd(
@@ -382,6 +446,37 @@ FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleStatCmd(
 			       static_cast<unsigned long long>(Ripple->DisturbancesDroppedInert()),
 			       Ripple->WindowOriginUU().X, Ripple->WindowOriginUU().Y,
 			       UVoxelRippleFieldSubsystem::kWindowUU / 100.0);
+
+			// THE SECOND LINE IS THE ONE THAT CANNOT LIE. Everything above
+			// measures the process; on 2026-09-06 all of it read healthy over
+			// textures that never left their clear value (the boat wake:
+			// steps=115889 injected=26240, invisible at gain 20). fieldMaxAbs
+			// is a readback of the DATA, and the knobs are printed because that
+			// same session ran its whole wake test with SpeedMPS at 0 and
+			// nobody could see that in this output.
+			FString Health;
+			if (!Ripple->FieldHealthSampled())
+			{
+				Health = TEXT("never sampled (samples start once something has been injected)");
+			}
+			else
+			{
+				Health = FString::Printf(
+					TEXT("fieldMaxAbs=%.5f stateMaxAbs=%.5f m, sampled %.0f s ago -- %s"),
+					Ripple->FieldMaxAbs(), Ripple->StateMaxAbs(), Ripple->FieldHealthAgeSec(),
+					Ripple->FieldVerifiedLive()
+						? TEXT("VERIFIED LIVE, sampling stopped")
+						: TEXT("DARK so far (see the RippleField warning if it persists)"));
+			}
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("Ripple: knobs enable=%d freeze=%d maskEnable=%d speed=%.2f m/s ")
+			       TEXT("gain=%.2f halfLife=%.1f s | health: %s"),
+			       CVarVoxelWaterRippleEnable.GetValueOnGameThread() ? 1 : 0,
+			       CVarVoxelWaterRippleFreeze.GetValueOnGameThread() ? 1 : 0,
+			       CVarVoxelWaterRippleMaskEnable.GetValueOnGameThread() ? 1 : 0,
+			       CVarVoxelWaterRippleSpeed.GetValueOnGameThread(),
+			       CVarVoxelWaterRippleGain.GetValueOnGameThread(),
+			       CVarVoxelWaterRippleHalfLife.GetValueOnGameThread(), *Health);
 		}));
 } // namespace
 
@@ -613,6 +708,15 @@ void UVoxelRippleFieldSubsystem::ClearState()
 	UKismetRenderingLibrary::ClearRenderTarget2D(World, StateB_, Flat);
 	UKismetRenderingLibrary::ClearRenderTarget2D(World, Field_, FLinearColor::Transparent);
 	bFrontIsA_ = true;
+
+	// RE-ARM THE HEALTH SAMPLER. A verification earned before this clear says
+	// nothing about the field after it -- the 2026-09-05 session's exact shape
+	// was "worked before a disable/re-enable cycle, dark after", and a sampler
+	// that stayed satisfied across the clear would have slept through the half
+	// that mattered.
+	bFieldVerifiedLive_ = false;
+	bWarnedFieldDark_ = false;
+	DarkHealthSamples_ = 0;
 }
 
 void UVoxelRippleFieldSubsystem::AddDisturbance(const FVector& WorldPos, float RadiusM,
@@ -690,6 +794,90 @@ void UVoxelRippleFieldSubsystem::AddDisturbanceAt(const UWorld* World, const FVe
 	        const_cast<UWorld*>(World)->GetSubsystem<UVoxelRippleFieldSubsystem>())
 	{
 		Ripple->AddDisturbance(WorldPos, RadiusM, StrengthM);
+	}
+}
+
+void UVoxelRippleFieldSubsystem::AddSweptDisturbance(const FVector& StartWorld,
+                                                     const FVector& EndWorld, float WidthM,
+                                                     float StrengthM)
+{
+	// NON-FINITE INPUT LEAVES BY THE COUNTED DOOR, not by an early return. One
+	// call through AddDisturbance puts it in DroppedInert with everything else a
+	// caller's arithmetic got wrong, which keeps the identity in the header
+	// intact and keeps "the wake hook fires and its numbers are NaN"
+	// distinguishable from "the wake hook never fires". Checked BEFORE the
+	// subdivision because a NaN length is also how this function would loop
+	// forever.
+	if (StartWorld.ContainsNaN() || EndWorld.ContainsNaN() || !FMath::IsFinite(WidthM)
+	    || !FMath::IsFinite(StrengthM))
+	{
+		AddDisturbance(StartWorld, WidthM, StrengthM);
+		return;
+	}
+
+	// A ring of half the wake's width, laid at a spacing of at most that same
+	// half-width, so consecutive rings overlap by construction instead of
+	// beading into a dotted line. The floor is the field's own honesty limit:
+	// below kMinDisturbanceRadiusM AddDisturbance widens the ring anyway, and a
+	// spacing finer than the ring it is spacing would only queue more splats for
+	// the same wake.
+	const double RadiusM = FMath::Max(0.5 * double(WidthM), kMinDisturbanceRadiusM);
+	const double SpacingUU = RadiusM * 100.0;
+
+	const FVector Segment = EndWorld - StartWorld;
+	// XY only. The field is a 2D sheet and AddDisturbance discards Z at the
+	// door; counting a boat's vertical bob as arc length would subdivide a
+	// stationary rocking hull into a queue full of splats at one point.
+	const double LengthUU = FMath::Sqrt(Segment.X * Segment.X + Segment.Y * Segment.Y);
+
+	int32 NumSplats = 1 + int32(FMath::FloorToDouble(LengthUU / SpacingUU));
+	if (NumSplats > kMaxSweptSplats)
+	{
+		// Said once. The clamp bounds the LOOP; it does not pretend the request
+		// was served -- a caller asking for more than four full queues in one
+		// call is asking for something the queue could not have carried anyway,
+		// and the sub-splats past kMaxPending are already landing in
+		// DroppedFull, which is that counter's documented "this is a bug".
+		if (!bLoggedSweptClamp_)
+		{
+			bLoggedSweptClamp_ = true;
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("RippleField: a swept disturbance of %.1f m at %.2f m spacing asked for %d ")
+			       TEXT("sub-splats and was clamped to %d. The queue holds %d, so this request was ")
+			       TEXT("already overflowing it -- read voxel.Water.Ripple.Stat's dropped(full=N). ")
+			       TEXT("Said once."),
+			       LengthUU / 100.0, RadiusM, NumSplats, kMaxSweptSplats, kMaxPending);
+		}
+		NumSplats = kMaxSweptSplats;
+	}
+
+	// N == 1 is the zero-length case and is not a special case: the loop below
+	// runs once at t = 0, i.e. exactly AddDisturbance(StartWorld, ...). A boat
+	// that is not moving still leaves the ring it displaces.
+	const double InvSteps = (NumSplats > 1) ? 1.0 / double(NumSplats - 1) : 0.0;
+	for (int32 I = 0; I < NumSplats; ++I)
+	{
+		const double T = double(I) * InvSteps;
+		AddDisturbance(StartWorld + Segment * T, static_cast<float>(RadiusM), StrengthM);
+	}
+}
+
+void UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt(const UWorld* World,
+                                                       const FVector& StartWorld,
+                                                       const FVector& EndWorld, float WidthM,
+                                                       float StrengthM)
+{
+	if (!World)
+	{
+		return;
+	}
+	// const_cast for AddDisturbanceAt's reason: fetching a subsystem does not
+	// modify the world, and a caller holding a const world should need no
+	// ceremony at the call site.
+	if (UVoxelRippleFieldSubsystem* Ripple =
+	        const_cast<UWorld*>(World)->GetSubsystem<UVoxelRippleFieldSubsystem>())
+	{
+		Ripple->AddSweptDisturbance(StartWorld, EndWorld, WidthM, StrengthM);
 	}
 }
 
@@ -872,6 +1060,99 @@ void UVoxelRippleFieldSubsystem::StepOnce(double ShiftUvX, double ShiftUvY)
 	}
 }
 
+void UVoxelRippleFieldSubsystem::DumpFieldToDisk(const FString& Dir, const FString& Name)
+{
+	// WHERE IS THE RING, IN WORLD UNITS. Not "is there data" -- SampleFieldHealth
+	// already answers that and has answered it nine times today while the screen
+	// stayed empty. This answers the question that separates the last two
+	// suspects: the texel the peak sits in, converted back through the SAME
+	// origin the material is handed, so its uv can be compared directly against
+	// what the material samples at that world position. If the peak's uv is not
+	// where the caller dropped it, the write is misplaced; if it IS, then the
+	// material's uv is reading somewhere else and the mapping is the bug.
+	if (!Field_)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Dump: no field render target."));
+		return;
+	}
+	FTextureRenderTargetResource* Res = Field_->GameThread_GetRenderTargetResource();
+	TArray<FLinearColor> Px;
+	if (!Res || !Res->ReadLinearColorPixels(Px, FReadSurfaceDataFlags(RCM_MinMax),
+	                                        FIntRect(0, 0, kSize, kSize))
+	    || Px.Num() < kSize * kSize)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Dump: readback failed."));
+		return;
+	}
+
+	int32 PeakX = -1, PeakY = -1;
+	float PeakV = 0.0f;
+	int32 NonZero = 0;
+	// PER CHANNEL, because "the field has data" stopped being a useful sentence.
+	// R,G are the GRADIENT -- the only thing the shipping graph turns into a
+	// normal, and the only thing the wake art reads. B is HEIGHT. A max taken
+	// across all three cannot tell those apart, and the uniform test fill that
+	// "proved" the sampler works wrote all three at once, so it could not
+	// either. If R,G are flat while B carries the ring, the derive's gradient
+	// write is the defect and every symptom in this hunt follows from it.
+	float MaxR = 0.0f, MaxG = 0.0f, MaxB = 0.0f;
+	int32 NonZeroRG = 0, NonZeroB = 0;
+	for (int32 Y = 0; Y < kSize; ++Y)
+	{
+		for (int32 X = 0; X < kSize; ++X)
+		{
+			const FLinearColor& C = Px[Y * kSize + X];
+			MaxR = FMath::Max(MaxR, FMath::Abs(C.R));
+			MaxG = FMath::Max(MaxG, FMath::Abs(C.G));
+			MaxB = FMath::Max(MaxB, FMath::Abs(C.B));
+			if (FMath::Abs(C.R) > 1e-4f || FMath::Abs(C.G) > 1e-4f)
+			{
+				++NonZeroRG;
+			}
+			if (FMath::Abs(C.B) > 1e-4f)
+			{
+				++NonZeroB;
+			}
+			const float V = FMath::Max3(FMath::Abs(C.R), FMath::Abs(C.G), FMath::Abs(C.B));
+			if (V > 1e-4f)
+			{
+				++NonZero;
+			}
+			if (V > PeakV)
+			{
+				PeakV = V;
+				PeakX = X;
+				PeakY = Y;
+			}
+		}
+	}
+	UE_LOG(LogVoxelWater, Warning,
+	       TEXT("Ripple.Dump[%s] CHANNELS: maxR=%.5f maxG=%.5f (GRADIENT -- what the water "
+	            "material actually consumes) maxB=%.5f (height). Non-zero: gradient %d texels, "
+	            "height %d texels. Gradient flat while height is not means the DERIVE's gradient "
+	            "write is the bug."),
+	       *Name, MaxR, MaxG, MaxB, NonZeroRG, NonZeroB);
+
+	const double OriginXUU = static_cast<double>(OriginPx_) * kTexelUU;
+	const double OriginYUU = static_cast<double>(OriginPy_) * kTexelUU;
+	const double PeakWorldX = OriginXUU + (PeakX + 0.5) * kTexelUU;
+	const double PeakWorldY = OriginYUU + (PeakY + 0.5) * kTexelUU;
+	UE_LOG(LogVoxelWater, Warning,
+	       TEXT("Ripple.Dump[%s]: peak %.4f at texel (%d,%d) = uv (%.4f,%.4f) = world "
+	            "(%.0f,%.0f) UU. Non-zero texels %d of %d (%.2f%%). Window origin (%.0f,%.0f) UU, "
+	            "%.1f m across. A peak whose world position is NOT where the caller dropped it "
+	            "means the WRITE is misplaced; a peak that IS there means the material's uv reads "
+	            "elsewhere."),
+	       *Name, PeakV, PeakX, PeakY,
+	       (PeakX + 0.5) / double(kSize), (PeakY + 0.5) / double(kSize),
+	       PeakWorldX, PeakWorldY, NonZero, kSize * kSize,
+	       100.0 * double(NonZero) / double(kSize * kSize),
+	       OriginXUU, OriginYUU, kWindowUU / 100.0);
+
+	IFileManager::Get().MakeDirectory(*Dir, /*Tree=*/true);
+	UKismetRenderingLibrary::ExportRenderTarget(GetWorld(), Field_, Dir, Name + TEXT(".png"));
+}
+
 void UVoxelRippleFieldSubsystem::RunDerive()
 {
 	UWorld* World = GetWorld();
@@ -881,6 +1162,144 @@ void UVoxelRippleFieldSubsystem::RunDerive()
 	}
 	DeriveMid_->SetTextureParameterValue(TEXT("State"), Front());
 	UKismetRenderingLibrary::DrawMaterialToRenderTarget(World, Field_, DeriveMid_);
+
+	// THE BINDING TEST (voxel.Water.Ripple.TestFill, default 0 = untouched).
+	//
+	// 2026-09-06: three captures eliminated everything AROUND the sample. The
+	// emissive pin works (a constant wrote blazing red over the whole lake),
+	// the UV mapping lands (the UV painted straight to emissive is a smooth
+	// two-channel ramp centred on the player), the field's own readback finds
+	// real data, and the counters show 20,778 injections with zero drops --
+	// and yet gradient x50 on emissive renders NOTHING. The one thing none of
+	// those tests can separate is whether the texture THIS CODE writes is the
+	// texture the MATERIAL reads: both resolve /Game/Voxel/RT_VoxelRippleField
+	// by path, so a mismatch cannot be seen from either side alone.
+	//
+	// This overwrites Field_ -- the exact UObject this subsystem holds and
+	// draws into -- with a known constant, immediately after the derive that
+	// is supposed to fill it. Then the debug arm's gradient x50 is a direct
+	// question with only two answers:
+	//   THE LAKE LIGHTS UP -> same object. The binding is fine and the fault
+	//       is upstream: the derive is not depositing what we think it is.
+	//   STILL NOTHING -> the material samples a DIFFERENT object, and the
+	//       baked texture reference is the bug.
+	// Costs one clear per frame while armed and nothing at all at 0.
+	const float TestFill = CVarVoxelWaterRippleTestFill.GetValueOnGameThread();
+	if (TestFill > 0.0f)
+	{
+		UKismetRenderingLibrary::ClearRenderTarget2D(
+			World, Field_, FLinearColor(TestFill, TestFill, TestFill, 1.0f));
+		static bool bLoggedTestFill = false;
+		if (!bLoggedTestFill)
+		{
+			bLoggedTestFill = true;
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("RippleField: TEST FILL ACTIVE at %.3f -- the field render target is being "
+			            "overwritten with a constant every frame, so NOTHING in this run is a "
+			            "statement about the simulation. This is the material-binding test."),
+			       TestFill);
+		}
+	}
+}
+
+double UVoxelRippleFieldSubsystem::FieldHealthAgeSec() const
+{
+	return FPlatformTime::Seconds() - LastHealthSampleAt_;
+}
+
+// THE COUNTER THAT CANNOT LIE. Twice now (2026-08-13 and 2026-09-06) this
+// system reported perfect health -- armed, published, steps and injections all
+// counting -- while the render targets held nothing but their clear value, and
+// both times the counters were RIGHT about what they measure: slots written and
+// draws scheduled. Neither is evidence a single value was ever DEPOSITED; a
+// splat can be multiplied to exactly zero by the shore mask in the same draw
+// that was counted, and no CPU-side number can see that. So this reads the
+// pixels: a 64x64 patch at the window centre, front state and derived field,
+// every kHealthSamplePeriodSec once anything has been injected, STOPPING for
+// the session at the first proof of life (ClearState re-arms it). Same
+// instrument as voxel.Water.Ripple.Probe, shrunk and automated -- the probe
+// stays the full-window manual tool.
+void UVoxelRippleFieldSubsystem::SampleFieldHealth()
+{
+	if (bFieldVerifiedLive_ || !bArmed_ || !Field_ || Injected_ == 0)
+	{
+		return;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (Now - LastHealthSampleAt_ < kHealthSamplePeriodSec)
+	{
+		return;
+	}
+	LastHealthSampleAt_ = Now;
+
+	const FIntRect Rect(kSize / 2 - kHealthRectHalf, kSize / 2 - kHealthRectHalf,
+	                    kSize / 2 + kHealthRectHalf, kSize / 2 + kHealthRectHalf);
+	auto MaxAbsIn = [&Rect](UTextureRenderTarget2D* RT, bool bStateBiased) -> float
+	{
+		FTextureRenderTargetResource* Res = RT ? RT->GameThread_GetRenderTargetResource() : nullptr;
+		TArray<FLinearColor> Px;
+		if (!Res
+		    || !Res->ReadLinearColorPixels(Px, FReadSurfaceDataFlags(RCM_MinMax), Rect)
+		    || Px.Num() == 0)
+		{
+			// A failed readback says nothing about the contents; -1 keeps it
+			// distinguishable from a real zero in Stat's output.
+			return -1.0f;
+		}
+		float M = 0.0f;
+		for (const FLinearColor& C : Px)
+		{
+			if (bStateBiased)
+			{
+				// RG32f state: h(t) and h(t-dt), both stored +kStateBias.
+				M = FMath::Max3(M, FMath::Abs(C.R - kStateBias), FMath::Abs(C.G - kStateBias));
+			}
+			else
+			{
+				// RGBA16f field: gradient x2 + height; .a is never written.
+				M = FMath::Max(M, FMath::Max3(FMath::Abs(C.R), FMath::Abs(C.G), FMath::Abs(C.B)));
+			}
+		}
+		return M;
+	};
+	LastStateMaxAbs_ = MaxAbsIn(Front(), /*bStateBiased=*/true);
+	LastFieldMaxAbs_ = MaxAbsIn(Field_, /*bStateBiased=*/false);
+
+	if (LastFieldMaxAbs_ >= kHealthMinSignal)
+	{
+		bFieldVerifiedLive_ = true;
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RippleField: field verified LIVE -- centre patch max field value %.4f, max ")
+		       TEXT("state height %.4f m, after %llu injection(s) and %llu step(s). The draws ")
+		       TEXT("deposit data, not just get scheduled. Health sampling stops for this world ")
+		       TEXT("(a ClearState re-arms it)."),
+		       LastFieldMaxAbs_, LastStateMaxAbs_,
+		       static_cast<unsigned long long>(Injected_),
+		       static_cast<unsigned long long>(TotalSteps_));
+		return;
+	}
+
+	++DarkHealthSamples_;
+	if (DarkHealthSamples_ >= kDarkSamplesBeforeWarn && !bWarnedFieldDark_)
+	{
+		bWarnedFieldDark_ = true;
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("RippleField: THE COUNTERS ARE HEALTHY AND THE TEXTURES ARE EMPTY. ")
+		       TEXT("injected=%llu steps=%llu, yet %d samples over %.0f+ seconds of the centre ")
+		       TEXT("%.1f m of the window read max state height %.6f m and max field value %.6f ")
+		       TEXT("-- the draws are being scheduled and depositing nothing visible. Triage, in ")
+		       TEXT("the order the data flows: state ~0 means the deposit is annihilated in the ")
+		       TEXT("step itself -- FIRST suspect is the baked shore mask multiplying the splat ")
+		       TEXT("to zero where the bake calls this water dry; try voxel.Water.Ripple.MaskEnable ")
+		       TEXT("0 and re-test, then voxel.Water.Ripple.Probe for the full window. State > 0 ")
+		       TEXT("with field ~0 means the derive draw. Also check voxel.Water.Ripple.SpeedMPS ")
+		       TEXT("> 0 -- with it at 0 nothing propagates into this centre patch from ")
+		       TEXT("disturbances injected further out."),
+		       static_cast<unsigned long long>(Injected_),
+		       static_cast<unsigned long long>(TotalSteps_),
+		       DarkHealthSamples_, DarkHealthSamples_ * kHealthSamplePeriodSec,
+		       2.0 * kHealthRectHalf * kTexelUU / 100.0, LastStateMaxAbs_, LastFieldMaxAbs_);
+	}
 }
 
 void UVoxelRippleFieldSubsystem::PublishWindow(float Gain)
@@ -938,6 +1357,9 @@ void UVoxelRippleFieldSubsystem::RunSteps(int32 NumSteps)
 	PublishWindow(CVarVoxelWaterRippleEnable.GetValueOnGameThread()
 	                  ? FMath::Max(0.0f, CVarVoxelWaterRippleGain.GetValueOnGameThread())
 	                  : 0.0f);
+	// A synchronous burst is exactly when somebody is at the console trying to
+	// verify the field, so sample immediately rather than waiting for a tick.
+	SampleFieldHealth();
 }
 
 void UVoxelRippleFieldSubsystem::Tick(float DeltaTime)
@@ -1040,6 +1462,7 @@ void UVoxelRippleFieldSubsystem::Tick(float DeltaTime)
 	}
 	RunDerive();
 	PublishWindow(FMath::Max(0.0f, CVarVoxelWaterRippleGain.GetValueOnGameThread()));
+	SampleFieldHealth();
 }
 
 // ============================================================================
@@ -1163,6 +1586,10 @@ void UVoxelRippleFieldSubsystem::AutoWatch(float DeltaTime)
 			return;
 		}
 		const FVector P = Actor->GetActorLocation();
+        if(auto Terrain=World->GetSubsystem<UVoxelWorldSubsystem>())if(auto Fine=Terrain->GetFineTileStreamer()){
+            const int64 X=FMath::FloorToInt64(P.X*10.),Y=FMath::FloorToInt64(P.Y*10.);
+            if(!Fine->IsFootprintResident(X,Y,X+1,Y+1)){Watched_.Remove(Actor);return;}
+        }
 		const bool bNow = Water->IsUnderwaterAtWorld(P);
 		FWatchedActor& W = Watched_.FindOrAdd(Actor);
 		if (W.bSeen && bNow && !W.bWasSubmerged && !bFrozen)

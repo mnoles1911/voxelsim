@@ -9,11 +9,11 @@ A tree is mostly air inside its bounding box, so runs do the heavy lifting: a
 typical broadleaf lands around 3-5% of its dense size.
 
     magic      "VXA1"              4 bytes  (unchanged across versions)
-    version    uint32              = 3
+    version    uint32              = 3 (whole mm) or 4 (micrometres)
     origin     int32 x, y, z       voxel offset from the asset's base, which is
                                    at (0, 0, 0) with z up
     size       uint32 nx, ny, nz
-    voxel_mm   uint32              EDGE OF ONE VOXEL IN MILLIMETRES
+    pitch      uint32              voxel edge: mm in v3, micrometres in v4
     runs       uint32              number of material run pairs
     part_runs  uint32              number of part run pairs; 0 when the asset
                                    has no moving parts (a rock, a tree)
@@ -120,24 +120,22 @@ def encode(grid: VoxelGrid, parts=None, joints=()) -> bytes:
     else:
         part_mat, part_len = np.empty(0, np.uint8), np.empty(0, np.uint32)
 
-    # Millimetres, and an integer, because the whole point is that the two
-    # sides agree exactly. Every lattice in the library is a whole number of
-    # millimetres (10, 20, 50, 100) and a fractional one would mean an asset
-    # that cannot be placed on any integer grid, so refusing is better than
-    # rounding silently.
-    voxel_mm = grid.voxel_m * 1000.0
-    if abs(voxel_mm - round(voxel_mm)) > 1e-6 or round(voxel_mm) <= 0:
-        raise ValueError(
-            f"voxel size {grid.voxel_m} m is not a whole number of millimetres; "
-            f"a VXA file has to state a scale the engine can place on an "
-            f"integer lattice")
+    # v3 retains integer-mm bytes for existing assets. v4 stores pitch in
+    # integer micrometres at the same offset; joints remain integer mm.
+    voxel_um = grid.voxel_m * 1_000_000.0
+    if not np.isfinite(voxel_um) or abs(voxel_um-round(voxel_um)) > 1e-6 or not 0 < voxel_um <= 4_096_000:
+        raise ValueError("VXA pitch must be a positive integer micrometre value <= 4096 mm")
+    voxel_um = int(round(voxel_um))
+    version = 3 if voxel_um % 1000 == 0 else 4
+    wire_pitch = voxel_um // 1000 if version == 3 else voxel_um
+    voxel_mm = voxel_um / 1000.0
 
     header = (
         MAGIC
-        + struct.pack("<I", VERSION)
+        + struct.pack("<I", version)
         + struct.pack("<iii", *(int(v) for v in grid.origin))
         + struct.pack("<III", *(int(v) for v in grid.shape))
-        + struct.pack("<I", int(round(voxel_mm)))
+        + struct.pack("<I", wire_pitch)
         + struct.pack("<I", runs_mat.size)
         + struct.pack("<I", part_mat.size)
         + struct.pack("<I", len(joints))
@@ -149,7 +147,7 @@ def encode(grid: VoxelGrid, parts=None, joints=()) -> bytes:
         rec["n"] = lens
         return rec.tobytes()
 
-    mm = float(round(voxel_mm))
+    mm = float(voxel_mm)
     jb = b""
     for j in joints:
         o = j["origin"]
@@ -183,11 +181,15 @@ def decode(blob: bytes) -> VoxelGrid:
         how = ("tools/vxa_upgrade.py converts it in place"
                if version == 1 else "re-bake the asset (forge.server.keep)")
         raise ValueError(f"VXA version {version} does not record {what}: {how}")
-    if version != VERSION:
+    if version not in (3, 4):
         raise ValueError(f"unsupported VXA version {version}")
     ox, oy, oz, nx, ny, nz, voxel_mm, nruns, npart, njoint = struct.unpack(
         "<iiiIIIIIII", blob[8:HEADER_BYTES])
 
+    if version == 4:
+        voxel_mm /= 1000.0
+    if not 0 < voxel_mm <= 4096:
+        raise ValueError("invalid VXA voxel pitch")
     at = HEADER_BYTES
     body = np.frombuffer(blob[at : at + nruns * 5],
                          dtype=[("m", np.uint8), ("n", np.uint32)])

@@ -173,6 +173,12 @@ import unreal
 # create_water_voxel_material.py:415.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import water_optics  # noqa: E402
+# Phase F1: the shared caustic field, the same module the two terrain (floor)
+# materials consume, so the pattern a swimmer sees on the bed below is the
+# pattern the walker sees from the beach -- both are functions of the same
+# absolute world XY. Written against a minimal builder surface (.material +
+# .mel) precisely so this file's own labelled Graph class qualifies.
+from water_caustics_graph import build_caustics  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_Underwater"
@@ -781,6 +787,47 @@ def main():
     added = b.mul(inscatter, b.one_minus(transmittance, "1 - transmittance"),
                   "in-scatter * (1 - transmittance)")
     result = b.add(attenuated, added, "attenuated scene + in-scatter")
+
+    # --- PHASE F1: THE CAUSTIC HALF THE SWIMMER SEES ------------------------
+    #
+    # The same water_caustics_graph field the two floor materials consume,
+    # evaluated at the SCENE PIXEL's world position -- which in MD_PostProcess
+    # is exactly what AbsoluteWorldPosition means (see the world_pos note far
+    # above), so the pattern lands on the reconstructed bed, not on a screen
+    # plane. Everything about the term (sun gate, absorption down the sun ray,
+    # 40->64 m fade, the CausticIntensity/CausticsEnabled control pair) is the
+    # module's; this site owns its inputs and two compositional choices:
+    #
+    #   * depth_m = SubmergedDepthM, the CAMERA's depth -- a documented proxy
+    #     for the pixel's own depth below the surface, which this material
+    #     cannot know (it has no bathy sample, no surface Z it may legally
+    #     read, and reconstructing one per pixel is F3-sized work for a term
+    #     the module's distance fade already limits to the near field where
+    #     the proxy error is smallest). Fails shallow when undriven, exactly
+    #     as SubmergedDepthM itself does.
+    #   * multiplied by the VIEW transmittance before compositing: caustic
+    #     light leaves the floor and crosses the same water column the scene
+    #     colour crossed, so it is attenuated by the same T -- adding it raw
+    #     would make caustics the only thing in the frame the murk cannot
+    #     touch, which reads as an overlay rather than as light on the bed.
+    #
+    # Additive AFTER the energy-conserving composite, deliberately: caustics
+    # are focused DIRECT light the volume term's flat ambient cannot
+    # represent, so they genuinely add energy the composite did not account
+    # for -- the same reasoning that puts them on the terrain's EMISSIVE.
+    # Quality gating rides the module's CausticsEnabled scalar on this
+    # material's instance (the F6 row's Low arm zeroes the underwater half
+    # first); light SHAFTS are F3's, consuming this same field, not built
+    # here.
+    caustic_time = b.node(unreal.MaterialExpressionTime)
+    caustic_pos_m = b.mul(
+        b.mask(world_pos, "", "scene pixel world position -> xy", r=True, g=True),
+        b.const(0.01), "UU -> metres for the caustic field")
+    caustics = build_caustics(
+        b, sky_collection, caustic_pos_m, caustic_time, submerged_depth_m)
+    caustic_seen = b.mul(caustics["light"], transmittance,
+                         "caustic light * the view path's own transmittance")
+    result = b.add(result, caustic_seen, "+ caustic light on the bed")
 
     b.prop(result, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR,
            "composite -> EmissiveColor (a post-process material's only real output)")

@@ -7,6 +7,8 @@
 // Invariant (replay test): world(tiles) + log == world(tiles) + log, always.
 
 #include <algorithm>
+#include <cmath>
+#include <stdexcept>
 #include <optional>
 #include <string>
 #include <utility>
@@ -68,7 +70,7 @@ public:
     //
     // kFormatVersion is therefore "the highest version this build can write",
     // and formatVersionForContent() is what it actually writes.
-    static constexpr uint32_t kFormatVersion = 3;
+    static constexpr uint32_t kFormatVersion = 4;
     static constexpr uint32_t kMinReadableFormatVersion = 1;
     static constexpr uint32_t kMagic = 0x4C455856; // "VXEL" little-endian
 
@@ -83,9 +85,9 @@ public:
     // `latticePitchMm` defaults to the terrain lattice, so every existing
     // caller keeps its exact meaning without naming it.
     EditLog(uint64_t seed, uint8_t brickEdge, std::string providerId = {},
-            uint32_t latticePitchMm = static_cast<uint32_t>(kVoxelSizeMm))
+            double latticePitchMm = kVoxelSizeMm)
         : seed_(seed), brickEdge_(brickEdge), providerId_(std::move(providerId)),
-          latticePitchMm_(latticePitchMm) {}
+          latticePitchUm_(encodePitchUm(latticePitchMm)) {}
 
     uint64_t seed() const { return seed_; }
     uint8_t brickEdge() const { return brickEdge_; }
@@ -93,13 +95,14 @@ public:
     // Which lattice this log's cell indices are addressed in. A brick is 8^3
     // cells on every lattice, so this is the ONLY field that separates a
     // terrain diff from a craft diff -- see the format-version note above.
-    uint32_t latticePitchMm() const { return latticePitchMm_; }
+    uint32_t latticePitchUm() const { return latticePitchUm_; }
+    double latticePitchMm() const { return double(latticePitchUm_) / 1000.0; }
 
     // The version serialize() will actually stamp: the LOWEST that can carry
     // this log's content. See the note on kFormatVersion for why writing the
     // newest unconditionally would refuse readable saves to older builds.
     uint32_t formatVersionForContent() const {
-        return latticePitchMm_ == static_cast<uint32_t>(kVoxelSizeMm) ? 2u : 3u;
+        return latticePitchUm_ == uint32_t(kVoxelSizeMm)*1000u ? 2u : (latticePitchUm_ % 1000u == 0 ? 3u : 4u);
     }
     // Content-addressed identity of the tile provider this log's diffs were
     // recorded against ("" means unstamped: a pre-v2 log, or a caller that
@@ -154,7 +157,7 @@ public:
         w.u64(seed_);
         w.u8(brickEdge_);
         writeString(w, providerId_);
-        if (fmt >= 3) w.u32(latticePitchMm_);
+        if (fmt >= 3) w.u32(fmt == 4 ? latticePitchUm_ : latticePitchUm_/1000u);
         w.u64(entries_.size());
         const uint32_t cellsPerBrick =
             uint32_t(brickEdge_) * brickEdge_ * brickEdge_;
@@ -184,9 +187,9 @@ public:
         // construction -- there was nothing else to be.
         uint32_t pitchMm = static_cast<uint32_t>(kVoxelSizeMm);
         if (fmt >= 3 && !r.u32(pitchMm)) return std::nullopt;
-        if (pitchMm == 0) return std::nullopt;
+        if (pitchMm == 0 || uint64_t(pitchMm)*(fmt == 4 ? 1u : 1000u) > UINT32_MAX) return std::nullopt;
         if (!r.u64(count)) return std::nullopt;
-        EditLog log(seed, edge, std::move(providerId), pitchMm);
+        EditLog log(seed, edge, std::move(providerId), fmt == 4 ? double(pitchMm)/1000.0 : double(pitchMm));
         const uint32_t cellsPerBrick = uint32_t(edge) * edge * edge;
         for (uint64_t i = 0; i < count; ++i) {
             EditEntry e;
@@ -233,7 +236,7 @@ public:
         // Reached by SKIPPING providerId rather than materialising it, so
         // peekHeader keeps its promise to allocate nothing.
         bool haveLatticePitch = false;
-        uint32_t latticePitchMm = 0;
+        double latticePitchMm = 0;
     };
 
     static HeaderPeek peekHeader(const uint8_t* data, size_t size) {
@@ -251,11 +254,19 @@ public:
         uint16_t providerLen = 0;
         if (!r.u16(providerLen)) return h;
         if (!r.skip(providerLen)) return h;
-        h.haveLatticePitch = r.u32(h.latticePitchMm);
+        uint32_t wirePitch = 0;
+        h.haveLatticePitch = r.u32(wirePitch);
+        h.latticePitchMm = h.format == 4 ? double(wirePitch)/1000.0 : double(wirePitch);
         return h;
     }
 
 private:
+    static uint32_t encodePitchUm(double mm) {
+        const double um=mm*1000.0;
+        if (!std::isfinite(um) || um<1 || um>double(UINT32_MAX) || std::abs(um-std::round(um))>1e-6)
+            throw std::invalid_argument("edit-log pitch must be a positive integer micrometre value");
+        return uint32_t(std::round(um));
+    }
     enum PayloadMode : uint8_t { kSparse = 0, kRle = 1 };
 
     // ByteWriter/ByteReader (voxelcore/bytes.h) are shared with the tile
@@ -343,7 +354,7 @@ private:
     uint64_t seed_;
     uint8_t brickEdge_;
     std::string providerId_;
-    uint32_t latticePitchMm_ = static_cast<uint32_t>(kVoxelSizeMm);
+    uint32_t latticePitchUm_ = uint32_t(kVoxelSizeMm)*1000u;
     std::vector<EditEntry> entries_;
 };
 

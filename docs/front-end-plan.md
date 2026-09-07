@@ -55,8 +55,13 @@ Both are needed. Idle alone passes in the lull before the streamer has been
 asked for anything -- on a cold start, frame one. Spatial alone passes as soon
 as the ground exists with half the visible ring still meshing.
 
-Then: hold at least `-VoxelLoadMinHold` (15 s), leave as soon as the gate
-passes, leave regardless at `-VoxelLoadMaxHold` (60 s, logged as a **warning**).
+Then: reveal at **max(load theatre elapsed, gate passed)** — the owner's
+2026-09-05 directive rolls an artificial uniform 30–60 s duration per load
+(`-VoxelLoadTheatre=<min>[,<max>]` overrides; `=0` restores reveal-on-ready,
+backstopped by `-VoxelLoadMinHold`), and leave regardless when the probe hits
+`-VoxelLoadMaxHold` (60 s, logged as a **warning**). Grep for
+`LoadScreen: theatre duration` and `LoadScreen: world ready at` — the pair is
+the engagement evidence.
 
 ### `GateMaxRing = 3` is a hypothesis, not a measurement
 
@@ -76,16 +81,23 @@ and record time-to-gate in `docs/measurements/front-end-gate-<date>.txt`.
 ## The progress bar
 
 ```
-P = clamp(max(P_prev, max(elapsed/MaxHold, 0.25*probeHits/112 + 0.75*ringFill)), 0, 0.995)
+P = clamp(max(P_prev, min(smoothstep(elapsed/theatre), gateOpen ? 1.0 : 0.97)), 0, 1)
 ```
 
-Godot's was `elapsed/total` and nothing else -- honest about time, wrong about
-work. On a warm cache it read 30% when the world was ready; on a cold fill,
-100% while chunks were still landing. Each term here stops one failure: the
-time floor stops a work bar sitting still through an R3 tail; the monotone
-clamp stops it going backwards, which it genuinely would, because
-`RecomputeDesiredSet` grows the desired set as the anchor settles; the 0.995
-cap means 100% is only ever reached by the gate passing.
+The bar is **theatre** (owner directive 2026-09-05, `ComputeTheatreProgress`):
+it plays the rolled 30–60 s duration out on a smoothstep, whose zero slope at
+both ends makes the start gentle and the ~97% hold read as a landing. The
+world's readiness enters as one bit that only gates the ending: a world faster
+than the timer waits behind the curtain while the show finishes; a slower one
+holds the bar at 0.97 — strictly under the hourglass grain emitter's 0.995
+cut-off, so the sand keeps falling — until the gate opens. The monotone clamp
+stays, and 100% is still only ever reached at reveal. (The previous
+work-driven model, `max(elapsed/MaxHold, 0.25*spatial + 0.75*ringFill)` capped
+at 0.995, was honest but lurched with ring fill and pinned warm loads at 99%
+with a frozen hourglass; its invariants that still apply are re-pinned in
+`VoxelEarth.FrontEnd.LoadProgress`.) During the theatre the front end also
+caps `voxel.Stream.ApplyBudgetMs` to 2.0 ms and restores it at reveal, logged
+both ways, so the screen stays smooth while the world streams behind it.
 
 ## Verification
 
@@ -161,6 +173,7 @@ forces a one-line decision in
 | `-VoxelMenuAutoStart[=<s>]` | Press NEW GAME, no capture, no quit |
 | `-VoxelReadyProbeLog` | One line per readiness poll |
 | `-VoxelLoadGateMaxRing=<n>`, `-VoxelLoadMinHold=<s>`, `-VoxelLoadMaxHold=<s>` | Gate tuning |
+| `-VoxelLoadTheatre=<min>[,<max>]` | Artificial load duration range; `0` disables the theatre (pass on `-VoxelMenuAutoStart` parity legs) |
 | `-VoxelUINoAssets` | Force the no-font, no-art path |
 | `-VoxelMenuWatchdog=<s>` | Unattended: exit rather than sit on the menu |
 

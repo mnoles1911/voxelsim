@@ -12,6 +12,7 @@ add_executable(vxc_tests
   test_assetpolicy.cpp
   test_assetdetail.cpp
   test_assetfield.cpp
+  test_assetslopefit.cpp
   test_carrier.cpp
   test_biome.cpp
   test_climate.cpp
@@ -46,11 +47,15 @@ add_executable(vxc_tests
   test_farwater.cpp
   test_riverribbon.cpp
   test_ocean.cpp
+  test_tide.cpp
+  test_oceanconnect.cpp
+  test_waterdeterminism.cpp
   test_fluidoccupancy.cpp
   test_fluidlifecycle.cpp
   test_fluidsprings.cpp
   test_weather.cpp
   test_craftlattice.cpp
+  test_craft125.cpp
   test_craftpersist.cpp
   test_craftcost.cpp
 )

@@ -120,10 +120,17 @@
 // --- WHERE RIPPLES ARE ALLOWED ----------------------------------------------
 //
 // The bake already knows. bake_ver 27's bathy_shore plane is a SIGNED DISTANCE
-// to the nearest shoreline, and the step multiplies the field by
-// saturate(shore_m / kShoreMaskM) every step: zero on land, zero at the
-// waterline, one 25 cm inside the water. That is both "no ripples on dry ground"
-// and "a shore for a ripple to die against", from one number.
+// to the nearest shoreline, and the step multiplies the PROPAGATING field by
+// max(saturate(shore_m / kShoreMaskM), MaskFloor) every step: MaskFloor (0.98,
+// a ~0.6 s half-life) on land and at the waterline, one 25 cm inside the
+// water. That is "a shore for a ripple to die against" WITHOUT a kill switch:
+// until 2026-09-06 the mask reached zero and was applied to the freshly
+// injected splat too, so anywhere the bake disagreed with the live water that
+// validated the injector -- including the waterline itself, where wading
+// entries splash -- the splat was erased in the very draw that counted it as
+// injected, with every counter green. The splat is now injected AFTER the
+// attenuation (see STEP_CODE in Tools/create_ripple_field_materials.py), so a
+// splash is always born and the mask governs how it dies.
 //
 // Where the bake has no answer there is no mask -- the same lerp-back-to-1 on
 // validity the wave field's shore damping uses
@@ -267,6 +274,66 @@ public:
 	static void AddDisturbanceAt(const UWorld* World, const FVector& WorldPos,
 	                             float RadiusM, float StrengthM);
 
+	// WHERE the field's peak is, in world UU, plus an image on disk.
+	// voxel.Water.Ripple.Dump. Public because the console command is a free
+	// function; see the implementation for why a "where" instrument became
+	// necessary after nine separate "is there data" answers all said yes while
+	// the screen stayed empty.
+	void DumpFieldToDisk(const FString& Dir, const FString& Name);
+
+	// ------------------------------------------------------------------------
+	// A WAKE: THE SAME RIPPLE, DRAGGED ALONG A LINE
+	// ------------------------------------------------------------------------
+	//
+	// Phase D4 of docs/water-ocean-tides-plan-2026-09-04.md. A boat is a source
+	// that MOVES, and the one thing the field already does perfectly is turn a
+	// moving source into a wedge: the step is a constant-c wave equation, so
+	// rings laid down along a track interfere into the V a Kelvin wake actually
+	// is. Nothing new is simulated to get that -- it falls out of the sim that
+	// is already running, which is why this is a helper and not a feature.
+	//
+	// THIS ADDS NO BUDGET AND NO STATE. It subdivides the segment and calls
+	// AddDisturbance once per sub-splat, so every sub-splat lands in the SAME
+	// kMaxPending queue, competes for the SAME kSplatSlots per step, and is
+	// counted by the SAME four Dropped counters. There is deliberately no
+	// "swept" counter: Injected + the four drops must stay exactly the number of
+	// AddDisturbance calls (the identity stated above), and a fifth counter here
+	// would be a second place for that identity to be wrong.
+	//
+	// AND IT STAYS COSMETIC. The rule at the top of this file (:16-20) is that
+	// this field is a material input and nothing else -- it moves no water, owns
+	// no datum, and a boat's buoyancy reads
+	// UVoxelWaterSubsystem::WaterSurfaceZAtWorld, never this. A wake that pushed
+	// the boat would be the exact change that rule exists to stop.
+	//
+	// WidthM is the wake's full width; each sub-splat is a ring of HALF that
+	// radius, laid at a spacing of at most half the width so consecutive rings
+	// overlap rather than beading. StrengthM is passed to every sub-splat
+	// UNCHANGED, which means a swept line is genuinely stronger than one splash
+	// of the same strength -- overlapping raised cosines sum. That is the
+	// correct physics for a continuous source and it is stated here because it
+	// is the number a caller will otherwise tune twice: a boat wants a per-tick
+	// StrengthM well BELOW the one-off splash figures quoted above.
+	//
+	// Same total safety as AddDisturbance: safe before the first frame, with the
+	// subsystem disabled, with a zero-length segment (one splat at Start) and
+	// with non-finite input (one call, counted DroppedInert, never a loop).
+	void AddSweptDisturbance(const FVector& StartWorld, const FVector& EndWorld,
+	                         float WidthM, float StrengthM);
+
+	// The UWorld form, for the same reason AddDisturbanceAt has one: a hook into
+	// a file this feature does not own should be one line that cannot fail.
+	static void AddSweptDisturbanceAt(const UWorld* World, const FVector& StartWorld,
+	                                  const FVector& EndWorld, float WidthM, float StrengthM);
+
+	// Hard ceiling on sub-splats from ONE swept call. Four full queues: enough
+	// that no boat at any plausible speed and frame time reaches it, small
+	// enough that a caller handing this a kilometre-long segment cannot spin.
+	// The excess is not silently dropped -- see the .cpp, where the ceiling logs
+	// once and the sub-splats past kMaxPending are counted DroppedFull by
+	// AddDisturbance itself, which is that counter's documented meaning.
+	static constexpr int32 kMaxSweptSplats = kMaxPending * 4;
+
 	// Run N simulation steps RIGHT NOW, outside the frame's own stepping. Exists
 	// for one reason: a screenshot at a pinned pose has to photograph the same
 	// water every time it is taken, and a ripple that has been settling for
@@ -279,6 +346,25 @@ public:
 	// check in this class measures the PROCESS, and there was a state in which
 	// all of them passed and nothing rendered.
 	void ProbeTextures();
+
+	// --- field health: the counter that cannot lie ---------------------------
+	//
+	// 2026-09-06: the second time this system reported perfect counters over
+	// empty textures (armed=1 published=1 steps=115889 injected=26240, boat
+	// wake invisible at gain 20). Every counter above measures the PROCESS --
+	// injected counts splat slots WRITTEN, steps counts draws SCHEDULED -- and
+	// none of them touches the DATA, so "the sim is healthy" could mean "the
+	// draws were merely scheduled". These read the data: a small centre patch
+	// of the front state and the derived field is read back every few seconds
+	// UNTIL the field first proves non-zero, then sampling stops for the
+	// session (re-arming on ClearState). Stat prints the result, and a field
+	// that stays dark while injections accrue logs a warning that names the
+	// triage. Cost: two 64x64 readbacks per sample, only while unverified.
+	bool FieldHealthSampled() const { return LastFieldMaxAbs_ >= 0.0f; }
+	float FieldMaxAbs() const { return LastFieldMaxAbs_; }   // -1 = never sampled
+	float StateMaxAbs() const { return LastStateMaxAbs_; }   // metres, bias removed
+	double FieldHealthAgeSec() const;
+	bool FieldVerifiedLive() const { return bFieldVerifiedLive_; }
 
 	// Both state targets back to flat water. Also called on arm and disarm -- a
 	// field left over from a previous world would otherwise be the first thing
@@ -340,6 +426,8 @@ private:
 	bool bLoggedFirstStep_ = false;
 	bool bLoggedRadiusClamp_ = false;
 	bool bLoggedCourantClamp_ = false;
+	// ...and a swept disturbance long enough to hit kMaxSweptSplats.
+	bool bLoggedSweptClamp_ = false;
 	// Whether MPC_VoxelSky actually carries the three ripple parameters. Checked
 	// ONCE, in Initialize, and never again: UKismetMaterialLibrary's setters log a
 	// warning and do nothing for a name that is not on the collection, and doing
@@ -384,6 +472,17 @@ private:
 	FVector LastPawnPos_ = FVector::ZeroVector;
 	bool bHaveLastPawnPos_ = false;
 
+	// --- field health state (see the public block above) ---------------------
+	// Sampled max|value| in the centre patch: field = max of |R|,|G|,|B| (the
+	// gradient/height the water actually reads), state = max of |R-bias|,
+	// |G-bias| in metres. -1 until the first sample.
+	float LastFieldMaxAbs_ = -1.0f;
+	float LastStateMaxAbs_ = -1.0f;
+	double LastHealthSampleAt_ = -1.0e18;
+	int32 DarkHealthSamples_ = 0;
+	bool bFieldVerifiedLive_ = false;
+	bool bWarnedFieldDark_ = false;
+
 	uint64 TotalSteps_ = 0;
 	uint64 Injected_ = 0;
 	uint64 DroppedOutside_ = 0;
@@ -396,6 +495,11 @@ private:
 	// camera-following windows centred on different things would disagree about
 	// where the world is, and the step samples the bathymetry window.
 	bool GetCameraXY(double& OutX, double& OutY) const;
+
+	// Read a 64x64 centre patch of the front state and the field back to the
+	// CPU and judge it. Throttled, and self-disarming on the first non-zero
+	// field -- see the public field-health block for the contract.
+	void SampleFieldHealth();
 
 	// One simulation step: scroll by ShiftUv (zero on every substep after the
 	// first of a frame), inject up to kSplatSlots queued disturbances, draw.

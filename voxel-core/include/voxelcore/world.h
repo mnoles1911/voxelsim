@@ -10,8 +10,24 @@
 
 namespace vxc {
 
-template <int B>
-class World {
+template <int B, int CraftRefinement = 3>
+class World : private CraftLayout<CraftRefinement> {
+public:
+    using Layout = CraftLayout<CraftRefinement>;
+    using Layout::kCraftCellsPerVoxel;
+    using Layout::kCraftChunkEdgeCells;
+    using Layout::kCraftBricksPerAxis;
+    using Layout::kCraftBricksPerChunk;
+    using Layout::kVoxelsPerCraftBrick;
+    using Layout::kCraftProjectionFolds;
+    using Layout::kCraftPitchUm;
+    using Layout::kCraftPitchMm;
+    using Layout::craftCellOfVoxelMin;
+    using Layout::voxelOfCraftCell;
+    using Layout::craftBrickKeyOfCell;
+    using Layout::craftChunkKeyOfCell;
+    using Layout::craftBrickBaseOfTerrainBrick;
+    using Layout::terrainBrickOfCraftBrick;
 public:
     // THE CRAFT LATTICE NEEDS B == 8, AND World<16> IS A REAL CONFIGURATION.
     // A craft chunk is one terrain brick only when 4 * B == 32 (see
@@ -35,7 +51,7 @@ public:
     // of the save that carries the player's building.
     World(uint64_t seed, ITileSampler& tiles, std::string providerId = {})
         : amp_(seed, tiles), gen_(amp_), log_(seed, B, providerId),
-          craftLog_(seed, B, std::move(providerId), static_cast<uint32_t>(kCraftPitchMm)) {}
+          craftLog_(seed, B, std::move(providerId), kCraftPitchMm) {}
 
     const Amplifier& amplifier() const { return amp_; }
 
@@ -92,7 +108,7 @@ public:
     // craft cells and for the coarse PROJECTION those cells imply; the terrain
     // log stays the authority for everything else. Replay order is terrain
     // first, then craft -- see replayCraft().
-    const CraftLattice<B>& craftLattice() const { return craft_; }
+    const CraftLattice<B, CraftRefinement>& craftLattice() const { return craft_; }
     const EditLog& craftLog() const { return craftLog_; }
     uint64_t craftDigest() const { return craft_.digest(); }
 
@@ -218,7 +234,31 @@ public:
     bool replayCraft(const EditLog& log) {
         static_assert(kCraftSupported, "the craft lattice needs terrain brick edge 8");
         if (log.seed() != amp_.seed() || log.brickEdge() != B) return false;
-        if (log.latticePitchMm() != static_cast<uint32_t>(kCraftPitchMm)) return false;
+        if (!craftLog_.providerId().empty() &&
+            log.checkProvider(craftLog_.providerId()) == EditLog::ProviderCheck::kMismatch) return false;
+        if constexpr (CraftRefinement == 3) {
+            if (log.latticePitchMm() == 25.0) {
+                EditLog expanded(log.seed(), log.brickEdge(), log.providerId(), kCraftPitchMm);
+                for (const auto& entry: log.entries()) {
+                    std::vector<std::pair<BrickKey,std::vector<EditCell>>> buckets;
+                    for(const auto& cell: entry.cells) {
+                        const int64_t x0=(int64_t(entry.key.x)*8+cell.cell%8)*2;
+                        const int64_t y0=(int64_t(entry.key.y)*8+(cell.cell/8)%8)*2;
+                        const int64_t z0=(int64_t(entry.key.z)*8+cell.cell/64)*2;
+                        for(int dz=0;dz<2;++dz) for(int dy=0;dy<2;++dy) for(int dx=0;dx<2;++dx) {
+                            const auto key=craftBrickKeyOfCell(x0+dx,y0+dy,z0+dz);
+                            auto it=std::find_if(buckets.begin(),buckets.end(),[&](const auto& p){return p.first==key;});
+                            if(it==buckets.end()) { buckets.push_back({key,{}}); it=std::prev(buckets.end()); }
+                            it->second.push_back({uint16_t(Brick<8>::cellIndex(int(floorMod(x0+dx,int64_t(8))),int(floorMod(y0+dy,int64_t(8))),int(floorMod(z0+dz,int64_t(8))))),cell.mat});
+                        }
+                    }
+                    std::sort(buckets.begin(),buckets.end(),[](const auto& a,const auto& b){return BrickKeyLess{}(a.first,b.first);});
+                    for(auto& bucket:buckets) expanded.append(bucket.first,std::move(bucket.second));
+                }
+                return replayCraft(expanded);
+            }
+        }
+        if (log.latticePitchMm() != kCraftPitchMm) return false;
         for (const EditEntry& e : log.entries()) {
             ensurePromoted(terrainBrickOfCraftBrick(e.key));
             craftLog_.append(e.key, e.cells);
@@ -417,7 +457,7 @@ private:
     Amplifier amp_;
     GeneratedWorld<B> gen_;
     ChunkMap<B> overlay_;
-    CraftLattice<B> craft_;
+    CraftLattice<B, CraftRefinement> craft_;
     EditLog log_;
     EditLog craftLog_;
     std::optional<EditLog::ProviderCheck> lastProviderCheck_;

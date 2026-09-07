@@ -137,46 +137,78 @@ def sample_bathy_field(b):
 
 
 def build_slant_depth(b, depth_m, camera_vector_z):
-    """Turn the baked VERTICAL depth into the path length light actually travels.
+    """Turn the baked VERTICAL depth into the path length the LOOK requires.
 
     A baked vertical depth is NOT a Beer-Lambert path length, and using it as one
     makes water viewed at a grazing angle read wrongly transparent -- the whole
     lake goes pale as you lower the camera, which is the single most obvious tell
-    that a depth term is fake. 0 A.D.'s water_high.fs is the usual reference here
-    and divides by a hand-tuned clamped function of the view ray's vertical
-    component:
+    that a depth term is fake. The curve here is one formula with one knob:
 
-        depth / (min(0.5, eyeVec.y) * 1.5 * min(0.5, eyeVec.y) * 2.0)
+        cos_eff = sqrt(1 - (1 - vz^2) * BathyRefractInvN2)
+        slant   = depth / max(cos_eff, 0.05)
 
-    WE DO NOT USE THAT CURVE, and it is worth saying why rather than just
-    diverging. It is an unclamped 1/cos with an arbitrary floor bolted on, and
-    the floor is doing a job that PHYSICS already does for free: the view ray
-    REFRACTS at the water surface. Snell at IOR 1.33 bends a ray arriving at 90
-    degrees from vertical down to 48.8 degrees inside the water, so the path
-    through a slab of thickness d can never exceed d / cos(48.8) = 1.52 d. The
-    elongation is self-limiting, no magic constant required:
+    and the KNOB IS THE WHOLE STORY, because this function has now been shipped
+    at both ends of it:
 
-        cos(theta_r) = sqrt(1 - (1 - vz^2) / n^2)        n = 1.33, n^2 = 1.7689
-        slant        = d / cos(theta_r)
+    BathyRefractInvN2 = 1/1.7689 (0.565) IS SNELL'S LAW, and was the original
+    default. The view ray refracts at the surface; IOR 1.33 bends a ray arriving
+    at 90 degrees from vertical down to 48.8 degrees inside the water, so the
+    refracted path through a slab of thickness d is provably bounded in
+    [d, 1.52 d] -- self-limiting, no clamp doing real work, and consistent with
+    the engine's own refraction one layer down (SingleLayerWaterShading.ush,
+    WaterRefract). AS TRANSMISSION PHYSICS THIS IS CORRECT AND IT IS NOT IN
+    DISPUTE: real grazing water hides its bed with Fresnel REFLECTION, not with
+    path length -- polariser glasses kill the reflection and the bed appears.
 
-    which is bounded in [d, 1.52 d] for every possible view direction, is exactly
-    1 looking straight down, and needs no clamp to stay finite. It is also
-    consistent with what the engine itself does one layer down -- SLW refracts
-    the view ray before evaluating its phase function
-    (SingleLayerWaterShading.ush, WaterRefract).
+    BathyRefractInvN2 = 1.0 IS THE STRAIGHT (UNREFRACTED) SECANT, the default
+    since 2026-09-05, and it is a DELIBERATE trade of that physics for the
+    owner's read of what water looks like. The directive ("Water is too
+    transparent and see through globally. Even very shallow water bodies should
+    clearly have a surface that looks like water from a distance") was first
+    answered with the physical lever -- a grazing sky sheen
+    (water_sky_reflection_graph's SurfacePresence) -- and the verdict on its
+    frames REJECTED the mirror: the sheen washed the deep teal into pale blue,
+    which read as MORE transparent, "looked better with its green coloring".
+    What "reads as water" to the owner is the water's own saturated BODY colour
+    beating the bed, and the lever for that is optical depth. At 1.0 the
+    formula degenerates exactly to cos_eff = |vz|, i.e. slant =
+    depth / max(NoV, 0.05): a 0.5 m flat seen 6 degrees above the horizon is
+    ~4.8 m of water instead of the 0.76 m Snell gave it, and it saturates
+    toward the deep-water colour the way the owner's reference picture does.
+    Straight down (vz = 1) the two curves are IDENTICAL -- slant = depth -- so
+    the 2026-08-12 optics midpoint (water_optics.py, untouched) means exactly
+    what it meant in every top-down and steep view; the change is confined to
+    the same grazing band every angle-true term lives in. This is also the
+    curve most shipped game water uses (0 A.D.'s water_high.fs divides by a
+    hand-clamped function of eyeVec.y for the same reason, just with less
+    honest bookkeeping).
+
+    THE 0.05 FLOOR IS NOW LOAD-BEARING, where under Snell it was a NaN guard
+    that could never engage: it caps the elongation at 20x, which is what
+    "clamped sensibly" means here -- at 20x the shallowest water the bake
+    resolves (10 mm) is already 20 cm of optical path, extinction has done its
+    work, and everything past the cap is invisible anyway; an unclamped divide
+    would trade that nothing for horizon NaNs.
+
+    THE LADDER IS THIS ONE PARAMETER, MID-probeable by name
+    (-VoxelWaterMatScalar=BathyRefractInvN2:<v>): 0.565 is the pre-directive
+    Snell arm, 1.0 the shipped secant arm, values between interpolate the
+    grazing response continuously. One knob on both waters -- the lake and
+    M_Ocean call this same function -- so the two cannot be laddered apart.
 
     `camera_vector_z` is the Z component of CameraVector (pixel -> camera, unit
     length), so vz^2 is what the formula wants and the sign never matters.
     """
     vz2 = b.mul(camera_vector_z, camera_vector_z)
     one_minus_vz2 = b.sub(b.const(1.0), vz2)
-    # 1 / n^2 for water. Named as a parameter so a stylised look can flatten the
-    # grazing response without editing the graph, but the DEFAULT is the physical
-    # value and anything above 1 makes the elongation unbounded again.
-    inv_n2 = b.scalar("BathyRefractInvN2", 1.0 / 1.7689)
+    # The knob the docstring above is about. 1.0 = straight secant (shipped,
+    # 2026-09-05 owner directive); 1/1.7689 = physical Snell (the original
+    # default, kept reachable for the ladder). Above 1.0 is meaningless
+    # (cos_eff goes imaginary before the saturate catches it) -- do not.
+    inv_n2 = b.scalar("BathyRefractInvN2", 1.0)
     cos_r = b.node(unreal.MaterialExpressionSquareRoot)
     b.link(b.saturate(b.sub(b.const(1.0), b.mul(one_minus_vz2, inv_n2))), "", cos_r, "")
-    # max() and not a raw divide: saturate() above can reach exactly 0 only if
-    # inv_n2 is pushed to 1, but a divide by zero in a shader is a NaN that
-    # propagates into the frame, and one node is cheaper than that conversation.
+    # max(): at the shipped default this is the 20x elongation cap the
+    # docstring argues for; at the Snell end it degenerates back into the NaN
+    # guard it originally was (cos_r never goes below 0.66 there).
     return b.div(depth_m, b.maximum(cos_r, b.const(0.05)))

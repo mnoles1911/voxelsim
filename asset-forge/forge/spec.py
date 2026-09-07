@@ -16,11 +16,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import biomes as biomelib, kinds as kindlib, materials
+from . import resolution as resolutionlib
+from . import (biomes as biomelib, categories as catlib,
+               kinds as kindlib, materials)
 
 
 @dataclass(frozen=True)
@@ -247,25 +250,11 @@ PARAMS: tuple[Param, ...] = (
     # `forge.cli selftest` now trips a bogus value through EVERY choice
     # parameter in this table, this one included, every run.
     P("resolution_cm", "Voxel size", "5", kind="choice", group="general",
-      choices=("10", "5", "2.5", "2", "1"),
-      help="Edge length of one voxel, and the size the asset EXPORTS at.\n\n"
-           "THIS IS A MENU, NOT A NUMBER. A value that is not on it is not "
-           "refused — it is silently replaced with 5 and the asset builds "
-           "anyway, roughly 4.6x lighter than a 3 cm author expects. There is "
-           "no 3 cm and no 4 cm.\n\n"
-           "WHICH SIZE IS NOT A MATTER OF TASTE, it follows from the kind "
-           "(owner, 2026-08-14; see forge/kinds.py). A tree or a rock JOINS THE "
-           "WORLD'S OWN VOXEL GRID and is destructible as terrain is, so it is "
-           "authored at the terrain's 10 cm and nothing else is legal — the "
-           "selftest refuses one that is not. Everything else — bushes, ground "
-           "cover, fish, birds and land animals — is a DETAIL asset carrying "
-           "its own grid and its own transform, so its lattice is free.\n\n"
-           "For those, the rule is measured rather than chosen: the COARSEST "
-           "voxel at which the species' smallest identifying feature is still "
-           "about three voxels across. That is why the library sits where it "
-           "does — 5 cm for ground cover, 1 cm for a bird whose eye stripe is a "
-           "centimetre, 2 cm for most land animals. Previews pick their own "
-           "size to stay cheap and say so when it differs from this."),
+      choices=resolutionlib.TIERS_CM,
+      help="Supported pitches: 100, 50, 25 and 12.5 mm. Only creatures and "
+           "craftables may use 12.5 mm. Terrain-stamped trees and rocks remain "
+           "at 100 mm; other environment assets may use 100, 50 or 25 mm. "
+           "Previews may select a coarser supported tier to fit their budget."),
 
     P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.01, 12.0, 0.01, group="trunk"),
     # THE STEM HAD NO d(z) AT ALL, AND THE LIBRARY MEASURED IT.
@@ -2719,6 +2708,213 @@ PARAMS: tuple[Param, ...] = (
            "metres and a squirrel's is five, so a world tuned only for the "
            "large species would let a player walk up to nothing."),
 
+    # --- artifacts: boats and aircraft ---------------------------------------
+    #
+    # THE WHOLE GROUP IS `kinds=("artifact",)`, and the group is checked in
+    # `forge/artifact.py` at import against this table, the same guard
+    # `forge/ground.py` puts on the plant menus. A parameter the generator reads
+    # that is not on this table returns None and crashes on the first build; a
+    # parameter on this table the generator never reads is a dead slider, and
+    # both are worth finding on the first run rather than in a render.
+    #
+    # TWO FORMS, ONE KIND, and that is the same call `grass`/`reed`/`flower`
+    # made in the other direction. There, three kinds share one generator
+    # because the designer authors them separately. Here one kind carries two
+    # form families because a boat and a glider are authored by the same person
+    # for the same reason on the same day, and the ten rows they share -- size,
+    # shell thickness, seed asymmetry, the materials -- are most of the table.
+    P("artifact.form", "Form", "hull", kind="choice", group="artifact",
+      kinds=("artifact",), choices=("hull", "wing", "raft", "bamboo_raft",
+      "flake_blade", "stone_knife", "fiber_bundle", "cordage_coil", "hammerstone",
+      "wooden_haft", "stone_axe_head", "stone_axe"),
+      help="Which family of shape this is.\n\n"
+           "'hull' is a lofted closed watercraft: a plan curve and a section "
+           "curve swept along the length, hollowed by re-evaluating the same "
+           "curves one shell thickness in. 'wing' is a thin swept panel on "
+           "spars with a frame hung below it. 'raft' is parallel logs lashed "
+           "into a platform: length is the log length, beam the footprint "
+           "width, depth the LOG DIAMETER; thwarts become the cross-poles and "
+           "deck_frac places the lashing stations in from each end. "
+           "'bamboo_raft' uses hollow, jointed bamboo poles, crossbars and "
+           "two posts; frame_drop_m sets post height above the deck. "
+           "Survival tool forms use length, beam and depth as their authoring "
+           "bounds; hull/frame/trim/strake materials control stone, wood, "
+           "cordage and weathering. Boat-specific settings do not apply.\n\n"
+           "THIS IS A MENU. A value that is not on it is not refused, it is "
+           "replaced with 'hull' -- so a glider spec with a typo here builds a "
+           "boat out of a glider's numbers and nothing downstream says so."),
+    P("artifact.length_m", "Length (m)", 4.0, 0.1, 30.0, 0.05, group="artifact",
+      kinds=("artifact",),
+      help="Fore-and-aft size. For a hull this is length overall, stem to "
+           "stern. For a wing it is the ROOT CHORD -- nose to the trailing "
+           "edge at the centreline -- which on a delta is also the length of "
+           "the keel tube under the sail."),
+    P("artifact.beam_m", "Beam / span (m)", 0.85, 0.1, 20.0, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Across the craft. For a hull, the maximum beam amidships, measured "
+           "outside the planking and before the gunwale lip is added. For a "
+           "wing, the full tip-to-tip span."),
+    P("artifact.depth_m", "Depth (m)", 0.35, 0.05, 4.0, 0.01, group="artifact",
+      kinds=("artifact",),
+      help="Hull only: keel to gunwale amidships, which is the SHALLOWEST "
+           "section of the boat because the sheer rises toward both ends. A "
+           "canoe is 0.32-0.40 m."),
+    P("artifact.shell_vox", "Shell thickness (voxels)", 2, 1, 6, 1, kind="int",
+      group="artifact", kinds=("artifact",),
+      help="How thick the planking is, IN VOXELS rather than in metres, "
+           "because that is the number that decides whether it survives. At "
+           "2.5 cm two voxels is 5 cm of plank -- thick for a real canoe, and "
+           "thin enough to read as a shell rather than a solid block.\n\n"
+           "One voxel is legal and is a trap at any pitch: the hull comes out "
+           "watertight in the field and a single diagonal step leaves a "
+           "one-voxel hole the mesher draws straight through. The build reports "
+           "the hollow fraction, so an over-thick shell is visible too."),
+    P("artifact.asym_vox", "Seed asymmetry (voxels)", 0.8, 0.0, 6.0, 0.1,
+      group="artifact", kinds=("artifact",),
+      help="How far the centreline may bow to one side on a given seed, at its "
+           "widest, in voxels. This is the main thing that makes two seeds of "
+           "one craft different objects rather than one object twice, and it is "
+           "deliberately SMALL: a hand-built boat is a bit crooked, and a boat "
+           "that is visibly crooked is a broken asset.\n\n"
+           "Applied to the FIELD -- the whole section slides sideways -- so it "
+           "cannot open a seam or shed a voxel the way a per-voxel jitter "
+           "would."),
+    P("artifact.strake_share", "Contrast strakes", 0.25, 0.0, 1.0, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="What fraction of the planking runs (or sail panels) is drawn in "
+           "the second material. WHICH ones is drawn per seed, so this is the "
+           "other half of what tells two individuals apart.\n\n"
+           "THESE RUN ALONG THE CRAFT, NOT AROUND IT. A band at constant HEIGHT "
+           "is a strake, which is how a boat is actually planked; a band at "
+           "constant STATION would be a contour ring around the girth, which is "
+           "this package's oldest shape defect wearing a paint job."),
+
+    P("artifact.sheer", "Sheer rise", 0.35, 0.0, 1.5, 0.01, group="artifact",
+      kinds=("artifact",),
+      help="Hull. How far the gunwale rises toward bow and stern, as a "
+           "fraction of the depth amidships. This is the line that makes a "
+           "canoe read as a canoe from the side; at 0 it is a bathtub."),
+    P("artifact.rocker", "Rocker", 0.14, 0.0, 1.0, 0.01, group="artifact",
+      kinds=("artifact",),
+      help="Hull. How far the keel rises toward the ends, as a fraction of "
+           "depth. With the sheer this is the whole profile: plenty of rocker "
+           "turns easily and tracks badly, which is a canoe; none is a punt."),
+    P("artifact.fullness", "Plan fullness", 2.4, 1.0, 6.0, 0.1,
+      group="artifact", kinds=("artifact",),
+      help="Hull. How much of the length carries close to full beam. The plan "
+           "half-breadth is (1 - u**fullness) ** entry, with u the distance "
+           "from amidships, so a high number holds the beam out toward the ends "
+           "and a low one is a lens."),
+    P("artifact.entry", "Entry fineness", 0.62, 0.2, 1.5, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Hull. The outer exponent on the same plan curve, which is what "
+           "sharpens the bow. Below 1 the ends draw out to a fine point; at 1 "
+           "they are elliptical; above 1 they are blunt. BOTH ends together -- "
+           "a canoe is double-ended and this generator does not do transoms."),
+    P("artifact.bilge", "Section shape", 2.6, 0.8, 6.0, 0.1, group="artifact",
+      kinds=("artifact",),
+      help="Hull. The superellipse exponent of every section: below 1 a hard V, "
+           "2 a circular arc, above 3 a flat floor with a hard turn of bilge.\n\n"
+           "ONE NUMBER FOR THE WHOLE BOAT, on purpose. A per-station section "
+           "table is exactly what produces contour rings when it is "
+           "interpolated coarsely, and there is nothing to interpolate if there "
+           "is only one."),
+    P("artifact.gunwale_m", "Gunwale depth (m)", 0.06, 0.0, 0.4, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Hull. How far down from the sheer line the gunwale band reaches. "
+           "Zero draws no gunwale at all, and the build then reports that step "
+           "as having changed nothing -- which is an error, not a style."),
+    P("artifact.gunwale_vox", "Gunwale overhang (voxels)", 1, 0, 4, 1,
+      kind="int", group="artifact", kinds=("artifact",),
+      help="Hull. How far the gunwale stands PROUD of the planking, in voxels. "
+           "One voxel at 2.5 cm is a 2.5 cm lip, and that is what makes the rim "
+           "read as a separate rail rather than as the top of the hull painted "
+           "a different colour."),
+    P("artifact.thwarts", "Thwarts", 2, 0, 6, 1, kind="int", group="artifact",
+      kinds=("artifact",),
+      help="Hull. Cross seats, evenly spaced, ends excluded. They are "
+           "structural here as well as visual: they are the only thing joining "
+           "port to starboard above the floor."),
+    P("artifact.thwart_w_m", "Thwart width (m)", 0.10, 0.02, 0.6, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Hull. Fore-and-aft width of one thwart."),
+    P("artifact.thwart_t_m", "Thwart thickness (m)", 0.05, 0.02, 0.3, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Hull. How far a thwart hangs below the sheer line."),
+    P("artifact.deck_frac", "End decks", 0.07, 0.0, 0.35, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Hull. Fraction of the length closed over at EACH end. A canoe has a "
+           "short deck plate at bow and stern; it stiffens the stem, and it is "
+           "most of what stops the ends reading as an open wedge."),
+
+    P("artifact.sweep", "Leading-edge sweep", 0.85, 0.0, 3.0, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. How far aft the leading edge runs per metre out along the "
+           "span: 0 is a straight wing, 1 is 45 degrees, and a Rogallo-derived "
+           "hang glider is around 0.8-1.0."),
+    P("artifact.taper", "Tip chord", 0.30, 0.02, 1.0, 0.01, group="artifact",
+      kinds=("artifact",),
+      help="Wing. Tip chord as a fraction of the root chord."),
+    P("artifact.panel_vox", "Sail thickness (voxels)", 2, 1, 4, 1, kind="int",
+      group="artifact", kinds=("artifact",),
+      help="Wing. How thick the fabric is drawn, in voxels. Fabric has no real "
+           "thickness at all, so this is entirely a lattice decision.\n\n"
+           "One voxel is the honest answer and it PERFORATES the moment the "
+           "sail is not level, because the panel is a vertical band about a "
+           "sloping surface and a vertical band of one voxel through a slope of "
+           "1:1 covers half of it. Two is the working default; the generator "
+           "raises it further when the authored droop and billow would tear a "
+           "two-voxel sheet, and says by how much."),
+    P("artifact.billow_m", "Sail billow (m)", 0.16, -1.0, 1.0, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. How far the sail bows between the leading edge and the "
+           "trailing edge, positive upward. This is the loose-sail curve that "
+           "separates a hang glider from a flat kite."),
+    P("artifact.droop_m", "Tip droop (m)", 0.30, -1.5, 1.5, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. How far the tips sit BELOW the root -- anhedral. Positive "
+           "droops; negative gives dihedral, for a wing meant to be stable "
+           "rather than hand-flown."),
+    P("artifact.spar_r_m", "Leading-edge spar (m)", 0.045, 0.01, 0.25, 0.005,
+      group="artifact", kinds=("artifact",),
+      help="Wing. Radius of the two leading-edge tubes. They are drawn ON the "
+           "sail surface, not beside it, so sail and frame are one "
+           "face-connected piece by construction rather than by luck."),
+    P("artifact.keel_r_m", "Keel spar (m)", 0.04, 0.01, 0.25, 0.005,
+      group="artifact", kinds=("artifact",),
+      help="Wing. Radius of the centreline keel tube."),
+    P("artifact.keel_m", "Keel overhang (m)", 0.45, 0.0, 3.0, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. How far the keel tube projects aft of the sail's trailing "
+           "edge at the centreline."),
+    P("artifact.crossbar_at", "Cross-bar station", 0.42, 0.0, 0.95, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. Where the cross-bar meets the leading-edge tubes, as a "
+           "fraction of the half-span. Zero draws none, and the build reports "
+           "that step as having changed nothing."),
+    P("artifact.frame_drop_m", "Control frame drop (m)", 1.15, 0.0, 3.0, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. How far the A-frame hangs below the keel. Zero draws no "
+           "frame, and the craft then sits on the sail's lowest point -- a kite "
+           "rather than a glider."),
+    P("artifact.frame_at", "Control frame station", 0.34, 0.05, 0.9, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. Where the A-frame apex meets the keel, as a fraction of the "
+           "root chord."),
+    P("artifact.frame_base_m", "Base bar (m)", 0.95, 0.1, 3.0, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. Width of the base bar between the two downtubes."),
+    P("artifact.frame_r_m", "Frame tube (m)", 0.03, 0.01, 0.2, 0.005,
+      group="artifact", kinds=("artifact",),
+      help="Wing. Radius of the downtubes and the base bar."),
+    P("artifact.seat", "Seat", True, kind="bool", group="artifact",
+      kinds=("artifact",),
+      help="Wing. Draw a seat slung under the keel behind the frame apex, on a "
+           "strap. Off leaves a bare airframe."),
+    P("artifact.seat_len_m", "Seat length (m)", 0.80, 0.1, 2.5, 0.01,
+      group="artifact", kinds=("artifact",),
+      help="Wing. Fore-and-aft length of the seat."),
+
     # Wood and leaf, and ONLY for the two kinds made of wood and leaf.
     #
     # The `materials` group is shared by every kind, so these three showed up in
@@ -2733,6 +2929,26 @@ PARAMS: tuple[Param, ...] = (
       kinds=("tree", "bush"), choices=materials.WOOD_NAMES),
     P("materials.leaf", "Leaf", "leaf_broadleaf", kind="choice", group="materials",
       kinds=("tree", "bush"), choices=materials.LEAF_NAMES),
+
+    # FOUR SLOTS, ONE MENU. See `materials.ARTIFACT_NAMES` for why they share
+    # it: two menus that differ by a few entries is how a value falls off one of
+    # them and is silently replaced by that row's default, which is what put
+    # four freshwater plants in blossom pink.
+    P("materials.hull", "Hull / sail", "heartwood", kind="choice",
+      group="materials", kinds=("artifact",), choices=materials.ARTIFACT_NAMES,
+      help="The main surface: the planking of a boat, the fabric of a wing."),
+    P("materials.trim", "Trim", "bark", kind="choice", group="materials",
+      kinds=("artifact",), choices=materials.ARTIFACT_NAMES,
+      help="Gunwale, end decks, thwarts and the seat -- the joinery that sits "
+           "on top of the main surface."),
+    P("materials.strake", "Contrast strake", "deadwood", kind="choice",
+      group="materials", kinds=("artifact",), choices=materials.ARTIFACT_NAMES,
+      help="The second planking colour, applied to the runs `strake_share` "
+           "selects. Keep it CLOSE to the hull colour: a boat is one object "
+           "made of one material weathered unevenly, not a striped one."),
+    P("materials.frame", "Frame", "beak_horn", kind="choice",
+      group="materials", kinds=("artifact",), choices=materials.ARTIFACT_NAMES,
+      help="Spars, tubes and struts."),
 )
 del P
 
@@ -2798,12 +3014,21 @@ def validate(spec: dict) -> tuple[dict, Report]:
             continue
         if path == "biome_allow" or path.startswith(("biome_allow.", "biome_rules")):
             continue
+        # And `category` rides the same way -- WHAT a species is, not a slider
+        # that draws it. See forge/categories.py for why it is deliberately not
+        # a PARAMS row: a row there puts a new key in all 830 canonical JSONs
+        # and re-identifies every species in the library.
+        if path in ("category", "subcategory"):
+            continue
         if path not in known:
             rep.warnings.append(f"ignored unknown parameter {path!r}")
 
     for p in PARAMS:
         raw = get(spec, p.path, _MISSING)
         if raw is _MISSING:
+            continue
+        if p.path == "resolution_cm":
+            set_(out,p.path,raw)
             continue
         try:
             val = _coerce(p, raw)
@@ -2866,6 +3091,27 @@ def validate(spec: dict) -> tuple[dict, Report]:
         cleaned = _clean_biome_rules(spec["biome_rules"], rep)
         if cleaned is not None:
             out["biome_rules"] = cleaned
+    # The category override, same rule: carried whole, cleaned, and ONLY when
+    # present. A spec that never authors one must come back byte for byte
+    # identical -- its category stays DERIVED from its kind, which is what
+    # every spec in the library means today (see forge.categories.of).
+    if "category" in spec:
+        out["category"] = catlib.clean(spec["category"], rep)
+    # The sub-category GROUPING (owner directive 2026-09-05), same rule again:
+    # carried whole, cleaned, only when present. It is a LABEL over an
+    # existing generator -- the spec's `kind` is still what draws the asset
+    # ("eels" is a grouping of kind `fish`, not a new generator) -- so like
+    # `category` it is a statement about what the thing IS and is excluded
+    # from both hashes: naming a group must not redraw or reseed anything.
+    if "subcategory" in spec:
+        cleaned = _clean_subcategory(spec["subcategory"], rep)
+        if cleaned is not None:
+            out["subcategory"] = cleaned
+    prior_pitch = get(out,"resolution_cm")
+    pitch = resolutionlib.normalize(out,prior_pitch)
+    if str(prior_pitch) != pitch and "resolution_cm" in spec:
+        rep.warnings.append(f"resolution_cm: {prior_pitch!r} changed to {pitch} cm under the supported pitch policy")
+    set_(out,"resolution_cm",pitch)
     # Cross-checks with the consequence named: these are the two ways an
     # authored block quietly does less than it reads as doing.
     if "biome_allow" in out:
@@ -2925,6 +3171,28 @@ def validate(spec: dict) -> tuple[dict, Report]:
 
 
 _MISSING = object()
+
+
+_SUBCATEGORY_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,39}$")
+
+
+def _clean_subcategory(raw, rep: "Report") -> "str | None":
+    """Validate an authored `subcategory` grouping label. None means drop it.
+
+    The label is a slug so it can live in filenames, query strings and menus
+    without escaping. Case is folded rather than refused; anything else warns
+    WITH THE CONSEQUENCE and drops -- the species then groups under its kind,
+    which is the default meaning of an absent label.
+    """
+    if isinstance(raw, str):
+        slug = raw.strip().lower()
+        if _SUBCATEGORY_RE.match(slug):
+            return slug
+    rep.warnings.append(
+        f"subcategory: {raw!r} is not a readable grouping label (lowercase "
+        f"letters, digits and dashes, up to 40 chars), so it is DROPPED and "
+        f"this species groups under its kind instead")
+    return None
 
 
 # --- curation ----------------------------------------------------------------
@@ -3152,6 +3420,99 @@ def canonical_json(spec: dict) -> str:
     return json.dumps(spec, sort_keys=True, separators=(",", ":"))
 
 
+# PARAMETERS THAT BELONG TO ONE KIND AND ARE HASHED ONLY ON SPECS OF THAT KIND.
+#
+# THE ARITHMETIC THIS EXISTS TO SURVIVE, which is the same arithmetic
+# `SEED_EXCLUDED` below is written against and worth stating once more here
+# because this device is stronger and therefore easier to misuse.
+# `validate` starts from `default_spec()`, so EVERY saved spec carries EVERY
+# parameter. Adding a row to `PARAMS` therefore puts a new key in all 828
+# specs' canonical JSON, and both hashes move for all of them: every species
+# becomes a different individual (`seed_hash`) AND a different library entry
+# whose banks `tools/enginecheck.py` will report as stale (`spec_hash`). The
+# README records what the first of those cost -- "every species in the library
+# moved to a different individual", which is how `hero-sequoia` landed on a
+# shedding seed.
+#
+# `SEED_EXCLUDED` handles that for one hash by deleting the key. This handles
+# it for BOTH, and scoped: a path listed under kind K is deleted from the hash
+# body of every spec whose kind is NOT K, and kept in full for the specs that
+# are. So a canoe's hull curves are part of its identity exactly as a fish's
+# body curves are part of a fish's, and the 828 specs that predate the row get
+# back the byte-for-byte body they hashed before it existed.
+#
+# WHY NOT DO THIS FOR EVERY KIND'S GROUP. Because it is not free and it is not
+# reversible: stripping `fish.*` from a tree would change that tree's bytes
+# TODAY, which is the reseed this whole mechanism exists to avoid. This is an
+# ADDITIVE-ONLY device. It removes keys that did not exist yesterday from the
+# specs that did, and it must only ever be extended at the moment a new
+# kind-scoped group is added, in the same commit, with
+# `tools/artifactprobe.py --hashes` (or `tools/trunkform.py --hashes`) showing
+# 828 of 828 unchanged on both hashes. A path added here LATER, after specs have
+# been baked against it, would silently re-identify them.
+KIND_SCOPED_PARAMS: dict[str, tuple[str, ...]] = {
+    "artifact": tuple(p.path for p in PARAMS if p.kinds == ("artifact",)),
+}
+
+
+def _drop_paths(body: dict, paths) -> dict:
+    """Remove dotted paths from a hash body, pruning containers left empty.
+
+    THE PRUNE IS NOT TIDINESS, IT IS THE WHOLE POINT. `{"artifact": {}}`
+    serialises as `"artifact":{}` and that is four bytes the library never
+    hashed. Dropping every key of a group without dropping the group would
+    reseed all 828 specs just as surely as not dropping anything -- and it
+    would do it while the code read as though it had handled the problem.
+    Nothing else needs the prune today: `trunk.taper` leaves eleven siblings
+    behind, which is exactly why it was never noticed.
+
+    Copies only if something is actually removed, so a spec that carries none
+    of these paths comes back as the identical object and the identical bytes.
+    """
+    todo = [path for path in paths if get(body, path, _MISSING) is not _MISSING]
+    if not todo:
+        return body
+    body = copy.deepcopy(body)
+    for path in todo:
+        keys = path.split(".")
+        chain = [body]
+        node = body
+        for key in keys[:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+            if not isinstance(node, dict):
+                break
+            chain.append(node)
+        if len(chain) != len(keys):
+            continue
+        chain[-1].pop(keys[-1], None)
+        # Walk back out, deleting any container this emptied.
+        for depth in range(len(chain) - 1, 0, -1):
+            if chain[depth]:
+                break
+            chain[depth - 1].pop(keys[depth - 1], None)
+    return body
+
+
+def _hash_body(spec: dict) -> dict:
+    """The part of a spec that decides what it IS.
+
+    `notes` is free text for a person. `curation` is a verdict ON the species,
+    `biome_allow`/`biome_rules` are placement metadata ON it, and `category`
+    and `subcategory` are CLASSIFICATIONS of it; every one of them would
+    re-bake banks whose voxels are unchanged, and the classifications would
+    additionally reseed the individual -- a statement about what a thing IS
+    must not redraw it. And the kind-scoped
+    rows of OTHER kinds are dropped per `KIND_SCOPED_PARAMS`.
+    """
+    body = {k: v for k, v in spec.items()
+            if k not in ("notes", "curation", "biome_allow", "biome_rules",
+                         "category", "subcategory")}
+    kind = body.get("kind")
+    foreign = [path for k, paths in KIND_SCOPED_PARAMS.items() if k != kind
+               for path in paths]
+    return _drop_paths(body, foreign)
+
+
 def spec_hash(spec: dict) -> str:
     """What this SPEC is. Library identity: two specs with this hash are the
     same authored species, and `notes` is left out because it is free text for
@@ -3177,9 +3538,8 @@ def spec_hash(spec: dict) -> str:
     these blocks are manifest input, and a stale species.vxm fails that check
     by name.
     """
-    body = {k: v for k, v in spec.items()
-            if k not in ("notes", "curation", "biome_allow", "biome_rules")}
-    return hashlib.blake2b(canonical_json(body).encode(), digest_size=8).hexdigest()
+    return hashlib.blake2b(
+        canonical_json(_hash_body(spec)).encode(), digest_size=8).hexdigest()
 
 
 # Fields a spec may carry that must NOT change which individual comes out.
@@ -3272,8 +3632,7 @@ def seed_hash(spec: dict) -> str:
     likewise: where a species may stand must not change WHICH individual
     stands there.
     """
-    body = {k: v for k, v in spec.items()
-            if k not in ("notes", "curation", "biome_allow", "biome_rules")}
+    body = _hash_body(spec)
     for path in SEED_INVARIANT:
         if get(body, path, _MISSING) is _MISSING:
             continue          # not carried: nothing to normalise, bytes unchanged
@@ -3282,18 +3641,7 @@ def seed_hash(spec: dict) -> str:
             continue          # already the default: bytes unchanged
         body = copy.deepcopy(body)
         set_(body, path, row.default)
-    for path in SEED_EXCLUDED:
-        if get(body, path, _MISSING) is _MISSING:
-            continue
-        body = copy.deepcopy(body)
-        parts = path.split(".")
-        cur = body
-        for key in parts[:-1]:
-            cur = cur.get(key) if isinstance(cur, dict) else None
-            if not isinstance(cur, dict):
-                break
-        if isinstance(cur, dict):
-            cur.pop(parts[-1], None)
+    body = _drop_paths(body, SEED_EXCLUDED)
     return hashlib.blake2b(canonical_json(body).encode(), digest_size=8).hexdigest()
 
 
@@ -3483,7 +3831,10 @@ def ui_schema(kind: str | None = None) -> list[dict]:
             "lo": p.lo,
             "hi": p.hi,
             "step": p.step,
-            "choices": list(p.choices),
+            "choices": list(resolutionlib.allowed({"kind":kind})) if p.path=="resolution_cm" and kind else list(p.choices),
+            **({"default_category":catlib.BY_KIND.get(kind or "tree"),
+                "choices_by_category":{c:list(resolutionlib.allowed({"kind":kind or "tree","category":c})) for c in ("environment","creature","craftable")}}
+               if p.path=="resolution_cm" else {}),
             "group": p.group,
             "help": p.help,
         }

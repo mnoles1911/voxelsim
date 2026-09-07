@@ -20,8 +20,10 @@ from typing import Any
 
 import numpy as np
 
-from . import (bird as birdlib, envelope, fish as fishlib, ground as groundlib,
-               materials, quadruped as quadlib, rasterize, rock as rocklib)
+from . import (artifact as artifactlib, bird as birdlib, envelope,
+               fish as fishlib, ground as groundlib, materials,
+               quadruped as quadlib, rasterize, rock as rocklib)
+from . import resolution as resolutionlib
 from . import parts as partslib
 from .grid import VoxelGrid, dense_bytes, ground_band
 from .skeleton import Skeleton, add_roots, add_strands, grow, grow_frond, grow_whorl
@@ -33,9 +35,15 @@ TUFT_KINDS = frozenset({"grass", "reed", "flower"})
 FISH_KINDS = frozenset({"fish", "cetacean"})
 BIRD_KINDS = frozenset({"bird"})
 QUAD_KINDS = frozenset({"quadruped"})
+# ENTITY kinds (ADR-0010): spawned objects with their own pitch and their own
+# transform. They are not composed into the world, they carry no biome weight
+# and they produce no bank -- see `forge/kinds.py` and
+# `forge/manifest.py:species_record`.
+ARTIFACT_KINDS = frozenset({"artifact"})
 # Kinds with no branch structure, so the branch-shaped stats and the checks
 # that read them do not apply.
-BRANCHLESS = BOULDER_KINDS | TUFT_KINDS | FISH_KINDS | BIRD_KINDS | QUAD_KINDS
+BRANCHLESS = (BOULDER_KINDS | TUFT_KINDS | FISH_KINDS | BIRD_KINDS
+              | QUAD_KINDS | ARTIFACT_KINDS)
 # Kinds that do not stand on the ground. A tree with nothing on its bottom slab
 # is floating and broken; a fish is SUPPOSED to be in mid-water and the check
 # would be a permanent false alarm on every one of them -- which is the fastest
@@ -48,7 +56,15 @@ SWIMS = FISH_KINDS
 # not the ground plane, so the check would fire on every one of the twenty
 # species and mean nothing on any of them.
 FLIES = BIRD_KINDS
-UNGROUNDED = SWIMS | FLIES
+# A CRAFT DOES NOT STAND ON THE GROUND PLANE EITHER: a canoe floats and a
+# glider flies, and what either of them rests on when it is not doing that is
+# whatever the spawner put it on. Worth being honest about what the exclusion is
+# worth, though, because it is worth almost nothing: `build` CROPS the grid, so
+# the bottom slab of any finished asset is occupied and the check passes for
+# everything either way. The measurement that actually matters for a hull is
+# `artifact.hollow_fraction` -- a solid block renders as a perfectly good canoe.
+RIDES = ARTIFACT_KINDS
+UNGROUNDED = SWIMS | FLIES | RIDES
 # A LAND ANIMAL IS DELIBERATELY NOT IN `UNGROUNDED`. It is the first asset here
 # after a tree that genuinely stands on the ground plane, so the floating check
 # applies to it and should.
@@ -101,7 +117,7 @@ class GridTooLarge(RuntimeError):
 
 def resolution_m(spec: dict, override=None) -> float:
     """Metres per voxel for this build. `override` wins, for coarse previews."""
-    cm = float(override) if override else float(get(spec, "resolution_cm"))
+    cm = resolutionlib.require(spec, override if override is not None else get(spec, "resolution_cm"))
     return cm / 100.0
 
 
@@ -348,9 +364,16 @@ def rng_for(spec: dict, seed: int) -> np.random.Generator:
 
 
 def build(spec: dict, seed: int, *, connectivity: bool = True,
-          resolution_cm=None) -> Tree:
+          resolution_cm=None, environment_lod_prototype: bool = False) -> Tree:
     t0 = time.perf_counter()
-    voxel_m = resolution_m(spec, resolution_cm)
+    if environment_lod_prototype:
+        # Offline experimental sources only. Production admission and the UI
+        # retain the terrain pitch contract; do not reclassify a tree as an item.
+        if spec.get('kind') not in ('tree', 'rock', 'bush', 'flower') or resolution_cm not in (2.5, 5):
+            raise ValueError('Environment LOD prototype requires an environment kind at 25 or 50 mm')
+        voxel_m = float(resolution_cm) / 100
+    else:
+        voxel_m = resolution_m(spec, resolution_cm)
     rng = rng_for(spec, seed)
 
     # Pick this individual out of the species before growing it, so two seeds
@@ -382,10 +405,11 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         gen = (rocklib if kind in BOULDER_KINDS
                else fishlib if kind in FISH_KINDS
                else birdlib if kind in BIRD_KINDS
-               else quadlib if kind in QUAD_KINDS else groundlib)
+               else quadlib if kind in QUAD_KINDS
+               else artifactlib if kind in ARTIFACT_KINDS else groundlib)
         gen_out: dict = {}
         grid = (gen.build(live, rng, voxel_m, out=gen_out)
-                if kind in FISH_KINDS or kind in BIRD_KINDS or kind in QUAD_KINDS
+                if kind in (FISH_KINDS | BIRD_KINDS | QUAD_KINDS | ARTIFACT_KINDS)
                 else gen.build(live, rng, voxel_m))
         parts = gen_out.get("tags")
         part_names = partslib.names() if parts is not None else None
@@ -395,6 +419,16 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
             orphans, airborne_kept = _single_piece(grid)
             # Rocks shatter at face-connectivity the same way crowns do --
             # hero-tor-stack was 35 face-pieces inside one 26-conn lump.
+            bridges = _bridge_corner_joins(grid)
+        elif kind in ARTIFACT_KINDS:
+            # A CRAFT IS BRIDGED AND NEVER PRUNED, and the difference from the
+            # rock branch above is deliberate. An A-frame meets a keel tube at
+            # an angle and a thwart meets a hull at the turn of the bilge; both
+            # are exactly the corner-only contact `_bridge_corner_joins` was
+            # written for, and both are load paths a person can see. Deleting
+            # the smaller side instead -- which is what `_drop_orphans` would do
+            # -- would silently ship a glider with no seat, and the render would
+            # look fine because the seat is under the wing.
             bridges = _bridge_corner_joins(grid)
         need_mb = dense_bytes(grid.shape) / 1e6
         t_raster = time.perf_counter()
@@ -477,8 +511,18 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         "ms_grow": round((t_grow - t0) * 1e3, 1),
         "ms_raster": round((t_raster - t_grow) * 1e3, 1),
     }
+    # PER-STEP VOXEL DELTAS, for the kinds whose generator reports them. This is
+    # the accounting that makes a silent no-op visible: `health` below turns a
+    # zero delta on a step that was asked to draw into a named problem, and the
+    # numbers themselves go into the library's meta.json so that "the gunwale
+    # got thinner" is a diff and not an argument.
+    if kind in ARTIFACT_KINDS:
+        stats["steps"] = gen_out.get("steps") or []
+        stats["silent_steps"] = gen_out.get("silent_steps") or []
+        stats["hollow_frac"] = round(artifactlib.hollow_fraction(grid), 4)
     if connectivity and (kind in TUFT_KINDS or kind in FISH_KINDS
-                         or kind in BIRD_KINDS or kind in QUAD_KINDS):
+                         or kind in BIRD_KINDS or kind in QUAD_KINDS
+                         or kind in ARTIFACT_KINDS):
         # Ground cover has no wood, but "is this one piece?" is exactly the
         # question that matters for it -- a tuft whose blades do not reach the
         # root crown is a handful of floating threads. A fish is the same
@@ -550,4 +594,19 @@ def health(tree: Asset) -> list[str]:
     if (kind not in BRANCHLESS
             and get(tree.spec, "foliage.enabled") and s["clumps"] == 0):
         problems.append("bald: foliage is on but no clump was placed")
+    # A STEP THAT RAN AND CHANGED NOTHING IS A PROBLEM, not a note. This is the
+    # house failure -- a pass that runs, reports success and draws nothing --
+    # and it is reported here rather than raised in the generator so that a spec
+    # being explored with sliders may be briefly nonsense while a spec being
+    # saved to the library may not, which is the rule the rest of this function
+    # already follows.
+    for line in s.get("silent_steps") or []:
+        problems.append(f"silent: {line}")
+    # AND A HULL THAT IS NOT HOLLOW IS THE SAME FAILURE WEARING THE SHAPE OF A
+    # BOAT. Every camera in this package draws a solid block of hull voxels as a
+    # perfectly good canoe; the only way to see it from outside is to count.
+    if (kind in ARTIFACT_KINDS
+            and get(tree.spec, "artifact.form") == "hull"
+            and float(s.get("hollow_frac") or 0.0) <= 0.0):
+        problems.append("solid: the hull enclosed no air -- nobody can sit in it")
     return problems

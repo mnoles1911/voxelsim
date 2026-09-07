@@ -8,6 +8,7 @@
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
 
+#include "HAL/IConsoleManager.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/Images/SImage.h"
@@ -17,6 +18,22 @@
 namespace SVoxelLoadingDetail
 {
 // Named namespace, not anonymous: see tools/lint-unity-collisions.py.
+
+// voxel.UI.LoadingFps -- the loading screen's top-right FPS / worst-frame
+// readout, REMOVED FROM THE DEFAULT SCREEN by owner directive (2026-09-05):
+// under the load theatre the screen is a show, and a frame-health figure in
+// its corner is stagecraft showing its rigging. The capability stays, behind
+// this flag, because it is still the cheapest way to see whether the
+// loading-screen streaming cap is actually protecting frame pacing -- the
+// same voxel.UI.* debug-flag shape as voxel.UI.HoverSlide. Read once per
+// show, at Construct: the screen is rebuilt every time it appears.
+int32 GLoadingFpsReadout = 0;
+FAutoConsoleVariableRef CVarLoadingFpsReadout(TEXT("voxel.UI.LoadingFps"),
+                                              GLoadingFpsReadout,
+                                              TEXT("1 shows the loading screen's top-right FPS / worst-ms readout. ")
+                                              TEXT("0 (default): absent -- the readout is a debug instrument now, ")
+                                              TEXT("not part of the screen."),
+                                              ECVF_Default);
 
 constexpr int32 kFrameSamples = 60;
 // The GDScript's threshold for tinting the worst-frame figure red. It is the
@@ -53,7 +70,12 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 
-	FrameTimesMs.SetNumZeroed(SVoxelLoadingDetail::kFrameSamples);
+	// The frame-sample ring exists only when the debug readout does.
+	bFpsReadoutEnabled = SVoxelLoadingDetail::GLoadingFpsReadout != 0;
+	if (bFpsReadoutEnabled)
+	{
+		FrameTimesMs.SetNumZeroed(SVoxelLoadingDetail::kFrameSamples);
+	}
 
 	const float HalfSep = L.LoadingSeparation * 0.5f;
 
@@ -151,13 +173,7 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.9f))
 		];
 
-	// The FPS readout's outline is part of the font, not the text block.
-	FSlateFontInfo FpsFont = Style.Serif(L.FpsFontSize);
-	FpsFont.OutlineSettings.OutlineSize = 4;
-	FpsFont.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 0.85f);
-
-	ChildSlot
-	[
+	TSharedRef<SOverlay> Root =
 		SNew(SOverlay)
 
 		// Crossfading background pair.
@@ -223,10 +239,19 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 					.ColorAndOpacity(FSlateColor(Tint(InkDim, 0.55f)))
 				]
 			]
-		]
+		];
 
-		// FPS readout, top-right.
-		+ SOverlay::Slot()
+	// FPS readout, top-right -- DEBUG-ONLY, absent by default, per the owner
+	// directive that removed it from the shipping screen. voxel.UI.LoadingFps
+	// puts it back; see the flag's comment at the top of this file.
+	if (bFpsReadoutEnabled)
+	{
+		// The readout's outline is part of the font, not the text block.
+		FSlateFontInfo FpsFont = Style.Serif(L.FpsFontSize);
+		FpsFont.OutlineSettings.OutlineSize = 4;
+		FpsFont.OutlineSettings.OutlineColor = FLinearColor(0.f, 0.f, 0.f, 0.85f);
+
+		Root->AddSlot()
 		.HAlign(HAlign_Right)
 		.VAlign(VAlign_Top)
 		.Padding(FMargin(0.f, 12.f, 12.f, 0.f))
@@ -238,7 +263,12 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			.ShadowOffset(FVector2D(1.f, 1.f))
 			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.7f))
 			.Justification(ETextJustify::Right)
-		]
+		];
+	}
+
+	ChildSlot
+	[
+		Root
 	];
 
 	OnShown();
@@ -343,29 +373,34 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 		TipCursor = TipOrder.Num() > 0 ? (TipCursor + 1) % TipOrder.Num() : 0;
 	}
 
-	// --- FPS readout --------------------------------------------------------
+	// --- FPS readout (debug-only; see GLoadingFpsReadout) -------------------
 	// Sampled from the REAL delta, not the clamped one: the entire point of
-	// this readout is to show how bad the frame time is.
-	FrameTimesMs[FrameCursor] = InDeltaTime * 1000.f;
-	FrameCursor = (FrameCursor + 1) % FrameTimesMs.Num();
-
-	FpsRefreshTimer += InDeltaTime;
-	if (FpsRefreshTimer >= L.FpsRefreshInterval)
+	// this readout is to show how bad the frame time is. When the readout is
+	// off -- the default -- the screen pays nothing here at all.
+	if (bFpsReadoutEnabled && FrameTimesMs.Num() > 0)
 	{
-		FpsRefreshTimer = 0.f;
-		float WorstMs = 0.f;
-		for (const float Sample : FrameTimesMs)
+		FrameTimesMs[FrameCursor] = InDeltaTime * 1000.f;
+		FrameCursor = (FrameCursor + 1) % FrameTimesMs.Num();
+
+		FpsRefreshTimer += InDeltaTime;
+		if (FpsRefreshTimer >= L.FpsRefreshInterval)
 		{
-			WorstMs = FMath::Max(WorstMs, Sample);
+			FpsRefreshTimer = 0.f;
+			float WorstMs = 0.f;
+			for (const float Sample : FrameTimesMs)
+			{
+				WorstMs = FMath::Max(WorstMs, Sample);
+			}
+			const int32 Fps = InDeltaTime > 0.f ? FMath::RoundToInt(1.f / InDeltaTime) : 0;
+			// Rebuilt only four times a second. An STextBlock re-lays-out its
+			// text whenever the string changes, and doing that every frame
+			// while the machine is already struggling is precisely the wrong
+			// time to pay for it -- the GDScript throttles this for the same
+			// reason.
+			CachedFpsText = FText::FromString(FString::Printf(TEXT("FPS: %d\nworst: %d ms"), Fps,
+			                                                  FMath::RoundToInt(WorstMs)));
+			bFpsWorstIsBad = WorstMs > SVoxelLoadingDetail::kWorstFrameBadMs;
 		}
-		const int32 Fps = InDeltaTime > 0.f ? FMath::RoundToInt(1.f / InDeltaTime) : 0;
-		// Rebuilt only four times a second. An STextBlock re-lays-out its text
-		// whenever the string changes, and doing that every frame while the
-		// machine is already struggling is precisely the wrong time to pay for
-		// it -- the GDScript throttles this for the same reason.
-		CachedFpsText = FText::FromString(FString::Printf(TEXT("FPS: %d\nworst: %d ms"), Fps,
-		                                                  FMath::RoundToInt(WorstMs)));
-		bFpsWorstIsBad = WorstMs > SVoxelLoadingDetail::kWorstFrameBadMs;
 	}
 }
 
@@ -393,6 +428,7 @@ float SVoxelLoadingScreen::GetBackgroundBOpacity() const
 
 FText SVoxelLoadingScreen::GetQuipText() const
 {
+	if (bLoadFailed) return FText::FromString(TEXT("This save could not be restored."));
 	const TArray<FText>& Quips = VoxelUIStrings::LoadingQuips();
 	if (QuipOrder.Num() == 0 || Quips.Num() == 0)
 	{
@@ -408,6 +444,7 @@ FSlateColor SVoxelLoadingScreen::GetQuipColour() const
 
 FText SVoxelLoadingScreen::GetTipText() const
 {
+	if (bLoadFailed) return FText::FromString(TEXT("Your checkpoint has been preserved. Restart the game before trying another save."));
 	const TArray<FText>& Tips = VoxelUIStrings::GameplayTips();
 	if (TipOrder.Num() == 0 || Tips.Num() == 0)
 	{
@@ -418,6 +455,7 @@ FText SVoxelLoadingScreen::GetTipText() const
 
 FText SVoxelLoadingScreen::GetPercentText() const
 {
+	if (bLoadFailed) return FText::FromString(TEXT("Load failed"));
 	// floor, not round: 99.6% should read 99%, because a bar that says 100%
 	// while the world is still landing is the specific lie this whole progress
 	// model exists to avoid.

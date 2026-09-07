@@ -242,7 +242,7 @@ public:
         out.reserve(sites.size());
         for (const AssetSite& s : sites) {
             if (terrainOnly && (size_t(s.layer) >= layers_.size() ||
-                                !layers_[s.layer].terrainLattice))
+                                !layers_[size_t(s.layer)].terrainLattice))
                 continue;
             const int64_t avx = floorDiv(s.anchorXMm, int64_t(kVoxelSizeMm));
             const int64_t avy = floorDiv(s.anchorYMm, int64_t(kVoxelSizeMm));
@@ -276,6 +276,9 @@ public:
         // per-layer mesher counters exist because an aggregate count hid a
         // whole missing layer); composition itself never reads it.
         uint8_t layer = 0;
+        // Preserve bank provenance for render ownership; these identifiers do
+        // not alter composition, collision or first-non-air ordering.
+        uint16_t bankId = 0, seedIndex = 0, speciesIndex = 0;
     };
 
     // Resolve every TERRAIN-LATTICE instance's grid once. Detail-lattice
@@ -304,6 +307,9 @@ public:
             r.anchorVz = inst.anchorVz;
             r.yawQuarter = inst.yawQuarter;
             r.layer = inst.layer;
+            r.bankId = inst.bankId;
+            r.seedIndex = inst.seedIndex;
+            r.speciesIndex = inst.speciesIndex;
             out.push_back(r);
         }
         return out;

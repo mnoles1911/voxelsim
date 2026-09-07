@@ -514,6 +514,87 @@ DEG2RAD = math.pi / 180.0
 WIND_VECTOR_PARAM = "WindVectorMS"
 WIND_VALID_PARAM = "WindFieldValid"
 
+# THE LIVE WAVE-SPEED KNOB (owner live-play verdict, 2026-09-05: "The surface
+# wave effects are moving way too fast still"). A multiplier on the time the
+# caller hands build_wave_field, applied INSIDE this module so both consumers
+# of the field -- M_WaterVoxel and M_Ocean -- slow together from one number;
+# two water surfaces meeting at a coastline on two different clock rates would
+# shear at the seam. Bound as an MPC parameter, not a material scalar, because
+# speed cannot be judged from stills: the owner turns the engine cvar
+# `voxel.Water.WaveTimeScale` live in his console (UVoxelWaterSubsystem pushes
+# it into this parameter every tick -- the CausticIntensity pattern), reports
+# the number he likes, and that number becomes the CVAR's default. The MPC
+# default stays 1.0 = neutral = today's speed.
+#
+# THE MAP, for the next "everything water moves too fast" report -- what this
+# knob does and does not scale, decided rather than discovered, and AMENDED
+# THE SAME DAY by a live finding:
+#   * SCALED (in time): every phase in the eight-octave field, its patch
+#     drift, and the breaking-foam ride (all derive from the one T input this
+#     multiplies), on both water surfaces, and the WPO displacement with them
+#     (one evaluation, two outputs -- the crest and the pixel slow together
+#     by construction).
+#   * GATED (in amplitude): the interactive RIPPLE field's contribution.
+#     This reverses the first revision of this map, which left the ripple
+#     entirely alone, and the owner found the gap within hours: "even value
+#     of 0 still leaves this very fast racing wave effect on the surface...
+#     Is there another knob?" At scale 0 the octave field is provably frozen
+#     (0 x T), and the graph inventory shows the ONLY other animated input
+#     either water has is RT_VoxelRippleField -- a texture whose CONTENT the
+#     C++ wave-equation sim redraws every frame. A consumer material cannot
+#     slow that (the motion is not in the graph), but it can GATE it: both
+#     waters multiply the sampled ripple gradient and height by this same
+#     parameter (via the `time_scale` node build_wave_field returns), so
+#     scale 0 is a provably STILL surface -- which is what an owner reaching
+#     for the one wave knob means by 0. Honest limitation: intermediate
+#     values scale the ripple's HEIGHT, not its speed; the ripple's
+#     propagation cadence is the sim's c*dt and its true speed knob is
+#     engine-side (the ripple subsystem's step rate), flagged there rather
+#     than faked here.
+#   * NOT SCALED, still: the CAUSTIC pan -- it has its own CausticSpeed
+#     material parameter (water_caustics_graph), because caustic flicker
+#     rate is a separate perceptual quantity from swell speed and the owner
+#     may want them tuned apart.
+WAVE_TIME_SCALE_PARAM = "WaveTimeScale"
+
+# Phase F2's MPC gain (docs/water-ocean-tides-plan-2026-09-04.md): the global
+# whitecap strength, pushed each tick by UVoxelWaterSubsystem from the float
+# cvar `voxel.Water.FoamV2` -- the CausticIntensity/WaveTimeScale pattern.
+# Bound by build_whitecap_foam below through the CHECKED collection_param, so
+# a collection older than create_sky_material.py's 2026-09-05 late block makes
+# both water generators raise by name at authoring rather than compile the
+# whitecaps to a silent constant.
+FOAM_V2_PARAM = "FoamV2Gain"
+
+# build_whitecap_foam's own table, SEPARATE from DEFAULTS/LEGACY_RECIPE on
+# purpose: those two are the WAVE RECIPE (the five-value legacy flip swaps
+# between them), and the whitecap thresholds are not part of the field --
+# flipping the legacy arm must not silently move the foam tuning.
+FOAM_V2_DEFAULTS = {
+    # |grad H| where whitecaps begin / where coverage saturates. The field's
+    # slope at the 5 m/s reference wind peaks around 0.10-0.15; a 0.08 onset
+    # puts caps on the steepest crests only, and deep-water waves physically
+    # whitecap from steepness ~0.1 (well below the 0.30-0.44 Stokes limit --
+    # visible caps come from micro-breaking, not the limiting wave). Both are
+    # material parameters: the owner's foam ladder is instance overrides.
+    "FoamV2SlopeThresh": 0.08,
+    "FoamV2SlopeFull": 0.16,
+    # Wind-speed coverage window, m/s at the U10 reference the whole module
+    # is calibrated against, applied to SUSTAINED + GUST since F8.2 (the
+    # gust channel is additive m/s -- see build_whitecap_foam's docstring).
+    # 3 m/s is Beaufort 3/4's "scattered whitecaps begin"; 9 m/s is Beaufort
+    # 5's "many". THE CALM ARM IS THIS RAMP: calm weather publishes both
+    # sustained ~0 AND gust ~0, so coverage is exactly 0 and the calm
+    # control pose shows ZERO whitecaps whatever the slopes do. Note the
+    # MATERIAL-FALLBACK wind is 5 m/s (build_wind_input) -- a fallback build
+    # is deliberately NOT the calm arm; calm is published through the MPC.
+    "FoamV2WindMinMS": 3.0,
+    "FoamV2WindFullMS": 9.0,
+    # The material-side kill switch, default ON; the runtime OFF authority is
+    # the MPC gain the cvar drives. Zeroing either is a pixel-identical off.
+    "FoamV2Enabled": 1.0,
+}
+
 # Number of octaves. NOT a parameter: it is the loop bound in the HLSL, the
 # length of the spread table, and the thing the 1.42 frequency ratio was chosen
 # against (eight octaves from a 5 m base end at 0.43 m, which is still four
@@ -616,6 +697,25 @@ DEFAULTS = {
     "WindPatchDriftFrac": 0.5,
     "WindFallbackSpeedMS": 5.0,
     "WindFallbackDirDeg": 238.7,
+    # F8.1: the width of the direction bins the PHASE is allowed to see (the
+    # racing-surface fix -- the whole argument is in the HLSL's steering
+    # comment). Self-snapped in the shader to an integer bin count, so 30 =
+    # 12 bins exactly. Wider bins = rarer, more theatrical reorganisations;
+    # narrower = subtler and more frequent. At WindDirectionAuthority 0 the
+    # direction bins collapse to one angle.
+    "WindDirBinDeg": 30.0,
+    # F8.1 SECOND HALF (owner: "still racing with WaveTimeScale both on 0
+    # and 1"): the width of the SPEED bins the WAVELENGTH is allowed to see,
+    # in log2 of u = speed/reference. Continuous speed reached the phase
+    # through lambda0 (freq = 2pi/lambda multiplies dot(d, pos): the same
+    # |pos| lever arm the direction bins killed) and through omega0 (which
+    # multiplies unbounded T). 0.5 = a x1.41 speed step per bin = a x1.27
+    # wavelength step at the shipped 0.68 exponent, crossfaded. AMPLITUDE
+    # stays fully continuous -- it never touches a phase. At the reference
+    # speed (u = 1, which is also the legacy fallback arm's operating point)
+    # the bin boundary lands exactly on log2(1) = 0 with a flat smoothstep
+    # end, so the shipped wavelength is reproduced exactly there.
+    "WindSpeedBinLog2": 0.5,
     # --- the shore band, shared by damping and breaking -------------------
     "BreakSurfFloorM": 0.15,
     "BreakDepthRatio": 1.28,
@@ -624,6 +724,16 @@ DEFAULTS = {
     "BreakMinWaveHeightM": 0.05,
     "BreakPeakGain": 0.6,
     "BreakFoamGain": 1.0,
+    # --- the WPO distance fade (ocean/tides plan B2) ----------------------
+    #
+    # NOT a look setting. See build_wpo_distance_fade below: these two numbers
+    # are what stops the tessellated lake sheet tearing open along every LOD
+    # boundary, because there is no stitching and there is not going to be.
+    # 55 -> 72 m is strictly inside both the finest sheet band and the 80 m
+    # tessellation disc, so the displacement has already reached exactly zero
+    # before the geometry that carries it changes resolution.
+    "WaveWpoFadeStartM": 55.0,
+    "WaveWpoFadeEndM": 72.0,
 }
 
 
@@ -745,82 +855,181 @@ float  u         = windSpeed / max(WindRefSpeedMS, 0.1);
 // reference speed, which is what makes the shipped field reproducible.
 //
 // The amplitude term reads u directly, so wind 0 gives amplitude EXACTLY 0 --
-// dead calm, with the breaking term gated to zero by the same value. The
-// wavelength term reads max(u, 0.2) instead, because a wavelength that
-// collapses toward zero would send the octave frequencies to infinity long
-// before the amplitude reached zero, and a field of infinite frequency at zero
-// amplitude is a field of NaNs waiting for a rounding error.
+// dead calm, with the breaking term gated to zero by the same value.
+// AMPLITUDE STAYS FULLY CONTINUOUS: it multiplies the field AFTER evaluation
+// and never touches a phase, so a drifting speed cannot slide anything
+// through it (F8.1's second lesson, below).
 float  ampScale = pow(max(u, 0.0), max(WindAmpExponent, 0.01));
-float  lenScale = pow(max(u, 0.2), max(WindLenExponent, 0.0));
-float  lambda0  = max(BaseWavelengthM * lenScale, 0.15);
 
-// Deep-water dispersion, omega = sqrt(g k): a longer wave oscillates slower but
-// its crests travel faster. 2.0 is the shipped base time multiplier, and the
-// sqrt is exactly 1.0 at the reference speed.
-float  omega0 = 2.0 * sqrt(BaseWavelengthM / max(lambda0, 1.0e-4));
+// --- WIND: THE WAVELENGTH, THROUGH SPEED BINS (F8.1 second half) --------
+// The direction fix below was not enough, and the owner found the gap in one
+// session: "still racing with WaveTimeScale both on 0 and 1", weather on.
+// The survivor was this block's own wavelength: lambda0 = Base * u^LenExp
+// with CONTINUOUS u sets freq = 2pi/lambda0, which multiplies dot(d, pos) --
+// the SAME |pos| lever arm the direction bins killed, re-opened through the
+// speed channel (and omega0 = f(lambda0) multiplies T, an arm that grows
+// with uptime). So the WAVELENGTH-SETTING speed is binned exactly as the
+// direction is: log2 bins (uniform wavelength RATIOS -- each bin is a x1.41
+// speed step, a x1.27 wavelength step at the shipped 0.68 exponent), floor +
+// frac + smoothstep weight, and the field evaluated at the two neighbouring
+// bins' wavelengths and crossfaded. Combined with the two direction bins
+// that makes FOUR octave-loop evaluations blended bilinearly -- the honest
+// price of killing both lever arms without state; the two crossfade weights
+// are independent lerps. max(u, 0.2) first, as before, so the frequencies
+// cannot run away at calm -- and at calm the bin index is CONSTANT, so a
+// still morning pays no crossfade churn.
+//
+// PERCEPTUALLY: a strengthening wind now re-organises to longer swell in
+// discrete, minutes-scale crossfaded steps instead of stretching
+// continuously -- which is what a sea looks like to an observer anyway (a
+// new, longer train grows through the old one; nothing about a real sea
+// reads as a smooth zoom).
+float  ue   = max(u, 0.2);
+float  sBinW = max(SpeedBinLog2, 0.01);
+float  aSpd = log2(ue) / sBinW;
+float  jSpd = floor(aSpd);
+float  wSpd = smoothstep(0.0, 1.0, frac(aSpd));
+float  lenExpEff = max(WindLenExponent, 0.0);
 
-// --- WIND: STEERING -----------------------------------------------------
-// atan2(-w.x, -w.y) and not atan2(w.x, w.y). `ang` names the wavefront's UPWIND
-// normal, because the loop below writes `+ T * tmul`, which makes crests travel
-// along -d. Negating here puts travel on +windDir, i.e. downwind. This is the
-// classic 180-degree bug and it is the reason the sign is spelled out.
-float  upwindAng = atan2(-windDir.x, -windDir.y);
-float  baseAng   = radians(DirBaseDeg);
-// Unwrap before blending, so a wind turning through the 359->1 degree boundary
-// does not swing the field the long way round at intermediate authorities.
-float  dA = upwindAng - baseAng;
-dA -= 6.2831853 * round(dA * 0.15915494);
-baseAng += WindDirAuthority * dA;
+// --- WIND: STEERING, THROUGH DIRECTION BINS (F8.1, 2026-09-05) ----------
+// atan2(-w.x, -w.y) and not atan2(w.x, w.y). The angle names the wavefront's
+// UPWIND normal, because the loop below writes `+ T * tmul`, which makes
+// crests travel along -d. Negating here puts travel on +windDir, i.e.
+// downwind. This is the classic 180-degree bug and the sign is spelled out.
+//
+// WHY THE DIRECTION IS QUANTISED BEFORE IT TOUCHES PHASE -- the racing-
+// surface bug (plan F8.1). Phase is dot(d, pos) with pos ABSOLUTE, so a
+// continuously rotating d sweeps phase at |pos| x dTheta/dt: at 60 km from
+// the origin an imperceptible synoptic drift of 0.06 deg/s slides the whole
+// pattern by tens of metres per second, everywhere, immune to WaveTimeScale
+// by construction (it multiplies T, and this term is not in T). The fix
+// kills the lever arm: the phase NEVER sees the continuous direction. It
+// sees the two nearest DIRECTION BINS -- both constants while the wind
+// wanders inside a bin -- and the field is evaluated once per bin and
+// crossfaded by where the true direction sits between them. Each evaluated
+// train has a frozen direction, so there is nothing for |pos| to amplify;
+// a turning wind reads as one train fading while its neighbour (one bin
+// over) fades in -- a sea REORGANISING, which is also what a real turning
+// sea does (the old swell decays while the new wind sea grows).
+//
+// smoothstep ON THE BLEND WEIGHT is the stateless stand-in for hysteresis:
+// its zero-derivative ends sit exactly ON the bin directions, so wind
+// jitter around a bin direction moves the picture almost not at all, and
+// the fastest crossfade rate is bounded by dTheta/dt / binW -- position-
+// independent, minutes-scale at synoptic rates. (True hysteresis needs
+// state a material does not have; if jitter at bin EDGES ever shows, the
+// engine-side direction tau the plan names is the stateful half.)
+//
+// The bin width self-snaps to an integer bin count so the frac() below is
+// continuous across the atan2 wrap -- a DirBinDeg that does not divide 360
+// would otherwise put a permanent seam on one compass heading.
+float upwindAng = atan2(-windDir.x, -windDir.y);
+float nBins = max(round(360.0 / max(DirBinDeg, 1.0)), 3.0);
+float binW  = 6.2831853 / nBins;
+float aBin  = upwindAng / binW;
+float kBin  = floor(aBin);
+float wBin  = smoothstep(0.0, 1.0, frac(aBin));
 
+float  baseRef   = radians(DirBaseDeg);
 float  spreadRad = radians(WindSpreadDeg);
 float  dIncRad   = radians(DirIncrementDeg);
 
-float2 pos    = p;
-float  freq   = 6.2831853 / lambda0;
-float  tmul   = omega0;
-float  weight = 1.0;
-float  sumH   = 0.0;
-float  sumW   = 0.0;
-float2 sumD   = float2(0.0, 0.0);
+float  H4[2][2];
+float2 G4[2][2];
+float  patch2[2];
 
 [unroll]
-for (int i = 0; i < %(octaves)d; ++i)
+for (int bin = 0; bin < 2; ++bin)
 {
-    // Authority 0: the shipped whole-circle golden-angle placement, exactly.
-    // Authority 1: a directional cone about the wind, narrow at the peak octave
-    // and broad in the tail.
-    float  ang = baseAng + lerp(dIncRad * i, spreadRad * SPREAD_SHAPE[i], WindDirAuthority);
-    float2 d = float2(sin(ang), cos(ang));
-    float  x = dot(d, pos) * freq + T * tmul;
-    float  wv  = exp(sin(x) - 1.0) * 0.5;
-    float  dwv = wv * cos(x);
+    // This bin's upwind angle -- a CONSTANT until the wind leaves the bin
+    // pair. Unwrap before blending toward it, so a wind turning through the
+    // 359->1 degree boundary does not swing the field the long way round at
+    // intermediate authorities. At WindDirAuthority 0 both direction bins
+    // collapse to the same baseAng and their evaluations are identical: the
+    // legacy recipe's field is reproduced in VALUE exactly (at four times
+    // the cost -- the price of an unrolled shader with no branch and no
+    // state).
+    float upA = (kBin + bin) * binW;
+    float dA = upA - baseRef;
+    dA -= 6.2831853 * round(dA * 0.15915494);
+    float baseAng = baseRef + WindDirAuthority * dA;
 
-    // Drag: this octave warps the sample position seen by the next one.
-    pos += d * (-dwv) * weight * DRAG_MULT;
+    [unroll]
+    for (int sb = 0; sb < 2; ++sb)
+    {
+        // THIS SPEED BIN's wavelength and dispersion -- constants until the
+        // wind speed leaves the bin pair. pow(2^x, e) = 2^(x*e), so the
+        // binned lenScale is one exp2. omega0 is derived from the BINNED
+        // lambda, which is what keeps dispersion consistent with the
+        // wavelength inside a bin: phase is frozen there by construction.
+        float lenScaleB = exp2((jSpd + sb) * sBinW * lenExpEff);
+        float lambda0B  = max(BaseWavelengthM * lenScaleB, 0.15);
+        float omega0B   = 2.0 * sqrt(BaseWavelengthM / max(lambda0B, 1.0e-4));
 
-    sumH += wv * weight;
-    sumD += d * (dwv * freq * weight);
-    sumW += weight;
+        float2 pos    = p;
+        float  freq   = 6.2831853 / lambda0B;
+        float  tmul   = omega0B;
+        float  weight = 1.0;
+        float  sumH   = 0.0;
+        float  sumW   = 0.0;
+        float2 sumD   = float2(0.0, 0.0);
 
-    weight *= 0.8;      // lerp(weight, 0, 0.2)
-    freq   *= 1.42;     // non-commensurate on purpose
-    tmul   *= 1.07;     // NOT the dispersion-correct 1.19; see the docstring
+        [unroll]
+        for (int i = 0; i < %(octaves)d; ++i)
+        {
+            // Authority 0: the shipped whole-circle golden-angle placement,
+            // exactly. Authority 1: a directional cone about the wind,
+            // narrow at the peak octave and broad in the tail.
+            float  ang = baseAng + lerp(dIncRad * i, spreadRad * SPREAD_SHAPE[i], WindDirAuthority);
+            float2 d = float2(sin(ang), cos(ang));
+            float  x = dot(d, pos) * freq + T * tmul;
+            float  wv  = exp(sin(x) - 1.0) * 0.5;
+            float  dwv = wv * cos(x);
+
+            // Drag: this octave warps the sample position seen by the next.
+            pos += d * (-dwv) * weight * DRAG_MULT;
+
+            sumH += wv * weight;
+            sumD += d * (dwv * freq * weight);
+            sumW += weight;
+
+            weight *= 0.8;      // lerp(weight, 0, 0.2)
+            freq   *= 1.42;     // non-commensurate on purpose
+            tmul   *= 1.07;     // NOT the dispersion-correct 1.19; see docstring
+        }
+
+        float invW = 1.0 / max(sumW, 1e-6);
+        H4[bin][sb] = (sumH * invW) - MEAN_WAVE;
+        G4[bin][sb] = sumD * invW;
+    }
+
+    // --- CALM AND CHOPPY PATCHES, BLOWN DOWNWIND OF THIS BIN --------------
+    // The two diagonal sines at ~180 m and ~232 m are the shipped field's,
+    // verbatim. Advection uses THIS BIN's frozen direction and the REFERENCE
+    // speed -- both lever-arm-free, and neither depends on the speed bin, so
+    // the patches stay two evaluations, not four. The old
+    // `windDir * (windSpeed * T * ...)` term multiplied the CONTINUOUS
+    // direction and the live speed by a T that grows without bound; a
+    // material cannot integrate the wind's history (v*t is only a path when
+    // v never changes), so the honest stateless drift is a constant rate
+    // along a binned direction. Gated by WindDirAuthority so the regression
+    // recipe reproduces the shipped breathing-in-place patches exactly.
+    float2 pp = p + float2(sin(upA), cos(upA)) * (WindRefSpeedMS * T * WindPatchDrift * WindDirAuthority);
+    float lfa = sin(dot(pp, float2( 0.0349,  0.0217)) + T * 0.031);
+    float lfb = sin(dot(pp, float2(-0.0161,  0.0271)) + T * 0.0193);
+    patch2[bin] = saturate(0.5 + 0.35 * lfa + 0.35 * lfb);
 }
 
-float  invW = 1.0 / max(sumW, 1e-6);
-float  H = (sumH * invW) - MEAN_WAVE;
-float2 G = sumD * invW;
-
-// --- CALM AND CHOPPY PATCHES, NOW BLOWN DOWNWIND ------------------------
-// The two diagonal sines at ~180 m and ~232 m are the shipped field's, verbatim.
-// What is new is that the sample position is advected by the wind, so gust cells
-// drift instead of merely breathing in place. Gated by WindDirAuthority so the
-// regression recipe reproduces the shipped patch field exactly.
-float2 pp = p - windDir * (windSpeed * T * WindPatchDrift * WindDirAuthority);
-float lfa = sin(dot(pp, float2( 0.0349,  0.0217)) + T * 0.031);
-float lfb = sin(dot(pp, float2(-0.0161,  0.0271)) + T * 0.0193);
-float patch = saturate(0.5 + 0.35 * lfa + 0.35 * lfb);
-float amp = AmplitudeM * ampScale * lerp(1.0 - PatchContrast, 1.0 + PatchContrast, patch);
+// The bilinear crossfade: the two weights are independent lerps (direction
+// and speed can each be mid-transition without touching the other). At any
+// bin handover (kBin or jSpd steps by one) the surviving corner is the same
+// (angle, wavelength) pair it was on the other side of the step, so the
+// surface is CONTINUOUS through every handover by construction; nothing
+// teleports.
+float  H = lerp(lerp(H4[0][0], H4[0][1], wSpd), lerp(H4[1][0], H4[1][1], wSpd), wBin);
+float2 G = lerp(lerp(G4[0][0], G4[0][1], wSpd), lerp(G4[1][0], G4[1][1], wSpd), wBin);
+float  patch = lerp(patch2[0], patch2[1], wBin);
+float  amp = AmplitudeM * ampScale * lerp(1.0 - PatchContrast, 1.0 + PatchContrast, patch);
 
 // --- TWO NESTED DEPTH BANDS ---------------------------------------------
 // Hs is the OFFSHORE significant wave height: what the wave would be if the bed
@@ -892,7 +1101,8 @@ WAVE_INPUTS = [
     "AmplitudeM", "BaseWavelengthM", "DirBaseDeg", "DirIncrementDeg",
     "QuantPerVoxel", "PatchContrast",
     "WindVecMS", "WindDirAuthority", "WindSpreadDeg", "WindRefSpeedMS",
-    "WindAmpExponent", "WindLenExponent", "WindPatchDrift",
+    "WindAmpExponent", "WindLenExponent", "WindPatchDrift", "DirBinDeg",
+    "SpeedBinLog2",
     "DepthM", "Validity", "SurfFloorM",
     "BreakDepthRatio", "ShoalGain", "CrestThreshold", "MinWaveHeightM",
     "PeakGain", "FoamGain",
@@ -1029,6 +1239,10 @@ def build_wave_field(b, pos_m, time_expr, bathy, defaults=None, log=None):
                  (create_water_voxel_material.py:503-533): freezing that one
                  node still provably freezes every animated term on the surface,
                  including the breaking foam, which now also rides it.
+                 MULTIPLIED BY MPC WaveTimeScale before it enters the field
+                 (see WAVE_TIME_SCALE_PARAM at the top) -- the scale applies
+                 to whatever drives the pin, so the freeze arm still freezes
+                 (0 x scale = 0) and the live knob still slows a live clock.
       bathy      the dict from bathy_field_graph.sample_bathy_field(b). Read for
                  `depth_m` and `validity` ONLY -- the shoreline foam's use of
                  `shore_m` is a different effect and stays where it is.
@@ -1058,6 +1272,17 @@ def build_wave_field(b, pos_m, time_expr, bathy, defaults=None, log=None):
 
     wind, wind_source = build_wind_input(b, defaults=d, log=log)
 
+    # The live speed knob (WAVE_TIME_SCALE_PARAM at the top carries the whole
+    # argument). b.collection_param is the CHECKED binding, so a collection
+    # older than the 2026-09-05 sky table raises here by name rather than
+    # compiling the scale to a constant -- and the fix it names (re-run
+    # create_sky_material.py, then the chain) is the same full-chain regen the
+    # CausticIntensity addition already forces. The NODE is kept and returned
+    # (`time_scale` below) so consumers can gate their ripple contribution by
+    # the same binding rather than making a second one.
+    time_scale = b.collection_param(WAVE_TIME_SCALE_PARAM)
+    time_scaled = b.mul(time_expr, time_scale)
+
     node = _custom_node(b, "WaveField", wave_code(), WAVE_INPUTS,
                         unreal.CustomMaterialOutputType.CMOT_FLOAT4)
 
@@ -1066,7 +1291,7 @@ def build_wave_field(b, pos_m, time_expr, bathy, defaults=None, log=None):
     # fastest way to find the one cause these ever have (a name).
     wiring = [
         ("PosM", pos_m),
-        ("T", time_expr),
+        ("T", time_scaled),
         # --- the shipped field's knobs, unchanged in name, default and meaning
         ("AmplitudeM", b.scalar("WaveAmplitudeM", d["WaveAmplitudeM"])),
         ("BaseWavelengthM", b.scalar("WaveBaseWavelengthM", d["WaveBaseWavelengthM"])),
@@ -1094,6 +1319,11 @@ def build_wave_field(b, pos_m, time_expr, bathy, defaults=None, log=None):
         ("WindAmpExponent", b.scalar("WindAmpExponent", d["WindAmpExponent"])),
         ("WindLenExponent", b.scalar("WindLenExponent", d["WindLenExponent"])),
         ("WindPatchDrift", b.scalar("WindPatchDriftFrac", d["WindPatchDriftFrac"])),
+        # F8.1's two knobs: the direction-bin and speed-bin widths the phase
+        # sees. See the HLSL steering and wavelength comments for the two
+        # lever-arm mechanisms they kill.
+        ("DirBinDeg", b.scalar("WindDirBinDeg", d["WindDirBinDeg"])),
+        ("SpeedBinLog2", b.scalar("WindSpeedBinLog2", d["WindSpeedBinLog2"])),
         # --- the shore band
         ("DepthM", bathy["depth_m"]),
         ("Validity", bathy["validity"]),
@@ -1144,6 +1374,13 @@ def build_wave_field(b, pos_m, time_expr, bathy, defaults=None, log=None):
     for pin, src in wiring:
         b.link(src, "", node, pin)
 
+    # The CPU mirror's staleness anchor (see write_cpu_mirror_header at the
+    # bottom of this file): an unconnected scalar parameter whose DEFAULT is
+    # the mirror fingerprint, queryable off the saved asset, so C++ can refuse
+    # to bob boats on a header built from different field math. Unconnected on
+    # purpose -- it is a version stamp, not a shader input.
+    b.scalar("WaveMirrorFingerprint", float(mirror_fingerprint()))
+
     return {
         "node": node,
         "gradient": b.mask(node, "", r=True, g=True),
@@ -1151,7 +1388,233 @@ def build_wave_field(b, pos_m, time_expr, bathy, defaults=None, log=None):
         "breaking": b.mask(node, "", a=True),
         "wind": wind,
         "wind_source": wind_source,
+        # The WaveTimeScale CollectionParameter node itself, so a consumer can
+        # gate its RIPPLE contribution by the same binding (see the owner
+        # finding at WAVE_TIME_SCALE_PARAM) without binding the name twice.
+        "time_scale": time_scale,
     }
+
+
+def build_whitecap_foam(b, wave, defaults=None, log=None):
+    """Phase F2: crest/energy whitecap coverage, 0..1, from the field's OWN
+    slopes. Returns a dict of expressions.
+
+    REUSE, NOT A SECOND FIELD -- the plan's own words. `wave` is the dict
+    build_wave_field returned; this reads its `gradient` (the summed dH/dx,
+    dH/dy of all eight octaves -- the total crest steepness, already computed
+    for the normal) and its `wind` (the float2 velocity, already resolved
+    through the MPC/fallback arbitration). Nothing here evaluates an octave,
+    so the whitecaps provably sit on the same crests the surface shows: a cap
+    is drawn exactly where the normal says the surface is steepest.
+
+    WHAT IT COMPUTES:
+
+        crest    = saturate((|gradient| - SlopeThresh) / (SlopeFull - SlopeThresh))
+        coverage = saturate((|sustained| + gust - WindMinMS) / (WindFullMS - WindMinMS))
+        whitecap = crest * coverage * FoamV2Gain(MPC) * FoamV2Enabled
+
+    SUSTAINED + GUST (F8.2). The coverage reads the UNSMOOTHED gust channel on
+    top of the smoothed sustained speed: WindVectorMS.B, a magnitude in m/s
+    riding on the sustained wind, published by UVoxelWeatherSubsystem
+    explicitly "for spray and foam, which SHOULD twitch, and nothing reads it
+    yet" (VoxelWeatherSubsystem.h:62-64 -- additive m/s, NOT a multiplier,
+    and deliberately not derivable from the velocity). This is the division
+    of labour the weather subsystem designed for: the WAVE FIELD keeps the
+    smoothed sustained velocity only (a sea's size has hours of inertia; a
+    gust does not raise swell), while the whitecaps -- the thing that
+    genuinely flickers with gusts -- take the twitchy channel. The gust is
+    gated by WindFieldValid, so the material-fallback arm (no weather
+    publishing) sees gust 0 and its coverage is sustained-only -- and, like
+    build_wind_input, a collection with no wind parameters degrades LOUDLY
+    to sustained-only rather than refusing to build.
+
+    CREST x COVERAGE IS A PRODUCT, NOT A MAX, and that is the physics: wind
+    speed sets how MANY crests carry caps (Beaufort's whole scale is coverage
+    fractions), steepness sets WHERE on a crest a cap sits. A max would paint
+    caps on a glassy swell the moment the wind picked up, before the sea had
+    steepened to carry them.
+
+    THE CALM-WIND ARM SHOWS ZERO WHITECAPS BY CONSTRUCTION: published wind at
+    zero puts coverage at exactly 0 (see FOAM_V2_DEFAULTS' note -- and note
+    the 5 m/s material-fallback build is not the calm arm). The shore break
+    (`breaking`) and the lake's shoreline/CA foams are UNTOUCHED -- consumers
+    max this in as a fifth independent signal, per the lake's own
+    max-not-add doctrine at its foam composite.
+
+    Both controls are pixel-identical offs: FoamV2Enabled (material scalar,
+    per-consumer) and the MPC FoamV2Gain the `voxel.Water.FoamV2` cvar
+    drives (global, both waters at once).
+    """
+    d = dict(FOAM_V2_DEFAULTS)
+    if defaults:
+        d.update(defaults)
+
+    slope2 = b.binary(unreal.MaterialExpressionDotProduct,
+                      wave["gradient"], "", wave["gradient"], "")
+    slope = b.unary(unreal.MaterialExpressionSquareRoot, slope2)
+    crest = b.ramp(slope, "",
+                   b.scalar("FoamV2SlopeThresh", d["FoamV2SlopeThresh"]),
+                   b.scalar("FoamV2SlopeFull", d["FoamV2SlopeFull"]))
+
+    speed2 = b.binary(unreal.MaterialExpressionDotProduct,
+                      wave["wind"], "", wave["wind"], "")
+    speed = b.unary(unreal.MaterialExpressionSquareRoot, speed2)
+
+    # F8.2: + the unsmoothed gust (WindVectorMS.B, m/s, additive -- see the
+    # docstring). Gated by WindFieldValid so an undriven collection
+    # contributes exactly nothing, and probed rather than demanded for the
+    # same scheduling reason build_wind_input probes: a collection with no
+    # wind parameters builds sustained-only foam, loudly, instead of taking
+    # both water generators down with a feature the weather half owns.
+    names = b.mpc_names()
+    if WIND_VECTOR_PARAM in names and WIND_VALID_PARAM in names:
+        gust = b.mul(
+            b.mask(b.collection_param(WIND_VECTOR_PARAM), "", b=True),
+            b.collection_param(WIND_VALID_PARAM))
+        speed_eff = b.add(speed, gust)
+    else:
+        (log or print)(
+            "[water_wave_graph] MPC_VoxelSky has no %s / %s -- building whitecap "
+            "coverage on the SUSTAINED speed only (no gust twitch). This is the "
+            "expected state until the weather parameters are on the collection; "
+            "the wave field's own wind fallback note applies here identically."
+            % (WIND_VECTOR_PARAM, WIND_VALID_PARAM))
+        speed_eff = speed
+
+    coverage = b.ramp(speed_eff, "",
+                      b.scalar("FoamV2WindMinMS", d["FoamV2WindMinMS"]),
+                      b.scalar("FoamV2WindFullMS", d["FoamV2WindFullMS"]))
+
+    whitecap = b.mul(
+        b.mul(b.mul(crest, coverage), b.collection_param(FOAM_V2_PARAM)),
+        b.scalar("FoamV2Enabled", d["FoamV2Enabled"]))
+
+    return {
+        "whitecap": whitecap,
+        "crest": crest,
+        "coverage": coverage,
+    }
+
+
+def build_wpo_distance_fade(b, pos_m, defaults=None):
+    """The distance weight the VERTEX DISPLACEMENT is multiplied by. 1 near, 0 far.
+
+    Returns one scalar expression:
+
+        1 - saturate((|pos - camera| - WaveWpoFadeStartM)
+                     / (WaveWpoFadeEndM - WaveWpoFadeStartM))
+
+    `pos_m` is the SAME float2 the caller passed to `build_wave_field` --
+    absolute world XY in metres. Passing the same expression is not a
+    convenience, it is the guarantee that the fade and the field cannot disagree
+    about where a vertex is; a second world-position node with different offset
+    settings would be a second, silent opinion on that.
+
+    =======================================================================
+    THIS IS NOT A LEVEL-OF-DETAIL OPTIMISATION. IT IS THE CRACK FIX.
+    =======================================================================
+
+    The lake sheet tessellates only the rects in its finest band that intersect a
+    camera disc (plan B1, `AppendRectQuadTessellated`). Everything outside that
+    disc stays a greedy rect -- four vertices spanning hundreds of metres. So
+    every boundary of the tessellated region is a T-junction between a dense edge
+    and a sparse one, AND THERE IS NO STITCHING. None is planned. A stitching
+    pass over a mask that re-keys with the camera every time it crosses a snap
+    grid is a rebuild of the sheet's topology per snap, which is the shape of the
+    22.7 ms first-build hitch this project has already measured once.
+
+    The alternative that works is arithmetic rather than topological: MAKE THE
+    DISPLACEMENT ZERO ON BOTH SIDES OF EVERY SEAM. A T-junction between two
+    UNDISPLACED surfaces is not a crack -- the dense edge's extra vertices lie
+    exactly on the straight line between the sparse edge's two, because that is
+    where the tessellator put them and nothing has moved them since. The gap a
+    T-junction normally opens is entirely the interpolation error of a MOVED
+    midpoint, and a fade that reaches exactly 0 before the resolution changes
+    removes the movement rather than correcting the error.
+
+    HENCE THE ORDER OF THE THREE RADII, AND ALL THREE HAVE TO HOLD:
+
+        WaveWpoFadeEndM (72)  <  WaveTessRadiusM (80)  <=  finest sheet band
+
+    Fade end inside the tess disc: displacement is already zero by the time the
+    geometry goes sparse. Tess disc inside the finest band: the dense region is
+    never straddling a band change as well. RAISING WaveWpoFadeEndM PAST
+    WaveTessRadiusM AT RUNTIME ON A MATERIAL INSTANCE WILL CRACK THE SHEET, and
+    it will read as a rendering bug rather than as a setting. That is the one
+    dependency in this file a material parameter can violate from the console,
+    so it is written here rather than left as a coincidence between two numbers
+    owned by two different lanes.
+
+    IT ALSO HEALS A LATENT SEAM THAT PREDATES THE TESSELLATION, which is the
+    second reason it belongs in the shared module and not in one generator.
+    Near-field water is drawn as voxel quads and far water as flat sheets; both
+    materials displace from this one field, but only one of them has vertices
+    dense enough to displace meaningfully, so the two draw paths have always met
+    along a line where a moved surface abuts an unmoved one. One fade in one
+    module fixes it for both, for the same reason the field itself is one module.
+
+    WHAT IS DELIBERATELY *NOT* FADED: the pixel normal. Shading detail is free at
+    distance and costs no geometric agreement -- two surfaces meeting at a seam
+    may SHADE differently without tearing, they may only not MOVE differently.
+    Fading the normal too would put a visible ring of "the water goes glassy at
+    70 m" into every wide shot, which is a picture change bought for nothing.
+
+    THE ONE-EVALUATION INVARIANT SURVIVES THIS. The normal and the displacement
+    still come from ONE evaluation of ONE field -- the property the WaveField
+    Custom node exists to preserve (create_water_voxel_material.py:2530-2632) --
+    and this multiplies the displacement half of that shared value by a smooth
+    function of position, exactly as WaveWpoFraction already does. Crests do not
+    move to a different place near the fade; they get shorter, together, in a
+    coordinate both halves share.
+
+    AND ADJACENT PRIMITIVES STILL AGREE BIT FOR BIT AT A SHARED VERTEX, which is
+    what stops the mesh tearing as the phase moves and which every term in this
+    file is written to preserve. The fade is a pure function of absolute world
+    position and the camera position, and two bricks sharing a physical vertex
+    compute both identically.
+    """
+    d = dict(DEFAULTS)
+    if defaults:
+        d.update(defaults)
+
+    start_m = float(d["WaveWpoFadeStartM"])
+    end_m = float(d["WaveWpoFadeEndM"])
+    if not end_m > start_m:
+        raise RuntimeError(
+            "WaveWpoFadeEndM (%.3f) must be strictly greater than WaveWpoFadeStartM "
+            "(%.3f): the fade divides by their difference. Equal or inverted values are "
+            "not a subtle mis-tune -- see the max() below for what they do at runtime."
+            % (end_m, start_m))
+
+    start = b.scalar("WaveWpoFadeStartM", start_m)
+    end = b.scalar("WaveWpoFadeEndM", end_m)
+
+    # THE CAMERA, from the engine's own view transform rather than from anything
+    # this project publishes. CameraPositionWS is ResolvedView.WorldCameraOrigin
+    # and is available in the VERTEX shader as well as the pixel shader, which it
+    # has to be: this weight is consumed by World Position Offset.
+    cam_m = b.mul(b.mask(b.node(unreal.MaterialExpressionCameraPositionWS), "",
+                         r=True, g=True),
+                  b.const(0.01))
+
+    # HORIZONTAL DISTANCE ONLY -- .xy, not the full 3-D distance. A camera 200 m
+    # above a lake is not far from it in the sense this fade means; the 3-D
+    # distance would switch the displacement off in every aerial shot, which is
+    # the shot the owner takes most often, and it would do it silently.
+    dist_m = b.dist(pos_m, cam_m)
+
+    # NOT b.ramp(), AND THE DIFFERENCE IS ONE max() NODE THAT MATTERS MORE HERE
+    # THAN ANYWHERE ELSE IN THIS FILE. ramp() divides by (hi - lo) unguarded.
+    # Both ends are material PARAMETERS, so a material instance can set them
+    # equal from the console with no regeneration and no warning -- and the
+    # result of that divide is not a wrong number, it is a NaN, and this NaN's
+    # destination is WORLD POSITION OFFSET. A NaN in a colour discolours a pixel;
+    # a NaN in a vertex position sends every vertex of the sheet to a
+    # non-position and the whole water surface leaves the frame. The floor is
+    # 0.01 m, i.e. an instant cut-off, which is the honest reading of "start and
+    # end are the same distance" and is a picture somebody can diagnose.
+    span = b.maximum(b.sub(end, start), b.const(0.01))
+    return b.one_minus(b.saturate(b.div(b.sub(dist_m, start), span)))
 
 
 def summary_lines(wind_source=None):
@@ -1178,7 +1641,304 @@ def summary_lines(wind_source=None):
         % WIND_VECTOR_PARAM,
         "  interface: MPC_VoxelSky.%s (1 once the weather field has published)"
         % WIND_VALID_PARAM,
+        "  WPO distance fade %.0f -> %.0f m, applied to the DISPLACEMENT only"
+        % (DEFAULTS["WaveWpoFadeStartM"], DEFAULTS["WaveWpoFadeEndM"]),
+        "    crack prevention for the tessellated sheet, NOT an LOD saving; it must",
+        "    stay strictly inside WaveTessRadiusM or every ring boundary opens",
     ]
     if wind_source is not None:
         lines.append("  wind source THIS BUILD: %s" % wind_source)
     return lines
+
+
+# =============================================================================
+# THE CPU WAVE MIRROR (plan D2 stretch, activated by owner verdict 2026-09-05:
+# the boat shows no bobbing and flat-datum buoyancy is rejected)
+# =============================================================================
+#
+# write_cpu_mirror_header() emits a pure-C++ header containing the SAME field
+# math the HLSL above ships -- octave table, wind consumption, the F8.1
+# two-bin direction logic, patches -- so UVoxelWaterSubsystem can evaluate the
+# wave height at a world position + time on the CPU for buoyancy probes. It is
+# written by BOTH water generator runs (write-if-changed, byte-deterministic),
+# following gen_material_palette_ush.py's precedent: a generated artefact that
+# is re-emitted by the run that consumes its source tables can never go stale
+# silently. The fingerprint below is emitted into the header AND baked into
+# both materials as the WaveMirrorFingerprint scalar parameter, so the C++
+# can assert header-vs-asset agreement at startup
+# (GetScalarParameterDefaultValue(M_WaterVoxel, "WaveMirrorFingerprint") ==
+# VOXELWAVEMIRROR_FINGERPRINT) and refuse to bob a boat on a stale mirror.
+
+# The DEFAULTS keys the mirror bakes as struct defaults -- exactly the ones
+# the field math reads (the shore/breaking block is deliberately absent; see
+# the header's own doc block).
+_MIRROR_PARAM_KEYS = [
+    "WaveAmplitudeM", "WaveBaseWavelengthM", "WaveDirBaseDeg",
+    "WaveDirIncrementDeg", "WaveQuantPerVoxel", "WavePatchContrast",
+    "WindDirectionAuthority", "WindSpreadDeg", "WindRefSpeedMS",
+    "WindAmpExponent", "WindLenExponent", "WindPatchDriftFrac",
+    "WindDirBinDeg", "WindSpeedBinLog2",
+]
+
+MIRROR_HEADER_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "Source", "VoxelEarth", "VoxelWaveMirror.generated.h"))
+
+
+def mirror_fingerprint():
+    """A 24-bit fingerprint of everything the mirror's correctness depends on.
+
+    Hashes the spread table, the mirror-relevant defaults and the HLSL
+    template itself -- so ANY change to the field math or its numbers yields a
+    new fingerprint, the regenerated materials carry the new value, and a C++
+    build still holding the old header fails its startup assert instead of
+    bobbing boats on last week's sea. 24 bits so the value is exactly
+    representable as the float32 a ScalarParameter stores.
+    """
+    import hashlib
+    payload = repr((
+        octave_spread_shape(),
+        [(k, DEFAULTS[k]) for k in _MIRROR_PARAM_KEYS],
+        OCTAVES,
+        _WAVE_CODE_TEMPLATE,
+    )).encode("utf-8")
+    return int(hashlib.md5(payload).hexdigest()[:6], 16)
+
+
+def write_cpu_mirror_header(log=None):
+    """Emit VoxelWaveMirror.generated.h. Returns (path, changed, fingerprint).
+
+    Pure C++ (only <cmath>/<algorithm>), no UE types, so the header compiles
+    standalone and the offline harness can syntax-check it without UBT.
+    """
+    fp = mirror_fingerprint()
+    spread = octave_spread_shape()
+
+    def cf(v):
+        """A float literal C++ accepts: %.9g plus a guaranteed decimal point
+        (5 -> '5.0f', not the invalid '5f' -- the standalone clang compile in
+        the offline harness is what caught this)."""
+        s = "%.9g" % float(v)
+        if "." not in s and "e" not in s and "E" not in s:
+            s += ".0"
+        return s + "f"
+
+    param_lines = "\n".join(
+        "    float %s = %s;" % (k, cf(DEFAULTS[k])) for k in _MIRROR_PARAM_KEYS)
+    spread_line = ", ".join("%.6ff" % v for v in spread)
+
+    text = _MIRROR_HEADER_TEMPLATE % {
+        "fingerprint": fp,
+        "params": param_lines,
+        "spread": spread_line,
+        "octaves": OCTAVES,
+    }
+
+    changed = True
+    try:
+        with open(MIRROR_HEADER_PATH, "r", encoding="utf-8") as fh:
+            changed = fh.read() != text
+    except OSError:
+        pass
+    if changed:
+        with open(MIRROR_HEADER_PATH, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    (log or print)("[water_wave_graph] CPU mirror header %s: %s (fingerprint 0x%06x)"
+                   % ("WRITTEN" if changed else "unchanged", MIRROR_HEADER_PATH, fp))
+    return MIRROR_HEADER_PATH, changed, fp
+
+
+# NO literal '%' below except the formatting slots: this string is %-formatted.
+_MIRROR_HEADER_TEMPLATE = """// VoxelWaveMirror.generated.h -- DO NOT EDIT BY HAND.
+// Generated by Tools/water_wave_graph.py (write_cpu_mirror_header), re-emitted
+// by every water material regeneration so it cannot go stale silently against
+// the shipped WaveField HLSL. Change the field there, never here.
+//
+// WHAT THIS IS. The CPU mirror of the water surface's wind-driven wave field,
+// for buoyancy probes (ocean/tides plan D2 stretch, activated 2026-09-05):
+// the SAME eight-octave sum, drag warp, wind sizing, F8.1 two-bin direction
+// crossfade and calm/choppy patch modulation the materials evaluate per
+// pixel, transcribed to C++ so UVoxelWaterSubsystem can ask "how high is the
+// drawn wave at this world position right now" without a readback.
+//
+// ============================= PHASE COHERENCE =============================
+// WHAT THE CALLER MUST MIRROR, EXACTLY:
+//   * TIME: the material's clock is MaterialExpressionTime == View.GameTime
+//     == UWorld::GetTimeSeconds() (pause-aware seconds since world start).
+//     Pass ScaledTimeS = World->GetTimeSeconds() * <WaveTimeScale as last
+//     pushed to MPC_VoxelSky>. NOT the sky epoch -- the sky runs a different,
+//     offset clock and mixing the two is the known phase-drift trap the plan
+//     records. A live WaveTimeScale change steps material phase (T*s is not
+//     an integral); this mirror steps identically, so the two stay coherent
+//     through the step.
+//   * WIND: the same WindVectorMS.xy (sustained, smoothed) the subsystem
+//     pushed to the collection this frame. The MPC write is one frame ahead
+//     of the draw at worst; at the wind's smoothed rate of change that is
+//     sub-millimetre of phase.
+//   * PARAMS: FParams defaults below equal the generators' shipped material
+//     parameter defaults. An INSTANCE override on the material (a ladder, a
+//     tuned WindDirBinDeg) is not visible here -- query the material and
+//     fill FParams from it if instance parity ever matters.
+// WHAT THE MIRROR DELIBERATELY IS:
+//   * the OPEN-WATER field: exactly the material's bathy-validity-0 branch.
+//     No shore damping, shoaling, breaking or crest peaking -- near a shore
+//     the drawn wave is depth-limited SMALLER than this value, so probes
+//     overstate bob amplitude in the surf zone by up to the amplitude itself
+//     (centimetres at shipped defaults). No ripple field (that is the C++
+//     simulation's own render target -- probe the ripple subsystem if wake
+//     bobbing is ever wanted).
+//   * the FIELD height, metres. The DRAWN surface displaces by
+//     FieldHeightM * kWaveWpoFraction, faded to zero between
+//     kWpoFadeStartM..kWpoFadeEndM of CAMERA distance -- so multiply by
+//     kWaveWpoFraction for probe-vs-pixel contact, and accept that past the
+//     fade the pixels stop moving while the probe keeps bobbing (invisible
+//     at that range; physics must not depend on the camera).
+// RESIDUAL, HONESTLY: GPU/CPU float op ordering differs -> sub-mm; the
+// one-frame MPC latency -> sub-mm; instance overrides -> whatever was
+// overridden. Expected total probe-vs-pixel mismatch: a FEW CENTIMETRES,
+// which is the acceptance band the owner verdict set (plausible bobbing,
+// not pixel-exact contact).
+//
+// ============================== STALENESS ==================================
+// VOXELWAVEMIRROR_FINGERPRINT hashes the octave table, the defaults and the
+// HLSL template. Both regenerated water materials carry the same value as
+// the scalar parameter "WaveMirrorFingerprint". Assert at startup:
+//   ensure(GetScalarParameterDefaultValue(WaterMat, "WaveMirrorFingerprint")
+//          == float(VOXELWAVEMIRROR_FINGERPRINT))
+// and treat a mismatch as "header and asset were built from different field
+// math" -- rebuild one of them, do not bob boats on the disagreement.
+
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+
+#define VOXELWAVEMIRROR_FINGERPRINT 0x%(fingerprint)06Xu
+
+namespace VoxelWaveMirror
+{
+
+// The generators' shipped defaults for every parameter the field math reads.
+struct FParams
+{
+%(params)s
+};
+
+// The displayed-surface constants (shared parameter defaults in both water
+// generators; see WaveWpoFraction's one-name-one-default argument there).
+constexpr float kWaveWpoFraction = 0.25f;
+constexpr float kWpoFadeStartM = 55.0f;
+constexpr float kWpoFadeEndM = 72.0f;
+
+inline float FieldHeightM(float PosXM, float PosYM, float ScaledTimeS,
+                          float WindXMS, float WindYMS,
+                          const FParams& P = FParams())
+{
+    constexpr int   kOctaves = %(octaves)d;
+    constexpr float kDragMult = 0.2f;
+    constexpr float kMeanWave = 0.2329f;
+    constexpr float kTwoPi = 6.2831853f;
+    const float kSpread[kOctaves] = { %(spread)s };
+
+    const float T = ScaledTimeS;
+
+    float px = PosXM, py = PosYM;
+    if (P.WaveQuantPerVoxel > 0.0f)
+    {
+        const float k = P.WaveQuantPerVoxel * 10.0f;
+        px = std::floor(px * k) / k;
+        py = std::floor(py * k) / k;
+    }
+
+    const float windSpeed = std::sqrt(WindXMS * WindXMS + WindYMS * WindYMS);
+    const float invWS = 1.0f / ((windSpeed > 1.0e-4f) ? windSpeed : 1.0e-4f);
+    const float wdx = WindXMS * invWS, wdy = WindYMS * invWS;
+    const float u = windSpeed / std::max(P.WindRefSpeedMS, 0.1f);
+
+    const float ampScale = std::pow(std::max(u, 0.0f), std::max(P.WindAmpExponent, 0.01f));
+
+    // F8.1: the phase sees direction BINS, never the continuous direction.
+    const float upwindAng = std::atan2(-wdx, -wdy);
+    const float nBins = std::max(std::round(360.0f / std::max(P.WindDirBinDeg, 1.0f)), 3.0f);
+    const float binW = kTwoPi / nBins;
+    const float aBin = upwindAng / binW;
+    const float kBin = std::floor(aBin);
+    const float fr = aBin - kBin;
+    const float wBin = fr * fr * (3.0f - 2.0f * fr);   // smoothstep(0,1,frac)
+
+    // F8.1 second half: the WAVELENGTH sees speed BINS, never the continuous
+    // speed (amplitude above stays continuous -- it never touches a phase).
+    const float ue = std::max(u, 0.2f);
+    const float sBinW = std::max(P.WindSpeedBinLog2, 0.01f);
+    const float aSpd = std::log2(ue) / sBinW;
+    const float jSpd = std::floor(aSpd);
+    const float sfr = aSpd - jSpd;
+    const float wSpd = sfr * sfr * (3.0f - 2.0f * sfr); // smoothstep(0,1,frac)
+    const float lenExpEff = std::max(P.WindLenExponent, 0.0f);
+
+    const float baseRef = P.WaveDirBaseDeg * 0.017453293f;
+    const float spreadRad = P.WindSpreadDeg * 0.017453293f;
+    const float dIncRad = P.WaveDirIncrementDeg * 0.017453293f;
+
+    float H4[2][2];
+    float patch2[2];
+    for (int bin = 0; bin < 2; ++bin)
+    {
+        const float upA = (kBin + float(bin)) * binW;
+        float dA = upA - baseRef;
+        dA -= kTwoPi * std::round(dA * 0.15915494f);
+        const float baseAng = baseRef + P.WindDirectionAuthority * dA;
+
+        for (int sb = 0; sb < 2; ++sb)
+        {
+            const float lenScaleB = std::exp2((jSpd + float(sb)) * sBinW * lenExpEff);
+            const float lambda0B = std::max(P.WaveBaseWavelengthM * lenScaleB, 0.15f);
+            const float omega0B =
+                2.0f * std::sqrt(P.WaveBaseWavelengthM / std::max(lambda0B, 1.0e-4f));
+
+            float posX = px, posY = py;
+            float freq = kTwoPi / lambda0B;
+            float tmul = omega0B;
+            float weight = 1.0f;
+            float sumH = 0.0f, sumW = 0.0f;
+            for (int i = 0; i < kOctaves; ++i)
+            {
+                const float ang = baseAng
+                    + (dIncRad * float(i)) * (1.0f - P.WindDirectionAuthority)
+                    + (spreadRad * kSpread[i]) * P.WindDirectionAuthority;
+                const float dx = std::sin(ang), dy = std::cos(ang);
+                const float x = (dx * posX + dy * posY) * freq + T * tmul;
+                const float wv = std::exp(std::sin(x) - 1.0f) * 0.5f;
+                const float dwv = wv * std::cos(x);
+                posX += dx * (-dwv) * weight * kDragMult;
+                posY += dy * (-dwv) * weight * kDragMult;
+                sumH += wv * weight;
+                sumW += weight;
+                weight *= 0.8f;
+                freq *= 1.42f;
+                tmul *= 1.07f;
+            }
+            H4[bin][sb] = (sumH / std::max(sumW, 1.0e-6f)) - kMeanWave;
+        }
+
+        const float drift = P.WindRefSpeedMS * T * P.WindPatchDriftFrac * P.WindDirectionAuthority;
+        const float ppx = px + std::sin(upA) * drift;
+        const float ppy = py + std::cos(upA) * drift;
+        const float lfa = std::sin(ppx * 0.0349f + ppy * 0.0217f + T * 0.031f);
+        const float lfb = std::sin(ppx * -0.0161f + ppy * 0.0271f + T * 0.0193f);
+        const float pr = 0.5f + 0.35f * lfa + 0.35f * lfb;
+        patch2[bin] = std::min(std::max(pr, 0.0f), 1.0f);
+    }
+
+    const float Hs0 = H4[0][0] + (H4[0][1] - H4[0][0]) * wSpd;
+    const float Hs1 = H4[1][0] + (H4[1][1] - H4[1][0]) * wSpd;
+    const float H = Hs0 + (Hs1 - Hs0) * wBin;
+    const float patch = patch2[0] + (patch2[1] - patch2[0]) * wBin;
+    const float lo = 1.0f - P.WavePatchContrast;
+    const float hi = 1.0f + P.WavePatchContrast;
+    const float amp = P.WaveAmplitudeM * ampScale * (lo + (hi - lo) * patch);
+    return H * amp;
+}
+
+} // namespace VoxelWaveMirror
+"""

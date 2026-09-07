@@ -20,11 +20,15 @@ export interface DecodedInfo {
 }
 
 export function VoxelCanvas({
-  src, palette, className, onDecoded,
+  src, palette, className, wrapperClassName, onDecoded,
 }: {
   src: string;
   palette: Record<string, [number, number, number]>;
   className?: string;
+  /** Size the OUTER box instead of the canvas (e.g. "min-h-0 flex-1" inside
+   *  a resizable panel); pair with className="h-full". The viewer re-reads
+   *  clientWidth/Height every frame, so live resizing just works. */
+  wrapperClassName?: string;
   onDecoded?: (info: DecodedInfo) => void;
 }) {
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
@@ -76,7 +80,7 @@ export function VoxelCanvas({
   }, [src, palette]);
 
   return (
-    <div className="relative">
+    <div className={cn("relative", wrapperClassName)}>
       <canvas
         ref={canvasRef}
         className={cn("chamfer bevel-down block h-80 w-full touch-none bg-stone-850", className)}

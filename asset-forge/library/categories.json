@@ -1,0 +1,6087 @@
+{
+ "categories": {
+  "craftable": {
+   "blurb": "Human-made objects a player can make, carry and use. Rigid, spawned, on their own pitch under their own transform, and outside world composition entirely: no bank, no biome weight, no manifest record. The boat and the glider are the first two.",
+   "count": 12,
+   "in_manifest": false,
+   "kinds": [
+    "artifact"
+   ],
+   "label": "Craftable items",
+   "scattered": false,
+   "species": [
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 238368,
+       "extent_vox": [
+        169,
+        98,
+        60
+       ],
+       "seed": 1,
+       "voxels": 52214,
+       "vxa": "library/bushcraft-bamboo-raft/bushcraft-bamboo-raft-0001/tree.vxa"
+      }
+     ],
+     "kind": "artifact",
+     "name": "bushcraft-bamboo-raft",
+     "subcategory": "vehicles",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-cordage-coil",
+     "subcategory": "materials",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-fiber-bundle",
+     "subcategory": "materials",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-flake-blade",
+     "subcategory": "tools",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-hammerstone",
+     "subcategory": "tools",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-stone-axe",
+     "subcategory": "tools",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-stone-axe-head",
+     "subcategory": "components",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-stone-knife",
+     "subcategory": "tools",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "bushcraft-wooden-haft",
+     "subcategory": "components",
+     "via": "spec",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 54863,
+       "extent_vox": [
+        156,
+        36,
+        21
+       ],
+       "seed": 1,
+       "voxels": 16998,
+       "vxa": "library/canoe/canoe-0001/tree.vxa"
+      }
+     ],
+     "kind": "artifact",
+     "name": "canoe",
+     "subcategory": "vehicles",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 167058,
+       "extent_vox": [
+        132,
+        227,
+        49
+       ],
+       "seed": 1,
+       "voxels": 35701,
+       "vxa": "library/glider/glider-0001/tree.vxa"
+      }
+     ],
+     "kind": "artifact",
+     "name": "glider",
+     "subcategory": "vehicles",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "draft",
+     "kind": "artifact",
+     "name": "raft",
+     "subcategory": "vehicles",
+     "via": "kind",
+     "voxel_mm": 25.0
+    }
+   ]
+  },
+  "creature": {
+   "blurb": "Living things that are spawned rather than composed. They carry their own pitch under their own transform (ADR-0010), they are published in the manifest with biome weights so a spawner can find them, and they are authored and deliberately not rendered until animation exists.",
+   "count": 382,
+   "in_manifest": true,
+   "kinds": [
+    "fish",
+    "cetacean",
+    "bird",
+    "quadruped"
+   ],
+   "label": "Creatures",
+   "scattered": false,
+   "species": [
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "addax",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "african-bush-elephant",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "african-forest-elephant",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "african-lungfish",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "african-sharptooth-catfish",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "african-tigerfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "african-wild-dog",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "alpaca",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "alpine-chough",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "alpine-ibex",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "alpine-marmot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "alpine-swift",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "amazon-river-dolphin",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "american-bison",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "american-black-bear",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "american-mink",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "anglerfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "antelope-ground-squirrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "arabian-oryx",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "arapaima",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "arctic-char",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "arctic-fox",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "arctic-grayling",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "arctic-ground-squirrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "arctic-tern",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "armoured-catfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "atlantic-cod",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "atlantic-halibut",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "atlantic-mackerel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "atlantic-mudskipper",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "atlantic-puffin",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "atlantic-sailfish",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "atlantic-salmon",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "atlantic-wolffish",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "bar-tailed-godwit",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "barbary-sheep",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "barbel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "barn-swallow",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "basking-shark",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "bearded-vulture",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "beluga",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "bengal-tiger",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "bighorn-sheep",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "black-browed-albatross",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "black-headed-gull",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "black-howler-monkey",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "black-legged-kittiwake",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "black-tailed-jackrabbit",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "black-tailed-prairie-dog",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "black-woodpecker",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "blue-marlin",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "blue-shark",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "blue-tit",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "blue-whale",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "blue-wildebeest",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "bluefin-tuna",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "bluegill",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "bluestripe-snapper",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "bobcat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "bongo",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "bottlenose-dolphin",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "brook-lamprey",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "brook-trout",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "brown-bear",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "brown-booby",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "brown-pelican",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "brown-throated-sloth",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "brown-trout",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "bullhead",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "burbot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "burrowing-owl",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "cape-buffalo",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "cape-hare",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "capybara",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "caracal",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "carrion-crow",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "chacma-baboon",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "chamois",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "cheetah",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "chimpanzee",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "chub",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "clown-anemonefish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "clown-triggerfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "coati",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-blackbird",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "common-bream",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-buzzard",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-chaffinch",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-crane",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-cuckoo",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "common-dace",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "common-dolphin",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "common-frog",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-guillemot",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-kestrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-kingfisher",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "common-minnow",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-ostrich",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-pheasant",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-quail",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 8075,
+       "extent_vox": [
+        50,
+        11,
+        22
+       ],
+       "seed": 7,
+       "voxels": 2135,
+       "vxa": "library/common-raven/common-raven-0007/tree.vxa"
+      }
+     ],
+     "kind": "bird",
+     "name": "common-raven",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-redshank",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-redstart",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "common-sole",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-starling",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "common-tern",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "conger-eel",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "coral-grouper",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "corn-bunting",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "corsac-fox",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "coyote",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "cream-coloured-courser",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "crowned-sandgrouse",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "crucian-carp",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "desert-monitor",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "desert-pupfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "dingo",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "dorcas-gazelle",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "dromedary-camel",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "eastern-chipmunk",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "eastern-grey-kangaroo",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "eastern-grey-squirrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "electric-eel",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "elk-wapiti",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "emperor-angelfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "emu",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "eurasian-beaver",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-bullfinch",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-crag-martin",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-curlew",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-dotterel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-hoopoe",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-jay",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "eurasian-lynx",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-magpie",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-nuthatch",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-oystercatcher",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-skylark",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-sparrowhawk",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-treecreeper",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-woodcock",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "eurasian-wren",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "european-anchovy",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-badger",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-bison",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "european-flounder",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "european-goldfinch",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "european-green-woodpecker",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-hare",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-hedgehog",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-mole",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-otter",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "european-plaice",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-polecat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-rabbit",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "european-robin",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "european-sea-bass",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-souslik",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "european-stonechat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "european-wildcat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "fallow-deer",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "fennec-fox",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "fin-whale",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "fire-salamander",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "fisher",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "flying-fish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "forest-buffalo",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "freshwater-stingray",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "garfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "gemsbok",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "giant-anteater",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "giant-manta-ray",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "giant-moray",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "giant-trevally",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "goldcrest",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "golden-carp",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "golden-eagle",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "golden-jackal",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "great-barracuda",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-blue-turaco",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-bustard",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-cormorant",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-curassow",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-hornbill",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-skua",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-spotted-woodpecker",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "great-tit",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "great-white-shark",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "greater-kudu",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "greater-rhea",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "greater-roadrunner",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "grey-heron",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "grey-partridge",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "grey-whale",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "grey-wolf",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "griffon-vulture",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "guanaco",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "gudgeon",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "harbour-porpoise",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "harpy-eagle",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "hen-harrier",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "herring-gull",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "hippopotamus",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "hoatzin",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "horned-lark",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "houbara-bustard",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "hummingbird",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "humpback-whale",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "impala",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "klipspringer",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "lappet-faced-vulture",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "lesser-egyptian-jerboa",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "lesser-sand-eel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "lilac-breasted-roller",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "lion",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "lionfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "little-egret",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "little-owl",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "long-finned-pilot-whale",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "long-tailed-tit",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "lowland-tapir",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "magnificent-frigatebird",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "mahi-mahi",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "mallard-duck",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "mandrill",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "maned-wolf",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "manx-shearwater",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "marine-iguana",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "meadow-pipit",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "meerkat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "minke-whale",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "mirror-carp",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "moorish-idol",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "moose",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "mountain-goat",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "mountain-hare",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "mud-catfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "muskox",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "napoleon-wrasse",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "narwhal",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "nile-crocodile",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "nile-monitor",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "nile-perch",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "nile-tilapia",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "nine-banded-armadillo",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "north-american-porcupine",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "north-atlantic-right-whale",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "northern-fulmar",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "northern-gannet",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "northern-goshawk",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "northern-lapwing",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "northern-pike",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "northern-wheatear",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "norway-lemming",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "nurse-shark",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "oarfish",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "ocean-sunfish",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "ocellated-lizard",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "okapi",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "orca",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "osprey",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "pale-minnow",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "parrotfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "peacock-cichlid",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "peregrine-falcon",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "pharaoh-eagle-owl",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "pied-avocet",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "pika",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "pileated-woodpecker",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "pine-marten",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "plains-zebra",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "poison-dart-frog",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "porcupinefish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "pronghorn",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "przewalskis-horse",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "raccoon",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "racoon-butterflyfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "rainbow-trout",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "razorbill",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "red-bellied-piranha",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "red-billed-chough",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "red-deer-hind",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "red-deer-stag",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "red-fox",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "red-kangaroo",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "red-kite",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "red-river-hog",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "red-squirrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "reef-shark",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "reef-tang",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "reindeer",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "remora",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "ringed-plover",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "rissos-dolphin",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "river-eel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "river-perch",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "roach",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "rock-hyrax",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "rock-pigeon",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "rock-ptarmigan",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "roe-deer",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "rudd",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "ruddy-turnstone",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "saiga-antelope",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "sand-cat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "sand-goby",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "sand-lizard",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "sanderling",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "sandwich-tern",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "sardine",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "scalloped-hammerhead",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "scarlet-macaw",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "scarlet-tanager",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "secretary-bird",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "sei-whale",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "shanny",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "shoal-herring",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "shortfin-mako",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "siberian-flying-squirrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "siberian-musk-deer",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "sika-deer",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "small-indian-mongoose",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "small-spotted-catshark",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "smallmouth-bass",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "snow-bunting",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "snowy-owl",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "snowy-plover",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "song-thrush",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "sooty-tern",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "spectacled-caiman",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "sperm-whale",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "cetacean",
+     "name": "spinner-dolphin",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "spiny-tailed-lizard",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "spotted-eagle-ray",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "spotted-hyena",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "steppe-polecat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "stoat",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "stone-loach",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "striped-hyena",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "striped-skunk",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "sunbittern",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "swordfish",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "taimen",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "tawny-owl",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "tench",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "thick-lipped-mullet",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "thornback-ray",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "three-spined-stickleback",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "thresher-shark",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "tiger-shark",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "toco-toucan",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "trumpeter-finch",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "turbot",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "vicuna",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "virginia-opossum",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "viviparous-lizard",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "wallcreeper",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "wandering-albatross",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "warthog",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "water-monitor",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "wattled-jacana",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "wels-catfish",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "western-capercaillie",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "western-jackdaw",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "western-lowland-gorilla",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "western-meadowlark",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "western-mosquitofish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "whale-shark",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "white-rhinoceros",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "white-stork",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "white-tailed-deer",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "wild-boar",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "wild-turkey",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "wild-yak",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "wilsons-storm-petrel",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "wolverine",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "quadruped",
+     "name": "wood-bison",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "wood-thrush",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "yellow-boxfish",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "yellowfin-tuna",
+     "via": "kind",
+     "voxel_mm": 25.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bird",
+     "name": "yellowhammer",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "kind": "fish",
+     "name": "zander",
+     "via": "kind",
+     "voxel_mm": 12.5
+    }
+   ]
+  },
+  "environment": {
+   "blurb": "Static world content. The engine composes it into terrain chunks on both the CPU and GPU paths and the deterministic per-chunk scatter decides where it goes. Trees and rocks join the world voxel grid at 10 cm and are destructible as terrain is; the rest carry their own finer grid and are drawn as instances in the detail ring.",
+   "count": 446,
+   "in_manifest": true,
+   "kinds": [
+    "tree",
+    "bush",
+    "rock",
+    "grass",
+    "reed",
+    "flower"
+   ],
+   "label": "Environment",
+   "scattered": true,
+   "species": [
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "alpenrose",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "alpine-cushion-flower",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "alpine-krummholz",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "alpine-scree",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "alpine-sedge",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "american-beech",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "arctic-poppy",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "arctic-willow-thicket",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "arrowhead",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "banded-sandstone-ledge",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "baobab",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "barrel-sponge",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "basalt-colonnade",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "bayberry",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "beach-hibiscus",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "beach-morning-glory",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "beach-rose",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "beachrock-slab",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "bedrock-ledge",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "bedrock-pothole",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "big-bluestem",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "big-galleta",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "big-sagebrush",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "bigleaf-maple",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "bilberry-mat",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "birch",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "birdsfoot-trefoil",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "black-cherry",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "black-coral-tree",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "black-mangrove",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "black-smoker-chimney",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "blackthorn-scrub",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "bladderwrack",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "blanket-weed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "blazing-star",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "blowhole",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "bogbean",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "boulder-beach",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "boulder-reef",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "boulder-star-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "box",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "bracken",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "brain-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 23108,
+       "extent_vox": [
+        43,
+        43,
+        29
+       ],
+       "seed": 1,
+       "voxels": 6983,
+       "vxa": "library/bramble-thicket/bramble-thicket-0001/tree.vxa"
+      }
+     ],
+     "kind": "bush",
+     "name": "bramble-thicket",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "branched-bur-reed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "branching-stony-coral",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "brittlebush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "broadleaf-cattail",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "brook-moss-cushion",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "bubble-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "buffalo-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "buffalo-thorn",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "bugle",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "bull-kelp",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "bulrush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "bur-oak",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "butchers-broom",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "california-poppy",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "canadian-waterweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "carnation-soft-coral",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "casuarina",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "cecropia",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "chalk-cliff-foot",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "chalk-outcrop",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "channelled-wrack",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "charcoal-blackened-block",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "cherry-blossom",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "cliff-fall-block",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "cloudberry",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "coast-palm",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "coastal-scrub",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "coastal-thrift",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "cocksfoot",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "coffee-shrub",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "cold-water-coral",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "columnar-cypress",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "common-alder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "common-ash",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "common-bluebell",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "common-broom",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "common-chicory",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "common-cottongrass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "common-dog-violet",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "common-dogwood",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "common-knapweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "common-milkweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "common-poppy",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "common-stonewort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "conglomerate-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "coquina-shell-rock",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "coral-rubble-bank",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "coralline-turf",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "corestone-tor",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "cork-oak",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "cornflower",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "cowslip",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "crab-apple",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "creosote-bush",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "cross-bedded-butte",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "crowberry-mat",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "curled-pondweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "cyclamen",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "dabberlocks",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "date-palm",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "dead-mans-fingers",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "desert-arch",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "desert-bloom",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "desert-dead",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "desert-hoodoo",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "desert-ironwood",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "desert-lily",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "desert-marigold",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "desert-mesa-block",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "desert-saltgrass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "desert-shrub",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "devils-thorn",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "dog-rose",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "dogs-mercury",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "douglas-fir",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "doum-palm",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "dracaena-thicket",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "dry-tussock",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "dulse",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "dwarf-birch",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "dwarf-eelgrass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "dwarf-mountain-pine",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "eastern-cottonwood",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "eastern-hemlock",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "edelweiss",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "eelgrass-meadow",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "elder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "elephant-ear-sponge",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "elephant-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "elkhorn-coral",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "esparto-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "european-beech",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "european-yew",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "exfoliating-dome",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "fanwort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "fault-breccia",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "feather-boa-kelp",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "feather-duster-worm",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "feather-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "feather-moss",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "fever-tree",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "field-elm",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "field-maple",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "field-scabious",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "fire-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "fire-lily",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "fireweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "floodplain-sedge",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "flowering-dogwood",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "flowering-rush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "four-wing-saltbush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "foxglove",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "fractured-outcrop",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "fringed-water-lily",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "furbelows",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "giant-green-anemone",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "giant-kelp",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "giant-reed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "giant-water-lily",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "glacial-erratic",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "glasswort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "globe-mallow",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "golden-samphire",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "gorse",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4763,
+       "extent_vox": [
+        26,
+        22,
+        13
+       ],
+       "seed": 1,
+       "voxels": 3931,
+       "vxa": "library/granite-boulder/granite-boulder-0001/tree.vxa"
+      }
+     ],
+     "kind": "rock",
+     "name": "granite-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "granite-kopje",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "gravel-bar",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "green-sea-fingers",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "guelder-rose",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "gutweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "hair-cap-moss",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "halimeda",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "harebell",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "harts-tongue-fern",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "hawthorn-scrub",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "hazel-coppice",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "heliconia",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "hellebore",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "herb-robert",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3638563,
+       "extent_vox": [
+        926,
+        321,
+        584
+       ],
+       "seed": 6,
+       "voxels": 49336892,
+       "vxa": "library/hero-arch-colossal/hero-arch-colossal-0006/tree.vxa"
+      }
+     ],
+     "kind": "rock",
+     "name": "hero-arch-colossal",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "hero-balanced-rock",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "hero-basalt-colonnade",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "hero-natural-arch",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "hero-sea-stack",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "hero-sequoia",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "hero-tor-stack",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "hero-tsingy-pinnacles",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "holly-understorey",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "holm-oak",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "honey-locust",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "honeycomb-tafoni",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "honeycomb-worm-reef",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "hornbeam",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "hydrothermal-mound",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "impatiens",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "irish-moss",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "ivy-ground-layer",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "jackalberry",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "japanese-maple",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "jointed-granite-tor",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "joshua-tree",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "jungle-emergent",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "jungle-groundcover",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "jungle-understory-flower",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "juniper-scrub",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "kapok",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "karren-pavement",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "karst-breakdown-block",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "knotted-wrack",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "labrador-tea",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "lady-fern",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "lake-bed-slab",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "large-trillium",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "laterite-crust-block",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "lava-tube-bench",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "laver-weed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "leaf-littered-slab",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "leather-coral",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "lesser-pond-sedge",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "lettuce-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "lily-of-the-valley",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "limestone-pinnacles",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "limestone-slab",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "little-bluestem",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "lyme-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "maerl-bed",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "magnificent-sea-anemone",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "male-fern",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "manatee-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "mangrove-sapling",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "maritime-pine",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "marl-bench",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "marram-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "marsh-cinquefoil",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "marsh-marigold",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "marula",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 503,
+       "extent_vox": [
+        9,
+        8,
+        9
+       ],
+       "seed": 1,
+       "voxels": 106,
+       "vxa": "library/meadow-daisy/meadow-daisy-0001/tree.vxa"
+      }
+     ],
+     "kind": "flower",
+     "name": "meadow-daisy",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 593,
+       "extent_vox": [
+        12,
+        10,
+        9
+       ],
+       "seed": 1,
+       "voxels": 124,
+       "vxa": "library/meadow-grass/meadow-grass-0001/tree.vxa"
+      }
+     ],
+     "kind": "grass",
+     "name": "meadow-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "monstera-clump",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "monterey-cypress",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "mopane",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "moraine-boulder-ridge",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "moss-cushion",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "mossy-forest-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "mossy-sandstone-bench",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "mountain-avens",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "mountain-laurel",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "needle-spike-rush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "neptune-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "norway-spruce",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "oarweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "ocotillo",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "olive",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "organ-pipe-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "oxeye-daisy",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "oyster-reef-bank",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "pampas-plume",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "papyrus",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "patch-reef-head",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "pickerelweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "pillar-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "pillow-lava-mound",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "plate-coral",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "plumose-anemone",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "plunge-pool-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "prairie-coneflower",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "prairie-lupine",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "primrose",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "purple-coneflower",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "purple-loosestrife",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "purple-saxifrage",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "quaking-aspen",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "quartz-vein-cobble-bar",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "quillwort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "ramsons",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "rapids-whaleback",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "red-campion",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "red-clover",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "red-comb-weed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "red-huckleberry",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "red-mangrove",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "red-oat-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "reed-sweet-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "reef-flat-pavement",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "reef-spur",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "reindeer-lichen",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "rhododendron-thicket",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "ribbon-weed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "ribwort-plantain",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "riffle-slab",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "rigid-hornwort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "river-broadleaf",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "river-cobble",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "river-water-crowfoot",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "roche-moutonnee",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "rock-samphire",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "rockpool-platform",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "rowan",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "rubber-rabbitbrush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "rubble-apron",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sacred-lotus",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "saguaro",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "salal",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "saltbush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "saltmarsh-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sand-sedge",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sand-verbena",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "sargassum-weed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "sarsen-stone",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "sausage-tree",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "savanna-acacia",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "scots-pine",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "screwpine",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "sea-arch",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sea-aster",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sea-beet",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sea-bindweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sea-blite",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "sea-buckthorn",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sea-campion",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "sea-cave-mouth",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sea-couch",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "sea-grape",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sea-holly",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sea-kale",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sea-lavender",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sea-lettuce",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "sea-oak-weed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "sea-palm",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "sea-pen",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sea-purslane",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "sea-rocket",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "sea-rush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sea-sandwort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "sea-whip",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "seamount-flank",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sedge-tussock",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "serrated-wrack",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "shagbark-hickory",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sheeps-fescue",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "shoal-grass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "siberian-larch",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "sicklebush",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "sinkhole-rim",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "sitka-spruce",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "small-leaved-lime",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "smooth-cordgrass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "snakelocks-anemone",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "snowberry",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "soft-rush",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sphagnum-hummock",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "spiked-water-milfoil",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "spikemoss-mat",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "spindle",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "spiral-wrack",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "staghorn-coral",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "standing-stone",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "step-pool-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "stone-pine",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "storm-cast-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "strangler-fig",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "streambed-cascade-block",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "submerged-granite-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "submerged-limestone-pavement",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "sugar-kelp",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "sugar-maple",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "summit-tor",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "surfgrass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "sweet-chestnut",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "sweet-flag",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "switchgrass",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "sword-fern",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "sycamore-maple",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "tafoni-sandstone",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "tamarisk-scrub",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "temperate-oak",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "temperate-sapling",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "termite-mound",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "terrestrial-bromeliad",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "thongweed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "tidal-notch",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "timothy",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "travertine-rimstone-dam",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "tree-fern",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "trout-lily",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "trumpet-gentian",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "tube-anemone",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "tube-sponge-cluster",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "tufa-curtain",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "tufa-spring-mound",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "tulip-tree",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 69328,
+       "extent_vox": [
+        49,
+        49,
+        80
+       ],
+       "seed": 2,
+       "voxels": 14314,
+       "vxa": "library/tundra-pine/tundra-pine-0002/tree.vxa"
+      }
+     ],
+     "kind": "tree",
+     "name": "tundra-pine",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "turtlegrass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "tussock-cottongrass",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "undercut-bank-block",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "understory-fan-palm",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "understory-fern",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "vase-sponge",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "veined-granite",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "ventifact-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "vipers-bugloss",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "water-chestnut",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "water-earwort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "water-forget-me-not",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "water-horsetail",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "water-hyacinth",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "water-lettuce",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "water-mint",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "water-plantain",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2668,
+       "extent_vox": [
+        21,
+        23,
+        47
+       ],
+       "seed": 1,
+       "voxels": 1261,
+       "vxa": "library/water-reed/water-reed-0001/tree.vxa"
+      }
+     ],
+     "kind": "reed",
+     "name": "water-reed",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "water-soldier",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "water-starwort",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "watercress",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "waterfall-lip-ledge",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "wave-cut-stack",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "rock",
+     "name": "wave-polished-boulder",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "weeping-willow",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "western-hemlock",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "western-red-cedar",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "white-poplar",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "white-water-lily",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "wild-banana",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "wild-gerbera",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "wild-ginger",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "wild-hibiscus",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "wild-pear",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "wild-privet",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "reed",
+     "name": "wild-rice",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "wild-sage-bush",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "wild-thyme",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "willow-moss",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "bush",
+     "name": "witch-hazel",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "wood-anemone",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "wood-horsetail",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "wood-sedge",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "wood-sorrel",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "grass",
+     "name": "woolly-fringe-moss",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "tree",
+     "name": "wych-elm",
+     "via": "kind",
+     "voxel_mm": 100.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "yarrow",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "yellow-flag-iris",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "yellow-horned-poppy",
+     "via": "kind",
+     "voxel_mm": 50.0
+    },
+    {
+     "curation": "approved",
+     "kind": "flower",
+     "name": "yellow-water-lily",
+     "via": "kind",
+     "voxel_mm": 50.0
+    }
+   ]
+  }
+ },
+ "format": "asset-forge-categories",
+ "note": "Generated by tools/export_categories.py. THE SEAM: read categories.craftable.species to enumerate craftable items. Paths are relative to the asset-forge root. voxel_mm is the asset's own pitch -- nothing in voxel-core resamples, so a grid read at the wrong pitch is not an error, it is an object at the wrong size.",
+ "refused": [],
+ "version": 1
+}

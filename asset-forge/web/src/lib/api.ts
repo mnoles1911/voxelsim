@@ -2,7 +2,8 @@
  * lib/schema.ts (the seam); no route is called anywhere else in the app. */
 
 import type {
-  Biome, Curation, CurationStatus, Kind, LibraryEntry, PlacementRule, RulesDoc, SpeciesRow,
+  Biome, Category, Curation, CurationStatus, Kind, LibraryEntry, PlacementRule, RulesDoc,
+  SpeciesRow,
 } from "./schema";
 
 async function j<T>(r: Response): Promise<T> {
@@ -13,16 +14,74 @@ async function j<T>(r: Response): Promise<T> {
   return body as T;
 }
 
+/* --- the ONE fetch wrapper (owner bug 2026-09-05) --------------------------
+ * "TypeError: failed to fetch" is a NETWORK-level failure: the request never
+ * got an answer, because the forge server is gone or this tab's server was
+ * killed/replaced under it (a second launch steals the port on Windows).
+ * Every route in this file goes through `hit`, so the failure is detected in
+ * exactly one place: callers get a readable error instead of the raw
+ * TypeError, and the app-level banner (App.tsx, subscribed via
+ * `serverDown`) tells the owner to relaunch from the Desktop shortcut. The
+ * server side is separately proven to always answer JSON while alive
+ * (llmprobe --http drives the real HTTP route with slow/crashing CLIs). */
+
+let _down = false;
+const _listeners = new Set<(down: boolean) => void>();
+
+export const serverDown = {
+  get current(): boolean { return _down; },
+  subscribe(fn: (down: boolean) => void): () => void {
+    _listeners.add(fn);
+    return () => _listeners.delete(fn);
+  },
+};
+
+function _setDown(d: boolean): void {
+  if (_down !== d) {
+    _down = d;
+    _listeners.forEach((fn) => fn(d));
+  }
+}
+
+/** Probe whether the server is back; flips the banner off on success. */
+export async function retryServer(): Promise<boolean> {
+  try {
+    const r = await hit("/api/biomes");
+    if (r.ok) _setDown(false);
+    return r.ok;
+  } catch {
+    _setDown(true);
+    return false;
+  }
+}
+
+async function hit(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    const r = await fetch(url, init);
+    _setDown(false);
+    return r;
+  } catch (e) {
+    _setDown(true);
+    throw new Error(
+      "the Asset Forge server did not answer (" + String((e as Error)?.message ?? e) + "). "
+      + "Relaunch it from the Desktop shortcut, then retry.");
+  }
+}
+
 const post = (url: string, body: unknown) =>
-  fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  hit(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 export const api = {
-  biomes: () => fetch("/api/biomes").then((r) => j<Biome[]>(r)),
-  kinds: () => fetch("/api/kinds").then((r) => j<Kind[]>(r)),
-  specs: () => fetch("/api/specs").then((r) => j<SpeciesRow[]>(r)),
-  library: () => fetch("/api/library").then((r) => j<LibraryEntry[]>(r)),
-  rules: () => fetch("/api/rules").then((r) => j<RulesDoc>(r)),
-  palette: () => fetch("/api/palette").then((r) => j<Record<string, [number, number, number]>>(r)),
+  biomes: () => hit("/api/biomes").then((r) => j<Biome[]>(r)),
+  kinds: () => hit("/api/kinds").then((r) => j<Kind[]>(r)),
+  /* THE QUERY SEAM, live. Same answer as library/categories.json and the same
+   * resolver behind it (forge.categories.of); that file is what a game reads
+   * without running Python. */
+  categories: () => hit("/api/categories").then((r) => j<Category[]>(r)),
+  specs: () => hit("/api/specs").then((r) => j<SpeciesRow[]>(r)),
+  library: () => hit("/api/library").then((r) => j<LibraryEntry[]>(r)),
+  rules: () => hit("/api/rules").then((r) => j<RulesDoc>(r)),
+  palette: () => hit("/api/palette").then((r) => j<Record<string, [number, number, number]>>(r)),
 
   /* Curation writes mirror the server contract: the spec FILE is the record,
    * and only the curation block moves. */
@@ -69,35 +128,50 @@ export const api = {
     voxel_mm?: number;
   }) => post("/api/import", payload).then((r) => j<LibraryEntry>(r)),
 
-  deleteLibrary: (id: string) => post("/api/library/delete", { id }).then((r) => j<{ deleted: string }>(r)),
+  deleteLibrary: (id: string) =>
+    post("/api/library/delete", { id }).then((r) => j<{ deleted: string; curation?: Curation }>(r)),
+
+  /* ONE publish verb (plan P2, keep-driven): shells tools/publish.py -- the
+   * same publisher the CLI runs -- and returns its full report. Blocking;
+   * bank bakes are hash-skipped so a no-op publish is quick, a real one is
+   * minutes. */
+  publish: () => post("/api/publish", {}).then((r) => j<{ ok: boolean; report: string }>(r)),
 
   thumbUrl: (id: string) => "/api/library/thumb?id=" + encodeURIComponent(id),
   voxelsUrl: (id: string, budget?: number) =>
     "/api/voxels?id=" + encodeURIComponent(id) + (budget ? "&max=" + budget : ""),
+  /* The judgment viewport's address: any (species, bank seed), regenerated
+   * deterministically from specs/ -- no kept entry required, so the whole
+   * never-reviewed queue can be orbited before a verdict. `hash` rides as a
+   * cache-buster (?v=) because the response is immutable-cached and the spec
+   * file can change under the same name. */
+  voxelsBySeedUrl: (name: string, seed: number, hash: string, budget?: number) =>
+    "/api/voxels?name=" + encodeURIComponent(name) + "&seed=" + seed +
+    "&v=" + encodeURIComponent(hash) + (budget ? "&max=" + budget : ""),
   downloadUrl: (id: string, fmt: "vox" | "vxa" | "spec") =>
     "/api/download?id=" + encodeURIComponent(id) + "&fmt=" + fmt,
 };
 
 /* --- authoring: generation, adjustment, keeping (stages 1-3) ------------- */
 
-import type { InterpretResult, JobProgress, UiSchema } from "./schema";
+import type { CreateResult, InterpretResult, JobProgress, UiSchema } from "./schema";
 
 export const forgeApi = {
-  schema: (kind: string) => fetch("/api/schema?kind=" + encodeURIComponent(kind)).then((r) => j<UiSchema>(r)),
+  schema: (kind: string) => hit("/api/schema?kind=" + encodeURIComponent(kind)).then((r) => j<UiSchema>(r)),
 
   spec: (name: string) =>
-    fetch("/api/spec?name=" + encodeURIComponent(name)).then((r) =>
+    hit("/api/spec?name=" + encodeURIComponent(name)).then((r) =>
       j<{ spec: Record<string, unknown>; warnings: string[]; hash: string }>(r)),
 
   librarySpec: (id: string) =>
-    fetch("/api/library/spec?id=" + encodeURIComponent(id)).then((r) =>
+    hit("/api/library/spec?id=" + encodeURIComponent(id)).then((r) =>
       j<{ spec: Record<string, unknown>; seed: number; hash: string }>(r)),
 
   generate: (spec: Record<string, unknown>, seed_start: number, count: number) =>
     post("/api/generate", { spec, seed_start, count }).then((r) =>
       j<{ job: string; seeds: number[]; warnings: string[]; hash: string }>(r)),
 
-  job: (id: string) => fetch("/api/job?job=" + encodeURIComponent(id)).then((r) => j<JobProgress>(r)),
+  job: (id: string) => hit("/api/job?job=" + encodeURIComponent(id)).then((r) => j<JobProgress>(r)),
 
   keep: (spec: Record<string, unknown>, seed: number) =>
     post("/api/keep", { spec, seed }).then((r) =>
@@ -111,8 +185,36 @@ export const forgeApi = {
   interpret: (spec: Record<string, unknown>, request: string) =>
     post("/api/interpret", { spec, request }).then((r) => j<InterpretResult>(r)),
 
+  /* A new species from a sentence: LOCAL (forge/language.py), same doctrine
+   * as interpret. Kept as the offline/CLI path; the app's creation flow is
+   * createLlm below. */
+  create: (request: string) =>
+    post("/api/create", { request }).then((r) => j<CreateResult>(r)),
+
+  /* THE GUIDED CREATION FLOW (owner directive 2026-09-05): the human fixed
+   * category -> kind/sub-category -> name; the description routes to Claude
+   * on the owner's subscription (local grammar answers if claude is
+   * missing, labelled by `source`). The server saves the draft spec so the
+   * new species is in the ledger immediately. */
+  createLlm: (payload: {
+    request: string;
+    kind: string;
+    name: string;
+    subcategory?: string;
+    new_subcategory?: boolean;
+  }) => post("/api/create-llm", payload).then((r) =>
+    j<CreateResult & { saved?: string; subcategory?: string }>(r)),
+
+  /* THE CLAUDE LANE -- the one call that leaves this machine. Runs on the
+   * owner's Claude subscription via the claude CLI (no API key); opt-in per
+   * use and labelled in the UI. The server post-validates the reply and
+   * applies it only through spec.patch; on failure the local grammar
+   * answers (source: "local-fallback", reason in `error`). */
+  interpretLlm: (spec: Record<string, unknown>, request: string) =>
+    post("/api/interpret-llm", { spec, request }).then((r) => j<InterpretResult>(r)),
+
   vocabulary: () =>
-    fetch("/api/vocabulary").then((r) => j<{ concepts: unknown[] }>(r)),
+    hit("/api/vocabulary").then((r) => j<{ concepts: unknown[] }>(r)),
 
   tileUrl: (job: string, seed: number) => "/api/tile?job=" + encodeURIComponent(job) + "&seed=" + seed,
   detailUrl: (job: string, seed: number) => "/api/detail?job=" + encodeURIComponent(job) + "&seed=" + seed,

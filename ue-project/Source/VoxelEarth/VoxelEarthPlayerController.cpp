@@ -12,8 +12,10 @@
 #include "UnrealClient.h"
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
+#include "VoxelBoat.h"
 #include "VoxelEarthHUD.h"
 #include "VoxelExplosive.h"
+#include "VoxelGlider.h"
 #include "VoxelInventoryComponent.h"
 #include "VoxelItem.h"
 #include "VoxelThrownItem.h"
@@ -47,11 +49,18 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	//
 	// The three dig sizes shifted up one rather than losing 1x1x1 -- the small
 	// dig is the one you actually use for detail work, so dropping it would
-	// have been the wrong trade. 2/3/4 now select 1/2/4 voxels.
-	InputComponent->BindKey(EKeys::One, IE_Pressed, this, &AVoxelEarthPlayerController::PourWaterBucket);
+	// have been the wrong trade. 2/3/4 now select 1/2/3 voxels (100/200/300 mm per side).
+	// The '1' water-pour bind is DISABLED by owner ruling 2026-09-05 ("Disable
+	// the 1 hotkey to dump live water"): an accidental keypress while typing
+	// console values dumped a bucket onto the judged lake, collapsed the frame
+	// rate while the CA settled it, and hid the sheet surface -- a hair-trigger
+	// world edit on the easiest key to fat-finger. Pouring stays available
+	// deliberately through the ocean-dig fixtures and SpawnWaterAt; rebind here
+	// only with a chord or a mode gate, not a bare number key.
+	// InputComponent->BindKey(EKeys::One, IE_Pressed, this, &AVoxelEarthPlayerController::PourWaterBucket);
 	InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize1);
 	InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize2);
-	InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize4);
+	InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize3);
 
 	// --- THE HOTBAR, ON 5-9 AND NOT 1-9 ------------------------------------
 	//
@@ -81,6 +90,25 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	// Explosive charge/throw (m1-plan.md "Explosives v1" row).
 	InputComponent->BindKey(EKeys::F, IE_Pressed, this, &AVoxelEarthPlayerController::OnChargeStart);
 	InputComponent->BindKey(EKeys::F, IE_Released, this, &AVoxelEarthPlayerController::OnChargeRelease);
+
+	// --- VEHICLES, AND WHY THEY ARE BOUND HERE RATHER THAN ON THE PAWN ------
+	//
+	// docs/water-ocean-tides-plan-2026-09-04.md D3/E. E boards or leaves a
+	// vehicle; X opens or stows a glider.
+	//
+	// THE CONTROLLER'S INPUT COMPONENT IS THE ONLY ONE THAT SURVIVES A
+	// POSSESSION CHANGE, and that is the whole argument. A key bound on the fly
+	// pawn stops existing the moment the boat is possessed, so "press E to get
+	// out" would have to be bound a second time on every vehicle, and the two
+	// copies would be free to disagree about what "interact" means. One binding
+	// here dispatches on WHAT IS CURRENTLY POSSESSED and there is exactly one
+	// definition of the rule.
+	//
+	// E and X are the only two unbound keys left that a hand rests on: A/C/D/F/
+	// G/Q/S/T/V/W, 1-9, F1/F3, both brackets, both mouse buttons, the wheel,
+	// Space, Shift, Ctrl and Alt are all taken (grep EKeys:: across the module).
+	InputComponent->BindKey(EKeys::E, IE_Pressed, this, &AVoxelEarthPlayerController::OnVehicleInteract);
+	InputComponent->BindKey(EKeys::X, IE_Pressed, this, &AVoxelEarthPlayerController::OnGliderDeploy);
 
 	// docs/debug-tooling-plan.md P1 "CVars + F3": F3 cycles voxel.Debug
 	// 0(off)->1(perf HUD)->2(HUD+visualizations)->0 in PIE/game.
@@ -557,8 +585,42 @@ void AVoxelEarthPlayerController::ClientReceiveJoinSyncChunk_Implementation(cons
 	Subsystem->ReceiveJoinSyncChunk(Bytes, bFinal);
 }
 
+#include "VoxelTreeFellingPrototype.h"
+#include "VoxelDetachedReplication.h"
+void AVoxelEarthPlayerController::ClientReceiveDetachedPacket_Implementation(const TArray<uint8>& Bytes)
+{
+	if(auto Replication=GetWorld()->GetSubsystem<UVoxelDetachedReplication>())Replication->Receive(this,Bytes);
+}
+void AVoxelEarthPlayerController::ClientReceiveDetachedMotion_Implementation(const TArray<uint8>& Bytes)
+{
+	if(auto Replication=GetWorld()->GetSubsystem<UVoxelDetachedReplication>())Replication->ReceiveMotion(this,Bytes);
+}
+void AVoxelEarthPlayerController::ServerAcknowledgeDetachedPacket_Implementation(uint32 Sequence,bool Accepted)
+{
+	if(auto Replication=GetWorld()->GetSubsystem<UVoxelDetachedReplication>())Replication->Acknowledge(this,Sequence,Accepted);
+}
+bool AVoxelEarthPlayerController::RequestChop(const FVector& CameraLoc,const FVector& CameraDir,int32 SizeVoxels)
+{
+	if(!IsLocalController())return false;
+	ServerSubmitChopIntent(CameraLoc,CameraDir,SizeVoxels);
+	return true;
+}
+bool AVoxelEarthPlayerController::ServerSubmitChopIntent_Validate(const FVector& CameraLoc,const FVector& CameraDir,int32 SizeVoxels)
+{
+	return !CameraLoc.ContainsNaN()&&!CameraDir.ContainsNaN()&&SizeVoxels>=1&&SizeVoxels<=3&&FMath::Abs(CameraDir.SizeSquared()-1.0)<.05;
+}
+void AVoxelEarthPlayerController::ServerSubmitChopIntent_Implementation(const FVector& CameraLoc,const FVector& CameraDir,int32 SizeVoxels)
+{
+	if(!ServerSubmitChopIntent_Validate(CameraLoc,CameraDir,SizeVoxels)||!TryConsumeIntentToken(TEXT("ServerSubmitChopIntent")))return;
+	const APawn* ControlledPawn=GetPawn();const double Now=GetWorld()->GetTimeSeconds();
+	if(!ControlledPawn||FVector::DistSquared(CameraLoc,ControlledPawn->GetActorLocation())>FMath::Square(150.0)||
+	   (LastChopSeconds>=0&&Now-LastChopSeconds<.65)||!VoxelTreeFelling::IsEquipped(GetWorld()))return;
+	LastChopSeconds=Now;
+	VoxelTreeFelling::Chop(GetWorld(),CameraLoc,CameraDir.GetSafeNormal(),SizeVoxels);
+}
 void AVoxelEarthPlayerController::OnDig()
 {
+	if(VoxelTreeFelling::TrySwing(GetWorld()))return;
 	UWorld* World = GetWorld();
 	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
 	if (!Subsystem)
@@ -594,13 +656,13 @@ void AVoxelEarthPlayerController::OnPlace()
 
 void AVoxelEarthPlayerController::CycleDigSizeUp()
 {
-	// 1 -> 2 -> 4 -> 1 (m1-plan.md "Dig sizes" row).
-	DigSizeVoxels = (DigSizeVoxels >= 4) ? 1 : DigSizeVoxels * 2;
+	// 100 -> 200 -> 300 mm, capped at the normal swing size (m1-plan.md "Dig sizes" row).
+	DigSizeVoxels = FMath::Min(3, DigSizeVoxels + 1);
 }
 
 void AVoxelEarthPlayerController::CycleDigSizeDown()
 {
-	DigSizeVoxels = (DigSizeVoxels <= 1) ? 4 : DigSizeVoxels / 2;
+	DigSizeVoxels = FMath::Max(1, DigSizeVoxels - 1);
 }
 
 // `1`: a bucket of water, at the player, on demand.
@@ -640,7 +702,7 @@ void AVoxelEarthPlayerController::PourWaterBucket()
 
 void AVoxelEarthPlayerController::SelectDigSize1() { DigSizeVoxels = 1; }
 void AVoxelEarthPlayerController::SelectDigSize2() { DigSizeVoxels = 2; }
-void AVoxelEarthPlayerController::SelectDigSize4() { DigSizeVoxels = 4; }
+void AVoxelEarthPlayerController::SelectDigSize3() { DigSizeVoxels = 3; }
 
 void AVoxelEarthPlayerController::CyclePaletteMaterial()
 {
@@ -848,4 +910,85 @@ float AVoxelEarthPlayerController::GetExplosiveChargeAlpha() const
 	}
 	const float HeldSeconds = World->GetTimeSeconds() - ChargeStartTimeSeconds;
 	return FMath::Clamp(HeldSeconds / MaxChargeSeconds, 0.f, 1.f);
+}
+
+// ---------------------------------------------------------------------------
+// Vehicles (plan D3 / E). Two handlers, and both of them are a DISPATCH rather
+// than a behaviour: everything a boat or a glider does lives in that class, so
+// this file learns nothing about buoyancy, wings, or how a pawn is parked.
+// ---------------------------------------------------------------------------
+
+void AVoxelEarthPlayerController::OnVehicleInteract()
+{
+	// Order matters: LEAVING comes before boarding. Without that, pressing E in
+	// a boat that happens to be moored next to another boat would step out of
+	// one and straight into the other, and the second half would look like the
+	// key had done nothing.
+	if (AVoxelBoat* Boat = Cast<AVoxelBoat>(GetPawn()))
+	{
+		Boat->ExitToStoredPawn();
+		return;
+	}
+	if (AVoxelGlider* Glider = Cast<AVoxelGlider>(GetPawn()))
+	{
+		// Parked: dismount and LEAVE the glider parked (owner respec
+		// 2026-09-05). Airborne: bail out, the v1 behaviour. The glider knows
+		// which; this file does not need to.
+		Glider->ExitToStoredPawn();
+		return;
+	}
+
+	// Walk-up boarding, generalized (owner respec 2026-09-05): E boards the
+	// NEAREST boardable vehicle -- an uncrewed boat or a parked, uncrewed
+	// glider -- each within its own interact range. THE TIE RULE: on an exact
+	// distance tie the boat wins, by construction of the comparison below (the
+	// glider must be STRICTLY nearer to take the key); arbitrary, but stated,
+	// deterministic, and cheap to remember.
+	// Named to dodge C4458: 'Pawn' is AController's own member.
+	APawn* InteractPawn = GetPawn();
+	if (!InteractPawn)
+	{
+		return;
+	}
+	const FVector From = InteractPawn->GetActorLocation();
+	AVoxelBoat* Boat = AVoxelBoat::FindNearest(GetWorld(), From, VoxelBoatTuning::InteractRangeUU);
+	AVoxelGlider* Glider =
+		AVoxelGlider::FindNearestParked(GetWorld(), From, VoxelGliderTuning::InteractRangeUU);
+	if (Boat && Glider)
+	{
+		if (FVector::DistSquared(From, Glider->GetActorLocation())
+		    < FVector::DistSquared(From, Boat->GetActorLocation()))
+		{
+			Boat = nullptr;
+		}
+		else
+		{
+			Glider = nullptr;
+		}
+	}
+	if (Boat)
+	{
+		Boat->Enter(this);
+		return;
+	}
+	if (Glider)
+	{
+		Glider->Board(this);
+		return;
+	}
+	// Nothing in range. Each class logs its own say-why line (counts and a
+	// spawn hint) -- two lines, but "I pressed E and nothing happened" is the
+	// report that costs an evening, and the two halves have different answers.
+	AVoxelBoat::TryEnterNearest(this);
+	AVoxelGlider::TryBoardNearest(this);
+}
+
+void AVoxelEarthPlayerController::OnGliderDeploy()
+{
+	if (AVoxelGlider* Glider = Cast<AVoxelGlider>(GetPawn()))
+	{
+		Glider->ReturnPilot(Glider->GetActorLocation());
+		return;
+	}
+	AVoxelGlider::TryDeploy(this);
 }

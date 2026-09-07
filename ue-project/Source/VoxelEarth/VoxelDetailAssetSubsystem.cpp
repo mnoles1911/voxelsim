@@ -91,6 +91,7 @@
 // capture must show.
 
 #include "VoxelDetailAssetSubsystem.h"
+#include "VoxelVegetationRender.h"
 
 #include "VoxelCoords.h"
 #include "VoxelDebug.h" // VoxelDebug::kHitchThresholdMs -- the adaptive budgets' bar
@@ -545,6 +546,7 @@ struct FMeshGeometry
 	TArray<FVector3f> TangentsX;
 	TArray<FVector4f> Colors; // LINEAR floats -- see the colour note up top
 	TArray<FVector2f> UVs;
+	TArray<FVector2f> WindUVs;
 	TArray<uint32> Indices;
 	uint64 SolidVoxels = 0;
 };
@@ -721,6 +723,7 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 	Out.TangentsX.Reserve(ReserveFaces * 4);
 	Out.Colors.Reserve(ReserveFaces * 4);
 	Out.UVs.Reserve(ReserveFaces * 4);
+	Out.WindUVs.Reserve(ReserveFaces * 4);
 	Out.Indices.Reserve(ReserveFaces * 6);
 
 	int32 Cell[3];
@@ -752,7 +755,8 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 					{
 						int32 N[3] = {Cell[0], Cell[1], Cell[2]};
 						N[Axis] += Positive ? 1 : -1;
-						if (MatAt(N[0], N[1], N[2]) != 0)
+						if (MatAt(N[0], N[1], N[2]) != 0 &&
+                            !(VoxelVegetationRender::IsWood(M) && VoxelVegetationRender::IsLeaf(MatAt(N[0], N[1], N[2]))))
 						{
 							continue; // face culled against a solid neighbour
 						}
@@ -787,7 +791,8 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 							Out.Positions.Add(P);
 							Out.Normals.Add(Normal);
 							Out.TangentsX.Add(TangentX);
-							Out.Colors.Add(FVector4f(C.R, C.G, C.B, 1.0f));
+							Out.Colors.Add(FVector4f(C.R, C.G, C.B, VoxelVegetationRender::MaterialClass(M)));
+                            Out.WindUVs.Add(VoxelVegetationRender::WindData(P.Z, float(Origin[2] + SZ) * PitchUU));
 							// The material samples no texture; a stable planar
 							// UV keeps every downstream assumption (non-zero
 							// UV channel, finite derivatives) honest.
@@ -1182,6 +1187,7 @@ UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* 
 	TVertexInstanceAttributesRef<FVector3f> InstTangents = Attributes.GetVertexInstanceTangents();
 	TVertexInstanceAttributesRef<FVector4f> InstColors = Attributes.GetVertexInstanceColors();
 	TVertexInstanceAttributesRef<FVector2f> InstUVs = Attributes.GetVertexInstanceUVs();
+    InstUVs.SetNumChannels(2);
 
 	TArray<FVertexID> VertexIds;
 	VertexIds.Reserve(NumVerts);
@@ -1202,7 +1208,8 @@ UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* 
 			InstNormals[VI] = G.Normals[int32(SrcVert)];
 			InstTangents[VI] = G.TangentsX[int32(SrcVert)];
 			InstColors[VI] = G.Colors[int32(SrcVert)];
-			InstUVs[VI] = G.UVs[int32(SrcVert)];
+			InstUVs.Set(VI, 0, G.UVs[int32(SrcVert)]);
+            InstUVs.Set(VI, 1, G.WindUVs[int32(SrcVert)]);
 			Corner[C] = VI;
 		}
 		MeshDesc.CreateTriangle(PolyGroup, Corner);
@@ -1228,6 +1235,9 @@ UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* 
 	{
 		return nullptr;
 	}
+	Mesh->SetPositiveBoundsExtension(FVector(30.0));
+	Mesh->SetNegativeBoundsExtension(FVector(30.0));
+	Mesh->CalculateExtendedBounds();
 	return Mesh;
 }
 

@@ -27,12 +27,44 @@ export interface Biome {
   hosts: string[]; // kind keys this biome hosts
 }
 
+/* --- categories (mirrors forge/categories.py) ----------------------------
+ *
+ * WHAT an asset is, as opposed to which generator drew it. `kind` answers the
+ * second question; a canoe and a torch would share a kind and not a category,
+ * a rope and a vine could share a kind and not a category. The kind carries
+ * the DEFAULT and a spec may override it, so the per-species answer is on
+ * SpeciesRow and the kind's default is on Kind -- both resolved server-side by
+ * `forge.categories.of`, never re-derived here. Two copies of one rule is the
+ * failure this repo repeats. */
+export const CATEGORIES = ["environment", "creature", "craftable"] as const;
+export type CategoryKey = (typeof CATEGORIES)[number];
+
+export const CATEGORY_LABEL: Record<string, string> = {
+  environment: "Environment",
+  creature: "Creatures",
+  craftable: "Craftable items",
+};
+
 export interface Kind {
   key: string;
   label: string;
   blurb: string;
   ready: boolean;
+  voxel_pitches_mm: number[];
   species: number;
+  /** The kind's DEFAULT category. A spec may override it -- read
+   *  SpeciesRow.category for the per-species answer. */
+  category?: string;
+}
+
+export interface Category {
+  key: string;
+  label: string;
+  blurb: string;
+  kinds: string[];
+  scattered: boolean;
+  in_manifest: boolean;
+  species: string[];
 }
 
 /* --- curation (mirrors forge/spec.py curation block) -------------------- */
@@ -217,6 +249,15 @@ export interface SpeciesRow {
   name: string;
   file: string;
   kind: string;
+  /** Resolved server-side. `null` means nothing can classify it -- an
+   *  illegible `category` block -- and such a species appears in no index. */
+  category?: string | null;
+  /** "kind" | "spec" | "illegible" | "unknown": whether a human said so or the
+   *  kind decided. Two different facts, shown as two. */
+  category_via?: string;
+  /** Grouping label over the kind's generator ("eels" over `fish`), when
+   *  authored. Hash-excluded like `category`; absent = groups under kind. */
+  subcategory?: string | null;
   hash: string;
   size_m: number;
   resolution_cm: number;
@@ -252,6 +293,8 @@ export interface RulesDoc {
  * GENERATED from these -- never hand-written per kind -- so a new kind's
  * sliders appear the moment its generator lands server-side. */
 export interface UiParam {
+  choices_by_category?: Record<string, string[]>;
+  default_category?: string;
   path: string; // dotted path into the spec
   label: string;
   kind: "float" | "int" | "bool" | "choice" | "text";
@@ -289,6 +332,7 @@ export function setPath(obj: Record<string, unknown>, path: string, value: unkno
 
 export interface TileState {
   ready: boolean;
+  voxel_pitches_mm: number[];
   error: string | null;
   stats: Record<string, unknown> | null;
   problems: string[];
@@ -302,13 +346,31 @@ export interface JobProgress {
   tiles: Record<string, TileState>;
 }
 
-/** /api/interpret: the LOCAL plain-language spec editor (forge/language.py).
- * No model callbacks, by standing constraint -- the vocabulary is authored
- * in the repo and the route never leaves the machine. */
+/** /api/interpret: the LOCAL plain-language spec editor (forge/language.py)
+ * -- the vocabulary is authored in the repo and the route never leaves the
+ * machine. The privacy promise is PER PANEL (owner ruling 2026-09-05):
+ * /api/interpret-llm is the one route that leaves the machine, on the
+ * owner's Claude subscription, opt-in per use and labelled; it returns the
+ * same shape plus `source`/`model`/`error` so the UI can say which lane
+ * answered (a failed Claude call falls back to the local grammar, with
+ * `source: "local-fallback"` and the reason in `error`). */
 export interface InterpretResult {
   spec: Record<string, unknown>;
   understood: string[];
   ignored: string[];
-  edits: { label: string; from: unknown; to: unknown }[];
+  edits: { path?: string; label: string; from: unknown; to: unknown }[];
   warnings?: string[];
+  source?: "llm" | "local-fallback";
+  model?: string;
+  error?: string;
+}
+
+/** /api/create: a species from a sentence -- LOCAL (forge/language.py).
+ * `spec` is null when no kind word was recognised; the failure is said in
+ * `warnings` and every unknown word is in `ignored` -- never a silent
+ * default species. */
+export interface CreateResult extends Omit<InterpretResult, "spec"> {
+  spec: Record<string, unknown> | null;
+  kind: string | null;
+  name: string | null;
 }

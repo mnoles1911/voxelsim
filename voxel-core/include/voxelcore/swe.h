@@ -218,6 +218,16 @@
 // =======================================================================
 // 5. THE CA <-> SWE COUPLING
 // =======================================================================
+// !! KNOWN DEFECT, MEASURED, UNFIXED BY DECISION (ADR-0007, rejected as
+// obsolete 2026-09-05): none of the three exchange channels below is a
+// SIDEWAYS spill. A sheet-owned pool cannot drain into a lower CA-owned
+// neighbour: a breach notch cut three voxels below the waterline drained
+// 0.5% of the pool over 200 ticks. If you are arming voxel.Water.SWE for a
+// demo or experiment, this is a hard wall, not a rough edge. The fix (a
+// lateral-spill channel) and ADR-0007's depth term were deliberately left
+// unbuilt when SWE became the shelved fallback (ADR-0004 superseded
+// 2026-08-09); both together still cost kSweVersion 1->2 + a golden re-pin.
+//
 // The two solvers model genuinely different regimes and the coupling must not
 // pretend otherwise. The CA is a 3D volumetric automaton: correct in confined
 // space (caves, pipes, a breach, a drain shaft, an inrush), where flow is not

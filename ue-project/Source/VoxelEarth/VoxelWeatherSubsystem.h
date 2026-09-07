@@ -158,8 +158,12 @@ struct FVoxelWeatherImpl;
 struct FVoxelWindSample
 {
 	// --- the vector ----------------------------------------------------------
-	// The direction the air TRAVELS, +X east and +Y north (the world's own axes,
-	// as VoxelEphemeris.cpp:289 fixes them), in metres per second.
+	// The direction the air TRAVELS, in metres per second, on the WORLD's own
+	// axes: X = NORTH, Y = EAST (VoxelEphemeris.h:43-45 and PublishWind are the
+	// authority). An earlier version of this comment said "+X east" -- that was
+	// the map convention, not the engine's, and it sent one consumer (the
+	// glider) to the authority to double-check. The field NAMES are the truth:
+	// EastMps is east however the axes fall.
 	double EastMps = 0.0;
 	double NorthMps = 0.0;
 

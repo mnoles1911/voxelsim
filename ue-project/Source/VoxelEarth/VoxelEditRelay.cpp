@@ -4,6 +4,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Net/UnrealNetwork.h"
 #include "VoxelEarth.h"
+#include "VoxelSkySubsystem.h" // OnRep_SkyClock forwards the replicated clock -- F7 sky-epoch replication
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -21,6 +22,36 @@ void AVoxelEditRelay::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	DOREPLIFETIME(AVoxelEditRelay, ServerSeed);
 	DOREPLIFETIME(AVoxelEditRelay, ServerWorldGenVersion);
 	DOREPLIFETIME(AVoxelEditRelay, ServerProbeDigest);
+	DOREPLIFETIME(AVoxelEditRelay, ServerSkyEpochSeconds);
+	DOREPLIFETIME(AVoxelEditRelay, ServerSkyTimeScale);
+}
+
+void AVoxelEditRelay::AuthoritySetSkyClock(double EpochSeconds, float TimeScale)
+{
+	if (!HasAuthority())
+	{
+		return; // a client writing its own proxy would silently fork it from the server's truth
+	}
+	ServerSkyEpochSeconds = EpochSeconds;
+	ServerSkyTimeScale = TimeScale;
+}
+
+void AVoxelEditRelay::OnRep_SkyClock()
+{
+	// Client-only by construction (RepNotifies never fire on the authority).
+	// Forward-and-done, exactly the MulticastWaterDiffs shape: the relay is a
+	// transport, and every policy decision about the received clock -- adopt vs
+	// blend, the correction rate bound, the gate log line -- lives with the
+	// clock's owner, UVoxelSkySubsystem::AdoptReplicatedEpoch. UE applies every
+	// property in the bunch before invoking RepNotifies, so ServerSkyTimeScale
+	// is already this push's value here.
+	UWorld* World = GetWorld();
+	UVoxelSkySubsystem* Sky = World ? World->GetSubsystem<UVoxelSkySubsystem>() : nullptr;
+	if (!Sky)
+	{
+		return;
+	}
+	Sky->AdoptReplicatedEpoch(ServerSkyEpochSeconds, ServerSkyTimeScale);
 }
 
 void AVoxelEditRelay::BeginPlay()

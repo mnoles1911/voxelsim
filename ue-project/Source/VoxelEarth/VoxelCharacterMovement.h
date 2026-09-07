@@ -230,6 +230,12 @@ private:
 	bool bWaitingForTerrain = false;
 	bool bGroundedLastTick = false;
 	bool bSwimmingLastTick = false;
+
+	// Player surface-ripple sweep anchor (see the block after SetActorLocation
+	// in the .cpp): last tick's position while the waterline crossed the body,
+	// so this tick can sweep a disturbance along the actual travel.
+	FVector LastRipplePos = FVector::ZeroVector;
+	bool bHaveLastRipplePos = false;
 	bool bSprintEngagedLastTick = false;
 
 	float GaitPhase = 0.f;

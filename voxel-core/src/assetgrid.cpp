@@ -40,7 +40,7 @@ void AssetGrid::clear() {
     // Zero, not kVoxelSizeMm. A cleared grid must not answer `true` to
     // onTerrainLattice() -- that is the one question whose wrong answer stamps
     // a detail entity into the world.
-    voxelSizeMm_ = 0;
+    voxelSizeUm_ = 0;
     runMat_.clear();
     runLen_.clear();
     colRun_.clear();
@@ -56,7 +56,8 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     clear();
     if (blob == nullptr || bytes < kVxaHeaderBytes) return AssetParseError::kTooSmall;
     if (readU32(blob) != kVxaMagic) return AssetParseError::kBadMagic;
-    if (readU32(blob + 4) != kVxaVersion) return AssetParseError::kBadVersion;
+    const uint32_t version = readU32(blob + 4);
+    if (version != 3u && version != 4u) return AssetParseError::kBadVersion;
 
     const int32_t ox = readI32(blob + 8);
     const int32_t oy = readI32(blob + 12);
@@ -68,7 +69,8 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     // kVxaHeaderBytes moved 36 -> 40 and why a v1 blob is refused rather than
     // read: at these offsets a v1 file's run count would be read as its voxel
     // size and its first run record as its run count.
-    const uint32_t voxelMm = readU32(blob + 32);
+    const uint32_t wirePitch = readU32(blob + 32);
+    const uint64_t voxelUm = uint64_t(wirePitch) * (version == 3 ? 1000u : 1u);
     const uint32_t nruns = readU32(blob + 36);
     const uint32_t npartRuns = readU32(blob + 40);
     const uint32_t njoints = readU32(blob + 44);
@@ -87,7 +89,7 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     // uninitialised field without ever rejecting content, since the coarsest
     // thing anyone has baked is 100 mm.
     constexpr uint32_t kMaxVoxelMm = 4096u;
-    if (voxelMm == 0 || voxelMm > kMaxVoxelMm) return AssetParseError::kBadVoxelSize;
+    if (voxelUm == 0 || voxelUm > uint64_t(kMaxVoxelMm) * 1000u) return AssetParseError::kBadVoxelSize;
 
     const uint64_t cells = uint64_t(nx) * uint64_t(ny) * uint64_t(nz);
     const size_t bodyBytes = size_t(nruns) * kVxaRunBytes
@@ -114,7 +116,7 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     sizeX_ = static_cast<int32_t>(nx);
     sizeY_ = static_cast<int32_t>(ny);
     sizeZ_ = static_cast<int32_t>(nz);
-    voxelSizeMm_ = voxelMm;
+    voxelSizeUm_ = uint32_t(voxelUm);
     originX_ = ox;
     originY_ = oy;
     originZ_ = oz;

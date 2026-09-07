@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import mimetypes
+import re
 import struct
 import threading
 import traceback
@@ -30,7 +31,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import parts as partslib
-from . import (biomes as biomelib, contact, kinds as kindlib, materials, pipeline,
+from . import (biomes as biomelib, categories as catlib, contact,
+               kinds as kindlib, materials, pipeline,
                render, spec as specmod, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -65,7 +67,7 @@ PREVIEW_CM = float(os.environ.get("ASSET_FORGE_PREVIEW_CM", "10"))   # coarsest 
 
 # The tiers a preview may land on, finest first. Authored resolutions coarser
 # than a tier are never refined up to it.
-PREVIEW_TIERS = (1.0, 2.0, 2.5, 5.0, 10.0)
+PREVIEW_TIERS = (1.25, 2.5, 5.0, 10.0)
 
 # Ceiling on instances sent to the browser's 3D viewer. Above this the voxels
 # are thinned by a fixed stride -- a 2 cm emergent has tens of millions of
@@ -262,13 +264,16 @@ def _finest_within(spec: dict, budget: float, weight: float) -> float:
     the browser has to draw.
     """
     authored = float(specmod.get(spec, "resolution_cm"))
+    from . import resolution as resolutionlib
     for cm in PREVIEW_TIERS:
+        if cm not in map(float,resolutionlib.allowed(spec)):
+            continue
         if cm < authored:
             continue
         nx, ny, nz = render.predicted_extent(spec, cm / 100.0)
         if nx * ny * nz * weight <= budget:
             return cm
-    return max(PREVIEW_CM, authored)
+    return 10.0
 
 
 def preview_resolution(spec: dict) -> float:
@@ -341,6 +346,7 @@ def keep(spec: dict, seed: int) -> dict:
         "id": entry_id,
         "species": name,
         "kind": specmod.get(spec, "kind"),
+        "category": catlib.of(spec),
         "seed": seed,
         "spec_hash": specmod.spec_hash(spec),
         "stats": tree.stats,
@@ -348,7 +354,67 @@ def keep(spec: dict, seed: int) -> dict:
         "vox_models": models,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # THE KEEP-DRIVEN VERDICT (owner ruling 2026-09-05): keeping IS the
+    # approval gesture, so the spec file's curation block is re-derived from
+    # the library on every keep. See sync_curation_from_library.
+    cur = sync_curation_from_library(str(name), gesture="keep")
+    if cur is not None:
+        meta["curation"] = cur
     return meta
+
+
+def sync_curation_from_library(name: str, gesture: str) -> "dict | None":
+    """Re-derive a species' curation block from its KEPT library entries.
+
+    Owner ruling 2026-09-05 (supersedes the species+seed verdict model):
+    "Keep should be only human action in the Forge phase ... once it's kept
+    it goes to the library and then the library contents are used in our
+    game world." So the bank seed list is DERIVED -- `manifest.kept_seeds`
+    is the one derivation -- and this is its writer. Nobody hand-edits
+    seeds any more; the exporters keep reading the block exactly as before
+    (the block is now a derived record with the same bytes-on-disk law:
+    RAW file, curation block only, same dump format as /api/curation).
+
+    `gesture` says which human act triggered the sync, because the acts
+    differ on status:
+      * "keep":   the newest gesture is an approval -- status becomes
+                  approved even over an earlier rejection.
+      * "unkeep": removing a variant updates the seed list; it never
+                  UPGRADES a status. Removing the LAST kept seed of an
+                  approved species sets it back to draft (a species with no
+                  chosen content has nothing to publish -- and that was a
+                  human's deletion, not an auto-demotion); a rejected
+                  species stays rejected.
+
+    A grandfathered species (no block, no keeps) is returned untouched with
+    None: its bytes must not move -- that is the standing no-unpublish rule.
+    """
+    p = SPECS / f"{Path(name).name}.json"
+    if not name or not p.is_file():
+        return None
+    from . import manifest as manifestmod
+
+    kept = manifestmod.kept_seeds(LIBRARY, name)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    prior = raw.get("curation") or {}
+    if kept:
+        status = "approved" if (gesture == "keep" or not prior) \
+            else ("approved" if prior.get("status") != "rejected" else "rejected")
+        block = {"status": status, "seeds": kept,
+                 "notes": str(prior.get("notes", "") or "")}
+    elif prior:
+        status = "rejected" if prior.get("status") == "rejected" else "draft"
+        block = {"status": status,
+                 "seeds": prior.get("seeds") or [1],
+                 "notes": str(prior.get("notes", "") or "")}
+    else:
+        return None
+    if prior == block:
+        return specmod.curation(raw)     # already in sync: zero byte churn
+    raw["curation"] = block
+    p.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
+                 encoding="utf-8")
+    return specmod.curation(raw)
 
 
 def _size_m(spec: dict, kind: str) -> float:
@@ -372,6 +438,12 @@ def _size_m(spec: dict, kind: str) -> float:
         # bison reading "1.8" next to a trout reading "0.3" would be comparing
         # two different measurements in one column.
         return specmod.get(spec, "quad.length_m")
+    if kind == "artifact":
+        # LENGTH OVERALL for a hull, ROOT CHORD for a wing -- both of which are
+        # `artifact.length_m`, and neither of which is `height_m`, which an
+        # artifact never authors and which would read as 12 m for every craft in
+        # the library.
+        return specmod.get(spec, "artifact.length_m")
     return specmod.get(spec, "height_m")
 
 
@@ -393,6 +465,11 @@ def _shape_word(spec: dict, kind: str) -> str:
         # standing / sprawling / bipedal splits it into three groups that mean
         # something, and it is the row that decides the limb geometry.
         return specmod.get(spec, "quad.stance")
+    if kind == "artifact":
+        # THE FORM, which is the row that decides the entire parameter set, the
+        # camera, the grid and which of two generators runs. Same reasoning as
+        # the bird's pose above.
+        return specmod.get(spec, "artifact.form")
     return specmod.get(spec, "crown.shape")
 
 
@@ -532,8 +609,10 @@ def import_asset(name: str, kind: str, grid, source_format: str) -> dict:
     is no (spec, seed) that regenerates it, so routes that rebuild from the
     spec serve the stored files instead.
     """
+    specmod.resolutionlib.require({"kind":kind},grid.voxel_m*100)
     spec, _ = specmod.validate({
         "name": name, "kind": kind,
+        "resolution_cm": f"{grid.voxel_m*100:g}",
         "notes": f"imported from an outside 3D source ({source_format})",
     })
     entry_id = f"{name}-0001"
@@ -575,7 +654,7 @@ def import_asset(name: str, kind: str, grid, source_format: str) -> dict:
     return meta
 
 
-def grid_from_vox(blob: bytes, voxel_mm: int):
+def grid_from_vox(blob: bytes, voxel_mm: float):
     """A MagicaVoxel .vox (first model) as a VoxelGrid.
 
     Colours snap to the nearest forge material colour -- imports keep their
@@ -724,9 +803,29 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/kinds":
             return self._json([
                 {"key": k.key, "label": k.label, "blurb": k.blurb, "ready": k.ready,
+                 # The kind's DEFAULT category. A spec may override it, so the
+                 # per-species answer is on /api/specs and both come from
+                 # `forge.categories.of` -- one resolver, so the kind bar and
+                 # the species list cannot disagree.
+                 "category": catlib.BY_KIND.get(k.key),
+                 "voxel_pitches_mm": [float(c)*10 for c in specmod.resolutionlib.allowed({"kind":k.key})],
                  "species": sum(1 for _, s in self._all_specs()
                                 if specmod.get(s, "kind") == k.key)}
                 for k in kindlib.KINDS
+            ])
+
+        if path == "/api/categories":
+            # THE QUERY SEAM, over HTTP. Same answer as
+            # `library/categories.json` (tools/export_categories.py) and the
+            # same resolver behind it; this one is live and that one is what a
+            # game reads without running Python.
+            loaded = [(specmod.get(s, "name"), s) for _p, s in self._all_specs()]
+            return self._json([
+                {"key": c.key, "label": c.label, "blurb": c.blurb,
+                 "kinds": list(c.kinds), "scattered": c.scattered,
+                 "in_manifest": c.in_manifest,
+                 "species": catlib.members(c.key, loaded)}
+                for c in catlib.CATEGORIES
             ])
 
         if path == "/api/vocabulary":
@@ -767,7 +866,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "kept": kept.get(name, 0),
                                 "size_m": _size_m(s, kind),
                                 "model": (kind if kind in ("rock", "fish", "cetacean", "bird",
-                                                   "quadruped")
+                                                   "quadruped", "artifact")
                                           else specmod.get(s, "growth.model")),
                             })
                     members.sort(key=lambda m: -m["weight"])
@@ -783,16 +882,29 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/specs":
             want = q.get("kind") or None
+            want_cat = q.get("category") or None
             out = []
             for p, s in self._all_specs():
                 kind = specmod.get(s, "kind")
                 if want and kind != want:
+                    continue
+                if want_cat and catlib.of(s) != want_cat:
                     continue
                 out.append(
                     {
                         "name": specmod.get(s, "name"),
                         "file": p.name,
                         "kind": kind,
+                        # WHAT it is, and whether a human said so or the kind
+                        # decided -- two different facts, printed as two, the
+                        # same way `curation` distinguishes an approved species
+                        # from a grandfathered one.
+                        "category": catlib.of(s),
+                        "category_via": catlib.source_of(s),
+                        # The grouping label, when authored: "eels" over kind
+                        # `fish`. Absent means the species groups under its
+                        # kind. A label, never a generator.
+                        "subcategory": s.get("subcategory"),
                         "hash": specmod.spec_hash(s),
                         "size_m": _size_m(s, kind),
                         "height_m": specmod.get(s, "height_m"),
@@ -863,11 +975,29 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/voxels":
             # Binary surface voxels for the 3D viewer. Regenerated from
             # (spec, seed) like the detail render -- deterministic build means
-            # this is exactly the tree the thumbnail showed.
+            # this is exactly the tree the thumbnail showed. Three addresses:
+            #   ?job=&seed=   a generate-job's variant (the Forge detail view)
+            #   ?id=          a KEPT library entry (the library inspector)
+            #   ?name=&seed=  any (species, bank seed), regenerated from
+            #                 specs/ -- the judgment viewport's address, so a
+            #                 species with NOTHING kept (the whole
+            #                 never-reviewed queue) can still be orbited
+            #                 before its verdict. Callers append the spec
+            #                 hash as ?v= so the immutable cache below stays
+            #                 honest across spec edits; the server ignores it.
             job = FORGE.get(q.get("job", ""))
             grid = None
             if job:
                 spec, seed = job.spec, int(q["seed"])
+            elif q.get("name"):
+                p = SPECS / f"{Path(q['name']).name}.json"
+                if not p.is_file():
+                    return self._json({"error": "no such spec"}, 404)
+                spec, _ = specmod.load(p)
+                try:
+                    seed = int(q.get("seed", 1))
+                except ValueError:
+                    return self._json({"error": "seed must be a whole number"}, 400)
             else:
                 d = library_dir(Path(q.get("id", "")).name)
                 if not d:
@@ -973,6 +1103,79 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "say what you want changed"}, 400)
             return self._json(language.interpret(spec, request))
 
+        if path == "/api/create":
+            # A species from a sentence -- LOCAL (forge/language.py), same
+            # doctrine as /api/interpret. The server owns the one thing the
+            # grammar cannot know: name collisions against specs/ on disk.
+            from . import language
+
+            request = str(body.get("request", "")).strip()
+            if not request:
+                return self._json({"error": "describe the species to create"}, 400)
+            out = language.create(request)
+            if out["spec"] is not None:
+                name = base_name = Path(out["name"]).name
+                n = 2
+                while (SPECS / f"{name}.json").exists():
+                    name = f"{base_name}-{n}"
+                    n += 1
+                if name != base_name:
+                    specmod.set_(out["spec"], "name", name)
+                    out["name"] = name
+                    out["understood"].append(
+                        f"named '{name}' ('{base_name}' already exists)")
+            return self._json(out)
+
+        if path == "/api/create-llm":
+            # The guided creation flow (owner directive 2026-09-05): the
+            # human fixed category -> kind/sub-category -> name in the UI;
+            # the description routes through the Claude lane against the
+            # kind's defaults (local grammar as the offline fallback,
+            # labelled by `source`). The server owns the name collision and
+            # SAVES the draft spec so the new species is in the ledger
+            # immediately -- review then runs keep-driven like everything
+            # else.
+            from . import llm
+
+            request = str(body.get("request", "")).strip()
+            kind = str(body.get("kind", "")).strip()
+            name = Path(str(body.get("name", "new-species"))).name.strip().lower()
+            name = re.sub(r"[^a-z0-9\-]+", "-", name).strip("-") or "new-species"
+            if not request:
+                return self._json({"error": "describe what to generate"}, 400)
+            base_name, n = name, 2
+            while (SPECS / f"{name}.json").exists():
+                name = f"{base_name}-{n}"
+                n += 1
+            out = llm.create_llm(
+                kind, name, request,
+                subcategory=(str(body["subcategory"]).strip()
+                             if body.get("subcategory") else None),
+                wants_new_generator=bool(body.get("new_subcategory")))
+            if out.get("spec") is None:
+                return self._json(out, 400)
+            specmod.save(out["spec"], SPECS / f"{name}.json")
+            out["saved"] = f"{name}.json"
+            if name != base_name:
+                out["understood"] = [f"named '{name}' ('{base_name}' already "
+                                     f"exists)"] + out["understood"]
+            return self._json(out)
+
+        if path == "/api/interpret-llm":
+            # The Claude lane (forge/llm.py): the ONE route that sends text
+            # off this machine, on the owner's subscription via the claude
+            # CLI -- opt-in per use and labelled in the UI. The reply is
+            # post-validated and lands only through spec.patch; on any
+            # failure the local grammar answers instead, and the response
+            # says which lane answered (`source`).
+            from . import llm
+
+            spec, _ = specmod.validate(body.get("spec") or {})
+            request = str(body.get("request", "")).strip()
+            if not request:
+                return self._json({"error": "say what you want changed"}, 400)
+            return self._json(llm.interpret_llm(spec, request))
+
         if path == "/api/save-spec":
             spec, rep = specmod.validate(body.get("spec") or {})
             name = Path(str(specmod.get(spec, "name") or "unnamed")).name
@@ -1020,6 +1223,23 @@ class Handler(BaseHTTPRequestHandler):
             meta = keep(spec, int(body["seed"]))
             return self._json(meta)
 
+        if path == "/api/publish":
+            # ONE publisher, two callers (the plan-P2 law): this shells the
+            # same tools/publish.py the CLI runs and returns its full report.
+            # Blocking on purpose -- publish is minutes at worst (bank bakes
+            # are hash-skipped), and a fake-async publish whose report nobody
+            # reads is how a failed export ships.
+            import subprocess
+            import sys as _sys
+
+            proc = subprocess.run(
+                [_sys.executable, str(ROOT / "tools" / "publish.py")],
+                cwd=str(ROOT), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=1800)
+            report = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+            return self._json({"ok": proc.returncode == 0,
+                               "report": report})
+
         if path == "/api/library/delete":
             d = library_dir(Path(str(body.get("id", ""))).name)
             if not d:
@@ -1031,9 +1251,18 @@ class Handler(BaseHTTPRequestHandler):
             # Drop the species folder too once its last entry is gone, so the
             # library does not accumulate empty directories.
             parent = d.parent
+            species = parent.name
             if parent != LIBRARY and not any(parent.iterdir()):
                 parent.rmdir()
-            return self._json({"deleted": d.name})
+            # Keep-driven model: the bank IS the kept set, so removing a
+            # variant re-derives the verdict's seed list (and the last one
+            # going sets an approved species back to draft -- a human's
+            # deletion, not an auto-demotion).
+            cur = sync_curation_from_library(species, gesture="unkeep")
+            out = {"deleted": d.name}
+            if cur is not None:
+                out["curation"] = cur
+            return self._json(out)
 
         if path == "/api/sheet":
             # Contact sheet of the current job, written to out/.
@@ -1251,15 +1480,18 @@ class Handler(BaseHTTPRequestHandler):
                         if tmp:
                             os.unlink(tmp)
                 elif fmt == "vox":
-                    voxel_mm = int(body.get("voxel_mm", 100))
-                    if not (10 <= voxel_mm <= 1000):
-                        return self._json({"error": "voxel_mm must be 10-1000"}, 400)
+                    voxel_mm = float(body.get("voxel_mm", 100))
+                    if voxel_mm not in [float(c)*10 for c in specmod.resolutionlib.allowed({"kind":kind})]:
+                        return self._json({"error": "voxel_mm must be one of the supported pitches for this kind"}, 400)
                     grid = grid_from_vox(blob, voxel_mm)
                 else:
                     return self._json({"error": "format must be 'vox' or 'vxa'"}, 400)
             except ValueError as e:
                 return self._json({"error": str(e)}, 400)
-            return self._json(import_asset(name, kind, grid, fmt))
+            try:
+                return self._json(import_asset(name, kind, grid, fmt))
+            except ValueError as e:
+                return self._json({"error":str(e)},400)
 
         return self._json({"error": "no such route"}, 404)
 

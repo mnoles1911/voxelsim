@@ -172,7 +172,7 @@ struct AssetManifestSpecies {
     AssetWaterKind waterKind = AssetWaterKind::kAny;
     uint8_t waterMask = 0;
     uint16_t seedsBaked = 0;
-    uint32_t voxelSizeMm = 0;
+    double voxelSizeMm = 0;
     uint16_t biomeWeightPerMille[kBiomeCount] = {};
     uint16_t abundanceQ10 = 0;
     uint16_t clusterQ10 = 0;
@@ -342,7 +342,7 @@ private:
 struct AssetCoverPitchRefusal {
     std::string name;            // banks/<name>/<name>-NNNN.vxa
     AssetKind kind = AssetKind::kTree;
-    uint32_t voxelSizeMm = 0;    // what it was actually baked at
+    double voxelSizeMm = 0;    // what it was actually baked at
 };
 
 // Every DETAIL-lattice, scattered species whose bake pitch is not `pitchMm`.

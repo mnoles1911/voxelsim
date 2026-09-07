@@ -5,6 +5,8 @@
 #include "GameFramework/Actor.h"
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
+#include "VoxelEarth.h" // LogVoxelEarth, for the player-ripple witness below
+#include "VoxelRippleField.h"
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -150,14 +152,21 @@ bool UVoxelCharacterMovementComponent::IsInWaterAt(const FVector& Pos) const
 		return false;
 	}
 	// The water subsystem owns the full predicate (simulated water, the
-	// implicit field, and the open-sea datum). Without it -- a world with no
-	// water simulation -- fall back to the datum half alone, which still needs
-	// the terrain: "below sea level" on its own is what this replaced.
+	// implicit field, and the open-sea datum -- which, since Phase A of the
+	// tides plan, is the TIDAL datum: IsUnderwaterAtWorld routes through
+	// IsOpenSeaNowAtWorld, so swimming follows the waterline as it rises and
+	// falls with no code here). Without the subsystem -- a world with no water
+	// simulation -- fall back to the datum half alone, which still needs the
+	// terrain: "below sea level" on its own is what this replaced.
 	if (UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
 	{
 		return Water->IsUnderwaterAtWorld(Pos);
 	}
 	UVoxelWorldSubsystem* Terrain = GetVoxelWorldSubsystem();
+	// STILL THE STATIC, GEOLOGICAL FORM, deliberately: this branch only runs
+	// when there is no water subsystem, and the tide lives on the subsystem
+	// (its state IS the instance -- no instance, no tide anywhere in this
+	// world, so kSeaLevelMm is not an approximation here, it is the answer).
 	return Terrain && UVoxelWaterSubsystem::IsOpenSeaAtWorld(
 	                      Pos.Z, Terrain->GetSurfaceHeightUU(Pos.X, Pos.Y));
 }
@@ -883,6 +892,70 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	}
 
 	Owner->SetActorLocation(NewPos);
+
+	// --- Player surface ripples (2026-09-06, owner session 9: "No player
+	// ripples either") -----------------------------------------------------
+	//
+	// The ripple field's own tuning block (VoxelRipple::kMinImpactFraction,
+	// "wading in still makes something rather than nothing") was written for
+	// exactly this caller, and until today nothing called it: only the boat
+	// and the glider ditch injected. The gate is "the waterline crosses the
+	// body" -- feet in water, head (plus half a metre) out -- so wading and
+	// surface swimming stir the field while a deep diver does not paint
+	// surface rings from the bottom of a lake. Strength rides the same
+	// saturating speed ramp as every other injector, on the boat's bow-wake
+	// scale (a torso is narrower than a hull, so width sits below
+	// BowWakeWidthM and strength below BowWakeStrengthM). A swept splat, not
+	// a per-tick drop, for the reason AddSweptDisturbance exists: sub-splats
+	// share one frame's slots, so a fast wader cannot outrun their own rings.
+	{
+		const FVector FeetProbe(NewPos.X, NewPos.Y, NewPos.Z - GetHalfExtentZ() + 5.0);
+		const FVector HeadProbe(NewPos.X, NewPos.Y, NewPos.Z + GetHalfExtentZ() + 50.0);
+		const bool bAtWaterSurface = IsInWaterAt(FeetProbe) && !IsInWaterAt(HeadProbe);
+		// PLAYER-RIPPLE WITNESS (2026-09-06), same reason as the boat's: the
+		// owner reports no rings, and "feet never read wet", "head reads wet
+		// too", and "too slow" are indistinguishable from outside. Throttled
+		// to 1 Hz and only while actually in contact with water, so walking
+		// around on dry land says nothing.
+		{
+			static double LastRippleReportSeconds = 0.0;
+			const double NowSeconds = FPlatformTime::Seconds();
+			const bool bFeetWet = IsInWaterAt(FeetProbe);
+			if (bFeetWet && !bAtWaterSurface && NowSeconds - LastRippleReportSeconds >= 1.0)
+			{
+				LastRippleReportSeconds = NowSeconds;
+				UE_LOG(LogVoxelEarth, Display,
+				       TEXT("[player-ripple] DECLINED: feet wet but head ALSO wet (fully "
+				            "submerged), so no surface ring. Speed %.2f m/s."),
+				       HorizontalVelocity.Size() / 100.0);
+			}
+		}
+		if (bAtWaterSurface && bHaveLastRipplePos)
+		{
+			const double SpeedMPS = HorizontalVelocity.Size() / 100.0;
+			static double LastSlowReportSeconds = 0.0;
+			const double NowSlow = FPlatformTime::Seconds();
+			if (SpeedMPS <= 0.15 && NowSlow - LastSlowReportSeconds >= 1.0)
+			{
+				LastSlowReportSeconds = NowSlow;
+				UE_LOG(LogVoxelEarth, Display,
+				       TEXT("[player-ripple] at the surface but too slow to ring: %.2f m/s "
+				            "(needs > 0.15)."),
+				       SpeedMPS);
+			}
+			if (SpeedMPS > 0.15)
+			{
+				const double Frac = FMath::Max(
+					VoxelRipple::kMinImpactFraction,
+					FMath::Min(1.0, SpeedMPS / VoxelRipple::kFullImpactSpeedMPS));
+				UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt(
+					GetWorld(), LastRipplePos, NewPos,
+					/*RadiusM=*/0.45f, /*StrengthM=*/float(0.020 * Frac));
+			}
+		}
+		LastRipplePos = NewPos;
+		bHaveLastRipplePos = bAtWaterSurface;
+	}
 
 	// Gait phase advances with DISTANCE travelled, not time, so the limb swing
 	// and camera bob speed up with the character rather than running at a fixed

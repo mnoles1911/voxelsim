@@ -9,7 +9,7 @@ import { allowedBiomes } from "../lib/schema";
 import { kindIcon } from "../lib/kindIcons";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
-import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import { FloatingPanel } from "./ui/floating-panel";
 import { useToast } from "./ui/toast";
 import { CurationBadge } from "./LibraryView";
 import { VoxelCanvas, type DecodedInfo } from "./VariantViewer";
@@ -63,9 +63,21 @@ export function LibraryInspector({
   const allowed = allowedBiomes(row, world.biomes);
 
   return (
-    <Dialog open onOpenChange={(o) => !o && onOpenChange(null)}>
-      <DialogContent className="max-w-5xl">
-        <DialogTitle className="flex items-center gap-2 pr-8">
+    /* Same floating-panel semantics as the Forge's variant view (owner
+     * directive 2026-09-05): 2x the old dialog by default, drag the title
+     * bar to move, the corner to resize, remembered in localStorage under
+     * its own key. The canvas fills the panel's height. */
+    <FloatingPanel
+      /* -v2: viewport-relative default per the half-the-screen directive;
+       * the key bump makes it beat any earlier persisted box. */
+      storageKey="af-panel-library-inspector-v2"
+      defaultSize={{
+        w: Math.max(900, Math.round(window.innerWidth * 0.6)),
+        h: Math.round(window.innerHeight * 0.92),
+      }}
+      onClose={() => onOpenChange(null)}
+      title={
+        <span className="flex items-center gap-2 pr-6">
           <Icon className="h-5 w-5 text-gold-400" />
           {entry.id}
           {entry.imported && <Badge variant="gold">imported</Badge>}
@@ -73,14 +85,16 @@ export function LibraryInspector({
           {row.curation.seeds.includes(entry.seed) && !entry.imported && (
             <Badge variant="outline" title="This seed is in the published bank">in bank</Badge>
           )}
-        </DialogTitle>
-
-        <div className="grid gap-4 lg:grid-cols-[1fr_290px]">
-          <div>
+        </span>
+      }
+    >
+        <div className="grid h-full gap-4 lg:grid-cols-[1fr_290px]">
+          <div className="flex h-full min-h-0 flex-col">
             <VoxelCanvas
               src={api.voxelsUrl(entry.id)}
               palette={world.palette}
-              className="h-[480px]"
+              wrapperClassName="min-h-0 flex-1"
+              className="h-full"
               onDecoded={setDecoded}
             />
             {/* seed switching without losing the camera */}
@@ -113,7 +127,7 @@ export function LibraryInspector({
             )}
           </div>
 
-          <div className="flex min-w-0 flex-col gap-3">
+          <div className="flex min-w-0 flex-col gap-3 overflow-y-auto">
             <table className="w-full border-collapse font-mono text-xs">
               <tbody>
                 {(
@@ -158,7 +172,11 @@ export function LibraryInspector({
               </div>
             </div>
 
-            {/* the tie to the app's other half: where this asset places */}
+            {/* the tie to the app's other half: where this asset places.
+              * ABSENT for vehicles (owner directive 2026-09-05): entity
+              * kinds are outside world composition per ADR-0010, so there
+              * is nothing here to tie to. */}
+            {row.category !== "craftable" && (
             <div>
               <div className="mb-1 flex items-center gap-1.5 font-display text-xs uppercase tracking-widest text-parch-400">
                 <MapIcon className="h-3.5 w-3.5" /> Placed under
@@ -184,6 +202,7 @@ export function LibraryInspector({
                 Edit placement in the panel below
               </Button>
             </div>
+            )}
 
             <div className="mt-auto flex flex-col gap-2">
               <div className="flex gap-2">
@@ -234,7 +253,6 @@ export function LibraryInspector({
             </div>
           </div>
         </div>
-      </DialogContent>
-    </Dialog>
+    </FloatingPanel>
   );
 }

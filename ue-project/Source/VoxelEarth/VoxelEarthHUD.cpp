@@ -1,4 +1,5 @@
 #include "VoxelEarthHUD.h"
+#include "VoxelTreeFellingPrototype.h"
 
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
@@ -101,27 +102,32 @@ void AVoxelEarthHUD::DrawHUD()
 		return;
 	}
 
-	// docs/debug-tooling-plan.md P1 "Perf HUD": mode >= 1 (mode 2 additionally
-	// activates the 3D visualization layers, handled in VoxelWorldSubsystem).
-	if (VoxelDebug::GetDebugMode() >= 1)
+	// EVERY DIAGNOSTIC BEHIND ONE TOGGLE, AND NOTHING ELSE DRAWN HERE
+	// (owner ruling, 2026-09-06, ahead of the Voxelmark HUD integration):
+	// "Kill crosshair. Remove mode line. Bottom left text block can be killed.
+	// Kill charge bar. All debug and diagnostics can stay but gate them behind
+	// a F1 or F3 overlay."
+	//
+	// So this function no longer paints ANY always-on player-facing element.
+	// The crosshair, the walk/fly mode line, the dig-size and palette text and
+	// the F-charge bar are gone -- the designed HUD owns that layer now, and a
+	// Canvas element drawn underneath it would be a second, unstyled UI that
+	// nobody can theme.
+	//
+	// DrawPerfHUD draws the stream panel and the fps line itself (see its call
+	// to DrawStreamPanel), so gating it here merges all four diagnostics --
+	// perf, stream, fps, tunables -- onto the single F1 toggle the ruling asks
+	// for. The debug-mode arm is KEPT beside it because that is how automated
+	// legs request the perf panel without a keypress; it is a developer mode by
+	// definition and cannot appear in normal play.
+	if (bOverlayVisible || VoxelDebug::GetDebugMode() >= 1)
 	{
 		DrawPerfHUD();
 	}
-
-	// Usability task: F1 overlay (default OFF -- see the header) and the
-	// always-on walk/fly mode line.
 	if (bOverlayVisible)
 	{
 		DrawDebugOverlay();
 	}
-	DrawModeLine();
-
-	// Crosshair: a small filled dot at the screen center (dig/place always
-	// traces camera-through-crosshair, m1-plan.md "Cameras" row).
-	const float CenterX = Canvas->SizeX * 0.5f;
-	const float CenterY = Canvas->SizeY * 0.5f;
-	DrawRect(FLinearColor(1.f, 1.f, 1.f, 0.9f), CenterX - CrosshairHalfSizePx, CenterY - CrosshairHalfSizePx,
-	         CrosshairHalfSizePx * 2.f, CrosshairHalfSizePx * 2.f);
 
 	const AVoxelEarthPlayerController* VoxelPC = Cast<AVoxelEarthPlayerController>(PlayerOwner);
 	if (!VoxelPC)
@@ -129,26 +135,44 @@ void AVoxelEarthHUD::DrawHUD()
 		return;
 	}
 
-	// Bottom-left text block: dig/place size and palette material.
+	// THE DIG PREVIEW WIREFRAME IS DELIBERATELY KEPT. It shared a code block
+	// with the bottom-left text the ruling removed, but it is not text and not
+	// decoration: it is the only remaining thing that shows WHERE a dig or
+	// place will land now that the crosshair is gone. Removing it as well would
+	// leave the player aiming blind until the designed HUD supplies its own
+	// reticle.
 	const int32 DigSize = VoxelPC->GetDigSizeVoxels();
-	const FString DigSizeText = FString::Printf(TEXT("Dig %dx%dx%d"), DigSize, DigSize, DigSize);
-	const FString MaterialText = FString::Printf(TEXT("Place: %s"), *PaletteMaterialName(VoxelPC->GetPaletteMaterialId()));
-
-	float LineY = Canvas->SizeY - MarginPx - LineHeightPx * 2.f;
-	DrawText(DigSizeText, FLinearColor::White, MarginPx, LineY, nullptr, 1.f, false);
-	LineY += LineHeightPx;
-	DrawText(MaterialText, FLinearColor::White, MarginPx, LineY, nullptr, 1.f, false);
-
-	// "F charge" bar while charging (m1-plan.md HUD row), drawn just above
-	// the two text lines.
-	if (VoxelPC->IsChargingExplosive())
+	const bool AxeEquipped=VoxelTreeFelling::IsEquipped(GetWorld());
+	const FString DigSizeText = FString::Printf(TEXT("%s: %d mm per side | 2:100  3:200  4:300 mm"), AxeEquipped?TEXT("Stone axe"):TEXT("Mine"), DigSize * 100);
+	if (!VoxelPC->bShowMouseCursor)
 	{
-		const float BarY = Canvas->SizeY - MarginPx - LineHeightPx * 2.f - ChargeBarHeightPx - 6.f;
-		DrawRect(FLinearColor(0.1f, 0.1f, 0.1f, 0.6f), MarginPx, BarY, ChargeBarWidthPx, ChargeBarHeightPx);
-		const float Alpha = VoxelPC->GetExplosiveChargeAlpha();
-		DrawRect(FLinearColor(1.f, 0.45f, 0.05f, 0.95f), MarginPx, BarY, ChargeBarWidthPx * Alpha, ChargeBarHeightPx);
-		DrawText(TEXT("F charge"), FLinearColor::White, MarginPx, BarY - LineHeightPx, nullptr, 1.f, false);
+		FVector Eye; FRotator Aim;
+		VoxelPC->GetPlayerViewPoint(Eye, Aim);
+		FBox Bounds;
+		if (auto Terrain = GetWorld()->GetSubsystem<UVoxelWorldSubsystem>(); Terrain && (AxeEquipped ? VoxelTreeFelling::GetPreview(GetWorld(),Eye,Aim.Vector(),DigSize,Bounds) : Terrain->GetDigPreview(Eye, Aim.Vector(), DigSize, Bounds)))
+		{
+			FVector2D Corners[8]; bool Visible[8];
+			for (int32 I = 0; I < 8; ++I)
+			{
+				const FVector P((I & 1) ? Bounds.Max.X : Bounds.Min.X, (I & 2) ? Bounds.Max.Y : Bounds.Min.Y, (I & 4) ? Bounds.Max.Z : Bounds.Min.Z);
+				Visible[I] = VoxelPC->ProjectWorldLocationToScreen(P, Corners[I], true);
+			}
+			for (int32 I = 0; I < 8; ++I) for (int32 Axis = 0; Axis < 3; ++Axis)
+			{
+				const int32 J = I ^ (1 << Axis);
+				if (I < J && Visible[I] && Visible[J])
+				{
+					DrawLine(Corners[I].X, Corners[I].Y, Corners[J].X, Corners[J].Y, FLinearColor::Black, 4.f);
+					DrawLine(Corners[I].X, Corners[I].Y, Corners[J].X, Corners[J].Y, FLinearColor(1.f, .8f, .3f), 2.f);
+				}
+			}
+		}
 	}
+	// The dig-size and palette-material text lines and the "F charge" bar that
+	// used to be drawn here are REMOVED per the same ruling. Their data is not
+	// lost -- GetDigSizeVoxels, GetPaletteMaterialId, IsChargingExplosive and
+	// GetExplosiveChargeAlpha are all still on the controller, so the designed
+	// HUD reads exactly the same sources when it takes over those readouts.
 }
 
 void AVoxelEarthHUD::DrawPerfHUD()
@@ -1201,6 +1225,11 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 	DrawOverlayInfo(TEXT("LMB dig   RMB place   1/2/3 dig size   F hold-throw   F3 debug"), kOverlayInfo, PanelX, Y);
 }
 
+// NO LONGER CALLED (owner ruling 2026-09-06, "Remove mode line"). Kept rather
+// than deleted for one reason and only for one: the designed HUD may want the
+// same walk/fly readout in its own styling, and this is the function that knows
+// where the state lives. If the Voxelmark HUD lands without needing it, delete
+// this and its declaration -- do not leave it here as permanent dead code.
 void AVoxelEarthHUD::DrawModeLine()
 {
 	// Never in a headless verification capture (see the header). The overlay

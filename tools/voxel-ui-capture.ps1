@@ -200,7 +200,7 @@ Write-Host "editor exited with code $($process.ExitCode)"
 # list is worth reading. "VoxelFrontEnd: suppressed (...)" means the picture is
 # of an empty world, not of a menu.
 if (Test-Path $LogPath) {
-    $verdicts = Select-String -Path $LogPath -Pattern 'VoxelFrontEnd:|VoxelLoadGate:' -ErrorAction SilentlyContinue
+    $verdicts = Select-String -Path $LogPath -Pattern 'VoxelFrontEnd:|VoxelLoadGate:|LoadScreen:' -ErrorAction SilentlyContinue
     if ($verdicts) {
         Write-Host ''
         Write-Host '--- front-end log lines ---------------------------------------'

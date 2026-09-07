@@ -56,6 +56,20 @@ class Kind:
 # lattice that matters is the one the world uses, and half the library cannot
 # join it at any size. `tools/all_to_10cm.py` is the move back, and
 # `forge.cli.selftest` refuses a terrain-lattice spec that is not at 10 cm.
+# "entity" -- vehicles and anything else SPAWNED as an independent object with
+# its own transform (ADR-0010, docs/adr/0010-two-lattice-jurisdictions.md). It
+# is deliberately a THIRD value and not a synonym for "detail", because the two
+# differ in the one place it matters: a detail asset is still world content --
+# it is scattered by the manifest, it goes in a bank, it belongs to a biome --
+# and an entity is none of those. The ADR is explicit that per-entity pitch is
+# NOT "an entity lattice": there is no shared grid, only a per-asset `voxel_mm`
+# under a per-entity transform. The word here names the JURISDICTION, not a
+# grid.
+#
+# What reads it: `forge.cli selftest` (only "terrain" is pinned to 10 cm) and
+# `forge.manifest.species_record`, which refuses to compose an entity kind into
+# the world rather than letting it fall through the KIND_ORDER check as an
+# "unknown kind". Nothing else, on purpose.
 TERRAIN_LATTICE_CM = 10.0
 
 
@@ -151,6 +165,31 @@ KINDS: tuple[Kind, ...] = (
          "tail. Three stances — standing, sprawling and bipedal. Voxel size is "
          "per species: 1 cm for a squirrel, 5 cm for a bison.", True,
          ("quad", "herd")),
+    # THE FIRST KIND THAT WAS NEVER ALIVE, and the first ENTITY kind
+    # (ADR-0010). A canoe and a hang glider are rigid human-made objects: they
+    # do not grow, they have no habit, no allometry and no species variation to
+    # speak of, and the thing that makes them recognisable is a drawn line --
+    # a sheer, a rocker, a sweep -- rather than a growth model.
+    #
+    # SO THE GENERATOR IS DELIBERATELY THE SIMPLEST ONE HERE. No recursion, no
+    # skeleton, no competition: two closed-form families evaluated as FIELDS
+    # over the whole grid at once -- a lofted hull (watercraft) and a thin
+    # panel on spars (aircraft) -- plus a handful of struts drawn with the
+    # capsule primitive that already exists. Every shape rule this package has
+    # paid for falls out of that: quantising a field rather than stacking
+    # stations is what stops contour rings, and there is no per-voxel thinning
+    # pass to ruin a silhouette at 2.5 cm.
+    #
+    # THEY DO NOT BAKE. An entity is excluded from world composition, carries
+    # no biome weight and produces no bank; the .vxa is loaded by the engine's
+    # entity path at its own pitch. See `forge/artifact.py` and
+    # `forge/manifest.py:species_record`.
+    # Generator identity is independent of the object's browsing subcategory.
+    # Vehicles, tools, materials and components share this procedural generator.
+    Kind("artifact", "Craftable objects",
+         "Human-made objects: vehicles, tools, materials and components. "
+         "Each asset has its own voxel pitch and transform.", True,
+         ("artifact",), lattice="entity"),
 )
 
 BY_KEY = {k.key: k for k in KINDS}

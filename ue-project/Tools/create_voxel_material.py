@@ -66,6 +66,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from terrain_material_common import build_terrain_base_color  # noqa: E402
 from sky_star_graph import SkyGraphBuilder  # noqa: E402
 from bathy_field_graph import sample_bathy_field  # noqa: E402
+# Phase F1: the shared caustic field. The lake and sea FLOORS are this
+# material, so the caustics land here (and on the clipmap, and in
+# M_Underwater) rather than in a water material -- all three consume one
+# module for the one-implementation reason every shared graph in this
+# directory states.
+from water_caustics_graph import build_caustics  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelTerrain"
@@ -245,6 +251,44 @@ def main():
         roughness = b.lerp(roughness, "", b.scalar("WetShoreRoughness", 0.22), "", wet)
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness failed")
+
+    # --- PHASE F1: CAUSTICS ON THE SUBMERGED FLOOR ---------------------------
+    #
+    # The lake and sea floors ARE this material, so the caustic light lands
+    # here. Everything about the term -- the field, the sun-altitude gate, the
+    # depth absorption down the sun ray, the 40->64 m distance fade, the
+    # CausticIntensity(MPC)/CausticsEnabled controls -- is
+    # water_caustics_graph's and is documented there; this call site owns only
+    # its three inputs and the output pin.
+    #
+    # depth_m IS bathy R TIMES VALIDITY, and that one expression covers BOTH
+    # waters: the lake bake fills R with lake depth, and the B5 ocean fill
+    # (VoxelBathyField.cpp) writes ocean depth -- seaNow minus ground, done in
+    # C++ where the datum legally lives -- into the same plane. Validity
+    # gating means an unbaked or out-of-window texel gets depth 0 = dry = no
+    # caustic, which fails to the known-good picture.
+    #
+    # EMISSIVE, because this is ADDED LIGHT arriving through the water, not
+    # albedo: on BaseColor it would be multiplied by AO and by the diffuse
+    # term, so caustics would dim in occluded corners the sun is actually
+    # focusing into. The pin was free on this material (the clipmap's is not
+    # -- it sums there).
+    #
+    # ONE Time node, created HERE and not in the module, per build_wave_field's
+    # convention: a consumer that ever grows a freeze arm substitutes this one
+    # node and provably freezes the whole term.
+    caustic_time = mel.create_material_expression(
+        material, unreal.MaterialExpressionTime, -1300, 2340)
+    caustic_wp = mel.create_material_expression(
+        material, unreal.MaterialExpressionWorldPosition, -1300, 2260)
+    caustic_xy = b.mask(caustic_wp, "", r=True, g=True)
+    caustic_pos_m = b.mul(caustic_xy, b.const(0.01))
+    caustic_depth_m = b.mul(bathy["depth_m"], bathy["validity"])
+    caustics = build_caustics(
+        b, sky_collection, caustic_pos_m, caustic_time, caustic_depth_m)
+    if not mel.connect_material_property(
+            caustics["light"], "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+        raise RuntimeError("connect caustics -> EmissiveColor failed")
 
     # One-sided: absolute quad winding was verified empirically on 5.8
     # (2026-07-19) — front faces render correctly without two-sided cost.

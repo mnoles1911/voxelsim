@@ -1,0 +1,53 @@
+{
+  "scope": "Logical reachability only; not gameplay, mass, quantity, geography or economy validation.",
+  "resources": 19,
+  "capabilities": 50,
+  "rules": 52,
+  "checks": [
+    {
+      "name": "All defined capabilities have a bootstrap route",
+      "result": "PASS",
+      "reachable_capabilities": 50
+    },
+    {
+      "name": "No metals: raft, pottery, textiles and farming remain possible",
+      "result": "PASS",
+      "reachable_capabilities": 25
+    },
+    {
+      "name": "No tin: iron, steel and water power remain possible",
+      "result": "PASS",
+      "reachable_capabilities": 47
+    },
+    {
+      "name": "No copper: surface iron avoids a copper-pick bootstrap cycle",
+      "result": "PASS",
+      "reachable_capabilities": 46
+    },
+    {
+      "name": "No power site: advanced hand workshop remains possible",
+      "result": "PASS",
+      "reachable_capabilities": 45
+    },
+    {
+      "name": "No bamboo: log raft remains possible",
+      "result": "PASS",
+      "reachable_capabilities": 49
+    },
+    {
+      "name": "No iron: bronze-driven milling remains possible",
+      "result": "PASS",
+      "reachable_capabilities": 41
+    },
+    {
+      "name": "No bellows: thermal metallurgy stays blocked",
+      "result": "PASS",
+      "reachable_capabilities": 23
+    },
+    {
+      "name": "Ore alone cannot bypass bloom consolidation",
+      "result": "PASS",
+      "reachable_capabilities": 42
+    }
+  ]
+}

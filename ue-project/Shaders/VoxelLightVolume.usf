@@ -1,0 +1,255 @@
+// VoxelLightVolume.usf -- VINTAGE STORY'S FLOOD FILL, ON THE GPU.
+//
+// Phase L3 of docs/vs-lighting-implementation-plan-2026-09-06.md. The C++ side
+// (VoxelLightVolume.h) owns the storage argument, the memory numbers and the
+// display-only doctrine; this file owns the two kernels and the propagation
+// rule they implement.
+//
+// THE RULE, from the research doc (section 1.2, and VS's own forum description
+// of block light spreading "like a liquid"):
+//
+//     level(cell) = max(level(cell), max over 6 neighbours(level) - absorption)
+//
+// iterated to a fixed point, with the sky seeding level 1 wherever it can see
+// down. That is all of it. VS runs it on the CPU when a block changes and pays
+// nothing per frame; we run it on the GPU a couple of iterations at a time and
+// pay a bounded, amortized amount per frame while anything is dirty. Both
+// arrive at the same field, and the field is the reason light in VS WRAPS INTO
+// SHADE instead of stopping at a shadow boundary.
+//
+// MAX, NOT SUM, AND NOT AN AVERAGE. Two half-lit neighbours must not add up to
+// a fully lit cell (that manufactures energy and makes corridors glow), and an
+// average would diffuse the sky INTO solid rock's neighbours and back out --
+// the leak this whole structure exists to avoid. VS's own combination rule is
+// max-then-renormalise for exactly this reason (research doc section 1.4).
+//
+// NO ENGINE INCLUDES beyond Platform.ush, on the rule VoxelShadowMarch.usf and
+// VoxelGIMarch.usf both state: what a standalone dxc invocation compiles is
+// then byte-for-byte what UE's compiler sees, minus only UE's preprocessor
+// environment.
+
+#include "/Engine/Public/Platform.ush"
+
+// The brick pool is the ONLY source here, exactly as in VoxelGIMarch.usf. A
+// source-0 permutation would probe the fluid occupancy volume instead, whose
+// 51.2 m box is smaller than this volume -- and the symptom would be sky light
+// that is correct near the camera and wrong at the edges, which reads as a
+// falloff bug rather than as the wrong volume being asked.
+#include "/VoxelEarth/VoxelBrickTraverse.ush"
+
+#if VOXEL_MARCH_SOURCE != VOXEL_MARCH_SOURCE_BRICKPOOL
+#error VoxelLightVolume.usf seeds from the BRICK POOL. Compile with VOXEL_MARCH_SOURCE=1 -- see the note above this line for what a source-0 permutation would probe instead.
+#endif
+
+// ---------------------------------------------------------------------------
+// Structural constants. PUSHED AS DEFINES BY ModifyCompilationEnvironment, not
+// spelled here, so VoxelLightVolume::kDimXY / kDimZ are the ONE authority and a
+// resize cannot leave the kernel addressing a box of a different size than the
+// host allocated. The fallbacks exist only so a standalone dxc compile of this
+// file is possible; they mirror the C++ constants and must be changed with them.
+// ---------------------------------------------------------------------------
+#ifndef LIGHTVOL_DIM_XY
+#define LIGHTVOL_DIM_XY 128
+#endif
+#ifndef LIGHTVOL_DIM_Z
+#define LIGHTVOL_DIM_Z 64
+#endif
+// Level-0 voxels per light cell: 100 UU / 10 UU. An integer by construction
+// (the cell size is a whole number of voxels) so the cell centre below is an
+// exact integer voxel and no rounding rule is needed.
+#ifndef LIGHTVOL_VOXELS_PER_CELL
+#define LIGHTVOL_VOXELS_PER_CELL 10
+#endif
+#ifndef LIGHTVOL_SEED_GROUP
+#define LIGHTVOL_SEED_GROUP 64
+#endif
+#ifndef LIGHTVOL_RELAX_GROUP_XY
+#define LIGHTVOL_RELAX_GROUP_XY 8
+#endif
+#ifndef LIGHTVOL_RELAX_GROUP_Z
+#define LIGHTVOL_RELAX_GROUP_Z 4
+#endif
+
+// ---------------------------------------------------------------------------
+// Uniforms
+// ---------------------------------------------------------------------------
+
+// The volume's min corner in LEVEL-0 WORLD VOXELS. An integer, deliberately:
+// the seed's brick probe wants a world voxel, and deriving one from a float
+// world position at planet scale quantises coarser than the voxel it is
+// addressing -- the same argument MarchBrickOriginVoxel exists for.
+int3  LightVolOriginVoxel;
+
+// Sky level lost per cell of travel, in the R channel's 0..1 units. The host
+// derives it from voxel.Light.AbsorptionCells: 1/N, so N is "how many metres of
+// air the sky reaches around a corner".
+float LightVolAbsorption;
+
+// SEED: how many columns this dispatch covers, and the list itself. One entry
+// per column, packed x | (y << 16) -- 16 bits each is 65,536 per axis against a
+// 128-cell volume, i.e. 512x the headroom, and one dword per column keeps the
+// worst case (a full reseed, 16,384 columns) at 64 KB of upload.
+uint                   LightVolSeedColumnCount;
+StructuredBuffer<uint> LightVolSeedColumns;
+
+// RELAX: read from Src, write to Dst. PING-PONG, never in place: a relax that
+// read the buffer it was writing would be Gauss-Seidel in an order the GPU does
+// not define, so the answer would depend on scheduling and differ between runs
+// on the same frame. (The CPU light field made exactly this mistake once and
+// the correction is recorded at VoxelLightField.h's energy-conservation note.)
+Texture3D<float4>   LightVolSrc;
+RWTexture3D<float4> LightVolDst;
+
+// ---------------------------------------------------------------------------
+// SEED -- one thread per column, top down
+// ---------------------------------------------------------------------------
+//
+// WHY A COLUMN AND NOT A CELL. Sky visibility down a column is a PREFIX
+// property -- everything above the first solid cell sees the sky, nothing below
+// it does -- so one serial walk of 64 cells answers 64 cells, while a
+// thread-per-cell version would have each cell walk up to the top face and do
+// O(n^2) work for the same answer. 64 iterations is a short loop and the
+// dispatch is over the DIRTY columns, not all of them.
+//
+// A NON-RESIDENT CHUNK READS AS AIR, and that is a decision. The probe returns
+// VOXEL_MARCH_REJECT_NO_CHUNK for a chunk the pool does not hold, and treating
+// that as solid would make every unstreamed region a black shadow that resolves
+// as it streams in -- dark flashes over the whole frame during a cold fill.
+// Treating it as air makes an unstreamed region LIT, which is what the marcher
+// already does with the same absence and is the direction that fails quietly.
+[numthreads(LIGHTVOL_SEED_GROUP, 1, 1)]
+void VoxelLightVolumeSeedMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Entry = DispatchThreadId.x;
+	if (Entry >= LightVolSeedColumnCount)
+	{
+		return;
+	}
+
+	const uint Packed = LightVolSeedColumns[Entry];
+	const uint Cx = Packed & 0xFFFFu;
+	const uint Cy = (Packed >> 16) & 0xFFFFu;
+	// The host builds the list, but a bad entry here writes into another
+	// column's texels rather than failing, so it is checked rather than trusted.
+	if (Cx >= uint(LIGHTVOL_DIM_XY) || Cy >= uint(LIGHTVOL_DIM_XY))
+	{
+		return;
+	}
+
+	// LEVEL 0, EXPLICITLY, before any probe: this kernel reads the chunk index
+	// and the chunk records, and both are addressed per ring level. Without this
+	// the walk context is whatever the last caller left in it.
+	VoxelMarchBeginLevel(0);
+
+	// Top face down. bSkyVisible starts TRUE -- the volume's top face is treated
+	// as open sky, which is v1's stated bound (VoxelLightVolume.h, "NOT BOUNDED
+	// BY THE WORLD, only by the box"): a mountain above the box does not shade
+	// the ground beneath it until the camera rises enough to bring it inside.
+	bool bSkyVisible = true;
+	for (int Z = LIGHTVOL_DIM_Z - 1; Z >= 0; --Z)
+	{
+		const int3 Cell = int3(int(Cx), int(Cy), Z);
+		// The cell CENTRE, in world level-0 voxels. Centre rather than corner so
+		// a 1 m cell straddling a voxel-thin ledge resolves to what is mostly
+		// there rather than to whatever its lowest corner happens to touch.
+		const int3 WorldVoxel = LightVolOriginVoxel
+		                      + Cell * LIGHTVOL_VOXELS_PER_CELL
+		                      + (LIGHTVOL_VOXELS_PER_CELL / 2);
+
+		const uint Reject = VoxelMarchBrickProbeVoxel(WorldVoxel);
+		const bool bSolid = (Reject == VOXEL_MARCH_REJECT_SOLID);
+
+		// AIR MASK IN G. Written for every cell this pass touches, and it is what
+		// the relax reads to refuse to flood light through a wall. A solid cell
+		// is 0 in both channels: no light, and no permission to receive any.
+		const float AirMask = bSolid ? 0.0f : 1.0f;
+		// Full sky above the first solid cell; zero at and below it. The relax is
+		// what carries light back UNDER an overhang, which is the entire point of
+		// the second pass -- the seed alone would be a hard-edged sky mask.
+		const float Level = (bSolid || !bSkyVisible) ? 0.0f : 1.0f;
+
+		// B: reserved for L4's block light, written 0.
+		// A: reserved for L4's hue, written 1 so a debug view is not invisible.
+		LightVolDst[uint3(Cell)] = float4(Level, AirMask, 0.0f, 1.0f);
+
+		if (bSolid)
+		{
+			bSkyVisible = false;
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RELAX -- one thread per cell, 6-neighbour max minus absorption
+// ---------------------------------------------------------------------------
+//
+// BOUNDARY RULE, and it is two different rules on purpose:
+//
+//   +Z out of range  -> level 1.0 (open sky above the box, consistent with the
+//                       seed's own assumption; anything else would draw a dark
+//                       lid across the top of the volume).
+//   X/Y/-Z out of range -> the CENTRE'S OWN value, i.e. zero gradient. Using 0
+//                       there would ring the volume in a dark frame that slides
+//                       with the camera -- a moving brightness gradient on
+//                       static geometry, which is the exact artefact the GI
+//                       volume's fade-centre note exists to prevent.
+float VoxelLightVolumeNeighbour(int3 Coord, float CentreLevel)
+{
+	if (Coord.z >= LIGHTVOL_DIM_Z)
+	{
+		return 1.0f;
+	}
+	if (Coord.x < 0 || Coord.y < 0 || Coord.z < 0 ||
+	    Coord.x >= LIGHTVOL_DIM_XY || Coord.y >= LIGHTVOL_DIM_XY)
+	{
+		return CentreLevel;
+	}
+	return LightVolSrc.Load(int4(Coord, 0)).r;
+}
+
+[numthreads(LIGHTVOL_RELAX_GROUP_XY, LIGHTVOL_RELAX_GROUP_XY, LIGHTVOL_RELAX_GROUP_Z)]
+void VoxelLightVolumeRelaxMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int3 Cell = int3(DispatchThreadId);
+	// The dispatch divides exactly at the shipped dims (128/8 and 64/4), so this
+	// is belt and braces -- and it stays correct if the dims ever stop dividing.
+	if (Cell.x >= LIGHTVOL_DIM_XY || Cell.y >= LIGHTVOL_DIM_XY || Cell.z >= LIGHTVOL_DIM_Z)
+	{
+		return;
+	}
+
+	const float4 Centre = LightVolSrc.Load(int4(Cell, 0));
+	const float CentreLevel = Centre.r;
+	const float AirMask = Centre.g;
+
+	// SOLID CELLS ARE COPIED, NOT SKIPPED. Every cell must be written every
+	// iteration or the ping-pong leaves the other buffer holding whatever the
+	// iteration before last put there -- a stale field that flickers between two
+	// answers at the relax cadence. Copying keeps the air mask alive too, which
+	// is the seed's work and must survive an arbitrary number of relaxations.
+	if (AirMask <= 0.0f)
+	{
+		LightVolDst[uint3(Cell)] = float4(0.0f, 0.0f, Centre.b, Centre.a);
+		return;
+	}
+
+	// THE NEIGHBOUR MAX ONLY -- the centre is folded back in after the
+	// absorption, one line down, which is what the comment there is about.
+	float Best = 0.0f;
+	Best = max(Best, VoxelLightVolumeNeighbour(Cell + int3( 1, 0, 0), CentreLevel));
+	Best = max(Best, VoxelLightVolumeNeighbour(Cell + int3(-1, 0, 0), CentreLevel));
+	Best = max(Best, VoxelLightVolumeNeighbour(Cell + int3( 0, 1, 0), CentreLevel));
+	Best = max(Best, VoxelLightVolumeNeighbour(Cell + int3( 0,-1, 0), CentreLevel));
+	Best = max(Best, VoxelLightVolumeNeighbour(Cell + int3( 0, 0, 1), CentreLevel));
+	Best = max(Best, VoxelLightVolumeNeighbour(Cell + int3( 0, 0,-1), CentreLevel));
+
+	// THE ABSORPTION IS SUBTRACTED FROM THE NEIGHBOUR, NOT FROM THE MAX
+	// INCLUDING SELF -- otherwise a cell would decay its own value every
+	// iteration and the field would fade to black wherever the seed did not
+	// re-establish it. max(self, best - absorption) is VS's rule and it is a
+	// monotone operator: repeated application converges rather than oscillating,
+	// which is what makes "a few iterations per frame" a legitimate amortization
+	// instead of a shimmer.
+	const float Relaxed = max(CentreLevel, Best - LightVolAbsorption);
+	LightVolDst[uint3(Cell)] = float4(saturate(Relaxed), AirMask, Centre.b, Centre.a);
+}

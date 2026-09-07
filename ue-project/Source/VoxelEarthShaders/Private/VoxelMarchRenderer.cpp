@@ -16,6 +16,8 @@
 #include "VoxelMarchChunkIndex.h" // and the GPU lookup that makes it walkable
 #include "VoxelHeightPyramid.h"  // the terrain-height upper bound the marcher skips air with
 #include "VoxelGIVolume.h"       // the marcher now samples voxel GI
+#include "VoxelLightVolume.h"    // Phase L3: the propagated sunlight volume the emit samples
+                                 // and whose seed/relax passes ride this frame's graph
 #include "SystemTextures.h"       // GetDefaultBuffer, for the emit pass's index fallback
 #include "VoxelFluidOccupancy.h" // the P3 traversal source; see the header, section 5
 
@@ -1060,6 +1062,218 @@ TEXT("voxel.March.SkyLadder"), 0,
 		     "really does bounce a great deal."),
 		ECVF_RenderThreadSafe);
 
+	// ======================================================================
+	// THE VINTAGE-STORY SUN WRAP (voxel.March.VSLighting)
+	// ======================================================================
+	//
+	// docs/vintage-story-lighting-research-2026-09-05.md, recommendation 1.
+	// The owner's live complaint (2026-09-05): "very harsh with very dark and
+	// very bright lighting depending on relative position to sun" -- measured
+	// as shaded faces at 22.5% of the sunlit faces beside them, because the
+	// true surface term for an anti-sun face under UE's saturate(N.L) is ZERO
+	// and the only lift is the flat, unshadowed AmbientIntensity 1.5.
+	//
+	// Vintage Story bounds the face-orientation response instead of letting it
+	// reach zero (research doc section 1.4, quoted from their shipped GLSL):
+	//
+	//     nb = max(max(0.34, 0.5 + 0.5*dot(N, L)), up * 0.95)
+	//
+	// -- a half-Lambert wrap, a hard floor, and an up-facing sky boost, which
+	// together refuse to let orientation alone produce more than ~3:1 contrast.
+	//
+	// THE COMPOSE (see VoxelMarch.usf's emissive block for the shader half):
+	// UE's deferred sun cannot be rewritten from here, so the marcher emits the
+	// DEFICIT between the VS response and UE's own --
+	//
+	//     SunTerm  = max(max(SunWrapFloor, 0.5 + 0.5*dot(N, SunDir)),
+	//                    N.z * SkyBoost)
+	//     Emissive += BaseColor * SunWrapGain * duskFade * (SunTerm - saturate(N.L))
+	//
+	// -- so total directional response = UE's saturate(N.L) + the deficit,
+	// i.e. exactly VS's bounded shape, converging to UE's own term on faces
+	// the sun already lights (the deficit is zero there by algebra).
+	//
+	// KNOWN ISSUES DELIBERATELY NOT TOUCHED HERE: AmbientIntensity's help text
+	// still describes its pre-1.5 era (a recorded stale-help defect, handled
+	// elsewhere), and the clipmap's baked ambient has its own known issue --
+	// the clipmap generator and its config are OUT OF SCOPE for this change
+	// and are handled elsewhere. Do not couple either into this block.
+	TAutoConsoleVariable<int32> CVarVoxelMarchVSLighting(
+		// DEFAULT 1 BY OWNER DIRECTION, 2026-09-05: this ships ON so the owner
+		// can judge it live next session. 0 is the A/B arm -- the exact
+		// pre-change math, byte-identical (house rule): the shader sees the
+		// off sentinel (w = -1) and computes the shipped expression, the
+		// ambient coupling multiplies by exactly 1.0, and the shadow mask
+		// floor reads 0.0.
+		TEXT("voxel.March.VSLighting"), 1,
+		TEXT("Master switch for the Vintage-Story-style bounded face lighting "
+		     "(docs/vintage-story-lighting-research-2026-09-05.md, recommendation 1). "
+		     "1 (default) = the sun-wrap deficit term in the marcher's emissive, the "
+		     "AmbientIntensity coupling, and the shadow-mask floor "
+		     "(voxel.March.ShadowFloor) are all live. 0 = every one of them off and the "
+		     "frame byte-identical to the pre-change renderer -- the A/B arm. Requires a "
+		     "directional light: until UVoxelShadowMarchSubsystem publishes a sun "
+		     "direction the wrap declines to the off path (said once in the log)."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelMarchSunWrapFloor(
+		TEXT("voxel.March.SunWrapFloor"), 0.34f,
+		TEXT("The Vintage Story orientation floor: no face's total sun response may fall "
+		     "below this fraction of full sun, however it faces (VS ships 0.34 by day; "
+		     "research doc section 1.4). This is what bounds lit:shaded contrast at "
+		     "roughly 1/floor ~= 3:1. Also the ambient coupling's operand: the flat "
+		     "ambient is scaled by (1 - floor) while the wrap is engaged, because the "
+		     "floor takes over that share of the ambient's keep-faces-from-black job. "
+		     "Clamped to [0, 0.95]. Only meaningful with voxel.March.VSLighting 1."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelMarchSkyBoost(
+		TEXT("voxel.March.SkyBoost"), 0.95f,
+		TEXT("The up-facing sky boost: the sun term is floored at N.z * this, so the top "
+		     "of terrain never reads darker than its sides at a low sun. VS's own value "
+		     "is 0.95 on their up axis, with the comment that tops darker than sides is "
+		     "'uncanny' (research doc section 1.4). Clamped to [0, 2]. Only meaningful "
+		     "with voxel.March.VSLighting 1."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelMarchSunWrapGain(
+		// 6.0 IS DERIVED FROM THE 2026-08-30 AMBIENT LADDER, NOT MEASURED
+		// FRESH: that sweep moved the shaded-face fraction by ~0.048 per unit
+		// of AmbientIntensity, so reaching the ~1/3 VS bound from the 0.183
+		// baseline needs ~3.1 units of lift on an anti-sun face; the wrap
+		// floor delivers Gain * 0.34 of this scale there, and with the coupled
+		// ambient at ~1.0 the remainder is ~2.1, giving Gain ~= 6. Same units
+		// as AmbientIntensity, same ladder discipline to re-tune: screenshot
+		// pairs at the two harshness poses, owner verdict.
+		TEXT("voxel.March.SunWrapGain"), 6.0f,
+		TEXT("Strength of the sun-wrap deficit term, in the SAME units as "
+		     "voxel.March.AmbientIntensity (the 2026-08-30 ladder's axis). This is the "
+		     "stand-in for the sun's own brightness in emissive units -- the one number "
+		     "the deficit compose cannot derive, so it is a knob and the dial for 'how "
+		     "hard the contrast bound bites'. 0 disarms the wrap's light while leaving "
+		     "the rest of the arm on (a bisection state, not a shipping one). Only "
+		     "meaningful with voxel.March.VSLighting 1."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelMarchShadowFloor(
+		TEXT("voxel.March.ShadowFloor"), 0.4f,
+		TEXT("Floor for the voxel.Shadow.March mask: a fully shadowed pixel writes this "
+		     "instead of 0, so cast shadows DEEPEN the ground rather than blacken it -- "
+		     "Vintage Story's 'shadows remove at most half the light' rule (research doc "
+		     "section 1.4; VS bounds each cascade at 0.5). Consumed by the shadow march's "
+		     "mask write (VoxelShadowMarch.usf), which the light function copies verbatim "
+		     "onto the sun. Clamped to [0, 0.95]; 0 restores hard black shadows. Reads as "
+		     "0 (the pre-change mask) under voxel.March.VSLighting 0."),
+		ECVF_RenderThreadSafe);
+
+	// ---- the sun-direction seam (game -> render) --------------------------
+	//
+	// Fed by UVoxelShadowMarchSubsystem's tick, which already finds the sun
+	// every frame for the shadow march (and now feeds it whatever mode that
+	// cvar is in). Plain atomics rather than a lock, the streaming publisher's
+	// argument verbatim: written once per tick, read a few times per frame,
+	// and a torn read mixes two consecutive ticks' sun directions -- fractions
+	// of a degree, invisible for one frame. Published == 0 means the wire has
+	// never carried anything, and the wrap then declines to the OFF path
+	// rather than wrapping around a made-up sun.
+	std::atomic<float> GVSSunDirX{0.0f};
+	std::atomic<float> GVSSunDirY{0.0f};
+	std::atomic<float> GVSSunDirZ{1.0f};
+	std::atomic<int32> GVSSunPublished{0};
+
+	// ---- the day-night COLOUR seam (Phase L2) -----------------------------
+	//
+	// A SECOND WIRE BESIDE THE DIRECTION, fed by UVoxelSkySubsystem rather than
+	// by the shadow march, because the colours are a property of the CLOCK and
+	// the clock is the sky subsystem's. Same atomics-not-a-lock argument as
+	// above, verbatim: written once per tick, read three times per frame, and a
+	// torn read mixes two consecutive ticks' colours -- which at the ramp's
+	// slowest interesting rate (a 3600 s day crossing the horizon band in ~90 s)
+	// is a difference in the fourth decimal place for one frame.
+	//
+	// THE DEFAULTS ARE WHITE AND THAT IS THE OFF ARM. Published == 0 means the
+	// wire has never carried anything, and every consumer below then uses the
+	// SHIPPED constants -- the wrap's neutral gain and MakeMarchAmbient's
+	// 1.00/1.04/1.12 -- which makes an un-driven build byte-identical to the
+	// pre-L2 renderer rather than tinted by a made-up sky.
+	std::atomic<float> GVSSunColR{1.0f};
+	std::atomic<float> GVSSunColG{1.0f};
+	std::atomic<float> GVSSunColB{1.0f};
+	std::atomic<float> GVSAmbColR{1.0f};
+	std::atomic<float> GVSAmbColG{1.0f};
+	std::atomic<float> GVSAmbColB{1.0f};
+	std::atomic<float> GVSMoonFraction{0.0f};
+	std::atomic<int32> GVSColourPublished{0};
+
+	// The dusk fade: smoothstep of the sun's Z over [-0.02, +0.15]. The sky
+	// rig keeps the sun component's INTENSITY constant and lets the atmosphere
+	// extinguish the beam at the horizon (VoxelSkySubsystem.cpp's own comment:
+	// 'the direct beam still falls to zero as the sun sets -- the atmosphere
+	// does it'), so an emissive term keyed to the sun must fade itself or it
+	// would keep day-lighting the terrain all night. This is the marcher-side
+	// analog of VS driving shadowIntensity down at low sun.
+	float VoxelMarchVSDuskFade(float DirToSunZ)
+	{
+		const float T = FMath::Clamp((DirToSunZ + 0.02f) / 0.17f, 0.0f, 1.0f);
+		return T * T * (3.0f - 2.0f * T);
+	}
+
+	// How engaged the wrap is right now, [0..1]: 0 when the master is off or
+	// no sun was ever published, else the dusk fade. ONE derivation, because
+	// the ambient coupling and the wrap uniforms must agree about it -- an
+	// ambient that shrank for a wrap that never engaged is the exact
+	// double-count this helper exists to prevent.
+	float VoxelMarchVSWrapEngagement()
+	{
+		if (CVarVoxelMarchVSLighting.GetValueOnRenderThread() == 0 ||
+		    GVSSunPublished.load() == 0)
+		{
+			return 0.0f;
+		}
+		return VoxelMarchVSDuskFade(GVSSunDirZ.load());
+	}
+
+	// ---- ONE derivation of the published colours (Phase L2) ---------------
+	//
+	// Every consumer asks THIS, never the atomics, for the same reason
+	// VoxelMarchVSWrapEngagement exists: the ambient tint and the wrap tint must
+	// agree about whether a sky is driving them, and two independent reads of
+	// "is it published" is how a night ambient ends up composed against a noon
+	// wrap for one frame.
+	//
+	// GATED ON THE MASTER. Under voxel.March.VSLighting 0 this returns the OFF
+	// answer whatever the sky published, so the A/B arm stays byte-identical --
+	// the master gates every VS-lighting term from one place, which is the rule
+	// stated at the cvar.
+	struct FVoxelMarchVSColours
+	{
+		// White, not black: these are TINTS and the neutral tint is 1. A zeroed
+		// default would be a black frame, which is the wrong direction to fail in
+		// for a value whose whole job is to be multiplied into light.
+		FVector3f Sun = FVector3f(1.0f, 1.0f, 1.0f);
+		// The SHIPPED constant, so an unpublished build reproduces MakeMarchAmbient's
+		// pre-L2 expression exactly rather than merely closely. Mirrored from the
+		// comment two functions down; the two are cross-referenced by name because a
+		// compiler cannot check that a "slightly cool" constant appears twice.
+		FVector3f Ambient = FVector3f(1.00f, 1.04f, 1.12f);
+		float MoonFraction = 0.0f;
+		bool bPublished = false;
+	};
+	FVoxelMarchVSColours MakeMarchVSColours()
+	{
+		FVoxelMarchVSColours Out; // the shipped constants: the byte-identical arm
+		if (CVarVoxelMarchVSLighting.GetValueOnRenderThread() == 0 ||
+		    GVSColourPublished.load() == 0)
+		{
+			return Out;
+		}
+		Out.Sun = FVector3f(GVSSunColR.load(), GVSSunColG.load(), GVSSunColB.load());
+		Out.Ambient = FVector3f(GVSAmbColR.load(), GVSAmbColG.load(), GVSAmbColB.load());
+		Out.MoonFraction = GVSMoonFraction.load();
+		Out.bPublished = true;
+		return Out;
+	}
+
 	// ONE derivation of the ambient uniform, so the three fill sites cannot drift.
 	//
 	// The sky colour is deliberately NOT read from the SkyLight here. That light
@@ -1070,12 +1284,111 @@ TEXT("voxel.March.SkyLadder"), 0,
 	// owner tunes it by eye like every other appearance knob in this project.
 	FVector4f MakeMarchAmbient()
 	{
-		const float Intensity = FMath::Max(CVarVoxelMarchAmbientIntensity.GetValueOnRenderThread(), 0.0f);
+		float Intensity = FMath::Max(CVarVoxelMarchAmbientIntensity.GetValueOnRenderThread(), 0.0f);
+		// THE COUPLING TO THE SUN WRAP, stated because two knobs that secretly
+		// sum are how a ladder stops meaning anything: the 1.5 default exists
+		// partly BECAUSE an anti-sun face otherwise read as a hole, and the
+		// wrap floor now delivers sun-proportional light to every face -- so
+		// the flat ambient hands exactly that share of its job over:
+		//
+		//     Intensity *= 1 - SunWrapFloor * engagement
+		//
+		// At the defaults that is 1.5 * (1 - 0.34) ~= 1.0 -- the ambient back
+		// at its honest interreflection scale while the wrap carries the
+		// directional lift. Engagement is 0 with the arm off, with no sun
+		// published, and at night (dusk fade), so the off arm and the night
+		// frame keep the owner's tuned 1.5 EXACTLY.
+		{
+			const float WrapFloor =
+				FMath::Clamp(CVarVoxelMarchSunWrapFloor.GetValueOnRenderThread(), 0.0f, 0.95f);
+			Intensity *= 1.0f - WrapFloor * VoxelMarchVSWrapEngagement();
+		}
 		const float GroundMix = FMath::Clamp(CVarVoxelMarchAmbientGroundMix.GetValueOnRenderThread(), 0.0f, 1.0f);
-		// Slightly cool, because a clear sky is: 1.00/1.04/1.12 normalised so
-		// that intensity means what it says at the zenith rather than being
-		// scaled by whatever tint is chosen.
-		return FVector4f(1.00f * Intensity, 1.04f * Intensity, 1.12f * Intensity, GroundMix);
+		// THE SKY TINT. Slightly cool, because a clear sky is: 1.00/1.04/1.12
+		// normalised so that intensity means what it says at the zenith rather
+		// than being scaled by whatever tint is chosen.
+		//
+		// SINCE PHASE L2 IT IS NO LONGER A CONSTANT WHEN A SKY IS DRIVING IT.
+		// The comment above this function still stands about WHY it is not the
+		// SkyLight -- that light is captured in fog and its arms are a measured
+		// null -- but "a neutral constant is honest about being a stand-in" was
+		// only ever true while nothing better existed. UVoxelSkySubsystem now
+		// samples an authored day-night ramp off the sun's elevation and
+		// publishes the result (VoxelMarchPublishSunColour), so the stand-in is
+		// replaced rather than multiplied: this is one tint, from one place.
+		//
+		// MULTIPLYING would double-count, and visibly -- the ramp's noon row IS
+		// 1.00/1.04/1.12, so a product would square the coolness at exactly the
+		// hour every archived capture was taken at. Replacement also makes the
+		// noon frame byte-identical to the pre-L2 renderer, which is a property
+		// worth having when the owner judges dawn/noon/dusk side by side: the
+		// noon plate is the control.
+		const FVoxelMarchVSColours Colours = MakeMarchVSColours();
+		return FVector4f(Colours.Ambient.X * Intensity, Colours.Ambient.Y * Intensity,
+		                 Colours.Ambient.Z * Intensity, GroundMix);
+	}
+
+	// The wrap's two uniforms, derived in ONE place for the same reason the
+	// ambient is. The OFF answer (w = -1, colour 0) is what the shader's
+	// sentinel branch keys on and is returned for: master 0, sun never
+	// published.
+	//
+	// RECOMMENDATION 2 (day-night colour) LANDED IN PHASE L2 AND THIS BLOCK
+	// USED TO EXPLAIN WHY IT COULD NOT. The old note was correct about the
+	// obstacle -- the sky rig holds the sun at a constant 5778 K and paints the
+	// day-night ramp with GPU atmosphere transmittance, so there IS no colour to
+	// read off the light -- and wrong only about the conclusion. The plumbing it
+	// named as missing is the thing that was built: UVoxelSkySubsystem samples
+	// an AUTHORED ramp (VoxelSky::SampleLightColours, a pure function of sun
+	// elevation) and publishes it, exactly as VS reads its own hand-shaped
+	// SunLightLevels[] table rather than arguing with a radiometric formula
+	// (research doc section 2, mechanism 7). The wrap colour is that sun tint
+	// times the gain; the dusk FADE is unchanged and still comes from the sun's
+	// published elevation, and the two compose (a warm low sun fading out).
+	struct FVoxelMarchVSLightingUniforms
+	{
+		FVector4f SunDirAndWrapFloor = FVector4f(0.0f, 0.0f, 1.0f, -1.0f);
+		FVector4f WrapColorAndSkyBoost = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+	};
+	FVoxelMarchVSLightingUniforms MakeMarchVSLighting()
+	{
+		FVoxelMarchVSLightingUniforms Off; // w = -1: the shader takes the exact pre-change path
+		if (CVarVoxelMarchVSLighting.GetValueOnRenderThread() == 0)
+		{
+			return Off;
+		}
+		if (GVSSunPublished.load() == 0)
+		{
+			// Armed with no sun is the house failure (armed-and-inert), so it
+			// is SAID once rather than left to be inferred from an unchanged
+			// picture.
+			static bool bLoggedNoSun = false;
+			if (!bLoggedNoSun)
+			{
+				bLoggedNoSun = true;
+				UE_LOG(LogVoxelMarch, Warning,
+				       TEXT("voxel.March.VSLighting 1 but no sun direction has been published ")
+				       TEXT("(UVoxelShadowMarchSubsystem feeds it every tick once a directional ")
+				       TEXT("light exists). The sun wrap runs the OFF path until one arrives."));
+			}
+			return Off;
+		}
+		const FVector3f DirToSun(GVSSunDirX.load(), GVSSunDirY.load(), GVSSunDirZ.load());
+		const float WrapFloor =
+			FMath::Clamp(CVarVoxelMarchSunWrapFloor.GetValueOnRenderThread(), 0.0f, 0.95f);
+		const float SkyBoost =
+			FMath::Clamp(CVarVoxelMarchSkyBoost.GetValueOnRenderThread(), 0.0f, 2.0f);
+		const float Gain =
+			FMath::Max(CVarVoxelMarchSunWrapGain.GetValueOnRenderThread(), 0.0f) *
+			VoxelMarchVSDuskFade(DirToSun.Z);
+		// THE SUN TINT (Phase L2). White until the sky publishes, so this line
+		// is `Gain * 1` -- the shipped grey triple -- on an undriven build.
+		const FVoxelMarchVSColours Colours = MakeMarchVSColours();
+		FVoxelMarchVSLightingUniforms U;
+		U.SunDirAndWrapFloor = FVector4f(DirToSun.X, DirToSun.Y, DirToSun.Z, WrapFloor);
+		U.WrapColorAndSkyBoost = FVector4f(Gain * Colours.Sun.X, Gain * Colours.Sun.Y,
+		                                   Gain * Colours.Sun.Z, SkyBoost);
+		return U;
 	}
 
 	// The distance ramp for the shading-normal fade. See VoxelMarch.usf's block
@@ -5123,6 +5436,78 @@ bool VoxelMarchIsStreamConverged()
 	return Frames >= FMath::Max(CVarVoxelMarchSettleFrames.GetValueOnAnyThread(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// The VS-lighting seams (voxel.March.VSLighting -- see the cvar block)
+// ---------------------------------------------------------------------------
+
+void VoxelMarchPublishSunDirection(const FVector3f& DirToSunWorld)
+{
+	// Normalised HERE, once, so every reader may treat the stored triple as a
+	// unit vector. A degenerate direction is refused rather than stored: the
+	// wrap then stays on its declined-to-off path, which is the fail-off arm.
+	const FVector3f N = DirToSunWorld.GetSafeNormal();
+	if (N.IsNearlyZero())
+	{
+		return;
+	}
+	GVSSunDirX.store(N.X);
+	GVSSunDirY.store(N.Y);
+	GVSSunDirZ.store(N.Z);
+	GVSSunPublished.store(1);
+}
+
+void VoxelMarchPublishSunColour(const FLinearColor& SunColour, const FLinearColor& AmbientColour,
+                                float MoonFraction)
+{
+	// REFUSED WHOLE, NOT SANITISED PER COMPONENT. A NaN or a negative in one
+	// channel means the ramp that produced it is wrong, and clamping it here
+	// would hide that behind a plausible-looking tint on every voxel in the
+	// world -- the same fail-off call VoxelMarchPublishSunDirection makes about a
+	// degenerate direction. Declining leaves the last good colours standing (or
+	// the shipped constants, if none has ever landed), which is the arm a reader
+	// can recognise from the picture.
+	//
+	// The upper bound is generous on purpose: 8 is far outside anything the
+	// authored ramp produces (its rows sit in [0.4, 1.25]) and exists only to
+	// catch a caller multiplying an intensity into a tint.
+	auto IsSaneTint = [](const FLinearColor& C)
+	{
+		const float Max = 8.0f;
+		return FMath::IsFinite(C.R) && FMath::IsFinite(C.G) && FMath::IsFinite(C.B) &&
+		       C.R >= 0.0f && C.G >= 0.0f && C.B >= 0.0f &&
+		       C.R <= Max && C.G <= Max && C.B <= Max;
+	};
+	if (!IsSaneTint(SunColour) || !IsSaneTint(AmbientColour) ||
+	    !FMath::IsFinite(MoonFraction) || MoonFraction < 0.0f)
+	{
+		return;
+	}
+	GVSSunColR.store(SunColour.R);
+	GVSSunColG.store(SunColour.G);
+	GVSSunColB.store(SunColour.B);
+	GVSAmbColR.store(AmbientColour.R);
+	GVSAmbColG.store(AmbientColour.G);
+	GVSAmbColB.store(AmbientColour.B);
+	GVSMoonFraction.store(MoonFraction);
+	// LAST, after every component, so a render thread that observes the flag
+	// cannot then read a half-written triple. Relaxed ordering is enough for the
+	// same reason the direction's is: the six floats are independent scalars and
+	// a mix of two consecutive ticks' values is a difference in the fourth
+	// decimal place for one frame, not a wrong branch.
+	GVSColourPublished.store(1);
+}
+
+float VoxelMarchGetShadowMaskFloor_RenderThread()
+{
+	// Under the master's OFF arm this is 0.0 EXACTLY: the shadow mask then
+	// writes the same 0/1 it always wrote, byte-identical.
+	if (CVarVoxelMarchVSLighting.GetValueOnRenderThread() == 0)
+	{
+		return 0.0f;
+	}
+	return FMath::Clamp(CVarVoxelMarchShadowFloor.GetValueOnRenderThread(), 0.0f, 0.95f);
+}
+
 FVoxelMarchStats VoxelMarchGetStats()
 {
 	if (!GMarchState.IsValid())
@@ -5602,6 +5987,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchViewParameters, )
 	// fraction. Packed as one float4 so it is one uniform slot, and so that
 	// "intensity 0" is provably one multiply away from the shipped frame.
 	SHADER_PARAMETER(FVector4f, MarchAmbientSkyAndGround)
+	// The Vintage-Story sun wrap (voxel.March.VSLighting). xyz = world-space
+	// direction TO the sun, w = SunWrapFloor or -1 as the OFF sentinel; then
+	// rgb = wrap gain x dusk fade (AmbientIntensity units), w = SkyBoost. Two
+	// float4s so the shader's off test is one compare, and packed beside the
+	// ambient they couple to. Filled by MakeMarchVSLighting at every fill site
+	// that fills the ambient -- the same cannot-drift rule.
+	SHADER_PARAMETER(FVector4f, MarchVSSunDirAndWrapFloor)
+	SHADER_PARAMETER(FVector4f, MarchVSWrapColorAndSkyBoost)
 	// x/y = the normal fade's start and end, in UU. x >= y disables it.
 	SHADER_PARAMETER(FVector2f, MarchNormalFadeUU)
 	// NOTE: the volume's origin in TRANSLATED world is deliberately NOT here.
@@ -5920,6 +6313,14 @@ END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchEmitParameters, )
 	SHADER_PARAMETER_STRUCT_REF(FVoxelGIVolumeParameters, VoxelGIVol)
+	// PHASE L3: the propagated sunlight volume. Bound on EVERY emit, armed or
+	// not, for the reason the GI binding beside it is: this pass is added with a
+	// raw AddPass, so nothing calls ClearUnusedGraphResources and an unset
+	// uniform buffer is an RDG validation failure rather than a black frame.
+	// VoxelLightVolumeGetUniformBuffer() therefore never returns null -- with the
+	// feature off it hands back a buffer pointing at GBlackVolumeTexture with
+	// Enabled = 0, which is the byte-identical arm.
+	SHADER_PARAMETER_STRUCT_REF(FVoxelLightVolumeParameters, VoxelLightVol)
 	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 	VOXEL_FLUID_OCCUPANCY_PARAMETERS()
 	VOXEL_BRICK_POOL_PARAMETERS()
@@ -7190,6 +7591,12 @@ class FVoxelMarchEmitPS : public FGlobalShader
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_TILE_SIZE"), kVoxelMarchTileSize);
+		// THE .USF IS READ FROM DISK BY WHATEVER BINARY IS RUNNING. Only this
+		// binary registers and binds the VoxelLightVol uniform buffer, so only
+		// this binary may compile the block that references it; an older binary
+		// picking up the same file compiles the pre-L3 shader verbatim. The
+		// .usf defaults the define to 0 for exactly that reader.
+		OutEnvironment.SetDefine(TEXT("VOXEL_LIGHTVOL_BOUND"), 1);
 	}
 };
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchEmitPS, VOXEL_MARCH_USF, "VoxelMarchEmitPS", SF_Pixel);
@@ -9703,11 +10110,48 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 	// experiment from silently priming view B off view A's depths.
 	bool bPrimeHistoryClaimed = false;
 
+	// L3 ENGAGEMENT TRACE, STAGE 2 (2026-09-06). Stage 1 proved the light
+	// volume's call site -- deep in this loop, after VoxelMarchBindPool -- is
+	// NEVER reached in a -game leg, while the marcher plainly renders terrain.
+	// So the loop is exited before it gets there, and these one-time lines say
+	// WHERE: an empty view set, a frame-number mismatch, or a missing scene
+	// depth each look identical from outside. One branch, once per process.
+	{
+		static bool bLoggedMarchLoopEntry = false;
+		if (!bLoggedMarchLoopEntry)
+		{
+			bLoggedMarchLoopEntry = true;
+			int32 FrameMatched = 0;
+			for (const FViewMarch& Probe : Views)
+			{
+				if (Probe.FrameNumber == GFrameNumberRenderThread)
+				{
+					++FrameMatched;
+				}
+			}
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("[voxel-light] STAGE2 PreRenderBasePass_RenderThread entered: Views=%d, ")
+			       TEXT("frameMatched=%d (rt frame %u). A frameMatched of 0 means this hook is not ")
+			       TEXT("where the live march dispatch happens for this configuration."),
+			       Views.Num(), FrameMatched, GFrameNumberRenderThread);
+		}
+	}
 	for (FViewMarch& Entry : Views)
 	{
 		if (Entry.FrameNumber != GFrameNumberRenderThread)
 		{
 			continue;
+		}
+		{
+			static bool bLoggedFramePassed = false;
+			if (!bLoggedFramePassed)
+			{
+				bLoggedFramePassed = true;
+				UE_LOG(LogVoxelMarch, Display,
+				       TEXT("[voxel-light] STAGE2 view passed the frame gate -- the loop body runs. ")
+				       TEXT("If STAGE2 'pool bound' never follows, the exit is the scene-texture or ")
+				       TEXT("depth gate below."));
+			}
 		}
 
 		// Scene textures, via the public accessor. SceneDepth here is the
@@ -10155,6 +10599,11 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		MarchView.MarchPixelConeSlope = Entry.PixelConeSlope;
 		MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
 		MarchView.MarchAmbientSkyAndGround = MakeMarchAmbient();
+		{
+			const FVoxelMarchVSLightingUniforms VS = MakeMarchVSLighting();
+			MarchView.MarchVSSunDirAndWrapFloor = VS.SunDirAndWrapFloor;
+			MarchView.MarchVSWrapColorAndSkyBoost = VS.WrapColorAndSkyBoost;
+		}
 		MarchView.MarchNormalFadeUU = MakeMarchNormalFade();
 		// The frame's one lattice, resolved above the loop. The depth pre-emit
 		// and the source comparator copy this whole struct, so they cannot get a
@@ -10329,6 +10778,101 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				FScopeLock Guard(&State->Lock);
 				State->Stats.IndexEntries = IndexEntries;
 			}
+			{
+				static bool bLoggedPoolBound = false;
+				if (!bLoggedPoolBound)
+				{
+					bLoggedPoolBound = true;
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("[voxel-light] STAGE2 pool bound (%d index entries) -- the light ")
+					       TEXT("volume call site is one statement away."),
+					       IndexEntries);
+				}
+			}
+
+			// ---- PHASE L3: THE PROPAGATED SUNLIGHT VOLUME ------------------
+			//
+			// voxel.Light.Propagated, DEFAULT 0.
+			// docs/vs-lighting-implementation-plan-2026-09-06.md phase L3.
+			//
+			// PLACED EXACTLY HERE, AND THE PLACEMENT IS THREE SEPARATE
+			// CONSTRAINTS THAT ONLY THIS POINT SATISFIES:
+			//
+			//  1. AFTER VoxelMarchBindPool, BECAUSE THE INDEX MAY BE REGISTERED
+			//     ONLY ONCE PER FRAME. FVoxelMarchChunkIndex::Register consumes
+			//     the staged upload and clears bStagedValid (its own comment;
+			//     the emit's binding block carries the consequence). A second
+			//     Register call from this feature would take this frame's upload
+			//     for the light volume and hand the MARCHER last frame's pooled
+			//     buffer -- a permanently one-frame-stale index, which renders
+			//     as terrain lagging the world and would be blamed on streaming.
+			//     So the light volume never registers the index at all: it is
+			//     handed the SRV this dispatch has already made.
+			//  2. BEFORE THE EMIT THAT SAMPLES THE VOLUME. Both live in this
+			//     frame's graph and RDG executes passes in the order they are
+			//     added, so this is call order and nothing else. A volume
+			//     updated after the emit would hand the marcher last frame's
+			//     field -- which at a recentre describes a DIFFERENT BOX.
+			//  3. ONCE PER FRAME, however many views the family holds. The
+			//     volume follows ONE camera; per-view updates would have two
+			//     views reseeding the whole field at each other every frame,
+			//     which on a split screen is unbounded rather than doubled.
+			//
+			// AND THE MEASUREMENT CONSEQUENCE, STATED RATHER THAN DISCOVERED:
+			// this point is INSIDE the March timing bracket (opened far above,
+			// at the top of the view loop), so voxel.March.Stats' marchMs
+			// INCLUDES these passes. That is not free to change -- the bracket
+			// has to open before the frame's params are built and the index SRV
+			// only exists after -- so the split is made on the OTHER instrument
+			// instead: VoxelLightVolumeUpdate_RenderThread opens its own
+			// RDG_EVENT_SCOPE_STAT, and GPU stat time is charged to the
+			// INNERMOST scope, so a -csvGpuStats leg reads the volume's cost in
+			// its own GPU/VoxelLightVolume column and it is subtracted from
+			// GPU/VoxelMarch rather than hidden inside it. A leg quoting marchMs
+			// across the two arms of voxel.Light.Propagated is quoting a sum and
+			// must say so.
+			//
+			// Its inputs are COPIED FROM THE FIELDS THIS DISPATCH IS ABOUT TO
+			// UPLOAD -- Params->MarchBrickOriginVoxel and Params->MarchChunkIndex
+			// themselves, not a second read of their sources -- which is the
+			// MarchHeightOriginVoxel rule one screen up, applied again: there is
+			// no join left to drift.
+			//
+			// OFF ARM: the call returns immediately at voxel.Light.Propagated 0
+			// with nothing allocated and no pass added.
+			{
+				// L3 ENGAGEMENT TRACE (2026-09-06). The first leg with
+				// voxel.Light.Propagated 1 produced NO output from the light
+				// volume at all -- not the census, not even EnsureAllocated's
+				// one-time line -- so "never called" and "called but reads 0 on
+				// the render thread" were indistinguishable from the log. This
+				// one-time line separates them and stays: it is the witness that
+				// the call site is live, and it costs one branch on one frame.
+				static bool bLoggedLightVolumeCallSite = false;
+				if (!bLoggedLightVolumeCallSite)
+				{
+					bLoggedLightVolumeCallSite = true;
+					UE_LOG(LogVoxelMarch, Display,
+					       TEXT("[voxel-light] CALL SITE REACHED in PreRenderBasePass_RenderThread ")
+					       TEXT("(frame %u, source %d). voxel.Light.Propagated reads %d here. If the ")
+					       TEXT("volume prints nothing after this line, the fault is INSIDE the ")
+					       TEXT("update, not in reaching it."),
+					       GFrameNumberRenderThread, Arm.Source,
+					       VoxelLightVolume::IsEnabled() ? 1 : 0);
+				}
+				static uint32 LastLightVolumeFrame = 0xFFFFFFFFu;
+				if (LastLightVolumeFrame != GFrameNumberRenderThread)
+				{
+					LastLightVolumeFrame = GFrameNumberRenderThread;
+					FVoxelLightVolumeFrame LightFrame;
+					LightFrame.CameraWorldUU = Entry.ViewOriginUU;
+					LightFrame.FrameOriginVoxel = Params->MarchBrickOriginVoxel;
+					LightFrame.ChunkIndexSRV = Params->MarchChunkIndex;
+					LightFrame.StepBudget = Arm.StepBudget;
+					VoxelLightVolumeUpdate_RenderThread(GraphBuilder, ShaderMap, LightFrame);
+				}
+			}
+
 			// ---- THE TIGHT RESIDENT-Z SLABS, FILLED (voxel.March.ZTight) ---
 			//
 			// AFTER VoxelMarchBindPool AND FROM Params->MarchBrickOriginVoxel
@@ -11722,6 +12266,11 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
 		Params->MarchView.MarchAmbientSkyAndGround = MakeMarchAmbient();
+		{
+			const FVoxelMarchVSLightingUniforms VS = MakeMarchVSLighting();
+			Params->MarchView.MarchVSSunDirAndWrapFloor = VS.SunDirAndWrapFloor;
+			Params->MarchView.MarchVSWrapColorAndSkyBoost = VS.WrapColorAndSkyBoost;
+		}
 		Params->MarchView.MarchNormalFadeUU = MakeMarchNormalFade();
 		// TAKEN FROM THE MARCH'S OWN STAMP, not re-read from the cvar -- the
 		// same argument bHalfResEmit above makes about the VisBuffer extent,
@@ -11749,6 +12298,13 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 			// published -- the shader's Enabled check then reads 0 and the sample
 			// is skipped, which is byte-identical to the behaviour before this.
 			Params->VoxelGIVol = GVoxelGIVolume.GetUniformBufferRef();
+
+			// PHASE L3. The seed/relax passes ran earlier in THIS graph (see the
+			// call beside the march dispatch), so what is bound here is this
+			// frame's field rather than last frame's -- which matters at a
+			// recentre, where last frame's field describes a different box.
+			// Never null; Enabled = 0 with the feature off.
+			Params->VoxelLightVol = VoxelLightVolumeGetUniformBuffer();
 
 			// THE INDEX MAY LEGITIMATELY BE UNAVAILABLE HERE, AND ONLY HERE.
 			//
@@ -11977,6 +12533,11 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 				Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
 		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
 		Params->MarchView.MarchAmbientSkyAndGround = MakeMarchAmbient();
+		{
+			const FVoxelMarchVSLightingUniforms VS = MakeMarchVSLighting();
+			Params->MarchView.MarchVSSunDirAndWrapFloor = VS.SunDirAndWrapFloor;
+			Params->MarchView.MarchVSWrapColorAndSkyBoost = VS.WrapColorAndSkyBoost;
+		}
 		Params->MarchView.MarchNormalFadeUU = MakeMarchNormalFade();
 				// THE GATE MUST STAND WHERE THE EMIT STANDS. It grades the depth
 				// the emit would have written, so it goes through the same

@@ -622,6 +622,95 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildSettingsPanel()
 	// ATTRIBUTE reading the persisted value, so the button never holds state
 	// of its own -- VoxelGraphicsUserSettings is the single authority and a
 	// toggle that failed to persist would VISIBLY fail to flip.
+	//
+	// ---- THE ROW BUILDER, AT FOUR ROWS (2026-09-05) -------------------------
+	//
+	// The previous version's own note said "a third row is another copy of this
+	// block -- refactor to a row builder at three". This is that refactor, and
+	// the reason to do it is not line count: four hand-copied blocks means four
+	// places to forget the attribute binding, and a row whose toggle text was
+	// bound to the WRONG getter would look completely normal until someone
+	// flipped it and watched a different row change. There is now exactly one
+	// place where a label, a toggle and a description are wired together, so a
+	// row can only be wrong in its DATA -- which is the four lines below, all
+	// visible at once.
+	//
+	// PLAIN FUNCTION POINTERS, not TFunction: every getter and setter here is a
+	// free function in VoxelGraphicsUserSettings, so this needs no capture, no
+	// allocation and no lifetime argument -- the row table is data, and it
+	// reads as data.
+	struct FSettingRow
+	{
+		FText (*Label)();
+		FText (*Desc)();
+		bool (*Get)();
+		void (*Set)(bool);
+	};
+	const FSettingRow Rows[] = {
+		{&VoxelUIStrings::SettingsFineDetailLabel, &VoxelUIStrings::SettingsFineDetailDesc,
+		 &VoxelGraphicsUserSettings::GetFineDetailSmoothing, &VoxelGraphicsUserSettings::SetFineDetailSmoothing},
+		{&VoxelUIStrings::SettingsFasterTerrainLabel, &VoxelUIStrings::SettingsFasterTerrainDesc,
+		 &VoxelGraphicsUserSettings::GetFasterTerrainDrawing, &VoxelGraphicsUserSettings::SetFasterTerrainDrawing},
+		{&VoxelUIStrings::SettingsWaterWaveLabel, &VoxelUIStrings::SettingsWaterWaveDesc,
+		 &VoxelGraphicsUserSettings::GetWaterWaveDetail, &VoxelGraphicsUserSettings::SetWaterWaveDetail},
+		{&VoxelUIStrings::SettingsOceanDetailLabel, &VoxelUIStrings::SettingsOceanDetailDesc,
+		 &VoxelGraphicsUserSettings::GetOceanMeshDetail, &VoxelGraphicsUserSettings::SetOceanMeshDetail},
+	};
+
+	// Built by AddSlot rather than by the declarative += chain, because the
+	// number of rows is now data. The spacing is unchanged from the hand-built
+	// version: no gap above the first row (the panel title already provides it),
+	// HalfSep above each later row, and half of that between a row and its own
+	// description so the description reads as belonging to the row above it.
+	TSharedRef<SVerticalBox> RowBox = SNew(SVerticalBox);
+	bool bFirstRow = true;
+	for (const FSettingRow& Row : Rows)
+	{
+		RowBox->AddSlot()
+		.AutoHeight()
+		.Padding(FMargin(0.f, bFirstRow ? 0.f : HalfSep, 0.f, 0.f))
+		[
+			SNew(SHorizontalBox)
+			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+			[
+				SNew(STextBlock)
+				.Text(Row.Label())
+				.Font(Style.Serif(L.SubPanelBodySize))
+				.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+			]
+			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+			[
+				SNew(SVoxelMenuButton)
+				.Text(TAttribute<FText>::CreateLambda([Get = Row.Get]()
+				{
+					return Get() ? VoxelUIStrings::SettingsToggleOn() : VoxelUIStrings::SettingsToggleOff();
+				}))
+				.FontSize(L.SaveRowButtonFont)
+				.MinHeight(L.DialogButtonHeight)
+				.MinWidth(L.DialogButtonWidth)
+				.OnClicked_Lambda([Get = Row.Get, Set = Row.Set]()
+				{
+					// Read-modify-write through the SAME getter the label is
+					// bound to. Holding a bool here instead would let the button
+					// and the persisted value disagree after any failed write.
+					Set(!Get());
+					return FReply::Handled();
+				})
+			]
+		];
+		RowBox->AddSlot()
+		.AutoHeight()
+		.Padding(FMargin(0.f, HalfSep * 0.5f, 0.f, 0.f))
+		[
+			SNew(STextBlock)
+			.Text(Row.Desc())
+			.Font(Style.Serif(L.SubPanelBodySize - 4))
+			.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+			.AutoWrapText(true)
+		];
+		bFirstRow = false;
+	}
+
 	TSharedRef<SWidget> Frame = WrapInPanelFrame(
 		SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
@@ -636,87 +725,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildSettingsPanel()
 			SNew(SScrollBox)
 			+ SScrollBox::Slot()
 			[
-				SNew(SVerticalBox)
-				+ SVerticalBox::Slot().AutoHeight()
-				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
-					[
-						SNew(STextBlock)
-						.Text(VoxelUIStrings::SettingsFineDetailLabel())
-						.Font(Style.Serif(L.SubPanelBodySize))
-						.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-					]
-					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-					[
-						SNew(SVoxelMenuButton)
-						.Text(TAttribute<FText>::CreateLambda([]()
-						{
-							return VoxelGraphicsUserSettings::GetFineDetailSmoothing()
-							           ? VoxelUIStrings::SettingsToggleOn()
-							           : VoxelUIStrings::SettingsToggleOff();
-						}))
-						.FontSize(L.SaveRowButtonFont)
-						.MinHeight(L.DialogButtonHeight)
-						.MinWidth(L.DialogButtonWidth)
-						.OnClicked_Lambda([]()
-						{
-							VoxelGraphicsUserSettings::SetFineDetailSmoothing(
-							    !VoxelGraphicsUserSettings::GetFineDetailSmoothing());
-							return FReply::Handled();
-						})
-					]
-				]
-				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep * 0.5f, 0.f, 0.f))
-				[
-					SNew(STextBlock)
-					.Text(VoxelUIStrings::SettingsFineDetailDesc())
-					.Font(Style.Serif(L.SubPanelBodySize - 4))
-					.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-					.AutoWrapText(true)
-				]
-				// Row 2: Faster Terrain Drawing (temporal ray priming),
-				// default ON, owner-approved 2026-09-04. Same shape as row 1;
-				// a third row is another copy of this block -- refactor to a
-				// row builder at three.
-				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep, 0.f, 0.f))
-				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
-					[
-						SNew(STextBlock)
-						.Text(VoxelUIStrings::SettingsFasterTerrainLabel())
-						.Font(Style.Serif(L.SubPanelBodySize))
-						.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-					]
-					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-					[
-						SNew(SVoxelMenuButton)
-						.Text(TAttribute<FText>::CreateLambda([]()
-						{
-							return VoxelGraphicsUserSettings::GetFasterTerrainDrawing()
-							           ? VoxelUIStrings::SettingsToggleOn()
-							           : VoxelUIStrings::SettingsToggleOff();
-						}))
-						.FontSize(L.SaveRowButtonFont)
-						.MinHeight(L.DialogButtonHeight)
-						.MinWidth(L.DialogButtonWidth)
-						.OnClicked_Lambda([]()
-						{
-							VoxelGraphicsUserSettings::SetFasterTerrainDrawing(
-							    !VoxelGraphicsUserSettings::GetFasterTerrainDrawing());
-							return FReply::Handled();
-						})
-					]
-				]
-				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep * 0.5f, 0.f, 0.f))
-				[
-					SNew(STextBlock)
-					.Text(VoxelUIStrings::SettingsFasterTerrainDesc())
-					.Font(Style.Serif(L.SubPanelBodySize - 4))
-					.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-					.AutoWrapText(true)
-				]
+				RowBox
 			]
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
