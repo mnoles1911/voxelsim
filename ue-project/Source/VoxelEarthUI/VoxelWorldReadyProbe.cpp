@@ -42,10 +42,11 @@ void FVoxelWorldReadyProbe::Start(const FVector& AnchorUU, const FVoxelReadyProb
 	bStarted = true;
 
 	UE_LOG(LogVoxelUI, Log,
-	       TEXT("VoxelLoadGate: started at (%.0f, %.0f) UU -- %d probes, rings R0..R%d, %d good sample(s) at %.1fs, ")
-	       TEXT("max wait %.0fs."),
-	       Anchor.X, Anchor.Y, Status.ProbeTotal, Config.GateMaxRingLevel, Config.RequiredGoodSamples,
-	       Config.PollIntervalSeconds, Config.MaxWaitSeconds);
+	       TEXT("VoxelLoadGate: started at (%.0f, %.0f) UU -- %d probes, rings R0..R%d, fineRing gate %s, ")
+	       TEXT("%d good sample(s) at %.1fs, max wait %.0fs."),
+	       Anchor.X, Anchor.Y, Status.ProbeTotal, Config.GateMaxRingLevel,
+	       Config.bRequireFineRing ? TEXT("ON") : TEXT("OFF (-VoxelLoadGateFineRing=0)"),
+	       Config.RequiredGoodSamples, Config.PollIntervalSeconds, Config.MaxWaitSeconds);
 }
 
 void FVoxelWorldReadyProbe::Tick(float DeltaSeconds, const UVoxelWorldSubsystem& World)
@@ -77,10 +78,12 @@ void FVoxelWorldReadyProbe::Tick(float DeltaSeconds, const UVoxelWorldSubsystem&
 		// to lift on a world that never reported itself ready, and in a
 		// headless run the log line is the only witness.
 		UE_LOG(LogVoxelUI, Warning,
-		       TEXT("VoxelLoadGate: TIMED OUT after %.1fs -- hits %d/%d, pending %d, jobs %d on R0..R%d. ")
-		       TEXT("Lifting the curtain anyway."),
+		       TEXT("VoxelLoadGate: TIMED OUT after %.1fs -- hits %d/%d, pending %d, jobs %d on R0..R%d, ")
+		       TEXT("fineRing=%d/%d (%s). Lifting the curtain anyway."),
 		       Status.ElapsedSeconds, Status.ProbeHits, Status.ProbeTotal, Status.PendingInGate, Status.JobsInGate,
-		       Config.GateMaxRingLevel);
+		       Config.GateMaxRingLevel, Status.FineRingSettled, Status.FineRingTotal,
+		       Config.bRequireFineRing ? (Status.bFineRingOk ? TEXT("settled") : TEXT("NOT settled"))
+		                               : TEXT("gate off"));
 	}
 }
 
@@ -138,10 +141,17 @@ void FVoxelWorldReadyProbe::Poll(const UVoxelWorldSubsystem& World)
 	Status.JobsInGate = Jobs;
 	Status.RingFillFraction = WeightTotal > 0.f ? WeightedFill / WeightTotal : 0.f;
 
-	// --- Both gates, sustained ----------------------------------------------
+	// --- Gate 3: has the fine tier's prefetch ring settled? -----------------
+	// Polled whether or not it is required, so the t= line always shows n/m
+	// and a control leg (-VoxelLoadGateFineRing=0) can be read for what the
+	// gate WOULD have said. True with no fine tier at all.
+	Status.bFineRingOk = World.IsFineRingSettled(Status.FineRingSettled, Status.FineRingTotal);
+	const bool bFineRingOk = !Config.bRequireFineRing || Status.bFineRingOk;
+
+	// --- All gates, sustained -----------------------------------------------
 	const bool bSpatialOk = (Status.ProbeTotal > 0) && (Hits >= Status.ProbeTotal);
 	const bool bStreamerIdle = Progress.bSessionStarted && Pending == 0 && Jobs == 0;
-	if (bSpatialOk && bStreamerIdle)
+	if (bSpatialOk && bStreamerIdle && bFineRingOk)
 	{
 		++Status.ConsecutiveGood;
 	}
@@ -158,16 +168,20 @@ void FVoxelWorldReadyProbe::Poll(const UVoxelWorldSubsystem& World)
 	if (Status.ConsecutiveGood >= Config.RequiredGoodSamples)
 	{
 		Status.bReady = true;
-		UE_LOG(LogVoxelUI, Log, TEXT("VoxelLoadGate: READY after %.2fs (hits %d/%d, %d chunk(s) tracked)."),
-		       Status.ElapsedSeconds, Hits, Status.ProbeTotal, Progress.TrackedChunks);
+		UE_LOG(LogVoxelUI, Log,
+		       TEXT("VoxelLoadGate: READY after %.2fs (hits %d/%d, %d chunk(s) tracked, fineRing=%d/%d)."),
+		       Status.ElapsedSeconds, Hits, Status.ProbeTotal, Progress.TrackedChunks, Status.FineRingSettled,
+		       Status.FineRingTotal);
 		return;
 	}
 
 	if (FVoxelFrontEndSwitches::Get().bReadyProbeLog)
 	{
 		UE_LOG(LogVoxelUI, Log,
-		       TEXT("VoxelLoadGate: t=%.1fs hits=%d/%d pending(R0..R%d)=%d jobs=%d fill=%.2f consec=%d/%d poll=%.2fms"),
+		       TEXT("VoxelLoadGate: t=%.1fs hits=%d/%d pending(R0..R%d)=%d jobs=%d fill=%.2f fineRing=%d/%d ")
+		       TEXT("consec=%d/%d poll=%.2fms"),
 		       Status.ElapsedSeconds, Hits, Status.ProbeTotal, MaxRing, Pending, Jobs, Status.RingFillFraction,
-		       Status.ConsecutiveGood, Config.RequiredGoodSamples, Status.LastPollMs);
+		       Status.FineRingSettled, Status.FineRingTotal, Status.ConsecutiveGood, Config.RequiredGoodSamples,
+		       Status.LastPollMs);
 	}
 }

@@ -397,3 +397,202 @@ tools\voxel-ui-capture.ps1 -Shot GateSweep -GateRing 3 -MaxHold 300 -TimeoutSec 
 and prints one line per readiness poll. Then the control arm, identical but
 `-VoxelLoadingScreenThread=0`. Read from each log: the `Voxel frame dist seg=LOADING scope=total`
 row, the `seg=FILL` row from the same log, and the `LoadScreen: curtain thread ...` counters.
+
+## Phase 2: menu A/B (seg=MENU instrument + tick gates)
+
+`tools\voxel-ui-capture.ps1 -Shot Menu -SettleSec 6 -ExtraArgs '-VoxelFramePhase=1','-VoxelMenuTickGates=N'`.
+Arm proven by the read-back line `VoxelFrontEnd: menu tick gates=N`, which read 0,
+then 1, then 0 again.
+
+| arm | n | meanMs | p50Ms | p95Ms | p99Ms |
+|---|---|---|---|---|---|
+| gates=0 (A) | 1566 | 3.19 | 3.00 | 3.20 | 3.40 |
+| gates=1 (B) | 1570 | 3.12 | 2.90 | 3.20 | 3.40 |
+| gates=0 (A2) | 1561 | 3.20 | 3.00 | 3.20 | 3.40 |
+
+**Instrument gate PASS**: `seg=MENU scope=window n>0` in every log (1566/1570/1561).
+Before HOOK 0 this segment did not exist, so `n=0` was the failure it had to avoid.
+
+**A/A noise floor**: 0.01 ms on mean, zero bins on p50. The arm moves mean by
+0.07 ms (7x the floor) and p50 by one full 0.10 ms bin while A/A stays on the same
+bin, so the reduction is real: about 2-3% of menu CPU frame time. p95 and p99 are
+identical in all three arms -- the gates remove steady-state per-frame work, not
+spikes.
+
+**Image gate PASS**: `VoxelMenu00019/20/21` are byte-identical,
+md5 `4ad4ec1ba2a7cc8edc45b9f5721ac82c`.
+
+**What this does NOT show.** 3.2 ms is ~310 fps. The seg=MENU CPU number was never
+what the owner felt on the title screen; the reported ~11 ms GPU and busy render
+workers are untouched and this instrument cannot see them, because Lumen and TSR
+history render every menu frame with nothing to light. That remains unmeasured.
+
+### UI scale (same commit)
+
+`DefaultEngine.ini` gained `[/Script/Engine.UserInterfaceSettings]`
+`UIScaleRule=ShortestSide` with an integer-stepped curve, because the engine
+default interpolated to exactly 1.333 at a 1440 shortest side and a fractional
+scale blurs the 1 px borders of a pixel-art UI. Measured in-game shell width in a
+2560-wide frame: **1348 px (52.7%) before, 1053 px (41.1%) after** -- the intended
+1.0. Every UI capture taken before commit `d2965c2` is the "before" set.
+
+## Phase 3.5: tile-crossing legs
+
+### The rig, and the trap that voided the first attempt
+
+**The 8 km cascade reach, not the pawn position, is what bounds a flight leg
+inside a baked set.** The first leg A was sized against a 4 km admission reach and
+died at a FATAL gate leak on tile (-2,-5): the pawn never left the baked -3 column,
+but the streaming footprint runs 8192 m ahead of it and crossed into the unbaked
+-2 column. Arithmetic that must be used instead: fine tile = 15360 m,
+`tile = floor(metres/15360)`; the baked -3 column spans [-46080, -30720), so the
+pawn must satisfy `pawn_x + 8192 < -30720`, i.e. `pawn_x < -38912`. From the spawn
+at -61440 that caps travel at 22528 m; `-RunSec 100` at 240 m/s asked for 24000 m
+and overran by ~1.5 km. `-RunSec 85` (20400 m, pawn to -41040, reach to -32848,
+~2.1 km margin) is the corrected size. **This trap has now cost a leg twice in
+this project.**
+
+Baked coverage is also much sparser than the plan assumed: 24 tiles total, and the
+block around the spawn is a bare 3x3 (x -5..-3, y -5..-3) with (-3,-3) missing.
+
+Final rig, all four arms identical apart from the two switches:
+`-Flight line -SpawnAt '-61440,-61440' -RunSec 85 -PreflightSec 90 -LingerSec 30
+-LogIntervalSec 2 -VoxelPerfSpeed=240 -VoxelPerfHeading=0 -VoxelFineLockMeter=1`.
+
+### Containment and correctness (all four legs)
+
+| leg | resident | absentOnDisk | blockingLoads | gateLeaks | ringCentre | ringMoves | mirrorOffThread | Fatal |
+|---|---|---|---|---|---|---|---|---|
+| A sync r0 | 6 | 0 | 2 | 0 | (-3,-4) | 1 | 0 | 0 |
+| B async r1 | 8 | 5 | 3 | 0 | (-3,-4) | 1 | 0 | 0 |
+| C async r0 | 6 | 0 | 5 | 0 | (-3,-4) | 1 | 0 | 0 |
+| A2 sync r0 | 6 | 0 | 2 | 0 | (-3,-4) | 1 | 0 | 0 |
+
+Every leg crossed the -4/-3 boundary (`ringMoves=1`, `ringCentre=(-3,-4)`) and
+every leg stayed inside coverage. **Leg B's `absentOnDisk=5` with `gateLeaks=0` is
+the important correctness result**: at ring radius 1 the 3x3 ring includes the
+unbaked -2 column, and an absent file is recorded as known-missing rather than
+answered at sea level. If an absent ring tile had produced a gate leak that would
+have been a real loader defect; it did not.
+
+### Two gate definitions were wrong and were replaced
+
+Recorded rather than quietly passed:
+
+* **`asyncLaunched>=8` on leg B was wrong.** Actual is 6, and 6 is correct: the
+  ring is 9 tiles, 8 are baked, and 2 are already resident from the synchronous
+  startup path before the residency tick first runs. Replacement gate, which can
+  still fail: `asyncPublished == asyncLaunched` AND `asyncFailed=0` AND
+  `asyncDropped=0` AND `gateLeaks=0` AND `mirrorOffThread=0` AND the ring fully
+  resident. Leg B: 6/6, 0, 0, 0, 0, resident=8. **PASS.**
+* **"leg A must show a `residency tick stalled` line" was wrong.** Zero legs show
+  one, because at ring radius 0 the synchronous load is taken by the FUNNEL
+  (`blockingLoads`), not by the residency tick, so that line cannot fire in either
+  arm. As written the control was VOID and the whole comparison with it, which is
+  not the truth. Replacement proof that the leg exercised the disease:
+  `ringMoves>=1` AND `blockingLoads>=1` AND a multi-second `maxMs` -- satisfied by
+  all four. The absent stall line is evidence of nothing.
+
+### Timing, and the noise floor that decides it
+
+`seg=SETTLED-MOVING scope=total`. Mean speeds 245.1-247.3 m/s, so the arms are
+comparable.
+
+| leg | n | p50Ms | p95Ms | p99Ms | maxMs | meanMs | hitches | stutterPct |
+|---|---|---|---|---|---|---|---|---|
+| A sync r0 | 1670 | 44.00 | 112.00 | 235.00 | 1668.09 | 52.69 | 1100 | 85.03 |
+| B async r1 | 1785 | 41.00 | 103.00 | 229.00 | **726.46** | 48.59 | 1088 | 84.82 |
+| C async r0 | 1527 | 49.00 | 123.00 | 247.00 | 1130.33 | 57.45 | 1080 | 87.56 |
+| A2 sync r0 | 1293 | 57.00 | 147.00 | 1251.99 | 1251.99 | 68.26 | 996 | 89.33 |
+
+**Noise floor = |A - A2|, the two identical arms:**
+
+| metric | p50 | p95 | p99 | max | mean |
+|---|---|---|---|---|---|
+| floor | **13.00** | **35.00** | **1016.99** | **416.10** | **15.57** |
+
+Against that floor:
+
+| claim | delta | floor | verdict |
+|---|---|---|---|
+| B p50 vs A | -3.00 | 13.00 | does NOT clear |
+| B p95 vs A | -9.00 | 35.00 | does NOT clear |
+| B p99 vs A | -6.00 | 1016.99 | does NOT clear |
+| B mean vs A | -4.10 | 15.57 | does NOT clear |
+| **B max vs A** | **-941.63** | **416.10** | **CLEARS** |
+| C p50 vs A | +5.00 | 13.00 | does NOT clear |
+| C p95 vs A | +11.00 | 35.00 | does NOT clear |
+| C p99 vs A | +12.00 | 1016.99 | does NOT clear |
+
+**The only claim that survives is B's `maxMs`.** B's worst frame is 726.46 ms
+against 1668.09 (A) and 1251.99 (A2) -- below *both* controls, by 941.63 and
+525.53 ms, both larger than the 416.10 ms floor. That is exactly the mechanism the
+arm was built for: a multi-second blocking whole-tile load taken off the game
+thread.
+
+**C's apparent 10% regression does NOT clear the floor** and must not be reported
+as one. And because it does not, neither does B's p50/p95 improvement: the two are
+the same size. The honest summary is that **this rig cannot resolve percentile
+differences at all** -- the A/A floor swamps them -- and the single surviving
+result is the removal of the worst frame.
+
+Worth noting even though it is n=1 per leg: both async arms have a lower `maxMs`
+than both sync arms (726 and 1130 against 1252 and 1668), which is consistent with
+the mechanism but is not a claim this leg set can make.
+
+### Ring fill, joins, and whether prefetch stays ahead
+
+| leg | max `queued` | ring-fill wall (first to last ASYNC publish) | joins pre-preflight | joins post-preflight | capRefusals | asyncWorkerMs | asyncPublishMs |
+|---|---|---|---|---|---|---|---|
+| A sync r0 | n/a | n/a | 0 | 0 | 0 | 0.0 | 0.00 |
+| B async r1 | 5705 ms | 14 s (20:21:25 -> 20:21:39) | 1 | **0** | 17 | 4526.3 | 0.24 (6 publishes) |
+| C async r0 | 83 ms | ~0 s (both publishes in one second) | 1 | **0** | 2 | 1639.7 | 0.10 (2 publishes) |
+| A2 sync r0 | n/a | n/a | 0 | 0 | 0 | 0.0 | 0.00 |
+
+`queued` climbs 0, 21, 70, 1103, 1599, 5705 ms as the ring fills: nine ring tiles
+sharing `-VoxelFineTileAsyncCap=2` at roughly 600-960 ms of worker time each.
+
+**Both joins happen during world init, before the preflight clock starts; there
+are ZERO post-preflight joins in either async arm.** By the standing decision rule
+the cap is adequate and **ships at 2**; no cap sweep is warranted. A
+`-VoxelFineTileAsyncCap 4` arm was therefore not run.
+
+**Does prefetch stay ahead of the flight?** Ring radius 1 populates in 14 s of wall
+time. At 240 m/s a tile is 15360 m = 64 s of flight. So the ring fills roughly 4.5x
+faster than the player crosses a tile, and prefetch stays ahead with margin. The
+same 14 s is the floor on the Phase 3.4 loading-gate wait, since the `fineRing`
+condition cannot release faster than the ring populates. The gate is live: an
+in-game screen capture on this build logged
+`VoxelLoadGate: ... fineRing gate ON ... READY after 9.02s (hits 112/112, ... fineRing=1/1)`.
+
+4526.3 ms of worker wall time was moved off the game thread on leg B, against
+0.24 ms of total game-thread publish cost for six publishes.
+
+### A fifth arm was considered and skipped
+
+A sync + ring-1 arm would cleanly isolate prefetch from async. It was not run: it
+is exactly the configuration `VoxelFineTileStreamer.h` explains is unaffordable
+(nine synchronous whole-tile decodes on the game thread), so its result is
+predictable and the box time is better spent elsewhere.
+
+### Context these numbers must carry
+
+Both arms are GOAL3-FAIL at p50 ~24 fps, and that is **expected, not a
+regression**. This rig flies at 246 m/s, over 12x the 20 m/s the standing targets
+are written against, deliberately, to force tile crossings inside a short leg.
+These numbers may not be quoted as representative play, and per the house rule a
+capture-leg `frameMs` is not an FPS claim.
+
+Box sharing: a Codex `python` process was live throughout. CPU deltas across the
+legs were 0.5 s (A), 13.6 s (B), 14.6 s (C) against ~245 s of wall each -- light
+background work, no compile and no second editor, so no leg is marked
+VOID-CONTENDED.
+
+### Verdict
+
+The async loader is **correct** (every counter clean on every arm, an absent ring
+tile handled as known-missing rather than a gate leak, `mirrorOffThread=0`
+throughout) and it **removes the worst frame** (`maxMs` -56% against a floor it
+clears). It is **not** demonstrated to improve typical frame time: no percentile
+delta in either direction clears the A/A noise floor of this rig. It ships behind
+`-VoxelFineTileAsync` defaulting to 0.

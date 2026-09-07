@@ -21,25 +21,30 @@
 #include <utility>
 
 // See VoxelFineTileStreamer.h's class-level comment for the full contract.
-// Short version: this file is a synchronous, local-disk-only implementation of
-// the residency/prefetch/eviction POLICY (voxelcore/tilestreaming.h owns the
+// Short version: this file is a local-disk-only implementation of the
+// residency/prefetch/eviction POLICY (voxelcore/tilestreaming.h owns the
 // actual maths -- ring geometry, dilation, read-margin, LRU ordering,
 // cache-key formatting, validation) plus the RWLock that makes one
 // vxc::FineTileSampler safe to hand to the meshing worker pool. Everything
 // else is glue: turning UE world-mm coordinates into calls against that pure
 // library, and turning its answers into vxc::FineTileSampler loads/unloads.
 //
-// A future async/network loader would replace EnsureTileResident_Locked's body
-// (currently a vxc::FileRangeSource + vxc::readFineTilePreamble +
-// vxc::fetchFineTileBlocks + vxc::validateAndParseFineTilePartial + a full
-// prewarm, all synchronous) with a background fetch+decode that completes on
-// some later tick and is published under the exclusive lock; the public API
-// (IsFootprintResident / RequestFootprint / TickResidencyAndEviction) would
-// not need to change shape, because RequestFootprint already returns false
-// rather than blocking forever when something isn't ready -- "not yet
-// resident" and "will never be resident" already look identical to a caller,
-// which is exactly the "block until ready, never fall back" contract the plan
-// requires.
+// TWO LOADERS, ONE READ. The read itself -- vxc::FileRangeSource +
+// vxc::readFineTilePreamble + vxc::validateAndParseFineTilePartial +
+// vxc::fetchFineTileBlocks -- is ReadAndFetchTile, a pure function of a
+// RangeSource that touches no streamer state. The SYNCHRONOUS loader
+// (EnsureTileResident_Locked, the default) calls it on the game thread under
+// Lock_ exclusive and then loadTile + prewarm into Sampler_, exactly as it
+// always did. The ASYNC loader (-VoxelFineTileAsync=1) calls it on a worker
+// task, loads and prewarms into a PRIVATE vxc::FineTileSampler there, and
+// hands the finished sampler back through an MPSC queue; the game thread
+// adopts the tile with vxc::FineTileSampler::adoptWarmTile in
+// PumpAsyncLoads_Locked. The public API kept its shape, because
+// RequestFootprint already returned false rather than blocking when something
+// was not ready -- "not yet resident" and "will never be resident" already
+// looked identical to a caller, which is exactly the "block until ready, never
+// fall back" contract the plan requires, and "in flight" is now a third thing
+// that looks the same to it.
 
 namespace
 {
@@ -175,6 +180,30 @@ FVoxelFineTileStreamer::FVoxelFineTileStreamer(FString RootDir, FString Provider
 	const int32 FastModeNow = VoxelFineLock::FastMode();
 	LastProbeLogSeconds_ = FPlatformTime::Seconds();
 
+	// THE ASYNC ARM'S SWITCHES, latched here and only here (same discipline as
+	// the two above). Default OFF: bAsyncMode_ false means no task is ever
+	// launched, AsyncShared_ stays null, and every guarded path below is the
+	// pre-arm code. The in-flight cap is -VoxelFineTileAsyncCap, NOT
+	// *InFlight: "Flight" is in VoxelFrontEndPolicy's self-driving substrings
+	// and would silently suppress the main menu on any interactive launch that
+	// passed it (see -VoxelGpuMeshInFlight's entry in
+	// tools/frontend-switch-classification.txt for the precedent).
+	{
+		int32 AsyncValue = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileAsync="), AsyncValue);
+		bAsyncMode_ = (AsyncValue != 0);
+		int32 CapValue = 2;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileAsyncCap="), CapValue);
+		AsyncInFlightCap_ = FMath::Clamp(CapValue, 1, 4);
+		int32 PerTickValue = 2;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileAsyncPerTick="), PerTickValue);
+		AsyncPerTickCap_ = FMath::Clamp(PerTickValue, 1, 9);
+		if (bAsyncMode_)
+		{
+			AsyncShared_ = MakeShared<FAsyncShared, ESPMode::ThreadSafe>();
+		}
+	}
+
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Fine lock: fast=%d (%s) meter=%d (%s). Fast modes: 0=exclusive always (today), ")
 	       TEXT("1=shared when already resident, 2=+lock-free game-thread mirror, 3=+mirror audit. ")
@@ -229,6 +258,14 @@ FVoxelFineTileStreamer::FVoxelFineTileStreamer(FString RootDir, FString Provider
 		       bRefusesOrigin ? 1 : 0, bRefusesNegative ? 1 : 0);
 	}
 
+}
+
+FVoxelFineTileStreamer::~FVoxelFineTileStreamer()
+{
+	// A worker that is still reading would otherwise enqueue into a queue this
+	// destructor is about to free. ShutdownAsync is idempotent, so the usual
+	// call from FVoxelWorldImpl::WaitForInFlightTasks makes this a no-op.
+	ShutdownAsync();
 }
 
 FString FVoxelFineTileStreamer::LocalPathFor(vxc::TileCoord Tile) const
@@ -419,163 +456,49 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 		}
 	}
 
-	// The preamble: header, section table, elevation index, water index, basin
-	// table, headwater table. DISJOINT regions, not a prefix -- encode_v2 puts
-	// each plane's multi-megabyte data section immediately after its own index
-	// -- which is why this is a call into voxel-core rather than a "read the
-	// first 64 KB" here. ~62-67 KB of content in 2-5 requests.
-	vxc::FinePreambleRequest Want;
-	Want.wantFlow = false;   // see above: nothing in this module reads flow
-	Want.wantWater = true;   // lakes.h / riverribbon.h decode water lazily
-	Want.wantBasins = true;  // the lake registry; absent != empty, so fetch it
-	// HEADS LOAD WHEREVER BASINS DO. Same argument, same cost class (a table of
-	// a few dozen 8-byte rows, not a plane), and the same absent-vs-empty trap:
-	// a tile whose heads were never fetched reports headsResident()==false, the
-	// fluid's faucet gather reads that as "no baked heads in this box" and falls
-	// to the rivernet graph fallback, whose rim false-heads were the "square of
-	// hovering water" the first playtest saw. It is the default in
-	// FinePreambleRequest; stated here so a future edit has to mean it.
-	Want.wantHeads = true;
-	vxc::FineTileBytes Held;
-	vxc::FineError PreambleErr = vxc::FineError::kNone;
-	vxc::FineHeaderFacts PreambleFacts;
-	if (!vxc::readFineTilePreamble(Source, Source.fileSize(), Want, Held, &PreambleErr, &PreambleFacts))
+	// THE READ, extracted (2026-09-07) so the async arm can run the identical
+	// sequence on a worker: preamble, validation, identity check, elevation /
+	// water / bathymetry payload. ReadAndFetchTile touches no streamer state;
+	// the counter and the failure memo are applied HERE, in the order they
+	// always were, so the synchronous per-tile log lines are unchanged.
+	// TIMED (2026-09-07), because on two launches tile (-5,-3) showed ~4.8 s
+	// of wall between the previous tile's line and its own with only 280 ms of
+	// decode and the smallest read of the four, and nothing said where the rest
+	// went. `read` is the whole of ReadAndFetchTile: preamble, validation and
+	// every payload range, i.e. the disk's share of the load.
+	const double ReadT0 = FPlatformTime::Seconds();
+	FTileReadOutcome Read = ReadAndFetchTile(Source, Sampler_.decompressor(), Seed_, Tile);
+	const double ReadMs = (FPlatformTime::Seconds() - ReadT0) * 1000.0;
+	if (Read.Kind != FTileReadOutcome::EKind::kParsed)
 	{
-		++CorruptLoads_;
-		// A preamble read that failed on the SOURCE (kFileUnreadable: locked,
-		// being written, shrank) is the one failure here that another attempt
-		// can fix. A malformed section table is not, and asking again for it is
-		// the spin this whole path now refuses to perform.
-		return RecordLoadFailure_Locked(Tile, Path, FileSizeNow, WriteTimeNow, TEXT("preamble"),
-		                                DescribeRejection(PreambleErr, PreambleFacts),
-		                                vxc::fineErrorIsTransient(PreambleErr));
-	}
-
-	// "Validate, never trust": FineTile::parsePartial's own all-or-nothing
-	// structural check, PLUS the identity check that follows
-	// EditLog::checkProvider()'s precedent (compare a stamped identity, refuse
-	// on mismatch) rather than inventing a second mechanism. The decompressor is
-	// the sampler's, so a CODEC_ZSTD tile is decodable here exactly when this
-	// build has zstd.
-	vxc::FineTileValidationResult Validated = vxc::validateAndParseFineTilePartial(
-		std::move(Held), Seed_, Tile.x, Tile.y, Sampler_.decompressor());
-	if (Validated.verdict == vxc::FineTileVerdict::kCorrupt)
-	{
-		++CorruptLoads_;
-		// "failed structural validation (bad-header)" used to be the whole of
-		// this message, and it was the same words whether the file was
-		// truncated or this binary was three weeks behind the bake. It is now
-		// vxc::fineDescribeRejection's sentence, which names the file's
-		// bake_ver AND this build's ceiling; and retryWorthwhile() decides
-		// whether asking again could ever help, which for a structural refusal
-		// it cannot.
-		return RecordLoadFailure_Locked(Tile, Path, FileSizeNow, WriteTimeNow, TEXT("validation"),
-		                                DescribeRejection(Validated.error, Validated.facts),
-		                                Validated.retryWorthwhile());
-	}
-	if (Validated.verdict == vxc::FineTileVerdict::kIdentityMismatch)
-	{
-		++IdentityMismatches_;
-		return RecordLoadFailure_Locked(
-			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("identity"),
-			FString::Printf(
-				TEXT("the file parsed cleanly but carries a DIFFERENT tile's identity than the one requested ")
-				TEXT("(wanted seed=%llu x=%d y=%d). This is a cache-key/provider mismatch, the same class of ")
-				TEXT("refusal EditLog::checkProvider() already models for edit-log replay -- check ")
-				TEXT("-VoxelFineTileProviderId and the seed before suspecting the tile."),
-				(unsigned long long)Seed_, Tile.x, Tile.y),
-			/*bTransient=*/false);
-	}
-
-	// Now the payload bytes, in coalesced ranges planned off the indices the
-	// preamble just gave us. CONSTANT blocks are served from the index and cost
-	// no request at all -- on these tiles that is 72-87% of the water plane.
-	//
-	// EVERY non-CONSTANT elevation block, because rule 1 decodes them all below
-	// and a block whose bytes are absent would fail that decode with
-	// kBlockNotResident rather than silently yielding sea level. The residency
-	// invariant this class publishes ("resident tile => every block readable")
-	// is therefore still exactly true after this call, or the load fails.
-	if (!vxc::fetchFineTileBlocks(Source, *Validated.tile, vxc::FinePlane::kElevation,
-	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kElevation)))
-	{
-		++CorruptLoads_;
-		// GENUINELY TRANSIENT, and one of the two cases that justify keeping a
-		// retry at all: the preamble read succeeded, so the file was whole a
-		// moment ago and something rewrote it underneath us. The next attempt
-		// sees the new file, whose size or timestamp differs, and starts over.
-		return RecordLoadFailure_Locked(
-			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("elev-fetch"),
-			TEXT("the elevation payload could not be read: the file shrank or changed between the preamble ")
-			TEXT("read and the payload read. Transient -- a re-bake in progress looks exactly like this."),
-			/*bTransient=*/true);
-	}
-	// The water plane, which lakes.h / riverribbon.h decode lazily out of the
-	// tile's own bytes long after this function returns. It must be fetched HERE
-	// rather than on demand: those decoders run on worker threads, and an
-	// unfetched water block would answer kBlockNotResident there with no way to
-	// go and get it. 51-174 KB, and mostly one coalesced span.
-	if (Validated.tile->hasWater() &&
-	    !vxc::fetchFineTileBlocks(Source, *Validated.tile, vxc::FinePlane::kWater,
-	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kWater)))
-	{
-		++CorruptLoads_;
-		return RecordLoadFailure_Locked(
-			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("water-fetch"),
-			TEXT("the water payload could not be read: the file shrank or changed between the preamble read ")
-			TEXT("and the payload read. Transient -- see elev-fetch."),
-			/*bTransient=*/true);
-	}
-
-	// THE BATHYMETRY PAIR (bake_ver 27), fetched here for exactly the reason the
-	// water plane above is: the consumer decodes it long after this function
-	// returns, and an unfetched block answers kBlockNotResident with no way to go
-	// and get the bytes. The consumer is the camera-centred bathymetry field
-	// (VoxelBathyField.cpp), which reads a rect of it every time the window
-	// recentres, off the game thread.
-	//
-	// The preamble already brought both INDICES down -- FinePreambleRequest's
-	// wantBathy defaults to true and readFineTilePreamble honours it -- so
-	// without these two calls a tile would look like it had bathymetry
-	// (bathyDepthIndexResident() true) and answer every actual read
-	// kBlockNotResident. That is the failure mode the flag/section agreement test
-	// exists to make loud at the format level, arriving instead one layer up.
-	//
-	// UNCONDITIONAL, matching the water plane. The two planes are the same cost
-	// class -- int16, block_log2 8, and mostly MODE_CONSTANT away from lakes, so
-	// a dry tile pays nothing at all -- and gating them would mean a second
-	// residency state for something the material reads on every water pixel.
-	if (Validated.tile->hasBathy())
-	{
-		const vxc::FinePlane BathyPlanes[2] = { vxc::FinePlane::kBathyDepth,
-		                                        vxc::FinePlane::kBathyShore };
-		for (vxc::FinePlane Plane : BathyPlanes)
+		if (Read.Counter == FTileReadOutcome::ECounter::kIdentity)
 		{
-			if (!vxc::fetchFineTileBlocks(Source, *Validated.tile, Plane,
-			                              vxc::fineNonConstantBlocks(*Validated.tile, Plane)))
-			{
-				++CorruptLoads_;
-				return RecordLoadFailure_Locked(
-					Tile, Path, FileSizeNow, WriteTimeNow, TEXT("bathy-fetch"),
-					TEXT("a bathymetry payload could not be read: the file shrank or changed between the ")
-					TEXT("preamble read and the payload read. Transient -- see elev-fetch."),
-					/*bTransient=*/true);
-			}
+			++IdentityMismatches_;
 		}
+		else
+		{
+			++CorruptLoads_;
+		}
+		// The refusal's sentence carries the read time too: a 4 s "preamble"
+		// failure and a 4 ms one are different diseases.
+		return RecordLoadFailure_Locked(Tile, Path, FileSizeNow, WriteTimeNow, Read.ReasonTag,
+		                                Read.Why + FString::Printf(TEXT(" (read %.0f ms)"), ReadMs),
+		                                Read.bTransient);
 	}
+	std::optional<vxc::FineTile>& ParsedTile = Read.Tile;
 
 	// Capture the geometry before the move below hands ownership to the sampler.
-	const int64 TileSizePx = int64(Validated.tile->size());
+	const int64 TileSizePx = int64(ParsedTile->size());
 	// What this tile HOLDS, which is now less than its size on disk: the flow
 	// plane's 12.6 MB (on the shipped tiles) was never read. Charging the LRU
 	// the fetched bytes rather than the file size is what makes the budget mean
 	// what it says once the two stop being equal.
-	const uint64 ByteCount = Validated.tile->residentFileBytes();
+	const uint64 ByteCount = ParsedTile->residentFileBytes();
 	const uint64 FileSizeOnDisk = Source.fileSize();
 	const uint64 TileDecodedBytes =
-		uint64(Validated.tile->blockCount()) * uint64(Validated.tile->blockPixelCount()) * sizeof(int16_t);
+		uint64(ParsedTile->blockCount()) * uint64(ParsedTile->blockPixelCount()) * sizeof(int16_t);
 
-	if (!Sampler_.loadTile(std::move(*Validated.tile)))
+	if (!Sampler_.loadTile(std::move(*ParsedTile)))
 	{
 		// Should be unreachable: the identity check above already confirmed
 		// seed matches, and loadTile only additionally rejects on a `size`
@@ -652,15 +575,179 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	Budget_.touch(Key, ByteCount + TileDecodedBytes);
 	KeyToTile_.emplace(Key, Tile);
 
+	// `read %.0f ms` is APPENDED after `full decode` (2026-09-07), never
+	// reordered: legs grep for `full decode`, and a field inserted before it
+	// would silently break every one of them.
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("Fine tile (%d,%d) resident: %llu px edge, %.1f MB read of a %.1f MB file in %llu range(s) ")
-	       TEXT("+ %.1f MB decoded lattice, full decode %.0f ms. Resident tiles now %llu, %.2f GiB of ")
+	       TEXT("+ %.1f MB decoded lattice, full decode %.0f ms, read %.0f ms. Resident tiles now %llu, %.2f GiB of ")
 	       TEXT("%.2f GiB budget."),
 	       Tile.x, Tile.y, (unsigned long long)TileSizePx, double(ByteCount) / 1e6,
 	       double(FileSizeOnDisk) / 1e6, (unsigned long long)Source.requests,
-	       double(TileDecodedBytes) / 1e6, DecodeMs, (unsigned long long)Sampler_.tileCount(),
+	       double(TileDecodedBytes) / 1e6, DecodeMs, ReadMs, (unsigned long long)Sampler_.tileCount(),
 	       double(Budget_.residentBytes()) / double(1ull << 30), double(Budget_.budgetBytes()) / double(1ull << 30));
 	return true;
+}
+
+FVoxelFineTileStreamer::FTileReadOutcome FVoxelFineTileStreamer::ReadAndFetchTile(
+	vxc::FileRangeSource& Source, const vxc::FineDecompressor& Decompressor, uint64 Seed, vxc::TileCoord Tile)
+{
+	// PURE, and it has to stay pure: this runs on a worker task on the async
+	// arm, with no lock held and no streamer member in reach. Every failure is
+	// RETURNED with the tag, sentence and transience the caller feeds to
+	// RecordLoadFailure_Locked, and the counter it should charge -- the two
+	// callers apply them on the game thread. Nothing here logs.
+	FTileReadOutcome Out;
+	auto Fail = [&Out](FTileReadOutcome::ECounter Counter, const TCHAR* Tag, FString Why, bool bTransient)
+	{
+		Out.Kind = FTileReadOutcome::EKind::kFailed;
+		Out.Counter = Counter;
+		Out.ReasonTag = Tag;
+		Out.Why = MoveTemp(Why);
+		Out.bTransient = bTransient;
+		return std::move(Out);
+	};
+
+	// The preamble: header, section table, elevation index, water index, basin
+	// table, headwater table. DISJOINT regions, not a prefix -- encode_v2 puts
+	// each plane's multi-megabyte data section immediately after its own index
+	// -- which is why this is a call into voxel-core rather than a "read the
+	// first 64 KB" here. ~62-67 KB of content in 2-5 requests.
+	vxc::FinePreambleRequest Want;
+	Want.wantFlow = false;   // nothing in this module reads flow; see EnsureTileResident_Locked
+	Want.wantWater = true;   // lakes.h / riverribbon.h decode water lazily
+	Want.wantBasins = true;  // the lake registry; absent != empty, so fetch it
+	// HEADS LOAD WHEREVER BASINS DO. Same argument, same cost class (a table of
+	// a few dozen 8-byte rows, not a plane), and the same absent-vs-empty trap:
+	// a tile whose heads were never fetched reports headsResident()==false, the
+	// fluid's faucet gather reads that as "no baked heads in this box" and falls
+	// to the rivernet graph fallback, whose rim false-heads were the "square of
+	// hovering water" the first playtest saw. It is the default in
+	// FinePreambleRequest; stated here so a future edit has to mean it.
+	Want.wantHeads = true;
+	vxc::FineTileBytes Held;
+	vxc::FineError PreambleErr = vxc::FineError::kNone;
+	vxc::FineHeaderFacts PreambleFacts;
+	if (!vxc::readFineTilePreamble(Source, Source.fileSize(), Want, Held, &PreambleErr, &PreambleFacts))
+	{
+		// A preamble read that failed on the SOURCE (kFileUnreadable: locked,
+		// being written, shrank) is the one failure here that another attempt
+		// can fix. A malformed section table is not, and asking again for it is
+		// the spin this whole path now refuses to perform.
+		return Fail(FTileReadOutcome::ECounter::kCorrupt, TEXT("preamble"),
+		            DescribeRejection(PreambleErr, PreambleFacts), vxc::fineErrorIsTransient(PreambleErr));
+	}
+
+	// "Validate, never trust": FineTile::parsePartial's own all-or-nothing
+	// structural check, PLUS the identity check that follows
+	// EditLog::checkProvider()'s precedent (compare a stamped identity, refuse
+	// on mismatch) rather than inventing a second mechanism. The decompressor is
+	// the sampler's, so a CODEC_ZSTD tile is decodable here exactly when this
+	// build has zstd.
+	vxc::FineTileValidationResult Validated =
+		vxc::validateAndParseFineTilePartial(std::move(Held), Seed, Tile.x, Tile.y, Decompressor);
+	if (Validated.verdict == vxc::FineTileVerdict::kCorrupt)
+	{
+		// "failed structural validation (bad-header)" used to be the whole of
+		// this message, and it was the same words whether the file was
+		// truncated or this binary was three weeks behind the bake. It is now
+		// vxc::fineDescribeRejection's sentence, which names the file's
+		// bake_ver AND this build's ceiling; and retryWorthwhile() decides
+		// whether asking again could ever help, which for a structural refusal
+		// it cannot.
+		return Fail(FTileReadOutcome::ECounter::kCorrupt, TEXT("validation"),
+		            DescribeRejection(Validated.error, Validated.facts), Validated.retryWorthwhile());
+	}
+	if (Validated.verdict == vxc::FineTileVerdict::kIdentityMismatch)
+	{
+		return Fail(
+			FTileReadOutcome::ECounter::kIdentity, TEXT("identity"),
+			FString::Printf(
+				TEXT("the file parsed cleanly but carries a DIFFERENT tile's identity than the one requested ")
+				TEXT("(wanted seed=%llu x=%d y=%d). This is a cache-key/provider mismatch, the same class of ")
+				TEXT("refusal EditLog::checkProvider() already models for edit-log replay -- check ")
+				TEXT("-VoxelFineTileProviderId and the seed before suspecting the tile."),
+				(unsigned long long)Seed, Tile.x, Tile.y),
+			/*bTransient=*/false);
+	}
+
+	// Now the payload bytes, in coalesced ranges planned off the indices the
+	// preamble just gave us. CONSTANT blocks are served from the index and cost
+	// no request at all -- on these tiles that is 72-87% of the water plane.
+	//
+	// EVERY non-CONSTANT elevation block, because rule 1 decodes them all at
+	// load and a block whose bytes are absent would fail that decode with
+	// kBlockNotResident rather than silently yielding sea level. The residency
+	// invariant this class publishes ("resident tile => every block readable")
+	// is therefore still exactly true after the load, or the load fails.
+	if (!vxc::fetchFineTileBlocks(Source, *Validated.tile, vxc::FinePlane::kElevation,
+	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kElevation)))
+	{
+		// GENUINELY TRANSIENT, and one of the two cases that justify keeping a
+		// retry at all: the preamble read succeeded, so the file was whole a
+		// moment ago and something rewrote it underneath us. The next attempt
+		// sees the new file, whose size or timestamp differs, and starts over.
+		return Fail(
+			FTileReadOutcome::ECounter::kCorrupt, TEXT("elev-fetch"),
+			TEXT("the elevation payload could not be read: the file shrank or changed between the preamble ")
+			TEXT("read and the payload read. Transient -- a re-bake in progress looks exactly like this."),
+			/*bTransient=*/true);
+	}
+	// The water plane, which lakes.h / riverribbon.h decode lazily out of the
+	// tile's own bytes long after this function returns. It must be fetched HERE
+	// rather than on demand: those decoders run on worker threads, and an
+	// unfetched water block would answer kBlockNotResident there with no way to
+	// go and get it. 51-174 KB, and mostly one coalesced span.
+	if (Validated.tile->hasWater() &&
+	    !vxc::fetchFineTileBlocks(Source, *Validated.tile, vxc::FinePlane::kWater,
+	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kWater)))
+	{
+		return Fail(
+			FTileReadOutcome::ECounter::kCorrupt, TEXT("water-fetch"),
+			TEXT("the water payload could not be read: the file shrank or changed between the preamble read ")
+			TEXT("and the payload read. Transient -- see elev-fetch."),
+			/*bTransient=*/true);
+	}
+
+	// THE BATHYMETRY PAIR (bake_ver 27), fetched here for exactly the reason the
+	// water plane above is: the consumer decodes it long after this function
+	// returns, and an unfetched block answers kBlockNotResident with no way to go
+	// and get the bytes. The consumer is the camera-centred bathymetry field
+	// (VoxelBathyField.cpp), which reads a rect of it every time the window
+	// recentres, off the game thread.
+	//
+	// The preamble already brought both INDICES down -- FinePreambleRequest's
+	// wantBathy defaults to true and readFineTilePreamble honours it -- so
+	// without these two calls a tile would look like it had bathymetry
+	// (bathyDepthIndexResident() true) and answer every actual read
+	// kBlockNotResident. That is the failure mode the flag/section agreement test
+	// exists to make loud at the format level, arriving instead one layer up.
+	//
+	// UNCONDITIONAL, matching the water plane. The two planes are the same cost
+	// class -- int16, block_log2 8, and mostly MODE_CONSTANT away from lakes, so
+	// a dry tile pays nothing at all -- and gating them would mean a second
+	// residency state for something the material reads on every water pixel.
+	if (Validated.tile->hasBathy())
+	{
+		const vxc::FinePlane BathyPlanes[2] = { vxc::FinePlane::kBathyDepth,
+		                                        vxc::FinePlane::kBathyShore };
+		for (vxc::FinePlane Plane : BathyPlanes)
+		{
+			if (!vxc::fetchFineTileBlocks(Source, *Validated.tile, Plane,
+			                              vxc::fineNonConstantBlocks(*Validated.tile, Plane)))
+			{
+				return Fail(
+					FTileReadOutcome::ECounter::kCorrupt, TEXT("bathy-fetch"),
+					TEXT("a bathymetry payload could not be read: the file shrank or changed between the ")
+					TEXT("preamble read and the payload read. Transient -- see elev-fetch."),
+					/*bTransient=*/true);
+			}
+		}
+	}
+
+	Out.Kind = FTileReadOutcome::EKind::kParsed;
+	Out.Tile = std::move(Validated.tile);
+	return Out;
 }
 
 bool FVoxelFineTileStreamer::IsSettledFailure_Locked(vxc::TileCoord Tile) const
@@ -1150,6 +1237,29 @@ bool FVoxelFineTileStreamer::RequestFootprint(int64 WorldMmX0, int64 WorldMmY0, 
 	ReqEscalated_.fetch_add(1, std::memory_order_relaxed);
 	VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::ReqExcl);
 	bool bAllResident = true;
+	if (bAsyncMode_)
+	{
+		// THE ASYNC ARM. Pump first, so a tile whose worker finished since the
+		// last pump is adopted before it is asked for again; then launch what
+		// is missing and answer false. The callers already treat false as
+		// "defer and re-ask" (DeferredFootprints in VoxelWorldSubsystem.cpp), so
+		// "in flight" costs them nothing new. Never blocks here: the funnel is
+		// the one place that joins, and it counts every join.
+		PumpAsyncLoads_Locked();
+		for (const vxc::TileCoord& T : Tiles)
+		{
+			if (KnownMissing_.find(TileHash(T)) != KnownMissing_.end())
+			{
+				bAllResident = false; // absent as of this ring; do not re-stat per candidate
+				continue;
+			}
+			if (!MaybeLaunchAsyncLoad_Locked(T))
+			{
+				bAllResident = false; // launched, in flight, capped or refused: not yet
+			}
+		}
+		return bAllResident;
+	}
 	for (const vxc::TileCoord& T : Tiles)
 	{
 		if (KnownMissing_.find(TileHash(T)) != KnownMissing_.end())
@@ -1249,6 +1359,24 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 		if (Sampler_.findTile(Tile.x, Tile.y) != nullptr)
 		{
 			return Sampler_.elevationMm(px, py);
+		}
+		// THE ASYNC ARM'S JOIN. A worker is already reading this tile: wait for
+		// IT rather than opening a second copy on this thread. Task.Wait()
+		// under Lock_ exclusive is deadlock-free because the worker takes no
+		// lock; the wait is never longer than the synchronous load it replaces,
+		// because the worker has already done part of the work. Counted as a
+		// join AND as a blocking load (JoinInFlight_Locked), so a steady-state
+		// leg whose ring prefetch is ahead of the player must read asyncJoins=0
+		// -- and if it does not, that is the reading, not a nuisance. If the
+		// join lands the tile, answer; if the worker FAILED it, fall through to
+		// the synchronous path below, which is now the safety net: the failure
+		// memo it consults was written by the publish a moment ago.
+		if (bAsyncMode_ && InFlight_.find(TileHash(Tile)) != InFlight_.end())
+		{
+			if (JoinInFlight_Locked(Tile))
+			{
+				return Sampler_.elevationMm(px, py);
+			}
 		}
 		// KnownMissing_ is the "we already stat'ed this and it is not on disk"
 		// memo. Honouring it here keeps a query storm over a genuinely absent
@@ -1471,6 +1599,16 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 	{
 		VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::TickExcl);
 
+		// ASYNC ARM: adopt whatever landed BEFORE the pin set is rebuilt and
+		// before selectEvictions runs, so a tile that arrived this tick is
+		// touched into the LRU (Budget_.touch in the publish) and pinned by the
+		// ring below rather than being a candidate for the eviction pass that
+		// follows. Off, this is one branch.
+		if (bAsyncMode_)
+		{
+			PumpAsyncLoads_Locked();
+		}
+
 		if (!(PlayerCoarseTile == LastRingCentre_))
 		{
 			// The ring moved: everything we believed absent is worth one more look
@@ -1514,11 +1652,32 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 		// the frontier has not generated yet simply stays non-resident --
 		// IsFootprintResident keeps refusing that area, which is the intended
 		// "block until ready" behavior, not a bug to work around here.
-		for (const vxc::TileCoord& T : Ring)
+		if (bAsyncMode_)
 		{
-			if (KnownMissing_.find(TileHash(T)) == KnownMissing_.end())
+			// CENTRE FIRST, then the ring in its row-major order: the tile under
+			// the player is the one a join would otherwise wait on, so it takes
+			// the first launch slot of a tick with the caps in play.
+			MaybeLaunchAsyncLoad_Locked(PlayerCoarseTile);
+			for (const vxc::TileCoord& T : Ring)
 			{
-				EnsureTileResident_Locked(T);
+				if (T == PlayerCoarseTile)
+				{
+					continue;
+				}
+				if (KnownMissing_.find(TileHash(T)) == KnownMissing_.end())
+				{
+					MaybeLaunchAsyncLoad_Locked(T);
+				}
+			}
+		}
+		else
+		{
+			for (const vxc::TileCoord& T : Ring)
+			{
+				if (KnownMissing_.find(TileHash(T)) == KnownMissing_.end())
+				{
+					EnsureTileResident_Locked(T);
+				}
 			}
 		}
 
@@ -1541,6 +1700,473 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 	} // Lock_ released here -- see the scope comment at the top of the function.
 
 	MaybeLogLockProbe_();
+}
+
+// ---------------------------------------------------------------------------
+// THE ASYNC ARM (-VoxelFineTileAsync=1)
+//
+// Shape: the worker reads AND decodes into a PRIVATE vxc::FineTileSampler; the
+// game thread adopts the warm tile under Lock_ exclusive in O(1). What makes
+// it sound is what the worker does NOT touch: no streamer member, no counter,
+// no memo, no lock, no Sampler_. It captures plain values (path, seed, tile,
+// the module-lifetime decompressor, a generation stamp) and a TSharedPtr to
+// the results queue, and hands back a struct. Every write to shared state --
+// the adoption, the mirror insert, the LRU charge, the memos, the epoch -- is
+// PumpAsyncLoads_Locked on the game thread. So the two invariants the header
+// states (rule 1: never publish a half-warm tile; rule 2: the tile map only
+// mutates under the write lock) hold exactly as they did for the synchronous
+// loader, and MirrorOffThreadWritesSinceStart() stays 0 by construction.
+//
+// Every arm must prove it engaged: asyncLaunched / asyncPublished on the
+// window line, and the `resident via ASYNC` per-tile line. A leg that passed
+// the switch and printed neither did not run the arm.
+// ---------------------------------------------------------------------------
+
+bool FVoxelFineTileStreamer::MaybeLaunchAsyncLoad_Locked(vxc::TileCoord Tile)
+{
+	if (Sampler_.findTile(Tile.x, Tile.y) != nullptr)
+	{
+		return true; // the only true this function ever returns
+	}
+	const uint64 Hash = TileHash(Tile);
+	if (InFlight_.find(Hash) != InFlight_.end())
+	{
+		return false; // a worker is on it
+	}
+	if (KnownMissing_.find(Hash) != KnownMissing_.end())
+	{
+		return false; // absent as of this ring; the ring move clears this memo
+	}
+	if (int32(InFlight_.size()) >= AsyncInFlightCap_ || AsyncLaunchedThisTick_ >= AsyncPerTickCap_)
+	{
+		AsyncCapRefusals_.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+
+	// ONE GAME-THREAD OPEN+STAT, the same one EnsureTileResident_Locked
+	// performs, with the same two consequences: an absent file is recorded
+	// exactly as the synchronous path records it (absent and refused are
+	// different states and stay different), and a file version this streamer
+	// already refused is never re-read -- while a CHANGED file earns a fresh
+	// set of attempts, which is what keeps a mid-session re-bake loadable.
+	const FString Path = LocalPathFor(Tile);
+	const std::filesystem::path StdPath(*Path);
+	vxc::FileRangeSource Probe(StdPath);
+	if (!Probe.ok())
+	{
+		++MissingFileLoads_;
+		KnownMissing_.insert(Hash);
+		LoadFailures_.erase(Hash);
+		return false;
+	}
+	const uint64 FileSizeNow = Probe.fileSize();
+	const int64 WriteTimeNow = FileWriteTimeTicks(StdPath);
+	if (auto FailIt = LoadFailures_.find(Hash); FailIt != LoadFailures_.end())
+	{
+		if (FailIt->second.FileSize == FileSizeNow && FailIt->second.WriteTime == WriteTimeNow)
+		{
+			if (FailIt->second.bPermanent || FailIt->second.Attempts >= kMaxTransientLoadAttempts)
+			{
+				++SuppressedRetries_;
+				return false; // silently -- the reason was logged when it was decided
+			}
+		}
+		else
+		{
+			LoadFailures_.erase(FailIt); // the file changed: a new fact, full budget
+		}
+	}
+
+	// LAUNCH. Everything the task captures is a value or the shared queue;
+	// `this` is deliberately NOT captured, so a task that outlives a shutdown
+	// (the deadline in ShutdownAsync expired) has nothing of ours to touch.
+	const double LaunchedAt = FPlatformTime::Seconds();
+	TSharedPtr<FAsyncShared, ESPMode::ThreadSafe> Shared = AsyncShared_;
+	const uint64 Seed = Seed_;
+	const vxc::FineDecompressor Dec = Sampler_.decompressor();
+	const uint64 Generation = AsyncGeneration_;
+	UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+		TEXT("VoxelFineTileLoad"),
+		[Shared, Path, Seed, Tile, Dec, Generation, FileSizeNow, WriteTimeNow]()
+		{
+			const double T0 = FPlatformTime::Seconds();
+			TUniquePtr<FAsyncLoadResult> R = MakeUnique<FAsyncLoadResult>();
+			R->Tile = Tile;
+			R->Generation = Generation;
+			R->Path = Path;
+			R->FileSize = FileSizeNow;
+			R->WriteTime = WriteTimeNow;
+
+			const std::filesystem::path WorkerPath(*Path);
+			vxc::FileRangeSource Source(WorkerPath);
+			if (!Source.ok())
+			{
+				// Gone between the game thread's stat and this open. Published
+				// as absent, exactly as the synchronous path records it.
+				R->Kind = FTileReadOutcome::EKind::kMissingFile;
+			}
+			else
+			{
+				FTileReadOutcome Out = ReadAndFetchTile(Source, Dec, Seed, Tile);
+				R->ReadMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+				R->Kind = Out.Kind;
+				R->Counter = Out.Counter;
+				R->ReasonTag = Out.ReasonTag;
+				R->Why = MoveTemp(Out.Why);
+				R->bTransient = Out.bTransient;
+				if (Out.Kind == FTileReadOutcome::EKind::kParsed)
+				{
+					R->Requests = Source.requests;
+					R->FileSizeOnDisk = Source.fileSize();
+					R->TileSizePx = int64(Out.Tile->size());
+					R->ByteCount = Out.Tile->residentFileBytes();
+					R->TileDecodedBytes =
+						uint64(Out.Tile->blockCount()) * uint64(Out.Tile->blockPixelCount()) * sizeof(int16_t);
+
+					// THE PRIVATE SAMPLER. Same seed, no climate source (climate
+					// is answered by the shared sampler after adoption), the same
+					// decompressor the shared one was given.
+					R->Warm = std::make_unique<vxc::FineTileSampler>(Seed, nullptr);
+					R->Warm->setDecompressor(Dec);
+					if (!R->Warm->loadTile(std::move(*Out.Tile)))
+					{
+						// Unreachable on a fresh sampler (the identity check already
+						// matched the seed and there is no other tile to disagree
+						// on stride with); kept so the outcome is a refusal and not
+						// a silent drop if it ever fires.
+						R->Kind = FTileReadOutcome::EKind::kFailed;
+						R->Counter = FTileReadOutcome::ECounter::kIdentity;
+						R->ReasonTag = TEXT("stride");
+						R->Why = TEXT("the file passed validation but FineTileSampler::loadTile rejected it on the ")
+						         TEXT("worker's private sampler, which holds nothing else -- this should be unreachable.");
+						R->bTransient = false;
+						R->Warm.reset();
+					}
+					else
+					{
+						// RULE 1, OFF THE GAME THREAD: decode the WHOLE tile here.
+						// tileFullyDecoded is the gate the adoption asserts, so it
+						// is checked here too -- a worker never enqueues a warm tile
+						// that the publish would have to refuse.
+						const double DecodeT0 = FPlatformTime::Seconds();
+						const bool bDecoded = R->Warm->prewarm(
+							int64(Tile.x) * R->TileSizePx, int64(Tile.y) * R->TileSizePx,
+							(int64(Tile.x) + 1) * R->TileSizePx - 1, (int64(Tile.y) + 1) * R->TileSizePx - 1);
+						R->DecodeMs = (FPlatformTime::Seconds() - DecodeT0) * 1000.0;
+						if (!bDecoded || !R->Warm->tileFullyDecoded(Tile.x, Tile.y))
+						{
+							R->Kind = FTileReadOutcome::EKind::kFailed;
+							R->Counter = FTileReadOutcome::ECounter::kCorrupt;
+							R->ReasonTag = TEXT("decode");
+							R->Why = FString::Printf(
+								TEXT("the file parsed but at least one block failed to DECODE on the worker ")
+								TEXT("(blockDecodeFailures=%llu, notResidentBlockQueries=%llu) -- discarded, never ")
+								TEXT("published. A half-decoded tile is not servable: a worker query into a missing ")
+								TEXT("block would decode on the read path, which the shared read lock cannot survive. ")
+								TEXT("The bytes are bad; re-reading them decodes them the same way."),
+								(unsigned long long)R->Warm->blockDecodeFailures.load(std::memory_order_relaxed),
+								(unsigned long long)R->Warm->notResidentBlockQueries.load(std::memory_order_relaxed));
+							R->bTransient = false;
+							R->Warm.reset();
+						}
+					}
+				}
+			}
+			R->FinishedAtSeconds = FPlatformTime::Seconds();
+			R->WorkerMs = (R->FinishedAtSeconds - T0) * 1000.0;
+			// After ShutdownAsync nobody will ever pump, so the result (and its
+			// ~134 MB) is dropped here rather than parked in a dead queue.
+			if (Shared->bAccepting.load(std::memory_order_acquire))
+			{
+				Shared->Queue.Enqueue(MoveTemp(R));
+			}
+		},
+		// The mesh jobs' own band: this is work the game thread would otherwise
+		// have done synchronously, not speculation, so it is not put below them.
+		UE::Tasks::ETaskPriority::BackgroundNormal);
+
+	FInFlightLoad Entry;
+	Entry.Task = MoveTemp(Task);
+	Entry.LaunchedAtSeconds = LaunchedAt;
+	Entry.Generation = Generation;
+	InFlight_.emplace(Hash, MoveTemp(Entry));
+	++AsyncLaunchedThisTick_;
+	AsyncLaunched_.fetch_add(1, std::memory_order_relaxed);
+	AsyncInFlightPeak_ = FMath::Max(AsyncInFlightPeak_, int32(InFlight_.size()));
+	return false;
+}
+
+void FVoxelFineTileStreamer::PumpAsyncLoads_Locked()
+{
+	if (!AsyncShared_)
+	{
+		return;
+	}
+	TUniquePtr<FAsyncLoadResult> R;
+	while (AsyncShared_->Queue.Dequeue(R))
+	{
+		const double PublishT0 = FPlatformTime::Seconds();
+		const uint64 Hash = TileHash(R->Tile);
+		AsyncWorkerNs_.fetch_add(uint64(FMath::Max(0.0, R->WorkerMs) * 1.0e6), std::memory_order_relaxed);
+
+		if (auto It = InFlight_.find(Hash); It != InFlight_.end() && It->second.Generation == R->Generation)
+		{
+			InFlight_.erase(It);
+		}
+		if (R->Generation != AsyncGeneration_)
+		{
+			AsyncDropped_.fetch_add(1, std::memory_order_relaxed); // launched before a shutdown
+			continue;
+		}
+		if (Sampler_.findTile(R->Tile.x, R->Tile.y) != nullptr)
+		{
+			// Became resident by another route while the worker ran (a join
+			// that fell through to the synchronous load, say). NEVER charge
+			// Budget_ twice: the copy in R is simply freed.
+			AsyncDropped_.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+
+		switch (R->Kind)
+		{
+		case FTileReadOutcome::EKind::kMissingFile:
+			// The synchronous path's absent triple, verbatim.
+			++MissingFileLoads_;
+			KnownMissing_.insert(Hash);
+			LoadFailures_.erase(Hash);
+			AsyncFailed_.fetch_add(1, std::memory_order_relaxed);
+			break;
+
+		case FTileReadOutcome::EKind::kFailed:
+			if (R->Counter == FTileReadOutcome::ECounter::kIdentity)
+			{
+				++IdentityMismatches_;
+			}
+			else
+			{
+				++CorruptLoads_;
+			}
+			// Same read-time suffix the synchronous refusal carries, so the two
+			// arms' refusals read alike.
+			RecordLoadFailure_Locked(R->Tile, R->Path, R->FileSize, R->WriteTime, R->ReasonTag,
+			                         R->Why + FString::Printf(TEXT(" (worker read %.0f ms)"), R->ReadMs),
+			                         R->bTransient);
+			AsyncFailed_.fetch_add(1, std::memory_order_relaxed);
+			break;
+
+		case FTileReadOutcome::EKind::kParsed:
+		{
+			// The worker refuses to enqueue a half-warm tile, so this is an
+			// invariant, not a branch: violating it is the one way a lazy decode
+			// could get back onto the shared read path.
+			checkf(R->Warm && R->Warm->tileFullyDecoded(R->Tile.x, R->Tile.y),
+			       TEXT("async fine tile (%d,%d) reached publish without a full decode"), R->Tile.x, R->Tile.y);
+			const vxc::FineAdoptResult Adopt = Sampler_.adoptWarmTile(*R->Warm, R->Tile.x, R->Tile.y);
+			if (Adopt == vxc::FineAdoptResult::kStrideMismatch)
+			{
+				// The synchronous path's "stride" refusal, same counter, same words.
+				++IdentityMismatches_;
+				RecordLoadFailure_Locked(
+					R->Tile, R->Path, R->FileSize, R->WriteTime, TEXT("stride"),
+					TEXT("the file passed validation but FineTileSampler::adoptWarmTile rejected it -- almost ")
+					TEXT("certainly a `size` stride mismatch against a tile already loaded in this run. The format ")
+					TEXT("allows `size` to vary per tile; this sampler (like the wire spec's own single-grid-stride ")
+					TEXT("assumption) does not."),
+					/*bTransient=*/false);
+				AsyncFailed_.fetch_add(1, std::memory_order_relaxed);
+				break;
+			}
+			if (Adopt != vxc::FineAdoptResult::kOk)
+			{
+				// kAlreadyResident was excluded above and kSeedMismatch /
+				// kNotInSource cannot happen for a sampler the worker built for
+				// this seed and this tile. Said out loud rather than trusted.
+				UE_LOG(LogVoxelEarth, Error,
+				       TEXT("Fine tile (%d,%d): async publish could not adopt the worker's warm tile ")
+				       TEXT("(FineAdoptResult=%d). Dropped; the tile stays non-resident."),
+				       R->Tile.x, R->Tile.y, int32(Adopt));
+				AsyncDropped_.fetch_add(1, std::memory_order_relaxed);
+				break;
+			}
+			// THE MIRROR, WRITE 4 OF 4 -- and only on kOk, which the two returns
+			// above guarantee. Same statement group as the adoption, for the
+			// same reason writes 1-3 sit beside their loadTile/unloadTile.
+			NoteMirrorWriteThread_();
+			ResidentTiles_.insert(Hash);
+
+			DecodedBytes_ += R->TileDecodedBytes;
+			++TilesLoaded_;
+			KnownMissing_.erase(Hash);
+			LoadFailures_.erase(Hash);
+			ResidencyEpoch_.fetch_add(1, std::memory_order_relaxed); // once per published tile
+			const std::string Key = vxc::formatFineTileCacheKey(ProviderId_, Seed_, R->Tile.x, R->Tile.y);
+			Budget_.touch(Key, R->ByteCount + R->TileDecodedBytes);
+			KeyToTile_.emplace(Key, R->Tile);
+			AsyncPublished_.fetch_add(1, std::memory_order_relaxed);
+
+			const double PublishMs = (FPlatformTime::Seconds() - PublishT0) * 1000.0;
+			const double QueuedMs = FMath::Max(0.0, (PublishT0 - R->FinishedAtSeconds) * 1000.0);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Fine tile (%d,%d) resident via ASYNC: %llu px edge, %.1f MB read of a %.1f MB file in %llu ")
+			       TEXT("range(s) + %.1f MB decoded lattice; worker read %.0f ms + full decode %.0f ms OFF the game ")
+			       TEXT("thread (%.0f ms total, queued %.0f ms), publish %.2f ms on the game thread. Resident tiles ")
+			       TEXT("now %llu, %.2f GiB of %.2f GiB budget."),
+			       R->Tile.x, R->Tile.y, (unsigned long long)R->TileSizePx, double(R->ByteCount) / 1e6,
+			       double(R->FileSizeOnDisk) / 1e6, (unsigned long long)R->Requests,
+			       double(R->TileDecodedBytes) / 1e6, R->ReadMs, R->DecodeMs, R->WorkerMs, QueuedMs, PublishMs,
+			       (unsigned long long)Sampler_.tileCount(),
+			       double(Budget_.residentBytes()) / double(1ull << 30),
+			       double(Budget_.budgetBytes()) / double(1ull << 30));
+			break;
+		}
+		}
+		AsyncPublishNs_.fetch_add(uint64(FMath::Max(0.0, FPlatformTime::Seconds() - PublishT0) * 1.0e9),
+		                          std::memory_order_relaxed);
+	}
+}
+
+void FVoxelFineTileStreamer::PumpAsyncLoads()
+{
+	if (!bAsyncMode_)
+	{
+		return; // OFF: one branch, nothing else
+	}
+	check(IsInGameThread());
+	// The per-tick launch budget is per FRAME: this is called once a frame
+	// from TickStreaming, after the recompute that may have launched.
+	AsyncLaunchedThisTick_ = 0;
+	if (InFlight_.empty())
+	{
+		return; // nothing can be in the queue either: results come from in-flight tasks only
+	}
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::PublishExcl);
+	PumpAsyncLoads_Locked();
+}
+
+bool FVoxelFineTileStreamer::JoinInFlight_Locked(vxc::TileCoord Tile)
+{
+	auto It = InFlight_.find(TileHash(Tile));
+	if (It == InFlight_.end())
+	{
+		return Sampler_.findTile(Tile.x, Tile.y) != nullptr;
+	}
+	const double T0 = FPlatformTime::Seconds();
+	const double RunningMs = (T0 - It->second.LaunchedAtSeconds) * 1000.0;
+	// Deadlock-free: the task takes no lock, and this thread holds the only
+	// one. The result is enqueued BEFORE the task completes, so it is in the
+	// queue when Wait returns and the pump below adopts it.
+	It->second.Task.Wait();
+	const double WaitMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+	AsyncJoins_.fetch_add(1, std::memory_order_relaxed);
+	BlockingLoads_.fetch_add(1, std::memory_order_relaxed);
+	PumpAsyncLoads_Locked(); // erases the in-flight entry; `It` is dead from here
+	const bool bResident = Sampler_.findTile(Tile.x, Tile.y) != nullptr;
+	if (WaitMs > 50.0)
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Fine tile (%d,%d) JOINED on the game thread: waited %.0f ms for a worker load that had been ")
+		       TEXT("running %.0f ms (resident after=%d). A join is a blocking load the ring prefetch did not get ")
+		       TEXT("ahead of -- raise -VoxelFineTileRingRadius or the caps if these recur post-preflight."),
+		       Tile.x, Tile.y, WaitMs, RunningMs, bResident ? 1 : 0);
+	}
+	return bResident;
+}
+
+void FVoxelFineTileStreamer::ShutdownAsync()
+{
+	if (!bAsyncMode_ || !AsyncShared_)
+	{
+		return;
+	}
+	check(IsInGameThread());
+	// Stop first, so a worker finishing during the wait below drops its result
+	// instead of enqueueing into a queue nobody will pump again.
+	AsyncShared_->bAccepting.store(false, std::memory_order_release);
+
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_Write, VoxelFineLock::ESite::PublishExcl);
+	++AsyncGeneration_;
+
+	// The WaitForInFlightTasks discipline: a bounded wait, then REPORT. A load
+	// is one read plus one decode -- seconds off a cold HDD, never tens of
+	// them -- so anything past this is stuck, not slow.
+	constexpr double kDrainBudgetSec = 30.0;
+	const double WaitT0 = FPlatformTime::Seconds();
+	const double Deadline = WaitT0 + kDrainBudgetSec;
+	const int32 ToWaitFor = int32(InFlight_.size());
+	int32 TimedOut = 0;
+	for (auto& Pair : InFlight_)
+	{
+		const double Remaining = Deadline - FPlatformTime::Seconds();
+		if (Remaining <= 0.0 || !Pair.second.Task.Wait(FTimespan::FromSeconds(Remaining)))
+		{
+			++TimedOut;
+		}
+	}
+	InFlight_.clear();
+
+	int32 Discarded = 0;
+	TUniquePtr<FAsyncLoadResult> R;
+	while (AsyncShared_->Queue.Dequeue(R))
+	{
+		++Discarded;
+		R.Reset();
+	}
+	const double WaitMs = (FPlatformTime::Seconds() - WaitT0) * 1000.0;
+
+	if (TimedOut > 0)
+	{
+		UE_LOG(LogVoxelStream, Error,
+		       TEXT("Fine tier async loader: %d of %d in-flight tile load(s) did NOT complete within %.0fs at shutdown. ")
+		       TEXT("They hold no pointer into the streamer (values and a shared queue only), so this is not the ")
+		       TEXT("unsound-teardown case WaitForInFlightTasks reports, but it is a worker stuck in I/O and it is ")
+		       TEXT("reported for the same reason. Discarded %d queued result(s)."),
+		       TimedOut, ToWaitFor, kDrainBudgetSec, Discarded);
+		bAsyncShutdownLogged_ = true;
+	}
+	else if (!bAsyncShutdownLogged_ || ToWaitFor > 0 || Discarded > 0)
+	{
+		UE_LOG(LogVoxelStream, Log,
+		       TEXT("Fine tier async loader shut down: joined %d in-flight tile load(s) in %.0f ms, discarded %d ")
+		       TEXT("queued result(s). Lifetime: launched=%llu published=%llu joins=%llu failed=%llu dropped=%llu ")
+		       TEXT("capRefusals=%llu inFlightPeak=%d."),
+		       ToWaitFor, WaitMs, Discarded, (unsigned long long)AsyncLaunched_.load(std::memory_order_relaxed),
+		       (unsigned long long)AsyncPublished_.load(std::memory_order_relaxed),
+		       (unsigned long long)AsyncJoins_.load(std::memory_order_relaxed),
+		       (unsigned long long)AsyncFailed_.load(std::memory_order_relaxed),
+		       (unsigned long long)AsyncDropped_.load(std::memory_order_relaxed),
+		       (unsigned long long)AsyncCapRefusals_.load(std::memory_order_relaxed), AsyncInFlightPeak_);
+		bAsyncShutdownLogged_ = true;
+	}
+}
+
+bool FVoxelFineTileStreamer::IsRingSettled(int32& OutOutstanding, int32& OutRingTiles) const
+{
+	VoxelFineLock::FLockScope Lock(Lock_, SLT_ReadOnly, VoxelFineLock::ESite::DiagShared);
+	OutOutstanding = 0;
+	OutRingTiles = 0;
+	if (LastRingCentre_.x == INT32_MIN && LastRingCentre_.y == INT32_MIN)
+	{
+		return false; // the residency tick has never run: there is no ring to have settled
+	}
+	const std::vector<vxc::TileCoord> Ring = vxc::squareTileRing(LastRingCentre_, RingRadiusTiles_);
+	OutRingTiles = int32(Ring.size());
+	for (const vxc::TileCoord& T : Ring)
+	{
+		if (Sampler_.findTile(T.x, T.y) != nullptr)
+		{
+			continue; // resident
+		}
+		if (KnownMissing_.find(TileHash(T)) != KnownMissing_.end())
+		{
+			continue; // not baked: cannot hold the gate
+		}
+		if (IsSettledFailure_Locked(T))
+		{
+			continue; // refused for good: cannot hold the gate either
+		}
+		++OutOutstanding; // in flight, or not yet attempted
+	}
+	return InFlight_.empty() && OutOutstanding == 0;
 }
 
 // ---------------------------------------------------------------------------

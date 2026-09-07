@@ -65,6 +65,17 @@ struct VOXELEARTHUI_API FVoxelReadyProbeConfig
 	int32 RequiredGoodSamples = 3;
 	float PollIntervalSeconds = 0.4f;
 	float MaxWaitSeconds = 60.0f;
+
+	// GATE 3 (2026-09-07): "the fine tier's prefetch ring has settled". With
+	// the async tile loader (-VoxelFineTileAsync=1) the ring's tiles arrive on
+	// workers over the first seconds of the world, and gates 1 and 2 can both
+	// pass while a neighbour tile is still in flight -- the curtain would lift
+	// onto a world whose first step across a tile edge is a blocking load.
+	// Asks UVoxelWorldSubsystem::IsFineRingSettled, which is true when there
+	// is no fine tier at all and cannot be held by an unbaked neighbour (a
+	// known-absent tile counts as settled). -VoxelLoadGateFineRing=0 switches
+	// it off; MaxWaitSeconds still bounds it either way.
+	bool bRequireFineRing = true;
 };
 
 struct VOXELEARTHUI_API FVoxelReadyProbeStatus
@@ -73,6 +84,11 @@ struct VOXELEARTHUI_API FVoxelReadyProbeStatus
 	int32 ProbeTotal = 0;
 	int32 PendingInGate = 0;
 	int32 JobsInGate = 0;
+	// Gate 3's n/m: ring tiles settled (resident, absent or refused) over the
+	// ring's size. 0/0 until the residency tick has run once.
+	int32 FineRingSettled = 0;
+	int32 FineRingTotal = 0;
+	bool bFineRingOk = false;
 	int32 ConsecutiveGood = 0;
 	float ElapsedSeconds = 0.f;
 	// 0..1, how much of the gated rings is drawn. The progress bar's work term.

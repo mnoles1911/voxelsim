@@ -58,6 +58,33 @@ VoxelFineTileDir
 VoxelFineTileGateFatal
 VoxelFineTileProviderId
 VoxelFineTileRingRadius
+# --- 2026-09-07: the async fine-tile loader (VoxelFineTileStreamer) ---------
+# -VoxelFineTileAsync=0|1 picks the loader (0 = synchronous, byte-identical
+# default); the other two are its caps. All three are tuning/configuration
+# and none drives, poses or ends a run; they are meant for ordinary interactive
+# launches (tools/voxel-editor.ps1 will pass -VoxelFineTileAsync=1). THE
+# IN-FLIGHT CAP IS NAMED *AsyncCap, NOT *AsyncInFlight, ON PURPOSE: "Flight"
+# is in kSelfDrivingSubstrings, and the plan's original name would have
+# suppressed the main menu on every launch that tuned it -- the same trap
+# -VoxelGpuMeshInFlight records below. Renamed rather than excepted.
+VoxelFineTileAsync
+VoxelFineTileAsyncCap
+VoxelFineTileAsyncPerTick
+# -VoxelLoadGateFineRing=0|1: the loading screen's third gate ("the fine ring
+# has settled"), FVoxelReadyProbeConfig::bRequireFineRing. Configuration for
+# the ready probe, like VoxelLoadGateMaxRing; 0 is the A/B control arm.
+VoxelLoadGateFineRing
+# --- 2026-09-07: the water wake injection's parameters (VoxelRippleField.cpp)
+# Left unclassified by the water session; recorded by the loader session so
+# the lint is green again. Radius, strength, step count, heading and a freeze
+# toggle for the wake that -VoxelRippleWakeAfter (acknowledged below, under
+# SUBSTRING-MATCHED) injects. Configuration for a capture some OTHER switch
+# drives; passing any of them alone injects nothing and quits nothing.
+VoxelRippleWakeFreeze
+VoxelRippleWakeRadiusM
+VoxelRippleWakeSteps
+VoxelRippleWakeStrengthM
+VoxelRippleWakeYaw
 VoxelFlySpeedStep
 VoxelForceUnderwaterSpawn
 VoxelGIBreach
@@ -213,6 +240,18 @@ VoxelNoMenu
 VoxelMenuPanel
 VoxelMenuAutoStart
 VoxelMenuWatchdog
+# menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): the A/B switch
+# for whether the menu's per-frame ticker gates are active. Configuration, not
+# a driver -- it changes what a run DOES while parked at the menu, never
+# whether the menu appears or the run exits on its own.
+VoxelMenuTickGates
+# menu scalability drop 2026-09-07 (plan Phase 2 step 3): 0 = off (the A/B
+# control arm), 1 = default (drop the render cost while the menu and the
+# loading curtain own the screen, restore at the reveal), 2 = dry run (log the
+# cvar list it would set and set nothing). Configuration, not a driver -- it
+# changes how expensively the menu RENDERS, never whether the menu appears or
+# whether the run ends on its own. See VoxelMenuScalability.h.
+VoxelMenuScalability
 VoxelUINoAssets
 VoxelLoadGateMaxRing
 VoxelLoadMinHold
@@ -539,3 +578,10 @@ VoxelDumpIndexKeys = ACCIDENTAL ('Dump'): passive resident index-key logging ins
 VoxelSkyMarkVerify = ACCIDENTAL ('Verify'): runtime sky-band correctness sampling during normal streaming; does not drive or end a run.
 VoxelSkyMarkVerifyGrid = ACCIDENTAL ('Verify'): sample-grid size for the passive sky-band correctness check.
 VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive sky-band correctness check.
+# --- 2026-09-07: the water wake injection (VoxelRippleField.cpp) ------------
+# Left unclassified by the water session; recorded here by the loader session
+# so the lint is green again. -VoxelRippleWakeAfter=<s> injects a wake into
+# the ripple field at an offset inside a capture run (the plan's wake legs pair
+# it with -VoxelScreenshotAfter); the five parameters below only shape that
+# injection and are inert without it.
+VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a wake at an offset; the run is ended by the capture switch it is paired with. Matches 'After' by intent, not by accident.

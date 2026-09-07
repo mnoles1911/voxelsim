@@ -1388,6 +1388,16 @@ bool FVoxelRasterAtlasCpu::IsPageAsyncSafe(int64 PageX, int64 PageY) const
 			return false;
 		}
 	}
+	// THE ASYNC-LOADER AMENDMENT (see the callback's comment in the header):
+	// inside the ring is no longer the same as resident when ring tiles load on
+	// workers, so ask. Unset on the synchronous arm, where the ring test above
+	// was and remains the whole answer. Refused pages fill synchronously on the
+	// game thread, whose funnel joins or loads the tile -- correctness costs
+	// nothing here, only the page's place in the async batch.
+	if (PixelRectResident && !PixelRectResident(X0, Y0, X1, Y1))
+	{
+		return false;
+	}
 	return true;
 }
 

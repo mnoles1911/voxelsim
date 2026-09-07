@@ -671,6 +671,14 @@ public:
 	// share this one implementation.
 	bool IsChunkPresentableAt(const FVector& WorldPos) const;
 
+	// Loading gate 3 (FVoxelWorldReadyProbe): has the fine tier's prefetch
+	// ring settled -- every ring tile resident, known absent, or refused for
+	// good, and nothing in flight on the async loader? TRUE when there is no
+	// fine streamer at all (a coarse-only or synthetic world has no ring to
+	// wait for). OutSettledTiles / OutRingTiles are the n/m the probe prints.
+	// Game thread; see FVoxelFineTileStreamer::IsRingSettled.
+	bool IsFineRingSettled(int32& OutSettledTiles, int32& OutRingTiles) const;
+
 	// docs/debug-tooling-plan.md P1 "Perf HUD": a snapshot refreshed at 1Hz
 	// (per-frame collection, see FVoxelWorldImpl::UpdatePerfSnapshot), read by
 	// AVoxelEarthHUD every frame when voxel.Debug >= 1. Cheap struct copy;

@@ -213,6 +213,11 @@ FVoxelFrontEndSwitches Parse()
 	S.bReadyProbeLog = FParse::Param(Cmd, TEXT("VoxelReadyProbeLog"));
 
 	FParse::Value(Cmd, TEXT("VoxelLoadGateMaxRing="), S.LoadGateMaxRing);
+	{
+		int32 FineRingGate = 1;
+		FParse::Value(Cmd, TEXT("VoxelLoadGateFineRing="), FineRingGate);
+		S.bLoadGateFineRing = (FineRingGate != 0);
+	}
 	FParse::Value(Cmd, TEXT("VoxelLoadMinHold="), S.LoadMinHoldSeconds);
 	FParse::Value(Cmd, TEXT("VoxelLoadMaxHold="), S.LoadMaxHoldSeconds);
 	FParse::Value(Cmd, TEXT("VoxelMenuWatchdog="), S.MenuWatchdogSeconds);

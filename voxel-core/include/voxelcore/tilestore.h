@@ -1404,6 +1404,19 @@ private:
 // region of interest from one thread first; once every touched block is
 // resident, queries are pure reads and the class has TileGridSampler's
 // contract again.
+//
+// Why FineTileSampler::adoptWarmTile answered the way it did. Every value but
+// kOk means NEITHER sampler changed. Ordered the way adoptWarmTile checks, so
+// the first failing condition is the one named.
+enum class FineAdoptResult : uint8_t {
+    kOk,
+    kSeedMismatch,     // `other` was built for a different seed than this sampler
+    kNotInSource,      // `other` holds no tile at (tx, ty)
+    kAlreadyResident,  // this sampler already holds (tx, ty); nothing is moved
+    kStrideMismatch,   // the tile's `size` differs from this sampler's grid stride
+    kNotFullyDecoded,  // `other` never finished decoding it -- see tileFullyDecoded
+};
+
 class FineTileSampler final : public ITileSampler {
 public:
     // `climateSource` is optional and borrowed: the fine tier carries
@@ -1459,6 +1472,37 @@ public:
     // tile, tileSize() resets to 0 (matching the pre-any-load state) rather
     // than pinning the grid to a stride nothing justifies any more.
     bool unloadTile(int32_t tx, int32_t ty);
+
+    // --- moving a tile that was warmed SOMEWHERE ELSE into this sampler ------
+    //
+    // The shape a background loader needs. The threading contract above says
+    // "prewarm from one thread, then share", and a host that decodes on a
+    // worker cannot prewarm into the SHARED sampler without holding its write
+    // lock for the whole decode -- which is the stall the worker exists to
+    // remove. So the worker builds a PRIVATE FineTileSampler, loads and
+    // prewarms into that, and the owner of the shared one adopts the finished
+    // tile here: one hash-node move, O(1), under whatever lock the host uses
+    // for its other mutations. Nothing is decoded, copied or fetched by the
+    // adoption itself.
+    //
+    // tileFullyDecoded is the GATE, and it is pure: true iff (tx, ty) is loaded
+    // here and its elevation block cache holds every block of the tile. A whole-
+    // tile prewarm that returned true leaves it true; a prewarm that hit an
+    // unfetched or corrupt block leaves it false. It answers about the
+    // ELEVATION plane only -- the placement cache is lazy by design and is not
+    // part of "warm".
+    bool tileFullyDecoded(int32_t tx, int32_t ty) const;
+
+    // Moves tile (tx, ty) -- its bytes AND its decoded block cache -- out of
+    // `other` and into this sampler. Refuses, with NO change to either sampler,
+    // when the seeds differ, `other` does not hold the tile, this sampler
+    // already does, the tile's `size` does not match this grid's stride, or
+    // -- the one that matters -- `other` never fully decoded it: adopting a
+    // half-warm tile would reintroduce exactly the lazy decode on the shared
+    // read path that whole-tile warming exists to rule out. On kOk this
+    // sampler's stride is set as loadTile would set it, and `other`'s resets
+    // to 0 if the tile was its last, matching unloadTile.
+    FineAdoptResult adoptWarmTile(FineTileSampler& other, int32_t tx, int32_t ty);
 
     // Raw lattice access in fine tile-pixel coords. False (and a counter bump)
     // when the tile isn't loaded or its block fails to decode.

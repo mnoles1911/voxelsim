@@ -29,6 +29,8 @@
 #include "voxelcore/amplifier.h"
 #include "voxelcore/bytes.h"
 #include "voxelcore/core.h"
+#include "voxelcore/tilerange.h"     // BytesRangeSource + the ranged fetch -- the adopt tests' production sequence
+#include "voxelcore/tilestreaming.h" // validateAndParseFineTilePartial -- same
 #include "vxctest.h"
 
 using namespace vxc;
@@ -1378,6 +1380,294 @@ VXC_TEST(finetilesampler_exposes_the_control_lattice) {
     CHECK_EQ(warm.residentBlockCount(), size_t(2)); // no new decode
     CHECK(!warm.prewarm(int64_t(kFineTileSize), 0, int64_t(kFineTileSize), 0)); // missing tile
     CHECK(!warm.prewarm(10, 10, 0, 0)); // inverted rect
+}
+
+// --- adoptWarmTile: the background loader's hand-off ------------------------
+//
+// The UE streamer's async arm decodes a tile into a PRIVATE FineTileSampler on
+// a worker and moves the finished tile into the shared sampler on the game
+// thread (FVoxelFineTileStreamer::PumpAsyncLoads_Locked). The property every
+// one of these tests protects is the shared sampler's read-side contract: after
+// adoption, no query may ever decode, because a decode is a write under a
+// shared lock.
+
+namespace {
+// Whole-tile prewarm over the (0,0) production-size tile, the exact call the
+// streamer makes at load.
+bool prewarmWholeTile(FineTileSampler& s) {
+    return s.prewarm(0, 0, int64_t(kFineTileSize) - 1, int64_t(kFineTileSize) - 1);
+}
+} // namespace
+
+VXC_TEST(finetilesampler_adopts_a_warm_tile_without_decoding_again) {
+    V2Params p;
+    p.seed = 4242;
+    p.baseOffsetMm = 50'000;
+    const std::vector<uint8_t> bytes = buildFineTile(p, makeMixedElevPlans());
+
+    FineTileSampler worker(4242);
+    CHECK(worker.loadTile(bytes));
+    CHECK(!worker.tileFullyDecoded(0, 0)); // §4: nothing decoded until asked
+    CHECK(prewarmWholeTile(worker));
+    CHECK(worker.tileFullyDecoded(0, 0));
+    CHECK_EQ(worker.residentBlockCount(), size_t(kTestBlocks));
+    const uint64_t warmBytes = worker.decodedBlockBytes();
+
+    FineTileSampler host(4242);
+    CHECK(!host.tileFullyDecoded(0, 0)); // not loaded here: false, no counter
+    CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kOk));
+
+    // Moved, not copied: the worker is empty and back to its pre-load stride.
+    CHECK_EQ(worker.tileCount(), size_t(0));
+    CHECK_EQ(worker.tileSize(), uint32_t(0));
+    CHECK_EQ(worker.residentBlockCount(), size_t(0));
+    CHECK(worker.findTile(0, 0) == nullptr);
+    // ...and the host has the whole warm tile, stride set as loadTile sets it.
+    CHECK_EQ(host.tileCount(), size_t(1));
+    CHECK_EQ(host.tileSize(), uint32_t(kFineTileSize));
+    CHECK(host.findTile(0, 0) != nullptr);
+    CHECK(host.tileFullyDecoded(0, 0));
+    CHECK_EQ(host.residentBlockCount(), size_t(kTestBlocks));
+    CHECK_EQ(host.decodedBlockBytes(), warmBytes);
+
+    // THE CONTRACT: queries after adoption are pure reads. The block count is
+    // the witness -- a lazy decode would raise it.
+    auto expectMm = [&](uint32_t bx, uint32_t by, uint32_t lx, uint32_t ly) {
+        return 50'000 + int32_t(expectedCp(bx, by, lx, ly)) * 100;
+    };
+    CHECK_EQ(host.elevationMm(0, 0), expectMm(0, 0, 0, 0));
+    CHECK_EQ(host.elevationMm(int64_t(kTestDim) + 5, 9), expectMm(1, 0, 5, 9));
+    CHECK_EQ(host.elevationMm(int64_t(2 * kTestDim) + 4, 6), expectMm(2, 0, 4, 6));
+    CHECK_EQ(host.elevationMm(int64_t(3 * kTestDim) + 200, 201), expectMm(3, 0, 200, 201));
+    CHECK_EQ(host.elevationMm(int64_t(kFineTileSize) - 1, int64_t(kFineTileSize) - 1),
+             expectMm(kTestPerAxis - 1, kTestPerAxis - 1, kTestDim - 1, kTestDim - 1));
+    CHECK_EQ(host.residentBlockCount(), size_t(kTestBlocks)); // unchanged
+    CHECK_EQ(host.missingTileQueries.load(), uint64_t(0));
+    CHECK_EQ(host.notResidentBlockQueries.load(), uint64_t(0));
+    CHECK_EQ(host.blockDecodeFailures.load(), uint64_t(0));
+    // The worker now answers "missing" for the tile it gave away, which is the
+    // documented empty-sampler behaviour, not a leak of the moved tile.
+    CHECK_EQ(worker.elevationMm(0, 0), 0);
+    CHECK_EQ(worker.missingTileQueries.load(), uint64_t(1));
+}
+
+VXC_TEST(finetilesampler_adopt_refuses_a_tile_that_is_not_fully_decoded) {
+    // THE MUST-FAIL ARM. Delete the kNotFullyDecoded return in adoptWarmTile
+    // and this test goes red on its first CHECK below: a never-prewarmed tile
+    // would be adopted, and the shared sampler would decode on its read path.
+    V2Params p;
+    p.seed = 4242;
+    const std::vector<uint8_t> bytes = buildFineTile(p, makeMixedElevPlans());
+
+    FineTileSampler worker(4242);
+    CHECK(worker.loadTile(bytes));
+    FineTileSampler host(4242);
+
+    // Never prewarmed: refused, and neither sampler changed.
+    CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kNotFullyDecoded));
+    CHECK_EQ(host.tileCount(), size_t(0));
+    CHECK_EQ(host.tileSize(), uint32_t(0));
+    CHECK_EQ(worker.tileCount(), size_t(1));
+    CHECK_EQ(worker.tileSize(), uint32_t(kFineTileSize));
+
+    // One block warm out of 1,024: still refused. "Some" is not "all".
+    CHECK(worker.prewarm(0, 0, int64_t(kTestDim) - 1, int64_t(kTestDim) - 1));
+    CHECK_EQ(worker.residentBlockCount(), size_t(1));
+    CHECK(!worker.tileFullyDecoded(0, 0));
+    CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kNotFullyDecoded));
+    CHECK_EQ(host.tileCount(), size_t(0));
+    CHECK_EQ(worker.tileCount(), size_t(1));
+    CHECK_EQ(worker.residentBlockCount(), size_t(1)); // the refusal decoded nothing either
+
+    // All 1,024 warm: accepted.
+    CHECK(prewarmWholeTile(worker));
+    CHECK(worker.tileFullyDecoded(0, 0));
+    CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kOk));
+    CHECK_EQ(host.tileCount(), size_t(1));
+    CHECK_EQ(worker.tileCount(), size_t(0));
+}
+
+VXC_TEST(finetilesampler_adopt_refuses_seed_duplicate_missing_and_stride) {
+    V2Params p;
+    p.seed = 4242;
+    const std::vector<uint8_t> bytes = buildFineTile(p, makeMixedElevPlans());
+
+    FineTileSampler worker(4242);
+    CHECK(worker.loadTile(bytes));
+    CHECK(prewarmWholeTile(worker));
+
+    // Seed: a host built for another world refuses, as loadTile does.
+    FineTileSampler wrongSeed(1);
+    CHECK_EQ(int(wrongSeed.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kSeedMismatch));
+    CHECK_EQ(wrongSeed.tileCount(), size_t(0));
+    CHECK_EQ(worker.tileCount(), size_t(1));
+
+    FineTileSampler host(4242);
+    // Missing: the worker holds (0,0), not (1,0).
+    CHECK_EQ(int(host.adoptWarmTile(worker, 1, 0)), int(FineAdoptResult::kNotInSource));
+    CHECK_EQ(host.tileCount(), size_t(0));
+    CHECK_EQ(worker.tileCount(), size_t(1));
+
+    // Duplicate: the host already holds (0,0). Nothing moves -- the worker's
+    // copy stays where it is (the streamer drops it, never double-charging).
+    CHECK(host.loadTile(bytes));
+    CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kAlreadyResident));
+    CHECK_EQ(host.tileCount(), size_t(1));
+    CHECK_EQ(host.residentBlockCount(), size_t(0)); // the host's own copy, still cold
+    CHECK_EQ(worker.tileCount(), size_t(1));
+    CHECK_EQ(worker.residentBlockCount(), size_t(kTestBlocks));
+    // Self-adoption is the same answer: it is already here.
+    CHECK_EQ(int(host.adoptWarmTile(host, 0, 0)), int(FineAdoptResult::kAlreadyResident));
+    CHECK_EQ(host.tileCount(), size_t(1));
+
+    // Stride: a host whose grid is a 512-edge tile refuses an 8192-edge one,
+    // for the reason loadTile does -- two strides make addressing ambiguous.
+    V2Params small;
+    small.seed = 4242;
+    small.x = 5;
+    small.y = 5;
+    small.size = 512;
+    std::vector<PlanePlan<int16_t>> smallPlans(4); // 2x2 blocks of 256
+    for (PlanePlan<int16_t>& plan : smallPlans) {
+        plan.mode = 0;
+        plan.constCp = 7;
+    }
+    FineTileSampler smallHost(4242);
+    CHECK(smallHost.loadTile(buildFineTile(small, smallPlans)));
+    CHECK_EQ(smallHost.tileSize(), uint32_t(512));
+    CHECK_EQ(int(smallHost.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kStrideMismatch));
+    CHECK_EQ(smallHost.tileCount(), size_t(1));
+    CHECK_EQ(smallHost.tileSize(), uint32_t(512));
+    CHECK_EQ(worker.tileCount(), size_t(1));
+    CHECK_EQ(worker.tileSize(), uint32_t(kFineTileSize));
+}
+
+VXC_TEST(finetilesampler_adopted_tile_is_byte_identical_to_load_and_prewarm) {
+    V2Params p;
+    p.seed = 4242;
+    p.baseOffsetMm = 50'000;
+    const std::vector<uint8_t> bytes = buildFineTile(p, makeMixedElevPlans());
+
+    // The reference: what the synchronous streamer path produces today.
+    FineTileSampler reference(4242);
+    CHECK(reference.loadTile(bytes));
+    CHECK(prewarmWholeTile(reference));
+
+    // The arm: warmed elsewhere, adopted here.
+    FineTileSampler worker(4242);
+    CHECK(worker.loadTile(bytes));
+    CHECK(prewarmWholeTile(worker));
+    FineTileSampler host(4242);
+    CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kOk));
+
+    CHECK_EQ(host.decodedBlockBytes(), reference.decodedBlockBytes());
+    CHECK_EQ(host.residentFileBytes(), reference.residentFileBytes());
+
+    // A per-block lattice: five positions in every one of the 1,024 blocks --
+    // the four corners and an interior point -- through controlPointAt, which
+    // reads the decoded cache. Counted mismatches rather than 5,120 CHECKs so
+    // a failure prints one number.
+    uint64_t mismatches = 0;
+    uint64_t compared = 0;
+    const uint32_t offsets[5][2] = {{0, 0}, {kTestDim - 1, 0}, {0, kTestDim - 1},
+                                    {kTestDim - 1, kTestDim - 1}, {37, 141}};
+    for (uint32_t by = 0; by < kTestPerAxis; ++by) {
+        for (uint32_t bx = 0; bx < kTestPerAxis; ++bx) {
+            for (const auto& off : offsets) {
+                const int64_t px = int64_t(bx) * kTestDim + off[0];
+                const int64_t py = int64_t(by) * kTestDim + off[1];
+                int16_t a = 0, b = 0;
+                const bool okA = reference.controlPointAt(px, py, a);
+                const bool okB = host.controlPointAt(px, py, b);
+                ++compared;
+                if (!okA || !okB || a != b || a != expectedCp(bx, by, off[0], off[1])) ++mismatches;
+            }
+        }
+    }
+    CHECK_EQ(compared, uint64_t(5) * kTestBlocks);
+    CHECK_EQ(mismatches, uint64_t(0));
+    // And still nothing decoded on either side: both were already complete.
+    CHECK_EQ(host.residentBlockCount(), size_t(kTestBlocks));
+    CHECK_EQ(reference.residentBlockCount(), size_t(kTestBlocks));
+    CHECK_EQ(host.blockDecodeFailures.load(), uint64_t(0));
+    CHECK_EQ(host.notResidentBlockQueries.load(), uint64_t(0));
+}
+
+VXC_TEST(finetilesampler_adopt_refuses_the_production_sequence_with_a_block_unfetched) {
+    // The streamer's worker does exactly this: range-read the preamble,
+    // validate, fetch the elevation payload, load, prewarm. If ONE elevation
+    // block's bytes never arrive, prewarm fails on it, the tile is not fully
+    // decoded, and adoption must refuse -- otherwise a worker query into that
+    // block would find no bytes and answer sea level.
+    V2Params p;
+    p.seed = 4242;
+    const std::vector<uint8_t> bytes = buildFineTile(p, makeMixedElevPlans());
+
+    FinePreambleRequest want;
+    want.wantFlow = false;
+    want.wantWater = false;
+    want.wantBasins = false;
+    want.wantHeads = false;
+    want.wantBathy = false;
+
+    // Arm 1: one non-CONSTANT block deliberately left unfetched.
+    {
+        BytesRangeSource src(bytes);
+        FineTileBytes held;
+        FineError err = FineError::kNone;
+        CHECK(readFineTilePreamble(src, src.fileSize(), want, held, &err));
+        FineTileValidationResult r = validateAndParseFineTilePartial(std::move(held), 4242, 0, 0);
+        CHECK(r.verdict == FineTileVerdict::kOk);
+        if (r.verdict != FineTileVerdict::kOk) return;
+
+        std::vector<uint32_t> ids = fineNonConstantBlocks(*r.tile, FinePlane::kElevation);
+        CHECK_EQ(ids.size(), size_t(3)); // blocks (1,0), (2,0), (3,0) of the mixed tile
+        if (ids.empty()) return;
+        const uint32_t skipped = ids.back();
+        ids.pop_back();
+        CHECK(fetchFineTileBlocks(src, *r.tile, FinePlane::kElevation, ids));
+        CHECK(!r.tile->elevBlockResident(skipped % kTestPerAxis, skipped / kTestPerAxis));
+
+        FineTileSampler worker(4242);
+        CHECK(worker.loadTile(std::move(*r.tile)));
+        CHECK(!prewarmWholeTile(worker)); // the unfetched block fails the warm
+        CHECK_EQ(worker.notResidentBlockQueries.load(), uint64_t(1));
+        CHECK_EQ(worker.blockDecodeFailures.load(), uint64_t(0)); // not corrupt: absent
+        CHECK_EQ(worker.residentBlockCount(), size_t(kTestBlocks - 1));
+        CHECK(!worker.tileFullyDecoded(0, 0));
+
+        FineTileSampler host(4242);
+        CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kNotFullyDecoded));
+        CHECK_EQ(host.tileCount(), size_t(0));
+        CHECK_EQ(worker.tileCount(), size_t(1));
+    }
+
+    // Arm 2: the same sequence with every block fetched is adoptable, and its
+    // lattice matches a whole-file load -- so the refusal above was about the
+    // missing block and nothing else in the ranged path.
+    {
+        BytesRangeSource src(bytes);
+        FineTileBytes held;
+        CHECK(readFineTilePreamble(src, src.fileSize(), want, held, nullptr));
+        FineTileValidationResult r = validateAndParseFineTilePartial(std::move(held), 4242, 0, 0);
+        CHECK(r.verdict == FineTileVerdict::kOk);
+        if (r.verdict != FineTileVerdict::kOk) return;
+        CHECK(fetchFineTileBlocks(src, *r.tile, FinePlane::kElevation,
+                                  fineNonConstantBlocks(*r.tile, FinePlane::kElevation)));
+
+        FineTileSampler worker(4242);
+        CHECK(worker.loadTile(std::move(*r.tile)));
+        CHECK(prewarmWholeTile(worker));
+        CHECK(worker.tileFullyDecoded(0, 0));
+
+        FineTileSampler host(4242);
+        CHECK_EQ(int(host.adoptWarmTile(worker, 0, 0)), int(FineAdoptResult::kOk));
+        CHECK_EQ(host.residentBlockCount(), size_t(kTestBlocks));
+        int16_t cp = 0;
+        CHECK(host.controlPointAt(int64_t(3 * kTestDim) + 200, 201, cp));
+        CHECK_EQ(cp, rawCp(200, 201));
+        CHECK_EQ(host.residentBlockCount(), size_t(kTestBlocks)); // still a pure read
+    }
 }
 
 VXC_TEST(amplifier_over_fine_control_lattice_is_deterministic) {

@@ -114,14 +114,38 @@
 // still decode, the read lock would have to become exclusive and the worker
 // pool would serialise on terrain sampling.
 //
-// SYNCHRONOUS LOADING, NOT ASYNC -- BY SCOPE, NOT OVERSIGHT. Today's only
-// transport is a local directory mirroring terrain-service's cache layout
-// (cache.py), read on the calling thread, exactly like MakeTileSampler's
-// existing -VoxelTileDir path. A single fine tile is ~22-28 MB compressed and
-// decodes to ~128 MB, so a cold ring shift that has to load several at once
-// WILL block whatever thread calls TickResidencyAndEviction for the duration
-// of those reads and decodes. Moving this to a background loader is future
-// work -- see the .cpp's top comment for what that would need.
+// --- LOADING: SYNCHRONOUS BY DEFAULT, ASYNCHRONOUS BEHIND ONE SWITCH --------
+//
+// The transport is a local directory mirroring terrain-service's cache layout
+// (cache.py). A single fine tile is ~22-28 MB compressed on disk (200-340 MB
+// for the CODEC_RAW bakes shipped today) and decodes to ~134 MB, so a load is
+// a read of that size plus a full-tile decode -- 260-280 ms warm-cache, ~2 s
+// per tile off a cold HDD -- and every load used to happen on the game thread.
+//
+//   -VoxelFineTileAsync=0 (DEFAULT). Every load is synchronous on the calling
+//   thread, exactly as before: EnsureTileResident_Locked reads, validates,
+//   fetches and prewarms under Lock_ exclusive. Byte-identical to the build
+//   before the async arm existed -- every async member is inert and no task is
+//   ever launched.
+//
+//   -VoxelFineTileAsync=1. A load becomes a WORKER task: it reads and decodes
+//   into a PRIVATE vxc::FineTileSampler (ReadAndFetchTile + loadTile + a
+//   whole-tile prewarm, touching no streamer state at all), and the GAME
+//   THREAD adopts the finished tile under Lock_ exclusive in one O(1) move
+//   (vxc::FineTileSampler::adoptWarmTile, PumpAsyncLoads_Locked). Rule 1 is
+//   therefore kept EXACTLY: a tile is fully decoded before it is published,
+//   the decode has merely moved off this thread. Rule 2 is kept too: the only
+//   mutation of Sampler_ is the adoption, on the game thread, under the write
+//   lock. The public API does not change shape -- RequestFootprint returns
+//   false while a covered tile is in flight, which its callers already treat
+//   as "defer and re-ask" (DeferredFootprints), and the funnel's game-thread
+//   cold path JOINS an in-flight load rather than starting a second one.
+//   Caps: -VoxelFineTileAsyncCap= tasks in flight (2, clamp 1..4; NOT named
+//   *InFlight because "Flight" is a self-driving substring that would suppress
+//   the main menu, see VoxelFrontEndPolicy.cpp), -VoxelFineTileAsyncPerTick=
+//   launches per tick (2, clamp 1..9). Every counter the arm keeps is printed
+//   on the `Fine tier (window)` line; asyncLaunched=0 on a leg that passed the
+//   switch is the arm NOT engaged, never a quiet success.
 //
 // --- THE READ IS RANGED, THE DECODE IS NOT (task #52) -------------------
 //
@@ -149,15 +173,21 @@
 // making in the same change as the read.
 
 #include "CoreMinimal.h" // FString/uint64/int64 -- see VoxelCoords.h for the same self-containment reasoning
+#include "Containers/Queue.h"          // the MPSC results queue of the async arm
 #include "Misc/ScopeRWLock.h"
+#include "Tasks/Task.h"                // UE::Tasks::TTask -- the async arm's in-flight handles
+#include "Templates/SharedPointer.h"   // TSharedPtr<FAsyncShared> the worker tasks hold
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "voxelcore/tilerange.h"     // vxc::RangeSource -- ReadAndFetchTile's transport parameter
 #include "voxelcore/tilestore.h"
 #include "voxelcore/tilestreaming.h"
 
@@ -225,6 +255,11 @@ public:
 	// conversion itself).
 	FVoxelFineTileStreamer(FString RootDir, FString ProviderId, uint64 Seed, uint64 BudgetBytes,
 	                       vxc::ITileSampler* ClimateSource);
+	// Joins every in-flight async load (ShutdownAsync) before the members the
+	// workers were filling are destroyed. A no-op when the async arm is off.
+	~FVoxelFineTileStreamer();
+	FVoxelFineTileStreamer(const FVoxelFineTileStreamer&) = delete;
+	FVoxelFineTileStreamer& operator=(const FVoxelFineTileStreamer&) = delete;
 
 	// The sampler the world/amplifier generates terrain through. Safe to call
 	// from meshing worker threads; see the threading note above.
@@ -363,6 +398,67 @@ public:
 	// ringMoves=0 is the frozen-ring bug, out loud.
 	vxc::TileCoord RingCentreTile() const;
 	uint64 RingCentreMovesSinceStart() const;
+
+	// --- HAS THE PREFETCH RING SETTLED? (loading gate 3) ----------------------
+	//
+	// True when the residency tick has run at least once, nothing is in flight
+	// on the async arm, and every tile of the current ring is resident OR known
+	// absent on disk OR a settled refusal -- so an unbaked neighbour cannot hold
+	// the loading screen forever, only a tile that is still arriving can.
+	// OutOutstanding is how many ring tiles are none of those three;
+	// OutRingTiles is the ring's size, so a log line can print n/m. GAME THREAD
+	// (takes Lock_ shared; InFlight_ is game-thread state). With the async arm
+	// off this is true as soon as the first tick has run, because that tick
+	// loaded the ring synchronously.
+	bool IsRingSettled(int32& OutOutstanding, int32& OutRingTiles) const;
+
+	// --- THE ASYNC ARM'S SURFACE (-VoxelFineTileAsync=1) ----------------------
+	bool AsyncEnabled() const { return bAsyncMode_; }
+	int32 AsyncInFlightCap() const { return AsyncInFlightCap_; }
+	int32 AsyncPerTickCap() const { return AsyncPerTickCap_; }
+	// The per-FRAME pump. TickResidencyAndEviction only runs on anchor movement
+	// and RequestFootprint only when something asks, so a tile that landed
+	// while the player stood still would otherwise sit in the queue until the
+	// next move. Called from FVoxelWorldImpl::TickStreaming every frame; costs
+	// one branch and one empty-map test when nothing is in flight, and takes
+	// Lock_ exclusively (ESite::PublishExcl) only when something is. Also the
+	// per-tick launch counter's reset point. GAME THREAD ONLY. Inert at mode 0.
+	void PumpAsyncLoads();
+	// Teardown: stop accepting results, join every in-flight task under a
+	// bounded deadline (the WaitForInFlightTasks discipline), drain and discard
+	// whatever landed. Idempotent; called from FVoxelWorldImpl::
+	// WaitForInFlightTasks and again from the destructor.
+	void ShutdownAsync();
+	// Counters, all cumulative since start and printed on the window line. THE
+	// ENGAGEMENT READING: a leg with -VoxelFineTileAsync=1 that crossed a tile
+	// boundary and shows asyncLaunched=0 did not run the arm, whatever else it
+	// says. asyncPublished should equal asyncLaunched - asyncFailed - asyncDropped
+	// once inFlight returns to 0.
+	uint64 AsyncLaunchedSinceStart() const { return AsyncLaunched_.load(std::memory_order_relaxed); }
+	uint64 AsyncPublishedSinceStart() const { return AsyncPublished_.load(std::memory_order_relaxed); }
+	// The funnel's game-thread cold path found the tile IN FLIGHT and waited
+	// for the worker instead of loading a second copy. Each one is also a
+	// blocking load; a steady state with the ring prefetch ahead of the player
+	// reads asyncJoins=0.
+	uint64 AsyncJoinsSinceStart() const { return AsyncJoins_.load(std::memory_order_relaxed); }
+	// Results that were published as a FAILURE (absent, refused, undecodable),
+	// routed through the same memo/log path the synchronous load uses.
+	uint64 AsyncFailedSinceStart() const { return AsyncFailed_.load(std::memory_order_relaxed); }
+	// Results discarded unpublished: stale generation (teardown) or the tile
+	// had become resident by other means while the worker ran.
+	uint64 AsyncDroppedSinceStart() const { return AsyncDropped_.load(std::memory_order_relaxed); }
+	// Launch attempts refused by the in-flight or per-tick cap. Large values
+	// mean the caps, not the disk, are pacing the ring.
+	uint64 AsyncCapRefusalsSinceStart() const { return AsyncCapRefusals_.load(std::memory_order_relaxed); }
+	// Game-thread time spent adopting results (the publish), and worker
+	// wall time spent reading+decoding OFF the game thread. The second is the
+	// cost the arm moved; the first is what it costs to move it.
+	uint64 AsyncPublishNsSinceStart() const { return AsyncPublishNs_.load(std::memory_order_relaxed); }
+	uint64 AsyncWorkerNsSinceStart() const { return AsyncWorkerNs_.load(std::memory_order_relaxed); }
+	// Tasks in flight right now, and the most ever. GAME THREAD (no lock:
+	// InFlight_ is game-thread state, see its comment).
+	int32 AsyncInFlightCount() const { return int32(InFlight_.size()); }
+	int32 AsyncInFlightPeak() const { return AsyncInFlightPeak_; }
 
 	// WHAT A GATE LEAK DOES. A leak means a query could not be answered from a
 	// resident tile and could not be made resident either -- i.e. this run is
@@ -518,6 +614,102 @@ private:
 	// resident. Returns true if it is resident after the call (already was, or
 	// the load succeeded this call). Caller must already hold Lock_ exclusively.
 	bool EnsureTileResident_Locked(vxc::TileCoord Tile);
+
+	// --- THE PURE READ, shared by the synchronous and the async path ---------
+	//
+	// Everything EnsureTileResident_Locked does between "the file is open and
+	// its bytes were not already refused" and "hand the parsed tile to the
+	// sampler": preamble, validation, identity check, elevation/water/bathy
+	// payload fetch. It touches NO streamer state -- no counters, no memos, no
+	// lock -- so a worker may run it on a private vxc::RangeSource. The
+	// synchronous caller applies the counter and the failure memo itself, in
+	// exactly the order it always did; the async caller carries the outcome to
+	// the game thread and applies them there (PumpAsyncLoads_Locked).
+	struct FTileReadOutcome
+	{
+		enum class EKind : uint8
+		{
+			kMissingFile, // the source was not open (worker-side open failed)
+			kFailed,      // read and refused; ReasonTag/Why/bTransient say why
+			kParsed       // Tile holds the validated, payload-complete tile
+		};
+		// Which streamer counter a kFailed outcome charges, so the async publish
+		// increments the same one the synchronous path would have.
+		enum class ECounter : uint8 { kCorrupt, kIdentity };
+		EKind Kind = EKind::kFailed;
+		ECounter Counter = ECounter::kCorrupt;
+		std::optional<vxc::FineTile> Tile;
+		const TCHAR* ReasonTag = TEXT("");
+		FString Why;
+		bool bTransient = false;
+	};
+	static FTileReadOutcome ReadAndFetchTile(vxc::FileRangeSource& Source, const vxc::FineDecompressor& Decompressor,
+	                                         uint64 Seed, vxc::TileCoord Tile);
+
+	// --- THE ASYNC ARM (-VoxelFineTileAsync=1) ------------------------------
+	//
+	// What one worker hands back. Plain values plus the private sampler the
+	// tile was warmed in; NOTHING here points into the streamer.
+	struct FAsyncLoadResult
+	{
+		vxc::TileCoord Tile{0, 0};
+		uint64 Generation = 0;
+		FTileReadOutcome::EKind Kind = FTileReadOutcome::EKind::kFailed;
+		FTileReadOutcome::ECounter Counter = FTileReadOutcome::ECounter::kCorrupt;
+		const TCHAR* ReasonTag = TEXT("");
+		FString Why;
+		bool bTransient = false;
+		FString Path;
+		// The file version the launch-time memo check saw, so the failure memo
+		// is keyed exactly as the synchronous path keys it.
+		uint64 FileSize = 0;
+		int64 WriteTime = 0;
+		// kParsed only: the warmed tile, and the numbers the resident log line
+		// and the LRU charge need, captured before the tile changed hands.
+		std::unique_ptr<vxc::FineTileSampler> Warm;
+		uint64 Requests = 0;
+		uint64 ByteCount = 0;
+		uint64 FileSizeOnDisk = 0;
+		int64 TileSizePx = 0;
+		uint64 TileDecodedBytes = 0;
+		double ReadMs = 0.0;
+		double DecodeMs = 0.0;
+		double WorkerMs = 0.0;
+		double FinishedAtSeconds = 0.0; // worker clock; queued time = publish - this
+	};
+	// Shared between the streamer and every task it launched, so a task that
+	// outlives a shutdown (the 30 s deadline expired) still has somewhere safe
+	// to put -- or, once bAccepting is false, to drop -- its result.
+	struct FAsyncShared
+	{
+		TQueue<TUniquePtr<FAsyncLoadResult>, EQueueMode::Mpsc> Queue;
+		std::atomic<bool> bAccepting{true};
+	};
+	struct FInFlightLoad
+	{
+		UE::Tasks::TTask<void> Task;
+		double LaunchedAtSeconds = 0.0;
+		uint64 Generation = 0;
+	};
+	// Launches a worker load of Tile unless it is already resident, already in
+	// flight, known absent, memo-refused, or a cap is reached. Returns true ONLY
+	// if the tile is resident right now -- it never blocks, so a launch reads as
+	// "not yet". Performs the same single open+stat and the same failure-memo
+	// check the synchronous path performs, on the game thread, so an absent
+	// file is recorded exactly as before and a refused file version is never
+	// re-read. Caller must hold Lock_ exclusively.
+	bool MaybeLaunchAsyncLoad_Locked(vxc::TileCoord Tile);
+	// Drains the results queue: adopts every finished tile into Sampler_ (the
+	// ONLY write to the shared sampler the async arm ever makes), routes
+	// failures through RecordLoadFailure_Locked, drops stale or duplicate
+	// results. Caller must hold Lock_ exclusively, on the game thread.
+	void PumpAsyncLoads_Locked();
+	// The funnel's answer to "this tile is in flight": wait for that worker,
+	// then pump. Deadlock-free by construction -- the worker takes no lock --
+	// and never worse than the synchronous load it replaces, because the
+	// worker has already done part of the work. Caller must hold Lock_
+	// exclusively. Returns true if the tile is resident afterwards.
+	bool JoinInFlight_Locked(vxc::TileCoord Tile);
 	// Which coarse tiles the dilated footprint of this world-mm rect touches.
 	// Thin wrapper over vxc::tilesCoveringFootprint -- the arithmetic lives in
 	// voxel-core so that tests/test_tilestreaming.cpp can exercise it with a
@@ -723,16 +915,23 @@ private:
 	// WHY READING IT WITHOUT A LOCK IS SAFE, AND IT IS A THREAD-IDENTITY
 	// ARGUMENT RATHER THAN A MEMORY-ORDERING ONE:
 	//
-	//   WRITERS. Exactly three statements mutate it, and each sits immediately
-	//   beside the Sampler_.loadTile / Sampler_.unloadTile it mirrors:
+	//   WRITERS. Exactly four statements mutate it, and each sits immediately
+	//   beside the Sampler_ load / unload / adopt it mirrors:
 	//     1. EnsureTileResident_Locked, after a successful loadTile      (insert)
 	//     2. EnsureTileResident_Locked, on the prewarm failure unloadTile (erase)
 	//     3. TickResidencyAndEviction's LRU eviction unloadTile           (erase)
-	//   All three are inside Lock_ held EXCLUSIVELY, and all three are on the
-	//   GAME THREAD: RequestFootprint and TickResidencyAndEviction are game
-	//   thread by contract, and ResolveNonResidentPixel only loads on the
-	//   IsInGameThread() branch (its worker branch takes the lock but never
-	//   loads or unloads -- it reports a leak and returns).
+	//     4. PumpAsyncLoads_Locked, after adoptWarmTile returned kOk      (insert)
+	//        -- and ONLY then: the insert is asserted against the adopt
+	//        result, never written on any other outcome.
+	//   All four are inside Lock_ held EXCLUSIVELY, and all four are on the
+	//   GAME THREAD: RequestFootprint, TickResidencyAndEviction and
+	//   PumpAsyncLoads are game thread by contract, and ResolveNonResidentPixel
+	//   only loads (or joins a worker load) on the IsInGameThread() branch (its
+	//   worker branch takes the lock but never loads or unloads -- it reports a
+	//   leak and returns). The async WORKERS never touch this set or Sampler_:
+	//   they warm a private sampler, and the game thread adopts from it. So
+	//   MirrorOffThreadWritesSinceStart() stays 0 by construction on the async
+	//   arm, and the leg gate reads it to prove that.
 	//
 	//   READERS. The lock-free read happens ONLY inside `IsInGameThread()`.
 	//
@@ -786,4 +985,39 @@ private:
 	// 18.7 million times. Not cleared with KnownMissing_: the point is the
 	// LOG's volume, and a tile that reappears has already had its say.
 	std::unordered_set<uint64> LeakReportedTiles_;
+
+	// --- THE ASYNC ARM'S STATE -----------------------------------------------
+	//
+	// Latched once in the constructor from -VoxelFineTileAsync=, like MeterMode
+	// and FastMode. false leaves every member below untouched for the whole
+	// run: no task, no queue, no lock site, and every code path the switch
+	// guards is the pre-arm code byte for byte.
+	bool bAsyncMode_ = false;
+	int32 AsyncInFlightCap_ = 2;
+	int32 AsyncPerTickCap_ = 2;
+	// Null unless bAsyncMode_. Held by every launched task as well, so it
+	// outlives this object if a task does (see FAsyncShared).
+	TSharedPtr<FAsyncShared, ESPMode::ThreadSafe> AsyncShared_;
+	// What is in flight, keyed by tile hash. GAME THREAD ONLY, written under
+	// Lock_ exclusive (launch, publish, shutdown) and read by the same thread --
+	// the same single-thread argument ResidentTiles_ makes, so the lock-free
+	// reads in PumpAsyncLoads and AsyncInFlightCount are sound.
+	std::unordered_map<uint64, FInFlightLoad> InFlight_;
+	// Bumped by ShutdownAsync; a result stamped with an older generation is
+	// dropped at publish rather than adopted into a streamer that is going away.
+	uint64 AsyncGeneration_ = 1;
+	// Launches so far this tick; reset by the per-frame pump.
+	int32 AsyncLaunchedThisTick_ = 0;
+	int32 AsyncInFlightPeak_ = 0;
+	bool bAsyncShutdownLogged_ = false;
+	// Relaxed atomics for the same reason GateLeaks_ is one: written under the
+	// exclusive lock on the game thread, read without it by the perf log.
+	std::atomic<uint64> AsyncLaunched_{0};
+	std::atomic<uint64> AsyncPublished_{0};
+	std::atomic<uint64> AsyncJoins_{0};
+	std::atomic<uint64> AsyncFailed_{0};
+	std::atomic<uint64> AsyncDropped_{0};
+	std::atomic<uint64> AsyncCapRefusals_{0};
+	std::atomic<uint64> AsyncPublishNs_{0};
+	std::atomic<uint64> AsyncWorkerNs_{0};
 };

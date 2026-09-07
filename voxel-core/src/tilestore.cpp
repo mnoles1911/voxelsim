@@ -1565,6 +1565,42 @@ bool FineTileSampler::unloadTile(int32_t tx, int32_t ty) {
     return erased;
 }
 
+bool FineTileSampler::tileFullyDecoded(int32_t tx, int32_t ty) const {
+    auto it = tiles_.find(tileKey(tx, ty));
+    if (it == tiles_.end()) return false;
+    // Every elevation block decoded, and nothing else: the block cache only
+    // ever holds blocks of THIS tile, so its size is the count that matters.
+    return it->second.blocks.size() == static_cast<size_t>(it->second.tile.blockCount());
+}
+
+FineAdoptResult FineTileSampler::adoptWarmTile(FineTileSampler& other, int32_t tx, int32_t ty) {
+    // Checked in the order the enum lists, so the first failing condition is
+    // the one reported. None of these mutate anything; the move is last.
+    if (other.seed_ != seed_) return FineAdoptResult::kSeedMismatch;
+    const uint64_t key = tileKey(tx, ty);
+    auto src = other.tiles_.find(key);
+    if (src == other.tiles_.end()) return FineAdoptResult::kNotInSource;
+    // `other` may be this very sampler; findTile then reports the tile as
+    // already here, which is the true answer and moves nothing.
+    if (tiles_.find(key) != tiles_.end()) return FineAdoptResult::kAlreadyResident;
+    if (tileSize_ != 0 && src->second.tile.size() != tileSize_) {
+        return FineAdoptResult::kStrideMismatch;
+    }
+    // THE REFUSAL THAT MATTERS. A tile whose block cache is short of complete
+    // would decode on first touch after adoption -- a WRITE on what the host
+    // promises its workers is a pure read.
+    if (!other.tileFullyDecoded(tx, ty)) return FineAdoptResult::kNotFullyDecoded;
+
+    Resident moved = std::move(src->second);
+    other.tiles_.erase(src);
+    if (other.tiles_.empty()) {
+        other.tileSize_ = 0; // same rule as unloadTile: no tile, no stride
+    }
+    tileSize_ = moved.tile.size(); // same rule as loadTile
+    tiles_.insert_or_assign(key, std::move(moved));
+    return FineAdoptResult::kOk;
+}
+
 size_t FineTileSampler::residentBlockCount() const {
     size_t n = 0;
     for (const auto& kv : tiles_) n += kv.second.blocks.size();

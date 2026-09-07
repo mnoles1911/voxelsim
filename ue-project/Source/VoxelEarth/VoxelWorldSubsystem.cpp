@@ -2011,11 +2011,16 @@ TUniquePtr<FVoxelFineTileStreamer> MakeFineTileStreamer(uint64 Seed, const FStri
 	                  : TEXT("log an Error and continue (interactive)"));
 
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("Fine tier ENABLED: root=%s provider=%s seed=%llu pitch=%d mm/px ringRadius=%d budget=%.2f GiB. ")
+	       TEXT("Fine tier ENABLED: root=%s provider=%s seed=%llu pitch=%d mm/px ringRadius=%d budget=%.2f GiB ")
+	       // async= is the arm's identity on every leg: 0 is the synchronous
+	       // loader, byte-identical to before; 1 is the worker loader whose
+	       // engagement the window line's asyncLaunched= must then prove.
+	       TEXT("async=%d inFlightCap=%d perTick=%d. ")
 	       TEXT("Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess."),
 	       *FineTileDir, *FineProviderId, (unsigned long long)Seed,
 	       vxc::tilePixelSizeMm(vxc::kFineTileScale), Streamer->RingRadiusTiles(),
-	       double(Streamer->BudgetBytes()) / double(1ull << 30));
+	       double(Streamer->BudgetBytes()) / double(1ull << 30),
+	       Streamer->AsyncEnabled() ? 1 : 0, Streamer->AsyncInFlightCap(), Streamer->AsyncPerTickCap());
 	return Streamer;
 }
 
@@ -11403,6 +11408,29 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				RasterAtlas->Init(ActiveTiles().pixelSizeMm(),
 				                  int64(FineOuterMeters * 1000.0), LastFineRing,
 				                  AdmitCentreReachMm, CoveragePadChunks);
+				// THE ASYNC-LOADER AMENDMENT to the atlas's worker-admission proof
+				// (FVoxelRasterAtlasCpu::IsPageAsyncSafe): with -VoxelFineTileAsync=1
+				// a ring tile can be in flight, so "inside the pinned ring" no
+				// longer implies "resident". Wired ONLY on the async arm, so the
+				// synchronous arm's atlas is byte-identical. Atlas pixels are the
+				// fine pitch here (this atlas is built over ActiveTiles(), the fine
+				// sampler when the fine tier is live); the rect is inclusive in
+				// pixels and IsFootprintResident takes a half-open world-mm rect,
+				// hence the +1 on the far corner. Captures the streamer by raw
+				// pointer: the atlas is declared after FineStreamer in this class
+				// and therefore destroyed before it.
+				if (FineStreamer && FineStreamer->AsyncEnabled())
+				{
+					const int64 AtlasPitchMm = int64(ActiveTiles().pixelSizeMm());
+					FVoxelFineTileStreamer* StreamerPtr = FineStreamer.Get();
+					RasterAtlas->SetPixelRectResidentCallback(
+						[StreamerPtr, AtlasPitchMm](int64 PxX0, int64 PxY0, int64 PxX1, int64 PxY1)
+						{
+							return StreamerPtr->IsFootprintResident(PxX0 * AtlasPitchMm, PxY0 * AtlasPitchMm,
+							                                        (PxX1 + 1) * AtlasPitchMm,
+							                                        (PxY1 + 1) * AtlasPitchMm);
+						});
+				}
 
 				// THE COARSE-TIER ATLAS. Created alongside so its init line is
 				// on every log from the day the rule landed, not from the day a
@@ -11760,6 +11788,17 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// Off, this is one integer compare (see DrainWarmShadingResults).
 	DrainWarmShadingResults();
 	WarmShadingAheadTick();
+
+	// THE ASYNC FINE-TILE LOADER'S PER-FRAME PUMP (-VoxelFineTileAsync=1). The
+	// residency tick only runs on anchor movement and RequestFootprint only
+	// when something asks, so a tile whose worker finished while the player
+	// stood still would otherwise sit in the queue until the next move. Off,
+	// this is one branch inside the streamer; with nothing in flight, one
+	// empty-map test.
+	if (FineStreamer)
+	{
+		FineStreamer->PumpAsyncLoads();
+	}
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
 	// -VoxelWorkerPool arm: same prune, same reason (WaitForInFlightTasks'
@@ -12177,6 +12216,16 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		       TasksToWaitFor, WaitMs, TasksBeforePrune - TasksToWaitFor, TasksBeforePrune);
 	}
 	InFlightTasks.Empty();
+
+	// The async fine-tile loader's in-flight reads, under the same
+	// prune/deadline/report discipline (its own 30 s budget, its own line). A
+	// no-op on the synchronous arm. Done here, before Impl's members go, so a
+	// worker mid-read is joined rather than left to enqueue into a freed queue
+	// -- the streamer's destructor calls it again, idempotently, as the belt.
+	if (FineStreamer)
+	{
+		FineStreamer->ShutdownAsync();
+	}
 
 	// --- -VoxelWorkerPool arm (dedicated pool futures + the pool itself) ----
 	// Same prune / deadline-wait / report discipline as the task loop above,
@@ -16869,7 +16918,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       // 1.2 km inside a 15.36 km tile. ringCentre=(-2147483648,...)
 		       // is the sentinel for "the residency tick has never run", which
 		       // is a third, genuinely broken state that used to look the same.
-		       TEXT("| blockingLoads=%llu gateLeaks=%llu | ringRadius=%d ringCentre=(%d,%d) ringMoves=%llu"),
+		       TEXT("| blockingLoads=%llu gateLeaks=%llu | ringRadius=%d ringCentre=(%d,%d) ringMoves=%llu")
+		       // The async loader's fields, APPENDED AT THE END per the
+		       // old-leg-grep rule. async= is the arm; asyncLaunched= is its
+		       // engagement (0 with async=1 across a tile crossing means the
+		       // arm did not run); asyncJoins= is the safety net firing;
+		       // asyncWorkerMs= is the read+decode time that left the game
+		       // thread and asyncPublishMs= what adopting it cost there.
+		       TEXT(" | async=%d inFlight=%d asyncLaunched=%llu asyncPublished=%llu asyncJoins=%llu ")
+		       TEXT("asyncFailed=%llu asyncDropped=%llu asyncCapRefusals=%llu asyncPublishMs=%.2f ")
+		       TEXT("asyncWorkerMs=%.1f asyncInFlightPeak=%d"),
 		       (unsigned long long)FineStreamer->ResidentTileCount(),
 		       double(FineStreamer->ResidentBytes()) / double(1ull << 30),
 		       double(FineStreamer->BudgetBytes()) / double(1ull << 30),
@@ -16888,7 +16946,17 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (unsigned long long)FineStreamer->GateLeaksSinceStart(),
 		       FineStreamer->RingRadiusTiles(), FineStreamer->RingCentreTile().x,
 		       FineStreamer->RingCentreTile().y,
-		       (unsigned long long)FineStreamer->RingCentreMovesSinceStart());
+		       (unsigned long long)FineStreamer->RingCentreMovesSinceStart(),
+		       FineStreamer->AsyncEnabled() ? 1 : 0, FineStreamer->AsyncInFlightCount(),
+		       (unsigned long long)FineStreamer->AsyncLaunchedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncPublishedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncJoinsSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncFailedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncDroppedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncCapRefusalsSinceStart(),
+		       double(FineStreamer->AsyncPublishNsSinceStart()) / 1.0e6,
+		       double(FineStreamer->AsyncWorkerNsSinceStart()) / 1.0e6,
+		       FineStreamer->AsyncInFlightPeak());
 
 		// THE AFTER-THE-FACT CHECK, now reported against GateLeaksSinceStart()
 		// rather than the sampler's missingTileQueries.
@@ -31889,6 +31957,20 @@ bool UVoxelWorldSubsystem::IsChunkPresentableAt(const FVector& WorldPos) const
 		return false;
 	}
 	return true;
+}
+
+bool UVoxelWorldSubsystem::IsFineRingSettled(int32& OutSettledTiles, int32& OutRingTiles) const
+{
+	OutSettledTiles = 0;
+	OutRingTiles = 0;
+	if (!Impl || !Impl->FineStreamer)
+	{
+		return true; // no fine tier: nothing to wait for, and nothing to print
+	}
+	int32 Outstanding = 0;
+	const bool bSettled = Impl->FineStreamer->IsRingSettled(Outstanding, OutRingTiles);
+	OutSettledTiles = OutRingTiles - Outstanding;
+	return bSettled;
 }
 
 void UVoxelWorldSubsystem::Tick(float DeltaTime)

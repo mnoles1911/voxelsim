@@ -147,6 +147,10 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// Loading-gate tuning, so the GateMaxRing measurement is one flag rather
 	// than a rebuild. Defaults are the ported Godot contract.
 	int32 LoadGateMaxRing = 3;
+	// -VoxelLoadGateFineRing=0|1 (default 1): gate 3, "the fine tier's
+	// prefetch ring has settled" -- see FVoxelReadyProbeConfig::bRequireFineRing.
+	// 0 restores the two-gate rule exactly (the A/B control arm).
+	bool bLoadGateFineRing = true;
 	// ---- THE MINIMUM HOLD: 15.0 -> 2.0, 2026-08-27 ------------------------
 	//
 	// THE MINIMUM IS NOT THE THING THAT MAKES THE PLAYER WAIT. The contract in
