@@ -77,7 +77,7 @@ size-fit attempts. Only seed 1 completed the full measured arch build here.
 The public repository's Ubuntu runner has 16 GB RAM according to the
 [GitHub runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 The measured peak supports using its ordinary authored-pitch heavy build gate;
-CI records `/usr/bin/time -v` for the actual Linux result. A 7 GB private runner
+CI records `/usr/bin/time -v` for the actual Linux result. A smaller private runner
 would not have the same margin. Future larger specs and finer pitches need new
 measurements; this result does not establish a universal dense-generation budget.
 

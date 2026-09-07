@@ -575,6 +575,15 @@ struct FVoxelBrickChunkShading
 	}
 };
 
+// Game-thread observation only, not a reservation. Re-read or validate at commit.
+// Absence has canonical Slot=INDEX_NONE and AddSequence=0.
+struct FVoxelBrickAllocationToken
+{
+	bool bPresent=false;
+	int32 Slot=INDEX_NONE;
+	uint64 AddSequence=0;
+};
+
 // Prepared replacement pages retain their payloads outside the visible pool.
 // ExpectedSlot/sequence guard eviction or remeshing while preparation ran.
 struct FVoxelBrickPreparedReplacement
@@ -880,6 +889,10 @@ public:
 	// marcher that walks it, and the resident LevelAndFlags field is what makes
 	// building it a lookup change rather than a format change.
 	int32 FindChunkSlot(const FVoxelBrickChunkKey& Key) const;
+
+	// GAME THREAD ONLY. Matches the resident identity checked by
+	// PublishPreparedBatch; it does not promise allocator mode or capacity.
+	FVoxelBrickAllocationToken SnapshotAllocation(const FVoxelBrickChunkKey& Key) const;
 
 	// DEBUG REVERSE LOOKUP (2026-09-02, the stolen-cell hunt): which resident
 	// key owns a chunk slot right now, or false if no resident record names it

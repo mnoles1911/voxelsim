@@ -2203,6 +2203,16 @@ int32 FVoxelBrickPool::FindChunkSlot(const FVoxelBrickChunkKey& Key) const
 	return INDEX_NONE;
 }
 
+FVoxelBrickAllocationToken FVoxelBrickPool::SnapshotAllocation(const FVoxelBrickChunkKey& Key) const
+{
+	check(IsInGameThread());
+	if (const FResidentChunk* Found = Resident.Find(Key))
+	{
+		return {true, int32(Found->ChunkSlot), Found->AddSequence};
+	}
+	return {};
+}
+
 bool FVoxelBrickPool::DebugGetResidentChunk(const FVoxelBrickChunkKey& Key, FResidentChunk& Out) const
 {
 	if (const FResidentChunk* Found = Resident.Find(Key))

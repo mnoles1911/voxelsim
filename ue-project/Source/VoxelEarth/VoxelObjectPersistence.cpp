@@ -17,7 +17,15 @@
 namespace VoxelDetachedPersistence {
 namespace {
 constexpr int32 Limit=512*1024*1024;
-bool IsObject(AActor* A) { return IsValid(A)&&!A->ActorHasTag(TEXT("ObjectRestorePending"))&&(A->IsA<AVoxelDebris>()||A->IsA<AVoxelFallingTimber>()||A->IsA<AVoxelEnvironmentLODPrototype>()); }
+bool IsObject(AActor* A) {
+    if(!IsValid(A)||A->ActorHasTag(TEXT("ObjectRestorePending")))return false;
+    // Actor discovery is independent of the prototype interaction list. A
+    // hidden preparation actor must not acquire an empty registry entry that
+    // poisons the next whole-world snapshot. Ordinary hidden live actors and
+    // existing restoring data records remain eligible for persistence.
+    if(const auto Environment=Cast<AVoxelEnvironmentLODPrototype>(A))return !Environment->IsUnpublishedPreparation();
+    return A->IsA<AVoxelDebris>()||A->IsA<AVoxelFallingTimber>();
+}
 }
 bool CaptureObject(VoxelObjects::FEntry& E) {
     check(IsInGameThread());auto A=E.Actor.Get();if(!IsObject(A))return false;

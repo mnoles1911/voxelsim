@@ -1,5 +1,17 @@
 # Environment, crafting and detached-object handover — 2026-09-07
 
+## Current continuation status
+
+PR #234 merged as `c54de6e245d38fd0edfe714dcd579420789d27bf` after every required CI check passed, including GCC/Clang/MSVC, cross-compiler determinism, shader compilation, terrain tests, every Forge specification and authored-pitch heavy assets. The heavy Forge job passed in 12m12s. This is a verified checkpoint, not completed production ownership.
+
+Continue in `D:/voxelsim/.scratch/environment-verification`, branch `codex/environment-production-preparation-2026-09-07`. The primary `D:/voxelsim` checkout belongs to the Asset Forge task. Do not switch its branch or stage its work. New candidate preparation, explicit save-discovery exclusion, GPU worklist coverage, pool allocation-token access and state-driven multiplayer test barriers are pending validation/commit in this isolated checkout. The initial candidate compile found a test-only TSharedRef/TSharedPtr mismatch, corrected before the incremental rebuild. No new runtime pass is claimed here yet.
+
+Latest validation: `D:/voxelsim/Saved/build-environment-proof-lifetime.log` succeeded (13 actions,37.07s). All23 `Voxel.Objects` DX12 tests passed with process exit0 in `environment-proof-lifetime-tests.log`, including actual worklist readbacks, candidate persistence exclusion, allocation tokens and concurrent/recreated worklist proof isolation. Use `tools/verify-object-persistence.ps1 -Wait` for completed-queue/exit-code verification. Two initial fixture failures were corrected: required nonzero GPU generation IDs and the registry's deliberate Import normalization before entering Restoring. Worklist testing also exposed a real process-global proof mailbox collision; per-instance shared mailbox ownership now fixes it while preserving every diagnostic and draining queued raw-pointer borrows at destruction.
+
+The real dedicated-server/two-DX12-client network fixture passed with normal exits and zero displayed-position error: isolated `Saved/Tests/detached-net-20260907-015619-9198275d/result.json`. Commit `b7a47a3` is pushed. Run `tools/verify-detached-network.ps1 -TimeoutSeconds 480 -AllowOtherProjectEditors` when no compiler is active. That optional switch permits only identified different-project editors and does not permit same-project or unknown processes. The new network barriers verify initial client installation before movement, both replicas before deletion, and both tombstones before server exit. They do not fabricate network state.
+
+See `production-candidate-preparation.md` for the opt-in hidden preparation bridge and `production-environment-ownership.md` for the remaining atomic transaction. Production publication still requires ownership generations through every streaming/parked path, held CPU/GPU replacements, stable registry-ID reservation and a renderer-controlled visibility boundary. Keep the feature disabled until that acceptance passes.
+
 ## User request and checkpoint scope
 
 The user authorized completing the remaining framework work autonomously, then requested **commit and merge all progress and prepare a handover now**. This checkpoint preserves unfinished implementation; it does not declare production environment migration complete. Resume the outstanding work below without routine confirmation.
