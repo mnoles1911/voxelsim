@@ -96,6 +96,10 @@ VOXELEARTH_API FString WorldLogPath(const FString& Slug);
 // loadable save that opens an empty world.
 VOXELEARTH_API bool Write(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool bIsAutosave,
                           const FTransform& PlayerTransform, int32 PlayTimeSeconds);
+// True means admitted, not finished. Completion runs on the game thread after
+// terrain, debris and metadata have been written. A busy writer rejects admission.
+VOXELEARTH_API bool WriteAsync(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIsAutosave,
+                              const FTransform& PlayerTransform,int32 PlayTimeSeconds,TFunction<void(bool)> Completion = {});
 
 // Removes the whole directory. Returns false if it did not exist.
 VOXELEARTH_API bool Delete(const FString& Slug);

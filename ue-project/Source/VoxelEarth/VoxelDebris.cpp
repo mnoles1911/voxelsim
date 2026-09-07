@@ -1,4 +1,8 @@
 #include "VoxelDebris.h"
+#include "VoxelDebrisLifecycle.h"
+#include "VoxelDetachedPersistence.h"
+#include "Serialization/MemoryReader.h"
+#include "Serialization/MemoryWriter.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -8,10 +12,12 @@
 #include "VoxelEarth.h" // LogVoxelEarth
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelWorldSubsystem.h"
+#include "VoxelFineTileStreamer.h"
 
 AVoxelDebris::AVoxelDebris()
 {
 	PrimaryActorTick.bCanEverTick = true;
+	Cleanup = CreateDefaultSubobject<UVoxelDebrisLifecycle>(TEXT("Cleanup"));
 
 	// Root = the physics body (see class comment): an engine cube kept at
 	// component scale 1 so the attached ISM's per-voxel instances are never
@@ -43,8 +49,11 @@ AVoxelDebris::AVoxelDebris()
 int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels, int32 MaxInstances)
 {
 	VoxelCount = IslandVoxels.Num();
+	PersistentVoxels = IslandVoxels;
+	CachedObjectGeometry.Reset();
 	if (VoxelCount == 0)
 	{
+		Destroy();
 		return 0;
 	}
 
@@ -60,6 +69,11 @@ int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Islan
 	const FVector CentreWorld = (MinC + MaxC) * 0.5;
 	const double HalfVoxel = VoxelCoords::VoxelSizeUU * 0.5;
 	AabbHalfHeightUU = (MaxC.Z - MinC.Z) * 0.5 + HalfVoxel;
+	// Only genuinely small islands are cosmetic chips. Sparse long branches
+	// must not disappear just because they contain few voxels.
+	const double LongestSide = (MaxC - MinC).GetMax() + 2. * HalfVoxel;
+	Cleanup->Configure(VoxelCount <= 8 && LongestSide <= 30.
+		? EVoxelDebrisLifetime::Cosmetic : EVoxelDebrisLifetime::Substantial);
 
 	SetActorLocation(CentreWorld);
 
@@ -137,6 +151,59 @@ int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Islan
 	return Instances;
 }
 
+void AVoxelDebris::EndPlay(const EEndPlayReason::Type Reason)
+{
+    VoxelDetachedPersistence::OnEndPlay(this,Reason);
+    Super::EndPlay(Reason);
+}
+bool AVoxelDebris::CaptureObjectState(TSharedPtr<const TArray<uint8>,ESPMode::ThreadSafe>& Geometry,TArray<uint8>& Dynamic)
+{
+    check(IsInGameThread());
+    if(!CachedObjectGeometry){
+        auto Data=MakeShared<TArray<uint8>,ESPMode::ThreadSafe>();FMemoryWriter Ar(*Data);
+        if(!VoxelDetachedPersistence::Array(Ar,PersistentVoxels,1024*1024,[](FArchive& A,VoxelCoords::FVoxelCoord& V){A<<V.X<<V.Y<<V.Z;}))return false;
+        CachedObjectGeometry=Data;
+    }
+    Geometry=CachedObjectGeometry;Dynamic.Reset();FMemoryWriter Ar(Dynamic);
+    FTransform Transform=GetActorTransform();auto Linear=PhysicsBody->GetPhysicsLinearVelocity();auto Angular=PhysicsBody->GetPhysicsAngularVelocityInRadians();
+    auto Lifetime=Cleanup->CaptureState();uint8 Kind=uint8(Lifetime.Kind);
+    bool Simulating=PhysicsBody->IsSimulatingPhysics(),TickEnabled=IsActorTickEnabled();
+    Ar<<Transform<<Linear<<Angular<<bSettled<<AgeSeconds<<Kind<<Lifetime.RemainingSeconds<<Simulating<<TickEnabled;
+    return !Ar.IsError();
+}
+bool AVoxelDebris::RestoreObjectState(const TArray<uint8>& Geometry,const TArray<uint8>& Dynamic)
+{
+    TArray<uint8> Legacy;Legacy.Reserve(Geometry.Num()+Dynamic.Num());Legacy.Append(Geometry);Legacy.Append(Dynamic);
+    FMemoryReader Ar(Legacy);if(!PersistentState(Ar)||Ar.IsError())return false;
+    if(Ar.Tell()<Ar.TotalSize()){
+        bool Simulating=false,TickEnabled=false;Ar<<Simulating<<TickEnabled;
+        if(Ar.IsError())return false;
+        PhysicsBody->SetSimulatePhysics(Simulating);SetActorTickEnabled(TickEnabled);
+    }
+    return Ar.Tell()==Ar.TotalSize();
+}
+bool AVoxelDebris::PersistentState(FArchive& Ar)
+{
+    using namespace VoxelDetachedPersistence;
+    if(!Array(Ar,PersistentVoxels,1024*1024,[](FArchive& A,VoxelCoords::FVoxelCoord& V){A<<V.X<<V.Y<<V.Z;}))return false;
+    FTransform Transform=GetActorTransform();
+    FVector Linear=PhysicsBody->GetPhysicsLinearVelocity(),Angular=PhysicsBody->GetPhysicsAngularVelocityInRadians();
+    bool Settled=bSettled;float Elapsed=AgeSeconds;
+    auto Lifetime=Cleanup->CaptureState();uint8 Kind=uint8(Lifetime.Kind);
+    Ar<<Transform<<Linear<<Angular<<Settled<<Elapsed<<Kind<<Lifetime.RemainingSeconds;
+    if(Ar.IsError()||Transform.ContainsNaN()||Linear.ContainsNaN()||Angular.ContainsNaN()||!FMath::IsFinite(Elapsed)||Kind>3)return false;
+    if(Ar.IsLoading())
+    {
+        if(PersistentVoxels.IsEmpty())return false;
+        auto Voxels=PersistentVoxels;InitFromIsland(Voxels);
+        SetActorTransform(Transform);AgeSeconds=Elapsed;bSettled=Settled;
+        if(Settled){PhysicsBody->SetSimulatePhysics(false);SetActorTickEnabled(false);}
+        else{PhysicsBody->SetPhysicsLinearVelocity(Linear);PhysicsBody->SetPhysicsAngularVelocityInRadians(Angular);}
+        Lifetime.Kind=EVoxelDebrisLifetime(Kind);Cleanup->RestoreState(Lifetime);
+    }
+    return true;
+}
+
 void AVoxelDebris::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
@@ -144,7 +211,6 @@ void AVoxelDebris::Tick(float DeltaSeconds)
 	{
 		return;
 	}
-	AgeSeconds += DeltaSeconds;
 
 	UWorld* W = GetWorld();
 	UVoxelWorldSubsystem* Sub = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -154,6 +220,15 @@ void AVoxelDebris::Tick(float DeltaSeconds)
 	}
 
 	const FVector Loc = GetActorLocation();
+	// Detached bodies can outlive terrain residency. Never turn an unloaded
+	// tile into a ground hit at the fallback elevation. Pause the cheap island
+	// proxy until the same terrain gate used by terrain generation is ready.
+	if(auto Fine=Sub->GetFineTileStreamer()){
+		const int64 X=FMath::FloorToInt64(Loc.X*10.),Y=FMath::FloorToInt64(Loc.Y*10.);
+		if(!Fine->IsFootprintResident(X,Y,X+1,Y+1)){PhysicsBody->SetSimulatePhysics(false);return;}
+	}
+	if(!PhysicsBody->IsSimulatingPhysics())PhysicsBody->SetSimulatePhysics(true);
+	AgeSeconds += DeltaSeconds;
 
 	// Raycast the voxel world straight down (terrain has no Chaos collision --
 	// see class comment). Start a little above the body centre so a body that
@@ -188,6 +263,7 @@ void AVoxelDebris::SettleOnSurface(double SurfaceTopZUU)
 		return;
 	}
 	bSettled = true;
+	SetActorTickEnabled(false); // cleanup has its own timer; no idle terrain rays
 
 	PhysicsBody->SetSimulatePhysics(false);
 	FVector L = GetActorLocation();

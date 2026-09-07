@@ -820,7 +820,7 @@ def _fish(**kw) -> tuple[tuple[str, str, object], ...]:
     length = float(kw.get("length_m", 0.0))
     if length:
         cm = "10" if length >= 10.0 else "5" if length >= 3.0 else (
-            "2" if length >= 0.5 else "1")
+            "2.5" if length >= 0.5 else "1.25")
         out.append(("resolution_cm", SET, cm))
     return tuple(out)
 

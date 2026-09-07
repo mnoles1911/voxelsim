@@ -5,8 +5,8 @@
     "bilge": 2.6,
     "billow_m": 0.16,
     "crossbar_at": 0.42,
-    "deck_frac": 0.12,
-    "depth_m": 0.3,
+    "deck_frac": 0.14,
+    "depth_m": 0.34,
     "droop_m": 0.3,
     "entry": 0.62,
     "form": "raft",
@@ -30,7 +30,7 @@
     "strake_share": 0.3,
     "sweep": 0.85,
     "taper": 0.3,
-    "thwart_t_m": 0.11,
+    "thwart_t_m": 0.14,
     "thwart_w_m": 0.1,
     "thwarts": 2
   },
@@ -306,7 +306,7 @@
     "trim": "plume_buff"
   },
   "name": "raft",
-  "notes": "Reference-informed rough timber raft, revised 2026-09-05: nominal 4 x 2 m at 25 mm cubic pitch. Seven logs with independent diameters, alternating taper, bowed centrelines, oval sections, raised branch scars and staggered chopped/split ends. Uneven bark islands expose warm sapwood and grey weathered wood; each log has a different bark-loss history. Existing skin_brown colour slot provides bark without the upright-tree palette's false horizontal end-grain stripes. Two partly peeled cross-poles near the ends, with three rope turns and a knot at each crossing. References and measurements: docs/raft-2026-09-05.md. Player support/movement remains an engine responsibility.",
+  "notes": "Remodeled 2026-09-06 as a basic temperate-forest log raft: seven round spruce-like logs with individual diameter, bow, taper, branch collars and chipped exposed end grain. Bark-dominant longitudinal plates and narrow interrupted furrows contrast with one heavily peeled log. Reduced timber overlap preserves round profiles and narrow natural seams. Two 14 cm weathered cross-poles carry three rope turns and a compact tightening knot at each crossing. Nominal 4 x 2 m, 25 mm cubic voxels. Draft for owner review. See docs/raft-remodel-2026-09-06.md.",
   "placement": {
     "abundance": 0.5,
     "cluster": 0.3,
@@ -448,6 +448,7 @@
     "outer": 0.7,
     "spread": 0.18
   },
+  "subcategory": "vehicles",
   "trunk": {
     "buttress": 0.0,
     "clear_frac": 0.35,

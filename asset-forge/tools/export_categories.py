@@ -104,9 +104,11 @@ def build() -> dict:
                  "why": f"category resolves to nothing ({cat.source_of(body)})"})
             continue
         row = {"name": p.stem, "kind": sm.get(body, "kind"),
-               "voxel_mm": int(round(float(sm.get(body, "resolution_cm")) * 10)),
+               "voxel_mm": float(sm.get(body, "resolution_cm")) * 10,
                "via": cat.source_of(body),
                "curation": sm.curation(body)["status"]}
+        if body.get("subcategory"):
+            row["subcategory"] = body["subcategory"]
         grids = grids_for(p.stem)
         if grids:
             row["grids"] = grids

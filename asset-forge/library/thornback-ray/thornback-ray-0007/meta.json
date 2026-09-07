@@ -1,0 +1,51 @@
+{
+  "id": "thornback-ray-0007",
+  "species": "thornback-ray",
+  "kind": "fish",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "04e47046deb16c76",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "04e47046deb16c76",
+    "kind": "fish",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.08,
+    "length_m": 0.8,
+    "footprint_m": [
+      0.8,
+      0.14
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      64,
+      11,
+      6
+    ],
+    "vox_models_needed": 1,
+    "voxels": 1488,
+    "by_material": {
+      "26": 677,
+      "27": 135,
+      "30": 676
+    },
+    "ground_contact": 37,
+    "ms_grow": 2.5,
+    "ms_raster": 2.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 5.8
+  },
+  "problems": [],
+  "vox_models": 1
+}

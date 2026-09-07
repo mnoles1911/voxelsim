@@ -73,6 +73,7 @@ import math
 import numpy as np
 
 from . import materials
+from .creature_detail import side_disk, side_seam
 from . import parts
 from .grid import VoxelGrid
 from .spec import (_CAUDAL_SHAPES, _DORSAL_SHAPES, _FIELD_CURVES,
@@ -334,6 +335,8 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
         "barbels": int(get(spec, "fish.barbels")),
         "barbel_len": float(get(spec, "fish.barbel_len")),
         "fin_thick": int(get(spec, "fish.fin_thick")),
+        "kind": get(spec, "kind"),
+        "species": get(spec, "name"),
         "eye": float(get(spec, "fish.eye")),
         "eye_patch": float(get(spec, "fish.eye_patch")),
         "blowhole": float(get(spec, "fish.blowhole")),
@@ -1257,6 +1260,7 @@ def _paint(grid: VoxelGrid, p: dict, body: np.ndarray, fins: np.ndarray,
     # thick and the pattern was designed against a body twelve voxels deep.
     mat[fins & (fin_kind != FIN_NONE)] = p["mat_fin"]
 
+    _face_detail(mat, p, t, valid, dtop, dbot, body)
     _eye(mat, p, t, valid, dtop, dbot, occ)
     grid.data[:] = mat
 
@@ -1475,14 +1479,38 @@ def _eye(mat, p: dict, t, valid, dtop, dbot, occ) -> None:
     ys = np.flatnonzero(occ[x, :, z])
     if ys.size == 0:
         return
-    n = rad - 1
-    for y in (int(ys[0]), int(ys[-1])):
-        for dz in range(-n, n + 1):
-            for dx in range(-n, n + 1):
-                xx, zz = x + dx, z + dz
-                if 0 <= xx < nx and 0 <= zz < nz and occ[xx, y, zz]:
-                    mat[xx, y, zz] = p["mat_eye"]
-        # The contrast partner, one voxel forward of the pupil.
-        xx = min(x + rad, nx - 1)
-        if occ[xx, y, z]:
-            mat[xx, y, z] = p["mat_belly"]
+    radius = max(0.5, rad - 1, min(p["length_v"] * 0.006, dtop[x] * 0.14))
+    side_disk(mat, occ, x, z, radius, p["mat_eye"])
+    if radius >= 1.2:
+        side_disk(mat, occ, x + radius * 0.45, z + radius * 0.45, 0.5, p["mat_belly"])
+
+
+def _face_detail(mat, p, t, valid, dtop, dbot, body):
+    """A closed mouth and operculum; cetaceans have no gill marking."""
+    if p["length_v"] < 24:
+        return
+    points = []
+    for x in np.flatnonzero(valid & (t < min(0.14, p["head_frac"] * 0.65))):
+        z = p["zaxis"] - 0.15 * dbot[x]
+        points.append((x, z))
+    side_seam(mat, body, points, p["mat_eye"])
+    if p["kind"] != "fish" or any(w in p["species"] for w in ("ray", "skate", "lamprey", "hagfish")):
+        return
+    station = p["head_frac"] * 0.88
+    candidates = np.flatnonzero(valid)
+    if not len(candidates):
+        return
+    x = int(candidates[np.argmin(abs(t[candidates]-station))])
+    if dtop[x] + dbot[x] < 8:
+        return
+    # A fine curved cover seam, limited to the head rather than a body stripe.
+    points = [(x - (1-u*u)*min(2.0, p["length_v"]*.012),
+               p["zaxis"] + u*(dtop[x] if u>0 else dbot[x])*.65)
+              for u in np.linspace(-1,1,max(4,int(dtop[x]+dbot[x])))]
+    if "shark" in p["species"] or p["species"] in ("shortfin-mako", "scalloped-hammerhead"):
+        spacing = max(2, int(p["length_v"] * .013))
+        for slit in range(5):
+            side_seam(mat, body, [(px-slit*spacing,pz) for px,pz in points], p["mat_eye"])
+    else:
+        side_seam(mat, body, points, p["mat_eye"])
+

@@ -1,0 +1,50 @@
+{
+  "id": "plains-zebra-0007",
+  "species": "plains-zebra",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "ae400d8052fbb893",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "ae400d8052fbb893",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.7,
+    "length_m": 2.475,
+    "footprint_m": [
+      2.48,
+      0.46
+    ],
+    "grid_mb": 2.3,
+    "extent_vox": [
+      198,
+      37,
+      136
+    ],
+    "vox_models_needed": 1,
+    "voxels": 162039,
+    "by_material": {
+      "26": 47886,
+      "36": 114153
+    },
+    "ground_contact": 108,
+    "ms_grow": 1.7,
+    "ms_raster": 343.1,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 365.2
+  },
+  "problems": [],
+  "vox_models": 1
+}

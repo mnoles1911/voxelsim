@@ -25,7 +25,7 @@ namespace {
 constexpr uint64_t kSeed = 918273;
 constexpr int kB = kMarchBrickEdge;
 
-int64_t surfaceVoxelZ(const World<kB>& w) {
+int64_t surfaceVoxelZ(const World<kB, 2>& w) {
     const ColumnSample col = w.amplifier().column(0, 0);
     return topSolidVoxelZ(col.surfaceMm);
 }
@@ -34,7 +34,7 @@ int64_t surfaceVoxelZ(const World<kB>& w) {
 // generates: two neighbouring terrain bricks, a notch that does not reach the
 // projection's threshold, a fully hollowed voxel that does, and an overwrite
 // then revert on one cell so normalisation has work to do.
-void carveSession(World<kB>& w, int64_t topVz) {
+void carveSession(World<kB, 2>& w, int64_t topVz) {
     const int64_t cx0 = craftCellOfVoxelMin(0);
     const int64_t cy0 = craftCellOfVoxelMin(0);
     const int64_t cz0 = craftCellOfVoxelMin(topVz);
@@ -121,7 +121,7 @@ VXC_TEST(a_craft_log_is_stamped_v3_because_it_actually_needs_the_field) {
     const uint32_t stamped = uint32_t(bytes[4]) | (uint32_t(bytes[5]) << 8) |
                              (uint32_t(bytes[6]) << 16) | (uint32_t(bytes[7]) << 24);
     CHECK(stamped == 3u);
-    CHECK(stamped == EditLog::kFormatVersion);
+    CHECK(stamped == 3u); // legacy whole-mm craft logs retain v3 bytes
 
     const auto parsed = EditLog::parse(bytes.data(), bytes.size());
     CHECK(parsed.has_value());
@@ -133,7 +133,7 @@ VXC_TEST(a_world_with_no_chiselling_writes_a_terrain_log_an_older_build_accepts)
     // described: play without touching a chisel, autosave, and the file must
     // still be one a pre-craft build opens.
     SyntheticTileSampler tiles(kSeed);
-    World<kB> w(kSeed, tiles);
+    World<kB, 2> w(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(w);
     w.setVoxel(0, 0, topVz, MAT_AIR);
     w.setVoxel(1, 0, topVz, MAT_AIR);
@@ -164,7 +164,7 @@ VXC_TEST(peekHeader_reports_the_pitch_and_stays_total_on_a_truncated_file) {
 
     const EditLog::HeaderPeek full = EditLog::peekHeader(bytes.data(), bytes.size());
     CHECK(full.haveMagic && full.haveFormat && full.haveBrickEdge);
-    CHECK(full.format == EditLog::kFormatVersion);
+    CHECK(full.format == 3u);
     CHECK(full.haveLatticePitch);
     CHECK(full.latticePitchMm == static_cast<uint32_t>(kCraftPitchMm));
 
@@ -197,7 +197,7 @@ VXC_TEST(a_craft_log_is_refused_by_the_terrain_replay_and_vice_versa) {
     // brickEdge is 8 on BOTH lattices, so this refusal rests entirely on the
     // pitch field. Without it each log would replay into the other happily.
     SyntheticTileSampler tiles(kSeed);
-    World<kB> src(kSeed, tiles);
+    World<kB, 2> src(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(src);
     src.setVoxel(0, 0, topVz, MAT_AIR);
     src.setCraftCell(craftCellOfVoxelMin(3), craftCellOfVoxelMin(3),
@@ -206,7 +206,7 @@ VXC_TEST(a_craft_log_is_refused_by_the_terrain_replay_and_vice_versa) {
     CHECK(src.craftLog().size() == 1);
 
     SyntheticTileSampler tiles2(kSeed);
-    World<kB> dst(kSeed, tiles2);
+    World<kB, 2> dst(kSeed, tiles2);
     CHECK(!dst.replay(src.craftLog()));      // craft bytes into the terrain stream
     CHECK(!dst.replayCraft(src.log()));      // terrain bytes into the craft stream
     // ...and neither refusal left anything behind.
@@ -221,7 +221,7 @@ VXC_TEST(a_craft_log_is_refused_by_the_terrain_replay_and_vice_versa) {
 
 VXC_TEST(two_stream_replay_reproduces_the_world_exactly) {
     SyntheticTileSampler tiles(kSeed);
-    World<kB> src(kSeed, tiles);
+    World<kB, 2> src(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(src);
     // Terrain edits first, so the craft bricks promote from EDITED terrain and
     // the ordering rule is actually exercised.
@@ -240,7 +240,7 @@ VXC_TEST(two_stream_replay_reproduces_the_world_exactly) {
     CHECK(craftLog.has_value());
 
     SyntheticTileSampler tiles2(kSeed);
-    World<kB> dst(kSeed, tiles2);
+    World<kB, 2> dst(kSeed, tiles2);
     CHECK(dst.replay(*terrainLog));
     CHECK(dst.replayCraft(*craftLog));
 
@@ -270,7 +270,7 @@ VXC_TEST(replaying_craft_BEFORE_terrain_loses_the_carve) {
     // orders. Only craftDigest can tell them apart -- which is exactly why the
     // handshake has to fold it.
     SyntheticTileSampler tiles(kSeed);
-    World<kB> src(kSeed, tiles);
+    World<kB, 2> src(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(src);
     // A terrain edit, then a chisel into THE SAME voxel.
     src.setVoxel(0, 0, topVz, MAT_SAND);
@@ -285,7 +285,7 @@ VXC_TEST(replaying_craft_BEFORE_terrain_loses_the_carve) {
     CHECK(tlog.has_value() && clog.has_value());
 
     SyntheticTileSampler t1(kSeed);
-    World<kB> right(kSeed, t1);
+    World<kB, 2> right(kSeed, t1);
     CHECK(right.replay(*tlog));
     CHECK(right.replayCraft(*clog));
     CHECK(right.craftDigest() == src.craftDigest());
@@ -297,7 +297,7 @@ VXC_TEST(replaying_craft_BEFORE_terrain_loses_the_carve) {
     // silently left the dig on the overlay and the chisel in the craft lattice,
     // disagreeing about the same voxel.
     SyntheticTileSampler t2(kSeed);
-    World<kB> wrong(kSeed, t2);
+    World<kB, 2> wrong(kSeed, t2);
     CHECK(wrong.replayCraft(*clog));
     CHECK(!wrong.replay(*tlog));
 
@@ -317,7 +317,7 @@ VXC_TEST(the_out_of_order_guard_can_fire_and_leaves_the_world_untouched) {
     // work. A terrain log naming a brick that is already promoted is exactly
     // the state a craft-first replay produces.
     SyntheticTileSampler tiles(kSeed);
-    World<kB> src(kSeed, tiles);
+    World<kB, 2> src(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(src);
     src.setVoxel(0, 0, topVz, MAT_SAND);
     std::vector<uint8_t> tb;
@@ -326,12 +326,12 @@ VXC_TEST(the_out_of_order_guard_can_fire_and_leaves_the_world_untouched) {
     CHECK(tlog.has_value());
 
     SyntheticTileSampler t2(kSeed);
-    World<kB> dst(kSeed, t2);
+    World<kB, 2> dst(kSeed, t2);
     // Not promoted yet: the replay is accepted.
     CHECK(dst.replay(*tlog));
 
     SyntheticTileSampler t3(kSeed);
-    World<kB> promotedFirst(kSeed, t3);
+    World<kB, 2> promotedFirst(kSeed, t3);
     promotedFirst.setCraftCell(craftCellOfVoxelMin(0), craftCellOfVoxelMin(0),
                                craftCellOfVoxelMin(topVz), MAT_AIR);
     const uint64_t before = promotedFirst.editedDigest();
@@ -352,7 +352,7 @@ VXC_TEST(a_routed_dig_projects_its_brick_exactly_once) {
     // projection is right for the state at that moment and the last one wins.
     // Only counting them catches it.
     SyntheticTileSampler tiles(kSeed);
-    World<kB> w(kSeed, tiles);
+    World<kB, 2> w(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(w);
     const BrickKey tb = ChunkMap<kB>::keyForVoxel(0, 0, topVz);
 
@@ -392,7 +392,7 @@ VXC_TEST(a_dig_into_a_promoted_brick_keeps_overlay_equal_to_the_projection) {
     // straight to the overlay of a promoted brick would look right until the
     // next chisel anywhere in that brick silently reverted it.
     SyntheticTileSampler tiles(kSeed);
-    World<kB> w(kSeed, tiles);
+    World<kB, 2> w(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(w);
     const BrickKey tb = ChunkMap<kB>::keyForVoxel(0, 0, topVz);
 
@@ -429,7 +429,7 @@ VXC_TEST(a_dig_into_a_promoted_brick_keeps_overlay_equal_to_the_projection) {
 
 VXC_TEST(a_craft_carve_moves_materialAt_only_when_it_crosses_the_threshold) {
     SyntheticTileSampler tiles(kSeed);
-    World<kB> w(kSeed, tiles);
+    World<kB, 2> w(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(w);
     const MaterialId before = w.materialAt(0, 0, topVz);
     CHECK(before != MAT_AIR); // the test needs solid ground under it
@@ -457,7 +457,7 @@ VXC_TEST(promotion_alone_does_not_move_the_coarse_world) {
     // that changes nothing must leave every one of the brick's 512 voxels
     // exactly as it was, including the ones nobody touched.
     SyntheticTileSampler tiles(kSeed);
-    World<kB> w(kSeed, tiles);
+    World<kB, 2> w(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(w);
     const BrickKey tb = ChunkMap<kB>::keyForVoxel(0, 0, topVz);
 
@@ -481,7 +481,7 @@ VXC_TEST(promotion_alone_does_not_move_the_coarse_world) {
 
 VXC_TEST(craftMaterialAt_reads_terrain_where_nothing_is_promoted) {
     SyntheticTileSampler tiles(kSeed);
-    World<kB> w(kSeed, tiles);
+    World<kB, 2> w(kSeed, tiles);
     const int64_t topVz = surfaceVoxelZ(w);
     // Far from anything chiselled: all 4^3 craft cells report the parent voxel.
     const MaterialId want = w.materialAt(40, 40, topVz);

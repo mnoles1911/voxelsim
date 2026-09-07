@@ -1,0 +1,50 @@
+{
+  "id": "snowy-owl-0007",
+  "species": "snowy-owl",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "b6e29ef520b645a2",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "b6e29ef520b645a2",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.51,
+    "length_m": 0.562,
+    "footprint_m": [
+      0.56,
+      0.28
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      45,
+      22,
+      41
+    ],
+    "vox_models_needed": 1,
+    "voxels": 10790,
+    "by_material": {
+      "26": 132,
+      "36": 10658
+    },
+    "ground_contact": 8,
+    "ms_grow": 1.7,
+    "ms_raster": 16.1,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 19.0
+  },
+  "problems": [],
+  "vox_models": 1
+}

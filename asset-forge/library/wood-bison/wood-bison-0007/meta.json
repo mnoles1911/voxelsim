@@ -1,0 +1,52 @@
+{
+  "id": "wood-bison-0007",
+  "species": "wood-bison",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "a20ef90bc5eb3913",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "a20ef90bc5eb3913",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.88,
+    "length_m": 2.988,
+    "footprint_m": [
+      2.99,
+      0.83
+    ],
+    "grid_mb": 2.6,
+    "extent_vox": [
+      239,
+      66,
+      150
+    ],
+    "vox_models_needed": 1,
+    "voxels": 577516,
+    "by_material": {
+      "26": 113720,
+      "27": 3461,
+      "30": 318153,
+      "39": 142182
+    },
+    "ground_contact": 92,
+    "ms_grow": 1.7,
+    "ms_raster": 248.0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 311.1
+  },
+  "problems": [],
+  "vox_models": 1
+}

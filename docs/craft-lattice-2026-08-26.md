@@ -1,5 +1,8 @@
 # The craft lattice — 25 mm sub-voxel building
 
+> Current pitch policy (6 September 2026): binary 100 / 50 / 25 / 12.5 mm; 12.5 mm is reserved for craftables and creatures. See [implementation notes](binary-voxel-pitches.md). Earlier minimum-pitch proposals below are historical.
+
+
 Date: 2026-08-26, updated 2026-08-27. Design, and the record of what has landed.
 Territory so far: **`voxel-core` only** — `craftlattice.h`, `craftvolume.h`,
 `world.h`, `editlog.h`, `editcompact.h`, two test files. **No UE file has been
@@ -49,6 +52,8 @@ indistinguishable in every grep and every log line. This one is **craft**.
 > think it is a bug, read the ADR first — it almost certainly is not.
 
 ## 1b. PINNED DECISION (owner, 2026-08-27): three levels, and no more
+
+**Superseded floor, 2026-09-06:** Matt now requests 10 mm world craft support. See the [source review and proposed architecture](craft-lattice-10mm-architecture-review.md). This section records the old decision and its implementation constraints; its pool slot numbers are historical, not current UE assignments.
 
 **10 cm terrain -> 5 cm -> 2.5 cm, and 2.5 cm is the floor.** Settled; do not
 re-open without the owner.

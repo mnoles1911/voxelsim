@@ -1,0 +1,50 @@
+{
+  "id": "giant-anteater-0007",
+  "species": "giant-anteater",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "d7fc8dd234eb7c44",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "d7fc8dd234eb7c44",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.64,
+    "length_m": 2.1,
+    "footprint_m": [
+      2.1,
+      0.35
+    ],
+    "grid_mb": 0.5,
+    "extent_vox": [
+      168,
+      28,
+      51
+    ],
+    "vox_models_needed": 1,
+    "voxels": 59767,
+    "by_material": {
+      "26": 13981,
+      "37": 45786
+    },
+    "ground_contact": 44,
+    "ms_grow": 1.7,
+    "ms_raster": 45.0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 52.0
+  },
+  "problems": [],
+  "vox_models": 1
+}

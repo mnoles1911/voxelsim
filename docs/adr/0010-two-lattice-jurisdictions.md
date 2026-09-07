@@ -1,5 +1,8 @@
 # ADR-0010: Two lattice jurisdictions — the world ladder, and per-entity pitch
 
+> Current pitch policy (6 September 2026): binary 100 / 50 / 25 / 12.5 mm; 12.5 mm is reserved for craftables and creatures. See [implementation notes](../binary-voxel-pitches.md). Earlier minimum-pitch proposals below are historical.
+
+
 - **Status:** accepted
 - **Date:** 2026-08-27
 - **Doctrine sections affected:** none directly. No voxel-core change, no new
@@ -44,6 +47,8 @@ why it read as a backlog of stragglers.
 **There are two lattice jurisdictions, and they answer to different rules.**
 
 ### 1. The world ladder — 10 cm → 5 cm → 2.5 cm
+
+**Scope update, 2026-09-06:** Matt has requested world craft support down to 10 mm. This supersedes the 25 mm floor below as a product requirement, but the replacement architecture is still proposed. See [10 mm architecture review](../craft-lattice-10mm-architecture-review.md). The per-entity/world jurisdiction distinction remains valid; the historical binary implementation constraints below must be addressed rather than removed by changing a constant.
 
 Static world content: terrain, rocks, trees, ground cover, and player
 chiselling. Exactly three rungs; **2.5 cm is the floor and there is no 2 cm

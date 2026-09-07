@@ -1,0 +1,122 @@
+{
+  "seed": 1,
+  "spec_hash": "af329812718661b7",
+  "kind": "artifact",
+  "nodes": 0,
+  "segments": 0,
+  "max_order": 0,
+  "iterations": 0,
+  "targets_left": 0,
+  "clumps": 0,
+  "orphans_removed": 0,
+  "bridges_added": 0,
+  "airborne_kept": [],
+  "pieces_built": 1,
+  "voxel_cm": 2.5,
+  "height_m": 0.53,
+  "length_m": 4.175,
+  "footprint_m": [
+    4.17,
+    2.1
+  ],
+  "grid_mb": 0.6,
+  "extent_vox": [
+    167,
+    84,
+    21
+  ],
+  "vox_models_needed": 1,
+  "voxels": 152958,
+  "by_material": {
+    "17": 112199,
+    "18": 4401,
+    "30": 17700,
+    "39": 13457,
+    "46": 5201
+  },
+  "ground_contact": 12,
+  "ms_grow": 2.2,
+  "ms_raster": 2598.4,
+  "steps": [
+    {
+      "step": "rough timber",
+      "added": 149869,
+      "repainted": 0,
+      "must_change": true,
+      "note": "7 independently tapered, bowed logs; ragged bark islands, branch collars, split ends",
+      "voxels_after": 149869,
+      "logs": [
+        {
+          "radius_m": 0.18563165367790993,
+          "taper": 0.10779587659711459,
+          "bow_m": 0.011238933293667694,
+          "knots": 3,
+          "bark_fraction": 0.804798962386511
+        },
+        {
+          "radius_m": 0.1597532471793361,
+          "taper": -0.09798372948120149,
+          "bow_m": -0.017567074080788392,
+          "knots": 3,
+          "bark_fraction": 0.018093614789563395
+        },
+        {
+          "radius_m": 0.15413955427018955,
+          "taper": 0.10751226101319501,
+          "bow_m": 0.01413125889129959,
+          "knots": 6,
+          "bark_fraction": 0.9233462548455671
+        },
+        {
+          "radius_m": 0.14084839635844812,
+          "taper": -0.13550006087659994,
+          "bow_m": -0.01983303934671616,
+          "knots": 4,
+          "bark_fraction": 0.994555620953502
+        },
+        {
+          "radius_m": 0.14202455855717588,
+          "taper": 0.07666344928295711,
+          "bow_m": 0.007913784875367612,
+          "knots": 5,
+          "bark_fraction": 0.07825252040326452
+        },
+        {
+          "radius_m": 0.17801763137699836,
+          "taper": -0.09541759410210099,
+          "bow_m": -0.0013138573790149148,
+          "knots": 6,
+          "bark_fraction": 0.244398294895617
+        },
+        {
+          "radius_m": 0.18348631434281887,
+          "taper": 0.08213834772920386,
+          "bow_m": 0.02152821814633009,
+          "knots": 5,
+          "bark_fraction": 0.3611248149975333
+        }
+      ]
+    },
+    {
+      "step": "cross-poles",
+      "added": 1944,
+      "repainted": 417,
+      "must_change": true,
+      "note": "two irregular partly peeled poles",
+      "voxels_after": 151813
+    },
+    {
+      "step": "rope turns and knots",
+      "added": 1145,
+      "repainted": 1344,
+      "must_change": true,
+      "note": "14 crossings, three turns and a short tied tail",
+      "voxels_after": 152958
+    }
+  ],
+  "silent_steps": [],
+  "hollow_frac": 0.0341,
+  "attached_frac": 1.0,
+  "detached": 0,
+  "ms_total": 2615.2
+}

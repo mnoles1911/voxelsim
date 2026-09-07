@@ -45,6 +45,7 @@ public class VoxelEarth : ModuleRules
 			// the voxel rendering path, not a conventional heightmap clipmap
 			// -- see VoxelClipmapActor.h's class comment).
 			"ProceduralMeshComponent",
+			"PhysicsCore",
 			// ADR-0006 G2a: the GPU worldgen/mesher kernels. They live in their
 			// own module because that module has to load at PostConfigInit to
 			// register its shader directory before the global shader map is

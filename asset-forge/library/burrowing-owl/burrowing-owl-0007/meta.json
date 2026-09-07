@@ -1,0 +1,52 @@
+{
+  "id": "burrowing-owl-0007",
+  "species": "burrowing-owl",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "fb4c7eb1b339187b",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "fb4c7eb1b339187b",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.16,
+    "length_m": 0.175,
+    "footprint_m": [
+      0.18,
+      0.08
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      14,
+      6,
+      13
+    ],
+    "vox_models_needed": 1,
+    "voxels": 251,
+    "by_material": {
+      "26": 55,
+      "30": 135,
+      "36": 9,
+      "39": 52
+    },
+    "ground_contact": 10,
+    "ms_grow": 1.7,
+    "ms_raster": 4.0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 6.3
+  },
+  "problems": [],
+  "vox_models": 1
+}

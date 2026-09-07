@@ -1,0 +1,51 @@
+{
+  "id": "manx-shearwater-0007",
+  "species": "manx-shearwater",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "aa042ace284f8640",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "aa042ace284f8640",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.1,
+    "length_m": 0.4,
+    "footprint_m": [
+      0.4,
+      0.96
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      32,
+      77,
+      8
+    ],
+    "vox_models_needed": 1,
+    "voxels": 1627,
+    "by_material": {
+      "26": 1416,
+      "32": 4,
+      "36": 207
+    },
+    "ground_contact": 13,
+    "ms_grow": 2.0,
+    "ms_raster": 5.1,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 8.3
+  },
+  "problems": [],
+  "vox_models": 1
+}

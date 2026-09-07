@@ -143,3 +143,9 @@ bake-out/*.vxtl
 bake-out/karst/
 # Stray bake transcripts. The findings go in docs/measurements/, not the raw log.
 bake-*.log
+
+# Local dependency download and research inputs; project source stays tracked.
+/.scratch/raft-python/
+/.scratch/*.log
+/lumen.pdf
+/lumen.txt

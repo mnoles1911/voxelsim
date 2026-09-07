@@ -1,4 +1,5 @@
 #include "VoxelEarthGameMode.h"
+#include "VoxelEnvironmentLODPrototype.h"
 
 // The five light/sky includes that used to be here went with the rig (W4):
 // DirectionalLightComponent, SkyAtmosphereComponent, SkyLightComponent,
@@ -2689,6 +2690,7 @@ void AVoxelEarthGameMode::BeginPlay()
 	// all carve outside the +/-25.6 m xy, +/-12.8 m z box the implicit water
 	// is computed in, so their digs are meshed correctly and are invisible.
 	VoxelOceanCaptureFixture::StartFromCommandLine(World);
+	VoxelEnvironmentLODPrototype::StartFromCommandLine(World);
 
 	// --- W6 day/night acceptance ladder ---------------------------------------
 	//

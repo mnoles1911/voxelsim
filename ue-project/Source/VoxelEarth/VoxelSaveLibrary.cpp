@@ -1,4 +1,6 @@
 #include "VoxelSaveLibrary.h"
+#include "VoxelSaveJobs.h"
+#include "VoxelSaveGuard.h"
 
 #include "VoxelDebug.h" // LogVoxelEdit
 #include "VoxelWorldSubsystem.h"
@@ -12,6 +14,7 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
@@ -165,8 +168,9 @@ TArray<FSaveInfo> List()
 	return Out;
 }
 
-bool Write(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool bIsAutosave,
-           const FTransform& PlayerTransform, int32 PlayTimeSeconds)
+struct FNamedSnapshot { FString Slug,Name,Json; bool Autosave=false; };
+bool PrepareNamed(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool bIsAutosave,
+           const FTransform& PlayerTransform, int32 PlayTimeSeconds,FNamedSnapshot& Out)
 {
 	const FString Name = DisplayName.TrimStartAndEnd().IsEmpty() ? TEXT("Untitled") : DisplayName.TrimStartAndEnd();
 	FString Slug = Slugify(Name);
@@ -184,18 +188,6 @@ bool Write(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool b
 		}
 	}
 
-	const FString Directory = SaveDirectory(Slug);
-	IFileManager::Get().MakeDirectory(*Directory, /*Tree=*/true);
-
-	// THE WORLD GOES FIRST. If serialising the edit log fails, no meta.json is
-	// written, so the menu never lists a save whose world is missing --
-	// a row that opens an empty world is worse than a save that visibly did
-	// not happen.
-	if (!World.SaveWorldToPath(WorldLogPath(Slug)))
-	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("SaveGame '%s': the world log could not be written; no save was created."), *Slug);
-		return false;
-	}
 
 	const FDateTime Now = FDateTime::UtcNow();
 	const TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -234,27 +226,48 @@ bool Write(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool b
 
 	FString Json;
 	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Json);
-	if (!FJsonSerializer::Serialize(Root, Writer) || !FFileHelper::SaveStringToFile(Json, *(Directory / VoxelSaveDetail::kMetaFile)))
+	if (!FJsonSerializer::Serialize(Root, Writer))
 	{
-		UE_LOG(LogVoxelEdit, Error, TEXT("SaveGame '%s': the world was written but meta.json was not."), *Slug);
+		UE_LOG(LogVoxelEdit, Error, TEXT("SaveGame '%s': metadata could not be serialized."), *Slug);
 		return false;
 	}
 
-	VoxelSaveDetail::GActiveSlug = Slug;
-	UE_LOG(LogVoxelEdit, Log, TEXT("SaveGame '%s' (%s): %llu edit(s), seed %llu, at (%.0f, %.0f, %.0f)."), *Slug,
-	       bIsAutosave ? TEXT("autosave") : TEXT("named"), (unsigned long long)World.GetLogSize(),
-	       (unsigned long long)World.GetSeed(), PlayerTransform.GetLocation().X, PlayerTransform.GetLocation().Y,
-	       PlayerTransform.GetLocation().Z);
-
-	if (bIsAutosave)
-	{
-		PruneAutosaves();
-	}
+	Out={Slug,Name,MoveTemp(Json),bIsAutosave};
 	return true;
+}
+
+void FinishNamed(const FNamedSnapshot& Snapshot,bool Success)
+{
+	if(!Success){UE_LOG(LogVoxelEdit,Error,TEXT("SaveGame '%s': save failed; completion was not reported."),*Snapshot.Slug);return;}
+	VoxelSaveDetail::GActiveSlug=Snapshot.Slug;
+	UE_LOG(LogVoxelEdit,Log,TEXT("SaveGame '%s': completed (%s)."),*Snapshot.Slug,Snapshot.Autosave?TEXT("autosave"):TEXT("named"));
+	if(Snapshot.Autosave)PruneAutosaves();
+}
+bool Write(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIsAutosave,const FTransform& PlayerTransform,int32 PlayTimeSeconds)
+{
+	VoxelSaveJobs::Drain();FNamedSnapshot Snapshot;
+	if(!PrepareNamed(World,DisplayName,bIsAutosave,PlayerTransform,PlayTimeSeconds,Snapshot))return false;
+	const FString Meta=SaveDirectory(Snapshot.Slug)/VoxelSaveDetail::kMetaFile;
+	const bool Success=World.SaveWorldToPath(WorldLogPath(Snapshot.Slug))
+		&&FFileHelper::SaveStringToFile(Snapshot.Json,*(Meta+TEXT(".tmp")))&&IFileManager::Get().Move(*Meta,*(Meta+TEXT(".tmp")),true);
+	FinishNamed(Snapshot,Success);return Success;
+}
+bool WriteAsync(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIsAutosave,const FTransform& PlayerTransform,int32 PlayTimeSeconds,TFunction<void(bool)> Completion)
+{
+	check(IsInGameThread());if(VoxelSaveJobs::IsBusy()){UE_LOG(LogVoxelEdit,Warning,TEXT("SaveGame: another save is still running."));return false;}
+	const double Start=FPlatformTime::Seconds();FNamedSnapshot Named;
+	if(!PrepareNamed(World,DisplayName,bIsAutosave,PlayerTransform,PlayTimeSeconds,Named))return false;
+	VoxelSaveJobs::FSnapshot Snapshot;Snapshot.TerrainPath=WorldLogPath(Named.Slug);
+	if(VoxelSaveGuard::RefuseWrite(Snapshot.TerrainPath,TEXT("SaveAsync"))||!World.CaptureTerrainSnapshot(Snapshot.Terrain)||!VoxelDetachedPersistence::CaptureSnapshot(World.GetWorld(),Snapshot.Objects))return false;
+	Snapshot.bObjectSnapshot=true;Snapshot.MetadataJson=Named.Json;Snapshot.CaptureMs=(FPlatformTime::Seconds()-Start)*1000.;
+	return VoxelSaveJobs::Submit(MoveTemp(Snapshot),[Named=MoveTemp(Named),Completion=MoveTemp(Completion)](bool Success){
+		FinishNamed(Named,Success);if(Completion)Completion(Success);
+	});
 }
 
 bool Delete(const FString& Slug)
 {
+	if(VoxelSaveJobs::IsBusy()){UE_LOG(LogVoxelEdit,Warning,TEXT("DeleteSave: wait for the active save to finish."));return false;}
 	const FString Directory = SaveDirectory(Slug);
 	if (!IFileManager::Get().DirectoryExists(*Directory))
 	{
@@ -371,8 +384,10 @@ FAutoConsoleCommandWithWorldAndArgs GSaveGameCommand(
 			// the obvious thing rather than saving a file called "Copper".
 			const FString Name = Args.Num() > 0 ? FString::Join(Args, TEXT(" "))
 			                                    : FDateTime::Now().ToString(TEXT("%Y-%m-%d %H:%M"));
-			VoxelSave::Write(*Voxels, Name, /*bIsAutosave=*/false,
-			                 VoxelSaveCommands::PlayerTransformOrIdentity(World), /*PlayTimeSeconds=*/0);
+			const bool Started=VoxelSave::WriteAsync(*Voxels,Name,false,VoxelSaveCommands::PlayerTransformOrIdentity(World),0,[Name](bool Success){
+				if(GEngine)GEngine->AddOnScreenDebugMessage(7319,5.f,Success?FColor::Green:FColor::Red,Success?FString::Printf(TEXT("Saved %s"),*Name):TEXT("Save failed"));
+			});
+			if(GEngine)GEngine->AddOnScreenDebugMessage(7319,5.f,Started?FColor::White:FColor::Yellow,Started?TEXT("Saving..."):TEXT("Save not started; check the log"));
 		}));
 
 FAutoConsoleCommand GListSavesCommand(

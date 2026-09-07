@@ -1,0 +1,56 @@
+{
+  "id": "goblin-stalker-0001",
+  "species": "goblin-stalker",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 1,
+  "spec_hash": "c687d48a3f440bb8",
+  "stats": {
+    "seed": 1,
+    "spec_hash": "c687d48a3f440bb8",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.1,
+    "length_m": 0.463,
+    "footprint_m": [
+      0.46,
+      0.5
+    ],
+    "grid_mb": 1.8,
+    "extent_vox": [
+      37,
+      40,
+      88
+    ],
+    "vox_models_needed": 1,
+    "voxels": 21186,
+    "by_material": {
+      "26": 66,
+      "27": 22,
+      "28": 287,
+      "29": 15082,
+      "30": 1636,
+      "32": 6,
+      "38": 4046,
+      "46": 41
+    },
+    "ground_contact": 24,
+    "ms_grow": 3.2,
+    "ms_raster": 23.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 31.4
+  },
+  "problems": [],
+  "vox_models": 1
+}

@@ -241,7 +241,7 @@
     "fish_fin": "skin_silver",
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
-    "fish_pattern": "plume_rufous",
+    "fish_pattern": "skin_red",
     "head": "leaf_blossom",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
@@ -331,7 +331,7 @@
     "waist": 0.94,
     "width": 0.62
   },
-  "resolution_cm": "1",
+  "resolution_cm": "1.25",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,

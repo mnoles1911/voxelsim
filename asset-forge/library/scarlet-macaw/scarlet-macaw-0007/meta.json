@@ -1,0 +1,53 @@
+{
+  "id": "scarlet-macaw-0007",
+  "species": "scarlet-macaw",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "28302ccab9dc7a7f",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "28302ccab9dc7a7f",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.36,
+    "length_m": 0.825,
+    "footprint_m": [
+      0.83,
+      0.18
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      66,
+      14,
+      29
+    ],
+    "vox_models_needed": 1,
+    "voxels": 3062,
+    "by_material": {
+      "26": 2,
+      "32": 130,
+      "34": 661,
+      "36": 496,
+      "41": 1773
+    },
+    "ground_contact": 10,
+    "ms_grow": 1.7,
+    "ms_raster": 18.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 21.2
+  },
+  "problems": [],
+  "vox_models": 1
+}

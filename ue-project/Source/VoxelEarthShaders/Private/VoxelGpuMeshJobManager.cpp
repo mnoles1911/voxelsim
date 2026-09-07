@@ -1634,6 +1634,8 @@ struct FVoxelGpuMeshJobManager::FJob
 	// region or none at all. There is no half state to check for later.
 	bool bBrickPack = false;
 	bool bBrickResident = false;
+	bool bHoldBrickPublication = false;
+	uint64 OwnershipGeneration = 0;
 
 	// --- P1 (voxel.GPU.PoolAlloc): this job claims its own pool ranges -------
 	//
@@ -1938,6 +1940,7 @@ namespace
 	bool IsStackableBrickJob(const FVoxelGpuMeshJobManager::FJob& Job)
 	{
 		return Job.bBrickPack
+			&& !Job.bHoldBrickPublication
 			&& !Job.bQuadMesh
 			&& Job.Region.BandEdge == 0
 			&& Job.BrickRegion.AssetInstances.Num() == 0;
@@ -2220,7 +2223,8 @@ FVoxelGpuMeshJobManager::~FVoxelGpuMeshJobManager()
 }
 
 uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag,
-                                       bool bRequestGpuResidentQuads, bool bLowPriority)
+                                       bool bRequestGpuResidentQuads, bool bLowPriority,
+                                       bool bHoldBrickPublication, uint64 OwnershipGeneration)
 {
 	check(IsInGameThread());
 
@@ -2234,6 +2238,8 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	FJobPtr Job = MakeShared<FJob, ESPMode::ThreadSafe>();
 	Job->JobId = NextJobId++;
 	Job->UserTag = UserTag;
+	Job->bHoldBrickPublication = bHoldBrickPublication;
+	Job->OwnershipGeneration = OwnershipGeneration;
 	Job->Region = MoveTemp(Region);
 	// Latched per job rather than read at delivery: a cvar flip between
 	// dispatch and readback would otherwise rebase quads that were already
@@ -2319,7 +2325,7 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	// without a derivation.
 	bool bBrickRegionDerived = false;
 	bool bAssetsMoved = false;
-	if (VoxelGpuBrickPackEnabled())
+	if (VoxelGpuBrickPackEnabled() || Job->bHoldBrickPublication)
 	{
 		if (bMoveAssets)
 		{
@@ -2344,7 +2350,7 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	    VoxelGpuWorldGen::ValidateRegionRequest(Job->BrickRegion, BrickRegionError))
 	{
 		Job->bBrickPack = true;
-		Job->bBrickResident = GVoxelGpuBrickPackResident != 0;
+		Job->bBrickResident = GVoxelGpuBrickPackResident != 0 && !Job->bHoldBrickPublication;
 
 		// The chunk the brick region covers, in its OWN level's units. The
 		// origins are exact multiples of the chunk edge by construction
@@ -2434,6 +2440,8 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 	FVoxelGpuMeshJobResult Result;
 	Result.JobId = Job->JobId;
 	Result.UserTag = Job->UserTag;
+	Result.bPublicationHeld = Job->bHoldBrickPublication;
+	Result.OwnershipGeneration = Job->OwnershipGeneration;
 	Result.Status = Status;
 	Result.Error = Error;
 	const double DeliverSeconds = FPlatformTime::Seconds();
@@ -2580,6 +2588,11 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 		Job->bGpuShellAllocated = false;
 	}
 
+	if (Job->bHoldBrickPublication && Result.Status == EVoxelGpuMeshJobStatus::Success && !Result.BrickVolume.IsValid())
+	{
+		Result.Status = EVoxelGpuMeshJobStatus::Rejected;
+		Result.Error = TEXT("Prepared terrain job produced no owned brick payload; publication remains unchanged");
+	}
 	OnJobComplete.ExecuteIfBound(MoveTemp(Result));
 }
 

@@ -31,10 +31,11 @@ export function ImportDialog({
   const [error, setError] = React.useState<string | null>(null);
 
   const format = file?.name.toLowerCase().endsWith(".vxa") ? "vxa" : "vox";
+  const pitches = world.kinds.find(k => k.key === kind)?.voxel_pitches_mm ?? [100];
   const problems: string[] = [];
   if (file && !/\.(vox|vxa)$/i.test(file.name)) problems.push("Only .vox (MagicaVoxel) and .vxa files import.");
   if (name && !NAME_RE.test(name)) problems.push("Species name: lowercase letters, digits and dashes, up to 40.");
-  if (format === "vox" && (voxelMm < 10 || voxelMm > 1000)) problems.push("Voxel size must be 10-1000 mm.");
+  if (format === "vox" && !pitches.includes(voxelMm)) problems.push("Choose a supported voxel size for this asset kind.");
   const ready = !!file && NAME_RE.test(name) && problems.length === 0;
 
   const run = async () => {
@@ -120,7 +121,7 @@ export function ImportDialog({
               <span className="mb-1 block font-display text-xs uppercase tracking-widest text-parch-400">
                 Voxel size (mm)
               </span>
-              <Input type="number" min={10} max={1000} step={10} value={voxelMm} onChange={(e) => setVoxelMm(Number(e.target.value))} />
+              <Select value={String(voxelMm)} onValueChange={v => setVoxelMm(Number(v))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{pitches.map(mm => <SelectItem key={mm} value={String(mm)}>{mm} mm</SelectItem>)}</SelectContent></Select>
             </label>
           )}
 

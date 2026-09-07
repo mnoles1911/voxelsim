@@ -1,3 +1,4 @@
+import { groupLabel } from "../lib/taxonomy";
 import * as React from "react";
 import { Archive, ChevronLeft, ChevronRight, FileBox, Rotate3d, Stamp, Trash2, X } from "lucide-react";
 import type { World } from "../App";
@@ -52,7 +53,7 @@ export function SpeciesPanel({
             <span className={row.category ? "text-parch-400" : "text-rust-400"}>
               {categoryLabel}
             </span>
-            {" · "}{kindLabel}{row.subcategory ? " · " + row.subcategory + " (grouping)" : ""} · {row.size_m.toFixed(1)} m · {row.shape} · authored at {row.resolution_cm} cm · spec {row.hash}
+            {" · "}{row.subcategory ? groupLabel(row.subcategory) : kindLabel} · {row.size_m.toFixed(1)} m · {row.shape} · authored at {row.resolution_cm} cm · spec {row.hash}
           </div>
         </div>
         <div className="ml-auto">

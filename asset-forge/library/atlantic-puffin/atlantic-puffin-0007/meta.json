@@ -1,0 +1,51 @@
+{
+  "id": "atlantic-puffin-0007",
+  "species": "atlantic-puffin",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "1678f0e5fe0ce2f5",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "1678f0e5fe0ce2f5",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.2,
+    "length_m": 0.3,
+    "footprint_m": [
+      0.3,
+      0.12
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      24,
+      10,
+      16
+    ],
+    "vox_models_needed": 1,
+    "voxels": 1146,
+    "by_material": {
+      "26": 565,
+      "31": 75,
+      "36": 506
+    },
+    "ground_contact": 24,
+    "ms_grow": 2.9,
+    "ms_raster": 6.9,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 10.6
+  },
+  "problems": [],
+  "vox_models": 1
+}

@@ -1,0 +1,52 @@
+{
+  "id": "golden-jackal-0007",
+  "species": "golden-jackal",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "a998e66f5b7e0dc6",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "a998e66f5b7e0dc6",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.58,
+    "length_m": 0.95,
+    "footprint_m": [
+      0.95,
+      0.18
+    ],
+    "grid_mb": 0.2,
+    "extent_vox": [
+      76,
+      14,
+      46
+    ],
+    "vox_models_needed": 1,
+    "voxels": 9403,
+    "by_material": {
+      "26": 175,
+      "36": 1786,
+      "39": 6287,
+      "40": 1155
+    },
+    "ground_contact": 4,
+    "ms_grow": 1.8,
+    "ms_raster": 22.1,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 26.0
+  },
+  "problems": [],
+  "vox_models": 1
+}

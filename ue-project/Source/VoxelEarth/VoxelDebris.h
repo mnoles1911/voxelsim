@@ -7,20 +7,16 @@
 
 class UStaticMeshComponent;
 class UInstancedStaticMeshComponent;
+class UVoxelDebrisLifecycle;
 
 // M5 destruction (first slice, docs/voxel-earth-implementation-plan.md SS3.5
 // "disconnected islands promoted to rigid voxel debris bodies (Chaos)").
 //
-// A cosmetic, client-side falling-debris body for one disconnected voxel
-// island detected by the connectivity flood-fill (vxc::findDisconnectedIslands)
-// after a chop/dig severs a piece of world from the ground. See
-// docs/status.md "M5 -- Destruction" for the deterministic/cosmetic split:
-//   * The AUTHORITATIVE effect of a chop is the edit-log REMOVAL of the island
-//     voxels (deterministic connectivity decision + replicated edit entries),
-//     applied in UVoxelWorldSubsystem before this actor is ever spawned.
-//   * THIS actor is pure presentation. Its Chaos rigid-body fall/tumble is NOT
-//     part of world state, is never replicated, and may differ per client. It
-//     touches no edit log and no authoritative voxel data.
+// Detached island presentation/physics proxy. Terrain removal is authoritative
+// in UVoxelWorldSubsystem before this actor spawns. Persistent-sized islands
+// now join VoxelObjectRegistry, save with stable IDs, and replicate server
+// transforms; client replicas do not run their own physics. Tiny cosmetic
+// chips retain their local ten-second lifetime and are not persisted.
 //
 // v0 simplifications (documented as follow-ups in docs/status.md):
 //   * Physics proxy is a single Chaos rigid body (a 1m cube body carrying
@@ -45,6 +41,14 @@ public:
 	AVoxelDebris();
 
 	virtual void Tick(float DeltaSeconds) override;
+	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+	bool PersistentState(FArchive& Ar);
+	bool CaptureObjectState(TSharedPtr<const TArray<uint8>,ESPMode::ThreadSafe>& Geometry,TArray<uint8>& Dynamic);
+	bool RestoreObjectState(const TArray<uint8>& Geometry,const TArray<uint8>& Dynamic);
+    bool RestoreObjectState(const TSharedPtr<const TArray<uint8>,ESPMode::ThreadSafe>& Geometry,const TArray<uint8>& Dynamic) {
+        if(!Geometry||!RestoreObjectState(*Geometry,Dynamic))return false;
+        CachedObjectGeometry=Geometry;return true;
+    }
 
 	// Builds the physics body + instanced cubes from a detached island's world
 	// voxel coordinates and starts it falling. Call once, immediately after
@@ -68,6 +72,7 @@ public:
 	static constexpr int32 MaxInstancesPerBody = 8192;
 
 private:
+	UPROPERTY(VisibleAnywhere) TObjectPtr<UVoxelDebrisLifecycle> Cleanup;
 	void SettleOnSurface(double SurfaceTopZUU);
 
 	// Root: the Chaos rigid body (invisible 1m cube; gravity only, ignores all
@@ -86,6 +91,8 @@ private:
 	double AabbHalfHeightUU = 0.0;
 
 	int32 VoxelCount = 0;
+	TArray<VoxelCoords::FVoxelCoord> PersistentVoxels;
+	TSharedPtr<const TArray<uint8>,ESPMode::ThreadSafe> CachedObjectGeometry;
 	float AgeSeconds = 0.f;
 	bool bSettled = false;
 

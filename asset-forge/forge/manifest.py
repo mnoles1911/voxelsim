@@ -965,7 +965,7 @@ def folded_top_per_mille(spec: dict, layer: int, top_weight_pm: "int | None" = N
 
 
 def species_record(spec: dict, name: str, seeds_baked: int,
-                   report: ExportReport) -> bytes | None:
+                   report: ExportReport, pitch_um: bool = False) -> bytes | None:
     kind = sm.get(spec, "kind")
     if kind in KINDS_ENTITY:
         report.unplaceable.append(
@@ -1020,7 +1020,9 @@ def species_record(spec: dict, name: str, seeds_baked: int,
         return None
 
     res_cm = float(sm.get(spec, "resolution_cm"))
-    voxel_mm = int(round(res_cm * 10.0))
+    if not pitch_um and not float(res_cm * 10.0).is_integer():
+        raise ValueError("Fractional species pitch requires a VXM v3 micrometre record")
+    voxel_mm = int(round(res_cm * (10000.0 if pitch_um else 10.0)))
     lo, hi, radius_mm = _kind_group_params(spec, kind)
 
     encoded_name = name.encode("ascii")
@@ -1118,11 +1120,13 @@ def encode(specs: "list[tuple[str, dict]]",
     rule_names = sorted(rules)
     rule_index = {n: i for i, n in enumerate(rule_names)}
 
+    pitch_um = any(not float(float(sm.get(s,"resolution_cm"))*10).is_integer() for _,s in specs)
+    version = 3 if pitch_um else 2
     records = []
     attachments: list[tuple[int, int, int]] = []  # (species_idx, biome_id, rule_idx)
     problems: list[str] = []
     for name, spec in sorted(specs, key=lambda t: t[0]):
-        rec = species_record(spec, name, int(seeds_baked.get(name, 0)), report)
+        rec = species_record(spec, name, int(seeds_baked.get(name, 0)), report, pitch_um=pitch_um)
         if rec is None:
             continue
         idx = len(records)
@@ -1164,7 +1168,7 @@ def encode(specs: "list[tuple[str, dict]]",
     report.attachments = len(attachments)
 
     header = MAGIC + struct.pack(
-        "<IIIIIII", MANIFEST_VERSION, len(BIOME_ORDER), len(LAYERS),
+        "<IIIIIII", version, len(BIOME_ORDER), len(LAYERS),
         len(records), SPECIES_RECORD_BYTES, len(rule_names), len(attachments))
     assert len(header) == HEADER_BYTES
 
@@ -1207,7 +1211,7 @@ def decode(blob: bytes) -> dict:
         raise ValueError("bad magic")
     version, biomes, layers, count, rec_bytes, rule_count, attach_count = \
         struct.unpack_from("<IIIIIII", blob, 4)
-    if version != MANIFEST_VERSION:
+    if version not in (2,3):
         raise ValueError(f"version {version}")
     off = HEADER_BYTES
     names = []
@@ -1253,7 +1257,7 @@ def decode(blob: bytes) -> dict:
             "water_kind": WATER_ORDER[rec[4]],
             "water_mask": rec[5],
             "seeds_baked": rec[6],
-            "voxel_size_mm": rec[7],
+            "voxel_size_mm": rec[7] / 1000.0 if version == 3 else rec[7],
             "weights": rec[8:18],
             "abundance_q10": rec[18],
             "cluster_q10": rec[19],

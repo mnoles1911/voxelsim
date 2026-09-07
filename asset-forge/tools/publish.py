@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 import _path  # noqa: F401  (sys.path bootstrap)
-from forge import manifest, spec as sm
+from forge import manifest, publishing, spec as sm
 
 ROOT = Path(__file__).resolve().parents[1]
 SPECS = ROOT / "specs"
@@ -49,7 +49,7 @@ LIBRARY = ROOT / "library"
 OUT = ROOT / "out" / "engine"
 
 
-def resync_from_library() -> tuple[list[str], int]:
+def resync_from_library(*, dry_run: bool = False) -> tuple[list[str], int]:
     """The library-wins pass. Returns (report lines, conflict count)."""
     lines: list[str] = []
     conflicts = 0
@@ -73,8 +73,9 @@ def resync_from_library() -> tuple[list[str], int]:
         if prior == block:
             continue
         raw["curation"] = block
-        p.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
-                     encoding="utf-8")
+        if not dry_run:
+            p.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
+                         encoding="utf-8")
         was = f"seeds {prior.get('seeds')}" if prior else "never reviewed"
         lines.append(f"  {name}: bank re-derived from keeps -> {kept} (was {was})")
     return lines, conflicts
@@ -102,19 +103,25 @@ def main() -> int:
     t0 = time.time()
 
     print("publish: library -> game (keep-driven)")
-    lines, conflicts = resync_from_library()
+    lines, conflicts = resync_from_library(dry_run=args.check_only)
     print(f"re-sync from library: {len(lines)} line(s)"
           if lines else "re-sync from library: everything already in sync")
     for ln in lines:
         print(ln)
 
-    rc = 0
+    rc = int(bool(conflicts or (args.check_only and lines)))
     vxm = OUT / "species.vxm"
     before = _digest(vxm)
     if not args.check_only:
         rc |= run_tool("export_categories.py")
         rc |= run_tool("export_banks.py")
         rc |= run_tool("export_manifest.py")
+    try:
+        count = publishing.publish_craft(SPECS, LIBRARY, OUT / "craft", check_only=args.check_only)
+        print(f"craft: {count} approved saved models {'verified' if args.check_only else 'published'}")
+    except (OSError, ValueError) as exc:
+        print(f"craft: FAILED: {exc}")
+        rc = 1
     rc |= run_tool("enginecheck.py")
     rc |= run_tool("export_categories.py", "--check")
     after = _digest(vxm)

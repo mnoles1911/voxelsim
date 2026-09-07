@@ -49,7 +49,7 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	//
 	// The three dig sizes shifted up one rather than losing 1x1x1 -- the small
 	// dig is the one you actually use for detail work, so dropping it would
-	// have been the wrong trade. 2/3/4 now select 1/2/4 voxels.
+	// have been the wrong trade. 2/3/4 now select 1/2/3 voxels (100/200/300 mm per side).
 	// The '1' water-pour bind is DISABLED by owner ruling 2026-09-05 ("Disable
 	// the 1 hotkey to dump live water"): an accidental keypress while typing
 	// console values dumped a bucket onto the judged lake, collapsed the frame
@@ -60,7 +60,7 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	// InputComponent->BindKey(EKeys::One, IE_Pressed, this, &AVoxelEarthPlayerController::PourWaterBucket);
 	InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize1);
 	InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize2);
-	InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize4);
+	InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize3);
 
 	// --- THE HOTBAR, ON 5-9 AND NOT 1-9 ------------------------------------
 	//
@@ -585,8 +585,42 @@ void AVoxelEarthPlayerController::ClientReceiveJoinSyncChunk_Implementation(cons
 	Subsystem->ReceiveJoinSyncChunk(Bytes, bFinal);
 }
 
+#include "VoxelTreeFellingPrototype.h"
+#include "VoxelDetachedReplication.h"
+void AVoxelEarthPlayerController::ClientReceiveDetachedPacket_Implementation(const TArray<uint8>& Bytes)
+{
+	if(auto Replication=GetWorld()->GetSubsystem<UVoxelDetachedReplication>())Replication->Receive(this,Bytes);
+}
+void AVoxelEarthPlayerController::ClientReceiveDetachedMotion_Implementation(const TArray<uint8>& Bytes)
+{
+	if(auto Replication=GetWorld()->GetSubsystem<UVoxelDetachedReplication>())Replication->ReceiveMotion(this,Bytes);
+}
+void AVoxelEarthPlayerController::ServerAcknowledgeDetachedPacket_Implementation(uint32 Sequence,bool Accepted)
+{
+	if(auto Replication=GetWorld()->GetSubsystem<UVoxelDetachedReplication>())Replication->Acknowledge(this,Sequence,Accepted);
+}
+bool AVoxelEarthPlayerController::RequestChop(const FVector& CameraLoc,const FVector& CameraDir,int32 SizeVoxels)
+{
+	if(!IsLocalController())return false;
+	ServerSubmitChopIntent(CameraLoc,CameraDir,SizeVoxels);
+	return true;
+}
+bool AVoxelEarthPlayerController::ServerSubmitChopIntent_Validate(const FVector& CameraLoc,const FVector& CameraDir,int32 SizeVoxels)
+{
+	return !CameraLoc.ContainsNaN()&&!CameraDir.ContainsNaN()&&SizeVoxels>=1&&SizeVoxels<=3&&FMath::Abs(CameraDir.SizeSquared()-1.0)<.05;
+}
+void AVoxelEarthPlayerController::ServerSubmitChopIntent_Implementation(const FVector& CameraLoc,const FVector& CameraDir,int32 SizeVoxels)
+{
+	if(!ServerSubmitChopIntent_Validate(CameraLoc,CameraDir,SizeVoxels)||!TryConsumeIntentToken(TEXT("ServerSubmitChopIntent")))return;
+	const APawn* ControlledPawn=GetPawn();const double Now=GetWorld()->GetTimeSeconds();
+	if(!ControlledPawn||FVector::DistSquared(CameraLoc,ControlledPawn->GetActorLocation())>FMath::Square(150.0)||
+	   (LastChopSeconds>=0&&Now-LastChopSeconds<.65)||!VoxelTreeFelling::IsEquipped(GetWorld()))return;
+	LastChopSeconds=Now;
+	VoxelTreeFelling::Chop(GetWorld(),CameraLoc,CameraDir.GetSafeNormal(),SizeVoxels);
+}
 void AVoxelEarthPlayerController::OnDig()
 {
+	if(VoxelTreeFelling::TrySwing(GetWorld()))return;
 	UWorld* World = GetWorld();
 	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
 	if (!Subsystem)
@@ -622,13 +656,13 @@ void AVoxelEarthPlayerController::OnPlace()
 
 void AVoxelEarthPlayerController::CycleDigSizeUp()
 {
-	// 1 -> 2 -> 4 -> 1 (m1-plan.md "Dig sizes" row).
-	DigSizeVoxels = (DigSizeVoxels >= 4) ? 1 : DigSizeVoxels * 2;
+	// 100 -> 200 -> 300 mm, capped at the normal swing size (m1-plan.md "Dig sizes" row).
+	DigSizeVoxels = FMath::Min(3, DigSizeVoxels + 1);
 }
 
 void AVoxelEarthPlayerController::CycleDigSizeDown()
 {
-	DigSizeVoxels = (DigSizeVoxels <= 1) ? 4 : DigSizeVoxels / 2;
+	DigSizeVoxels = FMath::Max(1, DigSizeVoxels - 1);
 }
 
 // `1`: a bucket of water, at the player, on demand.
@@ -668,7 +702,7 @@ void AVoxelEarthPlayerController::PourWaterBucket()
 
 void AVoxelEarthPlayerController::SelectDigSize1() { DigSizeVoxels = 1; }
 void AVoxelEarthPlayerController::SelectDigSize2() { DigSizeVoxels = 2; }
-void AVoxelEarthPlayerController::SelectDigSize4() { DigSizeVoxels = 4; }
+void AVoxelEarthPlayerController::SelectDigSize3() { DigSizeVoxels = 3; }
 
 void AVoxelEarthPlayerController::CyclePaletteMaterial()
 {

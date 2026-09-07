@@ -60,7 +60,7 @@
     "wing_aspect": 6.9,
     "wing_dihedral": 0.1,
     "wing_fold": 0.7,
-    "wing_mark": "panel",
+    "wing_mark": "none",
     "wing_shape": "slotted",
     "wing_slots": 6,
     "wing_span": 2.45,
@@ -220,8 +220,8 @@
     "bird_bill": "skin_yellow",
     "bird_eye": "skin_dark",
     "bird_head": "skin_brown",
-    "bird_head_mark": "skin_yellow",
-    "bird_mark": "plume_buff",
+    "bird_head_mark": "plume_buff",
+    "bird_mark": "skin_brown",
     "bird_wing": "skin_dark",
     "core": "heartwood",
     "fish_back": "skin_olive",
@@ -247,7 +247,7 @@
     "spacing_m": 1500.0,
     "water_max_m": 0.0
   },
-  "resolution_cm": "1",
+  "resolution_cm": "1.25",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,

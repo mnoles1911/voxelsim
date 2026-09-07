@@ -164,7 +164,7 @@ KINDS: tuple[Kind, ...] = (
          "its own angle, a muzzle, ears, optional horns or antlers and a rod "
          "tail. Three stances — standing, sprawling and bipedal. Voxel size is "
          "per species: 1 cm for a squirrel, 5 cm for a bison.", True,
-         ("quad", "herd")),
+         ("quad", "goblin", "herd")),
     # THE FIRST KIND THAT WAS NEVER ALIVE, and the first ENTITY kind
     # (ADR-0010). A canoe and a hang glider are rigid human-made objects: they
     # do not grow, they have no habit, no allometry and no species variation to
@@ -184,18 +184,11 @@ KINDS: tuple[Kind, ...] = (
     # no biome weight and produces no bank; the .vxa is loaded by the engine's
     # entity path at its own pitch. See `forge/artifact.py` and
     # `forge/manifest.py:species_record`.
-    # DISPLAY LABEL "Vehicles" (owner directive 2026-09-05: "'craft and
-    # artifacts' group is renamed to 'vehicles'. Raft, canoe, and glider
-    # specs all belong to this"). The KEY stays `artifact` -- it is spec
-    # identity, cvar names (voxel.Boat.Asset resolves under it) and the
-    # category mapping; the label is what a person reads and is the only
-    # thing the directive names. The `craftable` category slug and its
-    # ruling stand untouched.
-    Kind("artifact", "Vehicles",
-         "Rigid human-made craft: boats, rafts and aircraft. A lofted "
-         "closed hull with a sheer line, lashed logs on a levelled deck, or "
-         "a thin swept panel on spars. Spawned entities — own pitch, no "
-         "biome, no bank.", True,
+    # Generator identity is independent of the object's browsing subcategory.
+    # Vehicles, tools, materials and components share this procedural generator.
+    Kind("artifact", "Craftable objects",
+         "Human-made objects: vehicles, tools, materials and components. "
+         "Each asset has its own voxel pitch and transform.", True,
          ("artifact",), lattice="entity"),
 )
 

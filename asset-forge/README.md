@@ -1,5 +1,10 @@
 # asset-forge
 
+**Creature refresh (2026-09-06):** all 382 wildlife species have regenerated
+library models, joined by five goblin mobs. 368 wildlife models and all five
+goblins use 12.5 mm voxels. See the [refresh report](docs/creature-refresh-2026-09-06.md)
+for the gallery, larger-species pitch exceptions, validation and regeneration commands.
+
 Cubic-voxel environment assets for voxelsim: trees, bushes, rocks, grass, reeds,
 flowers and fish.
 

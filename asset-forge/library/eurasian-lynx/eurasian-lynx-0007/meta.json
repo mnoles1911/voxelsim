@@ -1,0 +1,51 @@
+{
+  "id": "eurasian-lynx-0007",
+  "species": "eurasian-lynx",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "fa6813852d019ad5",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "fa6813852d019ad5",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.65,
+    "length_m": 0.938,
+    "footprint_m": [
+      0.94,
+      0.26
+    ],
+    "grid_mb": 0.2,
+    "extent_vox": [
+      75,
+      21,
+      52
+    ],
+    "vox_models_needed": 1,
+    "voxels": 21747,
+    "by_material": {
+      "26": 1131,
+      "36": 4199,
+      "39": 16417
+    },
+    "ground_contact": 92,
+    "ms_grow": 1.8,
+    "ms_raster": 25.8,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 29.8
+  },
+  "problems": [],
+  "vox_models": 1
+}
