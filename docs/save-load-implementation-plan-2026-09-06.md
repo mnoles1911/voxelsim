@@ -2,6 +2,8 @@
 
 Research of the current working tree, 6 September 2026. Proposed work only; no implementation or runtime verification performed. The checkout contains substantial existing modifications and untracked object/persistence code; findings include those files, not just HEAD. No AGENTS.md was found in the checkout or its filesystem ancestors.
 
+Update, 7 September: this document records the pre-implementation audit. A separate session subsequently implemented and merged a partial transactional persistence checkpoint. Read [its handover](session-persistence-handover-2026-09-07.md) and [execution record](session-persistence-execution.md) before implementing any item below; some listed gaps have now been addressed. Session cleanup and current validation are recorded in [the planning-session handover](handover-save-load-2026-09-07.md).
+
 ## Recommendation and design constraints
 
 Extend the existing persistence into one authority-owned, transactional session checkpoint. Do not build a second terrain serializer or rely on independent subsystem shutdown saves. Single-player, listen-server and dedicated-server should use the same capture/load contract; clients receive authoritative reconstructed state through networking.
