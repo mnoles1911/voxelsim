@@ -1025,3 +1025,34 @@ NEXT, when the box frees, in order:
    water_optics.ABSORPTION_DISTANCE_M = 5.5 and SCATTERING_PER_M. Ladder
    -VoxelWaterMatScalar=AbsorptionDistanceM:5.5/3.0/2.0 at a low near-shore
    pose. No rebuild, no regen.
+
+## 2026-09-07 morning: persistence regression found + fixed in the harness; uv ladder state
+
+PERSISTENCE REGRESSION (affects the owner's launches, not just captures). The
+session-persistence merge writes `<seed>.vxlog.checkpoints/` + detached
+sidecars beside the .vxlog. The capture harness cleared only .vxlog/.vxwater,
+so every launch after the first post-merge session found committed checkpoints
+with no log -> loader: "No complete supported checkpoint generation could be
+loaded" -> VoxelSessionCheckpoint::Fail -> BeginPlayerSession returns early ->
+no player session, fine tiles stall at 1 (vs 4), and at low altitude the frame
+is a VOID (camera in unloaded space). Fixed in tools/voxel-capture.ps1
+(e90f7f7): the clear now includes the checkpoints dir and sidecars. Proven:
+captures at 05:17/05:20 show refused=0, tiles=4 again. The loader's refusal is
+left alone -- for a real player a vanished log under committed checkpoints IS
+suspicious; that semantic belongs to the persistence lane. Note for the owner:
+the fixture seed 20260719 is also his play seed.
+
+INVALIDATED BY THE ABOVE (do not cite): shore-foam ladder frames 00820/00822
+(different shoreline than baseline = stalled world), uvstep 0.55 frame 00824
+and the T=0 "control" 00826 (both void). Withdrawn: "uv never reaches 0.55".
+
+STILL STANDING, on healthy sessions: uvstep T=0.51 (00828) and T=0.52 (00830)
+painted NO red/green anywhere across the lake. That is a real null only if the
+T=0 control paints the whole lake; the control has not yet run on a healthy
+session. NEXT (box permitting): T=0 control -> then re-run shore-foam ladder
+(ship / ShelfHi 2.0 / ShelfHi 100 single-pair -- the two-pair "off" arm did not
+echo its second scalar and is not trusted).
+
+Also: Codex is running automation in a scratch checkout
+(.scratch/environment-verification) that occupies the box; two of my captures
+overlapped it. Visual validity holds (fixed pose, frozen sun); timing does not.
