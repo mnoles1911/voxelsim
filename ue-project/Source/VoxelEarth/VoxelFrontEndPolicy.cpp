@@ -60,6 +60,8 @@ struct FNamedException
 	const TCHAR* Reason;
 };
 const FNamedException kSelfDrivingExtras[] = {
+	{TEXT("VoxelEnvironmentLODCapture"), TEXT("environment fixture: poses the camera, captures LOD transitions and exits")},
+	{TEXT("VoxelTreeFellingCapture"), TEXT("tree fixture: performs timed axe swings and captures the falling tree")},
 	{TEXT("VoxelPerfRun"), TEXT("perf harness: flies a fixed path and exits on its own watchdog")},
 	{TEXT("VoxelPerfStaticAt"), TEXT("perf harness: poses the camera and measures, no input")},
 	{TEXT("VoxelExecCmds"), TEXT("runs a console script at a timed offset; -VoxelExecAfter is its delay")},
@@ -103,6 +105,10 @@ const FNamedException kSelfDrivingExtras[] = {
 // taken from that file rather than re-judged here, and
 // VoxelEarth.FrontEnd.SwitchPolicy fails if the two ever drift apart.
 const FNamedException kRule5Exemptions[] = {
+	{TEXT("VoxelDumpIndexKeys"), TEXT("'Dump': logs resident index keys during ordinary streaming; does not drive or end the run")},
+	{TEXT("VoxelSkyMarkVerify"), TEXT("'Verify': samples the generator during normal streaming to check sky marks")},
+	{TEXT("VoxelSkyMarkVerifyGrid"), TEXT("'Verify': sample grid size for the streaming correctness diagnostic")},
+	{TEXT("VoxelSkyMarkVerifyStride"), TEXT("'Verify': sampling stride for the streaming correctness diagnostic")},
 	{TEXT("VoxelBucketedExitScanVerify"), TEXT("'Verify': correctness arm for the eviction index's bucketed exit scan; verifies DURING a normal run")},
 	{TEXT("VoxelGpuMeshInFlight"), TEXT("'Flight', as a SUFFIX: a job in-flight cap, pure tuning -- the case that proves a suffix rename cannot fix this class")},
 	{TEXT("VoxelGpuWorklistVerifyCT"), TEXT("'Verify': byte gate for the worklist ClassifyTotals stage; adds a compare pass and ends nothing")},

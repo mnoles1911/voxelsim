@@ -5795,7 +5795,8 @@ void FlushSweIntoCA(FVoxelWaterImpl& Impl, const TCHAR* Reason)
 
 void MaybeRelatchImplicitOcean(FVoxelWaterImpl& Impl)
 {
-    if (Impl.bImplicitOceanPinned) return;
+	// A restored session owns this setting; process defaults cannot relatch it.
+	if (Impl.bImplicitOceanPinned) return;
 	const bool bWant = CVarVoxelWaterImplicitOcean.GetValueOnGameThread();
 	if (bWant == Impl.bImplicitOcean)
 	{

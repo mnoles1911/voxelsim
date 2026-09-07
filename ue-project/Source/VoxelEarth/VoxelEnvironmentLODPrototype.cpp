@@ -35,7 +35,7 @@
 #include "voxelcore/raycast.h"
 
 namespace {
-constexpr int64 kMaxGridCells=64*1024*1024;
+constexpr int64 kEnvironmentMaxGridCells=64*1024*1024;
 struct FPrototypeGrid {
     FIntVector Size, Origin;
     double Mm=100;
@@ -150,7 +150,7 @@ struct FEnvironmentLODState {
     FVector LastChopDirection=FVector::ForwardVector;
 };
 namespace {
-struct FMeshGeometry
+struct FEnvironmentMeshGeometry
 {
 	uint32 MeshKey = 0;
 	TArray<FVector3f> Positions;
@@ -163,11 +163,11 @@ struct FMeshGeometry
 	uint64 SolidVoxels = 0;
 };
 
-struct FPaletteLinear
+struct FEnvironmentPaletteLinear
 {
 	FLinearColor Face[vxc::kMaterialCount][vxc::kFaceClassCount];
 	uint8 Jitter[vxc::kMaterialCount];
-	FPaletteLinear()
+	FEnvironmentPaletteLinear()
 	{
 		for (uint32 M = 0; M < uint32(vxc::kMaterialCount); ++M)
 		{
@@ -182,17 +182,17 @@ struct FPaletteLinear
 	}
 };
 
-const FPaletteLinear& PaletteLinear()
+const FEnvironmentPaletteLinear& EnvironmentPaletteLinear()
 {
-	static const FPaletteLinear P; // thread-safe magic-static init
+	static const FEnvironmentPaletteLinear P; // thread-safe magic-static init
 	return P;
 }
 
-void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FMeshGeometry& Out, const FIntVector& Min, const FIntVector& Max)
+void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FEnvironmentMeshGeometry& Out, const FIntVector& Min, const FIntVector& Max)
 {
 	const int32 SX = Grid.sizeX(), SY = Grid.sizeY(), SZ = Grid.sizeZ();
 	const int64 Cells = int64(SX) * int64(SY) * int64(SZ);
-	if (Cells <= 0 || Cells > kMaxGridCells)
+	if (Cells <= 0 || Cells > kEnvironmentMaxGridCells)
 	{
 		return;
 	}
@@ -212,7 +212,7 @@ void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FMeshGeo
 	const float PitchUU = float(double(Grid.voxelSizeMm()) * 0.1);
 	const int32 Origin[3] = {Grid.originX(), Grid.originY(), Grid.originZ()};
 
-	const FPaletteLinear& Pal = PaletteLinear();
+	const FEnvironmentPaletteLinear& Pal = EnvironmentPaletteLinear();
 	const uint64 JitterSeed = (uint64(MeshKey) << 1) | 1u;
 
 	static const FVector3f AxisDir[3] = {FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1)};
@@ -318,7 +318,7 @@ void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FMeshGeo
 }
 
 
-void ApplyGeometry(UProceduralMeshComponent* Component,const FMeshGeometry& Geometry){
+void ApplyGeometry(UProceduralMeshComponent* Component,const FEnvironmentMeshGeometry& Geometry){
         TArray<FVector> Positions,Normals;TArray<FVector2D> UVs,WindUVs;
         TArray<FLinearColor> Colors;TArray<FProcMeshTangent> Tangents;TArray<int32> Indices;
         const int32 Count=Geometry.Positions.Num();
@@ -337,7 +337,7 @@ void ApplyGeometry(UProceduralMeshComponent* Component,const FMeshGeometry& Geom
 
 } // namespace
 struct FEnvironmentStagedRestore {
-    struct FSection {int32 Level=0;FIntVector Key;FMeshGeometry Mesh;};
+    struct FSection {int32 Level=0;FIntVector Key;FEnvironmentMeshGeometry Mesh;};
     TAtomic<bool> Cancelled{false};
     FVoxelImmutableGeometry Geometry;
     TFunction<void(bool)> Completion;
@@ -367,7 +367,7 @@ bool AVoxelEnvironmentLODPrototype::InitializeAsset(const FString& Name,int32 Fi
     FPrototypeGrid Grid;Grid.Size=FIntVector(Source.sizeX(),Source.sizeY(),Source.sizeZ());
     Grid.Origin=FIntVector(Source.originX(),Source.originY(),Source.originZ());Grid.Mm=FinestMm;
     const int64 Cells=int64(Grid.Size.X)*Grid.Size.Y*Grid.Size.Z;
-    if(Source.voxelSizeMm()!=FinestMm||Cells<=0||Cells>kMaxGridCells)return false;
+    if(Source.voxelSizeMm()!=FinestMm||Cells<=0||Cells>kEnvironmentMaxGridCells)return false;
     Grid.Data.SetNumZeroed(int32(Cells));
     for(int X=0;X<Grid.Size.X;++X)for(int Y=0;Y<Grid.Size.Y;++Y)
         Source.columnRuns(X,Y,[&](int Z,int Len,vxc::MaterialId M){for(int I=Z;I<Z+Len;++I)Grid.Data[Grid.Index(X,Y,I)]=uint8(M);});
@@ -395,7 +395,7 @@ bool AVoxelEnvironmentLODPrototype::PersistentState(FArchive& Ar) {
     const int64 Cells=int64(Grid.Size.X)*Grid.Size.Y*Grid.Size.Z;
     if(Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
     for(int32 Axis=0;Axis<3;++Axis)if(FMath::Abs(int64(Grid.Origin[Axis]))>1000000)return false;
-    if(Cells>kMaxGridCells||(Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100))return false;
+    if(Cells>kEnvironmentMaxGridCells||(Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100))return false;
     if(Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
     for(int32 Axis=0;Axis<3;++Axis)if(FMath::Abs(int64(Grid.Origin[Axis]))>1000000)return false;
     if(!VoxelDetachedPersistence::Bytes(Ar,Grid.Data)||Grid.Data.Num()!=Cells)return false;
@@ -467,7 +467,7 @@ void AVoxelEnvironmentLODPrototype::BeginStagedObjectRestore(FVoxelImmutableGeom
             D<<Job->Kind<<Job->Transform<<Grid.Size<<Grid.Origin<<Grid.Mm<<Grid.MaxDataZ<<Job->Collision<<Job->Severed;
             if(D.IsError()||D.Tell()!=D.TotalSize()||Job->Kind<0||Job->Kind>3||Job->Transform.ContainsNaN()||Grid.Size.GetMin()<=0||Grid.Size.GetMax()>4096)return false;
             const int64 Cells=int64(Grid.Size.X)*Grid.Size.Y*Grid.Size.Z;
-            if(Cells>kMaxGridCells||(Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100)||Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
+            if(Cells>kEnvironmentMaxGridCells||(Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100)||Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
             for(int A=0;A<3;++A)if(FMath::Abs(int64(Grid.Origin[A]))>1000000)return false;
             if(!VoxelDetachedPersistence::Bytes(G,Grid.Data)||Grid.Data.Num()!=Cells||G.Tell()!=G.TotalSize())return false;
             Job->WoodPerLayer.Init(0,Grid.Size.Z);
@@ -512,7 +512,7 @@ bool AVoxelEnvironmentLODPrototype::AdvanceStagedObjectRestore(){
     }
     if(Job->Next<Job->Meshes.Num()){
         auto& S=Job->Meshes[Job->Next++];auto C=NewObject<UVoxelPlantMeshComponent>(this);C->SetupAttachment(Levels[S.Level]);C->SetMobility(EComponentMobility::Movable);C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetMaterial(0,Materials[S.Level]);C->SetVisibility(false);C->RegisterComponent();
-        ApplyGeometry(C,S.Mesh);Sections.Add(C);State->SectionMaps[S.Level].Add(S.Key,C);S.Mesh=FMeshGeometry();return true;
+        ApplyGeometry(C,S.Mesh);Sections.Add(C);State->SectionMaps[S.Level].Add(S.Key,C);S.Mesh=FEnvironmentMeshGeometry();return true;
     }
     GeometrySnapshot=Job->Geometry;ActiveLOD=0;PreviousLOD=-1;SetLevelVisible(0,true);
     PreparedRestore=Job;StagedRestore.Reset();
@@ -565,7 +565,7 @@ void AVoxelEnvironmentLODPrototype::RebuildSections(int32 L,const FIntVector& Mi
     for(int Z=Min.Z/Edge;Z<=(Max.Z-1)/Edge;++Z){
         const FIntVector Key(X,Y,Z),Lo=Key*Edge;
         const FIntVector Hi(FMath::Min(Lo.X+Edge,Grid.Size.X),FMath::Min(Lo.Y+Edge,Grid.Size.Y),FMath::Min(Lo.Z+Edge,Grid.Size.Z));
-        FMeshGeometry Geometry;Geometry.MeshKey=GetTypeHash(AssetName);
+        FEnvironmentMeshGeometry Geometry;Geometry.MeshKey=GetTypeHash(AssetName);
         BuildNaiveFaceGeometry(Grid,Geometry.MeshKey,Geometry,Lo,Hi);
         auto Existing=State->SectionMaps[L].Find(Key);
         if(Geometry.Indices.IsEmpty()){
@@ -680,7 +680,7 @@ bool AVoxelEnvironmentLODPrototype::Carve(const FVector& Hit,int32 SizeVoxels) {
         // Slow oracle is opt-in and deliberately outside the edit timing.
         // It catches lost or duplicate faces at section seams after carving.
         for(int L=0;L<State->Grids.Num();++L){
-            FMeshGeometry Reference;const auto& G=State->Grids[L];
+            FEnvironmentMeshGeometry Reference;const auto& G=State->Grids[L];
             BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Reference,FIntVector::ZeroValue,G.Size);
             int32 Triangles=0;for(const auto& Pair:State->SectionMaps[L])Triangles+=Pair.Value->GetProcMeshSection(0)->ProcIndexBuffer.Num()/3;
             checkf(Triangles==Reference.Indices.Num()/3,TEXT("Section face count differs from full mesh"));
@@ -728,11 +728,11 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
     const double Split=FMath::RoundToDouble((Plane+Top)*.5/160.)*160.;
     const int SplitZ=FMath::RoundToInt(Split/(Fine.Mm*.1))-Fine.Origin.Z;
     for(int Side=0;Side<2;++Side){
-        FMeshGeometry Cap;const float P=float(Fine.Mm*.1);
+        FEnvironmentMeshGeometry Cap;const float P=float(Fine.Mm*.1);
         for(int X=0;X<Fine.Size.X;++X)for(int Y=0;Y<Fine.Size.Y;++Y){
             if(!Fine.At(X,Y,SplitZ-1)||!Fine.At(X,Y,SplitZ))continue;
             const auto M=Fine.At(X,Y,Side?SplitZ:SplitZ-1);
-            const auto Color=PaletteLinear().Face[(M==16||M==18)?17:M][vxc::kFaceTop];
+            const auto Color=EnvironmentPaletteLinear().Face[(M==16||M==18)?17:M][vxc::kFaceTop];
             const uint32 B=Cap.Positions.Num();const float FX=(X+Fine.Origin.X)*P,FY=(Y+Fine.Origin.Y)*P;
             Cap.Positions.Append({FVector3f(FX,FY,Split),FVector3f(FX,FY+P,Split),FVector3f(FX+P,FY+P,Split),FVector3f(FX+P,FY,Split)});
             for(int V=0;V<4;++V){Cap.Normals.Add(FVector3f(0,0,Side?-1:1));Cap.TangentsX.Add(FVector3f(1,0,0));Cap.Colors.Add(FVector4f(Color.R,Color.G,Color.B,1));Cap.UVs.Add(FVector2f::ZeroVector);}
@@ -753,7 +753,7 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
                 State->SectionMaps[L].Remove(Key);Sections.Remove(C);
                 if(L==0){C->SetMaterial(0,Material);Moving.Add(C);}else C->DestroyComponent();
             }else if(L==0&&Lo.Z+Edge>Cut){
-                FMeshGeometry Geometry;const FIntVector UpperLo(Lo.X,Lo.Y,Cut);
+                FEnvironmentMeshGeometry Geometry;const FIntVector UpperLo(Lo.X,Lo.Y,Cut);
                 const FIntVector Hi(FMath::Min(Lo.X+Edge,G.Size.X),FMath::Min(Lo.Y+Edge,G.Size.Y),FMath::Min(Lo.Z+Edge,G.Size.Z));
                 BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Geometry,UpperLo,Hi);
                 if(!Geometry.Indices.IsEmpty()){
@@ -788,7 +788,7 @@ bool AVoxelStoneAxePrototype::Initialize(){
     if(G.Mm!=12.5||int64(G.Size.X)*G.Size.Y*G.Size.Z>1000000)return false;
     G.Data.SetNumZeroed(G.Size.X*G.Size.Y*G.Size.Z);
     for(int X=0;X<G.Size.X;++X)for(int Y=0;Y<G.Size.Y;++Y)Source.columnRuns(X,Y,[&](int Z,int Len,vxc::MaterialId M){for(int I=Z;I<Z+Len;++I)G.Data[G.Index(X,Y,I)]=uint8(M);});
-    FMeshGeometry Geometry;BuildNaiveFaceGeometry(G,1,Geometry,FIntVector::ZeroValue,G.Size);ApplyGeometry(Mesh,Geometry);
+    FEnvironmentMeshGeometry Geometry;BuildNaiveFaceGeometry(G,1,Geometry,FIntVector::ZeroValue,G.Size);ApplyGeometry(Mesh,Geometry);
     auto Base=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/Voxel/M_VoxelEnvironmentLOD.M_VoxelEnvironmentLOD"));
     auto Material=UMaterialInstanceDynamic::Create(Base,this);Material->SetScalarParameterValue(TEXT("Fade"),1);Material->SetScalarParameterValue(TEXT("Reverse"),0);Material->SetScalarParameterValue(TEXT("WindEnabled"),0);Mesh->SetMaterial(0,Material);
     UE_LOG(LogVoxelEarth,Log,TEXT("TreeFelling AXE loaded pitchMm=12.5 faces=%d"),Geometry.Indices.Num()/6);return true;
@@ -1023,4 +1023,3 @@ void StartFromCommandLine(UWorld* World){
     World->GetTimerManager().SetTimer(Timer,[WeakWorld,Capture](){if(auto W=WeakWorld.Get())SpawnEnvironmentPrototype(W,Capture);},10.f,false);
 }
 }
-

@@ -2802,7 +2802,9 @@ void voxelizeColumnInto(GpuColumnSample col,
                         int brickZMin, uint bricksZ,
                         uint2 t, uint bricksX, uint cellBase)
 {
+    // lint-shader-ub: allow SIGNED_DIVISION - t is a uint2 parameter; both component divisions and divisors are unsigned
     const uint bx = t.x / 8u, by = t.y / 8u;
+    // lint-shader-ub: allow SIGNED_DIVISION - t is a uint2 parameter; both component remainders and divisors are unsigned
     const uint lx = t.x % 8u, ly = t.y % 8u;
     const uint footprintIndex = bx + bricksX * by;
 
