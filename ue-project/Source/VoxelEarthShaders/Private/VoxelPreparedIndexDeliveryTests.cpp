@@ -47,6 +47,13 @@ bool FVoxelPreparedIndexDeliveryTest::RunTest(const FString&)
     TestEqual(TEXT("Wrong sink leaves resident unchanged"),Pool.SnapshotAllocation(A).AddSequence,Old.AddSequence);
     TestEqual(TEXT("Wrong sink releases reserved credit"),Index.GetReservedPilotIndexBytes(),uint64(0));
     Install();
+    auto PoolToken=Pool.PreparePreparedBatch(Pages());
+    TestTrue(TEXT("Pool token reserves real index delivery"),PoolToken.IsValid() && Pool.ValidatePreparedBatch(PoolToken));
+    TestTrue(TEXT("Pool reservation holds index credits"),Index.GetReservedPilotIndexBytes()>0);
+    RetainedDelivery.Reset(); // fixture must not separately retain the index lease
+    Pool.CancelPreparedBatch(PoolToken);
+    TestEqual(TEXT("Pool cancellation returns index credits"),Index.GetReservedPilotIndexBytes(),uint64(0));
+    if(PoolToken) TestEqual(TEXT("Retained cancelled pool token releases snapshots"),PoolToken->GetRetainedBytes(),uint64(0));
     auto Cancel=Index.DebugPrepareIndexForTest(Prospective);
     TestTrue(TEXT("Explicit reservation is valid"),Cancel.IsValid() && Cancel->ValidateForCommit());
     const uint64 Reserved=Index.GetReservedPilotIndexBytes();

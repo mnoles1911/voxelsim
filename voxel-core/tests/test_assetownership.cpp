@@ -54,6 +54,27 @@ VXC_TEST(asset_ownership_identity_leaves_authority_intact) {
     CHECK_EQ(authoritative.size(),2u);
     CHECK(authoritative[0]==a); // collision/edit source is never filtered
 }
+VXC_TEST(asset_ownership_publication_rejects_reentrant_mutation) {
+    AssetRenderOwnership state;AssetProvenance source;source.worldSeed=91;
+    const std::vector<AssetRenderPage> pages{{0,0,0,0,AssetCpu}};
+    const auto ticket=state.begin(source,AssetRenderOwner::Object,1,1,pages);
+    CHECK(state.objectReady(ticket,1));CHECK(state.pageReady(ticket,pages[0],AssetCpu,1));
+    auto callback=[&](const auto& before,const auto& after,const auto&) {
+        CHECK(!state.cancel(ticket));
+        CHECK(!state.objectReady(ticket,1));
+        CHECK(!state.pageReady(ticket,pages[0],AssetCpu,1));
+        CHECK(!state.begin(source,AssetRenderOwner::Terrain,1,1,pages).serial);
+        CHECK(!state.publish(ticket,[](auto&,auto&,auto&){return true;}));
+        CHECK(state.target(ticket)!=nullptr);
+        CHECK(!before.objectOwns(source));CHECK(after.objectOwns(source));
+        return false;
+    };
+    CHECK(!state.publish(ticket,callback));CHECK(state.ready(ticket));
+    CHECK(state.publish(ticket,[&](const auto& before,const auto& after,const auto& touched){
+        callback(before,after,touched);return true;
+    }));
+    CHECK(state.visible().objectOwns(source));CHECK_EQ(state.visible().generation,1u);
+}
 VXC_TEST(asset_resolved_instances_preserve_bank_provenance) {
     std::vector<uint8_t> bytes;auto word=[&](uint32_t value){for(int i=0;i<4;++i)bytes.push_back(uint8_t(value>>(8*i)));};
     word(kVxaMagic);word(3);word(0);word(0);word(0);word(1);word(1);word(1);word(100);word(1);word(0);word(0);

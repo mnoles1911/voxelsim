@@ -444,8 +444,11 @@ bool AVoxelEnvironmentLODPrototype::RefreshGeometrySnapshot(){
     return true;
 }
 bool AVoxelEnvironmentLODPrototype::CaptureObjectState(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic){
+    return CaptureStateForCommit(Geometry,Dynamic,false);
+}
+bool AVoxelEnvironmentLODPrototype::CaptureStateForCommit(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic,bool AllowPrepared){
     check(IsInGameThread());Geometry.Reset();Dynamic.Reset();
-    if(StagedRestore||PreparedRestore||!GeometrySnapshot||State->Grids.IsEmpty())return false;
+    if(StagedRestore||(!AllowPrepared&&PreparedRestore)||!GeometrySnapshot||State->Grids.IsEmpty())return false;
     auto Descriptor=SourceDescriptor;if(!Descriptor.IsValid())return false;
     auto& Grid=State->Grids[0];FTransform Transform=GetActorTransform();
     bool Collision=State->Collision,Severed=State->Severed;
@@ -464,6 +467,7 @@ bool AVoxelEnvironmentLODPrototype::RestoreObjectState(const TArray<uint8>& Geom
     return PersistentState(Reader)&&!Reader.IsError()&&Reader.Tell()==Reader.TotalSize();
 }
 void AVoxelEnvironmentLODPrototype::CancelStagedObjectRestore(){
+    ProductionCommitSerial.Invalidate();
     check(IsInGameThread());auto Job=StagedRestore?MoveTemp(StagedRestore):MoveTemp(PreparedRestore);if(!Job)return;
     Job->Cancelled.Store(true);
     if(Job->Adopted){
@@ -565,14 +569,70 @@ bool AVoxelEnvironmentLODPrototype::IsStagedRenderResourcesPending() const {
     check(IsInGameThread());return StagedRestore&&StagedRestore->RenderFenceBegun;
 }
 void AVoxelEnvironmentLODPrototype::MarkUnpublishedPreparation(){
-    check(IsInGameThread());bUnpublishedPreparation=true;
+    check(IsInGameThread());ProductionCommitSerial.Invalidate();bUnpublishedPreparation=true;
     SetActorHiddenInGame(true);SetActorEnableCollision(false);SetActorTickEnabled(false);
 }
+// Opaque, immutable preparation evidence. Weak actor/job identities prevent
+// replay after cancellation, restaging, destruction, or another actor instance.
+struct FVoxelEnvironmentProductionCommit {
+    TWeakObjectPtr<AVoxelEnvironmentLODPrototype> Actor;
+    TWeakPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe> Restore;
+    FGuid Serial;
+    int32 Revision=0;
+    FVoxelImmutableGeometry Geometry;
+    TArray<uint8> Dynamic;
+    FTransform Transform;
+    TArray<TWeakObjectPtr<UActorComponent>> Components;
+};
+FVoxelEnvironmentProductionCommitRef AVoxelEnvironmentLODPrototype::PrepareProductionCommit(
+    FVoxelImmutableGeometry Geometry,const TArray<uint8>& Dynamic,const FTransform& Transform)
+{
+    check(IsInGameThread());
+    ProductionCommitSerial.Invalidate();
+    if(!IsValid(this)||!bUnpublishedPreparation||!PreparedRestore||!PreparedRestore->Adopted||
+       !PreparedRestore->RenderFenceBegun||!PreparedRestore->RenderFence.IsFenceComplete()||
+       !IsHidden()||GetActorEnableCollision()||IsActorTickEnabled()||Dynamic.Num()>4096)return {};
+    FVoxelImmutableGeometry Captured;TArray<uint8> Header;
+    if(!CaptureStateForCommit(Captured,Header,true)||Captured!=Geometry||Header!=Dynamic||!GetActorTransform().Equals(Transform,0.))return {};
+    auto Token=MakeShared<FVoxelEnvironmentProductionCommit,ESPMode::ThreadSafe>();
+    Token->Actor=this;Token->Restore=PreparedRestore;Token->Revision=State->Revision;
+    Token->Geometry=MoveTemp(Geometry);Token->Dynamic=Dynamic;Token->Transform=Transform;
+    Token->Components.Add(GetRootComponent());
+    for(auto C:Levels)Token->Components.Add(C.Get());
+    for(auto C:Sections)Token->Components.Add(C.Get());
+    for(const auto& Weak:Token->Components){auto C=Weak.Get();if(!IsValid(C)||!C->IsRegistered()||C->IsRenderStateDirty())return {};}
+    ProductionCommitSerial=FGuid::NewGuid();Token->Serial=ProductionCommitSerial;return Token;
+}
+bool AVoxelEnvironmentLODPrototype::ValidateProductionCommit(const FVoxelEnvironmentProductionCommitRef& Token)
+{
+    check(IsInGameThread());
+    if(!Token||Token->Actor.Get()!=this||!IsValid(this)||!Token->Serial.IsValid()||Token->Serial!=ProductionCommitSerial||
+       Token->Restore.Pin()!=PreparedRestore||!PreparedRestore||!bUnpublishedPreparation||State->Revision!=Token->Revision||
+       !IsHidden()||GetActorEnableCollision()||IsActorTickEnabled()||!GetActorTransform().Equals(Token->Transform,0.)||
+       Token->Components.Num()!=1+Levels.Num()+Sections.Num())return false;
+    int32 I=0;
+    const auto Same=[&](UActorComponent* C){return IsValid(C)&&C->IsRegistered()&&!C->IsRenderStateDirty()&&Token->Components[I++].Get()==C;};
+    if(!Same(GetRootComponent()))return false;
+    for(auto C:Levels)if(!Same(C))return false;
+    for(auto C:Sections)if(!Same(C))return false;
+    FVoxelImmutableGeometry Geometry;TArray<uint8> Dynamic;
+    return CaptureStateForCommit(Geometry,Dynamic,true)&&Geometry==Token->Geometry&&Dynamic==Token->Dynamic;
+}
+void AVoxelEnvironmentLODPrototype::CommitPreparedProduction(const FVoxelEnvironmentProductionCommitRef& Token)
+{
+    check(IsInGameThread());
+    if(!ValidateProductionCommit(Token)){checkf(false,TEXT("Invalid prepared actor commit token"));return;}
+    // No render visibility, collision, ticking, or Actors discovery mutation.
+    // PreparedRestore remains available to the future render-boundary latch.
+    ProductionCommitSerial.Invalidate();bUnpublishedPreparation=false;
+}
 bool AVoxelEnvironmentLODPrototype::PublishStagedObjectRestore(){
+    ProductionCommitSerial.Invalidate();
     check(IsInGameThread());if(!PreparedRestore)return false;
     PreparedRestore.Reset();bUnpublishedPreparation=false;Actors.AddUnique(this);SetActorHiddenInGame(false);SetActorEnableCollision(true);SetActorTickEnabled(true);return true;
 }
 void AVoxelEnvironmentLODPrototype::Rebuild() {
+    ProductionCommitSerial.Invalidate();
     GeometrySnapshot.Reset();
     if(State->Grids.IsEmpty())return;
     const double Start=FPlatformTime::Seconds();

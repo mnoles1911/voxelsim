@@ -5,6 +5,7 @@
 class AActor;
 class UWorld;
 struct FVoxelEnvironmentAssetDescriptor;
+struct FVoxelEnvironmentProductionCommit;
 
 // Game-thread registry. Snapshot byte handles alone may cross to workers.
 namespace VoxelObjects
@@ -56,6 +57,8 @@ struct FProductionReservation {
     FGuid Id,RegistryNonce,Serial;
     bool IsValid() const {return Id.IsValid()&&RegistryNonce.IsValid()&&Serial.IsValid();}
 };
+struct FPreparedProductionCommit;
+using FPreparedProductionCommitRef=TSharedPtr<const FPreparedProductionCommit,ESPMode::ThreadSafe>;
 class FRegistry
 {
 public:
@@ -72,6 +75,13 @@ public:
     // Caller must prevalidate fallible work and pair reveal/bind in a non-yielding
     // GT transaction with the renderer publication boundary; not yet wired in World.
     bool CommitProduction(const FProductionReservation& Ticket);
+    // Prepare/validate hidden actor and immutable reserved entry. Commit requires
+    // immediate successful validation on GT, without intervening mutation/yield.
+    // It binds logical state only; no actor reveal or render-frame guarantee.
+    FPreparedProductionCommitRef PrepareProductionCommit(const FProductionReservation& Ticket);
+    bool ValidatePreparedProduction(const FPreparedProductionCommitRef& Token);
+    void CommitPreparedProduction(const FPreparedProductionCommitRef& Token);
+
     bool RollbackProduction(const FProductionReservation& Ticket);
     int32 NumProductionReservations() const {return Reservations.Num();}
     FGuid Bind(AActor* Actor, uint8 Kind, FGuid Id = FGuid());
@@ -95,7 +105,7 @@ public:
     static bool ShouldEvict(const FEntry& Entry, const TArray<FView>& Views, double DistanceCm);
     int32 Num() const { return Entries.Num(); }
 private:
-    struct FReservedProduction {FProductionReservation Ticket;FEntry Entry;bool HadActor=false;};
+    struct FReservedProduction {FProductionReservation Ticket;FEntry Entry;bool HadActor=false;FGuid CommitSerial;};
     FGuid RegistryNonce=FGuid::NewGuid();
     TMap<FGuid,FReservedProduction> Reservations;
     bool ActorReserved(const AActor* Actor) const;

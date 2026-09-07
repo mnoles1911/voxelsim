@@ -1681,8 +1681,55 @@ uint64 FVoxelBrickPoolBuffers::GetCapacityBytes() const
 // FVoxelBrickPool
 // ---------------------------------------------------------------------------
 
-FVoxelBrickPool::FVoxelBrickPool() = default;
-FVoxelBrickPool::~FVoxelBrickPool() = default;
+struct FVoxelBrickPreparedPoolLifetime { FVoxelBrickPool* Owner=nullptr; };
+struct FVoxelBrickPreparedBatch::FState
+{
+    struct FReserved { FVoxelGpuPoolAllocation Desc,Occ,Mat; };
+    struct FGpuShape { uint32 Occ=0,Mat=0,BrickFirst=0,ChunkIndex=0,OccFirst=0,MatFirst=0; FIntVector Origin=FIntVector::ZeroValue; };
+    TSharedPtr<FVoxelBrickPreparedPoolLifetime,ESPMode::ThreadSafe> Lifetime;
+    TArray<FVoxelBrickPreparedReplacement> Pages;
+    TArray<FVoxelBrickChunkKey> Absent;
+    TArray<FReserved> Reserved;
+    TArray<FGpuShape> GpuShapes;
+    FVoxelBrickPreparedIndexDeliveryRef Delivery;
+    FVoxelBrickEvictionPinTicket Ticket;
+    FGuid Epoch;
+    uint64 Mutation=0,Sink=0;
+    bool Ready=false,Consumed=false;
+};
+FVoxelBrickPreparedBatch::FVoxelBrickPreparedBatch() : State(MakeUnique<FState>()) {}
+FVoxelBrickPreparedBatch::~FVoxelBrickPreparedBatch()
+{
+    check(IsInGameThread());
+    if (State && State->Lifetime && State->Lifetime->Owner)
+        State->Lifetime->Owner->ReleasePreparedBatchState(*State);
+}
+uint64 FVoxelBrickPreparedBatch::GetRetainedBytes() const
+{
+    check(IsInGameThread());
+    uint64 Bytes=uint64(State->Pages.GetAllocatedSize())+uint64(State->Absent.GetAllocatedSize())+uint64(State->Reserved.GetAllocatedSize())+uint64(State->GpuShapes.GetAllocatedSize());
+    for (const auto& P:State->Pages) if (P.CpuPack)
+        Bytes+=uint64(P.CpuPack->Desc.GetAllocatedSize())+uint64(P.CpuPack->Occ.GetAllocatedSize())+uint64(P.CpuPack->Mat.GetAllocatedSize())+sizeof(FVoxelBrickCpuPack);
+    return Bytes;
+}
+FVoxelBrickPool::FVoxelBrickPool() : PreparedLifetime(MakeShared<FVoxelBrickPreparedPoolLifetime,ESPMode::ThreadSafe>())
+{ PreparedLifetime->Owner=this; }
+FVoxelBrickPool::~FVoxelBrickPool()
+{
+    check(IsInGameThread());
+    if (auto Token=ActivePreparedBatch.Pin()) ReleasePreparedBatchState(*Token->State);
+    PreparedLifetime->Owner=nullptr;
+}
+void FVoxelBrickPool::ReleasePreparedBatchState(FVoxelBrickPreparedBatch::FState& S)
+{
+    check(IsInGameThread());
+    if (!S.Consumed && S.Epoch==EvictionPinNonce)
+        for (const auto& R:S.Reserved)
+        { if(R.Desc.IsValid())DescArena.Free(R.Desc); if(R.Occ.IsValid())OccArena.Free(R.Occ); if(R.Mat.IsValid())MatArena.Free(R.Mat); }
+    S.Consumed=true; S.Ready=false;
+    S.Pages.Empty(); S.Absent.Empty(); S.Reserved.Empty(); S.GpuShapes.Empty(); S.Delivery.Reset();
+}
+
 
 void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 {
@@ -2621,6 +2668,7 @@ FVoxelBrickEvictionPinTicket FVoxelBrickPool::AcquireEvictionPins(TConstArrayVie
         if (Unique.Contains(Key) || EvictionPins.Contains(Key)) return Ticket;
         Unique.Add(Key);
     }
+    ++IndexMutationSequence;
     Ticket.PoolNonce = EvictionPinNonce;
     Ticket.Serial = ++NextEvictionPinSerial;
     auto& Stored = EvictionPinTickets.Add(Ticket.Serial);
@@ -2635,6 +2683,7 @@ bool FVoxelBrickPool::ReleaseEvictionPins(FVoxelBrickEvictionPinTicket Ticket)
     if (Ticket.PoolNonce != EvictionPinNonce) return false;
     const auto* Keys = EvictionPinTickets.Find(Ticket.Serial);
     if (!Keys) return false;
+    ++IndexMutationSequence;
     for (const auto& Key : *Keys) EvictionPins.Remove(Key);
     EvictionPinTickets.Remove(Ticket.Serial);
     // A protected key may have been passed by the cursor. Re-rank lazily.
@@ -2642,61 +2691,121 @@ bool FVoxelBrickPool::ReleaseEvictionPins(FVoxelBrickEvictionPinTicket Ticket)
     return true;
 }
 
-bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages, FVoxelBrickEvictionPinTicket Ticket)
+FVoxelBrickPreparedBatchRef FVoxelBrickPool::PreparePreparedBatch(
+    const TArray<FVoxelBrickPreparedReplacement>& InputPages,FVoxelBrickEvictionPinTicket Ticket,
+    TConstArrayView<FVoxelBrickChunkKey> ExpectedAbsent,uint64 MaxAdditionalBytes)
 {
-	check(IsInGameThread());
-	if(!bInitialised||bGpuAllocArmed||!IndexSink||!IndexPreflight||Pages.IsEmpty()||Pages.Num()>8192)return false;
-	const bool HasTicket = Ticket.IsValid();
-    if (HasTicket && (Ticket.PoolNonce != EvictionPinNonce || !EvictionPinTickets.Contains(Ticket.Serial))) return false;
+    check(IsInGameThread());
+    const uint64 Limit=FMath::Min(MaxAdditionalBytes,64ull*1024*1024);
+    if(!bInitialised || bGpuAllocArmed || !IndexSink || !IndexPreflight ||
+        (InputPages.IsEmpty() && ExpectedAbsent.IsEmpty()) || InputPages.Num()>8192 ||
+        ExpectedAbsent.Num()>8192-InputPages.Num() || ActivePreparedBatch.IsValid() ||
+        NextAddSequence>MAX_uint64-uint64(InputPages.Num())) return {};
+    const bool HasTicket=Ticket.IsValid();
+    if(HasTicket && (Ticket.PoolNonce!=EvictionPinNonce || !EvictionPinTickets.Contains(Ticket.Serial))) return {};
+    const auto PinMatches=[&](const auto& Key) { const auto* Pin=EvictionPins.Find(Key); return HasTicket ? Pin && *Pin==Ticket.Serial : !Pin; };
+    // Integer-safe upper bounds before allocating copies or prospective delta.
+    const uint64 Entries=uint64(PendingIndexRemovals.Num())+uint64(PendingWrites.Num())+uint64(PendingGpuIndexAdds.Num())+2ull*uint64(InputPages.Num());
+    uint64 Bound=4096+2*Entries*sizeof(FVoxelBrickIndexEntry)+
+        uint64(InputPages.Num())*2*(sizeof(FVoxelBrickPreparedReplacement)+sizeof(FVoxelBrickPreparedBatch::FState::FReserved)+sizeof(FVoxelBrickPreparedBatch::FState::FGpuShape))+
+        uint64(ExpectedAbsent.Num())*2*sizeof(FVoxelBrickChunkKey);
+    Bound+=(uint64(InputPages.Num())+uint64(ExpectedAbsent.Num()))*128;
+    for(const auto& Page:InputPages) if(Page.CpuPack)
+        Bound+=2*(uint64(Page.CpuPack->Desc.Num())+uint64(Page.CpuPack->Occ.Num())+uint64(Page.CpuPack->Mat.Num()))*4+sizeof(FVoxelBrickCpuPack);
+    if(Bound>Limit || Entries>MAX_int32) return {};
     TSet<FVoxelBrickChunkKey> Keys;
-	for(const auto& Page:Pages){
-        const uint64* Pin = EvictionPins.Find(Page.Key);
-        if (HasTicket ? (!Pin || *Pin != Ticket.Serial) : Pin != nullptr) return false;
-		if(Keys.Contains(Page.Key)||Page.CpuPack.IsValid()==Page.GpuPack.IsValid())return false;Keys.Add(Page.Key);
-		const auto Old=Resident.Find(Page.Key);
-		if(Old?(int32(Old->ChunkSlot)!=Page.ExpectedSlot||Old->AddSequence!=Page.ExpectedSequence||Old->bGpuArenas):Page.ExpectedSlot!=INDEX_NONE)return false;
-		if(Page.CpuPack&&(Page.CpuPack->Desc.Num()!=128||Page.CpuPack->OccWords()>1024||Page.CpuPack->MatWords()>8448))return false;
-		if(Page.GpuPack&&(Page.GpuPack->BrickCount!=64||Page.GpuPack->OccWords>1024||Page.GpuPack->MatWords>8448))return false;
-	}
-	struct FReserved {FVoxelGpuPoolAllocation Desc,Occ,Mat;};TArray<FReserved> Reserved;Reserved.Reserve(Pages.Num());
-	auto Rollback=[&](){for(const auto& R:Reserved){if(R.Desc.IsValid())DescArena.Free(R.Desc);if(R.Occ.IsValid())OccArena.Free(R.Occ);if(R.Mat.IsValid())MatArena.Free(R.Mat);}};
-	for(const auto& Page:Pages){
-		const uint32 Occ=Page.CpuPack?Page.CpuPack->OccWords():Page.GpuPack->OccWords;
-		const uint32 Mat=Page.CpuPack?Page.CpuPack->MatWords():Page.GpuPack->MatWords;
-		auto& R=Reserved.AddDefaulted_GetRef();R.Desc=DescArena.Alloc(64);if(Occ)R.Occ=OccArena.Alloc(Occ);if(Mat)R.Mat=MatArena.Alloc(Mat);
-		if(!R.Desc.IsValid()||(Occ&&!R.Occ.IsValid())||(Mat&&!R.Mat.IsValid())){Rollback();return false;}
-	}
-    // Mirror Flush's complete delta, including pending ordinary writes. A
-    // replacement drops pending writes naming its old slot before adding its
-    // new write; removals already pending remain in their original order.
-    FVoxelBrickIndexDelta Prospective;
-    Prospective.Removed=PendingIndexRemovals;
+    for(const auto& Page:InputPages)
+    {
+        if(!PinMatches(Page.Key) || Keys.Contains(Page.Key) || Page.CpuPack.IsValid()==Page.GpuPack.IsValid()) return {};
+        Keys.Add(Page.Key);
+        const auto* Old=Resident.Find(Page.Key);
+        if(Old ? (int32(Old->ChunkSlot)!=Page.ExpectedSlot || Old->AddSequence!=Page.ExpectedSequence || Old->bGpuArenas) : Page.ExpectedSlot!=INDEX_NONE) return {};
+        if(Page.CpuPack)
+        {
+            if(Page.CpuPack->Desc.Num()!=128 || Page.CpuPack->OccWords()>1024 || Page.CpuPack->MatWords()>8448) return {};
+        }
+        if(Page.GpuPack && (Page.GpuPack->BrickCount!=64 || Page.GpuPack->OccWords>1024 || Page.GpuPack->MatWords>8448)) return {};
+    }
+    for(const auto& Key:ExpectedAbsent)
+    { if(!PinMatches(Key) || Keys.Contains(Key) || Resident.Contains(Key)) return {}; Keys.Add(Key); }
+    // Include temporary set nodes/buckets; allocator/driver overhead is not an
+    // exact allocator accounting promise. Index packet has its separate credits.
+    if(Bound>Limit || Entries>MAX_int32) return {};
+    FVoxelBrickPreparedBatchRef Token=MakeShareable(new FVoxelBrickPreparedBatch()); auto& S=*Token->State;
+    S.Lifetime=PreparedLifetime; S.Epoch=EvictionPinNonce; S.Mutation=IndexMutationSequence; S.Sink=IndexSinkGeneration; S.Ticket=Ticket;
+    ActivePreparedBatch=Token;
+    S.Pages=InputPages; S.Absent.Append(ExpectedAbsent.GetData(),ExpectedAbsent.Num());
+    S.Reserved.Reserve(S.Pages.Num()); S.GpuShapes.SetNum(S.Pages.Num());
+    for(int32 I=0;I<S.Pages.Num();++I)
+    {
+        auto& P=S.Pages[I];
+        if(P.CpuPack) P.CpuPack=MakeShared<FVoxelBrickCpuPack,ESPMode::ThreadSafe>(*P.CpuPack);
+        if(P.GpuPack) { const auto& G=*P.GpuPack; S.GpuShapes[I]={G.OccWords,G.MatWords,G.SrcBrickFirst,G.SrcChunkIndex,G.SrcOccFirst,G.SrcMatFirst,G.OriginVoxel}; }
+        const uint32 Occ=P.CpuPack?P.CpuPack->OccWords():P.GpuPack->OccWords, Mat=P.CpuPack?P.CpuPack->MatWords():P.GpuPack->MatWords;
+        auto& R=S.Reserved.AddDefaulted_GetRef(); R.Desc=DescArena.Alloc(64); if(Occ)R.Occ=OccArena.Alloc(Occ); if(Mat)R.Mat=MatArena.Alloc(Mat);
+        if(!R.Desc.IsValid() || (Occ&&!R.Occ.IsValid()) || (Mat&&!R.Mat.IsValid())) return {};
+    }
+    const auto& Pages=S.Pages; const auto& Reserved=S.Reserved;
+    FVoxelBrickIndexDelta Prospective; Prospective.Removed=PendingIndexRemovals;
     TSet<uint32> ReplacedSlots;
     for(const auto& Page:Pages)if(const auto* Old=Resident.Find(Page.Key))
-    {
-        ReplacedSlots.Add(Old->ChunkSlot);
-        Prospective.Removed.Add(FVoxelBrickIndexEntry{Page.Key,Old->ChunkSlot});
-    }
-    for(const auto& Write:PendingWrites)if(!ReplacedSlots.Contains(Write.ChunkSlot))
-        Prospective.Added.Add(FVoxelBrickIndexEntry{Write.Key,Write.ChunkSlot});
-    for(int32 I=0;I<Pages.Num();++I)
-        Prospective.Added.Add(FVoxelBrickIndexEntry{Pages[I].Key,Reserved[I].Desc.Offset/64});
+    { ReplacedSlots.Add(Old->ChunkSlot); Prospective.Removed.Add({Page.Key,Old->ChunkSlot}); }
+    for(const auto& Write:PendingWrites)if(!ReplacedSlots.Contains(Write.ChunkSlot)) Prospective.Added.Add({Write.Key,Write.ChunkSlot});
+    for(int32 I=0;I<Pages.Num();++I) Prospective.Added.Add({Pages[I].Key,Reserved[I].Desc.Offset/64});
     Prospective.Added.Append(PendingGpuIndexAdds);
-    const uint64 SinkGeneration=IndexSinkGeneration;
-    const uint64 MutationSequence=IndexMutationSequence;
-    const FGuid PoolEpoch=EvictionPinNonce;
-    // Copy callback: replacing the sink from within preparation must not
-    // destroy the callable currently executing. Such replacement is rejected.
+    if(Token->GetRetainedBytes()+uint64(Prospective.Added.GetAllocatedSize())+uint64(Prospective.Removed.GetAllocatedSize())>Limit) return {};
     const auto Prepare=IndexPreflight;
-    auto Delivery=Prepare(Prospective);
-    const bool DeliveryValid=Delivery && Delivery->ValidateForCommit();
-    if(!DeliveryValid || SinkGeneration!=IndexSinkGeneration || MutationSequence!=IndexMutationSequence || PoolEpoch!=EvictionPinNonce)
+    S.Delivery=Prepare(Prospective);
+    // The callback may reset/change the pool; validate lifetime first.
+    if(S.Lifetime->Owner!=this || S.Consumed) return {};
+    S.Ready=true;
+    if(!ValidatePreparedBatch(Token)) return {};
+    return Token;
+}
+bool FVoxelBrickPool::ValidatePreparedBatch(const FVoxelBrickPreparedBatchRef& Token) const
+{
+    check(IsInGameThread());
+    if(!Token || !Token->State) return false;
+    const auto& S=*Token->State;
+    if(!S.Ready || S.Consumed || !S.Lifetime || S.Lifetime->Owner!=this ||
+        S.Epoch!=EvictionPinNonce || S.Mutation!=IndexMutationSequence || S.Sink!=IndexSinkGeneration ||
+        bGpuAllocArmed || !bInitialised || ActivePreparedBatch.Pin().Get()!=Token.Get()) return false;
+    const bool HasTicket=S.Ticket.IsValid();
+    if(HasTicket && (S.Ticket.PoolNonce!=EvictionPinNonce || !EvictionPinTickets.Contains(S.Ticket.Serial))) return false;
+    const auto PinMatches=[&](const auto& Key) { const auto* Pin=EvictionPins.Find(Key); return HasTicket ? Pin && *Pin==S.Ticket.Serial : !Pin; };
+    for(int32 I=0;I<S.Pages.Num();++I)
     {
-        if(PoolEpoch==EvictionPinNonce)Rollback(); // Reset already freed old arenas.
-        return false;
+        const auto& P=S.Pages[I]; if(!PinMatches(P.Key)) return false;
+        const auto* Old=Resident.Find(P.Key);
+        if(Old ? (int32(Old->ChunkSlot)!=P.ExpectedSlot || Old->AddSequence!=P.ExpectedSequence || Old->bGpuArenas) : P.ExpectedSlot!=INDEX_NONE) return false;
+        if(P.GpuPack) { const auto& G=*P.GpuPack; const auto& E=S.GpuShapes[I];
+            if(G.BrickCount!=64 || G.OccWords!=E.Occ || G.MatWords!=E.Mat || G.SrcBrickFirst!=E.BrickFirst ||
+                G.SrcChunkIndex!=E.ChunkIndex || G.SrcOccFirst!=E.OccFirst || G.SrcMatFirst!=E.MatFirst || G.OriginVoxel!=E.Origin) return false; }
     }
-	// Admission and every allocation succeeded before touching resident keys.
-	// No callback or asynchronous operation can interleave this GT commit.
+    for(const auto& Key:S.Absent) if(!PinMatches(Key) || Resident.Contains(Key)) return false;
+    const auto Delivery=S.Delivery; // retain across a defensive reentrant callback
+    const bool DeliveryValid=Delivery && Delivery->ValidateForCommit();
+    return DeliveryValid && S.Lifetime->Owner==this && !S.Consumed && S.Epoch==EvictionPinNonce &&
+        S.Mutation==IndexMutationSequence && S.Sink==IndexSinkGeneration;
+
+}
+bool FVoxelBrickPool::PreparedBatchCoversAbsent(const FVoxelBrickPreparedBatchRef& Token,const FVoxelBrickChunkKey& Key) const
+{
+    return ValidatePreparedBatch(Token) && Token->State->Absent.Contains(Key);
+}
+bool FVoxelBrickPool::CancelPreparedBatch(const FVoxelBrickPreparedBatchRef& Token)
+{
+    check(IsInGameThread());
+    if(!Token || !Token->State->Lifetime || Token->State->Lifetime->Owner!=this || Token->State->Consumed) return false;
+    ReleasePreparedBatchState(*Token->State); ActivePreparedBatch.Reset(); return true;
+}
+void FVoxelBrickPool::CommitPreparedBatch(const FVoxelBrickPreparedBatchRef& Token)
+{
+    check(IsInGameThread());
+    if(!ValidatePreparedBatch(Token))
+    { checkf(false,TEXT("Prepared pool commit requires a live, unchanged reservation")); return; }
+    auto& S=*Token->State; const auto& Pages=S.Pages; const auto& Reserved=S.Reserved;
+    S.Consumed=true; // arena reservations become residents below, never rolled back
 	for(int32 I=0;I<Pages.Num();++I){
 		const auto& Page=Pages[I];const auto& R=Reserved[I];RemoveChunk(Page.Key);
 		FResidentChunk Chunk;Chunk.Key=Page.Key;Chunk.ChunkSlot=R.Desc.Offset/64;Chunk.BrickBase=R.Desc.Offset;
@@ -2709,7 +2818,17 @@ bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedRepla
 		Write.Shading=Page.Shading;Write.OriginVoxel=Page.CpuPack?Page.CpuPack->OriginVoxel:Page.GpuPack->OriginVoxel;
 		PendingWrites.Add(MoveTemp(Write));
 	}
-	FlushWithPreparedIndex(MoveTemp(Delivery));return true;
+
+    auto Delivery=MoveTemp(S.Delivery);
+    FlushWithPreparedIndex(MoveTemp(Delivery));
+    ReleasePreparedBatchState(S); ActivePreparedBatch.Reset();
+}
+bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages,FVoxelBrickEvictionPinTicket Ticket)
+{
+    if(Pages.IsEmpty()) return false;
+    auto Token=PreparePreparedBatch(Pages,Ticket);
+    if(!Token || !ValidatePreparedBatch(Token)) return false;
+    CommitPreparedBatch(Token); return true;
 }
 
 int32 FVoxelBrickPool::AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload,
@@ -3444,6 +3563,8 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 void FVoxelBrickPool::Reset()
 {
     check(IsInGameThread());
+    if(auto Token=ActivePreparedBatch.Pin()) ReleasePreparedBatchState(*Token->State);
+    ActivePreparedBatch.Reset();
     EvictionPins.Reset();
     EvictionPinTickets.Reset();
     EvictionPinNonce = FGuid::NewGuid();

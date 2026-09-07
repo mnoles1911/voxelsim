@@ -90,6 +90,51 @@ bool FRegistry::RollbackProduction(const FProductionReservation& Ticket)
     if(!Ticket.IsValid()||Ticket.RegistryNonce!=RegistryNonce||!R||R->Ticket.Serial!=Ticket.Serial)return false;
     Reservations.Remove(Ticket.Id);return true;
 }
+struct FPreparedProductionCommit {
+    FProductionReservation Reservation;
+    FGuid Serial;
+    FVoxelEnvironmentProductionCommitRef Actor;
+    int32 EntryCount=0,OrderCount=0,DormantCount=0;
+};
+FPreparedProductionCommitRef FRegistry::PrepareProductionCommit(const FProductionReservation& Ticket)
+{
+    check(IsInGameThread());auto R=Reservations.Find(Ticket.Id);
+    if(!Ticket.IsValid()||Ticket.RegistryNonce!=RegistryNonce||!R||R->Ticket.Serial!=Ticket.Serial||Entries.Contains(Ticket.Id))return {};
+    R->CommitSerial.Invalidate();
+    FVoxelEnvironmentProductionCommitRef ActorToken;
+    if(R->HadActor){
+        auto A=Cast<AVoxelEnvironmentLODPrototype>(R->Entry.Actor.Get());if(!IsValid(A)||Find(A))return {};
+        ActorToken=A->PrepareProductionCommit(R->Entry.Geometry,R->Entry.Dynamic,R->Entry.Transform);
+        if(!ActorToken)return {};
+    }
+    // Reserve insertion capacity before the future non-yielding commit boundary.
+    Entries.Reserve(Entries.Num()+Reservations.Num());Order.Reserve(Order.Num()+Reservations.Num());
+    LastDormantSample.Reserve(LastDormantSample.Num()+Reservations.Num());
+    auto Token=MakeShared<FPreparedProductionCommit,ESPMode::ThreadSafe>();
+    R->CommitSerial=FGuid::NewGuid();Token->Reservation=Ticket;Token->Serial=R->CommitSerial;Token->Actor=MoveTemp(ActorToken);
+    Token->EntryCount=Entries.Num();Token->OrderCount=Order.Num();Token->DormantCount=LastDormantSample.Num();return Token;
+}
+bool FRegistry::ValidatePreparedProduction(const FPreparedProductionCommitRef& Token)
+{
+    check(IsInGameThread());if(!Token)return false;
+    const auto& T=Token->Reservation;const auto R=Reservations.Find(T.Id);
+    if(!T.IsValid()||T.RegistryNonce!=RegistryNonce||!R||R->Ticket.Serial!=T.Serial||
+       !Token->Serial.IsValid()||R->CommitSerial!=Token->Serial||Entries.Contains(T.Id)||
+       Entries.Num()!=Token->EntryCount||Order.Num()!=Token->OrderCount||LastDormantSample.Num()!=Token->DormantCount)return false;
+    if(R->HadActor){auto A=Cast<AVoxelEnvironmentLODPrototype>(R->Entry.Actor.Get());return IsValid(A)&&!Find(A)&&A->ValidateProductionCommit(Token->Actor);}
+    return !Token->Actor&&R->Entry.Actor.IsExplicitlyNull();
+}
+void FRegistry::CommitPreparedProduction(const FPreparedProductionCommitRef& Token)
+{
+    check(IsInGameThread());
+    if(!ValidatePreparedProduction(Token)){checkf(false,TEXT("Invalid prepared registry commit token"));return;}
+    const FGuid Id=Token->Reservation.Id;auto R=Reservations.Find(Id);
+    if(R->HadActor){
+        auto A=CastChecked<AVoxelEnvironmentLODPrototype>(R->Entry.Actor.Get());
+        A->CommitPreparedProduction(Token->Actor);R->Entry.Residency=EResidency::Live;
+    }else {R->Entry.Actor.Reset();R->Entry.Residency=EResidency::Dormant;}
+    Entries.Add(Id,MoveTemp(R->Entry));Order.Add(Id);LastDormantSample.Add(Id,Clock);Reservations.Remove(Id);
+}
 bool FRegistry::CommitProduction(const FProductionReservation& Ticket)
 {
     check(IsInGameThread());const auto R=Reservations.Find(Ticket.Id);
