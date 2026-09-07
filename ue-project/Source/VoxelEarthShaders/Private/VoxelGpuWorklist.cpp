@@ -9,6 +9,7 @@
 // sequencing arithmetic.
 
 #include "VoxelGpuWorklist.h"
+#include "VoxelGpuClaimProof.h"
 
 #include "VoxelGpuWorldGen.h"        // FVoxelGpuColumnSample -- the arena element
 #include "VoxelGpuWorldGenGraph.h"   // AddWorklistColumnPass (the converted Column dispatch)
@@ -745,7 +746,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		Proof.ClaimWitnessRecord = ProofMailbox->GProofClaimWitnessRec.load(std::memory_order_relaxed);
 		GpuClaimEligible = int64(ClaimEligible);
 		Proof.ClaimEligibleOnGpu = ClaimEligible;
-		Proof.ClaimStagedOnHost = CumClaimStaged;
+		Proof.ClaimStagedOnHost = ProofStashClaims;
 		Proof.MalformedOnGpu = GpuBad;
 		Proof.ColumnDwordMismatches = ColMismatch;
 		Proof.ColumnsChecked = ColChecked;
@@ -762,12 +763,10 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		++Proof.Landed;
 		// --- THE SET-IDENTITY GATE (the one that was missing) ---------------
 		//
-		// The records the GPU claims and the records the host staged for a GPU
-		// claim must be THE SAME SET. Both counters are cumulative and both
-		// are captured at the same flush, so the compare is exact -- with one
-		// allowance: the GPU number is as of the flush whose readback landed,
-		// which is a few flushes behind the host's, so the GPU may be BEHIND.
-		// It may never be AHEAD.
+        // Compare the landed GPU snapshot to its captured host claim cohort.
+        // Live CumClaimStaged includes later flushes and current deferred work;
+        // comparing it to an early zero readback falsely reports missing claims.
+        // ProofStashClaims excludes the current async deferred claim window.
 		//
 		// GPU AHEAD OF HOST is the double claim: the flush graph claimed a
 		// slot the batch graph also claims classically, the first grant is
@@ -775,7 +774,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		// Its other face is [brick-gpualloc] `unclaimed` going NEGATIVE --
 		// claims + claimFails exceeding shells, claims with no shell behind
 		// them. The leg that found this read unclaimed = -643,164.
-		if (int64(ClaimEligible) > CumClaimStaged)
+		if (VoxelGpuClaimProof::Ahead(ProofStashClaims,ClaimEligible))
 		{
 			UE_LOG(LogVoxelGpuWorklist, Error,
 			       TEXT("[gpu-worklist] CLAIM SET MISMATCH: the GPU claimed %u records but ")
@@ -784,9 +783,9 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       TEXT("once classically in the batch graph -- and the first grant of each ")
 			       TEXT("pair LEAKS. Cross-check [brick-gpualloc] `unclaimed`: it will be ")
 			       TEXT("negative by about this much. The leg is invalid."),
-			       ClaimEligible, CumClaimStaged, int64(ClaimEligible) - CumClaimStaged);
+			       ClaimEligible, ProofStashClaims, int64(ClaimEligible) - ProofStashClaims);
 		}
-		if (ClaimEligible == 0u && CumClaimStaged > 0)
+		if (VoxelGpuClaimProof::Dark(ProofStashClaims,ClaimEligible))
 		{
 			// The other direction, and it is NOT harmless: the host skipped
 			// the batch graph's brick chain for chunks it believed the flush
@@ -795,7 +794,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       TEXT("[gpu-worklist] CLAIM STAGE DARK: host staged %lld records for a GPU ")
 			       TEXT("claim and the GPU claimed 0. Those chunks' batch brick chains were ")
 			       TEXT("skipped and nothing landed them -- expect holes, not corruption."),
-			       CumClaimStaged);
+			       ProofStashClaims);
 		}
 		if (ClaimMismatch > 0)
 		{
@@ -913,7 +912,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch,
 			       VoxChecked, VoxMismatch, CtChecked, CtMismatch, StampChecked, StampMismatch,
 			       PackChecked, PackMismatch, ClaimChecked, ClaimMismatch,
-			       ClaimEligible, CumClaimStaged);
+			       ClaimEligible, ProofStashClaims);
 			if (GpuBad > 0)
 			{
 				UE_LOG(LogVoxelGpuWorklist, Error,
@@ -942,6 +941,9 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			ProofStashTail = Tail + Take;
 			ProofStashConsumed = uint32(CumConsumedRecords);
 			ProofStashFold = CumConsumedFold;
+            // Current async claim is deferred until the next flush; its host
+            // count is not part of the stats copied by this proof graph.
+            ProofStashClaims=VoxelGpuClaimProof::Expected(CumClaimStaged,DeferredClaim.bValid?DeferredClaim.StagedRecords:0u);
 		}
 	}
 

@@ -241,6 +241,9 @@ public:
 	// Null by default, so behaviour is unchanged until something wires it.
 	void SetCoarseFallback(vxc::ITileSampler* Sampler) { CoarseFallback_ = Sampler; }
 	vxc::ITileSampler* CoarseFallback() const { return CoarseFallback_; }
+#if WITH_DEV_AUTOMATION_TESTS
+    bool DebugKnownAbsentForTest(vxc::TileCoord Tile) const;
+#endif
 
 	// The ONE query gate callers must honor. Footprint is a column's XY
 	// bounds in WORLD MILLIMETRES (VoxelCoords::WorldToMm), half-open like

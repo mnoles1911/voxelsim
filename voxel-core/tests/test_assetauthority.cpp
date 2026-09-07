@@ -286,6 +286,31 @@ VXC_TEST(authority_coordinator_bounds_leases_and_rejects_stale_publication) {
     CHECK(!other.prepareInitial(world,bad,source,projection,7,1,1,identity,error));CHECK_EQ(other.usage().generations,size_t(0));
     // A raw independently captured view is not publishable/admissible as expected base.
     auto uncoordinated=capture(world,p,1);CHECK(bool(uncoordinated));CHECK(!coordinator.prepareCarve(uncoordinated,x,y,z));
+    // One operation, one retained generation, regardless of cell count.
+    auto batchBase=coordinator.visible();const auto usageBefore=coordinator.usage();
+    std::vector<AssetAuthorityTerrainEdit> cells{{x+1,y,z,MAT_ROCK},{x,y,z-1,MAT_AIR},{x+1,y,z,MAT_AIR},{x+2,y,z,MAT_ROCK}};
+    auto invalid=cells;invalid.push_back({batchBase->bounds().x1+1,y,z,MAT_ROCK});
+    CHECK(!coordinator.prepareTerrainEditBatch(batchBase,invalid));
+    CHECK_EQ(coordinator.usage().bytes,usageBefore.bytes);CHECK_EQ(coordinator.visible()->generation(),batchBase->generation());
+    invalid=cells;invalid.push_back({x,y,z,MaterialId(kMaterialCount)});
+    CHECK(!coordinator.prepareTerrainEditBatch(batchBase,invalid));CHECK_EQ(coordinator.usage().generations,usageBefore.generations);
+    CHECK(!coordinator.prepareTerrainEditBatch(batchBase,{}));
+    std::vector<AssetAuthorityTerrainEdit> oversized(StationaryAssetAuthority<16>::MaxTerrainEditCells+1,{x,y,z,MAT_AIR});
+    CHECK(!coordinator.prepareTerrainEditBatch(batchBase,oversized));CHECK_EQ(coordinator.usage().bytes,usageBefore.bytes);
+    CHECK(!coordinator.prepareTerrainEditBatch(uncoordinated,cells));
+    auto batch=coordinator.prepareTerrainEditBatch(batchBase,cells);CHECK(bool(batch));
+    CHECK_EQ(coordinator.usage().generations,usageBefore.generations+1);CHECK_EQ(coordinator.usage().bytes,usageBefore.bytes+charge);
+    auto competing=coordinator.prepareTerrainEditBatch(batchBase,cells);CHECK(bool(competing));
+    CHECK(!coordinator.prepareTerrainEditBatch(batchBase,cells)); // retained quota full
+    CHECK(coordinator.publish(batch));CHECK(!coordinator.publish(competing));CHECK(coordinator.cancel(competing));
+    AssetAuthoritySample batchHit;CHECK(coordinator.visible()->sampleAt(x+1,y,z,batchHit));CHECK_EQ(batchHit.material,MAT_AIR);
+    CHECK(coordinator.visible()->sampleAt(x,y,z-1,batchHit));CHECK_EQ(batchHit.material,MAT_AIR);CHECK(batchHit.owner==AssetObjectId{});
+    CHECK(coordinator.visible()->sampleAt(x+2,y,z,batchHit));CHECK_EQ(batchHit.material,MAT_ROCK);
+    CHECK(batchBase->sampleAt(x,y,z-1,batchHit));CHECK_EQ(batchHit.material,MAT_BARK); // immutable old projection survives
+    CHECK_EQ(coordinator.visible()->generation(),batchBase->generation()+1);
+    CHECK_EQ(coordinator.visible()->objectRevision(),batchBase->objectRevision());
+    batchBase.reset();CHECK_EQ(coordinator.usage().generations,size_t(1));
+    auto released=coordinator.prepareTerrainEditBatch(coordinator.visible(),cells);CHECK(bool(released));CHECK(coordinator.cancel(released));
     typename Coordinator::Ref orphan;
     {
         Coordinator temporary(charge*2,2);auto t=temporary.prepareInitial(world,p,source,projection,7,1,1,identity,error);

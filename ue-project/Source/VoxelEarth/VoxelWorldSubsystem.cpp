@@ -6947,10 +6947,13 @@ struct FVoxelWorldImpl
         uint64 GpuBytes=0;
         vxc::AssetOwnershipTicket OwnershipTicket;
         FVoxelBrickPreparedBatchRef PoolBatch;
+        FVoxelPrivateGpuReservationRef GpuPoolBatch;
         VoxelObjects::FProductionReservation RegistryReservation;
         VoxelObjects::FPreparedProductionCommitRef RegistryCommit;
         bool RegistryBound=false;
         int32 VisualCaptureStage=0;
+        bool VisualGpuDrain=false;
+        double VisualGpuDrainStarted=0;
         uint64 VisualCameraFrame=0;
         TWeakObjectPtr<APawn> VisualPawn;
         FVector VisualPawnLocation=FVector::ZeroVector;
@@ -18237,6 +18240,7 @@ void FVoxelWorldImpl::EndProductionRehearsal(const TCHAR* Reason)
 {
     check(IsInGameThread());
     if(!ProductionRehearsal)return;
+    if(ProductionRehearsal->GpuPoolBatch)GetGlobalVoxelBrickPool().CancelPrivateGpuReservation(ProductionRehearsal->GpuPoolBatch);
     if(ProductionRehearsal->PoolBatch)GetGlobalVoxelBrickPool().CancelPreparedBatch(ProductionRehearsal->PoolBatch);
     if(ProductionRehearsal->RegistryReservation.IsValid())VisualPilotRegistry->RollbackProduction(ProductionRehearsal->RegistryReservation);
     if(ProductionRehearsal->RegistryBound&&!VisualPublished)VisualPilotRegistry=MakeUnique<VoxelObjects::FRegistry>();
@@ -18552,11 +18556,12 @@ bool FVoxelWorldImpl::ValidateVisualPublication()
     auto& S=*ProductionRehearsal;auto* Actor=Work->Actor.Get();auto* World=Actor?Actor->GetWorld():nullptr;
     auto& Pool=GetGlobalVoxelBrickPool();
     int32 Worlds=0;if(GEngine)for(const auto& C:GEngine->GetWorldContexts())if(C.World()&&C.World()->IsGameWorld())++Worlds;
-    if(!World||World->GetNetMode()!=NM_Standalone||Worlds!=1||Pool.IsGpuAllocArmed()||
+    if(!World||World->GetNetMode()!=NM_Standalone||Worlds!=1||Pool.IsGpuAllocArmed()!=bool(S.GpuPoolBatch)||
        !Actor||!Actor->IsVisualOnlyPreparation()||!Actor->ValidatePreparedVisualReveal()||
        !S.RegistryBound||!VisualPilotRegistry->Find(Actor)||!S.CpuContext||
        !VoxelProductionCandidate::IsCurrent(*Work,EditEpoch.load(),FineStreamer?FineStreamer->ResidencyEpoch():0)||
-       !PageBarrier.IsQuiescent(S.Ticket)||!Pool.ValidatePreparedBatch(S.PoolBatch)||
+       !PageBarrier.IsQuiescent(S.Ticket)||
+       !(S.GpuPoolBatch?Pool.ValidatePrivateGpuCommit(S.GpuPoolBatch):Pool.ValidatePreparedBatch(S.PoolBatch))||
        S.MaxRing!=UVoxelWorldSubsystem::GetMaxRingLevel()||!S.VisualPawn.IsValid()||
        !S.VisualPawn->GetActorLocation().Equals(S.VisualPawnLocation,0.01))return false;
     const auto Snapshot=ProductionOwnership.Prepared(S.OwnershipTicket);
@@ -18580,7 +18585,8 @@ bool FVoxelWorldImpl::CommitVisualPublication(const vxc::AssetOwnershipSnapshot&
     // Single-world GT boundary: no view family can be submitted between these
     // ordered renderer commands and the final flush. Not an asynchronous path.
     ProductionRenderContext=S.CpuContext;
-    GetGlobalVoxelBrickPool().CommitPreparedBatch(S.PoolBatch);
+    if(S.GpuPoolBatch)GetGlobalVoxelBrickPool().CommitPrivateGpuReservation(S.GpuPoolBatch);
+    else GetGlobalVoxelBrickPool().CommitPreparedBatch(S.PoolBatch);
     Work->Actor->PublishPreparedVisualOnly();
     for(const auto& Key:S.Keys){
         if(auto* R=ChunkRecords.Find(Key))R->OwnershipGeneration=After.generation;
@@ -18597,6 +18603,7 @@ void FVoxelWorldImpl::TickVisualPublication()
     const auto Refuse=[&](const TCHAR* Why){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: %s; gameplay=0"),Why);CancelProductionCandidate(Why);};
     auto* PC=World?World->GetFirstPlayerController():nullptr;
     if(!Actor||!PC||!PC->GetPawn()||!PC->PlayerCameraManager||!GEngine||!GEngine->GameViewport){Refuse(TEXT("live standalone viewport/camera required"));return;}
+    if(S.VisualGpuDrain&&FPlatformTime::Seconds()-S.VisualGpuDrainStarted>15.){Refuse(TEXT("bounded GPU producer drain/publication exceeded15seconds"));return;}
     if(S.VisualCaptureStage==0){
         RestoreVisualBufferSettings();
         VisualBufferRequests=0;VisualBuffersVerified.Reset();VisualBufferMaterialNames.Reset();
@@ -18618,6 +18625,14 @@ void FVoxelWorldImpl::TickVisualPublication()
     if(S.VisualCaptureStage==2){
         if(VisualBuffersEnabled&&FPlatformTime::Seconds()-VisualBufferRequestStarted>32.){Refuse(TEXT("before buffer capture timed out after 32 seconds"));return;}
         if(FScreenshotRequest::IsScreenshotRequested()||!VerifyVisualBuffers(VisualBeforePath)||!IFileManager::Get().FileExists(*VisualBeforePath))return;
+        if(GetGlobalVoxelBrickPool().IsGpuAllocArmed()){
+            if(!S.VisualGpuDrain){
+                S.VisualGpuDrain=true;S.VisualGpuDrainStarted=FPlatformTime::Seconds();
+                UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot GPU_DRAIN started maxSeconds=15 newDispatchPaused=1"));return;
+            }
+            if(JobsInFlightCounter.GetValue()>0||!ResultsQueue.IsEmpty()||!PendingGameThreadKeys.IsEmpty()||!GetGlobalVoxelBrickPool().PrivateGpuInputsDrained())return;
+            UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot GPU_DRAIN ready elapsed=%.3f"),FPlatformTime::Seconds()-S.VisualGpuDrainStarted);
+        }
         // Private logical registration can still refuse here, before any terrain
         // or visibility mutation. Its registry is never saved or replicated.
         VoxelObjects::FEntry Entry;Entry.Kind=3;Entry.GeometryRevision=1;Entry.Geometry=Work->Geometry;Entry.Dynamic=Work->Dynamic;
@@ -18643,13 +18658,40 @@ void FVoxelWorldImpl::TickVisualPublication()
         }
         constexpr uint64 MaxBytes=128ull*1024*1024;
         if(S.CpuBytes>MaxBytes||S.GpuBytes>MaxBytes-S.CpuBytes){Refuse(TEXT("publication budget exhausted"));return;}
+        if(GetGlobalVoxelBrickPool().IsGpuAllocArmed()){
+            // Reserve both additional bounds before beginning private GPU work.
+            // Source CPU/GPU packs remain retained until the transaction retires.
+            constexpr uint64 PrivateAndHostBytes=(8ull+32ull)*1024*1024;
+            if(MaxBytes-S.CpuBytes-S.GpuBytes<PrivateAndHostBytes){Refuse(TEXT("GPU publication aggregate budget exhausted"));return;}
+            FString Error;
+            S.GpuPoolBatch=GetGlobalVoxelBrickPool().BeginPrivateGpuReservation(Replacements,S.PressurePins,Error);
+            if(!S.GpuPoolBatch){Refuse(*FString::Printf(TEXT("private GPU reservation refused: %s"),*Error));return;}
+            S.VisualCaptureStage=3;return; // poll without blocking the game thread
+        }
         S.PoolBatch=GetGlobalVoxelBrickPool().PreparePreparedBatch(Replacements,S.PressurePins,Absent,MaxBytes-S.CpuBytes-S.GpuBytes);
         if(!S.PoolBatch){Refuse(TEXT("pool/index batch reservation refused"));return;}
-        for(int32 I=0;I<S.Keys.Num();++I)if(!S.Tokens[I].bPresent&&!ProductionOwnership.StageAbsentPage(S.OwnershipTicket,Work->Pages[size_t(I)],S.CpuContext->Generation(),GetGlobalVoxelBrickPool(),S.PoolBatch)){
-            Refuse(TEXT("validated absence staging refused"));return;
+        S.VisualCaptureStage=4;
+    }
+    if(S.VisualCaptureStage==3){
+        auto& Pool=GetGlobalVoxelBrickPool();FString Error;
+        const auto Status=Pool.PollPrivateGpuReservation(S.GpuPoolBatch,Error);
+        if(Status==EVoxelPrivateGpuReservationStatus::Pending)return;
+        if(Status!=EVoxelPrivateGpuReservationStatus::ReadyPrivate){Refuse(*FString::Printf(TEXT("private GPU proof refused: %s"),*Error));return;}
+        TArray<FVoxelBrickChunkKey> Absent;
+        for(int32 I=0;I<S.Keys.Num();++I)if(!S.Tokens[I].bPresent)Absent.Add(VoxelBrickCpuArm::MakeKey(S.Keys[I]));
+        if(!Pool.PrivateGpuInputsDrained())return;
+        if(!Pool.PreparePrivateGpuCommit(S.GpuPoolBatch,Absent,Error)){Refuse(*FString::Printf(TEXT("private GPU commit preparation refused: %s"),*Error));return;}
+        S.VisualCaptureStage=4;
+    }
+    if(S.VisualCaptureStage==4){
+        for(int32 I=0;I<S.Keys.Num();++I)if(!S.Tokens[I].bPresent){
+            const bool Staged=S.GpuPoolBatch?
+                ProductionOwnership.StageAbsentPage(S.OwnershipTicket,Work->Pages[size_t(I)],S.CpuContext->Generation(),GetGlobalVoxelBrickPool(),S.GpuPoolBatch):
+                ProductionOwnership.StageAbsentPage(S.OwnershipTicket,Work->Pages[size_t(I)],S.CpuContext->Generation(),GetGlobalVoxelBrickPool(),S.PoolBatch);
+            if(!Staged){Refuse(TEXT("validated absence staging refused"));return;}
         }
         if(!ProductionOwnership.MarkObjectReady(S.OwnershipTicket,1)){Refuse(TEXT("object readiness rejected"));return;}
-        S.VisualCaptureStage=3;
+        S.VisualCaptureStage=5;
     }
     if(!ValidateVisualPublication()){Refuse(TEXT("prepared transaction validation refused"));return;}
     const double Start=FPlatformTime::Seconds();
@@ -18664,7 +18706,9 @@ void FVoxelWorldImpl::TickVisualPublication()
     if(!ProductionOwnership.Commit(S.OwnershipTicket)){VisualBoundary=false;Refuse(TEXT("ownership publication callback refused"));return;}
     VisualBoundary=false;
     Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;Work->PrepareHeldGpuPages=false;
+    const bool UsedGpuAllocator=bool(S.GpuPoolBatch);
     EndProductionRehearsal(TEXT("visual renderer boundary completed"));
+    UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot ALLOCATOR gpu=%d privateProof=%d"),UsedGpuAllocator?1:0,UsedGpuAllocator?1:0);
     UE_LOG(LogVoxelEarth,Log,TEXT("ProductionVisualPilot PUBLISHED complete=%d allocated=%d absent=%d generation=%llu blockingMs=%.3f registry=isolated gameplay=0"),Complete,Allocated,Complete-Allocated,Generation,(FPlatformTime::Seconds()-Start)*1000.);
     // Request only after the complete first boundary; save occurs in a later
     // viewport frame, never by replacing the pending before request.
@@ -18854,8 +18898,8 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
             CancelProductionCandidate(TEXT("replacement request"));
             if(Request==6){
                 int32 Worlds=0;if(GEngine)for(const auto& C:GEngine->GetWorldContexts())if(C.World()&&C.World()->IsGameWorld())++Worlds;
-                if(!World||World->GetNetMode()!=NM_Standalone||Worlds!=1||GetGlobalVoxelBrickPool().IsGpuAllocArmed()||!GIsRHIInitialized){
-                    UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: requires exactly one standalone game world, initialized renderer and CPU arena allocator"));return;
+                if(!World||World->GetNetMode()!=NM_Standalone||Worlds!=1||!GIsRHIInitialized){
+                    UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionVisualPilot REFUSED: requires exactly one standalone game world and initialized renderer"));return;
                 }
             }
             if(!FMath::IsFinite(Anchor.X)||!FMath::IsFinite(Anchor.Y)||FMath::Abs(Anchor.X)>double(int64(1)<<30)*10.||FMath::Abs(Anchor.Y)>double(int64(1)<<30)*10.)return;
@@ -25504,6 +25548,9 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 
 void FVoxelWorldImpl::DispatchJobs()
 {
+    // Visual-only GPU pilot pauses new producers, not manager/result draining.
+    // TickStreaming continues both drains and pool flushes outside this method.
+    if(ProductionRehearsal&&ProductionRehearsal->VisualGpuDrain)return;
 	// B.3: collect the warm resolves that finished, then queue more.
 	//
 	// DRAIN FIRST, WARM SECOND, AND BOTH BEFORE THE DISPATCH LOOP. Draining

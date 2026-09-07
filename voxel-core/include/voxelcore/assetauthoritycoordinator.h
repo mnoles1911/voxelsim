@@ -59,6 +59,10 @@ public:
         if(!expected||expected!=visible_)return {};
         return ticket(expected,expected->carve(expected->generation(),x,y,z));
     }
+    Ticket prepareTerrainEditBatch(const Ref& expected,std::span<const AssetAuthorityTerrainEdit> cells) {
+        if(!expected||expected!=visible_)return {};
+        return ticket(expected,expected->editTerrainBatch(expected->generation(),cells));
+    }
     Ticket prepareTerrainEdit(const Ref& expected,int64_t x,int64_t y,int64_t z,MaterialId m) {
         if(!expected||expected!=visible_)return {};
         return ticket(expected,expected->editTerrain(expected->generation(),x,y,z,m));

@@ -54,6 +54,8 @@ public:
     // publication callback must revalidate the same complete pool token.
     bool StageAbsentPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,
                          const FVoxelBrickPool& Pool,const FVoxelBrickPreparedBatchRef& Batch);
+    bool StageAbsentPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,
+                         const FVoxelBrickPool& Pool,const FVoxelPrivateGpuReservationRef& Batch);
     const TArray<FPreparedPage>* PreparedPages(vxc::AssetOwnershipTicket Ticket) const;
     bool Commit(vxc::AssetOwnershipTicket Ticket);
     bool Cancel(vxc::AssetOwnershipTicket Ticket);

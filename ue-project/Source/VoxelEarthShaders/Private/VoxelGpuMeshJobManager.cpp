@@ -3869,10 +3869,10 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		// first grant of each pair leaked, the occ arena filled to 288/288 MiB
 		// and [brick-gpualloc] `unclaimed` ran to -643,164. gpuClaimed lags
 		// hostStaged by the readback latency; it may never EXCEED it.
-		const int64 HostStaged = Worklist.GetCumClaimStaged();
+		const int64 HostStaged = int64(P.ClaimStagedOnHost); // exact landed proof cohort
 		const int64 GpuClaimed = Worklist.GetGpuClaimEligible();
 		const bool bSetAhead = GpuClaimed > HostStaged;
-		const bool bSetShort = GpuClaimed == 0 && HostStaged > 0;
+		const bool bSetShort = P.Landed>0 && GpuClaimed == 0 && HostStaged > 0;
 		UE_LOG(LogVoxelGpuMeshJob, Log,
 		       TEXT("[gpu-worklist] wlclaim conv=%lld hostStaged=%lld gpuClaimed=%lld ")
 		       TEXT("dupRefused=%lld fedNoBit=%lld claimverify checked=%llu mism=%llu ")

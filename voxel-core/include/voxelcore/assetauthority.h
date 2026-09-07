@@ -3,6 +3,7 @@
 #include "voxelcore/world.h"
 #include "voxelcore/assetcandidate.h"
 #include <memory>
+#include <span>
 #include <string>
 namespace vxc {
 // Trusted host binding service: resolve the actual loaded field's catalog
@@ -58,6 +59,7 @@ inline size_t assetAuthorityWinner(const std::vector<AssetField::ResolvedAssetIn
     for(size_t i=0;i<ordered.size();++i)if(assetCandidateMaterial(ordered[i],boxes[i],x,y,z)!=MAT_AIR)return i;
     return ordered.size();
 }
+struct AssetAuthorityTerrainEdit {int64_t x=0,y=0,z=0;MaterialId material=MAT_AIR;};
 struct AssetAuthoritySample {MaterialId material=MAT_AIR;AssetObjectId owner{};uint64_t generation=0,objectRevision=0;};
 template<int B> class StationaryAssetAuthorityCoordinator;
 // A coordinated view must reserve a sibling credit before any edit array copy.
@@ -99,9 +101,25 @@ public:
         size_t i;if(expectedGeneration!=generation_||generation_==UINT64_MAX||revision_==UINT64_MAX||!index(x,y,z,i)||(*projection_)[i]==MAT_AIR||(*edits_)[i].present)return {};
         auto out=clone();if(!out)return {};auto p=std::make_shared<std::vector<MaterialId>>(*projection_);(*p)[i]=MAT_AIR;out->projection_=p;++out->revision_;return out;
     }
+    static constexpr size_t MaxTerrainEditCells=4096;
+    // Caller owns an immutable input span for this synchronous operation.
+    // Validate the entire batch before credit admission or array allocation.
+    // Duplicate coordinates have explicit last-input-wins semantics, including air.
+    Ref editTerrainBatch(uint64_t expectedGeneration,std::span<const AssetAuthorityTerrainEdit> cells) const {
+        if(expectedGeneration!=generation_||generation_==UINT64_MAX||cells.empty()||cells.size()>MaxTerrainEditCells)return {};
+        for(const auto& c:cells) {
+            size_t i;if(!index(c.x,c.y,c.z,i)||uint32_t(c.material)>=uint32_t(kMaterialCount))return {};
+        }
+        auto out=clone();if(!out)return {};
+        auto edits=std::make_shared<std::vector<Override>>(*edits_);
+        for(const auto& c:cells) {
+            size_t i=0;index(c.x,c.y,c.z,i);(*edits)[i]={true,c.material};
+        }
+        out->edits_=std::move(edits);return out;
+    }
     Ref editTerrain(uint64_t expectedGeneration,int64_t x,int64_t y,int64_t z,MaterialId m) const {
-        size_t i;if(expectedGeneration!=generation_||generation_==UINT64_MAX||!index(x,y,z,i))return {};
-        auto out=clone();if(!out)return {};auto e=std::make_shared<std::vector<Override>>(*edits_);(*e)[i]={true,m};out->edits_=e;return out;
+        const AssetAuthorityTerrainEdit cell{x,y,z,m};
+        return editTerrainBatch(expectedGeneration,std::span<const AssetAuthorityTerrainEdit>(&cell,1));
     }
     // Construction synchronously borrows a frozen World only here. No provider,
     // bank, World, grid or UObject pointer survives the capture.
