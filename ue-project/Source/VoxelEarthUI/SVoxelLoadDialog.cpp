@@ -101,11 +101,11 @@ void SVoxelLoadDialog::Construct(const FArguments& InArgs)
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(FLinearColor::Black))
 			]
-			+ SOverlay::Slot().Padding(FMargin(1.f))
+			+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(ParchmentEdge)))
 			]
-			+ SOverlay::Slot().Padding(FMargin(2.f))
+			+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 			[
 				SNew(SImage).Image(Style.SolidWhite())
 				.ColorAndOpacity(FSlateColor(Tint(Mix(Parchment, Parchment2))))
@@ -232,7 +232,7 @@ TSharedRef<SWidget> SVoxelLoadDialog::BuildTag(const FText& Label, bool bWarm)
 			SNew(SImage).Image(Style.SolidWhite())
 			.ColorAndOpacity(FSlateColor(bWarm ? FLinearColor::Black : Tint(LeatherEdge)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(1.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 		[
 			SNew(SImage).Image(Style.SolidWhite())
 			.ColorAndOpacity(FSlateColor(bWarm ? Tint(Mix(WarmPrimary, WarmSecondary)) : Tint(Leather2)))
@@ -301,7 +301,7 @@ TSharedRef<SWidget> SVoxelLoadDialog::BuildRow(const FVoxelSaveRowInfo& Row, boo
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(LeatherEdge)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(1.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 		[
 			// Opaque, not `rgba(...,.55)`: see VoxelUITheme::Over. The 0.55 is
 			// still there, applied once against the panel it sits on.
@@ -322,11 +322,11 @@ TSharedRef<SWidget> SVoxelLoadDialog::BuildRow(const FVoxelSaveRowInfo& Row, boo
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(FLinearColor::Black))
 					]
-					+ SOverlay::Slot().Padding(FMargin(1.f))
+					+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(LeatherEdge)))
 					]
-					+ SOverlay::Slot().Padding(FMargin(2.f))
+					+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 					[
 						SNew(SImage).Image(Style.SolidWhite())
 						.ColorAndOpacity(FSlateColor(Tint(Mix(Palette.Top, Palette.Bottom))))

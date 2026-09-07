@@ -201,6 +201,13 @@ void SVoxelCodexScreen::RebuildEntryList()
 			return;
 		}
 
+		// `.grp-head` is `BUILDING <count>` -- upper case, tracked, with the
+		// group's tally right-aligned on the same line. The port drew a plain
+		// lower-case word and no count, which is the one thing the header
+		// carries that the rows do not.
+		FSlateFontInfo GroupFont = Style.Serif(L.SubTabLabelSize);
+		GroupFont.LetterSpacing = L.CodexGroupLetterSpacing;
+
 		FText CurrentGroup;
 		for (int32 Slot = 0; Slot < VisibleRecipes.Num(); ++Slot)
 		{
@@ -208,10 +215,31 @@ void SVoxelCodexScreen::RebuildEntryList()
 			if (!Recipe.Category.EqualTo(CurrentGroup))
 			{
 				CurrentGroup = Recipe.Category;
+				// Counted over the VISIBLE recipes, not over Data.Recipes: with
+				// a search active the header has to describe the list the
+				// player is looking at, or the number contradicts the rows
+				// under it.
+				int32 GroupCount = 0;
+				for (int32 Other = 0; Other < VisibleRecipes.Num(); ++Other)
+				{
+					GroupCount += Data.Recipes[VisibleRecipes[Other]].Category.EqualTo(CurrentGroup) ? 1 : 0;
+				}
 				EntryListBox->AddSlot().AutoHeight().Padding(FMargin(2.f, 8.f, 0.f, 4.f))
 				[
-					SNew(STextBlock).Text(Recipe.Category).Font(Style.Serif(L.SubTabLabelSize))
-					.ColorAndOpacity(FVoxelUIStyle::MutedColour())
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+					[
+						SNew(STextBlock).Text(Recipe.Category.ToUpper()).Font(GroupFont)
+						.ColorAndOpacity(FVoxelUIStyle::MutedColour())
+					]
+					+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+					.Padding(FMargin(8.f, 0.f, 6.f, 0.f))
+					[
+						SNew(STextBlock).Text(FText::AsNumber(GroupCount))
+						.Font(Style.Mono(L.SubTabLabelSize))
+						.ColorAndOpacity(FVoxelUIStyle::MutedColour())
+						.Justification(ETextJustify::Right)
+					]
 				];
 			}
 			Row(SNew(SHorizontalBox)
@@ -341,7 +369,7 @@ void SVoxelCodexScreen::RebuildPage()
 		PageBox->AddSlot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 14.f))
 		[
 			SNew(STextBlock).Text(Recipe.Description).Font(Style.Hand(L.CodexBodySize))
-			.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(1.45f)
+			.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(HandLineHeight(1.45f))
 		];
 
 		PageBox->AddSlot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 8.f))
@@ -479,7 +507,7 @@ void SVoxelCodexScreen::RebuildPage()
 
 	PageBox->AddSlot().AutoHeight().Padding(FMargin(0.f, 12.f, 0.f, 10.f))
 	[
-		SNew(SBox).HeightOverride(1.f)
+		SNew(SBox).HeightOverride(VoxelUITheme::RulePx)
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(ParchmentInk, 0.4f))
 		]
@@ -489,7 +517,7 @@ void SVoxelCodexScreen::RebuildPage()
 		PageBox->AddSlot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 10.f))
 		[
 			SNew(STextBlock).Text(Paragraph).Font(Style.Hand(L.CodexBodySize + 1))
-			.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(1.45f)
+			.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(HandLineHeight(1.45f))
 		];
 	}
 	if (!Entry.Quote.IsEmpty())
@@ -497,7 +525,7 @@ void SVoxelCodexScreen::RebuildPage()
 		PageBox->AddSlot().AutoHeight().Padding(FMargin(14.f, 6.f, 0.f, 0.f))
 		[
 			SNew(STextBlock).Text(Entry.Quote).Font(Style.HandItalic(L.CodexBodySize + 1))
-			.ColorAndOpacity(Tint(PageDropCap)).AutoWrapText(true).LineHeightPercentage(1.4f)
+			.ColorAndOpacity(Tint(PageDropCap)).AutoWrapText(true).LineHeightPercentage(HandLineHeight(1.4f))
 		];
 	}
 }

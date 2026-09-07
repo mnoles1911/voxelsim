@@ -140,6 +140,21 @@ void SVoxelDeathScreen::Construct(const FArguments& InArgs)
 				Actions
 			]
 		]
+		// .version-stamp -- the mock puts one on this screen at
+		// `left:48px; bottom:32px` and the port drew nothing there. Same string
+		// and same treatment as the title screen's and the loading screen's, so
+		// the three cannot say different things about the same build; the
+		// insets are the shared VersionInset* pair for the same reason.
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Left)
+		.VAlign(VAlign_Bottom)
+		.Padding(FMargin(L.VersionInsetLeft, 0.f, 0.f, L.VersionInsetBottom))
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::VersionStamp())
+			.Font(Style.Serif(L.VersionFontSize))
+			.ColorAndOpacity(FVoxelUIStyle::MutedColour())
+		]
 	];
 }
 

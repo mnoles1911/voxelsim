@@ -24,6 +24,9 @@ const TCHAR* const kSerifRelativePath = TEXT("UI/Fonts/MacondoSwashCaps-Regular.
 const TCHAR* const kMonoRelativePath = TEXT("UI/Fonts/VT323-Regular.ttf");
 const TCHAR* const kHandRelativePath = TEXT("UI/Fonts/IMFeENrm28P.ttf");
 const TCHAR* const kHandItalicRelativePath = TEXT("UI/Fonts/IMFeENit28P.ttf");
+// NOT PRESENT IN THE REPOSITORY. The exact path the owner has to drop the file
+// at for the `--pixel` sites to stop falling back; see FVoxelUIStyle::Pixel.
+const TCHAR* const kPixelRelativePath = TEXT("UI/Fonts/PressStart2P-Regular.ttf");
 
 // One face by path, with the same graceful-degradation contract Serif has:
 // returns null (and says why, once) when the file is absent or assets are
@@ -163,6 +166,12 @@ void FVoxelUIStyle::Initialise()
 	HandFont = VoxelUIStyleDetail::LoadFaceOrNull(VoxelUIStyleDetail::kHandRelativePath, TEXT("hand"), bForceFallback);
 	HandItalicFont = VoxelUIStyleDetail::LoadFaceOrNull(VoxelUIStyleDetail::kHandItalicRelativePath,
 	                                                    TEXT("hand-italic"), bForceFallback);
+	// EXPECTED TO BE NULL, and the warning LoadFaceOrNull prints for it is the
+	// standing reminder that the file is missing rather than a fault. Wired the
+	// same way as the other three so that dropping the .ttf in is the whole
+	// change -- see FVoxelUIStyle::Pixel.
+	PixelFont = VoxelUIStyleDetail::LoadFaceOrNull(VoxelUIStyleDetail::kPixelRelativePath, TEXT("pixel"),
+	                                               bForceFallback);
 
 	// --- Oak button ---------------------------------------------------------
 	// UIStyles.menu_button_styles(): four StyleBoxFlat, all 2px border and
@@ -264,6 +273,22 @@ FSlateFontInfo FVoxelUIStyle::Hand(int32 SizePx) const
 		return FSlateFontInfo(HandFont, SizePx);
 	}
 	return FCoreStyle::GetDefaultFontStyle("Regular", SizePx);
+}
+
+FSlateFontInfo FVoxelUIStyle::Pixel(int32 SizePx) const
+{
+	if (PixelFont.IsValid())
+	{
+		return FSlateFontInfo(PixelFont, SizePx);
+	}
+	// VT323, NOT THE ENGINE DEFAULT. The other three accessors fall back to
+	// FCoreStyle because their faces have no near neighbour in the shipped set;
+	// this one does. Press Start 2P is an 8x8 pixel face and VT323 is a
+	// terminal-bitmap face -- both fixed pitch, both all-caps-legible at 8-12 px,
+	// both wrong in the same direction. Falling through to the Macondo swash (or
+	// to Roboto) is what made the journal stamps read as a serif in the
+	// 2026-09-07 capture.
+	return Mono(SizePx);
 }
 
 FSlateFontInfo FVoxelUIStyle::HandItalic(int32 SizePx) const

@@ -113,7 +113,7 @@ void SVoxelMenuButton::Construct(const FArguments& InArgs)
 				]
 				+ SOverlay::Slot().VAlign(VAlign_Top)
 				[
-					SNew(SBox).HeightOverride(1.f)
+					SNew(SBox).HeightOverride(VoxelUITheme::RulePx)
 					[
 						SNew(SImage).Image(Style.SolidWhite())
 						.ColorAndOpacity(this, &SVoxelMenuButton::GetCartoucheRuleColour)
@@ -121,7 +121,7 @@ void SVoxelMenuButton::Construct(const FArguments& InArgs)
 				]
 				+ SOverlay::Slot().VAlign(VAlign_Bottom)
 				[
-					SNew(SBox).HeightOverride(1.f)
+					SNew(SBox).HeightOverride(VoxelUITheme::RulePx)
 					[
 						SNew(SImage).Image(Style.SolidWhite())
 						.ColorAndOpacity(this, &SVoxelMenuButton::GetCartoucheRuleColour)
@@ -416,7 +416,7 @@ void SVoxelMenuButton::Construct(const FArguments& InArgs)
 				// border-bottom:1px solid rgba(90,56,24,0.3).
 				+ SVerticalBox::Slot().AutoHeight()
 				[
-					SNew(SBox).HeightOverride(1.f)
+					SNew(SBox).HeightOverride(VoxelUITheme::RulePx)
 					[
 						SNew(SImage).Image(Style.SolidWhite())
 						.ColorAndOpacity(FSlateColor(Tint(LeatherEdge, 0.30f)))
@@ -580,6 +580,22 @@ bool SVoxelMenuButton::IsLit() const
 	// stick has to be able to see where they are.
 	const bool bFocused = Button.IsValid() && Button->HasKeyboardFocus();
 	return IsHovered() || bFocused;
+}
+
+bool SVoxelMenuButton::IsCartoucheOn() const
+{
+	if (IsLit())
+	{
+		return true;
+	}
+	// The Muted (QUIT) exception is IsLit's; restated here because this branch
+	// does not go through it. A disabled item never takes the band either --
+	// the mock has no `.active` on a greyed CONTINUE.
+	if (!IsEnabled() || bMuted)
+	{
+		return false;
+	}
+	return ActiveAttribute.Get(false);
 }
 
 bool SVoxelMenuButton::IsWarmPlate() const
@@ -753,24 +769,24 @@ FSlateColor SVoxelMenuButton::GetCartoucheLabelColour() const
 	{
 		return FSlateColor(IsHovered() ? Tint(Ink) : Tint(Parchment, 0.45f));
 	}
-	return FSlateColor(IsLit() ? Tint(CartoucheText) : Tint(Parchment));
+	return FSlateColor(IsCartoucheOn() ? Tint(CartoucheText) : Tint(Parchment));
 }
 
 FSlateColor SVoxelMenuButton::GetCartoucheFillColour() const
 {
 	using namespace VoxelUITheme;
-	return FSlateColor(IsLit() ? Tint(Gold, CartoucheFillAlpha) : FLinearColor::Transparent);
+	return FSlateColor(IsCartoucheOn() ? Tint(Gold, CartoucheFillAlpha) : FLinearColor::Transparent);
 }
 
 FSlateColor SVoxelMenuButton::GetCartoucheRuleColour() const
 {
 	using namespace VoxelUITheme;
-	return FSlateColor(IsLit() ? Tint(Gold, GoldRuleAlpha) : FLinearColor::Transparent);
+	return FSlateColor(IsCartoucheOn() ? Tint(Gold, GoldRuleAlpha) : FLinearColor::Transparent);
 }
 
 FSlateFontInfo SVoxelMenuButton::GetCartoucheFont() const
 {
-	FSlateFontInfo Font = FVoxelUIStyle::Get().Serif(IsLit() ? ActiveFontSize : RestFontSize);
+	FSlateFontInfo Font = FVoxelUIStyle::Get().Serif(IsCartoucheOn() ? ActiveFontSize : RestFontSize);
 	Font.LetterSpacing = LetterSpacing;
 	return Font;
 }

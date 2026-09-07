@@ -117,7 +117,10 @@ TSharedRef<SWidget> SVoxelPauseMenu::BuildPausePanel()
 	TArray<FPauseItem> Items;
 	Items.Add({VoxelUIStrings::ButtonResume(), false, [this]() { OnResume.ExecuteIfBound(); }});
 	Items.Add({VoxelUIStrings::ButtonSave(), false, [this]() { ShowPanel(EVoxelPausePanel::Save); }});
-	Items.Add({VoxelUIStrings::ButtonLoadGame(), false, [this]() { ShowPanel(EVoxelPausePanel::Load); }});
+	// LOAD, not LOAD GAME: the mock's third .pa-btn is the short word. The long
+	// one belongs to the title screen, where it sits next to CONTINUE and has to
+	// say which game. ButtonLoad() already existed for the per-save row button.
+	Items.Add({VoxelUIStrings::ButtonLoad(), false, [this]() { ShowPanel(EVoxelPausePanel::Load); }});
 	Items.Add({VoxelUIStrings::ButtonSettings(), false, [this]() { ShowPanel(EVoxelPausePanel::Settings); }});
 	Items.Add({VoxelUIStrings::ButtonExitToMenu(), true, [this]() { OnExitToMenu.ExecuteIfBound(); }});
 	Items.Add({VoxelUIStrings::ButtonQuit(), true, [this]() { OnQuit.ExecuteIfBound(); }});

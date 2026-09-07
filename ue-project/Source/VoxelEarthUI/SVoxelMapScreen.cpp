@@ -160,7 +160,9 @@ TSharedRef<SWidget> SVoxelMapScreen::BuildSheet()
 		BuildCompass()
 	];
 
-	// The 2 px black border and 1 px bronze ring the frame carries.
+	// The 2 px black border and the bronze ring, both at VoxelUITheme::RulePx.
+	// The mock's ring is 1 px; ADR-0011 forbids a one-unit band, so the inner
+	// inset is 4 rather than 3 and the ring is two units.
 	return SNew(SOverlay)
 		+ SOverlay::Slot()
 		[
@@ -170,7 +172,7 @@ TSharedRef<SWidget> SVoxelMapScreen::BuildSheet()
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(BronzeDeep))
 		]
-		+ SOverlay::Slot().Padding(FMargin(3.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 		[
 			Sheet
 		];

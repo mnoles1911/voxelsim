@@ -658,7 +658,8 @@ TSharedRef<SWidget> SVoxelPlayerScreen::BuildPerksPage()
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(PerkPanelEdge))
 				]
-				+ SOverlay::Slot().Padding(FMargin(3.f))
+				// 4, not 3: the crimson edge band was one unit. ADR-0011.
+				+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 				[
 					SNew(SImage).Image(Style.SolidWhite())
 					.ColorAndOpacity(Tint(Mix(PerkPanelTop, PerkPanelBottom)))
@@ -703,12 +704,12 @@ void SVoxelPlayerScreen::RebuildPerkDetail()
 	PerkDetailBox->AddSlot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 12.f))
 	[
 		SNew(STextBlock).Text(Perk.Description).Font(Style.Hand(L.CodexBodySize))
-		.ColorAndOpacity(Tint(Parchment)).AutoWrapText(true).LineHeightPercentage(1.4f)
+		.ColorAndOpacity(Tint(Parchment)).AutoWrapText(true).LineHeightPercentage(HandLineHeight(1.4f))
 	];
 	PerkDetailBox->AddSlot().AutoHeight()
 	[
 		SNew(STextBlock).Text(Perk.Flavour).Font(Style.HandItalic(L.CodexBodySize))
-		.ColorAndOpacity(Tint(Parchment, 0.7f)).AutoWrapText(true).LineHeightPercentage(1.4f)
+		.ColorAndOpacity(Tint(Parchment, 0.7f)).AutoWrapText(true).LineHeightPercentage(HandLineHeight(1.4f))
 	];
 }
 
@@ -739,11 +740,11 @@ TSharedRef<SWidget> SVoxelPlayerScreen::BuildReputationPage()
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(ParchmentEdge))
 				]
-				+ SOverlay::Slot().Padding(FMargin(1.f))
+				+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(ParchmentInk, 0.35f))
 				]
-				+ SOverlay::Slot().Padding(FMargin(1.f))
+				+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 				[
 					SNew(SHorizontalBox)
 					+ SHorizontalBox::Slot().FillWidth(bNegative ? 1.f - Magnitude : 1.f)

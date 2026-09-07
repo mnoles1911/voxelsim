@@ -137,7 +137,11 @@ void SVoxelJournalScreen::RebuildList()
 			.Visibility(EVisibility::SelfHitTestInvisible)
 			+ SVerticalBox::Slot().AutoHeight()
 			[
-				SNew(STextBlock).Text(Stamp).Font(Style.Mono(L.JournalStampSize))
+				// `.card .stamp` is `var(--pixel)`, not `var(--mono)`. See
+				// FVoxelUIStyle::Pixel: Press Start 2P is not in the repository,
+				// so this resolves to VT323 today and to the real face the day
+				// the .ttf is dropped in -- without another edit here.
+				SNew(STextBlock).Text(Stamp).Font(Style.Pixel(L.JournalStampSize))
 				.ColorAndOpacity(Tint(StampColour))
 				.Visibility(EVisibility::HitTestInvisible)
 			]
@@ -223,7 +227,7 @@ void SVoxelJournalScreen::RebuildList()
 					+ SVerticalBox::Slot().AutoHeight()
 					[
 						SNew(STextBlock).Text(VoxelUIStrings::JournalNewEntry())
-						.Font(Style.Mono(L.JournalStampSize))
+						.Font(Style.Pixel(L.JournalStampSize))
 						.ColorAndOpacity(FVoxelUIStyle::MutedColour())
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 3.f, 0.f, 0.f))
@@ -368,7 +372,8 @@ void SVoxelJournalScreen::RebuildPage()
 	{
 		PageBox->AddSlot().AutoHeight()
 		[
-			SNew(STextBlock).Text(Text).Font(Style.Mono(L.JournalPageKindSize))
+			// `.p-kind` -- also `var(--pixel)`; same substitution as the stamps.
+			SNew(STextBlock).Text(Text).Font(Style.Pixel(L.JournalPageKindSize))
 			.ColorAndOpacity(Tint(PageKind))
 		];
 	};
@@ -384,7 +389,7 @@ void SVoxelJournalScreen::RebuildPage()
 			]
 			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 8.f, 0.f, 0.f))
 			[
-				SNew(SBox).HeightOverride(1.f)
+				SNew(SBox).HeightOverride(VoxelUITheme::RulePx)
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(ParchmentInk, 0.4f))
 				]
@@ -419,7 +424,7 @@ void SVoxelJournalScreen::RebuildPage()
 		PageBox->AddSlot().AutoHeight()
 		[
 			SNew(STextBlock).Text(Entry.Body).Font(Style.Hand(L.JournalPageBodySize))
-			.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(1.55f)
+			.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(HandLineHeight(1.55f))
 		];
 		return;
 	}
@@ -435,7 +440,7 @@ void SVoxelJournalScreen::RebuildPage()
 	PageBox->AddSlot().AutoHeight()
 	[
 		SNew(STextBlock).Text(Goal.Flavour).Font(Style.Hand(L.JournalPageBodySize))
-		.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(1.55f)
+		.ColorAndOpacity(Tint(ParchmentInk)).AutoWrapText(true).LineHeightPercentage(HandLineHeight(1.55f))
 	];
 
 	FSlateFontInfo SectionFont = Style.Serif(L.JournalSectionSize);
@@ -450,7 +455,7 @@ void SVoxelJournalScreen::RebuildPage()
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 4.f, 0.f, 0.f))
 		[
-			SNew(SBox).HeightOverride(1.f)
+			SNew(SBox).HeightOverride(VoxelUITheme::RulePx)
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(ParchmentInk, 0.4f))
 			]
@@ -479,7 +484,7 @@ void SVoxelJournalScreen::RebuildPage()
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(ParchmentInk))
 					]
-					+ SOverlay::Slot().Padding(FMargin(1.f))
+					+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Marker))
 					]

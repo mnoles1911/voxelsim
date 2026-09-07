@@ -1,5 +1,6 @@
 #include "SVoxelScreenChrome.h"
 
+#include "VoxelUIStrings.h" // ItemStackCount -- the cell's "x16" badge
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
 
@@ -15,7 +16,13 @@ namespace VoxelScreenChromeDetail
 // Named namespace, not anonymous: see tools/lint-unity-collisions.py.
 
 constexpr float kBorderPx = 2.f;
-constexpr float kRingPx = 1.f;
+// 2, NOT THE CSS'S 1. ADR-0011: no band may be one unit -- see
+// VoxelUITheme::RulePx. Every stack below is built outside in, so a band's
+// width is the difference between two consecutive insets; with kRingPx at 1 the
+// oak card's edge, the iron well's edge and the item slot's rarity ring were
+// each exactly one unit wide and smeared at any fractional scale. The chrome
+// on each of those surfaces therefore grows by one unit per side.
+constexpr float kRingPx = VoxelUITheme::RulePx;
 const FColor kWellFill(0x0a, 0x08, 0x05);   // .pack-box / .side-box background
 const FColor kSlotTop(0x1a, 0x14, 0x10);    // .slot linear-gradient stops
 const FColor kSlotBottom(0x0a, 0x08, 0x05);
@@ -194,11 +201,14 @@ TSharedRef<SWidget> ParchmentPanel(TSharedRef<SWidget> Content)
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(ParchmentEdge))
 		]
-		+ SOverlay::Slot().Padding(FMargin(kBorderPx + kRingPx * 2.f))
+		// ONE ring width, not two: this stack asked for `kRingPx * 2` back when
+		// kRingPx was 1, i.e. it already wanted the 2-unit edge ADR-0011 now
+		// gives every band. Leaving the doubling in would make it four.
+		+ SOverlay::Slot().Padding(FMargin(kBorderPx + kRingPx))
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Mix(Parchment, Parchment2)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(kBorderPx + kRingPx * 2.f))
+		+ SOverlay::Slot().Padding(FMargin(kBorderPx + kRingPx))
 		[
 			Content
 		];
@@ -296,21 +306,20 @@ TSharedRef<SWidget> PanelHeading(const FText& Text, const FText& Meta)
 
 TSharedRef<SWidget> ItemGlyph(FName Glyph, float Size)
 {
-	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
 	const FGlyphBands Bands = BandsFor(Glyph);
+	// A RAMP, NOT TWO FLAT BANDS. Every `.it.*` in the CSS is a
+	// `linear-gradient(...)`; the port drew the two end stops as two hard blocks,
+	// which is what the 2026-09-07 pass saw as "flat colour swatches". Four
+	// bands is the smallest count that reads as a ramp rather than as a seam at
+	// the 18-58 px sizes this is drawn at, and it is still four boxes per glyph.
+	// The middle stop is the midpoint of the two the table carries -- the table
+	// records the CSS's ends, not its interior.
+	const FColor MidBand = Mix(Bands.Top, Bands.Bottom);
 	return SNew(SBox)
 		.WidthOverride(Size)
 		.HeightOverride(Size)
 		[
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().FillHeight(0.55f)
-			[
-				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Bands.Top))
-			]
-			+ SVerticalBox::Slot().FillHeight(0.45f)
-			[
-				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Bands.Bottom))
-			]
+			VerticalRamp(Bands.Top, MidBand, Bands.Bottom, 4)
 		];
 }
 
@@ -360,7 +369,11 @@ TSharedRef<SWidget> ItemSlot(const FVoxelInventoryScreenItem& Item, float Size,
 	{
 		// .it is `inset:6px` on a 56 px tile; scaled so the glyph keeps its
 		// proportion at the 48, 58, 62, 64 and 66 px cells this is called at.
-		const float Inset = FMath::Max(4.f, Size * (6.f / 56.f));
+		// ROUNDED TO A WHOLE UNIT. Not load-bearing under ADR-0011 -- the scale
+		// is continuous, so no authored value lands on a device pixel anyway --
+		// but a fractional AUTHORED figure buys nothing, and 6.214 at the pack's
+		// 58 px cell was an accident of the 6/56 ratio, not a design number.
+		const float Inset = FMath::Max(4.f, FMath::RoundToFloat(Size * (6.f / 56.f)));
 		Cell->AddSlot().Padding(FMargin(Inset))
 		[
 			ItemGlyph(Item.Glyph, Size - Inset * 2.f)
@@ -371,7 +384,7 @@ TSharedRef<SWidget> ItemSlot(const FVoxelInventoryScreenItem& Item, float Size,
 			Cell->AddSlot().HAlign(HAlign_Right).VAlign(VAlign_Bottom).Padding(FMargin(4.f))
 			[
 				SNew(STextBlock)
-				.Text(FText::AsNumber(Item.Count))
+				.Text(VoxelUIStrings::ItemStackCount(Item.Count))
 				.Font(Style.Mono(L.InvSlotQtySize))
 				.ColorAndOpacity(FVoxelUIStyle::BodyColour())
 				.ShadowOffset(FVector2D(1.f, 1.f))
@@ -415,9 +428,78 @@ TSharedRef<SWidget> CardRule(float Alpha)
 {
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
 	return SNew(SBox)
-		.HeightOverride(1.f)
+		// ADR-0011: 2 units, not the CSS's 1 px. See VoxelUITheme::RulePx.
+		.HeightOverride(RulePx)
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(PanelOakEdge, Alpha))
+		];
+}
+
+TSharedRef<SWidget> VerticalRamp(const FColor& Top, const FColor& Mid, const FColor& Bottom, int32 Steps,
+                                 float Alpha)
+{
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const int32 BandCount = FMath::Max(2, Steps);
+
+	TSharedRef<SVerticalBox> Column = SNew(SVerticalBox);
+	for (int32 I = 0; I < BandCount; ++I)
+	{
+		// The band's colour is sampled at its CENTRE, not its top edge: sampling
+		// at the edge would put the Top stop on a band half a band tall and end
+		// the ramp one band short of Bottom.
+		const float T = (float(I) + 0.5f) / float(BandCount);
+		// Two linear segments meeting at the middle stop, which is how a
+		// three-stop CSS gradient interpolates.
+		const FColor Lo = T < 0.5f ? Top : Mid;
+		const FColor Hi = T < 0.5f ? Mid : Bottom;
+		const float Local = T < 0.5f ? T * 2.f : (T - 0.5f) * 2.f;
+		const FColor Band(
+			uint8(FMath::RoundToInt(FMath::Lerp(float(Lo.R), float(Hi.R), Local))),
+			uint8(FMath::RoundToInt(FMath::Lerp(float(Lo.G), float(Hi.G), Local))),
+			uint8(FMath::RoundToInt(FMath::Lerp(float(Lo.B), float(Hi.B), Local))));
+
+		Column->AddSlot().FillHeight(1.f)
+		[
+			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Band, Alpha))
+		];
+	}
+	return Column;
+}
+
+TSharedRef<SWidget> Track(float Height, const FColor& FillTop, const FColor& FillMid, const FColor& FillBottom,
+                          const TAttribute<float>& Fraction)
+{
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get(); // the black surround's brush
+	return SNew(SBox)
+		.HeightOverride(Height)
+		[
+			SNew(SOverlay)
+			+ SOverlay::Slot()
+			[
+				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(FColor::Black))
+			]
+			// ADR-0011. On the HUD's 11-unit bar this takes the fill from 9
+			// units to 7; flagged for the owner's capture with the tick rules.
+			+ SOverlay::Slot().Padding(FMargin(RulePx))
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot()
+				.FillWidth(TAttribute<float>::CreateLambda([Fraction]()
+				{
+					return FMath::Clamp(Fraction.Get(0.f), 0.f, 1.f);
+				}))
+				[
+					VerticalRamp(FillTop, FillMid, FillBottom)
+				]
+				+ SHorizontalBox::Slot()
+				.FillWidth(TAttribute<float>::CreateLambda([Fraction]()
+				{
+					return 1.f - FMath::Clamp(Fraction.Get(0.f), 0.f, 1.f);
+				}))
+				[
+					SNullWidget::NullWidget
+				]
+			]
 		];
 }
 
@@ -436,7 +518,9 @@ TSharedRef<SWidget> Track(float Height, const FSlateColor& Fill, const TAttribut
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(FColor::Black))
 			]
-			+ SOverlay::Slot().Padding(FMargin(1.f))
+			// ADR-0011. On the HUD's 11-unit bar this takes the fill from 9
+			// units to 7; flagged for the owner's capture with the tick rules.
+			+ SOverlay::Slot().Padding(FMargin(RulePx))
 			[
 				SNew(SHorizontalBox)
 				+ SHorizontalBox::Slot()

@@ -216,7 +216,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 			// border-left/border-right at gold @ .35.
 			+ SHorizontalBox::Slot().AutoWidth()
 			[
-				SNew(SBox).WidthOverride(1.f)
+				SNew(SBox).WidthOverride(VoxelUITheme::RulePx)
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(Gold, 0.35f)))
 				]
@@ -230,7 +230,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(Gold, 0.5f)))
 					]
-					+ SOverlay::Slot().Padding(FMargin(1.f))
+					+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(PanelIron)))
 					]
@@ -279,12 +279,12 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 					.ShadowOffset(FVector2D(1.f, 1.f))
 					.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.8f))
 					.AutoWrapText(true)
-					.LineHeightPercentage(1.45f)
+					.LineHeightPercentage(HandLineHeight(1.45f))
 				]
 			]
 			+ SHorizontalBox::Slot().AutoWidth()
 			[
-				SNew(SBox).WidthOverride(1.f)
+				SNew(SBox).WidthOverride(VoxelUITheme::RulePx)
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(Gold, 0.35f)))
 				]
@@ -316,6 +316,13 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 		.ActiveFontSize(L.TitleMenuActiveSize)
 		.LetterSpacing(L.TitleMenuLetterSpacing)
 		.MinHeight(0.f)
+		// `.title-menu__item.active` -- the mock puts it on NEW GAME, and it is
+		// a resting state, not a hover. See HasNoColumnFocus: without this the
+		// list shows NO selection at all whenever something else in the window
+		// holds keyboard focus, which is what the 2026-09-07 title capture
+		// caught. It yields the moment any item is actually focused, so
+		// arrowing down never lights two rows.
+		.Active(this, &SVoxelMainMenu::HasNoColumnFocus)
 		.OnClicked_Lambda([this]() { OnNewGame.ExecuteIfBound(); return FReply::Handled(); })
 	];
 
@@ -627,6 +634,27 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildSettingsPanel()
 	// what stopped it being message-panel-shaped.
 	return SAssignNew(SettingsPanel, SVoxelSettingsPanel)
 		.OnLeave(FSimpleDelegate::CreateLambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); }));
+}
+
+bool SVoxelMainMenu::HasNoColumnFocus() const
+{
+	// True when the keyboard is not on any title-screen item, which is the only
+	// time the resting `.active` cartouche on NEW GAME should paint. Reads the
+	// inner SButton because that is the widget focus lands on -- see
+	// SVoxelMenuButton::GetFocusWidget.
+	for (const TSharedPtr<SVoxelMenuButton>& Button : ColumnButtons)
+	{
+		if (!Button.IsValid())
+		{
+			continue;
+		}
+		const TSharedPtr<SWidget> FocusWidget = Button->GetFocusWidget();
+		if (FocusWidget.IsValid() && FocusWidget->HasKeyboardFocus())
+		{
+			return false;
+		}
+	}
+	return true;
 }
 
 bool SVoxelMainMenu::HasAnyLoadableSave() const

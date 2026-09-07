@@ -57,6 +57,29 @@ public:
 	FSlateFontInfo Hand(int32 SizePx) const;
 	FSlateFontInfo HandItalic(int32 SizePx) const;
 
+	// THE FOURTH FACE, AND THE ONE THAT IS NOT IN THE REPOSITORY.
+	//
+	// `menus_shared.css` sets `--pixel:"Press Start 2P"` and the 2026-09-07
+	// mocks spend it on the journal stamps, the journal page's kind line and a
+	// handful of other small all-caps labels. It is an OFL face like the other
+	// three, but no .ttf for it was ever committed:
+	// docs/ui-mocks/2026-09-07/README.md records it as "not shipped", and a
+	// directory listing of Content/UI/Fonts on 2026-09-07 confirmed the four
+	// files there are Macondo, VT323 and the two IM Fell romans.
+	//
+	// SO THIS ACCESSOR SHIPS THE FALLBACK, NOT THE FONT. It looks for
+	// PressStart2P-Regular.ttf beside the other three and uses it if the owner
+	// drops it in -- no code change, no rebuild-with-an-asset, the same
+	// load-by-path story every other face here has. Until then it returns Mono
+	// (VT323), which is the closest thing in the shipped set: a fixed-pitch
+	// bitmap-derived face, so the `--pixel` sites read as deliberate small caps
+	// rather than as the Macondo swash they currently fall back to.
+	//
+	// IsPixelFontAvailable() is what a capture-comparison should read before
+	// filing "the stamp font is wrong" a second time.
+	FSlateFontInfo Pixel(int32 SizePx) const;
+	bool IsPixelFontAvailable() const { return PixelFont.IsValid(); }
+
 	// UIStyles.menu_button_styles() + apply_menu_button(), as one FButtonStyle:
 	// normal PANEL_OAK_2 on black, hover PANEL_OAK_1 on GOLD, pressed
 	// PANEL_OAK_2.darkened(0.15) on GOLD_DEEP, disabled
@@ -120,6 +143,8 @@ private:
 	TSharedPtr<FCompositeFont> MonoFont;
 	TSharedPtr<FCompositeFont> HandFont;
 	TSharedPtr<FCompositeFont> HandItalicFont;
+	// Null on every build to date -- see Pixel() above.
+	TSharedPtr<FCompositeFont> PixelFont;
 
 	FButtonStyle MenuButtonStyle;
 	FButtonStyle CartoucheButtonStyle;

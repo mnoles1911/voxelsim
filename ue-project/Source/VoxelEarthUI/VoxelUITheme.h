@@ -223,6 +223,20 @@ inline const FColor HudHungerDeep  = FColor(0x2a, 0x5a, 0x78);
 // later divergence should not be a silent one.
 inline const FColor HudWound       = FColor(0x5a, 0x14, 0x10);
 
+// THE TOP STOP OF EACH BAR, which is the half of every `.bar .fill` gradient
+// the port had no name for and therefore could not draw. Each fill in the HUD
+// mock is a three-stop 180deg ramp; the port was painting the MIDPOINT of the
+// two ends it did know, which is why both bars read as one flat colour. The
+// bright stops below are the CSS's literal 0% values -- they are not derived
+// from the darker tokens, so do not "simplify" them into a Lerp.
+//
+//   .bar.hp   .fill  #d44a3a 0% -> --hp     50%  -> --hp-deep   100%
+//   .bar.stam .fill  #bfe6f5 0% -> --stam   55%  -> --stam-deep 100%
+//   .bar.hp   .wound #6a1a14 0%               -> --hp-wound  100%
+inline const FColor HpTop          = FColor(0xd4, 0x4a, 0x3a);
+inline const FColor HudHungerTop   = FColor(0xbf, 0xe6, 0xf5);
+inline const FColor HudWoundTop    = FColor(0x6a, 0x1a, 0x14);
+
 // --- Loading-screen extras --------------------------------------------------
 // Not in Colors.gd; hardcoded in LoadingHourglass.gd and TransitionManager.gd,
 // straight from the mock's :root block.
@@ -282,6 +296,60 @@ VOXELEARTHUI_API FColor Mix(const FColor& A, const FColor& B);
 // uses) and cannot be got wrong per call site. Byte space, like Mix and
 // Darkened, because these are sRGB hex values.
 VOXELEARTHUI_API FColor Over(const FColor& Src, float Alpha, const FColor& Dst);
+
+// --- The minimum width of any line this front end draws ---------------------
+//
+// ADR-0011 (scale-tolerant UI), decision 3: **never a 1 px border**. The
+// interface is authored at 1080p and the engine scales it continuously off the
+// shortest side, so on the owner's 1440p screen every authored unit is
+// multiplied by 1.333. A 1-unit rule therefore lands on 1.333 device pixels --
+// it cannot sit on a pixel boundary and is resampled into a smear at every
+// scale that is not a whole number. Two units survive any factor: the worst it
+// can do is spread 2.67 device pixels over three, and the line is still a line.
+//
+// EVERY hairline rule, divider, tick and border BAND in this module is this
+// number. It is a constant rather than an FVoxelMenuLayout field on purpose:
+// it is a rendering constraint, not a design choice, and nothing should be able
+// to tune it back down to 1 from an ini.
+//
+// `menus_shared.css` already uses 2 px in places, so where the mock states a
+// heavier weight nearby that weight is what the port follows. Where the mock
+// says 1 px and this says 2, the port is deliberately heavier than the mock and
+// that is a visible change the owner judges on a capture.
+inline constexpr float RulePx = 2.f;
+
+// --- Line height ------------------------------------------------------------
+//
+// A CSS `line-height:1.45` AND AN STextBlock `LineHeightPercentage(1.45f)` ARE
+// NOT THE SAME NUMBER, and passing the mock's straight through is how the title
+// screen's callout ended up a third looser than the mock it was copied from.
+//
+//   CSS   line-height: N   =>  N x the FONT SIZE.
+//   Slate LineHeightPercentage(N)
+//         =>  N x the FACE'S OWN line height. FTextLayout.cpp:451 is literally
+//             `LineSize.Y = UnscaleLineHeight * LineHeightPercentage`, and
+//             UnscaleLineHeight comes from the font's ascent/descent/lineGap.
+//
+// IM Fell English -- the --hand face every wrapped body block in this front end
+// uses -- has a natural line height of 1.269 em (hhea ascender 1638, descender
+// -961, lineGap 0, unitsPerEm 2048; read out of both IMFeENrm28P.ttf and
+// IMFeENit28P.ttf on 2026-09-07). So the mock's 1.45 was arriving as 1.84 em.
+//
+// Call sites keep writing the CSS number and convert here, so the mock and the
+// port can still be compared line for line. The other two faces are recorded
+// beside it for the day a wrapped block uses one.
+inline constexpr float HandFaceLineHeightEm  = 1.269f; // IM Fell English, roman and italic
+inline constexpr float SerifFaceLineHeightEm = 1.180f; // Macondo Swash Caps
+inline constexpr float MonoFaceLineHeightEm  = 1.000f; // VT323 (USE_TYPO_METRICS set)
+
+// NOTE: these are the metrics of the SHIPPED faces. Under -VoxelUINoAssets, or
+// on a checkout missing Content/UI/Fonts, the accessors fall back to the engine
+// face and the conversion is off by that face's metrics instead. That is the
+// documented degraded path, not a bug to guard here.
+inline constexpr float HandLineHeight(float CssLineHeight)
+{
+	return CssLineHeight / HandFaceLineHeightEm;
+}
 } // namespace VoxelUITheme
 
 // --- Layout -----------------------------------------------------------------
@@ -302,6 +370,20 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float QuitSpacer           = 80.f;
 	float ButtonMinHeight      = 56.f;
 	int32 ButtonFontSize       = 24;
+	// DEAD SINCE THE 2026-09-07 TITLE SCREEN, TitleFontSize AND TitleBoxWidth
+	// BOTH. Nothing in the module reads either any more -- the title screen's
+	// wordmark is `.title-logo__name` and comes from LogoFontSize below; a grep
+	// of every .cpp on 2026-09-07 found the only remaining references are their
+	// own ini registrations in VoxelUITheme.cpp.
+	//
+	// This matters because ADR-0011 lists "TitleFontSize = 84 against the
+	// mock's 108" as a constant to re-derive. It cannot be re-derived and does
+	// not need to be: it draws nothing. Left at its values rather than deleted
+	// because the centred oak column they belong to still exists behind the
+	// sub-panels, and re-deriving 84 to 108 without also re-measuring the 720
+	// (which was measured from a rendered capture, not from the face) would
+	// clip the string the day something draws it again.
+	//
 	// 84, not the mock's 108, and with no letter-spacing (the mock asks for
 	// 10px; Slate has no tracking and the Godot build applies none either).
 	int32 TitleFontSize        = 84;
@@ -352,10 +434,21 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	// oak column above is what the previous mock had; its numbers stay because
 	// the sub-panels still use them.
 	float LogoTop              = 80.f;
-	// 100 in the mock. Macondo's swash K overhangs its advance by 0.42 em (73
-	// px at 1440p), which Slate right-aligns without: the 2026-09-07 capture
-	// measured 34 px of ink margin against the mock's ~60. +20 restores it.
-	float LogoRight            = 120.f;
+	// 100, WHICH IS WHAT `.stage .title-logo{right:100px}` SAYS.
+	//
+	// This was 120: +20 over the mock, added to "restore the ink margin" after
+	// a 2026-09-07 capture measured 34 device px of margin against an expected
+	// ~60. ADR-0011 retires that compensation. The 34 was device pixels at a
+	// 1.333 scale (25 units), the ~60 it was compared against was an authored
+	// figure, and the two were never in the same space -- so the deficit it
+	// corrected for may not exist. The overhang itself is real (Macondo's swash
+	// K runs about 0.42 em past its advance, and Slate right-aligns on the
+	// advance) but a browser right-aligns on the box too, so the mock has the
+	// same overhang and the port should not be compensating for it at all.
+	//
+	// If a 1.0-era capture shows the K crowding the frame, the fix is a right
+	// padding on the logo's own text block, not a bigger inset on everything.
+	float LogoRight            = 100.f;
 	int32 LogoFontSize         = 132;
 	// letter-spacing in the mock is px; FSlateFontInfo::LetterSpacing is
 	// 1/1000 em. 6 px at 132 px = 45. (The earlier note that Slate "has no
@@ -415,9 +508,15 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	// family. The scale reads as the author shrinking one card to sit beside two
 	// other states in the same file, not as a design intent, so the authored
 	// 380 px is what is built.
+	// 2 / 2 / 2, NOT THE CSS'S 2 / 1 / 3. VoxelOverlayChrome::Panel stacks these
+	// outside in, so the widths of the three visible bands are Border, then
+	// EdgeRing - Border, then InnerRing - EdgeRing. The mock's 2/1/3 gives bands
+	// of 2, 1 and 2 -- and the 1 is a hairline ADR-0011 forbids. Widening the
+	// edge ring to 2 and the inner ring to 4 gives 2, 2, 2: the panel's chrome
+	// grows by one unit in total and no band is thinner than VoxelUITheme::RulePx.
 	float OverlayBorderPx      = 2.f;  // border:2px solid #000
-	float OverlayEdgeRingPx    = 1.f;  // inset 0 0 0 1px --leather-edge
-	float OverlayInnerRingPx   = 3.f;  // inset 0 0 0 3px --leather-1
+	float OverlayEdgeRingPx    = 2.f;  // inset 0 0 0 1px --leather-edge, widened
+	float OverlayInnerRingPx   = 4.f;  // inset 0 0 0 3px --leather-1, widened
 	float OverlayShadowSize    = 24.f; // 0 8px 24px rgba(0,0,0,.8)
 	float OverlayShadowOffsetY = 8.f;
 	// The paused world behind the panel. The mock blurs it and drops it to 35%
@@ -447,15 +546,31 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 
 	// .se-panel and its rows
 	float SettingsPanelWidth   = 600.f;
-	// The mock is `max-height:calc(100vh - 24px)` on a panel whose content
-	// happens to fit; this port keeps the four GRAPHICS rows the earlier
-	// settings panel already had ON TOP of the mock's audio and display
-	// sections, so it does not fit and the body scrolls. A FIXED height rather
-	// than a max, because a dialog that changes size as rows are added is a
-	// dialog whose footer moves.
-	// 660: measured against the built panel (2026-09-07 settings capture), which
-	// at 780 left a third of itself empty under the last row.
-	float SettingsPanelHeight  = 660.f;
+	// THERE IS NO FIXED PANEL HEIGHT ANY MORE, AND THAT IS THE FIX FOR THE FOLD.
+	//
+	// This was `SettingsPanelHeight = 660`, a constant tuned against one
+	// capture. On the 2026-09-07 settings capture at 2560x1440 it cut OCEAN
+	// MESH DETAIL -- one of only two player-facing water rows -- off below a
+	// scrollbar, because four graphics rows with two-line hints do not fit in
+	// 660 units and nothing in the code knew that. A dialog whose height is a
+	// constant hides a row the moment a row is added, silently, and the row it
+	// hides is always the newest one.
+	//
+	// The panel is now as tall as its content (VoxelOverlayChrome::Panel's
+	// documented `Height <= 0` contract) and clamped only by what the viewport
+	// can hold -- which is the mock's own rule, `max-height:calc(100vh - 24px)`.
+	// The body still sits in an SScrollBox, so a viewport too short for the
+	// content scrolls instead of clipping; at 1080p and 1440p it never engages.
+	float SettingsPanelViewportMargin = 24.f; // .se-panel calc(100vh - 24px)
+	// The floor the viewport clamp will not go below, so a freak-small window
+	// yields a scrolling panel rather than a panel with no body at all.
+	float SettingsPanelMinHeight = 240.f;
+	// AND WHEN IT DOES SCROLL, IT SAYS SO. Slate's default bar is 8 units of
+	// near-panel-coloured hairline; on the 2026-09-07 capture it was drawn, and
+	// the row below it was still read as absent rather than as scrolled off.
+	// A control the player cannot see is the same as no control.
+	float SettingsScrollBarThickness = 12.f;
+	float SettingsScrollBarPadding   = 6.f;
 	float SettingsPanelPadX    = 32.f;
 	float SettingsPanelPadTop  = 18.f;
 	float SettingsPanelPadBottom = 14.f;
@@ -473,7 +588,12 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float SliderValueWidth     = 50.f;
 	int32 SliderValueSize      = 14;
 	float CheckboxSize         = 22.f;
-	float CheckboxMarkSize     = 14.f;
+	// 10, NOT 14. The well's two 1-unit bands became two 2-unit bands under
+	// ADR-0011, which takes the well's interior from 18 units to 14 -- exactly
+	// the old mark, so a checked box would have read as a solid block with no
+	// well left around it. 10 restores the two-unit gap the mock's
+	// `.ck-box::after` sits in.
+	float CheckboxMarkSize     = 10.f;
 	int32 SettingsCyclerSize   = 15;
 	int32 SettingsBadgeSize    = 11;
 	int32 SettingsHelpSize     = 12;
@@ -482,6 +602,8 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float SettingsActionPadX   = 24.f;
 	float SettingsActionPadY   = 9.f;
 	int32 SettingsHintSize     = 13;
+	// `.grp-head` letter-spacing: 3 px at the sub-tab label size.
+	int32 CodexGroupLetterSpacing = 231;
 	// THE HINT WRAPS AT AN EXPLICIT WIDTH, NOT WITH AutoWrapText, and this is a
 	// measurement rather than a preference. Inside the panel's SScrollBox an
 	// auto-wrapping block wrapped at a width WIDER than the panel and was
@@ -695,6 +817,11 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float InvRenderFrameHeight = 300.f;
 	int32 InvStatsSize         = 17;
 	int32 InvWeightSize        = 17;
+	// `#invSearch{max-width:280px}`. A REAL WIDTH, not a max on a stretched
+	// slot: see the note at the call site for why the max never bound.
+	float InvSearchWidth       = 280.f;
+	// `.weight i` -- the 11 px swatch in front of the readout.
+	float InvWeightSwatchSize  = 11.f;
 
 	// --- Map ----------------------------------------------------------------
 	float MapCompassSize       = 72.f;

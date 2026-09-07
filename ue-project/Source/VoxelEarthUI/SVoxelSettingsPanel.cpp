@@ -12,6 +12,7 @@
 #include "Engine/Engine.h" // GEngine, guarding UGameUserSettings::GetGameUserSettings
 #include "Framework/Application/SlateApplication.h"
 #include "GameFramework/GameUserSettings.h"
+#include "Types/SlateStructs.h" // FOptionalSize -- MaxPanelHeight's return
 #include "Widgets/Input/SCheckBox.h"
 #include "Widgets/Input/SSlider.h"
 #include "Widgets/Images/SImage.h"
@@ -135,6 +136,20 @@ void SVoxelSettingsPanel::Construct(const FArguments& InArgs)
 		              })
 	];
 
+	// --- INTERFACE ----------------------------------------------------------
+	// NOT IN THE MOCK. ADR-0011 decision 5: the engine scales the interface
+	// continuously off the shortest side, and the player gets a manual
+	// multiplier on top of that -- the project's settings-panel policy applied
+	// to size. See VoxelGraphicsUserSettings::GetUIScale.
+	Body->AddSlot().AutoHeight().Padding(RowPad)
+	[
+		VoxelOverlayChrome::SectionHeader(VoxelUIStrings::SettingsSectionInterface())
+	];
+	Body->AddSlot().AutoHeight().Padding(RowPad)
+	[
+		BuildUIScaleRow()
+	];
+
 	Body->AddSlot().AutoHeight().Padding(RowPad)
 	[
 		VoxelOverlayChrome::SectionHeader(VoxelUIStrings::SettingsSectionGraphics())
@@ -203,42 +218,75 @@ void SVoxelSettingsPanel::Construct(const FArguments& InArgs)
 	.HAlign(HAlign_Center)
 	.VAlign(VAlign_Center)
 	[
-		VoxelOverlayChrome::Panel(
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, L.SettingsPanelGap))
-			[
-				VoxelOverlayChrome::Title(VoxelUIStrings::SettingsPanelTitle(), L.SettingsTitleSize,
-				                          L.SettingsTitleLetterSpacing)
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				VoxelOverlayChrome::Rule()
-			]
-			// SCROLLED, for the reason BuildMessagePanel's body is: this panel
-			// carries the mock's two sections AND the four graphics rows that
-			// already shipped, and it is the rows that will keep arriving.
-			+ SVerticalBox::Slot().FillHeight(1.f).Padding(FMargin(0.f, L.SettingsPanelGap))
-			[
-				SNew(SScrollBox)
-				+ SScrollBox::Slot()
+		// THE VIEWPORT CLAMP, WHICH REPLACED A FIXED PANEL HEIGHT.
+		//
+		// The panel below asks for Height 0 -- VoxelOverlayChrome::Panel's
+		// "as tall as the content" contract -- so every row it carries is on
+		// screen at once and the SScrollBox inside it never engages. This box
+		// is the only thing that stops it: it caps the panel at what the
+		// viewport can hold, exactly as the mock's
+		// `max-height:calc(100vh - 24px)` does.
+		//
+		// MaxDesiredHeight is bound to THIS widget's geometry, not the panel's,
+		// and that distinction is what makes it safe. Both hosts (the title
+		// screen's switcher and the pause overlay's) give this widget a filling
+		// slot, so its own size is the whole overlay area and does not depend
+		// on how tall the panel wants to be -- there is no feedback loop
+		// between the measurement and the thing being measured.
+		SNew(SBox)
+		.MaxDesiredHeight(this, &SVoxelSettingsPanel::MaxPanelHeight)
+		[
+			VoxelOverlayChrome::Panel(
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, L.SettingsPanelGap))
 				[
-					Body
+					VoxelOverlayChrome::Title(VoxelUIStrings::SettingsPanelTitle(), L.SettingsTitleSize,
+					                          L.SettingsTitleLetterSpacing)
 				]
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				VoxelOverlayChrome::Rule()
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, L.SettingsPanelGap, 0.f, 0.f))
-			[
-				Footer
-			],
-			L.SettingsPanelWidth, L.SettingsPanelHeight,
-			FMargin(L.SettingsPanelPadX, L.SettingsPanelPadTop, L.SettingsPanelPadX, L.SettingsPanelPadBottom))
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					VoxelOverlayChrome::Rule()
+				]
+				// STILL SCROLLED, BUT AS A BACKSTOP RATHER THAN AS THE LAYOUT.
+				// The slot fills, and in a content-sized panel "fill" resolves
+				// to exactly the scroll box's own desired height -- so at any
+				// viewport this game ships on, every row is drawn and the bar
+				// never appears. It engages only when the clamp above bites,
+				// i.e. on a window shorter than the panel, which is the one
+				// case where scrolling beats clipping.
+				+ SVerticalBox::Slot().FillHeight(1.f).Padding(FMargin(0.f, L.SettingsPanelGap))
+				[
+					SNew(SScrollBox)
+					// When it DOES engage, it must not do so silently: the
+					// 2026-09-07 capture hid OCEAN MESH DETAIL behind a hairline
+					// bar nobody read as an affordance. Thicker, and padded off
+					// the last column of text.
+					.ScrollBarThickness(FVector2f(L.SettingsScrollBarThickness, L.SettingsScrollBarThickness))
+					.ScrollBarPadding(FMargin(L.SettingsScrollBarPadding, 0.f, 0.f, 0.f))
+					+ SScrollBox::Slot()
+					[
+						Body
+					]
+				]
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					VoxelOverlayChrome::Rule()
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, L.SettingsPanelGap, 0.f, 0.f))
+				[
+					Footer
+				],
+				// HEIGHT 0 = AS TALL AS THE CONTENT. The clamp above is the only
+				// cap; see FVoxelMenuLayout::SettingsPanelViewportMargin.
+				L.SettingsPanelWidth, 0.f,
+				FMargin(L.SettingsPanelPadX, L.SettingsPanelPadTop, L.SettingsPanelPadX, L.SettingsPanelPadBottom))
+		]
 	];
 }
 
-TSharedRef<SWidget> SVoxelSettingsPanel::BuildSliderRow(const FText& Label, float (*Get)(), void (*Set)(float))
+TSharedRef<SWidget> SVoxelSettingsPanel::BuildSliderRow(const FText& Label, TFunction<float()> Get,
+                                                        TFunction<void(float)> Set, TFunction<FText()> Readout,
+                                                        float Step)
 {
 	using namespace VoxelUITheme;
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
@@ -257,17 +305,21 @@ TSharedRef<SWidget> SVoxelSettingsPanel::BuildSliderRow(const FText& Label, floa
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(FLinearColor::Black))
 			]
-			+ SOverlay::Slot().Padding(FMargin(1.f))
+			+ SOverlay::Slot().Padding(FMargin(RulePx))
 			[
 				SNew(SImage).Image(Style.SolidWhite())
 				.ColorAndOpacity(FSlateColor(Tint(LeatherEdge)))
 			]
-			+ SOverlay::Slot().Padding(FMargin(2.f))
+			+ SOverlay::Slot().Padding(FMargin(RulePx * 2.f))
 			[
 				SNew(SImage).Image(Style.SolidWhite())
 				.ColorAndOpacity(FSlateColor(Tint(Mix(WellTop, WellBottom))))
 			]
-			+ SOverlay::Slot().Padding(FMargin(2.f))
+			// THE SAME INSET AS THE WELL ABOVE IT. The value fill sits inside
+			// the well, not on top of the edge ring; when the ring widened to
+			// VoxelUITheme::RulePx this had to move with it or the warm bar
+			// would paint over the border it is supposed to sit within.
+			+ SOverlay::Slot().Padding(FMargin(RulePx * 2.f))
 			[
 				SNew(SHorizontalBox)
 				+ SHorizontalBox::Slot()
@@ -287,7 +339,7 @@ TSharedRef<SWidget> SVoxelSettingsPanel::BuildSliderRow(const FText& Label, floa
 				SNew(SSlider)
 				.Style(&Style.Slider())
 				.Value(TAttribute<float>::CreateLambda([Get]() { return Get(); }))
-				.StepSize(SVoxelSettingsPanelDetail::kSliderStep)
+				.StepSize(Step > 0.f ? Step : SVoxelSettingsPanelDetail::kSliderStep)
 				.IsFocusable(true)
 				// SSlider defaults to requiring a gamepad "lock" press before
 				// the stick moves the value. On a settings panel a player has
@@ -328,8 +380,12 @@ TSharedRef<SWidget> SVoxelSettingsPanel::BuildSliderRow(const FText& Label, floa
 				// .sl-val is Courier at 14 px; VT323 is this port's --mono and
 				// the readout is the same kind of thing -- a fixed-width number
 				// that must not jitter as it counts.
-				.Text(TAttribute<FText>::CreateLambda([Get]()
+				.Text(TAttribute<FText>::CreateLambda([Get, Readout]()
 				{
+					if (Readout)
+					{
+						return Readout();
+					}
 					return FText::AsNumber(FMath::RoundToInt(Get() * 100.f));
 				}))
 				.Font(Style.Mono(L.SliderValueSize))
@@ -339,6 +395,52 @@ TSharedRef<SWidget> SVoxelSettingsPanel::BuildSliderRow(const FText& Label, floa
 		];
 
 	return Row;
+}
+
+TSharedRef<SWidget> SVoxelSettingsPanel::BuildUIScaleRow()
+{
+	using namespace VoxelUITheme;
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	// THE SLIDER RUNS 0..1 AND THE SETTING DOES NOT, so the mapping lives here
+	// and the range is asked for rather than restated -- UIScaleMin/Max are the
+	// one authority (VoxelGraphicsUserSettings.h).
+	const float Min = VoxelGraphicsUserSettings::UIScaleMin();
+	const float Max = VoxelGraphicsUserSettings::UIScaleMax();
+	const float Span = FMath::Max(Max - Min, UE_KINDA_SMALL_NUMBER);
+	// One keyboard press = one 0.05 stop of the SETTING, not 5% of the track.
+	// Without this the arrow keys would move by a fraction the setter then
+	// snapped away, and every other press would appear to do nothing.
+	const float Step = VoxelGraphicsUserSettings::UIScaleStep() / Span;
+
+	TSharedRef<SWidget> Row = BuildSliderRow(
+		VoxelUIStrings::SettingsUIScaleLabel(),
+		[Min, Span]() { return (VoxelGraphicsUserSettings::GetUIScale() - Min) / Span; },
+		[Min, Span](float Fraction) { VoxelGraphicsUserSettings::SetUIScale(Min + Fraction * Span); },
+		[]()
+		{
+			return VoxelUIStrings::SettingsPercent(
+				FMath::RoundToInt(VoxelGraphicsUserSettings::GetUIScale() * 100.f));
+		},
+		Step);
+
+	// The hint sits under the row, on the same terms and at the same indent as
+	// BuildCheckRow's -- see the note there for why it is not inline.
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			Row
+		]
+		+ SVerticalBox::Slot().AutoHeight()
+		.Padding(FMargin(L.CheckboxSize + L.SettingsRowGap, 2.f, 0.f, 0.f))
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::SettingsUIScaleHint())
+			.Font(Style.HandItalic(L.SettingsHintSize))
+			.ColorAndOpacity(FVoxelUIStyle::MutedColour())
+			.WrapTextAt(L.SettingsHintWrapWidth)
+		];
 }
 
 TSharedRef<SWidget> SVoxelSettingsPanel::BuildCheckRow(const FText& Label, const FText& Hint,
@@ -381,11 +483,11 @@ TSharedRef<SWidget> SVoxelSettingsPanel::BuildCheckRow(const FText& Label, const
 						[
 							SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(FLinearColor::Black))
 						]
-						+ SOverlay::Slot().Padding(FMargin(1.f))
+						+ SOverlay::Slot().Padding(FMargin(RulePx))
 						[
 							SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(LeatherEdge)))
 						]
-						+ SOverlay::Slot().Padding(FMargin(2.f))
+						+ SOverlay::Slot().Padding(FMargin(RulePx * 2.f))
 						[
 							SNew(SImage).Image(Style.SolidWhite())
 							.ColorAndOpacity(FSlateColor(Tint(Mix(WellTop, WellBottom))))
@@ -435,6 +537,26 @@ void SVoxelSettingsPanel::ApplyPending()
 		return; // the ordinary case: nothing deferred is outstanding
 	}
 	SVoxelSettingsPanelDetail::SetFullscreenNow(bPendingFullscreen);
+}
+
+FOptionalSize SVoxelSettingsPanel::MaxPanelHeight() const
+{
+	// This widget's own arranged height, which is the whole overlay area: both
+	// hosts put it in a filling slot. Reading it here rather than asking
+	// FSlateApplication for a window size keeps the number in the same
+	// coordinate space and the same DPI scale as the panel it is capping.
+	const float Available = GetTickSpaceGeometry().GetLocalSize().Y;
+	if (Available <= 0.f)
+	{
+		// The first prepass, before this widget has ever been arranged. An
+		// UNSET size, not a guess: the panel measures at its natural height for
+		// one frame and the cap lands on the next. It can only ever shrink a
+		// panel that would not have fitted anyway.
+		return FOptionalSize();
+	}
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+	return FOptionalSize(
+		FMath::Max(L.SettingsPanelMinHeight, Available - L.SettingsPanelViewportMargin));
 }
 
 void SVoxelSettingsPanel::FocusDefaultWidget()

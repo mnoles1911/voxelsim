@@ -56,7 +56,7 @@ void SVoxelSaveDialog::Construct(const FArguments& InArgs)
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(LeatherEdge)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(1.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 		[
 			// Opaque, composited once against the panel -- see VoxelUITheme::Over.
 			SNew(SImage).Image(Style.SolidWhite())
@@ -75,7 +75,7 @@ void SVoxelSaveDialog::Construct(const FArguments& InArgs)
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(LeatherEdge)))
 					]
-					+ SOverlay::Slot().Padding(FMargin(1.f))
+					+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 					[
 						SNew(SImage).Image(Style.SolidWhite())
 						.ColorAndOpacity(FSlateColor(Tint(Mix(Leather1, Leather2))))
@@ -112,11 +112,11 @@ void SVoxelSaveDialog::Construct(const FArguments& InArgs)
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(FLinearColor::Black))
 		]
-		+ SOverlay::Slot().Padding(FMargin(1.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(ParchmentEdge)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(2.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 		[
 			SNew(SImage).Image(Style.SolidWhite())
 			.ColorAndOpacity(FSlateColor(Tint(Mix(Parchment, Parchment2))))

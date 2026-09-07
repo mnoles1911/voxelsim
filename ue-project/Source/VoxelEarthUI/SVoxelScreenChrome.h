@@ -72,8 +72,33 @@ VOXELEARTHUI_API TSharedRef<SWidget> ItemGlyph(FName Glyph, float Size);
 // A horizontal 1 px rule in --panel-oak-edge, for the hairlines inside a card.
 VOXELEARTHUI_API TSharedRef<SWidget> CardRule(float Alpha = 1.f);
 
+// A vertical `linear-gradient(180deg, Top, Mid, Bottom)`, as a stack of flat
+// bands.
+//
+// BANDS, NOT SSimpleGradient, AND THE REASON IS GAMMA. Slate does have a
+// gradient primitive, but SSimpleGradient paints with
+// ESlateDrawEffect::NoGamma -- its stops bypass the transform every other
+// colour in this front end goes through (VoxelUITheme::Tint decodes the sRGB
+// token, Slate re-encodes on output). Mixing the two paths would give one bar
+// on the screen a different answer to "what colour is #b8302a" from the box
+// beside it, and the difference would only ever show up in a capture. Bands go
+// through the ordinary tinted-brush path, so every colour in the port is still
+// resolved exactly one way. At the 11-18 px heights these ramps are used at,
+// Steps of 4-6 is already below one band per two device pixels.
+//
+// The stops are the CSS's: Top at 0%, Mid at the middle, Bottom at 100%.
+VOXELEARTHUI_API TSharedRef<SWidget> VerticalRamp(const FColor& Top, const FColor& Mid, const FColor& Bottom,
+                                                  int32 Steps = 5, float Alpha = 1.f);
+
 // A labelled progress track: the level bar, the reputation bar and the HUD's
 // vitals are the same two boxes at three sizes. Fraction is 0..1.
 VOXELEARTHUI_API TSharedRef<SWidget> Track(float Height, const FSlateColor& Fill,
                                            const TAttribute<float>& Fraction);
+
+// The same track with a THREE-STOP VERTICAL RAMP for its fill, which is what
+// every `.bar .fill` in the HUD mock actually is. The flat overload above is
+// still the right call for the level and reputation bars, whose CSS is a flat
+// colour.
+VOXELEARTHUI_API TSharedRef<SWidget> Track(float Height, const FColor& FillTop, const FColor& FillMid,
+                                           const FColor& FillBottom, const TAttribute<float>& Fraction);
 } // namespace VoxelScreenChrome

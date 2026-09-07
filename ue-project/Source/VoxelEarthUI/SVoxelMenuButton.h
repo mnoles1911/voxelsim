@@ -150,6 +150,21 @@ private:
 	// Muted; that exception lives inside the function rather than at four call
 	// sites.
 	bool IsLit() const;
+	// THE CARTOUCHE HAS TWO WAYS ON, AND ONLY ONE OF THEM IS THE POINTER.
+	//
+	// `.title-menu__item.active` and `.dlg-option.selected` are STATES the mock
+	// sets on the current selection; they are not `:hover`. Keying the gold
+	// band off IsLit() alone made the only selection indicator on the title
+	// screen and in the dialogue overlay depend on the inner SButton holding
+	// keyboard focus -- so anything that takes focus elsewhere (a viewport
+	// click, a capture harness, a panel that focuses its own default) erases
+	// it, which is exactly what the 2026-09-07 captures show on both screens.
+	//
+	// Kept separate from IsLit rather than folded into it: the Leather variant
+	// already reads the same Active attribute through IsWarmPlate, and making
+	// Active imply "lit" there would give a selected filter chip the HOVER
+	// plate as well as the selected one.
+	bool IsCartoucheOn() const;
 	FSlateColor GetCartoucheLabelColour() const;
 	FSlateColor GetCartoucheFillColour() const;
 	FSlateColor GetCartoucheRuleColour() const;

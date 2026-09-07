@@ -117,6 +117,10 @@ private:
 	EVoxelMenuPanel VisiblePanel = EVoxelMenuPanel::MainColumn;
 
 	bool HasAnyLoadableSave() const;
+	// Whether the keyboard is on none of the title-screen items. Drives the
+	// resting `.title-menu__item.active` cartouche on NEW GAME -- see the call
+	// site for why a focus-only highlight was not enough.
+	bool HasNoColumnFocus() const;
 
 	const struct FSlateBrush* GetBackgroundBrush() const;
 	FSlateColor GetBackgroundTint() const;

@@ -1,6 +1,7 @@
 #include "SVoxelInventoryScreen.h"
 
 #include "SVoxelMenuButton.h"
+#include "SVoxelOverlayChrome.h" // Diamond -- the weight swatch's ornament
 #include "SVoxelScreenChrome.h"
 #include "SVoxelScreenShell.h"
 #include "VoxelUIStrings.h"
@@ -93,11 +94,18 @@ TSharedRef<SWidget> SVoxelInventoryScreen::BuildPackColumn()
 		[
 			VoxelScreenChrome::PanelHeading(VoxelUIStrings::InvPack())
 		]
-		+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+		// AUTOWIDTH PLUS A FIXED BOX, NOT FILLWIDTH PLUS MaxDesiredWidth.
+		// MaxDesiredWidth caps what a widget ASKS for; a FillWidth slot hands
+		// it the remainder of the row whatever it asked for, so the 280 px cap
+		// that was already written here never bound anything -- the 2026-09-07
+		// capture measured the field at ~537 device px (~403 units). The mock's
+		// `#invSearch{max-width:280px}` is what pushes the weight readout to the
+		// right-hand end of .panel-head, so the cap has to be real.
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
 		.Padding(FMargin(12.f, 0.f))
 		[
 			SNew(SBox)
-			.MaxDesiredWidth(280.f)
+			.WidthOverride(L.InvSearchWidth)
 			[
 				SNew(SEditableTextBox)
 				.Font(Style.Mono(L.InvWeightSize))
@@ -108,6 +116,24 @@ TSharedRef<SWidget> SVoxelInventoryScreen::BuildPackColumn()
 					RebuildPack();
 				})
 			]
+		]
+		// The spacer the FillWidth used to be. `.panel-head` is
+		// `justify-content:space-between` with the weight readout last, so
+		// something has to eat the slack and it must not be the search field.
+		+ SHorizontalBox::Slot().FillWidth(1.f)
+		[
+			SNullWidget::NullWidget
+		]
+		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+		.Padding(FMargin(0.f, 0.f, 6.f, 0.f))
+		[
+			// `.weight i` -- an 11 px --bronze swatch before the number. The
+			// mock clips it to a hexagon; no shipped face carries a hexagon
+			// glyph (a cmap dump of all four on 2026-09-07 found none of
+			// U+2B22, U+2B21, U+2726 or U+2205), so it takes the same rotated
+			// square this front end already uses wherever a mock ornament has
+			// no glyph -- see VoxelOverlayChrome::Diamond.
+			VoxelOverlayChrome::Diamond(L.InvWeightSwatchSize, FSlateColor(Tint(Bronze)))
 		]
 		+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
 		[
@@ -325,7 +351,16 @@ TSharedRef<SWidget> SVoxelInventoryScreen::BuildCraftMode()
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 
 	TSharedRef<SUniformGridPanel> Grid =
-		SNew(SUniformGridPanel).SlotPadding(FMargin(L.InvCraftSlotGap * 0.5f));
+		// AN ODD GAP, SPLIT ASYMMETRICALLY. `.craft-3` is a 3 px gap and the
+		// symmetric half of an odd number is 1.5. Not a correctness problem
+		// under ADR-0011's continuous scale, but a fractional authored value
+		// buys nothing; the halves are 2 and 1 instead, so between any two
+		// cells the gap is still exactly 3 and no authored edge is fractional.
+		SNew(SUniformGridPanel).SlotPadding(
+			FMargin(FMath::FloorToFloat(L.InvCraftSlotGap * 0.5f) + 1.f,
+			        FMath::FloorToFloat(L.InvCraftSlotGap * 0.5f) + 1.f,
+			        FMath::FloorToFloat(L.InvCraftSlotGap * 0.5f),
+			        FMath::FloorToFloat(L.InvCraftSlotGap * 0.5f)));
 	for (int32 I = 0; I < 9; ++I)
 	{
 		Grid->AddSlot(I % 3, I / 3)

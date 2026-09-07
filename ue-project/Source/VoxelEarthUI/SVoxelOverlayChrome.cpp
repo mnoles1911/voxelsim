@@ -98,7 +98,8 @@ TSharedRef<SWidget> Title(const FText& Text, int32 FontSize, int32 LetterSpacing
 TSharedRef<SWidget> Rule(float Alpha)
 {
 	using namespace VoxelUITheme;
-	return SNew(SBox).HeightOverride(1.f)
+	// ADR-0011: 2 units, not the CSS's 1 px. See VoxelUITheme::RulePx.
+	return SNew(SBox).HeightOverride(RulePx)
 		[
 			VoxelOverlayChromeDetail::Box(FSlateColor(Tint(LeatherEdge, Alpha)))
 		];
@@ -154,7 +155,7 @@ TSharedRef<SWidget> KeyCap(const FText& Key)
 		[
 			VoxelOverlayChromeDetail::Box(FSlateColor(Tint(LeatherEdge)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(1.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 		[
 			VoxelOverlayChromeDetail::Box(FSlateColor(Tint(Leather2)))
 		]

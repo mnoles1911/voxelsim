@@ -156,11 +156,14 @@ TSharedRef<SWidget> SVoxelDialogueOverlay::BuildSpeaker() const
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Bronze))
 			]
-			+ SOverlay::Slot().Padding(FMargin(3.f))
+			// 4 and 6, not 3 and 5: ADR-0011. The bronze and bronze-deep bands
+			// were one unit each; both are two now and the ring stack is
+			// 2 / 2 / 2 like every other in this front end.
+			+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(BronzeDeep))
 			]
-			+ SOverlay::Slot().Padding(FMargin(5.f))
+			+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 3.f))
 			[
 				SNew(SImage).Image(Style.SolidWhite())
 				.ColorAndOpacity(Tint(Mix(PanelIron, FColor(0x14, 0x10, 0x0a))))
@@ -206,7 +209,7 @@ TSharedRef<SWidget> SVoxelDialogueOverlay::BuildSpeaker() const
 						.Font(Style.HandItalic(L.DlgSpeakerLineSize))
 						.ColorAndOpacity(Tint(InkBright))
 						.AutoWrapText(true)
-						.LineHeightPercentage(1.35f)
+						.LineHeightPercentage(HandLineHeight(1.35f))
 						.ShadowOffset(FVector2D(0.f, 2.f))
 						.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.9f))
 					]
@@ -268,7 +271,9 @@ TSharedRef<SWidget> SVoxelDialogueOverlay::BuildOptions()
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(BronzeDeep))
 				]
-				+ SOverlay::Slot().Padding(FMargin(1.5f))
+				// 2, NOT 1.5 -- ADR-0011's two-unit floor; see the same ring in
+				// SVoxelGameHud's interact key.
+				+ SOverlay::Slot().Padding(FMargin(2.f))
 				[
 					SNew(SImage).Image(Style.SolidWhite())
 					.ColorAndOpacity(Tint(FColor(0x14, 0x0e, 0x08), 0.7f))
@@ -290,25 +295,27 @@ TSharedRef<SWidget> SVoxelDialogueOverlay::BuildOptions()
 			// its longest reply and the stage is 780 px wide, which fits them.
 			SNew(STextBlock)
 			.Text(Option.Text)
-			.Font(Style.HandItalic(L.DlgOptionSize))
+			// UPRIGHT, NOT ITALIC. `.dlg-option` sets no font-style; only
+			// `.dlg-speaker__line` and `.role` are italic in this mock, and
+			// putting the replies in the same italic as the NPC's spoken line
+			// erased the difference between what is said and what you may say.
+			.Font(Style.Hand(L.DlgOptionSize))
 			.ColorAndOpacity(Tint(Option.bAvailable ? InkBright : InkMute))
 			.Justification(ETextJustify::Right)
 			.ShadowOffset(FVector2D(0.f, 2.f))
 			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.85f))
 		];
-		// .dlg-option__diamond -- a small rotated gold square. Slate has no
-		// rotation on a brush, so it is drawn square, on the same terms as
-		// VoxelOverlayChrome::Diamond's substitution for the missing glyph.
+		// .dlg-option__diamond -- a small gold square at `rotate(45deg)`.
+		// SLATE DOES HAVE THE ROTATION: SBox takes a RenderTransform, which is
+		// exactly what VoxelOverlayChrome::Diamond already wraps for the save
+		// dialog's ornament. The comment that used to sit here said Slate had
+		// no rotation on a brush, which is true and beside the point -- the
+		// transform goes on the widget, not on the brush.
 		Row->AddSlot().AutoWidth().VAlign(VAlign_Center)
 		.Padding(FMargin(10.f, 0.f, 0.f, 0.f))
 		[
-			SNew(SBox)
-			.WidthOverride(L.DlgOptionDiamondSize)
-			.HeightOverride(L.DlgOptionDiamondSize)
-			[
-				SNew(SImage).Image(Style.SolidWhite())
-				.ColorAndOpacity(Tint(Gold, Option.bAvailable ? 1.f : 0.3f))
-			]
+			VoxelOverlayChrome::Diamond(L.DlgOptionDiamondSize,
+			                            FSlateColor(Tint(Gold, Option.bAvailable ? 1.f : 0.3f)))
 		];
 
 		TSharedPtr<SVoxelMenuButton> Button;
@@ -325,6 +332,15 @@ TSharedRef<SWidget> SVoxelDialogueOverlay::BuildOptions()
 				.Text(FText::GetEmpty())
 				.Variant(EVoxelMenuButtonVariant::Cartouche)
 				.MinHeight(0.f)
+				// `.dlg-option.selected` -- THE SELECTION INDICATOR, and it is
+				// bound to Selected rather than left to keyboard focus. The
+				// 2026-09-07 dialogue capture shows row 1 with no highlight at
+				// all while Selected was 0: the cartouche keyed only off the
+				// inner SButton holding focus, which the game viewport takes
+				// back the moment anything else asks for it. This screen's
+				// whole affordance is "which reply am I on", so it cannot be
+				// the one thing that depends on focus surviving.
+				.Active_Lambda([this, I]() { return Selected == I; })
 				.IsEnabled(Option.bAvailable)
 				.ContentPadding(FMargin(L.DlgOptionPadX, L.DlgOptionPadY))
 				.OnClicked_Lambda([this, I]() { Commit(I); return FReply::Handled(); })
@@ -377,7 +393,7 @@ TSharedRef<SWidget> SVoxelDialogueOverlay::BuildSkillStrip() const
 			// .dlg-skill's `border-right`, as a hairline between cells.
 			Row->AddSlot().AutoWidth()
 			[
-				SNew(SBox).WidthOverride(1.f)
+				SNew(SBox).WidthOverride(VoxelUITheme::RulePx)
 				[
 					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(BronzeDeep, 0.4f))
 				]
@@ -395,13 +411,14 @@ TSharedRef<SWidget> SVoxelDialogueOverlay::BuildSkillStrip() const
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Bronze))
 		]
-		+ SOverlay::Slot().Padding(FMargin(3.f))
+		// 4, not 3: the bronze band above was one unit. ADR-0011.
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 		[
 			SNew(SImage).Image(Style.SolidWhite())
 			.ColorAndOpacity(Tint(Over(Mix(FColor(0x28, 0x1c, 0x10), FColor(0x14, 0x0e, 0x08)),
 			                          0.85f, FColor::Black)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(3.f))
+		+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 		[
 			Row
 		];

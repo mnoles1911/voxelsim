@@ -40,6 +40,22 @@ FText SettingsFullscreenLabel() { return LOCTEXT("SetFullscreen", "FULLSCREEN");
 // The one row on this panel that does NOT take effect as you touch it, said out
 // loud rather than left for the player to discover by not noticing.
 FText SettingsFullscreenHint() { return LOCTEXT("SetFullscreenHint", "Takes effect on APPLY."); }
+FText SettingsUIScaleLabel() { return LOCTEXT("SetUIScale", "INTERFACE SIZE"); }
+// Says what the row does and no more. Under ADR-0011 the engine already sizes
+// the interface for the screen, so 100% is "what was designed for this display"
+// rather than a sharpness claim -- the earlier wording promised a
+// pixel-exactness that continuous scaling does not deliver at any setting.
+FText SettingsUIScaleHint()
+{
+	return LOCTEXT("SetUIScaleHint",
+	               "How large the menus and the HUD are drawn. 100% is the size chosen for your "
+	               "screen; raise it if the text is small, lower it for more room.");
+}
+FText SettingsSectionInterface() { return LOCTEXT("SetSecInterface", "INTERFACE"); }
+FText SettingsPercent(int32 Percent)
+{
+	return FText::Format(LOCTEXT("SetPercent", "{0}%"), FText::AsNumber(Percent));
+}
 FText ButtonApply() { return LOCTEXT("BtnApply", "APPLY"); }
 FText ButtonSaveAndLeave() { return LOCTEXT("BtnSaveLeave", "SAVE & LEAVE"); }
 FText SettingsBackHint() { return LOCTEXT("SetBackHint", "back"); }
@@ -301,7 +317,18 @@ const TArray<FText>& PlayerEquipSlotNames()
 	return Names;
 }
 
-FText InvSearchHint() { return LOCTEXT("InvSearch", "Search the pack"); }
+// The mock's `#invSearch` placeholder is the bare "Search…"; the longer
+// sentence read as a label rather than as a hint next to a 280 px field.
+FText InvSearchHint() { return LOCTEXT("InvSearch", "Search…"); }
+
+// `.slot .qty` is built in the mock as `'×' + it.qty` -- the count is
+// always prefixed, so a lone "16" in the corner of a cell reads as an index
+// rather than as a quantity. U+00D7 is in the cmap of all four shipped faces
+// (checked 2026-09-07), unlike the mocks' U+2726 and U+2205.
+FText ItemStackCount(int32 Count)
+{
+	return FText::Format(LOCTEXT("ItemStackCount", "×{0}"), FText::AsNumber(Count));
+}
 
 FText InvWeight(float CarriedKg)
 {
@@ -416,8 +443,11 @@ FText JournalStepProgress(int32 Done, int32 Total, const FText& Place)
 
 FText JournalCardStamp(int32 Day, const FText& Season)
 {
+	// `${e.season.toUpperCase()}` -- the whole stamp is upper case in the mock,
+	// and half-capitalising it ("DAY 12 . Summer") reads as a mistake rather
+	// than as a style.
 	return FText::Format(LOCTEXT("JrCardStamp", "DAY {0} · {1}"),
-	                     FText::AsNumber(Day), Season);
+	                     FText::AsNumber(Day), Season.ToUpper());
 }
 
 FText PlayerSubStats()      { return LOCTEXT("PlSubStats", "STATS"); }

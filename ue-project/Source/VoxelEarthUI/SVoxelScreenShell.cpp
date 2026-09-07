@@ -316,11 +316,11 @@ TSharedRef<SWidget> SVoxelScreenShell::BuildActionBar() const
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(FColor::Black))
 					]
-					+ SOverlay::Slot().Padding(FMargin(1.f))
+					+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx))
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(PanelIronEdge))
 					]
-					+ SOverlay::Slot().Padding(FMargin(2.f))
+					+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 					[
 						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(PanelIron))
 					]

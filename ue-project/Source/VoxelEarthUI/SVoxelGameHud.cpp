@@ -91,7 +91,10 @@ void SVoxelGameHud::Construct(const FArguments& InArgs)
 						SNew(SImage).Image(FVoxelUIStyle::Get().SolidWhite())
 						.ColorAndOpacity(VoxelUITheme::Tint(VoxelUITheme::Bronze))
 					]
-					+ SOverlay::Slot().Padding(FMargin(1.5f))
+					// 2, NOT 1.5. ADR-0011 forbids any band under two units, and
+					// two is what the compass frame in this same file uses for
+					// the identical bronze band.
+					+ SOverlay::Slot().Padding(FMargin(2.f))
 					[
 						SNew(SImage).Image(FVoxelUIStyle::Get().SolidWhite())
 						.ColorAndOpacity(VoxelUITheme::Tint(FColor(0x14, 0x0e, 0x08), 0.85f))
@@ -150,7 +153,15 @@ FMargin SVoxelGameHud::GetTapePadding() const
 	                   - L.HudCompassSegWidth * 0.5f
 	                   - TurnWidth
 	                   - (Cached.HeadingDeg / 30.f) * L.HudCompassSegWidth;
-	return FMargin(Offset, 0.f, 0.f, 0.f);
+	// ROUNDED TO A WHOLE UNIT, and what it buys is worth stating precisely. The
+	// heading term is continuous, so the tape's left edge otherwise lands on an
+	// arbitrary fraction and every tick and cardinal letter is resampled on a
+	// different subpixel phase each frame. ADR-0011 makes the display scale
+	// continuous too, so this does NOT buy pixel alignment -- it buys a STABLE
+	// phase, which is what stops the letters shimmering as the player turns.
+	// The tape advances one unit per half a degree at the shipped 60-unit
+	// segment, below what a turning player can see.
+	return FMargin(FMath::RoundToFloat(Offset), 0.f, 0.f, 0.f);
 }
 
 TSharedRef<SWidget> SVoxelGameHud::BuildBarTicks() const
@@ -171,7 +182,12 @@ TSharedRef<SWidget> SVoxelGameHud::BuildBarTicks() const
 		{
 			Row->AddSlot().AutoWidth()
 			[
-				SNew(SBox).WidthOverride(1.f)
+				// ADR-0011 promotes these ticks with everything else. THE ONE
+				// PROMOTION MOST LIKELY TO LOOK WRONG: nine 2-unit rules on an
+				// 11-unit bar is a lot of black where the CSS asks for 1 px.
+				// Flagged for the owner's capture rather than exempted, because a
+				// 1-unit tick smears at 1.333 exactly like every other rule.
+				SNew(SBox).WidthOverride(RulePx)
 				[
 					SNew(SImage).Image(Style.SolidWhite())
 					.ColorAndOpacity(Tint(FColor::Black, 0.55f))
@@ -226,14 +242,17 @@ TSharedRef<SWidget> SVoxelGameHud::BuildCompass()
 			[
 				SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Bronze))
 			]
-			+ SOverlay::Slot().Padding(FMargin(3.f))
+			// 4, NOT 3: the bronze band between this inset and the 2 above it
+			// was one unit wide (ADR-0011). The tape's clip inset below moves
+			// with it or the strip paints over the frame.
+			+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 			[
 				SNew(SImage).Image(Style.SolidWhite())
 				.ColorAndOpacity(Tint(Over(Mix(FColor(0x28, 0x1c, 0x10), FColor(0x14, 0x0e, 0x08)),
 				                          0.85f, FColor::Black)))
 			]
 			// The sliding tape, clipped to the frame.
-			+ SOverlay::Slot().Padding(FMargin(3.f))
+			+ SOverlay::Slot().Padding(FMargin(VoxelUITheme::RulePx * 2.f))
 			[
 				SNew(SBox)
 				.Clipping(EWidgetClipping::ClipToBounds)
@@ -286,7 +305,14 @@ TSharedRef<SWidget> SVoxelGameHud::BuildDock()
 				// capacity reads as shortened rather than as merely low.
 				+ SOverlay::Slot()
 				[
-					VoxelScreenChrome::Track(L.HudBarHeight, Tint(HudWound),
+					// THREE STOPS, NOT ONE. See VoxelUITheme::HpTop: every
+					// `.bar .fill` and `.wound` in the HUD mock is a 180deg
+					// ramp, and the flat overload was painting the midpoint of
+					// the two ends it knew. The wound band has only two stops
+					// in the CSS, so its middle is stated as their midpoint
+					// rather than invented.
+					VoxelScreenChrome::Track(L.HudBarHeight, HudWoundTop, Mix(HudWoundTop, HudWound),
+					                         HudWound,
 					                         TAttribute<float>::CreateLambda([this]()
 					                         {
 						                         return Cached.WoundFraction;
@@ -294,7 +320,7 @@ TSharedRef<SWidget> SVoxelGameHud::BuildDock()
 				]
 				+ SOverlay::Slot()
 				[
-					VoxelScreenChrome::Track(L.HudBarHeight, Tint(Mix(Hp, HpDeep)),
+					VoxelScreenChrome::Track(L.HudBarHeight, HpTop, Hp, HpDeep,
 					                         TAttribute<float>::CreateLambda([this]()
 					                         {
 						                         return Cached.HealthFraction;
@@ -307,7 +333,11 @@ TSharedRef<SWidget> SVoxelGameHud::BuildDock()
 				SNew(SOverlay)
 				+ SOverlay::Slot()
 				[
-					VoxelScreenChrome::Track(L.HudBarHeight, Tint(Mix(HudHungerFill, HudHungerDeep)),
+					// HudHungerFill IS THE MIDDLE STOP, and it is blue on
+					// purpose: the HUD mock carries its own :root and overrides
+					// --stam to #6fb8d8. See the note at VoxelUITheme.h's
+					// HudHungerFill before "correcting" this to gold.
+					VoxelScreenChrome::Track(L.HudBarHeight, HudHungerTop, HudHungerFill, HudHungerDeep,
 					                         TAttribute<float>::CreateLambda([this]()
 					                         {
 						                         return Cached.HungerFraction;

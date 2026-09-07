@@ -94,6 +94,15 @@ VOXELEARTHUI_API FText SettingsMasterLabel();
 VOXELEARTHUI_API FText SettingsMusicLabel();
 VOXELEARTHUI_API FText SettingsFullscreenLabel();
 VOXELEARTHUI_API FText SettingsFullscreenHint();
+// The INTERFACE section, which the 2026-09-07 mock has no counterpart for:
+// ADR-0011 decision 5, the player's manual multiplier on top of the engine's
+// own resolution scale.
+VOXELEARTHUI_API FText SettingsSectionInterface();
+VOXELEARTHUI_API FText SettingsUIScaleLabel();
+VOXELEARTHUI_API FText SettingsUIScaleHint();
+// "125%" -- the INTERFACE SIZE readout. Its own function because the slider
+// readouts elsewhere on the panel are bare numbers and this one is not.
+VOXELEARTHUI_API FText SettingsPercent(int32 Percent);
 VOXELEARTHUI_API FText ButtonApply();
 VOXELEARTHUI_API FText ButtonSaveAndLeave();
 VOXELEARTHUI_API FText SettingsBackHint();   // the word after the ESC cap
@@ -214,6 +223,8 @@ VOXELEARTHUI_API const TArray<FText>& InvEquipSlotNames();
 // second list exists to stop.
 VOXELEARTHUI_API const TArray<FText>& PlayerEquipSlotNames();
 VOXELEARTHUI_API FText InvSearchHint();
+// The "x16" badge in the corner of a stacked inventory cell.
+VOXELEARTHUI_API FText ItemStackCount(int32 Count);
 VOXELEARTHUI_API FText InvWeight(float CarriedKg);
 VOXELEARTHUI_API FText InvNoEquipment();
 
