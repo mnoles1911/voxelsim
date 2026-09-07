@@ -410,6 +410,9 @@ VoxelEnvironmentLODKeepOpen
 VoxelEnvironmentLODValidate
 VoxelTreeFelling
 
+# Configuration: selects an isolated local persistent player credential profile.
+VoxelPlayerProfile
+
 ## SUBSTRING-MATCHED -- ACKNOWLEDGED
 #
 # Everything below is a switch whose NAME contains one of rule 5's substrings,
@@ -521,3 +524,7 @@ VoxelDumpIndexKeys = ACCIDENTAL ('Dump'): passive resident index-key logging ins
 VoxelSkyMarkVerify = ACCIDENTAL ('Verify'): runtime sky-band correctness sampling during normal streaming; does not drive or end a run.
 VoxelSkyMarkVerifyGrid = ACCIDENTAL ('Verify'): sample-grid size for the passive sky-band correctness check.
 VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive sky-band correctness check.
+
+VoxelSessionVerify = Fixture: verifies encrypted player restart or selected-seed world travel and exits through its harness.
+VoxelSessionVerifyDir = Fixture output directory and stop marker for the session process harness.
+VoxelSessionVerifyPlayers = Fixture expected encrypted admission count; session harness input.
