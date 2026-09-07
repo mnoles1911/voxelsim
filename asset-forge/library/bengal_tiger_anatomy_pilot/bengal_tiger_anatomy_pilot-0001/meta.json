@@ -1,0 +1,32 @@
+{
+  "id": "bengal_tiger_anatomy_pilot-0001",
+  "species": "bengal_tiger_anatomy_pilot",
+  "kind": "quadruped",
+  "seed": 1,
+  "imported": true,
+  "source_format": "reviewed reference mesh; RGB voxel study",
+  "spec_hash": "757cddeca087a33a",
+  "stats": {
+    "height_m": 1.388,
+    "voxels": 210538
+  },
+  "problems": [],
+  "vox_models": 1,
+  "static_model_complete": false,
+  "review_status": "pilot_candidate",
+  "visual_approved": false,
+  "runtime_ready": false,
+  "animation": "not rigged",
+  "appearance": "RGB surface sidecar",
+  "voxel_mm": 12.5,
+  "dimensions_m": [
+    2.6750000000000003,
+    0.5125000000000001,
+    1.3875000000000002
+  ],
+  "validation": [
+    "one connected component",
+    "VXA roundtrip",
+    "RGB payload byte equality"
+  ]
+}

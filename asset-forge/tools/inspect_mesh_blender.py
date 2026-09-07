@@ -46,7 +46,8 @@ scene.render.image_settings.file_format='PNG';scene.render.film_transparent=Fals
 # Fixed exposure keeps this bright three-light studio from washing out coat
 # regions. Orthographic RGB images remain the unlit color reference.
 scene.view_settings.exposure=-1.5
-for i,offset in enumerate(((3,-5,2),(-3,-5,2),(0,-5,1),(5,0,1))):
+for i,offset in enumerate(((3,-5,2),(-3,-5,2),(0,-5,1),(5,0,1),
+                           (-3,5,2),(3,5,2))):
     camera.location=center+Vector(offset)*span
     camera.rotation_euler=(center-camera.location).to_track_quat('-Z','Y').to_euler()
     scene.render.filepath=str(target/f'view-{i}.png')
