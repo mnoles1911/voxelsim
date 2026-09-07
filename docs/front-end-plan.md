@@ -1,5 +1,12 @@
 # The front end: main menu, loading screen, and how to verify them
 
+> **UI SCALING DOCTRINE (owner-directed 2026-09-07): read [ADR-0011](adr/0011-scale-tolerant-ui.md) before touching any widget.**
+> One 1080p reference resolution, continuous `ShortestSide` scaling, and NO
+> pixel-locked primitives: never a 1 px border (minimum 2), outline fonts only,
+> icons vector or authored at >= 2x. Never rescale a widget constant to
+> compensate for the display -- every figure in `VoxelUITheme.h` is an authored
+> 1080p number and the engine curve does the rest.
+
 The port of the Mira-Thal / *Voxelmark* front end into VoxelEarth. This is the
 operational document -- what exists, what is unproven, and what to run. The
 decisions and their reasoning are in

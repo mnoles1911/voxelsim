@@ -3041,3 +3041,32 @@ section. Left undone there:
   tan/orange voxels along the line), which is a poor backdrop for white foam;
   the surveyed coastal sites in the tides doc need their fine tiles baked
   first.
+
+### 15a. Left undone when the owner paused live wake/ripple tuning (2026-09-07 night)
+
+* **The swept-splat deposit fix is UNBUILT** (`VoxelRippleField.cpp`
+  `AddSweptDisturbance`, +30/-1): build it and re-run the C1 command line
+  without `-Cvars`, or `git checkout` the file before the next leg. Until it
+  is in, a moving hull deposits one full ring per station per tick and the
+  wake amplitude depends on frame rate.
+* **No instrument reads the ripple field at the shutter.** Health sampling
+  stops at first verification (t+0.25 s after boarding); the capture
+  injector's `fieldMaxAbs` reprints that stale value. Add a `voxel.Water.
+  Ripple.Stat`-style whole-field max/mean readback that can be scheduled at
+  `-VoxelScreenshotAfter - 1 s`, so an amplitude claim can be a number.
+* **`voxel.Boat.WakeGain` 3.0 and `voxel.Water.Ripple.Gain` 2.5** were both
+  chosen against readbacks taken before the boat moved; re-derive both after
+  the deposit fix, from a shutter-time readback, and update the Ripple.Gain
+  help text ("1 is shipped strength") to match whatever ships.
+* **The `DisturbanceFoam*` defaults (Threshold 0.05, HeightWeight 1, Gain 6)
+  are provisional**: the ladder that was to settle them never ran, and B0 at
+  those defaults still showed a window-wide foam at WakeGain 3.
+* **Arm A1** (`DisturbanceFoamEmissive:0` at full coverage) never ran; it
+  decides whether foam can ever be lit albedo here or only emissive.
+* **`M_WaterVoxel.uasset` on disk is regenerated (17:46:42) and `M_Ocean.
+  uasset` is not**; the ocean's next regen picks up the new helper defaults.
+  Restore or regenerate before the pair is judged together.
+* **The boat leg is not pose-reproducible across a regen** (boarding point
+  and heading moved on the first post-regen leg, `FRAMING NOT AS REQUESTED`);
+  pin the boat's spawn transform and heading explicitly in the harness before
+  using region means across regens.

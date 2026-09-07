@@ -70,3 +70,11 @@ own placeholder content until those systems arrive.
 The one exception is the **inventory**, which is real:
 `UVoxelInventoryComponent` and `FVoxelItemRegistry` back the pack, the hotbar
 and the HUD dock live.
+
+**Scaling doctrine: [ADR-0011](../../adr/0011-scale-tolerant-ui.md).** These mocks are
+authored at 1920x1080 and each `.html` carries its own `zoom:1.33333` to preview as
+1440p. The Slate port stores the **1080p** figures and lets the engine's continuous
+`ShortestSide` curve supply the rest. Do NOT re-author these at 2560x1440: it moves
+the design above the legibility floor and makes every 1080p player receive a
+downscale. Any absolute pixel figure measured from a capture taken before
+2026-09-07 afternoon was measured at 1.333 and must be divided before comparison.
