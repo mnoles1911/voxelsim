@@ -1678,6 +1678,79 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler
 	};
 }
 
+// Overlay-aware COARSE chunk sampler -- the game-thread counterpart of
+// FCoarseChunkGridSampler, and the reason a shoreline edit no longer parks the
+// game thread for minutes (backlog §14).
+//
+// MakeOverlayAwareLevelSampler above is the 8^L mip recursion with World::brickAt
+// as its level-0 source, and it was still the ONLY level>=1 game-thread sampler
+// after the worker path went coarse (-VoxelCoarseMinLevel default 1, 2026-08).
+// Its cost is the one MakeCoarseLevelSampler's comment already prices, times a
+// worse level-0 source: a chunk plus mesher apron is 6x6x6 level-L bricks, so
+// level L folds (6*2^L)^3 level-0 bricks, each one a World::brickAt that
+// re-derives its own 8x8 amplifier column grid (world.h: gen_.makeBrick(key),
+// no grid argument, no cache). Measured off Saved/capture-shore-B-shelf2.log,
+// one 3x3x3 edit at a lake shore: L3 1.4s, L4 10.5s, L5 79.5s, L6 never
+// returned -- 8x per level, and level 6's 56.6M level-0 bricks would also have
+// to fit in the recursion's job-local map.
+//
+// The fix is the rule the worker already ships, not a new one. Every level>=1
+// chunk in the world is meshed by FCoarseChunkGridSampler; re-meshing an edited
+// one through the MIP rule was also a silent rule swap (coarse is nearest-
+// neighbour at the representative voxel, mip is a majority vote -- generator.h
+// documents them as separate paths with separate goldens), so a distant dig
+// changed the shape of terrain it did not touch. This composes the SAME coarse
+// grid and overrides only the cells whose representative level-0 voxel lands in
+// an edited brick, where the overlay's stored value is World::materialAt at that
+// voxel by construction (world.h: the overlay brick is gen_.makeBrick with the
+// edit's cells written over it, assets included).
+//
+// Game thread only, same constraint as MakeOverlayAwareLevelSampler and for the
+// same reason: World's overlay is not thread-safe. The coarse half reads
+// GeneratedWorld only and is passed no FSharedColumnGridCache -- the column grid
+// is edit-invariant (see FSharedColumnGridCache's residency comment) so sharing
+// would be sound, but it is gated on a dispatch-time residency verdict this path
+// has no equivalent of, and 1156 columns is not what was costing minutes.
+struct FOverlayCoarseChunkSampler
+{
+	using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
+	static constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+
+	FOverlayCoarseChunkSampler(const vxc::World<B>& InVoxels, int32 InLevel, const VoxelCoords::FVoxelChunkKey& Key)
+		: Coarse(InVoxels.generated(), InLevel, Key, /*PerfCounters*/ nullptr)
+		, Overlay(InVoxels.editedBricks())
+		, Level(InLevel)
+	{
+	}
+
+	vxc::MaterialId operator()(int64 X, int64 Y, int64 Z) const
+	{
+		// One hash probe per voxel against the edit overlay, which is what
+		// World::materialAt costs at level 0 -- and it is skipped outright in a
+		// session that has never edited. The rep coordinates are the coarse
+		// rule's own (FCoarseChunkGridSampler's derivation), so an edited brick
+		// is consulted exactly where the coarse rule would have sampled the
+		// generator.
+		if (Overlay.size() > 0)
+		{
+			const int64 RX = GenT::coarseRep(X, Level);
+			const int64 RY = GenT::coarseRep(Y, Level);
+			const int64 RZ = GenT::coarseRep(Z, Level);
+			const vxc::BrickKey EditedKey = vxc::ChunkMap<B>::keyForVoxel(RX, RY, RZ);
+			if (const vxc::Brick<B>* Edited = Overlay.find(EditedKey))
+			{
+				return Edited->get(int(vxc::floorMod(RX, B)), int(vxc::floorMod(RY, B)),
+				                   int(vxc::floorMod(RZ, B)));
+			}
+		}
+		return Coarse(X, Y, Z);
+	}
+
+	FCoarseChunkGridSampler Coarse;
+	const vxc::ChunkMap<B>& Overlay;
+	int32 Level;
+};
+
 // Track B2 ("real .vxtl terrain tiles as a selectable tile source"): builds
 // the ITileSampler FVoxelWorldImpl::Tiles owns for this run.
 //
@@ -28844,34 +28917,67 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		else
 		{
 			// M2 wave 2 item 2 ("Distant-edit mip propagation"): overlay-aware
-			// level>=1 sampler over World::brickAt, game-thread only (see
-			// MakeOverlayAwareLevelSampler's doc comment) -- this is what
-			// closes the wave-1 "R1+ never shows edits" limitation. Logged
-			// (not Verbose): this is a rare, edit-triggered event, and the
-			// log line is the headless-run evidence that a distant edit
-			// actually re-meshed a mip ring chunk.
-			const auto OverlaySampler = MakeOverlayAwareLevelSampler(Voxels, LevelKey.Level);
-			if (bRetireQuads)
+			// level>=1 sampler, game-thread only (World's overlay is not
+			// thread-safe) -- this is what closes the wave-1 "R1+ never shows
+			// edits" limitation. Logged (not Verbose): this is a rare,
+			// edit-triggered event, and the log line is the headless-run
+			// evidence that a distant edit actually re-meshed a mip ring chunk.
+			//
+			// WHICH SAMPLER IS THE SAME QUESTION THE WORKER ASKS, and it was not
+			// being asked here (backlog §14). The worker went coarse for every
+			// level>=GetCoarseMinLevel() (default 1) because the mip recursion's
+			// 8^L fold capped the voxel radius at ~250m; this path kept folding,
+			// on the game thread, with a level-0 source that rebuilds its own
+			// column grid per brick -- 79.5s for one level-5 chunk, measured, and
+			// level 6 never returned. Matching the worker's predicate also ends a
+			// silent rule swap: an edited distant chunk was re-meshed under the
+			// majority-vote mip rule while every chunk around it kept the coarse
+			// representative-sample rule.
+			const bool bCoarseLevel = LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel();
+			const double RemeshStartSeconds = FPlatformTime::Seconds();
+			// One body, two sampler types: the four arms below are the worker's
+			// arms verbatim, and the only thing the level check picks is which
+			// concrete functor they are handed.
+			auto MeshWithOverlaySampler = [&](const auto& OverlaySampler)
 			{
-				BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, OverlaySampler);
-			}
-			else if (bPackBricksOnCpu && bReuseMesherVoxels)
+				if (bRetireQuads)
+				{
+					BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, OverlaySampler);
+				}
+				else if (bPackBricksOnCpu && bReuseMesherVoxels)
+				{
+					vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
+					MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters, /*RingSkirtMask*/ 0,
+					                FNeverSkipBrick(), VoxelBrickCpuArm::FDenseChunkSink{ Dense });
+					BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+				}
+				else
+				{
+					MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters);
+					if (bPackBricksOnCpu)
+					{
+						BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, OverlaySampler);
+					}
+				}
+			};
+			if (bCoarseLevel)
 			{
-				vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
-				MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters, /*RingSkirtMask*/ 0,
-				                FNeverSkipBrick(), VoxelBrickCpuArm::FDenseChunkSink{ Dense });
-				BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+				MeshWithOverlaySampler(FOverlayCoarseChunkSampler(Voxels, LevelKey.Level, LevelKey.Key));
 			}
 			else
 			{
-				MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters);
-				if (bPackBricksOnCpu)
-				{
-					BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, OverlaySampler);
-				}
+				// -VoxelCoarseMinLevel=99 restores the pre-coarse mip behaviour on
+				// this path too, so the A/B stays a rule A/B on both producers.
+				MeshWithOverlaySampler(MakeOverlayAwareLevelSampler(Voxels, LevelKey.Level));
 			}
-			UE_LOG(LogVoxelEdit, Log, TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d"), LevelKey.Level,
-			       LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num());
+			// ms= is the §14 measurement, kept in the shipping line rather than
+			// behind a switch: the failure it names was a single re-mesh, and a
+			// per-level wall time is the only thing that distinguishes this path
+			// working from this path hanging.
+			UE_LOG(LogVoxelEdit, Log,
+			       TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d coarse=%d ms=%.1f"),
+			       LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num(),
+			       bCoarseLevel ? 1 : 0, (FPlatformTime::Seconds() - RemeshStartSeconds) * 1000.0);
 		}
 		// Same first-settle sample as DrainResults takes before ITS apply: this
 		// queue carries both FIRST loads (chunks born edited, routed here
@@ -30823,7 +30929,8 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 		{
 			WaterSubsystem->NotifyTerrainVoxelsCleared(RemovedVoxels);
 			WaterSubsystem->NotifyTerrainRegionEdited(VoxelCoords::FVoxelCoord{MinX, MinY, MinZ},
-			                                          VoxelCoords::FVoxelCoord{MaxX, MaxY, MaxZ});
+			                                          VoxelCoords::FVoxelCoord{MaxX, MaxY, MaxZ},
+			                                          TEXT("PromoteDetachedIslands"));
 		}
 	}
 
@@ -32362,7 +32469,7 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeEditVoxelBounds(DugCells, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("TryDig"));
 			}
 		}
 	}
@@ -32418,7 +32525,7 @@ bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FV
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeEditVoxelBounds(PlacedCells, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("TryPlace"));
 			}
 		}
 	}
@@ -32825,7 +32932,7 @@ int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeEditVoxelBounds(CarvedCells, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("CarveSphere"));
 			}
 		}
 	}
@@ -32911,7 +33018,7 @@ int32 UVoxelWorldSubsystem::SpawnTreeFixtureAt(double WorldX, double WorldY)
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeVoxelCoordBounds(Coords, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("SpawnTreeFixtureAt"));
 			}
 		}
 	}
@@ -32996,7 +33103,7 @@ int32 UVoxelWorldSubsystem::SpawnStructureFixtureAt(double WorldX, double WorldY
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeVoxelCoordBounds(Coords, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("SpawnStructureFixtureAt"));
 			}
 		}
 	}

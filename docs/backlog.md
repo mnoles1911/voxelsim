@@ -2822,3 +2822,135 @@ and `VoxelEditedLaneGate.h` — the designed fix for exactly that — is dead co
 (never included, `FLevelGate` never instantiated) while
 `VoxelResidencyGpu.h:195-207` carries counters wired to a gate that does not
 exist.
+
+## 14. FIXED 2026-09-07 — GAME-THREAD MIP RE-MESH CASCADE ON EDITS (found the same day)
+
+**Symptom.** An unattended shore-foam capture (`Saved/capture-shore-B-shelf2.log`,
+spawn `-65102,-51084` +6 m, no input, fresh world, no dig switch) stopped
+producing frames at frame 710 and never took its shot; the harness gave up at
+420 s. Its twin arm A (`capture-shore-A-ship.log`, identical apart from one
+material scalar) ran ~900 frames and captured. Same family as §13's hang, and
+very likely the half of it the front-containment did not address.
+
+**Mechanism (read off the log, not inferred).** At frame 709, 0.4 s after
+`Lake sheets: DRAINED build` and `OceanConnect`, a 3x3x3 voxel edit landed at the
+pawn's column (`[-651009,-510840,16439]..[-651007,-510838,16441]`, 30 cm under
+ground top) with NO dig/tool/carve log line of its own — the only edit sources
+that print are absent, so the writer is silent; the water subsystem's own
+implicit→CA conversion is the leading suspect (`Mobilized 24 cavern water
+brick(s) on edit`, `VoxelWaterSubsystem.cpp:7822`, fired on that region, and the
+CA bucket came up at the same spot). The edit then ran the normal edit pipeline:
+`Destruction: region=` (`VoxelWorldSubsystem.cpp:29693`), `Distant-edit mip
+propagation` levels 1..7, and `Distant-edit mip re-mesh` — which is documented
+game-thread only (`:28846`, overlay-aware `World::brickAt` sampler) and whose
+cost grows with the level's footprint:
+
+| level | chunk | wall time to log | delta |
+|---|---|---|---|
+| 1 | (-10173,-7982,256) x2 | 05:42:04.2 | — |
+| 2 | (-5086,-3991,128) x2 | 05:42:04.5 / 04.7 | 0.2 s each |
+| 3 | (-2544,-1996,64) x2 | 05:42:06.1 / 07.5 | 1.4 s each |
+| 4 | (-1272,-998,32) | 05:42:18.0 | 10.5 s |
+| 5 | (-636,-499,16) | 05:43:37.6 | **79.5 s** |
+| 6 | (-318,-250,8) marked | never logged | > 70 s at harness kill |
+
+The frame counter sat at 710 throughout: this is a synchronous stall, not a
+slowdown, and it is triggered by any edit near enough to the player for a mip
+ancestor to be resident.
+
+`quads=0` on every line is NOT evidence that the re-mesh had nothing to do, and
+the first reading of this entry took it that way. `voxel.Terrain.RetireQuads` is
+the default (`VoxelApplyBatch.h:78`), so `bRetireQuads` sends every one of these
+through `PackChunkMaterialising` and `Quads` is empty by construction at every
+level, edited or not. There was no empty diff to early-out on.
+
+### FIXED 2026-09-07 — the game thread was still folding 8^L bricks the worker retired in August
+
+**Root cause, and the water is a bystander.** `DrainGameThreadMesh`'s level>=1
+arm was the ONLY level>=1 sampler in the project still on the mip recursion.
+`MakeCoarseLevelSampler`'s own comment (`VoxelWorldSubsystem.cpp:1001-1031`) had
+already priced that recursion and retired it — *"a level-L brick is folded from
+8^L level-0 bricks ... R3 1543ms, R4 15901ms"* — and `-VoxelCoarseMinLevel`
+(default 1) moved every worker job to the direct coarse path. Nothing moved this
+one. Worse, its level-0 source is `World::brickAt`, which is
+`gen_.makeBrick(key)` with NO column grid argument (`world.h:138`), so each of
+those bricks also re-derives its own 8x8 amplifier column grid — the worker's
+`FJobColumnGridCache` does not exist on this path. A chunk plus the mesher's
+apron is 6x6x6 level-L bricks, i.e. (6*2^L)^3 level-0 bricks: 110k at level 3,
+885k at level 4, 7.1M at level 5, 56.6M at level 6. The measured table divides
+out to ~11 us per level-0 brick at every level, which is what an 8x-per-level
+curve looks like when it is real work and not a hang.
+
+Two consequences, one of them silent: level 6 was ~10 minutes of game thread,
+and its 56.6M `Brick<8>` job-local map would not have fit in memory either. And
+because coarse and mip are DIFFERENT RULES (`generator.h`: nearest-neighbour at
+the representative voxel vs. majority vote, separate goldens), an edited distant
+chunk was being re-meshed under a rule none of its neighbours use — a dig
+changed the shape of terrain it never touched.
+
+**The fix is the rule the worker already ships.** `FOverlayCoarseChunkSampler`
+(`VoxelWorldSubsystem.cpp:1714`) composes `FCoarseChunkGridSampler` — the same
+concrete functor the worker meshes every level>=1 chunk with — and overrides
+only the cells whose representative level-0 voxel lands in an edited brick,
+where the overlay's stored value is `World::materialAt` at that voxel by
+construction. One overlay hash probe per voxel, skipped entirely in a session
+that has never edited. `DrainGameThreadMesh` picks it on the worker's own
+predicate (`Level >= GetCoarseMinLevel()`), so `-VoxelCoarseMinLevel=99` still
+restores the mip rule on BOTH producers and the A/B stays a rule A/B.
+`MakeOverlayAwareLevelSampler` is kept for exactly that arm.
+
+**Measured, `-VoxelHeadlessDigTest` at the §14 spawn**
+(`Saved/capture-s14-digtest.log`, r=10 m carve, 2,149,398 voxels — four orders of
+magnitude more edited voxels than the 27 that stalled arm B, because the cost is
+per CHUNK and not per voxel):
+
+| level | before (§14 arm B, per chunk) | after (per chunk) | chunks re-meshed after |
+|---|---|---|---|
+| 1 | 39 / 32 ms | 1.42 ms mean, 2.0 max | 48 |
+| 2 | 240 / 210 ms | 1.79 ms mean, 2.4 max | 12 |
+| 3 | 1,411 / 1,382 ms | 2.50 ms mean, 2.7 max | 2 |
+| 4 | 10,522 ms | 2.0 ms | 1 |
+| 5 | **79,526 ms** | 2.2 ms | 1 |
+| 6 | never returned (>70 s at kill) | 4.3 ms | 1 |
+| 7 | never reached | 3.3 ms | 1 |
+
+The whole 66-chunk cascade, levels 1 through 7, cost 107 ms of game thread and
+finished 127 ms after the carve, spread over frames 879-887 by the existing
+`voxel.Stream.MaxRemeshesPerFrame` budget. Cost is now FLAT in level, which is
+the coarse rule's whole claim. The run captured; the frame counter went on
+advancing through the cascade.
+
+RUN TWICE, and the second run is why the numbers above are the second one's. A
+stale runner re-ran the same leg 8 minutes later and overwrote the log; the two
+legs agree within the ~15% this box's timings move (L1 mean 1.57 vs 1.42, L5 2.6
+vs 2.2, L6 4.8 vs 4.3, L7 3.7 vs 3.3; 115 ms vs 107 ms for the same 66 chunks),
+so the table cites the log that is actually on disk rather than the one that is
+not. `coarse=0` appears nowhere in either — every level>=1 re-mesh took the new
+path.
+
+The `Distant-edit mip re-mesh` line now carries `coarse=` and `ms=`, in the
+shipping line rather than behind a switch: the failure this entry names was a
+single re-mesh, and a per-level wall time is the only thing that separates this
+path working from this path hanging.
+
+**Also done: the writer now names itself.**
+`UVoxelWaterSubsystem::NotifyTerrainRegionEdited` takes an `EditSource` literal
+and prints it on both the `Mobilized ... on edit` line and the wake line; the six
+call sites in `VoxelWorldSubsystem.cpp` pass `TryDig` / `TryPlace` /
+`CarveSphere` / `PromoteDetachedIslands` / `SpawnTreeFixtureAt` /
+`SpawnStructureFixtureAt`. That set is the answer to arm B's mystery on its own:
+NONE of `CarveSphere` or `PromoteDetachedIslands` logs a line of its own, which
+is why the forensic pass found a silent writer. Compiled but NOT exercised at
+runtime — the dig-test run mobilized no cavern water, so no `source=` line was
+printed. The next shoreline hang will name it.
+
+**Left open, deliberately.** `MaxRemeshesPerFrame` is still 4 and was tuned when
+every entry on that queue was a ~1.5 ms level-0 chunk; a coarse level-7 chunk is
+~5 ms, so a worst-case frame is now ~20 ms of re-mesh. That is a tuning question
+with a real measurement behind it and it did not need answering to remove the
+stall. `FCoarseChunkGridSampler` also resolves its asset shortlist inline here
+(`PreResolved` is null) where the worker gets it from `AssetResolveCache`; the
+game thread could peek that same cache, but at 2.0-4.8 ms per chunk across both
+legs the resolve is visibly not the term that matters. No `Voxel.*` automation test covers
+distant-edit propagation — the evidence is the log line, as it has been since M2
+wave 2.

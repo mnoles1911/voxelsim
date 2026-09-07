@@ -7752,7 +7752,8 @@ void UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared(const TArray<VoxelCoords::
 }
 
 void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCoord& MinVoxelIncl,
-                                                       const VoxelCoords::FVoxelCoord& MaxVoxelIncl)
+                                                       const VoxelCoords::FVoxelCoord& MaxVoxelIncl,
+                                                       const TCHAR* EditSource)
 {
 	if (!Impl)
 	{
@@ -7819,9 +7820,9 @@ void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCo
 	{
 		MarkMobilizedBricksDirty(*Impl);
 		UE_LOG(LogVoxelWater, Log,
-		       TEXT("Mobilized %d cavern water brick(s) on edit [%d,%d,%d]..[%d,%d,%d] (implicit -> CA; ledger %llu debited / %llu credited, shortfall %llu)"),
+		       TEXT("Mobilized %d cavern water brick(s) on edit [%d,%d,%d]..[%d,%d,%d] source=%s (implicit -> CA; ledger %llu debited / %llu credited, shortfall %llu)"),
 		       static_cast<int32>(Converted), MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X,
-		       MaxVoxelIncl.Y, MaxVoxelIncl.Z, (unsigned long long)Impl->Mob.debitedVolume(),
+		       MaxVoxelIncl.Y, MaxVoxelIncl.Z, EditSource, (unsigned long long)Impl->Mob.debitedVolume(),
 		       (unsigned long long)Impl->Mob.creditedVolume(), (unsigned long long)Impl->Mob.shortfallVolume());
 	}
 
@@ -7830,9 +7831,9 @@ void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCo
 	if (Woken > 0)
 	{
 		UE_LOG(LogVoxelWater, Verbose,
-		       TEXT("NotifyTerrainRegionEdited: woke %d water brick(s) for edit [%d,%d,%d]..[%d,%d,%d]"),
+		       TEXT("NotifyTerrainRegionEdited: woke %d water brick(s) for edit [%d,%d,%d]..[%d,%d,%d] source=%s"),
 		       static_cast<int32>(Woken), MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X,
-		       MaxVoxelIncl.Y, MaxVoxelIncl.Z);
+		       MaxVoxelIncl.Y, MaxVoxelIncl.Z, EditSource);
 	}
 }
 
