@@ -14,8 +14,13 @@ honest list of what is open. Everything below is either committed or named as un
 | `668c96a` | Menu scalability behind `-VoxelMenuScalability` | frame time -36%, PNGs identical |
 | `cf6dc9a` | Threaded loading curtain behind `-VoxelLoadingScreenThread`; `-VoxelLoadGateMaxWait` 60 -> 300; PSO config + `tools/voxel-pso-cache-record.ps1`; all doc corrections | `seg=LOADING` p99 23.9 ms through 7.6 s world stalls |
 
-Uncommitted at time of writing: the scale-tolerant UI pass (~25 files in `VoxelEarthUI`,
-compiled, being photographed and committed by an agent). The water-look work is NOT in the
+The scale-tolerant UI pass is committed as `423e25c` (28 source files + before/after pairs
+under `docs/ui-mocks/2026-09-07/captures/after/`, README with pose and md5 per pair). Its
+falsifier passed: the shell measures 1326 px before AND after, not 1060, so the curve is in
+force. Note the scale in a windowed capture reads ~1.29, not 1.333, because the work area is
+2560x1392 (window chrome), so the shortest side is 1392; a true fullscreen 1440p session is
+1.333. Three 2 px promotions await the owner: HUD bar ticks, HUD vitals bars, the Settings
+checkbox (crops in `captures/after/crops/`). The water-look work is NOT in the
 tree: the owner paused wake/ripple tuning for live iteration, and the night pass is
 preserved verbatim in `docs/patches/water-look-2026-09-07-night.patch` (commit 9288355),
 with the four water files restored to `fe51c15`. Everything under `asset-forge/` belongs to a
