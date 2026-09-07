@@ -11,15 +11,41 @@ namespace {
 struct FReservationFinish : IAutomationLatentCommand {
     FAutomationTestBase* Test;UWorld* World;TWeakObjectPtr<AVoxelEnvironmentLODPrototype> Actor;
     VoxelObjects::FProductionReservation Ticket;TSharedRef<bool> Done=MakeShared<bool>(false),Ready=MakeShared<bool>(false);
+    bool DestroyPrepared=false;
     double Started=FPlatformTime::Seconds();
     FReservationFinish(FAutomationTestBase* InTest,UWorld* W,AVoxelEnvironmentLODPrototype* A,VoxelObjects::FProductionReservation T):Test(InTest),World(W),Actor(A),Ticket(T){}
     bool Update() override {
         auto A=Actor.Get();if(A&&!*Done){A->AdvanceStagedObjectRestore();if(!*Done&&FPlatformTime::Seconds()-Started<60.)return false;}
         auto& Registry=VoxelObjects::Get(World);
         if(Test->TestTrue(TEXT("hidden staged actor completes before timeout"),A&&*Done&&*Ready)){
-            Test->TestTrue(TEXT("explicit staged actor publication succeeds"),A->PublishStagedObjectRestore());
-            Test->TestFalse(TEXT("reservation blocks random ID after preparation flag clears"),Registry.Bind(A,3).IsValid());
-            Test->TestTrue(TEXT("capturable actor commits exact reserved identity"),Registry.CommitProduction(Ticket));
+            const auto Prepared=Registry.PrepareProductionCommit(Ticket);
+            Test->TestTrue(TEXT("hidden ready actor has prepared commit"),Prepared.IsValid());
+            if(DestroyPrepared){
+                Test->TestTrue(TEXT("prepared actor valid before destruction"),Registry.ValidatePreparedProduction(Prepared));
+                A->Destroy();
+                Test->TestFalse(TEXT("destroyed prepared actor invalidates token"),Registry.ValidatePreparedProduction(Prepared));
+                Test->TestTrue(TEXT("destroyed-token refusal exposes no entry"),Registry.Find(Ticket.Id)==nullptr);
+                Registry.RollbackProduction(Ticket);VoxelObjects::Forget(World);World->DestroyWorld(false);return true;
+            }
+            Test->TestTrue(TEXT("prepared actor validates"),Registry.ValidatePreparedProduction(Prepared));
+            VoxelObjects::FRegistry Other;
+            Test->TestFalse(TEXT("prepared token is registry-instance scoped"),Other.ValidatePreparedProduction(Prepared));
+            const FTransform Original=A->GetActorTransform();
+            A->SetActorLocation(Original.GetLocation()+FVector(10,0,0));
+            Test->TestFalse(TEXT("mutated transform invalidates commit"),Registry.ValidatePreparedProduction(Prepared));
+            Test->TestTrue(TEXT("refused commit leaves actor hidden and undiscoverable"),A->IsHidden()&&!Registry.Find(Ticket.Id)&&A->IsUnpublishedPreparation());
+            A->SetActorTransform(Original);
+            const auto Replacement=Registry.PrepareProductionCommit(Ticket);
+            Test->TestFalse(TEXT("new preparation invalidates stale token"),Registry.ValidatePreparedProduction(Prepared));
+            if(Test->TestTrue(TEXT("replacement validates before commit"),Registry.ValidatePreparedProduction(Replacement))){
+                Registry.CommitPreparedProduction(Replacement);
+                Test->TestFalse(TEXT("consumed token cannot replay"),Registry.ValidatePreparedProduction(Replacement));
+                Test->TestTrue(TEXT("logical commit never reveals or enables actor"),A->IsHidden()&&!A->GetActorEnableCollision()&&!A->IsActorTickEnabled());
+                Test->TestFalse(TEXT("logical commit marks authority"),A->IsUnpublishedPreparation());
+                // Legacy reveal remains explicit. This test asserts GT state,
+                // not render-frame atomicity with a terrain publication.
+                Test->TestTrue(TEXT("explicit staged actor publication succeeds"),A->PublishStagedObjectRestore());
+            }
             Test->TestTrue(TEXT("live actor has reserved stable ID"),Registry.Find(A)&&Registry.Find(A)->Id==Ticket.Id);
             TArray<VoxelObjects::FEntry> Saved;Test->TestTrue(TEXT("committed entry is saveable"),VoxelDetachedPersistence::CaptureSnapshot(World,Saved));
         }
@@ -69,7 +95,11 @@ bool FVoxelProductionRegistryReservationTest::RunTest(const FString&)
     const auto OtherTicket=Other.ReserveProduction(Work.Descriptor,Prepared);
     TestFalse(TEXT("cross registry commit refused"),Other.CommitProduction(Ticket));TestFalse(TEXT("cross registry rollback refused"),Other.RollbackProduction(Ticket));
     TestTrue(TEXT("other reservation remains intact"),Other.RollbackProduction(OtherTicket));
-    TestTrue(TEXT("rollback succeeds"),Registry.RollbackProduction(Ticket));TestEqual(TEXT("rollback creates no tombstone"),Registry.Num(),0);
+    const auto PreparedCommit=Registry.PrepareProductionCommit(Ticket);
+    TestTrue(TEXT("data-only reservation has prepared token"),Registry.ValidatePreparedProduction(PreparedCommit));
+    TestFalse(TEXT("cross-registry prepared validation refused"),Other.ValidatePreparedProduction(PreparedCommit));
+    TestTrue(TEXT("rollback succeeds"),Registry.RollbackProduction(Ticket));
+    TestFalse(TEXT("rolled-back prepared token cannot validate"),Registry.ValidatePreparedProduction(PreparedCommit));TestEqual(TEXT("rollback creates no tombstone"),Registry.Num(),0);
     const auto Replacement=Registry.ReserveProduction(Work.Descriptor,Prepared);
     TestFalse(TEXT("stale rollback cannot release replacement"),Registry.RollbackProduction(Ticket));
     TestFalse(TEXT("stale commit cannot publish replacement"),Registry.CommitProduction(Ticket));
@@ -94,11 +124,14 @@ bool FVoxelProductionRegistryReservationTest::RunTest(const FString&)
     TestEqual(TEXT("rejected update leaves revision unchanged"),Live.Find(Existing.Id)->Revision,ExistingRevision);
     Live.Remove(Existing.Id);
     TestFalse(TEXT("unpublished candidate cannot commit"),Live.CommitProduction(LiveTicket));
+    TestFalse(TEXT("actor without staged resources cannot prepare commit"),Live.PrepareProductionCommit(LiveTicket).IsValid());
+    TestTrue(TEXT("resource refusal leaves actor hidden and registry empty"),Actor->IsHidden()&&Live.Find(Stable)==nullptr);
     TestEqual(TEXT("failed commit preserves reservation"),Live.NumProductionReservations(),1);
     TArray<FEntry> Saved;TestTrue(TEXT("reservation cannot poison whole-world capture"),VoxelDetachedPersistence::CaptureSnapshot(World,Saved));TestTrue(TEXT("hidden reservation absent from save"),!Saved.ContainsByPredicate([&](const FEntry& E){return E.Id==Stable;}));
     TestTrue(TEXT("hidden rollback succeeds"),Live.RollbackProduction(LiveTicket));
     const auto DestroyedTicket=Live.ReserveProduction(Work.Descriptor,Prepared);Actor->Destroy();
     TestFalse(TEXT("destroyed candidate cannot become data-only commit"),Live.CommitProduction(DestroyedTicket));
+    TestFalse(TEXT("destroyed reservation cannot prepare commit"),Live.PrepareProductionCommit(DestroyedTicket).IsValid());
     TestTrue(TEXT("destroyed candidate reservation can roll back"),Live.RollbackProduction(DestroyedTicket));
     TestTrue(TEXT("cancellation leaves no candidate entry"),Live.Find(Stable)==nullptr);
     auto Published=World->SpawnActor<AVoxelEnvironmentLODPrototype>();
@@ -114,4 +147,25 @@ bool FVoxelProductionRegistryReservationTest::RunTest(const FString&)
     AddError(TEXT("spawn published-path fixture"));
     Forget(World);World->DestroyWorld(false);return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelProductionCommitDestroyedActorTest,"Voxel.Objects.ProductionCommitDestroyedActor",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FVoxelProductionCommitDestroyedActorTest::RunTest(const FString&)
+{
+    std::vector<uint8> Vxa;auto Word=[&](uint32 V){for(int I=0;I<4;++I)Vxa.push_back(uint8(V>>(8*I)));};
+    for(uint32 V:{vxc::kVxaMagic,3u,0u,0u,0u,1u,1u,1u,100u,1u,0u,0u})Word(V);Vxa.push_back(16);Word(1);
+    VoxelProductionCandidate::FWork Work;Work.Provenance={19,123,456,-13,4,10,5,1,2,3};
+    Work.Descriptor.SpecId=TEXT("destroyed-canonical-rock");Work.Descriptor.Kind=TEXT("rock");Work.Descriptor.Category=TEXT("environment");Work.Descriptor.SeedIndex=1;
+    Work.CanonicalSourceHash=TEXT("22222222222222222222222222222222");
+    if(!TestTrue(TEXT("destroy fixture snapshot"),VoxelProductionCandidate::BuildImmutableSnapshot(Work,Vxa)))return false;
+    auto World=UWorld::CreateWorld(EWorldType::Game,false,FName(*FGuid::NewGuid().ToString(EGuidFormats::Digits)));if(!World)return false;
+    auto Actor=World->SpawnActor<AVoxelEnvironmentLODPrototype>();if(!Actor){World->DestroyWorld(false);return false;}
+    Actor->MarkUnpublishedPreparation();
+    VoxelObjects::FEntry Entry;Entry.Kind=3;Entry.GeometryRevision=1;Entry.Geometry=Work.Geometry;Entry.Dynamic=Work.Dynamic;
+    Entry.Transform=FTransform(FVector(-130.,40.,100.));Entry.Actor=Actor;Entry.bRetained=true;Entry.Lifetime.Kind=EVoxelDebrisLifetime::Retained;
+    const auto Ticket=VoxelObjects::Get(World).ReserveProduction(Work.Descriptor,Entry);
+    auto Finish=MakeShared<FReservationFinish>(this,World,Actor,Ticket);Finish->DestroyPrepared=true;
+    const auto Done=Finish->Done,Ready=Finish->Ready;
+    Actor->BeginStagedObjectRestore(Work.Geometry,Work.Dynamic,[Done,Ready](bool Success){*Ready=Success;*Done=true;});
+    FAutomationTestFramework::Get().EnqueueLatentCommand(Finish);return true;
+}
+
 #endif

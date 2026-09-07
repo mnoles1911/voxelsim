@@ -9,6 +9,8 @@ class UProceduralMeshComponent;
 class UMaterialInstanceDynamic;
 struct FEnvironmentLODState;
 struct FEnvironmentStagedRestore;
+struct FVoxelEnvironmentProductionCommit;
+using FVoxelEnvironmentProductionCommitRef=TSharedPtr<const FVoxelEnvironmentProductionCommit,ESPMode::ThreadSafe>;
 
 // Shared editable environment actor. The legacy class name and four-fixture
 // launcher remain for compatibility; source identity and grids are generic.
@@ -31,6 +33,13 @@ public:
     bool AdvanceStagedObjectRestore();
     bool IsStagedRenderResourcesPending() const;
     bool PublishStagedObjectRestore();
+    // Prepare/validate while hidden. Commit is a non-yielding GT preconditioned
+    // operation: it only makes state authoritative, and never reveals the actor.
+    // A future renderer transaction must latch visibility at its own boundary.
+    FVoxelEnvironmentProductionCommitRef PrepareProductionCommit(FVoxelImmutableGeometry Geometry,const TArray<uint8>& Dynamic,const FTransform& Transform);
+    bool ValidateProductionCommit(const FVoxelEnvironmentProductionCommitRef& Token);
+    void CommitPreparedProduction(const FVoxelEnvironmentProductionCommitRef& Token);
+
     // Explicit production preparation status, independent of rendering visibility.
     // Retained on cancellation; only publication clears it. Persistence discovery
     // must not bind actors that are not yet authoritative world objects.
@@ -60,8 +69,10 @@ public:
     UPROPERTY(Transient) TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
 private:
     bool bUnpublishedPreparation=false;
+    FGuid ProductionCommitSerial;
     FVoxelEnvironmentAssetDescriptor SourceDescriptor;
     bool RefreshGeometrySnapshot();
+    bool CaptureStateForCommit(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic,bool AllowPrepared);
     FVoxelImmutableGeometry GeometrySnapshot;
     TSharedPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe> StagedRestore;
     TSharedPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe> PreparedRestore;

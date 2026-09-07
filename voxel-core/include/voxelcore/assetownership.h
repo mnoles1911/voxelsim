@@ -73,7 +73,7 @@ public:
     AssetOwnershipTicket begin(const AssetProvenance& source,AssetRenderOwner owner,
                                uint64_t objectRevision,uint64_t projectionRevision,
                                std::vector<AssetRenderPage> pages) {
-        if(busy()||pages.empty()||pages.size()>8192||!objectRevision||projectionRevision!=objectRevision)return {};
+        if(publishing_||busy()||pages.empty()||pages.size()>8192||!objectRevision||projectionRevision!=objectRevision)return {};
         std::sort(pages.begin(),pages.end(),[](const auto& a,const auto& b){return std::tie(a.level,a.x,a.y,a.z)<std::tie(b.level,b.x,b.y,b.z);});
         for(size_t i=0;i<pages.size();++i){
             if(!pages[i].backends||(pages[i].backends&~uint8_t(AssetCpu|AssetGpu)))return {};
@@ -91,13 +91,13 @@ public:
         return ticket_;
     }
     bool objectReady(AssetOwnershipTicket t,uint64_t revision) {
-        if(!matches(t)||target_.records.empty())return false;
+        if(publishing_||!matches(t)||target_.records.empty())return false;
         // The changed record is remembered independently of record order.
         if(revision!=objectRevision_)return false;
         objectReady_=true;return true;
     }
     bool pageReady(AssetOwnershipTicket t,const AssetRenderPage& page,uint8_t backend,uint64_t generation) {
-        if(!matches(t)||generation!=target_.generation||(backend!=AssetCpu&&backend!=AssetGpu))return false;
+        if(publishing_||!matches(t)||generation!=target_.generation||(backend!=AssetCpu&&backend!=AssetGpu))return false;
         for(size_t i=0;i<pages_.size();++i)if(pages_[i].x==page.x&&pages_[i].y==page.y&&pages_[i].z==page.z&&pages_[i].level==page.level){
             if(!(pages_[i].backends&backend))return false;
             ready_[i]|=backend;return true;
@@ -110,13 +110,20 @@ public:
         return true;
     }
     template<class AtomicPublish> bool publish(AssetOwnershipTicket t,AtomicPublish&& apply) {
-        if(!ready(t))return false;
+        if(publishing_||!ready(t))return false;
+        // A publication callback may inspect this transaction, but must not
+        // cancel or recursively replace the target it is about to expose.
+        struct PublicationGuard {
+            bool& flag;
+            explicit PublicationGuard(bool& value):flag(value){flag=true;}
+            ~PublicationGuard(){flag=false;}
+        } guard(publishing_);
         // apply must enqueue every page replacement and object visibility in
         // one renderer transaction; false must leave the old scene untouched.
         if(!apply(std::as_const(visible_),std::as_const(target_),std::as_const(pages_)))return false;
         visible_=std::move(target_);clear();return true;
     }
-    bool cancel(AssetOwnershipTicket t){if(!matches(t))return false;clear();return true;}
+    bool cancel(AssetOwnershipTicket t){if(publishing_||!matches(t))return false;clear();return true;}
 private:
     bool matches(AssetOwnershipTicket t) const {return t.serial&&t==ticket_&&t.sourceGeneration==visible_.generation;}
     void clear(){ticket_={};target_={};pages_.clear();ready_.clear();objectReady_=false;}
@@ -125,7 +132,7 @@ private:
     uint64_t serial_=0,objectRevision_=0;
     std::vector<AssetRenderPage> pages_;
     std::vector<uint8_t> ready_;
-    bool objectReady_=false;
+    bool objectReady_=false,publishing_=false;
 };
 // Render ownership must suppress the canonical winning cell, not remove an
 // instance before composition: later overlapping assets would become visible.

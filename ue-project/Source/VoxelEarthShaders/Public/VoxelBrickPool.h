@@ -622,6 +622,20 @@ struct FVoxelBrickPreparedReplacement
 	FVoxelBrickChunkShading Shading;
 };
 
+struct FVoxelBrickPreparedPoolLifetime;
+class VOXELEARTHSHADERS_API FVoxelBrickPreparedBatch
+{
+public:
+    ~FVoxelBrickPreparedBatch();
+    uint64 GetRetainedBytes() const;
+private:
+    friend class FVoxelBrickPool;
+    FVoxelBrickPreparedBatch();
+    struct FState;
+    TUniquePtr<FState> State;
+};
+using FVoxelBrickPreparedBatchRef = TSharedPtr<FVoxelBrickPreparedBatch, ESPMode::ThreadSafe>;
+
 class VOXELEARTHSHADERS_API FVoxelBrickPool
 {
 public:
@@ -937,6 +951,21 @@ public:
     // Requires an installed index preflight contract; legacy-only sinks refuse.
 	bool PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages,
         FVoxelBrickEvictionPinTicket Ticket = {});
+    // Opaque GT reservation; one outstanding per pool. No resident mutation.
+    // Budget covers additional CPU snapshots and pool metadata/scratch, not the
+    // separately credited index packet or already-owned source GPU payloads.
+    FVoxelBrickPreparedBatchRef PreparePreparedBatch(
+        const TArray<FVoxelBrickPreparedReplacement>& Pages,
+        FVoxelBrickEvictionPinTicket Ticket = {},
+        TConstArrayView<FVoxelBrickChunkKey> ExpectedAbsent = {},
+        uint64 MaxAdditionalBytes = 64ull*1024*1024);
+    bool ValidatePreparedBatch(const FVoxelBrickPreparedBatchRef& Token) const;
+    bool PreparedBatchCoversAbsent(const FVoxelBrickPreparedBatchRef& Token, const FVoxelBrickChunkKey& Key) const;
+    // Validate all participants first, then commit without GT yield/callbacks.
+    // Invalid tokens violate the contract before mutation; no fallible admission
+    // remains after this boundary. Does not itself reveal an actor.
+    void CommitPreparedBatch(const FVoxelBrickPreparedBatchRef& Token);
+    bool CancelPreparedBatch(const FVoxelBrickPreparedBatchRef& Token);
     // GT only, bounded to 8192 total unique keys and 16 live tickets. Absent
     // keys are protected on subsequent insertion. Overlap is refused atomically.
     FVoxelBrickEvictionPinTicket AcquireEvictionPins(TConstArrayView<FVoxelBrickChunkKey> Keys);
@@ -1483,6 +1512,10 @@ private:
 	FVoxelBrickIndexSink IndexSink;
     FVoxelBrickIndexPreflight IndexPreflight;
     uint64 IndexSinkGeneration=0;
+    friend class FVoxelBrickPreparedBatch;
+    TSharedPtr<FVoxelBrickPreparedPoolLifetime, ESPMode::ThreadSafe> PreparedLifetime;
+    TWeakPtr<FVoxelBrickPreparedBatch, ESPMode::ThreadSafe> ActivePreparedBatch;
+    void ReleasePreparedBatchState(FVoxelBrickPreparedBatch::FState& State);
     uint64 IndexMutationSequence=0;
     void FlushWithPreparedIndex(FVoxelBrickPreparedIndexDeliveryRef Delivery);
 	// Retirements queued since the last flush, in lockstep with PendingClears.
