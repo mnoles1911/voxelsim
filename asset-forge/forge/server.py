@@ -233,7 +233,7 @@ FORGE = Forge()
 # --- library ----------------------------------------------------------------
 
 
-def encode_voxels(grid) -> bytes:
+def encode_voxels(grid, appearance=None) -> bytes:
     """Surface voxels as a compact binary blob for the 3D viewer.
 
         uint32 nx, ny, nz          grid dimensions
@@ -253,7 +253,18 @@ def encode_voxels(grid) -> bytes:
     pos = np.empty((xs.size, 3), dtype=np.int16)
     pos[:, 0], pos[:, 1], pos[:, 2] = xs, ys, zs
     header = struct.pack("<IIII", *(int(v) for v in grid.shape), int(xs.size))
-    return header + pos.tobytes() + mats.tobytes()
+    body = header + pos.tobytes() + mats.tobytes()
+    if appearance is not None:
+        # Optional RGB1 trailer preserves an imported model's authored coat.
+        # Material IDs remain intact for inspection and VXA export.
+        with np.load(appearance, allow_pickle=False) as data:
+            if not np.array_equal(data['cells'], pos):
+                raise ValueError('appearance cells do not match stored voxel surface')
+            rgb = data['rgb']
+            if rgb.shape != (len(pos), 3) or rgb.dtype != np.uint8:
+                raise ValueError('invalid surface RGB data')
+            body += b'RGB1' + rgb.tobytes()
+    return body
 
 
 def _finest_within(spec: dict, budget: float, weight: float) -> float:
@@ -987,6 +998,7 @@ class Handler(BaseHTTPRequestHandler):
             #                 honest across spec edits; the server ignores it.
             job = FORGE.get(q.get("job", ""))
             grid = None
+            appearance = None
             if job:
                 spec, seed = job.spec, int(q["seed"])
             elif q.get("name"):
@@ -1009,6 +1021,8 @@ class Handler(BaseHTTPRequestHandler):
                     # No (spec, seed) regenerates an import -- the stored
                     # voxels ARE the asset, so serve those.
                     grid = vxa.read(d / "tree.vxa")
+                    if (d / "appearance.npz").is_file():
+                        appearance = d / "appearance.npz"
             try:
                 cap = int(q["max"]) if q.get("max") else None
             except ValueError:
@@ -1019,7 +1033,7 @@ class Handler(BaseHTTPRequestHandler):
                                       resolution_cm=cm).grid
             else:
                 cm = grid.voxel_m * 100.0
-            body = encode_voxels(grid)
+            body = encode_voxels(grid, appearance)
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))

@@ -61,7 +61,12 @@ export function SpeciesPanel({
         </div>
       </header>
 
-      <JudgmentViewport row={row} world={world} />
+      {variants.some((e) => e.imported) ? (
+        <section className="chamfer bevel-up bg-stone-800 p-3">
+          <h3 className="mb-2 font-display text-sm uppercase tracking-widest text-parch-400">Imported model</h3>
+          <VoxelCanvas src={api.voxelsUrl(variants.find((e) => e.imported)!.id)} palette={world.palette} />
+        </section>
+      ) : <JudgmentViewport row={row} world={world} />}
 
       <CurationBar row={row} world={world} />
 
