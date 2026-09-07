@@ -3,6 +3,11 @@ param([string]$LogPath='', [ValidateRange(20,60)][int]$WorldSeconds=55,
 $ErrorActionPreference='Stop'
 $projectRoot=Split-Path $PSScriptRoot -Parent
 $projectPath=[IO.Path]::GetFullPath((Join-Path $projectRoot 'ue-project/VoxelEarth.uproject'))
+foreach($texture in @('T_SkyStarmap','T_MoonColor','T_MoonDisplacement')) {
+    if(!(Test-Path -LiteralPath (Join-Path $projectRoot ('ue-project/Content/Voxel/'+$texture+'.uasset')))) {
+        throw "Missing generated sky texture $texture. Restore/import the dependencies documented in ue-project/Content/Voxel/TextureSource/SKY_ASSET_CREDITS.md before visual travel verification."
+    }
+}
 $runDir=Join-Path $projectRoot ('ue-project/Saved/GpuTravel/' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 if (!$LogPath) { $LogPath=Join-Path $runDir 'runtime.log' }
@@ -60,6 +65,8 @@ try {
     if($captures.Count -ne 3){throw 'Expected three completed viewport captures.'}
     for($i=0;$i -lt 3;$i++) {
         if($captures[$i].Index -ge $teardowns[$i].Index -or ($i -lt 2 -and $teardowns[$i].Index -ge $captures[$i+1].Index)){throw 'Screenshot/teardown order does not prove three separate worlds.'}
+        $shutdown=$content.Substring($captures[$i].Index,$teardowns[$i].Index-$captures[$i].Index)
+        if($shutdown -notmatch 'CPU quiescence COMPLETE tasks=[0-9]+ pool=[0-9]+ elapsedMs=[0-9.]+ admissionClosed=1'){throw "World$($i+1) lacks completed CPU quiescence before GPU ownership teardown."}
     }
     $shots=@(Get-ChildItem -LiteralPath (Join-Path $runDir 'Saved/Screenshots') -Filter '*.png' -Recurse -ErrorAction SilentlyContinue)
     if($shots.Count -ne 3){throw "Expected3 reviewable screenshots, found $($shots.Count)."}

@@ -1,6 +1,7 @@
 #pragma once
 #include "voxelcore/assetauthority.h"
 #include <mutex>
+#include <atomic>
 namespace vxc {
 // Mutation methods are single-owner-thread operations. Immutable views may be
 // read/destroyed on workers; ledger reserve/release is synchronized separately.
@@ -15,6 +16,7 @@ template<int B> class StationaryAssetAuthorityCoordinator final {
     };
     struct Ledger {
         std::mutex lock;uint64_t bytes=0,budget=0;size_t count=0,maxCount=0;bool closed=false;
+        std::atomic<bool> accepting{false};
     };
     static std::shared_ptr<const IAssetAuthorityRetention> reserve(const std::shared_ptr<Ledger>& l) {
         std::lock_guard<std::mutex> guard(l->lock);
@@ -45,6 +47,73 @@ public:
     StationaryAssetAuthorityCoordinator& operator=(const StationaryAssetAuthorityCoordinator&)=delete;
     Ref visible() const{return visible_;}
     Usage usage() const{std::lock_guard<std::mutex> guard(ledger_->lock);return {ledger_->bytes,ledger_->count};}
+    class AsyncRequest {
+        friend class StationaryAssetAuthorityCoordinator;
+        std::weak_ptr<Ledger> owner;
+        // Destruction releases admission/source/lifetime before reservation.
+        std::shared_ptr<const IAssetAuthorityRetention> credit;
+        typename View::AdmissionRef admission;
+        uint64_t epoch=0;
+        std::atomic<bool> started{false},cancelled{false},consumed{false};
+    public:
+        AsyncRequest()=default;AsyncRequest(const AsyncRequest&)=delete;AsyncRequest& operator=(const AsyncRequest&)=delete;
+    };
+    using AsyncRequestRef=std::shared_ptr<AsyncRequest>;
+    class AsyncResult {
+        friend class StationaryAssetAuthorityCoordinator;
+        // Result arrays die before the input's reservation on final release.
+        AsyncRequestRef input;
+        typename View::CompletedRef completed;
+    public:
+        AsyncResult()=default;AsyncResult(const AsyncResult&)=delete;AsyncResult& operator=(const AsyncResult&)=delete;
+    };
+    using AsyncResultRef=std::shared_ptr<const AsyncResult>;
+    // Owner/GT only, initial source only. Credit precedes admission/dispatch.
+    // Arguments are exactly View::admitCapture; no arbitrary worker factory.
+    template<class... Args> AsyncRequestRef prepareAsyncInitial(Args&&... args) {
+        if(visible_)return {};
+        auto lease=reserve(ledger_);if(!lease)return {};
+        auto admission=View::admitCapture(std::forward<Args>(args)...);if(!admission)return {};
+        auto request=std::make_shared<AsyncRequest>();request->owner=ledger_;request->credit=std::move(lease);
+        request->admission=std::move(admission);request->epoch=epoch_;return request;
+    }
+    // Worker entry point. At most one sample per request/credit, even if queued
+    // twice. No owner shared_ptr variable, World map or coordinator is borrowed.
+    static AsyncResultRef runAsync(const AsyncRequestRef& input,std::string& error) {
+        error.clear();
+        if(!input||!input->admission||input->cancelled.load()||input->started.exchange(true)) {error="async request cancelled/already started";return {};}
+        auto owner=input->owner.lock();
+        if(!owner){error="async owner unavailable";return {};}
+        {std::lock_guard<std::mutex> guard(owner->lock);if(owner->closed){error="async owner closed";return {};}}
+        auto completed=View::sampleCapture(input->admission,error);
+        if(!completed||input->cancelled.load())return {};
+        auto out=std::make_shared<AsyncResult>();out->input=input;out->completed=std::move(completed);return out;
+    }
+    bool cancelAsync(const AsyncRequestRef& input) {
+        if(!input||input->owner.lock()!=ledger_||input->consumed.load())return false;
+        return !input->cancelled.exchange(true);
+    }
+    // Owner/GT only. Revalidate actual session/world/epochs immediately before
+    // the core visible pointer handoff; no delayed ticket can outlive this check.
+    // This is not the multi-resource UE publication transaction.
+    bool publishAsync(const AsyncResultRef& result,const World<B>& world,
+        const typename View::CaptureLifetime& lifetime,AssetAuthorityCaptureEpoch now) {
+        if(visible_||epoch_==UINT64_MAX||!result||!result->input||!result->completed)return false;
+        const auto& input=result->input;
+        if(input->owner.lock()!=ledger_||input->epoch!=epoch_||input->cancelled.load()||input->consumed.load())return false;
+        auto owner=ledger_;
+        if(owner->accepting.exchange(true))return false;
+        struct AcceptGuard {std::shared_ptr<Ledger> owner;~AcceptGuard(){owner->accepting.store(false);}} guard{owner};
+        auto accepted=View::acceptCapture(world,result->completed,lifetime,now);if(!accepted)return false;
+        // A callback can cancel this request or publish a competing ticket.
+        // Check the retained ledger before touching this after a callback;
+        // coordinator destruction marks it closed while worker credits survive.
+        {std::lock_guard<std::mutex> lock(owner->lock);if(owner->closed)return false;}
+        if(visible_||epoch_==UINT64_MAX||input->owner.lock()!=ledger_||input->epoch!=epoch_||input->cancelled.load()||input->consumed.load())return false;
+        if(input->consumed.exchange(true))return false;
+        std::const_pointer_cast<View>(accepted)->retention_=input->credit;
+        visible_=std::move(accepted);++epoch_;return true;
+    }
     // Initial capture only. Reservation precedes all capture arrays and callbacks.
     // Args are exactly View::capture arguments; no arbitrary factory callback.
     template<class... Args> Ticket prepareInitial(Args&&... args) {

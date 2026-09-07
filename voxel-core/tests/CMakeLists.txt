@@ -190,3 +190,8 @@ add_test(NAME vxc_authority_tests COMMAND vxc_authority_tests)
 if(NOT MSVC)
   target_compile_options(vxc_authority_tests PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# Focused CPU teardown quiescence contract (no UE scheduler dependency).
+add_executable(vxc_cpuquiescence_tests test_main.cpp test_cpuquiescence.cpp)
+target_link_libraries(vxc_cpuquiescence_tests PRIVATE voxelcore Threads::Threads)
+add_test(NAME vxc_cpuquiescence_tests COMMAND vxc_cpuquiescence_tests)

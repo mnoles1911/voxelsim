@@ -1,3 +1,4 @@
+#include <functional>
 #include "voxelcore/assetauthority.h"
 #include "voxelcore/assetauthoritycoordinator.h"
 #include <thread>
@@ -319,4 +320,136 @@ VXC_TEST(authority_coordinator_bounds_leases_and_rejects_stale_publication) {
     AssetAuthoritySample hit;CHECK(orphan->sampleAt(x,y,z,hit));CHECK_EQ(hit.material,MAT_BARK);
     CHECK(!orphan->editTerrain(orphan->generation(),x+1,y,z,MAT_ROCK)); // closed ledger survives owner
     orphan.reset();
+}
+
+VXC_TEST(authority_split_capture_never_reads_live_overlay_on_worker) {
+    SyntheticTileSampler tiles(kSeed);World<16> world(kSeed,tiles,"fixture-provider");
+    AssetGrid source;CHECK(source.parse(solidBlock(1,1,30,MAT_BARK,100))==AssetParseError::kOk);
+    OneGridBank bank(&source);AssetField field;field.setSeed(kSeed);
+    const AssetLayer layers[]{everyCell(3200,3000,0)};const AssetSpecies species[]{pillarSpecies(0,3000,100)};
+    field.setLayers(layers,1);field.setSpecies(species,1);field.setBankSource(&bank);world.setAssetField(&field);
+    FixtureIdentity identity;identity.field=&field;
+    auto facts=[&](int64_t x,int64_t y){return assetColumnFactsFromSample(world.amplifier().columnCached(x,y));};
+    std::vector<AssetInstance> instances;CHECK(assetAuthorityInstances(field,{-32,-32,31,31},facts,instances));
+    auto ordered=field.resolveForCompose(instances);CHECK(!ordered.empty());if(ordered.empty())return;
+    const auto r=ordered.front();AssetCandidateBounds b;CHECK(assetCandidateBounds(r,b));
+    // Re-resolve full selected footprint so clipping and capture share winners.
+    CHECK(assetAuthorityInstances(field,{b.x0,b.y0,b.x1,b.y1},facts,instances));ordered=field.resolveForCompose(instances);
+    size_t selected=ordered.size();for(size_t i=0;i<ordered.size();++i)if(ordered[i].anchorVx==r.anchorVx&&ordered[i].anchorVy==r.anchorVy)selected=i;
+    CHECK(selected<ordered.size());if(selected==ordered.size())return;
+    std::vector<uint8_t> clipped;CHECK(assetBuildCandidateVxa(ordered,selected,[&](int64_t x,int64_t y){return world.amplifier().columnCached(x,y);},clipped));
+    AssetGrid projection;CHECK(projection.parse(clipped)==AssetParseError::kOk);
+    AssetProvenance p;p.worldSeed=kSeed;p.providerFingerprint=assetAuthorityFingerprint("fixture-provider:worldgen:"+std::to_string(kWorldGenVersion));
+    p.catalogFingerprint=assetAuthorityFingerprint("fixture-catalog:"+identity.contentHash(source));
+    p.anchorVx=r.anchorVx;p.anchorVy=r.anchorVy;p.anchorVz=r.anchorVz;p.layer=r.layer;p.yawQuarter=r.yawQuarter;p.bankId=r.bankId;p.seedIndex=r.seedIndex;
+    std::string error;auto capture=[&](const auto& w,const auto& prov,uint64_t rev){return StationaryAssetAuthority<16>::capture(w,prov,source,projection,7,1,rev,identity,error);};
+
+    using View=StationaryAssetAuthority<16>;
+    struct Lifetime : IAssetAuthorityCaptureLifetime<16> {
+        const World<16>& world;const IAssetAuthorityIdentity& service;
+        Lifetime(const World<16>& w,const IAssetAuthorityIdentity& i):world(w),service(i){}
+        const GeneratedWorld<16>& generated() const override{return world.generated();}
+        const IAssetAuthorityIdentity& identity() const override{return service;}
+    };
+    // Fixture owner scope pins all dependencies until after worker join.
+    auto lifetime=std::make_shared<Lifetime>(world,identity);
+    auto sourceCopy=std::make_shared<const AssetGrid>(source),projectionCopy=std::make_shared<const AssetGrid>(projection);
+    AssetAuthorityCaptureEpoch epoch{3,4,5,1};
+    auto admission=View::admitCapture(world,p,sourceCopy,projectionCopy,7,epoch,lifetime,error);CHECK(bool(admission));
+    auto completed=View::sampleCapture(admission,error);CHECK(bool(completed));
+    auto accepted=View::acceptCapture(world,completed,lifetime,epoch);CHECK(bool(accepted));
+    auto changed=epoch;++changed.configuration;CHECK(!View::acceptCapture(world,completed,lifetime,changed));
+    changed=epoch;++changed.residency;CHECK(!View::acceptCapture(world,completed,lifetime,changed));
+    changed=epoch;++changed.objectRevision;CHECK(!View::acceptCapture(world,completed,lifetime,changed));
+    auto otherLifetime=std::make_shared<Lifetime>(world,identity);CHECK(!View::acceptCapture(world,completed,otherLifetime,epoch));
+    World<16> other(kSeed,tiles,"fixture-provider");other.setAssetField(&field);
+    CHECK(!View::admitCapture(other,p,sourceCopy,projectionCopy,7,epoch,lifetime,error));
+    CHECK(!View::acceptCapture(other,completed,lifetime,epoch));
+    using Coordinator=StationaryAssetAuthorityCoordinator<16>;
+    const auto charge=Coordinator::creditBytes();Coordinator coordinator(charge,1);
+    auto prepare=[&]{return coordinator.prepareAsyncInitial(world,p,sourceCopy,projectionCopy,7,epoch,lifetime,error);};
+    auto request=prepare();CHECK(bool(request));CHECK_EQ(coordinator.usage().bytes,charge);
+    auto workerInput=request;CHECK(coordinator.cancelAsync(request));request.reset();
+    CHECK_EQ(coordinator.usage().generations,size_t(1));CHECK(!prepare());
+    CHECK(!Coordinator::runAsync(workerInput,error));workerInput.reset();CHECK_EQ(coordinator.usage().bytes,uint64_t(0));
+    request=prepare();auto result=Coordinator::runAsync(request,error);CHECK(bool(result));
+    CHECK(!Coordinator::runAsync(request,error)); // one sample per reservation
+    CHECK(coordinator.cancelAsync(request));request.reset();
+    CHECK_EQ(coordinator.usage().generations,size_t(1));CHECK(!prepare()); // completed result pins arrays/charge
+    result.reset();CHECK_EQ(coordinator.usage().bytes,uint64_t(0));
+    request=prepare();result=Coordinator::runAsync(request,error);CHECK(bool(result));
+    Coordinator foreign(charge,1);CHECK(!foreign.publishAsync(result,world,lifetime,epoch));
+    changed=epoch;++changed.edits;CHECK(!coordinator.publishAsync(result,world,lifetime,changed));
+    CHECK(!coordinator.publishAsync(result,world,otherLifetime,epoch));
+    CHECK(coordinator.publishAsync(result,world,lifetime,epoch));CHECK(!coordinator.publishAsync(result,world,lifetime,epoch));
+    CHECK(!coordinator.cancelAsync(request));result.reset();request.reset();
+    CHECK_EQ(coordinator.usage().generations,size_t(1)); // visible view now owns the same credit
+    Coordinator competing(charge*2,2);
+    auto queued=competing.prepareAsyncInitial(world,p,sourceCopy,projectionCopy,7,epoch,lifetime,error);
+    auto queuedResult=Coordinator::runAsync(queued,error);CHECK(bool(queuedResult));
+    auto synchronousTicket=competing.prepareInitial(world,p,source,projection,7,1,1,identity,error);
+    CHECK(competing.publish(synchronousTicket));CHECK(!competing.publishAsync(queuedResult,world,lifetime,epoch));
+    CHECK(competing.cancelAsync(queued));queuedResult.reset();queued.reset();CHECK_EQ(competing.usage().generations,size_t(1));
+    typename Coordinator::AsyncRequestRef orphan;
+    {
+        Coordinator owner(charge,1);orphan=owner.prepareAsyncInitial(world,p,sourceCopy,projectionCopy,7,epoch,lifetime,error);
+        CHECK(bool(orphan));
+    }
+    CHECK(!Coordinator::runAsync(orphan,error));orphan.reset(); // closed ledger, dependencies still pinned until release
+    struct CallbackIdentity : IAssetAuthorityIdentity {
+        const FixtureIdentity& base;mutable std::function<void()> callback;
+        explicit CallbackIdentity(const FixtureIdentity& b):base(b){}
+        std::string catalogIdentity(const AssetField& f)const override {
+            auto once=std::move(callback);callback={};if(once)once();return base.catalogIdentity(f);
+        }
+        std::string contentHash(const AssetGrid& g)const override{return base.contentHash(g);}
+    } callbackIdentity(identity);
+    auto callbackLifetime=std::make_shared<Lifetime>(world,callbackIdentity);
+    {
+        Coordinator c(charge*2,2);
+        auto q=c.prepareAsyncInitial(world,p,sourceCopy,projectionCopy,7,epoch,callbackLifetime,error);
+        auto r=Coordinator::runAsync(q,error);CHECK(bool(r));
+        callbackIdentity.callback=[&]{CHECK(c.cancelAsync(q));};
+        CHECK(!c.publishAsync(r,world,callbackLifetime,epoch));CHECK(!c.visible());
+        r.reset();q.reset();CHECK_EQ(c.usage().bytes,uint64_t(0));
+    }
+    {
+        Coordinator c(charge*2,2);
+        auto q=c.prepareAsyncInitial(world,p,sourceCopy,projectionCopy,7,epoch,callbackLifetime,error);
+        auto r=Coordinator::runAsync(q,error);CHECK(bool(r));
+        auto otherTicket=c.prepareInitial(world,p,source,projection,8,1,1,identity,error);CHECK(bool(otherTicket));
+        callbackIdentity.callback=[&]{CHECK(c.publish(otherTicket));};
+        CHECK(!c.publishAsync(r,world,callbackLifetime,epoch));CHECK(c.visible());CHECK_EQ(c.visible()->generation(),uint64_t(8));
+        CHECK(c.cancelAsync(q));r.reset();q.reset();CHECK_EQ(c.usage().generations,size_t(1));
+    }
+    {
+        Coordinator c(charge,1);
+        auto q=c.prepareAsyncInitial(world,p,sourceCopy,projectionCopy,7,epoch,callbackLifetime,error);
+        auto r=Coordinator::runAsync(q,error);CHECK(bool(r));
+        callbackIdentity.callback=[&]{CHECK(!c.publishAsync(r,world,callbackLifetime,epoch));};
+        CHECK(c.publishAsync(r,world,callbackLifetime,epoch));
+    }
+    Coordinator changedWorld(charge,1);
+    auto staleInput=changedWorld.prepareAsyncInitial(world,p,sourceCopy,projectionCopy,7,epoch,lifetime,error);
+    auto staleResult=Coordinator::runAsync(staleInput,error);CHECK(bool(staleResult));
+    // This writes only World's overlay/log while worker uses generated input.
+    // After join, even an incorrectly unbumped external edit epoch is caught by
+    // the actual log counts/domain revalidation; no unsynchronized map read.
+    View::CompletedRef concurrent;std::string workerError;
+    std::thread worker([&]{concurrent=View::sampleCapture(admission,workerError);});
+    world.setVoxel(b.x0+1,b.y0,b.z1,MAT_ROCK);worker.join();CHECK(bool(concurrent));
+    CHECK(!changedWorld.publishAsync(staleResult,world,lifetime,epoch));CHECK(changedWorld.cancelAsync(staleInput));
+    CHECK(!View::acceptCapture(world,concurrent,lifetime,epoch));
+    CHECK(!View::admitCapture(world,p,sourceCopy,projectionCopy,8,epoch,lifetime,error));
+    // Prior accepted captured material is still immutable after World changed.
+    AssetAuthoritySample hit;CHECK(accepted->sampleAt(b.x0,b.y0,b.z1,hit));CHECK_EQ(hit.material,MAT_BARK);
+    auto synchronous=capture(other,p,1);CHECK(bool(synchronous)); // legacy core API retained
+    {
+        auto otherCallbackLifetime=std::make_shared<Lifetime>(other,callbackIdentity);
+        Coordinator c(charge,1);
+        auto q=c.prepareAsyncInitial(other,p,sourceCopy,projectionCopy,7,epoch,otherCallbackLifetime,error);
+        auto r=Coordinator::runAsync(q,error);CHECK(bool(r));
+        callbackIdentity.callback=[&]{other.setVoxel(b.x0+1,b.y0,b.z1,MAT_ROCK);};
+        CHECK(!c.publishAsync(r,other,otherCallbackLifetime,epoch));CHECK(!c.visible());CHECK(c.cancelAsync(q));
+    }
 }

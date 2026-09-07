@@ -8,6 +8,9 @@
 #include "VoxelEnvironmentLODPrototype.h"
 #include "VoxelProductionCandidatePreparation.h"
 #include "VoxelEnvironmentRenderContext.h"
+#include "voxelcore/cpuquiescence.h"
+#include "VoxelCpuQuiescence.h"
+#include "Misc/ScopeExit.h"
 #include "VoxelEnvironmentAuthorityIdentity.h"
 #include "VoxelEnvironmentPageBarrier.h"
 #include "VoxelEnvironmentPageSampler.h"
@@ -4744,7 +4747,7 @@ UE::Tasks::ETaskPriority WorkerTaskPriorityEnum()
 // priority is implicated and the next probe is TPri_Normal here.
 //
 // Teardown is covered: pool futures are pruned in Tick beside InFlightTasks,
-// waited with the same deadline in WaitForInFlightTasks, and the pool is
+// retained until completion in WaitForInFlightTasks, and the pool is
 // destroyed there -- the raw-pointer capture contract ("no job outlives
 // Impl") is inherited unchanged.
 int32 WorkerPoolThreads()
@@ -10137,6 +10140,21 @@ struct FVoxelWorldImpl
 
 	void TickStreaming(const FVector& Anchor, AActor& Owner, USceneComponent& Root, UMaterialInterface* Material, float DeltaTime);
 	void WaitForInFlightTasks();
+	void DrainCpuWorkers();
+    template<class Body,class... Options>
+    UE::Tasks::TTask<void> LaunchAdmittedCpuTask(const TCHAR* Name,Body&& Work,Options&&... Opts) {
+        check(IsInGameThread());
+        if(!CpuAdmission.isOpen()){ UE_LOG(LogVoxelStream,Fatal,TEXT("CPU launch attempted after quiescence admission closed")); }
+        return UE::Tasks::Launch(Name,Forward<Body>(Work),Forward<Options>(Opts)...);
+    }
+
+	vxc::CpuAdmissionGate CpuAdmission;
+    TFuture<void> LaunchAdmittedPoolTask(TUniqueFunction<void()>&& Work) {
+        check(IsInGameThread());
+        if(!CpuAdmission.isOpen()){ UE_LOG(LogVoxelStream,Fatal,TEXT("CPU launch attempted after quiescence admission closed")); }
+        return AsyncPool(GetOrCreateWorkerPool(),MoveTemp(Work));
+    }
+
 
 	// Dig/place (edit-log authority path). Game thread only. OutPredicted,
 	// when non-null, receives a COPY of the per-brick cell groups actually
@@ -12218,125 +12236,26 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	}
 }
 
+void FVoxelWorldImpl::DrainCpuWorkers()
+{
+    const auto Receipt=DrainVoxelCpuBorrowers(CpuAdmission,InFlightTasks,InFlightPoolFutures,
+        [](int32 Tasks,int32 Futures){
+            UE_LOG(LogVoxelStream,Warning,TEXT("CPU quiescence still waiting: tasks=%d pool=%d; admission closed, handles/providers retained"),Tasks,Futures);
+        });
+    UE_LOG(LogVoxelStream,Log,TEXT("CPU quiescence COMPLETE tasks=%d pool=%d elapsedMs=%.3f admissionClosed=1"),
+        Receipt.Tasks,Receipt.Pool,Receipt.Seconds*1000.);
+
+}
+
 void FVoxelWorldImpl::WaitForInFlightTasks()
 {
+    CpuAdmission.close();
     RestoreVisualBufferSettings();
     RestoreVisualViewMode();
-	// Called from Deinitialize before Impl is torn down: worker jobs capture
-	// raw pointers into Voxels.generated() and the results queue (see
-	// DispatchJobs) rather than a ref-counted handle, on the assumption that
-	// no job outlives Impl. This is what makes that assumption true.
-	//
-	// 2026-07-29: THIS FUNCTION WAS THE PRIME SUSPECT FOR AN EDITOR THAT NEVER
-	// EXITS AFTER A FLIGHT LEG (harness reports "ok", UnrealEditor-Cmd stays
-	// alive at ~4.5 GB, idle, and the next leg then dies on the one-editor
-	// guard). Three properties made it a hang rather than a wait:
-	//
-	//   1. InFlightTasks IS ONLY PRUNED IN Tick (the RemoveAllSwap above the
-	//      MaybeLogCounters call). Deinitialize runs after the last tick, so
-	//      the array here holds every task launched since that prune --
-	//      hundreds of them, most already finished. Pruning first turns most
-	//      of the loop below into nothing.
-	//   2. Task.Wait() TOOK NO TIMEOUT. The jobs run at
-	//      ETaskPriority::BackgroundNormal; a task already executing on a
-	//      background worker cannot be retracted and run inline by the waiter,
-	//      so if the scheduler's background workers are parked (which engine
-	//      exit paths do) the game thread blocks on an event nothing will ever
-	//      signal. An unbounded wait turns that into a permanently live
-	//      process instead of a diagnosable failure.
-	//   3. IT SAID NOTHING. A wedge here and a wedge in GPU teardown below
-	//      looked identical from the log, which is why this was still a
-	//      hypothesis and not a fact after two legs.
-	//
-	// So: prune, then wait with a deadline, then REPORT. The deadline does not
-	// make abandoning a task safe -- the raw-pointer capture above is still
-	// real -- which is exactly why timing out is logged as an Error and why
-	// UVoxelPerfRunSubsystem arms a hard exit watchdog around the whole
-	// shutdown rather than this function pretending it recovered.
-	const double WaitT0 = FPlatformTime::Seconds();
-	const int32 TasksBeforePrune = InFlightTasks.Num();
-	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
-	const int32 TasksToWaitFor = InFlightTasks.Num();
-
-	// Generous but finite. A single worker job's p95 is ~1.2 s and they drain
-	// in parallel, so a healthy teardown of a few hundred tasks finishes in
-	// seconds; anything past this is not slow, it is stuck.
-	constexpr double kTaskDrainBudgetSec = 60.0;
-	const double Deadline = WaitT0 + kTaskDrainBudgetSec;
-	int32 TimedOut = 0;
-	for (UE::Tasks::TTask<void>& Task : InFlightTasks)
-	{
-		const double Remaining = Deadline - FPlatformTime::Seconds();
-		if (Remaining <= 0.0 || !Task.Wait(FTimespan::FromSeconds(Remaining)))
-		{
-			++TimedOut;
-		}
-	}
-	const double WaitMs = (FPlatformTime::Seconds() - WaitT0) * 1000.0;
-	if (TimedOut > 0)
-	{
-		UE_LOG(LogVoxelStream, Error,
-		       TEXT("WaitForInFlightTasks: %d of %d worker task(s) did NOT complete within %.0fs. Impl is about to be ")
-		       TEXT("destroyed while they may still hold raw pointers into it -- this shutdown is unsound, and the ")
-		       TEXT("process is expected to be terminated by the perf-run exit watchdog rather than exit cleanly."),
-		       TimedOut, TasksToWaitFor, kTaskDrainBudgetSec);
-	}
-	else
-	{
-		UE_LOG(LogVoxelStream, Log,
-		       TEXT("WaitForInFlightTasks: drained %d worker task(s) in %.0f ms (%d of %d were already complete)."),
-		       TasksToWaitFor, WaitMs, TasksBeforePrune - TasksToWaitFor, TasksBeforePrune);
-	}
-	InFlightTasks.Empty();
-
-	// --- -VoxelWorkerPool arm (dedicated pool futures + the pool itself) ----
-	// Same prune / deadline-wait / report discipline as the task loop above,
-	// under the same overall deadline: the job body is the same code holding
-	// the same raw pointers into Impl, so every property of the hang
-	// postmortem applies verbatim. The pool is destroyed here and only here;
-	// after the futures drain its queue is empty, so Destroy() only joins
-	// idle threads.
-	if (InFlightPoolFutures.Num() > 0 || WorkerPool)
-	{
-		const double PoolWaitT0 = FPlatformTime::Seconds();
-		const int32 FuturesBeforePrune = InFlightPoolFutures.Num();
-		InFlightPoolFutures.RemoveAllSwap([](const TFuture<void>& F) { return F.IsReady(); },
-		                                  EAllowShrinking::No);
-		int32 PoolTimedOut = 0;
-		for (TFuture<void>& Future : InFlightPoolFutures)
-		{
-			const double Remaining = Deadline - FPlatformTime::Seconds();
-			if (Remaining <= 0.0 || !Future.WaitFor(FTimespan::FromSeconds(Remaining)))
-			{
-				++PoolTimedOut;
-			}
-		}
-		if (PoolTimedOut > 0)
-		{
-			UE_LOG(LogVoxelStream, Error,
-			       TEXT("WaitForInFlightTasks: %d of %d POOL job(s) (-VoxelWorkerPool) did NOT complete within the ")
-			       TEXT("shared deadline. Same unsound-shutdown consequences as the task arm above; the pool is ")
-			       TEXT("deliberately LEAKED rather than Destroy()ed, because Destroy() would block on the very jobs ")
-			       TEXT("that just proved they are stuck."),
-			       PoolTimedOut, InFlightPoolFutures.Num());
-		}
-		else
-		{
-			if (FuturesBeforePrune > 0)
-			{
-				UE_LOG(LogVoxelStream, Log,
-				       TEXT("WaitForInFlightTasks: drained %d pool job(s) (-VoxelWorkerPool) in %.0f ms."),
-				       FuturesBeforePrune, (FPlatformTime::Seconds() - PoolWaitT0) * 1000.0);
-			}
-			if (WorkerPool)
-			{
-				WorkerPool->Destroy();
-				delete WorkerPool;
-				WorkerPool = nullptr;
-			}
-		}
-		InFlightPoolFutures.Empty();
-	}
+    // Close admission and retain every borrower until completion. A stuck
+    // scheduler may block shutdown, but cannot turn timeout into freed memory.
+    DrainCpuWorkers();
+    if(WorkerPool){WorkerPool->Destroy();delete WorkerPool;WorkerPool=nullptr;}
 
 	// --- GPU-meshed jobs (Wave D / D4) --------------------------------------
 	//
@@ -12414,8 +12333,7 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		}
 	}
 
-	// The bounded worker waits and manager cancellation are complete. Existing
-	// timeout diagnostics above still apply: a timed-out worker is NOT joined.
+	// CPU borrowers are fully joined and manager cancellation is complete.
 	// Discard queued payloads before the final render flush because their
 	// destructors may enqueue render-resource releases, including the last item.
 	for (const auto& Entry : GpuJobsPending) {
@@ -18353,6 +18271,7 @@ static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelK
 
 void FVoxelWorldImpl::TickHeldCpuPreparation()
 {
+    if(!CpuAdmission.isOpen())return;
     auto Work=ProductionCandidate;if(!Work||!ProductionRehearsal)return;
     auto& State=*ProductionRehearsal;
     constexpr uint64 MaxBytes=128ull*1024*1024;
@@ -18379,7 +18298,7 @@ void FVoxelWorldImpl::TickHeldCpuPreparation()
                 if(!PilotSnapshot){Refuse(TEXT("real ownership preparation refused"));return;}
             }
             ProductionCandidateWorkers.fetch_add(1);
-            auto Task=UE::Tasks::Launch(TEXT("HeldCpuTargetContext"),[this,Job,Work,Provider,Catalog,Generation,PilotSnapshot](){
+            auto Task=LaunchAdmittedCpuTask(TEXT("HeldCpuTargetContext"),[this,Job,Work,Provider,Catalog,Generation,PilotSnapshot](){
                 ON_SCOPE_EXIT {Job->Ready.Store(true);ProductionCandidateWorkers.fetch_sub(1);};
                 if(Job->Cancelled.Load())return;
                 // Draft only: no publication callback or backend readiness exists.
@@ -18447,7 +18366,7 @@ void FVoxelWorldImpl::TickHeldCpuPreparation()
         auto Job=MakeShared<FHeldCpuPageJob,ESPMode::ThreadSafe>();Job->Key=Key;State.CpuJobs.Add(Job);
         const auto Context=State.CpuContext;const auto* Gen=&Voxels.generated();
         ProductionCandidateWorkers.fetch_add(1);
-        auto Task=UE::Tasks::Launch(TEXT("HeldCpuPagePack"),[this,Job,Context,Gen,Key](){
+        auto Task=LaunchAdmittedCpuTask(TEXT("HeldCpuPagePack"),[this,Job,Context,Gen,Key](){
             ON_SCOPE_EXIT {Job->Ready.Store(true);ProductionCandidateWorkers.fetch_sub(1);};
             if(Job->Cancelled.Load())return;
             auto Resolved=VoxelResolveTerrainInstances(*Gen,VoxelAssetRectForFootprint(Key.Level,Key.Key.X,Key.Key.Y));
@@ -18820,6 +18739,7 @@ void FVoxelWorldImpl::RestoreVisualViewMode()
 
 void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Anchor)
 {
+    if(!CpuAdmission.isOpen())return;
     using namespace VoxelProductionCandidate;
     check(IsInGameThread());
     const int32 Request=ConsumeRequest(World);
@@ -18919,7 +18839,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
             Work->Started=FPlatformTime::Seconds();Work->EditEpoch=EditEpoch.load();Work->ResidencyEpoch=FineStreamer->ResidencyEpoch();
             const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
             ProductionCandidateWorkers.fetch_add(1);
-            auto Task=UE::Tasks::Launch(TEXT("ProductionCandidateSelect"),[this,Work,Rect,X,Y,Provider,Catalog]()
+            auto Task=LaunchAdmittedCpuTask(TEXT("ProductionCandidateSelect"),[this,Work,Rect,X,Y,Provider,Catalog]()
             {
                 const auto Resolved=VoxelResolveTerrainInstances(Voxels.generated(),Rect);
                 int64 Best=MAX_int64;
@@ -18994,7 +18914,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
         {
             Work->Phase=2;Work->WorkerReady.Store(false);Work->Success=false;
             ProductionCandidateWorkers.fetch_add(1);
-            auto Task=UE::Tasks::Launch(TEXT("ProductionCandidateClip"),[this,Work,FullRect]()
+            auto Task=LaunchAdmittedCpuTask(TEXT("ProductionCandidateClip"),[this,Work,FullRect]()
             {
                 const auto Ordered=VoxelResolveTerrainInstances(Voxels.generated(),FullRect);
                 size_t Selected=Ordered.size();
@@ -19704,6 +19624,7 @@ void FVoxelWorldImpl::DrainAssetResolveResults()
 
 void FVoxelWorldImpl::WarmAssetResolves()
 {
+    if(!CpuAdmission.isOpen())return;
 	check(IsInGameThread());
 	if (!VoxelStreamAdmission::AsyncAssetResolveEnabled())
 	{
@@ -19789,7 +19710,7 @@ void FVoxelWorldImpl::WarmAssetResolves()
 			// warm task that is NOT registered there would outlive Impl on
 			// teardown and read freed worldgen -- which is why this is added to
 			// the array on the very next line rather than fired and forgotten.
-			UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+			UE::Tasks::TTask<void> Task = LaunchAdmittedCpuTask(
 				TEXT("VoxelAssetResolveWarm"),
 				[GenPtr, QueuePtr, CacheKey, Rect]()
 				{
@@ -24092,6 +24013,7 @@ void FVoxelWorldImpl::DrainWarmShadingResults()
 // ---------------------------------------------------------------------------
 void FVoxelWorldImpl::WarmShadingAheadTick()
 {
+    if(!CpuAdmission.isOpen())return;
 	const float BudgetMs = CVarVoxelStreamWarmShadingAhead.GetValueOnGameThread();
 	const int32 AsyncPerTick = CVarVoxelStreamWarmShadingAsync.GetValueOnGameThread();
 	const bool bAsync = AsyncPerTick > 0;
@@ -24331,7 +24253,7 @@ void FVoxelWorldImpl::WarmShadingAheadTick()
 						++AsyncLaunchedThisTick;
 						++WarmAsyncLaunchedSinceLog;
 						++WarmAsyncLaunchedTotal;
-						UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+						UE::Tasks::TTask<void> Task = LaunchAdmittedCpuTask(
 							TEXT("VoxelWarmShading"),
 							[AmpPtr, WarmQueuePtr, WarmKey, ChunkWorldOrigin, RootLoc,
 							 SampledWorld, Level]()
@@ -25548,6 +25470,7 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 
 void FVoxelWorldImpl::DispatchJobs()
 {
+    if(!CpuAdmission.isOpen())return;
     // Visual-only GPU pilot pauses new producers, not manager/result draining.
     // TickStreaming continues both drains and pool flushes outside this method.
     if(ProductionRehearsal&&ProductionRehearsal->VisualGpuDrain)return;
@@ -27403,11 +27326,11 @@ void FVoxelWorldImpl::DispatchJobs()
 			// see WorkerPoolThreads). Future stored for the teardown wait,
 			// exactly as the TTask is on the default arm.
 			InFlightPoolFutures.Add(
-			    AsyncPool(GetOrCreateWorkerPool(), TUniqueFunction<void()>(MoveTemp(JobBody))));
+			    LaunchAdmittedPoolTask(TUniqueFunction<void()>(MoveTemp(JobBody))));
 		}
 		else
 		{
-			UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+			UE::Tasks::TTask<void> Task = LaunchAdmittedCpuTask(
 				TEXT("VoxelChunkMeshJob"), MoveTemp(JobBody),
 				// -VoxelWorkerTaskPri (default: BackgroundNormal, the historical
 				// hardwired value). See WorkerTaskPriorityEnum's comment for the
@@ -32479,6 +32402,9 @@ bool UVoxelWorldSubsystem::InstallWaterMarker(vxc::IWaterSampler* Sampler, bool 
 		       TEXT("InstallWaterMarker: no world impl -- the marker was requested before Initialize ran."));
 		return false;
 	}
+    const bool ReopenAdmission=Impl->CpuAdmission.close();
+    Impl->DrainCpuWorkers();
+    ON_SCOPE_EXIT { if(ReopenAdmission)Impl->CpuAdmission.reopen(); };
 	if (!Sampler)
 	{
 		Impl->Voxels.setWaterMarker(nullptr, bIncludeOcean);
