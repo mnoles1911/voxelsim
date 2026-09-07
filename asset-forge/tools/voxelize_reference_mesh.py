@@ -16,6 +16,56 @@ from scipy import ndimage
 from reconstruct_pilot import ortho
 
 
+def write_views(output, cells, surface_cells, rgb, pitch):
+    """Export matched sRGB orthographic images and linear-color cubic GLB."""
+    lower = cells.min(0) - 1
+    shape = cells.max(0) - lower + 2
+    occupied = np.zeros(shape, bool)
+    occupied[tuple((cells-lower).T)] = True
+    indices = surface_cells - lower
+    full = np.zeros((*shape, 3), np.uint8)
+    full[tuple(indices.T)] = rgb
+    # Exposed cube faces preserve the actual cubic surface in oblique renders.
+    vertices, faces, colors = [], [], []
+    for axis in range(3):
+        u, v = [i for i in range(3) if i != axis]
+        for sign in (-1, 1):
+            adjacent = indices.copy(); adjacent[:, axis] += sign
+            exposed = ~occupied[tuple(adjacent.T)]
+            selected = indices[exposed]
+            corners = np.zeros((4, 3))
+            corners[:, axis] = sign*.5
+            corners[:, u] = [-.5, .5, .5, -.5]
+            corners[:, v] = [-.5, -.5, .5, .5]
+            quad = ((selected+lower)[:, None, :] + corners)*pitch
+            base = len(vertices)
+            vertices.extend(quad.reshape(-1, 3))
+            # Make winding consistent with the exposed face normal.
+            pattern = np.array([[0, 1, 2], [0, 2, 3]])
+            if (1 if axis != 1 else -1) != sign:
+                pattern = pattern[:, ::-1]
+            faces.extend((np.arange(len(selected))[:, None, None]*4 + base + pattern).reshape(-1, 3))
+            colors.extend(np.repeat(full[tuple(selected.T)], 4, axis=0))
+    # glTF vertex COLOR_0 is linear, while the image/RGB sidecar is sRGB.
+    srgb = np.asarray(colors, dtype=float)/255
+    linear = np.where(srgb <= .04045, srgb/12.92, ((srgb+.055)/1.055)**2.4)
+    voxel_mesh = trimesh.Trimesh(vertices=vertices, faces=faces,
+        vertex_colors=np.c_[np.rint(linear*255).astype(np.uint8), np.full(len(colors), 255)], process=False)
+    voxel_mesh.apply_transform(np.array([[1,0,0,0],[0,0,1,0],[0,-1,0,0],[0,0,0,1]]))
+    voxel_mesh.export(output/'colored-voxels.glb')
+    sheet = Image.new('RGB', (2100, 1460), (223, 226, 229))
+    draw = ImageDraw.Draw(sheet)
+    for i, (name, axis, reverse) in enumerate([
+        ('side A', 1, False), ('side B', 1, True), ('end A', 0, True),
+        ('end B', 0, False), ('top', 2, True), ('bottom', 2, False)]):
+        view = ortho(full, occupied, axis, reverse)
+        view.save(output/f'view-{i}.png')
+        x, y = i % 3 * 700, i // 3 * 730
+        sheet.paste(view, (x, y + 30))
+        draw.text((x + 20, y + 8), name, fill='black')
+    sheet.save(output/'six-views.png')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', type=Path)
@@ -89,47 +139,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output/'surface-appearance.npz', cells=indices+lower,
                         rgb=rgb, occupied_cells=cells, voxel_m=pitch)
-    full = np.zeros((*shape, 3), np.uint8)
-    full[tuple(indices.T)] = rgb
-    # Exposed cube faces preserve the actual cubic surface in oblique renders.
-    vertices, faces, colors = [], [], []
-    for axis in range(3):
-        u, v = [i for i in range(3) if i != axis]
-        for sign in (-1, 1):
-            adjacent = indices.copy(); adjacent[:, axis] += sign
-            exposed = ~occupied[tuple(adjacent.T)]
-            selected = indices[exposed]
-            corners = np.zeros((4, 3))
-            corners[:, axis] = sign*.5
-            corners[:, u] = [-.5, .5, .5, -.5]
-            corners[:, v] = [-.5, -.5, .5, .5]
-            quad = ((selected+lower)[:, None, :] + corners)*pitch
-            base = len(vertices)
-            vertices.extend(quad.reshape(-1, 3))
-            # Make winding consistent with the exposed face normal.
-            pattern = np.array([[0, 1, 2], [0, 2, 3]])
-            if (1 if axis != 1 else -1) != sign:
-                pattern = pattern[:, ::-1]
-            faces.extend((np.arange(len(selected))[:, None, None]*4 + base + pattern).reshape(-1, 3))
-            colors.extend(np.repeat(full[tuple(selected.T)], 4, axis=0))
-    # glTF vertex COLOR_0 is linear, while the image/RGB sidecar is sRGB.
-    srgb = np.asarray(colors, dtype=float)/255
-    linear = np.where(srgb <= .04045, srgb/12.92, ((srgb+.055)/1.055)**2.4)
-    voxel_mesh = trimesh.Trimesh(vertices=vertices, faces=faces,
-        vertex_colors=np.c_[np.rint(linear*255).astype(np.uint8), np.full(len(colors), 255)], process=False)
-    voxel_mesh.apply_transform(np.array([[1,0,0,0],[0,0,1,0],[0,-1,0,0],[0,0,0,1]]))
-    voxel_mesh.export(args.output/'colored-voxels.glb')
-    sheet = Image.new('RGB', (2100, 1460), (223, 226, 229))
-    draw = ImageDraw.Draw(sheet)
-    for i, (name, axis, reverse) in enumerate([
-        ('side A', 1, False), ('side B', 1, True), ('end A', 0, True),
-        ('end B', 0, False), ('top', 2, True), ('bottom', 2, False)]):
-        view = ortho(full, occupied, axis, reverse)
-        view.save(args.output/f'view-{i}.png')
-        x, y = i % 3 * 700, i // 3 * 730
-        sheet.paste(view, (x, y + 30))
-        draw.text((x + 20, y + 8), name, fill='black')
-    sheet.save(args.output/'six-views.png')
+    write_views(args.output, cells, indices+lower, rgb, pitch)
     report = dict(source=args.source.name,
         source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
         scale_assumption='Total source bounding length, including tail; not a measured specimen',

@@ -1,5 +1,21 @@
 # Creature reconstruction pilot checkpoint
 
+## Latest continuation: wolf coat study
+
+The user explicitly supported the process and requested continuing the wolf.
+`asset-forge/tools/refine_wolf_pilot.py` now generates a separate reference-informed
+coat candidate from the previous source study. See
+`asset-forge/refs/reconstruction/grey-wolf/coat-study-review.md` for visual findings
+and the newly identified shoulder-height discrepancy. The comparison lives at
+`asset-forge/out/creature-reconstruction/grey-wolf-coat-study/before-after.png`.
+This is an appearance improvement candidate; anatomical approval remains open.
+
+Exact occupied cells and surface indices match the prior study; six projections
+from the refactored exporter are pixel-identical to the baseline, and exterior
+triangle count/winding checks pass. The inspection studio now uses fixed -1.5 EV
+exposure to avoid washing out the coat. Re-render older oblique images under the
+same exposure for a fair comparison. Orthographic RGB images remain unlit.
+
 The user accepted the anatomy-first eight-species pilot and explicitly made
 anatomical and visual realism the primary acceptance criterion. Continue
 autonomously; do not ask for approval of ordinary experimentation.

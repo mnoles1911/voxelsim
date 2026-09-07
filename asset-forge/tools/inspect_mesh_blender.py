@@ -43,6 +43,9 @@ scene.render.engine='CYCLES';scene.cycles.device='CPU';scene.cycles.samples=24
 scene.cycles.use_denoising=True;scene.render.threads_mode='FIXED';scene.render.threads=6
 scene.render.resolution_x=800;scene.render.resolution_y=700;scene.render.resolution_percentage=100
 scene.render.image_settings.file_format='PNG';scene.render.film_transparent=False
+# Fixed exposure keeps this bright three-light studio from washing out coat
+# regions. Orthographic RGB images remain the unlit color reference.
+scene.view_settings.exposure=-1.5
 for i,offset in enumerate(((3,-5,2),(-3,-5,2),(0,-5,1),(5,0,1))):
     camera.location=center+Vector(offset)*span
     camera.rotation_euler=(center-camera.location).to_track_quat('-Z','Y').to_euler()
