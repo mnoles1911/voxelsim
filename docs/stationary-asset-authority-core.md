@@ -128,3 +128,22 @@ known canonical MD5 and compression-insensitive hash) and EnvironmentAuthorityPr
 seed/worldgen mismatch refused). No UE build/runtime has run for these additions.
 The adapter is registered but no authority coordinator/capture is created in game.
 Production promotion, epoch binding, replay of ownership and publication remain off.
+
+## Bounded terrain edit batches
+
+`editTerrainBatch(expectedGeneration, span)` accepts1..4096 terrain cells. It checks
+all coordinates and material IDs before reserving a generation credit or copying
+storage. A mixed valid/invalid batch refuses atomically. Duplicate coordinates use
+last-input-wins order, including explicit air. One accepted operation clones the
+override array once and increments authority generation once; object revision and
+projection remain unchanged. The single-cell API delegates to this same path.
+Input storage must remain immutable throughout the synchronous call.
+
+The coordinator's `prepareTerrainEditBatch(expectedRef, span)` requires the exact
+visible base and uses the existing opaque ticket/epoch/foreign-owner checks. The
+batch pays one full-generation credit, not one per cell. Source tests cover mixed
+coordinate/material refusal without admission change, empty/oversized batches,
+duplicate air precedence, old readers, quota exhaustion/release, stale competing
+tickets and foreign expected refs. The focused MSVC authority target passed all
+five cases (0.24 seconds). They do not write World::log or World overlays;
+joint World-log/materialization integration remains separate work.

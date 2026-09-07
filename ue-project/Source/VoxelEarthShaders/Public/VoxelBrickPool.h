@@ -623,8 +623,8 @@ struct FVoxelBrickPreparedReplacement
 };
 
 struct FVoxelBrickPreparedPoolLifetime;
-enum class EVoxelPrivateGpuReservationStatus : uint8 { Pending, ReadyPrivate, Failed, Cancelled };
-// Diagnostic prerequisite only: private claims are NEVER published to the index.
+enum class EVoxelPrivateGpuReservationStatus : uint8 { Pending, ReadyPrivate, Failed, Cancelled, Published };
+// Private claims stay unexposed until the explicit diagnostic commit seam is used.
 class VOXELEARTHSHADERS_API FVoxelPrivateGpuReservation {
 public:
     FVoxelPrivateGpuReservation()=default;
@@ -980,11 +980,24 @@ public:
     bool CancelPreparedBatch(const FVoxelBrickPreparedBatchRef& Token);
     // Explicit diagnostic, CPU packs only, <=64 pages / 8MiB / 30 seconds.
     // Reserves descriptors and claims GPU words without touching Resident/index.
-    // No publication API exists until GPU reservation acceptance is complete.
+    // Publication is an explicit diagnostic step below and requires the caller
+    // to supply a complete World freeze and renderer boundary.
+    // Owner-thread observation for a bounded diagnostic producer drain.
+    // Does not itself pause producers, flush queues, or reserve admission.
+    bool PrivateGpuInputsDrained() const;
     FVoxelPrivateGpuReservationRef BeginPrivateGpuReservation(const TArray<FVoxelBrickPreparedReplacement>& Pages,
         FVoxelBrickEvictionPinTicket Pins,FString& OutError,uint64 MaxBytes=8ull*1024*1024);
     EVoxelPrivateGpuReservationStatus PollPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token,FString& OutError);
     bool CancelPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token);
+    // Diagnostic backend seam only; no World activation or renderer boundary.
+    // After ReadyPrivate, reserve index delivery and host storage. Full absence
+    // membership shares the same pins. Commit allocates no GPU ranges.
+    bool PreparePrivateGpuCommit(const FVoxelPrivateGpuReservationRef& Token,
+        TConstArrayView<FVoxelBrickChunkKey> ExpectedAbsent,FString& OutError,uint64 MaxHostBytes=32ull*1024*1024);
+    bool ValidatePrivateGpuCommit(const FVoxelPrivateGpuReservationRef& Token) const;
+    bool PrivateGpuCommitCoversAbsent(const FVoxelPrivateGpuReservationRef& Token,const FVoxelBrickChunkKey& Key) const;
+    void CommitPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token);
+
 #if WITH_DEV_AUTOMATION_TESTS
     void InitPrivateGpuReservationTestPool(const FVoxelBrickPoolConfig& InConfig);
 #endif
@@ -1217,7 +1230,8 @@ public:
 	                                       const FVoxelBrickPoolBuffersRef& Buffers);
 
 	// Drops every allocation and queues a clear of nothing -- the records are
-	// left as they are, because a Reset with no re-add is only used at teardown.
+	// rotated into a fresh holder. Callers must first quiesce producers and detach
+	// their index; queued RT commands retain the old holder until retirement.
 	void Reset();
 
 	// --- the numbers P2 is gated on ----------------------------------------

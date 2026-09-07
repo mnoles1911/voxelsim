@@ -801,6 +801,7 @@ private:
 	uint32 ProofStashTail = 0;
 	uint32 ProofStashConsumed = 0;
 	uint32 ProofStashFold = 0;
+    int64 ProofStashClaims = 0;
 	double LastProofSeconds = 0.0;
 	FProofStatus Proof;
 

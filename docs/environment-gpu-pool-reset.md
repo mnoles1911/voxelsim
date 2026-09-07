@@ -1,0 +1,19 @@
+# GPU allocator lifetime across world travel
+
+World teardown detaches its index and joins producers before calling the process-global brick pool Reset. Previously Reset cleared CPU slot ownership but retained GPU allocator state and records, while Init returned early on the next world. New CPU slots could therefore name stale records and old arena ranges survived without host ownership.
+
+Reset now rotates the shared buffer holder, creates the next empty holder on the game thread, and queues retirement of the old holder. Queued render work retains its exact old shared buffers; resources are never cleared in place beneath it. This still requires the caller to quiesce producers and detach the index first; it does not support two concurrent worlds sharing one pool.
+
+The existing CPU worker timeout path does not yet meet that quiescence contract: it can continue destruction after a timeout. The separate lifetime follow-up must retain dependencies until workers stop, including externally owned water-marker data. Normal completed teardown tests do not establish timeout safety.
+
+Allocator diagnostic readbacks carry a render-thread epoch. Ready retired-epoch readbacks are drained and discarded, never folded into the new world's counters. Epoch rotation clears raw modular-counter history and published allocator snapshots. Existing cumulative cross-check verdicts remain session evidence. Host shell/fallback tallies restart with the new arena. No GPU-idle wait was added to ordinary Reset.
+
+The separate claim diagnostic now compares the landed GPU claim count with the host cohort captured for that same proof. Current async-deferred claims are excluded; later staging cannot turn an earlier zero snapshot into a false CLAIM STAGE DARK. The manager's summary uses the same landed host cohort. Missing claims and excess claims still fail.
+
+Source regression tests cover real ordinary CPU-to-GPU claims, Reset followed by a completely zero GPU state/bitmap/side-table/record readback, slot reuse at a different signed world origin, one-claim counters and unchanged bump demand after reset, and freeing all new bitmap ownership without double grants or bad frees. Index coverage here uses a local test sink and reattachment snapshot; the separate real-index publication test covers actual ordered delivery. The claim-cohort test covers the first async zero snapshot, delayed host advancement, genuine missing claims, excess claims and serial execution.
+
+Final Unreal build passed11actions50.44s. All55DX12 tests passed with complete queue and normal exit0 in environment-final-gpu-fine-tests.log, including sequential reset, removal-only index drain, cohort and cold fine-tile absence tests.
+
+The first actual travel run exposed a fine-tile cold-absence bug before travel: the first failed load established known absence but fell through to the fatal gate. Both final lock paths now recheck confirmed absence; present corrupt/unreadable data remains refused. The next run completed three worlds and two OpenLevel transitions normally without allocator errors, but the first world's verification samples had not landed before travel. The harness refused that incomplete evidence. A longer settling run remains required. Screenshots show existing sky coverage and terrain-streaming visual defects; allocator acceptance does not imply visual completion.
+
+The final 55s/world run `environment-gpu-world-travel-settled.log` passed: three worlds, two actual OpenLevel transitions, new successful cross-checks in each world, ordered viewport captures and empty pool/index teardown, normal exit0. All three images under Saved/GpuTravel/4c097db40e6d4295baacdaf124cb37f5 were inspected and show consistent settled terrain, with the existing sky coverage warning. This establishes ordinary sequential reload acceptance for the tested site.

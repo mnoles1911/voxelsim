@@ -14,11 +14,13 @@ param(
     [switch]$SurfaceLightingDiagnostic,
     [switch]$CaptureBuffers,
     [switch]$AssetResolveCacheOnly,
+    [switch]$GpuAllocatorVisualPilot,
     [switch]$AllowOtherProjectEditors
 )
 $ErrorActionPreference = 'Stop'
 if ($SurfaceLightingDiagnostic -and $Mode -ne 'VisualPilot') { throw '-SurfaceLightingDiagnostic requires -Mode VisualPilot.' }
 if ($CaptureBuffers -and $Mode -ne 'VisualPilot') { throw '-CaptureBuffers requires -Mode VisualPilot.' }
+if ($GpuAllocatorVisualPilot -and $Mode -ne 'VisualPilot') { throw '-GpuAllocatorVisualPilot requires -Mode VisualPilot.' }
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $projectPath = [IO.Path]::GetFullPath((Join-Path $projectRoot 'ue-project/VoxelEarth.uproject'))
 if (!$LogPath) { $LogPath = Join-Path $projectRoot ('Saved/environment-' + $Mode.ToLowerInvariant() + '-' + [Guid]::NewGuid().ToString('N') + '.log') }
@@ -74,7 +76,7 @@ $testArgs = @(
     ('-VoxelExecCmds="' + $delayedCommands + ',voxel.DeferExec ' + $ExitAfterSeconds + ' quit"'),
     ('-abslog="' + $LogPath + '"')
 )
-if ($Mode -eq 'VisualPilot') { $testArgs += '-VoxelGpuPoolAlloc=0' }
+if ($Mode -eq 'VisualPilot') { $testArgs += $(if ($GpuAllocatorVisualPilot) { '-VoxelGpuPoolAlloc=1' } else { '-VoxelGpuPoolAlloc=0' }) }
 if ($AssetResolveCacheOnly) { $testArgs += @('-VoxelAsyncAssetResolve','-VoxelAsyncAssetResolveWarm=0') }
 $testProcess = Start-Process 'D:/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe' -ArgumentList $testArgs -WindowStyle Hidden -PassThru
 Write-Output "Owned environment verification PID $($testProcess.Id); log $LogPath"
@@ -84,6 +86,10 @@ try {
     $testText = Get-Content -LiteralPath $LogPath -Raw
     if ($testText -notmatch 'Authority identity READY providerBound=1' -or $testText -match 'Authority identity unavailable:') {
         throw 'Canonical catalog and active provider identity binding was not confirmed.'
+    }
+    if ($GpuAllocatorVisualPilot -and $testText -notmatch 'ProductionVisualPilot ALLOCATOR gpu=1 privateProof=1') { throw 'Default GPU allocator publication proof is missing.' }
+    if ($testText -match 'ALLOCATOR CROSS-CHECK FAILED|doubleGrant [1-9][0-9]*|badFree [1-9][0-9]*|Error:.*CLAIM STAGE DARK') {
+        throw 'GPU allocator or claim proof reported a failure; transaction success alone is insufficient.'
     }
     if ($AssetResolveCacheOnly) {
         $cacheReceipts = [regex]::Matches($testText,'assets RESOLVE \(B\.3\): hits=([0-9]+) inline=([0-9]+) uncached=([0-9]+) \| warm launched=([0-9]+)')

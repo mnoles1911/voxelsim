@@ -76,6 +76,22 @@ bool FAdapter::StageAbsentPage(vxc::AssetOwnershipTicket Ticket,const vxc::Asset
     if(!Item){Item=&StagedPages.AddDefaulted_GetRef();Item->Page=Page;Item->Generation=Generation;}
     Item->ValidatedAbsent=true;return true;
 }
+bool FAdapter::StageAbsentPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,
+                              const FVoxelBrickPool& Pool,const FVoxelPrivateGpuReservationRef& Batch)
+{
+    check(IsInGameThread());
+    const auto Target=Ownership.target(Ticket);
+    if(!PreparedPages(Ticket)||!Target||Target->generation!=Generation||
+       Page.x<MIN_int32||Page.x>MAX_int32||Page.y<MIN_int32||Page.y>MAX_int32||Page.z<MIN_int32||Page.z>MAX_int32||
+       (Page.backends&RequiredBackends)!=RequiredBackends||
+       !Pool.PrivateGpuCommitCoversAbsent(Batch,{int32(Page.x),int32(Page.y),int32(Page.z),Page.level}))return false;
+    auto Item=StagedPages.FindByPredicate([&](const auto& P){return P.Page.x==Page.x&&P.Page.y==Page.y&&P.Page.z==Page.z&&P.Page.level==Page.level;});
+    if(Item&&!Item->ValidatedAbsent)return false;
+    for(uint8 Backend:{uint8(vxc::AssetCpu),uint8(vxc::AssetGpu)})
+        if((Page.backends&Backend)&&!MarkPageReady(Ticket,Page,Backend,Generation))return false;
+    if(!Item){Item=&StagedPages.AddDefaulted_GetRef();Item->Page=Page;Item->Generation=Generation;}
+    Item->ValidatedAbsent=true;return true;
+}
 bool FAdapter::Commit(vxc::AssetOwnershipTicket Ticket)
 {
     check(IsInGameThread());

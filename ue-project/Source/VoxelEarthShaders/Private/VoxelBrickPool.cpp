@@ -1125,14 +1125,17 @@ namespace VoxelBrickPoolDetail
 
 	// RENDER THREAD ONLY, the GPendingFlushVerify shape (and the same
 	// deliberate leak-at-exit trade -- see that struct's comment).
+	uint64 GAllocDiagnosticEpoch=1; // render-thread-only buffer lifetime
 	struct FPendingAllocVerify
 	{
+        uint64 Epoch=0;
 		FRHIGPUBufferReadback* Readback = nullptr;
 		uint32 ExpectedChunks = 0;
 	};
 	TArray<FPendingAllocVerify> GPendingAllocVerify;
 	struct FPendingAllocCounters
 	{
+        uint64 Epoch=0;
 		FRHIGPUBufferReadback* Readback = nullptr;
 		// The layout the readback was taken under, for the stack-top walk.
 		uint32 OccTopsFirst = 0, OccClasses = 0, OccClassStep = 0;
@@ -1214,6 +1217,10 @@ namespace VoxelBrickPoolDetail
 			{
 				continue;
 			}
+            if(Pending.Epoch!=GAllocDiagnosticEpoch){
+                delete Pending.Readback;GPendingAllocVerify.RemoveAtSwap(I,EAllowShrinking::No);
+                GAllocXchkPending.fetch_sub(1,std::memory_order_relaxed);continue;
+            }
 			uint32 Result[3] = { 0, 0, 0 };
 			if (const void* Src = Pending.Readback->Lock(sizeof(Result)))
 			{
@@ -1256,6 +1263,9 @@ namespace VoxelBrickPoolDetail
 			{
 				continue;
 			}
+            if(Pending.Epoch!=GAllocDiagnosticEpoch){
+                delete Pending.Readback;GPendingAllocCounters.RemoveAtSwap(I,EAllowShrinking::No);continue;
+            }
 			// Sized from the pending entry, not the constant -- the step latches
 			// can widen the tops arrays past 96 dwords (see the constant).
 			TArray<uint32> CArr;
@@ -1696,7 +1706,11 @@ struct FVoxelPrivateGpuReservation::FState {
     TArray<TUniquePtr<FRHIGPUBufferReadback>> Reads;
     FVoxelBrickEvictionPinTicket Pins;
     FGuid Epoch;
-    uint64 Mutation=0;
+    uint64 Mutation=0,CommitSink=0;
+    TArray<FVoxelBrickChunkKey> ExpectedAbsent;
+    FVoxelBrickPreparedIndexDeliveryRef Delivery;
+    bool CommitReady=false,CommitPreparing=false,CommitValidating=false;
+    std::atomic<bool> ProofReady{false},Committed{false};
     double Started=0;
     std::atomic<int32> Status{0}; // pending, ready-private, failed, cancelled
     std::atomic<bool> Cancelled{false},Retired{false},PollQueued{false};
@@ -1710,7 +1724,7 @@ struct FVoxelPrivateGpuReservation::FState {
         A.AllocState=G.RegisterExternalBuffer(B->AllocStatePooled);A.AllocBitmap=G.RegisterExternalBuffer(B->AllocBitmapPooled);A.AllocSide=G.RegisterExternalBuffer(B->AllocSidePooled);return A;
     }
     void Free_RenderThread(FRHICommandListImmediate& RHICmdList){
-        if(Freed)return;Freed=true;
+        if(Freed||Committed.load())return;Freed=true;
         if(!Buffers||!Buffers->IsValid()||!Buffers->HasGpuAlloc())return;
         TArray<uint32> Slots;for(const auto& D:Descriptors)Slots.Add(D.Offset/64);
         if(Slots.IsEmpty())return;
@@ -1719,7 +1733,7 @@ struct FVoxelPrivateGpuReservation::FState {
         VoxelGpuWorldGen::AddBrickPoolFreePass(G,A,Layout,List,Slots.Num());G.Execute();
     }
     void Read_RenderThread(FRHICommandListImmediate& RHICmdList){
-        if(Retired.load()||!Issued)return;
+        if(Retired.load()||Committed.load()||!Issued)return;
         if(Cancelled.load())Free_RenderThread(RHICmdList);
         for(const auto& R:Reads)if(R&&!R->IsReady())return;
         if(Status.load()==0&&!Cancelled.load()){
@@ -1766,6 +1780,7 @@ struct FVoxelPrivateGpuReservation::FState {
             Status.store(Valid?1:2);if(!Valid)Cancelled.store(true);
         }
         Reads.Empty();
+        if(Status.load()==1&&!Cancelled.load())ProofReady.store(true);
         if(Cancelled.load()){
             Free_RenderThread(RHICmdList);
             if(Status.load()!=2)Status.store(3);
@@ -2809,6 +2824,12 @@ void FVoxelBrickPool::RetirePrivateGpuReservation(bool Shutdown){
     });
     if(Shutdown)ActivePrivateGpuReservation.Reset();
 }
+bool FVoxelBrickPool::PrivateGpuInputsDrained() const {
+    check(IsInGameThread());
+    return PendingWrites.IsEmpty()&&PendingClears.IsEmpty()&&PendingIndexRemovals.IsEmpty()&&
+        PendingGpuCpuWrites.IsEmpty()&&PendingGpuIndexAdds.IsEmpty()&&DeferredGpuIndexAdds.IsEmpty()&&
+        GpuClaimPendingSlots.IsEmpty()&&PendingGpuFreeSlots.IsEmpty();
+}
 FVoxelPrivateGpuReservationRef FVoxelBrickPool::BeginPrivateGpuReservation(
     const TArray<FVoxelBrickPreparedReplacement>& Input,FVoxelBrickEvictionPinTicket Pins,FString& Error,uint64 MaxBytes){
     check(IsInGameThread());Error.Reset();
@@ -2881,6 +2902,7 @@ FVoxelPrivateGpuReservationRef FVoxelBrickPool::BeginPrivateGpuReservation(
         G.Execute();S->Issued=true;
     });
     FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Token,S](float){
+        if(S->Committed.load())return false;
         if(auto* Owner=S->Lifetime->Owner){FString Ignored;Owner->PollPrivateGpuReservation(Token,Ignored);}
         else S->Cancelled.store(true);
         if(S->Retired.load())return false;
@@ -2895,24 +2917,120 @@ EVoxelPrivateGpuReservationStatus FVoxelBrickPool::PollPrivateGpuReservation(con
     check(IsInGameThread());Error.Reset();
     if(!Token||!Token->State||Token->State->Lifetime->Owner!=this){Error=TEXT("Foreign or expired reservation");return EVoxelPrivateGpuReservationStatus::Failed;}
     const auto S=Token->State;
-    bool Valid=S->Epoch==EvictionPinNonce&&S->Mutation==IndexMutationSequence&&S->Pins.PoolNonce==EvictionPinNonce&&EvictionPinTickets.Contains(S->Pins.Serial);
+    if(S->Committed.load())return EVoxelPrivateGpuReservationStatus::Published;
+    // Unrelated map/index work cannot own these descriptor slots: DescArena
+    // reservations exclude them from allocation, and no Resident entry names
+    // them. Epoch/buffer identity covers allocator replacement; exact old-page
+    // identities and pin serial cover target removal/replacement and pin release.
+    // Index delivery acquires its own tighter version proof at final preparation.
+    bool Valid=bGpuAllocArmed&&S->Buffers==Buffers&&S->Epoch==EvictionPinNonce&&S->Pins.PoolNonce==EvictionPinNonce&&EvictionPinTickets.Contains(S->Pins.Serial);
     for(const auto& P:S->Pages){const auto* Pin=EvictionPins.Find(P.Key);const auto* Old=Resident.Find(P.Key);
         Valid=Valid&&Pin&&*Pin==S->Pins.Serial&&(Old?(int32(Old->ChunkSlot)==P.ExpectedSlot&&Old->AddSequence==P.ExpectedSequence):P.ExpectedSlot==INDEX_NONE);}
     if(!Valid||FPlatformTime::Seconds()-S->Started>30.){Error=TEXT("Reservation invalidated or timed out");CancelPrivateGpuReservation(Token);}
     if(S->Retired.load()&&ActivePrivateGpuReservation==Token){
         if(S->Epoch==EvictionPinNonce)for(const auto& D:S->Descriptors)DescArena.Free(D);
-        S->Pages.Empty();S->Descriptors.Empty();S->WordBases.Empty();S->Buffers.Reset();
+        S->Pages.Empty();S->Descriptors.Empty();S->WordBases.Empty();S->ExpectedAbsent.Empty();S->Delivery.Reset();S->Buffers.Reset();
         ActivePrivateGpuReservation.Reset();
     }
     const int32 Status=S->Status.load();
     if(Status==2){Error=TEXT("GPU claim or record proof failed");return EVoxelPrivateGpuReservationStatus::Failed;}
     if(S->Cancelled.load())return EVoxelPrivateGpuReservationStatus::Cancelled;
-    return Status==1?EVoxelPrivateGpuReservationStatus::ReadyPrivate:EVoxelPrivateGpuReservationStatus::Pending;
+    return Status==1&&S->ProofReady.load()?EVoxelPrivateGpuReservationStatus::ReadyPrivate:EVoxelPrivateGpuReservationStatus::Pending;
 }
 bool FVoxelBrickPool::CancelPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token){
-    check(IsInGameThread());if(!Token||ActivePrivateGpuReservation!=Token)return false;
+    check(IsInGameThread());if(!Token||ActivePrivateGpuReservation!=Token||Token->State->Committed.load())return false;
     if(!Token->State->Cancelled.exchange(true))RetirePrivateGpuReservation(false);
     return true;
+}
+
+bool FVoxelBrickPool::PreparePrivateGpuCommit(const FVoxelPrivateGpuReservationRef& Token,
+    TConstArrayView<FVoxelBrickChunkKey> Absences,FString& Error,uint64 MaxHostBytes){
+    check(IsInGameThread());
+    if(PollPrivateGpuReservation(Token,Error)!=EVoxelPrivateGpuReservationStatus::ReadyPrivate)return false;
+    const auto S=Token->State;
+    const auto Refuse=[&](const TCHAR* Why){Error=Why;return false;};
+    if(S->CommitPreparing||S->CommitReady||!IndexSink||!IndexPreflight||Absences.Num()>1024-S->Pages.Num())return Refuse(TEXT("Commit already prepared, missing index contract, or footprint too large"));
+    // A short final window drains ordinary writes before reserving their exact
+    // replacement delta. Preparation itself never flushes or exposes anything.
+    if(!PendingWrites.IsEmpty()||!PendingClears.IsEmpty()||!PendingIndexRemovals.IsEmpty()||
+       !PendingGpuCpuWrites.IsEmpty()||!PendingGpuIndexAdds.IsEmpty()||!DeferredGpuIndexAdds.IsEmpty()||
+       !GpuClaimPendingSlots.IsEmpty()||!PendingGpuFreeSlots.IsEmpty())return Refuse(TEXT("Ordinary pool queues must drain before final index preparation"));
+    const int32 N=S->Pages.Num();
+    if(NextAddSequence>MAX_uint64-uint64(N)||Resident.Num()>MAX_int32-N||EvictionOrder.Num()>MAX_int32-N)return Refuse(TEXT("Host identity/capacity overflow"));
+    const uint64 Bound=4096+uint64(Resident.Num()+N)*256+uint64(EvictionOrder.Num()+N)*32+uint64(N+Absences.Num())*256;
+    if(Bound>FMath::Min(MaxHostBytes,32ull*1024*1024))return Refuse(TEXT("Host preparation budget exceeded"));
+    TSet<FVoxelBrickChunkKey> Keys;
+    FVoxelBrickIndexDelta Delta;
+    Delta.Removed.Reserve(N);Delta.Added.Reserve(N);
+    for(int32 I=0;I<N;++I){
+        const auto& P=S->Pages[I];Keys.Add(P.Key);
+        if(const auto* Old=Resident.Find(P.Key)){
+            if(!Old->bGpuArenas)return Refuse(TEXT("CPU-owned source in armed pool"));
+            Delta.Removed.Add({P.Key,Old->ChunkSlot});
+        }
+        Delta.Added.Add({P.Key,S->Descriptors[I].Offset/64});
+    }
+    for(const auto& Key:Absences){
+        const auto* Pin=EvictionPins.Find(Key);
+        if(Keys.Contains(Key)||Resident.Contains(Key)||!Pin||*Pin!=S->Pins.Serial)return Refuse(TEXT("Absence identity/pin mismatch"));
+        Keys.Add(Key);
+    }
+    // Reserve all mutable host collections used by the no-admission commit.
+    // UE allocator OOM remains fatal engine behavior, not a recoverable commit.
+    Resident.Reserve(Resident.Num()+N);EvictionOrder.Reserve(EvictionOrder.Num()+N);
+    PendingGpuFreeSlots.Reserve(N);PendingIndexRemovals.Reserve(N);PendingGpuIndexAdds.Reserve(N);
+    S->ExpectedAbsent.Append(Absences.GetData(),Absences.Num());
+    S->Mutation=IndexMutationSequence;S->CommitSink=IndexSinkGeneration;
+    TGuardValue<bool> Preparing(S->CommitPreparing,true);
+    const auto Preflight=IndexPreflight;S->Delivery=Preflight(Delta);
+    S->CommitReady=true;
+    if(S->Lifetime->Owner!=this){S->CommitReady=false;S->Delivery.Reset();S->ExpectedAbsent.Empty();return Refuse(TEXT("Pool destroyed during preflight"));}
+    if(!ValidatePrivateGpuCommit(Token)){S->CommitReady=false;S->Delivery.Reset();S->ExpectedAbsent.Empty();return Refuse(TEXT("Index credit or source changed during preflight"));}
+    return true;
+}
+bool FVoxelBrickPool::ValidatePrivateGpuCommit(const FVoxelPrivateGpuReservationRef& Token)const{
+    check(IsInGameThread());
+    if(!Token||!Token->State||ActivePrivateGpuReservation!=Token)return false;
+    const auto S=Token->State;
+    if(S->CommitValidating||!S->CommitReady||S->Committed.load()||S->Cancelled.load()||!S->ProofReady.load()||S->Status.load()!=1||
+        S->Lifetime->Owner!=this||!bGpuAllocArmed||S->Buffers!=Buffers||S->Epoch!=EvictionPinNonce||
+        S->Mutation!=IndexMutationSequence||S->CommitSink!=IndexSinkGeneration||
+        S->Pins.PoolNonce!=EvictionPinNonce||!EvictionPinTickets.Contains(S->Pins.Serial)||FPlatformTime::Seconds()-S->Started>30.)return false;
+    for(const auto& P:S->Pages){
+        const auto* Pin=EvictionPins.Find(P.Key);const auto* Old=Resident.Find(P.Key);
+        if(!Pin||*Pin!=S->Pins.Serial||(Old?(!Old->bGpuArenas||int32(Old->ChunkSlot)!=P.ExpectedSlot||Old->AddSequence!=P.ExpectedSequence):P.ExpectedSlot!=INDEX_NONE))return false;
+    }
+    for(const auto& Key:S->ExpectedAbsent){const auto* Pin=EvictionPins.Find(Key);if(!Pin||*Pin!=S->Pins.Serial||Resident.Contains(Key))return false;}
+    const auto Delivery=S->Delivery;
+    TGuardValue<bool> Validating(S->CommitValidating,true);
+    if(!Delivery||!Delivery->ValidateForCommit())return false;
+    return S->Lifetime->Owner==this&&ActivePrivateGpuReservation==Token&&!S->Cancelled.load()&&
+        S->CommitReady&&!S->Committed.load()&&S->Delivery==Delivery&&
+        S->Epoch==EvictionPinNonce&&S->Mutation==IndexMutationSequence&&S->CommitSink==IndexSinkGeneration;
+}
+bool FVoxelBrickPool::PrivateGpuCommitCoversAbsent(const FVoxelPrivateGpuReservationRef& Token,const FVoxelBrickChunkKey& Key)const{
+    return ValidatePrivateGpuCommit(Token)&&Token->State->ExpectedAbsent.Contains(Key);
+}
+void FVoxelBrickPool::CommitPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token){
+    check(IsInGameThread());
+    if(!ValidatePrivateGpuCommit(Token)){checkf(false,TEXT("GPU publication requires complete validated private/index reservation"));return;}
+    const auto S=Token->State;
+    // Transfer ownership before any callback. The private cancellation path can
+    // never free these ranges once Resident owns them, including reentrant ticks.
+    S->Committed.store(true);S->CommitReady=false;
+    for(int32 I=0;I<S->Pages.Num();++I){
+        const auto& P=S->Pages[I];const auto& D=S->Descriptors[I];RemoveChunk(P.Key);
+        FResidentChunk C;C.Key=P.Key;C.ChunkSlot=D.Offset/64;C.BrickBase=D.Offset;C.bGpuArenas=true;
+        C.AddSequence=NextAddSequence++;
+        // GPU ranges remain owned by the allocator side table, like ordinary
+        // GPU residents. CPU FreeResident must never return word-arena ranges.
+        Resident.Add(P.Key,C);NoteResidentDelta(P.Key,+1);EvictionOrder.Add(P.Key);++ChunksAdded;
+        PendingGpuIndexAdds.Add({P.Key,C.ChunkSlot});
+    }
+    auto Delivery=MoveTemp(S->Delivery);
+    FlushWithPreparedIndex(MoveTemp(Delivery));
+    S->Pages.Empty();S->Descriptors.Empty();S->WordBases.Empty();S->ExpectedAbsent.Empty();S->Buffers.Reset();S->Retired.store(true);
+    if(S->Lifetime->Owner==this&&ActivePrivateGpuReservation==Token)ActivePrivateGpuReservation.Reset();
 }
 FVoxelBrickPreparedBatchRef FVoxelBrickPool::PreparePreparedBatch(
     const TArray<FVoxelBrickPreparedReplacement>& InputPages,FVoxelBrickEvictionPinTicket Ticket,
@@ -3644,6 +3762,7 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 					new FRHIGPUBufferReadback(TEXT("Voxel.BrickPoolAllocVerify"));
 				AddEnqueueCopyPass(GraphBuilder, Readback, VerifyBuf, 3 * sizeof(uint32));
 				FPendingAllocVerify Pending;
+                Pending.Epoch=GAllocDiagnosticEpoch;
 				Pending.Readback = Readback;
 				Pending.ExpectedChunks = NumEntries;
 				GPendingAllocVerify.Add(Pending);
@@ -3662,6 +3781,7 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 			AddEnqueueCopyPass(GraphBuilder, Counters, AB.AllocState,
 			                   ReadDwords * sizeof(uint32));
 			FPendingAllocCounters PendingCounters;
+            PendingCounters.Epoch=GAllocDiagnosticEpoch;
 			PendingCounters.Readback = Counters;
 			PendingCounters.ReadDwords = ReadDwords;
 			PendingCounters.OccTopsFirst = Layout.OccTopsFirst;
@@ -3804,10 +3924,47 @@ void FVoxelBrickPool::Reset()
 	PendingWrites.Reset();
 	PendingClears.Reset();
 	PendingIndexRemovals.Reset();
-	// P1. The GPU-side allocator state is NOT reset here -- Reset with no re-add
-	// is teardown-only (see the declaration), and the buffers die with the
-	// holder. What must not survive is the CPU-side pending work naming slots
-	// this pool no longer owns.
+    // Reset follows producer quiescence and index detachment. The global
+    // holder survives map travel: reset CPU slots MUST receive fresh GPU
+    // records/side-table/bitmap too. Old queued commands keep their exact
+    // shared holder; never clear buffers in place beneath those commands.
+    auto RetiredBuffers=MoveTemp(Buffers);
+    if(bInitialised)GetOrCreateBuffers(); // publish stable new holder on GT
+    const bool GlobalDiagnostics=this==&GetGlobalVoxelBrickPool();
+    ENQUEUE_RENDER_COMMAND(RetireVoxelPoolEpoch)([RetiredBuffers=MoveTemp(RetiredBuffers),GlobalDiagnostics](FRHICommandListImmediate&) mutable {
+        if(GlobalDiagnostics){
+            using namespace VoxelBrickPoolDetail;
+            ++GAllocDiagnosticEpoch;
+            FMemory::Memzero(GAllocCtrLastRaw,sizeof(GAllocCtrLastRaw));
+            FMemory::Memzero(GAllocCtrAccum,sizeof(GAllocCtrAccum));
+            GAllocSnapClaims.store(0,std::memory_order_relaxed);
+            GAllocSnapStackPops.store(0,std::memory_order_relaxed);
+            GAllocSnapFrees.store(0,std::memory_order_relaxed);
+            GAllocSnapClaimFailOcc.store(0,std::memory_order_relaxed);
+            GAllocSnapClaimFailMat.store(0,std::memory_order_relaxed);
+            GAllocSnapClaimFailWorst.store(0,std::memory_order_relaxed);
+            GAllocSnapBitmapCollision.store(0,std::memory_order_relaxed);
+            GAllocSnapFreeMissing.store(0,std::memory_order_relaxed);
+            GAllocDupFreeSlots.store(0,std::memory_order_relaxed);
+            GAllocSnapPushOverflow.store(0,std::memory_order_relaxed);
+            GAllocSnapOccBump.store(0,std::memory_order_relaxed);
+            GAllocSnapMatBump.store(0,std::memory_order_relaxed);
+            GAllocSnapOccInFlight.store(0,std::memory_order_relaxed);
+            GAllocSnapMatInFlight.store(0,std::memory_order_relaxed);
+            GAllocSnapOccPaddedCum.store(0,std::memory_order_relaxed);
+            GAllocSnapOccActualCum.store(0,std::memory_order_relaxed);
+            GAllocSnapMatPaddedCum.store(0,std::memory_order_relaxed);
+            GAllocSnapMatActualCum.store(0,std::memory_order_relaxed);
+            GAllocSnapStrandedOccDwords.store(0,std::memory_order_relaxed);
+            GAllocSnapStrandedMatDwords.store(0,std::memory_order_relaxed);
+            GAllocSnapOccStackPeak.store(0,std::memory_order_relaxed);
+            GAllocSnapMatStackPeak.store(0,std::memory_order_relaxed);
+            GAllocCountersLanded.store(0,std::memory_order_relaxed);
+        }
+        RetiredBuffers.Reset();
+    });
+    GpuShellsAllocated=GpuFreesQueued=GpuFallbackStacked=GpuFallbackDiscard=GpuFallbackShellRefused=GpuFallbackShellStolen=0;
+    if(GlobalDiagnostics)VoxelBrickPoolDetail::GAllocWindowStart=0.;
 	PendingGpuFreeSlots.Reset();
 	PendingGpuIndexAdds.Reset();
 	// P2: the deferred half of the same pending work, same reason.
@@ -4810,7 +4967,7 @@ void FVoxelBrickPool::FlushWithPreparedIndex(FVoxelBrickPreparedIndexDeliveryRef
 	// FlushPendingGpuFrees's declaration. No-op unarmed and when empty.
 	FlushPendingGpuFrees();
 
-	if (PendingWrites.Num() == 0 && PendingClears.Num() == 0 &&
+	if (PendingWrites.Num() == 0 && PendingClears.Num() == 0 && PendingIndexRemovals.Num() == 0 &&
 	    PendingGpuCpuWrites.Num() == 0 && PendingGpuIndexAdds.Num() == 0)
 	{
 		// The window still has to tick while the pipeline idles -- the counter
