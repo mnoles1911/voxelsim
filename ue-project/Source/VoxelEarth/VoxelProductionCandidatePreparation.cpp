@@ -15,6 +15,10 @@ FAutoConsoleCommandWithWorld PrepareProductionCandidateCommand(
 FAutoConsoleCommandWithWorld CancelProductionCandidateCommand(
     TEXT("voxel.Environment.CancelCandidate"),TEXT("Cancel and destroy the hidden production candidate preparation."),
     FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,2);}));
+FAutoConsoleCommandWithWorld RehearseProductionHandoffCommand(
+    TEXT("voxel.Environment.RehearseHandoff"),
+    TEXT("Prepare a hidden canonical candidate, then rehearse bounded page quiescence and allocation-token validation. No ownership publication or allocator pin guarantee."),
+    FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,3);}));
 }
 namespace VoxelProductionCandidate
 {

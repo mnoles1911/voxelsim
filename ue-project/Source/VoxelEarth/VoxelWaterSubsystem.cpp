@@ -2146,16 +2146,18 @@ void TickOceanConnectivity(FVoxelWaterImpl& Impl, UWorld* World)
 	}
 
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
-	if (PC == nullptr)
+	const bool bHaveCamera = PC && PC->GetPawn();
+	if (!bHaveCamera && !W.bValid)
 	{
-		return; // nothing to centre on; same rule as the implicit sweep
+		return; // No authoritative location from which to initialize the window.
 	}
 	FVector CamUU = FVector::ZeroVector;
 	FRotator UnusedRot = FRotator::ZeroRotator;
-	PC->GetPlayerViewPoint(CamUU, UnusedRot);
-	const int64 CamXMm = VoxelCoords::WorldToMm(CamUU.X);
-	const int64 CamYMm = VoxelCoords::WorldToMm(CamUU.Y);
+	if (bHaveCamera) PC->GetPlayerViewPoint(CamUU, UnusedRot);
 	const int64 HalfMm = FW::kCellMm * int64(FW::kN) / 2;
+	// Keep the published window and tide updates alive during unpossession.
+	const int64 CamXMm = bHaveCamera ? VoxelCoords::WorldToMm(CamUU.X) : W.OriginXMm + HalfMm;
+	const int64 CamYMm = bHaveCamera ? VoxelCoords::WorldToMm(CamUU.Y) : W.OriginYMm + HalfMm;
 	// Min corner snapped DOWN to the cell grid (floorDiv, the one idiom), so a
 	// cell's world footprint never shifts sub-cell between recentres.
 	const int64 WantX = vxc::floorDiv(CamXMm - HalfMm, FW::kCellMm) * FW::kCellMm;
@@ -5915,7 +5917,7 @@ void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World)
 		AnchorVy = int64(FMath::FloorToDouble(SumY / double(Count)));
 		bHaveAnchor = true;
 	}
-	else if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr)
+	else if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr; PC && PC->GetPawn())
 	{
 		FVector ViewUU = FVector::ZeroVector;
 		FRotator UnusedRot = FRotator::ZeroRotator;
@@ -7471,7 +7473,7 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 			}
 		}
 
-		if (APlayerController* PC = World->GetFirstPlayerController())
+		if (APlayerController* PC = World->GetFirstPlayerController(); PC && PC->GetPawn())
 		{
 			FVector CameraUU = FVector::ZeroVector;
 			FRotator UnusedRot = FRotator::ZeroRotator;

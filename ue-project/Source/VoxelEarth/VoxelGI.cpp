@@ -1200,7 +1200,7 @@ FVector UVoxelGISubsystem::ResolveViewOriginUU(bool& bOutResolved) const
 		{
 			if (const APlayerCameraManager* Cam = PC->PlayerCameraManager)
 			{
-				if (Cam->GetCameraCacheTime() > 0.f)
+				if (PC->GetPawn() && Cam->GetCameraCacheTime() > 0.f)
 				{
 					return Cam->GetCameraLocation();
 				}

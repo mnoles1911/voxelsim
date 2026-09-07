@@ -153,9 +153,18 @@ class FRHIGPUBufferReadback;
 	SHADER_PARAMETER(FUintVector, MarchIndexDimChunks) \
 	SHADER_PARAMETER(FUintVector, MarchIndexWrapChunk)
 
+struct FVoxelMarchOrderedLifetime;
+namespace VoxelMarchOrdered { struct FPacket; }
+
 class VOXELEARTHSHADERS_API FVoxelMarchChunkIndex
 {
 public:
+    #if WITH_DEV_AUTOMATION_TESTS
+    void DebugSeedOrderedForTest(const TArray<struct FVoxelBrickIndexEntry>& Snapshot);
+    void DebugResetOrderedForTest();
+    void DebugApplyOrderedForTest(const struct FVoxelBrickIndexDelta& Delta);
+    void DebugReadOrderedForTest(uint32 Cell, uint64& Generation, uint32& Value, uint32& OccupiedWord) const;
+    #endif
 	FVoxelMarchChunkIndex();
 	~FVoxelMarchChunkIndex();
 
@@ -899,7 +908,8 @@ public:
 	// tracks bytes that actually cross to RDG rather than bytes that were
 	// merely prepared. This is the number that decided the delta path was
 	// required: ~10 GB per 5 s window staged to move ~0.065% of the grid.
-	uint64 GetUploadBytes() const { return UploadBytes; }
+	uint64 GetUploadBytes() const { return UploadBytes.load(); }
+    uint64 GetQueuedIndexPacketBytes() const;
 	// See BlockFallbackBinds. Non-zero while a block-skip leg is running means
 	// some binds marched against an all-ones coarse level, i.e. against the
 	// control, and their timings are not the arm's. READ IT AGAINST
@@ -1056,7 +1066,7 @@ public:
 	// the rest on the game thread; reads are diagnostic and a one-frame-stale
 	// verify count is acceptable, a torn uint64 on x64 is not possible for
 	// aligned words.
-	FUploadStats GetUploadStats() const { return UploadStats; }
+	FUploadStats GetUploadStats() const;
 
 	// A CONTENT HASH OF THE WHOLE GRID, and it exists because equal counts are
 	// not equal contents.
@@ -1208,7 +1218,8 @@ private:
 	// additions) into a render command that scatters them into the persistent
 	// index buffer via the publish kernel. GAME THREAD; called only from
 	// MarkDirtyAndUpload's publish leaf, which owns the fallback ladder.
-	void EnqueueGpuPublish(bool bVerifyWanted, uint64 ExpectedHash);
+	void ResetOrderedState();
+	void PublishGpuOrdered_RenderThread(FRHICommandListImmediate& RHICmdList, VoxelMarchOrdered::FPacket& Packet);
 	void NoteObservedSpan(const FIntVector& Coord, int32 Slot);
 	// ---- the coarse level's mutation points --------------------------------
 	// Sized, and set to "nothing resident anywhere" -- Occupied clear, AnyAbsent
@@ -1257,9 +1268,10 @@ private:
 	// slot, and it survived in comments long enough to make the full-upload
 	// cost look 14x cheaper than it was.
 	TArray<uint32> Cells;
-	// Staged for the next graph (FULL upload path). See MarkDirtyAndUpload.
-	TArray<uint32> Staged;
-	bool bStagedValid = false;
+    TSharedPtr<FVoxelMarchOrderedLifetime, ESPMode::ThreadSafe> Ordered;
+    uint64 OrderedEpoch=1, OrderedGeneration=0;
+    bool bOrderedGpuCompatible=true;
+	// Render-visible image/staging lives exclusively in Ordered->State.
 
 	// ---- THE COARSE OCCUPANCY LEVEL'S SHADOW (voxel.March.BlockSkip) --------
 	//
@@ -1308,30 +1320,7 @@ private:
 	// of pairs this is noise, and a whole snapshot cannot be missing a block the
 	// index staging carries.
 	//
-	// IT WAS A ONE-SHOT `bStagedBlocksValid` AND THAT WAS THE BUG, recorded here
-	// because the shape is the interesting part and it will be tempting to
-	// "simplify" it back. The flag was cleared the moment the upload was QUEUED,
-	// but QueueBufferExtraction only writes the pooled pointer when the graph
-	// EXECUTES. Any call that queued an upload into a graph whose extraction
-	// never landed -- and the march site declines with `continue` AFTER
-	// VoxelMarchBindPool has already consumed the staging -- left NOTHING TO
-	// UPLOAD FROM until the next flush. On a moving world the next flush is a
-	// few milliseconds away and the gap is invisible; on a STATIC leg it is
-	// seconds, and the marcher spends them on the all-ones fallback, structurally
-	// unable to skip anything. Measured: 210 fallback binds on a static pitch-0
-	// leg, and a timing A/B taken mostly on frames where the arm could only lose.
-	//
-	// A GENERATION INSTEAD OF A FLAG IS WHAT MAKES IT SELF-HEALING. The mirror
-	// is always uploadable, so the render side can ask "is what the GPU holds
-	// the generation I want, and does it still exist" and re-upload whenever the
-	// answer is no -- on the very next frame, without waiting for a flush.
-	TArray<uint32> BlockMirrorOccupied;
-	TArray<uint32> BlockMirrorAnyAbsent;
-	TArray<uint32> BlockMirrorAllSky;
-	// Bumped by MarkDirtyAndUpload under DeltaStageLock, together with the copy.
-	// 0 means "nothing has ever been mirrored", which is the only state in which
-	// the all-ones fallback is legitimate.
-	uint64 BlockShadowGeneration = 0;
+	// Coarse mirrors and their generation are RT-owned in Ordered->State.
 	// What the pooled buffers below were last UPLOADED from. Set optimistically
 	// at queue time, which is safe ONLY because the IsValid() half of the test
 	// is checked with it: if the extraction never landed, the pointer is null
@@ -1376,46 +1365,12 @@ private:
 
 	// ---- Wave 1.3: the delta upload path (voxel.March.IndexDeltaUpload) ----
 	//
-	// Cells written since the LAST staging. Game thread only; populated by
-	// ApplyDelta's remove and add loops, and only while the delta switch is on
-	// -- with the switch off every staging is full and an untended set would
-	// grow for the life of the process.
-	TSet<uint32> DeltaPendingCells;
-	// Cells covered by the CURRENTLY STAGED pair list. Kept separate from
-	// pending so that a staging Register() has already consumed can be dropped,
-	// while one it has not must be merged into the next -- losing a cell here
-	// is a wrong index entry that renders as a hole or as another chunk's
-	// terrain, with no error anywhere.
-	TSet<uint32> DeltaStagedCells;
-	// Flat [cell, value] dword pairs, deduplicated by cell (the sets above are
-	// keyed by cell), values snapshotted from Cells on the GAME thread at
-	// staging time -- Register() must never read Cells itself, the game thread
-	// may be rewriting it. Guarded by DeltaStageLock, and the lock is NOT
-	// optional the way it would be for Staged: Staged never changes size, so a
-	// concurrent overwrite tears data at worst; this array changes size every
-	// staging, so an unguarded overwrite can REALLOCATE while the render
-	// thread reads the old allocation -- a dangling pointer, not a torn value.
-	TArray<uint32> StagedDeltaPairs;
-	bool bStagedDeltaValid = false;
-	FCriticalSection DeltaStageLock;
-	// Whether a FULL upload has been staged since the last Detach, i.e.
-	// whether there is a base on the GPU that a delta can legally patch. The
-	// first upload after creation (or after a teardown) must be full -- there
-	// is nothing to patch into.
-	bool bDeltaBaseEstablished = false;
-	// Seed() sets this: a reseed rewrites the meaning of the whole grid, so
-	// the next staging must be full regardless of how few cells moved.
-	bool bForceFullUpload = false;
-	// Bytes of the staging that has not been consumed yet, so a replaced
-	// staging can be subtracted back out of UploadBytes (see GetUploadBytes).
-	uint64 PendingStagedBytes = 0;
-	FUploadStats UploadStats;
-	// voxel.March.IndexDeltaVerify: hash of Cells at the moment the current
-	// delta pairs were staged (game thread writes, render thread reads under
-	// DeltaStageLock). The readback that checks the GPU buffer against it is
-	// the RING below.
-	uint64 StagedContentHash = 0;
-	bool bStagedHashValid = false;
+    // GT tracks all writes regardless of the GPU upload policy. Render-side
+    // coalescing starts only after the packet's command reaches the RT.
+    TSet<uint32> DeltaPendingCells;
+    bool bForceFullUpload=false;
+    mutable FCriticalSection UploadStatsMutex;
+    FUploadStats UploadStats;
 
 	// THE VERIFY READBACK RING, replacing a single readback that CRASHED THE
 	// D3D12 RHI (Fence->SyncPoints[GPUIndex] == nullptr, 28 s into a leg).
@@ -1520,7 +1475,7 @@ private:
 	// (entries dropped); the next MarkDirtyAndUpload forces a full staging to
 	// heal, counted as FullBecauseLost. Atomic because it is the one flag that
 	// crosses render -> game.
-	std::atomic<bool> bGpuPublishLost{ false };
+
 
 	// See SetStreamedRingLevels. Defaults to 6 -- the shipped 4 km cascade --
 	// so a run where nothing pushes it behaves exactly as before level 6
@@ -1556,7 +1511,7 @@ private:
 	// so it is the size of the resident set (tens of thousands), not of the grid.
 	TMap<uint32, FIntVector> CellOwner;
 	uint64 Uploads = 0;
-	uint64 UploadBytes = 0;
+	std::atomic<uint64> UploadBytes{0};
 	uint64 ContentHash = 0;
 	bool bContentHashEnabled = false;
 };
