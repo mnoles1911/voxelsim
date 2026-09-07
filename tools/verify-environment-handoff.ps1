@@ -6,14 +6,18 @@ param(
     [Parameter(Mandatory)][long]$Seed,
     [Parameter(Mandatory)][double]$SpawnX,
     [Parameter(Mandatory)][double]$SpawnY,
-    [ValidateSet('Prepare','Rehearse','HeldCpu','HeldGpu')][string]$Mode = 'Rehearse',
+    [ValidateSet('Prepare','Rehearse','HeldCpu','HeldGpu','VisualPilot')][string]$Mode = 'Rehearse',
     [ValidateRange(1,120)][int]$StartAfterSeconds = 45,
     [ValidateRange(35,120)][int]$ExitAfterSeconds = 60,
     [ValidateRange(60,900)][int]$TimeoutSeconds = 300,
     [string]$LogPath = '',
+    [switch]$SurfaceLightingDiagnostic,
+    [switch]$CaptureBuffers,
     [switch]$AllowOtherProjectEditors
 )
 $ErrorActionPreference = 'Stop'
+if ($SurfaceLightingDiagnostic -and $Mode -ne 'VisualPilot') { throw '-SurfaceLightingDiagnostic requires -Mode VisualPilot.' }
+if ($CaptureBuffers -and $Mode -ne 'VisualPilot') { throw '-CaptureBuffers requires -Mode VisualPilot.' }
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $projectPath = [IO.Path]::GetFullPath((Join-Path $projectRoot 'ue-project/VoxelEarth.uproject'))
 if (!$LogPath) { $LogPath = Join-Path $projectRoot ('Saved/environment-' + $Mode.ToLowerInvariant() + '-' + [Guid]::NewGuid().ToString('N') + '.log') }
@@ -47,8 +51,14 @@ $command = switch ($Mode) {
     'Rehearse' { 'voxel.Environment.RehearseHandoff' }
     'HeldCpu' { 'voxel.Environment.PrepareHeldCpuPages' }
     'HeldGpu' { 'voxel.Environment.PrepareHeldGpuPages' }
+    'VisualPilot' { 'voxel.Environment.PublishVisualPilot' }
     default { 'voxel.Environment.PrepareCandidate' }
 }
+$delayedCommands = $command
+if ($SurfaceLightingDiagnostic) {
+    $delayedCommands = 'voxel.GI.Volume 0,voxel.Light.Propagated 0,voxel.Environment.SurfaceLightingDiagnostic 1,' + $command
+}
+if ($CaptureBuffers) { $delayedCommands = 'voxel.Environment.CaptureBuffers 1,' + $delayedCommands }
 $culture = [Globalization.CultureInfo]::InvariantCulture
 $testArgs = @(
     ('"' + $projectPath + '"'), '-game','-dx12','-sm6','-Multiprocess','-unattended','-nosplash','-nosound','-VoxelNoMenu',
@@ -60,15 +70,19 @@ $testArgs = @(
     ('-VoxelAssetDir="' + [IO.Path]::GetFullPath($AssetDir) + '"'),
     ('-VoxelSpawnAt=' + $SpawnX.ToString($culture) + ',' + $SpawnY.ToString($culture)), '-VoxelSpawnAltM=10',
     ('-VoxelExecAfter=' + $StartAfterSeconds),
-    ('-VoxelExecCmds="' + $command + ',voxel.DeferExec ' + $ExitAfterSeconds + ' quit"'),
+    ('-VoxelExecCmds="' + $delayedCommands + ',voxel.DeferExec ' + $ExitAfterSeconds + ' quit"'),
     ('-abslog="' + $LogPath + '"')
 )
+if ($Mode -eq 'VisualPilot') { $testArgs += '-VoxelGpuPoolAlloc=0' }
 $testProcess = Start-Process 'D:/UE_5.8/Engine/Binaries/Win64/UnrealEditor-Cmd.exe' -ArgumentList $testArgs -WindowStyle Hidden -PassThru
 Write-Output "Owned environment verification PID $($testProcess.Id); log $LogPath"
 try {
     if (!$testProcess.WaitForExit($TimeoutSeconds * 1000)) { throw "Environment verification timed out: $LogPath" }
     if ($testProcess.ExitCode -ne 0) { throw "Environment verification exited $($testProcess.ExitCode): $LogPath" }
     $testText = Get-Content -LiteralPath $LogPath -Raw
+    if ($SurfaceLightingDiagnostic -and ($testText -notmatch 'SurfaceLightingDiagnostic APPLIED enabled=1 volumesOff=1' -or $testText -match 'SurfaceLightingDiagnostic REFUSED')) {
+        throw 'Surface lighting diagnostic application with both volume paths disabled was not confirmed.'
+    }
     if ($testText -notmatch 'ProductionCandidate PREPARED HIDDEN .*publicationReady=0') { throw 'Hidden preparation evidence is missing.' }
     if ($testText -match 'assets PROBE:') { throw 'Unexpected automatic composition diagnostic.' }
     if ($Mode -eq 'Rehearse') {
@@ -86,7 +100,50 @@ try {
             $testText -notmatch 'REHEARSAL RELEASED reason=private CPU/GPU packs matched and discarded') { throw 'Successful GPU preparation/parity/release evidence is missing.' }
         if ($testText -match 'ProductionHeldGpu REFUSED|ProductionHeldCpu REFUSED|REHEARSAL REFUSED') { throw 'GPU preparation reported a refusal.' }
     }
-    Write-Output "PASS: $Mode completed with normal process exit0."
+    if ($Mode -eq 'VisualPilot') {
+        if ($testText -notmatch 'Environment material preparation READY materials=[1-3] .*intendedProxy=1') {
+            throw 'Intended material readiness evidence is missing.'
+        }
+        if ($testText -notmatch 'ProductionVisualPilot PUBLISHED .*registry=isolated gameplay=0' -or
+            $testText -match 'ProductionVisualPilot REFUSED|ProductionHeldGpu REFUSED|ProductionHeldCpu REFUSED|REHEARSAL REFUSED') {
+            throw 'Successful visual-only publication evidence is missing or a refusal occurred.'
+        }
+        if ($testText -notmatch 'ProductionVisualPilot CAPTURED before="([^"]+)" after="([^"]+)"; colorOnly=1') {
+            throw 'Before/after color capture evidence is missing.'
+        }
+        $capturePaths = @($Matches[1],$Matches[2])
+        if ($testText -notmatch 'ProductionVisualPilot STEADY_CAPTURED path="([^"]+)" frame=([0-9]+) elapsed=([0-9.]+)') {
+            throw 'Delayed steady-state color capture evidence is missing.'
+        }
+        if ([double]::Parse($Matches[3],[Globalization.CultureInfo]::InvariantCulture) -lt 10) {
+            throw 'Steady-state capture occurred before the required settling interval.'
+        }
+        $capturePaths += $Matches[1]
+        if ($testText -notmatch 'ProductionVisualPilot UNLIT_CAPTURED path="([^"]+)"; actualViewMode=Unlit gameplay=0') {
+            throw 'Unlit diagnostic capture evidence is missing.'
+        }
+        $capturePaths += $Matches[1]
+        if ($CaptureBuffers) {
+            $buffers = [regex]::Matches($testText,'ProductionVisualPilot BUFFER_CAPTURED stage=(before|after|steady) target=(BaseColor|WorldNormal|SceneDepthWorldUnits) path="([^"]+)"; format=EXR viewportWidth=960 viewportHeight=540')
+            if ($buffers.Count -ne 9) { throw 'Expected exactly nine verified EXR buffer sidecars.' }
+            $seenBuffers = @{}
+            foreach ($buffer in $buffers) {
+                $identity = $buffer.Groups[1].Value + '/' + $buffer.Groups[2].Value
+                if ($seenBuffers.ContainsKey($identity)) { throw "Duplicate buffer: $identity" }
+                $seenBuffers[$identity] = $true
+                $capturePaths += $buffer.Groups[3].Value
+            }
+        }
+        foreach ($capturePath in $capturePaths) {
+            if (!(Test-Path -LiteralPath $capturePath -PathType Leaf) -or (Get-Item -LiteralPath $capturePath).Length -eq 0) {
+                throw "Capture file is missing or empty: $capturePath"
+            }
+        }
+        Write-Output ('Color captures: ' + ($capturePaths -join ', '))
+        Write-Output 'Capture files require visual review; continuous-frame depth/shadow and gameplay acceptance remain outstanding.'
+    }
+    if ($Mode -eq 'VisualPilot') { Write-Output 'PASS: transaction and capture-file checks, normal exit0. Visual acceptance requires image review.' }
+    else { Write-Output "PASS: $Mode completed with normal process exit0." }
 }
 finally {
     $testProcess.Refresh()

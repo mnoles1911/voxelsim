@@ -13,6 +13,11 @@
 #include "Components/StaticMeshComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialRenderProxy.h"
+#include "MaterialShared.h"
+#include "UObject/StrongObjectPtr.h"
+#include "RHIGlobals.h"
+#include "Misc/App.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
@@ -342,6 +347,21 @@ void ApplyGeometry(UProceduralMeshComponent* Component,const FEnvironmentLodMesh
 
 
 } // namespace
+// Exact intended material evidence survives cancellation until queued RT work
+// retires. No worker dereferences UObjects; only the GT creates these snapshots.
+struct FEnvironmentMaterialProbe {
+    struct FEntry {
+        TStrongObjectPtr<UMaterialInstanceDynamic> Material;
+        TStrongObjectPtr<UMaterialInterface> Parent;
+        FMaterialResource* Resource=nullptr;
+        FMaterialRenderProxy* Proxy=nullptr;
+        TRefCountPtr<FMaterialShaderMap> ShaderMap;
+    };
+    TArray<FEntry> Entries;
+    ERHIFeatureLevel::Type FeatureLevel=ERHIFeatureLevel::Num;
+    EShaderPlatform Platform=SP_NumPlatforms;
+    TAtomic<int32> State{0}; // 0 pending, 1 intended material ready, 2 retry
+};
 struct FEnvironmentStagedRestore {
     struct FSection {int32 Level=0;FIntVector Key;FEnvironmentLodMeshGeometry Mesh;};
     TAtomic<bool> Cancelled{false};
@@ -355,6 +375,9 @@ struct FEnvironmentStagedRestore {
     int32 Next=0,RenderNext=0;
     bool RenderUpdatesStarted=false,RenderFenceBegun=false;
     FRenderCommandFence RenderFence;
+    bool MaterialReadinessRequired=false;
+    double MaterialWaitStarted=0;
+    TSharedPtr<FEnvironmentMaterialProbe,ESPMode::ThreadSafe> MaterialProbe;
     bool Collision=false,Severed=false,Ready=false,Valid=false,Adopted=false;
 };
 AVoxelEnvironmentLODPrototype::AVoxelEnvironmentLODPrototype() {
@@ -371,6 +394,7 @@ bool AVoxelEnvironmentLODPrototype::InitializeAsset(const FString& Name,int32 Fi
     return InitializeAssetFromVxa(FVoxelEnvironmentAssetDescriptor::Prototype(Name),Vxa,Collision,true);
 }
 bool AVoxelEnvironmentLODPrototype::InitializeAssetFromVxa(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& Vxa,bool Collision,bool FitTerrain) {
+    if(bVisualOnlyPreparation)return false;
     if(StagedRestore||PreparedRestore||Vxa.IsEmpty()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform()))return false;
     vxc::AssetGrid Source;if(Source.parse(Vxa.GetData(),Vxa.Num())!=vxc::AssetParseError::kOk)return false;
     const double FinestMm=Source.voxelSizeMm();if(FinestMm!=25&&FinestMm!=50&&FinestMm!=100)return false;
@@ -405,6 +429,7 @@ void AVoxelEnvironmentLODPrototype::EndPlay(const EEndPlayReason::Type Reason) {
     Actors.Remove(this);Super::EndPlay(Reason);
 }
 bool AVoxelEnvironmentLODPrototype::PersistentState(FArchive& Ar) {
+    if(bVisualOnlyPreparation)return false;
     if(StagedRestore||PreparedRestore){if(Ar.IsLoading())CancelStagedObjectRestore();return false;}
     auto Descriptor=SourceDescriptor;
     FPrototypeGrid Grid;if(Ar.IsSaving()){
@@ -444,6 +469,7 @@ bool AVoxelEnvironmentLODPrototype::RefreshGeometrySnapshot(){
     return true;
 }
 bool AVoxelEnvironmentLODPrototype::CaptureObjectState(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic){
+    if(bVisualOnlyPreparation){Geometry.Reset();Dynamic.Reset();return false;}
     return CaptureStateForCommit(Geometry,Dynamic,false);
 }
 bool AVoxelEnvironmentLODPrototype::CaptureStateForCommit(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic,bool AllowPrepared){
@@ -467,6 +493,8 @@ bool AVoxelEnvironmentLODPrototype::RestoreObjectState(const TArray<uint8>& Geom
     return PersistentState(Reader)&&!Reader.IsError()&&Reader.Tell()==Reader.TotalSize();
 }
 void AVoxelEnvironmentLODPrototype::CancelStagedObjectRestore(){
+    CommittedProduction.Reset();
+    if(bVisualOnlyPreparation){bVisualOnlyRevealed=false;SetActorHiddenInGame(true);}
     ProductionCommitSerial.Invalidate();
     check(IsInGameThread());auto Job=StagedRestore?MoveTemp(StagedRestore):MoveTemp(PreparedRestore);if(!Job)return;
     Job->Cancelled.Store(true);
@@ -484,6 +512,7 @@ void AVoxelEnvironmentLODPrototype::BeginStagedObjectRestore(FVoxelImmutableGeom
     if(!Levels.IsEmpty()||!Geometry||Geometry->Num()<4||Dynamic.Num()<4||Dynamic.Num()>4096||int64(Geometry->Num())+Dynamic.Num()>VoxelObjectGeometrySnapshot::MaxBytes){if(Completion)Completion(false);return;}
     SetActorHiddenInGame(true);SetActorEnableCollision(false);SetActorTickEnabled(false);
     auto Job=MakeShared<FEnvironmentStagedRestore,ESPMode::ThreadSafe>();Job->Geometry=MoveTemp(Geometry);Job->Completion=MoveTemp(Completion);StagedRestore=Job;
+    Job->MaterialReadinessRequired=FApp::CanEverRender()&&!GUsingNullRHI&&GetWorld()&&GetWorld()->GetNetMode()!=NM_DedicatedServer;
     TWeakObjectPtr<AVoxelEnvironmentLODPrototype> Weak(this);
     Async(EAsyncExecution::ThreadPool,[Job,Weak,Dynamic=MoveTemp(Dynamic)](){
         auto Decode=[&](){
@@ -558,6 +587,45 @@ bool AVoxelEnvironmentLODPrototype::AdvanceStagedObjectRestore(){
         Job->RenderFenceBegun=true;return true;
     }
     if(!Job->RenderFence.IsFenceComplete())return false;
+    if(Job->MaterialReadinessRequired){
+    // A component fence alone does not establish shader readiness. In editor
+    // builds the first render can otherwise select the default checker material
+    // and only then submit its deferred shader jobs.
+    if(Job->MaterialWaitStarted==0)Job->MaterialWaitStarted=FPlatformTime::Seconds();
+    if(FPlatformTime::Seconds()-Job->MaterialWaitStarted>30.){
+        UE_LOG(LogVoxelEarth,Warning,TEXT("Environment material preparation REFUSED: intended shader maps not ready within 30 seconds"));CancelStagedObjectRestore();return true;
+    }
+    if(!Job->MaterialProbe||Job->MaterialProbe->State.Load()==2){
+        auto Probe=MakeShared<FEnvironmentMaterialProbe,ESPMode::ThreadSafe>();
+        if(!GetWorld()||Materials.IsEmpty()||Materials.Num()>3){CancelStagedObjectRestore();return true;}
+        Probe->FeatureLevel=GetWorld()->GetFeatureLevel();Probe->Platform=GetFeatureLevelShaderPlatform_Checked(Probe->FeatureLevel);
+        for(auto Mat:Materials){
+            if(!IsValid(Mat)||!IsValid(Mat->Parent)){CancelStagedObjectRestore();return true;}
+            auto& E=Probe->Entries.AddDefaulted_GetRef();E.Material=TStrongObjectPtr<UMaterialInstanceDynamic>(Mat.Get());E.Parent=TStrongObjectPtr<UMaterialInterface>(Mat->Parent.Get());
+            E.Resource=Mat->GetMaterialResource(Probe->Platform);E.Proxy=Mat->GetRenderProxy();
+            if(!E.Resource||!E.Proxy){CancelStagedObjectRestore();return true;}
+            E.ShaderMap=E.Resource->GetGameThreadShaderMap();
+        }
+        Job->MaterialProbe=Probe;
+        ENQUEUE_RENDER_COMMAND(VoxelEnvironmentIntendedMaterialProbe)([Probe](FRHICommandListImmediate&){
+            bool Ready=true;
+            for(const auto& E:Probe->Entries){
+                // This engine API schedules missing editor shader jobs without
+                // blocking compilation. A fallback is evidence to wait, not ready.
+                const FMaterialRenderProxy* SelectedProxy=E.Proxy;
+                const FMaterial& Selected=E.Proxy->GetMaterialWithFallback(Probe->FeatureLevel,SelectedProxy);
+                const FMaterial* Intended=E.Proxy->GetMaterialNoFallback(Probe->FeatureLevel);
+                Ready=Ready&&Intended==E.Resource&&(&Selected)==E.Resource&&SelectedProxy==E.Proxy&&
+                    E.Resource->IsRenderingThreadShaderMapComplete()&&E.ShaderMap&&E.Resource->GetRenderingThreadShaderMap()==E.ShaderMap.GetReference();
+            }
+            Probe->State.Store(Ready?1:2);
+        });
+        return true;
+    }
+    if(Job->MaterialProbe->State.Load()==0)return false;
+    if(!AreMaterialResourcesCurrent(Job)){Job->MaterialProbe.Reset();return false;}
+    UE_LOG(LogVoxelEarth,Log,TEXT("Environment material preparation READY materials=%d elapsed=%.3f intendedProxy=1"),Materials.Num(),FPlatformTime::Seconds()-Job->MaterialWaitStarted);
+    }
     PreparedRestore=Job;StagedRestore.Reset();
     // Visibility/collision publication belongs to the bridge after its final
     // revision check. The fence acknowledges preceding resource commands,
@@ -565,11 +633,35 @@ bool AVoxelEnvironmentLODPrototype::AdvanceStagedObjectRestore(){
     // The actor remains hidden until explicit PublishStagedObjectRestore.
     auto Done=MoveTemp(Job->Completion);if(Done)Done(true);return true;
 }
+bool AVoxelEnvironmentLODPrototype::AreMaterialResourcesCurrent(const TSharedPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe>& Job) const
+{
+    check(IsInGameThread());
+    if(!Job)return false;
+    if(!Job->MaterialReadinessRequired)return true; // dedicated/NullRHI restores have no visible material contract
+    if(!Job->MaterialProbe||Job->MaterialProbe->State.Load()!=1||!GetWorld())return false;
+    const auto& P=*Job->MaterialProbe;
+    if(GetWorld()->GetFeatureLevel()!=P.FeatureLevel||GetFeatureLevelShaderPlatform_Checked(P.FeatureLevel)!=P.Platform||P.Entries.Num()!=Materials.Num())return false;
+    for(int32 I=0;I<Materials.Num();++I){
+        auto Mat=Materials[I];const auto& E=P.Entries[I];
+        if(!IsValid(Mat)||E.Material.Get()!=Mat||E.Parent.Get()!=Mat->Parent||Mat->GetRenderProxy()!=E.Proxy||
+            Mat->GetMaterialResource(P.Platform)!=E.Resource||!E.Resource->IsGameThreadShaderMapComplete()||
+            !E.ShaderMap||E.Resource->GetGameThreadShaderMap()!=E.ShaderMap.GetReference())return false;
+        float Fade=0,Reverse=0;
+        if(!Mat->GetScalarParameterValue(FHashedMaterialParameterInfo(TEXT("Fade")),Fade)||Fade!=1.f||
+            !Mat->GetScalarParameterValue(FHashedMaterialParameterInfo(TEXT("Reverse")),Reverse)||Reverse!=0.f)return false;
+    }
+    for(auto Section:Sections){
+        if(!IsValid(Section))return false;
+        const int32 Level=Levels.IndexOfByPredicate([&](const auto& Root){return Root==Section->GetAttachParent();});
+        if(!Materials.IsValidIndex(Level)||Section->GetMaterial(0)!=Materials[Level])return false;
+    }
+    return true;
+}
 bool AVoxelEnvironmentLODPrototype::IsStagedRenderResourcesPending() const {
     check(IsInGameThread());return StagedRestore&&StagedRestore->RenderFenceBegun;
 }
 void AVoxelEnvironmentLODPrototype::MarkUnpublishedPreparation(){
-    check(IsInGameThread());ProductionCommitSerial.Invalidate();bUnpublishedPreparation=true;
+    check(IsInGameThread());ProductionCommitSerial.Invalidate();CommittedProduction.Reset();bUnpublishedPreparation=true;
     SetActorHiddenInGame(true);SetActorEnableCollision(false);SetActorTickEnabled(false);
 }
 // Opaque, immutable preparation evidence. Weak actor/job identities prevent
@@ -590,7 +682,7 @@ FVoxelEnvironmentProductionCommitRef AVoxelEnvironmentLODPrototype::PrepareProdu
     check(IsInGameThread());
     ProductionCommitSerial.Invalidate();
     if(!IsValid(this)||!bUnpublishedPreparation||!PreparedRestore||!PreparedRestore->Adopted||
-       !PreparedRestore->RenderFenceBegun||!PreparedRestore->RenderFence.IsFenceComplete()||
+       !PreparedRestore->RenderFenceBegun||!PreparedRestore->RenderFence.IsFenceComplete()||!AreMaterialResourcesCurrent(PreparedRestore)||
        !IsHidden()||GetActorEnableCollision()||IsActorTickEnabled()||Dynamic.Num()>4096)return {};
     FVoxelImmutableGeometry Captured;TArray<uint8> Header;
     if(!CaptureStateForCommit(Captured,Header,true)||Captured!=Geometry||Header!=Dynamic||!GetActorTransform().Equals(Transform,0.))return {};
@@ -607,11 +699,18 @@ bool AVoxelEnvironmentLODPrototype::ValidateProductionCommit(const FVoxelEnviron
 {
     check(IsInGameThread());
     if(!Token||Token->Actor.Get()!=this||!IsValid(this)||!Token->Serial.IsValid()||Token->Serial!=ProductionCommitSerial||
-       Token->Restore.Pin()!=PreparedRestore||!PreparedRestore||!bUnpublishedPreparation||State->Revision!=Token->Revision||
+       Token->Restore.Pin()!=PreparedRestore||!PreparedRestore||!AreMaterialResourcesCurrent(PreparedRestore)||!bUnpublishedPreparation||State->Revision!=Token->Revision||
        !IsHidden()||GetActorEnableCollision()||IsActorTickEnabled()||!GetActorTransform().Equals(Token->Transform,0.)||
        Token->Components.Num()!=1+Levels.Num()+Sections.Num())return false;
+    if(bVisualOnlyPreparation)
+    {
+        if(bVisualOnlyRevealed)return false;
+        int32 Registered=0;
+        ForEachComponent<UActorComponent>(false,[&](UActorComponent* C){if(C->IsRegistered())++Registered;});
+        if(Registered!=Token->Components.Num())return false;
+    }
     int32 I=0;
-    const auto Same=[&](UActorComponent* C){return IsValid(C)&&C->IsRegistered()&&!C->IsRenderStateDirty()&&Token->Components[I++].Get()==C;};
+    const auto Same=[&](UActorComponent* C){return IsValid(C)&&C->IsRegistered()&&!C->IsRenderStateDirty()&&(!bVisualOnlyPreparation||!C->IsRenderTransformDirty())&&Token->Components[I++].Get()==C;};
     if(!Same(GetRootComponent()))return false;
     for(auto C:Levels)if(!Same(C))return false;
     for(auto C:Sections)if(!Same(C))return false;
@@ -624,9 +723,49 @@ void AVoxelEnvironmentLODPrototype::CommitPreparedProduction(const FVoxelEnviron
     if(!ValidateProductionCommit(Token)){checkf(false,TEXT("Invalid prepared actor commit token"));return;}
     // No render visibility, collision, ticking, or Actors discovery mutation.
     // PreparedRestore remains available to the future render-boundary latch.
+    CommittedProduction=Token;
     ProductionCommitSerial.Invalidate();bUnpublishedPreparation=false;
 }
+void AVoxelEnvironmentLODPrototype::MarkVisualOnlyPreparation()
+{
+    check(IsInGameThread()); bVisualOnlyPreparation=true; bVisualOnlyRevealed=false;
+    Actors.Remove(this); MarkUnpublishedPreparation();
+}
+bool AVoxelEnvironmentLODPrototype::ValidatePreparedVisualReveal() const
+{
+    check(IsInGameThread());
+    const auto& T=CommittedProduction;
+    if(!IsValid(this)||!bVisualOnlyPreparation||bVisualOnlyRevealed||bUnpublishedPreparation||!T||
+        T->Actor.Get()!=this||T->Restore.Pin()!=PreparedRestore||!PreparedRestore||!PreparedRestore->Adopted||
+        !PreparedRestore->RenderFenceBegun||!PreparedRestore->RenderFence.IsFenceComplete()||!AreMaterialResourcesCurrent(PreparedRestore)||
+        State->Revision!=T->Revision||GeometrySnapshot!=T->Geometry||!GetActorTransform().Equals(T->Transform,0.)||
+        !IsHidden()||GetActorEnableCollision()||IsActorTickEnabled()||
+        T->Components.Num()!=1+Levels.Num()+Sections.Num())return false;
+    int32 Registered=0;
+    ForEachComponent<UActorComponent>(false,[&](UActorComponent* C){if(C->IsRegistered())++Registered;});
+    if(Registered!=T->Components.Num())return false;
+    int32 I=0;
+    const auto Same=[&](UActorComponent* C){return IsValid(C)&&C->IsRegistered()&&!C->IsRenderStateDirty()&&!C->IsRenderTransformDirty()&&T->Components[I++].Get()==C;};
+    if(!Same(GetRootComponent()))return false;
+    for(auto C:Levels)if(!Same(C))return false;
+    for(auto C:Sections)if(!Same(C))return false;
+    return true;
+}
+void AVoxelEnvironmentLODPrototype::PublishPreparedVisualOnly()
+{
+    check(IsInGameThread());
+    if(!ValidatePreparedVisualReveal()){checkf(false,TEXT("Visual reveal requires unchanged committed preparation"));return;}
+    // No fallible admission after visibility. Components were registered and
+    // acknowledged in preparation; this submits their visibility proxy updates
+    // in caller's synchronous GT transaction before its next view family.
+    bVisualOnlyRevealed=true; SetActorHiddenInGame(false);
+    for(const auto& Weak:CommittedProduction->Components) Weak.Get()->DoDeferredRenderUpdates_Concurrent();
+    // Keep PreparedRestore and permanent discovery exclusion. This API alone
+    // makes no assertion about terrain index or renderer-frame atomicity.
+}
 bool AVoxelEnvironmentLODPrototype::PublishStagedObjectRestore(){
+    if(bVisualOnlyPreparation)return false;
+    CommittedProduction.Reset();
     ProductionCommitSerial.Invalidate();
     check(IsInGameThread());if(!PreparedRestore)return false;
     PreparedRestore.Reset();bUnpublishedPreparation=false;Actors.AddUnique(this);SetActorHiddenInGame(false);SetActorEnableCollision(true);SetActorTickEnabled(true);return true;
@@ -732,11 +871,13 @@ void AVoxelEnvironmentLODPrototype::Tick(float DeltaSeconds) {
     }
 }
 bool AVoxelEnvironmentLODPrototype::SolidAt(const FVector& WorldUU) const {
+    if(bVisualOnlyPreparation)return false;
     if(!State->Collision||State->Grids.IsEmpty()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform())||WorldUU.ContainsNaN())return false;
     const auto& Grid=State->Grids.Last();const FVector Local=VoxelEnvironmentAsset::LocalPosition(GetActorTransform(),WorldUU);
     return Grid.LocalAt(FMath::FloorToInt64(Local.X/10),FMath::FloorToInt64(Local.Y/10),FMath::FloorToInt64(Local.Z/10))!=0;
 }
 bool AVoxelEnvironmentLODPrototype::Trace(const FVector& Start,const FVector& Direction,double Range,FVector& Hit) const {
+    if(bVisualOnlyPreparation)return false;
     if(State->Grids.IsEmpty()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform())||Start.ContainsNaN()||Direction.ContainsNaN()||!FMath::IsFinite(Range)||Range<=0)return false;
     const auto& Grid=State->Grids[0];const double Pitch=Grid.Mm*.1;
     const FVector O=VoxelEnvironmentAsset::LocalPosition(GetActorTransform(),Start)*(100./Pitch),D=VoxelEnvironmentAsset::LocalVector(GetActorTransform(),Direction.GetSafeNormal())*(Range*100./Pitch);
@@ -746,6 +887,7 @@ bool AVoxelEnvironmentLODPrototype::Trace(const FVector& Start,const FVector& Di
     Hit=VoxelEnvironmentAsset::WorldPosition(GetActorTransform(),FVector((H.vx+.5)*Pitch,(H.vy+.5)*Pitch,(H.vz+.5)*Pitch));return true;
 }
 bool AVoxelEnvironmentLODPrototype::GetDigBounds(const FVector& Hit,int32 SizeVoxels,FBox& Bounds) const {
+    if(bVisualOnlyPreparation)return false;
     Bounds=FBox(ForceInit);
     if(State->Grids.IsEmpty()||SizeVoxels<1||SizeVoxels>4||Hit.ContainsNaN()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform()))return false;
     const FVector Local=VoxelEnvironmentAsset::LocalPosition(GetActorTransform(),Hit);FVector Min;
@@ -756,6 +898,7 @@ bool AVoxelEnvironmentLODPrototype::GetDigBounds(const FVector& Hit,int32 SizeVo
     return true;
 }
 bool AVoxelEnvironmentLODPrototype::Carve(const FVector& Hit,int32 SizeVoxels) {
+    if(bVisualOnlyPreparation)return false;
     if(StagedRestore||PreparedRestore){CancelStagedObjectRestore();return false;}
     if(State->Grids.IsEmpty()||SizeVoxels<1||SizeVoxels>4||Hit.ContainsNaN()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform()))return false;
     auto& Grid=State->Grids[0];const double Pitch=Grid.Mm*.1;
@@ -834,12 +977,14 @@ bool AVoxelEnvironmentLODPrototype::Carve(const FVector& Hit,int32 SizeVoxels) {
     return Empty;
 }
 bool AVoxelEnvironmentLODPrototype::CanChop(const FVector& Hit) const {
+    if(bVisualOnlyPreparation)return false;
     if(!IsFellable()||State->Grids.IsEmpty()||Hit.ContainsNaN()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform()))return false;
     const auto& G=State->Grids[0];const FVector P=VoxelEnvironmentAsset::LocalPosition(GetActorTransform(),Hit)/(G.Mm*.1);
     const auto M=G.LocalAt(FMath::FloorToInt64(P.X),FMath::FloorToInt64(P.Y),FMath::FloorToInt64(P.Z));
     return M==16||M==17||M==18||M==23;
 }
 bool AVoxelEnvironmentLODPrototype::Chop(const FVector& Hit,const FVector& Direction,int32 Size){
+    if(bVisualOnlyPreparation)return false;
     if(GetWorld()->GetNetMode()==NM_Client)return false;
     if(!CanChop(Hit))return false;
     State->AxeCut=true;State->LastChopDirection=Direction;

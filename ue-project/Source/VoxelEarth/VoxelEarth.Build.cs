@@ -40,6 +40,8 @@ public class VoxelEarth : ModuleRules
 			// is JSON, because it is a file a human may well want to read when
 			// a save misbehaves.
 			"Json",
+			// Opt-in buffer screenshot completion fence before associating EXR files.
+			"ImageWriteQueue",
 			// M2 Band 3 first slice (docs/m2-plan.md, AVoxelClipmapActor):
 			// PRAGMATIC EXCEPTION to the "no PMC" doctrine (that rule targets
 			// the voxel rendering path, not a conventional heightmap clipmap

@@ -44,7 +44,13 @@ public:
     // Retained on cancellation; only publication clears it. Persistence discovery
     // must not bind actors that are not yet authoritative world objects.
     void MarkUnpublishedPreparation();
-    bool IsUnpublishedPreparation() const { return bUnpublishedPreparation; }
+    bool IsUnpublishedPreparation() const { return bUnpublishedPreparation || bVisualOnlyPreparation; }
+    // Diagnostic renderer latch only. This exclusion is permanent for the
+    // actor: visual publication never enrolls gameplay/persistence discovery.
+    void MarkVisualOnlyPreparation();
+    bool IsVisualOnlyPreparation() const { return bVisualOnlyPreparation; }
+    bool ValidatePreparedVisualReveal() const;
+    void PublishPreparedVisualOnly();
     void CancelStagedObjectRestore();
     bool RestoreObjectState(const TSharedPtr<const TArray<uint8>,ESPMode::ThreadSafe>& Geometry,const TArray<uint8>& Dynamic) {
         if(!Geometry||!RestoreObjectState(*Geometry,Dynamic))return false;
@@ -69,9 +75,12 @@ public:
     UPROPERTY(Transient) TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
 private:
     bool bUnpublishedPreparation=false;
+    bool bVisualOnlyPreparation=false, bVisualOnlyRevealed=false;
+    FVoxelEnvironmentProductionCommitRef CommittedProduction;
     FGuid ProductionCommitSerial;
     FVoxelEnvironmentAssetDescriptor SourceDescriptor;
     bool RefreshGeometrySnapshot();
+    bool AreMaterialResourcesCurrent(const TSharedPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe>& Job) const;
     bool CaptureStateForCommit(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic,bool AllowPrepared);
     FVoxelImmutableGeometry GeometrySnapshot;
     TSharedPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe> StagedRestore;

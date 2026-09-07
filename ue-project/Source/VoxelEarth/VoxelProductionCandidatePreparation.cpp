@@ -7,6 +7,8 @@
 #include "Engine/World.h"
 namespace
 {
+TAutoConsoleVariable<int32> CVarProductionCaptureBuffers(TEXT("voxel.Environment.CaptureBuffers"),0,
+    TEXT("Opt-in VisualPilot diagnostic: three 960x540 screenshots with BaseColor, WorldNormal and SceneDepthWorldUnits EXR sidecars. No continuous-frame or shadow proof."));
 TMap<TWeakObjectPtr<UWorld>,int32> CandidateRequests;
 FAutoConsoleCommandWithWorld PrepareProductionCandidateCommand(
     TEXT("voxel.Environment.PrepareCandidate"),
@@ -27,6 +29,10 @@ FAutoConsoleCommandWithWorld PrepareHeldGpuPagesCommand(
     TEXT("voxel.Environment.PrepareHeldGpuPages"),
     TEXT("Prepare private CPU and brick-only GPU packs for candidate pages, with bounded admission and parity checks. Does not publish ownership or backend readiness."),
     FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,5);}));
+FAutoConsoleCommandWithWorld PublishVisualPilotCommand(
+    TEXT("voxel.Environment.PublishVisualPilot"),
+    TEXT("Explicit standalone CPU-arena visual-only handoff with before/after screenshots. Blocks renderer at commit; no gameplay, save or multiplayer support."),
+    FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,6);}));
 }
 namespace VoxelProductionCandidate
 {
