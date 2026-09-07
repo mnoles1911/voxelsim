@@ -139,7 +139,7 @@ VXC_TEST(authority_stationary_carve_adjacent_edit_and_binding) {
     CHECK(edited->sampleAt(x,y,z-1,hit));CHECK_EQ(hit.material,MAT_BARK);CHECK(hit.owner==assetObjectId(p));
     CHECK(edited->sampleAt(x+1,y,z,hit));CHECK_EQ(hit.material,MAT_ROCK);CHECK(hit.owner==AssetObjectId{});
     const auto key=ChunkMap<16>::keyForVoxel(x,y,z);Brick<16> brick;CHECK(edited->makeBrick(key,brick));
-    for(int dz=0;dz<16;++dz)for(int dy=0;dy<16;++dy)for(int dx=0;dx<16;++dx){MaterialId mat;CHECK(edited->terrainAt(int64_t(key.x)*16+dx,int64_t(key.y)*16+dy,int64_t(key.z)*16+dz,mat));CHECK_EQ(mat,brick.get(dx,dy,dz));}
+    for(int dz=0;dz<16;++dz)for(int dy=0;dy<16;++dy)for(int dx=0;dx<16;++dx){MaterialId mat=MAT_AIR;CHECK(edited->terrainAt(int64_t(key.x)*16+dx,int64_t(key.y)*16+dy,int64_t(key.z)*16+dz,mat));CHECK_EQ(mat,brick.get(dx,dy,dz));}
     auto air=edited->editTerrain(edited->generation(),x,y,z-1,MAT_AIR);CHECK(bool(air));CHECK(air->sampleAt(x,y,z-1,hit));CHECK_EQ(hit.material,MAT_AIR);
     CHECK(view->sampleAt(x,y,z,hit));CHECK_EQ(hit.material,MAT_BARK); // Old generation remains coherent.
     CHECK(!edited->carve(7,x,y,z-1));CHECK(!view->sampleAt(view->bounds().x1+1,y,z,hit));

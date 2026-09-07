@@ -91,7 +91,7 @@ public:
         size_t ignored;
         if(!index(int64_t(key.x)*B,int64_t(key.y)*B,int64_t(key.z)*B,ignored)||
            !index(int64_t(key.x)*B+B-1,int64_t(key.y)*B+B-1,int64_t(key.z)*B+B-1,ignored))return false;
-        Brick<B> b;for(int z=0;z<B;++z)for(int y=0;y<B;++y)for(int x=0;x<B;++x){MaterialId m;terrainAt(int64_t(key.x)*B+x,int64_t(key.y)*B+y,int64_t(key.z)*B+z,m);b.set(x,y,z,m);}
+        Brick<B> b;for(int z=0;z<B;++z)for(int y=0;y<B;++y)for(int x=0;x<B;++x){MaterialId m=MAT_AIR;if(!terrainAt(int64_t(key.x)*B+x,int64_t(key.y)*B+y,int64_t(key.z)*B+z,m))return false;b.set(x,y,z,m);}
         b.tryCollapse();out=std::move(b);return true;
     }
     // Functional edits: old readers retain a consistent old generation.
