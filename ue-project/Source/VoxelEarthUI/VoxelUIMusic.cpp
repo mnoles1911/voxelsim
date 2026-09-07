@@ -1,6 +1,7 @@
 #include "VoxelUIMusic.h"
 
 #include "VoxelEarthUI.h" // LogVoxelUI
+#include "VoxelAudioUserSettings.h"
 
 #include "AudioDefines.h" // INDEFINITELY_LOOPING_DURATION
 #include "Components/AudioComponent.h"
@@ -232,9 +233,24 @@ void FVoxelUIMusic::StartRandom(UWorld* World, FRandomStream& Stream)
 		return;
 	}
 	Component.Reset(NewComponent);
+	// The component is created at 1.0 above and brought to the player's chosen
+	// level HERE rather than by passing the volume to CreateSound2D, so that
+	// there is exactly one place -- ApplyVolume -- that knows how the two audio
+	// settings combine. Before Play(), so a track never sounds for one buffer at
+	// full volume on a machine set to 20%.
+	ApplyVolume();
 	NewComponent->Play();
 
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelUIMusic: playing '%s' (%d track(s) available)."), *TrackName, Files.Num());
+}
+
+void FVoxelUIMusic::ApplyVolume()
+{
+	if (!Component.IsValid())
+	{
+		return; // silent, and the next StartRandom will apply it
+	}
+	Component->SetVolumeMultiplier(VoxelAudioUserSettings::GetEffectiveMusicVolume());
 }
 
 void FVoxelUIMusic::OnUnderflow(USoundWaveProcedural* InWave, int32 SamplesRequired)

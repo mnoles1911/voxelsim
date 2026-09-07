@@ -56,6 +56,20 @@ FVoxelFrontEndSwitches Parse()
 	FParse::Value(Cmd, TEXT("VoxelMenuPanel="), S.MenuPanel);
 	S.MenuPanel = S.MenuPanel.TrimStartAndEnd().ToLower();
 
+	// -VoxelPauseShot / -VoxelPauseShot=<s>, both forms like every other
+	// capture switch here.
+	if (FParse::Value(Cmd, TEXT("VoxelPauseShot="), Seconds))
+	{
+		S.bPauseShot = true;
+		S.PauseShotSeconds = FMath::Max(Seconds, 0.f);
+	}
+	else if (FParse::Param(Cmd, TEXT("VoxelPauseShot")))
+	{
+		S.bPauseShot = true;
+	}
+	FParse::Value(Cmd, TEXT("VoxelPausePanel="), S.PausePanel);
+	S.PausePanel = S.PausePanel.TrimStartAndEnd().ToLower();
+
 	if (ParseFloatList(TEXT("VoxelLoadingShotAt="), S.LoadingShotSeconds))
 	{
 		S.bLoadingShot = true;
@@ -110,7 +124,19 @@ FVoxelFrontEndSwitches Parse()
 		S.AutoStartSeconds = 0.5f;
 	}
 
+	// -VoxelPauseShot IMPLIES IT TOO, one step further along: the pause overlay
+	// only exists after the world has been handed to the player, so an
+	// unattended capture has to press NEW GAME *and* sit through the loading
+	// theatre. Without the first, the shot is of a title screen; without the
+	// second, of 30-60 s of hourglass.
+	if (S.bPauseShot && !S.bAutoStart)
+	{
+		S.bAutoStart = true;
+		S.AutoStartSeconds = 0.5f;
+	}
+
 	S.bNoAssets = FParse::Param(Cmd, TEXT("VoxelUINoAssets"));
+	S.bDemoSaves = FParse::Param(Cmd, TEXT("VoxelDemoSaves"));
 	S.bReadyProbeLog = FParse::Param(Cmd, TEXT("VoxelReadyProbeLog"));
 
 	FParse::Value(Cmd, TEXT("VoxelLoadGateMaxRing="), S.LoadGateMaxRing);

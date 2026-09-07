@@ -8,6 +8,16 @@ FText Title() { return LOCTEXT("MenuTitle", "VOXELMARK"); }
 FText Subtitle() { return LOCTEXT("MenuSubtitle", "Mira-Thal Trilogy · Game One"); }
 FText VersionStamp() { return LOCTEXT("MenuVersion", "Milestone 5-3D — dev build"); }
 
+FText CalloutTag() { return LOCTEXT("CalloutTag", "PATCH 0.18 — THE BRONZE AGE"); }
+FText CalloutTitle() { return LOCTEXT("CalloutTitle", "Metalsmithing Update"); }
+FText CalloutCopy()
+{
+	return LOCTEXT("CalloutCopy",
+	               "Copper and tin now spawn in surface veins. Smelt them together for bronze: a full tool tier that "
+	               "mines faster and lasts four times as long as stone. New crafting stations — bloomery, crucible "
+	               "and anvil. Worn tools can be reforged instead of thrown away.");
+}
+
 FText ButtonContinue() { return LOCTEXT("BtnContinue", "CONTINUE"); }
 FText ButtonNewGame() { return LOCTEXT("BtnNewGame", "NEW GAME"); }
 FText ButtonLoadGame() { return LOCTEXT("BtnLoadGame", "LOAD GAME"); }
@@ -20,6 +30,61 @@ FText ButtonDelete() { return LOCTEXT("BtnDelete", "DELETE"); }
 FText ButtonCancel() { return LOCTEXT("BtnCancel", "CANCEL"); }
 FText ButtonBack() { return LOCTEXT("BtnBack", "BACK"); }
 
+// --- Overlay family (2026-09-07 mocks) --------------------------------------
+FText SettingsSectionAudio() { return LOCTEXT("SetSecAudio", "AUDIO"); }
+FText SettingsSectionDisplay() { return LOCTEXT("SetSecDisplay", "DISPLAY"); }
+FText SettingsSectionGraphics() { return LOCTEXT("SetSecGraphics", "GRAPHICS"); }
+FText SettingsMasterLabel() { return LOCTEXT("SetMaster", "MASTER"); }
+FText SettingsMusicLabel() { return LOCTEXT("SetMusic", "MUSIC"); }
+FText SettingsFullscreenLabel() { return LOCTEXT("SetFullscreen", "FULLSCREEN"); }
+// The one row on this panel that does NOT take effect as you touch it, said out
+// loud rather than left for the player to discover by not noticing.
+FText SettingsFullscreenHint() { return LOCTEXT("SetFullscreenHint", "Takes effect on APPLY."); }
+FText ButtonApply() { return LOCTEXT("BtnApply", "APPLY"); }
+FText ButtonSaveAndLeave() { return LOCTEXT("BtnSaveLeave", "SAVE & LEAVE"); }
+FText SettingsBackHint() { return LOCTEXT("SetBackHint", "back"); }
+FText KeyEscape() { return LOCTEXT("KeyEsc", "ESC"); }
+FText KeyEnter() { return LOCTEXT("KeyEnter", "ENTER"); }
+
+FText PauseTitle() { return LOCTEXT("PauseTitle", "— PAUSED —"); }
+FText ButtonResume() { return LOCTEXT("BtnResume", "RESUME"); }
+FText ButtonSave() { return LOCTEXT("BtnSave", "SAVE"); }
+FText ButtonExitToMenu() { return LOCTEXT("BtnExitToMenu", "EXIT TO MENU"); }
+FText PauseFooter(int32 DayNumber)
+{
+	return FText::Format(LOCTEXT("PauseFooter", "Day {0}"), FText::AsNumber(DayNumber));
+}
+
+FText SaveDialogTitle() { return LOCTEXT("SaveDialogTitle", "— SAVE GAME —"); }
+FText SaveDialogPrompt() { return LOCTEXT("SaveDialogPrompt", "NAME THIS SAVE"); }
+FText SaveDialogCounter(int32 Used, int32 Max)
+{
+	// AsNumber would group at a thousand; these are two- and three-digit counts
+	// in a monospace readout and a separator would be noise.
+	return FText::FromString(FString::Printf(TEXT("%d / %d"), Used, Max));
+}
+FText SaveOverwritePrefix() { return LOCTEXT("SaveOverwritePrefix", "A save named"); }
+FText SaveOverwriteSuffix() { return LOCTEXT("SaveOverwriteSuffix", "already exists. Confirm to overwrite it."); }
+FText SaveKeysConfirm() { return LOCTEXT("SaveKeysConfirm", "to confirm"); }
+FText SaveKeysCancel() { return LOCTEXT("SaveKeysCancel", "to cancel"); }
+FText ButtonConfirm() { return LOCTEXT("BtnConfirm", "CONFIRM"); }
+FText DefaultSaveName(const FText& Context, int32 DayNumber)
+{
+	return FText::Format(LOCTEXT("DefaultSaveName", "{0} Day {1}"), Context, FText::AsNumber(DayNumber));
+}
+
+FText LoadFilterAll() { return LOCTEXT("LoadFilterAll", "ALL"); }
+FText LoadFilterManual() { return LOCTEXT("LoadFilterManual", "MANUAL"); }
+FText LoadFilterAuto() { return LOCTEXT("LoadFilterAuto", "AUTO"); }
+FText LoadSearchHint() { return LOCTEXT("LoadSearchHint", "Search…"); }
+FText LoadCountTotal(int32 Total)
+{
+	return FText::Format(LOCTEXT("LoadCountTotal", "/ {0}"), FText::AsNumber(Total));
+}
+FText LoadTagLatest() { return LOCTEXT("LoadTagLatest", "LATEST"); }
+FText LoadTagAuto() { return LOCTEXT("LoadTagAuto", "AUTO"); }
+FText LoadNoMatch() { return LOCTEXT("LoadNoMatch", "No saves match."); }
+FText LoadAutosaveName() { return LOCTEXT("LoadAutosaveName", "Autosave"); }
 FText LoadPanelTitle() { return LOCTEXT("LoadPanelTitle", "LOAD GAME"); }
 FText LoadPanelEmpty() { return LOCTEXT("LoadPanelEmpty", "No saves yet. Start a New Game to begin."); }
 FText HelpPanelTitle() { return LOCTEXT("HelpPanelTitle", "HELP"); }
@@ -74,7 +139,6 @@ FText CreditsPanelBody()
 		"project.\n");
 }
 FText SettingsPanelTitle() { return LOCTEXT("SettingsPanelTitle", "SETTINGS"); }
-FText SettingsPanelBody() { return LOCTEXT("SettingsPanelBody", "Settings coming soon."); }
 FText SettingsFineDetailLabel() { return LOCTEXT("SettingsFineDetailLabel", "Fine Detail Smoothing"); }
 FText SettingsFineDetailDesc()
 {
@@ -106,7 +170,10 @@ FText SettingsOceanDetailDesc()
 	               "close to the camera; the horizon reaches just as far either way.");
 }
 
-FText LoadingTitle() { return LOCTEXT("LoadingTitle", "L O A D I N G"); }
+// "LOADING", tracked by FSlateFontInfo::LetterSpacing (FVoxelMenuLayout::
+// LoadingTitleLetterSpacing) rather than by literal spaces: UE5 has real
+// tracking, which the Godot-era note in the header predates.
+FText LoadingTitle() { return LOCTEXT("LoadingTitle", "LOADING"); }
 FText TipPrefix() { return LOCTEXT("TipPrefix", "TIP"); }
 
 const TArray<FText>& LoadingQuips()

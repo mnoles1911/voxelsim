@@ -55,6 +55,11 @@ public:
 	// left to fade into.
 	VOXELEARTHUI_API void Stop();
 
+	// Re-reads VoxelAudioUserSettings and pushes master x music at the live
+	// component. Called when a track starts and whenever either slider moves;
+	// a no-op while silent, because the next StartRandom applies it anyway.
+	VOXELEARTHUI_API void ApplyVolume();
+
 	VOXELEARTHUI_API bool IsPlaying() const;
 
 	// What is currently playing, for the log and for captures. Empty when

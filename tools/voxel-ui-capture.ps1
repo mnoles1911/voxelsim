@@ -29,16 +29,19 @@
     tools\voxel-ui-capture.ps1 -Shot Fallback
     tools\voxel-ui-capture.ps1 -Shot Hourglass
     tools\voxel-ui-capture.ps1 -Shot Loading -At '0.5,6,20'
+    tools\voxel-ui-capture.ps1 -Shot Pause
+    tools\voxel-ui-capture.ps1 -Shot Pause -Panel save
     tools\voxel-ui-capture.ps1 -Shot GateSweep -GateRing 2 -MaxHold 180
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Menu', 'Panel', 'Fallback', 'Hourglass', 'Loading', 'GateSweep')]
+    [ValidateSet('Menu', 'Panel', 'Fallback', 'Hourglass', 'Loading', 'GateSweep', 'Pause')]
     [string]$Shot,
 
-    # -Shot Panel only: which sub-panel to open before the shutter.
-    [ValidateSet('load', 'help', 'credits', 'settings')]
+    # -Shot Panel: which title-screen sub-panel to open before the shutter.
+    # -Shot Pause: which of the pause overlay's four screens.
+    [ValidateSet('load', 'help', 'credits', 'settings', 'pause', 'save')]
     [string]$Panel = 'load',
 
     # -Shot Loading only: comma-separated seconds to capture at. The default
@@ -48,6 +51,14 @@ param(
 
     # -Shot Hourglass only: comma-separated progress values.
     [string]$Progress = '0.0,0.25,0.5,0.75,1.0',
+
+    # Put a fabricated set of saves in front of the LOAD list and the save
+    # dialog. A capture box has no saves, so without this every picture of the
+    # LOAD dialog is a picture of its empty state -- no tags, no filter chips
+    # doing anything, and no way to see the overwrite band at all. Also
+    # suppresses -VoxelNoLoad on `-Shot Panel -Panel load`, which exists to
+    # guarantee the opposite.
+    [switch]$DemoSaves,
 
     # Hard ceiling on the whole run, seconds. NOT a tuning knob -- it is the
     # backstop that stops a finished-but-unexited editor holding the box all
@@ -132,7 +143,7 @@ switch ($Shot) {
         # An empty LOAD list is the interesting case for a fresh checkout, and
         # -VoxelNoLoad guarantees it rather than depending on what happens to
         # be in Saved/.
-        if ($Panel -eq 'load') { $argList += '-VoxelNoLoad' }
+        if ($Panel -eq 'load' -and -not $DemoSaves) { $argList += '-VoxelNoLoad' }
     }
     'Fallback' {
         # The degraded path: no font, no art. It is the arm nobody exercises
@@ -145,6 +156,22 @@ switch ($Shot) {
     'Loading' {
         $argList += "-VoxelLoadingShotAt=$At"
     }
+    'Pause' {
+        # THE ONE SHOT THAT NEEDS A WORLD. The pause overlay only exists after
+        # hand-off, so this arm drives NEW GAME, skips the load theatre, waits
+        # out the settle twice (once for the world, once for the overlay's
+        # glyphs) and photographs whichever of the four screens -Panel names.
+        #
+        # -VoxelSpawnAt IS MANDATORY, not a tuning knob: the world origin has no
+        # fine tiles and the spawn gate is fatal there. -61440,-61440 is the
+        # column every in-game capture in this repository uses.
+        $argList += @("-VoxelPauseShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+        # -Panel's default is 'load', which is right for -Shot Panel and wrong
+        # here; an unspecified pause shot wants the pause list itself.
+        $pausePanel = if ($PSBoundParameters.ContainsKey('Panel')) { $Panel } else { 'pause' }
+        $argList += "-VoxelPausePanel=$pausePanel"
+    }
     'GateSweep' {
         # No shutter at all: this arm is a MEASUREMENT, and its output is the
         # VoxelLoadGate lines in the log rather than a picture. Feeds
@@ -155,6 +182,7 @@ switch ($Shot) {
     }
 }
 
+if ($DemoSaves) { $argList += '-VoxelDemoSaves' }
 if ($ExtraArgs) { $argList += $ExtraArgs }
 
 Write-Host ''

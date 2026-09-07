@@ -18,6 +18,29 @@ TUniquePtr<FVoxelUIStyle> GInstance;
 int32 GLiveWidgets = 0;
 
 const TCHAR* const kSerifRelativePath = TEXT("UI/Fonts/MacondoSwashCaps-Regular.ttf");
+// The 2026-09-07 mocks' other faces. The IM Fell filenames are Google Fonts'
+// own (IMFeENrm28P = roman, IMFeENit28P = italic); kept as shipped rather than
+// renamed so the OFL provenance stays greppable.
+const TCHAR* const kMonoRelativePath = TEXT("UI/Fonts/VT323-Regular.ttf");
+const TCHAR* const kHandRelativePath = TEXT("UI/Fonts/IMFeENrm28P.ttf");
+const TCHAR* const kHandItalicRelativePath = TEXT("UI/Fonts/IMFeENit28P.ttf");
+
+// One face by path, with the same graceful-degradation contract Serif has:
+// returns null (and says why, once) when the file is absent or assets are
+// forced off, and the accessor falls back to the engine face.
+TSharedPtr<FCompositeFont> LoadFaceOrNull(const TCHAR* RelativePath, const TCHAR* Role, bool bForceFallback)
+{
+	const FString Path = FPaths::ProjectContentDir() / RelativePath;
+	if (!bForceFallback && IFileManager::Get().FileExists(*Path))
+	{
+		return MakeShared<FStandaloneCompositeFont>(NAME_None, Path, EFontHinting::Default,
+		                                            EFontLoadingPolicy::LazyLoad);
+	}
+	UE_LOG(LogVoxelUI, Warning,
+	       TEXT("Menu %s font not loaded (%s); falling back to the engine default face. Expected at: %s"),
+	       Role, bForceFallback ? TEXT("-VoxelUINoAssets") : TEXT("file missing"), *Path);
+	return nullptr;
+}
 
 // A 1x1 opaque white box, tinted per use. Every flat colour in this front end
 // is one of these -- Slate has no "solid colour" primitive, and a white brush
@@ -135,6 +158,12 @@ void FVoxelUIStyle::Initialise()
 		       bForceFallback ? TEXT("-VoxelUINoAssets") : TEXT("file missing"), *SerifPath);
 	}
 
+	// The three 2026-09-07 faces ride the same switch as Serif.
+	MonoFont = VoxelUIStyleDetail::LoadFaceOrNull(VoxelUIStyleDetail::kMonoRelativePath, TEXT("mono"), bForceFallback);
+	HandFont = VoxelUIStyleDetail::LoadFaceOrNull(VoxelUIStyleDetail::kHandRelativePath, TEXT("hand"), bForceFallback);
+	HandItalicFont = VoxelUIStyleDetail::LoadFaceOrNull(VoxelUIStyleDetail::kHandItalicRelativePath,
+	                                                    TEXT("hand-italic"), bForceFallback);
+
 	// --- Oak button ---------------------------------------------------------
 	// UIStyles.menu_button_styles(): four StyleBoxFlat, all 2px border and
 	// 10px content margin. Only the FILL is carried on the brush; the border
@@ -146,6 +175,62 @@ void FVoxelUIStyle::Initialise()
 	MenuButtonStyle.SetDisabled(VoxelUIStyleDetail::MakeFilledBrush(Darkened(PanelOak2, 0.30f)));
 	MenuButtonStyle.SetNormalPadding(ButtonPadding);
 	MenuButtonStyle.SetPressedPadding(ButtonPadding);
+
+	// --- Title-screen item (transparent SButton) ----------------------------
+	{
+		FSlateBrush Clear = VoxelUIStyleDetail::MakeSolidBrush();
+		Clear.TintColor = FSlateColor(FLinearColor::Transparent);
+		CartoucheButtonStyle.SetNormal(Clear);
+		CartoucheButtonStyle.SetHovered(Clear);
+		CartoucheButtonStyle.SetPressed(Clear);
+		CartoucheButtonStyle.SetDisabled(Clear);
+		CartoucheButtonStyle.SetNormalPadding(FMargin(0.f));
+		CartoucheButtonStyle.SetPressedPadding(FMargin(0.f));
+	}
+
+	// --- Audio slider (.sl-knob) --------------------------------------------
+	{
+		const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+		FSlateBrush Clear = VoxelUIStyleDetail::MakeSolidBrush();
+		Clear.TintColor = FSlateColor(FLinearColor::Transparent);
+		SliderStyle.SetNormalBarImage(Clear);
+		SliderStyle.SetHoveredBarImage(Clear);
+		SliderStyle.SetDisabledBarImage(Clear);
+
+		// SSlider TAKES THE THUMB'S SIZE FROM THE BRUSH'S ImageSize, which is
+		// the only reason this style knows a layout number at all.
+		// --warm-highlight IS --gold; the CSS aliases them so the two families
+		// cannot drift, and the port spells the alias out at the use site.
+		FSlateBrush Knob = VoxelUIStyleDetail::MakeFilledBrush(Mix(Gold, WarmPrimary));
+		Knob.ImageSize = FVector2D(L.SliderKnobWidth, L.SliderKnobHeight);
+		SliderStyle.SetNormalThumbImage(Knob);
+		// linear-gradient(180deg,--warm-highlight,--warm-primary) unchanged on
+		// hover in the mock; the drag affordance is the knob's motion.
+		SliderStyle.SetHoveredThumbImage(Knob);
+		FSlateBrush DisabledKnob = Knob;
+		DisabledKnob.TintColor = FSlateColor(Tint(IronDeep));
+		SliderStyle.SetDisabledThumbImage(DisabledKnob);
+		SliderStyle.SetBarThickness(L.SliderTrackHeight);
+	}
+
+	// --- Settings checkbox (.ck-box) ----------------------------------------
+	{
+		FSlateBrush Clear = VoxelUIStyleDetail::MakeSolidBrush();
+		Clear.TintColor = FSlateColor(FLinearColor::Transparent);
+		OverlayCheckBoxStyle.SetUncheckedImage(Clear);
+		OverlayCheckBoxStyle.SetUncheckedHoveredImage(Clear);
+		OverlayCheckBoxStyle.SetUncheckedPressedImage(Clear);
+		OverlayCheckBoxStyle.SetCheckedImage(Clear);
+		OverlayCheckBoxStyle.SetCheckedHoveredImage(Clear);
+		OverlayCheckBoxStyle.SetCheckedPressedImage(Clear);
+		OverlayCheckBoxStyle.SetUndeterminedImage(Clear);
+		OverlayCheckBoxStyle.SetUndeterminedHoveredImage(Clear);
+		OverlayCheckBoxStyle.SetUndeterminedPressedImage(Clear);
+		OverlayCheckBoxStyle.SetBackgroundImage(Clear);
+		OverlayCheckBoxStyle.SetBackgroundHoveredImage(Clear);
+		OverlayCheckBoxStyle.SetBackgroundPressedImage(Clear);
+		OverlayCheckBoxStyle.SetPadding(FMargin(0.f));
+	}
 
 	// --- Oak panel ----------------------------------------------------------
 	MenuBodyPanelBrush = VoxelUIStyleDetail::MakeFilledBrush(PanelOak1);
@@ -161,6 +246,33 @@ FSlateFontInfo FVoxelUIStyle::Serif(int32 SizePx) const
 	// few pixels of difference in title width and vertical centring, which is
 	// R2 in docs/front-end-plan.md and is accepted rather than papered over.
 	return FCoreStyle::GetDefaultFontStyle("Regular", SizePx);
+}
+
+FSlateFontInfo FVoxelUIStyle::Mono(int32 SizePx) const
+{
+	if (MonoFont.IsValid())
+	{
+		return FSlateFontInfo(MonoFont, SizePx);
+	}
+	return FCoreStyle::GetDefaultFontStyle("Mono", SizePx);
+}
+
+FSlateFontInfo FVoxelUIStyle::Hand(int32 SizePx) const
+{
+	if (HandFont.IsValid())
+	{
+		return FSlateFontInfo(HandFont, SizePx);
+	}
+	return FCoreStyle::GetDefaultFontStyle("Regular", SizePx);
+}
+
+FSlateFontInfo FVoxelUIStyle::HandItalic(int32 SizePx) const
+{
+	if (HandItalicFont.IsValid())
+	{
+		return FSlateFontInfo(HandItalicFont, SizePx);
+	}
+	return FCoreStyle::GetDefaultFontStyle("Italic", SizePx);
 }
 
 FSlateColor FVoxelUIStyle::TitleColour() { return FSlateColor(VoxelUITheme::Tint(VoxelUITheme::Gold)); }

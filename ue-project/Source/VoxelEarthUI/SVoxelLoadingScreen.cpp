@@ -8,6 +8,8 @@
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
 
+#include "Widgets/Layout/SSpacer.h"
+
 #include "HAL/IConsoleManager.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SOverlay.h"
@@ -79,6 +81,13 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 
 	const float HalfSep = L.LoadingSeparation * 0.5f;
 
+	// 2026-09-07 mock: the title is tracked (10 px at 40 px) rather than
+	// spelled with spaces, and the quip and tip are set in the italic hand face.
+	FSlateFontInfo TitleFont = Style.Serif(L.LoadingTitleSize);
+	TitleFont.LetterSpacing = L.LoadingTitleLetterSpacing;
+	FSlateFontInfo VersionFont = Style.Serif(L.VersionFontSize);
+	VersionFont.LetterSpacing = 187; // 3 px at 16 px
+
 	// The centred column. Godot builds it as a fixed 600x360 VBox at
 	// PRESET_CENTER; the SBox reproduces the fixed size, and the per-slot
 	// half-separation padding reproduces the 18px gap.
@@ -112,7 +121,7 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			// fakes the tracking with thin spaces and the port keeps the same
 			// trick rather than inventing a different one.
 			.Text(VoxelUIStrings::LoadingTitle())
-			.Font(Style.Serif(L.LoadingTitleSize))
+			.Font(TitleFont)
 			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
 			.ShadowOffset(FVector2D(3.f, 3.f))
 			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.95f))
@@ -128,7 +137,9 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			[
 				SNew(STextBlock)
 				.Text(this, &SVoxelLoadingScreen::GetQuipText)
-				.Font(Style.Serif(L.LoadingQuipSize))
+				// .msg: the italic hand face. The colour attribute below keeps
+				// the crossfade; its base is parchment, per the mock.
+				.Font(Style.HandItalic(L.LoadingQuipSize))
 				.ColorAndOpacity(this, &SVoxelLoadingScreen::GetQuipColour)
 				.ShadowOffset(FVector2D(2.f, 2.f))
 				.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.85f))
@@ -198,16 +209,49 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			.ColorAndOpacity(FSlateColor(FLinearColor(0.f, 0.f, 0.f, L.LoadingTintAlpha)))
 		]
 
+		// The stack sits in the upper third (.stack top:33%), not centred as the
+		// Godot build had it. Two fill-height spacers carry the fraction so the
+		// placement scales with the viewport instead of being a pixel offset.
+		//
+		// THE PROGRESS BAR AND PERCENTAGE STAY, and this is a recorded divergence
+		// from the mock, which has neither: the owner's 2026-09-06 directive
+		// asked for a bar that "actually advance[s] smoothly", and a screen that
+		// dropped it the day after would be a regression wearing a redesign.
 		+ SOverlay::Slot()
 		.HAlign(HAlign_Center)
-		.VAlign(VAlign_Center)
+		.VAlign(VAlign_Fill)
 		[
-			SNew(SBox)
-			.WidthOverride(L.LoadingColumnWidth)
-			.HeightOverride(L.LoadingColumnHeight)
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().FillHeight(L.LoadingStackTopFrac)
 			[
-				Column
+				SNew(SSpacer)
 			]
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+			[
+				SNew(SBox)
+				.WidthOverride(L.LoadingColumnWidth)
+				[
+					Column
+				]
+			]
+			+ SVerticalBox::Slot().FillHeight(1.f - L.LoadingStackTopFrac)
+			[
+				SNew(SSpacer)
+			]
+		]
+
+		// .version-stamp, bottom-left, new on this screen in the 2026-09-07 mock.
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Left)
+		.VAlign(VAlign_Bottom)
+		.Padding(FMargin(L.VersionInsetLeft, 0.f, 0.f, L.VersionInsetBottom))
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::VersionStamp())
+			.Font(VersionFont)
+			.ColorAndOpacity(FSlateColor(Tint(Parchment, 0.32f)))
+			.ShadowOffset(FVector2D(1.f, 1.f))
+			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.8f))
 		]
 
 		// TIP footer, pinned to the bottom edge with the GDScript's insets.
@@ -235,8 +279,9 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 				[
 					SNew(STextBlock)
 					.Text(this, &SVoxelLoadingScreen::GetTipText)
-					.Font(Style.Serif(L.LoadingTipSize))
-					.ColorAndOpacity(FSlateColor(Tint(InkDim, 0.55f)))
+					// .tip: italic hand face at rgba(230,213,168,.55) ~ parchment @ 0.55.
+					.Font(Style.HandItalic(L.LoadingTipSize))
+					.ColorAndOpacity(FSlateColor(Tint(Parchment, 0.55f)))
 				]
 			]
 		];

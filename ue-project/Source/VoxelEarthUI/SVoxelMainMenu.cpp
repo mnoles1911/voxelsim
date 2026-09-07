@@ -2,7 +2,7 @@
 
 #include "SVoxelCoverImage.h"
 #include "SVoxelMenuButton.h"
-#include "VoxelGraphicsUserSettings.h"
+#include "SVoxelSettingsPanel.h"
 #include "VoxelEarthUI.h"
 #include "VoxelUIAssetLibrary.h"
 #include "VoxelUIStrings.h"
@@ -97,9 +97,14 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 			.ColorAndOpacity(this, &SVoxelMainMenu::GetBackgroundTint)
 		]
 
+		// THE SWITCHER FILLS THE SCREEN NOW (2026-09-07). The title screen places
+		// its logo, menu and callout against the frame edges, so its panel has
+		// to be given the whole viewport; the sub-panels still want to be
+		// centred, and each one centres ITSELF below rather than inheriting a
+		// centring that the main column can no longer share.
 		+ SOverlay::Slot()
-		.HAlign(HAlign_Center)
-		.VAlign(VAlign_Center)
+		.HAlign(HAlign_Fill)
+		.VAlign(VAlign_Fill)
 		[
 			SAssignNew(PanelSwitcher, SWidgetSwitcher)
 			// SLOT ORDER IS THE ENUM ORDER. SVoxelMainMenuDetail::PanelIndex
@@ -110,24 +115,31 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 			]
 			+ SWidgetSwitcher::Slot()
 			[
+				// Not wrapped in a centring SBox like its siblings: the overlay
+				// dialogs centre themselves, so that the same widget centres the
+				// same way over the paused world.
 				BuildLoadPanel()
 			]
 			+ SWidgetSwitcher::Slot()
 			[
-				BuildMessagePanel(EVoxelMenuPanel::Help, VoxelUIStrings::HelpPanelTitle(), VoxelUIStrings::HelpPanelBody())
+				SNew(SBox).HAlign(HAlign_Center).VAlign(VAlign_Center)
+				[
+					BuildMessagePanel(EVoxelMenuPanel::Help, VoxelUIStrings::HelpPanelTitle(), VoxelUIStrings::HelpPanelBody())
+				]
 			]
 			+ SWidgetSwitcher::Slot()
 			[
-				BuildMessagePanel(EVoxelMenuPanel::Credits, VoxelUIStrings::CreditsPanelTitle(), VoxelUIStrings::CreditsPanelBody())
+				SNew(SBox).HAlign(HAlign_Center).VAlign(VAlign_Center)
+				[
+					BuildMessagePanel(EVoxelMenuPanel::Credits, VoxelUIStrings::CreditsPanelTitle(), VoxelUIStrings::CreditsPanelBody())
+				]
 			]
 			+ SWidgetSwitcher::Slot()
 			[
-				// SETTINGS is out of scope this pass (docs/front-end-plan.md
-				// R8's placeholder era ended 2026-09-04: the owner asked for a
-				// player-facing graphics toggle, so SETTINGS is a real panel
-				// with one row (Fine Detail Smoothing) and room to grow. Rows
-				// arrive only through the A/B-plus-owner-verdict pipeline --
-				// see VoxelGraphicsUserSettings.h for the doctrine.
+				// The 2026-09-07 SETTINGS overlay, which centres itself for the
+				// same reason the LOAD dialog above it does. Rows still arrive
+				// only through the A/B-plus-owner-verdict pipeline -- see
+				// VoxelGraphicsUserSettings.h for the doctrine.
 				BuildSettingsPanel()
 			]
 		]
@@ -159,14 +171,18 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	// gap is expressed as symmetric per-slot padding of half the separation --
 	// which sums to exactly 14 between neighbours and adds 7 at the ends, a
 	// difference invisible inside a centred, fixed-height box.
-	const float HalfSep = L.MainColumnSeparation * 0.5f;
+	// THE 2026-09-07 TITLE SCREEN (Voxelmark Main Menu.html). Three groups
+	// pinned to the frame: the hero logo top-RIGHT, the menu list hanging
+	// under it right-aligned, and a patch-notes callout top-LEFT. The centred
+	// oak column this function used to build is gone from THIS panel; the
+	// sub-panels keep their oak chrome until their own mocks land.
+	//
+	// The list uses the same SVoxelMenuButton the oak panels do, in its
+	// Cartouche variant -- so every line of focus and navigation below is
+	// unchanged, which is the point of making the chrome a flag.
+	const float HalfSep = L.TitleMenuGap * 0.5f;
 	const FMargin SlotPad(0.f, HalfSep);
 
-	// TWO COLUMNS, NOT ONE, AND THE SPLIT IS THE FIX. Everything in `Column`
-	// is 520 units wide (MainPanelHalfWidth * 2, the Godot _main_panel width)
-	// because the BUTTONS want to be. The title does not fit in 520 and must
-	// not inherit it -- see the return at the bottom of this function.
-	TSharedRef<SVerticalBox> TitleColumn = SNew(SVerticalBox);
 	TSharedRef<SVerticalBox> Column = SNew(SVerticalBox);
 	TSharedPtr<SVoxelMenuButton> NewGameButton;
 	TSharedPtr<SVoxelMenuButton> SettingsButton;
@@ -174,102 +190,202 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	TSharedPtr<SVoxelMenuButton> CreditsButton;
 	TSharedPtr<SVoxelMenuButton> QuitButton;
 
-	TitleColumn->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
-	[
+	// .title-logo__name: 132 px serif, 6 px tracking, --shadow-emboss-lg
+	// (0 4px 0 black @ .55 plus a 28 px blur the port does not fake).
+	FSlateFontInfo LogoFont = Style.Serif(L.LogoFontSize);
+	LogoFont.LetterSpacing = L.LogoLetterSpacing;
+	TSharedRef<SWidget> Logo =
 		SNew(STextBlock)
 		.Text(VoxelUIStrings::Title())
-		.Font(Style.Serif(L.TitleFontSize))
-		.ColorAndOpacity(FVoxelUIStyle::TitleColour())
-		.Justification(ETextJustify::Center)
-	];
+		.Font(LogoFont)
+		.ColorAndOpacity(FSlateColor(Tint(InkBright)))
+		.ShadowOffset(FVector2D(0.f, 4.f))
+		.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.55f))
+		.Justification(ETextJustify::Right);
 
-	TitleColumn->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
-	[
-		SNew(STextBlock)
-		.Text(VoxelUIStrings::Subtitle())
-		.Font(Style.Serif(L.SubtitleFontSize))
-		.ColorAndOpacity(FVoxelUIStyle::DimColour())
-		.Justification(ETextJustify::Center)
-	];
-
-	TitleColumn->AddSlot().AutoHeight()
-	[
-		SNew(SSpacer).Size(FVector2D(0.f, L.TitleToButtonsSpacer))
-	];
+	// .callout-news: a 64 px glyph box, a bordered column of tag / italic
+	// title / copy, bounded to 520 wide.
+	FSlateFontInfo TagFont = Style.Serif(L.CalloutTagSize);
+	TagFont.LetterSpacing = 187; // 3 px at 16 px
+	TSharedRef<SWidget> Callout =
+		SNew(SBox)
+		.MaxDesiredWidth(L.CalloutMaxWidth)
+		[
+			SNew(SHorizontalBox)
+			// Left rule, then content, then right rule: the mock's
+			// border-left/border-right at gold @ .35.
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(1.f)
+				[
+					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(Gold, 0.35f)))
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(L.CalloutPadX, 4.f, 0.f, 0.f)).VAlign(VAlign_Top)
+			[
+				SNew(SBox).WidthOverride(L.CalloutGlyphSize).HeightOverride(L.CalloutGlyphSize)
+				[
+					SNew(SOverlay)
+					+ SOverlay::Slot()
+					[
+						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(Gold, 0.5f)))
+					]
+					+ SOverlay::Slot().Padding(FMargin(1.f))
+					[
+						SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(PanelIron)))
+					]
+					+ SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+					[
+						// .callout-news__glyph holds U+2726, a four-pointed star.
+						// None of the four shipped faces has it, and what the
+						// 2026-09-07 capture showed in its place was Slate's
+						// last-resort tile. A gold diamond is the ornament instead.
+						SNew(SBox).WidthOverride(L.CalloutOrnamentSize).HeightOverride(L.CalloutOrnamentSize)
+						.RenderTransform(FSlateRenderTransform(FQuat2D(FMath::DegreesToRadians(45.f))))
+						.RenderTransformPivot(FVector2D(0.5f, 0.5f))
+						[
+							SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FVoxelUIStyle::TitleColour())
+						]
+					]
+				]
+			]
+			+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(L.CalloutGap, 0.f, L.CalloutPadX, 0.f))
+			[
+				SNew(SVerticalBox)
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 4.f))
+				[
+					SNew(STextBlock)
+					.Text(VoxelUIStrings::CalloutTag())
+					.Font(TagFont)
+					.ColorAndOpacity(FSlateColor(Tint(CalloutTag)))
+					.ShadowOffset(FVector2D(1.f, 1.f))
+					.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.8f))
+				]
+				+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 0.f, 0.f, 8.f))
+				[
+					SNew(STextBlock)
+					.Text(VoxelUIStrings::CalloutTitle())
+					.Font(Style.HandItalic(L.CalloutTitleSize))
+					.ColorAndOpacity(FVoxelUIStyle::TitleColour())
+					.ShadowOffset(FVector2D(1.f, 1.f))
+					.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.8f))
+				]
+				+ SVerticalBox::Slot().AutoHeight()
+				[
+					SNew(STextBlock)
+					.Text(VoxelUIStrings::CalloutCopy())
+					.Font(Style.Hand(L.CalloutCopySize))
+					.ColorAndOpacity(FSlateColor(Tint(Parchment, 0.85f)))
+					.ShadowOffset(FVector2D(1.f, 1.f))
+					.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.8f))
+					.AutoWrapText(true)
+					.LineHeightPercentage(1.45f)
+				]
+			]
+			+ SHorizontalBox::Slot().AutoWidth()
+			[
+				SNew(SBox).WidthOverride(1.f)
+				[
+					SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(Gold, 0.35f)))
+				]
+			]
+		];
 
 	// The six buttons, in source order. CONTINUE and LOAD GAME are attribute-
 	// bound to HasAnyLoadableSave() rather than being enabled/disabled
 	// imperatively, so SetSaveRows does not have to remember to update them.
-	Column->AddSlot().AutoHeight().Padding(SlotPad)
+	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Right)
 	[
 		SAssignNew(ContinueButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonContinue())
-		.FontSize(L.ButtonFontSize)
-		.MinHeight(L.ButtonMinHeight)
+		.Variant(EVoxelMenuButtonVariant::Cartouche)
+		.FontSize(L.TitleMenuItemSize)
+		.ActiveFontSize(L.TitleMenuActiveSize)
+		.LetterSpacing(L.TitleMenuLetterSpacing)
+		.MinHeight(0.f)
 		.IsEnabled(this, &SVoxelMainMenu::HasAnyLoadableSave)
 		.OnClicked_Lambda([this]() { OnContinue.ExecuteIfBound(); return FReply::Handled(); })
 	];
 
-	Column->AddSlot().AutoHeight().Padding(SlotPad)
+	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Right)
 	[
 		SAssignNew(NewGameButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonNewGame())
-		.FontSize(L.ButtonFontSize)
-		.MinHeight(L.ButtonMinHeight)
+		.Variant(EVoxelMenuButtonVariant::Cartouche)
+		.FontSize(L.TitleMenuItemSize)
+		.ActiveFontSize(L.TitleMenuActiveSize)
+		.LetterSpacing(L.TitleMenuLetterSpacing)
+		.MinHeight(0.f)
 		.OnClicked_Lambda([this]() { OnNewGame.ExecuteIfBound(); return FReply::Handled(); })
 	];
 
-	Column->AddSlot().AutoHeight().Padding(SlotPad)
+	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Right)
 	[
 		SAssignNew(LoadGameButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonLoadGame())
-		.FontSize(L.ButtonFontSize)
-		.MinHeight(L.ButtonMinHeight)
+		.Variant(EVoxelMenuButtonVariant::Cartouche)
+		.FontSize(L.TitleMenuItemSize)
+		.ActiveFontSize(L.TitleMenuActiveSize)
+		.LetterSpacing(L.TitleMenuLetterSpacing)
+		.MinHeight(0.f)
 		.IsEnabled(this, &SVoxelMainMenu::HasAnyLoadableSave)
 		.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::Load); return FReply::Handled(); })
 	];
 
-	Column->AddSlot().AutoHeight().Padding(SlotPad)
+	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Right)
 	[
 		SAssignNew(SettingsButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonSettings())
-		.FontSize(L.ButtonFontSize)
-		.MinHeight(L.ButtonMinHeight)
+		.Variant(EVoxelMenuButtonVariant::Cartouche)
+		.FontSize(L.TitleMenuItemSize)
+		.ActiveFontSize(L.TitleMenuActiveSize)
+		.LetterSpacing(L.TitleMenuLetterSpacing)
+		.MinHeight(0.f)
 		.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::Settings); return FReply::Handled(); })
 	];
 
-	Column->AddSlot().AutoHeight().Padding(SlotPad)
+	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Right)
 	[
 		SAssignNew(HelpButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonHelp())
-		.FontSize(L.ButtonFontSize)
-		.MinHeight(L.ButtonMinHeight)
+		.Variant(EVoxelMenuButtonVariant::Cartouche)
+		.FontSize(L.TitleMenuItemSize)
+		.ActiveFontSize(L.TitleMenuActiveSize)
+		.LetterSpacing(L.TitleMenuLetterSpacing)
+		.MinHeight(0.f)
 		.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::Help); return FReply::Handled(); })
 	];
 
-	Column->AddSlot().AutoHeight().Padding(SlotPad)
+	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Right)
 	[
 		SAssignNew(CreditsButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonCredits())
-		.FontSize(L.ButtonFontSize)
-		.MinHeight(L.ButtonMinHeight)
+		.Variant(EVoxelMenuButtonVariant::Cartouche)
+		.FontSize(L.TitleMenuItemSize)
+		.ActiveFontSize(L.TitleMenuActiveSize)
+		.LetterSpacing(L.TitleMenuLetterSpacing)
+		.MinHeight(0.f)
 		.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::Credits); return FReply::Handled(); })
 	];
 
-	// The 80px gap before QUIT. It is the one piece of vertical rhythm in the
-	// column that is not the uniform separation, and it is what stops a
-	// mis-aimed click from leaving the game.
+	// The gap before QUIT (.title-menu__item.quit margin-top: 52px). It is the
+	// one piece of vertical rhythm in the list that is not the uniform gap,
+	// and it is what stops a mis-aimed click from leaving the game.
 	Column->AddSlot().AutoHeight()
 	[
-		SNew(SSpacer).Size(FVector2D(0.f, L.QuitSpacer))
+		SNew(SSpacer).Size(FVector2D(0.f, L.TitleMenuQuitGap))
 	];
 
-	Column->AddSlot().AutoHeight().Padding(SlotPad)
+	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Right)
 	[
 		SAssignNew(QuitButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonQuit())
-		.FontSize(L.ButtonFontSize)
-		.MinHeight(L.ButtonMinHeight)
+		.Variant(EVoxelMenuButtonVariant::Cartouche)
+		.Muted(true)
+		.FontSize(L.TitleMenuItemSize)
+		.ActiveFontSize(L.TitleMenuItemSize)
+		.LetterSpacing(L.TitleMenuLetterSpacing)
+		.MinHeight(0.f)
 		.OnClicked_Lambda([this]() { OnQuit.ExecuteIfBound(); return FReply::Handled(); })
 	];
 
@@ -289,40 +405,38 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	// lives on each SVoxelMenuButton's inner SButton rather than here -- see
 	// that file for why a container is the wrong place for it.
 
-	// THE TITLE SITS OUTSIDE THE BUTTON PANEL'S WIDTH, and it has to -- a child
-	// cannot escape a narrower parent by asking for more. Slate's AlignChild
-	// (LayoutUtils.h) clamps a non-Fill child to its parent by default:
-	//
-	//     ChildSize = bClampToParent ? Min(ChildDesiredSize, AllottedSize) : ...
-	//
-	// so an inner SBox asking for 720 inside a 520 parent is silently given
-	// 520. That was tried first and produced a byte-identical capture, which is
-	// how the clamp was found. The width has to come from the PARENT chain.
-	//
-	// So the outer box is TitleBoxWidth and the buttons get their own 520 box
-	// inside it. Everything the buttons care about is unchanged: same width,
-	// same centring, same fixed height. Only the title and subtitle see the
-	// wider box. See backlog 0.0l.
-	return SNew(SBox)
-		.WidthOverride(L.TitleBoxWidth)
-		.HeightOverride(L.MainPanelHalfHeight * 2.f)
-		.HAlign(HAlign_Center)
-		.VAlign(VAlign_Center)
+	// Three groups pinned to the frame. Overlay slots take an alignment and a
+	// padding, which is exactly the mock's "top/right/left" absolute offsets
+	// once the panel is given the whole viewport (see Construct). The old
+	// TitleBoxWidth clamp story (backlog 0.0l) does not arise here: the logo
+	// sits in its own auto-sized slot and clamps against the screen, not a
+	// 520-wide column.
+	return SNew(SOverlay)
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Right)
+		.VAlign(VAlign_Top)
+		.Padding(FMargin(0.f, L.LogoTop, L.LogoRight, 0.f))
 		[
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+			Logo
+		]
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Right)
+		.VAlign(VAlign_Top)
+		.Padding(FMargin(0.f, L.TitleMenuTop, L.TitleMenuRight, 0.f))
+		[
+			SNew(SBox)
+			.WidthOverride(L.TitleMenuWidth)
+			.HAlign(HAlign_Right)
 			[
-				TitleColumn
+				Column
 			]
-			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
-			[
-				SNew(SBox)
-				.WidthOverride(L.MainPanelHalfWidth * 2.f)
-				.HAlign(HAlign_Fill)
-				[
-					Column
-				]
-			]
+		]
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Left)
+		.VAlign(VAlign_Top)
+		.Padding(FMargin(L.CalloutLeft, L.CalloutTop, 0.f, 0.f))
+		[
+			Callout
 		];
 }
 
@@ -345,10 +459,13 @@ void SVoxelMainMenu::FocusDefaultWidget()
 		}
 		break;
 	case EVoxelMenuPanel::Load:
-		// CANCEL rather than the first save row: it is the control that is
-		// always there, and arrowing up from it reaches the rows.
-		Target = LoadPanelCancelButton;
-		break;
+		// The dialog owns its own focus default now, and knows which of its
+		// controls exists in the empty state.
+		if (LoadDialog.IsValid()) { LoadDialog->FocusDefaultWidget(); }
+		return;
+	case EVoxelMenuPanel::Settings:
+		if (SettingsPanel.IsValid()) { SettingsPanel->FocusDefaultWidget(); }
+		return;
 	default:
 		if (const TSharedPtr<SVoxelMenuButton>* Found = MessagePanelBackButtons.Find(VisiblePanel))
 		{
@@ -425,134 +542,21 @@ TSharedRef<SWidget> SVoxelMainMenu::WrapInPanelFrame(TSharedRef<SWidget> Content
 
 TSharedRef<SWidget> SVoxelMainMenu::BuildLoadPanel()
 {
-	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
-	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
-	const float HalfSep = L.SubPanelSeparation * 0.5f;
-
-	TSharedRef<SVerticalBox> Column = SNew(SVerticalBox);
-
-	Column->AddSlot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
-	[
-		SNew(STextBlock)
-		.Text(VoxelUIStrings::LoadPanelTitle())
-		.Font(Style.Serif(L.SubPanelTitleSize))
-		.ColorAndOpacity(FVoxelUIStyle::TitleColour())
-	];
-
-	// FillHeight, so the list takes whatever the title and CANCEL leave --
-	// the Godot ScrollContainer is SIZE_EXPAND_FILL for the same reason.
-	Column->AddSlot().FillHeight(1.f).Padding(FMargin(0.f, HalfSep))
-	[
-		SNew(SScrollBox)
-		+ SScrollBox::Slot()
-		[
-			SAssignNew(SaveList, SVerticalBox)
-		]
-	];
-
-	Column->AddSlot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
-	[
-		SAssignNew(LoadPanelCancelButton, SVoxelMenuButton)
-		.Text(VoxelUIStrings::ButtonCancel())
-		.FontSize(L.SaveRowButtonFont)
-		.MinHeight(L.DialogButtonHeight)
-		.MinWidth(L.DialogButtonWidth)
-		.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); return FReply::Handled(); })
-	];
-
-	RebuildSaveList();
-	return WrapInPanelFrame(Column);
-}
-
-void SVoxelMainMenu::RebuildSaveList()
-{
-	using namespace VoxelUITheme;
-	if (!SaveList.IsValid())
-	{
-		return; // the LOAD panel has not been built yet
-	}
-	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
-	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
-
-	SaveList->ClearChildren();
-
-	if (SaveRows.Num() == 0)
-	{
-		// MainMenu.gd's empty state, word for word.
-		SaveList->AddSlot().AutoHeight().Padding(FMargin(0.f, L.SaveRowSeparation))
-		[
-			SNew(STextBlock)
-			.Text(VoxelUIStrings::LoadPanelEmpty())
-			.Font(Style.Serif(L.SaveRowFontSize))
-			.ColorAndOpacity(FVoxelUIStyle::MutedColour())
-			.AutoWrapText(true)
-		];
-		return;
-	}
-
-	for (const FVoxelSaveRowInfo& Row : SaveRows)
-	{
-		const FString Slug = Row.Slug;
-		// Godot renders this as ONE Label with an embedded newline:
-		//   "<save_name>\n<timestamp>   X ..  Y ..  Z .."
-		// Two STextBlocks in a vertical box give the same two lines with
-		// independent colours, which is worth the extra widget: the name wants
-		// INK and the detail wants INK_DIM, and a single label cannot do both.
-		TSharedRef<SVerticalBox> Info = SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(STextBlock)
-				.Text(Row.DisplayName)
-				.Font(Style.Serif(L.SaveRowFontSize))
-				.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(STextBlock)
-				// An unloadable row shows WHY in place of its coordinates.
-				// The alternative -- showing the position of a world this
-				// build cannot open -- is an invitation to click it.
-				.Text(Row.bLoadable ? Row.Detail : Row.DisabledReason)
-				.Font(Style.Serif(L.SaveRowFontSize - 2))
-				.ColorAndOpacity(Row.bLoadable ? FVoxelUIStyle::DimColour() : FVoxelUIStyle::MutedColour())
-			];
-
-		SaveList->AddSlot().AutoHeight().Padding(FMargin(0.f, L.SaveRowSeparation * 0.5f))
-		[
-			SNew(SBox)
-			.MinDesiredHeight(L.SaveRowMinHeight)
-			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
-				[
-					Info
-				]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(L.SaveRowSeparation, 0.f, 0.f, 0.f))
-				[
-					SNew(SVoxelMenuButton)
-					.Text(VoxelUIStrings::ButtonLoad())
-					.FontSize(L.SaveRowButtonFont)
-					.MinHeight(L.SaveRowButtonHeight)
-					.MinWidth(L.SaveRowButtonWidth)
-					.IsEnabled(Row.bLoadable)
-					.OnClicked_Lambda([this, Slug]() { OnLoadSave.ExecuteIfBound(Slug); return FReply::Handled(); })
-				]
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(L.SaveRowSeparation, 0.f, 0.f, 0.f))
-				[
-					SNew(SVoxelMenuButton)
-					.Text(VoxelUIStrings::ButtonDelete())
-					.FontSize(L.SaveRowButtonFont)
-					.MinHeight(L.SaveRowButtonHeight)
-					.MinWidth(L.SaveRowButtonWidth)
-					// HP_BRIGHT, matching the Godot row's font_color override.
-					// DELETE is enabled even on an unloadable save: not being
-					// able to OPEN a world is no reason to be stuck with it.
-					.TextColorOverride(Tint(HpBright))
-					.OnClicked_Lambda([this, Slug]() { OnDeleteSave.ExecuteIfBound(Slug); return FReply::Handled(); })
-				]
-			]
-		];
-	}
+	// NO OAK FRAME HERE ANY MORE. SVoxelLoadDialog brings the overlay family's
+	// leather panel with it, which is the whole point of the 2026-09-07 mock:
+	// the title screen's LOAD list and the pause menu's are one screen, so they
+	// are one widget.
+	return SAssignNew(LoadDialog, SVoxelLoadDialog)
+		.Rows(SaveRows)
+		.OnLoadSave(FOnVoxelSaveAction::CreateLambda([this](const FString& Slug)
+		{
+			OnLoadSave.ExecuteIfBound(Slug);
+		}))
+		.OnDeleteSave(FOnVoxelSaveAction::CreateLambda([this](const FString& Slug)
+		{
+			OnDeleteSave.ExecuteIfBound(Slug);
+		}))
+		.OnCancel(FSimpleDelegate::CreateLambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); }));
 }
 
 TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(EVoxelMenuPanel Panel, const FText& Title, const FText& Body)
@@ -610,136 +614,19 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(EVoxelMenuPanel Panel, con
 
 TSharedRef<SWidget> SVoxelMainMenu::BuildSettingsPanel()
 {
-	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
-	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
-	const float HalfSep = L.SubPanelSeparation * 0.5f;
-	TSharedPtr<SVoxelMenuButton> BackButton;
-
-	// Shaped like BuildMessagePanel on purpose (same frame, same Back wiring,
-	// same scroll rule) so keyboard focus and the panel switcher treat it as
-	// one more message panel. The one difference is the row area: a settings
-	// row is label + live toggle + description, and the toggle's text is an
-	// ATTRIBUTE reading the persisted value, so the button never holds state
-	// of its own -- VoxelGraphicsUserSettings is the single authority and a
-	// toggle that failed to persist would VISIBLY fail to flip.
+	// SVoxelSettingsPanel since 2026-09-07: the mock's audio and display
+	// sections around the four VoxelGraphicsUserSettings rows that used to be
+	// the whole panel. Those rows are KEPT -- they are player-facing settings
+	// that shipped with owner verdicts behind them, and the mock simply predates
+	// them. The row table, the plain-function-pointer idiom and the
+	// read-modify-write-through-the-getter rule all moved into that file
+	// unchanged; see its header.
 	//
-	// ---- THE ROW BUILDER, AT FOUR ROWS (2026-09-05) -------------------------
-	//
-	// The previous version's own note said "a third row is another copy of this
-	// block -- refactor to a row builder at three". This is that refactor, and
-	// the reason to do it is not line count: four hand-copied blocks means four
-	// places to forget the attribute binding, and a row whose toggle text was
-	// bound to the WRONG getter would look completely normal until someone
-	// flipped it and watched a different row change. There is now exactly one
-	// place where a label, a toggle and a description are wired together, so a
-	// row can only be wrong in its DATA -- which is the four lines below, all
-	// visible at once.
-	//
-	// PLAIN FUNCTION POINTERS, not TFunction: every getter and setter here is a
-	// free function in VoxelGraphicsUserSettings, so this needs no capture, no
-	// allocation and no lifetime argument -- the row table is data, and it
-	// reads as data.
-	struct FSettingRow
-	{
-		FText (*Label)();
-		FText (*Desc)();
-		bool (*Get)();
-		void (*Set)(bool);
-	};
-	const FSettingRow Rows[] = {
-		{&VoxelUIStrings::SettingsFineDetailLabel, &VoxelUIStrings::SettingsFineDetailDesc,
-		 &VoxelGraphicsUserSettings::GetFineDetailSmoothing, &VoxelGraphicsUserSettings::SetFineDetailSmoothing},
-		{&VoxelUIStrings::SettingsFasterTerrainLabel, &VoxelUIStrings::SettingsFasterTerrainDesc,
-		 &VoxelGraphicsUserSettings::GetFasterTerrainDrawing, &VoxelGraphicsUserSettings::SetFasterTerrainDrawing},
-		{&VoxelUIStrings::SettingsWaterWaveLabel, &VoxelUIStrings::SettingsWaterWaveDesc,
-		 &VoxelGraphicsUserSettings::GetWaterWaveDetail, &VoxelGraphicsUserSettings::SetWaterWaveDetail},
-		{&VoxelUIStrings::SettingsOceanDetailLabel, &VoxelUIStrings::SettingsOceanDetailDesc,
-		 &VoxelGraphicsUserSettings::GetOceanMeshDetail, &VoxelGraphicsUserSettings::SetOceanMeshDetail},
-	};
-
-	// Built by AddSlot rather than by the declarative += chain, because the
-	// number of rows is now data. The spacing is unchanged from the hand-built
-	// version: no gap above the first row (the panel title already provides it),
-	// HalfSep above each later row, and half of that between a row and its own
-	// description so the description reads as belonging to the row above it.
-	TSharedRef<SVerticalBox> RowBox = SNew(SVerticalBox);
-	bool bFirstRow = true;
-	for (const FSettingRow& Row : Rows)
-	{
-		RowBox->AddSlot()
-		.AutoHeight()
-		.Padding(FMargin(0.f, bFirstRow ? 0.f : HalfSep, 0.f, 0.f))
-		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
-			[
-				SNew(STextBlock)
-				.Text(Row.Label())
-				.Font(Style.Serif(L.SubPanelBodySize))
-				.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-			]
-			+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-			[
-				SNew(SVoxelMenuButton)
-				.Text(TAttribute<FText>::CreateLambda([Get = Row.Get]()
-				{
-					return Get() ? VoxelUIStrings::SettingsToggleOn() : VoxelUIStrings::SettingsToggleOff();
-				}))
-				.FontSize(L.SaveRowButtonFont)
-				.MinHeight(L.DialogButtonHeight)
-				.MinWidth(L.DialogButtonWidth)
-				.OnClicked_Lambda([Get = Row.Get, Set = Row.Set]()
-				{
-					// Read-modify-write through the SAME getter the label is
-					// bound to. Holding a bool here instead would let the button
-					// and the persisted value disagree after any failed write.
-					Set(!Get());
-					return FReply::Handled();
-				})
-			]
-		];
-		RowBox->AddSlot()
-		.AutoHeight()
-		.Padding(FMargin(0.f, HalfSep * 0.5f, 0.f, 0.f))
-		[
-			SNew(STextBlock)
-			.Text(Row.Desc())
-			.Font(Style.Serif(L.SubPanelBodySize - 4))
-			.ColorAndOpacity(FVoxelUIStyle::BodyColour())
-			.AutoWrapText(true)
-		];
-		bFirstRow = false;
-	}
-
-	TSharedRef<SWidget> Frame = WrapInPanelFrame(
-		SNew(SVerticalBox)
-		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
-		[
-			SNew(STextBlock)
-			.Text(VoxelUIStrings::SettingsPanelTitle())
-			.Font(Style.Serif(L.SubPanelTitleSize))
-			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
-		]
-		+ SVerticalBox::Slot().FillHeight(1.f).Padding(FMargin(0.f, HalfSep))
-		[
-			SNew(SScrollBox)
-			+ SScrollBox::Slot()
-			[
-				RowBox
-			]
-		]
-		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
-		[
-			SAssignNew(BackButton, SVoxelMenuButton)
-			.Text(VoxelUIStrings::ButtonBack())
-			.FontSize(L.SaveRowButtonFont)
-			.MinHeight(L.DialogButtonHeight)
-			.MinWidth(L.DialogButtonWidth)
-			.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); return FReply::Handled(); })
-		]);
-
-	MessagePanelBackButtons.Add(EVoxelMenuPanel::Settings, BackButton);
-	return Frame;
+	// It is no longer registered in MessagePanelBackButtons: the panel owns its
+	// own footer, its own Escape and its own focus default, which is exactly
+	// what stopped it being message-panel-shaped.
+	return SAssignNew(SettingsPanel, SVoxelSettingsPanel)
+		.OnLeave(FSimpleDelegate::CreateLambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); }));
 }
 
 bool SVoxelMainMenu::HasAnyLoadableSave() const
@@ -763,7 +650,10 @@ bool SVoxelMainMenu::HasAnyLoadableSave() const
 void SVoxelMainMenu::SetSaveRows(TArray<FVoxelSaveRowInfo> Rows)
 {
 	SaveRows = MoveTemp(Rows);
-	RebuildSaveList();
+	if (LoadDialog.IsValid())
+	{
+		LoadDialog->SetRows(SaveRows);
+	}
 }
 
 void SVoxelMainMenu::ShowPanel(EVoxelMenuPanel Panel)

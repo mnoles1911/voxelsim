@@ -1,0 +1,378 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Load Dialog" subtitle="Load-game picker — save slots with day and season" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Load Game</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  body{font-family:var(--hand);color:var(--parchment);background:#000;overflow:hidden;user-select:none}
+  a{color:var(--warm-highlight);text-decoration:none}a:hover{color:var(--parchment)}
+
+  .bg{
+    position:absolute;inset:0;
+    background:url("assets/menu_backgrounds/cave_background1.jpg") center/cover no-repeat;
+    filter:blur(8px) brightness(0.32) saturate(0.6);
+  }
+  .vignette{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 200px rgba(0,0,0,0.65)}
+  .grain{position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg, rgba(255,180,80,0.015) 0 1px, transparent 1px 3px);mix-blend-mode:overlay}
+
+  /* ============ LOAD PANEL ============ */
+  .ld-panel{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:780px;height:min(640px, calc(100vh - 32px));
+    background:linear-gradient(180deg,rgba(28,18,10,0.96),rgba(14,8,4,0.98));
+    border:2px solid #000;
+    box-shadow:
+      inset 0 0 0 1px var(--leather-edge),
+      inset 0 0 0 3px var(--leather-1),
+      0 8px 24px rgba(0,0,0,0.8);
+    padding:24px 28px 20px;
+    display:flex;flex-direction:column;gap:12px;
+  }
+  .ld-title{
+    font-family:var(--serif);font-size:26px;letter-spacing:4px;color:var(--warm-highlight);
+    text-align:center;text-shadow:2px 2px 0 #000;
+  }
+  .ld-rule{height:1px;background:var(--leather-edge);margin:-4px 0 0}
+
+  /* header strip with filter chips + search */
+  .ld-header{
+    display:flex;align-items:center;gap:10px;
+  }
+  .ld-filters{display:flex;gap:4px}
+  .ld-filter{
+    font-family:var(--serif);font-size:11px;letter-spacing:2px;
+    background:var(--leather-2);color:var(--parchment);
+    border:1px solid var(--leather-edge);
+    padding:6px 12px;cursor:pointer;text-shadow:1px 1px 0 #000;
+  }
+  .ld-filter:hover{border-color:var(--warm-primary)}
+  .ld-filter.on{
+    background:linear-gradient(180deg,var(--warm-primary),var(--warm-secondary));
+    color:#fff8e0;border-color:#000;
+  }
+  .ld-search{
+    flex:1;
+    font-family:var(--hand);font-size:14px;font-style:italic;color:var(--parchment-ink);
+    background:linear-gradient(180deg,var(--parchment),var(--parchment-2));
+    border:1px solid #000;
+    box-shadow:inset 0 0 0 1px var(--parchment-edge),inset 0 2px 3px rgba(0,0,0,0.15);
+    padding:7px 12px;outline:none;
+  }
+  .ld-search::placeholder{color:var(--ink-mute);font-style:italic}
+  .ld-count{
+    font-family:var(--hand);font-style:italic;font-size:12px;color:var(--ink-mute);
+    white-space:nowrap;
+  }
+  .ld-count b{color:var(--warm-highlight);font-style:normal;font-family:var(--serif);letter-spacing:1px}
+
+  /* list — richer rows */
+  .ld-list{
+    flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;
+    padding-right:6px;
+  }
+  .ld-list::-webkit-scrollbar{width:8px}
+  .ld-list::-webkit-scrollbar-track{background:rgba(0,0,0,0.3)}
+  .ld-list::-webkit-scrollbar-thumb{background:var(--leather-edge);border:1px solid #000}
+
+  .ld-row{
+    display:grid;grid-template-columns:64px 1fr auto;gap:14px;align-items:center;
+    background:linear-gradient(180deg,rgba(58,36,18,0.55),rgba(28,18,10,0.55));
+    border:1px solid var(--leather-edge);
+    padding:10px 14px;cursor:pointer;
+    transition:border-color .12s,background .12s;
+  }
+  .ld-row:hover{
+    border-color:var(--warm-primary);
+    background:linear-gradient(180deg,rgba(78,46,22,0.6),rgba(40,24,12,0.6));
+  }
+  .ld-row.selected{
+    border-color:var(--warm-primary);
+    box-shadow:inset 0 0 0 1px rgba(232,135,58,0.4),0 0 12px rgba(232,135,58,0.12);
+    background:linear-gradient(180deg,rgba(78,46,22,0.7),rgba(40,24,12,0.7));
+  }
+  .ld-row.current::after{
+    content:"LATEST";
+    position:absolute;
+  }
+
+  /* thumb — abstract sigil per save */
+  .ld-thumb{
+    width:64px;height:64px;flex:none;
+    background:linear-gradient(135deg,#1a0e04,#3a2412);
+    border:1px solid #000;
+    box-shadow:inset 0 0 0 1px var(--leather-edge);
+    display:grid;place-items:center;
+    font-family:var(--serif);font-size:28px;color:var(--warm-primary);
+    text-shadow:1px 1px 0 #000;position:relative;overflow:hidden;
+  }
+  .ld-thumb.cave{background:linear-gradient(135deg,#0a0502,#28180c);color:#a07050}
+  .ld-thumb.field{background:linear-gradient(135deg,#1a2008,#3a3812);color:#a89050}
+  .ld-thumb.deep{background:linear-gradient(135deg,#020812,#0a1828);color:#5080a0}
+  .ld-thumb.holy{background:linear-gradient(135deg,#180c04,#3a2008);color:var(--warm-highlight)}
+  .ld-thumb-day{
+    position:absolute;left:0;right:0;bottom:0;
+    font-family:"Courier New",monospace;font-size:9px;letter-spacing:1px;
+    color:var(--parchment);background:rgba(0,0,0,0.65);
+    text-align:center;padding:1px 0;text-shadow:none;
+  }
+
+  .ld-info{display:flex;flex-direction:column;gap:3px;min-width:0}
+  .ld-name-row{display:flex;align-items:center;gap:8px;min-width:0}
+  .ld-name{
+    font-family:var(--serif);font-size:18px;letter-spacing:1px;color:var(--warm-highlight);
+    text-shadow:1px 1px 0 #000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .ld-name.auto{color:rgba(230,213,168,0.65)}
+  .ld-tag{
+    font-family:var(--serif);font-size:9px;letter-spacing:2px;
+    padding:2px 6px;border:1px solid var(--leather-edge);
+    flex:none;text-shadow:1px 1px 0 #000;
+  }
+  .ld-tag.auto{background:var(--leather-2);color:var(--warm-highlight)}
+  .ld-tag.latest{background:linear-gradient(180deg,var(--warm-primary),var(--warm-secondary));color:#fff8e0;border-color:#000}
+  .ld-meta{
+    font-family:var(--hand);font-style:italic;font-size:13px;color:rgba(230,213,168,0.6);
+    display:flex;gap:14px;flex-wrap:wrap;
+  }
+  .ld-meta .coord{font-family:"Courier New",monospace;font-style:normal;letter-spacing:1px;font-size:12px}
+  .ld-meta .sep{color:var(--ink-mute)}
+
+  .ld-actions{
+    display:flex;gap:6px;flex:none;
+  }
+  .ld-btn{
+    font-family:var(--serif);font-size:12px;letter-spacing:2px;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    color:var(--parchment);border:1px solid var(--leather-edge);
+    padding:8px 14px;cursor:pointer;text-shadow:1px 1px 0 #000;
+  }
+  .ld-btn:hover{border-color:var(--warm-primary);color:var(--warm-highlight)}
+  .ld-btn.primary{
+    background:linear-gradient(180deg,var(--warm-primary),var(--warm-secondary));
+    color:#fff8e0;border-color:#000;
+    box-shadow:inset 0 1px 0 rgba(255,220,160,0.3);
+  }
+  .ld-btn.primary:hover{
+    background:linear-gradient(180deg,var(--warm-highlight),var(--warm-primary));
+    color:var(--parchment-ink);
+  }
+  .ld-btn.del{color:rgba(230,150,130,0.8)}
+  .ld-btn.del:hover{border-color:#e8a090;color:#e8a090}
+
+  /* empty state */
+  .ld-empty{
+    flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+    font-family:var(--hand);font-style:italic;font-size:16px;color:rgba(230,213,168,0.5);
+    text-align:center;
+  }
+  .ld-empty.on{display:flex}
+  .ld-empty .glyph{
+    font-family:var(--serif);font-size:54px;color:var(--leather-edge);
+    text-shadow:2px 2px 0 #000;
+  }
+
+  /* footer */
+  .ld-foot{
+    display:flex;gap:12px;align-items:center;justify-content:flex-end;padding-top:10px;
+    border-top:1px solid var(--leather-edge);
+  }
+  .ld-keys{
+    font-family:var(--hand);font-style:italic;font-size:12px;color:var(--ink-mute);
+    margin-right:auto;
+  }
+  .ld-keys kbd{
+    font-family:var(--serif);font-style:normal;letter-spacing:2px;
+    color:var(--warm-highlight);background:var(--leather-2);
+    border:1px solid var(--leather-edge);padding:2px 8px;font-size:11px;margin:0 2px;
+  }
+  .ld-cancel{
+    font-family:var(--serif);font-size:15px;letter-spacing:3px;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    color:var(--parchment);border:1px solid var(--leather-edge);
+    padding:9px 24px;cursor:pointer;text-shadow:1px 1px 0 #000;
+  }
+  .ld-cancel:hover{color:var(--warm-highlight);border-color:var(--warm-primary)}
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="vignette"></div>
+  <div class="grain"></div>
+
+  <div class="ld-panel">
+    <div class="ld-title">LOAD GAME</div>
+    <div class="ld-rule"></div>
+
+    <div class="ld-header">
+      <div class="ld-filters">
+        <button class="ld-filter on" data-filter="all">ALL</button>
+        <button class="ld-filter" data-filter="manual">MANUAL</button>
+        <button class="ld-filter" data-filter="auto">AUTO</button>
+      </div>
+      <input class="ld-search" id="search" type="text" placeholder="Search…" />
+      <div class="ld-count"><b id="visible">6</b> / 6</div>
+    </div>
+
+    <div class="ld-list" id="list">
+      <div class="ld-row selected" data-kind="manual" data-name="roland day 12 latest">
+        <div class="ld-thumb holy">✦<div class="ld-thumb-day">DAY 12</div></div>
+        <div class="ld-info">
+          <div class="ld-name-row">
+            <div class="ld-name">Roland Day 12</div>
+            <div class="ld-tag latest">LATEST</div>
+          </div>
+          <div class="ld-meta">
+            <span>11/04 · 18:42</span>
+          </div>
+        </div>
+        <div class="ld-actions">
+          <button class="ld-btn primary">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+      </div>
+
+      <div class="ld-row" data-kind="auto" data-name="11 04 17 08">
+        <div class="ld-thumb cave">▲<div class="ld-thumb-day">DAY 12</div></div>
+        <div class="ld-info">
+          <div class="ld-name-row">
+            <div class="ld-name auto">Autosave</div>
+            <div class="ld-tag auto">AUTO</div>
+          </div>
+          <div class="ld-meta">
+            <span>11/04 · 17:08</span>
+          </div>
+        </div>
+        <div class="ld-actions">
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+      </div>
+
+      <div class="ld-row" data-kind="manual" data-name="before the chapel">
+        <div class="ld-thumb holy">†<div class="ld-thumb-day">DAY 11</div></div>
+        <div class="ld-info">
+          <div class="ld-name-row">
+            <div class="ld-name">Before the Chapel</div>
+          </div>
+          <div class="ld-meta">
+            <span>11/04 · 16:15</span>
+          </div>
+        </div>
+        <div class="ld-actions">
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+      </div>
+
+      <div class="ld-row" data-kind="auto" data-name="11 03 22 51">
+        <div class="ld-thumb deep">◇<div class="ld-thumb-day">DAY 9</div></div>
+        <div class="ld-info">
+          <div class="ld-name-row">
+            <div class="ld-name auto">Autosave</div>
+            <div class="ld-tag auto">AUTO</div>
+          </div>
+          <div class="ld-meta">
+            <span>11/03 · 22:51</span>
+          </div>
+        </div>
+        <div class="ld-actions">
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+      </div>
+
+      <div class="ld-row" data-kind="manual" data-name="hollowford cave-in">
+        <div class="ld-thumb cave">⛯<div class="ld-thumb-day">DAY 7</div></div>
+        <div class="ld-info">
+          <div class="ld-name-row">
+            <div class="ld-name">Hollowford cave-in</div>
+          </div>
+          <div class="ld-meta">
+            <span>11/03 · 19:30</span>
+          </div>
+        </div>
+        <div class="ld-actions">
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+      </div>
+
+      <div class="ld-row" data-kind="manual" data-name="roland day 1">
+        <div class="ld-thumb field">❀<div class="ld-thumb-day">DAY 1</div></div>
+        <div class="ld-info">
+          <div class="ld-name-row">
+            <div class="ld-name">Roland Day 1</div>
+          </div>
+          <div class="ld-meta">
+            <span>11/02 · 14:02</span>
+          </div>
+        </div>
+        <div class="ld-actions">
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="ld-empty" id="empty">
+      <div class="glyph">∅</div>
+      <div>No saves match.</div>
+    </div>
+
+    <div class="ld-foot">
+      <button class="ld-cancel">CANCEL</button>
+    </div>
+  </div>
+
+  <div class="version-stamp bl">DEV BUILD v0.18.2</div>
+<script>
+  const rows = [...document.querySelectorAll('.ld-row')];
+  const filters = [...document.querySelectorAll('.ld-filter')];
+  const search = document.getElementById('search');
+  const visible = document.getElementById('visible');
+  const empty = document.getElementById('empty');
+  const list = document.getElementById('list');
+
+  let activeFilter = 'all';
+
+  function refresh(){
+    const q = search.value.trim().toLowerCase();
+    let n = 0;
+    rows.forEach(r=>{
+      const matchesFilter = activeFilter === 'all' || r.dataset.kind === activeFilter;
+      const matchesQuery  = !q || r.dataset.name.includes(q);
+      const show = matchesFilter && matchesQuery;
+      r.style.display = show ? '' : 'none';
+      if(show) n++;
+    });
+    visible.textContent = n;
+    empty.classList.toggle('on', n === 0);
+    list.style.display = n === 0 ? 'none' : '';
+  }
+
+  filters.forEach(f=>{
+    f.addEventListener('click',()=>{
+      filters.forEach(x=>x.classList.remove('on'));
+      f.classList.add('on');
+      activeFilter = f.dataset.filter;
+      refresh();
+    });
+  });
+  search.addEventListener('input', refresh);
+
+  rows.forEach(r=>{
+    r.addEventListener('click',(e)=>{
+      if(e.target.closest('.ld-btn')) return;
+      rows.forEach(x=>x.classList.remove('selected'));
+      r.classList.add('selected');
+    });
+  });
+
+  refresh();
+</script>
+</body>
+</html>

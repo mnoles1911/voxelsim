@@ -1,0 +1,207 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Save Dialog" subtitle="Save-game dialog — name the save, browse existing slots" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Save Game</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  body{font-family:var(--hand);color:var(--parchment);background:#000;overflow:hidden;user-select:none}
+  a{color:var(--warm-highlight);text-decoration:none}a:hover{color:var(--parchment)}
+
+  .bg{
+    position:absolute;inset:0;
+    background:url("assets/menu_backgrounds/cave_background1.jpg") center/cover no-repeat;
+    filter:blur(8px) brightness(0.32) saturate(0.6);
+  }
+  .vignette{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 200px rgba(0,0,0,0.65)}
+  .grain{position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg, rgba(255,180,80,0.015) 0 1px, transparent 1px 3px);mix-blend-mode:overlay}
+
+  /* ============ SAVE PANEL ============ */
+  .sv-panel{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:560px;
+    background:linear-gradient(180deg,rgba(28,18,10,0.96),rgba(14,8,4,0.98));
+    border:2px solid #000;
+    box-shadow:
+      inset 0 0 0 1px var(--leather-edge),
+      inset 0 0 0 3px var(--leather-1),
+      0 8px 24px rgba(0,0,0,0.8);
+    padding:28px 36px 22px;
+    display:flex;flex-direction:column;gap:14px;
+  }
+  .sv-title{
+    font-family:var(--serif);font-size:28px;letter-spacing:6px;color:var(--warm-highlight);
+    text-align:center;text-shadow:2px 2px 0 #000;
+  }
+  .sv-rule{height:1px;background:var(--leather-edge);margin:-4px 0 6px}
+
+  /* current-context band — what they're saving */
+  .sv-context{
+    display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;
+    background:linear-gradient(180deg,rgba(58,36,18,0.5),rgba(28,18,10,0.5));
+    border:1px solid var(--leather-edge);
+    padding:10px 14px;
+  }
+  .sv-ctx-icon{
+    width:38px;height:38px;flex:none;display:grid;place-items:center;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    border:1px solid var(--leather-edge);
+    color:var(--warm-primary);font-family:var(--serif);font-size:22px;
+    text-shadow:1px 1px 0 #000;
+  }
+  .sv-ctx-info{display:flex;flex-direction:column;gap:1px;min-width:0}
+  .sv-ctx-name{
+    font-family:var(--serif);font-size:17px;letter-spacing:2px;color:var(--warm-highlight);
+    text-shadow:1px 1px 0 #000;
+  }
+  .sv-ctx-meta{
+    font-family:var(--hand);font-style:italic;font-size:13px;color:rgba(230,213,168,0.55);
+  }
+  .sv-ctx-coord{
+    font-family:"Courier New",monospace;font-size:12px;color:rgba(230,213,168,0.55);
+    letter-spacing:1px;
+  }
+
+  .sv-prompt{
+    font-family:var(--serif);font-size:13px;letter-spacing:3px;color:var(--warm-primary);
+    text-shadow:1px 1px 0 #000;margin-top:6px;
+  }
+  .sv-input-wrap{position:relative}
+  .sv-input{
+    width:100%;
+    font-family:var(--hand);font-size:22px;color:var(--parchment-ink);
+    background:linear-gradient(180deg,var(--parchment),var(--parchment-2));
+    border:1px solid #000;
+    box-shadow:inset 0 0 0 1px var(--parchment-edge),inset 0 2px 4px rgba(0,0,0,0.15);
+    padding:12px 90px 12px 14px;outline:none;
+    font-style:italic;letter-spacing:0.5px;
+  }
+  .sv-input:focus{
+    box-shadow:inset 0 0 0 1px var(--warm-primary),inset 0 2px 4px rgba(0,0,0,0.15),0 0 8px rgba(232,135,58,0.25);
+  }
+  .sv-input::selection{background:var(--warm-primary);color:#fff}
+  .sv-counter{
+    position:absolute;right:12px;top:50%;transform:translateY(-50%);
+    font-family:"Courier New",monospace;font-size:12px;color:var(--ink-mute);
+    letter-spacing:1px;pointer-events:none;
+  }
+  .sv-counter.warn{color:var(--warm-secondary)}
+
+  /* suggestion chips */
+  .sv-suggest{
+    display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+    margin-top:2px;
+  }
+  .sv-suggest-label{
+    font-family:var(--hand);font-style:italic;font-size:12px;color:var(--ink-mute);
+    margin-right:4px;
+  }
+  .sv-chip{
+    font-family:var(--hand);font-style:italic;font-size:13px;
+    background:transparent;color:rgba(230,213,168,0.7);
+    border:1px solid var(--leather-edge);
+    padding:4px 10px;cursor:pointer;
+  }
+  .sv-chip:hover{border-color:var(--warm-primary);color:var(--warm-highlight)}
+
+  /* warn band — only shown when name collides */
+  .sv-warn{
+    display:none;
+    font-family:var(--hand);font-style:italic;font-size:13px;
+    color:#e8b090;
+    background:rgba(140,60,30,0.2);
+    border-left:3px solid var(--warm-secondary);
+    padding:8px 12px;
+  }
+  .sv-warn.on{display:block}
+  .sv-warn b{font-style:normal;color:#f5d090;font-family:var(--serif);letter-spacing:2px}
+
+  /* footer */
+  .sv-foot{
+    display:flex;gap:12px;align-items:center;justify-content:flex-end;margin-top:8px;padding-top:12px;
+    border-top:1px solid var(--leather-edge);
+  }
+  .sv-keys{
+    font-family:var(--hand);font-style:italic;font-size:12px;color:var(--ink-mute);
+    margin-right:auto;
+  }
+  .sv-keys kbd{
+    font-family:var(--serif);font-style:normal;letter-spacing:2px;
+    color:var(--warm-highlight);background:var(--leather-2);
+    border:1px solid var(--leather-edge);padding:2px 8px;font-size:11px;
+    margin:0 2px;
+  }
+  .sv-act{
+    font-family:var(--serif);font-size:15px;letter-spacing:3px;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    color:var(--parchment);border:1px solid var(--leather-edge);
+    padding:9px 24px;cursor:pointer;text-shadow:1px 1px 0 #000;
+  }
+  .sv-act:hover{border-color:var(--warm-primary);color:var(--warm-highlight)}
+  .sv-act.primary{
+    background:linear-gradient(180deg,var(--warm-primary),var(--warm-secondary));
+    color:#fff8e0;border-color:#000;
+    box-shadow:inset 0 1px 0 rgba(255,220,160,0.3),0 2px 6px rgba(0,0,0,0.5);
+  }
+  .sv-act.primary:hover{
+    background:linear-gradient(180deg,var(--warm-highlight),var(--warm-primary));
+    color:var(--parchment-ink);
+  }
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="vignette"></div>
+  <div class="grain"></div>
+
+  <div class="sv-panel">
+    <div class="sv-title">— SAVE GAME —</div>
+    <div class="sv-rule"></div>
+
+    <div class="sv-context">
+      <div class="sv-ctx-icon">✦</div>
+      <div class="sv-ctx-info">
+        <div class="sv-ctx-name">ROLAND · DAY 12</div>
+      </div>
+    </div>
+
+    <div class="sv-prompt">NAME THIS SAVE</div>
+    <div class="sv-input-wrap">
+      <input class="sv-input" id="name" type="text" value="Roland Day 12" maxlength="40" />
+      <div class="sv-counter" id="count">12 / 40</div>
+    </div>
+
+    <div class="sv-warn" id="warn">
+      A save named <b>Roland Day 12</b> already exists. Confirm to overwrite it.
+    </div>
+
+    <div class="sv-foot">
+      <button class="sv-act">CANCEL</button>
+      <button class="sv-act primary">CONFIRM</button>
+    </div>
+  </div>
+
+  <div class="version-stamp bl">DEV BUILD v0.18.2</div>
+<script>
+  const input = document.getElementById('name');
+  const count = document.getElementById('count');
+  const warn  = document.getElementById('warn');
+  const EXISTING = new Set(['Roland Day 12','Before the Chapel','Hollowford cave-in','Roland Day 1']);
+
+  function refresh(){
+    const v = input.value;
+    count.textContent = v.length + ' / 40';
+    count.classList.toggle('warn', v.length > 32);
+    warn.classList.toggle('on', EXISTING.has(v.trim()));
+  }
+  document.getElementById('name').addEventListener('input', refresh);
+  refresh();
+
+  // Auto-focus + select
+  setTimeout(()=>{ input.focus(); input.select(); }, 50);
+</script>
+</body>
+</html>

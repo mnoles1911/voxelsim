@@ -25,9 +25,25 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	bool bMenuShot = false;
 	float MenuShotSeconds = 2.0f;
 
-	// -VoxelMenuPanel=load|help|credits: open that panel before the capture.
-	// Empty means the main column.
+	// -VoxelMenuPanel=load|help|credits|settings: open that panel before the
+	// capture. Empty means the main column.
 	FString MenuPanel;
+
+	// -VoxelPauseShot[=<seconds>]: play for N seconds, open the PAUSE overlay,
+	// settle another N, capture with the UI on, quit. Two settles because the
+	// overlay is built at the first and its glyphs rasterise during the second.
+	//
+	// IT NEEDS A WORLD, unlike every switch above it, which is why it is driven
+	// by UVoxelPauseUISubsystem rather than by the front end: the front end has
+	// stopped ticking by the time there is anything to photograph. Pair it with
+	// -VoxelMenuAutoStart (and -VoxelLoadTheatre=0) to reach Playing without a
+	// human, and with -VoxelSpawnAt to avoid the origin's missing fine tiles.
+	bool bPauseShot = false;
+	float PauseShotSeconds = 2.0f;
+
+	// -VoxelPausePanel=pause|settings|save|load: which of the overlay's four
+	// screens to open before the shutter. Empty means the pause list.
+	FString PausePanel;
 
 	// -VoxelLoadingShot[=<seconds>] / -VoxelLoadingShotAt=<s,s,s>: press NEW
 	// GAME immediately, then capture at each offset. The default single offset
@@ -54,6 +70,19 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// -VoxelUINoAssets: pretend the font and background art are missing. Makes
 	// the degraded path screenshot-testable instead of theoretical.
 	bool bNoAssets = false;
+
+	// -VoxelDemoSaves: put a fabricated set of saves in front of the LOAD list
+	// and the save dialog's collision check.
+	//
+	// THE ROW STRUCT WAS DESIGNED FOR THIS -- FVoxelSaveRowInfo's own comment
+	// says it is "kept as a plain struct so the widget ... can be
+	// screenshot-tested with fabricated rows" -- and this is the switch that
+	// finally uses it. A capture box has no saves, so without it every picture
+	// of the LOAD dialog is a picture of its empty state: no tags, no filter
+	// chips doing anything, no rich rows, and no way to see the overwrite band
+	// at all. CAPTURE ONLY: the rows name no world on disk, so LOADING one
+	// fails the way loading a deleted save does.
+	bool bDemoSaves = false;
 
 	// -VoxelReadyProbeLog: one line per readiness poll, with hit counts,
 	// per-ring pending/in-flight, and the poll's own cost in ms.
@@ -129,7 +158,7 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// its own quit, so nothing consults this yet; it is the predicate a future
 	// caller wanting "is this a capture run at all" should use rather than
 	// re-deriving the disjunction.
-	bool IsCaptureRun() const { return bMenuShot || bLoadingShot || bHourglassShot; }
+	bool IsCaptureRun() const { return bMenuShot || bLoadingShot || bHourglassShot || bPauseShot; }
 };
 
 namespace VoxelFrontEndSwitches

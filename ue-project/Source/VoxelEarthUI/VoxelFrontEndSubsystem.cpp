@@ -1,6 +1,9 @@
 #include "VoxelFrontEndSubsystem.h"
 #include "VoxelSessionCheckpoint.h"
+#include "VoxelAudioUserSettings.h"
 #include "VoxelGraphicsUserSettings.h"
+#include "VoxelPauseUISubsystem.h" // VoxelPauseUIHandoff
+#include "VoxelSaveRows.h"
 
 #include "SVoxelHourglass.h"
 #include "SVoxelLoadingScreen.h"
@@ -91,6 +94,10 @@ void UVoxelFrontEndSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// the player is playing, and their persisted choices must land before the
 	// first marched frame either way. Idempotent per world.
 	VoxelGraphicsUserSettings::ApplyAll();
+	// And the player's volumes, for exactly the same reason and on the same
+	// side of the suppression branch: a suppressed front end is a run where the
+	// player is playing, and their audio choices must land either way.
+	VoxelAudioUserSettings::ApplyAll();
 
 	if (!VoxelFrontEnd::IsEnabledThisRun())
 	{
@@ -296,6 +303,21 @@ void UVoxelFrontEndSubsystem::EnterMenu()
 	State = EVoxelFrontEndState::Menu;
 	StateSeconds = 0.f;
 	bMenuInputApplied = false;
+
+	// THE PAUSE MENU'S LOAD LANDS HERE. There is no world teardown in this
+	// project, so UVoxelPauseUISubsystem::ReturnToMenu reopens the map and
+	// leaves the chosen slug behind; this is the far side of that journey. The
+	// menu is built and on screen first, so that if the load is refused (the
+	// save was deleted between the click and the reopen, say) the player is
+	// looking at the title screen rather than at nothing.
+	//
+	// Consumed unconditionally, even when empty, so a plain EXIT TO MENU cannot
+	// leave a stale slug for the next visit.
+	if (const FString PendingSlug = VoxelPauseUIHandoff::ConsumePendingLoadSlug(); !PendingSlug.IsEmpty())
+	{
+		UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: resuming a pause-menu LOAD of '%s'."), *PendingSlug);
+		RequestLoad(PendingSlug);
+	}
 }
 
 void UVoxelFrontEndSubsystem::ApplyMenuInputMode()
@@ -346,41 +368,12 @@ void UVoxelFrontEndSubsystem::RefreshSaveRows()
 	}
 	UWorld* World = GetWorld();
 	UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
-	const uint64 RunningSeed = WorldSub ? WorldSub->GetSeed() : 0;
 
-	TArray<FVoxelSaveRowInfo> Rows;
-	for (const VoxelSave::FSaveInfo& Info : VoxelSave::List())
-	{
-		FVoxelSaveRowInfo Row;
-		Row.Slug = Info.Slug;
-		Row.DisplayName = FText::FromString(Info.DisplayName);
-
-		// MainMenu.gd's row reads
-		//   "<save_name>\n<timestamp>   X %.0f  Y %.0f  Z %.0f"
-		// so the shape is preserved exactly. The UNITS are not: Godot stored
-		// metres and this project stores Unreal units (1 UU = 1 cm), which
-		// would print a coordinate like -6510200 and read as noise. Converted
-		// to metres, which is what the F1 overlay and every log line in this
-		// project use -- so the number a player sees here matches the one they
-		// see in game.
-		const FVector Metres = Info.PlayerPosition / 100.0;
-		Row.Detail = FText::FromString(FString::Printf(TEXT("%s   X %.0f  Y %.0f  Z %.0f"), *Info.TimestampIso,
-		                                               Metres.X, Metres.Y, Metres.Z));
-
-		// THE ONE PLACE A 1:1 CLONE CANNOT HOLD. The world seed is baked into
-		// the amplifier when Impl is constructed, long before any menu exists,
-		// so a save recorded under a different seed cannot be opened without
-		// rebuilding the voxel world wholesale. Only reachable via -VoxelSeed=,
-		// so in ordinary play every row is loadable -- but a row that silently
-		// did nothing when clicked would be far worse than one that says why.
-		if (RunningSeed != 0 && Info.Seed != RunningSeed)
-		{
-			Row.bLoadable = false;
-			Row.DisabledReason = FText::FromString(
-				FString::Printf(TEXT("requires relaunch with -VoxelSeed=%llu"), (unsigned long long)Info.Seed));
-		}
-		Rows.Add(MoveTemp(Row));
-	}
+	// THE CONVERSION MOVED, NOT THE BEHAVIOUR. The pause overlay's LOAD dialog
+	// shows the same saves, and the two judgements this loop used to carry --
+	// metres, and the seed-mismatch reason -- must not be made differently on
+	// two screens. See VoxelSaveRows.h.
+	TArray<FVoxelSaveRowInfo> Rows = VoxelSaveRows::Build(WorldSub ? WorldSub->GetSeed() : 0);
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: %d save(s) listed."), Rows.Num());
 	MenuWidget->SetSaveRows(MoveTemp(Rows));
 }
