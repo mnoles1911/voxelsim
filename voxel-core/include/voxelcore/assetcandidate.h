@@ -23,7 +23,7 @@ inline MaterialId assetCandidateMaterial(const AssetField::ResolvedAssetInstance
 template<class Owned> MaterialId assetTerrainRenderMaterial(const std::vector<AssetField::ResolvedAssetInstance>& ordered,
     int64_t x,int64_t y,int64_t z,Owned&& owned){
     for(const auto& r:ordered){AssetCandidateBounds b;if(!assetCandidateBounds(r,b))continue;
-        const auto m=assetCandidateMaterial(r,b,x,y,z);if(m!=MAT_AIR)return owned(r)?MAT_AIR:m;}
+        const auto m=assetCandidateMaterial(r,b,x,y,z);if(m!=MAT_AIR)return owned(r)?MaterialId(MAT_AIR):m;}
     return MAT_AIR;
 }
 // Worker-safe with immutable ordered inputs and a thread-safe column provider.

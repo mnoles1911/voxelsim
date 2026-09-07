@@ -4,7 +4,7 @@
 
 The user authorized completing the remaining framework work autonomously, then requested **commit and merge all progress and prepare a handover now**. This checkpoint preserves unfinished implementation; it does not declare production environment migration complete. Resume the outstanding work below without routine confirmation.
 
-Workspace: `D:/voxelsim`, Unreal 5.8 at `D:/UE_5.8`. Other Codex and Claude tasks share this repository and may open editors or build separate checkouts. The three environment subagents are frozen. Coordinate before writing shared files or running Unreal builds. Preserve other tasks' changes. No push was requested.
+Workspace: `D:/voxelsim`, Unreal 5.8 at `D:/UE_5.8`. Other Codex and Claude tasks share this repository and may open editors or build separate checkouts. The three environment subagents are frozen. Coordinate before writing shared files or running Unreal builds. Preserve other tasks' changes. The user authorized pushing and merging the session PR.
 
 Read `HANDOVER-2026-09-07.md` for Asset Forge/creature work, and the persistence task's own handover for its separate session checkpoint/inventory work. Creature checkpoint `5303d99` and shared checkpoint `fa56da9` must both remain ancestors of the integrated result; use Git history for the final commit IDs.
 
@@ -24,7 +24,7 @@ Do not enable ordinary tree overlays yet. `docs/production-environment-ownership
 
 Implemented prerequisites now include held GPU generation results, adapter-owned prepared CPU/GPU buffers and a pool batch that reserves every replacement before replacing old slots. Capacity failure rolls back. That pool batch deliberately refuses the default GPU allocator mode: there is no whole-batch host-verifiable reservation there yet.
 
-`voxelcore/assetcandidate.h` is a newly added, **not yet integrated** helper for composition-clipped VXA extraction, canonical bounds and apron-aware page intersection. Its output has canonical yaw baked into voxel indices and therefore requires an anchor-translation-only actor transform. Source provenance must retain original quarter yaw. The helper has not yet received a focused compiled test.
+`voxelcore/assetcandidate.h` is a newly added, **not yet integrated** helper for composition-clipped VXA extraction, canonical bounds and apron-aware page intersection. Its output has canonical yaw baked into voxel indices and therefore requires an anchor-translation-only actor transform. Source provenance must retain original quarter yaw. Focused compiled tests now cover overlap suppression, composition clipping, all quarter yaws, capacity rejection and negative-coordinate page aprons. It remains unintegrated into production.
 
 Next steps:
 
@@ -64,3 +64,6 @@ Local integration `a347e83` preserves creature checkpoint `5303d99` and persiste
 Follow-up CI repairs include unique environment-local symbols, explicit frontend switch classification, narrow reviewed floating API boundaries (integer derivation remains required), portable signed karst division, a missing `<cmath>` include, and explicit SciPy/Numba bake-test dependencies. The stale terrain hash was verified against the approved `660f041` pond-floor change: reverting only 0.5 m to 1.0 m reproduces the old hash. The version/payload test passes with both old and current pins. Six independent checkpoint-store tests pass. Full new terrain numerical tests have not been run locally because pytest/Numba are not installed in this runtime.
 
 An hourly continuation is active in this task for twelve runs: `finish-environment-framework-overnight`. It resumes the scoped work and updates evidence, preserving other active tasks. Disable it when the environment framework is complete. It is not a claim that any remaining feature has already shipped.
+
+Isolated integration verification at 72866e1: Unreal Editor Development build succeeded (160.21 s), using a freshly compiled voxelcore.lib. All three focused CTest targets pass: ownership/candidate extraction, sparse storage, and exception-disabled sparse storage. Float-boundary, unity-collision, frontend classification and shader UB lints pass. The independent checkout is D:/voxelsim/.scratch/environment-verification; the shared Asset Forge branch and its anatomy pilot files remain untouched. Object automation is running against the isolated modules; no runtime result is claimed yet.
+

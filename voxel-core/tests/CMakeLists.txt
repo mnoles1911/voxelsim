@@ -59,6 +59,7 @@ add_executable(vxc_tests
   test_craftpersist.cpp
   test_craftcost.cpp
   test_assetownership.cpp
+  test_assetcandidate.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
@@ -156,7 +157,7 @@ endif()
 add_test(NAME vxc_tests COMMAND vxc_tests)
 
 # Focused publication/provenance checks without the unrelated fluid suite.
-add_executable(vxc_assetownership_tests test_main.cpp test_assetownership.cpp)
+add_executable(vxc_assetownership_tests test_main.cpp test_assetownership.cpp test_assetcandidate.cpp)
 target_link_libraries(vxc_assetownership_tests PRIVATE voxelcore Threads::Threads)
 if(NOT MSVC)
   target_compile_options(vxc_assetownership_tests PRIVATE -Wall -Wextra -Werror)
