@@ -1,39 +1,15 @@
-# Bengal tiger candidate
+# Tiger: static pilot review
 
-Saved draft: `bengal_tiger_anatomy_pilot-0001`. This is a pilot candidate, not
-user approval or runtime completion.
+Status: ready for user set review. All cubes are 12.5 mm.
 
-Source and modifications are in `attribution.json`. The walking master has a
-short broad muzzle, rounded ears, substantial shoulders and forepaws, striped
-flanks, pale underside and ringed tail. These features were checked against
-[Animal Diversity Web's physical description](https://animaldiversity.org/accounts/Panthera_tigris/).
-That account's historical taxonomy and broad species size range are not used as
-Bengal-specific measurement evidence. The source does not identify a subspecies.
+Muscular shoulders, long ringed tail, broad paws, rounded ears and bilateral stripes. Both sides and underside inspected.
 
-The first voxel pass enlarged individual whiskers into a grey moustache and
-left detached cells. `refine_tiger_master.py` removes 32 inspected whisker mesh
-components, preserving teeth, eyes, claws, ears and tail. The refined study has
-210,538 occupied voxels, 26,916 surface voxels, one connected component and
-12.5 mm pitch. Six unlit projections and the first oblique render were visually
-inspected; the muzzle is cleaner and stripe boundaries remain legible.
+The source identifies a tiger, not a verified Bengal specimen. Pose bounds include a raised head and lifted paws; they are not shoulder height.
 
-Remaining review: measure shoulder and body landmarks against Bengal-specific
-evidence; inspect the expanded opposite-side obliques and actual Forge viewport;
-compare physical scale with the wolf. Bounding dimensions are 2.675 x 0.5125 x
-1.3875 m, including the raised head and walking pose. These are not shoulder
-height or a biological nose-to-tail measurement.
+Biological reference: [Tiger species account](https://animaldiversity.org/accounts/Panthera_tigris/). This constrains visual plausibility; it is not a measured registration of the source mesh. See attribution.json for the mesh license and modifications.
 
-Reproduction from the cached licensed source:
+Orthographic and oblique reviews: `out/creature-reconstruction/bengal-tiger-refined`. Saved model: `bengal_tiger_anatomy_pilot/bengal_tiger_anatomy_pilot-0001`.
 
-1. Blender `prepare_creature_master.py`: source UID in attribution, output
-   `bengal-tiger-master/master.glb`, length argument `2.7`.
-2. Python `refine_tiger_master.py`.
-3. Python `voxelize_reference_mesh.py` on `clean-master.glb`, output
-   `bengal-tiger-refined`, `--long-axis 0 --length-m 2.658254861831665`.
-4. Blender `inspect_mesh_blender.py` on the study's `colored-voxels.glb`.
-5. Python `install_creature_pilot.py` with that study, species identifier,
-   `quadruped` and this attribution file. Installer refuses existing entries.
+Validation: one connected component; exact surface/RGB alignment; 12.5 mm VXA; RGB payload byte equality. Bounds (including pose, fins or antlers): 2.675 × 0.5125 × 1.388 m. Occupied cubes: 210,538.
 
-Installer checks passed: connected geometry, surface alignment, VXA occupancy
-and pitch roundtrip, and byte-exact RGB viewport payload. Full RGB is a Forge
-sidecar; engine VXA appearance and animation remain separate.
+Static appearance only. Rigging, animation, collisions, LODs and game integration remain separate. Technical checks do not confer visual approval.

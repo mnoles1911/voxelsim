@@ -85,3 +85,23 @@ then consider expanding to the remaining library, incorporating review lessons.
   `--fill-union` is explicit and cannot repair a missing exterior surface.
 - HTTP 429 means incomplete discovery. Stop requests and report deferred records;
   do not interpret an empty shortlist as absence of licensed sources.
+
+
+## Completed pilot lessons
+
+All eight static pilots are now delivered for set review; see pilot-manifest.json.
+A museum scan can preserve anatomy while having a fused perch, distorted feet or
+preservation colors. Remove supports with explicit anatomical masks and document any
+reconstructed anatomy. Never treat largest-component selection as anatomical repair.
+The raven and eagle have authored articulated feet; the trout has authored living colors.
+
+At 12.5 mm a 0.65 m fish is only about 52 cubes long. Fine scales, spots, toes and
+feather barbs cannot be literal photographic detail. Keep silhouette and diagnostic
+landmarks first, then use restrained color. Scaling a specimen does not establish
+adult morphometrics. Generic mesh species/subspecies labels require explicit caveats.
+
+Constant PBR materials can return one RGB(A) value instead of one per UV. Broadcast
+that result and bypass expensive nearest-triangle texture queries when every mesh
+shares the same constant material. For complex textured scans, small query batches
+bound nearest-surface memory. Preserve RGB sidecars: palette VXA alone is not the
+reviewed full-color appearance. Appearance approval and runtime publication are distinct.

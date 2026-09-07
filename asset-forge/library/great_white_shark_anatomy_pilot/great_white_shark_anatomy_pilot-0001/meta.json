@@ -1,0 +1,33 @@
+{
+  "id": "great_white_shark_anatomy_pilot-0001",
+  "species": "great_white_shark_anatomy_pilot",
+  "kind": "fish",
+  "seed": 1,
+  "imported": true,
+  "source_format": "reviewed reference mesh; RGB voxel study",
+  "spec_hash": "06ca74e66d3aa22a",
+  "stats": {
+    "height_m": 1.625,
+    "voxels": 399955
+  },
+  "problems": [],
+  "vox_models": 2,
+  "static_model_complete": true,
+  "review_status": "ready_for_set_review",
+  "visual_approved": false,
+  "runtime_ready": false,
+  "animation": "not rigged",
+  "appearance": "RGB surface sidecar",
+  "voxel_mm": 12.5,
+  "dimensions_m": [
+    4.2125,
+    2.1375,
+    1.625
+  ],
+  "validation": [
+    "one connected component",
+    "VXA roundtrip",
+    "RGB payload byte equality"
+  ],
+  "review_limitations": "Source proportions retained; sex and individual morphometrics are unverified. Fin edges retain the cubic lattice."
+}
