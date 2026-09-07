@@ -31545,10 +31545,9 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// usable via TryDig/TryPlace/CarveSphere regardless.
 	if (InWorld.GetNetMode() == NM_DedicatedServer)
 	{
-		UE_LOG(LogVoxelStream, Log,
-		       TEXT("Voxel streaming DISABLED (seed %llu): NM_DedicatedServer has no viewport -- only the authoritative ")
-		       TEXT("World + edit log run here."),
-		       (unsigned long long)Seed);
+		// Restore authority before skipping rendering. The front-end split must
+		// not leave a headless server permanently outside session admission.
+		StartWorldSession(GetWorldSaveFilePath(Seed));
 		return;
 	}
 

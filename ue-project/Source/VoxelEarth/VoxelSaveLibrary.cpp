@@ -280,7 +280,22 @@ bool Write(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIs
 }
 bool WriteAsync(const UVoxelWorldSubsystem& World,const FString& DisplayName,bool bIsAutosave,const FTransform& PlayerTransform,int32 PlayTimeSeconds,TFunction<void(bool)> Completion)
 {
-	check(IsInGameThread());if(VoxelSaveJobs::IsBusy()){UE_LOG(LogVoxelEdit,Warning,TEXT("SaveGame: another save is still running."));return false;}
+	check(IsInGameThread());
+    if(VoxelSaveJobs::IsBusy())
+    {
+        if(bIsAutosave) return false;
+        TWeakObjectPtr<UWorld> Weak=World.GetWorld();
+        const FGuid Id=VoxelSessionCheckpoint::WorldId(World.GetWorld());
+        return VoxelSaveJobs::Defer([Weak,Id,DisplayName,PlayerTransform,PlayTimeSeconds,Completion=MoveTemp(Completion)]() mutable {
+            auto W=Weak.Get(); auto Terrain=W?W->GetSubsystem<UVoxelWorldSubsystem>():nullptr;
+            if(!Terrain || !VoxelSessionCheckpoint::Ready(W) || VoxelSessionCheckpoint::WorldId(W)!=Id || VoxelSessionCheckpoint::FinalSaveAttempted(W))
+            { if(Completion) Completion(false); return; }
+            // Keep the completion available if admission fails before Submit.
+            auto Callback=MakeShared<TFunction<void(bool)>>(MoveTemp(Completion));
+            if(!WriteAsync(*Terrain,DisplayName,false,PlayerTransform,PlayTimeSeconds,[Callback](bool Success){if(*Callback)(*Callback)(Success);}))
+                if(*Callback)(*Callback)(false);
+        });
+    }
 	const double Start=FPlatformTime::Seconds();FNamedSnapshot Named;
 	if(!PrepareNamed(World,DisplayName,bIsAutosave,PlayerTransform,PlayTimeSeconds,Named))return false;
 	VoxelSaveJobs::FSnapshot Snapshot;Snapshot.TerrainPath=WorldLogPath(Named.Slug);

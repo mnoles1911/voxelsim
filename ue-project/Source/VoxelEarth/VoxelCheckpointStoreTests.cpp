@@ -117,6 +117,10 @@ bool FVoxelCheckpointTransactionTest::RunTest(const FString&)
     TestEqual(TEXT("Gameplay recovered with terrain"),Recovered.TerrainPath,Before.TerrainPath);
     Simulation.Hydrology.Empty();
     TestFalse(TEXT("Empty domain cannot publish"),VoxelCheckpointStore::Commit(Complete,Terrain,Detached,FString(),-1,&Simulation));
+    const FString LongLogical=Directory/FString::ChrN(80,TCHAR('x'))/FString::ChrN(80,TCHAR('y'))/TEXT("world.vxlog");
+    TestTrue(TEXT("Publish beyond Windows MAX_PATH"),VoxelCheckpointStore::Commit(LongLogical,Terrain,Detached));
+    TestTrue(TEXT("Resolve long-path checkpoint"),VoxelCheckpointStore::Resolve(LongLogical,Current));
+    TestTrue(TEXT("Long-path publication is committed"),Current.bCheckpoint);
     return true;
 }
 #endif

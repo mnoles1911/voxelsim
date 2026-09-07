@@ -24,6 +24,20 @@ namespace VoxelSessionCheckpoint
 {
 namespace Detail
 {
+bool Relationships(const TArray<VoxelPlayerRecords::FRecord>& StagedPlayers,const TArray<VoxelGameplayActors::FRecord>& StagedActors)
+{
+    for(const auto& Actor:StagedActors)
+    {
+        if(!Actor.Owner.IsValid()) continue;
+        const auto Player=StagedPlayers.FindByPredicate([&](const auto& P){return P.Id==Actor.Owner;});
+        if(!Player) return false;
+        if((Actor.Kind==VoxelGameplayActors::EKind::Boat || Actor.Kind==VoxelGameplayActors::EKind::Glider) && Player->Vehicle!=Actor.Id) return false;
+    }
+    for(const auto& Player:StagedPlayers)
+        if(Player.Vehicle.IsValid() && !StagedActors.ContainsByPredicate([&](const auto& A){return A.Id==Player.Vehicle && A.Owner==Player.Id &&
+            (A.Kind==VoxelGameplayActors::EKind::Boat || A.Kind==VoxelGameplayActors::EKind::Glider);})) return false;
+    return true;
+}
 struct FSession { bool Ready=false, Failed=false, Final=false, SavePending=false; double SaveElapsed=0; FGuid WorldId=FGuid::NewGuid(); };
 TMap<TWeakObjectPtr<UWorld>, FSession> Sessions;
 struct FCleanup
@@ -102,6 +116,9 @@ bool Capture(UWorld* W, VoxelCheckpointStore::FSimulationPayload& Out)
     Gameplay->SetStringField(TEXT("players"),FBase64::Encode(PlayerBytes));
     TArray<uint8> ActorBytes;
     if(!VoxelGameplayActors::Capture(W,ActorBytes)) return false;
+    TArray<VoxelPlayerRecords::FRecord> Players; TArray<VoxelGameplayActors::FRecord> Actors;
+    if(!VoxelPlayerRecords::Decode(PlayerBytes,Players) || !VoxelGameplayActors::Decode(ActorBytes,Actors) ||
+        !Detail::Relationships(Players,Actors)) return false;
     Gameplay->SetStringField(TEXT("actors"),FBase64::Encode(ActorBytes));
     FString GameplayText;
     if (!FJsonSerializer::Serialize(Gameplay,TJsonWriterFactory<>::Create(&GameplayText))) return false;
@@ -143,16 +160,7 @@ bool Restore(UWorld* W,const FString& Logical,const VoxelCheckpointStore::FResol
             FString Actors; TArray<VoxelGameplayActors::FRecord> StagedActors;
             if(!Json->TryGetStringField(TEXT("actors"),Actors) || Actors.Len()>24*1024*1024 || !FBase64::Decode(Actors,ActorBytes) ||
                 !VoxelGameplayActors::Decode(ActorBytes,StagedActors) || !VoxelGameplayActors::ValidateContent(StagedActors)) return false;
-            for(const auto& Actor:StagedActors)
-            {
-                if(!Actor.Owner.IsValid()) continue;
-                const auto Player=StagedPlayers.FindByPredicate([&](const auto& P){return P.Id==Actor.Owner;});
-                if(!Player) return false;
-                if((Actor.Kind==VoxelGameplayActors::EKind::Boat || Actor.Kind==VoxelGameplayActors::EKind::Glider) && Player->Vehicle!=Actor.Id) return false;
-            }
-            for(const auto& Player:StagedPlayers)
-                if(Player.Vehicle.IsValid() && !StagedActors.ContainsByPredicate([&](const auto& A){return A.Id==Player.Vehicle && A.Owner==Player.Id &&
-                    (A.Kind==VoxelGameplayActors::EKind::Boat || A.Kind==VoxelGameplayActors::EKind::Glider);})) return false;
+            if(!Detail::Relationships(StagedPlayers,StagedActors)) return false;
         }
     }
     if (Checkpoint && Checkpoint->bSimulation)

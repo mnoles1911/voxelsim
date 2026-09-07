@@ -1,9 +1,13 @@
 #include "VoxelPlayerRecords.h"
+#include "VoxelDurableFile.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelWorldSubsystem.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelGameplayActors.h"
 #include "VoxelItem.h"
+#include "VoxelSaveLibrary.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "VoxelCharacterMovement.h"
 #include "VoxelSessionCheckpoint.h"
 #include "Engine/World.h"
@@ -116,11 +120,7 @@ bool Identity(UWorld* W,const FString& Token,FGuid& Id,FString& Issued)
         TUniquePtr<IFileHandle> File(FPlatformFileManager::Get().GetPlatformFile().OpenWrite(*Temp));
         if(!File || !File->Write(reinterpret_cast<const uint8*>(Utf8.Get()),Utf8.Length()) || !File->Flush(true)) return false;
     }
-#if PLATFORM_WINDOWS
-    return ::MoveFileExW(*FPaths::ConvertRelativePathToFull(Temp),*FPaths::ConvertRelativePathToFull(Path),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
-#else
-    return FPlatformFileManager::Get().GetPlatformFile().MoveFile(*Path,*Temp);
-#endif
+    return VoxelDurableFile::Publish(Temp,Path,true);
 }
 struct FCleanup
 {
@@ -193,6 +193,13 @@ int32 Credit(UWorld* W,const FGuid& Id,FName Item,int32 Count)
         { const int32 N=FMath::Min(Remaining,Def->MaxStack); Slot.ItemId=Item; Slot.Count=N; Remaining-=N; }
     return Count-Remaining;
 }
+APawn* ActivePawn(UWorld* W,const FGuid& Id)
+{
+    const auto State=Detail::States.Find(W);
+    if(State) for(const auto& Binding:State->Bindings)
+        if(Binding.Value==Id && Binding.Key.IsValid()) return Binding.Key->GetPawn();
+    return nullptr;
+}
 bool BindHost(AVoxelEarthPlayerController* PC)
 {
     if (!PC || !PC->HasAuthority() || !PC->IsLocalController() || !PC->GetInventory()) return false;
@@ -231,6 +238,20 @@ bool ApplyPawn(AVoxelEarthPlayerController* PC)
     }
     if(Record->Vehicle.IsValid() && !VoxelGameplayActors::BindVehicle(PC,Record->Vehicle)) return false;
     State.AppliedPawns.Add(Record->Id); return true;
+}
+void VehicleDestroyed(UWorld* W,const FGuid& Vehicle,const FVector& Position)
+{
+    if(!W || W->GetNetMode()==NM_Client || !Vehicle.IsValid()) return;
+    if(auto State=Detail::States.Find(W)) for(auto& Record:State->Records)
+        if(Record.Vehicle==Vehicle)
+        {
+            Record.Vehicle.Invalidate();
+            Record.Position=Position+FVector(0,0,200);
+            Record.Velocity=FVector::ZeroVector;
+            Record.Motion.Velocity=FVector::ZeroVector;
+            Record.Motion.Walk=false;
+            Record.HasPawn=true;
+        }
 }
 void Disconnect(AVoxelEarthPlayerController* PC)
 {
@@ -384,18 +405,38 @@ FString CredentialPath(AVoxelEarthPlayerController* PC,const FGuid& Id)
     if(!PC || !PC->IsLocalController() || PC->HasAuthority() || !Id.IsValid() || !PC->GetNetConnection() ||
         !PC->GetNetConnection()->IsEncryptionEnabled()) return FString();
     const FString Endpoint=PC->GetWorld()->URL.Host.ToLower()+TEXT(":")+FString::FromInt(PC->GetWorld()->URL.Port);
-    return FPaths::ProjectSavedDir()/TEXT("PlayerProfiles")/(HashToken(Endpoint+TEXT("/")+Id.ToString(EGuidFormats::Digits))+TEXT(".credential"));
+    FString Root=FPaths::ProjectSavedDir()/TEXT("PlayerProfiles"),Profile;
+    if(FParse::Value(FCommandLine::Get(),TEXT("VoxelPlayerProfile="),Profile))
+    {
+        if(!VoxelSave::IsValidSlug(Profile)) return FString();
+        Root/=Profile;
+    }
+    return Root/(HashToken(Endpoint+TEXT("/")+Id.ToString(EGuidFormats::Digits))+TEXT(".credential"));
+}
+bool ReadProfile(const FString& Path,FString& Token)
+{
+    TUniquePtr<IFileHandle> File(FPlatformFileManager::Get().GetPlatformFile().OpenRead(*Path));
+    ANSICHAR Bytes[65]={};
+    if(!File || File->Size()!=64 || !File->Read(reinterpret_cast<uint8*>(Bytes),64)) return false;
+    Token=UTF8_TO_TCHAR(Bytes); return Hex64(Token);
 }
 }
 bool ReadCredential(AVoxelEarthPlayerController* PC,const FGuid& Id,FString& Token)
 {
     Token.Reset(); const FString Path=Detail::CredentialPath(PC,Id); if(Path.IsEmpty()) return false;
     if(!IFileManager::Get().FileExists(*Path)) return true;
-    return IFileManager::Get().FileSize(*Path)==64 && FFileHelper::LoadFileToString(Token,*Path) && Detail::Hex64(Token);
+    return Detail::ReadProfile(Path,Token);
 }
 bool WriteCredential(AVoxelEarthPlayerController* PC,const FGuid& Id,const FString& Token)
 {
     const FString Path=Detail::CredentialPath(PC,Id); if(Path.IsEmpty() || !Detail::Hex64(Token)) return false;
+    FSystemWideCriticalSection Lock(TEXT("VoxelPlayerProfile-")+Detail::HashToken(FPaths::ConvertRelativePathToFull(Path).ToLower()));
+    if(!Lock.IsValid()) return false;
+    if(IFileManager::Get().FileExists(*Path))
+    {
+        FString Existing;
+        return Detail::ReadProfile(Path,Existing) && Existing==Token;
+    }
     if(!IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path),true)) return false;
     const FString Temp=Path+TEXT(".")+FGuid::NewGuid().ToString(EGuidFormats::Digits)+TEXT(".tmp");
     FTCHARToUTF8 Utf8(*Token);
@@ -403,10 +444,6 @@ bool WriteCredential(AVoxelEarthPlayerController* PC,const FGuid& Id,const FStri
         TUniquePtr<IFileHandle> File(FPlatformFileManager::Get().GetPlatformFile().OpenWrite(*Temp));
         if(!File || !File->Write(reinterpret_cast<const uint8*>(Utf8.Get()),Utf8.Length()) || !File->Flush(true)) return false;
     }
-#if PLATFORM_WINDOWS
-    return ::MoveFileExW(*FPaths::ConvertRelativePathToFull(Temp),*FPaths::ConvertRelativePathToFull(Path),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
-#else
-    return FPlatformFileManager::Get().GetPlatformFile().MoveFile(*Path,*Temp);
-#endif
+    return VoxelDurableFile::Publish(Temp,Path,true);
 }
 }

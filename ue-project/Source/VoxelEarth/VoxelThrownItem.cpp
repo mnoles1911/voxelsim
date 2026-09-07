@@ -859,7 +859,7 @@ void AVoxelThrownItem::TryProximityPickup()
 		// in your inventory before you have seen it land.
 		return;
 	}
-	AActor* T = Thrower.Get();
+	AActor* T = PersistentOwner.IsValid()?VoxelPlayerRecords::ActivePawn(GetWorld(),PersistentOwner):Thrower.Get();
 	if (!T)
 	{
 		return; // nobody to pick it up; the timer will deal with it

@@ -167,6 +167,8 @@ void AVoxelGlider::BeginPlay()
 
 void AVoxelGlider::EndPlay(const EEndPlayReason::Type Reason)
 {
+    if(Reason==EEndPlayReason::Destroyed)
+        VoxelPlayerRecords::VehicleDestroyed(GetWorld(),PersistentId,GetActorLocation());
 	// NEVER STRAND THE PLAYER -- the same rule AVoxelBoat::EndPlay states. A
 	// glider destroyed by anything other than its own landing path must still
 	// hand the pawn back before it goes. ONLY on Destroyed: on level
@@ -594,7 +596,6 @@ bool AVoxelGlider::Board(APlayerController* PC)
 	const auto Player=Cast<AVoxelEarthPlayerController>(PC);
 	if(!HasAuthority() || !Player || !VoxelPlayerRecords::IsBound(Player) ||
 		(PersistentPilot.IsValid() && PersistentPilot!=VoxelPlayerRecords::PlayerId(Player))) return false;
-	PersistentPilot=VoxelPlayerRecords::PlayerId(Player);
 	APawn* Previous = PC ? PC->GetPawn() : nullptr;
 	if (!PC || !Previous || Previous == this || StoredPawn.IsValid() || !bParked)
 	{
@@ -602,6 +603,7 @@ bool AVoxelGlider::Board(APlayerController* PC)
 	}
 
 	StoredPawn = Previous;
+	PersistentPilot=VoxelPlayerRecords::PlayerId(Player);
 	Driver = PC;
 
 	// The outgoing pawn is PARKED, not destroyed -- AVoxelBoat::Enter's rule,

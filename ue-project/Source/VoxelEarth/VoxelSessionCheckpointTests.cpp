@@ -7,6 +7,11 @@
 #include "VoxelAgentSubsystem.h"
 #include "VoxelPlayerRecords.h"
 #include "VoxelEarthPlayerController.h"
+#include "VoxelEarthFlyPawn.h"
+#include "VoxelThrownItem.h"
+#include "VoxelExplosive.h"
+#include "VoxelGameplayActors.h"
+#include "VoxelItem.h"
 #include "Engine/World.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/Engine.h"
@@ -23,6 +28,15 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelSessionCheckpointTest,"Voxel.Persistence.
     EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
 bool FVoxelSessionCheckpointTest::RunTest(const FString&)
 {
+    // Actor launch queries water/terrain. This fixture owns no streamed tile
+    // residency, so construct explicit synthetic worlds rather than querying
+    // unbaked production coordinates or disabling the fine-tier safety gate.
+    struct FCommandLineScope
+    {
+        FString Saved=FCommandLine::Get();
+        FCommandLineScope(){FCommandLine::Append(TEXT(" -VoxelSyntheticTerrain"));}
+        ~FCommandLineScope(){FCommandLine::Set(*Saved);}
+    } CommandLineScope;
     // NullRHI strips the bathymetry render resource. This fixture exercises
     // scalar persistence, with exactly one known rendering diagnostic per world.
     if (FParse::Param(FCommandLine::Get(),TEXT("nullrhi")))
@@ -60,6 +74,17 @@ bool FVoxelSessionCheckpointTest::RunTest(const FString&)
         if(Count>0) SourceInventory->TryRemoveFromSlot(I,Count);
     }
     SourceInventory->SetSelectedSlot(3);
+    auto SourcePawn=Source.W->SpawnActor<AVoxelEarthFlyPawn>();
+    if(!TestNotNull(TEXT("Source player pawn"),SourcePawn)) return false;
+    SourcePlayer->Possess(SourcePawn);
+    SourcePawn->SetActorLocation(FVector(-12345,54321,500000));
+    FVoxelPlayerMotion Motion; Motion.Walk=false; Motion.Velocity=FVector(31,-12,7); Motion.Crouched=true;
+    Motion.WalkSpeed=1; Motion.FlySpeed=2; Motion.GroundAge=0.07; Motion.JumpRemaining=0.1;
+    TestTrue(TEXT("Set actual player mover state"),SourcePawn->RestoreMotion(Motion));
+    TestNotNull(TEXT("Owned item in flight"),AVoxelThrownItem::SpawnAndThrow(Source.W,FVector(0,0,500000),FVector(10,20,30),SourcePlayer,VoxelItemIds::ThrowCube30(),1));
+    auto Charge=Source.W->SpawnActor<AVoxelExplosive>();
+    if(!TestNotNull(TEXT("Live charge"),Charge)) return false;
+    Charge->SetActorLocation(FVector(50,20,500000)); Charge->Launch(FVector(30,10,20));
     TestEqual(TEXT("Agents exist before checkpoint"),Source.W->GetSubsystem<UVoxelAgentSubsystem>()->SpawnSwarmAtOffset(2,FVector::ZeroVector,FVector(1,0,0),100,0),2);
     TArray<uint8> BaselineWater,BaselineHydro; double Remainder=0; bool Implicit=false;
     TestTrue(TEXT("Capture defaults"),Water->CaptureCheckpoint(BaselineWater,BaselineHydro,Remainder,Implicit));
@@ -92,6 +117,21 @@ bool FVoxelSessionCheckpointTest::RunTest(const FString&)
     TestTrue(TEXT("Admit restored player"),VoxelPlayerRecords::BindHost(TargetPlayer));
     TestEqual(TEXT("Empty inventory is not reseeded"),TargetPlayer->GetInventory()->GetSlot(0).Count,0);
     TestEqual(TEXT("Selected slot restored"),TargetPlayer->GetInventory()->GetSelectedSlot(),3);
+    auto TargetPawn=Target.W->SpawnActor<AVoxelEarthFlyPawn>();
+    if(!TestNotNull(TEXT("Restored player pawn"),TargetPawn)) return false;
+    TargetPlayer->Possess(TargetPawn);
+    TestTrue(TEXT("Apply restored player motion"),VoxelPlayerRecords::ApplyPawn(TargetPlayer));
+    FVoxelPlayerMotion RestoredMotion; TestTrue(TEXT("Read restored mover"),TargetPawn->CaptureMotion(RestoredMotion));
+    TestEqual(TEXT("Fly velocity restored"),RestoredMotion.Velocity,Motion.Velocity);
+    TestEqual(TEXT("Crouch restored"),RestoredMotion.Crouched,Motion.Crouched);
+    TestEqual(TEXT("Fly speed restored"),RestoredMotion.FlySpeed,Motion.FlySpeed);
+    TestEqual(TEXT("Ground timing restored"),RestoredMotion.GroundAge,Motion.GroundAge);
+    TestEqual(TEXT("Jump buffer restored"),RestoredMotion.JumpRemaining,Motion.JumpRemaining);
+    TestEqual(TEXT("Player position restored"),TargetPawn->GetActorLocation(),SourcePawn->GetActorLocation());
+    TArray<uint8> ActorBytes; TArray<VoxelGameplayActors::FRecord> ActorRecords;
+    TestTrue(TEXT("Recapture restored live actors"),VoxelGameplayActors::Capture(Target.W,ActorBytes));
+    TestTrue(TEXT("Read restored live actors"),VoxelGameplayActors::Decode(ActorBytes,ActorRecords));
+    TestEqual(TEXT("Item and charge both restored"),ActorRecords.Num(),2);
     VoxelCheckpointStore::FSimulationPayload Reloaded;
     TestTrue(TEXT("Recapture restored world"),VoxelSessionCheckpoint::Capture(Target.W,Reloaded));
     TestTrue(TEXT("Water round trip"),Reloaded.Water==Snapshot.Water);
@@ -124,6 +164,7 @@ bool FVoxelSessionCheckpointTest::RunTest(const FString&)
         TargetSky->Tick(0.25f);
         TargetSky->CaptureEpochSeconds(Epoch);
         TestEqual(TEXT("Hidden sky advances clock"),Epoch,500.5);
+        TestEqual(TEXT("Water/weather see the hidden clock"),TargetSky->GetSkyState().EpochSeconds,500.5);
         Enabled->Set(OldValue,ECVF_SetByCode);
         Enabled->ClearFlags(ECVF_SetByMask);
         Enabled->SetFlags(EConsoleVariableFlags(OldFlags & ECVF_SetByMask));
@@ -140,6 +181,26 @@ bool FVoxelSessionCheckpointTest::RunTest(const FString&)
     AgentBytes.Add(0); TArray<FVoxelAgent> InvalidAgents;
     TestFalse(TEXT("Agent trailing bytes refused"),UVoxelAgentSubsystem::DecodeCheckpoint(AgentBytes,InvalidAgents));
     TestEqual(TEXT("Invalid agent decode publishes no records"),InvalidAgents.Num(),0);
+    TArray<uint8> OfflineBytes;
+    TestTrue(TEXT("Capture player for offline vehicle fixture"),VoxelPlayerRecords::Capture(Source.W,OfflineBytes));
+    const FGuid LostVehicle=FGuid::NewGuid();
+    FUTF8ToTCHAR OfflineText(reinterpret_cast<const ANSICHAR*>(OfflineBytes.GetData()),OfflineBytes.Num());
+    FString OfflineJson(OfflineText.Length(),OfflineText.Get());
+    OfflineJson.ReplaceInline(*FGuid().ToString(EGuidFormats::Digits),*LostVehicle.ToString(EGuidFormats::Digits));
+    FTCHARToUTF8 OfflineUtf8(*OfflineJson);
+    OfflineBytes.Reset(); OfflineBytes.Append(reinterpret_cast<const uint8*>(OfflineUtf8.Get()),OfflineUtf8.Length());
+    TestTrue(TEXT("Install offline reserved vehicle record"),VoxelPlayerRecords::Restore(Refused.W,OfflineBytes));
+    VoxelPlayerRecords::VehicleDestroyed(Refused.W,LostVehicle,FVector(100,200,300));
+    TestTrue(TEXT("Capture released offline record"),VoxelPlayerRecords::Capture(Refused.W,OfflineBytes));
+    TArray<VoxelPlayerRecords::FRecord> OfflineRecords;
+    TestTrue(TEXT("Decode released offline record"),VoxelPlayerRecords::Decode(OfflineBytes,OfflineRecords));
+    if(TestEqual(TEXT("One offline player retained"),OfflineRecords.Num(),1))
+    {
+        TestFalse(TEXT("Destroyed vehicle reference cleared"),OfflineRecords[0].Vehicle.IsValid());
+        TestEqual(TEXT("Offline player retained at destruction location"),OfflineRecords[0].Position,FVector(100,200,500));
+        TestFalse(TEXT("Offline player can fly clear of lost hull"),OfflineRecords[0].Motion.Walk);
+        TestEqual(TEXT("Destroyed vehicle momentum cleared"),OfflineRecords[0].Velocity,FVector::ZeroVector);
+    }
     VoxelSessionCheckpoint::Fail(Source.W);
     TestFalse(TEXT("Failed session cannot publish under another name"),VoxelSessionCheckpoint::Capture(Source.W,Reloaded));
     return true;

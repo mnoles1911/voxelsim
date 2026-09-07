@@ -3463,7 +3463,7 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 
 	if (!VoxelSky::IsEnabled())
 	{
-		// One frame of work to undo the feature, then IsTickable goes false.
+		// Undo rendering once, but keep the public simulation clock available to water and weather.
 		if (bHasState)
 		{
 			ApplyStaticRigPose();
@@ -3471,6 +3471,8 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 			bHasState = false;
 			UE_LOG(LogVoxelSky, Log, TEXT("voxel.Sky.Enabled 0: rig returned to the static pre-W4 pose."));
 		}
+		Impl->State.EpochSeconds=Impl->EpochSeconds;
+		Impl->State.bClockRunning=TimeScale!=0;
 		return;
 	}
 

@@ -1,4 +1,5 @@
 #include "VoxelCheckpointStore.h"
+#include "VoxelDurableFile.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelSaveGuard.h"
 #include "VoxelEarth.h"
@@ -47,12 +48,7 @@ TArray<uint8> Utf8(const FString& String)
 bool Publish(const FString& From, const FString& To)
 {
     // A unique commit record is the publication point. No replacement/delete window.
-#if PLATFORM_WINDOWS
-    return ::MoveFileExW(*FPaths::ConvertRelativePathToFull(From),
-        *FPaths::ConvertRelativePathToFull(To), MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    return FPlatformFileManager::Get().GetPlatformFile().MoveFile(*To, *From);
-#endif
+    return VoxelDurableFile::Publish(From,To,false);
 }
 void Commits(const FString& Path, TArray<FString>& Names)
 {
