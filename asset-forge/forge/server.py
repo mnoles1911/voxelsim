@@ -31,11 +31,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import parts as partslib
+from .server_version import snapshot as server_snapshot
 from . import (biomes as biomelib, categories as catlib, contact,
                kinds as kindlib, materials, pipeline,
                render, spec as specmod, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
+RUNNING_VERSION = server_snapshot()
 # The React frontend (web/dist, built by `npm run build` in web/) took over
 # from the hand-written page in forge/web on 2026-08-18. The old page is kept
 # as a fallback ONLY for a checkout that has never built the app, so the
@@ -770,6 +772,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": traceback.format_exc(limit=4)}, 500)
 
     def _route_get(self, path: str, q: dict) -> None:
+        if path == "/api/server-version":
+            return self._json(RUNNING_VERSION)
         if path == "/":
             return self._static("index.html")
         if path.startswith("/static/"):
