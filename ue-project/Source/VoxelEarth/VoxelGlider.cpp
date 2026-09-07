@@ -1,4 +1,8 @@
 #include "VoxelGlider.h"
+#include "VoxelGameplayActors.h"
+#include "VoxelPlayerRecords.h"
+#include "VoxelEarthPlayerController.h"
+#include "VoxelSessionCheckpoint.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/InputComponent.h"
@@ -84,6 +88,7 @@ bool ClearanceAboveGround(const UWorld* World, const FVector& P, double& OutClea
 
 AVoxelGlider::AVoxelGlider()
 {
+	bReplicates=true; SetReplicateMovement(true);
 	PrimaryActorTick.bCanEverTick = true;
 
 	AutoPossessPlayer = EAutoReceiveInput::Disabled;
@@ -128,7 +133,7 @@ void AVoxelGlider::BeginPlay()
 
 	if (Body)
 	{
-		Body->AssetName = CVarVoxelGliderAsset.GetValueOnGameThread();
+		if(!bCheckpointContent) Body->AssetName = CVarVoxelGliderAsset.GetValueOnGameThread();
 		Body->Build();
 		const FBox B = Body->GetLocalBoundsUU();
 		if (B.IsValid)
@@ -157,6 +162,7 @@ void AVoxelGlider::BeginPlay()
 	       VoxelGliderTuning::CD0, VoxelGliderTuning::InducedK,
 	       (Body && !Body->IsPlaceholder()) ? *Body->GetResolvedPath() : TEXT("PLACEHOLDER"),
 	       Body ? Body->GetInstanceCount() : 0, Body ? Body->GetPitchUU() * 10.0 : 0.0);
+	VoxelGameplayActors::FinishRestore(this);
 }
 
 void AVoxelGlider::EndPlay(const EEndPlayReason::Type Reason)
@@ -175,6 +181,8 @@ void AVoxelGlider::EndPlay(const EEndPlayReason::Type Reason)
 
 void AVoxelGlider::Tick(float DeltaSeconds)
 {
+	VoxelGameplayActors::FinishRestore(this);
+	if(!HasAuthority() || !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaSeconds);
 	if (bFinished || DeltaSeconds <= 0.f)
 	{
@@ -447,6 +455,7 @@ bool AVoxelGlider::CheckWater()
 
 void AVoxelGlider::ReturnPilot(const FVector& PilotWorldPos)
 {
+	PersistentPilot.Invalidate();
 	if (bFinished)
 	{
 		return;
@@ -582,6 +591,10 @@ bool AVoxelGlider::TryBoardNearest(APlayerController* PC)
 
 bool AVoxelGlider::Board(APlayerController* PC)
 {
+	const auto Player=Cast<AVoxelEarthPlayerController>(PC);
+	if(!HasAuthority() || !Player || !VoxelPlayerRecords::IsBound(Player) ||
+		(PersistentPilot.IsValid() && PersistentPilot!=VoxelPlayerRecords::PlayerId(Player))) return false;
+	PersistentPilot=VoxelPlayerRecords::PlayerId(Player);
 	APawn* Previous = PC ? PC->GetPawn() : nullptr;
 	if (!PC || !Previous || Previous == this || StoredPawn.IsValid() || !bParked)
 	{
@@ -610,6 +623,7 @@ bool AVoxelGlider::Board(APlayerController* PC)
 
 void AVoxelGlider::ExitToStoredPawn()
 {
+	PersistentPilot.Invalidate();
 	using namespace VoxelGliderTuning;
 
 	if (!bParked)

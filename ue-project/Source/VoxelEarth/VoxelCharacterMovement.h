@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "VoxelPlayerMotion.h"
 #include "Components/ActorComponent.h"
 #include "VoxelMovementTuning.h"
 #include "VoxelCharacterMovement.generated.h"
@@ -65,6 +66,8 @@ public:
 	// Called when the pawn enters or leaves walk mode so stale state never
 	// leaks across a mode toggle.
 	void ResetState();
+    void CaptureMotion(FVoxelPlayerMotion& Out) const;
+    bool RestoreMotion(const FVoxelPlayerMotion& State);
 
 	// Stands up unconditionally, skipping the CanStandAt check, and moves the
 	// owner to match. ONLY valid where collision does not apply -- specifically

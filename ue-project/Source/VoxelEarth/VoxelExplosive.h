@@ -7,6 +7,7 @@
 
 class UStaticMeshComponent;
 class UProjectileMovementComponent;
+namespace VoxelGameplayActors { struct FAdapter; }
 
 // Brief camera kick on detonation (m1-plan.md "Explosives v1" row: "add a
 // brief camera shake"). A perlin-noise rotation/FOV shake (EngineCameras
@@ -67,6 +68,8 @@ public:
 	static constexpr double BlastRadiusVarianceUU = 25.0; // +-0.25 m per charge
 
 private:
+	friend struct VoxelGameplayActors::FAdapter;
+	FGuid PersistentId=FGuid::NewGuid();
 	void Detonate();
 
 	// Per-tick voxel-space collision. UProjectileMovementComponent resolves

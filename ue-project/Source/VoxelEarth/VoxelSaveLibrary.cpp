@@ -38,17 +38,21 @@ FString SavesRoot()
 	return FPaths::ProjectSavedDir() / TEXT("SaveGames");
 }
 
-// The slug that this session's saves belong to. Deliberately process-global
-// rather than a member of anything: it outlives the menu widget that sets it
-// and is read by the world subsystem's shutdown path, and threading it through
-// both would mean giving the world subsystem a dependency on the save layer.
-FString GActiveSlug;
+struct FSlotBinding { FString Slug; FGuid Epoch=FGuid::NewGuid(); };
+TMap<TWeakObjectPtr<const UWorld>, FSlotBinding> ActiveSlots;
+struct FSlotCleanup
+{
+    FDelegateHandle Handle;
+    FSlotCleanup() { Handle=FWorldDelegates::OnPreWorldFinishDestroy.AddLambda([](UWorld* World){ActiveSlots.Remove(World);}); }
+    ~FSlotCleanup() { FWorldDelegates::OnPreWorldFinishDestroy.Remove(Handle); }
+} SlotCleanup;
 
 // Reads meta.json. Returns false on anything unreadable rather than
 // half-populating -- a save row built from a corrupt file would advertise a
 // world that will not open.
 bool ReadMeta(const FString& Slug, VoxelSave::FSaveInfo& Out)
 {
+    if (!VoxelSave::IsValidSlug(Slug)) return false;
 	VoxelCheckpointStore::FResolved Resolved;
 	if (!VoxelCheckpointStore::Resolve(VoxelSave::WorldLogPath(Slug), Resolved)) return false;
 	const FString Path = Resolved.MetadataPath;
@@ -109,14 +113,23 @@ bool ReadMeta(const FString& Slug, VoxelSave::FSaveInfo& Out)
 
 namespace VoxelSave
 {
+bool IsValidSlug(const FString& Slug)
+{
+    if (Slug.IsEmpty() || Slug.Len()>128) return false;
+    for (TCHAR C:Slug) if (!(FChar::IsAlnum(C) || C==TEXT('_') || C==TEXT('-'))) return false;
+    const FString Lower=Slug.ToLower();
+    if (Lower==TEXT("con") || Lower==TEXT("prn") || Lower==TEXT("aux") || Lower==TEXT("nul") ||
+        (Lower.Len()==4 && (Lower.StartsWith(TEXT("com")) || Lower.StartsWith(TEXT("lpt"))) && Lower[3]>=TEXT('1') && Lower[3]<=TEXT('9'))) return false;
+    return true;
+}
 FString SaveDirectory(const FString& Slug)
 {
-	return VoxelSaveDetail::SavesRoot() / Slug;
+    return IsValidSlug(Slug)?VoxelSaveDetail::SavesRoot()/Slug:FString();
 }
 
 FString WorldLogPath(const FString& Slug)
 {
-	return SaveDirectory(Slug) / VoxelSaveDetail::kWorldFile;
+    return IsValidSlug(Slug)?SaveDirectory(Slug)/VoxelSaveDetail::kWorldFile:FString();
 }
 
 FString Slugify(const FString& DisplayName)
@@ -172,12 +185,13 @@ TArray<FSaveInfo> List()
 	return Out;
 }
 
-struct FNamedSnapshot { FString Slug,Name,Json; bool Autosave=false; };
+struct FNamedSnapshot { FString Slug,Name,Json; bool Autosave=false; TWeakObjectPtr<const UWorld> World; FGuid Epoch; };
 bool PrepareNamed(const UVoxelWorldSubsystem& World, const FString& DisplayName, bool bIsAutosave,
-           const FTransform& PlayerTransform, int32 PlayTimeSeconds,FNamedSnapshot& Out)
+           const FTransform& PlayerTransform, int32 PlayTimeSeconds,FNamedSnapshot& Out,const FString& ForcedSlug=FString())
 {
 	const FString Name = DisplayName.TrimStartAndEnd().IsEmpty() ? TEXT("Untitled") : DisplayName.TrimStartAndEnd();
-	FString Slug = Slugify(Name);
+	FString Slug = ForcedSlug.IsEmpty()?Slugify(Name):ForcedSlug;
+    if (!IsValidSlug(Slug)) return false;
 
 	// Collisions get a suffix rather than a silent overwrite. Overwriting IS
 	// wanted when the player saves over their own file, which they do by
@@ -186,7 +200,7 @@ bool PrepareNamed(const UVoxelWorldSubsystem& World, const FString& DisplayName,
 	{
 		FSaveInfo Existing;
 		int32 Attempt = 2;
-		while (VoxelSaveDetail::ReadMeta(Slug, Existing) && Existing.DisplayName != Name && Attempt < 1000)
+		while (ForcedSlug.IsEmpty() && VoxelSaveDetail::ReadMeta(Slug, Existing) && Existing.DisplayName != Name && Attempt < 1000)
 		{
 			Slug = Slugify(Name) + FString::Printf(TEXT("-%d"), Attempt++);
 		}
@@ -237,13 +251,20 @@ bool PrepareNamed(const UVoxelWorldSubsystem& World, const FString& DisplayName,
 	}
 
 	Out={Slug,Name,MoveTemp(Json),bIsAutosave};
+    Out.World=World.GetWorld();
+    Out.Epoch=VoxelSaveDetail::ActiveSlots.FindOrAdd(World.GetWorld()).Epoch;
 	return true;
 }
 
 void FinishNamed(const FNamedSnapshot& Snapshot,bool Success)
 {
 	if(!Success){UE_LOG(LogVoxelEdit,Error,TEXT("SaveGame '%s': save failed; completion was not reported."),*Snapshot.Slug);return;}
-	VoxelSaveDetail::GActiveSlug=Snapshot.Slug;
+    auto Binding=VoxelSaveDetail::ActiveSlots.Find(Snapshot.World);
+    if (Snapshot.World.IsValid() && Binding && Binding->Epoch==Snapshot.Epoch)
+    {
+        Binding->Slug=Snapshot.Slug;
+        VoxelSessionCheckpoint::NotifySaved(Snapshot.World.Get());
+    }
 	UE_LOG(LogVoxelEdit,Log,TEXT("SaveGame '%s': completed (%s)."),*Snapshot.Slug,Snapshot.Autosave?TEXT("autosave"):TEXT("named"));
 	if(Snapshot.Autosave)PruneAutosaves();
 }
@@ -272,7 +293,10 @@ bool WriteAsync(const UVoxelWorldSubsystem& World,const FString& DisplayName,boo
 
 bool Delete(const FString& Slug)
 {
+    if (!IsValidSlug(Slug)) return false;
 	if(VoxelSaveJobs::IsBusy()){UE_LOG(LogVoxelEdit,Warning,TEXT("DeleteSave: wait for the active save to finish."));return false;}
+    for (const auto& Binding:VoxelSaveDetail::ActiveSlots)
+        if (Binding.Key.IsValid() && Binding.Value.Slug.Equals(Slug,ESearchCase::IgnoreCase)) return false;
 	const FString Directory = SaveDirectory(Slug);
 	if (!IFileManager::Get().DirectoryExists(*Directory))
 	{
@@ -280,10 +304,6 @@ bool Delete(const FString& Slug)
 	}
 	const bool bOk = IFileManager::Get().DeleteDirectory(*Directory, /*RequireExists=*/false, /*Tree=*/true);
 	UE_LOG(LogVoxelEdit, Log, TEXT("DeleteSave '%s': %s."), *Slug, bOk ? TEXT("removed") : TEXT("FAILED"));
-	if (bOk && VoxelSaveDetail::GActiveSlug == Slug)
-	{
-		VoxelSaveDetail::GActiveSlug.Reset();
-	}
 	return bOk;
 }
 
@@ -327,14 +347,64 @@ int64 SecondsSinceLastSave()
 	return FMath::Max<int64>(0, FDateTime::UtcNow().ToUnixTimestamp() - Saves[0].UnixTime);
 }
 
-const FString& GetActiveSlug()
+FString GetActiveSlug(const UWorld* World)
 {
-	return VoxelSaveDetail::GActiveSlug;
+    const auto Binding=VoxelSaveDetail::ActiveSlots.Find(World);
+    return Binding?Binding->Slug:FString();
 }
 
-void SetActiveSlug(const FString& Slug)
+FString CreateWorldSlot(UWorld* World)
 {
-	VoxelSaveDetail::GActiveSlug = Slug;
+    if (!World || World->GetNetMode()==NM_Client) return FString();
+    const FString Slug=TEXT("world-")+FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    SetActiveSlug(World,Slug); return Slug;
+}
+
+bool PrepareActive(const UVoxelWorldSubsystem& World,FNamedSnapshot& Out)
+{
+    const FString Slug=GetActiveSlug(World.GetWorld());
+    if (Slug.IsEmpty()) return false;
+    FSaveInfo Existing;
+    const bool HasMetadata=VoxelSaveDetail::ReadMeta(Slug,Existing);
+    const auto PC=World.GetWorld()?World.GetWorld()->GetFirstPlayerController():nullptr;
+    const auto Pawn=PC?PC->GetPawn():nullptr;
+    const FTransform Transform=Pawn?Pawn->GetActorTransform():FTransform(Existing.PlayerRotation,Existing.PlayerPosition);
+    const FString Name=HasMetadata?Existing.DisplayName:TEXT("World ")+FString::Printf(TEXT("%llu"),(unsigned long long)World.GetSeed());
+    return PrepareNamed(World,Name,false,Transform,HasMetadata?Existing.PlayTimeSeconds:0,Out,Slug);
+}
+
+bool WriteActive(const UVoxelWorldSubsystem& World)
+{
+    VoxelSaveJobs::Drain(); FNamedSnapshot Named;
+    if (!PrepareActive(World,Named)) return false;
+    TArray<uint8> Terrain,Detached; VoxelCheckpointStore::FSimulationPayload Simulation;
+    const bool Success=VoxelSessionCheckpoint::Capture(World.GetWorld(),Simulation) && World.CaptureSaveSnapshot(Terrain,Detached) &&
+        VoxelCheckpointStore::Commit(WorldLogPath(Named.Slug),Terrain,Detached,Named.Json,-1,&Simulation);
+    FinishNamed(Named,Success); return Success;
+}
+
+bool WriteActiveAsync(const UVoxelWorldSubsystem& World,TFunction<void(bool)> Completion)
+{
+    if (VoxelSaveJobs::IsBusy()) return false;
+    FNamedSnapshot Named;
+    if (!PrepareActive(World,Named)) return false;
+    VoxelSaveJobs::FSnapshot Snapshot; Snapshot.TerrainPath=WorldLogPath(Named.Slug);
+    const double Start=FPlatformTime::Seconds();
+    if (!VoxelSessionCheckpoint::Capture(World.GetWorld(),Snapshot.Simulation) || !World.CaptureTerrainSnapshot(Snapshot.Terrain) ||
+        !VoxelDetachedPersistence::CaptureSnapshot(World.GetWorld(),Snapshot.Objects)) return false;
+    Snapshot.bObjectSnapshot=true; Snapshot.MetadataJson=Named.Json; Snapshot.CaptureMs=(FPlatformTime::Seconds()-Start)*1000.0;
+    return VoxelSaveJobs::Submit(MoveTemp(Snapshot),[Named=MoveTemp(Named),Completion=MoveTemp(Completion)](bool Success){
+        FinishNamed(Named,Success); if (Completion) Completion(Success);
+    });
+}
+
+void SetActiveSlug(UWorld* World, const FString& Slug)
+{
+    check(IsInGameThread());
+    if (!World || (!Slug.IsEmpty() && !IsValidSlug(Slug))) return;
+    auto& Binding=VoxelSaveDetail::ActiveSlots.FindOrAdd(World);
+    Binding.Slug=Slug;
+    Binding.Epoch=FGuid::NewGuid();
 }
 } // namespace VoxelSave
 

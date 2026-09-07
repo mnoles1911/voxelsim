@@ -25,3 +25,21 @@ User authorization: implement every remaining phase without waiting for feedback
 ## Evidence carried forward
 
 Storage and object regression tests pass. Initial runtime domain test passes in `Saved/session-runtime-verified-report/index.json`; its three transient worlds explicitly expect NullRHI bathymetry resource diagnostics. The latest source compiled and both gameplay/UI modules linked after a targeted TEXT-wrapper correction. Rendered shutdown and multiplayer acceptance remain open.
+
+## Active continuation after PR 232
+
+Implementation is continuing in `.scratch/persistence-integration` on `codex/session-persistence-integration`. The original dirty worktree is preserved. PR 232 merged the earlier checkpoint; it did not complete P0–P6.
+
+The current batch adds world-scoped slot bindings, unique New Game slots, periodic gameplay-time saves, strict version-3 readers, persisted agent records, player inventories and motion records, and restore-before-seed admission. Remote registration requires an encrypted connection and a durable client credential acknowledgement. Transport configuration and remote-process acceptance remain open; the default plaintext connection cannot admit persistent remote players.
+
+Verified continuation evidence:
+
+- `tools/test_checkpoint_store.py -v`: 11 tests passed, repeated under Python `-O`. Run the script directly so its local `checkpoint_store` import resolves.
+- `Saved/persistence-continuation-report/index.json`: four persistence/object tests passed before the connected player/identity batch. This is not evidence for the later player changes.
+- `Saved/persistence-gameplay-build.log`: full Unreal build passed before the latest player admission/motion changes.
+- `Saved/persistence-player-verified-build.log`: full Unreal build passed. The first runtime fixture correctly refused a synthetic controller without a local player; after fixing that setup, it exposed an admitted-controller capture gap. Capture now iterates the persistence bindings, including controllers outside the world iterator during lifecycle transitions.
+- `Saved/persistence-player-bound-report/index.json`: `Voxel.Persistence.SessionDomains` passed with zero errors, including empty host inventory, selected slot and agent round trip. The other three storage/object tests passed in `Saved/persistence-player-verified-report/index.json`.
+
+The next source batch connects boat/glider/item/explosive adapters and player relationships, adds per-game-instance world replacement for selected-seed loads and a failed-load return button. `Saved/persistence-actors-travel-build.log` passed all 157 actions. `Saved/persistence-actors-travel-report/index.json` reports all five tests successful with zero errors: SessionDomains, GameplayActors, CheckpointTransaction, Objects.Pages and Objects.Snapshot. The actor test validates the codec; live vehicle/physics restoration and actual travel still require process tests. A per-client AES-GCM invite handshake is being added separately and is not included in that build.
+
+See [the state inventory](session-state-inventory.md) for remaining entity adapters and acceptance gates. Build success alone does not close those gates.

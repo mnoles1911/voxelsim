@@ -1,4 +1,5 @@
 #include "VoxelEarthGameMode.h"
+#include "VoxelPlayerRecords.h"
 #include "VoxelSessionCheckpoint.h"
 #include "VoxelEnvironmentLODPrototype.h"
 
@@ -4460,9 +4461,20 @@ FRotator AVoxelEarthGameMode::UndergroundTestCameraRotation() const
 	return IsUndergroundShaftView() ? FRotator(-8.f, 0.f, 0.f) : FRotator(-8.f, 180.f, 0.f);
 }
 
+void AVoxelEarthGameMode::FinishRestartPlayer(AController* NewPlayer,const FRotator& StartRotation)
+{
+    Super::FinishRestartPlayer(NewPlayer,StartRotation);
+    if(VoxelSessionCheckpoint::Ready(GetWorld()))
+        if(auto PC=Cast<AVoxelEarthPlayerController>(NewPlayer))
+            if(VoxelPlayerRecords::IsBound(PC) || VoxelPlayerRecords::BindHost(PC)) VoxelPlayerRecords::ApplyPawn(PC);
+}
+
 void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 {
 	if (VoxelSessionCheckpoint::Failed(GetWorld())) return;
+    if(!VoxelSessionCheckpoint::Ready(GetWorld())) return;
+    if(auto PC=Cast<AVoxelEarthPlayerController>(NewPlayer))
+        if(!VoxelPlayerRecords::IsBound(PC) && !VoxelPlayerRecords::BindHost(PC)) return;
 	// docs/m1-plan.md Stage 2 decisions table item 3: spawn above the
 	// terrain surface (Amplifier column at 0,0), +5m -- rather than via
 	// FindPlayerStart/APlayerStart, since no level in this repo places one

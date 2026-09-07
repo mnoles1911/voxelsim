@@ -1,4 +1,8 @@
 #include "VoxelBoat.h"
+#include "VoxelGameplayActors.h"
+#include "VoxelPlayerRecords.h"
+#include "VoxelEarthPlayerController.h"
+#include "VoxelSessionCheckpoint.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/InputComponent.h"
@@ -192,6 +196,7 @@ bool WaveMirrorFingerprintOK()
 
 AVoxelBoat::AVoxelBoat()
 {
+	bReplicates=true; SetReplicateMovement(true);
 	PrimaryActorTick.bCanEverTick = true;
 	// AFTER physics. The buoyancy forces are read back as a transform by the
 	// solver, and the wake is swept from where the hull ACTUALLY ended up; a
@@ -284,7 +289,7 @@ void AVoxelBoat::BeginPlay()
 	// draw a hull somewhere else, which is a mismatch nothing on screen reports.
 	if (Body)
 	{
-		Body->AssetName = CVarVoxelBoatAsset.GetValueOnGameThread();
+		if(!bCheckpointContent) Body->AssetName = CVarVoxelBoatAsset.GetValueOnGameThread();
 		Body->Build();
 		AdoptHullFromBody();
 	}
@@ -419,6 +424,7 @@ void AVoxelBoat::BeginPlay()
 	       (Body && !Body->IsPlaceholder()) ? *Body->GetResolvedPath() : TEXT("PLACEHOLDER"),
 	       Body ? Body->GetInstanceCount() : 0, Body ? Body->GetBatchCount() : 0,
 	       Body ? Body->GetPitchUU() * 10.0 : 0.0);
+	VoxelGameplayActors::FinishRestore(this);
 }
 
 void AVoxelBoat::EndPlay(const EEndPlayReason::Type Reason)
@@ -468,6 +474,8 @@ void AVoxelBoat::AdoptHullFromBody()
 
 void AVoxelBoat::Tick(float DeltaSeconds)
 {
+	VoxelGameplayActors::FinishRestore(this);
+	if(!HasAuthority() || !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaSeconds);
 	if (DeltaSeconds <= 0.f || !PhysicsBody)
 	{
@@ -1097,6 +1105,10 @@ bool AVoxelBoat::TryEnterNearest(APlayerController* PC)
 
 bool AVoxelBoat::Enter(APlayerController* PC)
 {
+	const auto Player=Cast<AVoxelEarthPlayerController>(PC);
+	if(!HasAuthority() || !Player || !VoxelPlayerRecords::IsBound(Player) ||
+		(PersistentPilot.IsValid() && PersistentPilot!=VoxelPlayerRecords::PlayerId(Player))) return false;
+	PersistentPilot=VoxelPlayerRecords::PlayerId(Player);
 	APawn* Previous = PC ? PC->GetPawn() : nullptr;
 	if (!PC || !Previous || Previous == this || StoredPawn.IsValid())
 	{
@@ -1133,6 +1145,7 @@ bool AVoxelBoat::Enter(APlayerController* PC)
 
 void AVoxelBoat::ExitToStoredPawn()
 {
+	PersistentPilot.Invalidate();
 	APawn* Pawn = StoredPawn.Get();
 	APlayerController* PC = Driver.Get();
 	StoredPawn = nullptr;

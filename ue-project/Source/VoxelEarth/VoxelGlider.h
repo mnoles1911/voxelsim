@@ -10,6 +10,7 @@
 
 class APlayerController;
 class UCameraComponent;
+namespace VoxelGameplayActors { struct FAdapter; }
 
 // ============================================================================
 // A GLIDER
@@ -162,6 +163,9 @@ public:
 	const UVoxelAssetBodyComponent* GetBody() const { return Body; }
 
 private:
+	friend struct VoxelGameplayActors::FAdapter;
+	FGuid PersistentId=FGuid::NewGuid(), PersistentPilot;
+	bool bCheckpointContent=false;
 	void InputPitch(float Value);
 	void InputRoll(float Value);
 	void InputLookYaw(float Value);

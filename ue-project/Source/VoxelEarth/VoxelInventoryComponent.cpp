@@ -90,9 +90,7 @@ UVoxelInventoryComponent::UVoxelInventoryComponent()
 void UVoxelInventoryComponent::BeginPlay()
 {
 	Super::BeginPlay();
-    // Keep server-side initialization usable until player-record admission is
-    // connected. That admission must replace this call with restore-or-seed.
-    SeedDefaultsOnce();
+    // Player-record admission chooses restore or first-time seeding.
 }
 
 void UVoxelInventoryComponent::SeedDefaultsOnce()

@@ -37,6 +37,8 @@ enum class EVoxelAgentTier : uint8
 
 struct FVoxelAgent
 {
+    FGuid PersistentId=FGuid::NewGuid();
+    double RestoredDigCooldownSeconds=0;
 	// World-space (UU = cm, LWC-safe) position of the agent's FEET (ground
 	// contact point, not the body's visual center -- UVoxelAgentSubsystem::
 	// UpdateInstanceTransform offsets the ISM instance up by
