@@ -1,0 +1,17 @@
+{
+  "uid": "56de4df672654ed599777d2980bf0f53",
+  "title": "Grey Wolf (Rigged and Animated)",
+  "url": "https://sketchfab.com/3d-models/grey-wolf-rigged-and-animated-56de4df672654ed599777d2980bf0f53",
+  "author": "rhcreations",
+  "author_url": "https://sketchfab.com/rhcreations",
+  "license": {
+    "uri": "https://api.sketchfab.com/v3/licenses/322a749bcfa841b29dff1e8a1bb74b0b",
+    "label": "CC Attribution",
+    "fullName": "Creative Commons Attribution",
+    "requirements": "Author must be credited. Commercial use is allowed.",
+    "url": "http://creativecommons.org/licenses/by/4.0/",
+    "slug": "by"
+  },
+  "description": "A Wolf with animations made using Blender 2.79 and the cycles render engine.\n\nCheck out my blog at: https://rhcreations.tumblr.com/",
+  "modifications": "Uniform scale, torso extension, 12.5 mm cubic voxelization, authored grey/buff coat, amber eyes and neutral ear shadows."
+}
