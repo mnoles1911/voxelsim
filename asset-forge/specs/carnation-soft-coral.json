@@ -202,7 +202,7 @@
     "radius_exp": 2.0,
     "shade": 0.4,
     "step_m": 0.08,
-    "tip_radius_m": 0.02
+    "tip_radius_m": 0.025
   },
   "height_m": 0.4,
   "herd": {

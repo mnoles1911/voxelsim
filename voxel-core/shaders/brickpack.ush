@@ -604,6 +604,7 @@ void packBrickInto(uint packIndex, uint cellBase, uint chunkIndex, uint localInd
         // Bounded: packIndex plus a host base, and packIndex is capped both by
         // decodeBrick's brick-count early-out and by the ScanCount guard above;
         // the host sizes the descriptor table to BrickDescBase plus that count.
+        // lint-shader-ub: allow UNGUARDED_WRITE - both callers bound packIndex through decodeBrick; classic uses host-sized BrickDescBase, worklist uses Rec < Take with a 64-descriptor slice per record
         OutBrickDesc[descBase + packIndex] = uint2(occWord, matWord);
 
         // L1: one bit per brick in the chunk record. Any non-empty brick sets

@@ -107,6 +107,9 @@ void AssetStampWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadI
 	const int ZCellBase = R.BrickZMin * 8;
 	const int RegionZCells = 32;   // BricksZ 4 x 8, the lean shape
 
+	// One bit per K (0..31) remembers owned winners without stealing cell bits.
+	uint OwnedWinnerZ = 0u;
+
 	// Instances IN SLICE ORDER -- the classic per-instance pass order, so
 	// first-non-air-wins picks the same winner for every overlapped cell.
 	for (uint I = 0u; I < R.AssetCount; ++I)
@@ -159,9 +162,16 @@ void AssetStampWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadI
 			// AIR ONLY -- terrain (and every earlier instance this thread
 			// already stamped) wins; upper bits preserved, both classic
 			// kernels' rule verbatim.
-			if ((Cell & 0xffu) == 0u)
+			if ((Cell & 0xffu) == 0u && (OwnedWinnerZ & (1u << (uint(K) & 31u))) == 0u) // lint-shader-ub: allow VARIABLE_SHIFT - explicit 31 mask bounds distance to 0..31
 			{
-				OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+				if (Inst.SuppressTerrainRender != 0u)
+				{
+					OwnedWinnerZ |= 1u << (uint(K) & 31u); // lint-shader-ub: allow VARIABLE_SHIFT - explicit 31 mask bounds distance to 0..31
+				}
+				else
+				{
+					OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+				}
 			}
 		}
 	}

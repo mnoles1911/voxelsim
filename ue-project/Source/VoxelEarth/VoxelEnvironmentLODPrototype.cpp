@@ -169,7 +169,7 @@ struct FEnvironmentLODState {
     FVector LastChopDirection=FVector::ForwardVector;
 };
 namespace {
-struct FMeshGeometry
+struct FEnvironmentLodMeshGeometry
 {
 	uint32 MeshKey = 0;
 	TArray<FVector3f> Positions;
@@ -182,11 +182,11 @@ struct FMeshGeometry
 	uint64 SolidVoxels = 0;
 };
 
-struct FPaletteLinear
+struct FEnvironmentLodPaletteLinear
 {
 	FLinearColor Face[vxc::kMaterialCount][vxc::kFaceClassCount];
 	uint8 Jitter[vxc::kMaterialCount];
-	FPaletteLinear()
+	FEnvironmentLodPaletteLinear()
 	{
 		for (uint32 M = 0; M < uint32(vxc::kMaterialCount); ++M)
 		{
@@ -201,13 +201,13 @@ struct FPaletteLinear
 	}
 };
 
-const FPaletteLinear& PaletteLinear()
+const FEnvironmentLodPaletteLinear& EnvironmentLodPaletteLinear()
 {
-	static const FPaletteLinear P; // thread-safe magic-static init
+	static const FEnvironmentLodPaletteLinear P; // thread-safe magic-static init
 	return P;
 }
 
-void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FMeshGeometry& Out, const FIntVector& Min, const FIntVector& Max)
+void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FEnvironmentLodMeshGeometry& Out, const FIntVector& Min, const FIntVector& Max)
 {
 	const int32 SX = Grid.sizeX(), SY = Grid.sizeY(), SZ = Grid.sizeZ();
 	if (SX <= 0 || SY <= 0 || SZ <= 0)
@@ -229,7 +229,7 @@ void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FMeshGeo
 	const float PitchUU = float(double(Grid.voxelSizeMm()) * 0.1);
 	const int32 Origin[3] = {Grid.originX(), Grid.originY(), Grid.originZ()};
 
-	const FPaletteLinear& Pal = PaletteLinear();
+	const FEnvironmentLodPaletteLinear& Pal = EnvironmentLodPaletteLinear();
 	const uint64 JitterSeed = (uint64(MeshKey) << 1) | 1u;
 
 	static const FVector3f AxisDir[3] = {FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1)};
@@ -323,7 +323,7 @@ void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FMeshGeo
 }
 
 
-void ApplyGeometry(UProceduralMeshComponent* Component,const FMeshGeometry& Geometry){
+void ApplyGeometry(UProceduralMeshComponent* Component,const FEnvironmentLodMeshGeometry& Geometry){
         TArray<FVector> Positions,Normals;TArray<FVector2D> UVs,WindUVs;
         TArray<FLinearColor> Colors;TArray<FProcMeshTangent> Tangents;TArray<int32> Indices;
         const int32 Count=Geometry.Positions.Num();
@@ -342,7 +342,7 @@ void ApplyGeometry(UProceduralMeshComponent* Component,const FMeshGeometry& Geom
 
 } // namespace
 struct FEnvironmentStagedRestore {
-    struct FSection {int32 Level=0;FIntVector Key;FMeshGeometry Mesh;};
+    struct FSection {int32 Level=0;FIntVector Key;FEnvironmentLodMeshGeometry Mesh;};
     TAtomic<bool> Cancelled{false};
     FVoxelImmutableGeometry Geometry;
     TFunction<void(bool)> Completion;
@@ -527,7 +527,7 @@ bool AVoxelEnvironmentLODPrototype::AdvanceStagedObjectRestore(){
     }
     if(Job->Next<Job->Meshes.Num()){
         auto& S=Job->Meshes[Job->Next++];auto C=NewObject<UVoxelPlantMeshComponent>(this);C->SetupAttachment(Levels[S.Level]);C->SetMobility(EComponentMobility::Movable);C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetMaterial(0,Materials[S.Level]);C->SetVisibility(false);C->RegisterComponent();
-        ApplyGeometry(C,S.Mesh);Sections.Add(C);State->SectionMaps[S.Level].Add(S.Key,C);S.Mesh=FMeshGeometry();return true;
+        ApplyGeometry(C,S.Mesh);Sections.Add(C);State->SectionMaps[S.Level].Add(S.Key,C);S.Mesh=FEnvironmentLodMeshGeometry();return true;
     }
     GeometrySnapshot=Job->Geometry;ActiveLOD=0;PreviousLOD=-1;SetLevelVisible(0,true);
     PreparedRestore=Job;StagedRestore.Reset();
@@ -582,7 +582,7 @@ void AVoxelEnvironmentLODPrototype::RebuildSections(int32 L,const FIntVector& Mi
         const FIntVector Lo=Key*Edge;
         if(Lo.X>=Max.X||Lo.Y>=Max.Y||Lo.Z>=Max.Z||Lo.X+Edge<=Min.X||Lo.Y+Edge<=Min.Y||Lo.Z+Edge<=Min.Z)continue;
         const FIntVector Hi(FMath::Min(Lo.X+Edge,Grid.Size.X),FMath::Min(Lo.Y+Edge,Grid.Size.Y),FMath::Min(Lo.Z+Edge,Grid.Size.Z));
-        FMeshGeometry Geometry;Geometry.MeshKey=GetTypeHash(AssetName);
+        FEnvironmentLodMeshGeometry Geometry;Geometry.MeshKey=GetTypeHash(AssetName);
         BuildNaiveFaceGeometry(Grid,Geometry.MeshKey,Geometry,Lo,Hi);
         auto Existing=State->SectionMaps[L].Find(Key);
         if(Geometry.Indices.IsEmpty()){
@@ -719,7 +719,7 @@ bool AVoxelEnvironmentLODPrototype::Carve(const FVector& Hit,int32 SizeVoxels) {
         // Slow oracle is opt-in and deliberately outside the edit timing.
         // It catches lost or duplicate faces at section seams after carving.
         for(int L=0;L<State->Grids.Num();++L){
-            FMeshGeometry Reference;const auto& G=State->Grids[L];
+            FEnvironmentLodMeshGeometry Reference;const auto& G=State->Grids[L];
             BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Reference,FIntVector::ZeroValue,G.Size);
             int32 Triangles=0;for(const auto& Pair:State->SectionMaps[L])Triangles+=Pair.Value->GetProcMeshSection(0)->ProcIndexBuffer.Num()/3;
             checkf(Triangles==Reference.Indices.Num()/3,TEXT("Section face count differs from full mesh"));
@@ -767,11 +767,11 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
     const double Split=FMath::RoundToDouble((Plane+Top)*.5/160.)*160.;
     const int SplitZ=FMath::RoundToInt(Split/(Fine.Mm*.1))-Fine.Origin.Z;
     for(int Side=0;Side<2;++Side){
-        FMeshGeometry Cap;const float P=float(Fine.Mm*.1);
+        FEnvironmentLodMeshGeometry Cap;const float P=float(Fine.Mm*.1);
         Fine.VisitBox(FIntVector(0,0,SplitZ),FIntVector(Fine.Size.X,Fine.Size.Y,SplitZ+1),[&](int X,int Y,int,uint8){
             if(!Fine.At(X,Y,SplitZ-1))return;
             const auto M=Fine.At(X,Y,Side?SplitZ:SplitZ-1);
-            const auto Color=PaletteLinear().Face[(M==16||M==18)?17:M][vxc::kFaceTop];
+            const auto Color=EnvironmentLodPaletteLinear().Face[(M==16||M==18)?17:M][vxc::kFaceTop];
             const uint32 B=Cap.Positions.Num();const float FX=(X+Fine.Origin.X)*P,FY=(Y+Fine.Origin.Y)*P;
             Cap.Positions.Append({FVector3f(FX,FY,Split),FVector3f(FX,FY+P,Split),FVector3f(FX+P,FY+P,Split),FVector3f(FX+P,FY,Split)});
             for(int V=0;V<4;++V){Cap.Normals.Add(FVector3f(0,0,Side?-1:1));Cap.TangentsX.Add(FVector3f(1,0,0));Cap.Colors.Add(FVector4f(Color.R,Color.G,Color.B,1));Cap.UVs.Add(FVector2f::ZeroVector);}
@@ -792,7 +792,7 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
                 State->SectionMaps[L].Remove(Key);Sections.Remove(C);
                 if(L==0){C->SetMaterial(0,Material);Moving.Add(C);}else C->DestroyComponent();
             }else if(L==0&&Lo.Z+Edge>Cut){
-                FMeshGeometry Geometry;const FIntVector UpperLo(Lo.X,Lo.Y,Cut);
+                FEnvironmentLodMeshGeometry Geometry;const FIntVector UpperLo(Lo.X,Lo.Y,Cut);
                 const FIntVector Hi(FMath::Min(Lo.X+Edge,G.Size.X),FMath::Min(Lo.Y+Edge,G.Size.Y),FMath::Min(Lo.Z+Edge,G.Size.Z));
                 BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Geometry,UpperLo,Hi);
                 if(!Geometry.Indices.IsEmpty()){
@@ -827,7 +827,7 @@ bool AVoxelStoneAxePrototype::Initialize(){
     if(!G.Init())return false;bool Imported=true;
     for(int X=0;X<G.Size.X;++X)for(int Y=0;Y<G.Size.Y;++Y)Source.columnRuns(X,Y,[&](int Z,int Len,vxc::MaterialId M){if(M&&Imported)Imported=G.SetRun(X,Y,Z,Len,uint8(M));});
     if(!Imported)return false;
-    FMeshGeometry Geometry;BuildNaiveFaceGeometry(G,1,Geometry,FIntVector::ZeroValue,G.Size);ApplyGeometry(Mesh,Geometry);
+    FEnvironmentLodMeshGeometry Geometry;BuildNaiveFaceGeometry(G,1,Geometry,FIntVector::ZeroValue,G.Size);ApplyGeometry(Mesh,Geometry);
     auto Base=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/Voxel/M_VoxelEnvironmentLOD.M_VoxelEnvironmentLOD"));
     auto Material=UMaterialInstanceDynamic::Create(Base,this);Material->SetScalarParameterValue(TEXT("Fade"),1);Material->SetScalarParameterValue(TEXT("Reverse"),0);Material->SetScalarParameterValue(TEXT("WindEnabled"),0);Mesh->SetMaterial(0,Material);
     UE_LOG(LogVoxelEarth,Log,TEXT("TreeFelling AXE loaded pitchMm=12.5 faces=%d"),Geometry.Indices.Num()/6);return true;

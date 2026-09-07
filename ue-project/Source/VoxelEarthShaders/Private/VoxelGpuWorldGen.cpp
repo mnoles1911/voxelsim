@@ -487,6 +487,9 @@ namespace
 			SHADER_PARAMETER(uint32, SizeY)
 			SHADER_PARAMETER(uint32, SizeZ)
 			SHADER_PARAMETER(uint32, ColStartsBase)
+			SHADER_PARAMETER(uint32, HasRenderSuppression)
+			SHADER_PARAMETER(uint32, SuppressTerrainRender)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OwnedWinnerClaims)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ColStarts)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Spans)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
@@ -528,6 +531,9 @@ namespace
 			SHADER_PARAMETER(uint32, SizeY)
 			SHADER_PARAMETER(uint32, SizeZ)
 			SHADER_PARAMETER(uint32, ColStartsBase)
+			SHADER_PARAMETER(uint32, HasRenderSuppression)
+			SHADER_PARAMETER(uint32, SuppressTerrainRender)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OwnedWinnerClaims)
 			// The gather's own three: the scale (host-computed 1 << level, same
 			// VARIABLE_SHIFT reasoning as FillLooseParameters' CoarseScale) and
 			// the covering cell box the dispatch is threaded over.
@@ -1895,6 +1901,14 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		// rather than truncated into a hole at the top of a tall asset.
 		for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Req.AssetInstances)
 		{
+			// Bounded optional scratch: at most 4 MiB per classic request.
+			// RDG owns lifetime, including cancellation; no retained ownership resource.
+			if (Inst.SuppressTerrainRender > 1u ||
+			    (Inst.SuppressTerrainRender != 0u && uint64(Req.BricksZ) > 1048576ull / Cx / Cy / 8u))
+			{
+				OutError = TEXT("Asset render suppression flag invalid or claim scratch exceeds 4 MiB");
+				return false;
+			}
 			if (Inst.SizeX == 0 || Inst.SizeY == 0 || Inst.SizeZ == 0 || Inst.SizeZ > 4095)
 			{
 				OutError = FString::Printf(
@@ -2396,6 +2410,18 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			Request.AssetSpans.Num(), Request.AssetSpans.GetData(),
 			Request.AssetSpans.Num() * sizeof(uint32));
 
+		const bool bHasRenderSuppression = Request.AssetInstances.ContainsByPredicate(
+			[](const FVoxelGpuRegionRequest::FAssetInstance& Inst) { return Inst.SuppressTerrainRender != 0u; });
+		// No allocation/clear for the default path. The fallback UAV is never
+		// accessed while HasRenderSuppression is zero.
+		FRDGBufferRef WinnerClaims = Out.Cells;
+		if (bHasRenderSuppression)
+		{
+			WinnerClaims = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumCells), TEXT("Voxel.AssetOwnedWinnerClaims"));
+			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(WinnerClaims), 0u);
+		}
+
 		if (Request.CoarseLevel == 0)
 		{
 			// Level 0: the scatter kernel, untouched -- byte-identical to every
@@ -2418,6 +2444,9 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 				Params->SizeY = Inst.SizeY;
 				Params->SizeZ = Inst.SizeZ;
 				Params->ColStartsBase = Inst.ColStartsBase;
+				Params->HasRenderSuppression = bHasRenderSuppression ? 1u : 0u;
+				Params->SuppressTerrainRender = Inst.SuppressTerrainRender;
+				Params->OwnedWinnerClaims = GraphBuilder.CreateUAV(WinnerClaims);
 				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
 				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
 				Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
@@ -2486,6 +2515,9 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 				Params->SizeY = Inst.SizeY;
 				Params->SizeZ = Inst.SizeZ;
 				Params->ColStartsBase = Inst.ColStartsBase;
+				Params->HasRenderSuppression = bHasRenderSuppression ? 1u : 0u;
+				Params->SuppressTerrainRender = Inst.SuppressTerrainRender;
+				Params->OwnedWinnerClaims = GraphBuilder.CreateUAV(WinnerClaims);
 				Params->CoarseScale = uint32(Scale);
 				Params->CellBoxMin = FUintVector2(uint32(C0x), uint32(C0y));
 				Params->CellBoxSize = FUintVector2(uint32(C1x - C0x + 1), uint32(C1y - C0y + 1));

@@ -190,6 +190,13 @@ bool FVoxelFrontEndSwitchPolicyTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("a timed *After is self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelScreenshotAfter")));
 	TestTrue(TEXT("a named extra is self-driving"), IsSelfDrivingSwitchName(TEXT("VoxelPerfRun")));
 	TestTrue(TEXT("mid-name Shot still counts"), IsSelfDrivingSwitchName(TEXT("VoxelHudShotOnly")));
+	TestTrue(TEXT("environment capture cannot stop at the menu"), IsSelfDrivingSwitchName(TEXT("VoxelEnvironmentLODCapture")));
+	TestTrue(TEXT("tree capture cannot stop at the menu"), IsSelfDrivingSwitchName(TEXT("VoxelTreeFellingCapture")));
+	TestFalse(TEXT("interactive environment prototype preserves the menu"), IsSelfDrivingSwitchName(TEXT("VoxelEnvironmentLOD")));
+	TestFalse(TEXT("index diagnostics preserve the menu"), IsSelfDrivingSwitchName(TEXT("VoxelDumpIndexKeys")));
+	TestFalse(TEXT("sky-mark diagnostics preserve the menu"), IsSelfDrivingSwitchName(TEXT("VoxelSkyMarkVerify")));
+	TestFalse(TEXT("sky-mark grid tuning preserves the menu"), IsSelfDrivingSwitchName(TEXT("VoxelSkyMarkVerifyGrid")));
+	TestFalse(TEXT("sky-mark stride tuning preserves the menu"), IsSelfDrivingSwitchName(TEXT("VoxelSkyMarkVerifyStride")));
 
 	// A switch that did not exist when the rule was written must still classify
 	// from its name alone. This is the property that makes a rule better than a

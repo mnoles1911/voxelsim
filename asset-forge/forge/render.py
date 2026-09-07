@@ -558,8 +558,6 @@ def camera_for(spec: dict) -> str:
                                 or str(get(spec, "name")).endswith("ray")) else "broad"
     if kind == "bird":
         return "broad" if get(spec, "bird.pose") == "perched" else "iso"
-    if kind == "quadruped" and get(spec, "goblin.role") != "none":
-        return "iso"
     if kind == "quadruped":
         # BROADSIDE, LIFTED. Every cue a land animal is identified by is a side
         # view: the slope of the back from shoulder to hip, how high it stands,
@@ -832,8 +830,6 @@ def predicted_extent(spec: dict, voxel_m: float = 0.10) -> tuple[int, int, int]:
         return (max(1, int(span / voxel_m)), max(1, int(wide / voxel_m)),
                 max(1, int(tall / voxel_m)))
 
-    if kind == "quadruped" and get(spec, "goblin.role") != "none":
-        return "iso"
     if kind == "quadruped":
         # Nose to tail tip, and tall enough to hold a raised neck under a rack
         # of antlers. Same warning as the fish and the bird above, and it bites

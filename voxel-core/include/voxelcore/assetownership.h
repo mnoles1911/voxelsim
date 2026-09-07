@@ -101,7 +101,8 @@ public:
         for(size_t i=0;i<pages_.size();++i)if(pages_[i].x==page.x&&pages_[i].y==page.y&&pages_[i].z==page.z&&pages_[i].level==page.level){
             if(!(pages_[i].backends&backend))return false;
             ready_[i]|=backend;return true;
-        }return false;
+        }
+        return false;
     }
     bool ready(AssetOwnershipTicket t) const {
         if(!matches(t)||!objectReady_)return false;
@@ -126,14 +127,8 @@ private:
     std::vector<uint8_t> ready_;
     bool objectReady_=false;
 };
-// Both CPU and GPU terrain request builders must use this stable-order filter
-// when the production ownership bridge is wired.
-// Never apply this to authoritative world/collision queries.
-template<class Instance,class ProvenanceFn>
-std::vector<Instance> assetTerrainRenderInstances(const std::vector<Instance>& source,
-                                                 const AssetOwnershipSnapshot& ownership,ProvenanceFn provenance) {
-    std::vector<Instance> out;out.reserve(source.size());
-    for(const auto& instance:source)if(!ownership.objectOwns(provenance(instance)))out.push_back(instance);
-    return out;
-}
+// Render ownership must suppress the canonical winning cell, not remove an
+// instance before composition: later overlapping assets would become visible.
+// assetcandidate.h provides the cell-level CPU reference. Authoritative world
+// and collision queries remain unfiltered.
 }

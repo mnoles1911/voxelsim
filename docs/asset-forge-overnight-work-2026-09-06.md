@@ -1,5 +1,17 @@
 # Asset Forge overnight completion ledger
 
+> Latest steering (2026-09-07): the owner requested removal of all goblins,
+> then rejected the wildlife visual quality and asked for a research-based
+> redesign. Read [the new strategy](creature-reconstruction-strategy-2026-09-07.md)
+> before further regeneration. Five goblins and their controls are removed;
+> 382 wildlife remain. Creature (382 exports/12 rebuilds), publish fixtures,
+> creation, LLM, pitch, frontend and quick selftest checks pass. Plant radius
+> fixes are committed separately as 30398a2. Three approved crafts are published
+> locally and byte/path verified. The real full publisher still reports stale
+> environment exports and pending keep resync; the UE default root has not yet
+> changed. Earlier completion counts below describe the previous checkpoint.
+
+
 User authorization: finish all remaining planned work autonomously while the
 user sleeps. Scope is this thread's Asset Forge/creature work and the current
 Asset Forge application plan, not every superseded project-wide backlog.

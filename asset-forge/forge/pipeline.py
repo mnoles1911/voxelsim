@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 from . import (artifact as artifactlib, bird as birdlib, envelope,
-               fish as fishlib, goblin as goblinlib, ground as groundlib, materials,
+               fish as fishlib, ground as groundlib, materials,
                quadruped as quadlib, rasterize, rock as rocklib)
 from . import resolution as resolutionlib
 from . import parts as partslib
@@ -405,7 +405,6 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         gen = (rocklib if kind in BOULDER_KINDS
                else fishlib if kind in FISH_KINDS
                else birdlib if kind in BIRD_KINDS
-               else goblinlib if kind in QUAD_KINDS and get(live, "goblin.role") != "none"
                else quadlib if kind in QUAD_KINDS
                else artifactlib if kind in ARTIFACT_KINDS else groundlib)
         gen_out: dict = {}

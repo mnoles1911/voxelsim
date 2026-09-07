@@ -78,30 +78,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Grep for float/double in voxel-core src+include (comments/strings stripped)
-        shell: python
-        run: |
-          import re, sys, pathlib
-          # Doctrine bans float/double as TYPES in world-derivation code, not
-          # the words "double" / "float" appearing in comments or strings
-          # (e.g. "double-visit"). Strip // and /* */ comments and string
-          # literals before searching so prose never trips the guard.
-          bad = []
-          for base in ("voxel-core/include", "voxel-core/src"):
-              for f in pathlib.Path(base).rglob("*"):
-                  if f.suffix not in (".h", ".hpp", ".cpp", ".cc"):
-                      continue
-                  src = f.read_text(encoding="utf-8", errors="replace")
-                  src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)   # block comments
-                  src = re.sub(r"//[^\n]*", " ", src)                # line comments
-                  for i, line in enumerate(src.splitlines(), 1):
-                      if re.search(r"\b(float|double)\b", line):
-                          bad.append(f"{f}:{i}: {line.strip()}")
-          if bad:
-              print("float/double type found in voxel-core world-derivation code:")
-              print("\n".join(bad))
-              sys.exit(1)
-          print("float-ban clean")
+      - name: Check integer derivation and reviewed floating API boundaries
+        run: python3 tools/lint-core-floats.py
 
   # No CI job compiles the Unreal module -- see .github/workflows/ue-build.yml
   # for the measurement that says why (the engine is a 30 GB install; a hosted
@@ -222,7 +200,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install deps
-        run: python -m pip install -r terrain-service/requirements.txt
+        run: python -m pip install -r terrain-service/requirements-test.txt
       - name: Test (incl. golden tiles)
         run: cd terrain-service && python -m pytest -q
 
@@ -247,17 +225,11 @@ jobs:
   # to forge/rock.py, but the specs are data and the last two defects were spec
   # tuning, so scoping this job to a subtree would have missed them.
   #
-  # WHAT THIS JOB DOES NOT COVER, and why. Four specs dominate the wall clock
-  # and one of them cannot run here at all: `hero-arch-colossal` is 26M voxels
-  # at its authored 5 cm, needs a 23.6 GB working set, takes 27 minutes on a
-  # dev box and raises MemoryError on some seeds. So the library is built in
-  # two passes -- 63 specs at their authored size, then the four heavy ones at
-  # 20 cm. The coarse pass is a WEAKER check (pieces touching at a single voxel
-  # can merge on a coarser lattice, and a thin neck can part), and it is run
-  # rather than skipped because a hero that comes apart into six pieces still
-  # comes apart at 20 cm -- that is how large the defects being caught here are.
-  # A hero regression that only shows at 5 cm is caught by a person running
-  # `python tools/buildcheck.py --only-heavy` locally, not by this job.
+  # All specs use their authored supported lattice pitches. The heavy four
+  # run separately to make their time and peak resident memory visible.
+  # The former 200 mm diagnostic override violates the binary pitch policy.
+  # rock.py releases large scratch arrays after their last use; generation
+  # and connected-component checks still run on the full authored geometry.
   #
   # Seed 1 only. Three seeds is the local sign-off command (`--seeds 1 2 3`),
   # not the per-PR gate.
@@ -284,14 +256,10 @@ jobs:
       # it this job would build the entire library twice for one verdict.
       - name: Selftest
         run: cd asset-forge && python -m forge.cli selftest --quick
-      # Measured on a dev box at seed 1: 7 minutes for the 63, 3 minutes for the
-      # heavy four at 20 cm. 10 cm was tried for the coarse pass and abandoned
-      # -- hero-arch-colossal alone runs over 20 minutes there, against 110 s at
-      # 20 cm, because the size fit re-searches on a grid 8x larger.
       - name: Build every spec (one asset per generation, no warnings)
         run: cd asset-forge && python tools/buildcheck.py --skip-heavy
-      - name: The four heavy heroes, on a coarse lattice
-        run: cd asset-forge && python tools/buildcheck.py --only-heavy --res 20
+      - name: The four heavy heroes, at authored resolution
+        run: cd asset-forge && /usr/bin/time -v python tools/buildcheck.py --only-heavy
 
   shader-compile:
     name: Shader compilation (DXIL + SPIR-V)

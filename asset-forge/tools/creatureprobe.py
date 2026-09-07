@@ -50,13 +50,15 @@ def main():
         info = vox.inspect(path.parent / 'tree.vox')
         assert info['voxels'] == grid.count() and not info['oversized'], meta['id']
         assert not meta['problems'], (meta['id'], meta['problems'])
-        if meta['species'] in samples or meta['species'].startswith('goblin-'):
+        if meta['species'] in samples:
             rebuilt = pipeline.build(body, meta['seed'])
             assert np.array_equal(rebuilt.grid.data, grid.data), meta['id']
             assert np.array_equal(rebuilt.parts, tags), meta['id']
         checks.append(meta['id'])
-    assert len(checks) == 387, len(checks)
-    result = dict(exports=len(checks), deterministic_rebuilds=17,
+    assert len(checks) == 382, len(checks)
+    assert not list((ROOT / 'specs').glob('goblin-*.json'))
+    assert not list((ROOT / 'library').glob('goblin-*'))
+    result = dict(exports=len(checks), deterministic_rebuilds=len(samples),
                   curved_surface_regression=True, failures=[])
     target = ROOT / 'out' / 'creature-refresh' / 'verification.json'
     target.parent.mkdir(parents=True, exist_ok=True)

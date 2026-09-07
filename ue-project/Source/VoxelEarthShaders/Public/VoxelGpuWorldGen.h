@@ -253,6 +253,8 @@ struct FVoxelGpuRegionRequest
 		uint32 SizeY = 0;
 		uint32 SizeZ = 0;        // host-validated <= 4095 (span packing)
 		uint32 ColStartsBase = 0;
+		// Render-only winner suppression. Never remove this instance from ordering.
+		uint32 SuppressTerrainRender = 0;
 	};
 	TArray<FAssetInstance> AssetInstances;
 	TArray<uint32> AssetColStarts;

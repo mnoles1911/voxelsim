@@ -1,0 +1,54 @@
+{
+  "primary_gate": "anatomically and visually correct against real references; technical checks cannot approve appearance",
+  "pitch_m": 0.0125,
+  "species": [
+    {
+      "id": "grey-wolf",
+      "scientific_name": "Canis lupus",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    },
+    {
+      "id": "bengal-tiger",
+      "scientific_name": "Panthera tigris tigris",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    },
+    {
+      "id": "red-deer-stag",
+      "scientific_name": "Cervus elaphus",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    },
+    {
+      "id": "common-raven",
+      "scientific_name": "Corvus corax",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    },
+    {
+      "id": "golden-eagle",
+      "scientific_name": "Aquila chrysaetos",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    },
+    {
+      "id": "rainbow-trout",
+      "scientific_name": "Oncorhynchus mykiss",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    },
+    {
+      "id": "great-white-shark",
+      "scientific_name": "Carcharodon carcharias",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    },
+    {
+      "id": "orca",
+      "scientific_name": "Orcinus orca",
+      "status": "reference_and_candidate_work",
+      "visual_approved": false
+    }
+  ]
+}

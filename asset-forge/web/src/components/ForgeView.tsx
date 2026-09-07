@@ -50,7 +50,7 @@ const DEFAULT_SPECIES: Record<string, string> = {
 
 /** Groups worth opening by default; the rest start folded. */
 const OPEN_GROUPS = new Set(["general", "crown", "trunk", "rock", "tuft", "fish", "bird", "quad",
-                             "artifact", "goblin"]);
+                             "artifact"]);
 
 type Spec = Record<string, unknown>;
 
@@ -683,11 +683,7 @@ function ParamPanel({
 }) {
   void rev; // rerender trigger; the spec object itself is mutated in place
   const byGroup = new Map<string, UiParam[]>();
-  const goblinRole = getPath(spec, "goblin.role");
-  const isGoblin = spec.kind === "quadruped" && goblinRole != null && goblinRole !== "none";
   for (const p of schema.params) {
-    if (isGoblin && p.group === "quad") continue;
-    if (!isGoblin && p.group === "goblin" && p.path !== "goblin.role") continue;
     if (!byGroup.has(p.group)) byGroup.set(p.group, []);
     byGroup.get(p.group)!.push(p);
   }
