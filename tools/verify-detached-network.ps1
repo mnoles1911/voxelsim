@@ -11,6 +11,8 @@ $Project = Join-Path $Workspace 'ue-project\VoxelEarth.uproject'
 if (!(Test-Path -LiteralPath $Editor)) { throw "Editor missing: $Editor" }
 $Busy = @(Get-Process -Name 'UnrealEditor','UnrealEditor-Cmd','UnrealBuildTool','cl','link','ShaderCompileWorker' -ErrorAction SilentlyContinue)
 if ($Busy.Count) { throw ('Editor/compiler already running; leave it untouched and retry when idle: ' + (($Busy | ForEach-Object { "$($_.ProcessName):$($_.Id)" }) -join ', ')) }
+$BuildTools = @(Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe'" | Where-Object { $_.CommandLine -match 'UnrealBuildTool' })
+if ($BuildTools.Count) { throw 'UnrealBuildTool is active, possibly between compiler actions. Leave that build untouched and retry when idle.' }
 if (Get-NetUDPEndpoint -LocalPort $Port -ErrorAction SilentlyContinue) { throw "UDP port $Port is already in use" }
 $RunName = 'detached-net-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
 $RunDir = Join-Path $Workspace "Saved\Tests\$RunName"
@@ -36,7 +38,7 @@ function Wait-Log([string]$Path,[string]$Pattern) {
 }
 function Launch([string]$Role) {
     $Url = if ($Role -eq 'server') { '/Engine/Maps/Entry' } else { "127.0.0.1:$Port" }
-    $Args = @("`"$Project`"",$Url,'-unattended','-nosplash','-nosound','-log',"-abslog=`"$($Logs[$Role])`"",'-VoxelNoMenu','-VoxelSyntheticTerrain',"-VoxelSeed=$Seed",'-NoSteam')
+    $Args = @("`"$Project`"",$Url,'-unattended','-nosplash','-nosound','-Multiprocess','-log',"-abslog=`"$($Logs[$Role])`"",'-VoxelNoMenu','-VoxelSyntheticTerrain',"-VoxelSeed=$Seed",'-NoSteam')
     if ($Role -eq 'server') { $Args += @('-server',"-port=$Port",'-nullrhi','-VoxelObjectsNetVerify=server') }
     else { $Args += @('-game',"-$Render",'-sm6','-windowed','-ResX=640','-ResY=360','-VoxelObjectsNetVerify=client') }
     $P = Start-Process -FilePath $Editor -ArgumentList $Args -WorkingDirectory $Workspace -WindowStyle Hidden -PassThru
@@ -76,7 +78,10 @@ try {
     foreach ($Role in @('server','client1','client2')) {
         if ($Text[$Role] -match 'DetachedNet[^\r\n]*(rejected|failed|exceeds)|Fatal error:') { throw "$Role reported network/engine failure" }
         $Before=State-At $Text[$Role] 8 $Id;$After=State-At $Text[$Role] 70 $Id
-        if ($Before.Actor -ne 1 -or $Before.Retained -ne 1 -or $Before.Geometry -ne $Expected.Geometry) { throw "$Role did not receive retained geometry" }
+        if ($Before.Actor -ne 1 -or $Before.State -ne 0 -or $Before.Retained -ne 1 -or $Before.Geometry -ne $Expected.Geometry) { throw "$Role did not receive live retained geometry" }
+        $Visual = [regex]::Matches($Text[$Role], ('DetachedNetVerify visual id=' + [regex]::Escape($Id) + ' errorCm=([\d.]+)'))
+        if (!$Visual.Count) { throw "$Role did not report its displayed actor pose" }
+        foreach ($Sample in $Visual) { if ([double]$Sample.Groups[1].Value -gt .1) { throw "$Role displayed pose did not converge to authoritative state" } }
         if ([Math]::Abs($Before.X-$Expected.X) -gt .1 -or [Math]::Abs($Before.Y-$Expected.Y) -gt .1 -or [Math]::Abs($Before.Z-$Expected.Z) -gt .1) { throw "$Role transform differs from server" }
         if ($After.State -ne 4 -or $After.Actor -ne 0) { throw "$Role did not receive deletion tombstone" }
         $Results[$Role]=@{before=$Before;after=$After}

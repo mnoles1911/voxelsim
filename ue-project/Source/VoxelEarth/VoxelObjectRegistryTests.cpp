@@ -49,8 +49,14 @@ bool FVoxelObjectRegistryTest::RunTest(const FString&)
     int32 Attempts=0;Callbacks.Restore=[&](const FEntry& E)->AActor*{++Attempts;Budget.Remove(E.Id);return nullptr;};
     FSettings Settings;Settings.MaxTransitions=2;Settings.MaxInspections=3;
     const auto Result=Budget.Tick(Views,1.,Callbacks,Settings);
-    TestEqual(TEXT("Bounded inspections"),Result.Inspected,3);TestEqual(TEXT("Bounded restore attempts"),Attempts,2);
+    TestEqual(TEXT("Inspection cursor stops after attempt budget"),Result.Inspected,2);TestEqual(TEXT("Bounded restore attempts"),Attempts,2);
     TestEqual(TEXT("Callback removal survives stale restore"),Budget.Snapshot(false).Num(),3);
+    FRegistry Fair;for(int32 I=0;I<5;++I){FEntry Candidate;Candidate.Id=FGuid::NewGuid();Candidate.Kind=1;Candidate.Geometry=MakeShared<const TArray<uint8>,ESPMode::ThreadSafe>();Fair.Import(Candidate);}
+    TSet<FGuid> Attempted;FCallbacks Failures;Failures.BeginRestore=[&](const FEntry& Candidate){Attempted.Add(Candidate.Id);return false;};
+    // Default 128 inspections exceeds the five entries; failed starts must not
+    // reset the cursor and repeatedly monopolize both transition attempts.
+    for(int32 I=0;I<3;++I)Fair.Tick(Views,.1,Failures);
+    TestEqual(TEXT("Every entry gets an attempt despite persistent failures"),Attempted.Num(),5);
     FRegistry Staged;FEntry Pending;Pending.Id=FGuid::NewGuid();Pending.Kind=2;Pending.Geometry=MakeShared<const TArray<uint8>,ESPMode::ThreadSafe>();
     Pending.Lifetime.Kind=EVoxelDebrisLifetime::Harvestable;Pending.Lifetime.RemainingSeconds=5.;Staged.Import(Pending);
     FCallbacks AsyncCallbacks;int32 Began=0;AsyncCallbacks.BeginRestore=[&](const FEntry&){++Began;return true;};

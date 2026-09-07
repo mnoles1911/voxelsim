@@ -1,0 +1,51 @@
+{
+  "id": "chacma-baboon-0007",
+  "species": "chacma-baboon",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "5e5029d3a6c05492",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "5e5029d3a6c05492",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.74,
+    "length_m": 1.325,
+    "footprint_m": [
+      1.33,
+      0.31
+    ],
+    "grid_mb": 0.3,
+    "extent_vox": [
+      106,
+      25,
+      59
+    ],
+    "vox_models_needed": 1,
+    "voxels": 23691,
+    "by_material": {
+      "26": 1610,
+      "30": 17,
+      "39": 22064
+    },
+    "ground_contact": 22,
+    "ms_grow": 3.0,
+    "ms_raster": 41.0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 47.7
+  },
+  "problems": [],
+  "vox_models": 1
+}

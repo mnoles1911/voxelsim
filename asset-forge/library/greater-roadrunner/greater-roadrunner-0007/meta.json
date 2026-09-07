@@ -1,0 +1,53 @@
+{
+  "id": "greater-roadrunner-0007",
+  "species": "greater-roadrunner",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "15a2719c5bfcfd1c",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "15a2719c5bfcfd1c",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.26,
+    "length_m": 0.488,
+    "footprint_m": [
+      0.49,
+      0.11
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      39,
+      9,
+      21
+    ],
+    "vox_models_needed": 1,
+    "voxels": 912,
+    "by_material": {
+      "26": 90,
+      "30": 551,
+      "31": 20,
+      "32": 30,
+      "39": 221
+    },
+    "ground_contact": 12,
+    "ms_grow": 1.9,
+    "ms_raster": 8.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 11.1
+  },
+  "problems": [],
+  "vox_models": 1
+}

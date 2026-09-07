@@ -1,0 +1,52 @@
+{
+  "id": "blue-whale-0007",
+  "species": "blue-whale",
+  "kind": "cetacean",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "7ee98c07a1046167",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "7ee98c07a1046167",
+    "kind": "cetacean",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 10.0,
+    "height_m": 4.1,
+    "length_m": 29.9,
+    "footprint_m": [
+      29.9,
+      9.5
+    ],
+    "grid_mb": 4.1,
+    "extent_vox": [
+      299,
+      95,
+      41
+    ],
+    "vox_models_needed": 2,
+    "voxels": 237988,
+    "by_material": {
+      "26": 95,
+      "27": 103344,
+      "28": 40528,
+      "34": 94021
+    },
+    "ground_contact": 843,
+    "ms_grow": 3.1,
+    "ms_raster": 261.6,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 293.1
+  },
+  "problems": [],
+  "vox_models": 2
+}

@@ -1,5 +1,6 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "VoxelObjectPages.h"
+#include "VoxelDetachedPersistence.h"
 #include "Misc/AutomationTest.h"
 #include "Async/Async.h"
 #include "Misc/Paths.h"
@@ -20,6 +21,12 @@ bool FVoxelObjectPagesTest::RunTest(const FString&)
     TestFalse(TEXT("Dormant payload is disk backed"),Registry.Find(E.Id)->Geometry.IsValid());
     TestTrue(TEXT("In-flight immutable snapshot remains usable"),Frozen[0].Geometry==E.Geometry);
     FEntry DiskSnapshot=*Registry.Find(E.Id);
+    auto PortableJob=Async(EAsyncExecution::ThreadPool,[DiskSnapshot,E](){
+        VoxelDetachedPersistence::FSnapshot Input;Input.Add(DiskSnapshot);TArray<uint8> Payload;
+        VoxelDetachedPersistence::FSnapshot Output;
+        return VoxelDetachedPersistence::EncodeSnapshot(Input,Payload)&&VoxelDetachedPersistence::DecodeSnapshot(Payload,Output)&&
+            Output.Num()==1&&Output[0].Id==E.Id&&Output[0].Geometry&&*Output[0].Geometry==*E.Geometry&&!Output[0].Page.IsValid();
+    });TestTrue(TEXT("Page-only snapshot becomes portable self-contained save bytes"),PortableJob.Get());
     auto ReadJob=Async(EAsyncExecution::ThreadPool,[DiskSnapshot]()mutable{Hydrate(DiskSnapshot);return DiskSnapshot.Geometry;});
     const auto Loaded=ReadJob.Get();TestTrue(TEXT("Worker snapshot hydration exact bytes"),Loaded&&*Loaded==*E.Geometry);
     TestTrue(TEXT("Hydration publishes current geometry"),PublishRead(Registry,E.Id,3,Page,Loaded));
@@ -32,6 +39,10 @@ bool FVoxelObjectPagesTest::RunTest(const FString&)
         if(!FFileHelper::SaveArrayToFile(File,*Page.Path))return false;
         VoxelObjects::FGeometry Value;return !Read(Page,Value)&&!Value;
     });TestTrue(TEXT("Corrupt page rejected before materialization"),CorruptJob.Get());
+    auto CorruptSaveJob=Async(EAsyncExecution::ThreadPool,[DiskSnapshot](){
+        VoxelDetachedPersistence::FSnapshot Input;Input.Add(DiskSnapshot);TArray<uint8> Payload;
+        return !VoxelDetachedPersistence::EncodeSnapshot(Input,Payload);
+    });TestTrue(TEXT("Corrupt referenced page refuses save encoding"),CorruptSaveJob.Get());
     auto FailureJob=Async(EAsyncExecution::ThreadPool,[Directory,E](){
         const FString Blocker=Directory/TEXT("not-a-directory");TArray<uint8> B;B.Add(1);
         if(!FFileHelper::SaveArrayToFile(B,*Blocker))return false;

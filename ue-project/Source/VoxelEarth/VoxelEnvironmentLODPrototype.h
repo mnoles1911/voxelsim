@@ -2,6 +2,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "VoxelObjectGeometrySnapshot.h"
+#include "VoxelEnvironmentAsset.h"
 #include "VoxelEnvironmentLODPrototype.generated.h"
 class UStaticMeshComponent;
 class UProceduralMeshComponent;
@@ -9,8 +10,8 @@ class UMaterialInstanceDynamic;
 struct FEnvironmentLODState;
 struct FEnvironmentStagedRestore;
 
-// Opt-in, standalone four-asset experiment. Separate editable grids; no change
-// to terrain generation, production banks or the terrain renderer's ownership.
+// Shared editable environment actor. The legacy class name and four-fixture
+// launcher remain for compatibility; source identity and grids are generic.
 UCLASS()
 class VOXELEARTH_API AVoxelEnvironmentLODPrototype : public AActor
 {
@@ -33,8 +34,12 @@ public:
         GeometrySnapshot=Geometry;return true;
     }
     bool InitializeAsset(const FString& Name, int32 FinestMm, bool Collision);
+    bool InitializeAssetFromVxa(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& Vxa,bool Collision,bool FitTerrain=false);
+    const FVoxelEnvironmentAssetDescriptor& GetAssetDescriptor() const {return SourceDescriptor;}
+    bool IsFellable() const {return SourceDescriptor.Fellable;}
     bool SolidAt(const FVector& WorldUU) const;
     bool Trace(const FVector& Start, const FVector& Direction, double Range, FVector& Hit) const;
+    bool GetDigBounds(const FVector& WorldHit,int32 SizeVoxels,FBox& Bounds) const;
     bool Carve(const FVector& Hit, int32 SizeVoxels);
     bool Chop(const FVector& Hit,const FVector& Direction,int32 SizeVoxels);
     bool CanChop(const FVector& Hit) const;
@@ -46,6 +51,7 @@ public:
     UPROPERTY(Transient) TArray<TObjectPtr<UStaticMeshComponent>> Levels;
     UPROPERTY(Transient) TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
 private:
+    FVoxelEnvironmentAssetDescriptor SourceDescriptor;
     bool RefreshGeometrySnapshot();
     FVoxelImmutableGeometry GeometrySnapshot;
     TSharedPtr<FEnvironmentStagedRestore,ESPMode::ThreadSafe> StagedRestore;

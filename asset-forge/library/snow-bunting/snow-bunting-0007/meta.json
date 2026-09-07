@@ -1,0 +1,50 @@
+{
+  "id": "snow-bunting-0007",
+  "species": "snow-bunting",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "19ef221b2833452c",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "19ef221b2833452c",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.11,
+    "length_m": 0.213,
+    "footprint_m": [
+      0.21,
+      0.08
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      17,
+      6,
+      9
+    ],
+    "vox_models_needed": 1,
+    "voxels": 217,
+    "by_material": {
+      "26": 130,
+      "36": 87
+    },
+    "ground_contact": 14,
+    "ms_grow": 1.7,
+    "ms_raster": 3.2,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 5.7
+  },
+  "problems": [],
+  "vox_models": 1
+}

@@ -1,6 +1,7 @@
 #pragma once
 #include "CoreMinimal.h"
 #include "voxelcore/assetownership.h"
+#include "VoxelGpuMeshJobManager.h"
 
 // Presentation bridge for ordinary terrain assets. This class does not spawn
 // actors, edit the terrain or suppress materials. The production renderer must
@@ -22,6 +23,15 @@ struct FSource
     uint64 ObjectRevision=1,ProjectionRevision=1;
     FAdmission Admission;
 };
+struct FPreparedPage
+{
+    vxc::AssetRenderPage Page;
+    uint64 Generation=0;
+    FVoxelBrickCpuPackRef CpuBricks;
+    TArray<uint64> CpuQuads;
+    FVoxelGpuBrickPayloadRef GpuBricks;
+    FVoxelGpuQuadPayloadRef GpuQuads;
+};
 using FAtomicPublish=TFunction<bool(const vxc::AssetOwnershipSnapshot& Before,
                                   const vxc::AssetOwnershipSnapshot& After,
                                   const std::vector<vxc::AssetRenderPage>& Pages)>;
@@ -36,6 +46,9 @@ public:
                                      std::vector<vxc::AssetRenderPage> Pages);
     bool MarkObjectReady(vxc::AssetOwnershipTicket Ticket,uint64 Revision);
     bool MarkPageReady(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint8 Backend,uint64 Generation);
+    bool StageGpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,FVoxelGpuMeshJobResult&& Result);
+    bool StageCpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,FVoxelBrickCpuPackRef Bricks,TArray<uint64>&& Quads);
+    const TArray<FPreparedPage>* PreparedPages(vxc::AssetOwnershipTicket Ticket) const;
     bool Commit(vxc::AssetOwnershipTicket Ticket);
     bool Cancel(vxc::AssetOwnershipTicket Ticket);
     bool AcceptsVisibleJob(uint64 Generation) const {return Ownership.acceptsVisibleJob(Generation);}
@@ -44,5 +57,7 @@ private:
     FSnapshot Published;
     FAtomicPublish Publish;
     uint8 RequiredBackends;
+    vxc::AssetOwnershipTicket StagingTicket;
+    TArray<FPreparedPage> StagedPages;
 };
 }

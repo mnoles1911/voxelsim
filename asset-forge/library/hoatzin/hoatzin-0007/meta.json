@@ -1,0 +1,54 @@
+{
+  "id": "hoatzin-0007",
+  "species": "hoatzin",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "0b89d85a6e02d8c5",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "0b89d85a6e02d8c5",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.48,
+    "length_m": 0.525,
+    "footprint_m": [
+      0.53,
+      0.18
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      42,
+      14,
+      38
+    ],
+    "vox_models_needed": 1,
+    "voxels": 2716,
+    "by_material": {
+      "30": 1335,
+      "32": 26,
+      "34": 224,
+      "36": 47,
+      "39": 630,
+      "40": 454
+    },
+    "ground_contact": 8,
+    "ms_grow": 1.8,
+    "ms_raster": 11.6,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 14.4
+  },
+  "problems": [],
+  "vox_models": 1
+}

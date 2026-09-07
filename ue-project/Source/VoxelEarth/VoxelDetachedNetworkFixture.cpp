@@ -83,9 +83,13 @@ void Tick(UWorld* W,float Delta)
     Run.Age+=Delta;const double At[]={8.,20.,70.};
     if(Run.Checkpoint<3&&Run.Age>=At[Run.Checkpoint]){
         UE_LOG(LogVoxelEarth,Log,TEXT("DetachedNetVerify checkpoint=%d role=%s"),int32(At[Run.Checkpoint]),*Mode);
-        if(auto R=VoxelObjects::Find(W))for(const auto& E:R->Snapshot())UE_LOG(LogVoxelEarth,Log,
-            TEXT("DetachedNetVerify id=%s rev=%llu geom=%llu state=%u actor=%d retained=%d pos=%s"),
-            *E.Id.ToString(),E.Revision,E.GeometryRevision,uint32(E.Residency),E.Actor.IsValid(),E.bRetained,*E.Transform.GetLocation().ToString());
+        if(auto R=VoxelObjects::Find(W))for(const auto& E:R->Snapshot()){
+            UE_LOG(LogVoxelEarth,Log,
+                TEXT("DetachedNetVerify id=%s rev=%llu geom=%llu state=%u actor=%d retained=%d pos=%s"),
+                *E.Id.ToString(),E.Revision,E.GeometryRevision,uint32(E.Residency),E.Actor.IsValid(),E.bRetained,*E.Transform.GetLocation().ToString());
+            if(auto Actor=E.Actor.Get())UE_LOG(LogVoxelEarth,Log,TEXT("DetachedNetVerify visual id=%s errorCm=%.6f"),
+                *E.Id.ToString(),FVector::Distance(Actor->GetActorLocation(),E.Transform.GetLocation()));
+        }
         ++Run.Checkpoint;
     }
     // Give a cold late-client startup enough time to verify its tombstone too.

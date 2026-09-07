@@ -1,0 +1,52 @@
+{
+  "id": "greater-rhea-0007",
+  "species": "greater-rhea",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "9ee4d08ae9d4984e",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "9ee4d08ae9d4984e",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.14,
+    "length_m": 1.0,
+    "footprint_m": [
+      1.0,
+      0.59
+    ],
+    "grid_mb": 0.8,
+    "extent_vox": [
+      80,
+      47,
+      91
+    ],
+    "vox_models_needed": 1,
+    "voxels": 62143,
+    "by_material": {
+      "26": 3733,
+      "37": 37715,
+      "39": 20110,
+      "46": 585
+    },
+    "ground_contact": 10,
+    "ms_grow": 3.4,
+    "ms_raster": 64.1,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 74.8
+  },
+  "problems": [],
+  "vox_models": 1
+}

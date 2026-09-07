@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(slopeprobe LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+add_executable(slopeprobe main.cpp)
+target_include_directories(slopeprobe PRIVATE ../../voxel-core/include)
+target_link_libraries(slopeprobe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../voxel-core/build/Release/voxelcore.lib)

@@ -1,0 +1,51 @@
+{
+  "id": "mud-catfish-0007",
+  "species": "mud-catfish",
+  "kind": "fish",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "0f235013b259b91f",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "0f235013b259b91f",
+    "kind": "fish",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.16,
+    "length_m": 0.537,
+    "footprint_m": [
+      0.54,
+      0.21
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      43,
+      17,
+      13
+    ],
+    "vox_models_needed": 1,
+    "voxels": 1279,
+    "by_material": {
+      "26": 394,
+      "27": 240,
+      "30": 645
+    },
+    "ground_contact": 2,
+    "ms_grow": 1.8,
+    "ms_raster": 3.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 5.9
+  },
+  "problems": [],
+  "vox_models": 1
+}

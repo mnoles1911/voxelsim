@@ -1,5 +1,7 @@
 #include "VoxelDetachedReplication.h"
 #include "VoxelDetachedPersistence.h"
+#include "VoxelEnvironmentAsset.h"
+#include "VoxelReplicaMotion.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelEarth.h"
 #include "Engine/World.h"
@@ -69,7 +71,7 @@ void Motion(FArchive& Ar,VoxelObjects::FEntry& E)
 }
 bool Valid(const VoxelObjects::FEntry& E)
 {
-    return E.Id.IsValid()&&E.Revision>0&&E.Kind>=1&&E.Kind<=3&&E.Transform.IsValid()&&!E.Transform.ContainsNaN()&&
+    return E.Id.IsValid()&&E.Revision>0&&E.Kind>=1&&E.Kind<=3&&(E.Kind!=3||VoxelEnvironmentAsset::IsSupportedTransform(E.Transform))&&E.Transform.IsValid()&&!E.Transform.ContainsNaN()&&
       !E.Velocity.ContainsNaN()&&!E.AngularVelocity.ContainsNaN()&&!E.BoundsExtent.ContainsNaN()&&
       FMath::IsFinite(E.Lifetime.RemainingSeconds)&&E.Lifetime.RemainingSeconds>=0&&
       uint8(E.Lifetime.Kind)<=uint8(EVoxelDebrisLifetime::Retained);
@@ -81,14 +83,13 @@ void DestroyReplica(VoxelObjects::FEntry& E)
     AActor* Actor=E.Actor.Get();E.Actor.Reset();
     if(IsValid(Actor))Actor->Destroy();
 }
-bool ApplyGeometry(UWorld* W,VoxelObjects::FEntry E)
+bool ApplyGeometry(UWorld* W,VoxelObjects::FEntry E,AActor* Actor)
 {
     const FGuid IncomingId=E.Id;
     auto& Registry=VoxelObjects::Get(W);auto Old=Registry.Find(E.Id);
     if(!Valid(E))return false;
-    if(Old&&(Old->Residency==VoxelObjects::EResidency::Tombstone||Old->Revision>E.Revision||
-       (Old->Revision==E.Revision&&Old->Actor.IsValid())))return true;
-    AActor* Actor=VoxelDetachedPersistence::RestoreObject(W,E);if(!IsValid(Actor))return false;
+    if(Old&&(Old->Residency==VoxelObjects::EResidency::Tombstone||Old->Revision>E.Revision))return false;
+    if(!IsValid(Actor)||!VoxelDetachedPersistence::PublishRestoredObject(Actor,E))return false;
     Old=Registry.Find(E.Id);AActor* Previous=Old?Old->Actor.Get():nullptr;E.Actor=Actor;
     bool Accepted=true;
     if(Old&&Old->Revision==E.Revision){*Old=MoveTemp(E);Old->Residency=VoxelObjects::EResidency::Live;}
@@ -96,12 +97,14 @@ bool ApplyGeometry(UWorld* W,VoxelObjects::FEntry E)
     if(Accepted){
         if(IsValid(Previous))Previous->Destroy();
         UE_LOG(LogVoxelEarth,Log,TEXT("DetachedNet installed id=%s pos=%s"),*IncomingId.ToString(),*Actor->GetActorLocation().ToString());
-    }else Actor->Destroy();
+    }
     return Accepted;
 }
 }
 struct FVoxelDetachedReplicationState
 {
+    struct FVisualMotion {TWeakObjectPtr<AActor> Actor;VoxelReplicaMotion::FBlend Blend;};
+    TMap<FGuid,FVisualMotion> VisualMotion;
     FGuid RemoteEpoch;
     TSet<FGuid> RetiredEpochs;
     uint32 Received=0;
@@ -114,10 +117,39 @@ struct FVoxelDetachedReplicationState
     int32 IncomingRawBytes=0;
     uint32 DecodeSequence=0;
     TWeakObjectPtr<AVoxelEarthPlayerController> DecodeController;
+    TUniquePtr<VoxelObjects::FEntry> WaitingRestore, LatestMotion;
+    FGuid IncomingId;
+    uint64 RestoreHandle=0;
 };
+namespace
+{
+void ApplyReplicaMotion(FVoxelDetachedReplicationState& State,UWorld* World,const VoxelObjects::FEntry& Entry)
+{
+    auto Actor=Entry.Actor.Get();if(!IsValid(Actor))return;
+    if(VoxelReplicaMotion::ShouldBlend(Entry.Kind,Actor->GetActorTransform(),Entry.Transform)){
+        auto& Visual=State.VisualMotion.FindOrAdd(Entry.Id);
+        Visual.Actor=Actor;
+        Visual.Blend={Actor->GetActorTransform(),Entry.Transform,World->GetTimeSeconds(),.1};
+    }else{
+        State.VisualMotion.Remove(Entry.Id);
+        Actor->SetActorTransform(Entry.Transform,false,nullptr,ETeleportType::TeleportPhysics);
+    }
+    if(auto Life=Actor->FindComponentByClass<UVoxelDebrisLifecycle>())Life->RestoreState(Entry.Lifetime);
+}
+void TickReplicaMotion(FVoxelDetachedReplicationState& State,UWorld* World)
+{
+    const auto Registry=VoxelObjects::Find(World);const double Now=World->GetTimeSeconds();
+    for(auto It=State.VisualMotion.CreateIterator();It;++It){
+        const auto Entry=Registry?Registry->Find(It.Key()):nullptr;auto Actor=It.Value().Actor.Get();
+        if(!Entry||Entry->Residency!=VoxelObjects::EResidency::Live||!IsValid(Actor)||Entry->Actor.Get()!=Actor){It.RemoveCurrent();continue;}
+        Actor->SetActorTransform(It.Value().Blend.Sample(Now),false,nullptr,ETeleportType::TeleportPhysics);
+        if(It.Value().Blend.Complete(Now))It.RemoveCurrent();
+    }
+}
+}
 void UVoxelDetachedReplication::Initialize(FSubsystemCollectionBase& Collection)
 {Super::Initialize(Collection);State=MakeShared<FVoxelDetachedReplicationState>();}
-void UVoxelDetachedReplication::Deinitialize(){State.Reset();Super::Deinitialize();}
+void UVoxelDetachedReplication::Deinitialize(){if(State){State->RemoteEpoch.Invalidate();if(State->RestoreHandle)VoxelDetachedPersistence::CancelRestoreObject(State->RestoreHandle);}State.Reset();Super::Deinitialize();}
 bool UVoxelDetachedReplication::DoesSupportWorldType(EWorldType::Type Type) const
 {return Type==EWorldType::Game||Type==EWorldType::PIE;}
 TStatId UVoxelDetachedReplication::GetStatId() const
@@ -141,12 +173,40 @@ void UVoxelDetachedReplication::Tick(float Delta)
     UWorld* W=GetWorld();if(!State||!W)return;
     VoxelDetachedNetworkFixture::Tick(W,Delta);
     if(W->GetNetMode()==NM_Client){
+        TickReplicaMotion(*State,W);
         if(State->Decoding&&State->Decoding->IsReady()){
             auto Result=State->Decoding->Get();State->Decoding.Reset();
-            const bool Accepted=Result.Valid&&Result.Entries.Num()==1&&ApplyGeometry(W,MoveTemp(Result.Entries[0]));
-            State->Received=State->DecodeSequence;
-            if(auto PC=State->DecodeController.Get())PC->ServerAcknowledgeDetachedPacket(State->DecodeSequence,Accepted);
-            if(!Accepted)UE_LOG(LogVoxelEarth,Error,TEXT("DetachedNet async snapshot decode/restore failed"));
+            if(Result.Valid&&Result.Entries.Num()==1)State->WaitingRestore=MakeUnique<VoxelObjects::FEntry>(MoveTemp(Result.Entries[0]));
+            else {
+                State->Received=State->DecodeSequence;
+                if(auto PC=State->DecodeController.Get())PC->ServerAcknowledgeDetachedPacket(State->DecodeSequence,false);
+                UE_LOG(LogVoxelEarth,Error,TEXT("DetachedNet async snapshot decode failed"));
+            }
+        }
+        if(State->WaitingRestore&&!State->RestoreHandle&&!W->bIsTearingDown){
+            const auto Incoming=*State->WaitingRestore;const FGuid Epoch=State->RemoteEpoch;const uint32 Sequence=State->DecodeSequence;
+            TWeakPtr<FVoxelDetachedReplicationState> Weak=State;TWeakObjectPtr<UWorld> World=W;
+            auto Completion=[Weak,World,Incoming,Epoch,Sequence](AActor* Actor){
+                auto S=Weak.Pin();auto CurrentWorld=World.Get();if(!S||!CurrentWorld||CurrentWorld->bIsTearingDown||S->RemoteEpoch!=Epoch)return false;
+                S->RestoreHandle=0;S->WaitingRestore.Reset();
+                auto& Registry=VoxelObjects::Get(CurrentWorld);auto Existing=Registry.Find(Incoming.Id);
+                const bool Obsolete=Existing&&(Existing->Residency==VoxelObjects::EResidency::Tombstone||Existing->GeometryRevision>Incoming.GeometryRevision);
+                auto Current=Incoming;
+                auto Merge=[&](const VoxelObjects::FEntry* Motion){if(Motion&&Motion->GeometryRevision==Current.GeometryRevision&&Motion->Revision>Current.Revision){auto Geometry=Current.Geometry;auto Dynamic=MoveTemp(Current.Dynamic);const uint32 Format=Current.GeometryFormat;Current=*Motion;Current.Geometry=MoveTemp(Geometry);Current.Dynamic=MoveTemp(Dynamic);Current.GeometryFormat=Format;Current.Actor.Reset();}};
+                Merge(Existing);Merge(S->LatestMotion.Get());
+                const bool Published=!Obsolete&&IsValid(Actor)&&ApplyGeometry(CurrentWorld,MoveTemp(Current),Actor);
+                S->Received=Sequence;S->IncomingId.Invalidate();S->LatestMotion.Reset();
+                if(auto PC=S->DecodeController.Get())PC->ServerAcknowledgeDetachedPacket(Sequence,Published||Obsolete);
+                if(!Published&&!Obsolete)UE_LOG(LogVoxelEarth,Error,TEXT("DetachedNet staged replica publication failed"));
+                return Published;
+            };
+            // A full restore queue is temporary: retain the decoded snapshot
+            // and retry next tick without rejecting its authoritative revision.
+            State->RestoreHandle=VoxelDetachedPersistence::BeginRestoreObject(W,Incoming,MoveTemp(Completion),[Weak,World,Epoch,Id=Incoming.Id,Geometry=Incoming.GeometryRevision](){
+                auto S=Weak.Pin();if(!S||!World.IsValid()||World->bIsTearingDown||S->RemoteEpoch!=Epoch)return false;
+                auto Registry=VoxelObjects::Find(World.Get());auto Existing=Registry?Registry->Find(Id):nullptr;
+                return !Existing||(Existing->Residency!=VoxelObjects::EResidency::Tombstone&&Existing->GeometryRevision<=Geometry);
+            });
         }
         return;
     }
@@ -220,7 +280,7 @@ void UVoxelDetachedReplication::Tick(float Delta)
                             if(!Known)continue;
                             Tag(Removed?EMessage::Remove:EMessage::Evict);Motion(Ar,E);P.Known.Remove(E.Id);Found=true;
                         } else if(!Known||Known->Geometry!=E.GeometryRevision){
-                            if(!E.Geometry)continue;
+                            if(!E.Geometry&&!E.Page.IsValid())continue;
                             if(State->ActiveEncode.IsValid())continue;
                             P.Entry=E;E.Actor.Reset();P.Encoding=MakeShared<FEncodeJob>();State->ActiveEncode=P.Encoding;
                             P.Encoding->Result=Async(EAsyncExecution::ThreadPool,[E=MoveTemp(E)]() mutable {
@@ -265,11 +325,15 @@ void UVoxelDetachedReplication::ReceiveMotion(AVoxelEarthPlayerController* PC,co
     auto& R=VoxelObjects::Get(W);
     for(int32 I=0;I<Updates.Num();++I){
         auto E=MoveTemp(Updates[I]);auto Old=R.Find(E.Id);
+        if(E.Id==State->IncomingId){
+            if(!State->LatestMotion||State->LatestMotion->Revision<E.Revision)State->LatestMotion=MakeUnique<VoxelObjects::FEntry>(E);
+            if(Removed[I]&&!Old){E.Residency=VoxelObjects::EResidency::Tombstone;R.Import(MoveTemp(E));continue;}
+        }
         if(!Old||Old->Residency==VoxelObjects::EResidency::Tombstone||Old->Revision>=E.Revision)continue;
         if(Removed[I]){DestroyReplica(*Old);E.Residency=VoxelObjects::EResidency::Tombstone;R.Import(MoveTemp(E));}
         else if(Old->GeometryRevision==E.GeometryRevision){
-            E.Actor=Old->Actor;E.Geometry=Old->Geometry;E.Dynamic=Old->Dynamic;E.GeometryFormat=Old->GeometryFormat;
-            if(auto A=E.Actor.Get()){A->SetActorTransform(E.Transform,false,nullptr,ETeleportType::TeleportPhysics);if(auto Life=A->FindComponentByClass<UVoxelDebrisLifecycle>())Life->RestoreState(E.Lifetime);}
+            E.Actor=Old->Actor;E.Geometry=Old->Geometry;E.Dynamic=Old->Dynamic;E.GeometryFormat=Old->GeometryFormat;E.Residency=Old->Residency;
+            ApplyReplicaMotion(*State,W,E);
             R.Import(MoveTemp(E));
         }
     }
@@ -286,21 +350,27 @@ void UVoxelDetachedReplication::Receive(AVoxelEarthPlayerController* PC,const TA
         if(Sequence!=1||State->RetiredEpochs.Contains(Epoch)||Ar.Tell()!=Ar.TotalSize())return;
         if(State->RemoteEpoch==Epoch){PC->ServerAcknowledgeDetachedPacket(Sequence,true);return;}
         if(State->RemoteEpoch.IsValid())State->RetiredEpochs.Add(State->RemoteEpoch);
+        // Cancel currently invokes completion(nullptr); invalidate its captured
+        // epoch before cancellation so it cannot ACK an old-world sequence.
+        State->RemoteEpoch=Epoch;
+        if(State->RestoreHandle)VoxelDetachedPersistence::CancelRestoreObject(State->RestoreHandle);
+        State->RestoreHandle=0;State->WaitingRestore.Reset();State->LatestMotion.Reset();State->IncomingId.Invalidate();
         if(auto R=VoxelObjects::Find(W))for(auto E:R->Snapshot())if(auto Current=R->Find(E.Id))DestroyReplica(*Current);
-        VoxelObjects::Forget(W);State->Assembly.Reset();State->Decoding.Reset();State->DecodeController.Reset();
+        VoxelObjects::Forget(W);State->VisualMotion.Reset();State->Assembly.Reset();State->Decoding.Reset();State->DecodeController.Reset();
         State->RemoteEpoch=Epoch;State->Received=Sequence;
         PC->ServerAcknowledgeDetachedPacket(Sequence,true);return;
     }
     if(Epoch!=State->RemoteEpoch)return;
     if(Sequence<=State->Received){PC->ServerAcknowledgeDetachedPacket(Sequence,true);return;}
     if(Sequence!=State->Received+1)return;
+    if(Sequence==State->DecodeSequence&&(State->WaitingRestore||State->RestoreHandle))return;
     auto& Registry=VoxelObjects::Get(W);bool Accepted=false;
     if(Message==EMessage::Geometry){
         FGuid Id;uint64 Revision=0;int32 Total=0,RawBytes=0,Offset=0,N=0;uint32 Checksum=0;
         Ar<<Id<<Revision<<Total<<RawBytes<<Checksum<<Offset<<N;
         if(!Ar.IsError()&&!State->Decoding&&RawBytes>0&&RawBytes<=MaxRawBytes&&N>0&&N<=VoxelDetachedWire::ChunkBytes&&N==Ar.TotalSize()-Ar.Tell()&&
            (Offset==0||RawBytes==State->IncomingRawBytes)){
-            if(Offset==0)State->IncomingRawBytes=RawBytes;
+            if(Offset==0){State->IncomingRawBytes=RawBytes;State->IncomingId=Id;State->LatestMotion.Reset();}
             TArray<uint8> Chunk;Chunk.SetNumUninitialized(N);Ar.Serialize(Chunk.GetData(),N);
             Accepted=State->Assembly.Add(Id,Revision,Total,Checksum,Offset,Chunk);
             if(Accepted&&State->Assembly.Data.Num()==Total){
@@ -332,8 +402,8 @@ void UVoxelDetachedReplication::Receive(AVoxelEarthPlayerController* PC,const TA
             } else if(Message==EMessage::Evict){
                 if(Old&&Old->Revision<=E.Revision){DestroyReplica(*Old);Old->Residency=VoxelObjects::EResidency::Dormant;}
             } else if(Old&&Old->Residency!=VoxelObjects::EResidency::Tombstone&&Old->Revision<E.Revision&&Old->GeometryRevision==E.GeometryRevision){
-                E.Actor=Old->Actor;E.Geometry=Old->Geometry;E.Dynamic=Old->Dynamic;E.GeometryFormat=Old->GeometryFormat;
-                if(auto Actor=E.Actor.Get()){Actor->SetActorTransform(E.Transform,false,nullptr,ETeleportType::TeleportPhysics);if(auto Life=Actor->FindComponentByClass<UVoxelDebrisLifecycle>())Life->RestoreState(E.Lifetime);}
+                E.Actor=Old->Actor;E.Geometry=Old->Geometry;E.Dynamic=Old->Dynamic;E.GeometryFormat=Old->GeometryFormat;E.Residency=Old->Residency;
+                ApplyReplicaMotion(*State,W,E);
                 Registry.Import(MoveTemp(E));
             }
         }

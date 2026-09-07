@@ -1,0 +1,51 @@
+{
+  "id": "great-skua-0007",
+  "species": "great-skua",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "8da6f9ac9d0a408c",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "8da6f9ac9d0a408c",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.18,
+    "length_m": 0.488,
+    "footprint_m": [
+      0.49,
+      1.16
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      39,
+      93,
+      14
+    ],
+    "vox_models_needed": 1,
+    "voxels": 5181,
+    "by_material": {
+      "30": 3993,
+      "32": 5,
+      "36": 1183
+    },
+    "ground_contact": 7,
+    "ms_grow": 2.8,
+    "ms_raster": 16.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 20.9
+  },
+  "problems": [],
+  "vox_models": 1
+}

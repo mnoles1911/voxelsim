@@ -1,0 +1,52 @@
+{
+  "id": "elk-wapiti-0007",
+  "species": "elk-wapiti",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "f220467ceb807748",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "f220467ceb807748",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 2.5,
+    "length_m": 1.988,
+    "footprint_m": [
+      1.99,
+      0.71
+    ],
+    "grid_mb": 2.9,
+    "extent_vox": [
+      159,
+      57,
+      200
+    ],
+    "vox_models_needed": 1,
+    "voxels": 183682,
+    "by_material": {
+      "26": 2272,
+      "30": 27614,
+      "39": 128522,
+      "46": 25274
+    },
+    "ground_contact": 60,
+    "ms_grow": 2.9,
+    "ms_raster": 272.1,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 309.8
+  },
+  "problems": [],
+  "vox_models": 1
+}

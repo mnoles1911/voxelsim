@@ -58,6 +58,7 @@ add_executable(vxc_tests
   test_craft125.cpp
   test_craftpersist.cpp
   test_craftcost.cpp
+  test_assetownership.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
@@ -153,3 +154,29 @@ if(VXC_WITH_ZSTD)
 endif()
 
 add_test(NAME vxc_tests COMMAND vxc_tests)
+
+# Focused publication/provenance checks without the unrelated fluid suite.
+add_executable(vxc_assetownership_tests test_main.cpp test_assetownership.cpp)
+target_link_libraries(vxc_assetownership_tests PRIVATE voxelcore Threads::Threads)
+if(NOT MSVC)
+  target_compile_options(vxc_assetownership_tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME vxc_assetownership_tests COMMAND vxc_assetownership_tests)
+
+add_executable(vxc_sparseassetgrid_tests test_main.cpp test_sparseassetgrid.cpp)
+target_link_libraries(vxc_sparseassetgrid_tests PRIVATE voxelcore Threads::Threads)
+if(NOT MSVC)
+  target_compile_options(vxc_sparseassetgrid_tests PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME vxc_sparseassetgrid_tests COMMAND vxc_sparseassetgrid_tests)
+
+# Compile the same grid coverage under Unreal's exception-disabled contract.
+add_executable(vxc_sparseassetgrid_noexceptions_tests test_main.cpp test_sparseassetgrid.cpp)
+target_link_libraries(vxc_sparseassetgrid_noexceptions_tests PRIVATE voxelcore Threads::Threads)
+if(MSVC)
+  target_compile_options(vxc_sparseassetgrid_noexceptions_tests PRIVATE /EHs-c-)
+  target_compile_definitions(vxc_sparseassetgrid_noexceptions_tests PRIVATE _HAS_EXCEPTIONS=0)
+else()
+  target_compile_options(vxc_sparseassetgrid_noexceptions_tests PRIVATE -fno-exceptions -Wall -Wextra -Werror)
+endif()
+add_test(NAME vxc_sparseassetgrid_noexceptions_tests COMMAND vxc_sparseassetgrid_noexceptions_tests)

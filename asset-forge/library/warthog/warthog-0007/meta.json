@@ -1,0 +1,51 @@
+{
+  "id": "warthog-0007",
+  "species": "warthog",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "8f85812b6c17f900",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "8f85812b6c17f900",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.85,
+    "length_m": 1.1,
+    "footprint_m": [
+      1.1,
+      0.31
+    ],
+    "grid_mb": 0.2,
+    "extent_vox": [
+      88,
+      25,
+      68
+    ],
+    "vox_models_needed": 1,
+    "voxels": 23235,
+    "by_material": {
+      "26": 25,
+      "27": 83,
+      "37": 23127
+    },
+    "ground_contact": 50,
+    "ms_grow": 1.7,
+    "ms_raster": 25.0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 29.9
+  },
+  "problems": [],
+  "vox_models": 1
+}

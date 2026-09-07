@@ -1,0 +1,51 @@
+{
+  "id": "spotted-eagle-ray-0007",
+  "species": "spotted-eagle-ray",
+  "kind": "fish",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "c03c1d350b858b0b",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "c03c1d350b858b0b",
+    "kind": "fish",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.18,
+    "length_m": 2.85,
+    "footprint_m": [
+      2.85,
+      0.3
+    ],
+    "grid_mb": 0.2,
+    "extent_vox": [
+      228,
+      24,
+      14
+    ],
+    "vox_models_needed": 1,
+    "voxels": 19786,
+    "by_material": {
+      "26": 10256,
+      "27": 2982,
+      "36": 6548
+    },
+    "ground_contact": 352,
+    "ms_grow": 1.7,
+    "ms_raster": 9.8,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 14.1
+  },
+  "problems": [],
+  "vox_models": 1
+}

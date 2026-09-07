@@ -1,0 +1,51 @@
+{
+  "id": "forest-buffalo-0007",
+  "species": "forest-buffalo",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "f97006f6f82beed6",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "f97006f6f82beed6",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.11,
+    "length_m": 2.087,
+    "footprint_m": [
+      2.09,
+      0.56
+    ],
+    "grid_mb": 1.0,
+    "extent_vox": [
+      167,
+      45,
+      89
+    ],
+    "vox_models_needed": 1,
+    "voxels": 149479,
+    "by_material": {
+      "26": 32920,
+      "30": 799,
+      "40": 115760
+    },
+    "ground_contact": 122,
+    "ms_grow": 3.1,
+    "ms_raster": 103.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 120.2
+  },
+  "problems": [],
+  "vox_models": 1
+}

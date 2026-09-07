@@ -1,0 +1,53 @@
+{
+  "id": "dorcas-gazelle-0007",
+  "species": "dorcas-gazelle",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "8e5de83bd40dfea1",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "8e5de83bd40dfea1",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.86,
+    "length_m": 0.888,
+    "footprint_m": [
+      0.89,
+      0.2
+    ],
+    "grid_mb": 0.2,
+    "extent_vox": [
+      71,
+      16,
+      69
+    ],
+    "vox_models_needed": 1,
+    "voxels": 16052,
+    "by_material": {
+      "26": 4,
+      "30": 1520,
+      "36": 3273,
+      "39": 11116,
+      "46": 139
+    },
+    "ground_contact": 30,
+    "ms_grow": 3.0,
+    "ms_raster": 31.9,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 37.1
+  },
+  "problems": [],
+  "vox_models": 1
+}

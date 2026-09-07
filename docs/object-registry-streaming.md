@@ -13,3 +13,9 @@ Dormant harvestable objects preserve their remaining gameplay lifetime and conti
 `Voxel.Objects.Registry` automation checks stable identity, strict revision ordering, immutable geometry replacement, negative-region boundaries, load/unload hysteresis, active-body/pin exclusions, timer preservation and expiry, permanent tombstones, stale restore callbacks, and bounded inspections/restores.
 
 This registry does not by itself implement disk paging, asset-library deduplication, arbitrary ordinary terrain-stamped tree ownership migration, or bounded mesh reconstruction within a single restore. Integration layers own those capabilities; shared geometry handles do not make a monolithic actor rebuild asynchronous.
+
+## Integrated paging and restoration
+
+`VoxelObjectPages` now supplies bounded worker IO and verified disk references. `VoxelObjectRestore` supplies the four-job global staged actor queue, with a two-step/soft-2-ms frame budget. The registry's optional `BeginRestore` callback keeps a record `Restoring`; `CompleteRestore` accepts only the matching geometry revision, and cancellation returns it to dormancy. Lifetime changes during restoration do not invalidate the geometry job. The scheduler preserves its cursor when transition attempts exhaust the budget, so repeatedly failing entries cannot starve later ones.
+
+See `detached-object-integration.md` for measured verification and remaining production renderer/physics limits.

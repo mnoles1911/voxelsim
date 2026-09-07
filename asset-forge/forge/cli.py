@@ -409,7 +409,8 @@ def _palette_drift() -> str:
 def cmd_selftest(args) -> int:
     """Checks the three properties the rest of the tool assumes."""
     ok = True
-    s = specmod.default_spec()
+    # Exercise the current supported-pitch policy, as loaded specs do.
+    s, _ = specmod.validate(specmod.default_spec())
 
     # forge/palette.py is GENERATED from the engine's materialpalette.h, and
     # nothing makes anyone regenerate it. Edit the header, forget the command,

@@ -1,0 +1,51 @@
+{
+  "id": "white-rhinoceros-0007",
+  "species": "white-rhinoceros",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "ee2ce08049f1c031",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "ee2ce08049f1c031",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.6,
+    "length_m": 3.3,
+    "footprint_m": [
+      3.3,
+      1.01
+    ],
+    "grid_mb": 3.6,
+    "extent_vox": [
+      264,
+      81,
+      128
+    ],
+    "vox_models_needed": 2,
+    "voxels": 848974,
+    "by_material": {
+      "26": 68,
+      "37": 839850,
+      "39": 9056
+    },
+    "ground_contact": 214,
+    "ms_grow": 1.7,
+    "ms_raster": 328.7,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 394.5
+  },
+  "problems": [],
+  "vox_models": 2
+}

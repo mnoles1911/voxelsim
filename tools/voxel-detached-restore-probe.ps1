@@ -1,4 +1,4 @@
-param([ValidateSet('restore','async','async-exit')][string]$Mode = 'restore')
+param([ValidateSet('restore','async','async-exit','async-v4')][string]$Mode = 'restore')
 $ErrorActionPreference = 'Stop'
 $busy = Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild -ErrorAction SilentlyContinue
 if ($busy) { throw 'An editor or compiler is active. Leave that session alone.' }
@@ -8,11 +8,13 @@ if (-not (Test-Path -LiteralPath $save)) { throw 'Run the tree-felling -Persiste
 $probeCommands = @{
     'restore' = 'voxel.DetachedPersistence.CheckRestored'
     'async' = 'voxel.SaveAsync.Probe'
+    'async-v4' = 'voxel.SaveAsync.Probe'
     'async-exit' = 'voxel.SaveAsync.Probe exit'
 }
 $probeLogs = @{
     'restore' = 'Saved/detached-restart-game.log'
     'async' = 'Saved/async-save-game.log'
+    'async-v4' = 'Saved/staged-restore-game.log'
     'async-exit' = 'Saved/async-save-exit-game.log'
 }
 $launchArgs = @(
@@ -24,10 +26,10 @@ $launchArgs = @(
     ('-ExecCmds="voxel.Debug.PlayerBox 0,' + $probeCommands[$Mode] + '"'),
     ('-abslog="' + (Join-Path $projectRoot $probeLogs[$Mode]) + '"')
 )
-if ($Mode -eq 'async-exit') {
+if ($Mode -in @('async-exit','async-v4')) {
     $asyncSave = Join-Path $projectRoot 'ue-project/Saved/SaveGames/async_save_verification/world.vxlog'
     if (-not (Test-Path -LiteralPath $asyncSave)) { throw 'Run -Mode async first.' }
     $launchArgs += '-VoxelAsyncRestoreProbe'
 }
-$gameProcess = Start-Process 'D:/UE_5.8/Engine/Binaries/Win64/UnrealEditor.exe' -ArgumentList $launchArgs -WindowStyle Normal -PassThru
+$gameProcess = Start-Process 'D:/UE_5.8/Engine/Binaries/Win64/UnrealEditor.exe' -ArgumentList $launchArgs -WindowStyle Hidden -PassThru
 Write-Output "Restore verification game launched: PID $($gameProcess.Id)"

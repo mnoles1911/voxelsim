@@ -1,0 +1,53 @@
+{
+  "id": "great-barracuda-0007",
+  "species": "great-barracuda",
+  "kind": "fish",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "26f29e6e0b74be25",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "26f29e6e0b74be25",
+    "kind": "fish",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.28,
+    "length_m": 1.45,
+    "footprint_m": [
+      1.45,
+      0.19
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      116,
+      15,
+      22
+    ],
+    "vox_models_needed": 1,
+    "voxels": 5373,
+    "by_material": {
+      "26": 1502,
+      "27": 1059,
+      "28": 1791,
+      "32": 45,
+      "38": 976
+    },
+    "ground_contact": 32,
+    "ms_grow": 2.8,
+    "ms_raster": 7.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 11.6
+  },
+  "problems": [],
+  "vox_models": 1
+}

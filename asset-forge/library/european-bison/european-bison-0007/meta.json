@@ -1,0 +1,51 @@
+{
+  "id": "european-bison-0007",
+  "species": "european-bison",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "a7d8f919b637053b",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "a7d8f919b637053b",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.89,
+    "length_m": 2.9,
+    "footprint_m": [
+      2.9,
+      0.84
+    ],
+    "grid_mb": 2.7,
+    "extent_vox": [
+      232,
+      67,
+      151
+    ],
+    "vox_models_needed": 1,
+    "voxels": 579604,
+    "by_material": {
+      "26": 331636,
+      "27": 1759,
+      "30": 246209
+    },
+    "ground_contact": 50,
+    "ms_grow": 3.0,
+    "ms_raster": 276.1,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 323.9
+  },
+  "problems": [],
+  "vox_models": 1
+}

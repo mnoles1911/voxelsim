@@ -1,0 +1,51 @@
+{
+  "id": "narwhal-0007",
+  "species": "narwhal",
+  "kind": "cetacean",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "6a60a69e432e632a",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "6a60a69e432e632a",
+    "kind": "cetacean",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.74,
+    "length_m": 4.475,
+    "footprint_m": [
+      4.48,
+      1.11
+    ],
+    "grid_mb": 7.5,
+    "extent_vox": [
+      358,
+      89,
+      59
+    ],
+    "vox_models_needed": 2,
+    "voxels": 478895,
+    "by_material": {
+      "26": 190187,
+      "36": 81031,
+      "37": 207677
+    },
+    "ground_contact": 677,
+    "ms_grow": 1.8,
+    "ms_raster": 737.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 783.1
+  },
+  "problems": [],
+  "vox_models": 2
+}

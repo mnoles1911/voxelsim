@@ -130,6 +130,11 @@ FTickResult FRegistry::Tick(const TArray<FView>& Views,double Delta,const FCallb
     const double Load=FMath::Max(0.,S.LoadDistanceCm),Unload=FMath::Max(Load,S.UnloadDistanceCm);
     int32 Transitions=0;
     for(int32 I=0;I<Inspect;++I){
+        // Stop at the attempt budget rather than wrapping the scan to its old
+        // start. Otherwise two failed restores starve every later entry when
+        // the whole registry fits in one inspection pass. Dormant timers use
+        // elapsed samples, so skipped entries accrue time on their next visit.
+        if(S.MaxTransitions>0&&Transitions>=S.MaxTransitions)break;
         if(Order.IsEmpty())break;Cursor%=Order.Num();const FGuid Id=Order[Cursor++];++Result.Inspected;
         auto E=Find(Id);if(!E||E->Residency==EResidency::Tombstone)continue;
         if(E->Residency==EResidency::Dormant||E->Residency==EResidency::Restoring){

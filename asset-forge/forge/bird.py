@@ -129,6 +129,7 @@ import math
 import numpy as np
 
 from . import materials
+from .creature_detail import side_disk, side_seam
 from . import parts
 from .grid import VoxelGrid
 from .spec import BY_PATH as _BY_PATH
@@ -292,10 +293,21 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float,
     _tail(tag, p)
     _wings(tag, p, body)
 
+    # On tiny short-necked birds the skull can engulf the entire neck/body
+    # seam, leaving a few neck-coloured voxels on the skull's outside. These
+    # are cranial surface, not a free-floating articulated neck. Assign their
+    # rig ownership to the head while retaining the original painting tags.
+    rig_tags = tag.data
+    from scipy.ndimage import binary_dilation
+    neck = tag.data == T_NECK
+    if neck.any() and not (binary_dilation(neck) & (tag.data == T_BODY)).any():
+        rig_tags = tag.data.copy()
+        rig_tags[neck] = T_HEAD
+
     grid = VoxelGrid(p["shape"], (0, 0, 0), voxel_m)
     _paint(grid, tag.data, p, body)
     if out is not None:
-        out["tags"] = parts.to_shared(tag.data, _TO_SHARED)
+        out["tags"] = parts.to_shared(rig_tags, _TO_SHARED)
     return grid
 
 
@@ -1166,7 +1178,12 @@ def _wings_folded(tag: VoxelGrid, p: dict, body: np.ndarray) -> None:
     # the top of the back, which is the one place the upperparts colour has to
     # be seen. A folded wing is a rind on the SIDE of the bird.
     bulge = max(1.0, 0.16 * p["width_v"])
-    halfmap = np.interp(tt, tg, half) + bulge
+    # Taper the covert layer into shoulder and rump, with subtle overlapping
+    # feather ridges only once a feather can span several fine-lattice cells.
+    taper = np.sin(np.pi * np.clip(s / body_v, 0.0, 1.0)) ** 0.5
+    feather = (0.5 + 0.5 * np.cos(2 * np.pi * (7 * tt + h / max(p["depth_v"], 1))))
+    relief = min(0.65, bulge * 0.18) * feather if body_v >= 18 else 0.0
+    halfmap = np.interp(tt, tg, half) + bulge * (0.45 + 0.55 * taper) + relief
     dmap = np.where(h >= 0.0, np.interp(tt, tg, dtop), np.interp(tt, tg, dbot))
 
     # The closed wing runs from just behind the shoulder to the rump and covers
@@ -1537,16 +1554,13 @@ def _eye(mat: np.ndarray, tags: np.ndarray, p: dict) -> None:
     if _contrast(materials.color(partner), materials.color(p["mat_eye"])) < 1.4:
         partner = None
 
-    n = rad - 1
-    for y in (int(ys[0]), int(ys[-1])):
-        for dz in range(-n, n + 1):
-            for dx in range(-n, n + 1):
-                xx, zz = x + dx, z + dz
-                if 0 <= xx < nx and 0 <= zz < nz and head[xx, y, zz]:
-                    mat[xx, y, zz] = p["mat_eye"]
-        xx = min(x + rad, nx - 1)
-        if partner is not None and head[xx, y, z]:
-            mat[xx, y, z] = partner
+    # Follow the curved head separately at every sample. A fixed y plane
+    # buries all but the centre of a larger pupil in the skull.
+    radius = max(rad - 1, 0.12 * p["head_r"], 0.5)
+    side_disk(mat, head, x, z, radius, p["mat_eye"])
+    if partner is not None and radius >= 1.2:
+        side_disk(mat, head, x + radius * 0.45, z + radius * 0.45, 0.5, partner)
+
 
 
 def _luminance(rgb) -> float:
