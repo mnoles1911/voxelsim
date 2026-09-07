@@ -2337,6 +2337,38 @@ VOXELEARTHSHADERS_API void VoxelMarchPublishSunColour(const FLinearColor& SunCol
                                                       const FLinearColor& AmbientColour,
                                                       float MoonFraction);
 
+// THE BATHYMETRY SEAM (R7, docs/water-realism-analysis-2026-09-06.md).
+//
+// The marcher draws the lake and sea FLOORS -- observation 4d: terrain quads
+// are retired (voxel.Terrain.RetireQuads 1) and the clipmap's inner hole is
+// 8,192 m, so neither material Phase F1 wired its caustic term into shades a
+// near-field terrain pixel. To put that light where the floor actually is, the
+// emit pass needs the same water depth the water material reads, and it cannot
+// get it the way the material does: UVoxelBathyFieldSubsystem publishes its
+// window's origin and size to MPC_VoxelSky, and a render pass cannot read a
+// Material Parameter Collection.
+//
+// So this is that publication, as a wire. GAME THREAD; called by the bathy
+// subsystem every time it uploads a window, and with bValid false whenever it
+// drops one (disarm, deinitialise). The texture is /Game/Voxel/T_VoxelBathyInfo
+// itself -- R = water depth in metres, B = "the bake answered this cell" -- and
+// the marcher honours both channels and this flag, which fail independently
+// (see VoxelBathyField.h's "A CONSUMER MUST HONOUR BOTH").
+//
+//   OriginUU  world UU of the window's MINIMUM corner, xy -- the same number
+//             that goes to MPC BathyFieldOrigin
+//   SizeUU    the window's width in UU (kSize * kTexelUU), i.e. the reciprocal
+//             of MPC BathyFieldInvSize. Passed the right way up so the caller
+//             never has to invert anything twice.
+//
+// NEVER CALLED => the marcher has no window, the caustic block is skipped, and
+// the emit is byte-identical to the pre-R7 pass. That is the off arm and the
+// fail-off direction: with no depth, the alternative would be caustics painted
+// on dry ground.
+VOXELEARTHSHADERS_API void VoxelMarchPublishBathyField(class UTexture2D* InfoTexture,
+                                                       const FVector2D& OriginUU, double SizeUU,
+                                                       bool bValid);
+
 // The shadow-mask floor the shadow march composes with (voxel.March.ShadowFloor
 // under the voxel.March.VSLighting master -- both cvars live in
 // VoxelMarchRenderer.cpp so the master can gate every VS-lighting term from one

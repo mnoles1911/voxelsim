@@ -16,6 +16,7 @@
 
 #include "VoxelDebug.h"           // LogVoxelWater
 #include "VoxelFineTileStreamer.h" // pulls voxelcore/tilestore.h -- NOT UHT-parsed, so this is legal
+#include "VoxelMarchRenderer.h"   // R7: VoxelMarchPublishBathyField -- the marcher draws the floor
 #include "VoxelWaterSubsystem.h" // Phase C: quantised sea datum + connectivity window
 #include "VoxelWorldSubsystem.h"
 
@@ -494,6 +495,20 @@ void UVoxelBathyFieldSubsystem::PublishWindow(int64 Px0, int64 Py0)
 			delete Regions;
 		});
 
+	const double OriginXUU = static_cast<double>(OriginPx_) * kTexelUU;
+	const double OriginYUU = static_cast<double>(OriginPy_) * kTexelUU;
+
+	// THE SECOND CONSUMER, AND IT IS NOT A MATERIAL (R7,
+	// docs/water-realism-analysis-2026-09-06.md). The ray marcher draws the lake
+	// and sea floors -- terrain quads are retired and the clipmap's inner hole
+	// is 8 km, so the two materials Phase F1 wired its caustic term into shade
+	// nothing here -- and a render pass cannot read a Material Parameter
+	// Collection. Same tick as the upload, same reason as the MPC write below,
+	// and it carries the origin in DOUBLE rather than through the float the
+	// collection can hold.
+	VoxelMarchPublishBathyField(InfoTexture_, FVector2D(OriginXUU, OriginYUU),
+	                            static_cast<double>(kSize) * kTexelUU, /*bValid=*/true);
+
 	// SAME TICK AS THE UPLOAD. See the header: the pixels and the origin they
 	// are relative to must never be a frame apart, and the only way to guarantee
 	// that is to enqueue the render command and write the collection in the same
@@ -503,8 +518,6 @@ void UVoxelBathyFieldSubsystem::PublishWindow(int64 Px0, int64 Py0)
 		if (UMaterialParameterCollection* Sky =
 		        LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath))
 		{
-			const double OriginXUU = static_cast<double>(OriginPx_) * kTexelUU;
-			const double OriginYUU = static_cast<double>(OriginPy_) * kTexelUU;
 			UKismetMaterialLibrary::SetVectorParameterValue(
 				World, Sky, kBathyParamOrigin,
 				FLinearColor(static_cast<float>(OriginXUU), static_cast<float>(OriginYUU), 0.0f, 0.0f));
@@ -518,6 +531,13 @@ void UVoxelBathyFieldSubsystem::PublishWindow(int64 Px0, int64 Py0)
 
 void UVoxelBathyFieldSubsystem::PublishInvalid()
 {
+	// THE MARCHER FIRST, AND UNCONDITIONALLY. Its wire is not a world
+	// subsystem's parameter collection, so it must be dropped even on the paths
+	// that return early below (no world -- Deinitialize after the world has
+	// gone). A valid window left standing over a world that no longer has one
+	// would paint caustics from yesterday's lake.
+	VoxelMarchPublishBathyField(nullptr, FVector2D::ZeroVector, 0.0, /*bValid=*/false);
+
 	UWorld* World = GetWorld();
 	if (!World)
 	{

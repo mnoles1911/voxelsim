@@ -1,0 +1,159 @@
+// ===========================================================================
+// THE UNDERWATER CAUSTIC FIELD -- ONE DERIVATION, TWO CONSUMERS
+// ===========================================================================
+//
+// The dancing bright filaments sunlight paints on a floor seen through water.
+// Authored for docs/water-ocean-tides-plan-2026-09-04.md Phase F1 as a Python
+// material builder (ue-project/Tools/water_caustics_graph.py); moved HERE by
+// R7 of docs/water-realism-analysis-2026-09-06.md, because the material it was
+// wired into does not draw the lake floor and the RAY MARCHER does.
+//
+// WHY THE HLSL LIVES IN A .USH AND NOT IN TWO PLACES. This project has a
+// four-times-repeated rule that two copies of one derivation drift silently
+// (water_sky_reflection_graph.py:22-31), and a caustic pattern that differs
+// between the marcher's floor and M_Underwater's view of the SAME floor is
+// exactly that defect, in the one frame guaranteed to show both: surfacing at
+// a shoreline. So the field is written once, here, and the two consumers are:
+//
+//   * the ray marcher's emit pass -- VoxelMarch.usf, `#include`s this file;
+//   * the Python material builders -- water_caustics_graph.py, which SHOULD
+//     read the marked body below off disk and emit it verbatim into its
+//     Custom node.
+//
+// THE SECOND CONSUMER IS NOT WIRED YET, AND THAT IS DELIBERATE, NOT AN
+// OVERSIGHT. water_caustics_graph.py is a water-material GENERATOR and was
+// owned by another session on the day this file was written; R7's marcher half
+// does not need it and must not wait for it. Until it lands, the Python module
+// still carries its own `CAUSTIC_CODE` string, and it is BYTE-IDENTICAL to the
+// block between the two markers below -- that is the invariant, and the hook
+// that closes it is one function:
+//
+//     THE HOOK: water_caustics_graph.CAUSTIC_CODE should become
+//         _read_field_body("VoxelCaustics.ush")
+//     slicing between the BEGIN/END marker lines, with a raise if either
+//     marker is missing. Nothing else in that module changes; the Custom
+//     node's five inputs are already named PosM/T/ScaleM/Speed/Sharpness in
+//     the same order this file's VoxelCausticField takes them.
+//
+// WHAT IS *NOT* SHARED, and why. The chain around the field -- the gates, the
+// fade, the sun-ray attenuation -- is duplicated in HLSL here and as material
+// nodes there, because a material graph cannot call a function. The numbers
+// they agree on are all in one of three places: this file's four baked
+// constants, the water's optics (water_optics.py, mirrored into the marcher's
+// C++ as one derived RGB with its own note), and the runtime knobs. Every one
+// of those has a stated authority; none of them is typed twice without a
+// comment saying so.
+// ===========================================================================
+
+#pragma once
+
+// --- THE FOUR BAKED CONSTANTS ----------------------------------------------
+//
+// Mirrors of water_caustics_graph.DEFAULTS' "Baked (not parameters)" block,
+// and they carry that module's arguments for their values:
+//   * the sun-altitude gate is a RAMP and not a step, because a hard cut at
+//     the horizon is the most visible artefact available here;
+//   * the submersion ramp fades the term in over the first 10 cm of depth, so
+//     the waterline does not draw a hard caustic edge on dry sand;
+//   * the secant floor is build_slant_depth's 20x path cap, reused down the
+//     SUN ray: a low sun's light crosses more water, so caustics die earlier
+//     in the evening than at noon.
+#define VOXEL_CAUSTIC_SUN_GATE_SIN_LO   0.10f   // zero below sin(alt) 0.10 (~5.7 deg)
+#define VOXEL_CAUSTIC_SUN_GATE_SIN_HI   0.25f   // full above 0.25 (~14.5 deg)
+#define VOXEL_CAUSTIC_SUBMERGE_RAMP_M   0.10f   // waterline fade-in depth
+#define VOXEL_CAUSTIC_SUN_SECANT_FLOOR  0.05f   // 20x sun-path cap
+
+// ---------------------------------------------------------------------------
+// THE FIELD. Three panned, mutually-warped interference layers.
+//
+// PosM is ABSOLUTE world XY in METRES -- absolute, and not camera-relative,
+// for water_wave_graph's reason: world XY is the only coordinate on which the
+// pattern a swimmer sees below can agree with the pattern a walker sees from
+// the beach. T is material time (View.GameTime for the marcher, the Time node
+// for a material).
+//
+// Real caustics are the wave field's second derivative focused through
+// refraction; this is the industry-standard interference cheat, and
+// water_caustics_graph's docstring argues for it at length. Do not "improve"
+// it here without moving that argument too.
+//
+// THE BODY BETWEEN THE MARKERS IS THE SHARED TEXT. Keep it a self-contained
+// statement list with a `return`, using only the five parameter names -- it
+// has to compile unchanged as the body of a material Custom node, which is
+// exactly that and nothing else. No helper calls, no ResolvedView, no
+// #defines from this file.
+// ---------------------------------------------------------------------------
+float VoxelCausticField(float2 PosM, float T, float ScaleM, float Speed, float Sharpness)
+{
+// ---- BEGIN CAUSTIC_FIELD_BODY (verbatim source for water_caustics_graph.CAUSTIC_CODE)
+// Three panned, mutually-warped interference layers -> one caustic intensity.
+// PosM is ABSOLUTE world XY in metres; T is material time.
+float2 p = PosM / max(ScaleM, 0.01);
+float  t = T * Speed;
+float2 d1 = float2( 0.8572,  0.5150);
+float2 d2 = float2(-0.5878,  0.8090);
+float2 d3 = float2( 0.1219, -0.9925);
+// layer 1: the coarse cell structure
+float a = sin(dot(p, d1) * 6.2832 + t) * sin(dot(p, d2) * 5.1100 - t * 0.87);
+// layer 2, sampled on a domain layer 1 has displaced
+float2 pw = p + 0.35 * float2(a, -a);
+float b = sin(dot(pw, d2) * 8.1300 + t * 1.31) * sin(dot(pw, d1) * 7.0700 - t * 0.71);
+// layer 3, displaced by both
+float2 pw2 = pw + 0.27 * float2(b, b);
+float c = sin(dot(pw2, d3) * 11.900 + t * 1.73) * sin(dot(pw2, d1) * 9.4000 + t * 0.53);
+// interference sum -> [0,1] -> sharpened filaments
+float v = saturate(0.5 + 0.5 * (a * 0.45 + b * 0.35 + c * 0.40));
+return pow(v, max(Sharpness, 1.0));
+// ---- END CAUSTIC_FIELD_BODY
+}
+
+// ---------------------------------------------------------------------------
+// THE WHOLE TERM, as an additive light. The chain is
+//
+//   light = field * sunGate * submerged * distanceFade * Intensity
+//         * exp(-absorbRGB * depth / max(sunZ, floor))
+//
+// term for term the one water_caustics_graph's module docstring states, with
+// its two intensities (the MPC gain and the per-material CausticsEnabled)
+// collapsed into the single `Intensity` the caller hands in -- the marcher has
+// one consumer, so a second kill switch there would be a knob with no second
+// thing to switch.
+//
+// NON-NEGATIVE AND ZERO WHEREVER ANY GATE IS ZERO, which is what makes
+// Intensity 0 a byte-identical off arm at the call site: the caller multiplies
+// nothing, it skips the call.
+//
+//   PosM        absolute world XY, metres, at the shaded point
+//   T           material time
+//   DepthM      metres of water ABOVE the shaded point; <= 0 is dry
+//   DistUU      camera distance to the shaded point, UE units
+//   SunZ        sin(sun altitude) -- SunDirection.z, the same quantity the
+//               material reads off MPC_VoxelSky
+//   FieldParams ScaleM, Speed, Sharpness, Intensity
+//   FadeUU      distance fade start and end, UE units (1 inside start, 0 past
+//               end)
+//   AbsorbPerM  the water's absorption coefficient, per metre, per channel --
+//               derived from water_optics, never typed as a literal
+// ---------------------------------------------------------------------------
+float3 VoxelCausticLight(float2 PosM, float T, float DepthM, float DistUU, float SunZ,
+                         float4 FieldParams, float2 FadeUU, float3 AbsorbPerM)
+{
+	const float SunGate = saturate((SunZ - VOXEL_CAUSTIC_SUN_GATE_SIN_LO) /
+	                               (VOXEL_CAUSTIC_SUN_GATE_SIN_HI - VOXEL_CAUSTIC_SUN_GATE_SIN_LO));
+	const float Submerged = saturate(DepthM / VOXEL_CAUSTIC_SUBMERGE_RAMP_M);
+	// 1 at FadeUU.x, 0 at FadeUU.y. max() on the denominator is the degenerate
+	// guard for an end <= start, which a cvar can produce and which would
+	// otherwise divide by zero on every submerged pixel in the frame.
+	const float Fade = 1.0f - saturate((DistUU - FadeUU.x) / max(FadeUU.y - FadeUU.x, 1.0f));
+	const float Gates = SunGate * Submerged * Fade * FieldParams.w;
+	if (Gates <= 0.0f)
+	{
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	// The PATH is angle-true down the SUN ray, which is bathy_field_graph's
+	// 2026-09-05 secant lesson applied to the one ray this term is about.
+	const float SunPathM = DepthM / max(SunZ, VOXEL_CAUSTIC_SUN_SECANT_FLOOR);
+	const float3 Transmit = exp(-AbsorbPerM * SunPathM);
+	const float Field = VoxelCausticField(PosM, T, FieldParams.x, FieldParams.y, FieldParams.z);
+	return Field * Gates * Transmit;
+}
