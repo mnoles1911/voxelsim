@@ -6845,6 +6845,20 @@ struct FVoxelWorldImpl
     bool ProductionRenderAffects(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const;
     bool ProductionRenderSupported(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const;
     VoxelProductionCandidate::FWorkRef ProductionCandidate;
+    struct FProductionPageRehearsal {
+        VoxelEnvironmentPages::FTicket Ticket;
+        TArray<VoxelCoords::FVoxelLevelChunkKey> Keys;
+        TArray<FVoxelBrickAllocationToken> Tokens;
+        FVector Anchor=FVector::ZeroVector;
+        double Started=0;
+        int32 MaxRing=0,WaitTicks=0;
+        double Inner[VoxelCoords::kNumLevels]={},Outer[VoxelCoords::kNumLevels]={};
+        bool Captured=false;
+    };
+    TUniquePtr<FProductionPageRehearsal> ProductionRehearsal;
+    void EndProductionRehearsal(const TCHAR* Reason);
+    void CancelProductionCandidate(const TCHAR* Reason);
+    void TickProductionRehearsal(const FVector& Anchor);
 	std::atomic<int32> ProductionCandidateWorkers{0};
 	void TickProductionCandidate(UWorld* World,const FVector& Anchor);
 	bool ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const;
@@ -18082,13 +18096,89 @@ bool FVoxelWorldImpl::ProductionCandidateResident(const vxc::AssetVoxelRect& Rec
     return FineStreamer->IsFootprintResident(Rect.vx0*100-Reach,Rect.vy0*100-Reach,Rect.vx1*100+Reach+100,Rect.vy1*100+Reach+100);
 }
 
+void FVoxelWorldImpl::EndProductionRehearsal(const TCHAR* Reason)
+{
+    check(IsInGameThread());
+    if(!ProductionRehearsal)return;
+    const bool Released=PageBarrier.Release(ProductionRehearsal->Ticket);check(Released);
+    UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL RELEASED reason=%s; allocatorPinned=0 publicationReady=0"),Reason);
+    ProductionRehearsal.Reset();
+}
+void FVoxelWorldImpl::CancelProductionCandidate(const TCHAR* Reason)
+{
+    EndProductionRehearsal(Reason);
+    VoxelProductionCandidate::Cancel(ProductionCandidate);
+}
+void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
+{
+    check(IsInGameThread());
+    auto Work=ProductionCandidate;
+    if(!Work||!Work->RehearseHandoff||Work->Phase!=5)return;
+    const auto Refuse=[&](const TCHAR* Why){
+        UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHandoff REHEARSAL REFUSED: %s; allocatorPinned=0 publicationReady=0"),Why);
+        Work->RehearseHandoff=false;EndProductionRehearsal(Why);
+    };
+    if(!ProductionRehearsal){
+        auto State=MakeUnique<FProductionPageRehearsal>();
+        if(Work->Pages.empty()||Work->Pages.size()>VoxelProductionCandidate::MaxPages){Refuse(TEXT("invalid complete page set"));return;}
+        State->Keys.Reserve(int32(Work->Pages.size()));
+        for(const auto& P:Work->Pages){
+            if(P.level>=VoxelCoords::kNumLevels||P.x<MIN_int32||P.x>MAX_int32||P.y<MIN_int32||P.y>MAX_int32||P.z<MIN_int32||P.z>MAX_int32){Refuse(TEXT("page coordinate out of bounds"));return;}
+            State->Keys.Add({int32(P.level),{int32(P.x),int32(P.y),int32(P.z)}});
+        }
+        State->Ticket=PageBarrier.TryFreeze(State->Keys);
+        if(!State->Ticket.IsValid()){Refuse(TEXT("complete page freeze refused"));return;}
+        State->Started=FPlatformTime::Seconds();State->Anchor=Anchor;
+        State->MaxRing=UVoxelWorldSubsystem::GetMaxRingLevel();
+        const auto* Rings=UVoxelWorldSubsystem::GetRingPresets();
+        for(int32 L=0;L<VoxelCoords::kNumLevels;++L){State->Inner[L]=Rings[L].InnerMeters;State->Outer[L]=Rings[L].OuterMeters;}
+        ProductionRehearsal=MoveTemp(State);
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL FROZEN pages=%d activeWorldLeases=%d; draining existing producers; allocatorPinned=0 publicationReady=0"),
+            ProductionRehearsal->Keys.Num(),PageBarrier.ActiveLeases());
+    }
+    auto& State=*ProductionRehearsal;
+    if(FPlatformTime::Seconds()-State.Started>30.){Refuse(TEXT("30-second quiescence/validation timeout"));return;}
+    // Conservative fixed-anchor rehearsal: ring movement invalidates the evidence.
+    // Real transactions need a versioned desired-ring set, not this diagnostic hold.
+    if(!Anchor.Equals(State.Anchor,0.01)||State.MaxRing!=UVoxelWorldSubsystem::GetMaxRingLevel()){Refuse(TEXT("streaming anchor/ring extent changed"));return;}
+    const auto* Rings=UVoxelWorldSubsystem::GetRingPresets();
+    for(int32 L=0;L<VoxelCoords::kNumLevels;++L)if(State.Inner[L]!=Rings[L].InnerMeters||State.Outer[L]!=Rings[L].OuterMeters){Refuse(TEXT("ring configuration changed"));return;}
+    if(!PageBarrier.IsQuiescent(State.Ticket)){++State.WaitTicks;return;}
+    auto& Pool=GetGlobalVoxelBrickPool();
+    if(!State.Captured){
+        // Observe only AFTER old ordinary CPU/GPU producers and queued results drain.
+        // These tokens are not allocator pins. External pool pressure may invalidate
+        // them, which the following tick must reject rather than call a successful handoff.
+        State.Tokens.Reserve(State.Keys.Num());
+        for(const auto& Key:State.Keys)State.Tokens.Add(Pool.SnapshotAllocation(VoxelBrickCpuArm::MakeKey(Key)));
+        State.Captured=true;
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL QUIESCENT pages=%d; validating allocation observations on next tick; allocatorPinned=0 publicationReady=0"),State.Keys.Num());
+        return;
+    }
+    int32 Visible=0,Pending=0,Parked=0,Absent=0;
+    for(int32 I=0;I<State.Keys.Num();++I){
+        const auto& Key=State.Keys[I];const auto& Before=State.Tokens[I];
+        const auto Now=Pool.SnapshotAllocation(VoxelBrickCpuArm::MakeKey(Key));
+        if(Before.bPresent!=Now.bPresent||Before.Slot!=Now.Slot||Before.AddSequence!=Now.AddSequence){Refuse(TEXT("unpinned allocation token changed after quiescence"));return;}
+        const auto* Record=ChunkRecords.Find(Key);
+        // Exclusive categories, including pages outside currently loaded rings.
+        if(ParkedGeometry.Contains(Key))++Parked;
+        else if(Now.bPresent||(Record&&Record->HoldsGeometry()))++Visible;
+        else if(Record||SpeculativeInFlight.Contains(Key)||PendingGameThreadKeys.Contains(Key))++Pending;
+        else ++Absent;
+    }
+    UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHandoff REHEARSAL PASSED spec=%s pages=%d visibleResident=%d pending=%d parked=%d absent=%d affectedLeaseWaitTicks=%d; allocation observations stable for one tick; allocatorPinned=0 publicationReady=0"),
+        *Work->Descriptor.SpecId,State.Keys.Num(),Visible,Pending,Parked,Absent,State.WaitTicks);
+    Work->RehearseHandoff=false;EndProductionRehearsal(TEXT("successful observation-only rehearsal"));
+}
+
 void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Anchor)
 {
     using namespace VoxelProductionCandidate;
     check(IsInGameThread());
     const int32 Request=ConsumeRequest(World);
-    if(Request==2){Cancel(ProductionCandidate);UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate CANCELLED"));return;}
-    if(Request==1)
+    if(Request==2){CancelProductionCandidate(TEXT("explicit cancellation"));UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate CANCELLED"));return;}
+    if(Request==1||Request==3)
     {
         if((ProductionCandidate&&ProductionCandidate->Phase<5)||ProductionCandidateWorkers.load()>0)
         {
@@ -18096,7 +18186,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
         }
         else
         {
-            Cancel(ProductionCandidate);
+            CancelProductionCandidate(TEXT("replacement request"));
             if(!FMath::IsFinite(Anchor.X)||!FMath::IsFinite(Anchor.Y)||FMath::Abs(Anchor.X)>double(int64(1)<<30)*10.||FMath::Abs(Anchor.Y)>double(int64(1)<<30)*10.)return;
             const int64 X=FMath::FloorToInt64(Anchor.X/10.),Y=FMath::FloorToInt64(Anchor.Y/10.);
             constexpr int64 MaxAnchor=int64(1)<<30;
@@ -18107,6 +18197,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
                 UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: requires resident fine terrain, provider identity and catalog"));return;
             }
             auto Work=MakeShared<FWork,ESPMode::ThreadSafe>();ProductionCandidate=Work;
+            Work->RehearseHandoff=Request==3;
             Work->Started=FPlatformTime::Seconds();Work->EditEpoch=EditEpoch.load();Work->ResidencyEpoch=FineStreamer->ResidencyEpoch();
             const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
             ProductionCandidateWorkers.fetch_add(1);
@@ -18152,7 +18243,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
         }
     }
     auto Work=ProductionCandidate;if(!Work)return;
-    const auto Refuse=[&](const TCHAR* Why){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: %s"),Why);Cancel(ProductionCandidate);};
+    const auto Refuse=[&](const TCHAR* Why){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: %s"),Why);CancelProductionCandidate(Why);};
     if(!FineStreamer||!IsCurrent(*Work,EditEpoch.load(),FineStreamer->ResidencyEpoch())){Refuse(TEXT("cancelled or edit/residency epoch changed"));return;}
     if(FPlatformTime::Seconds()-Work->Started>90.){Refuse(TEXT("90-second preparation/retention limit"));return;}
     if(Work->Phase==0)
@@ -18233,6 +18324,7 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
                 *Work->Descriptor.SpecId,Id.high,Id.low,uint32(Work->Provenance.yawQuarter),*Work->CanonicalSourceHash,*Work->ClippedGeometryHash,int32(Work->Pages.size()),Work->VisiblePages,Work->PendingPages,Work->ParkedPages);
         }
     }
+    if(Work->Phase==5&&Work->RehearseHandoff)TickProductionRehearsal(Anchor);
 }
 
 // The rect a (Level, ChunkX, ChunkY) footprint resolves over. ONE derivation,
@@ -19430,6 +19522,10 @@ uint8 FVoxelWorldImpl::ComputeRetainReplacementZMask(const VoxelCoords::FVoxelLe
 bool FVoxelWorldImpl::AdmitCandidateCommit(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, double SortKeySq,
                                             bool bDeepAnchorRelative, bool bOverlayAware, const FVector& Anchor)
 {
+    if (PageBarrier.IsFrozen(LevelKey)) {
+        DeferredFootprints[FMath::Clamp(LevelKey.Level,0,VoxelCoords::kNumLevels-1)].Add(FIntPoint(LevelKey.Key.X,LevelKey.Key.Y));
+        return false;
+    }
 	using namespace VoxelCoords;
 	// Recomputed, not passed: (Cx+0.5)*ChunkEdge is the identical expression
 	// the cell sweep evaluated, on the same doubles, so the values are
@@ -19623,6 +19719,10 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
     const VoxelCoords::FVoxelLevelChunkKey& LevelKey, bool bDeepAnchorRelative, const FVector& Anchor,
     bool* bCellDeferredRecordedPtr)
 {
+    if (PageBarrier.IsFrozen(LevelKey)) {
+        DeferredFootprints[FMath::Clamp(LevelKey.Level,0,VoxelCoords::kNumLevels-1)].Add(FIntPoint(LevelKey.Key.X,LevelKey.Key.Y));
+        return EAdmitEvalOutcome::RejectedBudget;
+    }
 	using namespace VoxelCoords;
 	const double ChunkEdge = ChunkEdgeUUForLevel(LevelKey.Level);
 	const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
@@ -22099,6 +22199,7 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 	for (int32 Read = 0; Read < OldNum; ++Read)
 	{
 		const FSortEntry Entry = Entries[Read];
+		if (PageBarrier.IsFrozen(Entry.Key)) { Entries[Write++] = Entry; continue; }
 		if (ToDrop > 0)
 		{
 			VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Entry.Key);
@@ -24988,6 +25089,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		const FSortEntry PoppedEntry =
 			PendingJobKeysByLevel[PickLevel].Pop(EAllowShrinking::No); // highest priority in that ring (see SortPendingQueues)
 		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PoppedEntry.Key;
+		if (PageBarrier.IsFrozen(LevelKey)) { DeferredOwnership[PickLevel].Add(PoppedEntry); continue; }
 		ThisFrameDispatchPickMs += float((FPlatformTime::Seconds() - PickStart) * 1000.0);
 
 		// dispatchDot: mean cos(bearing of the picked chunk vs the camera's
@@ -27255,6 +27357,8 @@ void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)
 // producers frees nothing and reports nothing.
 void FVoxelWorldImpl::ReleaseChunkBricks(const VoxelCoords::FVoxelLevelChunkKey& Key)
 {
+	// Unload/park eviction only; old producer replacements must still drain.
+	if (PageBarrier.IsFrozen(Key)) return;
 	if (GetGlobalVoxelBrickPool().RemoveChunk(VoxelBrickCpuArm::MakeKey(Key)))
 	{
 		++BricksReleasedSinceLog;
@@ -27633,6 +27737,7 @@ void FVoxelWorldImpl::DispatchSpeculativeJobs()
 			break;
 		}
 		const VoxelCoords::FVoxelLevelChunkKey Key = SpeculativeKeys.Pop(EAllowShrinking::No);
+		if (PageBarrier.IsFrozen(Key)) { SpeculativeKeys.Add(Key); break; }
 
 		// Re-check: demand may have admitted this key since it was enumerated,
 		// in which case speculating it is duplicate work.
@@ -27904,7 +28009,7 @@ void FVoxelWorldImpl::EvictOldestSpeculative()
 	{
 		const VoxelCoords::FVoxelLevelChunkKey Key = ParkedInsertionOrder[I];
 		const FParkedGeometry* Entry = ParkedGeometry.Find(Key);
-		if (Entry && Entry->bSpeculative)
+		if (Entry && Entry->bSpeculative && !PageBarrier.IsFrozen(Key))
 		{
 			EvictParkedKey(Key);
 			++SpecEvictedUnusedSinceLog;
@@ -27917,6 +28022,7 @@ void FVoxelWorldImpl::EvictOldestSpeculative()
 // Free one parked entry for real. Used by the cap, and by the edit paths.
 void FVoxelWorldImpl::EvictParkedKey(const VoxelCoords::FVoxelLevelChunkKey& Key)
 {
+	if (PageBarrier.IsFrozen(Key)) return;
 	FParkedGeometry Parked;
 	if (!ParkedGeometry.RemoveAndCopyValue(Key, Parked))
 	{
@@ -27958,9 +28064,11 @@ void FVoxelWorldImpl::EvictParkedOverCap(int32 Cap)
 	// Oldest first, from the front of the insertion queue. See
 	// ParkedInsertionOrder for why this is not a scan.
 	int32 Front = 0;
+	TArray<VoxelCoords::FVoxelLevelChunkKey> FrozenDeferred;
 	while (ParkedGeometry.Num() > Cap && Front < ParkedInsertionOrder.Num())
 	{
 		const VoxelCoords::FVoxelLevelChunkKey Key = ParkedInsertionOrder[Front++];
+		if (PageBarrier.IsFrozen(Key)) { FrozenDeferred.Add(Key); continue; }
 		// Adopted (or edit-evicted) out from under us -- its queue slot is stale.
 		if (!ParkedGeometry.Contains(Key))
 		{
@@ -27973,6 +28081,7 @@ void FVoxelWorldImpl::EvictParkedOverCap(int32 Cap)
 	if (Front > 0)
 	{
 		ParkedInsertionOrder.RemoveAt(0, Front, EAllowShrinking::No);
+		ParkedInsertionOrder.Insert(FrozenDeferred,0);
 	}
 	// The queue accumulates stale keys for entries adopted out of the map. Compact
 	// when they dominate, so it cannot grow without bound on a long session.
@@ -29105,6 +29214,7 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		// PropagateEditToMips / MarkChunkDirtyForRemesh).
 		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PendingGameThreadKeys.Pop(EAllowShrinking::No); // nearest
         ++OwnershipScanned;
+		if (PageBarrier.IsFrozen(LevelKey)) { OwnershipDeferred.Add(LevelKey); continue; }
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
@@ -29333,6 +29443,7 @@ void FVoxelWorldImpl::DrainUnloads()
 	{
 		const VoxelCoords::FVoxelLevelChunkKey Key = PendingUnloadKeys.Pop(EAllowShrinking::No);
 		++Pops;
+		if (PageBarrier.IsFrozen(Key)) { Deferred.Add(Key); continue; }
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Key);
 		if (!Rec)
@@ -29624,6 +29735,8 @@ bool FVoxelWorldImpl::NeedsOverlayAwarePath(const VoxelCoords::FVoxelLevelChunkK
 
 void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
 {
+	// Cancel before edit-driven eviction, including parked-only keys.
+	if (ProductionRehearsal) CancelProductionCandidate(TEXT("terrain edit during rehearsal"));
 	if(LevelKey.Level==0)if(auto World=EnvironmentObjectWorld.Get()){
 		const FVector Min=VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key,0);
 		const double Edge=VoxelCoords::ChunkEdgeVoxels*10.;
@@ -31693,7 +31806,7 @@ void UVoxelWorldSubsystem::Deinitialize()
 	{
 		// Worker jobs hold raw pointers into Impl-owned data (DispatchJobs);
 		// block until every in-flight job has finished before freeing it.
-		VoxelProductionCandidate::Cancel(Impl->ProductionCandidate);
+		Impl->CancelProductionCandidate(TEXT("world teardown"));
 		VoxelProductionCandidate::ForgetWorld(GetWorld());
 		Impl->WaitForInFlightTasks();
 

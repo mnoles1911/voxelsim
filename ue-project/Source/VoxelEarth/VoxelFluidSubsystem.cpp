@@ -1783,17 +1783,19 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 
 	// ---- view origin -------------------------------------------------------
 	FVector ViewOrigin = FVector::ZeroVector;
+	bool bHaveViewOrigin = false;
 	if (const APlayerController* PC = World->GetFirstPlayerController())
 	{
-		if (PC->PlayerCameraManager != nullptr)
+		if (PC->GetPawn() && PC->PlayerCameraManager != nullptr)
 		{
 			ViewOrigin = PC->PlayerCameraManager->GetCameraLocation();
+			bHaveViewOrigin = true;
 		}
 	}
 
 	// ---- origin latch (first spawn / emit / faucet arm) --------------------
 	const bool bLatchedThisTick =
-		!bOriginLatched &&
+		bHaveViewOrigin && !bOriginLatched &&
 		(PendingSpawnCount > 0 || EmitPerSecond > 0.0f || bFaucets);
 	if (bLatchedThisTick)
 	{
@@ -1809,7 +1811,7 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	//
 	// Not on the tick that latched: the drift is zero by construction there, and
 	// the check costs a ground-surface query.
-	if (bOriginLatched && !bLatchedThisTick)
+	if (bHaveViewOrigin && bOriginLatched && !bLatchedThisTick)
 	{
 		MaybeRecentre(ViewOrigin);
 	}
@@ -1896,7 +1898,7 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		};
 
 		// 1. Dam-break block: an explicit user request; not budget-capped.
-		if (PendingSpawnCount > 0)
+		if (bHaveViewOrigin && PendingSpawnCount > 0)
 		{
 			PushSpawn(uint32(PendingSpawnCount), 0,
 			          ViewOrigin + FVector(0, 0, kSpawnHeightAboveViewUU), FVector3f::ZeroVector);
@@ -1906,7 +1908,7 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		int32 Budget = FMath::Max(0, CVarVoxelFluidMaxSpawnPerTick.GetValueOnGameThread());
 
 		// 2. Camera faucet (voxel.Fluid.Emit).
-		if (EmitPerSecond > 0.0f)
+		if (EmitPerSecond > 0.0f && (bFaucetLatched || bHaveViewOrigin))
 		{
 			EmitCarry += EmitPerSecond * DeltaTime;
 			const int32 EmitNow = FMath::Min(FMath::FloorToInt(EmitCarry), Budget);
