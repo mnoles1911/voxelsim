@@ -130,6 +130,10 @@ export function ForgeView({
   const specsOfKind = world.specs.filter((s) => category === "craftable"
     ? s.category === category && (s.subcategory ?? "ungrouped") === craftGroup
     : s.kind === kind && s.category === category);
+  const importedModel = world.library.find((e) => e.species === speciesName && e.imported);
+  const importedNames = new Set(world.library.filter((e) => e.imported).map((e) => e.species));
+  const importedSpecs = specsOfKind.filter((s) => importedNames.has(s.name));
+  const generatedSpecs = specsOfKind.filter((s) => !importedNames.has(s.name));
 
   /* --- loading ----------------------------------------------------------- */
 
@@ -143,6 +147,13 @@ export function ForgeView({
 
   const generate = React.useCallback(
     async (fromSpec: Spec, start: number, n: number) => {
+      if (world.library.some((e) => e.species === fromSpec.name && e.imported)) {
+        stopPolling();
+        setJob(null);
+        setProgress(null);
+        setDetailSeed(null);
+        return;
+      }
       try {
         const r = await forgeApi.generate(fromSpec, start, n);
         setHash(r.hash);
@@ -165,7 +176,7 @@ export function ForgeView({
         toast.error("Generate failed: " + String(e));
       }
     },
-    [stopPolling, toast],
+    [stopPolling, toast, world.library],
   );
 
   const loadSpec = React.useCallback(
@@ -232,6 +243,7 @@ export function ForgeView({
     void (async () => {
       const k = String(getPath(request.spec, "kind") ?? "tree");
       setKind(k);
+      setCategory(world.kinds.find((x) => x.key === k)?.category ?? "other");
       setSchema(await forgeApi.schema(k));
       setSpec(request.spec);
       setSaved(JSON.parse(JSON.stringify(request.spec)));
@@ -397,8 +409,12 @@ export function ForgeView({
             <SelectContent>
               {/* Grouped by sub-category label when authored; a label is a
                 * grouping over the kind's generator, never a generator. */}
-              {[...new Set(specsOfKind.map((s) => s.subcategory ?? ""))].sort().map((sub) => {
-                const members = specsOfKind.filter((s) => (s.subcategory ?? "") === sub);
+              {importedSpecs.length > 0 && <SelectGroup>
+                <SelectLabel>Saved imported models</SelectLabel>
+                {importedSpecs.map((s) => <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>)}
+              </SelectGroup>}
+              {[...new Set(generatedSpecs.map((s) => s.subcategory ?? ""))].sort().map((sub) => {
+                const members = generatedSpecs.filter((s) => (s.subcategory ?? "") === sub);
                 if (!sub) {
                   return members.map((s) => (
                     <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>
@@ -437,16 +453,17 @@ export function ForgeView({
             <Input
               className="h-7 font-mono text-xs"
               value={speciesName}
+              disabled={!!importedModel}
               onChange={(e) => spec && (setPath(spec, "name", e.target.value), setRev((v) => v + 1))}
               placeholder="species name"
             />
             <span className="font-mono text-[10px] text-parch-500">{hash}</span>
           </div>
           <div className="flex gap-2">
-            <Button size="sm" variant="gold" onClick={() => void saveSpecFile()} disabled={!spec}>
+            <Button size="sm" variant="gold" onClick={() => void saveSpecFile()} disabled={!spec || !!importedModel}>
               <Save className="h-3.5 w-3.5" /> Save spec
             </Button>
-            <Button size="sm" variant="ghost" onClick={revert} disabled={!spec}>
+            <Button size="sm" variant="ghost" onClick={revert} disabled={!spec || !!importedModel}>
               <Undo2 className="h-3.5 w-3.5" /> Revert
             </Button>
             <Button
@@ -462,7 +479,9 @@ export function ForgeView({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-2" key={"params-" + kind + "-" + speciesName}>
-          {schema && spec ? (
+          {importedModel ? (
+            <p className="p-4 text-sm text-parch-400">This saved model uses imported geometry. Review its shape and colors in the viewport; approval is available in Asset Library.</p>
+          ) : schema && spec ? (
             <ParamPanel schema={schema} spec={spec} saved={saved} rev={rev} onEdit={editParam} onCommit={commitParam} />
           ) : (
             <div className="p-4 text-sm text-parch-500">
@@ -484,7 +503,7 @@ export function ForgeView({
             }}
           />
         )}
-        <AskPanel
+        {!importedModel && <AskPanel
           spec={spec}
           onApplied={(next, summary) => {
             setSpec(next);
@@ -492,7 +511,7 @@ export function ForgeView({
             toast.ok(summary);
             void generate(next, seedStart, count);
           }}
-        />
+        />}
       </aside>
 
       {/* gallery (stage 1's output) */}
@@ -504,7 +523,11 @@ export function ForgeView({
           noPlacement={isVehicleCat}
         />
 
-        <div className="mortar-b flex flex-wrap items-center gap-2 bg-stone-850 px-3 py-2">
+        {importedModel ? (
+          <div className="mortar-b bg-stone-850 px-3 py-2 text-sm text-parch-300">
+            Saved imported model · <Button size="sm" onClick={() => onOpenPlacement(speciesName)}>Review in Asset Library</Button>
+          </div>
+        ) : <div className="mortar-b flex flex-wrap items-center gap-2 bg-stone-850 px-3 py-2">
           <Button variant="gold" size="sm" onClick={() => spec && void generate(spec, seedStart, count)} disabled={!spec}>
             <Hammer className="h-4 w-4" /> Generate
           </Button>
@@ -553,7 +576,7 @@ export function ForgeView({
               <Archive className="h-3.5 w-3.5" /> Keep all clean
             </Button>
           </div>
-        </div>
+        </div>}
 
         {/* progress: the visible generation state */}
         <div className="mortar-b bg-stone-900 px-3 py-1.5">
@@ -575,7 +598,9 @@ export function ForgeView({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          {job == null ? (
+          {importedModel ? (
+            <VoxelCanvas src={api.voxelsUrl(importedModel.id)} palette={world.palette} />
+          ) : job == null ? (
             <div className="flex h-full items-center justify-center text-center font-display text-parch-500">
               Pick a species and strike Generate.
             </div>
