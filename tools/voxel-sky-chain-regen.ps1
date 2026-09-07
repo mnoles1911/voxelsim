@@ -248,6 +248,19 @@ $NOT_A_GENERATOR = @(
     # builder handed in by its caller, so it matches every one of
     # $BINDING_PATTERNS -- which is the scan working, not a false positive.
     'water_sky_reflection_graph.py',
+    # module: masked cubic foliage + weather-driven vertex motion, imported by
+    # create_detail_asset_material.py and create_environment_lod_material.py.
+    # Classified here on 2026-09-06 because it is objectively a module and not
+    # a chain step -- one `add_vegetation` function, no entry point, no asset
+    # of its own -- exactly the shape of every other entry above. It matches
+    # $BINDING_PATTERNS because it binds the wind parameters THROUGH its
+    # caller's builder, which is the scan working, not a false positive.
+    #
+    # NOTE FOR WHOEVER WIRES THE VEGETATION LANE: its two CONSUMERS are
+    # generators, and if they ship they belong in $ORDER so a sky rebuild
+    # rebuilds them too. That is the 2026-08-10 hazard this guard exists for,
+    # and classifying the module does not discharge it for them.
+    'vegetation_material_common.py',
     # module: the Phase F1 caustic field, imported by BOTH terrain generators
     # and create_underwater_material.py. Binds SunDirection and the F1-new
     # CausticIntensity against the collection handed in by its caller, so it

@@ -116,7 +116,38 @@ type a 0.01 anywhere except at the one node that does the conversion.
 # In words: the bed is plainly visible in the shallows, clearly tinted but still
 # readable at a metre, dim by three metres, and effectively gone at the pond's
 # 6 m deep end -- where the colour is the water's own rather than the bed's.
-ABSORPTION_DISTANCE_M = 5.5
+#
+# 5.5 -> 3.5 ON 2026-09-06, OWNER VERDICT. The complaint this answers, in his
+# words: "our water is far too transparent and, while it does gather a depth
+# effect in very deep spots, the depth gradient is not strong enough and, as a
+# result, in shallow spots, and any camera angles close to player, the water
+# surface seems completely see through and very transparent."
+#
+# THE LADDER THAT PRODUCED THE NUMBER. Three captures, one low shoreline pose
+# (6 m, -18 deg), frozen sun, only this value moved, measured over a near band
+# and a far band of the same frames:
+#
+#     AbsorptionDistanceM     near G/B        near->far luminance gradient
+#       5.5 (was)             0.379 / 0.493      -0.088
+#       3.0                   0.308 / 0.422      -0.128
+#       2.0                   0.296 / 0.403      -0.135
+#
+# The gradient strengthens ~45% between 5.5 and 3.0 and then FLATTENS -- 2.0
+# buys almost nothing over 3.0 except darkness. The owner picked 3.5, i.e. just
+# shy of the knee, which keeps most of the gradient gain without the flat
+# darkening. The far field is unmoved at every rung (0.516 -> 0.505): far water
+# is already fully absorbed, so this is a near-field control, which is exactly
+# the band the complaint is about.
+#
+# THE TABLES ABOVE ARE NOW STALE AT THE HEAD ROW and are kept deliberately: they
+# are the derivation of the 2026-08-12 midpoint verdict, not a description of
+# what ships today. Re-deriving them for 3.5 would erase the reasoning that
+# produced the parameterisation.
+#
+# SHARED WITH THE UNDERWATER MATERIAL BY DESIGN (see this module's docstring):
+# moving this moves what a swimmer is inside as well as what he was looking at,
+# which is the point. The swim view wants an owner look before this is final.
+ABSORPTION_DISTANCE_M = 3.5
 
 # "What colour survives longest": the coefficient is scaled by (1 - this), so 0
 # in a channel means that channel is fully absorbed at the distance above and 1
