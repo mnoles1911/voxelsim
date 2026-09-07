@@ -1,9 +1,23 @@
-param([string]$LogPath = '', [switch]$Wait, [ValidateRange(30,3600)][int]$TimeoutSeconds = 300)
+param([string]$LogPath = '', [switch]$Wait, [ValidateRange(30,3600)][int]$TimeoutSeconds = 300, [switch]$AllowOtherProjectEditors)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 if (-not $LogPath) { $LogPath = Join-Path $projectRoot 'Saved/object-persistence-tests.log' }
 $busy = @(Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild -ErrorAction SilentlyContinue)
+if ($AllowOtherProjectEditors) {
+    $projectPath = [IO.Path]::GetFullPath((Join-Path $projectRoot 'ue-project/VoxelEarth.uproject'))
+    $busy = @($busy | Where-Object {
+        if ($_.ProcessName -notin @('UnrealEditor','UnrealEditor-Cmd')) { return $true }
+        $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)").CommandLine
+        if ($commandLine -match '(?i)(?:"([^\"]+\.uproject)"|([^\s"]+\.uproject))') {
+            $otherProject = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            return [IO.Path]::GetFullPath($otherProject) -eq $projectPath
+        }
+        return $true
+    })
+}
 if ($busy.Count) { throw 'An editor or compiler is active. Leave that session alone.' }
+$buildTools = @(Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe'" | Where-Object { $_.CommandLine -match 'UnrealBuildTool' })
+if ($buildTools.Count) { throw 'UnrealBuildTool is active. Leave that build untouched and retry when idle.' }
 $testArgs = @(
     ('"' + (Join-Path $projectRoot 'ue-project/VoxelEarth.uproject') + '"'),
     '-unattended', '-nop4', '-nosplash', '-dx12',

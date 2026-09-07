@@ -62,6 +62,13 @@ bool BuildImmutableSnapshot(FWork& Work,const std::vector<uint8>& Vxa)
     if(uint64(Source.sizeX())*Source.sizeY()*Source.sizeZ()>MaxCells)return false;
     Work.ClippedGeometryHash=FMD5::HashBytes(Vxa.data(),int32(Vxa.size()));
     Work.Descriptor.SourceHash=Work.ClippedGeometryHash;
+    if(Work.Provenance.providerFingerprint||Work.Provenance.catalogFingerprint){
+        FVoxelEnvironmentProductionProvenance Identity;
+        Identity.Source=Work.Provenance;Identity.StableId=vxc::assetObjectId(Work.Provenance);
+        Identity.CanonicalSourceHash=Work.CanonicalSourceHash;
+        Work.Descriptor.ProductionProvenance=MoveTemp(Identity);
+    }else if(Work.Descriptor.ProductionProvenance.IsSet())return false;
+
     if(!Work.Descriptor.IsValid())return false;
     FVoxelEnvironmentSparseGrid Grid;
     Grid.Size=FIntVector(Source.sizeX(),Source.sizeY(),Source.sizeZ());Grid.Origin=FIntVector(Source.originX(),Source.originY(),Source.originZ());Grid.Mm=100;

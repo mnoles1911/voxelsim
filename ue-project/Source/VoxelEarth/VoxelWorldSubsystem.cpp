@@ -202,6 +202,13 @@ inline uint64 VoxelThreadCycles()
 static_assert(vxc::kVoxelSizeMm == int32(VoxelCoords::VoxelSizeUU) * 10,
               "VoxelCoords::VoxelSizeUU (UE units) must track vxc::kVoxelSizeMm (mm)");
 
+static TAutoConsoleVariable<int32> CVarVoxelAssetCompositionProbe(
+	TEXT("voxel.Assets.CompositionProbe"), 0,
+	TEXT("EXPENSIVE synchronous diagnostic: set 1 to scan canonical asset composition once per process at the next asset stats log. ")
+	TEXT("Scans 1089 columns plus crown reach on the game thread; can freeze the game for minutes. Default 0. ")
+	TEXT("Use only to diagnose solid voxels/air gaps in world composition, not for performance captures."),
+	ECVF_Default);
+
 // M5 destruction (first slice, docs/voxel-earth-implementation-plan.md SS3.5):
 // gates the connectivity-flood-fill "did this edit detach a floating island?"
 // pass that runs after every solid-removing dig/carve on the authority. On by
@@ -12908,9 +12915,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			// columns carrying solid material ABOVE their own surface, which is
 			// what a tree is and what terrain never is.
 			static bool bProbedOnce = false;
-			if (!bProbedOnce)
+			if (!bProbedOnce && CVarVoxelAssetCompositionProbe.GetValueOnGameThread() != 0)
 			{
 				bProbedOnce = true;
+				UE_LOG(LogVoxelPerf, Warning,
+				       TEXT("assets PROBE: explicit EXPENSIVE synchronous composition diagnostic starting; game thread may stall for minutes."));
+				const double ProbeStartedSeconds = FPlatformTime::Seconds();
 				const vxc::Amplifier& Amp = Voxels.amplifier();
 				int32 ColsWithAir = 0, ColsWithSolidAbove = 0, MaxRunVox = 0, MaxInternalGap = 0;
 				int64 TallestVX = 0, TallestVY = 0, TallestBaseZ = 0;
@@ -13015,6 +13025,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				       (long long)TallestVX, (long long)TallestVY,
 				       double(TallestVX) * 0.1, double(TallestVY) * 0.1,
 				       (long long)TallestBaseZ, TallestFirst);
+				UE_LOG(LogVoxelPerf, Warning, TEXT("assets PROBE: synchronous composition diagnostic finished in %.3f seconds."),
+				       FPlatformTime::Seconds() - ProbeStartedSeconds);
 			}
 		}
 	}
