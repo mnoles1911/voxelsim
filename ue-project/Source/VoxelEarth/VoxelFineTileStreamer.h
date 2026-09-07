@@ -229,6 +229,8 @@ public:
 	// The sampler the world/amplifier generates terrain through. Safe to call
 	// from meshing worker threads; see the threading note above.
 	vxc::ITileSampler& WorldSampler() { return Proxy_; }
+	// Identity of the actual live sampler, not a possibly failed configuration.
+	const std::string& ProviderId() const { return ProviderId_; }
 
 	// THE COARSE FALLBACK -- what an absent fine tile resolves to. Without it,
 	// a pixel whose fine tile is not on disk resolves to SEA LEVEL and the

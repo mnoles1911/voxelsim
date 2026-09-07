@@ -8,8 +8,10 @@
 #include "VoxelEnvironmentLODPrototype.h"
 #include "VoxelProductionCandidatePreparation.h"
 #include "VoxelEnvironmentRenderContext.h"
+#include "VoxelEnvironmentAuthorityIdentity.h"
 #include "VoxelEnvironmentPageBarrier.h"
 #include "VoxelEnvironmentPageSampler.h"
+#include "VoxelGpuAssetVerticalBounds.h"
 #include "VoxelHeldBrickParity.h"
 #include "VoxelObjectRegistry.h"
 #include "Engine/Engine.h"
@@ -6474,9 +6476,10 @@ struct FVoxelWorldImpl
 		: Tiles(MakeTileSampler(Seed, TileDir, TileScale, bUsingTileGrid, TileCoverageUU))
 		, FineStreamer(MakeFineTileStreamer(Seed, FineTileDir, FineProviderId, FineBudgetBytes, FineRingRadius,
 		                                    Tiles.get()))
-		, Voxels(Seed, FineStreamer ? FineStreamer->WorldSampler() : *Tiles)
+		, Voxels(Seed, FineStreamer ? FineStreamer->WorldSampler() : *Tiles,
+		         FineStreamer ? FineStreamer->ProviderId() : std::string{})
 	{
-		ProductionProviderHash=FineProviderId;
+		ProductionProviderHash=UTF8_TO_TCHAR(Voxels.log().providerId().c_str());
 		// bUsingTileGrid (declared, and thus constructed via its NSDMI, BEFORE
 		// Tiles below -- member init order follows DECLARATION order, not this
 		// list's order) is already valid by the time MakeTileSampler's
@@ -6651,6 +6654,20 @@ struct FVoxelWorldImpl
 							       double(AssetTallestTerrainVox) / double(VoxelCoords::ChunkEdgeVoxels),
 							       (long long)(CapMm > 0 ? vxc::floorDiv(CapMm, int64(vxc::kVoxelSizeMm)) + 1 : 0));
 							Voxels.setAssetField(&AssetFieldObj);
+                            FString AuthorityIdentityError;
+                            ProductionAuthorityIdentity=VoxelEnvironmentAuthority::FIdentity::Create(AssetFieldObj,Blob,AuthorityIdentityError);
+                            if(ProductionAuthorityIdentity&&ProductionAuthorityIdentity->catalogIdentity(AssetFieldObj).empty())
+                            {
+                                ProductionAuthorityIdentity.Reset();
+                                AuthorityIdentityError=TEXT("live catalog validation refused after registration");
+                            }
+                            if(!ProductionAuthorityIdentity)
+                            { UE_LOG(LogVoxelEarth,Warning,TEXT("Authority identity unavailable: %s"),*AuthorityIdentityError); }
+                            else
+                            {
+                                UE_LOG(LogVoxelEarth,Log,TEXT("Authority identity READY providerBound=%d"),
+                                    !Voxels.log().providerId().empty()?1:0);
+                            }
 							// THE CHANNEL BINDING RIDES WITH THE FIELD (see
 							// FVoxelAssetChannelSource). Installed here, in bring-up,
 							// before any worker reads -- the same narrow-door rule as
@@ -7139,6 +7156,7 @@ struct FVoxelWorldImpl
 	FCountingBankSource AssetBankTap;
 	std::vector<vxc::AssetSpecies> AssetSpeciesTable;
 	vxc::AssetField AssetFieldObj;
+	TUniquePtr<VoxelEnvironmentAuthority::FIdentity> ProductionAuthorityIdentity;
 
 	// The engine's channel binding (see FVoxelAssetChannelSource above).
 	// DECLARED BEFORE Voxels for the same destruction-order reason the field
@@ -9354,6 +9372,7 @@ struct FVoxelWorldImpl
 	double AccumGpuAssetSpanLookupMs = 0.0;
 	double AccumGpuAssetTableCopyMs = 0.0;
 	uint64 GpuAssetSpanHits = 0, GpuAssetSpanMisses = 0, GpuAssetCopiedBytes = 0;
+	uint64 GpuAssetZCulled = 0, GpuAssetSubmitted = 0;
 	double AccumGpuSubmitPoolMs = 0.0;    // direct-to-pool decision incl. GI probe
 	double AccumGpuSubmitMgrMs = 0.0;     // Manager->Submit + GpuJobsPending insert
 	double AccumGpuSubmitTotalMs = 0.0;   // whole SubmitGpuMeshJob wall
@@ -14163,11 +14182,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       AccumDispatchSubmitGpuMs,
 		       AccumDispatchSubmitGpuMs - AccumGpuSubmitTotalMs);
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel gpu asset preparation (window): resolveMs=%.3f spanLookupBuildMs=%.3f tableCopyRebaseMs=%.3f otherMs=%.3f spanHits=%llu spanMisses=%llu copiedBytes=%llu"),
+		       TEXT("Voxel gpu asset preparation (window): resolveMs=%.3f spanLookupBuildMs=%.3f tableCopyRebaseMs=%.3f otherMs=%.3f spanHits=%llu spanMisses=%llu copiedBytes=%llu zCulled=%llu submitted=%llu"),
 		       AccumGpuAssetResolveMs, AccumGpuAssetSpanLookupMs, AccumGpuAssetTableCopyMs,
 		       AccumGpuSubmitAssetsMs-AccumGpuAssetResolveMs-AccumGpuAssetSpanLookupMs-AccumGpuAssetTableCopyMs,
 		       (unsigned long long)GpuAssetSpanHits, (unsigned long long)GpuAssetSpanMisses,
-		       (unsigned long long)GpuAssetCopiedBytes);
+		       (unsigned long long)GpuAssetCopiedBytes, (unsigned long long)GpuAssetZCulled, (unsigned long long)GpuAssetSubmitted);
 	}
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
@@ -16833,6 +16852,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumGpuSubmitAssetsMs = AccumGpuSubmitPoolMs = AccumGpuSubmitMgrMs = AccumGpuSubmitTotalMs = 0.0;
 	AccumGpuAssetResolveMs = AccumGpuAssetSpanLookupMs = AccumGpuAssetTableCopyMs = 0.0;
 	GpuAssetSpanHits = GpuAssetSpanMisses = GpuAssetCopiedBytes = 0;
+	GpuAssetZCulled = GpuAssetSubmitted = 0;
 	AccumDispatchSubmitGpuMs = 0.0;
 	GpuSubmitCallsSinceLog = 0;
 	// The cold-burst census, zeroed with the submit split it belongs to and in
@@ -24929,6 +24949,14 @@ bool FVoxelWorldImpl::BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey
 			TMap<const vxc::AssetGrid*, uint32> BaseForGrid;
 			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
 			{
+                // Full grid bounds cannot contribute to any generated Z sample,
+                // including all apron bricks and coarse representatives. Preserve
+                // every survivor's order; skip before span lookup/table copying.
+                if(R.grid&&VoxelGpuAssetVerticalBounds::DefinitelyOutside(Req.BrickZMin,Req.BricksZ,Req.CoarseLevel,
+                    R.anchorVz,R.grid->originZ(),R.grid->sizeZ())){
+                    if(bOrdinary)++GpuAssetZCulled;
+                    continue;
+                }
 				const double SpanLookupStarted = bOrdinary ? FPlatformTime::Seconds() : 0.0;
 				bool SpanCacheHit=false;
 				const FGpuAssetGridSpans& S = GpuSpansForGrid(R.grid,bOrdinary?&SpanCacheHit:nullptr);
@@ -25011,6 +25039,7 @@ bool FVoxelWorldImpl::BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey
 					}
 				}
 				Req.AssetInstances.Add(Inst);
+                if(bOrdinary)++GpuAssetSubmitted;
 			}
 		}
 	}
@@ -32170,20 +32199,22 @@ bool LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& LogicalPath, UWor
 		return false;
 	}
 
-	if (!Impl.Voxels.replay(*ParsedLog))
+	if (!Impl.Voxels.replay(*ParsedLog,Impl.Voxels.log().providerId()))
 	{
 		VoxelSaveGuard::Quarantine(LogicalPath, TEXT("Checkpoint terrain identity was refused."));
 		// Same class, different door: the file parsed, so the bytes are fine,
 		// but they describe a different world than the one running. Replaying
 		// would be wrong and overwriting would be worse.
 		VoxelSaveGuard::FRefusal Refusal;
-		Refusal.Token = TEXT("seed-mismatch");
+		const bool ProviderMismatch=Impl.Voxels.lastProviderCheck()==vxc::EditLog::ProviderCheck::kMismatch;
+        Refusal.Token = ProviderMismatch?TEXT("provider-mismatch"):TEXT("seed-mismatch");
 		Refusal.bVersionMismatch = false;
 		Refusal.Detail = FString::Printf(
 			TEXT("the log parsed cleanly but records seed %llu / brickEdge %u, and this world is seed %llu. The "
 			     "bytes are intact; they belong to a different world."),
 			(unsigned long long)ParsedLog->seed(), uint32(ParsedLog->brickEdge()),
 			(unsigned long long)Impl.Voxels.amplifier().seed());
+        if(ProviderMismatch)Refusal.Detail=TEXT("The saved terrain provider differs from the active fine terrain provider; the original bytes are preserved.");
 		if (Checkpoint.bCheckpoint) VoxelSaveGuard::Quarantine(Path, Refusal.Detail);
 		else VoxelSaveGuard::RefuseFile(Path, Refusal, TEXT("saved world"));
 		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: starting fresh; %s will NOT be overwritten by this session."),

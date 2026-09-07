@@ -2,6 +2,14 @@
 
 ## Current continuation status
 
+PR244 is merged as `12e7473fd6e31976dc8d2a99ee441151022d59ed`; all required CI passed after the narrow GCC material initialization fix. PR234-244 are merged.
+
+Current culling/provider checkpoint passed `build-environment-culling-identity.log` (14 actions,48.62s),49/49DX12 tests and real HeldGpu20/20 allocated-page parity against unculled CPU output. Actual manifest identity reported READY providerBound=1. Conservative vertical culling preserves retained order and checked coarse/apron coordinates. Actual active-streamer provider stamps now guard replay while retaining legacy unstamped support.
+
+Both same-site visual probes completed normally and first-after/steady images were inspected green without fallback/glow: culling capture76EC58C44E7BA36BB5F81FB869AB4328 and cache-only EC17CA46422B021AEBEAAA97D6E62C65. Culling reduced copied bytes/request from520399 to148589 and copying time92.455us to23.797us; total asset preparation did not improve (314.075us to319.377us/request). Diagnostic cache-only reduced measured asset work to78.887us/request, resolution40.131us/request, with all warm launches0. Different request mixes and window counters do not prove frame-rate or tail-latency improvement. Cache remains opt-in because epoch, memory and worker-lifetime gaps remain. See performance follow-up for complete receipts.
+
+Root released its UE slot after the cache probe normal exit; persistence owns the next walking/recovery batch. Next: commit current checkpoint, then apply/review ignored Saved/gpu-publication-draft/publication.patch with base hashes before building. That draft is not yet applied or tested. Production ownership remains disabled and incomplete.
+
 PR243 is merged as `a5a60d99a2ea94ece7aaa0ed801bf9c03384a49a` (head468a8f27), with all required CI green, including cross-compiler determinism and every Asset Forge spec. Root branch fast-forwarded to that merge. The following visual checkpoint is committed.
 
 Next verified batch: private GPU Begin/Poll/Cancel reservations and four DX12 tests, asset preparation timing splits, and stationary authority facade/coordinator. `build-environment-private-gpu-reservation-fixed.log` succeeded5actions15.13seconds after a braced render-command macro fix; `environment-private-gpu-reservation-tests.log` passed46/46DX12 tests, normalexit0. Core `build/authority-core` MSVC focused target passed5cases, including retained-generation admission. No production ownership activation exists in either increment. See private-gpu-reservations.md and stationary-asset-authority-core.md.
