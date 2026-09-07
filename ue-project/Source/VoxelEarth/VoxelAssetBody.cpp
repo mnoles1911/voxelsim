@@ -27,7 +27,7 @@
 TAutoConsoleVariable<FString> CVarVoxelAssetBodyLibraryRoot(
 	TEXT("voxel.AssetBody.LibraryRoot"), TEXT(""),
 	TEXT("Directory asset-forge writes entity .vxa grids into. EMPTY means the default, which is ")
-	TEXT("<ProjectDir>/../asset-forge/library -- the checkout layout, so an ordinary run needs ")
+	TEXT("<ProjectDir>/../asset-forge/out/engine/craft -- the approved published set, so an ordinary run needs ")
 	TEXT("no argument at all. Set it to point a leg at a staging directory. The resolver tries ")
 	TEXT("<root>/<name>/<name>-NNNN/tree.vxa (asset-forge's library layout), then ")
 	TEXT("<root>/<name>/<name>-NNNN.vxa (export_banks.py's bank layout), then <root>/<name>.vxa, ")
@@ -102,9 +102,9 @@ constexpr int64 kMaxDenseCells = 8 * 1024 * 1024;
 FString DefaultLibraryRoot()
 {
 	// <ProjectDir> is D:/voxelsim/ue-project/ ; asset-forge sits beside it at
-	// D:/voxelsim/asset-forge/library. Collapsed so the log prints a path a
+	// D:/voxelsim/asset-forge/out/engine/craft. Collapsed so the log prints a path a
 	// human can paste rather than one with ".." in the middle.
-	FString Root = FPaths::Combine(FPaths::ProjectDir(), TEXT(".."), TEXT("asset-forge"), TEXT("library"));
+	FString Root = FPaths::Combine(FPaths::ProjectDir(), TEXT(".."), TEXT("asset-forge"), TEXT("out"), TEXT("engine"), TEXT("craft"));
 	FPaths::CollapseRelativeDirectories(Root);
 	FPaths::NormalizeDirectoryName(Root);
 	return Root;

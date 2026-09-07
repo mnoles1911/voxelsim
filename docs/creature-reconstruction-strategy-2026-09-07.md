@@ -5,6 +5,12 @@ approach. This supersedes the assumption that a successful bulk regeneration
 constitutes a successful realism improvement. No new reconstruction system has
 been implemented or benchmarked yet.
 
+**Owner's primary acceptance rule:** every model must appear anatomically and
+visually correct/real. A technically valid model that looks wrong fails. Compare
+proportions, pose, species-defining anatomy, surface transitions and coloration
+against real evidence in multiple views. Automated metrics support this decision;
+they do not replace visual inspection or establish biological correctness.
+
 ## Findings from the actual saved models
 
 Inspected grey-wolf, bengal-tiger and common-raven thumbnails, plus the quadruped
