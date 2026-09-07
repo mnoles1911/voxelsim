@@ -1,0 +1,75 @@
+{
+  "commit": "3f58bb886bb1bda681d41240344fe3126ac0e9bd",
+  "files": [
+    {
+      "file": "LICENSE",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/LICENSE",
+      "sha256": "e610a367a4cb695282366ffc5b669ed28e8b728ceac45e98f77aa77a7498559a",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "body_feline_wolf.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/body_feline_wolf.npy",
+      "sha256": "a743f003ad6915d8ba9bb35648b96b72d55aecbaf45d1e5a73a0a557ca421caf",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "head_carnivore_wolf.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/head_carnivore_wolf.npy",
+      "sha256": "3fe7664066ea83f7ad48b1f11bbdf1dff4a62f6732937afd20d7ff5c7c99a72c",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "body_feline_tiger.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/body_feline_tiger.npy",
+      "sha256": "95c9cc177d3e47fa015a0db1b92cd3072d195df9d7716d74a7a0e6b59bae2fe1",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "head_carnivore_tiger.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/head_carnivore_tiger.npy",
+      "sha256": "adf37be76ebfd759ed1f867ef786d4ea262dbbc3fee43b1412aee080fe7adde6",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "body_bird_robin.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/body_bird_robin.npy",
+      "sha256": "83489bb08e8c37290edd26e7e2fad7e53914c252f2bf2a49184c7a899c2afc3c",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "body_bird_gull.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/body_bird_gull.npy",
+      "sha256": "81e4cf63a7f9e3f214422c9a056a95a92185a31fa4f004370a34558646ecf371",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "body_herbivore_goat.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/body_herbivore_goat.npy",
+      "sha256": "b59a608a762e6f6c1a5864e665dd86722a6dd7a6975134b67720edf27426cfb4",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "head_herbivore_goat.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/head_herbivore_goat.npy",
+      "sha256": "093f3528167092e94c23b2cb94f4b240792de9f33d33963bbb9867da5d83f716",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    },
+    {
+      "file": "body_fish_bluefish.npy",
+      "url": "https://raw.githubusercontent.com/princeton-vl/infinigen/3f58bb886bb1bda681d41240344fe3126ac0e9bd/src/infinigen/assets/objects/creatures/parts/nurbs_data/body_fish_bluefish.npy",
+      "sha256": "75696e51feaa5db66f3140f098903bc51eea05a18677464ca9ee65a22001147b",
+      "license": "BSD-3-Clause",
+      "copyright": "2023 Princeton University"
+    }
+  ]
+}
