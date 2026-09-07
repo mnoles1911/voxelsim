@@ -1,8 +1,8 @@
-# Session persistence handover — 2026-09-07
+# Session persistence handover â€” 2026-09-07
 
 ## Immediate instruction
 
-The user interrupted implementation to request: commit and merge all progress made thus far and prepare a handover now. This supersedes continuing overnight implementation in this session. The overall P0–P6 persistence plan remains unfinished; resume from `docs/session-persistence-execution.md` and `docs/session-persistence-plan-2026-09-07.md` in a new session.
+The user interrupted implementation to request: commit and merge all progress made thus far and prepare a handover now. This supersedes continuing overnight implementation in this session. The overall P0â€“P6 persistence plan remains unfinished; resume from `docs/session-persistence-execution.md` and `docs/session-persistence-plan-2026-09-07.md` in a new session.
 
 This task worked in `C:/Users/Matt Noles/.codex/worktrees/5aaf/voxelsim`, initially detached at `1d1005a`. The shared primary checkout is `D:/voxelsim`. Other tasks have concurrently evolved environment/object/core and Asset Forge code there. The persistence commit deliberately excludes unrelated asset/model changes. Its integration depends on the shared primary checkpoint's existing object/geometry/streaming implementation, which was uncommitted at this task's start. Read the final Git history for actual merge IDs.
 
@@ -16,7 +16,7 @@ This task worked in `C:/Users/Matt Noles/.codex/worktrees/5aaf/voxelsim`, initia
 
 Evidence before the interrupted extension: `Saved/session-runtime-verified-report/index.json` reports `Voxel.Persistence.SessionDomains` Success. Storage and object companion tests passed in `Saved/session-runtime-final-report/index.json`. The runtime fixture expects exactly three literal NullRHI bathymetry resource diagnostics, one per transient world, and suppresses no persistence errors. Independent reader/tests are `tools/checkpoint_store.py` and `tools/test_checkpoint_store.py`.
 
-## Latest interrupted extension — do not confuse with completed phases
+## Latest interrupted extension â€” do not confuse with completed phases
 
 - Water hydrology container v2 adds original river region, suspended graph bytes, remaining routing tick delay and enabled state. Disarming retains graph state. Restore validates graph against its recorded region before installation, and rearm failure stops the session rather than discarding dams/water. Legacy graph blobs without region identity still refuse.
 - Restored implicit-ocean mode is pinned per world. Sky clock rate/calendar now use per-world restored values rather than rejecting a different process-global configuration. Console-cvar override behavior and clock-disabled behavior need follow-up validation.
@@ -46,4 +46,22 @@ Rendered gameplay/shutdown and multiplayer admission were not verified by the pa
 
 ## Final verification / integration
 
-Pending at document creation. The handover build log is `Saved/persistence-handover-build.log`; final results and merge disposition will be recorded before completion.
+Checkpoint commit: `c3b7951`; integrated with accumulated gameplay main `fa56da9` by `a46bfed`. Compile corrections are `93fcd2f`, merged into the integration branch by `1a8ac0d`. Local main first fast-forwarded to `a46bfed`; the environment session is subsequently integrating its separate environment/creature checkpoint and the compile corrections. Do not reset main to this older persistence integration branch.
+
+The initial full 143-action build in `Saved/persistence-handover-build.log` found two compile errors: the inventory replication macro requires the output parameter name `OutLifetimeProps`, and the implicit-ocean pin guard had been inserted into the hot-reload constructor instead of `MaybeRelatchImplicitOcean`. Both were corrected. Recompiling both affected translation units using the generated response files, rebuilding the gameplay import library, and linking both gameplay and UI DLLs completed successfully (exit 0). The original full-build log retains the earlier errors; it is not evidence of a second full successful UBT invocation.
+
+Final runtime evidence: `Saved/session-handover-final-report/index.json` reports all four tests Success with zero errors: `Voxel.Persistence.SessionDomains`, `Voxel.Persistence.CheckpointTransaction`, `Voxel.Objects.Pages`, and `Voxel.Objects.Snapshot`. The transaction fault test emitted six warnings. `tools/test_checkpoint_store.py` passed all six tests. These tests exercised the corrected binaries, including the latest clock/hydrology extension; they do not replace the outstanding river graph, multiplayer, rendered gameplay, or scale validation listed above.
+
+The user authorized publishing and merging a PR after finishing this session checkpoint. Use the repository PR history for the final remote merge commit. The broader P0-P6 implementation remains incomplete and is explicitly handed over above; no unattended continuation or scheduling is active.
+
+## Remote checkpoint CI
+
+PR #232: https://github.com/mnoles1911/voxelsim/pull/232. CI run `34082724414` is not green. This PR includes previously unpublished ancestor work, so these are real integration follow-ups even though the persistence diff against `fa56da9` does not change their files:
+
+- GCC and Clang: `voxel-core/bench/riverribbonprobe.cpp` uses `std::sqrt` without its own `<cmath>` include.
+- Asset Forge: selftest uses a 50 mm environment tree where resolution policy requires 100 mm; generated palette is out of sync.
+- Terrain service: missing SciPy/Numba bake dependencies and a stale bake-fingerprint expectation (13 failures, 518 passes, 125 skips).
+- Unity lint: DetailAssetSubsystem and EnvironmentLODPrototype collide on `FMeshGeometry`, `FPaletteLinear`, `PaletteLinear`, and `kMaxGridCells`.
+- Front-end switch classification has unclassified switches; float-ban reports asset pitch/slope and fluid helpers; shader vendor lint reports brickpack bounds and signed arithmetic in karst/worldgen.
+
+Shader compilation, Docker build, SFX parity and Python syntax/perf-gate checks passed. Unreal CI is skipped; use the local build/runtime evidence above. Do not describe this checkpoint as having passed the complete repository CI suite. Coordinate fixes with the environment session, which is integrating newer versions of several affected files.
