@@ -23,6 +23,10 @@ FAutoConsoleCommandWithWorld PrepareHeldCpuPagesCommand(
     TEXT("voxel.Environment.PrepareHeldCpuPages"),
     TEXT("Prepare private CPU replacement packs for all allocated candidate pages under a bounded freeze and eviction-pressure pins. No GPU readiness or ownership publication."),
     FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,4);}));
+FAutoConsoleCommandWithWorld PrepareHeldGpuPagesCommand(
+    TEXT("voxel.Environment.PrepareHeldGpuPages"),
+    TEXT("Prepare private CPU and brick-only GPU packs for candidate pages, with bounded admission and parity checks. Does not publish ownership or backend readiness."),
+    FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* World){if(World)CandidateRequests.Add(World,5);}));
 }
 namespace VoxelProductionCandidate
 {

@@ -20,7 +20,7 @@ $buildTools = @(Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe'" | Wh
 if ($buildTools.Count) { throw 'UnrealBuildTool is active. Leave that build untouched and retry when idle.' }
 $testArgs = @(
     ('"' + (Join-Path $projectRoot 'ue-project/VoxelEarth.uproject') + '"'),
-    '-unattended', '-nop4', '-nosplash', '-dx12',
+    '-unattended', '-nop4', '-nosplash', '-dx12', '-Multiprocess',
     '-ExecCmds="Automation RunTests Voxel.Objects"', '-TestExit="Automation Test Queue Empty"',
     ('-abslog="' + $LogPath + '"')
 )
