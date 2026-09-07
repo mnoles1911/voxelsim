@@ -686,7 +686,35 @@ DEFAULTS = {
     "WaveBaseWavelengthM": 5.0,
     "WaveDirBaseDeg": 58.7,
     "WaveDirIncrementDeg": 137.507764,
-    "WaveQuantPerVoxel": 1.0,
+    # 1.0 -> 0.0 ON 2026-09-07, OWNER VERDICT: "WaveQuantPerVoxel 0 looked
+    # better. I like the smooth look rather than hard edged rectangles in the
+    # water."
+    #
+    # WHAT THE QUANTISATION WAS DOING, measured rather than assumed. It snaps
+    # the field's SAMPLE POSITION to a 10 cm grid, so height is piecewise-flat
+    # per voxel -- the deliberate voxel-stepped water style. But the shader is
+    # one evaluation with four outputs, and the gradient that drives MP_NORMAL
+    # is snapped with it. Under SSR (shipped 2026-09-06) every flat facet
+    # reflects the beach as a coherent block, and the reflection of a white
+    # shoreline fractured into hard-edged rectangles across the lake. The same
+    # snapping is the source of the stair-step "contour lines" the owner had
+    # complained about on the first screenshot of the day.
+    #
+    # THE ABLATION THAT PROVED IT, one pose, bright-desaturated pixel share:
+    #   shipping 0.95% | shore foam off 0.93% | disturbance off 0.94% |
+    #   whitecaps off 0.95% | quantisation off 0.94% (same share, but SMOOTH
+    #   streaks instead of rectangles) | SSR off 0.00%.
+    # The patches were never foam. Four foam hypotheses died first, and the
+    # instrument that painted the foam composite to emissive was itself blind
+    # to them because SSR is an engine term outside emissive.
+    #
+    # The alternative -- keep the stepped height and evaluate the gradient
+    # from the unquantised position -- would mean a second octave-loop
+    # evaluation per water pixel and would break the "two halves of one field
+    # cannot disagree about a crest" invariant the breaking foam relies on.
+    # Rejected as not worth it against a style the owner has now judged.
+    # 1.0 restores the stepped look byte-for-byte for anyone who wants an A/B.
+    "WaveQuantPerVoxel": 0.0,
     "WavePatchContrast": 0.55,
     # --- wind ------------------------------------------------------------
     "WindDirectionAuthority": 1.0,

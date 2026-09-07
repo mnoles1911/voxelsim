@@ -62,7 +62,7 @@
 #include <algorithm>
 #include <cmath>
 
-#define VOXELWAVEMIRROR_FINGERPRINT 0xBDB8BBu
+#define VOXELWAVEMIRROR_FINGERPRINT 0xB0BDDDu
 
 namespace VoxelWaveMirror
 {
@@ -74,7 +74,7 @@ struct FParams
     float WaveBaseWavelengthM = 5.0f;
     float WaveDirBaseDeg = 58.7f;
     float WaveDirIncrementDeg = 137.507764f;
-    float WaveQuantPerVoxel = 1.0f;
+    float WaveQuantPerVoxel = 0.0f;
     float WavePatchContrast = 0.55f;
     float WindDirectionAuthority = 1.0f;
     float WindSpreadDeg = 35.0f;
