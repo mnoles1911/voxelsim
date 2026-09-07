@@ -3041,3 +3041,241 @@ helper's baked defaults; no breakup, no shallow term) -- backlog.
 ### 6. Arms and verdicts
 
 (filled in below as each leg lands; every row names its engagement echo)
+
+Every arm below is a headless leg through `tools\voxel-capture.ps1` at the
+boat pose used for `VoxelVerify00974`: `-SpawnAt '-65102,-51084' -SpawnAltM 6
+-SpawnPitch -12 -SettleSec 173 -ExtraArgs @('-VoxelExecAfter=165',
+'-VoxelExecCmds="voxel.Boat.Spawn 3,voxel.Boat.Enter,voxel.Boat.Throttle 1
+12"')` plus the arm's own switch. Sun frozen 12:00 03-20, 2560x1440
+(`-ResX/-ResY`), frame 2560x1398. The "regions" are the box means in
+`wake_regions.py` (session scratch; the boxes are listed in section 1 above):
+`ahead` = (1280,820)-(1790,895), `wake` = (1408,1024)-(1920,1150), `outside`
+= (2240,717)-(2496,780) (water beyond the window, the control), `snow` =
+(768,512)-(1280,576) (exposure control). Every region number is stated as
+measured; no reading of how the frame looks is offered here -- the owner and
+the designer judge the frames.
+
+**The one thing to know before reading the table: the boat leg is NOT
+pose-reproducible across a material regen.** The five legs on the committed
+asset all boarded at exactly (-6509900,-5108400) and shot from
+(-6507979,-5108666..668, 165316) at pitch -11.8 / yaw 44.8. The first leg on
+the regenerated asset boarded at (-6510301,-5108682), the boat then headed a
+different way, and the harness flagged `FRAMING NOT AS REQUESTED`; the next
+leg boarded at (-6509984,-5108191). Region numbers are therefore comparable
+WITHIN the committed-asset group (A0-A4) and not across it.
+
+| arm | log | frame | asset | switch | engagement echo (from the log) | regions: ahead / wake / outside / snow |
+|---|---|---|---|---|---|---|
+| baseline (box owner, earlier today) | `Saved/capture-boat-underway-a6.log` | `VoxelVerify00974.png` | committed `fe51c15` (211037 B, 14:41:41) | none | `BOARDED at (-6509900,-5108400,165038)`; `field verified LIVE -- centre patch max field value 0.1919, max state height 0.0436 m, after 6 injection(s)` | 182,186,187 / 151,158,162 / 170,195,206 / 215,215,214 |
+| **A0** foam off | `Saved/capture-wl-a0-foamoff.log` | `VoxelVerify00980.png` (shutter cam (-6507979,-5108668,165316) pitch -11.8 yaw 44.8) | committed | `-VoxelWaterMatScalar=DisturbanceFoamEnabled:0` | `Lake sheets: material scalar 'DisturbanceFoamEnabled' set to 0.0000`; BOARDED same; LIVE `0.1910, 0.0438 m` | 171,199,206 / 83,162,185 / 170,195,205 / 215,215,214 |
+| **A2** gain 1 | `Saved/capture-wl-a2-gain1.log` | `VoxelVerify00982.png` (cam (-6507978,-5108665,165316)) | committed | `-VoxelWaterMatScalar=DisturbanceFoamGain:1` | `material scalar 'DisturbanceFoamGain' set to 1.0000`; LIVE `0.1918, 0.0436 m` | 182,186,187 / 151,158,162 / 172,196,206 / 215,215,214 |
+| **A3** gain 0.25 | `Saved/capture-wl-a3-gain025.log` | `VoxelVerify00984.png` (cam (-6507979,-5108667,165316)) | committed | `-VoxelWaterMatScalar=DisturbanceFoamGain:0.25` | `material scalar 'DisturbanceFoamGain' set to 0.2500`; LIVE `0.1913, 0.0437 m` | 182,187,188 / 151,158,162 / 170,195,206 / 215,215,214 |
+| **A4** field readback attempt | `Saved/capture-wl-a4-fieldread.log` | `VoxelVerify00986.png` (cam (-6507979,-5108666,165316)) | committed | `-VoxelRippleWakeAfter=172 -VoxelRippleWakeStrengthM=0.001 -VoxelRippleWakeRadiusM=0.1 -VoxelRippleWakeSteps=1` | `CAPTURE WAKE FIRED ... injected=1649 dropped(outside=0 full=0 unarmed=0 inert=0) steps=10084 ... fieldMaxAbs=0.0959 stateMaxAbs=0.0218. FROZEN.`; ring depths at 4/6/8/10/12 m ahead: `1.85 / 1.00 / 0.84 / 0.23 / 0.00 m`, shore `5.60 / 3.80 / 3.80 / 1.90 / -1.90 m` | not measured (the injection freezes the sim 1 s before the shutter) |
+| **B0** new asset, defaults | `Saved/capture-wl-b0-default.log` | `VoxelVerify00988.png` (cam (-6511125,-5110629,165324) pitch -13.6 yaw 44.7 -- `FRAMING NOT AS REQUESTED`) | regenerated 17:46:42 (229742 B) | none | `BOARDED at (-6510301,-5108682,165038)`; LIVE `0.0950, 0.0220 m, after 3 injection(s)` | 147,155,157 / 152,160,164 / 107,127,137 / 166,173,177 -- pose moved; the `snow` box is no longer snow, so these are NOT comparable with A0-A4 |
+| **C1** new asset, boat wake gain 1 | `Saved/capture-wl-c1-wakegain1.log` | `VoxelVerify00990.png` (cam (-6508521,-5106788,165322) pitch -12.1 yaw 45.2) | regenerated | `-Cvars 'voxel.Boat.WakeGain 1'` | `voxel.Boat.WakeGain = "1"`; `BOARDED at (-6509984,-5108191,165038)`; LIVE `0.0625, 0.0148 m, after 6 injection(s)`; the shutter lies 15 m E / 14 m N of the boarding point, i.e. along yaw 45 | not measured (pose differs from every other leg) |
+
+Arms authored but NOT run (owner paused live tuning at this point):
+**A1** `-VoxelWaterMatScalar=DisturbanceFoamEmissive:0` on the committed asset
+(the "is the SLW surface layer lit" test at full coverage); the threshold /
+height-weight ladder on the new asset; the ocean regen; and any leg with the
+C++ change in section 7(c).
+
+### 6.1 What the arms establish, stated as measurements
+
+1. **A0 vs baseline**: with the one scalar `DisturbanceFoamEnabled` at 0 the
+   `wake` box moves from (151,158,162) to (83,162,185) and the `ahead` box
+   from (182,186,187) to (171,199,206), while `outside` and `snow` are
+   unchanged to +/-1. So (i) `-VoxelWaterMatScalar` reaches the surface the
+   wake is drawn on -- the lake at the boat is the SHEET, `voxel.Water.
+   MeshImplicitLakes` default 0 -- and (ii) the entire grey window is the
+   disturbance-foam channel and nothing else. This arm could have failed
+   either way (an unchanged window would have meant reach failure or a
+   different mechanism).
+2. **A2 and A3 vs baseline**: `DisturbanceFoamGain` 8 -> 1 -> 0.25 leaves
+   every region unchanged to +/-1. `foam = saturate(raw * gain)` is
+   therefore saturated at gain 0.25, i.e. **raw >= 4 across the whole
+   window at the shutter**, `ahead` included. The "field verified LIVE"
+   figure (0.19 / 0.044 m) cannot be the field the shutter saw: health
+   sampling runs until the first verification, 0.25 s after boarding, and
+   stops. **There is no instrument that reads the field at the shutter**;
+   A4 shows the injector's `fieldMaxAbs` is the same stale number
+   (`LastFieldMaxAbs_`).
+3. **Arithmetic behind raw >= 4.** The material multiplies the field by
+   `RippleFieldGain`, which `voxel.Water.Ripple.Gain` publishes at **2.5**
+   (`VoxelRippleField.cpp:114`; its help text says "1 is shipped strength";
+   set to 2.5 in `c031b03`, 2026-08-13). With the committed response
+   `(|grad| + 4|h|) * 2.5`, raw >= 4 needs |h| >= 0.4 m or |grad| >= 1.6 on
+   every texel. The World Position Offset is the same `2.5 * h`, so a window
+   at |h| ~0.4-0.6 m is drawn 1.0-1.5 m proud of the lake.
+4. **Where that amplitude comes from (source, not a frame).** The boat calls
+   `AddSweptDisturbance` once per tick per station with that tick's sweep.
+   `VoxelRippleField.cpp:895` sets `NumSplats = 1 + floor(Length / Spacing)`
+   with spacing = max(width/2, 0.3 m) = 0.30 m, so a 3.3 cm per-tick sweep at
+   2 m/s still injects one FULL `StrengthM` ring per station per tick --
+   ~9 rings per spacing of travel instead of one, and `injected=1649` by
+   t=172 s in A4 (7 s under way). `voxel.Boat.WakeGain` **3.0**
+   (`VoxelBoat.cpp:68`, owner directive 2026-09-06, chosen against the 1.5 cm
+   LIVE readback which is taken at boarding, before the throttle) multiplies
+   each ring. The authored strengths are `BowWakeStrengthM 0.030`,
+   `TransomWakeStrengthM 0.022` (`VoxelMovementTuning.h:388-391`).
+5. **B0 vs C1** (different poses; read the frames, not the boxes): B0 is the
+   new asset at `WakeGain` 3.0, C1 the same asset at `WakeGain` 1. In B0 the
+   near-surface silhouette against the far water reaches display y~460 of
+   1092 with the frame centre at 546, i.e. ~9 deg above the camera's axis
+   (pitch -13.6), and the hull is covered up to the bow tip; in C1 the near
+   surface meets the far water at the window edge (display y~600-650) with
+   no silhouette above the far water line. The `voxel.Boat.WakeGain` echo is
+   the only difference in the two command lines.
+
+### 7. Classification of every edit in the tree, for the commit decision
+
+**(a) Proven by an arm that could have failed -- the DIAGNOSIS, not a fix:**
+the grey window is the disturbance-foam channel (A0); the field the material
+samples is >= 4 raw everywhere at the shutter (A2/A3), so the committed
+response's saturation is the visible symptom and the amplitude is the cause;
+the amplitude tracks `voxel.Boat.WakeGain` (B0 vs C1, two poses). **No edit
+below has been proven to fix the look.** B0 -- the regenerated asset at its
+new defaults -- still carries a window-wide foam at `WakeGain` 3.
+
+**(b) Generator edits now on disk, and their arms:**
+
+| file | change | default state | zero arm |
+|---|---|---|---|
+| `ue-project/Tools/ripple_field_graph.py` | `build_disturbance_foam`: `saturate((x - Threshold) * Gain * Enabled)`, `x = |grad| + |h| * HeightWeight`; three new ScalarParameters | **LIVE change of the shipped response**: HeightWeight 4.0 -> 1.0, Threshold 0 -> 0.05, Gain 8 -> 6 | `DisturbanceFoamEnabled:0` (pixel-identical off, unchanged); `Threshold:0,HeightWeight:4,Gain:8` reproduces the committed response exactly |
+| `ue-project/Tools/create_water_voxel_material.py` | shore-noise `scale` 0.35 -> 0.0035 (Common.ush: Position is in cm) | **LIVE change of the shipped shore band** (+/-0.9 m perturbation at ~3 m features instead of ~3 cm) | `BathyFoamNoiseM:0` |
+| same | `FoamBreakupGain/ScaleM/DriftMPS/Contrast` -- drifting turbulent noise multiplied into shore, shallow and disturbance foam | **dark** (gain 0.0 = multiply by exactly 1.0) | it is the default |
+| same | `ShallowFoamDepthM/ShallowFoamGain` -- depth-keyed shore foam max()ed into `shore_foam` | **dark** (gain 0.0 = bit-identical) | it is the default |
+
+Both `.py` files are unmodified in HEAD as of `fa86d97`; `git diff --stat`
+below. The three LIVE changes are the ones a commit has to decide on; the
+two dark ones ride along at no image cost.
+
+**(c) Experimental -- decide before any commit or any leg:**
+
+* `ue-project/Source/VoxelEarth/VoxelRippleField.cpp` (+30/-1 at
+  `AddSweptDisturbance`): a sweep shorter than one spacing now deposits
+  `StrengthM * Length / Spacing` instead of a full ring. **AUTHORED, NOT
+  BUILT, NOT TESTED** -- the owner paused live tuning before the build. It is
+  the mechanism fix for item 6.1(4) and is four lines of arithmetic, but an
+  unbuilt C++ edit is live input to the next `Build.bat`. Either build it
+  (`tools\voxel-build.ps1`) and re-run C1's command line without the `-Cvars`
+  (the observable is the same near-surface silhouette test as B0 vs C1), or
+  `git checkout -- ue-project/Source/VoxelEarth/VoxelRippleField.cpp` before
+  anyone runs a leg. The stationary-hull consequence (no deposit at zero
+  sweep, so `DroppedInert` counts those calls) is in the comment.
+* **`ue-project/Content/Voxel/M_WaterVoxel.uasset` is a regenerated shipping
+  asset**: mtime 17:46:42, 229742 B, against `fe51c15`'s 211037 B; `git
+  status` shows it modified. It carries every (b) change including the three
+  LIVE ones. `M_Ocean.uasset` was NOT regenerated (178139 B, 14:42:15,
+  committed bytes) although `create_ocean_material.py` imports the changed
+  helper, so the two water materials are now inconsistent on disk until
+  either the ocean is regenerated (`tools\voxel-sky-chain-regen.ps1 -Only
+  create_ocean_material.py -SkipCapture`) or the lake asset is restored
+  (`git checkout fe51c15 -- ue-project/Content/Voxel/M_WaterVoxel.uasset`).
+  Regen log for the lake: `Saved/sky-chain/regen-create_water_voxel_material.
+  log` -- `Python script executed successfully` x1, `LogPython: Error` x0,
+  `NOT A SHIPPING MATERIAL` x0, `Failed to compile Material` x0, 23 s; the
+  asset's bytes contain `DisturbanceFoamThreshold`,
+  `DisturbanceFoamHeightWeight`, `ShallowFoamGain`, `FoamBreakupGain` and no
+  `RIPPLE_DEBUG` / `NOT A SHIPPING` marker. `Get-ChildItem env:VOXEL_*` was
+  empty.
+
+### 8. How to iterate live (for the designer)
+
+**Live in a running session (console, no relaunch):**
+
+| cvar | default | what it does |
+|---|---|---|
+| `voxel.Boat.WakeGain` | 3.0 | multiplier on every bow/transom/slam splat the boat injects (the amplitude lever of section 6.1) |
+| `voxel.Water.Ripple.Gain` | 2.5 | multiplier on the ripple field AS DRAWN (normal, WPO and foam); does not touch the sim |
+| `voxel.Water.WaveTimeScale` | 1 | wind-wave clock; also gates the ripple's amplitude in the material (0 = provably still surface AND no disturbance foam) |
+| `voxel.Water.Ripple.Drop <XUU> <YUU> [RadiusM] [StrengthM] [Steps]`, `voxel.Water.Ripple.DropHere ...` | -- | inject one ring |
+| `voxel.Water.Ripple.Freeze` | 0 | freeze the sim to study a frame |
+| `voxel.Water.Ripple.PlayerStrengthM / PlayerRadiusM / ObjectStrengthM` | 0.22 / 0.9 / 0.18 | the player's and objects' splash sizes |
+| `voxel.Water.Ripple.TestFill` | 0 | DIAGNOSTIC: overwrite the field with a constant (proves the material samples this RT; everything else in the run is void) |
+| `voxel.Water.MeshImplicitLakes` | 0 | 1 = the old two-path lake draw (near-field voxels + sheet) |
+| `voxel.Boat.WaveBobGain`, `voxel.Boat.WaveBob` | 6.0 / 1 | hull bobbing on the wind waves (unrelated to the ripple field) |
+
+**Material scalars on `M_WaterVoxel`** (all ScalarParameters; live in the
+editor through a Material Instance of `/Game/Voxel/M_WaterVoxel`, or at
+launch through the switch below; the generator default is the source of
+truth and must be edited + regenerated for anything kept):
+`DisturbanceFoamGain` 6, `DisturbanceFoamThreshold` 0.05,
+`DisturbanceFoamHeightWeight` 1, `DisturbanceFoamEnabled` 1,
+`DisturbanceFoamEmissive` 0.6, `ShoreFoamEmissive` 0.6, `BathyFoamWidthM` 6,
+`BathyFoamNoiseM` 0.9, `BathyFoamShelfLo` 0.05, `BathyFoamShelfHi` 0.25,
+`BathyFoamGain` 0.55, `ShallowFoamDepthM` 0.6, `ShallowFoamGain` 0,
+`FoamBreakupGain` 0, `FoamBreakupScaleM` 0.6, `FoamBreakupDriftMPS` 0.15,
+`FoamBreakupContrast` 2.2, `WaterRoughnessFarGain` 0 (`WaterRoughnessFar`
+0.30, `WaterRoughnessFadeStartM/EndM`), `SurfacePresence` 0.
+`M_Ocean` shares the four `DisturbanceFoam*` scalars only.
+
+**Launch-only switches (headless legs; each echoes, and a missing echo is a
+void arm, not a null):**
+`-VoxelWaterMatScalar=Name:Value[,Name:Value...]` -- sets scalars on the
+**lake SHEET's MID only** (`VoxelWaterSheetActor.cpp:350`; the ocean and the
+near-field voxel water have no such path); echo `Lake sheets: material scalar
+'<Name>' set to <v>`, one line per pair (multi-pair works on the current
+build; any multi-pair arm run before 2026-09-07 06:00 applied only its first
+pair). `-Cvars 'voxel.Boat.WakeGain 1'` on `voxel-capture.ps1` (`-ExecCmds`
+underneath; echo `voxel.Boat.WakeGain = "1"`). `-VoxelRippleWakeAfter=<s>
+-VoxelRippleWakeSteps/RadiusM/StrengthM/Freeze` -- the capture injector; its
+`fieldMaxAbs` in the FIRED line is stale. `-VoxelLakeSheets=0` removes the
+sheet. The boat leg itself: `-VoxelExecAfter=165 -VoxelExecCmds="voxel.Boat.
+Spawn 3,voxel.Boat.Enter,voxel.Boat.Throttle 1 12"` with `-SettleSec 173`.
+
+**Regen (23 s for the lake, measured; pass = `Python script executed
+successfully` x1, `LogPython: Error` x0, `NOT A SHIPPING MATERIAL` x0,
+`Failed to compile Material` x0, and `Get-ChildItem env:VOXEL_*` empty
+first):**
+`tools\voxel-sky-chain-regen.ps1 -Only create_water_voxel_material.py -SkipCapture`
+(log `Saved\sky-chain\regen-create_water_voxel_material.log`);
+`tools\voxel-sky-chain-regen.ps1 -Only create_ocean_material.py -SkipCapture`.
+`ripple_field_graph.py` has no asset of its own: regenerate BOTH consumers
+after editing it.
+
+**The two questions a live session can answer in minutes that this pass
+could not:** (1) with `voxel.Water.Ripple.Freeze 1` after a run, what the
+field actually holds (there is no readback; `voxel.Water.Ripple.TestFill`
+proves the binding, the frozen frame shows the content); (2) A1 -- at full
+coverage with `DisturbanceFoamEmissive 0`, whether the SLW surface layer is
+lit on this water (`BasePassPixelShader.usf:1480-1492` says it is
+forward-lit; the record says it renders black).
+
+### 9. Settled elsewhere this session, recorded here so nobody re-opens it
+
+The white terrain at this lake is genuine alpine ground, not a colour-authority
+fault: the 00974 log carries `Clipmap colour authority: PALETTE (one authority,
+default)`, tan/orange voxels render along the waterline in 00962/00974/00980,
+and the ground top is 1644.2 m with higher peaks in frame (box owner, from the
+log). The biome name at the column is not yet on record (`vxc_terrainprobe`).
+
+## 2026-09-07 night, coordinator: water look PAUSED by owner; the night's authoring preserved as a patch, tree restored to fe51c15
+
+Owner, on the six ladder frames (00980-00990): "All of the capture screenshots look bad
+for different reasons. Boat is moving around. There is water inside boat in second.
+Massive grey coloration is 1, 3rd, 4th, 5th, and 6th. Wakes and ripples still look
+very bad." And earlier: pause wake/ripple tuning until a human designer iterates live;
+agent image interpretation is not good enough. Both stand.
+
+Those six frames were the DIAGNOSTIC ladder that found the mechanism (section 6 above),
+not candidates for the look; the coordinator should not have presented them as such.
+
+**State of the tree after this note:** the four water files the night pass edited
+(`ripple_field_graph.py`, `create_water_voxel_material.py`, `VoxelRippleField.cpp`,
+`M_WaterVoxel.uasset`) are restored to `fe51c15`, so the shipping asset pair is
+consistent again and no unbuilt C++ can be swept into a build. Everything authored is
+in **`docs/patches/water-look-2026-09-07-night.patch`** (`git apply` it, then regen
+BOTH water generators, then build for the C++ deposit fix). Its contents, per the
+agent's own classification: (a) the foam response re-keyed on a dead band + linear
+ramp with three new scalars -- LIVE default change, UNPROVEN (B0 still showed
+window-wide foam); (b) shore-noise scale 0.35 -> 0.0035 (Position is in cm) -- live,
+unproven; (c) `FoamBreakup*` and `ShallowFoam*` -- dark by default; (d) the C++
+rate-independent wake deposit -- UNBUILT, UNTESTED, and the only change aimed at the
+actual mechanism. Its gate is a counter, not an image: `injected` per metre of boat
+travel must fall ~9x from the ~1649-in-7-s the B0 log shows.
+
+**Recommended first step for the live session:** apply the patch, build, and read the
+`injected=` count on one boat run BEFORE looking at any picture. Until the deposition
+rate is fixed the surface is a half-metre dome and no material setting can make it
+read as a wake.
