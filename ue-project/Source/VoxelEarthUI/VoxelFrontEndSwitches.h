@@ -45,6 +45,62 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// screens to open before the shutter. Empty means the pause list.
 	FString PausePanel;
 
+	// --- The 2026-09-07 in-game screens ------------------------------------
+	// All four follow -VoxelPauseShot exactly: play for N seconds, open the
+	// thing, settle another N so its glyphs rasterise, photograph with the UI
+	// on, quit. They need a world for the same reason it does, and are driven
+	// by UVoxelScreensUISubsystem rather than by the front end, which has
+	// stopped ticking by the time there is anything to photograph.
+	//
+	// PAIR EVERY ONE WITH -VoxelSpawnAt. The world origin has no fine tiles and
+	// the spawn gate is fatal there; tools/voxel-ui-capture.ps1 adds it for
+	// these shots the same way it does for -Shot Pause.
+
+	// -VoxelScreenShot[=<seconds>]: open the five-tab stack and photograph it.
+	bool bScreenShot = false;
+	float ScreenShotSeconds = 2.0f;
+	// -VoxelScreenPanel=map|journal|inventory|player|codex. Empty means
+	// inventory, which is the tab with real data behind it.
+	FString ScreenPanel;
+
+	// -VoxelDeathShot[=<seconds>]. CAPTURE-ONLY BY NECESSITY: nothing in this
+	// project can kill the player (no health, no damage, no death delegate), so
+	// this switch is the death screen's only caller.
+	bool bDeathShot = false;
+	float DeathShotSeconds = 2.0f;
+
+	// -VoxelDialogueShot[=<seconds>]. Also capture-only: there is no
+	// conversation system, and design/CONVERSATION_SYSTEM.md -- which the
+	// dialogue CSS names as its spec -- is not in this repository.
+	bool bDialogueShot = false;
+	float DialogueShotSeconds = 2.0f;
+
+	// -VoxelDemoVitals[=<hp>,<hunger>,<wound>]: draw the HUD's health and hunger
+	// bars, and its interaction prompt, at fabricated values.
+	//
+	// SAME JOB AS -VoxelDemoSaves, AND THE SAME JUSTIFICATION. This project has
+	// no health, no hunger and no interaction system, so SVoxelGameHud gates
+	// all three off -- a health bar drawn full is a CLAIM, not a decoration, and
+	// it would go on telling the player they were unhurt after something could
+	// hurt them. But that leaves every picture of the HUD a picture of its
+	// empty state, with no way to review the layout the mock was drawn for.
+	//
+	// So this is capture-only, exactly as the demo save rows are: it fabricates
+	// what no system can yet supply, it is off by default, and nothing in
+	// ordinary play can turn it on. Values are 0..100 and default to the HUD
+	// mock's own TWEAK_DEFAULTS (100 / 100 / 0).
+	bool bDemoVitals = false;
+	float DemoHealth = 100.f;
+	float DemoHunger = 100.f;
+	float DemoWound = 0.f;
+
+	// -VoxelHudShot[=<seconds>]: photograph the world with ONLY the HUD on it.
+	// Opens nothing, because the HUD is installed as soon as the player has a
+	// pawn; the settle is there so the compass tape and the hotbar glyphs have
+	// rasterised.
+	bool bHudShot = false;
+	float HudShotSeconds = 2.0f;
+
 	// -VoxelLoadingShot[=<seconds>] / -VoxelLoadingShotAt=<s,s,s>: press NEW
 	// GAME immediately, then capture at each offset. The default single offset
 	// is 6 s, which on a cold cascade puts the bar mid-fill with the sand
@@ -158,7 +214,11 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// its own quit, so nothing consults this yet; it is the predicate a future
 	// caller wanting "is this a capture run at all" should use rather than
 	// re-deriving the disjunction.
-	bool IsCaptureRun() const { return bMenuShot || bLoadingShot || bHourglassShot || bPauseShot; }
+	bool IsCaptureRun() const
+	{
+		return bMenuShot || bLoadingShot || bHourglassShot || bPauseShot
+		    || bScreenShot || bDeathShot || bDialogueShot || bHudShot;
+	}
 };
 
 namespace VoxelFrontEndSwitches

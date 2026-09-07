@@ -210,6 +210,148 @@ void SVoxelMenuButton::Construct(const FArguments& InArgs)
 		return;
 	}
 
+	if (Variant == EVoxelMenuButtonVariant::Tab || Variant == EVoxelMenuButtonVariant::Chip)
+	{
+		// .menu-tab and .filter-tab are the same construction at two sizes: a
+		// full-bleed black rect, a 1 px edge ring, the plate fill, and -- when
+		// selected -- a 3 px gold rule along the bottom edge standing in for the
+		// CSS `inset 0 -3px 0 var(--gold)`.
+		//
+		// THE UNDERLINE IS A SIBLING BOX, NOT AN INSET SHADOW. Slate's brushes
+		// carry no inset shadow, and drawing it as a bottom-aligned box inside
+		// the same overlay is the only way to get a rule that is exactly 3 px
+		// regardless of the plate's height.
+		const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+		const bool bIsTab = Variant == EVoxelMenuButtonVariant::Tab;
+
+		const FMargin& Given = InArgs._ContentPadding;
+		const bool bDefaultPadding = Given.Left == 0.f && Given.Top == 0.f && Given.Right == 0.f && Given.Bottom == 0.f;
+		const FMargin Padding = bDefaultPadding
+			? (bIsTab ? FMargin(L.TabPadX, L.TabPadTop, L.TabPadX, L.TabPadBottom)
+			          : FMargin(L.InvFilterPadX, L.InvFilterPadY))
+			: Given;
+
+		FSlateFontInfo LabelFont = Style.Serif(InArgs._FontSize);
+		LabelFont.LetterSpacing = LetterSpacing;
+
+		TSharedRef<SHorizontalBox> Content = SNew(SHorizontalBox);
+		// .menu-tab .key -- the shortcut letter, in the mono face, ahead of the
+		// name. Collapsed rather than empty when a caller passes nothing, so a
+		// keyless tab does not carry the 8 px gap.
+		TAttribute<FText> KeyAttr = InArgs._KeyLabel;
+		if (KeyAttr.IsSet())
+		{
+			Content->AddSlot().AutoWidth().VAlign(VAlign_Center)
+			.Padding(FMargin(0.f, 0.f, L.TabKeyGap, 0.f))
+			[
+				SNew(STextBlock)
+				.Text(KeyAttr)
+				.Font(Style.Mono(L.TabKeySize))
+				.ColorAndOpacity(this, &SVoxelMenuButton::GetTabKeyColour)
+				.Visibility_Lambda([KeyAttr]()
+				{
+					return KeyAttr.Get().IsEmpty() ? EVisibility::Collapsed : EVisibility::HitTestInvisible;
+				})
+			];
+		}
+		Content->AddSlot().AutoWidth().VAlign(VAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(InArgs._Text)
+			.Font(LabelFont)
+			.ColorAndOpacity(this, &SVoxelMenuButton::GetTabLabelColour)
+			.ShadowOffset(FVector2D(1.f, 1.f))
+			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.9f))
+		];
+		// .filter-tab .n -- the tally, in the mono face, after the name.
+		TAttribute<FText> CountAttr = InArgs._CountLabel;
+		if (CountAttr.IsSet())
+		{
+			Content->AddSlot().AutoWidth().VAlign(VAlign_Center)
+			.Padding(FMargin(L.ActionKeyGap, 0.f, 0.f, 0.f))
+			[
+				SNew(STextBlock)
+				.Text(CountAttr)
+				.Font(Style.Mono(InArgs._FontSize + 4))
+				.ColorAndOpacity(this, &SVoxelMenuButton::GetTabKeyColour)
+				.Visibility_Lambda([CountAttr]()
+				{
+					return CountAttr.Get().IsEmpty() ? EVisibility::Collapsed : EVisibility::HitTestInvisible;
+				})
+			];
+		}
+
+		TSharedRef<SButton> ButtonRef =
+			SNew(SButton)
+			.ButtonStyle(&Style.CartoucheButton())
+			.ContentPadding(Padding)
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Center)
+			.IsEnabled_Lambda([this]() { return IsEnabled(); })
+			.OnClicked(InArgs._OnClicked)
+			.ForegroundColor(this, &SVoxelMenuButton::GetTabLabelColour)
+			[
+				Content
+			];
+		Button = ButtonRef;
+
+		// The tab bar is a row and the chip groups are rows, so Left/Right wrap
+		// -- the opposite axis from every other variant in this file.
+		TSharedRef<FNavigationMetaData> Navigation = MakeShared<FNavigationMetaData>();
+		Navigation->SetNavigationWrap(EUINavigation::Left);
+		Navigation->SetNavigationWrap(EUINavigation::Right);
+		ButtonRef->AddMetadata(Navigation);
+
+		ChildSlot
+		[
+			SNew(SBox)
+			.MinDesiredHeight(InArgs._MinHeight)
+			.MinDesiredWidth(InArgs._MinWidth > 0.f ? FOptionalSize(InArgs._MinWidth) : FOptionalSize())
+			[
+				SNew(SOverlay)
+				+ SOverlay::Slot()
+				[
+					SNew(SImage)
+					.Image(Style.SolidWhite())
+					.ColorAndOpacity(Tint(FColor::Black))
+				]
+				+ SOverlay::Slot()
+				.Padding(FMargin(SVoxelMenuButtonDetail::kBorderPx))
+				[
+					SNew(SImage)
+					.Image(Style.SolidWhite())
+					.ColorAndOpacity(this, &SVoxelMenuButton::GetTabEdgeColour)
+				]
+				+ SOverlay::Slot()
+				.Padding(FMargin(SVoxelMenuButtonDetail::kBorderPx + SVoxelMenuButtonDetail::kLeatherBorderPx))
+				[
+					SNew(SImage)
+					.Image(Style.SolidWhite())
+					.ColorAndOpacity(this, &SVoxelMenuButton::GetTabFillColour)
+				]
+				// The gold underline, bottom-aligned inside the border.
+				+ SOverlay::Slot()
+				.VAlign(VAlign_Bottom)
+				.Padding(FMargin(SVoxelMenuButtonDetail::kBorderPx, 0.f,
+				                 SVoxelMenuButtonDetail::kBorderPx, SVoxelMenuButtonDetail::kBorderPx))
+				[
+					SNew(SBox)
+					.HeightOverride(L.TabUnderlinePx)
+					[
+						SNew(SImage)
+						.Image(Style.SolidWhite())
+						.ColorAndOpacity(this, &SVoxelMenuButton::GetTabUnderlineColour)
+					]
+				]
+				+ SOverlay::Slot()
+				[
+					ButtonRef
+				]
+			]
+		];
+		return;
+	}
+
 	if (Variant == EVoxelMenuButtonVariant::PauseItem)
 	{
 		// .pa-btn: a chevron, a left-aligned label, and a hairline rule under
@@ -495,6 +637,72 @@ FSlateColor SVoxelMenuButton::GetLeatherLabelColour() const
 		return FSlateColor(Tint(IsLit() ? DangerHover : DeleteRest));
 	}
 	return FSlateColor(Tint(IsLit() ? Gold : Parchment));
+}
+
+bool SVoxelMenuButton::IsSelected() const
+{
+	return ActiveAttribute.Get(false);
+}
+
+FSlateColor SVoxelMenuButton::GetTabFillColour() const
+{
+	using namespace VoxelUITheme;
+	// linear-gradient(180deg, --panel-iron, #14100a) at rest; the oak plate
+	// when this is the open screen. Both flattened by Mix, as everywhere else.
+	static const FColor IronBottom(0x14, 0x10, 0x0a);
+	return IsSelected() ? Tint(Mix(PanelOak1, PanelOak2)) : Tint(Mix(PanelIron, IronBottom));
+}
+
+FSlateColor SVoxelMenuButton::GetTabEdgeColour() const
+{
+	using namespace VoxelUITheme;
+	return IsSelected() ? Tint(PanelOakEdge) : Tint(PanelIronEdge);
+}
+
+FSlateColor SVoxelMenuButton::GetTabLabelColour() const
+{
+	using namespace VoxelUITheme;
+	if (!IsEnabled())
+	{
+		return Tint(InkMute, 0.5f);
+	}
+	// SELECTION BEATS HOVER. `.menu-tab.active` is gold whether or not the
+	// pointer is on it, and `.menu-tab:hover` only lifts an inactive tab from
+	// --ink-mute to --ink.
+	if (IsSelected())
+	{
+		return Tint(Gold);
+	}
+	// The resting-state override, on GetLabelColour's own terms: applied only
+	// when the chip is neither selected nor lit, so a hovered chip still goes
+	// INK like every other one. The skill ladder uses it to paint an unlocked
+	// node gold and a locked one dim while both sit unselected.
+	if (TextColorOverride.IsSet() && !IsLit())
+	{
+		return FSlateColor(*TextColorOverride);
+	}
+	return IsLit() ? Tint(Ink) : Tint(InkMute);
+}
+
+FSlateColor SVoxelMenuButton::GetTabKeyColour() const
+{
+	using namespace VoxelUITheme;
+	// `.menu-tab .key` is GOLD and `.menu-tab.active .key` is INK -- the key
+	// glyph and the label swap colours when a tab opens, so the pair always
+	// reads as two tones rather than one.
+	if (!IsEnabled())
+	{
+		return Tint(InkMute, 0.5f);
+	}
+	return IsSelected() ? Tint(Ink) : Tint(Gold);
+}
+
+FSlateColor SVoxelMenuButton::GetTabUnderlineColour() const
+{
+	using namespace VoxelUITheme;
+	// Fully transparent rather than collapsed: the rule occupies its 3 px in
+	// every state, so a tab does not change height as it is selected.
+	return IsSelected() ? Tint(Gold) : Tint(Gold, 0.f);
 }
 
 FSlateColor SVoxelMenuButton::GetPauseLabelColour() const

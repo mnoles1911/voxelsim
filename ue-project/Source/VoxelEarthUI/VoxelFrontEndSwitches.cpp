@@ -103,6 +103,70 @@ FVoxelFrontEndSwitches Parse()
 		S.HourglassProgress = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
 	}
 
+	// --- The 2026-09-07 in-game screens -------------------------------------
+	// Both forms of each, on the -VoxelPauseShot pattern above.
+	if (FParse::Value(Cmd, TEXT("VoxelScreenShot="), Seconds))
+	{
+		S.bScreenShot = true;
+		S.ScreenShotSeconds = FMath::Max(Seconds, 0.f);
+	}
+	else if (FParse::Param(Cmd, TEXT("VoxelScreenShot")))
+	{
+		S.bScreenShot = true;
+	}
+	FParse::Value(Cmd, TEXT("VoxelScreenPanel="), S.ScreenPanel);
+	S.ScreenPanel = S.ScreenPanel.TrimStartAndEnd().ToLower();
+
+	if (FParse::Value(Cmd, TEXT("VoxelDeathShot="), Seconds))
+	{
+		S.bDeathShot = true;
+		S.DeathShotSeconds = FMath::Max(Seconds, 0.f);
+	}
+	else if (FParse::Param(Cmd, TEXT("VoxelDeathShot")))
+	{
+		S.bDeathShot = true;
+	}
+
+	if (FParse::Value(Cmd, TEXT("VoxelDialogueShot="), Seconds))
+	{
+		S.bDialogueShot = true;
+		S.DialogueShotSeconds = FMath::Max(Seconds, 0.f);
+	}
+	else if (FParse::Param(Cmd, TEXT("VoxelDialogueShot")))
+	{
+		S.bDialogueShot = true;
+	}
+
+	// THROUGH ParseFloatList, not FParse::Value: the value is a comma-separated
+	// list and FParse::Value's default terminator set includes the comma, which
+	// has already silently truncated -VoxelSpawnAt and -VoxelTimeOfDay once
+	// each. See ParseFloatList's own comment.
+	{
+		TArray<float> Vitals;
+		if (ParseFloatList(TEXT("VoxelDemoVitals="), Vitals) && Vitals.Num() > 0)
+		{
+			S.bDemoVitals = true;
+			S.DemoHealth = FMath::Clamp(Vitals[0], 0.f, 100.f);
+			if (Vitals.Num() > 1) { S.DemoHunger = FMath::Clamp(Vitals[1], 0.f, 100.f); }
+			if (Vitals.Num() > 2) { S.DemoWound = FMath::Clamp(Vitals[2], 0.f, 100.f); }
+		}
+		else if (FParse::Param(Cmd, TEXT("VoxelDemoVitals")))
+		{
+			// Bare form: the HUD mock's own TWEAK_DEFAULTS.
+			S.bDemoVitals = true;
+		}
+	}
+
+	if (FParse::Value(Cmd, TEXT("VoxelHudShot="), Seconds))
+	{
+		S.bHudShot = true;
+		S.HudShotSeconds = FMath::Max(Seconds, 0.f);
+	}
+	else if (FParse::Param(Cmd, TEXT("VoxelHudShot")))
+	{
+		S.bHudShot = true;
+	}
+
 	if (FParse::Value(Cmd, TEXT("VoxelMenuAutoStart="), Seconds))
 	{
 		S.bAutoStart = true;
@@ -130,6 +194,15 @@ FVoxelFrontEndSwitches Parse()
 	// theatre. Without the first, the shot is of a title screen; without the
 	// second, of 30-60 s of hourglass.
 	if (S.bPauseShot && !S.bAutoStart)
+	{
+		S.bAutoStart = true;
+		S.AutoStartSeconds = 0.5f;
+	}
+
+	// The four in-game-screen shots imply it for exactly the same reason: every
+	// one of them needs a world with a pawn in it, and an unattended run has
+	// nobody to press NEW GAME.
+	if ((S.bScreenShot || S.bDeathShot || S.bDialogueShot || S.bHudShot) && !S.bAutoStart)
 	{
 		S.bAutoStart = true;
 		S.AutoStartSeconds = 0.5f;

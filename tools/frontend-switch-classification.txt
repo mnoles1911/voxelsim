@@ -218,6 +218,19 @@ VoxelLoadGateMaxRing
 VoxelLoadMinHold
 VoxelLoadMaxHold
 VoxelLoadTheatre
+# The three below arrived with the 2026-09-07 overlay family and were missed
+# when it landed; the lint has been reporting them since. They are all
+# configuration for a capture that some OTHER switch drives -- passing
+# -VoxelPausePanel on its own opens nothing and quits nothing.
+VoxelPausePanel
+VoxelDemoSaves
+# Fabricates the HUD's health, hunger and interaction prompt for a capture, the
+# way -VoxelDemoSaves fabricates save rows. It draws nothing on its own and
+# quits nothing -- it is configuration for whichever shot is driving the run.
+VoxelDemoVitals
+# Which of the five in-game screens -VoxelScreenShot opens. Same shape as
+# -VoxelMenuPanel and -VoxelPausePanel above, and inert without its shot.
+VoxelScreenPanel
 
 # --- 2026-08-23: far-clipmap appearance (docs/backlog.md 0.0d) ---------------
 # All tuning, diagnosis or configuration; none of them drives the run, so all of
@@ -432,6 +445,11 @@ VoxelTreeFelling
 # would break leg commands, tools and docs other agents are running against
 # right now. Each accidental entry names the rename it wants and the owner.
 VoxelAutoDigAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelPauseShot = Front-end capture: reaches Playing, opens the pause overlay, photographs it and quits. Matches by intent, not by accident; it was simply never recorded when the overlay family landed on 2026-09-07.
+VoxelScreenShot = Front-end capture: reaches Playing, opens the in-game tab stack on -VoxelScreenPanel's screen, photographs it and quits.
+VoxelDeathShot = Front-end capture: reaches Playing, opens the death screen and quits. It is the death screen's ONLY caller -- nothing in this project can kill the player.
+VoxelDialogueShot = Front-end capture: reaches Playing, opens the dialogue overlay on the seeded node and quits. Also the overlay's only caller; there is no conversation system.
+VoxelHudShot = Front-end capture: reaches Playing, settles so the compass tape and hotbar glyphs have rasterised, photographs the world with only the HUD on it and quits. Opens nothing, because the HUD installs itself as soon as the player has a pawn.
 VoxelBreachTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelBucketedExitScanVerify = ACCIDENTAL ('Verify'). Correctness arm for the bucketed exit scan in the eviction index; verifies during a normal run. Owner: VoxelEvictionIndex.*
 VoxelCaveTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.

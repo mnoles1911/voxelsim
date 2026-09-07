@@ -75,6 +75,22 @@ public:
 	// Kicks the decode on first request.
 	const FSlateBrush* RequestBackground(int32 Index);
 
+	// The brush for ONE named image file, decoded on the same worker path as the
+	// backgrounds, or null while the decode is in flight or after it failed.
+	//
+	// ADDED FOR THE MAP SCREEN, which draws the offline hillshade raster from
+	// world-maps/. That file is 5.7 MB and 4096 px square: exactly the kind of
+	// decode doctrine 5 forbids doing on the game thread at an unpredictable
+	// moment, and exactly what this class already exists to keep off it. So the
+	// map gets the same treatment as the menu art rather than a second, simpler
+	// loader that would be the one nobody thought about.
+	//
+	// AN ABSOLUTE PATH, and deliberately not a Content-relative one: the raster
+	// lives outside Content/ (see SVoxelMapScreen for why it is not copied in),
+	// so a caller has to be able to name a file anywhere. A path that does not
+	// exist is an ordinary answer -- null forever, logged once.
+	const FSlateBrush* RequestImageFile(const FString& AbsolutePath);
+
 	// Drops every decoded texture and brush.
 	//
 	// Called at hand-off, because the front end is the ONLY thing that draws
@@ -107,6 +123,11 @@ private:
 	// matches -- without which a rescan mid-decode indexes an Entries array
 	// that has been reset underneath it.
 	uint32 Generation = 0;
+	// Files requested by RequestImageFile, as indices into Entries. They are
+	// ordinary entries that are simply NOT IN Order, so the rotation cannot
+	// draw them and ReleaseTextures still frees them -- rather than a second
+	// array with a second copy of the decode plumbing.
+	TMap<FString, int32> ExtraByPath;
 	// Indices into Entries, in the current shuffled order.
 	TArray<int32> Order;
 	TStrongObjectPtr<UVoxelUITextureCache> Cache;

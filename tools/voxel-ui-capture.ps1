@@ -31,17 +31,25 @@
     tools\voxel-ui-capture.ps1 -Shot Loading -At '0.5,6,20'
     tools\voxel-ui-capture.ps1 -Shot Pause
     tools\voxel-ui-capture.ps1 -Shot Pause -Panel save
+    tools\voxel-ui-capture.ps1 -Shot Screen
+    tools\voxel-ui-capture.ps1 -Shot Screen -Panel map
+    tools\voxel-ui-capture.ps1 -Shot Death
+    tools\voxel-ui-capture.ps1 -Shot Dialogue
+    tools\voxel-ui-capture.ps1 -Shot Hud
     tools\voxel-ui-capture.ps1 -Shot GateSweep -GateRing 2 -MaxHold 180
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Menu', 'Panel', 'Fallback', 'Hourglass', 'Loading', 'GateSweep', 'Pause')]
+    [ValidateSet('Menu', 'Panel', 'Fallback', 'Hourglass', 'Loading', 'GateSweep', 'Pause',
+                 'Screen', 'Death', 'Dialogue', 'Hud')]
     [string]$Shot,
 
     # -Shot Panel: which title-screen sub-panel to open before the shutter.
     # -Shot Pause: which of the pause overlay's four screens.
-    [ValidateSet('load', 'help', 'credits', 'settings', 'pause', 'save')]
+    # -Shot Screen: which of the five in-game screens.
+    [ValidateSet('load', 'help', 'credits', 'settings', 'pause', 'save',
+                 'map', 'journal', 'inventory', 'player', 'codex')]
     [string]$Panel = 'load',
 
     # -Shot Loading only: comma-separated seconds to capture at. The default
@@ -59,6 +67,19 @@ param(
     # suppresses -VoxelNoLoad on `-Shot Panel -Panel load`, which exists to
     # guarantee the opposite.
     [switch]$DemoSaves,
+
+    # Draw the HUD's health and hunger bars, and its interaction prompt, at
+    # fabricated values. Same job as -DemoSaves and the same justification:
+    # this game has no health, hunger or interaction system, so the HUD gates
+    # all three off in play -- a full health bar is a claim, not a decoration --
+    # and without this every picture of the HUD is a picture of its empty
+    # state. Implied by -Shot Hud, which exists to be reviewed against the
+    # mock; pass -NoDemoVitals to photograph the honest in-play HUD instead.
+    [switch]$DemoVitals,
+    [switch]$NoDemoVitals,
+    # 0..100, comma-separated: hp,hunger,wound. Default is the HUD mock's own
+    # TWEAK_DEFAULTS.
+    [string]$Vitals = '100,100,0',
 
     # Hard ceiling on the whole run, seconds. NOT a tuning knob -- it is the
     # backstop that stops a finished-but-unexited editor holding the box all
@@ -172,6 +193,37 @@ switch ($Shot) {
         $pausePanel = if ($PSBoundParameters.ContainsKey('Panel')) { $Panel } else { 'pause' }
         $argList += "-VoxelPausePanel=$pausePanel"
     }
+    'Screen' {
+        # THE FOUR ARMS BELOW ALL NEED A WORLD, exactly as 'Pause' does, and
+        # carry the same mandatory -VoxelSpawnAt for the same reason: the world
+        # origin has no fine tiles and the spawn gate is fatal there.
+        $argList += @("-VoxelScreenShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+        # -Panel's default is 'load', which belongs to -Shot Panel; an
+        # unspecified screen shot wants INVENTORY, the one tab with a real
+        # backing system behind it.
+        $screenPanel = if ($PSBoundParameters.ContainsKey('Panel')) { $Panel } else { 'inventory' }
+        $argList += "-VoxelScreenPanel=$screenPanel"
+    }
+    'Death' {
+        $argList += @("-VoxelDeathShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+    }
+    'Dialogue' {
+        $argList += @("-VoxelDialogueShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+    }
+    'Hud' {
+        # Opens nothing: the HUD installs itself as soon as the player has a
+        # pawn, so this arm only has to reach Playing and wait out the settle.
+        $argList += @("-VoxelHudShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+        # The vitals bars are the half of this screen the owner is reviewing
+        # and the half nothing can fill, so this shot demos them by default --
+        # the mirror of `-Shot Panel -Panel load` passing -VoxelNoLoad to
+        # guarantee the opposite.
+        if (-not $NoDemoVitals) { $DemoVitals = $true }
+    }
     'GateSweep' {
         # No shutter at all: this arm is a MEASUREMENT, and its output is the
         # VoxelLoadGate lines in the log rather than a picture. Feeds
@@ -183,6 +235,7 @@ switch ($Shot) {
 }
 
 if ($DemoSaves) { $argList += '-VoxelDemoSaves' }
+if ($DemoVitals) { $argList += "-VoxelDemoVitals=$Vitals" }
 if ($ExtraArgs) { $argList += $ExtraArgs }
 
 Write-Host ''

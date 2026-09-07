@@ -161,6 +161,68 @@ inline const FColor ThumbDeepInk       = FColor(0x50, 0x80, 0xa0);
 inline const FColor ThumbHolyTop       = FColor(0x18, 0x0c, 0x04);
 inline const FColor ThumbHolyBottom    = FColor(0x3a, 0x20, 0x08);
 
+// --- In-game screen family (2026-09-07 wave 2) ------------------------------
+// Inventory / Map / Journal / Player / Codex share the .menu-shell tab bar and
+// draw almost entirely from the tokens above. These are the ones their own
+// <style> blocks introduce as literals, named here for the same reason the
+// overlay family's are: a literal with no name is how two screens start
+// disagreeing about the same colour.
+
+// The map's parchment. .parchment-frame is a three-stop gradient and .sheet-paper
+// a different three-stop gradient over it; Mix() takes two stops, so the port
+// names the frame's end stops and uses the sheet's middle stop as the flat body.
+inline const FColor MapFrameTop    = FColor(0xe8, 0xd3, 0xa0);
+inline const FColor MapFrameBottom = FColor(0xc8, 0xa8, 0x68);
+inline const FColor MapSheetPaper  = FColor(0xdd, 0xc4, 0x8c); // .sheet-paper 45% stop
+// Marks are drawn in iron-gall ink on the sheet, not in the UI palette's golds.
+inline const FColor MapMarkInk     = FColor(0x7a, 0x2a, 0x12);
+inline const FColor MapMarkCaption = FColor(0x5a, 0x2a, 0x12);
+
+// The journal page's ink accents, all on parchment rather than on leather.
+inline const FColor PageKind       = FColor(0xa0, 0x4a, 0x14); // .p-kind, .p-steps li.now
+inline const FColor PageDropCap    = FColor(0x5a, 0x2a, 0x14); // .p-body .first, .p-sect
+
+// .perks-detail is the one blood-red panel in the whole front end: a dark
+// crimson plate with a lighter crimson ring, so an owned perk's description
+// reads as a different KIND of object from the oak stat blocks beside it.
+inline const FColor PerkPanelTop    = FColor(0x5a, 0x14, 0x10);
+inline const FColor PerkPanelBottom = FColor(0x2a, 0x08, 0x08);
+inline const FColor PerkPanelEdge   = FColor(0x8a, 0x30, 0x30);
+
+// .dlg-option__badge.easy. MEDIUM is Gold and HARD is HpBright, both already
+// named above; only the green has no existing token.
+inline const FColor DlgCheckEasy    = FColor(0x9e, 0xe0, 0x7a);
+
+// --- Death screen -----------------------------------------------------------
+//
+// THE MOCK REFERENCES TWO CSS VARIABLES THAT DO NOT EXIST. "Voxelmark Death
+// Screen.html" paints .died and .rule with var(--blood) and var(--blood-bright),
+// and neither is declared in menus_shared.css's :root block nor in the mock's
+// own <style> -- in a browser both resolve to nothing and the heading renders
+// in the inherited parchment. So the port cannot copy a value and has to choose
+// one, which is recorded here rather than buried at the call site.
+//
+// DeathBlood is measured from the only blood-red the mock does state: the
+// heading's own `text-shadow: 0 0 40px rgba(142,31,20,0.75)`. The bright stop
+// is HpBright, the palette's existing brightest red, so the death screen and
+// the DELETE button cannot drift apart.
+inline const FColor DeathBlood     = FColor(0x8e, 0x1f, 0x14);
+
+// --- HUD (2026-09-07 "Voxelmark HUD v2") ------------------------------------
+//
+// THE HUD MOCK OVERRIDES THE SHARED PALETTE. It carries its own :root block and
+// sets --stam to #6fb8d8, a cold blue, where menus_shared.css sets it to the
+// gold #c8a04a -- and then draws the HUNGER bar with .bar.stam. Taking the
+// shared token would paint that bar gold and lose the only colour contrast the
+// bottom dock has, so the port follows the screen it is cloning and names the
+// override instead of silently resolving the conflict.
+inline const FColor HudHungerFill  = FColor(0x6f, 0xb8, 0xd8);
+inline const FColor HudHungerDeep  = FColor(0x2a, 0x5a, 0x78);
+// .bar.hp .wound -- the un-healable band at the left of the health bar. Same
+// value as HpDeep; named because the mock names it (--hp-wound) and because a
+// later divergence should not be a silent one.
+inline const FColor HudWound       = FColor(0x5a, 0x14, 0x10);
+
 // --- Loading-screen extras --------------------------------------------------
 // Not in Colors.gd; hardcoded in LoadingHourglass.gd and TransitionManager.gd,
 // straight from the mock's :root block.
@@ -538,6 +600,257 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float LoadingTipInsetBottom = 16.f;
 	float LoadingTintAlpha     = 0.62f;
 	int32 FpsFontSize          = 14;
+
+	// --- In-game screen shell (2026-09-07 wave 2) ---------------------------
+	// .menu-shell.compact and the tab bar above it, shared by all five in-game
+	// screens. The mock sizes the shell
+	// `min(1060px, calc((100vw - 24px) / 1.33333))`, which is the author saying
+	// "1060 unless the window is too small"; Slate's DPI scale already divides
+	// by the same 1.333, so the port uses the 1060x760 figure and lets the
+	// containing SBox clamp it.
+	float ScreenShellWidth     = 1060.f;
+	float ScreenShellHeight    = 760.f;
+	float ScreenShellPadX      = 18.f; // padding:14px 18px 18px
+	float ScreenShellPadTop    = 14.f;
+	float ScreenShellPadBottom = 18.f;
+	// THE INVENTORY SHELL HAS NO SIZE HERE, deliberately. Its mock overrides the
+	// compact shell with `width:max-content`, and the port honours that by
+	// setting no override at all -- see SVoxelScreenShell::Construct for the
+	// arithmetic that rules out giving it a second fixed size. A knob nothing
+	// reads is worse than no knob, so there is none.
+
+	// .menu-tabs / .menu-tab
+	float TabBarPadLeft        = 8.f;
+	int32 TabFontSize          = 15;
+	int32 TabLetterSpacing     = 133;  // 2 px at 15 px
+	float TabPadX              = 22.f; // padding:10px 22px 9px
+	float TabPadTop            = 10.f;
+	float TabPadBottom         = 9.f;
+	float TabActivePadBottom   = 11.f; // .menu-tab.active grows 2 px downward
+	float TabUnderlinePx       = 3.f;  // inset 0 -3px 0 var(--gold)
+	int32 TabKeySize           = 15;   // .menu-tab .key
+	float TabKeyGap            = 8.f;
+	float TabBarRulePx         = 2.f;  // border-bottom:2px solid #000
+
+	// .menu-body -- an oak panel with a black/oak/black/oak ring stack and a
+	// bronze stud inset 8 px at each corner.
+	float ScreenBodyPad        = 18.f;
+	float ScreenBodyStudInset  = 8.f;
+	float ScreenBodyStudSize   = 4.f;  // radial-gradient ... 2px radius
+
+	// .action-bar
+	float ActionBarTopGap      = 10.f; // padding:10px 4px 0
+	float ActionBarGap         = 18.f;
+	int32 ActionBarFontSize    = 14;
+	int32 ActionKeyFontSize    = 15;
+	float ActionKeyMinWidth    = 18.f;
+	float ActionKeyHeight      = 18.f;
+	float ActionKeyPadX        = 5.f;
+	float ActionKeyGap         = 6.f;
+
+	// .sub-tabs / .sub-tab (PLAYER's four sub-pages, CODEX's categories)
+	float SubTabGap            = 6.f;
+	float SubTabRowBottomGap   = 10.f;
+	float SubTabRowPadBottom   = 6.f;
+	float SubTabShieldWidth    = 36.f;
+	float SubTabShieldHeight   = 42.f;
+	int32 SubTabLabelSize      = 11;
+	int32 SubTabLetterSpacing  = 182; // 2 px at 11 px
+	float SubTabMinWidth       = 64.f;
+
+	// .list-parchment / .list-header / .list-row / .list-divider
+	float ListHeaderPadX       = 16.f;
+	float ListHeaderPadY       = 8.f;
+	int32 ListHeaderSize       = 15;
+	float ListRowPadX          = 16.f;
+	float ListRowPadY          = 7.f;
+	int32 ListRowSize          = 17;
+	float ListRowIconSize      = 20.f;
+	int32 ListDividerSize      = 14;
+	int32 ListDividerSpacing   = 214; // 3 px at 14 px
+
+	// --- Inventory (.pack / .hotbar / .filter-tab / .side) -------------------
+	float InvSlotSize          = 58.f;
+	float InvSlotGap           = 2.f;
+	int32 InvPackCols          = 8;
+	int32 InvPackRows          = 8;
+	int32 InvHotbarSlots       = 8;
+	float InvPackBoxPad        = 6.f;
+	float InvHotbarRuleGap     = 5.f;
+	int32 InvSlotQtySize       = 14;   // .slot .qty
+	float InvDurabilityHeight  = 3.f;  // .dura
+	int32 InvFilterSize        = 11;
+	int32 InvFilterSpacing     = 182;  // 2 px at 11 px
+	float InvFilterPadX        = 10.f;
+	float InvFilterPadY        = 5.f;
+	int32 InvPanelNameSize     = 15;
+	int32 InvPanelNameSpacing  = 267;  // 4 px at 15 px
+	float InvSidePanelWidth    = 430.f;
+	float InvSideBoxPad        = 16.f;
+	float InvColumnGap         = 22.f; // .fit-inner gap
+	float InvCraftSlotSize     = 66.f;
+	float InvCraftSlotGap      = 3.f;
+	float InvEquipSlotSize     = 58.f;
+	float InvEquipColumnGap    = 14.f;
+	float InvRenderFrameHeight = 300.f;
+	int32 InvStatsSize         = 17;
+	int32 InvWeightSize        = 17;
+
+	// --- Map ----------------------------------------------------------------
+	float MapCompassSize       = 72.f;
+	float MapCompassInset      = 26.f;
+	// The mock's sheet is 4200x2800 and pans under a frame. The port draws the
+	// hillshade raster letterboxed into the frame at a fixed scale instead --
+	// see SVoxelMapScreen for why panning a 4200 px sheet is not what this
+	// screen can honestly offer yet.
+	float MapMarkIconSize      = 26.f;
+	int32 MapMarkCaptionSize   = 19;
+	float MapDrawerWidth       = 250.f;
+	int32 MapDrawerRowSize     = 18;
+	int32 MapReadoutSize       = 18;
+	int32 MapReadoutLabelSize  = 13;
+
+	// --- Journal ------------------------------------------------------------
+	float JournalListWidth     = 300.f; // grid-template-columns:300px 1fr
+	float JournalColumnGap     = 18.f;
+	float JournalCardPadX      = 12.f;
+	float JournalCardPadY      = 9.f;
+	float JournalCardGap       = 4.f;
+	int32 JournalStampSize     = 12;   // .card .stamp (--pixel 8px; see note)
+	int32 JournalCardHeadSize  = 15;
+	int32 JournalCardSnipSize  = 15;
+	float JournalPagePadX      = 28.f;
+	float JournalPagePadY      = 24.f;
+	int32 JournalPageKindSize  = 13;
+	int32 JournalPageTitleSize = 30;
+	int32 JournalPageStampSize = 16;
+	int32 JournalPageBodySize  = 18;
+	int32 JournalDropCapSize   = 48;
+	int32 JournalSectionSize   = 13;
+	int32 JournalStepSize      = 17;
+	float JournalStepMarkSize  = 10.f;
+
+	// --- Player -------------------------------------------------------------
+	float PlayerColumnGap      = 14.f;
+	float PlayerCardPadX       = 12.f;
+	float PlayerCardPadY       = 10.f;
+	float PlayerEquipSlotSize  = 62.f;
+	float PlayerEquipGap       = 6.f;
+	int32 PlayerNameSize       = 20;
+	int32 PlayerNameSpacing    = 150; // 3 px at 20 px
+	int32 PlayerHeadSize       = 12;
+	int32 PlayerBlockTitleSize = 13;
+	int32 PlayerBlockTitleSpacing = 231; // 3 px at 13 px
+	int32 PlayerAttrNameSize   = 13;
+	int32 PlayerAttrValueSize  = 12;
+	float PlayerAttrGlyphSize  = 19.f;
+	float PlayerLevelTrackHeight = 6.f;
+	int32 PlayerSkillNodeSize  = 64;
+	int32 PlayerRepNameSize    = 18;
+	float PlayerRepBarHeight   = 14.f;
+	float PlayerRepNameColumn  = 240.f;
+	float PlayerRepValueColumn = 80.f;
+
+	// --- Codex --------------------------------------------------------------
+	float CodexCategoryWidth   = 200.f;
+	float CodexEntryListWidth  = 260.f;
+	float CodexColumnGap       = 14.f;
+	int32 CodexCategorySize    = 14;
+	int32 CodexEntrySize       = 17;
+	int32 CodexTitleSize       = 26;
+	int32 CodexBodySize        = 17;
+	float CodexRecipeSlotSize  = 48.f;
+	float CodexRecipeSlotGap   = 3.f;
+
+	// --- Death screen (.died / .rule / .quip / .btn) -------------------------
+	int32 DeathTitleSize       = 104;
+	int32 DeathTitleSpacing    = 135;  // 14 px at 104 px
+	float DeathRuleWidth       = 520.f;
+	float DeathRuleHeight      = 2.f;
+	float DeathRuleTopGap      = 22.f;
+	float DeathRuleBottomGap   = 18.f;
+	int32 DeathQuipSize        = 26;
+	float DeathQuipMaxWidth    = 720.f;
+	int32 DeathStampSize       = 12;
+	int32 DeathStampSpacing    = 417; // 5 px at 12 px
+	float DeathStampTopGap     = 26.f;
+	// .actions sits `bottom:120px` in a 1080-tall stage; expressed as a gap
+	// below the message stack, which is what a Slate vertical box can honour at
+	// any window size.
+	float DeathActionsTopGap   = 120.f;
+	float DeathButtonGap       = 18.f;
+	float DeathButtonPadX      = 40.f;
+	float DeathButtonPadY      = 13.f;
+	int32 DeathButtonSize      = 17;
+	int32 DeathButtonSpacing   = 235; // 4 px at 17 px
+	// The mock fades the world to greyscale at 0.28 brightness under a radial
+	// ink wash. Slate can neither desaturate the scene nor draw a radial
+	// gradient, so the port lays one flat black wash at the brightness the two
+	// together were reaching for -- the same decision, and the same reasoning,
+	// as OverlayDimAlpha above.
+	float DeathDimAlpha        = 0.82f;
+
+	// --- Dialogue (.dlg-* in menus_shared.css) ------------------------------
+	float DlgStagePadX         = 64.f;
+	float DlgStagePadY         = 48.f;
+	float DlgPortraitWidth     = 160.f;
+	float DlgPortraitHeight    = 200.f;
+	float DlgSpeakerGap        = 18.f;
+	float DlgSpeakerMaxWidth   = 780.f;
+	int32 DlgSpeakerNameSize   = 22;
+	int32 DlgSpeakerNameSpacing = 182; // 4 px at 22 px
+	int32 DlgSpeakerRoleSize   = 16;
+	int32 DlgSpeakerLineSize   = 26;
+	float DlgSpeakerLineMaxWidth = 620.f;
+	float DlgOptionGap         = 6.f;
+	float DlgOptionPadX        = 14.f;
+	float DlgOptionPadY        = 8.f;
+	int32 DlgOptionSize        = 22;
+	float DlgOptionKeySize     = 22.f;
+	int32 DlgOptionKeyFontSize = 16;
+	float DlgOptionDiamondSize = 6.f;
+	int32 DlgBadgeSize         = 15;
+	float DlgSkillPadX         = 14.f;
+	float DlgSkillPadY         = 8.f;
+	float DlgSkillIconSize     = 26.f;
+	int32 DlgSkillValueSize    = 20;
+	int32 DlgSkillNameSize     = 9;
+	int32 DlgSkillNameSpacing  = 222; // 2 px at 9 px
+	float DlgCompanionWidth    = 360.f;
+	// The overlay dims the world less than the pause menu does, because the
+	// player is meant to still read the scene behind the conversation -- but
+	// NOT as little as the mock's own .scene-tint alone.
+	//
+	// 0.35 -> 0.55, MEASURED. The mock stacks rgba(0,0,0,0.25) on a .dlg-stage
+	// radial wash that reaches 0.6 at the edges, and the port draws one flat
+	// layer for both. Setting that layer to the tint alone was reading the
+	// stack's first term only: the 2026-09-07 dialogue capture put white
+	// parchment reply text over sunlit snow at near-full brightness, and the
+	// right-hand column was barely legible. 0.55 is the wash's own mid-range,
+	// which is what the two layers together were reaching for.
+	float DlgDimAlpha          = 0.55f;
+
+	// --- HUD ("Voxelmark HUD v2") -------------------------------------------
+	float HudCompassWidth      = 560.f;
+	float HudCompassHeight     = 24.f;
+	float HudCompassTop        = 12.f;
+	float HudCompassSegWidth   = 60.f;  // one 30-degree segment
+	int32 HudCompassSegSize    = 12;
+	int32 HudCompassCardSize   = 14;    // N/E/S/W read larger than the numbers
+	float HudDockBottom        = 12.f;
+	float HudDockGap           = 5.f;
+	float HudBarsWidth         = 694.f; // --hotbar-w: 10 slots + 9 gaps
+	float HudBarHeight         = 11.f;
+	float HudBarGap            = 10.f;
+	int32 HudBarSegments       = 10;    // the ::after 10% tick overlay
+	float HudSlotSize          = 64.f;
+	float HudSlotGap           = 6.f;
+	int32 HudSlotCount         = 10;
+	int32 HudSlotNumSize       = 13;
+	int32 HudSlotQtySize       = 14;
+	float HudSlotGlyphInset    = 15.f;
+	int32 HudInteractSize      = 14;
+	float HudInteractKeySize   = 21.f;
 
 	// --- Timings (seconds) --------------------------------------------------
 	float FadeDuration         = 0.4f;

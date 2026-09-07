@@ -29,3 +29,44 @@ Background art referenced as `assets/menu_backgrounds/*.jpg` already lives in
 
 Every mock is authored at 1920x1080 and shown at `zoom:1.33333` for 1440p;
 all pixel numbers in the port are the 1080p figures.
+
+## What is ported, and where
+
+| Mock | Slate |
+|------|-------|
+| Main Menu | `SVoxelMainMenu` |
+| Loading Screen | `SVoxelLoadingScreen`, `SVoxelHourglass` |
+| Pause Menu / Settings / Save / Load | `SVoxelPauseMenu` + `SVoxelSettingsPanel` / `SVoxelSaveDialog` / `SVoxelLoadDialog` |
+| Inventory / Map / Journal / Player / Codex | one `SVoxelScreenShell` hosting `SVoxelInventoryScreen`, `SVoxelMapScreen`, `SVoxelJournalScreen`, `SVoxelPlayerScreen`, `SVoxelCodexScreen` |
+| Death Screen | `SVoxelDeathScreen` |
+| Dialogue | `SVoxelDialogueOverlay` |
+| HUD v2 | `SVoxelGameHud` |
+
+All eight wave-2 screens are owned by `UVoxelScreensUISubsystem`.
+
+## Two things the mocks reference that do not exist
+
+* **`design/CONVERSATION_SYSTEM.md`.** `menus_shared.css` names it as the
+  dialogue layer's spec and "Voxelmark Dialogue.html" cites it plus
+  `SKILLS_AND_PROGRESSION.md` and a `SpeechCheckBroker` for every number in the
+  node. None of them is in this repository and `git log` finds no deleted one,
+  so the mock's own markup and comments are the whole spec the port had.
+* **`--blood` and `--blood-bright`.** "Voxelmark Death Screen.html" paints its
+  heading and rule with both; neither is declared in the `:root` block or in
+  the mock's own `<style>`, so in a browser they resolve to nothing. The port
+  chooses values and records the choice at `VoxelUITheme::DeathBlood`.
+
+## Systems the mocks assume that this game does not have
+
+Recorded here because it is the single biggest gap between these pictures and
+the port, and because each one is a decision a reader will otherwise re-derive:
+**rarity, durability, equipment, crafting recipes, quests/journal, codex/lore,
+skills, perks, factions, XP/levels, health, hunger, death/respawn, and
+conversations.** A case-sensitive grep for each across both modules on
+2026-09-07 returned nothing. `VoxelScreenData.h` is the interface every screen
+draws through, and `VoxelScreenData.cpp`'s `Seed*()` functions hold the mock's
+own placeholder content until those systems arrive.
+
+The one exception is the **inventory**, which is real:
+`UVoxelInventoryComponent` and `FVoxelItemRegistry` back the pack, the hotbar
+and the HUD dock live.

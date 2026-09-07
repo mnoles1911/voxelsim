@@ -162,4 +162,161 @@ VOXELEARTHUI_API FText TipPrefix();   // "TIP"
 // screen's lifetime, not to the string table.
 VOXELEARTHUI_API const TArray<FText>& LoadingQuips();
 VOXELEARTHUI_API const TArray<FText>& GameplayTips();
+
+// --- In-game screens (2026-09-07 wave 2) ------------------------------------
+//
+// CHROME ONLY. The labels below are the parts of the five screens that are the
+// SCREEN rather than its contents -- tab names, column headings, button words,
+// action-bar hints. The placeholder journal entries, codex pages, perks and
+// factions are NOT here: they live in VoxelScreenData.cpp behind Seed*(), for
+// the reason that file gives -- they are scaffolding to be deleted whole when
+// the systems arrive, and mixing them into the permanent string table would
+// make that deletion a hunt rather than a file.
+
+// .menu-tab labels and the shortcut letter each draws in its .key span.
+VOXELEARTHUI_API FText ScreenTabMap();
+VOXELEARTHUI_API FText ScreenTabJournal();
+VOXELEARTHUI_API FText ScreenTabInventory();
+VOXELEARTHUI_API FText ScreenTabPlayer();
+VOXELEARTHUI_API FText ScreenTabCodex();
+VOXELEARTHUI_API FText ScreenKeyMap();
+VOXELEARTHUI_API FText ScreenKeyJournal();
+VOXELEARTHUI_API FText ScreenKeyInventory();
+VOXELEARTHUI_API FText ScreenKeyPlayer();
+VOXELEARTHUI_API FText ScreenKeyCodex();
+VOXELEARTHUI_API FText ScreenActionClose();   // the shared "ESC  Exit" hint
+VOXELEARTHUI_API FText ScreenActionPage();    // "Q/E  Switch screen"
+
+// --- Inventory --------------------------------------------------------------
+VOXELEARTHUI_API FText InvPack();
+VOXELEARTHUI_API FText InvCrafting();
+VOXELEARTHUI_API FText InvCharacter();
+VOXELEARTHUI_API FText InvModeCraft();
+VOXELEARTHUI_API FText InvModeCharacter();
+VOXELEARTHUI_API FText InvCraftButton();
+VOXELEARTHUI_API FText InvCraftHint();
+VOXELEARTHUI_API FText InvNoRecipe();
+// The seven .filter-tab chips. NOTHING IN THIS GAME HAS A CATEGORY that maps
+// onto six of them -- FVoxelItemDef's four categories are Block, Tool,
+// Throwable and Misc -- so Weapons, Armor, Food and Quest are always empty and
+// are drawn anyway, because a filter row that changed length with the contents
+// of the pack would move under the cursor.
+VOXELEARTHUI_API const TArray<FText>& InvFilterNames();
+// HEAD / NECK / CHEST / HANDS / MAIN / OFF / RING / FEET -- the INVENTORY
+// mock's paperdoll.
+VOXELEARTHUI_API const TArray<FText>& InvEquipSlotNames();
+// HEAD / CHEST / HANDS / LEGS / MAIN / OFF / RING / FEET -- the PLAYER mock's.
+//
+// THE TWO MOCKS DISAGREE, and it is not a typo in either: the inventory screen
+// has a NECK socket the player screen does not, and the player screen has LEGS
+// where the inventory has HANDS in the fourth position. One shared list put
+// the chest piece on the neck in the first player capture, which is what this
+// second list exists to stop.
+VOXELEARTHUI_API const TArray<FText>& PlayerEquipSlotNames();
+VOXELEARTHUI_API FText InvSearchHint();
+VOXELEARTHUI_API FText InvWeight(float CarriedKg);
+VOXELEARTHUI_API FText InvNoEquipment();
+
+// --- Map --------------------------------------------------------------------
+VOXELEARTHUI_API FText MapSavedPlaces();
+VOXELEARTHUI_API FText MapNoPlaces();
+VOXELEARTHUI_API FText MapLabelPosition();
+VOXELEARTHUI_API FText MapLabelGeo();
+VOXELEARTHUI_API FText MapLabelAltitude();
+VOXELEARTHUI_API FText MapLabelChunk();
+VOXELEARTHUI_API FText MapLabelHeading();
+VOXELEARTHUI_API FText MapLabelSeed();
+// The action-bar line that says the sheet is a fixed overview rather than the
+// mock's pannable 4200 px map. Shown only when no raster loaded.
+VOXELEARTHUI_API FText MapNoRaster();
+// Shown when the raster IS drawn: it is a fixed world overview, and the
+// player's own position is the readout beside it rather than a pin on it.
+VOXELEARTHUI_API FText MapOverviewNote();
+VOXELEARTHUI_API FText MapPositionValue(const FVector& World);
+VOXELEARTHUI_API FText MapGeoValue(double LatitudeDeg, double LongitudeDeg);
+VOXELEARTHUI_API FText MapChunkValue(const FIntVector& Chunk);
+VOXELEARTHUI_API FText MapHeadingValue(float Degrees);
+VOXELEARTHUI_API FText MapSeedValue(uint64 Seed);
+// N, E, S, W in that order -- the four letters on the compass rose.
+VOXELEARTHUI_API const TArray<FText>& MapCompassLetters();
+
+// --- Journal ----------------------------------------------------------------
+VOXELEARTHUI_API FText JournalSectionEntries();
+VOXELEARTHUI_API FText JournalSectionGoals();
+VOXELEARTHUI_API FText JournalTracked();
+VOXELEARTHUI_API FText JournalUntracked();
+VOXELEARTHUI_API FText JournalEntriesTab();
+VOXELEARTHUI_API FText JournalNewEntry();
+VOXELEARTHUI_API FText JournalWriteHere();
+VOXELEARTHUI_API FText JournalEmpty();
+VOXELEARTHUI_API FText JournalNothingTracked();
+VOXELEARTHUI_API FText JournalNothingUntracked();
+VOXELEARTHUI_API FText JournalSteps();
+VOXELEARTHUI_API FText JournalTrack();
+VOXELEARTHUI_API FText JournalUntrack();
+VOXELEARTHUI_API FText JournalStepProgress(int32 Done, int32 Total, const FText& Place);
+VOXELEARTHUI_API FText JournalKindEntry();
+VOXELEARTHUI_API FText JournalKindTracked();
+VOXELEARTHUI_API FText JournalKindUntracked();
+VOXELEARTHUI_API FText JournalCardStamp(int32 Day, const FText& Season);
+
+// --- Player -----------------------------------------------------------------
+VOXELEARTHUI_API FText PlayerSubStats();
+VOXELEARTHUI_API FText PlayerSubSkills();
+VOXELEARTHUI_API FText PlayerSubPerks();
+VOXELEARTHUI_API FText PlayerSubReputation();
+VOXELEARTHUI_API FText PlayerMainLevel();
+VOXELEARTHUI_API FText PlayerXp();
+VOXELEARTHUI_API FText PlayerXpValue(int32 Current, int32 Next);
+VOXELEARTHUI_API FText PlayerSkillPoints();
+VOXELEARTHUI_API FText PlayerDisciplines();
+VOXELEARTHUI_API FText PlayerColumnName();
+VOXELEARTHUI_API FText PlayerColumnLevel();
+VOXELEARTHUI_API FText PlayerColumnStatus();
+VOXELEARTHUI_API FText PlayerColumnFaction();
+VOXELEARTHUI_API FText PlayerColumnStanding();
+VOXELEARTHUI_API FText PlayerColumnValue();
+VOXELEARTHUI_API FText PlayerStatusOwned();
+VOXELEARTHUI_API FText PlayerStatusLocked();
+VOXELEARTHUI_API FText PlayerRankLine(int32 From, int32 To);
+VOXELEARTHUI_API FText PlayerUnlockCost(int32 Points);
+VOXELEARTHUI_API FText PlayerRankBadge(int32 Rank, int32 MaxRank);
+VOXELEARTHUI_API FText PlayerDisciplineTally(int32 Unlocked, int32 Total);
+
+// --- Codex ------------------------------------------------------------------
+VOXELEARTHUI_API FText CodexRecipes();
+VOXELEARTHUI_API FText CodexPlaces();
+VOXELEARTHUI_API FText CodexIngredients();
+VOXELEARTHUI_API FText CodexMadeAt(const FText& Station);
+VOXELEARTHUI_API FText CodexYield(const FText& Category, int32 Count);
+VOXELEARTHUI_API FText CodexYieldLabel();
+VOXELEARTHUI_API FText CodexSearchHint();
+VOXELEARTHUI_API FText CodexNoRecipe();
+VOXELEARTHUI_API FText CodexLocked();
+VOXELEARTHUI_API FText CodexIngredientLine(int32 Needed, const FText& Name);
+VOXELEARTHUI_API FText CodexHeldLine(int32 Held);
+VOXELEARTHUI_API FText CodexHeldUnknown();
+
+// --- Death screen -----------------------------------------------------------
+VOXELEARTHUI_API FText DeathTitle();      // "YOU DIED"
+VOXELEARTHUI_API FText DeathRespawn();
+VOXELEARTHUI_API FText DeathQuit();
+// The mock's generic pool. Its ten per-cause pools are NOT ported: this game
+// has no damage system, so it can never name a cause, and ten pools that can
+// only ever be unreachable would be ten lists nobody maintains. Adding them
+// back is one array each, beside this one, the day something can kill a player.
+VOXELEARTHUI_API const TArray<FText>& DeathQuips();
+
+// --- Dialogue ---------------------------------------------------------------
+VOXELEARTHUI_API FText DlgBandEasy();
+VOXELEARTHUI_API FText DlgBandMedium();
+VOXELEARTHUI_API FText DlgBandHard();
+VOXELEARTHUI_API FText DlgActionSelect();
+
+// --- HUD --------------------------------------------------------------------
+// The interaction prompt the HUD mock shows. CAPTURE-ONLY: there is no
+// interaction system and no examinable actor, so this is drawn under
+// -VoxelDemoVitals and never in play. The mock's own line, verbatim.
+VOXELEARTHUI_API FText HudDemoInteract();
+VOXELEARTHUI_API FText HudDemoInteractKey();
 } // namespace VoxelUIStrings

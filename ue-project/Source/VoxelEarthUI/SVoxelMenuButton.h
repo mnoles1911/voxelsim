@@ -43,6 +43,18 @@ enum class EVoxelMenuButtonVariant : uint8
 	// .pa-btn, the pause list line: no box at all, a "›" chevron, the label
 	// left-aligned, and a hairline rule underneath.
 	PauseItem,
+	// .menu-tab (2026-09-07 wave 2): one tab of the in-game screen bar. An iron
+	// plate with no bottom border, which goes oak with a 3 px gold underline
+	// when it is the open screen. KeyLabel puts the shortcut letter in front of
+	// the name, in the mono face, exactly as the mock's `.menu-tab .key` does.
+	Tab,
+	// .filter-tab / .sect / .subtab / .cat / .sk-class-item / .mode-toggle
+	// button. FIVE MOCK CLASSES, ONE VARIANT: all five are a small iron plate
+	// with a tracked serif label that turns gold on an oak ground when
+	// selected, and four of them additionally carry a count. They differ only
+	// in font size and padding, which are arguments -- the same call made for
+	// Leather, and for the same reason.
+	Chip,
 };
 
 class VOXELEARTHUI_API SVoxelMenuButton : public SCompoundWidget
@@ -83,6 +95,12 @@ public:
 		// Leather: the plate's own padding (.se-act is 9px 24px, .ld-btn 8/14).
 		// Zero means the variant's default.
 		SLATE_ARGUMENT(FMargin, ContentPadding)
+		// Tab: the shortcut letter drawn before the name (.menu-tab .key).
+		// Chip: the tally drawn after it (.filter-tab .n). Both are empty by
+		// default and both are ATTRIBUTES, because a filter chip's count
+		// changes as the pack is searched.
+		SLATE_ATTRIBUTE(FText, KeyLabel)
+		SLATE_ATTRIBUTE(FText, CountLabel)
 		SLATE_ARGUMENT(int32, ActiveFontSize)
 		// FSlateFontInfo::LetterSpacing units (1/1000 em).
 		SLATE_ARGUMENT(int32, LetterSpacing)
@@ -144,6 +162,17 @@ private:
 	FSlateColor GetLeatherFillColour() const;
 	FSlateColor GetLeatherBorderColour() const;
 	FSlateColor GetLeatherLabelColour() const;
+
+	// Tab and Chip (.menu-tab / .filter-tab). Both key off the Active attribute
+	// rather than off IsLit, because a tab is "the open screen" whether or not
+	// the cursor is over it -- the one place in this widget where selection and
+	// lit-ness are different questions.
+	bool IsSelected() const;
+	FSlateColor GetTabFillColour() const;
+	FSlateColor GetTabEdgeColour() const;
+	FSlateColor GetTabLabelColour() const;
+	FSlateColor GetTabKeyColour() const;
+	FSlateColor GetTabUnderlineColour() const;
 
 	// PauseItem (.pa-btn): the label, the chevron, and the chevron's 4 px slide.
 	FSlateColor GetPauseLabelColour() const;

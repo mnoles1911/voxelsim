@@ -98,6 +98,10 @@ void FVoxelUIAssetLibrary::RescanBackgrounds()
 {
 	Entries.Reset();
 	Order.Reset();
+	// The extra entries index into Entries, which has just been emptied, so the
+	// map has to go with it -- a stale index here would hand the map screen a
+	// menu background.
+	ExtraByPath.Reset();
 	// Invalidates every decode currently in flight; see FEntry / Generation.
 	++Generation;
 
@@ -193,6 +197,56 @@ const FSlateBrush* FVoxelUIAssetLibrary::RequestBackground(int32 Index)
 	// which for a crossfade means the incoming image simply starts at zero
 	// opacity for a few frames longer, and for the menu means one flat frame
 	// before the art appears.
+	return nullptr;
+}
+
+const FSlateBrush* FVoxelUIAssetLibrary::RequestImageFile(const FString& AbsolutePath)
+{
+	if (AbsolutePath.IsEmpty() || FVoxelFrontEndSwitches::Get().bNoAssets)
+	{
+		return nullptr;
+	}
+
+	int32 EntryIndex = INDEX_NONE;
+	if (const int32* Found = ExtraByPath.Find(AbsolutePath))
+	{
+		EntryIndex = *Found;
+	}
+	else
+	{
+		// EXISTENCE IS CHECKED ONCE, HERE, rather than left to the decode. The
+		// map raster is optional by design and a missing file is the normal
+		// case on a checkout that never generated one; letting it become a
+		// decode failure would log a warning every time the map opened.
+		if (!IFileManager::Get().FileExists(*AbsolutePath))
+		{
+			UE_LOG(LogVoxelUI, Log, TEXT("UI image %s not present; the caller draws its fallback."), *AbsolutePath);
+			ExtraByPath.Add(AbsolutePath, INDEX_NONE);
+			return nullptr;
+		}
+		FEntry Entry;
+		Entry.Path = AbsolutePath;
+		EntryIndex = Entries.Add(MoveTemp(Entry));
+		ExtraByPath.Add(AbsolutePath, EntryIndex);
+	}
+
+	if (EntryIndex == INDEX_NONE || !Entries.IsValidIndex(EntryIndex))
+	{
+		return nullptr;
+	}
+	FEntry& Entry = Entries[EntryIndex];
+	if (Entry.Brush.IsValid())
+	{
+		return Entry.Brush.Get();
+	}
+	if (Entry.bDecodeFailed)
+	{
+		return nullptr;
+	}
+	if (!Entry.bDecodeStarted)
+	{
+		BeginDecode(EntryIndex);
+	}
 	return nullptr;
 }
 
