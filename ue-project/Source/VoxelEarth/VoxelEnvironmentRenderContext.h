@@ -19,6 +19,8 @@ FContextRef Build(VoxelProductionEnvironment::FSnapshot Snapshot,uint64 WorldSee
 class FContext {
 public:
     uint64 Generation() const {return Snapshot->generation;}
+    // Inclusive base-voxel AABB; conservative for coarse representative/apron sampling.
+    bool AffectsBounds(int64 X0,int64 Y0,int64 Z0,int64 X1,int64 Y1,int64 Z1) const;
     bool HasOwnedSources() const {return !Sources.IsEmpty();}
     // Input MUST already be job-private; even an empty context clears old flags.
     // Preserves order and storage. False means a stale/wrong bank binding; no

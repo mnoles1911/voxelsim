@@ -46,6 +46,9 @@ bool FVoxelEnvironmentRenderContextTest::RunTest(const FString&){
     auto Oversized=MakeShared<vxc::AssetOwnershipSnapshot,ESPMode::ThreadSafe>();Oversized->records.resize(257);
     TestFalse(TEXT("oversized all-terrain snapshot fails before scan"),Build(Oversized,19,Provider,Catalog,{},Error).IsValid());
     const int64 X=P.anchorVx+A.rotatedOriginX(P.yawQuarter),Y=P.anchorVy+A.rotatedOriginY(P.yawQuarter),Z=P.anchorVz;
+    TestTrue(TEXT("negative rotated bounds include touching apron cell"),Context->AffectsBounds(X-32,Y,Z,X,Y,Z));
+    TestFalse(TEXT("disjoint page is unaffected"),Context->AffectsBounds(X+2,Y,Z,X+33,Y+32,Z+32));
+    TestFalse(TEXT("empty ownership affects no bounds"),Empty->AffectsBounds(X,Y,Z,X+1,Y+1,Z+1));
     TestEqual(TEXT("default first winner"),vxc::AssetField::materialAtResolved(Canonical,X,Y,Z),vxc::MaterialId(16));
     TestEqual(TEXT("owned first winner becomes air without revealing overlap"),vxc::AssetField::materialAtResolvedForRender<true>(Private,X,Y,Z),vxc::MAT_AIR);
     TestEqual(TEXT("authoritative composition ignores marker"),vxc::AssetField::materialAtResolved(Private,X,Y,Z),vxc::MaterialId(16));
