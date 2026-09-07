@@ -2820,7 +2820,10 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 	// (VoxelEarthGameMode.cpp:54-92) so the two cannot drift apart.
 	double SpawnColumnXUU = 0.0;
 	double SpawnColumnYUU = 0.0;
-	VoxelEarthSpawn::ParseSpawnColumnUU(SpawnColumnXUU, SpawnColumnYUU); // stays (0,0) if the switch is absent
+	// Resolve, not Parse (2026-09-07): the spawn rule can move an ordinary
+	// launch's column to a fine-baked tile, and the rig must follow it for the
+	// same reason it follows -VoxelSpawnAt. Stays (0,0) when neither applies.
+	VoxelEarthSpawn::ResolveSpawnColumnUU(GetWorld(), SpawnColumnXUU, SpawnColumnYUU);
 	Impl->ObserverXUU = SpawnColumnXUU;
 	Impl->ObserverYUU = SpawnColumnYUU;
 

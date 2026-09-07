@@ -598,7 +598,10 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 	{
 		double SpawnX = 0.0;
 		double SpawnY = 0.0;
-		VoxelEarthSpawn::ParseSpawnColumnUU(SpawnX, SpawnY);
+		// Resolve, not Parse (2026-09-07): the spawn rule moves an ordinary
+		// launch to a fine-baked column, and the 112 probes must ring THAT
+		// column, not the origin.
+		VoxelEarthSpawn::ResolveSpawnColumnUU(World, SpawnX, SpawnY);
 		Anchor = FVector(SpawnX, SpawnY, WorldSub->GetSurfaceHeightUU(SpawnX, SpawnY));
 	}
 

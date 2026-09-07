@@ -6,6 +6,8 @@
 #include "VoxelFineLockMeter.h" // FLockScope -- the instrument on Lock_, and the two switches
 #include "VoxelDebug.h"    // LogVoxelPerf -- the probe line rides the perf category
 #include "VoxelTileCodec.h"  // VoxelEarth::GetFineTileDecompressor -- CODEC_ZSTD host boundary
+#include "VoxelCoords.h"     // VoxelCoords::WorldToMm -- TileForWorldUU routes through the residency maths
+#include "HAL/FileManager.h" // IFileManager::FindFiles -- EnumerateTilesOnDisk
 #include "Misc/Paths.h"      // FPaths::Combine
 
 #include "voxelcore/caverns.h"  // kCavernMaxReachMm -- see kFineReadMarginMm below
@@ -718,6 +720,59 @@ bool FVoxelFineTileStreamer::RecordLoadFailure_Locked(vxc::TileCoord Tile, const
 vxc::TileCoord FVoxelFineTileStreamer::CoarseTileForWorldMm(int64 WorldMmX, int64 WorldMmY)
 {
 	return vxc::tileCoordForWorldMm(WorldMmX, WorldMmY, kTileFootprintMm);
+}
+
+double FVoxelFineTileStreamer::TileFootprintUU()
+{
+	// mm -> UU (cm): 15,360,000 mm == 1,536,000 UU == 15.36 km.
+	return double(kTileFootprintMm) / 10.0;
+}
+
+FIntPoint FVoxelFineTileStreamer::TileForWorldUU(double WorldXUU, double WorldYUU)
+{
+	// Through the SAME voxel-core routing residency uses (floorDiv, not
+	// truncation), so a column 1 cm west of a tile edge lands in the western
+	// tile here and in the streamer alike.
+	const vxc::TileCoord T = CoarseTileForWorldMm(VoxelCoords::WorldToMm(WorldXUU), VoxelCoords::WorldToMm(WorldYUU));
+	return FIntPoint(T.x, T.y);
+}
+
+FVector2D FVoxelFineTileStreamer::TileCentreWorldUU(FIntPoint Tile)
+{
+	const double Footprint = TileFootprintUU();
+	return FVector2D((double(Tile.X) + 0.5) * Footprint, (double(Tile.Y) + 0.5) * Footprint);
+}
+
+FString FVoxelFineTileStreamer::TilesDirectory() const
+{
+	// The s16 directory is the parent of any tile's local path; derived from
+	// LocalPathFor rather than re-formatted here so the two cannot disagree
+	// about the namespace.
+	return FPaths::GetPath(LocalPathFor(vxc::TileCoord{0, 0}));
+}
+
+TArray<FIntPoint> FVoxelFineTileStreamer::EnumerateTilesOnDisk() const
+{
+	TArray<FIntPoint> Tiles;
+	const FString Dir = TilesDirectory();
+	TArray<FString> Files;
+	IFileManager::Get().FindFiles(Files, *Dir, TEXT("vxtl"));
+	for (const FString& File : Files)
+	{
+		// "<x>_<y>.vxtl". Anything else in the directory is not a tile and is
+		// skipped silently -- this is a listing, not a validator.
+		FString XStr, YStr;
+		if (!FPaths::GetBaseFilename(File).Split(TEXT("_"), &XStr, &YStr, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+		{
+			continue;
+		}
+		if (!XStr.IsNumeric() || !YStr.IsNumeric())
+		{
+			continue;
+		}
+		Tiles.Add(FIntPoint(FCString::Atoi(*XStr), FCString::Atoi(*YStr)));
+	}
+	return Tiles;
 }
 
 std::vector<vxc::TileCoord> FVoxelFineTileStreamer::CoveredTiles(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1,

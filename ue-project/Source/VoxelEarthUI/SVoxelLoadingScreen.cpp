@@ -108,8 +108,12 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 				.WidthOverride(L.HourglassWidth)
 				.HeightOverride(L.HourglassHeight)
 				[
+					// Self-driven (2026-09-07 mock): drains, rests, turns over,
+					// and tells this screen to change its line at each turn.
+					// Load progress no longer drives the sand -- see the header.
 					SAssignNew(Hourglass, SVoxelHourglass)
-					.Progress_Lambda([this]() { return Progress; })
+					.SelfDriven(true)
+					.OnFlipped(this, &SVoxelLoadingScreen::OnHourglassFlipped)
 				]
 			]
 		]
@@ -146,43 +150,10 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 				.Justification(ETextJustify::Center)
 				.AutoWrapText(true)
 			]
-		]
-		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(FMargin(0.f, HalfSep))
-		[
-			SNew(SBox)
-			.WidthOverride(L.LoadingBarWidth)
-			.HeightOverride(L.LoadingBarHeight)
-			[
-				SNew(SOverlay)
-				+ SOverlay::Slot()
-				[
-					SNew(SImage)
-					.Image(Style.SolidWhite())
-					// "Dark leather", the GDScript's own word for it.
-					.ColorAndOpacity(FSlateColor(FLinearColor(0.04f, 0.024f, 0.016f, 1.f)))
-				]
-				+ SOverlay::Slot()
-				.HAlign(HAlign_Left)
-				[
-					SNew(SBox)
-					.WidthOverride(this, &SVoxelLoadingScreen::GetBarFillWidth)
-					[
-						SNew(SImage)
-						.Image(Style.SolidWhite())
-						.ColorAndOpacity(FSlateColor(Tint(SandBright)))
-					]
-				]
-			]
-		]
-		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(FMargin(0.f, HalfSep))
-		[
-			SNew(STextBlock)
-			.Text(this, &SVoxelLoadingScreen::GetPercentText)
-			.Font(Style.Serif(L.LoadingPctSize))
-			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
-			.ShadowOffset(FVector2D(2.f, 2.f))
-			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.9f))
 		];
+		// The progress bar and percentage that used to follow the quip were
+		// REMOVED 2026-09-07 (owner directive; the mock has neither -- see the
+		// header). The theatre progress still drives the curtain, not pixels.
 
 	TSharedRef<SOverlay> Root =
 		SNew(SOverlay)
@@ -213,10 +184,9 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 		// Godot build had it. Two fill-height spacers carry the fraction so the
 		// placement scales with the viewport instead of being a pixel offset.
 		//
-		// THE PROGRESS BAR AND PERCENTAGE STAY, and this is a recorded divergence
-		// from the mock, which has neither: the owner's 2026-09-06 directive
-		// asked for a bar that "actually advance[s] smoothly", and a screen that
-		// dropped it the day after would be a regression wearing a redesign.
+		// The column matches the mock exactly now: hourglass, LOADING, one line.
+		// The bar and percentage kept on 2026-09-06 were dropped on 2026-09-07 at
+		// the owner's direction, in favour of the mock's turning hourglass.
 		+ SOverlay::Slot()
 		.HAlign(HAlign_Center)
 		.VAlign(VAlign_Fill)
@@ -336,6 +306,7 @@ void SVoxelLoadingScreen::OnShown()
 	TipOrder = SVoxelLoadingDetail::ShuffledIndices(VoxelUIStrings::GameplayTips().Num(), Stream);
 	QuipCursor = 0;
 	TipCursor = 0;
+	QuipPhase = EQuipPhase::Idle;
 	QuipTimer = 0.f;
 	TipTimer = 0.f;
 	QuipFadeAlpha = 1.f;
@@ -389,25 +360,38 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 		}
 	}
 
-	// --- Quip rotation ------------------------------------------------------
-	// Fade out over QuipFade, swap, fade back in over QuipFade, hold until
-	// QuipRotate has elapsed in total.
-	QuipTimer += AnimDelta;
-	const float FadeOutStart = FMath::Max(L.QuipRotate - L.QuipFade, 0.f);
-	if (QuipTimer >= L.QuipRotate)
+	// --- Quip change, once per turn of the glass ----------------------------
+	// OnHourglassFlipped starts the fade-out; this carries it through the swap
+	// and the fade-in and then holds. No timer of its own: the cadence is the
+	// hourglass's (the mock's rotateTip() is only called from the flip phase).
 	{
-		QuipTimer = 0.f;
-		QuipCursor = QuipOrder.Num() > 0 ? (QuipCursor + 1) % QuipOrder.Num() : 0;
-		QuipFadeAlpha = 0.f;
-	}
-	else if (QuipTimer >= FadeOutStart)
-	{
-		QuipFadeAlpha = 1.f - (QuipTimer - FadeOutStart) / FMath::Max(L.QuipFade, 0.001f);
-	}
-	else
-	{
-		// Fading back in after a swap, then held at 1.
-		QuipFadeAlpha = FMath::Min(1.f, QuipTimer / FMath::Max(L.QuipFade, 0.001f));
+		const float Fade = FMath::Max(L.QuipFade, 0.001f);
+		switch (QuipPhase)
+		{
+		case EQuipPhase::FadingOut:
+			QuipTimer += AnimDelta;
+			QuipFadeAlpha = FMath::Max(0.f, 1.f - QuipTimer / Fade);
+			if (QuipTimer >= Fade)
+			{
+				QuipCursor = QuipOrder.Num() > 0 ? (QuipCursor + 1) % QuipOrder.Num() : 0;
+				QuipPhase = EQuipPhase::FadingIn;
+				QuipTimer = 0.f;
+			}
+			break;
+		case EQuipPhase::FadingIn:
+			QuipTimer += AnimDelta;
+			QuipFadeAlpha = FMath::Min(1.f, QuipTimer / Fade);
+			if (QuipTimer >= Fade)
+			{
+				QuipPhase = EQuipPhase::Idle;
+				QuipFadeAlpha = 1.f;
+			}
+			break;
+		case EQuipPhase::Idle:
+		default:
+			QuipFadeAlpha = 1.f;
+			break;
+		}
 	}
 
 	// --- Tip rotation (hard cut, no fade) -----------------------------------
@@ -498,18 +482,17 @@ FText SVoxelLoadingScreen::GetTipText() const
 	return Tips[TipOrder[TipCursor % TipOrder.Num()]];
 }
 
-FText SVoxelLoadingScreen::GetPercentText() const
+void SVoxelLoadingScreen::OnHourglassFlipped()
 {
-	if (bLoadFailed) return FText::FromString(TEXT("Load failed"));
-	// floor, not round: 99.6% should read 99%, because a bar that says 100%
-	// while the world is still landing is the specific lie this whole progress
-	// model exists to avoid.
-	return FText::FromString(FString::Printf(TEXT("%d%%"), FMath::FloorToInt(Progress * 100.f)));
-}
-
-FOptionalSize SVoxelLoadingScreen::GetBarFillWidth() const
-{
-	return FOptionalSize(FVoxelMenuLayout::Get().LoadingBarWidth * Progress);
+	// A turn that lands mid-fade restarts the fade-out from the current alpha
+	// rather than snapping; with 7.8 s between turns and a 0.4 s fade that is
+	// a defensive branch, not an expected one.
+	if (QuipPhase == EQuipPhase::FadingOut)
+	{
+		return;
+	}
+	QuipPhase = EQuipPhase::FadingOut;
+	QuipTimer = (1.f - QuipFadeAlpha) * FMath::Max(FVoxelMenuLayout::Get().QuipFade, 0.001f);
 }
 
 FMargin SVoxelLoadingScreen::GetHourglassBobPadding() const

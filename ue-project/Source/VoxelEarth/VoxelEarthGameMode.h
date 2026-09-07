@@ -399,4 +399,31 @@ private:
 namespace VoxelEarthSpawn
 {
 	VOXELEARTH_API bool ParseSpawnColumnUU(double& OutWorldX, double& OutWorldY);
+
+	// THE SPAWN RULE (owner, 2026-09-07): "new game spawn points have to be on
+	// the ground level surface of an actual fine-baked tile."
+	//
+	// The column every ORDINARY launch spawns on -- pawn, sky rig and the
+	// loading gate's probe ring all ask THIS, so they cannot land on different
+	// columns (the same argument that made ParseSpawnColumnUU shared). Order:
+	//   1. -VoxelSpawnAt=X,Y, if present -- unchanged, the switch still wins.
+	//   2. A self-driving run (front end suppressed), or a run with no fine
+	//      tier: (0,0), exactly as before. Every fixture and capture leg is
+	//      byte-identical.
+	//   3. Otherwise the preferred column (DefaultSpawnColumnM in
+	//      DefaultGame.ini, else (0,0)) IF its tile and its 4,096 m outer-ring
+	//      reach are all baked and the coarse ground there is above sea level;
+	//      else the centre of the nearest baked tile whose ground is dry.
+	// Returns true when the column is an override of (0,0) -- whether by
+	// switch or by resolution -- so callers keep their existing "(0,0) if
+	// absent" shape. The resolution is logged once per world, with the reason.
+	//
+	// WHY A RULE AND NOT A CONSTANT. Fine coverage is 24 of 289 tiles and moves
+	// with every bake; the origin is not in it and never has been. A NEW GAME
+	// at (0,0) on 2026-09-07 spawned the player 380 m under a coarse sea floor
+	// with no fine data, which rendered as a black screen behind a working HUD
+	// -- and looked like a UI fault for a while. A constant would have moved
+	// the failure to the next re-bake; the rule cannot pick a column the disk
+	// does not have.
+	VOXELEARTH_API bool ResolveSpawnColumnUU(const UWorld* World, double& OutWorldX, double& OutWorldY);
 }

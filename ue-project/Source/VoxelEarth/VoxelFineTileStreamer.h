@@ -275,6 +275,34 @@ public:
 	// PlayerCoarseTile TickResidencyAndEviction wants.
 	static vxc::TileCoord CoarseTileForWorldMm(int64 WorldMmX, int64 WorldMmY);
 
+	// --- WHAT IS BAKED, AS A FACT ABOUT THE DISK ------------------------------
+	//
+	// ADDED 2026-09-07 FOR THE SPAWN RULE (VoxelEarthSpawn::ResolveSpawnColumnUU):
+	// "a new-game spawn must be on the ground surface of an actual fine-baked
+	// tile". Coverage is partial by design (DefaultGame.ini: 24 of 289 tiles),
+	// the origin is not in it, and a NEW GAME that spawned at (0,0) put the
+	// player 380 m under a sea floor no tile describes -- a black screen with a
+	// working HUD. The resolver needs the baked set BEFORE anything is
+	// resident, so this is a directory listing and nothing else: no load, no
+	// decode, no residency change, no lock. Tile coordinates come straight off
+	// the file names (<x>_<y>.vxtl under this run's provider/seed/s16 -- the
+	// same LocalPathFor layout, so a namespace mismatch lists nothing rather
+	// than the wrong world). A tile that is on disk but corrupt is still
+	// listed; the residency path validates, this does not, and a corrupt tile
+	// under the spawn fails loudly there exactly as it always has.
+	TArray<FIntPoint> EnumerateTilesOnDisk() const;
+	// The directory EnumerateTilesOnDisk lists (<root>/<provider>/<seed>/s16),
+	// for log lines that need to say WHERE nothing was found.
+	FString TilesDirectory() const;
+
+	// The 15.36 km tile footprint in UE units, and the two conversions the
+	// spawn rule needs. A tile CENTRE is the column with the most margin to
+	// any edge (7,680 m) -- self-contained for the 4,096 m outer ring, so it
+	// needs no neighbours baked (DefaultGame.ini, "A GOOD MEASUREMENT SITE").
+	static double TileFootprintUU();
+	static FIntPoint TileForWorldUU(double WorldXUU, double WorldYUU);
+	static FVector2D TileCentreWorldUU(FIntPoint Tile);
+
 	// --- BATHYMETRY, IN BULK --------------------------------------------------
 	//
 	// Fills an inclusive rect of fine tile-pixel coordinates with the baked lake

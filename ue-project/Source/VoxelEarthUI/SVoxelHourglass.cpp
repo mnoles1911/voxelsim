@@ -42,6 +42,18 @@ constexpr float kSpawnXJitter = 0.6f;
 // The mock's second grain colour, alongside SandBright.
 const FColor kGrainAlt = FColor(0xE8, 0xB8, 0x50);
 
+// --- Self-driven loop (2026-09-07 mock: FILL_MS / REST_MS / FLIP_MS) -----------
+constexpr float kFillSeconds = 6.5f;  // one chamber drains
+constexpr float kRestSeconds = 0.42f; // a beat before the turn
+constexpr float kFlipSeconds = 0.85f; // the turn; matches the CSS transition
+// The mock's cubic-bezier(.55,.02,.35,1) is a slow-in, quick-out ease; Slate's
+// InterpEaseInOut at exponent 2 is the closest built-in curve and the
+// difference is not visible at 0.85 s.
+constexpr float kFlipEaseExponent = 2.f;
+// A stalled frame must not swallow a whole phase: the mock clamps its own
+// delta at 40 ms for the same reason.
+constexpr float kMaxPhaseDelta = 0.05f;
+
 // Glass, at the alphas the mock's CSS gives them.
 const FLinearColor kGlassFill = FLinearColor(0.961f, 0.816f, 0.431f, 0.05f);   // rgba(245,208,110,0.05)
 
@@ -132,7 +144,14 @@ void StrokeRect(FSlateWindowElementList& Out, int32 LayerId, const FGeometry& Ge
 void SVoxelHourglass::Construct(const FArguments& InArgs)
 {
 	ProgressAttribute = InArgs._Progress;
-	Progress = ProgressAttribute.Get();
+	bSelfDriven = InArgs._SelfDriven;
+	OnFlipped = InArgs._OnFlipped;
+	Progress = bSelfDriven ? 0.f : ProgressAttribute.Get();
+	Phase = EPhase::Fill;
+	PhaseSeconds = 0.f;
+	// The turn rotates about the widget's own centre. Set once here: the pivot
+	// is a construction-time property, only the transform itself animates.
+	SetRenderTransformPivot(FVector2D(0.5, 0.5));
 	// Deterministic under -unattended, so a -VoxelHourglassShot strip taken
 	// twice produces comparable images. Without it every grain position would
 	// differ between runs and the whole capture would be undiffable.
@@ -140,10 +159,64 @@ void SVoxelHourglass::Construct(const FArguments& InArgs)
 	SetCanTick(true);
 }
 
+void SVoxelHourglass::SelfDrivenTick(float DeltaSeconds)
+{
+	using namespace SVoxelHourglassDetail;
+	PhaseSeconds += FMath::Min(DeltaSeconds, kMaxPhaseDelta);
+	switch (Phase)
+	{
+	case EPhase::Fill:
+		Progress = FMath::Min(1.f, PhaseSeconds / kFillSeconds);
+		if (Progress >= 1.f)
+		{
+			Phase = EPhase::Rest;
+			PhaseSeconds = 0.f;
+		}
+		break;
+
+	case EPhase::Rest:
+		if (PhaseSeconds >= kRestSeconds)
+		{
+			Phase = EPhase::Flip;
+			PhaseSeconds = 0.f;
+			// "one line per full turn of the glass" -- the mock fires its
+			// rotateTip() at exactly this moment.
+			OnFlipped.ExecuteIfBound();
+		}
+		break;
+
+	case EPhase::Flip:
+	{
+		const float T = FMath::Clamp(PhaseSeconds / kFlipSeconds, 0.f, 1.f);
+		const float Eased = FMath::InterpEaseInOut(0.f, 1.f, T, kFlipEaseExponent);
+		SetRenderTransform(FSlateRenderTransform(FQuat2D(Eased * PI)));
+		if (T >= 1.f)
+		{
+			// Snap back and refill the top -- invisible, see the header: the
+			// full mound rotated by 180 degrees IS the full top chamber.
+			SetRenderTransform(TOptional<FSlateRenderTransform>());
+			Grains.Reset();
+			SpawnAccumulator = 0.f;
+			Progress = 0.f;
+			Phase = EPhase::Fill;
+			PhaseSeconds = 0.f;
+		}
+		break;
+	}
+	}
+}
+
 void SVoxelHourglass::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
 {
 	using namespace SVoxelHourglassDetail;
-	Progress = FMath::Clamp(ProgressAttribute.Get(), 0.f, 1.f);
+	if (bSelfDriven)
+	{
+		SelfDrivenTick(InDeltaTime);
+	}
+	else
+	{
+		Progress = FMath::Clamp(ProgressAttribute.Get(), 0.f, 1.f);
+	}
 
 	PhysicsAccumulator += InDeltaTime;
 	int32 Ticks = 0;
