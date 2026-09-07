@@ -305,9 +305,9 @@ void UVoxelInventoryComponent::ServerSelectSlot_Implementation(int32 Index)
 {
     if (Slots.IsValidIndex(Index)) SetSelectedSlot(Index);
 }
-void UVoxelInventoryComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out) const
+void UVoxelInventoryComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
-    Super::GetLifetimeReplicatedProps(Out);
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
     DOREPLIFETIME_CONDITION(UVoxelInventoryComponent,Slots,COND_OwnerOnly);
     DOREPLIFETIME_CONDITION(UVoxelInventoryComponent,SelectedSlot,COND_OwnerOnly);
     DOREPLIFETIME_CONDITION(UVoxelInventoryComponent,bSeeded,COND_OwnerOnly);
