@@ -14,6 +14,7 @@ struct FWork
     TAtomic<bool> Cancelled{false}, WorkerReady{false};
     bool Success=false, ActorDone=false, ActorValid=false;
     bool RehearseHandoff=false; // explicit diagnostic request; game-thread only
+    bool PrepareHeldGpuPages=false; // brick-only private diagnostic, never publication
     bool PrepareHeldCpuPages=false; // no GPU readiness/publication implied
     int32 Phase=0, PageCursor=0, VisiblePages=0, PendingPages=0, ParkedPages=0;
     uint64 EditEpoch=0, ResidencyEpoch=0;

@@ -10,6 +10,7 @@
 #include "VoxelEnvironmentRenderContext.h"
 #include "VoxelEnvironmentPageBarrier.h"
 #include "VoxelEnvironmentPageSampler.h"
+#include "VoxelHeldBrickParity.h"
 #include "Misc/SecureHash.h"
 
 #include "VoxelChunkComponent.h"
@@ -6854,6 +6855,14 @@ struct FVoxelWorldImpl
         FString Error;
     };
     using FHeldCpuJobRef=TSharedPtr<FHeldCpuPageJob,ESPMode::ThreadSafe>;
+    struct FHeldGpuPageResult {
+        bool Cancelled=false,Ready=false; // game-thread only
+        FVoxelGpuMeshJobResult Result;
+        FVoxelGpuHeldBrickBudget Budget;
+    };
+    using FHeldGpuResultRef=TSharedPtr<FHeldGpuPageResult,ESPMode::ThreadSafe>;
+    // Survives diagnostic cancellation until the manager delivers exactly once.
+    TMap<uint64,FHeldGpuResultRef> HeldGpuPending;
     struct FProductionPageRehearsal {
         VoxelEnvironmentPages::FTicket Ticket;
         TArray<VoxelCoords::FVoxelLevelChunkKey> Keys;
@@ -6872,12 +6881,17 @@ struct FVoxelWorldImpl
         uint64 CpuBytes=0;
         int32 NextCpuPage=0;
         bool CpuPreflightDone=false;
+        FHeldGpuResultRef GpuJob;
+        TUniquePtr<FVoxelHeldBrickParity> Parity;
+        int32 NextGpuPage=0;
+        uint64 GpuBytes=0;
     };
     TUniquePtr<FProductionPageRehearsal> ProductionRehearsal;
     void EndProductionRehearsal(const TCHAR* Reason);
     void CancelProductionCandidate(const TCHAR* Reason);
     void TickProductionRehearsal(const FVector& Anchor);
     void TickHeldCpuPreparation();
+    void TickHeldGpuPreparation();
 	std::atomic<int32> ProductionCandidateWorkers{0};
 	void TickProductionCandidate(UWorld* World,const FVector& Anchor);
 	bool ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const;
@@ -7983,6 +7997,12 @@ struct FVoxelWorldImpl
 	// so the census tap here does not re-ask (see FColdShadingVerdict above).
 	// A null or unprobed PrecomputedCold means "ask for yourself", which is
 	// every other call site and every leg with the cap off.
+    struct FGpuRequestBuildTimes {double Start=0,Header=0,Band=0,Raster=0,Assets=0;};
+    // Shared GT construction; held diagnostics omit streaming band/census accounting.
+    bool BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,
+        uint8 RingSkirtMask,const FColdShadingVerdict* PrecomputedCold,
+        VoxelEnvironmentRender::FContextRef RenderContext,bool bOrdinary,
+        FVoxelGpuRegionRequest& Req,FGpuRequestBuildTimes& Times);
 	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
 	                      uint8 RingSkirtMask, bool bSpeculative = false,
 	                      const FColdShadingVerdict* PrecomputedCold = nullptr,
@@ -12316,6 +12336,9 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		const bool bRetired = PageBarrier.Retire(Entry.Value.PageLease); check(bRetired);
 	}
 	GpuJobsPending.Reset();
+    // Manager cancellation delivered every private job; release any defensive
+    // leftover payload before the render-resource flush below.
+    HeldGpuPending.Reset();
 	{
 		VoxelStreaming::FJobResult Discarded;
 		while (ResultsQueue.Dequeue(Discarded)) {
@@ -12326,6 +12349,9 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		}
 	}
 
+    // Shutdown-only: finish any private parity readback retirement even when
+    // no further game ticker frame will run, before flushing resource releases.
+    FVoxelHeldBrickParity::DrainForShutdown();
 	if (GIsRHIInitialized)
 	{
 		const double FlushT0 = FPlatformTime::Seconds();
@@ -18121,6 +18147,8 @@ void FVoxelWorldImpl::EndProductionRehearsal(const TCHAR* Reason)
     if(!ProductionRehearsal)return;
     if(ProductionRehearsal->ContextJob)ProductionRehearsal->ContextJob->Cancelled.Store(true);
     for(const auto& Job:ProductionRehearsal->CpuJobs)Job->Cancelled.Store(true);
+    if(ProductionRehearsal->GpuJob)ProductionRehearsal->GpuJob->Cancelled=true;
+    if(ProductionRehearsal->Parity)ProductionRehearsal->Parity->Cancel();
     if(ProductionRehearsal->PressurePins.IsValid()){
         // Pool Reset retires tickets independently of this private diagnostic.
         // A stale/already-retired ticket must not prevent cancellation from
@@ -18144,7 +18172,8 @@ void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
     if(!Work||!Work->RehearseHandoff||Work->Phase!=5)return;
     const auto Refuse=[&](const TCHAR* Why){
         UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHandoff REHEARSAL REFUSED: %s; publicationReady=0"),Why);
-        if(Work->PrepareHeldCpuPages)UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldCpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);
+        if(Work->PrepareHeldGpuPages){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldGpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);}
+        else if(Work->PrepareHeldCpuPages){UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldCpu REFUSED: %s; backendReady=0 publicationReady=0"),Why);}
         Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;EndProductionRehearsal(Why);
     };
     if(!ProductionRehearsal){
@@ -18215,6 +18244,7 @@ void FVoxelWorldImpl::TickProductionRehearsal(const FVector& Anchor)
 
 // Same footprint used by ordinary CPU/GPU composition; defined below.
 static vxc::AssetVoxelRect VoxelAssetRectForFootprint(int32 Level,int32 ChunkX,int32 ChunkY);
+static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,const FVector& Anchor);
 
 void FVoxelWorldImpl::TickHeldCpuPreparation()
 {
@@ -18287,6 +18317,7 @@ void FVoxelWorldImpl::TickHeldCpuPreparation()
         State.CpuPacks.Add(MoveTemp(Prepared));State.CpuJobs.RemoveAtSwap(I,1,EAllowShrinking::No);
     }
     if(State.CpuPacks.Num()==State.AllocatedPages.Num()){
+        if(Work->PrepareHeldGpuPages){TickHeldGpuPreparation();return;}
         UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldCpu PASSED spec=%s completePages=%d allocated=%d absent=%d completed=%d bytes=%llu elapsed=%.3f pressurePinned=1; cpuOnly=1 backendReady=0 publicationReady=0"),
             *Work->Descriptor.SpecId,State.Keys.Num(),State.AllocatedPages.Num(),State.Keys.Num()-State.AllocatedPages.Num(),State.CpuPacks.Num(),State.CpuBytes,FPlatformTime::Seconds()-State.Started);
         Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;EndProductionRehearsal(TEXT("CPU-only private packs validated and discarded"));return;
@@ -18325,15 +18356,85 @@ void FVoxelWorldImpl::TickHeldCpuPreparation()
     }
 }
 
+void FVoxelWorldImpl::TickHeldGpuPreparation()
+{
+    check(IsInGameThread());
+    auto Work=ProductionCandidate;if(!Work||!ProductionRehearsal)return;
+    auto& State=*ProductionRehearsal;
+    constexpr uint64 MaxBytes=128ull*1024*1024;
+    const auto Refuse=[&](const FString& Why){
+        UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionHeldGpu REFUSED: %s; backendReady=0 publicationReady=0"),*Why);
+        Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;Work->PrepareHeldGpuPages=false;
+        EndProductionRehearsal(*Why);
+    };
+    // Caller revalidates all tokens, edit/residency epochs, anchor and rings
+    // before every call, including the final parity completion below.
+    if(State.Parity){
+        FVoxelHeldBrickParityResult Result;
+        const auto Status=State.Parity->Poll(Result);
+        if(Status==EVoxelHeldBrickParityStatus::Pending)return;
+        if(Status!=EVoxelHeldBrickParityStatus::Passed||Result.OwnershipGeneration!=State.CpuContext->Generation()){
+            Refuse(FString::Printf(TEXT("parity failed page=%d mismatches=%u first=(%d,%d,%d) cpu=%u gpu=%u: %s"),
+                State.NextGpuPage,Result.Mismatches,Result.FirstMismatch.X,Result.FirstMismatch.Y,Result.FirstMismatch.Z,
+                uint32(Result.CpuMaterial),uint32(Result.GpuMaterial),*Result.Error));return;
+        }
+        State.Parity.Reset();++State.NextGpuPage;
+    }
+    if(State.NextGpuPage==State.CpuPacks.Num()){
+        UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldGpu PASSED spec=%s completePages=%d allocated=%d completed=%d cpuBytes=%llu gpuAccountedBytes=%llu elapsed=%.3f; parity=all-pages pressurePinned=1 backendReady=0 publicationReady=0"),
+            *Work->Descriptor.SpecId,State.Keys.Num(),State.AllocatedPages.Num(),State.NextGpuPage,
+            State.CpuBytes,State.GpuBytes,FPlatformTime::Seconds()-State.Started);
+        Work->RehearseHandoff=false;Work->PrepareHeldCpuPages=false;Work->PrepareHeldGpuPages=false;
+        EndProductionRehearsal(TEXT("private CPU/GPU packs matched and discarded"));return;
+    }
+    auto& Page=State.CpuPacks[State.NextGpuPage];
+    const VoxelCoords::FVoxelLevelChunkKey Key{int32(Page.Page.level),{int32(Page.Page.x),int32(Page.Page.y),int32(Page.Page.z)}};
+    const int64 X=int64(Key.Key.X)*32,Y=int64(Key.Key.Y)*32,Z=int64(Key.Key.Z)*32;
+    if(X<MIN_int32||X>MAX_int32||Y<MIN_int32||Y>MAX_int32||Z<MIN_int32||Z>MAX_int32){Refuse(TEXT("GPU origin out of range"));return;}
+    const FIntVector Origin{int32(X),int32(Y),int32(Z)};
+    if(State.GpuJob){
+        const auto Job=State.GpuJob;if(!Job->Ready)return;
+        auto& Result=Job->Result;
+        if(Result.Status!=EVoxelGpuMeshJobStatus::Success||!Result.bPublicationHeld||!Result.bHeldBrickOnly||
+           Result.UserTag!=uint64(State.NextGpuPage)||Result.OwnershipGeneration!=Page.Generation||Result.HeldAccountedBytes!=Job->Budget.TotalBytes||
+           !Result.BrickVolume||Result.BrickVolume->OriginVoxel!=Origin||Result.BrickVolume->BrickCount!=64){
+            Refuse(FString::Printf(TEXT("GPU private result identity/shape/status refused: %s"),*Result.Error));return;
+        }
+        if(State.CpuBytes>MaxBytes||State.GpuBytes>MaxBytes-State.CpuBytes||
+           Job->Budget.RetainedAndReadbackBytes>MaxBytes-State.CpuBytes-State.GpuBytes){Refuse(TEXT("GPU retained budget exceeded"));return;}
+        Page.GpuBricks=MoveTemp(Result.BrickVolume);
+        State.Parity=MakeUnique<FVoxelHeldBrickParity>();FString Error;
+        if(!State.Parity->Begin(Page.CpuBricks,Page.GpuBricks,Origin,Page.Generation,Error)){Refuse(Error);return;}
+        State.GpuBytes+=Job->Budget.RetainedAndReadbackBytes;State.GpuJob.Reset();return;
+    }
+    // A cancelled predecessor still owns its manager delivery; do not start
+    // another private job or consume ordinary streaming admission slots.
+    if(!HeldGpuPending.IsEmpty())return;
+    if(!ProductionRenderSupported(Key,State.CpuContext)||!IsColumnGridFootprintResident(Key.Level,Key.Key.X,Key.Key.Y)||
+       !AssetResolveFootprintResident(Key.Level,Key.Key.X,Key.Key.Y)){Refuse(TEXT("GPU page support/residency changed"));return;}
+    auto* Manager=EnsureGpuMeshJobs();if(!Manager){Refuse(TEXT("GPU manager unavailable"));return;}
+    FVoxelGpuRegionRequest Request;FGpuRequestBuildTimes Times;Times.Start=FPlatformTime::Seconds();
+    if(!BuildGpuMeshRequest(Key,ComputeRingSkirtMask(Key,State.Anchor),nullptr,State.CpuContext,false,Request,Times)){
+        Refuse(TEXT("canonical GPU request construction refused"));return;
+    }
+    if(State.CpuBytes>MaxBytes||State.GpuBytes>MaxBytes-State.CpuBytes){Refuse(TEXT("GPU admission budget exhausted"));return;}
+    auto Job=MakeShared<FHeldGpuPageResult,ESPMode::ThreadSafe>();FString Error;
+    const uint64 JobId=Manager->SubmitHeldBrickOnly(MoveTemp(Request),uint64(State.NextGpuPage),Page.Generation,
+        MaxBytes-State.CpuBytes-State.GpuBytes,Job->Budget,Error);
+    if(JobId==0){Refuse(Error);return;}
+    HeldGpuPending.Add(JobId,Job);State.GpuJob=Job;
+    if(State.NextGpuPage==0)UE_LOG(LogVoxelEarth,Log,TEXT("ProductionHeldGpu START allocated=%d maxJobs=1 maxBytes=%llu; brickOnly=1 backendReady=0 publicationReady=0"),State.CpuPacks.Num(),MaxBytes);
+}
+
 void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Anchor)
 {
     using namespace VoxelProductionCandidate;
     check(IsInGameThread());
     const int32 Request=ConsumeRequest(World);
     if(Request==2){CancelProductionCandidate(TEXT("explicit cancellation"));UE_LOG(LogVoxelEarth,Log,TEXT("ProductionCandidate CANCELLED"));return;}
-    if(Request==1||Request==3||Request==4)
+    if(Request==1||Request==3||Request==4||Request==5)
     {
-        if((ProductionCandidate&&ProductionCandidate->Phase<5)||ProductionCandidateWorkers.load()>0)
+        if((ProductionCandidate&&ProductionCandidate->Phase<5)||ProductionCandidateWorkers.load()>0||!HeldGpuPending.IsEmpty()||FVoxelHeldBrickParity::IsRetirementPending())
         {
             UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate busy; preparation remains bounded to one candidate per world"));
         }
@@ -18350,8 +18451,9 @@ void FVoxelWorldImpl::TickProductionCandidate(UWorld* World,const FVector& Ancho
                 UE_LOG(LogVoxelEarth,Warning,TEXT("ProductionCandidate REFUSED: requires resident fine terrain, provider identity and catalog"));return;
             }
             auto Work=MakeShared<FWork,ESPMode::ThreadSafe>();ProductionCandidate=Work;
-            Work->RehearseHandoff=Request==3||Request==4;
-            Work->PrepareHeldCpuPages=Request==4;
+            Work->RehearseHandoff=Request==3||Request==4||Request==5;
+            Work->PrepareHeldCpuPages=Request==4||Request==5;
+            Work->PrepareHeldGpuPages=Request==5;
             Work->Started=FPlatformTime::Seconds();Work->EditEpoch=EditEpoch.load();Work->ResidencyEpoch=FineStreamer->ResidencyEpoch();
             const FString Provider=ProductionProviderHash,Catalog=ProductionCatalogHash;
             ProductionCandidateWorkers.fetch_add(1);
@@ -23935,38 +24037,13 @@ FVoxelWorldImpl::FColdShadingVerdict FVoxelWorldImpl::ProbeColdShading(
 	return Verdict;
 }
 
-bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
-                                       uint8 RingSkirtMask, bool bSpeculative,
-                                       const FColdShadingVerdict* PrecomputedCold,
-                                       VoxelEnvironmentRender::FContextRef RenderContext,
-                                       bool* OutPageLeaseRefused)
+bool FVoxelWorldImpl::BuildGpuMeshRequest(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,
+    uint8 RingSkirtMask,const FColdShadingVerdict* PrecomputedCold,
+    VoxelEnvironmentRender::FContextRef RenderContext,bool bOrdinary,
+    FVoxelGpuRegionRequest& Req,FGpuRequestBuildTimes& Times)
 {
-    if (OutPageLeaseRefused) *OutPageLeaseRefused = false;
-    if(!RenderContext)RenderContext=CaptureProductionRenderContext();
-    if(!ProductionRenderSupported(LevelKey,RenderContext))return false;
-	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
-	if (Manager == nullptr)
-	{
-		// Before the first stamp on purpose: an uncounted early exit here is a
-		// dead fork, not a submit cost, and it would dilute perCallUs.
-		return false;
-	}
-
-	const auto PageLease = PageBarrier.TryAcquire(LevelKey, VoxelEnvironmentPages::EProducer::Gpu);
-	if (!PageLease.IsValid()) {
-		if (OutPageLeaseRefused) *OutPageLeaseRefused = true;
-		return false;
-	}
-	bool bLeaseSubmitted = false;
-	ON_SCOPE_EXIT { if (!bLeaseSubmitted) { const bool bRetired = PageBarrier.Retire(PageLease); check(bRetired); } };
-
-	// The gpu-submit split (see the AccumGpuSubmit* members for the 1,547 ms
-	// finding these exist to name). CONTIGUOUS sequential stamps: each bucket
-	// is the span to the previous stamp, so their sum telescopes to the total
-	// and the printed drift can only move if someone breaks that contiguity.
-	const double SubT0 = FPlatformTime::Seconds();
-
-	FVoxelGpuRegionRequest Req;
+	check(IsInGameThread());
+	const double SubT0=Times.Start;
 	// The chunk footprint is LEVEL-AGNOSTIC and that is not a coincidence: the
 	// coarse grid is self-similar, so a level-L chunk is still 4x4x4 bricks of
 	// 8 level-L cells with a one-brick halo. SetChunkFootprint's arithmetic is
@@ -24049,7 +24126,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		Req.BrickShading = VoxelApplyFast::ShadingForDispatch(
 			LevelKey, *PoolRootForShading,
 			&SampleChunkParamsForPool, &ShadingFromChunkParams);
-		if (Verdict.bCold)
+		if (bOrdinary && Verdict.bCold)
 		{
 			// COUNTED HERE, AT THE SAMPLE, AND NOT AT A LATER SUCCESS TEST. The
 			// game thread has already paid for this shading by the time control
@@ -24080,7 +24157,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// D5.3. Computed on the game thread where the anchor and RingPresets are
 	// live, exactly as the worker job's is, and baked into this dispatch.
 	Req.RingSkirtMask = RingSkirtMask;
-	const double SubT1 = FPlatformTime::Seconds(); // reqHdr: footprint/seed/shading/skirt
+	const double SubT1 = Times.Header = FPlatformTime::Seconds(); // reqHdr: footprint/seed/shading/skirt
 
 	// Ask for the band (D6), which is what lets the fork take a chunk whose
 	// footprint has not been seen before instead of leaving every cold column to
@@ -24108,7 +24185,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// DrainResults only consults a band for level-0 results. Asking a coarse
 	// dispatch for one would reduce over level-L cells and produce a band in the
 	// wrong units, which is worse than not having one.
-	if (LevelKey.Level == 0)
+	if (bOrdinary && LevelKey.Level == 0)
 	{
 		// -VoxelGpuBandColdOnly (default off, latched -- the -ExecCmds
 		// startup-window rule): ask for the band ONLY when this footprint's band
@@ -24281,7 +24358,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			++GpuBandFreeSubmitsSinceLog;
 		}
 	}
-	const double SubT2 = FPlatformTime::Seconds(); // band: policy + request build
+	const double SubT2 = Times.Band = FPlatformTime::Seconds(); // band: policy + request build
 	// The one place the raster-window arithmetic may live -- see
 	// VoxelGpuRegionBuild's header. Undersizing it does not fault; the kernel
 	// clamps to the window edge and silently produces different terrain.
@@ -24362,7 +24439,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	{
 		VoxelGpuRegionBuild::FillRasterWindow(Req, Sampler);
 	}
-	const double SubT3 = FPlatformTime::Seconds(); // raster: atlas check / window fill
+	const double SubT3 = Times.Raster = FPlatformTime::Seconds(); // raster: atlas check / window fill
 
 	// --- Asset compose: stamp this chunk's terrain instances on the GPU ------
 	//
@@ -24400,6 +24477,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// resolveForCompose's, which is instancesForRect's -- unchanged.
 			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
 			const auto& CanonicalResolved=*ResolvedAssetsForFootprint(LevelKey.Level,LevelKey.Key.X,LevelKey.Key.Y,ResolveScratch);
+            if(!bOrdinary&&CanonicalResolved.size()>VoxelProductionCandidate::MaxResolved)return false;
             std::vector<vxc::AssetField::ResolvedAssetInstance> MarkedResolved;
             const auto* RenderResolved=&CanonicalResolved;
             if(RenderContext->HasOwnedSources()){
@@ -24417,6 +24495,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// miss path would make the "assets MESHER" line read as though
 			// composition had collapsed the moment the cache warmed -- the same
 			// shape as the counter that reported chunksPerSec=0 forever.
+			if(bOrdinary){
 			VoxelStreamAdmission::GMesherChunksComposed.fetch_add(1, std::memory_order_relaxed);
 			VoxelStreamAdmission::GMesherChunksWithInstances.fetch_add(Resolved.empty() ? 0 : 1,
 			                                     std::memory_order_relaxed);
@@ -24430,6 +24509,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 				while (H > Prev &&
 				       !VoxelStreamAdmission::GMesherTallestGridVox.compare_exchange_weak(
 				           Prev, H, std::memory_order_relaxed)) {}
+			}
 			}
 			// Two instances of one species-seed in the same chunk share one
 			// prefix table -- the dedup FVoxelGpuRegionRequest's header
@@ -24459,7 +24539,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 					// paid for everything up to here whether or not a job came
 					// of it, and an uncounted decline path is how perCallUs
 					// drifts from the budget line's dispatch=.
-					{
+					if(bOrdinary){
 						const double SubTAbort = FPlatformTime::Seconds();
 						AccumGpuSubmitReqHdrMs += (SubT1 - SubT0) * 1000.0;
 						AccumGpuSubmitBandMs += (SubT2 - SubT1) * 1000.0;
@@ -24499,6 +24579,10 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 				}
 				else
 				{
+                    // Bound private request expansion before appending another
+                    // unique grid; production requests retain their existing policy.
+                    if(!bOrdinary&&(uint64(Req.AssetColStarts.Num())+S.ColStarts.Num()+
+                        uint64(Req.AssetSpans.Num())+S.Spans.Num())*sizeof(uint32)>32ull*1024*1024)return false;
 					Inst.ColStartsBase = uint32(Req.AssetColStarts.Num());
 					BaseForGrid.Add(R.grid, Inst.ColStartsBase);
 					const uint32 SpanBase = uint32(Req.AssetSpans.Num());
@@ -24519,7 +24603,46 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			}
 		}
 	}
-	const double SubT4 = FPlatformTime::Seconds(); // assets: resolve + span marshal
+	const double SubT4 = Times.Assets = FPlatformTime::Seconds(); // assets: resolve + span marshal
+
+	return true;
+}
+
+bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
+                                       uint8 RingSkirtMask, bool bSpeculative,
+                                       const FColdShadingVerdict* PrecomputedCold,
+                                       VoxelEnvironmentRender::FContextRef RenderContext,
+                                       bool* OutPageLeaseRefused)
+{
+    if (OutPageLeaseRefused) *OutPageLeaseRefused = false;
+    if(!RenderContext)RenderContext=CaptureProductionRenderContext();
+    if(!ProductionRenderSupported(LevelKey,RenderContext))return false;
+	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
+	if (Manager == nullptr)
+	{
+		// Before the first stamp on purpose: an uncounted early exit here is a
+		// dead fork, not a submit cost, and it would dilute perCallUs.
+		return false;
+	}
+
+	const auto PageLease = PageBarrier.TryAcquire(LevelKey, VoxelEnvironmentPages::EProducer::Gpu);
+	if (!PageLease.IsValid()) {
+		if (OutPageLeaseRefused) *OutPageLeaseRefused = true;
+		return false;
+	}
+	bool bLeaseSubmitted = false;
+	ON_SCOPE_EXIT { if (!bLeaseSubmitted) { const bool bRetired = PageBarrier.Retire(PageLease); check(bRetired); } };
+
+	// The gpu-submit split (see the AccumGpuSubmit* members for the 1,547 ms
+	// finding these exist to name). CONTIGUOUS sequential stamps: each bucket
+	// is the span to the previous stamp, so their sum telescopes to the total
+	// and the printed drift can only move if someone breaks that contiguity.
+	const double SubT0 = FPlatformTime::Seconds();
+
+	FVoxelGpuRegionRequest Req;
+    FGpuRequestBuildTimes BuildTimes;BuildTimes.Start=SubT0;
+    if(!BuildGpuMeshRequest(LevelKey,RingSkirtMask,PrecomputedCold,RenderContext,true,Req,BuildTimes))return false;
+    const double SubT1=BuildTimes.Header,SubT2=BuildTimes.Band,SubT3=BuildTimes.Raster,SubT4=BuildTimes.Assets;
 
 	// --- Wave D / D1: may this chunk's quads stay on the GPU? ----------------
 	//
@@ -24617,6 +24740,13 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 
 void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 {
+    FHeldGpuResultRef Held;
+    if(HeldGpuPending.RemoveAndCopyValue(GpuResult.JobId,Held)){
+        // Private jobs never enter ordinary streaming counters, leases or apply.
+        if(bAcceptingGpuResults&&!Held->Cancelled){Held->Result=MoveTemp(GpuResult);Held->Ready=true;}
+        return;
+    }
+
 	// Teardown absorbs rather than acts. See WaitForInFlightTasks for why this
 	// has to come before anything that touches Impl state.
 	if (!bAcceptingGpuResults)

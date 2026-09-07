@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory)][long]$Seed,
     [Parameter(Mandatory)][double]$SpawnX,
     [Parameter(Mandatory)][double]$SpawnY,
-    [ValidateSet('Prepare','Rehearse','HeldCpu')][string]$Mode = 'Rehearse',
+    [ValidateSet('Prepare','Rehearse','HeldCpu','HeldGpu')][string]$Mode = 'Rehearse',
     [ValidateRange(1,120)][int]$StartAfterSeconds = 45,
     [ValidateRange(35,120)][int]$ExitAfterSeconds = 60,
     [ValidateRange(60,900)][int]$TimeoutSeconds = 300,
@@ -46,6 +46,7 @@ if ($buildTools.Count) { throw 'UnrealBuildTool is active. Retry after the build
 $command = switch ($Mode) {
     'Rehearse' { 'voxel.Environment.RehearseHandoff' }
     'HeldCpu' { 'voxel.Environment.PrepareHeldCpuPages' }
+    'HeldGpu' { 'voxel.Environment.PrepareHeldGpuPages' }
     default { 'voxel.Environment.PrepareCandidate' }
 }
 $culture = [Globalization.CultureInfo]::InvariantCulture
@@ -79,6 +80,11 @@ try {
         if ($testText -notmatch 'ProductionHeldCpu PASSED .*cpuOnly=1 backendReady=0 publicationReady=0' -or
             $testText -notmatch 'REHEARSAL RELEASED reason=CPU-only private packs validated and discarded') { throw 'Successful CPU preparation/release evidence is missing.' }
         if ($testText -match 'ProductionHeldCpu REFUSED|REHEARSAL REFUSED') { throw 'CPU preparation reported a refusal.' }
+    }
+    if ($Mode -eq 'HeldGpu') {
+        if ($testText -notmatch 'ProductionHeldGpu PASSED .*parity=all-pages .*backendReady=0 publicationReady=0' -or
+            $testText -notmatch 'REHEARSAL RELEASED reason=private CPU/GPU packs matched and discarded') { throw 'Successful GPU preparation/parity/release evidence is missing.' }
+        if ($testText -match 'ProductionHeldGpu REFUSED|ProductionHeldCpu REFUSED|REHEARSAL REFUSED') { throw 'GPU preparation reported a refusal.' }
     }
     Write-Output "PASS: $Mode completed with normal process exit0."
 }
