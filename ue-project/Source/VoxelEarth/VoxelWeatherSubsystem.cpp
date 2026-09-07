@@ -827,18 +827,9 @@ void UVoxelWeatherSubsystem::Tick(float DeltaTime)
 		if (!S.bClockRunning && !Impl->bLoggedClockOff)
 		{
 			Impl->bLoggedClockOff = true;
-			// WORTH A LINE, because it is genuinely surprising and costs an
-			// afternoon otherwise: the sky zeroes its whole state struct when
-			// switched off, so EpochSeconds reads 0 rather than holding where it
-			// was, and the wind therefore freezes at the t=0 field rather than at
-			// what was on screen. That is deterministic and fine; it is just not
-			// what "freeze" looks like from outside.
 			UE_LOG(LogVoxelWeather, Log,
-			       TEXT("the sky clock is not running (voxel.Sky.Enabled 0 or TimeScale 0), so ")
-			       TEXT("the wind is frozen at epoch %.3f s. With voxel.Sky.Enabled at 0 that ")
-			       TEXT("epoch is 0, not wherever the clock had got to -- the sky clears its ")
-			       TEXT("state when it is switched off. The wind is still spatially varying and ")
-			       TEXT("still correct; it just will not change."),
+			       TEXT("The simulation clock is paused at epoch %.3f s; wind remains spatially varying. ")
+			       TEXT("Disabling sky rendering does not pause the simulation clock."),
 			       Epoch);
 		}
 	}

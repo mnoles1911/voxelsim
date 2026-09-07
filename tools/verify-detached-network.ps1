@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
+    [string]$Python = '',
     [int]$Port = 17879,
     [ValidateSet('nullrhi','dx12')][string]$Render = 'dx12',
     [int]$TimeoutSeconds = 240,
@@ -10,6 +11,13 @@ $ErrorActionPreference = 'Stop'
 $Workspace = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $Project = Join-Path $Workspace 'ue-project\VoxelEarth.uproject'
 if (!(Test-Path -LiteralPath $Editor)) { throw "Editor missing: $Editor" }
+$TransportCreator = Join-Path $PSScriptRoot 'create-session-transport.py'
+if (!(Test-Path -LiteralPath $TransportCreator)) { throw 'Secure transport generator missing; merge the session transport implementation before running this harness.' }
+if (!$Python) {
+    $PythonCommand = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($PythonCommand) { $Python = $PythonCommand.Source }
+}
+if (!$Python -or !(Test-Path -LiteralPath $Python -PathType Leaf)) { throw 'Python executable unavailable; pass -Python <absolute-path-to-python.exe>.' }
 $Busy = @(Get-Process -Name 'UnrealEditor','UnrealEditor-Cmd','UnrealBuildTool','cl','link','ShaderCompileWorker' -ErrorAction SilentlyContinue)
 if ($AllowOtherProjectEditors) {
     # Only an explicitly identified DIFFERENT project may coexist. Unknown
@@ -32,6 +40,22 @@ if (Get-NetUDPEndpoint -LocalPort $Port -ErrorAction SilentlyContinue) { throw "
 $RunName = 'detached-net-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
 $RunDir = Join-Path $Workspace "Saved\Tests\$RunName"
 New-Item -ItemType Directory -Path $RunDir | Out-Null
+$PrivateDir = Join-Path $RunDir 'private'
+# The generator creates a NEW directory and writes secrets only to files.
+# Never print invite JSON or place its key in a URL or process argument.
+& $Python $TransportCreator $PrivateDir --clients 2
+if ($LASTEXITCODE -ne 0) { throw 'Private transport invite generation failed; refusing to launch without encryption.' }
+$ServerKeys = Join-Path $PrivateDir 'server.json'
+if (!(Test-Path -LiteralPath $ServerKeys -PathType Leaf)) { throw 'Transport generator did not produce the server key index.' }
+$ClientTransport = @{}
+foreach ($Number in 1..2) {
+    $InvitePath = Join-Path $PrivateDir "invite-$Number.json"
+    $Invite = Get-Content -LiteralPath $InvitePath -Raw | ConvertFrom-Json
+    if ($Invite.version -ne 1 -or $Invite.id -cnotmatch '^[a-f0-9]{32}$') { throw "Transport invite $Number has invalid public metadata." }
+    $ClientTransport["client$Number"] = @{ Path=$InvitePath; Id=[string]$Invite.id; Profile="$RunName-client-$Number" }
+    $Invite = $null
+}
+if ($ClientTransport.client1.Id -eq $ClientTransport.client2.Id) { throw 'Distinct client transport invites are required.' }
 $GateFile = Join-Path $RunDir 'clients-ready.marker'
 $EarlyFile = $GateFile + '.early'
 $CompleteFile = $GateFile + '.complete'
@@ -63,10 +87,10 @@ function Wait-Log([string]$Path,[string]$Pattern) {
     throw "Timed out waiting for '$Pattern' in $Path"
 }
 function Launch([string]$Role) {
-    $Url = if ($Role -eq 'server') { '/Engine/Maps/Entry' } else { "127.0.0.1:$Port" }
+    $Url = if ($Role -eq 'server') { '/Engine/Maps/Entry' } else { "127.0.0.1:$Port`?EncryptionToken=$($ClientTransport[$Role].Id)" }
     $Args = @("`"$Project`"",$Url,'-unattended','-nosplash','-nosound','-Multiprocess','-log',"-abslog=`"$($Logs[$Role])`"",'-VoxelNoMenu','-VoxelSyntheticTerrain',"-VoxelSeed=$Seed",'-NoSteam',"-VoxelObjectsNetGateFile=`"$GateFile`"")
-    if ($Role -eq 'server') { $Args += @('-server',"-port=$Port",'-nullrhi','-VoxelObjectsNetVerify=server') }
-    else { $Args += @('-game',"-$Render",'-sm6','-windowed','-ResX=640','-ResY=360','-VoxelObjectsNetVerify=client') }
+    if ($Role -eq 'server') { $Args += @('-server',"-port=$Port",'-nullrhi','-VoxelObjectsNetVerify=server',"-VoxelTransportKeys=`"$ServerKeys`"") }
+    else { $Args += @('-game',"-$Render",'-sm6','-windowed','-ResX=640','-ResY=360','-VoxelObjectsNetVerify=client',"-VoxelTransportInvite=`"$($ClientTransport[$Role].Path)`"","-VoxelPlayerProfile=$($ClientTransport[$Role].Profile)") }
     $P = Start-Process -FilePath $Editor -ArgumentList $Args -WorkingDirectory $Workspace -WindowStyle Hidden -PassThru
     $Owned.Add($P)
     Write-Host "Started $Role PID=$($P.Id) log=$($Logs[$Role])"

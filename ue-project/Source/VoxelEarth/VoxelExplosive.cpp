@@ -1,4 +1,5 @@
 #include "VoxelExplosive.h"
+#include "VoxelGameplayActors.h"
 
 #include "Camera/PlayerCameraManager.h"
 #include "Components/StaticMeshComponent.h"
@@ -43,6 +44,7 @@ UVoxelBlastCameraShake::UVoxelBlastCameraShake(const FObjectInitializer& ObjectI
 
 AVoxelExplosive::AVoxelExplosive()
 {
+	bReplicates=true; SetReplicateMovement(true);
 	// Ticks so it can resolve its own collision against the voxel world -- see
 	// AVoxelExplosive::Tick. Nothing else here needs a tick.
 	PrimaryActorTick.bCanEverTick = true;
@@ -76,6 +78,7 @@ AVoxelExplosive::AVoxelExplosive()
 void AVoxelExplosive::BeginPlay()
 {
 	Super::BeginPlay();
+	VoxelGameplayActors::FinishRestore(this);
 
 	// Dark tint on the BasicShapes sphere (m1-plan.md "visible as a small
 	// engine BasicShapes sphere (dark MID tint)"). Best-effort: the exact
@@ -99,6 +102,7 @@ void AVoxelExplosive::BeginPlay()
 
 void AVoxelExplosive::Launch(const FVector& InitialVelocityUUPerSec)
 {
+	if(!HasAuthority()) return;
 	if (Projectile)
 	{
 		Projectile->Activate();
@@ -122,6 +126,7 @@ void AVoxelExplosive::Launch(const FVector& InitialVelocityUUPerSec)
 
 void AVoxelExplosive::Tick(float DeltaSeconds)
 {
+	if(!HasAuthority()) return;
 	Super::Tick(DeltaSeconds);
 
 	if (bLanded)
@@ -173,6 +178,7 @@ void AVoxelExplosive::Tick(float DeltaSeconds)
 
 void AVoxelExplosive::Detonate()
 {
+	if(!HasAuthority()) return;
 	UWorld* World = GetWorld();
 	if (World)
 	{

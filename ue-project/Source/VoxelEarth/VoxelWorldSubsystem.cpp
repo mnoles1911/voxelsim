@@ -4,8 +4,11 @@
 #include "VoxelSaveJobs.h"
 #include "VoxelCheckpointStore.h"
 #include "VoxelSessionCheckpoint.h"
+#include "VoxelSessionTravel.h"
 #include "VoxelEnvironmentLODPrototype.h"
 #include "VoxelProductionCandidatePreparation.h"
+#include "VoxelEnvironmentRenderContext.h"
+#include "VoxelEnvironmentPageBarrier.h"
 #include "Misc/SecureHash.h"
 
 #include "VoxelChunkComponent.h"
@@ -1366,7 +1369,8 @@ struct FCoarseChunkGridSampler
 	FCoarseChunkGridSampler(const GenT& Gen, int32 InLevel, const VoxelCoords::FVoxelChunkKey& Key,
 	                        vxc::Counters* PerfCounters,
 	                        FSharedColumnGridCache* SharedCache = nullptr, bool bFootprintResident = false,
-	                        const std::vector<vxc::AssetField::ResolvedAssetInstance>* PreResolved = nullptr)
+	                        const std::vector<vxc::AssetField::ResolvedAssetInstance>* PreResolved = nullptr,
+                            VoxelEnvironmentRender::FContextRef RenderContext = {})
 		: Level(InLevel)
 		, BaseVX(int64(Key.X) * ChunkVox)
 		, BaseVY(int64(Key.Y) * ChunkVox)
@@ -1494,6 +1498,7 @@ struct FCoarseChunkGridSampler
 					int64((FPlatformTime::Seconds() - AT0) * 1e6), std::memory_order_relaxed);
 			}
 			}
+			if(RenderContext&&RenderContext->HasOwnedSources())bRenderContextValid=RenderContext->MarkPrivate(Resolved);
 			if (!Resolved.empty())
 			{
 				ColShortlist.SetNum(GridEdge * GridEdge);
@@ -1529,8 +1534,10 @@ struct FCoarseChunkGridSampler
 		}
 	}
 
+	bool bRenderContextValid=true;
 	vxc::MaterialId operator()(int64 X, int64 Y, int64 Z) const
 	{
+		if(!bRenderContextValid)return vxc::MAT_AIR;
 		const int32 LX = int32(X - BaseVX) + 1;
 		const int32 LY = int32(Y - BaseVY) + 1;
 		checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
@@ -1577,7 +1584,7 @@ struct FCoarseChunkGridSampler
 						int32(Rx), int32(Ry), int32(Rz), R.yawQuarter);
 					if (AM != vxc::MAT_AIR)
 					{
-						return AM;
+						return R.suppressTerrainRender?vxc::MAT_AIR:AM;
 					}
 				}
 			}
@@ -2046,6 +2053,7 @@ struct FChunkRecord
 	// (superseded by an edit while the job was in flight) and is discarded
 	// rather than applied -- this IS the stale-result discard mechanism.
 	uint64 GenerationId = 1;
+	uint64 OwnershipGeneration = 0;
 
 	bool bJobInFlight = false;
 
@@ -2182,8 +2190,11 @@ struct FChunkRecord
 
 struct FJobResult
 {
+	VoxelEnvironmentPages::FLease PageLease;
+	bool bRenderContextValid = true;
 	VoxelCoords::FVoxelLevelChunkKey Key;
 	uint64 GenerationId = 0;
+	uint64 OwnershipGeneration = 0;
 	TArray<FVoxelChunkQuad> Quads;
 	// CPU worker arm ONLY: wall time inside the worker task body, pickup to
 	// enqueue (docs/debug-tooling-plan.md P1 "Worker timings"). This is SERVICE
@@ -6826,7 +6837,14 @@ struct FVoxelWorldImpl
 	vxc::AssetManifest AssetManifestData;
 	TWeakObjectPtr<UWorld> EnvironmentObjectWorld;
 	FString ProductionProviderHash,ProductionCatalogHash;
-	VoxelProductionCandidate::FWorkRef ProductionCandidate;
+	// No callback: this adapter cannot publish ownership. A future transaction
+    // must install its worker-validated context together with the visible snapshot.
+    VoxelProductionEnvironment::FAdapter ProductionOwnership;
+    VoxelEnvironmentRender::FContextRef ProductionRenderContext;
+    VoxelEnvironmentRender::FContextRef CaptureProductionRenderContext();
+    bool ProductionRenderAffects(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const;
+    bool ProductionRenderSupported(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const;
+    VoxelProductionCandidate::FWorkRef ProductionCandidate;
 	std::atomic<int32> ProductionCandidateWorkers{0};
 	void TickProductionCandidate(UWorld* World,const FVector& Anchor);
 	bool ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const;
@@ -7120,6 +7138,7 @@ struct FVoxelWorldImpl
 		// re-queues, so without this an edited chunk would silently un-park with
 		// its pre-edit shape.
 		uint64 GenerationId = 0;
+	uint64 OwnershipGeneration = 0;
 		uint64 EditEpoch = 0;
 		float ParkedAtSeconds = 0.f;
 		// T4-1: was this geometry SPECULATED, or parked from a real eviction?
@@ -7722,6 +7741,10 @@ struct FVoxelWorldImpl
 	int64 LevelSkySkippedTotal[VoxelCoords::kNumLevels] = {};
 
 	TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc> ResultsQueue;
+	// Independent of ChunkRecords and worker counters: leases survive unload
+	// and worker completion until the queued result is finally consumed.
+	// No page freezes/publication changes are activated by this ledger yet.
+	VoxelEnvironmentPages::FBarrier PageBarrier;
 	// Current ResultsQueue depth: delivered-but-not-yet-applied results.
 	// Incremented immediately before BOTH Enqueue sites (the CPU worker task
 	// and OnGpuMeshJobComplete's demand path -- speculative results never
@@ -7868,9 +7891,11 @@ struct FVoxelWorldImpl
 	{
 		VoxelCoords::FVoxelLevelChunkKey Key;
 		uint64 GenerationId = 0;
+	uint64 OwnershipGeneration = 0;
 		// T4-1: a speculative result is PARKED on arrival, not applied -- nothing
 		// has asked for it, so it must not create a record or become visible.
 		bool bSpeculative = false;
+		VoxelEnvironmentPages::FLease PageLease;
 	};
 	TMap<uint64, FGpuPendingJob> GpuJobsPending;
 
@@ -7916,8 +7941,10 @@ struct FVoxelWorldImpl
 	// the caller MUST fall through to the CPU path -- the counters have already
 	// been incremented and something owes a result.
 	//
-	// THERE IS NO "DEFER" RETURN AND THERE MUST NOT BE. False means fall
-	// through to the CPU worker, which is a producer change, not a delay; the
+	// False normally falls through to the CPU worker. If the independent page
+	// ledger also refuses CPU admission, demand rolls back its claim and retries.
+	// OutPageLeaseRefused lets speculation preserve its queued key on that bound.
+	// The cold-shading decision remains a producer change, not a delay; the
 	// cold-shading cap therefore decides in the CALLER, before anything is
 	// claimed, and hands its already-taken verdict down through PrecomputedCold
 	// so the census tap here does not re-ask (see FColdShadingVerdict above).
@@ -7925,7 +7952,9 @@ struct FVoxelWorldImpl
 	// every other call site and every leg with the cap off.
 	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
 	                      uint8 RingSkirtMask, bool bSpeculative = false,
-	                      const FColdShadingVerdict* PrecomputedCold = nullptr);
+	                      const FColdShadingVerdict* PrecomputedCold = nullptr,
+                          VoxelEnvironmentRender::FContextRef RenderContext = {},
+                          bool* OutPageLeaseRefused = nullptr);
 	// Delivery callback. Game thread, from inside Tick().
 	void OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult);
 
@@ -12246,6 +12275,24 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		}
 	}
 
+	// The bounded worker waits and manager cancellation are complete. Existing
+	// timeout diagnostics above still apply: a timed-out worker is NOT joined.
+	// Discard queued payloads before the final render flush because their
+	// destructors may enqueue render-resource releases, including the last item.
+	for (const auto& Entry : GpuJobsPending) {
+		const bool bRetired = PageBarrier.Retire(Entry.Value.PageLease); check(bRetired);
+	}
+	GpuJobsPending.Reset();
+	{
+		VoxelStreaming::FJobResult Discarded;
+		while (ResultsQueue.Dequeue(Discarded)) {
+			ResultsBacklogCounter.Decrement();
+			if (Discarded.PageLease.IsValid()) {
+				const bool bRetired = PageBarrier.Retire(Discarded.PageLease); check(bRetired);
+			}
+		}
+	}
+
 	if (GIsRHIInitialized)
 	{
 		const double FlushT0 = FPlatformTime::Seconds();
@@ -12253,6 +12300,8 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		UE_LOG(LogVoxelStream, Log, TEXT("WaitForInFlightTasks: flushed rendering commands at teardown in %.0f ms."),
 		       (FPlatformTime::Seconds() - FlushT0) * 1000.0);
 	}
+
+	check(PageBarrier.ActiveLeases() == 0);
 }
 
 namespace
@@ -18001,6 +18050,29 @@ static std::vector<vxc::AssetField::ResolvedAssetInstance> VoxelResolveTerrainIn
 // Preparation only: no page filtering, registry admission or actor reveal.
 // The two workers borrow Impl inputs and are tracked by InFlightTasks, so the
 // existing teardown barrier outlives every bank/manifest/sampler access.
+VoxelEnvironmentRender::FContextRef FVoxelWorldImpl::CaptureProductionRenderContext()
+{
+    check(IsInGameThread());const auto Snapshot=ProductionOwnership.Visible();
+    if(ProductionRenderContext&&ProductionRenderContext->Generation()==Snapshot->generation)return ProductionRenderContext;
+    // Nonempty snapshots require an already validated context from the future
+    // bounded publication worker. Never build/hash canonical grids per dispatch.
+    if(!Snapshot->records.empty())return {};
+    FString Error;ProductionRenderContext=VoxelEnvironmentRender::Build(Snapshot,Voxels.amplifier().seed(),TEXT(""),TEXT(""),{},Error);
+    return ProductionRenderContext;
+}
+bool FVoxelWorldImpl::ProductionRenderAffects(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const
+{
+    if(!Context)return true;if(!Context->HasOwnedSources())return false;
+    const int64 Scale=int64(1)<<Key.Level;
+    const int64 X=int64(Key.Key.X)*32,Y=int64(Key.Key.Y)*32,Z=int64(Key.Key.Z)*32;
+    return Context->AffectsBounds((X-1)*Scale,(Y-1)*Scale,(Z-1)*Scale,(X+33)*Scale-1,(Y+33)*Scale-1,(Z+33)*Scale-1);
+}
+bool FVoxelWorldImpl::ProductionRenderSupported(const VoxelCoords::FVoxelLevelChunkKey& Key,const VoxelEnvironmentRender::FContextRef& Context) const
+{
+    if(!Context)return false;if(!ProductionRenderAffects(Key,Context))return true;
+    return !NeedsOverlayAwarePath(Key)&&(Key.Level==0||(VoxelStreamAdmission::GetCoarseMinLevel()==1&&VoxelStreamAdmission::CoarseGridEnabled()&&!VoxelStreamAdmission::CoarseGridVerifyEnabled()));
+}
+
 bool FVoxelWorldImpl::ProductionCandidateResident(const vxc::AssetVoxelRect& Rect) const
 {
     if(!FineStreamer||ProductionProviderHash.IsEmpty()||ProductionCatalogHash.IsEmpty())return false;
@@ -19637,7 +19709,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 			bBrickParkLost = !GetGlobalVoxelBrickPool().DebugGetResidentChunk(
 				VoxelBrickCpuArm::MakeKey(LevelKey), ResidentProbe);
 		}
-		if (Parked->EditEpoch != NowEpoch)
+		if (Parked->EditEpoch != NowEpoch||!ProductionOwnership.AcceptsVisibleJob(Parked->OwnershipGeneration))
 		{
 			EvictParkedKey(LevelKey);
 			++ParkEvictedStaleSinceLog;
@@ -19669,6 +19741,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 			Adopted.AdmittedAtSeconds = ElapsedSeconds;
 			Adopted.PoolSlot = Parked->PoolHandle;
 			Adopted.GenerationId = Parked->GenerationId;
+            Adopted.OwnershipGeneration=Parked->OwnershipGeneration;
 			Adopted.LastQuadCount = Parked->QuadCount;
 			Adopted.bDeepAnchorRelative = bDeepAnchorRelative;
 			// Phase 3 hook 1 of 4 (adoption re-admits a parked
@@ -23609,8 +23682,13 @@ FVoxelWorldImpl::FColdShadingVerdict FVoxelWorldImpl::ProbeColdShading(
 
 bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
                                        uint8 RingSkirtMask, bool bSpeculative,
-                                       const FColdShadingVerdict* PrecomputedCold)
+                                       const FColdShadingVerdict* PrecomputedCold,
+                                       VoxelEnvironmentRender::FContextRef RenderContext,
+                                       bool* OutPageLeaseRefused)
 {
+    if (OutPageLeaseRefused) *OutPageLeaseRefused = false;
+    if(!RenderContext)RenderContext=CaptureProductionRenderContext();
+    if(!ProductionRenderSupported(LevelKey,RenderContext))return false;
 	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
 	if (Manager == nullptr)
 	{
@@ -23618,6 +23696,14 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		// dead fork, not a submit cost, and it would dilute perCallUs.
 		return false;
 	}
+
+	const auto PageLease = PageBarrier.TryAcquire(LevelKey, VoxelEnvironmentPages::EProducer::Gpu);
+	if (!PageLease.IsValid()) {
+		if (OutPageLeaseRefused) *OutPageLeaseRefused = true;
+		return false;
+	}
+	bool bLeaseSubmitted = false;
+	ON_SCOPE_EXIT { if (!bLeaseSubmitted) { const bool bRetired = PageBarrier.Retire(PageLease); check(bRetired); } };
 
 	// The gpu-submit split (see the AccumGpuSubmit* members for the 1,547 ms
 	// finding these exist to name). CONTIGUOUS sequential stamps: each bucket
@@ -24058,8 +24144,15 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// returns resolveForCompose's own vector unmodified, so the order is
 			// resolveForCompose's, which is instancesForRect's -- unchanged.
 			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
-			const std::vector<vxc::AssetField::ResolvedAssetInstance>& Resolved =
-				*ResolvedAssetsForFootprint(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y, ResolveScratch);
+			const auto& CanonicalResolved=*ResolvedAssetsForFootprint(LevelKey.Level,LevelKey.Key.X,LevelKey.Key.Y,ResolveScratch);
+            std::vector<vxc::AssetField::ResolvedAssetInstance> MarkedResolved;
+            const auto* RenderResolved=&CanonicalResolved;
+            if(RenderContext->HasOwnedSources()){
+                MarkedResolved=CanonicalResolved;
+                if(!RenderContext->MarkPrivate(MarkedResolved))return false;
+                RenderResolved=&MarkedResolved;
+            }
+            const auto& Resolved=*RenderResolved;
 			// Same mesher-side accounting as the CPU job: a GPU-meshed chunk
 			// resolves here and never runs the worker's block.
 			//
@@ -24141,6 +24234,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 				Inst.RotOriginX = R.grid->rotatedOriginX(R.yawQuarter);
 				Inst.RotOriginY = R.grid->rotatedOriginY(R.yawQuarter);
 				Inst.YawQuarter = R.yawQuarter;
+                Inst.SuppressTerrainRender=R.suppressTerrainRender?1u:0u;
 				Inst.SizeX = uint32(S.SizeX);
 				Inst.SizeY = uint32(S.SizeY);
 				Inst.SizeZ = uint32(S.SizeZ);
@@ -24240,8 +24334,9 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	const double SubT5 = FPlatformTime::Seconds(); // pool: direct-to-pool + GI probe
 
 	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool,
-	                                     /*bLowPriority*/ bSpeculative);
-	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, bSpeculative });
+	                                     /*bLowPriority*/ bSpeculative, /*bHoldBrickPublication*/ false, RenderContext->Generation());
+	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, RenderContext->Generation(), bSpeculative, PageLease });
+	bLeaseSubmitted = true;
 
 	// The gpu-submit split's normal exit (the decline path above mirrors it).
 	{
@@ -24272,7 +24367,7 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	if (!bAcceptingGpuResults)
 	{
 		++GpuResultsAbsorbedAtTeardown;
-		GpuJobsPending.Remove(GpuResult.JobId);
+		// Keep the lease until teardown has drained the manager/render commands.
 		return;
 	}
 
@@ -24290,6 +24385,8 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 		return;
 	}
 
+	bool bLeaseQueued = false;
+	ON_SCOPE_EXIT { if (!bLeaseQueued) { const bool bRetired = PageBarrier.Retire(Pending.PageLease); check(bRetired); } };
 	++GpuMeshJobsDeliveredSinceLog;
 	GpuMeshSubmitToDeliverMsSinceLog += GpuResult.SubmitToDeliverMs;
 	GpuMeshSubmitToDeliverMaxMs = FMath::Max(GpuMeshSubmitToDeliverMaxMs, GpuResult.SubmitToDeliverMs);
@@ -24359,6 +24456,9 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	if (Pending.bSpeculative)
 	{
 		SpeculativeInFlight.Remove(Pending.Key);
+        // Manager may already have published normal GPU payloads. This guard
+        // prevents cache/adoption resurrection; it is NOT atomic publication.
+        if(!ProductionOwnership.AcceptsVisibleJob(Pending.OwnershipGeneration)||GpuResult.OwnershipGeneration!=Pending.OwnershipGeneration){++SpecDroppedOvertakenSinceLog;return;}
 		// KEEP THE BAND EVEN THOUGH THE GEOMETRY MAY BE DISCARDED.
 		//
 		// The GPU computes a per-COLUMN band (D6) alongside the mesh, and
@@ -24414,7 +24514,10 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 
 	VoxelStreaming::FJobResult Result;
 	Result.Key = Pending.Key;
+	Result.PageLease = Pending.PageLease;
 	Result.GenerationId = Pending.GenerationId;
+    Result.OwnershipGeneration=Pending.OwnershipGeneration;
+    Result.bRenderContextValid=ProductionOwnership.AcceptsVisibleJob(Pending.OwnershipGeneration)&&GpuResult.OwnershipGeneration==Pending.OwnershipGeneration;
 	// Into its OWN field, not JobMs. This line used to write SubmitToDeliverMs
 	// -- an end-to-end latency including the manager's queue wait -- into
 	// JobMs, whose CPU-arm meaning is worker service time, and DrainResults
@@ -24550,7 +24653,7 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	if (Pending.Key.Level == 0)
 	{
 		const FIntPoint DoneFootprint(Pending.Key.Key.X, Pending.Key.Key.Y);
-		if (Result.bBandValid)
+		if (Result.bBandValid&&Result.bRenderContextValid&&ProductionOwnership.AcceptsVisibleJob(Result.OwnershipGeneration))
 		{
 			FootprintBandCache.Add(DoneFootprint, Result.Band);
 		}
@@ -24570,6 +24673,7 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	// direction. Counting after would under-read and let dispatch overshoot.
 	ResultsBacklogCounter.Increment();
 	ResultsQueue.Enqueue(MoveTemp(Result));
+	bLeaseQueued = true;
 	JobsInFlightCounter.Decrement();
 }
 
@@ -24642,6 +24746,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		(VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled()) &&
 		VoxelStreamAdmission::ColdBandThrottleEnabled();
 	TArray<FSortEntry> DeferredColdBand;
+    TArray<FSortEntry> DeferredOwnership[VoxelCoords::kNumLevels];
 
 	// --- THE DEMAND-SIDE COLD-SHADING CAP (voxel.Stream.ColdShadingCapPerTick)
 	//
@@ -25001,7 +25106,9 @@ void FVoxelWorldImpl::DispatchJobs()
 		// recompute and dispatch, may have made this chunk (or one of its
 		// mip ancestors) edited-only.
 		const double OverlayStart = FPlatformTime::Seconds();
-		const bool bNeedsOverlay = NeedsOverlayAwarePath(LevelKey);
+		const auto RenderContext=CaptureProductionRenderContext();
+        if(!ProductionRenderSupported(LevelKey,RenderContext)){DeferredOwnership[PickLevel].Add(PoppedEntry);continue;}
+        const bool bNeedsOverlay = NeedsOverlayAwarePath(LevelKey);
 		ThisFrameDispatchOverlayMs += float((FPlatformTime::Seconds() - OverlayStart) * 1000.0);
 		if (bNeedsOverlay)
 		{
@@ -25091,6 +25198,7 @@ void FVoxelWorldImpl::DispatchJobs()
 			// one below are the two the previous column-index version forgot,
 			// which docs/streaming-handoff.md flagged as the prime suspect.)
 			Rec->bMeshSettled = true;
+            Rec->OwnershipGeneration=RenderContext->Generation();
 			continue;
 		}
 
@@ -25152,6 +25260,7 @@ void FVoxelWorldImpl::DispatchJobs()
 				ReleaseChunkGeometry(*Rec);
 				Rec->bJobInFlight = false;
 				Rec->bMeshSettled = true; // see the band-skip site above
+                Rec->OwnershipGeneration=RenderContext->Generation();
 				continue;
 			}
 		}
@@ -25460,10 +25569,9 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		// THE CLAIM (moved here from above the fork predicates -- see the note
 		// at its old site for the identifier-by-identifier argument). From this
-		// statement to the end of the iteration there is no `continue`: both
-		// fork branches owe exactly one FJobResult on ResultsQueue and exactly
-		// one JobsInFlightCounter decrement, and any early exit inserted between
-		// here and them breaks that contract.
+		// statement onward a successful producer owes exactly one queued result
+		// and counter decrement. The bounded page-lease refusal below is the
+		// sole non-producing exit: it explicitly rolls this entire claim back.
 		Rec->bJobInFlight = true;
 		JobsInFlightCounter.Increment();
 		++LevelJobsInFlight[PickLevel];
@@ -25485,7 +25593,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		};
 
 		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId, RingSkirtMask,
-		                                    /*bSpeculative*/ false, &ColdVerdict))
+		                                    /*bSpeculative*/ false, &ColdVerdict, RenderContext))
 		{
 			// The fork resolved GPU: this ring's in-flight slot is now held by
 			// a round trip (p50 2.3 s), not a worker (p50 <1 ms). The split
@@ -25627,6 +25735,22 @@ void FVoxelWorldImpl::DispatchJobs()
 			}
 		}
 
+		const auto CpuPageLease = PageBarrier.TryAcquire(LevelKey, VoxelEnvironmentPages::EProducer::Cpu);
+		if (!CpuPageLease.IsValid())
+		{
+			// Undo the shared dispatch claim; no producer owns this key yet.
+			// Retry next tick, rather than repeatedly popping it in this loop.
+			Rec->bJobInFlight = false;
+			JobsInFlightCounter.Decrement();
+			--LevelJobsInFlight[PickLevel];
+			--JobsDispatchedSinceLog;
+			--JobsDispatchedTotalForCap;
+			--LevelJobsDispatchedSinceLog[PickLevel];
+			--LevelJobsDispatchedTotal[PickLevel];
+			DeferredOwnership[PickLevel].Add(PoppedEntry);
+			continue;
+		}
+
 		// The fork resolved CPU (GPU declined, failed to submit, or was
 		// excluded). Split bookkeeping mirrors the GPU branch above; the
 		// atomic is the exact-CPU instrument (see its doc comment) and is
@@ -25641,7 +25765,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// spelling (-VoxelWorkerPool routes it to a dedicated pool; default
 		// is UE::Tasks exactly as before). Captures unchanged.
 		auto JobBody =
-			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, BacklogPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
+			[GenPtr, LevelKey, GenId, RenderContext, CpuPageLease, QueuePtr, CounterPtr, BacklogPtr, CpuCounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
 			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident,
@@ -25659,6 +25783,8 @@ void FVoxelWorldImpl::DispatchJobs()
 				VoxelStreaming::FJobResult Result;
 				Result.Key = LevelKey;
 				Result.GenerationId = GenId;
+				Result.PageLease = CpuPageLease;
+                Result.OwnershipGeneration=RenderContext->Generation();
 				Result.bPredictedEmpty = bPredictedEmpty;
 
 				const VoxelCoords::FVoxelChunkKey& Key = LevelKey.Key;
@@ -25985,7 +26111,8 @@ void FVoxelWorldImpl::DispatchJobs()
 							           Prev, H, std::memory_order_relaxed)) {}
 						}
 					}
-					const std::vector<vxc::AssetField::ResolvedAssetInstance>* AResolvedPtr = &AResolved;
+					if(RenderContext->HasOwnedSources())Result.bRenderContextValid=RenderContext->MarkPrivate(AResolved);
+                    const std::vector<vxc::AssetField::ResolvedAssetInstance>* AResolvedPtr = &AResolved;
 					if (bComputeBand)
 					{
 						int64 MaxTop = INT64_MIN;
@@ -26042,7 +26169,7 @@ void FVoxelWorldImpl::DispatchJobs()
 						// same winner as the bank-source path did, byte for byte.
 						if (M == vxc::MAT_AIR && !AResolvedPtr->empty())
 						{
-							M = vxc::AssetField::materialAtResolved(*AResolvedPtr, X, Y, Z);
+							M = vxc::AssetField::materialAtResolvedForRender<true>(*AResolvedPtr, X, Y, Z);
 						}
 						return M;
 					};
@@ -26303,7 +26430,8 @@ void FVoxelWorldImpl::DispatchJobs()
 						                                            // The COARSE resolve is the expensive one (1,156x
 						                                            // level 0's rect area at level 5) and warm tasks
 						                                            // exist precisely to have it ready here.
-						                                            bAssetResolveFromCache ? &AssetResolveList : nullptr);
+						                                            bAssetResolveFromCache ? &AssetResolveList : nullptr, RenderContext);
+                        Result.bRenderContextValid=CoarseSampler.bRenderContextValid;
 						Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
 						// P2 coverage, coarse levels. FCoarseChunkGridSampler satisfies the
 						// same (int64,int64,int64) -> MaterialId contract the packer wants,
@@ -26484,6 +26612,7 @@ void FVoxelWorldImpl::DispatchJobs()
 	// irrelevant here -- SortPendingQueues re-sorts both queues on the next
 	// recompute -- and they are retried next frame, by which time the seeding
 	// job has usually drained and the band can answer for the whole column.
+    for(int32 L=0;L<VoxelCoords::kNumLevels;++L)PendingJobKeysByLevel[L].Append(DeferredOwnership[L]);
 	if (DeferredColdBand.Num() > 0)
 	{
 		PendingJobKeysByLevel[0].Append(DeferredColdBand);
@@ -27219,6 +27348,7 @@ bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& 
 	Parked.Level = Key.Level;
 	Parked.QuadCount = Rec.LastQuadCount;
 	Parked.GenerationId = Rec.GenerationId;
+    Parked.OwnershipGeneration=Rec.OwnershipGeneration;
 	Parked.EditEpoch = EditEpoch.load(std::memory_order_relaxed);
 	Parked.ParkedAtSeconds = ElapsedSeconds;
 
@@ -27551,10 +27681,12 @@ void FVoxelWorldImpl::DispatchSpeculativeJobs()
 				++ColdCapExemptSinceLog;
 			}
 		}
+		bool bPageLeaseRefused = false;
 		if (!SubmitGpuMeshJob(Key, /*GenId*/ 0, /*RingSkirtMask*/ 0, /*bSpeculative*/ true,
-		                      &SpecVerdict))
+		                      &SpecVerdict, {}, &bPageLeaseRefused))
 		{
-			SpeculativeInFlight.Remove(Key);
+			if (bPageLeaseRefused) SpeculativeKeys.Add(Key); // bounded retry, no lost candidate
+			else SpeculativeInFlight.Remove(Key);
 			break; // fork refused (budget) -- stop, do not spin
 		}
 		++SpecOutstanding;
@@ -27649,6 +27781,7 @@ void FVoxelWorldImpl::ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkK
 		// Speculation is worldgen-only, so its generation is the base one --
 		// same reasoning as the quad arm below.
 		Parked.GenerationId = 1;
+    Parked.OwnershipGeneration=GpuResult.OwnershipGeneration;
 		Parked.EditEpoch = EditEpoch.load(std::memory_order_relaxed);
 		Parked.ParkedAtSeconds = ElapsedSeconds;
 		Parked.bSpeculative = true;
@@ -27744,6 +27877,7 @@ void FVoxelWorldImpl::ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkK
 	// epoch is what actually invalidates it, and MarkChunkDirtyForRemesh evicts
 	// parked entries directly on edit.
 	Parked.GenerationId = 1;
+    Parked.OwnershipGeneration=GpuResult.OwnershipGeneration;
 	Parked.EditEpoch = EditEpoch.load(std::memory_order_relaxed);
 	Parked.ParkedAtSeconds = ElapsedSeconds;
 	Parked.bSpeculative = true;
@@ -28434,6 +28568,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			ExitReason = EDrainExit::QueueEmpty;
 			break;
 		}
+		// Capture independently of Result: application may move its payload.
+		// All continue/discard paths (including absent records) retire exactly once.
+		const auto ConsumedPageLease = Result.PageLease;
+		ON_SCOPE_EXIT {
+			if (ConsumedPageLease.IsValid()) { const bool bRetired = PageBarrier.Retire(ConsumedPageLease); check(bRetired); }
+		};
 		// Dispatch-ahead depth: one dequeue, one decrement -- stale discards
 		// included, because the counter measures QUEUE DEPTH (what the
 		// dispatch loop's gate must not let grow), not live results.
@@ -28499,7 +28639,7 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// function of (X,Y) and the amplifier -- it is equally true whether or
 		// not this particular chunk is still wanted, and a stale result is
 		// exactly as good a source for it as a live one.
-		if (Result.bBandValid)
+		if (Result.bBandValid&&Result.bRenderContextValid&&ProductionOwnership.AcceptsVisibleJob(Result.OwnershipGeneration))
 		{
 			FootprintBandCache.Add(FIntPoint(Result.Key.Key.X, Result.Key.Key.Y), Result.Band);
 		}
@@ -28752,12 +28892,22 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// was in flight (GenerationId no longer matches the id the job was
 		// dispatched with -- MarkChunkDirtyForRemesh bumped it). Free (no
 		// proxy) -- does NOT consume the render-facing MaxApplies budget.
-		if (!Rec || Rec->GenerationId != Result.GenerationId)
+		if (!Rec || Rec->GenerationId != Result.GenerationId||!Result.bRenderContextValid||!ProductionOwnership.AcceptsVisibleJob(Result.OwnershipGeneration))
 		{
+            if(Rec&&Rec->GenerationId==Result.GenerationId){
+                Rec->bJobInFlight=false;
+                if(NeedsOverlayAwarePath(Result.Key))PendingGameThreadKeys.AddUnique(Result.Key);
+                else {
+                    auto& Retry=PendingJobKeysByLevel[FMath::Clamp(Result.Key.Level,0,VoxelCoords::kNumLevels-1)];
+                    if(!Retry.ContainsByPredicate([&](const FSortEntry& E){return E.Key==Result.Key;}))Retry.Add(FSortEntry{0.,Result.Key});
+                }
+            }
 			++StaleResultsDiscarded;
 			++StaleDiscardsSinceLog;
 			continue;
 		}
+
+		Rec->OwnershipGeneration=Result.OwnershipGeneration;
 
 		// -VoxelVerifySkyBand: the verdict was computed at dispatch but the job
 		// ran anyway, so this is the real mesh to check it against. A violation
@@ -28946,18 +29096,24 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 	const int32 MaxRemeshes = VoxelDebug::GetStreamMaxRemeshesPerFrame();
 	int32 Count = 0;
 	int32 ProxiesCreated = 0;
-	while (Count < MaxRemeshes && PendingGameThreadKeys.Num() > 0)
+    TArray<VoxelCoords::FVoxelLevelChunkKey> OwnershipDeferred;
+    int32 OwnershipScanned=0;
+	while (Count < MaxRemeshes && PendingGameThreadKeys.Num() > 0 && (OwnershipDeferred.IsEmpty()||OwnershipScanned<FMath::Max(64,MaxRemeshes)))
 	{
 		// M2 wave 2: ANY level can be on this queue now -- level 0 (unchanged
 		// from wave 1) and level>=1 mip ancestors of an edit (see
 		// PropagateEditToMips / MarkChunkDirtyForRemesh).
 		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PendingGameThreadKeys.Pop(EAllowShrinking::No); // nearest
+        ++OwnershipScanned;
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
 		{
 			continue; // left the desired set; doesn't consume the budget
 		}
+        const auto RenderContext=CaptureProductionRenderContext();
+        if(!RenderContext||ProductionRenderAffects(LevelKey,RenderContext)){OwnershipDeferred.Add(LevelKey);continue;}
+        Rec->OwnershipGeneration=RenderContext->Generation();
 		++Count;
 
 		SCOPE_CYCLE_COUNTER(STAT_VoxelGameThreadMesh);
@@ -29096,6 +29252,8 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			NoteChunkVisible(*Rec);
 		}
 	}
+    // Keep blocked entries retryable, behind other pending work next tick.
+    if(!OwnershipDeferred.IsEmpty())PendingGameThreadKeys.Insert(OwnershipDeferred,0);
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);
 	ThisFrameEditRemeshes = Count;
 	ThisFrameProxiesCreated += ProxiesCreated;
@@ -31287,6 +31445,8 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSeed override: using seed %llu (default %llu)"),
 		       (unsigned long long)ParsedSeed, (unsigned long long)DefaultSeed);
 	}
+	VoxelSessionTravel::FRequest LaunchRequest;
+	if (VoxelSessionTravel::Peek(GetWorld(),LaunchRequest)) ParsedSeed=LaunchRequest.Seed;
 	Seed = ParsedSeed;
 
 	// Track B2 ("real .vxtl terrain tiles as a selectable tile source"):
@@ -31565,7 +31725,7 @@ void UVoxelWorldSubsystem::Deinitialize()
 			// A session with no named save behind it -- NEW GAME, or any
 			// headless run -- keeps writing to the seed-derived default, which
 			// is byte-identical to the behaviour that predates named saves.
-			const FString& ActiveSlug = VoxelSave::GetActiveSlug();
+			const FString& ActiveSlug = VoxelSave::GetActiveSlug(GetWorld());
 			if (!ActiveSlug.IsEmpty())
 			{
 				SaveWorldToPath(VoxelSave::WorldLogPath(ActiveSlug));
@@ -31730,10 +31890,9 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// usable via TryDig/TryPlace/CarveSphere regardless.
 	if (InWorld.GetNetMode() == NM_DedicatedServer)
 	{
-		UE_LOG(LogVoxelStream, Log,
-		       TEXT("Voxel streaming DISABLED (seed %llu): NM_DedicatedServer has no viewport -- only the authoritative ")
-		       TEXT("World + edit log run here."),
-		       (unsigned long long)Seed);
+		// Restore authority before skipping rendering. The front-end split must
+		// not leave a headless server permanently outside session admission.
+		StartWorldSession(GetWorldSaveFilePath(Seed));
 		return;
 	}
 
@@ -31811,7 +31970,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if(FParse::Param(FCommandLine::Get(),TEXT("VoxelDetachedRestoreProbe")))
 	{
 		// Keep the verification run's shutdown autosave out of the player's save.
-		VoxelSave::SetActiveSlug(TEXT("detached-restore-probe"));
+		VoxelSave::SetActiveSlug(GetWorld(), TEXT("detached-restore-probe"));
 		const FString ProbePath=FParse::Param(FCommandLine::Get(),TEXT("VoxelAsyncRestoreProbe"))
 			?VoxelSave::WorldLogPath(TEXT("async_save_verification")):FPaths::ProjectSavedDir()/TEXT("Tests/detached-roundtrip.vxlog");
 		StartWorldSession(ProbePath);
@@ -31980,12 +32139,13 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 	}
 
 	// Streaming anchor (decisions table: "Track a streaming anchor each
-	// tick"): the first local player's possessed pawn, falling back to the
-	// world origin if there is none yet (e.g. before RestartPlayer runs).
+	// tick"): the first local player's possessed pawn or an explicit preview
+	// anchor while possession is pending.
 	// A possessed pawn always wins. The override below only fills the gap
 	// before one exists -- see SetStreamingAnchorOverride for the two ways the
 	// world-origin fallback misleads the front end.
 	FVector Anchor = StreamingAnchorOverride.Get(FVector::ZeroVector);
+	bool bHasStreamingAnchor = StreamingAnchorOverride.IsSet();
 	// The camera's forward (XY, unit), captured here on the game thread and
 	// handed to streaming BY VALUE -- the view-direction half of the priority
 	// key (-VoxelViewBias) and the dispatchDot metric both read it. The PAWN
@@ -32001,6 +32161,7 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 			if (APawn* Pawn = PC->GetPawn())
 			{
 				Anchor = Pawn->GetActorLocation();
+				bHasStreamingAnchor = true;
 			}
 			if (PC->PlayerCameraManager)
 			{
@@ -32015,6 +32176,9 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 			}
 		}
 	}
+	// Session restoration can defer possession. Origin is not a substitute:
+	// it may be outside the resident terrain provider's coverage.
+	if (!bHasStreamingAnchor) return;
 	Impl->SetStreamViewDir(ViewDirXY);
 
 	Impl->TickStreaming(Anchor, *ChunkOwner, *ChunkRoot, ChunkMaterial, DeltaTime);
@@ -32503,6 +32667,7 @@ bool FVoxelWorldImpl::GetDigPreview(const FVector& CameraLocation, const FVector
 
 bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return false;
 	if (!Impl)
 	{
 		return false;
@@ -32561,6 +32726,7 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels,
                                      uint8 MaterialId, const FVector& PlayerActorLocation)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return false;
 	if (!Impl)
 	{
 		return false;
@@ -32974,6 +33140,7 @@ bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVect
 
 int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU)
 {
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return 0;
 	if (!Impl)
 	{
 		return 0;

@@ -2433,6 +2433,8 @@ bool FVoxelBrickPool::EvictOne()
 		RebuildEvictionOrder();
 	}
 
+	for (int32 Pass = 0; Pass < (bNeedRebuild ? 1 : 2); ++Pass)
+	{
 	const bool bByDistance = bHasEvictionFocus && bEvictionOrderSorted;
 
 	// Front first, skipping stale entries. A key can appear here more than once
@@ -2443,6 +2445,7 @@ bool FVoxelBrickPool::EvictOne()
 	{
 		const FVoxelBrickChunkKey Key = EvictionOrder[EvictionCursor];
 		++EvictionCursor;
+        if (!EvictionPins.IsEmpty() && EvictionPins.Contains(Key)) continue;
 		if (FResidentChunk* Found = Resident.Find(Key))
 		{
 			FreeResident(*Found);
@@ -2498,14 +2501,11 @@ bool FVoxelBrickPool::EvictOne()
 		}
 	}
 
-	// The array held nothing live but the map is not empty -- every entry was a
-	// ghost. One rebuild, then take the front. Bounded: the rebuild is built from
-	// the resident map, so it contains no ghosts and this cannot recurse twice.
-	if (Resident.Num() > 0 && EvictionCursor >= EvictionOrder.Num() && !bNeedRebuild)
-	{
-		RebuildEvictionOrder();
-		return EvictOne();
-	}
+    // A stale suffix can omit eligible residents. Rebuild at most once;
+    // unlike ghosts, live pinned entries can survive every rebuild.
+    if (Pass == 0 && !bNeedRebuild) RebuildEvictionOrder();
+    }
+
 	return false;
 }
 
@@ -2604,12 +2604,50 @@ bool FVoxelBrickPool::AllocateForChunk(const FVoxelBrickChunkKey& Key, uint32 Oc
 	return true;
 }
 
-bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages)
+FVoxelBrickEvictionPinTicket FVoxelBrickPool::AcquireEvictionPins(TConstArrayView<FVoxelBrickChunkKey> Keys)
+{
+    check(IsInGameThread());
+    FVoxelBrickEvictionPinTicket Ticket;
+    if (!bInitialised || Keys.IsEmpty() || Keys.Num() > 8192 ||
+        EvictionPins.Num() > 8192 - Keys.Num() || EvictionPinTickets.Num() >= 16 ||
+        NextEvictionPinSerial == MAX_uint64) return Ticket;
+    TSet<FVoxelBrickChunkKey> Unique;
+    for (const auto& Key : Keys)
+    {
+        if (Unique.Contains(Key) || EvictionPins.Contains(Key)) return Ticket;
+        Unique.Add(Key);
+    }
+    Ticket.PoolNonce = EvictionPinNonce;
+    Ticket.Serial = ++NextEvictionPinSerial;
+    auto& Stored = EvictionPinTickets.Add(Ticket.Serial);
+    Stored.Reserve(Keys.Num());
+    for (const auto& Key : Keys) { Stored.Add(Key); EvictionPins.Add(Key, Ticket.Serial); }
+    return Ticket;
+}
+
+bool FVoxelBrickPool::ReleaseEvictionPins(FVoxelBrickEvictionPinTicket Ticket)
+{
+    check(IsInGameThread());
+    if (Ticket.PoolNonce != EvictionPinNonce) return false;
+    const auto* Keys = EvictionPinTickets.Find(Ticket.Serial);
+    if (!Keys) return false;
+    for (const auto& Key : *Keys) EvictionPins.Remove(Key);
+    EvictionPinTickets.Remove(Ticket.Serial);
+    // A protected key may have been passed by the cursor. Re-rank lazily.
+    EvictionCursor = EvictionOrder.Num();
+    return true;
+}
+
+bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages, FVoxelBrickEvictionPinTicket Ticket)
 {
 	check(IsInGameThread());
 	if(!bInitialised||bGpuAllocArmed||!IndexSink||Pages.IsEmpty()||Pages.Num()>8192)return false;
-	TSet<FVoxelBrickChunkKey> Keys;
+	const bool HasTicket = Ticket.IsValid();
+    if (HasTicket && (Ticket.PoolNonce != EvictionPinNonce || !EvictionPinTickets.Contains(Ticket.Serial))) return false;
+    TSet<FVoxelBrickChunkKey> Keys;
 	for(const auto& Page:Pages){
+        const uint64* Pin = EvictionPins.Find(Page.Key);
+        if (HasTicket ? (!Pin || *Pin != Ticket.Serial) : Pin != nullptr) return false;
 		if(Keys.Contains(Page.Key)||Page.CpuPack.IsValid()==Page.GpuPack.IsValid())return false;Keys.Add(Page.Key);
 		const auto Old=Resident.Find(Page.Key);
 		if(Old?(int32(Old->ChunkSlot)!=Page.ExpectedSlot||Old->AddSequence!=Page.ExpectedSequence||Old->bGpuArenas):Page.ExpectedSlot!=INDEX_NONE)return false;
@@ -3371,6 +3409,11 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 
 void FVoxelBrickPool::Reset()
 {
+    check(IsInGameThread());
+    EvictionPins.Reset();
+    EvictionPinTickets.Reset();
+    EvictionPinNonce = FGuid::NewGuid();
+    NextEvictionPinSerial = 0;
 	DescArena.Reset();
 	OccArena.Reset();
 	MatArena.Reset();

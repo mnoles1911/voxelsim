@@ -38,6 +38,16 @@ FContextRef Build(VoxelProductionEnvironment::FSnapshot Snapshot,uint64 WorldSee
     }
     return Context;
 }
+bool FContext::AffectsBounds(int64 X0,int64 Y0,int64 Z0,int64 X1,int64 Y1,int64 Z1) const
+{
+    if(Sources.IsEmpty())return false;
+    if(X0>X1||Y0>Y1||Z0>Z1)return true;
+    for(const auto& S:Sources){const auto& P=S.Provenance;const auto& G=*S.Grid;
+        const int64 X=P.anchorVx+G.rotatedOriginX(P.yawQuarter),Y=P.anchorVy+G.rotatedOriginY(P.yawQuarter),Z=P.anchorVz+G.originZ();
+        if(X<=X1&&X+G.rotatedSizeX(P.yawQuarter)-1>=X0&&Y<=Y1&&Y+G.rotatedSizeY(P.yawQuarter)-1>=Y0&&Z<=Z1&&Z+G.sizeZ()-1>=Z0)return true;
+    }
+    return false;
+}
 bool FContext::MarkPrivate(std::vector<vxc::AssetField::ResolvedAssetInstance>& Instances) const
 {
     if(Instances.size()>8192)return false;

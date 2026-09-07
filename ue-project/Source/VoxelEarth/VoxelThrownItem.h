@@ -7,6 +7,7 @@
 
 class UProjectileMovementComponent;
 class UStaticMeshComponent;
+namespace VoxelGameplayActors { struct FAdapter; }
 
 // How a thrown item gets back into an inventory without this file knowing what
 // an inventory is. See AVoxelThrownItem::SetInventorySink for the full argument.
@@ -292,6 +293,8 @@ private:
 	bool bSplashed = false;
 	float LastSplashTimeSeconds = -1000.0f;
 
+	friend struct VoxelGameplayActors::FAdapter;
+	FGuid PersistentId=FGuid::NewGuid(), PersistentOwner;
 	bool bSettled = false;
 	bool bItemAccountedFor = false; // returned, lost, or picked up -- exactly once
 	float FlightSeconds = 0.0f;

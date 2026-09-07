@@ -145,6 +145,11 @@ public:
 	                          double LateralJitterUU);
 
 	int32 GetAgentCount() const { return Agents.Num(); }
+    // Checkpoint records contain authority only; pathfinding and render instances rebuild.
+    bool CaptureCheckpoint(TArray<uint8>& Bytes) const;
+    static bool DecodeCheckpoint(const TArray<uint8>& Bytes,TArray<FVoxelAgent>& Staged);
+    bool RestoreCheckpoint(const TArray<uint8>& Bytes);
+    void RebuildCheckpointInstances();
 
 	// --- M6 gap closure: NPC state replication (docs/status.md M6 section
 	// "Tier-1 hierarchical planning + NPC replication") -----------------------

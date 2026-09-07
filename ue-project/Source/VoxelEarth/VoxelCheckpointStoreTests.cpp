@@ -96,8 +96,31 @@ bool FVoxelCheckpointTransactionTest::RunTest(const FString&)
         TestTrue(TEXT("Original hydrology bytes"),Hydrology==TArray<uint8>{12});
         TestTrue(TEXT("Original clock bytes"),Clock==TArray<uint8>{13});
     }
+    const FString Gameplay=Directory/TEXT("gameplay.vxlog");
+    Simulation.Gameplay={123,125};
+    TestTrue(TEXT("Publish gameplay generation"),VoxelCheckpointStore::Commit(Gameplay,Terrain,Detached,FString(),-1,&Simulation));
+    TestTrue(TEXT("Resolve gameplay generation"),VoxelCheckpointStore::Resolve(Gameplay,Before));
+    TestFalse(TEXT("Gameplay is a required path"),Before.GameplayPath.IsEmpty());
+    for (int32 Stage=0; Stage<10; ++Stage)
+    {
+        TestFalse(TEXT("Interrupted gameplay cannot publish"),VoxelCheckpointStore::Commit(Gameplay,Terrain,Detached,FString(),Stage,&Simulation));
+        TestTrue(TEXT("Resolve interrupted gameplay"),VoxelCheckpointStore::Resolve(Gameplay,Current));
+        TestEqual(TEXT("Gameplay interruption preserves generation"),Current.TerrainPath,Before.TerrainPath);
+    }
+    Simulation.Gameplay.Empty();
+    TestFalse(TEXT("Version two writer cannot drop gameplay"),VoxelCheckpointStore::Commit(Gameplay,Terrain,Detached,FString(),-1,&Simulation));
+    Simulation.Gameplay={123,125};
+    TestTrue(TEXT("Publish next gameplay"),VoxelCheckpointStore::Commit(Gameplay,Terrain,Detached,FString(),-1,&Simulation));
+    TestTrue(TEXT("Resolve next gameplay"),VoxelCheckpointStore::Resolve(Gameplay,Current));
+    TestTrue(TEXT("Damage required gameplay"),IFileManager::Get().Delete(*Current.GameplayPath));
+    TestTrue(TEXT("Recover whole gameplay generation"),VoxelCheckpointStore::Resolve(Gameplay,Recovered));
+    TestEqual(TEXT("Gameplay recovered with terrain"),Recovered.TerrainPath,Before.TerrainPath);
     Simulation.Hydrology.Empty();
     TestFalse(TEXT("Empty domain cannot publish"),VoxelCheckpointStore::Commit(Complete,Terrain,Detached,FString(),-1,&Simulation));
+    const FString LongLogical=Directory/FString::ChrN(80,TCHAR('x'))/FString::ChrN(80,TCHAR('y'))/TEXT("world.vxlog");
+    TestTrue(TEXT("Publish beyond Windows MAX_PATH"),VoxelCheckpointStore::Commit(LongLogical,Terrain,Detached));
+    TestTrue(TEXT("Resolve long-path checkpoint"),VoxelCheckpointStore::Resolve(LongLogical,Current));
+    TestTrue(TEXT("Long-path publication is committed"),Current.bCheckpoint);
     return true;
 }
 #endif

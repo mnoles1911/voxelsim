@@ -12,6 +12,23 @@ An independent unreliable path carries up to 32 motion/removal records per conne
 
 The prototype axe routes strikes through an owned PlayerController RPC. The server validates finite direction, size 1–3, camera proximity to its pawn, a 650 ms cooldown and the shared intent rate budget. Tool entitlement still uses the existing world prototype axe flag: this is not a production server-authoritative inventory system. Terrain networking remains its existing separate protocol.
 
+## Secure harness transport
+
+The automated harness requires the session transport implementation and
+`tools/create-session-transport.py`. It discovers `python` on PATH or accepts
+`-Python <absolute-path-to-python.exe>`. Before launching, it creates two distinct
+invites in its new ignored `Saved/Tests/<run>/private` directory. The server receives
+only the server-key-file path; each client receives its own invite-file path and
+a distinct profile name stable for that run. The connection URL contains only
+the public invite ID as `EncryptionToken`, never a key or persistent credential.
+Invite generation failure aborts the run; there is no plaintext fallback.
+
+Keep the private directory and generated client profile credentials out of source
+control and shared test artifacts. Existing replication assertions and the early,
+ready, and completion barriers remain unchanged. The historical successful run
+below predates this transport adaptation; a new encrypted runtime run is required
+after merging and building the session implementation.
+
 ## Verification
 
 `Voxel.Objects.NetworkAssembly` checks missing, duplicate, overlapping, oversized, cross-object and cross-revision fragments, byte identity and corrupt checksums. The registry test checks permanent tombstones and revision rejection. These unit tests do not substitute for a multi-process UE session.
@@ -25,3 +42,5 @@ The harness asserts stable IDs, geometry revisions, movement, retained late-join
 Verified 2026-09-07 with `-TimeoutSeconds 480 -AllowOtherProjectEditors`: all three processes exited normally, authoritative identity/motion/retention/late-join/deletion agreed, and both client displayed-position errors were zero. Evidence: isolated checkout `Saved/Tests/detached-net-20260907-015619-9198275d/result.json` and its three process logs. This nine-cell transport fixture does not establish large fracture-chain or production ownership synchronization acceptance.
 
 Also verify a real chopped tree/fracture chain, client intent rejection, a client leaving and returning beyond 250 m, packet loss, and a large compressed snapshot before treating this as production multiplayer validation. The fixture is intentionally small and does not measure forest-scale replication performance.
+
+Encrypted integration verification: all three processes exited0 in `Saved/Tests/detached-net-20260907-031142-700ebdab/result.json`. Stable ID `0234303A40D0489CB60BF2BC9C253C73`, live retained geometry, early movement, late join and deletion agreed. Both clients used distinct invites and isolated profiles. All three observed-state barriers were preserved. This remains a nine-cell functional fixture, not a scale or production terrain-ownership benchmark.

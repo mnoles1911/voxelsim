@@ -11,6 +11,7 @@
 class APlayerController;
 class UCameraComponent;
 class UStaticMeshComponent;
+namespace VoxelGameplayActors { struct FAdapter; }
 
 // ============================================================================
 // A BOAT
@@ -162,6 +163,9 @@ public:
 	const UVoxelAssetBodyComponent* GetBody() const { return Body; }
 
 private:
+	friend struct VoxelGameplayActors::FAdapter;
+	FGuid PersistentId=FGuid::NewGuid(), PersistentPilot;
+	bool bCheckpointContent=false;
 	// Hull half-extents in UU, taken from VoxelBoatTuning and then OVERRIDDEN by
 	// the loaded asset's own bounds. A boat whose probes sit outside its own hull
 	// looks like a physics bug and is not one, so the geometry follows the thing

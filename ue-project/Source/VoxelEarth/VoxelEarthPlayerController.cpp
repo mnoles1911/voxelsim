@@ -17,6 +17,11 @@
 #include "VoxelExplosive.h"
 #include "VoxelGlider.h"
 #include "VoxelInventoryComponent.h"
+#include "VoxelSessionCheckpoint.h"
+#include "VoxelPlayerRecords.h"
+#include "Engine/NetConnection.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/GameSession.h"
 #include "VoxelItem.h"
 #include "VoxelThrownItem.h"
 #include "VoxelWaterSubsystem.h"
@@ -175,9 +180,25 @@ void AVoxelEarthPlayerController::OnOverlayActivate()
 	OnOverlayRight();
 }
 
+void AVoxelEarthPlayerController::EndPlay(const EEndPlayReason::Type Reason)
+{
+    if(GetWorld()) GetWorld()->GetTimerManager().ClearTimer(PersistentIdentityTimer);
+    if(HasAuthority()) VoxelPlayerRecords::Disconnect(this);
+    Super::EndPlay(Reason);
+}
+void AVoxelEarthPlayerController::PawnLeavingGame()
+{
+    VoxelPlayerRecords::Disconnect(this);
+    // Disconnect releases a persistent vehicle and destroys only its stored
+    // player pawn. Unreal's default path can destroy an ordinary player pawn.
+    if(GetPawn()) Super::PawnLeavingGame();
+}
+
 void AVoxelEarthPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
+    if(HasAuthority() && GetWorld()) GetWorld()->GetTimerManager().SetTimer(PersistentIdentityTimer,this,&AVoxelEarthPlayerController::BeginPersistentIdentity,0.25f,true);
+    if(!HasAuthority()) { SetIgnoreMoveInput(true); SetIgnoreLookInput(true); }
 
 	UWorld* World = GetWorld();
 	if (!World || !IsLocalController())
@@ -381,6 +402,7 @@ void AVoxelEarthPlayerController::BeginPlay()
 
 bool AVoxelEarthPlayerController::TryConsumeIntentToken(const TCHAR* IntentName)
 {
+    if (!VoxelSessionCheckpoint::Ready(GetWorld()) || !VoxelPlayerRecords::IsBound(this)) return false;
 	// M3 wave 2 "Validation hardening" (docs/m3-plan.md): continuous-refill
 	// token bucket, capacity == voxel.Server.MaxIntentsPerSec. Starts full
 	// (not empty) on first use so a client's very first post-join intent
@@ -535,6 +557,8 @@ void AVoxelEarthPlayerController::ServerSubmitCarveIntent_Implementation(const F
 
 void AVoxelEarthPlayerController::ServerRequestJoinSync_Implementation()
 {
+    if(!VoxelSessionCheckpoint::Ready(GetWorld()) || !VoxelPlayerRecords::IsBound(this)) { bPersistentJoinDeferred=true; return; }
+    bPersistentJoinDeferred=false;
 	UWorld* World = GetWorld();
 	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
 	if (!Subsystem)
@@ -803,7 +827,11 @@ void AVoxelEarthPlayerController::OnUseHotbar5() { UseHotbarSlot(4); }
 
 void AVoxelEarthPlayerController::UseHotbarSlot(int32 SlotIndex)
 {
+    if (!HasAuthority()) { ServerUseHotbarSlot(SlotIndex); return; }
 	UWorld* World = GetWorld();
+    if (!World || !VoxelSessionCheckpoint::Ready(World) || !VoxelPlayerRecords::IsBound(this) || !GetPawn() || !Inventory ||
+        !Inventory->IsInitialized() || SlotIndex<0 || SlotIndex>=Inventory->NumSlots() || World->GetTimeSeconds()<NextHotbarUseSeconds) return;
+    NextHotbarUseSeconds=World->GetTimeSeconds()+0.15;
 	if (!World || !Inventory)
 	{
 		UE_LOG(LogVoxelEarth, Warning,
@@ -895,6 +923,80 @@ void AVoxelEarthPlayerController::UseHotbarSlot(int32 SlotIndex)
 
 	UE_LOG(LogVoxelEarth, Log, TEXT("Hotbar %d: threw '%s' at %.0f UU/s (%d left in slot)."),
 	       SlotIndex + 1, *Def->DisplayName, SpeedUU, Slot.Count - 1);
+}
+
+void AVoxelEarthPlayerController::BeginPersistentIdentity()
+{
+    if(!GetWorld() || !VoxelSessionCheckpoint::Ready(GetWorld())) return;
+    GetWorld()->GetTimerManager().ClearTimer(PersistentIdentityTimer);
+    if(IsLocalController())
+    {
+        if(VoxelPlayerRecords::BindHost(this))
+        {
+            if(!GetPawn()) if(auto Mode=GetWorld()->GetAuthGameMode()) Mode->RestartPlayer(this);
+            VoxelPlayerRecords::ApplyPawn(this);
+        }
+        return;
+    }
+    if(!GetNetConnection() || !GetNetConnection()->IsEncryptionEnabled())
+    {
+        if(auto Mode=GetWorld()->GetAuthGameMode()) if(Mode->GameSession)
+            Mode->GameSession->KickPlayer(this,FText::FromString(TEXT("Persistent player login requires an encrypted connection.")));
+        return;
+    }
+    ClientRequestPersistentIdentity(VoxelSessionCheckpoint::WorldId(GetWorld()));
+    GetWorld()->GetTimerManager().SetTimer(PersistentIdentityTimer,FTimerDelegate::CreateWeakLambda(this,[this]{
+        if(!VoxelPlayerRecords::IsBound(this)) if(auto Mode=GetWorld()->GetAuthGameMode()) if(Mode->GameSession)
+            Mode->GameSession->KickPlayer(this,FText::FromString(TEXT("Persistent player login timed out.")));
+    }),30.0f,false);
+}
+void AVoxelEarthPlayerController::ClientRequestPersistentIdentity_Implementation(FGuid Id)
+{
+    CredentialWorld=Id;
+    if(!VoxelPlayerRecords::ReadCredential(this,Id,CredentialToken))
+    {
+        ClientMessage(TEXT("Cannot read the persistent player profile; login stopped.")); return;
+    }
+    ServerAuthenticatePersistentIdentity(CredentialToken);
+}
+void AVoxelEarthPlayerController::ServerAuthenticatePersistentIdentity_Implementation(const FString& Token)
+{
+    FGuid Id; FString Issued;
+    if(!VoxelPlayerRecords::Authenticate(this,Token,Id,Issued))
+    {
+        if(auto Mode=GetWorld()?GetWorld()->GetAuthGameMode():nullptr) if(Mode->GameSession)
+            Mode->GameSession->KickPlayer(this,FText::FromString(TEXT("Player identity was refused or is already connected.")));
+        return;
+    }
+    ClientStorePersistentIdentity(Id,Issued);
+}
+void AVoxelEarthPlayerController::ClientStorePersistentIdentity_Implementation(FGuid Id,const FString& Token)
+{
+    if(!Token.IsEmpty()) CredentialToken=Token;
+    if(!Id.IsValid() || !VoxelPlayerRecords::WriteCredential(this,CredentialWorld,CredentialToken))
+    {
+        ClientMessage(TEXT("Cannot save the persistent player profile; login stopped.")); return;
+    }
+    ServerConfirmPersistentIdentity(Id);
+    CredentialToken.Reset();
+}
+void AVoxelEarthPlayerController::ServerConfirmPersistentIdentity_Implementation(FGuid Id)
+{
+    if(!VoxelPlayerRecords::Confirm(this,Id)) return;
+    GetWorld()->GetTimerManager().ClearTimer(PersistentIdentityTimer);
+    if(auto Mode=GetWorld()->GetAuthGameMode()) Mode->RestartPlayer(this);
+    VoxelPlayerRecords::ApplyPawn(this);
+    ClientPersistentIdentityReady();
+    if(bPersistentJoinDeferred) ServerRequestJoinSync_Implementation();
+}
+void AVoxelEarthPlayerController::ClientPersistentIdentityReady_Implementation()
+{
+    ResetIgnoreMoveInput(); ResetIgnoreLookInput();
+}
+
+void AVoxelEarthPlayerController::ServerUseHotbarSlot_Implementation(int32 SlotIndex)
+{
+    UseHotbarSlot(SlotIndex);
 }
 
 float AVoxelEarthPlayerController::GetExplosiveChargeAlpha() const

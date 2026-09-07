@@ -577,6 +577,17 @@ struct FVoxelBrickChunkShading
 
 // Game-thread observation only, not a reservation. Re-read or validate at commit.
 // Absence has canonical Slot=INDEX_NONE and AddSequence=0.
+// Opaque, pool-scoped pressure protection. Not a reservation of arena capacity
+// and not a seal against explicit same-key removal/replacement.
+struct FVoxelBrickEvictionPinTicket
+{
+    bool IsValid() const { return PoolNonce.IsValid() && Serial != 0; }
+private:
+    friend class FVoxelBrickPool;
+    FGuid PoolNonce;
+    uint64 Serial = 0;
+};
+
 struct FVoxelBrickAllocationToken
 {
 	bool bPresent=false;
@@ -907,7 +918,12 @@ public:
 	// Reserves the complete batch without eviction, then replaces it in one
 	// Flush. False changes no visible pages. Currently the CPU arena allocator
 	// is required; GPU-allocator reservation needs its own verified batch path.
-	bool PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages);
+	bool PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages,
+        FVoxelBrickEvictionPinTicket Ticket = {});
+    // GT only, bounded to 8192 total unique keys and 16 live tickets. Absent
+    // keys are protected on subsequent insertion. Overlap is refused atomically.
+    FVoxelBrickEvictionPinTicket AcquireEvictionPins(TConstArrayView<FVoxelBrickChunkKey> Keys);
+    bool ReleaseEvictionPins(FVoxelBrickEvictionPinTicket Ticket);
 
 	// --- P1: GPU-side pool allocation (voxel.GPU.PoolAlloc) ------------------
 	//
@@ -1368,6 +1384,10 @@ private:
 	FVoxelGpuGeometryPool MatArena;    // unit: dwords
 
 	TMap<FVoxelBrickChunkKey, FResidentChunk> Resident;
+    FGuid EvictionPinNonce = FGuid::NewGuid(); // Reset rotates the pool epoch.
+    uint64 NextEvictionPinSerial = 0;
+    TMap<FVoxelBrickChunkKey, uint64> EvictionPins;
+    TMap<uint64, TArray<FVoxelBrickChunkKey>> EvictionPinTickets;
 	// Published from the game thread as Resident is mutated, read from the render
 	// thread. See GetResidentChunkCountAtLevel for why a walk was not an option.
 	std::atomic<int32> LevelChunkCounts[kLevelBuckets] = {};
