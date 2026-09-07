@@ -1,10 +1,12 @@
 #include "VoxelTreeFellingPrototype.h"
+#include "VoxelEnvironmentLODPrototype.h"
 #include "Async/Async.h"
 #include "VoxelDebrisLifecycle.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelPackedTimberMesh.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "VoxelWorldSubsystem.h"
+#include "VoxelFineTileStreamer.h"
 #include "VoxelEarth.h"
 #include "Components/BoxComponent.h"
 #include "ProceduralMeshComponent.h"
@@ -33,7 +35,7 @@ struct FTimberStagedRestore {
 };
 
 AVoxelFallingTimber::AVoxelFallingTimber(){
-    PrimaryActorTick.bCanEverTick=true;
+    PrimaryActorTick.bCanEverTick=true;PrimaryActorTick.TickGroup=TG_PrePhysics;
     Cleanup=CreateDefaultSubobject<UVoxelDebrisLifecycle>(TEXT("Cleanup"));
     Cleanup->Configure(EVoxelDebrisLifetime::Substantial);
     Body=CreateDefaultSubobject<UBoxComponent>(TEXT("TimberPhysics"));SetRootComponent(Body);
@@ -49,6 +51,7 @@ AVoxelFallingTimber::AVoxelFallingTimber(){
 }
 void AVoxelFallingTimber::Initialize(const TArray<UProceduralMeshComponent*>& Meshes,const FBox& LocalTrunk,
                                     const FTransform& Source,const FVector& Direction,bool CanBreak){
+    if(StagedRestore||PreparedRestore){CancelStagedObjectRestore();return;}
     GeometrySnapshot.Reset();
     Trunk=LocalTrunk;Breakable=CanBreak;
     SetActorTransform(FTransform(Source.GetRotation(),Source.TransformPosition(Trunk.GetCenter())));
@@ -124,8 +127,37 @@ void AVoxelFallingTimber::Contact(UPrimitiveComponent*,AActor* Other,UPrimitiveC
     const double FractureJ=Size.X*Size.Y*6000.;
     if(Breakable&&ReleaseHinge&&Energy>FractureJ)PendingBreak=true;
 }
+FBox AVoxelFallingTimber::GetGroundSupportBounds() const {
+    if(!Trunk.IsValid)return FBox(GetActorLocation()-FVector(1400),GetActorLocation()+FVector(1400));
+    // The whole trunk can rotate around its stump, or around its mass center
+    // after release. Include a two-second linear lookahead and 4 m guard band.
+    const bool Hinged=StumpHinge||(PreparedRestore&&PreparedRestore->Hinged);
+    const FVector Center=StumpHinge?StumpHinge->GetComponentLocation():PreparedRestore&&PreparedRestore->Hinged?PreparedRestore->HingeTransform.GetLocation():GetActorLocation();
+    const double Radius=(Hinged?Trunk.GetSize().Size():Trunk.GetExtent().Size())+400.;
+    FBox Bounds(Center-FVector(Radius),Center+FVector(Radius));
+    const FVector Velocity=PreparedRestore?PreparedRestore->Linear:GroundPaused?GroundLinear:Body->GetPhysicsLinearVelocity();
+    const FBox Future(Bounds.Min+Velocity*2.,Bounds.Max+Velocity*2.);Bounds+=Future;
+    return Bounds;
+}
+void AVoxelFallingTimber::PauseForGroundSupport(){
+    if(GroundPaused||!Body||StagedRestore||PreparedRestore||ActorHasTag(TEXT("ObjectRestorePending"))||GetNetMode()==NM_Client)return;
+    GroundLinear=Body->GetPhysicsLinearVelocity();GroundAngular=Body->GetPhysicsAngularVelocityInRadians();
+    GroundWasAwake=Body->IsAnyRigidBodyAwake();GroundPaused=true;Body->SetSimulatePhysics(false);
+}
 void AVoxelFallingTimber::Tick(float Dt){
-    Super::Tick(Dt);Age+=Dt;
+    Super::Tick(Dt);
+    if(GetNetMode()!=NM_Client){
+        if(!VoxelTreeFelling::AdvanceRestoreGround(GetWorld(),GetGroundSupportBounds())){
+            PauseForGroundSupport();
+            return;
+        }
+        if(GroundPaused){
+            Body->SetSimulatePhysics(true);
+            if(StumpHinge)StumpHinge->SetConstrainedComponents(Body,NAME_None,nullptr,NAME_None);
+            Body->SetPhysicsLinearVelocity(GroundLinear);Body->SetPhysicsAngularVelocityInRadians(GroundAngular);if(!GroundWasAwake&&!StumpHinge)Body->PutAllRigidBodiesToSleep();GroundPaused=false;
+        }
+    }
+    Age+=Dt;
     LastLinear=Body->GetPhysicsLinearVelocity();LastAngular=Body->GetPhysicsAngularVelocityInRadians();LastCenter=Body->GetCenterOfMass();
     if(ReleaseHinge&&StumpHinge){
         StumpHinge->BreakConstraint();StumpHinge->DestroyComponent();StumpHinge=nullptr;
@@ -138,7 +170,7 @@ void AVoxelFallingTimber::Tick(float Dt){
     if(!StumpHinge&&!ReportedRest&&Age>3&&PreviousSpeed<10){ReportedRest=true;UE_LOG(LogVoxelEarth,Log,TEXT("TreeFelling REST %s age=%.2f tilt=%.1f"),*GetName(),Age,FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(GetActorUpVector().Z,-1.,1.))));}
     // Substantial fragments remain in the world. Chaos can wake them on later
     // contact without needing the prototype's per-frame diagnostic tick.
-    if(!StumpHinge&&!Breakable&&Age>35&&!Body->IsAnyRigidBodyAwake())SetActorTickEnabled(false);
+    // Keep the inexpensive support admission tick: sleeping bodies may wake later.
 }
 void AVoxelFallingTimber::BreakOnImpact(){
     Breakable=false;
@@ -166,13 +198,14 @@ void AVoxelFallingTimber::BreakOnImpact(){
     Visuals.Reset();GeometrySnapshot.Reset();UE_LOG(LogVoxelEarth,Log,TEXT("TreeFelling BREAK %s fragments=2 splitLocalZ=%.1f"),*GetName(),Split);Destroy();
 }
 bool AVoxelFallingTimber::PersistentState(FArchive& Ar){
+    if(StagedRestore||PreparedRestore){if(Ar.IsLoading())CancelStagedObjectRestore();return false;}
     return SerializePersistentState(Ar,false);
 }
 bool AVoxelFallingTimber::SerializePersistentState(FArchive& Ar,bool GeometryOnly){
     using namespace VoxelDetachedPersistence;
     FTransform Transform=GetActorTransform(),HingeTransform=StumpHinge?StumpHinge->GetComponentTransform():FTransform::Identity;
-    FVector Linear=Body->GetPhysicsLinearVelocity(),Angular=Body->GetPhysicsAngularVelocityInRadians();
-    bool Hinged=StumpHinge!=nullptr,Awake=Body->IsAnyRigidBodyAwake();
+    FVector Linear=GroundPaused?GroundLinear:Body->GetPhysicsLinearVelocity(),Angular=GroundPaused?GroundAngular:Body->GetPhysicsAngularVelocityInRadians();
+    bool Hinged=StumpHinge!=nullptr,Awake=GroundPaused?GroundWasAwake:Body->IsAnyRigidBodyAwake();
     auto Lifetime=Cleanup->CaptureState();uint8 Kind=uint8(Lifetime.Kind);
     if(!GeometryOnly)Ar<<Trunk<<Transform<<Linear<<Angular<<Hinged<<HingeTransform<<Awake<<Breakable<<FallHeading<<Age<<Kind<<Lifetime.RemainingSeconds;
     if(Ar.IsError()||!Trunk.IsValid||Trunk.GetSize().GetMin()<=0||Trunk.GetSize().GetMax()>100000||Transform.ContainsNaN()||Linear.ContainsNaN()||Angular.ContainsNaN()||HingeTransform.ContainsNaN()||!FMath::IsFinite(Age)||FallHeading.ContainsNaN()||Kind>3)return false;
@@ -244,8 +277,8 @@ bool AVoxelFallingTimber::RefreshGeometrySnapshot(){
 bool AVoxelFallingTimber::CaptureObjectState(FVoxelImmutableGeometry& Geometry,TArray<uint8>& Dynamic){
     check(IsInGameThread());Geometry.Reset();Dynamic.Reset();if(StagedRestore||PreparedRestore||!GeometrySnapshot)return false;
     FTransform Transform=GetActorTransform(),HingeTransform=StumpHinge?StumpHinge->GetComponentTransform():FTransform::Identity;
-    FVector Linear=Body->GetPhysicsLinearVelocity(),Angular=Body->GetPhysicsAngularVelocityInRadians();
-    bool Hinged=StumpHinge!=nullptr,Awake=Body->IsAnyRigidBodyAwake();
+    FVector Linear=GroundPaused?GroundLinear:Body->GetPhysicsLinearVelocity(),Angular=GroundPaused?GroundAngular:Body->GetPhysicsAngularVelocityInRadians();
+    bool Hinged=StumpHinge!=nullptr,Awake=GroundPaused?GroundWasAwake:Body->IsAnyRigidBodyAwake();
     auto Lifetime=Cleanup->CaptureState();uint8 Kind=uint8(Lifetime.Kind);
     if(Transform.ContainsNaN()||Linear.ContainsNaN()||Angular.ContainsNaN()||HingeTransform.ContainsNaN()||!FMath::IsFinite(Age))return false;
     FMemoryWriter Writer(Dynamic);VoxelObjectGeometrySnapshot::WriteVersion(Writer);
@@ -276,7 +309,7 @@ void AVoxelFallingTimber::BeginStagedObjectRestore(FVoxelImmutableGeometry Geome
         auto Decode=[&](){
             FMemoryReader D(Dynamic),G(*Job->Geometry);uint32 DV=0,GV=0;D<<DV;G<<GV;if(DV!=1||GV!=1)return false;
             uint8 Kind=0;D<<Job->Trunk<<Job->Transform<<Job->Linear<<Job->Angular<<Job->Hinged<<Job->HingeTransform<<Job->Awake<<Job->Breakable<<Job->Heading<<Job->Age<<Kind<<Job->Lifetime.RemainingSeconds;
-            if(D.IsError()||D.Tell()!=D.TotalSize()||!Job->Trunk.IsValid||Job->Trunk.GetSize().GetMin()<=0||Job->Trunk.GetSize().GetMax()>100000||Job->Transform.ContainsNaN()||Job->Linear.ContainsNaN()||Job->Angular.ContainsNaN()||Job->HingeTransform.ContainsNaN()||Job->Heading.ContainsNaN()||!FMath::IsFinite(Job->Age)||!FMath::IsFinite(Job->Lifetime.RemainingSeconds)||Kind>3)return false;
+            if(D.IsError()||D.Tell()!=D.TotalSize()||!Job->Trunk.IsValid||Job->Trunk.Min.ContainsNaN()||Job->Trunk.Max.ContainsNaN()||Job->Trunk.GetSize().GetMin()<=0||Job->Trunk.GetSize().GetMax()>100000||Job->Transform.ContainsNaN()||Job->Linear.ContainsNaN()||Job->Angular.ContainsNaN()||Job->HingeTransform.ContainsNaN()||Job->Heading.ContainsNaN()||!FMath::IsFinite(Job->Age)||!FMath::IsFinite(Job->Lifetime.RemainingSeconds)||Kind>3)return false;
             Job->Lifetime.Kind=EVoxelDebrisLifetime(Kind);
             int32 Count=0;G<<Count;if(G.IsError()||Count<1||Count>4096)return false;
             Job->Sections.Reserve(Count);
@@ -357,38 +390,151 @@ void AVoxelStoneAxePrototype::Tick(float Dt){
     }
 }
 namespace VoxelTreeFelling {
+namespace {
+struct FGroundRestore {
+    TWeakObjectPtr<AActor> Actor;
+    FVector Center;
+    TArray<FVector> Vertices;
+    int32 Tile=0,NextTile=0;
+    TSet<int32> DirtyTiles;
+    TArray<TWeakObjectPtr<UProceduralMeshComponent>> Sections;
+    bool Ready=false;
+    int32 TilesX=10,TilesY=10;
+};
+TMap<TWeakObjectPtr<UWorld>,TArray<TSharedPtr<FGroundRestore>>> GroundRestores;
+TMap<TWeakObjectPtr<UWorld>,uint64> GroundFrames;
+struct FGroundRestoreLifetime {
+    FDelegateHandle Handle;
+    FGroundRestoreLifetime(){Handle=FWorldDelegates::OnWorldBeginTearDown.AddLambda([](UWorld* W){GroundRestores.Remove(W);GroundFrames.Remove(W);});}
+    ~FGroundRestoreLifetime(){FWorldDelegates::OnWorldBeginTearDown.Remove(Handle);}
+} GroundRestoreLifetime;
+bool CanReclaimGround(UWorld* W,const FGroundRestore& Ground,const FVector& Requested){
+    const auto Near=[&](const FVector& P,double Radius){return FMath::Square(P.X-Ground.Center.X)+FMath::Square(P.Y-Ground.Center.Y)<=Radius*Radius;};
+    if(Near(Requested,6400.))return false;
+    for(auto It=W->GetPlayerControllerIterator();It;++It)if(auto PC=It->Get()){
+        FVector Eye;FRotator Rotation;PC->GetPlayerViewPoint(Eye,Rotation);if(Near(Eye,10000.))return false;
+    }
+    for(TActorIterator<AVoxelEnvironmentLODPrototype> It(W);It;++It)
+        if((It->IsFellable()||It->ActorHasTag(TEXT("ObjectRestorePending")))&&Near(It->GetActorLocation(),3500.))return false;
+    const FBox Proxy(Ground.Center-FVector(Ground.TilesX*160.,Ground.TilesY*160.,0),Ground.Center+FVector(Ground.TilesX*160.,Ground.TilesY*160.,0));
+    for(TActorIterator<AVoxelFallingTimber> It(W);It;++It){
+        FBox B=It->GetGroundSupportBounds();
+        if(It->ActorHasTag(TEXT("ObjectRestorePending"))){
+            // The bridge assigns the entry transform before worker dispatch.
+            // A placeholder box does not yet include the future whole trunk.
+            const FVector P=It->GetActorLocation();B+=P-FVector(1400);B+=P+FVector(1400);
+        }
+        if(B.IsValid&&B.Min.X<=Proxy.Max.X&&B.Max.X>=Proxy.Min.X&&B.Min.Y<=Proxy.Max.Y&&B.Max.Y>=Proxy.Min.Y)return false;
+    }
+    return true;
+}
+}
+void EnsureAxe(UWorld* W){
+    if(!W)return;for(TActorIterator<AVoxelStoneAxePrototype> It(W);It;++It)return;
+    auto Axe=W->SpawnActor<AVoxelStoneAxePrototype>();if(Axe&&!Axe->Initialize())Axe->Destroy();
+}
+bool AdvanceRestoreGround(UWorld* W,const FVector& Location){return AdvanceRestoreGround(W,FBox(Location-FVector(200),Location+FVector(200)));}
+bool AdvanceRestoreGround(UWorld* W,const FBox& Bounds){
+    if(!Bounds.IsValid||Bounds.Min.ContainsNaN()||Bounds.Max.ContainsNaN()||Bounds.GetSize().GetMax()>1000000.)return false;const FVector Location=Bounds.GetCenter();
+    const int32 TilesX=FMath::Max(1,FMath::CeilToInt(Bounds.GetSize().X/320.)+1),TilesY=FMath::Max(1,FMath::CeilToInt(Bounds.GetSize().Y/320.)+1);
+    if(int64(TilesX)*TilesY>16384)return false;
+    check(IsInGameThread());if(!W||W->bIsTearingDown||Location.ContainsNaN())return false;
+    if(W->GetNetMode()==NM_Client)return true;
+    auto& Jobs=GroundRestores.FindOrAdd(W);TSharedPtr<FGroundRestore> Job;
+    // Reuse only when the complete requested footprint is covered.
+    for(auto Candidate:Jobs)if(Candidate->Actor.IsValid()&&Bounds.Min.X>=Candidate->Center.X-Candidate->TilesX*160.&&Bounds.Max.X<=Candidate->Center.X+Candidate->TilesX*160.&&Bounds.Min.Y>=Candidate->Center.Y-Candidate->TilesY*160.&&Bounds.Max.Y<=Candidate->Center.Y+Candidate->TilesY*160.){Job=Candidate;break;}
+    if(!Job){
+        for(TActorIterator<AActor> It(W);It;++It)if(It->ActorHasTag(TEXT("TreeFellingGround"))&&!It->ActorHasTag(TEXT("GroundRestorePartial"))){
+            const FBox B=It->GetComponentsBoundingBox(true);
+            if(B.IsValid&&B.Min.X<=Bounds.Min.X&&B.Max.X>=Bounds.Max.X&&B.Min.Y<=Bounds.Min.Y&&B.Max.Y>=Bounds.Max.Y)return true;
+        }
+        Jobs.RemoveAll([](const TSharedPtr<FGroundRestore>& Existing){return !Existing->Actor.IsValid();});
+        int64 ReservedTiles=int64(TilesX)*TilesY;for(const auto& Existing:Jobs)ReservedTiles+=int64(Existing->TilesX)*Existing->TilesY;
+        if(Jobs.Num()>=32||ReservedTiles>16384){
+            int32 Reclaim=INDEX_NONE;double Furthest=-1;
+            for(int I=0;I<Jobs.Num();++I)if(CanReclaimGround(W,*Jobs[I],Location)){
+                const double Distance=FMath::Square(Jobs[I]->Center.X-Location.X)+FMath::Square(Jobs[I]->Center.Y-Location.Y);
+                if(Distance>Furthest){Furthest=Distance;Reclaim=I;}
+            }
+            // At most one proxy teardown in this call. Admission resumes on
+            // the next step. If the footprint/section budget is occupied, defer safely.
+            if(Reclaim!=INDEX_NONE){auto Old=Jobs[Reclaim]->Actor.Get();Jobs.RemoveAtSwap(Reclaim);if(Old)Old->Destroy();}
+            return false;
+        }
+        if(!W->GetSubsystem<UVoxelWorldSubsystem>())return false;
+        auto Settings=UPhysicsSettings::Get();Settings->bSubstepping=true;Settings->MaxSubstepDeltaTime=1.f/120.f;Settings->MaxSubsteps=16;
+        Job=MakeShared<FGroundRestore>();Job->TilesX=TilesX;Job->TilesY=TilesY;Job->Sections.SetNum(TilesX*TilesY);Job->Center=FVector(FMath::GridSnap(Location.X,10.),FMath::GridSnap(Location.Y,10.),Location.Z);
+        auto A=W->SpawnActor<AActor>();if(!A)return false;Job->Actor=A;A->Tags.Add(TEXT("TreeFellingGround"));A->Tags.Add(TEXT("GroundRestorePartial"));
+        auto Root=NewObject<USceneComponent>(A);A->SetRootComponent(Root);A->SetActorLocation(Job->Center);Root->SetMobility(EComponentMobility::Static);Root->RegisterComponent();Jobs.Add(Job);
+    }
+    if(Job->Ready)return true;
+    auto A=Job->Actor.Get();auto Sub=W->GetSubsystem<UVoxelWorldSubsystem>();if(!A||!Sub)return false;
+    // Global per-world frame gate includes publication jobs and moving bodies.
+    constexpr int32 TileCells=16,Side=17;constexpr double Step=20.;
+    const int32 TileCount=Job->TilesX*Job->TilesY;
+    if(Job->Vertices.IsEmpty())Job->Tile=Job->DirtyTiles.Num()?*Job->DirtyTiles.CreateConstIterator():Job->NextTile;
+    if(Job->Tile>=TileCount){Job->Ready=true;return true;}
+    const double TileMinX=Job->Center.X-Job->TilesX*160.+(Job->Tile/Job->TilesY)*320.;
+    const double TileMinY=Job->Center.Y-Job->TilesY*160.+(Job->Tile%Job->TilesY)*320.;
+    auto Streamer=Sub->GetFineTileStreamer();
+    if(!Streamer||!Streamer->IsFootprintResident(FMath::FloorToInt64(TileMinX*10),FMath::FloorToInt64(TileMinY*10),
+        FMath::CeilToInt64((TileMinX+320)*10)+1,FMath::CeilToInt64((TileMinY+320)*10)+1))return false;
+    if(const auto F=GroundFrames.Find(W);F&&*F==GFrameCounter)return false;
+    GroundFrames.Add(W,GFrameCounter);
+    const double Start=FPlatformTime::Seconds();int32 Samples=0;
+    // Residency was checked above; no fine-tier loading is initiated here.
+    while(Job->Vertices.Num()<Side*Side&&Samples<64&&FPlatformTime::Seconds()-Start<.001){
+        const int32 I=Job->Vertices.Num(),X=I/Side,Y=I%Side;
+        const double WX=TileMinX+X*Step,WY=TileMinY+Y*Step;
+        double Z=Sub->GetSurfaceHeightUU(WX,WY);FVector Hit,Previous;
+        if(Sub->RaycastVoxelWorld(FVector(WX,WY,Z+200),FVector(0,0,-1),500,Hit,Previous))Z=Hit.Z+5;
+        Job->Vertices.Add(FVector(WX-Job->Center.X,WY-Job->Center.Y,Z-Job->Center.Z));++Samples;
+    }
+    if(Job->Vertices.Num()==Side*Side){
+        TArray<int32> Indices;Indices.Reserve(TileCells*TileCells*6);
+        for(int X=0;X<TileCells;++X)for(int Y=0;Y<TileCells;++Y){const int I=X*Side+Y,J=I+Side;Indices.Append({I,I+1,J,I+1,J+1,J});}
+        // One PMC per tile avoids re-cooking all previous sections each time.
+        auto Mesh=Job->Sections[Job->Tile].Get();
+        if(!Mesh){Mesh=NewObject<UProceduralMeshComponent>(A);Mesh->SetupAttachment(A->GetRootComponent());Mesh->SetMobility(EComponentMobility::Static);Mesh->bUseComplexAsSimpleCollision=true;
+            Mesh->SetCollisionObjectType(ECC_WorldStatic);Mesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);Mesh->SetCollisionResponseToAllChannels(ECR_Block);Mesh->SetVisibility(false);Mesh->RegisterComponent();Job->Sections[Job->Tile]=Mesh;}
+        Mesh->CreateMeshSection(0,Job->Vertices,Indices,TArray<FVector>(),TArray<FVector2D>(),TArray<FColor>(),TArray<FProcMeshTangent>(),true);
+        Job->Vertices.Reset();Job->DirtyTiles.Remove(Job->Tile);if(Job->Tile==Job->NextTile)++Job->NextTile;
+        if(Job->NextTile==TileCount&&Job->DirtyTiles.IsEmpty()){Job->Ready=true;A->Tags.Remove(TEXT("GroundRestorePartial"));UE_LOG(LogVoxelEarth,Log,TEXT("ObjectRestore GROUND_READY tiles=%d samplingMm=200 center=%s"),TileCount,*Job->Center.ToCompactString());}
+    }
+    return Job->Ready;
+}
+void NotifyTerrainEdited(UWorld* W,const FBox& Bounds){
+    check(IsInGameThread());if(!W||!Bounds.IsValid||Bounds.Min.ContainsNaN()||Bounds.Max.ContainsNaN())return;
+    auto Jobs=GroundRestores.Find(W);if(!Jobs)return;bool Changed=false;
+    for(auto& Job:*Jobs){
+        if(!Job->Actor.IsValid())continue;
+        const double X0=Job->Center.X-Job->TilesX*160.,Y0=Job->Center.Y-Job->TilesY*160.;
+        // Include a sampling-cell halo: an edited boundary vertex influences
+        // triangles on both sides, including the adjacent collision section.
+        if(Bounds.Max.X+20<X0||Bounds.Min.X-20>X0+Job->TilesX*320.||Bounds.Max.Y+20<Y0||Bounds.Min.Y-20>Y0+Job->TilesY*320.)continue;
+        const int MinX=FMath::Clamp(FMath::FloorToInt((Bounds.Min.X-20-X0)/320.),0,Job->TilesX-1);
+        const int MaxX=FMath::Clamp(FMath::FloorToInt((Bounds.Max.X+20-X0)/320.),0,Job->TilesX-1);
+        const int MinY=FMath::Clamp(FMath::FloorToInt((Bounds.Min.Y-20-Y0)/320.),0,Job->TilesY-1);
+        const int MaxY=FMath::Clamp(FMath::FloorToInt((Bounds.Max.Y+20-Y0)/320.),0,Job->TilesY-1);
+        for(int X=MinX;X<=MaxX;++X)for(int Y=MinY;Y<=MaxY;++Y){
+            const int Index=X*Job->TilesY+Y;
+            // Unbuilt sections already sample the new terrain when reached.
+            if(Index<Job->NextTile)Job->DirtyTiles.Add(Index);
+            if(Index==Job->Tile)Job->Vertices.Reset();
+        }
+        Job->Ready=false;Job->Actor->Tags.AddUnique(TEXT("GroundRestorePartial"));Changed=true;
+    }
+    if(Changed)for(TActorIterator<AVoxelFallingTimber> It(W);It;++It){
+        const FBox B=It->GetGroundSupportBounds();
+        if(B.Min.X<=Bounds.Max.X+20&&B.Max.X>=Bounds.Min.X-20&&B.Min.Y<=Bounds.Max.Y+20&&B.Max.Y>=Bounds.Min.Y-20)It->PauseForGroundSupport();
+    }
+}
 bool IsEquipped(UWorld* W){if(!W)return false;for(TActorIterator<AVoxelStoneAxePrototype> It(W);It;++It)if(It->Equipped)return true;return false;}
 bool TrySwing(UWorld* W){for(TActorIterator<AVoxelStoneAxePrototype> It(W);It;++It)if(It->Equipped)return It->Swing();return false;}
-void PrepareGround(UWorld* W,const FVector& Location){
-    if(!W||W->GetNetMode()==NM_Client)return;
-    for(TActorIterator<AActor> It(W);It;++It)if(It->ActorHasTag(TEXT("TreeFellingGround"))&&FVector::DistSquared(It->GetActorLocation(),Location)<FMath::Square(800.))return;
-    auto Sub=W->GetSubsystem<UVoxelWorldSubsystem>();if(!Sub)return;
-    auto Settings=UPhysicsSettings::Get();Settings->bSubstepping=true;Settings->MaxSubstepDeltaTime=1.f/120.f;Settings->MaxSubsteps=16;
-    // Local collision bridge for this physics experiment. The production
-    // terrain remains voxel-query-only. 20 cm sampling follows actual top cells.
-    auto Ground=W->SpawnActor<AActor>();Ground->Tags.Add(TEXT("TreeFellingGround"));
-    auto Mesh=NewObject<UProceduralMeshComponent>(Ground);Ground->SetRootComponent(Mesh);Ground->SetActorLocation(Location);
-    Mesh->SetMobility(EComponentMobility::Static);Mesh->bUseComplexAsSimpleCollision=true;
-    Mesh->SetCollisionObjectType(ECC_WorldStatic);Mesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-    Mesh->SetCollisionResponseToAllChannels(ECR_Block);Mesh->SetVisibility(false);Mesh->RegisterComponent();
-    constexpr int N=160;constexpr double Step=20.;
-    TArray<FVector> Vertices;TArray<int32> Indices;
-    for(int X=0;X<=N;++X)for(int Y=0;Y<=N;++Y){
-        const double WX=Location.X+(X-N/2)*Step,WY=Location.Y+(Y-N/2)*Step;
-        double Z=Sub->GetSurfaceHeightUU(WX,WY);FVector Hit,Prev;
-        if(Sub->RaycastVoxelWorld(FVector(WX,WY,Z+200),FVector(0,0,-1),500,Hit,Prev))Z=Hit.Z+5;
-        Vertices.Add(FVector(WX-Location.X,WY-Location.Y,Z-Location.Z));
-    }
-    // PMC's collision provider flips normals: use Unreal's clockwise top-face
-    // winding, matching the visible voxel mesher, so the surface blocks above.
-    for(int X=0;X<N;++X)for(int Y=0;Y<N;++Y){const int A=X*(N+1)+Y,B=A+N+1;Indices.Append({A,A+1,B,A+1,B+1,B});}
-    Mesh->CreateMeshSection(0,Vertices,Indices,TArray<FVector>(),TArray<FVector2D>(),TArray<FColor>(),TArray<FProcMeshTangent>(),true);
-    UE_LOG(LogVoxelEarth,Log,TEXT("TreeFelling GROUND vertices=%d triangles=%d widthM=32 samplingMm=200"),Vertices.Num(),Indices.Num()/3);
-}
+void PrepareGround(UWorld* W,const FVector& Location){AdvanceRestoreGround(W,Location);}
 void Prepare(UWorld* W,const FVector& Location){
     if(!W)return;PrepareGround(W,Location);
-    for(TActorIterator<AVoxelStoneAxePrototype> It(W);It;++It)return;
-    auto Axe=W->SpawnActor<AVoxelStoneAxePrototype>();if(!Axe->Initialize())Axe->Destroy();
+    EnsureAxe(W);
 }
 void Reset(UWorld* W){for(TActorIterator<AVoxelFallingTimber> It(W);It;++It)It->Destroy();}
 }

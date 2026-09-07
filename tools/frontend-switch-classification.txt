@@ -33,31 +33,6 @@
 # leading dash and without a trailing '='.
 
 VoxelAdmissionBandSkip
-VoxelAmortizeOuterScans
-VoxelApplyColumnCacheWays
-VoxelBathyOcean
-VoxelBrickUploadCoalesce
-VoxelClipmapAlbedoSrgb
-VoxelClipmapVertexAlbedo
-VoxelClipmapVoxelize
-VoxelEnvironmentLOD
-VoxelEnvironmentLODKeepOpen
-VoxelEnvironmentLODValidate
-VoxelForceInternal
-VoxelForceRes
-VoxelGpuRasterAtlasDemandPagesPerTick
-VoxelGpuRasterAtlasFillSafety
-VoxelRenderFrameFakeFamilies
-VoxelSyntheticTerrain
-VoxelTickBudgetMaxDefer
-VoxelTickBudgetMs
-VoxelTickBudgetReserveMs
-VoxelTreeFelling
-VoxelWaterDepthAuthority
-VoxelWaterFoamGain
-VoxelWaterMatScalar
-VoxelWaterShoreClip
-VoxelWaveTessM
 VoxelAssetDir
 VoxelBuriedSkip
 VoxelCameraHigh
@@ -397,6 +372,44 @@ VoxelRenderFrame
 VoxelRenderFrameMutate
 VoxelRenderFrameMutateMs
 
+# --- 2026-08-24: the streaming tick per-frame work budget -------------------
+# ue-project/Source/VoxelEarth/VoxelTickBudget.h. Defers whole stages at their
+# existing loop boundaries so a burst becomes several ordinary frames instead
+# of one long one. Tuning: they change how much of a frame the streaming tick
+# may spend, and none of them drives, poses or ends a run. 0 = off = the
+# shipped behaviour byte for byte.
+VoxelTickBudgetMs
+VoxelTickBudgetMaxDefer
+VoxelTickBudgetReserveMs
+
+# --- 2026-09-07: source-reviewed environment, renderer and streaming flags ---
+# Cache sizing, scheduling, rendering/material overrides and fixture inputs.
+# None independently drives a camera, capture sequence or timed exit.
+VoxelAmortizeOuterScans
+VoxelApplyColumnCacheWays
+VoxelBathyOcean
+VoxelBrickUploadCoalesce
+VoxelClipmapAlbedoSrgb
+VoxelClipmapVertexAlbedo
+VoxelClipmapVoxelize
+VoxelForceInternal
+VoxelForceRes
+VoxelGpuRasterAtlasDemandPagesPerTick
+VoxelGpuRasterAtlasFillSafety
+VoxelRenderFrameFakeFamilies
+VoxelSyntheticTerrain
+VoxelWaterDepthAuthority
+VoxelWaterFoamGain
+VoxelWaterMatScalar
+VoxelWaterShoreClip
+VoxelWaveTessM
+# Interactive prototype opt-ins; capture drivers are runtime policy extras.
+# Validate adds assertions after edits; KeepOpen only changes capture completion.
+VoxelEnvironmentLOD
+VoxelEnvironmentLODKeepOpen
+VoxelEnvironmentLODValidate
+VoxelTreeFelling
+
 ## SUBSTRING-MATCHED -- ACKNOWLEDGED
 #
 # Everything below is a switch whose NAME contains one of rule 5's substrings,
@@ -467,13 +480,6 @@ VoxelPerfShotMaxCount = Parameter of a self-driving fixture; only meaningful whe
 VoxelPerfShotName = Parameter of a self-driving fixture; only meaningful when -VoxelPerfShotEveryM= is also present, so suppressing the menu is correct.
 VoxelPerfShotStartM = Parameter of a self-driving fixture; only meaningful when -VoxelPerfShotEveryM= is also present, so suppressing the menu is correct.
 VoxelReadyProbeLog = ACCIDENTAL ('Probe'). Enables a readiness log line; a diagnostic, not a run that drives itself.
-VoxelAsyncRestoreProbe = Restore fixture: selects the async verification save during an unattended restore run.
-VoxelDetachedRestoreProbe = Restore fixture: loads the detached snapshot and verifies restored objects on a timer.
-VoxelObjectsNetVerify = Multiplayer fixture: observes object motion, retention and deletion at fixed times, then exits.
-VoxelDumpIndexKeys = ACCIDENTAL ('Dump'). Logs resident index keys during normal streaming without driving or ending the run.
-VoxelSkyMarkVerify = ACCIDENTAL ('Verify'). Samples generated terrain during normal streaming to validate sky marks.
-VoxelSkyMarkVerifyGrid = ACCIDENTAL ('Verify'). Configures the sample grid of the streaming sky-mark diagnostic.
-VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'). Configures the sampling stride of the streaming sky-mark diagnostic.
 VoxelReplicationSelfTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelSaveWorldAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
 VoxelScreenshotAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
@@ -506,12 +512,12 @@ VoxelWaterPersistTest = Fixture: drives the run and exits on its own; the naming
 VoxelWaterWakeTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelWindingCheck = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 
-# --- 2026-08-24: the streaming tick per-frame work budget -------------------
-# ue-project/Source/VoxelEarth/VoxelTickBudget.h. Defers whole stages at their
-# existing loop boundaries so a burst becomes several ordinary frames instead
-# of one long one. Tuning: they change how much of a frame the streaming tick
-# may spend, and none of them drives, poses or ends a run. 0 = off = the
-# shipped behaviour byte for byte.
-VoxelTickBudgetMs
-VoxelTickBudgetMaxDefer
-VoxelTickBudgetReserveMs
+
+# --- 2026-09-07: restoration/network fixtures and passive diagnostics ---
+VoxelAsyncRestoreProbe = Restore fixture input: selects the async-save verification snapshot for the detached restart probe.
+VoxelDetachedRestoreProbe = Fixture: checks restored timber, plants and resources on a timer, reports and exits.
+VoxelObjectsNetVerify = Fixture: spawns server test objects, observes client replication at checkpoints and exits on a timer.
+VoxelDumpIndexKeys = ACCIDENTAL ('Dump'): passive resident index-key logging inside MaybeLogCounters; does not drive or end a run.
+VoxelSkyMarkVerify = ACCIDENTAL ('Verify'): runtime sky-band correctness sampling during normal streaming; does not drive or end a run.
+VoxelSkyMarkVerifyGrid = ACCIDENTAL ('Verify'): sample-grid size for the passive sky-band correctness check.
+VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive sky-band correctness check.

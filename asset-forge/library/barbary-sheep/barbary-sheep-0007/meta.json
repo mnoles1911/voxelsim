@@ -1,0 +1,52 @@
+{
+  "id": "barbary-sheep-0007",
+  "species": "barbary-sheep",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "5791162262836999",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "5791162262836999",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.95,
+    "length_m": 1.25,
+    "footprint_m": [
+      1.25,
+      0.53
+    ],
+    "grid_mb": 0.7,
+    "extent_vox": [
+      100,
+      42,
+      76
+    ],
+    "vox_models_needed": 1,
+    "voxels": 44325,
+    "by_material": {
+      "26": 20,
+      "30": 2321,
+      "36": 6571,
+      "39": 35413
+    },
+    "ground_contact": 6,
+    "ms_grow": 2.3,
+    "ms_raster": 72.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 84.0
+  },
+  "problems": [],
+  "vox_models": 1
+}

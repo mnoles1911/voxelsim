@@ -39,7 +39,7 @@ bool CaptureObject(VoxelObjects::FEntry& E) {
     return true;
 }
 AActor* RestoreObject(UWorld* W,const VoxelObjects::FEntry& E) {
-    if(!W||!E.Geometry||E.Kind<1||E.Kind>3)return nullptr;
+    if(!W||!E.Geometry||E.Kind<1||E.Kind>3||(E.Kind==3&&!VoxelEnvironmentAsset::IsSupportedTransform(E.Transform)))return nullptr;
     AActor* A=E.Kind==1?static_cast<AActor*>(W->SpawnActor<AVoxelDebris>()):E.Kind==2?static_cast<AActor*>(W->SpawnActor<AVoxelFallingTimber>()):static_cast<AActor*>(W->SpawnActor<AVoxelEnvironmentLODPrototype>());
     if(!A)return nullptr;bool Ok=false;
     if(E.GeometryFormat==1){
@@ -61,7 +61,7 @@ AActor* RestoreObject(UWorld* W,const VoxelObjects::FEntry& E) {
         else if(Body->IsSimulatingPhysics()){Body->SetPhysicsLinearVelocity(E.Velocity);Body->SetPhysicsAngularVelocityInRadians(E.AngularVelocity);}
     }
     if(W->GetNetMode()==NM_Client&&!A->IsA<AVoxelEnvironmentLODPrototype>())A->SetActorTickEnabled(false);
-    if(auto P=Cast<AVoxelEnvironmentLODPrototype>(A))if(P->AssetName==TEXT("temperate-oak")&&!VoxelTreeFelling::IsEquipped(W))VoxelTreeFelling::Prepare(W,P->GetActorLocation());
+    if(auto P=Cast<AVoxelEnvironmentLODPrototype>(A))if(P->IsFellable()&&!VoxelTreeFelling::IsEquipped(W))VoxelTreeFelling::Prepare(W,P->GetActorLocation());
     return A;
 }
 void RefreshObjects(UWorld* W) {
@@ -109,6 +109,7 @@ bool DecodeSnapshot(const TArray<uint8>& Payload,FSnapshot& Out) {
         Ar<<E.Id<<E.Revision<<E.GeometryRevision<<E.Kind<<State<<E.Transform<<E.Velocity<<E.AngularVelocity<<E.BoundsExtent
           <<Life<<E.Lifetime.RemainingSeconds<<E.OwnerId<<E.bRetained<<E.bActivePhysics<<E.GeometryFormat;
         if(!E.Id.IsValid()||Seen.Contains(E.Id)||!E.Revision||E.Kind<1||E.Kind>3||State>uint8(VoxelObjects::EResidency::Tombstone)||Life>3||E.GeometryFormat>1||!E.Transform.IsValid()||E.Velocity.ContainsNaN()||E.AngularVelocity.ContainsNaN()||E.BoundsExtent.ContainsNaN()||!FMath::IsFinite(E.Lifetime.RemainingSeconds)||E.Lifetime.RemainingSeconds<0)return false;
+        if(E.Kind==3&&!VoxelEnvironmentAsset::IsSupportedTransform(E.Transform))return false;
         Seen.Add(E.Id);E.Lifetime.Kind=EVoxelDebrisLifetime(Life);E.Residency=State==uint8(VoxelObjects::EResidency::Tombstone)?VoxelObjects::EResidency::Tombstone:VoxelObjects::EResidency::Dormant;
         TArray<uint8> Geometry;if(!Bytes(Ar,E.Dynamic,1024*1024)||!Bytes(Ar,Geometry,Limit))return false;
         if(E.Residency!=VoxelObjects::EResidency::Tombstone&&Geometry.IsEmpty())return false;
@@ -136,18 +137,21 @@ struct FDriver {
             auto W=Context.World();if(!W||!W->IsGameWorld()||W->bIsTearingDown||W->GetNetMode()==NM_Client||W->IsPaused())continue;
             double& Last=Samples.FindOrAdd(W,W->GetTimeSeconds());const double Delta=W->GetTimeSeconds()-Last;if(Delta<.1)continue;Last=W->GetTimeSeconds();
             RefreshObjects(W);TArray<VoxelObjects::FView> Views;
-            for(auto It=W->GetPlayerControllerIterator();It;++It)if(auto PC=It->Get()){FVector P;FRotator R;PC->GetPlayerViewPoint(P,R);Views.Add({P,R.Vector()});}
+            for(auto It=W->GetPlayerControllerIterator();It;++It)if(auto PC=It->Get()){FVector P;FRotator ViewRotation;PC->GetPlayerViewPoint(P,ViewRotation);Views.Add({P,ViewRotation.Vector()});}
             VoxelObjects::FCallbacks C;C.Capture=&CaptureObject;C.BeginRestore=[W](const auto& E){
                 const FGuid Id=E.Id;const uint64 GeometryRevision=E.GeometryRevision;
                 return BeginRestoreObject(W,E,[W,Id,GeometryRevision](AActor* A){
                     auto R=VoxelObjects::Find(W);auto Current=R?R->Find(Id):nullptr;
                     if(!A){if(R)R->CancelRestore(Id);return false;}
                     if(!Current||Current->Residency!=VoxelObjects::EResidency::Restoring||Current->GeometryRevision!=GeometryRevision)return false;
-                    if(!PublishRestoredObject(A,*Current))return false;
+                    if(!PublishRestoredObject(A,*Current)){R->CancelRestore(Id);return false;}
                     return R->CompleteRestore(Id,GeometryRevision,A);
                 },[W,Id,GeometryRevision](){
                     auto R=VoxelObjects::Find(W);auto E=R?R->Find(Id):nullptr;
-                    return E&&E->Residency==VoxelObjects::EResidency::Restoring&&E->GeometryRevision==GeometryRevision;
+                    if(!E||E->Residency!=VoxelObjects::EResidency::Restoring||E->GeometryRevision!=GeometryRevision)return false;
+                    TArray<VoxelObjects::FView> Views;
+                    for(auto It=W->GetPlayerControllerIterator();It;++It)if(auto PC=It->Get()){FVector P;FRotator ViewRotation;PC->GetPlayerViewPoint(P,ViewRotation);Views.Add({P,ViewRotation.Vector()});}
+                    return !VoxelObjects::FRegistry::ShouldEvict(*E,Views,20000.);
                 })!=0;
             };C.Evict=[](AActor* A){A->Destroy();};
             auto Result=VoxelObjects::Get(W).Tick(Views,Delta,C);

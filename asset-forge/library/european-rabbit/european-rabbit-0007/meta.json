@@ -1,0 +1,51 @@
+{
+  "id": "european-rabbit-0007",
+  "species": "european-rabbit",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "26c6ae083affd8dc",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "26c6ae083affd8dc",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.21,
+    "length_m": 0.388,
+    "footprint_m": [
+      0.39,
+      0.09
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      31,
+      7,
+      17
+    ],
+    "vox_models_needed": 1,
+    "voxels": 1002,
+    "by_material": {
+      "26": 3,
+      "36": 187,
+      "39": 812
+    },
+    "ground_contact": 12,
+    "ms_grow": 2.0,
+    "ms_raster": 6.3,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 9.0
+  },
+  "problems": [],
+  "vox_models": 1
+}

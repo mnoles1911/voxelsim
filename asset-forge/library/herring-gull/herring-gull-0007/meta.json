@@ -1,0 +1,52 @@
+{
+  "id": "herring-gull-0007",
+  "species": "herring-gull",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "b2a411629fb73069",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "b2a411629fb73069",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.19,
+    "length_m": 0.638,
+    "footprint_m": [
+      0.64,
+      1.54
+    ],
+    "grid_mb": 0.2,
+    "extent_vox": [
+      51,
+      123,
+      15
+    ],
+    "vox_models_needed": 1,
+    "voxels": 6982,
+    "by_material": {
+      "26": 618,
+      "31": 6,
+      "36": 1446,
+      "37": 4912
+    },
+    "ground_contact": 27,
+    "ms_grow": 2.0,
+    "ms_raster": 17.8,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 22.7
+  },
+  "problems": [],
+  "vox_models": 1
+}

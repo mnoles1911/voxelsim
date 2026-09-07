@@ -32,13 +32,13 @@ Usage:
     python tools/buildcheck.py --kind rock        # rocks only
     python tools/buildcheck.py --skip-heavy       # leave out the four big heroes
     python tools/buildcheck.py --only-heavy       # just those four
-    python tools/buildcheck.py --only-heavy --res 20   # ... on a coarser lattice
+    python tools/buildcheck.py --only-heavy --res 10   # explicit supported 100 mm
     python tools/buildcheck.py --no-allow         # ignore the known-failure list
 
-The whole library at seed 1 and authored resolution is about half an hour, and
-`hero-arch-colossal` alone is 12 minutes of it (40M voxels, a measured 24 GB
-peak). That is why `--skip-heavy` / `--only-heavy` exist and why CI runs the
-heavy four at 20 cm; see `forge.cli.HEAVY_SPECS`.
+Large assets are validated at their authored supported pitch. CI separates the
+heavy four so their build time and peak memory are visible. The old 200 mm
+diagnostic override is no longer supported; it is outside the binary lattice
+policy. Rock generation releases large temporary arrays after their last use.
 
 `--no-allow` is how a fix gets verified and how the true count is read at any
 time: the allow-list in `forge/cli.py` keeps CI green on defects that are
@@ -80,9 +80,7 @@ def main() -> int:
     ap.add_argument("--res", type=float, default=None,
                     help="voxel size in cm, overriding the spec. A COARSER lattice is a "
                          "weaker check -- pieces that touch at one voxel can merge, and "
-                         "thin necks can part -- but it is the only way the heaviest "
-                         "heroes fit in a CI runner (hero-arch-colossal peaks at 24 GB "
-                         "and 12 minutes at its authored 10 cm)")
+                         "thin necks can part. The pitch must be supported by the asset category.")
     heavy = ap.add_mutually_exclusive_group()
     heavy.add_argument("--skip-heavy", action="store_true",
                        help=f"leave out the few specs that dominate the wall clock "

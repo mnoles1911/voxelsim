@@ -1,0 +1,51 @@
+{
+  "id": "grey-whale-0007",
+  "species": "grey-whale",
+  "kind": "cetacean",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "a54c79851b600737",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "a54c79851b600737",
+    "kind": "cetacean",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 5.0,
+    "height_m": 2.95,
+    "length_m": 15.8,
+    "footprint_m": [
+      15.8,
+      4.45
+    ],
+    "grid_mb": 6.7,
+    "extent_vox": [
+      316,
+      89,
+      59
+    ],
+    "vox_models_needed": 2,
+    "voxels": 443317,
+    "by_material": {
+      "26": 97,
+      "36": 152483,
+      "37": 290737
+    },
+    "ground_contact": 56,
+    "ms_grow": 1.7,
+    "ms_raster": 548.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 587.6
+  },
+  "problems": [],
+  "vox_models": 2
+}

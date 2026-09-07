@@ -1,0 +1,51 @@
+{
+  "id": "norway-lemming-0007",
+  "species": "norway-lemming",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "fa3e265142ddf54a",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "fa3e265142ddf54a",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.1,
+    "length_m": 0.175,
+    "footprint_m": [
+      0.18,
+      0.08
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      14,
+      6,
+      8
+    ],
+    "vox_models_needed": 1,
+    "voxels": 163,
+    "by_material": {
+      "26": 21,
+      "36": 4,
+      "39": 138
+    },
+    "ground_contact": 4,
+    "ms_grow": 2.0,
+    "ms_raster": 4.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 7.1
+  },
+  "problems": [],
+  "vox_models": 1
+}

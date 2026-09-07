@@ -100,6 +100,13 @@ P_HORN = 13        # renumbered later, which would re-label baked files
 # Paired parts become two: id and id+SIDE_STRIDE for the far side. A stride
 # rather than a flag bit because it keeps every id a small integer that indexes
 # a table directly, and 128 parts is far past anything anatomical.
+P_ARM = 14
+P_FOREARM = 15
+P_HAND = 16
+P_SHIN = 17
+P_FOOT = 18
+P_WEAPON = 19
+
 SIDE_STRIDE = 64
 
 # ... and fore/hind is a second stride on top of it. See the header: this is
@@ -108,7 +115,8 @@ SIDE_STRIDE = 64
 # are untouched, and the hind pair lands in the gap between them.
 AXIS_STRIDE = 32
 
-PAIRED = frozenset({P_FIN_PAIRED, P_WING, P_LEG, P_EAR, P_HORN})
+PAIRED = frozenset({P_FIN_PAIRED, P_WING, P_LEG, P_EAR, P_HORN,
+                    P_ARM, P_FOREARM, P_HAND, P_SHIN, P_FOOT, P_WEAPON})
 
 # Parts that come in a FORE set and a HIND set as well as a left and a right.
 # Only legs, and deliberately only legs: an ear is not a fore ear, and a
@@ -122,6 +130,8 @@ _BASE_NAMES = {
     P_FIN_MEDIAN: "median-fin", P_FIN_CAUDAL: "caudal-fin",
     P_FIN_PAIRED: "paired-fin", P_WING: "wing", P_LEG: "leg",
     P_EAR: "ear", P_HORN: "horn",
+    P_ARM: "arm", P_FOREARM: "forearm", P_HAND: "hand",
+    P_SHIN: "shin", P_FOOT: "foot", P_WEAPON: "weapon",
 }
 
 # THE ARITHMETIC THAT MAKES TWO STRIDES SAFE, checked at import rather than
@@ -263,6 +273,8 @@ PARENT = {
     P_LEG: P_BODY,
     P_EAR: P_HEAD,
     P_HORN: P_HEAD,
+    P_ARM: P_BODY, P_FOREARM: P_ARM, P_HAND: P_FOREARM,
+    P_SHIN: P_LEG, P_FOOT: P_SHIN, P_WEAPON: P_HAND,
 }
 
 
@@ -306,14 +318,22 @@ def joints(tags: np.ndarray) -> list[dict]:
         return []
     present = {int(v) for v in np.unique(tags) if v != P_NONE}
     out: list[dict] = []
+
+    def anatomical_parent(pid):
+        parent = PARENT.get(base_id(pid), P_BODY)
+        # A right hand attaches to the right forearm, never the left one.
+        if parent in PAIRED and side_of(pid) == "R":
+            parent += SIDE_STRIDE
+        return parent
+
     for pid in sorted(present):
         base = base_id(pid)
         if base == P_BODY:
             continue
         # Walk up until we reach a part this animal actually has.
-        parent = PARENT.get(base, P_BODY)
+        parent = anatomical_parent(pid)
         while parent not in present and parent != P_BODY:
-            parent = PARENT.get(parent, P_BODY)
+            parent = anatomical_parent(parent)
         if parent not in present:
             continue
 
@@ -350,7 +370,7 @@ def joints(tags: np.ndarray) -> list[dict]:
         # which is what a short-necked animal's head physically does.
         touch = contact(parent)
         while not touch.any() and parent != P_BODY:
-            parent = PARENT.get(parent, P_BODY)
+            parent = anatomical_parent(parent)
             if parent not in present:
                 break
             touch = contact(parent)

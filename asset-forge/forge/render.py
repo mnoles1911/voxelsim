@@ -554,7 +554,8 @@ def camera_for(spec: dict) -> str:
         # high camera's 30 it projects onto 12. So a fish that authors a head
         # span is reviewed from where the head can be seen -- the same
         # exception `bird.pose` needs and for the same geometric reason.
-        return "broadhigh" if float(get(spec, "fish.head_width")) > 0.0 else "broad"
+        return "broadhigh" if (float(get(spec, "fish.head_width")) > 0.0
+                                or str(get(spec, "name")).endswith("ray")) else "broad"
     if kind == "bird":
         return "broad" if get(spec, "bird.pose") == "perched" else "iso"
     if kind == "quadruped":

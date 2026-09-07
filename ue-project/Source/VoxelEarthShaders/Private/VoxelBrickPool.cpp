@@ -2594,6 +2594,43 @@ bool FVoxelBrickPool::AllocateForChunk(const FVoxelBrickChunkKey& Key, uint32 Oc
 	return true;
 }
 
+bool FVoxelBrickPool::PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages)
+{
+	check(IsInGameThread());
+	if(!bInitialised||bGpuAllocArmed||!IndexSink||Pages.IsEmpty()||Pages.Num()>8192)return false;
+	TSet<FVoxelBrickChunkKey> Keys;
+	for(const auto& Page:Pages){
+		if(Keys.Contains(Page.Key)||Page.CpuPack.IsValid()==Page.GpuPack.IsValid())return false;Keys.Add(Page.Key);
+		const auto Old=Resident.Find(Page.Key);
+		if(Old?(int32(Old->ChunkSlot)!=Page.ExpectedSlot||Old->AddSequence!=Page.ExpectedSequence||Old->bGpuArenas):Page.ExpectedSlot!=INDEX_NONE)return false;
+		if(Page.CpuPack&&(Page.CpuPack->Desc.Num()!=128||Page.CpuPack->OccWords()>1024||Page.CpuPack->MatWords()>8448))return false;
+		if(Page.GpuPack&&(Page.GpuPack->BrickCount!=64||Page.GpuPack->OccWords>1024||Page.GpuPack->MatWords>8448))return false;
+	}
+	struct FReserved {FVoxelGpuPoolAllocation Desc,Occ,Mat;};TArray<FReserved> Reserved;Reserved.Reserve(Pages.Num());
+	auto Rollback=[&](){for(const auto& R:Reserved){if(R.Desc.IsValid())DescArena.Free(R.Desc);if(R.Occ.IsValid())OccArena.Free(R.Occ);if(R.Mat.IsValid())MatArena.Free(R.Mat);}};
+	for(const auto& Page:Pages){
+		const uint32 Occ=Page.CpuPack?Page.CpuPack->OccWords():Page.GpuPack->OccWords;
+		const uint32 Mat=Page.CpuPack?Page.CpuPack->MatWords():Page.GpuPack->MatWords;
+		auto& R=Reserved.AddDefaulted_GetRef();R.Desc=DescArena.Alloc(64);if(Occ)R.Occ=OccArena.Alloc(Occ);if(Mat)R.Mat=MatArena.Alloc(Mat);
+		if(!R.Desc.IsValid()||(Occ&&!R.Occ.IsValid())||(Mat&&!R.Mat.IsValid())){Rollback();return false;}
+	}
+	// Admission and every allocation succeeded before touching resident keys.
+	// No callback or asynchronous operation can interleave this GT commit.
+	for(int32 I=0;I<Pages.Num();++I){
+		const auto& Page=Pages[I];const auto& R=Reserved[I];RemoveChunk(Page.Key);
+		FResidentChunk Chunk;Chunk.Key=Page.Key;Chunk.ChunkSlot=R.Desc.Offset/64;Chunk.BrickBase=R.Desc.Offset;
+		Chunk.OccBase=R.Occ.IsValid()?R.Occ.Offset:0;Chunk.MatBase=R.Mat.IsValid()?R.Mat.Offset:0;
+		Chunk.OccWords=Page.CpuPack?Page.CpuPack->OccWords():Page.GpuPack->OccWords;
+		Chunk.MatWords=Page.CpuPack?Page.CpuPack->MatWords():Page.GpuPack->MatWords;Chunk.AddSequence=NextAddSequence++;
+		Resident.Add(Page.Key,Chunk);NoteResidentDelta(Page.Key,+1);EvictionOrder.Add(Page.Key);++ChunksAdded;
+		FPendingWrite Write;Write.Payload=Page.GpuPack;Write.CpuPack=Page.CpuPack;Write.Key=Page.Key;Write.ChunkSlot=Chunk.ChunkSlot;
+		Write.BrickBase=Chunk.BrickBase;Write.OccBase=Chunk.OccBase;Write.MatBase=Chunk.MatBase;Write.RingLevel=uint32(FMath::Clamp(Page.Key.Level,0,15));
+		Write.Shading=Page.Shading;Write.OriginVoxel=Page.CpuPack?Page.CpuPack->OriginVoxel:Page.GpuPack->OriginVoxel;
+		PendingWrites.Add(MoveTemp(Write));
+	}
+	Flush();return true;
+}
+
 int32 FVoxelBrickPool::AddChunkFromGpu(const FVoxelGpuBrickPayloadRef& Payload,
                                        const FVoxelBrickChunkKey& Key,
                                        const FVoxelBrickChunkShading& Shading)

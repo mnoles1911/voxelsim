@@ -247,9 +247,9 @@
     "quad_back": "plume_grey",
     "quad_belly": "plume_white",
     "quad_eye": "skin_dark",
-    "quad_head": "plume_buff",
+    "quad_head": "plume_grey",
     "quad_horn": "beak_horn",
-    "quad_leg": "plume_buff",
+    "quad_leg": "plume_grey",
     "quad_mark": "plume_slate",
     "quad_tail": "plume_grey",
     "rock": "rock",
@@ -268,7 +268,7 @@
   },
   "quad": {
     "belly": 0.5,
-    "cape": 0.3,
+    "cape": 0.12,
     "chest": 1.05,
     "depth": 0.663,
     "dewlap": 0.0,
@@ -278,7 +278,7 @@
     "ear_shape": "pointed",
     "ear_width": 0.62,
     "eye": 1,
-    "foot": 1.0,
+    "foot": 0.78,
     "fore_bend": 0.18,
     "fore_reach": 1.0,
     "head_deg": -4.0,
@@ -331,7 +331,7 @@
     "waist": 0.86,
     "width": 0.54
   },
-  "resolution_cm": "2.5",
+  "resolution_cm": "1.25",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,

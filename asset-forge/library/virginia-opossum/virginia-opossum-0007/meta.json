@@ -1,0 +1,52 @@
+{
+  "id": "virginia-opossum-0007",
+  "species": "virginia-opossum",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "0c99a2497d3a265a",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "0c99a2497d3a265a",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.19,
+    "length_m": 0.663,
+    "footprint_m": [
+      0.66,
+      0.1
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      53,
+      8,
+      15
+    ],
+    "vox_models_needed": 1,
+    "voxels": 897,
+    "by_material": {
+      "26": 342,
+      "27": 116,
+      "36": 114,
+      "37": 325
+    },
+    "ground_contact": 26,
+    "ms_grow": 1.7,
+    "ms_raster": 8.9,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 11.5
+  },
+  "problems": [],
+  "vox_models": 1
+}

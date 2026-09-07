@@ -279,6 +279,8 @@ public:
         // Preserve bank provenance for render ownership; these identifiers do
         // not alter composition, collision or first-non-air ordering.
         uint16_t bankId = 0, seedIndex = 0, speciesIndex = 0;
+        // Set only on immutable render-request copies. Authoritative sampling ignores it.
+        bool suppressTerrainRender = false;
     };
 
     // Resolve every TERRAIN-LATTICE instance's grid once. Detail-lattice
@@ -321,6 +323,14 @@ public:
     // cannot touch the bank source.
     static MaterialId materialAtResolved(const std::vector<ResolvedAssetInstance>& resolved,
                                          int64_t vx, int64_t vy, int64_t vz) {
+        return materialAtResolvedForRender<false>(resolved, vx, vy, vz);
+    }
+
+    // Resolve the original winner BEFORE applying render ownership. An owned
+    // non-air cell still occludes later instances. Never use for collision.
+    template<bool ApplyRenderOwnership = true>
+    static MaterialId materialAtResolvedForRender(const std::vector<ResolvedAssetInstance>& resolved,
+                                                  int64_t vx, int64_t vy, int64_t vz) {
         for (const ResolvedAssetInstance& r : resolved) {
             // Identical arithmetic to materialOfInstance, against the cached
             // grid. atYaw answers MAT_AIR out of range, so the only guard
@@ -333,7 +343,7 @@ public:
                 continue;
             const MaterialId m = r.grid->atYaw(static_cast<int32_t>(rx), static_cast<int32_t>(ry),
                                                static_cast<int32_t>(rz), r.yawQuarter);
-            if (m != MAT_AIR) return m;
+            if (m != MAT_AIR) return ApplyRenderOwnership && r.suppressTerrainRender ? MaterialId(MAT_AIR) : m;
         }
         return MAT_AIR;
     }

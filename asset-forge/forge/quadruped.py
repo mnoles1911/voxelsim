@@ -140,6 +140,7 @@ import math
 import numpy as np
 
 from . import materials
+from .creature_detail import side_disk, side_seam
 from . import parts
 from .grid import VoxelGrid
 from .spec import PARAMS as _PARAMS
@@ -291,13 +292,31 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float,
     # when both rotate, which is the overlapping-collar problem wearing a hat.
     _caps(tag, p)
     _head(tag, p)
+    cranial_tags = tag.data.copy()
     _ears(tag, p)
     _headgear(tag, p)
+
+    # Large ear roots can overlap the entire back of a small skull. The
+    # occupied skull/neck volume beneath them still belongs to the skull and
+    # neck, otherwise the head ends up connected only through its own ears.
+    # Restore that internal ownership when the ear overlay severs its seam;
+    # paint with the original tags so outer ear anatomy remains unchanged.
+    rig_tags = tag.data
+    from scipy.ndimage import binary_dilation
+    head_contact = binary_dilation(tag.data == T_HEAD)
+    if not (head_contact & ((tag.data == T_NECK) | (tag.data == T_BODY))).any():
+        beneath_ear = ((tag.data == T_EAR)
+                       & ((cranial_tags == T_HEAD) | (cranial_tags == T_NECK)
+                          | (cranial_tags == T_BODY)))
+        if beneath_ear.any():
+            rig_tags = tag.data.copy()
+            rig_tags[beneath_ear] = cranial_tags[beneath_ear]
+
 
     grid = VoxelGrid(p["shape"], (0, 0, 0), voxel_m)
     _paint(grid, tag.data, p)
     if out is not None:
-        out["tags"] = parts.to_shared(tag.data, _TO_SHARED)
+        out["tags"] = parts.to_shared(rig_tags, _TO_SHARED)
         out["layout"] = p
     return grid
 
@@ -1726,6 +1745,7 @@ def _paint(grid: VoxelGrid, tags: np.ndarray, p: dict) -> None:
     _tail_tip(mat, tags, p)
     _cape(mat, tags, p, tt3, occ)
     _mark(mat, tags, p, tt3, uz3, occ)
+    _face_detail(mat, tags, p)
     _eye(mat, tags, p)
     grid.data[:] = mat
 
@@ -1823,8 +1843,15 @@ def _mark(mat: np.ndarray, tags: np.ndarray, p: dict, tt3: np.ndarray,
 
     if kind == "bars":
         n = max(1, p["mark_count"])
-        phase = tt3 * n + p["phase"]
-        sel = body & ((phase % 1.0) < np.clip(p["mark_width"] * 1.6, 0.05, 0.9))
+        # Stripes follow the flank instead of reading as equally spaced bars
+        # painted with a ruler. Anatomical coordinates keep the pattern stable
+        # as pitch changes; tapered widths and two frequencies avoid repetition.
+        phase = (tt3 * n + p["phase"]
+                 + 0.22 * np.sin(uz3 * 7.0 + tt3 * 11.0 + p["phase"] * 6.0)
+                 + 0.10 * np.sin(uz3 * 17.0 - tt3 * 13.0))
+        taper = 0.62 + 0.38 * np.sin(np.pi * np.clip(uz3, 0, 1))
+        width = np.clip(p["mark_width"] * 1.6 * taper, 0.05, 0.9)
+        sel = body & ((phase % 1.0) < width)
     elif kind == "flankstripe":
         # A horizontal band along the flank at the countershading boundary. A
         # gemsbok, an impala, a dorcas gazelle, a springbok.
@@ -1873,18 +1900,41 @@ def _eye(mat: np.ndarray, tags: np.ndarray, p: dict) -> None:
         return
     r = p["head_r"]
     c = p["p_head"] + p["muz_dir"] * (r * 0.42) + np.array([0.0, 0.0, r * 0.35])
-    rad = max(1, int(round(p["eye"])))
-    nx, ny, nz = tags.shape
+    radius = max(0.5, p["eye"] - 0.5, r * 0.11)
     head = (tags == T_HEAD) | (tags == T_MUZZLE)
-    for sgn in (-1, 1):
-        cy = p["ycen"] + sgn * r * 0.78
-        x0, x1 = int(c[0] - rad), int(c[0] + rad) + 1
-        y0, y1 = int(cy - rad), int(cy + rad) + 1
-        z0, z1 = int(c[2] - rad), int(c[2] + rad) + 1
-        sub = (slice(max(0, x0), min(nx, x1)), slice(max(0, y0), min(ny, y1)),
-               slice(max(0, z0), min(nz, z1)))
-        m = head[sub]
-        if m.any():
-            block = mat[sub]
-            block[m] = p["mat_eye"]
-            mat[sub] = block
+    side_disk(mat, head, round(c[0]), round(c[2]), radius, p["mat_eye"])
+
+
+def _face_detail(mat, tags, p):
+    """Nostrils, lip line and inset ear colour at anatomically local positions."""
+    muzzle = tags == T_MUZZLE
+    coords = np.argwhere(muzzle)
+    if len(coords) and p["muz_v"] >= 3:
+        # Locate the actual bent muzzle instead of extrapolating its axis.
+        along = (coords - p["p_muz_base"]) @ p["muz_dir"]
+        tip = coords[along >= along.max() - max(1, p["muz_v"] * 0.09)]
+        c = tip.mean(axis=0)
+        side_disk(mat, muzzle, round(c[0]), round(c[2] + p["head_r"] * 0.12),
+                  max(0.5, p["head_r"] * 0.07), p["mat_eye"])
+        # The narrow lip line ends well before the cheek; no cartoon smile.
+        points = []
+        for x in np.unique(coords[:, 0]):
+            if abs(x-c[0]) > p["muz_v"] * 0.6:
+                continue
+            zs = np.flatnonzero(muzzle[x].any(axis=0))
+            if len(zs) >= 4:
+                points.append((x, zs[0] + 0.40 * (zs[-1]-zs[0])))
+        side_seam(mat, muzzle, points, p["mat_eye"])
+    # Inner ear is a smaller surface patch; the outline retains its fur rim.
+    ears = tags == T_EAR
+    for sign in (-1, 1):
+        local = np.argwhere(ears)
+        local = local[(local[:, 1]-p["ycen"]) * sign > 0]
+        if len(local) < 12:
+            continue
+        c = local.mean(axis=0)
+        radius = min(np.ptp(local[:, 0]), np.ptp(local[:, 2])) * 0.22
+        if radius >= 1:
+            # Restrict to this ear so the projection cannot colour the other.
+            region = ears & (((np.arange(tags.shape[1])-p["ycen"])*sign > 0)[None,:,None])
+            side_disk(mat, region, round(c[0]), round(c[2]), radius, p["mat_belly"])

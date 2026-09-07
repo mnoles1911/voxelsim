@@ -1,0 +1,51 @@
+{
+  "id": "wolverine-0007",
+  "species": "wolverine",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "c22dc3722890071b",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "c22dc3722890071b",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.39,
+    "length_m": 0.888,
+    "footprint_m": [
+      0.89,
+      0.24
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      71,
+      19,
+      31
+    ],
+    "vox_models_needed": 1,
+    "voxels": 11336,
+    "by_material": {
+      "26": 10127,
+      "30": 956,
+      "39": 253
+    },
+    "ground_contact": 44,
+    "ms_grow": 3.0,
+    "ms_raster": 16.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 21.8
+  },
+  "problems": [],
+  "vox_models": 1
+}

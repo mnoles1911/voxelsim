@@ -1,0 +1,50 @@
+{
+  "id": "whale-shark-0007",
+  "species": "whale-shark",
+  "kind": "fish",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "eaf5793bfcebc4f8",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "eaf5793bfcebc4f8",
+    "kind": "fish",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 5.0,
+    "height_m": 3.75,
+    "length_m": 15.15,
+    "footprint_m": [
+      15.15,
+      6.15
+    ],
+    "grid_mb": 3.7,
+    "extent_vox": [
+      303,
+      123,
+      75
+    ],
+    "vox_models_needed": 2,
+    "voxels": 235170,
+    "by_material": {
+      "26": 144568,
+      "27": 90602
+    },
+    "ground_contact": 20,
+    "ms_grow": 1.7,
+    "ms_raster": 91.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 149.2
+  },
+  "problems": [],
+  "vox_models": 2
+}

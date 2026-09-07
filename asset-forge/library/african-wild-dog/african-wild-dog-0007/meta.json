@@ -1,0 +1,50 @@
+{
+  "id": "african-wild-dog-0007",
+  "species": "african-wild-dog",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "becf01136065db6a",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "becf01136065db6a",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.85,
+    "length_m": 1.363,
+    "footprint_m": [
+      1.36,
+      0.31
+    ],
+    "grid_mb": 0.4,
+    "extent_vox": [
+      109,
+      25,
+      68
+    ],
+    "vox_models_needed": 1,
+    "voxels": 36110,
+    "by_material": {
+      "26": 9967,
+      "39": 26143
+    },
+    "ground_contact": 6,
+    "ms_grow": 3.0,
+    "ms_raster": 54.0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 63.7
+  },
+  "problems": [],
+  "vox_models": 1
+}

@@ -1,0 +1,53 @@
+{
+  "id": "yellowfin-tuna-0007",
+  "species": "yellowfin-tuna",
+  "kind": "fish",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "ee30a75593ec6f69",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "ee30a75593ec6f69",
+    "kind": "fish",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.84,
+    "length_m": 2.15,
+    "footprint_m": [
+      2.15,
+      0.54
+    ],
+    "grid_mb": 0.6,
+    "extent_vox": [
+      172,
+      43,
+      67
+    ],
+    "vox_models_needed": 1,
+    "voxels": 42409,
+    "by_material": {
+      "26": 86,
+      "27": 9534,
+      "28": 16598,
+      "32": 4668,
+      "34": 11523
+    },
+    "ground_contact": 34,
+    "ms_grow": 2.6,
+    "ms_raster": 15.6,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 28.9
+  },
+  "problems": [],
+  "vox_models": 1
+}

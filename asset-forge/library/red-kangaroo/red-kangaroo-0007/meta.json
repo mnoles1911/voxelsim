@@ -1,0 +1,51 @@
+{
+  "id": "red-kangaroo-0007",
+  "species": "red-kangaroo",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "2a4869f3c281c245",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "2a4869f3c281c245",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 1.54,
+    "length_m": 1.4,
+    "footprint_m": [
+      1.4,
+      0.34
+    ],
+    "grid_mb": 1.4,
+    "extent_vox": [
+      112,
+      27,
+      123
+    ],
+    "vox_models_needed": 1,
+    "voxels": 47979,
+    "by_material": {
+      "26": 20,
+      "39": 12590,
+      "40": 35369
+    },
+    "ground_contact": 13,
+    "ms_grow": 1.7,
+    "ms_raster": 123.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 133.3
+  },
+  "problems": [],
+  "vox_models": 1
+}

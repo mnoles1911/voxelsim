@@ -1,0 +1,52 @@
+{
+  "id": "northern-goshawk-0007",
+  "species": "northern-goshawk",
+  "kind": "bird",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "0dca9ce038fd4b0f",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "0dca9ce038fd4b0f",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 0.15,
+    "length_m": 0.513,
+    "footprint_m": [
+      0.51,
+      1.05
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      41,
+      84,
+      12
+    ],
+    "vox_models_needed": 1,
+    "voxels": 3953,
+    "by_material": {
+      "32": 6,
+      "36": 320,
+      "37": 168,
+      "38": 3459
+    },
+    "ground_contact": 24,
+    "ms_grow": 3.2,
+    "ms_raster": 14.2,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 19.1
+  },
+  "problems": [],
+  "vox_models": 1
+}

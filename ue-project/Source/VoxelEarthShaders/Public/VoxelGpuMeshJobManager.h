@@ -157,7 +157,7 @@ namespace VoxelGpuChunkRegion
 	// every array the request carries. Per chunk that is
 	//
 	//     4 * (ElevationMm.Num() + ClimatePacked.Num())        raster window
-	//   + 44 * AssetInstances.Num()                            instances
+	//   + 48 * AssetInstances.Num()                            instances
 	//   +  4 * (AssetColStarts.Num() + AssetSpans.Num())       span tables
 	//
 	// bytes of malloc + memcpy on the GAME THREAD, once per chunk routed to the
@@ -292,6 +292,10 @@ VOXELEARTHSHADERS_API bool VoxelGpuJobLeanEnabled();
 
 struct FVoxelGpuMeshJobResult
 {
+	// Explicit preparation jobs return owned buffers without touching any
+	// visible brick slot/index. The transaction consumer controls publication.
+	bool bPublicationHeld = false;
+	uint64 OwnershipGeneration = 0;
 	uint64 JobId = 0;
 	// Whatever the caller passed to Submit, echoed back untouched. The streaming
 	// integration will put a packed chunk key here.
@@ -523,7 +527,8 @@ public:
 	// exactly-once contract. They are never starved into a different OUTCOME,
 	// only a later one, and the caller is expected to treat them as droppable.
 	uint64 Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag = 0,
-	              bool bRequestGpuResidentQuads = false, bool bLowPriority = false);
+	              bool bRequestGpuResidentQuads = false, bool bLowPriority = false,
+	              bool bHoldBrickPublication = false, uint64 OwnershipGeneration = 0);
 
 	// Promotes queued jobs, polls readbacks, delivers finished ones. Game thread
 	// only. Cheap and safe to call every frame with nothing outstanding.

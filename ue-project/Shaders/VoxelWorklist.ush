@@ -132,7 +132,7 @@ struct GpuAssetStampInstance
 	uint SizeY;
 	uint SizeZ;
 	uint ColStartsBase;
-	uint Pad0;
+	uint SuppressTerrainRender;
 };
 
 // --- the record fold, GPU half ----------------------------------------------

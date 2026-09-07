@@ -1,0 +1,51 @@
+{
+  "id": "basking-shark-0007",
+  "species": "basking-shark",
+  "kind": "fish",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "2d3496664df91c18",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "2d3496664df91c18",
+    "kind": "fish",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 2.5,
+    "height_m": 2.58,
+    "length_m": 9.85,
+    "footprint_m": [
+      9.85,
+      2.62
+    ],
+    "grid_mb": 5.4,
+    "extent_vox": [
+      394,
+      105,
+      103
+    ],
+    "vox_models_needed": 2,
+    "voxels": 410622,
+    "by_material": {
+      "26": 488,
+      "37": 209868,
+      "38": 200266
+    },
+    "ground_contact": 96,
+    "ms_grow": 3.0,
+    "ms_raster": 159.3,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 262.0
+  },
+  "problems": [],
+  "vox_models": 2
+}

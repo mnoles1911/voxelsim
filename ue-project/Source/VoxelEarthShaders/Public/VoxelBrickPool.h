@@ -575,6 +575,18 @@ struct FVoxelBrickChunkShading
 	}
 };
 
+// Prepared replacement pages retain their payloads outside the visible pool.
+// ExpectedSlot/sequence guard eviction or remeshing while preparation ran.
+struct FVoxelBrickPreparedReplacement
+{
+	FVoxelBrickChunkKey Key;
+	int32 ExpectedSlot=INDEX_NONE;
+	uint64 ExpectedSequence=0;
+	FVoxelBrickCpuPackRef CpuPack;
+	FVoxelGpuBrickPayloadRef GpuPack;
+	FVoxelBrickChunkShading Shading;
+};
+
 class VOXELEARTHSHADERS_API FVoxelBrickPool
 {
 public:
@@ -879,6 +891,10 @@ public:
 	// ONE graph. Clears are recorded before writes, so a slot retired and reused
 	// in the same batch cannot end up cleared. GAME THREAD ONLY.
 	void Flush();
+	// Reserves the complete batch without eviction, then replaces it in one
+	// Flush. False changes no visible pages. Currently the CPU arena allocator
+	// is required; GPU-allocator reservation needs its own verified batch path.
+	bool PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages);
 
 	// --- P1: GPU-side pool allocation (voxel.GPU.PoolAlloc) ------------------
 	//

@@ -19,6 +19,8 @@ public:
     AVoxelFallingTimber();
     void Initialize(const TArray<UProceduralMeshComponent*>& Meshes, const FBox& LocalTrunk,
                     const FTransform& Source, const FVector& PushDirection, bool CanBreak);
+    FBox GetGroundSupportBounds() const;
+    void PauseForGroundSupport();
     virtual void Tick(float DeltaSeconds) override;
     virtual void EndPlay(const EEndPlayReason::Type Reason) override;
     bool PersistentState(FArchive& Ar);
@@ -40,13 +42,15 @@ private:
     TSharedPtr<FTimberStagedRestore,ESPMode::ThreadSafe> StagedRestore;
     TSharedPtr<FTimberStagedRestore,ESPMode::ThreadSafe> PreparedRestore;
     bool DeferringGeometrySnapshot=false;
+    bool GroundPaused=false,GroundWasAwake=false;
+    FVector GroundLinear=FVector::ZeroVector,GroundAngular=FVector::ZeroVector;
     UPROPERTY(VisibleAnywhere) TObjectPtr<UVoxelDebrisLifecycle> Cleanup;
     UFUNCTION() void Contact(UPrimitiveComponent* HitComponent,AActor* OtherActor,UPrimitiveComponent* OtherComp,
                             FVector Impulse,const FHitResult& Hit);
     void BreakOnImpact();
     UPROPERTY(Transient) TArray<TObjectPtr<UProceduralMeshComponent>> Visuals;
     UPROPERTY(Transient) TObjectPtr<UPhysicsConstraintComponent> StumpHinge;
-    FBox Trunk;
+    FBox Trunk=FBox(ForceInit);
     FVector LastLinear=FVector::ZeroVector,LastAngular=FVector::ZeroVector,LastCenter=FVector::ZeroVector;
     FVector FallHeading=FVector::ForwardVector;
     bool ReleaseHinge=false;
@@ -78,5 +82,9 @@ namespace VoxelTreeFelling {
     bool Chop(UWorld* World,const FVector& Start,const FVector& Direction,int32 Size);
     void Prepare(UWorld* World,const FVector& TreeLocation);
     void PrepareGround(UWorld* World,const FVector& TreeLocation);
+    void EnsureAxe(UWorld* World);
+    bool AdvanceRestoreGround(UWorld* World,const FVector& Location);
+    bool AdvanceRestoreGround(UWorld* World,const FBox& Bounds);
+    void NotifyTerrainEdited(UWorld* World,const FBox& Bounds);
     void Reset(UWorld* World);
 }

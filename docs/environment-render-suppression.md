@@ -1,0 +1,19 @@
+# Render-only canonical asset winner suppression
+
+This is request/sampling support, not an enabled production actor handoff. WorldSubsystem does not set ownership markers or call the new CPU render sampler yet. Generated world, collision, edit journals and default rendered output remain unchanged.
+
+`ResolvedAssetInstance::suppressTerrainRender` defaults false. `materialAtResolvedForRender` resolves the original first non-air bank winner before returning render air for an owned winner. The existing authoritative `materialAtResolved` explicitly ignores the marker. Mark only immutable request copies after capturing an ownership generation; never remove owned instances from canonical ordering. The explicit bool increases the x64 resolved-instance stride from 40 to 48 bytes.
+
+`FAssetInstance::SuppressTerrainRender` is a validated 0/1 render flag. Request copies and lean-region moves preserve it; worklist staging copies it into a formerly unused dword. Request records grow from 44 to 48 bytes; worklist records remain 48 bytes. Nothing automatically transfers CPU markers to GPU requests yet: that belongs in the generation-captured WorldSubsystem bridge.
+
+Classic level-zero scatter and coarse gather use a transient separate winner-claim buffer only when any instance is owned. No material ID or packed cell bits are reserved. Terrain still wins; an owned asset claims its original non-air cells without writing material, preventing later overlapping assets from appearing. Default requests allocate or clear no claim buffer. Claim scratch is capped at 4 MiB per region (1 Mi cells); admission rejects invalid flags or larger regions using division to avoid arithmetic overflow. RDG owns scratch lifetime, including cancelled jobs; no persistent ownership allocation needs manual cleanup. This is a per-request bound, not a new global GPU reservation policy.
+
+The worklist gather uses one local 32-bit owned-Z mask per column thread, matching the existing 32-cell-high record. Its marker travels through consumed payload staging, with no extra buffer. Deferred worklist records deliberately drop asset payload staging and fall back to the preserved classic request; they must not consume stale payloads on a later flush. Mask shifts are explicitly bounded to 0..31. No cell-packing temporary state escapes either backend.
+
+Validation at this revision:
+
+- Focused `vxc_assetownership_tests`: all seven tests pass. Coverage includes disabled-marker parity, authoritative sampling independence, owned overlap suppression, unowned tails, negative anchors and all quarter yaws.
+- Standalone DXC cs_6_0 compilation succeeds for `AssetStampMain`, `AssetStampCoarseMain` and `AssetStampWorklistMain`. Outputs are in `Saved/winner-suppression-shaders` in the isolated checkout. This is compile evidence, not runtime GPU parity.
+- New Unreal automation `Voxel.Objects.AssetRenderSuppressionAdmission` checks default flags, exact scratch limit, invalid flags and non-wrapping overflow rejection. `Voxel.Objects.AssetRenderSuppressionGpu` dispatches real classic scatter/coarse gather for two overlapping bank volumes and checks readback with each ownership choice. Both pass against rebuilt modules in Saved/environment-suppression-tests.log; all 17 object tests pass, and all five full core CTest targets pass in Saved/environment-core-suppression-tests.log.
+
+Remaining integration: ownership-generation capture, CPU dispatch sampler selection, GPU request marker population, overlay/edited-brick projection semantics, held publication across CPU/GPU/parked pages, object reveal, persistence and multiplayer synchronization. Worklist runtime parity still requires the existing verify-stamp route with actual owned requests. Do not enable ordinary actor overlays until the full publication transaction and acceptance scenarios in `production-environment-ownership.md` are complete.

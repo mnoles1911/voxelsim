@@ -1,0 +1,54 @@
+{
+  "id": "greater-kudu-0007",
+  "species": "greater-kudu",
+  "kind": "quadruped",
+  "category": "creature",
+  "seed": 7,
+  "spec_hash": "b03d7158cb0a23cc",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "b03d7158cb0a23cc",
+    "kind": "quadruped",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.25,
+    "height_m": 2.04,
+    "length_m": 2.05,
+    "footprint_m": [
+      2.05,
+      0.84
+    ],
+    "grid_mb": 3.4,
+    "extent_vox": [
+      164,
+      67,
+      163
+    ],
+    "vox_models_needed": 1,
+    "voxels": 207330,
+    "by_material": {
+      "26": 32,
+      "36": 47402,
+      "37": 133267,
+      "38": 5949,
+      "39": 15406,
+      "46": 5274
+    },
+    "ground_contact": 126,
+    "ms_grow": 2.7,
+    "ms_raster": 551.3,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 588.1
+  },
+  "problems": [],
+  "vox_models": 1
+}

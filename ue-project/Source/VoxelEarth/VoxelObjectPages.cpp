@@ -18,11 +18,11 @@ using namespace VoxelObjects;
 using FGeometry = VoxelObjects::FGeometry;
 namespace {
 constexpr int32 MaxBytes=512*1024*1024;
-struct FResult { bool Ok=false,Loading=false;FGuid Id;uint64 Revision=0;FGeometry Original,Loaded;FGeometryPage Page; };
+struct FResult { bool Ok=false,Loading=false;FGuid Id;uint64 Revision=0;VoxelObjects::FGeometry Original,Loaded;FGeometryPage Page; };
 struct FState { FString Directory;int32 Cursor=0;TArray<TFuture<FResult>> Jobs;TSet<FGuid> Pending;TMap<FGuid,double> RetryAfter; };
 TMap<TWeakObjectPtr<UWorld>,TUniquePtr<FState>> States;
 }
-bool Read(const FGeometryPage& Page,FGeometry& Geometry)
+bool Read(const FGeometryPage& Page,VoxelObjects::FGeometry& Geometry)
 {
     check(!IsInGameThread());if(!Page.IsValid())return false;
     const int64 FileSize=IFileManager::Get().FileSize(*Page.Path);if(FileSize<20||FileSize>MaxBytes+20)return false;
@@ -34,12 +34,12 @@ bool Read(const FGeometryPage& Page,FGeometry& Geometry)
     if(FCrc::MemCrc32(Data->GetData(),Size)!=Page.Crc||FMD5::HashBytes(Data->GetData(),Size)!=Page.Hash)return false;
     Geometry=Data;return true;
 }
-bool Write(const FString& Directory,const FGeometry& Geometry,FGeometryPage& Page)
+bool Write(const FString& Directory,const VoxelObjects::FGeometry& Geometry,FGeometryPage& Page)
 {
     check(!IsInGameThread());if(!Geometry||Geometry->IsEmpty()||Geometry->Num()>MaxBytes)return false;
     FGeometryPage Result;Result.Bytes=Geometry->Num();Result.Crc=FCrc::MemCrc32(Geometry->GetData(),Result.Bytes);
     Result.Hash=FMD5::HashBytes(Geometry->GetData(),Result.Bytes);Result.Path=Directory/(Result.Hash+TEXT(".vpage"));
-    FGeometry Existing;if(Read(Result,Existing)){Page=MoveTemp(Result);return true;}
+    VoxelObjects::FGeometry Existing;if(Read(Result,Existing)){Page=MoveTemp(Result);return true;}
     int32 PackedSize=FCompression::CompressMemoryBound(NAME_Zlib,Result.Bytes);TArray<uint8> Packed;Packed.SetNumUninitialized(PackedSize);
     if(!FCompression::CompressMemory(NAME_Zlib,Packed.GetData(),PackedSize,Geometry->GetData(),Result.Bytes,COMPRESS_BiasSpeed))return false;
     TArray<uint8> File;FMemoryWriter W(File);uint32 Magic=0x56504745,Version=1;W<<Magic<<Version<<Result.Bytes<<Result.Crc<<PackedSize;W.Serialize(Packed.GetData(),PackedSize);
@@ -49,22 +49,22 @@ bool Write(const FString& Directory,const FGeometry& Geometry,FGeometryPage& Pag
     Out->Serialize(File.GetData(),File.Num());Out->Flush();const bool Ok=!Out->IsError()&&Out->Close();Out.Reset();
     if(!Ok||!IFileManager::Get().Move(*Result.Path,*Temp,true,true))return false;
     // Verify the published bytes before the only resident copy can be released.
-    FGeometry Verified;if(!Read(Result,Verified))return false;Page=MoveTemp(Result);return true;
+    VoxelObjects::FGeometry Verified;if(!Read(Result,Verified))return false;Page=MoveTemp(Result);return true;
 }
 bool Hydrate(FEntry& E)
 {
     if(E.Geometry||E.Residency==EResidency::Tombstone)return true;
     // Reject missing backing data before entering the worker-only disk reader.
     if(!E.Page.IsValid())return false;
-    FGeometry Loaded;if(!Read(E.Page,Loaded))return false;E.Geometry=MoveTemp(Loaded);return true;
+    VoxelObjects::FGeometry Loaded;if(!Read(E.Page,Loaded))return false;E.Geometry=MoveTemp(Loaded);return true;
 }
-bool PublishWrite(FRegistry& Registry,const FGuid& Id,uint64 Revision,const FGeometry& Original,const FGeometryPage& Page)
+bool PublishWrite(FRegistry& Registry,const FGuid& Id,uint64 Revision,const VoxelObjects::FGeometry& Original,const FGeometryPage& Page)
 {
     check(IsInGameThread());auto E=Registry.Find(Id);
     if(!E||E->Residency!=EResidency::Dormant||E->GeometryRevision!=Revision||!Original||E->Geometry!=Original||!Page.IsValid())return false;
     E->Page=Page;E->Geometry.Reset();return true;
 }
-bool PublishRead(FRegistry& Registry,const FGuid& Id,uint64 Revision,const FGeometryPage& Page,const FGeometry& Loaded)
+bool PublishRead(FRegistry& Registry,const FGuid& Id,uint64 Revision,const FGeometryPage& Page,const VoxelObjects::FGeometry& Loaded)
 {
     check(IsInGameThread());auto E=Registry.Find(Id);
     if(!E||E->Residency!=EResidency::Dormant||E->GeometryRevision!=Revision||E->Geometry||E->Page.Path!=Page.Path||!Loaded)return false;

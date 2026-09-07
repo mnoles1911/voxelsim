@@ -61,7 +61,7 @@
     "phototropism": 0.1,
     "radius_exp": 2.3,
     "step_m": 0.12,
-    "tip_radius_m": 0.03
+    "tip_radius_m": 0.05
   },
   "height_m": 1.5,
   "kind": "bush",

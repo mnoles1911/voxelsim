@@ -162,41 +162,119 @@
    "species": [
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 74916,
+       "extent_vox": [
+        127,
+        40,
+        116
+       ],
+       "seed": 7,
+       "voxels": 63442,
+       "vxa": "library/addax/addax-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "addax",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 253761,
+       "extent_vox": [
+        220,
+        62,
+        160
+       ],
+       "seed": 7,
+       "voxels": 434977,
+       "vxa": "library/african-bush-elephant/african-bush-elephant-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "african-bush-elephant",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 401826,
+       "extent_vox": [
+        246,
+        89,
+        186
+       ],
+       "seed": 7,
+       "voxels": 1014935,
+       "vxa": "library/african-forest-elephant/african-forest-elephant-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "african-forest-elephant",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 29704,
+       "extent_vox": [
+        144,
+        25,
+        20
+       ],
+       "seed": 7,
+       "voxels": 10051,
+       "vxa": "library/african-lungfish/african-lungfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "african-lungfish",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 36569,
+       "extent_vox": [
+        122,
+        25,
+        29
+       ],
+       "seed": 7,
+       "voxels": 12742,
+       "vxa": "library/african-sharptooth-catfish/african-sharptooth-catfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "african-sharptooth-catfish",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9494,
+       "extent_vox": [
+        68,
+        15,
+        22
+       ],
+       "seed": 7,
+       "voxels": 2103,
+       "vxa": "library/african-tigerfish/african-tigerfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "african-tigerfish",
      "via": "kind",
@@ -204,20 +282,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 70368,
+       "extent_vox": [
+        109,
+        25,
+        68
+       ],
+       "seed": 7,
+       "voxels": 36110,
+       "vxa": "library/african-wild-dog/african-wild-dog-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "african-wild-dog",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 62983,
+       "extent_vox": [
+        90,
+        30,
+        118
+       ],
+       "seed": 7,
+       "voxels": 57454,
+       "vxa": "library/alpaca/alpaca-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "alpaca",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3775,
+       "extent_vox": [
+        33,
+        9,
+        16
+       ],
+       "seed": 7,
+       "voxels": 801,
+       "vxa": "library/alpine-chough/alpine-chough-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "alpine-chough",
      "via": "kind",
@@ -225,13 +342,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 85773,
+       "extent_vox": [
+        101,
+        34,
+        86
+       ],
+       "seed": 7,
+       "voxels": 51888,
+       "vxa": "library/alpine-ibex/alpine-ibex-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "alpine-ibex",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7918,
+       "extent_vox": [
+        30,
+        11,
+        38
+       ],
+       "seed": 7,
+       "voxels": 2789,
+       "vxa": "library/alpine-marmot/alpine-marmot-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "alpine-marmot",
      "via": "kind",
@@ -239,6 +382,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7403,
+       "extent_vox": [
+        22,
+        51,
+        5
+       ],
+       "seed": 7,
+       "voxels": 748,
+       "vxa": "library/alpine-swift/alpine-swift-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "alpine-swift",
      "via": "kind",
@@ -246,27 +402,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 145389,
+       "extent_vox": [
+        230,
+        73,
+        42
+       ],
+       "seed": 7,
+       "voxels": 109556,
+       "vxa": "library/amazon-river-dolphin/amazon-river-dolphin-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "amazon-river-dolphin",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 216020,
+       "extent_vox": [
+        208,
+        62,
+        126
+       ],
+       "seed": 7,
+       "voxels": 362593,
+       "vxa": "library/american-bison/american-bison-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "american-bison",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 72874,
+       "extent_vox": [
+        118,
+        33,
+        70
+       ],
+       "seed": 7,
+       "voxels": 75060,
+       "vxa": "library/american-black-bear/american-black-bear-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "american-black-bear",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2923,
+       "extent_vox": [
+        35,
+        6,
+        12
+       ],
+       "seed": 7,
+       "voxels": 466,
+       "vxa": "library/american-mink/american-mink-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "american-mink",
      "via": "kind",
@@ -274,6 +482,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 44404,
+       "extent_vox": [
+        67,
+        53,
+        60
+       ],
+       "seed": 7,
+       "voxels": 30369,
+       "vxa": "library/anglerfish/anglerfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "anglerfish",
      "via": "kind",
@@ -281,6 +502,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1895,
+       "extent_vox": [
+        21,
+        6,
+        18
+       ],
+       "seed": 7,
+       "voxels": 230,
+       "vxa": "library/antelope-ground-squirrel/antelope-ground-squirrel-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "antelope-ground-squirrel",
      "via": "kind",
@@ -288,34 +522,99 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 68881,
+       "extent_vox": [
+        125,
+        31,
+        141
+       ],
+       "seed": 7,
+       "voxels": 76985,
+       "vxa": "library/arabian-oryx/arabian-oryx-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "arabian-oryx",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 104969,
+       "extent_vox": [
+        200,
+        39,
+        49
+       ],
+       "seed": 7,
+       "voxels": 80758,
+       "vxa": "library/arapaima/arapaima-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "arapaima",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3829,
+       "extent_vox": [
+        39,
+        9,
+        14
+       ],
+       "seed": 7,
+       "voxels": 633,
+       "vxa": "library/arctic-char/arctic-char-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "arctic-char",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 10353,
+       "extent_vox": [
+        59,
+        12,
+        24
+       ],
+       "seed": 7,
+       "voxels": 3304,
+       "vxa": "library/arctic-fox/arctic-fox-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "arctic-fox",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3784,
+       "extent_vox": [
+        44,
+        9,
+        23
+       ],
+       "seed": 7,
+       "voxels": 747,
+       "vxa": "library/arctic-grayling/arctic-grayling-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "arctic-grayling",
      "via": "kind",
@@ -323,6 +622,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2705,
+       "extent_vox": [
+        14,
+        7,
+        22
+       ],
+       "seed": 7,
+       "voxels": 458,
+       "vxa": "library/arctic-ground-squirrel/arctic-ground-squirrel-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "arctic-ground-squirrel",
      "via": "kind",
@@ -330,6 +642,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9077,
+       "extent_vox": [
+        21,
+        63,
+        5
+       ],
+       "seed": 7,
+       "voxels": 904,
+       "vxa": "library/arctic-tern/arctic-tern-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "arctic-tern",
      "via": "kind",
@@ -337,6 +662,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4789,
+       "extent_vox": [
+        30,
+        15,
+        14
+       ],
+       "seed": 7,
+       "voxels": 717,
+       "vxa": "library/armoured-catfish/armoured-catfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "armoured-catfish",
      "via": "kind",
@@ -344,20 +682,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 15749,
+       "extent_vox": [
+        82,
+        17,
+        24
+       ],
+       "seed": 7,
+       "voxels": 4698,
+       "vxa": "library/atlantic-cod/atlantic-cod-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "atlantic-cod",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 189474,
+       "extent_vox": [
+        208,
+        63,
+        54
+       ],
+       "seed": 7,
+       "voxels": 153399,
+       "vxa": "library/atlantic-halibut/atlantic-halibut-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "atlantic-halibut",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2199,
+       "extent_vox": [
+        32,
+        9,
+        11
+       ],
+       "seed": 7,
+       "voxels": 297,
+       "vxa": "library/atlantic-mackerel/atlantic-mackerel-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "atlantic-mackerel",
      "via": "kind",
@@ -365,6 +742,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 884,
+       "extent_vox": [
+        16,
+        5,
+        8
+       ],
+       "seed": 7,
+       "voxels": 69,
+       "vxa": "library/atlantic-mudskipper/atlantic-mudskipper-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "atlantic-mudskipper",
      "via": "kind",
@@ -372,6 +762,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 5125,
+       "extent_vox": [
+        24,
+        10,
+        16
+       ],
+       "seed": 7,
+       "voxels": 1146,
+       "vxa": "library/atlantic-puffin/atlantic-puffin-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "atlantic-puffin",
      "via": "kind",
@@ -379,27 +782,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 55344,
+       "extent_vox": [
+        240,
+        35,
+        118
+       ],
+       "seed": 7,
+       "voxels": 53357,
+       "vxa": "library/atlantic-sailfish/atlantic-sailfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "atlantic-sailfish",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 21124,
+       "extent_vox": [
+        98,
+        23,
+        32
+       ],
+       "seed": 7,
+       "voxels": 7866,
+       "vxa": "library/atlantic-salmon/atlantic-salmon-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "atlantic-salmon",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 21294,
+       "extent_vox": [
+        90,
+        21,
+        20
+       ],
+       "seed": 7,
+       "voxels": 7118,
+       "vxa": "library/atlantic-wolffish/atlantic-wolffish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "atlantic-wolffish",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3250,
+       "extent_vox": [
+        28,
+        7,
+        12
+       ],
+       "seed": 7,
+       "voxels": 457,
+       "vxa": "library/bar-tailed-godwit/bar-tailed-godwit-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "bar-tailed-godwit",
      "via": "kind",
@@ -407,13 +862,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 54757,
+       "extent_vox": [
+        100,
+        42,
+        76
+       ],
+       "seed": 7,
+       "voxels": 44325,
+       "vxa": "library/barbary-sheep/barbary-sheep-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "barbary-sheep",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 8704,
+       "extent_vox": [
+        57,
+        15,
+        22
+       ],
+       "seed": 7,
+       "voxels": 2031,
+       "vxa": "library/barbel/barbel-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "barbel",
      "via": "kind",
@@ -421,6 +902,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 8227,
+       "extent_vox": [
+        20,
+        45,
+        8
+       ],
+       "seed": 7,
+       "voxels": 834,
+       "vxa": "library/barn-swallow/barn-swallow-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "barn-swallow",
      "via": "kind",
@@ -428,13 +922,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 276779,
+       "extent_vox": [
+        394,
+        105,
+        103
+       ],
+       "seed": 7,
+       "voxels": 410622,
+       "vxa": "library/basking-shark/basking-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "basking-shark",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 149832,
+       "extent_vox": [
+        97,
+        243,
+        26
+       ],
+       "seed": 7,
+       "voxels": 36792,
+       "vxa": "library/bearded-vulture/bearded-vulture-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "bearded-vulture",
      "via": "kind",
@@ -442,27 +962,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 453679,
+       "extent_vox": [
+        429,
+        127,
+        71
+       ],
+       "seed": 7,
+       "voxels": 897736,
+       "vxa": "library/beluga/beluga-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "beluga",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 139133,
+       "extent_vox": [
+        221,
+        37,
+        81
+       ],
+       "seed": 7,
+       "voxels": 119568,
+       "vxa": "library/bengal-tiger/bengal-tiger-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "bengal-tiger",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 88719,
+       "extent_vox": [
+        111,
+        46,
+        84
+       ],
+       "seed": 7,
+       "voxels": 94694,
+       "vxa": "library/bighorn-sheep/bighorn-sheep-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "bighorn-sheep",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 67252,
+       "extent_vox": [
+        73,
+        189,
+        19
+       ],
+       "seed": 7,
+       "voxels": 15102,
+       "vxa": "library/black-browed-albatross/black-browed-albatross-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "black-browed-albatross",
      "via": "kind",
@@ -470,6 +1042,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 5400,
+       "extent_vox": [
+        34,
+        10,
+        14
+       ],
+       "seed": 7,
+       "voxels": 1123,
+       "vxa": "library/black-headed-gull/black-headed-gull-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "black-headed-gull",
      "via": "kind",
@@ -477,6 +1062,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 15469,
+       "extent_vox": [
+        83,
+        17,
+        81
+       ],
+       "seed": 7,
+       "voxels": 6801,
+       "vxa": "library/black-howler-monkey/black-howler-monkey-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "black-howler-monkey",
      "via": "kind",
@@ -484,6 +1082,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 17592,
+       "extent_vox": [
+        33,
+        81,
+        11
+       ],
+       "seed": 7,
+       "voxels": 2825,
+       "vxa": "library/black-legged-kittiwake/black-legged-kittiwake-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "black-legged-kittiwake",
      "via": "kind",
@@ -491,6 +1102,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7638,
+       "extent_vox": [
+        38,
+        9,
+        28
+       ],
+       "seed": 7,
+       "voxels": 1755,
+       "vxa": "library/black-tailed-jackrabbit/black-tailed-jackrabbit-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "black-tailed-jackrabbit",
      "via": "kind",
@@ -498,6 +1122,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3460,
+       "extent_vox": [
+        21,
+        7,
+        21
+       ],
+       "seed": 7,
+       "voxels": 683,
+       "vxa": "library/black-tailed-prairie-dog/black-tailed-prairie-dog-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "black-tailed-prairie-dog",
      "via": "kind",
@@ -505,6 +1142,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3920,
+       "extent_vox": [
+        23,
+        10,
+        31
+       ],
+       "seed": 7,
+       "voxels": 1334,
+       "vxa": "library/black-woodpecker/black-woodpecker-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "black-woodpecker",
      "via": "kind",
@@ -512,20 +1162,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 206319,
+       "extent_vox": [
+        347,
+        71,
+        100
+       ],
+       "seed": 7,
+       "voxels": 229934,
+       "vxa": "library/blue-marlin/blue-marlin-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "blue-marlin",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 80014,
+       "extent_vox": [
+        275,
+        73,
+        54
+       ],
+       "seed": 7,
+       "voxels": 56187,
+       "vxa": "library/blue-shark/blue-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "blue-shark",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1576,
+       "extent_vox": [
+        15,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 197,
+       "vxa": "library/blue-tit/blue-tit-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "blue-tit",
      "via": "kind",
@@ -533,6 +1222,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 300649,
+       "extent_vox": [
+        299,
+        95,
+        41
+       ],
+       "seed": 7,
+       "voxels": 237988,
+       "vxa": "library/blue-whale/blue-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "blue-whale",
      "via": "kind",
@@ -540,20 +1242,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 147640,
+       "extent_vox": [
+        180,
+        42,
+        110
+       ],
+       "seed": 7,
+       "voxels": 119203,
+       "vxa": "library/blue-wildebeest/blue-wildebeest-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "blue-wildebeest",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 116274,
+       "extent_vox": [
+        218,
+        91,
+        80
+       ],
+       "seed": 7,
+       "voxels": 116538,
+       "vxa": "library/bluefin-tuna/bluefin-tuna-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "bluefin-tuna",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 914,
+       "extent_vox": [
+        17,
+        7,
+        12
+       ],
+       "seed": 7,
+       "voxels": 106,
+       "vxa": "library/bluegill/bluegill-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "bluegill",
      "via": "kind",
@@ -561,6 +1302,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3554,
+       "extent_vox": [
+        32,
+        11,
+        17
+       ],
+       "seed": 7,
+       "voxels": 519,
+       "vxa": "library/bluestripe-snapper/bluestripe-snapper-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "bluestripe-snapper",
      "via": "kind",
@@ -568,6 +1322,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 22148,
+       "extent_vox": [
+        62,
+        14,
+        38
+       ],
+       "seed": 7,
+       "voxels": 8223,
+       "vxa": "library/bobcat/bobcat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "bobcat",
      "via": "kind",
@@ -575,20 +1342,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 140075,
+       "extent_vox": [
+        171,
+        46,
+        141
+       ],
+       "seed": 7,
+       "voxels": 114620,
+       "vxa": "library/bongo/bongo-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "bongo",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 311154,
+       "extent_vox": [
+        289,
+        103,
+        82
+       ],
+       "seed": 7,
+       "voxels": 314636,
+       "vxa": "library/bottlenose-dolphin/bottlenose-dolphin-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "bottlenose-dolphin",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1236,
+       "extent_vox": [
+        25,
+        2,
+        5
+       ],
+       "seed": 7,
+       "voxels": 116,
+       "vxa": "library/brook-lamprey/brook-lamprey-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "brook-lamprey",
      "via": "kind",
@@ -596,6 +1402,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1249,
+       "extent_vox": [
+        23,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 145,
+       "vxa": "library/brook-trout/brook-trout-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "brook-trout",
      "via": "kind",
@@ -603,13 +1422,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 129629,
+       "extent_vox": [
+        156,
+        46,
+        91
+       ],
+       "seed": 7,
+       "voxels": 164369,
+       "vxa": "library/brown-bear/brown-bear-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "brown-bear",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 33947,
+       "extent_vox": [
+        56,
+        117,
+        15
+       ],
+       "seed": 7,
+       "voxels": 7326,
+       "vxa": "library/brown-booby/brown-booby-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "brown-booby",
      "via": "kind",
@@ -617,6 +1462,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 25885,
+       "extent_vox": [
+        87,
+        25,
+        29
+       ],
+       "seed": 7,
+       "voxels": 12787,
+       "vxa": "library/brown-pelican/brown-pelican-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "brown-pelican",
      "via": "kind",
@@ -624,13 +1482,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 13667,
+       "extent_vox": [
+        44,
+        38,
+        22
+       ],
+       "seed": 7,
+       "voxels": 4999,
+       "vxa": "library/brown-throated-sloth/brown-throated-sloth-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "brown-throated-sloth",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1159,
+       "extent_vox": [
+        25,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 138,
+       "vxa": "library/brown-trout/brown-trout-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "brown-trout",
      "via": "kind",
@@ -638,6 +1522,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1344,
+       "extent_vox": [
+        15,
+        9,
+        8
+       ],
+       "seed": 7,
+       "voxels": 106,
+       "vxa": "library/bullhead/bullhead-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "bullhead",
      "via": "kind",
@@ -645,6 +1542,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4174,
+       "extent_vox": [
+        43,
+        9,
+        11
+       ],
+       "seed": 7,
+       "voxels": 615,
+       "vxa": "library/burbot/burbot-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "burbot",
      "via": "kind",
@@ -652,6 +1562,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1991,
+       "extent_vox": [
+        14,
+        6,
+        13
+       ],
+       "seed": 7,
+       "voxels": 251,
+       "vxa": "library/burrowing-owl/burrowing-owl-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "burrowing-owl",
      "via": "kind",
@@ -659,13 +1582,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 206096,
+       "extent_vox": [
+        222,
+        86,
+        119
+       ],
+       "seed": 7,
+       "voxels": 323981,
+       "vxa": "library/cape-buffalo/cape-buffalo-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "cape-buffalo",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7594,
+       "extent_vox": [
+        38,
+        8,
+        26
+       ],
+       "seed": 7,
+       "voxels": 1703,
+       "vxa": "library/cape-hare/cape-hare-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "cape-hare",
      "via": "kind",
@@ -673,20 +1622,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 35049,
+       "extent_vox": [
+        79,
+        27,
+        39
+       ],
+       "seed": 7,
+       "voxels": 28325,
+       "vxa": "library/capybara/capybara-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "capybara",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 16183,
+       "extent_vox": [
+        63,
+        13,
+        39
+       ],
+       "seed": 7,
+       "voxels": 6358,
+       "vxa": "library/caracal/caracal-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "caracal",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4570,
+       "extent_vox": [
+        39,
+        9,
+        17
+       ],
+       "seed": 7,
+       "voxels": 1050,
+       "vxa": "library/carrion-crow/carrion-crow-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "carrion-crow",
      "via": "kind",
@@ -694,20 +1682,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 34137,
+       "extent_vox": [
+        106,
+        25,
+        59
+       ],
+       "seed": 7,
+       "voxels": 23691,
+       "vxa": "library/chacma-baboon/chacma-baboon-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "chacma-baboon",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 32532,
+       "extent_vox": [
+        79,
+        17,
+        72
+       ],
+       "seed": 7,
+       "voxels": 17969,
+       "vxa": "library/chamois/chamois-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "chamois",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 105743,
+       "extent_vox": [
+        142,
+        33,
+        73
+       ],
+       "seed": 7,
+       "voxels": 69231,
+       "vxa": "library/cheetah/cheetah-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "cheetah",
      "via": "kind",
@@ -715,13 +1742,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 60609,
+       "extent_vox": [
+        98,
+        35,
+        72
+       ],
+       "seed": 7,
+       "voxels": 61594,
+       "vxa": "library/chimpanzee/chimpanzee-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "chimpanzee",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3454,
+       "extent_vox": [
+        38,
+        9,
+        13
+       ],
+       "seed": 7,
+       "voxels": 587,
+       "vxa": "library/chub/chub-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "chub",
      "via": "kind",
@@ -729,6 +1782,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 994,
+       "extent_vox": [
+        18,
+        7,
+        13
+       ],
+       "seed": 7,
+       "voxels": 169,
+       "vxa": "library/clown-anemonefish/clown-anemonefish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "clown-anemonefish",
      "via": "kind",
@@ -736,6 +1802,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3309,
+       "extent_vox": [
+        32,
+        13,
+        20
+       ],
+       "seed": 7,
+       "voxels": 852,
+       "vxa": "library/clown-triggerfish/clown-triggerfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "clown-triggerfish",
      "via": "kind",
@@ -743,13 +1822,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7848,
+       "extent_vox": [
+        43,
+        9,
+        63
+       ],
+       "seed": 7,
+       "voxels": 1857,
+       "vxa": "library/coati/coati-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "coati",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1515,
+       "extent_vox": [
+        16,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 208,
+       "vxa": "library/common-blackbird/common-blackbird-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-blackbird",
      "via": "kind",
@@ -757,6 +1862,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 5874,
+       "extent_vox": [
+        55,
+        17,
+        25
+       ],
+       "seed": 7,
+       "voxels": 1619,
+       "vxa": "library/common-bream/common-bream-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "common-bream",
      "via": "kind",
@@ -764,6 +1882,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 41122,
+       "extent_vox": [
+        46,
+        110,
+        17
+       ],
+       "seed": 7,
+       "voxels": 6552,
+       "vxa": "library/common-buzzard/common-buzzard-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-buzzard",
      "via": "kind",
@@ -771,6 +1902,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1521,
+       "extent_vox": [
+        17,
+        5,
+        11
+       ],
+       "seed": 7,
+       "voxels": 172,
+       "vxa": "library/common-chaffinch/common-chaffinch-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-chaffinch",
      "via": "kind",
@@ -778,6 +1922,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 25165,
+       "extent_vox": [
+        85,
+        25,
+        75
+       ],
+       "seed": 7,
+       "voxels": 15717,
+       "vxa": "library/common-crane/common-crane-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-crane",
      "via": "kind",
@@ -785,6 +1942,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 13672,
+       "extent_vox": [
+        30,
+        67,
+        9
+       ],
+       "seed": 7,
+       "voxels": 1476,
+       "vxa": "library/common-cuckoo/common-cuckoo-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-cuckoo",
      "via": "kind",
@@ -792,6 +1962,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1199,
+       "extent_vox": [
+        23,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 129,
+       "vxa": "library/common-dace/common-dace-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "common-dace",
      "via": "kind",
@@ -799,13 +1982,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 131754,
+       "extent_vox": [
+        197,
+        79,
+        49
+       ],
+       "seed": 7,
+       "voxels": 83610,
+       "vxa": "library/common-dolphin/common-dolphin-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "common-dolphin",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3406,
+       "extent_vox": [
+        17,
+        17,
+        9
+       ],
+       "seed": 7,
+       "voxels": 411,
+       "vxa": "library/common-frog/common-frog-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "common-frog",
      "via": "kind",
@@ -813,6 +2022,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4305,
+       "extent_vox": [
+        17,
+        12,
+        26
+       ],
+       "seed": 7,
+       "voxels": 1855,
+       "vxa": "library/common-guillemot/common-guillemot-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-guillemot",
      "via": "kind",
@@ -820,6 +2042,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9502,
+       "extent_vox": [
+        23,
+        51,
+        6
+       ],
+       "seed": 7,
+       "voxels": 1014,
+       "vxa": "library/common-kestrel/common-kestrel-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-kestrel",
      "via": "kind",
@@ -827,6 +2062,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2482,
+       "extent_vox": [
+        17,
+        7,
+        10
+       ],
+       "seed": 7,
+       "voxels": 367,
+       "vxa": "library/common-kingfisher/common-kingfisher-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-kingfisher",
      "via": "kind",
@@ -834,6 +2082,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1184,
+       "extent_vox": [
+        22,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 103,
+       "vxa": "library/common-minnow/common-minnow-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "common-minnow",
      "via": "kind",
@@ -841,13 +2102,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 108385,
+       "extent_vox": [
+        108,
+        70,
+        138
+       ],
+       "seed": 7,
+       "voxels": 183556,
+       "vxa": "library/common-ostrich/common-ostrich-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-ostrich",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 10220,
+       "extent_vox": [
+        65,
+        17,
+        24
+       ],
+       "seed": 7,
+       "voxels": 3348,
+       "vxa": "library/common-pheasant/common-pheasant-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-pheasant",
      "via": "kind",
@@ -855,6 +2142,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3371,
+       "extent_vox": [
+        18,
+        11,
+        11
+       ],
+       "seed": 7,
+       "voxels": 801,
+       "vxa": "library/common-quail/common-quail-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-quail",
      "via": "kind",
@@ -864,14 +2164,14 @@
      "curation": "approved",
      "grids": [
       {
-       "bytes": 8075,
+       "bytes": 5930,
        "extent_vox": [
-        50,
+        42,
         11,
-        22
+        19
        ],
        "seed": 7,
-       "voxels": 2135,
+       "voxels": 1684,
        "vxa": "library/common-raven/common-raven-0007/tree.vxa"
       }
      ],
@@ -882,6 +2182,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2125,
+       "extent_vox": [
+        22,
+        6,
+        10
+       ],
+       "seed": 7,
+       "voxels": 220,
+       "vxa": "library/common-redshank/common-redshank-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-redshank",
      "via": "kind",
@@ -889,6 +2202,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1710,
+       "extent_vox": [
+        16,
+        6,
+        10
+       ],
+       "seed": 7,
+       "voxels": 204,
+       "vxa": "library/common-redstart/common-redstart-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-redstart",
      "via": "kind",
@@ -896,6 +2222,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2709,
+       "extent_vox": [
+        29,
+        7,
+        10
+       ],
+       "seed": 7,
+       "voxels": 379,
+       "vxa": "library/common-sole/common-sole-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "common-sole",
      "via": "kind",
@@ -903,6 +2242,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1720,
+       "extent_vox": [
+        15,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 200,
+       "vxa": "library/common-starling/common-starling-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-starling",
      "via": "kind",
@@ -910,6 +2262,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 11417,
+       "extent_vox": [
+        27,
+        67,
+        7
+       ],
+       "seed": 7,
+       "voxels": 1138,
+       "vxa": "library/common-tern/common-tern-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "common-tern",
      "via": "kind",
@@ -917,20 +2282,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 75184,
+       "extent_vox": [
+        190,
+        27,
+        29
+       ],
+       "seed": 7,
+       "voxels": 31957,
+       "vxa": "library/conger-eel/conger-eel-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "conger-eel",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 13784,
+       "extent_vox": [
+        60,
+        23,
+        27
+       ],
+       "seed": 7,
+       "voxels": 4159,
+       "vxa": "library/coral-grouper/coral-grouper-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "coral-grouper",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1815,
+       "extent_vox": [
+        16,
+        7,
+        11
+       ],
+       "seed": 7,
+       "voxels": 272,
+       "vxa": "library/corn-bunting/corn-bunting-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "corn-bunting",
      "via": "kind",
@@ -938,20 +2342,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 11418,
+       "extent_vox": [
+        59,
+        11,
+        26
+       ],
+       "seed": 7,
+       "voxels": 3750,
+       "vxa": "library/corsac-fox/corsac-fox-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "corsac-fox",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 20432,
+       "extent_vox": [
+        80,
+        13,
+        52
+       ],
+       "seed": 7,
+       "voxels": 8157,
+       "vxa": "library/coyote/coyote-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "coyote",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1835,
+       "extent_vox": [
+        17,
+        7,
+        10
+       ],
+       "seed": 7,
+       "voxels": 222,
+       "vxa": "library/cream-coloured-courser/cream-coloured-courser-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "cream-coloured-courser",
      "via": "kind",
@@ -959,6 +2402,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4140,
+       "extent_vox": [
+        24,
+        12,
+        11
+       ],
+       "seed": 7,
+       "voxels": 940,
+       "vxa": "library/crowned-sandgrouse/crowned-sandgrouse-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "crowned-sandgrouse",
      "via": "kind",
@@ -966,6 +2422,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1824,
+       "extent_vox": [
+        23,
+        9,
+        14
+       ],
+       "seed": 7,
+       "voxels": 293,
+       "vxa": "library/crucian-carp/crucian-carp-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "crucian-carp",
      "via": "kind",
@@ -973,13 +2442,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7820,
+       "extent_vox": [
+        69,
+        21,
+        10
+       ],
+       "seed": 7,
+       "voxels": 1032,
+       "vxa": "library/desert-monitor/desert-monitor-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "desert-monitor",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1159,
+       "extent_vox": [
+        20,
+        7,
+        12
+       ],
+       "seed": 7,
+       "voxels": 197,
+       "vxa": "library/desert-pupfish/desert-pupfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "desert-pupfish",
      "via": "kind",
@@ -987,27 +2482,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 29648,
+       "extent_vox": [
+        92,
+        17,
+        53
+       ],
+       "seed": 7,
+       "voxels": 14335,
+       "vxa": "library/dingo/dingo-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "dingo",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 30366,
+       "extent_vox": [
+        71,
+        16,
+        69
+       ],
+       "seed": 7,
+       "voxels": 16052,
+       "vxa": "library/dorcas-gazelle/dorcas-gazelle-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "dorcas-gazelle",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 197823,
+       "extent_vox": [
+        213,
+        48,
+        210
+       ],
+       "seed": 7,
+       "voxels": 271285,
+       "vxa": "library/dromedary-camel/dromedary-camel-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "dromedary-camel",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1940,
+       "extent_vox": [
+        20,
+        6,
+        14
+       ],
+       "seed": 7,
+       "voxels": 198,
+       "vxa": "library/eastern-chipmunk/eastern-chipmunk-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "eastern-chipmunk",
      "via": "kind",
@@ -1015,13 +2562,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 52583,
+       "extent_vox": [
+        103,
+        24,
+        111
+       ],
+       "seed": 7,
+       "voxels": 35990,
+       "vxa": "library/eastern-grey-kangaroo/eastern-grey-kangaroo-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "eastern-grey-kangaroo",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3968,
+       "extent_vox": [
+        37,
+        6,
+        26
+       ],
+       "seed": 7,
+       "voxels": 687,
+       "vxa": "library/eastern-grey-squirrel/eastern-grey-squirrel-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "eastern-grey-squirrel",
      "via": "kind",
@@ -1029,20 +2602,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 40824,
+       "extent_vox": [
+        152,
+        17,
+        15
+       ],
+       "seed": 7,
+       "voxels": 12033,
+       "vxa": "library/electric-eel/electric-eel-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "electric-eel",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 152803,
+       "extent_vox": [
+        159,
+        57,
+        200
+       ],
+       "seed": 7,
+       "voxels": 183682,
+       "vxa": "library/elk-wapiti/elk-wapiti-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "elk-wapiti",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3214,
+       "extent_vox": [
+        34,
+        15,
+        30
+       ],
+       "seed": 7,
+       "voxels": 973,
+       "vxa": "library/emperor-angelfish/emperor-angelfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "emperor-angelfish",
      "via": "kind",
@@ -1050,20 +2662,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 74260,
+       "extent_vox": [
+        94,
+        58,
+        107
+       ],
+       "seed": 7,
+       "voxels": 107589,
+       "vxa": "library/emu/emu-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "emu",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 27513,
+       "extent_vox": [
+        90,
+        17,
+        28
+       ],
+       "seed": 7,
+       "voxels": 14803,
+       "vxa": "library/eurasian-beaver/eurasian-beaver-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "eurasian-beaver",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1885,
+       "extent_vox": [
+        18,
+        6,
+        11
+       ],
+       "seed": 7,
+       "voxels": 269,
+       "vxa": "library/eurasian-bullfinch/eurasian-bullfinch-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-bullfinch",
      "via": "kind",
@@ -1071,6 +2722,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4168,
+       "extent_vox": [
+        15,
+        31,
+        5
+       ],
+       "seed": 7,
+       "voxels": 396,
+       "vxa": "library/eurasian-crag-martin/eurasian-crag-martin-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-crag-martin",
      "via": "kind",
@@ -1078,6 +2742,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7515,
+       "extent_vox": [
+        46,
+        13,
+        21
+       ],
+       "seed": 7,
+       "voxels": 1894,
+       "vxa": "library/eurasian-curlew/eurasian-curlew-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-curlew",
      "via": "kind",
@@ -1085,6 +2762,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2205,
+       "extent_vox": [
+        18,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 277,
+       "vxa": "library/eurasian-dotterel/eurasian-dotterel-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-dotterel",
      "via": "kind",
@@ -1092,6 +2782,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1555,
+       "extent_vox": [
+        18,
+        5,
+        15
+       ],
+       "seed": 7,
+       "voxels": 152,
+       "vxa": "library/eurasian-hoopoe/eurasian-hoopoe-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-hoopoe",
      "via": "kind",
@@ -1099,6 +2802,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2409,
+       "extent_vox": [
+        23,
+        7,
+        17
+       ],
+       "seed": 7,
+       "voxels": 353,
+       "vxa": "library/eurasian-jay/eurasian-jay-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-jay",
      "via": "kind",
@@ -1106,13 +2822,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 43013,
+       "extent_vox": [
+        75,
+        21,
+        52
+       ],
+       "seed": 7,
+       "voxels": 21747,
+       "vxa": "library/eurasian-lynx/eurasian-lynx-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "eurasian-lynx",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3940,
+       "extent_vox": [
+        37,
+        8,
+        17
+       ],
+       "seed": 7,
+       "voxels": 744,
+       "vxa": "library/eurasian-magpie/eurasian-magpie-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-magpie",
      "via": "kind",
@@ -1120,6 +2862,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2010,
+       "extent_vox": [
+        17,
+        6,
+        7
+       ],
+       "seed": 7,
+       "voxels": 254,
+       "vxa": "library/eurasian-nuthatch/eurasian-nuthatch-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-nuthatch",
      "via": "kind",
@@ -1127,6 +2882,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3745,
+       "extent_vox": [
+        33,
+        7,
+        14
+       ],
+       "seed": 7,
+       "voxels": 580,
+       "vxa": "library/eurasian-oystercatcher/eurasian-oystercatcher-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-oystercatcher",
      "via": "kind",
@@ -1134,6 +2902,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4846,
+       "extent_vox": [
+        15,
+        29,
+        9
+       ],
+       "seed": 7,
+       "voxels": 514,
+       "vxa": "library/eurasian-skylark/eurasian-skylark-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-skylark",
      "via": "kind",
@@ -1141,6 +2922,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9997,
+       "extent_vox": [
+        25,
+        47,
+        6
+       ],
+       "seed": 7,
+       "voxels": 1456,
+       "vxa": "library/eurasian-sparrowhawk/eurasian-sparrowhawk-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-sparrowhawk",
      "via": "kind",
@@ -1148,6 +2942,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 965,
+       "extent_vox": [
+        8,
+        4,
+        14
+       ],
+       "seed": 7,
+       "voxels": 108,
+       "vxa": "library/eurasian-treecreeper/eurasian-treecreeper-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-treecreeper",
      "via": "kind",
@@ -1155,6 +2962,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3875,
+       "extent_vox": [
+        24,
+        9,
+        10
+       ],
+       "seed": 7,
+       "voxels": 704,
+       "vxa": "library/eurasian-woodcock/eurasian-woodcock-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-woodcock",
      "via": "kind",
@@ -1162,6 +2982,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1580,
+       "extent_vox": [
+        12,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 216,
+       "vxa": "library/eurasian-wren/eurasian-wren-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "eurasian-wren",
      "via": "kind",
@@ -1169,6 +3002,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 739,
+       "extent_vox": [
+        17,
+        5,
+        7
+       ],
+       "seed": 7,
+       "voxels": 51,
+       "vxa": "library/european-anchovy/european-anchovy-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "european-anchovy",
      "via": "kind",
@@ -1176,20 +3022,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 12308,
+       "extent_vox": [
+        58,
+        13,
+        22
+       ],
+       "seed": 7,
+       "voxels": 4380,
+       "vxa": "library/european-badger/european-badger-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-badger",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 268640,
+       "extent_vox": [
+        232,
+        67,
+        151
+       ],
+       "seed": 7,
+       "voxels": 579604,
+       "vxa": "library/european-bison/european-bison-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-bison",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3349,
+       "extent_vox": [
+        30,
+        9,
+        9
+       ],
+       "seed": 7,
+       "voxels": 373,
+       "vxa": "library/european-flounder/european-flounder-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "european-flounder",
      "via": "kind",
@@ -1197,6 +3082,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1541,
+       "extent_vox": [
+        15,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 176,
+       "vxa": "library/european-goldfinch/european-goldfinch-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "european-goldfinch",
      "via": "kind",
@@ -1204,6 +3102,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4120,
+       "extent_vox": [
+        26,
+        9,
+        15
+       ],
+       "seed": 7,
+       "voxels": 748,
+       "vxa": "library/european-green-woodpecker/european-green-woodpecker-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "european-green-woodpecker",
      "via": "kind",
@@ -1211,6 +3122,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 8004,
+       "extent_vox": [
+        43,
+        9,
+        27
+       ],
+       "seed": 7,
+       "voxels": 2001,
+       "vxa": "library/european-hare/european-hare-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-hare",
      "via": "kind",
@@ -1218,6 +3142,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3351,
+       "extent_vox": [
+        18,
+        9,
+        14
+       ],
+       "seed": 7,
+       "voxels": 665,
+       "vxa": "library/european-hedgehog/european-hedgehog-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-hedgehog",
      "via": "kind",
@@ -1225,6 +3162,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3126,
+       "extent_vox": [
+        16,
+        15,
+        8
+       ],
+       "seed": 7,
+       "voxels": 510,
+       "vxa": "library/european-mole/european-mole-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-mole",
      "via": "kind",
@@ -1232,13 +3182,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 14328,
+       "extent_vox": [
+        97,
+        10,
+        21
+       ],
+       "seed": 7,
+       "voxels": 3670,
+       "vxa": "library/european-otter/european-otter-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-otter",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4614,
+       "extent_vox": [
+        31,
+        9,
+        10
+       ],
+       "seed": 7,
+       "voxels": 590,
+       "vxa": "library/european-plaice/european-plaice-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "european-plaice",
      "via": "kind",
@@ -1246,6 +3222,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3758,
+       "extent_vox": [
+        38,
+        7,
+        13
+       ],
+       "seed": 7,
+       "voxels": 664,
+       "vxa": "library/european-polecat/european-polecat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-polecat",
      "via": "kind",
@@ -1253,6 +3242,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4988,
+       "extent_vox": [
+        31,
+        7,
+        17
+       ],
+       "seed": 7,
+       "voxels": 1002,
+       "vxa": "library/european-rabbit/european-rabbit-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-rabbit",
      "via": "kind",
@@ -1260,6 +3262,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1770,
+       "extent_vox": [
+        17,
+        6,
+        13
+       ],
+       "seed": 7,
+       "voxels": 233,
+       "vxa": "library/european-robin/european-robin-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "european-robin",
      "via": "kind",
@@ -1267,13 +3282,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7884,
+       "extent_vox": [
+        61,
+        15,
+        23
+       ],
+       "seed": 7,
+       "voxels": 2169,
+       "vxa": "library/european-sea-bass/european-sea-bass-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "european-sea-bass",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2125,
+       "extent_vox": [
+        13,
+        7,
+        18
+       ],
+       "seed": 7,
+       "voxels": 316,
+       "vxa": "library/european-souslik/european-souslik-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-souslik",
      "via": "kind",
@@ -1281,6 +3322,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2240,
+       "extent_vox": [
+        15,
+        8,
+        12
+       ],
+       "seed": 7,
+       "voxels": 373,
+       "vxa": "library/european-stonechat/european-stonechat-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "european-stonechat",
      "via": "kind",
@@ -1288,6 +3342,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 17178,
+       "extent_vox": [
+        64,
+        13,
+        30
+       ],
+       "seed": 7,
+       "voxels": 5864,
+       "vxa": "library/european-wildcat/european-wildcat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "european-wildcat",
      "via": "kind",
@@ -1295,13 +3362,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 89561,
+       "extent_vox": [
+        97,
+        39,
+        109
+       ],
+       "seed": 7,
+       "voxels": 37888,
+       "vxa": "library/fallow-deer/fallow-deer-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "fallow-deer",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6543,
+       "extent_vox": [
+        42,
+        10,
+        22
+       ],
+       "seed": 7,
+       "voxels": 1408,
+       "vxa": "library/fennec-fox/fennec-fox-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "fennec-fox",
      "via": "kind",
@@ -1309,13 +3402,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 379319,
+       "extent_vox": [
+        413,
+        79,
+        55
+       ],
+       "seed": 7,
+       "voxels": 388027,
+       "vxa": "library/fin-whale/fin-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "fin-whale",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 50.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2335,
+       "extent_vox": [
+        28,
+        12,
+        6
+       ],
+       "seed": 7,
+       "voxels": 194,
+       "vxa": "library/fire-salamander/fire-salamander-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "fire-salamander",
      "via": "kind",
@@ -1323,6 +3442,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7783,
+       "extent_vox": [
+        66,
+        9,
+        20
+       ],
+       "seed": 7,
+       "voxels": 1921,
+       "vxa": "library/fisher/fisher-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "fisher",
      "via": "kind",
@@ -1330,6 +3462,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2274,
+       "extent_vox": [
+        32,
+        13,
+        9
+       ],
+       "seed": 7,
+       "voxels": 213,
+       "vxa": "library/flying-fish/flying-fish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "flying-fish",
      "via": "kind",
@@ -1337,20 +3482,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 123176,
+       "extent_vox": [
+        167,
+        45,
+        89
+       ],
+       "seed": 7,
+       "voxels": 149479,
+       "vxa": "library/forest-buffalo/forest-buffalo-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "forest-buffalo",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 12727,
+       "extent_vox": [
+        88,
+        12,
+        7
+       ],
+       "seed": 7,
+       "voxels": 2282,
+       "vxa": "library/freshwater-stingray/freshwater-stingray-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "freshwater-stingray",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3514,
+       "extent_vox": [
+        63,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 348,
+       "vxa": "library/garfish/garfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "garfish",
      "via": "kind",
@@ -1358,41 +3542,119 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 109486,
+       "extent_vox": [
+        140,
+        37,
+        153
+       ],
+       "seed": 7,
+       "voxels": 119177,
+       "vxa": "library/gemsbok/gemsbok-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "gemsbok",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 66655,
+       "extent_vox": [
+        168,
+        28,
+        51
+       ],
+       "seed": 7,
+       "voxels": 59767,
+       "vxa": "library/giant-anteater/giant-anteater-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "giant-anteater",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 501102,
+       "extent_vox": [
+        512,
+        70,
+        39
+       ],
+       "seed": 7,
+       "voxels": 419303,
+       "vxa": "library/giant-manta-ray/giant-manta-ray-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "giant-manta-ray",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 37151,
+       "extent_vox": [
+        154,
+        11,
+        27
+       ],
+       "seed": 7,
+       "voxels": 15200,
+       "vxa": "library/giant-moray/giant-moray-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "giant-moray",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 24749,
+       "extent_vox": [
+        97,
+        37,
+        51
+       ],
+       "seed": 7,
+       "voxels": 10218,
+       "vxa": "library/giant-trevally/giant-trevally-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "giant-trevally",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2695,
+       "extent_vox": [
+        16,
+        9,
+        12
+       ],
+       "seed": 7,
+       "voxels": 510,
+       "vxa": "library/goldcrest/goldcrest-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "goldcrest",
      "via": "kind",
@@ -1400,6 +3662,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3704,
+       "extent_vox": [
+        32,
+        13,
+        20
+       ],
+       "seed": 7,
+       "voxels": 1005,
+       "vxa": "library/golden-carp/golden-carp-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "golden-carp",
      "via": "kind",
@@ -1407,6 +3682,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 68592,
+       "extent_vox": [
+        59,
+        146,
+        20
+       ],
+       "seed": 7,
+       "voxels": 14326,
+       "vxa": "library/golden-eagle/golden-eagle-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "golden-eagle",
      "via": "kind",
@@ -1414,20 +3702,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 20903,
+       "extent_vox": [
+        76,
+        14,
+        46
+       ],
+       "seed": 7,
+       "voxels": 9403,
+       "vxa": "library/golden-jackal/golden-jackal-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "golden-jackal",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 19039,
+       "extent_vox": [
+        116,
+        15,
+        22
+       ],
+       "seed": 7,
+       "voxels": 5373,
+       "vxa": "library/great-barracuda/great-barracuda-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "great-barracuda",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 15309,
+       "extent_vox": [
+        62,
+        20,
+        42
+       ],
+       "seed": 7,
+       "voxels": 6305,
+       "vxa": "library/great-blue-turaco/great-blue-turaco-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-blue-turaco",
      "via": "kind",
@@ -1435,6 +3762,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 44285,
+       "extent_vox": [
+        68,
+        40,
+        57
+       ],
+       "seed": 7,
+       "voxels": 32764,
+       "vxa": "library/great-bustard/great-bustard-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-bustard",
      "via": "kind",
@@ -1442,6 +3782,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 12460,
+       "extent_vox": [
+        63,
+        16,
+        22
+       ],
+       "seed": 7,
+       "voxels": 4086,
+       "vxa": "library/great-cormorant/great-cormorant-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-cormorant",
      "via": "kind",
@@ -1449,6 +3802,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 37289,
+       "extent_vox": [
+        72,
+        36,
+        59
+       ],
+       "seed": 7,
+       "voxels": 28168,
+       "vxa": "library/great-curassow/great-curassow-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-curassow",
      "via": "kind",
@@ -1456,6 +3822,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 16610,
+       "extent_vox": [
+        75,
+        19,
+        26
+       ],
+       "seed": 7,
+       "voxels": 7171,
+       "vxa": "library/great-hornbill/great-hornbill-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-hornbill",
      "via": "kind",
@@ -1463,6 +3842,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 27397,
+       "extent_vox": [
+        39,
+        93,
+        14
+       ],
+       "seed": 7,
+       "voxels": 5181,
+       "vxa": "library/great-skua/great-skua-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-skua",
      "via": "kind",
@@ -1470,6 +3862,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1735,
+       "extent_vox": [
+        12,
+        6,
+        18
+       ],
+       "seed": 7,
+       "voxels": 294,
+       "vxa": "library/great-spotted-woodpecker/great-spotted-woodpecker-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-spotted-woodpecker",
      "via": "kind",
@@ -1477,6 +3882,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1896,
+       "extent_vox": [
+        18,
+        6,
+        13
+       ],
+       "seed": 7,
+       "voxels": 238,
+       "vxa": "library/great-tit/great-tit-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "great-tit",
      "via": "kind",
@@ -1484,27 +3902,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 98884,
+       "extent_vox": [
+        222,
+        91,
+        68
+       ],
+       "seed": 7,
+       "voxels": 65056,
+       "vxa": "library/great-white-shark/great-white-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "great-white-shark",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 189670,
+       "extent_vox": [
+        164,
+        67,
+        163
+       ],
+       "seed": 7,
+       "voxels": 207330,
+       "vxa": "library/greater-kudu/greater-kudu-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "greater-kudu",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 60995,
+       "extent_vox": [
+        80,
+        47,
+        91
+       ],
+       "seed": 7,
+       "voxels": 62143,
+       "vxa": "library/greater-rhea/greater-rhea-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "greater-rhea",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4949,
+       "extent_vox": [
+        39,
+        9,
+        21
+       ],
+       "seed": 7,
+       "voxels": 912,
+       "vxa": "library/greater-roadrunner/greater-roadrunner-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "greater-roadrunner",
      "via": "kind",
@@ -1512,6 +3982,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 11640,
+       "extent_vox": [
+        58,
+        15,
+        49
+       ],
+       "seed": 7,
+       "voxels": 3907,
+       "vxa": "library/grey-heron/grey-heron-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "grey-heron",
      "via": "kind",
@@ -1519,6 +4002,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 8645,
+       "extent_vox": [
+        28,
+        18,
+        16
+       ],
+       "seed": 7,
+       "voxels": 2885,
+       "vxa": "library/grey-partridge/grey-partridge-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "grey-partridge",
      "via": "kind",
@@ -1526,20 +4022,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 334985,
+       "extent_vox": [
+        316,
+        89,
+        59
+       ],
+       "seed": 7,
+       "voxels": 443317,
+       "vxa": "library/grey-whale/grey-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "grey-whale",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 50.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 51572,
+       "extent_vox": [
+        116,
+        27,
+        63
+       ],
+       "seed": 7,
+       "voxels": 36872,
+       "vxa": "library/grey-wolf/grey-wolf-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "grey-wolf",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 145032,
+       "extent_vox": [
+        82,
+        220,
+        30
+       ],
+       "seed": 7,
+       "voxels": 33997,
+       "vxa": "library/griffon-vulture/griffon-vulture-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "griffon-vulture",
      "via": "kind",
@@ -1547,13 +4082,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 82833,
+       "extent_vox": [
+        113,
+        31,
+        147
+       ],
+       "seed": 7,
+       "voxels": 96891,
+       "vxa": "library/guanaco/guanaco-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "guanaco",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1564,
+       "extent_vox": [
+        24,
+        7,
+        9
+       ],
+       "seed": 7,
+       "voxels": 185,
+       "vxa": "library/gudgeon/gudgeon-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "gudgeon",
      "via": "kind",
@@ -1561,13 +4122,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 71309,
+       "extent_vox": [
+        126,
+        43,
+        37
+       ],
+       "seed": 7,
+       "voxels": 40392,
+       "vxa": "library/harbour-porpoise/harbour-porpoise-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "harbour-porpoise",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 35684,
+       "extent_vox": [
+        83,
+        30,
+        58
+       ],
+       "seed": 7,
+       "voxels": 22307,
+       "vxa": "library/harpy-eagle/harpy-eagle-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "harpy-eagle",
      "via": "kind",
@@ -1575,6 +4162,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 19103,
+       "extent_vox": [
+        34,
+        79,
+        19
+       ],
+       "seed": 7,
+       "voxels": 3110,
+       "vxa": "library/hen-harrier/hen-harrier-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "hen-harrier",
      "via": "kind",
@@ -1582,6 +4182,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 39287,
+       "extent_vox": [
+        51,
+        123,
+        15
+       ],
+       "seed": 7,
+       "voxels": 6982,
+       "vxa": "library/herring-gull/herring-gull-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "herring-gull",
      "via": "kind",
@@ -1589,13 +4202,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 546184,
+       "extent_vox": [
+        284,
+        109,
+        137
+       ],
+       "seed": 7,
+       "voxels": 1423535,
+       "vxa": "library/hippopotamus/hippopotamus-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "hippopotamus",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 8664,
+       "extent_vox": [
+        42,
+        14,
+        38
+       ],
+       "seed": 7,
+       "voxels": 2716,
+       "vxa": "library/hoatzin/hoatzin-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "hoatzin",
      "via": "kind",
@@ -1603,6 +4242,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1450,
+       "extent_vox": [
+        16,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 135,
+       "vxa": "library/horned-lark/horned-lark-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "horned-lark",
      "via": "kind",
@@ -1610,6 +4262,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9925,
+       "extent_vox": [
+        43,
+        15,
+        30
+       ],
+       "seed": 7,
+       "voxels": 3235,
+       "vxa": "library/houbara-bustard/houbara-bustard-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "houbara-bustard",
      "via": "kind",
@@ -1617,6 +4282,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6612,
+       "extent_vox": [
+        17,
+        39,
+        8
+       ],
+       "seed": 7,
+       "voxels": 730,
+       "vxa": "library/hummingbird/hummingbird-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "hummingbird",
      "via": "kind",
@@ -1624,6 +4302,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 102684,
+       "extent_vox": [
+        172,
+        109,
+        36
+       ],
+       "seed": 7,
+       "voxels": 75474,
+       "vxa": "library/humpback-whale/humpback-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "humpback-whale",
      "via": "kind",
@@ -1631,20 +4322,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 50286,
+       "extent_vox": [
+        98,
+        37,
+        89
+       ],
+       "seed": 7,
+       "voxels": 39716,
+       "vxa": "library/impala/impala-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "impala",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 19982,
+       "extent_vox": [
+        60,
+        14,
+        61
+       ],
+       "seed": 7,
+       "voxels": 9696,
+       "vxa": "library/klipspringer/klipspringer-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "klipspringer",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 160847,
+       "extent_vox": [
+        96,
+        240,
+        33
+       ],
+       "seed": 7,
+       "voxels": 43410,
+       "vxa": "library/lappet-faced-vulture/lappet-faced-vulture-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "lappet-faced-vulture",
      "via": "kind",
@@ -1652,6 +4382,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3053,
+       "extent_vox": [
+        32,
+        8,
+        17
+       ],
+       "seed": 7,
+       "voxels": 426,
+       "vxa": "library/lesser-egyptian-jerboa/lesser-egyptian-jerboa-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "lesser-egyptian-jerboa",
      "via": "kind",
@@ -1659,6 +4402,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 989,
+       "extent_vox": [
+        22,
+        5,
+        7
+       ],
+       "seed": 7,
+       "voxels": 100,
+       "vxa": "library/lesser-sand-eel/lesser-sand-eel-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "lesser-sand-eel",
      "via": "kind",
@@ -1666,6 +4422,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2920,
+       "extent_vox": [
+        25,
+        7,
+        11
+       ],
+       "seed": 7,
+       "voxels": 477,
+       "vxa": "library/lilac-breasted-roller/lilac-breasted-roller-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "lilac-breasted-roller",
      "via": "kind",
@@ -1673,13 +4442,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 161177,
+       "extent_vox": [
+        230,
+        49,
+        97
+       ],
+       "seed": 7,
+       "voxels": 202196,
+       "vxa": "library/lion/lion-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "lion",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4609,
+       "extent_vox": [
+        34,
+        23,
+        27
+       ],
+       "seed": 7,
+       "voxels": 654,
+       "vxa": "library/lionfish/lionfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "lionfish",
      "via": "kind",
@@ -1687,6 +4482,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 5829,
+       "extent_vox": [
+        42,
+        12,
+        41
+       ],
+       "seed": 7,
+       "voxels": 1853,
+       "vxa": "library/little-egret/little-egret-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "little-egret",
      "via": "kind",
@@ -1694,6 +4502,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2491,
+       "extent_vox": [
+        16,
+        7,
+        13
+       ],
+       "seed": 7,
+       "voxels": 381,
+       "vxa": "library/little-owl/little-owl-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "little-owl",
      "via": "kind",
@@ -1701,13 +4522,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 138264,
+       "extent_vox": [
+        216,
+        77,
+        54
+       ],
+       "seed": 7,
+       "voxels": 138105,
+       "vxa": "library/long-finned-pilot-whale/long-finned-pilot-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "long-finned-pilot-whale",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 25.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1226,
+       "extent_vox": [
+        16,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 118,
+       "vxa": "library/long-tailed-tit/long-tailed-tit-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "long-tailed-tit",
      "via": "kind",
@@ -1715,13 +4562,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 88548,
+       "extent_vox": [
+        158,
+        37,
+        83
+       ],
+       "seed": 7,
+       "voxels": 106088,
+       "vxa": "library/lowland-tapir/lowland-tapir-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "lowland-tapir",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 52097,
+       "extent_vox": [
+        65,
+        167,
+        14
+       ],
+       "seed": 7,
+       "voxels": 9332,
+       "vxa": "library/magnificent-frigatebird/magnificent-frigatebird-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "magnificent-frigatebird",
      "via": "kind",
@@ -1729,13 +4602,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 13579,
+       "extent_vox": [
+        100,
+        21,
+        40
+       ],
+       "seed": 7,
+       "voxels": 5662,
+       "vxa": "library/mahi-mahi/mahi-mahi-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "mahi-mahi",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 14340,
+       "extent_vox": [
+        50,
+        22,
+        20
+       ],
+       "seed": 7,
+       "voxels": 6066,
+       "vxa": "library/mallard-duck/mallard-duck-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "mallard-duck",
      "via": "kind",
@@ -1743,6 +4642,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 20718,
+       "extent_vox": [
+        61,
+        21,
+        45
+       ],
+       "seed": 7,
+       "voxels": 13652,
+       "vxa": "library/mandrill/mandrill-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "mandrill",
      "via": "kind",
@@ -1750,13 +4662,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 49507,
+       "extent_vox": [
+        92,
+        25,
+        80
+       ],
+       "seed": 7,
+       "voxels": 36930,
+       "vxa": "library/maned-wolf/maned-wolf-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "maned-wolf",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 13737,
+       "extent_vox": [
+        32,
+        77,
+        8
+       ],
+       "seed": 7,
+       "voxels": 1627,
+       "vxa": "library/manx-shearwater/manx-shearwater-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "manx-shearwater",
      "via": "kind",
@@ -1764,13 +4702,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 12089,
+       "extent_vox": [
+        87,
+        29,
+        15
+       ],
+       "seed": 7,
+       "voxels": 2450,
+       "vxa": "library/marine-iguana/marine-iguana-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "marine-iguana",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1275,
+       "extent_vox": [
+        15,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 117,
+       "vxa": "library/meadow-pipit/meadow-pipit-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "meadow-pipit",
      "via": "kind",
@@ -1778,6 +4742,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2865,
+       "extent_vox": [
+        22,
+        6,
+        25
+       ],
+       "seed": 7,
+       "voxels": 380,
+       "vxa": "library/meerkat/meerkat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "meerkat",
      "via": "kind",
@@ -1785,20 +4762,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 329914,
+       "extent_vox": [
+        381,
+        73,
+        64
+       ],
+       "seed": 7,
+       "voxels": 334686,
+       "vxa": "library/minke-whale/minke-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "minke-whale",
-     "via": "kind",
-     "voxel_mm": 50.0
-    },
-    {
-     "curation": "approved",
-     "kind": "fish",
-     "name": "mirror-carp",
      "via": "kind",
      "voxel_mm": 25.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 22684,
+       "extent_vox": [
+        95,
+        27,
+        35
+       ],
+       "seed": 7,
+       "voxels": 10402,
+       "vxa": "library/mirror-carp/mirror-carp-0007/tree.vxa"
+      }
+     ],
+     "kind": "fish",
+     "name": "mirror-carp",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1644,
+       "extent_vox": [
+        21,
+        11,
+        39
+       ],
+       "seed": 7,
+       "voxels": 362,
+       "vxa": "library/moorish-idol/moorish-idol-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "moorish-idol",
      "via": "kind",
@@ -1806,20 +4822,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 213102,
+       "extent_vox": [
+        187,
+        70,
+        195
+       ],
+       "seed": 7,
+       "voxels": 303159,
+       "vxa": "library/moose/moose-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "moose",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 63527,
+       "extent_vox": [
+        114,
+        31,
+        85
+       ],
+       "seed": 7,
+       "voxels": 65844,
+       "vxa": "library/mountain-goat/mountain-goat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "mountain-goat",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6464,
+       "extent_vox": [
+        37,
+        9,
+        22
+       ],
+       "seed": 7,
+       "voxels": 1769,
+       "vxa": "library/mountain-hare/mountain-hare-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "mountain-hare",
      "via": "kind",
@@ -1827,6 +4882,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7424,
+       "extent_vox": [
+        43,
+        17,
+        13
+       ],
+       "seed": 7,
+       "voxels": 1279,
+       "vxa": "library/mud-catfish/mud-catfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "mud-catfish",
      "via": "kind",
@@ -1834,48 +4902,139 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 142672,
+       "extent_vox": [
+        166,
+        65,
+        90
+       ],
+       "seed": 7,
+       "voxels": 170511,
+       "vxa": "library/muskox/muskox-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "muskox",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 84524,
+       "extent_vox": [
+        152,
+        63,
+        74
+       ],
+       "seed": 7,
+       "voxels": 81100,
+       "vxa": "library/napoleon-wrasse/napoleon-wrasse-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "napoleon-wrasse",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 379285,
+       "extent_vox": [
+        358,
+        89,
+        59
+       ],
+       "seed": 7,
+       "voxels": 478895,
+       "vxa": "library/narwhal/narwhal-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "narwhal",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 126154,
+       "extent_vox": [
+        315,
+        85,
+        45
+       ],
+       "seed": 7,
+       "voxels": 73601,
+       "vxa": "library/nile-crocodile/nile-crocodile-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "nile-crocodile",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 12970,
+       "extent_vox": [
+        109,
+        29,
+        16
+       ],
+       "seed": 7,
+       "voxels": 1984,
+       "vxa": "library/nile-monitor/nile-monitor-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "nile-monitor",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 53784,
+       "extent_vox": [
+        161,
+        39,
+        58
+       ],
+       "seed": 7,
+       "voxels": 38205,
+       "vxa": "library/nile-perch/nile-perch-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "nile-perch",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2809,
+       "extent_vox": [
+        36,
+        11,
+        19
+       ],
+       "seed": 7,
+       "voxels": 625,
+       "vxa": "library/nile-tilapia/nile-tilapia-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "nile-tilapia",
      "via": "kind",
@@ -1883,20 +5042,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6578,
+       "extent_vox": [
+        64,
+        8,
+        17
+       ],
+       "seed": 7,
+       "voxels": 1231,
+       "vxa": "library/nine-banded-armadillo/nine-banded-armadillo-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "nine-banded-armadillo",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 13509,
+       "extent_vox": [
+        60,
+        13,
+        25
+       ],
+       "seed": 7,
+       "voxels": 5072,
+       "vxa": "library/north-american-porcupine/north-american-porcupine-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "north-american-porcupine",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 149685,
+       "extent_vox": [
+        189,
+        69,
+        40
+       ],
+       "seed": 7,
+       "voxels": 136860,
+       "vxa": "library/north-atlantic-right-whale/north-atlantic-right-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "north-atlantic-right-whale",
      "via": "kind",
@@ -1904,6 +5102,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 16902,
+       "extent_vox": [
+        35,
+        79,
+        9
+       ],
+       "seed": 7,
+       "voxels": 2948,
+       "vxa": "library/northern-fulmar/northern-fulmar-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "northern-fulmar",
      "via": "kind",
@@ -1911,6 +5122,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 51347,
+       "extent_vox": [
+        77,
+        161,
+        17
+       ],
+       "seed": 7,
+       "voxels": 12070,
+       "vxa": "library/northern-gannet/northern-gannet-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "northern-gannet",
      "via": "kind",
@@ -1918,6 +5142,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 25517,
+       "extent_vox": [
+        41,
+        84,
+        12
+       ],
+       "seed": 7,
+       "voxels": 3953,
+       "vxa": "library/northern-goshawk/northern-goshawk-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "northern-goshawk",
      "via": "kind",
@@ -1925,6 +5162,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3964,
+       "extent_vox": [
+        26,
+        10,
+        24
+       ],
+       "seed": 7,
+       "voxels": 808,
+       "vxa": "library/northern-lapwing/northern-lapwing-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "northern-lapwing",
      "via": "kind",
@@ -1932,6 +5182,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 11879,
+       "extent_vox": [
+        81,
+        15,
+        25
+       ],
+       "seed": 7,
+       "voxels": 3047,
+       "vxa": "library/northern-pike/northern-pike-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "northern-pike",
      "via": "kind",
@@ -1939,6 +5202,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2190,
+       "extent_vox": [
+        18,
+        7,
+        11
+       ],
+       "seed": 7,
+       "voxels": 271,
+       "vxa": "library/northern-wheatear/northern-wheatear-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "northern-wheatear",
      "via": "kind",
@@ -1946,6 +5222,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1546,
+       "extent_vox": [
+        14,
+        6,
+        8
+       ],
+       "seed": 7,
+       "voxels": 163,
+       "vxa": "library/norway-lemming/norway-lemming-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "norway-lemming",
      "via": "kind",
@@ -1953,27 +5242,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 162214,
+       "extent_vox": [
+        280,
+        71,
+        51
+       ],
+       "seed": 7,
+       "voxels": 147820,
+       "vxa": "library/nurse-shark/nurse-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "nurse-shark",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 59919,
+       "extent_vox": [
+        372,
+        17,
+        45
+       ],
+       "seed": 7,
+       "voxels": 40657,
+       "vxa": "library/oarfish/oarfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "oarfish",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 79919,
+       "extent_vox": [
+        141,
+        51,
+        249
+       ],
+       "seed": 7,
+       "voxels": 144896,
+       "vxa": "library/ocean-sunfish/ocean-sunfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "ocean-sunfish",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3410,
+       "extent_vox": [
+        49,
+        14,
+        8
+       ],
+       "seed": 7,
+       "voxels": 299,
+       "vxa": "library/ocellated-lizard/ocellated-lizard-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "ocellated-lizard",
      "via": "kind",
@@ -1981,20 +5322,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 157791,
+       "extent_vox": [
+        158,
+        43,
+        152
+       ],
+       "seed": 7,
+       "voxels": 180958,
+       "vxa": "library/okapi/okapi-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "okapi",
+     "via": "kind",
+     "voxel_mm": 12.5
+    },
+    {
+     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 310839,
+       "extent_vox": [
+        281,
+        119,
+        110
+       ],
+       "seed": 7,
+       "voxels": 369644,
+       "vxa": "library/orca/orca-0007/tree.vxa"
+      }
+     ],
+     "kind": "cetacean",
+     "name": "orca",
      "via": "kind",
      "voxel_mm": 25.0
     },
     {
      "curation": "approved",
-     "kind": "cetacean",
-     "name": "orca",
-     "via": "kind",
-     "voxel_mm": 50.0
-    },
-    {
-     "curation": "approved",
+     "grids": [
+      {
+       "bytes": 37052,
+       "extent_vox": [
+        47,
+        118,
+        17
+       ],
+       "seed": 7,
+       "voxels": 5761,
+       "vxa": "library/osprey/osprey-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "osprey",
      "via": "kind",
@@ -2002,6 +5382,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1184,
+       "extent_vox": [
+        18,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 118,
+       "vxa": "library/pale-minnow/pale-minnow-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "pale-minnow",
      "via": "kind",
@@ -2009,6 +5402,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6799,
+       "extent_vox": [
+        46,
+        17,
+        21
+       ],
+       "seed": 7,
+       "voxels": 1594,
+       "vxa": "library/parrotfish/parrotfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "parrotfish",
      "via": "kind",
@@ -2016,13 +5422,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6884,
+       "extent_vox": [
+        51,
+        17,
+        27
+       ],
+       "seed": 7,
+       "voxels": 2125,
+       "vxa": "library/peacock-cichlid/peacock-cichlid-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "peacock-cichlid",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 23917,
+       "extent_vox": [
+        41,
+        87,
+        11
+       ],
+       "seed": 7,
+       "voxels": 4066,
+       "vxa": "library/peregrine-falcon/peregrine-falcon-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "peregrine-falcon",
      "via": "kind",
@@ -2030,6 +5462,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9284,
+       "extent_vox": [
+        31,
+        15,
+        31
+       ],
+       "seed": 7,
+       "voxels": 4021,
+       "vxa": "library/pharaoh-eagle-owl/pharaoh-eagle-owl-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "pharaoh-eagle-owl",
      "via": "kind",
@@ -2037,6 +5482,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4805,
+       "extent_vox": [
+        37,
+        10,
+        19
+       ],
+       "seed": 7,
+       "voxels": 1041,
+       "vxa": "library/pied-avocet/pied-avocet-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "pied-avocet",
      "via": "kind",
@@ -2044,6 +5502,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1664,
+       "extent_vox": [
+        15,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 215,
+       "vxa": "library/pika/pika-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "pika",
      "via": "kind",
@@ -2051,6 +5522,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4499,
+       "extent_vox": [
+        22,
+        11,
+        45
+       ],
+       "seed": 7,
+       "voxels": 1555,
+       "vxa": "library/pileated-woodpecker/pileated-woodpecker-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "pileated-woodpecker",
      "via": "kind",
@@ -2058,6 +5542,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 8558,
+       "extent_vox": [
+        61,
+        7,
+        18
+       ],
+       "seed": 7,
+       "voxels": 2101,
+       "vxa": "library/pine-marten/pine-marten-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "pine-marten",
      "via": "kind",
@@ -2065,13 +5562,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 153287,
+       "extent_vox": [
+        198,
+        37,
+        136
+       ],
+       "seed": 7,
+       "voxels": 162039,
+       "vxa": "library/plains-zebra/plains-zebra-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "plains-zebra",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4171,
+       "extent_vox": [
+        19,
+        18,
+        10
+       ],
+       "seed": 7,
+       "voxels": 510,
+       "vxa": "library/poison-dart-frog/poison-dart-frog-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "poison-dart-frog",
      "via": "kind",
@@ -2079,6 +5602,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 16054,
+       "extent_vox": [
+        37,
+        33,
+        22
+       ],
+       "seed": 7,
+       "voxels": 4879,
+       "vxa": "library/porcupinefish/porcupinefish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "porcupinefish",
      "via": "kind",
@@ -2086,27 +5622,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 43007,
+       "extent_vox": [
+        88,
+        18,
+        89
+       ],
+       "seed": 7,
+       "voxels": 23644,
+       "vxa": "library/pronghorn/pronghorn-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "pronghorn",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 117867,
+       "extent_vox": [
+        164,
+        33,
+        115
+       ],
+       "seed": 7,
+       "voxels": 95690,
+       "vxa": "library/przewalskis-horse/przewalskis-horse-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "przewalskis-horse",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9203,
+       "extent_vox": [
+        50,
+        9,
+        18
+       ],
+       "seed": 7,
+       "voxels": 2113,
+       "vxa": "library/raccoon/raccoon-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "raccoon",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1469,
+       "extent_vox": [
+        22,
+        9,
+        17
+       ],
+       "seed": 7,
+       "voxels": 296,
+       "vxa": "library/racoon-butterflyfish/racoon-butterflyfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "racoon-butterflyfish",
      "via": "kind",
@@ -2114,6 +5702,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2829,
+       "extent_vox": [
+        32,
+        9,
+        12
+       ],
+       "seed": 7,
+       "voxels": 383,
+       "vxa": "library/rainbow-trout/rainbow-trout-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "rainbow-trout",
      "via": "kind",
@@ -2121,6 +5722,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7070,
+       "extent_vox": [
+        21,
+        16,
+        31
+       ],
+       "seed": 7,
+       "voxels": 3622,
+       "vxa": "library/razorbill/razorbill-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "razorbill",
      "via": "kind",
@@ -2128,6 +5742,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1884,
+       "extent_vox": [
+        27,
+        9,
+        16
+       ],
+       "seed": 7,
+       "voxels": 323,
+       "vxa": "library/red-bellied-piranha/red-bellied-piranha-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "red-bellied-piranha",
      "via": "kind",
@@ -2135,6 +5762,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3000,
+       "extent_vox": [
+        27,
+        8,
+        13
+       ],
+       "seed": 7,
+       "voxels": 571,
+       "vxa": "library/red-billed-chough/red-billed-chough-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "red-billed-chough",
      "via": "kind",
@@ -2142,34 +5782,99 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 64814,
+       "extent_vox": [
+        123,
+        24,
+        102
+       ],
+       "seed": 7,
+       "voxels": 54710,
+       "vxa": "library/red-deer-hind/red-deer-hind-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "red-deer-hind",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 125826,
+       "extent_vox": [
+        150,
+        54,
+        192
+       ],
+       "seed": 7,
+       "voxels": 133285,
+       "vxa": "library/red-deer-stag/red-deer-stag-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "red-deer-stag",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 15718,
+       "extent_vox": [
+        76,
+        11,
+        34
+       ],
+       "seed": 7,
+       "voxels": 5213,
+       "vxa": "library/red-fox/red-fox-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "red-fox",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 65103,
+       "extent_vox": [
+        112,
+        27,
+        123
+       ],
+       "seed": 7,
+       "voxels": 47979,
+       "vxa": "library/red-kangaroo/red-kangaroo-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "red-kangaroo",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 57427,
+       "extent_vox": [
+        55,
+        150,
+        13
+       ],
+       "seed": 7,
+       "voxels": 8934,
+       "vxa": "library/red-kite/red-kite-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "red-kite",
      "via": "kind",
@@ -2177,13 +5882,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 48292,
+       "extent_vox": [
+        108,
+        31,
+        60
+       ],
+       "seed": 7,
+       "voxels": 44740,
+       "vxa": "library/red-river-hog/red-river-hog-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "red-river-hog",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2893,
+       "extent_vox": [
+        29,
+        6,
+        24
+       ],
+       "seed": 7,
+       "voxels": 348,
+       "vxa": "library/red-squirrel/red-squirrel-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "red-squirrel",
      "via": "kind",
@@ -2191,13 +5922,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 33464,
+       "extent_vox": [
+        143,
+        41,
+        34
+       ],
+       "seed": 7,
+       "voxels": 12325,
+       "vxa": "library/reef-shark/reef-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "reef-shark",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1549,
+       "extent_vox": [
+        19,
+        9,
+        17
+       ],
+       "seed": 7,
+       "voxels": 245,
+       "vxa": "library/reef-tang/reef-tang-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "reef-tang",
      "via": "kind",
@@ -2205,13 +5962,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 100177,
+       "extent_vox": [
+        127,
+        46,
+        120
+       ],
+       "seed": 7,
+       "voxels": 103972,
+       "vxa": "library/reindeer/reindeer-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "reindeer",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3909,
+       "extent_vox": [
+        42,
+        9,
+        11
+       ],
+       "seed": 7,
+       "voxels": 551,
+       "vxa": "library/remora/remora-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "remora",
      "via": "kind",
@@ -2219,6 +6002,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1940,
+       "extent_vox": [
+        17,
+        7,
+        8
+       ],
+       "seed": 7,
+       "voxels": 219,
+       "vxa": "library/ringed-plover/ringed-plover-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "ringed-plover",
      "via": "kind",
@@ -2226,13 +6022,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 405499,
+       "extent_vox": [
+        332,
+        107,
+        101
+       ],
+       "seed": 7,
+       "voxels": 461621,
+       "vxa": "library/rissos-dolphin/rissos-dolphin-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "rissos-dolphin",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7234,
+       "extent_vox": [
+        55,
+        11,
+        11
+       ],
+       "seed": 7,
+       "voxels": 982,
+       "vxa": "library/river-eel/river-eel-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "river-eel",
      "via": "kind",
@@ -2240,6 +6062,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1364,
+       "extent_vox": [
+        24,
+        7,
+        11
+       ],
+       "seed": 7,
+       "voxels": 155,
+       "vxa": "library/river-perch/river-perch-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "river-perch",
      "via": "kind",
@@ -2247,6 +6082,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1574,
+       "extent_vox": [
+        26,
+        7,
+        11
+       ],
+       "seed": 7,
+       "voxels": 177,
+       "vxa": "library/roach/roach-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "roach",
      "via": "kind",
@@ -2254,13 +6102,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7870,
+       "extent_vox": [
+        38,
+        11,
+        19
+       ],
+       "seed": 7,
+       "voxels": 2076,
+       "vxa": "library/rock-hyrax/rock-hyrax-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "rock-hyrax",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2975,
+       "extent_vox": [
+        24,
+        8,
+        11
+       ],
+       "seed": 7,
+       "voxels": 551,
+       "vxa": "library/rock-pigeon/rock-pigeon-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "rock-pigeon",
      "via": "kind",
@@ -2268,6 +6142,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4175,
+       "extent_vox": [
+        27,
+        11,
+        12
+       ],
+       "seed": 7,
+       "voxels": 1027,
+       "vxa": "library/rock-ptarmigan/rock-ptarmigan-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "rock-ptarmigan",
      "via": "kind",
@@ -2275,13 +6162,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 31817,
+       "extent_vox": [
+        78,
+        17,
+        79
+       ],
+       "seed": 7,
+       "voxels": 16788,
+       "vxa": "library/roe-deer/roe-deer-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "roe-deer",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2029,
+       "extent_vox": [
+        29,
+        9,
+        14
+       ],
+       "seed": 7,
+       "voxels": 351,
+       "vxa": "library/rudd/rudd-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "rudd",
      "via": "kind",
@@ -2289,6 +6202,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2635,
+       "extent_vox": [
+        19,
+        7,
+        9
+       ],
+       "seed": 7,
+       "voxels": 370,
+       "vxa": "library/ruddy-turnstone/ruddy-turnstone-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "ruddy-turnstone",
      "via": "kind",
@@ -2296,13 +6222,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 45847,
+       "extent_vox": [
+        99,
+        20,
+        89
+       ],
+       "seed": 7,
+       "voxels": 29443,
+       "vxa": "library/saiga-antelope/saiga-antelope-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "saiga-antelope",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9908,
+       "extent_vox": [
+        50,
+        9,
+        26
+       ],
+       "seed": 7,
+       "voxels": 2680,
+       "vxa": "library/sand-cat/sand-cat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "sand-cat",
      "via": "kind",
@@ -2310,6 +6262,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 724,
+       "extent_vox": [
+        16,
+        5,
+        8
+       ],
+       "seed": 7,
+       "voxels": 61,
+       "vxa": "library/sand-goby/sand-goby-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "sand-goby",
      "via": "kind",
@@ -2317,6 +6282,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2970,
+       "extent_vox": [
+        38,
+        13,
+        7
+       ],
+       "seed": 7,
+       "voxels": 264,
+       "vxa": "library/sand-lizard/sand-lizard-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "sand-lizard",
      "via": "kind",
@@ -2324,6 +6302,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1730,
+       "extent_vox": [
+        16,
+        6,
+        7
+       ],
+       "seed": 7,
+       "voxels": 184,
+       "vxa": "library/sanderling/sanderling-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "sanderling",
      "via": "kind",
@@ -2331,6 +6322,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 11906,
+       "extent_vox": [
+        27,
+        69,
+        9
+       ],
+       "seed": 7,
+       "voxels": 1207,
+       "vxa": "library/sandwich-tern/sandwich-tern-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "sandwich-tern",
      "via": "kind",
@@ -2338,6 +6342,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 994,
+       "extent_vox": [
+        19,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 88,
+       "vxa": "library/sardine/sardine-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "sardine",
      "via": "kind",
@@ -2345,13 +6362,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 234769,
+       "extent_vox": [
+        382,
+        111,
+        79
+       ],
+       "seed": 7,
+       "voxels": 134951,
+       "vxa": "library/scalloped-hammerhead/scalloped-hammerhead-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "scalloped-hammerhead",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9715,
+       "extent_vox": [
+        66,
+        14,
+        29
+       ],
+       "seed": 7,
+       "voxels": 3062,
+       "vxa": "library/scarlet-macaw/scarlet-macaw-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "scarlet-macaw",
      "via": "kind",
@@ -2359,6 +6402,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1685,
+       "extent_vox": [
+        16,
+        7,
+        10
+       ],
+       "seed": 7,
+       "voxels": 246,
+       "vxa": "library/scarlet-tanager/scarlet-tanager-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "scarlet-tanager",
      "via": "kind",
@@ -2366,6 +6422,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 17114,
+       "extent_vox": [
+        86,
+        16,
+        73
+       ],
+       "seed": 7,
+       "voxels": 5628,
+       "vxa": "library/secretary-bird/secretary-bird-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "secretary-bird",
      "via": "kind",
@@ -2373,13 +6442,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 307449,
+       "extent_vox": [
+        378,
+        79,
+        67
+       ],
+       "seed": 7,
+       "voxels": 379358,
+       "vxa": "library/sei-whale/sei-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "sei-whale",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 50.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 974,
+       "extent_vox": [
+        16,
+        5,
+        8
+       ],
+       "seed": 7,
+       "voxels": 103,
+       "vxa": "library/shanny/shanny-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "shanny",
      "via": "kind",
@@ -2387,6 +6482,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 929,
+       "extent_vox": [
+        22,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 83,
+       "vxa": "library/shoal-herring/shoal-herring-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "shoal-herring",
      "via": "kind",
@@ -2394,13 +6502,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 155904,
+       "extent_vox": [
+        280,
+        75,
+        90
+       ],
+       "seed": 7,
+       "voxels": 155556,
+       "vxa": "library/shortfin-mako/shortfin-mako-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "shortfin-mako",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1855,
+       "extent_vox": [
+        25,
+        6,
+        10
+       ],
+       "seed": 7,
+       "voxels": 209,
+       "vxa": "library/siberian-flying-squirrel/siberian-flying-squirrel-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "siberian-flying-squirrel",
      "via": "kind",
@@ -2408,6 +6542,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 18792,
+       "extent_vox": [
+        56,
+        12,
+        49
+       ],
+       "seed": 7,
+       "voxels": 7381,
+       "vxa": "library/siberian-musk-deer/siberian-musk-deer-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "siberian-musk-deer",
      "via": "kind",
@@ -2415,13 +6562,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 71771,
+       "extent_vox": [
+        94,
+        25,
+        103
+       ],
+       "seed": 7,
+       "voxels": 29172,
+       "vxa": "library/sika-deer/sika-deer-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "sika-deer",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2175,
+       "extent_vox": [
+        44,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 238,
+       "vxa": "library/small-indian-mongoose/small-indian-mongoose-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "small-indian-mongoose",
      "via": "kind",
@@ -2429,13 +6602,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 10999,
+       "extent_vox": [
+        83,
+        15,
+        13
+       ],
+       "seed": 7,
+       "voxels": 1929,
+       "vxa": "library/small-spotted-catshark/small-spotted-catshark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "small-spotted-catshark",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3149,
+       "extent_vox": [
+        41,
+        11,
+        15
+       ],
+       "seed": 7,
+       "voxels": 545,
+       "vxa": "library/smallmouth-bass/smallmouth-bass-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "smallmouth-bass",
      "via": "kind",
@@ -2443,6 +6642,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1705,
+       "extent_vox": [
+        17,
+        6,
+        9
+       ],
+       "seed": 7,
+       "voxels": 217,
+       "vxa": "library/snow-bunting/snow-bunting-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "snow-bunting",
      "via": "kind",
@@ -2450,6 +6662,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 16605,
+       "extent_vox": [
+        45,
+        22,
+        41
+       ],
+       "seed": 7,
+       "voxels": 10790,
+       "vxa": "library/snowy-owl/snowy-owl-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "snowy-owl",
      "via": "kind",
@@ -2457,6 +6682,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2945,
+       "extent_vox": [
+        20,
+        8,
+        10
+       ],
+       "seed": 7,
+       "voxels": 416,
+       "vxa": "library/snowy-plover/snowy-plover-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "snowy-plover",
      "via": "kind",
@@ -2464,6 +6702,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2055,
+       "extent_vox": [
+        18,
+        7,
+        12
+       ],
+       "seed": 7,
+       "voxels": 293,
+       "vxa": "library/song-thrush/song-thrush-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "song-thrush",
      "via": "kind",
@@ -2471,6 +6722,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 17342,
+       "extent_vox": [
+        33,
+        85,
+        8
+       ],
+       "seed": 7,
+       "voxels": 1885,
+       "vxa": "library/sooty-tern/sooty-tern-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "sooty-tern",
      "via": "kind",
@@ -2478,27 +6742,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 27300,
+       "extent_vox": [
+        137,
+        38,
+        21
+       ],
+       "seed": 7,
+       "voxels": 6926,
+       "vxa": "library/spectacled-caiman/spectacled-caiman-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "spectacled-caiman",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 298669,
+       "extent_vox": [
+        304,
+        95,
+        60
+       ],
+       "seed": 7,
+       "voxels": 459324,
+       "vxa": "library/sperm-whale/sperm-whale-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "sperm-whale",
      "via": "kind",
-     "voxel_mm": 100.0
+     "voxel_mm": 50.0
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 119314,
+       "extent_vox": [
+        198,
+        59,
+        47
+       ],
+       "seed": 7,
+       "voxels": 71065,
+       "vxa": "library/spinner-dolphin/spinner-dolphin-0007/tree.vxa"
+      }
+     ],
      "kind": "cetacean",
      "name": "spinner-dolphin",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3330,
+       "extent_vox": [
+        27,
+        15,
+        7
+       ],
+       "seed": 7,
+       "voxels": 337,
+       "vxa": "library/spiny-tailed-lizard/spiny-tailed-lizard-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "spiny-tailed-lizard",
      "via": "kind",
@@ -2506,20 +6822,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 70872,
+       "extent_vox": [
+        228,
+        24,
+        14
+       ],
+       "seed": 7,
+       "voxels": 19786,
+       "vxa": "library/spotted-eagle-ray/spotted-eagle-ray-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "spotted-eagle-ray",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 66967,
+       "extent_vox": [
+        110,
+        29,
+        68
+       ],
+       "seed": 7,
+       "voxels": 37851,
+       "vxa": "library/spotted-hyena/spotted-hyena-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "spotted-hyena",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6203,
+       "extent_vox": [
+        48,
+        9,
+        16
+       ],
+       "seed": 7,
+       "voxels": 1305,
+       "vxa": "library/steppe-polecat/steppe-polecat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "steppe-polecat",
      "via": "kind",
@@ -2527,6 +6882,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1963,
+       "extent_vox": [
+        26,
+        6,
+        10
+       ],
+       "seed": 7,
+       "voxels": 249,
+       "vxa": "library/stoat/stoat-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "stoat",
      "via": "kind",
@@ -2534,6 +6902,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1399,
+       "extent_vox": [
+        21,
+        5,
+        9
+       ],
+       "seed": 7,
+       "voxels": 136,
+       "vxa": "library/stone-loach/stone-loach-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "stone-loach",
      "via": "kind",
@@ -2541,20 +6922,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 38582,
+       "extent_vox": [
+        89,
+        21,
+        56
+       ],
+       "seed": 7,
+       "voxels": 17999,
+       "vxa": "library/striped-hyena/striped-hyena-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "striped-hyena",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 6218,
+       "extent_vox": [
+        45,
+        7,
+        30
+       ],
+       "seed": 7,
+       "voxels": 1247,
+       "vxa": "library/striped-skunk/striped-skunk-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "striped-skunk",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3515,
+       "extent_vox": [
+        33,
+        7,
+        16
+       ],
+       "seed": 7,
+       "voxels": 606,
+       "vxa": "library/sunbittern/sunbittern-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "sunbittern",
      "via": "kind",
@@ -2562,20 +6982,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 102464,
+       "extent_vox": [
+        284,
+        49,
+        91
+       ],
+       "seed": 7,
+       "voxels": 90276,
+       "vxa": "library/swordfish/swordfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "swordfish",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 45724,
+       "extent_vox": [
+        151,
+        27,
+        38
+       ],
+       "seed": 7,
+       "voxels": 20798,
+       "vxa": "library/taimen/taimen-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "taimen",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 5735,
+       "extent_vox": [
+        24,
+        11,
+        21
+       ],
+       "seed": 7,
+       "voxels": 1374,
+       "vxa": "library/tawny-owl/tawny-owl-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "tawny-owl",
      "via": "kind",
@@ -2583,6 +7042,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4104,
+       "extent_vox": [
+        35,
+        13,
+        16
+       ],
+       "seed": 7,
+       "voxels": 925,
+       "vxa": "library/tench/tench-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "tench",
      "via": "kind",
@@ -2590,20 +7062,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 11794,
+       "extent_vox": [
+        59,
+        17,
+        21
+       ],
+       "seed": 7,
+       "voxels": 2553,
+       "vxa": "library/thick-lipped-mullet/thick-lipped-mullet-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "thick-lipped-mullet",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9552,
+       "extent_vox": [
+        64,
+        11,
+        6
+       ],
+       "seed": 7,
+       "voxels": 1488,
+       "vxa": "library/thornback-ray/thornback-ray-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "thornback-ray",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1054,
+       "extent_vox": [
+        21,
+        5,
+        8
+       ],
+       "seed": 7,
+       "voxels": 104,
+       "vxa": "library/three-spined-stickleback/three-spined-stickleback-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "three-spined-stickleback",
      "via": "kind",
@@ -2611,20 +7122,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 346649,
+       "extent_vox": [
+        637,
+        141,
+        108
+       ],
+       "seed": 7,
+       "voxels": 462312,
+       "vxa": "library/thresher-shark/thresher-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "thresher-shark",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 228319,
+       "extent_vox": [
+        389,
+        121,
+        94
+       ],
+       "seed": 7,
+       "voxels": 301682,
+       "vxa": "library/tiger-shark/tiger-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "tiger-shark",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7030,
+       "extent_vox": [
+        52,
+        11,
+        20
+       ],
+       "seed": 7,
+       "voxels": 1780,
+       "vxa": "library/toco-toucan/toco-toucan-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "toco-toucan",
      "via": "kind",
@@ -2632,6 +7182,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2045,
+       "extent_vox": [
+        18,
+        7,
+        12
+       ],
+       "seed": 7,
+       "voxels": 357,
+       "vxa": "library/trumpeter-finch/trumpeter-finch-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "trumpeter-finch",
      "via": "kind",
@@ -2639,27 +7202,79 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 20179,
+       "extent_vox": [
+        51,
+        25,
+        21
+       ],
+       "seed": 7,
+       "voxels": 5289,
+       "vxa": "library/turbot/turbot-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "turbot",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 51908,
+       "extent_vox": [
+        90,
+        25,
+        119
+       ],
+       "seed": 7,
+       "voxels": 50026,
+       "vxa": "library/vicuna/vicuna-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "vicuna",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 4788,
+       "extent_vox": [
+        53,
+        8,
+        15
+       ],
+       "seed": 7,
+       "voxels": 897,
+       "vxa": "library/virginia-opossum/virginia-opossum-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "virginia-opossum",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2420,
+       "extent_vox": [
+        28,
+        12,
+        6
+       ],
+       "seed": 7,
+       "voxels": 201,
+       "vxa": "library/viviparous-lizard/viviparous-lizard-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "viviparous-lizard",
      "via": "kind",
@@ -2667,6 +7282,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 5487,
+       "extent_vox": [
+        16,
+        29,
+        8
+       ],
+       "seed": 7,
+       "voxels": 638,
+       "vxa": "library/wallcreeper/wallcreeper-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "wallcreeper",
      "via": "kind",
@@ -2674,6 +7302,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 128842,
+       "extent_vox": [
+        107,
+        283,
+        36
+       ],
+       "seed": 7,
+       "voxels": 55652,
+       "vxa": "library/wandering-albatross/wandering-albatross-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "wandering-albatross",
      "via": "kind",
@@ -2681,20 +7322,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 33707,
+       "extent_vox": [
+        88,
+        25,
+        68
+       ],
+       "seed": 7,
+       "voxels": 23235,
+       "vxa": "library/warthog/warthog-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "warthog",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 26540,
+       "extent_vox": [
+        145,
+        43,
+        22
+       ],
+       "seed": 7,
+       "voxels": 5769,
+       "vxa": "library/water-monitor/water-monitor-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "water-monitor",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2115,
+       "extent_vox": [
+        17,
+        7,
+        13
+       ],
+       "seed": 7,
+       "voxels": 427,
+       "vxa": "library/wattled-jacana/wattled-jacana-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "wattled-jacana",
      "via": "kind",
@@ -2702,13 +7382,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 83939,
+       "extent_vox": [
+        165,
+        45,
+        45
+       ],
+       "seed": 7,
+       "voxels": 46423,
+       "vxa": "library/wels-catfish/wels-catfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "wels-catfish",
      "via": "kind",
-     "voxel_mm": 50.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 24210,
+       "extent_vox": [
+        59,
+        32,
+        32
+       ],
+       "seed": 7,
+       "voxels": 16798,
+       "vxa": "library/western-capercaillie/western-capercaillie-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "western-capercaillie",
      "via": "kind",
@@ -2716,6 +7422,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3525,
+       "extent_vox": [
+        27,
+        9,
+        14
+       ],
+       "seed": 7,
+       "voxels": 682,
+       "vxa": "library/western-jackdaw/western-jackdaw-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "western-jackdaw",
      "via": "kind",
@@ -2723,13 +7442,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 76034,
+       "extent_vox": [
+        103,
+        34,
+        84
+       ],
+       "seed": 7,
+       "voxels": 71823,
+       "vxa": "library/western-lowland-gorilla/western-lowland-gorilla-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "western-lowland-gorilla",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 2200,
+       "extent_vox": [
+        19,
+        7,
+        11
+       ],
+       "seed": 7,
+       "voxels": 318,
+       "vxa": "library/western-meadowlark/western-meadowlark-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "western-meadowlark",
      "via": "kind",
@@ -2737,6 +7482,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1239,
+       "extent_vox": [
+        21,
+        5,
+        10
+       ],
+       "seed": 7,
+       "voxels": 143,
+       "vxa": "library/western-mosquitofish/western-mosquitofish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "western-mosquitofish",
      "via": "kind",
@@ -2744,6 +7502,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 247934,
+       "extent_vox": [
+        303,
+        123,
+        75
+       ],
+       "seed": 7,
+       "voxels": 235170,
+       "vxa": "library/whale-shark/whale-shark-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "whale-shark",
      "via": "kind",
@@ -2751,13 +7522,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 349926,
+       "extent_vox": [
+        264,
+        81,
+        128
+       ],
+       "seed": 7,
+       "voxels": 848974,
+       "vxa": "library/white-rhinoceros/white-rhinoceros-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "white-rhinoceros",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 20980,
+       "extent_vox": [
+        84,
+        23,
+        60
+       ],
+       "seed": 7,
+       "voxels": 11143,
+       "vxa": "library/white-stork/white-stork-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "white-stork",
      "via": "kind",
@@ -2765,20 +7562,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 75271,
+       "extent_vox": [
+        114,
+        36,
+        129
+       ],
+       "seed": 7,
+       "voxels": 58925,
+       "vxa": "library/white-tailed-deer/white-tailed-deer-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "white-tailed-deer",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 38932,
+       "extent_vox": [
+        98,
+        21,
+        61
+       ],
+       "seed": 7,
+       "voxels": 23145,
+       "vxa": "library/wild-boar/wild-boar-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "wild-boar",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 46805,
+       "extent_vox": [
+        88,
+        45,
+        56
+       ],
+       "seed": 7,
+       "voxels": 47167,
+       "vxa": "library/wild-turkey/wild-turkey-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "wild-turkey",
      "via": "kind",
@@ -2786,13 +7622,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 341535,
+       "extent_vox": [
+        257,
+        87,
+        154
+       ],
+       "seed": 7,
+       "voxels": 980131,
+       "vxa": "library/wild-yak/wild-yak-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "wild-yak",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 9947,
+       "extent_vox": [
+        21,
+        57,
+        8
+       ],
+       "seed": 7,
+       "voxels": 1149,
+       "vxa": "library/wilsons-storm-petrel/wilsons-storm-petrel-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "wilsons-storm-petrel",
      "via": "kind",
@@ -2800,20 +7662,59 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 20553,
+       "extent_vox": [
+        71,
+        19,
+        31
+       ],
+       "seed": 7,
+       "voxels": 11336,
+       "vxa": "library/wolverine/wolverine-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "wolverine",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 281595,
+       "extent_vox": [
+        239,
+        66,
+        150
+       ],
+       "seed": 7,
+       "voxels": 577516,
+       "vxa": "library/wood-bison/wood-bison-0007/tree.vxa"
+      }
+     ],
      "kind": "quadruped",
      "name": "wood-bison",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1926,
+       "extent_vox": [
+        19,
+        7,
+        10
+       ],
+       "seed": 7,
+       "voxels": 260,
+       "vxa": "library/wood-thrush/wood-thrush-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "wood-thrush",
      "via": "kind",
@@ -2821,6 +7722,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 3799,
+       "extent_vox": [
+        21,
+        13,
+        11
+       ],
+       "seed": 7,
+       "voxels": 884,
+       "vxa": "library/yellow-boxfish/yellow-boxfish-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "yellow-boxfish",
      "via": "kind",
@@ -2828,13 +7742,39 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 57264,
+       "extent_vox": [
+        172,
+        43,
+        67
+       ],
+       "seed": 7,
+       "voxels": 42409,
+       "vxa": "library/yellowfin-tuna/yellowfin-tuna-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "yellowfin-tuna",
      "via": "kind",
-     "voxel_mm": 25.0
+     "voxel_mm": 12.5
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 1391,
+       "extent_vox": [
+        16,
+        5,
+        10
+       ],
+       "seed": 7,
+       "voxels": 163,
+       "vxa": "library/yellowhammer/yellowhammer-0007/tree.vxa"
+      }
+     ],
      "kind": "bird",
      "name": "yellowhammer",
      "via": "kind",
@@ -2842,6 +7782,19 @@
     },
     {
      "curation": "approved",
+     "grids": [
+      {
+       "bytes": 7359,
+       "extent_vox": [
+        74,
+        13,
+        22
+       ],
+       "seed": 7,
+       "voxels": 1941,
+       "vxa": "library/zander/zander-0007/tree.vxa"
+      }
+     ],
      "kind": "fish",
      "name": "zander",
      "via": "kind",
@@ -3169,14 +8122,14 @@
      "curation": "approved",
      "grids": [
       {
-       "bytes": 23108,
+       "bytes": 30033,
        "extent_vox": [
-        43,
-        43,
+        52,
+        55,
         29
        ],
        "seed": 1,
-       "voxels": 6983,
+       "voxels": 9453,
        "vxa": "library/bramble-thicket/bramble-thicket-0001/tree.vxa"
       }
      ],

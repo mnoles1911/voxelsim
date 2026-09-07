@@ -20,16 +20,11 @@
 //
 // -- THE MIRROR HAZARDS IN THIS PARTICULAR CARVE, NAMED -------------------
 //
-// A. INTEGER DIVISION DIRECTION. Match C++ truncation toward zero using
-//    unsigned-magnitude division so mixed signs are portable across GPUs.
-//    This file uses karstTruncDiv, NOT floorDiv: floorDiv
-//    exists for LATTICE indexing, where truncation and floor genuinely differ
-//    and floor is the correct answer. Here every division is either by a
-//    positive denominator with the numerator's sign preserved (karstLerp,
-//    karstFoot) or wholly non-negative (marginSq), so truncation is both
-//    correct and identical on the two sides. Getting this backwards -- using
-//    floorDiv here, or plain division for a lattice -- is the class of bug the
-//    mirror exists to prevent.
+// A. INTEGER DIVISION DIRECTION. The CPU truncates toward zero. Bare HLSL
+//    signed division with mixed signs is not portable across SPIR-V vendors.
+//    karstTruncDiv reconstructs the sign around unsigned magnitude division,
+//    matching C++ truncation without changing any worldgen rounding. Do not
+//    substitute floor division: negative conduit interpolation differs.
 //
 // B. 64-BIT INTERMEDIATES ARE REQUIRED, NOT OPTIONAL. `rV*rV * (rH*rH - dSq)`
 //    peaks near 2.1e16 with the radii this carve permits, which overflows int32
@@ -55,19 +50,6 @@
 #define KARST_ENTRANCE    6
 
 #define kMaxKarstSegs 8
-
-// Preserve C++ truncation toward zero using unsigned magnitudes, as in
-// worldgen.ush's truncDiv. Bare signed division is not portable across GPUs.
-uint64_t karstMagnitude(int64_t v) {
-    const uint64_t u = (uint64_t)v;
-    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - defined unsigned negation recovers the magnitude, including INT64_MIN
-    return v < 0 ? (uint64_t)0 - u : u;
-}
-int64_t karstTruncDiv(int64_t a, int64_t b) {
-    const uint64_t q = karstMagnitude(a) / karstMagnitude(b);
-    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - defined unsigned negation restores the quotient sign without signed remainder
-    return ((a < 0) != (b < 0)) ? (int64_t)((uint64_t)0 - q) : (int64_t)q;
-}
 
 static const int kKarstRoofMinMm = 4000;
 static const int kKarstBedrockMarginMm = 2000;
@@ -113,6 +95,20 @@ struct GpuKarstColumn {
 // Arithmetic -- transliterated from karst.h line for line.
 // ---------------------------------------------------------------------------
 
+// Standalone counterpart of worldgen.ush's truncDiv: this include is also
+// compiled independently by KarstMirrorTest.usf. All callers have positive,
+// nonzero divisors (segment denominator is guarded or replaced with one).
+uint64_t karstMagnitude(int64_t v) {
+    const uint64_t u = (uint64_t)v;
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - deliberate unsigned two's-complement magnitude, defined even for INT64_MIN
+    return v < 0 ? (uint64_t)0 - u : u;
+}
+int64_t karstTruncDiv(int64_t a, int64_t b) {
+    const uint64_t q = karstMagnitude(a) / karstMagnitude(b);
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - unsigned wrap deliberately reconstructs the signed quotient, matching C++ truncation
+    return ((a < 0) != (b < 0)) ? (int64_t)((uint64_t)0 - q) : (int64_t)q;
+}
+
 // karstFoot: squared distance from (px,py) to the segment, and the
 // interpolation parameter as an exact numerator/denominator pair.
 void karstFoot(int64_t px, int64_t py, int64_t ax, int64_t ay,
@@ -134,8 +130,7 @@ void karstFoot(int64_t px, int64_t py, int64_t ax, int64_t ay,
     if (num > den) num = den;
     const int64_t fx = apx * den - abx * num;
     const int64_t fy = apy * den - aby * num;
-    const int64_t dx = karstTruncDiv(fx, den);
-    const int64_t dy = karstTruncDiv(fy, den);
+    const int64_t dx = karstTruncDiv(fx, den), dy = karstTruncDiv(fy, den);
     distSq = dx * dx + dy * dy;
     tNum = num;
     tDen = den;
