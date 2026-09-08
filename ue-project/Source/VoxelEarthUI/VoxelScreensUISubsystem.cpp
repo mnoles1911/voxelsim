@@ -55,28 +55,25 @@ namespace VoxelScreensUIDetail
 // but BELOW pause itself (120): opening the pause menu over an inventory screen
 // has to cover it, not sit under it.
 constexpr int32 kScreenZOrder = 110;
-// 18 -> 111 (COORDINATOR DECISION, 2026-09-07), and the reason is a click path,
-// not a picture.
+// 18 -> 111 -> 109, and the last move is the 2026-09-08 backlog item "HUD stays
+// lit behind overlay panels".
 //
-// The owner's directive is "clicking pause button stops the music", and the
-// cursor only ever exists while an overlay owns the screen -- so the HUD's music
-// transport has to be reachable through an open screen or the directive is
-// unmet. The obvious fix was to stop the screen shell eating clicks in the empty
-// area around its panel. THAT WAS TRIED AND REJECTED: SVoxelScreenShell
-// SupportsKeyboardFocus and handles Escape in OnKeyDown, and Slate focuses the
-// first focusable widget in the clicked path -- so a shell that stops taking
-// those clicks stops holding focus, and a player who clicks the background of an
-// open inventory would find Escape no longer closes it. The shell must keep
-// eating empty-area clicks.
+// THE 111 WAS FOR A CLICK PATH THAT NOW HAS A BETTER ONE. It put the HUD above
+// the screen stack so the music transport in the corner stayed clickable while
+// an inventory was open, because at the time an overlay was the ONLY state in
+// which a cursor existed at all -- and the owner's directive was "clicking pause
+// button stops the music". Hold-Tab point mode (owner, live, 2026-09-08) removed
+// that constraint: the player now gets a cursor with NO overlay open, over the
+// HUD it is aimed at, which is a strictly better place to click a transport than
+// over a panel covering half of it. The , . / and numpad 4/5/6 keys were always
+// the primary path and none of this touches them.
 //
-// Moving the HUD instead costs nothing, because the body is COLLAPSED for
-// exactly the states this now sits above (see ApplyOverlayInput). Above the
-// screen stack (110), below pause (120): the transport is clickable over an open
-// screen, and the pause overlay still covers everything, scrim included.
-//
-// It is also still above the survival hotbar's old 15, which is what the
-// original 18 was for and which SetHiddenForOverlay makes moot anyway.
-constexpr int32 kHudZOrder = 111;
+// So the HUD goes back BELOW the screen stack (110) and the loading curtain
+// (110), stays above the survival panel (30) and hotbar (15), and stays below
+// pause (120). RefreshHudForOverlays hides it outright while any overlay is up;
+// the z-order is the belt to that brace, so an overlay added later whose author
+// forgets the refresh still cannot be drawn over by the compass.
+constexpr int32 kHudZOrder = 109;
 // Matches UVoxelPauseUISubsystem: FScreenshotRequest only QUEUES, and the frame
 // that services it has to be rendered and written before the process may leave.
 constexpr float kCaptureQuitDelaySeconds = 4.0f;
@@ -116,6 +113,45 @@ int32 CurrentDayNumber(UWorld* World)
 		return 0;
 	}
 	return 1 + FMath::FloorToInt32(Sky->GetSkyState().EpochSeconds / DayLength);
+}
+
+// The whole-YEAR index, on the same terms: zero means "cannot name one".
+//
+// ONE GAME YEAR IS DayLengthSeconds x DaysPerYear, which is the divisor
+// VoxelSky::DayOfYearFromEpoch uses to derive the seasonal position -- so this
+// number and the season below always agree about where a year ends. At the
+// shipped voxel.Sky.DaysPerYear = 48 a new world spends its first 48 days in
+// year 1, which is why the journal's seeded "18th Year" cannot simply be
+// replaced by this one without also re-anchoring its day (see SeedJournal).
+int32 CurrentYearNumber(UWorld* World)
+{
+	const UVoxelSkySubsystem* Sky = World ? World->GetSubsystem<UVoxelSkySubsystem>() : nullptr;
+	if (Sky == nullptr)
+	{
+		return 0;
+	}
+	const double YearLength = VoxelSky::GetDayLengthSeconds() * VoxelSky::GetDaysPerYear();
+	if (YearLength <= 0.0)
+	{
+		return 0;
+	}
+	return 1 + FMath::FloorToInt32(Sky->GetSkyState().EpochSeconds / YearLength);
+}
+
+// 0 spring .. 3 winter, or INDEX_NONE when there is no sky to ask. Both the
+// day-of-year and the latitude come from the SAME FVoxelSkyState read, because
+// the latitude is resolved from the player's position every tick and a season
+// named from one frame's date and another frame's hemisphere would be wrong
+// exactly at the equator crossing that makes the hemisphere matter.
+int32 CurrentSeasonIndex(UWorld* World)
+{
+	const UVoxelSkySubsystem* Sky = World ? World->GetSubsystem<UVoxelSkySubsystem>() : nullptr;
+	if (Sky == nullptr)
+	{
+		return INDEX_NONE;
+	}
+	const FVoxelSkyState& State = Sky->GetSkyState();
+	return VoxelSky::SeasonIndexFromDayOfYear(State.DayOfYear, State.LatitudeDeg);
 }
 } // namespace VoxelScreensUIDetail
 
@@ -194,6 +230,12 @@ void UVoxelScreensUISubsystem::Tick(float DeltaTime)
 	}
 	EnsureInput(PC);
 	InstallHud(PC);
+	// THE LAST LINE OF DEFENCE, and it costs one bool compare on the frames where
+	// nothing changed. The three overlay owners here call it directly on open and
+	// close and the pause subsystem calls it too; this catches what is left -- a
+	// controller swap that reinstalls the HUD under an open overlay, a pause menu
+	// torn down with its world, and whatever overlay is added next.
+	RefreshHudForOverlays();
 	EnsureMusicInGame();
 
 	// --- the four capture switches -------------------------------------------
@@ -603,6 +645,13 @@ void UVoxelScreensUISubsystem::RemoveHud()
 		Viewport->RemoveViewportWidgetContent(Hud.ToSharedRef());
 	}
 	Hud.Reset();
+	// THE CACHED ANSWER GOES WITH THE WIDGET. RefreshHudForOverlays early-outs
+	// when the state it last applied matches, and the state it applied belonged
+	// to a widget that no longer exists -- so a HUD removed while an overlay was
+	// up (a controller swap is the real path) and then reinstalled would come
+	// back VISIBLE over that overlay, with the refresh believing it had already
+	// hidden it. A fresh SVoxelGameHud is built visible; say so.
+	bHudHiddenForOverlay = false;
 	if (UVoxelSurvivalUISubsystem* Survival = World ? World->GetSubsystem<UVoxelSurvivalUISubsystem>() : nullptr)
 	{
 		Survival->SetHiddenForOverlay(false);
@@ -675,7 +724,7 @@ void UVoxelScreensUISubsystem::OpenScreen(EVoxelScreenTab Tab)
 	// PAUSED SIMULATION, LIVE PICTURE -- the same pairing the pause menu makes,
 	// and for the same reason its comment gives.
 	UGameplayStatics::SetGamePaused(World, true);
-	ApplyOverlayInput(Shell.ToSharedRef(), /*bKeepMusicCluster=*/true);
+	ApplyOverlayInput(Shell.ToSharedRef());
 	Shell->FocusDefaultWidget();
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelScreens: opened."));
 }
@@ -728,9 +777,19 @@ void UVoxelScreensUISubsystem::ShowTab(EVoxelScreenTab Tab)
 		break;
 	}
 	case EVoxelScreenTab::Journal:
+	{
 		Actions = SVoxelJournalScreen::Actions();
-		Body = SNew(SVoxelJournalScreen).Data(VoxelScreenData::SeedJournal(DayStamp()));
+		// THE LIVE CALENDAR, NOT THE MOCK'S. Without it the newest placeholder
+		// card is dated day 12 whatever day the world is on -- which on the
+		// owner's day-11 session put a journal entry in the future. See
+		// SeedJournal for what is re-anchored and what is kept.
+		FVoxelSeedCalendar Calendar;
+		Calendar.Day = VoxelScreensUIDetail::CurrentDayNumber(World);
+		Calendar.Year = VoxelScreensUIDetail::CurrentYearNumber(World);
+		Calendar.Season = VoxelUIStrings::SeasonLabel(VoxelScreensUIDetail::CurrentSeasonIndex(World));
+		Body = SNew(SVoxelJournalScreen).Data(VoxelScreenData::SeedJournal(DayStamp(), Calendar));
 		break;
+	}
 	case EVoxelScreenTab::Inventory:
 		Actions = SVoxelInventoryScreen::Actions();
 		Body = SNew(SVoxelInventoryScreen).Data(GatherInventoryData());
@@ -814,7 +873,7 @@ void UVoxelScreensUISubsystem::OpenDeathScreen()
 
 	Viewport->AddViewportWidgetContent(DeathScreen.ToSharedRef(), VoxelScreensUIDetail::kScreenZOrder);
 	UGameplayStatics::SetGamePaused(World, true);
-	ApplyOverlayInput(DeathScreen.ToSharedRef(), /*bKeepMusicCluster=*/false);
+	ApplyOverlayInput(DeathScreen.ToSharedRef());
 	DeathScreen->FocusDefaultWidget();
 }
 
@@ -843,7 +902,7 @@ void UVoxelScreensUISubsystem::OpenDialogue(const FVoxelDialogueData& Node)
 	// stays live behind the overlay ("world stays visible but dimmed"), and the
 	// dim alpha is set well below the pause menu's for that reason. Input is
 	// still taken, so the player cannot dig while reading.
-	ApplyOverlayInput(Dialogue.ToSharedRef(), /*bKeepMusicCluster=*/false);
+	ApplyOverlayInput(Dialogue.ToSharedRef());
 	Dialogue->FocusDefaultWidget();
 }
 
@@ -871,7 +930,7 @@ void UVoxelScreensUISubsystem::CloseOverlay()
 	}
 }
 
-void UVoxelScreensUISubsystem::ApplyOverlayInput(TSharedRef<SWidget> Widget, bool bKeepMusicCluster)
+void UVoxelScreensUISubsystem::ApplyOverlayInput(TSharedRef<SWidget> Widget)
 {
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
@@ -900,21 +959,48 @@ void UVoxelScreensUISubsystem::ApplyOverlayInput(TSharedRef<SWidget> Widget, boo
 	{
 		PC->MyHUD->bShowHUD = false;
 	}
-	if (Hud.IsValid())
+	// Every caller has already stored the overlay in Shell/DeathScreen/Dialogue
+	// by the time it reaches here, so OverlayOwnsInput() answers TRUE and the
+	// refresh takes the HUD down. Stated as a refresh rather than a hide because
+	// exactly one function is allowed to decide this.
+	RefreshHudForOverlays();
+}
+
+void UVoxelScreensUISubsystem::RefreshHudForOverlays()
+{
+	if (!Hud.IsValid())
 	{
-		// COORDINATOR DECISION, 2026-09-07: the BODY only, for the five in-game
-		// screens. The compass, the dock and the prompt would otherwise sit under
-		// the panel, dimmed but legible, which is not what any of the mocks show
-		// -- but the music transport in the corner has to STAY, because this is
-		// the only state in which a cursor exists to click it with.
-		Hud->SetBodyVisible(false);
-		// THE DEATH SCREEN AND THE DIALOGUE OVERLAY ARE THE EXCEPTION, and it is
-		// a composition judgement rather than a mechanical one. Both are
-		// full-bleed dramatic screens whose mocks show nothing in that corner,
-		// and a transport drawn over a death card reads as a UI bug. They keep
-		// the old behaviour: the whole HUD goes.
-		Hud->SetMusicClusterVisible(bKeepMusicCluster);
+		return;
 	}
+	const bool bHidden = OverlayOwnsInput();
+	if (bHidden == bHudHiddenForOverlay)
+	{
+		return;
+	}
+	bHudHiddenForOverlay = bHidden;
+
+	// BOTH HALVES, TOGETHER. The body (compass, dock, interaction prompt) and the
+	// music cluster are separate setters because the 2026-09-07 arrangement
+	// needed them to be; they now move as one, and the HUD draws nothing at all
+	// while an overlay is up. Collapsed rather than Hidden inside both: no
+	// sibling's layout depends on the space, so reserving it would only buy a
+	// measure pass.
+	//
+	// NOT SetVisibility ON THE HUD ITSELF, which is what the call sites did
+	// before SVoxelGameHud grew these two setters. The root is
+	// SelfHitTestInvisible so the cluster can opt back in, and a blanket
+	// SetVisibility(Visible) on restore silently puts the root back to
+	// HitTestInvisible -- after which the transport is unclickable for the rest
+	// of the session and nothing looks wrong.
+	Hud->SetBodyVisible(!bHidden);
+	Hud->SetMusicClusterVisible(!bHidden);
+
+	// SAID OUT LOUD so an unattended leg can prove the arm engaged instead of
+	// inferring it from a picture: a HUD merely BEHIND a centred panel and a HUD
+	// that is collapsed are the same still frame, and only one of them survives
+	// an overlay that leaves a corner uncovered.
+	UE_LOG(LogVoxelUI, Log, TEXT("VoxelScreens: HUD %s for overlay."),
+	       bHidden ? TEXT("hidden") : TEXT("restored"));
 }
 
 void UVoxelScreensUISubsystem::RestoreGameInput()
@@ -931,17 +1017,11 @@ void UVoxelScreensUISubsystem::RestoreGameInput()
 			PC->MyHUD->bShowHUD = true;
 		}
 	}
-	if (Hud.IsValid())
-	{
-		// Body back, and NOT via SetVisibility on the widget: that would put the
-		// root to HitTestInvisible and silently undo the SelfHitTestInvisible the
-		// music cluster needs to be hittable at all.
-		Hud->SetBodyVisible(true);
-		// Unconditional, because this is the ONE restore path for all three
-		// overlay kinds: a death screen closed after a dialogue must not leave
-		// the transport switched off for the rest of the session.
-		Hud->SetMusicClusterVisible(true);
-	}
+	// NOT AN UNCONDITIONAL RESTORE. Every caller has already reset the widget it
+	// closed, so the refresh sees what is genuinely left -- which is what matters
+	// when a pause menu is closed over a still-open inventory: an unconditional
+	// restore there would put the compass back on top of the panel.
+	RefreshHudForOverlays();
 }
 
 void UVoxelScreensUISubsystem::TeardownStack()
@@ -973,11 +1053,24 @@ FText UVoxelScreensUISubsystem::DayStamp() const
 	{
 		return FText::GetEmpty();
 	}
-	// DAY ONLY, NO SEASON. VoxelUIStrings.h:108-118 records why: the HUD's
-	// SeasonName helper assumes a 365-day year while voxel.Sky.DaysPerYear
-	// defaults to 48, so it prints a confidently wrong season. The pause
-	// footer made the same choice for the same reason.
-	return VoxelUIStrings::PauseFooter(Day);
+	// DAY, SEASON AND YEAR (2026-09-08). This used to return PauseFooter(Day) --
+	// "Day 11" and nothing else -- on the argument that the only season namer in
+	// the project assumed a 365-day year while voxel.Sky.DaysPerYear defaults to
+	// 48. That argument was wrong about what FVoxelSkyState::DayOfYear is: it is
+	// an astronomical 0..365 index, not a day count, so the season is available
+	// and true. VoxelUIStrings::WorldStamp's header carries the full retraction.
+	//
+	// THE PAUSE FOOTER IS DELIBERATELY LEFT ALONE. It is a shipped screen the
+	// owner has judged; the two callers here are the journal and the death card,
+	// both of which their mocks stamp with the long form.
+	//
+	// WorldStamp degrades on its own if the sky is missing: an empty season or a
+	// zero year drops back to "Day N".
+	UWorld* World = GetWorld();
+	return VoxelUIStrings::WorldStamp(
+		Day,
+		VoxelUIStrings::SeasonLabel(VoxelScreensUIDetail::CurrentSeasonIndex(World)),
+		VoxelScreensUIDetail::CurrentYearNumber(World));
 }
 
 FVoxelMapScreenData UVoxelScreensUISubsystem::GatherMapData() const

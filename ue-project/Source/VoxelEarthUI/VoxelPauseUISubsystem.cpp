@@ -5,6 +5,7 @@
 #include "VoxelFrontEndSubsystem.h"
 #include "VoxelFrontEndSwitches.h"
 #include "VoxelSaveRows.h"
+#include "VoxelScreensUISubsystem.h"
 #include "VoxelSurvivalUISubsystem.h"
 #include "VoxelUIStrings.h"
 
@@ -292,6 +293,18 @@ void UVoxelPauseUISubsystem::OpenPause()
 		Survival->SetHiddenForOverlay(true);
 	}
 
+	// THE SAME ARGUMENT, FOR THE NEWER HUD (2026-09-08). The Voxelmark HUD sits
+	// at z-order 109 and the pause scrim is not opaque, so the compass, the dock
+	// and the music transport were all still legible through it -- the exact
+	// symptom the line above was written for, on the widget that replaced the
+	// hotbar it names. UVoxelScreensUISubsystem owns that HUD's visibility;
+	// asking it to refresh is enough, because its answer is OverlayOwnsInput()
+	// and that already includes this subsystem.
+	if (UVoxelScreensUISubsystem* Screens = World->GetSubsystem<UVoxelScreensUISubsystem>())
+	{
+		Screens->RefreshHudForOverlays();
+	}
+
 	// Focus a BUTTON, not the overlay: SetWidgetToFocus is enough for Escape to
 	// reach OnKeyDown and not enough for navigation, which starts from the
 	// focused widget and a compound widget has no siblings to move between.
@@ -329,6 +342,16 @@ void UVoxelPauseUISubsystem::TeardownOverlay()
 	if (UVoxelSurvivalUISubsystem* Survival = World ? World->GetSubsystem<UVoxelSurvivalUISubsystem>() : nullptr)
 	{
 		Survival->SetHiddenForOverlay(false);
+	}
+
+	// AFTER Overlay.Reset() ABOVE, and that ordering is the whole correctness of
+	// it: the refresh re-reads IsPaused(), which is this pointer. Refreshing
+	// before the reset would leave the HUD hidden until the next tick, and
+	// refreshing unconditionally would show it over a screen the player opened
+	// the pause menu on top of.
+	if (UVoxelScreensUISubsystem* Screens = World ? World->GetSubsystem<UVoxelScreensUISubsystem>() : nullptr)
+	{
+		Screens->RefreshHudForOverlays();
 	}
 
 	if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr)

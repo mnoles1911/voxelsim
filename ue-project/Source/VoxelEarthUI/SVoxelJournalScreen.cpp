@@ -293,8 +293,17 @@ void SVoxelJournalScreen::RebuildList()
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, 2.f, 0.f, 0.f))
 					[
+						// ELLIPSIS, LIKE EVERY OTHER `.snip` IN THIS COLUMN, and
+						// it stopped being optional on 2026-09-08. This line was
+						// "Day 11" until the stamp grew its season, year and age
+						// (VoxelUIStrings::WorldStamp); the full form is about 43
+						// characters and the column is a hard 300 px wide, so
+						// without this it runs out of the card. The mock's own
+						// `.snip` rule is text-overflow:ellipsis for the same
+						// reason.
 						SNew(STextBlock).Text(Data.TodayStamp)
 						.Font(Style.Mono(L.JournalCardSnipSize))
+						.OverflowPolicy(ETextOverflowPolicy::Ellipsis)
 						.ColorAndOpacity(FVoxelUIStyle::MutedColour())
 					]
 				]

@@ -90,7 +90,8 @@ public:
 	virtual void Tick(const FGeometry& Geometry, const double CurrentTime, const float DeltaTime) override;
 
 	// Shows or collapses the HUD BODY -- the compass, the dock and the
-	// interaction prompt -- leaving the music transport in the corner alone.
+	// interaction prompt. It leaves the music transport alone; its caller pairs
+	// it with SetMusicClusterVisible when the whole HUD is meant to go.
 	//
 	// COORDINATOR DECISION, 2026-09-07. What an overlay used to do was
 	// SetVisibility(Collapsed) on the whole widget, which took the transport with
@@ -101,12 +102,17 @@ public:
 	// than a call site.
 	void SetBodyVisible(bool bVisible);
 
-	// Takes the music transport off the screen entirely, for the two overlays
-	// that are full-bleed: the death screen and the dialogue. COORDINATOR
-	// DECISION, 2026-09-07 -- neither mock shows anything in that corner, and a
-	// transport drawn over a death card reads as a UI bug rather than a control.
-	// The five in-game screens keep it, because their panel is centred and the
-	// corner is free.
+	// Takes the music transport off the screen entirely.
+	//
+	// ORIGINALLY (2026-09-07) FOR THE TWO FULL-BLEED OVERLAYS ONLY -- the death
+	// screen and the dialogue, neither of whose mocks shows anything in that
+	// corner -- while the five in-game screens kept the transport so there was
+	// somewhere to click it. Since 2026-09-08 it moves with SetBodyVisible for
+	// every overlay kind: hold-Tab point mode gives the player a cursor with no
+	// overlay open, which is a better place to click a transport than over a
+	// panel, so nothing is lost by taking the whole HUD down. The single caller
+	// is UVoxelScreensUISubsystem::RefreshHudForOverlays; the , . / and numpad
+	// 4/5/6 hotkeys are a separate path and are unaffected either way.
 	void SetMusicClusterVisible(bool bVisible);
 
 private:

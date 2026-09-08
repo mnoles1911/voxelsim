@@ -585,6 +585,76 @@ FText CodexHeldUnknown()
 	return LOCTEXT("CdHeldUnknown", "not an item yet");
 }
 
+// --- The world stamp ---------------------------------------------------------
+// See the header for what is real here and what is the mock's fiction.
+
+FText SeasonLabel(int32 SeasonIndex)
+{
+	switch (SeasonIndex)
+	{
+	case 0: return LOCTEXT("SeasonSpring", "Spring");
+	case 1: return LOCTEXT("SeasonSummer", "Summer");
+	case 2: return LOCTEXT("SeasonAutumn", "Autumn");
+	case 3: return LOCTEXT("SeasonWinter", "Winter");
+	default: break;
+	}
+	// Not a guess and not "Spring". An index this function does not recognise
+	// means the caller had no sky to ask, and WorldStamp drops the season half
+	// when it is empty.
+	return FText::GetEmpty();
+}
+
+FText Ordinal(int32 Number)
+{
+	// UNGROUPED. FText::AsNumber's default groups at a thousand, which would
+	// print the 1000th year as "1,000th" -- the same trap SaveDialogCounter
+	// above sidesteps with Printf.
+	FNumberFormattingOptions Plain;
+	Plain.SetUseGrouping(false);
+	const FText Digits = FText::AsNumber(Number, &Plain);
+
+	// 11, 12 and 13 TAKE "th" DESPITE ENDING IN 1, 2 AND 3, and so does every
+	// hundred above them (111th, 212th). Testing mod 100 before mod 10 is the
+	// whole of the rule; an inline version that tests only the last digit is
+	// wrong exactly once per century and looks right the rest of the time.
+	const int32 Mod100 = FMath::Abs(Number) % 100;
+	if (Mod100 < 11 || Mod100 > 13)
+	{
+		switch (FMath::Abs(Number) % 10)
+		{
+		case 1: return FText::Format(LOCTEXT("OrdinalSt", "{0}st"), Digits);
+		case 2: return FText::Format(LOCTEXT("OrdinalNd", "{0}nd"), Digits);
+		case 3: return FText::Format(LOCTEXT("OrdinalRd", "{0}rd"), Digits);
+		default: break;
+		}
+	}
+	return FText::Format(LOCTEXT("OrdinalTh", "{0}th"), Digits);
+}
+
+FText WorldStamp(int32 DayNumber, const FText& Season, int32 YearNumber)
+{
+	if (DayNumber <= 0)
+	{
+		return FText::GetEmpty();
+	}
+	FNumberFormattingOptions Plain;
+	Plain.SetUseGrouping(false);
+	const FText Day = FText::AsNumber(DayNumber, &Plain);
+
+	// THE SEASON AND THE YEAR DEGRADE SEPARATELY. A session with a day but no
+	// sky subsystem (an unattended leg, a world torn down mid-frame) gets
+	// "Day 11" rather than "Day 11 · , 0th Year of the Second Age", which is the
+	// same rule the death card's own stamp follows one level up: say the part
+	// that is true, omit the rest.
+	if (Season.IsEmpty() || YearNumber <= 0)
+	{
+		return FText::Format(LOCTEXT("WorldStampDayOnly", "Day {0}"), Day);
+	}
+	// The interpunct is the mocks' own separator (`Day ${d.day} · ${d.season}`).
+	return FText::Format(LOCTEXT("WorldStamp", "Day {0} · {1}, {2} Year of the Second Age"),
+	                     Day, Season, Ordinal(YearNumber));
+}
+
 FText DeathTitle()   { return LOCTEXT("DeathTitle", "YOU DIED"); }
 FText DeathRespawn() { return LOCTEXT("DeathRespawn", "RESPAWN"); }
 FText DeathQuit()    { return LOCTEXT("DeathQuit", "QUIT"); }

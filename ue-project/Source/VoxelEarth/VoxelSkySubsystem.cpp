@@ -1309,6 +1309,43 @@ namespace VoxelSky
 	constexpr int32 kDaysBeforeMonth[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
 	constexpr int32 kDaysInMonth[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
+	// ASTRONOMICAL CONVENTION -- seasons run solstice to equinox -- and not the
+	// meteorological one (whole months, spring = Mar/Apr/May), because the
+	// boundaries then ARE the solar declination's extremes and zero crossings,
+	// which is what the ephemeris this reads from is built on (VoxelEphemeris.h:
+	// 119-124). A season named on any other convention could disagree with the sun
+	// the frame is actually lit by.
+	//
+	//     79  = 20 Mar, March equinox        172 = 21 Jun, June solstice
+	//     265 = 22 Sep, September equinox    355 = 21 Dec, December solstice
+	//
+	// (20 March and not 21: reference year 2000 is a LEAP year, the same fact
+	// kDaysBeforeMonth above exists to carry.)
+	//
+	// MOVED HERE FROM VoxelEarthHUD.cpp's ANONYMOUS NAMESPACE on 2026-09-08, when
+	// the journal and death stamps became the second consumer. See the header for
+	// why the boundaries live in one place and the display names do not.
+	int32 SeasonIndexFromDayOfYear(int32 DayOfYear, double LatitudeDeg)
+	{
+		const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
+		const bool bNorth = LatitudeDeg >= 0.0;
+		if (Doy >= 79 && Doy < 172)
+		{
+			return bNorth ? 0 : 2; // spring / autumn
+		}
+		if (Doy >= 172 && Doy < 265)
+		{
+			return bNorth ? 1 : 3; // summer / winter
+		}
+		if (Doy >= 265 && Doy < 355)
+		{
+			return bNorth ? 2 : 0; // autumn / spring
+		}
+		// Wraps the year end: 355..365 and 0..78, i.e. December solstice to March
+		// equinox.
+		return bNorth ? 3 : 1; // winter / summer
+	}
+
 	void MonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay)
 	{
 		const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);

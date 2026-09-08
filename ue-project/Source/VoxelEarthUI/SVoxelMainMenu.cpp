@@ -416,7 +416,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	// Three groups pinned to the frame. Overlay slots take an alignment and a
 	// padding, which is exactly the mock's "top/right/left" absolute offsets
 	// once the panel is given the whole viewport (see Construct). The old
-	// TitleBoxWidth clamp story (backlog 0.0l) does not arise here: the logo
+	// title-width clamp story (backlog 0.0l) does not arise here: the logo
 	// sits in its own auto-sized slot and clamps against the screen, not a
 	// 520-wide column.
 	return SNew(SOverlay)

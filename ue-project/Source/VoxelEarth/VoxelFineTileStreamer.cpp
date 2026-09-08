@@ -152,6 +152,31 @@ vxc::ClimateSample FVoxelFineTileSamplerProxy::climate(int64_t px, int64_t py)
 
 // ---------------------------------------------------------------------------
 
+// -VoxelFineTileRingRadius=, LATCHED HERE AND ONLY HERE. Same discipline as
+// the async arm's three switches a few lines down in the constructor: read
+// FCommandLine once, keep the resolved value, make every later read a plain
+// load. Every consumer -- MakeFineTileStreamer in VoxelWorldSubsystem.cpp and
+// FineRingRadiusTiles() in VoxelRasterAtlas.cpp -- goes through this function,
+// so the two of them cannot drift apart and a default flip is one edit to
+// kDefaultFineRingRadiusTiles.
+//
+// THE CLAMP IS ONE-SIDED ON PURPOSE. A negative value (including the "absent"
+// case, since FParse leaves the initialiser alone) means "the default"; there
+// is no upper bound, because there is no radius the code is wrong at -- only
+// radii the machine cannot afford (each ring is (2N+1)^2 fully decoded tiles,
+// ~335 MB each), and that is a budget failure the LRU reports, not a bug this
+// function should hide by silently capping.
+int32_t FVoxelFineTileStreamer::RingRadiusFromCommandLine()
+{
+	static const int32_t Value = []
+	{
+		int32 V = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), V);
+		return (V >= 0) ? int32_t(V) : kDefaultFineRingRadiusTiles;
+	}();
+	return Value;
+}
+
 FVoxelFineTileStreamer::FVoxelFineTileStreamer(FString RootDir, FString ProviderId, uint64 Seed,
                                                uint64 BudgetBytes, vxc::ITileSampler* ClimateSource)
 	: RootDir_(MoveTemp(RootDir))

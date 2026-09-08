@@ -375,45 +375,21 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float QuitSpacer           = 80.f;
 	float ButtonMinHeight      = 56.f;
 	int32 ButtonFontSize       = 24;
-	// DEAD SINCE THE 2026-09-07 TITLE SCREEN, TitleFontSize AND TitleBoxWidth
-	// BOTH. Nothing in the module reads either any more -- the title screen's
-	// wordmark is `.title-logo__name` and comes from LogoFontSize below; a grep
-	// of every .cpp on 2026-09-07 found the only remaining references are their
-	// own ini registrations in VoxelUITheme.cpp.
+	// NO TitleFontSize AND NO TitleBoxWidth. Both were deleted on 2026-09-08
+	// after a grep of the whole ue-project/Source tree found the only
+	// references left were their own ini registrations in VoxelUITheme.cpp:
+	// the title screen's wordmark is `.title-logo__name` and is sized by
+	// LogoFontSize below, so neither constant drew anything.
 	//
-	// This matters because ADR-0011 lists "TitleFontSize = 84 against the
-	// mock's 108" as a constant to re-derive. It cannot be re-derived and does
-	// not need to be: it draws nothing. Left at its values rather than deleted
-	// because the centred oak column they belong to still exists behind the
-	// sub-panels, and re-deriving 84 to 108 without also re-measuring the 720
-	// (which was measured from a rendered capture, not from the face) would
-	// clip the string the day something draws it again.
-	//
-	// 84, not the mock's 108, and with no letter-spacing (the mock asks for
-	// 10px; Slate has no tracking and the Godot build applies none either).
-	int32 TitleFontSize        = 84;
-	// THE TITLE GETS ITS OWN WIDTH, WIDER THAN THE PANEL. Without this the
-	// title is laid out inside MainPanelHalfWidth*2 = 520 and Slate's text
-	// layout cuts it at that boundary: the first capture rendered "VOXELMARK"
-	// as "OXELMAR", losing the V and the K, clipped symmetrically. 520 is the
-	// Godot _main_panel width and it governs the BUTTON column; the title was
-	// never meant to inherit it.
-	//
-	// 720 IS MEASURED, NOT GUESSED, and the measurement is the interesting
-	// part. The gold title pixels in the first capture spanned centre-347 to
-	// centre+346 of a 2560-wide shot -- symmetric, and 347 = 260 x 1.335, which
-	// identified both the clipper and the layout scale. Backing the visible
-	// substring out against the face's advance widths puts the full string at
-	// 659 local units. 720 is that plus headroom.
-	//
-	// DO NOT RE-DERIVE THIS FROM THE FONT FILE. MacondoSwashCaps at nominal
-	// 84 px measures 483 px advance and 518 px ink for "VOXELMARK", which fits
-	// 520 comfortably -- and it does not. Slate lays the string out about 25%
-	// wider than the raw face metrics predict, so an offline measurement
-	// clears this as fine. Only a rendered capture is trustworthy here; if the
-	// title string or TitleFontSize changes, re-shoot -Shot Menu and re-measure
-	// the span rather than recomputing it. See backlog 0.0l.
-	float TitleBoxWidth        = 720.f;
+	// SAID HERE BECAUSE ADR-0011 STILL NAMES THEM. Its consequences list
+	// carries "TitleFontSize = 84 against the mock's 108" as a constant to
+	// re-derive from the mock. There is nothing to re-derive; the entry is
+	// about a screen that no longer exists. If a centred title column ever
+	// comes back, author its width from a RENDERED CAPTURE and not from the
+	// font's advance widths -- the deleted 720 was measured that way for a
+	// reason (Slate laid "VOXELMARK" out ~25% wider than the face metrics
+	// predicted, and an offline measurement cleared a string that clipped).
+	// See backlog 0.0l.
 	int32 SubtitleFontSize     = 18;
 	// 16 and (36, 24): the 2026-09-07 mock's .version-stamp.bl. Was 12/(16,16).
 	int32 VersionFontSize      = 16;

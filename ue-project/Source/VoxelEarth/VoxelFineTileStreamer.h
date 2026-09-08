@@ -229,6 +229,28 @@ public:
 	// still pulls in whatever a footprint actually needs regardless of the
 	// ring, so a larger ring buys prefetch, not correctness.
 	static constexpr int32_t kDefaultFineRingRadiusTiles = 0;
+
+	// THE ONE READER OF -VoxelFineTileRingRadius=. Latched once, on the first
+	// call, exactly like the async arm's three switches in the constructor
+	// below (-VoxelFineTileAsync, -VoxelFineTileAsyncCap,
+	// -VoxelFineTileAsyncPerTick) -- see VoxelFineTileStreamer.cpp.
+	//
+	// WHY IT IS A STATIC RATHER THAN A MEMBER, and why it exists at all: the
+	// switch has TWO consumers that are not both streamers. The streamer wants
+	// it to size the prefetch ring; VoxelRasterAtlas.cpp wants it to size the
+	// mode-3 async admission margin (R-1), and the atlas has no streamer to
+	// ask -- it only ever sees an ITileSampler. Until 2026-09-08 each of them
+	// ran its own FParse with its own copy of the "<0 means the default"
+	// convention, i.e. one switch with two spellings of one policy. They agreed,
+	// which is exactly why the duplication was cheap to leave and expensive to
+	// keep: the pending default flip (HANDOVER-2026-09-08 item 4) would have
+	// had to land in both, and a flip that lands in one is a run whose atlas
+	// admits pages its streamer never pinned -- wrong in the UNSAFE direction.
+	//
+	// RETURN: always >= 0. Absent, unparseable or negative -> the default
+	// (kDefaultFineRingRadiusTiles). A FUTURE DEFAULT FLIP IS THAT CONSTANT,
+	// and nothing else.
+	static int32_t RingRadiusFromCommandLine();
 	// Plan Storage section: "LRU with a configurable budget, default 8-16 GB".
 	// A literal here is fine (it is the DEFAULT, overridable via the
 	// constructor's BudgetBytes -- see -VoxelFineTileCacheBudgetGB= in

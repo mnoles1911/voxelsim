@@ -121,14 +121,21 @@ VOXELEARTHUI_API FText ButtonSave();
 VOXELEARTHUI_API FText ButtonExitToMenu();
 // The mock's footer reads "Day 12, the 18th Summer of the Second Age".
 //
-// THE DAY IS REAL AND THE REST IS NOT. UVoxelSkySubsystem keeps a genuine
+// THE DAY IS REAL AND THE ERA IS NOT. UVoxelSkySubsystem keeps a genuine
 // calendar -- EpochSeconds over voxel.Sky.DayLengthSeconds gives the day, and
 // FVoxelSkyState::DayOfYear the seasonal position -- so "Day N" is a fact this
-// project can state. There is no era or age anywhere in the codebase, and the
-// only season NAMING that exists is a file-scope helper in VoxelEarthHUD.cpp
-// whose boundaries (day-of-year 79/172/265/355) assume a 365-day year while
-// voxel.Sky.DaysPerYear defaults to 48 -- so quoting a season here would print
-// a confidently wrong one. The footer says the day and stops.
+// project can state. There is no era or age anywhere in the codebase, so the
+// footer says the day and stops.
+//
+// THE SEASON HALF OF THIS NOTE IS RETRACTED (2026-09-08). It used to argue that
+// a season here would be "confidently wrong" because VoxelEarthHUD.cpp's
+// boundaries (day-of-year 79/172/265/355) assume a 365-day year while
+// voxel.Sky.DaysPerYear defaults to 48. DayOfYear is not a day COUNT: it is
+// frac(Epoch / (DayLength x DaysPerYear)) x 365.2425, an astronomical index that
+// spans 0..365 at every DaysPerYear, so those boundaries are right. The season
+// is now printed by WorldStamp above. THIS FOOTER STILL DOES NOT USE IT -- not
+// because it cannot, but because the pause screen is one the owner has judged
+// and widening its footer is a visual change, not a correction.
 VOXELEARTHUI_API FText PauseFooter(int32 DayNumber);
 
 // --- SAVE DIALOG ------------------------------------------------------------
@@ -335,6 +342,53 @@ VOXELEARTHUI_API FText CodexLocked();
 VOXELEARTHUI_API FText CodexIngredientLine(int32 Needed, const FText& Name);
 VOXELEARTHUI_API FText CodexHeldLine(int32 Held);
 VOXELEARTHUI_API FText CodexHeldUnknown();
+
+// --- The world stamp --------------------------------------------------------
+//
+// "Day 11 · Summer, 1st Year of the Second Age" -- ONE composer, used by the
+// journal (its three placeholder cards and the composer card's date line) and by
+// the death screen. Both mocks print the identical string from the identical
+// helper (`stampOf` in Voxelmark Journal.html:117 and the literal in Voxelmark
+// Death Screen.html:63), and before 2026-09-08 the port had it hard-coded three
+// times in VoxelScreenData.cpp and not at all on the death card.
+//
+// THE DAY, THE SEASON AND THE YEAR ARE ALL REAL. Day is EpochSeconds over
+// voxel.Sky.DayLengthSeconds; year is the same over a whole game year; season is
+// VoxelSky::SeasonIndexFromDayOfYear, which reads FVoxelSkyState::DayOfYear --
+// an ASTRONOMICAL 0..365 index that is correct whatever voxel.Sky.DaysPerYear
+// is. The note that used to sit on PauseFooter said a season here would be
+// "confidently wrong" because SeasonName assumes a 365-day year; that was a
+// misreading of DayOfYear and it is retracted. See the header of
+// SeasonIndexFromDayOfYear for the arithmetic.
+//
+// "OF THE SECOND AGE" IS THE ONE PART THAT IS NOT. There is no era anywhere in
+// this project, and it is here because both mocks say it and because the two
+// screens that print it are the ones still showing seeded placeholder content
+// (VoxelScreenData.cpp's Seed* functions). It is a single edit in WorldStamp's
+// format string the day an era exists or the fiction is dropped -- which is why
+// the era is inside the composer and not appended by each caller.
+//
+// THE PAUSE FOOTER DELIBERATELY DOES NOT USE THIS. It says "Day N" and stops;
+// it is a shipped screen the owner has judged, not a placeholder, and its own
+// note argues the case. See PauseFooter.
+
+// 0 spring, 1 summer, 2 autumn, 3 winter -- VoxelSky::SeasonIndexFromDayOfYear's
+// own numbering. Title case, because this is the register the stamps print in;
+// the F1 overlay keeps its own lower-case table for mid-sentence use. Any index
+// outside 0..3 gives an empty text rather than a wrong season.
+VOXELEARTHUI_API FText SeasonLabel(int32 SeasonIndex);
+
+// 1 -> "1st", 12 -> "12th", 18 -> "18th", 21 -> "21st". Its own function because
+// the 11/12/13 exception is the part everybody's inline version gets wrong, and
+// because it is the only piece of this that a headless test can pin.
+// UNGROUPED: a 1000th year must not print as "1,000th".
+VOXELEARTHUI_API FText Ordinal(int32 Number);
+
+// EMPTY WHEN DayNumber <= 0, which is how UVoxelScreensUISubsystem::DayStamp
+// reports "this session cannot name a day" -- both callers already omit the
+// stamp rather than drawing a blank one. An empty Season drops the season half
+// and keeps the rest, so a world with no sky subsystem still dates its journal.
+VOXELEARTHUI_API FText WorldStamp(int32 DayNumber, const FText& Season, int32 YearNumber);
 
 // --- Death screen -----------------------------------------------------------
 VOXELEARTHUI_API FText DeathTitle();      // "YOU DIED"

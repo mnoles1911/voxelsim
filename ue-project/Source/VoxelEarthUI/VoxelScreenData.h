@@ -469,6 +469,22 @@ struct FVoxelDeathData
 	FText Stamp;
 };
 
+// The calendar the placeholder journal is dated in. Passed in rather than read,
+// so SeedJournal stays a pure function of its arguments and can be tested
+// headlessly (VoxelFrontEndTests.cpp) with no world and no sky subsystem.
+//
+// Day 0 means "this session cannot name a day", exactly as
+// UVoxelScreensUISubsystem::DayStamp uses it, and the fixture then falls back to
+// the mock's own 12 / Summer / 18th year.
+struct FVoxelSeedCalendar
+{
+	int32 Day = 0;
+	int32 Year = 0;
+	FText Season;
+};
+// Declared OUTSIDE the namespace: every caller (the subsystem, the tests)
+// names it bare, and the 2026-09-08 build broke on exactly that.
+
 namespace VoxelScreenData
 {
 // Which .it glyph an item draws with, derived from what the registry actually
@@ -477,9 +493,20 @@ VOXELEARTHUI_API FName GlyphForItem(FName ItemId);
 
 // The placeholder content. Each is the mock's own data, verbatim, and each is
 // what the screen shows until a real system replaces the call.
-VOXELEARTHUI_API FVoxelJournalData SeedJournal(const FText& TodayStamp);
+//
+// SeedJournal TAKES THE LIVE CALENDAR because its newest entry used to be dated
+// day 12 unconditionally -- the mock's number -- while the live world was on day
+// 11, so the placeholder journal contained an entry from the future. The three
+// cards keep the mock's SPACING (newest, newest-3, day 1); only the anchor
+// moves. See the .cpp.
+VOXELEARTHUI_API FVoxelJournalData SeedJournal(const FText& TodayStamp,
+                                               const FVoxelSeedCalendar& Calendar);
 VOXELEARTHUI_API FVoxelPlayerData SeedPlayer();
 VOXELEARTHUI_API FVoxelCodexData SeedCodex();
 VOXELEARTHUI_API FVoxelDialogueData SeedDialogue();
+// Stamp is UVoxelScreensUISubsystem::DayStamp(), i.e.
+// VoxelUIStrings::WorldStamp of the live day, season and year. It used to be
+// "Day 11" and nothing more, which is why FVoxelDeathData::Stamp's own comment
+// above described a string the port did not actually produce.
 VOXELEARTHUI_API FVoxelDeathData SeedDeath(const FText& Stamp);
 } // namespace VoxelScreenData

@@ -46,50 +46,16 @@ FString OnOff(bool bOn)
 
 // Season from day-of-year AND hemisphere.
 //
-// ASTRONOMICAL CONVENTION -- seasons run solstice-to-equinox -- and not the
-// meteorological one (whole months, spring = Mar/Apr/May) because the boundaries
-// below then ARE the solar declination's own extremes and zero crossings, which
-// is exactly what the ephemeris this reads from is built on
-// (VoxelEphemeris.h:119-124). A season named on any other convention could
-// disagree with the sun the frame is actually lit by, and the overlay's whole job
-// is to state what the frame used.
-//
-// The boundary day-of-year values are in the ephemeris's REFERENCE YEAR 2000,
-// which is the year FVoxelSkyState::DayOfYear counts in and which is a LEAP year
-// -- so day-of-year 79 is 20 March, not 21 (VoxelEphemeris.h:150-153, and the
-// same fact is what the kDaysBeforeMonth table in VoxelSkySubsystem.cpp exists to
-// carry):
-//     79  = 20 Mar, March equinox
-//     172 = 21 Jun, June solstice
-//     265 = 22 Sep, September equinox
-//     355 = 21 Dec, December solstice
-//
-// THE SOUTHERN HEMISPHERE IS INVERTED, AND THAT IS NOT HYPOTHETICAL HERE.
-// voxel.Sky.OriginLatitudeDeg defaults to +52, but FVoxelSkyState::LatitudeDeg is
-// resolved from the PLAYER's position every tick, so a long enough southward
-// flight legitimately crosses the equator. Printing "summer" over a southern
-// midwinter is precisely the plausible-but-wrong reading this project prefers to
-// have absent. Latitude exactly 0 falls to the northern naming; the equator has
-// no seasons to get wrong, so there is nothing to arbitrate.
+// THE FOUR NAMES, LOWER CASE, because this overlay prints them mid-sentence.
+// The BOUNDARIES are not here: they moved to VoxelSky::SeasonIndexFromDayOfYear
+// on 2026-09-08 when the journal and death stamps became a second consumer, and
+// a second copy of 79/172/265/355 is how two readouts start disagreeing about
+// which season the sun in the frame belongs to. That function's comment carries
+// the convention, the leap-year note and the southern-hemisphere inversion.
 const TCHAR* SeasonName(int32 DayOfYear, double LatitudeDeg)
 {
-	const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
-	const bool bNorth = LatitudeDeg >= 0.0;
-	if (Doy >= 79 && Doy < 172)
-	{
-		return bNorth ? TEXT("spring") : TEXT("autumn");
-	}
-	if (Doy >= 172 && Doy < 265)
-	{
-		return bNorth ? TEXT("summer") : TEXT("winter");
-	}
-	if (Doy >= 265 && Doy < 355)
-	{
-		return bNorth ? TEXT("autumn") : TEXT("spring");
-	}
-	// Wraps the year end: 355..365 and 0..78, i.e. December solstice to March
-	// equinox.
-	return bNorth ? TEXT("winter") : TEXT("summer");
+	static const TCHAR* kNames[4] = {TEXT("spring"), TEXT("summer"), TEXT("autumn"), TEXT("winter")};
+	return kNames[FMath::Clamp(VoxelSky::SeasonIndexFromDayOfYear(DayOfYear, LatitudeDeg), 0, 3)];
 }
 } // namespace
 

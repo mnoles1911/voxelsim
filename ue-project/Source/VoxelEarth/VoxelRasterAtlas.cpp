@@ -8,7 +8,7 @@
 
 #include "VoxelGpuWorldGen.h"
 
-#include "VoxelFineTileStreamer.h"  // kDefaultFineRingRadiusTiles -- the pin mode 3 rides on
+#include "VoxelFineTileStreamer.h"  // RingRadiusFromCommandLine() -- the pin mode 3 rides on
 
 #include "voxelcore/core.h"
 #include "voxelcore/tilestore.h"      // vxc::tilePixelSizeMm -- the climate-pitch default
@@ -482,24 +482,30 @@ namespace
 		return Value;
 	}
 
-	// The streamer's ring radius, read from the SAME switch the streamer is
-	// constructed from (VoxelWorldSubsystem.cpp's FineRingRadius: <0 leaves
-	// FVoxelFineTileStreamer::kDefaultFineRingRadiusTiles). This is the rule
-	// ClimatePitchMm() already follows -- read the producer's switch, never
-	// restate the producer's policy -- and it matters more here than there,
-	// because a value that is too LARGE makes the admission test wrong in the
-	// UNSAFE direction. So the window line prints the number this file used and
-	// the streamer prints its own on the `Fine tier ENABLED:` startup line: two
-	// independent spellings of one fact, in one log, greppable side by side.
+	// The streamer's ring radius. NOT this file's own switch read: it forwards
+	// to FVoxelFineTileStreamer::RingRadiusFromCommandLine(), the single latch
+	// for -VoxelFineTileRingRadius=, which is also what the streamer itself is
+	// constructed from. This is the rule ClimatePitchMm() already follows --
+	// read the producer's value, never restate the producer's policy -- and it
+	// matters more here than there, because a value that is too LARGE makes the
+	// admission test wrong in the UNSAFE direction.
+	//
+	// UNTIL 2026-09-08 THIS WAS A SECOND FParse WITH ITS OWN COPY OF THE "<0
+	// MEANS THE DEFAULT" RULE. It agreed with the streamer's, so it cost
+	// nothing while the default stood; it would have cost a leg the moment the
+	// default moved on one side only (HANDOVER-2026-09-08 item 4), since an
+	// atlas that thinks the ring is 1 while the streamer pins 0 admits pages
+	// nothing is holding. The forwarder stays because five call sites below
+	// read better with the short local name -- but it carries no policy.
+	//
+	// The window line still prints the number this file used and the streamer
+	// still prints its own on the `Fine tier ENABLED:` startup line: two
+	// independent spellings of one fact, in one log, greppable side by side --
+	// and now they are spellings of one VALUE as well, so a disagreement
+	// between them is a real bug rather than a switch parsed twice.
 	int32 FineRingRadiusTiles()
 	{
-		static const int32 Value = []
-		{
-			int32 V = -1;
-			FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), V);
-			return (V >= 0) ? V : int32(FVoxelFineTileStreamer::kDefaultFineRingRadiusTiles);
-		}();
-		return Value;
+		return int32(FVoxelFineTileStreamer::RingRadiusFromCommandLine());
 	}
 
 	// CAN A WORKER OF OURS REACH THE FATAL GATE THROUGH THIS SAMPLER?

@@ -1969,6 +1969,13 @@ TUniquePtr<FVoxelFineTileStreamer> MakeFineTileStreamer(uint64 Seed, const FStri
 	auto Streamer = MakeUnique<FVoxelFineTileStreamer>(
 		FineTileDir, FineProviderId, Seed,
 		FineBudgetBytes != 0 ? FineBudgetBytes : FVoxelFineTileStreamer::kDefaultBudgetBytes, ClimateSource);
+	// Initialize() resolves this through
+	// FVoxelFineTileStreamer::RingRadiusFromCommandLine(), the switch's only
+	// reader, so in practice it is always >= 0 and this always fires. The guard
+	// is kept as the parameter's contract: a caller that has no opinion passes
+	// <0 and gets kDefaultFineRingRadiusTiles, which is what the member already
+	// holds. Do NOT reintroduce an FParse here -- see the comment at the call
+	// site, and VoxelRasterAtlas.cpp's FineRingRadiusTiles().
 	if (FineRingRadius >= 0)
 	{
 		Streamer->SetRingRadiusTiles(FineRingRadius);
@@ -31364,7 +31371,13 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	//                              nine tiles and ~3 GB. Raise it only with
 	//                              that in mind; correctness does not depend
 	//                              on it (RequestFootprint pulls in whatever a
-	//                              footprint needs regardless).
+	//                              footprint needs regardless). PARSED IN ONE
+	//                              PLACE ONLY:
+	//                              FVoxelFineTileStreamer::RingRadiusFromCommandLine().
+	//                              The raster atlas reads the same accessor to
+	//                              size its mode-3 admission margin, so
+	//                              changing the default is one edit to
+	//                              kDefaultFineRingRadiusTiles.
 	// INI FALLBACK ADDED 2026-08-01, and the paragraph above is the reason it
 	// needs justifying rather than just doing. That text argued command-line
 	// only "so it must never become a silent standing default the way
@@ -31419,8 +31432,14 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	double FineBudgetGB = 0.0;
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileCacheBudgetGB="), FineBudgetGB);
 	const uint64 FineBudgetBytes = FineBudgetGB > 0.0 ? uint64(FineBudgetGB * 1024.0 * 1024.0 * 1024.0) : 0;
-	int32 FineRingRadius = -1; // <0 => leave the streamer's own default
-	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), FineRingRadius);
+	// -VoxelFineTileRingRadius= IS NOT PARSED HERE. It has one reader,
+	// FVoxelFineTileStreamer::RingRadiusFromCommandLine(), because the raster
+	// atlas needs the same number to size its mode-3 admission margin and has
+	// no streamer to ask; two FParse sites for one switch is one default flip
+	// away from an atlas admitting pages the streamer never pinned. The
+	// accessor resolves absent/negative to kDefaultFineRingRadiusTiles, so this
+	// is always >= 0 and the streamer is always told explicitly.
+	const int32 FineRingRadius = int32(FVoxelFineTileStreamer::RingRadiusFromCommandLine());
 
     // Explicit transport/automation fixture; avoids depending on baked tiles
     // for an intentionally unique test seed. Ordinary launches keep their tier.

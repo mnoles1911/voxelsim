@@ -72,7 +72,32 @@ FName GlyphForItem(FName ItemId)
 	return NAME_None;
 }
 
-FVoxelJournalData SeedJournal(const FText& TodayStamp)
+// THE MOCK'S THREE DATES WERE ABSOLUTE AND THE WORLD'S IS NOT.
+//
+// The cards were hard-stamped 12, 9 and 1 -- Voxelmark Journal.html's own
+// numbers -- so on a world that was on day 11 the newest placeholder entry was
+// dated TOMORROW. A player cannot tell placeholder prose from real prose, and a
+// journal that contains an entry from the future is a bug report rather than
+// scaffolding.
+//
+// WHAT IS KEPT IS THE SPACING, NOT THE NUMBERS. The mock's cards sit at the
+// newest day, three days before it, and day one; anchoring that shape on the
+// live day reproduces 12 / 9 / 1 exactly when the world IS on day 12, which is
+// the property that makes this a re-anchoring rather than a rewrite. On a very
+// young world the middle card collides with the first (day 2 gives 2 / 1 / 1)
+// and that is deliberate: a duplicate date on two placeholder cards is a
+// cosmetic oddity; an entry dated after today is not.
+//
+// STILL DETERMINISTIC. Nothing here reads a clock or a random stream -- the
+// calendar arrives as an argument, so the same FVoxelSeedCalendar always yields
+// the same journal, which is what VoxelFrontEndTests.cpp relies on.
+//
+// THE SEASON AND YEAR ARE THE LIVE ONES ON ALL THREE CARDS, including the day-1
+// card that on a real calendar would often belong to an earlier season. Dating a
+// past entry properly needs the epoch of that day, which this fixture is not
+// given and should not grow: the whole function exists to be deleted when a real
+// journal lands.
+FVoxelJournalData SeedJournal(const FText& TodayStamp, const FVoxelSeedCalendar& Calendar)
 {
 	FVoxelJournalData Data;
 	Data.TodayStamp = TodayStamp;
@@ -83,19 +108,29 @@ FVoxelJournalData SeedJournal(const FText& TodayStamp)
 		E.Title = Title; E.Body = Body; E.Day = Day; E.Season = Season; E.Stamp = Stamp;
 		return E;
 	};
-	const FText Summer = LOCTEXT("SeedSummer", "Summer");
+	// The mock's own calendar, used only when the session cannot name a day --
+	// an unattended capture leg with no sky subsystem, or a world torn down
+	// mid-frame. See FVoxelSeedCalendar.
+	const bool bLive = Calendar.Day > 0;
+	const FText Season = (bLive && !Calendar.Season.IsEmpty())
+		? Calendar.Season
+		: LOCTEXT("SeedSummer", "Summer");
+	const int32 Year = (bLive && Calendar.Year > 0) ? Calendar.Year : 18;
+	const int32 NewestDay = bLive ? Calendar.Day : 12;
+	const int32 MiddleDay = FMath::Max(1, NewestDay - 3);
+	const int32 FirstDay = 1;
 	Data.Entries.Add(Entry(
 		LOCTEXT("SeedE3T", "The wolves came back"),
 		LOCTEXT("SeedE3B", "Three of them at the treeline before dusk. They did not come closer than the fire, but they did not leave either.\n\nI have started a stone wall on the north side. Two courses laid. It will not stop anything yet but it makes me feel better to have put something between us and the dark."),
-		12, Summer, LOCTEXT("SeedE3S", "Day 12 · Summer, 18th Year of the Second Age")));
+		NewestDay, Season, VoxelUIStrings::WorldStamp(NewestDay, Season, Year)));
 	Data.Entries.Add(Entry(
 		LOCTEXT("SeedE2T", "Copper in the cliff face"),
 		LOCTEXT("SeedE2B", "Found a green streak in the rock above the creek. Chipped out eleven lumps before the pick gave out.\n\nIf I can find tin I can make bronze, and then I can stop breaking a tool every second day."),
-		9, Summer, LOCTEXT("SeedE2S", "Day 9 · Summer, 18th Year of the Second Age")));
+		MiddleDay, Season, VoxelUIStrings::WorldStamp(MiddleDay, Season, Year)));
 	Data.Entries.Add(Entry(
 		LOCTEXT("SeedE1T", "First night"),
 		LOCTEXT("SeedE1B", "No shelter, no fire, nothing but what I could carry. Slept in a hole I dug into the hillside with my hands.\n\nIt rained. Of course it rained."),
-		1, Summer, LOCTEXT("SeedE1S", "Day 1 · Summer, 18th Year of the Second Age")));
+		FirstDay, Season, VoxelUIStrings::WorldStamp(FirstDay, Season, Year)));
 
 	auto Step = [](const FText& Text, EVoxelGoalStepState State)
 	{

@@ -76,6 +76,19 @@ public:
 	// not the checkpoint system.
 	const TArray<FVoxelMapMark>& GetMarks() const { return Marks; }
 
+	// THE HUD'S ONE VISIBILITY AUTHORITY (2026-09-08 backlog: "HUD stays lit
+	// behind overlay panels"). It does not toggle -- it re-reads
+	// OverlayOwnsInput() and makes the HUD agree with it, which is what makes
+	// nested and interleaved overlays safe: a pause menu opened over an open
+	// inventory and then closed must NOT put the compass back while the
+	// inventory is still up, and a toggle would.
+	//
+	// PUBLIC BECAUSE THE PAUSE MENU IS A DIFFERENT SUBSYSTEM. UVoxelPauseUISubsystem
+	// owns z-order 120 and already hides the older survival hotbar for exactly
+	// this reason; it calls this for the newer HUD. Cheap enough to call every
+	// tick: it early-outs unless the answer changed.
+	void RefreshHudForOverlays();
+
 private:
 	// UInputComponent::BindKey's delegate signature takes no payload, so each
 	// key needs its own nullary target -- the same shape
@@ -144,11 +157,12 @@ private:
 	FVoxelHudData GatherHudData() const;
 	FText DayStamp() const;
 
-	// bKeepMusicCluster is TRUE for the five in-game screens, whose panel is
-	// centred and leaves the corner free, and FALSE for the death screen and the
-	// dialogue overlay, which are full-bleed and whose mocks show nothing there.
-	// COORDINATOR DECISION, 2026-09-07.
-	void ApplyOverlayInput(TSharedRef<class SWidget> Widget, bool bKeepMusicCluster);
+	// NO bKeepMusicCluster PARAMETER ANY MORE (2026-09-08). It used to hold the
+	// music transport on screen under the five in-game screens; RefreshHudForOverlays
+	// now takes the whole HUD down for every overlay kind, so there is nothing
+	// left to vary per call site. See that function for why the 2026-09-07
+	// decision it encoded no longer applies.
+	void ApplyOverlayInput(TSharedRef<class SWidget> Widget);
 	void RestoreGameInput();
 	void TeardownStack();
 
@@ -169,6 +183,10 @@ private:
 	// subsystem, so this is also once per world session.
 	bool bMarksLoaded = false;
 	bool bSavedShowCursor = false;
+	// What RefreshHudForOverlays last applied. Held so the per-tick call is a
+	// comparison rather than two SetVisibility calls a frame -- SWidget::SetVisibility
+	// invalidates layout whether or not the value changed.
+	bool bHudHiddenForOverlay = false;
 
 	// EnsureMusicInGame runs exactly once per world. Not per session: a map
 	// reopen (which is how EXIT TO MENU and LOAD work here -- see
