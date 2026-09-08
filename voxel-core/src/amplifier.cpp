@@ -2123,6 +2123,22 @@ int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
     return marked > int64_t(kSeaLevelMm) ? marked : int64_t(kSeaLevelMm);
 }
 
+bool Amplifier::surfaceBoundPairMm(int64_t vx0, int64_t vy0, int64_t vx1,
+                                  int64_t vy1, int64_t& lower, int64_t& upper) const {
+    if (!surfaceBoundsMm(vx0, vy0, vx1, vy1, lower, upper)) {
+        lower = kSurfaceLowerBoundDeclined;
+        upper = kSurfaceBoundDeclined;
+        return false;
+    }
+    // Preserve the existing upper-only debug marker envelope exactly. No water
+    // sampler call or additional raster traversal is introduced.
+    if (waterMarker_ != nullptr) {
+        const int64_t marked = upper + kWaterMarkerHeightMm;
+        upper = marked > int64_t(kSeaLevelMm) ? marked : int64_t(kSeaLevelMm);
+    }
+    return true;
+}
+
 int64_t Amplifier::surfaceLowerBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
                                        int64_t vy1) const {
     int64_t lo = 0, hi = 0;

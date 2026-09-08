@@ -386,7 +386,7 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
         const bool Exists=std::filesystem::exists(StdPath,ExistsError);
         if(!ExistsError&&!Exists){
             ++MissingFileLoads_;
-            KnownMissing_.insert(TileHash(Tile));
+            if(KnownMissing_.insert(TileHash(Tile)).second)ResidencyEpoch_.fetch_add(1,std::memory_order_relaxed);
             LoadFailures_.erase(TileHash(Tile));
         }
         return false;
@@ -1501,6 +1501,7 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 			Sampler_.unloadTile(It->second.x, It->second.y);
 			NoteMirrorWriteThread_();
 			ResidentTiles_.erase(TileHash(It->second)); // THE MIRROR, WRITE 3 OF 3
+            ResidencyEpoch_.fetch_add(1,std::memory_order_relaxed);
 			Budget_.remove(Key);
 			KeyToTile_.erase(It);
 		}

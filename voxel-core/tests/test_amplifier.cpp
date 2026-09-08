@@ -1321,3 +1321,69 @@ VXC_TEST(surfaceInfo_gradient_direction_points_uphill) {
                 sloped ? 100 * rose / sloped : 0);
     CHECK(rose * 100 >= sloped * 90);
 }
+
+VXC_TEST(surface_bound_pair_matches_independent_paths) {
+    SyntheticTileSampler tiles(kSeed); Amplifier amp(kSeed,tiles);
+    FlatWaterSampler water(0);
+    for(int marker=0;marker<3;++marker) {
+        amp.setWaterMarker(marker?&water:nullptr,marker!=2);
+        for(const int64_t span:{1,32,1024,4096,20000,1000000})
+        for(const int64_t x:{-9001,-1,0,8192}) {
+            const int64_t y=-x-37;
+            const auto lo=amp.surfaceLowerBoundMm(x,y,x+span-1,y+span-1);
+            const auto hi=amp.surfaceUpperBoundMm(x,y,x+span-1,y+span-1);
+            int64_t pairLo=123,pairHi=456;
+            const bool ok=amp.surfaceBoundPairMm(x,y,x+span-1,y+span-1,pairLo,pairHi);
+            CHECK_EQ(pairLo,lo);CHECK_EQ(pairHi,hi);
+            CHECK_EQ(ok,lo!=kSurfaceLowerBoundDeclined&&hi!=kSurfaceBoundDeclined);
+        }
+        int64_t lo=0,hi=0;
+        CHECK(!amp.surfaceBoundPairMm(1,0,0,0,lo,hi));
+        CHECK_EQ(lo,kSurfaceLowerBoundDeclined);CHECK_EQ(hi,kSurfaceBoundDeclined);
+    }
+}
+
+VXC_TEST(surface_bound_pair_uses_one_raster_traversal) {
+    struct CountingTiles final : ITileSampler {
+        uint64_t reads=0;
+        int32_t pixelSizeMm() const override{return 1875;}
+        int32_t elevationMm(int64_t x,int64_t y) override{++reads;return int32_t((floorMod(x,17)+floorMod(y,13))*100);}
+        ClimateSample climate(int64_t,int64_t) override{return {};}
+    };
+    uint64_t counts[3]={};
+    for(int mode=0;mode<3;++mode) {
+        // Fresh thread gives each measurement empty raster memo tables.
+        // This isolates traversal cost; warm production memo misses need not halve.
+        std::thread worker([&,mode]{
+            CountingTiles tiles;Amplifier amp(kSeed,tiles);int64_t lo=0,hi=0;
+            if(mode==0)amp.surfaceBoundPairMm(-512,-512,511,511,lo,hi);
+            if(mode==1)lo=amp.surfaceLowerBoundMm(-512,-512,511,511);
+            if(mode==2)hi=amp.surfaceUpperBoundMm(-512,-512,511,511);
+            counts[mode]=tiles.reads;
+        });worker.join();
+    }
+    CHECK(counts[0]>0);CHECK_EQ(counts[0],counts[1]);CHECK_EQ(counts[0],counts[2]);
+    CHECK_EQ(counts[1]+counts[2],2*counts[0]);
+}
+
+VXC_TEST(surface_bound_pair_fine_pitch_decline_parity) {
+    struct FineBoundsTiles final : ITileSampler {
+        int32_t pixelSizeMm() const override{return 1875;}
+        int32_t elevationMm(int64_t x,int64_t y) override{return int32_t((floorMod(x,17)+floorMod(y,13))*100);}
+        ClimateSample climate(int64_t,int64_t) override{return {};}
+    } tiles;
+    Amplifier amp(kSeed,tiles);FlatWaterSampler water(0);
+    for(int marker=0;marker<2;++marker) {
+        amp.setWaterMarker(marker?&water:nullptr);
+        for(const int64_t span:{32,1024,2048,4096}) {
+            const int64_t x=-span-17,y=-1;
+            const int64_t oldLo=amp.surfaceLowerBoundMm(x,y,x+span-1,y+span-1);
+            const int64_t oldHi=amp.surfaceUpperBoundMm(x,y,x+span-1,y+span-1);
+            int64_t lo=123,hi=456;
+            const bool ok=amp.surfaceBoundPairMm(x,y,x+span-1,y+span-1,lo,hi);
+            CHECK_EQ(lo,oldLo);CHECK_EQ(hi,oldHi);
+            CHECK_EQ(ok,oldLo!=kSurfaceLowerBoundDeclined&&oldHi!=kSurfaceBoundDeclined);
+            if(span==4096)CHECK(!ok); // L7 footprint must retain recursive fallback.
+        }
+    }
+}

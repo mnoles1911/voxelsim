@@ -195,15 +195,18 @@ inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col) {
 class AssetField {
 public:
     AssetField() = default;
+    AssetField(const AssetField& other):seed_(other.seed_),layers_(other.layers_),species_(other.species_),banks_(other.banks_){}
+    AssetField& operator=(const AssetField& other){if(this!=&other){changed();seed_=other.seed_;layers_=other.layers_;species_=other.species_;banks_=other.banks_;}return *this;}
+    uint64_t configurationRevision() const{return revision_;}
 
-    void setLayers(const AssetLayer* layers, int count) {
+    void setLayers(const AssetLayer* layers, int count) { changed();
         layers_.assign(layers, layers + (count < kAssetLayerCount ? count : kAssetLayerCount));
     }
-    void setSpecies(const AssetSpecies* species, int count) {
+    void setSpecies(const AssetSpecies* species, int count) { changed();
         species_.assign(species, species + count);
     }
-    void setBankSource(const IAssetBankSource* banks) { banks_ = banks; }
-    void setSeed(uint64_t seed) { seed_ = seed; }
+    void setBankSource(const IAssetBankSource* banks) { changed(); banks_ = banks; }
+    void setSeed(uint64_t seed) { changed(); seed_ = seed; }
 
     const std::vector<AssetLayer>& layers() const { return layers_; }
     const std::vector<AssetSpecies>& species() const { return species_; }
@@ -541,6 +544,8 @@ public:
     }
 
 private:
+    void changed(){if(revision_!=UINT64_MAX)++revision_;}
+    uint64_t revision_=0;
     uint64_t seed_ = 0;
     std::vector<AssetLayer> layers_;
     std::vector<AssetSpecies> species_;

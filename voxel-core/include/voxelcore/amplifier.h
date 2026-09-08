@@ -471,6 +471,11 @@ public:
     // independently testable.
     int64_t surfaceLowerBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
 
+    // Same conservative answers as the independent methods, one raster traversal.
+    // False writes both decline sentinels; marker widening applies only to upper.
+    bool surfaceBoundPairMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1,
+                            int64_t& lower, int64_t& upper) const;
+
     // A PROVABLE ALL-SOLID FLOOR for the inclusive voxel-index rectangle: every
     // voxel in that footprint whose centre is strictly below the returned mm
     // elevation is guaranteed non-air. Returns kSurfaceLowerBoundDeclined when

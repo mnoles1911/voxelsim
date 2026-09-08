@@ -239,7 +239,7 @@ public:
 	// because only part of the world is fine-baked. Rationale and the
 	// known-absent-only gating live at ResolveNonResidentPixel in the .cpp.
 	// Null by default, so behaviour is unchanged until something wires it.
-	void SetCoarseFallback(vxc::ITileSampler* Sampler) { CoarseFallback_ = Sampler; }
+	void SetCoarseFallback(vxc::ITileSampler* Sampler) { CoarseFallback_ = Sampler; ResidencyEpoch_.fetch_add(1,std::memory_order_relaxed); }
 	vxc::ITileSampler* CoarseFallback() const { return CoarseFallback_; }
 #if WITH_DEV_AUTOMATION_TESTS
     bool DebugKnownAbsentForTest(vxc::TileCoord Tile) const;
