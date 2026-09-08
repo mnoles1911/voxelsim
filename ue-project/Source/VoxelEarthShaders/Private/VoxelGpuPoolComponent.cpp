@@ -721,6 +721,18 @@ public:
 		// CPU shadow happens to contain. Once the GPU writes quads directly,
 		// re-uploading here would silently revert them.
 		check(SharedBuffers.IsValid());
+		// --- THE COMMIT INSTRUMENT (2026-09-08) -----------------------------
+		//
+		// 192M quads is 1465 MB of quad buffer plus 732 MB of chunk-id buffer,
+		// both SetInitActionZeroData, both created HERE on the render thread the
+		// first time a chunk reaches the pool -- i.e. inside the first streaming
+		// frames of a load, with no timer on them. docs/cold-start-attribution.md
+		// names that as a suspect for the load screen's hitches; it has never
+		// been measured, and "named as a suspect" is not a measurement. This
+		// bracket is what lets the next log say the number instead of inferring
+		// it, in either direction: a small value RETIRES the commit, a large one
+		// convicts it.
+		const double CommitT0 = FPlatformTime::Seconds();
 		if (!SharedBuffers->IsValid() || SharedBuffers->CapacityQuads < BufferQuads)
 		{
 			// First proxy, or the pool outgrew the allocation. The latter means
@@ -845,6 +857,16 @@ public:
 
 			UE_LOG(LogTemp, Log,
 			       TEXT("%s: created persistent pool buffers, capacity %d quads — GPU-writable"),
+			       *PoolName, SharedBuffers->CapacityQuads);
+
+			// THE NUMBER, on the thread that paid it. Both buffers together:
+			// 8 B/quad of quad payload + 4 B/quad of chunk id, which is the same
+			// arithmetic kPoolCapacityQuads' own comment states, so the two
+			// cannot drift.
+			UE_LOG(LogTemp, Log,
+			       TEXT("GpuPool: committed %.0f MB in %.0f ms (%s, %d quads)"),
+			       double(SharedBuffers->CapacityQuads) * 12.0 / (1024.0 * 1024.0),
+			       (FPlatformTime::Seconds() - CommitT0) * 1000.0,
 			       *PoolName, SharedBuffers->CapacityQuads);
 		}
 		else

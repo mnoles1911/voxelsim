@@ -986,6 +986,29 @@ namespace VoxelBrickPoolDetail
 		return RHICmdList.CreateBuffer(Desc);
 	}
 
+	// --- THE ARENA-COMMIT INSTRUMENT AND THE MENU PRE-WARM (2026-09-08) -------
+	//
+	// The 2026-09-08 live load carried five hitch frames whose whole wall time
+	// was rendered as `renderWaitMs`, and the arena commit was INFERRED to be
+	// one of them because `FVoxelBrickPool: ... 952.0 MiB committed` sits two
+	// frames after NEW GAME. Inference is not attribution: that line is printed
+	// by Init on the GAME thread and says what the pool INTENDS to allocate, not
+	// what CreateBuffer cost. These two brackets are what let the next log say
+	// which it was, and a zero here is as informative as a large number --
+	// it retires the arena commit as a suspect instead of leaving it open.
+	//
+	// bPrewarmRequested is set on the GAME thread by PrewarmArenas and read on
+	// the RENDER thread inside EnsureCreated_RenderThread, hence the atomic. It
+	// only ever goes false -> true and it is used for LOGGING ONLY, so a stale
+	// read costs one mislabelled line and nothing else.
+	std::atomic<bool> GPrewarmRequested{ false };
+	// RENDER THREAD ONLY (every reader and writer is inside
+	// EnsureCreated_RenderThread), so a plain bool is the right idiom here --
+	// the same one FVoxelGpuPoolBuffers::ElementsLogged uses for its own
+	// once-per-process line. Only the "already created (pre-warmed)" arm needs
+	// one; the creation arm is already once-per-holder by construction.
+	bool GLoggedPrewarmHit = false;
+
 	// --- P1: voxel.GPU.PoolAlloc -------------------------------------------
 	//
 	// The switch itself. Default 0 = today's behaviour byte-for-byte: CPU
@@ -2138,8 +2161,25 @@ void FVoxelBrickPool::EnsureCreated_RenderThread(FRHICommandListImmediate& RHICm
 	{
 		return;
 	}
+	// THE BRACKET. Opened before the existence test rather than inside it, so
+	// the "already created" arm is measurable too -- a pre-warmed pool must be
+	// able to show that the streaming path paid ~0 ms here, and a bracket that
+	// only exists on the creation path could never say so.
+	const double EnsureT0 = FPlatformTime::Seconds();
+	const bool bCreatedArenasThisCall = !Buffers->IsValid();
+	double ArenaMiB = 0.0;
+
 	if (!Buffers->IsValid())
 	{
+		// Byte totals taken from the SAME fields the creation calls below use,
+		// so the MiB in the line cannot drift from the MiB actually committed.
+		ArenaMiB =
+			(double(Buffers->DescSlots) * double(VoxelBrickPoolDetail::kBrickDescBytes)
+			 + double(Buffers->OccWords) * double(sizeof(uint32))
+			 + double(Buffers->MatWords) * double(sizeof(uint32))
+			 + double(Buffers->ChunkSlots) * double(VoxelBrickPoolDetail::kChunkRecordDwords)
+			   * double(sizeof(uint32)))
+			/ (1024.0 * 1024.0);
 		Buffers->DescBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Desc"),
 		                                        VoxelBrickPoolDetail::kBrickDescBytes, Buffers->DescSlots);
 		Buffers->OccBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.Occ"),
@@ -2171,6 +2211,12 @@ void FVoxelBrickPool::EnsureCreated_RenderThread(FRHICommandListImmediate& RHICm
 
 	// P1: the allocator's own buffers, only on an armed pool. Zero-initialised
 	// IS the allocator's initial state -- see the holder's comment.
+	const bool bCreatedAllocThisCall = Buffers->AllocStateDwords > 0 && !Buffers->HasGpuAlloc();
+	if (bCreatedAllocThisCall)
+	{
+		ArenaMiB += (double(Buffers->AllocStateDwords) + double(Buffers->AllocBitmapDwords)
+		             + double(Buffers->AllocSideDwords)) * double(sizeof(uint32)) / (1024.0 * 1024.0);
+	}
 	if (Buffers->AllocStateDwords > 0 && !Buffers->HasGpuAlloc())
 	{
 		Buffers->AllocStateBuffer = VoxelBrickPoolDetail::CreateArenaBuffer(RHICmdList, TEXT("VoxelBrickPool.AllocState"),
@@ -2192,6 +2238,80 @@ void FVoxelBrickPool::EnsureCreated_RenderThread(FRHICommandListImmediate& RHICm
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Buffers->AllocSideDwords),
 			Buffers->AllocSideDwords, TEXT("VoxelBrickPool.AllocSide"));
 	}
+
+	// --- WHAT THE COMMIT ACTUALLY COST -------------------------------------
+	//
+	// One line per process on each arm, because both arms are readings:
+	//
+	//   BrickPool: arenas created in %.0f ms (%.0f MiB)%s
+	//       the commit itself, on the thread that paid for it. The suffix names
+	//       WHERE it was paid -- "under the menu (pre-warmed)" or "inside the
+	//       load". A NEW GAME leg that prints "inside the load" is the pre-warm
+	//       FAILING, and a leg that prints 0-2 ms is the arena commit RETIRED
+	//       as a suspect for the load-screen hitches.
+	//
+	//   BrickPool: arenas already created (pre-warmed), ensure cost %.2f ms
+	//       the first streaming-path call finding the work already done. This
+	//       is the pre-warm's proof of engagement; without it the pre-warm
+	//       could be a silent no-op and every number above would still look
+	//       right.
+	//
+	// THE CREATION ARM NEEDS NO ONCE-FLAG: `if (!Buffers->IsValid())` already
+	// makes it fire exactly once per buffer holder, so a private verification
+	// pool (VoxelCoverVerify, VoxelGpuMeshAsyncVerify) prints its OWN line
+	// rather than stealing the global pool's -- which a shared one-shot would
+	// have done, silently, on exactly the legs that build both.
+	const double EnsureMs = (FPlatformTime::Seconds() - EnsureT0) * 1000.0;
+	if (bCreatedArenasThisCall || bCreatedAllocThisCall)
+	{
+		UE_LOG(LogVoxelBrickPool, Log,
+		       TEXT("BrickPool: arenas created in %.0f ms (%.0f MiB) -- %s"),
+		       EnsureMs, ArenaMiB,
+		       VoxelBrickPoolDetail::GPrewarmRequested.load(std::memory_order_relaxed)
+		           ? TEXT("under the menu (pre-warmed)")
+		           : TEXT("inside the load (NOT pre-warmed)"));
+	}
+	// The "already created" arm DOES need a once-flag -- without one it would
+	// print on every flush for the rest of the session -- and it is additionally
+	// gated on AllocStateDwords, which is nonzero ONLY on the global pool (see
+	// Init: bGpuAllocArmed requires `this == &GetGlobalVoxelBrickPool()`). That
+	// keeps a private verification pool from consuming the one shot the pre-warm
+	// is proved by.
+	else if (!bCreatedArenasThisCall && !bCreatedAllocThisCall
+	         && Buffers->AllocStateDwords > 0
+	         && VoxelBrickPoolDetail::GPrewarmRequested.load(std::memory_order_relaxed)
+	         && !VoxelBrickPoolDetail::GLoggedPrewarmHit)
+	{
+		VoxelBrickPoolDetail::GLoggedPrewarmHit = true;
+		UE_LOG(LogVoxelBrickPool, Log,
+		       TEXT("BrickPool: arenas already created (pre-warmed), ensure cost %.2f ms."),
+		       EnsureMs);
+	}
+}
+
+// GAME THREAD. See the declaration for the whole argument; the body is
+// deliberately four statements.
+void FVoxelBrickPool::PrewarmArenas()
+{
+	check(IsInGameThread());
+	if (!bInitialised)
+	{
+		// The SAME config the lazy path picks (AddChunkFromCpu /
+		// AddChunkFromGpu / the flush), so pre-warming cannot commit a
+		// different pool from the one the world would have built.
+		Init(FVoxelBrickPoolConfig{});
+	}
+	VoxelBrickPoolDetail::GPrewarmRequested.store(true, std::memory_order_relaxed);
+
+	// ENQUEUED, NOT FLUSHED. The caller is the front end's Menu-state entry and
+	// it must return within its frame; the render thread does the commit at its
+	// own pace behind a static 2D title screen. Nothing here waits.
+	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolPrewarm)(
+		[Buffers = GetOrCreateBuffers()](FRHICommandListImmediate& RHICmdList)
+	{
+		VOXEL_RENDER_FRAME_SCOPE_TAIL(TailBrickPool);
+		EnsureCreated_RenderThread(RHICmdList, Buffers);
+	});
 }
 
 int32 FVoxelBrickPool::FindChunkSlot(const FVoxelBrickChunkKey& Key) const

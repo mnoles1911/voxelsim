@@ -240,6 +240,12 @@ VoxelNoMenu
 VoxelMenuPanel
 VoxelMenuAutoStart
 VoxelMenuWatchdog
+# 2026-09-08: -VoxelMenuPrewarm=0|1 (default 1). Configuration. Commits the
+# brick pool's GPU arenas while the title screen is up instead of inside the
+# first streaming frames of a load. Its call site is EnterMenu, so it needs a
+# human at the menu by construction and can never drive a headless run; =0 is
+# the control arm of the loading-screen A/B.
+VoxelMenuPrewarm
 # menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): the A/B switch
 # for whether the menu's per-frame ticker gates are active. Configuration, not
 # a driver -- it changes what a run DOES while parked at the menu, never
@@ -604,4 +610,4 @@ VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive
 # the ripple field at an offset inside a capture run (the plan's wake legs pair
 # it with -VoxelScreenshotAfter); the five parameters below only shape that
 # injection and are inert without it.
-VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a wake at an offset; the run is ended by the capture switch it is paired with. Matches 'After' by intent, not by accident.
+VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a wake at an offset; the run is ended by the capture switch it is paired with. Matches 'After' by intent, not by accident.

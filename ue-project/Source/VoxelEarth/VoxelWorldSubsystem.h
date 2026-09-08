@@ -613,6 +613,43 @@ public:
 	void StartWorldSession(const FString& EditLogPathOrEmpty);
 	bool HasWorldSessionStarted() const { return ChunkOwner != nullptr; }
 
+	// --- THE MENU PRE-WARM (2026-09-08, owner: "the hourglass freezes") -----
+	//
+	// GAME THREAD, NON-BLOCKING. Enqueues the big zero-initialised GPU
+	// allocations so the RENDER thread pays for them while a static 2D title
+	// screen is on top of a HELD world, instead of inside the first streaming
+	// frames of a load where the same commit is a visible freeze.
+	//
+	// IT DOES NOT START THE WORLD. ChunkOwner stays null, no chunk is admitted,
+	// no edit log is touched; only the allocation moves earlier in wall-clock
+	// time. That is the property that makes it legal to call from the menu at
+	// all, and it is why this is a separate method rather than a flag on
+	// StartWorldSession.
+	//
+	// IT DOES NOT FLUSH THE RENDER THREAD. Every commit goes out as an ordinary
+	// ENQUEUE_RENDER_COMMAND and this returns within the caller's frame. A
+	// FlushRenderingCommands here would trade a hitch in the load for a hitch in
+	// the menu -- and, worse, it is the shape of call the 2026-09-07 curtain
+	// deadlock came out of (see VoxelLoadingCurtainThread.h). If anybody ever
+	// needs the commit to have LANDED before returning, that is a different
+	// method with the argument written out, not a quiet flush added here.
+	//
+	// WHAT IT CAN AND CANNOT REACH TODAY:
+	//   * the brick pool's arenas (952 MiB at the shipping config) -- YES. Its
+	//     config is world-independent, so pre-warming picks exactly the pool the
+	//     first chunk would have built.
+	//   * the GPU quad pool (1465 MB + 732 MB) -- NO, and the log says so rather
+	//     than passing silently. Those buffers are created by
+	//     FVoxelGpuPoolSceneProxy::CreateRenderThreadResources, which needs a
+	//     registered UVoxelGpuPoolComponent, which GetOrCreateGpuPool spawns off
+	//     ChunkOwner -- and ChunkOwner not existing IS the held world. Reaching
+	//     it from the menu means either spawning the chunk owner early (that is
+	//     starting the world) or teaching the component to adopt a pre-built
+	//     buffer holder. Neither is a one-night change, and a pre-warm that
+	//     quietly warmed nothing would be exactly the silent success this
+	//     project keeps paying for.
+	void PrewarmGpuPools();
+
 	// Started AND at least one full frame ago.
 	//
 	// THE ONE-FRAME GAP IS REAL AND IT KILLED A CAPTURE. BeginPlayerSession

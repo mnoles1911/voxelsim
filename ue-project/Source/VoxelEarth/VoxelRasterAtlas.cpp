@@ -19,6 +19,7 @@
 #include "Misc/Parse.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/ScopeExit.h"   // ON_SCOPE_EXIT -- PrepareRequest has several returns
+#include "HAL/IConsoleManager.h" // voxel.Stream.AtlasFillMs -- the load theatre's sweep cap
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelRasterAtlas, Log, All);
 
@@ -61,6 +62,49 @@ namespace
 	// allows. Raising the budget does not change the shape and lowering it
 	// below one page does not either -- which is the argument for making the
 	// page cheaper (mode 2) or moving it (mode 3) rather than tuning this.
+	// --- THE LOAD-THEATRE OVERRIDE (2026-09-08) -----------------------------
+	//
+	// A CVAR BESIDE THE LATCHED SWITCH, NOT INSTEAD OF IT, and default -1 so
+	// that with nobody setting it this function returns EXACTLY what it
+	// returned before -- same latched value, same overshoot, byte-identical
+	// behaviour on the off arm. -1 is the sentinel rather than 0 because 0 is a
+	// meaningful budget here (it degrades to one page per tick through the
+	// overshoot, which is a real arm somebody may want).
+	//
+	// WHY THIS IS THE KNOB AND `cap=256/tick` IS NOT. The demand cap
+	// (DemandPagesPerTick, below) bounds only FillWindowOnDemand's rescue path.
+	// On the 2026-09-08 live load the burst that cost the loading screen was
+	// `fills=1645 (205.62 MiB, 2016.4 ms GT)` of which the demand path
+	// accounted for 9.4 ms -- the other ~2,007 ms is the SWEEP, and the sweep
+	// is bounded here and nowhere else. Lowering the demand cap instead has
+	// already been measured and is WORSE (see DemandPagesPerTick: at 64 it
+	// produced capHit=1070/noAtlas=1070 by pushing chunks onto the inline
+	// window path), so this is the lever that exists and that one is spent.
+	//
+	// WHAT LOWERING IT BUYS, AND ITS FLOOR. The deadline is tested BEFORE a
+	// page and never during, so the minimum this can reach is ONE WHOLE PAGE
+	// per tick -- 1.23 ms measured at the fine tier on that load, 1.85 ms once
+	// the pages got more expensive. The live load ran ~2.9 pages/tick; at 0.5
+	// it runs one. That is ~2 ms of game thread returned to Slate every frame
+	// of the load screen and nothing else changes: the pages it did not fill
+	// stay queued and the sweep gets them on later ticks, so this trades total
+	// load DURATION for per-frame smoothness, which is the trade the owner
+	// asked for in as many words.
+	//
+	// FAILING READING: `[raster-atlas] fill` still showing >1 page per tick
+	// while the theatre is up means the cvar was not found or not applied --
+	// the front end logs `LoadScreen: capped voxel.Stream.AtlasFillMs` and the
+	// absence of that line is the same failure said earlier.
+	TAutoConsoleVariable<float> CVarAtlasFillMsOverride(
+		TEXT("voxel.Stream.AtlasFillMs"),
+		-1.0f,
+		TEXT("Per-tick game-thread budget, in ms, for the raster atlas's page sweep. "
+		     "-1 (default) = use -VoxelGpuRasterAtlasFillMs (2.0). The loading screen caps this "
+		     "for the duration of the load theatre and restores it at the reveal, the same way it "
+		     "caps voxel.Stream.ApplyBudgetMs. Cannot go below one page per tick: the deadline is "
+		     "tested before a page, never during."),
+		ECVF_Default);
+
 	double FillBudgetMs()
 	{
 		static const double Value = []
@@ -69,7 +113,17 @@ namespace
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuRasterAtlasFillMs="), V);
 			return V;
 		}();
-		return Value;
+		// Read every call rather than latched: the whole point is that the
+		// front end can raise it back at the reveal. One cvar read per TICK
+		// (this is called once per tick to compute the deadline, not once per
+		// page), which is not a cost worth caching against.
+		//
+		// ...OnAnyThread, the file's neighbours' idiom (VoxelDebug.cpp), and
+		// not ...OnGameThread: every caller here IS the game thread today, but
+		// the game-thread accessor carries an ensure() that would turn a future
+		// off-thread caller into a check failure rather than a stale float.
+		const float Override = CVarAtlasFillMsOverride.GetValueOnAnyThread();
+		return Override >= 0.0f ? double(Override) : Value;
 	}
 
 	// --- THE DEMAND-FILL CAP, IN PAGES PER STREAMING TICK -------------------

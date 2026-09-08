@@ -111,6 +111,7 @@
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "LocalVertexFactory.h" // hitch isolation: FLocalVertexFactory::StaticType for the BeginPlay PSO precache warmup
+#include "VoxelQuadVertexFactory.h" // 2026-09-08: FVoxelQuadVertexFactory::StaticType -- the POOLED draw path's half of that same precache
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Misc/App.h" // FApp::IsUnattended() -- fine-tier gate-leak policy, see MakeFineTileStreamer
@@ -31770,6 +31771,31 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		// time, not a Static-mobility variant that would go unused.
 		TerrainPrecacheParams.SetMobility(EComponentMobility::Movable);
 		ChunkMaterial->PrecachePSOs(&FLocalVertexFactory::StaticType, TerrainPrecacheParams);
+
+		// --- THE POOLED PATH'S PSO, WHICH WAS NEVER PRECACHED (2026-09-08) ---
+		//
+		// The line above precaches M_VoxelTerrain against FLocalVertexFactory,
+		// which is the PER-CHUNK component path. The shipping draw path has not
+		// been that for a long time: terrain streams as ranges in ONE primitive
+		// through FVoxelGpuPoolSceneProxy, and that proxy draws with
+		// FVoxelQuadVertexFactory. Nothing has ever asked for THAT pair's
+		// pipeline state, so it compiles the first time a pooled chunk reaches
+		// GetDynamicMeshElements -- which is inside the load, on the render
+		// thread, exactly where the 2026-09-08 hitches live.
+		//
+		// SAME CONTRACT AS THE LINE ABOVE, and that is why it sits here rather
+		// than anywhere else: BeginPlay is before ChunkOwner exists, the request
+		// is asynchronous (PrecachePSOs only enqueues shader-compile graph
+		// events; it never waits), and the whole menu + load theatre is
+		// available for it to finish in. Same -VoxelNoPSOPrecache switch, so the
+		// A/B arm covers both requests together.
+		//
+		// FAILING READING: this cannot be proved from a log line of its own --
+		// the engine owns the precache bookkeeping. What it CAN be judged on is
+		// the render-thread hitch profile of the first seconds after NEW GAME
+		// with and without -VoxelNoPSOPrecache, which is the same instrument
+		// the line above was landed on.
+		ChunkMaterial->PrecachePSOs(&FVoxelQuadVertexFactory::StaticType, TerrainPrecacheParams);
 	}
 
 	// THE STREAMING GATE (docs/front-end-plan.md). Everything above this point
@@ -31804,6 +31830,44 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		StartWorldSession(ProbePath);
 	}
 	else StartWorldSession(GetWorldSaveFilePath(Seed));
+}
+
+// See the declaration for the whole argument, including what this deliberately
+// does NOT reach and why that is logged rather than passed over.
+void UVoxelWorldSubsystem::PrewarmGpuPools()
+{
+	check(IsInGameThread());
+
+	// THE BRICK POOL. Init (if it has not run) + one enqueued render command.
+	// The pool's own instrument prints the millisecond cost on the render
+	// thread; what this line proves is that the CALL happened at all, and on
+	// which side of NEW GAME.
+	const double T0 = FPlatformTime::Seconds();
+	FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
+	const bool bWasInitialised = BrickPool.IsInitialised();
+	BrickPool.PrewarmArenas();
+	const FVoxelBrickPoolConfig& Cfg = BrickPool.GetConfig();
+	// The same four arenas EnsureCreated_RenderThread commits, in the same
+	// arithmetic the pool's own `... MiB committed` line uses.
+	const double BrickMiB =
+		(double(Cfg.ChunkCapacity) * double(FVoxelBrickPool::kBricksPerChunk) * 8.0
+		 + double(Cfg.OccWordCapacity) * 4.0
+		 + double(Cfg.MatWordCapacity) * 4.0
+		 + double(Cfg.ChunkCapacity) * double(FVoxelBrickPool::kChunkRecordDwords) * 4.0)
+		/ (1024.0 * 1024.0);
+	const double EnqueueMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+
+	// ONE LINE, AND IT CAN FAIL. `quad SKIPPED` is the honest half: the quad
+	// pool genuinely is not reachable with the world held, and a pre-warm that
+	// printed a quad number here would be claiming work it did not do.
+	UE_LOG(LogVoxelStream, Log,
+	       TEXT("VoxelWorld: GPU pools pre-warmed under the menu: brick %.0f MiB in %.0f ms (enqueue only -- ")
+	       TEXT("the commit lands on the render thread; read `BrickPool: arenas created` for its cost), ")
+	       TEXT("quad SKIPPED (0 MB in 0 ms): the terrain quad pool's buffers are created by its scene proxy ")
+	       TEXT("and the proxy needs a UVoxelGpuPoolComponent that GetOrCreateGpuPool spawns off ChunkOwner -- ")
+	       TEXT("ChunkOwner is null while the world is HELD, which is the point of holding it. Pool was %s ")
+	       TEXT("before this call."),
+	       BrickMiB, EnqueueMs, bWasInitialised ? TEXT("ALREADY INITIALISED") : TEXT("uninitialised"));
 }
 
 void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
