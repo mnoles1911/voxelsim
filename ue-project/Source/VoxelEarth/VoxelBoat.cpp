@@ -10,7 +10,9 @@
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerInput.h"
 #include "HAL/IConsoleManager.h"
+#include "Kismet/KismetMaterialLibrary.h"          // the hull ripple mask's MPC push
 #include "Materials/MaterialInterface.h" // the WaveMirror fingerprint check
+#include "Materials/MaterialParameterCollection.h" // ...and its one-time name check
 #include "PhysicsEngine/BodyInstance.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -19,6 +21,7 @@
 #include "VoxelDebug.h" // LogVoxelWater -- the wake half of this actor
 #include "VoxelEarth.h" // LogVoxelEarth -- the chassis half
 #include "VoxelRippleField.h"
+#include "VoxelSkySubsystem.h" // VoxelSky::kSkyCollectionPath
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWaveMirror.generated.h" // the CPU mirror of the drawn wave field
 #include "VoxelWeatherSubsystem.h"     // the published wind the mirror phase needs
@@ -65,14 +68,19 @@ TAutoConsoleVariable<float> CVarVoxelBoatWaveBobGain(
 	TEXT("dials it live. Applies to every vessel riding this buoyancy (the raft inherits it)."),
 	ECVF_Default);
 TAutoConsoleVariable<float> CVarVoxelBoatWakeGain(
-	TEXT("voxel.Boat.WakeGain"), 3.0f,
-	TEXT("Multiplier on the bow/transom/slam splat strengths (same 2026-09-06 owner directive: the ")
+	TEXT("voxel.Boat.WakeGain"), 1.5f,
+	TEXT("Multiplier on the bow/transom/slam splat strengths. DEFAULT 1.5 since 2026-09-08 (owner, ")
+	TEXT("live: wake lines 'much too large'; halved from 3.0 together with WakeWidthScale 0.3). ")
+	TEXT("3.0 came from the 2026-09-06 owner directive: the ")
 	TEXT("verified-LIVE wake measured 1.5 cm of state height -- honest but invisible). Dials the ")
 	TEXT("wake's visual weight without touching the ripple sim's physics constants."),
 	ECVF_Default);
 TAutoConsoleVariable<float> CVarVoxelBoatWakeWidthScale(
-	TEXT("voxel.Boat.WakeWidthScale"), 1.0f,
-	TEXT("Multiplier on the bow/transom splat WIDTHS (owner, live 2026-09-08: the wake waves ")
+	TEXT("voxel.Boat.WakeWidthScale"), 0.3f,
+	TEXT("Multiplier on the bow/transom splat WIDTHS. DEFAULT 0.3 since 2026-09-08 (owner, live, ")
+	TEXT("second pass: still 'much too large, spread too far'; the footprint sets the ring ")
+	TEXT("wavelength, so 0.3 is what makes them 'smaller, finer, closer to the canoe'). ")
+	TEXT("First pass, same day: the wake waves ")
 	TEXT("'should be much smaller and finer. fine ripples in high quantity'). 1.0 = the authored ")
 	TEXT("BowWakeWidthM/TransomWakeWidthM; 0.5 halves the ring radius so the field carries ")
 	TEXT("shorter, more numerous ripples. Dial with voxel.Boat.WakeGain (amplitude) and ")
@@ -115,6 +123,25 @@ TAutoConsoleVariable<float> CVarVoxelBoatHullMaskLidUU(
 	TEXT("(VoxelVerify00860) left the cockpit dry end to end and showed no ring at that camera ")
 	TEXT("depression; 6 is the default because the ring is the failure that reaches the owner's ")
 	TEXT("grazing shots and 6 UU still clears the few-cm mismatch and the 4 UU wake."),
+	ECVF_Default);
+
+TAutoConsoleVariable<bool> CVarVoxelBoatHullRippleMask(
+	TEXT("voxel.Boat.HullRippleMask"), true,
+	TEXT("The SECOND half of 'the cockpit is dry' (owner, live 2026-09-08: 'there is water and ")
+	TEXT("wake, surface effects inside the canoe'). The lid mask above stands 6 UU over the ")
+	TEXT("AMBIENT surface, and the wake's ripple height is ADDED to that surface as WPO, so a ")
+	TEXT("crest inside the hull lifts the sheet over the lid and out of the stencil cull. This ")
+	TEXT("pushes the hull's plan ellipse through MPC_VoxelSky (HullEllipseA/B) and both water ")
+	TEXT("materials zero the ripple WPO and the disturbance foam inside it ")
+	TEXT("(Tools/water_hull_mask_graph.py). 0 pushes the off encoding: pixel-identical to the ")
+	TEXT("mask never existing, and the A arm for 'is the cockpit dry because of this'."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelBoatHullRippleMaskEdgeUU(
+	TEXT("voxel.Boat.HullRippleMaskEdgeUU"), 10.0f,
+	TEXT("Width of the soft edge on the hull ripple mask's ellipse, UU, measured along the ")
+	TEXT("beam. A hard edge (1) shows as a seam in the wake where it meets the planking; too ")
+	TEXT("wide and the cockpit's last few centimetres pick the wake back up."),
 	ECVF_Default);
 
 TAutoConsoleVariable<bool> CVarVoxelBoatDebugDraw(
@@ -327,6 +354,34 @@ void AVoxelBoat::BeginPlay()
 		AdoptHullFromBody();
 	}
 
+	// --- the hull ripple mask's MPC binding, checked ONCE (PushHullRippleMask)
+	//
+	// UKismetMaterialLibrary's setters log a warning and do nothing for a
+	// parameter that is not on the collection; pushed twice a tick that would
+	// bury every other diagnostic in the run. The honest failure is one line
+	// naming the regen that has not been applied, and a boat that then behaves
+	// exactly as it did before this mask existed.
+	HullRippleMaskCollection =
+		LoadObject<UMaterialParameterCollection>(nullptr, VoxelSky::kSkyCollectionPath);
+	bHullRippleMaskMpcOk = false;
+	if (const UMaterialParameterCollection* Sky = HullRippleMaskCollection)
+	{
+		bool bHasA = false, bHasB = false;
+		for (const FCollectionVectorParameter& P : Sky->VectorParameters)
+		{
+			bHasA |= (P.ParameterName == FName(TEXT("HullEllipseA")));
+			bHasB |= (P.ParameterName == FName(TEXT("HullEllipseB")));
+		}
+		bHullRippleMaskMpcOk = bHasA && bHasB;
+	}
+	if (!bHullRippleMaskMpcOk)
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("VoxelBoat: MPC_VoxelSky has no HullEllipseA/HullEllipseB, so the hull ripple mask ")
+		       TEXT("cannot engage and wake ripples will still draw inside the cockpit. Regenerate the ")
+		       TEXT("sky chain (create_sky_material.py, then M_WaterVoxel and M_Ocean)."));
+	}
+
 	// --- the water-exclusion mask's plan footprint, from the adopted hull -----
 	//
 	// PLAN ONLY: where each station sits along the keel line and how wide it is
@@ -441,7 +496,93 @@ void AVoxelBoat::EndPlay(const EEndPlayReason::Type Reason)
 	{
 		ExitToStoredPawn();
 	}
+	// A destroyed boat must not leave a dry ellipse of lake behind it. Only on
+	// Destroyed, for the same teardown reason as above: during level transition
+	// the collection instance is going with the world.
+	if (Reason == EEndPlayReason::Destroyed)
+	{
+		PushHullRippleMask(false);
+	}
 	Super::EndPlay(Reason);
+}
+
+void AVoxelBoat::PushHullRippleMask(bool bEnabled)
+{
+	// THE HULL'S PLAN ELLIPSE, in world XY, for the water materials.
+	//
+	// Encoding (Tools/water_hull_mask_graph.py is the registry):
+	//   HullEllipseA = (centreX, centreY, cos yaw, sin yaw)   world UU
+	//   HullEllipseB = (half-length, half-beam, enabled, edge) UU, UU, 0/1, UU
+	//
+	// THE FOOTPRINT IS THE COCKPIT, NOT THE WAKE STATIONS. Half-length is
+	// kExclusionPlanFraction of the hull's (the same reach the stencil lid
+	// covers); half-beam is the hull's, since the ellipse is the canoe's own
+	// plan and the inboard fraction the lid uses is about planking clearance
+	// for a rectangle, which an ellipse does not need. The bow shoulders that
+	// inject the wake sit at 0.9 L, +-B and the transom at -0.95 L, 0
+	// (TickWake): the shoulders fall OUTSIDE this ellipse (r = 1.4 there), the
+	// transom lands on its edge band. The splats' own radius (BowWakeWidthM x
+	// WakeWidthScale) does overlap the mask's rim, which is accepted and
+	// display-only: a splat is deposited in the SIMULATION untouched, and this
+	// mask only decides where the drawn surface shows the result.
+	//
+	// ONE COLLECTION, ONE ELLIPSE. MPC_VoxelSky is world-global, so this is the
+	// nearest-to-the-camera hull's by construction: every other hull within
+	// SleepRadiusUU also pushes, last writer wins, and today there is one boat.
+	// The day there are two awake hulls in one lake this becomes a per-hull
+	// slot list like the ripple field's splats; noted, not built.
+	UWorld* World = GetWorld();
+	if (!World || !bHullRippleMaskMpcOk || !HullRippleMaskCollection)
+	{
+		return;
+	}
+	if (!bEnabled)
+	{
+		if (!bHullRippleMaskPushedOff)
+		{
+			UKismetMaterialLibrary::SetVectorParameterValue(
+				World, HullRippleMaskCollection, TEXT("HullEllipseB"),
+				FLinearColor(0.0f, 0.0f, 0.0f, 0.0f));
+			bHullRippleMaskPushedOff = true;
+		}
+		return;
+	}
+
+	const FTransform Xf = GetActorTransform();
+	const FVector FwdW = Xf.GetUnitAxis(EAxis::X);
+	// Yaw from the hull's own forward axis in XY, exactly as UpdateWaterExclusion
+	// takes it: no rotator decomposition, so a pitched or rolled hull keeps the
+	// plan heading. A vertical hull (capsized end-up) degenerates to yaw 0.
+	const double FwdLen = FVector2D(FwdW.X, FwdW.Y).Size();
+	const double CosYaw = FwdLen > 1e-6 ? FwdW.X / FwdLen : 1.0;
+	const double SinYaw = FwdLen > 1e-6 ? FwdW.Y / FwdLen : 0.0;
+	const FVector Centre = Xf.GetLocation();
+	const double HalfLen = HalfLengthUU * VoxelBoatLocal::kExclusionPlanFraction;
+	const double HalfBeam = HalfBeamUU;
+	const double EdgeUU =
+		FMath::Max(1.0, double(CVarVoxelBoatHullRippleMaskEdgeUU.GetValueOnGameThread()));
+
+	// LWC NOTE: the centre goes through a float4, so at |x| ~ 6.5e6 UU it carries
+	// ~0.5 UU of quantisation -- the same budget the ripple window's origin
+	// (RippleFieldOrigin) already spends, and a hundredth of the edge band.
+	UKismetMaterialLibrary::SetVectorParameterValue(
+		World, HullRippleMaskCollection, TEXT("HullEllipseA"),
+		FLinearColor(float(Centre.X), float(Centre.Y), float(CosYaw), float(SinYaw)));
+	UKismetMaterialLibrary::SetVectorParameterValue(
+		World, HullRippleMaskCollection, TEXT("HullEllipseB"),
+		FLinearColor(float(HalfLen), float(HalfBeam), 1.0f, float(EdgeUU)));
+	bHullRippleMaskPushedOff = false;
+
+	if (!bHullRippleMaskLogged)
+	{
+		bHullRippleMaskLogged = true;
+		// The engagement line: a log without it is a run in which the cockpit
+		// was never masked, whatever the picture looks like.
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("VoxelBoat: hull ripple mask ENGAGED halfLen=%.0f halfBeam=%.0f edge=%.0f UU ")
+		       TEXT("(MPC_VoxelSky HullEllipseA/B; voxel.Boat.HullRippleMask 0 is the off arm)."),
+		       HalfLen, HalfBeam, EdgeUU);
+	}
 }
 
 void AVoxelBoat::AdoptHullFromBody()
@@ -506,6 +647,10 @@ void AVoxelBoat::Tick(float DeltaSeconds)
 	// in absolute world space, so a sleeping boat has to HIDE its stations
 	// rather than leave them behind in the lake (see the function).
 	UpdateWaterExclusion();
+	// The ripple mask rides the same world-space argument: an awake hull
+	// publishes its ellipse every tick (the boat moves, the sheet does not), a
+	// sleeping one publishes the off encoding once and leaves the water alone.
+	PushHullRippleMask(!bAsleep && CVarVoxelBoatHullRippleMask.GetValueOnGameThread());
 
 	if (bAsleep)
 	{

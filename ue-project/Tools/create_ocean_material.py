@@ -305,7 +305,7 @@ from ripple_field_graph import build_disturbance_foam, sample_ripple_field  # no
 import ripple_field_graph  # noqa: E402
 import water_optics  # noqa: E402
 from water_sky_reflection_graph import build_sky_reflection  # noqa: E402
-from water_hull_mask_graph import build_hull_mask  # noqa: E402
+from water_hull_mask_graph import build_hull_mask, build_hull_ripple_mask  # noqa: E402
 import water_wave_graph  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
@@ -728,6 +728,12 @@ def main():
         # amplitude rides the same knob and scale 0 is a provably still sea.
         ripple_grad_gated = b.mul(ripple["grad_xy"], wave["time_scale"])
         ripple_height_gated = b.mul(ripple["height_m"], wave["time_scale"])
+        # THE COCKPIT IS DRY at sea too (owner, live 2026-09-08). The hull's
+        # plan ellipse from MPC_VoxelSky zeroes the ripple WPO and the
+        # disturbance foam inside the hull; the lake carries the full
+        # argument at the same site, the mechanism is water_hull_mask_graph's.
+        hull_ripple = build_hull_ripple_mask(b)
+        ripple_height_gated = b.mul(ripple_height_gated, hull_ripple["keep"])
         grad_total = b.add(wave_grad, ripple_grad_gated)
         height_total = b.add(wave_height_m, ripple_height_gated)
         # The wake's ART channel (owner verdict 2026-09-05: "Do we actually
@@ -737,6 +743,7 @@ def main():
         # derivation and defaults are ripple_field_graph's.
         disturbance_foam = build_disturbance_foam(
             b, ripple_grad_gated, ripple_height_gated)
+        disturbance_foam["foam"] = b.mul(disturbance_foam["foam"], hull_ripple["keep"])
         ripple_arm = "PRESENT"
 
     # ======================================================================

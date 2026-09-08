@@ -536,7 +536,7 @@ from bathy_field_graph import build_slant_depth, sample_bathy_field  # noqa: E40
 from water_sky_reflection_graph import build_sky_reflection  # noqa: E402
 # The hull water-exclusion mask (owner boat-session directive) -- shared with
 # M_Ocean; binds nothing on the MPC, reads CustomDepth/Stencil directly.
-from water_hull_mask_graph import build_hull_mask  # noqa: E402
+from water_hull_mask_graph import build_hull_mask, build_hull_ripple_mask  # noqa: E402
 
 # THE OTHER TWO SHARED SUBGRAPHS, same directory, same sys.path.insert above.
 #
@@ -2076,12 +2076,27 @@ def main():
         # lie at exactly the scale value used to isolate the field.
         ripple_grad_gated = bathy_b.mul(ripple["grad_xy"], wave_field["time_scale"])
         ripple_height_gated = bathy_b.mul(ripple["height_m"], wave_field["time_scale"])
+        # THE COCKPIT IS DRY (owner, live 2026-09-08: "water and wake, surface
+        # effects inside the canoe"). The hull's plan ellipse, published by the
+        # boat through MPC_VoxelSky, zeroes the ripple's WPO half and the
+        # disturbance foam INSIDE the hull -- the wake crest was lifting the
+        # sheet above the CustomDepth lid (6 UU over the AMBIENT surface, the
+        # only surface the C++ side can place it against), so those pixels
+        # escaped the stencil cull and the foam painted them white. The
+        # GRADIENT is left alone on purpose: it moves no geometry, the lid
+        # already covers it, and the wedge should shade up to the planking.
+        # Mechanism, encoding and the off arm: water_hull_mask_graph.py.
+        hull_ripple = build_hull_ripple_mask(bathy_b)
+        ripple_height_gated = bathy_b.mul(ripple_height_gated, hull_ripple["keep"])
         wave_grad_total = bathy_b.add(wave_grad_raw, ripple_grad_gated)
         wave_height_total = bathy_b.add(wave_height_m, ripple_height_gated)
         # The wake's ART channel (SIGNAL 6 below) -- built from the GATED
         # taps, so foam and displacement are one channel on one knob.
         disturbance_foam = build_disturbance_foam(
             bathy_b, ripple_grad_gated, ripple_height_gated)
+        # ...and masked by the same hull ellipse (the gradient term inside the
+        # foam is the one input the height gate above does not reach).
+        disturbance_foam["foam"] = bathy_b.mul(disturbance_foam["foam"], hull_ripple["keep"])
         # ...times the foam breakup built with the shore band above (a
         # multiply by exactly 1.0 at FoamBreakupGain 0), so the wake's white
         # is streaked like the shore's rather than a second, smoother paint.

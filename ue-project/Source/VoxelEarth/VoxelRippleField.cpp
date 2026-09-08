@@ -151,8 +151,11 @@ TAutoConsoleVariable<float> CVarVoxelWaterRippleStateFill(
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelWaterRippleSpeed(
-	TEXT("voxel.Water.Ripple.SpeedMPS"), 1.6f,
-	TEXT("Ripple propagation speed in metres per second. 1.6 is roughly right for the ")
+	TEXT("voxel.Water.Ripple.SpeedMPS"), 0.5f,
+	TEXT("Ripple propagation speed in metres per second. DEFAULT 0.5 since 2026-09-08 (owner, ")
+	TEXT("live at the canoe: wake rings 'spread too far' and should 'radiate out much slower but ")
+	TEXT("persist as long if not longer'; spread = speed x lifetime, so speed is the dial that ")
+	TEXT("keeps them near the hull). Was 1.6, which is roughly right for the ")
 	TEXT("30-60 cm gravity-capillary waves a splash makes; a ring crosses 5 m in about 3 s. ")
 	TEXT("CLAMPED so the Courant number stays under 0.6 against a 2D stability limit of 0.7071 ")
 	TEXT("-- at the fixed 1/60 s timestep and 10 cm cells that ceiling is 3.6 m/s, and the clamp ")
@@ -160,8 +163,10 @@ TAutoConsoleVariable<float> CVarVoxelWaterRippleSpeed(
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelWaterRippleHalfLife(
-	TEXT("voxel.Water.Ripple.HalfLifeSec"), 5.0f,
-	TEXT("Seconds for a ripple's amplitude to halve. 1.8 puts a splash at ~10% after 6 s, and ")
+	TEXT("voxel.Water.Ripple.HalfLifeSec"), 8.0f,
+	TEXT("Seconds for a ripple's amplitude to halve. DEFAULT 8 since 2026-09-08 (owner: the slowed ")
+	TEXT("rings must persist as long or longer than before; at 0.5 m/s a ring travels 4 m per ")
+	TEXT("half-life). History: 1.8 puts a splash at ~10% after 6 s, and ")
 	TEXT("since 2026-08-12 that is the REALISED figure rather than the intended one -- the step ")
 	TEXT("material damped only one of the two time levels, which made every configured half-life ")
 	TEXT("come out at twice its value (1.8 s ran at 3.6 s, ~35% left at 6 s). Expressed as a ")

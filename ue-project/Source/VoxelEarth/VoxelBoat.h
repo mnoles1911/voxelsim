@@ -10,6 +10,7 @@
 
 class APlayerController;
 class UCameraComponent;
+class UMaterialParameterCollection;
 class UStaticMeshComponent;
 
 // ============================================================================
@@ -184,6 +185,11 @@ private:
 	// against the hull, because WaveBobGain moves the hull several times as far
 	// as the surface the pixels show.
 	void UpdateWaterExclusion();
+	// The hull's plan ellipse, pushed through MPC_VoxelSky so both water
+	// materials zero the ripple WPO and the disturbance foam INSIDE the hull
+	// (mechanism: Tools/water_hull_mask_graph.py, the second half of "the
+	// cockpit is dry"). `bEnabled` false pushes the off encoding.
+	void PushHullRippleMask(bool bEnabled);
 	void TickDrive(float DeltaSeconds);
 	void TickGround(float DeltaSeconds);
 	void TickWake(float DeltaSeconds);
@@ -281,6 +287,17 @@ private:
 
 	bool bAsleep = false;
 	bool bGrounded = false;
+
+	// PushHullRippleMask's state: the collection (looked up once in BeginPlay,
+	// checked for the two parameter names once, so a stale MPC costs one log
+	// line rather than one engine warning per tick), a log-once latch for the
+	// engagement line, and whether the last push was the off encoding (so a
+	// sleeping or dying boat pushes it exactly once).
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialParameterCollection> HullRippleMaskCollection;
+	bool bHullRippleMaskMpcOk = false;
+	bool bHullRippleMaskLogged = false;
+	bool bHullRippleMaskPushedOff = true;
 
 	uint64 ProbeQueries = 0;
 	uint64 ProbesWet = 0;

@@ -1453,14 +1453,20 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 
 bool AVoxelClipmapActor::GetCameraLocationUU(FVector& OutCameraLocationUU) const
 {
-	// Same fallback chain as AVoxelOceanActor::UpdateFollowPlane.
+	// Same fallback chain as AVoxelOceanActor::UpdateFollowPlane, with the
+	// VoxelGI guard: the camera cache is the ORIGIN until its first update
+	// (GetCameraCacheTime() == 0), and on 2026-09-08 an unattended leg died on
+	// frame 1 because IsCameraUnderRock walked IsSolidAtVoxel up a column at
+	// (0,0), whose tile is not baked (Saved/capture-chainproof-boat2.log). The
+	// pawn is posed from the frame it exists, so it is the truthful camera
+	// until the manager has run once.
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
 	if (!PC)
 	{
 		return false;
 	}
-	if (PC->PlayerCameraManager)
+	if (PC->PlayerCameraManager && PC->PlayerCameraManager->GetCameraCacheTime() > 0.f)
 	{
 		OutCameraLocationUU = PC->PlayerCameraManager->GetCameraLocation();
 		return true;

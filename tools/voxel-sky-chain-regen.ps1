@@ -269,7 +269,14 @@ $NOT_A_GENERATOR = @(
     # SCALAR_PARAMS: the first regen after that lands must be this FULL chain,
     # never an -Only, because the sky recreates the collection and every
     # dependent must rebuild against the one that has the new name.)
-    'water_caustics_graph.py'
+    'water_caustics_graph.py',
+    # module: the hull CustomDepth lid mask and, since 2026-09-08, the hull
+    # RIPPLE mask (HullEllipseA/B, pushed by AVoxelBoat through MPC_VoxelSky so
+    # the cockpit stays dry under the wake). Imported by BOTH water generators;
+    # binds the two ellipse vectors THROUGH its caller's builder, so it matches
+    # $BINDING_PATTERNS -- the scan working, not a false positive. Its consumers
+    # (create_water_voxel_material.py, create_ocean_material.py) are in $ORDER.
+    'water_hull_mask_graph.py'
 )
 # Generators that bind the collection but are NOT yet wired into the game. They
 # are skipped rather than silently ignored, and the skip is printed -- an
