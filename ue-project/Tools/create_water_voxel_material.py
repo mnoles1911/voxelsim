@@ -1447,6 +1447,16 @@ def main():
     # (0.02, 0.10, 0.26) per metre, shared with the underwater material so a
     # swimmer is inside the same medium he was looking at. Same star-unpack
     # arity check as the absorption colour above.
+    # --- (4) PER-CHANNEL EXTINCTION (owner-directed 2026-09-08) ---------------
+    # Three scalars so the launch-time ladder can move ONE channel: the
+    # derivation and the numbers are water_optics.ABSORPTION_CHANNEL_SCALE's.
+    # 1/1/1 is the pre-2026-09-08 water bit for bit.
+    absorb_scale_r = scalar_param("WaterAbsorbScaleR", water_optics.ABSORPTION_CHANNEL_SCALE[0], -1300, -720)
+    absorb_scale_g = scalar_param("WaterAbsorbScaleG", water_optics.ABSORPTION_CHANNEL_SCALE[1], -1300, -680)
+    absorb_scale_b = scalar_param("WaterAbsorbScaleB", water_optics.ABSORPTION_CHANNEL_SCALE[2], -1300, -640)
+    absorb_scale_rgb = bathy_b.append(bathy_b.append(absorb_scale_r, "", absorb_scale_g, ""), "",
+                                      absorb_scale_b, "")
+    absorb_per_cm = bathy_b.mul(absorb_per_cm, absorb_scale_rgb)
     scatter_color = vector_param(
         "ScatteringPerMetre", *water_optics.SCATTERING_PER_M, -1300, -400)
     scatter_rgb = rgb(scatter_color, -1120, -400)
@@ -1534,6 +1544,36 @@ def main():
     # future engine version raises here rather than silently compiling to the
     # node's default (Constant3(0,0,0) for the two coefficient pins), which
     # would be perfectly clear, perfectly invisible water.
+    # --- (1) THE TURBIDITY FLOOR (owner-directed 2026-09-08) ------------------
+    #
+    # "our water in general at the SLW level is too transparent (especially
+    # when it is only 1-4 voxels deep) such that its hard to even tell there
+    # is water". At 10-40 cm the absorption above cannot act -- exp(-0.46 *
+    # 0.2) is 0.91 in green -- and the SLW volume term integrates ~nothing
+    # over that path, so the pixel is the white bed, tinted. Real shallow
+    # lake water is not clear: it carries silt and plankton, i.e. SCATTERING
+    # that is many times the open-water value. So the in-water scattering
+    # coefficient is raised where the baked depth is small:
+    #
+    #     turb    = ShallowTurbidityFloor * (1 - ramp(depth_m, 0, ShallowTurbidityDepthM)) * validity
+    #     scatter = scatter * (1 + ShallowScatterBoost * turb)
+    #
+    # At the defaults a 20 cm column scatters 0.067 * 15 * 0.2 = 0.20 of the
+    # green light into the eye (was 0.013), which is a visible body of water.
+    # ShallowTurbidityFloor 0 is the pre-2026-09-08 water bit for bit. The
+    # second half of the floor -- a body colour that exists even at zero
+    # depth -- is on the emissive below (ShallowBody*), because that is the
+    # channel proven to reach the pixel on this shading model.
+    turb_floor = scalar_param("ShallowTurbidityFloor", 0.7, -1300, -220)
+    turb_depth = scalar_param("ShallowTurbidityDepthM", 1.5, -1300, -160)
+    turb_boost = scalar_param("ShallowScatterBoost", 15.0, -1300, -100)
+    turb = bathy_b.mul(
+        bathy_b.mul(bathy_b.one_minus(bathy_b.ramp(bathy["depth_m"], "", bathy_b.const(0.0), turb_depth)),
+                    turb_floor),
+        bathy["validity"])
+    scatter_per_cm = bathy_b.mul(
+        scatter_per_cm, bathy_b.add(bathy_b.const(1.0), bathy_b.mul(turb, turb_boost)))
+
     slw_out = mel.create_material_expression(
         material, unreal.MaterialExpressionSingleLayerWaterMaterialOutput, -420, -500)
     if not mel.connect_material_expressions(scatter_per_cm, "", slw_out, "ScatteringCoefficients"):
@@ -1762,7 +1802,16 @@ def main():
             "texture lookup is the expensive part, which on this material it is not."
             % ([n for n in dir(unreal.NoiseFunction) if n.startswith("NOISEFUNCTION")],))
     shore_noise.set_editor_property("noise_function", _nf)
-    shore_noise.set_editor_property("scale", 0.35)
+    # THE SCALE IS IN 1/CENTIMETRES, NOT 1/METRES (fixed 2026-09-07). The Noise
+    # node's Position input is unconnected, so it is the world position in UU,
+    # and Common.ush:1799 does `Position *= Scale` before the lookup. 0.35 was
+    # therefore a ~3 cm feature, i.e. per-pixel speckle at any shoreline
+    # distance this material is judged at -- the "+/-0.9 m irregular
+    # waterline" the comment below promises was never drawn; a per-pixel
+    # +/-0.9 m jitter on a 6 m band is what shipped. 0.0035 is the ~3 m and
+    # ~1.4 m (level scale 2) the comment always meant. BathyFoamNoiseM:0 is
+    # the zero arm for both the old and the new value.
+    shore_noise.set_editor_property("scale", 0.0035)
     shore_noise.set_editor_property("levels", 2)
     shore_noise.set_editor_property("output_min", -1.0)
     shore_noise.set_editor_property("output_max", 1.0)
@@ -1815,6 +1864,88 @@ def main():
     shore_gain = scalar_param("BathyFoamGain", 0.55 if SHORE_FX else 0.0, -1300, 360)
     shore_foam = bathy_b.mul(bathy_b.mul(bathy_b.mul(shore_band, shelf_gate), shore_gain),
                              bathy["validity"])
+
+    # --- FOAM BREAKUP (2026-09-07, objective 2) --------------------------------
+    #
+    # Every foam signal in this graph is a smooth SCALAR, and a smooth scalar
+    # painted in one tint is paint, not whitewater. Epic's own Water_Material
+    # never draws foam as a scalar: it multiplies a depth/velocity mask by a
+    # tiling foam TEXTURE with its own normal (T_WaterFlow_01_Foam_Tiled +
+    # _N; the parameter names "Foam Texture Blend Min/Width", "Foam
+    # MacroScale", "FoamContrast" are the knobs on that product), and the
+    # community guides do the same with "multiple foam textures at different
+    # scales". This project ships no foam texture and its water is generated,
+    # so the texture is a procedural one: a slowly drifting 3-level turbulent
+    # gradient noise at ~0.6 m features, applied as a MULTIPLIER to the shore,
+    # shallow and disturbance foam. Not to the whitecaps (they carry their own
+    # coverage product) and not to the ocean (untouched this pass).
+    #
+    # DARK BY DEFAULT. FoamBreakupGain 0 makes `breakup` lerp(1, n, 0) == 1
+    # exactly, so every multiply below is a multiply by 1.0 and the OFF arm is
+    # bit-identical to a graph without the term. The owner judges the ON arm
+    # from -VoxelWaterMatScalar=FoamBreakupGain:1 frames before any default
+    # moves. Cost: one Noise evaluation per water pixel (~100 instructions at
+    # 3 levels), unmeasured; image before timing.
+    #
+    # THE DRIFT REUSES THE ONE Time NODE (`ripple_time`), because the regen
+    # gate at the bottom of this file counts MaterialExpressionTime nodes and
+    # refuses a second one -- and because under VOXEL_WATER_FREEZE_TIME that
+    # node is a constant, which is exactly what a frozen-arm capture wants.
+    breakup_gain = scalar_param("FoamBreakupGain", 0.0, -1300, 420)
+    breakup_scale = scalar_param("FoamBreakupScaleM", 0.6, -1300, 480)   # feature size, metres
+    breakup_drift = scalar_param("FoamBreakupDriftMPS", 0.15, -1300, 540)  # metres per second
+    # Position = world UU + time * drift, as a float3. 100 UU per metre.
+    drift_uu = bathy_b.mul(bathy_b.mul(ripple_time, breakup_drift), bathy_b.const(100.0))
+    drift_xy = bathy_b.append(drift_uu, "", bathy_b.mul(drift_uu, bathy_b.const(0.37)), "")
+    drift_xyz = bathy_b.append(drift_xy, "", bathy_b.const(0.0), "")
+    breakup_pos = bathy_b.add(world_pos_abs, drift_xyz)
+    # The Noise node's Scale is a baked float, not an input, so the metres
+    # knob is applied to the POSITION instead: position / (ScaleM * 100)
+    # gives one noise period per ScaleM metres at Scale 1.0.
+    breakup_pos = bathy_b.div(breakup_pos, bathy_b.mul(breakup_scale, bathy_b.const(100.0)))
+    breakup_noise = bathy_b.node(unreal.MaterialExpressionNoise)
+    breakup_noise.set_editor_property("noise_function", _nf)
+    breakup_noise.set_editor_property("scale", 1.0)
+    breakup_noise.set_editor_property("levels", 3)
+    breakup_noise.set_editor_property("output_min", 0.0)
+    breakup_noise.set_editor_property("output_max", 1.0)
+    breakup_noise.set_editor_property("turbulence", True)
+    bathy_b.link(breakup_pos, "", breakup_noise, "World Position")
+    # Contrast: turbulence noise sits mostly in 0.2-0.6; stretch it so the
+    # multiplier has real holes and real full-strength streaks.
+    breakup_contrast = scalar_param("FoamBreakupContrast", 2.2, -1300, 600)
+    breakup_shaped = bathy_b.saturate(
+        bathy_b.mul(bathy_b.sub(breakup_noise, bathy_b.const(0.25)), breakup_contrast))
+    breakup = bathy_b.lerp(bathy_b.const(1.0), "", breakup_shaped, "", breakup_gain)
+    shore_foam = bathy_b.mul(shore_foam, breakup)
+
+    # --- SHALLOW FOAM: DEPTH-DRIVEN, THE WAY EVERYONE ELSE DRIVES IT --------
+    #
+    # The shore band above is keyed on DISTANCE to the waterline. Epic's
+    # Water_Material keys its shore foam on DEPTH ("Depth for DF Foam", "Foam
+    # Depth Min", "Foam Distance", WaterOpacityMaskFromDepth), the Unity/UE
+    # community guides key it on SceneDepth - PixelDepth, and the physics
+    # agrees: surf whitens where the water is SHALLOW, which on a 1:40 shelf
+    # is a wide apron and on a cliff-edged pool is nothing. The distance band
+    # cannot tell those two shores apart -- and the 2026-09-07 record says
+    # exactly that ("a one-texel ribbon on any shore steeper than about
+    # 1:20"). So: a second term on the baked depth, max()ed into the same
+    # shore foam so it rides the same emissive route, the same gain ladder
+    # and the same off arms.
+    #
+    # DARK BY DEFAULT (ShallowFoamGain 0 -> shallow_foam == 0 exactly ->
+    # max(shore_foam, 0) == shore_foam bit for bit, since shore_foam >= 0).
+    # Ladder via -VoxelWaterMatScalar=ShallowFoamGain:<g>,ShallowFoamDepthM:<d>.
+    shallow_depth = scalar_param("ShallowFoamDepthM", 0.6, -1300, 660)
+    shallow_gain = scalar_param("ShallowFoamGain", 0.0, -1300, 720)
+    shallow_band = bathy_b.one_minus(
+        bathy_b.ramp(bathy["depth_m"], "", bathy_b.const(0.0), shallow_depth))
+    # Same land-side sign test as the shore band (x8: a 12.5 cm cutoff).
+    shallow_band = bathy_b.mul(
+        shallow_band, bathy_b.saturate(bathy_b.mul(bathy["shore_m"], bathy_b.const(8.0))))
+    shallow_foam = bathy_b.mul(bathy_b.mul(bathy_b.mul(shallow_band, shallow_gain),
+                                           bathy["validity"]), breakup)
+    shore_foam = bathy_b.maximum(shore_foam, shallow_foam)
 
     # MAX, not add: the signals describe the same physical thing from different
     # directions, and a steep, active front should be fully foamed rather than
@@ -1951,6 +2082,10 @@ def main():
         # taps, so foam and displacement are one channel on one knob.
         disturbance_foam = build_disturbance_foam(
             bathy_b, ripple_grad_gated, ripple_height_gated)
+        # ...times the foam breakup built with the shore band above (a
+        # multiply by exactly 1.0 at FoamBreakupGain 0), so the wake's white
+        # is streaked like the shore's rather than a second, smoother paint.
+        disturbance_foam["foam"] = bathy_b.mul(disturbance_foam["foam"], breakup)
 
     # SIGNAL 5 (Phase F2, 2026-09-05): WIND-DRIVEN WHITECAPS, the fifth
     # direction on the same physical thing, maxed in like the other four.
@@ -2182,6 +2317,22 @@ def main():
     # remove the BaseColor path -- that stays, harmless, and right the day SLW
     # honours it.
     surface_emissive = sky_light["emissive"]
+    # --- (1b) THE BODY-COLOUR FLOOR, on emissive, UNDER the foam --------------
+    # The minimum "there is water here" colour at any depth, keyed on the same
+    # `turb` the scattering boost uses. Additive on emissive because that is
+    # the one channel proven to reach the pixel on this water (the foam rides
+    # it by the same argument, 2026-09-06/07). Multiplied by (1 - foam) so foam
+    # sits ON TOP of the tinted body and reads white rather than tinted.
+    # ShallowBodyEmissive 0 restores the previous emissive bit for bit. Three
+    # scalars for the colour so the launch-time ladder can move one channel.
+    body_r = bathy_b.scalar("ShallowBodyR", 0.05)
+    body_g = bathy_b.scalar("ShallowBodyG", 0.22)
+    body_b = bathy_b.scalar("ShallowBodyB", 0.20)
+    body_emiss_gain = bathy_b.scalar("ShallowBodyEmissive", 0.30)
+    body_rgb = bathy_b.append(bathy_b.append(body_r, "", body_g, ""), "", body_b, "")
+    body_weight = bathy_b.mul(bathy_b.mul(turb, body_emiss_gain), bathy_b.one_minus(foam))
+    body_emiss = bathy_b.mul(bathy_b.mul(body_rgb, body_weight), top_face_mask)
+    surface_emissive = bathy_b.add(surface_emissive, body_emiss)
     shore_emiss_gain = bathy_b.scalar("ShoreFoamEmissive", 0.6)
     shore_emiss_masked = bathy_b.mul(shore_foam, top_face_mask)
     shore_emiss = bathy_b.mul(shore_emiss_masked, shore_emiss_gain)

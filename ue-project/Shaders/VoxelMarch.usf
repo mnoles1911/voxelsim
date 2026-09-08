@@ -805,6 +805,20 @@ float4 MarchCausticWindow;       // bathy origin rel camera UU (xy), 1/sizeUU, v
 float4 MarchCausticGate;         // sin(sun altitude), fade start UU, fade end UU, unused
 float3 MarchCausticAbsorbPerM;   // the water's absorption per metre, per channel
 float2 MarchCausticCamXYm;       // camera absolute world XY, metres
+// (2) SUBMERGED-BED DARKENING (owner-directed 2026-09-08). The marcher draws
+// the near-field lake bed, so the terrain materials' SubmergedDarken /
+// SubmergedRampM (terrain_material_common.py) are mirrored here as
+// constants: same factor, same two numbers, same bathy channel -- ONE colour
+// authority, one darkening. They are #defines and not loose parameters
+// because binding two more floats is a C++ change (VoxelMarchRenderer's
+// caustic bindings), and the material half had to ship tonight; the C++
+// pair that makes these a live dial is in the backlog. The term rides the
+// caustic bathy sample below and is therefore gated with it
+// (VOXEL_MARCH_CAUSTICS, MarchCausticField.w > 0, inside the fade end) --
+// caustics OFF turns the marcher's bed darkening off with it, which is a
+// known limit of the no-C++ version, stated in the backlog.
+#define VOXEL_MARCH_SUBMERGED_DARKEN 0.45f
+#define VOXEL_MARCH_SUBMERGED_RAMP_M 0.30f
 Texture2D    MarchBathyTexture;
 SamplerState MarchBathySampler;
 #endif
@@ -3643,6 +3657,18 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 					const float DepthM = Bathy.r * Bathy.b;
 					if (DepthM > 0.0f)
 					{
+						// (2) The bed under water is darker. BOTH halves of the
+						// marcher's colour take the factor: Emissive is the
+						// ambient term already built from BaseColor above, and
+						// BaseColor itself goes on to GBufferC below, where the
+						// deferred pass lights it with the sun. Applied BEFORE
+						// the caustic light is added, so caustics stay bright on
+						// a dark floor rather than being dimmed with it. Same
+						// factor as terrain_material_common.py's SubmergedDarken.
+						const float SubmergedDark = lerp(1.0f, VOXEL_MARCH_SUBMERGED_DARKEN,
+						                                 saturate(DepthM / VOXEL_MARCH_SUBMERGED_RAMP_M));
+						BaseColor *= SubmergedDark;
+						Emissive *= SubmergedDark;
 						// ABSOLUTE world XY in metres -- the coordinate the
 						// field must be evaluated on so that this floor and
 						// M_Underwater's view of the same floor draw the SAME

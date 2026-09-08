@@ -484,6 +484,13 @@ def main():
     # few tens of metres of path IS that number times the arriving light.
     # Absorption alone only REMOVES light -- crank it and the sea goes dark
     # rather than deep.
+    # (4) per-channel extinction, same three scalars and defaults as the lake
+    # (water_optics.ABSORPTION_CHANNEL_SCALE); 1/1/1 is the previous water.
+    absorb_scale_rgb = b.append(
+        b.append(b.scalar("WaterAbsorbScaleR", water_optics.ABSORPTION_CHANNEL_SCALE[0]), "",
+                 b.scalar("WaterAbsorbScaleG", water_optics.ABSORPTION_CHANNEL_SCALE[1]), ""), "",
+        b.scalar("WaterAbsorbScaleB", water_optics.ABSORPTION_CHANNEL_SCALE[2]), "")
+    absorb_per_cm = b.mul(absorb_per_cm, absorb_scale_rgb)
     scatter_color = b.vector("ScatteringPerMetre", *water_optics.SCATTERING_PER_M)
     scatter_per_cm = b.mul(b.xyz(scatter_color), per_cm)
 
@@ -551,6 +558,16 @@ def main():
     # renamed pin in a future engine version raises here rather than silently
     # compiling to the node's default (Constant3(0,0,0) for the two coefficient
     # pins), which would be perfectly clear, perfectly invisible water.
+    # (1) the turbidity floor, same derivation and scalars as the lake
+    # (create_water_voxel_material.py, "THE TURBIDITY FLOOR"): boosted
+    # scattering where the baked depth is small. depth_eff_m is 60 m wherever
+    # the bathy is invalid, so open sea is untouched by construction.
+    turb_floor = b.scalar("ShallowTurbidityFloor", 0.7)
+    turb_depth = b.scalar("ShallowTurbidityDepthM", 1.5)
+    turb_boost = b.scalar("ShallowScatterBoost", 15.0)
+    turb = b.mul(b.mul(b.one_minus(b.ramp(depth_eff_m, "", b.const(0.0), turb_depth)), turb_floor),
+                 bathy["validity"])
+    scatter_per_cm = b.mul(scatter_per_cm, b.add(b.const(1.0), b.mul(turb, turb_boost)))
     slw_out = b.node(unreal.MaterialExpressionSingleLayerWaterMaterialOutput)
     b.link(scatter_per_cm, "", slw_out, "ScatteringCoefficients")
     b.link(absorb_engine, "", slw_out, "AbsorptionCoefficients")
@@ -938,6 +955,12 @@ def main():
     # scalar name, same tint, so one regen ladder tunes both waters. No top
     # face mask for the same reason the reflection passes None above.
     surface_emissive = sky_light["emissive"]
+    # (1b) the body-colour floor on emissive, under the foam -- the lake's
+    # "THE BODY-COLOUR FLOOR" note applies verbatim.
+    body_rgb = b.append(b.append(b.scalar("ShallowBodyR", 0.05), "", b.scalar("ShallowBodyG", 0.22), ""), "",
+                        b.scalar("ShallowBodyB", 0.20), "")
+    body_weight = b.mul(b.mul(turb, b.scalar("ShallowBodyEmissive", 0.30)), b.one_minus(foam))
+    surface_emissive = b.add(surface_emissive, b.mul(body_rgb, body_weight))
     if disturbance_foam is not None:
         dist_emiss_gain = b.scalar("DisturbanceFoamEmissive", 0.6)
         dist_emiss = b.mul(disturbance_foam["foam"], dist_emiss_gain)

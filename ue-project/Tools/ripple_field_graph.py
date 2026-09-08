@@ -321,19 +321,61 @@ def sample_ripple_field(b):
 # by the field itself, so a moving boat trails a white wedge, rings read as
 # white circles, and a splash flashes white and fades with the field's own
 # decay -- no new state, no new timing, the sim already animates it.
+#
+# THE RESPONSE HAS A THRESHOLD, AND THE 2026-09-07 GREY-BLOB VERDICT IS WHY.
+#
+# The first shipped form was saturate((|grad| + |h| * 4) * 8): a straight line
+# through the origin. Any texel above raw 0.125 -- 3 cm of ripple, or a slope
+# of 1 in 8 -- pinned to FULL foam, and there was no value the field could hold
+# that read as "barely disturbed". The boat leg that produced VoxelVerify00974
+# logged its wake at max |grad| 0.19 and max |h| 0.044 m (`field verified LIVE
+# -- centre patch max field value 0.1919, max state height 0.0436 m`), i.e.
+# raw 0.36 at the hull, 2.9x past saturation before the gain had even done its
+# work; and the sim's spread-out remainder -- millimetres of height across the
+# whole 51 m window after eight seconds under way -- was ALSO past saturation.
+# The owner's "hard grey blob ... a grey plane covering almost the entire
+# world map" is that: a window-shaped mask of every texel the field had ever
+# touched, cut off by the window's own 3.3 m edge fade. Whitewater is not a
+# mask of "has the water moved"; it sits on the steep crests and nowhere else.
+#
+# So the response is now
+#
+#     x    = |grad| + |height_m| * HeightWeight
+#     foam = saturate((x - Threshold) * Gain * Enabled)
+#
+# which is the same family the wind whitecaps already use (water_wave_graph.
+# build_whitecap_foam: saturate((|gradient| - SlopeThresh) / (SlopeFull -
+# SlopeThresh))): a dead band below Threshold, a linear knee above it. Texels
+# the field has merely touched sit in the dead band and draw NOTHING, so the
+# window edge is invisible by construction on undisturbed water -- the fade
+# no longer has to hide anything and its width (FADE_START/FADE_END) is left
+# alone, since widening it would also soften the ripple NORMAL for no reason.
+#
+# ALL FOUR NUMBERS ARE ScalarParameters, so the whole ladder runs on
+# -VoxelWaterMatScalar=Name:Value[,Name:Value] against ONE regenerated asset
+# (sheet material only -- the ocean takes the baked defaults). Read the
+# sheet's "material scalar '<Name>' set to" echo for EVERY pair; a missing
+# echo is a void arm, not a null (the 2026-09-07 06:00 first-pair-only trap).
 DISTURBANCE_FOAM_DEFAULTS = {
-    # saturate((|grad| + |height_m| * HeightWeight) * Gain * Enabled).
-    # THE GAIN DEFAULT IS DERIVED, NOT GUESSED: the debug frames measured the
-    # field's wake values at ~0.06-0.3 (gradient units, RippleFieldGain in the
-    # loop). 8.0 puts the wedge's faint tail (0.06) at 0.48 foam and anything
-    # over 0.125 at FULL white -- deliberately vivid, per the owner's brief
-    # ("he wants to SEE it"); he dials it live via the MID probe
-    # (-VoxelWaterMatScalar=DisturbanceFoamGain:<v>).
-    "DisturbanceFoamGain": 8.0,
-    # Metres of ripple height that count like slope 1.0 (1/0.25 m). Baked, not
-    # a parameter: the gain above is the one knob, and gradient is the
-    # dominant term for a wake anyway (a wake is steep before it is tall).
-    "DisturbanceFoamHeightWeight": 4.0,
+    # Slope of the knee above the threshold: foam reaches 1.0 at
+    # Threshold + 1/Gain. OWNER-DIRECTED 2026-09-08 after the live session
+    # ("surface foam ... way too prevalent and spreads out in a circle
+    # everywhere from the boat ... should only be near the wake and pretty
+    # small"): threshold 0.05 -> 0.2, gain 6 -> 3, height weight 1 -> 0, so
+    # only the crests (|grad| * RippleFieldGain > 0.2) carry foam and full
+    # white needs 0.53. Ladder on the next launch as scalars.
+    "DisturbanceFoamGain": 3.0,
+    # Metres of ripple height that count like slope 1.0. Was 4.0 (a baked
+    # constant); now a parameter, and 1.0 -- a wake is steep before it is
+    # tall (the hull's 0.044 m is 0.044 of slope-equivalent against a
+    # gradient of 0.19), so the gradient is the driver and the height is a
+    # tie-breaker for a tall slow swell the gradient under-reads.
+    "DisturbanceFoamHeightWeight": 0.0,
+    # The dead band. Nothing below this raw value draws any foam at all.
+    # 0.05 is a 1-in-20 slope or 5 cm of ripple with HeightWeight 1: above
+    # the spread remainder of a wake (millimetres, slopes of ~0.01) and well
+    # below its crests. PROVISIONAL, same ladder.
+    "DisturbanceFoamThreshold": 0.2,
     # The arm's off switch, FoamV2Enabled-style: a pixel-identical off for
     # A/Bs without a regeneration. The real inert default is upstream --
     # RippleFieldGain 0 on an undriven collection zeroes the taps themselves.
@@ -353,22 +395,26 @@ def build_disturbance_foam(b, grad_xy, height_m, defaults=None):
     the C++ sim's, so a frozen-arm capture shows the wake foam still moving
     -- the arm freezes the material's own animation, which this is not.
 
-    Returns {"foam": expr} -- max() it into the existing foam composite (the
-    lake's signal stack, the ocean's chain), per the standing max-not-add
-    doctrine there: disturbed water breaking over an already-foamy crest is
-    one patch of white, not two whites summed past 1. Riding the composite
-    also buys the full foam contract for free: colour, opacity AND roughness
-    move together, which is what makes the wedge read as whitewater rather
-    than as paint.
+    Returns {"foam": expr, "raw": expr} -- max() `foam` into the existing foam
+    composite (the lake's signal stack, the ocean's chain), per the standing
+    max-not-add doctrine there: disturbed water breaking over an already-foamy
+    crest is one patch of white, not two whites summed past 1. Riding the
+    composite also buys the full foam contract for free: colour, opacity AND
+    roughness move together, which is what makes the wedge read as whitewater
+    rather than as paint. `raw` is the pre-threshold x, exposed for
+    instruments only; nothing shipping reads it.
     """
     d = dict(DISTURBANCE_FOAM_DEFAULTS)
     if defaults:
         d.update(defaults)
     g2 = b.binary(unreal.MaterialExpressionDotProduct, grad_xy, "", grad_xy, "")
     gmag = b.unary(unreal.MaterialExpressionSquareRoot, g2)
-    hterm = b.mul(b.abs_(height_m), b.const(d["DisturbanceFoamHeightWeight"]))
+    height_weight = b.scalar("DisturbanceFoamHeightWeight", d["DisturbanceFoamHeightWeight"])
+    hterm = b.mul(b.abs_(height_m), height_weight)
     raw = b.add(gmag, hterm)
+    threshold = b.scalar("DisturbanceFoamThreshold", d["DisturbanceFoamThreshold"])
     gain = b.scalar("DisturbanceFoamGain", d["DisturbanceFoamGain"])
     enabled = b.scalar("DisturbanceFoamEnabled", d["DisturbanceFoamEnabled"])
-    foam = b.saturate(b.mul(b.mul(raw, gain), enabled))
-    return {"foam": foam}
+    knee = b.sub(raw, threshold)
+    foam = b.saturate(b.mul(b.mul(knee, gain), enabled))
+    return {"foam": foam, "raw": raw}

@@ -3558,3 +3558,7 @@ Results of the regens are appended below as they land.
 
 Both water logs print `absorb channel scale  R 2.00  G 1.00  B 1.50 (2026-09-08 item 4)`.
 2026-09-08 | UI | OWNER VERDICT: "title screen passes" (pass-two insets, title 112, callout x0.75, K no longer clipping) | **ACCEPTED** | live session, build of 01:1x
+2026-09-08 | WATER | OWNER VERDICT on the turbidity floor + bed darkening + channel extinction set (live, lake over snow shore): "water looks better/good enough for now" | **ACCEPTED** | committed this row
+2026-09-08 | UI | OWNER VERDICT: map (marker, zoom, right-drag pan, marks) and hold-Tab cursor "work as expected" | **ACCEPTED** | live
+2026-09-08 | UI | OWNER: journal elements inside the unified pane now too small; no hover/drag handle to resize the unified panel | **OPEN** | UI agent
+2026-09-08 | WAKE | OWNER: "much better but still much too large, spread too far, last too long; smaller, finer, closer to the canoe, radiate slower, persist as long or longer" | **OPEN** | live dials then defaults

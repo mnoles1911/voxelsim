@@ -44,6 +44,20 @@ Three options were considered:
 
 ## Decision
 
+### September 8, 2026 appearance pilot amendment
+
+Matt requested slight differences between tree voxel faces, especially bark,
+after reviewing the foliage pilot. The isolated tree appearance pilot therefore
+adds a smaller face-keyed brightness offset on top of voxel-keyed variation.
+Each face remains one solid color; this is an explicit exception to invariant 2
+below, not a change to terrain materials. Bark defaults to ±8.5% voxel gain
+plus ±4.5% face gain; foliage now uses the same strengths per Matt's follow-up.
+Small warm/cool shifts are
+shared by all faces of a voxel. Asset-local integer coordinates keep this stable
+while orbiting, moving, or reopening a tree. The pilot slider scales the effect.
+The separately approved leaf-only silhouette cutout is the sole sub-voxel
+exception. Production adoption remains subject to the pilot review and tests.
+
 **Every voxel face is a single flat colour. There is no texture and no
 sub-voxel detail.** Colour comes from `vxc::kMaterialPalette`
 (`voxel-core/include/voxelcore/materialpalette.h`), which is the one definition
