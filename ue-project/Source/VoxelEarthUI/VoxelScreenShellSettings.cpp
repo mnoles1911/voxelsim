@@ -43,6 +43,7 @@ float ScaleMin() { return VoxelScreenShellSettingsDetail::kMin; }
 float ScaleMax() { return VoxelScreenShellSettingsDetail::kMax; }
 float ScaleStep() { return VoxelScreenShellSettingsDetail::kStep; }
 float ScaleDefault() { return VoxelScreenShellSettingsDetail::kDefault; }
+float SnapScale(float Scale) { return VoxelScreenShellSettingsDetail::Snap(Scale); }
 
 FOnVoxelScreenShellScaleChanged& OnScaleChanged()
 {

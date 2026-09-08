@@ -60,8 +60,9 @@ FText SettingsMenuSizeHint()
 {
 	return LOCTEXT("SetMenuSizeHint",
 	               "How large the map, journal, inventory, player and codex screens are drawn. "
-	               "Ctrl and the mouse wheel, or Ctrl with plus and minus, does the same while "
-	               "one of them is open; Ctrl and 0 puts it back.");
+	               "While one of them is open you can drag its bottom-right corner, or its right "
+	               "or bottom edge, to resize it; Ctrl and the mouse wheel, or Ctrl with plus and "
+	               "minus, does the same, and Ctrl and 0 puts it back.");
 }
 FText SettingsPercent(int32 Percent)
 {

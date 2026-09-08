@@ -785,6 +785,34 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float ScreenBodyStudInset  = 8.f;
 	float ScreenBodyStudSize   = 4.f;  // radial-gradient ... 2px radius
 
+	// --- The shell's drag-resize grip (2026-09-08) --------------------------
+	// Owner directive, 2026-09-08, verbatim: *"there is no click cursor hover
+	// ability to resize the entire inventory panel whenever that/map/inventory/
+	// player/or codex is open."*
+	//
+	// THE BAND, measured inward from the frame's right and bottom edges, in
+	// which the cursor turns into a resize cursor and a left-drag rescales the
+	// shell. Wide enough to hit without aiming, and deliberately smaller than
+	// ScreenShellPadX/ScreenShellPadBottom (18) so it can never reach past the
+	// shell's own padding onto .menu-body's chrome -- true at the smallest
+	// Menu Size too, where 18 units of padding are drawn as 13.5.
+	//
+	// It is NOT multiplied by the Menu Size scale. The band lives in the
+	// shell's unscaled local space, so a constant here is a constant number of
+	// screen pixels at every setting, which is what a hit target wants to be.
+	float ShellResizeEdge      = 10.f;
+	// The gripper itself: a three-row stair of squares in the bottom-right
+	// corner, six drawn cells on a 3x3 lattice. Slate geometry over the 1x1
+	// white brush per ADR-0011 -- and no band is one unit, the dot being
+	// RulePx*2 and the gap RulePx. Total 3*4 + 2*2 = 16, which with the inset
+	// below sits entirely inside the shell's 18-unit padding.
+	// Expressed IN RulePx rather than as 4 and 2 with a comment saying so, for
+	// the reason RulePx exists: if the rendering constraint ever moves, a
+	// gripper written as literals is a band that quietly stops satisfying it.
+	float ShellGripDot         = VoxelUITheme::RulePx * 2.f;
+	float ShellGripGap         = VoxelUITheme::RulePx;
+	float ShellGripInset       = 3.f;
+
 	// .action-bar
 	float ActionBarTopGap      = 10.f; // padding:10px 4px 0
 	float ActionBarGap         = 18.f;
@@ -1107,6 +1135,46 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	// STextBlock's layout every frame while the machine is already struggling
 	// is exactly the wrong time to pay for it.
 	float FpsRefreshInterval   = 0.25f;
+
+	// --- Derived from the shell figures, never restated ---------------------
+	//
+	// FUNCTIONS AND NOT FIELDS, deliberately, and the reason is the defect they
+	// were added for. Each is an exact consequence of the shell numbers above;
+	// writing one of them down a second time is how a screen's layout drifts
+	// away from the frame it has to fill, and on 2026-09-08 that drift was
+	// INVISIBLE rather than obviously wrong -- the shell's down-only fit read
+	// the oversized measurement and quietly drew the whole journal at ~0.62,
+	// which the owner reported as "journal UI elements within that pane look
+	// too small now". A derived number cannot drift.
+	//
+	// They are also not ini-registered for the same reason: an override that
+	// let one of these disagree with ScreenShellWidth would reintroduce exactly
+	// the condition being fixed.
+
+	// The box .menu-body hands a screen body: the frame, less the shell's own
+	// padding, less .menu-body's padding. 1060 - 2*18 - 2*18 = 988. (The mock's
+	// own figure is 984; the port's ring stack is drawn INSIDE the 18-unit
+	// padding rather than outside it, which is the whole of the difference.)
+	float ScreenBodyContentWidth() const
+	{
+		return ScreenShellWidth - 2.f * ScreenShellPadX - 2.f * ScreenBodyPad;
+	}
+
+	// `.jr-grid{grid-template-columns:300px 1fr}` with the `1fr` resolved,
+	// which it can be because the shell is a fixed authored size.
+	// 988 - 300 - 18 = 670.
+	float JournalPageWidth() const
+	{
+		return ScreenBodyContentWidth() - JournalListWidth - JournalColumnGap;
+	}
+
+	// The codex's third column, resolved the same way.
+	// 988 - 200 - 260 - 2*14 = 500.
+	float CodexPageWidth() const
+	{
+		return ScreenBodyContentWidth() - CodexCategoryWidth - CodexEntryListWidth
+		     - 2.f * CodexColumnGap;
+	}
 
 	// Loaded once from Config/DefaultVoxelUI.ini, section [VoxelUI.Layout],
 	// key names identical to the member names above. Absent keys keep the

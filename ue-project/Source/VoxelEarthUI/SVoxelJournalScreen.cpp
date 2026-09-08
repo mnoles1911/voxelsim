@@ -42,15 +42,58 @@ void SVoxelJournalScreen::Construct(const FArguments& InArgs)
 		[
 			SNew(SBox).WidthOverride(L.JournalListWidth)[BuildLeftColumn()]
 		]
-		+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(L.JournalColumnGap, 0.f, 0.f, 0.f))
+		+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(L.JournalColumnGap, 0.f, 0.f, 0.f))
 		[
-			VoxelScreenChrome::ParchmentPanel(
-				SNew(SScrollBox)
-				+ SScrollBox::Slot()
-				.Padding(FMargin(L.JournalPagePadX, L.JournalPagePadY))
-				[
-					SAssignNew(PageBox, SVerticalBox)
-				])
+			// THE PAGE HAS A WIDTH, AND THAT IS THE FIX FOR "TOO SMALL".
+			//
+			// Owner report, live 1440p session 2026-09-08, verbatim: *"journal
+			// UI elements within that pane look too small now"*. Nothing about
+			// this screen's type changed -- every size below still matches the
+			// mock to the point (.p-body 18, .p-title 30, .card .head 15). What
+			// changed is that 2ee81bc wrapped every screen body in an SScaleBox
+			// (ScaleToFit, DownOnly) so the inventory's 8x8 pack could shrink
+			// into the now-fixed 1060x760 frame, and a ScaleBox decides its
+			// factor from the child's DESIRED size.
+			//
+			// This column used to be `FillWidth(1.f)`, and an auto-wrapping
+			// STextBlock asked for its LONGEST UNWRAPPED LINE. Measured against
+			// the shipped IM Fell English face at 18 px, the default entry's
+			// second paragraph is 1221 units on one line; with the 300-unit card
+			// list, the gap, the parchment chrome and the 28-unit page padding
+			// that is a desired width of ~1603 against the 988 the body has --
+			// so the fit factor came out at 988/1603 = 0.62 and the WHOLE
+			// journal, type and elements alike, was drawn at 62%. Worse, it
+			// changed with the selection, because a different entry is a
+			// different longest line.
+			//
+			// Before that commit the body was simply allotted 988 and the text
+			// wrapped, which is why this is a regression and not an old bug.
+			//
+			// AUTOWIDTH PLUS A FIXED BOX, NOT FILLWIDTH PLUS MaxDesiredWidth --
+			// the same call SVoxelInventoryScreen's .panel-head makes, and for
+			// the same reason: a FillWidth slot hands over the remainder
+			// whatever the child asked for, so a cap on the ASK binds nothing.
+			// The width is the mock's `1fr` with the arithmetic done, which is
+			// legitimate here precisely because the shell is a fixed authored
+			// size -- see FVoxelMenuLayout::JournalPageWidth.
+			//
+			// MaxDesiredHeight(0) is `.page{overflow-y:auto;min-height:0}`, the
+			// other half of the same class of bug: a scroll region that reports
+			// its content height would hand the same ScaleBox a reason to shrink
+			// the screen as soon as an entry ran long. A scroll box has no
+			// intrinsic height; it takes what the row gives it.
+			SNew(SBox)
+			.WidthOverride(L.JournalPageWidth())
+			.MaxDesiredHeight(0.f)
+			[
+				VoxelScreenChrome::ParchmentPanel(
+					SNew(SScrollBox)
+					+ SScrollBox::Slot()
+					.Padding(FMargin(L.JournalPagePadX, L.JournalPagePadY))
+					[
+						SAssignNew(PageBox, SVerticalBox)
+					])
+			]
 		]
 	];
 
@@ -106,7 +149,19 @@ TSharedRef<SWidget> SVoxelJournalScreen::BuildLeftColumn()
 		]
 		+ SVerticalBox::Slot().FillHeight(1.f)
 		[
-			SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(ListBox, SVerticalBox)]
+			// `.listbox{flex:1;min-height:0;overflow-y:auto}` -- BOTH halves of
+			// it. The SScrollBox is the `overflow-y:auto`; MaxDesiredHeight(0)
+			// is the `min-height:0`, and it is not decoration. A vertical scroll
+			// box reports its whole CONTENT height as its desired height, so
+			// without this the card list's length reaches the shell's down-only
+			// fit and a journal with enough entries shrinks itself -- the same
+			// mechanism that shrank this screen on the width axis, one axis over
+			// and waiting for the tenth entry.
+			SNew(SBox)
+			.MaxDesiredHeight(0.f)
+			[
+				SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(ListBox, SVerticalBox)]
+			]
 		];
 }
 

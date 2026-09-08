@@ -168,14 +168,30 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 			// header); the owner's answer is one size for all five.
 			//
 			// ScaleToFit + DownOnly is what makes that safe rather than a
-			// clipping bet. A body that fits is untouched -- DownOnly can only
-			// ever return a factor of 1 for the four screens that already fit,
-			// so this changes nothing about them. A body that does not fit is
-			// drawn uniformly smaller instead of losing a pack row off the
-			// bottom, which is the failure the earlier fixed-size draft was
-			// abandoned over. No reflow either: the content keeps its authored
-			// layout and is scaled, so the inventory looks like itself, only
-			// fractionally smaller than the other four.
+			// clipping bet. A body that does not fit is drawn uniformly smaller
+			// instead of losing a pack row off the bottom, which is the failure
+			// the earlier fixed-size draft was abandoned over. No reflow either:
+			// the content keeps its authored layout and is scaled, so the
+			// inventory looks like itself, only fractionally smaller.
+			//
+			// "DOWNONLY CAN ONLY EVER RETURN 1 FOR THE FOUR SCREENS THAT ALREADY
+			// FIT" -- THAT SENTENCE STOOD HERE AND IT WAS FALSE. It was derived,
+			// never measured, and the owner measured it for us the same night:
+			// *"journal UI elements within that pane look too small now"*. A
+			// ScaleBox decides its factor from the child's DESIRED size, and a
+			// desired size is what a widget ASKS for, not what it needs. An
+			// auto-wrapping STextBlock with no width asks for its longest line
+			// unwrapped, and a vertical SScrollBox asks for its whole content
+			// height. The journal's parchment page did both, so it asked for
+			// ~1603 units against the 988 here and was drawn at 0.62.
+			//
+			// SO THE STANDING RULE IS ON THE SCREENS, NOT HERE: a screen body
+			// must bound its own fluid columns -- a fixed width on a text
+			// column, MaxDesiredHeight(0) on a scroll region -- so that whatever
+			// desired size reaches this box is a size the screen genuinely
+			// needs. This box then scales for RIGIDITY only, which is the
+			// inventory's fixed 8x8 pack and nothing else. See
+			// SVoxelJournalScreen::Construct for the worked case.
 			SNew(SScaleBox)
 			.Stretch(EStretch::ScaleToFit)
 			.StretchDirection(EStretchDirection::DownOnly)
@@ -237,20 +253,47 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 	// The earlier draft's objection -- that a fixed height would clip a pack row
 	// -- is answered on the CONTENT side now, by the down-only fit around the
 	// body above. Nothing here can clip.
+	// The shell's padding moved off the frame box and onto this inner one so the
+	// grip can sit in the corner of the frame ITSELF rather than inside the
+	// padding's content box. Same layout: an SBox's padding pads its child
+	// either way.
+	TSharedRef<SOverlay> FrameStack =
+		SNew(SOverlay)
+		+ SOverlay::Slot()
+		[
+			SNew(SBox)
+			.Padding(FMargin(L.ScreenShellPadX, L.ScreenShellPadTop, L.ScreenShellPadX, L.ScreenShellPadBottom))
+			[
+				Column
+			]
+		]
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Right)
+		.VAlign(VAlign_Bottom)
+		.Padding(FMargin(L.ShellGripInset))
+		[
+			// 3 + 16 = 19 units in from each edge, against 18 units of shell
+			// padding -- so the gripper sits in the corner of the padding and
+			// stops one unit short of the action bar's last hint rather than
+			// over it.
+			BuildResizeGrip()
+		];
+
 	TSharedRef<SBox> Frame =
 		SNew(SBox)
 		.WidthOverride(L.ScreenShellWidth)
 		.HeightOverride(L.ScreenShellHeight)
-		.Padding(FMargin(L.ScreenShellPadX, L.ScreenShellPadTop, L.ScreenShellPadX, L.ScreenShellPadBottom))
 		// THE PLAYER'S MENU SIZE DIAL. A render transform about the frame's
-		// centre, read fresh every paint, so the Settings row and Ctrl+wheel
-		// are the same control and neither has to tell the other. The pivot is
-		// the frame's own centre, so the shell grows and shrinks in place
-		// inside the centring box below rather than walking off one corner.
+		// centre, read fresh every paint, so the Settings row, Ctrl+wheel and
+		// the corner drag are the same control and none has to tell the others.
+		// The pivot is the frame's own centre, so the shell grows and shrinks in
+		// place inside the centring box below rather than walking off one
+		// corner -- which is also what lets the hit region below be arithmetic
+		// on this widget's centre instead of a lookup of where the frame landed.
 		.RenderTransform(this, &SVoxelScreenShell::GetShellRenderTransform)
 		.RenderTransformPivot(FVector2D(0.5f, 0.5f))
 		[
-			Column
+			FrameStack
 		];
 
 	ChildSlot
@@ -400,9 +443,262 @@ void SVoxelScreenShell::FocusDefaultWidget()
 	}
 }
 
+TSharedRef<SWidget> SVoxelScreenShell::BuildResizeGrip()
+{
+	using namespace VoxelUITheme;
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	// A 3x3 lattice with the anti-diagonal and everything below it drawn: six
+	// squares in the shape of a stair, which is the resize gripper every desktop
+	// window corner has worn since the nineties. Squares rather than the usual
+	// diagonal rules because ADR-0011 forbids a one-unit band and a rule thin
+	// enough to read as a gripper line would be exactly that; a 4-unit square on
+	// a 2-unit gap says the same thing and survives any scale factor.
+	TSharedRef<SVerticalBox> Stair = SNew(SVerticalBox);
+	for (int32 Row = 0; Row < 3; ++Row)
+	{
+		TSharedRef<SHorizontalBox> Line = SNew(SHorizontalBox);
+		for (int32 Col = 0; Col < 3; ++Col)
+		{
+			TSharedRef<SWidget> Cell = SNullWidget::NullWidget;
+			if (Row + Col >= 2)
+			{
+				Cell = SNew(SImage)
+					.Image(Style.SolidWhite())
+					.ColorAndOpacity(this, &SVoxelScreenShell::GripColour);
+			}
+			Line->AddSlot().AutoWidth()
+			.Padding(FMargin(0.f, 0.f, Col == 2 ? 0.f : L.ShellGripGap, 0.f))
+			[
+				SNew(SBox)
+				.WidthOverride(L.ShellGripDot)
+				.HeightOverride(L.ShellGripDot)
+				[
+					Cell
+				]
+			];
+		}
+		Stair->AddSlot().AutoHeight()
+		.Padding(FMargin(0.f, 0.f, 0.f, Row == 2 ? 0.f : L.ShellGripGap))
+		[
+			Line
+		];
+	}
+
+	// HIT-TEST INVISIBLE, ON PURPOSE. The grip is a picture of the hit region,
+	// not the hit region: ResizeZoneAt owns that, because the two EDGES have
+	// nothing drawn on them and a widget cannot be the target for a band that
+	// has no widget. One authority for where the shell can be grabbed.
+	return SNew(SBox)
+		.Visibility(EVisibility::HitTestInvisible)
+		[
+			Stair
+		];
+}
+
+FSlateColor SVoxelScreenShell::GripColour() const
+{
+	using namespace VoxelUITheme;
+	// Lit while the pointer is anywhere on the resize band, not only on the
+	// gripper itself -- so the corner answers for the edges too and the player
+	// learns that the whole rim is draggable without having to find it twice.
+	const bool bHot = DragZone != EResizeZone::None || HoverZone != EResizeZone::None;
+	return Tint(bHot ? Gold : Bronze);
+}
+
+float SVoxelScreenShell::LiveScale() const
+{
+	return DragScale.IsSet() ? DragScale.GetValue() : VoxelScreenShellSettings::GetScale();
+}
+
+SVoxelScreenShell::EResizeZone SVoxelScreenShell::ResizeZoneAt(const FVector2D& LocalPos,
+                                                               const FVector2D& LocalSize,
+                                                               float Scale)
+{
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	// The frame is centred in this widget and scaled about its own centre, so
+	// its painted half-extent is the authored half-extent times the scale. That
+	// is the whole geometry of the hit region -- no cached arranged rectangle,
+	// nothing to keep in step with a relayout.
+	const double HalfW = double(L.ScreenShellWidth) * 0.5 * double(Scale);
+	const double HalfH = double(L.ScreenShellHeight) * 0.5 * double(Scale);
+	const double CentreX = LocalSize.X * 0.5;
+	const double CentreY = LocalSize.Y * 0.5;
+	const double Right = CentreX + HalfW;
+	const double Bottom = CentreY + HalfH;
+
+	// UNSCALED, see ShellResizeEdge: the band is a constant number of screen
+	// pixels at every Menu Size, which is what a hit target wants to be.
+	const double Band = double(L.ShellResizeEdge);
+
+	// The band's own slack is added at the far ends of each edge so the corner
+	// is reachable from outside the frame as well as inside it -- a player
+	// aiming at a corner overshoots it, and a target that only exists on the
+	// inside reads as one that does not work.
+	const bool bOnRight = FMath::Abs(LocalPos.X - Right) <= Band
+	                   && LocalPos.Y >= CentreY - HalfH - Band
+	                   && LocalPos.Y <= Bottom + Band;
+	const bool bOnBottom = FMath::Abs(LocalPos.Y - Bottom) <= Band
+	                    && LocalPos.X >= CentreX - HalfW - Band
+	                    && LocalPos.X <= Right + Band;
+
+	if (bOnRight && bOnBottom)
+	{
+		return EResizeZone::Corner;
+	}
+	if (bOnRight)
+	{
+		return EResizeZone::RightEdge;
+	}
+	if (bOnBottom)
+	{
+		return EResizeZone::BottomEdge;
+	}
+	return EResizeZone::None;
+}
+
+float SVoxelScreenShell::ResizeRatioAt(EResizeZone Zone, const FVector2D& LocalPos, const FVector2D& LocalSize)
+{
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+	const double HalfW = FMath::Max(double(L.ScreenShellWidth) * 0.5, 1.0);
+	const double HalfH = FMath::Max(double(L.ScreenShellHeight) * 0.5, 1.0);
+	const double RatioX = FMath::Abs(LocalPos.X - LocalSize.X * 0.5) / HalfW;
+	const double RatioY = FMath::Abs(LocalPos.Y - LocalSize.Y * 0.5) / HalfH;
+
+	switch (Zone)
+	{
+	case EResizeZone::RightEdge:  return float(RatioX);
+	case EResizeZone::BottomEdge: return float(RatioY);
+	// THE DOMINANT AXIS, not the diagonal distance. A corner drag has two
+	// answers and the player is watching one of them; taking the larger means
+	// the corner never falls behind the cursor on either axis, and because the
+	// shell scales uniformly the other axis follows for free.
+	case EResizeZone::Corner:     return float(FMath::Max(RatioX, RatioY));
+	default:                      break;
+	}
+	return 1.f;
+}
+
+void SVoxelScreenShell::CommitResizeDrag()
+{
+	if (DragScale.IsSet())
+	{
+		// One write, one flush, one `VoxelScreenShell: scale %.2f` line, at the
+		// end of the gesture. SetScale already declines to do any of the three
+		// when the value has not moved, so a drag that ended where it started is
+		// silent rather than confirming a change that did not happen.
+		VoxelScreenShellSettings::SetScale(DragScale.GetValue());
+	}
+	DragScale.Reset();
+	DragZone = EResizeZone::None;
+}
+
+FCursorReply SVoxelScreenShell::OnCursorQuery(const FGeometry& Geometry, const FPointerEvent& CursorEvent) const
+{
+	const FVector2D Local = Geometry.AbsoluteToLocal(CursorEvent.GetScreenSpacePosition());
+	const FVector2D Size = Geometry.GetLocalSize();
+
+	// The LATCHED zone wins while a drag is in flight, so the cursor does not
+	// flicker back to an arrow the moment the pointer leaves the band it
+	// grabbed -- which it does immediately, since dragging is what moves it.
+	const EResizeZone Zone = DragZone != EResizeZone::None
+		? DragZone
+		: ResizeZoneAt(Local, Size, LiveScale());
+
+	switch (Zone)
+	{
+	case EResizeZone::Corner:     return FCursorReply::Cursor(EMouseCursor::ResizeSouthEast);
+	case EResizeZone::RightEdge:  return FCursorReply::Cursor(EMouseCursor::ResizeLeftRight);
+	case EResizeZone::BottomEdge: return FCursorReply::Cursor(EMouseCursor::ResizeUpDown);
+	default:                      break;
+	}
+	// UNHANDLED, not "the default cursor". A reply here would claim the cursor
+	// for the whole shell and override whatever a child asks for over its own
+	// pixels; the query walks leaf-to-root and stops at the first answer, so
+	// declining is how the rest of the screen keeps its own.
+	return FCursorReply::Unhandled();
+}
+
+FReply SVoxelScreenShell::OnMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() != EKeys::LeftMouseButton)
+	{
+		return SCompoundWidget::OnMouseButtonDown(Geometry, MouseEvent);
+	}
+
+	const FVector2D Local = Geometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
+	const FVector2D Size = Geometry.GetLocalSize();
+	const EResizeZone Zone = ResizeZoneAt(Local, Size, LiveScale());
+	if (Zone == EResizeZone::None)
+	{
+		// Every other click on the shell's empty area still falls through to the
+		// base class, which is what keeps this widget holding focus -- see the
+		// z-order note in VoxelScreensUISubsystem for why that matters.
+		return SCompoundWidget::OnMouseButtonDown(Geometry, MouseEvent);
+	}
+
+	DragZone = Zone;
+	DragGrabScale = VoxelScreenShellSettings::GetScale();
+	DragGrabRatio = ResizeRatioAt(Zone, Local, Size);
+	DragScale = DragGrabScale;
+
+	// THE CAPTURE IS NOT OPTIONAL. Without it the drag ends the moment the
+	// pointer crosses out of the frame, which for a grow gesture is instantly.
+	return FReply::Handled().CaptureMouse(SharedThis(this)).PreventThrottling();
+}
+
+FReply SVoxelScreenShell::OnMouseMove(const FGeometry& Geometry, const FPointerEvent& MouseEvent)
+{
+	const FVector2D Local = Geometry.AbsoluteToLocal(MouseEvent.GetScreenSpacePosition());
+	const FVector2D Size = Geometry.GetLocalSize();
+
+	if (DragZone != EResizeZone::None && HasMouseCapture())
+	{
+		// ADDITIVE, NOT ABSOLUTE. The grabbed edge keeps whatever offset it was
+		// grabbed at: a player who catches the band a few pixels inside the edge
+		// does not want the shell to jump so the edge lands under the cursor.
+		// Snapped through the settings module's own funnel so that what is drawn
+		// during the drag is exactly what will be stored on release -- a preview
+		// that lands somewhere else on the way down is its own small lie.
+		const float Ratio = ResizeRatioAt(DragZone, Local, Size);
+		DragScale = VoxelScreenShellSettings::SnapScale(DragGrabScale + (Ratio - DragGrabRatio));
+		return FReply::Handled();
+	}
+
+	HoverZone = ResizeZoneAt(Local, Size, LiveScale());
+	return SCompoundWidget::OnMouseMove(Geometry, MouseEvent);
+}
+
+FReply SVoxelScreenShell::OnMouseButtonUp(const FGeometry& Geometry, const FPointerEvent& MouseEvent)
+{
+	if (DragZone != EResizeZone::None && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		CommitResizeDrag();
+		return FReply::Handled().ReleaseMouseCapture();
+	}
+	return SCompoundWidget::OnMouseButtonUp(Geometry, MouseEvent);
+}
+
+void SVoxelScreenShell::OnMouseLeave(const FPointerEvent& MouseEvent)
+{
+	HoverZone = EResizeZone::None;
+	SCompoundWidget::OnMouseLeave(MouseEvent);
+}
+
+void SVoxelScreenShell::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
+{
+	// Reached twice on the ordinary path -- ReleaseMouseCapture above lands here
+	// after CommitResizeDrag has already run -- which is why the commit clears
+	// its own state and is safe to call again.
+	CommitResizeDrag();
+	SCompoundWidget::OnMouseCaptureLost(CaptureLostEvent);
+}
+
 TOptional<FSlateRenderTransform> SVoxelScreenShell::GetShellRenderTransform() const
 {
-	const float Scale = VoxelScreenShellSettings::GetScale();
+	const float Scale = LiveScale();
 	if (FMath::IsNearlyEqual(Scale, 1.f, UE_KINDA_SMALL_NUMBER))
 	{
 		// UNSET AT 1.00, not an identity transform. A widget with no render

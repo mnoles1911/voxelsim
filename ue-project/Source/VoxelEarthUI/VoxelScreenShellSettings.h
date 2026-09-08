@@ -72,5 +72,13 @@ VOXELEARTHUI_API float ScaleDefault();
 // disagree with each other or with the slider about what a step is.
 VOXELEARTHUI_API void StepScale(int32 Steps);
 
+// THE FUNNEL ITSELF, EXPORTED, and only because one author needs to show the
+// value before it stores it. SVoxelScreenShell's corner drag paints the shell
+// at a scale it has not committed yet -- the ini is written once, on release --
+// so it has to snap the same way SetScale will, or the shell would settle onto
+// a different size at the end of the gesture than the one the player was
+// watching. Snapping locally in the widget would be a second copy of the rule.
+VOXELEARTHUI_API float SnapScale(float Scale);
+
 VOXELEARTHUI_API FOnVoxelScreenShellScaleChanged& OnScaleChanged();
 } // namespace VoxelScreenShellSettings

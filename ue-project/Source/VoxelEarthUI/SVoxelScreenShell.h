@@ -35,9 +35,24 @@
 // the ShrinkWrap argument below, plus the down-only fit around the body in
 // Construct that lets the inventory's content live inside one shared frame
 // instead of growing it.
+//
+// A THIRD DIRECTIVE, 2026-09-08, after the first two shipped and were flown:
+//
+//   *"there is no click cursor hover ability to resize the entire inventory
+//   panel whenever that/map/inventory/player/or codex is open."*
+//
+// The Ctrl chords were the whole of the resize, and a chord is not an
+// affordance -- nothing on screen said the shell could be resized. That is the
+// grip: a stair of bronze squares in the bottom-right corner, a resize cursor
+// on the frame's right edge, bottom edge and corner, and a left-drag that
+// rescales live and commits one value on release. It writes the SAME setting
+// the Menu Size row and the Ctrl chords write, so all three are one control.
+// See ResizeZoneAt / ResizeRatioAt below and the mouse handlers in the .cpp.
 
 #include "CoreMinimal.h"
 #include "VoxelScreenData.h" // EVoxelScreenTab
+#include "Input/CursorReply.h"
+#include "Styling/SlateColor.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
 #include "Widgets/SCompoundWidget.h"
 
@@ -94,6 +109,37 @@ public:
 		SLATE_EVENT(FSimpleDelegate, OnClose)
 	SLATE_END_ARGS()
 
+	// Which part of the shell's painted frame the pointer is over. The frame is
+	// centred in this widget's geometry and scaled about its own centre, so the
+	// zone is pure arithmetic on the pointer, the widget size and the scale --
+	// no child widget hit-tests the grip, which is why the grip can be drawn
+	// hit-test-invisible and the edges can be draggable with nothing drawn on
+	// them at all.
+	enum class EResizeZone : uint8
+	{
+		None,
+		RightEdge,
+		BottomEdge,
+		Corner,
+	};
+
+	// PURE FUNCTIONS OF GEOMETRY, PUBLIC AND STATIC, so SVoxelScreenShellTests
+	// can exercise the hit region and the drag mapping with no viewport, no
+	// world and no pointer -- which is the only part of this feature a machine
+	// with no display can check at all.
+	//
+	// LocalSize is this widget's own size (the viewport, in practice: the shell
+	// is added with AddViewportWidgetContent and its centring box fills it).
+	// Scale is the live Menu Size, because the frame's painted half-extent is
+	// its authored half-extent times that.
+	static EResizeZone ResizeZoneAt(const FVector2D& LocalPos, const FVector2D& LocalSize, float Scale);
+
+	// Where the pointer sits along the dragged axis, as a multiple of the
+	// authored half-extent: 1.0 is exactly the frame's edge at Menu Size 1.00.
+	// The drag is the DIFFERENCE of two of these, so the grabbed edge tracks the
+	// cursor from wherever it was grabbed instead of jumping to it.
+	static float ResizeRatioAt(EResizeZone Zone, const FVector2D& LocalPos, const FVector2D& LocalSize);
+
 	void Construct(const FArguments& InArgs);
 	virtual ~SVoxelScreenShell() override;
 
@@ -105,6 +151,20 @@ public:
 	// Ctrl + wheel resizes the shell. Plain wheel is left alone so the lists
 	// inside these screens still scroll.
 	virtual FReply OnMouseWheel(const FGeometry& Geometry, const FPointerEvent& MouseEvent) override;
+
+	// --- The drag-resize grip ------------------------------------------------
+	// The cursor answers on hover; the left button starts a drag and takes the
+	// mouse capture; the move rescales live; the release commits ONE value.
+	virtual FCursorReply OnCursorQuery(const FGeometry& Geometry, const FPointerEvent& CursorEvent) const override;
+	virtual FReply OnMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseButtonUp(const FGeometry& Geometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseMove(const FGeometry& Geometry, const FPointerEvent& MouseEvent) override;
+	virtual void OnMouseLeave(const FPointerEvent& MouseEvent) override;
+	// A capture can end without a button-up -- a window losing focus mid-drag,
+	// or another widget taking the capture. Committing here as well as on the
+	// release is what stops a drag that ended untidily from leaving the shell at
+	// a size the setting does not know about.
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override;
 
 	// Focus lands on the ACTIVE TAB's button, so arrowing works from the moment
 	// a screen opens -- SVoxelPauseMenu::FocusDefaultWidget's rule, and for the
@@ -123,6 +183,20 @@ public:
 private:
 	TSharedRef<class SWidget> BuildTabBar();
 	TSharedRef<class SWidget> BuildActionBar() const;
+	// The stair of squares in the bottom-right corner. Drawn, never hit-tested
+	// -- the shell owns the hit region, so the picture and the target cannot
+	// disagree about where the grip is.
+	TSharedRef<class SWidget> BuildResizeGrip();
+	FSlateColor GripColour() const;
+
+	// The scale in force RIGHT NOW: the drag's uncommitted value while one is in
+	// flight, the stored setting otherwise. Every reader goes through this, so
+	// the painted frame, the hit region and the cursor cannot disagree during a
+	// drag about how big the shell is.
+	float LiveScale() const;
+	// Writes the drag's value to VoxelScreenShellSettings and clears the drag.
+	// Idempotent, because the release path and the capture-lost path both run.
+	void CommitResizeDrag();
 
 	// The player's Menu Size dial, as a render transform about the frame's
 	// centre. A RENDER transform and not a layout one, which is the whole point:
@@ -136,6 +210,23 @@ private:
 	EVoxelScreenTab ActiveTab = EVoxelScreenTab::Inventory;
 	TArray<FVoxelScreenAction> Actions;
 	TArray<TSharedPtr<class SVoxelMenuButton>> TabButtons;
+
+	// --- Drag state ----------------------------------------------------------
+	// None unless a drag is in flight. The zone is latched at button-down and
+	// held for the whole drag: a corner drag that wanders onto the right edge
+	// must keep behaving like a corner drag.
+	EResizeZone DragZone = EResizeZone::None;
+	float DragGrabScale = 1.f;
+	float DragGrabRatio = 1.f;
+	// UNSET EXCEPT DURING A DRAG, and that is what makes "live rescale, one
+	// commit" possible. VoxelScreenShellSettings::SetScale writes the ini,
+	// flushes it and logs a line; doing that on every mouse-move would write the
+	// config a hundred times across one gesture and bury the one line that says
+	// what the player chose. So the drag paints from here and commits once.
+	TOptional<float> DragScale;
+	// Hover only, for the grip's colour. Not load-bearing: the cursor and the
+	// drag both re-derive the zone from the pointer they were handed.
+	EResizeZone HoverZone = EResizeZone::None;
 
 	FOnVoxelScreenTabChanged OnTabChanged;
 	FSimpleDelegate OnClose;

@@ -48,19 +48,42 @@ void SVoxelCodexScreen::Construct(const FArguments& InArgs)
 		[
 			SNew(SBox)
 			.WidthOverride(L.CodexEntryListWidth)
+			// `min-height:0` -- see the page column below and
+			// SVoxelJournalScreen::BuildLeftColumn. A scroll box that reports
+			// its content height gives the shell's down-only fit a reason to
+			// shrink the whole screen once the list is long enough.
+			.MaxDesiredHeight(0.f)
 			[
 				SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(EntryListBox, SVerticalBox)]
 			]
 		]
-		+ SHorizontalBox::Slot().FillWidth(1.f).Padding(FMargin(L.CodexColumnGap, 0.f, 0.f, 0.f))
+		+ SHorizontalBox::Slot().AutoWidth().Padding(FMargin(L.CodexColumnGap, 0.f, 0.f, 0.f))
 		[
-			VoxelScreenChrome::ParchmentPanel(
-				SNew(SScrollBox)
-				+ SScrollBox::Slot()
-				.Padding(FMargin(L.JournalPagePadX, L.JournalPagePadY))
-				[
-					SAssignNew(PageBox, SVerticalBox)
-				])
+			// THE SAME DEFECT THE JOURNAL WAS REPORTED FOR, IN THE OTHER SCREEN
+			// THAT HAS A PARCHMENT PAGE IN A `1fr` COLUMN. It was not reported
+			// because it is not what the owner had open, not because it is not
+			// there: measured against the shipped IM Fell English face at the
+			// codex's own 17 px, the longest seeded entry paragraph is 1151
+			// units on one unwrapped line, which put this screen's desired width
+			// at ~1703 against the body's 988 and its down-only fit factor at
+			// 0.58. Fixing one and leaving the other would file the second
+			// report by hand.
+			//
+			// See SVoxelJournalScreen::Construct for the full account of the
+			// mechanism and for why the width is a fixed authored figure rather
+			// than a cap on a FillWidth slot.
+			SNew(SBox)
+			.WidthOverride(L.CodexPageWidth())
+			.MaxDesiredHeight(0.f)
+			[
+				VoxelScreenChrome::ParchmentPanel(
+					SNew(SScrollBox)
+					+ SScrollBox::Slot()
+					.Padding(FMargin(L.JournalPagePadX, L.JournalPagePadY))
+					[
+						SAssignNew(PageBox, SVerticalBox)
+					])
+			]
 		]
 	];
 
