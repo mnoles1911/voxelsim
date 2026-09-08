@@ -90,6 +90,9 @@ private:
 	// The INTERFACE SIZE row: a slider row over a non-0..1 range, plus the hint
 	// that says what the trade is. See VoxelGraphicsUserSettings::GetUIScale.
 	TSharedRef<class SWidget> BuildUIScaleRow();
+	// The MENU SIZE row: the same shape, over the five in-game screens' own
+	// scale rather than the application's. See VoxelScreenShellSettings.h.
+	TSharedRef<class SWidget> BuildMenuSizeRow();
 	// One checkbox row (.ck-row): the well, the mark, a label and an italic
 	// hint. Used by DISPLAY and by every GRAPHICS row. The toggle is a
 	// TFunction rather than an FOnCheckStateChanged so this header does not have

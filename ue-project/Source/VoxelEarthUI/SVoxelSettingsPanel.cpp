@@ -5,6 +5,7 @@
 #include "VoxelAudioUserSettings.h"
 #include "VoxelEarthUI.h"
 #include "VoxelGraphicsUserSettings.h"
+#include "VoxelScreenShellSettings.h"
 #include "VoxelUIStrings.h"
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
@@ -148,6 +149,36 @@ void SVoxelSettingsPanel::Construct(const FArguments& InArgs)
 	Body->AddSlot().AutoHeight().Padding(RowPad)
 	[
 		BuildUIScaleRow()
+	];
+	// The two HUD-furniture switches (owner directive, 2026-09-08). INTERFACE
+	// rather than GRAPHICS because neither costs a frame: they are about what
+	// the player wants to look at, which is the question this section already
+	// answers for size. Straight through to the persisted setting on the
+	// GRAPHICS rows' own pattern -- nothing cached here, so a write that failed
+	// visibly fails to flip.
+	Body->AddSlot().AutoHeight().Padding(RowPad)
+	[
+		BuildCheckRow(VoxelUIStrings::SettingsHideMusicUILabel(),
+		              VoxelUIStrings::SettingsHideMusicUIHint(),
+		              TAttribute<bool>::CreateLambda([]() { return VoxelGraphicsUserSettings::GetHideMusicUI(); }),
+		              [](bool bChecked) { VoxelGraphicsUserSettings::SetHideMusicUI(bChecked); })
+	];
+	Body->AddSlot().AutoHeight().Padding(RowPad)
+	[
+		BuildCheckRow(VoxelUIStrings::SettingsHideCompassUILabel(),
+		              VoxelUIStrings::SettingsHideCompassUIHint(),
+		              TAttribute<bool>::CreateLambda([]() { return VoxelGraphicsUserSettings::GetHideCompassUI(); }),
+		              [](bool bChecked) { VoxelGraphicsUserSettings::SetHideCompassUI(bChecked); })
+	];
+	// MENU SIZE, the second half of the owner's 2026-09-07 resize directive --
+	// the same setting Ctrl+wheel drives inside an open screen, so a player who
+	// found the shortcut and a player who found the panel are turning one dial.
+	// It sits under INTERFACE SIZE rather than beside it because it is the
+	// narrower of the two: that one scales the whole application, this one
+	// scales the five in-game screens. See VoxelScreenShellSettings.h.
+	Body->AddSlot().AutoHeight().Padding(RowPad)
+	[
+		BuildMenuSizeRow()
 	];
 
 	Body->AddSlot().AutoHeight().Padding(RowPad)
@@ -437,6 +468,55 @@ TSharedRef<SWidget> SVoxelSettingsPanel::BuildUIScaleRow()
 		[
 			SNew(STextBlock)
 			.Text(VoxelUIStrings::SettingsUIScaleHint())
+			.Font(Style.HandItalic(L.SettingsHintSize))
+			.ColorAndOpacity(FVoxelUIStyle::MutedColour())
+			.WrapTextAt(L.SettingsHintWrapWidth)
+		];
+}
+
+TSharedRef<SWidget> SVoxelSettingsPanel::BuildMenuSizeRow()
+{
+	using namespace VoxelUITheme;
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	// Built exactly as BuildUIScaleRow is, and against the same shape of API,
+	// so the two rows cannot end up behaving differently: the slider works in
+	// 0..1 track space, the setting does not, and the mapping lives here while
+	// the range stays the settings module's to state.
+	const float Min = VoxelScreenShellSettings::ScaleMin();
+	const float Max = VoxelScreenShellSettings::ScaleMax();
+	const float Span = FMath::Max(Max - Min, UE_KINDA_SMALL_NUMBER);
+	const float Step = VoxelScreenShellSettings::ScaleStep() / Span;
+
+	TSharedRef<SWidget> Row = BuildSliderRow(
+		VoxelUIStrings::SettingsMenuSizeLabel(),
+		[Min, Span]() { return (VoxelScreenShellSettings::GetScale() - Min) / Span; },
+		[Min, Span](float Fraction) { VoxelScreenShellSettings::SetScale(Min + Fraction * Span); },
+		[]()
+		{
+			return VoxelUIStrings::SettingsPercent(
+				FMath::RoundToInt(VoxelScreenShellSettings::GetScale() * 100.f));
+		},
+		Step);
+
+	// NOTHING SUBSCRIBES TO VoxelScreenShellSettings::OnScaleChanged HERE, and
+	// that is deliberate rather than an omission. Both halves of this row --
+	// the fill width and the readout -- are TAttributes that re-read GetScale()
+	// every paint, so a Ctrl+wheel made elsewhere is already reflected the next
+	// frame with no binding and no lifetime to manage. The delegate exists for
+	// a future consumer that must ACT on a change rather than merely display
+	// it; a widget that polls does not need to be told.
+	return SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight()
+		[
+			Row
+		]
+		+ SVerticalBox::Slot().AutoHeight()
+		.Padding(FMargin(L.CheckboxSize + L.SettingsRowGap, 2.f, 0.f, 0.f))
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::SettingsMenuSizeHint())
 			.Font(Style.HandItalic(L.SettingsHintSize))
 			.ColorAndOpacity(FVoxelUIStyle::MutedColour())
 			.WrapTextAt(L.SettingsHintWrapWidth)

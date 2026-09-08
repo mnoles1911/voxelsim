@@ -95,6 +95,31 @@ VOXELEARTHUI_API float UIScaleMin();
 VOXELEARTHUI_API float UIScaleMax();
 VOXELEARTHUI_API float UIScaleStep();
 
+// "Hide Music UI" / "Hide Compass UI" -- THE TWO ROWS HERE THAT ARE NOT A
+// CVAR AND NOT A RENDER TRADE. Owner directive, 2026-09-08, after confirming the
+// transport works: two switches that take HUD furniture off the screen.
+//
+// WHY THEY LIVE HERE RATHER THAN IN VoxelAudioUserSettings. HIDING THE MUSIC UI
+// IS NOT MUTING THE MUSIC. This pair is about what is drawn -- the same question
+// INTERFACE SIZE answers -- and the transport hotkeys keep working with the
+// plates hidden, exactly as the volume sliders keep working with the panel shut.
+// Filing them under audio would invite the next reader to make hiding the
+// buttons stop the soundtrack.
+//
+// BOTH DEFAULT FALSE: nothing is hidden until the player says so, and a missing
+// ini key must therefore read as "shown". The HUD reads them every frame through
+// its own visibility attributes, so a toggle is live with no apply step -- which
+// is why neither appears in ApplyAll's cvar list below.
+//
+// HIDDEN WINS OVER EVERY OTHER GATE in the music cluster: over the cursor gate,
+// over hold-Tab, over the death screen exception. "Hidden" is the player's own
+// instruction and nothing else in the HUD is entitled to overrule it.
+VOXELEARTHUI_API bool GetHideMusicUI();
+VOXELEARTHUI_API void SetHideMusicUI(bool bHidden);
+
+VOXELEARTHUI_API bool GetHideCompassUI();
+VOXELEARTHUI_API void SetHideCompassUI(bool bHidden);
+
 // Push every persisted setting into its cvar. Idempotent; called from
 // UVoxelFrontEndSubsystem::Initialize so a fresh process honours the player's
 // saved choices before the first marched frame, and from every Set* so a

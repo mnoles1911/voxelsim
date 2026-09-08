@@ -232,6 +232,17 @@ FVoxelFrontEndSwitches Parse()
 		S.bLoadingScreenThread = (CurtainThread != 0);
 	}
 
+	// -VoxelMenuPrewarm=0|1, default 1. Int-valued rather than a bare Param for
+	// the same reason the curtain thread is: BOTH directions have to be
+	// expressible from a command line, and =0 is the control arm of the
+	// loading-screen A/B. See the field's comment for what it moves and why the
+	// attended-run gate is the menu itself rather than a check here.
+	{
+		int32 MenuPrewarm = 1;
+		FParse::Value(Cmd, TEXT("VoxelMenuPrewarm="), MenuPrewarm);
+		S.bMenuPrewarm = (MenuPrewarm != 0);
+	}
+
 	// -VoxelLoadTheatre=<min>[,<max>]: the artificial load duration's range.
 	// One value pins the duration; 0 disables the theatre (the arm unattended
 	// hand-off parity legs should pass). Through ParseFloatList for the same

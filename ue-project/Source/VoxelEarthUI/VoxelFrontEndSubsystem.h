@@ -114,7 +114,13 @@ private:
 	void RestoreStreamingBudget();
 
 	// Removes the menu from the viewport and hands input back to the game.
-	void TeardownMenu();
+	//
+	// bKeepMusic is the ONE thing that differs between the hand-off call and
+	// every other one. Hand-off is not an exit -- the player is carrying on into
+	// a world that is meant to keep the soundtrack -- so it passes true and the
+	// music survives; a quit, a Deinitialize or a run that ends on the loading
+	// screen passes the default and the track is stopped as it always was.
+	void TeardownMenu(bool bKeepMusic = false);
 
 	EVoxelFrontEndState State = EVoxelFrontEndState::Inactive;
 
@@ -159,6 +165,15 @@ private:
 	// backstop for every path that never reaches one.
 	bool bStreamBudgetCapped = false;
 	float SavedApplyBudgetMs = 0.f;
+
+	// The second theatre cap (2026-09-08): the raster atlas's per-tick page
+	// sweep, voxel.Stream.AtlasFillMs. Separate flag from the apply budget's on
+	// purpose -- either cap may decline to engage, and one restore path must
+	// not be able to skip the other. The saved value may legitimately be
+	// NEGATIVE: -1 is the cvar's "use the latched -VoxelGpuRasterAtlasFillMs"
+	// sentinel and restoring it is how an ordinary run gets its 2.0 ms back.
+	bool bAtlasFillCapped = false;
+	float SavedAtlasFillMs = -1.f;
 
 	TUniquePtr<class FVoxelWorldReadyProbe> ReadyProbe;
 

@@ -19,6 +19,22 @@
 // IT SWITCHES NOTHING BY ITSELF. Pressing a tab raises OnTabChanged and the
 // subsystem rebuilds; this widget never constructs a screen body. That keeps it
 // constructible in a screenshot run with no world, on SVoxelPauseMenu's rule.
+//
+// TWO OWNER DIRECTIVES SHAPE THIS FILE, 2026-09-07, verbatim:
+//
+//   *"for the unified inventory/journal/map/player/codex UI menu, make it
+//   resizable if a player wants to make the entire thing larger or smaller in
+//   run time."*
+//
+//   *"also, it currently appears that the inventory UI menu size is slightly
+//   larger than the default sizing for map, journal, player, and codex
+//   sections. unify this."*
+//
+// The first is VoxelScreenShellSettings plus GetShellRenderTransform and the
+// Ctrl bindings in OnKeyDown / OnMouseWheel. The second is the retirement of
+// the ShrinkWrap argument below, plus the down-only fit around the body in
+// Construct that lets the inventory's content live inside one shared frame
+// instead of growing it.
 
 #include "CoreMinimal.h"
 #include "VoxelScreenData.h" // EVoxelScreenTab
@@ -54,9 +70,23 @@ public:
 		, _ShrinkWrap(false)
 	{}
 		SLATE_ARGUMENT(EVoxelScreenTab, ActiveTab)
-		// The INVENTORY mock replaces the compact shell's fixed size with
-		// `width:max-content`. True sets NO size override, so the frame is as
-		// big as its contents; false uses ScreenShellWidth/Height.
+		// RETIRED, AND KEPT ONLY SO ITS CALLER STILL COMPILES. Owner directive,
+		// 2026-09-07, verbatim: *"it currently appears that the inventory UI
+		// menu size is slightly larger than the default sizing for map,
+		// journal, player, and codex sections. unify this."*
+		//
+		// This argument WAS that difference. The inventory mock's .menu-shell
+		// carries `width:max-content` where the other four carry the compact
+		// shell's fixed size, and passing true here dropped the size override
+		// entirely so the frame grew to whatever the 8x8 pack needed --
+		// measured on the 2026-09-07 captures as 1348x944 against 1326x906 for
+		// the other four, i.e. 16 units wider and 28 taller in authored space.
+		// Five screens the player tabs between cannot be five sizes.
+		//
+		// The shell is now ALWAYS ScreenShellWidth x ScreenShellHeight and this
+		// flag does nothing. It is still declared because
+		// VoxelScreensUISubsystem passes it at two call sites owned by another
+		// agent; whoever holds that file can delete both and then this.
 		SLATE_ARGUMENT(bool, ShrinkWrap)
 		SLATE_ARGUMENT(TArray<FVoxelScreenAction>, Actions)
 		SLATE_NAMED_SLOT(FArguments, Body)
@@ -69,8 +99,12 @@ public:
 
 	virtual bool SupportsKeyboardFocus() const override { return true; }
 	// Escape closes; the five tab keys switch; Q/E page between tabs, which is
-	// the gamepad-shoulder idiom the mock's key hints describe.
+	// the gamepad-shoulder idiom the mock's key hints describe. Ctrl with
+	// plus / minus / zero drives the resize -- see OnMouseWheel.
 	virtual FReply OnKeyDown(const FGeometry& Geometry, const FKeyEvent& KeyEvent) override;
+	// Ctrl + wheel resizes the shell. Plain wheel is left alone so the lists
+	// inside these screens still scroll.
+	virtual FReply OnMouseWheel(const FGeometry& Geometry, const FPointerEvent& MouseEvent) override;
 
 	// Focus lands on the ACTIVE TAB's button, so arrowing works from the moment
 	// a screen opens -- SVoxelPauseMenu::FocusDefaultWidget's rule, and for the
@@ -89,6 +123,15 @@ public:
 private:
 	TSharedRef<class SWidget> BuildTabBar();
 	TSharedRef<class SWidget> BuildActionBar() const;
+
+	// The player's Menu Size dial, as a render transform about the frame's
+	// centre. A RENDER transform and not a layout one, which is the whole point:
+	// nothing inside the shell re-measures or re-wraps at any setting, so the
+	// screens cannot look different from each other at 1.25 than they do at
+	// 1.00. Read every paint from VoxelScreenShellSettings, so a change made
+	// from the Settings panel while a screen is open lands on the next frame
+	// with nothing to subscribe to.
+	TOptional<FSlateRenderTransform> GetShellRenderTransform() const;
 
 	EVoxelScreenTab ActiveTab = EVoxelScreenTab::Inventory;
 	TArray<FVoxelScreenAction> Actions;

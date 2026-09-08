@@ -2749,6 +2749,89 @@ edges.
   is pixel-exact at any setting, and the earlier wording promised something the
   policy does not deliver.
 
+#### The unified screen shell: one size, and a resize dial (owner, 2026-09-07)
+
+Two directives, verbatim, both recorded at the top of `SVoxelScreenShell.h`:
+*"for the unified inventory/journal/map/player/codex UI menu, make it resizable
+if a player wants to make the entire thing larger or smaller in run time"* and
+*"it currently appears that the inventory UI menu size is slightly larger than
+the default sizing for map, journal, player, and codex sections. unify this."*
+
+**The size discrepancy had one named cause, and it was not a min-size leak.**
+`SVoxelScreenShell` carried a `ShrinkWrap` argument whose entire effect was
+`if (!ShrinkWrap) { SetWidthOverride; SetHeightOverride; }`.
+`VoxelScreensUISubsystem` passed `ShrinkWrap(Tab == Inventory)` at two call
+sites, so the inventory alone had **no size override at all** and its frame grew
+to whatever the 8x8 pack needed -- the 1348x944 against 1326x906 measured on the
+captures, i.e. 16 units wider and 28 taller in authored space. It was a
+deliberate port of the inventory mock's `.menu-shell{width:max-content}`, which
+the other four mocks do not carry.
+
+**The frame side is what changed.** The shell is now unconditionally
+`ScreenShellWidth x ScreenShellHeight` (the authored 1060x760) and `ShrinkWrap`
+is a documented no-op, kept declared only so its two callers in
+`VoxelScreensUISubsystem.cpp` -- another agent's file -- still compile. Whoever
+holds that file can delete both call sites and then the argument.
+
+**The content side is what makes that safe.** The comment the old code left
+behind is a real objection: a fixed height that also fits the other four screens
+would clip a row off the pack, and clipping an inventory row is worse than a
+frame that is the wrong size. So the body now sits in an `SScaleBox` at
+`ScaleToFit` + `DownOnly`. A body that fits is untouched -- `DownOnly` cannot
+return a factor above 1, so nothing about map, journal, player or codex changes
+-- and a body that does not fit is drawn uniformly smaller rather than losing
+its bottom row. No reflow: the inventory keeps its authored layout and is scaled,
+so it still looks like itself.
+
+**The resize dial.** `VoxelScreenShellSettings` (new pair) holds it:
+`[VoxelGraphics] ScreenShellScale` in `GGameUserSettingsIni`, default **1.00**,
+0.75-1.50 in 0.05 steps, snapped and clamped in one place on both the read and
+the write path, flushed immediately, and logged as
+`VoxelScreenShell: scale %.2f` **only when the value actually changes** -- a
+wheel notch that lands past a clamp must not produce the same line as one that
+moved something. It carries an `OnScaleChanged` multicast, which the Settings row
+deliberately does not subscribe to: both halves of that row are `TAttribute`s
+that re-read the getter every paint, so a Ctrl+wheel made elsewhere is already
+reflected next frame. The delegate is there for a future consumer that must
+*act* on a change rather than display it.
+
+It is applied to the shell frame as a **Slate render transform about the frame's
+centre**, not as a layout scale -- so nothing inside re-measures or re-wraps at
+any setting, and the five screens cannot look different from each other at 1.25
+than they do at 1.00. At exactly 1.00 the transform is returned **unset** rather
+than as an identity, so the shipped default takes the same paint path the widget
+took before the dial existed.
+
+| binding | where | note |
+|---|---|---|
+| `Ctrl` + mouse wheel | `SVoxelScreenShell::OnMouseWheel` | Only the SIGN of `GetWheelDelta` is used -- one notch is one 0.05 stop whatever magnitude the platform reports, or the size would differ per mouse. A bare wheel is passed straight through so the codex, journal and perk lists still scroll. **Caveat:** over one of those scroll boxes the list consumes the wheel first, so Ctrl+wheel resizes over the tab bar, the action bar, the panel margins and the inventory grid, but not over a scrolling list. The key bindings always work. |
+| `Ctrl` + `+` / `=` / numpad `+` | `OnKeyDown` | Three spellings because a keyboard has more than one: Slate reports the physical key, so the main row's `+` arrives as `EKeys::Equals` with shift held. |
+| `Ctrl` + `-` / `_` / numpad `-` | `OnKeyDown` | Same, via `Hyphen` / `Underscore` / `Subtract`. |
+| `Ctrl` + `0` / numpad `0` | `OnKeyDown` | Back to 1.00. Any dial that can be moved by accident needs a way back that does not require remembering what it was. |
+
+The Ctrl chords are tested **before** the tab keys, because the unmodified
+letters below them are tab switches and a chord that fell through would page the
+screen instead of resizing it. The screens run under `FInputModeUIOnly` with
+`SetWidgetToFocus(Shell)` and an unlocked, visible cursor
+(`VoxelScreensUISubsystem.cpp:720-723`), so both routes reach the shell.
+
+**Settings row: INTERFACE / MENU SIZE**, immediately after the two Hide rows,
+built with the panel's own slider-row builder exactly as INTERFACE SIZE is. Its
+hint names the shortcut, because a dial buried in a panel is not how anyone
+finds the size they want -- they find it by looking at the screen they are
+resizing.
+
+**Two more ADR-0011 misses, caught here.** Both were one-unit bands expressed as
+NAMED CONSTANTS summed into an inset, which is why the first sweep's grep for
+`FMargin(1.f)` did not see them:
+
+* `SVoxelScreenShell.cpp` `kBodyRing1Px` / `kBodyRing2Px` -- `.menu-body`'s
+  first two rings, 1 unit each. Both now `VoxelUITheme::RulePx`; the body's
+  chrome grows two units per side.
+* `SVoxelMenuButton.cpp` `kLeatherBorderPx` -- the width of a band in **two**
+  stacks: the Leather plate's border (every dialog action button) and the Tab
+  plate's edge ring. Now `RulePx`; both grow one unit per side.
+
 #### Needs a file outside this pass's scope
 
 **The journal shows two different day numbers at once**, and the fix needs one
@@ -3284,3 +3367,180 @@ read as a wake.
 
 2026-09-07 | UI | OWNER DIRECTIVE, live at 1440p: main-menu corner insets too wide | **AUTHORED VALUES TIGHTENED** (LogoTop 80->40, LogoRight 100->48, TitleMenuRight 160->64, CalloutTop 80->40, CalloutLeft 60->32, VersionInsetLeft 36->20, VersionInsetBottom 24->14) -- per ADR-0011 the scale is untouched; owner judges on the next launch | VoxelUITheme.h, pending build
 2026-09-07 | UI | OWNER BUG REPORT, live: NEW GAME always highlighted + expanded | **FIXED IN SOURCE** -- the 2026-09-07 UI pass bound NEW GAME's Active to HasNoColumnFocus (a resting selection from the mock's `.active`); removed, so it lights/grows only on hover or keyboard focus like its siblings | SVoxelMainMenu.cpp, pending build
+2026-09-07 | UI | OWNER VERDICT + DIRECTIVE, live: corner insets "spacing looks good" (ACCEPTED); title 15% smaller, patch-notes callout 25% smaller and compact | **AUTHORED** LogoFontSize 132->112; callout 520/14/16/64/22 + faces 16/22/16 -> 390/10/12/48/16 + 12/16/12 | VoxelUITheme.h, pending build
+2026-09-07 | audio | OWNER: "no music playing on home or load screen" -> "confirmed music is present" once the game window had focus | **NOT A BUG** -- the engine mutes all audio when the game window is unfocused (BaseEngine.ini [Audio] UnfocusedVolumeMultiplier=0.0, not overridden); the log showed the track playing throughout | live session
+2026-09-07 | audio/HUD | OWNER DIRECTIVE: in-game HUD music controls, top-right: back / play-pause / next, design-system styling; music from the soundtrack library plays BY DEFAULT in game; pause stops, next skips, back goes to the previous track | **ASSIGNED** (Opus agent; today the front end fades music OUT at hand-off, so this also changes that) | pending
+2026-09-08 | water, live | OWNER VERDICTS on the deposit-fix build (patch applied, both materials regenerated, curtain thread off): "no more water in the hull" **FIXED**; "i think the half metre dome is gone" **FIXED**; "i dont see any shore foam in the game" **OPEN**; "the disturbed areas from both the boat and from player in the water still paints as grey. i would expect this wake and water surface ripples to paint as effects on the water in a correct color - not this flat grey color" **OPEN**; "loading screen looks good" **ACCEPTED**; "title screen looks good as well" **ACCEPTED** | Ripple.Stat: injected=13932 over the run (~2 per tick = bow+transom, count unchanged by design; the deposit fix scales STRENGTH per deposit, so my injected-per-metre gate was ill-defined -- the field peak from voxel.Water.Ripple.Dump is the number) | live session
+2026-09-08 | water, live | NEXT ARM for the two open verdicts (flat grey disturbance foam; no shore foam): relaunch with `-VoxelWaterMatScalar=FoamBreakupGain:1,ShallowFoamGain:1,ShallowFoamDepthM:0.6,DisturbanceFoamEmissive:1.0` -- switches on the night pass's dark-by-default procedural breakup (textured whitewater instead of a flat tint lerp of (0.82,0.90,0.94)) and the depth-keyed shallow shore foam, and brightens the disturbance emissive | owner judges live; no regen, no build needed for these four (all sheet MID scalars) | pending the window close
+2026-09-08 | audio/HUD | HUD music controls AUTHORED (Opus agent): FVoxelUIMusic playlist (session shuffle, Next/Previous/TogglePause/NowPlaying, end-of-track advance marshalled to the game thread, PcmGuard), music continues into gameplay (VoxelAudioUserSettings MusicInGame default true; unattended runs stay silent), HUD cluster top-right [prev][play-pause][next] as Slate geometry + now-playing label; hotkeys , . / and NumPad 4/5/6; clicks whenever an in-game screen has the cursor up (HUD z 18->111 above the screen stack, below pause); hidden over death/dialogue | **BUILDING**, owner judges live; two unverified: triangle glyph rendering, long-name clipping | VoxelUIMusic.*, SVoxelGameHud.*, VoxelScreensUISubsystem.*, VoxelAudioUserSettings.*, VoxelFrontEndSubsystem.cpp, VoxelUITheme.h, VoxelUIStrings.*
+2026-09-08 | UI | OWNER, live: title + callout "are smaller" (size ACCEPTED); "patch notes can be moved up and to the left more"; "the voxelmark title needs to move further to the left because the end of the K letter ... is currently clipping off screen" | **AUTHORED** LogoRight 48->96 (swash-K overhang ~47 px at 112 px), CalloutTop 40->24, CalloutLeft 32->16 | VoxelUITheme.h, pending build
+2026-09-08 | UI | OWNER VERDICT: "confirmed new game grows and lights up as expected now" | **ACCEPTED** (resting-active binding removed, commit b9cdb75) | live session
+2026-09-08 | audio | Playlist observed live on the title screen: built 30 tracks shuffled; end-of-track advance fired 1->2->3->4 ("Defeat _ Game Over", "Boss Battle" among them) | **WORKS**; follow-up: curate menu vs combat vs ambient sets (stingers like Defeat/Boss Battle should not open the title screen) -- playlist tagging by filename prefix or a manifest | backlog
+2026-09-08 | UI/HUD | OWNER DIRECTIVE, live: "move the song/title name to the left of the back, pause, and next buttons" | **ASSIGNED** (music agent; one right-aligned row [label][prev][play-pause][next]) | pending build
+2026-09-08 | controls | OWNER DIRECTIVE, live: "holding tab should cause the mouse cursor to pop up on screen and be able to be controlled. when holding tab and moving the mouse, player can use the cursor to click anything on screen." | **ASSIGNED** (music agent: hold-to-point mode, game-and-UI input while held, look suppressed, release on focus loss; transport becomes clickable via the existing bCursorVisible gate) | pending build
+2026-09-08 | loading | OWNER, live: "lots of hitches and lags on the loading screen ... the hourglass freezes and sand stops falling" | **OPEN**; log profile of that load: renderWaitMs 6452/2002/1276/924 ms (render-thread waits, the 6.4 s inside the first GPU worklist burst ten seconds after the 952 MiB brick-pool commit), plus one 550 ms recompute and one 2016 ms raster-atlas fill window on the game thread. Threaded curtain is OFF (deadlock). Assigned: pre-warm GPU pools under the menu + cap atlas fills during the theatre (Opus agent) | pending
+2026-09-08 | audio/HUD | OWNER VERDICT: "confirmed pause, back, and next for music is working as expected" | **ACCEPTED** (transport + hotkeys; label placement change pending) | live session
+2026-09-08 | settings | OWNER DIRECTIVE: Settings rows "Hide Music UI" (hides all music HUD items) and "Hide Compass UI" (hides just the compass at the top of the HUD) | **ASSIGNED** (music agent; persisted like the other rows per the settings-panel policy) | pending build
+2026-09-08 | UI | OWNER DIRECTIVE: the unified inventory/journal/map/player/codex shell must be resizable at runtime (whole thing larger or smaller); and the inventory shell renders larger than the other four (measured 1348x944 vs 1326x906 on the after captures) -- unify | **ASSIGNED** (UI polish agent: shell scale multiplier, live Ctrl+wheel / keys, persisted; all five on one fixed shell size; the Settings row for it follows once the music agent's rows land) | pending build
+2026-09-08 | HUD/controls/settings | AUTHORED (music agent): now-playing label moved left of the plates (HudMusicLabelGap 4 now horizontal); hold-Tab point mode (Tab was unbound; SetIgnoreLookInput + FInputModeGameAndUI with SetHideCursorDuringCapture(false); ends on key-up, focus loss, or any overlay claiming input; logs `VoxelInput: point mode ON/OFF`); Settings rows Hide Music UI / Hide Compass UI ([VoxelGraphics] HideMusicUI/HideCompassUI, default false, live via bound visibility, hidden wins over hold-Tab, hotkeys untouched) | **PENDING BUILD**; unverified: triangle glyph rendering, long-name clipping, label gap 4 vs plate gap 6 | SVoxelGameHud.cpp, VoxelScreensUISubsystem.*, VoxelGraphicsUserSettings.*, SVoxelSettingsPanel.cpp, VoxelUIStrings.*, VoxelUITheme.h
+2026-09-08 | UI/map | OWNER DIRECTIVE: map screen -- live player marker; zoom in/out; right-click-drag pans; right-click dropdown to place, name and SAVE a marker for future reference; default view centred on the player at 10 km x 10 km, not the whole world | **ASSIGNED** (new Opus agent; SVoxelMapScreen.*, map data feed, a persisted marker store) | pending
+2026-09-08 | controls | OWNER: "spacebar ... appears to be pausing, starting or skipping music" -> "i was wrong about spacebar" | **BUG FOUND + FIXED IN SOURCE**: a clicked transport SButton kept Slate focus and SButton::OnKeyDown fires on SpaceBar (the pawn's ascend key), log burst `PREV ->` 27->22 at 04:09:47-04:10:06; fix: `.IsFocusable(false)` on the three plates, focus term dropped from IsMusicButtonLit, `SetAllUserFocusToGameViewport()` at EndPointMode. Space stays ascend; music keys stay , . / | pending build
+2026-09-08 | audio | OWNER VERDICT: "music is confirmed playing in world" | **ACCEPTED** (music continues through hand-off; MusicInGame default true) | live session
+2026-09-08 | UI | AUTHORED (shell agent): inventory discrepancy CAUSED by ShrinkWrap (only the inventory had no size override; faithful port of its mock's width:max-content) -> shell now unconditionally 1060x760 with the body in an SScaleBox ScaleToFit DownOnly (cannot enlarge the other four); runtime resize as a render transform about the frame centre, [VoxelGraphics] ScreenShellScale 0.75-1.50 @0.05 default 1.00, Ctrl+wheel / Ctrl+plus/minus / Ctrl+0, MENU SIZE slider row under INTERFACE; two more 1-unit rings promoted (kBodyRing1/2Px, kLeatherBorderPx) | **PENDING BUILD**; caveat: Ctrl+wheel over an inner scroll list is eaten by the list, keys always work | SVoxelScreenShell.*, VoxelScreenShellSettings.* (new), SVoxelSettingsPanel.*, VoxelUIStrings.*, SVoxelMenuButton.cpp
+2026-09-08 | water, live | OWNER VERDICT on the foam arm (FoamBreakupGain 1, ShallowFoamGain 1 @0.6 m, DisturbanceFoamEmissive 1.0): "i can see the shore foam effects and it looks pretty good" | **ACCEPTED** (first shore foam ever accepted). Owner's new diagnosis: "our water in general at the SLW level is too transparent (especially when it is only 1-4 voxels deep) such that its hard to even tell there is water ... i think i am in the carribean"; the foam reads light grey only because the surface under it is clear. Owner asked for PROPOSALS. Screenshot: C:/Users/Matt Noles/Pictures/Screenshots/Screenshot 2026-09-08 001606.png | live session
+2026-09-08 | loading | CORRECTION (load agent, from the engine's own timer semantics): `renderWaitMs` on the Hitch line is GRenderThreadWaitTime = the render thread's IDLE time, and on all five big hitches it equals the whole frame -- the render thread had nothing to do because the GAME THREAD was busy. My earlier 'the big waits are render-thread' reading was wrong. Frame 851 (6.47 s): two synchronous fine-tile loads (~1.0 s, `read 190/288 ms` + decode 270/274) plus ~5.1 s UNLOGGED; leading suspect the fine-tile RW lock: `req calls=23870 lockFree=0 shared=0 excl=23870` in 10.7 s with the wait meter off. Settles with `-VoxelFineLockMeter=2` on one leg | **the next relaunch carries -VoxelFineTileAsync=1 -VoxelFineTileRingRadius=1 -VoxelFineLockMeter=2** | authored: BrickPool arenas timed + pre-warmed under the menu (quad pool cannot be, ChunkOwner is null while held -- instrumented instead); FVoxelQuadVertexFactory PSO precache added (never precached before); voxel.Stream.AtlasFillMs 2.0->0.5 for the theatre (the sweep deadline, not the 256 demand cap, which was 9 ms of 2016); the R5/R7 entry scan has NO bound and none was invented
+2026-09-08 | water, live | OWNER VERDICT, boat under way on the foam arm: "good progress ... no longer terrible grey looking sheet. i can clearly see wake waves forming around the boat. the surface foam is also present. however, both of these look bad and need significant tuning": (1) wake waves "should be much smaller and finer. fine ripples in high quantity"; (2) surface foam "way too prevalent and spreads out in a circle everywhere from the boat", should be "only near the wake and pretty small/not very noticable" | **OPEN, tuning**; live cvars for (1): voxel.Boat.WakeGain 3.0, voxel.Water.Ripple.Gain 2.5, voxel.Water.Ripple.HalfLifeSec 5.0; launch scalars for (2): DisturbanceFoamThreshold 0.05, DisturbanceFoamGain 6, DisturbanceFoamHeightWeight 1 | screenshot 2026-09-08 (boat, blotchy foam ring, large smooth rings to the horizon)
+2026-09-08 | water | OWNER DIRECTIVE on the transparency proposals: "add the turbidity floor asap ... i accept darkening the voxel bed colors under any water. no more surface reflectance for now. execute 4 as well. so do 1, 2, and 4" -> (1) turbidity/scattering floor in the shallows with a minimum body colour keyed on bathy depth; (2) submerged-bed darkening on the terrain material keyed on water depth; (4) per-channel extinction, red first. NOT (3) reflectance | **ASSIGNED** (Fable water agent) | pending regen + build
+
+## 2026-09-08 (water-look agent): turbidity floor, submerged-bed darkening, per-channel extinction, and the smaller wake -- owner-directed, authored and regenerated
+
+Owner, live session 2026-09-07/08, verbatim: *"our water in general at the SLW
+level is too transparent (especially when it is only 1-4 voxels deep) such
+that its hard to even tell there is water ... i think i am in the carribean"*;
+*"add the turbidity floor asap ... i accept darkening the voxel bed colors
+under any water. no more surface reflectance for now. execute 4 as well. so do
+1, 2, and 4."* And on the wake: *"wake waves should be much smaller and finer.
+fine ripples in high quantity"*; *"surface foam ... way too prevalent and
+spreads out in a circle everywhere from the boat ... should only be near the
+wake and pretty small"*. Also accepted tonight: the first shore foam ever
+(ShallowFoam gain 1 / depth 0.6 + FoamBreakup gain 1 + DisturbanceFoamEmissive
+1.0, *"i can see the shore foam effects and it looks pretty good"*), and the
+swept-splat deposit fix (built and in: *"no more water in the hull"*, *"the
+half metre dome is gone"*).
+
+The mechanism behind "Caribbean", in numbers: a white bed (albedo ~0.9) under
+the shipped optics at 20 cm depth keeps 80% of its RED and 91% of its GREEN
+(absorption 1.118 / 0.458 / 0.291 per metre), and the SLW volume term
+integrates ~nothing over 20 cm of a 0.067/m scatterer. The pixel is the bed,
+faintly tinted, and blue survives best, so the tint is sky-blue. Three levers,
+all authored below; NOT touched: reflectance (owner: "no more surface
+reflectance for now").
+
+### (1) The turbidity floor -- both water generators
+
+    turb    = ShallowTurbidityFloor * (1 - ramp(depth_m, 0, ShallowTurbidityDepthM)) * validity
+    scatter = ScatteringPerMetre * (1 + ShallowScatterBoost * turb)          -> SLW ScatteringCoefficients
+    body    = (ShallowBodyR, G, B) * turb * ShallowBodyEmissive * (1 - foam)  -> added to Emissive (lake: x top-face mask)
+
+The scattering half is the physics (silt and plankton: shallow lake water is
+a strong scatterer); at the defaults a 20 cm column in-scatters 0.20 of the
+green light instead of 0.013. The body half is the "minimum colour even at
+zero depth" and rides EMISSIVE because that is the channel proven to reach
+the pixel on this water (the foam rides it by the same argument). `(1 - foam)`
+is what keeps foam ON TOP: where foam is 1 the body tint is gone and the foam
+white is what shows. In the ocean `depth_eff_m` is 60 m wherever the bathy is
+invalid, so open sea is untouched by construction.
+
+| scalar | default | 0 / off | where |
+|---|---|---|---|
+| `ShallowTurbidityFloor` | 0.7 | 0 = pre-2026-09-08 optics bit for bit | lake + ocean |
+| `ShallowTurbidityDepthM` | 1.5 m | -- | lake + ocean |
+| `ShallowScatterBoost` | 15 | 0 = no scatter boost (body floor still on) | lake + ocean |
+| `ShallowBodyEmissive` | 0.30 | 0 = previous emissive bit for bit | lake + ocean |
+| `ShallowBodyR` / `G` / `B` | 0.05 / 0.22 / 0.20 | -- | lake + ocean |
+
+### (2) Submerged-bed darkening -- terrain materials AND the marcher
+
+`terrain_material_common.build_terrain_base_color` (shared by
+`M_VoxelTerrain` and `M_VoxelClipmap`), right after the wet-shore band and
+OUTSIDE the `VOXEL_SHORE_FX` arm:
+
+    submerged = saturate(depth_m / SubmergedRampM) * validity     dry -> dark within 0.30 m
+    base     *= lerp(1, SubmergedDarken, submerged)               then the floor
+
+| scalar | default | off |
+|---|---|---|
+| `SubmergedDarken` | 0.45 | 1.0 = previous terrain bit for bit |
+| `SubmergedRampM` | 0.30 m | -- |
+
+**The near-field bed is drawn by the ray marcher, not by those materials**
+(`voxel.Terrain.RetireQuads` 1; clipmap inner hole 8 km), so the same factor
+is applied in `ue-project/Shaders/VoxelMarch.usf` at the caustic block's bathy
+sample, to BOTH `BaseColor` (goes to GBufferC, lit by the sun in the deferred
+pass) and `Emissive` (the marcher's ambient term), BEFORE the caustic light is
+added -- constants `VOXEL_MARCH_SUBMERGED_DARKEN 0.45f` /
+`VOXEL_MARCH_SUBMERGED_RAMP_M 0.30f`. **This is a shader edit, compiled at the
+next launch; it needs no `Build.bat`.** Two limits of the no-C++ version,
+both deliberate: (i) the marcher's numbers are `#define`s, not a live dial --
+binding two floats is a C++ change in `VoxelMarchRenderer`'s caustic
+bindings (backlog); (ii) the term rides the caustic bathy sample and is gated
+with it (`VOXEL_MARCH_CAUSTICS` permutation, `MarchCausticField.w > 0`, i.e.
+`voxel.Water.Caustics` > 0, and inside the caustic fade distance) -- caustics
+OFF turns the marcher's bed darkening off with it. ONE colour authority is
+respected: nothing here is a colour source; it is one multiplicative factor
+of the baked depth, with the same two numbers on every path. Change both or
+neither.
+
+### (4) Per-channel extinction -- both water generators + M_Underwater
+
+`water_optics.ABSORPTION_CHANNEL_SCALE = (2.0, 1.0, 1.5)`, applied inside
+`absorption_per_m()` (so `M_Underwater` stays on the same water) and baked as
+three scalars multiplied into the per-cm absorption in both water materials:
+
+| channel | absorption/m before | scale | after | 20 cm transmittance before -> after |
+|---|---|---|---|---|
+| R | 1.118 | `WaterAbsorbScaleR` 2.0 | 2.236 | 0.80 -> 0.64 |
+| G | 0.458 | `WaterAbsorbScaleG` 1.0 | 0.458 | 0.91 -> 0.91 |
+| B | 0.291 | `WaterAbsorbScaleB` 1.5 | 0.437 | 0.94 -> 0.92 |
+
+Red goes first; green and blue are now near-equal absorbers, so the survivor
+is cyan rather than sky-blue, and the shallows drift green-cyan with the
+scattering (G 0.067 vs B 0.120) setting the body hue. 1/1/1 is the previous
+water bit for bit. `water_caustics_graph` derives its own attenuation from
+`ABSORPTION_COLOR` and does not see the scale -- a minor, known divergence
+(backlog).
+
+### The wake's foam, new defaults (`ripple_field_graph.DISTURBANCE_FOAM_DEFAULTS`)
+
+| scalar | was | now |
+|---|---|---|
+| `DisturbanceFoamThreshold` | 0.05 | **0.2** |
+| `DisturbanceFoamGain` | 6 | **3** |
+| `DisturbanceFoamHeightWeight` | 1 | **0** (gradient only) |
+
+So foam needs `|grad| * RippleFieldGain > 0.2` to start and 0.53 to be full
+white -- crests only. The wave-size levers are live cvars with the owner
+(`voxel.Boat.WakeGain`, `voxel.Water.Ripple.Gain`, `HalfLifeSec`,
+`voxel.Boat.WakeWidthScale`).
+
+### The ladder (launch-time, lake sheet only, every pair echoes `Lake sheets: material scalar '<Name>' set to`)
+
+Baseline = the regenerated defaults (no switch). Move ONE thing per arm:
+
+    -VoxelWaterMatScalar=ShallowTurbidityFloor:0            (1) off  -- the control for the whole floor
+    -VoxelWaterMatScalar=ShallowTurbidityFloor:1
+    -VoxelWaterMatScalar=ShallowScatterBoost:5
+    -VoxelWaterMatScalar=ShallowScatterBoost:30
+    -VoxelWaterMatScalar=ShallowTurbidityDepthM:0.6
+    -VoxelWaterMatScalar=ShallowTurbidityDepthM:3
+    -VoxelWaterMatScalar=ShallowBodyEmissive:0               body floor off (scatter boost stays)
+    -VoxelWaterMatScalar=ShallowBodyEmissive:0.6
+    -VoxelWaterMatScalar=ShallowBodyR:0.02,ShallowBodyG:0.18,ShallowBodyB:0.26   bluer body
+    -VoxelWaterMatScalar=ShallowBodyR:0.08,ShallowBodyG:0.26,ShallowBodyB:0.14   greener body
+    -VoxelWaterMatScalar=WaterAbsorbScaleR:1,WaterAbsorbScaleG:1,WaterAbsorbScaleB:1   (4) off
+    -VoxelWaterMatScalar=WaterAbsorbScaleR:3
+    -VoxelWaterMatScalar=WaterAbsorbScaleB:2                 pushes the survivor toward green
+    -VoxelWaterMatScalar=DisturbanceFoamThreshold:0.35       wake foam: crests only, tighter
+    -VoxelWaterMatScalar=DisturbanceFoamThreshold:0.1,DisturbanceFoamGain:4   wake foam: wider
+
+(2) has no launch-time switch: `SubmergedDarken` / `SubmergedRampM` are
+scalars on `M_VoxelTerrain` / `M_VoxelClipmap` (Material Instance in the
+editor, or edit the default in `terrain_material_common.py` and regenerate
+both), and the marcher's copy is the two `#define`s in `VoxelMarch.usf`. The
+marcher's is the one the owner will see at the lake; keep the three in step.
+
+### Regen list (separate invocations; verified by byte-searching each .uasset for a new scalar name)
+
+| generator | asset | proves |
+|---|---|---|
+| `create_water_voxel_material.py` | `M_WaterVoxel.uasset` | `ShallowTurbidityFloor`, `WaterAbsorbScaleR`, `ShallowBodyEmissive` |
+| `create_ocean_material.py` | `M_Ocean.uasset` | same three |
+| `create_voxel_material.py` | `M_VoxelTerrain.uasset` | `SubmergedDarken` |
+| `create_clipmap_material.py` | `M_VoxelClipmap.uasset` | `SubmergedDarken` |
+| `create_underwater_material.py` | `M_Underwater.uasset` | (constants only: `absorption_per_m()` changed; no new name -- verified by the regen log and mtime) |
+| -- | `VoxelMarch.usf` | compiles at the next launch |
+
+Results of the regens are appended below as they land.
+2026-09-08 | UI/map | AUTHORED (map agent): SVoxelMapSheet with one transform (ViewCentreUU, UUPerPixel); default view player-centred at 10 km on the short side; wheel zoom about cursor (+/- keys; Ctrl+wheel left to the shell dial); right-drag pan with a 4 px threshold; right-click menu Mark/Rename/Remove with inline name field; marks persisted to Saved/VoxelWorlds/<seed>.vxmarks.json (write-through, tolerant loader, 4096/64 caps); geometry player arrow that leaves the frame rather than clamping. TWO DEFECTS FOUND: (a) the map has drawn a DIFFERENT PLANET since 2026-08-01 -- RasterPathForSeed resolved world-maps/seed<N> (provider 71e2b362) while DefaultGame.ini points the engine at 80b9ca451a23eae4-seed<N>; now resolved by provider from the coarse tile dir, no seed fallback; (b) the hillshade raster is SOUTH-UP (heightmap.py origin=upper, no Y negation; r=0.82 vs -0.29 against decoded tile-row elevations) -- the sheet now flips V. Extent measured from the .vxtl set (-245.76..+15.36 km). Build.cs gains Json | **BUILDING**; open: +/- need focus (first click), zoom floor 500 m is ~4 source px of a 120 m/px raster, CoarseTileDir() duplicates the subsystem's resolution | SVoxelMapScreen.*, VoxelMapMarks.* (new), VoxelScreenData.h, VoxelScreensUISubsystem.*, VoxelUITheme.h, VoxelUIStrings.*, VoxelEarthUI.Build.cs
+2026-09-08 | water | OWNER DIRECTIVE: "i want our river and lake water + surface effects and ripples to all look as close to possible as Elder Scrolls Oblivion IV Remastered. Do open source internet research and see if there is anything worth learning or calibrating our own config values after" | **ASSIGNED** (Fable research agent, read-only; deliverable docs/water-oblivion-remastered-reference-2026-09-08.md with a calibration table onto our scalars) | pending
+2026-09-08 | audio | OWNER DIRECTIVE: research Oblivion/Skyrim exploration music -- 20-30 ambient/environment tracks (no epic, no vocals, no hero moments), and the distinction between the released OST and the larger in-game explore pool; map onto our 30-track library with a tagging scheme | **ASSIGNED** (Opus research agent, read-only; deliverable docs/music-exploration-reference-2026-09-08.md) | pending

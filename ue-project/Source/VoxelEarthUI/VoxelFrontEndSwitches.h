@@ -240,6 +240,31 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// unbounded wait has an engine-side answer.
 	bool bLoadingScreenThread = false;
 
+	// -VoxelMenuPrewarm=0|1 (DEFAULT 1). Commit the big GPU allocations while
+	// the title screen is up instead of inside the first streaming frames of a
+	// load.
+	//
+	// THE TITLE SCREEN IS A STATIC 2D IMAGE OVER A HELD WORLD, so a render-
+	// thread commit there is invisible; the same commit during the load is a
+	// frozen hourglass. The call is
+	// UVoxelWorldSubsystem::PrewarmGpuPools() and it ENQUEUES -- it never
+	// flushes the render thread, because a flush here would trade a hitch in
+	// the load for a hitch in the menu and is the same shape of call the
+	// 2026-09-07 curtain deadlock came out of.
+	//
+	// ONLY REACHABLE ON AN ATTENDED RUN, and not by a check of its own: the
+	// call site is EnterMenu, which VoxelFrontEnd::IsEnabledThisRun() already
+	// gates. Every headless/-unattended leg logs `VoxelFrontEnd: suppressed`
+	// and never builds a menu, so it never pre-warms and its numbers stay
+	// comparable with every leg taken before this switch existed. Passing
+	// -VoxelMenuPrewarm=1 on such a run does NOT force it on; the menu is
+	// still what carries the call, which is deliberate -- pre-warming without
+	// a menu to hide it behind would just move the stall.
+	//
+	// =0 IS THE CONTROL ARM and the reason this is a switch at all: an A/B on
+	// the loading screen needs both halves from one binary.
+	bool bMenuPrewarm = true;
+
 	// ---- THE ARTIFICIAL LOAD DURATION (owner directive, 2026-09-05) --------
 	//
 	// On entering the loading screen the front end rolls a uniform random

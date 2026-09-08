@@ -100,6 +100,11 @@ VOXELEARTHUI_API FText SettingsFullscreenHint();
 VOXELEARTHUI_API FText SettingsSectionInterface();
 VOXELEARTHUI_API FText SettingsUIScaleLabel();
 VOXELEARTHUI_API FText SettingsUIScaleHint();
+// MENU SIZE -- the five in-game screens' own dial, separate from INTERFACE
+// SIZE above: that one scales the whole application, this one scales the
+// unified screen shell and nothing else. See VoxelScreenShellSettings.h.
+VOXELEARTHUI_API FText SettingsMenuSizeLabel();
+VOXELEARTHUI_API FText SettingsMenuSizeHint();
 // "125%" -- the INTERFACE SIZE readout. Its own function because the slider
 // readouts elsewhere on the panel are bare numbers and this one is not.
 VOXELEARTHUI_API FText SettingsPercent(int32 Percent);
@@ -237,12 +242,35 @@ VOXELEARTHUI_API FText MapLabelAltitude();
 VOXELEARTHUI_API FText MapLabelChunk();
 VOXELEARTHUI_API FText MapLabelHeading();
 VOXELEARTHUI_API FText MapLabelSeed();
-// The action-bar line that says the sheet is a fixed overview rather than the
-// mock's pannable 4200 px map. Shown only when no raster loaded.
+// The action-bar line shown when no raster loaded: the sheet is blank because
+// none exists for this seed, not because the map failed.
 VOXELEARTHUI_API FText MapNoRaster();
-// Shown when the raster IS drawn: it is a fixed world overview, and the
-// player's own position is the readout beside it rather than a pin on it.
+// Shown when the raster IS drawn. Was "a fixed world overview"; since
+// 2026-09-08 the sheet pans and zooms and carries the player's own marker, so
+// the line names the gesture that is least discoverable instead.
 VOXELEARTHUI_API FText MapOverviewNote();
+
+// --- Live map: action hints, context menu, name field (2026-09-08) ----------
+// TWO CAPS, and the keyboard alternative rides in the label rather than taking
+// a cap of its own -- the action bar is one row in a 1060-unit shell.
+VOXELEARTHUI_API FText MapActionZoom();     // WHEEL -> "zoom  -  or +/-"
+VOXELEARTHUI_API FText MapActionPan();      // RMB   -> "drag to pan  -  click to mark"
+VOXELEARTHUI_API FText MapKeyWheel();       // the "WHEEL" cap
+VOXELEARTHUI_API FText MapKeyRightDrag();   // the "RMB" cap
+// The right-click menu over empty sheet, and over an existing mark.
+VOXELEARTHUI_API FText MapCtxPlaceTitle();
+VOXELEARTHUI_API FText MapCtxMarkHere();
+VOXELEARTHUI_API FText MapCtxRename();
+VOXELEARTHUI_API FText MapCtxRemove();
+VOXELEARTHUI_API FText MapCtxCancel();
+// The inline name field: its title, its hint, and the two keys that end it.
+VOXELEARTHUI_API FText MapNameTitle();
+VOXELEARTHUI_API FText MapNameHint();
+VOXELEARTHUI_API FText MapNameKeys();
+// What a mark is called when the player confirms an empty field.
+VOXELEARTHUI_API FText MapMarkDefaultName();
+// The zoom readout under the compass: "2.4 km across" / "780 m across".
+VOXELEARTHUI_API FText MapScaleValue(double MetresAcross);
 VOXELEARTHUI_API FText MapPositionValue(const FVector& World);
 VOXELEARTHUI_API FText MapGeoValue(double LatitudeDeg, double LongitudeDeg);
 VOXELEARTHUI_API FText MapChunkValue(const FIntVector& Chunk);
@@ -330,4 +358,24 @@ VOXELEARTHUI_API FText DlgActionSelect();
 // -VoxelDemoVitals and never in play. The mock's own line, verbatim.
 VOXELEARTHUI_API FText HudDemoInteract();
 VOXELEARTHUI_API FText HudDemoInteractKey();
+
+// The music cluster's three tooltips, and the key each is also bound to.
+//
+// THE KEY IS IN THE TOOLTIP ON PURPOSE. The cluster is only clickable while a
+// cursor is up, and the cursor is only up over a menu -- so the moment a player
+// can read the tooltip is precisely the moment they most need to be told which
+// key does the same thing while they are playing. See UVoxelScreensUISubsystem
+// for the bindings these name; the two must be changed together.
+VOXELEARTHUI_API FText HudMusicPrevTip();
+VOXELEARTHUI_API FText HudMusicPlayTip();
+VOXELEARTHUI_API FText HudMusicPauseTip();
+VOXELEARTHUI_API FText HudMusicNextTip();
+
+// The two INTERFACE rows that hide HUD furniture. Owner directive, 2026-09-08.
+// Each hint says the thing a player would otherwise have to discover: hiding the
+// transport does not stop the music, and the compass row takes only the compass.
+VOXELEARTHUI_API FText SettingsHideMusicUILabel();
+VOXELEARTHUI_API FText SettingsHideMusicUIHint();
+VOXELEARTHUI_API FText SettingsHideCompassUILabel();
+VOXELEARTHUI_API FText SettingsHideCompassUIHint();
 } // namespace VoxelUIStrings

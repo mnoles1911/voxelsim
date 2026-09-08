@@ -66,6 +66,12 @@ public class VoxelEarthUI : ModuleRules
 			// manager -- see that file for why. FImageUtils loads this module
 			// dynamically; naming it here keeps the dependency list honest
 			// about what the module actually uses.
+			// FJsonObject / FJsonSerializer, for the map's saved marks
+			// (VoxelMapMarks.cpp -> Saved/VoxelWorlds/<seed>.vxmarks.json).
+			// PRIVATE, and it has to be named here rather than inherited:
+			// VoxelEarth uses Json for meta.json but lists it PRIVATELY too, so
+			// nothing propagates to this module.
+			"Json",
 			"ImageWrapper",
 			// ---- The threaded loading curtain, 2026-09-07 (Phase 4) --------
 			// GetMoviePlayer()/FLoadingScreenAttributes, used in WIDGET-ONLY

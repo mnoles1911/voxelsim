@@ -177,6 +177,11 @@ inline const FColor MapSheetPaper  = FColor(0xdd, 0xc4, 0x8c); // .sheet-paper 4
 // Marks are drawn in iron-gall ink on the sheet, not in the UI palette's golds.
 inline const FColor MapMarkInk     = FColor(0x7a, 0x2a, 0x12);
 inline const FColor MapMarkCaption = FColor(0x5a, 0x2a, 0x12);
+// The live you-are-here glyph (2026-09-08, owner directive). `.you::before` is
+// `background:var(--hp-bright)` inside `border:2px solid #1a0a05` under a
+// `0 0 0 3px rgba(240,193,75,0.5)` gold halo. HpBright and Gold are already
+// named above; the near-black rim is the one literal the mock introduces here.
+inline const FColor MapYouEdge     = FColor(0x1a, 0x0a, 0x05);
 
 // The journal page's ink accents, all on parchment rather than on leather.
 inline const FColor PageKind       = FColor(0xa0, 0x4a, 0x14); // .p-kind, .p-steps li.now
@@ -455,8 +460,21 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	//
 	// If a 1.0-era capture shows the K crowding the frame, the fix is a right
 	// padding on the logo's own text block, not a bigger inset on everything.
-	float LogoRight            = 48.f;
-	int32 LogoFontSize         = 132;
+	// SECOND LIVE PASS, 2026-09-08 (owner): "the voxelmark title needs to move further to
+	// the left because the end of the K letter at the end is currently clipping off
+	// screen" -- Macondo's swash K overhangs its advance by ~0.42 em, 47 px at 112 px, so
+	// a 48 inset put the ink past the edge; 96 keeps the INK about 49 from the edge, in
+	// line with the accepted spacing. And "patch notes can be moved up and to the left
+	// more": CalloutTop 40 -> 24, CalloutLeft 32 -> 16.
+	float LogoRight            = 96.f;
+	// SIZES REDUCED BY OWNER DIRECTION, 2026-09-07 night, live at 1440p, after the corner
+	// insets were accepted ("spacing looks good"): "the Voxelmark title text and the patch
+	// notes ... are both too large ... overall smaller by 25% for the patch note highlights
+	// in the top left and 15% for the game title in top right." Title 132 -> 112. Callout
+	// 520/14/16/64/22 and faces 16/22/16 -> 390/10/12/48/16 and 12/16/12, i.e. every
+	// dimension x0.75 (rounded down where it lands on a half, since he asked for tighter
+	// and compact, not merely scaled). Authored 1080p figures per ADR-0011.
+	int32 LogoFontSize         = 112;
 	// letter-spacing in the mock is px; FSlateFontInfo::LetterSpacing is
 	// 1/1000 em. 6 px at 132 px = 45. (The earlier note that Slate "has no
 	// tracking" predates UE5's LetterSpacing and is retired by this field.)
@@ -473,18 +491,18 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float TitleMenuItemMinWidth = 380.f;
 	float TitleMenuQuitGap     = 52.f;  // .title-menu__item.quit margin-top
 	// .callout-news
-	float CalloutTop           = 40.f;
-	float CalloutLeft          = 32.f;
-	float CalloutMaxWidth      = 520.f;
-	float CalloutPadX          = 14.f;
-	float CalloutGap           = 16.f;
-	float CalloutGlyphSize     = 64.f;
+	float CalloutTop           = 24.f;
+	float CalloutLeft          = 16.f;
+	float CalloutMaxWidth      = 390.f;
+	float CalloutPadX          = 10.f;
+	float CalloutGap           = 12.f;
+	float CalloutGlyphSize     = 48.f;
 	// The ornament inside the glyph box: a gold square turned 45 degrees,
 	// standing in for the mock's U+2726 star (no shipped face carries it).
-	float CalloutOrnamentSize  = 22.f;
-	int32 CalloutTagSize       = 16;
-	int32 CalloutTitleSize     = 22;
-	int32 CalloutCopySize      = 16;
+	float CalloutOrnamentSize  = 16.f;
+	int32 CalloutTagSize       = 12;
+	int32 CalloutTitleSize     = 16;
+	int32 CalloutCopySize      = 12;
 
 	// --- Sub-panels (load / help / credits) ---------------------------------
 	// All three share geometry: offsets (-360,-280)-(360,280).
@@ -833,16 +851,74 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	// --- Map ----------------------------------------------------------------
 	float MapCompassSize       = 72.f;
 	float MapCompassInset      = 26.f;
-	// The mock's sheet is 4200x2800 and pans under a frame. The port draws the
-	// hillshade raster letterboxed into the frame at a fixed scale instead --
-	// see SVoxelMapScreen for why panning a 4200 px sheet is not what this
-	// screen can honestly offer yet.
+	// SUPERSEDED 2026-09-08: this used to read "the port draws the hillshade
+	// letterboxed at a fixed scale, see SVoxelMapScreen for why panning is not
+	// what this screen can honestly offer yet." It pans and zooms now; the
+	// tokens for that are in the block below.
 	float MapMarkIconSize      = 26.f;
 	int32 MapMarkCaptionSize   = 19;
 	float MapDrawerWidth       = 250.f;
 	int32 MapDrawerRowSize     = 18;
 	int32 MapReadoutSize       = 18;
 	int32 MapReadoutLabelSize  = 13;
+
+	// --- Live map: player marker, marks, pan/zoom, context menu -------------
+	// 2026-09-08, owner directive: the sheet pans, zooms, carries a live player
+	// marker and takes named marks. The paragraph above is now historical --
+	// what the port draws IS a pannable map, and the mock's interaction is
+	// ported rather than declined.
+	//
+	// EVERY FIGURE HERE IS AN AUTHORED 1080p PIXEL, ADR-0011. The world-space
+	// constants the transform needs (the raster's extent, the default 10 km
+	// view, the zoom bounds) are NOT design tokens and are not here -- they are
+	// facts about the terrain and live in SVoxelMapScreen.cpp beside the
+	// arithmetic that uses them.
+
+	// `.you` is 16x16 with a 3 px halo ring outside it. The port draws an
+	// ARROW rather than a dot, because the mock's dot cannot show heading and
+	// the readout beside it already states the bearing in degrees.
+	float MapYouSize           = 18.f;
+	float MapYouRing           = 26.f;  // the outer gold halo's diameter
+	// The mark glyph is MapMarkIconSize above. This is how close the cursor has
+	// to come to one to hit it -- generous, because a 26 px diamond on a
+	// zoomed-out sheet is a small target and the cost of a miss is a context
+	// menu offering the wrong thing.
+	float MapMarkHitRadius     = 18.f;
+	// The label sits under the glyph (`.mark{transform:translate(-50%,-100%)}`
+	// puts the glyph's point ON the position and the caption below it).
+	float MapMarkLabelGap      = 2.f;
+
+	// A PRESS-MOVE-RELEASE HAS TO BE DISTINGUISHABLE FROM A CLICK, and 4 px is
+	// the figure Slate itself uses for its drag-detection default. Below it a
+	// right-press is a context menu; at or above it, it is a pan and no menu
+	// opens on release.
+	float MapDragThresholdPx   = 4.f;
+	// One wheel notch. A ratio, not a length -- 1.25 gives ten notches from the
+	// 10 km default out to the whole world and about nine in to the 500 m
+	// floor, which is a hand's worth of scrolling in either direction.
+	float MapZoomStep          = 1.25f;
+
+	// `.mk-dialog` -- the right-click panel. 236 px wide, 12 px padding, 8 px
+	// between rows.
+	float MapCtxWidth          = 236.f;
+	float MapCtxPad            = 12.f;
+	float MapCtxGap            = 8.f;
+	float MapCtxRowHeight      = 26.f;
+	int32 MapCtxTitleSize      = 13;   // .mk-title
+	int32 MapCtxTitleSpacing   = 231;  // letter-spacing:3px at 13 px
+	int32 MapCtxItemSize       = 16;
+	int32 MapCtxLabelSize      = 15;   // .mk-lab
+	int32 MapCtxInputSize      = 19;   // .mk-input
+	float MapCtxInputPadX      = 8.f;  // padding:5px 8px
+	float MapCtxInputPadY      = 5.f;
+	float MapCtxItemPadX       = 8.f;
+	// How far the menu is nudged off the click point so the cursor is not
+	// sitting on its first row the instant it opens.
+	float MapCtxOffset         = 4.f;
+	// The longest name the field will take. Shorter than the marks store's own
+	// 64-character cap on purpose: the store's cap is a corruption guard, this
+	// is what fits under a glyph on the sheet.
+	int32 MapMarkNameMaxLength = 28;
 
 	// --- Journal ------------------------------------------------------------
 	float JournalListWidth     = 300.f; // grid-template-columns:300px 1fr
@@ -985,6 +1061,32 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float HudSlotGlyphInset    = 15.f;
 	int32 HudInteractSize      = 14;
 	float HudInteractKeySize   = 21.f;
+
+	// --- HUD music cluster (owner directive, 2026-09-07) --------------------
+	// AUTHORED 1080p, like everything else in this struct (ADR-0011). The HUD
+	// mock has no top-right element to copy, so the numbers come from the two
+	// corner conventions it does establish: the compass sits 12 px from the top
+	// and the dock 12 px from the bottom, so the cluster takes the same 12 px
+	// inset; and the button plate is the hotbar slot's chrome at half its size.
+	float HudMusicTop          = 12.f;   // == HudCompassTop
+	float HudMusicRight        = 12.f;
+	// 30, inside the brief's 28-32 band. Half the 64 px hotbar slot minus a
+	// rounding, so the two plates read as the same object at two sizes.
+	float HudMusicButtonSize   = 30.f;
+	float HudMusicButtonGap    = 6.f;    // == HudSlotGap
+	// The glyph's inset inside the plate, on HudSlotGlyphInset's pattern
+	// (15 of 64 there, 7 of 30 here -- the same fraction to within a unit).
+	float HudMusicGlyphInset   = 7.f;
+	// HORIZONTAL since 2026-09-08: the owner moved the now-playing name to the
+	// LEFT of the three plates, so this is the gap between the end of the name
+	// and the first plate rather than the gap under the row. Same quantity, same
+	// name, one axis over -- a second token would have been two names for one
+	// distance.
+	float HudMusicLabelGap     = 4.f;
+	// The now-playing line. Narrow enough that a long filename elides rather
+	// than reaching back across the screen into the compass.
+	float HudMusicLabelWidth   = 220.f;
+	int32 HudMusicLabelSize    = 12;     // == HudCompassSegSize, the HUD's small serif
 
 	// --- Timings (seconds) --------------------------------------------------
 	float FadeDuration         = 0.4f;

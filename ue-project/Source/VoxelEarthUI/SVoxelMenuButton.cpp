@@ -29,8 +29,14 @@ FAutoConsoleVariableRef CVarHoverSlide(TEXT("voxel.UI.HoverSlide"),
 
 // The button's 2px border width, from UIStyles.menu_button_styles().
 constexpr float kBorderPx = 2.f;
-// The overlay plates' border is 1 px (`border:1px solid var(--leather-edge)`).
-constexpr float kLeatherBorderPx = 1.f;
+// The overlay plates' border, `border:1px solid var(--leather-edge)` in the CSS
+// and TWO units here: ADR-0011 forbids a one-unit band. It is the width of a
+// band in two stacks -- the Leather plate's outer border (every dialog action
+// button, .se-act / .sv-act / .ld-btn / .ld-filter) and the Tab plate's edge
+// ring between kBorderPx and this -- so promoting the constant fixes both, and
+// both grow by one unit per side. Missed by the first ADR-0011 sweep because a
+// named constant summed into an inset does not match a grep for `FMargin(1.f)`.
+constexpr float kLeatherBorderPx = VoxelUITheme::RulePx;
 // .pa-btn::before -- U+203A. MEASURED PRESENT in all four shipped faces
 // (a cmap dump of Content/UI/Fonts, 2026-09-07), unlike the mocks' U+2726 star
 // and U+2205 empty set, which are in none of them and are drawn geometrically

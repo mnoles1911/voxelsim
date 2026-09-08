@@ -108,18 +108,51 @@ struct FVoxelInventoryScreenData
 // --- Map --------------------------------------------------------------------
 
 // One player-placed mark. The mock persists these to localStorage under
-// `voxelmark.map.marks.v1` and the Codex "Places" list reads the same record;
-// the port keeps them in the subsystem for the session only, because this
-// project's save format has no room reserved for them yet.
+// `voxelmark.map.marks.v1` and the Codex "Places" list reads the same record.
+//
+// THESE NOW SURVIVE THE SESSION (2026-09-08, owner directive: "save the place
+// for future reference on the map"). They are written through to
+// Saved/VoxelWorlds/<seed>.vxmarks.json on every add, rename and remove -- see
+// VoxelMapMarks.h for why that file and not the checkpoint system. The
+// subsystem still owns the live array so the map and the Codex's PLACES list
+// cannot disagree; the file is where that array comes from and goes to.
 struct FVoxelMapMark
 {
 	FText Name;
-	// One of the mock's eighteen ICONS keys.
+	// One of the mock's eighteen ICONS keys. NOTHING SETS IT YET: the port
+	// draws one geometry glyph for every mark (Slate has no vector brush and
+	// eighteen hand-built polygons is a different piece of work), so this is
+	// carried through the store unchanged and is what an icon picker would
+	// write into.
 	FName Icon;
 	// World position in Unreal units, not sheet pixels: the mock's sheet
 	// coordinates are meaningless outside its own 4200x2800 image.
 	FVector2D WorldXY = FVector2D::ZeroVector;
 	int32 DayPlaced = 0;
+	// Unix seconds when the player made the mark, or 0 for a record written
+	// before this field existed. WALL TIME, NOT GAME TIME: DayPlaced above is
+	// the in-game day and answers "when in the story"; this answers "which of
+	// my marks is the newest", which is the one a list has to sort by and which
+	// an in-game clock that resets cannot.
+	int64 CreatedUnixTime = 0;
+};
+
+// The two values the map's live player marker reads every frame.
+//
+// A SECOND, TINY STRUCT RATHER THAN RE-GATHERING FVoxelMapScreenData. The
+// screen data is gathered once when the tab opens -- it queries the sky
+// subsystem, the terrain height and the filesystem, none of which belong on a
+// per-frame path. The marker needs two numbers, so two numbers are what the
+// per-frame attribute carries. Same rule as everything else in this file: the
+// widget takes plain data and never a subsystem pointer.
+struct FVoxelMapPose
+{
+	// Unreal units. X is East, Y is North -- the same convention
+	// VoxelUIStrings::MapPositionValue prints.
+	FVector2D WorldXY = FVector2D::ZeroVector;
+	// Yaw in degrees, 0 = +X = East, increasing towards +Y = North, which is
+	// what FRotator::Yaw already is.
+	float YawDeg = 0.f;
 };
 
 struct FVoxelMapScreenData
@@ -142,6 +175,16 @@ struct FVoxelMapScreenData
 	// parchment with the readout and says so in the action bar, rather than
 	// implying a map that is not there.
 	bool bHasTerrainRaster = false;
+	// Absolute path of the hillshade, resolved ONCE when the tab opens (see
+	// SVoxelMapScreen::RasterPathForSeed -- it reads the run's coarse tile
+	// directory, which is not something to do per paint). Empty when this run's
+	// world has no map.
+	FString RasterPath;
+	// The world rectangle the hillshade covers, in Unreal units, and the
+	// rectangle the view clamps itself to whether or not a raster exists. Both
+	// come from SVoxelMapScreen::ResolveExtentUU.
+	FVector2D ExtentMinUU = FVector2D::ZeroVector;
+	FVector2D ExtentMaxUU = FVector2D::ZeroVector;
 };
 
 // --- Journal ----------------------------------------------------------------
@@ -401,6 +444,16 @@ struct FVoxelHudData
 	float HungerFraction = 1.f;
 	FText InteractPrompt;
 	FText InteractKey;
+
+	// Whether the player controller is currently showing a mouse cursor.
+	//
+	// THE ONE THING THE HUD CANNOT WORK OUT FOR ITSELF. Every other field here
+	// is world state; this is input state, and the HUD is a Slate widget with no
+	// route to a player controller. It exists because the music cluster is the
+	// only part of the HUD that is ever allowed to take a click, and it may only
+	// do so when there is a pointer to take it with -- a hit-testable button
+	// under a captured mouse would eat a dig. See SVoxelGameHud::BuildMusic.
+	bool bCursorVisible = false;
 };
 
 // --- Death ------------------------------------------------------------------

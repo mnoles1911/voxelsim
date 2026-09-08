@@ -1,6 +1,7 @@
 #include "SVoxelScreenShell.h"
 
 #include "SVoxelMenuButton.h"
+#include "VoxelScreenShellSettings.h"
 #include "VoxelUIStrings.h"
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
@@ -8,6 +9,7 @@
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SScaleBox.h" // the body's down-only fit -- see Construct
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SNullWidget.h"
 #include "Widgets/SOverlay.h"
@@ -47,9 +49,14 @@ int32 IndexOf(EVoxelScreenTab Tab)
 // --panel-oak-edge`. Four rings and a fill, which is five nested SOverlay slots
 // -- the same stacking idiom VoxelOverlayChrome::Panel uses for the leather
 // dialogs, at a different thickness.
+// ADR-0011: no band may be one unit. The CSS's rings are 1 / 1 / 2 measured
+// from the border inward, so the first two were exactly the hairlines the ADR
+// forbids -- and they did not show up in a grep for `FMargin(1.f)` because they
+// are named constants summed into the insets below. Two each; .menu-body's
+// chrome grows by two units per side in total.
 constexpr float kBodyBorderPx = 2.f;
-constexpr float kBodyRing1Px = 1.f;
-constexpr float kBodyRing2Px = 1.f;
+constexpr float kBodyRing1Px = VoxelUITheme::RulePx;
+constexpr float kBodyRing2Px = VoxelUITheme::RulePx;
 constexpr float kBodyRing3Px = 2.f;
 const FColor kBodyInnerDark(0x0a, 0x08, 0x05);
 } // namespace SVoxelScreenShellDetail
@@ -151,7 +158,32 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 		]
 		+ SOverlay::Slot().Padding(FMargin(L.ScreenBodyPad))
 		[
-			InArgs._Body.Widget
+			// THE BODY FITS THE FRAME; THE FRAME NO LONGER FITS THE BODY.
+			//
+			// This is the other half of unifying the five shell sizes. The
+			// inventory's 8x8 pack plus its hotbar, filter row and head is a
+			// little taller and wider than the authored 1060x760 leaves for a
+			// body -- 16 x 28 units over, measured on the 2026-09-07 captures.
+			// The old answer was to let the frame grow (see ShrinkWrap in the
+			// header); the owner's answer is one size for all five.
+			//
+			// ScaleToFit + DownOnly is what makes that safe rather than a
+			// clipping bet. A body that fits is untouched -- DownOnly can only
+			// ever return a factor of 1 for the four screens that already fit,
+			// so this changes nothing about them. A body that does not fit is
+			// drawn uniformly smaller instead of losing a pack row off the
+			// bottom, which is the failure the earlier fixed-size draft was
+			// abandoned over. No reflow either: the content keeps its authored
+			// layout and is scaled, so the inventory looks like itself, only
+			// fractionally smaller than the other four.
+			SNew(SScaleBox)
+			.Stretch(EStretch::ScaleToFit)
+			.StretchDirection(EStretchDirection::DownOnly)
+			.HAlign(HAlign_Fill)
+			.VAlign(VAlign_Fill)
+			[
+				InArgs._Body.Widget
+			]
 		];
 
 	// .menu-body::before -- a bronze stud inset 8 px at each corner. Four small
@@ -195,25 +227,31 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 		];
 	}
 
-	// SHRINK-WRAP MEANS NO OVERRIDE AT ALL, which is what `width:max-content`
-	// on the inventory mock's .menu-shell actually says. An earlier draft gave
-	// it a second FIXED size and that was wrong by arithmetic: the 8x8 pack is
-	// 8 x 58 px of slot plus its gaps, well padding and borders -- about 570 px
-	// of body before the tab bar and action bar are added -- so any height that
-	// also fitted the other four screens would have clipped a row off the pack.
-	// Sizing to content cannot clip, and the centring box above keeps it on
-	// screen.
+	// ONE SIZE, ALWAYS, AND InArgs._ShrinkWrap IS IGNORED. Owner directive,
+	// 2026-09-07: *"it currently appears that the inventory UI menu size is
+	// slightly larger than the default sizing for map, journal, player, and
+	// codex sections. unify this."* The flag used to drop these two overrides
+	// for the inventory alone. See the header for the measurement and for why
+	// the argument still exists.
+	//
+	// The earlier draft's objection -- that a fixed height would clip a pack row
+	// -- is answered on the CONTENT side now, by the down-only fit around the
+	// body above. Nothing here can clip.
 	TSharedRef<SBox> Frame =
 		SNew(SBox)
+		.WidthOverride(L.ScreenShellWidth)
+		.HeightOverride(L.ScreenShellHeight)
 		.Padding(FMargin(L.ScreenShellPadX, L.ScreenShellPadTop, L.ScreenShellPadX, L.ScreenShellPadBottom))
+		// THE PLAYER'S MENU SIZE DIAL. A render transform about the frame's
+		// centre, read fresh every paint, so the Settings row and Ctrl+wheel
+		// are the same control and neither has to tell the other. The pivot is
+		// the frame's own centre, so the shell grows and shrinks in place
+		// inside the centring box below rather than walking off one corner.
+		.RenderTransform(this, &SVoxelScreenShell::GetShellRenderTransform)
+		.RenderTransformPivot(FVector2D(0.5f, 0.5f))
 		[
 			Column
 		];
-	if (!InArgs._ShrinkWrap)
-	{
-		Frame->SetWidthOverride(L.ScreenShellWidth);
-		Frame->SetHeightOverride(L.ScreenShellHeight);
-	}
 
 	ChildSlot
 	[
@@ -362,9 +400,79 @@ void SVoxelScreenShell::FocusDefaultWidget()
 	}
 }
 
+TOptional<FSlateRenderTransform> SVoxelScreenShell::GetShellRenderTransform() const
+{
+	const float Scale = VoxelScreenShellSettings::GetScale();
+	if (FMath::IsNearlyEqual(Scale, 1.f, UE_KINDA_SMALL_NUMBER))
+	{
+		// UNSET AT 1.00, not an identity transform. A widget with no render
+		// transform takes Slate's plain path; one with an identity transform
+		// still allocates a transform, still fails the renderer's is-identity
+		// fast paths, and -- the part that matters here -- would make the
+		// default case behave differently from the codebase's other widgets for
+		// no visible gain. At the shipped default this widget is exactly what
+		// it was before the dial existed.
+		return TOptional<FSlateRenderTransform>();
+	}
+	return FSlateRenderTransform(FScale2D(Scale, Scale));
+}
+
+FReply SVoxelScreenShell::OnMouseWheel(const FGeometry& Geometry, const FPointerEvent& MouseEvent)
+{
+	// CTRL AND ONLY CTRL. A bare wheel has to keep scrolling the codex list, the
+	// journal entries and the perk detail; the modifier is what makes a resize
+	// gesture and a scroll gesture distinguishable over the same pixels.
+	if (!MouseEvent.IsControlDown())
+	{
+		return SCompoundWidget::OnMouseWheel(Geometry, MouseEvent);
+	}
+
+	const float Delta = MouseEvent.GetWheelDelta();
+	if (FMath::IsNearlyZero(Delta))
+	{
+		return FReply::Unhandled();
+	}
+	// One notch, one stop, whatever the platform reports as a notch's magnitude
+	// -- the sign is the only part of GetWheelDelta this trusts. Stepping by the
+	// raw delta would give a different size per mouse.
+	VoxelScreenShellSettings::StepScale(Delta > 0.f ? +1 : -1);
+	return FReply::Handled();
+}
+
 FReply SVoxelScreenShell::OnKeyDown(const FGeometry& Geometry, const FKeyEvent& KeyEvent)
 {
 	const FKey Key = KeyEvent.GetKey();
+
+	// CTRL + PLUS / MINUS / ZERO, TESTED FIRST, and first for a reason: the
+	// unmodified letters below are tab switches, and a Ctrl chord that fell
+	// through to them would page the screen instead of resizing it.
+	//
+	// THREE SPELLINGS OF EACH SIGN, because a keyboard has more than one. The
+	// main row's `+` arrives as EKeys::Equals with shift held (Slate reports the
+	// physical key, not the shifted character), `-` as EKeys::Hyphen, and the
+	// numpad has its own pair. A player who finds one and not the other reads
+	// the feature as broken.
+	if (KeyEvent.IsControlDown())
+	{
+		if (Key == EKeys::Equals || Key == EKeys::Add)
+		{
+			VoxelScreenShellSettings::StepScale(+1);
+			return FReply::Handled();
+		}
+		if (Key == EKeys::Hyphen || Key == EKeys::Underscore || Key == EKeys::Subtract)
+		{
+			VoxelScreenShellSettings::StepScale(-1);
+			return FReply::Handled();
+		}
+		if (Key == EKeys::Zero || Key == EKeys::NumPadZero)
+		{
+			// Back to the authored size. Every dial that can be moved by
+			// accident needs a way back that does not require remembering what
+			// it was.
+			VoxelScreenShellSettings::SetScale(VoxelScreenShellSettings::ScaleDefault());
+			return FReply::Handled();
+		}
+	}
 
 	if (Key == EKeys::Escape || Key == EKeys::Virtual_Gamepad_Back.GetVirtualKey())
 	{

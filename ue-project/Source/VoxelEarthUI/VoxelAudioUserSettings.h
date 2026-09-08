@@ -41,6 +41,22 @@ VOXELEARTHUI_API void SetMasterVolume(float Volume);
 VOXELEARTHUI_API float GetMusicVolume();
 VOXELEARTHUI_API void SetMusicVolume(float Volume);
 
+// Whether the soundtrack keeps playing once the player has the world.
+//
+// TRUE BY DEFAULT, AND THAT IS THE OWNER'S DIRECTIVE (2026-09-07, verbatim:
+// "by default, music from the game's soundtrack/library should play when in
+// game"). It is a persisted setting rather than a constant so that the standing
+// settings-panel policy -- every visual or audible trade ships as a
+// player-facing row -- can be satisfied with a row and no code change: the row
+// is the only thing missing, and it reads and writes exactly this pair.
+//
+// A MISSING INI KEY MUST READ AS TRUE, for the same reason a missing volume key
+// reads as 1.0: an installed game plays its music until the player says
+// otherwise, and a fresh machine must not be silently different from the one
+// the feature was written on.
+VOXELEARTHUI_API bool GetMusicInGame();
+VOXELEARTHUI_API void SetMusicInGame(bool bEnabled);
+
 // Push both persisted values at their targets. Idempotent; called from
 // UVoxelFrontEndSubsystem::Initialize alongside VoxelGraphicsUserSettings so a
 // fresh process is at the player's chosen volume before the menu music starts,

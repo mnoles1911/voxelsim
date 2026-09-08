@@ -78,6 +78,47 @@ constexpr int32 kLoadingZOrder = 110;
 // apply-exit census depends on it staying put.
 constexpr float kTheatreApplyBudgetMs = 2.0f;
 const TCHAR* const kApplyBudgetCVarName = TEXT("voxel.Stream.ApplyBudgetMs");
+
+// --- THE SECOND GAME-THREAD BURST: THE RASTER ATLAS SWEEP (2026-09-08) -------
+//
+// The 2026-09-08 live load's largest single game-thread item was not the apply
+// budget. It was
+//
+//   [raster-atlas] window: served=33114 ... fills=1645 (205.62 MiB, 2016.4 ms GT)
+//
+// -- 2,016 ms of game thread inside a 5.00 s window, i.e. ~40% of every frame
+// the hourglass had to paint in. Slate ticks and paints on the game thread, so
+// that is the hourglass stopping.
+//
+// WHICH KNOB THIS IS, BECAUSE THE OBVIOUS ONE IS THE WRONG ONE. The line's own
+// `cap=256/tick` is DemandPagesPerTick, and it bounds only the demand-rescue
+// path -- which on that same window cost 9.4 ms of the 2,016. The other ~2,007
+// ms is the page SWEEP, whose only bound is the per-tick deadline in
+// FVoxelRasterAtlasCpu::Tick, i.e. FillBudgetMs(). So the sweep budget is what
+// the theatre caps. Lowering the demand cap instead is not merely off-target,
+// it is already MEASURED WORSE: VoxelRasterAtlas.cpp records that at 64 it
+// produced capHit=1070/noAtlas=1070 by pushing declined chunks onto the inline
+// full-window path. That lever is spent; this one is not.
+//
+// 2.0 -> 0.5, AND WHAT THAT ACTUALLY DOES. The deadline is tested BEFORE a page
+// and never during, so any value below one page's cost degrades to EXACTLY ONE
+// PAGE PER TICK -- 1.23 ms measured at the fine tier on that load. The load ran
+// ~2.9 pages/tick; the theatre runs one. ~2 ms of game thread per frame goes
+// back to Slate, the unfilled pages stay queued and the sweep collects them on
+// later ticks. Nothing is dropped; the load gets LONGER and smoother, which is
+// the trade the owner asked for in as many words ("Happy to have player sit on
+// loading screen for more than a minute ... However, the loading screen should
+// not feel chunky or hitching").
+//
+// 0.5 RATHER THAN 0. Zero would reach the same one-page floor, but a budget of
+// zero reads like "off" to the next person and this is not off -- the sweep
+// must keep running or the world never warms. 0.5 says "one page" in a unit
+// the cvar's help text explains.
+//
+// RESTORED AT THE REVEAL, exactly as the apply budget is, through the same two
+// callers (the reveal and TeardownMenu as the backstop).
+constexpr float kTheatreAtlasFillMs = 0.5f;
+const TCHAR* const kAtlasFillCVarName = TEXT("voxel.Stream.AtlasFillMs");
 } // namespace VoxelFrontEndDetail
 
 bool UVoxelFrontEndSubsystem::DoesSupportWorldType(const EWorldType::Type WorldType) const
@@ -128,6 +169,14 @@ void UVoxelFrontEndSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// answer is not known until there is a viewport.
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: loading screen thread=%d"),
 	       FVoxelFrontEndSwitches::Get().bLoadingScreenThread ? 1 : 0);
+	// 2026-09-08, printed here for the same reason the curtain thread is: the
+	// LATCHED value beside the other arms, so a log says which arm ran. The
+	// second half -- whether the pre-warm actually reached a world subsystem
+	// and what it committed -- is printed by EnterMenu and by
+	// UVoxelWorldSubsystem::PrewarmGpuPools, because that is not known until
+	// there is a menu.
+	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: menu GPU pool pre-warm=%d"),
+	       FVoxelFrontEndSwitches::Get().bMenuPrewarm ? 1 : 0);
 }
 
 // Out of line, and this is not a formality. ReadyProbe is a
@@ -323,6 +372,45 @@ void UVoxelFrontEndSubsystem::EnterMenu()
 	{
 		FRandomStream MusicStream = MakeVoxelUIRandomStream();
 		FVoxelUIMusic::Get().StartRandom(GetWorld(), MusicStream);
+	}
+
+	// --- PRE-WARM THE GPU POOLS UNDER THE MENU (2026-09-08) -----------------
+	//
+	// AFTER the menu widget is on screen and the scalability drop is applied,
+	// so the commit lands behind a curtain that is already up and already
+	// cheap to draw; and on the Menu path only, which is what keeps it off
+	// every -unattended leg (those never reach EnterMenu at all -- see
+	// VoxelFrontEnd::IsEnabledThisRun above).
+	//
+	// NON-BLOCKING BY CONTRACT. PrewarmGpuPools enqueues render commands and
+	// returns; it must never flush. The whole reason the threaded curtain is
+	// off by default is that a blocking wait on the render thread hung the
+	// owner's session on 2026-09-07 (VoxelLoadingCurtainThread.h), and this is
+	// not the file to re-learn that in.
+	//
+	// The world stays HELD: ChunkOwner is still null after this line, nothing
+	// is admitted, no edit log is read. Only the allocation moves.
+	if (FVoxelFrontEndSwitches::Get().bMenuPrewarm)
+	{
+		if (UVoxelWorldSubsystem* WorldSub = World->GetSubsystem<UVoxelWorldSubsystem>())
+		{
+			WorldSub->PrewarmGpuPools();
+		}
+		else
+		{
+			// The subsystem is how the menu reaches anything at all; if it is
+			// missing the pre-warm is a silent no-op, and a silent no-op is the
+			// house failure mode on this project. Say it.
+			UE_LOG(LogVoxelUI, Warning,
+			       TEXT("VoxelFrontEnd: -VoxelMenuPrewarm is on but there is no UVoxelWorldSubsystem in this ")
+			       TEXT("world; the GPU pools were NOT pre-warmed and the commit stays inside the load."));
+		}
+	}
+	else
+	{
+		UE_LOG(LogVoxelUI, Log,
+		       TEXT("VoxelFrontEnd: GPU pool pre-warm OFF (-VoxelMenuPrewarm=0); the control arm -- the ")
+		       TEXT("brick-pool arenas commit inside the first streaming frames, as they did before."));
 	}
 
 	State = EVoxelFrontEndState::Menu;
@@ -657,29 +745,75 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 
 void UVoxelFrontEndSubsystem::CapStreamingForTheatre()
 {
-	// The rationale, the lever, and the trade all live on the constants -- see
-	// VoxelFrontEndDetail at the top of this file.
-	IConsoleVariable* BudgetVar = IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kApplyBudgetCVarName);
-	if (BudgetVar == nullptr)
+	// TWO INDEPENDENT CAPS, IN TWO INDEPENDENT SCOPES, and that is load-bearing
+	// rather than tidiness: the apply-budget block has two early exits (cvar
+	// missing, already tighter) and if they were `return`s from this function
+	// they would silently skip the atlas cap below. A run with a hand-tuned
+	// -VoxelApplyBudgetMs would then get half the theatre and no line saying so.
 	{
-		// The cvar is owned by VoxelEarth and looked up by NAME, so a rename
-		// there must degrade to "no cap" here, loudly, not to a crash.
-		UE_LOG(LogVoxelUI, Warning, TEXT("LoadScreen: %s not found; loading runs uncapped."),
-		       VoxelFrontEndDetail::kApplyBudgetCVarName);
-		return;
+		// The rationale, the lever, and the trade all live on the constants --
+		// see VoxelFrontEndDetail at the top of this file.
+		IConsoleVariable* BudgetVar =
+			IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kApplyBudgetCVarName);
+		if (BudgetVar == nullptr)
+		{
+			// The cvar is owned by VoxelEarth and looked up by NAME, so a rename
+			// there must degrade to "no cap" here, loudly, not to a crash.
+			UE_LOG(LogVoxelUI, Warning, TEXT("LoadScreen: %s not found; loading runs uncapped."),
+			       VoxelFrontEndDetail::kApplyBudgetCVarName);
+		}
+		else if (BudgetVar->GetFloat() <= VoxelFrontEndDetail::kTheatreApplyBudgetMs)
+		{
+			// Somebody already runs tighter than the theatre cap; capping would
+			// RAISE their budget on restore-order mishaps. Leave it alone.
+		}
+		else
+		{
+			SavedApplyBudgetMs = BudgetVar->GetFloat();
+			bStreamBudgetCapped = true;
+			BudgetVar->Set(VoxelFrontEndDetail::kTheatreApplyBudgetMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: capped %s %.1f -> %.1f for the load theatre."),
+			       VoxelFrontEndDetail::kApplyBudgetCVarName, SavedApplyBudgetMs,
+			       VoxelFrontEndDetail::kTheatreApplyBudgetMs);
+		}
 	}
-	const float Current = BudgetVar->GetFloat();
-	if (Current <= VoxelFrontEndDetail::kTheatreApplyBudgetMs)
+
+	// --- The atlas sweep, same shape, same save/restore ---------------------
+	//
+	// See kTheatreAtlasFillMs for which knob this is and why it is not the
+	// `cap=256/tick` the atlas line prints. -1 is the cvar's "use the latched
+	// -VoxelGpuRasterAtlasFillMs" sentinel, so a run that never entered the
+	// theatre is byte-identical to one built before this change -- and it is
+	// also why the "already tighter" test below tests `>= 0` first: a negative
+	// value is not a tighter budget, it is no budget set at all.
 	{
-		// Somebody already runs tighter than the theatre cap; capping would
-		// RAISE their budget on restore-order mishaps. Leave it alone.
-		return;
+		IConsoleVariable* AtlasVar =
+			IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kAtlasFillCVarName);
+		if (AtlasVar == nullptr)
+		{
+			// Owned by VoxelEarth and looked up by NAME. A rename there must
+			// degrade to "no cap", loudly -- same contract as the apply budget.
+			UE_LOG(LogVoxelUI, Warning, TEXT("LoadScreen: %s not found; the atlas sweep runs uncapped."),
+			       VoxelFrontEndDetail::kAtlasFillCVarName);
+		}
+		else if (AtlasVar->GetFloat() >= 0.f
+		         && AtlasVar->GetFloat() <= VoxelFrontEndDetail::kTheatreAtlasFillMs)
+		{
+			// Already at or under the theatre cap; leave it alone.
+		}
+		else
+		{
+			SavedAtlasFillMs = AtlasVar->GetFloat();
+			bAtlasFillCapped = true;
+			AtlasVar->Set(VoxelFrontEndDetail::kTheatreAtlasFillMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log,
+			       TEXT("LoadScreen: capped %s %.2f -> %.2f for the load theatre (a negative saved value is ")
+			       TEXT("the 'use -VoxelGpuRasterAtlasFillMs' sentinel, not a budget). The sweep now fills ")
+			       TEXT("ONE page per tick; `[raster-atlas] fill` carries the page count that proves it."),
+			       VoxelFrontEndDetail::kAtlasFillCVarName, SavedAtlasFillMs,
+			       VoxelFrontEndDetail::kTheatreAtlasFillMs);
+		}
 	}
-	SavedApplyBudgetMs = Current;
-	bStreamBudgetCapped = true;
-	BudgetVar->Set(VoxelFrontEndDetail::kTheatreApplyBudgetMs, ECVF_SetByCode);
-	UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: capped %s %.1f -> %.1f for the load theatre."),
-	       VoxelFrontEndDetail::kApplyBudgetCVarName, SavedApplyBudgetMs, VoxelFrontEndDetail::kTheatreApplyBudgetMs);
 }
 
 void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
@@ -687,16 +821,36 @@ void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
 	// Idempotent, because it has two callers by design: the reveal (the normal
 	// path) and TeardownMenu (the backstop for a quit or world teardown while
 	// the screen is still up).
-	if (!bStreamBudgetCapped)
+	//
+	// TWO INDEPENDENT FLAGS, no early return between them, for the same reason
+	// CapStreamingForTheatre uses two scopes: either cap may have declined to
+	// engage, and a shared `return` would leave the other one applied for the
+	// rest of the session. A cap that outlives the theatre is worse than one
+	// that never ran.
+	if (bStreamBudgetCapped)
 	{
-		return;
+		bStreamBudgetCapped = false;
+		if (IConsoleVariable* BudgetVar =
+		        IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kApplyBudgetCVarName))
+		{
+			BudgetVar->Set(SavedApplyBudgetMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.1f."),
+			       VoxelFrontEndDetail::kApplyBudgetCVarName, SavedApplyBudgetMs);
+		}
 	}
-	bStreamBudgetCapped = false;
-	if (IConsoleVariable* BudgetVar = IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kApplyBudgetCVarName))
+	if (bAtlasFillCapped)
 	{
-		BudgetVar->Set(SavedApplyBudgetMs, ECVF_SetByCode);
-		UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.1f."),
-		       VoxelFrontEndDetail::kApplyBudgetCVarName, SavedApplyBudgetMs);
+		bAtlasFillCapped = false;
+		if (IConsoleVariable* AtlasVar =
+		        IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kAtlasFillCVarName))
+		{
+			// Put back EXACTLY what was there, sentinel included: restoring -1
+			// hands the budget back to the latched -VoxelGpuRasterAtlasFillMs,
+			// which is what an ordinary run had before the theatre.
+			AtlasVar->Set(SavedAtlasFillMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.2f."),
+			       VoxelFrontEndDetail::kAtlasFillCVarName, SavedAtlasFillMs);
+		}
 	}
 }
 
@@ -859,6 +1013,25 @@ void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 	HandOffSeconds += DeltaSeconds;
 
+	// THE MUSIC NO LONGER LEAVES WITH THE CURTAIN BY DEFAULT (owner directive,
+	// 2026-09-07: "by default, music from the game's soundtrack/library should
+	// play when in game"). What used to be an unconditional fade-and-stop is now
+	// a read of one persisted setting, and the two arms are genuinely different
+	// journeys rather than the same one with a flag:
+	//
+	//   CONTINUING -- nothing is faded, nothing is stopped, and the track the
+	//     player has been listening to since the title screen simply keeps
+	//     playing over the world. The decoded PCM (30-92 MB) stays resident for
+	//     the session; see FVoxelUIMusic's header, where that was previously
+	//     described as released here.
+	//   NOT CONTINUING -- exactly the old behaviour, fade then stop.
+	//
+	// Read ONCE, into a local, rather than at each of the three sites below. The
+	// setting is player-editable ini and could in principle change between them;
+	// a hand-off that faded the music out and then declined to stop it would
+	// leave a live silent component for the rest of the session.
+	const bool bContinueMusic = VoxelAudioUserSettings::GetMusicInGame();
+
 	// The fade is started ONCE, on the first hand-off tick, and runs alongside
 	// the curtain rather than after it. MusicFadeOut (1.5s) is independent of
 	// FadeDuration on purpose: the picture and the sound do not have to leave
@@ -866,7 +1039,18 @@ void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
 	if (!bMusicFadeStarted)
 	{
 		bMusicFadeStarted = true;
-		FVoxelUIMusic::Get().FadeOut(L.MusicFadeOut);
+		if (bContinueMusic)
+		{
+			// The engagement evidence for the continue arm, greppable, and a
+			// gate can fail on its absence. Without it "there is music in game"
+			// and "the fade simply did not run" look identical in a log.
+			UE_LOG(LogVoxelUI, Log, TEXT("VoxelUIMusic: continuing into gameplay ('%s')."),
+			       *FVoxelUIMusic::Get().NowPlaying());
+		}
+		else
+		{
+			FVoxelUIMusic::Get().FadeOut(L.MusicFadeOut);
+		}
 	}
 
 	const float Alpha = L.FadeDuration > 0.f ? FMath::Clamp(HandOffSeconds / L.FadeDuration, 0.f, 1.f) : 1.f;
@@ -882,25 +1066,28 @@ void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
 	// _hide_loading_screen's ordering, which matters: the world is already
 	// rendering underneath by the time the curtain starts fading, so the fade
 	// reveals a live world rather than cutting to one.
-	TeardownMenu();
+	TeardownMenu(/*bKeepMusic=*/bContinueMusic);
 	ReadyProbe.Reset();
 	// The front end is the only thing that draws the background art, and it is
 	// now finished with it -- six 1920-wide BGRA8 textures is roughly 48 MB to
 	// be holding for the rest of a session on a project whose stated
 	// constraint is the frame-time tail.
 	FVoxelUIAssetLibrary::Get().ReleaseTextures();
-	// And the track, which is 30-92 MB of decoded PCM. Stopped only now, after
-	// the curtain is fully down: stopping it when the fade STARTED would cut
-	// the fade off at its first frame, which sounds like a bug rather than a
-	// choice. If MusicFadeOut is ever set longer than FadeDuration the tail is
-	// clipped here, and that is the trade -- the front end does not outlive
-	// itself to finish a fade.
-	FVoxelUIMusic::Get().Stop();
+	if (!bContinueMusic)
+	{
+		// The track, which is 30-92 MB of decoded PCM. Stopped only now, after
+		// the curtain is fully down: stopping it when the fade STARTED would cut
+		// the fade off at its first frame, which sounds like a bug rather than a
+		// choice. If MusicFadeOut is ever set longer than FadeDuration the tail
+		// is clipped here, and that is the trade -- the front end does not
+		// outlive itself to finish a fade.
+		FVoxelUIMusic::Get().Stop();
+	}
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: handed off to the player."));
 	State = EVoxelFrontEndState::Playing;
 }
 
-void UVoxelFrontEndSubsystem::TeardownMenu()
+void UVoxelFrontEndSubsystem::TeardownMenu(bool bKeepMusic)
 {
 	// FIRST, and before the loading widget is removed below: End() disarms any
 	// in-flight block and puts the curtain back in the viewport, so the removal
@@ -913,7 +1100,18 @@ void UVoxelFrontEndSubsystem::TeardownMenu()
 	// ends while the loading screen is still up. Stop() is idempotent and
 	// silent when nothing is playing, so this is the backstop rather than a
 	// second owner of the decision.
-	FVoxelUIMusic::Get().Stop();
+	//
+	// EXCEPT ON THE ONE PATH THAT IS NOT AN EXIT. Hand-off calls this to take
+	// the menu off the screen while the player carries on into a world that is
+	// meant to keep the music -- so the backstop has to know the difference
+	// between "the front end is finished" and "the front end is finished WITH
+	// THE SCREEN". Everything else here (the curtain, the streaming cap, the
+	// scalability drop, the widgets) is torn down on both paths; only the audio
+	// outlives one of them.
+	if (!bKeepMusic)
+	{
+		FVoxelUIMusic::Get().Stop();
+	}
 
 	// Same backstop shape for the streaming cap: the cvar is process-wide, so
 	// a quit or PIE teardown mid-theatre must not leave the apply budget

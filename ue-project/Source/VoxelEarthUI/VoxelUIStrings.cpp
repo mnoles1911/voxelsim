@@ -52,6 +52,17 @@ FText SettingsUIScaleHint()
 	               "screen; raise it if the text is small, lower it for more room.");
 }
 FText SettingsSectionInterface() { return LOCTEXT("SetSecInterface", "INTERFACE"); }
+FText SettingsMenuSizeLabel() { return LOCTEXT("SetMenuSize", "MENU SIZE"); }
+// NAMES THE LIVE SHORTCUT, because a dial buried in a settings panel is not how
+// anyone actually finds the size they want -- they find it by looking at the
+// screen they are resizing. The row and the shortcut are the same setting.
+FText SettingsMenuSizeHint()
+{
+	return LOCTEXT("SetMenuSizeHint",
+	               "How large the map, journal, inventory, player and codex screens are drawn. "
+	               "Ctrl and the mouse wheel, or Ctrl with plus and minus, does the same while "
+	               "one of them is open; Ctrl and 0 puts it back.");
+}
 FText SettingsPercent(int32 Percent)
 {
 	return FText::Format(LOCTEXT("SetPercent", "{0}%"), FText::AsNumber(Percent));
@@ -354,7 +365,46 @@ FText MapNoRaster()
 
 FText MapOverviewNote()
 {
-	return LOCTEXT("MapOverview", "World overview — your position is on the right");
+	// WAS "World overview - your position is on the right", which stopped being
+	// true on 2026-09-08: the sheet pans, zooms and carries the player's own
+	// marker. NORTH UP is worth stating because the offline raster is rendered
+	// south-up and the sheet flips it -- anyone comparing the screen against
+	// the PNG in world-maps/ will find them mirrored and should know which one
+	// is the map. The gestures are on the caps beside this line.
+	return LOCTEXT("MapOverview", "North up — your marker is live");
+}
+
+FText MapActionZoom()   { return LOCTEXT("MapActZoom", "zoom · or +/-"); }
+FText MapActionPan()    { return LOCTEXT("MapActPan", "drag to pan · click to mark"); }
+FText MapKeyWheel()     { return LOCTEXT("MapKeyWheel", "WHEEL"); }
+FText MapKeyRightDrag() { return LOCTEXT("MapKeyRmb", "RMB"); }
+
+FText MapCtxPlaceTitle() { return LOCTEXT("MapCtxPlace", "THIS PLACE"); }
+FText MapCtxMarkHere()   { return LOCTEXT("MapCtxMark", "Mark this place"); }
+FText MapCtxRename()     { return LOCTEXT("MapCtxRename", "Rename"); }
+FText MapCtxRemove()     { return LOCTEXT("MapCtxRemove", "Remove"); }
+FText MapCtxCancel()     { return LOCTEXT("MapCtxCancel", "Cancel"); }
+
+FText MapNameTitle() { return LOCTEXT("MapNameTitle", "NAME THIS PLACE"); }
+FText MapNameHint()  { return LOCTEXT("MapNameHint", "Camp by the river…"); }
+FText MapNameKeys()  { return LOCTEXT("MapNameKeys", "ENTER to keep · ESC to cancel"); }
+FText MapMarkDefaultName() { return LOCTEXT("MapMarkDefault", "Unnamed place"); }
+
+FText MapScaleValue(double MetresAcross)
+{
+	// KILOMETRES ABOVE 1 km, METRES BELOW, and no decimal on the metre form.
+	// The zoom range is 500 m to 261 km, so a single unit would print either
+	// "0.5 km" at one end or "261120 m" at the other, and both read as noise.
+	FNumberFormattingOptions Opts;
+	Opts.MinimumFractionalDigits = 1;
+	Opts.MaximumFractionalDigits = 1;
+	if (MetresAcross >= 1000.0)
+	{
+		return FText::Format(LOCTEXT("MapScaleKm", "{0} km across"),
+		                     FText::AsNumber(MetresAcross / 1000.0, &Opts));
+	}
+	return FText::Format(LOCTEXT("MapScaleM", "{0} m across"),
+	                     FText::AsNumber(FMath::RoundToInt(MetresAcross)));
 }
 
 FText MapPositionValue(const FVector& World)
@@ -562,6 +612,25 @@ FText DlgActionSelect()  { return LOCTEXT("DlgSelect", "Choose a reply"); }
 
 FText HudDemoInteract()    { return LOCTEXT("HudInteract", "Examine the cairn"); }
 FText HudDemoInteractKey() { return LOCTEXT("HudInteractKey", "E"); }
+
+FText HudMusicPrevTip()  { return LOCTEXT("HudMusicPrev",  "Previous track  [ , ]"); }
+FText HudMusicPlayTip()  { return LOCTEXT("HudMusicPlay",  "Play  [ . ]"); }
+FText HudMusicPauseTip() { return LOCTEXT("HudMusicPause", "Pause  [ . ]"); }
+FText HudMusicNextTip()  { return LOCTEXT("HudMusicNext",  "Next track  [ / ]"); }
+
+FText SettingsHideMusicUILabel() { return LOCTEXT("SetHideMusicUI", "HIDE MUSIC UI"); }
+FText SettingsHideMusicUIHint()
+{
+	return LOCTEXT("SetHideMusicUIHint",
+	               "Takes the track name and the back, play and next buttons off the screen. "
+	               "The music keeps playing, and the , . and / keys still control it.");
+}
+FText SettingsHideCompassUILabel() { return LOCTEXT("SetHideCompassUI", "HIDE COMPASS UI"); }
+FText SettingsHideCompassUIHint()
+{
+	return LOCTEXT("SetHideCompassUIHint",
+	               "Takes the heading strip off the top of the screen. Nothing else in the HUD moves.");
+}
 } // namespace VoxelUIStrings
 
 #undef LOCTEXT_NAMESPACE

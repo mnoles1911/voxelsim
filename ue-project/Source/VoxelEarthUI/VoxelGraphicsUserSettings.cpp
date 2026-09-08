@@ -12,6 +12,8 @@ constexpr const TCHAR* kFasterTerrainKey = TEXT("FasterTerrainDrawing");
 constexpr const TCHAR* kWaterWaveKey = TEXT("WaterWaveDetail");
 constexpr const TCHAR* kOceanDetailKey = TEXT("OceanMeshDetail");
 constexpr const TCHAR* kUIScaleKey = TEXT("UIScale");
+constexpr const TCHAR* kHideMusicUIKey = TEXT("HideMusicUI");
+constexpr const TCHAR* kHideCompassUIKey = TEXT("HideCompassUI");
 
 // The interface-size row's bounds. 1.00 is the default: the engine's own
 // ShortestSide curve reaching the screen unmodified, which is the framing
@@ -216,6 +218,54 @@ void SetOceanMeshDetail(bool bEnabled)
 	ApplyOceanMeshDetail(bEnabled);
 }
 
+bool GetHideMusicUI()
+{
+	// FALSE on a missing key: nothing is hidden until the player hides it.
+	bool bHidden = false;
+	if (GConfig)
+	{
+		GConfig->GetBool(kSection, kHideMusicUIKey, bHidden, GGameUserSettingsIni);
+	}
+	return bHidden;
+}
+
+void SetHideMusicUI(bool bHidden)
+{
+	if (GConfig)
+	{
+		GConfig->SetBool(kSection, kHideMusicUIKey, bHidden, GGameUserSettingsIni);
+		// Flushed now, on this file's own standing reason: a crash between the
+		// toggle and exit must not silently revert a choice the player watched
+		// take effect.
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	// NO ApplyAll(). There is no cvar and no apply step -- SVoxelGameHud reads
+	// this every frame through a bound visibility attribute, so the row is live
+	// the instant it is clicked. The log line is the engagement evidence that
+	// takes ApplyAll's place for these two rows.
+	UE_LOG(LogTemp, Log, TEXT("VoxelHud: music UI hidden=%d"), bHidden ? 1 : 0);
+}
+
+bool GetHideCompassUI()
+{
+	bool bHidden = false;
+	if (GConfig)
+	{
+		GConfig->GetBool(kSection, kHideCompassUIKey, bHidden, GGameUserSettingsIni);
+	}
+	return bHidden;
+}
+
+void SetHideCompassUI(bool bHidden)
+{
+	if (GConfig)
+	{
+		GConfig->SetBool(kSection, kHideCompassUIKey, bHidden, GGameUserSettingsIni);
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	UE_LOG(LogTemp, Log, TEXT("VoxelHud: compass UI hidden=%d"), bHidden ? 1 : 0);
+}
+
 float UIScaleMin() { return kUIScaleMin; }
 float UIScaleMax() { return kUIScaleMax; }
 float UIScaleStep() { return kUIScaleStep; }
@@ -283,10 +333,16 @@ void ApplyAll()
 
 	UE_LOG(LogTemp, Log,
 	       TEXT("VoxelGraphicsUserSettings: applied FineDetailSmoothing=%d FasterTerrainDrawing=%d "
-	            "WaterWaveDetail=%d OceanMeshDetail=%d UIScale=%.2f%s"),
+	            "WaterWaveDetail=%d OceanMeshDetail=%d UIScale=%.2f%s "
+	            "HideMusicUI=%d HideCompassUI=%d"),
 	       GetFineDetailSmoothing() ? 1 : 0, GetFasterTerrainDrawing() ? 1 : 0, GetWaterWaveDetail() ? 1 : 0,
 	       GetOceanMeshDetail() ? 1 : 0, GetUIScale(),
-	       bScaleOk ? TEXT("") : TEXT(" (NOT APPLIED -- no Slate application)"));
+	       bScaleOk ? TEXT("") : TEXT(" (NOT APPLIED -- no Slate application)"),
+	       // REPORTED, NOT APPLIED, and the distinction is the point of this
+	       // line. These two have no cvar to push: the HUD reads them every
+	       // frame. Naming them here means a leg can still see at boot what the
+	       // player has chosen, without implying an apply that never happened.
+	       GetHideMusicUI() ? 1 : 0, GetHideCompassUI() ? 1 : 0);
 	if (!Missing.IsEmpty())
 	{
 		// WARNING, NOT LOG. A cvar that is not registered means the module that
