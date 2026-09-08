@@ -223,11 +223,11 @@ FVoxelFrontEndSwitches Parse()
 	FParse::Value(Cmd, TEXT("VoxelLoadGateMaxWait="), S.LoadGateMaxWaitSeconds);
 	FParse::Value(Cmd, TEXT("VoxelMenuWatchdog="), S.MenuWatchdogSeconds);
 
-	// -VoxelLoadingScreenThread=0|1. Int-valued rather than a bare Param
-	// because the DEFAULT IS ON, so the useful form is the one that turns it
-	// off, and FParse::Param has no "off".
+	// -VoxelLoadingScreenThread=0|1. Int-valued rather than a bare Param so
+	// that BOTH directions are expressible from a command line; the default
+	// moved 1 -> 0 after the 2026-09-07 hang, see the field's comment.
 	{
-		int32 CurtainThread = 1;
+		int32 CurtainThread = 0;
 		FParse::Value(Cmd, TEXT("VoxelLoadingScreenThread="), CurtainThread);
 		S.bLoadingScreenThread = (CurtainThread != 0);
 	}

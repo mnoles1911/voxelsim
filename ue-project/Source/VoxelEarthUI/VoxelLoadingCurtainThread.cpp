@@ -3,11 +3,12 @@
 #include "VoxelEarthUI.h"
 
 #include "Engine/GameViewportClient.h"
-#include "Engine/UserInterfaceSettings.h" // the UI scale the viewport path uses
+#include "Engine/UserInterfaceSettings.h"  // the UI scale the viewport path uses
 #include "Engine/World.h"
-#include "Slate/SceneViewport.h"              // FSceneViewport::GetSizeXY
+#include "Slate/SceneViewport.h"           // FSceneViewport::GetSizeXY
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/App.h"                      // FApp::HasFocus -- the alt-tab guard
 #include "Misc/ScopeLock.h"
 #include "MoviePlayer.h"
 #include "MoviePlayerProxy.h"
@@ -180,8 +181,13 @@ bool FVoxelLoadingCurtainThread::Begin(UWorld* InWorld, UGameViewportClient* InV
 	CoolDownRemaining = 0;
 	ConsecutiveRefusals = 0;
 	bDisabledByRefusals = false;
+	bDisabledBySlowDisarm = false;
+	bEndRequested = false;
 	BlocksArmed = 0;
 	BlockRefusals = 0;
+	FocusRefusals = 0;
+	CapRefusals = 0;
+	LongestDisarmMs = 0.0;
 	CoveredSeconds = 0.0;
 	LongestBlockMs = 0.0;
 	LongestUncoveredFrameMs = 0.0;
@@ -203,6 +209,13 @@ void FVoxelLoadingCurtainThread::End()
 		return;
 	}
 	check(IsInGameThread());
+
+	// THE LATCH FIRST, AND BEFORE ANY WIDGET MOVES. From here no arm can
+	// happen, so the hand-off is free to take the curtain out of the viewport
+	// and destroy it without racing a block that is about to start. This is the
+	// half the 2026-09-07 hang could have taken even with everything else
+	// right; see the header.
+	bEndRequested = true;
 
 	DisarmBlock();
 
@@ -228,10 +241,12 @@ void FVoxelLoadingCurtainThread::End()
 	// not, next to the longest frame that went UNCOVERED -- the two together
 	// say both "did it fire" and "did it fire where it mattered".
 	UE_LOG(LogVoxelUI, Log,
-	       TEXT("LoadScreen: curtain thread blocks=%lld refusals=%lld coveredSec=%.2f ")
-	       TEXT("longestBlockMs=%.1f longestUncoveredFrameMs=%.1f paints=%lld paintOverflow=%lld"),
-	       (long long)BlocksArmed, (long long)BlockRefusals, CoveredSeconds,
-	       LongestBlockMs, LongestUncoveredFrameMs,
+	       TEXT("LoadScreen: curtain thread blocks=%lld refusals=%lld focusRefusals=%lld ")
+	       TEXT("capRefusals=%lld coveredSec=%.2f longestBlockMs=%.1f longestDisarmMs=%.1f ")
+	       TEXT("longestUncoveredFrameMs=%.1f paints=%lld paintOverflow=%lld"),
+	       (long long)BlocksArmed, (long long)BlockRefusals, (long long)FocusRefusals,
+	       (long long)CapRefusals, CoveredSeconds, LongestBlockMs, LongestDisarmMs,
+	       LongestUncoveredFrameMs,
 	       (long long)VoxelLoadingCurtain::PaintCount(),
 	       (long long)VoxelLoadingCurtain::PaintOverflowCount());
 
@@ -243,7 +258,7 @@ void FVoxelLoadingCurtainThread::End()
 
 void FVoxelLoadingCurtainThread::OnPreActorTick(UWorld* TickWorld, ELevelTick TickType, float /*DeltaSeconds*/)
 {
-	if (!bActive || TickWorld != World || TickType != LEVELTICK_All)
+	if (!bActive || bEndRequested || TickWorld != World || TickType != LEVELTICK_All)
 	{
 		return;
 	}
@@ -267,7 +282,7 @@ void FVoxelLoadingCurtainThread::OnPreActorTick(UWorld* TickWorld, ELevelTick Ti
 	LastPreTickSeconds = Now;
 	++FramesSeen;
 
-	if (bDisabledByRefusals)
+	if (bDisabledByRefusals || bDisabledBySlowDisarm)
 	{
 		return;
 	}
@@ -307,8 +322,31 @@ void FVoxelLoadingCurtainThread::OnPostActorTick(UWorld* TickWorld, ELevelTick T
 
 void FVoxelLoadingCurtainThread::ArmBlock()
 {
-	if (bBlockArmed || !Curtain.IsValid() || Viewport == nullptr)
+	if (bBlockArmed || bEndRequested || !Curtain.IsValid() || Viewport == nullptr)
 	{
+		return;
+	}
+
+	// NOT WHILE THE WINDOW IS IN THE BACKGROUND. tools/voxel-editor.ps1 arms
+	// t.IdleWhenNotForeground, so an unfocused game window stops delivering
+	// ordinary frames -- and the engine's own force-finish, the render-thread
+	// heartbeat and the frame pacing this mechanism leans on all change
+	// character at once. The owner was alt-tabbing between the game and a
+	// terminal when it hung, and the gate-sweep leg that validated this NEVER
+	// LOST FOCUS: the state was never exercised before it shipped. A curtain
+	// nobody is looking at does not need a thread to paint it.
+	if (!FApp::HasFocus())
+	{
+		++FocusRefusals;
+		return;
+	}
+
+	// The hard ceiling. Every arm is one entry into an engine wait we cannot
+	// bound (see the header); a pathological load must not take that bet
+	// thousands of times.
+	if (BlocksArmed >= (int64)kMaxBlocksPerLoad)
+	{
+		++CapRefusals;
 		return;
 	}
 
@@ -405,11 +443,40 @@ void FVoxelLoadingCurtainThread::DisarmBlock()
 	}
 	bBlockArmed = false;
 
+	// A LINE ON BOTH SIDES OF THE JOIN, and this is not decoration. The
+	// 2026-09-07 hang was a SILENT STOP: the log simply ended, with nothing to
+	// say which of the frame's many candidates had swallowed the game thread.
+	// It is entering an engine wait with no timeout (MoviePlayerThreading.cpp:
+	// 75-81, see the header), so if a future run's log ends between these two
+	// lines, the hang has named itself and no bisect is needed. Verbose enough
+	// to matter, rare enough to afford: at most kMaxBlocksPerLoad per load.
+	const double DisarmStart = FPlatformTime::Seconds();
+	UE_LOG(LogVoxelUI, Verbose,
+	       TEXT("LoadScreen: curtain thread joining the Slate loading thread (block %lld) -- ")
+	       TEXT("if this log ends here, THAT is the hang (DestroySlateThread has no timeout)."),
+	       (long long)BlocksArmed);
+
 	// Joins the Slate loading thread and hands the window back to the game
 	// viewport (DefaultGameMoviePlayer.cpp:683 -> WaitForMovieToFinish).
 	FMoviePlayerProxy::BlockingFinished();
 
-	const double BlockMs = (FPlatformTime::Seconds() - BlockStartedSeconds) * 1000.0;
+	const double Now = FPlatformTime::Seconds();
+	const double DisarmMs = (Now - DisarmStart) * 1000.0;
+	LongestDisarmMs = FMath::Max(LongestDisarmMs, DisarmMs);
+	if (DisarmMs >= kDisarmWarnMs)
+	{
+		// It came back, but slowly -- which is the same mechanism as the hang,
+		// caught before it became one. Stop arming for the rest of this load
+		// rather than rolling the dice again.
+		bDisabledBySlowDisarm = true;
+		UE_LOG(LogVoxelUI, Warning,
+		       TEXT("LoadScreen: curtain thread join took %.0f ms (block %lld, limit %.0f). ")
+		       TEXT("That is the unbounded DestroySlateThread wait going slowly -- disabling the ")
+		       TEXT("threaded curtain for the rest of this load; it stays on the game thread."),
+		       DisarmMs, (long long)BlocksArmed, kDisarmWarnMs);
+	}
+
+	const double BlockMs = (Now - BlockStartedSeconds) * 1000.0;
 	CoveredSeconds += BlockMs / 1000.0;
 	LongestBlockMs = FMath::Max(LongestBlockMs, BlockMs);
 

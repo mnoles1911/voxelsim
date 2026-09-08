@@ -98,6 +98,17 @@ private:
 	// fading up. Indices walk forward through the shuffled library order.
 	int32 BackgroundIndexA = 0;
 	int32 BackgroundIndexB = 1;
+	// LAST BRUSH RESOLVED ON THE GAME THREAD, per slot. The curtain is painted from the
+	// Slate loading thread while the world ticks (VoxelLoadingCurtainThread), and
+	// FVoxelUIAssetLibrary::RequestBackground refuses any caller off the game thread
+	// (it may start a decode and mutate its tables). Without a cache every off-thread
+	// paint drew NO image and the backdrop flickered to black between game-thread
+	// paints (owner, live, 2026-09-07 night: "background image constantly flickers
+	// between visible and blackness ... hourglass and overlay text appear fine"). The
+	// brush object is owned by the library and lives for the load; caching the pointer
+	// is what lets an off-thread paint show the image the game thread last resolved.
+	mutable const FSlateBrush* CachedBackgroundA = nullptr;
+	mutable const FSlateBrush* CachedBackgroundB = nullptr;
 	float BackgroundTimer = 0.f;
 	float CrossfadeAlpha = 0.f;  // 0 = A fully visible, 1 = B fully visible
 	bool bCrossfading = false;

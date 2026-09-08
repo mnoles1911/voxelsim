@@ -412,8 +412,8 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	int32 SubtitleFontSize     = 18;
 	// 16 and (36, 24): the 2026-09-07 mock's .version-stamp.bl. Was 12/(16,16).
 	int32 VersionFontSize      = 16;
-	float VersionInsetLeft     = 36.f;
-	float VersionInsetBottom   = 24.f;
+	float VersionInsetLeft     = 20.f;
+	float VersionInsetBottom   = 14.f;
 	// The dark wash over the background art. 0.50 is the mock's .scene-tint
 	// (was MainMenu.gd's BG_NIGHT @ 0.55); the vignette that used to be folded
 	// into it is now its own layer, see SceneVignetteAlpha.
@@ -433,7 +433,14 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	// right-aligned, and a patch-notes callout takes the top-left. The centred
 	// oak column above is what the previous mock had; its numbers stay because
 	// the sub-panels still use them.
-	float LogoTop              = 80.f;
+	// CORNER INSETS TIGHTENED BY OWNER DIRECTION, 2026-09-07 night, live on his 1440p
+	// screen: "there is currently too much buffer and padding between the edges of the
+	// 1440p 2K monitor screen and the UI elements" -- the patch-notes callout, the
+	// Voxelmark title, the menu items and the version stamp all move toward their
+	// corners. These are AUTHORED 1080p figures per ADR-0011 (the engine scale is
+	// untouched); the mock's 80/100/160/80/60/36/24 were roughly halved. Design
+	// choice, judged live; iterate here, never in the scale curve.
+	float LogoTop              = 40.f;
 	// 100, WHICH IS WHAT `.stage .title-logo{right:100px}` SAYS.
 	//
 	// This was 120: +20 over the mock, added to "restore the ink margin" after
@@ -448,14 +455,14 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	//
 	// If a 1.0-era capture shows the K crowding the frame, the fix is a right
 	// padding on the logo's own text block, not a bigger inset on everything.
-	float LogoRight            = 100.f;
+	float LogoRight            = 48.f;
 	int32 LogoFontSize         = 132;
 	// letter-spacing in the mock is px; FSlateFontInfo::LetterSpacing is
 	// 1/1000 em. 6 px at 132 px = 45. (The earlier note that Slate "has no
 	// tracking" predates UE5's LetterSpacing and is retired by this field.)
 	int32 LogoLetterSpacing    = 45;
 	float TitleMenuTop         = 400.f;
-	float TitleMenuRight       = 160.f;
+	float TitleMenuRight       = 64.f;
 	float TitleMenuWidth       = 640.f;
 	int32 TitleMenuItemSize    = 29;
 	int32 TitleMenuActiveSize  = 33;   // hover/active grows the face
@@ -466,8 +473,8 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float TitleMenuItemMinWidth = 380.f;
 	float TitleMenuQuitGap     = 52.f;  // .title-menu__item.quit margin-top
 	// .callout-news
-	float CalloutTop           = 80.f;
-	float CalloutLeft          = 60.f;
+	float CalloutTop           = 40.f;
+	float CalloutLeft          = 32.f;
 	float CalloutMaxWidth      = 520.f;
 	float CalloutPadX          = 14.f;
 	float CalloutGap           = 16.f;

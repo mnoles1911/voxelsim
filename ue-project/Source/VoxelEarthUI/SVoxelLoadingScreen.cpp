@@ -495,12 +495,32 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 
 const FSlateBrush* SVoxelLoadingScreen::GetBackgroundA() const
 {
-	return FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexA);
+	// Game thread: ask the library (it may start a decode) and remember the answer.
+	// Loading thread: the library refuses; paint whatever the game thread last
+	// resolved for this slot rather than nothing. See CachedBackgroundA in the header.
+	if (IsInGameThread())
+	{
+		if (const FSlateBrush* Fresh = FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexA))
+		{
+			CachedBackgroundA = Fresh;
+		}
+	}
+	return CachedBackgroundA;
 }
 
 const FSlateBrush* SVoxelLoadingScreen::GetBackgroundB() const
 {
-	return FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexB);
+	// Game thread: ask the library (it may start a decode) and remember the answer.
+	// Loading thread: the library refuses; paint whatever the game thread last
+	// resolved for this slot rather than nothing. See CachedBackgroundB in the header.
+	if (IsInGameThread())
+	{
+		if (const FSlateBrush* Fresh = FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexB))
+		{
+			CachedBackgroundB = Fresh;
+		}
+	}
+	return CachedBackgroundB;
 }
 
 float SVoxelLoadingScreen::GetBackgroundAOpacity() const

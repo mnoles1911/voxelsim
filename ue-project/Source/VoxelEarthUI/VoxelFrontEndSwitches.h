@@ -209,18 +209,36 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// out)", so a run that took it can be told from one that did not.
 	float LoadGateMaxWaitSeconds = 300.0f;
 
-	// -VoxelLoadingScreenThread=0|1 (default 1): paint the loading curtain on
-	// the engine's Slate loading thread across long world ticks, so a 6.3 s
-	// fill frame no longer freezes the hourglass. 0 is the CONTROL ARM -- the
-	// curtain stays a plain viewport widget on the game thread, exactly as it
-	// was before 2026-09-07, and the seg=LOADING row then reads seconds instead
-	// of milliseconds.
+	// -VoxelLoadingScreenThread=0|1. DEFAULT 0 SINCE 2026-09-07 EVENING, AND
+	// THE DEFAULT IS THE FIX.
 	//
-	// The mechanism, and the four engine facts that rule out the more obvious
-	// versions of it, are in VoxelLoadingCurtainThread.h. Short version: UE 5.8
-	// has no persistent loading thread while the game thread ticks a world, so
-	// this arms the supported per-blocking-section path around each world tick.
-	bool bLoadingScreenThread = true;
+	// It shipped default 1 the same afternoon and HUNG THE OWNER'S LIVE
+	// SESSION on the first load: process alive and Responding, CPU flat, log
+	// dead mid-load, loading screen frozen on screen, killed after 14 minutes
+	// (docs/evidence/2026-09-07-live-curtain-hang-VoxelEarth.log).
+	//
+	// WHY IT CANNOT BE MADE SAFE FROM THIS SIDE. Ending one armed block runs
+	// FMoviePlayerProxy::BlockingFinished -> WaitForMovieToFinish ->
+	// FSlateLoadingSynchronizationMechanism::DestroySlateThread, whose body is
+	// `while (bMainLoopRunning) { PumpMessages(false); Sleep(0.001f); }`
+	// (MoviePlayerThreading.cpp:75-81) -- an UNBOUNDED wait with no timeout and
+	// no cancel. Its release depends on the RENDER thread ticking
+	// FDefaultGameMoviePlayer::Tick (DefaultGameMoviePlayer.cpp:520), which is
+	// the only place the Slate thread's draw-pass flag is ever reset, and which
+	// nothing guarantees: in a threaded build the game thread never calls
+	// TickRenderingTickables (LaunchEngineLoop.cpp:5610 is `if
+	// (!GUseThreadedRendering)`), the sole driver is the render-thread
+	// heartbeat (RenderingThread.cpp:466-486), and that heartbeat is
+	// deliberately suppressed while GSuspendRenderingTickables != 0, i.e.
+	// during any FlushRenderingCommands -- which WaitForMovieToFinish itself
+	// calls. We do not own the release condition, so we cannot bound the wait.
+	//
+	// A loading screen that can hang is worse than one that stutters. The code
+	// stays, with the extra guards the incident bought (see
+	// VoxelLoadingCurtainThread.h), and =1 is now an OPT-IN for a controlled
+	// leg with somebody watching -- never an interactive default until the
+	// unbounded wait has an engine-side answer.
+	bool bLoadingScreenThread = false;
 
 	// ---- THE ARTIFICIAL LOAD DURATION (owner directive, 2026-09-05) --------
 	//

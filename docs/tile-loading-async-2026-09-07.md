@@ -726,3 +726,129 @@ sampling when unblocked.
 The PSO recording script (`tools/voxel-pso-cache-record.ps1`) was **not run**:
 the bundled cache is unreachable from an editor binary and the script correctly
 refuses without a packaged build.
+
+The gate leg above **passed**, and the feature then **hung the owner's live session**
+on the same build. The leg never lost window focus; the owner did. What follows is the
+diagnosis and what changed as a result.
+
+### The threaded curtain HUNG a live session, and is now default OFF (2026-09-07 evening)
+
+Everything above shipped at 19:20 with `-VoxelLoadingScreenThread` defaulting to **1**. On the
+owner's first interactive load it **hung the game**: process alive and `Responding=True`, CPU
+flat, 61 threads, 7.9 GB, loading screen frozen on screen, unclickable, log dead mid-load,
+killed after 14 minutes. Evidence:
+`docs/evidence/2026-09-07-live-curtain-hang-VoxelEarth.log`.
+
+**The default is now 0.** `=1` is an opt-in for a controlled leg with somebody watching. A
+loading screen that can hang is worse than one that stutters.
+
+#### The timing is the evidence
+
+| time (UTC) | line |
+|---|---|
+| 23:27:20.181 | `LoadScreen: curtain thread ARMED (armMs=40 coolDownFrames=30 primeFrames=6)`; theatre rolls 41.4 s |
+| 23:27:20.901 | `VoxelLoadGate: started ... max wait 300s` |
+| 23:29:20.792 | `VoxelLoadGate: READY after 16.02s` — **119.9 s of wall clock later** |
+| 23:29:28.826 | `Hitch frame: frameMs=54.63` — the **first** frame in the whole load over the 40 ms arm threshold |
+| 23:29:28.874 | `Hitch frame: frameMs=67.22` — the second |
+| 23:29:29.063 | last line in the file. Nothing after it, ever. |
+
+The curtain armed its six prime frames at `:20.18` and then **did not arm again for two
+minutes** — every frame was under 40 ms. The hang is on the **first arm/disarm cycle after two
+minutes of not arming**, five frames after the threshold was first crossed. There is no other
+candidate in the log: no ensure, no Fatal, no `refused`, no `blocks=` summary.
+
+#### Defect 1 — an unbounded engine wait, entered from inside the world tick
+
+```
+DisarmBlock()
+  -> FMoviePlayerProxy::BlockingFinished()          MoviePlayerProxy.cpp:32
+  -> FDefaultGameMoviePlayer::BlockingFinished()    DefaultGameMoviePlayer.cpp:683
+  -> WaitForMovieToFinish()                         :445
+  -> SyncMechanism->DestroySlateThread()            :452
+  -> while (bMainLoopRunning) { PumpMessages(false); Sleep(0.001f); }
+                                                    MoviePlayerThreading.cpp:75-81
+```
+
+That loop has **no timeout and no cancel**, and `PumpMessages` is exactly why Windows kept
+reporting the process as Responding while it sat there. It exits only when the Slate thread sets
+`bMainLoopRunning = false` (`MoviePlayerThreading.cpp:179`), which it cannot do until
+`IsSlateDrawPassEnqueued()` goes false (`:174-177`), which happens in **exactly one place**:
+`FDefaultGameMoviePlayer::Tick`, **on the render thread** (`DefaultGameMoviePlayer.cpp:520-537`).
+
+And that render-thread tick is not guaranteed:
+
+- in a threaded build the game thread never calls `TickRenderingTickables` —
+  `LaunchEngineLoop.cpp:5610` guards it with `if (!GUseThreadedRendering)`;
+- the sole driver is `FRenderingThreadTickHeartbeat` (`RenderingThread.cpp:466-486`), which
+  **skips the tick entirely while `GSuspendRenderingTickables != 0`, i.e. during any
+  `FlushRenderingCommands`** (`:433-440`) — and `WaitForMovieToFinish` itself calls
+  `FlushRenderingCommands` twice;
+- even when it runs, `TickRenderingTickables` returns early **without ticking anything** if less
+  than `1/GRenderingThreadMaxIdleTickFrequency` (25 ms) has passed, off a shared function-local
+  `static LastTickTime` (`TickableObjectRenderThread.cpp:34-45`).
+
+So the game thread's exit from a disarm depends on a render-thread heartbeat that the engine
+itself suppresses during rendering flushes. **We do not own the release condition, so we cannot
+bound the wait.** Every frame of that load was already render-bound — `gameWaitMs ≈ 31 ms` of a
+38 ms frame, which is `GGameThreadWaitTime`, the render fence
+(`VoxelWorldSubsystem.cpp:12066`), *not* the proxy wait — which is precisely the state in which
+the heartbeat is most starved.
+
+**The standing rule this cost: never call an engine wait with no timeout from inside the world
+tick.** If the release condition belongs to another thread and the engine gives you no deadline,
+you do not get to enter it.
+
+#### Defect 2 — the loading screen was *also* never going to lift, and that is separate
+
+`VoxelLoadGate: READY after 16.02s` was printed **119.9 wall seconds** after
+`VoxelLoadGate: started`. The probe accumulates the same `DeltaSeconds` the front end's
+`LoadElapsedSeconds` does, and the engine's tick delta is clamped — so under this load the
+front end's clock ran at about **one seventh of wall time**. The reveal test was
+`LoadElapsedSeconds >= max(TheatreDuration = 41.4 s, LoadMinHold)`, with ~16 s banked at the
+two-minute mark: **the theatre had roughly five more real minutes to run before the curtain
+would have lifted**, hang or no hang. That is why the log contains no
+`LoadScreen: world ready ...` and no `closing the curtain` line.
+
+Fixed: the theatre fraction and the reveal test now run on the **wall clock**
+(`LoadWallSeconds`), because the rolled duration is a quantity of the player's life, not of the
+engine's clamped delta. The reveal line prints both so the divergence stays visible:
+`VoxelFrontEnd: closing the curtain after %.2fs wall (%.2fs ticked) (...)`.
+`-VoxelLoadingShotAt` offsets stay on the tick clock, unchanged.
+
+#### The five guards the incident bought
+
+1. **`-VoxelLoadingScreenThread` defaults to 0.**
+2. **`bEndRequested`** — a one-way latch set by `End()` *before* it does anything else. No block
+   can arm after it, so the hand-off's widget move can no longer race an arm.
+3. **`End()` runs at the reveal**, before the curtain fade starts, not at the end of teardown —
+   `TeardownMenu` stays as the idempotent backstop. Previously the mechanism was live across the
+   0.4 s fade, during which a long frame could arm a block on the widget `TickHandOff` was
+   animating.
+4. **No arm while the application does not have focus** (`FApp::HasFocus()`).
+   `tools/voxel-editor.ps1` arms `t.IdleWhenNotForeground`, the owner was alt-tabbing to a
+   terminal, and the gate-sweep leg that validated the feature **never lost focus** — that state
+   was never exercised before it shipped. Counted as `focusRefusals=`.
+5. **A hard cap of 240 blocks per load** (`capRefusals=`), a **slow-join tripwire** at 250 ms
+   that disables the mechanism for the rest of the load, and **a log line on both sides of the
+   join** so a future hang names itself instead of stopping silently.
+
+#### The exact lines a future run prints
+
+Entering the wait (Verbose, at most once per block):
+
+```
+LoadScreen: curtain thread joining the Slate loading thread (block N) -- if this log ends here, THAT is the hang (DestroySlateThread has no timeout).
+```
+
+The tripwire, if the join comes back slowly instead of never:
+
+```
+LoadScreen: curtain thread join took NNN ms (block N, limit 250). That is the unbounded DestroySlateThread wait going slowly -- disabling the threaded curtain for the rest of this load; it stays on the game thread.
+```
+
+And the summary, which now separates "never fired" from "never allowed to fire":
+
+```
+LoadScreen: curtain thread blocks=N refusals=N focusRefusals=N capRefusals=N coveredSec=X longestBlockMs=X longestDisarmMs=X longestUncoveredFrameMs=X paints=N paintOverflow=N
+```

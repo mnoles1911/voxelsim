@@ -316,13 +316,14 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 		.ActiveFontSize(L.TitleMenuActiveSize)
 		.LetterSpacing(L.TitleMenuLetterSpacing)
 		.MinHeight(0.f)
-		// `.title-menu__item.active` -- the mock puts it on NEW GAME, and it is
-		// a resting state, not a hover. See HasNoColumnFocus: without this the
-		// list shows NO selection at all whenever something else in the window
-		// holds keyboard focus, which is what the 2026-09-07 title capture
-		// caught. It yields the moment any item is actually focused, so
-		// arrowing down never lights two rows.
-		.Active(this, &SVoxelMainMenu::HasNoColumnFocus)
+		// NO RESTING-ACTIVE STATE ON NEW GAME. The mock's `.title-menu__item.active`
+		// was ported on 2026-09-07 as a resting selection (bound to HasNoColumnFocus),
+		// and the owner rejected it live the same night: "the new game menu option
+		// is constantly/always highlighted and expanded. hovering over settings and
+		// help and credits is correctly dynamic and only highlights and expands when
+		// mouse hovers over it." So NEW GAME lights and grows exactly as its siblings
+		// do: on hover or on keyboard focus (SVoxelMenuButton::IsLit), never at rest.
+		// HasNoColumnFocus stays defined for the keyboard path; nothing binds it here.
 		.OnClicked_Lambda([this]() { OnNewGame.ExecuteIfBound(); return FReply::Handled(); })
 	];
 

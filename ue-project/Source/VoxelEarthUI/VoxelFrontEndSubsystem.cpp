@@ -564,6 +564,8 @@ void UVoxelFrontEndSubsystem::BeginLoad(const FString& EditLogPath, const FTrans
 	// menu.
 	ArmFrames = 2;
 	LoadElapsedSeconds = 0.f;
+	LoadWallStartSeconds = FPlatformTime::Seconds();
+	LoadWallSeconds = 0.f;
 	LastProgress = 0.f;
 	NextLoadingShotIndex = 0;
 	WorldReadyAtSeconds = -1.f;
@@ -710,6 +712,9 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
         if (!VoxelSessionCheckpoint::Ready(GetWorld())) return;
     }
 	LoadElapsedSeconds += DeltaSeconds;
+	LoadWallSeconds = LoadWallStartSeconds > 0.0
+	                      ? float(FPlatformTime::Seconds() - LoadWallStartSeconds)
+	                      : LoadElapsedSeconds;
 
 	// HOOK 0b (Phase 4, 2026-09-07): the CURTAIN'S OWN PAINT CADENCE into
 	// VoxelFramePhase's seg=LOADING row -- not this tick's DeltaSeconds.
@@ -749,8 +754,15 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 	// The bar plays the rolled theatre duration out, eased. A zero duration
 	// (-VoxelLoadTheatre=0) degenerates to "full as soon as the gate opens",
 	// which is the pre-directive timing.
+	// ON THE WALL CLOCK, NOT THE TICK CLOCK (2026-09-07 evening). The rolled
+	// duration is "how long the player watches the show", and LoadElapsedSeconds
+	// is not that: it accumulates the engine's CLAMPED tick delta, which on the
+	// owner's live load ran at about one seventh of wall time -- the readiness
+	// probe, on the same clock, printed "READY after 16.02s" 119.9 wall seconds
+	// after it started. A 41.4 s theatre against that clock is five real
+	// minutes of hourglass, which is what the owner was looking at.
 	const float TheatreFraction = TheatreDurationSeconds > 0.f
-	                                  ? LoadElapsedSeconds / TheatreDurationSeconds
+	                                  ? LoadWallSeconds / TheatreDurationSeconds
 	                                  : 1.f;
 	LastProgress = ComputeTheatreProgress(TheatreFraction, bGateOpen, LastProgress);
 	if (LoadingWidget.IsValid())
@@ -788,7 +800,7 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 	// the gate opens. LoadMinHoldSeconds still backstops the warm-cache flash
 	// when the theatre is overridden shorter than it (-VoxelLoadTheatre=0).
 	const float MinimumSeconds = FMath::Max(TheatreDurationSeconds, Switches.LoadMinHoldSeconds);
-	if (LoadElapsedSeconds >= MinimumSeconds && bGateOpen)
+	if (LoadWallSeconds >= MinimumSeconds && bGateOpen)
 	{
 		// The second half of the engagement evidence; BeginLoad logged the
 		// roll. Greppable, and a gate can fail on either line's absence.
@@ -806,8 +818,19 @@ void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
 			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: world NOT ready (gate timed out) at %.1f s, revealing at %.1f s."),
 			       WorldReadyAtSeconds, LoadElapsedSeconds);
 		}
-		UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: closing the curtain after %.2fs (%s)."), LoadElapsedSeconds,
+		UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: closing the curtain after %.2fs wall (%.2fs ticked) (%s)."),
+		       LoadWallSeconds, LoadElapsedSeconds,
 		       bReady ? TEXT("world ready") : TEXT("timed out"));
+
+		// THE CURTAIN THREAD STOPS HERE, AT THE REVEAL -- not at the end of
+		// teardown. TeardownMenu is the backstop and runs after the 0.4 s fade;
+		// leaving the mechanism live across that fade means a long frame during
+		// it can arm a block while TickHandOff is animating the very widget the
+		// block moves out of the viewport. End() latches first and is
+		// idempotent, so calling it here and again in TeardownMenu is free.
+		// After the 2026-09-07 hang the rule is: stop it BEFORE anything else
+		// touches the curtain.
+		CurtainThread.End();
 
 		// The world is about to be on screen and wants its full apply budget
 		// back before the fade starts, not after it finishes.

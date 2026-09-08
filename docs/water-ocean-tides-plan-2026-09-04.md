@@ -3279,3 +3279,8 @@ travel must fall ~9x from the ~1649-in-7-s the B0 log shows.
 `injected=` count on one boat run BEFORE looking at any picture. Until the deposition
 rate is fixed the surface is a half-metre dome and no material setting can make it
 read as a wake.
+
+2026-09-07 | UI | OWNER VERDICT on the 2 px promotions, HUD pair + crops (bar ticks, vitals bars) | **ACCEPTED** -- "All of the after screenshots for HUD look better than the before." HUD bar ticks and HUD vitals bars ship as promoted; the Settings checkbox crop was not judged and stays open | commit 423e25c, docs/ui-mocks/2026-09-07/captures/after/
+
+2026-09-07 | UI | OWNER DIRECTIVE, live at 1440p: main-menu corner insets too wide | **AUTHORED VALUES TIGHTENED** (LogoTop 80->40, LogoRight 100->48, TitleMenuRight 160->64, CalloutTop 80->40, CalloutLeft 60->32, VersionInsetLeft 36->20, VersionInsetBottom 24->14) -- per ADR-0011 the scale is untouched; owner judges on the next launch | VoxelUITheme.h, pending build
+2026-09-07 | UI | OWNER BUG REPORT, live: NEW GAME always highlighted + expanded | **FIXED IN SOURCE** -- the 2026-09-07 UI pass bound NEW GAME's Active to HasNoColumnFocus (a resting selection from the mock's `.active`); removed, so it lights/grows only on hover or keyboard focus like its siblings | SVoxelMainMenu.cpp, pending build

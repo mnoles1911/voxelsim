@@ -107,6 +107,84 @@
 //     The cost of the arm during such a run is a rounding error against a 6.3 s
 //     frame; during a smooth run the arm never happens at all.
 //
+// ===========================================================================
+// IT HUNG A LIVE SESSION ON ITS FIRST DAY. READ THIS BEFORE RE-ENABLING IT.
+// ===========================================================================
+//
+// 2026-09-07, owner's interactive load, default -VoxelLoadingScreenThread=1.
+// The process went silent mid-load and never came back: Responding=True, CPU
+// flat, 61 threads, loading screen frozen on screen, killed after 14 minutes.
+// docs/evidence/2026-09-07-live-curtain-hang-VoxelEarth.log.
+//
+// THE TIMING IS THE EVIDENCE. The curtain armed its six prime frames at
+// 23:27:20.18 and then did not arm again for two minutes -- every frame was
+// under the 40 ms threshold. The first two frames in the whole load to cross
+// it are 54.63 ms at 23:29:28.826 and 67.22 ms at :28.874. The log's last
+// line is :29.063, five frames later. The hang is on the first arm/disarm
+// cycle after two minutes of not arming, and there is no other candidate in
+// the log: no ensure, no Fatal, no refusal, no summary line.
+//
+// THE MECHANISM, AND WHY IT CANNOT BE BOUNDED FROM HERE:
+//
+//   DisarmBlock()
+//     -> FMoviePlayerProxy::BlockingFinished()        MoviePlayerProxy.cpp:32
+//     -> FDefaultGameMoviePlayer::BlockingFinished()  DefaultGameMoviePlayer.cpp:683
+//     -> WaitForMovieToFinish()                       :445
+//     -> SyncMechanism->DestroySlateThread()          :452
+//     -> while (bMainLoopRunning) { PumpMessages(false); Sleep(0.001f); }
+//                                                     MoviePlayerThreading.cpp:75-81
+//
+// That loop has NO TIMEOUT AND NO CANCEL, and it is entered from inside the
+// world tick. It exits only when the Slate thread sets bMainLoopRunning=false
+// (MoviePlayerThreading.cpp:179) -- which it cannot do until
+// IsSlateDrawPassEnqueued() goes false (:174-177), which happens in EXACTLY
+// ONE place: FDefaultGameMoviePlayer::Tick, ON THE RENDER THREAD
+// (DefaultGameMoviePlayer.cpp:520-537).
+//
+// And that render-thread tick is not guaranteed:
+//   * in a threaded build the game thread never calls TickRenderingTickables
+//     -- LaunchEngineLoop.cpp:5610 guards it with `if (!GUseThreadedRendering)`;
+//   * the sole driver is FRenderingThreadTickHeartbeat
+//     (RenderingThread.cpp:466-486), which skips the tick entirely while
+//     GSuspendRenderingTickables != 0, i.e. during any FlushRenderingCommands
+//     (:433-440) -- and WaitForMovieToFinish itself calls FlushRenderingCommands
+//     twice;
+//   * even when it runs, TickRenderingTickables returns early without ticking
+//     anything if less than 1/GRenderingThreadMaxIdleTickFrequency (25 ms) has
+//     passed, off a shared function-local static
+//     (TickableObjectRenderThread.cpp:34-45).
+//
+// So the game thread's exit from a disarm depends on a render-thread heartbeat
+// the engine itself suppresses during rendering flushes. WE DO NOT OWN THE
+// RELEASE CONDITION. Every frame of that load was already render-bound
+// (gameWaitMs ~31 ms of a 38 ms frame -- GGameThreadWaitTime, the render fence,
+// VoxelWorldSubsystem.cpp:12066), which is exactly the state in which the
+// heartbeat is most starved.
+//
+// WHAT CHANGED AS A RESULT:
+//   1. -VoxelLoadingScreenThread DEFAULTS TO 0. Opt-in only, for a leg with
+//      somebody watching. A loading screen that can hang is worse than one
+//      that stutters.
+//   2. bEndRequested: once End() has been asked for, no block may EVER arm
+//      again on this instance -- the hand-off's widget move and an arm can no
+//      longer race.
+//   3. The front end calls End() AT THE REVEAL, before the curtain fade
+//      starts, not at the end of teardown -- see VoxelFrontEndSubsystem.cpp.
+//   4. The unattended/alt-tab path is refused: no block arms while the
+//      application does not have focus. tools/voxel-editor.ps1 sets
+//      t.IdleWhenNotForeground, the owner was alt-tabbing, and the gate-sweep
+//      leg that validated this never lost focus -- so that state was NEVER
+//      exercised before it shipped.
+//   5. A hard cap on blocks per load, and a log line on BOTH SIDES of the
+//      join, so a future hang names itself in the log instead of being a
+//      silent stop.
+//
+// THE STANDING RULE THIS COST: never call an engine wait with no timeout from
+// inside the world tick. If the release condition belongs to another thread
+// and the engine gives you no deadline, you do not get to enter it.
+//
+// ===========================================================================
+//
 // THE ARM PROVES ITSELF OR TURNS ITSELF OFF. After BlockingStarted the code
 // asks IsMovieCurrentlyPlaying() (which is `SyncMechanism != NULL`,
 // DefaultGameMoviePlayer.cpp:638 -- i.e. "the loading thread is actually
@@ -229,10 +307,27 @@ private:
 	// Consecutive failures to actually start the loading thread before the
 	// mechanism gives up for this load.
 	static constexpr int32 kMaxRefusals = 3;
+	// A HARD CEILING ON HOW MANY TIMES THIS MAY ENTER THE ENGINE'S UNBOUNDED
+	// JOIN IN ONE LOAD. Every arm is one throw of the dice described at the top
+	// of this file; a pathological load must not throw it thousands of times.
+	// 240 is ~4 s of continuously chunky frames, well past the point where the
+	// evidence would show whether it is helping.
+	static constexpr int32 kMaxBlocksPerLoad = 240;
+	// A disarm that takes longer than this is the hang, caught early. Logged as
+	// a Warning AFTER the fact -- the game thread is inside the engine's loop
+	// while it happens and nothing of ours can run -- and it disables the
+	// mechanism for the rest of the load.
+	static constexpr double kDisarmWarnMs = 250.0;
 
 	bool bActive = false;
 	bool bBlockArmed = false;
 	bool bDisabledByRefusals = false;
+	// Set by End() BEFORE it does anything else. A one-way latch: no block may
+	// arm after it, so the hand-off's widget move cannot race an arm.
+	bool bEndRequested = false;
+	// Set when a disarm took longer than kDisarmWarnMs, i.e. the engine's join
+	// is going slowly. Stops arming for the rest of this load.
+	bool bDisabledBySlowDisarm = false;
 
 	UWorld* World = nullptr;
 	UGameViewportClient* Viewport = nullptr;
@@ -251,6 +346,12 @@ private:
 	// --- Engagement counters, all printed by End() --------------------------
 	int64 BlocksArmed = 0;
 	int64 BlockRefusals = 0;
+	// Arms declined before touching the movie player at all. Printed beside
+	// blocks= so "it never fired" and "it was never allowed to fire" are
+	// different readings.
+	int64 FocusRefusals = 0;
+	int64 CapRefusals = 0;
+	double LongestDisarmMs = 0.0;
 	double CoveredSeconds = 0.0;
 	double LongestBlockMs = 0.0;
 	double LongestUncoveredFrameMs = 0.0;

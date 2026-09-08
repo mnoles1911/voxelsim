@@ -128,6 +128,16 @@ private:
 	FString PendingEditLogPath;
 	TOptional<FTransform> PendingSpawnTransform;
 	float LoadElapsedSeconds = 0.f;
+	// THE SAME LOAD, ON THE WALL CLOCK, and the pair exists because they
+	// disagree by 7.5x under a heavy load. On the 2026-09-07 live session the
+	// readiness probe -- which accumulates the same DeltaSeconds this field
+	// does -- reported "READY after 16.02s" at a wall-clock 119.9 s after it
+	// started: the tick delta is clamped, so a 41.4 s theatre roll had about
+	// five more WALL minutes to run before the curtain would have lifted. The
+	// theatre duration is a quantity of the player's life, so it is measured
+	// against the player's clock; see TickLoading.
+	double LoadWallStartSeconds = 0.0;
+	float LoadWallSeconds = 0.f;
 	// Never allowed to decrease -- see ComputeTheatreProgress.
 	float LastProgress = 0.f;
 	float HandOffSeconds = 0.f;
