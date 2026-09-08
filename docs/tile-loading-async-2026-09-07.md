@@ -852,3 +852,45 @@ And the summary, which now separates "never fired" from "never allowed to fire":
 ```
 LoadScreen: curtain thread blocks=N refusals=N focusRefusals=N capRefusals=N coveredSec=X longestBlockMs=X longestDisarmMs=X longestUncoveredFrameMs=X paints=N paintOverflow=N
 ```
+
+### The curtain never lifted in a live session, and the probe's timeout was the reason (2026-09-08)
+
+Owner report, 05:38 UTC: "UE5 game editor appears to just be looping on the loading screen."
+Window closed by the owner at 05:41:09. Log preserved at
+`docs/evidence/2026-09-08-live-session3-loading-loop-VoxelEarth.log`
+(md5 `6a7094682b8c8122758a7621a04229ee`). Launch: the 01:23 foam-arm build with
+`-VoxelFineTileAsync=1 -VoxelFineTileRingRadius=1 -VoxelFineLockMeter=2`, on a box where
+Codex had 17 editor commandlets running. Timing on this launch is VOID for perf purposes;
+the control-flow defect below is not.
+
+| wall time | event |
+|---|---|
+| 05:29:25 | NEW GAME; theatre 48.5 s rolled; curtain thread off |
+| 05:32:10 | first world tick, 165 s later (shader compile); `VoxelLoadGate: started ... max wait 300s`; first fine tile resident via ASYNC after a **159 s** worker read |
+| 05:32-05:35 | fine tiles land: worker reads 6.3 s, 36.9 s, 0.3 s, **46.7 s**, 0.3 s; one game-thread join (`asyncJoins=1`); 879 `VoxelGpuMesh ... ended TimedOut` requeues, one queued **188.9 s** before its 11.7 s readback timeout |
+| 05:36:36 | FILL segment ends: 1820 frames, one of **154.4 s**; SETTLED-PARKED begins |
+| 05:37:08-47 | a 38.6 s frame; then 101 ms frames (the unfocused-window idle, owner alt-tabbed) |
+| 05:38:34-05:41:04 | 154 s wall with 919 frames; a 7.5 s frame; no READY, no TIMED OUT |
+| 05:41:09 | owner closes the window |
+
+**Why no READY:** gate 2 wants the streamer quiet for three consecutive 0.4 s polls, and
+the GPU mesh path was requeueing timed-out readbacks continuously on a saturated GPU.
+That is the box, not the gate.
+
+**Why no TIMED OUT, which is the defect:** `FVoxelWorldReadyProbe::Tick` did
+`Status.ElapsedSeconds += DeltaSeconds`, and the world clamps DeltaSeconds to 0.4 s. The
+166 s, 154 s and 38 s frames each counted as 0.4 s. Summing the segments' frame time with
+the clamps applied, the probe had seen roughly 180 of its 300 s when the owner gave up, 539
+wall seconds after it started. On the wall clock it would have lifted the curtain at
+05:37:10. This is the same defect the theatre and the reveal test had on 2026-09-07 (the
+"READY after 16.02s printed 119.9 wall seconds later" entry above), one layer down.
+
+**Fix (this commit):** `ElapsedSeconds` is now wall time from a `WallStartSeconds` taken
+in `Start()`; the READY and TIMED OUT lines say "wall". The 0.4 s poll rate limit stays on
+the tick clock because it bounds per-frame cost, not time. Standing rule: every timeout
+that guards a curtain runs on the wall clock.
+
+**Also visible in this log, for the loader verdict:** under HDD contention the async
+worker reads ran 6-159 s per tile instead of ~0.3 s, and the one join blocked the game
+thread for the remainder of one of them. The safety net worked as designed; the ring
+prefetch cannot get ahead of a disc that is shared with 17 other processes.

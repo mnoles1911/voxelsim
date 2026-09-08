@@ -170,5 +170,8 @@ private:
 	FVoxelReadyProbeStatus Status;
 	FVector Anchor = FVector::ZeroVector;
 	float PollAccumulator = 0.f;
+	// Wall-clock start of the gate. MaxWaitSeconds is judged against THIS, not
+	// against accumulated tick deltas -- see Tick() for the 2026-09-08 evidence.
+	double WallStartSeconds = 0.0;
 	bool bStarted = false;
 };
