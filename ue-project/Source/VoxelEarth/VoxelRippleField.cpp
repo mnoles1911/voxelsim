@@ -912,9 +912,33 @@ void UVoxelRippleFieldSubsystem::AddSweptDisturbance(const FVector& StartWorld,
 		NumSplats = kMaxSweptSplats;
 	}
 
-	// N == 1 is the zero-length case and is not a special case: the loop below
-	// runs once at t = 0, i.e. exactly AddDisturbance(StartWorld, ...). A boat
-	// that is not moving still leaves the ring it displaces.
+	// THE DEPOSIT IS PER METRE OF TRAVEL, NOT PER CALL (fixed 2026-09-07).
+	//
+	// This function is called once per TICK per hull station, with the sweep
+	// that tick covered. At 2 m/s and 60 Hz that sweep is 3.3 cm against a
+	// 30 cm spacing, so the line above rounds it UP to one splat -- and the
+	// old text below it made that a feature ("a boat that is not moving still
+	// leaves the ring it displaces"). The result was one FULL-STRENGTH ring
+	// per station per tick on nearly the same texels: nine times the deposit
+	// the spacing intends per metre, sixty rings a second into one spot from a
+	// moored hull, and a wake whose amplitude depended on the frame rate.
+	// Measured as the owner's "hard grey blob": with voxel.Boat.WakeGain 3 the
+	// whole 51 m ripple window sat 0.4-0.6 m proud of the lake as a foam-white
+	// dome with the canoe buried to its gunwales (VoxelVerify00988); at gain 1
+	// the dome went and the window was still solid foam (VoxelVerify00990).
+	//
+	// So a sweep shorter than one spacing deposits its FRACTION of a ring:
+	// StrengthM * Length / Spacing. Consecutive ticks then sum to exactly one
+	// ring per spacing of travel whatever the tick rate, a sweep of one
+	// spacing or more is unchanged, and a stationary call (Length 0) deposits
+	// nothing -- which is the physics: a hull that is not moving displaces no
+	// new water. The caller already gates on WakeMinSpeedUU, so a zero-length
+	// call is the exception, not the moored case, and it lands in
+	// DroppedInert through AddDisturbance's own StrengthM == 0 door.
+	if (NumSplats == 1 && LengthUU < SpacingUU)
+	{
+		StrengthM = static_cast<float>(double(StrengthM) * (LengthUU / SpacingUU));
+	}
 	const double InvSteps = (NumSplats > 1) ? 1.0 / double(NumSplats - 1) : 0.0;
 	for (int32 I = 0; I < NumSplats; ++I)
 	{

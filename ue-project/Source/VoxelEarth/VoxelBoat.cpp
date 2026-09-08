@@ -70,6 +70,14 @@ TAutoConsoleVariable<float> CVarVoxelBoatWakeGain(
 	TEXT("verified-LIVE wake measured 1.5 cm of state height -- honest but invisible). Dials the ")
 	TEXT("wake's visual weight without touching the ripple sim's physics constants."),
 	ECVF_Default);
+TAutoConsoleVariable<float> CVarVoxelBoatWakeWidthScale(
+	TEXT("voxel.Boat.WakeWidthScale"), 1.0f,
+	TEXT("Multiplier on the bow/transom splat WIDTHS (owner, live 2026-09-08: the wake waves ")
+	TEXT("'should be much smaller and finer. fine ripples in high quantity'). 1.0 = the authored ")
+	TEXT("BowWakeWidthM/TransomWakeWidthM; 0.5 halves the ring radius so the field carries ")
+	TEXT("shorter, more numerous ripples. Dial with voxel.Boat.WakeGain (amplitude) and ")
+	TEXT("voxel.Water.Ripple.HalfLifeSec (how long the field remembers)."),
+	ECVF_Default);
 TAutoConsoleVariable<bool> CVarVoxelBoatWaveBob(
 	TEXT("voxel.Boat.WaveBob"), true,
 	TEXT("Couple the buoyancy probes to the CPU wave mirror (VoxelWaveMirror.generated.h): each ")
@@ -1113,16 +1121,19 @@ void AVoxelBoat::TickWake(float DeltaSeconds)
 		const float Frac =
 			float(VoxelBoatLocal::ImpactFraction(SpeedXY))
 			* FMath::Max(0.f, CVarVoxelBoatWakeGain.GetValueOnGameThread());
+		// Ring radius scale, live (owner 2026-09-08: finer, more numerous ripples).
+		const float WakeWidthScale =
+			FMath::Clamp(CVarVoxelBoatWakeWidthScale.GetValueOnGameThread(), 0.1f, 4.f);
 		UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt(World, LastBowPort, BowPort,
-		                                                  float(BowWakeWidthM),
+		                                                  float(BowWakeWidthM) * WakeWidthScale,
 		                                                  float(BowWakeStrengthM) * Frac);
 		UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt(World, LastBowStarboard, BowStarboard,
-		                                                  float(BowWakeWidthM),
+		                                                  float(BowWakeWidthM) * WakeWidthScale,
 		                                                  float(BowWakeStrengthM) * Frac);
 		// The transom trail is wider and weaker: it is the hollow a hull leaves
 		// behind it, not the crest it pushes ahead.
 		UVoxelRippleFieldSubsystem::AddSweptDisturbanceAt(World, LastTransom, Transom,
-		                                                  float(TransomWakeWidthM),
+		                                                  float(TransomWakeWidthM) * WakeWidthScale,
 		                                                  float(TransomWakeStrengthM) * Frac);
 		WakeSplats += 3;
 	}
