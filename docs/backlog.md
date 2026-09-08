@@ -3070,3 +3070,20 @@ section. Left undone there:
   and heading moved on the first post-regen leg, `FRAMING NOT AS REQUESTED`);
   pin the boat's spawn transform and heading explicitly in the harness before
   using region means across regens.
+
+### 15b. Left open by the 2026-09-08 turbidity / bed-darkening / extinction pass
+
+* **Marcher bed darkening is two `#define`s** (`VoxelMarch.usf` `VOXEL_MARCH_SUBMERGED_DARKEN 0.45` / `RAMP_M 0.30`). Making it a live dial that tracks the terrain materials' `SubmergedDarken` / `SubmergedRampM` means two loose floats bound beside the caustic bindings in `VoxelMarchRenderer` (C++), fed from the same cvar. Until then, change the three in step by hand.
+* **Marcher bed darkening rides the caustic bathy sample**, so it is gated by the `VOXEL_MARCH_CAUSTICS` permutation, `voxel.Water.Caustics > 0` and the caustic fade distance; caustics OFF turns the marcher's darkening off. Decoupling is the same C++ change (its own gate and fade).
+* **`water_caustics_graph` does not see `ABSORPTION_CHANNEL_SCALE`** -- it derives attenuation from `ABSORPTION_COLOR` alone; the caustic term is now on slightly clearer water than the surface. Route it through `water_optics.absorption_per_m()`.
+* **Turbidity floor and body colour are not yet owner-judged**; the ladder is in the water doc (2026-09-08 section). The body floor is emissive-only (unlit) by design until the SLW surface-layer question (arm A1) is answered.
+
+### 15c. Music: stingers and short cues (owner-directed backlog, 2026-09-08)
+
+Sub-30 s cues are deferred by the owner ("im not worried about sound effects and tracks
+that are only a couple seconds long"). When picked up: discovery chime, level/skill-up,
+quest accepted / completed, boss reveal, death (the 0:17 `Defeat _ Game Over` exists),
+enter-town and enter-cave transition swells. They belong in the Stingers pool (priority 1,
+play over whatever is running, never cycled) per `docs/music-design.md` §2. Also deferred
+from that doc: per-biome Explore weighting, a settlement-bounds signal for Town,
+Interior/Sacred cues 21-24, and the Cinematic/Ending sets 49-59.
