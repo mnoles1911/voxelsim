@@ -10,6 +10,7 @@
 #include "VoxelEnvironmentRenderContext.h"
 #include "voxelcore/cpuquiescence.h"
 #include "VoxelCpuQuiescence.h"
+#include "voxelcore/footprintresolvecache.h"
 #include "Misc/ScopeExit.h"
 #include "VoxelEnvironmentAuthorityIdentity.h"
 #include "VoxelEnvironmentPageBarrier.h"
@@ -3387,7 +3388,7 @@ bool L0GridScratchEnabled()
 // interesting.
 bool AsyncAssetResolveEnabled()
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelAsyncAssetResolve"));
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelAsyncAssetResolve")) || FParse::Param(FCommandLine::Get(),TEXT("VoxelAssetResolveCacheOnly"));
 	return bEnabled;
 }
 
@@ -3404,6 +3405,7 @@ bool AsyncAssetResolveEnabled()
 // MEASUREMENT -- nothing has been run.
 int32 AsyncAssetResolveWarmPerTick()
 {
+    if(FParse::Param(FCommandLine::Get(),TEXT("VoxelAssetResolveCacheOnly")))return 0;
 	static const int32 N = []
 	{
 		int32 Value = 24;
@@ -8427,30 +8429,21 @@ struct FVoxelWorldImpl
 	// every tree in that footprint for the rest of the session. So an entry is
 	// only stored once the footprint's dilated rect is resident, and until then
 	// the resolve is simply re-run, which is what today's code does anyway.
-	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, std::vector<vxc::AssetField::ResolvedAssetInstance>>
-		AssetResolveCache;
-
-	// Footprints with a warm task outstanding. Game thread only. Its job is to
-	// stop N chunks of one column each launching their own task for the same
-	// footprint -- without it the warm pass would be a work MULTIPLIER, not a
-	// mover.
-	mutable TSet<VoxelCoords::FVoxelLevelChunkKey> AssetResolveInFlight;
-
-	// Every key EVER stored in AssetResolveCache this session. Game thread
-	// only, diagnosis only: it exists to split a dispatch-peek miss into
-	// "first ask" (the designed cold path) versus "stored once and pruned
-	// since" (the prune eating the live set) -- the two need opposite fixes
-	// and one miss counter cannot tell them apart. Grows with footprints
-	// visited (~16 bytes each, ~2 MB over the longest leg to date) and is
-	// never pruned: pruning it would re-classify an evicted key as a first
-	// ask, which is precisely the lie it exists to catch.
-	mutable TSet<VoxelCoords::FVoxelLevelChunkKey> AssetResolveEverStored;
+    using FResolveCache=vxc::FootprintResolveCache<vxc::AssetField::ResolvedAssetInstance>;
+    mutable FResolveCache AssetResolveCache;
+    mutable uint64 ResolveResidency=UINT64_MAX,ResolveWorldConfig=UINT64_MAX,ResolveFieldConfig=UINT64_MAX,ResolveBankConfig=UINT64_MAX;
+    mutable const void* ResolveField=nullptr;mutable const void* ResolveBankSource=nullptr;mutable const void* ResolveStreamer=nullptr;
+    mutable std::string ResolveProvider,ResolveFineProvider;
+    mutable FString ResolveCatalog;
+    static vxc::FootprintResolveKey ResolveKeyOf(const VoxelCoords::FVoxelLevelChunkKey& K){return {K.Level,K.Key.X,K.Key.Y};}
+    void SyncAssetResolveCache() const;
 
 	// Worker -> game thread. Same MPSC shape as ResultsQueue and for the same
 	// reason: many task threads produce, exactly one consumer drains.
 	struct FAssetResolveResult
 	{
 		VoxelCoords::FVoxelLevelChunkKey Key;
+        FResolveCache::Warm Token;
 		std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved;
 	};
 	mutable TQueue<FAssetResolveResult, EQueueMode::Mpsc> AssetResolveQueue;
@@ -12968,21 +12961,24 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			       (unsigned long long)VoxelStreamAdmission::GAssetResolveWarmNotResident.load(std::memory_order_relaxed),
 			       double(VoxelStreamAdmission::GAssetResolveGameThreadUs.load(std::memory_order_relaxed)) / 1000.0,
 			       double(VoxelStreamAdmission::GAssetResolveWorkerUs.load(std::memory_order_relaxed)) / 1000.0,
-			       AssetResolveCache.Num(), AssetResolveInFlight.Num());
+			       int32(AssetResolveCache.size()), int32(AssetResolveCache.pendingSize()));
 			// The rewire's own line (see GAssetResolvePeekHit's doc comment for
 			// the reading and the failing states). Separate from the line above
 			// so every log taken between B.3 and this change stays
 			// field-comparable with both.
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("assets RESOLVE peek: hit=%llu missFirst=%llu missEvicted=%llu | "
-			            "meshWorker inline=%llu (%.1f ms) | pruned=%llu (everStored %d)"),
+			       TEXT("assets RESOLVE peek: hit=%llu missUnknown=%llu missEvicted=%llu | "
+			            "meshWorker inline=%llu (%.1f ms) | pruned=%llu (recentStored %d)"),
 			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePeekHit.load(std::memory_order_relaxed),
 			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePeekMissFirst.load(std::memory_order_relaxed),
 			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePeekMissEvicted.load(std::memory_order_relaxed),
 			       (unsigned long long)VoxelStreamAdmission::GAssetResolveMeshWorkerInline.load(std::memory_order_relaxed),
 			       double(VoxelStreamAdmission::GAssetResolveMeshWorkerUs.load(std::memory_order_relaxed)) / 1000.0,
 			       (unsigned long long)VoxelStreamAdmission::GAssetResolvePruneEvicted.load(std::memory_order_relaxed),
-			       AssetResolveEverStored.Num());
+			       int32(AssetResolveCache.historySize()));
+            UE_LOG(LogVoxelPerf,Log,TEXT("assets RESOLVE bounded: payloadBytes=%llu evicted=%llu refused=%llu staleWarm=%llu historyForgotten=%llu epoch=%llu"),
+                (unsigned long long)AssetResolveCache.bytes(),(unsigned long long)AssetResolveCache.evictions,(unsigned long long)AssetResolveCache.refused,
+                (unsigned long long)AssetResolveCache.stale,(unsigned long long)AssetResolveCache.historyForgotten,(unsigned long long)AssetResolveCache.epoch());
 		}
 
 		// The histogram, by NAME, sorted by share. A bankId is only a number to
@@ -19064,10 +19060,8 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 		static bool Get(const vxc::Amplifier& InAmp, int64 X0, int64 Y0, int64 X1,
 		                int64 Y1, int32 Depth, int64& OutLo, int64& OutHi)
 		{
-			const int64 Lo = InAmp.surfaceLowerBoundMm(X0, Y0, X1, Y1);
-			const int64 Hi = InAmp.surfaceUpperBoundMm(X0, Y0, X1, Y1);
-			if (Lo != vxc::kSurfaceLowerBoundDeclined &&
-			    Hi != vxc::kSurfaceBoundDeclined)
+			int64 Lo = 0, Hi = 0;
+			if (InAmp.surfaceBoundPairMm(X0, Y0, X1, Y1, Lo, Hi))
 			{
 				OutLo = Lo;
 				OutHi = Hi;
@@ -19522,108 +19516,62 @@ bool FVoxelWorldImpl::AssetResolveFootprintResident(int32 Level, int32 ChunkX, i
 	return FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm);
 }
 
-const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::ResolvedAssetsForFootprint(
-	int32 Level, int32 ChunkX, int32 ChunkY,
-	std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch) const
+void FVoxelWorldImpl::SyncAssetResolveCache() const
 {
-	check(IsInGameThread());
-	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
-	if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
-	{
-		if (const std::vector<vxc::AssetField::ResolvedAssetInstance>* Hit = AssetResolveCache.Find(CacheKey))
-		{
-			VoxelStreamAdmission::GAssetResolveCacheHits.fetch_add(1, std::memory_order_relaxed);
-			return Hit;
-		}
-	}
+    check(IsInGameThread());if(!VoxelStreamAdmission::AsyncAssetResolveEnabled())return;
+    const auto* Field=Voxels.assetField();
+    const uint64 Residency=FineStreamer?FineStreamer->ResidencyEpoch():0;
+    const uint64 WorldConfig=Voxels.configurationRevision(),FieldConfig=Field?Field->configurationRevision():0,BankConfig=AssetBanks.configurationRevision();
+    const std::string& Provider=Voxels.log().providerId();
+    static const std::string EmptyProvider;
+    const std::string& FineProvider=FineStreamer?FineStreamer->ProviderId():EmptyProvider;
+    if(WorldConfig==UINT64_MAX||FieldConfig==UINT64_MAX||BankConfig==UINT64_MAX){AssetResolveCache.disable();return;}
+    if(ResolveResidency!=Residency||ResolveWorldConfig!=WorldConfig||ResolveFieldConfig!=FieldConfig||ResolveBankConfig!=BankConfig||
+       ResolveField!=Field||ResolveBankSource!=AssetBankTap.Inner||ResolveStreamer!=FineStreamer.Get()||
+       ResolveProvider!=Provider||ResolveFineProvider!=FineProvider||ResolveCatalog!=ProductionCatalogHash){
+        AssetResolveCache.invalidate(); // pending slots stay charged until completion
+        ResolveResidency=Residency;ResolveWorldConfig=WorldConfig;ResolveFieldConfig=FieldConfig;ResolveBankConfig=BankConfig;
+        ResolveField=Field;ResolveBankSource=AssetBankTap.Inner;ResolveStreamer=FineStreamer.Get();
+        ResolveProvider=Provider;ResolveFineProvider=FineProvider;ResolveCatalog=ProductionCatalogHash;
+    }
+}
 
-	// THE FALLBACK, AND IT IS THE WHOLE SAFETY ARGUMENT. A miss resolves right
-	// here, on this thread, with the same body a warm task would have run. So
-	// there is no state in which a chunk waits for a task, no state in which a
-	// late task produces a hole, and with the switch OFF this is the only path
-	// and it is what the three call sites did before this change.
-	const double T0 = FPlatformTime::Seconds();
-	OutScratch = VoxelResolveTerrainInstances(Voxels.generated(),
-	                                          VoxelAssetRectForFootprint(Level, ChunkX, ChunkY));
-	VoxelStreamAdmission::GAssetResolveInline.fetch_add(1, std::memory_order_relaxed);
-	VoxelStreamAdmission::GAssetResolveGameThreadUs.fetch_add(
-		int64((FPlatformTime::Seconds() - T0) * 1e6), std::memory_order_relaxed);
-
-	if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
-	{
-		if (AssetResolveFootprintResident(Level, ChunkX, ChunkY))
-		{
-			// Cache it, and the Z-siblings behind this chunk in the SAME tick
-			// hit. That is where most of the 8.3-of-9.3 saving actually lands --
-			// a column's chunks are dispatched together, so waiting for a warm
-			// task to cover them would have left the largest term unpaid.
-			//
-			// COPIED, NOT MOVED, into the map. The caller owns OutScratch and the
-			// contract of this function is "the returned pointer is valid" --
-			// moving out of the caller's buffer would be a silent second contract
-			// nobody reading a call site could see, to save one vector copy of a
-			// handful of instances on a path that just paid an Amplifier::column
-			// per candidate site. Not a cost worth a footgun.
-			//
-			// AssetResolveInFlight is deliberately NOT cleared here even though a
-			// warm task for this footprint may now be redundant. The set means
-			// "a task is outstanding", and it is: letting the task land and be
-			// counted as `raced` is the truthful state, and clearing it early
-			// would only let WarmAssetResolves launch a SECOND task for the same
-			// footprint before the first one returned.
-			AssetResolveCache.Add(CacheKey, OutScratch);
-			AssetResolveEverStored.Add(CacheKey);
-			return AssetResolveCache.Find(CacheKey);
-		}
-		// Not resident: honest answer for THIS caller, not yet a fact worth
-		// memoizing. Identical policy to FootprintChunkZRangeCached, and the
-		// stakes are higher here -- a non-resident resolve returns an EMPTY
-		// list, and an empty list cached forever is every tree in this footprint
-		// gone for the session.
-		VoxelStreamAdmission::GAssetResolveUncached.fetch_add(1, std::memory_order_relaxed);
-	}
-	return &OutScratch;
+const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::ResolvedAssetsForFootprint(
+    int32 Level,int32 ChunkX,int32 ChunkY,std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch) const
+{
+    check(IsInGameThread());SyncAssetResolveCache();
+    const vxc::FootprintResolveKey Key{Level,ChunkX,ChunkY};const uint64 Epoch=AssetResolveCache.epoch();
+    if(VoxelStreamAdmission::AsyncAssetResolveEnabled())if(const auto* Hit=AssetResolveCache.find(Key)){
+        VoxelStreamAdmission::GAssetResolveCacheHits.fetch_add(1,std::memory_order_relaxed);return Hit;
+    }
+    const double Started=FPlatformTime::Seconds();
+    OutScratch=VoxelResolveTerrainInstances(Voxels.generated(),VoxelAssetRectForFootprint(Level,ChunkX,ChunkY));
+    VoxelStreamAdmission::GAssetResolveInline.fetch_add(1,std::memory_order_relaxed);
+    VoxelStreamAdmission::GAssetResolveGameThreadUs.fetch_add(int64((FPlatformTime::Seconds()-Started)*1e6),std::memory_order_relaxed);
+    if(VoxelStreamAdmission::AsyncAssetResolveEnabled()){
+        SyncAssetResolveCache();
+        if(Epoch==AssetResolveCache.epoch()&&AssetResolveFootprintResident(Level,ChunkX,ChunkY)&&AssetResolveCache.put(Key,OutScratch))return AssetResolveCache.find(Key);
+        VoxelStreamAdmission::GAssetResolveUncached.fetch_add(1,std::memory_order_relaxed);
+    }
+    return &OutScratch;
 }
 
 void FVoxelWorldImpl::DrainAssetResolveResults()
 {
-	check(IsInGameThread());
-	if (!VoxelStreamAdmission::AsyncAssetResolveEnabled())
-	{
-		return;
-	}
-	FAssetResolveResult Landed;
-	while (AssetResolveQueue.Dequeue(Landed))
-	{
-		VoxelStreamAdmission::GAssetResolveWarmLanded.fetch_add(1, std::memory_order_relaxed);
-		AssetResolveInFlight.Remove(Landed.Key);
-		if (AssetResolveCache.Contains(Landed.Key))
-		{
-			// The game thread resolved it inline before the task came back. Keep
-			// the entry that is already there rather than overwriting: they are
-			// the same function of the same inputs, but the resident one has
-			// already been checked and this one has not.
-			VoxelStreamAdmission::GAssetResolveWarmRaced.fetch_add(1, std::memory_order_relaxed);
-			continue;
-		}
-		// RESIDENCY CHECKED HERE TOO, not only at launch. Residency can only be
-		// read on the game thread, so the task cannot check its own inputs; the
-		// launch-side check says the raster was resident when the work started
-		// and this one says it still is. Neither proves it stayed resident
-		// throughout -- that is the same exposure FootprintZRangeCache already
-		// accepts and it is stated rather than papered over.
-		if (!AssetResolveFootprintResident(Landed.Key.Level, Landed.Key.Key.X, Landed.Key.Key.Y))
-		{
-			VoxelStreamAdmission::GAssetResolveWarmNotResident.fetch_add(1, std::memory_order_relaxed);
-			continue;
-		}
-		AssetResolveCache.Add(Landed.Key, MoveTemp(Landed.Resolved));
-		AssetResolveEverStored.Add(Landed.Key);
-	}
+    check(IsInGameThread());SyncAssetResolveCache();
+    FAssetResolveResult Landed;
+    while(AssetResolveQueue.Dequeue(Landed)){
+        VoxelStreamAdmission::GAssetResolveWarmLanded.fetch_add(1,std::memory_order_relaxed);
+        const bool Resident=AssetResolveFootprintResident(Landed.Key.Level,Landed.Key.Key.X,Landed.Key.Key.Y);
+        SyncAssetResolveCache();
+        if(!AssetResolveCache.complete(Landed.Token,std::move(Landed.Resolved),Resident))
+            VoxelStreamAdmission::GAssetResolveWarmNotResident.fetch_add(1,std::memory_order_relaxed);
+    }
 }
 
 void FVoxelWorldImpl::WarmAssetResolves()
 {
+    SyncAssetResolveCache();
     if(!CpuAdmission.isOpen())return;
 	check(IsInGameThread());
 	if (!VoxelStreamAdmission::AsyncAssetResolveEnabled())
@@ -19689,7 +19637,7 @@ void FVoxelWorldImpl::WarmAssetResolves()
 		{
 			const VoxelCoords::FVoxelLevelChunkKey CacheKey{
 				Level, VoxelCoords::FVoxelChunkKey{Queue[I].Key.Key.X, Queue[I].Key.Key.Y, 0}};
-			if (AssetResolveCache.Contains(CacheKey) || AssetResolveInFlight.Contains(CacheKey))
+			if (AssetResolveCache.contains(ResolveKeyOf(CacheKey)))
 			{
 				continue; // already answered, or already being answered
 			}
@@ -19699,7 +19647,11 @@ void FVoxelWorldImpl::WarmAssetResolves()
 			{
 				continue;
 			}
-			AssetResolveInFlight.Add(CacheKey);
+            const auto RectBound=VoxelAssetRectForFootprint(Level,CacheKey.Key.X,CacheKey.Key.Y);
+            if(!vxc::footprintResolveSitesBound(RectBound,Field->layers()))continue;
+            SyncAssetResolveCache();
+            const auto WarmToken=AssetResolveCache.beginWarm(ResolveKeyOf(CacheKey));
+            if(!WarmToken)continue;
 			++Launched;
 			VoxelStreamAdmission::GAssetResolveWarmLaunched.fetch_add(1, std::memory_order_relaxed);
 			const vxc::AssetVoxelRect Rect = VoxelAssetRectForFootprint(Level, CacheKey.Key.X, CacheKey.Key.Y);
@@ -19712,11 +19664,11 @@ void FVoxelWorldImpl::WarmAssetResolves()
 			// the array on the very next line rather than fired and forgotten.
 			UE::Tasks::TTask<void> Task = LaunchAdmittedCpuTask(
 				TEXT("VoxelAssetResolveWarm"),
-				[GenPtr, QueuePtr, CacheKey, Rect]()
+				[GenPtr, QueuePtr, CacheKey, Rect, WarmToken]()
 				{
 					const double T0 = FPlatformTime::Seconds();
 					FAssetResolveResult Out;
-					Out.Key = CacheKey;
+					Out.Key = CacheKey;Out.Token=WarmToken;
 					Out.Resolved = VoxelResolveTerrainInstances(*GenPtr, Rect);
 					VoxelStreamAdmission::GAssetResolveWorkerUs.fetch_add(
 						int64((FPlatformTime::Seconds() - T0) * 1e6), std::memory_order_relaxed);
@@ -19733,47 +19685,7 @@ void FVoxelWorldImpl::WarmAssetResolves()
 
 void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 {
-	// B.3: the asset resolve cache prunes on ITS OWN trigger, ahead of the early
-	// return below, and that is deliberate rather than tidy.
-	//
-	// The other three memos hold 8-12 bytes per entry, so 65,536 of them is under
-	// a megabyte and one shared trigger is fine. An AssetResolveCache entry is a
-	// std::vector -- a heap allocation plus ~40 bytes per resolved instance --
-	// and 65,536 live vectors is a different kind of object entirely. Sharing the
-	// trigger would let it sit at that size for as long as the z-range cache
-	// stayed under its own limit, which on a stationary session is forever.
-	//
-	// 8,192 entries is ~1.6x the 5,026 level-0 columns a 128 m R0 disc holds, so
-	// the working set of a stationary or slowly-moving camera fits with headroom
-	// and only travel evicts. Not tuned by measurement.
-	constexpr int32 AssetResolveCacheMaxEntries = 8192;
-	if (AssetResolveCache.Num() > AssetResolveCacheMaxEntries)
-	{
-		for (auto It = AssetResolveCache.CreateIterator(); It; ++It)
-		{
-			const int32 Level = It.Key().Level;
-			const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
-			// Twice the level's UNLOAD radius, single-sourced: a cache prune
-			// radius derived from a second spelling of the eviction radius
-			// would silently stop matching it under -VoxelUnloadBandChunks.
-			const double KeepRadiusUU = VoxelStreamAdmission::UnloadOuterUU(Level) * 2.0;
-			const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
-			const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
-			if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) >
-			    FMath::Square(KeepRadiusUU))
-			{
-				It.RemoveCurrent();
-				// Counted so the entry-count-vs-trigger gap is readable: the
-				// first leg sat at 40,831 entries against an 8,192 trigger and
-				// nothing said whether the prune was running at all. Paired
-				// with peekMissEvicted: pruneEvicted high + peekMissEvicted
-				// near zero is the prune doing its job on genuinely departed
-				// ground; both high is the prune discarding the live set.
-				VoxelStreamAdmission::GAssetResolvePruneEvicted.fetch_add(1, std::memory_order_relaxed);
-			}
-		}
-	}
-
+    // Resolve cache evicts under hard entry/payload admission, independently of this terrain memo.
 	if (FootprintZRangeCache.Num() <= FootprintZRangeCacheMaxEntries)
 	{
 		return;
@@ -26511,17 +26423,18 @@ void FVoxelWorldImpl::DispatchJobs()
 		std::vector<vxc::AssetField::ResolvedAssetInstance> AssetResolveList;
 		if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
 		{
+            SyncAssetResolveCache();
 			const VoxelCoords::FVoxelLevelChunkKey ResolveKey{
 				LevelKey.Level, VoxelCoords::FVoxelChunkKey{LevelKey.Key.X, LevelKey.Key.Y, 0}};
 			if (const std::vector<vxc::AssetField::ResolvedAssetInstance>* Hit =
-			        AssetResolveCache.Find(ResolveKey))
+			        AssetResolveCache.find(ResolveKeyOf(ResolveKey)))
 			{
 				AssetResolveList = *Hit; // copied: the prune may drop the entry while the job flies
 				bAssetResolveFromCache = true;
 				VoxelStreamAdmission::GAssetResolveCacheHits.fetch_add(1, std::memory_order_relaxed);
 				VoxelStreamAdmission::GAssetResolvePeekHit.fetch_add(1, std::memory_order_relaxed);
 			}
-			else if (AssetResolveEverStored.Contains(ResolveKey))
+			else if (AssetResolveCache.recentlyStored(ResolveKeyOf(ResolveKey)))
 			{
 				VoxelStreamAdmission::GAssetResolvePeekMissEvicted.fetch_add(1, std::memory_order_relaxed);
 			}

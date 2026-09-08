@@ -166,6 +166,7 @@ VoxelZstdDll
 # VoxelNoGpuMesh left this list the same day: the fork's default flipped to
 # OFF and the switch became VoxelGpuMesh (the enable arm).
 VoxelAsyncAssetResolve
+VoxelAssetResolveCacheOnly
 VoxelAsyncAssetResolveWarm
 VoxelNoIncrementalAdmission
 VoxelNoBucketedExitScan

@@ -53,6 +53,7 @@ public:
         : amp_(seed, tiles), gen_(amp_), log_(seed, B, providerId),
           craftLog_(seed, B, std::move(providerId), kCraftPitchMm) {}
 
+    uint64_t configurationRevision() const{return configurationRevision_;}
     const Amplifier& amplifier() const { return amp_; }
 
     // DEBUG WATER MARKER passthrough. `amplifier()` is deliberately const --
@@ -64,10 +65,10 @@ public:
     // Amplifier::setWaterMarker documents why; the practical reason here is
     // that a session-lifetime brick cache would otherwise serve pre-marker
     // bricks alongside marked ones.
-    void setWaterMarker(IWaterSampler* sampler, bool includeOcean = true) {
+    void setWaterMarker(IWaterSampler* sampler, bool includeOcean = true) { if(configurationRevision_!=UINT64_MAX)++configurationRevision_;
         amp_.setWaterMarker(sampler, includeOcean);
     }
-    void setWaterMarkerFillPx(int64_t px) { amp_.setWaterMarkerFillPx(px); }
+    void setWaterMarkerFillPx(int64_t px) { if(configurationRevision_!=UINT64_MAX)++configurationRevision_; amp_.setWaterMarkerFillPx(px); }
 
     // THE ASSET TERM, and the same narrow door for the same reason.
     //
@@ -81,14 +82,14 @@ public:
     //
     // The field is NOT owned. It holds decoded species banks that outlive any
     // one world, which is the whole point of residency being per bank.
-    void setAssetField(const AssetField* field) { gen_.setAssetField(field); }
+    void setAssetField(const AssetField* field) { if(configurationRevision_!=UINT64_MAX)++configurationRevision_; gen_.setAssetField(field); }
     const AssetField* assetField() const { return gen_.assetField(); }
     // The channel source is worldgen exactly as the field is (see
     // GeneratedWorld::setAssetChannelSource): same narrow door, same bring-up
     // rule. assetChannelsAt is forwarded so host-side parallel samplers (the
     // UE meshers, exact admission) resolve facts through the SAME source the
     // brick/materialAt paths compose with -- one binding, no drift.
-    void setAssetChannelSource(IAssetChannelSource* src) { gen_.setAssetChannelSource(src); }
+    void setAssetChannelSource(IAssetChannelSource* src) { if(configurationRevision_!=UINT64_MAX)++configurationRevision_; gen_.setAssetChannelSource(src); }
     AssetColumnChannels assetChannelsAt(int64_t vx, int64_t vy) const {
         return gen_.assetChannelsAt(vx, vy);
     }
@@ -454,6 +455,7 @@ private:
         overlay_.insert(terrainBrick, std::move(projected));
     }
 
+    uint64_t configurationRevision_=0;
     Amplifier amp_;
     GeneratedWorld<B> gen_;
     ChunkMap<B> overlay_;
