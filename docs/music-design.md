@@ -61,8 +61,10 @@ The sky clock exists (the journal already reads it). Four slots, boundaries in g
 
 A cue belongs to exactly one slot. A slot with fewer than four cues borrows from its
 neighbours in this order: Dawn borrows Day, Dusk borrows Day then Night, Night borrows
-Dusk. Day never borrows. The boundaries are a first draft; they are read from one table
-so they can move.
+Dusk, then Day as a floor. Day never borrows. The walk stops as soon as it has four cues,
+so Night reaches Day only while Night and Dusk together hold fewer than four, which is the
+library today (one Night cue, no Dusk); once the six Night cues exist that link is never
+consulted. The boundaries are a first draft; they are read from one table so they can move.
 
 ## 5. What belongs in Explore (the rule for every future cue)
 
@@ -144,6 +146,68 @@ Stingers and any cue under about thirty seconds are **backlog** by owner directi
   in its first seconds); menu music on legs is unchanged.
 - A `music.json` manifest replaces folders only if per-cue metadata beyond pool and slot
   becomes necessary (leitmotif tags, per-biome weighting). Not now.
+
+### Implemented 2026-09-08
+
+Sections 2, 3, 4, 6 and 8 are in the game. Nothing was built (a live editor held the
+DLL pair); the coordinator compiles.
+
+**Files.**
+
+| file | what it holds |
+|---|---|
+| `ue-project/Source/VoxelEarthUI/VoxelMusicPools.h/.cpp` | **new.** The pure half: the pool and slot enums, the folder table, the priority ladder (`VoxelMusicResolvePool`), the *one* hour-boundary table (`kSlotBounds`), the borrow chains, the gap ranges, and `FVoxelMusicShuffle`. No UWorld, no audio device, no file system. |
+| `ue-project/Source/VoxelEarthUI/VoxelUIMusic.h/.cpp` | rewritten. One shuffled playlist per folder instead of one per session; a 2 Hz signal poll; authored gaps; a crossfade; `SetContext(Menu/Loading/InWorld)`. |
+| `ue-project/Source/VoxelEarthUI/VoxelMusicPoolTests.cpp` | **new.** Six headless tests, `VoxelEarth.Music.*`: hour boundaries from both sides, borrowing, the priority ladder rung by rung, gap ranges *and* that the draw actually samples them, no-repeat-until-exhausted including the seam, and the recents rule. |
+| `ue-project/Source/VoxelEarthUI/VoxelAudioUserSettings.h/.cpp` | `GetRecentMusicCues` / `PushRecentMusicCue`, five deep, keyed by pool, stored by filename under `[VoxelAudio] RecentCues_<Pool>`. |
+| `ue-project/Source/VoxelEarth/VoxelClipmapActor.h` | one public inline `IsUndergroundVeilActive()`. The Cave signal is the veil's own latch, read rather than re-derived. |
+| `ue-project/Source/VoxelEarthUI/VoxelFrontEndSwitches.h/.cpp` | `-VoxelMusicPool=`, `-VoxelMusicGap=`. Both classified as tuning in `tools/frontend-switch-classification.txt`. |
+| `ue-project/Content/Audio/Music/` | 29 WAVs moved into the pool folders per section 6; `Main Theme.wav` deleted; `.gitkeep` in each folder; `MUSIC_CREDITS.md` rewritten as the real listing. |
+
+**Log contract.** One line per selection --
+`VoxelUIMusic: pool=<pool> slot=<slot> cue='<name>' gap=<s>` -- and one per pool change,
+`VoxelUIMusic: pool change <old> -> <new> (crossfade 3.0s)`. `VoxelUIMusic: pools built`
+prints every folder's cue count once at boot, so an empty pool and a misspelled folder
+are distinguishable.
+
+**Crossfade.** A real one, 3 s, without ever holding two decoded cues: the outgoing wave
+is handed 3 s of already-decoded PCM in one queue (~576 KB), un-registered as the active
+wave so the underflow callback ignores it, told to `FadeOut`, and reaped by the ticker;
+the incoming cue starts at once with `FadeIn`. Both voices are live, one buffer is.
+
+**Signals: two real, four stubbed.** Real -- Water (`Cast<AVoxelBoat>` on the player's
+pawn) and Cave (the veil latch). Stubbed false, each behind a named predicate rather than
+a bare `false`: Combat (no threat signal exists anywhere in this project), Town (no
+settlement bounds), Rain (`UVoxelWeatherSubsystem` publishes wind and nothing else), and
+Stingers (fired by an event; nothing fires one). So on the shipped build only Explore,
+Water, Cave and Menu are ever selected, and the seven Town and two Combat cues on disk
+are unreachable until their one line changes.
+
+**Two departures from the letter of the document, both deliberate.**
+
+1. *Explore has its own condition.* Section 2 puts Explore at 4 and Menu at 5, which only
+   means something if Explore can fail to apply, so the ladder's last rung is "the player
+   has a world" rather than "not the menu". The front end sets that explicitly at three
+   points rather than having the music derive it from whether a pawn exists.
+2. *Borrowing resolves to one folder, not a union.* One bank is one shuffled playlist, so
+   the chain is walked until the running cue count reaches four and the cue is drawn from
+   the link that got it there (with the widest link as the fallback when the chain never
+   reaches four -- which is exactly the shipped Night case: Night has one cue and Dusk has
+   none, and Night keeps its own rather than reaching past its borrow list into Day).
+   The slot that is logged is the one the cue actually came from, so a borrow is visible.
+
+**One behaviour the owner will notice at the hand-off.** ADR-0009's "adopt at BeginLoad"
+still holds from the title screen through the loading curtain -- both are the Menu pool, so
+the Main Title plays across the whole front end uninterrupted. But the moment the player
+has the world, the pool resolves to Explore and the Main Title crossfades out over 3 s into
+an Explore cue. That is section 2 doing what it says (the title is a Menu cue and gameplay
+is not the menu) rather than a regression of the adopt contract, and it is the only place
+the two documents point in different directions. If the owner prefers the title cue to run
+to its end in the world, the change is one condition on the first pool change after the
+hand-off.
+
+**Not done:** the `.mp4` was not re-encoded -- `ffmpeg` is not on this box's PATH and was
+not found installed. The exact command is in `MUSIC_CREDITS.md`.
 
 ## 9. Backlog (not this pass)
 

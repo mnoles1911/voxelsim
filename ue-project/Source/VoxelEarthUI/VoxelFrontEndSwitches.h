@@ -282,6 +282,29 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	float LoadTheatreMinSeconds = 30.0f;
 	float LoadTheatreMaxSeconds = 60.0f;
 
+	// ---- The music pools (docs/music-design.md), 2026-09-08 ---------------
+	//
+	// TWO DIAGNOSTIC OVERRIDES, AND THEY EXIST BECAUSE THE MECHANISM IS
+	// OTHERWISE UNPROVABLE FROM A LOG IN ANY REASONABLE TIME. The shipped
+	// authored silence is 45-120 s per cue and the Cave/Water pools need the
+	// player to be under rock or aboard a boat, so a run that wanted to show
+	// "the pool machinery selects, gaps and crossfades" would take ten minutes
+	// and a cave. Both of these are ORDINARY CONFIGURATION -- neither poses,
+	// captures or ends a run -- and both are recorded in
+	// tools/frontend-switch-classification.txt.
+
+	// -VoxelMusicPool=<Explore|Cave|Town|Water|Combat|Menu|Stingers|Cinematic>:
+	// pin the pool, ignoring the world's signals. Empty (the default) means the
+	// signals decide. A pinned pool with no cues on disk still falls through to
+	// the next pool down, so this cannot produce silence by itself.
+	FString MusicPool;
+
+	// -VoxelMusicGap=<seconds>: replace the authored silence with a fixed
+	// duration, for every pool. Negative means "leave the design's ranges
+	// alone", which is the default; 0 is legal and restores the pre-2026-09-08
+	// back-to-back behaviour for an A/B.
+	float MusicGapSeconds = -1.f;
+
 	// -VoxelMenuWatchdog=<seconds>: under -unattended, refuse to sit on the
 	// menu past N seconds and exit with an error. Same shape as
 	// -VoxelPerfExitWatchdog, and for the same reason: a mis-flagged headless

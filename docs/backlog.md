@@ -3087,3 +3087,32 @@ enter-town and enter-cave transition swells. They belong in the Stingers pool (p
 play over whatever is running, never cycled) per `docs/music-design.md` §2. Also deferred
 from that doc: per-biome Explore weighting, a settlement-bounds signal for Town,
 Interior/Sacred cues 21-24, and the Cinematic/Ending sets 49-59.
+
+**Deferred by the 2026-09-08 implementation pass** (the pool system itself shipped; see
+`docs/music-design.md` §8 "Implemented 2026-09-08"):
+
+* **`17 — Lirien-Thal _ The Silverwood.mp4` is still unplayable.** `ffmpeg` is not on this
+  machine's PATH and was not found installed, so the re-encode to 16-bit PCM 48 kHz stereo
+  did not happen. The file sits in the root of `Content/Audio/Music/`, outside every pool
+  folder, so it is never scanned and cannot break anything. The exact command and its
+  destination folder (`Explore/Day`) are in `Content/Audio/Music/MUSIC_CREDITS.md`.
+* **Three signals are stubbed predicates that cannot fire**, each named so it is one line
+  to wire: `IsCombatThreatActive` (no combat exists), `IsInsideSettlement` (no settlement
+  bounds -- this is the Town row above, restated at the call site), `IsRaining`
+  (`UVoxelWeatherSubsystem` publishes wind only; there is no precipitation state). Seven
+  Town cues and two Combat cues are on disk and unreachable until they do.
+* **`Discovery_Wonder` has not had its ear check.** `docs/music-design.md` §6 flags it as
+  ambiguous for Explore; it is in `Explore/Day` on the research pass's word. Also unjudged:
+  `11 — The Sorrowmarsh` is 7:59 against §5's three-to-six-minute rule, and 87.8 MB.
+* **Night is one cue on repeat.** `Explore/Night` holds only `Camp_Rest`, its borrow chain
+  is Dusk (empty), and §4 does not let Night borrow Day. Until §7's six Night cues exist,
+  a night in game is that one cue with 45-120 s of silence between plays. This is the
+  largest content gap in the library and is content, not code.
+* **No settings row for the music pools.** Nothing player-facing exposes the gap length,
+  the crossfade, or a "no authored silence" arm -- only `-VoxelMusicGap=` does, which is a
+  command-line switch. If the owner judges the 45-120 s silence too long or too short in
+  play, the standing settings-panel policy says that becomes a row.
+* **The pool machinery has not been run.** Nothing was built or launched this pass (a live
+  game window held the DLL pair); the headless tests cover the pure half only, and the
+  crossfade, the gap timer and the boat/cave signal transitions have never executed. The
+  selection log line is what a first attended launch should be read against.

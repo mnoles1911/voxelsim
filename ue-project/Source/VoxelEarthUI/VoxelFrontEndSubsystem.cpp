@@ -370,6 +370,10 @@ void UVoxelFrontEndSubsystem::EnterMenu()
 	// The stream is the one the backgrounds were shuffled from, so a seeded run
 	// pairs the same art with the same track.
 	{
+		// The title screen is the Menu pool (docs/music-design.md section 2,
+		// row 5). Set BEFORE StartRandom, because StartRandom resolves the pool
+		// from the context it finds.
+		FVoxelUIMusic::Get().SetContext(EVoxelMusicContext::Menu);
 		FRandomStream MusicStream = MakeVoxelUIRandomStream();
 		FVoxelUIMusic::Get().StartRandom(GetWorld(), MusicStream);
 	}
@@ -682,6 +686,12 @@ void UVoxelFrontEndSubsystem::BeginLoad(const FString& EditLogPath, const FTrans
 	// loading screen goes up WITHOUT a menu in front of it, which no switch
 	// takes today and which would otherwise be silently music-less.
 	{
+		// The loading curtain shares the Menu pool with the title screen
+		// (docs/music-design.md section 2, row 5: "title and loading screens"),
+		// so this is a context change and NOT a pool change -- the cue the menu
+		// started keeps playing across it, which is what "adopt at BeginLoad"
+		// has meant since ADR-0009.
+		FVoxelUIMusic::Get().SetContext(EVoxelMusicContext::Loading);
 		FRandomStream MusicStream = MakeVoxelUIRandomStream();
 		FVoxelUIMusic::Get().StartRandom(GetWorld(), MusicStream);
 	}

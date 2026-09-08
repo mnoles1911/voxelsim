@@ -223,6 +223,13 @@ FVoxelFrontEndSwitches Parse()
 	FParse::Value(Cmd, TEXT("VoxelLoadGateMaxWait="), S.LoadGateMaxWaitSeconds);
 	FParse::Value(Cmd, TEXT("VoxelMenuWatchdog="), S.MenuWatchdogSeconds);
 
+	// The music-pool overrides. The pool name is validated where it is used
+	// (FVoxelUIMusic::ChooseBank, against VoxelMusicPoolFromName) rather than
+	// here, so the warning names the eight legal spellings in one place.
+	FParse::Value(Cmd, TEXT("VoxelMusicPool="), S.MusicPool);
+	S.MusicPool = S.MusicPool.TrimStartAndEnd();
+	FParse::Value(Cmd, TEXT("VoxelMusicGap="), S.MusicGapSeconds);
+
 	// -VoxelLoadingScreenThread=0|1. Int-valued rather than a bare Param so
 	// that BOTH directions are expressible from a command line; the default
 	// moved 1 -> 0 after the 2026-09-07 hang, see the field's comment.

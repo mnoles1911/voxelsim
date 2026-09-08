@@ -15,6 +15,21 @@ constexpr const TCHAR* kMasterKey = TEXT("MasterVolume");
 constexpr const TCHAR* kMusicKey = TEXT("MusicVolume");
 constexpr const TCHAR* kMusicInGameKey = TEXT("MusicInGame");
 
+// One ini key per pool: RecentCues_Explore, RecentCues_Cave, ... Written with
+// GConfig's ARRAY form (repeated `+RecentCues_X=` lines) rather than as one
+// joined string, because a cue's filename may contain any separator character
+// we could have picked -- the shipped set already has spaces, em dashes,
+// underscores, parentheses and a `_` standing in for `/`.
+constexpr const TCHAR* kRecentCuesKeyPrefix = TEXT("RecentCues_");
+
+// docs/music-design.md section 8: "the last five cues played per pool".
+constexpr int32 kRecentCueMemory = 5;
+
+FString RecentCuesKey(const TCHAR* PoolName)
+{
+	return FString(kRecentCuesKeyPrefix) + PoolName;
+}
+
 // A value out of the ini is player-editable text and can be anything. Clamped
 // on the way IN as well as on the way out, because a hand-edited 5.0 would
 // otherwise reach FApp::SetVolumeMultiplier and be a genuinely damaging bug --
@@ -112,6 +127,43 @@ void SetMusicInGame(bool bEnabled)
 	// UVoxelScreensUISubsystem. Turning it off mid-game does not stop the track
 	// the player is already listening to -- the PAUSE button does that, which is
 	// the control they actually have their hand on.
+}
+
+TArray<FString> GetRecentMusicCues(const TCHAR* PoolName)
+{
+	TArray<FString> Cues;
+	if (GConfig && PoolName != nullptr)
+	{
+		GConfig->GetArray(VoxelAudioUserSettingsDetail::kSection,
+		                  *VoxelAudioUserSettingsDetail::RecentCuesKey(PoolName), Cues,
+		                  GGameUserSettingsIni);
+	}
+	return Cues;
+}
+
+void PushRecentMusicCue(const TCHAR* PoolName, const FString& CueName)
+{
+	if (!GConfig || PoolName == nullptr || CueName.IsEmpty())
+	{
+		return;
+	}
+	TArray<FString> Cues = GetRecentMusicCues(PoolName);
+	// MOST RECENT FIRST, and de-duplicated on the way in: replaying a cue must
+	// move it to the front rather than fill the memory with five copies of it,
+	// which is exactly what a small bank would otherwise do.
+	Cues.Remove(CueName);
+	Cues.Insert(CueName, 0);
+	while (Cues.Num() > VoxelAudioUserSettingsDetail::kRecentCueMemory)
+	{
+		Cues.Pop();
+	}
+	GConfig->SetArray(VoxelAudioUserSettingsDetail::kSection,
+	                  *VoxelAudioUserSettingsDetail::RecentCuesKey(PoolName), Cues,
+	                  GGameUserSettingsIni);
+	// Flushed per cue, for the volume sliders' reason: a relaunch after a crash
+	// must not reopen on the track the player just heard, and a cue change is
+	// at worst one small ini write every three to six minutes.
+	GConfig->Flush(false, GGameUserSettingsIni);
 }
 
 float GetEffectiveMusicVolume()

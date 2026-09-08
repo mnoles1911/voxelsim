@@ -64,6 +64,25 @@ VOXELEARTHUI_API void SetMusicInGame(bool bEnabled);
 // last Set is not created at full volume.
 VOXELEARTHUI_API void ApplyAll();
 
+// --- The music system's cross-session memory (docs/music-design.md section 8)
+//
+// "Remember the last five cues played per pool so a relaunch does not open on
+// the same one." Persisted here rather than in a file of its own because it is
+// exactly what this namespace already is: a handful of small player-scoped
+// values under one section of GGameUserSettingsIni.
+//
+// KEYED BY POOL, NOT BY BANK. Explore has five folders (Day/Night/Dawn/Dusk/
+// Rain) and one memory, which is what the sentence asks for: the player is
+// tired of a CUE, not of a folder, and a cue borrowed by Dusk from Day should
+// not sound fresh again because it arrived through a different slot.
+//
+// STORED BY NAME, NOT BY INDEX. An index into a folder listing is meaningless
+// after the designer drops a file in -- it would silently name a different cue
+// -- and the filename is already the cue's identity everywhere else here (it
+// is what the HUD label shows).
+VOXELEARTHUI_API TArray<FString> GetRecentMusicCues(const TCHAR* PoolName);
+VOXELEARTHUI_API void PushRecentMusicCue(const TCHAR* PoolName, const FString& CueName);
+
 // The music component's own multiplier: master x music, which is what
 // FVoxelUIMusic applies to the component it owns. Exposed rather than computed
 // at the call site so the two settings can only be combined one way.

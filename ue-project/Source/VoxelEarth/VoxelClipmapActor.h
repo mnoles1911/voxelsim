@@ -145,6 +145,25 @@ public:
 	// from is asserted against NumLevels in VoxelOceanActor.cpp.
 	static double OuterHalfExtentUU();
 
+	// IS THE CAMERA UNDERGROUND RIGHT NOW? The veil's own latch, exposed
+	// read-only.
+	//
+	// PUBLIC BECAUSE THE MUSIC POOLS NEED THE SAME PREDICATE AND MUST NOT
+	// RE-DERIVE IT. docs/music-design.md section 2 wires the Cave pool to "the
+	// underground veil is engaged (we already have this signal)", and the note
+	// on EnsureCaveRig below already records why there is exactly one such
+	// predicate in this project: "A second 'am I underground' test would be a
+	// second thing to keep in sync". The cave post-process rig is the first
+	// consumer of that rule; FVoxelUIMusic::ReadSignals is the second.
+	//
+	// TWO THINGS IT DOES NOT PROMISE. It is false before the first tick that
+	// has a camera (bVeilStateKnown), and it is false for the whole run under
+	// -VoxelUndergroundVeil=0, which disables the evaluation entirely -- so a
+	// run with the veil off gets no cave music either. That is the honest
+	// reading of "the veil is engaged" and is preferable to a second probe that
+	// could disagree with what the player can see.
+	bool IsUndergroundVeilActive() const { return bVeilActive; }
+
 private:
 	// 65x65 vertices per level (m2-plan.md binding decision), i.e. 64x64
 	// quads -- fixed for every level; only spacing/origin/heights differ.

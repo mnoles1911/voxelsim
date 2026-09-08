@@ -519,6 +519,16 @@ void UVoxelScreensUISubsystem::EnsureMusicInGame()
 	}
 	bMusicChecked = true;
 
+	// THE PLAYER HAS THE WORLD. This is the one place that knows it for
+	// certain -- this function is called once the HUD is installed, i.e. once
+	// there is a pawn -- and it is what switches the music from the Menu pool
+	// to the world's own (docs/music-design.md section 2). Set BEFORE the two
+	// early returns below, because the context is true regardless of whether
+	// this run is allowed to start a cue: an unattended leg and a player who
+	// turned music off are both in the world, and FVoxelUIMusic::
+	// PoolChangesAllowed is what keeps both of them silent.
+	FVoxelUIMusic::Get().SetContext(EVoxelMusicContext::InWorld);
+
 	// UNATTENDED RUNS GET NO MUSIC FROM HERE, AND THAT IS A MEASUREMENT
 	// DECISION, NOT A TASTE ONE. Every headless leg and every capture switch
 	// passes -unattended. Starting a track on those would read 30-92 MB off disk

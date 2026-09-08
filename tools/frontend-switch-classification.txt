@@ -258,6 +258,27 @@ VoxelMenuTickGates
 # changes how expensively the menu RENDERS, never whether the menu appears or
 # whether the run ends on its own. See VoxelMenuScalability.h.
 VoxelMenuScalability
+# --- 2026-09-08: the music pool system (docs/music-design.md) ---------------
+# -VoxelMusicPool=<Explore|Cave|Town|Water|Combat|Menu|Stingers|Cinematic>
+# pins which pool owns the music, ignoring the world's signals.
+# -VoxelMusicGap=<seconds> replaces the design's authored silence (45-120 s for
+# Explore/Cave/Town/Water, 20-40 s for Menu) with a fixed duration; 0 restores
+# the pre-2026-09-08 back-to-back behaviour, which is the A/B control arm.
+#
+# BOTH ARE CONFIGURATION. Neither poses a camera, captures anything, or ends a
+# run -- they change what the game SOUNDS like on an ordinary interactive
+# launch. They exist because the shipped gaps make the pool machinery
+# unprovable from a log in reasonable time and because the Cave and Water pools
+# otherwise need the player to be under rock or aboard a boat.
+#
+# NAMED WITHOUT A RULE-5 SUBSTRING ON PURPOSE, the same trap
+# -VoxelFineTileAsyncCap records above: the obvious alternative names for a
+# diagnostic like this ("-VoxelMusicPoolCheck", "-VoxelMusicProbe") contain
+# Check and Probe, would be classified self-driving, and would suppress the
+# main menu on every launch that tuned them -- which for a MUSIC switch would
+# also remove the menu music the switch was arming.
+VoxelMusicPool
+VoxelMusicGap
 VoxelUINoAssets
 VoxelLoadGateMaxRing
 VoxelLoadMinHold
@@ -610,4 +631,4 @@ VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive
 # the ripple field at an offset inside a capture run (the plan's wake legs pair
 # it with -VoxelScreenshotAfter); the five parameters below only shape that
 # injection and are inert without it.
-VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a wake at an offset; the run is ended by the capture switch it is paired with. Matches 'After' by intent, not by accident.
+VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a wake at an offset; the run is ended by the capture switch it is paired with. Matches 'After' by intent, not by accident.
