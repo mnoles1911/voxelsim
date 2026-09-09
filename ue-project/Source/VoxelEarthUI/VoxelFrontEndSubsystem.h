@@ -165,6 +165,10 @@ private:
 	// backstop for every path that never reaches one.
 	bool bStreamBudgetCapped = false;
 	float SavedApplyBudgetMs = 0.f;
+	// The third theatre cap (2026-09-09): voxel.Stream.DispatchBudgetMs. Own flag,
+	// same reason as the other two.
+	bool bDispatchBudgetCapped = false;
+	float SavedDispatchBudgetMs = 0.f;
 
 	// The second theatre cap (2026-09-08): the raster atlas's per-tick page
 	// sweep, voxel.Stream.AtlasFillMs. Separate flag from the apply budget's on

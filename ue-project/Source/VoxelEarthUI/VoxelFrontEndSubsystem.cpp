@@ -79,6 +79,19 @@ constexpr int32 kLoadingZOrder = 110;
 constexpr float kTheatreApplyBudgetMs = 2.0f;
 const TCHAR* const kApplyBudgetCVarName = TEXT("voxel.Stream.ApplyBudgetMs");
 
+// --- THE THIRD GAME-THREAD BURST: THE DISPATCH LOOP (2026-09-09) --------------
+//
+// With the lake tier off the game thread and the atlas sweep capped, an Insights
+// trace of a quiet-box load (Saved/loading-leg7.utrace) put every remaining
+// multi-second frame under the curtain in ONE call of FVoxelWorldImpl::DispatchJobs:
+// 6.2, 8.8 and 9.1 s, ~1300 loop iterations at 5-7 ms each. The loop had no time
+// bound (its in-flight cap is bypassed by the GPU fork). 8 ms per tick spreads the
+// same 1300 chunks over ~160 ticks, a few seconds of a 36 s theatre, and the
+// hourglass keeps painting. 0 is the cvar's "unbounded" and is what an ordinary
+// run had, so restore puts 0 back.
+constexpr float kTheatreDispatchBudgetMs = 8.0f;
+const TCHAR* const kDispatchBudgetCVarName = TEXT("voxel.Stream.DispatchBudgetMs");
+
 // --- THE SECOND GAME-THREAD BURST: THE RASTER ATLAS SWEEP (2026-09-08) -------
 //
 // The 2026-09-08 live load's largest single game-thread item was not the apply
@@ -824,6 +837,29 @@ void UVoxelFrontEndSubsystem::CapStreamingForTheatre()
 			       VoxelFrontEndDetail::kTheatreAtlasFillMs);
 		}
 	}
+
+	// --- The dispatch loop, same shape, same save/restore (2026-09-09) ---------
+	{
+		IConsoleVariable* DispatchVar =
+			IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kDispatchBudgetCVarName);
+		if (DispatchVar == nullptr)
+		{
+			UE_LOG(LogVoxelUI, Warning, TEXT("LoadScreen: %s not found; the dispatch loop runs unbounded under the theatre."),
+			       VoxelFrontEndDetail::kDispatchBudgetCVarName);
+		}
+		else if (DispatchVar->GetFloat() > 0.f && DispatchVar->GetFloat() <= VoxelFrontEndDetail::kTheatreDispatchBudgetMs)
+		{
+			// Already bounded tighter than the theatre; leave it.
+		}
+		else
+		{
+			SavedDispatchBudgetMs = DispatchVar->GetFloat();
+			bDispatchBudgetCapped = true;
+			DispatchVar->Set(VoxelFrontEndDetail::kTheatreDispatchBudgetMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: capped %s %.1f -> %.1f for the load theatre (0 = unbounded)."),
+			       VoxelFrontEndDetail::kDispatchBudgetCVarName, SavedDispatchBudgetMs, VoxelFrontEndDetail::kTheatreDispatchBudgetMs);
+		}
+	}
 }
 
 void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
@@ -860,6 +896,16 @@ void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
 			AtlasVar->Set(SavedAtlasFillMs, ECVF_SetByCode);
 			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.2f."),
 			       VoxelFrontEndDetail::kAtlasFillCVarName, SavedAtlasFillMs);
+		}
+	}
+	if (bDispatchBudgetCapped)
+	{
+		bDispatchBudgetCapped = false;
+		if (IConsoleVariable* DispatchVar =
+		        IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kDispatchBudgetCVarName))
+		{
+			DispatchVar->Set(SavedDispatchBudgetMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.1f."), VoxelFrontEndDetail::kDispatchBudgetCVarName, SavedDispatchBudgetMs);
 		}
 	}
 }

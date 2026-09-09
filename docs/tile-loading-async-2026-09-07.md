@@ -942,3 +942,42 @@ Leg 3 below is the check.
 **Loader default flip (this commit):** `tools/voxel-editor.ps1` passes
 `-VoxelFineTileAsync=1 -VoxelFineTileRingRadius=1` on interactive launches. Headless legs
 keep the constant default (0) so their numbers stay comparable.
+
+### Leg 3 onward: what the curtain still hides, traced (2026-09-09)
+
+After the lake tier moved off the game thread (leg 3: gather 0.0-0.1 ms per tile) the
+`seg=LOADING` row still carried a 9.1 s max frame and ~30 hitches. The `Hitch frame:` line
+could not say where: it prints the PREVIOUS frame's length (DeltaTime) against THIS tick's
+`TickMsSoFar`, so an 8.5 s streaming tick printed as `subsystemTickMs=8.91 elsewhereMs=391`
+(fixed this day: the line now prints `PrevTickMs`). Unreal Insights answered instead
+(`-trace=cpu,frame,log -tracefile=...`, then `UnrealInsights -OpenTraceFile=... -AutoQuit
+-NoUI -ExecOnAnalysisCompleteCmd="TimingInsights.ExportTimingEvents <tsv> -threads=GameThread"`,
+ONE export per run because `;` is taken as part of the filename; traces at
+`Saved/loading-leg{4,5,6,7}.utrace`):
+
+| trace time | length | scope (after adding `VoxelStream_*`, `VoxelRecompute_*`, `VoxelDispatch_*` scopes) |
+|---|---|---|
+| +15.9 s | 1.7 s | `RecomputeDesiredSet` > admission loop (first recompute after spawn) |
+| +17.6 s | 5.4 s | `RecomputeDesiredSet` > admission loop (second, all rings) |
+| +33.0 s | 6.2 s | `DispatchJobs` loop, 1308 iterations, ~4.7 ms each, all inside the per-chunk submit |
+| +39.9 s | 8.8 s | `DispatchJobs` loop, 1312 iterations |
+| +49.6 s | 9.1 s | `DispatchJobs` loop, 1024 iterations |
+
+The dispatch loop's only exits were the CPU in-flight cap (bypassed by the GPU fork) and
+the queue running dry, so during the cold fill one pass dispatched every pending chunk
+in the ring at 5-9 ms apiece. **Fix:** `voxel.Stream.DispatchBudgetMs` (default 0 =
+unbounded, byte-identical), a fourth loop exit counted as `exitBudget=` on the dispatch
+window line; the loading theatre caps it at 8 ms beside the apply and atlas caps
+(`kTheatreDispatchBudgetMs`) and restores 0 at the reveal. Engagement line:
+`Voxel dispatch loop: wall-clock budget ENGAGED`. The first-recompute admission loop
+(1.7 + 5.4 s at spawn) is the remaining item; it runs once per spawn and would need the
+per-level admission split across ticks (backlog).
+
+**Leg 9, the dispatch budget engaged** (`Saved/loading-leg9-dispatch-budget.log`):
+`capped voxel.Stream.DispatchBudgetMs 0.0 -> 8.0`, `Voxel dispatch loop: wall-clock budget
+ENGAGED`, `exitBudget=168` of 762 passes in the cold-fill window, restored to 0 at the
+reveal. `seg=LOADING`: n=3789, hitches=15, p50 5.2 ms, p99 **20.6 ms**, max 5,328 ms
+(before: n≈1060, hitches 33-40, p99 8.5-9.1 s, max 9.1 s). Gate READY at 14.1 s, so the
+budget cost the fill nothing in wall time under the theatre. What remains is the one
+first-recompute admission pass (5.3 s) at spawn, which runs once; splitting the per-level
+admission across ticks is the next item.

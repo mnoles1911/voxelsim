@@ -9522,6 +9522,7 @@ struct FVoxelWorldImpl
 	int64 DispatchExitCapSinceLog = 0;
 	int64 DispatchExitEmptySinceLog = 0;
 	int64 DispatchExitBacklogSinceLog = 0;
+	int64 DispatchExitBudgetSinceLog = 0;   // voxel.Stream.DispatchBudgetMs elapsed (2026-09-09), the FOURTH exit
 	int64 DispatchCpuLaunchedSinceLog = 0;
 	int64 DispatchGpuForkedSinceLog = 0;
 	// -VoxelBandSeedCpu traffic: fork-eligible level-0 chunks kept on the CPU
@@ -10032,6 +10033,7 @@ struct FVoxelWorldImpl
 	int32 DispatchExitCapSincePanel = 0;
 	int32 DispatchExitEmptySincePanel = 0;
 	int32 DispatchExitBacklogSincePanel = 0;
+	int32 DispatchExitBudgetSincePanel = 0;
 
 	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() /
 	// IsRingsEnabled() so the off-transition can drop every component's MID
@@ -11301,11 +11303,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		if (VoxelDebug::GetStreamBatchRecompute() != 0)
 		{
 			UVoxelGpuPoolComponent::FScopedBatch RecomputeBatch(GpuPool.Get());
-			RecomputeDesiredSet(Anchor);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet); RecomputeDesiredSet(Anchor); }
 		}
 		else
 		{
-			RecomputeDesiredSet(Anchor);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet); RecomputeDesiredSet(Anchor); }
 		}
 		// -VoxelRecomputeDutyPct: feed the bound what this call actually cost.
 		// ThisFrameRecomputeMs is stamped at the END of RecomputeDesiredSet and
@@ -11502,6 +11504,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				CVarVoxelStreamAtlasPrefetchAhead.GetValueOnGameThread();
 			if (PrefetchPagesPerTick > 0)
 			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_AtlasPrefetchAhead);
 				RasterAtlas->PrefetchAhead(ActiveTiles(),
 				                           int64(Anchor.X) * 10, int64(Anchor.Y) * 10,
 				                           int64(PredictedAnchorLocation.X) * 10,
@@ -11541,7 +11544,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// free-then-reallocate-within-one-frame race, which is what makes any
 		// widening of this scope safe.
 		UVoxelGpuPoolComponent::FScopedBatch PoolBatch(GpuPool.Get());
-		DispatchJobs();
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DispatchJobs); DispatchJobs(); }
 		// Poll the GPU runner BETWEEN dispatch and drain (Wave D / D4).
 		//
 		// Order matters and this is the only correct slot. Tick() is what calls
@@ -11597,9 +11600,9 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		{
 			// The batch is already open (see T0 above); this block keeps its
 			// original bounds for readability and for the T2/T3 timing points.
-			DrainResults(Owner, Root, Material);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainResults); DrainResults(Owner, Root, Material); }
 			T2 = FPlatformTime::Seconds();
-			DrainGameThreadMesh(Owner, Root, Material);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainGameThreadMesh); DrainGameThreadMesh(Owner, Root, Material); }
 			T3 = FPlatformTime::Seconds();
 
 		// Second DispatchJobs() pass (voxel.Stream.DispatchAfterDrain, default
@@ -11643,11 +11646,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			T3b = T3;
 			if (VoxelDebug::GetStreamDispatchAfterDrain() != 0 && PendingJobNum() > 0)
 			{
-				DispatchJobs();
+				{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DispatchJobs); DispatchJobs(); }
 				T3b = FPlatformTime::Seconds();
 			}
 
-			DrainUnloads();
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainUnloads); DrainUnloads(); }
 		}
 		} // PoolBatch closes here -- the tick's single publication happens now.
 		const double T4 = FPlatformTime::Seconds();
@@ -11794,7 +11797,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// tick's submits look at it, and a drain placed after the walk would let the
 	// walk re-probe footprints whose answers were already sitting in the queue.
 	// Off, this is one integer compare (see DrainWarmShadingResults).
-	DrainWarmShadingResults();
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainWarmShading); DrainWarmShadingResults(); }
 	WarmShadingAheadTick();
 
 	// THE ASYNC FINE-TILE LOADER'S PER-FRAME PUMP (-VoxelFineTileAsync=1). The
@@ -11805,7 +11808,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// empty-map test.
 	if (FineStreamer)
 	{
-		FineStreamer->PumpAsyncLoads();
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_PumpAsyncTiles); FineStreamer->PumpAsyncLoads(); }
 	}
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
@@ -12058,7 +12061,15 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	}
 	if (FrameMs > VoxelDebug::kHitchThresholdMs)
 	{
-		const float ElsewhereMs = FMath::Max(0.f, FrameMs - TickMsSoFar);
+		// THE FRAME BEING REPORTED IS THE PREVIOUS ONE (FrameMs is DeltaTime), so the
+		// world tick that belongs to it is PrevTickMs, not this tick's TickMsSoFar.
+		// Until 2026-09-09 this line printed TickMsSoFar and called the rest "elsewhere",
+		// which read an 8.5 s streaming tick as "subsystemTickMs=8.91 elsewhereMs=391"
+		// (Insights trace Saved/loading-leg4.utrace: the whole frame was UVoxelWorldSubsystem).
+		// The per-phase ThisFrame* counters below are still THIS tick's; the trace scopes
+		// (VoxelStream_*) are the honest attribution for the long ones.
+		const float ReportedTickMs = PrevTickMs;
+		const float ElsewhereMs = FMath::Max(0.f, FrameMs - ReportedTickMs);
 		// M1 gate attribution (docs/status.md M1 gate row): the engine's own
 		// per-thread frame timers, set once/frame in FViewport::Draw (so they
 		// describe the PREVIOUS frame -- a one-frame lag is immaterial for
@@ -12077,7 +12088,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		       TEXT("renderMs=%.2f renderWaitMs=%.2f rhiMs=%.2f gameWaitMs=%.2f | ")
 		       TEXT("dispatchMs=%.2f applyMs=%.2f remeshMs=%.2f unloadMs=%.2f | ")
 		       TEXT("componentsApplied=%d proxiesCreated=%d editRemeshes=%d unloads=%d poolReuses=%d poolSize=%d"),
-		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, RenderMs, RenderWaitMs, RHIMs, GameWaitMs,
+		       FrameMs, VoxelDebug::kHitchThresholdMs, ReportedTickMs, ElsewhereMs, RenderMs, RenderWaitMs, RHIMs, GameWaitMs,
 		       ThisFrameDispatchMs, ThisFrameApplyMs, ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker,
 		       ThisFrameProxiesCreated, ThisFrameEditRemeshes, ThisFrameUnloads, ThisFramePoolReuses, ComponentPool.Num());
 
@@ -13433,14 +13444,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // reading pair for that gate lives on its accessor; the twin
 	       // backlog= column is on the job-flow line.
 	       TEXT("Voxel dispatch loop (window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
-	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld seedCpu=%lld"),
+	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld exitBudget=%lld seedCpu=%lld"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
 	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue(),
 	       AccumCpuWorkerJobMsSinceLog / 1000.0,
 	       ThisLogWindowSeconds > 0.f ? AccumCpuWorkerJobMsSinceLog / (1000.0 * ThisLogWindowSeconds) : 0.0,
 	       VoxelStreamAdmission::WorkerTaskPriority(), VoxelStreamAdmission::WorkerPoolThreads(),
-	       (long long)DispatchExitBacklogSinceLog, (long long)DispatchBandSeedCpuSinceLog);
+	       (long long)DispatchExitBacklogSinceLog, (long long)DispatchExitBudgetSinceLog, (long long)DispatchBandSeedCpuSinceLog);
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
@@ -13475,6 +13486,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	DispatchExitCapSinceLog = 0;
 	DispatchExitEmptySinceLog = 0;
 	DispatchExitBacklogSinceLog = 0;
+	DispatchExitBudgetSinceLog = 0;
 	DispatchCpuLaunchedSinceLog = 0;
 	DispatchGpuForkedSinceLog = 0;
 	DispatchBandSeedCpuSinceLog = 0;
@@ -20242,7 +20254,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const int64 AnchorMmX = WorldToMm(Anchor.X);
 		const int64 AnchorMmY = WorldToMm(Anchor.Y);
 		const double FineT0 = FPlatformTime::Seconds();
-		FineStreamer->TickResidencyAndEviction(FVoxelFineTileStreamer::CoarseTileForWorldMm(AnchorMmX, AnchorMmY));
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_FineResidency); FineStreamer->TickResidencyAndEviction(FVoxelFineTileStreamer::CoarseTileForWorldMm(AnchorMmX, AnchorMmY)); }
 		// A tile load is a synchronous ~200 MB read plus a whole-tile decode
 		// (VoxelFineTileStreamer.h, threading rule 1), so a cold ring shift is a
 		// multi-second GAME THREAD STALL, not a hitch. Reported rather than
@@ -20608,6 +20620,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// else. See ThisFrameExitScanMs' doc comment for what the old number
 	// bundled in.
 	const double ExitWalkT0 = FPlatformTime::Seconds();
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_ExitScanAndFilter);
 	// PHASE 3, BUCKETED EVICTION (2026-08-23). The verdict below is a pure
 	// function of (Level, ChunkX, ChunkY) and the anchor's XY for every record
 	// that is not bDeepAnchorRelative, so most of this walk re-derives "keep"
@@ -20946,6 +20959,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	int32 OuterScansUsed = 0;
 
 	const int32 MaxRingLevel = UVoxelWorldSubsystem::GetMaxRingLevel();
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_AdmissionAndBeyond);
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		if (Level > MaxRingLevel)
@@ -21913,10 +21927,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		LiveOutcome.AdmitMs += float((FPlatformTime::Seconds() - LiveAdmitT0) * 1000.0);
 	}
 
-	PruneFootprintZRangeCache(Anchor);
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_PruneZRange); PruneFootprintZRangeCache(Anchor); }
 
 	const double SortT0 = FPlatformTime::Seconds();
-	SortPendingQueues(Anchor);
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_Sort); SortPendingQueues(Anchor); }
 	// Bounded admission gate (b) -- must run immediately after the sort, which
 	// is what puts the farthest (lowest-priority) entries at the front and
 	// leaves each level queue's cached distances aligned with the anchor. Timed inside
@@ -24737,14 +24751,29 @@ void FVoxelWorldImpl::DispatchJobs()
 	};
 
 	const double DispatchLoopStart = FPlatformTime::Seconds();
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Loop);
 	// Which exit the loop takes this pass -- see the DispatchExit* counters'
 	// doc comment for the competing readings this settles. The loop has
 	// exactly THREE ways out, each with its own counter, or the exitCap
 	// arithmetic (exitCap = passes - exitEmpty - exitBacklog) silently lies.
 	bool bLoopExitedQueueEmpty = false;
 	bool bLoopExitedBacklog = false;
+	// THE FOURTH EXIT (2026-09-09): a wall-clock budget, voxel.Stream.DispatchBudgetMs.
+	// 0 (shipped) is unbounded and byte-identical to before. The loading theatre
+	// sets it because one pass of this loop ran 6-9 s under the curtain (Insights,
+	// Saved/loading-leg7.utrace: ~1300 iterations at 5-7 ms in the per-chunk
+	// submit). Checked at the top of every iteration, after the previous one has
+	// been counted, so a pass always dispatches at least one chunk. Counted as
+	// exitBudget= so passes = exitCap + exitEmpty + exitBacklog + exitBudget holds.
+	const double DispatchBudgetSeconds = double(VoxelDebug::GetStreamDispatchBudgetMs()) / 1000.0;
+	bool bLoopExitedBudget = false;
 	while (CpuJobsOutstanding() < MaxJobsInFlight)
 	{
+		if (DispatchBudgetSeconds > 0.0 && FPlatformTime::Seconds() - DispatchLoopStart > DispatchBudgetSeconds)
+		{
+			bLoopExitedBudget = true;
+			break;
+		}
 		// Dispatch-ahead gate, FIRST and INSIDE the loop -- the while condition
 		// cannot carry it because the fork deliberately bypasses the CPU budget
 		// (a pass can fork thousands of GPU jobs while CpuJobsOutstanding never
@@ -24786,6 +24815,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// candidate for a fixed per-candidate cost -- exactly the shape `other`
 		// showed.
 		const double PickStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Pick);
 		int32 PickLevel = INDEX_NONE;
 		if (bRingQuota)
 		{
@@ -24964,6 +24994,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// recompute and dispatch, may have made this chunk (or one of its
 		// mip ancestors) edited-only.
 		const double OverlayStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Overlay);
 		const bool bNeedsOverlay = NeedsOverlayAwarePath(LevelKey);
 		ThisFrameDispatchOverlayMs += float((FPlatformTime::Seconds() - OverlayStart) * 1000.0);
 		if (bNeedsOverlay)
@@ -25002,6 +25033,7 @@ void FVoxelWorldImpl::DispatchJobs()
 			VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled();
 		bool bPredictedEmpty = false;
 		const double BandStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Band);
 		if (bComputeBand && LevelKey.Level == 0)
 		{
 			if (const VoxelStreaming::FFootprintBand* Band = FootprintBandCache.Find(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
@@ -25094,6 +25126,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// this number is read; the short-circuit means it is skipped entirely
 		// when the sky-band skip is off, which the bracket will also show.
 		const double AirProofStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_AirProof);
 		const bool bSkyBandSkip = VoxelSkyBand::GetSkipEnabled() && IsChunkProvablyAllAir(LevelKey);
 		ThisFrameDispatchAirProofMs += float((FPlatformTime::Seconds() - AirProofStart) * 1000.0);
 		if (bSkyBandSkip)
@@ -25442,6 +25475,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// fixes: a predicate that is too expensive gets memoised, a submit that
 		// is too expensive gets batched or moved off the game thread.
 		const double SubmitStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Submit);
 		ON_SCOPE_EXIT
 		{
 			ThisFrameDispatchSubmitMs += float((FPlatformTime::Seconds() - SubmitStart) * 1000.0);
@@ -26420,11 +26454,16 @@ void FVoxelWorldImpl::DispatchJobs()
 	{
 		++DispatchExitBacklogSincePanel;
 	}
+	else if (bLoopExitedBudget)
+	{
+		++DispatchExitBudgetSincePanel;
+	}
 	else
 	{
 		++DispatchExitCapSincePanel;
 	}
 	ThisFrameDispatchLoopMs += float((FPlatformTime::Seconds() - DispatchLoopStart) * 1000.0);
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_PostLoop);
 
 	// Exit attribution (see the DispatchExit* doc comment). Falling out of the
 	// while condition IS the cap exit -- the loop's only other ends are the
@@ -26437,6 +26476,14 @@ void FVoxelWorldImpl::DispatchJobs()
 	else if (bLoopExitedBacklog)
 	{
 		++DispatchExitBacklogSinceLog;
+	}
+	else if (bLoopExitedBudget)
+	{
+		if (DispatchExitBudgetSinceLog == 0 && DispatchExitBudgetSincePanel == 1)
+		{
+			UE_LOG(LogVoxelStream, Log, TEXT("Voxel dispatch loop: wall-clock budget ENGAGED (voxel.Stream.DispatchBudgetMs=%.1f); passes now exit on time, counted as exitBudget=."), VoxelDebug::GetStreamDispatchBudgetMs());
+		}
+		++DispatchExitBudgetSinceLog;
 	}
 	else
 	{

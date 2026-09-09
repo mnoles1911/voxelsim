@@ -317,6 +317,9 @@ namespace VoxelDebug
 	// overrides; for the armed-indicator line only.
 	VOXELEARTH_API int32 GetStreamMaxAppliesPerFrameCvar();
 	VOXELEARTH_API float GetStreamApplyBudgetMsCvar();
+	// voxel.Stream.DispatchBudgetMs: max wall-clock ms DispatchJobs may spend in its
+	// loop per tick; 0 = unbounded. Set by the loading theatre (2026-09-09).
+	VOXELEARTH_API float GetStreamDispatchBudgetMs();
 	// DrainResults' third per-tick ceiling (-VoxelApplyDrainCap=, default 1024).
 	VOXELEARTH_API int32 GetStreamDrainCapPerFrame();
 
