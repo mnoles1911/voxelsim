@@ -140,6 +140,14 @@ if ($wantGame) {
     # says out loud and the window then ignores.
     $argList += '-game'
     $argList += '-ExecCmds="t.IdleWhenNotForeground 1"'
+    # THE LOADER DEFAULT FLIP (2026-09-09), interactive launches only. Evidence:
+    # docs/tile-loading-async-2026-09-07.md (four-leg A/B: correct on every counter,
+    # worst frame halves, ring fill ~6 s) and the quiet-box loading legs of
+    # 2026-09-09 (6 tiles async, one 0.7 s join at the spawn tile, READY 27 s cold /
+    # 15 s warm). Headless legs keep kDefaultFineRingRadiusTiles (0) so their
+    # numbers stay comparable; pass the switches explicitly there.
+    $argList += '-VoxelFineTileAsync=1'
+    $argList += '-VoxelFineTileRingRadius=1'
 } elseif (-not $NoAutoPIE) {
     $argList += '-VoxelAutoPIE'
 }

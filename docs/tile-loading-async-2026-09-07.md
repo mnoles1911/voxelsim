@@ -894,3 +894,51 @@ that guards a curtain runs on the wall clock.
 worker reads ran 6-159 s per tile instead of ~0.3 s, and the one join blocked the game
 thread for the remainder of one of them. The safety net worked as designed; the ring
 prefetch cannot get ahead of a disc that is shared with 17 other processes.
+
+## Quiet-box loading measurement, 2026-09-09 (the box handed over by the owner)
+
+Two `-Shot Loading` legs at the lake column with `-VoxelFineTileAsync=1
+-VoxelFineTileRingRadius=1 -VoxelFineLockMeter=2 -VoxelFramePhase=1`, no other editor or
+build on the machine. Logs: `Saved/loading-leg1-quiet-box.log` (first launch, OS file cache
+cold for these tiles) and `Saved/loading-leg2-warm-cache.log` (second launch, warm).
+
+| | leg 1 (cold cache) | leg 2 (warm cache) |
+|---|---|---|
+| NEW GAME to gate READY | 27.3 s | 14.8 s |
+| curtain (theatre 36 s) lifted at | 36.5 s | 39.0 s |
+| `seg=LOADING` | n=1026, hitches=20, p99 101 ms, max **11,430 ms** | (same instrument) |
+| lake-sheet first gather, per tile | **11,267 / 1,962 / 384 / 0.1 ms** | 379 / 360 / 425 / 0.1 ms |
+| fine tiles | 6 async, 1 join (698 ms, the spawn tile) | same shape |
+
+**The freeze the owner sees on the hourglass is the lake-sheet gather.** `AVoxelWaterSheetActor`
+pops one fine tile per tick and calls `GatherLakeSheetBasinsInTile`, which reaches the lake
+tier's PRIVATE `FineTileSampler` and loads the whole `.vxtl` synchronously on the game thread
+(`FLakeWaterSampler::EnsureTile`). On leg 1 tile (-4,-3) was being read by the streamer's async
+worker at the same moment, on the same SATA HDD, and the lake tier's read of it took 11.3 s;
+the tiles the streamer had already finished cost ~0.4 s each (a second read of a 300-500 MB
+file from the OS cache plus parse). Frames 44-50 spanned 17 s of wall clock. `renderWaitMs`
+on those frames is the render thread idle (see voxelsim-counter-name-lies), not a render
+stall.
+
+Other game-thread items under the curtain, leg 1: ring-5 entry recompute 578 ms (known,
+R7 bound); raster-atlas DEMAND fills 1,033 and 1,171 ms of game thread per 5 s window (the
+theatre's 0.5 ms cap applies to the sweep, not to demand fills: `served=30951 fills=800`);
+two frames of 5.7 s (ending 03:04:51) and 4.6 s (the reveal frame, 03:05:05) with nothing
+logged inside them. UE's `stat dumphitches` printed nothing on leg 2 (needs the stats
+system armed differently under `-unattended`); those two remain unattributed. A `-Shot
+Loading -At` value later than the reveal never fires (TickLoading stops at HandOff), which is
+why both legs ran to the tool's 600 s timeout.
+
+**Fix landed (this commit):** the lake tier gains an async arm mirroring the streamer's:
+`FLakeWaterSampler::RequestTileAsync` reads and fully decodes the tile into a private
+sampler on a worker, `PumpAsync` (from `UVoxelWaterSubsystem::Tick`) adopts it with
+`adoptWarmTile`, and `UVoxelWaterSubsystem::IsLakeTileReadyForGather` gates the sheet
+actor's per-tile gather: it waits for the streamer's ring to settle (so the read is
+cache-warm and never contends with the streamer) and then for the worker. The gather now
+runs only against a tile the lake tier already holds; the log line is
+`Lake tier: fine tile (x,y) loaded ASYNC: read N ms + full decode N ms OFF the game thread`.
+Leg 3 below is the check.
+
+**Loader default flip (this commit):** `tools/voxel-editor.ps1` passes
+`-VoxelFineTileAsync=1 -VoxelFineTileRingRadius=1` on interactive launches. Headless legs
+keep the constant default (0) so their numbers stay comparable.

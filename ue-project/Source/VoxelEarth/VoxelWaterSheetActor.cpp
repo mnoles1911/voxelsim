@@ -1341,7 +1341,17 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		}
 	}
 
-	if (PendingTiles.Num() > 0)
+	// THE ASYNC ARM (2026-09-09): a tile whose lake data is still being read on a
+	// worker is rotated to the back and retried next tick rather than loaded here.
+	// The first gather on a quiet box used to cost 13.6 s of game thread under the
+	// loading curtain (Saved/loading-leg1-quiet-box.log); now GatherLakeSheetBasinsInTile
+	// only runs against a tile the lake tier already holds.
+	if (PendingTiles.Num() > 0 && !Water->IsLakeTileReadyForGather(PendingTiles.Last().X, PendingTiles.Last().Y))
+	{
+		const FIntPoint Waiting = PendingTiles.Pop(EAllowShrinking::No);
+		PendingTiles.Insert(Waiting, 0);
+	}
+	else if (PendingTiles.Num() > 0)
 	{
 		const FIntPoint T = PendingTiles.Pop(EAllowShrinking::No);
 		TArray<UVoxelWaterSubsystem::FLakeSheetBasin> Found;

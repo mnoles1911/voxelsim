@@ -665,6 +665,12 @@ public:
 	// half-extent RadiusUU around (CenterXUU, CenterYUU). Loads that tile, so it
 	// is game-thread only and does disk I/O; the caller budgets it. Returns the
 	// number appended.
+	// THE ASYNC ARM (2026-09-09): true when GatherLakeSheetBasinsInTile for this tile
+	// would not touch disk -- the lake tier has it (or knows it is absent), or there is
+	// no lake tier. False means "a worker is reading and decoding it; ask again next
+	// tick". Also false until the fine-tile ring has settled, so the worker's read is
+	// cache-warm rather than contending with the streamer on the disc. Game thread.
+	bool IsLakeTileReadyForGather(int32 TileX, int32 TileY);
 	int32 GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY, double CenterXUU, double CenterYUU,
 	                                  double RadiusUU, TArray<FLakeSheetBasin>& Out) const;
 
