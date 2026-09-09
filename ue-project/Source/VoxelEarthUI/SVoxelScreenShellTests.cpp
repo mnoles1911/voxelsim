@@ -43,6 +43,31 @@ constexpr EAutomationTestFlags kTestFlags = EAutomationTestFlags::EditorContext
 const FVector2D kLocalSize(1920.0, 1080.0);
 const FVector2D kCentre(960.0, 540.0);
 
+// THE LAYOUT SPACE A RESOLUTION ACTUALLY PRODUCES, and the reason this file can
+// test "at 1080p" and "at 1440p" at all without a window.
+//
+// DefaultEngine.ini's [/Script/Engine.UserInterfaceSettings] sets
+// UIScaleRule=ShortestSide on a curve whose keys are (480,0.444) (720,0.666)
+// (1080,1.0) (8640,8.0) -- linear throughout and therefore exactly
+// `shortestSide / 1080` at every point (ADR-0011 decision 2). Slate divides the
+// viewport by that before any widget sees it, so this function is the whole of
+// what a widget's local geometry is on a given screen.
+//
+// ITS OUTPUT IS THE POINT OF THE TEST BELOW: on ANY landscape display the
+// shortest side is the height, so the height always comes back 1080 and 1080p
+// and 1440p hand the shell the SAME space.
+FVector2D LayoutUnitsFor(const FVector2D& ViewportPx, float InterfaceSize = 1.f)
+{
+	const double ShortestSide = FMath::Min(ViewportPx.X, ViewportPx.Y);
+	const double EngineScale = ShortestSide / 1080.0;
+	// INTERFACE SIZE multiplies the engine scale (VoxelGraphicsUserSettings::
+	// GetUIScale through FSlateApplication::SetApplicationScale), so it divides
+	// the space, which is why it -- and not the resolution -- is what makes the
+	// shell run out of room.
+	const double Total = EngineScale * double(FMath::Max(InterfaceSize, 0.01f));
+	return FVector2D(ViewportPx.X / Total, ViewportPx.Y / Total);
+}
+
 // THE DRAG MAPPING, RESTATED. This is the one line SVoxelScreenShell::OnMouseMove
 // runs, and repeating it here tests ResizeRatioAt and SnapScale rather than the
 // widget's event wiring -- which needs a pointer, a capture and a viewport, and
@@ -261,6 +286,142 @@ bool FVoxelScreenShellResizeDragTest::RunTest(const FString& Parameters)
 		TestEqual(TEXT("a painted drag value survives its own commit"),
 		          VoxelScreenShellSettings::SnapScale(Painted), Painted, 0.0001f);
 	}
+
+	return true;
+}
+
+// --- Responsive trimming (ADR-0011 decision 4) -------------------------------
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelScreenShellChromeTest, "VoxelEarth.FrontEnd.ScreenShell.Chrome",
+                                 VoxelScreenShellTestsDetail::kTestFlags)
+
+bool FVoxelScreenShellChromeTest::RunTest(const FString& Parameters)
+{
+	using namespace VoxelScreenShellTestsDetail;
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	const FVector2D At1080 = LayoutUnitsFor(FVector2D(1920.0, 1080.0));
+	const FVector2D At1440 = LayoutUnitsFor(FVector2D(2560.0, 1440.0));
+	const FVector2D At4K   = LayoutUnitsFor(FVector2D(3840.0, 2160.0));
+
+	// 1. THE ASSERTION THIS WHOLE FEATURE TURNS ON, and the one that refuted the
+	// brief it was written from ("trim at 1080p, leave 1440p authored"). Under
+	// ShortestSide anchored 1.0 at 1080, the layout space is 1080 units tall on
+	// EVERY landscape display, so there is no such thing as a chrome that is
+	// right at 1440p and wrong at 1080p. Measured as well as derived: the
+	// before-captures in ue-project/Saved/ui-before are the same screen at both
+	// sizes and the shell's body measures 1024 px of 1920 and 1366 px of 2560 --
+	// 53.3% of the width in both.
+	TestEqual(TEXT("1080p lays out in 1080 units of height"), float(At1080.Y), 1080.f, 0.001f);
+	TestEqual(TEXT("1440p lays out in the SAME 1080 units of height"), float(At1440.Y), 1080.f, 0.001f);
+	TestEqual(TEXT("4K lays out in the same 1080 units of height"), float(At4K.Y), 1080.f, 0.001f);
+	TestEqual(TEXT("1080p and 1440p are the same layout width too"), float(At1440.X), float(At1080.X), 0.001f);
+
+	// 2. SO THE CHROME IS THE AUTHORED ONE AT BOTH, and nothing about it varies
+	// with the resolution. A future edit that keys the trim off pixels instead
+	// of off the space the shell has fails here.
+	const FVoxelShellChrome C1080 = L.ShellChromeForViewport(At1080, 1.f);
+	const FVoxelShellChrome C1440 = L.ShellChromeForViewport(At1440, 1.f);
+	TestFalse(TEXT("1080p at Menu Size 1.00 is not trimmed"), C1080.bTrimmed);
+	TestFalse(TEXT("1440p at Menu Size 1.00 is not trimmed"), C1440.bTrimmed);
+	TestEqual(TEXT("the frame is the authored 760 at 1080p"), C1080.ShellHeight, L.ScreenShellHeight, 0.01f);
+	TestEqual(TEXT("the frame is the authored 760 at 1440p"), C1440.ShellHeight, L.ScreenShellHeight, 0.01f);
+	TestEqual(TEXT("the top padding is authored at 1080p"), C1080.PadTop, L.ScreenShellPadTop, 0.01f);
+	TestEqual(TEXT("the body padding is authored at 1080p"), C1080.BodyPadY, L.ScreenBodyPad, 0.01f);
+	TestEqual(TEXT("the action-bar gap is authored at 1080p"), C1080.ActionBarTopGap, L.ActionBarTopGap, 0.01f);
+	TestEqual(TEXT("the body content box is still 988 wide"), C1080.BodyContentWidth(),
+	          L.ScreenBodyContentWidth(), 0.01f);
+
+	// 3. WHAT ACTUALLY MAKES THE SPACE SHRINK. INTERFACE SIZE at its shipped
+	// maximum divides the layout space by 1.5, so the viewport is 720 units tall
+	// and the authored 760-unit frame does not fit -- at EVERY resolution, which
+	// is the point. Before this trim the shell simply drew past the top and
+	// bottom of the screen.
+	const FVector2D Interface150 = LayoutUnitsFor(FVector2D(1920.0, 1080.0), 1.5f);
+	TestEqual(TEXT("INTERFACE SIZE 1.50 leaves 720 units of height"), float(Interface150.Y), 720.f, 0.001f);
+	TestTrue(TEXT("the authored frame does not fit at INTERFACE SIZE 1.50"),
+	         L.ScreenShellHeight > float(Interface150.Y));
+	const FVoxelShellChrome CBig = L.ShellChromeForViewport(Interface150, 1.f);
+	TestTrue(TEXT("INTERFACE SIZE 1.50 trims the chrome"), CBig.bTrimmed);
+	TestTrue(TEXT("and it fits afterwards"),
+	         CBig.ShellHeight + 2.f * L.ShellViewportMargin <= float(Interface150.Y) + 0.01f);
+
+	// 4. TIER ONE IS A TRADE OF CHROME FOR FRAME AND NOTHING ELSE. Menu Size
+	// 1.40 at 1080 units leaves the frame 754 units of room; the trimmed frame
+	// is 734, and every one of the 26 units it lost came off a padding, so the
+	// body's content box is exactly the size it was. This is the assertion that
+	// separates "trimmed" from "scaled down", which is the distinction the whole
+	// of ADR-0011 decision 4 rests on.
+	const FVoxelShellChrome CTier1 = L.ShellChromeForViewport(At1080, 1.40f);
+	TestTrue(TEXT("Menu Size 1.40 trims"), CTier1.bTrimmed);
+	TestFalse(TEXT("Menu Size 1.40 does not have to cut the body"), CTier1.bBodyShortened);
+	const float ChromeGiven = (L.ScreenShellPadTop - CTier1.PadTop)
+	                        + 2.f * (L.ScreenBodyPad - CTier1.BodyPadY)
+	                        + (L.ActionBarTopGap - CTier1.ActionBarTopGap);
+	TestEqual(TEXT("the frame lost exactly what the chrome gave"),
+	          L.ScreenShellHeight - CTier1.ShellHeight, ChromeGiven, 0.01f);
+	TestTrue(TEXT("the chrome actually gave something"), ChromeGiven > 0.f);
+
+	// 5. THE BOTTOM PADDING IS NEVER TRIMMED, at any viewport. The gripper is
+	// drawn inside it (ShellGripInset + 3 dots + 2 gaps), and test 7 of the
+	// resize-zone case pins that relationship against ScreenShellPadBottom -- a
+	// trim here would put the stair over the action bar's last hint.
+	const FVoxelShellChrome CTiny = L.ShellChromeForViewport(FVector2D(1920.0, 300.0), 1.f);
+	TestEqual(TEXT("the bottom padding survives the smallest viewport"),
+	          CTiny.PadBottom, L.ScreenShellPadBottom, 0.01f);
+	TestTrue(TEXT("the frame stops at its floor rather than inverting"),
+	         CTiny.ShellHeight >= L.ShellMinHeight - 0.01f);
+
+	// 6. NO GEOMETRY IS NOT A SMALL VIEWPORT. A widget's cached geometry is zero
+	// until its first arrange; answering "trim everything" for that one frame
+	// would open every screen with a visible twitch.
+	const FVoxelShellChrome CUnarranged = L.ShellChromeForViewport(FVector2D::ZeroVector, 1.f);
+	TestFalse(TEXT("an unarranged widget gets the authored chrome"), CUnarranged.bTrimmed);
+	TestEqual(TEXT("and the authored height with it"), CUnarranged.ShellHeight, L.ScreenShellHeight, 0.01f);
+
+	// 7. THE SHELL FITS AT EVERY MENU SIZE STOP, AT BOTH RESOLUTIONS. The reason
+	// this test exists: at the shipped maximum of 1.50 the untrimmed shell wanted
+	// 760 x 1.50 = 1140 units of the 1080 there are and hung 30 units off the top
+	// and bottom of the screen -- on the owner's 1440p monitor exactly as much as
+	// on a 1080p one. Stated as a loop over the setting's own stops so a change
+	// to the range cannot outrun it.
+	const FVector2D Viewports[] = {At1080, At1440};
+	const TCHAR* Names[] = {TEXT("1920x1080"), TEXT("2560x1440")};
+	for (int32 V = 0; V < 2; ++V)
+	{
+		for (float Stop = VoxelScreenShellSettings::ScaleMin();
+		     Stop <= VoxelScreenShellSettings::ScaleMax() + 0.0001f;
+		     Stop += VoxelScreenShellSettings::ScaleStep())
+		{
+			const float Snapped = VoxelScreenShellSettings::SnapScale(Stop);
+			const FVoxelShellChrome Chrome = L.ShellChromeForViewport(Viewports[V], Snapped);
+			const float PaintedH = Chrome.ShellHeight * Snapped;
+			const float PaintedW = Chrome.ShellWidth * Snapped;
+			TestTrue(*FString::Printf(TEXT("%s: the shell fits vertically at Menu Size %.2f"),
+			                          Names[V], Snapped),
+			         PaintedH + 2.f * L.ShellViewportMargin <= float(Viewports[V].Y) + 0.01f);
+			TestTrue(*FString::Printf(TEXT("%s: the shell fits horizontally at Menu Size %.2f"),
+			                          Names[V], Snapped),
+			         PaintedW + 2.f * L.ShellViewportMargin <= float(Viewports[V].X) + 0.01f);
+			// AND IT IS STILL A SHELL. A "fit" bought by collapsing the frame to
+			// nothing would satisfy the two above and be useless.
+			TestTrue(*FString::Printf(TEXT("%s: the frame is still usable at Menu Size %.2f"),
+			                          Names[V], Snapped),
+			         Chrome.ShellHeight >= L.ShellMinHeight - 0.01f);
+		}
+	}
+
+	// 8. AND THE TRIM IS ONE-WAY. Every trimmed value is smaller than the
+	// authored one it replaces, never larger -- a sign error here would grow the
+	// chrome on exactly the screens that have no room for it.
+	TestTrue(TEXT("the trimmed top padding is smaller"), L.TrimShellPadTop < L.ScreenShellPadTop);
+	TestTrue(TEXT("the trimmed body padding is smaller"), L.TrimScreenBodyPadY < L.ScreenBodyPad);
+	TestTrue(TEXT("the trimmed action-bar gap is smaller"), L.TrimActionBarTopGap < L.ActionBarTopGap);
+	// ADR-0011 decision 3 still binds the trimmed set: nothing may become a
+	// one-unit band.
+	TestTrue(TEXT("no trimmed padding falls to a hairline"),
+	         L.TrimShellPadTop >= VoxelUITheme::RulePx && L.TrimScreenBodyPadY >= VoxelUITheme::RulePx
+	             && L.TrimActionBarTopGap >= VoxelUITheme::RulePx);
 
 	return true;
 }

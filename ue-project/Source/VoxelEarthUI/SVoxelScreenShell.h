@@ -51,6 +51,7 @@
 
 #include "CoreMinimal.h"
 #include "VoxelScreenData.h" // EVoxelScreenTab
+#include "VoxelUITheme.h"    // FVoxelShellChrome -- the shell's trimmed chrome
 #include "Input/CursorReply.h"
 #include "Styling/SlateColor.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
@@ -132,6 +133,14 @@ public:
 	// is added with AddViewportWidgetContent and its centring box fills it).
 	// Scale is the live Menu Size, because the frame's painted half-extent is
 	// its authored half-extent times that.
+	//
+	// IT ASKS ShellChromeForViewport FOR THE HEIGHT rather than reading
+	// ScreenShellHeight, because since 2026-09-08 the frame is not always the
+	// authored 760: a viewport too short for it (INTERFACE SIZE at 1.50, or a
+	// large Menu Size) trims the shell, and a hit region wired to the authored
+	// rectangle would sit off the painted one exactly where the player has most
+	// reason to grab it. Same argument as point 5 in SVoxelScreenShellTests --
+	// the grip must follow the frame it is drawn on.
 	static EResizeZone ResizeZoneAt(const FVector2D& LocalPos, const FVector2D& LocalSize, float Scale);
 
 	// Where the pointer sits along the dragged axis, as a multiple of the
@@ -188,6 +197,21 @@ private:
 	// disagree about where the grip is.
 	TSharedRef<class SWidget> BuildResizeGrip();
 	FSlateColor GripColour() const;
+
+	// --- Responsive trimming (ADR-0011 decision 4) ---------------------------
+	// THE CHROME THE FRAME IS BUILT FROM THIS FRAME. Read from the widget's own
+	// cached geometry -- which is the viewport in layout units, both the engine
+	// DPI scale and the player's INTERFACE SIZE already divided out by Slate --
+	// and the live Menu Size, because the frame is painted at that scale and a
+	// scaled frame needs a smaller frame to fit the same screen.
+	//
+	// AN ATTRIBUTE AND NOT A CONSTRUCT-TIME VALUE, for the same reason the Menu
+	// Size render transform is: both dials are live, the Settings row can move
+	// either while a screen is open, and there is nothing here to subscribe to.
+	// Reading the cached geometry inside a layout attribute is not circular --
+	// this widget's arranged size comes from the viewport overlay slot that
+	// contains it and does not depend on what the frame inside it asks for.
+	FVoxelShellChrome CurrentChrome() const;
 
 	// The scale in force RIGHT NOW: the drag's uncommitted value while one is in
 	// flight, the stored setting otherwise. Every reader goes through this, so

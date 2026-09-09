@@ -357,6 +357,61 @@ inline constexpr float HandLineHeight(float CssLineHeight)
 }
 } // namespace VoxelUITheme
 
+// --- The screen shell's chrome, after responsive trimming --------------------
+//
+// ADR-0011 decision 4, verbatim: *"Scale is not a substitute for layout.
+// Anchoring and responsive containers handle aspect ratio; scale handles size.
+// A panel that must not exceed a width gets a max width, not a smaller scale."*
+//
+// This is what the shell reads instead of the authored fields when the space it
+// is given is smaller than the space it was drawn for. Every field here has an
+// authored default equal to the FVoxelMenuLayout field of the same meaning, and
+// FVoxelMenuLayout::ShellChromeForViewport is the ONLY thing that ever returns
+// anything else -- see the long note there for what actually makes the space
+// shrink, which is NOT the display's resolution.
+//
+// THE TRIM IS A TRADE OF CHROME FOR FRAME, NOT OF CONTENT FOR ANYTHING. Every
+// unit taken off ShellHeight in the first tier is a unit taken off a padding in
+// the same pass, so the body's content box is the same size it was: the frame
+// gets smaller and the screen inside it does not change at all. Only when that
+// is not enough does the second tier cut into the body, and it says so
+// (bBodyShortened) rather than leaving the caller to infer it.
+struct FVoxelShellChrome
+{
+	float ShellWidth      = 1060.f;
+	float ShellHeight     = 760.f;
+	float PadX            = 18.f;
+	float PadTop          = 14.f;
+	// NOT TRIMMED, EVER, and this is the one field with a hard floor: the
+	// resize gripper is drawn in the frame's bottom-right corner and needs
+	// ShellGripInset + 3 dots + 2 gaps of room to sit inside the padding rather
+	// than over the action bar's last hint. SVoxelScreenShellTests pins that
+	// relationship; trimming this would break it silently.
+	float PadBottom       = 18.f;
+	float BodyPadX        = 18.f;
+	float BodyPadY        = 18.f;
+	float ActionBarTopGap = 10.f;
+	// Anything above is below its authored value.
+	bool bTrimmed         = false;
+	// The chrome had nothing left to give and the frame was cut into the body's
+	// room. The five screens absorb this without any change of their own: every
+	// tall region in them is already an SScrollBox with MaxDesiredHeight(0)
+	// (see SVoxelJournalScreen / SVoxelCodexScreen / SVoxelPlayerScreen), which
+	// is ADR-0011's "where a page cannot fit, it scrolls inside its bounded
+	// column" already in place.
+	bool bBodyShortened   = false;
+
+	// The box .menu-body hands a screen body, computed from THIS chrome rather
+	// than from the authored fields. Equal to FVoxelMenuLayout::
+	// ScreenBodyContentWidth() whenever the width is untrimmed, which is every
+	// case the shipped product reaches -- see the width note in
+	// ShellChromeForViewport.
+	float BodyContentWidth() const
+	{
+		return ShellWidth - 2.f * PadX - 2.f * BodyPadX;
+	}
+};
+
 // --- Layout -----------------------------------------------------------------
 //
 // Every number the front end positions anything with. Defaults are the values
@@ -736,6 +791,31 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	float ScreenShellPadX      = 18.f; // padding:14px 18px 18px
 	float ScreenShellPadTop    = 14.f;
 	float ScreenShellPadBottom = 18.f;
+	// --- The trimmed set (ADR-0011 decision 4) ------------------------------
+	// What the vertical paddings become when the shell is not given the room it
+	// was authored for. Read ONLY by ShellChromeForViewport at the bottom of
+	// this struct, which is where the ladder and its justification are; they sit
+	// here so the trimmed value is beside the authored one it replaces and
+	// neither can be moved without seeing the other.
+	//
+	// AUTHORED NUMBERS, NOT A FRACTION OF THE AUTHORED ONES. A ratio would
+	// produce fractional paddings at some viewport and there is no reading of
+	// ADR-0011 under which "18 x 0.55" is a design token. These are the values
+	// the design would have used had it been drawn for a shorter frame.
+	float TrimShellPadTop      = 8.f;
+	float TrimScreenBodyPadY   = 10.f;
+	float TrimActionBarTopGap  = 6.f;
+	// THE GAP THE FRAME KEEPS FROM THE VIEWPORT EDGE. 12 because that is the
+	// inset every other edge-anchored thing in this front end uses -- the HUD's
+	// compass (HudCompassTop), its dock (HudDockBottom) and its music transport
+	// (HudMusicTop) are all 12 -- so the shell stops where they stop. Not a
+	// taste number and not tuned against a capture.
+	float ShellViewportMargin  = 12.f;
+	// The floor the second trim tier will not go below. Nothing renders usefully
+	// under this; a viewport this short is a window being dragged, not a screen,
+	// and a frame that stays legible while it happens is better than one that
+	// collapses.
+	float ShellMinHeight       = 420.f;
 	// THE INVENTORY SHELL HAS NO SIZE HERE, deliberately. Its mock overrides the
 	// compact shell with `width:max-content`, and the port honours that by
 	// setting no override at all -- see SVoxelScreenShell::Construct for the
@@ -1150,6 +1230,115 @@ struct VOXELEARTHUI_API FVoxelMenuLayout
 	{
 		return ScreenBodyContentWidth() - CodexCategoryWidth - CodexEntryListWidth
 		     - 2.f * CodexColumnGap;
+	}
+
+	// --- Responsive trimming (ADR-0011 decision 4) --------------------------
+	//
+	// THE FACT THAT DECIDES THIS FUNCTION, AND IT IS NOT THE ONE IT WAS ASKED
+	// FOR. The engine scales the UI by `ShortestSide` off a curve that is
+	// exactly `shortestSide / 1080` (DefaultEngine.ini, and the ADR's decision
+	// 2). On any landscape display the shortest side IS the height, so the
+	// height of the viewport IN THE UNITS EVERY WIDGET LAYS OUT IN is
+	//
+	//     1080 / 1.0   at 1920x1080     = 1080
+	//     1440 / 1.333 at 2560x1440     = 1080
+	//     2160 / 2.0   at 3840x2160     = 1080
+	//
+	// -- exactly 1080, always, at every resolution. A 1080p player and a 1440p
+	// player are handed the SAME layout space and the shell occupies the same
+	// fraction of both. MEASURED, not derived: the 2026-09-08 before-captures in
+	// ue-project/Saved/ui-before are the same screen at both sizes, and the
+	// shell's painted body measures 1024 px of 1920 at 1080p and 1366 px of 2560
+	// at 1440p -- 53.3% of the width in both, the frame 1060x760 and 1413x1013.
+	// So "trim at 1080p, leave 1440p alone" is not a thing this engine can even
+	// express; a chrome that changed with the resolution would give the 1080p
+	// player a different layout for no reason, and that is precisely the
+	// "rescale a constant to compensate for the display" ADR-0011 forbids.
+	//
+	// WHAT DOES SHRINK THE SPACE, and why this function is not dead code:
+	//
+	//   * INTERFACE SIZE (VoxelGraphicsUserSettings UIScale, 0.75-1.50, applied
+	//     through FSlateApplication::SetApplicationScale) MULTIPLIES the engine
+	//     scale, so it divides the layout space: at 1.50 the viewport is 720
+	//     units tall and the authored 760-unit shell DOES NOT FIT. That is a
+	//     shipped, reachable state of two settings rows, at any resolution.
+	//   * MENU SIZE (VoxelScreenShellSettings, 0.75-1.50) paints the frame at
+	//     ShellHeight x that scale about its own centre, so at 1.50 the shell
+	//     asks for 1140 of the 1080 units there are and hangs 30 units off the
+	//     top and bottom of the screen. Shipped since 2026-09-08 and wrong at
+	//     every resolution.
+	//   * A window that is not the whole screen, and any future non-16:9 or
+	//     portrait layout, where the shortest side is the width.
+	//
+	// So the input is the space the shell ACTUALLY HAS, in the shell's own
+	// units -- SVoxelScreenShell passes its own local geometry, which is the
+	// viewport with both scales already divided out -- and the Menu Size the
+	// frame will be painted at. Not a resolution. A function of the resolution
+	// could not be right, and would be untestable in the bargain.
+	//
+	// THE WIDTH IS NOT TRIMMED and that is a known gap, stated rather than
+	// hidden: the five screens' columns are bound to ScreenBodyContentWidth()
+	// at Construct (the 2026-09-08 journal fix), so a narrower frame would need
+	// those to be re-derived per screen. Width only binds below 1060 + 2 margins
+	// = 1084 units, which 16:9 and 16:10 never reach (1920 and 1728 at INTERFACE
+	// SIZE 1.00, 1280 and 1152 at 1.50); a 4:3 display at INTERFACE SIZE 1.50
+	// does (960), and there the body's down-only fit absorbs it by scaling, as
+	// it does for the inventory's rigid pack.
+	FVoxelShellChrome ShellChromeForViewport(FVector2D ViewportUnits, float MenuScale = 1.f) const
+	{
+		FVoxelShellChrome C;
+		C.ShellWidth      = ScreenShellWidth;
+		C.ShellHeight     = ScreenShellHeight;
+		C.PadX            = ScreenShellPadX;
+		C.PadTop          = ScreenShellPadTop;
+		C.PadBottom       = ScreenShellPadBottom;
+		C.BodyPadX        = ScreenBodyPad;
+		C.BodyPadY        = ScreenBodyPad;
+		C.ActionBarTopGap = ActionBarTopGap;
+
+		// NO GEOMETRY YET IS NOT A SMALL VIEWPORT. A widget's cached geometry is
+		// zero until its first arrange, and answering "trim everything" for one
+		// frame would make every screen open with a visible twitch.
+		if (!(ViewportUnits.Y > 0.0))
+		{
+			return C;
+		}
+
+		// The frame is painted at ShellHeight x MenuScale about its centre, and
+		// the margin is a gap on the SCREEN, so it is not scaled with the frame.
+		const float Scale = FMath::Max(MenuScale, 0.01f);
+		const float Available = float(ViewportUnits.Y - 2.0 * double(ShellViewportMargin)) / Scale;
+		if (Available >= C.ShellHeight)
+		{
+			return C;
+		}
+
+		// TIER ONE: THE SHELL PAYS OUT OF ITS OWN CHROME. Each unit below comes
+		// off the frame AND off a padding, so the body's content box does not
+		// move: the screens inside are untouched, which is the whole point of
+		// trimming rather than scaling. The tab bar's own padding is NOT in this
+		// set -- it belongs to SVoxelMenuButton's Tab variant, which four other
+		// menus share, and taking it here would mean trimming those too.
+		C.PadTop          = TrimShellPadTop;
+		C.BodyPadY        = TrimScreenBodyPadY;
+		C.ActionBarTopGap = TrimActionBarTopGap;
+		C.bTrimmed        = true;
+		C.ShellHeight     = ScreenShellHeight
+		                  - (ScreenShellPadTop - TrimShellPadTop)
+		                  - 2.f * (ScreenBodyPad - TrimScreenBodyPadY)
+		                  - (ActionBarTopGap - TrimActionBarTopGap);
+		if (Available >= C.ShellHeight)
+		{
+			return C;
+		}
+
+		// TIER TWO: THERE IS NOTHING LEFT TO TRIM AND THE FRAME TAKES THE CUT.
+		// The body loses the difference and scrolls, which every screen already
+		// does. Floored so that a viewport of nearly nothing produces a small
+		// shell rather than an inside-out one.
+		C.ShellHeight    = FMath::Max(Available, ShellMinHeight);
+		C.bBodyShortened = true;
+		return C;
 	}
 
 	// Loaded once from Config/DefaultVoxelUI.ini, section [VoxelUI.Layout],

@@ -97,7 +97,20 @@ param(
     # to check against.
     [string]$Engine = 'D:/UE_5.8',
     [string]$Project,
+    # THE CAPTURE'S RESOLUTION, and -ResX/-ResY are aliases because that is what
+    # the engine switches are called and what a caller reaches for.
+    #
+    # A REQUEST HERE WAS INERT UNTIL 2026-09-08 AND SAID NOTHING. The default
+    # game window is BORDERLESS FULLSCREEN (Saved/Config/WindowsEditor/
+    # GameUserSettings.ini carries FullscreenMode=1), and borderless fullscreen
+    # is by definition the desktop's resolution -- so -ResX=1920 -ResY=1080 was
+    # accepted, echoed in the banner, and produced a 2560x1440 image. See the
+    # -windowed decision and the size check at the bottom of this script: the
+    # request now takes, and a run whose image is not the requested size says so
+    # instead of handing back a picture of a different screen.
+    [Alias('ResX')]
     [int]$Width = 2560,
+    [Alias('ResY')]
     [int]$Height = 1440,
     # Settle before the menu shutter. The background art decodes on a worker
     # and glyphs rasterise lazily, so frame one is a half-built menu.
@@ -234,6 +247,22 @@ switch ($Shot) {
     }
 }
 
+# -windowed WHEN, AND ONLY WHEN, THE REQUEST IS NOT THE DESKTOP'S OWN SIZE.
+# Borderless fullscreen cannot be any size but the desktop's, so a smaller
+# request is only reachable in a real window. The default (2560x1440 on this
+# box) therefore keeps the borderless path every previous capture was taken on
+# -- a windowed 2560x1440 is NOT the same picture, because the window chrome
+# eats ~48 px of height, the shortest side becomes 1392, and the engine's UI
+# scale curve reads 1.29 instead of 1.333 (see docs/adr/0011-scale-tolerant-ui.md).
+$DesktopW = 0; $DesktopH = 0
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $DesktopW = $bounds.Width; $DesktopH = $bounds.Height
+} catch { }
+$Windowed = ($DesktopW -gt 0) -and (($Width -ne $DesktopW) -or ($Height -ne $DesktopH))
+if ($Windowed) { $argList += '-windowed' }
+
 if ($DemoSaves) { $argList += '-VoxelDemoSaves' }
 if ($DemoVitals) { $argList += "-VoxelDemoVitals=$Vitals" }
 if ($ExtraArgs) { $argList += $ExtraArgs }
@@ -244,6 +273,8 @@ Write-Host "  shot     : $Shot"
 Write-Host "  editor   : $EditorExe"
 Write-Host "  project  : $Project"
 Write-Host "  log      : $LogPath"
+Write-Host "  requested: ${Width}x${Height}$(if ($Windowed) { ' (windowed)' } else { ' (borderless fullscreen = desktop size)' })"
+Write-Host "  desktop  : $(if ($DesktopW) { "${DesktopW}x${DesktopH}" } else { 'unknown' })"
 Write-Host "  switches : $($argList -join ' ')"
 Write-Host '==============================================================='
 Write-Host ''
@@ -304,7 +335,29 @@ if (Test-Path $ShotDir) {
 if ($new) {
     Write-Host ''
     Write-Host "captured $($new.Count) image(s):"
-    $new | ForEach-Object { Write-Host ("  " + $_.FullName) }
+    # THE SIZE IS MEASURED, NOT ASSUMED. The banner above echoes the parameter;
+    # this reads the pixels. A capture whose image is not the requested size is
+    # a picture of a resolution nobody asked for, and every measurement taken
+    # off it -- an ADR-0011 shell width above all -- is attributed to the wrong
+    # screen. voxel-run-flight-leg.ps1 grew the same check on 2026-08-25 after
+    # exactly this failure, and this script did not have it.
+    $mismatch = $false
+    try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop } catch { }
+    $new | ForEach-Object {
+        $size = ''
+        try {
+            $img = [System.Drawing.Image]::FromFile($_.FullName)
+            $size = " -- $($img.Width)x$($img.Height)"
+            if ($img.Width -ne $Width -or $img.Height -ne $Height) { $mismatch = $true }
+            $img.Dispose()
+        } catch { }
+        Write-Host ("  " + $_.FullName + $size)
+    }
+    if ($mismatch) {
+        Write-Warning ("RESOLUTION MISMATCH: ${Width}x${Height} was requested and the image(s) above are not that size.")
+        Write-Warning ("  Quote the size printed above, never the request. Borderless fullscreen ignores -ResX/-ResY;")
+        Write-Warning ("  a windowed request larger than the desktop work area is shrunk to fit it.")
+    }
 } elseif ($Shot -ne 'GateSweep') {
     Write-Warning "No new screenshot appeared in $ShotDir. Check the log above."
 }

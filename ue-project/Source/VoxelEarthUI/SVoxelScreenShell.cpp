@@ -156,49 +156,64 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 		[
 			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(Tint(Mix(PanelOak1, PanelOak2)))
 		]
-		+ SOverlay::Slot().Padding(FMargin(L.ScreenBodyPad))
+		+ SOverlay::Slot()
 		[
-			// THE BODY FITS THE FRAME; THE FRAME NO LONGER FITS THE BODY.
-			//
-			// This is the other half of unifying the five shell sizes. The
-			// inventory's 8x8 pack plus its hotbar, filter row and head is a
-			// little taller and wider than the authored 1060x760 leaves for a
-			// body -- 16 x 28 units over, measured on the 2026-09-07 captures.
-			// The old answer was to let the frame grow (see ShrinkWrap in the
-			// header); the owner's answer is one size for all five.
-			//
-			// ScaleToFit + DownOnly is what makes that safe rather than a
-			// clipping bet. A body that does not fit is drawn uniformly smaller
-			// instead of losing a pack row off the bottom, which is the failure
-			// the earlier fixed-size draft was abandoned over. No reflow either:
-			// the content keeps its authored layout and is scaled, so the
-			// inventory looks like itself, only fractionally smaller.
-			//
-			// "DOWNONLY CAN ONLY EVER RETURN 1 FOR THE FOUR SCREENS THAT ALREADY
-			// FIT" -- THAT SENTENCE STOOD HERE AND IT WAS FALSE. It was derived,
-			// never measured, and the owner measured it for us the same night:
-			// *"journal UI elements within that pane look too small now"*. A
-			// ScaleBox decides its factor from the child's DESIRED size, and a
-			// desired size is what a widget ASKS for, not what it needs. An
-			// auto-wrapping STextBlock with no width asks for its longest line
-			// unwrapped, and a vertical SScrollBox asks for its whole content
-			// height. The journal's parchment page did both, so it asked for
-			// ~1603 units against the 988 here and was drawn at 0.62.
-			//
-			// SO THE STANDING RULE IS ON THE SCREENS, NOT HERE: a screen body
-			// must bound its own fluid columns -- a fixed width on a text
-			// column, MaxDesiredHeight(0) on a scroll region -- so that whatever
-			// desired size reaches this box is a size the screen genuinely
-			// needs. This box then scales for RIGIDITY only, which is the
-			// inventory's fixed 8x8 pack and nothing else. See
-			// SVoxelJournalScreen::Construct for the worked case.
-			SNew(SScaleBox)
-			.Stretch(EStretch::ScaleToFit)
-			.StretchDirection(EStretchDirection::DownOnly)
-			.HAlign(HAlign_Fill)
-			.VAlign(VAlign_Fill)
+			// .menu-body's own padding, on an SBox rather than on the slot
+			// above so it can be an ATTRIBUTE: it is one of the three paddings
+			// the shell trims when the viewport is too short for the authored
+			// frame (FVoxelMenuLayout::ShellChromeForViewport). Layout-identical
+			// to a slot padding -- a box pads its child either way -- and this
+			// form has an attribute overload that a slot's does not need to
+			// grow for one caller.
+			SNew(SBox)
+			.Padding_Lambda([this]()
+			{
+				const FVoxelShellChrome Chrome = CurrentChrome();
+				return FMargin(Chrome.BodyPadX, Chrome.BodyPadY);
+			})
 			[
-				InArgs._Body.Widget
+				// THE BODY FITS THE FRAME; THE FRAME NO LONGER FITS THE BODY.
+				//
+				// This is the other half of unifying the five shell sizes. The
+				// inventory's 8x8 pack plus its hotbar, filter row and head is a
+				// little taller and wider than the authored 1060x760 leaves for a
+				// body -- 16 x 28 units over, measured on the 2026-09-07 captures.
+				// The old answer was to let the frame grow (see ShrinkWrap in the
+				// header); the owner's answer is one size for all five.
+				//
+				// ScaleToFit + DownOnly is what makes that safe rather than a
+				// clipping bet. A body that does not fit is drawn uniformly smaller
+				// instead of losing a pack row off the bottom, which is the failure
+				// the earlier fixed-size draft was abandoned over. No reflow either:
+				// the content keeps its authored layout and is scaled, so the
+				// inventory looks like itself, only fractionally smaller.
+				//
+				// "DOWNONLY CAN ONLY EVER RETURN 1 FOR THE FOUR SCREENS THAT ALREADY
+				// FIT" -- THAT SENTENCE STOOD HERE AND IT WAS FALSE. It was derived,
+				// never measured, and the owner measured it for us the same night:
+				// *"journal UI elements within that pane look too small now"*. A
+				// ScaleBox decides its factor from the child's DESIRED size, and a
+				// desired size is what a widget ASKS for, not what it needs. An
+				// auto-wrapping STextBlock with no width asks for its longest line
+				// unwrapped, and a vertical SScrollBox asks for its whole content
+				// height. The journal's parchment page did both, so it asked for
+				// ~1603 units against the 988 here and was drawn at 0.62.
+				//
+				// SO THE STANDING RULE IS ON THE SCREENS, NOT HERE: a screen body
+				// must bound its own fluid columns -- a fixed width on a text
+				// column, MaxDesiredHeight(0) on a scroll region -- so that whatever
+				// desired size reaches this box is a size the screen genuinely
+				// needs. This box then scales for RIGIDITY only, which is the
+				// inventory's fixed 8x8 pack and nothing else. See
+				// SVoxelJournalScreen::Construct for the worked case.
+				SNew(SScaleBox)
+				.Stretch(EStretch::ScaleToFit)
+				.StretchDirection(EStretchDirection::DownOnly)
+				.HAlign(HAlign_Fill)
+				.VAlign(VAlign_Fill)
+				[
+					InArgs._Body.Widget
+				]
 			]
 		];
 
@@ -237,9 +252,18 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 
 	if (Actions.Num() > 0)
 	{
-		Column->AddSlot().AutoHeight().Padding(FMargin(0.f, L.ActionBarTopGap, 0.f, 0.f))
+		Column->AddSlot().AutoHeight()
 		[
-			BuildActionBar()
+			// The gap above the action bar, as an attribute for the reason the
+			// body's padding above is one: it is trimmed when the frame is.
+			SNew(SBox)
+			.Padding_Lambda([this]()
+			{
+				return FMargin(0.f, CurrentChrome().ActionBarTopGap, 0.f, 0.f);
+			})
+			[
+				BuildActionBar()
+			]
 		];
 	}
 
@@ -262,7 +286,11 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 		+ SOverlay::Slot()
 		[
 			SNew(SBox)
-			.Padding(FMargin(L.ScreenShellPadX, L.ScreenShellPadTop, L.ScreenShellPadX, L.ScreenShellPadBottom))
+			.Padding_Lambda([this]()
+			{
+				const FVoxelShellChrome Chrome = CurrentChrome();
+				return FMargin(Chrome.PadX, Chrome.PadTop, Chrome.PadX, Chrome.PadBottom);
+			})
 			[
 				Column
 			]
@@ -279,10 +307,24 @@ void SVoxelScreenShell::Construct(const FArguments& InArgs)
 			BuildResizeGrip()
 		];
 
+	// THE FRAME'S HEIGHT IS NOT A CONSTANT ANY MORE (ADR-0011 decision 4). It is
+	// the authored 760 whenever the viewport has room for it, which is every
+	// 16:9 display at INTERFACE SIZE 1.00 and Menu Size up to 1.35 -- and less
+	// when it does not, because a frame drawn past the edge of the screen is
+	// worse than a frame with tighter chrome. See ShellChromeForViewport for
+	// what makes the room shrink, and for the measurement showing it is not the
+	// resolution.
+	//
+	// THE WIDTH IS STILL A CONSTANT, deliberately: the five screens bound their
+	// columns to ScreenBodyContentWidth() at Construct, so a live width would
+	// have to reach them too. The gap is written down where the trim is decided.
 	TSharedRef<SBox> Frame =
 		SNew(SBox)
 		.WidthOverride(L.ScreenShellWidth)
-		.HeightOverride(L.ScreenShellHeight)
+		.HeightOverride_Lambda([this]()
+		{
+			return FOptionalSize(CurrentChrome().ShellHeight);
+		})
 		// THE PLAYER'S MENU SIZE DIAL. A render transform about the frame's
 		// centre, read fresh every paint, so the Settings row, Ctrl+wheel and
 		// the corner drag are the same control and none has to tell the others.
@@ -512,6 +554,21 @@ float SVoxelScreenShell::LiveScale() const
 	return DragScale.IsSet() ? DragScale.GetValue() : VoxelScreenShellSettings::GetScale();
 }
 
+FVoxelShellChrome SVoxelScreenShell::CurrentChrome() const
+{
+	// GetTickSpaceGeometry AND NOT GetPaintSpaceGeometry: the paint geometry
+	// carries the Menu Size render transform, and asking how much room the
+	// frame has in a space the frame has already been scaled into would feed the
+	// scale back into itself. The tick space is the layout space -- the viewport
+	// with the engine's DPI scale and the player's INTERFACE SIZE divided out,
+	// which is exactly the space ShellChromeForViewport wants.
+	//
+	// ZERO BEFORE THE FIRST ARRANGE, and ShellChromeForViewport answers that
+	// with the authored chrome rather than with the smallest one.
+	return FVoxelMenuLayout::Get().ShellChromeForViewport(
+		FVector2D(GetTickSpaceGeometry().GetLocalSize()), LiveScale());
+}
+
 SVoxelScreenShell::EResizeZone SVoxelScreenShell::ResizeZoneAt(const FVector2D& LocalPos,
                                                                const FVector2D& LocalSize,
                                                                float Scale)
@@ -519,11 +576,16 @@ SVoxelScreenShell::EResizeZone SVoxelScreenShell::ResizeZoneAt(const FVector2D& 
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 
 	// The frame is centred in this widget and scaled about its own centre, so
-	// its painted half-extent is the authored half-extent times the scale. That
-	// is the whole geometry of the hit region -- no cached arranged rectangle,
-	// nothing to keep in step with a relayout.
-	const double HalfW = double(L.ScreenShellWidth) * 0.5 * double(Scale);
-	const double HalfH = double(L.ScreenShellHeight) * 0.5 * double(Scale);
+	// its painted half-extent is its half-extent times the scale. That is the
+	// whole geometry of the hit region -- no cached arranged rectangle, nothing
+	// to keep in step with a relayout.
+	//
+	// THE HEIGHT COMES FROM THE CHROME, not from ScreenShellHeight: the frame is
+	// trimmed when the viewport is too short for the authored one, and the two
+	// disagree at exactly the sizes a player is most likely to be dragging.
+	const FVoxelShellChrome Chrome = L.ShellChromeForViewport(LocalSize, Scale);
+	const double HalfW = double(Chrome.ShellWidth) * 0.5 * double(Scale);
+	const double HalfH = double(Chrome.ShellHeight) * 0.5 * double(Scale);
 	const double CentreX = LocalSize.X * 0.5;
 	const double CentreY = LocalSize.Y * 0.5;
 	const double Right = CentreX + HalfW;
@@ -561,6 +623,13 @@ SVoxelScreenShell::EResizeZone SVoxelScreenShell::ResizeZoneAt(const FVector2D& 
 
 float SVoxelScreenShell::ResizeRatioAt(EResizeZone Zone, const FVector2D& LocalPos, const FVector2D& LocalSize)
 {
+	// THE AUTHORED HALF-EXTENT, ON PURPOSE, AND NOT THE TRIMMED ONE. This is a
+	// drag MAPPING, not a hit region: the gesture is the difference of two of
+	// these readings, so all it needs is a denominator that does not move
+	// during the drag. The trimmed height does move -- it is a function of the
+	// scale, which is what the drag is changing -- and feeding it in here would
+	// make the shell accelerate away from the cursor at the sizes where the
+	// trim engages. ResizeZoneAt is the one that must follow the painted frame.
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 	const double HalfW = FMath::Max(double(L.ScreenShellWidth) * 0.5, 1.0);
 	const double HalfH = FMath::Max(double(L.ScreenShellHeight) * 0.5, 1.0);
