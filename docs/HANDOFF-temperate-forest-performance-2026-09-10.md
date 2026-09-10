@@ -1,3 +1,14 @@
+# Final checkpoint decision — PR #253
+
+The user explicitly directed immediate commit/merge/push on September10 after reauthorizing the GitHub destination. Further validation was stopped; this is a work checkpoint, not full runtime or performance acceptance. Integration branch: `codex/temperate-checkpoint-integration-2026-09-10`; GitHub PR: https://github.com/mnoles1911/voxelsim/pull/253. The original checkpoint is df355dc; subsequent integration/fix commits include d9f4d90, c965170 and efa9f3d. Earlier STOPPED and unmerged descriptions below are historical and superseded by this decision and the PR's actual merge status.
+
+Verified: Asset Forge frontend build; 37 Python analysis regressions; 11 focused native CTest targets; Asset Forge quick selftest after regenerating categories; float, unity, frontend-switch and shader lints. GitHub shader compilation, terrain-service, Docker and ancillary lint jobs passed.
+
+Outstanding at the immediate-merge instruction: Linux CI still fails compilation in focused tests (GCC reports small-array sort bounds in mip provenance and enum/non-enum conditional in appearance-page tests). Full-library generation/MSVC checks were not all complete. The first merged UE build found old save API callers and a Windows `near` macro collision, both corrected in committed source. Subsequent compiler attempts stalled; the direct no-PCH probe consumed CPU but was stopped at the user's immediate-finish instruction. No final merged UE build or merged GPU runtime pass is claimed. Both conflicted material assets retain the checkpoint versions; regeneration from merged appearance+surface-lighting scripts remains required. Private caches need rebaking after material/source identity changes.
+
+All feature/performance follow-ups below remain outstanding, especially invalidated culling A/B24/25, mesh retirement, R0 diagnostics and gameplay acceptance. Do not interpret merge completion as those goals being achieved. Future work should begin with the CI compiler failures, a coherent merged UE build, material regeneration, and focused ownership/appearance/descriptor runtime tests.
+
+---
 # STOPPED — latest handoff update, September 10, 2026
 
 **The user again explicitly ordered all work and subagents stopped. Do not resume implementation, builds, merge resolution, commits, or pushes without a new instruction. This section supersedes earlier continuation/stop-state text below.**
