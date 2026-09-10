@@ -1,0 +1,1 @@
+PASS: All authored waypoints reached; optional foundation evidence recorded, not approved; arrived=8/8; travel_m=136.255; no broad navigability or building-support acceptance

@@ -32,7 +32,9 @@ def compare(before, after):
         # Diagnostics run only after an aborted route; analyze() below requires
         # successful completion. Cache files may differ only if models match.
         ignored = ("-UserDir=", "-abslog=", "-VoxelEcologyRouteOutput=", "-VoxelDetailMeshCache=")
-        return [a for a in run["arguments"] if not a.startswith(ignored) and a != "-VoxelEcologyRouteDiagnoseStalls"]
+        # Policy flags whose OFF/ON is the comparison itself; anything else differing is a scene change.
+        policy = ("-VoxelDetailSizeCull", "-VoxelDetailRetireUnused")
+        return [a for a in run["arguments"] if not a.startswith(ignored) and a != "-VoxelEcologyRouteDiagnoseStalls" and a not in policy]
     if args(runs[0]) != args(runs[1]):
         raise ValueError("Different gameplay arguments outside allowed artifact paths")
     models = [cache_models(r) for r in runs]

@@ -1,0 +1,43 @@
+﻿{
+    "runtimeModuleHashes":  {
+                                "UnrealEditor-VoxelEarthShaders.dll":  "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C",
+                                "UnrealEditor-VoxelEarth.dll":  "5EFE4816B3F32161CC19E10928D35EDE89088EAA8ED505AD3D48262AFF0107A0"
+                            },
+    "routeSha256":  "455191905752A52281F26F2BC67B33F6C3EC52C0400696C4F1C4802643EA43A6",
+    "arguments":  [
+                      "D:\\voxelsim\\ue-project\\VoxelEarth.uproject",
+                      "/Engine/Maps/Entry",
+                      "-game",
+                      "-dx12",
+                      "-RenderOffscreen",
+                      "-unattended",
+                      "-nosplash",
+                      "-nop4",
+                      "-ResX=1280",
+                      "-ResY=720",
+                      "-csvGpuStats",
+                      "-csvCompression=0",
+                      "-VoxelAssetDir=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\previews\\full-forest-low-cover-1",
+                      "-VoxelEcologyConfig=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\previews\\full-forest-low-cover-1\\placement.json",
+                      "-VoxelDetailRingMeters=48",
+                      "-VoxelSpawnAt=-153936,-81480",
+                      "-VoxelSpawnAltM=5",
+                      "-VoxelTimeOfDay=10:00",
+                      "-VoxelDate=2026-05-15",
+                      "-VoxelTimeScale=0",
+                      "-VoxelEcologyRoute=D:\\voxelsim\\docs\\temperate-route-shore-survey-pilot.json",
+                      "-VoxelEcologyRouteSha256=455191905752A52281F26F2BC67B33F6C3EC52C0400696C4F1C4802643EA43A6",
+                      "-VoxelEcologyRouteOutput=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\route-capture-12-shore-survey/results",
+                      "-UserDir=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\route-capture-12-shore-survey/session",
+                      "-abslog=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\route-capture-12-shore-survey/unreal.log",
+                      "-VoxelEcologyRouteProfile",
+                      "-VoxelDetailMeshLOD",
+                      "-VoxelDetailMeshCache=D:\\voxelsim\\ue-project\\Content\\Voxel\\Generated\\DetailPreview\\temperate-authored-lods-full-4\\detail-bake.json",
+                      "-VoxelDetailMeshCachePreview"
+                  ],
+    "speciesManifestSha256":  "0197DA097E17A2634C2F15DCA0589E5E98157EB631C2998513769738427DD4F6",
+    "configurationSha256":  "E68B98F5D52952D59CECE8E4403C6D42EADDB9FEE5D3259DABB999A6F1AD0936",
+    "scope":  "Authored actual-pawn route, with optional endpoint evidence; no broad navigation or building acceptance",
+    "detailCacheManifestSha256":  "B8C06ED75FFDC51E1A144AADBC765ED4504873F6E89E683766E4B41C86E2C1F5",
+    "startedUtc":  "2026-09-10T15:53:44.1343300Z"
+}

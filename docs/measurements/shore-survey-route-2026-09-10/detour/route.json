@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "scope": "Authored shore traversal survey-candidate; runtime-unverified. Sparse 8m samples do not prove pawn clearance, continuous dryness, support, or route connectivity. No foundation approval. Detour revision 2026-09-10 after route-capture-12 stalled 4.4 m short of the last target against a beech trunk; one via point added, targets unchanged.",
+  "spawn_x_m": -153936.0,
+  "spawn_y_m": -81480.0,
+  "configuration_sha256": "e68b98f5d52952d59cece8e4403c6d42eaddb9fee5d3259dabb999a6f1ad0936",
+  "species_manifest_sha256": "0197da097e17a2634c2f15dca0589e5e98157eb631c2998513769738427dd4f6",
+  "provenance": {
+    "parent_route": "docs/temperate-route-shore-survey-pilot.json",
+    "parent_route_sha256": "455191905752a52281f26f2bc67b33f6c3ec52c0400696c4f1c4802643ea43a6",
+    "first_run": "asset-forge/out/ecological-placement/route-capture-12-shore-survey (FAIL arrived=6/7, travel 130.754 m)",
+    "purpose": "Same survey targets reached through an unobstructed approach; no collision or placement edits"
+  },
+  "waypoints": [
+    {
+      "x_m": -153932,
+      "y_m": -81484,
+      "arrival_radius_m": 0.75,
+      "label": "shore survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 62866,
+      "survey_slope_mm_per_m": 50,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 4000
+    },
+    {
+      "x_m": -153932,
+      "y_m": -81460,
+      "arrival_radius_m": 0.75,
+      "label": "shore survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 62671,
+      "survey_slope_mm_per_m": 35,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 12000
+    },
+    {
+      "x_m": -153940,
+      "y_m": -81436,
+      "arrival_radius_m": 0.75,
+      "label": "shore survey-candidate; stand 2; clearance unverified",
+      "survey_surface_mm": 62850,
+      "survey_slope_mm_per_m": 53,
+      "survey_stand": 2,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 18000
+    },
+    {
+      "x_m": -153956,
+      "y_m": -81420,
+      "arrival_radius_m": 0.75,
+      "label": "shore survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 62511,
+      "survey_slope_mm_per_m": 20,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 2000
+    },
+    {
+      "x_m": -153964,
+      "y_m": -81404,
+      "arrival_radius_m": 0.75,
+      "label": "shore survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 62732,
+      "survey_slope_mm_per_m": 115,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 12000
+    },
+    {
+      "x_m": -153964,
+      "y_m": -81380,
+      "arrival_radius_m": 0.75,
+      "label": "shore survey-candidate; stand 1; clearance unverified",
+      "survey_surface_mm": 64386,
+      "survey_slope_mm_per_m": 186,
+      "survey_stand": 1,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 34000
+    },
+    {
+      "x_m": -153968.0,
+      "y_m": -81376.0,
+      "arrival_radius_m": 0.75,
+      "label": "detour via 4 m west of the authored line; european-beech-0012 trunk (anchor -153964.1,-81368.0) blocks the straight leg to the last target; original seven targets unchanged",
+      "detour_evidence": "asset-forge/out/ecological-placement/shore-blocker-analysis-1 (world-capture-15-forest-shore tree grids at pawn height and +0.3 m): wp5->via 0 blocked poses, via->arrival-disk entry 0, straight wp5->wp6 31"
+    },
+    {
+      "x_m": -153964,
+      "y_m": -81364,
+      "arrival_radius_m": 0.75,
+      "label": "shore survey-candidate; stand 1; clearance unverified",
+      "survey_surface_mm": 65000,
+      "survey_slope_mm_per_m": 105,
+      "survey_stand": 1,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 38000
+    }
+  ]
+}

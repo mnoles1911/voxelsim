@@ -1,0 +1,111 @@
+{
+  "schema": 1,
+  "scope": "Game-thread inclusive R0 entry slices accumulated per frame. Per-stage maxima are from different frames and must not be summed; subtract only contemporaneous disjoint children.",
+  "frames_total": 488,
+  "frames_with_entry": 17,
+  "tolerance_ms": 0.05,
+  "missing_series": [],
+  "stages": {
+    "Entry": {
+      "total_ms": 2140.5062,
+      "calls": 17,
+      "per_frame_median_ms": 114.1206,
+      "per_frame_p95_ms": 270.8749599999999,
+      "per_frame_max_ms": 382.5564
+    },
+    "Footprint": {
+      "total_ms": 2131.5324,
+      "calls": 2882,
+      "per_frame_median_ms": 113.5327,
+      "per_frame_p95_ms": 270.0018799999999,
+      "per_frame_max_ms": 381.8742
+    },
+    "Memo": {
+      "total_ms": 2116.7961,
+      "calls": 2882,
+      "per_frame_median_ms": 112.8132,
+      "per_frame_p95_ms": 269.26409999999987,
+      "per_frame_max_ms": 380.9477
+    },
+    "Compute": {
+      "total_ms": 2114.949,
+      "calls": 484,
+      "per_frame_median_ms": 112.6746,
+      "per_frame_p95_ms": 269.1146799999999,
+      "per_frame_max_ms": 380.7634
+    },
+    "Resolve": {
+      "total_ms": 2073.2819,
+      "calls": 484,
+      "per_frame_median_ms": 110.7183,
+      "per_frame_p95_ms": 262.36203999999987,
+      "per_frame_max_ms": 370.9754
+    },
+    "Sky": {
+      "total_ms": 0.086941,
+      "calls": 2882,
+      "per_frame_median_ms": 0.003401,
+      "per_frame_p95_ms": 0.011366399999999981,
+      "per_frame_max_ms": 0.032812
+    },
+    "Nearest": {
+      "total_ms": 8.3906,
+      "calls": 17,
+      "per_frame_median_ms": 0.5507,
+      "per_frame_p95_ms": 0.81034,
+      "per_frame_max_ms": 0.8781
+    },
+    "Prefetch": {
+      "total_ms": 0.0,
+      "calls": 0,
+      "per_frame_median_ms": 0.0,
+      "per_frame_p95_ms": 0.0,
+      "per_frame_max_ms": 0.0
+    }
+  },
+  "counters": {
+    "ZCells": 34939.0,
+    "Evaluations": 34939.0,
+    "MemoHits": 2398.0,
+    "EpochInvalidations": 0.0
+  },
+  "entry_residual_ms": {
+    "total": 0.5832000000000185,
+    "median": 0.02719999999999967,
+    "p95": 0.05816000000000388,
+    "max": 0.062400000000006395
+  },
+  "nesting_violations": {
+    "resolve<=compute": {
+      "frames": 0,
+      "worst_excess_ms": 0.0
+    },
+    "compute<=memo": {
+      "frames": 0,
+      "worst_excess_ms": 0.0
+    },
+    "memo+sky<=footprint": {
+      "frames": 0,
+      "worst_excess_ms": 0.0
+    },
+    "footprint+nearest<=entry": {
+      "frames": 0,
+      "worst_excess_ms": 0.0
+    },
+    "prefetch<=entry": {
+      "frames": 0,
+      "worst_excess_ms": 0.0
+    }
+  },
+  "nesting_ok": true,
+  "log_window_lines": 7,
+  "csv_diagnostics": {
+    "ambiguous_columns_excluded": {
+      "FMsgLogf/FMsgLogfCount": [
+        184,
+        392
+      ]
+    },
+    "duplicate_policy": "Exclude every occurrence of ambiguous nonprimary names; primary/route duplicates are fatal. No inferred thread sums."
+  }
+}

@@ -1,0 +1,145 @@
+{
+  "schema": 1,
+  "before": "D:\\voxelsim\\asset-forge\\out\\ecological-placement\\route-capture-8-revisit-retire-off",
+  "after": "D:\\voxelsim\\asset-forge\\out\\ecological-placement\\route-capture-9-revisit-retire-on",
+  "scope": "One same-route editor comparison of combined builds, not an isolated optimization A/B, repeated-run confidence, culling or default256m acceptance.",
+  "matching_scene_pins": true,
+  "matching_cache_model_fingerprints": 339,
+  "runtime_module_hashes": [
+    {
+      "UnrealEditor-VoxelEarthShaders.dll": "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C",
+      "UnrealEditor-VoxelEarth.dll": "3D084472E90558F6D4111A1406952ED3C725FB5CF8F8B3D01A70592B29E902A0"
+    },
+    {
+      "UnrealEditor-VoxelEarthShaders.dll": "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C",
+      "UnrealEditor-VoxelEarth.dll": "3D084472E90558F6D4111A1406952ED3C725FB5CF8F8B3D01A70592B29E902A0"
+    }
+  ],
+  "walking_frames": [
+    4332,
+    4287
+  ],
+  "route_evidence": [
+    {
+      "pinsVerified": true,
+      "arrivals": 18,
+      "trajectorySamples": 294,
+      "groundedSamples": 292,
+      "waitingSamples": 0
+    },
+    {
+      "pinsVerified": true,
+      "arrivals": 18,
+      "trajectorySamples": 297,
+      "groundedSamples": 296,
+      "waitingSamples": 0
+    }
+  ],
+  "csv_column_diagnostics": [
+    {
+      "ambiguous_columns_excluded": {
+        "FMsgLogf/FMsgLogfCount": [
+          269,
+          411
+        ]
+      },
+      "duplicate_policy": "Exclude every occurrence of ambiguous nonprimary names; primary/route duplicates are fatal. No inferred thread sums."
+    },
+    {
+      "ambiguous_columns_excluded": {
+        "FMsgLogf/FMsgLogfCount": [
+          269,
+          417
+        ]
+      },
+      "duplicate_policy": "Exclude every occurrence of ambiguous nonprimary names; primary/route duplicates are fatal. No inferred thread sums."
+    }
+  ],
+  "metrics": {
+    "FrameTime": {
+      "before_ms": {
+        "median": 25.5217,
+        "p95": 58.728899999999925,
+        "max": 1798.9781
+      },
+      "after_ms": {
+        "median": 25.8698,
+        "p95": 55.389579999999974,
+        "max": 1913.2191
+      },
+      "change_percent": {
+        "median": 1.3639373552702283,
+        "p95": -5.6859910538081815,
+        "max": 6.350327444230697
+      }
+    },
+    "GameThreadTime": {
+      "before_ms": {
+        "median": 25.52295,
+        "p95": 53.99885999999987,
+        "max": 1799.5643
+      },
+      "after_ms": {
+        "median": 25.9012,
+        "p95": 50.741139999999966,
+        "max": 1913.4454
+      },
+      "change_percent": {
+        "median": 1.4819995337529424,
+        "p95": -6.03294217692728,
+        "max": 6.3282595681632525
+      }
+    },
+    "GPUTime": {
+      "before_ms": {
+        "median": 13.5029,
+        "p95": 15.6723,
+        "max": 25.0187
+      },
+      "after_ms": {
+        "median": 13.5012,
+        "p95": 15.670029999999999,
+        "max": 32.2923
+      },
+      "change_percent": {
+        "median": -0.012589888098113455,
+        "p95": -0.014484153570315517,
+        "max": 29.072653655065995
+      }
+    },
+    "VoxelStream/TickMs": {
+      "before_ms": {
+        "median": 0.1042,
+        "p95": 8.679779999999989,
+        "max": 1774.7174
+      },
+      "after_ms": {
+        "median": 0.1036,
+        "p95": 8.878719999999992,
+        "max": 1888.0692
+      },
+      "change_percent": {
+        "median": -0.5758157389635365,
+        "p95": 2.291993575874085,
+        "max": 6.387033789154262
+      }
+    },
+    "VoxelStream/SubmitMs": {
+      "before_ms": {
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 1700.8572
+      },
+      "after_ms": {
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 1819.9386
+      },
+      "change_percent": {
+        "median": null,
+        "p95": null,
+        "max": 7.0012579539305175
+      }
+    }
+  }
+}

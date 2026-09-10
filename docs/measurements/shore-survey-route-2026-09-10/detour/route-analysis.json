@@ -1,0 +1,18 @@
+{
+  "status": "passed",
+  "pinsVerified": true,
+  "arrivals": 8,
+  "checkpointImages": 8,
+  "trajectorySamples": 116,
+  "legsShorterThanSampleIntervalWithoutCsvRows": [],
+  "actualSpeedMedianMps": 2.199,
+  "groundedSamples": 115,
+  "waitingSamples": 0,
+  "heightRangeM": [
+    63.401,
+    65.901
+  ],
+  "terminalResult": "PASS: All authored waypoints reached; optional foundation evidence recorded, not approved; arrived=8/8; travel_m=136.255; no broad navigability or building-support acceptance",
+  "authoredRouteScope": "Authored shore traversal survey-candidate; runtime-unverified. Sparse 8m samples do not prove pawn clearance, continuous dryness, support, or route connectivity. No foundation approval. Detour revision 2026-09-10 after route-capture-12 stalled 4.4 m short of the last target against a beech trunk; one via point added, targets unchanged.",
+  "scope": "One authored pawn route; no general navigation, sightline, building-support or performance acceptance."
+}

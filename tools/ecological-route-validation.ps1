@@ -3,7 +3,7 @@ param(
     [Parameter(Mandatory=$true)][string]$RouteFile,
     [Parameter(Mandatory=$true)][string]$Output,
     [ValidateRange(60,7200)][int]$TimeoutSeconds=3900,
-    [switch]$ProfileFrames,[switch]$DiagnoseStalls,[switch]$DetailMeshLOD,[switch]$DetailSizeCull,[string]$DetailMeshCache='',
+    [switch]$ProfileFrames,[switch]$DiagnoseStalls,[switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
     [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48
 )
 $ErrorActionPreference='Stop'
@@ -34,6 +34,7 @@ if($ProfileFrames){$runArgs+='-VoxelEcologyRouteProfile'}
 if($DiagnoseStalls){$runArgs+='-VoxelEcologyRouteDiagnoseStalls'}
 if($DetailMeshLOD){$runArgs+='-VoxelDetailMeshLOD'}
 if($DetailSizeCull){$runArgs+='-VoxelDetailSizeCull'}
+if($DetailRetireUnused){$runArgs+='-VoxelDetailRetireUnused'}
 if($cachePath){$runArgs+="-VoxelDetailMeshCache=$cachePath"}
 if($AllowPreviewDetailCache){$runArgs+='-VoxelDetailMeshCachePreview'}
 foreach($arg in $runArgs){if($arg -match '["\r\n]'){throw 'Unsupported quote/newline in command argument'}}

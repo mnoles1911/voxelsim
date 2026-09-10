@@ -1,0 +1,1 @@
+FAIL: Waypoint stalled or exceeded leg timeout; route is not demonstrated connected; arrived=6/7; travel_m=130.754; no broad navigability or building-support acceptance

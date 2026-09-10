@@ -1,8 +1,9 @@
 param([Parameter(Mandatory=$true)][string]$AssetDirectory,[Parameter(Mandatory=$true)][string]$Output,
     [string]$SpawnAt='-156260,-82356',[ValidateRange(60,7200)][int]$TimeoutSeconds=900,
-    [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[string]$DetailMeshCache='',
+    [switch]$DetailMeshLOD,[switch]$DetailSizeCull,[switch]$DetailRetireUnused,[string]$DetailMeshCache='',
     [switch]$PredictiveAssetResolve,[switch]$MarchDispatchIdentity,
-    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48)
+    [switch]$AllowPreviewDetailCache,[ValidateRange(16,512)][double]$DetailRingMeters=48,
+    [string[]]$ExtraArgs=@())
 $ErrorActionPreference='Stop'
 if(Get-Process UnrealEditor,UnrealEditor-Cmd,cl,link,MSBuild,UnrealBuildTool,dotnet -ErrorAction SilentlyContinue){throw 'UE or a build process is already running'}
 $outPath=[IO.Path]::GetFullPath($Output)
@@ -21,10 +22,14 @@ $runArgs=@('D:\voxelsim\ue-project\VoxelEarth.uproject','/Engine/Maps/Entry','-g
     '-VoxelTimeOfDay=10:00','-VoxelDate=2026-05-15','-VoxelTimeScale=0',"-UserDir=$outPath/session","-abslog=$outPath/game.log")
 if($DetailMeshLOD){$runArgs+='-VoxelDetailMeshLOD'}
 if($DetailSizeCull){$runArgs+='-VoxelDetailSizeCull'}
+if($DetailRetireUnused){$runArgs+='-VoxelDetailRetireUnused'}
 if($PredictiveAssetResolve){$runArgs+='-VoxelPredictiveAssetResolve'}
 if($MarchDispatchIdentity){$runArgs+='-VoxelMarchDispatchIdentity'}
 if($cachePath){$runArgs+="-VoxelDetailMeshCache=$cachePath"}
 if($AllowPreviewDetailCache){$runArgs+='-VoxelDetailMeshCachePreview'}
+# Opt-in diagnostics (e.g. -VoxelR0EntryProfile -VoxelRecomputeCensus). Recorded in the manifest's
+# argument list like every other flag, so a receipt binds them; never used for A/B arms.
+foreach($extra in $ExtraArgs){if($extra -notmatch '^-[A-Za-z0-9=.:,_-]+$'){throw 'Unsupported extra argument'};$runArgs+=$extra}
 $record=@{arguments=$runArgs;configurationSha256=(Get-FileHash -LiteralPath $config).Hash;startedUtc=[DateTime]::UtcNow.ToString('o');
     scope='Actual movement controller in ecological forest after streaming settles; scripted straight route, not general navigation acceptance'}
 $record.speciesManifestSha256=(Get-FileHash -LiteralPath $speciesManifest).Hash
