@@ -477,7 +477,7 @@ VXC_TEST(assetgrid_solid_count_matches_dense_across_reparse_copy_and_move) {
         uint64_t expected = 0;
         for (auto& material : dense) {
             state = state * 1664525u + 1013904223u;
-            material = trial % 3 == 0 ? MAT_AIR : MaterialId((state >> 23) % 25);
+            material = trial % 3 == 0 ? MaterialId(MAT_AIR) : MaterialId((state >> 23) % 25);
             if (material != MAT_AIR) ++expected;
         }
         auto blob = encode(-2, 3, -1, nx, ny, nz, dense);

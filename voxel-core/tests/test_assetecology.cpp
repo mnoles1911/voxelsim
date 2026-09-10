@@ -69,7 +69,8 @@ VXC_TEST(ecology_tree_and_detail_outputs_match_full_region_in_parallel){
     CHECK(nextQueryCalls>0);CHECK(unavailable.empty());
     auto facts=[](int64_t x,int64_t y){AssetColumnFacts f;f.known=true;f.anchorSolid=true;
         f.slopeMmPerM=x<0?450:80;f.curv=y<0?85:175;f.heat=150;
-        if(x>300&&y>300)f.standingWaterMm=10000;return f;};
+        if(x>300&&y>300)f.standingWaterMm=10000;
+        return f;};
     const auto whole=field.instancesForRect({-600,-600,599,599},facts);
     const auto copiedWhole=copied.instancesForRect({-600,-600,599,599},facts);
     CHECK_EQ(copiedWhole.size(),whole.size());
