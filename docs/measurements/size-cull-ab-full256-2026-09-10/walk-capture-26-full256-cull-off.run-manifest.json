@@ -1,0 +1,42 @@
+﻿{
+    "startedUtc":  "2026-09-10T13:49:08.8249096Z",
+    "configurationSha256":  "E68B98F5D52952D59CECE8E4403C6D42EADDB9FEE5D3259DABB999A6F1AD0936",
+    "scope":  "Actual movement controller in ecological forest after streaming settles; scripted straight route, not general navigation acceptance",
+    "speciesManifestSha256":  "0197DA097E17A2634C2F15DCA0589E5E98157EB631C2998513769738427DD4F6",
+    "arguments":  [
+                      "D:\\voxelsim\\ue-project\\VoxelEarth.uproject",
+                      "/Engine/Maps/Entry",
+                      "-game",
+                      "-dx12",
+                      "-RenderOffscreen",
+                      "-unattended",
+                      "-nosplash",
+                      "-nop4",
+                      "-ResX=1280",
+                      "-ResY=720",
+                      "-csvGpuStats",
+                      "-csvCompression=0",
+                      "-VoxelAssetDir=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\previews\\full-forest-low-cover-1",
+                      "-VoxelEcologyConfig=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\previews\\full-forest-low-cover-1\\placement.json",
+                      "-VoxelWalkTest=1",
+                      "-VoxelWalkWaitForEcology",
+                      "-VoxelDetailRingMeters=256",
+                      "-VoxelSpawnAt=-154740,-81476",
+                      "-VoxelSpawnAltM=5",
+                      "-VoxelTimeOfDay=10:00",
+                      "-VoxelDate=2026-05-15",
+                      "-VoxelTimeScale=0",
+                      "-UserDir=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\walk-capture-26-full256-cull-off/session",
+                      "-abslog=D:\\voxelsim\\asset-forge\\out\\ecological-placement\\walk-capture-26-full256-cull-off/game.log",
+                      "-VoxelDetailMeshLOD",
+                      "-VoxelMarchDispatchIdentity",
+                      "-VoxelDetailMeshCache=D:\\voxelsim\\ue-project\\Content\\Voxel\\Generated\\DetailPreview\\temperate-authored-lods-full-2\\detail-bake.json",
+                      "-VoxelDetailMeshCachePreview"
+                  ],
+    "detailCacheManifestSha256":  "603C973EC9E8CC57F25EBF3C1C4D52A0CE61DD53F24D44FCD347683189E3B0D0",
+    "runtimeModuleHashes":  {
+                                "UnrealEditor-VoxelEarthUI.dll":  "5DC6C1D3DBC6FE5941DE8E9EC4C02EC74A41B6AF4C9DB3C7E9C7FB129A342B09",
+                                "UnrealEditor-VoxelEarth.dll":  "D198449B933726B974A2E12B82BF45C5ACF33CB9222AEFF2202986DBA1FED678",
+                                "UnrealEditor-VoxelEarthShaders.dll":  "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C"
+                            }
+}

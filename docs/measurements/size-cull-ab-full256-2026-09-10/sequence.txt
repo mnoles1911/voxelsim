@@ -1,0 +1,54 @@
+﻿ARM walk-capture-26-full256-cull-off START 09:49:08 sizeCull=False
+ARM walk-capture-26-full256-cull-off END 09:58:51 wrapperExit=
+  Ecological walking test PID 23736
+  Walking checks completed: D:\voxelsim\asset-forge\out\ecological-placement\walk-capture-26-full256-cull-off; inspect 
+frame costs and route limitations
+  receipt status=passed failure=
+ARM walk-capture-27-full256-cull-on START 09:58:51 sizeCull=True
+ARM walk-capture-27-full256-cull-on END 10:07:04 wrapperExit=
+  Ecological walking test PID 28328
+  Walking checks completed: D:\voxelsim\asset-forge\out\ecological-placement\walk-capture-27-full256-cull-on; inspect 
+frame costs and route limitations
+  receipt status=passed failure=
+COMPARATOR START 10:07:04 offReceipt=True onReceipt=True
+COMPARATOR exit=0
+          "max": -39.302713716848224
+        }
+      },
+      "VoxelStream/TickMs": {
+        "off_ms": {
+          "median": 9.525649999999999,
+          "p95": 268.836675,
+          "max": 475.4692
+        },
+        "on_ms": {
+          "median": 10.7079,
+          "p95": 304.80695000000003,
+          "max": 377.8473
+        },
+        "change_percent": {
+          "median": 12.411226530472996,
+          "p95": 13.379973175162952,
+          "max": -20.531697952254312
+        }
+      },
+      "VoxelStream/GameThread/DetailTickMs": {
+        "off_ms": {
+          "median": 1.9997,
+          "p95": 9.608725,
+          "max": 12.9121
+        },
+        "on_ms": {
+          "median": 2.5259,
+          "p95": 11.00095,
+          "max": 18.873
+        },
+        "change_percent": {
+          "median": 26.313947092063806,
+          "p95": 14.489175202745418,
+          "max": 46.165224866597995
+        }
+      }
+    }
+  }
+}
