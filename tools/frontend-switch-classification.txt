@@ -216,6 +216,8 @@ VoxelGpuWorldGenBatch
 VoxelEditedLaneGate
 VoxelRadialCensus
 VoxelRecomputeCensus
+VoxelDetailRetireUnused
+VoxelR0EntryProfile
 VoxelResidencyAdmitBudget
 VoxelRingOrderScan
 VoxelHierarchicalCoverage
