@@ -9272,6 +9272,82 @@ struct FVoxelWorldImpl
 	int32 IncrFullEditSinceLog = 0;        // edit-forced rescan (bLevelEditRescan): interior Z verdicts moved, full sweep required
 	int32 IncrFullUndergroundSinceLog = 0; // underground now or at the level's last scan
 	int32 IncrFullConfigSinceLog = 0;      // skirt on/off, VolumeNeedsSolidChunks, or level-0 band-skip mode
+
+	// ---- RECOMPUTE SPLIT (voxel.Stream.RecomputeBudgetMs, 2026-09-10) --------
+	//
+	// THE FREEZE THIS EXISTS FOR. Insights on a quiet-box load
+	// (Saved/loading-leg7.utrace) put the last two multi-second frames under
+	// the loading curtain inside ONE RecomputeDesiredSet call each -- 1.7 s and
+	// 5.4 s, all of it in VoxelRecompute_AdmissionAndBeyond. There is no
+	// pathology to fix: eight rings x ~1300 footprints x ~0.45 ms of COLD
+	// worldgen column evaluation is simply 5 s of work, and the only thing
+	// wrong with it is that it lands on one tick. Leg 9 shows the same shape at
+	// a smaller size: `recomputeMs=578.99 ... R5=576.25 footprints R5=1285`.
+	//
+	// WHY DEFERRING WHOLE LEVELS IS NOT ENOUGH, unlike the outer-ring stagger
+	// directly above: one ring alone is 0.5-1.5 s, so level granularity buys a
+	// 5x and still misses an 8 ms budget by two orders of magnitude. The split
+	// therefore parks a CELL CURSOR inside the level's row-major sweep.
+	//
+	// WHAT MAKES THE RESULT IDENTICAL TO THE UNSPLIT CALL, which is the whole
+	// contract:
+	//   * THE ANCHOR IS LATCHED. Every slice decides against the anchor the
+	//     first slice ran at, so every distance verdict, every radius crossing
+	//     and every cutoff is the one the single-tick call would have produced.
+	//     A slice is a continuation, not a new call.
+	//   * THE LEVEL'S SCAN STATE IS TAKEN ONCE. The stateful prologue (the
+	//     stamps, the DeferredFootprints swap, the incremental-diff decision,
+	//     the per-level admission budget, the nearest-admit scratch) runs on
+	//     the slice that STARTS the level; a resuming slice restores the three
+	//     values it cannot re-derive (the diff decision, its box, and A0) from
+	//     here and touches nothing else.
+	//   * THE TAIL RUNS ONCE. PruneFootprintZRangeCache, SortPendingQueues,
+	//     TruncatePendingJobQueue and FlushAbsentMarks run only on the slice
+	//     that finishes the pass, so no half-built queue is ever sorted,
+	//     truncated or published.
+	//   * DISPATCH HOLDS -- ONE RING, NOT THE PIPELINE. Only the ring the cursor
+	//     sits in is withheld from DispatchJobs; a ring is re-keyed and sorted
+	//     the moment its own admission finishes, so the fill runs against the
+	//     near rings while the far ones are still being swept. Holding all eight
+	//     was tried and MEASURED WORSE: leg 10 read `passes=346 splitHeld=346
+	//     cpuLaunched=0 gpuForked=0` for two whole windows and the gate went
+	//     from READY at 14.1 s to 49.8 s, because the cold outer-ring footprint
+	//     costs 4-6 ms (not the 0.45 ms leg 9 measured warm at R5) so an 8 ms
+	//     budget buys one or two cells a tick and a pass runs ~950 slices.
+	//   * AND IT IS NOT REPORTED AS DONE. bHasRecomputed and LastAnchorChunk are
+	//     stamped by TickStreaming only when the pass completes, so a
+	//     half-finished first recompute still reads "never recomputed" and the
+	//     continuation is URGENT (it bypasses -VoxelRecomputeDutyPct: a rate
+	//     bound may delay a whole recompute, never leave one half-built).
+	//
+	// Self-healing against a teleport mid-split: the levels already finished
+	// stamped LastAnchorChunkPerLevel at the LATCHED anchor, so they read `due`
+	// again at the new one and the next call rescans them.
+	struct FRecomputeSplitState
+	{
+		bool bActive = false;                  // a pass is parked mid-sweep
+		FVector Anchor = FVector::ZeroVector;  // LATCHED: the anchor every slice decides against
+		int32 Level = 0;                       // the level to resume inside
+		int32 ResumeCy = 0;                    // cell cursor, inclusive; row-major like the sweep
+		int32 ResumeCx = 0;
+		// The three per-level scan decisions a resuming slice cannot re-derive:
+		// the diff verdict, the anchor box it diffs against, and A0 (the
+		// previous scan's anchor, which the first slice has already
+		// overwritten in LastEntryScanAnchorXY).
+		bool bIncrementalScan = false;
+		FVector2D IncrBoxMin = FVector2D::ZeroVector;
+		FVector2D IncrBoxMax = FVector2D::ZeroVector;
+		FVector2D PrevScanAnchorXY = FVector2D::ZeroVector;
+		int32 ScanSpan = 0;                    // the sweep's extent, latched with the rest of the scan
+		int32 Ticks = 0;                       // slices this pass has taken so far
+	};
+	FRecomputeSplitState RecomputeSplit;
+	// ENGAGEMENT, once per run: an arm that cannot show it fired is not an arm.
+	bool bLoggedRecomputeSplit = false;
+	int64 RecomputeSplitsSinceLog = 0;      // passes that had to split, this window
+	int64 RecomputeSplitTicksSinceLog = 0;  // continuation slices spent, this window
+	int32 RecomputeSplitMaxTicks = 0;       // worst slice count any one pass took, this window
+
 	int32 RecomputeCalls = 0;
 
 	// --- Streaming pipeline re-measure (docs/status.md "Streaming pipeline
@@ -9700,6 +9776,13 @@ struct FVoxelWorldImpl
 	int64 DispatchExitEmptySinceLog = 0;
 	int64 DispatchExitBacklogSinceLog = 0;
 	int64 DispatchExitBudgetSinceLog = 0;   // voxel.Stream.DispatchBudgetMs elapsed (2026-09-09), the FOURTH exit
+	// RECOMPUTE SPLIT (2026-09-10): pick-scan skips caused by the ONE ring whose
+	// admission is parked mid-sweep. Not a loop exit -- the loop still ends one
+	// of its four documented ways, so `passes = exitCap + exitEmpty +
+	// exitBacklog + exitBudget` still holds; this is a separate census of how
+	// often a ring was withheld. splitHeld=0 with split>0 on the admission line
+	// means the parked ring had nothing pending anyway.
+	int64 DispatchSplitHeldSinceLog = 0;
 	int64 DispatchCpuLaunchedSinceLog = 0;
 	int64 DispatchGpuForkedSinceLog = 0;
 	// -VoxelBandSeedCpu traffic: fork-eligible level-0 chunks kept on the CPU
@@ -10383,7 +10466,13 @@ private:
 	// pass, at most once per LOD-transition eviction.
 	uint8 ComputeRetainReplacementZMask(const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir,
 	                                     const FVector& Anchor) const;
-	void SortPendingQueues(const FVector& Anchor);
+	// OnlyLevel != INDEX_NONE re-keys and re-sorts JUST that ring's pending
+	// queue (and leaves the game-thread queue alone). The recompute split uses
+	// it to hand a ring to DispatchJobs the moment that ring's admission is
+	// whole, instead of holding the whole pipeline until every ring is -- see
+	// FRecomputeSplitState. One spelling of the key, deliberately: a second
+	// would be free to drift from the cutoff and the dispatch head comparison.
+	void SortPendingQueues(const FVector& Anchor, int32 OnlyLevel = INDEX_NONE);
 	// Drops the farthest entries of an ALREADY-SORTED (farthest-first) queue
 	// until it fits EntryCap, removing their chunk records too, and writes the
 	// re-admission cutoff distance. Returns true if anything was held back.
@@ -11493,14 +11582,41 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		//
 		// Default 0. This is an experiment, not a feature: it made things
 		// measurably worse and nothing here claims to have fixed that.
+		//
+		// RECOMPUTE SPLIT: a CONTINUATION slice gets its own Insights name.
+		// Under VoxelStream_RecomputeDesiredSet alone, a pass spread over
+		// hundreds of ticks reads as hundreds of recomputes, which is the
+		// opposite of what the trace is being asked -- the question is "did
+		// each slice land under the budget, and how many did the pass take".
+		// The scope is chosen here rather than inside the call because the
+		// macro declares a scope object; one name per branch is the whole
+		// mechanism. Wrapping the SAME call twice, deliberately: the batch arm
+		// (voxel.Stream.BatchRecompute, an experiment that measured worse) must
+		// keep its own shape.
+		const bool bRecomputeIsContinuation = RecomputeSplit.bActive;
 		if (VoxelDebug::GetStreamBatchRecompute() != 0)
 		{
 			UVoxelGpuPoolComponent::FScopedBatch RecomputeBatch(GpuPool.Get());
-			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet); RecomputeDesiredSet(Anchor); }
+			if (bRecomputeIsContinuation)
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_SplitContinuation);
+				RecomputeDesiredSet(Anchor);
+			}
+			else
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet);
+				RecomputeDesiredSet(Anchor);
+			}
+		}
+		else if (bRecomputeIsContinuation)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_SplitContinuation);
+			RecomputeDesiredSet(Anchor);
 		}
 		else
 		{
-			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet); RecomputeDesiredSet(Anchor); }
+			TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet);
+			RecomputeDesiredSet(Anchor);
 		}
 		// -VoxelRecomputeDutyPct: feed the bound what this call actually cost.
 		// ThisFrameRecomputeMs is stamped at the END of RecomputeDesiredSet and
@@ -11508,8 +11624,22 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// it is this call's cost and nothing else's. No-op with the switch off
 		// beyond two stores the gate never reads.
 		NoteRecomputeRan(ThisFrameRecomputeMs);
-		LastAnchorChunk = AnchorChunk;
-		bHasRecomputed = true;
+		// RECOMPUTE SPLIT: A PARTIALLY-COMPLETE RECOMPUTE IS NOT A RECOMPUTE.
+		// These two are the whole-call completion record -- bHasRecomputed
+		// gates the stale-scan and view-rescan triggers, the admission cap and
+		// the M1 tripwire; LastAnchorChunk is the call-level "nothing has
+		// moved" gate. Stamping either from a parked slice would tell every one
+		// of those readers that the set at this anchor is finished when half of
+		// it has not been swept. Leaving them unstamped is also what re-arms
+		// the continuation next tick (bRecomputeWanted above), so the pass
+		// finishes even if the anchor never moves again. NoteRecomputeRan is
+		// deliberately OUTSIDE this gate: the duty bound measures wall time
+		// spent, and a slice spent it.
+		if (!RecomputeSplit.bActive)
+		{
+			LastAnchorChunk = AnchorChunk;
+			bHasRecomputed = true;
+		}
 	}
 
 	// Budgets: jobs in flight <= MaxJobsInFlightCap(), i.e.
@@ -12314,11 +12444,18 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		       // line that dropped it when the split landed would have made
 		       // the worst case UNATTRIBUTABLE exactly where it matters most.
 		       TEXT("Hitch frame recompute: recomputeMs=%.2f fineMs=%.2f exitScanMs=%.2f queueFilterMs=%.2f sortMs=%.2f | ")
-		       TEXT("entryMs %s | footprints %s | tracked=%d"),
+		       // RECOMPUTE SPLIT: split=R<level>/<slice> when this frame's
+		       // recompute was a SLICE of a pass still in progress, and
+		       // sortMs=0.00 with it means the tail has not run yet -- not that
+		       // the sort was free. split=- is an ordinary whole call.
+		       TEXT("entryMs %s | footprints %s | tracked=%d split=%s"),
 		       ThisFrameRecomputeMs, ThisFrameFineResidencyMs, ThisFrameExitScanMs, ThisFrameQueueFilterMs, ThisFrameSortMs,
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.2f"), L, ThisFrameLevelEntryMs[L]); }),
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, ThisFrameLevelFootprints[L]); }),
-		       ChunkRecords.Num());
+		       ChunkRecords.Num(),
+		       RecomputeSplit.bActive
+		           ? *FString::Printf(TEXT("R%d/%d"), RecomputeSplit.Level, RecomputeSplit.Ticks)
+		           : TEXT("-"));
 	}
 
 	// Visualizations (mode 2 only; every helper early-outs on its own cvar
@@ -13572,14 +13709,15 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // reading pair for that gate lives on its accessor; the twin
 	       // backlog= column is on the job-flow line.
 	       TEXT("Voxel dispatch loop (window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
-	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld exitBudget=%lld seedCpu=%lld"),
+	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld exitBudget=%lld splitHeld=%lld seedCpu=%lld"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
 	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue(),
 	       AccumCpuWorkerJobMsSinceLog / 1000.0,
 	       ThisLogWindowSeconds > 0.f ? AccumCpuWorkerJobMsSinceLog / (1000.0 * ThisLogWindowSeconds) : 0.0,
 	       VoxelStreamAdmission::WorkerTaskPriority(), VoxelStreamAdmission::WorkerPoolThreads(),
-	       (long long)DispatchExitBacklogSinceLog, (long long)DispatchExitBudgetSinceLog, (long long)DispatchBandSeedCpuSinceLog);
+	       (long long)DispatchExitBacklogSinceLog, (long long)DispatchExitBudgetSinceLog,
+	       (long long)DispatchSplitHeldSinceLog, (long long)DispatchBandSeedCpuSinceLog);
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
@@ -13615,6 +13753,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	DispatchExitEmptySinceLog = 0;
 	DispatchExitBacklogSinceLog = 0;
 	DispatchExitBudgetSinceLog = 0;
+	DispatchSplitHeldSinceLog = 0;
 	DispatchCpuLaunchedSinceLog = 0;
 	DispatchGpuForkedSinceLog = 0;
 	DispatchBandSeedCpuSinceLog = 0;
@@ -14097,7 +14236,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		                   && (IncrFullEditSinceLog == 0) && (IncrFullUndergroundSinceLog == 0)
 		                   && (IncrFullConfigSinceLog == 0);
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel incremental admission (window): incr %s | full: first=%d edit=%d underground=%d config=%d | stagger=%s deferred=%lld maxStreak=%d%s"),
+		       TEXT("Voxel incremental admission (window): incr %s | full: first=%d edit=%d underground=%d config=%d | stagger=%s deferred=%lld maxStreak=%d | split=%lld splitTicks=%lld splitMaxTicks=%d budget=%.1f%s"),
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelIncrScansSinceLog[L]); }),
 		       IncrFullFirstSinceLog, IncrFullEditSinceLog, IncrFullUndergroundSinceLog,
 		       IncrFullConfigSinceLog,
@@ -14107,6 +14246,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		                              VoxelStreamAdmission::kAmortizeMinLevel)
 		           : TEXT("off"),
 		       (long long)OuterScanDeferredSinceLog, MaxDeferStreakSinceLog,
+		       // RECOMPUTE SPLIT: passes that had to split, slices they cost,
+		       // and the worst one -- beside the stagger because they are the
+		       // same kind of claim (work moved to a later tick, nothing
+		       // dropped) at two different granularities. budget= prints the
+		       // cvar so `split=0 budget=0.0` (never armed) reads differently
+		       // from `split=0 budget=8.0` (armed, nothing was big enough).
+		       (long long)RecomputeSplitsSinceLog, (long long)RecomputeSplitTicksSinceLog,
+		       RecomputeSplitMaxTicks, VoxelDebug::GetStreamRecomputeBudgetMs(),
 		       bAllZero
 		           ? TEXT(" -- ALL ZERO, WHICH IS THE EXPECTED READING FOR A PARKED OR LINGER WINDOW "
 		                  "(no motion, nothing to admit). NOT evidence the switch is inert: read a "
@@ -17028,6 +17175,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// this bound exists to rule out.
 	OuterScanDeferredSinceLog = 0;
 	MaxDeferStreakSinceLog = 0;
+	// Window sums for the recompute split. RecomputeSplit.Ticks is deliberately
+	// NOT reset here for the same reason LevelDeferStreak is not: it is the
+	// LIVE slice count of a pass that may still be running across this window
+	// edge, and clearing it would both lose the count and make the next park
+	// look like a new pass on the split= counter.
+	RecomputeSplitsSinceLog = 0;
+	RecomputeSplitTicksSinceLog = 0;
+	RecomputeSplitMaxTicks = 0;
 
 	// Track B2 missing-tile telemetry: only meaningful once a real tile grid
 	// is in use (bUsingTileGrid) -- the synthetic sampler has no concept of a
@@ -19987,7 +20142,7 @@ bool FVoxelWorldImpl::ChunkOwnsEditedBrick(const VoxelCoords::FVoxelChunkKey& Ch
 	return false;
 }
 
-void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
+void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor, int32 OnlyLevel)
 {
 	// The refreshed key is PrioritySortKeySq -- 3D distance, the hierarchical-
 	// coverage clamp, and the bounded view-direction penalty in one number
@@ -20076,13 +20231,26 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	// keeps the fine ring's leading edge in front, both in this sort and in
 	// DispatchJobs' cross-level head comparison, which reads the same stored
 	// number.
-	for (TArray<FSortEntry>& Queue : PendingJobKeysByLevel)
+	for (int32 QueueLevel = 0; QueueLevel < VoxelCoords::kNumLevels; ++QueueLevel)
 	{
+		if (OnlyLevel != INDEX_NONE && QueueLevel != OnlyLevel)
+		{
+			continue;
+		}
+		TArray<FSortEntry>& Queue = PendingJobKeysByLevel[QueueLevel];
 		for (FSortEntry& Entry : Queue)
 		{
 			Entry.DistSq = PriorityKeySq(Entry.Key);
 		}
 		SortEntries(Queue);
+	}
+	if (OnlyLevel != INDEX_NONE)
+	{
+		// A single-ring sort, from the recompute split's per-level release. The
+		// game-thread queue below is not per-ring and is edit-driven, so it has
+		// no half-built state to be rescued from; the pass's own full sort at
+		// the end covers it.
+		return;
 	}
 	// The game-thread queue is still a bare-key array (it is edit-driven, always
 	// near the player, and never deep enough for the storage to matter), so it
@@ -21107,8 +21275,19 @@ void FVoxelWorldImpl::EnumerateSurfaceFootprintCandidates(int32 Level, int32 Cx,
 	}
 }
 
-void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
+void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& InAnchor)
 {
+	// RECOMPUTE SPLIT (voxel.Stream.RecomputeBudgetMs, see FRecomputeSplitState):
+	// THE ANCHOR IS LATCHED FOR THE WHOLE PASS. A slice is a continuation of the
+	// call that started the pass, not a new call, so it must decide against the
+	// anchor that call ran at -- otherwise half the desired set would be
+	// evaluated at one position and half at another, which is precisely the
+	// admit/evict-against-different-anchors churn this file already paid for
+	// once (the 11,779-unloads/s band). With the budget off, RecomputeSplit is
+	// never active and this is InAnchor, byte for byte.
+	const FVector Anchor = RecomputeSplit.bActive ? RecomputeSplit.Anchor : InAnchor;
+	const bool bRecomputeResuming = RecomputeSplit.bActive;
+
 	// See VoxelBrickCpuArm::VolumeNeedsSolidChunks. Both admission-time skips
 	// below may only drop a provably ALL-SOLID chunk while nothing reads what is
 	// inside it; dropping one while the brick volume is being fed is terrain you
@@ -21120,14 +21299,29 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// collected, a handful of FPlatformTime::Seconds() calls on a path that
 	// only runs on an anchor chunk crossing, never per-frame.
 	const double RecomputeT0 = FPlatformTime::Seconds();
+	// EvictedThisCall is produced by the exit scan and consumed by the queue
+	// filter WITHIN one slice, so it resets per slice even across a split.
 	EvictedThisCall.Reset();
-	LevelsScannedThisCall = 0;
-	CandidatesRejectedThisCall = 0;
-	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	// RECOMPUTE SPLIT: the four below are per-CALL, and a split pass is ONE
+	// call. TruncatePendingJobQueue's deferral clear -- the site the one-way
+	// latch bug lives at -- tests bLevelScannedThisCall and
+	// LevelCandidatesRejectedThisCall, and it runs on the slice that COMPLETES
+	// the pass. Reset per slice, that clear would see only the last slice's
+	// levels: every ring finished earlier would read "not scanned this call",
+	// keep bAdmissionDeferredWork armed with nothing outstanding, and free-run
+	// its refill trigger the moment its queue drained -- the exact B1 shape
+	// (428 full-annulus rescans in 14 s for ~1.7 admitted chunks). So they
+	// accumulate over the pass and are cleared only when one starts.
+	if (!bRecomputeResuming)
 	{
-		bLevelScannedThisCall[Level] = false;
-		LevelCandidatesRejectedThisCall[Level] = 0;
-		bLevelScanClampedThisCall[Level] = false; // -VoxelCutoffClamp: per-call, set only by a scan that actually clamped
+		LevelsScannedThisCall = 0;
+		CandidatesRejectedThisCall = 0;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			bLevelScannedThisCall[Level] = false;
+			LevelCandidatesRejectedThisCall[Level] = 0;
+			bLevelScanClampedThisCall[Level] = false; // -VoxelCutoffClamp: per-call, set only by a scan that actually clamped
+		}
 	}
 
 	// Incremental admission: fold this call's anchor into every level's
@@ -21868,6 +22062,42 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	int32 OuterScansUsed = 0;
 
 	const int32 MaxRingLevel = UVoxelWorldSubsystem::GetMaxRingLevel();
+
+	// ---- RECOMPUTE SPLIT: this slice's deadline and its resume cursor -------
+	//
+	// See FRecomputeSplitState for the whole argument. Three things decided
+	// here, all of them inert at the default budget of 0:
+	//
+	//  * THE DEADLINE is measured from RecomputeT0, the top of the CALL, not
+	//    from here -- the number the owner feels is the tick, and the
+	//    prologue (fine residency, exit scan, queue filter) is inside it.
+	//    Those three are cheap enough to re-run per slice (leg 9 measured
+	//    exitScanMs 0.01-0.04, queueFilterMs 0.00-0.01) and re-running them
+	//    against the LATCHED anchor is idempotent, which is why a slice
+	//    re-enters this function from the top instead of jumping into the
+	//    middle of it.
+	//  * THE ARM IS CPU-ONLY. -VoxelGpuResidency mode >= 2 replaces these
+	//    sweeps with a delta consume whose cost is O(delta); there is nothing
+	//    here to split, and splitting a consume would strand a delta
+	//    half-adjudicated. Refused rather than silently ignored.
+	//  * A SLICE ALWAYS MAKES PROGRESS. The deadline is tested only after a
+	//    cell has been swept, so a budget smaller than one footprint degrades
+	//    to one footprint per tick -- slow, never stuck.
+	const double RecomputeBudgetMs = (FVoxelResidencyGpu::Get().GetMode() > 0)
+		? 0.0
+		: double(VoxelDebug::GetStreamRecomputeBudgetMs());
+	const double RecomputeDeadline =
+		RecomputeBudgetMs > 0.0 ? RecomputeT0 + RecomputeBudgetMs / 1000.0 : 0.0;
+	// The level this call must resume INSIDE (-1 = none). Cleared as soon as
+	// that level is reached, so a level after it starts fresh.
+	int32 SplitResumeLevel = bRecomputeResuming ? RecomputeSplit.Level : -1;
+	// Set by the cell loop when it stops on the deadline; read by the tail to
+	// decide whether this call finished the pass.
+	bool bSplitStoppedThisCall = false;
+	// Footprints swept by THIS slice, across all its levels. The deadline is
+	// not allowed to stop a slice that has done nothing.
+	int64 CellsSweptThisSlice = 0;
+
 	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_AdmissionAndBeyond);
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
@@ -21876,6 +22106,22 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			// Cascade ends below this level this run (-VoxelMaxRingLevel). Entry
 			// only -- see GetMaxRingLevel: the exit scan above still runs for
 			// every level so nothing already resident can be stranded.
+			continue;
+		}
+		// RECOMPUTE SPLIT: is THIS the level the parked cursor sits in?
+		//
+		// Everything BELOW the cursor is finished for this pass and is skipped
+		// outright, not merely left to the "already scanned at this anchor"
+		// gate -- a refill trigger firing between two slices can clear that
+		// level's gate, and re-entering its prologue would call
+		// NearestAdmitScratch.Reset() on the scratch the PARKED level is
+		// mid-way through filling, silently throwing away every candidate the
+		// earlier slices collected. The refill is not lost: the level's
+		// bHasRecomputedLevel stays false, so it scans on the first call after
+		// the pass completes.
+		const bool bResumeThisLevel = (Level == SplitResumeLevel);
+		if (SplitResumeLevel >= 0 && Level < SplitResumeLevel)
+		{
 			continue;
 		}
 		// T4-2 LIVE: on a walk-skipping call the GPU owns this level's sweep.
@@ -21908,7 +22154,13 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// box, and only while underground. Above ground this is byte-for-byte
 		// the M1/M2 gate, so the perf-gate flight's scan cadence is unchanged.
 		const bool bZMatters = bAnchorUnderground && VoxelUnderground::BoxRadiusChunks(Level, 0.0, ScratchBoxRadius);
-		if (bHasRecomputedLevel[Level] && AnchorChunk.X == LastAnchorChunkPerLevel[Level].X &&
+		// RECOMPUTE SPLIT: the resuming level stamped these on its FIRST slice
+		// (the stamp is a record of "this level is being scanned at this
+		// anchor", and it is -- the scan is simply not finished yet), so the
+		// gate would now send the continuation away. !bResumeThisLevel is the
+		// whole exception; every other level reads it unchanged.
+		if (!bResumeThisLevel &&
+		    bHasRecomputedLevel[Level] && AnchorChunk.X == LastAnchorChunkPerLevel[Level].X &&
 		    AnchorChunk.Y == LastAnchorChunkPerLevel[Level].Y &&
 		    (!bZMatters || AnchorChunk.Z == LastAnchorChunkPerLevel[Level].Z))
 		{
@@ -21919,7 +22171,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// LastAnchorChunkPerLevel, so the gate above still reads `due` and the
 		// work is moved rather than lost. See AmortizeOuterScans() for why this
 		// is safe where deferring admission generally is not.
-		if (OuterScanBudget > 0 && Level >= VoxelStreamAdmission::kAmortizeMinLevel)
+		// RECOMPUTE SPLIT: a level already part-swept is not a level asking to
+		// start; deferring it here would park a cursor nobody advances.
+		if (!bResumeThisLevel && OuterScanBudget > 0 && Level >= VoxelStreamAdmission::kAmortizeMinLevel)
 		{
 			if (OuterScansUsed >= OuterScanBudget)
 			{
@@ -21947,45 +22201,77 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// is wrong in the interior. (-VoxelMaxRingLevel is command-line-latched
 		// and cannot change mid-run, so it needs no fallback of its own.)
 		const bool bWasForcedScan = !bHasRecomputedLevel[Level];
-		const FVector2D PrevScanAnchorXY = LastEntryScanAnchorXY[Level];
+		// RECOMPUTE SPLIT: A0 IS CARRIED, NOT RE-READ. The slice that started
+		// this level has already overwritten LastEntryScanAnchorXY with the
+		// latched anchor, so a resuming slice reading it here would diff this
+		// scan against ITSELF -- every crossing test false, every remaining
+		// cell skipped, and a ring that is silently half-admitted with no
+		// counter moving. See FRecomputeSplitState.
+		const FVector2D PrevScanAnchorXY =
+			bResumeThisLevel ? RecomputeSplit.PrevScanAnchorXY : LastEntryScanAnchorXY[Level];
 		// The cause flags behind a forced scan (see bLevelRefillRescan's doc
 		// comment), consumed here so a stale cause can never leak into a
 		// later scan. Read before the stamps for the same reason A0 is.
 		const bool bRefillRescan = bLevelRefillRescan[Level];
 		const bool bEditRescan = bLevelEditRescan[Level];
-		bLevelRefillRescan[Level] = false;
-		bLevelEditRescan[Level] = false;
-		LastAnchorChunkPerLevel[Level] = AnchorChunk;
-		// Stale-scan refill (see LastEntryScanAnchorXY): the UNQUANTIZED anchor
-		// this scan is about to make its distance decisions against. Written here,
-		// past the gate, so it records only scans that actually ran -- which is
-		// what makes TickStreaming's "anchor moved since this level was scanned"
-		// trigger self-quiescing: the rescan it provokes sets this to the current
-		// anchor, so a pinned anchor fires the trigger at most once per level.
-		LastEntryScanAnchorXY[Level] = FVector2D(Anchor.X, Anchor.Y);
-		// Rotation analogue of the line above (the view-rescan trigger in
-		// TickStreaming compares against this; writing it only on scans that
-		// ran is what makes that trigger self-quenching). Written whether or
-		// not the bias is on -- it is a record of fact, and the trigger is
-		// gated on the switch, not this.
-		LastEntryScanViewDir[Level] = StreamViewDirXY;
-		bHasRecomputedLevel[Level] = true;
-		++LevelEntryScans[Level];
-		// -VoxelRecomputeCensus: arm THIS level's counters, here and nowhere
-		// else. Past every scan gate, so a level that early-continued above never
-		// arms and contributes nothing -- the same "did no work" reading its
-		// entry ms already gives. Closed at the entry-timer close below, and no
-		// `continue` exists between the two, so a level's counters and its ms
-		// always come from the same bracket.
-		if (VoxelRecomputeCensusEnabled())
+		// RECOMPUTE SPLIT: THE STAMPS AND THE PER-LEVEL SCAN STATE ARE TAKEN
+		// ONCE, by the slice that starts the level. A resuming slice is the
+		// same scan continuing, and re-running this block would double-count
+		// LevelEntryScans, re-consume the cause flags, restart the incremental
+		// baseline -- and, the one that loses work silently, reset
+		// AdmissionsThisLevel and NearestAdmitScratch, which hold the budget
+		// the earlier slices already spent and the candidates they collected
+		// but have not committed.
+		if (!bResumeThisLevel)
 		{
-			LevelCensusScratch = VoxelRecomputeProfile::FEntryCounters();
+			bLevelRefillRescan[Level] = false;
+			bLevelEditRescan[Level] = false;
+			LastAnchorChunkPerLevel[Level] = AnchorChunk;
+			// Stale-scan refill (see LastEntryScanAnchorXY): the UNQUANTIZED anchor
+			// this scan is about to make its distance decisions against. Written here,
+			// past the gate, so it records only scans that actually ran -- which is
+			// what makes TickStreaming's "anchor moved since this level was scanned"
+			// trigger self-quiescing: the rescan it provokes sets this to the current
+			// anchor, so a pinned anchor fires the trigger at most once per level.
+			LastEntryScanAnchorXY[Level] = FVector2D(Anchor.X, Anchor.Y);
+			// Rotation analogue of the line above (the view-rescan trigger in
+			// TickStreaming compares against this; writing it only on scans that
+			// ran is what makes that trigger self-quenching). Written whether or
+			// not the bias is on -- it is a record of fact, and the trigger is
+			// gated on the switch, not this.
+			LastEntryScanViewDir[Level] = StreamViewDirXY;
+			bHasRecomputedLevel[Level] = true;
+			++LevelEntryScans[Level];
+			// -VoxelRecomputeCensus: arm THIS level's counters, here and nowhere
+			// else. Past every scan gate, so a level that early-continued above never
+			// arms and contributes nothing -- the same "did no work" reading its
+			// entry ms already gives. Closed at the entry-timer close below, and no
+			// `continue` exists between the two, so a level's counters and its ms
+			// always come from the same bracket.
+			if (VoxelRecomputeCensusEnabled())
+			{
+				LevelCensusScratch = VoxelRecomputeProfile::FEntryCounters();
+				ActiveCensus = &LevelCensusScratch;
+			}
+			AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
+			NearestAdmitScratch.Reset(); // -VoxelNearestAdmit: this level's eligible candidates, committed after the sweep
+		}
+		else if (VoxelRecomputeCensusEnabled())
+		{
+			// Re-arm WITHOUT resetting. The census folds a level's counters
+			// against the ms that covered them; across a split both accumulate
+			// over the same set of slices, so they stay one bracket.
 			ActiveCensus = &LevelCensusScratch;
 		}
-		++LevelsScannedThisCall;
+		// Per-CALL, and a split pass is one call: the flag is idempotent across
+		// this level's slices (the deferral clear at the bottom reads exactly
+		// it), while the COUNT is taken once, by the slice that starts the
+		// level, or a parked ring would be counted once per tick it waited.
+		if (!bResumeThisLevel)
+		{
+			++LevelsScannedThisCall;
+		}
 		bLevelScannedThisCall[Level] = true;
-		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
-		NearestAdmitScratch.Reset(); // -VoxelNearestAdmit: this level's eligible candidates, committed after the sweep
 
 		// Incremental admission (-VoxelIncrementalAdmission): decide whether
 		// THIS scan may diff against the previous one instead of re-walking
@@ -22024,7 +22310,22 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const bool bSkirtOn = !VoxelUnderground::UndergroundDisabled();
 		bool bIncrementalScan = false;
 		FVector2D IncrBoxMin(0.0, 0.0), IncrBoxMax(0.0, 0.0);
-		if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
+		if (bResumeThisLevel)
+		{
+			// RECOMPUTE SPLIT: the diff verdict, the anchor box it diffs
+			// against and the backlog take are properties of the SCAN, not of
+			// the slice. They were decided (and consumed -- the box was reset,
+			// DeferredFootprints[Level] was swapped into
+			// DeferredFootprintsScratch) by the slice that started this level,
+			// so they are restored here rather than re-derived. Re-deriving
+			// would answer "config" instead of "incremental" and would swap the
+			// scratch a second time, dropping every backlog entry the sweep has
+			// not reached yet.
+			bIncrementalScan = RecomputeSplit.bIncrementalScan;
+			IncrBoxMin = RecomputeSplit.IncrBoxMin;
+			IncrBoxMax = RecomputeSplit.IncrBoxMax;
+		}
+		else if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
 		{
 			// Take this level's backlog for the cell loop and start the next
 			// window's collection empty -- on BOTH arms of the decision: a
@@ -22291,7 +22592,20 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// -- the GPU mirror predicts full-disc decisions and a clamped CPU
 		// walk will read as spurious mismatches in its comparator.
 		int32 ScanSpan = ChunkSpan;
-		if (VoxelStreamAdmission::CutoffClampEnabled() &&
+		if (bResumeThisLevel)
+		{
+			// RECOMPUTE SPLIT: the sweep's EXTENT is latched with the rest of
+			// the scan. The clamp below derives it from
+			// LevelAdmissionCutoffDistSq, and the cutoff RELAXATION at the top
+			// of this function writes that -- so a span that grew between two
+			// slices would leave the outer annulus of every row already walked
+			// permanently unvisited, with no counter moving. (The relaxation
+			// cannot fire during a split today, because it needs the queue to
+			// have drained and dispatch is held; latching means it never has
+			// to stay that way to be correct.)
+			ScanSpan = RecomputeSplit.ScanSpan;
+		}
+		else if (VoxelStreamAdmission::CutoffClampEnabled() &&
 		    LevelAdmissionCutoffDistSq[Level] < DBL_MAX)
 		{
 			const double CutoffRadiusUU = FMath::Sqrt(LevelAdmissionCutoffDistSq[Level]);
@@ -22302,6 +22616,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				ScanSpan = ClampSpan;
 				bLevelScanClampedThisCall[Level] = true;
 				bAdmissionDeferredWork[Level] = true;
+				// (RECOMPUTE SPLIT: unreachable on a resuming slice -- that arm
+				// takes the latched span above -- so these window counters are
+				// still charged exactly once per scan.)
 				++LevelClampedScansSinceLog[Level];
 				const int64 FullCells = FMath::Square(int64(2 * ChunkSpan + 1));
 				const int64 WalkedCells = FMath::Square(int64(2 * ScanSpan + 1));
@@ -22364,11 +22681,45 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// cell loop nothing.
 		const bool bIncrHasBacklog = bIncrementalScan && DeferredFootprintsScratch.Num() > 0;
 
+		// RECOMPUTE SPLIT: the cursor, in CHUNK COORDINATES rather than as an
+		// index into the disc -- an index means nothing without the span that
+		// produced it, and it would go wrong SILENTLY if the two ever parted.
+		// (The span is latched with the scan for the same reason; see the
+		// bResumeThisLevel arm at ScanSpan.) The resumed row starts at
+		// ResumeCx; every row after it starts at the left edge, which is
+		// exactly where an uninterrupted sweep would be.
+		const int32 SweepStartCy = bResumeThisLevel ? RecomputeSplit.ResumeCy : AnchorChunk.Y - ScanSpan;
+		const int32 SweepFirstRowCx = bResumeThisLevel ? RecomputeSplit.ResumeCx : AnchorChunk.X - ScanSpan;
+		bool bLevelSweptToEnd = true;
 		// ScanSpan == ChunkSpan except under an active -VoxelCutoffClamp (above).
-		for (int32 Cy = AnchorChunk.Y - ScanSpan; Cy <= AnchorChunk.Y + ScanSpan; ++Cy)
+		for (int32 Cy = SweepStartCy; Cy <= AnchorChunk.Y + ScanSpan; ++Cy)
 		{
-			for (int32 Cx = AnchorChunk.X - ScanSpan; Cx <= AnchorChunk.X + ScanSpan; ++Cx)
+			for (int32 Cx = (Cy == SweepStartCy ? SweepFirstRowCx : AnchorChunk.X - ScanSpan);
+			     Cx <= AnchorChunk.X + ScanSpan; ++Cx)
 			{
+				// RECOMPUTE SPLIT: the deadline. Tested per CELL, not per row,
+				// and the measurement says why twice over: a row is ~36
+				// footprints, and one COLD footprint costs 0.45 ms warm at R5
+				// (leg 9: 576.25 ms over 1285) but 4-6 ms cold at R6/R7 (leg
+				// 10: `entryMs R7=11.61 footprints R7=2`). A per-row test would
+				// miss an 8 ms budget by one to two orders of magnitude.
+				//
+				// AND THAT SETS THE FLOOR OF THIS ARM, which nothing here can
+				// lower: the test is BEFORE a cell and never inside one, and it
+				// only fires once a cell has already been swept THIS SLICE, so
+				// a slice always advances -- and a slice can be as long as one
+				// outer-ring footprint whatever the budget says. 8 ms buys ~18
+				// cells in the near rings and ONE in the far ones. Inert (one
+				// compare against 0.0) at the default budget.
+				if (RecomputeDeadline > 0.0 && CellsSweptThisSlice > 0 &&
+				    FPlatformTime::Seconds() > RecomputeDeadline)
+				{
+					RecomputeSplit.ResumeCy = Cy;
+					RecomputeSplit.ResumeCx = Cx;
+					bLevelSweptToEnd = false;
+					break;
+				}
+				++CellsSweptThisSlice;
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
@@ -22585,6 +22936,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 				}
 			}
+			// RECOMPUTE SPLIT: the inner break only left the row.
+			if (!bLevelSweptToEnd)
+			{
+				break;
+			}
 		}
 
 		// -VoxelNearestAdmit COMMIT PASS: spend this level's budget on the
@@ -22614,7 +22970,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// (Extracted 2026-08-23, T4-2 LIVE wiring, into
 		// CommitNearestAdmitScratch -- the live consumer spends its per-level
 		// budget through this same pass. The rationale comment above stays.)
-		CommitNearestAdmitScratch(Level, Anchor);
+		// RECOMPUTE SPLIT: the commit spends the level's budget on the NEAREST
+		// of the candidates the sweep collected, so it may only run once the
+		// sweep has collected all of them. Committing a half-swept level would
+		// spend the budget on the nearest of the first few ROWS -- the exact
+		// "far before near" outcome this pass exists to prevent -- and would
+		// then leave nothing for the cells the later slices reach.
+		if (bLevelSweptToEnd)
+		{
+			CommitNearestAdmitScratch(Level, Anchor);
+		}
 
 		// Levels that early-`continue`d above (anchor still inside the same
 		// level-L chunk) leave their entry at 0 -- exactly the "did no work"
@@ -22632,9 +22997,75 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// cover it would be an observation of a scan that never happened.
 		if (ActiveCensus)
 		{
-			RecomputeProfile.AddEntry(Level, LevelCensusScratch);
+			// RECOMPUTE SPLIT: folded once, by the slice that finishes the
+			// level -- the scratch accumulates across the slices, so folding
+			// per slice would count the early rows once per slice.
+			if (bLevelSweptToEnd)
+			{
+				RecomputeProfile.AddEntry(Level, LevelCensusScratch);
+			}
 			ActiveCensus = nullptr;
 		}
+
+		// ---- RECOMPUTE SPLIT: park, or move the cursor on ------------------
+		if (!bLevelSweptToEnd)
+		{
+			// PARKED. The cursor is already stored (the cell loop wrote it);
+			// everything else this level's continuation cannot re-derive goes
+			// with it. The level is NOT committed and the tail below will not
+			// sort, truncate or flush, so nothing downstream ever sees the
+			// half-built set.
+			RecomputeSplit.bActive = true;
+			RecomputeSplit.Anchor = Anchor;
+			RecomputeSplit.Level = Level;
+			RecomputeSplit.bIncrementalScan = bIncrementalScan;
+			RecomputeSplit.IncrBoxMin = IncrBoxMin;
+			RecomputeSplit.IncrBoxMax = IncrBoxMax;
+			RecomputeSplit.PrevScanAnchorXY = PrevScanAnchorXY;
+			RecomputeSplit.ScanSpan = ScanSpan;
+			++RecomputeSplit.Ticks;
+			bSplitStoppedThisCall = true;
+			// Levels after this one are deliberately left unstamped, so they
+			// still read `due` on the next slice -- the outer-ring stagger's
+			// rule, for the same reason: the claim is not dropped, it is not
+			// stamped.
+			break;
+		}
+		// ---- RECOMPUTE SPLIT: RELEASE THIS RING TO DISPATCH -----------------
+		//
+		// MEASURED, AND IT IS THE WHOLE DIFFERENCE BETWEEN A WIN AND A
+		// REGRESSION (Saved/loading-leg10-recompute-split.log). The first
+		// version of this arm held ALL dispatch until the pass completed. The
+		// pass took 948 slices, because the cold per-footprint cost in the
+		// outer rings is not the ~0.45 ms leg 9 measured warm at R5 -- it is
+		// 4-6 ms (leg 10: `entryMs R7=11.61 footprints R7=2`), so an 8 ms
+		// budget buys ONE or TWO footprints a tick and R6/R7 alone are ~650
+		// slices each. With the whole pipeline held behind that, the dispatch
+		// window line read `passes=346 splitHeld=346 cpuLaunched=0 gpuForked=0`
+		// twice over: ~40 s of wall clock with nothing dispatched at all, and
+		// the gate went from READY at 14.1 s to 49.8 s.
+		//
+		// The hold only ever needed to cover the ring being swept. Rings BELOW
+		// the cursor are whole -- swept, committed, and now re-keyed and sorted
+		// here, so their queues are in exactly the order the pass-end sort would
+		// leave them. Rings ABOVE it have not been touched by this pass at all
+		// and still hold the previous pass's sorted entries. So the fill runs
+		// against the near rings while the far ones are still being admitted,
+		// which is also the order the player sees terrain arrive in.
+		//
+		// Only when the budget is armed: with it off there is one sort per
+		// pass, exactly as before, and this line never runs.
+		// Charged to sortMs, which is what keeps that metric accounting for
+		// 100% of the queue-maintenance cost across a split (the tail below
+		// ADDS its own pass-end sort to the same accumulator).
+		if (RecomputeDeadline > 0.0 || bRecomputeResuming)
+		{
+			const double LevelSortT0 = FPlatformTime::Seconds();
+			SortPendingQueues(Anchor, Level);
+			ThisFrameSortMs += float((FPlatformTime::Seconds() - LevelSortT0) * 1000.0);
+		}
+		// This level is whole. Anything after it in THIS slice starts fresh.
+		SplitResumeLevel = -1;
 	}
 
 	// --- T4-2 LIVE: consume the entry-side delta (replaces the cell sweeps) --
@@ -22836,19 +23267,37 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		LiveOutcome.AdmitMs += float((FPlatformTime::Seconds() - LiveAdmitT0) * 1000.0);
 	}
 
-	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_PruneZRange); PruneFootprintZRangeCache(Anchor); }
+	// ---- RECOMPUTE SPLIT: the tail runs ONCE, on the completing slice -------
+	//
+	// Every stage below is a statement about a FINISHED desired set. Sorting a
+	// half-built queue would leave it re-sorted a slice later against a
+	// different population; truncating one would drop entries the sweep has not
+	// admitted yet and stamp a cutoff derived from them; flushing the absent
+	// marks would publish annotations the truncation is about to retract. So a
+	// parked slice does none of it. (Note what a parked slice DOES do: the
+	// per-ring release sort in the level loop, whose cost it charges to
+	// ThisFrameSortMs -- so sortMs on a split tick is that release, not this
+	// pass-end sort. The `split=` field on the hitch recompute line says which.)
+	if (!bSplitStoppedThisCall)
+	{
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_PruneZRange); PruneFootprintZRangeCache(Anchor); }
 
-	const double SortT0 = FPlatformTime::Seconds();
-	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_Sort); SortPendingQueues(Anchor); }
-	// Bounded admission gate (b) -- must run immediately after the sort, which
-	// is what puts the farthest (lowest-priority) entries at the front and
-	// leaves each level queue's cached distances aligned with the anchor. Timed inside
-	// sortMs: it is part of the same "get the queue into shape" stage, and
-	// keeping it there means the existing sortMs metric still accounts for
-	// 100% of the queue-maintenance cost.
-	TruncatePendingJobQueue();
+		const double SortT0 = FPlatformTime::Seconds();
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_Sort); SortPendingQueues(Anchor); }
+		// Bounded admission gate (b) -- must run immediately after the sort, which
+		// is what puts the farthest (lowest-priority) entries at the front and
+		// leaves each level queue's cached distances aligned with the anchor. Timed inside
+		// sortMs: it is part of the same "get the queue into shape" stage, and
+		// keeping it there means the existing sortMs metric still accounts for
+		// 100% of the queue-maintenance cost.
+		TruncatePendingJobQueue();
+		// ADDS, not assigns: a split slice may already have charged this tick's
+		// per-ring release sorts to the same accumulator (see the release site
+		// in the level loop). ThisFrameSortMs is zeroed once per tick, so on
+		// every unsplit call this is the same number the assignment produced.
+		ThisFrameSortMs += float((FPlatformTime::Seconds() - SortT0) * 1000.0);
+	}
 	const double SortT1 = FPlatformTime::Seconds();
-	ThisFrameSortMs = float((SortT1 - SortT0) * 1000.0);
 	ThisFrameRecomputeMs = float((SortT1 - RecomputeT0) * 1000.0);
 	MaxRecomputeMs = FMath::Max(MaxRecomputeMs, ThisFrameRecomputeMs);
 	MaxFineResidencyMs = FMath::Max(MaxFineResidencyMs, ThisFrameFineResidencyMs);
@@ -22866,8 +23315,13 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// pending/cleared annotations, AFTER the truncation above has retracted
 	// the ones it cancelled -- staging before it would upload marks this same
 	// call takes back. No-op when nothing was marked (the overwhelmingly
-	// common case, and every case while disarmed).
-	GetGlobalVoxelMarchChunkIndex().FlushAbsentMarks();
+	// common case, and every case while disarmed). RECOMPUTE SPLIT: batched
+	// across the whole pass for the same reason -- the truncation that
+	// retracts cancelled marks runs on the completing slice.
+	if (!bSplitStoppedThisCall)
+	{
+		GetGlobalVoxelMarchChunkIndex().FlushAbsentMarks();
+	}
 	// T4-2 LIVE: report this call's adjudication lanes to the [gpu-resid]
 	// live line -- including the calls that consumed nothing (NoDeltaCalls)
 	// and the ones that fell back to the CPU walks (CpuFallbackCalls), so a
@@ -22877,10 +23331,47 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	{
 		FVoxelResidencyGpu::Get().NoteLiveOutcome(LiveOutcome);
 	}
-	// T4-2 shadow: close this recompute's decision ledger (and drain any
-	// arrived deltas through the comparator). No-op in mode 0.
-	FVoxelResidencyGpu::Get().OnRecomputeEnd();
-	++RecomputeCalls;
+	// ---- RECOMPUTE SPLIT: close the pass, or leave it parked ---------------
+	if (bSplitStoppedThisCall)
+	{
+		// ENGAGEMENT, once per run and only from a pass that actually split.
+		// Printed on the FIRST park, not on arming: an armed budget that never
+		// stops a sweep is a different reading from a budget that is doing
+		// work, and the whole point of this line is to tell them apart.
+		if (!bLoggedRecomputeSplit)
+		{
+			bLoggedRecomputeSplit = true;
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("Voxel recompute: split across N ticks under voxel.Stream.RecomputeBudgetMs=%.1f ")
+			       TEXT("(parked in R%d at cell %d,%d after %.1f ms; the desired set is unchanged -- the anchor is ")
+			       TEXT("latched, each ring is sorted as its own admission finishes, and only the ring still being ")
+			       TEXT("swept is withheld from dispatch). ")
+			       TEXT("split= and splitTicks= on the incremental-admission window line carry N; ")
+			       TEXT("splitHeld= on the dispatch window line is how often the ONE parked ring was withheld."),
+			       RecomputeBudgetMs, RecomputeSplit.Level, RecomputeSplit.ResumeCx, RecomputeSplit.ResumeCy,
+			       float((FPlatformTime::Seconds() - RecomputeT0) * 1000.0));
+		}
+		if (RecomputeSplit.Ticks == 1)
+		{
+			++RecomputeSplitsSinceLog; // one per PASS that had to split
+		}
+		++RecomputeSplitTicksSinceLog;
+		RecomputeSplitMaxTicks = FMath::Max(RecomputeSplitMaxTicks, RecomputeSplit.Ticks);
+	}
+	else
+	{
+		// The pass is whole. Everything below is the ONE close a split pass
+		// gets, which is why it -- and RecomputeCalls, and the GPU ledger --
+		// sits behind this branch: a pass spread over 600 slices is still one
+		// recompute, and counting it 600 times would make every per-call
+		// average in this file wrong by that factor.
+		RecomputeSplit = FRecomputeSplitState{};
+
+		// T4-2 shadow: close this recompute's decision ledger (and drain any
+		// arrived deltas through the comparator). No-op in mode 0.
+		FVoxelResidencyGpu::Get().OnRecomputeEnd();
+		++RecomputeCalls;
+	}
 }
 
 bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq,
@@ -25764,6 +26255,24 @@ void FVoxelWorldImpl::DispatchJobs()
 	// exitBudget= so passes = exitCap + exitEmpty + exitBacklog + exitBudget holds.
 	const double DispatchBudgetSeconds = double(VoxelDebug::GetStreamDispatchBudgetMs()) / 1000.0;
 	bool bLoopExitedBudget = false;
+	// RECOMPUTE SPLIT (voxel.Stream.RecomputeBudgetMs, see FRecomputeSplitState):
+	// exactly ONE ring can be parked mid-sweep, and only that ring's queue is
+	// half-built and unsorted. Dispatching from it would hand the workers the
+	// cell sweep's row-major order instead of the nearest-first order the sort,
+	// the cutoff and CommitNearestAdmitScratch all agree on -- the "far before
+	// near" fill the nearest-admit commit exists to prevent. Every OTHER ring is
+	// dispatchable: the ones below the cursor were re-sorted the moment their
+	// admission finished, the ones above still hold the previous pass's sorted
+	// entries. (Holding all eight instead WAS measured, on
+	// Saved/loading-leg10-recompute-split.log, and it cost the gate 36 s -- see
+	// the release site in RecomputeDesiredSet.) Loop-invariant: nothing inside
+	// the loop can start or finish a recompute. INDEX_NONE, i.e. inert, at the
+	// default budget of 0.
+	const int32 SplitHeldLevel = RecomputeSplit.bActive ? RecomputeSplit.Level : INDEX_NONE;
+	if (SplitHeldLevel != INDEX_NONE && PendingJobKeysByLevel[SplitHeldLevel].Num() > 0)
+	{
+		++DispatchSplitHeldSinceLog; // splitHeld=: passes that actually withheld work
+	}
 	while (CpuJobsOutstanding() < MaxJobsInFlight)
 	{
 		if (DispatchBudgetSeconds > 0.0 && FPlatformTime::Seconds() - DispatchLoopStart > DispatchBudgetSeconds)
@@ -25824,6 +26333,10 @@ void FVoxelWorldImpl::DispatchJobs()
 				{
 					continue;
 				}
+				if (Level == SplitHeldLevel)
+				{
+					continue; // counted once per pass, before the loop
+				}
 				// Which population a floor slot is held against is the whole
 				// switch: blended, a p50 2.3 s GPU round trip satisfies the
 				// floor for its entire flight and the deficit below never
@@ -25853,6 +26366,10 @@ void FVoxelWorldImpl::DispatchJobs()
 				if (Queue.Num() == 0)
 				{
 					continue;
+				}
+				if (Level == SplitHeldLevel)
+				{
+					continue; // counted in the ring-quota scan above
 				}
 				const double HeadDistSq = Queue.Last().DistSq; // nearest in this ring
 				if (PickLevel == INDEX_NONE || HeadDistSq < BestDistSq)
@@ -33820,6 +34337,7 @@ FVoxelStreamingProgress UVoxelWorldSubsystem::GetStreamingProgress() const
 	// there is nothing left to load.
 	Out.bSessionStarted = (ChunkOwner != nullptr);
 	Out.TrackedChunks = Impl->ChunkRecords.Num();
+	Out.bRecomputeInProgress = Impl->RecomputeSplit.bActive;
 
 	// ONE walk, not three. This is the O(ChunkRecords) cost the header warns
 	// about (39,020 entries at a settled 4 km cascade), and loaded/in-flight

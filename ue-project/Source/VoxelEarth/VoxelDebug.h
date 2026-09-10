@@ -320,6 +320,10 @@ namespace VoxelDebug
 	// voxel.Stream.DispatchBudgetMs: max wall-clock ms DispatchJobs may spend in its
 	// loop per tick; 0 = unbounded. Set by the loading theatre (2026-09-09).
 	VOXELEARTH_API float GetStreamDispatchBudgetMs();
+	// voxel.Stream.RecomputeBudgetMs: max wall-clock ms one RecomputeDesiredSet call
+	// may spend before it splits its admission pass across ticks; 0 = never split.
+	// Set by the loading theatre (2026-09-10).
+	VOXELEARTH_API float GetStreamRecomputeBudgetMs();
 	// DrainResults' third per-tick ceiling (-VoxelApplyDrainCap=, default 1024).
 	VOXELEARTH_API int32 GetStreamDrainCapPerFrame();
 
@@ -516,6 +520,11 @@ struct FVoxelStreamingProgress
 	// walk this struct costs, and having it in the log makes an unexpectedly
 	// slow poll self-explaining.
 	int32 TrackedChunks = 0;
+	// A ring recompute is parked mid-sweep (voxel.Stream.RecomputeBudgetMs, 2026-09-10).
+	// While it is, "pending == 0" means nothing: the outer rings have not been admitted
+	// yet. Leg 11 opened the loading gate at 4.1 s with 3,851 chunks tracked (leg 9:
+	// 56,235) because the probe read a quiet streamer. The gate treats this as busy.
+	bool bRecomputeInProgress = false;
 
 	// False until UVoxelWorldSubsystem::StartWorldSession has run. Everything
 	// above is zero in that state, and zero-because-nothing-started reads
