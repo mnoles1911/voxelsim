@@ -92,6 +92,61 @@ const TCHAR* const kApplyBudgetCVarName = TEXT("voxel.Stream.ApplyBudgetMs");
 constexpr float kTheatreDispatchBudgetMs = 8.0f;
 const TCHAR* const kDispatchBudgetCVarName = TEXT("voxel.Stream.DispatchBudgetMs");
 
+// --- THE FOURTH GAME-THREAD BURST: THE FIRST RING RECOMPUTE (2026-09-10) -----
+//
+// The last multi-second frame the curtain hid. The same Insights trace
+// (Saved/loading-leg7.utrace) put 1.7 s and then 5.4 s -- one game-thread tick
+// each, at spawn -- inside FVoxelWorldImpl::RecomputeDesiredSet, all of it in
+// the per-level admission sweeps. Nothing is pathological about it: eight rings
+// x ~1300 footprints x ~0.45 ms of COLD worldgen column evaluation (leg 9 prints
+// the unit directly: `recomputeMs=578.99 ... R5=576.25 footprints R5=1285`) is
+// simply five seconds of work. The defect is that it lands on ONE tick, and
+// Slate ticks and paints on that thread, so the hourglass stops dead.
+//
+// voxel.Stream.RecomputeBudgetMs SPLITS the pass instead of deferring it: the
+// anchor is latched, a cell cursor is parked, and the SAME pass finishes over
+// the following ticks. The finished desired set is what one tick would have
+// produced, and DispatchJobs withholds only the ONE ring still being swept --
+// every other ring is sorted and dispatchable -- so the fill order the workers
+// see is unchanged and the fill itself is not serialised behind the sweep. See
+// the cvar's own help text and FRecomputeSplitState in VoxelWorldSubsystem.cpp
+// for the invariants, and leg 10 for what holding the whole pipeline cost.
+//
+// 8 ms, THE SAME NUMBER AS THE DISPATCH CAP: about a quarter of a 30 fps frame,
+// so the hourglass keeps painting. The work is not removed, it is spread, which
+// under a 36 s theatre is free. 0 is the cvar's "never split" and is what an
+// ordinary run had, so restore puts 0 back.
+//
+// THIS KNOB WAS PARKED AT 0 FOR PART OF A DAY, AND THE TWO LEGS THAT PARKED IT
+// ARE WHY THE THIRD ONE IS TRUSTWORTHY. In all three the freeze itself went and
+// the finished world was identical -- 71,517 jobs dispatched and tracked=71565
+// in every arm, same fine tier, same ring centre. What moved was the FILL:
+//
+//   * leg 10 (Saved/loading-leg10-recompute-split.log) held ALL dispatch while
+//     a pass was parked: `passes=346 splitHeld=346 cpuLaunched=0 gpuForked=0`
+//     for two whole windows, `cold fill: t=27.3s jobs=0`, gate READY 14.1 s ->
+//     49.8 s. Fixed by withholding only the ONE ring being swept.
+//   * leg 11 (Saved/loading-leg11-recompute-split-perlevel.log) fixed that
+//     (`splitHeld=0`, worst curtain frame 5,328 -> 1,056 ms) and exposed the
+//     real hazard: the load GATE fired after 4.08 s with 3,851 chunks tracked,
+//     against 14.07 s / 56,235 on the baseline. A 3x better gate time that is
+//     the curtain lifting on a world 6% built -- the arm's own success metric
+//     reading backwards.
+//   * leg 12 (Saved/loading-leg12-split-parked.log), with the gate taught to
+//     wait on a parked pass (FVoxelStreamingProgress::bRecomputeInProgress,
+//     fed from FRecomputeSplitState::bActive), passes on every column: worst
+//     curtain frame 5,328 -> 1,093 ms, hitches 15 -> 7, p99 20.6 -> 20.8,
+//     worst admission tick 578.99 -> 9.61 ms, READY 14.07 -> 16.69 s with
+//     60,250 tracked (MORE than the baseline's 56,235), jobs 71,517 exactly.
+//
+// THE GATE FIX IS LOAD-BEARING, NOT A TIDY-UP: legs 11 and 12 run the same
+// split (938 vs 932 slices, same budget) and differ only in it, which is what
+// makes READY 4.08 -> 16.69 s and tracked 3,851 -> 60,250 a measurement rather
+// than a coincidence. Do not re-arm this knob in a build where that gate
+// condition has been removed.
+constexpr float kTheatreRecomputeBudgetMs = 8.0f; // re-armed 2026-09-10: the gate now waits for a parked recompute (FVoxelStreamingProgress::bRecomputeInProgress)
+const TCHAR* const kRecomputeBudgetCVarName = TEXT("voxel.Stream.RecomputeBudgetMs");
+
 // --- THE SECOND GAME-THREAD BURST: THE RASTER ATLAS SWEEP (2026-09-08) -------
 //
 // The 2026-09-08 live load's largest single game-thread item was not the apply
@@ -860,6 +915,38 @@ void UVoxelFrontEndSubsystem::CapStreamingForTheatre()
 			       VoxelFrontEndDetail::kDispatchBudgetCVarName, SavedDispatchBudgetMs, VoxelFrontEndDetail::kTheatreDispatchBudgetMs);
 		}
 	}
+
+	// --- The ring recompute, same shape, same save/restore (2026-09-10) --------
+	//
+	// The guard is on the CONSTANT, not on a separate switch, so parking this
+	// arm again is one number -- and `if constexpr` rather than `if` so that at
+	// 0 the body is DISCARDED rather than merely dead, which costs no code and
+	// cannot raise an unreachable-code warning against a warnings-as-errors
+	// build. The body still has to compile at 0, which is the point: a parked
+	// arm that has rotted is not a parked arm. See kTheatreRecomputeBudgetMs
+	// for the three legs behind the current value.
+	if constexpr (VoxelFrontEndDetail::kTheatreRecomputeBudgetMs > 0.f)
+	{
+		IConsoleVariable* RecomputeVar =
+			IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kRecomputeBudgetCVarName);
+		if (RecomputeVar == nullptr)
+		{
+			UE_LOG(LogVoxelUI, Warning, TEXT("LoadScreen: %s not found; the ring recompute runs whole-tick under the theatre."),
+			       VoxelFrontEndDetail::kRecomputeBudgetCVarName);
+		}
+		else if (RecomputeVar->GetFloat() > 0.f && RecomputeVar->GetFloat() <= VoxelFrontEndDetail::kTheatreRecomputeBudgetMs)
+		{
+			// Already split tighter than the theatre; leave it.
+		}
+		else
+		{
+			SavedRecomputeBudgetMs = RecomputeVar->GetFloat();
+			bRecomputeBudgetCapped = true;
+			RecomputeVar->Set(VoxelFrontEndDetail::kTheatreRecomputeBudgetMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: capped %s %.1f -> %.1f for the load theatre (0 = never split)."),
+			       VoxelFrontEndDetail::kRecomputeBudgetCVarName, SavedRecomputeBudgetMs, VoxelFrontEndDetail::kTheatreRecomputeBudgetMs);
+		}
+	}
 }
 
 void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
@@ -906,6 +993,16 @@ void UVoxelFrontEndSubsystem::RestoreStreamingBudget()
 		{
 			DispatchVar->Set(SavedDispatchBudgetMs, ECVF_SetByCode);
 			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.1f."), VoxelFrontEndDetail::kDispatchBudgetCVarName, SavedDispatchBudgetMs);
+		}
+	}
+	if (bRecomputeBudgetCapped)
+	{
+		bRecomputeBudgetCapped = false;
+		if (IConsoleVariable* RecomputeVar =
+		        IConsoleManager::Get().FindConsoleVariable(VoxelFrontEndDetail::kRecomputeBudgetCVarName))
+		{
+			RecomputeVar->Set(SavedRecomputeBudgetMs, ECVF_SetByCode);
+			UE_LOG(LogVoxelUI, Log, TEXT("LoadScreen: restored %s to %.1f."), VoxelFrontEndDetail::kRecomputeBudgetCVarName, SavedRecomputeBudgetMs);
 		}
 	}
 }

@@ -163,7 +163,10 @@ void FVoxelWorldReadyProbe::Poll(const UVoxelWorldSubsystem& World)
 
 	// --- All gates, sustained -----------------------------------------------
 	const bool bSpatialOk = (Status.ProbeTotal > 0) && (Hits >= Status.ProbeTotal);
-	const bool bStreamerIdle = Progress.bSessionStarted && Pending == 0 && Jobs == 0;
+	// A parked ring recompute (the split arm, 2026-09-10) is streaming work that has
+	// not reached the queues yet; without this term leg 11 declared READY at 4 s.
+	const bool bStreamerIdle = Progress.bSessionStarted && Pending == 0 && Jobs == 0
+	                           && !Progress.bRecomputeInProgress;
 	if (bSpatialOk && bStreamerIdle && bFineRingOk)
 	{
 		++Status.ConsecutiveGood;
@@ -192,9 +195,10 @@ void FVoxelWorldReadyProbe::Poll(const UVoxelWorldSubsystem& World)
 	{
 		UE_LOG(LogVoxelUI, Log,
 		       TEXT("VoxelLoadGate: t=%.1fs hits=%d/%d pending(R0..R%d)=%d jobs=%d fill=%.2f fineRing=%d/%d ")
-		       TEXT("consec=%d/%d poll=%.2fms"),
+		       TEXT("split=%d consec=%d/%d poll=%.2fms"),
 		       Status.ElapsedSeconds, Hits, Status.ProbeTotal, MaxRing, Pending, Jobs, Status.RingFillFraction,
-		       Status.FineRingSettled, Status.FineRingTotal, Status.ConsecutiveGood, Config.RequiredGoodSamples,
+		       Status.FineRingSettled, Status.FineRingTotal, Progress.bRecomputeInProgress ? 1 : 0,
+		       Status.ConsecutiveGood, Config.RequiredGoodSamples,
 		       Status.LastPollMs);
 	}
 }

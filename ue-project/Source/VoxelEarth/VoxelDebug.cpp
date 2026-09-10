@@ -415,6 +415,24 @@ TAutoConsoleVariable<float> CVarVoxelStreamDispatchBudgetMs(
 	TEXT("a budget exit is counted as exitBudget= on the dispatch loop window line so the exit census still sums."),
 	ECVF_Default);
 
+TAutoConsoleVariable<float> CVarVoxelStreamRecomputeBudgetMs(
+	TEXT("voxel.Stream.RecomputeBudgetMs"),
+	0.0f,
+	TEXT("Max WALL-CLOCK milliseconds one FVoxelWorldImpl::RecomputeDesiredSet call may spend before it SPLITS -- ")
+	TEXT("parking a cell cursor and finishing the same admission pass on the next tick(s); 0 = never split (the ")
+	TEXT("shipped behaviour, byte-identical). 2026-09-09 Insights trace of a quiet-box load ")
+	TEXT("(Saved/loading-leg7.utrace): the first two recomputes after spawn ran 1.7 s and 5.4 s inside ONE game-thread ")
+	TEXT("tick each, all of it in VoxelRecompute_AdmissionAndBeyond -- ~1300 footprints per ring at ~0.45 ms apiece of ")
+	TEXT("cold worldgen column evaluation, across eight rings. The pass is SPLIT, not deferred: the anchor is latched ")
+	TEXT("at the first slice so every slice decides against the same anchor and the finished desired set is exactly ")
+	TEXT("what one tick would have produced; the queue sort, the truncation and the mark flush run only on the slice ")
+	TEXT("that completes it. Each RING is re-sorted the moment its own admission finishes and DispatchJobs withholds ")
+	TEXT("only the ONE ring still being swept, so the fill is never serialised behind the sweep and nothing is ever ")
+	TEXT("dispatched from a half-built queue. The loading theatre sets this (kTheatreRecomputeBudgetMs) and restores ")
+	TEXT("0 at the reveal. Engagement: `Voxel recompute: split across N ticks`, then split=/splitTicks= on the ")
+	TEXT("incremental-admission window line and splitHeld= on the dispatch window line."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
 	TEXT("voxel.Stream.LodRetentionMs"),
 	10000.0f,
@@ -1681,6 +1699,11 @@ int32 VoxelDebug::GetStreamMaxAppliesPerFrameCvar()
 float VoxelDebug::GetStreamDispatchBudgetMs()
 {
 	return FMath::Max(0.f, CVarVoxelStreamDispatchBudgetMs.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamRecomputeBudgetMs()
+{
+	return FMath::Max(0.f, CVarVoxelStreamRecomputeBudgetMs.GetValueOnGameThread());
 }
 
 float VoxelDebug::GetStreamApplyBudgetMsCvar()

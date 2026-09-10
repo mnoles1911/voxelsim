@@ -981,3 +981,32 @@ reveal. `seg=LOADING`: n=3789, hitches=15, p50 5.2 ms, p99 **20.6 ms**, max 5,32
 budget cost the fill nothing in wall time under the theatre. What remains is the one
 first-recompute admission pass (5.3 s) at spawn, which runs once; splitting the per-level
 admission across ticks is the next item.
+
+### The first ring recompute, split across ticks (2026-09-10)
+
+`voxel.Stream.RecomputeBudgetMs` (default 0 = one tick, byte-identical). When armed, one
+`RecomputeDesiredSet` pass parks at a cell cursor inside the level sweep when the budget
+elapses and resumes next tick against the LATCHED anchor, so the finished desired set is
+exactly what one tick produced; the tail (prune, sort, truncate) runs once; only the ring
+being swept is withheld from dispatch and each ring is re-sorted the moment its admission
+finishes. The loading theatre caps it at 8 ms (`kTheatreRecomputeBudgetMs`) and restores 0.
+Three legs got it right:
+
+| | leg 9 (base) | leg 10 (hold ALL dispatch) | leg 11 (per-ring) | leg 12 (+ gate term) |
+|---|---|---|---|---|
+| max admission per tick | 579 ms (R5) | 12 ms | 25 ms | 25 ms |
+| `seg=LOADING` max | 5,328 ms | 25,527 ms | 1,056 ms | **1,093 ms** |
+| hitches / p99 | 15 / 20.6 | 16 / 30.1 | 12 / 23.6 | **7 / 20.8** |
+| gate READY | 14.1 s | 49.8 s | 4.1 s (!) | **16.7 s** |
+| chunks tracked at READY | 56,235 | 53,143 | 3,851 | **60,250** |
+| jobs dispatched / final tracked | 71,517 / 71,565 | same | same | same |
+
+Leg 10 starved dispatch (a cold outer-ring footprint is 4-6 ms, so an 8 ms budget is one
+or two cells a tick and the pass ran ~940 slices; `splitHeld=346` for two windows). Leg 11
+fixed that but the ready probe read "pending 0" as quiet while the pass was parked and
+opened the gate at 4 s on 3,851 chunks. `FVoxelStreamingProgress::bRecomputeInProgress`
+now feeds the probe's idle term (`split=` on its poll line); leg 12 waits for the pass.
+The remaining ~1.1 s frame under the curtain is the next item; the floor of this arm is one
+outer-ring footprint (5-12 ms), not the 8 ms budget, because the deadline is tested
+between cells. The `Voxel cold fill` instrument still declares the fill over at `pending
+0` while a pass is parked (instrument only; the dispatch windows carry the truth).
