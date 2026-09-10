@@ -39,6 +39,7 @@ Run via (one editor per box -- do not run while another editor is up):
 
 import unreal
 from vegetation_material_common import add_vegetation
+from voxel_surface_lighting_common import add_surface_lighting
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelDetailAsset"
@@ -82,10 +83,12 @@ def main():
         raise RuntimeError("connect roughness failed")
 
     add_vegetation(material, vertex_color)
+    add_surface_lighting(material, power)
     mel.layout_material_expressions(material)
     mel.recompile_material(material)
 
-    unreal.EditorAssetLibrary.save_loaded_asset(material)
+    if not unreal.EditorAssetLibrary.save_loaded_asset(material):
+        raise RuntimeError("Failed to save detail asset material")
     unreal.log("M_VoxelDetailAsset created and saved at " + FULL_PATH)
 
 

@@ -1,4 +1,5 @@
 #include "VoxelSkySubsystem.h"
+#include "VoxelSurfaceLighting.h"
 #include "VoxelSessionCheckpoint.h"
 
 #include "VoxelEarth.h"
@@ -30,6 +31,7 @@
 #include "HAL/IConsoleManager.h"
 #include "Kismet/KismetMaterialLibrary.h" // the MPC writes -- see ApplySkyMaterialParams
 #include "Materials/MaterialParameterCollection.h"
+#include "Materials/MaterialParameterCollectionInstance.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "UObject/StrongObjectPtr.h" // FVoxelSkyImpl is a plain struct; see SkyParams
@@ -3429,7 +3431,7 @@ bool UVoxelSkySubsystem::IsTickable() const
 	// exactly as long as it takes to put the rig back to its static pose after a
 	// runtime toggle-off -- the same shape as UVoxelGISubsystem::IsTickable
 	// (VoxelGI.cpp:349-354).
-	return VoxelSky::IsEnabled() || bHasState;
+    return VoxelSky::IsEnabled() || bHasState || (GetWorld() && VoxelSessionCheckpoint::Ready(GetWorld()));
 }
 
 TStatId UVoxelSkySubsystem::GetStatId() const
@@ -3511,10 +3513,16 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	{
 		return;
 	}
+    // Simulation time is authoritative even when the sky rendering feature is disabled.
+    const double TimeScale = Impl->ClockRate();
+    const double DayLength = Impl->ClockDay();
+    const double DaysPerYear = Impl->ClockYear();
+    Impl->EpochSeconds += (double)DeltaTime * TimeScale;
+    TickReplicatedClock(DeltaTime, TimeScale);
 
 	if (!VoxelSky::IsEnabled())
 	{
-		// One frame of work to undo the feature, then IsTickable goes false.
+		// Undo rendering once, but keep the public simulation clock available to water and weather.
 		if (bHasState)
 		{
 			ApplyStaticRigPose();
@@ -3522,21 +3530,16 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 			bHasState = false;
 			UE_LOG(LogVoxelSky, Log, TEXT("voxel.Sky.Enabled 0: rig returned to the static pre-W4 pose."));
 		}
+		Impl->State.EpochSeconds=Impl->EpochSeconds;
+		Impl->State.bClockRunning=TimeScale!=0;
 		return;
 	}
-
-	const double TimeScale = Impl->ClockRate();
-	const double DayLength = Impl->ClockDay();
-	const double DaysPerYear = Impl->ClockYear();
-
-	Impl->EpochSeconds += (double)DeltaTime * TimeScale;
 
 	// F7: the replicated clock -- authority push / client bounded correction.
 	// Between the local accumulation above and the ephemeris reads below, so a
 	// correction is part of THIS frame's clock rather than a retroactive nudge
 	// the sun catches up to a frame late. Standalone pays one NetMode enum test
 	// and nothing else (the off arm).
-	TickReplicatedClock(DeltaTime, TimeScale);
 
 	// The observer's own position, because latitude is a function of it
 	// (GeoFromWorldUU). Held over from the previous frame when there is no
@@ -4829,6 +4832,65 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 		const FVoxelSkyLightColours Colours =
 			VoxelSky::SampleLightColours(S.SunAltitudeDeg, MoonLightFraction);
 		VoxelMarchPublishSunColour(Colours.Sun, Colours.Ambient, Colours.MoonFraction);
+        // Separate collection: do not recreate MPC_VoxelSky or its existing GUIDs.
+        // Sky drives this even for diagnostic actors whose gameplay tick is off.
+        const auto Surface=VoxelSurfaceLightingSnapshot_GameThread();
+        static TWeakObjectPtr<UMaterialParameterCollection> SurfaceCollection;
+        static double SurfaceRetryAfter=0.0;
+        const double SurfaceNow=FPlatformTime::Seconds();
+        if(Surface.AssetDiagnosticEnabled&&!SurfaceCollection.IsValid()&&SurfaceNow>=SurfaceRetryAfter)
+        {
+            // Bounded diagnostic-only reacquire after missing asset or GC; no per-frame IO.
+            SurfaceRetryAfter=SurfaceNow+30.0;
+            SurfaceCollection=LoadObject<UMaterialParameterCollection>(nullptr,TEXT("/Game/Voxel/MPC_VoxelSurfaceLighting.MPC_VoxelSurfaceLighting"));
+            if(!SurfaceCollection.IsValid())
+            { UE_LOG(LogVoxelSky,Warning,TEXT("Surface lighting diagnostic unavailable: generate MPC_VoxelSurfaceLighting and environment/detail materials.")); }
+        }
+        if(auto* SurfaceParameters=SurfaceCollection.Get())
+        {
+            const auto Color=[](const FVector4f& V){return FLinearColor(V.X,V.Y,V.Z,V.W);};
+            const FName EnabledName(TEXT("Enabled"));
+            const FName VectorNames[]={TEXT("AmbientSkyAndGround"),TEXT("SunDirAndWrapFloor"),TEXT("WrapColorAndSkyBoost")};
+            // Validate the actual loaded schema, not merely the expected asset
+            // path. Required names must be unique and have the correct type.
+            bool Schema=SurfaceParameters->ScalarParameters.Num()<=64&&SurfaceParameters->VectorParameters.Num()<=64;
+            int32 EnabledCount=0;
+            if(Schema){
+                for(const auto& P:SurfaceParameters->ScalarParameters){
+                    if(P.ParameterName==EnabledName){++EnabledCount;Schema&=P.DefaultValue==0.0f;}
+                    for(FName N:VectorNames)if(P.ParameterName==N)Schema=false;
+                }
+                for(const auto& P:SurfaceParameters->VectorParameters)if(P.ParameterName==EnabledName)Schema=false;
+                for(FName N:VectorNames){int32 Count=0;for(const auto& P:SurfaceParameters->VectorParameters)if(P.ParameterName==N)++Count;Schema&=Count==1;}
+            }
+            Schema&=EnabledCount==1;
+            auto* Instance=GetWorld()?GetWorld()->GetParameterCollectionInstance(SurfaceParameters):nullptr;
+            bool Applied=Schema&&Instance;
+            if(Applied){
+                // Checked ENGINE_API setters; enable only after every vector
+                // write succeeds. A partial update remains disabled on failure.
+                Applied=Instance->SetVectorParameterValue(VectorNames[0],Color(Surface.AmbientSkyAndGround));
+                Applied=Instance->SetVectorParameterValue(VectorNames[1],Color(Surface.SunDirAndWrapFloor))&&Applied;
+                Applied=Instance->SetVectorParameterValue(VectorNames[2],Color(Surface.WrapColorAndSkyBoost))&&Applied;
+                Applied=Instance->SetScalarParameterValue(EnabledName,Applied&&Surface.AssetDiagnosticEnabled?1.0f:0.0f)&&Applied;
+            }
+            if(!Applied){
+                if(Instance)Instance->SetScalarParameterValue(EnabledName,0.0f);
+                SurfaceCollection.Reset();SurfaceRetryAfter=SurfaceNow+30.0;
+                UE_LOG(LogVoxelSky,Warning,TEXT("SurfaceLightingDiagnostic REFUSED: loaded collection schema or checked parameter update failed; retry delayed30s"));
+            }
+            static TWeakObjectPtr<UWorld> LastDiagnosticWorld;
+            static bool LastDiagnosticEnabled=false;
+            if(Applied&&(LastDiagnosticWorld.Get()!=GetWorld()||LastDiagnosticEnabled!=Surface.AssetDiagnosticEnabled))
+            {
+                LastDiagnosticWorld=GetWorld();LastDiagnosticEnabled=Surface.AssetDiagnosticEnabled;
+                if(Surface.AssetDiagnosticEnabled)
+                { UE_LOG(LogVoxelSky,Log,TEXT("SurfaceLightingDiagnostic APPLIED enabled=1 volumesOff=1")); }
+                else
+                { UE_LOG(LogVoxelSky,Log,TEXT("SurfaceLightingDiagnostic APPLIED enabled=0")); }
+            }
+        }
+
 
 		// ---- THE GREPPABLE ENGAGEMENT LINE ---------------------------------
 		//

@@ -44,6 +44,7 @@ bool Bytes(FArchive& Ar,TArray<uint8>& Data,int32 Max)
 bool Eligible(AActor* A)
 {
     if(!A||A->ActorHasTag(TEXT("ObjectRestorePending")))return false;
+    if(const auto Environment=Cast<AVoxelEnvironmentLODPrototype>(A))if(Environment->IsUnpublishedPreparation())return false;
     auto Life=A->FindComponentByClass<UVoxelDebrisLifecycle>();
     if(Life&&Life->CaptureState().Kind==EVoxelDebrisLifetime::Cosmetic)return false;
     return A->IsA<AVoxelDebris>()||A->IsA<AVoxelFallingTimber>()||A->IsA<AVoxelEnvironmentLODPrototype>();

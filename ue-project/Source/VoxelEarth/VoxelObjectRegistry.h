@@ -4,6 +4,8 @@
 
 class AActor;
 class UWorld;
+struct FVoxelEnvironmentAssetDescriptor;
+struct FVoxelEnvironmentProductionCommit;
 
 // Game-thread registry. Snapshot byte handles alone may cross to workers.
 namespace VoxelObjects
@@ -51,9 +53,37 @@ struct FCallbacks
     TFunction<void(AActor*)> Evict;
 };
 struct FTickResult { int32 Inspected = 0, Restored = 0, Evicted = 0, Expired = 0; };
+struct FProductionReservation {
+    FGuid Id,RegistryNonce,Serial;
+    bool IsValid() const {return Id.IsValid()&&RegistryNonce.IsValid()&&Serial.IsValid();}
+};
+struct FPreparedProductionCommit;
+using FPreparedProductionCommitRef=TSharedPtr<const FPreparedProductionCommit,ESPMode::ThreadSafe>;
 class FRegistry
 {
 public:
+    FRegistry()=default;
+    FRegistry(const FRegistry&)=delete;
+    FRegistry& operator=(const FRegistry&)=delete;
+    FRegistry(FRegistry&&)=delete;
+    FRegistry& operator=(FRegistry&&)=delete;
+    // Reservations are outside Entries/Order: no discovery, save, streaming or
+    // replication visibility. New IDs only; existing records/tombstones survive.
+    FProductionReservation ReserveProduction(const FVoxelEnvironmentAssetDescriptor& Source,FEntry Prepared);
+    // Failed commit retains reservation. A live actor must already be published
+    // and capturable with the exact reserved geometry/header. No actor reveal here.
+    // Caller must prevalidate fallible work and pair reveal/bind in a non-yielding
+    // GT transaction with the renderer publication boundary; not yet wired in World.
+    bool CommitProduction(const FProductionReservation& Ticket);
+    // Prepare/validate hidden actor and immutable reserved entry. Commit requires
+    // immediate successful validation on GT, without intervening mutation/yield.
+    // It binds logical state only; no actor reveal or render-frame guarantee.
+    FPreparedProductionCommitRef PrepareProductionCommit(const FProductionReservation& Ticket);
+    bool ValidatePreparedProduction(const FPreparedProductionCommitRef& Token);
+    void CommitPreparedProduction(const FPreparedProductionCommitRef& Token);
+
+    bool RollbackProduction(const FProductionReservation& Ticket);
+    int32 NumProductionReservations() const {return Reservations.Num();}
     FGuid Bind(AActor* Actor, uint8 Kind, FGuid Id = FGuid());
     FEntry* Find(const FGuid& Id);
     const FEntry* Find(const FGuid& Id) const;
@@ -75,6 +105,10 @@ public:
     static bool ShouldEvict(const FEntry& Entry, const TArray<FView>& Views, double DistanceCm);
     int32 Num() const { return Entries.Num(); }
 private:
+    struct FReservedProduction {FProductionReservation Ticket;FEntry Entry;bool HadActor=false;FGuid CommitSerial;};
+    FGuid RegistryNonce=FGuid::NewGuid();
+    TMap<FGuid,FReservedProduction> Reservations;
+    bool ActorReserved(const AActor* Actor) const;
     TMap<FGuid,FEntry> Entries;
     TArray<FGuid> Order;
     TMap<FGuid,double> LastDormantSample;

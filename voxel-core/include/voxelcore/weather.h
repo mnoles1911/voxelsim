@@ -213,6 +213,7 @@
 // otherwise looks completely fine.
 
 #include "voxelcore/hash.h"
+#include <cstddef>
 
 namespace vxc {
 
@@ -266,10 +267,10 @@ inline constexpr int32_t kWindRoseSinQ[32] = {
 };
 
 constexpr int64_t windRoseSinQ(int64_t k) {
-    return kWindRoseSinQ[static_cast<size_t>(floorMod(k, kWindRoseSectors))];
+    return kWindRoseSinQ[static_cast<std::size_t>(floorMod(k, kWindRoseSectors))];
 }
 constexpr int64_t windRoseCosQ(int64_t k) {
-    return kWindRoseSinQ[static_cast<size_t>(floorMod(k + 8, kWindRoseSectors))];
+    return kWindRoseSinQ[static_cast<std::size_t>(floorMod(k + 8, kWindRoseSectors))];
 }
 
 // A horizontal unit direction in Q15. eastQ is +X, northQ is +Y.
@@ -729,7 +730,7 @@ inline constexpr const char* kWindCompass16[16] = {
 constexpr const char* windCompass16(int64_t fromBearingMilliDeg) {
     const int64_t half = kWindTurnMilliDeg / 32; // 11250
     const int64_t b = floorMod(fromBearingMilliDeg + half, kWindTurnMilliDeg);
-    return kWindCompass16[static_cast<size_t>(b / (kWindTurnMilliDeg / 16))];
+    return kWindCompass16[static_cast<std::size_t>(b / (kWindTurnMilliDeg / 16))];
 }
 
 // --- compile-time proofs ----------------------------------------------------

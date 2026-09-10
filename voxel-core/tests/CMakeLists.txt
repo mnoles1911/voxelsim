@@ -59,6 +59,7 @@ add_executable(vxc_tests
   test_craftpersist.cpp
   test_craftcost.cpp
   test_assetownership.cpp
+  test_assetcandidate.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
@@ -156,7 +157,7 @@ endif()
 add_test(NAME vxc_tests COMMAND vxc_tests)
 
 # Focused publication/provenance checks without the unrelated fluid suite.
-add_executable(vxc_assetownership_tests test_main.cpp test_assetownership.cpp)
+add_executable(vxc_assetownership_tests test_main.cpp test_assetownership.cpp test_assetcandidate.cpp)
 target_link_libraries(vxc_assetownership_tests PRIVATE voxelcore Threads::Threads)
 if(NOT MSVC)
   target_compile_options(vxc_assetownership_tests PRIVATE -Wall -Wextra -Werror)
@@ -180,3 +181,24 @@ else()
   target_compile_options(vxc_sparseassetgrid_noexceptions_tests PRIVATE -fno-exceptions -Wall -Wextra -Werror)
 endif()
 add_test(NAME vxc_sparseassetgrid_noexceptions_tests COMMAND vxc_sparseassetgrid_noexceptions_tests)
+
+# Bounded authority foundation, independently runnable without UE.
+add_executable(vxc_authority_tests test_main.cpp test_assetauthority.cpp)
+target_link_libraries(vxc_authority_tests PRIVATE voxelcore Threads::Threads)
+target_include_directories(vxc_authority_tests PRIVATE .)
+add_test(NAME vxc_authority_tests COMMAND vxc_authority_tests)
+if(NOT MSVC)
+  target_compile_options(vxc_authority_tests PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# Focused CPU teardown quiescence contract (no UE scheduler dependency).
+add_executable(vxc_cpuquiescence_tests test_main.cpp test_cpuquiescence.cpp)
+target_link_libraries(vxc_cpuquiescence_tests PRIVATE voxelcore Threads::Threads)
+add_test(NAME vxc_cpuquiescence_tests COMMAND vxc_cpuquiescence_tests)
+
+add_executable(vxc_footprintresolvecache_tests test_main.cpp test_footprintresolvecache.cpp)
+target_link_libraries(vxc_footprintresolvecache_tests PRIVATE voxelcore Threads::Threads)
+add_test(NAME vxc_footprintresolvecache_tests COMMAND vxc_footprintresolvecache_tests)
+if(NOT MSVC)
+  target_compile_options(vxc_footprintresolvecache_tests PRIVATE -Wall -Wextra -Werror)
+endif()

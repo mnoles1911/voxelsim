@@ -3,8 +3,8 @@
 What is and is not tested here, deliberately:
 
 * The numerics (``flow``/``noise``/``incise``/``thermal``) are a separate
-  workstream and need the terrain-diffusion venv (numba + scipy). CI has
-  neither. Every test that touches them is ``importorskip``-guarded, and this
+  workstream and need numba + scipy, installed by CI's requirements-test.txt.
+  Every test that touches them is ``importorskip``-guarded, and this
   MODULE never imports them at import time -- a test module that fails to
   import takes the whole CI job down, which has already happened once here.
 
@@ -2991,7 +2991,9 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     # pipeline.BAKE_VERSION. 26 -> 28 on 2026-08-17: the 27 roll (bathymetry
     # pair) never made this conscious edit -- found stale during the 28 roll
     # (placement channel planes).
-    assert on["bake_version"] == 28
+    # 28 -> 29: head points dried by final surface constraints no longer ship.
+    # Terrain identity and the surface calculation remain unchanged.
+    assert on["bake_version"] == 29
 
     n = 24
     z, water = _diagonal_reach(n)
@@ -4052,7 +4054,7 @@ def test_band_off_is_byte_identical_to_a_bake_that_never_heard_of_it(
     )
 
 
-def test_headwaters_reach_the_wire_with_their_discharge(_real_kernels):
+def test_headwaters_reach_the_wire_with_their_discharge(_real_kernels, monkeypatch):
     """bake_ver 24: the head mask stops being computed and thrown away.
 
     `water_head_mask` has returned this since bake_ver 9 and B6 has `del`'d it
@@ -4065,6 +4067,16 @@ def test_headwaters_reach_the_wire_with_their_discharge(_real_kernels):
 
     from terrain_service import tile_codec as tc
 
+    original = {}
+    head_mask = pipeline._water.water_head_mask
+
+    def capture_network_heads(*args, **kwargs):
+        wet, heads, stats = head_mask(*args, **kwargs)
+        original["heads"] = heads.copy()
+        original["q"] = np.asarray(args[0]).copy()
+        return wet, heads, stats
+
+    monkeypatch.setattr(pipeline._water, "water_head_mask", capture_network_heads)
     world, cl, base = _band_bake_consts()
     res = pipeline.bake_tile(
         world_seed=20260719, tile_x=0, tile_y=0,
@@ -4088,6 +4100,23 @@ def test_headwaters_reach_the_wire_with_their_discharge(_real_kernels):
     assert np.all(np.diff(keys) > 0), "heads must be strictly (y, x) ordered"
     assert np.all(np.isfinite(res.water_surface_m[ys, xs])), "a head on dry ground"
     assert np.all(qs > 0)
+    # Later constraints dry four original heads in this fixture. Preserve the
+    # remaining source identities and discharge exactly; never create faucets
+    # on widened banks or move a source downstream across a dried gap.
+    apron = TEST_GEOM.apron_coarse_px * TEST_GEOM.scale
+    interior = (slice(apron, apron + n), slice(apron, apron + n))
+    original_heads = original["heads"][interior]
+    eligible = original_heads & np.isfinite(res.water_surface_m)
+    ey, ex = np.nonzero(eligible)
+    np.testing.assert_array_equal(xs, ex)
+    np.testing.assert_array_equal(ys, ey)
+    np.testing.assert_array_equal(qs, np.rint(original["q"][interior][ey, ex]))
+    dried_interior = int((original_heads & ~eligible).sum())
+    assert dried_interior > 0, "the fixture must exercise a head dried after selection"
+    assert res.stats["heads_padded_dry_rejected_count"] >= dried_interior
+    assert (res.stats["heads_padded_count"]
+            + res.stats["heads_padded_dry_rejected_count"]
+            == float(original["heads"].sum()))
     # The reported maximum is the one the u32 field has to hold, and the
     # headroom fraction is how close this world is to needing a wider field.
     # abs=1: the stat is the float maximum and the array is already ROUNDED to
@@ -4138,6 +4167,14 @@ def test_headwaters_off_produces_no_heads_but_still_says_the_stage_ran(
     assert res.water_heads is None
     assert res.stats["heads_ran"] == 0.0
     assert res.stats["heads_count"] == 0.0
+    assert res.stats["heads_padded_dry_rejected_count"] == 0.0
+    enabled = pipeline.bake_tile(
+        world_seed=20260719, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        climate_fetch=lambda x, y: cl.get((x, y)),
+        kernels=_real_kernels, geom=TEST_GEOM, consts=base)
+    for field in ("elevation_m", "water_surface_m", "discharge_m3_yr"):
+        np.testing.assert_array_equal(getattr(res, field), getattr(enabled, field))
 
 
 def test_the_discharge_budget_refusals_reach_the_band(_real_kernels):

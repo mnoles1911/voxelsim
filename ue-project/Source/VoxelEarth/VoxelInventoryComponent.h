@@ -62,6 +62,8 @@ UCLASS(ClassGroup = (VoxelEarth), meta = (BlueprintSpawnableComponent))
 class VOXELEARTH_API UVoxelInventoryComponent : public UActorComponent
 {
 	GENERATED_BODY()
+public:
+    void InitializeNewPlayer() { SeedDefaultsOnce(); }
 
 public:
 	UVoxelInventoryComponent();

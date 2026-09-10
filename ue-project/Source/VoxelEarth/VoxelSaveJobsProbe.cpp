@@ -12,7 +12,7 @@
 
 namespace VoxelSaveJobsProbe
 {
-struct FRun { bool BusyRejected=false; uint64 StartFrame=0; };
+struct FRun { bool BusyRejected=false,Queued=false,FirstFinished=false; uint64 StartFrame=0; };
 FAutoConsoleCommandWithWorldAndArgs Probe(TEXT("voxel.SaveAsync.Probe"),TEXT("Async snapshot test; optional 'exit' tests shutdown while compression is pending."),
     FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args,UWorld* W){
         if(!W||W->GetNetMode()!=NM_Standalone)return;
@@ -22,9 +22,9 @@ FAutoConsoleCommandWithWorldAndArgs Probe(TEXT("voxel.SaveAsync.Probe"),TEXT("As
             auto Run=MakeShared<FRun>();Run->StartFrame=GFrameCounter;
             const FString Name=ExitDuringSave?TEXT("Async exit verification"):TEXT("Async save verification");
             auto PC=W->GetFirstPlayerController();const FTransform Player=PC&&PC->GetPawn()?PC->GetPawn()->GetActorTransform():FTransform::Identity;
-            const bool Started=VoxelSave::WriteAsync(*Sub,Name,false,Player,0,[Run,ExitDuringSave](bool Success){
+            auto Finished=[Run,ExitDuringSave](bool Success){
                 const uint64 Frames=GFrameCounter-Run->StartFrame;
-                const bool Pass=Success&&Run->BusyRejected&&(ExitDuringSave||Frames>2);
+                const bool Pass=Success&&Run->BusyRejected&&Run->Queued&&(ExitDuringSave||Run->FirstFinished);
                 UE_LOG(LogVoxelEarth,Log,TEXT("SaveAsync PROBE %s exit=%d busyRejected=%d framesAdvanced=%llu"),Pass?TEXT("PASS"):TEXT("FAIL"),ExitDuringSave,Run->BusyRejected,Frames);
                 if(ExitDuringSave)return;
                 // A file used as a parent directory forces a real worker-side
@@ -37,8 +37,12 @@ FAutoConsoleCommandWithWorldAndArgs Probe(TEXT("voxel.SaveAsync.Probe"),TEXT("As
                     UE_LOG(LogVoxelEarth,Log,TEXT("SaveAsync FAILURE_PROBE %s"),!Ok?TEXT("PASS"):TEXT("FAIL"));FPlatformMisc::RequestExit(false);
                 });
                 if(!Accepted){UE_LOG(LogVoxelEarth,Error,TEXT("SaveAsync FAILURE_PROBE admission failed"));FPlatformMisc::RequestExit(false);}
+            };
+            const bool Started=VoxelSave::WriteAsync(*Sub,Name,false,Player,0,[Run,ExitDuringSave,Finished](bool Success){
+                Run->FirstFinished=Success; if(ExitDuringSave) Finished(Success);
             });
             if(!Started){UE_LOG(LogVoxelEarth,Error,TEXT("SaveAsync PROBE admission failed"));FPlatformMisc::RequestExit(false);return;}
+            Run->Queued=VoxelSave::WriteAsync(*Sub,Name,false,Player,0,[ExitDuringSave,Finished](bool Success){if(!ExitDuringSave) Finished(Success);});
             Run->BusyRejected=!VoxelSave::WriteAsync(*Sub,Name,false,Player,0);
             if(ExitDuringSave)FPlatformMisc::RequestExit(false);
         }),ExitDuringSave?15.f:60.f,false);

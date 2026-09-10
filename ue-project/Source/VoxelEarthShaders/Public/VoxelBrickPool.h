@@ -357,6 +357,21 @@ struct FVoxelBrickIndexDelta
 // skipped.
 using FVoxelBrickIndexSink = TFunction<void(const FVoxelBrickIndexDelta&)>;
 
+// Optional prepared-publication contract. Preparation may refuse; Commit is
+// non-failing and consumes storage reserved before any resident mutation.
+class FVoxelBrickPreparedIndexDelivery
+{
+public:
+    virtual ~FVoxelBrickPreparedIndexDelivery() = default;
+    virtual bool ValidateForCommit() const = 0;
+    virtual void Commit(const FVoxelBrickIndexDelta& Delta) = 0;
+#if WITH_DEV_AUTOMATION_TESTS
+    virtual uint64 DebugRetainedArrayBytes() const {return 0;}
+#endif
+};
+using FVoxelBrickPreparedIndexDeliveryRef = TSharedPtr<FVoxelBrickPreparedIndexDelivery, ESPMode::ThreadSafe>;
+using FVoxelBrickIndexPreflight = TFunction<FVoxelBrickPreparedIndexDeliveryRef(const FVoxelBrickIndexDelta&)>;
+
 // --- P1 (voxel.GPU.PoolAlloc): the GPU allocator's layout --------------------
 //
 // Computed ONCE by FVoxelBrickPool::Init when the switch is armed, then bound to
@@ -575,6 +590,26 @@ struct FVoxelBrickChunkShading
 	}
 };
 
+// Game-thread observation only, not a reservation. Re-read or validate at commit.
+// Absence has canonical Slot=INDEX_NONE and AddSequence=0.
+// Opaque, pool-scoped pressure protection. Not a reservation of arena capacity
+// and not a seal against explicit same-key removal/replacement.
+struct FVoxelBrickEvictionPinTicket
+{
+    bool IsValid() const { return PoolNonce.IsValid() && Serial != 0; }
+private:
+    friend class FVoxelBrickPool;
+    FGuid PoolNonce;
+    uint64 Serial = 0;
+};
+
+struct FVoxelBrickAllocationToken
+{
+	bool bPresent=false;
+	int32 Slot=INDEX_NONE;
+	uint64 AddSequence=0;
+};
+
 // Prepared replacement pages retain their payloads outside the visible pool.
 // ExpectedSlot/sequence guard eviction or remeshing while preparation ran.
 struct FVoxelBrickPreparedReplacement
@@ -586,6 +621,32 @@ struct FVoxelBrickPreparedReplacement
 	FVoxelGpuBrickPayloadRef GpuPack;
 	FVoxelBrickChunkShading Shading;
 };
+
+struct FVoxelBrickPreparedPoolLifetime;
+enum class EVoxelPrivateGpuReservationStatus : uint8 { Pending, ReadyPrivate, Failed, Cancelled, Published };
+// Private claims stay unexposed until the explicit diagnostic commit seam is used.
+class VOXELEARTHSHADERS_API FVoxelPrivateGpuReservation {
+public:
+    FVoxelPrivateGpuReservation()=default;
+    ~FVoxelPrivateGpuReservation();
+private:
+    friend class FVoxelBrickPool;
+    struct FState;
+    TSharedPtr<FState,ESPMode::ThreadSafe> State;
+};
+using FVoxelPrivateGpuReservationRef=TSharedPtr<FVoxelPrivateGpuReservation,ESPMode::ThreadSafe>;
+class VOXELEARTHSHADERS_API FVoxelBrickPreparedBatch
+{
+public:
+    ~FVoxelBrickPreparedBatch();
+    uint64 GetRetainedBytes() const;
+private:
+    friend class FVoxelBrickPool;
+    FVoxelBrickPreparedBatch();
+    struct FState;
+    TUniquePtr<FState> State;
+};
+using FVoxelBrickPreparedBatchRef = TSharedPtr<FVoxelBrickPreparedBatch, ESPMode::ThreadSafe>;
 
 class VOXELEARTHSHADERS_API FVoxelBrickPool
 {
@@ -758,7 +819,8 @@ public:
 	// and the deltas are the tail.
 	//
 	// Pass a null sink to detach. The snapshot is filled either way.
-	void SetIndexSink(FVoxelBrickIndexSink InSink, TArray<FVoxelBrickIndexEntry>& OutSnapshot);
+	void SetIndexSink(FVoxelBrickIndexSink InSink, TArray<FVoxelBrickIndexEntry>& OutSnapshot,
+        FVoxelBrickIndexPreflight InPreflight = {});
 
 	// The resident set, as index entries. GAME THREAD ONLY. O(resident).
 	void SnapshotResidentIndex(TArray<FVoxelBrickIndexEntry>& Out) const;
@@ -881,6 +943,10 @@ public:
 	// building it a lookup change rather than a format change.
 	int32 FindChunkSlot(const FVoxelBrickChunkKey& Key) const;
 
+	// GAME THREAD ONLY. Matches the resident identity checked by
+	// PublishPreparedBatch; it does not promise allocator mode or capacity.
+	FVoxelBrickAllocationToken SnapshotAllocation(const FVoxelBrickChunkKey& Key) const;
+
 	// DEBUG REVERSE LOOKUP (2026-09-02, the stolen-cell hunt): which resident
 	// key owns a chunk slot right now, or false if no resident record names it
 	// (freed, or never granted). O(resident) linear scan -- capture-time
@@ -894,7 +960,52 @@ public:
 	// Reserves the complete batch without eviction, then replaces it in one
 	// Flush. False changes no visible pages. Currently the CPU arena allocator
 	// is required; GPU-allocator reservation needs its own verified batch path.
-	bool PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages);
+    // Requires an installed index preflight contract; legacy-only sinks refuse.
+	bool PublishPreparedBatch(const TArray<FVoxelBrickPreparedReplacement>& Pages,
+        FVoxelBrickEvictionPinTicket Ticket = {});
+    // Opaque GT reservation; one outstanding per pool. No resident mutation.
+    // Budget covers additional CPU snapshots and pool metadata/scratch, not the
+    // separately credited index packet or already-owned source GPU payloads.
+    FVoxelBrickPreparedBatchRef PreparePreparedBatch(
+        const TArray<FVoxelBrickPreparedReplacement>& Pages,
+        FVoxelBrickEvictionPinTicket Ticket = {},
+        TConstArrayView<FVoxelBrickChunkKey> ExpectedAbsent = {},
+        uint64 MaxAdditionalBytes = 64ull*1024*1024);
+    bool ValidatePreparedBatch(const FVoxelBrickPreparedBatchRef& Token) const;
+    bool PreparedBatchCoversAbsent(const FVoxelBrickPreparedBatchRef& Token, const FVoxelBrickChunkKey& Key) const;
+    // Validate all participants first, then commit without GT yield/callbacks.
+    // Invalid tokens violate the contract before mutation; no fallible admission
+    // remains after this boundary. Does not itself reveal an actor.
+    void CommitPreparedBatch(const FVoxelBrickPreparedBatchRef& Token);
+    bool CancelPreparedBatch(const FVoxelBrickPreparedBatchRef& Token);
+    // Explicit diagnostic, CPU packs only, <=64 pages / 8MiB / 30 seconds.
+    // Reserves descriptors and claims GPU words without touching Resident/index.
+    // Publication is an explicit diagnostic step below and requires the caller
+    // to supply a complete World freeze and renderer boundary.
+    // Owner-thread observation for a bounded diagnostic producer drain.
+    // Does not itself pause producers, flush queues, or reserve admission.
+    bool PrivateGpuInputsDrained() const;
+    FVoxelPrivateGpuReservationRef BeginPrivateGpuReservation(const TArray<FVoxelBrickPreparedReplacement>& Pages,
+        FVoxelBrickEvictionPinTicket Pins,FString& OutError,uint64 MaxBytes=8ull*1024*1024);
+    EVoxelPrivateGpuReservationStatus PollPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token,FString& OutError);
+    bool CancelPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token);
+    // Diagnostic backend seam only; no World activation or renderer boundary.
+    // After ReadyPrivate, reserve index delivery and host storage. Full absence
+    // membership shares the same pins. Commit allocates no GPU ranges.
+    bool PreparePrivateGpuCommit(const FVoxelPrivateGpuReservationRef& Token,
+        TConstArrayView<FVoxelBrickChunkKey> ExpectedAbsent,FString& OutError,uint64 MaxHostBytes=32ull*1024*1024);
+    bool ValidatePrivateGpuCommit(const FVoxelPrivateGpuReservationRef& Token) const;
+    bool PrivateGpuCommitCoversAbsent(const FVoxelPrivateGpuReservationRef& Token,const FVoxelBrickChunkKey& Key) const;
+    void CommitPrivateGpuReservation(const FVoxelPrivateGpuReservationRef& Token);
+
+#if WITH_DEV_AUTOMATION_TESTS
+    void InitPrivateGpuReservationTestPool(const FVoxelBrickPoolConfig& InConfig);
+#endif
+
+    // GT only, bounded to 8192 total unique keys and 16 live tickets. Absent
+    // keys are protected on subsequent insertion. Overlap is refused atomically.
+    FVoxelBrickEvictionPinTicket AcquireEvictionPins(TConstArrayView<FVoxelBrickChunkKey> Keys);
+    bool ReleaseEvictionPins(FVoxelBrickEvictionPinTicket Ticket);
 
 	// --- P1: GPU-side pool allocation (voxel.GPU.PoolAlloc) ------------------
 	//
@@ -1147,7 +1258,8 @@ public:
 	void PrewarmArenas();
 
 	// Drops every allocation and queues a clear of nothing -- the records are
-	// left as they are, because a Reset with no re-add is only used at teardown.
+	// rotated into a fresh holder. Callers must first quiesce producers and detach
+	// their index; queued RT commands retain the old holder until retirement.
 	void Reset();
 
 	// --- the numbers P2 is gated on ----------------------------------------
@@ -1383,6 +1495,10 @@ private:
 	FVoxelGpuGeometryPool MatArena;    // unit: dwords
 
 	TMap<FVoxelBrickChunkKey, FResidentChunk> Resident;
+    FGuid EvictionPinNonce = FGuid::NewGuid(); // Reset rotates the pool epoch.
+    uint64 NextEvictionPinSerial = 0;
+    TMap<FVoxelBrickChunkKey, uint64> EvictionPins;
+    TMap<uint64, TArray<FVoxelBrickChunkKey>> EvictionPinTickets;
 	// Published from the game thread as Resident is mutated, read from the render
 	// thread. See GetResidentChunkCountAtLevel for why a walk was not an option.
 	std::atomic<int32> LevelChunkCounts[kLevelBuckets] = {};
@@ -1459,6 +1575,20 @@ private:
 	// you land on against the key you looked up -- the record carries its own
 	// OriginVoxel and ring level, in the cache line the lookup already fetched.
 	FVoxelBrickIndexSink IndexSink;
+    FVoxelBrickIndexPreflight IndexPreflight;
+    uint64 IndexSinkGeneration=0;
+    friend class FVoxelBrickPreparedBatch;
+    TSharedPtr<FVoxelBrickPreparedPoolLifetime, ESPMode::ThreadSafe> PreparedLifetime;
+    TWeakPtr<FVoxelBrickPreparedBatch, ESPMode::ThreadSafe> ActivePreparedBatch;
+    FVoxelPrivateGpuReservationRef ActivePrivateGpuReservation;
+    void RetirePrivateGpuReservation(bool Shutdown);
+#if WITH_DEV_AUTOMATION_TESTS
+    bool bPrivateGpuReservationTestPool=false;
+#endif
+
+    void ReleasePreparedBatchState(FVoxelBrickPreparedBatch::FState& State);
+    uint64 IndexMutationSequence=0;
+    void FlushWithPreparedIndex(FVoxelBrickPreparedIndexDeliveryRef Delivery);
 	// Retirements queued since the last flush, in lockstep with PendingClears.
 	// Kept as its own array rather than by widening PendingClears because that
 	// array is handed to the render thread as a plain slot list and the index

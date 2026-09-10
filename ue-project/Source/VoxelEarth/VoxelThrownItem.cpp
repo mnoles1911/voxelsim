@@ -1,4 +1,7 @@
 #include "VoxelThrownItem.h"
+#include "VoxelGameplayActors.h"
+#include "VoxelPlayerRecords.h"
+#include "VoxelEarthPlayerController.h"
 
 #include "Camera/PlayerCameraManager.h"
 #include "Components/StaticMeshComponent.h"
@@ -276,6 +279,8 @@ FAutoConsoleCommandWithWorldAndArgs GThrowableStatCmd(
 
 AVoxelThrownItem::AVoxelThrownItem()
 {
+    bReplicates=true;
+    SetReplicateMovement(true);
 	// Ticks so it can resolve its own collision against the voxel world and its
 	// own crossing of the water surface -- the two things UE cannot do for it.
 	// See the class comment. Once settled the tick interval drops to 4 Hz.
@@ -326,6 +331,7 @@ AVoxelThrownItem::AVoxelThrownItem()
 void AVoxelThrownItem::BeginPlay()
 {
 	Super::BeginPlay();
+	VoxelGameplayActors::FinishRestore(this);
 
 	// A pale tint so a grey cube on grey rock is findable. Best-effort and
 	// deliberately silent on failure, exactly as AVoxelExplosive::BeginPlay
@@ -350,7 +356,11 @@ void AVoxelThrownItem::BeginPlay()
 void AVoxelThrownItem::Launch(const FVector& InitialVelocityUUPerSec, AActor* InThrower,
                               FName InItemId, int32 InCount)
 {
+    if (!HasAuthority()) return;
 	Thrower = InThrower;
+	auto OwnerPlayer=Cast<AVoxelEarthPlayerController>(InThrower);
+	if(!OwnerPlayer) if(auto Pawn=Cast<APawn>(InThrower)) OwnerPlayer=Cast<AVoxelEarthPlayerController>(Pawn->GetController());
+	PersistentOwner=VoxelPlayerRecords::PlayerId(OwnerPlayer);
 	ItemId = InItemId;
 	Count = FMath::Max(1, InCount);
 
@@ -398,7 +408,7 @@ AVoxelThrownItem* AVoxelThrownItem::SpawnAndThrow(UWorld* World, const FVector& 
                                                   const FVector& VelocityUUPerSec,
                                                   AActor* InThrower, FName InItemId, int32 InCount)
 {
-	if (!World)
+	if (!World || World->GetNetMode()==NM_Client)
 	{
 		return nullptr;
 	}
@@ -422,6 +432,7 @@ AVoxelThrownItem* AVoxelThrownItem::SpawnAndThrow(UWorld* World, const FVector& 
 
 void AVoxelThrownItem::Tick(float DeltaSeconds)
 {
+    if (!HasAuthority()) return;
 	Super::Tick(DeltaSeconds);
 
 	if (bSettled)
@@ -848,7 +859,7 @@ void AVoxelThrownItem::TryProximityPickup()
 		// in your inventory before you have seen it land.
 		return;
 	}
-	AActor* T = Thrower.Get();
+	AActor* T = PersistentOwner.IsValid()?VoxelPlayerRecords::ActivePawn(GetWorld(),PersistentOwner):Thrower.Get();
 	if (!T)
 	{
 		return; // nobody to pick it up; the timer will deal with it
@@ -940,6 +951,7 @@ void AVoxelThrownItem::OnReturnTimerExpired()
 
 int32 AVoxelThrownItem::GiveBackToThrower(const TCHAR* Reason)
 {
+	if(PersistentOwner.IsValid()) return VoxelPlayerRecords::Credit(GetWorld(),PersistentOwner,ItemId,Count);
 	AActor* T = Thrower.Get();
 	if (!T)
 	{

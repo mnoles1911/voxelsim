@@ -95,6 +95,7 @@ class FRDGBuilder;
 class FRHICommandListImmediate;
 class FRHIGPUBufferReadback;
 class FVoxelRasterAtlasGpu;
+struct FVoxelWorklistProofMailbox;
 
 // One chunk of pure-worldgen production, 64 bytes, mirrored bit-for-bit by
 // VoxelWorklist.ush's GpuChunkWorkRecord. 16 dwords; the .cpp static_asserts
@@ -143,7 +144,7 @@ struct FVoxelWorklistAssetInstance
 	uint32 SizeY = 0;
 	uint32 SizeZ = 0;
 	uint32 ColStartsBase = 0;
-	uint32 Pad0 = 0;
+	uint32 SuppressTerrainRender = 0;
 };
 static_assert(sizeof(FVoxelWorklistAssetInstance) == 48, "the 48-byte instance IS the contract");
 
@@ -275,6 +276,7 @@ public:
 	static constexpr uint32 kStatsDwords = 20;
 	static constexpr uint32 kStatsClaimEligible = 16;
 
+	FVoxelGpuWorklist();
 	~FVoxelGpuWorklist();
 
 	// Capacity is a latch, not a growth policy: a full ring REFUSES appends
@@ -793,20 +795,16 @@ private:
 	uint32 CumConsumedFold = 0;
 	// One proof in flight at a time. The stash is the host's answer, captured
 	// at the requesting flush; the render side lands the GPU's answer in
-	// file-scope atomics (see .cpp) keyed by ProofSeq.
+	// this instance's lifetime-safe shared mailbox keyed by ProofSeq.
 	bool bProofPending = false;
 	uint32 ProofSeq = 0;
 	uint32 ProofStashTail = 0;
 	uint32 ProofStashConsumed = 0;
 	uint32 ProofStashFold = 0;
+    int64 ProofStashClaims = 0;
 	double LastProofSeconds = 0.0;
 	FProofStatus Proof;
 
-	// --- render-thread-only proof plumbing ----------------------------------
-	// Created lazily inside a Flush render command, polled at the top of each
-	// subsequent one, deleted by a render command from ~FVoxelGpuWorklist
-	// (FVoxelGpuBrickStack's readback-release pattern, verbatim).
-	FRHIGPUBufferReadback* ProofReadback = nullptr;
-	bool bProofCopyInFlight = false;
-	uint32 ProofCopySeq = 0;
+    // Captured independently by queued render commands, never a global mailbox.
+    TSharedPtr<FVoxelWorklistProofMailbox, ESPMode::ThreadSafe> ProofMailbox;
 };

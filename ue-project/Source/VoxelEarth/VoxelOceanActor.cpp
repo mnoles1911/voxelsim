@@ -652,7 +652,7 @@ void AVoxelOceanActor::UpdateFollowPlane()
 {
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
-	if (!PC)
+	if (!PC || !PC->GetPawn())
 	{
 		return;
 	}
@@ -733,7 +733,7 @@ void AVoxelOceanActor::UpdateUnderwaterState(float DeltaTime)
 {
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
-	if (!PC)
+	if (!PC || !PC->GetPawn())
 	{
 		return;
 	}

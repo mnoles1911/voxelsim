@@ -2308,16 +2308,18 @@ void TickOceanConnectivity(FVoxelWaterImpl& Impl, UWorld* World)
 	}
 
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
-	if (PC == nullptr)
+	const bool bHaveCamera = PC && PC->GetPawn();
+	if (!bHaveCamera && !W.bValid)
 	{
-		return; // nothing to centre on; same rule as the implicit sweep
+		return; // No authoritative location from which to initialize the window.
 	}
 	FVector CamUU = FVector::ZeroVector;
 	FRotator UnusedRot = FRotator::ZeroRotator;
-	PC->GetPlayerViewPoint(CamUU, UnusedRot);
-	const int64 CamXMm = VoxelCoords::WorldToMm(CamUU.X);
-	const int64 CamYMm = VoxelCoords::WorldToMm(CamUU.Y);
+	if (bHaveCamera) PC->GetPlayerViewPoint(CamUU, UnusedRot);
 	const int64 HalfMm = FW::kCellMm * int64(FW::kN) / 2;
+	// Keep the published window and tide updates alive during unpossession.
+	const int64 CamXMm = bHaveCamera ? VoxelCoords::WorldToMm(CamUU.X) : W.OriginXMm + HalfMm;
+	const int64 CamYMm = bHaveCamera ? VoxelCoords::WorldToMm(CamUU.Y) : W.OriginYMm + HalfMm;
 	// Min corner snapped DOWN to the cell grid (floorDiv, the one idiom), so a
 	// cell's world footprint never shifts sub-cell between recentres.
 	const int64 WantX = vxc::floorDiv(CamXMm - HalfMm, FW::kCellMm) * FW::kCellMm;
@@ -5957,7 +5959,8 @@ void FlushSweIntoCA(FVoxelWaterImpl& Impl, const TCHAR* Reason)
 
 void MaybeRelatchImplicitOcean(FVoxelWaterImpl& Impl)
 {
-    if (Impl.bImplicitOceanPinned) return;
+	// A restored session owns this setting; process defaults cannot relatch it.
+	if (Impl.bImplicitOceanPinned) return;
 	const bool bWant = CVarVoxelWaterImplicitOcean.GetValueOnGameThread();
 	if (bWant == Impl.bImplicitOcean)
 	{
@@ -6076,7 +6079,7 @@ void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World)
 		AnchorVy = int64(FMath::FloorToDouble(SumY / double(Count)));
 		bHaveAnchor = true;
 	}
-	else if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr)
+	else if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr; PC && PC->GetPawn())
 	{
 		FVector ViewUU = FVector::ZeroVector;
 		FRotator UnusedRot = FRotator::ZeroRotator;
@@ -7639,7 +7642,7 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 			}
 		}
 
-		if (APlayerController* PC = World->GetFirstPlayerController())
+		if (APlayerController* PC = World->GetFirstPlayerController(); PC && PC->GetPawn())
 		{
 			FVector CameraUU = FVector::ZeroVector;
 			FRotator UnusedRot = FRotator::ZeroRotator;
@@ -10135,7 +10138,7 @@ bool UVoxelWaterSubsystem::SaveWaterState() const
 {
     auto Terrain=GetWorld()?GetWorld()->GetSubsystem<UVoxelWorldSubsystem>():nullptr;
     if (!Terrain) return false;
-    const FString Slug=VoxelSave::GetActiveSlug();
+    const FString Slug=VoxelSave::GetActiveSlug(GetWorld());
     return Slug.IsEmpty()?Terrain->SaveWorld():Terrain->SaveWorldToPath(VoxelSave::WorldLogPath(Slug));
 }
 
@@ -10190,7 +10193,7 @@ bool UVoxelWaterSubsystem::RestoreCheckpoint(const TArray<uint8>& Water,const TA
         !Reader.skip(LedgerSize) || !Reader.u32(GraphSize) || uint64(LedgerSize)+16+GraphSize>uint64(Hydrology.Num())) return false;
     const uint8* GraphAt=Hydrology.GetData()+16+LedgerSize;
     if (!Reader.skip(GraphSize)) return false;
-    vxc::RegionBounds Bounds{}; uint8 HasRegion=0,Enabled=0; double Delay=0;
+    vxc::RegionBounds Bounds{}; uint8 HasRegion=0,Enabled=VoxelDebug::GetWaterRivers()?1:0; double Delay=0;
     if (Version==2)
     {
         uint64 X0=0,Y0=0,X1=0,Y1=0,Bits=0;
@@ -10266,7 +10269,7 @@ bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint6
 	// over the same implicit-flood / terrain-solidity callbacks the live pair
 	// uses (FVoxelWaterImpl's constructor) -- this is the load path a genuine
 	// reload runs, isolated so it never touches live state.
-	const FString Slug=VoxelSave::GetActiveSlug();
+	const FString Slug=VoxelSave::GetActiveSlug(GetWorld());
     const FString Logical=Slug.IsEmpty()?GetTerrainSaveFilePath(Impl->Terrain.GetSeed()):VoxelSave::WorldLogPath(Slug);
     VoxelCheckpointStore::FResolved Checkpoint;
     if (!VoxelCheckpointStore::Resolve(Logical,Checkpoint) || !Checkpoint.bSimulation) return false;

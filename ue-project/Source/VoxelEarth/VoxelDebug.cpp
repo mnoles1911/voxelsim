@@ -10,6 +10,7 @@
 #include "Misc/Parse.h"
 #include "Misc/ScopeLock.h"
 #include "VoxelCoords.h"
+#include "UnrealClient.h"
 
 DEFINE_LOG_CATEGORY(LogVoxelStream);
 DEFINE_LOG_CATEGORY(LogVoxelEdit);
@@ -970,6 +971,14 @@ TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeZTrim(
 //
 // One general fix rather than a settle timer per command:
 //   voxel.DeferExec <seconds> <command with args>
+static FAutoConsoleCommand GVoxelScreenshotCmd(
+	TEXT("voxel.Debug.Screenshot"),
+	TEXT("Request a numbered viewport screenshot in the active user Saved/Screenshots directory."),
+	FConsoleCommandDelegate::CreateLambda([]()
+	{
+		FScreenshotRequest::RequestScreenshot(false);
+	}));
+
 static void VoxelDeferExec(const TArray<FString>& Args)
 {
 	if (Args.Num() < 2)

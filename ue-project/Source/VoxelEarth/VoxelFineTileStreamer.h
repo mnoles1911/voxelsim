@@ -286,6 +286,8 @@ public:
 	// The sampler the world/amplifier generates terrain through. Safe to call
 	// from meshing worker threads; see the threading note above.
 	vxc::ITileSampler& WorldSampler() { return Proxy_; }
+	// Identity of the actual live sampler, not a possibly failed configuration.
+	const std::string& ProviderId() const { return ProviderId_; }
 
 	// THE COARSE FALLBACK -- what an absent fine tile resolves to. Without it,
 	// a pixel whose fine tile is not on disk resolves to SEA LEVEL and the
@@ -294,8 +296,11 @@ public:
 	// because only part of the world is fine-baked. Rationale and the
 	// known-absent-only gating live at ResolveNonResidentPixel in the .cpp.
 	// Null by default, so behaviour is unchanged until something wires it.
-	void SetCoarseFallback(vxc::ITileSampler* Sampler) { CoarseFallback_ = Sampler; }
+	void SetCoarseFallback(vxc::ITileSampler* Sampler) { CoarseFallback_ = Sampler; ResidencyEpoch_.fetch_add(1,std::memory_order_relaxed); }
 	vxc::ITileSampler* CoarseFallback() const { return CoarseFallback_; }
+#if WITH_DEV_AUTOMATION_TESTS
+    bool DebugKnownAbsentForTest(vxc::TileCoord Tile) const;
+#endif
 
 	// The ONE query gate callers must honor. Footprint is a column's XY
 	// bounds in WORLD MILLIMETRES (VoxelCoords::WorldToMm), half-open like

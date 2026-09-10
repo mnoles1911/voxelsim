@@ -1635,6 +1635,8 @@ struct FVoxelGpuMeshJobManager::FJob
 	bool bBrickPack = false;
 	bool bBrickResident = false;
 	bool bHoldBrickPublication = false;
+    bool bHeldBrickOnly=false;
+    uint64 HeldAccountedBytes=0;
 	uint64 OwnershipGeneration = 0;
 
 	// --- P1 (voxel.GPU.PoolAlloc): this job claims its own pool ranges -------
@@ -2226,6 +2228,13 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
                                        bool bRequestGpuResidentQuads, bool bLowPriority,
                                        bool bHoldBrickPublication, uint64 OwnershipGeneration)
 {
+    return SubmitInternal(MoveTemp(Region),UserTag,bRequestGpuResidentQuads,bLowPriority,bHoldBrickPublication,OwnershipGeneration,false,0);
+}
+
+uint64 FVoxelGpuMeshJobManager::SubmitInternal(FVoxelGpuRegionRequest&& Region,uint64 UserTag,
+    bool bRequestGpuResidentQuads,bool bLowPriority,bool bHoldBrickPublication,uint64 OwnershipGeneration,
+    bool bHeldBrickOnly,uint64 AccountedBytes)
+{
 	check(IsInGameThread());
 
 	// The per-CHUNK half of this manager's game-thread cost, bracketed
@@ -2239,6 +2248,7 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	Job->JobId = NextJobId++;
 	Job->UserTag = UserTag;
 	Job->bHoldBrickPublication = bHoldBrickPublication;
+    Job->bHeldBrickOnly=bHeldBrickOnly;Job->HeldAccountedBytes=AccountedBytes;
 	Job->OwnershipGeneration = OwnershipGeneration;
 	Job->Region = MoveTemp(Region);
 	// Latched per job rather than read at delivery: a cvar flip between
@@ -2263,7 +2273,7 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	// PHASE 5: brick-only. Read once, here, for the latch reason on bQuadMesh.
 	// VoxelTerrainQuadsRetired is already ANDed with voxel.GPU.BrickPack, so this
 	// cannot turn the mesh chain off on a job that will not pack anything either.
-	Job->bQuadMesh = !VoxelTerrainQuadsRetired();
+	Job->bQuadMesh = !bHeldBrickOnly && !VoxelTerrainQuadsRetired();
 	if (!Job->bQuadMesh)
 	{
 		// bMeshChain is the pre-existing "stop after voxelization" switch the
@@ -2441,6 +2451,7 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 	Result.JobId = Job->JobId;
 	Result.UserTag = Job->UserTag;
 	Result.bPublicationHeld = Job->bHoldBrickPublication;
+    Result.bHeldBrickOnly=Job->bHeldBrickOnly;Result.HeldAccountedBytes=Job->HeldAccountedBytes;
 	Result.OwnershipGeneration = Job->OwnershipGeneration;
 	Result.Status = Status;
 	Result.Error = Error;
@@ -2593,6 +2604,18 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 		Result.Status = EVoxelGpuMeshJobStatus::Rejected;
 		Result.Error = TEXT("Prepared terrain job produced no owned brick payload; publication remains unchanged");
 	}
+    if(Job->bHeldBrickOnly)
+    {
+        check(HeldBrickOnlyJobId==Job->JobId);
+        HeldBrickOnlyJobId=0;
+        // Cancel/timeout callbacks precede legacy async cleanup. Fail closed for
+        // this manager instead of admitting overlapping unaccounted retirements.
+        if (Status!=EVoxelGpuMeshJobStatus::Success && Job->PromotedSeconds>0.0)
+            bHeldBrickRetirementUnproven=true;
+        if(Result.Status==EVoxelGpuMeshJobStatus::Success &&
+            (Result.NumQuads!=0 || !Result.Quads.IsEmpty() || !Result.bPublicationHeld))
+        {Result.Status=EVoxelGpuMeshJobStatus::Rejected;Result.Error=TEXT("Held brick-only contract violated");}
+    }
 	OnJobComplete.ExecuteIfBound(MoveTemp(Result));
 }
 
@@ -3846,10 +3869,10 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		// first grant of each pair leaked, the occ arena filled to 288/288 MiB
 		// and [brick-gpualloc] `unclaimed` ran to -643,164. gpuClaimed lags
 		// hostStaged by the readback latency; it may never EXCEED it.
-		const int64 HostStaged = Worklist.GetCumClaimStaged();
+		const int64 HostStaged = int64(P.ClaimStagedOnHost); // exact landed proof cohort
 		const int64 GpuClaimed = Worklist.GetGpuClaimEligible();
 		const bool bSetAhead = GpuClaimed > HostStaged;
-		const bool bSetShort = GpuClaimed == 0 && HostStaged > 0;
+		const bool bSetShort = P.Landed>0 && GpuClaimed == 0 && HostStaged > 0;
 		UE_LOG(LogVoxelGpuMeshJob, Log,
 		       TEXT("[gpu-worklist] wlclaim conv=%lld hostStaged=%lld gpuClaimed=%lld ")
 		       TEXT("dupRefused=%lld fedNoBit=%lld claimverify checked=%llu mism=%llu ")
@@ -4541,6 +4564,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 						// Payload-relative for now; Flush rebases into the
 						// flush blob as it concatenates.
 						W.ColStartsBase = Inst.ColStartsBase;
+						W.SuppressTerrainRender = Inst.SuppressTerrainRender;
 					}
 					P.ColStarts = Reg.AssetColStarts;
 					P.Spans = Reg.AssetSpans;
@@ -6131,4 +6155,62 @@ void FVoxelGpuMeshJobManager::CancelAll()
 	// InFlight were reset before delivery, so this is still idempotent: a
 	// reentrant CancelAll finds nothing outstanding and enqueues nothing.
 	ReleaseReadbacksOnRenderThread(MoveTemp(Outstanding));
+}
+
+bool FVoxelGpuMeshJobManager::EstimateHeldBrickOnly(const FVoxelGpuRegionRequest& Region,uint64 MaxAccountedBytes,
+    FVoxelGpuHeldBrickBudget& Out,FString& Error)
+{
+    Out={};Error.Reset();
+    constexpr uint64 HardCap=64ull*1024*1024;
+    const uint64 Limit=FMath::Min(MaxAccountedBytes,HardCap);
+    if(Region.DispatchColumns.X!=48 || Region.DispatchColumns.Y!=48 || Region.BricksZ!=6 || Region.QuadWriteBase!=0)
+    {Error=TEXT("Held brick-only pilot requires one48x48x6 apron region and zero quad base");return false;}
+    if (Region.CoarseLevel<0 || Region.CoarseLevel>=int32(FVoxelMarchChunkIndex::kLevels))
+    { Error=TEXT("Held request has invalid coarse level"); return false; }
+    const int64 Scale=int64(1)<<Region.CoarseLevel;
+    const auto SafeAxis=[Scale](int64 Start) { return Start*Scale>=MIN_int32 && (Start+48)*Scale<=MAX_int32; };
+    if (!SafeAxis(Region.OriginVx) || !SafeAxis(Region.OriginVy) || !SafeAxis(int64(Region.BrickZMin)*8))
+    { Error=TEXT("Held request coordinate arithmetic exceeds signed voxel range"); return false; }
+    for (const auto& A:Region.AssetInstances)
+        if (int64(A.AnchorRelVx)-8*Scale<MIN_int32 || int64(A.AnchorRelVy)-8*Scale<MIN_int32)
+        { Error=TEXT("Held asset anchor shift would overflow"); return false; }
+    const uint64 Arrays=uint64(Region.ElevationMm.GetAllocatedSize())+uint64(Region.ClimatePacked.GetAllocatedSize())+
+        uint64(Region.AssetInstances.GetAllocatedSize())+uint64(Region.AssetColStarts.GetAllocatedSize())+uint64(Region.AssetSpans.GetAllocatedSize());
+    if(Arrays>HardCap || Limit==0){Error=TEXT("Held request arrays exceed admission budget");return false;}
+    // Caller, validation copy and derived brick request can coexist. Upload
+    // staging + GPU copies of both request images cost at most four more copies.
+    Out.RequestBytes=3*Arrays;
+    constexpr uint64 Cells=48ull*48*48+32ull*32*32;
+    constexpr uint64 Columns=48ull*48+32ull*32;
+    constexpr uint64 Pack=128ull*4+1024ull*4+8448ull*4+8;
+    constexpr uint64 Scans=4ull*64*4+2*4+512+16;
+    // Two classic/reference columns, two cell images plus winner claims,
+    // private/reference pack buffers, scan scratch and bounded totals/band.
+    Out.TransientBytes=4*Arrays+2*Columns*sizeof(FVoxelGpuColumnSample)+3*Cells*4+2*Pack+2*Scans+4096;
+    // Retained GPU pack, readback/slice buffers, CPU snapshots and decoder copies.
+    // Extra pack/slack covers descriptor/coarse metadata and array allocation rounding.
+    Out.RetainedAndReadbackBytes=8*Pack+4096;
+    Out.TotalBytes=Out.RequestBytes+Out.TransientBytes+Out.RetainedAndReadbackBytes;
+    if(Out.TotalBytes>Limit){Error=TEXT("Held brick-only request exceeds accounted byte budget");return false;}
+    FVoxelGpuRegionRequest Checked=Region;
+    Checked.bMeshChain=false;Checked.BandEdge=0;Checked.bPerChunkBrickTotals=false;Checked.bReadbackBricks=false;
+    if(!VoxelGpuWorldGen::ValidateRegionRequest(Checked,Error))return false;
+    FVoxelGpuRegionRequest Brick;
+    if(!VoxelGpuChunkRegion::MakeBrickRegion(Checked,Brick) || !VoxelGpuWorldGen::ValidateRegionRequest(Brick,Error))
+    {if(Error.IsEmpty())Error=TEXT("Held request cannot derive one canonical brick chunk");return false;}
+    if(Brick.DispatchColumns.X!=32 || Brick.DispatchColumns.Y!=32 || Brick.BricksZ!=4)
+    {Error=TEXT("Held brick request is not one32-cubed chunk");return false;}
+    return true;
+}
+
+uint64 FVoxelGpuMeshJobManager::SubmitHeldBrickOnly(FVoxelGpuRegionRequest&& Region,uint64 UserTag,uint64 OwnershipGeneration,
+    uint64 MaxAccountedBytes,FVoxelGpuHeldBrickBudget& OutBudget,FString& OutError)
+{
+    check(IsInGameThread());OutBudget={};OutError.Reset();
+    if(bHeldBrickRetirementUnproven){OutError=TEXT("Held admission closed after unproven GPU retirement; manager teardown required");return 0;}
+    if(HeldBrickOnlyJobId!=0){OutError=TEXT("A held brick-only job is already outstanding");return 0;}
+    if(!EstimateHeldBrickOnly(Region,MaxAccountedBytes,OutBudget,OutError))return 0;
+    Region.bMeshChain=false;Region.BandEdge=0;Region.bPerChunkBrickTotals=false;Region.bReadbackBricks=false;
+    const uint64 Id=SubmitInternal(MoveTemp(Region),UserTag,false,false,true,OwnershipGeneration,true,OutBudget.TotalBytes);
+    HeldBrickOnlyJobId=Id;return Id;
 }

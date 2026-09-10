@@ -193,6 +193,7 @@ VoxelZstdDll
 # VoxelNoGpuMesh left this list the same day: the fork's default flipped to
 # OFF and the switch became VoxelGpuMesh (the enable arm).
 VoxelAsyncAssetResolve
+VoxelAssetResolveCacheOnly
 VoxelAsyncAssetResolveWarm
 VoxelNoIncrementalAdmission
 VoxelNoBucketedExitScan
@@ -508,6 +509,11 @@ VoxelTreeFelling
 # WAIT longer, it never ends one.
 VoxelLoadingScreenThread
 VoxelLoadGateMaxWait
+# Input to VoxelObjectsNetVerify: test-driver barriers for deletion/server exit.
+# Ignored without that fixture driver; this path alone must not skip the menu.
+VoxelObjectsNetGateFile
+# Configuration: selects an isolated local persistent player credential profile.
+VoxelPlayerProfile
 
 ## SUBSTRING-MATCHED -- ACKNOWLEDGED
 #
@@ -632,3 +638,7 @@ VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive
 # it with -VoxelScreenshotAfter); the five parameters below only shape that
 # injection and are inert without it.
 VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a wake at an offset; the run is ended by the capture switch it is paired with. Matches 'After' by intent, not by accident.
+
+VoxelSessionVerify = Fixture: verifies encrypted player restart or selected-seed world travel and exits through its harness.
+VoxelSessionVerifyDir = Fixture output directory and stop marker for the session process harness.
+VoxelSessionVerifyPlayers = Fixture expected encrypted admission count; session harness input.

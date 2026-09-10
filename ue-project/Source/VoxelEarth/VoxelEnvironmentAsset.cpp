@@ -2,11 +2,21 @@
 namespace {
 const TCHAR* LegacyEnvironmentNames[]={TEXT("temperate-oak"),TEXT("granite-boulder"),TEXT("bramble-thicket"),TEXT("meadow-daisy")};
 const TCHAR* LegacyEnvironmentKinds[]={TEXT("tree"),TEXT("rock"),TEXT("bush"),TEXT("flower")};
+bool IdentityHash(const FString& S){if(S.Len()!=32)return false;for(TCHAR C:S)if(!FChar::IsHexDigit(C))return false;return true;}
+bool ProductionIdentityValid(const FVoxelEnvironmentAssetDescriptor& D){
+    if(!D.ProductionProvenance.IsSet())return true;
+    const auto& P=D.ProductionProvenance.GetValue();const auto& S=P.Source;
+    constexpr int64 Bound=int64(1)<<30;
+    if(D.Legacy||!IdentityHash(P.CanonicalSourceHash)||!S.providerFingerprint||!S.catalogFingerprint||S.yawQuarter>3||D.SeedIndex>MAX_uint16||D.SeedIndex!=S.seedIndex)return false;
+    if(S.anchorVx < -Bound||S.anchorVx > Bound||S.anchorVy < -Bound||S.anchorVy > Bound||S.anchorVz < -Bound||S.anchorVz > Bound)return false;
+    return P.StableId==vxc::assetObjectId(S);
+}
 bool SafeText(const FString& S,int32 Max,bool Empty=false){
     if(S.Len()>Max||(!Empty&&S.IsEmpty()))return false;
     for(TCHAR C:S)if(C<32||C>126)return false;return true;
 }
 bool TextField(FArchive& Ar,FString& S,int32 Max){
+    if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<4)return false;
     int32 N=S.Len();Ar<<N;
     if(Ar.IsError()||N<0||N>Max||(Ar.IsLoading()&&int64(N)>Ar.TotalSize()-Ar.Tell()))return false;
     if(Ar.IsLoading()){TArray<ANSICHAR> Data;Data.SetNumZeroed(N+1);Ar.Serialize(Data.GetData(),N);for(int I=0;I<N;++I)if(Data[I]<32||Data[I]>126)return false;S=ANSI_TO_TCHAR(Data.GetData());}
@@ -17,27 +27,44 @@ bool TextField(FArchive& Ar,FString& S,int32 Max){
 bool FVoxelEnvironmentAssetDescriptor::IsValid() const {
     if(!SafeText(SpecId,128)||!SafeText(Kind,64)||Category!=TEXT("environment"))return false;
     if(!SafeText(SpecHash,128,true)||!SafeText(CatalogHash,128,true)||!SafeText(ProviderHash,128,true))return false;
+    if(!ProductionIdentityValid(*this))return false;
     if(Legacy){for(const auto Name:LegacyEnvironmentNames)if(SpecId==Name)return true;return false;}
-    if(SourceHash.Len()!=32)return false;for(TCHAR C:SourceHash)if(!FChar::IsHexDigit(C))return false;return true;
+    return IdentityHash(SourceHash);
 }
 FVoxelEnvironmentAssetDescriptor FVoxelEnvironmentAssetDescriptor::Prototype(const FString& Name){
     FVoxelEnvironmentAssetDescriptor D;
     for(int I=0;I<4;++I)if(Name==LegacyEnvironmentNames[I]){D.SpecId=Name;D.Kind=LegacyEnvironmentKinds[I];D.Category=TEXT("environment");D.Fellable=I==0;D.Legacy=true;break;}return D;
 }
 bool VoxelEnvironmentAsset::SerializeIdentity(FArchive& Ar,FVoxelEnvironmentAssetDescriptor& D){
+    if(Ar.IsLoading())D=FVoxelEnvironmentAssetDescriptor{};
     int32 Marker=-1;
     if(Ar.IsSaving()){
         if(!D.IsValid())return false;
         if(D.Legacy)for(int I=0;I<4;++I)if(D.SpecId==LegacyEnvironmentNames[I])Marker=I;
     }
+    if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<4)return false;
     Ar<<Marker;if(Ar.IsError())return false;
     if(Marker>=0&&Marker<4){if(Ar.IsLoading())D=FVoxelEnvironmentAssetDescriptor::Prototype(LegacyEnvironmentNames[Marker]);return true;}
     if(Marker!=-1)return false;
-    uint32 Version=1;Ar<<Version;if(Version!=1||Ar.IsError())return false;
+    if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<4)return false;
+    uint32 Version=D.ProductionProvenance.IsSet()?2u:1u;Ar<<Version;if((Version!=1&&Version!=2)||Ar.IsError())return false;
     if(!TextField(Ar,D.SpecId,128)||!TextField(Ar,D.Kind,64)||!TextField(Ar,D.Category,64)||!TextField(Ar,D.SourceHash,32)||
        !TextField(Ar,D.SpecHash,128)||!TextField(Ar,D.CatalogHash,128)||!TextField(Ar,D.ProviderHash,128))return false;
+    if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<5)return false;
     uint8 Flags=D.Fellable?1:0;Ar<<D.SeedIndex<<Flags;if(Flags>1||Ar.IsError())return false;
-    D.Fellable=Flags!=0;D.Legacy=false;return D.IsValid();
+    D.Fellable=Flags!=0;D.Legacy=false;
+    if(Version==2){
+        if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<74)return false; // fixed fields + hash length
+        if(Ar.IsLoading())D.ProductionProvenance.Emplace();
+        auto& P=D.ProductionProvenance.GetValue();auto& S=P.Source;
+        // Fixed-width fields, never native struct bytes/padding.
+        Ar<<S.worldSeed<<S.providerFingerprint<<S.catalogFingerprint;
+        Ar<<S.anchorVx<<S.anchorVy<<S.anchorVz;
+        Ar<<S.bankId<<S.seedIndex<<S.layer<<S.yawQuarter;
+        Ar<<P.StableId.low<<P.StableId.high;
+        if(Ar.IsError()||!TextField(Ar,P.CanonicalSourceHash,32))return false;
+    }
+    return !Ar.IsError()&&D.IsValid();
 }
 int32 VoxelEnvironmentAsset::QuarterYaw(const FTransform& T){
     if(!T.IsValid()||!T.GetScale3D().Equals(FVector::OneVector,1.e-8))return INDEX_NONE;

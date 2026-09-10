@@ -35,6 +35,7 @@ public:
 	AVoxelEarthGameMode();
 
 	virtual void RestartPlayer(AController* NewPlayer) override;
+    virtual void FinishRestartPlayer(AController* NewPlayer,const FRotator& StartRotation) override;
 
 	// --- Front-end seam (docs/front-end-plan.md) -----------------------------
 	//

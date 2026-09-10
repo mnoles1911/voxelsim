@@ -157,7 +157,7 @@ namespace VoxelGpuChunkRegion
 	// every array the request carries. Per chunk that is
 	//
 	//     4 * (ElevationMm.Num() + ClimatePacked.Num())        raster window
-	//   + 44 * AssetInstances.Num()                            instances
+	//   + 48 * AssetInstances.Num()                            instances
 	//   +  4 * (AssetColStarts.Num() + AssetSpans.Num())       span tables
 	//
 	// bytes of malloc + memcpy on the GAME THREAD, once per chunk routed to the
@@ -383,6 +383,8 @@ struct FVoxelGpuMeshJobResult
 	// Nothing about the mesh path depends on it, and dropping it is safe -- it
 	// releases the GPU memory on the render thread.
 	FVoxelGpuBrickPayloadRef BrickVolume;
+    bool bHeldBrickOnly=false;
+    uint64 HeldAccountedBytes=0;
 
 	// Wall-clock, all measured from the game thread's point of view except
 	// DispatchToReadyMs.
@@ -477,6 +479,13 @@ struct FVoxelGpuMeshJobResult
 
 DECLARE_DELEGATE_OneParam(FVoxelGpuMeshJobComplete, FVoxelGpuMeshJobResult&&);
 
+// Conservative per-request accounting; shared world/worklist arenas and RHI
+// allocator granularity remain separate. Explicit pilot hard cap is64MiB.
+struct FVoxelGpuHeldBrickBudget
+{
+    uint64 RequestBytes=0,TransientBytes=0,RetainedAndReadbackBytes=0,TotalBytes=0;
+};
+
 class VOXELEARTHSHADERS_API FVoxelGpuMeshJobManager
 {
 public:
@@ -529,6 +538,13 @@ public:
 	uint64 Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag = 0,
 	              bool bRequestGpuResidentQuads = false, bool bLowPriority = false,
 	              bool bHoldBrickPublication = false, uint64 OwnershipGeneration = 0);
+
+    //0 means synchronous refusal/no callback. Otherwise exactly one ordinary
+    // completion; never generates quads or publishes either pool representation.
+    uint64 SubmitHeldBrickOnly(FVoxelGpuRegionRequest&& Region,uint64 UserTag,uint64 OwnershipGeneration,
+        uint64 MaxAccountedBytes,FVoxelGpuHeldBrickBudget& OutBudget,FString& OutError);
+    static bool EstimateHeldBrickOnly(const FVoxelGpuRegionRequest& Region,uint64 MaxAccountedBytes,
+        FVoxelGpuHeldBrickBudget& OutBudget,FString& OutError);
 
 	// Promotes queued jobs, polls readbacks, delivers finished ones. Game thread
 	// only. Cheap and safe to call every frame with nothing outstanding.
@@ -633,6 +649,10 @@ private:
 	int32 MaxInFlight = 8;
 	FTickStageMs TickStageMs;
 	double TimeoutSeconds = 10.0;
+    uint64 SubmitInternal(FVoxelGpuRegionRequest&& Region,uint64 UserTag,bool bRequestGpuResidentQuads,
+        bool bLowPriority,bool bHoldBrickPublication,uint64 OwnershipGeneration,bool bHeldBrickOnly,uint64 AccountedBytes);
+    uint64 HeldBrickOnlyJobId=0;
+    bool bHeldBrickRetirementUnproven=false;
 	uint64 NextJobId = 1;
 
 	TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>> Queued;

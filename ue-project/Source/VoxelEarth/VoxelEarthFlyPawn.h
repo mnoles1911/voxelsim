@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
 #include "VoxelMovementTuning.h"
+#include "VoxelPlayerMotion.h"
 #include "VoxelEarthFlyPawn.generated.h"
 
 class UCameraComponent;
@@ -126,6 +127,8 @@ public:
 
 	// Public so the debug overlay's "Movement mode" row can flip it.
 	void SetWalkMode(bool bInWalkMode);
+    bool CaptureMotion(FVoxelPlayerMotion& Out) const;
+    bool RestoreMotion(const FVoxelPlayerMotion& State);
 
 protected:
 	virtual void BeginPlay() override;

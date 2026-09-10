@@ -2,6 +2,7 @@
 #include "CoreMinimal.h"
 #include "voxelcore/assetownership.h"
 #include "VoxelGpuMeshJobManager.h"
+#include "VoxelBrickPool.h"
 
 // Presentation bridge for ordinary terrain assets. This class does not spawn
 // actors, edit the terrain or suppress materials. The production renderer must
@@ -31,6 +32,7 @@ struct FPreparedPage
     TArray<uint64> CpuQuads;
     FVoxelGpuBrickPayloadRef GpuBricks;
     FVoxelGpuQuadPayloadRef GpuQuads;
+    bool ValidatedAbsent=false;
 };
 using FAtomicPublish=TFunction<bool(const vxc::AssetOwnershipSnapshot& Before,
                                   const vxc::AssetOwnershipSnapshot& After,
@@ -48,6 +50,12 @@ public:
     bool MarkPageReady(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint8 Backend,uint64 Generation);
     bool StageGpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,FVoxelGpuMeshJobResult&& Result);
     bool StageCpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,FVoxelBrickCpuPackRef Bricks,TArray<uint64>&& Quads);
+    // Absence is explicit evidence, never an invented empty payload. The
+    // publication callback must revalidate the same complete pool token.
+    bool StageAbsentPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,
+                         const FVoxelBrickPool& Pool,const FVoxelBrickPreparedBatchRef& Batch);
+    bool StageAbsentPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,
+                         const FVoxelBrickPool& Pool,const FVoxelPrivateGpuReservationRef& Batch);
     const TArray<FPreparedPage>* PreparedPages(vxc::AssetOwnershipTicket Ticket) const;
     bool Commit(vxc::AssetOwnershipTicket Ticket);
     bool Cancel(vxc::AssetOwnershipTicket Ticket);
@@ -55,6 +63,9 @@ public:
 private:
     vxc::AssetRenderOwnership Ownership;
     FSnapshot Published;
+    // Allocated before the renderer callback; successful publication only
+    // transfers this pointer and performs no snapshot allocation afterward.
+    FSnapshot PreparedSnapshot;
     FAtomicPublish Publish;
     uint8 RequiredBackends;
     vxc::AssetOwnershipTicket StagingTicket;

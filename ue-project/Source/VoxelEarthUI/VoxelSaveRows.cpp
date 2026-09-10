@@ -81,12 +81,11 @@ TArray<FVoxelSaveRowInfo> Build(uint64 RunningSeed)
 		// Only reachable via -VoxelSeed=, so in ordinary play every row is
 		// loadable -- but a row that silently did nothing when clicked would be
 		// far worse than one that says why.
-		if (RunningSeed != 0 && Info.Seed != RunningSeed)
-		{
-			Row.bLoadable = false;
-			Row.DisabledReason = FText::FromString(
-				FString::Printf(TEXT("requires relaunch with -VoxelSeed=%llu"), (unsigned long long)Info.Seed));
-		}
+		// MERGE 2026-09-10 (origin/main #249, session travel): a save with a different seed
+		// is no longer disabled here. UVoxelFrontEndSubsystem::RequestLoad routes it
+		// through VoxelSessionTravel into a fresh world, so every row stays loadable and
+		// RunningSeed is kept only for the signature; the pause LOAD dialog shares this.
+		(void)RunningSeed;
 		Rows.Add(MoveTemp(Row));
 	}
 	return Rows;

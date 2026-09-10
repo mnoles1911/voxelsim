@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 // THE SPECIES BANK LIBRARY -- decoded VXA v3 grids, keyed (species, seed),
 // resident PER SPECIES BANK and never per instance.
 //
@@ -81,6 +82,7 @@ const char* assetBankErrorText(AssetBankError e);
 class AssetBankLibrary : public IAssetBankSource {
 public:
     AssetBankLibrary() = default;
+    uint64_t configurationRevision() const{return revision_.load(std::memory_order_acquire);}
 
     // `manifest` must outlive this library; `root` is the banks directory.
     // Nothing is read here -- banks load on first touch, so a library over
@@ -120,6 +122,7 @@ private:
 
     const Bank& bankFor(uint16_t bankId) const;
 
+    std::atomic<uint64_t> revision_{0};
     const AssetManifest* manifest_ = nullptr;
     std::string root_;
     mutable std::mutex mu_;

@@ -294,7 +294,13 @@ def _build_once(spec: dict, rng: np.random.Generator, voxel_m: float,
         rz = max(m_to_vox(hz * scale, voxel_m), 0.6)
         q = (((gx - c[0]) / rx) ** 2 + ((gy - c[1]) / ry) ** 2
              + ((gz - c[2]) / rz) ** 2)
-        np.maximum(field, 1.0 - np.sqrt(q), out=field)
+        # q is private scratch. Keep the same float32 operations without
+        # retaining the previous lump's whole-grid distance array or allocating
+        # separate sqrt/subtraction arrays on top of it.
+        np.sqrt(q, out=q)
+        np.subtract(1.0, q, out=q)
+        np.maximum(field, q, out=field)
+        del q
 
     relief = _surface_noise((nx, ny, nz), 1.0, int(rng.integers(1 << 30)))
     if rough > 0.0:
@@ -390,21 +396,29 @@ def _build_once(spec: dict, rng: np.random.Generator, voxel_m: float,
             clasts=clasts, clast_r_vox=m_to_vox(clast_size * 0.5, voxel_m),
             clast_hardness=clast_hardness, sets=sets,
             salt=int(rng.integers(1 << 30)))
+        # Durability is the last consumer of the original mass and relief.
+        # Holding them through weathering keeps two full float grids alive
+        # alongside curvature/normal scratch, even though they are never read.
+        del field, relief
         # An arch's legs are the load path and load-bearing rock weathers
         # slower; without this the carve opens a hole and erosion closes it.
         # See `_arch`.
         lp = arch_out.get("load_path")
         if lp is not None and durability is not None:
-            durability = durability.copy()
+            # _durability returns its own clipped array, not shared storage.
             durability[lp] *= ARCH_LEG_HARDNESS
             np.clip(durability, 0.05, 12.0, out=durability)
         elif lp is not None:
             durability = np.where(lp, np.float32(ARCH_LEG_HARDNESS),
                                   np.float32(1.0))
+        del lp, arch_out
         _erode(grid, erode, cavernous, durability, voxel_m=voxel_m,
                notch=(notch, notch_z, notch_spread) if notch > 0.0 else None,
                aspect=(aspect, _unit(rng.normal(size=3) * [1.0, 1.0, 0.35]))
                if aspect > 0.0 else None)
+        del durability
+    else:
+        del field, relief, arch_out
 
     # 3b. exfoliation --------------------------------------------------------
     if exfoliate > 0.0:
@@ -612,6 +626,9 @@ def _surface_noise(shape, rough: float, salt: int) -> np.ndarray:
             # field is exactly grid-shaped.
             n = _fit(n, shape)
         out += n * weight
+        # Do not keep a full-resolution octave alive while drawing the next
+        # octave's float64 RNG field and converting it to float32.
+        del n
     return out * (rough * 0.55)
 
 
@@ -718,7 +735,7 @@ def _durability(shape, gx, gy, gz, field, rng, *, bedding, bed_thick_vox,
     # on its own is (1,1,nz), and slicing that by an x-range gives an empty
     # array rather than an error. Broadcasting before the clip costs one
     # allocation that was going to happen anyway.
-    return np.clip(np.broadcast_to(dur, shape), 0.05, 12.0).astype(np.float32)
+    return np.clip(np.broadcast_to(dur, shape), 0.05, 12.0).astype(np.float32, copy=False)
 
 
 def _clasts(shape, field, rng, count: int, r_vox: float, hardness: float,
@@ -1279,6 +1296,7 @@ def _arch(grid: VoxelGrid, rng, amount: float, out: dict | None = None) -> str:
     # made the same rock pass at one size and fail at another.
     lbl0, n0 = ndimage.label(occ, structure=conn)
     whole0 = (np.bincount(lbl0.ravel())[1:].max() / solid0) if n0 else 0.0
+    del lbl0
 
     nx, ny, nz = grid.data.shape
     ga = np.arange(nx if across == 0 else ny, dtype=np.float32)[:, None] + 0.5
@@ -1410,6 +1428,7 @@ def _arch(grid: VoxelGrid, rng, amount: float, out: dict | None = None) -> str:
         # attempt through as a thin stone ring: every test passed, and the
         # answer was a doughnut. Thickness is what separates an arch from one.
         big = (lbl == main).any(axis=axis)
+        del lbl
         a0, a1, z1 = int(c_a - r_a), int(c_a + r_a), int(base + r_z)
         if a0 <= 0 or a1 >= big.shape[0] or z1 >= big.shape[1]:
             continue
@@ -1641,6 +1660,9 @@ def _facet(grid: VoxelGrid, rng, facets: int, angular: float,
         xs, ys, zs = np.nonzero(occ)
         centre = np.array([xs.mean() + box[0].start, ys.mean() + box[1].start,
                            zs.mean() + box[2].start])
+        # Three int64 arrays per occupied voxel were otherwise retained
+        # through projection and into the next facet's np.nonzero allocation.
+        del xs, ys, zs
 
         if i == 0 and angular > 0.35:
             # A flat top, deliberately, before anything random. It is the single
@@ -1699,10 +1721,13 @@ def _facet(grid: VoxelGrid, rng, facets: int, angular: float,
         if proj.size > 120_000:
             proj = proj[::proj.size // 120_000]
         cut = float(np.quantile(proj, 1.0 - frac))
+        # The sampled view keeps the full gathered projection alive.
+        del proj
         # Wobble the plane so the face comes out broken rather than machined.
         # The quantile is taken on the true plane, so the depth still means what
         # it says; only the surface it leaves behind is roughened.
         sub[occ & (d > cut + (wob if wob is not None else 0.0))] = 0
+        del occ, d
 
 
 def rng_field(shape, salt: int = 0) -> np.ndarray:
@@ -1821,6 +1846,7 @@ def _erode(grid: VoxelGrid, amount: float, cavernous: float, durability,
     box = tuple(slice(max(0, b.start - pad), min(s, b.stop + pad))
                 for b, s in zip(box, grid.data.shape))
     data = grid.data[box]
+    del occ0
 
     span = max(data.shape)
     # The ball the curvature is measured over. Too small and it only sees the
@@ -1989,6 +2015,8 @@ def _erode(grid: VoxelGrid, amount: float, cavernous: float, durability,
             facing = -(gxf * direction[0] + gyf * direction[1]
                        + gzf * direction[2]) / mag
             side = (1.0 + strength * np.clip(facing, -1.0, 1.0)).astype(np.float32)
+            del gxf, gyf, gzf, mag, facing
+        del frac, curv, lean
         if side is not None:
             rate = rate * side
         if band is not None:
@@ -2022,6 +2050,9 @@ def _erode(grid: VoxelGrid, amount: float, cavernous: float, durability,
         if dur is not None:
             chance = chance / np.maximum(dur, 0.05)
         data[shell & (field < chance)] = 0
+        # None of these is an input to the next pass. Release them before its
+        # Gaussian filter and normals allocate their own working arrays.
+        del occ, rate, shell, chance
 
 
 def _flow(grid: VoxelGrid, flutes: float, sigma_vox: float, pans: float,
