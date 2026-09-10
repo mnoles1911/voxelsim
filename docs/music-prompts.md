@@ -37,14 +37,55 @@ Four consequences, each of which reverses a rule of the old plan:
 3. **Flat.** No crescendo, no fanfare, no brass stab, no drum hit. Development is by
    variation, register and thinning, never by building to a peak. A cue may swell gently
    and settle, never arrive.
-4. **One family of instruments.** The whole score is played by the same small band, so
-   any two cues could be from the same evening: piano, harp, nylon-string guitar or lute,
-   hammered dulcimer, solo cello, viola and violin, oboe, cor anglais, clarinet and bass
-   clarinet, low whistle (constrained, see section 4), celesta and music box, soft string
-   pads, and at most a soft frame drum. Two palette colours sit at the edge of the family
-   and are allowed only where section 2 names them: a soft, sustained French horn
-   (Highland and Dusk; never a stab) and bowed vibraphone or crotales (Marsh and
+4. **One family of instruments, never the same band twice.** The score draws on one
+   acoustic family: piano, harp, nylon-string guitar or lute, hammered dulcimer, solo
+   cello, viola and violin, string quartet, oboe, cor anglais, clarinet and bass clarinet,
+   low whistle (constrained, see section 4), celesta and music box, soft string pads, a
+   soft frame drum, plus two palette colours where section 2 names them (a soft sustained
+   French horn in Highland and Dusk, bowed vibraphone or crotales in Marsh and
    Underground). No choir, no vocals, no war horns, no battery, no synth, no accordion.
+   But a family is not a lineup: **no two cues in a pool share a lead instrument, an
+   ensemble, or an opening gesture**, and every cue names one concrete genre or style
+   idiom of its own. The first pass of this plan (2026-09-09) broke that and Suno
+   rendered thirty-one cues that sounded like one. Section 5 carries the levers.
+
+## 1b. Distinctness, the lesson of the first render
+
+Suno keys on the first clause of the style box, on genre words, and on the shape of the
+lyrics box. Thirty-one prompts that all opened "solo X in KEY at N BPM over held strings",
+all cited Soule, all ended with the same negative list and all used the same seven section
+names came back as one piece with the instruments swapped. Background music still has to
+be thirty-one different pieces. So every cue now sets six levers, and section 5 lists
+them per cue; the rules are hard:
+
+1. **Genre idiom**, one concrete tag per cue, used at most three times across the score:
+   Celtic slow air, English pastoral strings, chamber folk, minimalist piano, Nordic
+   folk, Renaissance lute, Appalachian dulcimer, neoclassical strings, ambient drone,
+   music-box lullaby, baroque chorale, Satie-like piano, post-rock ambient (acoustic),
+   Breton harp, sea shanty slowed to a lament, and so on. A composer name may follow the
+   tag once ("in the manner of Vaughan Williams"); "Soule" appears in at most a third of
+   the score.
+2. **Ensemble**, from solo to quartet, and the ensemble is named as a whole: solo piano;
+   guitar duo; harp and clarinet; string quartet; dulcimer with a drone; cello and piano;
+   woodwind trio; plucked consort; bowed metal over contrabass.
+3. **Meter and motion**: 3/4, 4/4, 6/8, 5/4, 7/8 slowly, or free; and whether the piece
+   is sustained (bowed, held) or in motion (plucked ostinato, arpeggio, walking figure).
+   Slow does not mean static; half the score should have a gentle pulse.
+4. **Opening gesture**, different for every cue in a pool: begins mid-texture; begins on a
+   single repeated note; begins with the bass alone; begins with a chord and silence;
+   begins with an ostinato already running; begins with two instruments in unison; begins
+   with a rising scale; begins on a drone that only later becomes a chord.
+5. **Structural shape**, one of: theme and variations; ground bass or passacaglia;
+   two-part with a contrasting middle; rondo (the opening idea returns between episodes);
+   slow chorale; ostinato piece that changes harmony under a fixed figure; call and
+   response between two instruments; ambient drift with no theme; arch (thin, fuller, thin)
+   without a climax. Section boxes are written to the shape, so no two cues in a pool
+   share a section list.
+6. **Space**: close and dry; small wooden room; open field; stone hall; cathedral tail;
+   cave; "inside the music box".
+
+The negative list stays, but it is placed last and kept short, and the phrase "no
+crescendo, no climax" is the only wording every cue repeats.
 
 ## 2. The palettes: biomes, not factions
 
@@ -116,692 +157,702 @@ Lirien-Thal MP4 is retired with the Town set, so it no longer needs re-encoding.
 - **Render**: best take, stereo 48 kHz 16-bit PCM WAV, into the pool folder named in
   section 3. The filename is the on-screen track title; use the titles below.
 
-## 5. Inventory of the 31 new cues
+## 5. Inventory of the 31 new cues, with their levers
 
-| # | pool | title | palette | key | BPM | lead | len |
-|---|---|---|---|---|---|---|---|
-| D1 | Explore/Day | Slow Fields | Meadow | G Mixolydian | 60 | nylon guitar + oboe | 6:00 |
-| D2 | Explore/Day | Under Tall Pines | Forest | A Lydian | 54 | harp + clarinet | 6:00 |
-| A1 | Explore/Dawn | First Light on the Meadow | Meadow | B♭ Lydian | 56 | solo oboe | 5:00 |
-| A2 | Explore/Dawn | Mist Off the River | Coast | A♭ Mixolydian | 58 | low whistle (constrained) | 5:00 |
-| A3 | Explore/Dawn | Frost Lifting | Highland | E Lydian | 50 | piano + cello harmonics | 5:00 |
-| K1 | Explore/Dusk | Long Shadows Home | Meadow | G Aeolian | 56 | viola + soft horn | 5:30 |
-| K2 | Explore/Dusk | Last Light on the Water | Coast | B Mixolydian | 52 | cello + hammered dulcimer | 5:30 |
-| K3 | Explore/Dusk | The Woods Go Quiet | Forest | F Dorian | 50 | clarinet + harp | 5:30 |
-| N1 | Explore/Night | Starfall | Meadow | E♭ Lydian | 46 | solo piano | 6:00 |
-| N2 | Explore/Night | Moonrise Through Leaves | Forest | A♭ Aeolian | 44 | celesta + harp | 6:00 |
-| N3 | Explore/Night | Cold Stars | Highland | F♯ Dorian | 48 | muted horn + string harmonics | 6:00 |
-| N4 | Explore/Night | The Owl Hours | Marsh | C Aeolian drone | 42 | bass clarinet + bowed vibraphone | 6:00 |
-| N5 | Explore/Night | Embers on the Road | Meadow | G Dorian | 50 | lute-guitar + viola | 6:00 |
-| N6 | Explore/Night | Lantern in the Window | Meadow | C Lydian | 44 | cello harmonics + celesta | 6:00 |
-| R1 | Explore/Rain | Rain on the Road | Meadow | C♯ Dorian | 50 | piano + harp | 6:00 |
-| R2 | Explore/Rain | The Storm Passing | Highland | E♭ Dorian | 48 | cor anglais | 6:00 |
-| R3 | Explore/Rain | Under the Eaves | Hearth | B♭ Dorian | 46 | guitar + soft pad | 6:00 |
-| H1 | Hearth | Turned Earth | Hearth/Meadow | F Mixolydian | 62 | nylon guitar + frame drum (soft) | 6:00 |
-| H2 | Hearth | Sawdust | Hearth | D Mixolydian | 58 | hammered dulcimer + piano | 6:00 |
-| H3 | Hearth | The Bench by the Fire | Hearth | A Dorian | 54 | piano + cello | 6:30 |
-| H4 | Hearth | Stone on Stone | Hearth/Highland | E♭ Mixolydian | 60 | dulcimer + viola | 6:00 |
-| H5 | Hearth | Supper | Hearth | B♭ Ionian (major) | 56 | guitar + oboe | 6:00 |
-| H6 | Hearth | The Day's Work Done | Hearth | F♯ Aeolian | 48 | music box + piano | 6:30 |
-| C1 | Cave | Drip and Dark | Underground | no centre (A drone) | 40 | bowed crotales + contrabass | 7:00 |
-| C2 | Cave | The Sleeping Stone | Underground | A♭ Phrygian | 46 | bass clarinet + cello | 6:30 |
-| W1 | Water | Slack Water | Coast | B Dorian | 54 | viola + hammered dulcimer | 6:00 |
-| W2 | Water | The Far Shore | Coast | E Mixolydian | 60 | low whistle (constrained) + harp | 6:00 |
-| X1 | Danger | Something in the Trees | Forest | G Phrygian | 84 | low strings ostinato + frame drum | 4:00 |
-| X2 | Danger | Held Breath | Marsh | B♭ Aeolian | 72 | cello + bowed metal + soft drum | 4:00 |
-| M1 | Menu | Prelude, a Quiet Morning | Meadow | F Lydian | 52 | piano + harp | 5:00 |
-| M2 | Menu | Prelude, After Dark | Highland | E Aeolian | 46 | cello + celesta | 5:00 |
+Pool, title, key, BPM and length are fixed; the six levers of section 1b are fixed too,
+so that no two cues in a pool share a lead, an ensemble, an idiom or an opening.
 
-Keys are unique within each pool. Danger is the only pool above 72 BPM and it still has
-no brass and no battery; it is a raised pulse, not a battle.
+| # | pool | title | key | BPM | meter | idiom | ensemble (lead first) | opening | shape | space |
+|---|---|---|---|---|---|---|---|---|---|---|
+| D1 | Explore/Day | Slow Fields | G Mixolydian | 66 | 3/4 | English pastoral strings (Vaughan Williams) | string quartet, oboe over it | begins mid-texture, quartet already moving | two-part with a contrasting middle | open field |
+| D2 | Explore/Day | Under Tall Pines | A Lydian | 54 | 4/4 free | Breton harp | harp and clarinet | harp alone, one arpeggio repeated | rondo | small wooden room |
+| A1 | Explore/Dawn | First Light on the Meadow | B♭ Lydian | 58 | 6/8 | Celtic slow air | solo oboe, then guitar | single repeated note, then the air | theme and variations | open field |
+| A2 | Explore/Dawn | Mist Off the River | A♭ Mixolydian | 60 | 4/4 | Nordic folk (Valheim-like) | low whistle (constrained), dulcimer, cello | bass alone (cello), the whistle after | ground bass | open field, water |
+| A3 | Explore/Dawn | Frost Lifting | E Lydian | 48 | free | minimalist piano (Einaudi-like) | solo piano, cello harmonics late | a chord and silence | arch without climax | stone hall |
+| K1 | Explore/Dusk | Long Shadows Home | G Aeolian | 56 | 3/4 | chamber folk | viola, guitar, soft horn late | two instruments in unison | call and response | small wooden room |
+| K2 | Explore/Dusk | Last Light on the Water | B Mixolydian | 52 | 6/8 | Appalachian dulcimer | hammered dulcimer, cello, harp | ostinato already running | ostinato with changing harmony | open field, water |
+| K3 | Explore/Dusk | The Woods Go Quiet | F Dorian | 50 | 5/4 | neoclassical strings (Arnalds-like) | string quartet, clarinet | rising scale in the cello | slow chorale | cathedral tail |
+| N1 | Explore/Night | Starfall | E♭ Lydian | 44 | free | Satie-like piano | solo piano | a chord and silence | theme and variations | close and dry |
+| N2 | Explore/Night | Moonrise Through Leaves | A♭ Aeolian | 46 | 4/4 | music-box lullaby | celesta, harp, bass clarinet once | drone that becomes a chord | ambient drift | inside the music box |
+| N3 | Explore/Night | Cold Stars | F♯ Dorian | 48 | 4/4 | Nordic folk, hymn-like | soft horn, string harmonics, piano | bass alone (piano low octave) | slow chorale | stone hall |
+| N4 | Explore/Night | The Owl Hours | C Aeolian | 42 | free | ambient drone | bass clarinet, bowed vibraphone, contrabass | drone that becomes a chord | ambient drift | cave |
+| N5 | Explore/Night | Embers on the Road | G Dorian | 52 | 6/8 | Renaissance lute | lute, viola | lute alone, one figure repeated | ground bass | small wooden room |
+| N6 | Explore/Night | Lantern in the Window | C Lydian | 40 | 3/4 | post-rock ambient, acoustic | cello harmonics, celesta, soft pad | begins mid-texture, pad already sounding | arch without climax | cathedral tail |
+| R1 | Explore/Rain | Rain on the Road | C♯ Dorian | 54 | 4/4 | minimalist piano (Nils Frahm-like) | piano, harp, viola | ostinato already running | ostinato with changing harmony | close and dry |
+| R2 | Explore/Rain | The Storm Passing | E♭ Dorian | 46 | free | English pastoral, wind-led | cor anglais, string quartet, distant timpani roll | rising scale in the cor anglais | two-part with a contrasting middle | open field |
+| R3 | Explore/Rain | Under the Eaves | B♭ Dorian | 50 | 3/4 | chamber folk, guitar duo | two nylon guitars | two instruments in unison | rondo | small wooden room |
+| H1 | Hearth | Turned Earth | F Mixolydian | 68 | 4/4 | Appalachian dulcimer with guitar | dulcimer, guitar, soft frame drum | ostinato already running | ostinato with changing harmony | close and dry |
+| H2 | Hearth | Sawdust | D Mixolydian | 62 | 6/8 | chamber folk, fiddle-led (slow) | violin, guitar, cello | violin alone, one phrase repeated | theme and variations | small wooden room |
+| H3 | Hearth | The Bench by the Fire | A Dorian | 54 | 4/4 | minimalist piano with cello | piano, cello | piano bass alone | call and response | close and dry |
+| H4 | Hearth | Stone on Stone | E♭ Mixolydian | 60 | 5/4 | Nordic folk, plucked | plucked consort: lute, harp, dulcimer | begins mid-texture | rondo | stone hall |
+| H5 | Hearth | Supper | B♭ major | 58 | 3/4 | Stardew-like waltz, acoustic | guitar, oboe, clarinet | a chord and silence, then the waltz | two-part with a contrasting middle | small wooden room |
+| H6 | Hearth | The Day's Work Done | F♯ Aeolian | 44 | free | music-box lullaby with piano | music box, piano | music box alone, one turn of the figure | ambient drift | inside the music box |
+| C1 | Cave | Drip and Dark | A drone | 40 | free | ambient drone, bowed metal | bowed crotales, contrabass, harp harmonics | drone that becomes a chord | ambient drift | cave |
+| C2 | Cave | The Sleeping Stone | A♭ Phrygian | 46 | 4/4 | baroque chorale, low | bass clarinet, cello, viola | bass alone | slow chorale | cave |
+| W1 | Water | Slack Water | B Dorian | 54 | 6/8 | sea shanty slowed to a lament | viola, dulcimer, harp | rising scale in the viola | ground bass | open field, water |
+| W2 | Water | The Far Shore | E Mixolydian | 60 | 4/4 | Celtic slow air | low whistle (constrained), harp, cello | harp alone, one arpeggio repeated | theme and variations | open field, water |
+| X1 | Danger | Something in the Trees | G Phrygian | 84 | 7/8 | neoclassical strings, tense | low strings ostinato, frame drum, clarinet | ostinato already running | ostinato with changing harmony | stone hall |
+| X2 | Danger | Held Breath | B♭ Aeolian | 72 | 4/4 | ambient drone, tense | cello, bowed metal, soft drum | drone that becomes a chord | arch without climax | cave |
+| M1 | Menu | Prelude, a Quiet Morning | F Lydian | 52 | 3/4 | baroque chorale, bright | piano, harp, oboe | two instruments in unison | slow chorale | cathedral tail |
+| M2 | Menu | Prelude, After Dark | E Aeolian | 46 | free | neoclassical strings, nocturne | cello, celesta, string quartet | bass alone (cello) | theme and variations | stone hall |
+
+Keys are unique within each pool; leads, ensembles, idioms and openings are unique within
+each pool; tempos are spread 40-68 outside Danger. Danger keeps a pulse and stays under 90.
 
 ## 6. The prompts
 
-One entry per cue in the section 5 order: **title, key, BPM, lead, palette, length**, a
-style box and a structure box. Written to the rules of section 4.
+One entry per cue in the section 5 order: **title, key, BPM, meter, idiom, ensemble,
+length**, a style box and a structure box. Written to sections 1b and 4: the first clause
+is the ensemble, idiom and key; the section list follows the cue's shape; the opening
+gesture is the first section.
 
 ---
 
 **Slow Fields**
-*Key G Mixolydian · 60 BPM · Meadow · nylon guitar + oboe · instrumental · 6:00*
+*Key G Mixolydian · 66 BPM · 3/4 · English pastoral strings (Vaughan Williams) · string quartet, oboe over it · instrumental · 6:00*
 
 Style prompt:
 ```
-Nylon-string guitar in G Mixolydian at 60 BPM, warm open meadow air, a quiet oboe answering over soft string pads. Flat dynamics, no pulse; variation and thinning. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax. No flute glissando, no pitch sweeps, no portamento, no octave runs, no whistle effects.
+A string quartet with an oboe above it, English pastoral writing in G Mixolydian, 66 BPM in a slow 3/4 that turns. The bows are long; the oboe keeps simple steady stepwise lines in a fixed register. Open field, wide air. Flat dynamics; variation, register and thinning. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax. No glissando, no pitch sweeps, no portamento.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo nylon guitar, slow G Mixolydian figure, open air, no pulse]
-[Instrumental A - oboe enters above with a plain stepwise line in one register]
-[Instrumental B - soft string pads underneath, the guitar figure moves down a register]
-[Instrumental Development - the same figure varied, oboe answering later each time]
-[Instrumental Drift - guitar alone, notes taken away, dynamics unchanged]
-[Instrumental Hush - one held pad note, oboe silent, almost nothing]
-[Instrumental Reprise - guitar and oboe return, no louder than the opening]
-[Instrumental Outro - guitar last, one open chord, very long quiet tail]
+[Instrumental Part One - the quartet is already moving as the cue begins, a turning 3/4 in G Mixolydian, no introduction]
+[Instrumental Part One Widens - the oboe enters above with a plain stepwise line, one register only]
+[Instrumental Part One Lower - the quartet takes the same material down, violas leading]
+[Instrumental Middle - a contrasting idea, quartet alone, longer bows, oboe resting]
+[Instrumental Middle Thinned - two voices of the quartet only, the field very wide]
+[Instrumental Part One Returns - the opening turn comes back at the opening level, oboe above]
+[Instrumental Part One Thinned - notes taken away, the 3/4 still turning underneath]
+[Instrumental Long Tail - one held quartet chord, oboe gone, very long quiet tail]
 ```
 
 ---
 
 **Under Tall Pines**
-*Key A Lydian · 54 BPM · Forest · harp + clarinet · instrumental · 6:00*
+*Key A Lydian · 54 BPM · 4/4 free · Breton harp · harp and clarinet · instrumental · 6:00*
 
 Style prompt:
 ```
-Harp in A Lydian at 54 BPM, small repeating figures under a low soft clarinet, held chords on string pads, celesta touching a note now and then. Shaded forest light, flat dynamics, no pulse; development by variation, register and thinning only. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Harp and clarinet, the Breton harp idiom, A Lydian at 54 BPM in a loose 4/4 you could not tap: the arpeggio never stops and the clarinet holds long above it. Recorded in a small wooden room, close and woody. The shaded calm of Soule's Skyrim forests. Flat dynamics; development by variation, register and thinning. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo harp, a small A Lydian figure, long gaps]
-[Instrumental A - low clarinet enters beneath, one slow line, shaded]
-[Instrumental B - string pads hold a chord under both, celesta adds single notes]
-[Instrumental Development - the harp figure varied and moved higher, clarinet resting]
-[Instrumental Drift - pads and celesta only, the figure implied not played]
-[Instrumental Hush - harp alone, three notes, very quiet]
-[Instrumental Reprise - clarinet returns once at the opening level, no louder]
-[Instrumental Outro - harp and one held pad chord, very long quiet tail]
+[Instrumental Refrain - harp alone, one A Lydian arpeggio repeated, small wooden room]
+[Instrumental Episode 1 - clarinet enters long and low above the arpeggio]
+[Instrumental Refrain - the harp arpeggio returns unchanged, clarinet resting]
+[Instrumental Episode 2 - the harmony under the arpeggio moves, clarinet answering]
+[Instrumental Refrain - the arpeggio again, a register lower, same level]
+[Instrumental Episode 3 - clarinet alone over a held harp chord, shaded]
+[Instrumental Refrain Thinned - the arpeggio with notes missing, still turning]
+[Instrumental Long Tail - one harp chord in the wooden room, very long quiet tail]
 ```
 
 ---
 
 **First Light on the Meadow**
-*Key B♭ Lydian · 56 BPM · Meadow · solo oboe · instrumental · 5:00*
+*Key B♭ Lydian · 58 BPM · 6/8 · Celtic slow air · solo oboe, then guitar · instrumental · 5:00*
 
 Style prompt:
 ```
-Solo oboe in B♭ Lydian at 56 BPM over harp and soft string pads, warm and open, the first hour of daylight. Flat dynamics, no pulse; variation and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax. No flute glissando, no pitch sweeps, no portamento, no octave runs, no whistle effects.
+Over a nylon guitar, a solo oboe carries a Celtic slow air in B♭ Lydian, 58 BPM, a lilting 6/8 that rolls. The oboe keeps simple steady stepwise lines in a fixed register. Open field at first light. Flat dynamics; variation, register and thinning, never a build. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax. No glissando, no pitch sweeps, no portamento.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - soft string pad alone, one B♭ Lydian chord opening]
-[Instrumental A - solo oboe enters, a plain stepwise line in a fixed register]
-[Instrumental B - harp underneath in slow open figures, the pad thinning]
-[Instrumental Development - the oboe line varied, harp moving to a lower register]
-[Instrumental Hush - harp alone, oboe silent, very quiet]
-[Instrumental Reprise - oboe returns with the opening line, unchanged in level]
-[Instrumental Outro - pad and one last oboe note, very long quiet tail]
+[Instrumental Theme - one oboe note repeated alone, then the slow air opens out in B♭ Lydian]
+[Instrumental Variation 1 - nylon guitar joins beneath in a lilting 6/8, the air unchanged]
+[Instrumental Variation 2 - the air ornamented lightly, still one register]
+[Instrumental Variation 3 - guitar takes the air, the oboe holding one note]
+[Instrumental Variation 4 - the air with notes removed, wide open field]
+[Instrumental Theme Lower - the air a fifth down, guitar rolling under it]
+[Instrumental Theme Returns - the air as at the opening, no louder]
+[Instrumental Long Tail - guitar last, one open chord, very long quiet tail]
 ```
 
 ---
 
 **Mist Off the River**
-*Key A♭ Mixolydian · 58 BPM · Coast · low whistle (constrained) · instrumental · 5:00*
+*Key A♭ Mixolydian · 60 BPM · 4/4 · Nordic folk (Valheim-like) · low whistle (constrained), dulcimer, cello · instrumental · 5:00*
 
 Style prompt:
 ```
-Low whistle in A♭ Mixolydian at 58 BPM, simple steady stepwise lines in a fixed register, over cello and open fifths on harp. Cool river mist, flat dynamics, no pulse. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax. No flute glissando, no pitch sweeps, no portamento, no octave runs, no whistle effects.
+Low whistle, dulcimer and cello playing Nordic folk in A♭ Mixolydian, 60 BPM, a walking 4/4. The whistle keeps simple steady stepwise lines in a fixed register; the cello's ground never stops. Valheim's calm. Open field and water. Flat dynamics; variation and thinning. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax. No glissando, no pitch sweeps, no portamento.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - harp in slow open fifths, mist on water, no pulse]
-[Instrumental A - low whistle enters, simple steady stepwise line, fixed register]
-[Instrumental B - solo cello holds a low note beneath, harp thinning]
-[Instrumental Development - the whistle line varied stepwise, still one register]
-[Instrumental Hush - cello and harp only, whistle silent]
-[Instrumental Reprise - whistle returns with the opening line, same level]
-[Instrumental Outro - harp last over a held cello note, very long quiet tail]
+[Instrumental Ground - the cello alone, a low A♭ Mixolydian ground, walking 4/4, mist on water]
+[Instrumental Variation 1 - low whistle enters above, simple steady stepwise line, fixed register]
+[Instrumental Variation 2 - hammered dulcimer fills between them, the ground unchanged]
+[Instrumental Variation 3 - the whistle line varied stepwise, dulcimer thinning]
+[Instrumental Variation 4 - dulcimer alone over the ground, whistle resting]
+[Instrumental Variation 5 - whistle returns lower, the ground still walking]
+[Instrumental Ground Bare - the cello's ground with nothing above it]
+[Instrumental Long Tail - the ground slowing to one held note, very long quiet tail]
 ```
 
 ---
 
 **Frost Lifting**
-*Key E Lydian · 50 BPM · Highland · piano + cello harmonics · instrumental · 5:00*
+*Key E Lydian · 48 BPM · free · minimalist piano (Einaudi-like) · solo piano, cello harmonics late · instrumental · 5:00*
 
 Style prompt:
 ```
-Solo piano in E Lydian at 50 BPM, cold and sparse, with cello harmonics held far behind it and a thin string pad. Long mountain reverb, wide space between notes, flat dynamics, no pulse; the piece develops only by variation, register and thinning. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Solo piano, with cello harmonics arriving late: minimalist writing in E Lydian, 48 BPM, unmetered, with no pulse to tap. Einaudi-like, plain and repeating, wide gaps between the notes. A stone hall with a long tail around every one of them. Flat dynamics; the piece fills in and empties out, never gets louder. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo piano, single E Lydian notes far apart, long reverb]
-[Instrumental A - cello harmonics enter high and thin behind the piano]
-[Instrumental B - a cold string pad underneath, the piano figure widening in register]
-[Instrumental Development - the figure varied, fewer notes each time, no louder]
-[Instrumental Hush - cello harmonics alone, piano silent]
-[Instrumental Reprise - piano returns with the opening notes, unchanged in level]
-[Instrumental Outro - one low piano note under a held harmonic, very long quiet tail]
+[Instrumental Thin - one E Lydian piano chord, then silence in the stone hall, unmetered]
+[Instrumental Filling - a second chord, then a third, the gaps shortening]
+[Instrumental Fuller - a plain repeating figure in the left hand, still quiet]
+[Instrumental Fullest, Still Quiet - cello harmonics arrive high above the figure, no louder]
+[Instrumental Emptying - the figure loses notes, the harmonics holding longer]
+[Instrumental Thin Again - single chords with silence between, as at the opening]
+[Instrumental Last Chord - one chord alone, a cello harmonic fading over it]
+[Instrumental Long Tail - the stone hall's tail alone, very long and quiet]
 ```
 
 ---
 
 **Long Shadows Home**
-*Key G Aeolian · 56 BPM · Meadow · viola + soft horn · instrumental · 5:30*
+*Key G Aeolian · 56 BPM · 3/4 · chamber folk · viola, guitar, soft horn late · instrumental · 6:00*
 
 Style prompt:
 ```
-Solo viola in G Aeolian at 56 BPM, warm and low, with a soft distant horn answering once a phrase over string pads and nylon guitar. Late-afternoon meadow light, flat dynamics, no pulse; development by variation, register and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Chamber folk for viola and nylon guitar, with a soft sustained horn entering late: G Aeolian, 56 BPM, a slow 3/4 that leans into every bar. The viola's bows are long and the guitar answers rather than accompanies. A small wooden room, close, little reverb. Flat dynamics; variation, register and thinning. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo viola, one slow G Aeolian phrase, warm and low]
-[Instrumental A - nylon guitar underneath in a plain repeating figure]
-[Instrumental B - a soft distant horn answers the viola once, quietly, then rests]
-[Instrumental Development - the viola phrase varied, guitar moving to a lower register]
-[Instrumental Drift - string pad only, both leads resting]
-[Instrumental Hush - viola alone, two notes, very quiet]
-[Instrumental Reprise - the horn answers once more, no louder than before]
-[Instrumental Outro - guitar and a held pad chord, very long quiet tail]
+[Instrumental Call - viola and guitar in unison, one leaning G Aeolian phrase in 3/4]
+[Instrumental Response - the guitar answers alone, the same phrase shortened]
+[Instrumental Call - viola alone, long bows, the phrase taken lower]
+[Instrumental Response - a soft horn answers from further off, one phrase only, never a stab]
+[Instrumental Call - guitar leads, the viola answering inside the phrase]
+[Instrumental Response - horn and viola answer together, no louder than before]
+[Instrumental Call Alone - viola with no answer at all, the room very close]
+[Instrumental Long Tail - guitar last, one open chord, very long quiet tail]
 ```
 
 ---
 
 **Last Light on the Water**
-*Key B Mixolydian · 52 BPM · Coast · cello + hammered dulcimer · instrumental · 5:30*
+*Key B Mixolydian · 52 BPM · 6/8 · Appalachian dulcimer · hammered dulcimer, cello, harp · instrumental · 6:00*
 
 Style prompt:
 ```
-Solo cello in B Mixolydian at 52 BPM over hammered dulcimer in rolling open fifths, harp beneath. Slow water, flat dynamics, no pulse to tap; development by variation, register and thinning only, never a peak. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Hammered dulcimer leading cello and harp through Appalachian writing in B Mixolydian, 52 BPM, a rolling 6/8. The dulcimer figure never stops; the cello's bows are long underneath it. Open field and water at last light. Soule's Oblivion at its quietest. Flat dynamics; variation, register and thinning only. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - hammered dulcimer alone, rolling open fifths, slow water]
-[Instrumental A - solo cello enters with one long B Mixolydian line]
-[Instrumental B - harp joins beneath, dulcimer thinning to single strikes]
-[Instrumental Development - the cello line varied and taken lower, dulcimer resting]
-[Instrumental Drift - harp and dulcimer only, no melody, level unchanged]
-[Instrumental Hush - cello alone on one held note]
-[Instrumental Reprise - dulcimer returns with the opening figure, same level]
-[Instrumental Outro - dulcimer last under a held cello note, very long quiet tail]
+[Instrumental Figure Alone - the dulcimer ostinato already running as the cue begins, rolling 6/8]
+[Instrumental Harmony Shifts - the cello moves the chord beneath, the figure unchanged]
+[Instrumental Harmony Shifts Again - harp adds open fifths, a second chord change]
+[Instrumental Figure Lower - the same ostinato an octave down, cello holding]
+[Instrumental New Harmony Under the Figure - the chord darkens, level unchanged]
+[Instrumental Harp Takes the Figure - dulcimer resting, the figure still turning]
+[Instrumental Figure Thins - notes dropped from the ostinato, the water flattening]
+[Instrumental Long Tail - one held cello note under a last dulcimer strike, very long quiet tail]
 ```
 
 ---
 
 **The Woods Go Quiet**
-*Key F Dorian · 50 BPM · Forest · clarinet + harp · instrumental · 5:30*
+*Key F Dorian · 50 BPM · 5/4 · neoclassical strings (Arnalds-like) · string quartet, clarinet · instrumental · 6:00*
 
 Style prompt:
 ```
-Low clarinet in F Dorian at 50 BPM over harp figures and held string-pad chords, celesta touching one note now and then. Shaded, thinning light, flat dynamics, no pulse; the piece develops by variation, register and thinning only. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+This is a slow chorale for string quartet and clarinet, neoclassical, F Dorian at 50 BPM in an uneven 5/4 that never hurries. The bows are long and the harmony moves one chord at a time. Arnalds-like. A cathedral tail stands behind everything. Flat dynamics; variation, register and thinning, never a peak. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - harp alone, a small F Dorian figure, shaded]
-[Instrumental A - low clarinet enters with one slow line, unhurried]
-[Instrumental B - string pads hold beneath, celesta places single notes]
-[Instrumental Development - the harp figure varied and thinned, clarinet lower]
-[Instrumental Drift - celesta and pad only, the woods emptying]
-[Instrumental Hush - harp alone, two notes, very quiet]
-[Instrumental Reprise - clarinet returns with the opening line, no louder]
-[Instrumental Outro - one held pad chord under a last harp note, very long quiet tail]
+[Instrumental Verse 1 - the cello alone climbs a slow F Dorian scale, uneven 5/4, cathedral tail]
+[Instrumental Verse 2 - the quartet answers in long-bowed chords, one chord per bar]
+[Instrumental Verse 3 - clarinet holds a line above the chorale, shaded]
+[Instrumental Verse 4 - the same chords a register lower, viola on top]
+[Instrumental Verse 5 - two voices only, the woods emptying, level unchanged]
+[Instrumental Verse 6 - the cello's rising scale returns under the chorale]
+[Instrumental Last Verse - one chord held, the clarinet silent]
+[Instrumental Long Tail - the cathedral tail alone, very long and quiet]
 ```
 
 ---
 
 **Starfall**
-*Key E♭ Lydian · 46 BPM · Meadow · solo piano · instrumental · 6:00*
+*Key E♭ Lydian · 44 BPM · free · Satie-like piano · solo piano · instrumental · 6:00*
 
 Style prompt:
 ```
-Solo piano in E♭ Lydian at 46 BPM, felt hammers, very slow, wide space between notes, a thin string pad far underneath. Open night sky over meadow. Flat dynamics, no pulse, no melody to follow; variation, register and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Solo piano, nothing else: Satie-like writing in E♭ Lydian at 44 BPM, unmetered, with no pulse anywhere in it. Felt hammers, close and dry, almost no room around the notes, and the theme is four bars long and never grows. Flat dynamics; each variation takes notes away rather than adding them. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo felt piano, single E♭ Lydian notes, long gaps]
-[Instrumental A - a thin string pad appears far underneath, barely there]
-[Instrumental B - the piano moves to a higher register, same few notes]
-[Instrumental Development - the figure varied, notes taken away one by one]
-[Instrumental Drift - pad alone holding, piano silent for a long while]
-[Instrumental Hush - two piano notes, nothing else]
-[Instrumental Reprise - the opening figure returns low, unchanged in level]
-[Instrumental Outro - one last piano note over the pad, very long quiet tail]
+[Instrumental Theme - one E♭ Lydian chord, a silence, then the plain theme, unmetered]
+[Instrumental Variation 1 - the theme with that chord answering it, close and dry]
+[Instrumental Variation 2 - the same notes an octave higher, felt hammers]
+[Instrumental Variation 3 - the theme with half its notes gone]
+[Instrumental Variation 4 - only the chords remain, the melody implied]
+[Instrumental Variation 5 - the theme very low, one hand alone]
+[Instrumental Variation 6 - two notes and a long silence]
+[Instrumental Theme Returns - the opening theme unchanged, no louder]
+[Instrumental Long Tail - one last chord, very long quiet tail]
 ```
 
 ---
 
 **Moonrise Through Leaves**
-*Key A♭ Aeolian · 44 BPM · Forest · celesta + harp · instrumental · 6:00*
+*Key A♭ Aeolian · 46 BPM · 4/4 · music-box lullaby · celesta, harp, bass clarinet once · instrumental · 6:00*
 
 Style prompt:
 ```
-Celesta and harp in A♭ Aeolian at 44 BPM, small shaded figures passing between them, one held string-pad note underneath. Moonlight through branches. Flat dynamics, no pulse, nothing arrives; variation, register and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Celesta and harp, with one bass clarinet entrance in the whole cue: a music-box lullaby in A♭ Aeolian, 46 BPM, a slow 4/4 with barely a pulse in it. The sound is inside the music box, tiny and close, the mechanism just audible. Flat dynamics; the piece drifts rather than develops and nothing ever arrives. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - celesta alone, a small A♭ Aeolian figure, cool and shaded]
-[Instrumental A - harp answers with the same figure a register lower]
-[Instrumental B - a held string-pad note underneath, both leads thinning]
-[Instrumental Development - the figure passed back and forth and varied, no louder]
-[Instrumental Drift - pad only, the figure implied by memory]
-[Instrumental Hush - celesta alone, three notes]
-[Instrumental Reprise - harp returns with the opening figure, same level]
-[Instrumental Outro - celesta last over the held pad note, very long quiet tail]
+[Instrumental Drift 1 - one held A♭ note that slowly becomes a chord, inside the music box]
+[Instrumental Drift 2 - celesta places single notes inside that chord]
+[Instrumental Drift 3 - harp joins, the two passing the same small figure]
+[Instrumental Drift 4 - the chord changes underneath, nothing else moves]
+[Instrumental Drift 5 - a bass clarinet holds one low note, once, then goes]
+[Instrumental Drift 6 - celesta alone, the harp gone, very small]
+[Instrumental Drift 7 - the chord thinning back towards one note]
+[Instrumental Long Tail - a last celesta note over that held note, very long quiet tail]
 ```
 
 ---
 
 **Cold Stars**
-*Key F♯ Dorian · 48 BPM · Highland · muted horn + string harmonics · instrumental · 6:00*
+*Key F♯ Dorian · 48 BPM · 4/4 · Nordic folk, hymn-like · soft horn, string harmonics, piano · instrumental · 6:00*
 
 Style prompt:
 ```
-A softly muted horn in F♯ Dorian at 48 BPM, one long phrase at a time, over string harmonics and a thin pad in cold mountain reverb. Sparse, very quiet, flat dynamics, no pulse; development by variation, register and thinning only, never a peak. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Scored for a soft sustained horn, string harmonics and piano: Nordic folk turned hymn-like, F♯ Dorian, 48 BPM, a slow 4/4 of held chords. The horn is never a stab; the bows are long and high. A stone hall with a long tail. Soule's Skyrim at its quietest. Flat dynamics; variation, register and thinning only. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - string harmonics alone, cold air, long reverb]
-[Instrumental A - a softly muted horn plays one long F♯ Dorian phrase, then rests]
-[Instrumental B - thin pad underneath, harmonics moving up a register]
-[Instrumental Development - the horn phrase varied and shortened, level unchanged]
-[Instrumental Drift - harmonics and pad only, the horn silent]
-[Instrumental Hush - one held harmonic, almost nothing]
-[Instrumental Reprise - the horn phrase returns once, no louder than the first]
-[Instrumental Outro - harmonics thinning over the pad, very long quiet tail]
+[Instrumental Verse 1 - piano alone in a low octave, F♯ Dorian, stone hall, slow 4/4]
+[Instrumental Verse 2 - string harmonics answer high above, thin and cold]
+[Instrumental Verse 3 - the soft horn sustains one line through the chords, never a stab]
+[Instrumental Verse 4 - the chorale a fifth lower, piano holding the bass]
+[Instrumental Verse 5 - harmonics and horn only, the piano resting]
+[Instrumental Verse 6 - the low octave returns under the chorale]
+[Instrumental Verse 7 - one chord held, the horn silent]
+[Instrumental Long Tail - a single low piano note in the hall, very long quiet tail]
 ```
 
 ---
 
 **The Owl Hours**
-*Key C Aeolian drone · 42 BPM · Marsh · bass clarinet + bowed vibraphone · instrumental · 6:00*
+*Key C Aeolian · 42 BPM · free · ambient drone · bass clarinet, bowed vibraphone, contrabass · instrumental · 6:00*
 
 Style prompt:
 ```
-Bass clarinet in C Aeolian at 42 BPM over a low C drone and bowed vibraphone, uneasy but calm, marsh air. Almost no melody, flat dynamics, no pulse; development by drift, register and thinning only, never a peak. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+An ambient drone in C Aeolian at 42 BPM, unmetered and pulseless, carried by bass clarinet, bowed vibraphone and contrabass. The bowed metal shimmers without attack; the clarinet's notes are few and far apart. Cave space, close stone and a long tail. Flat dynamics; the cue drifts and thins and nothing ever arrives. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - a low C drone alone, still water, no pulse]
-[Instrumental A - bass clarinet enters low and slow, few notes, uneasy but calm]
-[Instrumental B - bowed vibraphone adds long shimmering tones above the drone]
-[Instrumental Development - the clarinet line drifts and varies, drone unchanged]
-[Instrumental Drift - drone and bowed metal only, clarinet resting]
-[Instrumental Hush - the drone thins to one quiet note]
-[Instrumental Reprise - bass clarinet returns with the opening notes, same level]
-[Instrumental Outro - bowed vibraphone over the fading drone, very long quiet tail]
+[Instrumental Drift 1 - a low C drone that only slowly becomes a chord, unmetered, cave stone]
+[Instrumental Drift 2 - bass clarinet places a few dark notes inside it]
+[Instrumental Drift 3 - bowed vibraphone shimmers far above the drone]
+[Instrumental Drift Widens - the contrabass adds a second note, the space larger]
+[Instrumental Drift 4 - the clarinet drifts to new pitches, no centre]
+[Instrumental Drift Thins - bowed metal alone over the drone, the clarinet gone]
+[Instrumental Drift 5 - the clarinet returns at the opening level, uneasy but calm]
+[Instrumental Long Tail - the drone thinning to one quiet note, very long tail]
 ```
 
 ---
 
 **Embers on the Road**
-*Key G Dorian · 50 BPM · Meadow · lute-guitar + viola · instrumental · 6:00*
+*Key G Dorian · 52 BPM · 6/8 · Renaissance lute · lute, viola · instrumental · 6:00*
 
 Style prompt:
 ```
-Lute-like nylon guitar in G Dorian at 50 BPM, plain repeating figure, with a warm solo viola answering and a faint string pad. Night road, banked fire, flat dynamics, no pulse; development by variation, register and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Renaissance lute writing for lute and viola in G Dorian, 52 BPM, a rolling 6/8: the lute's figure never stops and the viola's bows are long over it. In the manner of Dowland, slowed to a walk. A small wooden room, close and nearly dry. Flat dynamics; each turn of the ground varies it and none of them builds. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - lute-like nylon guitar alone, a plain G Dorian figure]
-[Instrumental A - solo viola answers warmly, one phrase, then rests]
-[Instrumental B - a faint string pad underneath, guitar figure moving lower]
-[Instrumental Development - the figure varied, viola entering later each time]
-[Instrumental Drift - guitar only, notes taken away, level unchanged]
-[Instrumental Hush - one held viola note, guitar silent]
-[Instrumental Reprise - guitar and viola together at the opening level]
-[Instrumental Outro - guitar last, one open chord, very long quiet tail]
+[Instrumental Ground - the lute alone, one G Dorian figure repeated, rolling 6/8, wooden room]
+[Instrumental Variation 1 - viola enters with long bows over the ground]
+[Instrumental Variation 2 - the lute ornaments the ground, viola holding]
+[Instrumental Variation 3 - the ground an octave lower, viola above it]
+[Instrumental Variation 4 - viola alone over the bare ground, very few notes]
+[Instrumental Variation 5 - the ground plainest of all, no ornament left]
+[Instrumental Variation 6 - viola and lute together at the opening level]
+[Instrumental Long Tail - the ground slowing to one open chord, very long quiet tail]
 ```
 
 ---
 
 **Lantern in the Window**
-*Key C Lydian · 44 BPM · Meadow · cello harmonics + celesta · instrumental · 6:00*
+*Key C Lydian · 40 BPM · 3/4 · post-rock ambient, acoustic · cello harmonics, celesta, soft pad · instrumental · 6:00*
 
 Style prompt:
 ```
-Cello harmonics in C Lydian at 44 BPM, high and thin, with celesta placing single notes and a soft pad beneath. One warm light in an open dark field. Flat dynamics, no pulse; variation, register and thinning only. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Cello harmonics, celesta and a soft string pad, acoustic post-rock ambient in C Lydian, 40 BPM, a very slow 3/4 you feel rather than count. The harmonics are held for whole bars; the celesta gives one note at a time. A cathedral tail around all of it. Flat dynamics; the arch fills and empties without ever peaking. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - cello harmonics alone, high and thin, C Lydian]
-[Instrumental A - celesta places single notes between them, warm and small]
-[Instrumental B - a soft pad beneath, harmonics moving down a register]
-[Instrumental Development - the celesta figure varied, harmonics holding longer]
-[Instrumental Drift - pad and one harmonic, celesta silent]
-[Instrumental Hush - celesta alone, two notes]
-[Instrumental Reprise - harmonics return with the opening shape, no louder]
-[Instrumental Outro - one celesta note over the held pad, very long quiet tail]
+[Instrumental Thin - the pad is already sounding as the cue begins, C Lydian, very slow 3/4]
+[Instrumental Filling - cello harmonics enter high above, held for whole bars]
+[Instrumental Fuller - celesta places single notes between the harmonics]
+[Instrumental Widest, Still Quiet - all three together, no louder than the pad was alone]
+[Instrumental Emptying - the celesta drops out, harmonics holding longer]
+[Instrumental Thinner - one harmonic over the pad, the cathedral tail audible]
+[Instrumental Thin Again - the pad alone, as at the opening]
+[Instrumental Long Tail - the pad fading with the hall, very long quiet tail]
 ```
 
 ---
 
 **Rain on the Road**
-*Key C♯ Dorian · 50 BPM · Meadow · piano + harp · instrumental · 6:00*
+*Key C♯ Dorian · 54 BPM · 4/4 · minimalist piano (Nils Frahm-like) · piano, harp, viola · instrumental · 6:00*
 
 Style prompt:
 ```
-Solo piano in C♯ Dorian at 50 BPM with harp answering in the gaps and a soft string pad behind, the patter of rain implied by the figures, never by percussion. Flat dynamics, no pulse; variation, register and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Piano with harp and viola under it, minimalist writing in C♯ Dorian, 54 BPM, an even 4/4 in which the piano figure never stops from the first bar to the last. Nils Frahm-like: felt hammers, close and dry, the mechanism audible. Flat dynamics; only the harmony beneath the figure changes. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo piano, an even C♯ Dorian figure, rain implied not played]
-[Instrumental A - harp answers in the gaps, the same figure displaced]
-[Instrumental B - a soft string pad behind both, piano moving lower]
-[Instrumental Development - the figure varied, harp thinning to single notes]
-[Instrumental Drift - harp and pad only, piano resting]
-[Instrumental Hush - two piano notes, very quiet]
-[Instrumental Reprise - the opening figure returns, unchanged in level]
-[Instrumental Outro - harp last over a held pad chord, very long quiet tail]
+[Instrumental Figure Alone - the piano figure already running as the cue starts, even 4/4, close and dry]
+[Instrumental Harmony Shifts - viola moves the chord under the unchanged figure]
+[Instrumental Harp Doubles the Figure - the same notes displaced, rain implied and never played]
+[Instrumental Harmony Shifts Again - a darker chord, the figure identical]
+[Instrumental Figure Lower - the piano takes it an octave down, viola holding]
+[Instrumental Figure Alone Again - harp and viola resting, the figure still going]
+[Instrumental Figure Thins - notes dropped one at a time, dynamics unchanged]
+[Instrumental Long Tail - the last few notes of the figure, very long quiet tail]
 ```
 
 ---
 
 **The Storm Passing**
-*Key E♭ Dorian · 48 BPM · Highland · cor anglais · instrumental · 6:00*
+*Key E♭ Dorian · 46 BPM · free · English pastoral, wind-led · cor anglais, string quartet, distant timpani roll · instrumental · 6:00*
 
 Style prompt:
 ```
-Cor anglais in E♭ Dorian at 48 BPM, cold and sparse over long-reverb string pads and a distant piano. Weather moving away, flat dynamics, no pulse, nothing arrives. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax. No flute glissando, no pitch sweeps, no portamento, no octave runs, no whistle effects.
+Cor anglais, string quartet, one distant timpani roll: English pastoral, wind-led, E♭ Dorian, 46 BPM, unmetered. The cor anglais keeps simple steady stepwise lines in a fixed register; the bows are long. Open field. Flat dynamics; the roll is distant thunder, not a hit. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax. No glissando, no pitch sweeps, no portamento.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - long-reverb string pad alone, cold and wide, weather leaving]
-[Instrumental A - cor anglais enters with one plain E♭ Dorian line, fixed register]
-[Instrumental B - a distant piano places single notes under it, pad thinning]
-[Instrumental Development - the line varied and taken lower, level unchanged]
-[Instrumental Drift - piano and pad only, cor anglais silent]
-[Instrumental Hush - one held pad note, almost nothing]
-[Instrumental Reprise - cor anglais returns with the opening line, no louder]
-[Instrumental Outro - piano last under the fading pad, very long quiet tail]
+[Instrumental Part One - the cor anglais climbs a slow E♭ Dorian scale alone, unmetered, open field]
+[Instrumental Part One Widens - the quartet holds long bows beneath the line]
+[Instrumental Middle - a contrasting idea in the quartet alone, weather still overhead]
+[Instrumental Middle, Distant - one far-off timpani roll under the strings, thunder leaving, never a hit]
+[Instrumental Middle Thins - two string voices only, the sky clearing]
+[Instrumental Part One Returns - the rising line again on cor anglais, no louder]
+[Instrumental Part One Lower - the same line a fifth down, the quartet thinning]
+[Instrumental Long Tail - one held string chord, the wind gone, very long quiet tail]
 ```
 
 ---
 
 **Under the Eaves**
-*Key B♭ Dorian · 46 BPM · Hearth · guitar + soft pad · instrumental · 6:00*
+*Key B♭ Dorian · 50 BPM · 3/4 · chamber folk, guitar duo · two nylon guitars · instrumental · 6:00*
 
 Style prompt:
 ```
-Nylon guitar in B♭ Dorian at 46 BPM, close-miked and domestic, over a soft string pad, rain outside a shelter you built. Flat dynamics, no pulse, nothing arrives; variation, register and thinning only. Soule's Skyrim calm with Valheim and Stardew warmth. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Nothing but two nylon guitars: chamber folk in B♭ Dorian, 50 BPM, a quiet 3/4 that rocks gently and never pushes. Close-miked in a small wooden room, fingerboard noise left in, rain outside a shelter you built. Flat dynamics; the refrain returns unchanged and the episodes vary around it. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - close-miked nylon guitar alone, a slow B♭ Dorian figure]
-[Instrumental A - a soft string pad settles underneath, warm and near]
-[Instrumental B - the guitar figure moves lower, fingerboard noise left in]
-[Instrumental Development - the figure varied, quieter, rain outside implied]
-[Instrumental Drift - pad only, guitar resting for a long while]
-[Instrumental Hush - three guitar notes, very close and small]
-[Instrumental Reprise - the opening figure returns, unchanged in level]
-[Instrumental Outro - one held guitar chord over the pad, very long quiet tail]
+[Instrumental Refrain - both guitars in unison, one rocking B♭ Dorian phrase in 3/4, small wooden room]
+[Instrumental Episode 1 - the second guitar splits off into a counter-figure]
+[Instrumental Refrain Lower - unison again, a register down, close and woody]
+[Instrumental Episode 2 - one guitar alone, the phrase taken further down]
+[Instrumental Refrain - unison at the opening level, no louder]
+[Instrumental Episode 3 - both guitars in slow chords, the rain outside implied]
+[Instrumental Refrain Alone - the unison with notes missing, still rocking in 3/4]
+[Instrumental Long Tail - one held guitar chord, very long quiet tail]
 ```
 
 ---
 
 **Turned Earth**
-*Key F Mixolydian · 62 BPM · Hearth/Meadow · nylon guitar + frame drum (soft) · instrumental · 6:00*
+*Key F Mixolydian · 68 BPM · 4/4 · Appalachian dulcimer with guitar · dulcimer, guitar, soft frame drum · instrumental · 6:00*
 
 Style prompt:
 ```
-Nylon guitar in F Mixolydian at 62 BPM, close-miked and warm, with a very soft frame drum keeping an easy hand pulse and a little dulcimer. Planting weather, company not scenery. Flat dynamics, no build; variation, register and thinning only. Soule's Skyrim calm with Valheim and Stardew warmth. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Hammered dulcimer, nylon guitar and a soft frame drum keep an Appalachian figure in F Mixolydian, 68 BPM, an easy 4/4: the figure never stops and the drum is an even hand pulse, no accents. Close and dry, planting weather. Flat dynamics; only the harmony under the figure moves, and the drum leaves before the end. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - close-miked nylon guitar alone, an easy F Mixolydian figure]
-[Instrumental A - a very soft frame drum joins with a light hand pulse, warm room]
-[Instrumental B - hammered dulcimer answers the guitar in a higher register]
-[Instrumental Development - the figure varied, the drum staying soft and even]
-[Instrumental Drift - guitar and drum only, dulcimer resting, level unchanged]
-[Instrumental Hush - guitar alone, the drum stops, a few notes]
-[Instrumental Reprise - drum and dulcimer return at the opening level, no louder]
-[Instrumental Outro - guitar last, the drum gone, one open chord, very long quiet tail]
+[Instrumental Figure Alone - the dulcimer figure already running as the cue begins, easy 4/4, close and dry]
+[Instrumental Drum Joins - a soft frame drum takes an even hand pulse, no accents]
+[Instrumental Harmony Shifts - the guitar moves the chord, the figure unchanged]
+[Instrumental Guitar Takes the Figure - dulcimer answering above, the drum steady]
+[Instrumental Harmony Shifts Again - a warmer chord under the same notes]
+[Instrumental Figure Lower - the whole figure an octave down, level unchanged]
+[Instrumental Drum Leaves - the frame drum stops, the figure alone and quieter]
+[Instrumental Long Tail - one open guitar chord over a last dulcimer strike, very long quiet tail]
 ```
 
 ---
 
 **Sawdust**
-*Key D Mixolydian · 58 BPM · Hearth · hammered dulcimer + piano · instrumental · 6:00*
+*Key D Mixolydian · 62 BPM · 6/8 · chamber folk, fiddle-led (slow) · violin, guitar, cello · instrumental · 6:00*
 
 Style prompt:
 ```
-Hammered dulcimer in D Mixolydian at 58 BPM, close-miked, with piano answering underneath and a quiet nylon guitar. Workbench company: unhurried, domestic, warm. Flat dynamics, no build; variation, register and thinning only. Soule's Skyrim calm with Valheim and Stardew warmth. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Violin leading guitar and cello, chamber folk slowed almost to stillness, D Mixolydian at 62 BPM in a lilting 6/8 that rolls under everything. Workbench company: close-miked in a small wooden room, unhurried and domestic. Flat dynamics; each variation changes register or takes notes away, and none of them builds. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - close-miked hammered dulcimer alone, a plain D Mixolydian figure]
-[Instrumental A - piano answers underneath, soft-pedalled and near]
-[Instrumental B - a quiet nylon guitar joins, the three trading the same figure]
-[Instrumental Development - the figure varied and taken lower, no louder]
-[Instrumental Drift - piano only, dulcimer and guitar resting]
-[Instrumental Hush - dulcimer alone, single strikes, very quiet]
-[Instrumental Reprise - all three return at the opening level, unhurried]
-[Instrumental Outro - piano last under one held dulcimer note, very long quiet tail]
+[Instrumental Theme - the violin alone, one D Mixolydian phrase repeated, lilting 6/8]
+[Instrumental Variation 1 - nylon guitar rolls underneath, the phrase unchanged]
+[Instrumental Variation 2 - cello takes the phrase low, violin holding above]
+[Instrumental Variation 3 - guitar alone with the phrase, plain and unhurried]
+[Instrumental Variation 4 - violin ornaments it lightly, no louder]
+[Instrumental Variation 5 - the phrase with half its notes gone, the wooden room close]
+[Instrumental Theme Returns - all three at the opening level, unhurried]
+[Instrumental Long Tail - cello last under a held guitar chord, very long quiet tail]
 ```
 
 ---
 
 **The Bench by the Fire**
-*Key A Dorian · 54 BPM · Hearth · piano + cello · instrumental · 6:30*
+*Key A Dorian · 54 BPM · 4/4 · minimalist piano with cello · piano, cello · instrumental · 6:00*
 
 Style prompt:
 ```
-Solo piano in A Dorian at 54 BPM, close and soft-pedalled, with a warm solo cello answering a phrase at a time. Firelight, an evening at the place you built; company, not scenery. Flat dynamics, no build; variation, register and thinning only. Soule's Skyrim calm with Valheim and Stardew warmth. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Just piano and cello: minimalist writing in A Dorian at 54 BPM, an unhurried 4/4 with a soft walking left hand. The cello's bows are long, and the two take turns rather than play together. Close and dry, soft pedal, firelight at the place you built. Flat dynamics; variation, register and thinning only. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - close piano alone, a slow A Dorian phrase, soft pedal]
-[Instrumental A - warm solo cello answers the phrase, near and unhurried]
-[Instrumental B - the two settle into an easy exchange, firelight, no pulse]
-[Instrumental Development - the phrase varied, piano moving to a lower register]
-[Instrumental Drift - cello holds one long note, piano resting]
-[Instrumental Hush - piano alone, three notes, very quiet]
-[Instrumental C - a nylon guitar joins quietly for one pass, then leaves]
-[Instrumental Reprise - piano and cello return at the opening level, no louder]
-[Instrumental Outro - cello last under one held piano chord, very long quiet tail]
+[Instrumental Call - the piano's left hand alone, a walking A Dorian bass, unhurried 4/4]
+[Instrumental Response - the cello answers with one long-bowed phrase]
+[Instrumental Call - the right hand joins the bass, close and dry, soft pedal]
+[Instrumental Response - the cello answers lower, fewer notes]
+[Instrumental Call and Response Together - the two overlap once, no louder]
+[Instrumental Call - piano alone again, the bass still walking]
+[Instrumental Response Alone - one held cello note, no piano at all]
+[Instrumental Long Tail - the walking bass slowing to a stop, very long quiet tail]
 ```
 
 ---
 
 **Stone on Stone**
-*Key E♭ Mixolydian · 60 BPM · Hearth/Highland · dulcimer + viola · instrumental · 6:00*
+*Key E♭ Mixolydian · 60 BPM · 5/4 · Nordic folk, plucked · plucked consort: lute, harp, dulcimer · instrumental · 6:00*
 
 Style prompt:
 ```
-Hammered dulcimer in E♭ Mixolydian at 60 BPM, close-miked, with solo viola and a cold thin pad behind it. Building in stone on high ground, patient and domestic. Flat dynamics, no build; variation, register and thinning only. Soule's Skyrim calm with Valheim and Stardew warmth. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+A plucked consort of lute, harp and hammered dulcimer playing Nordic folk in E♭ Mixolydian, 60 BPM, an uneven 5/4 that is unhurried rather than driven. Everything is plucked; nothing is bowed and nothing is held. A stone hall with a long tail. Flat dynamics; the refrain returns unchanged between the episodes. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - close hammered dulcimer alone, a patient E♭ Mixolydian figure]
-[Instrumental A - solo viola enters warm and low, one phrase at a time]
-[Instrumental B - a cold thin pad behind both, high-ground air, still domestic]
-[Instrumental Development - the dulcimer figure varied, viola holding longer notes]
-[Instrumental Drift - viola and pad only, dulcimer resting]
-[Instrumental Hush - single dulcimer strikes, far apart]
-[Instrumental Reprise - viola returns with the opening phrase, no louder]
-[Instrumental Outro - dulcimer last over the fading pad, very long quiet tail]
+[Instrumental Refrain - the consort is already playing as the cue begins, uneven 5/4, stone hall]
+[Instrumental Episode 1 - lute alone with a new figure, harp answering late]
+[Instrumental Refrain - all three again, the refrain unchanged]
+[Instrumental Episode 2 - dulcimer leads, the harmony moving under it]
+[Instrumental Refrain Lower - the refrain an octave down, level unchanged]
+[Instrumental Episode 3 - harp alone, slow and wide, the hall audible around it]
+[Instrumental Refrain Thinned - the consort with notes missing, still in 5/4]
+[Instrumental Long Tail - one plucked chord ringing out in the hall, very long quiet tail]
 ```
 
 ---
 
 **Supper**
-*Key B♭ Ionian (major) · 56 BPM · Hearth · guitar + oboe · instrumental · 6:00*
+*Key B♭ major · 58 BPM · 3/4 · Stardew-like waltz, acoustic · guitar, oboe, clarinet · instrumental · 6:00*
 
 Style prompt:
 ```
-Nylon guitar in B♭ Ionian at 56 BPM with a soft oboe, close-miked and domestic, a shared table. Warm room, little reverb. Flat, unhurried, no pulse. Soule's Skyrim calm with Valheim and Stardew warmth. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax. No flute glissando, no pitch sweeps, no portamento, no octave runs, no whistle effects.
+An acoustic waltz in B♭ major for nylon guitar, oboe and clarinet, 58 BPM, 3/4 throughout, gently turning. The winds keep simple steady stepwise lines in a fixed register. Stardew-like warmth in a small wooden room. Flat dynamics; variation, register and thinning. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax. No glissando, no pitch sweeps, no portamento.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - close nylon guitar alone, a warm B♭ major figure, small room]
-[Instrumental A - soft oboe enters with a plain line in a fixed register]
-[Instrumental B - celesta places a few notes above, the table settling]
-[Instrumental Development - the guitar figure varied, oboe answering later]
-[Instrumental Drift - guitar only, quieter, fewer notes]
-[Instrumental Hush - one held oboe note over a single guitar chord]
-[Instrumental Reprise - guitar and oboe together at the opening level, unhurried]
-[Instrumental Outro - guitar last, one warm chord, very long quiet tail]
+[Instrumental Part One - one warm B♭ guitar chord, a silence, then the waltz begins turning in 3/4]
+[Instrumental Part One Widens - the oboe takes the tune, plain and stepwise, one register]
+[Instrumental Part One Shared - clarinet joins below the oboe, the table settling]
+[Instrumental Middle - a contrasting strain, guitar and clarinet only, the waltz still turning]
+[Instrumental Middle Quieter - guitar alone, fewer notes, small wooden room]
+[Instrumental Part One Returns - the waltz and the oboe as at the opening, no louder]
+[Instrumental Part One Thinned - the tune with notes taken away, still in 3/4]
+[Instrumental Long Tail - one held guitar chord, the winds gone, very long quiet tail]
 ```
 
 ---
 
 **The Day's Work Done**
-*Key F♯ Aeolian · 48 BPM · Hearth · music box + piano · instrumental · 6:30*
+*Key F♯ Aeolian · 44 BPM · free · music-box lullaby with piano · music box, piano · instrumental · 6:00*
 
 Style prompt:
 ```
-Music box in F♯ Aeolian at 48 BPM, tiny and close, with soft piano beneath and one held string-pad note. The end of an evening at your own place; intimate, unhurried, almost still. Flat dynamics, no build; variation and thinning only. Soule's Skyrim calm with Valheim and Stardew warmth. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Music box first, piano second: a lullaby in F♯ Aeolian, 44 BPM, unmetered, with no pulse to tap at all. The recording sits inside the music box, tiny and close, the mechanism audible under the notes. Flat dynamics; the cue drifts and thins and never arrives anywhere. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - music box alone, a small turning F♯ Aeolian figure, very close]
-[Instrumental A - soft piano beneath, answering the same figure slowly]
-[Instrumental B - one held string-pad note underneath, the room settling]
-[Instrumental Development - the figure simplified, fewer notes, no louder]
-[Instrumental Drift - music box winding down, almost stopping]
-[Instrumental Hush - piano alone, two notes, very quiet]
-[Instrumental C - the music box returns once, barely there]
-[Instrumental Reprise - piano and music box together at the opening level]
-[Instrumental Outro - one last music-box note over the held pad, very long quiet tail]
+[Instrumental Drift 1 - the music box alone, one turn of a small F♯ Aeolian figure, unmetered]
+[Instrumental Drift 2 - soft piano answers underneath, soft pedal, very near]
+[Instrumental Drift 3 - the figure turns again, simplified, the room settling]
+[Instrumental Drift Slows - piano alone holding a low chord, the box silent]
+[Instrumental Drift 4 - the music box winds down, almost stopping]
+[Instrumental Drift 5 - one turn of the figure returns, barely there]
+[Instrumental Drift Returns - piano and music box together at the opening level]
+[Instrumental Long Tail - a last music-box note, mechanism audible, very long quiet tail]
 ```
 
 ---
 
 **Drip and Dark**
-*Key no centre (A drone) · 40 BPM · Underground · bowed crotales + contrabass · instrumental · 7:00*
+*Key A drone · 40 BPM · free · ambient drone, bowed metal · bowed crotales, contrabass, harp harmonics · instrumental · 6:00*
 
 Style prompt:
 ```
-Bowed crotales and a low contrabass drone on A at 40 BPM, no tonal centre, no melody to follow, near-ambient stone. Long cavern reverb, single notes far apart, flat dynamics, no pulse; development by drift and thinning only. Morrowind cave ambience, Soule at his quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Bowed crotales over a contrabass, with harp harmonics far above: an ambient drone on an A centre, 40 BPM, unmetered, with no key and no melody to follow. Bowed metal only, no attack anywhere. Deep cave space, wet stone and a very long tail. Flat dynamics; the cue drifts and thins for six minutes and arrives nowhere. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - a low contrabass drone on A alone, long cavern reverb]
-[Instrumental A - bowed crotales enter far above, single tones, no melody]
-[Instrumental B - the drone thickens by one note, stone space widening]
-[Instrumental Development - crotales drift to new pitches, no centre, no pulse]
-[Instrumental Drift - drone only, very long, almost unchanging]
-[Instrumental Hush - one crotale tone, then silence around it]
-[Instrumental C - a clarinet holds one low note far off, then goes]
-[Instrumental Reprise - crotales and drone as at the opening, same level]
-[Instrumental Outro - the drone thinning to nothing, very long quiet tail]
+[Instrumental Drift 1 - a contrabass drone on A that only slowly becomes a chord, cave stone, unmetered]
+[Instrumental Drift 2 - bowed crotales enter far above, single tones, no melody]
+[Instrumental Drift 3 - harp harmonics fall between them like water]
+[Instrumental Drift 4 - the drone thickens by one note, the cave widening]
+[Instrumental Drift 5 - crotales drift to new pitches, no centre]
+[Instrumental Drift 6 - the drone alone, very long, almost unchanging]
+[Instrumental Drift 7 - one crotale tone with silence around it]
+[Instrumental Drift 8 - harp harmonics once more, then gone]
+[Instrumental Long Tail - the drone thinning to nothing, very long quiet tail]
 ```
 
 ---
 
 **The Sleeping Stone**
-*Key A♭ Phrygian · 46 BPM · Underground · bass clarinet + cello · instrumental · 6:30*
+*Key A♭ Phrygian · 46 BPM · 4/4 · baroque chorale, low · bass clarinet, cello, viola · instrumental · 6:00*
 
 Style prompt:
 ```
-Bass clarinet in A♭ Phrygian at 46 BPM over a low sustained cello, near-ambient, stone reverb, no melody to follow. Very dark, very slow, flat dynamics, no pulse; development by drift, register and thinning only. Morrowind cave ambience, Soule at his quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Bass clarinet, cello and viola in a low baroque chorale, A♭ Phrygian at 46 BPM, a slow 4/4 of one chord per bar. The bows are long, the clarinet holds under everything, and the Phrygian second darkens each cadence. Deep cave space, wet stone and a long tail. Flat dynamics; register and thinning only, never a peak. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - low sustained cello alone, stone reverb, no pulse]
-[Instrumental A - bass clarinet enters beneath it, a few dark A♭ Phrygian notes]
-[Instrumental B - the cello moves down a step, the space feeling larger]
-[Instrumental Development - the clarinet notes drift and thin, level unchanged]
-[Instrumental Drift - cello only, holding, almost nothing happening]
-[Instrumental Hush - one bass clarinet note, alone in the reverb]
-[Instrumental C - bowed crotales shimmer once far above, then gone]
-[Instrumental Reprise - clarinet and cello as at the opening, no louder]
-[Instrumental Outro - the cello note fading under the stone, very long quiet tail]
+[Instrumental Verse 1 - the bass clarinet alone in the cave, a low A♭ Phrygian line, slow 4/4]
+[Instrumental Verse 2 - cello adds the chord above, one chord per bar]
+[Instrumental Verse 3 - viola completes the chorale, all bows long]
+[Instrumental Verse 4 - the same chords lower, the stone space larger]
+[Instrumental Verse 5 - cello and viola only, the clarinet resting]
+[Instrumental Verse 6 - the Phrygian second darkens the cadence, level unchanged]
+[Instrumental Verse 7 - one chord held, nothing moving]
+[Instrumental Verse 8 - the bass clarinet alone again, as at the opening]
+[Instrumental Long Tail - the cave's tail alone, very long and quiet]
 ```
 
 ---
 
 **Slack Water**
-*Key B Dorian · 54 BPM · Coast · viola + hammered dulcimer · instrumental · 6:00*
+*Key B Dorian · 54 BPM · 6/8 · sea shanty slowed to a lament · viola, dulcimer, harp · instrumental · 6:00*
 
 Style prompt:
 ```
-Solo viola in B Dorian at 54 BPM, long-bowed and unhurried, over a hammered dulcimer and harp in slow rolling open fifths. Still water under a boat, flat dynamics, no pulse; development by variation, register and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Viola, hammered dulcimer and harp turn a sea shanty into a lament: B Dorian, 54 BPM, a rolling 6/8 that never quickens. The viola's bows are long over a ground that repeats for the whole cue and never stops. Open water under a boat, wide air. Flat dynamics; each turn of the ground varies it and none of them builds. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - harp in slow rolling open fifths, still water, no pulse]
-[Instrumental A - solo viola enters, long-bowed, one slow B Dorian line]
-[Instrumental B - hammered dulcimer takes the rolling fifths, harp thinning to single notes]
-[Instrumental Development - the viola line varied and taken lower, no louder]
-[Instrumental Drift - harp and dulcimer only, viola resting]
-[Instrumental Hush - one held viola note, almost nothing]
-[Instrumental Reprise - viola returns with the opening line, same level]
-[Instrumental Outro - harp last over the fading dulcimer, very long quiet tail]
+[Instrumental Ground - the viola climbs a slow B Dorian scale, then the ground settles under it, rolling 6/8]
+[Instrumental Variation 1 - harp takes the ground in open fifths, viola long-bowed above]
+[Instrumental Variation 2 - hammered dulcimer joins, the shanty tune plain and slow]
+[Instrumental Variation 3 - the tune lowered a register, the ground unchanged]
+[Instrumental Variation 4 - dulcimer alone over the ground, viola resting]
+[Instrumental Variation 5 - the viola's rising scale returns inside the tune]
+[Instrumental Ground Alone - the ground with notes missing, the water flattening]
+[Instrumental Long Tail - one held viola note over the last of the ground, very long quiet tail]
 ```
 
 ---
 
 **The Far Shore**
-*Key E Mixolydian · 60 BPM · Coast · low whistle (constrained) + harp · instrumental · 6:00*
+*Key E Mixolydian · 60 BPM · 4/4 · Celtic slow air · low whistle (constrained), harp, cello · instrumental · 6:00*
 
 Style prompt:
 ```
-Low whistle in E Mixolydian at 60 BPM, simple steady stepwise lines in a fixed register, over harp in rolling open fifths and a low cello. Flat dynamics, slow 6/8. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax. No flute glissando, no pitch sweeps, no portamento, no octave runs, no whistle effects.
+Low whistle with harp and cello, a Celtic slow air in E Mixolydian, 60 BPM, a walking 4/4. The whistle keeps simple steady stepwise lines in a fixed register; the harp's arpeggio never stops. Open water. Soule's quiet Oblivion coast. Flat dynamics; variation and thinning. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax. No glissando, no pitch sweeps, no portamento.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - harp alone in rolling open fifths, slow 6/8, open water]
-[Instrumental A - low whistle enters, simple steady stepwise line, fixed register]
-[Instrumental B - a low cello holds underneath, harp widening into fifths]
-[Instrumental Development - the whistle line varied stepwise, same register throughout]
-[Instrumental Drift - harp and cello only, whistle silent, level unchanged]
-[Instrumental Hush - one held cello note under a single harp figure]
-[Instrumental Reprise - whistle returns with the opening line, no louder]
-[Instrumental Outro - harp last over the fading cello, very long quiet tail]
+[Instrumental Theme - the harp alone, one E Mixolydian arpeggio repeated, walking 4/4]
+[Instrumental Variation 1 - low whistle states the air above it, stepwise, fixed register]
+[Instrumental Variation 2 - the cello holds a low note, the arpeggio unchanged]
+[Instrumental Variation 3 - the air varied stepwise, still one register]
+[Instrumental Variation 4 - harp and cello alone, the air remembered and not played]
+[Instrumental Variation 5 - the arpeggio widens into open fifths, whistle silent]
+[Instrumental Variation 6 - the whistle returns with the air, no louder]
+[Instrumental Theme Returns Alone - the harp with the opening arpeggio, nothing above it]
+[Instrumental Long Tail - one held cello note under a last harp figure, very long quiet tail]
 ```
 
 ---
 
 **Something in the Trees**
-*Key G Phrygian · 84 BPM · Forest · low strings ostinato + frame drum · instrumental · 4:00*
+*Key G Phrygian · 84 BPM · 7/8 · neoclassical strings, tense · low strings ostinato, frame drum, clarinet · instrumental · 4:00*
 
 Style prompt:
 ```
-Low strings ostinato in G Phrygian at 84 BPM under a soft frame drum, shaded forest, watchful. A raised pulse, not a battle: restrained, flat dynamics, no build, no arrival, development by variation and thinning only. Soule's Oblivion at its quietest, never his combat. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Low strings hold an ostinato under a soft frame drum and one clarinet: tense neoclassical strings in G Phrygian, 84 BPM, an off-balance 7/8 that never resolves. The figure never stops and the drum is even and unaccented. A stone hall with a long tail. A raised pulse, not a battle: flat dynamics, no build, no arrival. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - low strings ostinato alone in G Phrygian, quiet and even]
-[Instrumental A - a soft frame drum joins, restrained, no accents]
-[Instrumental B - a viola holds one shaded note above the ostinato]
-[Instrumental Development - the ostinato varied and thinned, dynamics unchanged]
-[Instrumental Hush - drum stops, low strings alone, very quiet]
-[Instrumental Outro - the ostinato slowing and thinning to one note, long quiet tail]
+[Instrumental Figure Alone - the low strings ostinato already running, off-balance 7/8, stone hall]
+[Instrumental Drum Joins - a soft frame drum takes the 7/8 evenly, no accents]
+[Instrumental Harmony Shifts - the chord under the figure darkens, level unchanged]
+[Instrumental Clarinet Above - one held clarinet note over the ostinato, watchful]
+[Instrumental Drum Leaves - the frame drum stops, low strings alone and very quiet]
+[Instrumental Long Tail - the ostinato thinning to one repeated note, very long quiet tail]
 ```
 
 ---
 
 **Held Breath**
-*Key B♭ Aeolian · 72 BPM · Marsh · cello + bowed metal + soft drum · instrumental · 4:00*
+*Key B♭ Aeolian · 72 BPM · 4/4 · ambient drone, tense · cello, bowed metal, soft drum · instrumental · 4:00*
 
 Style prompt:
 ```
-Solo cello in B♭ Aeolian at 72 BPM over bowed metal and a very soft frame drum, marsh drone underneath, uneasy but calm. A raised pulse, not a battle: restrained throughout, flat dynamics, no build, no arrival. Soule's Oblivion at its quietest, never his combat. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Cello against bowed metal and a very soft frame drum, a tense ambient drone in B♭ Aeolian, 72 BPM, an even 4/4 held back the whole way. The cello's bows are long; the drum is a flat pulse with no accents. Cave space, close stone. A raised pulse, not a battle: the arch fills and empties and never peaks. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - a low marsh drone with bowed metal shimmering over it]
-[Instrumental A - solo cello enters low in B♭ Aeolian, few notes, held back]
-[Instrumental B - a very soft frame drum keeps an even pulse, no accents]
-[Instrumental Development - the cello line varied and thinned, level unchanged]
-[Instrumental Hush - drum stops, bowed metal alone over the drone]
-[Instrumental Outro - one held cello note over the fading drone, long quiet tail]
+[Instrumental Thin - a low B♭ drone that slowly becomes a chord, bowed metal over it, cave stone]
+[Instrumental Filling - the cello enters low, few notes, long bows, held back]
+[Instrumental Fuller - a very soft frame drum keeps an even 4/4, no accents]
+[Instrumental Emptying - the drum stops, cello and bowed metal only]
+[Instrumental Thin Again - bowed metal alone over the drone, as at the opening]
+[Instrumental Long Tail - one held cello note under the fading drone, very long quiet tail]
 ```
 
 ---
 
 **Prelude, a Quiet Morning**
-*Key F Lydian · 52 BPM · Meadow · piano + harp · instrumental · 5:00*
+*Key F Lydian · 52 BPM · 3/4 · baroque chorale, bright · piano, harp, oboe · instrumental · 5:00*
 
 Style prompt:
 ```
-Solo piano in F Lydian at 52 BPM with harp answering and a thin string pad, warm and open, a title screen that asks nothing. Flat dynamics, no pulse, no fanfare; development by variation, register and thinning only. Soule's Oblivion exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+Piano, harp and oboe in a bright baroque chorale, F Lydian, 52 BPM, a walking 3/4 of one chord per bar. The oboe keeps simple steady stepwise lines in a fixed register. A cathedral tail; a title screen that asks nothing. Flat dynamics, no fanfare; thinning and variation. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax. No glissando, no pitch sweeps, no portamento.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo piano, one open F Lydian phrase, warm morning air]
-[Instrumental A - harp answers the phrase, a thin string pad underneath]
-[Instrumental B - the piano moves higher, the harp figure widening]
-[Instrumental Development - the phrase varied, no fanfare, level unchanged]
-[Instrumental Hush - harp alone, three notes, very quiet]
-[Instrumental Reprise - the opening phrase returns on piano, no louder]
-[Instrumental Outro - one held pad chord under a last piano note, very long quiet tail]
+[Instrumental Verse 1 - piano and harp in unison, one bright F Lydian phrase, walking 3/4]
+[Instrumental Verse 2 - the chorale opens into chords, one per bar, cathedral tail]
+[Instrumental Verse 3 - the oboe takes the top line, plain and stepwise]
+[Instrumental Verse 4 - the same chords a register lower, harp arpeggiating them]
+[Instrumental Verse 5 - piano alone with the chorale, no fanfare]
+[Instrumental Verse 6 - unison returns between harp and oboe, no louder]
+[Instrumental Chorale Thinned - two voices only, one chord held in the hall]
+[Instrumental Long Tail - the cathedral tail alone, very long and quiet]
 ```
 
 ---
 
 **Prelude, After Dark**
-*Key E Aeolian · 46 BPM · Highland · cello + celesta · instrumental · 5:00*
+*Key E Aeolian · 46 BPM · free · neoclassical strings, nocturne · cello, celesta, string quartet · instrumental · 5:00*
 
 Style prompt:
 ```
-Solo cello in E Aeolian at 46 BPM, low and warm, with celesta placing single notes above and long cold reverb around both. A title screen at night; flat dynamics, no pulse, no fanfare; variation, register and thinning only. Soule's Skyrim exploration at its quietest. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no taiko, no brass stabs, no synth, no electric guitar, no EDM, no crescendo, no climax.
+A nocturne for cello, celesta and string quartet, neoclassical, E Aeolian at 46 BPM, unmetered, with no pulse to tap. The cello's bows are very long; the celesta places one note at a time. A stone hall with a long tail. Soule's quietest night writing. Flat dynamics, no fanfare; each variation thins the one before. Full-length cue, developed and through-composed, no early fade, long outro. No vocals, no choir, no drum kit, no brass stabs, no synth, no electric guitar, no crescendo, no climax.
 ```
 Structure prompt:
 ```
-[Instrumental Intro - solo cello alone, one low E Aeolian phrase, cold reverb]
-[Instrumental A - celesta places single notes above, far apart]
-[Instrumental B - a thin string pad behind both, the space widening]
-[Instrumental Development - the cello phrase varied and taken lower, no fanfare]
-[Instrumental Hush - celesta alone, two notes, almost nothing]
-[Instrumental Reprise - the cello phrase returns as at the opening, no louder]
-[Instrumental Outro - one held cello note under a last celesta note, very long quiet tail]
+[Instrumental Theme - the cello alone in a low register, one E Aeolian theme, unmetered, stone hall]
+[Instrumental Variation 1 - celesta places single notes above the theme]
+[Instrumental Variation 2 - the string quartet holds the harmony behind, long bows]
+[Instrumental Variation 3 - the theme moves to the viola, cello holding the bass]
+[Instrumental Variation 4 - celesta and quartet only, the theme implied]
+[Instrumental Variation 5 - the theme with notes taken away, no fanfare]
+[Instrumental Theme Alone Again - the cello as at the opening, no louder]
+[Instrumental Long Tail - one celesta note over a held quartet chord, very long quiet tail]
 ```
