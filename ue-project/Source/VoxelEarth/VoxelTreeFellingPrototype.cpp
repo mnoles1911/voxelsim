@@ -565,4 +565,3 @@ void Reset(UWorld* W){for(TActorIterator<AVoxelFallingTimber> It(W);It;++It)It->
 namespace {
 FAutoConsoleCommandWithWorld AxeToggle(TEXT("voxel.TreeFelling.Axe"),TEXT("Toggle the prototype stone axe; left click swings."),FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* W){for(TActorIterator<AVoxelStoneAxePrototype> It(W);It;++It)It->Equipped=!It->Equipped;}));
 }
-

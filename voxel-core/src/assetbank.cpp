@@ -85,6 +85,7 @@ AssetBankError validateGrid(const AssetGrid& g, const AssetManifestSpecies& sp,
 
 void AssetBankLibrary::configure(const AssetManifest* manifest, std::string root, AcceptedSourceObserver observer) {
     std::lock_guard<std::mutex> lock(mu_);
+    if(revision_.load()!=UINT64_MAX)revision_.fetch_add(1,std::memory_order_release);
     manifest_ = manifest;
     root_ = std::move(root);
     observer_ = std::move(observer);

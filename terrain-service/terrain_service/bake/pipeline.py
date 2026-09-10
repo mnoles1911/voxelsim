@@ -466,7 +466,12 @@ TERRAIN_VERSION = 8
 #: curvature, heat load. Products-only again: the ground is bit-identical,
 #: only what asset placement can read about it changed. Consumed by
 #: voxel-core's assetpolicy gates from worldgen v26 on.
-BAKE_VERSION = 28
+#:
+#: 29: Headwater points retain their discharge-network identity but only ship
+#: where the final river surface is wet. Later surface constraints can dry an
+#: original head; emitting it would place a faucet on dry ground. Products
+#: only: routing, terrain, discharge and water-surface computation are unchanged.
+BAKE_VERSION = 29
 
 
 @dataclass(frozen=True)
@@ -5490,6 +5495,15 @@ def bake_tile(
         # is exactly the order the section requires, so the encoder's ordering
         # check is a free assertion rather than a sort.
         if consts.water_head_points_enabled:
+            # Preserve the ORIGINAL network heads. Recomputing donors on the
+            # widened/settled ribbon would invent sources at lateral edges or
+            # downstream of a newly dried gap. Only suppress original sources
+            # which no longer have drawn water after the final constraints.
+            # Inspect just head coordinates, avoiding another padded bool plane.
+            phy, phx = np.nonzero(heads_pad)
+            final_wet = np.isfinite(w_pad[phy, phx])
+            dry_head_count = int((~final_wet).sum())
+            heads_pad[phy[~final_wet], phx[~final_wet]] = False
             hy, hx = np.nonzero(heads_pad[sl, sl])
             hq = np.asarray(q_pad[sl, sl], np.float64)[hy, hx]
             water_heads = np.stack(
@@ -5504,7 +5518,7 @@ def bake_tile(
                 # NOT prefixed `water_`, deliberately: that prefix is itself a
                 # ran-flag (test_water_disabled_reproduces_a_bake_ver_8_tile_
                 # exactly asserts NO `water_*` key exists when the plane is
-                # off), and these five must be present-and-zero in that case
+                # off), and these stats must be present-and-zero in that case
                 # rather than absent. Two conventions, both honest, and the
                 # names keep them from colliding.
                 "heads_ran": 1.0,
@@ -5516,7 +5530,11 @@ def bake_tile(
                 "heads_q_u32_frac": (
                     float(hq.max()) / float(_codec_const("HEADWATER_Q_MAX"))
                     if hq.size else 0.0),
+                # Both counts refer to the padded domain. The first counts
+                # surviving eligible sources; the second records those dried
+                # by surface constraints, not relocated or newly manufactured.
                 "heads_padded_count": float(heads_pad.sum()),
+                "heads_padded_dry_rejected_count": float(dry_head_count),
             })
         # Kept for B7: the PADDED river wet mask, after every stage that can
         # move the drawn extent (widening, settling, levelling). A bool copy,
@@ -5672,6 +5690,7 @@ def bake_tile(
         "heads_q_max_m3_yr": 0.0,
         "heads_q_u32_frac": 0.0,
         "heads_padded_count": 0.0,
+        "heads_padded_dry_rejected_count": 0.0,
         "basin_water_volume_m3": float(sum(
             b.area_m2 * b.water_depth_m for b in survey.basins)),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),

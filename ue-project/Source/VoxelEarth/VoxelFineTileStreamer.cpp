@@ -444,10 +444,16 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 		// needs a human. A file that has GONE (deleted, or moved aside for a
 		// re-bake) has no version left to remember, so its refusal memo is
 		// dropped here -- whatever appears next earns a clean set of attempts.
-		++MissingFileLoads_;
-		KnownMissing_.insert(TileHash(Tile));
-		LoadFailures_.erase(TileHash(Tile));
-		return false;
+        // Failure to open is not itself proof of absence (permissions, a
+        // transient I/O failure, or a present invalid file must stay gated).
+        std::error_code ExistsError;
+        const bool Exists=std::filesystem::exists(StdPath,ExistsError);
+        if(!ExistsError&&!Exists){
+            ++MissingFileLoads_;
+            if(KnownMissing_.insert(TileHash(Tile)).second)ResidencyEpoch_.fetch_add(1,std::memory_order_relaxed);
+            LoadFailures_.erase(TileHash(Tile));
+        }
+        return false;
 	}
 
 	// --- HAVE WE ALREADY REFUSED THESE EXACT BYTES? -------------------------
@@ -1306,6 +1312,13 @@ bool FVoxelFineTileStreamer::RequestFootprint(int64 WorldMmX0, int64 WorldMmY0, 
 // The funnel's cold path: this pixel's tile is not resident.
 // ---------------------------------------------------------------------------
 
+#if WITH_DEV_AUTOMATION_TESTS
+bool FVoxelFineTileStreamer::DebugKnownAbsentForTest(vxc::TileCoord Tile) const {
+    VoxelFineLock::FLockScope Lock(Lock_,SLT_ReadOnly,VoxelFineLock::ESite::ElevShared);
+    return KnownMissing_.find(TileHash(Tile))!=KnownMissing_.end();
+}
+#endif
+
 int32_t FVoxelFineTileStreamer::CoarseElevationMm(int64_t px, int64_t py) const
 {
 	// Fine pixel -> world mm -> coarse pixel. FLOOR division, not truncation:
@@ -1432,6 +1445,10 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 				return Sampler_.elevationMm(px, py);
 			}
 		}
+        // The first load attempt can establish absence. It must answer the
+        // same coarse sample as every subsequent query, not leak once first.
+        if(CoarseFallback_&&KnownMissing_.find(TileHash(Tile))!=KnownMissing_.end())
+            return CoarseElevationMm(px,py);
 		return ReportGateLeak_Locked(Tile, px, py);
 	}
 
@@ -1446,6 +1463,10 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 	{
 		return Sampler_.elevationMm(px, py); // raced with a load; not a leak
 	}
+    // A GT load attempt can establish genuine absence between the shared
+    // check and this lock. Workers still never perform disk I/O here.
+    if(CoarseFallback_&&KnownMissing_.find(TileHash(Tile))!=KnownMissing_.end())
+        return CoarseElevationMm(px,py);
 	return ReportGateLeak_Locked(Tile, px, py);
 }
 
@@ -1719,6 +1740,7 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 			Sampler_.unloadTile(It->second.x, It->second.y);
 			NoteMirrorWriteThread_();
 			ResidentTiles_.erase(TileHash(It->second)); // THE MIRROR, WRITE 3 OF 3
+            ResidencyEpoch_.fetch_add(1,std::memory_order_relaxed);
 			Budget_.remove(Key);
 			KeyToTile_.erase(It);
 		}

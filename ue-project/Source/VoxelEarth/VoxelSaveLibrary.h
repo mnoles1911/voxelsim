@@ -36,6 +36,7 @@
 #include "CoreMinimal.h"
 
 class UVoxelWorldSubsystem;
+class UWorld;
 
 namespace VoxelSave
 {
@@ -86,6 +87,7 @@ VOXELEARTH_API TArray<FSaveInfo> List();
 
 // Directory for a slug, whether or not it exists.
 VOXELEARTH_API FString SaveDirectory(const FString& Slug);
+VOXELEARTH_API bool IsValidSlug(const FString& Slug);
 VOXELEARTH_API FString WorldLogPath(const FString& Slug);
 
 // Writes meta.json and world.vxlog. PlayerTransform is captured by the caller
@@ -125,6 +127,10 @@ VOXELEARTH_API int64 SecondsSinceLastSave();
 // front end when it opens a save; read by the autosave-on-shutdown path so a
 // session that came from a named save is written back to that save rather than
 // to the seed-derived default.
-VOXELEARTH_API const FString& GetActiveSlug();
-VOXELEARTH_API void SetActiveSlug(const FString& Slug);
+VOXELEARTH_API FString GetActiveSlug(const UWorld* World);
+VOXELEARTH_API void SetActiveSlug(UWorld* World, const FString& Slug);
+// Allocate an independent world history, including when its seed matches another slot.
+VOXELEARTH_API FString CreateWorldSlot(UWorld* World);
+VOXELEARTH_API bool WriteActive(const UVoxelWorldSubsystem& World);
+VOXELEARTH_API bool WriteActiveAsync(const UVoxelWorldSubsystem& World,TFunction<void(bool)> Completion = {});
 } // namespace VoxelSave

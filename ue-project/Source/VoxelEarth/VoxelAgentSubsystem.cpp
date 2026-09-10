@@ -19,6 +19,7 @@
 #include "VoxelEarth.h" // LogVoxelEarth
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution -- one count per whole-ISM proxy rebuild
 #include "VoxelWorldSubsystem.h"
+#include "VoxelSessionCheckpoint.h"
 
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (doctrine: never from a header UHT parses -- see
@@ -538,6 +539,7 @@ void UVoxelAgentSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	AgentISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	AgentISM->SetCanEverAffectNavigation(false);
 	AgentISM->RegisterComponent();
+    RebuildCheckpointInstances();
 	VoxelEofLedger::Count(VoxelEofLedger::ESource::AgentISM);
 	VoxelEofLedger::CountRegister();
 
@@ -655,6 +657,83 @@ int32 UVoxelAgentSubsystem::SpawnSwarmAtOffset(int32 Count, const FVector& Cente
 	       SpawnedCount, OffsetRadiusUU / 100.0, CenterWorldPos.X, CenterWorldPos.Y, Dir.X, Dir.Y, Dir.Z,
 	       LateralJitterUU / 100.0);
 	return SpawnedCount;
+}
+
+namespace VoxelAgentCheckpointDetail
+{
+constexpr int32 MaxAgents=10000;
+constexpr int32 RecordBytes=74;
+void Record(FArchive& Ar,FVoxelAgent& Agent)
+{
+    Ar << Agent.PersistentId;
+    Ar << Agent.Position.X << Agent.Position.Y << Agent.Position.Z;
+    Ar << Agent.Velocity.X << Agent.Velocity.Y << Agent.Velocity.Z;
+    uint8 Tier=uint8(Agent.Tier),Idle=Agent.bIdleAtStandoff?1:0;
+    Ar << Tier << Idle << Agent.RestoredDigCooldownSeconds;
+    if (Ar.IsLoading())
+    {
+        Agent.Tier=EVoxelAgentTier(Tier); Agent.bIdleAtStandoff=Idle!=0;
+        if (Tier>2 || Idle>1) Ar.SetError();
+    }
+}
+}
+
+bool UVoxelAgentSubsystem::CaptureCheckpoint(TArray<uint8>& Bytes) const
+{
+    Bytes.Reset();
+    if (!GetWorld() || GetWorld()->GetNetMode()==NM_Client || Agents.Num()>VoxelAgentCheckpointDetail::MaxAgents) return false;
+    FMemoryWriter Writer(Bytes,true);
+    uint32 Version=1,Count=uint32(Agents.Num()); Writer << Version << Count;
+    const double Now=GetWorld()->GetTimeSeconds();
+    for (auto Agent:Agents)
+    {
+        Agent.RestoredDigCooldownSeconds=FMath::Max(Agent.RestoredDigCooldownSeconds,
+            Agent.LastDigTimeSeconds<0?0.0:FMath::Max(0.0,NPCDigCooldownSeconds-(Now-Agent.LastDigTimeSeconds)));
+        VoxelAgentCheckpointDetail::Record(Writer,Agent);
+    }
+    TArray<FVoxelAgent> Check;
+    return !Writer.IsError() && DecodeCheckpoint(Bytes,Check);
+}
+
+bool UVoxelAgentSubsystem::DecodeCheckpoint(const TArray<uint8>& Bytes,TArray<FVoxelAgent>& Staged)
+{
+    Staged.Reset();
+    if (Bytes.Num()<8 || Bytes.Num()>8+VoxelAgentCheckpointDetail::MaxAgents*VoxelAgentCheckpointDetail::RecordBytes) return false;
+    FMemoryReader Reader(Bytes,true); uint32 Version=0,Count=0; Reader << Version << Count;
+    if (Version!=1 || Count>VoxelAgentCheckpointDetail::MaxAgents || Bytes.Num()!=8+int32(Count)*VoxelAgentCheckpointDetail::RecordBytes) return false;
+    TArray<FVoxelAgent> Parsed; Parsed.Reserve(Count); TSet<FGuid> Ids;
+    for (uint32 Index=0;Index<Count;++Index)
+    {
+        FVoxelAgent Agent; VoxelAgentCheckpointDetail::Record(Reader,Agent);
+        if (Reader.IsError() || !Agent.PersistentId.IsValid() || Ids.Contains(Agent.PersistentId) ||
+            Agent.Position.ContainsNaN() || Agent.Position.GetAbsMax()>1e12 || Agent.Velocity.ContainsNaN() || Agent.Velocity.GetAbsMax()>1e7 ||
+            !FMath::IsFinite(Agent.RestoredDigCooldownSeconds) || Agent.RestoredDigCooldownSeconds<0 || Agent.RestoredDigCooldownSeconds>NPCDigCooldownSeconds) return false;
+        Ids.Add(Agent.PersistentId); Parsed.Add(MoveTemp(Agent));
+    }
+    Staged=MoveTemp(Parsed); return true;
+}
+
+void UVoxelAgentSubsystem::RebuildCheckpointInstances()
+{
+    if (!AgentISM) return;
+    AgentISM->ClearInstances();
+    for (auto& Agent:Agents)
+    {
+        const FVector Scale(AgentBodyWidthUU/100.0,AgentBodyWidthUU/100.0,AgentHalfHeightUU*2.0/100.0);
+        Agent.InstanceIndex=AgentISM->AddInstance(FTransform(FRotator::ZeroRotator,Agent.Position+FVector(0,0,AgentHalfHeightUU),Scale),true);
+    }
+}
+
+bool UVoxelAgentSubsystem::RestoreCheckpoint(const TArray<uint8>& Bytes)
+{
+    if (!GetWorld() || GetWorld()->GetNetMode()==NM_Client || !Impl || !Agents.IsEmpty()) return false;
+    TArray<FVoxelAgent> Staged;
+    if (!DecodeCheckpoint(Bytes,Staged)) return false;
+    Agents=MoveTemp(Staged);
+    Impl->Paths.SetNum(Agents.Num()); Impl->PathIsDigCapable.Init(false,Agents.Num());
+    Impl->bTier1GraphValid=false;
+    RebuildCheckpointInstances();
+    return true;
 }
 
 int32 UVoxelAgentSubsystem::SpawnOneAgentAt(double WorldX, double WorldY, UVoxelWorldSubsystem& Terrain)
@@ -1257,7 +1336,7 @@ bool UVoxelAgentSubsystem::TryExecuteWaypointEdit(int32 AgentIndex, UVoxelWorldS
 
 	const UWorld* World = GetWorld();
 	const double Now = World ? World->GetTimeSeconds() : 0.0;
-	if (Agent.LastDigTimeSeconds >= 0.0 && (Now - Agent.LastDigTimeSeconds) < NPCDigCooldownSeconds)
+	if (Agent.RestoredDigCooldownSeconds>0 || (Agent.LastDigTimeSeconds >= 0.0 && (Now - Agent.LastDigTimeSeconds) < NPCDigCooldownSeconds))
 	{
 		return false; // per-agent cooldown (rate limit 1/3) -- still recovering from the last edit
 	}
@@ -1678,6 +1757,7 @@ void UVoxelAgentSubsystem::TickTier2(int32 AgentIndex, UVoxelWorldSubsystem& Ter
 void UVoxelAgentSubsystem::Tick(float DeltaTime)
 {
 	CSV_SCOPED_TIMING_STAT(VoxelStream, AgentTickMs);
+    if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaTime);
 
 	UWorld* World = GetWorld();
@@ -1701,6 +1781,7 @@ void UVoxelAgentSubsystem::Tick(float DeltaTime)
 		return;
 	}
 
+    for (auto& Agent:Agents) Agent.RestoredDigCooldownSeconds=FMath::Max(0.0,Agent.RestoredDigCooldownSeconds-double(DeltaTime));
 	if (Agents.Num() == 0 || !Impl)
 	{
 		return;

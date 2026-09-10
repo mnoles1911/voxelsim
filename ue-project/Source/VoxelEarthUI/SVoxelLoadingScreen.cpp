@@ -1,4 +1,5 @@
 #include "SVoxelLoadingScreen.h"
+#include "Widgets/Input/SButton.h"
 
 #include "SVoxelCoverImage.h"
 #include "SVoxelHourglass.h"
@@ -98,6 +99,7 @@ SVoxelLoadingScreen::~SVoxelLoadingScreen()
 
 void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 {
+	ReturnToMenu=InArgs._OnReturnToMenu;
 	FVoxelUIStyle::RegisterWidget();
 	using namespace VoxelUITheme;
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
@@ -185,6 +187,14 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 		// The progress bar and percentage that used to follow the quip were
 		// REMOVED 2026-09-07 (owner directive; the mock has neither -- see the
 		// header). The theatre progress still drives the curtain, not pixels.
+
+	Column->AddSlot().AutoHeight().HAlign(HAlign_Center).Padding(FMargin(0.f,HalfSep))
+	[
+		SNew(SButton)
+		.Visibility_Lambda([this](){return bLoadFailed?EVisibility::Visible:EVisibility::Collapsed;})
+		.Text(FText::FromString(TEXT("Return to menu")))
+		.OnClicked_Lambda([this](){ReturnToMenu.ExecuteIfBound(); return FReply::Handled();})
+	];
 
 	TSharedRef<SOverlay> Root =
 		SNew(SOverlay)
@@ -322,6 +332,7 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 
 void SVoxelLoadingScreen::OnShown()
 {
+	bLoadFailed=false;
 	FRandomStream Stream = MakeVoxelUIRandomStream();
 	FVoxelUIAssetLibrary::Get().ShuffleOrder(Stream);
 	BackgroundIndexA = 0;
@@ -551,7 +562,7 @@ FSlateColor SVoxelLoadingScreen::GetQuipColour() const
 
 FText SVoxelLoadingScreen::GetTipText() const
 {
-	if (bLoadFailed) return FText::FromString(TEXT("Your checkpoint has been preserved. Restart the game before trying another save."));
+	if (bLoadFailed) return FText::FromString(TEXT("Your checkpoint has been preserved. Return to the menu to try another save."));
 	const TArray<FText>& Tips = VoxelUIStrings::GameplayTips();
 	if (TipOrder.Num() == 0 || Tips.Num() == 0)
 	{

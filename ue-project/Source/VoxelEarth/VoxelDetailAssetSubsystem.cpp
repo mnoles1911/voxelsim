@@ -1615,13 +1615,16 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 
 	// --- anchor (same rule as UVoxelWorldSubsystem::Tick) -------------------
 	FVector Anchor = FVector::ZeroVector;
+	bool bHaveAnchor = false;
 	if (APlayerController* PC = World->GetFirstPlayerController())
 	{
 		if (APawn* Pawn = PC->GetPawn())
 		{
 			Anchor = Pawn->GetActorLocation();
+			bHaveAnchor = true;
 		}
 	}
+	if (!bHaveAnchor) return;
 
 	const double RingUU = S.RingMeters * 100.0;
 	const double UnloadUU = RingUU * kUnloadMultiplier;

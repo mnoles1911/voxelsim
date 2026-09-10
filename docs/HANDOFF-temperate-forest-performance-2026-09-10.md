@@ -1,3 +1,64 @@
+# STOPPED — latest handoff update, September 10, 2026
+
+**The user again explicitly ordered all work and subagents stopped. Do not resume implementation, builds, merge resolution, commits, or pushes without a new instruction. This section supersedes earlier continuation/stop-state text below.**
+
+## Exact final state
+
+- All three agents (`cpu_stream_cost`, `frame_stalls`, `gpu_cost`) were interrupted again. No owned UE, compiler, CMake, or MSBuild process was present in the final process inventory.
+- The main checkout `D:\voxelsim` remains on `codex/asset-forge-session-completion-2026-09-07` at **df355dc**, a local checkpoint commit: `Checkpoint temperate forest generators, appearance, ecology and performance handoff` (4,963 files). The original feature work is preserved there.
+- **No merge was completed.** An isolated worktree at `D:\voxelsim\.scratch\temperate-checkpoint-integration`, branch `codex/temperate-checkpoint-integration-2026-09-10`, has a merge of `origin/main` in progress. Preserve this worktree and its index/working files. It contains partial, uncompiled conflict resolutions. Do not mistake conflict-marker removal for validated integration.
+- Root's attempted remote push was rejected by automatic approval review because it required explicit authorization to upload source/assets to GitHub. No push by this agent succeeded. The final inventory observed a separate `git push --porcelain origin` process chain (PID22484/25244 and helpers), whose command was not issued by this agent; it was left untouched. Remote state is therefore not verified, and must not be inferred from this local checkpoint.
+- This latest handoff update is deliberately **uncommitted**, honoring the renewed stop instruction. The same updated document is copied into the integration worktree for discoverability. No further staging or merging was done.
+
+## Validation performed before the integration attempt
+
+- Asset Forge `npm run build`: PASS (TypeScript + Vite).
+- Python analysis tests: **37 PASS**, with `PYTHONPATH=asset-forge/tools;asset-forge;.scratch/oak-python` to provide existing SciPy. Initial run without SciPy had two import errors; corrected dependency run passed.
+- Rebuilt and ran five focused native targets in the ORIGINAL checkout: asset appearance page, ecology, bank, manifest, ownership. **69 PASS**, no failure markers. These results do not validate the later integrated source.
+- Logs: `.scratch/handoff-python-tests.txt`, `.scratch/handoff-web-build.txt`, `.scratch/handoff-native-build.txt`, `.scratch/handoff-native-tests.txt`.
+- `.gitignore` now excludes root scratch dependencies/worktrees and regenerable `ue-project/Content/Voxel/AppearancePilot/` and `Generated/DetailPreview/`. Approved library/source/frontend assets are in the checkpoint; private UE cache imports remain local.
+- Unapplied diagnostic/retirement patches were preserved in tracked `docs/handoff-patches/r0-entry-profile/` and `docs/handoff-patches/detail-retirement/`, including README and source hash files. They remain unapplied feature proposals, not tested runtime changes.
+
+## Partial integration details for a future agent
+
+The fetched main had74 commits beyond the checkpoint's original parent. A merge preview found22 conflicted paths. Root resolved/staged these in the INTEGRATION WORKTREE ONLY:
+
+- `docs/production-environment-ownership.md`: combined applicable appearance and upstream ownership notes.
+- `M_VoxelDetailAsset.uasset`, `M_VoxelEnvironmentLOD.uasset`: selected checkpoint's approved appearance materials. Combined material-script/runtime compatibility still needs validation.
+- `VoxelAgentSubsystem.cpp`: preserved both tick profiling and upstream checkpoint readiness gate.
+- `VoxelEnvironmentLODPrototype.cpp`: retained both appearance/profiling and render fence includes; preserved visual-only-preparation guard and composition guard. Semantic validation of upstream preparation versus composed appearance remains required.
+- `VoxelProductionEnvironmentAdapter.cpp/.h`: retained both GPU readback quads and validated-absence evidence; preserved strict complete-page validation and absence checks.
+- `VoxelProductionEnvironmentAdapterTests.cpp`: combined empty-page/readback tests and upstream absence tests.
+- `VoxelEnvironmentAsset.cpp/.h`: both branches had assigned schema2 to different payloads. Resolution preserves MAIN schema2 provenance layout and introduces schema3 for composition metadata plus optional provenance; schema1 and legacy remain unchanged. Old unpublished checkpoint schema2 composed saves are not migrated. User previously allowed development-save regeneration. This resolution is UNCOMPILED/UNTESTED.
+- `VoxelEnvironmentAssetDescriptorTests.cpp`: updated expected composed bytes to schema3 and added combined composition/provenance round-trip and truncation tests.
+- `VoxelEnvironmentProvenanceTests.cpp`: unknown-version test moved from3 to4. Existing schema2 tests retained.
+
+The final Git inventory still reports these12 paths **unmerged in the index**, even where agents may have removed working-file markers:
+
+1. `ue-project/Shaders/VoxelAssetStamp.usf`
+2. `ue-project/Shaders/VoxelWorklist.ush`
+3. `ue-project/Shaders/VoxelWorklistAssetStamp.usf`
+4. `ue-project/Source/VoxelEarth/VoxelSkySubsystem.cpp`
+5. `ue-project/Source/VoxelEarth/VoxelWorldSubsystem.cpp`
+6. `ue-project/Source/VoxelEarthShaders/Private/VoxelGpuMeshJobManager.cpp`
+7. `ue-project/Source/VoxelEarthShaders/Private/VoxelGpuWorklist.cpp`
+8. `ue-project/Source/VoxelEarthShaders/Private/VoxelGpuWorldGen.cpp`
+9. `ue-project/Source/VoxelEarthShaders/Public/VoxelGpuWorklist.h`
+10. `ue-project/Source/VoxelEarthShaders/Public/VoxelGpuWorldGen.h`
+11. `voxel-core/include/voxelcore/assetfield.h`
+12. `voxel-core/tests/CMakeLists.txt`
+
+Last agent reports, **not accepted build/test evidence**:
+
+- CPU agent intended to combine ecology setters/resolution with upstream configuration revisions and bounded cache; copy constructor/assignment must retain ecology state. Every `setEcology` attempt that clears state must invalidate revision, including failure. Upstream ordinary-site work bound does not account for ecology competition halos; residency must use full sampling reach. Agent had been asked to build isolated native tests but final inventory showed no active build; no completion evidence received.
+- World agent reported conflict-marker-free World source, not staged: shared request builder carries appearance output/EditEpoch with ownership generation/PageLease; bounded cache replaces TMap; predictive tasks globally capped at8. Held publication must preserve first-winner suppression and appearance identity. Full semantic review and runtime tests pending.
+- GPU agent planned to retain public `RenderOwned` and `SuppressTerrainRender` inputs, OR them into the existing48-byte worklist flag and shared classic first-winner clear path, avoiding two redundant masks. This must preserve upstream ownership callers and ours; no completed validation reported. Inspect actual partial edits rather than assuming the plan was fully executed.
+
+## What remains stopped
+
+Do not finish the merge merely because the prior goal remains active. A future authorized continuation should first inspect the isolated merge state and all partial edits, then complete conflict resolution and fresh merged native/UE tests before any merge claim. The broader unfinished performance/ecology work and invalidated24/25 comparison are detailed below. No new performance gain or overall completion is claimed.
+
+---
 # Temperate forest placement and rendering — agent handoff
 
 Prepared September 10, 2026. User explicitly stopped all work and requested this single handoff. Resume only when the receiving agent is instructed to do so. This document supersedes optimistic/in-progress wording in older status entries.

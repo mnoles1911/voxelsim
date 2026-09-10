@@ -1919,7 +1919,14 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		// rather than truncated into a hole at the top of a tall asset.
 		for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Req.AssetInstances)
 		{
-            if(Inst.RenderOwned>1){OutError=TEXT("AssetInstance RenderOwned must be 0 or 1");return false;}
+			// Bounded optional scratch: at most 4 MiB per classic request.
+			// RDG owns lifetime, including cancellation; no retained ownership resource.
+			if (Inst.RenderOwned > 1u || Inst.SuppressTerrainRender > 1u ||
+			    ((Inst.RenderOwned != 0u || Inst.SuppressTerrainRender != 0u) && uint64(Req.BricksZ) > 1048576ull / Cx / Cy / 8u))
+			{
+				OutError = TEXT("Asset render suppression flag invalid or claim scratch exceeds 4 MiB");
+				return false;
+			}
 			if (Inst.SizeX == 0 || Inst.SizeY == 0 || Inst.SizeZ == 0 || Inst.SizeZ > 4095)
 			{
 				OutError = FString::Printf(
@@ -3148,7 +3155,7 @@ void VoxelGpuWorldGen::AddClassicAssetStampPasses(FRDGBuilder& GraphBuilder,cons
 			Request.AssetSpans.Num(), Request.AssetSpans.GetData(),
 			Request.AssetSpans.Num() * sizeof(uint32));
 
-        const bool HasOwned=Request.AssetInstances.ContainsByPredicate([](const auto& I){return I.RenderOwned!=0;});
+        const bool HasOwned=Request.AssetInstances.ContainsByPredicate([](const auto& I){return I.RenderOwned!=0 || I.SuppressTerrainRender!=0;});
         FRDGBufferRef WinnerMask=nullptr;
         if(HasOwned){
             WinnerMask=GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),Cells->Desc.NumElements),TEXT("Voxel.AssetOwnedWinnerMask"));
@@ -3177,7 +3184,7 @@ void VoxelGpuWorldGen::AddClassicAssetStampPasses(FRDGBuilder& GraphBuilder,cons
 				Params->SizeY = Inst.SizeY;
 				Params->SizeZ = Inst.SizeZ;
 				Params->ColStartsBase = Inst.ColStartsBase;
-                Params->RenderOwned=Inst.RenderOwned;
+                Params->RenderOwned=Inst.RenderOwned | Inst.SuppressTerrainRender;
                 Params->OwnedWinnerMask=WinnerMask?GraphBuilder.CreateUAV(WinnerMask):nullptr;
 				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
 				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
@@ -3248,7 +3255,7 @@ void VoxelGpuWorldGen::AddClassicAssetStampPasses(FRDGBuilder& GraphBuilder,cons
 				Params->SizeY = Inst.SizeY;
 				Params->SizeZ = Inst.SizeZ;
 				Params->ColStartsBase = Inst.ColStartsBase;
-                Params->RenderOwned=Inst.RenderOwned;
+                Params->RenderOwned=Inst.RenderOwned | Inst.SuppressTerrainRender;
                 Params->OwnedWinnerMask=WinnerMask?GraphBuilder.CreateUAV(WinnerMask):nullptr;
 				Params->CoarseScale = uint32(Scale);
 				Params->CellBoxMin = FUintVector2(uint32(C0x), uint32(C0y));

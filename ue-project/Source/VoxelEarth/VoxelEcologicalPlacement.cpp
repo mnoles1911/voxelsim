@@ -29,9 +29,9 @@ bool Integer(const TSharedPtr<FJsonObject>& O,const TCHAR* Key,int32 Min,int32 M
     if(!O||!O->TryGetNumberField(Key,Number)||!FMath::IsFinite(Number)||Number<Min||Number>Max||Number!=FMath::FloorToDouble(Number))return false;
     Out=int32(Number);return true;
 }
-bool Hex(const FString& S,int32 Length){if(S.Len()!=Length)return false;for(TCHAR C:S)if(!FChar::IsHexDigit(C))return false;return true;}
+bool EcologyHex(const FString& S,int32 Length){if(S.Len()!=Length)return false;for(TCHAR C:S)if(!FChar::IsHexDigit(C))return false;return true;}
 bool StableID(const TSharedPtr<FJsonObject>& O,uint64& ID){
-    FString Text;if(!O||!O->TryGetStringField(TEXT("stable_id"),Text)||!Hex(Text,16))return false;
+    FString Text;if(!O||!O->TryGetStringField(TEXT("stable_id"),Text)||!EcologyHex(Text,16))return false;
     ID=FCString::Strtoui64(*Text,nullptr,16);return true;
 }
 bool Read(const FString& Path,FString& Text){
@@ -52,7 +52,7 @@ bool VoxelEcologicalPlacement::Load(const FString& Path,const FString& Directory
     if(!Integer(Root,TEXT("algorithm_version"),vxc::kEcoAlgorithmVersion,vxc::kEcoAlgorithmVersion,Version))
         return Fail(TEXT("ecology algorithm version mismatch; recompile placement rules for this engine"));
     FString PublicationHash;
-    if(!Root->TryGetStringField(TEXT("publication_sha256"),PublicationHash)||!Hex(PublicationHash,64))return Fail(TEXT("missing publication identity"));
+    if(!Root->TryGetStringField(TEXT("publication_sha256"),PublicationHash)||!EcologyHex(PublicationHash,64))return Fail(TEXT("missing publication identity"));
     TArray<uint8> Publication;
     const FString PublicationPath=Directory/TEXT("appearance/published.json");
     const int64 PublicationSize=IFileManager::Get().FileSize(*PublicationPath);
@@ -147,7 +147,7 @@ bool VoxelEcologicalPlacement::Load(const FString& Path,const FString& Directory
             const auto Variant=V?V->AsObject():nullptr;FString ID,BankFile,MD5;vxc::EcoNamedVariant Entry;
             if(!Variant||!Variant->TryGetStringField(TEXT("id"),ID)||!SafeName(ID)||
                !Variant->TryGetStringField(TEXT("bank_file"),BankFile)||BankFile!=TEXT("banks/")+Name+TEXT("/")+ID+TEXT(".vxa")||
-               !Variant->TryGetStringField(TEXT("geometry_md5"),MD5)||!Hex(MD5,32)||!StableID(Variant,Entry.placement.stableId)||
+               !Variant->TryGetStringField(TEXT("geometry_md5"),MD5)||!EcologyHex(MD5,32)||!StableID(Variant,Entry.placement.stableId)||
                !Integer(Variant,TEXT("height_mm"),1,1000000,Entry.placement.heightMm)||
                !Integer(Variant,TEXT("bounds_radius_mm"),1,100000,Entry.placement.crownMm)||
                !Integer(Variant,TEXT("trunk_exclusion_mm"),1,100000,Entry.placement.exclusionMm))return Fail(TEXT("invalid named variant/geometry"));

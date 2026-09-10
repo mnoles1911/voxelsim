@@ -110,6 +110,23 @@ double UVoxelCharacterMovementComponent::ConsumeLandingImpactUU()
 	return Value;
 }
 
+void UVoxelCharacterMovementComponent::CaptureMotion(FVoxelPlayerMotion& Out) const
+{
+    Out.Velocity=FVector(HorizontalVelocity.X,HorizontalVelocity.Y,VerticalVelocity);
+    Out.Crouched=bCrouched; Out.WalkSpeed=SpeedTierIndex;
+    Out.GroundAge=TimeSinceGroundedSeconds; Out.JumpRemaining=JumpBufferRemainingSeconds; Out.JumpHeld=bJumpKeyHeld;
+}
+bool UVoxelCharacterMovementComponent::RestoreMotion(const FVoxelPlayerMotion& State)
+{
+    if(State.Velocity.ContainsNaN() || State.Velocity.GetAbsMax()>1e7 || State.WalkSpeed<0 || State.WalkSpeed>=VoxelMovementTuning::kNumSpeedTiers ||
+        !FMath::IsFinite(State.GroundAge) || State.GroundAge<0 || State.GroundAge>1e9 ||
+        !FMath::IsFinite(State.JumpRemaining) || State.JumpRemaining<0 || State.JumpRemaining>1) return false;
+    ResetState(); HorizontalVelocity=FVector(State.Velocity.X,State.Velocity.Y,0); VerticalVelocity=State.Velocity.Z;
+    SpeedTierIndex=State.WalkSpeed; bCrouched=State.Crouched; bCrouchHeld=State.Crouched;
+    TimeSinceGroundedSeconds=State.GroundAge; JumpBufferRemainingSeconds=State.JumpRemaining; bJumpKeyHeld=State.JumpHeld;
+    return true;
+}
+
 void UVoxelCharacterMovementComponent::ResetState()
 {
 	HorizontalVelocity = FVector::ZeroVector;

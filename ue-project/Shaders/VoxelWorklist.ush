@@ -114,7 +114,7 @@ uint worklistClaimEligible(GpuChunkWorkRecord R)
 }
 
 // --- the per-flush asset instance blob (AssetStamp stage) -------------------
-// MIRROR OF FVoxelWorklistAssetInstance (VoxelGpuWorklist.h), 12 dwords, 48 B.
+// MIRROR OF FVoxelWorklistAssetInstance (VoxelGpuWorklist.h), 13 dwords, 52 B; independent ownership/suppression API inputs.
 // A record with stampsStaged reads instances [AssetBase, AssetBase+AssetCount)
 // of THIS flush's blob; ColStartsBase indexes the flush ColStarts buffer,
 // whose VALUES index the flush Spans buffer (both rebased at staging).
@@ -133,6 +133,7 @@ struct GpuAssetStampInstance
 	uint SizeZ;
 	uint ColStartsBase;
 	uint RenderOwned; // explicit winner ownership, not a cell material bit
+	uint SuppressTerrainRender;
 };
 
 // --- the record fold, GPU half ----------------------------------------------

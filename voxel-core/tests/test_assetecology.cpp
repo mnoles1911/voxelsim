@@ -31,6 +31,25 @@ VXC_TEST(ecology_tree_and_detail_outputs_match_full_region_in_parallel){
         p.variants={{uint64_t(i+10),uint16_t(i+7),i?500:12000,true,i?700:5500,i?200:1800}};
         config.species.push_back(p);}
     CHECK(field.setEcology(config));
+    // A cache-invalidating copy must retain ecological placement and its wider read halo.
+    AssetField copied(field);
+    CHECK(copied.ecologyEnabled());
+    CHECK_EQ(copied.columnSamplingReachMm(),field.columnSamplingReachMm());
+    AssetField assigned;assigned.setSeed(123);
+    const auto assignmentRevision=assigned.configurationRevision();
+    assigned=field;
+    CHECK(assigned.configurationRevision()>assignmentRevision);
+    CHECK(assigned.ecologyEnabled());
+    CHECK_EQ(assigned.seed(),field.seed());
+    CHECK_EQ(assigned.columnSamplingReachMm(),field.columnSamplingReachMm());
+    const auto ecologyRevision=assigned.configurationRevision();
+    CHECK(assigned.setEcology(config));
+    CHECK(assigned.configurationRevision()>ecologyRevision);
+    EcoPlacementConfig invalid=config;invalid.biomeMask=0;
+    const auto failedRevision=assigned.configurationRevision();
+    CHECK(!assigned.setEcology(invalid));
+    CHECK(!assigned.ecologyEnabled());
+    CHECK(assigned.configurationRevision()>failedRevision);
     const auto samplingReach=field.columnSamplingReachMm();
     CHECK(samplingReach>layers[0].maxRadiusMm);
     bool sampledOutsidePhysicalReach=false;
@@ -52,6 +71,14 @@ VXC_TEST(ecology_tree_and_detail_outputs_match_full_region_in_parallel){
         f.slopeMmPerM=x<0?450:80;f.curv=y<0?85:175;f.heat=150;
         if(x>300&&y>300)f.standingWaterMm=10000;return f;};
     const auto whole=field.instancesForRect({-600,-600,599,599},facts);
+    const auto copiedWhole=copied.instancesForRect({-600,-600,599,599},facts);
+    CHECK_EQ(copiedWhole.size(),whole.size());
+    for(size_t i=0;i<whole.size();++i){
+        CHECK_EQ(copiedWhole[i].anchorXMm,whole[i].anchorXMm);
+        CHECK_EQ(copiedWhole[i].anchorYMm,whole[i].anchorYMm);
+        CHECK_EQ(copiedWhole[i].bankId,whole[i].bankId);
+        CHECK_EQ(copiedWhole[i].seedIndex,whole[i].seedIndex);
+    }
     using Key=std::tuple<int64_t,int64_t,uint16_t,uint16_t,uint8_t>;
     auto key=[](const AssetInstance& i){return Key{i.anchorXMm,i.anchorYMm,i.bankId,i.seedIndex,i.layer};};
     // Owned-anchor streaming must reproduce the old overlapping query plus

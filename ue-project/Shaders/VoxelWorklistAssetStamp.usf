@@ -167,7 +167,7 @@ void AssetStampWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadI
 			{
 				OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
 #if VXC_ASSET_OWNERSHIP
-                OwnedWinners[K] = Inst.RenderOwned;
+                OwnedWinners[K] = Inst.RenderOwned | Inst.SuppressTerrainRender;
 #endif
 			}
 		}

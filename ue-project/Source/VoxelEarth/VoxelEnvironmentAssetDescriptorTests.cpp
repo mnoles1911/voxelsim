@@ -27,14 +27,14 @@ bool FVoxelEnvironmentDescriptorCompositionTest::RunTest(const FString&){
     FVoxelEnvironmentAssetDescriptor Loaded;
     for(uint8 Yaw=0;Yaw<4;++Yaw){
         auto D=Plain;D.ClippedGeometryHash=TEXT("ABCDEF0123456789ABCDEF0123456789");D.SourceYawQuarter=Yaw;
-        TestTrue(TEXT("composed metadata valid"),D.IsValid());TestTrue(TEXT("schema2 save"),Save(D,Encoded));
-        auto Expected=V1;Expected[4]=2;Text(Expected,D.ClippedGeometryHash);Expected.Add(Yaw);
-        TestTrue(TEXT("schema2 only appends metadata"),Expected==Encoded);
-        TestTrue(TEXT("schema2 read"),Read(Encoded,Loaded));TestEqual(TEXT("original source identity retained"),Loaded.SourceHash,Plain.SourceHash);
+        TestTrue(TEXT("composed metadata valid"),D.IsValid());TestTrue(TEXT("schema3 save"),Save(D,Encoded));
+        auto Expected=V1;Expected[4]=3;Text(Expected,D.ClippedGeometryHash);Expected.Add(Yaw);Expected.Add(0);
+        TestTrue(TEXT("schema3 only appends metadata"),Expected==Encoded);
+        TestTrue(TEXT("schema3 read"),Read(Encoded,Loaded));TestEqual(TEXT("original source identity retained"),Loaded.SourceHash,Plain.SourceHash);
         TestEqual(TEXT("clipped identity separate"),Loaded.ClippedGeometryHash,D.ClippedGeometryHash);
         TestEqual(TEXT("canonical yaw retained"),Loaded.SourceYawQuarter,Yaw);
         TestEqual(TEXT("seed retained"),Loaded.SeedIndex,Plain.SeedIndex);TestEqual(TEXT("provider retained"),Loaded.ProviderHash,Plain.ProviderHash);
-        TArray<uint8> Again;TestTrue(TEXT("schema2 resave"),Save(Loaded,Again));TestTrue(TEXT("schema2 roundtrip bytes"),Again==Encoded);
+        TArray<uint8> Again;TestTrue(TEXT("schema3 resave"),Save(Loaded,Again));TestTrue(TEXT("schema3 roundtrip bytes"),Again==Encoded);
         for(int32 Cut=V1.Num();Cut<Encoded.Num();++Cut){auto Truncated=Encoded;Truncated.SetNum(Cut);TestFalse(TEXT("truncated composition rejected"),Read(Truncated,Loaded));}
     }
     TestTrue(TEXT("v1 reads into previously composed descriptor"),Read(V1,Loaded));
@@ -53,10 +53,27 @@ bool FVoxelEnvironmentDescriptorCompositionTest::RunTest(const FString&){
     }
     auto D=Plain;D.SourceYawQuarter=1;TestFalse(TEXT("orphan yaw rejected"),D.IsValid());
     D.ClippedGeometryHash=Plain.SourceHash;D.SourceYawQuarter=4;TestFalse(TEXT("invalid yaw rejected"),D.IsValid());
-    D.SourceYawQuarter=0;Save(D,Encoded);Encoded.Last()=4;TestFalse(TEXT("serialized invalid yaw rejected"),Read(Encoded,Loaded));
-    Save(D,Encoded);Encoded[Encoded.Num()-2]='g';TestFalse(TEXT("serialized invalid digest rejected"),Read(Encoded,Loaded));
-    auto Unknown=V1;Unknown[4]=3;TestFalse(TEXT("unknown version rejected"),Read(Unknown,Loaded));
-    auto EmptyV2=V1;EmptyV2[4]=2;Word(EmptyV2,0);EmptyV2.Add(0);TestFalse(TEXT("empty schema2 metadata rejected"),Read(EmptyV2,Loaded));
+    D.SourceYawQuarter=0;Save(D,Encoded);Encoded[Encoded.Num()-2]=4;TestFalse(TEXT("serialized invalid yaw rejected"),Read(Encoded,Loaded));
+    Save(D,Encoded);Encoded[Encoded.Num()-3]='g';TestFalse(TEXT("serialized invalid digest rejected"),Read(Encoded,Loaded));
+    auto Unknown=V1;Unknown[4]=4;TestFalse(TEXT("unknown version rejected"),Read(Unknown,Loaded));
+    auto EmptyV2=V1;EmptyV2[4]=3;Word(EmptyV2,0);EmptyV2.Add(0);EmptyV2.Add(0);TestFalse(TEXT("empty schema3 metadata rejected"),Read(EmptyV2,Loaded));
+    // Main's schema2 provenance and composed schema3 must coexist.
+    auto Combined=Plain;Combined.ClippedGeometryHash=Plain.SourceHash;Combined.SourceYawQuarter=3;
+    FVoxelEnvironmentProductionProvenance P;
+    P.Source={123,456,789,-31,42,-53,67,uint16(Plain.SeedIndex),2,3};
+    P.StableId=vxc::assetObjectId(P.Source);P.CanonicalSourceHash=Plain.SourceHash;
+    Combined.ProductionProvenance=P;
+    TestTrue(TEXT("composed provenance saves"),Save(Combined,Encoded));
+    TestTrue(TEXT("composed provenance reads"),Read(Encoded,Loaded));
+    TestTrue(TEXT("both optional identities retained"),Loaded.HasComposition()&&Loaded.ProductionProvenance.IsSet());
+    if(Loaded.ProductionProvenance.IsSet())TestTrue(TEXT("full source provenance retained"),Loaded.ProductionProvenance->Source==P.Source);
+    TArray<uint8> BothAgain;TestTrue(TEXT("composed provenance resaves"),Save(Loaded,BothAgain));
+    TestTrue(TEXT("combined bytes stable"),BothAgain==Encoded);
+    auto Contradictory=Combined;Contradictory.SourceYawQuarter=2;
+    TestFalse(TEXT("composition and provenance yaw must agree"),Contradictory.IsValid());
+    Contradictory=Combined;Contradictory.ProductionProvenance->CanonicalSourceHash=TEXT("ffffffffffffffffffffffffffffffff");
+    TestFalse(TEXT("composition and provenance canonical hash must agree"),Contradictory.IsValid());
+    for(int32 Cut=V1.Num();Cut<Encoded.Num();++Cut){auto Truncated=Encoded;Truncated.SetNum(Cut);TestFalse(TEXT("truncated combined metadata refused"),Read(Truncated,Loaded));}
     return true;
 }
 #endif

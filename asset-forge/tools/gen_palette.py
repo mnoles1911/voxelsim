@@ -95,7 +95,7 @@ def source() -> str:
     lines = [
         '"""What each material looks like. GENERATED — do not edit.',
         "",
-        f"Source: {HEADER.as_posix()}",
+        f"Source: {HEADER.relative_to(ROOT.parent).as_posix()}",
         "Regenerate: python tools/gen_palette.py",
         "",
         "One flat colour per voxel face, varied per voxel. See ADR-0008 for why",

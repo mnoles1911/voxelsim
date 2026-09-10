@@ -256,7 +256,9 @@ struct FVoxelGpuRegionRequest
 		uint32 ColStartsBase = 0;
 		// Render-only ownership supplied by an immutable placement snapshot.
 		// Keep every instance in canonical order; an owned winner still occludes.
-		uint32 RenderOwned = 0; // exactly 0 or 1; default preserves composition
+		uint32 RenderOwned = 0; // 0 or 1; OR with SuppressTerrainRender; default preserves composition
+		// Render-only winner suppression. Never remove this instance from ordering.
+		uint32 SuppressTerrainRender = 0;
 	};
 	TArray<FAssetInstance> AssetInstances;
 	TArray<uint32> AssetColStarts;

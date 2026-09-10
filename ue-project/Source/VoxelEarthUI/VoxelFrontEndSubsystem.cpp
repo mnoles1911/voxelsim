@@ -1,6 +1,7 @@
 #include "VoxelFrontEndSubsystem.h"
 #include "VoxelSessionCheckpoint.h"
 #include "VoxelAudioUserSettings.h"
+#include "VoxelSessionTravel.h"
 #include "VoxelGraphicsUserSettings.h"
 #include "VoxelPauseUISubsystem.h" // VoxelPauseUIHandoff
 #include "VoxelSaveRows.h"
@@ -284,6 +285,12 @@ void UVoxelFrontEndSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		return;
 	}
 	EnterMenu();
+	VoxelSessionTravel::FRequest Request;
+	if (VoxelSessionTravel::Take(&InWorld,Request))
+	{
+		if(Request.Action==VoxelSessionTravel::EAction::NewGame) RequestNewGame();
+		else if(Request.Action==VoxelSessionTravel::EAction::Load) RequestLoad(Request.Slug);
+	}
 }
 
 void UVoxelFrontEndSubsystem::EnterHourglassShot()
@@ -566,31 +573,15 @@ void UVoxelFrontEndSubsystem::RefreshSaveRows()
 void UVoxelFrontEndSubsystem::RequestNewGame()
 {
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: NEW GAME."));
-
-	// THE PORT OF reset_for_new_game(), with one difference. The Godot version
-	// deletes the existing world deltas outright; this renames them aside with
-	// a UTC stamp. A new game genuinely should not inherit the old world's
-	// edits -- but this repository does not silently destroy evidence, and a
-	// player who presses NEW GAME on the wrong menu should be able to get
-	// their world back from the Saved directory rather than from a backup they
-	// did not make.
-	UWorld* World = GetWorld();
-	if (UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr)
+	if(VoxelSessionCheckpoint::Ready(GetWorld()) || VoxelSessionCheckpoint::Failed(GetWorld()) || !VoxelSave::GetActiveSlug(GetWorld()).IsEmpty())
 	{
-		const FString DefaultWorld = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds")
-		                             / FString::Printf(TEXT("%llu.vxlog"), (unsigned long long)WorldSub->GetSeed());
-		if (IFileManager::Get().FileExists(*DefaultWorld))
-		{
-			const FString Backup = DefaultWorld + TEXT(".bak-") + FDateTime::UtcNow().ToString(TEXT("%Y%m%d-%H%M%S"));
-			if (IFileManager::Get().Move(*Backup, *DefaultWorld))
-			{
-				UE_LOG(LogVoxelUI, Log, TEXT("NEW GAME: moved the previous world aside to %s."), *Backup);
-			}
-		}
+		auto Terrain=GetWorld()->GetSubsystem<UVoxelWorldSubsystem>();
+		if(Terrain) VoxelSessionTravel::Queue(GetWorld(),{VoxelSessionTravel::EAction::NewGame,Terrain->GetSeed(),FString()});
+		return;
 	}
-	// No active save: a new game writes to the seed-derived default until the
-	// player names one.
-	VoxelSave::SetActiveSlug(FString());
+
+	// Each new game owns an independent history; existing slots remain available.
+	if (VoxelSave::CreateWorldSlot(GetWorld()).IsEmpty()) return;
 	BeginLoad(FString(), nullptr);
 }
 
@@ -630,13 +621,9 @@ void UVoxelFrontEndSubsystem::RequestLoad(const FString& Slug)
 		RefreshSaveRows();
 		return;
 	}
-	if (Info->Seed != WorldSub->GetSeed())
+	if (Info->Seed != WorldSub->GetSeed() || VoxelSessionCheckpoint::Ready(World) || VoxelSessionCheckpoint::Failed(World) || !VoxelSave::GetActiveSlug(World).IsEmpty())
 	{
-		UE_LOG(LogVoxelUI, Warning,
-		       TEXT("VoxelFrontEnd: LOAD %s -- recorded under seed %llu but this session is seed %llu. ")
-		       TEXT("Relaunch with -VoxelSeed=%llu."),
-		       *Slug, (unsigned long long)Info->Seed, (unsigned long long)WorldSub->GetSeed(),
-		       (unsigned long long)Info->Seed);
+		VoxelSessionTravel::Queue(World,{VoxelSessionTravel::EAction::Load,Info->Seed,Slug});
 		return;
 	}
 
@@ -644,7 +631,7 @@ void UVoxelFrontEndSubsystem::RequestLoad(const FString& Slug)
 	// at any point after this writes back into it rather than into the
 	// seed-derived default -- otherwise a player's next CONTINUE quietly
 	// reopens the state they had when they loaded, losing the session.
-	VoxelSave::SetActiveSlug(Slug);
+	VoxelSave::SetActiveSlug(GetWorld(), Slug);
 
 	const FTransform SpawnTransform(Info->PlayerRotation, Info->PlayerPosition);
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: LOAD %s (%lld edit(s))."), *Slug, (long long)Info->EditCount);
@@ -661,6 +648,12 @@ void UVoxelFrontEndSubsystem::RequestDelete(const FString& Slug)
 	// Rebuild the list either way: if the directory was already gone, the row
 	// still on screen is the thing that is wrong.
 	RefreshSaveRows();
+}
+
+void UVoxelFrontEndSubsystem::RequestReturnToMenu()
+{
+	if(auto Terrain=GetWorld()->GetSubsystem<UVoxelWorldSubsystem>())
+		VoxelSessionTravel::Queue(GetWorld(),{VoxelSessionTravel::EAction::Menu,Terrain->GetSeed(),FString()});
 }
 
 void UVoxelFrontEndSubsystem::RequestQuit()
@@ -690,7 +683,7 @@ void UVoxelFrontEndSubsystem::BeginLoad(const FString& EditLogPath, const FTrans
 	PendingEditLogPath = EditLogPath;
 	PendingSpawnTransform = SpawnOverride ? TOptional<FTransform>(*SpawnOverride) : TOptional<FTransform>();
 
-	LoadingWidget = SNew(SVoxelLoadingScreen);
+	LoadingWidget = SNew(SVoxelLoadingScreen).OnReturnToMenu(FSimpleDelegate::CreateUObject(this,&UVoxelFrontEndSubsystem::RequestReturnToMenu));
 	Viewport->AddViewportWidgetContent(LoadingWidget.ToSharedRef(), VoxelFrontEndDetail::kLoadingZOrder);
 
 	// Phase 4: from here the curtain may also be painted on the engine's Slate

@@ -1451,7 +1451,7 @@ bool AVoxelClipmapActor::GetCameraLocationUU(FVector& OutCameraLocationUU) const
 	// until the manager has run once.
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
-	if (!PC)
+	if (!PC || !PC->GetPawn())
 	{
 		return false;
 	}

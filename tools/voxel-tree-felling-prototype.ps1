@@ -20,4 +20,3 @@ if ($KeepOpen) { $launchArgs += '-VoxelEnvironmentLODKeepOpen' }
 if ($Validate) { $launchArgs += '-VoxelEnvironmentLODValidate' }
 $gameProcess = Start-Process 'D:/UE_5.8/Engine/Binaries/Win64/UnrealEditor.exe' -ArgumentList $launchArgs -WindowStyle Normal -PassThru
 Write-Output "Visible game launched: PID $($gameProcess.Id), log $logPath"
-

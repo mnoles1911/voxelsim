@@ -20,6 +20,7 @@ struct FActive
     uint64 StartFrame=0;
 };
 TUniquePtr<FActive> Active;
+TFunction<void()> Deferred;
 FTSTicker::FDelegateHandle PollHandle;
 
 FResult Write(FSnapshot&& Snapshot)
@@ -38,6 +39,16 @@ void Complete()
     UE_LOG(LogVoxelEarth,Log,TEXT("SaveAsync COMPLETE success=%d captureMs=%.3f workerMs=%.3f framesAdvanced=%llu"),
         Result.Success,Finished->CaptureMs,Result.WorkerMs,GFrameCounter-Finished->StartFrame);
     if(Finished->Completion)Finished->Completion(Result.Success);
+    if(!Active && Deferred)
+    {
+        auto Request=MoveTemp(Deferred); Deferred=nullptr; Request();
+    }
+}
+bool Defer(TFunction<void()> Request)
+{
+    check(IsInGameThread());
+    if(!Active || Deferred || !Request) return false;
+    Deferred=MoveTemp(Request); return true;
 }
 bool IsBusy(){check(IsInGameThread());return Active.IsValid();}
 bool Submit(FSnapshot&& Snapshot,TFunction<void(bool)> Completion)

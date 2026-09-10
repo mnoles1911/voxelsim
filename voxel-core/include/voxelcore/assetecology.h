@@ -238,10 +238,10 @@ inline uint16_t ecoHydrologyWeight(int32_t distanceMm,int32_t waterMaxMm,int moi
     }
     // Broad, mild bank influence for general vegetation. TWI still models
     // moisture away from mapped water and species depth tolerances still veto.
-    const int near=1000-int(std::min<int64_t>(distanceMm,80000)*1000/80000);
+    const int waterProximity=1000-int(std::min<int64_t>(distanceMm,80000)*1000/80000);
     const int affinity=std::clamp(moistureAffinity,-2,2);
-    if(affinity>0)return uint16_t(1000-(1000-near)*affinity/8);
-    if(affinity<0)return uint16_t(1000+near*affinity/8);
+    if(affinity>0)return uint16_t(1000-(1000-waterProximity)*affinity/8);
+    if(affinity<0)return uint16_t(1000+waterProximity*affinity/8);
     return 1000;
 }
 inline uint16_t ecoCoverWeight(EcoCoverRole role,uint16_t canopy,const EcoContext& c){

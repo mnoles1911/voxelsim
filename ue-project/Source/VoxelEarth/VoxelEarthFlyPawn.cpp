@@ -420,6 +420,23 @@ double AVoxelEarthFlyPawn::GetEffectiveWalkSpeedUU() const
 	return WalkMovement ? WalkMovement->GetEffectiveMaxSpeedUU() : VMT::SpeedForTier(VMT::kDefaultSpeedTierIndex);
 }
 
+bool AVoxelEarthFlyPawn::CaptureMotion(FVoxelPlayerMotion& Out) const
+{
+    if(!WalkMovement || !Movement) return false;
+    WalkMovement->CaptureMotion(Out); Out.Walk=bWalkMode; Out.FlySpeed=FlySpeedIndex;
+    if(!bWalkMode) Out.Velocity=Movement->Velocity;
+    return true;
+}
+bool AVoxelEarthFlyPawn::RestoreMotion(const FVoxelPlayerMotion& State)
+{
+    if(!WalkMovement || !Movement || State.FlySpeed<0 || State.FlySpeed>=kNumFlySpeedSteps) return false;
+    SetWalkMode(State.Walk);
+    if(!WalkMovement->RestoreMotion(State)) return false;
+    FlySpeedIndex=State.FlySpeed; ApplyFlySpeedToMovement();
+    Movement->Velocity=State.Walk?FVector::ZeroVector:State.Velocity;
+    return true;
+}
+
 void AVoxelEarthFlyPawn::SetWalkMode(bool bInWalkMode)
 {
 	if (bWalkMode == bInWalkMode)

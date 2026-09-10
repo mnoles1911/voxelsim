@@ -22,6 +22,10 @@
 	],
 	"Plugins": [
 		{
+			"Name": "AESGCMHandlerComponent",
+			"Enabled": true
+		},
+		{
 			"Name": "PythonScriptPlugin",
 			"Enabled": true
 		},

@@ -1,4 +1,5 @@
 #include "VoxelCheckpointStore.h"
+#include "VoxelDurableFile.h"
 #include "VoxelDetachedPersistence.h"
 #include "VoxelSaveGuard.h"
 #include "VoxelEarth.h"
@@ -24,8 +25,14 @@ constexpr int64 MaxPayload = 512ll * 1024 * 1024;
 FString Root(const FString& Path) { return Path + TEXT(".checkpoints"); }
 bool Read(const FString& Path, TArray<uint8>& Bytes, int64 Limit = MaxPayload)
 {
-    const int64 Size = IFileManager::Get().FileSize(*Path);
-    return Size >= 0 && Size <= Limit && FFileHelper::LoadFileToArray(Bytes, *Path);
+    Bytes.Reset();
+    TUniquePtr<IFileHandle> File(FPlatformFileManager::Get().GetPlatformFile().OpenRead(*Path));
+    if (!File) return false;
+    const int64 Size=File->Size();
+    if (Size<0 || Size>Limit || Size>MAX_int32) return false;
+    Bytes.SetNumUninitialized(int32(Size));
+    if (!File->Read(Bytes.GetData(),Size) || File->Size()!=Size) { Bytes.Reset(); return false; }
+    return true;
 }
 FString Hash(const TArray<uint8>& Bytes) { return FMD5::HashBytes(Bytes.GetData(), Bytes.Num()); }
 bool Write(const FString& Path, const TArray<uint8>& Bytes)
@@ -41,12 +48,7 @@ TArray<uint8> Utf8(const FString& String)
 bool Publish(const FString& From, const FString& To)
 {
     // A unique commit record is the publication point. No replacement/delete window.
-#if PLATFORM_WINDOWS
-    return ::MoveFileExW(*FPaths::ConvertRelativePathToFull(From),
-        *FPaths::ConvertRelativePathToFull(To), MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    return FPlatformFileManager::Get().GetPlatformFile().MoveFile(*To, *From);
-#endif
+    return VoxelDurableFile::Publish(From,To,false);
 }
 void Commits(const FString& Path, TArray<FString>& Names)
 {
@@ -75,9 +77,10 @@ EValidation Validate(const FString& Logical, const FString& CommitName, FResolve
     FString Json; FFileHelper::BufferToString(Json, ManifestBytes.GetData(), ManifestBytes.Num());
     TSharedPtr<FJsonObject> Manifest;
     if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Manifest) || !Manifest) return EValidation::Damaged;
-    int32 Version=0;
-    if (!Manifest->TryGetNumberField(TEXT("version"), Version)) return EValidation::Damaged;
-    if (Version != 1 && Version != 2 && Version != 3) return EValidation::Unsupported;
+    double WireVersion=0;
+    if (!Manifest->TryGetNumberField(TEXT("version"), WireVersion) || !FMath::IsFinite(WireVersion)) return EValidation::Damaged;
+    if (WireVersion != 1 && WireVersion != 2 && WireVersion != 3) return EValidation::Unsupported;
+    const int32 Version=static_cast<int32>(WireVersion);
     FString RecordedGeneration;
     if (!Manifest->TryGetStringField(TEXT("generation"), RecordedGeneration) || RecordedGeneration != Generation) return EValidation::Damaged;
     const TArray<TSharedPtr<FJsonValue>>* Files=nullptr;
@@ -98,7 +101,7 @@ EValidation Validate(const FString& Logical, const FString& CommitName, FResolve
         if ((Name!=TEXT("world.vxlog") && Name!=TEXT("meta.json") && !Sidecar && !SimulationFile) || Seen.Contains(Name)) return EValidation::Damaged;
         Seen.Add(Name);
         TArray<uint8> Bytes;
-        const int64 Limit=Name==TEXT("meta.json")?1024*1024:(Name==TEXT("simulation.bin")?64*1024:MaxPayload);
+        const int64 Limit=Name==TEXT("meta.json")?1024*1024:(Name==TEXT("simulation.bin")?64*1024:(Name==TEXT("gameplay.json")?64ll*1024*1024:MaxPayload));
         if (!Read(Directory/Name,Bytes,Limit) ||
             double(Bytes.Num())!=Size || Hash(Bytes)!=Digest || (SimulationFile && Bytes.IsEmpty())) return EValidation::Damaged;
         if (Name==TEXT("meta.json")) Metadata=Directory/Name;
@@ -128,6 +131,7 @@ EValidation Validate(const FString& Logical, const FString& CommitName, FResolve
 
 bool Resolve(const FString& Logical, FResolved& Out)
 {
+    if (Logical.IsEmpty()) { Out={}; return false; }
     Out={}; TArray<FString> Names; Detail::Commits(Logical,Names);
     for (int32 I=0; I<Names.Num(); ++I)
     {
@@ -146,7 +150,8 @@ bool Resolve(const FString& Logical, FResolved& Out)
 
 bool Commit(const FString& Logical,const TArray<uint8>& Terrain,const TArray<uint8>& Detached,const FString& MetadataJson,int32 FailAfterStage,const FSimulationPayload* Simulation)
 {
-    if (Terrain.IsEmpty() || Terrain.Num()>Detail::MaxPayload || VoxelSaveGuard::RefuseWrite(Logical,TEXT("Checkpoint"))) return false;
+    if (Logical.IsEmpty()) return false;
+    if (Terrain.IsEmpty() || Terrain.Num()>Detail::MaxPayload || Detached.Num()>Detail::MaxPayload || VoxelSaveGuard::RefuseWrite(Logical,TEXT("Checkpoint"))) return false;
     if (Simulation && (Simulation->Water.IsEmpty() || Simulation->Hydrology.IsEmpty() || Simulation->Clock.IsEmpty() ||
         Simulation->Water.Num()>Detail::MaxPayload || Simulation->Hydrology.Num()>Detail::MaxPayload || Simulation->Clock.Num()>64*1024 || Simulation->Gameplay.Num()>64*1024*1024)) return false;
     FString Canonical=FPaths::ConvertRelativePathToFull(Logical); FPaths::NormalizeFilename(Canonical); FPaths::CollapseRelativeDirectories(Canonical);

@@ -1,4 +1,10 @@
 #include "VoxelObjectRegistry.h"
+#include "VoxelEnvironmentAsset.h"
+#include "VoxelEnvironmentSparseGrid.h"
+#include "VoxelEnvironmentLODPrototype.h"
+#include "VoxelProductionEnvironmentAdapter.h"
+#include "Serialization/MemoryReader.h"
+#include "Serialization/MemoryWriter.h"
 #include "GameFramework/Actor.h"
 #include "Engine/World.h"
 
@@ -35,12 +41,123 @@ FEntry* FRegistry::Find(const AActor* A)
     for(auto& Pair:Entries)if(Pair.Value.Actor.HasSameIndexAndSerialNumber(Identity))return &Pair.Value;
     return nullptr;
 }
+bool FRegistry::ActorReserved(const AActor* A) const
+{
+    if(!A)return false;const TWeakObjectPtr<const AActor> Identity(A);
+    for(const auto& R:Reservations)if(R.Value.HadActor&&R.Value.Entry.Actor.HasSameIndexAndSerialNumber(Identity))return true;
+    return false;
+}
+FProductionReservation FRegistry::ReserveProduction(const FVoxelEnvironmentAssetDescriptor& Source,FEntry Prepared)
+{
+    check(IsInGameThread());
+    if(!Source.IsValid()||!Source.ProductionProvenance.IsSet()||Reservations.Num()>=16)return {};
+    const FGuid Id=VoxelProductionEnvironment::StableId(Source.ProductionProvenance->Source);
+    if((Prepared.Id.IsValid()&&Prepared.Id!=Id)||Entries.Contains(Id)||Reservations.Contains(Id)||Prepared.Kind!=3||!Prepared.Revision||!Prepared.GeometryRevision||Prepared.GeometryFormat!=1||!Prepared.Geometry||Prepared.Geometry->Num()<4||Prepared.Geometry->Num()>32*1024*1024||Prepared.Dynamic.Num()<8||Prepared.Dynamic.Num()>4096)return {};
+    if(!Prepared.Transform.IsValid()||Prepared.Transform.ContainsNaN()||Prepared.Velocity.ContainsNaN()||Prepared.AngularVelocity.ContainsNaN()||Prepared.BoundsExtent.ContainsNaN()||!FMath::IsFinite(Prepared.Lifetime.RemainingSeconds)||Prepared.Lifetime.RemainingSeconds<0.||uint8(Prepared.Lifetime.Kind)>uint8(EVoxelDebrisLifetime::Retained))return {};
+    if(!VoxelEnvironmentAsset::IsSupportedTransform(Prepared.Transform)||Prepared.Residency==EResidency::Tombstone)return {};
+    int64 Total=Prepared.Geometry->Num();for(const auto& R:Reservations)Total+=R.Value.Entry.Geometry->Num();if(Total>64*1024*1024)return {};
+    const bool HadActor=Prepared.Actor.IsValid();
+    if(!HadActor&&!Prepared.Actor.IsExplicitlyNull())return {};
+    if(HadActor){const auto A=Cast<AVoxelEnvironmentLODPrototype>(Prepared.Actor.Get());if(!A||!A->IsUnpublishedPreparation()||Find(A)||ActorReserved(A))return {};}
+    // Compare bounded serialized identity, not native struct padding. Prepared
+    // dynamic state must carry exactly the descriptor whose stable ID we reserve.
+    FMemoryReader Reader(Prepared.Dynamic);uint32 Version=0;Reader<<Version;if(Version!=1)return {};
+    FVoxelEnvironmentAssetDescriptor Stored;if(!VoxelEnvironmentAsset::SerializeIdentity(Reader,Stored))return {};
+    auto Encode=[](FVoxelEnvironmentAssetDescriptor D){TArray<uint8> B;FMemoryWriter W(B);if(!VoxelEnvironmentAsset::SerializeIdentity(W,D))B.Reset();return B;};
+    if(Encode(Stored)!=Encode(Source))return {};
+    // Validate the complete bounded prepared envelope before any reservation.
+    // Derive the archive tail width through its serializers, avoiding assumptions
+    // about FTransform/bool wire widths, then reject short/extra tails before read.
+    FVoxelEnvironmentSparseGrid Grid;FTransform Transform;bool Collision=false,Severed=false;
+    TArray<uint8> TailBytes;FMemoryWriter TailWriter(TailBytes);
+    TailWriter<<Transform<<Grid.Size<<Grid.Origin<<Grid.Mm<<Grid.MaxDataZ<<Collision<<Severed;
+    if(Reader.TotalSize()-Reader.Tell()!=TailBytes.Num())return {};
+    Reader<<Transform<<Grid.Size<<Grid.Origin<<Grid.Mm<<Grid.MaxDataZ<<Collision<<Severed;
+    if(Reader.IsError()||Reader.Tell()!=Reader.TotalSize()||!VoxelEnvironmentAsset::IsSupportedTransform(Transform)||!Transform.Equals(Prepared.Transform)||Grid.Size.GetMin()<=0||Grid.Size.GetMax()>FVoxelEnvironmentSparseGrid::MaxAxis||Grid.Mm!=100||Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return {};
+    if(uint64(Grid.Size.X)*Grid.Size.Y*Grid.Size.Z>8ull*1024*1024)return {};
+    for(int Axis=0;Axis<3;++Axis)if(FMath::Abs(int64(Grid.Origin[Axis]))>1000000)return {};
+    FMemoryReader GeometryReader(*Prepared.Geometry);GeometryReader<<Version;if(Version!=1||GeometryReader.TotalSize()-GeometryReader.Tell()<4)return {};
+    const int64 BodyOffset=GeometryReader.Tell();int32 BodyMarker=0;GeometryReader<<BodyMarker;GeometryReader.Seek(BodyOffset);
+    if(BodyMarker<0&&GeometryReader.TotalSize()-GeometryReader.Tell()<12)return {};
+    if(!Grid.Serialize(GeometryReader)||GeometryReader.IsError()||GeometryReader.Tell()!=GeometryReader.TotalSize())return {};
+    Prepared.Id=Id;Prepared.Page={};
+    FProductionReservation Ticket{Id,RegistryNonce,FGuid::NewGuid()};
+    Reservations.Add(Id,FReservedProduction{Ticket,MoveTemp(Prepared),HadActor});return Ticket;
+}
+bool FRegistry::RollbackProduction(const FProductionReservation& Ticket)
+{
+    check(IsInGameThread());const auto R=Reservations.Find(Ticket.Id);
+    if(!Ticket.IsValid()||Ticket.RegistryNonce!=RegistryNonce||!R||R->Ticket.Serial!=Ticket.Serial)return false;
+    Reservations.Remove(Ticket.Id);return true;
+}
+struct FPreparedProductionCommit {
+    FProductionReservation Reservation;
+    FGuid Serial;
+    FVoxelEnvironmentProductionCommitRef Actor;
+    int32 EntryCount=0,OrderCount=0,DormantCount=0;
+};
+FPreparedProductionCommitRef FRegistry::PrepareProductionCommit(const FProductionReservation& Ticket)
+{
+    check(IsInGameThread());auto R=Reservations.Find(Ticket.Id);
+    if(!Ticket.IsValid()||Ticket.RegistryNonce!=RegistryNonce||!R||R->Ticket.Serial!=Ticket.Serial||Entries.Contains(Ticket.Id))return {};
+    R->CommitSerial.Invalidate();
+    FVoxelEnvironmentProductionCommitRef ActorToken;
+    if(R->HadActor){
+        auto A=Cast<AVoxelEnvironmentLODPrototype>(R->Entry.Actor.Get());if(!IsValid(A)||Find(A))return {};
+        ActorToken=A->PrepareProductionCommit(R->Entry.Geometry,R->Entry.Dynamic,R->Entry.Transform);
+        if(!ActorToken)return {};
+    }
+    // Reserve insertion capacity before the future non-yielding commit boundary.
+    Entries.Reserve(Entries.Num()+Reservations.Num());Order.Reserve(Order.Num()+Reservations.Num());
+    LastDormantSample.Reserve(LastDormantSample.Num()+Reservations.Num());
+    auto Token=MakeShared<FPreparedProductionCommit,ESPMode::ThreadSafe>();
+    R->CommitSerial=FGuid::NewGuid();Token->Reservation=Ticket;Token->Serial=R->CommitSerial;Token->Actor=MoveTemp(ActorToken);
+    Token->EntryCount=Entries.Num();Token->OrderCount=Order.Num();Token->DormantCount=LastDormantSample.Num();return Token;
+}
+bool FRegistry::ValidatePreparedProduction(const FPreparedProductionCommitRef& Token)
+{
+    check(IsInGameThread());if(!Token)return false;
+    const auto& T=Token->Reservation;const auto R=Reservations.Find(T.Id);
+    if(!T.IsValid()||T.RegistryNonce!=RegistryNonce||!R||R->Ticket.Serial!=T.Serial||
+       !Token->Serial.IsValid()||R->CommitSerial!=Token->Serial||Entries.Contains(T.Id)||
+       Entries.Num()!=Token->EntryCount||Order.Num()!=Token->OrderCount||LastDormantSample.Num()!=Token->DormantCount)return false;
+    if(R->HadActor){auto A=Cast<AVoxelEnvironmentLODPrototype>(R->Entry.Actor.Get());return IsValid(A)&&!Find(A)&&A->ValidateProductionCommit(Token->Actor);}
+    return !Token->Actor&&R->Entry.Actor.IsExplicitlyNull();
+}
+void FRegistry::CommitPreparedProduction(const FPreparedProductionCommitRef& Token)
+{
+    check(IsInGameThread());
+    if(!ValidatePreparedProduction(Token)){checkf(false,TEXT("Invalid prepared registry commit token"));return;}
+    const FGuid Id=Token->Reservation.Id;auto R=Reservations.Find(Id);
+    if(R->HadActor){
+        auto A=CastChecked<AVoxelEnvironmentLODPrototype>(R->Entry.Actor.Get());
+        A->CommitPreparedProduction(Token->Actor);R->Entry.Residency=EResidency::Live;
+    }else {R->Entry.Actor.Reset();R->Entry.Residency=EResidency::Dormant;}
+    Entries.Add(Id,MoveTemp(R->Entry));Order.Add(Id);LastDormantSample.Add(Id,Clock);Reservations.Remove(Id);
+}
+bool FRegistry::CommitProduction(const FProductionReservation& Ticket)
+{
+    check(IsInGameThread());const auto R=Reservations.Find(Ticket.Id);
+    if(!Ticket.IsValid()||Ticket.RegistryNonce!=RegistryNonce||!R||R->Ticket.Serial!=Ticket.Serial||Entries.Contains(Ticket.Id))return false;
+    FEntry Entry=R->Entry;
+    if(R->HadActor){
+        auto A=Cast<AVoxelEnvironmentLODPrototype>(Entry.Actor.Get());if(!IsValid(A)||A->IsUnpublishedPreparation()||Find(A))return false;
+        FGeometry Geometry;TArray<uint8> Dynamic;
+        if(!A->CaptureObjectState(Geometry,Dynamic)||Geometry!=Entry.Geometry||Dynamic!=Entry.Dynamic||!A->GetActorTransform().Equals(Entry.Transform))return false;
+        Entry.Residency=EResidency::Live;
+    }else {Entry.Actor.Reset();Entry.Residency=EResidency::Dormant;}
+    // Every fallible validation is complete. Bind the reserved exact ID without
+    // passing through random-ID Bind/Import, which intentionally reject claims.
+    const FGuid Id=Entry.Id;Entries.Add(Id,MoveTemp(Entry));Order.Add(Id);LastDormantSample.Add(Id,Clock);
+    Reservations.Remove(Id);return true;
+}
 FGuid FRegistry::Bind(AActor* A,uint8 Kind,FGuid Id)
 {
     check(IsInGameThread());
-    if(!IsValid(A)||Kind<1||Kind>3)return FGuid();
+    if(!IsValid(A)||Kind<1||Kind>3||ActorReserved(A)||(Id.IsValid()&&Reservations.Contains(Id)))return FGuid();
     if(auto Existing=Find(A))return Existing->Kind==Kind&&(!Id.IsValid()||Id==Existing->Id)?Existing->Id:FGuid();
     if(!Id.IsValid())Id=FGuid::NewGuid();
+    if(Reservations.Contains(Id))return FGuid();
     if(auto E=Find(Id)) {
         if(E->Kind!=Kind||E->Residency==EResidency::Tombstone||(E->Actor.IsValid()&&E->Actor.Get()!=A))return FGuid();
         E->Actor=A;E->Residency=EResidency::Live;E->Transform=A->GetActorTransform();++E->Revision;return Id;
@@ -51,6 +168,7 @@ FGuid FRegistry::Bind(AActor* A,uint8 Kind,FGuid Id)
 bool FRegistry::Import(FEntry E)
 {
     check(IsInGameThread());
+    if(Reservations.Contains(E.Id)||ActorReserved(E.Actor.Get()))return false;
     if(!E.Id.IsValid()||!E.Revision||E.Kind<1||E.Kind>3||E.Transform.ContainsNaN()||!E.Transform.IsValid()||
        E.Velocity.ContainsNaN()||E.AngularVelocity.ContainsNaN()||E.BoundsExtent.ContainsNaN()||
        !FMath::IsFinite(E.Lifetime.RemainingSeconds)||E.Lifetime.RemainingSeconds<0.||
@@ -68,7 +186,11 @@ bool FRegistry::Import(FEntry E)
 bool FRegistry::Update(const FGuid& Id,TFunctionRef<void(FEntry&)> Mutate)
 {
     auto E=Find(Id);if(!E||E->Residency==EResidency::Tombstone)return false;
-    const uint64 Revision=E->Revision;const auto Old=E->Geometry;Mutate(*E);if(Old!=E->Geometry)E->Page={};E->Id=Id;E->Revision=Revision+1;return true;
+    const uint64 Revision=E->Revision;const auto Old=E->Geometry;
+    if(!Reservations.IsEmpty()){
+        FEntry Updated=*E;Mutate(Updated);if(ActorReserved(Updated.Actor.Get()))return false;*E=MoveTemp(Updated);
+    }else Mutate(*E);
+    if(Old!=E->Geometry)E->Page={};E->Id=Id;E->Revision=Revision+1;return true;
 }
 bool FRegistry::PublishGeometry(const FGuid& Id,TArray<uint8>&& Bytes)
 {
@@ -81,7 +203,7 @@ bool FRegistry::Remove(const FGuid& Id)
 }
 bool FRegistry::CompleteRestore(const FGuid& Id,uint64 GeometryRevision,AActor* A)
 {
-    auto E=Find(Id);if(!E||E->Residency!=EResidency::Restoring||E->GeometryRevision!=GeometryRevision||!IsValid(A))return false;
+    auto E=Find(Id);if(!E||E->Residency!=EResidency::Restoring||E->GeometryRevision!=GeometryRevision||!IsValid(A)||ActorReserved(A))return false;
     if(auto Bound=Find(A))if(Bound->Id!=Id)return false;
     E->Actor=A;E->Residency=EResidency::Live;++E->Revision;LastDormantSample.Remove(Id);return true;
 }
@@ -152,7 +274,7 @@ FTickResult FRegistry::Tick(const TArray<FView>& Views,double Delta,const FCallb
             AActor* A=C.Restore(Saved);E=Find(Id);
             // A callback may process removal/import; do not resurrect its stale actor.
             if(!E||E->Residency==EResidency::Tombstone||E->Revision!=Saved.Revision){if(IsValid(A)&&C.Evict)C.Evict(A);continue;}
-            if(!IsValid(A)){E->Residency=EResidency::Dormant;continue;}
+            if(!IsValid(A)||ActorReserved(A)){E->Residency=EResidency::Dormant;continue;}
             E->Actor=A;E->Residency=EResidency::Live;++E->Revision;++Result.Restored;LastDormantSample.Remove(Id);
         } else if(E->Residency==EResidency::Live&&Transitions<S.MaxTransitions&&C.Capture&&C.Evict&&ShouldEvict(*E,Views,Unload)){
             FEntry Saved=*E;const uint64 Revision=E->Revision;++Transitions;

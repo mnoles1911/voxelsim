@@ -11,6 +11,7 @@
 #include "VoxelGpuWorklist.h"
 #include "VoxelAssetColumnAppend.h"
 #include "ProfilingDebugging/CsvProfiler.h"
+#include "VoxelGpuClaimProof.h"
 
 #include "VoxelGpuWorldGen.h"        // FVoxelGpuColumnSample -- the arena element
 #include "VoxelGpuWorldGenGraph.h"   // AddWorklistColumnPass (the converted Column dispatch)
@@ -26,6 +27,43 @@
 #include <atomic>
 #include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
 #include "RHIBreadcrumbs.h"                         // RHI_BREADCRUMB_EVENT_STAT (5.8 spelling)
+
+// One mailbox per worklist. Queued render commands own their reference; the
+// sequence publishes all diagnostic counters with release/acquire ordering.
+struct FVoxelWorklistProofMailbox
+{
+    std::atomic<uint32> GProofLandedSeq{0};
+    std::atomic<uint32> GProofGpuConsumed{0};
+    std::atomic<uint32> GProofGpuFold{0};
+    std::atomic<uint32> GProofGpuBad{0};
+    std::atomic<uint32> GProofGpuTail{0};
+    std::atomic<uint32> GProofColMismatch{0};
+    std::atomic<uint32> GProofColChecked{0};
+    std::atomic<uint32> GProofVoxMismatch{0};
+    std::atomic<uint32> GProofVoxChecked{0};
+    std::atomic<uint32> GProofCtMismatch{0};
+    std::atomic<uint32> GProofCtChecked{0};
+    std::atomic<uint32> GProofStampMismatch{0};
+    std::atomic<uint32> GProofStampChecked{0};
+    std::atomic<uint32> GProofPackMismatch{0};
+    std::atomic<uint32> GProofPackChecked{0};
+    std::atomic<uint32> GProofClaimMismatch{0};
+    std::atomic<uint32> GProofClaimChecked{0};
+    std::atomic<uint32> GProofClaimEligible{0};
+    std::atomic<uint32> GProofClaimWitnessCat{0};
+    std::atomic<uint32> GProofClaimWitnessSlot{0};
+    std::atomic<uint32> GProofClaimWitnessRec{0};
+    FRHIGPUBufferReadback* ProofReadback=nullptr;
+    bool bProofCopyInFlight=false;
+    uint32 ProofCopySeq=0;
+    ~FVoxelWorklistProofMailbox()
+    {
+        if (auto* Readback=ProofReadback)
+        {
+            ENQUEUE_RENDER_COMMAND(VoxelWorklistProofRelease)([Readback](FRHICommandListImmediate&){delete Readback;});
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // STREAMING-SIDE GPU STATS -- the split for the unattributed +5.47 ms.
@@ -101,15 +139,9 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
-	// The proof's render->game handoff. File-scope atomics rather than members
-	// for VoxelGpuBatchDetail's reason verbatim: the values are written inside
-	// render commands, and one worklist exists in practice. Values are stored
-	// FIRST, then the sequence (release); the game thread reads the sequence
-	// (acquire) before the values.
-	std::atomic<uint32> GProofLandedSeq{ 0 };
 	// --- P2 (voxel.GPU.AsyncGen) engagement counters, render thread ---------
-	// File-scope atomics for the GProof reason verbatim (written inside
-	// render commands / the scene delegate, one worklist exists in practice).
+	// Process-wide engagement totals, written inside render commands and the
+	// scene delegate; unlike proof identity these intentionally aggregate.
 	// sceneWindows: generation windows the SCENE builder consumed (the
 	// overlap actually engaged); serialFallbacks: windows the next flush had
 	// to build on graphics because no scene rendered (correct, no overlap);
@@ -118,38 +150,6 @@ namespace
 	std::atomic<int64> GAsyncGenSceneWindows{ 0 };
 	std::atomic<int64> GAsyncGenSerialFallbacks{ 0 };
 	std::atomic<int64> GAsyncGenWindowsDropped{ 0 };
-	std::atomic<uint32> GProofGpuConsumed{ 0 };
-	std::atomic<uint32> GProofGpuFold{ 0 };
-	std::atomic<uint32> GProofGpuBad{ 0 };
-	std::atomic<uint32> GProofGpuTail{ 0 };
-	// Column-stage verify counters (stats [4..5]); cumulative, like the rest.
-	std::atomic<uint32> GProofColMismatch{ 0 };
-	std::atomic<uint32> GProofColChecked{ 0 };
-	std::atomic<uint32> GProofVoxMismatch{ 0 };
-	std::atomic<uint32> GProofVoxChecked{ 0 };
-	std::atomic<uint32> GProofCtMismatch{ 0 };
-	std::atomic<uint32> GProofCtChecked{ 0 };
-	std::atomic<uint32> GProofStampMismatch{ 0 };
-	std::atomic<uint32> GProofStampChecked{ 0 };
-	std::atomic<uint32> GProofPackMismatch{ 0 };
-	std::atomic<uint32> GProofPackChecked{ 0 };
-	std::atomic<uint32> GProofClaimMismatch{ 0 };
-	std::atomic<uint32> GProofClaimChecked{ 0 };
-	// The claim stage's own TRAFFIC counter (stats[16]): how many records
-	// ClaimWorklistMain found eligible, cumulative, written on every armed
-	// tick whether or not a verify is armed. It is compared against the
-	// host's CumClaimStaged every proof, because those two being different
-	// sets is what let 96% of chunks be claimed TWICE -- once here and once
-	// classically in the batch graph -- with every existing indicator green.
-	std::atomic<uint32> GProofClaimEligible{ 0 };
-	// The claim verify's witness triple (stats [17..19]): which categories of
-	// byte disagreed, and the first record that disagreed. A count told us
-	// only that there was a race; these say whether it is the descriptors
-	// (the duplicate-slot mechanism), the word copies, the record composer,
-	// or a slot the free path failed to clear.
-	std::atomic<uint32> GProofClaimWitnessCat{ 0 };
-	std::atomic<uint32> GProofClaimWitnessSlot{ 0 };
-	std::atomic<uint32> GProofClaimWitnessRec{ 0 };
 
 	// Groups per record per stage -- the host copy of the stage shapes the
 	// converted kernels are written against. The Column entry is LOCKED: it
@@ -300,22 +300,18 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistArgsCS, VOXEL_WORKLIST_ARGS_USF, "Worklist
 #define VOXEL_WORKLIST_CONSUME_USF "/VoxelEarth/VoxelWorklistConsume.usf"
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistConsumeCS, VOXEL_WORKLIST_CONSUME_USF, "WorklistConsumeMain", SF_Compute);
 
+FVoxelGpuWorklist::FVoxelGpuWorklist()
+    : ProofMailbox(MakeShared<FVoxelWorklistProofMailbox, ESPMode::ThreadSafe>())
+{
+}
+
 FVoxelGpuWorklist::~FVoxelGpuWorklist()
 {
-	// The proof readback wraps RHI staging memory; free it in render-thread
-	// order behind any Flush command still touching it -- FVoxelGpuBrickStack's
-	// readback-release pattern, verbatim. (The pointer is normally written on
-	// the render thread; by the time a destructor can run, the game thread has
-	// stopped enqueuing flushes, so this read is not racing a creation.)
-	if (FRHIGPUBufferReadback* Readback = ProofReadback)
-	{
-		ProofReadback = nullptr;
-		ENQUEUE_RENDER_COMMAND(VoxelWorklistProofRelease)(
-			[Readback](FRHICommandListImmediate&)
-		{
-			delete Readback;
-		});
-	}
+    check(IsInGameThread());
+    // Flush commands borrow non-proof worklist buffers through this. Drain those
+    // borrows before destroying members; proof payload ownership is independent.
+    FlushRenderingCommands();
+    ProofMailbox.Reset();
 }
 
 uint32 FVoxelGpuWorklist::FoldRecord(const FVoxelGpuChunkWorkRecord& Record)
@@ -750,28 +746,28 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 	// The render side stored the GPU's four dwords and then the sequence
 	// (release); seeing our sequence here means the values are the answer to
 	// the stash we captured when we requested it.
-	if (bProofPending && GProofLandedSeq.load(std::memory_order_acquire) == ProofSeq)
+	if (bProofPending && ProofMailbox->GProofLandedSeq.load(std::memory_order_acquire) == ProofSeq)
 	{
-		const uint32 GpuConsumed = GProofGpuConsumed.load(std::memory_order_relaxed);
-		const uint32 GpuFold = GProofGpuFold.load(std::memory_order_relaxed);
-		const uint32 GpuBad = GProofGpuBad.load(std::memory_order_relaxed);
-		const uint32 GpuTail = GProofGpuTail.load(std::memory_order_relaxed);
-		const uint32 ColMismatch = GProofColMismatch.load(std::memory_order_relaxed);
-		const uint32 ColChecked = GProofColChecked.load(std::memory_order_relaxed);
-		const uint32 VoxMismatch = GProofVoxMismatch.load(std::memory_order_relaxed);
-		const uint32 VoxChecked = GProofVoxChecked.load(std::memory_order_relaxed);
-		const uint32 CtMismatch = GProofCtMismatch.load(std::memory_order_relaxed);
-		const uint32 CtChecked = GProofCtChecked.load(std::memory_order_relaxed);
-		const uint32 StampMismatch = GProofStampMismatch.load(std::memory_order_relaxed);
-		const uint32 StampChecked = GProofStampChecked.load(std::memory_order_relaxed);
-		const uint32 PackMismatch = GProofPackMismatch.load(std::memory_order_relaxed);
-		const uint32 PackChecked = GProofPackChecked.load(std::memory_order_relaxed);
-		const uint32 ClaimMismatch = GProofClaimMismatch.load(std::memory_order_relaxed);
-		const uint32 ClaimChecked = GProofClaimChecked.load(std::memory_order_relaxed);
-		const uint32 ClaimEligible = GProofClaimEligible.load(std::memory_order_relaxed);
-		Proof.ClaimWitnessCategories = GProofClaimWitnessCat.load(std::memory_order_relaxed);
-		Proof.ClaimWitnessSlot = GProofClaimWitnessSlot.load(std::memory_order_relaxed);
-		Proof.ClaimWitnessRecord = GProofClaimWitnessRec.load(std::memory_order_relaxed);
+		const uint32 GpuConsumed = ProofMailbox->GProofGpuConsumed.load(std::memory_order_relaxed);
+		const uint32 GpuFold = ProofMailbox->GProofGpuFold.load(std::memory_order_relaxed);
+		const uint32 GpuBad = ProofMailbox->GProofGpuBad.load(std::memory_order_relaxed);
+		const uint32 GpuTail = ProofMailbox->GProofGpuTail.load(std::memory_order_relaxed);
+		const uint32 ColMismatch = ProofMailbox->GProofColMismatch.load(std::memory_order_relaxed);
+		const uint32 ColChecked = ProofMailbox->GProofColChecked.load(std::memory_order_relaxed);
+		const uint32 VoxMismatch = ProofMailbox->GProofVoxMismatch.load(std::memory_order_relaxed);
+		const uint32 VoxChecked = ProofMailbox->GProofVoxChecked.load(std::memory_order_relaxed);
+		const uint32 CtMismatch = ProofMailbox->GProofCtMismatch.load(std::memory_order_relaxed);
+		const uint32 CtChecked = ProofMailbox->GProofCtChecked.load(std::memory_order_relaxed);
+		const uint32 StampMismatch = ProofMailbox->GProofStampMismatch.load(std::memory_order_relaxed);
+		const uint32 StampChecked = ProofMailbox->GProofStampChecked.load(std::memory_order_relaxed);
+		const uint32 PackMismatch = ProofMailbox->GProofPackMismatch.load(std::memory_order_relaxed);
+		const uint32 PackChecked = ProofMailbox->GProofPackChecked.load(std::memory_order_relaxed);
+		const uint32 ClaimMismatch = ProofMailbox->GProofClaimMismatch.load(std::memory_order_relaxed);
+		const uint32 ClaimChecked = ProofMailbox->GProofClaimChecked.load(std::memory_order_relaxed);
+		const uint32 ClaimEligible = ProofMailbox->GProofClaimEligible.load(std::memory_order_relaxed);
+		Proof.ClaimWitnessCategories = ProofMailbox->GProofClaimWitnessCat.load(std::memory_order_relaxed);
+		Proof.ClaimWitnessSlot = ProofMailbox->GProofClaimWitnessSlot.load(std::memory_order_relaxed);
+		Proof.ClaimWitnessRecord = ProofMailbox->GProofClaimWitnessRec.load(std::memory_order_relaxed);
 		GpuClaimEligible = int64(ClaimEligible);
 		Proof.ClaimEligibleOnGpu = ClaimEligible;
 		Proof.ClaimStagedOnHost = ProofStashClaims;
@@ -803,7 +799,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		// Its other face is [brick-gpualloc] `unclaimed` going NEGATIVE --
 		// claims + claimFails exceeding shells, claims with no shell behind
 		// them. The leg that found this read unclaimed = -643,164.
-		if (int64(ClaimEligible) > ProofStashClaims)
+		if (VoxelGpuClaimProof::Ahead(ProofStashClaims,ClaimEligible))
 		{
 			UE_LOG(LogVoxelGpuWorklist, Error,
 			       TEXT("[gpu-worklist] CLAIM SET MISMATCH: the GPU claimed %u records but ")
@@ -814,6 +810,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       TEXT("negative by about this much. The leg is invalid."),
 			       ClaimEligible, ProofStashClaims, int64(ClaimEligible) - ProofStashClaims);
 		}
+		// Preserve the checkpoint's partial-cohort mismatch detection too.
 		if (int64(ClaimEligible) < ProofStashClaims)
 		{
 			// The other direction, and it is NOT harmless: the host skipped
@@ -970,16 +967,15 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			ProofStashTail = Tail + Take;
 			ProofStashConsumed = uint32(CumConsumedRecords);
 			ProofStashFold = CumConsumedFold;
-			// The readback follows this flush's HeadClaim, but precedes the
-			// newly deferred async claim. Only consumed staged records carry
-			// claimStaged; queued/unconsumed records never enter this count.
-			ProofStashClaims = CumClaimStaged - (DeferredClaim.bValid ? int64(DeferredClaim.StagedRecords) : 0);
+            // Current async claim is deferred until the next flush; its host
+            // count is not part of the stats copied by this proof graph.
+            ProofStashClaims=VoxelGpuClaimProof::Expected(CumClaimStaged,DeferredClaim.bValid?DeferredClaim.StagedRecords:0u);
 			check(ProofStashClaims >= 0);
 		}
 	}
 
 	ENQUEUE_RENDER_COMMAND(VoxelWorklistFlush)(
-		[this, StagedNow = MoveTemp(Staged), FirstSlot, NewHead,
+		[this, ProofMailbox = ProofMailbox, StagedNow = MoveTemp(Staged), FirstSlot, NewHead,
 		 SliceBudgetRecords, bRequestProof, RequestSeq = ProofSeq,
 		 // Column stage: plain values latched on the game thread. The atlas
 		 // pointer is process-lifetime (FVoxelWorldImpl owns it), the same
@@ -1005,31 +1001,31 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		// Land any outstanding proof copy BEFORE building this tick's graph:
 		// Lock/Unlock want a quiescent readback, and the values must be
 		// published before the game thread can see the sequence move.
-		if (bProofCopyInFlight && ProofReadback != nullptr && ProofReadback->IsReady())
+		if (ProofMailbox->bProofCopyInFlight && ProofMailbox->ProofReadback != nullptr && ProofMailbox->ProofReadback->IsReady())
 		{
-			const uint32* Data = static_cast<const uint32*>(ProofReadback->Lock(kStatsDwords * sizeof(uint32)));
+			const uint32* Data = static_cast<const uint32*>(ProofMailbox->ProofReadback->Lock(kStatsDwords * sizeof(uint32)));
 			if (Data != nullptr)
 			{
-				GProofGpuConsumed.store(Data[0], std::memory_order_relaxed);
-				GProofGpuFold.store(Data[1], std::memory_order_relaxed);
-				GProofGpuBad.store(Data[2], std::memory_order_relaxed);
-				GProofGpuTail.store(Data[3], std::memory_order_relaxed);
-				GProofColMismatch.store(Data[4], std::memory_order_relaxed);
-				GProofColChecked.store(Data[5], std::memory_order_relaxed);
-				GProofVoxMismatch.store(Data[6], std::memory_order_relaxed);
-				GProofVoxChecked.store(Data[7], std::memory_order_relaxed);
-				GProofCtMismatch.store(Data[8], std::memory_order_relaxed);
-				GProofCtChecked.store(Data[9], std::memory_order_relaxed);
-				GProofStampMismatch.store(Data[10], std::memory_order_relaxed);
-				GProofStampChecked.store(Data[11], std::memory_order_relaxed);
-				GProofPackMismatch.store(Data[12], std::memory_order_relaxed);
-				GProofPackChecked.store(Data[13], std::memory_order_relaxed);
-				GProofClaimMismatch.store(Data[14], std::memory_order_relaxed);
-				GProofClaimChecked.store(Data[15], std::memory_order_relaxed);
+				ProofMailbox->GProofGpuConsumed.store(Data[0], std::memory_order_relaxed);
+				ProofMailbox->GProofGpuFold.store(Data[1], std::memory_order_relaxed);
+				ProofMailbox->GProofGpuBad.store(Data[2], std::memory_order_relaxed);
+				ProofMailbox->GProofGpuTail.store(Data[3], std::memory_order_relaxed);
+				ProofMailbox->GProofColMismatch.store(Data[4], std::memory_order_relaxed);
+				ProofMailbox->GProofColChecked.store(Data[5], std::memory_order_relaxed);
+				ProofMailbox->GProofVoxMismatch.store(Data[6], std::memory_order_relaxed);
+				ProofMailbox->GProofVoxChecked.store(Data[7], std::memory_order_relaxed);
+				ProofMailbox->GProofCtMismatch.store(Data[8], std::memory_order_relaxed);
+				ProofMailbox->GProofCtChecked.store(Data[9], std::memory_order_relaxed);
+				ProofMailbox->GProofStampMismatch.store(Data[10], std::memory_order_relaxed);
+				ProofMailbox->GProofStampChecked.store(Data[11], std::memory_order_relaxed);
+				ProofMailbox->GProofPackMismatch.store(Data[12], std::memory_order_relaxed);
+				ProofMailbox->GProofPackChecked.store(Data[13], std::memory_order_relaxed);
+				ProofMailbox->GProofClaimMismatch.store(Data[14], std::memory_order_relaxed);
+				ProofMailbox->GProofClaimChecked.store(Data[15], std::memory_order_relaxed);
 				// [16..19] WERE ALLOCATED, WRITTEN AND COPIED, AND THEN NEVER
 				// READ. The stats buffer is kStatsDwords = 20 dwords, the copy
 				// pass copies all 20, and Lock() maps all 20 -- but this unpack
-				// stopped at Data[15]. GProofClaimEligible therefore never left
+				// stopped at Data[15]. ProofMailbox->GProofClaimEligible therefore never left
 				// its {0} initialiser, and `wlclaim gpuClaimed` printed a hard
 				// 0 on every leg the claim stage has ever run.
 				//
@@ -1048,20 +1044,20 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				// missing, reads as the most alarming value in its range. It
 				// cannot be caught by checking the producer -- which is what
 				// every elimination pass here did.
-				GProofClaimEligible.store(Data[16], std::memory_order_relaxed);
+				ProofMailbox->GProofClaimEligible.store(Data[16], std::memory_order_relaxed);
 				// [17..19]: the claim verify's WITNESS -- categories seen, the
 				// first failing record's ChunkSlot (+1), and its packed
 				// record-index/category. Read here and nowhere else, and read
 				// UNCONDITIONALLY: the last three dwords of this buffer were
 				// allocated, written and copied and then not read for a whole
 				// session, which is the defect this very line replaces.
-				GProofClaimWitnessCat.store(Data[17], std::memory_order_relaxed);
-				GProofClaimWitnessSlot.store(Data[18], std::memory_order_relaxed);
-				GProofClaimWitnessRec.store(Data[19], std::memory_order_relaxed);
-				GProofLandedSeq.store(ProofCopySeq, std::memory_order_release);
+				ProofMailbox->GProofClaimWitnessCat.store(Data[17], std::memory_order_relaxed);
+				ProofMailbox->GProofClaimWitnessSlot.store(Data[18], std::memory_order_relaxed);
+				ProofMailbox->GProofClaimWitnessRec.store(Data[19], std::memory_order_relaxed);
+				ProofMailbox->GProofLandedSeq.store(ProofMailbox->ProofCopySeq, std::memory_order_release);
 			}
-			ProofReadback->Unlock();
-			bProofCopyInFlight = false;
+			ProofMailbox->ProofReadback->Unlock();
+			ProofMailbox->bProofCopyInFlight = false;
 		}
 		// ON THE RHI COMMAND LIST, NOT THE GRAPH, AND THAT IS FORCED. An
 		// RDG_EVENT_SCOPE_STAT here asserts at FRDGBuilder::Execute --
@@ -1252,13 +1248,13 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 
 			if (bRequestProof)
 			{
-				if (ProofReadback == nullptr)
+				if (ProofMailbox->ProofReadback == nullptr)
 				{
-					ProofReadback = new FRHIGPUBufferReadback(TEXT("Voxel.WorklistProof"));
+					ProofMailbox->ProofReadback = new FRHIGPUBufferReadback(TEXT("Voxel.WorklistProof"));
 				}
-				AddEnqueueCopyPass(GraphBuilder, ProofReadback, Stats, kStatsDwords * uint32(sizeof(uint32)));
-				bProofCopyInFlight = true;
-				ProofCopySeq = RequestSeq;
+				AddEnqueueCopyPass(GraphBuilder, ProofMailbox->ProofReadback, Stats, kStatsDwords * uint32(sizeof(uint32)));
+				ProofMailbox->bProofCopyInFlight = true;
+				ProofMailbox->ProofCopySeq = RequestSeq;
 			}
 		}
 		GraphBuilder.Execute();
@@ -1444,7 +1440,7 @@ void FVoxelGpuWorklist::RenderThread_AddGenStages(FRDGBuilder& GraphBuilder,
 			SDispatch.Spans = MakeBlobBuffer(
 				TEXT("Voxel.WorklistAssetSpans"), InWindow.StampSpans.GetData(),
 				uint32(InWindow.StampSpans.Num()), sizeof(uint32));
-			SDispatch.bHasOwnedWinners=InWindow.StampInstances.ContainsByPredicate([](const auto& I){return I.RenderOwned!=0;});
+			SDispatch.bHasOwnedWinners=InWindow.StampInstances.ContainsByPredicate([](const auto& I){return I.RenderOwned!=0 || I.SuppressTerrainRender!=0;});
 			SDispatch.bAsyncCompute = bAsyncCompute;
 			VoxelGpuWorldGen::AddWorklistAssetStampPass(GraphBuilder, SDispatch);
 		}

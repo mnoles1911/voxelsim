@@ -39,12 +39,19 @@ uint32 OwnershipSample(const FVoxelGpuRegionRequest& R,const FVoxelGpuRegionRequ
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelGpuOwnedWinnerTest,"Voxel.GPU.AssetOwnedWinner",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
 bool FVoxelGpuOwnedWinnerTest::RunTest(const FString&){
     if(!VoxelGpuWorldGen::IsSupportedOnCurrentRHI()){AddError(TEXT("Requires SM6 GPU"));return false;}
-    for(int Level:{0,1,3,7})for(int Yaw=0;Yaw<4;++Yaw)for(int Mode=0;Mode<4;++Mode){
-        auto Request=OwnershipRequest(Level,Yaw,Mode);TArray<uint32> Initial,Expected,Classic,Worklist;Initial.Init(0x5a123400u,32768);
+    for(int Level:{0,1,3,7})for(int Yaw=0;Yaw<4;++Yaw)for(int Mode=0;Mode<4;++Mode)for(int Channel=0;Channel<3;++Channel){
+        auto Request=OwnershipRequest(Level,Yaw,Mode);
+        // Exercise each public API independently and both together against the
+        // same CPU first-winner oracle, including the mirrored 52-byte GPU ABI.
+        for(auto& I:Request.AssetInstances){
+            if(Channel!=0)I.SuppressTerrainRender=I.RenderOwned;
+            if(Channel==1)I.RenderOwned=0;
+        }
+        TArray<uint32> Initial,Expected,Classic,Worklist;Initial.Init(0x5a123400u,32768);
         if(Mode!=3){Initial[OwnershipCell(0,0,0)]|=4;Initial[OwnershipCell(1,0,1)]|=5;}
         Expected=Initial;int OwnedWinners=0,LaterWinners=0;
         for(int X=0;X<32;++X)for(int Y=0;Y<32;++Y)for(int Z=0;Z<32;++Z){auto& C=Expected[OwnershipCell(X,Y,Z)];if(C&255)continue;
-            for(int A=0;A<Request.AssetInstances.Num();++A){const auto& I=Request.AssetInstances[A];const uint32 M=OwnershipSample(Request,I,X,Y,Z);if(M){C|=I.RenderOwned?0:M;OwnedWinners+=I.RenderOwned!=0;LaterWinners+=A>0;break;}}
+            for(int A=0;A<Request.AssetInstances.Num();++A){const auto& I=Request.AssetInstances[A];const uint32 M=OwnershipSample(Request,I,X,Y,Z);if(M){const bool Suppressed=I.RenderOwned!=0 || I.SuppressTerrainRender!=0;C|=Suppressed?0:M;OwnedWinners+=Suppressed;LaterWinners+=A>0;break;}}
         }
         if(Mode)TestTrue(TEXT("fixture actually exercises owned winners"),OwnedWinners>0);TestTrue(TEXT("fixture includes earlier-air later winner"),LaterWinners>0);
         FString Failure;
@@ -55,7 +62,7 @@ bool FVoxelGpuOwnedWinnerTest::RunTest(const FString&){
             VoxelGpuWorldGen::AddClassicAssetStampPasses(Graph,Request,C);
             FVoxelGpuChunkWorkRecord Record;Record.LevelFlags=uint32(Level)|(1u<<8)|(1u<<9);Record.AssetCount=Request.AssetInstances.Num();
             TArray<FVoxelWorklistAssetInstance> Instances;
-            for(const auto& I:Request.AssetInstances){auto& V=Instances.AddDefaulted_GetRef();V.AnchorRelVx=I.AnchorRelVx;V.AnchorRelVy=I.AnchorRelVy;V.AnchorVz=I.AnchorVz;V.GridOriginZ=I.GridOriginZ;V.RotOriginX=I.RotOriginX;V.RotOriginY=I.RotOriginY;V.YawQuarter=I.YawQuarter;V.SizeX=I.SizeX;V.SizeY=I.SizeY;V.SizeZ=I.SizeZ;V.ColStartsBase=I.ColStartsBase;V.RenderOwned=I.RenderOwned;}
+            for(const auto& I:Request.AssetInstances){auto& V=Instances.AddDefaulted_GetRef();V.AnchorRelVx=I.AnchorRelVx;V.AnchorRelVy=I.AnchorRelVy;V.AnchorVz=I.AnchorVz;V.GridOriginZ=I.GridOriginZ;V.RotOriginX=I.RotOriginX;V.RotOriginY=I.RotOriginY;V.YawQuarter=I.YawQuarter;V.SizeX=I.SizeX;V.SizeY=I.SizeY;V.SizeZ=I.SizeZ;V.ColStartsBase=I.ColStartsBase;V.RenderOwned=I.RenderOwned;V.SuppressTerrainRender=I.SuppressTerrainRender;}
             uint32 Control[]={0,1};uint32 Args[]={16,1,1};
             VoxelGpuWorldGen::FWorklistAssetStampDispatch D;
             D.Records=CreateStructuredBuffer(Graph,TEXT("OwnedTest.Records"),sizeof(Record),1,&Record,sizeof(Record));
