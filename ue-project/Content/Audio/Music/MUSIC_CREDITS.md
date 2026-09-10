@@ -27,7 +27,8 @@ right folder -- no code change and no registration, exactly like dropping a
 
 **Dawn, Dusk and Rain are empty**, and that is a supported state, not a fault:
 `Explore/Dawn` borrows `Explore/Day`, and `Explore/Dusk` borrows Day then
-Night, per section 4's borrow rule. Section 7 lists the twenty cues that still
+Night, per section 4's borrow rule. `docs/music-prompts.md` (rewritten 2026-09-09 for the
+survival and building game) lists the 31 cues that still
 have to be generated to fill them.
 
 ## Tracks, by pool
@@ -197,12 +198,9 @@ front end resolves against.
 
 ## The prompts that make these files
 
-`docs/music-prompts.md` -- the Suno portfolio (59 cues, style prompt + structure
-prompt each, with explicit key, BPM and lead instrument), copied from the Godot
-checkout so the recipe sits with the output. Its header records what it does NOT
-cover: the three tracks that exist in that repo today predate it and their
-prompts were never written down anywhere.
-`docs/music-generation-prompts-2026-09-08.md` -- the ~20 cues section 7 says are
+`docs/music-prompts-rpg-era-2026-05-16.md` -- the story-era Suno portfolio (59 cues,
+archived 2026-09-09) that most of the cues on disk were generated from.
+`docs/music-prompts.md` section 5 -- the 31 cues the 2026-09-09 plan says are
 still missing, with their prompts.
 
 ## Committed re-encodes

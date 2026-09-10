@@ -3116,3 +3116,13 @@ Interior/Sacred cues 21-24, and the Cinematic/Ending sets 49-59.
   game window held the DLL pair); the headless tests cover the pure half only, and the
   crossfade, the gap timer and the boat/cave signal transitions have never executed. The
   selection log line is what a first attended launch should be read against.
+
+### 15d. Music: the 2026-09-09 restart (survival and building OST)
+
+The 59-cue story-era plan is archived (`docs/music-prompts-rpg-era-2026-05-16.md`); the new
+`docs/music-prompts.md` carries 31 slow, background cues in one instrument family. Left to do:
+the `Archive/` folder and moving the 13 story-era files into it (unscanned); rename the `Town`
+folder and enum to Hearth and `Combat` to Danger together with their signals (Hearth = "near
+your own structures", Danger = a threat); a precipitation signal for Rain; the 60-150 s gap
+(code has 45-120); audition World Map _ Travel and Discovery_Wonder against the six Explore
+rules; a Settings row for gap length.
