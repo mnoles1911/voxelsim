@@ -1,0 +1,26 @@
+﻿{
+    "finishedUtc":  "2026-09-10T15:06:44.2798242Z",
+    "endInputHashes":  {
+                           "speciesManifestSha256":  "0197DA097E17A2634C2F15DCA0589E5E98157EB631C2998513769738427DD4F6",
+                           "configurationSha256":  "E68B98F5D52952D59CECE8E4403C6D42EADDB9FEE5D3259DABB999A6F1AD0936",
+                           "detailCacheManifestSha256":  "BE42BAD8D48E8C38E5AF3F5E5C2C02BB2F6930C06C27EF93C81250033F55198C"
+                       },
+    "manifestSha256":  "252104C1AFB8AC5D8EFEAE9ACCDB3F2575022B62FEBC03E0883C300D6BF29132",
+    "failure":  null,
+    "schema":  1,
+    "artifactHashes":  {
+                           "game.log":  "1312350C1909AEB8360A9E08EF7D58BA2FB595814901C7939A55B844929651F9",
+                           "frames.csv":  "B9AA704E0A680CE08CB8BFE065EA09F437C1F0FA2B7EA9BE34CB6CB2A475472E"
+                       },
+    "status":  "passed",
+    "endRuntimeModuleHashes":  {
+                                   "UnrealEditor-VoxelEarthShaders.dll":  "2F9A3F7AD8D706DF2ABCA410C49583E5A81F9A47BA172462278463967E66CC2C",
+                                   "UnrealEditor-VoxelEarth.dll":  "3D084472E90558F6D4111A1406952ED3C725FB5CF8F8B3D01A70592B29E902A0",
+                                   "UnrealEditor-VoxelEarthUI.dll":  "5DC6C1D3DBC6FE5941DE8E9EC4C02EC74A41B6AF4C9DB3C7E9C7FB129A342B09"
+                               },
+    "processExitCode":  0,
+    "competingProcesses":  [
+
+                           ],
+    "startedUtc":  "2026-09-10T14:58:13.5897089Z"
+}
