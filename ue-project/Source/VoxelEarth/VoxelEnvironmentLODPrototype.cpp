@@ -456,7 +456,7 @@ bool AVoxelEnvironmentLODPrototype::InitializeAssetFromVxa(FVoxelEnvironmentAsse
     if(bVisualOnlyPreparation)return false;
     if(StagedRestore||PreparedRestore||Vxa.IsEmpty()||Descriptor.HasComposition()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform()))return false;
     vxc::AssetGrid Source;if(Source.parse(Vxa.GetData(),Vxa.Num())!=vxc::AssetParseError::kOk)return false;
-    const double FinestMm=Source.voxelSizeMm();if(FinestMm!=12.5&&FinestMm!=25&&FinestMm!=50&&FinestMm!=100)return false;
+    const double FinestMm=Source.voxelSizeMm();if(FinestMm!=25&&FinestMm!=50&&FinestMm!=100)return false;
     const FString Hash=FMD5::HashBytes(Vxa.GetData(),Vxa.Num());
     if(!Descriptor.Legacy){if(!Descriptor.SourceHash.IsEmpty()&&!Descriptor.SourceHash.Equals(Hash,ESearchCase::IgnoreCase))return false;Descriptor.SourceHash=Hash;}
     if(!Descriptor.IsValid())return false;
@@ -543,7 +543,7 @@ bool AVoxelEnvironmentLODPrototype::PersistentState(FArchive& Ar) {
     if(Ar.IsError()||!VoxelEnvironmentAsset::IsSupportedTransform(Transform)||Grid.Size.X<=0||Grid.Size.Y<=0||Grid.Size.Z<=0||Grid.Size.GetMax()>FPrototypeGrid::MaxAxis)return false;
     if(Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
     for(int32 Axis=0;Axis<3;++Axis)if(FMath::Abs(int64(Grid.Origin[Axis]))>1000000)return false;
-    if((Grid.Mm!=12.5&&Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100))return false;
+    if((Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100))return false;
     if(Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
     for(int32 Axis=0;Axis<3;++Axis)if(FMath::Abs(int64(Grid.Origin[Axis]))>1000000)return false;
     if(!(Ar.IsSaving()?State->Grids[0].Serialize(Ar):Grid.Serialize(Ar)))return false;
@@ -625,7 +625,7 @@ void AVoxelEnvironmentLODPrototype::BeginStagedObjectRestore(FVoxelImmutableGeom
             Job->Appearance=FVoxelAssetAppearance::ForCanonicalYaw(FVoxelAssetAppearance::Load(Job->Descriptor.AppearanceSourceHash()),Job->Descriptor.AppearanceYawQuarter());
             D<<Job->Transform<<Grid.Size<<Grid.Origin<<Grid.Mm<<Grid.MaxDataZ<<Job->Collision<<Job->Severed;
             if(D.IsError()||D.Tell()!=D.TotalSize()||!VoxelEnvironmentAsset::IsSupportedTransform(Job->Transform)||Grid.Size.GetMin()<=0||Grid.Size.GetMax()>FPrototypeGrid::MaxAxis)return false;
-            if((Grid.Mm!=12.5&&Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100)||Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
+            if((Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100)||Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
             for(int A=0;A<3;++A)if(FMath::Abs(int64(Grid.Origin[A]))>1000000)return false;
             if(!Grid.Serialize(G)||G.Tell()!=G.TotalSize())return false;
             Job->WoodPerLayer.Init(0,Grid.Size.Z);
