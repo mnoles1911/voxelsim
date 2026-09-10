@@ -27,7 +27,7 @@ from analyze_ecological_route_frames import frame_rows
 
 STAGES = ["Entry", "Footprint", "Memo", "Compute", "Resolve", "Sky", "Nearest", "Prefetch"]
 COUNTERS = ["ZCells", "Evaluations", "MemoHits", "EpochInvalidations"]
-PREFIX = "VoxelStream/GameThread/R0Entry"
+PREFIX = "VoxelStream/R0Entry"  # CSV_CUSTOM_STAT names carry no thread segment (unlike scoped timers)
 LOG_MARKER = "R0EntryProfile inclusive slice-window-max ms:"
 NESTING = [  # (label, lhs stages summed, rhs stage) : sum(lhs) <= rhs + tolerance
     ("resolve<=compute", ["Resolve"], "Compute"),
