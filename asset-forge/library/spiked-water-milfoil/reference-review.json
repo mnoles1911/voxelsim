@@ -1,0 +1,130 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/myriophyllum-spicatum/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myriophyllum_spicatu_VjcVqEyHFWoQ.jpeg"
+  ],
+  "photo_reviewer": "Astra root actual photo review; understory agent geometry comparison",
+  "photo_observations": {
+    "species": "spiked-water-milfoil",
+    "taxon": "Myriophyllum spicatum",
+    "source": "https://plants.ces.ncsu.edu/plants/myriophyllum-spicatum/",
+    "photos": [
+      {
+        "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myriophyllum_spicatu_VjcVqEyHFWoQ.jpeg",
+        "credit": "\u00d0\u2018\u00d0\u00be\u00d0\u00b3\u00d0\u00b4\u00d0\u00b0\u00d0\u00bd\u00d0\u00be\u00d0\u00b2\u00d0\u00b8\u00d1\u2021 \u00d0\u00a1\u00d0\u00b2\u00d0\u00b5\u00d1\u201a\u00d0\u00bb\u00d0\u00b0\u00d0\u00bd\u00d0\u00b0, CC BY-NC 4.0",
+        "caption": "Leaves and stem held against hand"
+      }
+    ],
+    "viewed_photos": true,
+    "observations": "Feather-like leaves radiate at separated whorls around pale reddish stems. Each leaf has a central rachis and many paired fine segments; different from hornwort's few repeated forks. Wet specimen droops outside water.",
+    "metric_notes": "Leaves under51mm; roughly four per whorl; thread segments4\u00e2\u20ac\u201c13mm. Full stem length1.8\u00e2\u20ac\u201c6m is underwater, not emergent height.",
+    "spring_notes": "Summer flower spikes excluded; spring submerged olive-green shoots.",
+    "voxel_implications": "Fine pinnules are subvoxel. Model a bounded underwater shoot segment/patch and coarse whorl spacing; avoid scaling feather leaves to giant fern fronds."
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Submerged20-42cm shoot segment patch; four feather leaves per whorl with40mm rachis and10mm paired segments. Fine pinnules merge at25mm; no emergent summer spikes or metre-long enlarged fronds.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "11747a66b1d1e847fecf36aeaeacc1219749c9e5efa2a58c3c5fdb43503d38ab",
+  "sheet_hash": "a2e34f899a522f7d700c571bcadda2f753794d4f4714db03f049d96401381de9",
+  "reviewed_at": 1788861146.2567544,
+  "pilot_hashes": {
+    "1": "2d6d53daa6aaf9eac65b443d38ead6532f64c5a5c5b86f4e525bcaa78f0fc6ce",
+    "4": "859fd3f6b181c1c607e64e784a8fc598ab5f8735baa35fc43211a0848d0dd79d",
+    "7": "9eba88e5fbe771e7c385906b819d1bf91c6131301df7ecdb29146ec84694ef7b"
+  },
+  "profile": "spiked-water-milfoil",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myriophyllum_spicatu_VjcVqEyHFWoQ.jpeg",
+      "credit": "\u00d0\u2018\u00d0\u00be\u00d0\u00b3\u00d0\u00b4\u00d0\u00b0\u00d0\u00bd\u00d0\u00be\u00d0\u00b2\u00d0\u00b8\u00d1\u2021 \u00d0\u00a1\u00d0\u00b2\u00d0\u00b5\u00d1\u201a\u00d0\u00bb\u00d0\u00b0\u00d0\u00bd\u00d0\u00b0, CC BY-NC 4.0",
+      "caption": "Leaves and stem held against hand"
+    }
+  ],
+  "taxon": "Myriophyllum spicatum",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a2e34f899a522f7d700c571bcadda2f753794d4f4714db03f049d96401381de9"
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "id": "granite-boulder-0102",
+  "species": "granite-boulder",
+  "kind": "rock",
+  "category": "environment",
+  "seed": 102,
+  "imported": false,
+  "inventory_candidate": true,
+  "visual_approved": false,
+  "review_status": "inventory_candidate",
+  "spec_hash": "8e7ae98b0eaa5264",
+  "generation_key": "af597656f860238681c6ecac41a7a826424d8dae0fc0dc54d3d34c272a852f99",
+  "generator_digest": "e237bd8f343afe5e6caf362f2e1ff71b6b4f79d7fb3dcfc2e670ce2ad41fef5e",
+  "artifact_hashes": {
+    "realized.json": "6fa541f0e85bb7da63b8d890d21403f590f1ae6e882c64c79cb8e6ea322e2569",
+    "spec.json": "ca838358dafa85d027cd4b373dbd70c6407fc235a6a2a6987c89dd76b4da67f6",
+    "thumb.png": "7bd9544de5063e166f29e1593978b397eefdb14a71826d42a7896d75f2b0f5c8",
+    "tree.vox": "712a6146222f527f62e12e221b8e78b2ab5c987d04f876388c3c019ad1455d75",
+    "tree.vxa": "0520053ae6f0dc6fddb9000ad1918498b22486265cccb2313e6e269867fdf510"
+  },
+  "asset_bytes": 56914,
+  "stats": {
+    "seed": 102,
+    "spec_hash": "8e7ae98b0eaa5264",
+    "kind": "rock",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "bridges_added": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 10.0,
+    "height_m": 1.5,
+    "length_m": 2.3,
+    "footprint_m": [
+      2.3,
+      2.3
+    ],
+    "grid_mb": 0.0,
+    "extent_vox": [
+      23,
+      23,
+      15
+    ],
+    "vox_models_needed": 1,
+    "voxels": 4636,
+    "by_material": {
+      "2": 4636
+    },
+    "ground_contact": 325,
+    "ms_grow": 3.3,
+    "ms_raster": 36.9,
+    "ms_total": 41.4
+  },
+  "problems": [],
+  "vox_models": 1,
+  "generation_seconds": 0.09,
+  "batch_id": "4a08cc7a3e06",
+  "fingerprint_migration": {
+    "from": "27b125c72dc94933ab6e17a67eabec6ede3dc551b74c9fdeb02a5517d4540744",
+    "reason": "Exclude orchestration and UI modules from generator fingerprint; geometry and export modules unchanged"
+  }
+}

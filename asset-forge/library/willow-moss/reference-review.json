@@ -1,0 +1,120 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.westglamorganflora.org.uk/bryophytes/fontinalis-antipyretica/",
+  "viewed_photos": [
+    "https://www.westglamorganflora.org.uk/site/assets/files/29891/fontinalis_antipyretica_greater_water-moss_01feb12_1a.800x0.jpg"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Barry Stewart February closeup viewed: glossy overlapping strongly keeled triangular leaflets along long trailing branching axes. Regional flora5mm leaves;25mm only colony branching silhouette, not enlarged willow-like blades. Shallow15cm underwater patch.",
+    "viewed_photos": [
+      "https://www.westglamorganflora.org.uk/site/assets/files/29891/fontinalis_antipyretica_greater_water-moss_01feb12_1a.800x0.jpg"
+    ],
+    "source": "https://www.westglamorganflora.org.uk/bryophytes/fontinalis-antipyretica/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Shallow7-12cm underwater trailing branched colony, no tall bush or enlarged5mm leaves. Fine keeled leaves disappear into the25mm colony silhouette; open margins and branch extent remain variable.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "a914708c103885d90c8d0b3c186b84b65bbadeade784bb9d96e2169bed3662d6",
+  "sheet_hash": "5e9609b0988b8559e77ba4c42c53b9ef0d86513c3ea48a407c8a6a2ce68a2df1",
+  "reviewed_at": 1788861145.9986243,
+  "pilot_hashes": {
+    "1": "99055893f2a6812f8f5f5bec4ad3904b433770aced986ce651f2a9e4691c5fb5",
+    "4": "0ad328563323fc4ddfb28added18be96dde6d6724c7698c314ff7de0bb4d04f3",
+    "7": "f9fad2230d2c2cdac9d9a244ac1b2975da73faf89bfcf8bb7886fb6d02c3fe85"
+  },
+  "profile": "willow-moss",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://www.westglamorganflora.org.uk/site/assets/files/29891/fontinalis_antipyretica_greater_water-moss_01feb12_1a.800x0.jpg",
+      "credit": "Barry Stewart",
+      "caption": "Actual species photograph"
+    }
+  ],
+  "taxon": "Fontinalis antipyretica",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "5e9609b0988b8559e77ba4c42c53b9ef0d86513c3ea48a407c8a6a2ce68a2df1"
+  }
+}

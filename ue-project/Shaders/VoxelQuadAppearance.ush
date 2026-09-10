@@ -1,0 +1,35 @@
+// Approved per-pixel appearance for pooled voxel quads.
+#ifndef VOXEL_QUAD_APPEARANCE_USH
+#define VOXEL_QUAD_APPEARANCE_USH
+#include "/VoxelEarth/VoxelTerrainAppearance.ush"
+bool VoxelQuadSurfaceAppearance(StructuredBuffer<uint> Pages,StructuredBuffer<uint> Sources,
+    StructuredBuffer<uint2> Ranges,StructuredBuffer<uint4> Slots,
+    float4 LocalAndIdentity,uint Material,float3 PixelDx,float3 PixelDy,
+    out float3 RGB,out float Coverage)
+{
+    RGB=0;Coverage=1;
+    uint Identity=uint(LocalAndIdentity.w+0.5);
+    uint Slot=Identity>>3u,Axis=(Identity>>1u)&3u,Positive=Identity&1u;
+    uint SlotCount,Stride;Slots.GetDimensions(SlotCount,Stride);
+    if(Slot==0u||Slot>=SlotCount||Axis>2u)return false;
+    uint4 D=Slots[Slot];uint PageCount;Pages.GetDimensions(PageCount,Stride);
+    if(D.x>PageCount)return false;
+    if(D.y>PageCount-D.x||D.y<80u)return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - preceding branch bounds D.x by PageCount
+    uint Level=Pages[D.x+5u];if(Level>7u)return false;
+    float3 CellFloat=floor(LocalAndIdentity.xyz);
+    if(any(CellFloat<0)||any(CellFloat>=32))return false;
+    int3 LocalCell=int3(CellFloat);
+    int3 Key=int3(asint(Pages[D.x+2u]),asint(Pages[D.x+3u]),asint(Pages[D.x+4u]));
+    int64_t X=int64_t(Key.x)*32+LocalCell.x,Y=int64_t(Key.y)*32+LocalCell.y,Z=int64_t(Key.z)*32+LocalCell.z;
+    if(X<-2147483648LL||X>2147483647LL||Y<-2147483648LL||Y>2147483647LL||Z<-2147483648LL||Z>2147483647LL)return false;
+    float3 Fraction=LocalAndIdentity.xyz-CellFloat;
+    Fraction[Axis]=Positive?1.0:0.0;
+    uint Scale=1u<<(Level&7u); // lint-shader-ub: allow VARIABLE_SHIFT - masked to zero through seven
+    // Conservative projected footprint: 0.13m is the smaller approved period.
+    // Source yaw is orthonormal, so tangent derivative length is invariant.
+    float Footprint=max(length(PixelDx),length(PixelDy))*(0.1*float(Scale)/0.13);
+    float2 UV;
+    return VoxelTerrainSurfaceAppearance(Pages,Sources,Ranges,D,int3(int(X),int(Y),int(Z)),
+        Fraction,Axis,Positive,Material,100.0*float(Scale),Footprint,RGB,Coverage,UV);
+}
+#endif

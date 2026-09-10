@@ -1,0 +1,20 @@
+#include "/Engine/Public/Platform.ush"
+#define VOXEL_MARCH_SOURCE 1
+#define VOXEL_MARCH_RINGS 1
+#include "/VoxelEarth/VoxelBrickTraverse.ush"
+uint QueryCount;
+StructuredBuffer<float4> ProbeRays;
+RWStructuredBuffer<uint4> ProbeHits;
+[numthreads(64,1,1)]
+void BrickAppearanceProbeMain(uint3 ID:SV_DispatchThreadID){
+    if(ID.x>=QueryCount)return;
+    float4 A=ProbeRays[ID.x*2u],B=ProbeRays[ID.x*2u+1u];
+    VoxelMarchBeginLevel(asuint(B.w));
+    FVoxelMarchHit F=VoxelMarchTraverseBrick(A.xyz,B.xyz,0.0,A.w,0.0);
+    VoxelMarchBeginLevel(asuint(B.w));
+    FVoxelMarchHit H=VoxelMarchTraverseBrickHier(A.xyz,B.xyz,0.0,A.w,0.0);
+    ProbeHits[ID.x*4u]=uint4(F.bHit?1u:0u,F.Material,asuint(F.Voxel.x),asuint(F.Voxel.y));
+    ProbeHits[ID.x*4u+1u]=uint4(asuint(F.Voxel.z),asuint(F.FaceAxis),asuint(F.FaceSign),asuint(F.THitUU));
+    ProbeHits[ID.x*4u+2u]=uint4(H.bHit?1u:0u,H.Material,asuint(H.Voxel.x),asuint(H.Voxel.y));
+    ProbeHits[ID.x*4u+3u]=uint4(asuint(H.Voxel.z),asuint(H.FaceAxis),asuint(H.FaceSign),asuint(H.THitUU));
+}

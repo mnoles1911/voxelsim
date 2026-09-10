@@ -1,0 +1,89 @@
+{
+  "species": "hornbeam",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Dense upright oval crown matches the open-grown specimen; the paired leafless photograph informs fork structure."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "/site/assets/files/4607/carpinus-betulus-24.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/carpinus/carpinus-betulus/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "/site/assets/files/4607/carpinus-betulus-26.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/carpinus/carpinus-betulus/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "carpinus-betulus",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/carpinus-betulus/",
+    "https://www.treesandshrubsonline.org/articles/carpinus/carpinus-betulus/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "f283a419a538e125329eaefe7271f5072c46b2e5e7b3e2c1ae9db70b507f9a34",
+    "4": "d358099fa131be399f230f98e19c7f5392be4cfedc8d65eabe0003c945708506",
+    "7": "10d4121c69573b2960d7c6f7066a4a7111a0b2e8e05a692f433e6307686bfc14"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "569748cefc16886bebfa91861e865bfae7080f99bb2038e95703c3dd86280335"
+  }
+}

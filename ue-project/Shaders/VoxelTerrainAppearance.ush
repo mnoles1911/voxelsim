@@ -1,0 +1,62 @@
+#ifndef VOXEL_TERRAIN_APPEARANCE_USH
+#define VOXEL_TERRAIN_APPEARANCE_USH
+#include "/VoxelEarth/VoxelSparseAppearance.ush"
+#include "/VoxelEarth/VoxelApprovedAppearance.ush"
+
+// Explicit canonical Material IDs from voxelcore/core.h, never RGB inference.
+// Bark16..18 and root23 stay opaque. Only the declared foliage IDs use masks.
+bool VoxelTerrainAppearanceIsFoliage(uint Material)
+{
+    return Material==19u||Material==20u||Material==21u||Material==22u||Material==24u||Material==25u;
+}
+// Descriptor=(pageBase,pageCount,sourceRangeBase,sourceRangeCount).
+// WorldCell is the authoritative owning level-zero voxel, not floor(hitPoint)
+// at a boundary. Fraction is relative to that owning voxel, including 0/1 edges.
+// Footprint is in approved mask pattern units, supplied by each ray consumer.
+// False means ordinary material fallback; it NEVER means transparent geometry.
+// True yields final linear source color; coverage below .5 means continue the
+// SAME ray walk past this face. No material/occupancy buffers are changed here.
+bool VoxelTerrainSurfaceAppearance(
+    StructuredBuffer<uint> Pages,StructuredBuffer<uint> Sources,
+    StructuredBuffer<uint2> Ranges,uint4 Descriptor,int3 WorldCell,
+    float3 Fraction,uint WorldAxis,uint Positive,uint Material,float PitchMm,float PatternFootprint,
+    out float3 LinearRGB,out float Coverage,out float2 SourceUV)
+{
+    LinearRGB=0;Coverage=1.0;SourceUV=0;
+    // Page level selects the representative source voxel; source pitch stays100mm.
+    uint PageTotal,PageStride;Pages.GetDimensions(PageTotal,PageStride);
+    if(Descriptor.x>PageTotal)return false;
+    if(Descriptor.y>PageTotal-Descriptor.x||Descriptor.y<80u)return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - preceding branch proves page base is within buffer
+    uint Level=Pages[Descriptor.x+5u];if(Level>7u)return false;
+    uint Scale=1u<<(Level&7u); // lint-shader-ub: allow VARIABLE_SHIFT - level is masked to zero through seven
+    if(PitchMm!=100.0*float(Scale))return false;
+    int3 PageKey=int3(asint(Pages[Descriptor.x+2u]),asint(Pages[Descriptor.x+3u]),asint(Pages[Descriptor.x+4u]));
+    int64_t LX=int64_t(WorldCell.x)-int64_t(PageKey.x)*32,LY=int64_t(WorldCell.y)-int64_t(PageKey.y)*32,LZ=int64_t(WorldCell.z)-int64_t(PageKey.z)*32;
+    if(LX<0||LX>=32||LY<0||LY>=32||LZ<0||LZ>=32)return false;
+    uint Resource,Yaw;int3 SourceCell,WorldOffset;
+    if(!VoxelAppearanceLookupPage(Pages,Descriptor.x,Descriptor.y,uint3(uint(LX),uint(LY),uint(LZ)),Resource,SourceCell,Yaw,WorldOffset))return false;
+    uint RangeTotal,RangeStride;Ranges.GetDimensions(RangeTotal,RangeStride);
+    if(Descriptor.z>RangeTotal)return false;
+    if(Descriptor.w>RangeTotal-Descriptor.z||Resource==0u||Resource>=Descriptor.w)return false; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - preceding branch proves source range base is within buffer
+    uint2 Range=Ranges[Descriptor.z+Resource];uint Packed,Needle;uint3 Zero;
+    if(!VoxelAppearanceLookupSource(Sources,Range.x,Range.y,SourceCell,Material,Packed,Zero,Needle))return false;
+    // Lookup already verified the source range and its full20word header.
+    if(Sources[Range.x+13u]!=(Sources[Range.x]==1u?100u:100000u))return false;
+    float3 Color;float Mask;float2 UV;
+    uint Foliage=(VoxelTerrainAppearanceIsFoliage(Material)&&(Sources[Range.x]==1u||(Sources[Range.x+15u]&1u)!=0u))?1u:0u;
+    if(!VoxelApprovedAppearance(Packed,int3(Zero),WorldAxis,Positive,Yaw,Fraction,100.0,Needle,Foliage,PatternFootprint,Color,UV,Mask))return false;
+    if(Level>0u){
+        float3 F=Fraction*float(Scale)-float(Scale/2u)-float3(WorldOffset); // lint-shader-ub: allow UNSIGNED_UNDERFLOW - both operands are explicitly floating point, negative face offsets are intentional
+        if(Yaw==1u)F=float3(F.y,1.0-F.x,F.z);
+        else if(Yaw==2u)F=float3(1.0-F.x,1.0-F.y,F.z);
+        else if(Yaw==3u)F=float3(1.0-F.y,F.x,F.z);
+        uint Axis=WorldAxis;if(WorldAxis<2u&&(Yaw&1u)!=0u)Axis=1u-WorldAxis; // lint-shader-ub: allow UNSIGNED_UNDERFLOW - WorldAxis is zero or one in this branch
+        float3 P=(float3(Zero)+F)*.1;UV=Axis==2u?P.xy:Axis==0u?P.yz:P.xz;
+        // A coarse voxel represents a finite source area. Fade sub-cell holes
+        // as that area exceeds a pattern, matching the existing mask mip rule.
+        float Footprint=max(PatternFootprint,(float(Scale)-1.0)*.1/lerp(.19,.13,float(Needle))); // lint-shader-ub: allow UNSIGNED_UNDERFLOW - floating point subtraction with Scale at least two
+        Mask=Foliage!=0u?VoxelApprovedFoliageCoverage(UV,float(Needle),Footprint):1.0;
+    }
+    LinearRGB=Color;Coverage=Mask;SourceUV=UV;return true;
+}
+#endif

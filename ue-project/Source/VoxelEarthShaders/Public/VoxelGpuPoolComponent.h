@@ -25,6 +25,7 @@
 #include "RHIResources.h"
 #include "VoxelGpuGeometryPool.h"
 #include "VoxelGpuQuadPayload.h"
+#include "VoxelTerrainAppearanceGpuState.h"
 #include "VoxelGpuPoolComponent.generated.h"
 
 class FRDGPooledBuffer;
@@ -56,6 +57,8 @@ struct FVoxelGpuPoolBuffers
 	// Declared, not defaulted inline: the two FRDGPooledBuffer references below
 	// are held through a forward declaration, so the destructor has to be
 	// instantiated in the one translation unit that has the complete type.
+	// Independent quad ChunkId namespace; never aliases brick-pool descriptors.
+	TSharedPtr<FVoxelTerrainAppearanceGpuState, ESPMode::ThreadSafe> Appearance;
 	FVoxelGpuPoolBuffers();
 	~FVoxelGpuPoolBuffers();
 
@@ -263,7 +266,8 @@ public:
 	// under SetWaterMode. See ShadowPages.
 	int32 AddChunk(const TArray<uint64>& InQuads, const FVector3f& OriginUU, int32 Level,
 	               const FVector4f& Params = FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f),
-	               const TArray<uint32>* InCornerHeights = nullptr);
+	               const TArray<uint32>* InCornerHeights = nullptr,
+	               TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance = nullptr);
 
 	// Adds one chunk whose quads are ALREADY IN GPU MEMORY (Wave D / D1).
 	//
@@ -285,7 +289,8 @@ public:
 	// Returns INDEX_NONE without allocating if IsGpuWritable() is false.
 	int32 AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src, uint32 NumQuads,
 	                      const FVector3f& OriginUU, int32 Level,
-	                      const FVector4f& Params = FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f));
+	                      const FVector4f& Params = FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f),
+	                      TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance = nullptr);
 
 	// Whether a direct GPU write can land yet: true once the persistent buffers
 	// and their RDG wrappers exist, which happens on the render thread when the
@@ -372,7 +377,8 @@ public:
 	//
 	// Returns the handle (possibly a new one if it had to reallocate), or
 	// INDEX_NONE if there was no room.
-	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads);
+	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads,
+	                 TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance = nullptr);
 
 	// The same, carrying per-quad corner heights -- see AddChunk's
 	// InCornerHeights and ShadowPages' corner third.
@@ -384,7 +390,8 @@ public:
 	// A distinct signature makes the water caller name what it is passing, and
 	// leaves the terrain caller (VoxelWorldSubsystem's edit re-mesh) reaching the
 	// unchanged two-argument form with no ambiguity about which it meant.
-	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads, const TArray<uint32>& InCornerHeights);
+	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads, const TArray<uint32>& InCornerHeights,
+	                 TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance = nullptr);
 
 	// Drops every chunk.
 	void ClearChunks();
@@ -683,6 +690,10 @@ public:
 	// needs the buffers themselves. Read-only in intent; nothing in the shipping
 	// path calls this.
 	FVoxelGpuPoolBuffersRef DebugGetPoolBuffers() const { return PoolBuffers; }
+#if WITH_DEV_AUTOMATION_TESTS
+	// Exercise the real no-live-proxy publication branch before the next EOF rebuild.
+	void DebugDeferProxyRecreation() { MarkRenderStateDirty(); LiveProxy = nullptr; }
+#endif
 
 	// DEBUG ONLY — the run list the proxy culls and draws from. The harness
 	// checks the bytes at a RUN's offset rather than at an offset it worked out
@@ -951,6 +962,8 @@ private:
 	// now the DEFER POINT and this is the DO IT point; FScopedBatch is what sits
 	// between them. Split this way round so every existing mutator keeps calling
 	// PushUpdatesToProxy and none of them had to learn about batching.
+	// Last mutation wins within a batch; null retires old appearance.
+	TMap<uint32, TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe>> PendingAppearance;
 	void FlushUpdatesToProxy();
 
 	// Open scopes. >0 means a mutator's PushUpdatesToProxy only records that a
@@ -1027,7 +1040,7 @@ private:
 	// branches cannot drift apart between the corner-carrying and the plain
 	// caller (docs/backlog.md's "two copies of one calibration" failure mode).
 	int32 UpdateChunkInternal(int32 Handle, const TArray<uint64>& InQuads,
-	                          const TArray<uint32>* InCornerHeights);
+	                          const TArray<uint32>* InCornerHeights, TSharedPtr<const FVoxelTerrainAppearanceUpload, ESPMode::ThreadSafe> Appearance);
 
 	// The ONE writer of a pool range's three parallel CPU shadows -- quads, chunk
 	// ids and, on a water pool, corner heights. Add and both update branches all

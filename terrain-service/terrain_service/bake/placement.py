@@ -153,6 +153,24 @@ def talus_flux(z_sub: np.ndarray, tan_sub: np.ndarray, cell_m: float,
     return deposit
 
 
+def pack_final_water_mask(z_interior, lake_wet, river_wet):
+    """Preserve the bake's final lake/river/sea union for neighbor reconciliation.
+
+    Unlike elevation control points on the wire, z_interior contains actual
+    surface samples. Packed rows use little bit order and retain fine resolution.
+    """
+    z=np.asarray(z_interior)
+    if z.ndim!=2 or z.shape[0]!=z.shape[1] or z.shape[1]%8 or not np.isfinite(z).all():
+        raise ValueError('Finite square surface samples aligned to eight required')
+    wet=z<=0
+    for source in (lake_wet,river_wet):
+        if source is not None:
+            a=np.asarray(source)
+            if a.shape!=z.shape or a.dtype!=np.bool_:raise ValueError('Incompatible water mask')
+            wet|=a
+    return np.packbits(wet,axis=1,bitorder='little')
+
+
 def placement_planes(
     *,
     z_pad: np.ndarray,

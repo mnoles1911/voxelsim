@@ -2567,7 +2567,7 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 				if (Job->bBrickResident)
 				{
 					GetGlobalVoxelBrickPool().AddChunkFromGpu(
-						Job->BrickPayload, Job->BrickKey, Job->BrickShading);
+						Job->BrickPayload, Job->BrickKey, Job->BrickShading, Job->BrickRegion.Appearance);
 				}
 				// Handed on either way. Under voxel.GPU.BrickPackResident 0 the
 				// caller is the only thing holding it, which is what makes
@@ -4272,7 +4272,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				continue;
 			}
 			FVoxelBrickPool::FResidentChunk Shell;
-			if (Pool.AllocateGpuChunkShell(Job->BrickKey, Job->BrickOriginVoxel, Shell))
+			if (Pool.AllocateGpuChunkShell(Job->BrickKey, Job->BrickOriginVoxel, Shell, Job->BrickRegion.Appearance))
 			{
 				Job->bGpuPoolAlloc = true;
 				Job->bGpuShellAllocated = true;
@@ -4354,6 +4354,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		}
 	}
 
+	const double ShellStageEnd = FPlatformTime::Seconds();
 	// --- P3 spine: records + the passes-per-tick tally ----------------------
 	//
 	// HERE, not in Tick, because both need what the P1 shell loop just
@@ -4396,6 +4397,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		TSet<FVoxelGpuBrickStack*> TalliedStacks;
 		int64 PassesThisTick = 0;
 		const bool bLeanArmed = VoxelGpuLeanBrickJobsEnabled();
+		const double RecordPayloadStart = FPlatformTime::Seconds();
 		for (const FJobPtr& Job : Batch)
 		{
 			// The tally first: every promoted job costs passes, record or not.
@@ -4564,6 +4566,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 						// Payload-relative for now; Flush rebases into the
 						// flush blob as it concatenates.
 						W.ColStartsBase = Inst.ColStartsBase;
+						W.RenderOwned = Inst.RenderOwned;
 						W.SuppressTerrainRender = Inst.SuppressTerrainRender;
 					}
 					P.ColStarts = Reg.AssetColStarts;
@@ -4571,6 +4574,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				}
 			}
 		}
+		TickStageMs.RecordPayloadMs += (FPlatformTime::Seconds()-RecordPayloadStart)*1000.0;
 		const bool bColumnsArmed = VoxelGpuWorklistColumnsEnabled();
 		// The spine's own constant (args + prover + armed Column dispatch) is
 		// NOT tallied here: it is paid every armed tick, batch or no batch,
@@ -4606,7 +4610,9 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				Worklist.SetColumnStageInputs(AnyRegion.RasterAtlas, AnyRegion.Seed,
 				                              AnyRegion.PixelSizeMm);
 			}
+			const double RecordFlushStart = FPlatformTime::Seconds();
 			Worklist.Flush(VoxelGpuWorklistBudget());
+			TickStageMs.RecordFlushMs += (FPlatformTime::Seconds()-RecordFlushStart)*1000.0;
 			bWorklistFlushedThisTick = true;
 
 			// P2: the flush above enqueued batch N-1's deferred claim at its
@@ -5372,6 +5378,9 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	});
 
 	const double DispatchBatchEnd = FPlatformTime::Seconds();
+	TickStageMs.ShellMs += (ShellStageEnd - DispatchBatchStart) * 1000.0;
+	TickStageMs.WorkRecordsMs += (EnqDispatchStart - ShellStageEnd) * 1000.0;
+	TickStageMs.HandoffMs += (DispatchBatchEnd - EnqDispatchStart) * 1000.0;
 	TickStageMs.EnqueueMs += (DispatchBatchEnd - DispatchBatchStart) * 1000.0;
 	JobCost.EnqDispatchMs += (DispatchBatchEnd - EnqDispatchStart) * 1000.0;
 	++JobCost.EnqDispatchN;

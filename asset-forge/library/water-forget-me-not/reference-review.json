@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/myosotis-scorpioides/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_9gQOCKJVef53.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=mtOoKpYs5Q4x6fdIOTbEB1hE3%2BY%3D&Expires=1788863418"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Douglas Goldman midsummer form photograph viewed for architecture: low creeping-to-upright stems with alternate narrow pointed leaves and small terminal cymes. NCState15-45cm, summer flower window; choose25cm vegetative spring stems without blue blooms.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_9gQOCKJVef53.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=mtOoKpYs5Q4x6fdIOTbEB1hE3%2BY%3D&Expires=1788863418"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/myosotis-scorpioides/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Fresh15-30cm creeping-to-upright shoots with alternating narrow blades. Summer blue cymes excluded. Small form is coarse but retains shoot-led leaves rather than spherical foliage.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "927a9394bfef59ae4507e391d356fad3b30fdbf5b479d1789aa90dbc36631eb0",
+  "sheet_hash": "d1d94ced3b84c4b5005b477e8e08b0c6ac4c487a7a074563a6acb7566404eb87",
+  "reviewed_at": 1788861146.0538087,
+  "pilot_hashes": {
+    "1": "30c520dd543b984ab1f638d7d95e2e7c6198bca1527d9e9896b489207387e4d1",
+    "4": "353a70255f827fc439477e30c2d7dafad4f08aeb26538711836ab86721e22cef",
+    "7": "888c3254a27ec0a55475c036222ff02f13b2ec07393c4a76f45e0065a248961f"
+  },
+  "profile": "water-forget-me-not",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_9gQOCKJVef53.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=mtOoKpYs5Q4x6fdIOTbEB1hE3%2BY%3D&Expires=1788863418",
+      "caption": "Plant form in bloom (Alleghany County, NC)-Mid Summer",
+      "credit": "Douglas Goldman, USDA",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "30028"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_2q4hnHBe2L9M.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=INj1TgrLUoS%2B1UFb4WWlm10%2FNVE%3D&Expires=1788863418",
+      "caption": "repFull Plant In Bloomlace",
+      "credit": "k yamada",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "23018"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_pDWnac2agjlI.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=g96TfAPma5SYwDKbtE6bLDDAbug%3D&Expires=1788863418",
+      "caption": "Close-up of flower (Alleghany County, NC)-Mid Summer",
+      "credit": "Douglas Goldman, USDA",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "30027"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_UzTvMDwLIz7N.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=ffqlUBi2aGtIgSrzr%2Bmto%2BF79KE%3D&Expires=1788863418",
+      "caption": "Side view of flowers and stem (Alleghany County, NC)-Mid Summer",
+      "credit": "Douglas Goldman, USDA",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "30023"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_jmpSmSqPyFlb.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=IaGDX%2FkinYI%2BzMiZmWn0XjLJn8k%3D&Expires=1788863418",
+      "caption": "Flowers and stem (Alleghany County, NC)-Mid Summer",
+      "credit": "Douglas Goldman, USDA",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "30026"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Myosotis_scorpioides_k4dvQmWFajO5.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=yJUzf7%2FFytlQyrOQwdc%2Bwcle6Jk%3D&Expires=1788863418",
+      "caption": "Stem and leaf attachment (Alleghany County, NC)-Mid Summer",
+      "credit": "Douglas Goldman, USDA",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "30030"
+    }
+  ],
+  "taxon": "Myosotis scorpioides",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "d1d94ced3b84c4b5005b477e8e08b0c6ac4c487a7a074563a6acb7566404eb87"
+  }
+}

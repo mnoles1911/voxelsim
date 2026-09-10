@@ -838,6 +838,13 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                 return 1
             continue
         cache.put_fine(fine_provider_id, args.seed, x, y, encoded)
+        if npz_dir and getattr(result, "placement_water_mask_packed", None) is not None:
+            from .bake.hydrology_sources import write_bake_water_source
+            write_bake_water_source(
+                npz_dir / f"{x}_{y}.water-source.npz",
+                result.placement_water_mask_packed, encoded,
+                provider_id=fine_provider_id, cell_m=geom.fine_pixel_m,
+            )
         baked += 1
         # The water plane goes in the LOG LINE, not only in the stats dump.
         # "wet=0.000%" is a legitimate reading on a dry tile and a symptom on a

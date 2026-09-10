@@ -18,6 +18,51 @@ inline MaterialId assetCandidateMaterial(const AssetField::ResolvedAssetInstance
     if(x<b.x0||x>b.x1||y<b.y0||y>b.y1||z<b.z0||z>b.z1)return MAT_AIR;
     return r.grid->atYaw(int32_t(x-b.x0),int32_t(y-b.y0),int32_t(z-b.z0),r.yawQuarter);
 }
+// Map a world-aligned candidate cell/face back to the original source frame.
+// Coordinates include the source origin, matching appearance packet sampling.
+// This is a coordinate mapping only: callers must separately prove source
+// identity and that the cell survives canonical composition.
+struct AssetCandidateSourceSample {int32_t x=0,y=0,z=0;uint8_t axis=0;bool positive=false;};
+inline bool assetCandidateSourceSample(const AssetField::ResolvedAssetInstance& r,
+    int64_t x,int64_t y,int64_t z,uint8_t axis,bool positive,AssetCandidateSourceSample& out){
+    AssetCandidateBounds b;
+    if(axis>2||!assetCandidateBounds(r,b)||x<b.x0||x>b.x1||y<b.y0||y>b.y1||z<b.z0||z>b.z1)return false;
+    // Bounds above make these anchor-relative differences small, even for
+    // negative world coordinates near the admitted anchor limit.
+    const int64_t dx=x-r.anchorVx,dy=y-r.anchorVy,dz=z-r.anchorVz;
+    int64_t sx=dx,sy=dy;
+    switch(r.yawQuarter){
+        case 1:sx=dy;sy=-dx;break;
+        case 2:sx=-dx;sy=-dy;break;
+        case 3:sx=-dy;sy=dx;break;
+        default:break;
+    }
+    uint8_t sourceAxis=axis;bool sourcePositive=positive;
+    if(axis<2){
+        if(r.yawQuarter&1u)sourceAxis=uint8_t(1-axis);
+        if(r.yawQuarter==2||(r.yawQuarter==1&&axis==0)||(r.yawQuarter==3&&axis==1))sourcePositive=!positive;
+    }
+    out={int32_t(sx),int32_t(sy),int32_t(dz),sourceAxis,sourcePositive};return true;
+}
+// Corners need an additional reflection offset: canonical yaw rotates cell
+// indices, whereas a reflected unit box spans [cell, cell+1]. Mapping a raw
+// vertex with the cell rotation alone shifts leaf cutout coordinates by one
+// voxel. Return the corresponding original-source lattice vertex explicitly.
+struct AssetCandidateSourceVertex {int32_t x=0,y=0,z=0;};
+inline bool assetCandidateSourceVertex(const AssetField::ResolvedAssetInstance& r,
+    int64_t x,int64_t y,int64_t z,uint8_t cornerX,uint8_t cornerY,uint8_t cornerZ,
+    AssetCandidateSourceVertex& out){
+    AssetCandidateSourceSample cell;
+    if(cornerX>1||cornerY>1||cornerZ>1||!assetCandidateSourceSample(r,x,y,z,2,true,cell))return false;
+    int32_t cx=cornerX,cy=cornerY;
+    switch(r.yawQuarter){
+        case 1:cx=cornerY;cy=1-cornerX;break;
+        case 2:cx=1-cornerX;cy=1-cornerY;break;
+        case 3:cx=1-cornerY;cy=cornerX;break;
+        default:break;
+    }
+    out={cell.x+cx,cell.y+cy,cell.z+cornerZ};return true;
+}
 // Winner suppression preserves occlusion by owned assets. Removing instances
 // before composition would incorrectly reveal later overlapping instances.
 template<class Owned> MaterialId assetTerrainRenderMaterial(const std::vector<AssetField::ResolvedAssetInstance>& ordered,

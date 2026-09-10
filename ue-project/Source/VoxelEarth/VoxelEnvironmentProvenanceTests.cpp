@@ -17,6 +17,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelEnvironmentProvenanceTest,"Voxel.Objects.
 bool FVoxelEnvironmentProvenanceTest::RunTest(const FString&){
     const auto Original=ProvenanceFixture();const auto Bytes=ProvenanceEncode(Original);
     TestTrue(TEXT("production schema encoded"),Bytes.Num()>100);
+    TestEqual(TEXT("prepared appearance uses canonical identity"),Original.AppearanceSourceHash(),Original.ProductionProvenance->CanonicalSourceHash);
+    TestEqual(TEXT("prepared appearance uses baked source yaw"),Original.AppearanceYawQuarter(),Original.ProductionProvenance->Source.yawQuarter);
     FVoxelEnvironmentAssetDescriptor Loaded;
     if(!TestTrue(TEXT("production schema roundtrip"),ProvenanceDecode(Bytes,Loaded))||!Loaded.ProductionProvenance.IsSet())return false;
     TestTrue(TEXT("every provenance field preserved"),Loaded.ProductionProvenance->Source==Original.ProductionProvenance->Source);
@@ -24,7 +26,7 @@ bool FVoxelEnvironmentProvenanceTest::RunTest(const FString&){
     TestEqual(TEXT("canonical hash preserved independently"),Loaded.ProductionProvenance->CanonicalSourceHash,Original.ProductionProvenance->CanonicalSourceHash);
     TestEqual(TEXT("clipped hash preserved independently"),Loaded.SourceHash,Original.SourceHash);
     for(int32 N=0;N<Bytes.Num();++N){TArray<uint8> Cut;Cut.Append(Bytes.GetData(),N);FVoxelEnvironmentAssetDescriptor D; if(ProvenanceDecode(Cut,D)){AddError(FString::Printf(TEXT("Truncation accepted at %d"),N));return false;}}
-    auto Unknown=Bytes;Unknown[4]=3;TestFalse(TEXT("unknown schema refused"),ProvenanceDecode(Unknown,Loaded));
+    auto Unknown=Bytes;Unknown[4]=4;TestFalse(TEXT("unknown schema refused"),ProvenanceDecode(Unknown,Loaded));
     auto Bad=Original;Bad.ProductionProvenance->Source.yawQuarter=4;TestFalse(TEXT("invalid yaw refused"),Bad.IsValid());
     Bad=Original;Bad.SeedIndex=65536;TestFalse(TEXT("descriptor seed narrowing refused"),Bad.IsValid());
     Bad=Original;Bad.SeedIndex=10;TestFalse(TEXT("descriptor seed mismatch refused"),Bad.IsValid());

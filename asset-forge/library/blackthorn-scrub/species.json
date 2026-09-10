@@ -1,0 +1,909 @@
+{
+  "schema_version": 1,
+  "species": "blackthorn-scrub",
+  "display_name": null,
+  "reference_role": null,
+  "baseline_spec": {
+    "name": "blackthorn-scrub",
+    "notes": "Spring understory source for Prunus spinosa; architecture: shrub. Metric geometry at 25 mm cubic voxels. Species baseline and generator define the source; numbered seeds generate variants. User endorsement remains separate from source review.",
+    "kind": "bush",
+    "height_m": 3.0,
+    "resolution_cm": "2.5",
+    "trunk": {
+      "radius_base_m": 0.06,
+      "taper": 0.5,
+      "clear_frac": 0.05,
+      "lean_deg": 5.0,
+      "lean_dir_deg": 0.0,
+      "wander": 0.45,
+      "buttress": 0.0,
+      "lobes": 0,
+      "lobe_depth": 0.18
+    },
+    "crown": {
+      "shape": "ovoid",
+      "allometry": "off",
+      "radius_m": 1.0,
+      "height_frac": 0.92,
+      "center_frac": 0.54,
+      "shell_upper": 0.75,
+      "shell_lower": 0.6,
+      "squash": 1.0,
+      "lean_deg": 0.0,
+      "lean_dir_deg": 0.0,
+      "asymmetry": 0.45,
+      "offset": 0.24,
+      "points": 1500
+    },
+    "growth": {
+      "model": "colonize",
+      "step_m": 0.1,
+      "influence_m": 0.8,
+      "kill_m": 0.17,
+      "gravity": 0.02,
+      "phototropism": 0.1,
+      "inertia": 0.36,
+      "jitter": 0.2,
+      "max_iter": 260,
+      "shade": 0.4,
+      "tip_radius_m": 0.05,
+      "radius_exp": 2.0
+    },
+    "whorl": {
+      "count": 11,
+      "branches": 5,
+      "stagger": 0.42,
+      "rise": 0.28,
+      "droop": 0.55,
+      "sub": 2,
+      "sub_angle": 38.0,
+      "irregular": 0.22,
+      "leader": 0.03
+    },
+    "frond": {
+      "count": 14,
+      "length_m": 2.6,
+      "width_m": 0.55,
+      "rise": 0.85,
+      "droop": 1.15,
+      "dead": 0.15,
+      "irregular": 0.25
+    },
+    "roots": {
+      "count": 0,
+      "length_m": 1.8,
+      "rise": 0.35,
+      "thickness": 0.55,
+      "irregular": 0.3
+    },
+    "strand": {
+      "count": 0,
+      "length_m": 2.5,
+      "from_frac": 0.35,
+      "outer": 0.7,
+      "drift": 0.16,
+      "spread": 0.18
+    },
+    "foliage": {
+      "enabled": true,
+      "min_order": 2,
+      "clump_radius_m": 0.13,
+      "density": 0.6,
+      "rough": 0.55,
+      "habit": "spiral",
+      "stretch": 2.0,
+      "clustering": 0.45,
+      "compensate": 0.6,
+      "top_bias": 0.35,
+      "coverage": 0.72,
+      "separation": 1.7,
+      "clump_jitter": 0.4,
+      "droop_m": 0.15,
+      "squash": 0.85
+    },
+    "variation": {
+      "amount": 1.0,
+      "height": 0.24,
+      "crown_radius": 0.24,
+      "trunk_radius": 0.2,
+      "shape": 0.16,
+      "proportion": 0.26,
+      "lopsided": 0.45,
+      "foliage": 0.35,
+      "lean_deg": 10.0,
+      "droop": 0.4,
+      "density": 0.25,
+      "rotate": true
+    },
+    "biomes": {
+      "ocean": 0.0,
+      "beach": 0.0,
+      "grassland": 0.9,
+      "temperate_forest": 0.8,
+      "rainforest": 0.0,
+      "desert": 0.0,
+      "savanna": 0.0,
+      "taiga": 0.0,
+      "tundra_alpine": 0.0,
+      "bare_rock": 0.0
+    },
+    "placement": {
+      "abundance": 0.7,
+      "spacing_m": 1.2,
+      "cluster": 1.0,
+      "elev_min_m": 0.0,
+      "elev_max_m": 2000.0,
+      "slope_max_pct": 45.0,
+      "slope_min_pct": 0.0,
+      "water_max_m": 0.0
+    },
+    "rock": {
+      "size_m": 1.6,
+      "lumps": 5,
+      "spread": 0.42,
+      "flatten": 0.72,
+      "elongate": 1.25,
+      "angular": 0.45,
+      "facets": 4,
+      "rough": 0.4,
+      "erode": 0.25,
+      "cavernous": 0.0,
+      "bedding": 0.0,
+      "bed_thickness_m": 0.5,
+      "bed_dip_deg": 0.0,
+      "cross_beds": 0,
+      "caprock": 0.0,
+      "cap_frac": 0.62,
+      "notch": 0.0,
+      "notch_z_m": 0.25,
+      "notch_spread_m": 0.18,
+      "aspect": 0.0,
+      "joint_sets": 0,
+      "joint_scatter": 0.12,
+      "joint_dip_deg": 0.0,
+      "block_size_m": 1.2,
+      "block_relief_m": 0.0,
+      "joint_taper": 0.0,
+      "corestone": 0.0,
+      "settle_m": 0.0,
+      "columns": 0,
+      "column_gap_m": 0.08,
+      "column_stagger": 0.18,
+      "exfoliate": 0.0,
+      "shell_m": 0.25,
+      "veins": 0,
+      "vein_width_m": 0.1,
+      "vein_hardness": 3.0,
+      "rind": 0.0,
+      "rind_m": 0.08,
+      "clasts": 0,
+      "clast_size_m": 0.25,
+      "clast_hardness": 2.5,
+      "flutes": 0.0,
+      "flute_width_m": 0.25,
+      "pans": 0.0,
+      "pan_depth_m": 0.2,
+      "arch": 0.0,
+      "bury": 0.22,
+      "rubble": 0.15
+    },
+    "materials": {
+      "rock": "rock",
+      "stem": "grass",
+      "head": "leaf_blossom",
+      "fish_back": "skin_olive",
+      "fish_flank": "skin_silver",
+      "fish_belly": "skin_pale",
+      "fish_fin": "skin_olive",
+      "fish_pattern": "skin_dark",
+      "fish_eye": "skin_dark",
+      "fish_patch": "skin_pale",
+      "bird_back": "skin_brown",
+      "bird_belly": "plume_white",
+      "bird_head": "skin_brown",
+      "bird_wing": "skin_brown",
+      "bird_mark": "skin_dark",
+      "bird_head_mark": "skin_dark",
+      "bird_bill": "beak_horn",
+      "bird_eye": "skin_dark",
+      "bird_alt_back": "same",
+      "bird_alt_belly": "same",
+      "bird_alt_head": "same",
+      "bird_alt_wing": "same",
+      "bird_alt_mark": "same",
+      "bird_alt_head_mark": "same",
+      "bird_alt_bill": "same",
+      "quad_back": "skin_brown",
+      "quad_belly": "skin_pale",
+      "quad_head": "skin_brown",
+      "quad_leg": "skin_brown",
+      "quad_tail": "skin_brown",
+      "quad_mark": "skin_dark",
+      "quad_horn": "beak_horn",
+      "quad_eye": "skin_dark",
+      "bark": "bark",
+      "core": "heartwood",
+      "leaf": "leaf_broadleaf",
+      "hull": "heartwood",
+      "trim": "bark",
+      "strake": "deadwood",
+      "frame": "beak_horn"
+    },
+    "tuft": {
+      "stems": 24,
+      "spread_m": 0.06,
+      "splay_deg": 18.0,
+      "arc": 0.55,
+      "width_m": 0.02,
+      "taper": 0.5,
+      "wander": 0.35,
+      "length_var": 0.3,
+      "base_m": 0.05,
+      "head": "none",
+      "head_m": 0.12,
+      "head_frac": 0.22,
+      "head_share": 1.0
+    },
+    "fish": {
+      "length_m": 0.28,
+      "depth_ratio": 0.24,
+      "width_ratio": 0.58,
+      "depth_at": 0.36,
+      "fullness": 3.0,
+      "snout": 0.3,
+      "peduncle": 0.3,
+      "belly": 0.52,
+      "width_follow": 1.15,
+      "section": 2.0,
+      "head_frac": 0.26,
+      "head_width": 0.0,
+      "caudal_plane": "vertical",
+      "caudal_upper": 0.0,
+      "caudal_shape": "forked",
+      "caudal_len": 0.2,
+      "caudal_span": 1.15,
+      "caudal_fork": 0.45,
+      "dorsal_shape": "triangular",
+      "dorsal_start": 0.38,
+      "dorsal_len": 0.26,
+      "dorsal_height": 0.38,
+      "dorsal2_height": 0.0,
+      "dorsal2_start": 0.62,
+      "dorsal2_len": 0.1,
+      "adipose": false,
+      "anal_height": 0.32,
+      "anal_len": 0.16,
+      "pectoral": 0.26,
+      "pectoral_aspect": 1.2,
+      "pelvic": 0.18,
+      "barbels": 0,
+      "barbel_len": 0.1,
+      "fin_thick": 1,
+      "section_tail": 2.0,
+      "fin_min_vox": 2.0,
+      "blowhole": 0.0,
+      "eye_patch": 0.0,
+      "eye": 1.0,
+      "back_frac": 0.34,
+      "belly_frac": 0.26,
+      "field_curve": "flat",
+      "curve_at": 0.55,
+      "curve_amount": 0.0,
+      "sex": "unsexed",
+      "sex_length": 1.0,
+      "sex_dorsal": 1.0,
+      "sex_pectoral": 1.0,
+      "pattern": "none",
+      "claspers": 0.0,
+      "pattern_count": 6,
+      "pattern_width": 0.22,
+      "pattern_pos": 0.5,
+      "pattern_scale": 0.2,
+      "pattern_strength": 0.5
+    },
+    "detail": {
+      "entity_class": "detail",
+      "despawn_m": 45.0,
+      "despawn_delay_s": 4.0,
+      "school_min": 1,
+      "school_max": 8,
+      "school_radius_m": 2.5,
+      "water": "any",
+      "depth_min_m": 0.3,
+      "depth_max_m": 6.0,
+      "min_water_depth_m": 0.5,
+      "per_100m2": 3.0
+    },
+    "bird": {
+      "length_m": 0.24,
+      "bill_frac": 0.07,
+      "head_frac": 0.13,
+      "neck_frac": 0.05,
+      "body_frac": 0.4,
+      "tail_frac": 0.35,
+      "posture_deg": 30.0,
+      "body_depth": 0.62,
+      "body_width": 0.82,
+      "chest_at": 0.32,
+      "breast": 0.66,
+      "rump": 0.42,
+      "fullness": 3.2,
+      "belly": 0.52,
+      "section": 2.1,
+      "neck_thick": 0.45,
+      "neck_up_deg": 30.0,
+      "head_size": 1.0,
+      "crest": 0.0,
+      "bill_depth": 0.35,
+      "bill_curve": 0.0,
+      "bill_hook": 0.0,
+      "bill_gape": 0.15,
+      "tail_shape": "square",
+      "tail_width": 0.42,
+      "tail_fork": 0.3,
+      "tail_droop": 0.55,
+      "tail_thick": 1,
+      "pose": "perched",
+      "wing_shape": "elliptical",
+      "wing_span": 1.7,
+      "wing_aspect": 6.0,
+      "wing_sweep": 0.25,
+      "wing_dihedral": 0.1,
+      "wing_slots": 0,
+      "wing_thick": 1,
+      "wing_fold": 0.45,
+      "leg_len": 0.1,
+      "leg_thick": 1.0,
+      "eye": 1.0,
+      "upperparts": 0.5,
+      "head_mark": "none",
+      "wing_mark": "none",
+      "body_mark": "none",
+      "mark_count": 5,
+      "mark_width": 0.28,
+      "mark_strength": 0.35,
+      "sex": "unsexed",
+      "sex_length": 1.0,
+      "sex_tail": 1.0,
+      "sex_plumage": "same",
+      "sex_alt_head_mark": "same",
+      "sex_alt_wing_mark": "same",
+      "sex_alt_body_mark": "same"
+    },
+    "flock": {
+      "entity_class": "detail",
+      "despawn_m": 90.0,
+      "despawn_delay_s": 6.0,
+      "size_min": 1,
+      "size_max": 4,
+      "spread_m": 12.0,
+      "perch": "canopy",
+      "height_min_m": 2.0,
+      "height_max_m": 25.0,
+      "flight_share": 0.35,
+      "per_hectare": 4.0
+    },
+    "quad": {
+      "length_m": 1.2,
+      "stance": "standing",
+      "shoulder_h": 0.62,
+      "hip_h": 1.0,
+      "trunk_frac": 0.62,
+      "neck_frac": 0.12,
+      "head_frac": 0.16,
+      "muzzle_frac": 0.1,
+      "neck_deg": 30.0,
+      "head_deg": 0.0,
+      "depth": 0.42,
+      "width": 0.62,
+      "chest": 1.0,
+      "waist": 0.94,
+      "rump": 0.92,
+      "belly": 0.52,
+      "section": 2.2,
+      "hump": 0.0,
+      "hump_at": 0.16,
+      "neck_thick": 0.52,
+      "neck_taper": 0.72,
+      "mane": 0.0,
+      "dewlap": 0.0,
+      "head_size": 1.0,
+      "muzzle_depth": 0.62,
+      "muzzle_width": 0.58,
+      "muzzle_drop": 0.0,
+      "jaw": 0.35,
+      "eye": 1,
+      "ear_shape": "pointed",
+      "ear_len": 0.09,
+      "ear_width": 0.45,
+      "ear_deg": 62.0,
+      "ear_back": 0.25,
+      "horn_shape": "none",
+      "horn_len": 0.2,
+      "horn_thick": 0.16,
+      "horn_spread": 0.55,
+      "horn_curl": 0.35,
+      "horn_tines": 3,
+      "tail_len": 0.35,
+      "tail_thick": 0.2,
+      "tail_taper": 0.35,
+      "tail_deg": -35.0,
+      "tail_arc": 0.0,
+      "tail_tuft": 0.0,
+      "leg_thick": 0.22,
+      "fore_bend": 0.25,
+      "hock": 0.35,
+      "foot": 1.0,
+      "fore_reach": 1.0,
+      "under": 0.3,
+      "cape": 0.0,
+      "stocking": 0.0,
+      "tail_tip": 0.0,
+      "mark": "none",
+      "mark_count": 12,
+      "mark_width": 0.32,
+      "mark_strength": 1.0,
+      "sex": "unsexed",
+      "sex_length": 1.0,
+      "sex_horn": 1.0,
+      "sex_mane": 1.0
+    },
+    "herd": {
+      "entity_class": "detail",
+      "despawn_m": 220.0,
+      "despawn_delay_s": 20.0,
+      "size_min": 1,
+      "size_max": 1,
+      "spread_m": 30.0,
+      "cover": "any",
+      "per_hectare": 0.8,
+      "flee_m": 60.0
+    },
+    "artifact": {
+      "form": "hull",
+      "length_m": 4.0,
+      "beam_m": 0.85,
+      "depth_m": 0.35,
+      "shell_vox": 2,
+      "asym_vox": 0.8,
+      "strake_share": 0.25,
+      "sheer": 0.35,
+      "rocker": 0.14,
+      "fullness": 2.4,
+      "entry": 0.62,
+      "bilge": 2.6,
+      "gunwale_m": 0.06,
+      "gunwale_vox": 1,
+      "thwarts": 2,
+      "thwart_w_m": 0.1,
+      "thwart_t_m": 0.05,
+      "deck_frac": 0.07,
+      "sweep": 0.85,
+      "taper": 0.3,
+      "panel_vox": 2,
+      "billow_m": 0.16,
+      "droop_m": 0.3,
+      "spar_r_m": 0.045,
+      "keel_r_m": 0.04,
+      "keel_m": 0.45,
+      "crossbar_at": 0.42,
+      "frame_drop_m": 1.15,
+      "frame_at": 0.34,
+      "frame_base_m": 0.95,
+      "frame_r_m": 0.03,
+      "seat": true,
+      "seat_len_m": 0.8
+    },
+    "plant_recipe": {
+      "generator": "temperate-understory-v1",
+      "profile": "blackthorn-scrub",
+      "size": "mixed",
+      "form": "mixed"
+    },
+    "curation": {
+      "status": "draft",
+      "seeds": [
+        1
+      ],
+      "notes": "Reference-reviewed spring source; endorse variants individually in Forge."
+    }
+  },
+  "baseline_spec_hash": "76f52d724d37cc1f",
+  "reference_variant_id": "blackthorn-scrub-0007",
+  "reference_seed": 7,
+  "generator": "temperate-understory-v1",
+  "generator_digest": "1dac64c3826a961a3935ab8dfa3d8d2d782b0685604400df1dca99191ef66373",
+  "generator_approved": true,
+  "approved_generator_digest": "1dac64c3826a961a3935ab8dfa3d8d2d782b0685604400df1dca99191ef66373",
+  "review_status": "Astra reference-reviewed source",
+  "review_date": "2026-09-08",
+  "sources": [
+    "https://gobotany.nativeplanttrust.org/species/prunus/spinosa/"
+  ],
+  "reference_notes": "Compared dense leafy scrub, the early spring white flowering thicket and twig/leaf detail to the revised current size pilots 1/4/7 plus all 36 sheet entries. Increased attached terminal fork density from two to four and leaf positions from five to eight while reducing fine twig radius to 4 mm. This gives a denser, irregular thorn-scrub structure without leaf spheres; 25 mm rasterization still exaggerates the thinnest twig widths. Selected late spring leaf flush after the blossom stage, so flowers and autumn sloes are absent. Heights approximately 1.68-3.75 m. Short thorn microdetail cannot be reliably distinguished at this pitch. Accepted as a leafy spring blackthorn thicket source.",
+  "art_baseline": {
+    "season": "spring",
+    "voxel_mm": 25
+  },
+  "semantics": "species baseline + generator revision + numbered seed = variant",
+  "reference_selection": "Authoritative source design; user endorsement is a separate choice",
+  "variant_inventory": "out/forge-candidates; exact bytes move to species library upon endorsement",
+  "variants": [
+    {
+      "id": "blackthorn-scrub-0001",
+      "seed": 1,
+      "artifact_hash": "43542e509b7d3c3a4ab4ed9f6b7611b45b45d2eb99c95205bd32e9e647683b5a"
+    },
+    {
+      "id": "blackthorn-scrub-0002",
+      "seed": 2,
+      "artifact_hash": "5aa0a3982d04c7d934635ad28b528ee18a4fd2716dd6423973e45e0cb47626a3"
+    },
+    {
+      "id": "blackthorn-scrub-0003",
+      "seed": 3,
+      "artifact_hash": "d9f6e5f1a50aa5649e927dc3adf2d62172b3798349875cedac47842c24b25241"
+    },
+    {
+      "id": "blackthorn-scrub-0004",
+      "seed": 4,
+      "artifact_hash": "734e447e5b0b1540ba0847012c355719f5c0c012fee7c2b1f6839cb14296916d"
+    },
+    {
+      "id": "blackthorn-scrub-0005",
+      "seed": 5,
+      "artifact_hash": "b1ae42e2b54082ac3f6f8eceff821ca2f7261a8d006a21584bdee31649ab93a0"
+    },
+    {
+      "id": "blackthorn-scrub-0006",
+      "seed": 6,
+      "artifact_hash": "ab1a8cb86dfdfa2e894a8cc13bb3171f9f70543c4ab668f567d140cdcbf0dd86"
+    },
+    {
+      "id": "blackthorn-scrub-0007",
+      "seed": 7,
+      "artifact_hash": "b40c8b30b1be4ada5a6eb1f54104966082140a525c52bf14f1cdc7bfb3542c62"
+    },
+    {
+      "id": "blackthorn-scrub-0008",
+      "seed": 8,
+      "artifact_hash": "a40571311a5129e9a51ac63041da83001500e0d2a9ee2ae21d44c744c68ae22d"
+    },
+    {
+      "id": "blackthorn-scrub-0009",
+      "seed": 9,
+      "artifact_hash": "a7893a419daca5bf96c0362953994329ede5d7f976ce6e63ab30b2baf44e8e92"
+    },
+    {
+      "id": "blackthorn-scrub-0010",
+      "seed": 10,
+      "artifact_hash": "12cf2376b39201c22172096d97fb1a05d08605f40fa07798a20ffd98c508766e"
+    },
+    {
+      "id": "blackthorn-scrub-0011",
+      "seed": 11,
+      "artifact_hash": "bda76fd123f5de751be30b4bfffef47f64a2ca78e8d776d3e1c5f51a34eb7343"
+    },
+    {
+      "id": "blackthorn-scrub-0012",
+      "seed": 12,
+      "artifact_hash": "c403a2220dadbcf3ac36d1caa169367b8a1b9f6d553b04a917264449e74bb153"
+    },
+    {
+      "id": "blackthorn-scrub-0013",
+      "seed": 13,
+      "artifact_hash": "2424e8b4ee0cc1da157634067890ea8d24bf0084dc17de0209f1fc30bc60e7dd"
+    },
+    {
+      "id": "blackthorn-scrub-0014",
+      "seed": 14,
+      "artifact_hash": "f00ac8ac7e317f70c090102cdb338c7fbeac5746b2edb732506154b6a3955793"
+    },
+    {
+      "id": "blackthorn-scrub-0015",
+      "seed": 15,
+      "artifact_hash": "d1cf19fcd8b788264e8f4f0718c50479999eb229dc3e7dce89f247334c50d185"
+    },
+    {
+      "id": "blackthorn-scrub-0016",
+      "seed": 16,
+      "artifact_hash": "4065d57ce9961dcee5d24727cab36c7875e4ee2daa8afec38d5d76ad8ce2dc14"
+    },
+    {
+      "id": "blackthorn-scrub-0017",
+      "seed": 17,
+      "artifact_hash": "df3e82a265b24370d560b907d2c27f02ea02b019bef582280cbb4d57f2edd20f"
+    },
+    {
+      "id": "blackthorn-scrub-0018",
+      "seed": 18,
+      "artifact_hash": "3990552107b751fa0036dc04a00e02df20955543d14c49c9bf43ae8ef938f8d2"
+    },
+    {
+      "id": "blackthorn-scrub-0019",
+      "seed": 19,
+      "artifact_hash": "60871152126b76d819710ce0052c6a638069b9dfac0759d462f745b9794bf8cd"
+    },
+    {
+      "id": "blackthorn-scrub-0020",
+      "seed": 20,
+      "artifact_hash": "941807d914fab0f98196c29d0b947f55c3db9e84728e9488bc95a74d41483868"
+    },
+    {
+      "id": "blackthorn-scrub-0021",
+      "seed": 21,
+      "artifact_hash": "764bc50294f23f2b78609603fe41aa4cb4ee71f0ce988b8c82eed74c7dca8592"
+    },
+    {
+      "id": "blackthorn-scrub-0022",
+      "seed": 22,
+      "artifact_hash": "000252e2737988b9fba541c4dfe2cd30e2dc293eb7f6351c392436bb4ca755f3"
+    },
+    {
+      "id": "blackthorn-scrub-0023",
+      "seed": 23,
+      "artifact_hash": "22b7245f8911dff1956180303ba33edd6b7f85652e1e822821b2650e779fc291"
+    },
+    {
+      "id": "blackthorn-scrub-0024",
+      "seed": 24,
+      "artifact_hash": "b3a4b9fc71509e9cab00d0a517ec8ed7e89892705a64deea95427736fad07cd2"
+    },
+    {
+      "id": "blackthorn-scrub-0025",
+      "seed": 25,
+      "artifact_hash": "8db95a9a547ca2e7e5f2845ca0601b05200c0943dcd6d3821759463c06c71b54"
+    },
+    {
+      "id": "blackthorn-scrub-0026",
+      "seed": 26,
+      "artifact_hash": "061218f849d526e5a15df357092107b4cae10d279d7ae0a697d5f39dbc0ae449"
+    },
+    {
+      "id": "blackthorn-scrub-0027",
+      "seed": 27,
+      "artifact_hash": "e531b86f7b7b179f2e2d87c54def00b03efba3cb71a9b7bf4d95a533142c51c1"
+    },
+    {
+      "id": "blackthorn-scrub-0028",
+      "seed": 28,
+      "artifact_hash": "3c3b3c8a69a6ef7867ef2c9f7c4b16d6391b419db39f984d89737c139962266d"
+    },
+    {
+      "id": "blackthorn-scrub-0029",
+      "seed": 29,
+      "artifact_hash": "7672758d021e740017b85ac4c6021780c69db5409e637457bd9d60c9450f8103"
+    },
+    {
+      "id": "blackthorn-scrub-0030",
+      "seed": 30,
+      "artifact_hash": "42bb002102ba5e3293c6cd00dfac6289b7d3874a2289dd6947b4ed31dba4fe4e"
+    },
+    {
+      "id": "blackthorn-scrub-0031",
+      "seed": 31,
+      "artifact_hash": "6a9938c706a1138442f6158de8f442ad079316dad2b3ebd3d234ab7394df7ed7"
+    },
+    {
+      "id": "blackthorn-scrub-0032",
+      "seed": 32,
+      "artifact_hash": "94b3889611ad07a5809a2939b1ab51c39e465000950e126f13f60c756fdaba49"
+    },
+    {
+      "id": "blackthorn-scrub-0033",
+      "seed": 33,
+      "artifact_hash": "8ca31f3eb196d7b3a2b0f1d2b49ca7cdbcb189dad789b46b3e7c167badd0d208"
+    },
+    {
+      "id": "blackthorn-scrub-0034",
+      "seed": 34,
+      "artifact_hash": "b013ba66efbd535c665f5974df192a37c355590297ff388f12d93197205d6a44"
+    },
+    {
+      "id": "blackthorn-scrub-0035",
+      "seed": 35,
+      "artifact_hash": "0879717cf0d70cb996592b68471cc0931bfec21516fb0307a4c93f132212543d"
+    },
+    {
+      "id": "blackthorn-scrub-0036",
+      "seed": 36,
+      "artifact_hash": "cdf1ab6d69a7c86ea14bd4d058a7766b4132598e94a01eb83a04f5a2ba039f4c"
+    }
+  ],
+  "identity_revalidations": [
+    {
+      "previous_digest": "0a54b058b206f15d6adb682852c2e936349c7890574f8e888d2cd6c1a846a926",
+      "new_digest": "1dac64c3826a961a3935ab8dfa3d8d2d782b0685604400df1dca99191ef66373",
+      "timestamp": 1788847579.7655094,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "blackthorn-scrub-0001",
+          "seed": 1,
+          "hash": "43542e509b7d3c3a4ab4ed9f6b7611b45b45d2eb99c95205bd32e9e647683b5a"
+        },
+        {
+          "id": "blackthorn-scrub-0002",
+          "seed": 2,
+          "hash": "5aa0a3982d04c7d934635ad28b528ee18a4fd2716dd6423973e45e0cb47626a3"
+        },
+        {
+          "id": "blackthorn-scrub-0003",
+          "seed": 3,
+          "hash": "d9f6e5f1a50aa5649e927dc3adf2d62172b3798349875cedac47842c24b25241"
+        },
+        {
+          "id": "blackthorn-scrub-0004",
+          "seed": 4,
+          "hash": "734e447e5b0b1540ba0847012c355719f5c0c012fee7c2b1f6839cb14296916d"
+        },
+        {
+          "id": "blackthorn-scrub-0005",
+          "seed": 5,
+          "hash": "b1ae42e2b54082ac3f6f8eceff821ca2f7261a8d006a21584bdee31649ab93a0"
+        },
+        {
+          "id": "blackthorn-scrub-0006",
+          "seed": 6,
+          "hash": "ab1a8cb86dfdfa2e894a8cc13bb3171f9f70543c4ab668f567d140cdcbf0dd86"
+        },
+        {
+          "id": "blackthorn-scrub-0007",
+          "seed": 7,
+          "hash": "b40c8b30b1be4ada5a6eb1f54104966082140a525c52bf14f1cdc7bfb3542c62"
+        },
+        {
+          "id": "blackthorn-scrub-0008",
+          "seed": 8,
+          "hash": "a40571311a5129e9a51ac63041da83001500e0d2a9ee2ae21d44c744c68ae22d"
+        },
+        {
+          "id": "blackthorn-scrub-0009",
+          "seed": 9,
+          "hash": "a7893a419daca5bf96c0362953994329ede5d7f976ce6e63ab30b2baf44e8e92"
+        },
+        {
+          "id": "blackthorn-scrub-0010",
+          "seed": 10,
+          "hash": "12cf2376b39201c22172096d97fb1a05d08605f40fa07798a20ffd98c508766e"
+        },
+        {
+          "id": "blackthorn-scrub-0011",
+          "seed": 11,
+          "hash": "bda76fd123f5de751be30b4bfffef47f64a2ca78e8d776d3e1c5f51a34eb7343"
+        },
+        {
+          "id": "blackthorn-scrub-0012",
+          "seed": 12,
+          "hash": "c403a2220dadbcf3ac36d1caa169367b8a1b9f6d553b04a917264449e74bb153"
+        },
+        {
+          "id": "blackthorn-scrub-0013",
+          "seed": 13,
+          "hash": "2424e8b4ee0cc1da157634067890ea8d24bf0084dc17de0209f1fc30bc60e7dd"
+        },
+        {
+          "id": "blackthorn-scrub-0014",
+          "seed": 14,
+          "hash": "f00ac8ac7e317f70c090102cdb338c7fbeac5746b2edb732506154b6a3955793"
+        },
+        {
+          "id": "blackthorn-scrub-0015",
+          "seed": 15,
+          "hash": "d1cf19fcd8b788264e8f4f0718c50479999eb229dc3e7dce89f247334c50d185"
+        },
+        {
+          "id": "blackthorn-scrub-0016",
+          "seed": 16,
+          "hash": "4065d57ce9961dcee5d24727cab36c7875e4ee2daa8afec38d5d76ad8ce2dc14"
+        },
+        {
+          "id": "blackthorn-scrub-0017",
+          "seed": 17,
+          "hash": "df3e82a265b24370d560b907d2c27f02ea02b019bef582280cbb4d57f2edd20f"
+        },
+        {
+          "id": "blackthorn-scrub-0018",
+          "seed": 18,
+          "hash": "3990552107b751fa0036dc04a00e02df20955543d14c49c9bf43ae8ef938f8d2"
+        },
+        {
+          "id": "blackthorn-scrub-0019",
+          "seed": 19,
+          "hash": "60871152126b76d819710ce0052c6a638069b9dfac0759d462f745b9794bf8cd"
+        },
+        {
+          "id": "blackthorn-scrub-0020",
+          "seed": 20,
+          "hash": "941807d914fab0f98196c29d0b947f55c3db9e84728e9488bc95a74d41483868"
+        },
+        {
+          "id": "blackthorn-scrub-0021",
+          "seed": 21,
+          "hash": "764bc50294f23f2b78609603fe41aa4cb4ee71f0ce988b8c82eed74c7dca8592"
+        },
+        {
+          "id": "blackthorn-scrub-0022",
+          "seed": 22,
+          "hash": "000252e2737988b9fba541c4dfe2cd30e2dc293eb7f6351c392436bb4ca755f3"
+        },
+        {
+          "id": "blackthorn-scrub-0023",
+          "seed": 23,
+          "hash": "22b7245f8911dff1956180303ba33edd6b7f85652e1e822821b2650e779fc291"
+        },
+        {
+          "id": "blackthorn-scrub-0024",
+          "seed": 24,
+          "hash": "b3a4b9fc71509e9cab00d0a517ec8ed7e89892705a64deea95427736fad07cd2"
+        },
+        {
+          "id": "blackthorn-scrub-0025",
+          "seed": 25,
+          "hash": "8db95a9a547ca2e7e5f2845ca0601b05200c0943dcd6d3821759463c06c71b54"
+        },
+        {
+          "id": "blackthorn-scrub-0026",
+          "seed": 26,
+          "hash": "061218f849d526e5a15df357092107b4cae10d279d7ae0a697d5f39dbc0ae449"
+        },
+        {
+          "id": "blackthorn-scrub-0027",
+          "seed": 27,
+          "hash": "e531b86f7b7b179f2e2d87c54def00b03efba3cb71a9b7bf4d95a533142c51c1"
+        },
+        {
+          "id": "blackthorn-scrub-0028",
+          "seed": 28,
+          "hash": "3c3b3c8a69a6ef7867ef2c9f7c4b16d6391b419db39f984d89737c139962266d"
+        },
+        {
+          "id": "blackthorn-scrub-0029",
+          "seed": 29,
+          "hash": "7672758d021e740017b85ac4c6021780c69db5409e637457bd9d60c9450f8103"
+        },
+        {
+          "id": "blackthorn-scrub-0030",
+          "seed": 30,
+          "hash": "42bb002102ba5e3293c6cd00dfac6289b7d3874a2289dd6947b4ed31dba4fe4e"
+        },
+        {
+          "id": "blackthorn-scrub-0031",
+          "seed": 31,
+          "hash": "6a9938c706a1138442f6158de8f442ad079316dad2b3ebd3d234ab7394df7ed7"
+        },
+        {
+          "id": "blackthorn-scrub-0032",
+          "seed": 32,
+          "hash": "94b3889611ad07a5809a2939b1ab51c39e465000950e126f13f60c756fdaba49"
+        },
+        {
+          "id": "blackthorn-scrub-0033",
+          "seed": 33,
+          "hash": "8ca31f3eb196d7b3a2b0f1d2b49ca7cdbcb189dad789b46b3e7c167badd0d208"
+        },
+        {
+          "id": "blackthorn-scrub-0034",
+          "seed": 34,
+          "hash": "b013ba66efbd535c665f5974df192a37c355590297ff388f12d93197205d6a44"
+        },
+        {
+          "id": "blackthorn-scrub-0035",
+          "seed": 35,
+          "hash": "0879717cf0d70cb996592b68471cc0931bfec21516fb0307a4c93f132212543d"
+        },
+        {
+          "id": "blackthorn-scrub-0036",
+          "seed": 36,
+          "hash": "cdf1ab6d69a7c86ea14bd4d058a7766b4132598e94a01eb83a04f5a2ba039f4c"
+        }
+      ]
+    }
+  ],
+  "metadata_revisions": [
+    {
+      "timestamp": 1788850232.0212123,
+      "reason": "Replace pre-review seasonal notes with current spring description; geometry and source hash unchanged"
+    }
+  ]
+}

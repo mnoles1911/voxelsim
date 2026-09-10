@@ -1,0 +1,89 @@
+{
+  "species": "tree-fern",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Single fibrous stem with divided arching fronds follows the garden and grove references. The 100 mm fronds read as a coarse umbrella canopy at distance; individual pinnules remain simplified. Wet mild regional habitat is explicit."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "/site/assets/files/5264/dicksonia-antarctica-3.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/dicksonia/dicksonia-antarctica/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "/site/assets/files/5264/dicksonia-antarctica-2.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/dicksonia/dicksonia-antarctica/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "dicksonia-antarctica",
+  "sources": [
+    "https://www.rhs.org.uk/plants/5794/dicksonia-antarctica/details/",
+    "https://www.treesandshrubsonline.org/articles/dicksonia/dicksonia-antarctica/"
+  ],
+  "habitat": "wet-mild-regional",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "4abe9ec0e5fc6a044f504827ff6da03217834a10774852473f780e40a2ecb202",
+    "4": "f536ddb795975697800d696e0a73e8d2ab1bcbbdb1f6258c4ccd12cd2094c698",
+    "7": "288b9ff9b1dbd056b314cd59c544e2ab11040724d9cca65709cdfc9c20487c29"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "e2104ce204b3f77b5765815807e2ab90701c5e531456cac5756822adbdc1e384"
+  }
+}

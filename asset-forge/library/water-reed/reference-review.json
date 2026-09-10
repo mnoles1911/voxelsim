@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/phragmites-australis/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phragmites_australis_LxMs0ascpThU.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=CF02EPfox4gUd4%2F6AGdFSZNFcEE%3D&Expires=1788863419"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual NASA Goddard form with person viewed: very tall separate green culms with alternating narrow arching blades, dead basal litter not copied. NCState leaves<=60cm by38mm. Spring young1.5m green culms without late-season panicles.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phragmites_australis_LxMs0ascpThU.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=CF02EPfox4gUd4%2F6AGdFSZNFcEE%3D&Expires=1788863419"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/phragmites-australis/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Young green78-157cm culms, alternate attached blades arch then droop; no summer panicles or winter tan litter. Different stem height and shoot spacing visible across36. Root links belong below sediment.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "2f4c3930686124ee6d7e79a2619b88c49b5350d54f4d8b34ced5350485fc6307",
+  "sheet_hash": "cd5fdf8974d88504612d79b45bfa332503fb43e6d2f11d53ccc14404229f7dad",
+  "reviewed_at": 1788861145.8413713,
+  "pilot_hashes": {
+    "1": "58ae33a1e5990e7310625efa9ee6da7d566cdb3f847d14e862c560c60eea7196",
+    "4": "5bfbe53f895c9b0fc19e29998e8074d02b4996e39e84405a2b1cf826ec702c5d",
+    "7": "ce5ce7aa2f84a7ba439346fe760786dadde32ab9e26095dc4634cef1201a6a2d"
+  },
+  "profile": "water-reed",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phragmites_australis_LxMs0ascpThU.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=CF02EPfox4gUd4%2F6AGdFSZNFcEE%3D&Expires=1788863419",
+      "caption": "Form showing height",
+      "credit": "NASA Goddard Space Flight Center",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "36333"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phragmites_australis_IJ5lqAz8neU9.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=fXcnz3apwQrL2r7w7K6qZG2jM9k%3D&Expires=1788863419",
+      "caption": "Flowers in July",
+      "credit": "Natalia Ionina",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36338"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phragmites_australis_hBl88w5qCeyG.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=45AgAjcfC1VILSCxU5lmpGVQDCw%3D&Expires=1788863419",
+      "caption": "Stem and leaf juncture",
+      "credit": "NY State IPM Program at Cornell U.",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "36335"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phrqaagmites_austral_0Eqm7WhcZ68O.apng?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=jl9WoYy%2B2%2B05bOjuD5SsK6vhGpQ%3D&Expires=1788863419",
+      "caption": "Leaves",
+      "credit": "Ana Julia Pereira",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36336"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phragmites_australia_xtBeSaMxACSz.apng?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=owuw8jDrCSizfjPIBVG0gcdcDPc%3D&Expires=1788863419",
+      "caption": "Winter form",
+      "credit": "Ana Julia Pereira",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "36337"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Phragmites_australis_nnJqJYV99vtw.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=dRpJeXU2MW4OQYxO8M7z8fQH5E4%3D&Expires=1788863419",
+      "caption": "Seed head in Sept.",
+      "credit": "AnemoneProjectors",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "36334"
+    }
+  ],
+  "taxon": "Phragmites australis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "cd5fdf8974d88504612d79b45bfa332503fb43e6d2f11d53ccc14404229f7dad"
+  }
+}

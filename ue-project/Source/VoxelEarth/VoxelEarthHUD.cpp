@@ -1,4 +1,5 @@
 #include "VoxelEarthHUD.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelTreeFellingPrototype.h"
 
 #include "Engine/Canvas.h"
@@ -61,6 +62,7 @@ const TCHAR* SeasonName(int32 DayOfYear, double LatitudeDeg)
 
 void AVoxelEarthHUD::DrawHUD()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelHUD_DrawHUD);
 	Super::DrawHUD();
 
 	if (!Canvas)

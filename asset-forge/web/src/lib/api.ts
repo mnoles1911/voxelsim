@@ -72,6 +72,11 @@ const post = (url: string, body: unknown) =>
   hit(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
 export const api = {
+  variants: () => hit('/api/variants').then(r=>j<LibraryEntry[]>(r)),
+  generationRuns: () => hit('/api/inventory/runs').then(r=>j<any[]>(r)),
+  generateVariants: (species:string, seed_start:number, count:number, workers:number) => post('/api/inventory/start',{species:[species],seed_start,count,workers}).then(r=>j<{id:string}>(r)),
+  setReference: (id:string) => post('/api/library/reference',{id}).then(r=>j<any>(r)),
+  approveGenerator: (species:string) => post('/api/library/approve-generator',{species}).then(r=>j<any>(r)),
   biomes: () => hit("/api/biomes").then((r) => j<Biome[]>(r)),
   kinds: () => hit("/api/kinds").then((r) => j<Kind[]>(r)),
   /* THE QUERY SEAM, live. Same answer as library/categories.json and the same
@@ -128,6 +133,11 @@ export const api = {
     voxel_mm?: number;
   }) => post("/api/import", payload).then((r) => j<LibraryEntry>(r)),
 
+  keepInventory: (id: string) =>
+    post("/api/inventory/keep", { id }).then((r) => j<LibraryEntry>(r)),
+  rejectVariant: (id: string) =>
+    post('/api/inventory/reject', { id }).then(r => j<{ rejected: string }>(r)),
+
   deleteLibrary: (id: string) =>
     post("/api/library/delete", { id }).then((r) => j<{ deleted: string; curation?: Curation }>(r)),
 
@@ -139,7 +149,7 @@ export const api = {
   reviewAppearance: (id: string, approved: boolean) =>
     post("/api/library/appearance-review", { id, approved }).then((r) => j<LibraryEntry>(r)),
 
-  thumbUrl: (id: string) => "/api/library/thumb?id=" + encodeURIComponent(id),
+  thumbUrl: (id: string) => "/api/library/thumb?id=" + encodeURIComponent(id) + "&appearance=2",
   voxelsUrl: (id: string, budget?: number) =>
     "/api/voxels?id=" + encodeURIComponent(id) + (budget ? "&max=" + budget : ""),
   /* The judgment viewport's address: any (species, bank seed), regenerated

@@ -1,0 +1,88 @@
+{
+  "species": "holm-oak",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Dense compact evergreen crown follows April and May references. Exposed lower scaffold is a stylized open-grown interpretation; warm-dry habitat remains explicit."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "/site/assets/files/7071/quercus-ilex-11.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/quercus/quercus-ilex/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "/site/assets/files/7071/quercus-ilex-07.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/quercus/quercus-ilex/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "quercus-ilex",
+  "sources": [
+    "https://www.treesandshrubsonline.org/articles/quercus/quercus-ilex/"
+  ],
+  "habitat": "warm-dry",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "af678a80240c2d7d1a5866979cb4c8947df192f2d2943100c279414568794a7f",
+    "4": "d6d4aa83567ea94a70993c52d2c870a594a0ca0b3b7c24018c6cb1b2a95c8fd4",
+    "7": "75e9b3fe4a17babc1b54704522d998bef05bc6cac9749945d9e06544e6331fdd"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "40414af6894ae58149d62a85b863e88e0e9571db4d6805cc666ada3277105d22"
+  }
+}

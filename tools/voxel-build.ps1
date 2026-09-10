@@ -28,6 +28,8 @@ param(
     [switch]$Verify,
     [switch]$AllowDirty
 )
+$ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 # dotnet is on this list deliberately: UnrealBuildTool runs as dotnet.exe, so a
 # build in its UBT phase is invisible to a cl/link/UnrealBuildTool check -- which
 # is exactly the window in which the link happens.

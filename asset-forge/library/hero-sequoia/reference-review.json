@@ -1,0 +1,88 @@
+{
+  "species": "hero-sequoia",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Massive tapered bole and elevated conifer crown follow mature trunk and young whole-tree references. The seed family spans large juvenile to giant trees; this is a rare montane hero profile, not ordinary canopy filler."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "20151",
+      "source": "https://plants.ces.ncsu.edu/plants/sequoiadendron-giganteum/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "20150",
+      "source": "https://plants.ces.ncsu.edu/plants/sequoiadendron-giganteum/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "sequoiadendron-giganteum",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/sequoiadendron-giganteum/"
+  ],
+  "habitat": "montane-hero",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "9d1c79c8ae1f263eeb82803982f1d4510ab7077c8a475c304edd308fb1804cfb",
+    "4": "36a116945f0755e01b48f47b80072f8d42739947a3d0e5881268a8b02e9418b6",
+    "7": "80d4ee6560792129796460b8d0be77de882fb662cf738ca460247c729ea12704"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "6bfa30aa9715861f225d5f8aa414b2ceaf93426ef96afba001842d203ecfc120"
+  }
+}

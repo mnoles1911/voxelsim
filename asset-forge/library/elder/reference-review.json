@@ -1,0 +1,342 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/sambucus-nigra/",
+  "viewed_photos": [
+    "Form in flower - Jim Robbins",
+    "leaves and flowers - H. Zell",
+    "leaves and flowers - Walter Siegmund",
+    "Full Form and Black Lace - Jim Robbins; ornamental purple dissected foliage excluded"
+  ],
+  "findings": "Compared mature spreading shrub habit and wild-type pinnate foliage photographs to current seeds 1/4/7 and the entire 36 sheet. Explicit woody stools and attached daughter shoots carry seven-leaflet pinnate leaves, producing a dense irregular crown with separated upper branches and no spherical clumps. Selected the spring vegetative phase before cream flower cymes open; summer berries are absent. Ornamental Black Lace reference photographs were inspected but their purple dissected foliage was explicitly excluded. Heights approximately 1.85-3.75 m. Small leaf serrations remain unresolved at 25 mm. Accepted as a leafy spring elder shrub source; source acceptance does not endorse variants.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "71c8e981c9c1219f1d0411aefde665695c8aadb842c2e2c8639c18eeaa418c71",
+  "sheet_hash": "338119ddeb9ed218c5da29b7e5172efb16c0a130ab21a80a7c2847643a1ea46f",
+  "reviewed_at": 1788846488.2552338,
+  "pilot_hashes": {
+    "1": "42e936fb1a5b6dc2cdb3cf1bc0068b07ecb38b399259b24be070d1fadaee0e5d",
+    "4": "683cf2bac01cf79fc3a03531bd48aacae862090df45bd6bbac1c8ad171c33b4f",
+    "7": "85c85b099146b226c2298c807533bb0ddea20a00f1667bc76c8e8466a89e9ec3"
+  },
+  "profile": "elder",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sambucus_nigra_flfm__u8Z1lrXIeE8a.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=9meV7XPdxpaerHlb%2BUt7pE526Pg%3D&Expires=1788849621",
+      "caption": "Form in flower",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "21006"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sambucus_nigra_by_H._Iqz1wr8g5DVv.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Sc1F2EiOvL7iOnsZ6DAMCorzs%2F0%3D&Expires=1788849621",
+      "caption": "leaves and flowers",
+      "credit": "H. Zell",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "13406"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sambucus_nigra_by_Wa_YlZ0hMicgS4q.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=vLAKcvc2HC8Ak5lR0HCuBwbHQ1A%3D&Expires=1788849621",
+      "caption": "leaves and flowers",
+      "credit": "Walter Siegmund",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "13407"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sambucus_nigra_fm_06_Awe2Azilm8BP.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=tjlgh%2BszqctFmmCiri7GByJuOYw%3D&Expires=1788849621",
+      "caption": "Full Form",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "18478"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sambucus_nigra_Black_yN5YOMgNqGJp.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=AmrAVL6EB%2BKtv8Vx%2B9NEivNrBTw%3D&Expires=1788849621",
+      "caption": "'Black Lace' Form (Asheville, NC)",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "21004"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Sambucus_nigra_by_Fr_3s897rpXR0P8.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=f14sfVgr3ZOOp%2B98pOTchjcR6AY%3D&Expires=1788849621",
+      "caption": "leaves and flowers",
+      "credit": "Franz Xaver",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "13408"
+    }
+  ],
+  "taxon": "Sambucus nigra",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "338119ddeb9ed218c5da29b7e5172efb16c0a130ab21a80a7c2847643a1ea46f"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "a7c88c444f3e21825121faa3a976de57643412fcc469a9527fdd767916419d71",
+      "new_digest": "71c8e981c9c1219f1d0411aefde665695c8aadb842c2e2c8639c18eeaa418c71",
+      "timestamp": 1788847529.0377364,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "elder-0001",
+          "seed": 1,
+          "hash": "42e936fb1a5b6dc2cdb3cf1bc0068b07ecb38b399259b24be070d1fadaee0e5d"
+        },
+        {
+          "id": "elder-0002",
+          "seed": 2,
+          "hash": "c85984322932ad2132259b0f8c0fb80c0b0cdf5abafda835a78cf4dabe468a43"
+        },
+        {
+          "id": "elder-0003",
+          "seed": 3,
+          "hash": "79958774043829994932fafd6d5fc252ba96d13ff6f9fe3151f445a744911c0f"
+        },
+        {
+          "id": "elder-0004",
+          "seed": 4,
+          "hash": "683cf2bac01cf79fc3a03531bd48aacae862090df45bd6bbac1c8ad171c33b4f"
+        },
+        {
+          "id": "elder-0005",
+          "seed": 5,
+          "hash": "ddc7d1c5c5c325d1a35e036ea587bac10ef32ec2e2d19b5a30a6a694d6ebcff7"
+        },
+        {
+          "id": "elder-0006",
+          "seed": 6,
+          "hash": "e89baab7a1eaee70be97ab2ca3f3ccf4725605d48ae7bc7f7e8d132b54a91e40"
+        },
+        {
+          "id": "elder-0007",
+          "seed": 7,
+          "hash": "85c85b099146b226c2298c807533bb0ddea20a00f1667bc76c8e8466a89e9ec3"
+        },
+        {
+          "id": "elder-0008",
+          "seed": 8,
+          "hash": "de1c13064b9d88bca1630348a1496d80a1b793061f6edfcca42a501c74d30608"
+        },
+        {
+          "id": "elder-0009",
+          "seed": 9,
+          "hash": "b56d3d8ac54a93dbef94905198948577261032b0e77bdd6583ea333ae8494415"
+        },
+        {
+          "id": "elder-0010",
+          "seed": 10,
+          "hash": "098fdf04088a127373b0ae7c13f99ce82d5a37c18b631f2b19e8bcf093c7c4ff"
+        },
+        {
+          "id": "elder-0011",
+          "seed": 11,
+          "hash": "83cf76dded81b80a0d08a57bf1551ae0ee288c37a7fc13ee86e1b0b54f7cf44c"
+        },
+        {
+          "id": "elder-0012",
+          "seed": 12,
+          "hash": "0312b744ddae85c286d798ce64d047d3690f7902699ab08882a3a10864309393"
+        },
+        {
+          "id": "elder-0013",
+          "seed": 13,
+          "hash": "5b24074c6a42d875a573f45e93477cb153e9f892d3ee3fc59faa8a7b4d605e00"
+        },
+        {
+          "id": "elder-0014",
+          "seed": 14,
+          "hash": "ef1f45d0ac406dfb65ae12dfcb8ac533d7b1af81ca514f8543edc9295b5e6332"
+        },
+        {
+          "id": "elder-0015",
+          "seed": 15,
+          "hash": "a85757ead72077f8bfa8f92aab39c4be12aa644709492582d72769b44e9f74b2"
+        },
+        {
+          "id": "elder-0016",
+          "seed": 16,
+          "hash": "14c57ac2fbb497c4f130b529be2ae77979f4732ec4125937c22ee5fbe43fdd0f"
+        },
+        {
+          "id": "elder-0017",
+          "seed": 17,
+          "hash": "be18f091f234e0f6618624a8f253c92d6838a866f0e7aeac277b52857d75f36e"
+        },
+        {
+          "id": "elder-0018",
+          "seed": 18,
+          "hash": "af45786d54733a51949a178839bf864ed750d31fa743cc2cccaf9c262e0d73bf"
+        },
+        {
+          "id": "elder-0019",
+          "seed": 19,
+          "hash": "31d8cdc824a19228d54e4f97fd54e057a2d34b8452e93fad8c3ba20bf089a6da"
+        },
+        {
+          "id": "elder-0020",
+          "seed": 20,
+          "hash": "4c81c00afedf7e1a90bedd639c971be5ba31b9dc53a174316e5031d2c948f389"
+        },
+        {
+          "id": "elder-0021",
+          "seed": 21,
+          "hash": "4436ff428b6c567bd850eed3f002a0d3f0c83f7964006975b69f7b801f36afa3"
+        },
+        {
+          "id": "elder-0022",
+          "seed": 22,
+          "hash": "9100ecbed2385c2259200909b86bf70110f5892047b4997869d2d11eb8db67cc"
+        },
+        {
+          "id": "elder-0023",
+          "seed": 23,
+          "hash": "63511625dbc2a80e186055ae8b5445df7ada24921ee492c6743a7cbaa7d77e2d"
+        },
+        {
+          "id": "elder-0024",
+          "seed": 24,
+          "hash": "96e5b76cc519a4c62daccb2fd9c1e52f262b9fe21a6c39e0d4a0ce8bbe48d349"
+        },
+        {
+          "id": "elder-0025",
+          "seed": 25,
+          "hash": "fa81ac0b240aac5aa7c2036b6941af26a271175eefe032d8d8ed6bd123d24c06"
+        },
+        {
+          "id": "elder-0026",
+          "seed": 26,
+          "hash": "a53ae93d1647ea30cddf2e3c81c2abcf573f73effeb0de57d066cbf72c68e872"
+        },
+        {
+          "id": "elder-0027",
+          "seed": 27,
+          "hash": "9be3917b3c0f1b1a71c335cf1ff21190130c7581e0a5a65121ec07ac3dfdf7eb"
+        },
+        {
+          "id": "elder-0028",
+          "seed": 28,
+          "hash": "4c56a1863b692a55cae9e8c94eedfa62086d2f579f01915050c0afff8bf0f53e"
+        },
+        {
+          "id": "elder-0029",
+          "seed": 29,
+          "hash": "9e019b873bea172284d9e3b530c4abd72112d9f35fbc952cfa411fdce3437478"
+        },
+        {
+          "id": "elder-0030",
+          "seed": 30,
+          "hash": "d82ec32f1afc1a6423c1f64fdd5237826e0a9aa6ddf8a550ad1e62f5b7bcabdd"
+        },
+        {
+          "id": "elder-0031",
+          "seed": 31,
+          "hash": "36cc0e037aee497fcb7b9063624805fc2c9b6a4d770531a234db01899b83ea53"
+        },
+        {
+          "id": "elder-0032",
+          "seed": 32,
+          "hash": "688ed78b2d28e2c86feb8472d8aa4dbc4e0f850fc5878bf081ecbb1a5499c090"
+        },
+        {
+          "id": "elder-0033",
+          "seed": 33,
+          "hash": "babbc1eb64ef86e22bc9066ef2db9cce332b22b11d0e83aa8c70d0dd09ce7039"
+        },
+        {
+          "id": "elder-0034",
+          "seed": 34,
+          "hash": "2e3ea91643b402b48c6efb7d2368ec24e08021e38a0d82c2e08b1958f5b706ff"
+        },
+        {
+          "id": "elder-0035",
+          "seed": 35,
+          "hash": "0224b86a122348d62490fce93a2f437a9562859407a3900f63d22a53f11074e8"
+        },
+        {
+          "id": "elder-0036",
+          "seed": 36,
+          "hash": "21d5fb5a4d16552fd9a3aa282a9d9756edf87bb32f9fbde349943f766f8c26cf"
+        }
+      ]
+    }
+  ]
+}

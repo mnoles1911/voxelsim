@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "vxctest.h"
 
@@ -463,4 +464,69 @@ VXC_TEST(assetgrid_digest_is_stable_across_a_reparse) {
     CHECK_EQ(int(b.parse(blob)), int(AssetParseError::kOk));
     CHECK_EQ(int(digestGrid(a) == digestGrid(b)), 1);
     CHECK(digestGrid(a) != 0);
+}
+
+
+VXC_TEST(assetgrid_solid_count_matches_dense_across_reparse_copy_and_move) {
+    AssetGrid g;
+    CHECK_EQ(g.solidCount(), uint64_t(0));
+    uint32_t state = 93841;
+    for (int trial = 0; trial < 40; ++trial) {
+        const int nx = 1 + trial % 5, ny = 1 + trial % 7, nz = 1 + trial % 11;
+        std::vector<MaterialId> dense(size_t(nx * ny * nz));
+        uint64_t expected = 0;
+        for (auto& material : dense) {
+            state = state * 1664525u + 1013904223u;
+            material = trial % 3 == 0 ? MaterialId(MAT_AIR) : MaterialId((state >> 23) % 25);
+            if (material != MAT_AIR) ++expected;
+        }
+        auto blob = encode(-2, 3, -1, nx, ny, nz, dense);
+        // Exercise the raw pointer overload and the vector wrapper, at both
+        // accepted wire versions (v4 stores micrometres instead of millimetres).
+        if (trial & 1) {
+            blob[4] = 4; const uint32_t pitch = 100000;
+            for (int i = 0; i < 4; ++i) blob[32+i] = uint8_t(pitch >> (i*8));
+            CHECK_EQ(int(g.parse(blob.data(), blob.size())), int(AssetParseError::kOk));
+        } else CHECK_EQ(int(g.parse(blob)), int(AssetParseError::kOk));
+        uint64_t sampled = 0;
+        for (int x = 0; x < nx; ++x) for (int y = 0; y < ny; ++y) for (int z = 0; z < nz; ++z)
+            if (g.at(x,y,z) != MAT_AIR) ++sampled;
+        CHECK_EQ(sampled, expected); CHECK_EQ(g.solidCount(), sampled);
+        AssetGrid copied(g); AssetGrid assigned; assigned = g;
+        CHECK_EQ(copied.solidCount(), expected); CHECK_EQ(assigned.solidCount(), expected);
+        AssetGrid moved(std::move(copied));
+        CHECK_EQ(moved.solidCount(), expected); CHECK_EQ(copied.solidCount(), uint64_t(0));
+        copied = std::move(assigned);
+        CHECK_EQ(copied.solidCount(), expected); CHECK_EQ(assigned.solidCount(), uint64_t(0));
+        CHECK_EQ(int(assigned.parse(blob)), int(AssetParseError::kOk));
+        CHECK_EQ(assigned.solidCount(), expected);
+        // Reparse one copy as all air without altering the source or moved grid.
+        CHECK_EQ(int(copied.parse(encode(0,0,0,1,1,1,{MAT_AIR}))), int(AssetParseError::kOk));
+        CHECK_EQ(copied.solidCount(), uint64_t(0)); CHECK_EQ(moved.solidCount(), expected);
+    }
+}
+
+VXC_TEST(assetgrid_solid_count_preserves_failure_run_table_semantics) {
+    AssetGrid g;
+    const auto good = encode(0,0,0,2,2,2,std::vector<MaterialId>(8,MaterialId(16)));
+    CHECK_EQ(int(g.parse(good)), int(AssetParseError::kOk)); CHECK_EQ(g.solidCount(), uint64_t(8));
+    // Material-run sum failure historically retains the partial run table:
+    // dimensions remain invalid, but solidCount scans the decoded lengths.
+    for (uint8_t length : {uint8_t(7),uint8_t(9)}) {
+        auto bad = good; bad[kVxaHeaderBytes+1] = length;
+        CHECK_EQ(int(g.parse(bad)), int(AssetParseError::kRunLengthSum));
+        CHECK(!g.valid()); CHECK_EQ(g.solidCount(), uint64_t(length));
+        CHECK_EQ(int(g.parse(nullptr,0)), int(AssetParseError::kTooSmall));
+        CHECK_EQ(g.solidCount(), uint64_t(0));
+    }
+    // A bad part table follows material success but clears the entire object.
+    auto badPart = good; badPart[40] = 1;
+    badPart.insert(badPart.end(), {1,7,0,0,0});
+    CHECK_EQ(int(g.parse(badPart)), int(AssetParseError::kRunLengthSum));
+    CHECK(!g.valid()); CHECK_EQ(g.solidCount(), uint64_t(0));
+    // A zero-length non-air run contributes zero and remains accepted.
+    auto zero = good; zero[36] = 2;
+    zero.insert(zero.begin()+kVxaHeaderBytes, {16,0,0,0,0});
+    CHECK_EQ(int(g.parse(zero)), int(AssetParseError::kOk)); CHECK_EQ(g.solidCount(), uint64_t(8));
+    CHECK_EQ(int(g.parse(good)), int(AssetParseError::kOk)); CHECK_EQ(g.solidCount(), uint64_t(8));
 }

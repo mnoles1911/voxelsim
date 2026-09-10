@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://gobotany.nativeplanttrust.org/species/eleocharis/acicularis/",
+  "viewed_photos": [
+    "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-dcameron-a.jpg"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Donald Cameron low wet-rock patch viewed: fine hair-like bare culms with tiny oval tips, creeping colony. GoBotany0.2-0.7mm stems,1-2mm heads cannot resolve25mm; choose10-18cm young leafless needle colony without inflated brown heads.",
+    "viewed_photos": [
+      "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-dcameron-a.jpg"
+    ],
+    "source": "https://gobotany.nativeplanttrust.org/species/eleocharis/acicularis/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Rejected first overly dense32-culm patch; reduced to14 and widened spacing. Current10-23cm colony has separate tips and open larger patches; small compact seeds still merge strongly at25mm. True0.2-0.7mm stems and1-2mm heads are not reproducible; no inflated heads.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "c410814faecd83553262c8e8e0a07917a1b487349c4c61c33b93b3355c15d38d",
+  "sheet_hash": "e0b9e72c4ded26e201f88b1fb63d34116de080a088e7e696fb1f5d5e37dbaa91",
+  "reviewed_at": 1788861145.7480597,
+  "pilot_hashes": {
+    "1": "3161639d2743ef9f6d899884c8195f2d262a7b276bbe167cb29a9732d0462502",
+    "4": "828471d35f134cc604e24a26e99ae592a595750e77fff5e6fd9ba0a5f1c075f4",
+    "7": "416912dc6853e86fbb9df330a7f850091c058d049c3124ce3dcf0fe464011800"
+  },
+  "profile": "needle-spike-rush",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-dcameron-a.jpg",
+      "caption": "Plant form: Eleocharis acicularis.",
+      "credit": "By Donald Cameron. \u00b7 Copyright \u00a9 2026 Donald Cameron.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-dcameron-a.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-gmittelhauser.jpg",
+      "caption": "Plant form: Eleocharis acicularis.",
+      "credit": "By Glen Mittelhauser. \u00b7 Copyright \u00a9 2026 Glen Mittelhauser.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-gmittelhauser.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-ahaines-b.jpg",
+      "caption": "Plant form: Eleocharis acicularis.",
+      "credit": "By Arthur Haines. \u00b7 Copyright \u00a9 2026 Arthur Haines.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ha-ahaines-b.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ss-dzimmerman.jpg",
+      "caption": "Stems and sheaths: Eleocharis acicularis.",
+      "credit": "By Dale A. Zimmerman Herbarium - Western New Mexico University. \u00b7 Copyright \u00a9 2026 Dale A. Zimmerman Herbarium - Western New Mexico University.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ss-dzimmerman.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ff-mlovit-a.jpg",
+      "caption": "Flowers and fruits: Eleocharis acicularis.",
+      "credit": "By Marilee Lovit. \u00b7 Copyright \u00a9 2026 Marilee Lovit.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-ff-mlovit-a.jpg"
+    },
+    {
+      "url": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-st-blegler.jpg",
+      "caption": "Stems: Eleocharis acicularis.",
+      "credit": "By Ben Legler. \u00b7 Copyright \u00a9 2026 Ben Legler.",
+      "license": "See source credit; remotely hosted",
+      "image_id": "https://newfs.s3.amazonaws.com/taxon-images-1000s1000/Cyperaceae/eleocharis-acicularis-st-blegler.jpg"
+    }
+  ],
+  "taxon": "Eleocharis acicularis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "e0b9e72c4ded26e201f88b1fb63d34116de080a088e7e696fb1f5d5e37dbaa91"
+  }
+}

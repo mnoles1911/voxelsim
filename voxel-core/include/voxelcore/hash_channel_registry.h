@@ -99,6 +99,12 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     // the four size classes, so there is no index to reserve against.
     {CH_DETAIL_GROUP, 1, "CH_DETAIL_GROUP"},
     {CH_DETAIL_MEMBER, 1, "CH_DETAIL_MEMBER"},
+    {CH_ECO_COMMUNITY, 1, "CH_ECO_COMMUNITY"},
+    {CH_ECO_STRUCTURE, 1, "CH_ECO_STRUCTURE"},
+    {CH_ECO_FEATURE, 1, "CH_ECO_FEATURE"},
+    {CH_ECO_PRIORITY, 1, "CH_ECO_PRIORITY"},
+    {CH_ECO_VARIANT, 1, "CH_ECO_VARIANT"},
+    {CH_ECO_COVER, 1, "CH_ECO_COVER"},
 };
 
 inline constexpr int kChannelAllocCount =

@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/plantago-lanceolata/",
+  "viewed_photos": [
+    "Form - Sannse",
+    "Form (Wake County,NC) - Cathy Dewitt",
+    " - Kurt Steuber"
+  ],
+  "findings": "Sannse,Cathy DeWitt,Kurt Stueber actual photos: narrow lanceolate basal leaves with ribs and bare scapes ending in short cylindrical spikes. Generic square rosette rejected. Current seeds1,4,7 and all36contact-sheet panels visually inspected. Lanceolate basal rosettes and bare scapes ending in short brown spikes;23\u201347cm. Ribs and tiny anther ring unresolved. Accepted as coarse stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "97a1b2823f633835b7bcb061e9a2055c90f9a80610c2d64e367884c5673639d9",
+  "sheet_hash": "27f754ca54100d1c914e639617a4a1ce5837588f0e1eb3538106799885abf23c",
+  "reviewed_at": 1788858046.0777183,
+  "pilot_hashes": {
+    "1": "70ba3d162a60d3abb992fd6e733e733d2c95547ea2a7430d448025d7a1de8d93",
+    "4": "0b5e8fde294c5b6e88d3a9ae1af2f5cf178f1280ba3498b50ca440151df5b8f6",
+    "7": "995ed10ba0e82dfad5112dd7faa7c1df522ebddecc4380bb1b61425f4563b7d5"
+  },
+  "profile": "ribwort-plantain",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Plantago_lanceolata_form_sanusee_ccbysa30.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=8HHGDP6TWicQU4LiJ9KhzZ7LFcs%3D&Expires=1788859997",
+      "caption": "Form",
+      "credit": "Sannse",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "9453"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Plantago-lanceolata-_TPy0qDcYrzoF.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=leQJWuISOZ3r1uPYqGbE40zvTAo%3D&Expires=1788859997",
+      "caption": "Form (Wake County,NC)",
+      "credit": "Cathy Dewitt",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "28593"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Plantago_lanceolata_flowers_kurt_suber_ccbysa30.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=0Qp7XUsrEge9X7dJuLE6suDAyv8%3D&Expires=1788859997",
+      "caption": "",
+      "credit": "Kurt Steuber",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "9451"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/plantago_lanceolata_fd_richards_ccbysa20.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=XaBI5rcuBxg36tuspzqZl5mZ%2FbY%3D&Expires=1788859997",
+      "caption": "Strap-like leaf",
+      "credit": "F. D. Richards",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "9452"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Plantago_lanceolata-_lVlCWACa2Uim.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=RI33uQ3m3hj8ilu%2BOAWf5fLUhhA%3D&Expires=1788859997",
+      "caption": "Narrow Leaf (Wake County,NC)",
+      "credit": "Cathy Dewitt",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "25940"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Plantago_lanceolata-_Obd4oIhe84Fd.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=UYpnONPXOzVA%2B9IMipCpRYSrYOA%3D&Expires=1788859997",
+      "caption": "Flower Heads (Warren County,NC)",
+      "credit": "Cathy Dewitt",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "28592"
+    }
+  ],
+  "taxon": "Plantago lanceolata",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "27f754ca54100d1c914e639617a4a1ce5837588f0e1eb3538106799885abf23c"
+  }
+}

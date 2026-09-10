@@ -37,7 +37,7 @@ export function LibraryView({
   // grandfathered species is to be reviewed and approved explicitly, so the
   // ledger opens on "Never reviewed" -- the work remaining -- and keeps doing
   // so until that set is empty. Switch to "Approved" for the exporting set.
-  const [status, setStatus] = React.useState("unreviewed");
+  const [status, setStatus] = React.useState("all");
   const [query, setQuery] = React.useState("");
   const [selected, setSelected] = React.useState<string | null>(null);
 
@@ -58,6 +58,7 @@ export function LibraryView({
   const rows = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     return world.specs.filter((s) => {
+      if (!variantCount.has(s.name)) return false;
       // ONE control, two axes. "cat:craftable" is a question a person actually
       // asks -- "show me the things a player can make" -- and it is not the
       // same question as "show me artifacts": the two coincide today and will
@@ -77,18 +78,18 @@ export function LibraryView({
         const allowed = allowedBiomes(s, world.biomes);
         if (biome === "unassigned" ? allowed.length > 0 : !allowed.includes(biome)) return false;
       }
-      if (q && !s.name.includes(q) && !s.notes.toLowerCase().includes(q)) return false;
+      if (q && !s.name.includes(q) && !(s.design?.display_name||'').toLowerCase().includes(q) && !s.notes.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [world.specs, world.biomes, kind, biome, status, query]);
+  }, [world.specs, world.biomes, kind, biome, status, query, variantCount]);
 
   const selectedRow = world.specs.find((s) => s.name === selected) ?? null;
-  const unreviewed = world.specs.filter((s) => !s.curation.curated).length;
+  const unreviewed = world.specs.filter((s) => variantCount.has(s.name) && !s.curation.curated).length;
   const counts = React.useMemo(() => {
     const c = { approved: 0, draft: 0, rejected: 0 };
-    for (const s of world.specs) if (s.curation.curated) c[s.curation.status] = (c[s.curation.status] ?? 0) + 1;
+    for (const s of world.specs) if (variantCount.has(s.name) && s.curation.curated) c[s.curation.status] = (c[s.curation.status] ?? 0) + 1;
     return c;
-  }, [world.specs]);
+  }, [world.specs, variantCount]);
 
   /* ONE publish verb (plan P2): the same tools/publish.py the CLI runs,
    * shelled by the server; the full report lands in a dialog. */
@@ -205,7 +206,7 @@ export function LibraryView({
               {counts.approved} approved · {counts.draft} draft · {counts.rejected} rejected
             </span>
             <Button variant="gold" size="sm" disabled={publishing} onClick={() => void doPublish()}
-              title="Publish the library to the game: banks derived from kept seeds, manifest + categories re-exported, checks run">
+              title="Publish the library to the game: banks derived from kept variants, manifest + categories re-exported, checks run">
               <Rocket className="h-3.5 w-3.5" /> {publishing ? "Exporting…" : "Export to game"}
             </Button>
           </div>
@@ -283,14 +284,14 @@ function SpeciesLine({
     >
       <Icon className={cn("h-4 w-4 shrink-0", active ? "text-gold-400" : "text-parch-500")} />
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm text-parch-100">{row.name}</div>
+        <div className="truncate text-sm text-parch-100">{row.design?.display_name||row.name}</div>
         <div className="truncate font-mono text-[11px] text-parch-500">
           {row.subcategory && groupLabel(row.subcategory) + " · "}{row.size_m.toFixed(1)} m
           {/* biome text is placement-derived: absent for vehicles (owner
             * directive 2026-09-05) -- 'nowhere' on a canoe reads as a bug */}
           {row.category !== "craftable" &&
             " · " + (allowed.length === 0 ? "nowhere" : allowed.length + " biome" + (allowed.length > 1 ? "s" : ""))}
-          {variants > 0 && " · " + variants + " kept"}
+          {variants > 0 && " · " + variants + " saved"}
           {row.category !== "craftable" && Object.keys(row.biome_rules).length > 0 && " · ruled"}
         </div>
       </div>

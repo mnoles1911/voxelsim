@@ -1,0 +1,150 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/alisma-plantago-aquatica/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Alisma_plantgo-aquatica-whole_plant_with_flower-Bff_from_Wikimedia_Commons-CC__BY-SA_3.0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Phqqq%2F1FilV0YvmXdnuYxiuhtD4%3D&Expires=1788863418"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Bff whole-plant photo viewed: basal rosette, long petioles with oval broad emergent blades, sparse whorled branching floral axis. Source60-90cm mature, late-spring flowering; choose leafy50cm spring rosette, no mature panicle.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Alisma_plantgo-aquatica-whole_plant_with_flower-Bff_from_Wikimedia_Commons-CC__BY-SA_3.0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Phqqq%2F1FilV0YvmXdnuYxiuhtD4%3D&Expires=1788863418"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/alisma-plantago-aquatica/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Oval emergent blades at ends of long basal petioles;28-53cm leafy spring rosette. No mature summer panicle. Surface blades visibly broader than stems; sparse outer gaps retained.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "c432367a44ea9af1e4e5a6c60919aaa73c2c11d8504a1d4413c3c9d1745285f3",
+  "sheet_hash": "33d70988c3e7b74643d4b8f84bcb0b47fcd9f802c82cc6587f9319b6dada3f4d",
+  "reviewed_at": 1788861145.4276571,
+  "pilot_hashes": {
+    "1": "d66df58ed823aaa7425af1541b01d5eb60b067b22a9dd160c7aa2567ba0c0552",
+    "4": "5ca1beb4ecf7a2b851673f1b247b2edb8e9de0d3e84f4e196b35c95c5b68dc8e",
+    "7": "908f5b725f1205af3860849fbe3dd772ee85c807e7c1872c734d93c75ad11060"
+  },
+  "profile": "water-plantain",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Alisma_plantgo-aquatica-whole_plant_with_flower-Bff_from_Wikimedia_Commons-CC__BY-SA_3.0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Phqqq%2F1FilV0YvmXdnuYxiuhtD4%3D&Expires=1788863418",
+      "caption": "Whole plant",
+      "credit": "Bff Wikipedia Commons",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10433"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Alisma_plantgo-aquatica-close_up_of_flower-Christian_Fischer-CC_BY-SA_3.0.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=pndizPT2ou4WRYXtbsCa%2B9FCByg%3D&Expires=1788863419",
+      "caption": "Flower",
+      "credit": "Christian Fischer",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10429"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Alisma_plantgo-aquatica-inflorescence_shape-Stefan_Lefnaer-CC_BY-SA_4.0.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=SUH6mLyRGGEM0LgPZNbpEApEuD0%3D&Expires=1788863418",
+      "caption": "Inflorescence",
+      "credit": "Stefan Lefnaer",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "10431"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Alisma_plantgo-aquatica-Leaf_Blade-Christian_FischerCC_BY-SA.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=pTz7m5OJkgITLKLNB2efcnZAZZ4%3D&Expires=1788863418",
+      "caption": "Leaf Blade",
+      "credit": "Christian Fischer",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "10432"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Alisma_plantgo-aquatica-fruit-Ian_Sutton-CC_BY_2.0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=XVKvq1pWKVEhFCRb3dVK6PY%2B0rk%3D&Expires=1788863418",
+      "caption": "Fruit",
+      "credit": "Ian Sutton",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "10430"
+    }
+  ],
+  "taxon": "Alisma plantago-aquatica",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "33d70988c3e7b74643d4b8f84bcb0b47fcd9f802c82cc6587f9319b6dada3f4d"
+  }
+}

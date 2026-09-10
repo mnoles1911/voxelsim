@@ -1,0 +1,69 @@
+{
+  "id": "birch-0004",
+  "species": "birch",
+  "kind": "tree",
+  "category": "environment",
+  "seed": 4,
+  "imported": false,
+  "inventory_candidate": false,
+  "visual_approved": true,
+  "review_status": "endorsed",
+  "spec_hash": "0830fd3702ac81b2",
+  "generation_key": "686f74608472c0c45440e95c3e59b29d5b833f28218e469909cd2b2a9948edaa",
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "artifact_hashes": {
+    "realized.json": "bb0b28c907472a6e5455fbb47566ca23d447ec2fe77948c2a4ab547530916233",
+    "spec.json": "00ddd40715f9f39ad6a7fe76230242a5355f747a29434d42d3d8f7bcfb1081ad",
+    "thumb.png": "58543ed8376e48f5a171dfa0af657eccd119a980c44be167be44c3b9a66ae1d4",
+    "tree.vox": "2c71637a5769a4db88562b6349129a785cb12321c7cd47fa0afea32cfcbd8676",
+    "tree.vxa": "1eff0e404ab7f70864a1025ba0ec24e292f193d24589713d1f805632bf713123"
+  },
+  "asset_bytes": 291728,
+  "stats": {
+    "seed": 4,
+    "spec_hash": "0830fd3702ac81b2",
+    "kind": "tree",
+    "generator": "temperate-shoots-v2",
+    "profile": "birch",
+    "architecture": "light",
+    "habitat": "pioneer",
+    "size_class": "medium",
+    "growth_form": "open",
+    "nodes": 3860,
+    "segments": 2868,
+    "max_order": 4,
+    "clumps": 2820,
+    "branch_curves": 992,
+    "voxel_cm": 10.0,
+    "height_m": 11.4,
+    "length_m": 8.8,
+    "footprint_m": [
+      8.8,
+      8.0
+    ],
+    "extent_vox": [
+      88,
+      80,
+      114
+    ],
+    "voxels": 17865,
+    "by_material": {
+      "16": 33,
+      "19": 17336,
+      "23": 496
+    },
+    "wood_connected": 1.0,
+    "wood_detached": 0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ground_contact": 15,
+    "orphans_removed": 0,
+    "grid_mb": 0.8,
+    "ms_grow": 305.0,
+    "ms_total": 1548.5
+  },
+  "problems": [],
+  "vox_models": 1,
+  "generation_seconds": 1.649,
+  "batch_id": "temperate-birch"
+}

@@ -34,6 +34,8 @@ SPECS = ROOT / "specs"
 
 
 def main() -> int:
+    from library_layers import configure
+    configure(ROOT)
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(ROOT / "out" / "engine" / "species.vxm"))
     args = ap.parse_args()

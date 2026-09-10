@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/helleborus-orientalis/",
+  "viewed_photos": [
+    "Jim Robbins Form",
+    "Jim Robbins Flower Form",
+    "Bob Gutowski flowers and leaves"
+  ],
+  "findings": "Basal long-petioled divided evergreen leaves and separate branching nodding pale flowers. Generic mid-stem flat foliage and tan flowers rejected. Dedicated helleborus staged. Current seeds 1, 4 and 7 and every panel in the 36-seed contact sheet were visually inspected. Long petioles support divided foliage beneath separate branching pale flower stalks. The 25\u201347 cm forms avoid the former mid-stem foliage hats. Individual nodding cups remain coarse at this pitch. Accepted as a coarse stylized spring source at 25 mm; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "8df9db7b2a70f4d284b2e4a74273e057b26d603e6739b31c05d69037729f029f",
+  "sheet_hash": "b9668361bd37182c23809a4dd07b53d509af07ee65d91caf1e3fb154fe948101",
+  "reviewed_at": 1788854429.3125834,
+  "pilot_hashes": {
+    "1": "68994536676bef7e49b57c27a7d3779b114f423e31f6956c02b0d28c98efa5d5",
+    "4": "2729518987d9bcc0a7d04d17d59c264509e90533d82525f956362c806a9e13b1",
+    "7": "ca943f03cf7f819b2bc18690373a702564cf320349251c192e42c59296a84183"
+  },
+  "profile": "hellebore",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Helleborus_orientali_X6lhDgKcdjKL.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=QFGMbvyn6LqlefmA1%2Bev8ur046E%3D&Expires=1788856163",
+      "caption": "Form",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "20452"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Helleborus_orientali_mMUqXmmxZhY3.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=BdH%2FC%2FoWcEM8x6I1Hb8p%2FlCke%2Fs%3D&Expires=1788856163",
+      "caption": "Flower Form",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "20765"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Helleborus_orientalis--Bob_Gutowski--cc-by-nc-sa-2.0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=YZ%2FwtZLMaWbwDpz%2ByEiuZUD0qRo%3D&Expires=1788856163",
+      "caption": "Flowers and leaves",
+      "credit": "Bob Gutowski",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-sa/2.0/legalcode'>CC BY-NC-SA 2.0</a>",
+      "image_id": "5456"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Helleborus_orientali_CxDwwER7fXIK.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=WggqN95OeS%2F3HfNVXJq5BV4qjfQ%3D&Expires=1788856163",
+      "caption": "Palmately divided leaves",
+      "credit": "Kathleen Moore",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "11661"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Helleborus_orientali_BWljuXZHZzR1.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=ZJFLLD%2FdZQ0Xb0t%2F1qpv5Jk317M%3D&Expires=1788856163",
+      "caption": "Flower Close-up",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "20451"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/image1_FRh9xYaxURWH.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=OBMAki6z4fxnrlmYObxbAw7vDWM%3D&Expires=1788856163",
+      "caption": "Flower and Leaves Close-up (Waynesville, NC) - Spring",
+      "credit": "Rachel Arnold",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "21742"
+    }
+  ],
+  "taxon": "Helleborus orientalis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "b9668361bd37182c23809a4dd07b53d509af07ee65d91caf1e3fb154fe948101"
+  }
+}

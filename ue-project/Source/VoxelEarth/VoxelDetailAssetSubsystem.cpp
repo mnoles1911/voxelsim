@@ -1,3 +1,57 @@
+#include "VoxelDetailAssetSubsystem.h"
+#include <limits>
+#include "ProfilingDebugging/ResourceSize.h"
+#include "VoxelDetailMeshLOD.h"
+#include "VoxelDetailWindBounds.h"
+#include "VoxelDetailMeshBake.h"
+#include "VoxelDetailMeshCacheIndex.h"
+#include "VoxelMeshAttributeFingerprint.h"
+#include "VoxelAppearanceBankBinding.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Engine/StreamableManager.h"
+#include "Misc/EngineVersion.h"
+#include "Misc/PackageName.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "HAL/PlatformProperties.h"
+#include <openssl/sha.h>
+
+namespace {
+FString DetailCacheHash(const TArray<uint8>& Bytes){uint8 H[32];SHA256(Bytes.GetData(),Bytes.Num(),H);return BytesToHex(H,32).ToLower();}
+bool DetailCacheHashFile(const FString& Path,FString& Hash){TArray<uint8> B;if(!FFileHelper::LoadFileToArray(B,*Path))return false;Hash=DetailCacheHash(B);return true;}
+TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> LoadDetailCache(
+    const FString& Path,const TSharedPtr<const FVoxelAppearanceBankBinding,ESPMode::ThreadSafe>& Binding,FString& Error){
+    Error=TEXT("editor-only cache or publication unavailable");
+#if WITH_EDITOR
+    FString Directory,Text;TArray<uint8> Publication;
+    if(!Binding||!FParse::Value(FCommandLine::Get(),TEXT("VoxelAssetDir="),Directory)||
+       !FFileHelper::LoadFileToString(Text,*Path)||!FFileHelper::LoadFileToArray(Publication,*(Directory/TEXT("appearance/published.json"))))return nullptr;
+    FVoxelDetailCacheIdentity E;E.EngineVersion=FEngineVersion::Current().ToString();E.HostPlatform=UTF8_TO_TCHAR(FPlatformProperties::PlatformName());
+    E.bAllowPreview=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshCachePreview"));
+    FUTF8ToTCHAR U(reinterpret_cast<const ANSICHAR*>(Publication.GetData()),Publication.Num());TSharedPtr<FJsonObject> P;
+    if(!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(FString(U.Length(),U.Get())),P)||!P)return nullptr;
+    P->TryGetBoolField(TEXT("preview_only"),E.bActivePublicationIsPreview);
+    if(E.bActivePublicationIsPreview){
+        FString Marker;TSharedPtr<FJsonObject> M;bool Preview=false;
+        if(!FFileHelper::LoadFileToString(Marker,*(Directory/TEXT("PREVIEW_ONLY.json")))||!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Marker),M)||!M||!M->TryGetBoolField(TEXT("preview_only"),Preview)||!Preview){Error=TEXT("active preview marker missing");return nullptr;}
+    }
+    for(const TCHAR* Source:{TEXT("VoxelDetailAssetSubsystem.cpp"),TEXT("VoxelDetailMeshLOD.h"),TEXT("VoxelDetailWindBounds.h"),TEXT("VoxelAssetAppearance.cpp"),TEXT("VoxelBakeDetailMeshesCommandlet.cpp"),TEXT("VoxelMeshAttributeFingerprint.h"),TEXT("VoxelMeshAttributeFingerprint.cpp")}){
+        FString H;if(!DetailCacheHashFile(FPaths::ProjectDir()/TEXT("Source/VoxelEarth")/Source,H)){Error=TEXT("builder identity unavailable");return nullptr;}E.BuilderIdentity+=FString(Source)+TEXT(":")+H+TEXT("\n");
+    }
+    if(!DetailCacheHashFile(FPackageName::LongPackageNameToFilename(TEXT("/Game/Voxel/M_VoxelDetailAsset"),TEXT(".uasset")),E.MaterialSourceSHA256))return nullptr;
+    float Tolerance=.015f,Saving=.20f;FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodColorTolerance="),Tolerance);FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodMinSaving="),Saving);
+    if(!FMath::IsFinite(Tolerance)||!FMath::IsFinite(Saving))return nullptr;
+    E.Settings=FString::Printf(TEXT("schema=2;lod=%d;tolerance=%.9g;minSaving=%.9g;screens=1,.10,.025;patches=2,4;bounds=windXY-v1-allLOD-margin0.01UU-unitScale-quarterYaw-Z0-missing30-rejectNonFinite;collision=0;nanite=0;cpuAccess=1;fingerprint=1;authoredLOD=1"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0,FMath::Clamp(Tolerance,0.f,.05f),FMath::Clamp(Saving,0.f,1.f));
+    return FVoxelDetailMeshCacheIndex::ParseEditorSource(Text,Publication,Binding->SourceSnapshot(),E,Error);
+#else
+    return nullptr;
+#endif
+}
+}
+#if WITH_EDITOR
+#include "StaticMeshCompiler.h"
+#endif
 // TASK #7: render the invisible 85% -- detail-lattice (L3) ground cover as
 // instanced static meshes.
 //
@@ -90,7 +144,7 @@
 // See docs/detail-asset-rendering.md for the architecture write-up and what a
 // capture must show.
 
-#include "VoxelDetailAssetSubsystem.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelVegetationRender.h"
 
 #include "VoxelCoords.h"
@@ -116,6 +170,8 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "VoxelAppearanceBankBinding.h"
 #include "MaterialDomain.h"
 #include "MeshDescription.h"
 #include "HAL/IConsoleManager.h"
@@ -538,17 +594,12 @@ struct FDetailInstanceRec
 // an index list, converted to a MeshDescription on the game thread. Built off
 // the game thread because the face walk over a few thousand voxels is the
 // expensive half; the MeshDescription fill is a linear copy.
-struct FMeshGeometry
+struct FMeshGeometry : FVoxelDetailLodMesh
 {
-	uint32 MeshKey = 0;
-	TArray<FVector3f> Positions;
-	TArray<FVector3f> Normals;
-	TArray<FVector3f> TangentsX;
-	TArray<FVector4f> Colors; // LINEAR floats -- see the colour note up top
-	TArray<FVector2f> UVs;
-	TArray<FVector2f> WindUVs;
-	TArray<uint32> Indices;
-	uint64 SolidVoxels = 0;
+ uint32 MeshKey=0;uint64 SolidVoxels=0;
+ TSharedPtr<const FVoxelAssetAppearance,ESPMode::ThreadSafe> Appearance;
+ TArray<FVoxelDetailLodMesh> Lods;
+ TArray<float> LodScreens;
 };
 
 // One cover chunk on its way from a worker to the pool.
@@ -565,6 +616,9 @@ struct FCoverChunkPublish
 
 struct FGroupResult
 {
+    struct FCacheRequest {uint32 MeshKey=0,Resource=0;const vxc::AssetGrid* Grid=nullptr;TSharedPtr<const FVoxelAssetAppearance,ESPMode::ThreadSafe> Appearance;};
+    TArray<FCacheRequest> CacheRequests;
+    bool bGeometryOnly=false;
 	FGroupKey Group;
 	TArray<FDetailInstanceRec> Instances;
 	TArray<TUniquePtr<FMeshGeometry>> NewGeometry;
@@ -581,14 +635,25 @@ struct FGroupResult
 	TArray<FCoverChunkPublish> CoverPacks;
 };
 
+// Geometry-only cache fallbacks fulfill an already published promise and
+// carry no owning group. Never apply spatial rejection to those results.
+bool DetailResultOutsideUnload(const FGroupResult& Result,const FVector3d& Anchor,double UnloadUU) {
+    if(Result.bGeometryOnly)return false;
+    const double X=(double(Result.Group.X)+.5)*kGroupEdgeUU;
+    const double Y=(double(Result.Group.Y)+.5)*kGroupEdgeUU;
+    return FMath::Square(X-Anchor.X)+FMath::Square(Y-Anchor.Y)>FMath::Square(UnloadUU);
+}
+
 // Everything a resolve job needs, captured by value at dispatch. The three
 // borrowed pointers outlive every job -- Deinitialize() waits on all tasks
 // and runs before UVoxelWorldSubsystem's own teardown (InitializeDependency).
 struct FResolveJobInput
 {
+    TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> Cache;
 	const vxc::AssetField* Field = nullptr;
 	const vxc::Amplifier* Amp = nullptr;
 	const vxc::IAssetBankSource* Banks = nullptr;
+	TSharedPtr<const FVoxelAppearanceBankBinding,ESPMode::ThreadSafe> AppearanceBinding;
 	// The engine's ONE channel binding (UVoxelWorldSubsystem::
 	// GetAssetChannelSource) -- ground cover must gate on the same water
 	// distance / standing water / treeline the tree meshers gate on, or reeds
@@ -749,6 +814,9 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 				const float Gain =
 					1.0f + float(J) * 0.35f * (float(Pal.Jitter[M]) / 255.0f);
 
+                FColor AppearanceBase=FColor::Black;FIntVector SourceCell=FIntVector::ZeroValue;
+                const bool HasAppearance=Out.Appearance&&Out.Appearance->Sample(
+                    FIntVector(Cell[0]+Origin[0],Cell[1]+Origin[1],Cell[2]+Origin[2]),Grid.voxelSizeMm(),M,AppearanceBase,SourceCell);
 				for (int32 Axis = 0; Axis < 3; ++Axis)
 				{
 					for (int32 Positive = 0; Positive < 2; ++Positive)
@@ -771,6 +839,7 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 						C.G = FMath::Clamp(C.G, 0.0f, 1.0f);
 						C.B = FMath::Clamp(C.B, 0.0f, 1.0f);
 						C.A = 1.0f;
+                        if(HasAppearance)C=Out.Appearance->ColorForFace(AppearanceBase,SourceCell,Axis,Positive!=0);
 
 						const float FaceCoord = float(Cell[Axis] + Positive);
 						const float U0 = float(Cell[U]), U1 = float(Cell[U] + 1);
@@ -780,6 +849,7 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 
 						const FVector3f Normal = AxisDir[Axis] * (Positive ? 1.0f : -1.0f);
 						const FVector3f TangentX = AxisDir[U];
+                        Out.FaceMaterials.Add(M);
 						const uint32 Base = uint32(Out.Positions.Num());
 
 						for (int32 Corner = 0; Corner < 4; ++Corner)
@@ -796,8 +866,7 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 							// The material samples no texture; a stable planar
 							// UV keeps every downstream assumption (non-zero
 							// UV channel, finite derivatives) honest.
-							Out.UVs.Add(FVector2f(CornerU[Corner], CornerV[Corner]) *
-							            (PitchUU / 100.0f));
+							Out.UVs.Add(Out.Appearance?Out.Appearance->FaceUV(P,Axis):FVector2f(CornerU[Corner], CornerV[Corner]) * (PitchUU / 100.0f));
 						}
 
 						if (Positive)
@@ -813,6 +882,17 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 			}
 		}
 	}
+    // Experimental explicit opt-in; build reductions on this existing worker.
+    static const bool bLodPilot=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"));
+    if(bLodPilot){
+        static const float Tolerance=[](){float V=.015f;FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodColorTolerance="),V);return FMath::Clamp(V,0.f,.05f);}();
+        static const float MinimumSaving=[](){float V=.20f;FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailLodMinSaving="),V);return FMath::Clamp(V,0.f,1.f);}();
+        for(int Patch:{2,4}){auto Reduced=VoxelDetailMergeFaces(Out,Patch,Tolerance*float(Patch/2));
+            const int Previous=Out.Lods.IsEmpty()?Out.Indices.Num():Out.Lods.Last().Indices.Num();
+            if(VoxelDetailLodWorthKeeping(Previous,Reduced.Indices.Num(),MinimumSaving)){Out.Lods.Add(MoveTemp(Reduced));Out.LodScreens.Add(Patch==2?.10f:.025f);}
+        }
+    }
+
 }
 
 // The worker body: resolve one group's sites (terrain AND detail -- the
@@ -826,7 +906,7 @@ FGroupResult RunResolveJob(const FResolveJobInput& In)
 	FGroupResult R;
 	R.Group = In.Group;
 
-	const std::vector<vxc::AssetInstance> Insts = In.Field->instancesForRect(
+	const std::vector<vxc::AssetInstance> Insts = In.Field->detailInstancesOwnedByRect(
 		In.Rect,
 		[Amp = In.Amp, Ch = In.Channels](int64_t Vx, int64_t Vy)
 		{
@@ -835,8 +915,7 @@ FGroupResult RunResolveJob(const FResolveJobInput& In)
 			return vxc::assetColumnFactsFromSample(
 				Amp->column(Vx, Vy),
 				Ch != nullptr ? Ch->channelsAt(Vx, Vy) : vxc::AssetColumnChannels{});
-		},
-		/*terrainOnly*/ false);
+		});
 	R.SitesTotal = int32(Insts.size());
 
 	const std::vector<vxc::AssetLayer>& Layers = In.Field->layers();
@@ -887,8 +966,20 @@ FGroupResult RunResolveJob(const FResolveJobInput& In)
 
 		if (!In.KnownGeometry.Contains(Rec.MeshKey) && !BuiltHere.Contains(Rec.MeshKey))
 		{
+            if(In.Cache&&In.AppearanceBinding&&In.Cache->SourceSnapshot()==In.AppearanceBinding->SourceSnapshot()){
+				const uint32 Resource=In.AppearanceBinding->ResourceFor(Grid);
+				if(In.Cache->Find(Resource)){
+					R.CacheRequests.Add({Rec.MeshKey,Resource,Grid,In.AppearanceBinding->SourceSnapshot()->Sources()[Resource].Appearance});
+					BuiltHere.Add(Rec.MeshKey);continue;
+				}
+			}
 			TUniquePtr<FMeshGeometry> G = MakeUnique<FMeshGeometry>();
 			G->MeshKey = Rec.MeshKey;
+            if(In.AppearanceBinding){
+                const uint32 ID=In.AppearanceBinding->ResourceFor(Grid);
+                const auto Catalog=In.AppearanceBinding->SourceSnapshot();
+                if(ID&&Catalog&&ID<uint32(Catalog->Sources().Num()))G->Appearance=Catalog->Sources()[ID].Appearance;
+            }
 			BuildNaiveFaceGeometry(*Grid, Rec.MeshKey, *G);
 			if (G->Indices.Num() > 0)
 			{
@@ -1055,6 +1146,21 @@ struct FVoxelDetailAssetImpl
 	TSet<uint32> GeometryKnown;                      // geometry seen (built or pending)
 	TMap<uint32, TUniquePtr<FMeshGeometry>> PendingGeometry; // awaiting budgeted mesh build
 	TMap<uint32, FMeshEntry> Meshes;
+    TSharedPtr<const FVoxelDetailMeshCacheIndex,ESPMode::ThreadSafe> Cache;
+    FStreamableManager CacheStreamable;
+    struct FCacheLoad {TArray<FGroupResult::FCacheRequest> Requests;TSharedPtr<FStreamableHandle> Handle;bool bChecked=false,bFilesValid=false;};
+    TMap<uint32,FCacheLoad> CacheLoads;
+    TMap<uint32,UStaticMesh*> CachedMeshes;
+    struct FReadyCacheMesh {UStaticMesh* Mesh=nullptr;uint64 SolidVoxels=0;};
+    TMap<uint32,FReadyCacheMesh> PendingCachedMeshes;
+    TSet<uint32> CacheFailedResources;
+    struct FCacheCheck {uint32 Resource=0;bool bValid=false;};
+    TQueue<FCacheCheck,EQueueMode::Mpsc> CacheChecks;
+    uint64 CacheHits=0,CacheLoadsStarted=0,CacheFallbacks=0,CacheInstalled=0;
+    uint64 CacheRuntimeBuildCalls=0;
+    bool bUnresolvedMeshFailure=false;
+    int32 PendingCacheFallbacks=0;
+    double CacheValidationMs=0;
 
 	// Worker plumbing.
 	TQueue<TUniquePtr<FGroupResult>, EQueueMode::Mpsc> Results;
@@ -1062,6 +1168,7 @@ struct FVoxelDetailAssetImpl
 
 	// Telemetry.
 	uint64 StatGroupsResolved = 0;
+    uint64 StatStaleResultsDropped=0,StatStaleGeometryDropped=0,StatStaleCacheRequestsDropped=0;
 	uint64 StatInstancesLive = 0;
 	uint64 StatMeshesBuilt = 0;
 	uint64 StatBankMisses = 0;
@@ -1109,6 +1216,12 @@ struct FVoxelDetailAssetImpl
 // ---------------------------------------------------------------------------
 
 UVoxelDetailAssetSubsystem::UVoxelDetailAssetSubsystem() = default;
+bool UVoxelDetailAssetSubsystem::IsPlacementSettled(uint64& LiveInstances) const {
+    check(IsInGameThread());LiveInstances=Impl?Impl->StatInstancesLive:0;
+	if(!Impl||!Impl->bStarted||Impl->bDisabled||Impl->StatPendingGroups||!Impl->InFlight.IsEmpty()||!Impl->PendingGeometry.IsEmpty()||!Impl->CacheLoads.IsEmpty()||!Impl->PendingCachedMeshes.IsEmpty()||Impl->PendingCacheFallbacks||Impl->bUnresolvedMeshFailure)return false;
+    for(const auto& Entry:Impl->Meshes)if(Entry.Value.bDirty)return false;
+    return true;
+}
 UVoxelDetailAssetSubsystem::~UVoxelDetailAssetSubsystem() = default;
 UVoxelDetailAssetSubsystem::UVoxelDetailAssetSubsystem(FVTableHelper& Helper)
 	: Super(Helper)
@@ -1140,6 +1253,7 @@ void UVoxelDetailAssetSubsystem::Initialize(FSubsystemCollectionBase& Collection
 
 	Impl->bDisabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoDetailAssets"));
 	Impl->bCastShadow = FParse::Param(FCommandLine::Get(), TEXT("VoxelDetailShadows"));
+    UE_LOG(LogVoxelEarth,Log,TEXT("DetailMeshLOD pilot=%d (explicit -VoxelDetailMeshLOD), trial screens=1/.10/.025 (weak tiers omitted, -VoxelDetailLodMinSaving default.20); source25mm unchanged; color tolerance configurable via -VoxelDetailLodColorTolerance"),FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))?1:0);
 	double Ring = kDefaultRingMeters;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelDetailRingMeters="), Ring))
 	{
@@ -1151,6 +1265,7 @@ void UVoxelDetailAssetSubsystem::Deinitialize()
 {
 	if (Impl)
 	{
+		for(auto& Pair:Impl->CacheLoads)if(Pair.Value.Handle)Pair.Value.Handle->CancelHandle();
 		Impl->WaitForAllJobs();
 		Impl.Reset();
 	}
@@ -1167,9 +1282,8 @@ namespace
 // runtime path (BuildFromMeshDescriptions asserts it in non-editor builds and
 // takes the direct render-data route in editor builds); no source model, no
 // DDC, no collision.
-UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* Material)
+void FillDetailMeshDescription(const FVoxelDetailLodMesh& G,FMeshDescription& MeshDesc)
 {
-	FMeshDescription MeshDesc;
 	FStaticMeshAttributes Attributes(MeshDesc);
 	Attributes.Register();
 
@@ -1179,7 +1293,7 @@ UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* 
 	const int32 NumVerts = G.Positions.Num();
 	const int32 NumTris = G.Indices.Num() / 3;
 	MeshDesc.ReserveNewVertices(NumVerts);
-	MeshDesc.ReserveNewVertexInstances(G.Indices.Num());
+	MeshDesc.ReserveNewVertexInstances(NumVerts);
 	MeshDesc.ReserveNewTriangles(NumTris);
 
 	TVertexAttributesRef<FVector3f> Positions = Attributes.GetVertexPositions();
@@ -1189,37 +1303,55 @@ UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* 
 	TVertexInstanceAttributesRef<FVector2f> InstUVs = Attributes.GetVertexInstanceUVs();
     InstUVs.SetNumChannels(2);
 
-	TArray<FVertexID> VertexIds;
-	VertexIds.Reserve(NumVerts);
-	for (int32 I = 0; I < NumVerts; ++I)
-	{
-		const FVertexID V = MeshDesc.CreateVertex();
-		Positions[V] = G.Positions[I];
-		VertexIds.Add(V);
-	}
+	// A source vertex already owns its complete normal/tangent/color/UV tuple.
+    // Share it across the two triangles of its face, never across different
+    // source vertices (which may meet at a hard normal or appearance seam).
+    TArray<FVertexInstanceID> VertexInstances;
+    VertexInstances.Reserve(NumVerts);
+    for(int32 I=0;I<NumVerts;++I){
+        const FVertexID V=MeshDesc.CreateVertex();Positions[V]=G.Positions[I];
+        const auto VI=MeshDesc.CreateVertexInstance(V);VertexInstances.Add(VI);
+        InstNormals[VI]=G.Normals[I];InstTangents[VI]=G.TangentsX[I];
+        InstColors[VI]=G.Colors[I];InstUVs.Set(VI,0,G.UVs[I]);InstUVs.Set(VI,1,G.WindUVs[I]);
+    }
+    for(int32 T=0;T<NumTris;++T){
+        FVertexInstanceID Corner[3];
+        for(int32 C=0;C<3;++C)Corner[C]=VertexInstances[int32(G.Indices[T*3+C])];
+        MeshDesc.CreateTriangle(PolyGroup,Corner);
+    }
 
-	for (int32 T = 0; T < NumTris; ++T)
-	{
-		FVertexInstanceID Corner[3];
-		for (int32 C = 0; C < 3; ++C)
-		{
-			const uint32 SrcVert = G.Indices[T * 3 + C];
-			const FVertexInstanceID VI = MeshDesc.CreateVertexInstance(VertexIds[int32(SrcVert)]);
-			InstNormals[VI] = G.Normals[int32(SrcVert)];
-			InstTangents[VI] = G.TangentsX[int32(SrcVert)];
-			InstColors[VI] = G.Colors[int32(SrcVert)];
-			InstUVs.Set(VI, 0, G.UVs[int32(SrcVert)]);
-            InstUVs.Set(VI, 1, G.WindUVs[int32(SrcVert)]);
-			Corner[C] = VI;
-		}
-		MeshDesc.CreateTriangle(PolyGroup, Corner);
-	}
+}
 
+// Both persistent and transient builders use the same all-LOD shader bound.
+// DetailInstanceTransform is unit scale with quarter-yaw only. Finite world,
+// time and weather inputs are required by the material contract.
+VoxelDetailWindBounds::FResult DetailGeometryWindBounds(const FMeshGeometry& G)
+{
+    TArray<const FVoxelDetailLodMesh*> Meshes;Meshes.Add(&G);
+    for(const auto& Lod:G.Lods)Meshes.Add(&Lod);
+    return VoxelDetailWindBounds::Calculate(Meshes);
+}
+
+UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* Material)
+{
+    const auto WindBounds=DetailGeometryWindBounds(G);
+    if(WindBounds.Status==VoxelDetailWindBounds::EStatus::RejectNonFinite){
+        UE_LOG(LogVoxelEarth,Error,TEXT("Detail mesh rejected: nonfinite wind-bound input key=%08x"),G.MeshKey);return nullptr;
+    }
+    if(WindBounds.Status==VoxelDetailWindBounds::EStatus::MissingGeometryFallback)
+        UE_LOG(LogVoxelEarth,Warning,TEXT("Detail mesh missing wind-bound attributes; using explicit legacy 30UU fallback key=%08x"),G.MeshKey);
 	UStaticMesh* Mesh = NewObject<UStaticMesh>(
 		GetTransientPackage(),
 		MakeUniqueObjectName(GetTransientPackage(), UStaticMesh::StaticClass(),
 		                     *FString::Printf(TEXT("VoxelDetail_%08x"), G.MeshKey)),
 		RF_Transient);
+    if(G.Appearance){
+        auto AppearanceMaterial=UMaterialInstanceDynamic::Create(Material,Mesh);
+        AppearanceMaterial->SetScalarParameterValue(TEXT("TreeAppearance"),1.f);
+        AppearanceMaterial->SetScalarParameterValue(TEXT("TreeNeedle"),G.Appearance->IsNeedle()?1.f:0.f);
+        AppearanceMaterial->SetScalarParameterValue(TEXT("FoliageCutout"),G.Appearance->UsesFoliageMask()?1.f:0.f);
+        Material=AppearanceMaterial;
+    }
 	Mesh->GetStaticMaterials().Add(FStaticMaterial(Material, FName(TEXT("Detail"))));
 
 	UStaticMesh::FBuildMeshDescriptionsParams Params;
@@ -1230,15 +1362,52 @@ UStaticMesh* CreateDetailStaticMesh(const FMeshGeometry& G, UMaterialInterface* 
 	Params.bAllowCpuAccess = false;
 
 	TArray<const FMeshDescription*> Descs;
-	Descs.Add(&MeshDesc);
+    TArray<TUniquePtr<FMeshDescription>> OwnedDescriptions;
+    auto AddDescription=[&](const FVoxelDetailLodMesh& Geometry){auto D=MakeUnique<FMeshDescription>();FillDetailMeshDescription(Geometry,*D);Descs.Add(D.Get());OwnedDescriptions.Add(MoveTemp(D));};
+    AddDescription(G);for(const auto& Lod:G.Lods)AddDescription(Lod);
 	if (!Mesh->BuildFromMeshDescriptions(Descs, Params))
 	{
 		return nullptr;
 	}
-	Mesh->SetPositiveBoundsExtension(FVector(30.0));
-	Mesh->SetNegativeBoundsExtension(FVector(30.0));
+    // Pilot thresholds, not accepted quality defaults: projected bound diameter.
+    // Override fast-build's generic .75^LOD before any component consumes it.
+    const float Screens[]={1.f,.10f,.025f};
+    for(int L=0;L<Descs.Num();++L)Mesh->GetRenderData()->ScreenSize[L].Default=L>0&&G.LodScreens.IsValidIndex(L-1)?G.LodScreens[L-1]:Screens[FMath::Min(L,2)];
+    if(FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailMeshLOD"))){
+        FResourceSizeEx Bytes(EResourceSizeMode::Exclusive);FString Counts;
+        const auto* Data=Mesh->GetRenderData();
+        for(int L=0;L<Data->LODResources.Num();++L){const auto& R=Data->LODResources[L];R.GetResourceSizeEx(Bytes);Counts+=FString::Printf(TEXT(" L%d=%uverts/%utris@%.3f"),L,R.GetNumVertices(),R.GetNumTriangles(),Data->ScreenSize[L].Default);}
+        UE_LOG(LogVoxelEarth,Log,TEXT("DetailMeshLOD key=%08x%s engineResourceBytes=%llu (aggregate resource accounting, not measured VRAM)"),G.MeshKey,*Counts,uint64(Bytes.GetTotalMemoryBytes()));
+    }
+	Mesh->SetPositiveBoundsExtension(FVector(WindBounds.Extension));
+	Mesh->SetNegativeBoundsExtension(FVector(WindBounds.Extension));
 	Mesh->CalculateExtendedBounds();
 	return Mesh;
+}
+
+struct FDetailSizeCullDistances { int32 StartUU=0,EndUU=0;bool bFallback=false; };
+// Presentation only. Bounds already include all-LOD wind expansion. A maximum
+// absolute scale is conservative for quarter-yaw/nonuniform/mirrored instances.
+FDetailSizeCullDistances DetailSizeCullDistances(const FBoxSphereBounds& Bounds,
+    const FVector& InstanceScale,double RingUU,bool Enabled) {
+    FDetailSizeCullDistances R;R.EndUU=int32(RingUU);R.StartUU=int32(RingUU*.85);
+    if(!Enabled)return R;
+    const auto Finite=[](const FVector& V){return FMath::IsFinite(V.X)&&FMath::IsFinite(V.Y)&&FMath::IsFinite(V.Z);};
+    if(!Finite(Bounds.Origin)||!Finite(Bounds.BoxExtent)||!Finite(InstanceScale)||
+       Bounds.BoxExtent.X<=0||Bounds.BoxExtent.Y<=0||Bounds.BoxExtent.Z<=0||
+       !FMath::IsFinite(Bounds.SphereRadius)||Bounds.SphereRadius<=0){R.bFallback=true;return R;}
+    const double Scale=FMath::Max3(FMath::Abs(InstanceScale.X),FMath::Abs(InstanceScale.Y),FMath::Abs(InstanceScale.Z));
+    const double HeightM=2.*Bounds.BoxExtent.Z*Scale/100.;
+    const double WidthM=2.*FMath::Max(Bounds.BoxExtent.X,Bounds.BoxExtent.Y)*Scale/100.;
+    const double SizeM=FMath::Max(HeightM,.5*WidthM);
+    if(Scale<=0||!FMath::IsFinite(SizeM)){R.bFallback=true;return R;}
+    const double CapUU=RingUU;
+    const double FloorUU=FMath::Min(3200.,CapUU);
+    // Clamp BEFORE rounding/casting so very large finite source bounds cannot
+    // overflow an integer. One 16m presentation bucket, never a voxel change.
+    const double RawUU=FMath::Min(CapUU,SizeM*12800.);
+    const double EndUU=FMath::Clamp(FMath::CeilToDouble(RawUU/1600.)*1600.,FloorUU,CapUU);
+    R.EndUU=int32(EndUU);R.StartUU=int32(EndUU*.85);return R;
 }
 
 FTransform DetailInstanceTransform(const FDetailInstanceRec& Rec, const FVector3d& ComponentOrigin)
@@ -1252,12 +1421,85 @@ FTransform DetailInstanceTransform(const FDetailInstanceRec& Rec, const FVector3
 }
 } // namespace
 
+#if WITH_EDITOR
+UStaticMesh* VoxelBakePersistentDetailMesh(const vxc::AssetGrid& Grid,
+    TSharedPtr<const FVoxelAssetAppearance,ESPMode::ThreadSafe> Appearance,
+    UPackage* Package,FName Name,UMaterialInterface* Material,FString& Error)
+{
+    Error.Reset();
+    if(!IsInGameThread()||!Package||!Material||!Grid.valid()||Grid.onTerrainLattice()||Grid.hasParts()||!Appearance){
+        Error=TEXT("invalid persistent detail mesh inputs");return nullptr;
+    }
+    FMeshGeometry Geometry;Geometry.Appearance=MoveTemp(Appearance);
+    BuildNaiveFaceGeometry(Grid,0,Geometry);
+    if(Geometry.Indices.IsEmpty()){Error=TEXT("empty detail source geometry");return nullptr;}
+    const auto WindBounds=DetailGeometryWindBounds(Geometry);
+    if(WindBounds.Status==VoxelDetailWindBounds::EStatus::RejectNonFinite){Error=TEXT("nonfinite persistent mesh wind-bound input");return nullptr;}
+    if(WindBounds.Status==VoxelDetailWindBounds::EStatus::MissingGeometryFallback)
+        UE_LOG(LogVoxelEarth,Warning,TEXT("Persistent detail mesh missing wind-bound attributes; using explicit legacy 30UU fallback"));
+    auto* Mesh=NewObject<UStaticMesh>(Package,Name,RF_Public|RF_Standalone);
+    Mesh->bAllowCPUAccess=true;
+    Mesh->GetStaticMaterials().Add(FStaticMaterial(Material,FName(TEXT("Detail"))));
+    TArray<TUniquePtr<FMeshDescription>> Owned;
+    TArray<const FMeshDescription*> Descs;
+    auto Add=[&](const FVoxelDetailLodMesh& G){auto D=MakeUnique<FMeshDescription>();FillDetailMeshDescription(G,*D);Descs.Add(D.Get());Owned.Add(MoveTemp(D));};
+    Add(Geometry);for(const auto& Lod:Geometry.Lods)Add(Lod);
+    Mesh->SetNumSourceModels(Descs.Num());Mesh->SetAutoComputeLODScreenSize(false);
+    Mesh->NaniteSettings.bEnabled=false;
+    for(int32 L=0;L<Descs.Num();++L){
+        auto& Source=Mesh->GetSourceModel(L);
+        // SetNumSourceModels initializes missing descriptions with 50%^LOD
+        // reduction from LOD0. These descriptions are already authored LODs:
+        // prevent the editor builder from replacing them with generic reduction.
+        Source.ResetReductionSetting();
+        Source.ReductionSettings.BaseLODModel=L;
+        Source.BuildSettings.bRecomputeNormals=false;Source.BuildSettings.bRecomputeTangents=false;
+        Source.BuildSettings.bGenerateLightmapUVs=false;
+        Source.ScreenSize.Default=L?Geometry.LodScreens[L-1]:1.f;
+        // Match the saved section mapping before the engine computes its DDC
+        // key; otherwise the first reload changes empty '_' to material '_0'.
+        Mesh->GetSectionInfoMap().Set(L,0,FMeshSectionInfo(0));
+        Mesh->GetOriginalSectionInfoMap().Set(L,0,FMeshSectionInfo(0));
+    }
+    UStaticMesh::FBuildMeshDescriptionsParams Params;
+    Params.bFastBuild=false;Params.bCommitMeshDescription=true;Params.bMarkPackageDirty=true;
+    Params.bBuildSimpleCollision=false;Params.bAllowCpuAccess=true;Params.bUseHashAsGuid=true;
+    if(!Mesh->BuildFromMeshDescriptions(Descs,Params)){Error=TEXT("persistent mesh build failed");return nullptr;}
+    FStaticMeshCompilingManager::Get().FinishAllCompilation();
+    const auto* Built=Mesh->GetRenderData();
+    if(!Built||Built->LODResources.Num()!=Descs.Num()){
+        Error=TEXT("persistent mesh did not preserve authored LOD count");return nullptr;
+    }
+    FString AuthoredCounts;
+    for(int32 L=0;L<Descs.Num();++L){
+        const uint32 Expected=uint32(Descs[L]->Triangles().Num());
+        // Vertex welding/reordering is legitimate; source triangles here are
+        // nondegenerate exposed voxel faces and must not be reduced or removed.
+        if(Built->LODResources[L].GetNumTriangles()!=Expected||Mesh->IsReductionActive(L)){
+            Error=FString::Printf(TEXT("persistent authored LOD%d changed: expected=%u triangles actual=%u reductionActive=%d"),L,Expected,Built->LODResources[L].GetNumTriangles(),int(Mesh->IsReductionActive(L)));return nullptr;
+        }
+        AuthoredCounts+=FString::Printf(TEXT(" L%d=%u/%u"),L,Expected,Built->LODResources[L].GetNumTriangles());
+    }
+    UE_LOG(LogVoxelEarth,Log,TEXT("DetailAuthoredLOD preserved mesh=%s lods=%d authored/builtTriangles:%s"),*Mesh->GetPathName(),Descs.Num(),*AuthoredCounts);
+    Mesh->SetAutoComputeLODScreenSize(false);
+    for(int32 L=0;L<Descs.Num();++L){
+        const float Screen=L?Geometry.LodScreens[L-1]:1.f;
+        Mesh->GetSourceModel(L).ScreenSize.Default=Screen;
+        if(Mesh->GetRenderData())Mesh->GetRenderData()->ScreenSize[L].Default=Screen;
+    }
+    Mesh->SetPositiveBoundsExtension(FVector(WindBounds.Extension));Mesh->SetNegativeBoundsExtension(FVector(WindBounds.Extension));
+    Mesh->CalculateExtendedBounds();Mesh->MarkPackageDirty();
+    return Mesh;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // The tick pipeline
 // ---------------------------------------------------------------------------
 
 void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, DetailTickMs);
 	if (!Impl || Impl->bDisabled)
 	{
 		return;
@@ -1302,6 +1544,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				S.MaxReachMm = L.maxRadiusMm;
 			}
 		}
+		S.MaxReachMm=Field->columnSamplingReachMm(false);
 		if (!bAnyDetailLayer)
 		{
 			UE_LOG(LogVoxelEarth, Warning,
@@ -1354,6 +1597,12 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		DetailOwner->SetActorLabel(TEXT("VoxelDetailAssetOwner"));
 #endif
 
+        FString CachePath;
+        if(FParse::Value(FCommandLine::Get(),TEXT("VoxelDetailMeshCache="),CachePath)){
+            FString Why;S.Cache=LoadDetailCache(CachePath,VoxelWorld->GetAssetAppearanceBinding(),Why);
+            if(S.Cache){UE_LOG(LogVoxelEarth,Log,TEXT("DetailCache index accepted resources=%d editorOnly=1"),S.Cache->Num());}
+            else {UE_LOG(LogVoxelEarth,Warning,TEXT("DetailCache index refused; explicit runtime geometry fallback: %s"),*Why);}
+        }
 		S.bStarted = true;
 		S.StartTimeSeconds = FPlatformTime::Seconds();
 		UE_LOG(LogVoxelEarth, Log,
@@ -1441,37 +1690,152 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 	// frames stalls convergence to the old fixed-budget rate, never to zero.
 	double BudgetSpentMs = 0.0;
 
+    auto InstallMesh=[&](uint32 Key,UStaticMesh* Mesh,uint64 SolidVoxels){
+			BuiltMeshes.Add(Mesh);
+
+			UHierarchicalInstancedStaticMeshComponent* Hism =
+				NewObject<UHierarchicalInstancedStaticMeshComponent>(DetailOwner);
+			Hism->SetStaticMesh(Mesh);
+			Hism->SetMobility(EComponentMobility::Movable);
+			Hism->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			Hism->SetCanEverAffectNavigation(false);
+			Hism->SetCastShadow(Impl->bCastShadow);
+            // Presentation distance stays inside the configured residency
+            // ring. Start/end values alone do not establish material fading.
+            const bool SizeCull=FParse::Param(FCommandLine::Get(),TEXT("VoxelDetailSizeCull"));
+            // Every current detail transform has the same unit scale; keep the
+            // source of that contract shared instead of assuming mesh units.
+            const FVector Scale=DetailInstanceTransform(FDetailInstanceRec{},FVector3d::ZeroVector).GetScale3D();
+            const auto Cull=DetailSizeCullDistances(Mesh->GetBounds(),Scale,RingUU,SizeCull);
+            Hism->SetCullDistances(Cull.StartUU,Cull.EndUU);
+            if(SizeCull)UE_LOG(LogVoxelEarth,Log,TEXT("DetailSizeCull key=%08x bounds=%s scale=%s startM=%.2f endM=%.2f ringM=%.2f fallback=%d; presentation only, no fade claim"),
+                Key,*Mesh->GetBounds().ToString(),*Scale.ToString(),Cull.StartUU/100.,Cull.EndUU/100.,RingUU/100.,int(Cull.bFallback));
+			Hism->SetupAttachment(DetailRoot);
+			// Component origin near the anchor: instance transforms stay small
+			// (<= ring radius) so the instance buffer's float precision is
+			// spent on centimetres, not on the 400 km to the world origin.
+			const FVector3d Origin(FMath::GridSnap(Anchor.X, VoxelCoords::VoxelSizeUU),
+			                       FMath::GridSnap(Anchor.Y, VoxelCoords::VoxelSizeUU), 0.0);
+			Hism->SetWorldLocation(FVector(Origin));
+			Hism->RegisterComponent();
+			VoxelEofLedger::Count(VoxelEofLedger::ESource::Detail);
+			VoxelEofLedger::CountRegister();
+			HismComponents.Add(Hism);
+
+			FVoxelDetailAssetImpl::FMeshEntry& Entry = S.Meshes.Add(Key);
+			Entry.Mesh = Mesh;
+			Entry.Hism = Hism;
+			Entry.OriginUU = Origin;
+			Entry.SolidVoxels = SolidVoxels;
+			Entry.bDirty = true; // full rebuild picks up every already-applied group
+			++S.StatMeshesBuilt;
+
+    };
+    auto FallbackCache=[&](const FGroupResult::FCacheRequest& Request){
+        ++S.CacheFallbacks;++S.PendingCacheFallbacks;
+        auto* State=&S;
+        S.Tasks.Add(UE::Tasks::Launch(UE_SOURCE_LOCATION,[State,Request](){
+            auto R=MakeUnique<FGroupResult>();R->bGeometryOnly=true;
+            auto G=MakeUnique<FMeshGeometry>();G->MeshKey=Request.MeshKey;G->Appearance=Request.Appearance;
+            BuildNaiveFaceGeometry(*Request.Grid,Request.MeshKey,*G);R->NewGeometry.Add(MoveTemp(G));State->Results.Enqueue(MoveTemp(R));
+        }));
+    };
+    // Poll handles on the game thread: no UObject callbacks can outlive Impl.
+    FVoxelDetailAssetImpl::FCacheCheck Check;
+    while(S.CacheChecks.Dequeue(Check))if(auto* Pending=S.CacheLoads.Find(Check.Resource)){Pending->bChecked=true;Pending->bFilesValid=Check.bValid;}
+    bool ValidatedCacheThisTick=false;
+    for(auto It=S.CacheLoads.CreateIterator();It;++It){
+        auto& Pending=It.Value();const auto* Entry=S.Cache->Find(It.Key());
+        if(!Pending.bChecked)continue;
+        bool Failed=!Pending.bFilesValid;
+        if(!Failed&&!Pending.Handle){
+            ++S.CacheLoadsStarted;
+            Pending.Handle=S.CacheStreamable.RequestAsyncLoad(FSoftObjectPath(Entry->ObjectPath),FStreamableDelegate());
+            Failed=!Pending.Handle.IsValid();
+        }
+        UStaticMesh* Mesh=nullptr;
+        if(!Failed){
+            if(!Pending.Handle->HasLoadCompleted())continue;
+            Mesh=Cast<UStaticMesh>(Pending.Handle->GetLoadedAsset());Failed=!Mesh;
+#if WITH_EDITOR
+            if(Mesh&&Mesh->IsCompiling())continue;
+#endif
+            if(Mesh){
+                if(Mesh->GetMaterial(0)&&!Mesh->GetMaterial(0)->IsComplete())continue;
+                Mesh->SetForceMipLevelsToBeResident(30.f);
+                if(!Mesh->IsFullyStreamedIn())continue;
+                if(ValidatedCacheThisTick)continue;
+                ValidatedCacheThisTick=true;const double ValidationStart=FPlatformTime::Seconds();
+                const auto* Data=Mesh->GetRenderData();Failed=!Data||Data->LODResources.Num()!=Entry->Lods.Num()||!Mesh->GetMaterial(0)||Mesh->GetMaterial(0)->HasAnyFlags(RF_Transient);
+                if(!Failed)for(int32 L=0;L<Entry->Lods.Num();++L){const auto& Actual=Data->LODResources[L];const auto& Expected=Entry->Lods[L];
+                    if(Actual.GetNumVertices()!=Expected.Vertices||Actual.GetNumTriangles()!=Expected.Triangles||Actual.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords()!=Expected.UVChannels||Data->ScreenSize[L].Default!=float(Expected.ScreenSize)){Failed=true;break;}}
+                if(!Failed){
+                    FVoxelMeshAttributeFingerprint Fingerprint;FString Why;
+                    Failed=!Mesh->bAllowCPUAccess||Mesh->GetMaterial(0)->GetPathName()!=Entry->MaterialObjectPath||Mesh->GetBounds().ToString()!=Entry->Bounds||
+                        !VoxelFingerprintMeshAttributes(*Data,Fingerprint,Why)||Fingerprint.Sha256!=Entry->AttributeSHA256;
+                }
+                const double ValidationMs=(FPlatformTime::Seconds()-ValidationStart)*1000.0;
+                S.CacheValidationMs+=ValidationMs;
+                BudgetSpentMs+=ValidationMs;
+            }
+        }
+        if(Failed){
+            S.CacheFailedResources.Add(It.Key());
+            UE_LOG(LogVoxelEarth,Warning,TEXT("DetailCache load/validation failed resource=%u; scheduling explicit geometry fallback"),It.Key());
+            for(const auto& Request:Pending.Requests)FallbackCache(Request);
+        }else{
+            BuiltMeshes.AddUnique(Mesh);S.CachedMeshes.Add(It.Key(),Mesh);
+            for(const auto& Request:Pending.Requests)S.PendingCachedMeshes.Add(Request.MeshKey,{Mesh,Request.Grid->solidCount()});
+        }
+        It.RemoveCurrent();
+    }
 	// --- 1. drain worker results -------------------------------------------
 	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, DetailDrainMs);
 		TUniquePtr<FGroupResult> R;
 		while (S.Results.Dequeue(R))
 		{
-			S.InFlight.Remove(R->Group);
+			if(!R->bGeometryOnly)S.InFlight.Remove(R->Group);
 			S.StatSitesResolved += uint64(R->SitesTotal);
 			S.StatBankMisses += uint64(R->BankMisses);
 
-			// New geometry first (even if the group itself is dropped below --
-			// the mesh is position-independent and the next group will want it).
+            // Reject only normal resolve results BEFORE creating any new
+            // GeometryKnown promise. Workers cannot publish that set. Other
+            // jobs which saw an older unknown key carry their own payload;
+            // jobs which saw a known key still have its existing pending/built
+            // owner. Do not cancel those owners or geometry-only fallbacks.
+            if(DetailResultOutsideUnload(*R,Anchor,UnloadUU)) {
+                ++S.StatStaleResultsDropped;
+                S.StatStaleGeometryDropped+=uint64(R->NewGeometry.Num());
+                S.StatStaleCacheRequestsDropped+=uint64(R->CacheRequests.Num());
+                continue;
+            }
+
 			for (TUniquePtr<FMeshGeometry>& G : R->NewGeometry)
 			{
-				if (!S.GeometryKnown.Contains(G->MeshKey))
+				if (!S.GeometryKnown.Contains(G->MeshKey)||(R->bGeometryOnly&&!S.Meshes.Contains(G->MeshKey)))
 				{
 					S.GeometryKnown.Add(G->MeshKey);
 					S.PendingGeometry.Add(G->MeshKey, MoveTemp(G));
 				}
 				// else: duplicate from a concurrent job -- dropped.
 			}
-
-			// A group that left the ring while its job ran: drop the
-			// instances; it will re-resolve (identically -- determinism) if
-			// the anchor comes back.
-			const FVector3d Centre((double(R->Group.X) + 0.5) * kGroupEdgeUU,
-			                       (double(R->Group.Y) + 0.5) * kGroupEdgeUU, 0.0);
-			const double DistSq = FMath::Square(Centre.X - Anchor.X) + FMath::Square(Centre.Y - Anchor.Y);
-			if (DistSq > FMath::Square(UnloadUU))
-			{
-				continue;
-			}
+            if(R->bGeometryOnly){--S.PendingCacheFallbacks;continue;}
+            for(const auto& Request:R->CacheRequests){
+                if(S.GeometryKnown.Contains(Request.MeshKey))continue;
+                S.GeometryKnown.Add(Request.MeshKey);++S.CacheHits;
+                if(auto* Ready=S.CachedMeshes.Find(Request.Resource))S.PendingCachedMeshes.Add(Request.MeshKey,{*Ready,Request.Grid->solidCount()});
+                else if(S.CacheFailedResources.Contains(Request.Resource))FallbackCache(Request);
+                else{
+                    const bool New=!S.CacheLoads.Contains(Request.Resource);S.CacheLoads.FindOrAdd(Request.Resource).Requests.Add(Request);
+                    if(New){const auto Entry=*S.Cache->Find(Request.Resource);auto* State=&S;
+                        S.Tasks.Add(UE::Tasks::Launch(UE_SOURCE_LOCATION,[State,Entry](){FString MeshHash,MaterialHash;
+                            const bool Valid=DetailCacheHashFile(Entry.PackageFile,MeshHash)&&MeshHash==Entry.PackageSHA256&&DetailCacheHashFile(Entry.MaterialFile,MaterialHash)&&MaterialHash==Entry.MaterialSHA256;
+                            State->CacheChecks.Enqueue({Entry.Resource,Valid});
+                        }));
+                    }
+                }
+            }
 
 			FVoxelDetailAssetImpl::FGroupRecord& Rec = S.Groups.Add(R->Group);
 			Rec.Instances = MoveTemp(R->Instances);
@@ -1552,7 +1916,15 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 	}
 
 	// --- 2. budgeted mesh builds -------------------------------------------
+    {
+        int32 Installed=0;
+        for(auto It=S.PendingCachedMeshes.CreateIterator();It&&Installed<kMaxMeshBuildsPerTick&&(Installed==0||BudgetSpentMs<BuildBudgetMs);++It){
+            const double Start=FPlatformTime::Seconds();InstallMesh(It.Key(),It.Value().Mesh,It.Value().SolidVoxels);++S.CacheInstalled;++Installed;
+            It.RemoveCurrent();BudgetSpentMs+=(FPlatformTime::Seconds()-Start)*1000.0;
+        }
+    }
 	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, DetailMeshBuildMs);
 		int32 Built = 0;
 		for (auto It = S.PendingGeometry.CreateIterator();
 		     It && Built < kMaxMeshBuildsPerTick &&
@@ -1565,9 +1937,11 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			++Built;
 			const double BuildStart = FPlatformTime::Seconds();
 
+            ++S.CacheRuntimeBuildCalls;
 			UStaticMesh* Mesh = CreateDetailStaticMesh(*Geometry, DetailMaterial);
 			if (Mesh == nullptr)
 			{
+                S.bUnresolvedMeshFailure=true;
 				UE_LOG(LogVoxelEarth, Warning,
 				       TEXT("VoxelDetailAssets: mesh build FAILED for key %08x (%d verts) -- "
 				            "instances of this (species, seed) will not render this session."),
@@ -1575,38 +1949,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				BudgetSpentMs += (FPlatformTime::Seconds() - BuildStart) * 1000.0;
 				continue;
 			}
-			BuiltMeshes.Add(Mesh);
-
-			UHierarchicalInstancedStaticMeshComponent* Hism =
-				NewObject<UHierarchicalInstancedStaticMeshComponent>(DetailOwner);
-			Hism->SetStaticMesh(Mesh);
-			Hism->SetMobility(EComponentMobility::Movable);
-			Hism->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-			Hism->SetCanEverAffectNavigation(false);
-			Hism->SetCastShadow(Impl->bCastShadow);
-			// Per-instance distance cull inside the ring: instances vanish at
-			// the ring edge (10 cm cover at 112 m is subpixel; the pop is
-			// invisible) rather than living until the 1.15x release boundary.
-			Hism->SetCullDistances(int32(RingUU * 0.85), int32(RingUU));
-			Hism->SetupAttachment(DetailRoot);
-			// Component origin near the anchor: instance transforms stay small
-			// (<= ring radius) so the instance buffer's float precision is
-			// spent on centimetres, not on the 400 km to the world origin.
-			const FVector3d Origin(FMath::GridSnap(Anchor.X, VoxelCoords::VoxelSizeUU),
-			                       FMath::GridSnap(Anchor.Y, VoxelCoords::VoxelSizeUU), 0.0);
-			Hism->SetWorldLocation(FVector(Origin));
-			Hism->RegisterComponent();
-			VoxelEofLedger::Count(VoxelEofLedger::ESource::Detail);
-			VoxelEofLedger::CountRegister();
-			HismComponents.Add(Hism);
-
-			FVoxelDetailAssetImpl::FMeshEntry& Entry = S.Meshes.Add(Key);
-			Entry.Mesh = Mesh;
-			Entry.Hism = Hism;
-			Entry.OriginUU = Origin;
-			Entry.SolidVoxels = Geometry->SolidVoxels;
-			Entry.bDirty = true; // full rebuild picks up every already-applied group
-			++S.StatMeshesBuilt;
+            InstallMesh(Key,Mesh,Geometry->SolidVoxels);
 
 			const double BuildMs = (FPlatformTime::Seconds() - BuildStart) * 1000.0;
 			BudgetSpentMs += BuildMs;
@@ -1618,6 +1961,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 
 	// --- 3. release groups past the unload ring ----------------------------
 	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, DetailUnloadMs);
 		TArray<FGroupKey> ToRemove;
 		for (const TPair<FGroupKey, FVoxelDetailAssetImpl::FGroupRecord>& G : S.Groups)
 		{
@@ -1682,6 +2026,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 
 	// --- 4. budgeted full rebuilds of dirty components ----------------------
 	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, DetailHismRebuildMs);
 		int32 Rebuilt = 0;
 		for (TPair<uint32, FVoxelDetailAssetImpl::FMeshEntry>& Pair : S.Meshes)
 		{
@@ -1733,6 +2078,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 
 	// --- 5. dispatch new resolve jobs --------------------------------------
 	{
+		CSV_SCOPED_TIMING_STAT(VoxelStream, DetailDispatchMs);
 		// Prune finished task handles so the array (and Deinitialize's wait
 		// list) stays small.
 		S.Tasks.RemoveAll([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); });
@@ -1784,7 +2130,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			// HISM still waiting on a rebuild -- i.e. everything the resolver
 			// placed is actually on screen.
 			if (!S.bConvergedLogged && S.Groups.Num() > 0 && Candidates.Num() == 0 &&
-			    S.InFlight.Num() == 0 && S.PendingGeometry.Num() == 0)
+			    S.InFlight.Num() == 0 && S.PendingGeometry.Num() == 0 && S.CacheLoads.IsEmpty() && S.PendingCachedMeshes.IsEmpty() && !S.PendingCacheFallbacks && !S.bUnresolvedMeshFailure)
 			{
 				bool bAnyDirty = false;
 				for (const TPair<uint32, FVoxelDetailAssetImpl::FMeshEntry>& Pair : S.Meshes)
@@ -1842,6 +2188,8 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				Input.Field = Field;
 				Input.Amp = Amp;
 				Input.Banks = Banks;
+                Input.AppearanceBinding = VoxelWorld->GetAssetAppearanceBinding();
+                Input.Cache=S.Cache;
 				Input.Channels = VoxelWorld->GetAssetChannelSource();
 				Input.Group = C.Key;
 				Input.Rect = Rect;
@@ -1882,6 +2230,9 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		if (S.ProgressLogTimer >= 5.0 && S.StatGroupsResolved > 0)
 		{
 			S.ProgressLogTimer = 0.0;
+            UE_LOG(LogVoxelEarth,Log,TEXT("Detail stale completed results: groups=%llu geometryPayloads=%llu cacheRequests=%llu dropped before admission; existing promises retained"),
+                S.StatStaleResultsDropped,S.StatStaleGeometryDropped,S.StatStaleCacheRequestsDropped);
+            if(S.Cache)UE_LOG(LogVoxelEarth,Log,TEXT("DetailCache totals: hits=%llu asyncLoads=%llu installed=%llu fallbacks=%llu loading=%d ready=%d fallbackJobs=%d runtimeBuilds=%llu runtimeBuildMs=%.3f validationMs=%.3f"),S.CacheHits,S.CacheLoadsStarted,S.CacheInstalled,S.CacheFallbacks,S.CacheLoads.Num(),S.PendingCachedMeshes.Num(),S.PendingCacheFallbacks,S.CacheRuntimeBuildCalls,S.StatBuildMsTotal,S.CacheValidationMs);
 			UE_LOG(LogVoxelEarth, Log,
 			       TEXT("VoxelDetailAssets: converging -- %.1f s elapsed: %d groups live, "
 			            "%d pending, %d in flight; %d meshes built, %d builds pending; "
@@ -1918,3 +2269,140 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		}
 	}
 }
+
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#include "Misc/SecureHash.h"
+#include "StaticMeshResources.h"
+#include <openssl/sha.h>
+namespace {
+void DetailFixtureWrite(TArray<uint8>& Bytes,int Offset,uint32 Value){for(int I=0;I<4;++I)Bytes[Offset+I]=uint8(Value>>(8*I));}
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelDetailSizeCullTest,"Voxel.Appearance.DetailSizeCull",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FVoxelDetailSizeCullTest::RunTest(const FString&) {
+    const FVector Unit(1,1,1);
+    const auto Bounds=[](double Height){return FBoxSphereBounds(FVector::ZeroVector,FVector(10,10,Height*50),Height*100+20);};
+    TestEqual(TEXT("disabled retains full configured ring"),DetailSizeCullDistances(Bounds(.1),Unit,25600,false).EndUU,25600);
+    TestEqual(TEXT("small cover floor"),DetailSizeCullDistances(Bounds(.1),Unit,25600,true).EndUU,3200);
+    TestEqual(TEXT("floor cannot exceed16m ring"),DetailSizeCullDistances(Bounds(.1),Unit,1600,true).EndUU,1600);
+    TestEqual(TEXT("tall shrub retains256m"),DetailSizeCullDistances(Bounds(3),Unit,25600,true).EndUU,25600);
+    TestEqual(TEXT("48m global ring caps tall shrub"),DetailSizeCullDistances(Bounds(3),Unit,4800,true).EndUU,4800);
+    TestEqual(TEXT("tall shrub reaches configured512m ring"),DetailSizeCullDistances(Bounds(4),Unit,51200,true).EndUU,51200);
+    TestEqual(TEXT("medium shrub remains256m inside512m ring"),DetailSizeCullDistances(Bounds(2),Unit,51200,true).EndUU,25600);
+    auto Bad=Bounds(.5);Bad.BoxExtent.X=-1;
+    const auto Fallback=DetailSizeCullDistances(Bad,Unit,4800,true);
+    TestTrue(TEXT("malformed bounds use full ring"),Fallback.bFallback);TestEqual(TEXT("fallback endpoint"),Fallback.EndUU,4800);
+    Bad=Bounds(.5);Bad.Origin.X=std::numeric_limits<double>::quiet_NaN();
+    TestTrue(TEXT("nonfinite origin refused"),DetailSizeCullDistances(Bad,Unit,4800,true).bFallback);
+    int32 Previous=0;
+    for(double H:{.025,.1,.25,.5,1.,1.5,2.,3.}){
+        const auto A=DetailSizeCullDistances(Bounds(H),Unit,25600,true);
+        TestTrue(TEXT("distance monotonic"),A.EndUU>=Previous);Previous=A.EndUU;
+        TestEqual(TEXT("deterministic repetition"),A.EndUU,DetailSizeCullDistances(Bounds(H),Unit,25600,true).EndUU);
+    }
+    auto Shifted=Bounds(.5);Shifted.Origin=FVector(-15400000,-8110000,-123);
+    TestEqual(TEXT("negative translation does not alter size"),DetailSizeCullDistances(Shifted,Unit,25600,true).EndUU,DetailSizeCullDistances(Bounds(.5),Unit,25600,true).EndUU);
+    TestEqual(TEXT("mirrored doubled instance conservatively doubles dimension"),DetailSizeCullDistances(Bounds(.5),FVector(-2,1,1),25600,true).EndUU,12800);
+    FDetailInstanceRec Rec;Rec.PosUU=FVector3d(-15400000,-8110000,9900);Rec.YawQuarter=3;
+    TestTrue(TEXT("actual transform retains unit scale regardless of origin/yaw"),DetailInstanceTransform(Rec,FVector3d(-15400100,-81100100,0)).GetScale3D().Equals(Unit));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelDetailStaleResultTest,"Voxel.Appearance.DetailStaleResultAdmission",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FVoxelDetailStaleResultTest::RunTest(const FString&) {
+    FGroupResult R;R.Group={-2,-3};
+    const FVector3d Centre(-1.5*kGroupEdgeUU,-2.5*kGroupEdgeUU,0);
+    TestFalse(TEXT("negative group at anchor is admitted"),DetailResultOutsideUnload(R,Centre,100.));
+    TestFalse(TEXT("exact unload boundary retains prior semantics"),DetailResultOutsideUnload(R,Centre+FVector3d(100,0,0),100.));
+    TestTrue(TEXT("departed result rejected before geometry/cache admission"),DetailResultOutsideUnload(R,Centre+FVector3d(101,0,0),100.));
+    TestFalse(TEXT("return to group permits deterministic re-resolve"),DetailResultOutsideUnload(R,Centre,100.));
+    R.bGeometryOnly=true;
+    TestFalse(TEXT("fallback has no spatial owner and must fulfill its promise"),DetailResultOutsideUnload(R,Centre+FVector3d(10000,0,0),100.));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelDetailApprovedAppearanceTest,"Voxel.Appearance.DetailMesh",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FVoxelDetailApprovedAppearanceTest::RunTest(const FString&){
+    auto Material=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/Voxel/M_VoxelDetailAsset.M_VoxelDetailAsset"));
+    if(!TestNotNull(TEXT("actual detail material required"),Material))return false;
+    for(double Mm:{12.5,25.,100.}){
+        const bool Legacy=Mm==100.;const uint8 Mat=Legacy?19:24;
+        // Asymmetric occupied cube (one missing corner), negative source origin,
+        // and independent per-cell RGB exercise face culling and source mapping.
+        TArray<uint8> Vxa;Vxa.SetNumZeroed(48+8*5);FMemory::Memcpy(Vxa.GetData(),"VXA1",4);
+        DetailFixtureWrite(Vxa,4,Mm==12.5?4:3);
+        DetailFixtureWrite(Vxa,8,uint32(-2));DetailFixtureWrite(Vxa,12,uint32(-3));DetailFixtureWrite(Vxa,16,uint32(-1));
+        for(int O:{20,24,28})DetailFixtureWrite(Vxa,O,2);
+        DetailFixtureWrite(Vxa,32,Mm==12.5?12500:uint32(Mm));DetailFixtureWrite(Vxa,36,8);
+        for(int I=0;I<8;++I){Vxa[48+I*5]=I==0?0:Mat;DetailFixtureWrite(Vxa,49+I*5,1);}
+        vxc::AssetGrid Grid;if(!TestTrue(TEXT("real VXA fixture parsed"),Grid.parse(Vxa.GetData(),Vxa.Num())==vxc::AssetParseError::kOk))return false;
+        const FString Hash=FMD5::HashBytes(Vxa.GetData(),Vxa.Num());
+        TArray<uint8> Packet;Packet.SetNumZeroed(128+7*10);FMemory::Memcpy(Packet.GetData(),"VAC1",4);
+        DetailFixtureWrite(Packet,4,Legacy?1:2);for(int O:{8,12,16})DetailFixtureWrite(Packet,O,2);
+        DetailFixtureWrite(Packet,20,uint32(-2));DetailFixtureWrite(Packet,24,uint32(-3));DetailFixtureWrite(Packet,28,uint32(-1));
+        DetailFixtureWrite(Packet,32,Legacy?100:uint32(Mm*1000));DetailFixtureWrite(Packet,36,7);HexToBytes(Hash,Packet.GetData()+48);
+        for(int I=1;I<8;++I){auto R=Packet.GetData()+128+(I-1)*10;R[0]=uint8(I/4);R[2]=uint8((I/2)%2);R[4]=uint8(I%2);R[6]=Mat;R[7]=uint8(71+I*17);R[8]=uint8(43+I*13);R[9]=uint8(191-I*11);}
+        TArray<uint8> Checked;Checked.Append(Packet.GetData(),96);Checked.Append(Packet.GetData()+128,70);check(SHA256(Checked.GetData(),Checked.Num(),Packet.GetData()+96));
+        FString Error;auto Appearance=FVoxelAssetAppearance::Parse(Packet,Hash,Error);
+        if(!TestTrue(TEXT("verified source packet parsed"),Appearance.IsValid()))return false;
+        FMeshGeometry Plain,Approved,Repeat;Approved.Appearance=Appearance;
+        BuildNaiveFaceGeometry(Grid,117,Plain);BuildNaiveFaceGeometry(Grid,117,Approved);BuildNaiveFaceGeometry(Grid,117,Repeat);
+        TestEqual(TEXT("exact occupied count"),Approved.SolidVoxels,uint64(7));
+        TestEqual(TEXT("independent exposed face count"),Approved.Indices.Num()/6,24);
+        TestTrue(TEXT("appearance leaves positions, normals, tangents, winding and wind unchanged"),Plain.Positions==Approved.Positions&&Plain.Normals==Approved.Normals&&Plain.TangentsX==Approved.TangentsX&&Plain.Indices==Approved.Indices&&Plain.WindUVs==Approved.WindUVs);
+        TestTrue(TEXT("unapproved palette fallback deterministic"),Plain.Colors==Repeat.Colors&&Plain.UVs==Repeat.UVs);
+        TestTrue(TEXT("approved per-cell colors replace fallback"),Plain.Colors!=Approved.Colors);
+        int CheckedFaces=0;
+        for(int I=0;I<Approved.Positions.Num();I+=4){
+            FVector3f Center=FVector3f::ZeroVector;for(int J=0;J<4;++J)Center+=Approved.Positions[I+J]*.25f;
+            const auto N=Approved.Normals[I];const float Pitch=float(Mm*.1);const auto P=(Center-N*(Pitch*.5f))/Pitch;
+            const FIntVector Cell(FMath::FloorToInt(P.X),FMath::FloorToInt(P.Y),FMath::FloorToInt(P.Z));
+            FColor Base;FIntVector Zero;if(!TestTrue(TEXT("face maps to occupied approved source"),Appearance->Sample(Cell,Mm,Mat,Base,Zero)))return false;
+            const int Axis=FMath::Abs(N.X)>.5f?0:FMath::Abs(N.Y)>.5f?1:2;
+            const auto Expected=FVoxelAssetAppearance::FaceColor(Base,Zero,Axis,N[Axis]>0);
+            for(int J=0;J<4;++J){const auto C=Approved.Colors[I+J];TestTrue(TEXT("exact approved linear face RGB"),FMath::IsNearlyEqual(C.X,Expected.R,1.e-6f)&&FMath::IsNearlyEqual(C.Y,Expected.G,1.e-6f)&&FMath::IsNearlyEqual(C.Z,Expected.B,1.e-6f));TestEqual(TEXT("material classification unchanged"),C.W,Plain.Colors[I+J].W);TestTrue(TEXT("origin-inclusive source UV"),Approved.UVs[I+J].Equals(Appearance->FaceUV(Approved.Positions[I+J],Axis),1.e-6f));}++CheckedFaces;
+        }
+        TestEqual(TEXT("all visible faces checked"),CheckedFaces,24);
+        auto Mesh=CreateDetailStaticMesh(Approved,Material);auto Fallback=CreateDetailStaticMesh(Plain,Material);
+        if(!TestNotNull(TEXT("approved real static mesh built"),Mesh)||!TestNotNull(TEXT("fallback real static mesh built"),Fallback))return false;
+        TestTrue(TEXT("fallback uses original material without approval overrides"),Fallback->GetMaterial(0)==Material);
+        auto MID=Cast<UMaterialInstanceDynamic>(Mesh->GetMaterial(0));if(!TestNotNull(TEXT("approved mesh has dedicated MID"),MID))return false;
+        float A=-1,N=-1,F=-1;MID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("TreeAppearance")),A);MID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("TreeNeedle")),N);MID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("FoliageCutout")),F);
+        TestEqual(TEXT("approved face variation enabled"),A,1.f);TestEqual(TEXT("nonneedle fixture"),N,0.f);TestEqual(TEXT("generic petals opaque, legacy foliage masked"),F,Legacy?1.f:0.f);
+        const auto Data=Mesh->GetRenderData();if(!TestTrue(TEXT("built render data exists"),Data&&Data->LODResources.Num()==1))return false;
+        const auto& LOD=Data->LODResources[0];TestEqual(TEXT("static build preserves triangle count"),int32(LOD.GetNumTriangles()),48);
+        // Check the actual static vertex buffers too: BuildFromMeshDescriptions
+        // may reorder/deduplicate vertices, so match semantic vertices, not indices.
+        const auto& VB=LOD.VertexBuffers;int Bad=0;
+        if(!TestTrue(TEXT("built vertex channels complete"),VB.PositionVertexBuffer.GetNumVertices()>0&&VB.ColorVertexBuffer.GetNumVertices()==VB.PositionVertexBuffer.GetNumVertices()&&VB.StaticMeshVertexBuffer.GetNumVertices()==VB.PositionVertexBuffer.GetNumVertices()))return false;
+        for(uint32 V=0;V<VB.PositionVertexBuffer.GetNumVertices();++V){
+            const auto P=VB.PositionVertexBuffer.VertexPosition(V);const auto Nrm=VB.StaticMeshVertexBuffer.VertexTangentZ(V);const auto UV=VB.StaticMeshVertexBuffer.GetVertexUV(V,0);const auto C=VB.ColorVertexBuffer.VertexColor(V);bool Match=false;
+            for(int I=0;I<Approved.Positions.Num();++I){const auto Color=Approved.Colors[I];const auto Expected=FLinearColor(Color.X,Color.Y,Color.Z,Color.W).ToFColor(true);if(P.Equals(Approved.Positions[I],1.e-6f)&&FVector3f(Nrm).Equals(Approved.Normals[I],.01f)&&UV.Equals(Approved.UVs[I],.001f)&&C.R==Expected.R&&C.G==Expected.G&&C.B==Expected.B){Match=true;break;}}
+            Bad+=!Match;
+        }
+        TestEqual(TEXT("static build preserves actual RGB, position, normal and UV"),Bad,0);
+        TestEqual(TEXT("24 exposed quads retain four render vertices each"),int32(LOD.GetNumVertices()),96);
+        // Match each indexed corner, not just the set of vertices: loss of a
+        // face, changed winding, or crossing a hard material seam must fail.
+        const auto Indices=LOD.IndexBuffer.GetArrayView();
+        TestEqual(TEXT("all triangle corners retained"),Indices.Num(),Approved.Indices.Num());
+        int BadCorners=0;
+        for(int C=0;C<FMath::Min(Indices.Num(),Approved.Indices.Num());++C){
+            const uint32 V=Indices[C],S=Approved.Indices[C];
+            if(V>=uint32(LOD.GetNumVertices())){++BadCorners;continue;}
+            const auto Color=Approved.Colors[S];const auto Expected=FLinearColor(Color.X,Color.Y,Color.Z,Color.W).ToFColor(true);
+            const auto Actual=VB.ColorVertexBuffer.VertexColor(V);
+            const bool Match=VB.PositionVertexBuffer.VertexPosition(V).Equals(Approved.Positions[S],1.e-6f)&&
+                FVector3f(VB.StaticMeshVertexBuffer.VertexTangentZ(V)).Equals(Approved.Normals[S],.01f)&&
+                FVector3f(VB.StaticMeshVertexBuffer.VertexTangentX(V)).Equals(Approved.TangentsX[S],.01f)&&
+                VB.StaticMeshVertexBuffer.GetVertexUV(V,0).Equals(Approved.UVs[S],.001f)&&
+                VB.StaticMeshVertexBuffer.GetVertexUV(V,1).Equals(Approved.WindUVs[S],.001f)&&Actual==Expected;
+            BadCorners+=!Match;
+        }
+        TestEqual(TEXT("indexed triangles preserve winding and all appearance/wind attributes"),BadCorners,0);
+
+    }
+    return true;
+}
+#endif
+
+#include "VoxelDetailLodCaptureTests.inl"

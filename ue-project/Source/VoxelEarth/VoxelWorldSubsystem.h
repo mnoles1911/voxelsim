@@ -6,6 +6,8 @@
 #include "VoxelDebug.h" // FVoxelPerfSnapshot -- plain POD, voxel-core-free (see VoxelDebug.h doctrine note)
 #include "VoxelWorldSubsystem.generated.h"
 
+class FVoxelAppearanceBankBinding;
+
 // voxel-core owns the deterministic world + edit overlay (doctrine SS2.1 /
 // SS2.4: vxc::World<8> + its sampler). Kept behind a PImpl so this header
 // never includes a voxel-core header -- UHT-parsed headers stay
@@ -41,6 +43,7 @@ class AssetField;
 class IAssetBankSource;
 class Amplifier;
 class IAssetChannelSource;
+struct FoundationSurvey;
 }
 // --- end TASK #7 hook --------------------------------------------------------
 
@@ -403,6 +406,7 @@ public:
 	// GetFineTileStreamer's in the .cpp.
 	const vxc::AssetField* GetAssetField() const;
 	const vxc::IAssetBankSource* GetAssetBankSource() const;
+	TSharedPtr<const FVoxelAppearanceBankBinding,ESPMode::ThreadSafe> GetAssetAppearanceBinding() const;
 	const vxc::Amplifier* GetWorldgenAmplifier() const;
 	// The engine's ONE placement-channel binding (bake-28 planes + rendered
 	// water datum + treeline; see FVoxelAssetChannelSource in the .cpp). Any
@@ -423,6 +427,23 @@ public:
 	// collision in AVoxelEarthFlyPawn queries this per-voxel instead of using
 	// a physics engine.
 	bool IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const;
+    // Opt-in stopped-route evidence; bounded, resident-gated, no terrain edits.
+    bool DiagnoseRouteBodyBox(const FVector& CenterUU,const FVector& HalfExtentUU,FString& Json) const;
+    // Opt-in stopped-route evidence only. GT synchronous live world query;
+    // false leaves an unknown survey plus reason, never an assumed dry plot.
+    bool SurveyFoundation(int64 MinX,int64 MinY,int64 PlaneZ,
+                          vxc::FoundationSurvey& Out,FString& Reason) const;
+	// Game-thread, non-nested movement update scope. Bindings remain stable
+	// until End; edited voxel reads remain live. Never retained across ticks.
+	void BeginMovementCollisionQueries();
+	void EndMovementCollisionQueries();
+	// One overlay-aware asset shortlist for a whole collision slab/sweep.
+	// Scans Axis in Step order and returns its first occupied voxel slice.
+	bool FindFirstSolidVoxelSlice(const int64 (&Min)[3], const int64 (&Max)[3],
+		int32 Axis, int32 Step, int64& OutSlice) const;
+	// Batch the overhead veil probe; trees remain solid for collision but do
+	// not count as a rock/ground roof for underground lighting.
+	int32 CountUndergroundRoofSamples(const FVector& CameraUU, double StepUU, double MaxUU, int32 StopAfter) const;
 
 	// --- Water re-architecture Phase 3: the fluid occupancy edit-dirty hook --
 	//

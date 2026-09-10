@@ -104,10 +104,31 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 			ZeroRange, UniformBuffer_MultiFrame);
 	}
 
+    UpdateUniformBuffer(RHICmdList);
+}
+
+void FVoxelQuadVertexFactory::SetAppearanceBuffers(FRHICommandListBase& RHI, const FVoxelTerrainAppearanceGpuState::FViews& Views)
+{
+    check(IsInRenderingThread());
+    if(AppearanceViews.Pages==Views.Pages&&AppearanceViews.Sources==Views.Sources&&AppearanceViews.Ranges==Views.Ranges&&AppearanceViews.Slots==Views.Slots)return;
+    AppearanceViews=Views;
+    if(UniformBuffer.IsValid())UpdateUniformBuffer(RHI);
+}
+
+void FVoxelQuadVertexFactory::UpdateUniformBuffer(FRHICommandListBase& RHI)
+{
 	if (QuadBufferSRV.IsValid())
 	{
 		FVoxelQuadVertexFactoryParameters Parameters;
 		Parameters.QuadBuffer = QuadBufferSRV;
+        if(!AppearanceViews.Pages.IsValid()||!AppearanceViews.Sources.IsValid()||!AppearanceViews.Ranges.IsValid()||!AppearanceViews.Slots.IsValid()){
+            if(!EmptyAppearance)EmptyAppearance=MakeUnique<FVoxelTerrainAppearanceGpuState>();
+            AppearanceViews=EmptyAppearance->GetViews(FRHICommandListExecutor::GetImmediateCommandList());
+        }
+        Parameters.AppearancePages=AppearanceViews.Pages;
+        Parameters.AppearanceSources=AppearanceViews.Sources;
+        Parameters.AppearanceRanges=AppearanceViews.Ranges;
+        Parameters.AppearanceSlots=AppearanceViews.Slots;
 		Parameters.ChunkOriginUU = ChunkOriginUU;
 		Parameters.LevelScale = LevelScale;
 		Parameters.PoolMode = bPoolMode ? 1u : 0u;

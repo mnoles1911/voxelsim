@@ -127,7 +127,7 @@ struct FVoxelGpuChunkWorkRecord
 static_assert(sizeof(FVoxelGpuChunkWorkRecord) == 64, "the 64-byte record IS the contract");
 
 // One resolved asset instance as the worklist AssetStamp gather reads it --
-// MIRROR of GpuAssetStampInstance (VoxelWorklist.ush), 12 dwords, 48 B.
+// MIRROR of GpuAssetStampInstance (VoxelWorklist.ush), 13 dwords, 52 B; both suppression API inputs are mirrored explicitly.
 // AnchorRelVx/Vy are relative to the OWNING record's OriginVx/Vy;
 // ColStartsBase indexes the flush blob's ColStarts, whose VALUES index the
 // flush blob's Spans (both rebased when Flush stages the payload).
@@ -144,9 +144,12 @@ struct FVoxelWorklistAssetInstance
 	uint32 SizeY = 0;
 	uint32 SizeZ = 0;
 	uint32 ColStartsBase = 0;
+	uint32 RenderOwned = 0; // render-only first-winner suppression
 	uint32 SuppressTerrainRender = 0;
 };
-static_assert(sizeof(FVoxelWorklistAssetInstance) == 48, "the 48-byte instance IS the contract");
+static_assert(sizeof(FVoxelWorklistAssetInstance) == 52, "the 52-byte instance IS the contract");
+static_assert(STRUCT_OFFSET(FVoxelWorklistAssetInstance, RenderOwned) == 44, "ownership flag ABI");
+static_assert(STRUCT_OFFSET(FVoxelWorklistAssetInstance, SuppressTerrainRender) == 48, "suppression flag ABI");
 
 // A record's asset payload, handed to Append alongside the record and staged
 // into the FLUSH that consumes it (never uploaded for deferred records --
@@ -801,7 +804,7 @@ private:
 	uint32 ProofStashTail = 0;
 	uint32 ProofStashConsumed = 0;
 	uint32 ProofStashFold = 0;
-    int64 ProofStashClaims = 0;
+	int64 ProofStashClaims = 0; // same flush as GPU proof; excludes the deferred next-flush claim
 	double LastProofSeconds = 0.0;
 	FProofStatus Proof;
 

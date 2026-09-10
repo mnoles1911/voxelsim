@@ -15,6 +15,11 @@ bool SafeText(const FString& S,int32 Max,bool Empty=false){
     if(S.Len()>Max||(!Empty&&S.IsEmpty()))return false;
     for(TCHAR C:S)if(C<32||C>126)return false;return true;
 }
+bool Md5Text(const FString& S){
+    if(S.Len()!=32)return false;
+    for(TCHAR C:S)if(!((C>='0'&&C<='9')||(C>='a'&&C<='f')||(C>='A'&&C<='F')))return false;
+    return true;
+}
 bool TextField(FArchive& Ar,FString& S,int32 Max){
     if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<4)return false;
     int32 N=S.Len();Ar<<N;
@@ -27,9 +32,14 @@ bool TextField(FArchive& Ar,FString& S,int32 Max){
 bool FVoxelEnvironmentAssetDescriptor::IsValid() const {
     if(!SafeText(SpecId,128)||!SafeText(Kind,64)||Category!=TEXT("environment"))return false;
     if(!SafeText(SpecHash,128,true)||!SafeText(CatalogHash,128,true)||!SafeText(ProviderHash,128,true))return false;
+    if(SourceYawQuarter>3||(!HasComposition()&&SourceYawQuarter!=0))return false;
+    if(HasComposition()&&(Legacy||!Md5Text(ClippedGeometryHash)))return false;
     if(!ProductionIdentityValid(*this))return false;
+    if(HasComposition()&&ProductionProvenance.IsSet()&&
+       (ProductionProvenance->Source.yawQuarter!=SourceYawQuarter||
+        !ProductionProvenance->CanonicalSourceHash.Equals(SourceHash,ESearchCase::IgnoreCase)))return false;
     if(Legacy){for(const auto Name:LegacyEnvironmentNames)if(SpecId==Name)return true;return false;}
-    return IdentityHash(SourceHash);
+    return Md5Text(SourceHash);
 }
 FVoxelEnvironmentAssetDescriptor FVoxelEnvironmentAssetDescriptor::Prototype(const FString& Name){
     FVoxelEnvironmentAssetDescriptor D;
@@ -47,17 +57,25 @@ bool VoxelEnvironmentAsset::SerializeIdentity(FArchive& Ar,FVoxelEnvironmentAsse
     if(Marker>=0&&Marker<4){if(Ar.IsLoading())D=FVoxelEnvironmentAssetDescriptor::Prototype(LegacyEnvironmentNames[Marker]);return true;}
     if(Marker!=-1)return false;
     if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<4)return false;
-    uint32 Version=D.ProductionProvenance.IsSet()?2u:1u;Ar<<Version;if((Version!=1&&Version!=2)||Ar.IsError())return false;
+    uint32 Version=D.HasComposition()?3u:(D.ProductionProvenance.IsSet()?2u:1u);
+    Ar<<Version;if((Version<1||Version>3)||Ar.IsError())return false;
     if(!TextField(Ar,D.SpecId,128)||!TextField(Ar,D.Kind,64)||!TextField(Ar,D.Category,64)||!TextField(Ar,D.SourceHash,32)||
        !TextField(Ar,D.SpecHash,128)||!TextField(Ar,D.CatalogHash,128)||!TextField(Ar,D.ProviderHash,128))return false;
     if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<5)return false;
     uint8 Flags=D.Fellable?1:0;Ar<<D.SeedIndex<<Flags;if(Flags>1||Ar.IsError())return false;
     D.Fellable=Flags!=0;D.Legacy=false;
-    if(Version==2){
-        if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<74)return false; // fixed fields + hash length
+    uint8 HasProvenance=Version==2?1:0;
+    if(Version==3){
+        if(!TextField(Ar,D.ClippedGeometryHash,32))return false;
+        if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<2)return false;
+        if(Ar.IsSaving())HasProvenance=D.ProductionProvenance.IsSet()?1:0;
+        Ar<<D.SourceYawQuarter<<HasProvenance;
+        if(Ar.IsError()||D.ClippedGeometryHash.IsEmpty()||HasProvenance>1)return false;
+    }
+    if(HasProvenance){
+        if(Ar.IsLoading()&&Ar.TotalSize()-Ar.Tell()<74)return false;
         if(Ar.IsLoading())D.ProductionProvenance.Emplace();
         auto& P=D.ProductionProvenance.GetValue();auto& S=P.Source;
-        // Fixed-width fields, never native struct bytes/padding.
         Ar<<S.worldSeed<<S.providerFingerprint<<S.catalogFingerprint;
         Ar<<S.anchorVx<<S.anchorVy<<S.anchorVz;
         Ar<<S.bankId<<S.seedIndex<<S.layer<<S.yawQuarter;

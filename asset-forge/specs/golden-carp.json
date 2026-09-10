@@ -26,6 +26,13 @@
     "shell_upper": 0.55,
     "squash": 1.0
   },
+  "curation": {
+    "notes": "",
+    "seeds": [
+      7
+    ],
+    "status": "approved"
+  },
   "detail": {
     "depth_max_m": 4.0,
     "depth_min_m": 0.4,

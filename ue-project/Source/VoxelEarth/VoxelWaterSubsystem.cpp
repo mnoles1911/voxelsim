@@ -1,4 +1,5 @@
 #include "VoxelWaterSubsystem.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelSessionCheckpoint.h"
 #include "Tasks/Task.h"        // the lake tier's async tile load (2026-09-09)
 #include "Containers/Queue.h"
@@ -7421,6 +7422,7 @@ void UVoxelWaterSubsystem::TickTide(UWorld* World)
 
 void UVoxelWaterSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, WaterTickMs);
 	if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	if (!Impl)
 	{

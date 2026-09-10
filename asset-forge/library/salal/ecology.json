@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "revision": "temperate-ecology-authoring-v1",
+  "species": "salal",
+  "kind": "bush",
+  "cover_role": "shade-shrub",
+  "community_weights_per_mille": {
+    "oak-beech": 0,
+    "maple-beech": 0,
+    "coastal-conifer": 1000,
+    "pine-birch": 0,
+    "riparian": 0,
+    "warm-dry": 0,
+    "east-asian": 0,
+    "wet-mild": 0
+  },
+  "trunk_exclusion_mm": 100,
+  "crown_opacity_per_mille": 0,
+  "reference_review": "reference-review.json",
+  "placement_references": [
+    "https://research.fs.usda.gov/feis/species-reviews/gausha"
+  ],
+  "status": "authored_initial_placement_targets_pending_world_visual_review",
+  "notes": [
+    "Instanced non-colliding understory; no voxel-level destruction.",
+    "Water/depth gates are mandatory; wetland role alone does not establish suitability.",
+    "Weights are authored game targets. Broad default communities need regional refinement.",
+    "No seasonal simulation or recoloring."
+  ]
+}

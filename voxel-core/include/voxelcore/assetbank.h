@@ -51,6 +51,7 @@
 // integers mutated under the same mutex; they are diagnostics, not worldgen.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -87,7 +88,12 @@ public:
     // `manifest` must outlive this library; `root` is the banks directory.
     // Nothing is read here -- banks load on first touch, so a library over
     // 180 species costs only what the terrain actually asks for.
-    void configure(const AssetManifest* manifest, std::string root);
+    // Called once per accepted grid, under the library lock, with the exact
+    // bytes parsed. Observer must not reenter this library or retain byte data
+    // pointers. Grid address remains stable until reconfigure/destruction.
+    using AcceptedSourceObserver = std::function<void(const AssetGrid&,const uint8_t*,size_t)>;
+    void configure(const AssetManifest* manifest, std::string root,
+                   AcceptedSourceObserver observer = {});
 
     // The seam assetfield.h consumes. nullptr for anything absent or refused,
     // which composes as "no asset voxels here"; the miss is counted.
@@ -96,6 +102,11 @@ public:
     // Force-load one species bank (benches, load-time validation sweeps).
     // Returns the number of seed grids that survived validation.
     int loadSpecies(uint16_t bankId) const;
+    // Exact accepted filename -> compact runtime slot. Unlike bankGrid this
+    // never reduces modulo or substitutes another seed. Callers additionally
+    // verify source identity through the accepted-source observer before use.
+    bool findSeedByFilename(uint16_t bankId, const std::string& filename,
+                            uint16_t& slot, const AssetGrid*& grid) const;
 
     struct Stats {
         uint64_t requests = 0;      // bankGrid calls
@@ -118,6 +129,7 @@ private:
         // unique_ptr per grid so pointers survive the vector's growth during
         // load; the vector itself never changes after `loaded` flips.
         std::vector<std::unique_ptr<AssetGrid>> seeds;
+        std::vector<std::string> filenames;
     };
 
     const Bank& bankFor(uint16_t bankId) const;
@@ -125,6 +137,7 @@ private:
     std::atomic<uint64_t> revision_{0};
     const AssetManifest* manifest_ = nullptr;
     std::string root_;
+    AcceptedSourceObserver observer_;
     mutable std::mutex mu_;
     mutable std::unordered_map<uint16_t, Bank> banks_;
     mutable Stats stats_;

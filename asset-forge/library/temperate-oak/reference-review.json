@@ -1,0 +1,88 @@
+{
+  "species": "temperate-oak",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Retains the established branch-and-shoot oak architecture. Leaf-on and bare whole-tree photographs support the spreading scaffold and irregular crown; winter reference is structure-only."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "16040",
+      "source": "https://plants.ces.ncsu.edu/plants/quercus-robur/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "16041",
+      "source": "https://plants.ces.ncsu.edu/plants/quercus-robur/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "quercus-robur",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/quercus-robur/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "3427b81aba576b59eefec869c5d5291be8d29a6cec433705bcbd6014010e64ec",
+    "4": "e43454aca76b9f5aafa4222426d4920e8de2ddb31a1850bb3feaf8e3af8d4085",
+    "7": "8dee8e26a9c41662151cd143ae6d6a56b0bab346738b490ca897b2aaf7f47666"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "188bc30867e25c46cf0020af53aa322bf38ebb4453585dd2343399d52135220b"
+  }
+}

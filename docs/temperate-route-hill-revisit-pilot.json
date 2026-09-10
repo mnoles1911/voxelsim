@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "scope": "Out-and-back hill revisit pilot. Outbound route completed in captures6/7; reverse direction and resource restoration remain unverified. Designed for48m diagnostic residency ring, not256m unload acceptance.",
+  "spawn_x_m": -154048.0,
+  "spawn_y_m": -81112.0,
+  "configuration_sha256": "e68b98f5d52952d59cece8e4403c6d42eaddb9fee5d3259dabb999a6f1ad0936",
+  "species_manifest_sha256": "0197da097e17a2634c2f15dca0589e5e98157eb631c2998513769738427dd4f6",
+  "provenance": {
+    "outbound_route_sha256": "850a25f9c922e067889afc2e2d73f1aead9b3b82b189784e263c9b22cd76785c",
+    "outbound_runtime_evidence": "asset-forge/out/ecological-placement/route-capture-6-hill-profile/route-analysis.json",
+    "purpose": "Departure, direction reversal, and return through identical deterministic placement; no geometry or approval edits",
+    "authored_polyline_length_m": 344.5348316020861
+  },
+  "waypoints": [
+    {
+      "x_m": -154053,
+      "y_m": -81114,
+      "arrival_radius_m": 0.15,
+      "label": "west approach survey-candidate; tree-clear sampled, terrain unverified"
+    },
+    {
+      "x_m": -154053,
+      "y_m": -81116,
+      "arrival_radius_m": 0.15,
+      "label": "west-side entry to original arrival disk; terrain unverified"
+    },
+    {
+      "x_m": -154052,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 98265,
+      "survey_slope_mm_per_m": 208,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 228000
+    },
+    {
+      "x_m": -154076,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 2; clearance unverified",
+      "survey_surface_mm": 99537,
+      "survey_slope_mm_per_m": 159,
+      "survey_stand": 2,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 250000
+    },
+    {
+      "x_m": -154100,
+      "y_m": -81140,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 2; clearance unverified",
+      "survey_surface_mm": 92875,
+      "survey_slope_mm_per_m": 101,
+      "survey_stand": 2,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 278000
+    },
+    {
+      "x_m": -154124,
+      "y_m": -81164,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 3; clearance unverified",
+      "survey_surface_mm": 92671,
+      "survey_slope_mm_per_m": 274,
+      "survey_stand": 3,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 282000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81164,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 3; clearance unverified",
+      "survey_surface_mm": 95585,
+      "survey_slope_mm_per_m": 94,
+      "survey_stand": 3,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 304000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81140,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 97919,
+      "survey_slope_mm_per_m": 242,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 318000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 101158,
+      "survey_slope_mm_per_m": 244,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 324000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81140,
+      "arrival_radius_m": 0.75,
+      "label": "Return leg; reverse connectivity requires runtime validation",
+      "survey_surface_mm": 97919,
+      "survey_slope_mm_per_m": 242,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 318000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81164,
+      "arrival_radius_m": 0.75,
+      "label": "Return leg; reverse connectivity requires runtime validation",
+      "survey_surface_mm": 95585,
+      "survey_slope_mm_per_m": 94,
+      "survey_stand": 3,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 304000
+    },
+    {
+      "x_m": -154124,
+      "y_m": -81164,
+      "arrival_radius_m": 0.75,
+      "label": "Return leg; reverse connectivity requires runtime validation",
+      "survey_surface_mm": 92671,
+      "survey_slope_mm_per_m": 274,
+      "survey_stand": 3,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 282000
+    },
+    {
+      "x_m": -154100,
+      "y_m": -81140,
+      "arrival_radius_m": 0.75,
+      "label": "Return leg; reverse connectivity requires runtime validation",
+      "survey_surface_mm": 92875,
+      "survey_slope_mm_per_m": 101,
+      "survey_stand": 2,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 278000
+    },
+    {
+      "x_m": -154076,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "Return leg; reverse connectivity requires runtime validation",
+      "survey_surface_mm": 99537,
+      "survey_slope_mm_per_m": 159,
+      "survey_stand": 2,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 250000
+    },
+    {
+      "x_m": -154052,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "Return leg; reverse connectivity requires runtime validation",
+      "survey_surface_mm": 98265,
+      "survey_slope_mm_per_m": 208,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 228000
+    },
+    {
+      "x_m": -154053,
+      "y_m": -81116,
+      "arrival_radius_m": 0.15,
+      "label": "Return leg; reverse connectivity requires runtime validation"
+    },
+    {
+      "x_m": -154053,
+      "y_m": -81114,
+      "arrival_radius_m": 0.15,
+      "label": "Return leg; reverse connectivity requires runtime validation"
+    },
+    {
+      "x_m": -154048.0,
+      "y_m": -81112.0,
+      "arrival_radius_m": 0.15,
+      "label": "Return to original spawn; revisit comparison checkpoint"
+    }
+  ]
+}

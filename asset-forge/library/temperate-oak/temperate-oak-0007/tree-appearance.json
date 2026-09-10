@@ -1,0 +1,8 @@
+{
+  "revision": "spring-v2",
+  "geometry_sha256": "8dee8e26a9c41662151cd143ae6d6a56b0bab346738b490ca897b2aaf7f47666",
+  "preview_sha256": "675aaa0891ee55f107a518b2d1be7cf03a5f4a7922ae3d35c27ccdf81f798160",
+  "palette_sha256": "c6d06942f39405d2680d2989e6bc8b91318882a9f193c0ef98d2523d66e35c87",
+  "needle": false,
+  "voxel_mm": 100
+}

@@ -1,0 +1,137 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/water-soldier",
+  "viewed_photos": [
+    "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-05/Water-soldier.jpg?h=695059ea&itok=nAJEqzvM"
+  ],
+  "photo_reviewer": "Astra root actual photo review; understory agent geometry comparison",
+  "photo_observations": {
+    "species": "water-soldier",
+    "taxon": "Stratiotes aloides",
+    "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/water-soldier",
+    "additional_sources": [
+      "https://www.rhs.org.uk/plants/17806/stratiotes-aloides/details",
+      "https://nas.er.usgs.gov/queries/greatLakes/FactSheet.aspx?Species_ID=3159"
+    ],
+    "photos": [
+      {
+        "url": "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-05/Water-soldier.jpg?h=695059ea&itok=nAJEqzvM",
+        "credit": "Dr Malcolm Storey",
+        "caption": "Separate pointed rosettes at surface"
+      }
+    ],
+    "viewed_photos": true,
+    "observations": "Upright spear leaves radiate from discrete rosettes, with clear channels between neighboring crowns. Pineapple-top silhouette, not a branched bush.",
+    "metric_notes": "RHS leaves up to45cm; USGS emergent blades under40cm long and1\u00e2\u20ac\u201c4cm wide. Wildlife Trusts5cm height must not be used as total leaf length.",
+    "spring_notes": "Wildlife Trusts states mostly submerged, surfacing/flowering June\u00e2\u20ac\u201cAugust. Use submerged spring rosette, no white bloom.",
+    "voxel_implications": "One-cell blade widths approximate real narrow leaves. Keep actual rosette scale and separate blade tips; serrations unresolved. Water placement must be submerged for chosen spring state."
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Reduced rosette density to14 blades after initial review. Current15-25cm submerged spring rosettes retain spreading stiff strap leaves and separate tips. Serrations are below25mm; no summer white flowers.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "cd306c60de15971542c13e8f2e25d845ace45160f7c716c73071f5acdd8c8395",
+  "sheet_hash": "56004e799a04f99f3a6f056635f034c7b625374e945a13a674cde00efc32976a",
+  "reviewed_at": 1788861146.3595946,
+  "pilot_hashes": {
+    "1": "2d241136df2b6fe39f50937d0ed5c6c01089cdac89a584579d526d697b8fcf66",
+    "4": "98b602bac9ef1d46e32b619c34327e1ca4b9feabc96679b817acbeb78e6270f1",
+    "7": "023a490da451878326dabdf5f321067ca84a9034a564cdd53a08ee14f7eab65b"
+  },
+  "profile": "water-soldier",
+  "review_date": "2026-09-08",
+  "additional_sources": [
+    "https://www.rhs.org.uk/plants/17806/stratiotes-aloides/details",
+    "https://nas.er.usgs.gov/queries/greatLakes/FactSheet.aspx?Species_ID=3159"
+  ],
+  "reference_catalog_photos": [
+    {
+      "url": "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-05/Water-soldier.jpg?h=695059ea&itok=nAJEqzvM",
+      "credit": "Dr Malcolm Storey",
+      "caption": "Separate pointed rosettes at surface"
+    }
+  ],
+  "taxon": "Stratiotes aloides",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "56004e799a04f99f3a6f056635f034c7b625374e945a13a674cde00efc32976a"
+  }
+}

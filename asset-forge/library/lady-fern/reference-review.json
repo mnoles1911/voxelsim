@@ -1,0 +1,514 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/athyrium-filix-femina/",
+  "viewed_photos": [
+    "Form and frond - Peggy A. Lopipero-Langmo",
+    "Underside of leaflets with sori - MurielBendel"
+  ],
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "findings": "Inspected the low arching stand and twice-divided frond photographs, then all three current pilots and 36 variants. Curved rachises carry aligned pinnae and pinnules; the species has a more open arching frond range than the male fern source. Current heights span 0.28-0.70 m. The small end merges fine pinnules into stepped blades at 25 mm, while larger variants show separated divisions; microscopic sori and margin teeth are omitted. Accepted as stylized spring lady fern, pending user endorsement.",
+  "generator_digest": "7f17d9e2b1a3ce9194c385f12c26c986ad4cf472cad29d450fb5d97b9e76330f",
+  "sheet_hash": "8af2551acb8cf14befc27245adef1046468a38a18644e440b40371575eeb1966",
+  "reviewed_at": 1788842409.9052103,
+  "pilot_hashes": {
+    "1": "d0eeb0ec231715f9125fed136050b6a1310f82d3afe2aa21c10d714f9b0d457a",
+    "4": "376750db557bbba1b668fa2fcc51b04769fd772fcee33834511bee633a696658",
+    "7": "391a0dc6d4eccde783657868ed538f4aa73b24a4471755e42773e2222f9dc499"
+  },
+  "profile": "lady-fern",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Athyrium_filix-femin_6XRjTMbbEO4h.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=8A3ILBhKaXk8YAutjCD1ggD6IUQ%3D&Expires=1788845966",
+      "caption": "Form",
+      "credit": "Peggy A. Lopipero-Langmo",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "39016"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Athyrium_filix-femin_z9MJK0csDiPf.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=5Qp3cgqczt%2Fpl0%2B2VXvuwLcB1vQ%3D&Expires=1788845966",
+      "caption": "Frond",
+      "credit": "Peggy A. Lopipero-Langmo",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "39017"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Athyrium_filix-femin_os9HJVe5YmWs.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=yPknrMnqDoeBB4wK8R7RDCy9%2Brg%3D&Expires=1788845966",
+      "caption": "Underside of leaflets with sori",
+      "credit": "MurielBendel",
+      "license": "",
+      "image_id": "39015"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Athyrium_filix-femin_Yak5hkQn4T0h.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=MCAJX4N0mIgihSHblhe%2F8eVFhXE%3D&Expires=1788845966",
+      "caption": "Frond opening",
+      "credit": "Vladimir Bryukhov",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "39018"
+    }
+  ],
+  "taxon": "Athyrium filix-femina",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "8af2551acb8cf14befc27245adef1046468a38a18644e440b40371575eeb1966"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "4a447a1788943b69296062a9f6eabc1a3d3a3f61ba9f8a6463cad07246a0e0d6",
+      "new_digest": "d09278e3af53a1456a434e4d46977fb9fe3008c80a03fa5c9194aeeb5cecf3d5",
+      "timestamp": 1788842537.7653847,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "lady-fern-0001",
+          "seed": 1,
+          "hash": "d0eeb0ec231715f9125fed136050b6a1310f82d3afe2aa21c10d714f9b0d457a"
+        },
+        {
+          "id": "lady-fern-0002",
+          "seed": 2,
+          "hash": "2753cd2fa4aacf0fe6f1406dd0c4448d83666b5d41e55dfac1b421feecae86d4"
+        },
+        {
+          "id": "lady-fern-0003",
+          "seed": 3,
+          "hash": "e15f18f0ed0523021e2aad1c925866997281642172d89fe0106184249ff50164"
+        },
+        {
+          "id": "lady-fern-0004",
+          "seed": 4,
+          "hash": "376750db557bbba1b668fa2fcc51b04769fd772fcee33834511bee633a696658"
+        },
+        {
+          "id": "lady-fern-0005",
+          "seed": 5,
+          "hash": "4d174f7b1eeaf505956a257a68ca6ff21d30745490eeb430d45586ecea105322"
+        },
+        {
+          "id": "lady-fern-0006",
+          "seed": 6,
+          "hash": "5fecab69b9fff3aae4aa7857dc5822b85da37abdd32111a1a5f63c6474c41ef2"
+        },
+        {
+          "id": "lady-fern-0007",
+          "seed": 7,
+          "hash": "391a0dc6d4eccde783657868ed538f4aa73b24a4471755e42773e2222f9dc499"
+        },
+        {
+          "id": "lady-fern-0008",
+          "seed": 8,
+          "hash": "f716c642955bf242d698eb0f38b89dd518d6618f800f642b21069a46a7794b3b"
+        },
+        {
+          "id": "lady-fern-0009",
+          "seed": 9,
+          "hash": "f27ec8e6a51c56ffef23d3639ef782789b1b79cea5f6388fdc4be1c750324e58"
+        },
+        {
+          "id": "lady-fern-0010",
+          "seed": 10,
+          "hash": "bec42aaeaacfc295169044dafd7c5e0ead7ef92eec6650705007f76a1b9388fe"
+        },
+        {
+          "id": "lady-fern-0011",
+          "seed": 11,
+          "hash": "f4685a4b21743bf061556d8f13e9bd5861678de1a04bc95581d8f0985cfb5e78"
+        },
+        {
+          "id": "lady-fern-0012",
+          "seed": 12,
+          "hash": "e6029a19d842f7895c8d300a04dcbd5d3f52fb4cca5c82a82f24d0799b07885d"
+        },
+        {
+          "id": "lady-fern-0013",
+          "seed": 13,
+          "hash": "f1a342dd9da0adfef4a97041b18cd59e68bc594e36ef89e0d0194b6c7fd29101"
+        },
+        {
+          "id": "lady-fern-0014",
+          "seed": 14,
+          "hash": "ce72b72317b731a8491686e6800bf9faba57ae98295569d001ad47e13921a298"
+        },
+        {
+          "id": "lady-fern-0015",
+          "seed": 15,
+          "hash": "1bb84add7dd80ec3a421d0a348cbfea4dc6c3296cdb1f38cfe050c0cfb632cc6"
+        },
+        {
+          "id": "lady-fern-0016",
+          "seed": 16,
+          "hash": "f2e12c2ad48a074d8c5e1174e44862471fee561423b7445cfeee53cea15f0103"
+        },
+        {
+          "id": "lady-fern-0017",
+          "seed": 17,
+          "hash": "f3e9ed3f706293c435e81ef19d28dc31ae656fd80379d686b26a9d4e26fa70d8"
+        },
+        {
+          "id": "lady-fern-0018",
+          "seed": 18,
+          "hash": "1171df21557bd7b5a8d05b59793a8c3e0867c5ccd0bcef05cad72f627bbbd950"
+        },
+        {
+          "id": "lady-fern-0019",
+          "seed": 19,
+          "hash": "7c13afbfd384e5452a1aacef9090757fbed80bc5a5f1840f5c7cf5085d21ae37"
+        },
+        {
+          "id": "lady-fern-0020",
+          "seed": 20,
+          "hash": "512930c076b158b045db95f51c0106b9866e0d53521377e9a85f4dbb1402e857"
+        },
+        {
+          "id": "lady-fern-0021",
+          "seed": 21,
+          "hash": "265d2e6cd7412e2675b2ae0927266c05a1700f20a93635824a126f7bdb573ccf"
+        },
+        {
+          "id": "lady-fern-0022",
+          "seed": 22,
+          "hash": "45e5e89049f87b91b25223ddff679cf8cc84a43e014aa43a1153a81075ef8ac4"
+        },
+        {
+          "id": "lady-fern-0023",
+          "seed": 23,
+          "hash": "8cf659baa12017aee38447bfda4415a0c01b7ecfd104d76374b0cd223fcd743f"
+        },
+        {
+          "id": "lady-fern-0024",
+          "seed": 24,
+          "hash": "9d7bb7473599e047d1dd5922f1743eaee4f8bc45560f8bce5f18510aebc4276e"
+        },
+        {
+          "id": "lady-fern-0025",
+          "seed": 25,
+          "hash": "0f569d75cf67d64299e22fb133d99e0bdd0104708bedad82087f6d62c560d3cf"
+        },
+        {
+          "id": "lady-fern-0026",
+          "seed": 26,
+          "hash": "4c1d01f856af29ce74256c18240b386e9f4b5e68b1cb4fbb53b2546d4e17192b"
+        },
+        {
+          "id": "lady-fern-0027",
+          "seed": 27,
+          "hash": "31afeb51fdcb10aaf0483be7e3c3a662e71084364d949ee790c0c9074bf9d04f"
+        },
+        {
+          "id": "lady-fern-0028",
+          "seed": 28,
+          "hash": "b1cacc37bd6634b0a58f6dee1a4320dc57e7e71ba7c5663b33dfeb4765218b94"
+        },
+        {
+          "id": "lady-fern-0029",
+          "seed": 29,
+          "hash": "9444c9379eea9e4f28a6844d1a5ec012eb95c785f0780f3b881349d52f151849"
+        },
+        {
+          "id": "lady-fern-0030",
+          "seed": 30,
+          "hash": "a3f69dcac54e3c50414d14064f59f4e21307b2cb931859f5016e9e7176dcee0a"
+        },
+        {
+          "id": "lady-fern-0031",
+          "seed": 31,
+          "hash": "7e9fac15134c5f3cf3069e69426e05f8a13920f98e00c84c03556c1225d93b01"
+        },
+        {
+          "id": "lady-fern-0032",
+          "seed": 32,
+          "hash": "b313dff4282535350073bc5fefa0894e21df34d395668d052875b6fe531b19f0"
+        },
+        {
+          "id": "lady-fern-0033",
+          "seed": 33,
+          "hash": "4275fba820667ca7b7f1d39f4c9c2af20f9abc6273399c4ed6376694029fe7ed"
+        },
+        {
+          "id": "lady-fern-0034",
+          "seed": 34,
+          "hash": "7cd3bbf1d57e94911a5dab6d074993e426ceb3957842ef426297ca6967c6bbe4"
+        },
+        {
+          "id": "lady-fern-0035",
+          "seed": 35,
+          "hash": "9b2277afd734b0844312b3761ffe93cc84b605dbd676480728a16b48c393f209"
+        },
+        {
+          "id": "lady-fern-0036",
+          "seed": 36,
+          "hash": "0f6b00db8a353b7be3a9b9083e655555ef58e3be4123537c60c0b331f760701b"
+        }
+      ]
+    },
+    {
+      "previous_digest": "d09278e3af53a1456a434e4d46977fb9fe3008c80a03fa5c9194aeeb5cecf3d5",
+      "new_digest": "7f17d9e2b1a3ce9194c385f12c26c986ad4cf472cad29d450fb5d97b9e76330f",
+      "timestamp": 1788842601.7993455,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "lady-fern-0001",
+          "seed": 1,
+          "hash": "d0eeb0ec231715f9125fed136050b6a1310f82d3afe2aa21c10d714f9b0d457a"
+        },
+        {
+          "id": "lady-fern-0002",
+          "seed": 2,
+          "hash": "2753cd2fa4aacf0fe6f1406dd0c4448d83666b5d41e55dfac1b421feecae86d4"
+        },
+        {
+          "id": "lady-fern-0003",
+          "seed": 3,
+          "hash": "e15f18f0ed0523021e2aad1c925866997281642172d89fe0106184249ff50164"
+        },
+        {
+          "id": "lady-fern-0004",
+          "seed": 4,
+          "hash": "376750db557bbba1b668fa2fcc51b04769fd772fcee33834511bee633a696658"
+        },
+        {
+          "id": "lady-fern-0005",
+          "seed": 5,
+          "hash": "4d174f7b1eeaf505956a257a68ca6ff21d30745490eeb430d45586ecea105322"
+        },
+        {
+          "id": "lady-fern-0006",
+          "seed": 6,
+          "hash": "5fecab69b9fff3aae4aa7857dc5822b85da37abdd32111a1a5f63c6474c41ef2"
+        },
+        {
+          "id": "lady-fern-0007",
+          "seed": 7,
+          "hash": "391a0dc6d4eccde783657868ed538f4aa73b24a4471755e42773e2222f9dc499"
+        },
+        {
+          "id": "lady-fern-0008",
+          "seed": 8,
+          "hash": "f716c642955bf242d698eb0f38b89dd518d6618f800f642b21069a46a7794b3b"
+        },
+        {
+          "id": "lady-fern-0009",
+          "seed": 9,
+          "hash": "f27ec8e6a51c56ffef23d3639ef782789b1b79cea5f6388fdc4be1c750324e58"
+        },
+        {
+          "id": "lady-fern-0010",
+          "seed": 10,
+          "hash": "bec42aaeaacfc295169044dafd7c5e0ead7ef92eec6650705007f76a1b9388fe"
+        },
+        {
+          "id": "lady-fern-0011",
+          "seed": 11,
+          "hash": "f4685a4b21743bf061556d8f13e9bd5861678de1a04bc95581d8f0985cfb5e78"
+        },
+        {
+          "id": "lady-fern-0012",
+          "seed": 12,
+          "hash": "e6029a19d842f7895c8d300a04dcbd5d3f52fb4cca5c82a82f24d0799b07885d"
+        },
+        {
+          "id": "lady-fern-0013",
+          "seed": 13,
+          "hash": "f1a342dd9da0adfef4a97041b18cd59e68bc594e36ef89e0d0194b6c7fd29101"
+        },
+        {
+          "id": "lady-fern-0014",
+          "seed": 14,
+          "hash": "ce72b72317b731a8491686e6800bf9faba57ae98295569d001ad47e13921a298"
+        },
+        {
+          "id": "lady-fern-0015",
+          "seed": 15,
+          "hash": "1bb84add7dd80ec3a421d0a348cbfea4dc6c3296cdb1f38cfe050c0cfb632cc6"
+        },
+        {
+          "id": "lady-fern-0016",
+          "seed": 16,
+          "hash": "f2e12c2ad48a074d8c5e1174e44862471fee561423b7445cfeee53cea15f0103"
+        },
+        {
+          "id": "lady-fern-0017",
+          "seed": 17,
+          "hash": "f3e9ed3f706293c435e81ef19d28dc31ae656fd80379d686b26a9d4e26fa70d8"
+        },
+        {
+          "id": "lady-fern-0018",
+          "seed": 18,
+          "hash": "1171df21557bd7b5a8d05b59793a8c3e0867c5ccd0bcef05cad72f627bbbd950"
+        },
+        {
+          "id": "lady-fern-0019",
+          "seed": 19,
+          "hash": "7c13afbfd384e5452a1aacef9090757fbed80bc5a5f1840f5c7cf5085d21ae37"
+        },
+        {
+          "id": "lady-fern-0020",
+          "seed": 20,
+          "hash": "512930c076b158b045db95f51c0106b9866e0d53521377e9a85f4dbb1402e857"
+        },
+        {
+          "id": "lady-fern-0021",
+          "seed": 21,
+          "hash": "265d2e6cd7412e2675b2ae0927266c05a1700f20a93635824a126f7bdb573ccf"
+        },
+        {
+          "id": "lady-fern-0022",
+          "seed": 22,
+          "hash": "45e5e89049f87b91b25223ddff679cf8cc84a43e014aa43a1153a81075ef8ac4"
+        },
+        {
+          "id": "lady-fern-0023",
+          "seed": 23,
+          "hash": "8cf659baa12017aee38447bfda4415a0c01b7ecfd104d76374b0cd223fcd743f"
+        },
+        {
+          "id": "lady-fern-0024",
+          "seed": 24,
+          "hash": "9d7bb7473599e047d1dd5922f1743eaee4f8bc45560f8bce5f18510aebc4276e"
+        },
+        {
+          "id": "lady-fern-0025",
+          "seed": 25,
+          "hash": "0f569d75cf67d64299e22fb133d99e0bdd0104708bedad82087f6d62c560d3cf"
+        },
+        {
+          "id": "lady-fern-0026",
+          "seed": 26,
+          "hash": "4c1d01f856af29ce74256c18240b386e9f4b5e68b1cb4fbb53b2546d4e17192b"
+        },
+        {
+          "id": "lady-fern-0027",
+          "seed": 27,
+          "hash": "31afeb51fdcb10aaf0483be7e3c3a662e71084364d949ee790c0c9074bf9d04f"
+        },
+        {
+          "id": "lady-fern-0028",
+          "seed": 28,
+          "hash": "b1cacc37bd6634b0a58f6dee1a4320dc57e7e71ba7c5663b33dfeb4765218b94"
+        },
+        {
+          "id": "lady-fern-0029",
+          "seed": 29,
+          "hash": "9444c9379eea9e4f28a6844d1a5ec012eb95c785f0780f3b881349d52f151849"
+        },
+        {
+          "id": "lady-fern-0030",
+          "seed": 30,
+          "hash": "a3f69dcac54e3c50414d14064f59f4e21307b2cb931859f5016e9e7176dcee0a"
+        },
+        {
+          "id": "lady-fern-0031",
+          "seed": 31,
+          "hash": "7e9fac15134c5f3cf3069e69426e05f8a13920f98e00c84c03556c1225d93b01"
+        },
+        {
+          "id": "lady-fern-0032",
+          "seed": 32,
+          "hash": "b313dff4282535350073bc5fefa0894e21df34d395668d052875b6fe531b19f0"
+        },
+        {
+          "id": "lady-fern-0033",
+          "seed": 33,
+          "hash": "4275fba820667ca7b7f1d39f4c9c2af20f9abc6273399c4ed6376694029fe7ed"
+        },
+        {
+          "id": "lady-fern-0034",
+          "seed": 34,
+          "hash": "7cd3bbf1d57e94911a5dab6d074993e426ceb3957842ef426297ca6967c6bbe4"
+        },
+        {
+          "id": "lady-fern-0035",
+          "seed": 35,
+          "hash": "9b2277afd734b0844312b3761ffe93cc84b605dbd676480728a16b48c393f209"
+        },
+        {
+          "id": "lady-fern-0036",
+          "seed": 36,
+          "hash": "0f6b00db8a353b7be3a9b9083e655555ef58e3be4123537c60c0b331f760701b"
+        }
+      ]
+    }
+  ]
+}

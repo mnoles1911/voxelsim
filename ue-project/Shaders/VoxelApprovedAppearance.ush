@@ -1,0 +1,33 @@
+#include "/VoxelEarth/VoxelApprovedFoliageMask.ush"
+uint VoxelAppearanceColorHash(uint H){H^=H>>16u;H*=2246822519u;H^=H>>13u;H*=3266489917u;return H^(H>>16u);}
+float VoxelAppearanceUnit(uint H){return float(VoxelAppearanceColorHash(H)&65535u)/65535.0*2.0-1.0;}
+float VoxelAppearanceDecode(float V){V=saturate(V);return V<=.04045?V/12.92:pow((V+.055)/1.055,2.4);}
+// Fraction is relative to the WORLD owning voxel box, closed [0,1] corners.
+// ZeroCell is the original source zero-based cell returned by sparse lookup.
+// Footprint is in mask pattern coordinates p=UV/lerp(.19,.13,Needle).
+bool VoxelApprovedAppearance(uint Packed,int3 ZeroCell,uint WorldAxis,uint Positive,uint Yaw,
+    float3 Fraction,float PitchMm,uint Needle,uint Foliage,float PatternFootprint,
+    out float3 Color,out float2 UV,out float Coverage)
+{
+    Color=0;UV=0;Coverage=0;
+    if(WorldAxis>2u||Positive>1u||Yaw>3u||Needle>1u||Foliage>1u||any(ZeroCell<0)||any(ZeroCell>65534))return false;
+    if(any(!isfinite(Fraction))||any(Fraction<0.0)||any(Fraction>1.0)||!isfinite(PatternFootprint)||PatternFootprint<0.0)return false;
+    if(PitchMm!=25.0&&PitchMm!=50.0&&PitchMm!=100.0)return false;
+    uint Axis=WorldAxis,Sign=Positive;
+    if(WorldAxis<2u){if(Yaw==2u||(Yaw==1u&&WorldAxis==0u)||(Yaw==3u&&WorldAxis==1u))Sign=1u-Positive;if((Yaw&1u)!=0u)Axis=1u-WorldAxis;} // lint-shader-ub: allow UNSIGNED_UNDERFLOW - Positive is validated zero or one and WorldAxis is below two in this branch
+    uint Key=uint(ZeroCell.x)*73856093u^uint(ZeroCell.y)*19349663u^uint(ZeroCell.z)*83492791u;
+    float Gain=1.0+.085*VoxelAppearanceUnit(Key)+.045*VoxelAppearanceUnit(Key^((Axis*2u+Sign+1u)*2654435761u));
+    float Warmth=VoxelAppearanceUnit(Key^1597334677u);
+    float3 Base=float3((Packed>>8u)&255u,(Packed>>16u)&255u,(Packed>>24u)&255u)/255.0;
+    float3 T=Base*Gain*float3(1.0+.025*Warmth,1.0,1.0-.025*Warmth);
+    Color=float3(VoxelAppearanceDecode(T.x),VoxelAppearanceDecode(T.y),VoxelAppearanceDecode(T.z));
+    float3 F=Fraction;
+    if(Yaw==1u)F=float3(Fraction.y,1.0-Fraction.x,Fraction.z);
+    else if(Yaw==2u)F=float3(1.0-Fraction.x,1.0-Fraction.y,Fraction.z);
+    else if(Yaw==3u)F=float3(1.0-Fraction.y,Fraction.x,Fraction.z);
+    float3 P=(float3(ZeroCell)+F)*(PitchMm*.001);
+    UV=Axis==2u?P.xy:Axis==0u?P.yz:P.xz;
+    [branch] if(Foliage==0u)Coverage=1.0;
+    else Coverage=VoxelApprovedFoliageCoverage(UV,float(Needle),PatternFootprint);
+    return true;
+}

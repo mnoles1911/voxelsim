@@ -16,8 +16,8 @@
 // INSTANCE, in that same order, and only ever writes cells whose material is
 // AIR -- so instance i+1 sees instance i's writes through the pass barrier and
 // the same winner is picked for every overlapped cell. Optional render
-// suppression keeps an owned winner in separate transient claims while leaving
-// its material air; later instances still cannot occupy that cell.
+// suppression marks the winning material in a transient mask, then clears it
+// after all instances stamp; later instances cannot replace that winner.
 // One thread owns one
 // baked column, so there are no intra-dispatch races either.
 //
@@ -74,26 +74,14 @@ StructuredBuffer<uint> ColStarts;
 StructuredBuffer<uint> Spans;
 
 RWStructuredBuffer<uint> OutCells;
-// Optional transient claim buffer, separate from terrain/material packing.
-uint HasRenderSuppression;
-uint SuppressTerrainRender;
-RWStructuredBuffer<uint> OwnedWinnerClaims;
+#ifndef VXC_ASSET_OWNERSHIP
+#define VXC_ASSET_OWNERSHIP 0
+#endif
+#if VXC_ASSET_OWNERSHIP
+uint RenderOwned;
+RWStructuredBuffer<uint> OwnedWinnerMask;
+#endif
 
-void assetStampWinner(uint CellIndex, uint Mat)
-{
-    const uint Cell = OutCells[CellIndex];
-    if ((Cell & 0xffu) != 0u) return;
-    if (HasRenderSuppression != 0u)
-    {
-        if (OwnedWinnerClaims[CellIndex] != 0u) return;
-        if (SuppressTerrainRender != 0u)
-        {
-            OwnedWinnerClaims[CellIndex] = 1u;
-            return;
-        }
-    }
-    OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
-}
 
 [numthreads(8, 8, 1)]
 void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
@@ -159,7 +147,13 @@ void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
             // instance), same monotone rule as every CPU compose site. The
             // upper bits are preserved -- the low byte is the material and the
             // rest is the mirror's packing headroom, not this kernel's to own.
-            assetStampWinner(CellIndex, Mat);
+            if ((Cell & 0xffu) == 0u)
+            {
+                OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+#if VXC_ASSET_OWNERSHIP
+                if (RenderOwned != 0u && Mat != 0u) OwnedWinnerMask[CellIndex] = 1u; // lint-shader-ub: allow UNGUARDED_WRITE - same checked brick/cell index as OutCells; mask has identical element count
+#endif
+            }
         }
     }
 }
@@ -325,6 +319,12 @@ void AssetStampCoarseMain(uint3 Tid : SV_DispatchThreadID)
         const uint Cell = OutCells[CellIndex];
         // AIR ONLY -- same monotone rule, same upper-bit preservation, as the
         // level-0 kernel above.
-        assetStampWinner(CellIndex, Mat);
+        if ((Cell & 0xffu) == 0u)
+        {
+            OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+#if VXC_ASSET_OWNERSHIP
+                if (RenderOwned != 0u && Mat != 0u) OwnedWinnerMask[CellIndex] = 1u; // lint-shader-ub: allow UNGUARDED_WRITE - same checked brick/cell index as OutCells; mask has identical element count
+#endif
+        }
     }
 }

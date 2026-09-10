@@ -747,6 +747,12 @@ def test_bake_writes_only_the_interior():
     assert r.elevation_m.shape == (f, f)
     assert r.accumulation_m2.shape == (f, f)
     assert r.flow.shape == (f, f) and r.flow.dtype == np.uint8
+    assert r.placement_water_mask_packed.shape == (f, f // 8)
+    water_mask = np.unpackbits(r.placement_water_mask_packed, axis=1, bitorder="little").astype(bool)
+    expected_water = (r.elevation_m <= 0) | (r.bathy_depth >= 0)
+    if r.water_surface_m is not None:
+        expected_water |= np.isfinite(r.water_surface_m)
+    np.testing.assert_array_equal(water_mask, expected_water)
     assert set(r.cpu_seconds) == set(pipeline.STAGE_ORDER) | set(
         pipeline.PRODUCT_STAGE_ORDER
     )

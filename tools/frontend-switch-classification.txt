@@ -515,6 +515,37 @@ VoxelObjectsNetGateFile
 # Configuration: selects an isolated local persistent player credential profile.
 VoxelPlayerProfile
 
+# Temperate ecology: input paths, tuning and diagnostic arms. None starts a fixture.
+VoxelAppearanceForestCount
+VoxelAppearanceForestCpuTrace
+VoxelAppearanceForestExit
+VoxelAppearanceForestHidden
+VoxelAppearanceForestOutput
+VoxelAppearanceForestSequence
+VoxelAppearancePublishedSeed
+VoxelAppearancePublishedSpecies
+VoxelAssetAppearanceDir
+VoxelAssetScatterOff
+VoxelDetailLodColorTolerance
+VoxelDetailLodMinSaving
+VoxelDetailMeshCache
+VoxelDetailMeshCachePreview
+VoxelDetailMeshLOD
+VoxelDetailSizeCull
+VoxelEcologyConfig
+VoxelEcologyDecisionTrace
+VoxelEcologyForestLayout
+VoxelEcologyRouteDiagnoseStalls
+VoxelEcologyRouteOutput
+VoxelEcologyRouteProfile
+VoxelEcologyRouteSha256
+VoxelEcologyWorldOutput
+VoxelMarchDispatchIdentity
+VoxelNoEcologyResolveCache
+VoxelPredictiveAssetResolve
+VoxelRayQuery
+VoxelWalkWaitForEcology
+
 ## SUBSTRING-MATCHED -- ACKNOWLEDGED
 #
 # Everything below is a switch whose NAME contains one of rule 5's substrings,
@@ -642,3 +673,8 @@ VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a
 VoxelSessionVerify = Fixture: verifies encrypted player restart or selected-seed world travel and exits through its harness.
 VoxelSessionVerifyDir = Fixture output directory and stop marker for the session process harness.
 VoxelSessionVerifyPlayers = Fixture expected encrypted admission count; session harness input.
+
+# Automation inputs must not independently suppress interactive menus.
+VoxelAppearanceFellingTest = ACCIDENTAL ('Test'): optional felling branch inside an explicitly invoked automation test; does not start the test.
+VoxelAppearanceTestVxa = ACCIDENTAL ('Test'): input VXA path for an explicitly invoked automation test; does not start the test.
+VoxelEcologyTestPreview = ACCIDENTAL ('Test'): preview output path for an explicitly invoked automation test; does not start the test.

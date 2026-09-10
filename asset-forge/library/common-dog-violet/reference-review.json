@@ -1,0 +1,123 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/common-dog-violet",
+  "viewed_photos": [
+    "Philip Precey flower detail - Wildlife Trusts",
+    "Mike L Grant 2000 mat/leaves - RHS WSY0041315_11077"
+  ],
+  "findings": "Initial purple coverage was excessive. Reduced flowering-shoot density, regenerated and reviewed current pilots and sheet. Low green mats retain exposed foliage between upright purple marks. Correct 7-12 cm habit; 15-20 mm corollas and heart-shaped leaves are unresolved at 25 mm. Actually compared reference photographs, current seeds 1, 4, 7 and all 36 seeded variants. Accepted as coarse colony-scale spring geometry, not close-up botanical microdetail. Variant endorsement remains a user decision.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "9b9118861e16b49fd842b8b61fc6843a3fdf8a853061fbb9ed0aa2bada5e8a5b",
+  "sheet_hash": "945d76f2c8e8edc24d91451ad43d8d159bdbbcd48e6aa40950151366d5f87420",
+  "reviewed_at": 1788850127.1542172,
+  "pilot_hashes": {
+    "1": "56ac494ca9a66a4b2caa4d02ba8ad696b8e38aba88f06cdf2fc5233a11384131",
+    "4": "c2894dd849ff77b95b06c996009504eb8dafbf8e4f1366eb18de9d406980ffce",
+    "7": "cdbe98f0d6c6493a83b44e0923face386cbfb2806b216f72dc7e51eeeba4c773"
+  },
+  "profile": "common-dog-violet",
+  "review_date": "2026-09-08",
+  "additional_sources": [
+    "https://www.rhs.org.uk/plants/19012/viola-riviniana/details"
+  ],
+  "reference_catalog_photos": [
+    {
+      "url": "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-01/Common_Dog_Violet3%2C_Derbyshire%2C_Philip_Precey.JPG?h=07f60c19&itok=Zf23bJWu",
+      "caption": "Spring flower detail",
+      "credit": "Philip Precey",
+      "license": "See original source",
+      "image_id": "/sites/default/files/styles/spotlight_default/public/2018-01/Common_Dog_Violet3%2C_Derbyshire%2C_Philip_Precey.JPG?h=07f60c19&itok=Zf23bJWu"
+    },
+    {
+      "url": "https://apps.rhs.org.uk/plantselectorimages/detail/WSY0041315_11077.jpg",
+      "caption": "Rhizomatous mat, flowers and leaves",
+      "credit": "Mike L. Grant 2000 / RHS",
+      "license": "Reference only; remains remotely hosted"
+    }
+  ],
+  "taxon": "Viola riviniana",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "945d76f2c8e8edc24d91451ad43d8d159bdbbcd48e6aa40950151366d5f87420"
+  }
+}

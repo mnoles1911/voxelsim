@@ -1,0 +1,1283 @@
+{
+  "schema_version": 1,
+  "species": "primrose",
+  "baseline_spec": {
+    "name": "primrose",
+    "notes": "Spring understory source for Primula vulgaris; architecture: rosette. Metric geometry at 25 mm cubic voxels. Species baseline and generator define the source; numbered seeds generate variants. User endorsement remains separate from source review.",
+    "kind": "flower",
+    "height_m": 0.24,
+    "resolution_cm": "2.5",
+    "trunk": {
+      "radius_base_m": 0.3,
+      "taper": 0.5,
+      "clear_frac": 0.35,
+      "lean_deg": 3.0,
+      "lean_dir_deg": 0.0,
+      "wander": 0.15,
+      "buttress": 0.0,
+      "lobes": 0,
+      "lobe_depth": 0.18
+    },
+    "crown": {
+      "shape": "sphere",
+      "allometry": "off",
+      "radius_m": 3.5,
+      "height_frac": 0.65,
+      "center_frac": 0.66,
+      "shell_upper": 0.55,
+      "shell_lower": 0.4,
+      "squash": 1.0,
+      "lean_deg": 0.0,
+      "lean_dir_deg": 0.0,
+      "asymmetry": 0.25,
+      "offset": 0.2,
+      "points": 900
+    },
+    "growth": {
+      "model": "colonize",
+      "step_m": 0.35,
+      "influence_m": 3.0,
+      "kill_m": 0.7,
+      "gravity": -0.12,
+      "phototropism": 0.1,
+      "inertia": 0.45,
+      "jitter": 0.05,
+      "max_iter": 260,
+      "shade": 0.4,
+      "tip_radius_m": 0.045,
+      "radius_exp": 2.3
+    },
+    "whorl": {
+      "count": 11,
+      "branches": 5,
+      "stagger": 0.42,
+      "rise": 0.28,
+      "droop": 0.55,
+      "sub": 2,
+      "sub_angle": 38.0,
+      "irregular": 0.22,
+      "leader": 0.03
+    },
+    "frond": {
+      "count": 14,
+      "length_m": 2.6,
+      "width_m": 0.55,
+      "rise": 0.85,
+      "droop": 1.15,
+      "dead": 0.15,
+      "irregular": 0.25
+    },
+    "roots": {
+      "count": 0,
+      "length_m": 1.8,
+      "rise": 0.35,
+      "thickness": 0.55,
+      "irregular": 0.3
+    },
+    "strand": {
+      "count": 0,
+      "length_m": 2.5,
+      "from_frac": 0.35,
+      "outer": 0.7,
+      "drift": 0.16,
+      "spread": 0.18
+    },
+    "foliage": {
+      "enabled": true,
+      "min_order": 2,
+      "clump_radius_m": 0.65,
+      "density": 0.6,
+      "rough": 0.55,
+      "habit": "spiral",
+      "stretch": 2.2,
+      "clustering": 0.45,
+      "compensate": 0.6,
+      "top_bias": 0.35,
+      "coverage": 0.8,
+      "separation": 1.7,
+      "clump_jitter": 0.35,
+      "droop_m": 0.15,
+      "squash": 0.8
+    },
+    "variation": {
+      "amount": 1.0,
+      "height": 0.26,
+      "crown_radius": 0.3,
+      "trunk_radius": 0.3,
+      "shape": 0.18,
+      "proportion": 0.2,
+      "lopsided": 0.45,
+      "foliage": 0.35,
+      "lean_deg": 10.0,
+      "droop": 0.4,
+      "density": 0.25,
+      "rotate": true
+    },
+    "biomes": {
+      "ocean": 0.0,
+      "beach": 0.0,
+      "grassland": 0.4,
+      "temperate_forest": 0.9,
+      "rainforest": 0.0,
+      "desert": 0.0,
+      "savanna": 0.0,
+      "taiga": 0.0,
+      "tundra_alpine": 0.0,
+      "bare_rock": 0.0
+    },
+    "placement": {
+      "abundance": 0.55,
+      "spacing_m": 0.7,
+      "cluster": 0.9,
+      "elev_min_m": 0.0,
+      "elev_max_m": 2000.0,
+      "slope_max_pct": 45.0,
+      "slope_min_pct": 0.0,
+      "water_max_m": 0.0
+    },
+    "rock": {
+      "size_m": 1.6,
+      "lumps": 5,
+      "spread": 0.42,
+      "flatten": 0.72,
+      "elongate": 1.25,
+      "angular": 0.45,
+      "facets": 4,
+      "rough": 0.4,
+      "erode": 0.25,
+      "cavernous": 0.0,
+      "bedding": 0.0,
+      "bed_thickness_m": 0.5,
+      "bed_dip_deg": 0.0,
+      "cross_beds": 0,
+      "caprock": 0.0,
+      "cap_frac": 0.62,
+      "notch": 0.0,
+      "notch_z_m": 0.25,
+      "notch_spread_m": 0.18,
+      "aspect": 0.0,
+      "joint_sets": 0,
+      "joint_scatter": 0.12,
+      "joint_dip_deg": 0.0,
+      "block_size_m": 1.2,
+      "block_relief_m": 0.0,
+      "joint_taper": 0.0,
+      "corestone": 0.0,
+      "settle_m": 0.0,
+      "columns": 0,
+      "column_gap_m": 0.08,
+      "column_stagger": 0.18,
+      "exfoliate": 0.0,
+      "shell_m": 0.25,
+      "veins": 0,
+      "vein_width_m": 0.1,
+      "vein_hardness": 3.0,
+      "rind": 0.0,
+      "rind_m": 0.08,
+      "clasts": 0,
+      "clast_size_m": 0.25,
+      "clast_hardness": 2.5,
+      "flutes": 0.0,
+      "flute_width_m": 0.25,
+      "pans": 0.0,
+      "pan_depth_m": 0.2,
+      "arch": 0.0,
+      "bury": 0.22,
+      "rubble": 0.15
+    },
+    "materials": {
+      "rock": "rock",
+      "stem": "leaf_broadleaf",
+      "head": "skin_yellow",
+      "fish_back": "skin_olive",
+      "fish_flank": "skin_silver",
+      "fish_belly": "skin_pale",
+      "fish_fin": "skin_olive",
+      "fish_pattern": "skin_dark",
+      "fish_eye": "skin_dark",
+      "fish_patch": "skin_pale",
+      "bird_back": "skin_brown",
+      "bird_belly": "plume_white",
+      "bird_head": "skin_brown",
+      "bird_wing": "skin_brown",
+      "bird_mark": "skin_dark",
+      "bird_head_mark": "skin_dark",
+      "bird_bill": "beak_horn",
+      "bird_eye": "skin_dark",
+      "bird_alt_back": "same",
+      "bird_alt_belly": "same",
+      "bird_alt_head": "same",
+      "bird_alt_wing": "same",
+      "bird_alt_mark": "same",
+      "bird_alt_head_mark": "same",
+      "bird_alt_bill": "same",
+      "quad_back": "skin_brown",
+      "quad_belly": "skin_pale",
+      "quad_head": "skin_brown",
+      "quad_leg": "skin_brown",
+      "quad_tail": "skin_brown",
+      "quad_mark": "skin_dark",
+      "quad_horn": "beak_horn",
+      "quad_eye": "skin_dark",
+      "bark": "bark",
+      "core": "heartwood",
+      "leaf": "leaf_broadleaf",
+      "hull": "heartwood",
+      "trim": "bark",
+      "strake": "deadwood",
+      "frame": "beak_horn"
+    },
+    "tuft": {
+      "stems": 14,
+      "spread_m": 0.1,
+      "splay_deg": 52.0,
+      "arc": 0.78,
+      "width_m": 0.07,
+      "taper": 0.5,
+      "wander": 0.35,
+      "length_var": 0.35,
+      "base_m": 0.1,
+      "head": "bloom",
+      "head_m": 0.09,
+      "head_frac": 0.22,
+      "head_share": 0.4
+    },
+    "fish": {
+      "length_m": 0.28,
+      "depth_ratio": 0.24,
+      "width_ratio": 0.58,
+      "depth_at": 0.36,
+      "fullness": 3.0,
+      "snout": 0.3,
+      "peduncle": 0.3,
+      "belly": 0.52,
+      "width_follow": 1.15,
+      "section": 2.0,
+      "head_frac": 0.26,
+      "head_width": 0.0,
+      "caudal_plane": "vertical",
+      "caudal_upper": 0.0,
+      "caudal_shape": "forked",
+      "caudal_len": 0.2,
+      "caudal_span": 1.15,
+      "caudal_fork": 0.45,
+      "dorsal_shape": "triangular",
+      "dorsal_start": 0.38,
+      "dorsal_len": 0.26,
+      "dorsal_height": 0.38,
+      "dorsal2_height": 0.0,
+      "dorsal2_start": 0.62,
+      "dorsal2_len": 0.1,
+      "adipose": false,
+      "anal_height": 0.32,
+      "anal_len": 0.16,
+      "pectoral": 0.26,
+      "pectoral_aspect": 1.2,
+      "pelvic": 0.18,
+      "barbels": 0,
+      "barbel_len": 0.1,
+      "fin_thick": 1,
+      "section_tail": 2.0,
+      "fin_min_vox": 2.0,
+      "blowhole": 0.0,
+      "eye_patch": 0.0,
+      "eye": 1.0,
+      "back_frac": 0.34,
+      "belly_frac": 0.26,
+      "field_curve": "flat",
+      "curve_at": 0.55,
+      "curve_amount": 0.0,
+      "sex": "unsexed",
+      "sex_length": 1.0,
+      "sex_dorsal": 1.0,
+      "sex_pectoral": 1.0,
+      "pattern": "none",
+      "claspers": 0.0,
+      "pattern_count": 6,
+      "pattern_width": 0.22,
+      "pattern_pos": 0.5,
+      "pattern_scale": 0.2,
+      "pattern_strength": 0.5
+    },
+    "detail": {
+      "entity_class": "detail",
+      "despawn_m": 45.0,
+      "despawn_delay_s": 4.0,
+      "school_min": 1,
+      "school_max": 8,
+      "school_radius_m": 2.5,
+      "water": "any",
+      "depth_min_m": 0.3,
+      "depth_max_m": 6.0,
+      "min_water_depth_m": 0.5,
+      "per_100m2": 3.0
+    },
+    "bird": {
+      "length_m": 0.24,
+      "bill_frac": 0.07,
+      "head_frac": 0.13,
+      "neck_frac": 0.05,
+      "body_frac": 0.4,
+      "tail_frac": 0.35,
+      "posture_deg": 30.0,
+      "body_depth": 0.62,
+      "body_width": 0.82,
+      "chest_at": 0.32,
+      "breast": 0.66,
+      "rump": 0.42,
+      "fullness": 3.2,
+      "belly": 0.52,
+      "section": 2.1,
+      "neck_thick": 0.45,
+      "neck_up_deg": 30.0,
+      "head_size": 1.0,
+      "crest": 0.0,
+      "bill_depth": 0.35,
+      "bill_curve": 0.0,
+      "bill_hook": 0.0,
+      "bill_gape": 0.15,
+      "tail_shape": "square",
+      "tail_width": 0.42,
+      "tail_fork": 0.3,
+      "tail_droop": 0.55,
+      "tail_thick": 1,
+      "pose": "perched",
+      "wing_shape": "elliptical",
+      "wing_span": 1.7,
+      "wing_aspect": 6.0,
+      "wing_sweep": 0.25,
+      "wing_dihedral": 0.1,
+      "wing_slots": 0,
+      "wing_thick": 1,
+      "wing_fold": 0.45,
+      "leg_len": 0.1,
+      "leg_thick": 1.0,
+      "eye": 1.0,
+      "upperparts": 0.5,
+      "head_mark": "none",
+      "wing_mark": "none",
+      "body_mark": "none",
+      "mark_count": 5,
+      "mark_width": 0.28,
+      "mark_strength": 0.35,
+      "sex": "unsexed",
+      "sex_length": 1.0,
+      "sex_tail": 1.0,
+      "sex_plumage": "same",
+      "sex_alt_head_mark": "same",
+      "sex_alt_wing_mark": "same",
+      "sex_alt_body_mark": "same"
+    },
+    "flock": {
+      "entity_class": "detail",
+      "despawn_m": 90.0,
+      "despawn_delay_s": 6.0,
+      "size_min": 1,
+      "size_max": 4,
+      "spread_m": 12.0,
+      "perch": "canopy",
+      "height_min_m": 2.0,
+      "height_max_m": 25.0,
+      "flight_share": 0.35,
+      "per_hectare": 4.0
+    },
+    "quad": {
+      "length_m": 1.2,
+      "stance": "standing",
+      "shoulder_h": 0.62,
+      "hip_h": 1.0,
+      "trunk_frac": 0.62,
+      "neck_frac": 0.12,
+      "head_frac": 0.16,
+      "muzzle_frac": 0.1,
+      "neck_deg": 30.0,
+      "head_deg": 0.0,
+      "depth": 0.42,
+      "width": 0.62,
+      "chest": 1.0,
+      "waist": 0.94,
+      "rump": 0.92,
+      "belly": 0.52,
+      "section": 2.2,
+      "hump": 0.0,
+      "hump_at": 0.16,
+      "neck_thick": 0.52,
+      "neck_taper": 0.72,
+      "mane": 0.0,
+      "dewlap": 0.0,
+      "head_size": 1.0,
+      "muzzle_depth": 0.62,
+      "muzzle_width": 0.58,
+      "muzzle_drop": 0.0,
+      "jaw": 0.35,
+      "eye": 1,
+      "ear_shape": "pointed",
+      "ear_len": 0.09,
+      "ear_width": 0.45,
+      "ear_deg": 62.0,
+      "ear_back": 0.25,
+      "horn_shape": "none",
+      "horn_len": 0.2,
+      "horn_thick": 0.16,
+      "horn_spread": 0.55,
+      "horn_curl": 0.35,
+      "horn_tines": 3,
+      "tail_len": 0.35,
+      "tail_thick": 0.2,
+      "tail_taper": 0.35,
+      "tail_deg": -35.0,
+      "tail_arc": 0.0,
+      "tail_tuft": 0.0,
+      "leg_thick": 0.16,
+      "fore_bend": 0.25,
+      "hock": 0.35,
+      "foot": 1.0,
+      "fore_reach": 1.0,
+      "under": 0.3,
+      "cape": 0.0,
+      "stocking": 0.0,
+      "tail_tip": 0.0,
+      "mark": "none",
+      "mark_count": 12,
+      "mark_width": 0.32,
+      "mark_strength": 1.0,
+      "sex": "unsexed",
+      "sex_length": 1.0,
+      "sex_horn": 1.0,
+      "sex_mane": 1.0
+    },
+    "herd": {
+      "entity_class": "detail",
+      "despawn_m": 220.0,
+      "despawn_delay_s": 20.0,
+      "size_min": 1,
+      "size_max": 1,
+      "spread_m": 30.0,
+      "cover": "any",
+      "per_hectare": 0.8,
+      "flee_m": 60.0
+    },
+    "artifact": {
+      "form": "hull",
+      "length_m": 4.0,
+      "beam_m": 0.85,
+      "depth_m": 0.35,
+      "shell_vox": 2,
+      "asym_vox": 0.8,
+      "strake_share": 0.25,
+      "sheer": 0.35,
+      "rocker": 0.14,
+      "fullness": 2.4,
+      "entry": 0.62,
+      "bilge": 2.6,
+      "gunwale_m": 0.06,
+      "gunwale_vox": 1,
+      "thwarts": 2,
+      "thwart_w_m": 0.1,
+      "thwart_t_m": 0.05,
+      "deck_frac": 0.07,
+      "sweep": 0.85,
+      "taper": 0.3,
+      "panel_vox": 2,
+      "billow_m": 0.16,
+      "droop_m": 0.3,
+      "spar_r_m": 0.045,
+      "keel_r_m": 0.04,
+      "keel_m": 0.45,
+      "crossbar_at": 0.42,
+      "frame_drop_m": 1.15,
+      "frame_at": 0.34,
+      "frame_base_m": 0.95,
+      "frame_r_m": 0.03,
+      "seat": true,
+      "seat_len_m": 0.8
+    },
+    "plant_recipe": {
+      "generator": "temperate-understory-v1",
+      "profile": "primrose",
+      "size": "mixed",
+      "form": "mixed"
+    },
+    "curation": {
+      "status": "draft",
+      "seeds": [
+        1
+      ],
+      "notes": "Reference-reviewed spring source; endorse variants individually in Forge."
+    }
+  },
+  "baseline_spec_hash": "353f0b70bb9125f0",
+  "reference_variant_id": "primrose-0007",
+  "reference_seed": 7,
+  "generator": "temperate-understory-v1",
+  "generator_digest": "d80e32c5f3293a0482c4c35a3d9d731584683a0dcbbca38ce806c6e5cdc3514a",
+  "generator_approved": true,
+  "approved_generator_digest": "d80e32c5f3293a0482c4c35a3d9d731584683a0dcbbca38ce806c6e5cdc3514a",
+  "review_status": "Astra reference-reviewed source",
+  "review_date": "2026-09-08",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/primula-vulgaris/"
+  ],
+  "reference_notes": "Compared the wild-form photograph by David J. Stang, then all three refined sizes and the current 36-sheet. Broad basal rosettes and individual flower stalks remain legible across compact, spreading and leaning clumps. Purple double-flower cultivars were excluded from species/color judgment. Coarse opaque 25 mm petals and the existing stronger yellow palette are recorded stylization limits; leaf wrinkling and pale cream species coloring await the separate appearance pass.",
+  "art_baseline": {
+    "season": "spring",
+    "voxel_mm": 25
+  },
+  "semantics": "species baseline + generator revision + numbered seed = variant",
+  "reference_selection": "Authoritative source design; user endorsement is a separate choice",
+  "variant_inventory": "out/forge-candidates; exact bytes move to species library upon endorsement",
+  "variants": [
+    {
+      "id": "primrose-0001",
+      "seed": 1,
+      "artifact_hash": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f"
+    },
+    {
+      "id": "primrose-0002",
+      "seed": 2,
+      "artifact_hash": "9b35b3bfce975dc6dd1d734800873be185535ddb4e49b9f346480e38add7e7b8"
+    },
+    {
+      "id": "primrose-0003",
+      "seed": 3,
+      "artifact_hash": "145f03f75b2e3c1c2801d1123896e2ca9d1a919f78a696540f3c265a5c9ffa45"
+    },
+    {
+      "id": "primrose-0004",
+      "seed": 4,
+      "artifact_hash": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c"
+    },
+    {
+      "id": "primrose-0005",
+      "seed": 5,
+      "artifact_hash": "3d9c780d28fc97cd08bdd40082bdbe4c833d77f50de21a36e0b036caa659674e"
+    },
+    {
+      "id": "primrose-0006",
+      "seed": 6,
+      "artifact_hash": "fa6d7bb8f50e9699bf7aa031f01053eaccbc8bf35a41b0eb9f434e18f1b5cb1b"
+    },
+    {
+      "id": "primrose-0007",
+      "seed": 7,
+      "artifact_hash": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+    },
+    {
+      "id": "primrose-0008",
+      "seed": 8,
+      "artifact_hash": "42e9a9955c767aa5250ef2ae73aa7526121f3724e4dce234b1a2fb95f44a59f8"
+    },
+    {
+      "id": "primrose-0009",
+      "seed": 9,
+      "artifact_hash": "9bef79d1650c6e11b0d796c2b7d78259f1b0c5157963707c8cafacea38ccabcc"
+    },
+    {
+      "id": "primrose-0010",
+      "seed": 10,
+      "artifact_hash": "b8ba02177b0de0fc336dbf0b3137d1ed8f9bbd731672a86b72cb60762573c1dc"
+    },
+    {
+      "id": "primrose-0011",
+      "seed": 11,
+      "artifact_hash": "d81483223172f5d3bd6d26a1b7533c7043bbc4cba11f7218ef6ba01796db3224"
+    },
+    {
+      "id": "primrose-0012",
+      "seed": 12,
+      "artifact_hash": "fec8332932acee013bb8804d0b36051747f2585a6810d822961a33cb16ccbe20"
+    },
+    {
+      "id": "primrose-0013",
+      "seed": 13,
+      "artifact_hash": "d1d14ef016e5348da2c5cfd553f100cd65ae8c36969ad0ede70c29daa56d326a"
+    },
+    {
+      "id": "primrose-0014",
+      "seed": 14,
+      "artifact_hash": "62f067a0cb0773d98a3d9058d5de6098025cb86b5dc9f277dcab75f49ca8af1c"
+    },
+    {
+      "id": "primrose-0015",
+      "seed": 15,
+      "artifact_hash": "8b16a6a9f6154b4edfdb133f627bf569deaa79cf8305bd69d99411517bed37f3"
+    },
+    {
+      "id": "primrose-0016",
+      "seed": 16,
+      "artifact_hash": "d0bbecc4557e51555eb14327fdc105c4f2e01d5e7c82153e2c56e479785a2d60"
+    },
+    {
+      "id": "primrose-0017",
+      "seed": 17,
+      "artifact_hash": "b32acd911fb8768c4fe37e3b00be33f3006e907471aa4acf756241653efbdfaa"
+    },
+    {
+      "id": "primrose-0018",
+      "seed": 18,
+      "artifact_hash": "8284ab7a2ec8e12850a0a810122e0606150c22015539834c939285bd69e175c5"
+    },
+    {
+      "id": "primrose-0019",
+      "seed": 19,
+      "artifact_hash": "8f3c0d35bbca9519932cecee7f1b0cc77cfd5c8912c42371a9c704fff53a2340"
+    },
+    {
+      "id": "primrose-0020",
+      "seed": 20,
+      "artifact_hash": "86039f487b5a72edb23036efedb957dc5170fe29c6c51831471ca99bc41ea2f3"
+    },
+    {
+      "id": "primrose-0021",
+      "seed": 21,
+      "artifact_hash": "5992aecdd332ba5893909f1eecdcba159583389029d48945dad4398a596fa34c"
+    },
+    {
+      "id": "primrose-0022",
+      "seed": 22,
+      "artifact_hash": "12e528884b9328a3e2bdcedb63d9e64add80ea38b5e36067c83b5a9bbf6f535d"
+    },
+    {
+      "id": "primrose-0023",
+      "seed": 23,
+      "artifact_hash": "40bfda0bac70ee7277d59f0c5419f0ba9f0a0ee7566232d892d799f4250d384b"
+    },
+    {
+      "id": "primrose-0024",
+      "seed": 24,
+      "artifact_hash": "5bcdb49ac14fc72fde1abfb8066fe33fa715e7339c4ac87e2065079cccabda19"
+    },
+    {
+      "id": "primrose-0025",
+      "seed": 25,
+      "artifact_hash": "e8fc018f5dbaec9a84a1ec294b80b957e4df8da8f6d4c3728bfb218e72952de0"
+    },
+    {
+      "id": "primrose-0026",
+      "seed": 26,
+      "artifact_hash": "37fe2293af181af4ab37b252328a007f1a3d5928dfaada8940077396b4b1bf53"
+    },
+    {
+      "id": "primrose-0027",
+      "seed": 27,
+      "artifact_hash": "c23eeac62479d27a9e07141ba2e6bca1f7abe76588040a2d206679d41cb52a59"
+    },
+    {
+      "id": "primrose-0028",
+      "seed": 28,
+      "artifact_hash": "5cd3b23d31cfd2c366c33c876bb07e64b97220c959ed47e50d3986a64380906a"
+    },
+    {
+      "id": "primrose-0029",
+      "seed": 29,
+      "artifact_hash": "c93a6a4c2512f223709723cb34ed37f16da10cf5d97db2d05fb2c57fcceb75b5"
+    },
+    {
+      "id": "primrose-0030",
+      "seed": 30,
+      "artifact_hash": "8a3e49f95c7770b07dcea0602560a320632f84ef2f993322c09d766c2a6c1a71"
+    },
+    {
+      "id": "primrose-0031",
+      "seed": 31,
+      "artifact_hash": "2f911ce500f46ebc8321d31b911cad73c0b95efe50bc0474ef9a8d1ae7728c58"
+    },
+    {
+      "id": "primrose-0032",
+      "seed": 32,
+      "artifact_hash": "1ce731132531fd8963040f810606b37c6e50ea1ef8885220423c3f43d2569850"
+    },
+    {
+      "id": "primrose-0033",
+      "seed": 33,
+      "artifact_hash": "b3f1771d72d0b3e278d20c13767c465cd81bb51946f65040f58cf2df13e8382f"
+    },
+    {
+      "id": "primrose-0034",
+      "seed": 34,
+      "artifact_hash": "fe49c4f9912ffcd9a73842350a8f7b741de4906aa3d94cd92fb3ea004450e57f"
+    },
+    {
+      "id": "primrose-0035",
+      "seed": 35,
+      "artifact_hash": "d70a0336a58377ed0724b36e3cbc7b37c80b674e7f024d92b35108ec3c1b8409"
+    },
+    {
+      "id": "primrose-0036",
+      "seed": 36,
+      "artifact_hash": "8a26b1ecda9c47939ab02e4effc5ff574b70108231d00136380631d361ef8062"
+    }
+  ],
+  "identity_revalidations": [
+    {
+      "previous_digest": "747e396e8e0321902c68f64554f6ccae9527e8e8db197ec8993d7c4b8472ffa8",
+      "new_digest": "b48af3a6daeb5270b8282c4edd6d67b5ff9bf2d11c5bd2d5ea37b940cf02147e",
+      "timestamp": 1788840451.938254,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "primrose-0001",
+          "seed": 1,
+          "hash": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f"
+        },
+        {
+          "id": "primrose-0002",
+          "seed": 2,
+          "hash": "9b35b3bfce975dc6dd1d734800873be185535ddb4e49b9f346480e38add7e7b8"
+        },
+        {
+          "id": "primrose-0003",
+          "seed": 3,
+          "hash": "145f03f75b2e3c1c2801d1123896e2ca9d1a919f78a696540f3c265a5c9ffa45"
+        },
+        {
+          "id": "primrose-0004",
+          "seed": 4,
+          "hash": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c"
+        },
+        {
+          "id": "primrose-0005",
+          "seed": 5,
+          "hash": "3d9c780d28fc97cd08bdd40082bdbe4c833d77f50de21a36e0b036caa659674e"
+        },
+        {
+          "id": "primrose-0006",
+          "seed": 6,
+          "hash": "fa6d7bb8f50e9699bf7aa031f01053eaccbc8bf35a41b0eb9f434e18f1b5cb1b"
+        },
+        {
+          "id": "primrose-0007",
+          "seed": 7,
+          "hash": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+        },
+        {
+          "id": "primrose-0008",
+          "seed": 8,
+          "hash": "42e9a9955c767aa5250ef2ae73aa7526121f3724e4dce234b1a2fb95f44a59f8"
+        },
+        {
+          "id": "primrose-0009",
+          "seed": 9,
+          "hash": "9bef79d1650c6e11b0d796c2b7d78259f1b0c5157963707c8cafacea38ccabcc"
+        },
+        {
+          "id": "primrose-0010",
+          "seed": 10,
+          "hash": "b8ba02177b0de0fc336dbf0b3137d1ed8f9bbd731672a86b72cb60762573c1dc"
+        },
+        {
+          "id": "primrose-0011",
+          "seed": 11,
+          "hash": "d81483223172f5d3bd6d26a1b7533c7043bbc4cba11f7218ef6ba01796db3224"
+        },
+        {
+          "id": "primrose-0012",
+          "seed": 12,
+          "hash": "fec8332932acee013bb8804d0b36051747f2585a6810d822961a33cb16ccbe20"
+        },
+        {
+          "id": "primrose-0013",
+          "seed": 13,
+          "hash": "d1d14ef016e5348da2c5cfd553f100cd65ae8c36969ad0ede70c29daa56d326a"
+        },
+        {
+          "id": "primrose-0014",
+          "seed": 14,
+          "hash": "62f067a0cb0773d98a3d9058d5de6098025cb86b5dc9f277dcab75f49ca8af1c"
+        },
+        {
+          "id": "primrose-0015",
+          "seed": 15,
+          "hash": "8b16a6a9f6154b4edfdb133f627bf569deaa79cf8305bd69d99411517bed37f3"
+        },
+        {
+          "id": "primrose-0016",
+          "seed": 16,
+          "hash": "d0bbecc4557e51555eb14327fdc105c4f2e01d5e7c82153e2c56e479785a2d60"
+        },
+        {
+          "id": "primrose-0017",
+          "seed": 17,
+          "hash": "b32acd911fb8768c4fe37e3b00be33f3006e907471aa4acf756241653efbdfaa"
+        },
+        {
+          "id": "primrose-0018",
+          "seed": 18,
+          "hash": "8284ab7a2ec8e12850a0a810122e0606150c22015539834c939285bd69e175c5"
+        },
+        {
+          "id": "primrose-0019",
+          "seed": 19,
+          "hash": "8f3c0d35bbca9519932cecee7f1b0cc77cfd5c8912c42371a9c704fff53a2340"
+        },
+        {
+          "id": "primrose-0020",
+          "seed": 20,
+          "hash": "86039f487b5a72edb23036efedb957dc5170fe29c6c51831471ca99bc41ea2f3"
+        },
+        {
+          "id": "primrose-0021",
+          "seed": 21,
+          "hash": "5992aecdd332ba5893909f1eecdcba159583389029d48945dad4398a596fa34c"
+        },
+        {
+          "id": "primrose-0022",
+          "seed": 22,
+          "hash": "12e528884b9328a3e2bdcedb63d9e64add80ea38b5e36067c83b5a9bbf6f535d"
+        },
+        {
+          "id": "primrose-0023",
+          "seed": 23,
+          "hash": "40bfda0bac70ee7277d59f0c5419f0ba9f0a0ee7566232d892d799f4250d384b"
+        },
+        {
+          "id": "primrose-0024",
+          "seed": 24,
+          "hash": "5bcdb49ac14fc72fde1abfb8066fe33fa715e7339c4ac87e2065079cccabda19"
+        },
+        {
+          "id": "primrose-0025",
+          "seed": 25,
+          "hash": "e8fc018f5dbaec9a84a1ec294b80b957e4df8da8f6d4c3728bfb218e72952de0"
+        },
+        {
+          "id": "primrose-0026",
+          "seed": 26,
+          "hash": "37fe2293af181af4ab37b252328a007f1a3d5928dfaada8940077396b4b1bf53"
+        },
+        {
+          "id": "primrose-0027",
+          "seed": 27,
+          "hash": "c23eeac62479d27a9e07141ba2e6bca1f7abe76588040a2d206679d41cb52a59"
+        },
+        {
+          "id": "primrose-0028",
+          "seed": 28,
+          "hash": "5cd3b23d31cfd2c366c33c876bb07e64b97220c959ed47e50d3986a64380906a"
+        },
+        {
+          "id": "primrose-0029",
+          "seed": 29,
+          "hash": "c93a6a4c2512f223709723cb34ed37f16da10cf5d97db2d05fb2c57fcceb75b5"
+        },
+        {
+          "id": "primrose-0030",
+          "seed": 30,
+          "hash": "8a3e49f95c7770b07dcea0602560a320632f84ef2f993322c09d766c2a6c1a71"
+        },
+        {
+          "id": "primrose-0031",
+          "seed": 31,
+          "hash": "2f911ce500f46ebc8321d31b911cad73c0b95efe50bc0474ef9a8d1ae7728c58"
+        },
+        {
+          "id": "primrose-0032",
+          "seed": 32,
+          "hash": "1ce731132531fd8963040f810606b37c6e50ea1ef8885220423c3f43d2569850"
+        },
+        {
+          "id": "primrose-0033",
+          "seed": 33,
+          "hash": "b3f1771d72d0b3e278d20c13767c465cd81bb51946f65040f58cf2df13e8382f"
+        },
+        {
+          "id": "primrose-0034",
+          "seed": 34,
+          "hash": "fe49c4f9912ffcd9a73842350a8f7b741de4906aa3d94cd92fb3ea004450e57f"
+        },
+        {
+          "id": "primrose-0035",
+          "seed": 35,
+          "hash": "d70a0336a58377ed0724b36e3cbc7b37c80b674e7f024d92b35108ec3c1b8409"
+        },
+        {
+          "id": "primrose-0036",
+          "seed": 36,
+          "hash": "8a26b1ecda9c47939ab02e4effc5ff574b70108231d00136380631d361ef8062"
+        }
+      ]
+    },
+    {
+      "previous_digest": "b48af3a6daeb5270b8282c4edd6d67b5ff9bf2d11c5bd2d5ea37b940cf02147e",
+      "new_digest": "7eff9292a2dd6ed56a18cc17f9c74ed712f70f4ca345d0870eb559235c12f998",
+      "timestamp": 1788840906.7953072,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "primrose-0001",
+          "seed": 1,
+          "hash": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f"
+        },
+        {
+          "id": "primrose-0002",
+          "seed": 2,
+          "hash": "9b35b3bfce975dc6dd1d734800873be185535ddb4e49b9f346480e38add7e7b8"
+        },
+        {
+          "id": "primrose-0003",
+          "seed": 3,
+          "hash": "145f03f75b2e3c1c2801d1123896e2ca9d1a919f78a696540f3c265a5c9ffa45"
+        },
+        {
+          "id": "primrose-0004",
+          "seed": 4,
+          "hash": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c"
+        },
+        {
+          "id": "primrose-0005",
+          "seed": 5,
+          "hash": "3d9c780d28fc97cd08bdd40082bdbe4c833d77f50de21a36e0b036caa659674e"
+        },
+        {
+          "id": "primrose-0006",
+          "seed": 6,
+          "hash": "fa6d7bb8f50e9699bf7aa031f01053eaccbc8bf35a41b0eb9f434e18f1b5cb1b"
+        },
+        {
+          "id": "primrose-0007",
+          "seed": 7,
+          "hash": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+        },
+        {
+          "id": "primrose-0008",
+          "seed": 8,
+          "hash": "42e9a9955c767aa5250ef2ae73aa7526121f3724e4dce234b1a2fb95f44a59f8"
+        },
+        {
+          "id": "primrose-0009",
+          "seed": 9,
+          "hash": "9bef79d1650c6e11b0d796c2b7d78259f1b0c5157963707c8cafacea38ccabcc"
+        },
+        {
+          "id": "primrose-0010",
+          "seed": 10,
+          "hash": "b8ba02177b0de0fc336dbf0b3137d1ed8f9bbd731672a86b72cb60762573c1dc"
+        },
+        {
+          "id": "primrose-0011",
+          "seed": 11,
+          "hash": "d81483223172f5d3bd6d26a1b7533c7043bbc4cba11f7218ef6ba01796db3224"
+        },
+        {
+          "id": "primrose-0012",
+          "seed": 12,
+          "hash": "fec8332932acee013bb8804d0b36051747f2585a6810d822961a33cb16ccbe20"
+        },
+        {
+          "id": "primrose-0013",
+          "seed": 13,
+          "hash": "d1d14ef016e5348da2c5cfd553f100cd65ae8c36969ad0ede70c29daa56d326a"
+        },
+        {
+          "id": "primrose-0014",
+          "seed": 14,
+          "hash": "62f067a0cb0773d98a3d9058d5de6098025cb86b5dc9f277dcab75f49ca8af1c"
+        },
+        {
+          "id": "primrose-0015",
+          "seed": 15,
+          "hash": "8b16a6a9f6154b4edfdb133f627bf569deaa79cf8305bd69d99411517bed37f3"
+        },
+        {
+          "id": "primrose-0016",
+          "seed": 16,
+          "hash": "d0bbecc4557e51555eb14327fdc105c4f2e01d5e7c82153e2c56e479785a2d60"
+        },
+        {
+          "id": "primrose-0017",
+          "seed": 17,
+          "hash": "b32acd911fb8768c4fe37e3b00be33f3006e907471aa4acf756241653efbdfaa"
+        },
+        {
+          "id": "primrose-0018",
+          "seed": 18,
+          "hash": "8284ab7a2ec8e12850a0a810122e0606150c22015539834c939285bd69e175c5"
+        },
+        {
+          "id": "primrose-0019",
+          "seed": 19,
+          "hash": "8f3c0d35bbca9519932cecee7f1b0cc77cfd5c8912c42371a9c704fff53a2340"
+        },
+        {
+          "id": "primrose-0020",
+          "seed": 20,
+          "hash": "86039f487b5a72edb23036efedb957dc5170fe29c6c51831471ca99bc41ea2f3"
+        },
+        {
+          "id": "primrose-0021",
+          "seed": 21,
+          "hash": "5992aecdd332ba5893909f1eecdcba159583389029d48945dad4398a596fa34c"
+        },
+        {
+          "id": "primrose-0022",
+          "seed": 22,
+          "hash": "12e528884b9328a3e2bdcedb63d9e64add80ea38b5e36067c83b5a9bbf6f535d"
+        },
+        {
+          "id": "primrose-0023",
+          "seed": 23,
+          "hash": "40bfda0bac70ee7277d59f0c5419f0ba9f0a0ee7566232d892d799f4250d384b"
+        },
+        {
+          "id": "primrose-0024",
+          "seed": 24,
+          "hash": "5bcdb49ac14fc72fde1abfb8066fe33fa715e7339c4ac87e2065079cccabda19"
+        },
+        {
+          "id": "primrose-0025",
+          "seed": 25,
+          "hash": "e8fc018f5dbaec9a84a1ec294b80b957e4df8da8f6d4c3728bfb218e72952de0"
+        },
+        {
+          "id": "primrose-0026",
+          "seed": 26,
+          "hash": "37fe2293af181af4ab37b252328a007f1a3d5928dfaada8940077396b4b1bf53"
+        },
+        {
+          "id": "primrose-0027",
+          "seed": 27,
+          "hash": "c23eeac62479d27a9e07141ba2e6bca1f7abe76588040a2d206679d41cb52a59"
+        },
+        {
+          "id": "primrose-0028",
+          "seed": 28,
+          "hash": "5cd3b23d31cfd2c366c33c876bb07e64b97220c959ed47e50d3986a64380906a"
+        },
+        {
+          "id": "primrose-0029",
+          "seed": 29,
+          "hash": "c93a6a4c2512f223709723cb34ed37f16da10cf5d97db2d05fb2c57fcceb75b5"
+        },
+        {
+          "id": "primrose-0030",
+          "seed": 30,
+          "hash": "8a3e49f95c7770b07dcea0602560a320632f84ef2f993322c09d766c2a6c1a71"
+        },
+        {
+          "id": "primrose-0031",
+          "seed": 31,
+          "hash": "2f911ce500f46ebc8321d31b911cad73c0b95efe50bc0474ef9a8d1ae7728c58"
+        },
+        {
+          "id": "primrose-0032",
+          "seed": 32,
+          "hash": "1ce731132531fd8963040f810606b37c6e50ea1ef8885220423c3f43d2569850"
+        },
+        {
+          "id": "primrose-0033",
+          "seed": 33,
+          "hash": "b3f1771d72d0b3e278d20c13767c465cd81bb51946f65040f58cf2df13e8382f"
+        },
+        {
+          "id": "primrose-0034",
+          "seed": 34,
+          "hash": "fe49c4f9912ffcd9a73842350a8f7b741de4906aa3d94cd92fb3ea004450e57f"
+        },
+        {
+          "id": "primrose-0035",
+          "seed": 35,
+          "hash": "d70a0336a58377ed0724b36e3cbc7b37c80b674e7f024d92b35108ec3c1b8409"
+        },
+        {
+          "id": "primrose-0036",
+          "seed": 36,
+          "hash": "8a26b1ecda9c47939ab02e4effc5ff574b70108231d00136380631d361ef8062"
+        }
+      ]
+    },
+    {
+      "previous_digest": "7eff9292a2dd6ed56a18cc17f9c74ed712f70f4ca345d0870eb559235c12f998",
+      "new_digest": "d80e32c5f3293a0482c4c35a3d9d731584683a0dcbbca38ce806c6e5cdc3514a",
+      "timestamp": 1788843658.9740949,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "primrose-0001",
+          "seed": 1,
+          "hash": "70ff626f10e5869ee903e2ac77f4172d1ac101586eaacf11ae689662e9be289f"
+        },
+        {
+          "id": "primrose-0002",
+          "seed": 2,
+          "hash": "9b35b3bfce975dc6dd1d734800873be185535ddb4e49b9f346480e38add7e7b8"
+        },
+        {
+          "id": "primrose-0003",
+          "seed": 3,
+          "hash": "145f03f75b2e3c1c2801d1123896e2ca9d1a919f78a696540f3c265a5c9ffa45"
+        },
+        {
+          "id": "primrose-0004",
+          "seed": 4,
+          "hash": "48c9920114e854db29cdd058088fd4d563a20f3c0b0081980738459c0e6d0c5c"
+        },
+        {
+          "id": "primrose-0005",
+          "seed": 5,
+          "hash": "3d9c780d28fc97cd08bdd40082bdbe4c833d77f50de21a36e0b036caa659674e"
+        },
+        {
+          "id": "primrose-0006",
+          "seed": 6,
+          "hash": "fa6d7bb8f50e9699bf7aa031f01053eaccbc8bf35a41b0eb9f434e18f1b5cb1b"
+        },
+        {
+          "id": "primrose-0007",
+          "seed": 7,
+          "hash": "410f209251b15dcbb8e8122b722ab136239e3111fc9028a26454df985956b43f"
+        },
+        {
+          "id": "primrose-0008",
+          "seed": 8,
+          "hash": "42e9a9955c767aa5250ef2ae73aa7526121f3724e4dce234b1a2fb95f44a59f8"
+        },
+        {
+          "id": "primrose-0009",
+          "seed": 9,
+          "hash": "9bef79d1650c6e11b0d796c2b7d78259f1b0c5157963707c8cafacea38ccabcc"
+        },
+        {
+          "id": "primrose-0010",
+          "seed": 10,
+          "hash": "b8ba02177b0de0fc336dbf0b3137d1ed8f9bbd731672a86b72cb60762573c1dc"
+        },
+        {
+          "id": "primrose-0011",
+          "seed": 11,
+          "hash": "d81483223172f5d3bd6d26a1b7533c7043bbc4cba11f7218ef6ba01796db3224"
+        },
+        {
+          "id": "primrose-0012",
+          "seed": 12,
+          "hash": "fec8332932acee013bb8804d0b36051747f2585a6810d822961a33cb16ccbe20"
+        },
+        {
+          "id": "primrose-0013",
+          "seed": 13,
+          "hash": "d1d14ef016e5348da2c5cfd553f100cd65ae8c36969ad0ede70c29daa56d326a"
+        },
+        {
+          "id": "primrose-0014",
+          "seed": 14,
+          "hash": "62f067a0cb0773d98a3d9058d5de6098025cb86b5dc9f277dcab75f49ca8af1c"
+        },
+        {
+          "id": "primrose-0015",
+          "seed": 15,
+          "hash": "8b16a6a9f6154b4edfdb133f627bf569deaa79cf8305bd69d99411517bed37f3"
+        },
+        {
+          "id": "primrose-0016",
+          "seed": 16,
+          "hash": "d0bbecc4557e51555eb14327fdc105c4f2e01d5e7c82153e2c56e479785a2d60"
+        },
+        {
+          "id": "primrose-0017",
+          "seed": 17,
+          "hash": "b32acd911fb8768c4fe37e3b00be33f3006e907471aa4acf756241653efbdfaa"
+        },
+        {
+          "id": "primrose-0018",
+          "seed": 18,
+          "hash": "8284ab7a2ec8e12850a0a810122e0606150c22015539834c939285bd69e175c5"
+        },
+        {
+          "id": "primrose-0019",
+          "seed": 19,
+          "hash": "8f3c0d35bbca9519932cecee7f1b0cc77cfd5c8912c42371a9c704fff53a2340"
+        },
+        {
+          "id": "primrose-0020",
+          "seed": 20,
+          "hash": "86039f487b5a72edb23036efedb957dc5170fe29c6c51831471ca99bc41ea2f3"
+        },
+        {
+          "id": "primrose-0021",
+          "seed": 21,
+          "hash": "5992aecdd332ba5893909f1eecdcba159583389029d48945dad4398a596fa34c"
+        },
+        {
+          "id": "primrose-0022",
+          "seed": 22,
+          "hash": "12e528884b9328a3e2bdcedb63d9e64add80ea38b5e36067c83b5a9bbf6f535d"
+        },
+        {
+          "id": "primrose-0023",
+          "seed": 23,
+          "hash": "40bfda0bac70ee7277d59f0c5419f0ba9f0a0ee7566232d892d799f4250d384b"
+        },
+        {
+          "id": "primrose-0024",
+          "seed": 24,
+          "hash": "5bcdb49ac14fc72fde1abfb8066fe33fa715e7339c4ac87e2065079cccabda19"
+        },
+        {
+          "id": "primrose-0025",
+          "seed": 25,
+          "hash": "e8fc018f5dbaec9a84a1ec294b80b957e4df8da8f6d4c3728bfb218e72952de0"
+        },
+        {
+          "id": "primrose-0026",
+          "seed": 26,
+          "hash": "37fe2293af181af4ab37b252328a007f1a3d5928dfaada8940077396b4b1bf53"
+        },
+        {
+          "id": "primrose-0027",
+          "seed": 27,
+          "hash": "c23eeac62479d27a9e07141ba2e6bca1f7abe76588040a2d206679d41cb52a59"
+        },
+        {
+          "id": "primrose-0028",
+          "seed": 28,
+          "hash": "5cd3b23d31cfd2c366c33c876bb07e64b97220c959ed47e50d3986a64380906a"
+        },
+        {
+          "id": "primrose-0029",
+          "seed": 29,
+          "hash": "c93a6a4c2512f223709723cb34ed37f16da10cf5d97db2d05fb2c57fcceb75b5"
+        },
+        {
+          "id": "primrose-0030",
+          "seed": 30,
+          "hash": "8a3e49f95c7770b07dcea0602560a320632f84ef2f993322c09d766c2a6c1a71"
+        },
+        {
+          "id": "primrose-0031",
+          "seed": 31,
+          "hash": "2f911ce500f46ebc8321d31b911cad73c0b95efe50bc0474ef9a8d1ae7728c58"
+        },
+        {
+          "id": "primrose-0032",
+          "seed": 32,
+          "hash": "1ce731132531fd8963040f810606b37c6e50ea1ef8885220423c3f43d2569850"
+        },
+        {
+          "id": "primrose-0033",
+          "seed": 33,
+          "hash": "b3f1771d72d0b3e278d20c13767c465cd81bb51946f65040f58cf2df13e8382f"
+        },
+        {
+          "id": "primrose-0034",
+          "seed": 34,
+          "hash": "fe49c4f9912ffcd9a73842350a8f7b741de4906aa3d94cd92fb3ea004450e57f"
+        },
+        {
+          "id": "primrose-0035",
+          "seed": 35,
+          "hash": "d70a0336a58377ed0724b36e3cbc7b37c80b674e7f024d92b35108ec3c1b8409"
+        },
+        {
+          "id": "primrose-0036",
+          "seed": 36,
+          "hash": "8a26b1ecda9c47939ab02e4effc5ff574b70108231d00136380631d361ef8062"
+        }
+      ]
+    }
+  ],
+  "metadata_revisions": [
+    {
+      "timestamp": 1788850232.3976586,
+      "reason": "Replace pre-review seasonal notes with current spring description; geometry and source hash unchanged"
+    }
+  ]
+}

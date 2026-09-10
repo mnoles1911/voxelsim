@@ -1,4 +1,8 @@
 #include "VoxelCharacterMovement.h"
+#include "VoxelFrameProfiling.h"
+#include "VoxelJumpBuffer.h"
+#include "VoxelMovementIntegration.h"
+#include "Misc/ScopeExit.h"
 
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
@@ -55,6 +59,7 @@ void UVoxelCharacterMovementComponent::RequestJump()
 	// ate my input" complaint. TickMovement spends this within
 	// JumpBufferSeconds if a coyote-valid ground contact appears.
 	JumpBufferRemainingSeconds = JumpBufferSeconds;
+	bJumpRequestFresh = true;
 }
 
 void UVoxelCharacterMovementComponent::ReleaseJump()
@@ -128,6 +133,7 @@ void UVoxelCharacterMovementComponent::ResetState()
 	VerticalVelocity = 0.0;
 	JumpBufferRemainingSeconds = 0.0;
 	TimeSinceGroundedSeconds = 0.0;
+	bJumpRequestFresh = false;
 	bJumpKeyHeld = false;
 	// The remembered floor does NOT survive a mode toggle: fly mode may have
 	// moved the pawn kilometres from wherever it last stood, and clamping to
@@ -163,6 +169,7 @@ UVoxelWorldSubsystem* UVoxelCharacterMovementComponent::GetVoxelWorldSubsystem()
 
 bool UVoxelCharacterMovementComponent::IsInWaterAt(const FVector& Pos) const
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, MovementWaterProbeMs);
 	UWorld* World = GetWorld();
 	if (!World)
 	{
@@ -205,17 +212,9 @@ bool UVoxelCharacterMovementComponent::IsGroundedAt(const FVector& Pos) const
 	AxisVoxelRange(Pos.X - BoxHalfExtentXY, Pos.X + BoxHalfExtentXY, VXMin, VXMax);
 	AxisVoxelRange(Pos.Y - BoxHalfExtentXY, Pos.Y + BoxHalfExtentXY, VYMin, VYMax);
 
-	for (int64 VX = VXMin; VX <= VXMax; ++VX)
-	{
-		for (int64 VY = VYMin; VY <= VYMax; ++VY)
-		{
-			if (Subsystem->IsSolidAtVoxel(VX, VY, ProbeVZ))
-			{
-				return true;
-			}
-		}
-	}
-	return false;
+	const int64 Min[3]={VXMin,VYMin,ProbeVZ}, Max[3]={VXMax,VYMax,ProbeVZ};
+	int64 Hit=0;
+	return Subsystem->FindFirstSolidVoxelSlice(Min,Max,2,1,Hit);
 }
 
 bool UVoxelCharacterMovementComponent::CanStandAt(const FVector& CrouchCenterPos) const
@@ -241,20 +240,9 @@ bool UVoxelCharacterMovementComponent::CanStandAt(const FVector& CrouchCenterPos
 	AxisVoxelRange(CrouchCenterPos.Y - BoxHalfExtentXY, CrouchCenterPos.Y + BoxHalfExtentXY, VYMin, VYMax);
 	AxisVoxelRange(CrouchTopZ, StandTopZ, VZMin, VZMax);
 
-	for (int64 VZ = VZMin; VZ <= VZMax; ++VZ)
-	{
-		for (int64 VX = VXMin; VX <= VXMax; ++VX)
-		{
-			for (int64 VY = VYMin; VY <= VYMax; ++VY)
-			{
-				if (Subsystem->IsSolidAtVoxel(VX, VY, VZ))
-				{
-					return false;
-				}
-			}
-		}
-	}
-	return true;
+	const int64 Min[3]={VXMin,VYMin,VZMin}, Max[3]={VXMax,VYMax,VZMax};
+	int64 Hit=0;
+	return !Subsystem->FindFirstSolidVoxelSlice(Min,Max,2,1,Hit);
 }
 
 bool UVoxelCharacterMovementComponent::UpdateCrouchState(FVector& InOutPos)
@@ -349,35 +337,8 @@ bool UVoxelCharacterMovementComponent::SweepAxis(int32 Axis, double Delta, FVect
 	// Walk the moving axis from the near side (closest to OldCenter) toward the
 	// far side so the first hit found is the nearest blocking voxel.
 	const int32 Step = Delta > 0 ? 1 : -1;
-	const int64 AxisStart = Step > 0 ? VMin[Axis] : VMax[Axis];
-	const int64 AxisEnd = Step > 0 ? VMax[Axis] : VMin[Axis];
-
-	int64 V[3];
-	bool bBlocked = false;
 	int64 BlockingVoxel = 0;
-	for (int64 AV = AxisStart; Step > 0 ? AV <= AxisEnd : AV >= AxisEnd; AV += Step)
-	{
-		V[Axis] = AV;
-		bool bSliceSolid = false;
-		for (int64 O1 = VMin[Other1]; O1 <= VMax[Other1] && !bSliceSolid; ++O1)
-		{
-			V[Other1] = O1;
-			for (int64 O2 = VMin[Other2]; O2 <= VMax[Other2] && !bSliceSolid; ++O2)
-			{
-				V[Other2] = O2;
-				if (Subsystem->IsSolidAtVoxel(V[0], V[1], V[2]))
-				{
-					bSliceSolid = true;
-				}
-			}
-		}
-		if (bSliceSolid)
-		{
-			bBlocked = true;
-			BlockingVoxel = AV;
-			break;
-		}
-	}
+	const bool bBlocked=Subsystem->FindFirstSolidVoxelSlice(VMin,VMax,Axis,Step,BlockingVoxel);
 
 	if (!bBlocked)
 	{
@@ -549,6 +510,19 @@ void UVoxelCharacterMovementComponent::DebugDrawVolume(double EyeWorldZ) const
 
 void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, MovementTickMs);
+    if (!GetOwner() || !FMath::IsFinite(DeltaTime) || DeltaTime <= 0.f) return;
+    auto* Subsystem=GetVoxelWorldSubsystem();
+    if (!Subsystem) { bWaitingForTerrain=true; return; }
+    Subsystem->BeginMovementCollisionQueries();
+    ON_SCOPE_EXIT { Subsystem->EndMovementCollisionQueries(); };
+    const int32 Steps=VoxelMovement::IntegrationSteps(DeltaTime);
+    const float StepSeconds=DeltaTime/Steps;
+    for (int32 Step=0; Step<Steps; ++Step) StepMovement(StepSeconds);
+}
+
+void UVoxelCharacterMovementComponent::StepMovement(float DeltaTime)
+{
 	AActor* Owner = GetOwner();
 	if (!Owner || DeltaTime <= 0.f)
 	{
@@ -594,7 +568,8 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	{
 		TimeSinceGroundedSeconds += DeltaTime;
 	}
-	JumpBufferRemainingSeconds = FMath::Max(0.0, JumpBufferRemainingSeconds - DeltaTime);
+	JumpBufferRemainingSeconds = VoxelMovement::AdvanceJumpBuffer(
+		JumpBufferRemainingSeconds, bJumpRequestFresh, DeltaTime);
 
 	// Terrain not streamed underneath (see IsTerrainReadyAt).
 	//
@@ -679,6 +654,7 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 		bSprintEngagedLastTick = (WishDir | YawForward) >= SprintForwardDot;
 	}
 
+	double GravityStepUU=0.0;
 	if (bSwimming)
 	{
 		// Fly-style while submerged: no gravity, no jump, no step-up -- just
@@ -710,6 +686,7 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 		// Client-presentation kinematics only (see the header): plain gravity
 		// integration, not part of the deterministic world derivation and not
 		// authoritative -- M3's server owns real player movement.
+		GravityStepUU = VoxelMovement::GravityDisplacement(VerticalVelocity, GravityUUPerSec2, DeltaTime);
 		VerticalVelocity -= GravityUUPerSec2 * DeltaTime;
 	}
 
@@ -749,7 +726,7 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	// Swimming: vertical motion comes directly from the Space/LeftControl axis
 	// (fly-style), not integrated velocity -- there's no "falling" underwater in
 	// this placeholder.
-	const double VertDelta = bSwimming ? (CurrentUpInput * SwimSpeedUU * DeltaTime) : (VerticalVelocity * DeltaTime);
+	const double VertDelta = bSwimming ? (CurrentUpInput * SwimSpeedUU * DeltaTime) : GravityStepUU;
 
 	FVector NewPos = Pos;
 	const bool bBlockedX = SweepAxis(0, HorizDelta.X, NewPos);
@@ -928,7 +905,8 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	{
 		const FVector FeetProbe(NewPos.X, NewPos.Y, NewPos.Z - GetHalfExtentZ() + 5.0);
 		const FVector HeadProbe(NewPos.X, NewPos.Y, NewPos.Z + GetHalfExtentZ() + 50.0);
-		const bool bAtWaterSurface = IsInWaterAt(FeetProbe) && !IsInWaterAt(HeadProbe);
+		const bool bFeetWet = IsInWaterAt(FeetProbe);
+		const bool bAtWaterSurface = bFeetWet && !IsInWaterAt(HeadProbe);
 		// PLAYER-RIPPLE WITNESS (2026-09-06), same reason as the boat's: the
 		// owner reports no rings, and "feet never read wet", "head reads wet
 		// too", and "too slow" are indistinguishable from outside. Throttled
@@ -937,7 +915,6 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 		{
 			static double LastRippleReportSeconds = 0.0;
 			const double NowSeconds = FPlatformTime::Seconds();
-			const bool bFeetWet = IsInWaterAt(FeetProbe);
 			if (bFeetWet && !bAtWaterSurface && NowSeconds - LastRippleReportSeconds >= 1.0)
 			{
 				LastRippleReportSeconds = NowSeconds;

@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/achillea-millefolium/",
+  "viewed_photos": [
+    "Natural habitat - Thayne Tuason",
+    "Form - Chapstick Addict",
+    "Full Form (Cabarrus County,NC) - Hope Duckworth"
+  ],
+  "findings": "Thayne Tuason habitat,Chapstick Addict yellow garden form and Hope Duckworth pink form viewed. Yellow garden selection excluded. Fine pinnate leaves along stems; spring developing vegetative state chosen, no broad leaf slabs. Current seeds1,4,7 and all36contact-sheet panels visually inspected. Developing17\u201338cm spring vegetative shoots with narrow pinnate leaves, no summer corymbs. Small compact leaves merge; finer leaf segmentation cannot survive25mm. Yellow garden cultivar rejected. Accepted as coarse stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "df20d9d2677055d2a9c06184784954ec60352a8f885fe2237cded8024108cdcf",
+  "sheet_hash": "46dbed05a4ad8a26711e15cbe6b81a0f79ec69d16035a3328afbbf820f2aa19d",
+  "reviewed_at": 1788858046.1909251,
+  "pilot_hashes": {
+    "1": "f9579425973841c123dfeaa9251cb26a3d39162f0dccb35f36223906b6b37232",
+    "4": "2a3accc6915e63fa344028e5807eaf7e1949603823bf817c600f2b983ecbf3ba",
+    "7": "1dcd7682f9b187554e74eb9cf1dc310fa19eb7594606a208d62370cf35f37734"
+  },
+  "profile": "yarrow",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Achillea_millefolium_s2KXn8yEtBsc.mpo?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=WcGfLQZfE2ZDH3reBMQuEWZcEhU%3D&Expires=1788859720",
+      "caption": "Natural habitat",
+      "credit": "Thayne Tuason",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "11954"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Achillea-millefolium_47nTtC0WoU95.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=0fpIX5hKGIM9gWeUQ4Eizmf%2F%2F%2Bc%3D&Expires=1788859720",
+      "caption": "Form",
+      "credit": "Chapstick Addict",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/2.0/legalcode'>CC BY-NC-ND 2.0</a>",
+      "image_id": "16991"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/achillea_millefolia-_Jhl4MidUIQAe.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=SFl2p6iIbFB%2FGyfLcFavEmvyleE%3D&Expires=1788859720",
+      "caption": "Full Form (Cabarrus County,NC)",
+      "credit": "Hope Duckworth",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "23483"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/achillea_millefolium_0Rbh1rkVVuSN.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=hhinCYxM8cqh6mqaAqzKEfWWLJg%3D&Expires=1788859720",
+      "caption": "Form and flowers (Cabarrus County, NC)",
+      "credit": "Hope Duckworth",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "29004"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/achillea-millefolium_ib4PMlMXNnLa.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=sG77gqhtSrkxphZx4KjbF0SXAzk%3D&Expires=1788859720",
+      "caption": "Form June 2021",
+      "credit": "Hope Duckworth",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "33515"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Achillea_millefolium_QzI2WwAjd95s.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=6E4KHNGot20iP5SwWmHpK%2Fe89u8%3D&Expires=1788859720",
+      "caption": "Flowers of the species",
+      "credit": "Petar Milo\u0161evi\u0107",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "39954"
+    }
+  ],
+  "taxon": "Achillea millefolium",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "46dbed05a4ad8a26711e15cbe6b81a0f79ec69d16035a3328afbbf820f2aa19d"
+  }
+}

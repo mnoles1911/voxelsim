@@ -1,0 +1,13 @@
+// Clear only winners recorded during the complete ordered stamp sequence.
+// Terrain and later losers never enter the mask. All other cell bits survive.
+#include "/Engine/Public/Platform.ush"
+uint CellCount;
+uint ClearGroupsX;
+StructuredBuffer<uint> OwnedWinnerMask;
+RWStructuredBuffer<uint> OutCells;
+[numthreads(64,1,1)]
+void AssetOwnedClearMain(uint3 Tid:SV_DispatchThreadID){
+    const uint Index = Tid.x + Tid.y * ClearGroupsX * 64u;
+    if (Index >= CellCount) return;
+    if (OwnedWinnerMask[Index] != 0u) OutCells[Index] &= ~0xffu;
+}

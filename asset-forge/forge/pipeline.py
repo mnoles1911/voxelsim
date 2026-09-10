@@ -374,6 +374,15 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         voxel_m = float(resolution_cm) / 100
     else:
         voxel_m = resolution_m(spec, resolution_cm)
+    # UNDERSTORY_DISPATCH_BEGIN
+    if spec.get("plant_recipe", {}).get("generator") == "temperate-understory-v1":
+        from . import understory
+        return understory.build(spec, seed, voxel_m, connectivity=connectivity)
+    # UNDERSTORY_DISPATCH_END
+    if "plant_recipe" in spec:
+        from . import oak, forest
+        generator = oak if spec['plant_recipe'].get('generator') == oak.VERSION else forest
+        return generator.build(spec, seed, voxel_m, connectivity=connectivity)
     rng = rng_for(spec, seed)
 
     # Pick this individual out of the species before growing it, so two seeds

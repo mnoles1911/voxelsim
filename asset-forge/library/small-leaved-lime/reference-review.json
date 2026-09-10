@@ -1,0 +1,88 @@
+{
+  "species": "small-leaved-lime",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Ascending scaffold supports an upright rounded crown. Both photographed forms show the allowable range from irregular to compact crowns."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "9535",
+      "source": "https://plants.ces.ncsu.edu/plants/tilia-cordata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "9541",
+      "source": "https://plants.ces.ncsu.edu/plants/tilia-cordata/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "tilia-cordata",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/tilia-cordata/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "36624ac5825749ab1e1f14c0a5aa1ebb45df6d2ea25d1ae3b86dace5bfa04074",
+    "4": "269aa078b1a82aa3eb0265be9a2227061d46025f9c8ed8ca938440a45f8221a8",
+    "7": "deffaa366fabdc49c8f8bd75d9e79f413ec418fe988b8b2e03c379c27e8b31f3"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "56dad94fbda1b7b49f824caf0215aafe604c0633dea51fdf95df68d413fe622e"
+  }
+}

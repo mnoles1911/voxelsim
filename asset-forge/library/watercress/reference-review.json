@@ -1,0 +1,120 @@
+{
+  "status": "passed pilot review",
+  "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/water-cress",
+  "viewed_photos": [
+    "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-01/watercress-00003%20northeastwildlife.co_.uk_.jpg?h=52bde763&itok=xh5ANrOo"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Northeast Wildlife photo viewed: dense connected low shoots with rounded paired leaflets and larger terminal leaflets; small white clusters. WildlifeTrusts<=60cm,May-Oct bloom; choose30cm young patch with a few small late-spring white clusters.",
+    "viewed_photos": [
+      "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-01/watercress-00003%20northeastwildlife.co_.uk_.jpg?h=52bde763&itok=xh5ANrOo"
+    ],
+    "source": "https://www.wildlifetrusts.org/wildlife-explorer/wildflowers/water-cress"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Low15-33cm connected shoots, paired rounded leaflets and larger terminal leaflet; sparse small white late-May clusters. Flower microdetail merges into1-2cells; flowers are not oversized discs.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "61110945a06d4d25aaece14eb9b2016215cb969344583815844d9fb74327a7bb",
+  "sheet_hash": "1eafdbcb96e9bd966adcaa32b589d0734d800a8eaf6c8da0a4832b9fadc5dac6",
+  "reviewed_at": 1788861146.1042154,
+  "pilot_hashes": {
+    "1": "99d13e6c5669b582b2c1a1b0e794ea26feae20b74b74aa90e91cee26a0f22393",
+    "4": "adbf84449820fa0c71b6fdae1bdb1d7177d360f46f74ca1fa07af21042999509",
+    "7": "87e49937b83c88d4d0dc15841ce447e59fd817a2d04eb7654bd3ec3d4f5da902"
+  },
+  "profile": "watercress",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://www.wildlifetrusts.org/sites/default/files/styles/spotlight_default/public/2018-01/watercress-00003%20northeastwildlife.co_.uk_.jpg?h=52bde763&itok=xh5ANrOo",
+      "credit": "Northeast Wildlife",
+      "caption": "Watercress compound foliage and small white clusters"
+    }
+  ],
+  "taxon": "Nasturtium officinale",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "1eafdbcb96e9bd966adcaa32b589d0734d800a8eaf6c8da0a4832b9fadc5dac6"
+  }
+}

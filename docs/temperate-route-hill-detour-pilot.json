@@ -1,0 +1,147 @@
+{
+  "version": 1,
+  "scope": "Hill first-leg tree-clear detour candidate; original seven waypoint objects retained. Terrain and runtime connectivity unverified; original first target center is foliage-occupied but west side of unchanged arrival disk is source-tree-clear at assumed height.",
+  "spawn_x_m": -154048.0,
+  "spawn_y_m": -81112.0,
+  "configuration_sha256": "e68b98f5d52952d59cece8e4403c6d42eaddb9fee5d3259dabb999a6f1ad0936",
+  "species_manifest_sha256": "0197da097e17a2634c2f15dca0589e5e98157eb631c2998513769738427dd4f6",
+  "provenance": {
+    "capture": "asset-forge/out/ecological-placement/world-capture-16-hill",
+    "terrain_samples_sha256": "396cd4b6e75b1ed0f1f94ca5fb7f7a0f00ba8930888b69b2f393c44094bd7405",
+    "run_manifest_sha256": "7d272e66fc7dbd0b85c51356a5505952e99aa97d90810a726c3fefe27529bb26",
+    "sample_spacing_m": 8,
+    "legacy_footprint_water_ignored": true,
+    "authored_polyline_length_m": 169.53910524340094,
+    "segment_sample_screening": [
+      {
+        "sample_count_within_4m": 1,
+        "max_sampled_water_mm": 0,
+        "max_sampled_slope_mm_per_m": 208
+      },
+      {
+        "sample_count_within_4m": 4,
+        "max_sampled_water_mm": 0,
+        "max_sampled_slope_mm_per_m": 212
+      },
+      {
+        "sample_count_within_4m": 4,
+        "max_sampled_water_mm": 0,
+        "max_sampled_slope_mm_per_m": 424
+      },
+      {
+        "sample_count_within_4m": 4,
+        "max_sampled_water_mm": 0,
+        "max_sampled_slope_mm_per_m": 274
+      },
+      {
+        "sample_count_within_4m": 4,
+        "max_sampled_water_mm": 0,
+        "max_sampled_slope_mm_per_m": 274
+      },
+      {
+        "sample_count_within_4m": 4,
+        "max_sampled_water_mm": 0,
+        "max_sampled_slope_mm_per_m": 242
+      },
+      {
+        "sample_count_within_4m": 4,
+        "max_sampled_water_mm": 0,
+        "max_sampled_slope_mm_per_m": 244
+      }
+    ],
+    "original_route_sha256": "c744963b61ab3ac891b1f0ec7ce6652dc99f2fd9db70be3dfa8422116415492d",
+    "blocker_report_sha256": "8c87bc4c59fb84866efdcb064fe8b03c47ab13831bd83410777dce277b454a78",
+    "blocker_report": "asset-forge/out/ecological-placement/hill-blocker-analysis-1/report.json"
+  },
+  "waypoints": [
+    {
+      "x_m": -154053,
+      "y_m": -81114,
+      "arrival_radius_m": 0.15,
+      "label": "west approach survey-candidate; tree-clear sampled, terrain unverified"
+    },
+    {
+      "x_m": -154053,
+      "y_m": -81116,
+      "arrival_radius_m": 0.15,
+      "label": "west-side entry to original arrival disk; terrain unverified"
+    },
+    {
+      "x_m": -154052,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 98265,
+      "survey_slope_mm_per_m": 208,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 228000
+    },
+    {
+      "x_m": -154076,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 2; clearance unverified",
+      "survey_surface_mm": 99537,
+      "survey_slope_mm_per_m": 159,
+      "survey_stand": 2,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 250000
+    },
+    {
+      "x_m": -154100,
+      "y_m": -81140,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 2; clearance unverified",
+      "survey_surface_mm": 92875,
+      "survey_slope_mm_per_m": 101,
+      "survey_stand": 2,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 278000
+    },
+    {
+      "x_m": -154124,
+      "y_m": -81164,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 3; clearance unverified",
+      "survey_surface_mm": 92671,
+      "survey_slope_mm_per_m": 274,
+      "survey_stand": 3,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 282000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81164,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 3; clearance unverified",
+      "survey_surface_mm": 95585,
+      "survey_slope_mm_per_m": 94,
+      "survey_stand": 3,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 304000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81140,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 97919,
+      "survey_slope_mm_per_m": 242,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 318000
+    },
+    {
+      "x_m": -154148,
+      "y_m": -81116,
+      "arrival_radius_m": 0.75,
+      "label": "hill survey-candidate; stand 0; clearance unverified",
+      "survey_surface_mm": 101158,
+      "survey_slope_mm_per_m": 244,
+      "survey_stand": 0,
+      "survey_water_mm": 0,
+      "survey_distance_water_mm": 324000
+    }
+  ]
+}

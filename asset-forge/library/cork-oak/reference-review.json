@@ -1,0 +1,88 @@
+{
+  "species": "cork-oak",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Short stout bole and spreading evergreen crown follow the field specimen; rough bark is stylized. This is a warm-dry regional profile, not a default wet forest tree."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "19751",
+      "source": "https://plants.ces.ncsu.edu/plants/quercus-suber/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "28120",
+      "source": "https://plants.ces.ncsu.edu/plants/quercus-suber/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "quercus-suber",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/quercus-suber/"
+  ],
+  "habitat": "warm-dry",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "47189b0d95555e22e631c6dce60931936b5eca6d5c41b682e05004ea3af06661",
+    "4": "8c610cab991ae872723b536c1dfbd9e8a6eb72ed44de2dcae9844373921c7c9a",
+    "7": "9da0ee3722ee79fee462f97be9f667f0b75fd09aa08c1ffcddc7e62d0d0b24a7"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "d17e484f40d4bf8c3e045a0e8226333da88c2bd2916ed881a6e7c5bc386115e4"
+  }
+}

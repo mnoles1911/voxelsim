@@ -45,17 +45,21 @@ bool FAdapter::StageGpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRen
     const auto Existing=StagedPages.FindByPredicate([&](const auto& P){return P.Page.x==Page.x&&P.Page.y==Page.y&&P.Page.z==Page.z&&P.Page.level==Page.level;});
     if(Existing&&Existing->ValidatedAbsent)return false;
     if(!PreparedPages(Ticket)||!Result.bPublicationHeld||Result.Status!=EVoxelGpuMeshJobStatus::Success||!Result.BrickVolume.IsValid()||
+       Result.BrickVolume->BrickCount!=64||Result.BrickVolume->OccWords>1024||Result.BrickVolume->MatWords>8448||
        !MarkPageReady(Ticket,Page,vxc::AssetGpu,Result.OwnershipGeneration))return false;
     auto Item=StagedPages.FindByPredicate([&](const auto& P){return P.Page.x==Page.x&&P.Page.y==Page.y&&P.Page.z==Page.z&&P.Page.level==Page.level;});
     if(!Item){Item=&StagedPages.AddDefaulted_GetRef();Item->Page=Page;Item->Generation=Result.OwnershipGeneration;}
-    Item->GpuBricks=MoveTemp(Result.BrickVolume);Item->GpuQuads=MoveTemp(Result.GpuQuads);return true;
+    Item->GpuBricks=MoveTemp(Result.BrickVolume);Item->GpuQuads=MoveTemp(Result.GpuQuads);Item->GpuReadbackQuads=MoveTemp(Result.Quads);return true;
 }
 bool FAdapter::StageCpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,FVoxelBrickCpuPackRef Bricks,TArray<uint64>&& Quads)
 {
     check(IsInGameThread());
     const auto Existing=StagedPages.FindByPredicate([&](const auto& P){return P.Page.x==Page.x&&P.Page.y==Page.y&&P.Page.z==Page.z&&P.Page.level==Page.level;});
     if(Existing&&Existing->ValidatedAbsent)return false;
-    check(IsInGameThread());if(!PreparedPages(Ticket)||!Bricks||!MarkPageReady(Ticket,Page,vxc::AssetCpu,Generation))return false;
+    // Empty terrain is still a complete 64-descriptor page. Missing output is
+    // never evidence of air; zero arena words can also mean uniform SOLID.
+    if(!PreparedPages(Ticket)||!Bricks||Bricks->Desc.Num()!=128||Bricks->OccWords()>1024||Bricks->MatWords()>8448||
+       !MarkPageReady(Ticket,Page,vxc::AssetCpu,Generation))return false;
     auto Item=StagedPages.FindByPredicate([&](const auto& P){return P.Page.x==Page.x&&P.Page.y==Page.y&&P.Page.z==Page.z&&P.Page.level==Page.level;});
     if(!Item){Item=&StagedPages.AddDefaulted_GetRef();Item->Page=Page;Item->Generation=Generation;}
     Item->CpuBricks=MoveTemp(Bricks);Item->CpuQuads=MoveTemp(Quads);return true;

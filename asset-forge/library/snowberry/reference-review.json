@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/symphoricarpos-albus/",
+  "viewed_photos": [
+    "Tom Brandt Foliage",
+    "Donald Hobern Habit",
+    "David J Stang Stems and foliage"
+  ],
+  "findings": "Opposite rounded leaves, thin stems and wider footprint produce low branching thickets, 0.9-1.9 m. White autumn berries excluded. Leaf veins and millimetre twigs below pitch are simplified. Actually compared reference photographs, current seeds 1,4,7 and all 36 variants. Accepted as stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "c3caf04197287221fb64d22a653c50aa4df31032a1da7b35a1b3f921c6bcc708",
+  "sheet_hash": "7dc049cf5553798c76f6e5f2e677a665dd42dd9846691c2e2bbe935410585ecb",
+  "reviewed_at": 1788850912.62032,
+  "pilot_hashes": {
+    "1": "06c3b9610f237ef66ef2fe79db9e6c1b417efc1e651f065d6e79a86f8a4cacd8",
+    "4": "e305171fc8720918d6ef89d6499ae4562d4481d50df8464e37b2ad954297292e",
+    "7": "11c9ab27f001e0caab771c712f5e0ef6502232c408c271a4f6914e3d755b8760"
+  },
+  "profile": "snowberry",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Symphoricarpos-albus--Tom-Brandt--CC-BY.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=p9NF94irvQ914vEZpJfLVlVuHvI%3D&Expires=1788853897",
+      "caption": "Foliage",
+      "credit": "Tom Brandt",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "6350"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Symphoricarpos_albus_9Nm58x0naOAy.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=OQP28Jd0vtgtdc4KFHhvUZrUf3g%3D&Expires=1788853897",
+      "caption": "Habit",
+      "credit": "Donald Hobern",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "33960"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Symphoricarpos_albus_OVtRxKMZzP7K.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=LN25WCc0rzB2NDtzbZZtw%2FucPpM%3D&Expires=1788853897",
+      "caption": "Stems and foliage",
+      "credit": "David J. Stang",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "33961"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Symphoricarpos-albus--James-Gaither--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=yg0A9KvHekjp1T80Wg4X8HJfeJo%3D&Expires=1788853897",
+      "caption": "Symphoricarpos albus",
+      "credit": "James Gaither",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/2.0/legalcode'>CC BY-NC-ND 2.0</a>",
+      "image_id": "6345"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Symphoricarpos-albus--Matt-Lavin-CC-BY-NC.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=wQIs%2FVLg0CEtFPKBpumaNrohsvc%3D&Expires=1788853897",
+      "caption": "Flower",
+      "credit": "Matt Lavin",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/2.0/'>CC BY-NC 2.0</a>",
+      "image_id": "6346"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Symphoricarpos-albus--Hermann-Falkner--CC-BY-NC.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=LIlosg%2BeUUSyOC4h6p1H63URhF8%3D&Expires=1788853897",
+      "caption": "Symphoricarpos albus",
+      "credit": "Hermann Falkner",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/2.0/'>CC BY-NC 2.0</a>",
+      "image_id": "6347"
+    }
+  ],
+  "taxon": "Symphoricarpos albus",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "7dc049cf5553798c76f6e5f2e677a665dd42dd9846691c2e2bbe935410585ecb"
+  }
+}

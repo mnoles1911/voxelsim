@@ -24,7 +24,7 @@
 // cliff-slope gate fires below the median slope". Those two have completely
 // different fixes.
 //
-// Usage: vxc_climateprobe <tiledir|--synthetic> <seed> [samplesPerAxis]
+// Usage: vxc_climateprobe <tiledir|--synthetic> <seed> [samplesPerAxis [pointXM pointYM [gentleSearchRadiusM]]]
 //
 // Defaults to 512 samples per axis (262k columns), which takes a few seconds
 // and is well inside the sampling noise of every percentage it reports.
@@ -208,7 +208,7 @@ void printChannelRow(const ChannelScale& c, std::vector<int64_t> v) {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: vxc_climateprobe <tiledir|--synthetic> <seed> [samplesPerAxis]\n");
+                     "usage: vxc_climateprobe <tiledir|--synthetic> <seed> [samplesPerAxis [pointXM pointYM [gentleSearchRadiusM]]]\n");
         return 2;
     }
     const std::string dir = argv[1];
@@ -296,6 +296,48 @@ int main(int argc, char** argv) {
                 (long long)py1, (px1 - px0 + 1) * pxMm / 1e6, (py1 - py0 + 1) * pxMm / 1e6);
 
     Amplifier amp(seed, *tiles);
+    // Optional exact coarse-terrain site check for choosing a biome-specific
+    // runtime test location. Unlike the broad census, this refuses any miss.
+    if(argc==6||argc==7||argc==8){
+        const int64_t x=std::strtoll(argv[4],nullptr,10),y=std::strtoll(argv[5],nullptr,10);
+        const auto col=amp.column(x*10,y*10);
+        std::printf("SITE xM=%lld yM=%lld biome=%s surfaceMm=%d slopeMmPerM=%lld\n",
+            (long long)x,(long long)y,kBiomeName[col.biome],col.surfaceMm,(long long)col.slopeMmPerM);
+        if(argc>=7){
+            const int64_t radius=std::strtoll(argv[6],nullptr,10);
+            if(radius<64||radius>10000)return 2;
+            const int required=argc==8?std::atoi(argv[7]):0;
+            if(required<0||required>100)return 2;
+            struct Candidate{int64_t distance,x,y;};std::vector<Candidate> candidates;
+            int64_t best=INT64_MAX,bx=0,by=0;
+            for(int64_t dx=-radius;dx<=radius;dx+=64)for(int64_t dy=-radius;dy<=radius;dy+=64){
+                const auto c=amp.column((x+dx)*10,(y+dy)*10);
+                if(c.biome!=TEMPERATE_FOREST||c.slopeMmPerM>80||c.surfaceMm<20000)continue;
+                const int64_t score=dx*dx+dy*dy;
+                if(required){candidates.push_back({score,x+dx,y+dy});continue;}
+                if(score<best){best=score;bx=x+dx;by=y+dy;}
+            }
+            if(required){
+                std::sort(candidates.begin(),candidates.end(),[](const Candidate& a,const Candidate& b){
+                    if(a.distance!=b.distance)return a.distance<b.distance;
+                    return a.x!=b.x?a.x<b.x:a.y<b.y;});
+                int bestCoverage=0;
+                for(const auto& candidate:candidates){
+                    int forest=0;
+                    for(int dy=-128;dy<=128;dy+=32)for(int dx=-128;dx<=128;dx+=32)
+                        forest+=amp.column((candidate.x+dx)*10,(candidate.y+dy)*10).biome==TEMPERATE_FOREST;
+                    bestCoverage=std::max(bestCoverage,forest);
+                    if(forest*100>=required*81){best=candidate.distance;bx=candidate.x;by=candidate.y;
+                        std::printf("FOREST_REGION xM=%lld yM=%lld forestSamples=%d totalSamples=81 spanM=256\n",(long long)bx,(long long)by,forest);break;}
+                }
+                if(best==INT64_MAX)std::printf("No broad forest found; best coverage %d/81 among %zu gentle centers\n",bestCoverage,candidates.size());
+            }
+            if(best==INT64_MAX){std::printf("No gentle temperate-forest site found\n");return 1;}
+            const auto c=amp.column(bx*10,by*10);
+            std::printf("GENTLE_FOREST xM=%lld yM=%lld surfaceMm=%d slopeMmPerM=%lld\n",(long long)bx,(long long)by,c.surfaceMm,(long long)c.slopeMmPerM);
+        }
+        return grid.missingTileQueries.load(std::memory_order_relaxed)?1:0;
+    }
 
     std::vector<int64_t> chT, chS, chP, chV, slopes, elevs, topsoils, subsoils;
     const int64_t total = nAxis * nAxis;

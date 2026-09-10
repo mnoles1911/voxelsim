@@ -1,0 +1,157 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/acorus-calamus/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus_Mokki_4TzuFPXXiB2D.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=oTlAtfuvKKsGnpkZHYW76bTjZh8%3D&Expires=1788863418"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Mokkie vegetative photo viewed: upright sword leaves in planar basal fans, folded/twisted tips and separate outer arcs. NCState19mm width,>76cm length, green late-spring spadix. Choose0.8m fresh fans; minute ridges subvoxel.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus_Mokki_4TzuFPXXiB2D.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=oTlAtfuvKKsGnpkZHYW76bTjZh8%3D&Expires=1788863418"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/acorus-calamus/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Fresh planar sword fans33-78cm with one unobtrusive attached green late-spring spadix. Long outer leaves stand separately; midrib and wavy edge are below25mm.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "1c2d39001469028582b9cdb321e066b3a5544959dc1fb6c0ab500a27e7c8c904",
+  "sheet_hash": "a071b6a1f2f7e5205102f1fde01c03b2b0ffcd764c0dc2a2bc01b8f2284b1b21",
+  "reviewed_at": 1788861145.608015,
+  "pilot_hashes": {
+    "1": "ceb37fdb8a9802497bb510fdb0f7534e2615760b4fcf5be0c67ce1c5971675e6",
+    "4": "621b6d7eeea91279ba6cad67dbef757e75cd16dbc58e2dd760c1d76762f9eab6",
+    "7": "500a5741b08b38bd05142c90e5af808550413f4adc76751de65f4326b2b9c191"
+  },
+  "profile": "sweet-flag",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus_Mokki_4TzuFPXXiB2D.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=oTlAtfuvKKsGnpkZHYW76bTjZh8%3D&Expires=1788863418",
+      "caption": "Form",
+      "credit": "Mokkie",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "11535"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus_David_LcNhup1oIrn9.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=awVpwnVSLVCJFPAEynEPrP3XGSc%3D&Expires=1788863418",
+      "caption": "Form",
+      "credit": "David Stang",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "22847"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus-close_up_of_leaf_blade-Krzysztof_Ziarnek-CC_BY-SA_3.0.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=rB5UkTlOi%2F7f3uOnQphZcxMtIDM%3D&Expires=1788863418",
+      "caption": "Leaf Blade",
+      "credit": "Krzysztof Ziarnek",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10495"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus_Giles_A12H7TwkKpBK.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=dk30%2BoFAzpZABGzf1kchsJGlYEo%3D&Expires=1788863418",
+      "caption": "leaf blade",
+      "credit": "Giles Watson",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "11534"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus_roots_LML1Y0vAQr2a.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=e5dZv8WOIcsPc0LfeibATdhHLR4%3D&Expires=1788863418",
+      "caption": "Roots and rhizome",
+      "credit": "Dung Nguyen Viet",
+      "license": "<a href='https://creativecommons.org/about/cc0/'>CC0</a>",
+      "image_id": "11536"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Acorus_calamus_close_KrhDSneCPnUQ.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=T1aPTAeLbHWBbf9ry8KlW9Q5sm4%3D&Expires=1788863418",
+      "caption": "Close up",
+      "credit": "Krzysztof Zairnek, Kenraiz",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "11537"
+    }
+  ],
+  "taxon": "Acorus calamus",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a071b6a1f2f7e5205102f1fde01c03b2b0ffcd764c0dc2a2bc01b8f2284b1b21"
+  }
+}

@@ -1,4 +1,39 @@
 {
+  "artifact": {
+    "asym_vox": 0.8,
+    "beam_m": 0.85,
+    "bilge": 2.6,
+    "billow_m": 0.16,
+    "crossbar_at": 0.42,
+    "deck_frac": 0.07,
+    "depth_m": 0.35,
+    "droop_m": 0.3,
+    "entry": 0.62,
+    "form": "hull",
+    "frame_at": 0.34,
+    "frame_base_m": 0.95,
+    "frame_drop_m": 1.15,
+    "frame_r_m": 0.03,
+    "fullness": 2.4,
+    "gunwale_m": 0.06,
+    "gunwale_vox": 1,
+    "keel_m": 0.45,
+    "keel_r_m": 0.04,
+    "length_m": 4.0,
+    "panel_vox": 2,
+    "rocker": 0.14,
+    "seat": true,
+    "seat_len_m": 0.8,
+    "sheer": 0.35,
+    "shell_vox": 2,
+    "spar_r_m": 0.045,
+    "strake_share": 0.25,
+    "sweep": 0.85,
+    "taper": 0.3,
+    "thwart_t_m": 0.05,
+    "thwart_w_m": 0.1,
+    "thwarts": 2
+  },
   "biomes": {
     "bare_rock": 0.0,
     "beach": 0.0,
@@ -81,6 +116,13 @@
     "shell_lower": 0.4,
     "shell_upper": 0.7,
     "squash": 0.75
+  },
+  "curation": {
+    "notes": "Reference-informed generator; variants require endorsement in Forge.",
+    "seeds": [
+      1
+    ],
+    "status": "draft"
   },
   "detail": {
     "depth_max_m": 6.0,
@@ -243,7 +285,9 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
+    "frame": "beak_horn",
     "head": "leaf_blossom",
+    "hull": "heartwood",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -254,7 +298,9 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "grass"
+    "stem": "grass",
+    "strake": "deadwood",
+    "trim": "bark"
   },
   "name": "bur-oak",
   "notes": "HEAVY HORIZONTAL LIMBS ARE THREE PARAMETERS PULLING TOGETHER, and this is the spec that states the recipe: `radius_exp` 2.9 keeps a parent branch thick after it splits instead of dividing its section evenly, `step_m` 0.34 makes each segment long so a limb runs rather than curls, and `kill_m` 0.55 gives stubby branching at the end of it. Compare the shipped `temperate-oak`, which is the same genus with an ordinary 2.2-ish falloff: that one has a crown of twigs, this one has a crown of BOUGHS, and at distance the difference is the whole silhouette.\n\nSquashed to 0.75 so the dome is flat and much wider than tall, and placed alone -- 18 m spacing at cluster 0.2, the loneliest tree in the grassland set. Deeply corky bark is below the lattice.",
@@ -264,8 +310,15 @@
     "elev_max_m": 1400.0,
     "elev_min_m": 0.0,
     "slope_max_pct": 45.0,
+    "slope_min_pct": 0.0,
     "spacing_m": 18.0,
     "water_max_m": 0.0
+  },
+  "plant_recipe": {
+    "form": "mixed",
+    "generator": "temperate-shoots-v2",
+    "profile": "bur-oak",
+    "size": "mixed"
   },
   "quad": {
     "belly": 0.52,
@@ -406,6 +459,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.249,
+    "taper": 0.5,
     "wander": 0.24
   },
   "tuft": {

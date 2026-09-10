@@ -1,0 +1,93 @@
+{
+  "species": "birch",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Pale slender leader, irregular light crown and downward fine shoots replace the previous split top. Voxel-scale foliage remains a simplified interpretation of fine pendulous twigs."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "11642",
+      "source": "https://plants.ces.ncsu.edu/plants/betula-pendula/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "6407",
+      "source": "https://plants.ces.ncsu.edu/plants/betula-pendula/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "betula-pendula",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/betula-pendula/"
+  ],
+  "habitat": "pioneer",
+  "reviewed_generator": "temperate-shoots-v1",
+  "review_date": "2026-09-07",
+  "assessment": "Initial pilot rejected; v2 replacement requires a new comparison.",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "previous_findings": [
+    "Pilot is too triangular and upright; reference has long pendulous outer branchlets."
+  ],
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "6c8a870264504ca342c98212b68ff1d672974bd1c1856546b6dc8d14482c8d81",
+    "4": "1eff0e404ab7f70864a1025ba0ec24e292f193d24589713d1f805632bf713123",
+    "7": "f44b28994e3b31bf15c03eabaab411e509da153e6cbc0fa5c06b9e92ee908f7a"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "9a26b8aad86f2c10c613fcc7268148ac4c3839d077a1d0e55b36bc1c49bb470a"
+  }
+}

@@ -225,7 +225,7 @@ void UVoxelPauseUISubsystem::OpenPause()
 	const int32 Day = FVoxelFrontEndSwitches::Get().bDemoSaves ? 1 : VoxelPauseUIDetail::CurrentDayNumber(World);
 	// The context band's line: the save this session is writing into, or the
 	// game's own name on a session that has never been named.
-	const FString ActiveSlug = VoxelSave::GetActiveSlug();
+	const FString ActiveSlug = VoxelSave::GetActiveSlug(World);
 	FText Context = VoxelUIStrings::Title();
 	for (const VoxelSave::FSaveInfo& Info : VoxelSave::List())
 	{
@@ -418,7 +418,7 @@ void UVoxelPauseUISubsystem::HandleSaveConfirmed(const FString& DisplayName)
 	}
 	// Claim it, so an autosave-on-shutdown after this writes back into the save
 	// the player just named rather than into the seed-derived default.
-	VoxelSave::SetActiveSlug(VoxelSave::Slugify(DisplayName));
+	VoxelSave::SetActiveSlug(World,VoxelSave::Slugify(DisplayName));
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelPause: SAVE '%s' written."), *DisplayName);
 	RefreshRows();
 }

@@ -1,0 +1,88 @@
+{
+  "species": "wych-elm",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broad spreading crown over divided ascending forks; spring reference supplies visible branch layout and leaf-on photograph supplies mature crown extent."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "26942",
+      "source": "https://plants.ces.ncsu.edu/plants/ulmus-glabra/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "26938",
+      "source": "https://plants.ces.ncsu.edu/plants/ulmus-glabra/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "ulmus-glabra",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/ulmus-glabra/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "7983c7a3362189c9e4f2e3c9bec9fcade19cb127a27b61f50b764ab3b7ce63ec",
+    "4": "e8418d33c2c7e96e516272d53e49a171f3dbab75facfcc94ad8f55d24e5d63b4",
+    "7": "6c0acc53089c7ace7b5197da56d01d8e58bf305471b6f28dd2dcce2ef188f2d3"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "0ab1dc5f9f19402984fc64f9ca6e4e67a1f0e92aa463b5a8f80e379e2cac3e5a"
+  }
+}

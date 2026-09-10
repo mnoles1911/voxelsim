@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "revision": "temperate-ecology-authoring-v1",
+  "species": "temperate-sapling",
+  "kind": "tree",
+  "habitat_role": "regeneration",
+  "community_weights_per_mille": {
+    "oak-beech": 400,
+    "maple-beech": 400,
+    "coastal-conifer": 400,
+    "pine-birch": 400,
+    "riparian": 400,
+    "warm-dry": 400,
+    "east-asian": 400,
+    "wet-mild": 400
+  },
+  "trunk_exclusion_mm": 830,
+  "crown_opacity_per_mille": 595,
+  "reference_review": "reference-review.json",
+  "status": "authored_initial_placement_targets_pending_world_visual_review",
+  "notes": [
+    "Preferences do not bypass existing habitat gates.",
+    "Community memberships are game assemblages; regional botanical refinements remain tunable.",
+    "Variant bounds and publication authority come from the inventory, not this trait record.",
+    "Saplings concentrate in young stands and localized thickets; scarce beneath established ancient canopy. Stand order: mixed, young, open, ancient, thicket."
+  ],
+  "stand_weights_per_mille": [
+    60,
+    1000,
+    120,
+    10,
+    800
+  ],
+  "density_spacing_mm": 6500,
+  "density_abundance_q10": 819
+}

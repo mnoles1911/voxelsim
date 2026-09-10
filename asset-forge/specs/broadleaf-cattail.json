@@ -1,4 +1,39 @@
 {
+  "artifact": {
+    "asym_vox": 0.8,
+    "beam_m": 0.85,
+    "bilge": 2.6,
+    "billow_m": 0.16,
+    "crossbar_at": 0.42,
+    "deck_frac": 0.07,
+    "depth_m": 0.35,
+    "droop_m": 0.3,
+    "entry": 0.62,
+    "form": "hull",
+    "frame_at": 0.34,
+    "frame_base_m": 0.95,
+    "frame_drop_m": 1.15,
+    "frame_r_m": 0.03,
+    "fullness": 2.4,
+    "gunwale_m": 0.06,
+    "gunwale_vox": 1,
+    "keel_m": 0.45,
+    "keel_r_m": 0.04,
+    "length_m": 4.0,
+    "panel_vox": 2,
+    "rocker": 0.14,
+    "seat": true,
+    "seat_len_m": 0.8,
+    "sheer": 0.35,
+    "shell_vox": 2,
+    "spar_r_m": 0.045,
+    "strake_share": 0.25,
+    "sweep": 0.85,
+    "taper": 0.3,
+    "thwart_t_m": 0.05,
+    "thwart_w_m": 0.1,
+    "thwarts": 2
+  },
   "biomes": {
     "bare_rock": 0.0,
     "beach": 0.0,
@@ -82,6 +117,13 @@
     "shell_upper": 0.55,
     "squash": 1.0
   },
+  "curation": {
+    "notes": "Reference-reviewed spring source; endorse variants individually in Forge.",
+    "seeds": [
+      1
+    ],
+    "status": "draft"
+  },
   "detail": {
     "depth_max_m": 6.0,
     "depth_min_m": 0.3,
@@ -111,6 +153,7 @@
     "caudal_shape": "forked",
     "caudal_span": 1.15,
     "caudal_upper": 0.0,
+    "claspers": 0.0,
     "curve_amount": 0.0,
     "curve_at": 0.55,
     "depth_at": 0.36,
@@ -242,7 +285,9 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
+    "frame": "beak_horn",
     "head": "leaf_autumn",
+    "hull": "heartwood",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,18 +298,27 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "leaf_broadleaf"
+    "stem": "leaf_broadleaf",
+    "strake": "deadwood",
+    "trim": "bark"
   },
   "name": "broadleaf-cattail",
-  "notes": "THE MOST RECOGNISABLE WATERSIDE PLANT THERE IS AND THE LIBRARY DID NOT HAVE IT. `bulrush` ships with 'shorter, thicker stems with a fat dark head' and `water-reed` with 'tall near-vertical waterside stems with seed heads'; neither is a Typha, whose head is a dense velvet-brown CYLINDER 15-20 cm long and 2-3 cm thick on an otherwise bare stalk. That silhouette is unmistakable and unmatched by anything shipped.\n\n`head_m` IS 0.09 AND THE HONEST FIGURE IS 0.02, AND THE RENDER IS WHY. A real cigar is 2-3 cm thick (estimate). At 0.05 m -- already twice life size, because one voxel is the floor -- the head is ONE voxel across, and on a contact sheet it came out as a scatter of loose dots up the stem rather than as a cylinder. At 0.09 it is two voxels and reads as a cigar. That is roughly four times life thickness.\n\nTWO VOXELS IS THE FLOOR FOR ANYTHING THAT HAS TO READ AS A SHAPE RATHER THAN AS INK, which is the same conclusion `docs/fish-shape-research.md` reached for a shaped colour boundary and `docs/bird-shape-research.md` for a bill. Written down because it is exactly the kind of number someone later halves back to life size and quietly destroys.\n\n`head_frac` 0.11 puts it in the top 24 cm of a 2.2 m stem.\n\n`head_share` 0.35: two thirds of the shoots in a real stand are sterile leaf fans with no cigar at all, and that mix is what a cattail bed looks like.\n\n0-0.5 m of water at the margin; it will not grow in deep water and it dominates everything shallower.",
+  "notes": "Spring understory source for Typha latifolia; architecture: cattail. Metric geometry at 25 mm cubic voxels. Species baseline and generator define the source; numbered seeds generate variants. User endorsement remains separate from source review.",
   "placement": {
     "abundance": 0.9,
     "cluster": 1.0,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
     "slope_max_pct": 15.0,
+    "slope_min_pct": 0.0,
     "spacing_m": 0.5,
     "water_max_m": 2.0
+  },
+  "plant_recipe": {
+    "form": "mixed",
+    "generator": "temperate-understory-v1",
+    "profile": "broadleaf-cattail",
+    "size": "mixed"
   },
   "quad": {
     "belly": 0.52,
@@ -331,7 +385,7 @@
     "waist": 0.94,
     "width": 0.62
   },
-  "resolution_cm": "5",
+  "resolution_cm": "2.5",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,
@@ -405,6 +459,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.3,
+    "taper": 0.5,
     "wander": 0.15
   },
   "tuft": {

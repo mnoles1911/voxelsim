@@ -1,0 +1,792 @@
+{
+  "status": "staged; not installed",
+  "palette_sha256": "c6d06942f39405d2680d2989e6bc8b91318882a9f193c0ef98d2523d66e35c87",
+  "models": [
+    {
+      "id": "temperate-oak-0007",
+      "species": "temperate-oak",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 211319,
+      "geometry_sha256": "8dee8e26a9c41662151cd143ae6d6a56b0bab346738b490ca897b2aaf7f47666",
+      "source": "library\\temperate-oak\\temperate-oak-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "341269c8d2e962016a26d58d3029f5fbe970b46a131b183332312c2f9395ed44",
+        "species.rgb": "f1a65a9cd706380b86f46739a7dae8e6b57d20b113b257bbc13c44fa2b10abd5",
+        "voxels.bin": "c698a3ebac34b55d7d814a73d22b76feda9289a4c7174124b594fad320a3d160"
+      },
+      "color_count": 81
+    },
+    {
+      "id": "american-beech-0007",
+      "species": "american-beech",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 339073,
+      "geometry_sha256": "8f84ad2c2c0b3b1f60f5237e36400aa3f5a4d4a0ac7c5b3b85677feb9ecfda71",
+      "source": "out\\forge-candidates\\american-beech\\american-beech-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "ff3f2de6f0457ef851f7492f561d94d2ee34c9e200249be7e9827a9b0e643580",
+        "species.rgb": "b2cde4a478b3dc16b9b19a99e248c0eeb54c1d2e368ddc3899391d6086bd40bc",
+        "voxels.bin": "412431ddba451d445d9c3d66ecdd96d1ba2e95211f60490fad1df24cddd66eb3"
+      },
+      "color_count": 110
+    },
+    {
+      "id": "european-beech-0007",
+      "species": "european-beech",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 424878,
+      "geometry_sha256": "35514e0ddc272efadab765582af43a1314bcec0feffca4b92f95a469ff8933cc",
+      "source": "out\\forge-candidates\\european-beech\\european-beech-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "354cb6e5e196fc4069eb4cf48690170622ba01815e883e3ef3194d6a6b10de54",
+        "species.rgb": "98ee0be85f2d8540bf7e371ccc6c91d7359d5f792d40537bb019e9533e580863",
+        "voxels.bin": "96d8f7f06add18757ab966b709156be869579dcd4d005a9d0ae8df8c42f349e9"
+      },
+      "color_count": 106
+    },
+    {
+      "id": "sugar-maple-0007",
+      "species": "sugar-maple",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 374033,
+      "geometry_sha256": "ef770791dd2076847132ac4d2d22d5e4e51d27a31195c0f9af8d4dee30c9a95b",
+      "source": "out\\forge-candidates\\sugar-maple\\sugar-maple-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "71cdbc9492735e32dedab3a1220a1e34647e86909f74f51491ec78f4e3a6aa1a",
+        "species.rgb": "5beae73b6e9bb16d8350720bb1d01de62aa20fac791b7a2b70c7ec7c6bf92928",
+        "voxels.bin": "fb7c7cd00cc6003650e17461f7fa6b235d245b5df4781cc6e0f08b7f555bde25"
+      },
+      "color_count": 148
+    },
+    {
+      "id": "bigleaf-maple-0007",
+      "species": "bigleaf-maple",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 616475,
+      "geometry_sha256": "2f66de0b0d372b491fc15f77b0f9136996f40722587af1a060d75efaa99b2a89",
+      "source": "out\\forge-candidates\\bigleaf-maple\\bigleaf-maple-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "5da43a367e1e08cf21455b1207e4d81af68a94030a72ef82c023f0434962f2fc",
+        "species.rgb": "0d30ca9de17a572c0299de35293921d022f5ec8cebd6b56af80d62eeeac8a077",
+        "voxels.bin": "522118723059989e26e5885f0faf33647de4aee39fceb5093919b388027af5ab"
+      },
+      "color_count": 149
+    },
+    {
+      "id": "sycamore-maple-0007",
+      "species": "sycamore-maple",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 430567,
+      "geometry_sha256": "9607cfd264ecf892f650f3fcb191abaff22bbccfa62511df827ece3babbbc80a",
+      "source": "out\\forge-candidates\\sycamore-maple\\sycamore-maple-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "38081ffc0971578fcc53037a1ec5b447d27b7909f2df514c3b381aeb9114b15d",
+        "species.rgb": "5e41b62f58152c26f5e14f7234cc7a30dfcd1e82c7f66e5f39b09bbe0fa922df",
+        "voxels.bin": "f88bb2944baf18b2bdb0a7d311e1e4b71f8898d268c7e96498f0567c963edd9a"
+      },
+      "color_count": 161
+    },
+    {
+      "id": "field-maple-0007",
+      "species": "field-maple",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 46029,
+      "geometry_sha256": "a2967360092768b29a4b4b33993e1c0cf69eee03f708dde4b5aca7ad36b2e81f",
+      "source": "out\\forge-candidates\\field-maple\\field-maple-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "48501e9f4e022a1cb86c2de2a2961eef3ed3eb2dbbe4f24bc2567c09f6b8b974",
+        "species.rgb": "18376f1bd94c087d169136f881edd17e532e707a15bba02ae27ccb6fd6b18767",
+        "voxels.bin": "f777670e61ca3a153ab974eb0a185063bc6e2c4df05edb2fe2c0610449f6fc48"
+      },
+      "color_count": 95
+    },
+    {
+      "id": "japanese-maple-0007",
+      "species": "japanese-maple",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 10085,
+      "geometry_sha256": "399e1f0973d23c7f3c1b590eea5a5969ead783c3a85f30d042eada8a56b732af",
+      "source": "out\\forge-candidates\\japanese-maple\\japanese-maple-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "e283ff67f07e69f3b92bed0795e11911a4b23f5ff2f297933c126d7f04958148",
+        "species.rgb": "1ebda07752d61f3711e49696faa04e45cdabe955b63c2dc9481859f4b4ca6fa2",
+        "voxels.bin": "06a1e04a1f9aec4873e76b2d508fcafade9139827279c700543ca8a763311f55"
+      },
+      "color_count": 91
+    },
+    {
+      "id": "hornbeam-0007",
+      "species": "hornbeam",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 145896,
+      "geometry_sha256": "10d4121c69573b2960d7c6f7066a4a7111a0b2e8e05a692f433e6307686bfc14",
+      "source": "out\\forge-candidates\\hornbeam\\hornbeam-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "9ca310546b979b90063f7006a46741d7fad301e87fee1189c5c3c679b5824b98",
+        "species.rgb": "de000601508e00ecba1323f129ac7f0d6565fbb61d0424114982c0e7fab0fadb",
+        "voxels.bin": "f35213197cfe75a0e9354e65f68d322002b1811a3adf24952598f1185a45801b"
+      },
+      "color_count": 103
+    },
+    {
+      "id": "small-leaved-lime-0007",
+      "species": "small-leaved-lime",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 211741,
+      "geometry_sha256": "deffaa366fabdc49c8f8bd75d9e79f413ec418fe988b8b2e03c379c27e8b31f3",
+      "source": "out\\forge-candidates\\small-leaved-lime\\small-leaved-lime-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "b3251c2bfc01050f438df81cb028907d07f853f6b5a8337b09f36c0288eaf81f",
+        "species.rgb": "68efbfa7f1aeaa113e2292cea751cee6b7a087ea2757fe8ab9b9a1ba783a3266",
+        "voxels.bin": "06dbd173dcac913934fccc44ea7a33256de44d9e7a48d36fba9b88c2cee41438"
+      },
+      "color_count": 101
+    },
+    {
+      "id": "common-ash-0007",
+      "species": "common-ash",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 186271,
+      "geometry_sha256": "cd019cfa5793d0515a4b262f3a7c4306cca8970b5af0923568f10c036a3f5167",
+      "source": "out\\forge-candidates\\common-ash\\common-ash-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "19e36addf5989484dff243e8afe783ab28477294349a83bd36d478e418243523",
+        "species.rgb": "6b701f0ed3f6b51fe412a4a0dba0821ef8386beff37abdde53833a10d293e2cc",
+        "voxels.bin": "849b67bc56156997f0edc21aa871afead147673c18d363ee754ee4452b2d7703"
+      },
+      "color_count": 110
+    },
+    {
+      "id": "field-elm-0007",
+      "species": "field-elm",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 42931,
+      "geometry_sha256": "c61102de0070909c5d9b11694bef660260e504f115eded74969661c904bbc5e3",
+      "source": "out\\forge-candidates\\field-elm\\field-elm-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "4deeb5d959ca12ac2c275e26b65bfe3acdf9976fe843fc0d76c6709bcee71c39",
+        "species.rgb": "ffa5214511dafcde48e1d21e3df3c68f6ccbafbacd54ca1ffa2bbae082132783",
+        "voxels.bin": "03f895ff741d5a979647aa4fabaa183ef61ee6bcc8f5eed608213fb0ea9b6854"
+      },
+      "color_count": 85
+    },
+    {
+      "id": "wych-elm-0007",
+      "species": "wych-elm",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 184728,
+      "geometry_sha256": "6c0acc53089c7ace7b5197da56d01d8e58bf305471b6f28dd2dcce2ef188f2d3",
+      "source": "out\\forge-candidates\\wych-elm\\wych-elm-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "c40165837f6b3e54cccb49172b126e2044d7171fa72d8985df21b3d6faebd0f3",
+        "species.rgb": "c0c5b96a6a9754a03badac38f14e94969f97bee09affaa91a2ff1441fa4e9a4a",
+        "voxels.bin": "7afa9c6658b14bf880bd9296229bef41163c0ebe1a1ce20c34ca8955bc88151e"
+      },
+      "color_count": 93
+    },
+    {
+      "id": "birch-0007",
+      "species": "birch",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 49085,
+      "geometry_sha256": "f44b28994e3b31bf15c03eabaab411e509da153e6cbc0fa5c06b9e92ee908f7a",
+      "source": "library\\birch\\birch-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "1c91b186a2f8839898232a5d716b59886f02560a95fa6e7b743ddd99b7fb2872",
+        "species.rgb": "0b4422fe9dd1f68bbbc7349d7d873cadbe218130d5847059379ea7277c032200",
+        "voxels.bin": "2f13cacdd5bd691aae9021f04ccd9849c0f3d423ad2edf195415df2d63d8a899"
+      },
+      "color_count": 114
+    },
+    {
+      "id": "common-alder-0007",
+      "species": "common-alder",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 87849,
+      "geometry_sha256": "190788b61c4a60c60a22316e78a1622b04cb852724b7428eb37bc971b63ee780",
+      "source": "out\\forge-candidates\\common-alder\\common-alder-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "214528b50ab3edec93bf4128981949664b5f7f39fe42f31ff491ae79d6f7e1f7",
+        "species.rgb": "5692e4405de31bc75665a21cb59b199f98e83b547d0da7ccdc9b0ba0eeefb0d2",
+        "voxels.bin": "661495a3928224434405b0f26383f5df305c330789e11a91815e7ca0ff0cd99c"
+      },
+      "color_count": 136
+    },
+    {
+      "id": "eastern-cottonwood-0007",
+      "species": "eastern-cottonwood",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 273807,
+      "geometry_sha256": "a2ceb9d45665b9180161b8a602cdff125963d13b3862ee42cb6647a9083ea109",
+      "source": "out\\forge-candidates\\eastern-cottonwood\\eastern-cottonwood-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "46a6cb12f2de36d8d643f5d03d241ac07f6f7285628a3aa15ed7f8712f07dce8",
+        "species.rgb": "3762ce3abab0d13e1c9d97873e943e43e387f01859b32c6c742e34e53b8da0bf",
+        "voxels.bin": "f7ec93b044b79c1eab5a5b08179d6c43e14e9677d9c326da129d99d0168ef39b"
+      },
+      "color_count": 104
+    },
+    {
+      "id": "quaking-aspen-0007",
+      "species": "quaking-aspen",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 65924,
+      "geometry_sha256": "5f026b8b14024562df9a400c23530813c6755e54b995ac34b1bd27e3cb178b9f",
+      "source": "out\\forge-candidates\\quaking-aspen\\quaking-aspen-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "ae9af82103cd1bcb90ccc72247cc9837c9ae6ed8da83e903997ae2af51126560",
+        "species.rgb": "98c0cde2afe26a801caf37992ced023cdb13c655cec3b0f630e4837cb1a0bdf3",
+        "voxels.bin": "7323fc1bd01a2031e15ccb50c1cbd301c27625313b9c656ec12f944ecce6bb64"
+      },
+      "color_count": 128
+    },
+    {
+      "id": "white-poplar-0007",
+      "species": "white-poplar",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 125518,
+      "geometry_sha256": "eaab8bdac23f465e9786be8edf812cf2cf5c973a5c35a574a3aa79b88cef1db6",
+      "source": "out\\forge-candidates\\white-poplar\\white-poplar-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "e16b8e0e50fef4d10acfaa3a382bf20fde4640a2be371f0ffc9d9a98dc992f1c",
+        "species.rgb": "5900352533fbd7e85f56fa84a86cca4841233d5d638c0bc688b4e1d7bc29d50c",
+        "voxels.bin": "eefaf59541d1294bc5e9e21fafaf2b3df2e1a2f107a67ccfc7cef8ad8ec581d0"
+      },
+      "color_count": 110
+    },
+    {
+      "id": "weeping-willow-0007",
+      "species": "weeping-willow",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 124597,
+      "geometry_sha256": "2a709af7d29702990895bb48bc33579a213b43711ba467273693a680d8104f00",
+      "source": "out\\forge-candidates\\weeping-willow\\weeping-willow-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "361e5941a1d679fec22a7452763de545a883ee7be4e4eb07df488669737fffe7",
+        "species.rgb": "515c59f19cb0437240fe8a3abf73803a49be1f16a811892e61fb87c3ac268dba",
+        "voxels.bin": "ca7c7d93a4ddb8ac5dbf927d6f1f16b457dc4034c3ba197589219f3cf77bd371"
+      },
+      "color_count": 106
+    },
+    {
+      "id": "black-cherry-0007",
+      "species": "black-cherry",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 109707,
+      "geometry_sha256": "5ab3c4c2b9de7f010c510fe27f7b98cafe759abc1fb028b2009afa4d5bf931cc",
+      "source": "out\\forge-candidates\\black-cherry\\black-cherry-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "006735f28a360ed243b86a07b6ee984cb5ddd31f44abce0e1c3da05ef64dcaff",
+        "species.rgb": "cd09db933ad0e4ea3fcd882893a66443e72878d9d2ca9b5d7d68aef7f55a7998",
+        "voxels.bin": "aed8e07568a9f16811348df9cb38f55d802c234b0714eb057828df33e99c22b8"
+      },
+      "color_count": 127
+    },
+    {
+      "id": "cherry-blossom-0007",
+      "species": "cherry-blossom",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 16933,
+      "geometry_sha256": "c8016884e6f14f5f20212fb9896c5cc43c1d02b1b44ed3aad2dc6ead68047675",
+      "source": "out\\forge-candidates\\cherry-blossom\\cherry-blossom-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "f6f32c64b8dd176f09a93e7d539b9cf3f8831514797fe9eb9873dc6bf7506580",
+        "species.rgb": "1dc268bf0099a78cd2686f68bbab29ac77749d7d515b4970794dd620506db8d2",
+        "voxels.bin": "7770c4cd960f06c830fe89728ce8048cecd5dd509ff355ade30249308ce40a2b"
+      },
+      "color_count": 134
+    },
+    {
+      "id": "flowering-dogwood-0007",
+      "species": "flowering-dogwood",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 27464,
+      "geometry_sha256": "2ca2152020b6ece827e90daea0541453d25ac3b5691474b067424644e32e38cc",
+      "source": "out\\forge-candidates\\flowering-dogwood\\flowering-dogwood-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "8703e9642d55580d877ee879468ea451220295fc5c9fe680daec4ae942c3c516",
+        "species.rgb": "e471737ee0ce7489331cfbbecd758d041d6caf2838de8093f72a9a69f73392a6",
+        "voxels.bin": "80f167874489c9d5c0e33f9830852c1402533b1b858dec056b8f03a76dd4131d"
+      },
+      "color_count": 137
+    },
+    {
+      "id": "hawthorn-scrub-0007",
+      "species": "hawthorn-scrub",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 6083,
+      "geometry_sha256": "aaf7577d9298cacf3a26a5c4f6a9b0c29694edc7059d5d1ac6fc9e9d3087eede",
+      "source": "out\\forge-candidates\\hawthorn-scrub\\hawthorn-scrub-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "0b04f4f4ebd1b848c3d73b628aaf5d8be4703306f3fcbcc2e03f7324add3d864",
+        "species.rgb": "ddf9510d087f0fd8d404572a4a643f569dff7de9cd6ce38f4143643dd999950a",
+        "voxels.bin": "b8e5ffcfc2fa3ddf16675e2e9b432cc62236fe77cc1f2b0ae5fc837d9a58968d"
+      },
+      "color_count": 77
+    },
+    {
+      "id": "crab-apple-0007",
+      "species": "crab-apple",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 14045,
+      "geometry_sha256": "fc66854e951bfc074ae8800a005bbb5e02d605b7120feaad1b6415cde16e3c94",
+      "source": "out\\forge-candidates\\crab-apple\\crab-apple-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "690766fbaaba95a999f59336ac099310fcc844285456e61dd0794749a9b52215",
+        "species.rgb": "22dffc5448a21dfba898a847052e421363295b723748f324e08234a027122566",
+        "voxels.bin": "3958c6aea8867ec9179232aa307fcd37ea2930d1354a6a9dd925b85c9361fb59"
+      },
+      "color_count": 118
+    },
+    {
+      "id": "wild-pear-0007",
+      "species": "wild-pear",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 22104,
+      "geometry_sha256": "fa835c188f47fa69361fa87f91462e01451e9280fdeb853fb6f13945de062d84",
+      "source": "out\\forge-candidates\\wild-pear\\wild-pear-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "1afb0f1b290a3dafad57c3eec6f11635d24c926ad33e7e5b4af647c1c1041709",
+        "species.rgb": "48406fb4f78f93abec95a2bb1f0d3b917958b61a938f4e4c10d5c2967c457326",
+        "voxels.bin": "ccac5c31efdb5ebee2c36d3920b08671a832769ce1c6b9450fbb51a643c63113"
+      },
+      "color_count": 126
+    },
+    {
+      "id": "rowan-0007",
+      "species": "rowan",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 28839,
+      "geometry_sha256": "6f8dd8dc770a249646c91f3e20480da727517a6c94fce5612bf78592bcdc9ab2",
+      "source": "out\\forge-candidates\\rowan\\rowan-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "f40e272c53ebb5c3a39c1db294d26f2ea9e449b22e1afc8db877703fe6eddbf7",
+        "species.rgb": "3c863f9508720d3d05586374f68946de2f3c18ae438accc10af065a1dec60228",
+        "voxels.bin": "c36f0f69a7ba623098b70ee97f60009fdc5bc39aa29b2a4de5a222eeab8dfccd"
+      },
+      "color_count": 104
+    },
+    {
+      "id": "shagbark-hickory-0007",
+      "species": "shagbark-hickory",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 304826,
+      "geometry_sha256": "ab263ae0a5201e15c12be90cc6deade8dadc196c2674bafd3feb9ab8052437a8",
+      "source": "out\\forge-candidates\\shagbark-hickory\\shagbark-hickory-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "8bd2c203195fa327a7d366cc15b3c64a4d10546c3e05591c823bc98ad8aae911",
+        "species.rgb": "41b16cc43110743d753149df5e25e49d8501192ab45068e647345f7de43920d6",
+        "voxels.bin": "ad79645f64ade3ade7209c31c218f2420f87f0f9b2a6375998e15e196916d59e"
+      },
+      "color_count": 108
+    },
+    {
+      "id": "sweet-chestnut-0007",
+      "species": "sweet-chestnut",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 358818,
+      "geometry_sha256": "0040fd4c39d33f04db169fd57bf7d003533e42e3a291b2951dcf509f9e3cb366",
+      "source": "out\\forge-candidates\\sweet-chestnut\\sweet-chestnut-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "b77f0ed34a04ca6db0d80dcd2715f8e1a1f5b1d2aac60159a9927ccf1f44e20c",
+        "species.rgb": "44e50bce569343de53e230ec07352838e9b504b0d740402905e909354f224ab9",
+        "voxels.bin": "ab4cd902d83098f49f5df5c9e019698898fea9a43fea94c456223b677e705602"
+      },
+      "color_count": 94
+    },
+    {
+      "id": "tulip-tree-0007",
+      "species": "tulip-tree",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 318262,
+      "geometry_sha256": "662e9aa5b3f64da60b8a68b05a36dfea55b54779807e941acc2a4127ce8a08c3",
+      "source": "out\\forge-candidates\\tulip-tree\\tulip-tree-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "15186b90dc7304140ac0989743db517459f5de2a597019c945b6f54de64d0d40",
+        "species.rgb": "aaecd11cba97f86cb009f4397bf9c9be50d210b9720fad5082f782a42a97b8eb",
+        "voxels.bin": "5d42e7bf9448ad66cb8415f129009384e28dfd8b6ec3679bf0e7d733d31612c2"
+      },
+      "color_count": 112
+    },
+    {
+      "id": "honey-locust-0007",
+      "species": "honey-locust",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 101001,
+      "geometry_sha256": "5b3e004ea0c92c31e376a15f131256eddd766200544b0fd2c79938ed9d4f8f3b",
+      "source": "out\\forge-candidates\\honey-locust\\honey-locust-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "b7178cab718ff403f1c239cd774989afa2cee57a99b0308118ced1cc82ec53bb",
+        "species.rgb": "513fb66a8a28a91c500c043d105c9fa0466c91cba0c82ce9000d19c82a067b34",
+        "voxels.bin": "f7f0096d6cf61621f1e0c3d91fd6acc4410afa816e7a4e9eecbb4096a0f8def9"
+      },
+      "color_count": 111
+    },
+    {
+      "id": "bur-oak-0007",
+      "species": "bur-oak",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 210179,
+      "geometry_sha256": "645bc57f309d7563d820ec2f08223f2f3853cffde362acbac4d67d2b953d9b5e",
+      "source": "out\\forge-candidates\\bur-oak\\bur-oak-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "ac0fc16d060bf9543841ed2a1d0169af3eb1ff68aaefce4ab17568fffcd8b443",
+        "species.rgb": "68bcc31022229632b8278c7e284743c38e997a166a325b5a0095dff77d9585a1",
+        "voxels.bin": "4f04ec612f7367d106e181c700cdebb985ac57ccbe522adbfa26b5cc92815bd8"
+      },
+      "color_count": 95
+    },
+    {
+      "id": "cork-oak-0007",
+      "species": "cork-oak",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 94284,
+      "geometry_sha256": "9da0ee3722ee79fee462f97be9f667f0b75fd09aa08c1ffcddc7e62d0d0b24a7",
+      "source": "out\\forge-candidates\\cork-oak\\cork-oak-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "1c44cc275418481d7168b0021f4e090f817f0fe0514c3c193d7040571538dd78",
+        "species.rgb": "ce723ef861bed07ff365db7a88d3aa115604d390d708fa1a256f1a2eb359d902",
+        "voxels.bin": "0f42ab4c48b0134ba2c2e56489a3b4b258ffbc114006f594f0dfa0893137bfd9"
+      },
+      "color_count": 98
+    },
+    {
+      "id": "holm-oak-0007",
+      "species": "holm-oak",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 77813,
+      "geometry_sha256": "75e9b3fe4a17babc1b54704522d998bef05bc6cac9749945d9e06544e6331fdd",
+      "source": "out\\forge-candidates\\holm-oak\\holm-oak-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "f409559b28d789f21da55772bbac95e31d070bca8cb64738394d096c1ef341f0",
+        "species.rgb": "e9775f4ad9465d9de3513b8011502877a6a779d59888dfdff2abc6fade94aaa5",
+        "voxels.bin": "cd1b4c0802fd433d3b721b70881402f4558575fa63d7ceae9974bf6e52142300"
+      },
+      "color_count": 146
+    },
+    {
+      "id": "river-broadleaf-0007",
+      "species": "river-broadleaf",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 61041,
+      "geometry_sha256": "dc59e376678b46517bab3b3955e4158b158645a62dbb1423ee0d296b0e19bd5d",
+      "source": "out\\forge-candidates\\river-broadleaf\\river-broadleaf-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "cfde0f3367b45b6007ba6b7e811abadadb1dca9082c0656d3035e2901c6057e3",
+        "species.rgb": "ea70d755c6ce9b4a64e2410cb7ed63859a21cdccf876f176de9608cda3cc17a0",
+        "voxels.bin": "9e984dcde39328589def9e506032ae41e359050f4327bdf07a9df8ecbb887cfb"
+      },
+      "color_count": 136
+    },
+    {
+      "id": "temperate-sapling-0007",
+      "species": "temperate-sapling",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 5695,
+      "geometry_sha256": "2d1543d7f724be374cea2a94379165fd886e847eccc1d2e7f207555856fb5a80",
+      "source": "out\\forge-candidates\\temperate-sapling\\temperate-sapling-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "a1b5654f9b8c142a0d28d538f786183d29f90a13c6365e7e3bc3fa5228f9b1b1",
+        "species.rgb": "d3d5391663b0b3c865c06e35f351beaf48cec35ad0d2adeb50a7d9a56847d644",
+        "voxels.bin": "07897f5a3386b6b7e278e09bb2fbb550df27cfabd29289d0991668e79be8e425"
+      },
+      "color_count": 90
+    },
+    {
+      "id": "douglas-fir-0007",
+      "species": "douglas-fir",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 456611,
+      "geometry_sha256": "b4da17830a7f94a6b83215e8f45f28cc3ff04715f767553a76f41aa5edac8d65",
+      "source": "out\\forge-candidates\\douglas-fir\\douglas-fir-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "8c52f216ba73df5660fc1d87977c74959cf3dfabd5b58d9c1edc91a65510319c",
+        "species.rgb": "ce684af3c507a917b1f8f5caaaaa7d4dd7a8ce9939bae64936e1fa541200c414",
+        "voxels.bin": "bfca92563403f86432a4cc5e01fd6c8b8517312c2f8ca5c479c2a1351cd6c019"
+      },
+      "color_count": 90
+    },
+    {
+      "id": "eastern-hemlock-0007",
+      "species": "eastern-hemlock",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 320750,
+      "geometry_sha256": "14ffdcb8fa11f715b44692e326bc7153bc05ae8f7c1c0eff3392594cc5dc8809",
+      "source": "out\\forge-candidates\\eastern-hemlock\\eastern-hemlock-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "442771a8d3a96f607fc0c459bda5dbea048883c25bcb40ca6fd3a73736a60a9b",
+        "species.rgb": "dc40c328560b6fba94758c97f570549f030310411ed3919f619ae01fd3e9d2ee",
+        "voxels.bin": "1d18bb97f6e98b15b745f0068e19e55f8e7ed4d346a816eae4cd280b28a46840"
+      },
+      "color_count": 89
+    },
+    {
+      "id": "western-hemlock-0007",
+      "species": "western-hemlock",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 400322,
+      "geometry_sha256": "6a19a524aa184f9c9edd549b5d4f060846e5bd6418185c7bb69664df0661f190",
+      "source": "out\\forge-candidates\\western-hemlock\\western-hemlock-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "10ac35b042ef9ffd18be3c712521df1a5a0904c23bb8d1da10b7786d2ff4304c",
+        "species.rgb": "1e32d15e875172c8f00f330e7e0da457dd3a9c0c5a89cecd0585278567e841d7",
+        "voxels.bin": "baa59581647dd917e468bb7ea12383cc6fb2d2c5bd27bb13e5ba645bb62ef23e"
+      },
+      "color_count": 92
+    },
+    {
+      "id": "western-red-cedar-0007",
+      "species": "western-red-cedar",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 729822,
+      "geometry_sha256": "8ae83d56b63887532f387ef786d5c113964715717ab526146324762b2f8a045f",
+      "source": "out\\forge-candidates\\western-red-cedar\\western-red-cedar-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "24fb738499053ff9aa46c94586cf0a4903e4fa11d856572db5c81cd7e3eb7c5a",
+        "species.rgb": "f5453ec3e3b9ec1662130962e7f9ef18f2ff74b2afa125c3b29562baaeddf533",
+        "voxels.bin": "9bf23f9341a70ab5dfbf4187688a53752023a7b826c151517ae040f271effc69"
+      },
+      "color_count": 79
+    },
+    {
+      "id": "norway-spruce-0007",
+      "species": "norway-spruce",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 388558,
+      "geometry_sha256": "28ac8c0312429261f2149969085a27d0bc639108f4b9d058e4949b7d01256d38",
+      "source": "out\\forge-candidates\\norway-spruce\\norway-spruce-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "2bb6850c7c64ca651a2cc8fa1b9ab435adf9909ba2cb64b695f2796d478674ee",
+        "species.rgb": "3f91c901b6d09c9b0040192ead86a767dd0b458e5d483b4c99c9ea602cd86885",
+        "voxels.bin": "e7f5e2fa79d98ac5926006f54e7d4798c428cd3105bba8a3ff3aecbd6e903b95"
+      },
+      "color_count": 146
+    },
+    {
+      "id": "sitka-spruce-0007",
+      "species": "sitka-spruce",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 591397,
+      "geometry_sha256": "f2deece557dfb3181230366f2c1f6d103193a39a261e44f7a0f11702e4176086",
+      "source": "out\\forge-candidates\\sitka-spruce\\sitka-spruce-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "3232b0e4d368d2e85e832de68efa69c4c993947b0fdb178e23de8df407d09782",
+        "species.rgb": "6e480548a1192437982fbcbfbd08bbed7796a8e364c7f87147330caf1e8c782c",
+        "voxels.bin": "f50e03728f30634271c96578d96cd70aacb6f761e6bf7930959615f77252389f"
+      },
+      "color_count": 164
+    },
+    {
+      "id": "scots-pine-0007",
+      "species": "scots-pine",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 231778,
+      "geometry_sha256": "957d4d00a7b086d8dfed0167e1447c3afed363a0f745cc5d040ed1a86dd3b4c2",
+      "source": "out\\forge-candidates\\scots-pine\\scots-pine-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "99d2f303070aaea64ae6d086505a5da99d1e3129081b5736bf095680dc304f88",
+        "species.rgb": "62ec88101a6a929e4468e4f97c6835292191c128fac9a5c8a281a340f89eb203",
+        "voxels.bin": "92b4c41d57df302027cc36d654575cbf02f31dcfb76754aee8d6c66eead783f9"
+      },
+      "color_count": 287
+    },
+    {
+      "id": "maritime-pine-0007",
+      "species": "maritime-pine",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 219128,
+      "geometry_sha256": "5ef9faa5bc989ac4ecf3e10b5533347b2a6ff7effcd8f2f6dab74d9f10d072e7",
+      "source": "out\\forge-candidates\\maritime-pine\\maritime-pine-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "3d72826d3362b9a047a0525cfc1de256364a74dfca8978764e722006c48fdbf9",
+        "species.rgb": "5b2700882fe9b8ced2394670dd8fb0f70f4ae7f811c70daeae995fb816a259ab",
+        "voxels.bin": "f0545235bffd99b57ea587b679b726b6ca11dfcfe8a2806eee90e1eed9ce2895"
+      },
+      "color_count": 83
+    },
+    {
+      "id": "tundra-pine-0007",
+      "species": "tundra-pine",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 31224,
+      "geometry_sha256": "52c339ef1e278ae24bc342146bf765d383d371ebabd0f28b07d0973826a641ec",
+      "source": "out\\forge-candidates\\tundra-pine\\tundra-pine-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "082afb29d1341887dc19aaeb2bf42c3ed223ec00a7bbc483ba51052aa3763105",
+        "species.rgb": "613ddade7ec5027a1d685e1d0c564e3b5469af9a7784ab6fe88d438049951e03",
+        "voxels.bin": "7cd9f2514bc26e4f9cc05def675f5d17b12f797ae98e5eeb61070605c2be88f5"
+      },
+      "color_count": 223
+    },
+    {
+      "id": "monterey-cypress-0007",
+      "species": "monterey-cypress",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 95960,
+      "geometry_sha256": "42135147b5f6c354c1b8ddb301ab41257cb439fc0fad1a0ef753e35808f59a3f",
+      "source": "out\\forge-candidates\\monterey-cypress\\monterey-cypress-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "811a3e8ccba9b95a0eb52b90ecc78c78125177ff2631470706779e6be7813021",
+        "species.rgb": "0e464310ee89f104ad0c9cef2b3db0a8f747c9b24cc1d4464ba391a8448bb779",
+        "voxels.bin": "ac9b0e356a62e485648f9c5ac1e62ef627aeb26f7ac38e63845f1b1712bb9709"
+      },
+      "color_count": 99
+    },
+    {
+      "id": "columnar-cypress-0007",
+      "species": "columnar-cypress",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 23559,
+      "geometry_sha256": "33f9f0614681449c2a76372145004d197f3f71684021d5af10ff83e5c7de6da3",
+      "source": "out\\forge-candidates\\columnar-cypress\\columnar-cypress-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "65e82a43dbce4d5738ed304338e1ed214711dd3a9e9363967017b697a69e2d66",
+        "species.rgb": "b6510139d5dea37bd3256c86e800dc70cd32a260b8750de35f77c70faaa4850a",
+        "voxels.bin": "4e761ed056e7e0c78af522085585d33f0e708d1380045d19080feba50bebc682"
+      },
+      "color_count": 90
+    },
+    {
+      "id": "european-yew-0007",
+      "species": "european-yew",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 72310,
+      "geometry_sha256": "301670d36165f295354e4da4418cdab964ba2c77fe556994b9caf8f97ccdc8f5",
+      "source": "out\\forge-candidates\\european-yew\\european-yew-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "1e022e01334e40a2fab99763a3d6ad35038132a7daf7014c375ccae08eae7b2d",
+        "species.rgb": "6db64fbcb45ba2febe8958a7182933e930407f07961a17dbf49f607e02dfc6ef",
+        "voxels.bin": "b9bf2892711ec1488bdce0bdba005b7b440b9da92c0bcccf3028c3265be04ff1"
+      },
+      "color_count": 83
+    },
+    {
+      "id": "hero-sequoia-0007",
+      "species": "hero-sequoia",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 1354233,
+      "geometry_sha256": "80d4ee6560792129796460b8d0be77de882fb662cf738ca460247c729ea12704",
+      "source": "out\\forge-candidates\\hero-sequoia\\hero-sequoia-0007",
+      "needle": true,
+      "files": {
+        "baseline.rgb": "3f2c41c27f72dc5d958525562e15fa9643e48047647fce109d82878ddcc6c260",
+        "species.rgb": "e3c7276a199bf48542337e818c02bb96a0b7761efbd25e92be61217eacd67d44",
+        "voxels.bin": "c5b16e1d9c6d51d2eca801d6cb22d969a89123eb766f48a526556b5d1c713706"
+      },
+      "color_count": 95
+    },
+    {
+      "id": "tree-fern-0007",
+      "species": "tree-fern",
+      "seed": 7,
+      "voxel_mm": 100,
+      "voxels": 10859,
+      "geometry_sha256": "288b9ff9b1dbd056b314cd59c544e2ab11040724d9cca65709cdfc9c20487c29",
+      "source": "out\\forge-candidates\\tree-fern\\tree-fern-0007",
+      "needle": false,
+      "files": {
+        "baseline.rgb": "caa88f63463d37e8d9422bb3b8f9ed617808c1584fd2b05f4feda4b307482090",
+        "species.rgb": "1fc328936d0752c7d72260ed6641ab449dac0fe07083a2ebc55ae822bd10eaf8",
+        "voxels.bin": "b8ad0f122901c117f21ae24376138cbea8683abf980110a16c9ea37f18313e41"
+      },
+      "color_count": 90
+    }
+  ],
+  "errors": [],
+  "elapsed_seconds": 124.87
+}

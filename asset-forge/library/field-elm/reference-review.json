@@ -1,0 +1,88 @@
+{
+  "species": "field-elm",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Ascending scaffold and broad crown replace isolated leafy tiers; bark reference is retained alongside whole-tree habit."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "26946",
+      "source": "https://plants.ces.ncsu.edu/plants/ulmus-minor/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "26947",
+      "source": "https://plants.ces.ncsu.edu/plants/ulmus-minor/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "ulmus-minor",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/ulmus-minor/"
+  ],
+  "habitat": "edge",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "f0f436d567da4c5be349efa58dd2534669e467195a1ea0911b21eb6ac5960bcb",
+    "4": "bd2f9843be3afb9312185ad0275d004b03c8d2e5958f3ab9c6709bc874f6a5d7",
+    "7": "c61102de0070909c5d9b11694bef660260e504f115eded74969661c904bbc5e3"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "18d0003a2aa048229bcd1118ea89b61cfca655339b346ca5ad56fca32091121c"
+  }
+}

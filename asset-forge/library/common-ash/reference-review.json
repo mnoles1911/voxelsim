@@ -1,0 +1,89 @@
+{
+  "species": "common-ash",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Ascending fork network supports compound shoot groups. Autumn reference is structure-only; diversifolia photo informs crown outline, not typical compound leaf anatomy."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "/site/assets/files/5538/fraxinus-excelsior-12.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/fraxinus/fraxinus-excelsior/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "/site/assets/files/9855/fraxinus-excelsior-f-diversifolia-7.jpg",
+      "source": "https://www.treesandshrubsonline.org/articles/fraxinus/fraxinus-excelsior/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "fraxinus-excelsior",
+  "sources": [
+    "https://www.rhs.org.uk/plants/7308/fraxinus-excelsior/details",
+    "https://www.treesandshrubsonline.org/articles/fraxinus/fraxinus-excelsior/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "d641b289d6f527536f3de24b03992345b8b978b295f36934dc5c7ca61578ed32",
+    "4": "0641d1dec25a8143049bd04f93e7dcbfc123d8ff02eea4e7a9e2b605959813cf",
+    "7": "cd019cfa5793d0515a4b262f3a7c4306cca8970b5af0923568f10c036a3f5167"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a2e2833e7ce690e3aa902e8b416a9b526b484055753ad85e647ea9221626f938"
+  }
+}

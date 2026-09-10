@@ -1,4 +1,7 @@
 #include "VoxelEnvironmentLODPrototype.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "VoxelAssetAppearance.h"
+#include "VoxelAppearanceForest.h"
 #include "RenderCommandFence.h"
 #include "Async/Async.h"
 #include "VoxelPlantMeshComponent.h"
@@ -33,6 +36,9 @@
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/FileManager.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "TimerManager.h"
 #include "UnrealClient.h"
 #include "voxelcore/assetgrid.h"
@@ -74,7 +80,10 @@ FPrototypeGrid Reduce(const FPrototypeGrid& In) {
 // Admission applies to the complete hierarchy, not independently to each LOD.
 // Geometry arrays use about 296 bytes/face before allocator/component copies.
 constexpr int64 MaxHierarchyChunks=262144; // 128 MiB material payload
-constexpr int64 MaxHierarchyFaces=1000000;
+// Reviewed broadleaf crowns can exceed one million exposed voxel faces (the
+// sycamore pilot has1,022,968). Keep a bounded guard with headroom; GPU capture
+// and aggregate forest budgets still determine practical scene capacity.
+constexpr int64 MaxHierarchyFaces=1250000;
 constexpr int32 MaxHierarchySections=8192;
 bool PrepareHierarchy(FPrototypeGrid&& Source,TArray<FPrototypeGrid>& Out) {
     Out.Reset();Out.Add(MoveTemp(Source));
@@ -84,7 +93,7 @@ bool PrepareHierarchy(FPrototypeGrid&& Source,TArray<FPrototypeGrid>& Out) {
     int64 Chunks=0,Faces=0;int32 Sections=0;
     static const FIntVector Neighbors[]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
     for(const auto& G:Out){
-        Chunks+=int64(G.Data.chunkCount());Sections+=G.SectionKeys(G.Mm==25?16:32).Num();
+        Chunks+=int64(G.Data.chunkCount());Sections+=G.SectionKeys(G.Mm<=25?16:32).Num();
         if(Chunks>MaxHierarchyChunks||Sections>MaxHierarchySections)return false;
         G.Visit([&](int X,int Y,int Z,uint8){if(Faces>MaxHierarchyFaces)return;for(const auto& N:Neighbors)Faces+=!G.At(X+N.X,Y+N.Y,Z+N.Z);});
         if(Faces>MaxHierarchyFaces)return false;
@@ -167,6 +176,7 @@ bool SeatPrototypeAsset(AVoxelEnvironmentLODPrototype* Actor,const FPrototypeGri
 }
 struct FEnvironmentLODState {
     TArray<FPrototypeGrid> Grids;
+    TSharedPtr<const FVoxelAssetAppearance,ESPMode::ThreadSafe> Appearance;
     TArray<TMap<FIntVector,UProceduralMeshComponent*>> SectionMaps;
     bool Collision=false; int32 Revision=0;
     int32 LastSections=0, LastFaces=0;
@@ -213,7 +223,13 @@ const FEnvironmentLodPaletteLinear& EnvironmentLodPaletteLinear()
 	return P;
 }
 
-void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FEnvironmentLodMeshGeometry& Out, const FIntVector& Min, const FIntVector& Max)
+void ConfigureAppearance(UMaterialInstanceDynamic* Material,const TSharedPtr<const FVoxelAssetAppearance,ESPMode::ThreadSafe>& Appearance){
+    Material->SetScalarParameterValue(TEXT("TreeAppearance"),Appearance?1.f:0.f);
+    Material->SetScalarParameterValue(TEXT("TreeNeedle"),Appearance&&Appearance->IsNeedle()?1.f:0.f);
+    Material->SetScalarParameterValue(TEXT("FoliageCutout"),Appearance&&!Appearance->UsesFoliageMask()?0.f:1.f);
+}
+
+void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FEnvironmentLodMeshGeometry& Out, const FIntVector& Min, const FIntVector& Max,const FVoxelAssetAppearance* Appearance=nullptr)
 {
 	const int32 SX = Grid.sizeX(), SY = Grid.sizeY(), SZ = Grid.sizeZ();
 	if (SX <= 0 || SY <= 0 || SZ <= 0)
@@ -264,6 +280,8 @@ void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FEnviron
 				const float Gain =
 					1.0f + float(J) * 0.35f * (float(Pal.Jitter[M]) / 255.0f);
 
+                FColor AppearanceBase=FColor::Black;FIntVector AppearanceCell=FIntVector::ZeroValue;
+                const bool HasAppearance=Appearance&&Appearance->Sample(FIntVector(Cell[0]+Origin[0],Cell[1]+Origin[1],Cell[2]+Origin[2]),Grid.Mm,M,AppearanceBase,AppearanceCell);
 				for (int32 Axis = 0; Axis < 3; ++Axis)
 				{
 					for (int32 Positive = 0; Positive < 2; ++Positive)
@@ -286,6 +304,7 @@ void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FEnviron
 						C.G = FMath::Clamp(C.G, 0.0f, 1.0f);
 						C.B = FMath::Clamp(C.B, 0.0f, 1.0f);
 						C.A = 1.0f;
+                        if(HasAppearance)C=Appearance->ColorForFace(AppearanceBase,AppearanceCell,Axis,Positive!=0);
 
 						const float FaceCoord = float(Cell[Axis] + Positive);
 						const float U0 = float(Cell[U]), U1 = float(Cell[U] + 1);
@@ -311,8 +330,7 @@ void BuildNaiveFaceGeometry(const FPrototypeGrid& Grid, uint32 MeshKey, FEnviron
 							// The material samples no texture; a stable planar
 							// UV keeps every downstream assumption (non-zero
 							// UV channel, finite derivatives) honest.
-							Out.UVs.Add(FVector2f(CornerU[Corner], CornerV[Corner]) *
-							            (PitchUU / 100.0f));
+                            Out.UVs.Add(Appearance?Appearance->FaceUV(P,Axis):FVector2f(CornerU[Corner], CornerV[Corner])*(PitchUU/100.f));
 						}
 
 						if (Positive)
@@ -363,6 +381,7 @@ struct FEnvironmentMaterialProbe {
     TAtomic<int32> State{0}; // 0 pending, 1 intended material ready, 2 retry
 };
 struct FEnvironmentStagedRestore {
+    TSharedPtr<const FVoxelAssetAppearance,ESPMode::ThreadSafe> Appearance;
     struct FSection {int32 Level=0;FIntVector Key;FEnvironmentLodMeshGeometry Mesh;};
     TAtomic<bool> Cancelled{false};
     FVoxelImmutableGeometry Geometry;
@@ -393,14 +412,92 @@ bool AVoxelEnvironmentLODPrototype::InitializeAsset(const FString& Name,int32 Fi
     if(!FFileHelper::LoadFileToArray(Vxa,*Path)||Source.parse(Vxa.GetData(),Vxa.Num())!=vxc::AssetParseError::kOk||Source.voxelSizeMm()!=FinestMm)return false;
     return InitializeAssetFromVxa(FVoxelEnvironmentAssetDescriptor::Prototype(Name),Vxa,Collision,true);
 }
+bool AVoxelEnvironmentLODPrototype::InitializePublishedTree(const FString& Species,int32 Seed,bool FitTerrain){
+    if(Species.IsEmpty()||Species.Len()>128||Seed<1)return false;
+    for(TCHAR C:Species)if(!((C>='a'&&C<='z')||(C>='0'&&C<='9')||C=='-'))return false;
+    FString Directory;if(!FParse::Value(FCommandLine::Get(),TEXT("VoxelAssetDir="),Directory)||Directory.IsEmpty())return false;
+    const FString Id=FString::Printf(TEXT("%s-%04d"),*Species,Seed);
+    FString InventoryText;TSharedPtr<FJsonObject> Inventory;
+    if(!FFileHelper::LoadFileToString(InventoryText,*(Directory/TEXT("appearance/published.json")))||
+       !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(InventoryText),Inventory)||!Inventory)return false;
+    const TArray<TSharedPtr<FJsonValue>>* Published=nullptr;
+    if(!Inventory->TryGetArrayField(TEXT("models"),Published))return false;
+    FString PublishedHash;int Matches=0;
+    for(const auto& Row:*Published){
+        const auto Entry=Row->AsObject();FString EntryId,EntrySpecies,EntryHash;double EntrySeed=0;
+        if(Entry&&Entry->TryGetStringField(TEXT("id"),EntryId)&&EntryId==Id){
+            if(!Entry->TryGetStringField(TEXT("species"),EntrySpecies)||EntrySpecies!=Species||
+               !Entry->TryGetNumberField(TEXT("seed"),EntrySeed)||EntrySeed!=Seed||
+               !Entry->TryGetStringField(TEXT("geometry_md5"),EntryHash))return false;
+            PublishedHash=EntryHash;++Matches;
+        }
+    }
+    // Stale per-variant files may remain for saved objects, but cannot authorize
+    // new placements once the endorsed publication inventory removes a seed.
+    if(Matches!=1)return false;
+    FString Record;TSharedPtr<FJsonObject> Json;
+    if(!FFileHelper::LoadFileToString(Record,*(Directory/TEXT("appearance")/(Id+TEXT(".json"))))||
+       !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Record),Json)||!Json)return false;
+    FString StoredSpecies,StoredId,SourceHash;double StoredSeed=0;
+    if(!Json->TryGetStringField(TEXT("species"),StoredSpecies)||StoredSpecies!=Species||
+       !Json->TryGetStringField(TEXT("id"),StoredId)||StoredId!=Id||
+       !Json->TryGetNumberField(TEXT("seed"),StoredSeed)||StoredSeed!=Seed||
+       !Json->TryGetStringField(TEXT("geometry_md5"),SourceHash)||SourceHash!=PublishedHash)return false;
+    // Only the endorsed publication directory is admissible here. No fallback
+    // to Forge candidates or regeneration when a published bank is absent.
+    const FString Path=Directory/TEXT("banks")/Species/(Id+TEXT(".vxa"));
+    const int64 Bytes=IFileManager::Get().FileSize(*Path);if(Bytes<=0||Bytes>128*1024*1024)return false;
+    TArray<uint8> Vxa;if(!FFileHelper::LoadFileToArray(Vxa,*Path)||!FVoxelAssetAppearance::Load(SourceHash))return false;
+    FVoxelEnvironmentAssetDescriptor D;D.SpecId=Species;D.Kind=TEXT("tree");D.Category=TEXT("environment");
+    D.SeedIndex=uint32(Seed);D.SourceHash=SourceHash;D.Fellable=true;
+    return InitializeAssetFromVxa(MoveTemp(D),Vxa,true,FitTerrain);
+}
 bool AVoxelEnvironmentLODPrototype::InitializeAssetFromVxa(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& Vxa,bool Collision,bool FitTerrain) {
     if(bVisualOnlyPreparation)return false;
-    if(StagedRestore||PreparedRestore||Vxa.IsEmpty()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform()))return false;
+    if(StagedRestore||PreparedRestore||Vxa.IsEmpty()||Descriptor.HasComposition()||!VoxelEnvironmentAsset::IsSupportedTransform(GetActorTransform()))return false;
     vxc::AssetGrid Source;if(Source.parse(Vxa.GetData(),Vxa.Num())!=vxc::AssetParseError::kOk)return false;
-    const double FinestMm=Source.voxelSizeMm();if(FinestMm!=25&&FinestMm!=50&&FinestMm!=100)return false;
+    const double FinestMm=Source.voxelSizeMm();if(FinestMm!=12.5&&FinestMm!=25&&FinestMm!=50&&FinestMm!=100)return false;
     const FString Hash=FMD5::HashBytes(Vxa.GetData(),Vxa.Num());
     if(!Descriptor.Legacy){if(!Descriptor.SourceHash.IsEmpty()&&!Descriptor.SourceHash.Equals(Hash,ESearchCase::IgnoreCase))return false;Descriptor.SourceHash=Hash;}
     if(!Descriptor.IsValid())return false;
+    return InitializeVerifiedAssetPayload(MoveTemp(Descriptor),Vxa,Collision,FitTerrain);
+}
+bool AVoxelEnvironmentLODPrototype::InitializeComposedAssetFromVxa(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& SourceVxa,const TArray<uint8>& ClippedVxa,uint8 CanonicalYaw,bool Collision) {
+    constexpr int64 MaxCells=64ll*1024*1024;
+    constexpr int32 MaxBytes=128*1024*1024;
+    if(StagedRestore||PreparedRestore||Descriptor.Legacy||!Descriptor.HasComposition()||!Descriptor.IsValid()||
+       CanonicalYaw>3||Descriptor.SourceYawQuarter!=CanonicalYaw||VoxelEnvironmentAsset::QuarterYaw(GetActorTransform())!=0||
+       SourceVxa.IsEmpty()||ClippedVxa.IsEmpty()||SourceVxa.Num()>MaxBytes||ClippedVxa.Num()>MaxBytes)return false;
+    if(!Descriptor.SourceHash.Equals(FMD5::HashBytes(SourceVxa.GetData(),SourceVxa.Num()),ESearchCase::IgnoreCase)||
+       !Descriptor.ClippedGeometryHash.Equals(FMD5::HashBytes(ClippedVxa.GetData(),ClippedVxa.Num()),ESearchCase::IgnoreCase))return false;
+    vxc::AssetGrid Original,Clipped;
+    if(Original.parse(SourceVxa.GetData(),SourceVxa.Num())!=vxc::AssetParseError::kOk||
+       Clipped.parse(ClippedVxa.GetData(),ClippedVxa.Num())!=vxc::AssetParseError::kOk)return false;
+    if(Original.voxelSizeMm()!=100||Clipped.voxelSizeMm()!=100)return false;
+    const auto Bounded=[&](const vxc::AssetGrid& G){
+        return G.sizeX()>0&&G.sizeY()>0&&G.sizeZ()>0&&G.sizeX()<=FPrototypeGrid::MaxAxis&&G.sizeY()<=FPrototypeGrid::MaxAxis&&G.sizeZ()<=FPrototypeGrid::MaxAxis&&
+            int64(G.sizeX())*G.sizeY()*G.sizeZ()<=MaxCells&&FMath::Abs(int64(G.originX()))<=1000000&&FMath::Abs(int64(G.originY()))<=1000000&&FMath::Abs(int64(G.originZ()))<=1000000;
+    };
+    if(!Bounded(Original)||!Bounded(Clipped)||Clipped.sizeX()!=Original.rotatedSizeX(CanonicalYaw)||Clipped.sizeY()!=Original.rotatedSizeY(CanonicalYaw)||
+       Clipped.sizeZ()!=Original.sizeZ()||Clipped.originX()!=Original.rotatedOriginX(CanonicalYaw)||Clipped.originY()!=Original.rotatedOriginY(CanonicalYaw)||Clipped.originZ()!=Original.originZ())return false;
+    uint64 Solids=0;
+    for(int X=0;X<Clipped.sizeX();++X)for(int Y=0;Y<Clipped.sizeY();++Y)for(int Z=0;Z<Clipped.sizeZ();++Z){
+        const auto M=Clipped.at(X,Y,Z);if(M){if(M!=Original.atYaw(X,Y,Z,CanonicalYaw))return false;++Solids;}
+    }
+    if(!Solids)return false;
+    // A tree handoff must retain approved source appearance. Refuse before
+    // touching actor state if the original packet is unavailable or invalid.
+    if(Descriptor.Kind==TEXT("tree")&&!FVoxelAssetAppearance::Load(Descriptor.SourceHash))return false;
+    return InitializeVerifiedAssetPayload(MoveTemp(Descriptor),ClippedVxa,Collision,false);
+}
+bool AVoxelEnvironmentLODPrototype::InitializeVerifiedAssetPayload(FVoxelEnvironmentAssetDescriptor Descriptor,const TArray<uint8>& Vxa,bool Collision,bool FitTerrain) {
+    // Only the public verified import routes call this shared payload importer.
+    if(StagedRestore||PreparedRestore||Vxa.IsEmpty()||!Descriptor.IsValid())return false;
+    const FString Hash=FMD5::HashBytes(Vxa.GetData(),Vxa.Num());
+    const FString& Expected=Descriptor.HasComposition()?Descriptor.ClippedGeometryHash:Descriptor.SourceHash;
+    if(!Descriptor.Legacy&&!Expected.Equals(Hash,ESearchCase::IgnoreCase))return false;
+    vxc::AssetGrid Source;if(Source.parse(Vxa.GetData(),Vxa.Num())!=vxc::AssetParseError::kOk)return false;
+    const double FinestMm=Source.voxelSizeMm();
     FPrototypeGrid Grid;Grid.Size=FIntVector(Source.sizeX(),Source.sizeY(),Source.sizeZ());
     Grid.Origin=FIntVector(Source.originX(),Source.originY(),Source.originZ());Grid.Mm=FinestMm;
     const int64 Cells=int64(Grid.Size.X)*Grid.Size.Y*Grid.Size.Z;
@@ -420,6 +517,10 @@ bool AVoxelEnvironmentLODPrototype::InitializeAssetFromVxa(FVoxelEnvironmentAsse
     State->WoodPerLayer.Init(0,PreparedFine.Size.Z);
     PreparedFine.Visit([&](int,int,int Z,uint8 M){if(M==16||M==17||M==18||M==23)++State->WoodPerLayer[Z];});
     State->Grids=MoveTemp(Prepared);
+    // Legacy fixtures do not persist a source digest. Keep their existing
+    // palette on both initialization and restore; authoritative assets use
+    // the generic descriptor which preserves the appearance binding.
+    State->Appearance=SourceDescriptor.Legacy?nullptr:FVoxelAssetAppearance::ForCanonicalYaw(FVoxelAssetAppearance::Load(SourceDescriptor.AppearanceSourceHash()),SourceDescriptor.AppearanceYawQuarter());
     Rebuild();Actors.AddUnique(this);
     return !Levels.IsEmpty();
 }
@@ -442,7 +543,7 @@ bool AVoxelEnvironmentLODPrototype::PersistentState(FArchive& Ar) {
     if(Ar.IsError()||!VoxelEnvironmentAsset::IsSupportedTransform(Transform)||Grid.Size.X<=0||Grid.Size.Y<=0||Grid.Size.Z<=0||Grid.Size.GetMax()>FPrototypeGrid::MaxAxis)return false;
     if(Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
     for(int32 Axis=0;Axis<3;++Axis)if(FMath::Abs(int64(Grid.Origin[Axis]))>1000000)return false;
-    if((Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100))return false;
+    if((Grid.Mm!=12.5&&Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100))return false;
     if(Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
     for(int32 Axis=0;Axis<3;++Axis)if(FMath::Abs(int64(Grid.Origin[Axis]))>1000000)return false;
     if(!(Ar.IsSaving()?State->Grids[0].Serialize(Ar):Grid.Serialize(Ar)))return false;
@@ -450,6 +551,7 @@ bool AVoxelEnvironmentLODPrototype::PersistentState(FArchive& Ar) {
         TArray<FPrototypeGrid> Prepared;if(!PrepareHierarchy(MoveTemp(Grid),Prepared))return false;
         SourceDescriptor=MoveTemp(Descriptor);AssetName=SourceDescriptor.SpecId;SetActorTransform(Transform);State->Collision=Collision;State->Severed=Severed;
         State->Grids=MoveTemp(Prepared);auto& G=State->Grids[0];
+        State->Appearance=FVoxelAssetAppearance::ForCanonicalYaw(FVoxelAssetAppearance::Load(SourceDescriptor.AppearanceSourceHash()),SourceDescriptor.AppearanceYawQuarter());
         State->WoodPerLayer.Init(0,G.Size.Z);
         G.Visit([&](int,int,int Z,uint8 M){if(M==16||M==17||M==18||M==23)++State->WoodPerLayer[Z];});
         Rebuild();Actors.AddUnique(this);return !Levels.IsEmpty();
@@ -501,7 +603,7 @@ void AVoxelEnvironmentLODPrototype::CancelStagedObjectRestore(){
     if(Job->Adopted){
         for(auto C:Sections)if(IsValid(C))C->DestroyComponent();Sections.Reset();
         for(auto C:Levels)if(IsValid(C))C->DestroyComponent();Levels.Reset();Materials.Reset();
-        State->Grids.Reset();State->SectionMaps.Reset();GeometrySnapshot.Reset();
+        State->Grids.Reset();State->SectionMaps.Reset();State->Appearance.Reset();GeometrySnapshot.Reset();
     }
     auto Done=MoveTemp(Job->Completion);if(Done)Done(false);
 }
@@ -520,21 +622,22 @@ void AVoxelEnvironmentLODPrototype::BeginStagedObjectRestore(FVoxelImmutableGeom
             if(DV!=1||GV!=1)return false;
             FPrototypeGrid Grid;
             if(!VoxelEnvironmentAsset::SerializeIdentity(D,Job->Descriptor))return false;
+            Job->Appearance=FVoxelAssetAppearance::ForCanonicalYaw(FVoxelAssetAppearance::Load(Job->Descriptor.AppearanceSourceHash()),Job->Descriptor.AppearanceYawQuarter());
             D<<Job->Transform<<Grid.Size<<Grid.Origin<<Grid.Mm<<Grid.MaxDataZ<<Job->Collision<<Job->Severed;
             if(D.IsError()||D.Tell()!=D.TotalSize()||!VoxelEnvironmentAsset::IsSupportedTransform(Job->Transform)||Grid.Size.GetMin()<=0||Grid.Size.GetMax()>FPrototypeGrid::MaxAxis)return false;
-            if((Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100)||Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
+            if((Grid.Mm!=12.5&&Grid.Mm!=25&&Grid.Mm!=50&&Grid.Mm!=100)||Grid.MaxDataZ<0||(Grid.MaxDataZ>Grid.Size.Z&&Grid.MaxDataZ!=MAX_int32))return false;
             for(int A=0;A<3;++A)if(FMath::Abs(int64(Grid.Origin[A]))>1000000)return false;
             if(!Grid.Serialize(G)||G.Tell()!=G.TotalSize())return false;
             Job->WoodPerLayer.Init(0,Grid.Size.Z);
             Grid.Visit([&](int,int,int Z,uint8 M){if(M==16||M==17||M==18||M==23)++Job->WoodPerLayer[Z];});
             if(Job->Cancelled.Load()||!PrepareHierarchy(MoveTemp(Grid),Job->Grids))return false;
             const uint32 MeshKey=GetTypeHash(Job->Descriptor.SpecId);
-            for(int L=0;L<Job->Grids.Num();++L){const auto& Source=Job->Grids[L];const int Edge=Source.Mm==25?16:32;
+            for(int L=0;L<Job->Grids.Num();++L){const auto& Source=Job->Grids[L];const int Edge=Source.Mm<=25?16:32;
                 for(const auto& Key:Source.SectionKeys(Edge)){
                     const int X=Key.X*Edge,Y=Key.Y*Edge,Z=Key.Z*Edge;
                     if(Job->Cancelled.Load())return false;
                     FEnvironmentStagedRestore::FSection Section;Section.Level=L;Section.Key=FIntVector(X/Edge,Y/Edge,Z/Edge);Section.Mesh.MeshKey=MeshKey;
-                    BuildNaiveFaceGeometry(Source,MeshKey,Section.Mesh,FIntVector(X,Y,Z),FIntVector(FMath::Min(X+Edge,Source.Size.X),FMath::Min(Y+Edge,Source.Size.Y),FMath::Min(Z+Edge,Source.Size.Z)));
+                    BuildNaiveFaceGeometry(Source,MeshKey,Section.Mesh,FIntVector(X,Y,Z),FIntVector(FMath::Min(X+Edge,Source.Size.X),FMath::Min(Y+Edge,Source.Size.Y),FMath::Min(Z+Edge,Source.Size.Z)),Job->Appearance.Get());
                     if(!Section.Mesh.Indices.IsEmpty())Job->Meshes.Add(MoveTemp(Section));
                 }
             }
@@ -554,10 +657,11 @@ bool AVoxelEnvironmentLODPrototype::AdvanceStagedObjectRestore(){
         if(!Base){CancelStagedObjectRestore();return true;}
         SourceDescriptor=Job->Descriptor;AssetName=SourceDescriptor.SpecId;SetActorTransform(Job->Transform);State->Collision=Job->Collision;State->Severed=Job->Severed;
         State->Grids=MoveTemp(Job->Grids);State->WoodPerLayer=MoveTemp(Job->WoodPerLayer);State->SectionMaps.SetNum(State->Grids.Num());
+        State->Appearance=Job->Appearance;
         // At most three tiny LOD roots/materials; mesh buffers publish separately.
         for(int L=0;L<State->Grids.Num();++L){
             auto Root=NewObject<UStaticMeshComponent>(this);Root->SetupAttachment(GetRootComponent());Root->SetMobility(EComponentMobility::Movable);Root->SetCollisionEnabled(ECollisionEnabled::NoCollision);Root->SetVisibility(false);Root->RegisterComponent();Levels.Add(Root);
-            auto Mat=UMaterialInstanceDynamic::Create(Base,this);Mat->SetScalarParameterValue(TEXT("Fade"),1);Mat->SetScalarParameterValue(TEXT("Reverse"),0);Materials.Add(Mat);
+            auto Mat=UMaterialInstanceDynamic::Create(Base,this);Mat->SetScalarParameterValue(TEXT("Fade"),1);Mat->SetScalarParameterValue(TEXT("Reverse"),0);ConfigureAppearance(Mat,State->Appearance);Materials.Add(Mat);
         }
         Job->Adopted=true;return true;
     }
@@ -788,6 +892,7 @@ void AVoxelEnvironmentLODPrototype::Rebuild() {
         Levels.Add(Root);
         auto Material=UMaterialInstanceDynamic::Create(Base,this);
         Material->SetScalarParameterValue(TEXT("Fade"),1);Material->SetScalarParameterValue(TEXT("Reverse"),0);
+        ConfigureAppearance(Material,State->Appearance);
         Materials.Add(Material);
         RebuildSections(L,FIntVector::ZeroValue,State->Grids[L].Size);
     }
@@ -803,7 +908,7 @@ void AVoxelEnvironmentLODPrototype::RebuildSections(int32 L,const FIntVector& Mi
     // Bound mesh updates independently of tree size; procedural buffers avoid
     // expensive StaticMesh/MeshDescription construction on every strike.
     const auto& Grid=State->Grids[L];
-    const int32 Edge=Grid.Mm==25?16:32;
+    const int32 Edge=Grid.Mm<=25?16:32;
     if(Min.X>=Max.X||Min.Y>=Max.Y||Min.Z>=Max.Z)return;
     TSet<FIntVector> Candidates;
     for(const auto& Key:Grid.SectionKeys(Edge))Candidates.Add(Key);
@@ -815,7 +920,7 @@ void AVoxelEnvironmentLODPrototype::RebuildSections(int32 L,const FIntVector& Mi
         if(Lo.X>=Max.X||Lo.Y>=Max.Y||Lo.Z>=Max.Z||Lo.X+Edge<=Min.X||Lo.Y+Edge<=Min.Y||Lo.Z+Edge<=Min.Z)continue;
         const FIntVector Hi(FMath::Min(Lo.X+Edge,Grid.Size.X),FMath::Min(Lo.Y+Edge,Grid.Size.Y),FMath::Min(Lo.Z+Edge,Grid.Size.Z));
         FEnvironmentLodMeshGeometry Geometry;Geometry.MeshKey=GetTypeHash(AssetName);
-        BuildNaiveFaceGeometry(Grid,Geometry.MeshKey,Geometry,Lo,Hi);
+        BuildNaiveFaceGeometry(Grid,Geometry.MeshKey,Geometry,Lo,Hi,State->Appearance.Get());
         auto Existing=State->SectionMaps[L].Find(Key);
         if(Geometry.Indices.IsEmpty()){
             if(Existing){Sections.Remove(*Existing);(*Existing)->DestroyComponent();State->SectionMaps[L].Remove(Key);}
@@ -852,6 +957,9 @@ void AVoxelEnvironmentLODPrototype::Tick(float DeltaSeconds) {
         else if(Levels.Num()>2&&ActiveLOD==1&&Distance>Near*2.2)Wanted=2;
         else if(ActiveLOD==2&&Distance<Near*1.8)Wanted=1;
     }
+    // A 100 mm source has only one level. Distance thresholds must never
+    // request the second level that exists only for finer source grids.
+    Wanted=FMath::Clamp(Wanted,0,Levels.Num()-1);
     if(Wanted!=ActiveLOD&&PreviousLOD<0){
         PreviousLOD=ActiveLOD;ActiveLOD=Wanted;FadeTime=0;
         SetLevelVisible(ActiveLOD,true);
@@ -956,7 +1064,7 @@ bool AVoxelEnvironmentLODPrototype::Carve(const FVector& Hit,int32 SizeVoxels) {
         // It catches lost or duplicate faces at section seams after carving.
         for(int L=0;L<State->Grids.Num();++L){
             FEnvironmentLodMeshGeometry Reference;const auto& G=State->Grids[L];
-            BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Reference,FIntVector::ZeroValue,G.Size);
+            BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Reference,FIntVector::ZeroValue,G.Size,State->Appearance.Get());
             int32 Triangles=0;for(const auto& Pair:State->SectionMaps[L])Triangles+=Pair.Value->GetProcMeshSection(0)->ProcIndexBuffer.Num()/3;
             checkf(Triangles==Reference.Indices.Num()/3,TEXT("Section face count differs from full mesh"));
         }
@@ -999,6 +1107,7 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
     TArray<UProceduralMeshComponent*> Moving;
     auto Material=UMaterialInstanceDynamic::Create(Materials[0]->Parent,this);
     Material->SetScalarParameterValue(TEXT("WindEnabled"),0);
+    ConfigureAppearance(Material,State->Appearance);
     Material->SetScalarParameterValue(TEXT("Fade"),1);Material->SetScalarParameterValue(TEXT("Reverse"),0);
     // Prebuild only the two exposed cross-sections. Their surfaces remain hidden
     // until impact, so splitting the visual sections needs no full-tree remesh.
@@ -1009,10 +1118,25 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
         Fine.VisitBox(FIntVector(0,0,SplitZ),FIntVector(Fine.Size.X,Fine.Size.Y,SplitZ+1),[&](int X,int Y,int,uint8){
             if(!Fine.At(X,Y,SplitZ-1))return;
             const auto M=Fine.At(X,Y,Side?SplitZ:SplitZ-1);
-            const auto Color=EnvironmentLodPaletteLinear().Face[(M==16||M==18)?17:M][vxc::kFaceTop];
+            auto Color=EnvironmentLodPaletteLinear().Face[(M==16||M==18)?17:M][vxc::kFaceTop];
+            if(State->Appearance){
+                FColor Base=Color.ToFColor(true);FIntVector SourceCell(X,Y,Side?SplitZ:SplitZ-1);
+                FColor SourceBase;FIntVector SampleCell;
+                if(State->Appearance->Sample(SourceCell+Fine.Origin,Fine.Mm,M,SourceBase,SampleCell)){
+                    SourceCell=SampleCell;
+                    // A fresh cut through bark exposes heartwood. Keep that
+                    // physical appearance distinction, with stable face tone.
+                    if(M!=16&&M!=18)Base=SourceBase;
+                }
+                Color=State->Appearance->ColorForFace(Base,SourceCell,2,Side==0);
+            }
             const uint32 B=Cap.Positions.Num();const float FX=(X+Fine.Origin.X)*P,FY=(Y+Fine.Origin.Y)*P;
             Cap.Positions.Append({FVector3f(FX,FY,Split),FVector3f(FX,FY+P,Split),FVector3f(FX+P,FY+P,Split),FVector3f(FX+P,FY,Split)});
-            for(int V=0;V<4;++V){Cap.Normals.Add(FVector3f(0,0,Side?-1:1));Cap.TangentsX.Add(FVector3f(1,0,0));Cap.Colors.Add(FVector4f(Color.R,Color.G,Color.B,1));Cap.UVs.Add(FVector2f::ZeroVector);}
+            for(int V=0;V<4;++V){
+                Cap.Normals.Add(FVector3f(0,0,Side?-1:1));Cap.TangentsX.Add(FVector3f(1,0,0));
+                Cap.Colors.Add(FVector4f(Color.R,Color.G,Color.B,VoxelVegetationRender::MaterialClass(M)));
+                Cap.UVs.Add(State->Appearance?State->Appearance->FaceUV(Cap.Positions[B+V],2):FVector2f::ZeroVector);
+            }
             if(Side)Cap.Indices.Append({B,B+2,B+1,B,B+3,B+2});else Cap.Indices.Append({B,B+1,B+2,B,B+2,B+3});
         });
         if(!Cap.Indices.IsEmpty()){
@@ -1021,7 +1145,7 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
         }
     }
     for(int L=0;L<State->Grids.Num();++L){
-        auto& G=State->Grids[L];const int Edge=G.Mm==25?16:32;
+        auto& G=State->Grids[L];const int Edge=G.Mm<=25?16:32;
         const int Cut=FMath::Clamp(FMath::CeilToInt(Plane/(G.Mm*.1))-G.Origin.Z,0,G.Size.Z);
         TArray<FIntVector> Keys;State->SectionMaps[L].GetKeys(Keys);
         for(auto Key:Keys){
@@ -1032,7 +1156,7 @@ void AVoxelEnvironmentLODPrototype::DetachAbove(int32 CutLayer,const FVector& Di
             }else if(L==0&&Lo.Z+Edge>Cut){
                 FEnvironmentLodMeshGeometry Geometry;const FIntVector UpperLo(Lo.X,Lo.Y,Cut);
                 const FIntVector Hi(FMath::Min(Lo.X+Edge,G.Size.X),FMath::Min(Lo.Y+Edge,G.Size.Y),FMath::Min(Lo.Z+Edge,G.Size.Z));
-                BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Geometry,UpperLo,Hi);
+                BuildNaiveFaceGeometry(G,GetTypeHash(AssetName),Geometry,UpperLo,Hi,State->Appearance.Get());
                 if(!Geometry.Indices.IsEmpty()){
                     auto Upper=NewObject<UVoxelPlantMeshComponent>(this);Upper->SetupAttachment(GetRootComponent());
                     Upper->SetCollisionEnabled(ECollisionEnabled::NoCollision);Upper->RegisterComponent();
@@ -1075,7 +1199,13 @@ bool IsSolid(UWorld* World,const FVector& Position){
     for(auto Weak:Actors)if(auto A=Weak.Get())if(A->GetWorld()==World&&A->SolidAt(Position))return true;return false;
 }
 static AVoxelEnvironmentLODPrototype* FindDigTarget(UWorld* World,const FVector& Start,const FVector& Direction,FVector& Best){
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDig_FindObjectTarget);
     if(!World)return nullptr;
+    // The normal terrain-lattice forest has no prototype object targets.
+    // Avoid a terrain occlusion ray when there is nothing it could occlude.
+    bool HasTarget=false;
+    for(auto Weak:Actors)if(auto A=Weak.Get())if(A->GetWorld()==World){HasTarget=true;break;}
+    if(!HasTarget)return nullptr;
     AVoxelEnvironmentLODPrototype* Nearest=nullptr;double Range=800.;
     if(auto Sub=World->GetSubsystem<UVoxelWorldSubsystem>()){
         FVector Terrain,Previous;if(Sub->RaycastVoxelWorld(Start,Direction,Range,Terrain,Previous))Range=FMath::Max(0.,FVector::Dist(Start,Terrain)-8.7);
@@ -1289,9 +1419,22 @@ FAutoConsoleCommandWithWorld ResetCommand(TEXT("voxel.EnvironmentLOD.Reset"),TEX
     }
 }));
 FAutoConsoleCommandWithWorld SpawnCommand(TEXT("voxel.EnvironmentLOD.Spawn"),TEXT("Spawn the isolated oak, granite, bramble and daisy LOD pilot."),FConsoleCommandWithWorldDelegate::CreateLambda([](UWorld* W){SpawnEnvironmentPrototype(W,false);}));
+FAutoConsoleCommandWithWorldAndArgs PublishedTreeCommand(TEXT("voxel.Tree.SpawnPublished"),TEXT("Spawn an endorsed editable tree: species seed. Requires VoxelAssetDir."),FConsoleCommandWithWorldAndArgsDelegate::CreateLambda([](const TArray<FString>& Args,UWorld* W){
+    if(!W||W->GetNetMode()==NM_Client||Args.Num()!=2)return;
+    int32 Seed=0;if(!LexTryParseString(Seed,*Args[1]))return;
+    auto PC=W->GetFirstPlayerController();auto Terrain=W->GetSubsystem<UVoxelWorldSubsystem>();if(!PC||!PC->GetPawn()||!Terrain)return;
+    FVector Pos=PC->GetPawn()->GetActorLocation()+PC->GetPawn()->GetActorForwardVector()*1500.;
+    Pos.X=FMath::GridSnap(Pos.X,10.);Pos.Y=FMath::GridSnap(Pos.Y,10.);Pos.Z=FMath::CeilToDouble(Terrain->GetSurfaceHeightUU(Pos.X,Pos.Y)/10.)*10.+10.;
+    auto A=W->SpawnActor<AVoxelEnvironmentLODPrototype>(Pos,FRotator::ZeroRotator);
+    if(!A||!A->InitializePublishedTree(Args[0],Seed,true)){
+        if(A)A->Destroy();UE_LOG(LogVoxelEarth,Warning,TEXT("Published tree refused: %s seed %d; require endorsed bank and matching appearance"),*Args[0],Seed);return;
+    }
+    UE_LOG(LogVoxelEarth,Log,TEXT("Published tree spawned: %s seed %d (editable, source-bound appearance)"),*Args[0],Seed);
+}));
 }
 namespace VoxelEnvironmentLODPrototype {
 void StartFromCommandLine(UWorld* World){
+    VoxelAppearanceForest::Start(World);
     if(!FParse::Param(FCommandLine::Get(),TEXT("VoxelEnvironmentLOD")))return;
     const bool Capture=FParse::Param(FCommandLine::Get(),TEXT("VoxelEnvironmentLODCapture"));
     FTimerHandle Timer;TWeakObjectPtr<UWorld> WeakWorld=World;

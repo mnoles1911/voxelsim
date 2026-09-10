@@ -1,0 +1,65 @@
+{
+  "id": "temperate-oak-0020",
+  "species": "temperate-oak",
+  "kind": "tree",
+  "category": "environment",
+  "seed": 20,
+  "imported": false,
+  "inventory_candidate": false,
+  "visual_approved": true,
+  "review_status": "endorsed",
+  "spec_hash": "c0ffcea866324ce4",
+  "generation_key": "bd357645dceebae20ca093c14b36e03caed5ffb57b7a9f90431ec670d1211c61",
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "artifact_hashes": {
+    "realized.json": "5c1ae24d6806854c1e598ed50980d692ea3c7f0aaa4c0527e8f525a07854a645",
+    "spec.json": "ee380fea6d375fc75b3b65e4a9f88b037c400d513a2210a359e1cc9149542a1b",
+    "thumb.png": "4d0b84822c0dc43334a516163994e4b1ecb703befcafa3e7c589c79d31d7f1a6",
+    "tree.vox": "5997ae09cf309ce88ad99a3c33ff9e4e603e8294b95e20c17b25cb7232735854",
+    "tree.vxa": "22f6d4fe62973ff14ec90392e69f1a4cb6c1de9b99a1d1f8f2f518d7b0e29ae2"
+  },
+  "asset_bytes": 70698,
+  "stats": {
+    "seed": 20,
+    "spec_hash": "c0ffcea866324ce4",
+    "kind": "tree",
+    "generator": "oak-shoots-v1",
+    "size_class": "small",
+    "growth_form": "woodland",
+    "nodes": 4886,
+    "segments": 4188,
+    "max_order": 4,
+    "clumps": 3360,
+    "branch_curves": 698,
+    "voxel_cm": 10.0,
+    "height_m": 4.7,
+    "length_m": 2.8,
+    "footprint_m": [
+      2.8000000000000003,
+      2.4000000000000004
+    ],
+    "extent_vox": [
+      28,
+      24,
+      47
+    ],
+    "voxels": 4580,
+    "by_material": {
+      "16": 601,
+      "19": 3979
+    },
+    "wood_connected": 1.0,
+    "wood_detached": 0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ground_contact": 21,
+    "orphans_removed": 0,
+    "grid_mb": 0.03,
+    "ms_grow": 384.0,
+    "ms_total": 1811.7
+  },
+  "problems": [],
+  "vox_models": 1,
+  "generation_seconds": 1.864,
+  "batch_id": "temperate-temperate-oak"
+}

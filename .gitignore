@@ -161,3 +161,9 @@ bake-*.log
 /.scratch/*.log
 /lumen.pdf
 /lumen.txt
+
+# Local test dependencies, worktrees and raw captures; handoff patches live in docs.
+/.scratch/
+# Regenerable private UE preview imports and baked test caches, not endorsed assets.
+/ue-project/Content/Voxel/AppearancePilot/
+/ue-project/Content/Voxel/Generated/DetailPreview/

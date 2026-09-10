@@ -1,0 +1,122 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/schoenoplectus-lacustris/",
+  "viewed_photos": [
+    "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Yuvalr_Attribution-ShareAlike_4.0_International_CC_BY-SA_4.0_Scirpus_lacustris.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=vEp9lcW4HlFfMG8B800tVmGer0o%3D&Expires=1788863418"
+  ],
+  "photo_reviewer": "Astra understory agent actual browser photo inspection",
+  "photo_observations": {
+    "observations": "Actual Yuvalr photograph viewed: bare round green culms, few tips carrying branched brown spikelets. NC State says late-summer bloom; spring fresh bladeless stems without brown panicles. Height1.5m baseline for emergent stand.",
+    "viewed_photos": [
+      "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Yuvalr_Attribution-ShareAlike_4.0_International_CC_BY-SA_4.0_Scirpus_lacustris.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=vEp9lcW4HlFfMG8B800tVmGer0o%3D&Expires=1788863418"
+    ],
+    "source": "https://plants.ces.ncsu.edu/plants/schoenoplectus-lacustris/"
+  },
+  "findings": "Inspected all36current variants and seeds1/4/7 at small/medium/large scales. Bare round spring culms75-155cm with variable heights and lean, no brown summer spikelets. Slender connected root bases require sediment embedding; emergent stems stay separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "cddebf5d9095324cf57114a1135ae0e4b9cb30a06a8d2193b72a249e438a270f",
+  "sheet_hash": "a58ea5a8fa8ffb256be6dde95cd6b103eef39e830eca39f8f43898d52f539b09",
+  "reviewed_at": 1788861145.6998646,
+  "pilot_hashes": {
+    "1": "0f2b36fb0545270839af57e07131a55b5f501c5683f25200a8df85361a2d2512",
+    "4": "68e67af21705adce2ebc2d27530cb0b07770fc774bd3136446ca31b0a6e31d09",
+    "7": "8568206c0b0f15787c2bce41f101e6ee1d5721b6167c9926f89b7e74c8df205a"
+  },
+  "profile": "bulrush",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Yuvalr_Attribution-ShareAlike_4.0_International_CC_BY-SA_4.0_Scirpus_lacustris.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=vEp9lcW4HlFfMG8B800tVmGer0o%3D&Expires=1788863418",
+      "caption": "Scirpus lacustris",
+      "credit": "Yuvalr, CC BY-SA4.0 (image filename attribution)",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "10707"
+    }
+  ],
+  "taxon": "Schoenoplectus lacustris",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a58ea5a8fa8ffb256be6dde95cd6b103eef39e830eca39f8f43898d52f539b09"
+  }
+}

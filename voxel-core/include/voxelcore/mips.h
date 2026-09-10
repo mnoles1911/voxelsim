@@ -61,6 +61,52 @@
 
 namespace vxc {
 
+// A contributing child within ONE 2x2x2 cell group: dx+2*dy+4*dz.
+// Air has no contributor, including thresholds <=0 applied to all-air input.
+// Majority provenance is newly specified: first ascending child carrying the
+// winning material. Surface mode uses the existing topmost/first-(dy,dx) pick.
+// This provenance tie rule never changes material, occupancy, or worldgen version.
+struct MipReductionResult {
+    MaterialId material = MAT_AIR;
+    uint8_t childIndex = 255;
+};
+
+// Canonical MaterialIds only, as required by the former counts[] implementation.
+// Keep arbitrary caller thresholds unchanged; do not clamp to 1..8.
+inline MipReductionResult reduceMipCell(const MaterialId (&cells)[8],
+    int solidThreshold = 4, bool surfacePreserve = false) {
+    int counts[kMaterialCount] = {};
+    int solid = 0;
+    int topDz = -1;
+    uint8_t topIndex = 255;
+    for (int i = 0; i < 8; ++i) {
+        const MaterialId m = cells[i];
+        if (m != MAT_AIR) {
+            ++counts[m];
+            ++solid;
+            if (i / 4 > topDz) {
+                topDz = i / 4;
+                topIndex = static_cast<uint8_t>(i);
+            }
+        }
+    }
+    if (solid < solidThreshold) return {};
+    if (surfacePreserve)
+        return topIndex == 255 ? MipReductionResult{} : MipReductionResult{cells[topIndex], topIndex};
+    MaterialId best = MAT_AIR;
+    int bestCount = 0;
+    for (int m = 1; m < kMaterialCount; ++m) {
+        if (counts[m] > bestCount) {
+            bestCount = counts[m];
+            best = static_cast<MaterialId>(m);
+        }
+    }
+    if (best == MAT_AIR) return {};
+    for (int i = 0; i < 8; ++i)
+        if (cells[i] == best) return {best, static_cast<uint8_t>(i)};
+    return {}; // Unreachable for canonical inputs; never fabricate provenance.
+}
+
 // Downsample one 2x2x2 group of level-L child bricks into a single level-L+1
 // parent brick, both of edge B. Parent cell (x,y,z) draws its 8 contributing
 // child cells from exactly one child brick (2x2x2 groups never straddle a
@@ -88,49 +134,13 @@ Brick<B> downsampleBricks(const Brick<B>* const children[8], int solidThreshold 
                 const Brick<B>* child = children[cx + 2 * cy + 4 * cz];
                 if (!child) continue; // all-air; parent cell stays MAT_AIR.
 
-                int counts[kMaterialCount] = {};
-                int solid = 0;
-                // Topmost solid child in this 2x2x2 group: highest dz wins;
-                // within a dz layer the FIRST solid voxel in the ascending
-                // (dy, dx) scan wins, so the pick is deterministic without a
-                // second pass. Only consulted in surface-preserving mode.
-                MaterialId topMat = MAT_AIR;
-                int topDz = -1;
+                MaterialId cells[8];
                 for (int dz = 0; dz < 2; ++dz)
                     for (int dy = 0; dy < 2; ++dy)
-                        for (int dx = 0; dx < 2; ++dx) {
-                            const MaterialId m = child->get(lx + dx, ly + dy, lz + dz);
-                            if (m != MAT_AIR) {
-                                ++counts[m];
-                                ++solid;
-                                if (dz > topDz) {
-                                    topDz = dz;
-                                    topMat = m;
-                                }
-                            }
-                        }
-                if (solid < solidThreshold) continue; // stays MAT_AIR.
-
-                if (surfacePreserve) {
-                    // Backlog 0.0b: carry the topmost solid child's material so
-                    // a thin surface cap survives instead of being outvoted by
-                    // the body beneath it. Solidity (the threshold test above)
-                    // is untouched -- this mode changes colour, never shape.
-                    parent.set(x, y, z, topMat);
-                    continue;
-                }
-
-                // Majority vote; ascending scan + strict '>' ties toward the
-                // lowest material id (doctrine: deterministic tie-break).
-                MaterialId best = MAT_AIR;
-                int bestCount = 0;
-                for (int m = 1; m < kMaterialCount; ++m) {
-                    if (counts[m] > bestCount) {
-                        bestCount = counts[m];
-                        best = static_cast<MaterialId>(m);
-                    }
-                }
-                parent.set(x, y, z, best);
+                        for (int dx = 0; dx < 2; ++dx)
+                            cells[dx + 2 * dy + 4 * dz] = child->get(lx + dx, ly + dy, lz + dz);
+                const auto reduced = reduceMipCell(cells, solidThreshold, surfacePreserve);
+                parent.set(x, y, z, reduced.material);
             }
         }
     }

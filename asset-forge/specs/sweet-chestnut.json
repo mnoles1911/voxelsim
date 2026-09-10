@@ -1,4 +1,39 @@
 {
+  "artifact": {
+    "asym_vox": 0.8,
+    "beam_m": 0.85,
+    "bilge": 2.6,
+    "billow_m": 0.16,
+    "crossbar_at": 0.42,
+    "deck_frac": 0.07,
+    "depth_m": 0.35,
+    "droop_m": 0.3,
+    "entry": 0.62,
+    "form": "hull",
+    "frame_at": 0.34,
+    "frame_base_m": 0.95,
+    "frame_drop_m": 1.15,
+    "frame_r_m": 0.03,
+    "fullness": 2.4,
+    "gunwale_m": 0.06,
+    "gunwale_vox": 1,
+    "keel_m": 0.45,
+    "keel_r_m": 0.04,
+    "length_m": 4.0,
+    "panel_vox": 2,
+    "rocker": 0.14,
+    "seat": true,
+    "seat_len_m": 0.8,
+    "sheer": 0.35,
+    "shell_vox": 2,
+    "spar_r_m": 0.045,
+    "strake_share": 0.25,
+    "sweep": 0.85,
+    "taper": 0.3,
+    "thwart_t_m": 0.05,
+    "thwart_w_m": 0.1,
+    "thwarts": 2
+  },
   "biomes": {
     "bare_rock": 0.0,
     "beach": 0.0,
@@ -82,6 +117,13 @@
     "shell_upper": 0.72,
     "squash": 1.0
   },
+  "curation": {
+    "notes": "Reference-informed generator; variants require endorsement in Forge.",
+    "seeds": [
+      1
+    ],
+    "status": "draft"
+  },
   "detail": {
     "depth_max_m": 6.0,
     "depth_min_m": 0.3,
@@ -111,6 +153,7 @@
     "caudal_shape": "forked",
     "caudal_span": 1.15,
     "caudal_upper": 0.0,
+    "claspers": 0.0,
     "curve_amount": 0.0,
     "curve_at": 0.55,
     "depth_at": 0.36,
@@ -242,7 +285,9 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
+    "frame": "beak_horn",
     "head": "leaf_blossom",
+    "hull": "heartwood",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,7 +298,9 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "grass"
+    "stem": "grass",
+    "strake": "deadwood",
+    "trim": "bark"
   },
   "name": "sweet-chestnut",
   "notes": "THE FISSURES SPIRAL AND NOTHING HERE CAN TWIST. Chestnut bark runs in deep ridges that wind around the trunk as it ages, and the only parameter that could ever say it is `trunk.lobes` -- which the `hornbeam` spec records as unsafe and left at zero, because grooving the trunk severs the joins where limbs and roots attach. Even repaired it would cut STRAIGHT grooves; a spiral needs the flutes to rotate as they rise, which is a second feature on top of the first.\n\nSo the bole is authored as mass instead of as texture: 0.95 m of base radius, the thickest broadleaf trunk in the library at any height, under a big dome carried on long shoots (`stretch` 2.8, for leaves that are long and coarse rather than round).",
@@ -263,8 +310,15 @@
     "elev_max_m": 1000.0,
     "elev_min_m": 0.0,
     "slope_max_pct": 45.0,
+    "slope_min_pct": 0.0,
     "spacing_m": 9.0,
     "water_max_m": 0.0
+  },
+  "plant_recipe": {
+    "form": "mixed",
+    "generator": "temperate-shoots-v2",
+    "profile": "sweet-chestnut",
+    "size": "mixed"
   },
   "quad": {
     "belly": 0.52,
@@ -405,6 +459,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.95,
+    "taper": 0.5,
     "wander": 0.14
   },
   "tuft": {

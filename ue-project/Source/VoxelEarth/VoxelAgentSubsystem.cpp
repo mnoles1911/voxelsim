@@ -1,4 +1,5 @@
 #include "VoxelAgentSubsystem.h"
+#include "VoxelFrameProfiling.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
@@ -1755,6 +1756,7 @@ void UVoxelAgentSubsystem::TickTier2(int32 AgentIndex, UVoxelWorldSubsystem& Ter
 
 void UVoxelAgentSubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, AgentTickMs);
     if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaTime);
 

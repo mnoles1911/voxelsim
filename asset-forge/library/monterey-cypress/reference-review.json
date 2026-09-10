@@ -1,0 +1,89 @@
+{
+  "species": "monterey-cypress",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broad uneven crown and divided ascending scaffold follow the whole-tree reference; trunk photo informs coarse bark. This is a coastal regional profile with simplified scale-leaf fans."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "20390",
+      "source": "https://plants.ces.ncsu.edu/plants/cupressus-macrocarpa/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "19008",
+      "source": "https://plants.ces.ncsu.edu/plants/cupressus-macrocarpa/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "hesperocyparis-macrocarpa",
+  "sources": [
+    "https://www.conifers.org/cu/Hesperocyparis_macrocarpa.php",
+    "https://plants.ces.ncsu.edu/plants/cupressus-macrocarpa/"
+  ],
+  "habitat": "coastal-regional",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "d141d55646c8249b2f57a06460e16c20138557149db74b5f22ed9078138dea1e",
+    "4": "f504bf955309b3f603346cac924f3a52b62886e6b36a9a181b6591d6266956d5",
+    "7": "42135147b5f6c354c1b8ddb301ab41257cb439fc0fad1a0ef753e35808f59a3f"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "d75d0fd645d11fa30cddbed4170a13a7c83f3c31b81d2f7d67f7cab49d82b702"
+  }
+}

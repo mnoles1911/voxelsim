@@ -1,0 +1,88 @@
+{
+  "species": "tulip-tree",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Dominant straight leader and tapered high crown match the whole-tree photograph. Leaf lobes are below the 100 mm modeling resolution; foliage is attached to secondary shoots."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "17195",
+      "source": "https://plants.ces.ncsu.edu/plants/liriodendron-tulipifera/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "24107",
+      "source": "https://plants.ces.ncsu.edu/plants/liriodendron-tulipifera/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "liriodendron-tulipifera",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/liriodendron-tulipifera/"
+  ],
+  "habitat": "canopy",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "523cf230502924dac26bbe1f5b56d0aaa5be89dceb951c14cd827b65247ec8e6",
+    "4": "e7d0da31c934c10d68caf30680abe7cb4282455619427d7cd71f346829bc1460",
+    "7": "662e9aa5b3f64da60b8a68b05a36dfea55b54779807e941acc2a4127ce8a08c3"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "a1001c6770e72521e48b7aca8f90e29187660eefd28f8597dea654bc3c706144"
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/trifolium-pratense/",
+  "viewed_photos": [
+    "Mature plants in bloom - Sanja565658",
+    "Flower and foliage - Judy Gallagher",
+    "Foliage - Judy Gallagher"
+  ],
+  "findings": "Sanja565658 and Judy Gallagher actual photos: trifoliate leaves at stem nodes and compact globose pink heads. Pale leaf chevrons remain material limitation. Current seeds1,4,7 and all36contact-sheet panels visually inspected. Nodal trifoliate leaves and compact pink cylindrical-to-globose heads on multiple shoots;23\u201340cm forms. Flower microflorets and leaf chevrons unresolved. Accepted as coarse stylized spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "c8ae1a2ec5ed81b361c46b6bff7159717c261d690a64ea06c8d929abc3f4b4a7",
+  "sheet_hash": "9f385caeede4e47c0479330b04355b0f81037cf81bb396e009eb28bb816b944c",
+  "reviewed_at": 1788858045.9659958,
+  "pilot_hashes": {
+    "1": "85b20cd27af8b6a8bf0c1e8b645d7e23ecc6150b198ed4c568df5ffe5404f574",
+    "4": "3224d4572e94345382a38d157e6b6451ecba4eb9dd778e35af2f98a22ba439b8",
+    "7": "8e850550e41bc9ba17d9e846943063832169da0bdd85ed95b8d3703786414f52"
+  },
+  "profile": "red-clover",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Trifolium_pratense-f_vr7wKxXIYhxO.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=SGup0qyDqbxru3Ikmst0RSIQtJs%3D&Expires=1788859755",
+      "caption": "Mature plants in bloom",
+      "credit": "Sanja565658",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "14251"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Trifolium_pratense_f_QQg5vGb7ZrTB.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=fvV5vS2pxiE4mgZXcDItbqhwRRo%3D&Expires=1788859755",
+      "caption": "Flower and foliage",
+      "credit": "Judy Gallagher",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "28402"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Trifolium_pratense_f_M92ULF0htpFy.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=mP1HhT0BtUBjoQYLDZhpRQj7xh8%3D&Expires=1788859755",
+      "caption": "Foliage",
+      "credit": "Judy Gallagher",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "28403"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Trifolium_pratense_h_RmEGLnYK1s2g.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=TBWlOKBIhXv%2B8P4mhigumaxF%2FeM%3D&Expires=1788859755",
+      "caption": "Habit",
+      "credit": "H. Zell",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "28405"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Trifolium_pratense_h_bzsUStOr0zbx.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=StuZr1EhZGzwTiwMaDlUB9hSUKU%3D&Expires=1788859755",
+      "caption": "Habitat",
+      "credit": "Evelyn Simak",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "28406"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Trifolium_pratense_S_KFCgfDaHwiP6.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=2itKEoDDi66Pmi%2Bf1swt%2BBrbry4%3D&Expires=1788859755",
+      "caption": "Form",
+      "credit": "Sesamehoneytart",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "29258"
+    }
+  ],
+  "taxon": "Trifolium pratense",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "9f385caeede4e47c0479330b04355b0f81037cf81bb396e009eb28bb816b944c"
+  }
+}

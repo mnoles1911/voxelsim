@@ -730,7 +730,7 @@ def kept_seeds(library_root, name: str) -> list[int]:
             meta = json.loads((sub / "meta.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             meta = {}
-        if meta.get("imported"):
+        if meta.get("imported") or meta.get("inventory_candidate"):
             continue
         out.add(int(m.group(1)))
     return sorted(out)

@@ -60,6 +60,10 @@ struct FNamedException
 	const TCHAR* Reason;
 };
 const FNamedException kSelfDrivingExtras[] = {
+    {TEXT("VoxelAppearanceForest"), TEXT("appearance fixture: spawns the forest comparison and captures timed views")},
+    {TEXT("VoxelEcologyWorldCapture"), TEXT("ecological world fixture: surveys actual terrain and captures timed views")},
+    {TEXT("VoxelEcologyRoute"), TEXT("route fixture: independently arms scripted pawn travel and exits with route results")},
+
     {TEXT("VoxelEnvironmentLODCapture"), TEXT("environment fixture: poses cameras, captures LOD transitions and performs scripted digs")},
     {TEXT("VoxelTreeFellingCapture"), TEXT("felling fixture: poses camera, swings axe on timers and captures falling timber")},
 	{TEXT("VoxelPerfRun"), TEXT("perf harness: flies a fixed path and exits on its own watchdog")},
@@ -105,6 +109,10 @@ const FNamedException kSelfDrivingExtras[] = {
 // taken from that file rather than re-judged here, and
 // VoxelEarth.FrontEnd.SwitchPolicy fails if the two ever drift apart.
 const FNamedException kRule5Exemptions[] = {
+    {TEXT("VoxelAppearanceFellingTest"), TEXT("'Test': optional felling branch inside an explicitly invoked automation test; does not start the test")},
+    {TEXT("VoxelAppearanceTestVxa"), TEXT("'Test': input VXA path for an explicitly invoked automation test; does not start the test")},
+    {TEXT("VoxelEcologyTestPreview"), TEXT("'Test': preview output path for an explicitly invoked automation test; does not start the test")},
+
     {TEXT("VoxelDumpIndexKeys"), TEXT("'Dump': passive resident index logging during normal streaming; does not drive or exit")},
     {TEXT("VoxelSkyMarkVerify"), TEXT("'Verify': samples sky-band correctness during ordinary streaming")},
     {TEXT("VoxelSkyMarkVerifyGrid"), TEXT("'Verify': sample-grid tuning for passive sky-band validation")},

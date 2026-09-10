@@ -1,4 +1,5 @@
 #include "VoxelSkySubsystem.h"
+#include "VoxelFrameProfiling.h"
 #include "VoxelSurfaceLighting.h"
 #include "VoxelSessionCheckpoint.h"
 
@@ -3469,6 +3470,7 @@ bool UVoxelSkySubsystem::ResolveObserverXYUU(double& OutXUU, double& OutYUU) con
 
 void UVoxelSkySubsystem::Tick(float DeltaTime)
 {
+	CSV_SCOPED_TIMING_STAT(VoxelStream, SkyTickMs);
 	if (GetWorld() && GetWorld()->GetNetMode()!=NM_Client && !VoxelSessionCheckpoint::Ready(GetWorld())) return;
 	Super::Tick(DeltaTime);
 

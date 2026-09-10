@@ -1,0 +1,88 @@
+{
+  "species": "columnar-cypress",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Narrow vertical crown and strongly ascending branches follow the columnar specimens. Crown taper and small side irregularities avoid a perfect cylinder; regional planting role is explicit."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "19009",
+      "source": "https://plants.ces.ncsu.edu/plants/cupressus-sempervirens/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "19435",
+      "source": "https://plants.ces.ncsu.edu/plants/cupressus-sempervirens/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "cupressus-sempervirens",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/cupressus-sempervirens/"
+  ],
+  "habitat": "warm-regional",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "a1f3b56c5f6488a0eab8737deb559e56ba1b74fe0650780277615933f62b9389",
+    "4": "41296085edd6557a367994f0faad05d1c2f0c78cd33eb727c04c76c6ffd5e3d8",
+    "7": "33f9f0614681449c2a76372145004d197f3f71684021d5af10ff83e5c7de6da3"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "47a9eff24312280614f6c80fb3b39f3a7319da605185d4210c54f1d27a9debcc"
+  }
+}

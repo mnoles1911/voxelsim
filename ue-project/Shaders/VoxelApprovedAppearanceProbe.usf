@@ -1,0 +1,14 @@
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelApprovedAppearance.ush"
+StructuredBuffer<uint4> Queries;
+RWStructuredBuffer<uint4> Results;
+uint QueryCount;
+[numthreads(64,1,1)]
+void ApprovedAppearanceProbeMain(uint3 Tid:SV_DispatchThreadID){
+    if(Tid.x>=QueryCount)return;
+    uint4 A=Queries[Tid.x*4u],B=Queries[Tid.x*4u+1u],C=Queries[Tid.x*4u+2u],D=Queries[Tid.x*4u+3u];
+    float3 Color=0;float2 UV=0;float Coverage=0;
+    bool Valid=(D.z|D.w)==0u&&VoxelApprovedAppearance(A.x,asint(B.xyz),A.y,A.z,A.w,asfloat(C.xyz),asfloat(C.w),B.w,D.y,asfloat(D.x),Color,UV,Coverage);
+    Results[Tid.x*2u]=Valid?asuint(float4(Color,UV.x)):0u;
+    Results[Tid.x*2u+1u]=Valid?uint4(asuint(UV.y),asuint(Coverage),1u,0u):0u;
+}

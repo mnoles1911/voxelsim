@@ -1,0 +1,88 @@
+{
+  "species": "eastern-hemlock",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broad low horizontal boughs, pendant tips and uneven gaps distinguish the crown from fir. Whole-tree photographs support the fuller young form and open mature tiers."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "27079",
+      "source": "https://plants.ces.ncsu.edu/plants/tsuga-canadensis/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "31685",
+      "source": "https://plants.ces.ncsu.edu/plants/tsuga-canadensis/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "tsuga-canadensis",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/tsuga-canadensis/"
+  ],
+  "habitat": "cool-moist",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "fe6aff464f7a6afbadc2dc6c733c78488044cc0db1e33506f94057d89e705998",
+    "4": "755e3f476ba971a87a2382d5a686bf94759b11d26a8c739dafe92206809b013a",
+    "7": "14ffdcb8fa11f715b44692e326bc7153bc05ae8f7c1c0eff3392594cc5dc8809"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "13a8a06b3c79121023b5e4a55d21d0f640a9198d11deae028c2b965c4ef0735b"
+  }
+}

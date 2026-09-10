@@ -34,7 +34,7 @@ from . import parts as partslib
 from .server_version import snapshot as server_snapshot
 from . import (biomes as biomelib, categories as catlib, contact,
                kinds as kindlib, materials, pipeline,
-               render, spec as specmod, vox, vxa)
+               render, spec as specmod, species_registry, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNNING_VERSION = server_snapshot()
@@ -233,6 +233,47 @@ FORGE = Forge()
 
 
 # --- library ----------------------------------------------------------------
+
+
+_tree_appearance_lock=threading.Lock()
+
+def ensure_tree_appearance(directory):
+    # General temperate appearance preserves material/coat RGB and remains opaque.
+    from tools.temperate_appearance import install,in_scope
+    body=json.loads((directory/'spec.json').read_text(encoding='utf8'))
+    if body.get('kind')!='tree' and in_scope(body):
+        with _tree_appearance_lock:install(directory)
+        return
+    if (directory/'tree-appearance.json').is_file() or not (ROOT/'rules/tree-appearance-active.json').is_file():return
+    with _tree_appearance_lock:
+        _ensure_tree_appearance(directory)
+
+def _ensure_tree_appearance(directory):
+    """Apply the active appearance to newly saved tree seeds on first inspection."""
+    active=ROOT/'rules/tree-appearance-active.json'
+    if not active.is_file() or (directory/'tree-appearance.json').is_file():return
+    from .inventory import digest,write_json
+    activation=json.loads(active.read_text(encoding='utf8'))
+    palette_path=ROOT/'rules/tree-appearance-spring-v2.json'
+    if digest(palette_path)!=activation['palette_sha256']:raise ValueError('Active tree palette changed without migration')
+    profiles=json.loads(palette_path.read_text(encoding='utf8'))['profiles']
+    meta=json.loads((directory/'meta.json').read_text(encoding='utf8'))
+    name=meta.get('species')
+    if name not in profiles:return
+    import tempfile
+    from tools.tree_appearance_pilot import build
+    from .forest_profiles import PROFILES
+    profile=profiles[name]
+    with tempfile.TemporaryDirectory(prefix='tree-appearance-',dir=ROOT/'out') as tmp:
+        row=build(name,int(meta['seed']),source=directory,output=tmp,palette=tuple(profile[k] for k in ('bark','foliage','fresh_growth','bark_pattern')))
+        if digest(directory/'tree.vxa')!=row['geometry_sha256']:raise ValueError('Tree changed during appearance generation')
+        body=(Path(tmp)/'voxels.bin').read_bytes()+b'RGB1'+(Path(tmp)/'species.rgb').read_bytes()
+        path=directory/'tree-appearance.bin';pending=directory/'tree-appearance.bin.tmp'
+        pending.write_bytes(body);pending.replace(path)
+        needle=PROFILES[name].architecture in ('conifer','hemlock','cedar','spruce','pine','cedar-wide','column','giant')
+        write_json(directory/'tree-appearance.json',dict(revision=activation['revision'],geometry_sha256=row['geometry_sha256'],preview_sha256=digest(path),palette_sha256=activation['palette_sha256'],needle=needle,voxel_mm=row['voxel_mm']))
+        from tools.tree_appearance_thumbnails import render
+        render(directory)
 
 
 def encode_voxels(grid, appearance=None) -> bytes:
@@ -486,11 +527,13 @@ def _shape_word(spec: dict, kind: str) -> str:
     return specmod.get(spec, "crown.shape")
 
 
-def library_list() -> list[dict]:
+def library_list(include_candidates=False) -> list[dict]:
     if not LIBRARY.exists():
         return []
     entries = []
-    for meta_path in sorted(LIBRARY.glob("*/*/meta.json")):
+    paths=list(LIBRARY.glob('*/*/meta.json'))
+    if include_candidates:paths+=list((ROOT/'out/forge-candidates').glob('*/*/meta.json'))
+    for meta_path in sorted(paths):
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -504,16 +547,17 @@ def library_list() -> list[dict]:
                 meta["kind"] = specmod.get(s, "kind")
             except (OSError, json.JSONDecodeError, KeyError):
                 meta["kind"] = "tree"
-        entries.append(meta)
+        if meta.get('review_status')=='rejected':continue
+        if include_candidates or not meta.get('inventory_candidate'):entries.append(meta)
     entries.sort(key=lambda m: (m.get("species", ""), m.get("seed", 0)))
     return entries
 
 
 def library_dir(entry_id: str) -> Path | None:
     """Resolve an entry id to its directory, refusing anything that escapes."""
-    for d in LIBRARY.glob(f"*/{entry_id}"):
+    for d in [*LIBRARY.glob(f"*/{entry_id}"),*(ROOT/'out/forge-candidates').glob(f"*/{entry_id}")]:
         resolved = d.resolve()
-        if resolved.is_dir() and LIBRARY.resolve() in resolved.parents:
+        if resolved.is_dir() and any(root.resolve() in resolved.parents for root in [LIBRARY,ROOT/'out/forge-candidates']):
             return resolved
     return None
 
@@ -772,6 +816,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": traceback.format_exc(limit=4)}, 500)
 
     def _route_get(self, path: str, q: dict) -> None:
+        if path == "/api/inventory/runs":
+            from . import inventory
+            return self._json(inventory.reports())
         if path == "/api/server-version":
             return self._json(RUNNING_VERSION)
         if path == "/":
@@ -862,6 +909,8 @@ class Handler(BaseHTTPRequestHandler):
             want = q.get("kind") or None
             kept: dict[str, int] = {}
             for entry in library_list():
+                if entry.get("inventory_candidate"):
+                    continue
                 kept[entry.get("species", "")] = kept.get(entry.get("species", ""), 0) + 1
 
             loaded = [(specmod.get(s, "name"), specmod.get(s, "kind"), s)
@@ -928,6 +977,8 @@ class Handler(BaseHTTPRequestHandler):
                         "notes": specmod.get(s, "notes"),
                         "biomes": biomelib.summary(s),
                         "curation": specmod.curation(s),
+                        "design": species_registry.read(specmod.get(s, 'name')),
+                        "reference_review": species_registry.reference_review(specmod.get(s, 'name')),
                         # The placement blocks, for the library's placement
                         # panel. `biome_allow` absent -> null (derived from
                         # the weights); `validate` has already cleaned both.
@@ -1003,6 +1054,8 @@ class Handler(BaseHTTPRequestHandler):
             job = FORGE.get(q.get("job", ""))
             grid = None
             appearance = None
+            tree_appearance = None
+            tree_body = None
             if job:
                 spec, seed = job.spec, int(q["seed"])
             elif q.get("name"):
@@ -1021,12 +1074,19 @@ class Handler(BaseHTTPRequestHandler):
                 spec, _ = specmod.load(d / "spec.json")
                 meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
                 seed = meta["seed"]
-                if meta.get("imported"):
+                if (d / "tree.vxa").is_file():
                     # No (spec, seed) regenerates an import -- the stored
                     # voxels ARE the asset, so serve those.
                     grid = vxa.read(d / "tree.vxa")
+                    ensure_tree_appearance(d)
                     if (d / "appearance.npz").is_file():
                         appearance = d / "appearance.npz"
+                    if (d / 'tree-appearance.json').is_file():
+                        from .inventory import digest
+                        tree_appearance=json.loads((d/'tree-appearance.json').read_text(encoding='utf8'))
+                        if tree_appearance['geometry_sha256']!=digest(d/'tree.vxa') or tree_appearance['preview_sha256']!=digest(d/'tree-appearance.bin'):
+                            return self._json({'error':'Tree appearance does not match saved asset'},409)
+                        tree_body=(d/'tree-appearance.bin').read_bytes()
             try:
                 cap = int(q["max"]) if q.get("max") else None
             except ValueError:
@@ -1037,18 +1097,30 @@ class Handler(BaseHTTPRequestHandler):
                                       resolution_cm=cm).grid
             else:
                 cm = grid.voxel_m * 100.0
-            body = encode_voxels(grid, appearance)
+            body = tree_body if tree_body is not None else encode_voxels(grid, appearance)
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Voxel-Cm", f"{cm:g}")
             self.send_header("X-Authored-Cm", f"{float(specmod.get(spec, 'resolution_cm')):g}")
-            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            if tree_appearance:
+                self.send_header('X-Tree-Appearance',tree_appearance['revision'])
+                self.send_header('X-Tree-Foliage','none' if not tree_appearance.get('foliage_mask',True) else ('needle' if tree_appearance['needle'] else 'broadleaf'))
+            else:
+                from tools.temperate_appearance import in_scope
+                if in_scope(spec):
+                    self.send_header('X-Tree-Appearance','temperate-spring-variation-v1')
+                    self.send_header('X-Tree-Foliage','none')
+            # Appearance can change independently of the geometry seed/spec URL.
+            self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             return self.wfile.write(body)
 
         if path == "/api/library":
             return self._json(library_list())
+
+        if path == '/api/variants':
+            return self._json(library_list(include_candidates=True))
 
         if path == "/api/library/spec":
             d = library_dir(Path(q.get("id", "")).name)
@@ -1063,7 +1135,15 @@ class Handler(BaseHTTPRequestHandler):
             d = library_dir(Path(q.get("id", "")).name)
             if not d or not (d / "thumb.png").exists():
                 return self._json({"error": "not found"}, 404)
-            return self._send(200, (d / "thumb.png").read_bytes(), "image/png", cache=True)
+            if (d/'tree.vxa').is_file() and (d/'spec.json').is_file():ensure_tree_appearance(d)
+            appearance_thumb=d/'tree-appearance-thumb.png'
+            appearance_record=d/'tree-appearance-thumb.json'
+            if appearance_thumb.is_file() and appearance_record.is_file() and (d/'tree-appearance.json').is_file():
+                thumb_meta=json.loads(appearance_record.read_text(encoding='utf8'))
+                appearance_meta=json.loads((d/'tree-appearance.json').read_text(encoding='utf8'))
+                if thumb_meta.get('preview_sha256')==appearance_meta.get('preview_sha256'):
+                    return self._send(200, appearance_thumb.read_bytes(), "image/png")
+            return self._send(200, (d / "thumb.png").read_bytes(), "image/png")
 
         if path == "/api/download":
             d = library_dir(Path(q.get("id", "")).name)
@@ -1097,6 +1177,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": traceback.format_exc(limit=4)}, 500)
 
     def _route_post(self, path: str, body: dict) -> None:
+        if path in ("/api/inventory/start", "/api/inventory/keep", "/api/inventory/reject"):
+            from . import inventory
+            try:
+                result = inventory.start(body) if path.endswith("start") else (inventory.reject if path.endswith('reject') else inventory.promote)(str(body.get("id", "")))
+                return self._json(result)
+            except (ValueError, FileNotFoundError) as exc:
+                return self._json({"error": str(exc)}, 400)
         if path == "/api/generate":
             spec, rep = specmod.validate(body.get("spec") or {})
             if any(e.get("imported") and e.get("species") == spec.get("name") for e in library_list()):
@@ -1204,6 +1291,18 @@ class Handler(BaseHTTPRequestHandler):
             specmod.save(spec, SPECS / f"{name}.json")
             return self._json({"saved": f"{name}.json", "warnings": rep.warnings})
 
+        if path == '/api/library/approve-generator':
+            try:
+                return self._json(species_registry.approve(str(body.get('species',''))))
+            except (ValueError, OSError) as exc:
+                return self._json({'error':str(exc)},400)
+
+        if path == '/api/library/reference':
+            try:
+                return self._json(species_registry.designate(str(body.get('id',''))))
+            except (ValueError, OSError) as exc:
+                return self._json({'error':str(exc)},400)
+
         if path == "/api/library/appearance-review":
             entry_id = str(body.get("id", ""))
             if not re.fullmatch(r"[a-zA-Z0-9_-]+", entry_id):
@@ -1299,6 +1398,9 @@ class Handler(BaseHTTPRequestHandler):
             d = library_dir(Path(str(body.get("id", ""))).name)
             if not d:
                 return self._json({"error": "not found"}, 404)
+            design=species_registry.read(d.parent.name)
+            if design and design['reference_variant_id']==d.name:
+                return self._json({'error':'Choose another reference variant before deleting the species reference.'},400)
             for f in sorted(d.iterdir()):
                 if f.is_file():
                     f.unlink()

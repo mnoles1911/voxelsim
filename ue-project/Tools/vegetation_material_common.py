@@ -5,6 +5,7 @@ Vertex alpha: 1 inert, .75 wood, .5 foliage, .25 herbaceous/petals.
 These are geometry metadata, never inferred from an RGB colour.
 """
 import unreal
+from tree_foliage_mask import SHAPED_MASK_BODY
 
 # Shared with the renderer's 30 cm bounds expansion. This is visual bending,
 # not a collision deformation or a load applied to Chaos falling bodies.
@@ -28,7 +29,7 @@ float2 offset = direction*bend + float2(-direction.y,direction.x)*flutter;
 return float3(offset,0)*strength*moving;
 """
 
-MASK_CODE = r"""
+LEGACY_MASK_CODE = r"""
 float foliage = 1-step(.08,abs(Class-.5));
 // Larger trees need holes that survive a whole-canopy view: a 1 cm mask was
 // already filled by the distance filter at 21 m. Tree cells are 4 cm, grouped
@@ -48,6 +49,14 @@ float coverage = clustered*detail;
 coverage = lerp(coverage,1,smoothstep(2.0,5.0,footprint));
 return lerp(1,coverage,foliage*saturate(Cutout));
 """
+
+# Existing non-tree plants keep their reviewed material until they receive a
+# matching appearance source. Only leaf geometry can acquire holes.
+MASK_CODE = "if(TreeAppearance>.5){\n"+SHAPED_MASK_BODY+r"""
+float foliage=1-step(.08,abs(Class-.5));
+return lerp(1,step(.5,FoliageCoverage),foliage*saturate(Cutout));
+}
+"""+LEGACY_MASK_CODE
 
 
 def add_vegetation(material, vertex_color, lod_mask=None):
@@ -94,7 +103,8 @@ def add_vegetation(material, vertex_color, lod_mask=None):
         'Valid':(param('WindFieldValid'),''),'Enabled':(scalar('WindEnabled',1.),'')})
     assert mel.connect_material_property(offset,'',unreal.MaterialProperty.MP_WORLD_POSITION_OFFSET)
     mask=custom(MASK_CODE,unreal.CustomMaterialOutputType.CMOT_FLOAT1,{
-        'UV':(uv,''),'Data':(data,''),'Class':(vertex_color,'A'),'Cutout':(scalar('FoliageCutout',1.),'')})
+        'UV':(uv,''),'Data':(data,''),'Class':(vertex_color,'A'),'Cutout':(scalar('FoliageCutout',1.),''),
+        'TreeAppearance':(scalar('TreeAppearance',0.),''),'Needle':(scalar('TreeNeedle',0.),''),'Opening':(scalar('TreeOpening',.45),'')})
     if lod_mask:
         product=node(unreal.MaterialExpressionMultiply)
         link(mask,'',product,'A');link(lod_mask,'',product,'B');mask=product

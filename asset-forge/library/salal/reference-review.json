@@ -1,0 +1,341 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/gaultheria-shallon/",
+  "viewed_photos": [
+    "Form - Kathleen Moore",
+    "Plant in bloom - Walter Siegmund",
+    "Native habitat - Jinx McCombs"
+  ],
+  "findings": "Compared broad leathery alternate foliage and spreading evergreen woodland colonies to revised current pilots 1/4/7 and the full 36 sheet. The first tight upright hedge-like pilot was rejected during research. Reduced stems to three-to-five, secondary forks to one and leaf positions to four; widened spread and rounded blade envelopes while retaining attached stems. The revised crowns have separate outward shoots and openings rather than a clipped ball. Height approximately 0.70-1.48 m. Selected vegetative spring foliage before the small pendent flower racemes; no berries. Fine leaf serration and sheen are unresolved/current-palette limitations. Accepted as a stylized salal colony unit.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "40bc899a5a9bce4abbd33359c3643f1d87ec01b4a59dca2f707dce4bf43678c2",
+  "sheet_hash": "43de289dd0172d9376a8b8f1875a91fec5a87da2d8921bd5bd4cdece48390cbc",
+  "reviewed_at": 1788846955.9962451,
+  "pilot_hashes": {
+    "1": "6b3d09c2548448226a02150510a8b6da994ab700d141c515de9dd7656b092e1a",
+    "4": "8deb62c31add0a2bc5f5fafeae9e81c525219e33ce83a46c8e6b2a9ac0f32185",
+    "7": "4fb9358043933e793f31362c7604b41711ad558d1b995b060c939c8ace037b65"
+  },
+  "profile": "salal",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/4A3B2921-F2A9-405E-9_91MhDAF8i3Kq.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=v2wv2rm%2BT7%2F52tbq21jJwhFrsAY%3D&Expires=1788849621",
+      "caption": "Form",
+      "credit": "Kathleen Moore",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "21857"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Gaultheria_shallon_P_NYP9ryIGzhv3.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=07ismuLkktJczD9t3AvkNqKaXmo%3D&Expires=1788849621",
+      "caption": "Plant in bloom",
+      "credit": "Walter Siegmund",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "21848"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Gaultheria_shallon_n_nzqZfcGrctZc.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=xNADq%2BLlfN5zc8ht%2Bxpblp7rHwQ%3D&Expires=1788849621",
+      "caption": "Native habitat",
+      "credit": "Jinx McCombs",
+      "license": "<a href='http://creativecommons.org/licenses/by-nd/2.0/'>CC BY-ND 2.0</a>",
+      "image_id": "21847"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Gaultheria_shallon_f_e69gGcudj2xw.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=N6x9ndfr4XAQrIWqKoTIUTiEqCg%3D&Expires=1788849621",
+      "caption": "Flowers",
+      "credit": "Walter Siegmund",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "21849"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/70FF2096-FE0D-44B0-A_DfQcwsNv1XcD.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Yi28MIZKUtNj3LpYoWLGM6%2F5XSo%3D&Expires=1788849621",
+      "caption": "Flower buds in early spring.",
+      "credit": "Kathleen Moore",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "21853"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/99F37642-C850-4F2C-B_dV9IIkCagcms.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Sr8M8gQhdfetNscvEz3UlWa%2FaL4%3D&Expires=1788849621",
+      "caption": "Slightly serrate leaf margins.",
+      "credit": "Kathleen Moore",
+      "license": "<a href='http://creativecommons.org/licenses/by/4.0/legalcode'>CC BY 4.0</a>",
+      "image_id": "21854"
+    }
+  ],
+  "taxon": "Gaultheria shallon",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "43de289dd0172d9376a8b8f1875a91fec5a87da2d8921bd5bd4cdece48390cbc"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "5157c6c3969d44c9a71d38a82dc53ce45b3ab6d8313388d66f6d0ec3b7626c7a",
+      "new_digest": "40bc899a5a9bce4abbd33359c3643f1d87ec01b4a59dca2f707dce4bf43678c2",
+      "timestamp": 1788847610.8781078,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "salal-0001",
+          "seed": 1,
+          "hash": "6b3d09c2548448226a02150510a8b6da994ab700d141c515de9dd7656b092e1a"
+        },
+        {
+          "id": "salal-0002",
+          "seed": 2,
+          "hash": "1b443934f9aa8f24fadb9c028a5a7bf4580ea5749f164b8d490309d135f66e69"
+        },
+        {
+          "id": "salal-0003",
+          "seed": 3,
+          "hash": "c9c28e66cce74e613cd253ab4223084bce3ba73b910ea66cb485714e13de5585"
+        },
+        {
+          "id": "salal-0004",
+          "seed": 4,
+          "hash": "8deb62c31add0a2bc5f5fafeae9e81c525219e33ce83a46c8e6b2a9ac0f32185"
+        },
+        {
+          "id": "salal-0005",
+          "seed": 5,
+          "hash": "3dadfd1f08e32995c489d090549a5d97c68d3593f82f15ba0f9dab8f3e8ce6bc"
+        },
+        {
+          "id": "salal-0006",
+          "seed": 6,
+          "hash": "b95e1dbb284f28589b03f31aea093f3f2f0bfac75d27b483bc81769c41a48c36"
+        },
+        {
+          "id": "salal-0007",
+          "seed": 7,
+          "hash": "4fb9358043933e793f31362c7604b41711ad558d1b995b060c939c8ace037b65"
+        },
+        {
+          "id": "salal-0008",
+          "seed": 8,
+          "hash": "17b7f3e0df06b421325529fd68299bd4123f8820f0a86260fe02260df0b594b2"
+        },
+        {
+          "id": "salal-0009",
+          "seed": 9,
+          "hash": "c9c05b6fd29eeb601a0852d6527a06cc139854ec3bc07c92f6087183d3661c0f"
+        },
+        {
+          "id": "salal-0010",
+          "seed": 10,
+          "hash": "c0eb80587105c6b3bc0f89ed4f309f9f14cf689d24322b64dd597e878cdf537f"
+        },
+        {
+          "id": "salal-0011",
+          "seed": 11,
+          "hash": "d6832fe38792e22e73fd34355847a3ec2b640ea2b7308913c337b82de3f4fa18"
+        },
+        {
+          "id": "salal-0012",
+          "seed": 12,
+          "hash": "6b09d2e347eddc135dd85f8debf57020297cbce86013031c4cbbbf2ec87917b8"
+        },
+        {
+          "id": "salal-0013",
+          "seed": 13,
+          "hash": "d29a477014799721276a9bb44c094ce4a2bacc6678ce33d0e58fde3346cbe7d1"
+        },
+        {
+          "id": "salal-0014",
+          "seed": 14,
+          "hash": "0a46dad13ac6d9ac4b957c51978f98a1632dd5c0d8a0c5c0acf8af2ccb43565a"
+        },
+        {
+          "id": "salal-0015",
+          "seed": 15,
+          "hash": "c1e61eccffa2f6ed8325cdc41cb3280be99924c33dd1634c009a290e1dd95afd"
+        },
+        {
+          "id": "salal-0016",
+          "seed": 16,
+          "hash": "3fbb11b057ee67c0532bb55b80c5aa2c744e5f33b15c5c3854d4f1c22e471cf5"
+        },
+        {
+          "id": "salal-0017",
+          "seed": 17,
+          "hash": "e0e305d5f8eb4d3e61f8440fcaa6bc9667c1cc81f9ffc95895b54f97e42155a5"
+        },
+        {
+          "id": "salal-0018",
+          "seed": 18,
+          "hash": "2c208c0a073d5d8efd5a5ab68305204c163ff81c8a4bfde76131e82e5af7f7af"
+        },
+        {
+          "id": "salal-0019",
+          "seed": 19,
+          "hash": "460cbda4eeb913bcf1a0b6637303376b3232400f3eca57a2592ec7eea598570b"
+        },
+        {
+          "id": "salal-0020",
+          "seed": 20,
+          "hash": "8356dd9db5414f300cc938340c74ae5073a0b0d4b346f3eea4ac90a109a79ee9"
+        },
+        {
+          "id": "salal-0021",
+          "seed": 21,
+          "hash": "47100a6949d288c3cbe0625a20f5d95f22db70c5d2b7fcef6d4ace8f4171c20e"
+        },
+        {
+          "id": "salal-0022",
+          "seed": 22,
+          "hash": "2a5d63358e66b68ad937684d9bda7799f804454b242c7726ba3591330b508dd4"
+        },
+        {
+          "id": "salal-0023",
+          "seed": 23,
+          "hash": "3194d1445cc2ebea523f330eb0c9e450fed1b8779062e519d8f506318a56509f"
+        },
+        {
+          "id": "salal-0024",
+          "seed": 24,
+          "hash": "5879f95a517251f64e7ce8bddfe2a03ea9c6d38cfb0fd717c16c9ec25960d953"
+        },
+        {
+          "id": "salal-0025",
+          "seed": 25,
+          "hash": "f9ac35bb9a4b77194249b0ab2b6642031ea814e4a3d4058036b92f9c80a1f067"
+        },
+        {
+          "id": "salal-0026",
+          "seed": 26,
+          "hash": "c6d4afbd61175318d50104c54c193d15e15d01206ad4721726f906368532a8b9"
+        },
+        {
+          "id": "salal-0027",
+          "seed": 27,
+          "hash": "85b5ea3a606e4f3c2f487525a889a7c68ee621e112baae2afc44b0f37858249d"
+        },
+        {
+          "id": "salal-0028",
+          "seed": 28,
+          "hash": "34306fa3283e6aa8f95c458a471f9640f9058c24964febd5840303655761cdf8"
+        },
+        {
+          "id": "salal-0029",
+          "seed": 29,
+          "hash": "cb829bdd4407a9de5172a9bc1524a2d9b68f5dd59ba5ba1081a89cc66948a04a"
+        },
+        {
+          "id": "salal-0030",
+          "seed": 30,
+          "hash": "f9370f6aee164f9d7c9fce6d586a1adeec82f26f82d875fac4beff06d0143b5c"
+        },
+        {
+          "id": "salal-0031",
+          "seed": 31,
+          "hash": "94e8a3f5159d6551eb5256bcd63f9e2b95a46804845063705f7d64e6408859a9"
+        },
+        {
+          "id": "salal-0032",
+          "seed": 32,
+          "hash": "f9e2cd9a98afca3bba081a01d6d38ed379b363d092e8ed727ef963b329e2bf0b"
+        },
+        {
+          "id": "salal-0033",
+          "seed": 33,
+          "hash": "28a0fba99abc33d6f5d779291f9b9a56ec1f7c076edfa410a8aafff0eb4ec043"
+        },
+        {
+          "id": "salal-0034",
+          "seed": 34,
+          "hash": "bd84b466c3c8e5041d2e06cda4565bae5d5162ad0ebe082b089c713fbe809254"
+        },
+        {
+          "id": "salal-0035",
+          "seed": 35,
+          "hash": "581eacef17cb44dc243c0e691a327e7979854f36b4aeacae64f74466fda945e3"
+        },
+        {
+          "id": "salal-0036",
+          "seed": 36,
+          "hash": "e1d5a5ad7adc2edb6583b029cd61c377efbb9b0186bee0c64ff343f122297b42"
+        }
+      ]
+    }
+  ]
+}

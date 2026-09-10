@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "revision": "temperate-ecology-authoring-v1",
+  "species": "wood-anemone",
+  "kind": "flower",
+  "cover_role": "spring-woodland",
+  "community_weights_per_mille": {
+    "oak-beech": 900,
+    "maple-beech": 250,
+    "coastal-conifer": 250,
+    "pine-birch": 250,
+    "riparian": 250,
+    "warm-dry": 250,
+    "east-asian": 250,
+    "wet-mild": 250
+  },
+  "trunk_exclusion_mm": 100,
+  "crown_opacity_per_mille": 0,
+  "reference_review": "reference-review.json",
+  "placement_references": [],
+  "status": "authored_initial_placement_targets_pending_world_visual_review",
+  "notes": [
+    "Instanced non-colliding understory; no voxel-level destruction.",
+    "Water/depth gates are mandatory; wetland role alone does not establish suitability.",
+    "Weights are authored game targets. Broad default communities need regional refinement.",
+    "No seasonal simulation or recoloring."
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "scope": "Candidate actual-terrain route from world-capture-13 survey; not yet walked. Does not cover all representative habitats or establish building support.",
+  "spawn_x_m": -154740,
+  "spawn_y_m": -81476,
+  "configuration_sha256": "e68b98f5d52952d59cece8e4403c6d42eaddb9fee5d3259dabb999a6f1ad0936",
+  "species_manifest_sha256": "0197da097e17a2634c2f15dca0589e5e98157eb631c2998513769738427dd4f6",
+  "waypoints": [
+    {
+      "x_m": -154720.0,
+      "y_m": -81472.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 90,
+      "survey_stand": 0,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154696.0,
+      "y_m": -81448.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 1,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154720.0,
+      "y_m": -81416.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 100,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154752.0,
+      "y_m": -81440.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 71,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154776.0,
+      "y_m": -81464.0,
+      "label": "survey point; route connectivity unverified",
+      "survey_slope_mm_per_m": 127,
+      "survey_stand": 1,
+      "survey_water_mm": 0
+    },
+    {
+      "x_m": -154776.0,
+      "y_m": -81456.0,
+      "label": "screened plot candidate; support and access unverified"
+    }
+  ]
+}

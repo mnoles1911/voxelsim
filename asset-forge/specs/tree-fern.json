@@ -1,4 +1,39 @@
 {
+  "artifact": {
+    "asym_vox": 0.8,
+    "beam_m": 0.85,
+    "bilge": 2.6,
+    "billow_m": 0.16,
+    "crossbar_at": 0.42,
+    "deck_frac": 0.07,
+    "depth_m": 0.35,
+    "droop_m": 0.3,
+    "entry": 0.62,
+    "form": "hull",
+    "frame_at": 0.34,
+    "frame_base_m": 0.95,
+    "frame_drop_m": 1.15,
+    "frame_r_m": 0.03,
+    "fullness": 2.4,
+    "gunwale_m": 0.06,
+    "gunwale_vox": 1,
+    "keel_m": 0.45,
+    "keel_r_m": 0.04,
+    "length_m": 4.0,
+    "panel_vox": 2,
+    "rocker": 0.14,
+    "seat": true,
+    "seat_len_m": 0.8,
+    "sheer": 0.35,
+    "shell_vox": 2,
+    "spar_r_m": 0.045,
+    "strake_share": 0.25,
+    "sweep": 0.85,
+    "taper": 0.3,
+    "thwart_t_m": 0.05,
+    "thwart_w_m": 0.1,
+    "thwarts": 2
+  },
   "biomes": {
     "bare_rock": 0.0,
     "beach": 0.0,
@@ -82,6 +117,13 @@
     "shell_upper": 0.6,
     "squash": 1.0
   },
+  "curation": {
+    "notes": "Reference-informed generator; variants require endorsement in Forge.",
+    "seeds": [
+      1
+    ],
+    "status": "draft"
+  },
   "detail": {
     "depth_max_m": 6.0,
     "depth_min_m": 0.3,
@@ -111,6 +153,7 @@
     "caudal_shape": "forked",
     "caudal_span": 1.15,
     "caudal_upper": 0.0,
+    "claspers": 0.0,
     "curve_amount": 0.0,
     "curve_at": 0.55,
     "depth_at": 0.36,
@@ -242,7 +285,9 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
+    "frame": "beak_horn",
     "head": "leaf_blossom",
+    "hull": "heartwood",
     "leaf": "leaf_jungle",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,7 +298,9 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "grass"
+    "stem": "grass",
+    "strake": "deadwood",
+    "trim": "bark"
   },
   "name": "tree-fern",
   "notes": "NO TAPER IS THE SPECIES. A tree fern's trunk is the same width top to bottom -- it is a mass of old frond bases, not wood -- so `radius_exp` is 3.5, the top of the range, which keeps the parent thick all the way up, and the root flare is zero. Everything else here tapers.\n\nA `frond` crown that is FLAT rather than a fountain: rise 0.35 with a low droop, so the fronds go out rather than up. Head-height understorey, which is the layer the rainforest file says the biome is missing.\n\nTAPER 0 IS NOW SAID DIRECTLY. `radius_exp` 3.5 was the only way to say 'does not taper' before `trunk.taper` existed, and it says it by keeping every PARENT thick rather than by describing the stem; the note above ('everything else here tapers') was true of the intent and not of the generator, which measured `birch` at a taper ratio of 1.00 and had no d(z) at all.",
@@ -263,8 +310,15 @@
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
     "slope_max_pct": 45.0,
+    "slope_min_pct": 0.0,
     "spacing_m": 3.5,
     "water_max_m": 80.0
+  },
+  "plant_recipe": {
+    "form": "mixed",
+    "generator": "temperate-shoots-v2",
+    "profile": "tree-fern",
+    "size": "mixed"
   },
   "quad": {
     "belly": 0.52,

@@ -467,6 +467,8 @@ namespace
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelAssetStampCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelAssetStampCS, FGlobalShader);
+		class FOwnershipDim : SHADER_PERMUTATION_BOOL("VXC_ASSET_OWNERSHIP");
+		using FPermutationDomain = TShaderPermutationDomain<FOwnershipDim>;
 
 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 		{
@@ -487,9 +489,8 @@ namespace
 			SHADER_PARAMETER(uint32, SizeY)
 			SHADER_PARAMETER(uint32, SizeZ)
 			SHADER_PARAMETER(uint32, ColStartsBase)
-			SHADER_PARAMETER(uint32, HasRenderSuppression)
-			SHADER_PARAMETER(uint32, SuppressTerrainRender)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OwnedWinnerClaims)
+			SHADER_PARAMETER(uint32, RenderOwned)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OwnedWinnerMask)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ColStarts)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Spans)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
@@ -511,6 +512,8 @@ namespace
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelAssetStampCoarseCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelAssetStampCoarseCS, FGlobalShader);
+		class FOwnershipDim : SHADER_PERMUTATION_BOOL("VXC_ASSET_OWNERSHIP");
+		using FPermutationDomain = TShaderPermutationDomain<FOwnershipDim>;
 
 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 		{
@@ -531,9 +534,8 @@ namespace
 			SHADER_PARAMETER(uint32, SizeY)
 			SHADER_PARAMETER(uint32, SizeZ)
 			SHADER_PARAMETER(uint32, ColStartsBase)
-			SHADER_PARAMETER(uint32, HasRenderSuppression)
-			SHADER_PARAMETER(uint32, SuppressTerrainRender)
-			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OwnedWinnerClaims)
+			SHADER_PARAMETER(uint32, RenderOwned)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OwnedWinnerMask)
 			// The gather's own three: the scale (host-computed 1 << level, same
 			// VARIABLE_SHIFT reasoning as FillLooseParameters' CoarseScale) and
 			// the covering cell box the dispatch is threaded over.
@@ -548,6 +550,19 @@ namespace
 
 
 
+    class FVoxelAssetOwnedClearCS : public FGlobalShader {
+    public:
+        DECLARE_GLOBAL_SHADER(FVoxelAssetOwnedClearCS);
+        SHADER_USE_PARAMETER_STRUCT(FVoxelAssetOwnedClearCS,FGlobalShader);
+        static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters&){return true;}
+        BEGIN_SHADER_PARAMETER_STRUCT(FParameters,)
+            SHADER_PARAMETER(uint32,CellCount)
+            SHADER_PARAMETER(uint32,ClearGroupsX)
+            SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>,OwnedWinnerMask)
+            SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>,OutCells)
+        END_SHADER_PARAMETER_STRUCT()
+    };
+
 	// --- AssetStampWorklistMain: the order-preserving gather (P3 stage 4) ---
 	//
 	// One indirect dispatch per tick (16 groups per record, one thread per
@@ -561,6 +576,8 @@ namespace
 	public:
 		DECLARE_GLOBAL_SHADER(FVoxelWorklistAssetStampCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistAssetStampCS, FGlobalShader);
+		class FOwnershipDim : SHADER_PERMUTATION_BOOL("VXC_ASSET_OWNERSHIP");
+		using FPermutationDomain=TShaderPermutationDomain<FOwnershipDim>;
 
 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 		{
@@ -1573,6 +1590,7 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolAllocRecordCS,   VOXEL_BRICK_POOL_ALLOC_U
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolFreeCS,          VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolFreeMain",          SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolAllocVerifyCS,   VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolAllocVerifyMain",   SF_Compute);
 
+IMPLEMENT_GLOBAL_SHADER(FVoxelAssetOwnedClearCS, "/VoxelEarth/VoxelAssetOwnedClear.usf", "AssetOwnedClearMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCoarseCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampCoarseMain", SF_Compute);
 
@@ -1901,9 +1919,10 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		// rather than truncated into a hole at the top of a tall asset.
 		for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Req.AssetInstances)
 		{
-			// Bounded optional scratch: at most 4 MiB per classic request.
+			// SuppressTerrainRender retains its upstream 4 MiB scratch contract.
+			// RenderOwned-only requests retain their existing region-size admission.
 			// RDG owns lifetime, including cancellation; no retained ownership resource.
-			if (Inst.SuppressTerrainRender > 1u ||
+			if (Inst.RenderOwned > 1u || Inst.SuppressTerrainRender > 1u ||
 			    (Inst.SuppressTerrainRender != 0u && uint64(Req.BricksZ) > 1048576ull / Cx / Cy / 8u))
 			{
 				OutError = TEXT("Asset render suppression flag invalid or claim scratch exceeds 4 MiB");
@@ -2399,139 +2418,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	// SKIPPED for a cell-fed asset chunk (the flush graph's gather already
 	// stamped the arena) -- unless the verify-stamp arm needs the classic
 	// chain as its byte reference, in which case it stamps the TRANSIENT.
-	if (Request.AssetInstances.Num() > 0 && (!bWorklistCells || bVerifyStamp))
-	{
-		FRDGBufferRef ColStartsBuffer = CreateStructuredBuffer(
-			GraphBuilder, TEXT("Voxel.AssetColStarts"), sizeof(uint32),
-			Request.AssetColStarts.Num(), Request.AssetColStarts.GetData(),
-			Request.AssetColStarts.Num() * sizeof(uint32));
-		FRDGBufferRef SpansBuffer = CreateStructuredBuffer(
-			GraphBuilder, TEXT("Voxel.AssetSpans"), sizeof(uint32),
-			Request.AssetSpans.Num(), Request.AssetSpans.GetData(),
-			Request.AssetSpans.Num() * sizeof(uint32));
-
-		const bool bHasRenderSuppression = Request.AssetInstances.ContainsByPredicate(
-			[](const FVoxelGpuRegionRequest::FAssetInstance& Inst) { return Inst.SuppressTerrainRender != 0u; });
-		// No allocation/clear for the default path. The fallback UAV is never
-		// accessed while HasRenderSuppression is zero.
-		FRDGBufferRef WinnerClaims = Out.Cells;
-		if (bHasRenderSuppression)
-		{
-			WinnerClaims = GraphBuilder.CreateBuffer(
-				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumCells), TEXT("Voxel.AssetOwnedWinnerClaims"));
-			AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(WinnerClaims), 0u);
-		}
-
-		if (Request.CoarseLevel == 0)
-		{
-			// Level 0: the scatter kernel, untouched -- byte-identical to every
-			// dispatch taken before the coarse gather existed.
-			TShaderMapRef<FVoxelAssetStampCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Request.AssetInstances)
-			{
-				FVoxelAssetStampCS::FParameters* Params =
-					GraphBuilder.AllocParameters<FVoxelAssetStampCS::FParameters>();
-				Params->DispatchColumns = Request.DispatchColumns;
-				Params->BricksZ = Request.BricksZ;
-				Params->BrickZMin = Request.BrickZMin;
-				Params->AnchorRel = FIntPoint(Inst.AnchorRelVx, Inst.AnchorRelVy);
-				Params->AnchorVz = Inst.AnchorVz;
-				Params->GridOriginZ = Inst.GridOriginZ;
-				Params->RotOriginX = Inst.RotOriginX;
-				Params->RotOriginY = Inst.RotOriginY;
-				Params->YawQuarter = Inst.YawQuarter;
-				Params->SizeX = Inst.SizeX;
-				Params->SizeY = Inst.SizeY;
-				Params->SizeZ = Inst.SizeZ;
-				Params->ColStartsBase = Inst.ColStartsBase;
-				Params->HasRenderSuppression = bHasRenderSuppression ? 1u : 0u;
-				Params->SuppressTerrainRender = Inst.SuppressTerrainRender;
-				Params->OwnedWinnerClaims = GraphBuilder.CreateUAV(WinnerClaims);
-				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
-				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
-				Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
-
-				FComputeShaderUtils::AddPass(
-					GraphBuilder, RDG_EVENT_NAME("Voxel.AssetStamp"), Shader, Params,
-					FIntVector(FMath::DivideAndRoundUp(Inst.SizeX, 8u),
-					           FMath::DivideAndRoundUp(Inst.SizeY, 8u), 1));
-			}
-		}
-		else
-		{
-			// CoarseLevel > 0: the gather kernel, one thread per level-L cell
-			// of the instance's covering cell box. The box is computed HERE,
-			// mirroring FCoarseChunkGridSampler's shortlist bounds: cells whose
-			// rep coordinate COULD fall inside the rotated XY box, i.e.
-			// [floorDiv(min - s/2, s), floorDiv(max - s/2, s) + 1] inclusive,
-			// clamped to the region -- conservative on purpose, because the
-			// kernel's rep-in-box test is the exact filter (same division of
-			// labour as the CPU: cover loosely, test exactly). A box clamped to
-			// nothing is an instance whose rep coordinates never land in this
-			// region: the CPU composes nothing for it, so skipping the dispatch
-			// IS parity, not an optimisation over it.
-			//
-			// floorDiv is inlined here (this module deliberately does not link
-			// voxel-core); (min - s/2) is routinely negative for an instance
-			// leaning in from the negative side, so operator/ will not do.
-			const int32 Scale = 1 << Request.CoarseLevel;   // validated 1..5
-			const auto FloorDivI32 = [](int32 A, int32 B) -> int32
-			{
-				return (A >= 0) ? (A / B) : -((-A + B - 1) / B);
-			};
-
-			TShaderMapRef<FVoxelAssetStampCoarseCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
-			for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Request.AssetInstances)
-			{
-				const int32 RotSizeX = (Inst.YawQuarter & 1u) ? int32(Inst.SizeY) : int32(Inst.SizeX);
-				const int32 RotSizeY = (Inst.YawQuarter & 1u) ? int32(Inst.SizeX) : int32(Inst.SizeY);
-				const int32 MinRelVx = Inst.AnchorRelVx + Inst.RotOriginX;
-				const int32 MinRelVy = Inst.AnchorRelVy + Inst.RotOriginY;
-				const int32 Half = Scale / 2;
-
-				const int32 C0x = FMath::Max(FloorDivI32(MinRelVx - Half, Scale), 0);
-				const int32 C1x = FMath::Min(FloorDivI32(MinRelVx + RotSizeX - 1 - Half, Scale) + 1,
-				                             int32(Cx) - 1);
-				const int32 C0y = FMath::Max(FloorDivI32(MinRelVy - Half, Scale), 0);
-				const int32 C1y = FMath::Min(FloorDivI32(MinRelVy + RotSizeY - 1 - Half, Scale) + 1,
-				                             int32(Cy) - 1);
-				if (C0x > C1x || C0y > C1y)
-				{
-					continue;
-				}
-
-				FVoxelAssetStampCoarseCS::FParameters* Params =
-					GraphBuilder.AllocParameters<FVoxelAssetStampCoarseCS::FParameters>();
-				Params->DispatchColumns = Request.DispatchColumns;
-				Params->BricksZ = Request.BricksZ;
-				Params->BrickZMin = Request.BrickZMin;
-				Params->AnchorRel = FIntPoint(Inst.AnchorRelVx, Inst.AnchorRelVy);
-				Params->AnchorVz = Inst.AnchorVz;
-				Params->GridOriginZ = Inst.GridOriginZ;
-				Params->RotOriginX = Inst.RotOriginX;
-				Params->RotOriginY = Inst.RotOriginY;
-				Params->YawQuarter = Inst.YawQuarter;
-				Params->SizeX = Inst.SizeX;
-				Params->SizeY = Inst.SizeY;
-				Params->SizeZ = Inst.SizeZ;
-				Params->ColStartsBase = Inst.ColStartsBase;
-				Params->HasRenderSuppression = bHasRenderSuppression ? 1u : 0u;
-				Params->SuppressTerrainRender = Inst.SuppressTerrainRender;
-				Params->OwnedWinnerClaims = GraphBuilder.CreateUAV(WinnerClaims);
-				Params->CoarseScale = uint32(Scale);
-				Params->CellBoxMin = FUintVector2(uint32(C0x), uint32(C0y));
-				Params->CellBoxSize = FUintVector2(uint32(C1x - C0x + 1), uint32(C1y - C0y + 1));
-				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
-				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
-				Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
-
-				FComputeShaderUtils::AddPass(
-					GraphBuilder, RDG_EVENT_NAME("Voxel.AssetStampCoarse"), Shader, Params,
-					FIntVector(FMath::DivideAndRoundUp(uint32(C1x - C0x + 1), 8u),
-					           FMath::DivideAndRoundUp(uint32(C1y - C0y + 1), 8u), 1));
-			}
-		}
-	}
+    if(Request.AssetInstances.Num()>0&&(!bWorklistCells||bVerifyStamp))AddClassicAssetStampPasses(GraphBuilder,Request,Out.Cells);
 
 	// --- pass 2v (verify arms only): converted cells vs classic -------------
 	//
@@ -3256,6 +3143,147 @@ void VoxelGpuWorldGen::AddWorklistClassifyPasses(FRDGBuilder& GraphBuilder,
 	}
 }
 
+void VoxelGpuWorldGen::AddClassicAssetStampPasses(FRDGBuilder& GraphBuilder,const FVoxelGpuRegionRequest& Request,FRDGBufferRef Cells){
+    check(IsInRenderingThread());check(Cells);
+    if(Request.AssetInstances.IsEmpty())return;
+    const uint32 Cx=Request.DispatchColumns.X,Cy=Request.DispatchColumns.Y;
+		FRDGBufferRef ColStartsBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.AssetColStarts"), sizeof(uint32),
+			Request.AssetColStarts.Num(), Request.AssetColStarts.GetData(),
+			Request.AssetColStarts.Num() * sizeof(uint32));
+		FRDGBufferRef SpansBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.AssetSpans"), sizeof(uint32),
+			Request.AssetSpans.Num(), Request.AssetSpans.GetData(),
+			Request.AssetSpans.Num() * sizeof(uint32));
+
+        const bool HasOwned=Request.AssetInstances.ContainsByPredicate([](const auto& I){return I.RenderOwned!=0 || I.SuppressTerrainRender!=0;});
+        FRDGBufferRef WinnerMask=nullptr;
+        if(HasOwned){
+            WinnerMask=GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),Cells->Desc.NumElements),TEXT("Voxel.AssetOwnedWinnerMask"));
+            AddClearUAVPass(GraphBuilder,GraphBuilder.CreateUAV(WinnerMask),0u);
+        }
+		if (Request.CoarseLevel == 0)
+		{
+			// Level 0: the scatter kernel, untouched -- byte-identical to every
+			// dispatch taken before the coarse gather existed.
+			FVoxelAssetStampCS::FPermutationDomain Permutation;Permutation.Set<FVoxelAssetStampCS::FOwnershipDim>(HasOwned);
+			TShaderMapRef<FVoxelAssetStampCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel),Permutation);
+			for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Request.AssetInstances)
+			{
+				FVoxelAssetStampCS::FParameters* Params =
+					GraphBuilder.AllocParameters<FVoxelAssetStampCS::FParameters>();
+				Params->DispatchColumns = Request.DispatchColumns;
+				Params->BricksZ = Request.BricksZ;
+				Params->BrickZMin = Request.BrickZMin;
+				Params->AnchorRel = FIntPoint(Inst.AnchorRelVx, Inst.AnchorRelVy);
+				Params->AnchorVz = Inst.AnchorVz;
+				Params->GridOriginZ = Inst.GridOriginZ;
+				Params->RotOriginX = Inst.RotOriginX;
+				Params->RotOriginY = Inst.RotOriginY;
+				Params->YawQuarter = Inst.YawQuarter;
+				Params->SizeX = Inst.SizeX;
+				Params->SizeY = Inst.SizeY;
+				Params->SizeZ = Inst.SizeZ;
+				Params->ColStartsBase = Inst.ColStartsBase;
+                Params->RenderOwned=Inst.RenderOwned | Inst.SuppressTerrainRender;
+                Params->OwnedWinnerMask=WinnerMask?GraphBuilder.CreateUAV(WinnerMask):nullptr;
+				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
+				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
+				Params->OutCells = GraphBuilder.CreateUAV(Cells);
+
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.AssetStamp"), Shader, Params,
+					FIntVector(FMath::DivideAndRoundUp(Inst.SizeX, 8u),
+					           FMath::DivideAndRoundUp(Inst.SizeY, 8u), 1));
+			}
+		}
+		else
+		{
+			// CoarseLevel > 0: the gather kernel, one thread per level-L cell
+			// of the instance's covering cell box. The box is computed HERE,
+			// mirroring FCoarseChunkGridSampler's shortlist bounds: cells whose
+			// rep coordinate COULD fall inside the rotated XY box, i.e.
+			// [floorDiv(min - s/2, s), floorDiv(max - s/2, s) + 1] inclusive,
+			// clamped to the region -- conservative on purpose, because the
+			// kernel's rep-in-box test is the exact filter (same division of
+			// labour as the CPU: cover loosely, test exactly). A box clamped to
+			// nothing is an instance whose rep coordinates never land in this
+			// region: the CPU composes nothing for it, so skipping the dispatch
+			// IS parity, not an optimisation over it.
+			//
+			// floorDiv is inlined here (this module deliberately does not link
+			// voxel-core); (min - s/2) is routinely negative for an instance
+			// leaning in from the negative side, so operator/ will not do.
+			const int32 Scale = 1 << Request.CoarseLevel;   // validated 1..5
+			const auto FloorDivI32 = [](int32 A, int32 B) -> int32
+			{
+				return (A >= 0) ? (A / B) : -((-A + B - 1) / B);
+			};
+
+			FVoxelAssetStampCoarseCS::FPermutationDomain Permutation;Permutation.Set<FVoxelAssetStampCoarseCS::FOwnershipDim>(HasOwned);
+			TShaderMapRef<FVoxelAssetStampCoarseCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel),Permutation);
+			for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Request.AssetInstances)
+			{
+				const int32 RotSizeX = (Inst.YawQuarter & 1u) ? int32(Inst.SizeY) : int32(Inst.SizeX);
+				const int32 RotSizeY = (Inst.YawQuarter & 1u) ? int32(Inst.SizeX) : int32(Inst.SizeY);
+				const int32 MinRelVx = Inst.AnchorRelVx + Inst.RotOriginX;
+				const int32 MinRelVy = Inst.AnchorRelVy + Inst.RotOriginY;
+				const int32 Half = Scale / 2;
+
+				const int32 C0x = FMath::Max(FloorDivI32(MinRelVx - Half, Scale), 0);
+				const int32 C1x = FMath::Min(FloorDivI32(MinRelVx + RotSizeX - 1 - Half, Scale) + 1,
+				                             int32(Cx) - 1);
+				const int32 C0y = FMath::Max(FloorDivI32(MinRelVy - Half, Scale), 0);
+				const int32 C1y = FMath::Min(FloorDivI32(MinRelVy + RotSizeY - 1 - Half, Scale) + 1,
+				                             int32(Cy) - 1);
+				if (C0x > C1x || C0y > C1y)
+				{
+					continue;
+				}
+
+				FVoxelAssetStampCoarseCS::FParameters* Params =
+					GraphBuilder.AllocParameters<FVoxelAssetStampCoarseCS::FParameters>();
+				Params->DispatchColumns = Request.DispatchColumns;
+				Params->BricksZ = Request.BricksZ;
+				Params->BrickZMin = Request.BrickZMin;
+				Params->AnchorRel = FIntPoint(Inst.AnchorRelVx, Inst.AnchorRelVy);
+				Params->AnchorVz = Inst.AnchorVz;
+				Params->GridOriginZ = Inst.GridOriginZ;
+				Params->RotOriginX = Inst.RotOriginX;
+				Params->RotOriginY = Inst.RotOriginY;
+				Params->YawQuarter = Inst.YawQuarter;
+				Params->SizeX = Inst.SizeX;
+				Params->SizeY = Inst.SizeY;
+				Params->SizeZ = Inst.SizeZ;
+				Params->ColStartsBase = Inst.ColStartsBase;
+                Params->RenderOwned=Inst.RenderOwned | Inst.SuppressTerrainRender;
+                Params->OwnedWinnerMask=WinnerMask?GraphBuilder.CreateUAV(WinnerMask):nullptr;
+				Params->CoarseScale = uint32(Scale);
+				Params->CellBoxMin = FUintVector2(uint32(C0x), uint32(C0y));
+				Params->CellBoxSize = FUintVector2(uint32(C1x - C0x + 1), uint32(C1y - C0y + 1));
+				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
+				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
+				Params->OutCells = GraphBuilder.CreateUAV(Cells);
+
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.AssetStampCoarse"), Shader, Params,
+					FIntVector(FMath::DivideAndRoundUp(uint32(C1x - C0x + 1), 8u),
+					           FMath::DivideAndRoundUp(uint32(C1y - C0y + 1), 8u), 1));
+			}
+		}
+        if(HasOwned){
+            auto* Clear=GraphBuilder.AllocParameters<FVoxelAssetOwnedClearCS::FParameters>();
+            Clear->CellCount=Cells->Desc.NumElements;Clear->OwnedWinnerMask=GraphBuilder.CreateSRV(WinnerMask);Clear->OutCells=GraphBuilder.CreateUAV(Cells);
+            TShaderMapRef<FVoxelAssetOwnedClearCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+            // A legal region may exceed 65,535 groups. Wrap the clear into Y.
+            const uint32 Groups = FMath::DivideAndRoundUp(Clear->CellCount,64u);
+            Clear->ClearGroupsX = FMath::Min(Groups,65535u);
+            FComputeShaderUtils::AddPass(GraphBuilder,RDG_EVENT_NAME("Voxel.AssetOwnedClear"),Shader,Clear,
+                FIntVector(Clear->ClearGroupsX,FMath::DivideAndRoundUp(Groups,Clear->ClearGroupsX),1));
+        }
+
+}
+
 void VoxelGpuWorldGen::AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder,
                                                  const FWorklistAssetStampDispatch& Dispatch)
 {
@@ -3285,7 +3313,8 @@ void VoxelGpuWorldGen::AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder,
 	Params->OutCells = GraphBuilder.CreateUAV(Dispatch.CellArena);
 	Params->IndirectArgs = Dispatch.IndirectArgs;
 
-	TShaderMapRef<FVoxelWorklistAssetStampCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FVoxelWorklistAssetStampCS::FPermutationDomain Permutation;Permutation.Set<FVoxelWorklistAssetStampCS::FOwnershipDim>(Dispatch.bHasOwnedWinners);
+	TShaderMapRef<FVoxelWorklistAssetStampCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel),Permutation);
 	// P2: pipe is the caller's choice -- see AddWorklistColumnPass's note.
 	FComputeShaderUtils::AddPass(
 		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistAssetStamp(indirect)"),

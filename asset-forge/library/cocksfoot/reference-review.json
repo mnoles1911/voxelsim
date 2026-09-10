@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/dactylis-glomerata/",
+  "viewed_photos": [
+    "Whole Plant in Bloom - Harry Rose",
+    "Form - Rasbak",
+    "Flowers - Kristine Peters"
+  ],
+  "findings": "Harry Rose full flowering tussock, Rasbak foliage and Kristine Peters flowers: dense arched basal blades with separate taller culms; old stiff fan rejected. Spring vegetative form omits mature panicles. Current three-size pilots (seeds 1,4,7) and every panel of36-seed contact sheet visually reviewed. Dense arching basal blades beneath separate taller leafy culms; 28\u201372 cm. Thin blades are thickened to one voxel, but curved habit improves on former fan. Accepted as stylized spring source; variant endorsement remains a user decision.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "43895f22fa07d45f8c1d9fdb1eaddc0376d640d0099b47531cf0be71c0ba7bc6",
+  "sheet_hash": "e45d8ea8946759f7e983f28138a6c5614a5e0850808d9d2d42ad2166a004f8f1",
+  "reviewed_at": 1788855354.1942034,
+  "pilot_hashes": {
+    "1": "723f62366fbf16ae79f1f807603d629c3c8787d597eea7fd25cfe2acbf155d67",
+    "4": "3dd81c6cc1228d1a52dcca32a758dd6f12e16958db471970bb7be88203c291bb",
+    "7": "8b90b37c49e261fe810fe8e991103570b0a56cbd4a3ae76a249c235b04feaf3d"
+  },
+  "profile": "cocksfoot",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dactylis_glomerata-H_SBIai8dWr69Q.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=e4gHuheyTRpshRYkb3OBn9uaIOI%3D&Expires=1788858152",
+      "caption": "Whole Plant in Bloom",
+      "credit": "Harry Rose",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "15540"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dactylis_glomerata_K_sSasnomFd3X1.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=i%2B0mYQmyGgdiGOIRfE%2FLVrtTYsg%3D&Expires=1788858152",
+      "caption": "Form",
+      "credit": "Rasbak",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "17934"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dactylis_glomerata_f_GBwhBcdK9zpy.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=aRCKVKG4los%2Bfh%2F8%2FQmFfTR7B0U%3D&Expires=1788858152",
+      "caption": "Flowers",
+      "credit": "Kristine Peters",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "17935"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dactylis_glomerata_s_6bWSMSDJt0LG.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=kYrJjFGPWnw6bDeMfm5rE%2Bcq6Xg%3D&Expires=1788858152",
+      "caption": "Flat stems",
+      "credit": "Thayne Tuason",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/4.0/legalcode'>CC BY-NC 4.0</a>",
+      "image_id": "17933"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dactylis_glomerata-N_lIj0Vo2KQWIY.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=HBSn%2FwOCaIfC9LQXWkxgEcLqAKk%3D&Expires=1788858152",
+      "caption": "Herbarium Sheet",
+      "credit": "NATT-at-NKM",
+      "license": "<a href='https://creativecommons.org/about/cc0/'>CC0</a>",
+      "image_id": "15542"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dactylis_glomerata-U_B34FOr8uQh5v.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=A8WHQwvX%2B3lzLHeraV6n4yzUuh0%3D&Expires=1788858152",
+      "caption": "Seedheads",
+      "credit": "USDA NRCS Montana",
+      "license": "<a href='https://creativecommons.org/about/cc0/'>CC0</a>",
+      "image_id": "15541"
+    }
+  ],
+  "taxon": "Dactylis glomerata",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "e45d8ea8946759f7e983f28138a6c5614a5e0850808d9d2d42ad2166a004f8f1"
+  }
+}

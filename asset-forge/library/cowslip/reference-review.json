@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/primula-veris/",
+  "viewed_photos": [
+    "Full form - Alvals",
+    "Form - alen1988",
+    "Form - Rasbak"
+  ],
+  "findings": "Basal rosette, bare scapes and nodding one-sided yellow clusters match photographed habit. Correct 15-35 cm scale; individual bells merge and veins are omitted at 25 mm. Actually compared reference photographs, current seeds 1, 4, 7 and all 36 seeded variants. Accepted as coarse colony-scale spring geometry, not close-up botanical microdetail. Variant endorsement remains a user decision.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "d0a643bd2d4ce0039325a288b72425f5948d433711cb75c64db6421562dd45c2",
+  "sheet_hash": "1a07f56f3354ce3019441ba57c185760e95f676e8a5555a8d6a007ccd3a37714",
+  "reviewed_at": 1788850127.1221268,
+  "pilot_hashes": {
+    "1": "cdbe59b4c48cd19448987a24ec8756e38af41bf19b6430cb661aadf3a8407d6b",
+    "4": "b382df1494a8445b0e715b385372af8023d7ab166542a3b7c028e660235af5ca",
+    "7": "0c48a522c63659ed27b15a86dcc6ead23c9df9379fb0dadb175f6a663fe97eda"
+  },
+  "profile": "cowslip",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Primula_veris_Alvals_ImDY0pRCR2yO.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=%2BWk%2F8jd3SvFzeD7blGV2YIs2xso%3D&Expires=1788850880",
+      "caption": "Full form",
+      "credit": "Alvals",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "27955"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Primula_veris_Armeni_xR0M5efnpCyJ.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=CgNqFH1e0Stx4fIynZX7dCs13Fg%3D&Expires=1788850880",
+      "caption": "Form",
+      "credit": "alen1988",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "27956"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Primula_veris_Rasbak_Qkv3Z1a0AJoK.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=g6VjyhC8Q8iHQveFOQDyyoPLA4U%3D&Expires=1788850880",
+      "caption": "Form",
+      "credit": "Rasbak",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "31416"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Primula_veris_BerndH_yTz6dEHrMv9w.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=gGnY1FIqAaERjPLK95EViyymChA%3D&Expires=1788850880",
+      "caption": "Flower close-up",
+      "credit": "Primula veris",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "27957"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Primula_veris_Bjorn_4x7WKIwc5lW4.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=nCFZ1vn19K50VUHM%2F3XmjeJEMlw%3D&Expires=1788850880",
+      "caption": "Flowers",
+      "credit": "Bjo\u0308rn S",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "27958"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Primula_veris_Enrico_DBcp2haKSqxU.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=ByXxRAIY2mU3mOEnG4OodRlx4%2F0%3D&Expires=1788850880",
+      "caption": "Flower stem",
+      "credit": "Enrico Blasutto",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "27959"
+    }
+  ],
+  "taxon": "Primula veris",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "1a07f56f3354ce3019441ba57c185760e95f676e8a5555a8d6a007ccd3a37714"
+  }
+}

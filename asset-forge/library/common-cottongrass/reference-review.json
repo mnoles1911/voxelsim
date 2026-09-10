@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/eriophorum-angustifolium/",
+  "viewed_photos": [
+    "Eriophorum angustifolia - NPS: A. Kirby",
+    "Eriophorum angustifolia - Agnieszka Kwiecien\u0301, Nova",
+    "Eriophorum angustifolia - B.Lezius"
+  ],
+  "findings": "NPS A Kirby, Agnieszka Kwiecien and B Lezius actual photos: slender culms above narrow basal leaves, several drooping cotton fruit heads. Cotton is fruiting stage and is excluded from this vegetative spring instance. Current three-size pilots (seeds 1,4,7) and every panel of36-seed contact sheet visually reviewed. Narrow basal foliage plus slender culms replace broad leafless fan; 23\u201347 cm. No mature white cotton fruiting heads in chosen spring vegetative model. Fine blade widths remain voxel-limited. Accepted as stylized spring source; variant endorsement remains a user decision.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "39a98000e5c892965587746ab5790351f150f9ed4689dce09a00cc4be5ea3e6b",
+  "sheet_hash": "d655f96ab1ffb433e07eaa504cc91c3f866e1e5001dcce72ba6529167ed481b1",
+  "reviewed_at": 1788855354.3006635,
+  "pilot_hashes": {
+    "1": "b29f2182e014a3d50f70ed2d02b12eb6ab541618a62ea73d83c0073b1deecc6c",
+    "4": "f32489faf2aafdf29b0c10d0bf090d15c49d9394ec26e2159b7844efc1d02498",
+    "7": "bc02ab1d5655793100965c0b97a06ea291c4202bbbb23a0181e235cbb1d2e432"
+  },
+  "profile": "common-cottongrass",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Eriophorum_angustifo_kYqNarDWwBr7.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=lsN6JqIu8lO8A%2BK9rH1SGC7DjMA%3D&Expires=1788858152",
+      "caption": "Eriophorum angustifolia",
+      "credit": "NPS: A. Kirby",
+      "license": "<a href='https://creativecommons.org/publicdomain/zero/1.0/'>CC0 1.0</a>",
+      "image_id": "14401"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Eriophorum_angustifo_ljvdQl0RHe4k.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=QT8BvfgStqgpBN7eDMDxLNe4Edc%3D&Expires=1788858152",
+      "caption": "Eriophorum angustifolia",
+      "credit": "Agnieszka Kwiecien\u0301, Nova",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "14402"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Eriophorum_angustifo_SMS89jIsHWzb.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=LRgMj85m%2FeYnPpuMAziOPLb9TSw%3D&Expires=1788858152",
+      "caption": "Eriophorum angustifolia",
+      "credit": "B.Lezius",
+      "license": "<a href='https://creativecommons.org/licenses/by/3.0/'>CC BY 3.0</a>",
+      "image_id": "14403"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Eriophorum_angustifo_UjQBWs2a4qk6.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=CkYkNmTc4F9RRIviuWu5%2BVn4w3k%3D&Expires=1788858152",
+      "caption": "Eriophorum angustifolia",
+      "credit": "Bering Land Bridge National Preserve",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "14404"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Eriophorum_angustifo_AMvXi0QJyssi.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=OVTF6sBylTxn6p8YcSUd0nnc6UY%3D&Expires=1788858152",
+      "caption": "Eriophorum angustifolium",
+      "credit": "Bjo\u0308rn S...",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "14405"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Eriophorum_angustifo_tnDPyp3OPtSi.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=xXWWuW2XcTeyvYPe4vZf2HQb4bI%3D&Expires=1788858152",
+      "caption": "Eriophorum angustifolium",
+      "credit": "Dariusz Kowalcyk",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "14406"
+    }
+  ],
+  "taxon": "Eriophorum angustifolium",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "d655f96ab1ffb433e07eaa504cc91c3f866e1e5001dcce72ba6529167ed481b1"
+  }
+}

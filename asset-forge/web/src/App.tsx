@@ -4,7 +4,8 @@ import { api, retryServer, serverDown } from "./lib/api";
 import type { Biome, Kind, LibraryEntry, RulesDoc, SpeciesRow } from "./lib/schema";
 import { Button } from "./components/ui/button";
 import { useToast } from "./components/ui/toast";
-import { ForgeView, type ForgeRequest } from "./components/ForgeView";
+import type { ForgeRequest } from "./lib/schema";
+import { ForgeWorkbench } from './components/ForgeWorkbench';
 import { LibraryView } from "./components/LibraryView";
 import { RulesView } from "./components/RulesView";
 import { ImportDialog } from "./components/ImportDialog";
@@ -24,6 +25,7 @@ export interface World {
   kinds: Kind[];
   specs: SpeciesRow[];
   library: LibraryEntry[];
+  variants: LibraryEntry[];
   rules: RulesDoc;
   palette: Record<string, [number, number, number]>;
   refreshSpecs: () => Promise<void>;
@@ -73,7 +75,12 @@ function ServerDownBanner() {
 export default function App() {
   const toast = useToast();
   const [initialSpecies] = React.useState(() => new URLSearchParams(window.location.search).get("species"));
-  const [tab, setTab] = React.useState<Tab>(initialSpecies ? "library" : "forge");
+  const [tab, setTab] = React.useState<Tab>(() => {
+    const requested = new URLSearchParams(window.location.search).get("tab");
+    if (requested === "rules") return "rules";
+    if (requested === "library" || (initialSpecies && !requested)) return "library";
+    return "forge";
+  });
   const [importOpen, setImportOpen] = React.useState(false);
   const [world, setWorld] = React.useState<World | null>(null);
   const [bootError, setBootError] = React.useState<string | null>(null);
@@ -86,18 +93,18 @@ export default function App() {
 
   const load = React.useCallback(async () => {
     try {
-      const [biomes, kinds, specs, library, rules, palette] = await Promise.all([
-        api.biomes(), api.kinds(), api.specs(), api.library(), api.rules(), api.palette(),
+      const [biomes, kinds, specs, library, rules, palette, variants] = await Promise.all([
+        api.biomes(), api.kinds(), api.specs(), api.library(), api.rules(), api.palette(), api.variants(),
       ]);
       setWorld({
-        biomes, kinds, specs, library, rules, palette,
+        biomes, kinds, specs, library, rules, palette, variants,
         refreshSpecs: async () => {
           const s = await api.specs();
           setWorld((w) => (w ? { ...w, specs: s } : w));
         },
         refreshLibrary: async () => {
-          const l = await api.library();
-          setWorld((w) => (w ? { ...w, library: l } : w));
+          const [l,v] = await Promise.all([api.library(),api.variants()]);
+          setWorld((w) => (w ? { ...w, library: l,variants:v } : w));
         },
         refreshRules: async () => {
           const r = await api.rules();
@@ -115,6 +122,7 @@ export default function App() {
   React.useEffect(() => {
     void load();
   }, [load]);
+  React.useEffect(()=>{const url=new URL(window.location.href);url.searchParams.set('tab',tab);window.history.replaceState(null,'',url);},[tab]);
 
   const openPlacement = React.useCallback((name: string) => {
     setLibraryFocus((f) => ({ name, n: (f?.n ?? 0) + 1 }));
@@ -159,10 +167,11 @@ export default function App() {
           </TabButton>
         </nav>
         <div className="ml-auto flex items-center gap-3">
-          <a href="/static/pilot-review.html" className="text-sm text-gold-400 underline">Creature pilot review</a>
+          <a href="/static/tree-reference-review.html" className="text-sm text-gold-400 underline">Tree reference review</a>
+          <a href="/static/pilot-review.html" className="text-sm text-gold-400 underline">Creature pilots</a>
           {world && (
             <span className="font-mono text-xs text-parch-500">
-              {world.specs.length} species · {world.library.length} kept variants ·{" "}
+              {world.specs.length} sources · {world.library.length} endorsed variants ·{" "}
               {Object.keys(world.rules.rules).length} rules
             </span>
           )}
@@ -181,7 +190,7 @@ export default function App() {
           {/* Every view stays mounted: a generation keeps polling and the
            * library keeps its selection across tab switches. */}
           <div className={cn("min-h-0 flex-1 flex-col", tab === "forge" ? "flex" : "hidden")}>
-            <ForgeView world={world} request={forgeRequest} onOpenPlacement={openPlacement} />
+            <ForgeWorkbench world={world} request={forgeRequest} onOpenLibrary={openPlacement} />
           </div>
           <div className={cn("min-h-0 flex-1 flex-col", tab === "library" ? "flex" : "hidden")}>
             <LibraryView world={world} focus={libraryFocus} onVary={openInForge} />

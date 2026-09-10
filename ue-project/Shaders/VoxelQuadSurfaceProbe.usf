@@ -1,0 +1,22 @@
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelQuadAppearance.ush"
+StructuredBuffer<uint> PageWords;
+StructuredBuffer<uint> SourceWords;
+StructuredBuffer<uint2> SourceRanges;
+StructuredBuffer<uint4> SlotDescriptors;
+StructuredBuffer<uint4> Queries;
+RWStructuredBuffer<uint4> Results;
+uint QueryCount;
+[numthreads(64,1,1)]
+void QuadSurfaceProbeMain(uint3 Tid:SV_DispatchThreadID){
+    if(Tid.x>=QueryCount)return;
+    uint4 A=Queries[Tid.x*3u],B=Queries[Tid.x*3u+1u],C=Queries[Tid.x*3u+2u];
+    float3 RGB=0;float Coverage=1;bool Approved=false;uint Identity=0;
+    float4 Local=asfloat(A);float3 Dx=asfloat(B.xyz),Dy=asfloat(C.xyz);
+    if(all(isfinite(Local))&&all(isfinite(Dx))&&all(isfinite(Dy))&&Local.w>=0&&Local.w<=8388607.0&&C.w==0u){
+        Identity=uint(Local.w+0.5);
+        Approved=VoxelQuadSurfaceAppearance(PageWords,SourceWords,SourceRanges,SlotDescriptors,Local,B.w,Dx,Dy,RGB,Coverage);
+    }
+    Results[Tid.x*2u]=uint4(asuint(RGB),asuint(Coverage));
+    Results[Tid.x*2u+1u]=uint4(Approved?1u:0u,Identity,0u,0u);
+}

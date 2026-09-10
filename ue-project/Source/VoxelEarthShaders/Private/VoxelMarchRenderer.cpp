@@ -11,6 +11,8 @@
 #include "VoxelSurfaceLighting.h"
 
 #include <atomic>
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 
 #include "VoxelBrickPool.h"       // the P3-B1 traversal source
 #include "VoxelMarchChunkIndex.h"
@@ -11555,6 +11557,24 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				               MarchSize.X, MarchSize.Y, Size.X, Size.Y, Arm.StepBudget),
 				ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
 				Shader, Params, FIntVector(TileCount.X, TileCount.Y, 1));
+
+            // Opt-in evidence at the real, nonempty March dispatch site. This
+            // records the shader selected for the NeverCull pass just submitted;
+            // it is not a GPU completion fence or a compile/dump request.
+            static const bool bLogDispatchIdentity=FParse::Param(FCommandLine::Get(),TEXT("VoxelMarchDispatchIdentity"));
+            static bool bDispatchIdentityLogged=false; // render-thread only
+            if(bLogDispatchIdentity&&!bDispatchIdentityLogged&&TileCount.X>0&&TileCount.Y>0&&MarchSize.X>0&&MarchSize.Y>0){
+                bDispatchIdentityLogged=true;
+                const FVector Forward=Entry.ViewKey->ViewMatrices.GetInvViewMatrix().GetUnitAxis(EAxis::Z);
+                UE_LOG(LogVoxelMarch,Display,TEXT("VoxelMarchDispatchIdentity scheduled=1 type=FVoxelMarchCS permutation=%d outputHash=%s sourceHash=%s "
+                    "source=%d skip=%d rings=%d fallthrough=%d holeStats=%d blockSkip=%d skyLadder=%d halfRes=%d bound=%d zTight=%d rungProbe=%d temporalPrime=%d "
+                    "mode=%d stepBudget=%d rays=%dx%d view=%dx%d groups=%dx%d prepass=%d cameraUU=(%.3f,%.3f,%.3f) forward=(%.6f,%.6f,%.6f)"),
+                    Permutation.ToDimensionValueId(),*Shader->GetOutputHash().ToString(),*Shader->GetHash().ToString(),
+                    Arm.Source,Arm.Source==1?Arm.SkipLevels:0,int32(Arm.bRings),Arm.Fallthrough,Arm.HoleStatsLevel,int32(Arm.bBlockSkip),int32(Arm.bSkyLadder),int32(ResShift!=0),int32(BoundTex!=nullptr),int32(Arm.ZTight!=0),int32(Arm.RungProbe!=0),int32(bPrimeOn),
+                    Arm.Mode,Arm.StepBudget,MarchSize.X,MarchSize.Y,Size.X,Size.Y,TileCount.X,TileCount.Y,Params->MarchHasPrepassDepth,
+                    Entry.ViewOriginUU.X,Entry.ViewOriginUU.Y,Entry.ViewOriginUU.Z,Forward.X,Forward.Y,Forward.Z);
+            }
+
 
 			// ---- THE TEMPORAL PRIME'S EXTRACTION (the ping-pong's far end) -
 			//

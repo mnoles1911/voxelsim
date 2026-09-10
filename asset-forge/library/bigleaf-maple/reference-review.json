@@ -1,0 +1,93 @@
+{
+  "species": "bigleaf-maple",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Broad crown and robust branching distinguish this from sugar maple; larger shoot groups are retained at the voxel scale."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "16403",
+      "source": "https://plants.ces.ncsu.edu/plants/acer-macrophyllum/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "18611",
+      "source": "https://plants.ces.ncsu.edu/plants/acer-macrophyllum/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "acer-macrophyllum",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/acer-macrophyllum/"
+  ],
+  "habitat": "coastal",
+  "reviewed_generator": "temperate-shoots-v1",
+  "review_date": "2026-09-07",
+  "assessment": "Initial pilot rejected; v2 replacement requires a new comparison.",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "previous_findings": [
+    "Primary branches are too thin and evenly tiered; mature reference has substantial forks and a continuous irregular crown."
+  ],
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "bb2441c7ccc7932de6cbe12aa7cffed26c08de287ea9de9b1dfe3f1a709e5e49",
+    "4": "4cb78941ce0f49b314f3ebe17efc09073168549a5a505f87f21152787a948cc1",
+    "7": "2f66de0b0d372b491fc15f77b0f9136996f40722587af1a060d75efaa99b2a89"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "9dd26bab40e1ea91f3028e643771235dd24577201e5ff3216e79bb82e57fe848"
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/caltha-palustris/",
+  "viewed_photos": [
+    "BerndH whole plant near water",
+    "Michael Gabler whole plant",
+    "Alpsdake whole plant and flower"
+  ],
+  "findings": "Rounded kidney leaves on petioles, branching ascending flower stalks with yellow five-sepal flowers; not flat rosette and top hat. Dedicated caltha staged. Current seeds 1, 4 and 7 and every panel in the 36-seed contact sheet were visually inspected. Rounded petioled leaves and ascending branched yellow flower stalks give a low wetland colony. The 17\u201335 cm forms retain varied spread and height. Kidney notches and five individual sepals are only partly represented by the small number of cells. Accepted as a coarse stylized spring source at 25 mm; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "fb952c2611bdd52950a4a4311eb50c421b3f1efdcabd801d0a5a7609f29bd360",
+  "sheet_hash": "dc2100fcc455304a3e4da9198c10b1a376e0f05dea85f2a40bc281a3f1ecbd3e",
+  "reviewed_at": 1788854429.4148061,
+  "pilot_hashes": {
+    "1": "ccd15109ddffb83b51f670689acaf3acad9218693aa76e2d701122d688040e8e",
+    "4": "da4af13f2c5691856d7df8985ad30bb7d2ffd0900323a8b238ab3a63a46d149f",
+    "7": "7dd2dd158790d6df77b4dd4ebef9efaacd144f30d63cb307510eef7d1a2a9a75"
+  },
+  "profile": "marsh-marigold",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Caltha_palustris_water_bendh_ccbysa30.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=pSCY6cL3PBwj9LI08x%2FHwvTS%2Bco%3D&Expires=1788855580",
+      "caption": "Whole plant near the water.",
+      "credit": "BerndH",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "9279"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Caltha_palustris_flower_ccby30.JPG?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=FDmb3SFAa%2BmLiCwUzVul506WHqM%3D&Expires=1788855580",
+      "caption": "Whole plant",
+      "credit": "Michael G\u00e4bler",
+      "license": "<a href='https://creativecommons.org/licenses/by/3.0/'>CC BY 3.0</a>",
+      "image_id": "9281"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Caltha_palustris-whole_plant-Alpsdake_from_Wikimedia_Commons-PD.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=bhsgiQNLporzj0qM2%2FnpBMggujg%3D&Expires=1788855580",
+      "caption": "Whole plant",
+      "credit": "Alpsdake from Wikimedia Commons",
+      "license": "<a href='https://creativecommons.org/about/cc0/'>CC0</a>",
+      "image_id": "10795"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Caltha_palustris_flower_h_zell_ccbysa30.JPG?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=9S8%2Fs5WbA0wtVieFL0osQWuAyA4%3D&Expires=1788855580",
+      "caption": "Flower",
+      "credit": "H. Zell",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "9280"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Caltha_palustris-leaf-Alpsdake_from_Wikimedia_Commons-CC_BY-SA_3.0.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=cdoSITzo3xy%2BCLJi7hvmJNVCX2M%3D&Expires=1788855580",
+      "caption": "Leaf Blade",
+      "credit": "Alpsdake from Wikimedia Commons",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10794"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Caltha_palustris-emerging_buds-Alpsdake_from_Wikimedia_Commons-CC_BY-SA_3.0.jfif?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=psrXNn0hIZQZy0sk1nQb6H8mO40%3D&Expires=1788855580",
+      "caption": "Emerging Flowers",
+      "credit": "Alpsdake from Wikimedia Commons",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "10796"
+    }
+  ],
+  "taxon": "Caltha palustris",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "dc2100fcc455304a3e4da9198c10b1a376e0f05dea85f2a40bc281a3f1ecbd3e"
+  }
+}

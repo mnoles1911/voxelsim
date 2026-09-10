@@ -32,6 +32,9 @@ struct FPreparedPage
     TArray<uint64> CpuQuads;
     FVoxelGpuBrickPayloadRef GpuBricks;
     FVoxelGpuQuadPayloadRef GpuQuads;
+    // GPU meshing can return a CPU readback stream instead of GpuQuads.
+    // Keep it separate from the independently prepared CPU backend output.
+    TArray<uint64> GpuReadbackQuads;
     bool ValidatedAbsent=false;
 };
 using FAtomicPublish=TFunction<bool(const vxc::AssetOwnershipSnapshot& Before,
@@ -48,6 +51,10 @@ public:
                                      std::vector<vxc::AssetRenderPage> Pages);
     bool MarkObjectReady(vxc::AssetOwnershipTicket Ticket,uint64 Revision);
     bool MarkPageReady(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint8 Backend,uint64 Generation);
+    // Packed all-air pages retain their descriptors and are staged normally.
+    // Never convert missing payloads or zero quad/arena counts into deletion:
+    // uniform solid volumes also have zero arena words and may have no quads.
+    // Publication must replace the old page using this complete pack.
     bool StageGpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,FVoxelGpuMeshJobResult&& Result);
     bool StageCpuPage(vxc::AssetOwnershipTicket Ticket,const vxc::AssetRenderPage& Page,uint64 Generation,FVoxelBrickCpuPackRef Bricks,TArray<uint64>&& Quads);
     // Absence is explicit evidence, never an invented empty payload. The

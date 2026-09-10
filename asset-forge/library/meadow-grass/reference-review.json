@@ -1,0 +1,296 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/poa-pratensis/",
+  "viewed_photos": [
+    "Leaves and stems - Rasbak",
+    "Form October Auckland - Joseph Knight",
+    "Leaf/stem October New Zealand - Stevie-Ray Cairns"
+  ],
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "findings": "Compared photographed leaf tufts, rhizomes and blades with current three-size pilots and all 36 variants. The New Zealand October views are southern spring structure references; the extracted plant photograph exposes the basal tillers. Reduced blade count, narrowed rachis capsules and restored taller curved blades after the first batch looked like a solid short tuft. Current 0.20-0.42 m blades form open upright or spreading vegetative tufts without summer seed panicles. The 25 mm cells visibly exaggerate millimetre-wide Poa blades; this is an intentional coarse voxel representation and cannot capture boat-shaped tips. Accepted for spring ground-cover review, pending user seed endorsement.",
+  "generator_digest": "a17e423255a150510433f5b91b0b55b887667138cb173bf8a9cbe06f73c543a0",
+  "sheet_hash": "4e2150690b2784ab433248d9583d0ba6f1d5813d392eb38a2e7194953d56e482",
+  "reviewed_at": 1788841154.8443778,
+  "pilot_hashes": {
+    "1": "688341bd4970c97272f8d453a8a489ebfb3b527694b0b838ccdcc218bf28fb6d",
+    "4": "86799732d6795d8cf2b36e34a3aca2301c1d6c0d290cfc05084a99f7d2994baf",
+    "7": "78cd523e33774d4b2f17f10f6fb62999b1b9c8aec52cedaec88e4e44abfe06ee"
+  },
+  "profile": "meadow-grass",
+  "review_date": "2026-09-08",
+  "taxon": "Poa pratensis",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "4e2150690b2784ab433248d9583d0ba6f1d5813d392eb38a2e7194953d56e482"
+  },
+  "identity_revalidations": [
+    {
+      "previous_digest": "2b66002fdc074983b39f6db1781acc5a751f38ace329c39acbf6626842da88c6",
+      "new_digest": "a17e423255a150510433f5b91b0b55b887667138cb173bf8a9cbe06f73c543a0",
+      "timestamp": 1788841892.603581,
+      "method": "Every saved VXA rebuilt to identical SHA-256; original files and all user decisions preserved",
+      "variants": [
+        {
+          "id": "meadow-grass-0001",
+          "seed": 1,
+          "hash": "688341bd4970c97272f8d453a8a489ebfb3b527694b0b838ccdcc218bf28fb6d"
+        },
+        {
+          "id": "meadow-grass-0002",
+          "seed": 2,
+          "hash": "3830c082cdb4f37e8b43c2a0b82ceb1affae2e172c589e66c61ed3f1cfbdadbe"
+        },
+        {
+          "id": "meadow-grass-0003",
+          "seed": 3,
+          "hash": "a5db722245e06e4acda3e4ce5de092412c11df577dd998df3a3c38f9f45e5654"
+        },
+        {
+          "id": "meadow-grass-0004",
+          "seed": 4,
+          "hash": "86799732d6795d8cf2b36e34a3aca2301c1d6c0d290cfc05084a99f7d2994baf"
+        },
+        {
+          "id": "meadow-grass-0005",
+          "seed": 5,
+          "hash": "cff0e1272beedd5d3c2aebf4b05315dbad0ee5216a7d75f682b049153bc8c1e4"
+        },
+        {
+          "id": "meadow-grass-0006",
+          "seed": 6,
+          "hash": "152dd479e92e5e4e3a633bc9a4582f5592c1f38f4d8231266d512d2e6f1c8360"
+        },
+        {
+          "id": "meadow-grass-0007",
+          "seed": 7,
+          "hash": "78cd523e33774d4b2f17f10f6fb62999b1b9c8aec52cedaec88e4e44abfe06ee"
+        },
+        {
+          "id": "meadow-grass-0008",
+          "seed": 8,
+          "hash": "0a65ae79ff6297ed6e97b0d07ba27670c93973803f46974e4f3405d7260a6f09"
+        },
+        {
+          "id": "meadow-grass-0009",
+          "seed": 9,
+          "hash": "7a296778d22e15d93af1d07aac48c9f22304e2b563939310df2f07647a85702b"
+        },
+        {
+          "id": "meadow-grass-0010",
+          "seed": 10,
+          "hash": "b805dc135f7dd2dc8611d7b63691aa0cddb7ef40e6f5867d186e1bb6457b273c"
+        },
+        {
+          "id": "meadow-grass-0011",
+          "seed": 11,
+          "hash": "a00b2ee9940329717864fe2beef20fa42eda218afc51a1b35374cbb82ac511a0"
+        },
+        {
+          "id": "meadow-grass-0012",
+          "seed": 12,
+          "hash": "4ddf86a5b5b2f497e1e43cc4d3a3d90751cc96949bc62d7c2b2d8dea9b098331"
+        },
+        {
+          "id": "meadow-grass-0013",
+          "seed": 13,
+          "hash": "e9e94e1fc2e1d70ed16e4bf528ab60913e09b3f57e149195389edceb8481e2aa"
+        },
+        {
+          "id": "meadow-grass-0014",
+          "seed": 14,
+          "hash": "a6bb1181c4b0d8be366e53839a4f088a29f8f034b0647bd68285554b68d90de4"
+        },
+        {
+          "id": "meadow-grass-0015",
+          "seed": 15,
+          "hash": "75b3f29efbed26b0791b9e110ea0b7a1a2aceaf437a2c0a3fcf42a2d71398c43"
+        },
+        {
+          "id": "meadow-grass-0016",
+          "seed": 16,
+          "hash": "4c44c935aa2dd5d25549a300ffc6bd1ba2752fc744654420608d4426febc3f55"
+        },
+        {
+          "id": "meadow-grass-0017",
+          "seed": 17,
+          "hash": "74c883f8b8fdb5c537abb90361bb62e93d412f7ea05c444c5f0255bd47c1112a"
+        },
+        {
+          "id": "meadow-grass-0018",
+          "seed": 18,
+          "hash": "34127d2be959790b663b60a92bf775f7e21fd4fcc518549c635addb2b4b0fe52"
+        },
+        {
+          "id": "meadow-grass-0019",
+          "seed": 19,
+          "hash": "17456d392bcfa6fcb17f49808afee5e497acc1ee57fa5b2d38ec6622d63c25cf"
+        },
+        {
+          "id": "meadow-grass-0020",
+          "seed": 20,
+          "hash": "84879f5d838d36b9e5076ffb0fd9ec993f591c5e5131458d605f055ee53ede32"
+        },
+        {
+          "id": "meadow-grass-0021",
+          "seed": 21,
+          "hash": "7c576d05706c6807b04907ba18f45e179e70751791054cfcf4e2708df35b084f"
+        },
+        {
+          "id": "meadow-grass-0022",
+          "seed": 22,
+          "hash": "c412c06375bb889bbf180b81390fcc8e5e94227ccd751e707eceb84d2ccd577d"
+        },
+        {
+          "id": "meadow-grass-0023",
+          "seed": 23,
+          "hash": "1fff83990a695d237af604140f601d1981d986a953dbe1003c11b554bcbad5c5"
+        },
+        {
+          "id": "meadow-grass-0024",
+          "seed": 24,
+          "hash": "407eca1df2c9a01a90b607b3dcdda1b2737b2b0bf616313211d306b5d3c1ed5e"
+        },
+        {
+          "id": "meadow-grass-0025",
+          "seed": 25,
+          "hash": "05d9cb2e4eb1c7babf9f41c6287414a5c43b55c594fdd826216cd98225543ae8"
+        },
+        {
+          "id": "meadow-grass-0026",
+          "seed": 26,
+          "hash": "34c239f309584d4925507913482de703f5249052563576376fba6a5c7c28df83"
+        },
+        {
+          "id": "meadow-grass-0027",
+          "seed": 27,
+          "hash": "2aa65757ae4237b370f11aaad789c7e454ce199d7c108dcfaf82988b830533a4"
+        },
+        {
+          "id": "meadow-grass-0028",
+          "seed": 28,
+          "hash": "85c1743e0b19bc7a1f6f64e0687c4271863dd20a4e714bce5b18786c9e1b5c18"
+        },
+        {
+          "id": "meadow-grass-0029",
+          "seed": 29,
+          "hash": "a73a4ad90a9c8dc3813641f70b2318d62b2ee71407b532667c5505dec53d2f3f"
+        },
+        {
+          "id": "meadow-grass-0030",
+          "seed": 30,
+          "hash": "d2cd276bcf3455608ff19a9b31743f4e6f368bee4626d7a03e7ba60922c5f3f6"
+        },
+        {
+          "id": "meadow-grass-0031",
+          "seed": 31,
+          "hash": "63fd394b0e68a45c7dd9d0d95bdf5077bffb6c3863a8888ada08804b4848b154"
+        },
+        {
+          "id": "meadow-grass-0032",
+          "seed": 32,
+          "hash": "b7f0e3ff5d2bc0cbeaa9107dfeb31758263e70033dc4ddf415f7d9e7232a51c7"
+        },
+        {
+          "id": "meadow-grass-0033",
+          "seed": 33,
+          "hash": "b19626f8f9bbac17edd3dde0566f7bea2fabf7d62b20c5b3f2be77e13dbe54ea"
+        },
+        {
+          "id": "meadow-grass-0034",
+          "seed": 34,
+          "hash": "6c01b22ca68edc0ece3e87d1bd12eb47cf857f61cb3e977d6a2d8bfe133522fa"
+        },
+        {
+          "id": "meadow-grass-0035",
+          "seed": 35,
+          "hash": "679156612016c90352b0fe94e858b38d3ddd0e516ce1ca10d4d0ee8578c606f3"
+        },
+        {
+          "id": "meadow-grass-0036",
+          "seed": 36,
+          "hash": "689d7eddfc4fde678ec4bb765d8aa059b84b1e34fc97cff2d2cc2d02de119224"
+        }
+      ]
+    }
+  ]
+}

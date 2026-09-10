@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/cytisus-scoparius/",
+  "viewed_photos": [
+    "Bartosz Cuber trifoliate foliage",
+    "Jim Robbins flower form",
+    "Mike Kirby habit"
+  ],
+  "findings": "Dedicated branching green broom shoots with tiny basal trifoliate foliage and yellow pea-flower marks distributed along twigs replace the incorrect pink terminal rings. 1.0-2.4 m forms range upright to spreading. Pea petal structure is simplified at 25 mm. Actually reviewed botanical photos, current seeds 1,4,7 and all 36 variants. Accepted spring source; user endorsement remains separate.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "ad5d9286018927a2cd3f339ed114a7828b30e72943eeb5470c53681755d40487",
+  "sheet_hash": "9d9657a4f85711b93a8cc571aaa92880690da0a8cf82831cfdcdda80c1b6d5aa",
+  "reviewed_at": 1788852523.6311982,
+  "pilot_hashes": {
+    "1": "b294fee87d247b2505a49c4709fc861c2c295a449b0aa082553134e614660305",
+    "4": "2c33171b90c0d34090c4e29a7613b46b872ab52f0434216f909f98313b45574d",
+    "7": "c2f2319484dc414c7e0d1c0f44eb12be432cee18b8b9c60af1b41fdb201a4a93"
+  },
+  "profile": "common-broom",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cytisus_scoparius_fo_UmQhO7UGM3Cr.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=Yr25Cmo8a%2FnL7laAKCdUzOKscWQ%3D&Expires=1788854838",
+      "caption": "Foliage",
+      "credit": "Bartosz Cuber",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "34310"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cytisus_scoparius_fl_4Z7K5IytF2Gl.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=PqjHdNn8XoGuvaPBbMFIbwzlYFc%3D&Expires=1788854838",
+      "caption": "Flower Form",
+      "credit": "Jim Robbins",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "19013"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cytisus_scoparius_ha_ijJn0liHpn9q.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=7RO9hpJhS%2FOWcOExEzIJ0YBSfmA%3D&Expires=1788854838",
+      "caption": "Habit",
+      "credit": "Mike Kirby",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/2.0/'>CC-BY-SA 2.0</a>",
+      "image_id": "34311"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cytisus_scoparius_fl_VRcOudWFxRkZ.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=livzeYQxQBiQ8tLvk4R6LfShxHw%3D&Expires=1788854838",
+      "caption": "Flower",
+      "credit": "Bartosz Cuber",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "34307"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cytisus-scoparius--Phil-Sellens--cc-by-2-0.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=lWIMVqOjhoVaF6h0DvupQ%2FtFa%2F8%3D&Expires=1788854838",
+      "caption": "C. scoparius flowers",
+      "credit": "Photo by Phil Sellens",
+      "license": "<a href='http://creativecommons.org/licenses/by/2.0/legalcode'>CC BY 2.0</a>",
+      "image_id": "5042"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Cytisus_scoparius_fl_YaAfEAcJipyg.jpeg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=d0zJy9gg5KQehuHz7%2B1zf5KSpXM%3D&Expires=1788854838",
+      "caption": "Flower",
+      "credit": "Bartosz Cuber",
+      "license": "<a href='https://creativecommons.org/licenses/by-sa/3.0/deed.en'>CC BY-SA 3.0</a>",
+      "image_id": "34308"
+    }
+  ],
+  "taxon": "Cytisus scoparius",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "9d9657a4f85711b93a8cc571aaa92880690da0a8cf82831cfdcdda80c1b6d5aa"
+  }
+}

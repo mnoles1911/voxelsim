@@ -1,0 +1,151 @@
+{
+  "status": "passed pilot review",
+  "source": "https://plants.ces.ncsu.edu/plants/dryopteris-filix-mas/",
+  "viewed_photos": [
+    "Dryopteris filix-mas - Kari Phylaviita",
+    "Dryopteris filix-mas - Hermann-Falkner-sokol",
+    "Dryopteris filix-mas showing sori - Camelia TWU"
+  ],
+  "findings": "This legacy generic woodland-fern profile uses male fern as its documented architectural analogue, not a separate botanical species. Inspected upright crown and outward frond habit, then pinna structure in the underside detail; sori serve as structural reference only. Compared current small/medium/large pilots 1/4/7 and complete 36 sheet. Explicit curved rachises, tapering pinnae and aligned secondary pinnules give separate fronds and varied rosette openness. Heights approximately 0.33-0.68 m; 25 mm merges the fine pinnules in smaller fronds, an acknowledged stylization. Accepted the spring green archetype with no separate reproductive structures.",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "batch_seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "generator_digest": "3c902beef6124134924be88c5b7b3a099ef8816e9f18982f98596e1ff5c942bf",
+  "sheet_hash": "f6cbbf167476e19cb955b2c4df89a8e12e4b47b37cb978417efee8f174c7ba1e",
+  "reviewed_at": 1788845154.4301252,
+  "pilot_hashes": {
+    "1": "064260331ead16fc4ec54f02074cda8bacb870a598e7147ae86e462cdf612b21",
+    "4": "22696227a943614a39950ec28f71b941791f07223c553c5f958fe25882cb4296",
+    "7": "a1e42bb024736fa71f1e7a427ddddce4cfc0c36cb934235bff58222f58903885"
+  },
+  "profile": "understory-fern",
+  "review_date": "2026-09-08",
+  "additional_sources": [],
+  "reference_catalog_photos": [
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dryopteris-filix-mas-kivikkoalvejuuri--Kari-Phylaviita--CC-BY-NC.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=S8BszzC1euT38pDPfzg0nwQK144%3D&Expires=1788848684",
+      "caption": "Dryopteris filix-mas",
+      "credit": "Kari Phylaviita",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/2.0/'>CC BY-NC 2.0</a>",
+      "image_id": "198"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dryopteris-filix-mas--Hermann-Falkner-sokol--CC-BY-NC.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=ahcDRJRQS7TQOsgTH%2FY96RHTQCM%3D&Expires=1788848684",
+      "caption": "Dryopteris filix-mas",
+      "credit": "Hermann-Falkner-sokol",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc/2.0/'>CC BY-NC 2.0</a>",
+      "image_id": "6995"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dryopteris-filix-mas--Camelia-TWU--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=wgT9mehbjm%2FKZvglk3hRARL2rd8%3D&Expires=1788848684",
+      "caption": "Dryopteris filix-mas showing sori",
+      "credit": "Camelia TWU",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/4.0/legalcode'>CC BY-NC-ND 4.0</a>",
+      "image_id": "6996"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dryopteris-filix-mas--Nicholas-Turland--CC-BY-NC-ND.jpg?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=bLad96xe7Z%2FzkyRl6O6HtNSN1dI%3D&Expires=1788848684",
+      "caption": "Dryopteris filix-mas",
+      "credit": "Nicholas Turland",
+      "license": "<a href='http://creativecommons.org/licenses/by-nc-nd/2.0/legalcode'>CC BY-NC-ND 2.0</a>",
+      "image_id": "6997"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dryopteris_filix-mas_Je1jNm6eVI7T.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=0uVC0kIkdjqU%2BhGUWk2TUli4ppM%3D&Expires=1788848684",
+      "caption": "Dryopteris filix-mas showing sori",
+      "credit": "MurielBendel",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "28344"
+    },
+    {
+      "url": "https://eit-planttoolbox-prod.s3.amazonaws.com/media/images/Dryopteris_filix-mas_p3VqeSCaP9Jr.jpe?AWSAccessKeyId=AKIAILRBSC3CQKL5NNSQ&Signature=2vlz4H%2BP%2F2ehkk9edvnoCpglkTM%3D&Expires=1788848684",
+      "caption": "Dryopteris filix-mas",
+      "credit": "CatalpaSpirit",
+      "license": "<a href='http://creativecommons.org/licenses/by-sa/4.0/legalcode'>CC BY-SA 4.0</a>",
+      "image_id": "28345"
+    }
+  ],
+  "taxon": "Dryopteris filix-mas",
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "f6cbbf167476e19cb955b2c4df89a8e12e4b47b37cb978417efee8f174c7ba1e"
+  }
+}

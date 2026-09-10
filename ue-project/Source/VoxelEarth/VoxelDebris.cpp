@@ -13,6 +13,11 @@
 #include "VoxelEofDirtyLedger.h" // EndOfFrameUpdates attribution
 #include "VoxelWorldSubsystem.h"
 #include "VoxelFineTileStreamer.h"
+#include "VoxelAssetAppearance.h"
+#include "VoxelVegetationRender.h"
+#include "ProceduralMeshComponent.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "voxelcore/materialpalette.h"
 
 AVoxelDebris::AVoxelDebris()
 {
@@ -46,8 +51,35 @@ AVoxelDebris::AVoxelDebris()
 	VoxelISM->SetCanEverAffectNavigation(false);
 }
 
-int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels, int32 MaxInstances)
+namespace {
+constexpr int32 DebrisAppearanceMarker=-1447313969;
+constexpr int32 MaxAppearanceCells=512*1024; // coordinate+appearance payload below 64MiB
+bool ValidDebrisAppearance(const TArray<VoxelCoords::FVoxelCoord>& Voxels,const TArray<FVoxelDebrisCellAppearance>& Cells){
+    if(Voxels.IsEmpty()||Voxels.Num()>MaxAppearanceCells||Cells.Num()!=Voxels.Num())return false;
+    TSet<VoxelCoords::FVoxelCoord> Seen;Seen.Reserve(Voxels.Num());
+    for(int I=0;I<Cells.Num();++I){const auto& C=Cells[I];
+        if(!(C.Coord==Voxels[I])||Seen.Contains(C.Coord)||C.Material==0||C.Material>=vxc::kMaterialCount||C.SourceYawQuarter>3)return false;
+        for(int64 V:{C.Coord.X,C.Coord.Y,C.Coord.Z})if(V==MIN_int64||V==MAX_int64)return false;
+        if(C.Approved&&(C.SourceCell.GetMin()<0||C.SourceCell.GetMax()>65535))return false;
+        if(!C.Approved&&(C.Needle||C.FoliageMask))return false;
+        Seen.Add(C.Coord);
+    }
+    return true;
+}
+}
+int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Voxels,int32 MaxInstances){
+    PersistentAppearance.Reset();return InitIsland(Voxels,MaxInstances);
+}
+int32 AVoxelDebris::InitFromIslandWithAppearance(const TArray<VoxelCoords::FVoxelCoord>& Voxels,const TArray<FVoxelDebrisCellAppearance>& Cells,int32 MaxInstances){
+    if(!ValidDebrisAppearance(Voxels,Cells))return 0;
+    if(!LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/Voxel/M_VoxelDetailAsset.M_VoxelDetailAsset"))){UE_LOG(LogVoxelEarth,Error,TEXT("Debris appearance admission refused: detail material missing"));return 0;}
+    PersistentAppearance=Cells;return InitIsland(Voxels,MaxInstances);
+}
+int32 AVoxelDebris::InitIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels, int32 MaxInstances)
 {
+	for(auto C:AppearanceMeshes)if(C)C->DestroyComponent();AppearanceMeshes.Reset();
+    VoxelISM->ClearInstances();
+    PersistentInstanceBudget=FMath::Clamp(MaxInstances,1,MaxInstancesPerBody);
 	VoxelCount = IslandVoxels.Num();
 	PersistentVoxels = IslandVoxels;
 	CachedObjectGeometry.Reset();
@@ -117,15 +149,16 @@ int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Islan
 	// make a single voxel.
 	const double InstanceScale = VoxelCoords::VoxelSizeUU / 100.0;
 	const int32 Estimate = FMath::DivideAndRoundUp(Shell.Num(), Stride);
-	VoxelISM->PreAllocateInstancesMemory(Estimate);
+	if(PersistentAppearance.IsEmpty())VoxelISM->PreAllocateInstancesMemory(Estimate);
 	int32 Instances = 0;
 	for (int32 I = 0; I < Shell.Num(); I += Stride)
 	{
 		const FVector Rel = VoxelCoords::VoxelToWorldCenter(Shell[I]) - CentreWorld;
 		const FTransform Xf(FRotator::ZeroRotator, Rel, FVector(InstanceScale));
-		VoxelISM->AddInstance(Xf); // relative to the ISM (= actor origin)
+		if(PersistentAppearance.IsEmpty())VoxelISM->AddInstance(Xf); // relative to the ISM (= actor origin)
 		++Instances;
 	}
+	if(!PersistentAppearance.IsEmpty())BuildAppearanceShell(Shell,Stride,CentreWorld);
 	// ONE count for the whole fill, not one per instance: this is one debris
 	// body's ISM, dirtied once as far as EndOfFrameUpdates is concerned.
 	VoxelEofLedger::Count(VoxelEofLedger::ESource::Debris);
@@ -151,6 +184,81 @@ int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Islan
 	return Instances;
 }
 
+bool AVoxelDebris::GeometryState(FArchive& Ar)
+{
+    using namespace VoxelDetachedPersistence;
+    bool Extended=!PersistentAppearance.IsEmpty();
+    if(Ar.IsLoading()){
+        const int64 Start=Ar.Tell();int32 Marker=0;Ar<<Marker;
+        if(Ar.IsError())return false;
+        Extended=Marker==DebrisAppearanceMarker;
+        if(!Extended){Ar.Seek(Start);PersistentAppearance.Reset();PersistentInstanceBudget=MaxInstancesPerBody;}
+    }else if(Extended){int32 Marker=DebrisAppearanceMarker;Ar<<Marker;}
+    if(Extended){uint32 Version=1;Ar<<Version<<PersistentInstanceBudget;
+        if(Ar.IsError()||Version!=1||PersistentInstanceBudget<1||PersistentInstanceBudget>MaxInstancesPerBody)return false;}
+    if(!Array(Ar,PersistentVoxels,1024*1024,[](FArchive& A,VoxelCoords::FVoxelCoord& V){A<<V.X<<V.Y<<V.Z;}))return false;
+    if(Extended){
+        if(!Array(Ar,PersistentAppearance,MaxAppearanceCells,[](FArchive& A,FVoxelDebrisCellAppearance& C){
+            A<<C.Coord.X<<C.Coord.Y<<C.Coord.Z<<C.Material<<C.BaseRGB<<C.SourceCell<<C.SourceYawQuarter;
+            uint8 Flags=(C.Approved?1:0)|(C.Needle?2:0)|(C.FoliageMask?4:0);A<<Flags;
+            if(Flags&~7){A.SetError();return;}C.Approved=Flags&1;C.Needle=Flags&2;C.FoliageMask=Flags&4;
+        })||!ValidDebrisAppearance(PersistentVoxels,PersistentAppearance))return false;
+    }
+    return !Ar.IsError();
+}
+
+void AVoxelDebris::BuildAppearanceShell(const TArray<VoxelCoords::FVoxelCoord>& Shell,int32 Stride,const FVector& Centre)
+{
+    struct FSection {TArray<FVector> P,N;TArray<int32> I;TArray<FVector2D> UV,Wind;TArray<FLinearColor> C;TArray<FProcMeshTangent> T;};
+    FSection Sections[5];
+    TMap<VoxelCoords::FVoxelCoord,int32> Lookup;Lookup.Reserve(PersistentAppearance.Num());
+    for(int I=0;I<PersistentAppearance.Num();++I)Lookup.Add(PersistentAppearance[I].Coord,I);
+    TSet<VoxelCoords::FVoxelCoord> Rendered;
+    for(int I=0;I<Shell.Num();I+=Stride)Rendered.Add(Shell[I]);
+    for(int I=0;I<Shell.Num();I+=Stride){
+        const auto& Cell=PersistentAppearance[Lookup.FindChecked(Shell[I])];
+        auto& S=Sections[Cell.Approved?((Cell.Needle?1:0)|(Cell.FoliageMask?2:0)):4];
+        const FVector Base=VoxelCoords::VoxelToWorldCenter(Cell.Coord)-Centre-FVector(5.);
+        for(int Axis=0;Axis<3;++Axis)for(int Sign=0;Sign<2;++Sign){
+            auto Neighbor=Cell.Coord;const int Delta=Sign?1:-1;
+            if(Axis==0)Neighbor.X+=Delta;else if(Axis==1)Neighbor.Y+=Delta;else Neighbor.Z+=Delta;
+            if(Rendered.Contains(Neighbor)){
+                const auto& Other=PersistentAppearance[Lookup.FindChecked(Neighbor)];
+                if(!(VoxelVegetationRender::IsWood(Cell.Material)&&VoxelVegetationRender::IsLeaf(Other.Material)))continue;
+            }
+            int SourceAxis=Axis;bool Positive=Sign!=0;
+            if(SourceAxis<2){if(Cell.SourceYawQuarter==2||(Cell.SourceYawQuarter==1&&Axis==0)||(Cell.SourceYawQuarter==3&&Axis==1))Positive=!Positive;if(Cell.SourceYawQuarter&1)SourceAxis=1-SourceAxis;}
+            FLinearColor Color;
+            if(Cell.Approved)Color=FVoxelAssetAppearance::FaceColor(Cell.BaseRGB,Cell.SourceCell,SourceAxis,Positive);
+            else{const auto R=vxc::kMaterialPalette[Cell.Material].face[Axis==2?(Sign?vxc::kFaceTop:vxc::kFaceBottom):vxc::kFaceSide];Color=FLinearColor::FromSRGBColor(FColor(R.r,R.g,R.b));}
+            Color.A=VoxelVegetationRender::MaterialClass(Cell.Material);
+            FVector Normal=FVector::ZeroVector;Normal[Axis]=Sign?1.:-1.;const int U=(Axis+1)%3,V=(Axis+2)%3;
+            FVector Tangent=FVector::ZeroVector;Tangent[U]=1.;const int First=S.P.Num();
+            constexpr int CU[4]={0,0,1,1},CV[4]={0,1,1,0};
+            for(int Corner=0;Corner<4;++Corner){
+                FVector Fraction=FVector::ZeroVector;Fraction[Axis]=Sign;Fraction[U]=CU[Corner];Fraction[V]=CV[Corner];
+                S.P.Add(Base+Fraction*10.);S.N.Add(Normal);S.C.Add(Color);S.T.Add(FProcMeshTangent(Tangent,false));S.Wind.Add(FVector2D::ZeroVector);
+                FVector SourceFraction=Fraction;
+                if(Cell.SourceYawQuarter==1)SourceFraction=FVector(Fraction.Y,1.-Fraction.X,Fraction.Z);
+                else if(Cell.SourceYawQuarter==2)SourceFraction=FVector(1.-Fraction.X,1.-Fraction.Y,Fraction.Z);
+                else if(Cell.SourceYawQuarter==3)SourceFraction=FVector(1.-Fraction.Y,Fraction.X,Fraction.Z);
+                const FVector Source=(FVector(Cell.SourceCell)+SourceFraction)*.1;
+                S.UV.Add(Cell.Approved?(SourceAxis==2?FVector2D(Source.X,Source.Y):SourceAxis==0?FVector2D(Source.Y,Source.Z):FVector2D(Source.X,Source.Z)):FVector2D(CU[Corner]*.1,CV[Corner]*.1));
+            }
+            if(Sign)S.I.Append({First,First+1,First+2,First,First+2,First+3});else S.I.Append({First,First+2,First+1,First,First+3,First+2});
+        }
+    }
+    auto Material=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/Voxel/M_VoxelDetailAsset.M_VoxelDetailAsset"));
+    for(int Flag=0;Flag<5;++Flag){auto& S=Sections[Flag];if(S.P.IsEmpty())continue;
+        auto Mesh=NewObject<UProceduralMeshComponent>(this);AddInstanceComponent(Mesh);Mesh->SetupAttachment(PhysicsBody);
+        Mesh->SetMobility(EComponentMobility::Movable);Mesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);Mesh->SetCanEverAffectNavigation(false);Mesh->RegisterComponent();
+        Mesh->CreateMeshSection_LinearColor(0,S.P,S.I,S.N,S.UV,S.Wind,TArray<FVector2D>(),TArray<FVector2D>(),S.C,S.T,false,true);
+        if(Material){auto MID=UMaterialInstanceDynamic::Create(Material,Mesh);MID->SetScalarParameterValue(TEXT("TreeAppearance"),Flag<4?1.f:0.f);MID->SetScalarParameterValue(TEXT("TreeNeedle"),Flag<4&&(Flag&1)?1.f:0.f);MID->SetScalarParameterValue(TEXT("FoliageCutout"),Flag<4&&(Flag&2)?1.f:0.f);Mesh->SetMaterial(0,MID);}
+        else UE_LOG(LogVoxelEarth,Error,TEXT("Debris approved appearance material missing"));
+        AppearanceMeshes.Add(Mesh);
+    }
+}
+
 void AVoxelDebris::EndPlay(const EEndPlayReason::Type Reason)
 {
     VoxelDetachedPersistence::OnEndPlay(this,Reason);
@@ -161,7 +269,7 @@ bool AVoxelDebris::CaptureObjectState(TSharedPtr<const TArray<uint8>,ESPMode::Th
     check(IsInGameThread());
     if(!CachedObjectGeometry){
         auto Data=MakeShared<TArray<uint8>,ESPMode::ThreadSafe>();FMemoryWriter Ar(*Data);
-        if(!VoxelDetachedPersistence::Array(Ar,PersistentVoxels,1024*1024,[](FArchive& A,VoxelCoords::FVoxelCoord& V){A<<V.X<<V.Y<<V.Z;}))return false;
+        if(!GeometryState(Ar))return false;
         CachedObjectGeometry=Data;
     }
     Geometry=CachedObjectGeometry;Dynamic.Reset();FMemoryWriter Ar(Dynamic);
@@ -185,7 +293,7 @@ bool AVoxelDebris::RestoreObjectState(const TArray<uint8>& Geometry,const TArray
 bool AVoxelDebris::PersistentState(FArchive& Ar)
 {
     using namespace VoxelDetachedPersistence;
-    if(!Array(Ar,PersistentVoxels,1024*1024,[](FArchive& A,VoxelCoords::FVoxelCoord& V){A<<V.X<<V.Y<<V.Z;}))return false;
+    if(!GeometryState(Ar))return false;
     FTransform Transform=GetActorTransform();
     FVector Linear=PhysicsBody->GetPhysicsLinearVelocity(),Angular=PhysicsBody->GetPhysicsAngularVelocityInRadians();
     bool Settled=bSettled;float Elapsed=AgeSeconds;
@@ -195,7 +303,8 @@ bool AVoxelDebris::PersistentState(FArchive& Ar)
     if(Ar.IsLoading())
     {
         if(PersistentVoxels.IsEmpty())return false;
-        auto Voxels=PersistentVoxels;InitFromIsland(Voxels);
+        auto Voxels=PersistentVoxels;auto Cells=PersistentAppearance;const int32 Budget=PersistentInstanceBudget;
+        if(Cells.IsEmpty())InitFromIsland(Voxels,Budget);else if(!InitFromIslandWithAppearance(Voxels,Cells,Budget))return false;
         SetActorTransform(Transform);AgeSeconds=Elapsed;bSettled=Settled;
         if(Settled){PhysicsBody->SetSimulatePhysics(false);SetActorTickEnabled(false);}
         else{PhysicsBody->SetPhysicsLinearVelocity(Linear);PhysicsBody->SetPhysicsAngularVelocityInRadians(Angular);}

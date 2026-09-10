@@ -1,0 +1,88 @@
+{
+  "species": "tundra-pine",
+  "status": "passed pilot review",
+  "reviewed_seeds": [
+    1,
+    4,
+    7
+  ],
+  "findings": [
+    "Cold-edge authored pine profile uses a lower irregular crown than Scots pine; the hillside reference informs exposed branching. This is a transition archetype rather than an additional botanical species."
+  ],
+  "reviewed_images": [
+    {
+      "image_id": "19280",
+      "source": "https://plants.ces.ncsu.edu/plants/pinus-sylvestris/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    },
+    {
+      "image_id": "4608",
+      "source": "https://plants.ces.ncsu.edu/plants/pinus-sylvestris/",
+      "purpose": "Crown and branching; other-season photos are structure-only"
+    }
+  ],
+  "taxon": "pinus-sylvestris",
+  "sources": [
+    "https://plants.ces.ncsu.edu/plants/pinus-sylvestris/"
+  ],
+  "habitat": "cool-transition",
+  "art_baseline": {
+    "season": "spring",
+    "foliage": "Species-appropriate spring foliage and fresh growth; flowering only where appropriate to the species.",
+    "reference_policy": "Use spring photographs for finished color and foliage. Other seasons may inform branch structure only.",
+    "out_of_scope": [
+      "seasonal transitions",
+      "seasonal recoloring"
+    ]
+  },
+  "generator_digest": "6d0b2c04db2c83b942e5b228219a87f514e03cf06752831f8ac02256fa4cfa85",
+  "review_date": "2026-09-07",
+  "review_scope": "Stylized spring vertical slice; source acceptance is separate from world variant endorsement.",
+  "pilot_artifacts": {
+    "1": "59952ff1a87028741f7c635394c93e8d6231f2a0a192440d9af9cf54e2e978e8",
+    "4": "7f00d10e8b860e3f4c0ba8d2f4d509ab2c706a1c3ae43077b032f8c1da79510e",
+    "7": "52c339ef1e278ae24bc342146bf765d383d371ebabd0f28b07d0973826a641ec"
+  },
+  "batch_review": {
+    "status": "accepted",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "sheet_hash": "ea68ff2d3f8a51c26fb6013bd8ce970a9c93b26ada0eeaa790b146905f93d1ee"
+  }
+}

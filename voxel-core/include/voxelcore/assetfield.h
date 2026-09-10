@@ -60,11 +60,13 @@
 
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
 
 #include "voxelcore/amplifier.h"
 #include "voxelcore/assetgrid.h"
 #include "voxelcore/assetplacement.h"
 #include "voxelcore/assetpolicy.h"
+#include "voxelcore/assetecology.h"
 #include "voxelcore/core.h"
 
 namespace vxc {
@@ -192,21 +194,104 @@ inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col) {
 // AssetField is exactly the world that exists today, bit for bit, which is what
 // keeps every existing golden and the worldgen digest valid until the field is
 // deliberately switched on.
+enum class EcoDecisionReason : uint8_t {
+    Accepted, UnknownFacts, InvalidContext, PolicyFiltered, MissingProfile,
+    MissingPublishedVariant, Competition, LegacyAccepted, LegacyFiltered
+};
+inline const char* ecoDecisionReasonName(EcoDecisionReason reason){
+    switch(reason){
+    case EcoDecisionReason::Accepted:return "accepted";
+    case EcoDecisionReason::UnknownFacts:return "unknown_facts";
+    case EcoDecisionReason::InvalidContext:return "invalid_context";
+    case EcoDecisionReason::PolicyFiltered:return "policy_filtered";
+    case EcoDecisionReason::MissingProfile:return "missing_profile";
+    case EcoDecisionReason::MissingPublishedVariant:return "missing_published_variant";
+    case EcoDecisionReason::Competition:return "competition";
+    case EcoDecisionReason::LegacyAccepted:return "legacy_accepted";
+    case EcoDecisionReason::LegacyFiltered:return "legacy_filtered";
+    }
+    return "invalid_reason";
+}
+struct EcoPlacementDecision {
+    AssetSite site{};
+    AssetColumnFacts facts{};
+    EcoContext context{};
+    uint16_t canopyPerMille=0;
+    int32_t targetHeightMm=0;
+    AssetInstance instance{};
+    bool hasContext=false,hasInstance=false;
+    EcoDecisionReason reason=EcoDecisionReason::UnknownFacts;
+};
+
 class AssetField {
 public:
     AssetField() = default;
-    AssetField(const AssetField& other):seed_(other.seed_),layers_(other.layers_),species_(other.species_),banks_(other.banks_){}
-    AssetField& operator=(const AssetField& other){if(this!=&other){changed();seed_=other.seed_;layers_=other.layers_;species_=other.species_;banks_=other.banks_;}return *this;}
+    AssetField(const AssetField& other):seed_(other.seed_),ecologyEnabled_(other.ecologyEnabled_),ecology_(other.ecology_),layers_(other.layers_),species_(other.species_),banks_(other.banks_){}
+    AssetField& operator=(const AssetField& other){if(this!=&other){changed();seed_=other.seed_;ecologyEnabled_=other.ecologyEnabled_;ecology_=other.ecology_;layers_=other.layers_;species_=other.species_;banks_=other.banks_;}return *this;}
     uint64_t configurationRevision() const{return revision_;}
 
     void setLayers(const AssetLayer* layers, int count) { changed();
+        ecologyEnabled_ = false;
         layers_.assign(layers, layers + (count < kAssetLayerCount ? count : kAssetLayerCount));
     }
     void setSpecies(const AssetSpecies* species, int count) { changed();
+        ecologyEnabled_ = false;
         species_.assign(species, species + count);
     }
     void setBankSource(const IAssetBankSource* banks) { changed(); banks_ = banks; }
     void setSeed(uint64_t seed) { changed(); seed_ = seed; }
+    // Install before workers start. Failure leaves ecology disabled rather
+    // than accepting a partially authored species/community table.
+    bool setEcology(const EcoPlacementConfig& config) { changed();
+        ecologyEnabled_ = false;
+        if (!config.valid()) return false;
+        for (const auto& p : config.species) {
+            bool found = false;
+            for (const auto& s : species_) if (s.bankId == p.bankId) {
+                if (s.layer >= layers_.size()) return false;
+                const auto& l = layers_[s.layer];
+                if (p.tree && !l.terrainLattice) return false;
+                for (const auto& v : p.variants)
+                    if (v.heightMm > l.maxHeightMm || v.crownMm > l.maxRadiusMm) return false;
+                found = true;
+            }
+            if (!found) return false;
+        }
+        ecology_ = config;
+        ecologyEnabled_ = true;
+        return true;
+    }
+    bool ecologyEnabled() const { return ecologyEnabled_; }
+    // Opt-in inspection of output candidates, not the internal neighbor halo.
+    // Uses the actual resolver; accepted instances must match instancesForRect.
+    // PolicyFiltered includes the existing habitat/density/weighted-choice gates.
+    template<typename ColumnFactsFn>
+    std::vector<EcoPlacementDecision> ecologicalDecisionsForRect(const AssetVoxelRect& rect,
+        const ColumnFactsFn& factsAt,bool terrainOnly=false) const {
+        std::vector<EcoPlacementDecision> decisions;
+        if(!empty()&&ecologyEnabled_)ecologicalInstancesForRect(rect,factsAt,terrainOnly,&decisions);
+        return decisions;
+    }
+    // Same terrain-conditioned intent used by selection and diagnostic maps.
+    bool ecologicalContextAt(int64_t xMm,int64_t yMm,const AssetColumnFacts& facts,EcoContext& out) const {
+        out={};
+        return ecologyEnabled_&&facts.known&&facts.biome<kBiomeCount&&
+            (ecology_.biomeMask&(1u<<facts.biome))&&
+            ecoContextAt(seed_,xMm,yMm,ecology_.fields,out,
+                {facts.slopeMmPerM,facts.curv,facts.heat,facts.talus});
+    }
+
+    // Horizontal column-read reach beyond the requested rect, for host tile
+    // residency gates. Ecology reads neighbors of neighboring tree candidates;
+    // its sampling footprint is wider than a model's physical crown bounds.
+    int64_t columnSamplingReachMm(bool terrainOnly=false) const {
+        int64_t requested=0,terrain=0;
+        for(const auto& layer:layers_){
+            if(!terrainOnly||layer.terrainLattice)requested=std::max<int64_t>(requested,layer.maxRadiusMm);
+            if(layer.terrainLattice)terrain=std::max<int64_t>(terrain,layer.maxRadiusMm);
+        }
+        return ecologyEnabled_?std::max(requested,ecologicalHaloVox()*kVoxelSizeMm+terrain):requested;
+    }
 
     const std::vector<AssetLayer>& layers() const { return layers_; }
     const std::vector<AssetSpecies>& species() const { return species_; }
@@ -240,6 +325,7 @@ public:
                                                 bool terrainOnly = false) const {
         std::vector<AssetInstance> out;
         if (empty()) return out;
+        if (ecologyEnabled_) return ecologicalInstancesForRect(rect, columnFacts, terrainOnly);
         const std::vector<AssetSite> sites =
             assetSitesForRect(seed_, layers_.data(), int(layers_.size()), rect);
         out.reserve(sites.size());
@@ -254,6 +340,27 @@ public:
                                   int(species_.size()), s, columnFacts(avx, avy), inst))
                 continue;
             out.push_back(inst);
+        }
+        return out;
+    }
+
+    // Detail streaming owns anchors, rather than every model overlapping its
+    // group. Keep the full ecological tree halo, but avoid resolving output
+    // sites that this consumer would immediately discard. Order is identical
+    // to instancesForRect followed by the detail/anchor ownership filter.
+    template<typename ColumnFactsFn>
+    std::vector<AssetInstance> detailInstancesOwnedByRect(const AssetVoxelRect& rect,
+        const ColumnFactsFn& columnFacts) const {
+        if(empty() || !rect.valid()) return {};
+        if(ecologyEnabled_)return ecologicalInstancesForRect(rect,columnFacts,false,nullptr,true);
+        const auto outputLayers=ownedDetailLayers();
+        const auto sites=assetSitesForRect(seed_,outputLayers.data(),int(outputLayers.size()),rect);
+        std::vector<AssetInstance> out;
+        for(const auto& site:sites){
+            AssetInstance instance;
+            if(assetResolveSite(seed_,layers_.data(),int(layers_.size()),species_.data(),
+                int(species_.size()),site,columnFacts(floorDiv(site.anchorXMm,int64_t(kVoxelSizeMm)),
+                floorDiv(site.anchorYMm,int64_t(kVoxelSizeMm))),instance))out.push_back(instance);
         }
         return out;
     }
@@ -544,9 +651,208 @@ public:
     }
 
 private:
+    std::vector<AssetLayer> ownedDetailLayers() const {
+        auto result=layers_;
+        for(auto& layer:result){
+            if(layer.terrainLattice)layer.densityPerMille=0;
+            // Enumeration only: resolution still uses authoritative layers_.
+            layer.maxRadiusMm=0;
+        }
+        return result;
+    }
+    int64_t ecologicalHaloVox() const {
+        int64_t crown=0,exclusion=0,reach=0;
+        for(const auto& p:ecology_.species)if(p.tree)for(const auto& v:p.variants)if(v.published){
+            crown=std::max<int64_t>(crown,v.crownMm);exclusion=std::max<int64_t>(exclusion,v.exclusionMm);
+        }
+        for(const auto& layer:layers_)reach=std::max<int64_t>(reach,layer.maxRadiusMm);
+        return (reach+crown+2*exclusion+kVoxelSizeMm-1)/kVoxelSizeMm;
+    }
+    template<typename ColumnFactsFn>
+    std::vector<AssetInstance> ecologicalInstancesForRect(const AssetVoxelRect& rect,
+        const ColumnFactsFn& factsAt, bool terrainOnly,
+        std::vector<EcoPlacementDecision>* decisions=nullptr, bool detailOwned=false) const {
+        std::vector<AssetInstance> out;
+        if (!rect.valid()) return out;
+        // Bound influence of accepted crowns plus one nonrecursive spacing
+        // neighborhood. Do not enumerate the dense detail layer in this halo.
+        const int64_t halo = ecologicalHaloVox();
+        constexpr int64_t limit = (int64_t(1)<<50)/kVoxelSizeMm;
+        if(rect.vx0 < -limit+halo || rect.vy0 < -limit+halo ||
+           rect.vx1 > limit-halo || rect.vy1 > limit-halo)return out;
+        auto treeLayers = layers_;
+        for(auto& l:treeLayers)if(!l.terrainLattice)l.densityPerMille=0;
+        const AssetVoxelRect expanded{rect.vx0-halo,rect.vy0-halo,rect.vx1+halo,rect.vy1+halo};
+        const auto neighborSites=assetSitesForRect(seed_,treeLayers.data(),int(treeLayers.size()),expanded);
+        auto identity=[&](const AssetSite& s){return hash3(seed_,s.cellX,s.cellY,s.layer,CH_ECO_PRIORITY);};
+        struct Candidate { AssetInstance instance; EcoTree tree; };
+        std::vector<Candidate> candidates;
+        std::vector<EcoTree> rawTrees;
+        std::vector<size_t> canonicalOrder;
+        canonicalOrder.reserve(species_.size());
+        for(size_t i=0;i<species_.size();++i)canonicalOrder.push_back(i);
+        std::stable_sort(canonicalOrder.begin(),canonicalOrder.end(),[&](size_t a,size_t b){
+            const auto* pa=ecology_.profile(species_[a].bankId);
+            const auto* pb=ecology_.profile(species_[b].bankId);
+            const auto ia=pa?pa->stableId:UINT64_MAX;
+            const auto ib=pb?pb->stableId:UINT64_MAX;
+            if(ia!=ib)return ia<ib;
+            // Split rows for a species have disjoint biome weights. Keep their
+            // order canonical too, so active-row indices do not affect noise.
+            for(int biome=0;biome<kBiomeCount;++biome)
+                if(species_[a].weightPerMille[biome]!=species_[b].weightPerMille[biome])
+                    return species_[a].weightPerMille[biome]<species_[b].weightPerMille[biome];
+            return false;
+        });
+        // Only same-layer rows can participate in a site's selection. Resolve
+        // profile pointers once per query instead of scanning the ecology
+        // catalog for every species at every detail site.
+        std::array<std::vector<size_t>,kAssetLayerCount> layerOrder;
+        std::array<std::vector<uint16_t>,kAssetLayerCount> layerClusterIds;
+        std::vector<const EcoSpeciesProfile*> profiles(species_.size(),nullptr);
+        for(size_t rank=0;rank<canonicalOrder.size();++rank){
+            const auto index=canonicalOrder[rank];
+            profiles[index]=ecology_.profile(species_[index].bankId);
+            if(species_[index].layer<kAssetLayerCount){
+                layerOrder[species_[index].layer].push_back(index);
+                layerClusterIds[species_[index].layer].push_back(uint16_t(rank));
+            }
+        }
+        // Resolver retains the existing habitat and anchor checks. Reweight
+        // species BEFORE picking so regional composition works at saturation.
+        // Neighborhood and output passes overlap. Terrain facts are immutable
+        // within a query, but their host/residency identity is not owned here:
+        // reuse only inside this call, never across independent queries.
+        struct FactKey {
+            int64_t x,y;
+            bool operator==(const FactKey& other)const{return x==other.x&&y==other.y;}
+        };
+        struct FactHash {
+            size_t operator()(const FactKey& key)const{return size_t(splitmix64(uint64_t(key.x))^splitmix64(uint64_t(key.y)+1));}
+        };
+        std::unordered_map<FactKey,AssetColumnFacts,FactHash> factsMemo;
+        auto resolveRaw=[&](const AssetSite& site,uint16_t canopy,AssetInstance& inst,
+                         EcoTree* tree,EcoPlacementDecision* decision=nullptr)->bool {
+            auto fail=[&](EcoDecisionReason reason){if(decision)decision->reason=reason;return false;};
+            const FactKey key{floorDiv(site.anchorXMm,int64_t(kVoxelSizeMm)),floorDiv(site.anchorYMm,int64_t(kVoxelSizeMm))};
+            auto found=factsMemo.find(key);
+            if(found==factsMemo.end())found=factsMemo.emplace(key,factsAt(key.x,key.y)).first;
+            const auto& facts=found->second;
+            if(decision){decision->site=site;decision->facts=facts;decision->canopyPerMille=canopy;}
+            if(!facts.known || facts.biome>=kBiomeCount)return fail(EcoDecisionReason::UnknownFacts);
+            const bool active=(ecology_.biomeMask & (1u<<facts.biome))!=0;
+            if(!active){
+                const bool accepted=assetResolveSite(seed_,layers_.data(),int(layers_.size()),species_.data(),
+                    int(species_.size()),site,facts,inst);
+                if(decision){decision->reason=accepted?EcoDecisionReason::LegacyAccepted:EcoDecisionReason::LegacyFiltered;
+                    if(accepted){decision->instance=inst;decision->hasInstance=true;}}
+                return accepted;
+            }
+            EcoContext context;
+            if(!ecologicalContextAt(site.anchorXMm,site.anchorYMm,facts,context))return fail(EcoDecisionReason::InvalidContext);
+            if(decision){decision->context=context;decision->hasContext=true;}
+            std::vector<AssetSpecies> adjusted;
+            const auto& order=layerOrder[size_t(site.layer)];
+            adjusted.reserve(order.size());
+            for(auto index:order)adjusted.push_back(species_[index]);
+            for(size_t row=0;row<adjusted.size();++row){
+                auto& s=adjusted[row];
+                const auto* p=profiles[order[row]];
+                if(!p){s.weightPerMille[facts.biome]=0;continue;}
+                uint32_t weight=p->communityWeights[context.community];
+                weight=weight*ecoHydrologyWeight(facts.distanceToWaterMm,s.waterMaxMm,s.moistureAffinity)/1000;
+                weight=weight*p->standWeights[size_t(context.stand)]/1000;
+                if(p->ancientOnly&&context.stand!=EcoStand::Ancient)weight=0;
+                if(!p->tree)weight=weight*ecoCoverWeight(p->coverRole,canopy,context)/1000;
+                s.weightPerMille[facts.biome]=uint16_t(uint32_t(s.weightPerMille[facts.biome])*weight/1000);
+                if(p->tree)s.occupancyPerMille[facts.biome]=uint16_t(uint32_t(s.occupancyPerMille[facts.biome])*context.treeKeepPerMille/1000);
+            }
+            if(!assetResolveSite(seed_,layers_.data(),int(layers_.size()),adjusted.data(),
+                int(adjusted.size()),site,facts,inst,layerClusterIds[size_t(site.layer)].data()))return fail(EcoDecisionReason::PolicyFiltered);
+            inst.speciesIndex=uint16_t(order[inst.speciesIndex]);
+            const auto* p=ecology_.profile(inst.bankId);
+            if(!p)return fail(EcoDecisionReason::MissingProfile);
+            int32_t maxHeight=0;
+            for(const auto& v:p->variants)if(v.published)maxHeight=std::max(maxHeight,v.heightMm);
+            const int32_t target=std::max<int32_t>(1,int32_t(int64_t(maxHeight)*
+                (p->tree?context.targetHeightPerMille:650)/1000));
+            if(decision)decision->targetHeightMm=target;
+            const auto* variant=ecoChooseVariant(seed_,identity(site),target,p->variants,context.stand);
+            if(!variant)return fail(EcoDecisionReason::MissingPublishedVariant);
+            inst.seedIndex=variant->seedIndex;
+            if(decision){decision->reason=EcoDecisionReason::Accepted;decision->instance=inst;decision->hasInstance=true;}
+            if(tree && p->tree)*tree={identity(site),site.anchorXMm,site.anchorYMm,
+                variant->exclusionMm,variant->crownMm,p->crownOpacityPerMille};
+            return true;
+        };
+        // Tree candidates are resolved in both the neighborhood and output
+        // passes. Reuse only inside this query, with exactly the same zero
+        // canopy input. Diagnostics retain the original path and provenance.
+        struct RawKey {
+            int64_t x,y;int32_t layer;
+            bool operator==(const RawKey& other)const{return x==other.x&&y==other.y&&layer==other.layer;}
+        };
+        struct RawHash {size_t operator()(const RawKey& k)const{return size_t(splitmix64(uint64_t(k.x))^splitmix64(uint64_t(k.y)+1)^splitmix64(uint64_t(k.layer)+2));}};
+        const auto ownedLayers=detailOwned?ownedDetailLayers():std::vector<AssetLayer>{};
+        const auto& outputLayers=detailOwned?ownedLayers:(terrainOnly?treeLayers:layers_);
+        const auto sites=assetSitesForRect(seed_,outputLayers.data(),int(outputLayers.size()),rect);
+        struct RawResult {bool ready=false,accepted=false;AssetInstance instance{};EcoTree tree{};};
+        std::unordered_map<RawKey,RawResult,RawHash> rawMemo;
+        // Only output sites can be reused. Bound extra storage even for very
+        // large coarse requests; sites beyond the cap use the original path.
+        constexpr size_t maxRawMemoEntries=4096;
+        if(terrainOnly&&!decisions)for(const auto& site:sites){
+            if(rawMemo.size()==maxRawMemoEntries)break;
+            rawMemo.try_emplace({site.cellX,site.cellY,site.layer});
+        }
+        auto resolve=[&](const AssetSite& site,uint16_t canopy,AssetInstance& inst,
+                         EcoTree* tree,EcoPlacementDecision* decision=nullptr)->bool {
+            if(!terrainOnly||decisions||canopy!=0||!layers_[size_t(site.layer)].terrainLattice)
+                return resolveRaw(site,canopy,inst,tree,decision);
+            const RawKey key{site.cellX,site.cellY,site.layer};
+            auto found=rawMemo.find(key);
+            if(found==rawMemo.end())return resolveRaw(site,canopy,inst,tree,decision);
+            if(!found->second.ready){
+                auto& value=found->second;value.accepted=resolveRaw(site,canopy,value.instance,&value.tree);value.ready=true;
+            }
+            inst=found->second.instance;if(tree)*tree=found->second.tree;
+            return found->second.accepted;
+        };
+        for(const auto& site:neighborSites){
+            Candidate c;
+            if(!resolve(site,0,c.instance,&c.tree))continue;
+            const auto* p=ecology_.profile(c.instance.bankId);
+            if(!p || !p->tree || c.tree.crownMm==0)continue;
+            // A default EcoTree is not a resolved tree (inactive biome).
+            if(c.tree.id!=identity(site))continue;
+            candidates.push_back(c);rawTrees.push_back(c.tree);
+        }
+        const EcoTreeIndex rawIndex(seed_,rawTrees);
+        if(!rawIndex.valid())return out;
+        std::vector<EcoTree> accepted;
+        for(const auto& c:candidates)if(rawIndex.survives(c.tree))accepted.push_back(c.tree);
+        const EcoTreeIndex canopyIndex(seed_,accepted);
+        for(const auto& site:sites){
+            if(terrainOnly&&!layers_[size_t(site.layer)].terrainLattice)continue;
+            AssetInstance inst;EcoTree tree;
+            const auto canopy=layers_[size_t(site.layer)].terrainLattice?uint16_t(0):
+                canopyIndex.canopyAt(site.anchorXMm,site.anchorYMm);
+            EcoPlacementDecision* decision=nullptr;
+            if(decisions){decisions->emplace_back();decision=&decisions->back();}
+            if(!resolve(site,canopy,inst,&tree,decision))continue;
+            if(tree.id==identity(site) && !rawIndex.survives(tree)){
+                if(decision)decision->reason=EcoDecisionReason::Competition;
+                continue;
+            }
+            out.push_back(inst);
+        }
+        return out;
+    }
     void changed(){if(revision_!=UINT64_MAX)++revision_;}
     uint64_t revision_=0;
     uint64_t seed_ = 0;
+    bool ecologyEnabled_ = false;
+    EcoPlacementConfig ecology_;
     std::vector<AssetLayer> layers_;
     std::vector<AssetSpecies> species_;
     const IAssetBankSource* banks_ = nullptr;
