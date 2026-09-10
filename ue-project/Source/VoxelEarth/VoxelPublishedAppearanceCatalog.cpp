@@ -16,7 +16,7 @@ bool SafeSpecies(const FString& S){if(S.IsEmpty()||S.Len()>128)return false;for(
 bool ReadBounded(const FString& P,TArray<uint8>& B,int64 Limit){const int64 N=IFileManager::Get().FileSize(*P);return N>0&&N<=Limit&&FFileHelper::LoadFileToArray(B,*P)&&B.Num()==N;}
 bool SHAEquals(const TArray<uint8>& B,const FString& Expected){uint8 H[32];return Hex(Expected,64)&&SHA256(B.GetData(),B.Num(),H)&&BytesToHex(H,32).Equals(Expected,ESearchCase::IgnoreCase);}
 }
-uint32 FVoxelPublishedAppearanceCatalog::FindResource(const FString& Hash) const {
+uint32 FVoxelPublishedAppearanceCatalog::FindResourceId(const FString& Hash) const {
     const uint32* ID=ByHash.Find(Hash.ToLower());return ID?*ID:0;
 }
 TSharedPtr<const FVoxelPublishedAppearanceCatalog,ESPMode::ThreadSafe> FVoxelPublishedAppearanceCatalog::Load(

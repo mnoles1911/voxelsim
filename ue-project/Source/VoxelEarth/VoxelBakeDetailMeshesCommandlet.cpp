@@ -132,7 +132,7 @@ int32 UVoxelBakeDetailMeshesCommandlet::Main(const FString& Params){
             if(!Meta->TryGetBoolField(TEXT("visual_approved"),Approved)||!Approved||!Meta->TryGetStringField(TEXT("review_status"),Review)||Review!=TEXT("endorsed")||(Meta->TryGetBoolField(TEXT("inventory_candidate"),Candidate)&&Candidate))return Fail(TEXT("source is not explicitly endorsed: ")+ID);
             FString LibrarySHA;if(!FileDigest(Library/Species/ID/TEXT("tree.vxa"),LibrarySHA)||LibrarySHA!=GeometrySHA)return Fail(TEXT("endorsed source differs from publication"));
         }
-        const uint32 Resource=Catalog->FindResource(O->GetStringField(TEXT("geometry_md5")));if(!Resource)return Fail(TEXT("source appearance binding missing"));
+        const uint32 Resource=Catalog->FindResourceId(O->GetStringField(TEXT("geometry_md5")));if(!Resource)return Fail(TEXT("source appearance binding missing"));
         const auto Appearance=Catalog->Sources()[Resource].Appearance;
         const FString Key=TextDigest(GeometrySHA+TEXT("\n")+O->GetStringField(TEXT("sha256"))+TEXT("\n")+BuilderIdentity+Settings+Engine+MaterialHash+Host);
         if(const auto* Existing=DerivedRows.Find(Key)){

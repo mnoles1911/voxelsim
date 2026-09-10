@@ -17,7 +17,11 @@ public:
         // temperate three-form fixture needs ~276 MiB; retain a finite ceiling.
         const FString& AssetDirectory,FString& Error,uint64 MaxSourceBytes=384ull*1024*1024,
         uint64 MaxWorkingBytes=512ull*1024*1024);
-    uint32 FindResource(const FString& GeometryMD5) const;
+    // Named FindResourceId, not FindResource: winbase.h defines FindResource as a
+    // macro, and a unity neighbour that includes Windows headers (VoxelPlayerRecords.cpp)
+    // renamed the definition to FindResourceW while every other blob still called
+    // FindResource -- an unresolved external at link, 2026-09-10.
+    uint32 FindResourceId(const FString& GeometryMD5) const;
     const TArray<FSource>& Sources() const {return Entries;}
     uint64 ResourceBytes() const {return Bytes;}
 private:
