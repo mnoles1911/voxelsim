@@ -92,6 +92,7 @@ ue-project/Content/Voxel/T_MoonDisplacement.uasset
 # import dependency the design exists to avoid.
 ue-project/Content/UI/Backgrounds/*.uasset
 ue-project/Content/UI/Fonts/*.uasset
+ue-project/Content/Audio/Music/**/*.uasset
 ue-project/Content/Audio/Music/*.uasset
 
 # THE MUSIC ITSELF. The designer sources and places these locally; they are not
@@ -101,6 +102,17 @@ ue-project/Content/Audio/Music/*.uasset
 # FVoxelUIMusic scans the folder at runtime and plays one at random, so adding
 # a track is dropping a .wav in and relaunching. An empty folder is a supported
 # state: the menu runs silent and logs why.
+# RECURSIVE SINCE 2026-09-08, and it has to be. The library moved from one
+# flat folder into per-pool subfolders (Explore/Day, Cave, Town, ... -- see
+# docs/music-design.md section 8), and a non-recursive `Music/*.wav` stops
+# ignoring anything the moment a file lands one level down: the 92 MB
+# Sorrowmarsh cue would have become stageable again. The empty pool folders
+# carry a .gitkeep so the LAYOUT is committed while the bytes are not.
+ue-project/Content/Audio/Music/**/*.wav
+ue-project/Content/Audio/Music/**/*.ogg
+ue-project/Content/Audio/Music/**/*.mp3
+ue-project/Content/Audio/Music/**/*.flac
+ue-project/Content/Audio/Music/**/*.mp4
 ue-project/Content/Audio/Music/*.wav
 ue-project/Content/Audio/Music/*.ogg
 ue-project/Content/Audio/Music/*.mp3

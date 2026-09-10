@@ -322,7 +322,33 @@ void AVoxelWaterSheetActor::BeginPlay()
 	// the log, not the command line.
 	{
 		FString ScalarSpec;
-		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMatScalar="), ScalarSpec)
+		// bShouldStopOnSeparator = FALSE, AND THAT ARGUMENT IS THE WHOLE POINT
+		// OF THIS LINE (fixed 2026-09-07).
+		//
+		// FParse::Value's fourth parameter DEFAULTS TO TRUE, and true means "stop
+		// at the first separator", which includes the COMMA. So the multi-pair
+		// form this probe's own comment documents --
+		// -VoxelWaterMatScalar=Name:Value,Name:Value -- silently parsed as ONLY
+		// THE FIRST PAIR for as long as this switch has existed. Everything after
+		// the first comma was dropped with no warning, and because the loop below
+		// logs every assignment it DID make, the log looked healthy: it printed
+		// one correct line and simply never mentioned the others.
+		//
+		// MEASURED, and it is the exact failure this probe was built to prevent.
+		// -VoxelWaterMatScalar=WaterRoughnessFarGain:1,WaterRoughnessFadeStartM:0,
+		// WaterRoughnessFadeEndM:1,WaterRoughnessFar:0.30 reached the command line
+		// intact (it is in capture-r3-all030.log verbatim) and produced exactly
+		// one "material scalar ... set" line. The capture was therefore identical
+		// to the plain FarGain:1 arm, and would have been read as "collapsing the
+		// distance ramp changes nothing" -- a conclusion about the material drawn
+		// entirely from an argument that was never applied.
+		//
+		// THIS INVALIDATES ANY EARLIER MULTI-PAIR ARM. The shore-foam ladder's
+		// arm C (BathyFoamShelfLo:50 + BathyFoamShelfHi:100) and arm F (all three
+		// together) each set only their first pair, so neither is evidence for
+		// what its label says. Single-pair arms are unaffected.
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMatScalar="), ScalarSpec,
+		                  /*bShouldStopOnSeparator=*/false)
 		    && !ScalarSpec.IsEmpty() && WaterMaterial)
 		{
 			if (!SheetMaterialOverride)
@@ -1315,7 +1341,17 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		}
 	}
 
-	if (PendingTiles.Num() > 0)
+	// THE ASYNC ARM (2026-09-09): a tile whose lake data is still being read on a
+	// worker is rotated to the back and retried next tick rather than loaded here.
+	// The first gather on a quiet box used to cost 13.6 s of game thread under the
+	// loading curtain (Saved/loading-leg1-quiet-box.log); now GatherLakeSheetBasinsInTile
+	// only runs against a tile the lake tier already holds.
+	if (PendingTiles.Num() > 0 && !Water->IsLakeTileReadyForGather(PendingTiles.Last().X, PendingTiles.Last().Y))
+	{
+		const FIntPoint Waiting = PendingTiles.Pop(EAllowShrinking::No);
+		PendingTiles.Insert(Waiting, 0);
+	}
+	else if (PendingTiles.Num() > 0)
 	{
 		const FIntPoint T = PendingTiles.Pop(EAllowShrinking::No);
 		TArray<UVoxelWaterSubsystem::FLakeSheetBasin> Found;

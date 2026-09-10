@@ -25,9 +25,81 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	bool bMenuShot = false;
 	float MenuShotSeconds = 2.0f;
 
-	// -VoxelMenuPanel=load|help|credits: open that panel before the capture.
-	// Empty means the main column.
+	// -VoxelMenuPanel=load|help|credits|settings: open that panel before the
+	// capture. Empty means the main column.
 	FString MenuPanel;
+
+	// -VoxelPauseShot[=<seconds>]: play for N seconds, open the PAUSE overlay,
+	// settle another N, capture with the UI on, quit. Two settles because the
+	// overlay is built at the first and its glyphs rasterise during the second.
+	//
+	// IT NEEDS A WORLD, unlike every switch above it, which is why it is driven
+	// by UVoxelPauseUISubsystem rather than by the front end: the front end has
+	// stopped ticking by the time there is anything to photograph. Pair it with
+	// -VoxelMenuAutoStart (and -VoxelLoadTheatre=0) to reach Playing without a
+	// human, and with -VoxelSpawnAt to avoid the origin's missing fine tiles.
+	bool bPauseShot = false;
+	float PauseShotSeconds = 2.0f;
+
+	// -VoxelPausePanel=pause|settings|save|load: which of the overlay's four
+	// screens to open before the shutter. Empty means the pause list.
+	FString PausePanel;
+
+	// --- The 2026-09-07 in-game screens ------------------------------------
+	// All four follow -VoxelPauseShot exactly: play for N seconds, open the
+	// thing, settle another N so its glyphs rasterise, photograph with the UI
+	// on, quit. They need a world for the same reason it does, and are driven
+	// by UVoxelScreensUISubsystem rather than by the front end, which has
+	// stopped ticking by the time there is anything to photograph.
+	//
+	// PAIR EVERY ONE WITH -VoxelSpawnAt. The world origin has no fine tiles and
+	// the spawn gate is fatal there; tools/voxel-ui-capture.ps1 adds it for
+	// these shots the same way it does for -Shot Pause.
+
+	// -VoxelScreenShot[=<seconds>]: open the five-tab stack and photograph it.
+	bool bScreenShot = false;
+	float ScreenShotSeconds = 2.0f;
+	// -VoxelScreenPanel=map|journal|inventory|player|codex. Empty means
+	// inventory, which is the tab with real data behind it.
+	FString ScreenPanel;
+
+	// -VoxelDeathShot[=<seconds>]. CAPTURE-ONLY BY NECESSITY: nothing in this
+	// project can kill the player (no health, no damage, no death delegate), so
+	// this switch is the death screen's only caller.
+	bool bDeathShot = false;
+	float DeathShotSeconds = 2.0f;
+
+	// -VoxelDialogueShot[=<seconds>]. Also capture-only: there is no
+	// conversation system, and design/CONVERSATION_SYSTEM.md -- which the
+	// dialogue CSS names as its spec -- is not in this repository.
+	bool bDialogueShot = false;
+	float DialogueShotSeconds = 2.0f;
+
+	// -VoxelDemoVitals[=<hp>,<hunger>,<wound>]: draw the HUD's health and hunger
+	// bars, and its interaction prompt, at fabricated values.
+	//
+	// SAME JOB AS -VoxelDemoSaves, AND THE SAME JUSTIFICATION. This project has
+	// no health, no hunger and no interaction system, so SVoxelGameHud gates
+	// all three off -- a health bar drawn full is a CLAIM, not a decoration, and
+	// it would go on telling the player they were unhurt after something could
+	// hurt them. But that leaves every picture of the HUD a picture of its
+	// empty state, with no way to review the layout the mock was drawn for.
+	//
+	// So this is capture-only, exactly as the demo save rows are: it fabricates
+	// what no system can yet supply, it is off by default, and nothing in
+	// ordinary play can turn it on. Values are 0..100 and default to the HUD
+	// mock's own TWEAK_DEFAULTS (100 / 100 / 0).
+	bool bDemoVitals = false;
+	float DemoHealth = 100.f;
+	float DemoHunger = 100.f;
+	float DemoWound = 0.f;
+
+	// -VoxelHudShot[=<seconds>]: photograph the world with ONLY the HUD on it.
+	// Opens nothing, because the HUD is installed as soon as the player has a
+	// pawn; the settle is there so the compass tape and the hotbar glyphs have
+	// rasterised.
+	bool bHudShot = false;
+	float HudShotSeconds = 2.0f;
 
 	// -VoxelLoadingShot[=<seconds>] / -VoxelLoadingShotAt=<s,s,s>: press NEW
 	// GAME immediately, then capture at each offset. The default single offset
@@ -55,6 +127,19 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// the degraded path screenshot-testable instead of theoretical.
 	bool bNoAssets = false;
 
+	// -VoxelDemoSaves: put a fabricated set of saves in front of the LOAD list
+	// and the save dialog's collision check.
+	//
+	// THE ROW STRUCT WAS DESIGNED FOR THIS -- FVoxelSaveRowInfo's own comment
+	// says it is "kept as a plain struct so the widget ... can be
+	// screenshot-tested with fabricated rows" -- and this is the switch that
+	// finally uses it. A capture box has no saves, so without it every picture
+	// of the LOAD dialog is a picture of its empty state: no tags, no filter
+	// chips doing anything, no rich rows, and no way to see the overwrite band
+	// at all. CAPTURE ONLY: the rows name no world on disk, so LOADING one
+	// fails the way loading a deleted save does.
+	bool bDemoSaves = false;
+
 	// -VoxelReadyProbeLog: one line per readiness poll, with hit counts,
 	// per-ring pending/in-flight, and the poll's own cost in ms.
 	bool bReadyProbeLog = false;
@@ -62,6 +147,10 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// Loading-gate tuning, so the GateMaxRing measurement is one flag rather
 	// than a rebuild. Defaults are the ported Godot contract.
 	int32 LoadGateMaxRing = 3;
+	// -VoxelLoadGateFineRing=0|1 (default 1): gate 3, "the fine tier's
+	// prefetch ring has settled" -- see FVoxelReadyProbeConfig::bRequireFineRing.
+	// 0 restores the two-gate rule exactly (the A/B control arm).
+	bool bLoadGateFineRing = true;
 	// ---- THE MINIMUM HOLD: 15.0 -> 2.0, 2026-08-27 ------------------------
 	//
 	// THE MINIMUM IS NOT THE THING THAT MAKES THE PLAYER WAIT. The contract in
@@ -97,7 +186,84 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// -VoxelLoadMinHold= overrides it; set 15 to reproduce every build before
 	// this change.
 	float LoadMinHoldSeconds = 2.0f;
+	// NO LONGER THE READINESS GATE'S CEILING (2026-09-07). Until Phase 4 this
+	// one number did two jobs: it was the curtain's maximum hold AND it was
+	// passed straight into FVoxelReadyProbeConfig::MaxWaitSeconds. Those are
+	// different questions and the owner's directive separates them; the gate's
+	// patience is LoadGateMaxWaitSeconds below.
 	float LoadMaxHoldSeconds = 60.0f; // the value both menu call sites pass
+
+	// -VoxelLoadGateMaxWait=<s>: how long the readiness probe waits before it
+	// gives up and lets the curtain lift on a world that is not ready.
+	//
+	// 60 -> 300, OWNER DIRECTIVE 2026-09-07: "Happy to have player sit on
+	// loading screen for more than a minute if that time is needed to load the
+	// tiles and game world in." At 60 s a cold 8-ring cascade took the TIMEOUT
+	// path -- the curtain lifted on a world that was still landing, which is
+	// the one thing the gate exists to prevent, and the probe's own Warning was
+	// the only trace of it.
+	//
+	// 300 RATHER THAN NO CEILING. A gate with no ceiling is a hang, and the
+	// timeout arm has to stay distinguishable from a pass: FVoxelWorldReadyProbe
+	// logs a Warning and the front end prints "world NOT ready (gate timed
+	// out)", so a run that took it can be told from one that did not.
+	float LoadGateMaxWaitSeconds = 300.0f;
+
+	// -VoxelLoadingScreenThread=0|1. DEFAULT 0 SINCE 2026-09-07 EVENING, AND
+	// THE DEFAULT IS THE FIX.
+	//
+	// It shipped default 1 the same afternoon and HUNG THE OWNER'S LIVE
+	// SESSION on the first load: process alive and Responding, CPU flat, log
+	// dead mid-load, loading screen frozen on screen, killed after 14 minutes
+	// (docs/evidence/2026-09-07-live-curtain-hang-VoxelEarth.log).
+	//
+	// WHY IT CANNOT BE MADE SAFE FROM THIS SIDE. Ending one armed block runs
+	// FMoviePlayerProxy::BlockingFinished -> WaitForMovieToFinish ->
+	// FSlateLoadingSynchronizationMechanism::DestroySlateThread, whose body is
+	// `while (bMainLoopRunning) { PumpMessages(false); Sleep(0.001f); }`
+	// (MoviePlayerThreading.cpp:75-81) -- an UNBOUNDED wait with no timeout and
+	// no cancel. Its release depends on the RENDER thread ticking
+	// FDefaultGameMoviePlayer::Tick (DefaultGameMoviePlayer.cpp:520), which is
+	// the only place the Slate thread's draw-pass flag is ever reset, and which
+	// nothing guarantees: in a threaded build the game thread never calls
+	// TickRenderingTickables (LaunchEngineLoop.cpp:5610 is `if
+	// (!GUseThreadedRendering)`), the sole driver is the render-thread
+	// heartbeat (RenderingThread.cpp:466-486), and that heartbeat is
+	// deliberately suppressed while GSuspendRenderingTickables != 0, i.e.
+	// during any FlushRenderingCommands -- which WaitForMovieToFinish itself
+	// calls. We do not own the release condition, so we cannot bound the wait.
+	//
+	// A loading screen that can hang is worse than one that stutters. The code
+	// stays, with the extra guards the incident bought (see
+	// VoxelLoadingCurtainThread.h), and =1 is now an OPT-IN for a controlled
+	// leg with somebody watching -- never an interactive default until the
+	// unbounded wait has an engine-side answer.
+	bool bLoadingScreenThread = false;
+
+	// -VoxelMenuPrewarm=0|1 (DEFAULT 1). Commit the big GPU allocations while
+	// the title screen is up instead of inside the first streaming frames of a
+	// load.
+	//
+	// THE TITLE SCREEN IS A STATIC 2D IMAGE OVER A HELD WORLD, so a render-
+	// thread commit there is invisible; the same commit during the load is a
+	// frozen hourglass. The call is
+	// UVoxelWorldSubsystem::PrewarmGpuPools() and it ENQUEUES -- it never
+	// flushes the render thread, because a flush here would trade a hitch in
+	// the load for a hitch in the menu and is the same shape of call the
+	// 2026-09-07 curtain deadlock came out of.
+	//
+	// ONLY REACHABLE ON AN ATTENDED RUN, and not by a check of its own: the
+	// call site is EnterMenu, which VoxelFrontEnd::IsEnabledThisRun() already
+	// gates. Every headless/-unattended leg logs `VoxelFrontEnd: suppressed`
+	// and never builds a menu, so it never pre-warms and its numbers stay
+	// comparable with every leg taken before this switch existed. Passing
+	// -VoxelMenuPrewarm=1 on such a run does NOT force it on; the menu is
+	// still what carries the call, which is deliberate -- pre-warming without
+	// a menu to hide it behind would just move the stall.
+	//
+	// =0 IS THE CONTROL ARM and the reason this is a switch at all: an A/B on
+	// the loading screen needs both halves from one binary.
+	bool bMenuPrewarm = true;
 
 	// ---- THE ARTIFICIAL LOAD DURATION (owner directive, 2026-09-05) --------
 	//
@@ -116,6 +282,29 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	float LoadTheatreMinSeconds = 30.0f;
 	float LoadTheatreMaxSeconds = 60.0f;
 
+	// ---- The music pools (docs/music-design.md), 2026-09-08 ---------------
+	//
+	// TWO DIAGNOSTIC OVERRIDES, AND THEY EXIST BECAUSE THE MECHANISM IS
+	// OTHERWISE UNPROVABLE FROM A LOG IN ANY REASONABLE TIME. The shipped
+	// authored silence is 45-120 s per cue and the Cave/Water pools need the
+	// player to be under rock or aboard a boat, so a run that wanted to show
+	// "the pool machinery selects, gaps and crossfades" would take ten minutes
+	// and a cave. Both of these are ORDINARY CONFIGURATION -- neither poses,
+	// captures or ends a run -- and both are recorded in
+	// tools/frontend-switch-classification.txt.
+
+	// -VoxelMusicPool=<Explore|Cave|Town|Water|Combat|Menu|Stingers|Cinematic>:
+	// pin the pool, ignoring the world's signals. Empty (the default) means the
+	// signals decide. A pinned pool with no cues on disk still falls through to
+	// the next pool down, so this cannot produce silence by itself.
+	FString MusicPool;
+
+	// -VoxelMusicGap=<seconds>: replace the authored silence with a fixed
+	// duration, for every pool. Negative means "leave the design's ranges
+	// alone", which is the default; 0 is legal and restores the pre-2026-09-08
+	// back-to-back behaviour for an A/B.
+	float MusicGapSeconds = -1.f;
+
 	// -VoxelMenuWatchdog=<seconds>: under -unattended, refuse to sit on the
 	// menu past N seconds and exit with an error. Same shape as
 	// -VoxelPerfExitWatchdog, and for the same reason: a mis-flagged headless
@@ -129,7 +318,11 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// its own quit, so nothing consults this yet; it is the predicate a future
 	// caller wanting "is this a capture run at all" should use rather than
 	// re-deriving the disjunction.
-	bool IsCaptureRun() const { return bMenuShot || bLoadingShot || bHourglassShot; }
+	bool IsCaptureRun() const
+	{
+		return bMenuShot || bLoadingShot || bHourglassShot || bPauseShot
+		    || bScreenShot || bDeathShot || bDialogueShot || bHudShot;
+	}
 };
 
 namespace VoxelFrontEndSwitches

@@ -16,24 +16,15 @@
 // it is authored here rather than ported.
 
 #include "CoreMinimal.h"
+// FVoxelSaveRowInfo and FOnVoxelSaveAction moved to SVoxelLoadDialog.h when the
+// pause overlay became a second consumer of both -- a shared struct declared in
+// the header of one of its two consumers is how include cycles start.
+#include "SVoxelLoadDialog.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
 #include "Styling/SlateColor.h"
 
 DECLARE_DELEGATE(FOnVoxelMenuAction);
-DECLARE_DELEGATE_OneParam(FOnVoxelSaveAction, const FString& /*Slug*/);
-
-// One row of the LOAD GAME list. Populated from VoxelSaveLibrary; kept as a
-// plain struct so the widget has no dependency on the save system's headers
-// and can be screenshot-tested with fabricated rows.
-struct FVoxelSaveRowInfo
-{
-	FString Slug;
-	FText DisplayName;
-	FText Detail;        // "<timestamp>   X ..  Y ..  Z .."
-	bool bLoadable = true;
-	FText DisabledReason; // shown in place of Detail when !bLoadable
-};
 
 // Which of the four mutually exclusive panels is on screen. Exactly one is
 // visible at a time, matching MainMenu.gd's three sibling Controls plus the
@@ -83,19 +74,21 @@ public:
 
 private:
 	TSharedRef<class SWidget> BuildMainColumn();
+	// SVoxelLoadDialog, since 2026-09-07. The oak sub-panel with two lines of
+	// text per row is gone; the filter chips, the search field and the tagged
+	// rows are the mock's, and the pause overlay shows the same widget.
 	TSharedRef<class SWidget> BuildLoadPanel();
 	// HELP, CREDITS and SETTINGS are the same shape: a title, a paragraph and a
 	// BACK button. One builder rather than three near-identical ones, because
 	// three copies of a panel is how three panels start disagreeing.
 	TSharedRef<class SWidget> BuildMessagePanel(EVoxelMenuPanel Panel, const FText& Title, const FText& Body);
-	// The real SETTINGS panel (2026-09-04) -- message-panel shaped, one row per
-	// entry in VoxelGraphicsUserSettings. Registers its Back button under
-	// EVoxelMenuPanel::Settings in MessagePanelBackButtons like its siblings.
+	// SVoxelSettingsPanel since 2026-09-07 -- no longer message-panel shaped,
+	// and no longer registered in MessagePanelBackButtons, because it owns its
+	// own footer, its own Escape and its own focus default.
 	TSharedRef<class SWidget> BuildSettingsPanel();
 	// menu_body_panel(): oak fill, 2px black border, 18px content margin, plus
 	// the drop shadow Slate brushes cannot express -- see the .cpp.
 	TSharedRef<class SWidget> WrapInPanelFrame(TSharedRef<class SWidget> Content);
-	void RebuildSaveList();
 
 	FOnVoxelMenuAction OnContinue;
 	FOnVoxelMenuAction OnNewGame;
@@ -106,12 +99,14 @@ private:
 	TSharedPtr<class SWidgetSwitcher> PanelSwitcher;
 	TSharedPtr<class SVoxelMenuButton> ContinueButton;
 	TSharedPtr<class SVoxelMenuButton> LoadGameButton;
-	TSharedPtr<class SVerticalBox> SaveList;
+	// The two mock-ported sub-panels, each of which owns its own focus default
+	// and its own Escape.
+	TSharedPtr<class SVoxelLoadDialog> LoadDialog;
+	TSharedPtr<class SVoxelSettingsPanel> SettingsPanel;
 	// Per-panel focus targets. Slate finds neighbours on its own once something
 	// in the panel HAS focus; these are what give it that starting point when a
 	// panel opens, so a player can drive the whole menu from a gamepad without
 	// touching the mouse first.
-	TSharedPtr<class SVoxelMenuButton> LoadPanelCancelButton;
 	TArray<TSharedPtr<class SVoxelMenuButton>> ColumnButtons;
 	// One per message panel. A single shared pointer would end up holding
 	// whichever panel was built LAST, and focusing an invisible widget is a
@@ -122,6 +117,10 @@ private:
 	EVoxelMenuPanel VisiblePanel = EVoxelMenuPanel::MainColumn;
 
 	bool HasAnyLoadableSave() const;
+	// Whether the keyboard is on none of the title-screen items. Drives the
+	// resting `.title-menu__item.active` cartouche on NEW GAME -- see the call
+	// site for why a focus-only highlight was not enough.
+	bool HasNoColumnFocus() const;
 
 	const struct FSlateBrush* GetBackgroundBrush() const;
 	FSlateColor GetBackgroundTint() const;

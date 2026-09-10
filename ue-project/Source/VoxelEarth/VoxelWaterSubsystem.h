@@ -294,7 +294,17 @@ public:
 	// wakeRegion through it here is what makes water react to terrain edits
 	// at all. Waking writes no fill -- it is scheduling only, so
 	// GetWaterVolume() cannot move because of it.
-	void NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCoord& MinVoxelIncl, const VoxelCoords::FVoxelCoord& MaxVoxelIncl);
+	//
+	// EditSource NAMES THE WRITER, and it exists because a log could not.
+	// Backlog §14: an unattended capture stalled behind an edit whose only
+	// trace in the whole run was this function's "Mobilized ... on edit" line
+	// -- every edit source that prints its own line was absent, so the forensic
+	// pass ended at "something wrote 27 voxels under the pawn". A caller-supplied
+	// literal costs nothing and turns that into an answer. Defaulted so an
+	// unnamed caller is a MISSING TAG, visibly, rather than a compile error that
+	// tempts the next person to pass an empty string.
+	void NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCoord& MinVoxelIncl, const VoxelCoords::FVoxelCoord& MaxVoxelIncl,
+	                               const TCHAR* EditSource = TEXT("unnamed"));
 
 	// Diagnostic: whether the cross-tick solid_ memo (voxel.Water.SolidCacheEnabled)
 	// is currently enabled -- read by verification/perf-report log lines so a
@@ -655,6 +665,12 @@ public:
 	// half-extent RadiusUU around (CenterXUU, CenterYUU). Loads that tile, so it
 	// is game-thread only and does disk I/O; the caller budgets it. Returns the
 	// number appended.
+	// THE ASYNC ARM (2026-09-09): true when GatherLakeSheetBasinsInTile for this tile
+	// would not touch disk -- the lake tier has it (or knows it is absent), or there is
+	// no lake tier. False means "a worker is reading and decoding it; ask again next
+	// tick". Also false until the fine-tile ring has settled, so the worker's read is
+	// cache-warm rather than contending with the streamer on the disc. Game thread.
+	bool IsLakeTileReadyForGather(int32 TileX, int32 TileY);
 	int32 GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY, double CenterXUU, double CenterYUU,
 	                                  double RadiusUU, TArray<FLakeSheetBasin>& Out) const;
 

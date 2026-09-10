@@ -513,9 +513,26 @@ private:
 	// Is this page safe to hand to a worker? True when the safety mode is off,
 	// or when the sampler cannot reach the fine tier's fatal gate at all;
 	// otherwise true only when every fine tile the page can touch is inside the
-	// streamer's pinned ring with one tile of margin. THE WHOLE ARGUMENT is at
-	// AsyncSafetyMode() in the .cpp -- this is only the arithmetic.
+	// streamer's pinned ring with one tile of margin -- AND, when the residency
+	// callback below is set, actually resident right now. THE WHOLE ARGUMENT is
+	// at AsyncSafetyMode() in the .cpp -- this is only the arithmetic.
 	bool IsPageAsyncSafe(int64 PageX, int64 PageY) const;
+public:
+	// THE ASYNC-LOADER AMENDMENT TO THE PROOF (2026-09-07). Step 2 of the proof
+	// admits pages by ring GEOMETRY alone, relying on "every ring tile is
+	// resident because the residency tick loaded it earlier this tick". With
+	// -VoxelFineTileAsync=1 that premise fails: a ring tile can be IN FLIGHT
+	// on a worker, so a page inside the ring can still reach a non-resident
+	// tile and a worker sampling it would trip the fatal gate. This callback
+	// answers "is this inclusive pixel rect [X0..X1]x[Y0..Y1] (atlas pixels)
+	// resident now" -- the subsystem wires it to
+	// FVoxelFineTileStreamer::IsFootprintResident in world mm -- and
+	// IsPageAsyncSafe requires it in addition to the ring test. Left unset
+	// (the synchronous loader), nothing changes: the OFF arm is byte-identical.
+	// Game thread only, like everything else on this class.
+	using FPixelRectResidentFn = TFunction<bool(int64 PxX0, int64 PxY0, int64 PxX1, int64 PxY1)>;
+	void SetPixelRectResidentCallback(FPixelRectResidentFn InCallback) { PixelRectResident = MoveTemp(InCallback); }
+private:
 	bool AnyAsyncSlotBusy() const;
 	// THE BARRIER (step 4 of the proof). Waits out every busy slot and HARVESTS
 	// it -- the pages are correct, because everything a worker sampled it
@@ -790,6 +807,10 @@ private:
 	// because this module is compiled without RTTI.
 	bool bAsyncSafetyLatched = false;
 	bool bAsyncSamplerCanLeak = false;
+	// The async-loader amendment to the admission proof; see the setter.
+	// Unset (the synchronous loader) means IsPageAsyncSafe is byte-identical
+	// to the ring-geometry test alone.
+	FPixelRectResidentFn PixelRectResident;
 	// The anchor's COARSE tile at the moment the busy slots were launched. The
 	// invariant every busy slot depends on: because the barrier fires the tick
 	// this changes, all busy slots were always launched under the value stored

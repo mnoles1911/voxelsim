@@ -1,0 +1,740 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Player" subtitle="Player tab — equipped gear flanking the character, stats, skills, perks, standing" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Player</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Press+Start+2P&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  /* ============================================================
+     PLAYER screen — 4 sub-tabs:
+       Stats        — attributes + character render + main level
+       Skills       — skill tree (legacy from Skills.html)
+       Perks        — list of unlocked + available perks
+       Reputation   — faction standings
+     Only the active sub-tab is shown.
+     ============================================================ */
+
+  /* sub-page container */
+  .player-page{ flex:1; min-height:0; display:none; }
+  .player-page.active{ display:flex; }
+
+  /* ============ STATS sub-page ============ */
+  .stats-grid{
+    flex:1; min-height:0;
+    display:grid;
+    grid-template-columns: minmax(400px, 0.95fr) minmax(420px, 1.05fr);
+    gap:14px;
+  }
+
+  /* LEFT: equipped gear flanking the character, level bar beneath */
+  .char-card{
+    border:2px solid #000;
+    background: linear-gradient(180deg, var(--panel-oak-1) 0%, var(--panel-oak-2) 100%);
+    box-shadow: inset 0 0 0 1px var(--panel-oak-edge);
+    padding:10px 12px 12px;
+    display:flex; flex-direction:column; min-height:0; gap:8px;
+  }
+  .char-head{
+    display:flex; justify-content:space-between; align-items:baseline;
+    padding-bottom:7px; border-bottom:1px solid var(--panel-oak-edge);
+    font-family:var(--pixel); font-size:8px; letter-spacing:2px;
+    color:var(--gold); text-shadow:1px 1px 0 #000;
+  }
+  .char-head .name{ font-family:var(--serif); font-weight:700; font-size:20px; letter-spacing:3px; color:var(--ink-bright); }
+  .char-body{
+    flex:1; min-height:0;
+    display:grid; grid-template-columns: 62px minmax(0,1fr) 62px; gap:10px;
+    align-items:stretch;
+  }
+  .gear-col{ display:flex; flex-direction:column; justify-content:space-between; gap:6px; }
+  .eq{
+    position:relative; width:62px; height:62px; flex:none;
+    background: linear-gradient(180deg,#1a1410 0%,#0a0805 100%);
+    border:2px solid #000;
+    box-shadow: inset 0 0 0 1px var(--bronze-deep), inset 0 0 0 2px rgba(0,0,0,0.5);
+    cursor:pointer; transition:box-shadow .12s;
+  }
+  .eq:hover{ box-shadow: inset 0 0 0 1px var(--gold), inset 0 0 0 2px rgba(0,0,0,0.5), 0 0 10px rgba(240,193,75,0.3); }
+  .eq.uncommon{ box-shadow: inset 0 0 0 1px var(--rare-uncommon), inset 0 0 0 2px rgba(0,0,0,0.5); }
+  .eq.rare{ box-shadow: inset 0 0 0 1px var(--rare-rare), inset 0 0 0 2px rgba(0,0,0,0.5); }
+  .eq .gl{ position:absolute; inset:13px; image-rendering:pixelated; }
+  .eq .tag{
+    position:absolute; left:0; right:0; bottom:2px;
+    font-family:var(--pixel); font-size:7px; letter-spacing:1px;
+    color:var(--ink-mute); text-align:center; text-shadow:1px 1px 0 #000;
+  }
+  .eq.empty .gl{ inset:22px; background:var(--iron-deep); clip-path:polygon(45% 0,55% 0,55% 45%,100% 45%,100% 55%,55% 55%,55% 100%,45% 100%,45% 55%,0 55%,0 45%,45% 45%); opacity:.5 }
+
+  /* equipped-gear glyphs */
+  .gl-helm{ background:linear-gradient(180deg,#c8c0b0 0 40%,#6e6358 40% 100%); clip-path:polygon(10% 42%,24% 12%,76% 12%,90% 42%,90% 100%,66% 100%,66% 66%,34% 66%,34% 100%,10% 100%) }
+  .gl-armor{ background:linear-gradient(180deg,#8a8378 0 34%,#4a4038 34% 100%); clip-path:polygon(18% 8%,38% 8%,50% 20%,62% 8%,82% 8%,96% 30%,80% 42%,80% 96%,20% 96%,20% 42%,4% 30%) }
+  .gl-gloves{ background:linear-gradient(180deg,#a06a3a 0 45%,#6b4520 45% 100%); clip-path:polygon(18% 30%,34% 8%,50% 24%,66% 8%,82% 30%,82% 92%,18% 92%) }
+  .gl-legs{ background:linear-gradient(180deg,#4a4038 0 62%,#2a241f 62% 100%); clip-path:polygon(16% 6%,84% 6%,84% 96%,58% 96%,50% 54%,42% 96%,16% 96%) }
+  .gl-sword{ background:linear-gradient(180deg,#e8e4d8 0 62%,#8a8378 62% 70%,#6b4520 70% 88%,#b07a3a 88% 100%); clip-path:polygon(42% 0,58% 0,58% 62%,80% 68%,80% 78%,58% 78%,58% 100%,42% 100%,42% 78%,20% 78%,20% 68%,42% 62%) }
+  .gl-shield{ background:radial-gradient(circle at 50% 34%, var(--bronze) 0 18%, transparent 18%), linear-gradient(180deg,#8a5a28 0 16%,#5a3a18 16% 100%); clip-path:polygon(8% 4%,92% 4%,92% 58%,50% 100%,8% 58%) }
+  .gl-ring{ background:radial-gradient(circle at 50% 58%, transparent 0 26%, #d8a050 26% 40%, transparent 40%), radial-gradient(circle at 50% 16%, #b03a6a 0 20%, transparent 20%) }
+  .gl-boots{ background:linear-gradient(180deg,#6b4520 0 52%,#2a1a0c 52% 100%); clip-path:polygon(24% 6%,62% 6%,62% 58%,94% 58%,94% 94%,24% 94%) }
+
+  .render-frame{
+    position:relative; min-height:0;
+    border:2px solid #000;
+    background:
+      radial-gradient(ellipse 60% 26% at 50% 90%, rgba(0,0,0,0.75), transparent 62%),
+      radial-gradient(ellipse at 50% 26%, rgba(232,217,176,0.14), transparent 70%),
+      linear-gradient(180deg, #1a1410 0%, #0a0805 100%);
+    box-shadow: inset 0 0 0 1px var(--panel-iron-edge);
+    overflow:hidden;
+    display:grid; place-items:center;
+    perspective: 900px;
+  }
+  .render-frame::before{
+    content:""; position:absolute; inset:0;
+    background: repeating-linear-gradient(0deg, rgba(255,180,80,0.025) 0 1px, transparent 1px 3px);
+    pointer-events:none;
+  }
+  .render-stage{
+    transform-style: preserve-3d;
+    animation: turntable 14s linear infinite;
+  }
+  @keyframes turntable{
+    0%   { transform: rotateY(-22deg); }
+    50%  { transform: rotateY(22deg); }
+    100% { transform: rotateY(-22deg); }
+  }
+  .voxel-char{
+    transform: scale(1.55);
+    width: 96px; height: 168px;
+    image-rendering:pixelated;
+    position:relative;
+    transform-style: preserve-3d;
+  }
+  .vc{ position:absolute; }
+  .vc.head { left:32px; top:0; width:32px; height:32px;
+    background: linear-gradient(180deg,#c8c0b0 0 24%,#8a8378 24% 100%);
+    box-shadow: inset 0 0 0 2px #2a241f, inset -3px 0 0 rgba(0,0,0,0.45);
+  }
+  .vc.face { left:36px; top:14px; width:24px; height:14px;
+    background: linear-gradient(180deg,#8a6a4a 0 50%,#6b4a2a 50% 100%);
+    box-shadow: inset 0 0 0 1px #2a241f;
+  }
+  .vc.eye-l, .vc.eye-r{ width:3px; height:3px; background:#f0e0a8; top:18px; }
+  .vc.eye-l{ left:42px; }
+  .vc.eye-r{ left:51px; }
+  .vc.shoulder-l, .vc.shoulder-r{ top:32px; width:20px; height:18px;
+    background: linear-gradient(180deg,#8a8378 0 40%,#4a4038 40% 100%);
+    box-shadow: inset 0 0 0 2px #2a241f;
+  }
+  .vc.shoulder-l{ left:12px; }
+  .vc.shoulder-r{ left:64px; }
+  .vc.chest{ left:24px; top:34px; width:48px; height:50px;
+    background:
+      radial-gradient(circle at 50% 30%, var(--bronze) 0 8%, transparent 8%),
+      linear-gradient(180deg,#6a5a4a 0 30%,#4a4038 30% 100%);
+    box-shadow: inset 0 0 0 2px #2a241f, inset -4px 0 0 rgba(0,0,0,0.4);
+  }
+  .vc.belt{ left:24px; top:84px; width:48px; height:8px;
+    background: linear-gradient(180deg,#6b4520 0 50%,#4a2f1a 50% 100%);
+    box-shadow: inset 0 0 0 1px #2a241f;
+  }
+  .vc.leg-l, .vc.leg-r{ top:92px; width:20px; height:48px;
+    background: linear-gradient(180deg,#4a4038 0 70%,#2a241f 70% 100%);
+    box-shadow: inset 0 0 0 2px #14100a;
+  }
+  .vc.leg-l{ left:28px; }
+  .vc.leg-r{ left:48px; }
+  .vc.boot-l, .vc.boot-r{ top:140px; width:22px; height:14px;
+    background: linear-gradient(180deg,#6b4520 0 50%,#2a1a0c 50% 100%);
+    box-shadow: inset 0 0 0 2px #14100a;
+  }
+  .vc.boot-l{ left:27px; }
+  .vc.boot-r{ left:47px; }
+  .vc.weapon{ left:0; top:60px; width:8px; height:78px;
+    background: linear-gradient(180deg,
+      #6b4520 0 8%, #b07a3a 8% 12%, #6b4520 12% 16%,
+      #d8d4c8 16% 88%, #8a8378 88% 92%, transparent 92%);
+    box-shadow: 0 0 0 1px #2a241f;
+  }
+  .render-plinth{
+    position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+    width:200px; height:6px;
+    background: linear-gradient(180deg, #3a342d, #14100a);
+    border:1px solid #000;
+    box-shadow: 0 0 16px rgba(240,193,75,0.15);
+  }
+  /* main level bar, docked under the render */
+  .level-bar{
+    display:flex; flex-direction:column; gap:4px; flex:none;
+    padding-top:8px; border-top:1px solid var(--panel-oak-edge);
+  }
+  .level-bar .row{ display:flex; justify-content:space-between; align-items:baseline;
+    font-family:var(--pixel); font-size:8px; letter-spacing:2px;
+    color:var(--gold); text-shadow:1px 1px 0 #000; }
+  .level-bar .row b{ font-family:var(--serif); font-size:14px; letter-spacing:2px; color:var(--ink-bright); }
+  .level-bar .track{ height:6px; background:#000; border:1px solid var(--panel-iron-edge);
+    box-shadow: inset 0 0 0 1px #1a1410; }
+  .level-bar .fill{ height:100%;
+    background: linear-gradient(180deg, var(--gold) 0%, var(--bronze-deep) 100%);
+    box-shadow: inset 0 1px 0 rgba(255,245,200,0.4); }
+
+  /* right: stats blocks, sharing the column height evenly */
+  .stats-right{ display:flex; flex-direction:column; gap:9px; min-height:0; overflow-y:auto; overflow-x:hidden; }
+  .stats-right::-webkit-scrollbar{ width:8px }
+  .stats-right::-webkit-scrollbar-thumb{ background:var(--panel-oak-edge); border:1px solid #000 }
+  .stat-block{
+    flex:none;
+    display:flex; flex-direction:column;
+    border:2px solid #000;
+    background: linear-gradient(180deg, var(--panel-oak-1) 0%, var(--panel-oak-2) 100%);
+    box-shadow: inset 0 0 0 1px var(--panel-oak-edge);
+    padding:10px 13px;
+  }
+
+  .stat-block h3{
+    font-family:var(--serif); font-weight:700; font-size:13px;
+    letter-spacing:3px; color:var(--gold);
+    text-shadow:1px 1px 0 #000;
+    margin-bottom:7px; padding-bottom:5px; flex:none;
+    border-bottom:1px solid var(--panel-oak-edge);
+    display:flex; justify-content:space-between; align-items:baseline;
+  }
+  .stat-block h3 .meta{
+    font-family:var(--mono); font-size:14px; letter-spacing:1px; color:var(--ink-dim);
+  }
+
+  .attr-grid{
+    display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:4px 14px;
+  }
+  .attr{
+    display:flex; align-items:center; gap:8px;
+    padding:3px 0;
+    font-family:var(--mono); font-size:18px; color:var(--ink);
+    border-bottom:1px solid rgba(107,68,34,0.15);
+  }
+  .attr__glyph{
+    width:19px; height:19px; flex:none; image-rendering:pixelated;
+  }
+  .attr__name{ flex:1; min-width:0; font-family:var(--serif); font-weight:700; font-size:13px; letter-spacing:1px; color:var(--ink); text-shadow:1px 1px 0 #000; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .attr__val{ font-family:var(--pixel); font-size:12px; color:var(--gold); text-shadow:1px 1px 0 #000; min-width:28px; text-align:right; }
+  .attr__val.delta{ color:var(--rare-uncommon); font-size:10px; }
+  .attr.featured .attr__name{ color:var(--gold); }
+  .attr.featured .attr__val{ color:#fff5d0; }
+
+  /* attribute glyphs */
+  .g-speech    { background: radial-gradient(circle at 50% 40%, var(--gold) 0 30%, transparent 30%), linear-gradient(180deg, var(--bronze-deep) 0 100%); clip-path: polygon(0 0, 100% 0, 100% 70%, 60% 70%, 50% 100%, 40% 70%, 0 70%); }
+  .g-charisma  { background: linear-gradient(180deg, #f0c14b 0%, #a87320 100%); clip-path: polygon(50% 0, 75% 30%, 100% 50%, 75% 70%, 50% 100%, 25% 70%, 0 50%, 25% 30%); }
+  .g-speed     { background: linear-gradient(135deg, #6fbb47 0%, #2f7c1a 100%); clip-path: polygon(0 70%, 20% 70%, 30% 40%, 50% 40%, 60% 0, 80% 0, 70% 60%, 100% 60%, 80% 100%); }
+  .g-strength  { background: linear-gradient(180deg, var(--hp-bright) 0%, var(--hp-deep) 100%); clip-path: polygon(20% 30%, 40% 30%, 40% 0, 60% 0, 60% 30%, 80% 30%, 80% 70%, 60% 70%, 60% 100%, 40% 100%, 40% 70%, 20% 70%); }
+  .g-agility   { background: radial-gradient(circle at 50% 40%, #5fa84a 0 30%, transparent 30%), linear-gradient(180deg, #2f7c1a 0 100%); clip-path: polygon(50% 0, 70% 20%, 50% 40%, 70% 60%, 50% 80%, 70% 100%, 50% 100%, 30% 100%, 50% 80%, 30% 60%, 50% 40%, 30% 20%); }
+  .g-vitality  { background: linear-gradient(180deg, var(--rare-uncommon) 0%, #2f7c1a 100%); clip-path: polygon(50% 100%, 0 60%, 0 30%, 25% 0, 50% 25%, 75% 0, 100% 30%, 100% 60%); }
+  .g-noise     { background: linear-gradient(180deg, var(--rare-epic) 0%, #6a1a8a 100%); clip-path: polygon(0 50%, 25% 30%, 25% 70%, 50% 30%, 50% 70%, 75% 30%, 75% 70%, 100% 50%); }
+  .g-vis       { background: radial-gradient(ellipse at 50% 50%, #fff 0 12%, var(--rare-epic) 12% 35%, transparent 35%), linear-gradient(180deg, #6a1a8a 0 100%); clip-path: polygon(0 50%, 25% 25%, 75% 25%, 100% 50%, 75% 75%, 25% 75%); }
+  .g-consp     { background: linear-gradient(180deg, var(--rare-epic) 0%, #4a0c6a 100%); clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%); }
+
+  /* armour/weapon stats matrix */
+  .stat-mtx{
+    display:grid;
+    grid-template-columns: auto repeat(3, 1fr);
+    gap:4px 12px;
+    font-family:var(--mono); font-size:16px;
+  }
+  .stat-mtx .lbl{ display:flex; align-items:center; gap:8px;
+    font-family:var(--serif); font-weight:700; font-size:12px; letter-spacing:2px;
+    color:var(--ink-dim); text-shadow:1px 1px 0 #000; }
+  .stat-mtx .lbl .ico{ width:18px; height:18px; image-rendering:pixelated; }
+  .stat-mtx .v{ color:var(--ink); text-align:right; }
+  .stat-mtx .hd{ font-family:var(--pixel); font-size:8px; letter-spacing:1px; color:var(--gold);
+    text-shadow:1px 1px 0 #000; text-align:right; }
+
+  .ico-slash{ background: linear-gradient(135deg, transparent 40%, #d8d4c8 40% 60%, transparent 60%), linear-gradient(180deg, #6b4520 0 100%); clip-path: polygon(10% 80%, 80% 10%, 90% 20%, 20% 90%); }
+  .ico-stab { background: linear-gradient(180deg, #d8d4c8 0 70%, #6b4520 70% 100%); clip-path: polygon(45% 0, 55% 0, 60% 70%, 75% 70%, 50% 100%, 25% 70%, 40% 70%); }
+  .ico-blunt{ background: linear-gradient(180deg, #8a8378 0 50%, #4a4038 50% 100%); clip-path: polygon(30% 0, 70% 0, 80% 30%, 70% 60%, 60% 60%, 60% 100%, 40% 100%, 40% 60%, 30% 60%, 20% 30%); }
+
+  /* ============ SKILLS sub-page (carried over) ============ */
+  .sk-grid{
+    flex:1; min-height:0; width:100%;
+    display:grid;
+    grid-template-columns: 200px 1fr 280px;
+    gap:14px;
+  }
+  .sk-tree-wrap{
+    border:2px solid #000;
+    background: linear-gradient(180deg, #1a1410 0%, #0a0805 100%);
+    box-shadow: inset 0 0 0 1px var(--panel-iron-edge);
+    position:relative; overflow:hidden;
+  }
+  .sk-tree-wrap::before{
+    content:""; position:absolute; inset:0;
+    background-image:
+      linear-gradient(rgba(110,99,88,0.08) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(110,99,88,0.08) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  .sk-svg{ position:absolute; inset:0; width:100%; height:100%; }
+  .sk-node{ position:absolute; width:64px; height:64px; transform:translate(-50%,-50%); cursor:pointer; }
+  .sk-node .hex{
+    width:100%; height:100%;
+    background: linear-gradient(180deg, #2a241f 0%, #14100a 100%);
+    border:2px solid #000;
+    box-shadow: inset 0 0 0 1px var(--iron), inset 0 0 0 2px var(--iron-deep);
+    clip-path: polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);
+    display:grid; place-items:center;
+    position:relative;
+  }
+  .sk-node.unlocked .hex{
+    background: linear-gradient(180deg, var(--bronze) 0%, var(--bronze-deep) 100%);
+    box-shadow: inset 0 0 0 1px var(--gold), inset 0 0 0 2px var(--gold-deep);
+  }
+  .sk-node.available .hex{
+    background: linear-gradient(180deg, #2a241f 0%, #14100a 100%);
+    box-shadow: inset 0 0 0 1px var(--gold), inset 0 0 0 2px var(--gold-deep), 0 0 14px rgba(240,193,75,0.5);
+  }
+  .sk-node.selected .hex{
+    box-shadow: inset 0 0 0 1px var(--hp-bright), inset 0 0 0 2px var(--hp-deep), 0 0 18px rgba(232,74,58,0.7);
+  }
+  .sk-node.locked{ opacity:0.5; }
+  .sk-node .ico{ width:28px; height:28px; image-rendering:pixelated; }
+  .sk-node .lvl{
+    position:absolute; right:-2px; bottom:-2px;
+    font-family:var(--pixel); font-size:8px;
+    color:var(--ink); text-shadow:1px 1px 0 #000;
+    background:#000; padding:2px 4px;
+    border:1px solid var(--gold-deep);
+  }
+  .sk-node .lbl{
+    position:absolute; top:100%; left:50%; transform:translateX(-50%);
+    font-family:var(--serif); font-weight:700; font-size:11px;
+    letter-spacing:2px; color:var(--ink-dim);
+    text-shadow:1px 1px 0 #000;
+    white-space:nowrap; padding-top:4px;
+  }
+  .sk-node.unlocked .lbl{ color:var(--gold); }
+  .ico-blade { background: linear-gradient(180deg,#d8d4c8 0 70%, #6b4520 70% 100%); clip-path: polygon(50% 0,55% 65%,75% 65%,75% 75%,55% 75%,55% 100%,45% 100%,45% 75%,25% 75%,25% 65%,45% 65%); }
+  .ico-shieldsk{ background: linear-gradient(180deg,#6b4520 0 12%, var(--bronze) 12% 100%); clip-path: polygon(0 0,100% 0,100% 60%,50% 100%,0 60%); }
+  .ico-flame { background: radial-gradient(ellipse at 50% 70%, #f0c14b 0 30%, #e84a3a 30% 60%, transparent 60%); }
+
+  .sk-class{ display:flex; flex-direction:column; gap:0; }
+  .sk-class-item{
+    font-family:var(--serif); font-weight:700; font-size:14px;
+    letter-spacing:2px; color:var(--ink-mute);
+    padding:10px 12px; cursor:pointer; text-shadow:1px 1px 0 #000;
+    border-bottom: 1px solid rgba(107,68,34,0.35);
+    display:flex; justify-content:space-between; align-items:baseline;
+  }
+  .sk-class-item:hover{ color:var(--ink); }
+  .sk-class-item.active{ color:var(--gold); background:var(--panel-oak-2);
+    box-shadow: inset 3px 0 0 var(--gold);
+  }
+  .sk-class-item .n{ font-family:var(--pixel); font-size:8px; color:var(--ink-mute); }
+  .sk-class-item.active .n{ color:var(--gold); }
+  .pts-banner{
+    background: linear-gradient(180deg, var(--panel-iron) 0%, #14100a 100%);
+    border:2px solid #000; box-shadow: inset 0 0 0 1px var(--panel-iron-edge);
+    padding:12px 14px; margin-bottom:10px;
+    display:flex; align-items:center; justify-content:space-between;
+  }
+  .pts-banner .lab{ font-family:var(--serif); font-weight:700; font-size:12px; letter-spacing:3px; color:var(--ink-dim); text-shadow:1px 1px 0 #000; }
+  .pts-banner .val{ font-family:var(--pixel); font-size:18px; color:var(--gold); text-shadow:1px 1px 0 #000; }
+
+  .sk-detail{
+    border:2px solid #000;
+    background: linear-gradient(180deg, var(--panel-oak-1) 0%, var(--panel-oak-2) 100%);
+    box-shadow: inset 0 0 0 1px var(--panel-oak-edge), inset 0 0 0 2px #0a0805;
+    padding:16px;
+    display:flex; flex-direction:column; gap:10px;
+    overflow-y:auto;
+  }
+  .sd-name{ font-family:var(--serif); font-weight:700; font-size:20px; letter-spacing:2px; color:var(--gold); text-shadow:1px 1px 0 #000; border-bottom:2px solid #000; box-shadow: 0 1px 0 var(--panel-oak-edge); padding-bottom:6px; }
+  .sd-tier{ font-family:var(--pixel); font-size:9px; color:var(--ink-dim); letter-spacing:2px; }
+  .sd-flavor{ font-family:var(--mono); font-size:16px; font-style:italic; color:var(--ink-dim); line-height:1.35; }
+  .sd-rank{ font-family:var(--mono); font-size:15px; color:var(--ink); background: rgba(0,0,0,0.3); border:1px solid var(--panel-oak-edge); padding:8px 10px; }
+  .sd-rank b{ color:var(--gold); font-family:var(--serif); letter-spacing:2px; }
+  .sd-rank .delta{ color:var(--rare-uncommon); }
+  .sd-req{ font-family:var(--mono); font-size:14px; color:var(--ink-dim); }
+  .sd-req b{ color:var(--ink); }
+  .sd-cta{
+    margin-top:auto;
+    font-family:var(--serif); font-weight:700; font-size:14px; letter-spacing:3px;
+    color:#fff8e0;
+    background: linear-gradient(180deg, var(--bronze) 0%, var(--bronze-deep) 100%);
+    border:2px solid #000;
+    box-shadow: inset 0 0 0 1px var(--gold), 0 4px 0 #000;
+    padding:12px 0; cursor:pointer;
+    text-shadow:1px 1px 0 #000;
+  }
+  .sd-cta:hover{
+    background: linear-gradient(180deg, var(--gold) 0%, var(--bronze) 100%);
+    color:var(--parchment-ink); text-shadow:none;
+  }
+
+  /* ============ PERKS sub-page ============ */
+  .perks-grid{
+    flex:1; min-height:0;
+    display:grid; grid-template-columns: 1fr 320px; gap:18px;
+  }
+  .perks-list{ height:100%; }
+  .perks-list .list-row__name{ font-family:Georgia,"Times New Roman",serif; font-size:18px; }
+  .perks-list .list-row.locked{ color:#7a6248; font-style:italic; }
+  .perks-list .list-row.locked .list-row__icon{ filter:grayscale(1) opacity(0.6); }
+  .perks-detail{
+    border:2px solid #000;
+    background: linear-gradient(180deg, #5a1410 0%, #2a0808 100%);
+    box-shadow: inset 0 0 0 1px #8a3030, inset 0 0 80px rgba(0,0,0,0.6);
+    color: var(--parchment);
+    padding:18px 22px;
+    overflow-y:auto;
+    font-family:Georgia,"Times New Roman",serif;
+  }
+  .perks-detail h4{
+    font-family:var(--serif); font-weight:700; font-size:22px; letter-spacing:3px;
+    color:var(--ink-bright);
+    margin-bottom:8px; text-shadow:1px 1px 0 #000;
+  }
+  .perks-detail .req{
+    font-family:var(--pixel); font-size:8px; letter-spacing:2px;
+    color:#d4a64a; margin-bottom:14px;
+  }
+  .perks-detail p{ font-size:17px; line-height:1.4; margin-bottom:12px; color:#e8d9b0; }
+  .perks-detail .flavor{ font-style:italic; color:rgba(232,217,176,0.7); }
+  .perk-glyph{
+    width:20px; height:20px; image-rendering:pixelated;
+    background: linear-gradient(180deg, var(--bronze) 0%, var(--bronze-deep) 100%);
+    clip-path: polygon(50% 0,100% 25%,100% 75%,50% 100%,0 75%,0 25%);
+  }
+  .perk-glyph.locked{ background: linear-gradient(180deg, var(--iron) 0%, var(--iron-deep) 100%); }
+
+  /* ============ REPUTATION sub-page ============ */
+  .rep-list{ flex:1; min-height:0; display:flex; flex-direction:column; }
+  .rep-row{
+    display:grid; grid-template-columns: 240px 1fr 80px; gap:18px;
+    align-items:center;
+    padding:14px 18px;
+    border-bottom:1px solid rgba(120,80,30,0.18);
+    color:var(--parchment-ink);
+  }
+  .rep-row .name{ font-family:var(--serif); font-weight:700; font-size:18px; letter-spacing:2px; color:var(--parchment-ink); display:flex; align-items:center; gap:10px; }
+  .rep-row .seal{ width:24px; height:28px; image-rendering:pixelated;
+    background: linear-gradient(180deg, var(--bronze) 0%, var(--bronze-deep) 100%);
+    clip-path: polygon(0 0,100% 0,100% 60%,50% 100%,0 60%); }
+  .rep-row.friendly .seal{ background: linear-gradient(180deg, var(--rare-uncommon) 0%, #2f7c1a 100%); }
+  .rep-row.hostile  .seal{ background: linear-gradient(180deg, var(--hp-bright) 0%, var(--hp-deep) 100%); }
+  .rep-row .bar{
+    height:14px;
+    background:rgba(60,42,20,0.5);
+    border:1px solid var(--parchment-edge);
+    position:relative;
+    box-shadow: inset 0 0 0 1px rgba(255,245,200,0.15);
+  }
+  .rep-row .bar .center{
+    position:absolute; left:50%; top:-2px; bottom:-2px; width:1px;
+    background:rgba(60,42,20,0.4);
+  }
+  .rep-row .bar .fill{ position:absolute; top:0; bottom:0;
+    background: linear-gradient(180deg, var(--gold) 0%, var(--bronze-deep) 100%);
+    box-shadow: inset 0 1px 0 rgba(255,245,200,0.4); }
+  .rep-row.friendly .bar .fill{ background: linear-gradient(180deg, var(--rare-uncommon) 0%, #2f7c1a 100%); }
+  .rep-row.hostile  .bar .fill{ background: linear-gradient(180deg, var(--hp-bright) 0%, var(--hp-deep) 100%); }
+  .rep-row .num{ font-family:var(--pixel); font-size:12px; color:#5a3e1a; text-align:right; }
+  .rep-row.friendly .num{ color:#2f7c1a; }
+  .rep-row.hostile .num{ color:#8a1410; }
+</style>
+</head>
+<body>
+  <div class="bg-scene"></div>
+  <div class="bg-vignette"></div>
+  <div class="bg-grain"></div>
+
+  <div class="menu-shell compact">
+    <nav class="menu-tabs">
+      <a href="Voxelmark Map.html"       class="menu-tab">MAP</a>
+      <a href="Voxelmark Journal.html"   class="menu-tab">JOURNAL</a>
+      <a href="Voxelmark Inventory.html" class="menu-tab">INVENTORY</a>
+      <a href="Voxelmark Player.html"    class="menu-tab active">PLAYER</a>
+      <a href="Voxelmark Codex.html"     class="menu-tab">CODEX</a>
+    </nav>
+
+    <div class="menu-body">
+      <!-- shared sub-tab row -->
+      <div class="sub-tabs">
+        <a class="sub-tab active" data-page="stats">
+          <div class="sub-tab__shield"><div class="ico g-charisma"></div></div>
+          <div class="sub-tab__label">STATS</div>
+        </a>
+        <a class="sub-tab" data-page="skills">
+          <div class="sub-tab__shield"><div class="ico ico-blade"></div></div>
+          <div class="sub-tab__label">SKILLS</div>
+        </a>
+        <a class="sub-tab" data-page="perks">
+          <div class="sub-tab__shield"><div class="ico ico-flame"></div></div>
+          <div class="sub-tab__label">PERKS</div>
+        </a>
+        <a class="sub-tab" data-page="reputation">
+          <div class="sub-tab__shield"><div class="ico ico-shieldsk"></div></div>
+          <div class="sub-tab__label">REPUTATION</div>
+        </a>
+      </div>
+
+      <!-- ========= STATS ========= -->
+      <div class="player-page active" data-page="stats">
+        <div class="stats-grid">
+          <!-- LEFT: equipped gear flanking the character -->
+          <div class="char-card">
+            <div class="char-head">
+              <span class="name">ROLAND</span>
+              <span>WAYWARD HEIR · ARMOUR 42</span>
+            </div>
+
+            <div class="char-body">
+              <div class="gear-col">
+                <div class="eq uncommon" title="Iron Helm"><div class="gl gl-helm"></div><div class="tag">HEAD</div></div>
+                <div class="eq rare" title="Chain Hauberk"><div class="gl gl-armor"></div><div class="tag">CHEST</div></div>
+                <div class="eq" title="Leather Gloves"><div class="gl gl-gloves"></div><div class="tag">HANDS</div></div>
+                <div class="eq" title="Padded Hose"><div class="gl gl-legs"></div><div class="tag">LEGS</div></div>
+              </div>
+
+              <div class="render-frame">
+                <div class="render-stage">
+              <div class="voxel-char">
+                <div class="vc head"></div>
+                <div class="vc face"></div>
+                <div class="vc eye-l"></div>
+                <div class="vc eye-r"></div>
+                <div class="vc shoulder-l"></div>
+                <div class="vc shoulder-r"></div>
+                <div class="vc chest"></div>
+                <div class="vc belt"></div>
+                <div class="vc leg-l"></div>
+                <div class="vc leg-r"></div>
+                <div class="vc boot-l"></div>
+                <div class="vc boot-r"></div>
+                <div class="vc weapon"></div>
+              </div>
+                </div>
+                <div class="render-plinth"></div>
+              </div>
+
+              <div class="gear-col">
+                <div class="eq" title="Iron Longsword"><div class="gl gl-sword"></div><div class="tag">MAIN</div></div>
+                <div class="eq uncommon" title="Oaken Shield"><div class="gl gl-shield"></div><div class="tag">OFF</div></div>
+                <div class="eq rare" title="Ring of Vigor"><div class="gl gl-ring"></div><div class="tag">RING</div></div>
+                <div class="eq" title="Leather Boots"><div class="gl gl-boots"></div><div class="tag">FEET</div></div>
+              </div>
+            </div>
+
+            <div class="level-bar">
+              <div class="row"><span>MAIN LEVEL</span><b>6</b></div>
+              <div class="track"><div class="fill" style="width:42%"></div></div>
+              <div class="row"><span>XP</span><span>2,140 / 5,080</span></div>
+            </div>
+          </div>
+
+          <!-- RIGHT: attribute + combat blocks -->
+          <div class="stats-right">
+            <div class="stat-block">
+              <h3><span>◆ ATTRIBUTES</span><span class="meta">2 unspent points</span></h3>
+              <div class="attr-grid">
+                <div class="attr featured"><div class="attr__glyph g-speech"></div><div class="attr__name">Speech</div><div class="attr__val">6</div></div>
+                <div class="attr"><div class="attr__glyph g-charisma"></div><div class="attr__name">Charisma</div><div class="attr__val">2</div></div>
+                <div class="attr"><div class="attr__glyph g-speed"></div><div class="attr__name">Speed</div><div class="attr__val">22</div></div>
+                <div class="attr"><div class="attr__glyph g-strength"></div><div class="attr__name">Strength</div><div class="attr__val">5</div></div>
+                <div class="attr"><div class="attr__glyph g-agility"></div><div class="attr__name">Agility</div><div class="attr__val">6</div></div>
+                <div class="attr"><div class="attr__glyph g-vitality"></div><div class="attr__name">Vitality</div><div class="attr__val">6</div></div>
+              </div>
+            </div>
+
+            <div class="stat-block">
+              <h3><span>◆ STEALTH &amp; PRESENCE</span></h3>
+              <div class="attr-grid">
+                <div class="attr"><div class="attr__glyph g-consp"></div><div class="attr__name">Conspicuous</div><div class="attr__val">55</div></div>
+                <div class="attr"><div class="attr__glyph g-noise"></div><div class="attr__name">Noise</div><div class="attr__val">25</div></div>
+                <div class="attr"><div class="attr__glyph g-vis"></div><div class="attr__name">Visibility</div><div class="attr__val">61</div></div>
+              </div>
+            </div>
+
+            <div class="stat-block">
+              <h3><span>◆ COMBAT</span></h3>
+              <div class="stat-mtx">
+                <div class="lbl"></div><div class="hd">SLASH</div><div class="hd">STAB</div><div class="hd">BLUNT</div>
+                <div class="lbl"><div class="ico ico-shieldsk"></div>Armour</div><div class="v">21</div><div class="v">34</div><div class="v">35</div>
+                <div class="lbl"><div class="ico ico-blade"></div>Weapon</div><div class="v">28</div><div class="v">30</div><div class="v">12</div>
+              </div>
+            </div>
+
+            <div class="stat-block">
+              <h3><span>◆ VITALS &amp; EXPOSURE</span><span class="meta">summer, day 12</span></h3>
+              <div class="attr-grid">
+                <div class="attr"><div class="attr__glyph g-strength"></div><div class="attr__name">Health</div><div class="attr__val">69</div></div>
+                <div class="attr"><div class="attr__glyph g-charisma"></div><div class="attr__name">Energy</div><div class="attr__val">47</div></div>
+                <div class="attr"><div class="attr__glyph g-vitality"></div><div class="attr__name">Food</div><div class="attr__val">26</div></div>
+                <div class="attr"><div class="attr__glyph g-vitality"></div><div class="attr__name">Warmth</div><div class="attr__val">74</div></div>
+                <div class="attr"><div class="attr__glyph g-agility"></div><div class="attr__name">Rest</div><div class="attr__val">52</div></div>
+                <div class="attr"><div class="attr__glyph g-speed"></div><div class="attr__name">Carry</div><div class="attr__val">112</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========= SKILLS ========= -->
+      <div class="player-page" data-page="skills">
+        <div class="sk-grid">
+          <div class="col" style="display:flex;flex-direction:column;min-height:0;">
+            <div class="sub-title"><span>◆ Disciplines</span></div>
+            <div class="sk-class">
+              <div class="sk-class-item active">Blade <span class="n">3/8</span></div>
+              <div class="sk-class-item">Bulwark <span class="n">1/6</span></div>
+              <div class="sk-class-item">Hunt <span class="n">2/7</span></div>
+              <div class="sk-class-item">Wayfaring <span class="n">4/9</span></div>
+              <div class="sk-class-item">Stonecraft <span class="n">2/8</span></div>
+              <div class="sk-class-item">Pyromancy <span class="n">0/6</span></div>
+            </div>
+          </div>
+
+          <div class="col" style="display:flex;flex-direction:column;min-height:0;">
+            <div class="pts-banner">
+              <span class="lab">SKILL POINTS</span>
+              <span class="val">3</span>
+            </div>
+            <div class="sk-tree-wrap">
+              <svg class="sk-svg" viewBox="0 0 600 480" preserveAspectRatio="xMidYMid meet">
+                <g stroke="#6b4520" stroke-width="3" fill="none">
+                  <path d="M 300 60 L 300 160" />
+                  <path d="M 300 160 L 180 240" />
+                  <path d="M 300 160 L 420 240" />
+                  <path d="M 180 240 L 120 360" />
+                  <path d="M 180 240 L 240 360" />
+                  <path d="M 420 240 L 360 360" />
+                  <path d="M 420 240 L 480 360" />
+                </g>
+                <g stroke="#f0c14b" stroke-width="2" fill="none" filter="url(#glow)">
+                  <path d="M 300 60 L 300 160" />
+                  <path d="M 300 160 L 180 240" />
+                </g>
+                <defs>
+                  <filter id="glow"><feGaussianBlur stdDeviation="3" /></filter>
+                </defs>
+              </svg>
+
+              <div class="sk-node unlocked" style="left:50%; top:12.5%;"><div class="hex"><div class="ico ico-blade"></div><div class="lvl">3/3</div></div><div class="lbl">SWORDPLAY</div></div>
+              <div class="sk-node unlocked" style="left:50%; top:33%;"><div class="hex"><div class="ico ico-blade"></div><div class="lvl">2/3</div></div><div class="lbl">RIPOSTE</div></div>
+              <div class="sk-node available selected" style="left:30%; top:50%;"><div class="hex"><div class="ico ico-shieldsk"></div><div class="lvl">0/3</div></div><div class="lbl">PARRY</div></div>
+              <div class="sk-node available" style="left:70%; top:50%;"><div class="hex"><div class="ico ico-blade"></div><div class="lvl">0/3</div></div><div class="lbl">EXECUTE</div></div>
+              <div class="sk-node locked" style="left:20%; top:75%;"><div class="hex"><div class="ico ico-shieldsk"></div></div><div class="lbl">UNYIELDING</div></div>
+              <div class="sk-node locked" style="left:40%; top:75%;"><div class="hex"><div class="ico ico-blade"></div></div><div class="lbl">WHIRLWIND</div></div>
+              <div class="sk-node locked" style="left:60%; top:75%;"><div class="hex"><div class="ico ico-blade"></div></div><div class="lbl">DUELIST</div></div>
+              <div class="sk-node locked" style="left:80%; top:75%;"><div class="hex"><div class="ico ico-flame"></div></div><div class="lbl">SUNDERSTRIKE</div></div>
+            </div>
+          </div>
+
+          <div class="sk-detail">
+            <div class="sd-tier">◆ TIER II · BLADE</div>
+            <div class="sd-name">Parry</div>
+            <div class="sd-flavor">A blade in the right hand turns aside a blade in the wrong one — and Roland's grip has lately grown right-handed.</div>
+            <div class="sd-rank">
+              <b>Rank 0 → Rank 1</b><br>
+              Parry window <span class="delta">+0.10s</span><br>
+              Stagger on parry <span class="delta">+8</span>
+            </div>
+            <div class="sd-req">
+              <b>Requires:</b> Riposte II<br>
+              <b>Cost:</b> 1 Skill Point
+            </div>
+            <button class="sd-cta">UNLOCK · 1 PT</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========= PERKS ========= -->
+      <div class="player-page" data-page="perks">
+        <div class="perks-grid">
+          <div class="list-parchment perks-list">
+            <div class="list-header"><span>NAME</span><span class="col-right"><span>LEVEL</span><span>STATUS</span></span></div>
+            <div class="list-scroll">
+              <div class="list-divider">Main Level</div>
+              <div class="list-row"><div class="perk-glyph"></div><span class="list-row__name">Charming Man</span><div class="list-row__cols"><span>1</span><span>—</span></div></div>
+              <div class="list-row"><div class="perk-glyph"></div><span class="list-row__name">Driven by Vengeance</span><div class="list-row__cols"><span>3</span><span>—</span></div></div>
+              <div class="list-row"><div class="perk-glyph"></div><span class="list-row__name">Martin's Heritage</span><div class="list-row__cols"><span>4</span><span>—</span></div></div>
+              <div class="list-row"><div class="perk-glyph"></div><span class="list-row__name">Memorable</span><div class="list-row__cols"><span>5</span><span>Owned</span></div></div>
+              <div class="list-row selected"><div class="perk-glyph"></div><span class="list-row__name">Undaunted Cavalier</span><div class="list-row__cols"><span>6</span><span>Owned</span></div></div>
+              <div class="list-row locked"><div class="perk-glyph locked"></div><span class="list-row__name">Burgher</span><div class="list-row__cols"><span>8</span><span>Locked</span></div></div>
+              <div class="list-row locked"><div class="perk-glyph locked"></div><span class="list-row__name">Local Hero</span><div class="list-row__cols"><span>10</span><span>Locked</span></div></div>
+              <div class="list-divider">Blade</div>
+              <div class="list-row"><div class="perk-glyph"></div><span class="list-row__name">Quick Hands</span><div class="list-row__cols"><span>2</span><span>Owned</span></div></div>
+              <div class="list-row locked"><div class="perk-glyph locked"></div><span class="list-row__name">Blood of Siegfried</span><div class="list-row__cols"><span>12</span><span>Locked</span></div></div>
+            </div>
+          </div>
+
+          <div class="perks-detail">
+            <h4>Undaunted Cavalier</h4>
+            <div class="req">MAIN LEVEL · MIN. LV 6</div>
+            <p>Looking like an intrepid hero of legends is the first step to performing heroic deeds. And that's the first step to entering into legend.</p>
+            <p class="flavor">If your Charisma is higher than 20, your armour will be considered 15 higher.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========= REPUTATION ========= -->
+      <div class="player-page" data-page="reputation">
+        <div class="list-parchment" style="flex:1;">
+          <div class="list-header"><span>FACTION</span><span class="col-right"><span>STANDING</span><span>VALUE</span></span></div>
+          <div class="list-scroll">
+            <div class="rep-row friendly"><div class="name"><div class="seal"></div>Aldenholt Guard</div><div class="bar"><div class="center"></div><div class="fill" style="left:50%; width:34%"></div></div><div class="num">+68</div></div>
+            <div class="rep-row"><div class="name"><div class="seal"></div>The Wayfarers</div><div class="bar"><div class="center"></div><div class="fill" style="left:50%; width:18%"></div></div><div class="num">+36</div></div>
+            <div class="rep-row"><div class="name"><div class="seal"></div>House Mira-Thal</div><div class="bar"><div class="center"></div><div class="fill" style="left:50%; width:12%"></div></div><div class="num">+24</div></div>
+            <div class="rep-row"><div class="name"><div class="seal"></div>Brothers' End Miners</div><div class="bar"><div class="center"></div><div class="fill" style="right:50%; left:auto; width:8%; background:linear-gradient(180deg, var(--hp-bright), var(--hp-deep))"></div></div><div class="num">−16</div></div>
+            <div class="rep-row hostile"><div class="name"><div class="seal"></div>The Drun Cult</div><div class="bar"><div class="center"></div><div class="fill" style="right:50%; left:auto; width:42%"></div></div><div class="num">−84</div></div>
+            <div class="rep-row"><div class="name"><div class="seal"></div>Hollowford Merchants</div><div class="bar"><div class="center"></div><div class="fill" style="left:50%; width:6%"></div></div><div class="num">+12</div></div>
+            <div class="rep-row"><div class="name"><div class="seal"></div>Wardens of the Spires</div><div class="bar"><div class="center"></div><div class="fill" style="left:50%; width:0%"></div></div><div class="num">0</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ========= action bar ========= -->
+      <div class="action-bar">
+        <span class="action"><kbd>E</kbd>Spend point</span>
+        <span class="action"><kbd>F</kbd>Compare</span>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // sub-tab switching
+  const ctxLabel = null; // context label removed; kept for back-compat
+  document.querySelectorAll('.sub-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      const page = tab.dataset.page;
+      document.querySelectorAll('.sub-tab').forEach(t => t.classList.toggle('active', t === tab));
+      document.querySelectorAll('.player-page').forEach(p => p.classList.toggle('active', p.dataset.page === page));
+      if (ctxLabel) ctxLabel.textContent = tab.querySelector('.sub-tab__label').textContent;
+    });
+  });
+  // skill discipline switching
+  document.querySelectorAll('.sk-class-item').forEach(c => {
+    c.addEventListener('click', () => {
+      document.querySelectorAll('.sk-class-item').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+    });
+  });
+  // skill node selection
+  document.querySelectorAll('.sk-node').forEach(n => {
+    n.addEventListener('click', () => {
+      if (n.classList.contains('locked')) return;
+      document.querySelectorAll('.sk-node').forEach(x => x.classList.remove('selected'));
+      n.classList.add('selected');
+    });
+  });
+  // perk row selection
+  document.querySelectorAll('.perks-list .list-row').forEach(row => {
+    row.addEventListener('click', () => {
+      if (row.classList.contains('locked')) return;
+      document.querySelectorAll('.perks-list .list-row').forEach(r => r.classList.remove('selected'));
+      row.classList.add('selected');
+    });
+  });
+</script>
+</body>
+</html>

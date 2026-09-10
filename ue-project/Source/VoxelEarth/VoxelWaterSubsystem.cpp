@@ -1,5 +1,7 @@
 #include "VoxelWaterSubsystem.h"
 #include "VoxelSessionCheckpoint.h"
+#include "Tasks/Task.h"        // the lake tier's async tile load (2026-09-09)
+#include "Containers/Queue.h"
 #include "VoxelSaveLibrary.h"
 
 #include "VoxelDebug.h"
@@ -259,7 +261,7 @@ static TAutoConsoleVariable<float> CVarVoxelWaterCaustics(
 	TEXT("voxel.Water.Caustics"), 0.5f,
 	TEXT("F1 caustic intensity, pushed to MPC_VoxelSky.CausticIntensity each tick. 0 zeroes the caustic ")
 	TEXT("term in every consumer (terrain, clipmap, underwater) -- one switch, pixel-identical off (a ")
-	TEXT("zeroed uniform, not a shader permutation). Default 1."),
+	TEXT("zeroed uniform, not a shader permutation). Default 0.5."),
 	ECVF_Default);
 static TAutoConsoleVariable<float> CVarVoxelWaterFoamV2(
 	TEXT("voxel.Water.FoamV2"), 1.0f,
@@ -854,6 +856,157 @@ public:
 		return Both.basinAtVoxel(vx, vy, outTx, outTy, outId);
 	}
 
+	// --- THE ASYNC ARM (2026-09-09) ------------------------------------------
+	//
+	// Why: on a QUIET box the first lake-sheet gather ran 13.6 s on the game
+	// thread under the loading curtain (tile (-4,-3) alone 11,267 ms, its file
+	// contended with the streamer's own async read of it; the cache-warm tiles
+	// still cost 384 ms each) -- Saved/loading-leg1-quiet-box.log. EnsureTile
+	// below is that synchronous load: a private sampler reading the whole .vxtl
+	// on the caller's thread. This arm reads AND fully decodes into a private
+	// FineTileSampler on a worker and hands the tile over with adoptWarmTile,
+	// the same shape as FVoxelFineTileStreamer's async load
+	// (VoxelFineTileStreamer.h, "THE ASYNC ARM"). The worker touches nothing of
+	// this object: it captures plain values and a shared queue.
+	//
+	// Contract: RequestTileAsync is game-thread only and answers kReady when the
+	// tile is already in `Tiles`, kAbsent when a previous load memoised it as
+	// missing/refused, kPending otherwise (launching once per tile). PumpAsync
+	// adopts finished tiles and must run every game tick. EnsureTile stays the
+	// synchronous fallback for every other query path, so a caller that never
+	// asks async is byte-identical to before.
+public:
+	enum class ETileReady : uint8 { kReady, kPending, kAbsent };
+	ETileReady RequestTileAsync(int32 Tx, int32 Ty)
+	{
+		check(IsInGameThread());
+		if (Tiles.findTile(Tx, Ty) != nullptr)
+		{
+			return ETileReady::kReady;
+		}
+		const uint64 Key = (uint64(uint32(Tx)) << 32) | uint64(uint32(Ty));
+		if (Missing.Contains(Key))
+		{
+			return ETileReady::kAbsent;
+		}
+		if (AsyncInFlight.Contains(Key))
+		{
+			return ETileReady::kPending;
+		}
+		if (!AsyncShared.IsValid())
+		{
+			AsyncShared = MakeShared<FAsyncShared, ESPMode::ThreadSafe>();
+		}
+		AsyncInFlight.Add(Key);
+		const std::string CacheKey = vxc::formatFineTileCacheKey(ProviderId, Tiles.seed(), Tx, Ty);
+		const FString Path = FPaths::Combine(Root, FString(CacheKey.c_str()) + TEXT(".vxtl"));
+		const uint64 Seed = Tiles.seed();
+		const vxc::FineDecompressor Decompressor = VoxelEarth::GetFineTileDecompressor();
+		TSharedPtr<FAsyncShared, ESPMode::ThreadSafe> Shared = AsyncShared;
+		UE::Tasks::Launch(TEXT("VoxelLakeTileLoad"),
+			[Shared, Path, Seed, Decompressor, Tx, Ty]()
+			{
+				TUniquePtr<FAsyncTile> R = MakeUnique<FAsyncTile>();
+				R->Tx = Tx;
+				R->Ty = Ty;
+				R->Path = Path;
+				const double T0 = FPlatformTime::Seconds();
+				R->Warm = std::make_unique<vxc::FineTileSampler>(Seed);
+				R->Warm->setDecompressor(Decompressor);
+				R->bLoaded = R->Warm->loadTileFile(std::filesystem::path(*Path), &R->Err);
+				R->ReadMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+				if (R->bLoaded)
+				{
+					// adoptWarmTile refuses a half-warm tile (kNotFullyDecoded),
+					// and a fully decoded tile is what makes the later mask
+					// builds pure reads instead of game-thread decodes.
+					const int64 Size = int64(R->Warm->tileSize());
+					const int64 Ox = int64(Tx) * Size, Oy = int64(Ty) * Size;
+					const double T1 = FPlatformTime::Seconds();
+					R->bLoaded = Size > 0 && R->Warm->prewarm(Ox, Oy, Ox + Size - 1, Oy + Size - 1);
+					R->DecodeMs = (FPlatformTime::Seconds() - T1) * 1000.0;
+				}
+				if (Shared->bAccepting.load(std::memory_order_acquire))
+				{
+					Shared->Done.Enqueue(MoveTemp(R));
+				}
+			},
+			LowLevelTasks::ETaskPriority::BackgroundNormal);
+		return ETileReady::kPending;
+	}
+	void PumpAsync()
+	{
+		check(IsInGameThread());
+		if (!AsyncShared.IsValid())
+		{
+			return;
+		}
+		TUniquePtr<FAsyncTile> R;
+		while (AsyncShared->Done.Dequeue(R))
+		{
+			const uint64 Key = (uint64(uint32(R->Tx)) << 32) | uint64(uint32(R->Ty));
+			AsyncInFlight.Remove(Key);
+			if (!R->bLoaded)
+			{
+				Missing.Add(Key);
+				if (R->Err != vxc::FineError::kFileUnreadable)
+				{
+					++Refused;
+					UE_LOG(LogVoxelEarth, Warning,
+					       TEXT("Lake tier: fine tile (%d,%d) at %s was REFUSED (%s) on the async load. Its lakes will be absent."),
+					       R->Tx, R->Ty, *R->Path, ANSI_TO_TCHAR(vxc::fineErrorName(R->Err)));
+				}
+				continue;
+			}
+			if (Tiles.findTile(R->Tx, R->Ty) != nullptr)
+			{
+				continue; // a synchronous query loaded it meanwhile; the warm copy is dropped
+			}
+			const double T0 = FPlatformTime::Seconds();
+			const vxc::FineAdoptResult Adopt = Tiles.adoptWarmTile(*R->Warm, R->Tx, R->Ty);
+			if (Adopt != vxc::FineAdoptResult::kOk)
+			{
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("Lake tier: fine tile (%d,%d) async load could not be adopted (result %d); the next query loads it synchronously."),
+				       R->Tx, R->Ty, int32(Adopt));
+				continue;
+			}
+			++Loaded;
+			++AsyncAdopted;
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake tier: fine tile (%d,%d) loaded ASYNC: read %.0f ms + full decode %.0f ms OFF the game thread, adopt %.2f ms on it (async adopted so far %llu)."),
+			       R->Tx, R->Ty, R->ReadMs, R->DecodeMs, (FPlatformTime::Seconds() - T0) * 1000.0,
+			       (unsigned long long)AsyncAdopted);
+		}
+	}
+	~FLakeWaterSampler() override
+	{
+		if (AsyncShared.IsValid())
+		{
+			// Workers still running hold only the shared queue; they see the
+			// closed gate and drop their result.
+			AsyncShared->bAccepting.store(false, std::memory_order_release);
+		}
+	}
+private:
+	struct FAsyncTile
+	{
+		int32 Tx = 0, Ty = 0;
+		bool bLoaded = false;
+		vxc::FineError Err = vxc::FineError::kNone;
+		std::unique_ptr<vxc::FineTileSampler> Warm;
+		FString Path;
+		double ReadMs = 0.0, DecodeMs = 0.0;
+	};
+	struct FAsyncShared
+	{
+		std::atomic<bool> bAccepting{true};
+		TQueue<TUniquePtr<FAsyncTile>, EQueueMode::Mpsc> Done;
+	};
+	TSharedPtr<FAsyncShared, ESPMode::ThreadSafe> AsyncShared;
+	TSet<uint64> AsyncInFlight;
+	uint64 AsyncAdopted = 0;
+
 private:
 	// Loads the fine tile under this voxel column if it is not already
 	// resident. A tile that is absent or refused is remembered, so a world
@@ -921,8 +1074,9 @@ private:
 // subsystem; the rule is three lines and the ini keys are the same two
 // strings, and a divergence shows up immediately as "terrain is fine, water
 // says there are no lakes".
-std::unique_ptr<vxc::IWaterSampler> MakeWaterSampler(uint64 Seed)
+std::unique_ptr<vxc::IWaterSampler> MakeWaterSampler(uint64 Seed, FLakeWaterSampler** OutLake)
 {
+	if (OutLake) { *OutLake = nullptr; }
 	FString Dir;
 	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileDir="), Dir) && GConfig)
 	{
@@ -952,7 +1106,9 @@ std::unique_ptr<vxc::IWaterSampler> MakeWaterSampler(uint64 Seed)
 	            "table (bake_ver 8) and rivers from the water plane (bake_ver 9); a tile baked "
 	            "before either carries it not, and answers dry for that half alone."),
 	       *Dir, *ProviderId, (unsigned long long)Seed);
-	return std::make_unique<FLakeWaterSampler>(Seed, Dir, std::string(TCHAR_TO_UTF8(*ProviderId)));
+	std::unique_ptr<FLakeWaterSampler> Lake = std::make_unique<FLakeWaterSampler>(Seed, Dir, std::string(TCHAR_TO_UTF8(*ProviderId)));
+	if (OutLake) { *OutLake = Lake.get(); }
+	return Lake;
 }
 
 // FVoxelWaterImpl -- the voxel-core side of the subsystem, defined only here
@@ -1020,7 +1176,7 @@ struct FVoxelWaterImpl
 		: Terrain(InTerrain)
 		, Tiles(InTerrain.GetSeed())
 		, Amp(InTerrain.GetSeed(), Tiles)
-		, Water(MakeWaterSampler(InTerrain.GetSeed()))
+		, Water(MakeWaterSampler(InTerrain.GetSeed(), &LakeSampler))
 		, Mob(
 			  // The implicit static flood field (C7, docs/cavern-design.md SS5.1):
 			  // worldgen-owned, deterministic, ZERO storage. caverns.h's
@@ -1448,6 +1604,12 @@ struct FVoxelWaterImpl
 	//
 	// MUST be declared before Mob: the ImplicitFn captures `this` and
 	// dereferences this member on every voxel it is asked about.
+	// Non-owning view of `Water` when it is the baked lake tier, for the async tile
+	// arm (RequestTileAsync/PumpAsync). Null for the Null sampler. DECLARED BEFORE
+	// Water on purpose: MakeWaterSampler writes it through an out-param while Water
+	// is being initialised, and a member declared after Water would be reset by its
+	// own default initializer afterwards.
+	FLakeWaterSampler* LakeSampler = nullptr;
 	std::unique_ptr<vxc::IWaterSampler> Water;
 
 	// DEBUG WATER MARKER (-VoxelWaterMarker=1). `Water` above is documented
@@ -7264,6 +7426,13 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 	{
 		return;
 	}
+	// Adopt lake tiles that finished on a worker (the async arm). Before the menu
+	// hold below on purpose: adopting is O(1) and a tile that landed during the
+	// curtain should be resident the tick the gather asks for it.
+	if (Impl->LakeSampler)
+	{
+		Impl->LakeSampler->PumpAsync();
+	}
 
 	// THE MENU HOLDS THE WORLD, AND THAT HAS TO INCLUDE THIS SUBSYSTEM.
 	//
@@ -7755,7 +7924,8 @@ void UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared(const TArray<VoxelCoords::
 }
 
 void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCoord& MinVoxelIncl,
-                                                       const VoxelCoords::FVoxelCoord& MaxVoxelIncl)
+                                                       const VoxelCoords::FVoxelCoord& MaxVoxelIncl,
+                                                       const TCHAR* EditSource)
 {
 	if (!Impl)
 	{
@@ -7822,9 +7992,9 @@ void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCo
 	{
 		MarkMobilizedBricksDirty(*Impl);
 		UE_LOG(LogVoxelWater, Log,
-		       TEXT("Mobilized %d cavern water brick(s) on edit [%d,%d,%d]..[%d,%d,%d] (implicit -> CA; ledger %llu debited / %llu credited, shortfall %llu)"),
+		       TEXT("Mobilized %d cavern water brick(s) on edit [%d,%d,%d]..[%d,%d,%d] source=%s (implicit -> CA; ledger %llu debited / %llu credited, shortfall %llu)"),
 		       static_cast<int32>(Converted), MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X,
-		       MaxVoxelIncl.Y, MaxVoxelIncl.Z, (unsigned long long)Impl->Mob.debitedVolume(),
+		       MaxVoxelIncl.Y, MaxVoxelIncl.Z, EditSource, (unsigned long long)Impl->Mob.debitedVolume(),
 		       (unsigned long long)Impl->Mob.creditedVolume(), (unsigned long long)Impl->Mob.shortfallVolume());
 	}
 
@@ -7833,9 +8003,9 @@ void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCo
 	if (Woken > 0)
 	{
 		UE_LOG(LogVoxelWater, Verbose,
-		       TEXT("NotifyTerrainRegionEdited: woke %d water brick(s) for edit [%d,%d,%d]..[%d,%d,%d]"),
+		       TEXT("NotifyTerrainRegionEdited: woke %d water brick(s) for edit [%d,%d,%d]..[%d,%d,%d] source=%s"),
 		       static_cast<int32>(Woken), MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X,
-		       MaxVoxelIncl.Y, MaxVoxelIncl.Z);
+		       MaxVoxelIncl.Y, MaxVoxelIncl.Z, EditSource);
 	}
 }
 
@@ -8665,6 +8835,26 @@ void UVoxelWaterSubsystem::FineTileForWorldUU(double XUU, double YUU, int32& Out
 		FVoxelFineTileStreamer::CoarseTileForWorldMm(VoxelCoords::WorldToMm(XUU), VoxelCoords::WorldToMm(YUU));
 	OutTileX = T.x;
 	OutTileY = T.y;
+}
+
+bool UVoxelWaterSubsystem::IsLakeTileReadyForGather(int32 TileX, int32 TileY)
+{
+	check(IsInGameThread());
+	if (!Impl || !Impl->LakeSampler)
+	{
+		return true; // no lake tier: the gather answers "no basins" without touching disk
+	}
+	// The streamer's ring first. Its async workers are reading the same files;
+	// on the quiet-box leg the lake tier's own read of a tile the streamer was
+	// mid-read on took 11.3 s (disc contention on the HDD). Once the ring has
+	// settled the file is cache-warm and the worker below finishes in well
+	// under a second. A world with no fine tier answers settled.
+	int32 Settled = 0, Ring = 0;
+	if (!Impl->Terrain.IsFineRingSettled(Settled, Ring))
+	{
+		return false;
+	}
+	return Impl->LakeSampler->RequestTileAsync(TileX, TileY) != FLakeWaterSampler::ETileReady::kPending;
 }
 
 int32 UVoxelWaterSubsystem::GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY, double CenterXUU,

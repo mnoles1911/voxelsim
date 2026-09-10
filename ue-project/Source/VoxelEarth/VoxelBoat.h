@@ -10,6 +10,7 @@
 
 class APlayerController;
 class UCameraComponent;
+class UMaterialParameterCollection;
 class UStaticMeshComponent;
 namespace VoxelGameplayActors { struct FAdapter; }
 
@@ -93,6 +94,16 @@ namespace VoxelGameplayActors { struct FAdapter; }
 // for what the field is for and it is not a bug to be found again in six weeks.
 // ============================================================================
 
+// One water-exclusion station's plan footprint in the hull's frame: its centre
+// along the keel line and its half-extents there. Outside the UCLASS because it
+// carries no reflection and UHT has no business parsing it.
+struct FVoxelBoatExclusionStation
+{
+	double LocalX = 0.0;
+	double HalfLenUU = 0.0;
+	double HalfBeamUU = 0.0;
+};
+
 UCLASS()
 class VOXELEARTH_API AVoxelBoat : public APawn
 {
@@ -173,6 +184,16 @@ private:
 	void AdoptHullFromBody();
 
 	void TickBuoyancy(float DeltaSeconds);
+	// The water-exclusion mask's per-tick solve (mechanism in the .cpp): the
+	// stations are placed against the DRAWN water surface in world space, not
+	// against the hull, because WaveBobGain moves the hull several times as far
+	// as the surface the pixels show.
+	void UpdateWaterExclusion();
+	// The hull's plan ellipse, pushed through MPC_VoxelSky so both water
+	// materials zero the ripple WPO and the disturbance foam INSIDE the hull
+	// (mechanism: Tools/water_hull_mask_graph.py, the second half of "the
+	// cockpit is dry"). `bEnabled` false pushes the off encoding.
+	void PushHullRippleMask(bool bEnabled);
 	void TickDrive(float DeltaSeconds);
 	void TickGround(float DeltaSeconds);
 	void TickWake(float DeltaSeconds);
@@ -197,26 +218,28 @@ private:
 	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Boat")
 	TObjectPtr<UVoxelAssetBodyComponent> Body;
 
-	// The hull WATER-EXCLUSION volume (owner directive 2026-09-05: "the water
-	// should be masked and not filling the boat"). A closed, outward-facing
-	// box enclosing the water-free interior, rendered into CUSTOM DEPTH +
-	// CUSTOM STENCIL only (never the main pass, never the scene depth prepass,
-	// no collision, no shadow); the water materials discard pixels behind its
-	// near shell within a bounded band. THE CONTRACT IS PINNED in
+	// The hull WATER-EXCLUSION mask (owner directive 2026-09-05: "the water
+	// should be masked and not filling the boat"), as a ROW OF STATIONS along
+	// the hull rather than one or two hull-fixed boxes -- see
+	// UpdateWaterExclusion for why the shape and the placement are what they
+	// are. Each station is a closed, outward-facing box rendered into CUSTOM
+	// DEPTH + CUSTOM STENCIL only (never the main pass, never the scene depth
+	// prepass, no collision, no shadow); the water materials discard pixels
+	// behind the near shell within a bounded band. THE CONTRACT IS PINNED in
 	// Tools/water_hull_mask_graph.py's docstring, which is also the registry
-	// of stencil bit 0 = "water exclusion" -- this component writes stencil
-	// value 1 and nothing else. Sized in BeginPlay from the adopted hull
-	// geometry. Inert (safe direction) until r.CustomDepth=3 is set in config
-	// and the regenerated materials carry the mask term.
+	// of stencil bit 0 = "water exclusion" -- these components write stencil
+	// value 1 and nothing else. Plan footprint fixed in BeginPlay from the
+	// adopted hull geometry; vertical placement re-solved every tick. Inert
+	// (safe direction) until r.CustomDepth=3 is set in config and the
+	// regenerated materials carry the mask term.
 	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Boat")
-	TObjectPtr<UStaticMeshComponent> ExclusionVolume;
+	TArray<TObjectPtr<UStaticMeshComponent>> ExclusionStations;
 
-	// Second exclusion box for the bow/stern (2026-09-06, owner: water clipping
-	// through the cockpit ENDS once WaveBobGain 6.0 landed). Long and narrow so
-	// it stays inside the hull taper where the midship box cannot reach; same
-	// stencil bit, same render flags, sized beside the first in BeginPlay.
-	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Boat")
-	TObjectPtr<UStaticMeshComponent> ExclusionVolumeEnds;
+	// Per-station plan footprint in the HULL's frame, solved once in BeginPlay
+	// (see FVoxelBoatExclusionStation). Kept beside the components so the
+	// per-tick update is arithmetic on numbers rather than a re-read of the
+	// component transforms it is itself writing.
+	TArray<FVoxelBoatExclusionStation> ExclusionPlan;
 
 	// Camera arm: yaw/pitch relative to the HULL, not to the world. Looking
 	// around does not steer, and steering does not swing the camera -- the two
@@ -268,6 +291,17 @@ private:
 
 	bool bAsleep = false;
 	bool bGrounded = false;
+
+	// PushHullRippleMask's state: the collection (looked up once in BeginPlay,
+	// checked for the two parameter names once, so a stale MPC costs one log
+	// line rather than one engine warning per tick), a log-once latch for the
+	// engagement line, and whether the last push was the off encoding (so a
+	// sleeping or dying boat pushes it exactly once).
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialParameterCollection> HullRippleMaskCollection;
+	bool bHullRippleMaskMpcOk = false;
+	bool bHullRippleMaskLogged = false;
+	bool bHullRippleMaskPushedOff = true;
 
 	uint64 ProbeQueries = 0;
 	uint64 ProbesWet = 0;

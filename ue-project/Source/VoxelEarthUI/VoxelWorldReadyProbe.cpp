@@ -39,13 +39,15 @@ void FVoxelWorldReadyProbe::Start(const FVector& AnchorUU, const FVoxelReadyProb
 	Status = FVoxelReadyProbeStatus();
 	Status.ProbeTotal = Config.ProbeRadiiMeters.Num() * Config.ProbeDirectionCount;
 	PollAccumulator = 0.f;
+	WallStartSeconds = FPlatformTime::Seconds();
 	bStarted = true;
 
 	UE_LOG(LogVoxelUI, Log,
-	       TEXT("VoxelLoadGate: started at (%.0f, %.0f) UU -- %d probes, rings R0..R%d, %d good sample(s) at %.1fs, ")
-	       TEXT("max wait %.0fs."),
-	       Anchor.X, Anchor.Y, Status.ProbeTotal, Config.GateMaxRingLevel, Config.RequiredGoodSamples,
-	       Config.PollIntervalSeconds, Config.MaxWaitSeconds);
+	       TEXT("VoxelLoadGate: started at (%.0f, %.0f) UU -- %d probes, rings R0..R%d, fineRing gate %s, ")
+	       TEXT("%d good sample(s) at %.1fs, max wait %.0fs."),
+	       Anchor.X, Anchor.Y, Status.ProbeTotal, Config.GateMaxRingLevel,
+	       Config.bRequireFineRing ? TEXT("ON") : TEXT("OFF (-VoxelLoadGateFineRing=0)"),
+	       Config.RequiredGoodSamples, Config.PollIntervalSeconds, Config.MaxWaitSeconds);
 }
 
 void FVoxelWorldReadyProbe::Tick(float DeltaSeconds, const UVoxelWorldSubsystem& World)
@@ -54,7 +56,19 @@ void FVoxelWorldReadyProbe::Tick(float DeltaSeconds, const UVoxelWorldSubsystem&
 	{
 		return;
 	}
-	Status.ElapsedSeconds += DeltaSeconds;
+	// WALL CLOCK, NOT THE TICK CLOCK (2026-09-08 live session, log at
+	// docs/evidence/2026-09-08-live-session3-loading-loop-VoxelEarth.log).
+	// This used to accumulate DeltaSeconds, which the world clamps to 0.4 s per
+	// frame. A 166 s shader-compile frame, a 154 s fine-tile join and a 38 s
+	// stall each counted as 0.4 s, so after 539 wall seconds the probe believed
+	// ~180 s had passed, never reached MaxWaitSeconds (300), and the curtain sat
+	// on an animating hourglass until the owner closed the window. The theatre
+	// and the reveal test moved to the wall clock on 2026-09-07 for the same
+	// reason; this is the same defect one layer down. The poll rate limit below
+	// stays on the tick clock on purpose: it bounds per-frame cost, not time.
+	Status.ElapsedSeconds = WallStartSeconds > 0.0
+	                            ? float(FPlatformTime::Seconds() - WallStartSeconds)
+	                            : Status.ElapsedSeconds + DeltaSeconds;
 
 	// RATE LIMITED, and not for tidiness. Each poll fills
 	// FVoxelStreamingProgress, which walks every chunk record -- 39,020 of them
@@ -77,10 +91,12 @@ void FVoxelWorldReadyProbe::Tick(float DeltaSeconds, const UVoxelWorldSubsystem&
 		// to lift on a world that never reported itself ready, and in a
 		// headless run the log line is the only witness.
 		UE_LOG(LogVoxelUI, Warning,
-		       TEXT("VoxelLoadGate: TIMED OUT after %.1fs -- hits %d/%d, pending %d, jobs %d on R0..R%d. ")
-		       TEXT("Lifting the curtain anyway."),
+		       TEXT("VoxelLoadGate: TIMED OUT after %.1fs wall -- hits %d/%d, pending %d, jobs %d on R0..R%d, ")
+		       TEXT("fineRing=%d/%d (%s). Lifting the curtain anyway."),
 		       Status.ElapsedSeconds, Status.ProbeHits, Status.ProbeTotal, Status.PendingInGate, Status.JobsInGate,
-		       Config.GateMaxRingLevel);
+		       Config.GateMaxRingLevel, Status.FineRingSettled, Status.FineRingTotal,
+		       Config.bRequireFineRing ? (Status.bFineRingOk ? TEXT("settled") : TEXT("NOT settled"))
+		                               : TEXT("gate off"));
 	}
 }
 
@@ -138,10 +154,17 @@ void FVoxelWorldReadyProbe::Poll(const UVoxelWorldSubsystem& World)
 	Status.JobsInGate = Jobs;
 	Status.RingFillFraction = WeightTotal > 0.f ? WeightedFill / WeightTotal : 0.f;
 
-	// --- Both gates, sustained ----------------------------------------------
+	// --- Gate 3: has the fine tier's prefetch ring settled? -----------------
+	// Polled whether or not it is required, so the t= line always shows n/m
+	// and a control leg (-VoxelLoadGateFineRing=0) can be read for what the
+	// gate WOULD have said. True with no fine tier at all.
+	Status.bFineRingOk = World.IsFineRingSettled(Status.FineRingSettled, Status.FineRingTotal);
+	const bool bFineRingOk = !Config.bRequireFineRing || Status.bFineRingOk;
+
+	// --- All gates, sustained -----------------------------------------------
 	const bool bSpatialOk = (Status.ProbeTotal > 0) && (Hits >= Status.ProbeTotal);
 	const bool bStreamerIdle = Progress.bSessionStarted && Pending == 0 && Jobs == 0;
-	if (bSpatialOk && bStreamerIdle)
+	if (bSpatialOk && bStreamerIdle && bFineRingOk)
 	{
 		++Status.ConsecutiveGood;
 	}
@@ -158,16 +181,20 @@ void FVoxelWorldReadyProbe::Poll(const UVoxelWorldSubsystem& World)
 	if (Status.ConsecutiveGood >= Config.RequiredGoodSamples)
 	{
 		Status.bReady = true;
-		UE_LOG(LogVoxelUI, Log, TEXT("VoxelLoadGate: READY after %.2fs (hits %d/%d, %d chunk(s) tracked)."),
-		       Status.ElapsedSeconds, Hits, Status.ProbeTotal, Progress.TrackedChunks);
+		UE_LOG(LogVoxelUI, Log,
+		       TEXT("VoxelLoadGate: READY after %.2fs wall (hits %d/%d, %d chunk(s) tracked, fineRing=%d/%d)."),
+		       Status.ElapsedSeconds, Hits, Status.ProbeTotal, Progress.TrackedChunks, Status.FineRingSettled,
+		       Status.FineRingTotal);
 		return;
 	}
 
 	if (FVoxelFrontEndSwitches::Get().bReadyProbeLog)
 	{
 		UE_LOG(LogVoxelUI, Log,
-		       TEXT("VoxelLoadGate: t=%.1fs hits=%d/%d pending(R0..R%d)=%d jobs=%d fill=%.2f consec=%d/%d poll=%.2fms"),
+		       TEXT("VoxelLoadGate: t=%.1fs hits=%d/%d pending(R0..R%d)=%d jobs=%d fill=%.2f fineRing=%d/%d ")
+		       TEXT("consec=%d/%d poll=%.2fms"),
 		       Status.ElapsedSeconds, Hits, Status.ProbeTotal, MaxRing, Pending, Jobs, Status.RingFillFraction,
-		       Status.ConsecutiveGood, Config.RequiredGoodSamples, Status.LastPollMs);
+		       Status.FineRingSettled, Status.FineRingTotal, Status.ConsecutiveGood, Config.RequiredGoodSamples,
+		       Status.LastPollMs);
 	}
 }

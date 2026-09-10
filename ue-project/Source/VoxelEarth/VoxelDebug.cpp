@@ -405,6 +405,17 @@ TAutoConsoleVariable<float> CVarVoxelStreamApplyBudgetMs(
 	TEXT("pacing at the cost of slower fill; raise it to fill harder."),
 	ECVF_Default);
 
+TAutoConsoleVariable<float> CVarVoxelStreamDispatchBudgetMs(
+	TEXT("voxel.Stream.DispatchBudgetMs"),
+	0.0f,
+	TEXT("Max WALL-CLOCK milliseconds FVoxelWorldImpl::DispatchJobs may spend in its dispatch loop per tick; 0 = unbounded ")
+	TEXT("(the shipped behaviour). 2026-09-09 Insights trace of a quiet-box load (Saved/loading-leg7.utrace): three single ")
+	TEXT("DispatchJobs calls of 6.2, 8.8 and 9.1 s under the loading curtain, ~1300 loop iterations at 5-7 ms each, all ")
+	TEXT("inside the per-chunk submit. The loop had no time bound: its CPU in-flight cap is bypassed by the GPU fork and ")
+	TEXT("the queue only runs dry. The loading theatre sets this (kTheatreDispatchBudgetMs) and restores 0 at the reveal; ")
+	TEXT("a budget exit is counted as exitBudget= on the dispatch loop window line so the exit census still sums."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
 	TEXT("voxel.Stream.LodRetentionMs"),
 	10000.0f,
@@ -1674,6 +1685,11 @@ int32 VoxelDebug::GetStreamApplyStormBacklog()
 int32 VoxelDebug::GetStreamMaxAppliesPerFrameCvar()
 {
 	return FMath::Max(1, CVarVoxelStreamMaxAppliesPerFrame.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamDispatchBudgetMs()
+{
+	return FMath::Max(0.f, CVarVoxelStreamDispatchBudgetMs.GetValueOnGameThread());
 }
 
 float VoxelDebug::GetStreamApplyBudgetMsCvar()

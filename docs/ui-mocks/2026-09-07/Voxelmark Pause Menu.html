@@ -1,0 +1,258 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Pause Menu" subtitle="In-game pause panel — day and season footer" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Pause Menu</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  body{font-family:var(--hand);color:var(--parchment);background:#000;overflow:hidden;user-select:none}
+  a{color:var(--warm-highlight);text-decoration:none}a:hover{color:var(--parchment)}
+
+  /* faux paused gameworld behind the menu */
+  .bg{
+    position:absolute;inset:0;
+    background:url("assets/menu_backgrounds/cave_background1.jpg") center/cover no-repeat;
+    filter:blur(8px) brightness(0.35) saturate(0.6);
+  }
+  .vignette{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 200px rgba(0,0,0,0.6)}
+  .grain{position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg, rgba(255,180,80,0.015) 0 1px, transparent 1px 3px);mix-blend-mode:overlay}
+
+  .panel-state{display:none}
+  .panel-state.on{display:block}
+
+  /* ============ MAIN PAUSE PANEL ============ */
+  .pa-panel{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%) scale(0.7);transform-origin:center center;
+    width:380px;background:linear-gradient(180deg,rgba(28,18,10,0.95),rgba(14,8,4,0.98));
+    border:2px solid #000;
+    box-shadow:inset 0 0 0 1px var(--leather-edge),inset 0 0 0 3px var(--leather-1),0 8px 24px rgba(0,0,0,0.8);
+    padding:32px 28px;display:flex;flex-direction:column;gap:6px;
+  }
+  .pa-title{
+    font-family:var(--serif);font-size:34px;letter-spacing:6px;color:var(--warm-highlight);
+    text-align:center;text-shadow:2px 2px 0 #000;margin-bottom:6px;
+  }
+  .pa-rule{height:1px;background:var(--leather-edge);margin:4px 0 14px}
+  .pa-btn{
+    font-family:var(--serif);font-size:22px;letter-spacing:3px;color:var(--parchment);
+    background:transparent;border:none;cursor:pointer;padding:10px 0;
+    text-align:left;display:flex;align-items:center;gap:14px;
+    border-bottom:1px solid rgba(90,56,24,0.3);
+  }
+  .pa-btn::before{content:"›";color:var(--warm-secondary);font-size:24px;transition:transform .15s,color .15s}
+  .pa-btn:hover{color:var(--warm-highlight)}
+  .pa-btn:hover::before{transform:translateX(4px);color:var(--warm-highlight)}
+  .pa-btn.disabled{color:rgba(230,213,168,0.25);cursor:not-allowed}
+  .pa-btn.disabled::before{color:rgba(90,56,24,0.4)}
+  .pa-btn.disabled:hover{color:rgba(230,213,168,0.25)}
+  .pa-btn.disabled:hover::before{transform:none;color:rgba(90,56,24,0.4)}
+  .pa-btn.danger{color:rgba(230,170,150,0.7)}
+  .pa-btn.danger:hover{color:#e8a090}
+  .pa-foot{
+    font-family:var(--hand);font-style:italic;font-size:13px;color:var(--ink-mute);
+    text-align:center;margin-top:14px;
+  }
+
+  /* ============ SAVE DIALOG ============ */
+  .sv-panel{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:520px;background:linear-gradient(180deg,rgba(28,18,10,0.95),rgba(14,8,4,0.98));
+    border:2px solid #000;
+    box-shadow:inset 0 0 0 1px var(--leather-edge),inset 0 0 0 3px var(--leather-1),0 8px 24px rgba(0,0,0,0.8);
+    padding:32px 32px;display:flex;flex-direction:column;gap:14px;
+  }
+  .sv-title{
+    font-family:var(--serif);font-size:24px;letter-spacing:5px;color:var(--warm-highlight);
+    text-align:center;text-shadow:2px 2px 0 #000;
+  }
+  .sv-prompt{
+    font-family:var(--hand);font-size:16px;color:rgba(230,213,168,0.75);
+    margin-top:6px;
+  }
+  .sv-input{
+    font-family:var(--hand);font-size:20px;color:var(--parchment-ink);
+    background:linear-gradient(180deg,var(--parchment),var(--parchment-2));
+    border:1px solid #000;
+    box-shadow:inset 0 0 0 1px var(--parchment-edge),inset 0 2px 4px rgba(0,0,0,0.15);
+    padding:10px 12px;outline:none;
+    font-style:italic;
+  }
+  .sv-input::selection{background:var(--warm-primary);color:#fff}
+  .sv-row{display:flex;gap:12px;justify-content:center;margin-top:12px}
+  .sv-row .pa-btn{
+    font-size:18px;text-align:center;justify-content:center;
+    border:1px solid var(--leather-edge);
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    padding:10px 28px;
+  }
+  .sv-row .pa-btn::before{display:none}
+
+  /* ============ LOAD PICKER ============ */
+  .ld-panel{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:680px;height:560px;
+    background:linear-gradient(180deg,rgba(28,18,10,0.95),rgba(14,8,4,0.98));
+    border:2px solid #000;
+    box-shadow:inset 0 0 0 1px var(--leather-edge),inset 0 0 0 3px var(--leather-1),0 8px 24px rgba(0,0,0,0.8);
+    padding:24px 28px;display:flex;flex-direction:column;gap:12px;
+  }
+  .ld-title{
+    font-family:var(--serif);font-size:24px;letter-spacing:5px;color:var(--warm-highlight);
+    text-align:center;text-shadow:2px 2px 0 #000;
+  }
+  .ld-list{
+    flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;
+    padding-right:6px;
+  }
+  .ld-list::-webkit-scrollbar{width:8px}
+  .ld-list::-webkit-scrollbar-track{background:rgba(0,0,0,0.3)}
+  .ld-list::-webkit-scrollbar-thumb{background:var(--leather-edge);border:1px solid #000}
+  .ld-row{
+    display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;
+    background:linear-gradient(180deg,rgba(58,36,18,0.6),rgba(28,18,10,0.6));
+    border:1px solid var(--leather-edge);
+    padding:10px 14px;
+  }
+  .ld-row.current{
+    border-color:var(--warm-primary);
+    box-shadow:inset 0 0 0 1px rgba(232,135,58,0.3);
+  }
+  .ld-info{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .ld-name{
+    font-family:var(--serif);font-size:18px;letter-spacing:2px;color:var(--warm-highlight);
+    text-shadow:1px 1px 0 #000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .ld-name.auto{color:rgba(230,213,168,0.6)}
+  .ld-name.auto::before{
+    content:"AUTO";display:inline-block;
+    font-size:9px;letter-spacing:2px;
+    background:var(--leather-2);color:var(--warm-highlight);
+    padding:2px 6px;margin-right:8px;
+    border:1px solid var(--leather-edge);vertical-align:2px;
+  }
+  .ld-meta{
+    font-family:var(--hand);font-style:italic;font-size:13px;color:rgba(230,213,168,0.55);
+    display:flex;gap:14px;
+  }
+  .ld-meta .coord{font-family:"Courier New",monospace;font-style:normal;letter-spacing:1px}
+  .ld-btn{
+    font-family:var(--serif);font-size:13px;letter-spacing:2px;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    color:var(--parchment);border:1px solid var(--leather-edge);
+    padding:8px 14px;cursor:pointer;
+  }
+  .ld-btn:hover{border-color:var(--warm-primary);color:var(--warm-highlight)}
+  .ld-btn.del{color:rgba(230,150,130,0.8)}
+  .ld-btn.del:hover{border-color:#e8a090;color:#e8a090}
+  .ld-empty{
+    flex:1;display:grid;place-items:center;
+    font-family:var(--hand);font-style:italic;font-size:16px;color:rgba(230,213,168,0.45);
+    text-align:center;
+  }
+  .ld-cancel{
+    font-family:var(--serif);font-size:18px;letter-spacing:3px;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    color:var(--parchment);border:1px solid var(--leather-edge);
+    padding:10px 0;cursor:pointer;
+    align-self:center;width:160px;
+  }
+  .ld-cancel:hover{color:var(--warm-highlight);border-color:var(--warm-primary)}
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="vignette"></div>
+  <div class="grain"></div>
+
+  <!-- MAIN PAUSE PANEL — matches PauseMenu.gd: RESUME / SAVE / LOAD / SETTINGS / EXIT TO MENU / QUIT -->
+  <div class="panel-state on" id="state-main">
+    <div class="pa-panel">
+      <div class="pa-title">— PAUSED —</div>
+      <div class="pa-rule"></div>
+      <button class="pa-btn">RESUME</button>
+      <button class="pa-btn">SAVE</button>
+      <button class="pa-btn">LOAD</button>
+      <button class="pa-btn">SETTINGS</button>
+      <button class="pa-btn danger">EXIT TO MENU</button>
+      <button class="pa-btn danger">QUIT</button>
+      <div class="pa-foot">Day 12, the 18th Summer of the Second Age</div>
+    </div>
+  </div>
+
+  <!-- SAVE NAME DIALOG -->
+  <div class="panel-state" id="state-save">
+    <div class="sv-panel">
+      <div class="sv-title">— SAVE GAME —</div>
+      <div class="sv-prompt">Name this save:</div>
+      <input class="sv-input" type="text" value="Roland Day 12" />
+      <div class="sv-row">
+        <button class="pa-btn">CONFIRM</button>
+        <button class="pa-btn">CANCEL</button>
+      </div>
+      <div class="pa-foot" style="margin-top:4px">Press <b style="font-style:normal;font-family:var(--serif);letter-spacing:2px;color:var(--warm-highlight)">ENTER</b> to confirm · <b style="font-style:normal;font-family:var(--serif);letter-spacing:2px;color:var(--warm-highlight)">ESC</b> to cancel</div>
+    </div>
+  </div>
+
+  <!-- LOAD PICKER -->
+  <div class="panel-state" id="state-load">
+    <div class="ld-panel">
+      <div class="ld-title">— LOAD GAME —</div>
+      <div class="ld-list">
+        <div class="ld-row current">
+          <div class="ld-info">
+            <div class="ld-name">Roland Day 12</div>
+            <div class="ld-meta"><span>11/04 · 18:42</span><span class="coord">X -1248  Y 64  Z 872</span></div>
+          </div>
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+        <div class="ld-row">
+          <div class="ld-info">
+            <div class="ld-name auto">11/04 17:08</div>
+            <div class="ld-meta"><span>11/04 · 17:08</span><span class="coord">X -1244  Y 64  Z 858</span></div>
+          </div>
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+        <div class="ld-row">
+          <div class="ld-info">
+            <div class="ld-name">Before the Chapel</div>
+            <div class="ld-meta"><span>11/04 · 16:15</span><span class="coord">X -1102  Y 64  Z 924</span></div>
+          </div>
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+        <div class="ld-row">
+          <div class="ld-info">
+            <div class="ld-name auto">11/03 22:51</div>
+            <div class="ld-meta"><span>11/03 · 22:51</span><span class="coord">X -980  Y 70  Z 612</span></div>
+          </div>
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+        <div class="ld-row">
+          <div class="ld-info">
+            <div class="ld-name">Hollowford cave-in</div>
+            <div class="ld-meta"><span>11/03 · 19:30</span><span class="coord">X -612  Y 28  Z 480</span></div>
+          </div>
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+        <div class="ld-row">
+          <div class="ld-info">
+            <div class="ld-name">Roland Day 1</div>
+            <div class="ld-meta"><span>11/02 · 14:02</span><span class="coord">X 0  Y 64  Z 0</span></div>
+          </div>
+          <button class="ld-btn">LOAD</button>
+          <button class="ld-btn del">DELETE</button>
+        </div>
+      </div>
+      <button class="ld-cancel">CANCEL</button>
+    </div>
+  </div>
+
+</body>
+</html>

@@ -1,5 +1,6 @@
 #include "VoxelWeatherSubsystem.h"
 
+#include "VoxelFrontEndPolicy.h" // IsWorldHeldForMenu -- backlog 0.0k
 #include "VoxelSkySubsystem.h"   // the clock. There is no other clock; see the header.
 #include "VoxelWorldSubsystem.h" // the seed
 
@@ -782,6 +783,18 @@ void UVoxelWeatherSubsystem::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 	if (!Impl)
+	{
+		return;
+	}
+
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): the sample
+	// below reads the camera and the sky epoch and publishes a wind material
+	// parameter, and there is no water or foliage on screen for it to drive
+	// while the front end holds the world (the menu background is a static
+	// 2D image; see SVoxelMainMenu/SVoxelCoverImage).
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
 	{
 		return;
 	}

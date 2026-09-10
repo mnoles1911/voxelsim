@@ -27,6 +27,8 @@
 #include "EngineUtils.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/CommandLine.h" // -VoxelMenuTickGates re-read -- see the Tick() comment on why
+#include "Misc/Parse.h"
 #include "TextureResource.h" // FTextureRenderTargetResource
 #include "FXRenderingUtils.h"
 #include "GBufferInfo.h" // FGBufferBindings / GBL_Default -- which slot holds which GBuffer
@@ -1465,57 +1467,86 @@ void UVoxelShadowMarchSubsystem::Tick(float DeltaTime)
 	// wrap's side of the silence.
 	if (!SunComponent.IsValid())
 	{
-		// A stale sun (respawned actor) also invalidates the light-function
-		// wiring -- the NEW component has no light function until
-		// UpdateInjection re-applies it.
-		bInjectionWired = false;
-		UDirectionalLightComponent* Chosen = nullptr;
-		UDirectionalLightComponent* Fallback = nullptr;
-		int32 Candidates = 0;
-		for (TActorIterator<ADirectionalLight> It(GetWorld()); It; ++It)
+		// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): scan at
+		// most once a second instead of every tick -- see SunRetryAccumSec's
+		// comment in the header for why this is a throttle rather than an
+		// IsWorldHeldForMenu gate (VoxelEarth -> VoxelEarthShaders, never the
+		// reverse). Accumulated even on the tick that does not scan, so the
+		// interval is real wall time and not frame count.
+		//
+		// -VoxelMenuTickGates=0 IS THE A/B OFF ARM for the backlog item this
+		// throttle belongs to, so it has to disable the throttle too, not just
+		// the early returns at the other five sites. This module cannot call
+		// VoxelFrontEnd::MenuTickGatesEnabled() -- same VoxelEarth ->
+		// VoxelEarthShaders boundary as the gate itself, see VoxelGI.cpp's
+		// "VoxelEarth -> VoxelEarthShaders, never the reverse" -- so it
+		// RE-READS the producer's switch by name instead of restating its
+		// policy, the rule VoxelRasterAtlas.cpp's FineRingRadiusTiles()
+		// already follows (VoxelRasterAtlas.cpp:431-439) for the same reason.
+		static const bool bMenuTickGatesEnabled = []
 		{
-			UDirectionalLightComponent* C =
-				Cast<UDirectionalLightComponent>(It->GetLightComponent());
-			if (C == nullptr)
-			{
-				continue;
-			}
-			Candidates++;
-			if (Fallback == nullptr)
-			{
-				Fallback = C;
-			}
-			if (C->IsUsedAsAtmosphereSunLight() && C->GetAtmosphereSunLightIndex() == 0)
-			{
-				Chosen = C;
-				break;
-			}
-		}
-		if (Chosen == nullptr)
+			int32 Value = 1;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelMenuTickGates="), Value);
+			return FMath::Clamp(Value, 0, 1) != 0;
+		}();
+
+		SunRetryAccumSec += DeltaTime;
+		if (!bMenuTickGatesEnabled || SunRetryAccumSec >= 1.0f)
 		{
-			Chosen = Fallback;
-		}
-		if (Chosen != nullptr)
-		{
-			SunComponent = Chosen;
-			if (!bLoggedSunChoice)
+			SunRetryAccumSec = 0.0f;
+
+			// A stale sun (respawned actor) also invalidates the light-function
+			// wiring -- the NEW component has no light function until
+			// UpdateInjection re-applies it.
+			bInjectionWired = false;
+			UDirectionalLightComponent* Chosen = nullptr;
+			UDirectionalLightComponent* Fallback = nullptr;
+			int32 Candidates = 0;
+			for (TActorIterator<ADirectionalLight> It(GetWorld()); It; ++It)
 			{
-				bLoggedSunChoice = true;
-				UE_LOG(LogVoxelShadowMarch, Display,
-				       TEXT("shadow march sun: '%s' (%d directional light(s) present, ")
-				            TEXT("atmosphere-sun preferred)"),
-				       *Chosen->GetOwner()->GetName(), Candidates);
+				UDirectionalLightComponent* C =
+					Cast<UDirectionalLightComponent>(It->GetLightComponent());
+				if (C == nullptr)
+				{
+					continue;
+				}
+				Candidates++;
+				if (Fallback == nullptr)
+				{
+					Fallback = C;
+				}
+				if (C->IsUsedAsAtmosphereSunLight() && C->GetAtmosphereSunLightIndex() == 0)
+				{
+					Chosen = C;
+					break;
+				}
 			}
-			bLoggedNoSun = false;
-		}
-		else if (Mode != 0 && !bLoggedNoSun)
-		{
-			bLoggedNoSun = true;
-			UE_LOG(LogVoxelShadowMarch, Warning,
-			       TEXT("voxel.Shadow.March %d requested but NO DIRECTIONAL LIGHT exists yet. ")
-			            TEXT("Every frame declines with reason noSun until one appears -- the ")
-			            TEXT("census names it; this is not silent."),
-			       Mode);
+			if (Chosen == nullptr)
+			{
+				Chosen = Fallback;
+			}
+			if (Chosen != nullptr)
+			{
+				SunComponent = Chosen;
+				if (!bLoggedSunChoice)
+				{
+					bLoggedSunChoice = true;
+					UE_LOG(LogVoxelShadowMarch, Display,
+					       TEXT("shadow march sun: '%s' (%d directional light(s) present, ")
+					            TEXT("atmosphere-sun preferred)"),
+					       *Chosen->GetOwner()->GetName(), Candidates);
+				}
+				bLoggedNoSun = false;
+			}
+			else if (Mode != 0 && !bLoggedNoSun)
+			{
+				bLoggedNoSun = true;
+				UE_LOG(LogVoxelShadowMarch, Warning,
+				       TEXT("voxel.Shadow.March %d requested but NO DIRECTIONAL LIGHT exists yet. ")
+				            TEXT("Every frame declines with reason noSun until one appears -- the ")
+				            TEXT("census names it; this is not silent."),
+				       Mode);
+			}
 		}
 	}
 

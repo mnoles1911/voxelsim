@@ -4,10 +4,13 @@
 #include "SVoxelCoverImage.h"
 #include "SVoxelHourglass.h"
 #include "VoxelEarthUI.h"
+#include "VoxelLoadingCurtainThread.h" // the curtain's paint clock -- seg=LOADING
 #include "VoxelUIAssetLibrary.h"
 #include "VoxelUIStrings.h"
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
+
+#include "Widgets/Layout/SSpacer.h"
 
 #include "HAL/IConsoleManager.h"
 #include "Widgets/SBoxPanel.h"
@@ -57,6 +60,36 @@ TArray<int32> ShuffledIndices(int32 Count, FRandomStream& Stream)
 	}
 	return Order;
 }
+
+// Reshuffles an existing order in place and guarantees the entry that is
+// currently on screen does not come back as the very next one.
+//
+// THE GUARANTEE IS THE POINT, not the shuffle. A plain reshuffle at a wrap has
+// a 1-in-N chance of showing the same line twice in a row, and that is the one
+// artefact a player would actually notice -- it reads as the screen being stuck
+// rather than as a rotation. With N < 3 there is nothing to promise and the
+// order is left alone.
+void ReshuffleAvoidingRepeat(TArray<int32>& Order, int32 CurrentValue, FRandomStream& Stream)
+{
+	if (Order.Num() < 3)
+	{
+		return;
+	}
+	for (int32 Attempt = 0; Attempt < 8; ++Attempt)
+	{
+		for (int32 i = Order.Num() - 1; i > 0; --i)
+		{
+			Order.Swap(i, Stream.RandRange(0, i));
+		}
+		if (Order[0] != CurrentValue)
+		{
+			return;
+		}
+	}
+	// Eight shuffles in a row put the same line first. Astronomically unlikely,
+	// but a bounded loop beats an unbounded one and one swap settles it.
+	Order.Swap(0, 1);
+}
 } // namespace SVoxelLoadingDetail
 
 SVoxelLoadingScreen::~SVoxelLoadingScreen()
@@ -81,6 +114,13 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 
 	const float HalfSep = L.LoadingSeparation * 0.5f;
 
+	// 2026-09-07 mock: the title is tracked (10 px at 40 px) rather than
+	// spelled with spaces, and the quip and tip are set in the italic hand face.
+	FSlateFontInfo TitleFont = Style.Serif(L.LoadingTitleSize);
+	TitleFont.LetterSpacing = L.LoadingTitleLetterSpacing;
+	FSlateFontInfo VersionFont = Style.Serif(L.VersionFontSize);
+	VersionFont.LetterSpacing = 187; // 3 px at 16 px
+
 	// The centred column. Godot builds it as a fixed 600x360 VBox at
 	// PRESET_CENTER; the SBox reproduces the fixed size, and the per-slot
 	// half-separation padding reproduces the 18px gap.
@@ -101,8 +141,12 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 				.WidthOverride(L.HourglassWidth)
 				.HeightOverride(L.HourglassHeight)
 				[
+					// Self-driven (2026-09-07 mock): drains, rests, turns over,
+					// and tells this screen to change its line at each turn.
+					// Load progress no longer drives the sand -- see the header.
 					SAssignNew(Hourglass, SVoxelHourglass)
-					.Progress_Lambda([this]() { return Progress; })
+					.SelfDriven(true)
+					.OnFlipped(this, &SVoxelLoadingScreen::OnHourglassFlipped)
 				]
 			]
 		]
@@ -114,7 +158,7 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			// fakes the tracking with thin spaces and the port keeps the same
 			// trick rather than inventing a different one.
 			.Text(VoxelUIStrings::LoadingTitle())
-			.Font(Style.Serif(L.LoadingTitleSize))
+			.Font(TitleFont)
 			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
 			.ShadowOffset(FVector2D(3.f, 3.f))
 			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.95f))
@@ -130,50 +174,19 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			[
 				SNew(STextBlock)
 				.Text(this, &SVoxelLoadingScreen::GetQuipText)
-				.Font(Style.Serif(L.LoadingQuipSize))
+				// .msg: the italic hand face. The colour attribute below keeps
+				// the crossfade; its base is parchment, per the mock.
+				.Font(Style.HandItalic(L.LoadingQuipSize))
 				.ColorAndOpacity(this, &SVoxelLoadingScreen::GetQuipColour)
 				.ShadowOffset(FVector2D(2.f, 2.f))
 				.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.85f))
 				.Justification(ETextJustify::Center)
 				.AutoWrapText(true)
 			]
-		]
-		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(FMargin(0.f, HalfSep))
-		[
-			SNew(SBox)
-			.WidthOverride(L.LoadingBarWidth)
-			.HeightOverride(L.LoadingBarHeight)
-			[
-				SNew(SOverlay)
-				+ SOverlay::Slot()
-				[
-					SNew(SImage)
-					.Image(Style.SolidWhite())
-					// "Dark leather", the GDScript's own word for it.
-					.ColorAndOpacity(FSlateColor(FLinearColor(0.04f, 0.024f, 0.016f, 1.f)))
-				]
-				+ SOverlay::Slot()
-				.HAlign(HAlign_Left)
-				[
-					SNew(SBox)
-					.WidthOverride(this, &SVoxelLoadingScreen::GetBarFillWidth)
-					[
-						SNew(SImage)
-						.Image(Style.SolidWhite())
-						.ColorAndOpacity(FSlateColor(Tint(SandBright)))
-					]
-				]
-			]
-		]
-		+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(FMargin(0.f, HalfSep))
-		[
-			SNew(STextBlock)
-			.Text(this, &SVoxelLoadingScreen::GetPercentText)
-			.Font(Style.Serif(L.LoadingPctSize))
-			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
-			.ShadowOffset(FVector2D(2.f, 2.f))
-			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.9f))
 		];
+		// The progress bar and percentage that used to follow the quip were
+		// REMOVED 2026-09-07 (owner directive; the mock has neither -- see the
+		// header). The theatre progress still drives the curtain, not pixels.
 
 	Column->AddSlot().AutoHeight().HAlign(HAlign_Center).Padding(FMargin(0.f,HalfSep))
 	[
@@ -208,16 +221,48 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 			.ColorAndOpacity(FSlateColor(FLinearColor(0.f, 0.f, 0.f, L.LoadingTintAlpha)))
 		]
 
+		// The stack sits in the upper third (.stack top:33%), not centred as the
+		// Godot build had it. Two fill-height spacers carry the fraction so the
+		// placement scales with the viewport instead of being a pixel offset.
+		//
+		// The column matches the mock exactly now: hourglass, LOADING, one line.
+		// The bar and percentage kept on 2026-09-06 were dropped on 2026-09-07 at
+		// the owner's direction, in favour of the mock's turning hourglass.
 		+ SOverlay::Slot()
 		.HAlign(HAlign_Center)
-		.VAlign(VAlign_Center)
+		.VAlign(VAlign_Fill)
 		[
-			SNew(SBox)
-			.WidthOverride(L.LoadingColumnWidth)
-			.HeightOverride(L.LoadingColumnHeight)
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().FillHeight(L.LoadingStackTopFrac)
 			[
-				Column
+				SNew(SSpacer)
 			]
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+			[
+				SNew(SBox)
+				.WidthOverride(L.LoadingColumnWidth)
+				[
+					Column
+				]
+			]
+			+ SVerticalBox::Slot().FillHeight(1.f - L.LoadingStackTopFrac)
+			[
+				SNew(SSpacer)
+			]
+		]
+
+		// .version-stamp, bottom-left, new on this screen in the 2026-09-07 mock.
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Left)
+		.VAlign(VAlign_Bottom)
+		.Padding(FMargin(L.VersionInsetLeft, 0.f, 0.f, L.VersionInsetBottom))
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::VersionStamp())
+			.Font(VersionFont)
+			.ColorAndOpacity(FSlateColor(Tint(Parchment, 0.32f)))
+			.ShadowOffset(FVector2D(1.f, 1.f))
+			.ShadowColorAndOpacity(FLinearColor(0.f, 0.f, 0.f, 0.8f))
 		]
 
 		// TIP footer, pinned to the bottom edge with the GDScript's insets.
@@ -245,8 +290,9 @@ void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 				[
 					SNew(STextBlock)
 					.Text(this, &SVoxelLoadingScreen::GetTipText)
-					.Font(Style.Serif(L.LoadingTipSize))
-					.ColorAndOpacity(FSlateColor(Tint(InkDim, 0.55f)))
+					// .tip: italic hand face at rgba(230,213,168,.55) ~ parchment @ 0.55.
+					.Font(Style.HandItalic(L.LoadingTipSize))
+					.ColorAndOpacity(FSlateColor(Tint(Parchment, 0.55f)))
 				]
 			]
 		];
@@ -300,8 +346,11 @@ void SVoxelLoadingScreen::OnShown()
 	// sharing one would make them drift into lockstep.
 	QuipOrder = SVoxelLoadingDetail::ShuffledIndices(VoxelUIStrings::LoadingQuips().Num(), Stream);
 	TipOrder = SVoxelLoadingDetail::ShuffledIndices(VoxelUIStrings::GameplayTips().Num(), Stream);
+	// A COPY of the show's stream, kept and advanced -- see the member's comment.
+	RotationStream = Stream;
 	QuipCursor = 0;
 	TipCursor = 0;
+	QuipPhase = EQuipPhase::Idle;
 	QuipTimer = 0.f;
 	TipTimer = 0.f;
 	QuipFadeAlpha = 1.f;
@@ -311,6 +360,15 @@ void SVoxelLoadingScreen::OnShown()
 void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
 {
 	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+
+	// THE CURTAIN'S OWN CLOCK (2026-09-07, Phase 4). Called from Tick rather
+	// than from OnPaint because SWidget::Paint invokes Tick for any widget with
+	// bCanTick, INCLUDING on the engine's Slate loading thread -- so this one
+	// line records the paint cadence on both arms with no second hook. Any
+	// thread; the recorder locks. Drained on the game thread by the front end's
+	// loading tick into VoxelFramePhase's seg=LOADING row.
+	VoxelLoadingCurtain::NotePaint();
+
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 
 	// The curtain fade. Applied through SWidget::SetRenderOpacity rather than
@@ -355,25 +413,46 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 		}
 	}
 
-	// --- Quip rotation ------------------------------------------------------
-	// Fade out over QuipFade, swap, fade back in over QuipFade, hold until
-	// QuipRotate has elapsed in total.
-	QuipTimer += AnimDelta;
-	const float FadeOutStart = FMath::Max(L.QuipRotate - L.QuipFade, 0.f);
-	if (QuipTimer >= L.QuipRotate)
+	// --- Quip change, once per turn of the glass ----------------------------
+	// OnHourglassFlipped starts the fade-out; this carries it through the swap
+	// and the fade-in and then holds. No timer of its own: the cadence is the
+	// hourglass's (the mock's rotateTip() is only called from the flip phase).
 	{
-		QuipTimer = 0.f;
-		QuipCursor = QuipOrder.Num() > 0 ? (QuipCursor + 1) % QuipOrder.Num() : 0;
-		QuipFadeAlpha = 0.f;
-	}
-	else if (QuipTimer >= FadeOutStart)
-	{
-		QuipFadeAlpha = 1.f - (QuipTimer - FadeOutStart) / FMath::Max(L.QuipFade, 0.001f);
-	}
-	else
-	{
-		// Fading back in after a swap, then held at 1.
-		QuipFadeAlpha = FMath::Min(1.f, QuipTimer / FMath::Max(L.QuipFade, 0.001f));
+		const float Fade = FMath::Max(L.QuipFade, 0.001f);
+		switch (QuipPhase)
+		{
+		case EQuipPhase::FadingOut:
+			QuipTimer += AnimDelta;
+			QuipFadeAlpha = FMath::Max(0.f, 1.f - QuipTimer / Fade);
+			if (QuipTimer >= Fade)
+			{
+				const int32 PreviousQuip = QuipOrder.Num() > 0 ? QuipOrder[QuipCursor % QuipOrder.Num()] : -1;
+				QuipCursor = QuipOrder.Num() > 0 ? (QuipCursor + 1) % QuipOrder.Num() : 0;
+				// Wrapped: reshuffle rather than replay the same order. 26 quips
+				// at one per turn of the glass (~7.8 s) is ~203 s, and the load
+				// gate now waits up to 300.
+				if (QuipCursor == 0)
+				{
+					SVoxelLoadingDetail::ReshuffleAvoidingRepeat(QuipOrder, PreviousQuip, RotationStream);
+				}
+				QuipPhase = EQuipPhase::FadingIn;
+				QuipTimer = 0.f;
+			}
+			break;
+		case EQuipPhase::FadingIn:
+			QuipTimer += AnimDelta;
+			QuipFadeAlpha = FMath::Min(1.f, QuipTimer / Fade);
+			if (QuipTimer >= Fade)
+			{
+				QuipPhase = EQuipPhase::Idle;
+				QuipFadeAlpha = 1.f;
+			}
+			break;
+		case EQuipPhase::Idle:
+		default:
+			QuipFadeAlpha = 1.f;
+			break;
+		}
 	}
 
 	// --- Tip rotation (hard cut, no fade) -----------------------------------
@@ -381,7 +460,15 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 	if (TipTimer >= L.TipRotate)
 	{
 		TipTimer = 0.f;
+		const int32 PreviousTip = TipOrder.Num() > 0 ? TipOrder[TipCursor % TipOrder.Num()] : -1;
 		TipCursor = TipOrder.Num() > 0 ? (TipCursor + 1) % TipOrder.Num() : 0;
+		// Wrapped: 15 tips on an 8 s timer is 120 s, and a player may now sit
+		// here for up to 300. Replaying the identical order is what made a long
+		// load read as a loop.
+		if (TipCursor == 0)
+		{
+			SVoxelLoadingDetail::ReshuffleAvoidingRepeat(TipOrder, PreviousTip, RotationStream);
+		}
 	}
 
 	// --- FPS readout (debug-only; see GLoadingFpsReadout) -------------------
@@ -419,12 +506,32 @@ void SVoxelLoadingScreen::Tick(const FGeometry& AllottedGeometry, const double I
 
 const FSlateBrush* SVoxelLoadingScreen::GetBackgroundA() const
 {
-	return FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexA);
+	// Game thread: ask the library (it may start a decode) and remember the answer.
+	// Loading thread: the library refuses; paint whatever the game thread last
+	// resolved for this slot rather than nothing. See CachedBackgroundA in the header.
+	if (IsInGameThread())
+	{
+		if (const FSlateBrush* Fresh = FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexA))
+		{
+			CachedBackgroundA = Fresh;
+		}
+	}
+	return CachedBackgroundA;
 }
 
 const FSlateBrush* SVoxelLoadingScreen::GetBackgroundB() const
 {
-	return FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexB);
+	// Game thread: ask the library (it may start a decode) and remember the answer.
+	// Loading thread: the library refuses; paint whatever the game thread last
+	// resolved for this slot rather than nothing. See CachedBackgroundB in the header.
+	if (IsInGameThread())
+	{
+		if (const FSlateBrush* Fresh = FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndexB))
+		{
+			CachedBackgroundB = Fresh;
+		}
+	}
+	return CachedBackgroundB;
 }
 
 float SVoxelLoadingScreen::GetBackgroundAOpacity() const
@@ -464,18 +571,17 @@ FText SVoxelLoadingScreen::GetTipText() const
 	return Tips[TipOrder[TipCursor % TipOrder.Num()]];
 }
 
-FText SVoxelLoadingScreen::GetPercentText() const
+void SVoxelLoadingScreen::OnHourglassFlipped()
 {
-	if (bLoadFailed) return FText::FromString(TEXT("Load failed"));
-	// floor, not round: 99.6% should read 99%, because a bar that says 100%
-	// while the world is still landing is the specific lie this whole progress
-	// model exists to avoid.
-	return FText::FromString(FString::Printf(TEXT("%d%%"), FMath::FloorToInt(Progress * 100.f)));
-}
-
-FOptionalSize SVoxelLoadingScreen::GetBarFillWidth() const
-{
-	return FOptionalSize(FVoxelMenuLayout::Get().LoadingBarWidth * Progress);
+	// A turn that lands mid-fade restarts the fade-out from the current alpha
+	// rather than snapping; with 7.8 s between turns and a 0.4 s fade that is
+	// a defensive branch, not an expected one.
+	if (QuipPhase == EQuipPhase::FadingOut)
+	{
+		return;
+	}
+	QuipPhase = EQuipPhase::FadingOut;
+	QuipTimer = (1.f - QuipFadeAlpha) * FMath::Max(FVoxelMenuLayout::Get().QuipFade, 0.001f);
 }
 
 FMargin SVoxelLoadingScreen::GetHourglassBobPadding() const

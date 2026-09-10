@@ -182,6 +182,29 @@ ABSORPTION_COLOR = (0.0, 0.59, 0.74)
 #       SHIPPED                              0.014  0.187  0.394
 SCATTERING_PER_M = (0.010, 0.067, 0.120)
 
+# PER-CHANNEL EXTINCTION SCALE (owner-directed 2026-09-08, item 4): a plain
+# multiplier on the absorption per metre, per channel, applied AFTER the
+# distance/colour parameterisation above. The owner's diagnosis on the live
+# session: "our water in general at the SLW level is too transparent
+# (especially when it is only 1-4 voxels deep) ... i think i am in the
+# carribean" -- a white bed under an absorption that leaves 80% of RED alive
+# at 20 cm reads as tropical turquoise. Red has to go first and go hard, and
+# blue must not be the survivor (the survivor sets the hue: with B least
+# absorbed the shallows drift sky-blue; with G ~= B they drift cyan-green,
+# which is what a cold alpine lake over pale rock does).
+#
+#   channel   absorption/m before   scale   after
+#   R         1.118                 2.0     2.236   (20 cm: 64% survives, was 80%)
+#   G         0.458                 1.0     0.458
+#   B         0.291                 1.5     0.437   (now ~= G)
+#
+# Baked into BOTH water materials as WaterAbsorbScaleR/G/B ScalarParameters
+# (launch-time ladder via -VoxelWaterMatScalar, lake sheet only) and applied
+# inside absorption_per_m() below so M_Underwater stays on the same water.
+# water_caustics_graph derives its own attenuation from ABSORPTION_COLOR and
+# does NOT see this scale -- a known, minor divergence, noted in the backlog.
+ABSORPTION_CHANNEL_SCALE = (2.0, 1.0, 1.5)
+
 # Forward-scattering anisotropy for the sun term. 0.35 is a deliberate middle:
 # real particulate water is 0.9+, but at 0.9 the whole in-scatter collapses into
 # a lobe a top-down lake view never enters.
@@ -199,7 +222,7 @@ def absorption_per_m():
     quoted against, so changing it here would silently re-scale all of them.
     """
     k = 3.9120230054281460586 / ABSORPTION_DISTANCE_M  # -ln(0.02) / d
-    return tuple(k * (1.0 - c) for c in ABSORPTION_COLOR)
+    return tuple(k * (1.0 - c) * s for c, s in zip(ABSORPTION_COLOR, ABSORPTION_CHANNEL_SCALE))
 
 
 def extinction_per_m():
@@ -242,6 +265,7 @@ def summary_lines():
         % ((ABSORPTION_DISTANCE_M,) + ABSORPTION_COLOR),
         "  absorption  R %.4f  G %.4f  B %.4f" % a,
         "  scattering  R %.4f  G %.4f  B %.4f" % SCATTERING_PER_M,
+        "  absorb channel scale  R %.2f  G %.2f  B %.2f (2026-09-08 item 4)" % ABSORPTION_CHANNEL_SCALE,
         "  extinction  R %.4f  G %.4f  B %.4f" % e,
         "  deep-water albedo  R %.3f  G %.3f  B %.3f" % w,
         "  phase g %.2f" % PHASE_G,

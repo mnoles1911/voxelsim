@@ -1,5 +1,6 @@
 #include "VoxelGraphicsUserSettings.h"
 
+#include "Framework/Application/SlateApplication.h" // SetApplicationScale -- the UI-size row
 #include "HAL/IConsoleManager.h"
 #include "Misc/ConfigCacheIni.h"
 
@@ -10,6 +11,41 @@ constexpr const TCHAR* kFineDetailKey = TEXT("FineDetailSmoothing");
 constexpr const TCHAR* kFasterTerrainKey = TEXT("FasterTerrainDrawing");
 constexpr const TCHAR* kWaterWaveKey = TEXT("WaterWaveDetail");
 constexpr const TCHAR* kOceanDetailKey = TEXT("OceanMeshDetail");
+constexpr const TCHAR* kUIScaleKey = TEXT("UIScale");
+constexpr const TCHAR* kHideMusicUIKey = TEXT("HideMusicUI");
+constexpr const TCHAR* kHideCompassUIKey = TEXT("HideCompassUI");
+
+// The interface-size row's bounds. 1.00 is the default: the engine's own
+// ShortestSide curve reaching the screen unmodified, which is the framing
+// ADR-0011 chose. 0.05 is coarse enough to cross the range in fifteen presses
+// and fine enough to land on a size.
+constexpr float kUIScaleDefault = 1.00f;
+constexpr float kUIScaleMin = 0.75f;
+constexpr float kUIScaleMax = 1.50f;
+constexpr float kUIScaleStep = 0.05f;
+
+// SNAPPED AND CLAMPED IN ONE PLACE. The slider hands over a continuous value
+// and the ini can hold anything a text editor put there, so both routes go
+// through this -- otherwise the stored number and the sixteen the row can
+// display drift apart and the knob never sits where it was left.
+float SnapUIScale(float Scale)
+{
+	const float Snapped = FMath::RoundToFloat(Scale / kUIScaleStep) * kUIScaleStep;
+	return FMath::Clamp(Snapped, kUIScaleMin, kUIScaleMax);
+}
+
+// Applies to Slate. Returns false when there is no Slate application at all --
+// a commandlet or a server -- which is a real state on this project (the
+// dedicated server links no Slate) and not an error.
+bool ApplyUIScale(float Scale)
+{
+	if (!FSlateApplication::IsInitialized())
+	{
+		return false;
+	}
+	FSlateApplication::Get().SetApplicationScale(SnapUIScale(Scale));
+	return true;
+}
 
 // The cvar each row fronts, spelled once. A misspelling here does not fail to
 // compile and does not warn: FindConsoleVariable returns null and the toggle
@@ -182,12 +218,95 @@ void SetOceanMeshDetail(bool bEnabled)
 	ApplyOceanMeshDetail(bEnabled);
 }
 
+bool GetHideMusicUI()
+{
+	// FALSE on a missing key: nothing is hidden until the player hides it.
+	bool bHidden = false;
+	if (GConfig)
+	{
+		GConfig->GetBool(kSection, kHideMusicUIKey, bHidden, GGameUserSettingsIni);
+	}
+	return bHidden;
+}
+
+void SetHideMusicUI(bool bHidden)
+{
+	if (GConfig)
+	{
+		GConfig->SetBool(kSection, kHideMusicUIKey, bHidden, GGameUserSettingsIni);
+		// Flushed now, on this file's own standing reason: a crash between the
+		// toggle and exit must not silently revert a choice the player watched
+		// take effect.
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	// NO ApplyAll(). There is no cvar and no apply step -- SVoxelGameHud reads
+	// this every frame through a bound visibility attribute, so the row is live
+	// the instant it is clicked. The log line is the engagement evidence that
+	// takes ApplyAll's place for these two rows.
+	UE_LOG(LogTemp, Log, TEXT("VoxelHud: music UI hidden=%d"), bHidden ? 1 : 0);
+}
+
+bool GetHideCompassUI()
+{
+	bool bHidden = false;
+	if (GConfig)
+	{
+		GConfig->GetBool(kSection, kHideCompassUIKey, bHidden, GGameUserSettingsIni);
+	}
+	return bHidden;
+}
+
+void SetHideCompassUI(bool bHidden)
+{
+	if (GConfig)
+	{
+		GConfig->SetBool(kSection, kHideCompassUIKey, bHidden, GGameUserSettingsIni);
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	UE_LOG(LogTemp, Log, TEXT("VoxelHud: compass UI hidden=%d"), bHidden ? 1 : 0);
+}
+
+float UIScaleMin() { return kUIScaleMin; }
+float UIScaleMax() { return kUIScaleMax; }
+float UIScaleStep() { return kUIScaleStep; }
+
+float GetUIScale()
+{
+	float Scale = kUIScaleDefault;
+	if (GConfig)
+	{
+		GConfig->GetFloat(kSection, kUIScaleKey, Scale, GGameUserSettingsIni);
+	}
+	// Snapped on the way OUT as well as in: a hand-edited ini holding 1.37 must
+	// not make the slider sit between two of its own stops.
+	return SnapUIScale(Scale);
+}
+
+void SetUIScale(float Scale)
+{
+	const float Snapped = SnapUIScale(Scale);
+	if (GConfig)
+	{
+		GConfig->SetFloat(kSection, kUIScaleKey, Snapped, GGameUserSettingsIni);
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	// LIVE, like the volume sliders and unlike FULLSCREEN: the only way to judge
+	// an interface size is to watch it change under the cursor.
+	ApplyUIScale(Snapped);
+}
+
 void ApplyAll()
 {
 	const bool bFineOk = ApplyFineDetail(GetFineDetailSmoothing());
 	const bool bTerrainOk = ApplyFasterTerrain(GetFasterTerrainDrawing());
 	const bool bWaveOk = ApplyWaterWaveDetail(GetWaterWaveDetail());
 	const bool bOceanOk = ApplyOceanMeshDetail(GetOceanMeshDetail());
+	// Not folded into the Missing list below: that list names CVARS that were
+	// not registered, and "no Slate application" is a different fact about a
+	// different kind of build. ApplyAll runs from
+	// UVoxelFrontEndSubsystem::Initialize, which only exists where Slate does,
+	// so a false here would be news.
+	const bool bScaleOk = ApplyUIScale(GetUIScale());
 
 	// Engagement line, once per apply: "the switch is on" and "the key was
 	// misspelled and nothing latched" must not produce identical logs -- the
@@ -214,9 +333,16 @@ void ApplyAll()
 
 	UE_LOG(LogTemp, Log,
 	       TEXT("VoxelGraphicsUserSettings: applied FineDetailSmoothing=%d FasterTerrainDrawing=%d "
-	            "WaterWaveDetail=%d OceanMeshDetail=%d"),
+	            "WaterWaveDetail=%d OceanMeshDetail=%d UIScale=%.2f%s "
+	            "HideMusicUI=%d HideCompassUI=%d"),
 	       GetFineDetailSmoothing() ? 1 : 0, GetFasterTerrainDrawing() ? 1 : 0, GetWaterWaveDetail() ? 1 : 0,
-	       GetOceanMeshDetail() ? 1 : 0);
+	       GetOceanMeshDetail() ? 1 : 0, GetUIScale(),
+	       bScaleOk ? TEXT("") : TEXT(" (NOT APPLIED -- no Slate application)"),
+	       // REPORTED, NOT APPLIED, and the distinction is the point of this
+	       // line. These two have no cvar to push: the HUD reads them every
+	       // frame. Naming them here means a leg can still see at boot what the
+	       // player has chosen, without implying an apply that never happened.
+	       GetHideMusicUI() ? 1 : 0, GetHideCompassUI() ? 1 : 0);
 	if (!Missing.IsEmpty())
 	{
 		// WARNING, NOT LOG. A cvar that is not registered means the module that

@@ -109,6 +109,7 @@ enum class ESite : uint8
 	TickExcl,        // TickResidencyAndEviction -- the real I/O, once per streaming tick
 	ColdGameExcl,    // ResolveNonResidentPixel, game thread: blocking load
 	ColdWorkerExcl,  // ResolveNonResidentPixel, worker: leak report, no load
+	PublishExcl,     // PumpAsyncLoads, game thread: adopting a worker-warmed tile (-VoxelFineTileAsync=1)
 	Count
 };
 
@@ -139,6 +140,7 @@ inline const TCHAR* SiteName(ESite Site)
 	case ESite::TickExcl: return TEXT("tick");
 	case ESite::ColdGameExcl: return TEXT("coldGame");
 	case ESite::ColdWorkerExcl: return TEXT("coldWorker");
+	case ESite::PublishExcl: return TEXT("publish");
 	default: return TEXT("?");
 	}
 }

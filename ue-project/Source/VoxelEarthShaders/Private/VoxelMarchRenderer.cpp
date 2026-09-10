@@ -23,6 +23,8 @@
 #include "VoxelFluidOccupancy.h" // the P3 traversal source; see the header, section 5
 
 #include "CommonRenderResources.h" // GEmptyVertexDeclaration
+#include "Engine/Texture2D.h" // R7: the bathy info texture the caustic term samples
+#include "TextureResource.h"  // ... and FTextureResource::TextureRHI, read on the render thread
 #include "DataDrivenShaderPlatformInfo.h"
 #include "Engine/World.h"
 #include "FXRenderingUtils.h"
@@ -1341,6 +1343,296 @@ TEXT("voxel.March.SkyLadder"), 0,
 		FVoxelMarchVSLightingUniforms U;
 		U.SunDirAndWrapFloor=Shared.SunDirAndWrapFloor;
 		U.WrapColorAndSkyBoost=Shared.WrapColorAndSkyBoost;
+		return U;
+	}
+
+	// =======================================================================
+	// R7: THE CAUSTIC LIGHT ON THE LAKE AND SEA FLOOR
+	// docs/water-realism-analysis-2026-09-06.md, item R7
+	// =======================================================================
+	//
+	// WHY IT IS IN THE MARCHER AT ALL. Phase F1 built a caustic field and wired
+	// it into M_VoxelTerrain and M_VoxelClipmap emissive, on the premise
+	// (create_voxel_material.py:69-70) that "the lake and sea FLOORS are this
+	// material". That premise is false in the shipped configuration:
+	// voxel.Terrain.RetireQuads defaults to 1, so no terrain quad is produced
+	// at all, and the clipmap's inner hole is 8,192 m. The lake bed a player
+	// stands beside is drawn by THIS pass. The owner's "caustics are at 0.5 and
+	// I see none" was therefore never a tuning question -- the light was landing
+	// on materials that draw nothing here. Full evidence at observation 4d.
+	//
+	// THE FIELD IS NOT COPIED. It lives in /VoxelEarth/VoxelCaustics.ush, whose
+	// header carries the one-derivation-two-consumers argument and the named
+	// hook for the Python side. What is below is the FRAME around it: the
+	// knobs, the bathy seam, and the host-side folding of the off switch.
+
+	// The marcher's own gain, and the second half of R7's A/B. Multiplies the
+	// game-side voxel.Water.Caustics rather than replacing it: that cvar is the
+	// documented global (VoxelWaterSubsystem.cpp:256-258, "0 zeroes the caustic
+	// term in every consumer") and R7 requires the whole term to stay behind
+	// it. This one exists so the MARCHER's half can be taken out without
+	// touching the materials -- the arm that separates "caustics cost too much
+	// on the floor" from "caustics look wrong".
+	TAutoConsoleVariable<float> CVarVoxelMarchCaustics(
+		TEXT("voxel.March.Caustics"), 1.0f,
+		TEXT("R7: gain on the caustic light the marcher adds to submerged terrain, multiplied "
+		     "into the game-side voxel.Water.Caustics global. 0 skips the whole block and is "
+		     "byte-identical to the pre-R7 emit. The field, its gates and its sun-ray "
+		     "attenuation are in Shaders/VoxelCaustics.ush, shared with the water material "
+		     "generators."),
+		ECVF_RenderThreadSafe);
+
+	// THE FADE WINDOW, AND WHY THE MARCHER'S DEFAULTS ARE NOT THE MATERIAL'S.
+	//
+	// water_caustics_graph ships CausticFadeStartM 40 / CausticFadeEndM 64,
+	// which makes the term exactly zero past 64 m of camera distance -- most of
+	// any lake shot, and R7's "also fix the fade window while you are there".
+	// The marcher's bound is not a guess: the bathy window is +/-480 m around
+	// the camera (VoxelBathyField.h, kSize 512 at 1.875 m), and OUTSIDE it
+	// there is no depth to read and the term is zero whatever these say. So the
+	// fade's job here is to make that boundary invisible rather than to save
+	// cost, and it is placed well inside the window at both ends.
+	TAutoConsoleVariable<float> CVarVoxelMarchCausticFadeStartM(
+		TEXT("voxel.March.CausticFadeStartM"), 150.0f,
+		TEXT("R7: camera distance (m) at which the marcher's caustic term starts fading out. "
+		     "Full strength inside this."),
+		ECVF_RenderThreadSafe);
+	TAutoConsoleVariable<float> CVarVoxelMarchCausticFadeEndM(
+		TEXT("voxel.March.CausticFadeEndM"), 400.0f,
+		TEXT("R7: camera distance (m) at which the marcher's caustic term reaches zero. Kept "
+		     "inside the bathy field's +/-480 m window, past which there is no depth to read "
+		     "and the term is zero regardless."),
+		ECVF_RenderThreadSafe);
+
+	// THE FIELD'S THREE SHAPE KNOBS ARE A MIRROR, AND IT IS A MIRROR THIS FILE
+	// CANNOT CLOSE. water_caustics_graph.DEFAULTS holds the same three numbers
+	// as MATERIAL PARAMETERS, and a material graph cannot read a cvar any more
+	// than a cvar can read Python. The derivation they parameterise is shared
+	// (VoxelCaustics.ush); its calibration is typed twice, here and there, and
+	// the two must be moved together. Stated rather than discovered from a
+	// frame in which the marcher's floor and M_Underwater's floor cell at
+	// different sizes.
+	TAutoConsoleVariable<float> CVarVoxelMarchCausticScaleM(
+		TEXT("voxel.March.CausticScaleM"), 2.6f,
+		TEXT("R7: interference wavelength of the caustic field's first layer, metres. MIRROR "
+		     "of water_caustics_graph.DEFAULTS['CausticScaleM'] -- move both together."),
+		ECVF_RenderThreadSafe);
+	TAutoConsoleVariable<float> CVarVoxelMarchCausticSpeed(
+		TEXT("voxel.March.CausticSpeed"), 0.55f,
+		TEXT("R7: caustic pan/phase speed. MIRROR of "
+		     "water_caustics_graph.DEFAULTS['CausticSpeed'] -- move both together."),
+		ECVF_RenderThreadSafe);
+	TAutoConsoleVariable<float> CVarVoxelMarchCausticSharpness(
+		TEXT("voxel.March.CausticSharpness"), 6.0f,
+		TEXT("R7: pow() exponent on the interference sum -- higher is thinner, brighter "
+		     "filaments. MIRROR of water_caustics_graph.DEFAULTS['CausticSharpness'] -- move "
+		     "both together."),
+		ECVF_RenderThreadSafe);
+
+	// ---- the bathy seam (game -> render) ----------------------------------
+	//
+	// UVoxelBathyFieldSubsystem maintains ONE global texture asset holding a
+	// camera-following window of water depth (R, metres), shore distance (G),
+	// validity (B) and ocean connectivity (A), and publishes its origin and
+	// size to MPC_VoxelSky for the materials. A render pass cannot read an MPC,
+	// so the same three numbers come down this wire instead.
+	//
+	// A LOCK RATHER THAN ATOMICS, which is the opposite of the sun seam above,
+	// and for a stated reason: this publication is FOUR VALUES THAT MUST CHANGE
+	// TOGETHER. A frame that samples new pixels through an old origin shifts
+	// every lake by up to 120 m for one frame -- the same tearing hazard
+	// VoxelBathyField.h's "SAME-FRAME PUBLICATION" note is about, arriving by a
+	// second route. It is taken once per emit and written once per ~120 m of
+	// camera travel, so it is never contended.
+	FCriticalSection GCausticBathyLock;
+	FTextureRHIRef GCausticBathyTextureRHI;   // guarded by GCausticBathyLock
+	FVector2D GCausticBathyOriginUU = FVector2D::ZeroVector;
+	double GCausticBathySizeUU = 1.0;
+	bool GCausticBathyValid = false;
+
+	struct FVoxelMarchCausticUniforms
+	{
+		FVector4f Field = FVector4f(2.6f, 0.55f, 6.0f, 0.0f);  // w = 0: the off arm
+		FVector4f Window = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+		FVector4f Gate = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+		FVector3f AbsorbPerM = FVector3f::ZeroVector;
+		FVector2f CamXYm = FVector2f::ZeroVector;
+		FTextureRHIRef TextureRHI;
+	};
+
+	// THE ABSORPTION COEFFICIENT, DERIVED AND NOT TYPED -- the same two
+	// constants water_optics.py holds and both water generators derive from
+	// ("neither is allowed to type a coefficient as a literal"). This is the
+	// third renderer to need them and the first that cannot import the module,
+	// so the two SOURCE numbers are mirrored here and the coefficient is
+	// derived from them exactly as water_optics.absorption_per_m does:
+	//
+	//     k = -ln(0.02) / ABSORPTION_DISTANCE_M ;  absorb = k * (1 - colour)
+	//
+	// If water_optics ever moves, this pair moves with it. Deriving here rather
+	// than pasting the answer is what makes that a one-line edit whose result
+	// is checkable by arithmetic rather than by eye.
+	FVector3f VoxelMarchCausticAbsorbPerM()
+	{
+		constexpr float kAbsorptionDistanceM = 3.5f;                  // water_optics.py:150
+		constexpr float kAbsorptionColor[3] = {0.0f, 0.59f, 0.74f};   // water_optics.py:161
+		constexpr float kLn50 = 3.9120230054281460586f;               // -ln(0.02)
+		const float K = kLn50 / kAbsorptionDistanceM;
+		return FVector3f(K * (1.0f - kAbsorptionColor[0]),
+		                 K * (1.0f - kAbsorptionColor[1]),
+		                 K * (1.0f - kAbsorptionColor[2]));
+	}
+
+	// Everything the emit needs, derived in ONE place for the same reason the
+	// ambient and the wrap are. CameraWorldUU is the frame's own view origin --
+	// passed in rather than re-read, so the window offset and the absolute XY
+	// the field is evaluated on cannot come from two different cameras.
+	// ARMED-AND-INERT IS THIS PROJECT'S STANDING FAILURE, and a caustic term is
+	// unusually good at it: every one of the five declines below produces a
+	// frame that looks exactly like "the feature does nothing". So each is
+	// SAID, once, with the number that caused it, and the engagement is said
+	// once too. Render thread; plain statics, read and written from one thread.
+	enum class EVoxelMarchCausticDecline : uint8
+	{
+		None, MarchGain, WaterGain, NoSun, SunBelowGate, NoWindow
+	};
+	EVoxelMarchCausticDecline GLastCausticDecline = EVoxelMarchCausticDecline::None;
+	bool GLoggedCausticEngaged = false;
+	void VoxelMarchLogCausticDecline(EVoxelMarchCausticDecline Why, const TCHAR* What)
+	{
+		if (GLastCausticDecline == Why)
+		{
+			return;
+		}
+		GLastCausticDecline = Why;
+		UE_LOG(LogVoxelMarch, Display,
+		       TEXT("Caustics (R7): the marcher is adding NOTHING -- %s. voxel.Water.Caustics "
+		            "and voxel.March.Caustics both gate this term; the bathy window comes from "
+		            "UVoxelBathyFieldSubsystem."),
+		       What);
+	}
+
+	FVoxelMarchCausticUniforms MakeMarchCaustics(const FVector& CameraWorldUU)
+	{
+		FVoxelMarchCausticUniforms Off;  // Field.w = 0: the shader skips the block
+		const float MarchGain = FMath::Max(CVarVoxelMarchCaustics.GetValueOnRenderThread(), 0.0f);
+		if (MarchGain <= 0.0f)
+		{
+			VoxelMarchLogCausticDecline(EVoxelMarchCausticDecline::MarchGain,
+			                            TEXT("voxel.March.Caustics is 0"));
+			return Off;
+		}
+		// THE GAME-SIDE GLOBAL, BY NAME. voxel.Water.Caustics is registered by
+		// UVoxelWaterSubsystem (a VoxelEarth cvar), and this module does not
+		// depend on VoxelEarth -- so it is found through the console manager
+		// rather than plumbed through a second publisher. Cached once: a
+		// FindConsoleVariable per frame is a string hash this pass does not
+		// need to pay. Absent (a build without the game module) reads as the
+		// cvar's own default so the marcher behaves the same either way.
+		//
+		// READ THROUGH IConsoleVariable RATHER THAN TAutoConsoleVariable, and
+		// that is the reason as well as the mechanism: voxel.Water.Caustics is
+		// declared ECVF_Default, and TAutoConsoleVariable's typed accessors are
+		// the things that assert on the wrong thread. The raw getter does not,
+		// and what it can cost is a torn float on the frame the owner drags the
+		// knob -- a cosmetic gain, one frame, invisible. Promoting the cvar to
+		// ECVF_RenderThreadSafe would be the tidier fix and belongs to whoever
+		// owns VoxelWaterSubsystem.cpp.
+		static const IConsoleVariable* CVarWaterCaustics =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Water.Caustics"));
+		const float WaterGain =
+			CVarWaterCaustics ? FMath::Max(CVarWaterCaustics->GetFloat(), 0.0f) : 0.5f;
+		if (WaterGain <= 0.0f)
+		{
+			VoxelMarchLogCausticDecline(EVoxelMarchCausticDecline::WaterGain,
+			                            TEXT("voxel.Water.Caustics is 0 (or the game module is "
+			                                 "absent, so its default could not be found)"));
+			return Off;
+		}
+		if (GVSSunPublished.load() == 0)
+		{
+			// No sun has ever been published: there is no altitude to gate on,
+			// and a caustic pattern under a made-up sun is the armed-and-inert
+			// failure this file names elsewhere. Decline.
+			VoxelMarchLogCausticDecline(EVoxelMarchCausticDecline::NoSun,
+			                            TEXT("no sun direction has ever been published"));
+			return Off;
+		}
+		const float SunZ = GVSSunDirZ.load();
+		// HARD OFF BELOW THE GATE'S FLOOR, so a night frame pays one compare
+		// instead of a texture fetch on every submerged pixel. The RAMP itself
+		// is still the shader's -- this only removes the band where the ramp is
+		// exactly zero, and the constant is the .ush's own.
+		if (!(SunZ > 0.10f))  // VOXEL_CAUSTIC_SUN_GATE_SIN_LO
+		{
+			VoxelMarchLogCausticDecline(EVoxelMarchCausticDecline::SunBelowGate,
+			                            TEXT("the sun is below the field's altitude gate "
+			                                 "(sin(alt) <= 0.10, ~5.7 deg) -- no moon caustics, "
+			                                 "by design"));
+			return Off;
+		}
+
+		FVoxelMarchCausticUniforms U;
+		U.Field = FVector4f(FMath::Max(CVarVoxelMarchCausticScaleM.GetValueOnRenderThread(), 0.01f),
+		                    CVarVoxelMarchCausticSpeed.GetValueOnRenderThread(),
+		                    FMath::Max(CVarVoxelMarchCausticSharpness.GetValueOnRenderThread(), 1.0f),
+		                    MarchGain * WaterGain);
+		const float FadeStartUU =
+			FMath::Max(CVarVoxelMarchCausticFadeStartM.GetValueOnRenderThread(), 0.0f) * 100.0f;
+		const float FadeEndUU =
+			FMath::Max(CVarVoxelMarchCausticFadeEndM.GetValueOnRenderThread(), 0.0f) * 100.0f;
+		U.Gate = FVector4f(SunZ, FadeStartUU, FMath::Max(FadeEndUU, FadeStartUU + 1.0f), 0.0f);
+		U.AbsorbPerM = VoxelMarchCausticAbsorbPerM();
+		// Narrowed ONCE, here, and only ever added to a camera-relative offset
+		// on the GPU -- the standing rule for world-scale magnitudes in this
+		// renderer (see FVoxelLightVolumeParameters::OriginRelCameraUU).
+		U.CamXYm = FVector2f(float(CameraWorldUU.X * 0.01), float(CameraWorldUU.Y * 0.01));
+		{
+			FScopeLock Lock(&GCausticBathyLock);
+			if (!GCausticBathyValid || !GCausticBathyTextureRHI.IsValid() ||
+			    GCausticBathySizeUU <= 0.0)
+			{
+				// A published window is the ONE thing there is no fallback for:
+				// with no depth the term would paint caustics on dry ground.
+				VoxelMarchLogCausticDecline(
+					EVoxelMarchCausticDecline::NoWindow,
+					TEXT("UVoxelBathyFieldSubsystem has published no bathy window (no fine tier "
+					     "resident, or the T_VoxelBathyInfo asset failed its size/format guard)"));
+				return Off;
+			}
+			U.TextureRHI = GCausticBathyTextureRHI;
+			// Differenced in DOUBLE and narrowed once -- differencing in float
+			// at world scale is the catastrophic cancellation the light
+			// volume's origin comment documents.
+			U.Window = FVector4f(float(GCausticBathyOriginUU.X - CameraWorldUU.X),
+			                     float(GCausticBathyOriginUU.Y - CameraWorldUU.Y),
+			                     float(1.0 / GCausticBathySizeUU), 1.0f);
+			// THE FADE MUST FINISH INSIDE THE WINDOW, and this is what makes
+			// that true however the two cvars are set. Outside the window the
+			// shader's UV test cuts the term dead, so a fade end beyond the
+			// window's half-extent would draw a HARD SQUARE EDGE around the
+			// camera -- the same artefact the material's own Chebyshev edge
+			// fade exists to prevent (bathy_field_graph FADE_START/FADE_END).
+			// 0.9 of the half-extent leaves the cut a comfortable 48 m past
+			// the point where the term is already zero.
+			const float MaxFadeUU = float(GCausticBathySizeUU * 0.5 * 0.9);
+			U.Gate.Y = FMath::Min(U.Gate.Y, MaxFadeUU);
+			U.Gate.Z = FMath::Clamp(U.Gate.Z, U.Gate.Y + 1.0f, MaxFadeUU);
+		}
+		GLastCausticDecline = EVoxelMarchCausticDecline::None;
+		if (!GLoggedCausticEngaged)
+		{
+			GLoggedCausticEngaged = true;
+			UE_LOG(LogVoxelMarch, Display,
+			       TEXT("Caustics (R7): ENGAGED. intensity %.3f (march %.2f x water %.2f), "
+			            "sin(sunAlt) %.3f, fade %.0f-%.0f m, field scale %.2f m speed %.2f "
+			            "sharpness %.1f, absorb/m (%.3f %.3f %.3f), window origin rel camera "
+			            "(%.0f %.0f) UU size %.0f UU."),
+			       U.Field.W, MarchGain, WaterGain, SunZ, U.Gate.Y * 0.01f, U.Gate.Z * 0.01f,
+			       U.Field.X, U.Field.Y, U.Field.Z, U.AbsorbPerM.X, U.AbsorbPerM.Y,
+			       U.AbsorbPerM.Z, U.Window.X, U.Window.Y,
+			       U.Window.Z > 0.0f ? 1.0f / U.Window.Z : 0.0f);
+		}
 		return U;
 	}
 
@@ -5450,6 +5742,46 @@ void VoxelMarchPublishSunColour(const FLinearColor& SunColour, const FLinearColo
 	GVSColourPublished.store(1);
 }
 
+void VoxelMarchPublishBathyField(UTexture2D* InfoTexture, const FVector2D& OriginUU, double SizeUU,
+                                 bool bValid)
+{
+	// GAME THREAD. Called by UVoxelBathyFieldSubsystem every time it publishes
+	// a window (and with bValid false when it drops one), which is once per
+	// ~120 m of camera travel -- see VoxelBathyField.h's refill rule.
+	check(IsInGameThread());
+
+	// THE RESOURCE IS FETCHED HERE AND DEREFERENCED ON THE RENDER THREAD, which
+	// is the only place FTextureResource::TextureRHI is valid to read. The
+	// pointer survives the hop because a UTexture2D releases its resource
+	// through a render command too, and render commands run in order: a release
+	// enqueued after this call cannot execute before it. The REF we then take
+	// keeps the RHI texture alive for as long as the marcher holds it, so a
+	// texture destroyed between two emits degrades to a stale window rather
+	// than to a dangling read -- and the subsystem calls this with bValid false
+	// on the way down, which clears it outright.
+	FTextureResource* Resource =
+		(bValid && InfoTexture) ? InfoTexture->GetResource() : nullptr;
+	const bool bWanted = bValid && (Resource != nullptr) && (SizeUU > 0.0);
+
+	ENQUEUE_RENDER_COMMAND(VoxelMarchPublishBathyField)(
+		[Resource, OriginUU, SizeUU, bWanted](FRHICommandListImmediate&)
+		{
+			FScopeLock Lock(&GCausticBathyLock);
+			if (!bWanted || !Resource->TextureRHI.IsValid())
+			{
+				// DROPPED WHOLE, not half-updated: a valid flag standing over a
+				// released texture is the one state the emit cannot check for.
+				GCausticBathyTextureRHI.SafeRelease();
+				GCausticBathyValid = false;
+				return;
+			}
+			GCausticBathyTextureRHI = Resource->TextureRHI;
+			GCausticBathyOriginUU = OriginUU;
+			GCausticBathySizeUU = SizeUU;
+			GCausticBathyValid = true;
+		});
+}
+
 float VoxelMarchGetShadowMaskFloor_RenderThread()
 {
 	// Under the master's OFF arm this is 0.0 EXACTLY: the shadow mask then
@@ -6349,6 +6681,40 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchEmitParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<uint2>, MarchVis)
 	SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, MarchHitT)
 	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, MarchTileList)
+	// ---- R7: THE CAUSTIC TERM (docs/water-realism-analysis-2026-09-06.md) ---
+	//
+	// The lake and sea FLOORS are drawn by this pass and by nothing else in the
+	// near field (observation 4d), so this is where the Phase F1 caustic light
+	// has to land. The field itself is shared HLSL -- /VoxelEarth/VoxelCaustics
+	// .ush -- and these are the only things the marcher has to hand it.
+	//
+	// ScaleM, Speed, Sharpness, Intensity. Intensity is the WHOLE off switch:
+	// voxel.Water.Caustics * voxel.March.Caustics, zeroed outright when the sun
+	// is below the field's altitude gate, and the shader skips the block when
+	// it is not positive.
+	SHADER_PARAMETER(FVector4f, MarchCausticField)
+	// The bathy window: xy = its minimum corner RELATIVE TO THE CAMERA in UU,
+	// z = 1/(window size in UU), w = 1 when a window has been published. The
+	// offset is differenced in double and narrowed once, host-side; see the
+	// same discipline at FVoxelLightVolumeParameters::OriginRelCameraUU.
+	SHADER_PARAMETER(FVector4f, MarchCausticWindow)
+	// sin(sun altitude), fade start UU, fade end UU, unused.
+	SHADER_PARAMETER(FVector4f, MarchCausticGate)
+	// The water's absorption coefficient per metre per channel, applied down
+	// the SUN ray. DERIVED from the same two optical constants both water
+	// generators derive theirs from -- see MakeMarchCaustics for the mirror
+	// note, which is the one place in this file that types them.
+	SHADER_PARAMETER(FVector3f, MarchCausticAbsorbPerM)
+	// The camera's absolute world XY in METRES, narrowed once. The shader adds
+	// the (small) camera-relative hit offset to it to get the absolute world XY
+	// the field must be evaluated on.
+	SHADER_PARAMETER(FVector2f, MarchCausticCamXYm)
+	// BOUND ON EVERY EMIT, armed or not -- the same rule the two uniform
+	// buffers at the top of this struct are bound under, and for the same
+	// reason: raw AddPass, no ClearUnusedGraphResources, an unset texture is an
+	// RDG validation failure and not a black frame. GBlackTexture stands in.
+	SHADER_PARAMETER_TEXTURE(Texture2D, MarchBathyTexture)
+	SHADER_PARAMETER_SAMPLER(SamplerState, MarchBathySampler)
 	RDG_BUFFER_ACCESS(MarchDrawArgs, ERHIAccess::IndirectArgs)
 	RENDER_TARGET_BINDING_SLOTS()
 END_SHADER_PARAMETER_STRUCT()
@@ -7550,6 +7916,11 @@ class FVoxelMarchEmitPS : public FGlobalShader
 		// picking up the same file compiles the pre-L3 shader verbatim. The
 		// .usf defaults the define to 0 for exactly that reader.
 		OutEnvironment.SetDefine(TEXT("VOXEL_LIGHTVOL_BOUND"), 1);
+		// R7, and the same argument one line up: only this binary binds
+		// MarchBathyTexture and the caustic uniforms, so only this binary may
+		// compile the block that reads them. An older binary picking this .usf
+		// off disk gets the pre-R7 emit verbatim.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_CAUSTICS"), 1);
 	}
 };
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchEmitPS, VOXEL_MARCH_USF, "VoxelMarchEmitPS", SF_Pixel);
@@ -12295,6 +12666,28 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->MarchHitT = Entry->HitDistance;
 		Params->MarchTileList = GraphBuilder.CreateSRV(Entry->EmitTileList, PF_R32_UINT);
 		Params->MarchDrawArgs = Entry->EmitDrawArgs;
+		{
+			// R7: the caustic light on submerged terrain. Derived against the
+			// frame's OWN view origin -- the same camera the hit positions are
+			// relative to -- so the window offset and the absolute world XY the
+			// field is evaluated on cannot disagree.
+			const FVoxelMarchCausticUniforms C = MakeMarchCaustics(Entry->ViewOriginUU);
+			Params->MarchCausticField = C.Field;
+			Params->MarchCausticWindow = C.Window;
+			Params->MarchCausticGate = C.Gate;
+			Params->MarchCausticAbsorbPerM = C.AbsorbPerM;
+			Params->MarchCausticCamXYm = C.CamXYm;
+			// BOUND EVEN ON THE OFF ARM -- raw AddPass, no
+			// ClearUnusedGraphResources, so an unbound texture is a validation
+			// failure and not a dark frame. The shader never samples it when
+			// MarchCausticField.w is 0.
+			FRHITexture* BathyRHI = C.TextureRHI.IsValid()
+				? C.TextureRHI.GetReference()
+				: GBlackTexture->TextureRHI.GetReference();
+			Params->MarchBathyTexture = BathyRHI;
+			Params->MarchBathySampler =
+				TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		}
 
 		// THE SLOT ARRAY MUST BE CONTIGUOUS, and this is the whole reason the
 		// velocity slot is conditional rather than always 6.

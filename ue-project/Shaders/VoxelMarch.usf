@@ -595,6 +595,11 @@
 // Buffer<float> global they do not bind is an unbound SRV that reads ZEROS,
 // which at this datum is sea level. See the file's own header.
 #include "/VoxelEarth/VoxelHeightPyramid.ush"
+// R7 (docs/water-realism-analysis-2026-09-06.md): the caustic field, shared
+// with the water material generators rather than transcribed. Header-only --
+// two functions and four #defines, no globals, so unlike the include above it
+// has no binding hazard and its order does not matter.
+#include "/VoxelEarth/VoxelCaustics.ush"
 
 #ifndef VOXEL_MARCH_TILE_SIZE
 #define VOXEL_MARCH_TILE_SIZE 8
@@ -781,6 +786,42 @@ RWBuffer<uint> MarchOutDrawArgs;
 Texture2D<uint2> MarchVis;
 Texture2D<float> MarchHitT;
 Buffer<uint>     MarchTileList;
+
+// ---- R7: the caustic term's bindings ------------------------------------
+//
+// DECLARED HERE BY HAND, like every other loose parameter in this file, and
+// GUARDED, like MarchOutHoleStats above: only FVoxelMarchEmitPS binds these,
+// so only its permutation may declare them. Off is not merely unread -- the
+// globals do not exist -- which is what keeps the depth-only and verify
+// entry points compiling from this same source with no bindings of their own.
+// See the block in VoxelMarchEmitPS for what they mean and where they come
+// from (VoxelMarchRenderer.cpp, FVoxelMarchEmitParameters).
+#ifndef VOXEL_MARCH_CAUSTICS
+#define VOXEL_MARCH_CAUSTICS 0
+#endif
+#if VOXEL_MARCH_CAUSTICS
+float4 MarchCausticField;        // ScaleM, Speed, Sharpness, Intensity
+float4 MarchCausticWindow;       // bathy origin rel camera UU (xy), 1/sizeUU, valid
+float4 MarchCausticGate;         // sin(sun altitude), fade start UU, fade end UU, unused
+float3 MarchCausticAbsorbPerM;   // the water's absorption per metre, per channel
+float2 MarchCausticCamXYm;       // camera absolute world XY, metres
+// (2) SUBMERGED-BED DARKENING (owner-directed 2026-09-08). The marcher draws
+// the near-field lake bed, so the terrain materials' SubmergedDarken /
+// SubmergedRampM (terrain_material_common.py) are mirrored here as
+// constants: same factor, same two numbers, same bathy channel -- ONE colour
+// authority, one darkening. They are #defines and not loose parameters
+// because binding two more floats is a C++ change (VoxelMarchRenderer's
+// caustic bindings), and the material half had to ship tonight; the C++
+// pair that makes these a live dial is in the backlog. The term rides the
+// caustic bathy sample below and is therefore gated with it
+// (VOXEL_MARCH_CAUSTICS, MarchCausticField.w > 0, inside the fade end) --
+// caustics OFF turns the marcher's bed darkening off with it, which is a
+// known limit of the no-C++ version, stated in the backlog.
+#define VOXEL_MARCH_SUBMERGED_DARKEN 0.45f
+#define VOXEL_MARCH_SUBMERGED_RAMP_M 0.30f
+Texture2D    MarchBathyTexture;
+SamplerState MarchBathySampler;
+#endif
 
 // The box inset, lifted verbatim from VoxelMarchSpike.usf with its reason: the
 // walk's first act is floor(pos/10) + origin, and a point sitting exactly on a
@@ -3549,6 +3590,103 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 			// which reads as a cave lit from nowhere. 1.0 with the volume off.
 			Emissive += BaseColor * MarchVSWrapColorAndSkyBoost.rgb * Deficit * VoxelSkyScale;
 		}
+
+		// ---- R7: THE CAUSTIC LIGHT ON THE LAKE AND SEA FLOOR --------------
+		//
+		// docs/water-realism-analysis-2026-09-06.md R7, and observation 4d is
+		// the whole reason it is here rather than in a material: the Phase F1
+		// caustic term was wired into M_VoxelTerrain and M_VoxelClipmap, and
+		// NEITHER SHADES A NEAR-FIELD TERRAIN PIXEL in the shipped config
+		// (voxel.Terrain.RetireQuads 1 produces no terrain quads at all; the
+		// clipmap's inner hole is 8,192 m). A lake bed at 50-300 m is drawn by
+		// THIS PASS. So the owner's "caustics are at 0.5 and I see none" was
+		// never a tuning problem -- the light was being added to materials that
+		// do not draw the floor.
+		//
+		// ADDITIVE, ON EMISSIVE, for water_sky_reflection_graph's reason: this
+		// is a LIGHT arriving at the floor, and folding it into BaseColor would
+		// multiply it by AO and by the diffuse response, i.e. would darken a
+		// caustic filament in a crease where the real thing is at its
+		// brightest.
+		//
+		// THE DEPTH COMES FROM THE BATHY FIELD, which is the same channel the
+		// water material reads (VoxelBathyField.h: R = water depth in metres,
+		// B = "the bake answered this cell"). Both are honoured, and so is the
+		// window's own validity flag -- they fail independently, and reading
+		// only one of them draws every lake in the world as infinitely shallow.
+		//
+		// WHAT THIS SHARES ITS LIMIT WITH. A bathy texel is a COLUMN: it says
+		// how deep the water at this XY is, not whether THIS point is under it.
+		// A boulder standing proud in a lake therefore gets caustics on its
+		// top. That is exactly the approximation the terrain material's own
+		// consumer makes with the same channel (create_voxel_material.py), so
+		// the marcher inherits a known bound rather than inventing a new one;
+		// closing it needs a water-surface Z the marcher does not have.
+		//
+		// OFF ARM: MarchCausticField.w (voxel.Water.Caustics, folded with
+		// voxel.March.Caustics and the sun's altitude host-side) is 0 and the
+		// branch is not taken -- Emissive is the exact expression the line
+		// above computed. Byte-identical, the standing rule.
+		//
+		// COMPILE GUARD, same argument as VOXEL_LIGHTVOL_BOUND above: this
+		// .usf is read from disk by whatever binary is running, and only a
+		// binary that binds MarchBathyTexture may compile a reference to it.
+		// The guard is defined (and the globals declared) beside MarchVis at
+		// the top of this file, because a loose parameter in this project is
+		// declared BY HAND -- nothing generates these declarations.
+	#if VOXEL_MARCH_CAUSTICS
+		if (MarchCausticField.w > 0.0f && MarchCausticWindow.w > 0.0f)
+		{
+			// EXACT, rather than leaning on PreViewTranslation == -ViewOrigin
+			// the way the GI probe above does: the caustic window is published
+			// as an offset from the CAMERA, so if translated world ever stops
+			// being camera-relative this term must move with the camera and
+			// not with the translation.
+			const float3 HitRelCam = HitTWS - ResolvedView.TranslatedWorldCameraOrigin;
+			const float DistUU = length(HitRelCam);
+			// Past the fade end the term is zero by construction, so pay the
+			// compare and not the texture fetch. This is the hottest pass in
+			// the frame and most of a lake shot is past the window anyway.
+			if (DistUU < MarchCausticGate.z)
+			{
+				const float2 BathyUV = (HitRelCam.xy - MarchCausticWindow.xy) * MarchCausticWindow.z;
+				if (all(BathyUV > 0.0f) && all(BathyUV < 1.0f))
+				{
+					const float4 Bathy = Texture2DSampleLevel(MarchBathyTexture,
+					                                          MarchBathySampler, BathyUV, 0);
+					const float DepthM = Bathy.r * Bathy.b;
+					if (DepthM > 0.0f)
+					{
+						// (2) The bed under water is darker. BOTH halves of the
+						// marcher's colour take the factor: Emissive is the
+						// ambient term already built from BaseColor above, and
+						// BaseColor itself goes on to GBufferC below, where the
+						// deferred pass lights it with the sun. Applied BEFORE
+						// the caustic light is added, so caustics stay bright on
+						// a dark floor rather than being dimmed with it. Same
+						// factor as terrain_material_common.py's SubmergedDarken.
+						const float SubmergedDark = lerp(1.0f, VOXEL_MARCH_SUBMERGED_DARKEN,
+						                                 saturate(DepthM / VOXEL_MARCH_SUBMERGED_RAMP_M));
+						BaseColor *= SubmergedDark;
+						Emissive *= SubmergedDark;
+						// ABSOLUTE world XY in metres -- the coordinate the
+						// field must be evaluated on so that this floor and
+						// M_Underwater's view of the same floor draw the SAME
+						// pattern. Assembled from a camera XY narrowed once
+						// host-side plus a small camera-relative offset, which
+						// is the standing rule for world-scale magnitudes.
+						const float2 PosM = MarchCausticCamXYm + HitRelCam.xy * 0.01f;
+						Emissive += VoxelCausticLight(PosM, ResolvedView.GameTime, DepthM,
+						                              DistUU, MarchCausticGate.x,
+						                              MarchCausticField,
+						                              MarchCausticGate.yz,
+						                              MarchCausticAbsorbPerM);
+					}
+				}
+			}
+		}
+	#endif // VOXEL_MARCH_CAUSTICS
+
 		OutSceneColor = float4(Emissive, 0.0f);
 	}
 

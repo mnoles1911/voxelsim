@@ -65,6 +65,23 @@ FColor Darkened(const FColor& Colour, float Amount)
 	              uint8(FMath::RoundToInt(float(Colour.G) * Scale)),
 	              uint8(FMath::RoundToInt(float(Colour.B) * Scale)), Colour.A);
 }
+
+FColor Mix(const FColor& A, const FColor& B)
+{
+	// Byte space, like Darkened and for the same reason -- see the header.
+	return FColor(uint8((int32(A.R) + int32(B.R)) / 2), uint8((int32(A.G) + int32(B.G)) / 2),
+	              uint8((int32(A.B) + int32(B.B)) / 2), uint8((int32(A.A) + int32(B.A)) / 2));
+}
+
+FColor Over(const FColor& Src, float Alpha, const FColor& Dst)
+{
+	const float A = FMath::Clamp(Alpha, 0.f, 1.f);
+	auto Channel = [A](uint8 S, uint8 D)
+	{
+		return uint8(FMath::Clamp(FMath::RoundToInt(float(S) * A + float(D) * (1.f - A)), 0, 255));
+	};
+	return FColor(Channel(Src.R, Dst.R), Channel(Src.G, Dst.G), Channel(Src.B, Dst.B), 255);
+}
 } // namespace VoxelUITheme
 
 // --- FVoxelMenuLayout::Get --------------------------------------------------
@@ -145,15 +162,9 @@ FVoxelMenuLayout Load()
 	VOXELUI_LAYOUT_FLOAT(MainPanelHalfHeight);
 	VOXELUI_LAYOUT_FLOAT(MainColumnSeparation);
 	VOXELUI_LAYOUT_FLOAT(TitleToButtonsSpacer);
-	// Registered so the title width can be retuned from a capture without a
-	// rebuild -- which matters more here than for the other layout floats,
-	// because the only way to check it is to shoot the menu and measure the
-	// rendered span. See TitleBoxWidth in the header.
-	VOXELUI_LAYOUT_FLOAT(TitleBoxWidth);
 	VOXELUI_LAYOUT_FLOAT(QuitSpacer);
 	VOXELUI_LAYOUT_FLOAT(ButtonMinHeight);
 	VOXELUI_LAYOUT_INT(ButtonFontSize);
-	VOXELUI_LAYOUT_INT(TitleFontSize);
 	VOXELUI_LAYOUT_INT(SubtitleFontSize);
 	VOXELUI_LAYOUT_INT(VersionFontSize);
 	VOXELUI_LAYOUT_FLOAT(VersionInsetLeft);

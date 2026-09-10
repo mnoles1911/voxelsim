@@ -34,6 +34,8 @@
 #include "VoxelRiverRibbonActor.h" // Phase 4: river ribbons past the implicit disc
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
+#include "VoxelFineTileStreamer.h" // EnumerateTilesOnDisk / TileForWorldUU -- VoxelEarthSpawn::ResolveSpawnColumnUU
+#include "Misc/ConfigCacheIni.h"   // DefaultSpawnColumnM -- VoxelEarthSpawn::ResolveSpawnColumnUU
 
 namespace
 {
@@ -99,6 +101,201 @@ bool ParseSpawnColumnUU(double& OutWorldX, double& OutWorldY)
 	OutWorldX = SpawnMetersX * 100.0; // meters -> UU (1 UU = 1 cm)
 	OutWorldY = SpawnMetersY * 100.0;
 	return true;
+}
+
+namespace SpawnRuleDetail
+{
+// "On the ground": the coarse ground must clear sea level (z=0) by this much.
+// 2 m keeps a 30 m/px beach sample at the waterline from resolving to a spawn
+// that the 1.875 m bake then puts ankle-deep in the sea. The ORIGIN failed this
+// by 386 m, which is the case the rule exists for; the margin is for the edges.
+constexpr double kMinDryGroundUU = 2.0 * 100.0;
+
+// How far the streaming rings reach from the spawn column on the first frame:
+// the 4,096 m outer ring (DefaultGame.ini, "A COLUMN NEAR A TILE EDGE NEEDS
+// ITS NEIGHBOURS"). A column is only acceptable if every tile that reach
+// touches is baked, or the very first RecomputeDesiredSet trips the fatal
+// residency gate at the tile boundary.
+constexpr double kRingReachUU = 4096.0 * 100.0;
+
+// Is this column somewhere the rule allows a player to start?
+bool ColumnIsBakedAndDry(const UVoxelWorldSubsystem& Sub, const TSet<FIntPoint>& Baked, double XUU, double YUU,
+                         FString& OutWhyNot)
+{
+	const double Reach[5][2] = {{0.0, 0.0},
+	                            {-kRingReachUU, -kRingReachUU},
+	                            {kRingReachUU, -kRingReachUU},
+	                            {-kRingReachUU, kRingReachUU},
+	                            {kRingReachUU, kRingReachUU}};
+	for (const auto& Offset : Reach)
+	{
+		const FIntPoint Tile = FVoxelFineTileStreamer::TileForWorldUU(XUU + Offset[0], YUU + Offset[1]);
+		if (!Baked.Contains(Tile))
+		{
+			OutWhyNot = FString::Printf(TEXT("fine tile (%d,%d) is not on disk"), Tile.X, Tile.Y);
+			return false;
+		}
+	}
+	// The COARSE sampler, deliberately: it is ungated (SampleTerrainHeightUU's
+	// contract), so asking it never blocks on a tile load and never trips the
+	// fine tier's leak detector. The fine tier's own answer, once the tile is
+	// resident, differs from this by amplifier detail, not by hundreds of
+	// metres -- and RestartPlayer grounds the pawn on the true walkable surface
+	// afterwards anyway.
+	const double GroundUU = Sub.SampleTerrainHeightUU(XUU, YUU);
+	if (GroundUU < kMinDryGroundUU)
+	{
+		OutWhyNot = FString::Printf(TEXT("coarse ground is %.1f m against sea level 0 (need >= %.1f m)"),
+		                            GroundUU / 100.0, kMinDryGroundUU / 100.0);
+		return false;
+	}
+	return true;
+}
+
+struct FResolvedSpawn
+{
+	TWeakObjectPtr<const UWorld> World;
+	double XUU = 0.0;
+	double YUU = 0.0;
+	bool bOverride = false;
+};
+} // namespace SpawnRuleDetail
+
+bool ResolveSpawnColumnUU(const UWorld* World, double& OutWorldX, double& OutWorldY)
+{
+	using namespace SpawnRuleDetail;
+
+	// 1. The switch still wins, byte-for-byte.
+	if (ParseSpawnColumnUU(OutWorldX, OutWorldY))
+	{
+		return true;
+	}
+	OutWorldX = 0.0;
+	OutWorldY = 0.0;
+
+	// 2. Self-driving runs and runs without a fine tier keep (0,0). This is the
+	// clause that leaves every fixture, capture leg and coarse-tier A/B exactly
+	// as it was; the rule is about the shipping path.
+	if (!VoxelFrontEnd::IsEnabledThisRun())
+	{
+		return false;
+	}
+	const UVoxelWorldSubsystem* Sub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	const FVoxelFineTileStreamer* Fine = Sub ? Sub->GetFineTileStreamer() : nullptr;
+	if (Fine == nullptr)
+	{
+		return false;
+	}
+
+	// Resolved ONCE PER WORLD and remembered: the pawn spawn, the sky rig and
+	// the loading gate all ask on the same tick, they must get one answer, and
+	// one log line -- not three -- is the record of it. A PIE restart is a new
+	// UWorld and re-resolves; a dead weak pointer never compares equal.
+	static TOptional<FResolvedSpawn> Remembered;
+	if (Remembered.IsSet() && Remembered->World.IsValid() && Remembered->World.Get() == World)
+	{
+		OutWorldX = Remembered->XUU;
+		OutWorldY = Remembered->YUU;
+		return Remembered->bOverride;
+	}
+
+	// 3. The preferred column: DefaultSpawnColumnM (metres) from DefaultGame.ini,
+	// else the origin. A preference, not an answer -- it goes through the same
+	// test as everything else.
+	double PreferredXUU = 0.0;
+	double PreferredYUU = 0.0;
+	FString PreferredSource = TEXT("the origin (no DefaultSpawnColumnM in DefaultGame.ini)");
+	{
+		FString Configured;
+		if (GConfig &&
+		    GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelEarthGameMode"), TEXT("DefaultSpawnColumnM"), Configured,
+		                       GGameIni) &&
+		    !Configured.IsEmpty())
+		{
+			FString XStr, YStr;
+			if (Configured.Split(TEXT(","), &XStr, &YStr))
+			{
+				PreferredXUU = FCString::Atod(*XStr) * 100.0;
+				PreferredYUU = FCString::Atod(*YStr) * 100.0;
+				PreferredSource = FString::Printf(TEXT("DefaultSpawnColumnM=%s"), *Configured);
+			}
+			else
+			{
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("Spawn rule: DefaultSpawnColumnM='%s' is malformed (want X,Y in metres); treating the ")
+				       TEXT("preference as the origin."),
+				       *Configured);
+			}
+		}
+	}
+
+	const TArray<FIntPoint> OnDisk = Fine->EnumerateTilesOnDisk();
+	const TSet<FIntPoint> Baked(OnDisk);
+
+	FResolvedSpawn Result;
+	Result.World = World;
+	FString WhyNot;
+	if (ColumnIsBakedAndDry(*Sub, Baked, PreferredXUU, PreferredYUU, WhyNot))
+	{
+		Result.XUU = PreferredXUU;
+		Result.YUU = PreferredYUU;
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Spawn rule: new game spawns at (%.0f, %.0f) m -- %s, its tile and its 4,096 m ring reach are ")
+		       TEXT("baked and the ground is above sea level (%d fine tile(s) on disk)."),
+		       Result.XUU / 100.0, Result.YUU / 100.0, *PreferredSource, OnDisk.Num());
+	}
+	else
+	{
+		// 4. Nearest baked tile centre with dry ground. Centres only: 7,680 m to
+		// any edge, so the ring reach is inside the tile and no neighbour is
+		// needed (the same argument DefaultGame.ini makes for measurement sites).
+		TArray<FIntPoint> Candidates = OnDisk;
+		Candidates.Sort([PreferredXUU, PreferredYUU](const FIntPoint& A, const FIntPoint& B)
+		{
+			const FVector2D CA = FVoxelFineTileStreamer::TileCentreWorldUU(A);
+			const FVector2D CB = FVoxelFineTileStreamer::TileCentreWorldUU(B);
+			return FVector2D::DistSquared(CA, FVector2D(PreferredXUU, PreferredYUU)) <
+			       FVector2D::DistSquared(CB, FVector2D(PreferredXUU, PreferredYUU));
+		});
+		bool bFound = false;
+		int32 Rejected = 0;
+		FString LastReason;
+		for (const FIntPoint& Tile : Candidates)
+		{
+			const FVector2D Centre = FVoxelFineTileStreamer::TileCentreWorldUU(Tile);
+			if (ColumnIsBakedAndDry(*Sub, Baked, Centre.X, Centre.Y, LastReason))
+			{
+				Result.XUU = Centre.X;
+				Result.YUU = Centre.Y;
+				bFound = true;
+				UE_LOG(LogVoxelEarth, Log,
+				       TEXT("Spawn rule: the preferred column (%.0f, %.0f) m [%s] is not a legal start (%s), so the new ")
+				       TEXT("game spawns at the centre of fine tile (%d,%d) = (%.0f, %.0f) m, the nearest baked tile ")
+				       TEXT("with dry ground (%d candidate(s) rejected first; %d tile(s) on disk)."),
+				       PreferredXUU / 100.0, PreferredYUU / 100.0, *PreferredSource, *WhyNot, Tile.X, Tile.Y,
+				       Result.XUU / 100.0, Result.YUU / 100.0, Rejected, OnDisk.Num());
+				break;
+			}
+			++Rejected;
+		}
+		if (!bFound)
+		{
+			// Nothing on disk qualifies. Say so and leave (0,0): the fine tier's
+			// own gate will then fail loudly at the origin, which is the correct
+			// failure for a box with no usable bake -- fabricating a spawn is not.
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("Spawn rule: NO fine-baked tile with dry ground under %s (%d tile(s) on disk, last rejection: ")
+			       TEXT("%s). Spawning at the origin, which will not work -- bake a tile or pass -VoxelSpawnAt."),
+			       *Fine->TilesDirectory(), OnDisk.Num(),
+			       OnDisk.Num() > 0 ? *LastReason : *WhyNot);
+		}
+	}
+
+	Result.bOverride = !(FMath::IsNearlyZero(Result.XUU) && FMath::IsNearlyZero(Result.YUU));
+	Remembered = Result;
+	OutWorldX = Result.XUU;
+	OutWorldY = Result.YUU;
+	return Result.bOverride;
 }
 } // namespace VoxelEarthSpawn
 
@@ -4529,9 +4726,14 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	// fix") so the pawn and the sky actors can never land on different columns.
 	double SpawnWorldX = 0.0;
 	double SpawnWorldY = 0.0;
-	if (ParseSpawnColumnUU(SpawnWorldX, SpawnWorldY))
+	// THE SPAWN RULE goes through here (VoxelEarthSpawn::ResolveSpawnColumnUU):
+	// -VoxelSpawnAt still wins; otherwise an ordinary launch resolves to a
+	// fine-baked column with dry ground, and a self-driving run keeps (0,0).
+	if (VoxelEarthSpawn::ResolveSpawnColumnUU(World, SpawnWorldX, SpawnWorldY))
 	{
-		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSpawnAt override: spawning at column (%.1f, %.1f) m"),
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Spawn column override: spawning at column (%.1f, %.1f) m (-VoxelSpawnAt, or the fine-baked ")
+		       TEXT("spawn rule -- see the 'Spawn rule:' line above)."),
 		       SpawnWorldX / 100.0, SpawnWorldY / 100.0);
 	}
 

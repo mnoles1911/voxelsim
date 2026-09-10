@@ -66,7 +66,28 @@ public class VoxelEarthUI : ModuleRules
 			// manager -- see that file for why. FImageUtils loads this module
 			// dynamically; naming it here keeps the dependency list honest
 			// about what the module actually uses.
-			"ImageWrapper"
+			// FJsonObject / FJsonSerializer, for the map's saved marks
+			// (VoxelMapMarks.cpp -> Saved/VoxelWorlds/<seed>.vxmarks.json).
+			// PRIVATE, and it has to be named here rather than inherited:
+			// VoxelEarth uses Json for meta.json but lists it PRIVATELY too, so
+			// nothing propagates to this module.
+			"Json",
+			"ImageWrapper",
+			// ---- The threaded loading curtain, 2026-09-07 (Phase 4) --------
+			// GetMoviePlayer()/FLoadingScreenAttributes, used in WIDGET-ONLY
+			// mode: no movie streamer is registered and MoviePaths stays empty,
+			// so nothing here plays video. What we want from the module is the
+			// one thing only it owns -- FSlateLoadingSynchronizationMechanism,
+			// the engine's Slate loading thread, which paints and ticks the
+			// curtain while the game thread is inside a long world tick.
+			// PRIVATE on purpose: no VoxelEarthUI header names a MoviePlayer
+			// type, so the dependency stops at VoxelLoadingCurtainThread.cpp.
+			"MoviePlayer",
+			// FMoviePlayerProxy::BlockingStarted/Finished. A separate tiny
+			// module from MoviePlayer (MoviePlayerProxy.Build.cs depends on
+			// Core alone) and the supported entry point for "the game thread
+			// is about to block; put the loading screen on its own thread".
+			"MoviePlayerProxy"
 		});
 	}
 }

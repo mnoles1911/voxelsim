@@ -98,6 +98,10 @@ void FVoxelUIAssetLibrary::RescanBackgrounds()
 {
 	Entries.Reset();
 	Order.Reset();
+	// The extra entries index into Entries, which has just been emptied, so the
+	// map has to go with it -- a stale index here would hand the map screen a
+	// menu background.
+	ExtraByPath.Reset();
 	// Invalidates every decode currently in flight; see FEntry / Generation.
 	++Generation;
 
@@ -168,6 +172,24 @@ void FVoxelUIAssetLibrary::ShuffleOrder(FRandomStream& Stream)
 
 const FSlateBrush* FVoxelUIAssetLibrary::RequestBackground(int32 Index)
 {
+	// GAME THREAD ONLY (2026-09-07, Phase 4). The loading curtain may now be
+	// PAINTED on the engine's Slate loading thread across a long world tick
+	// (VoxelLoadingCurtainThread.h), so this accessor has a second caller
+	// thread -- and bDecodeStarted / bDecodeFailed are, as FEntry's own comment
+	// says, game-thread-only flags; Entries and ExtraByPath are game-thread
+	// containers; and the decode's completion lands through an AsyncTask that
+	// assumes it is racing nothing. Starting or registering a decode from the
+	// loading thread would race all three.
+	//
+	// Refusing costs nothing, because the caller's contract for a nullptr is
+	// ALREADY "draw nothing this frame and ask again" -- stated in this
+	// function's own tail comment. The only visible consequence is that an
+	// image whose turn comes up during a blocked frame fades in a few frames
+	// later than it would have.
+	if (!IsInGameThread())
+	{
+		return nullptr;
+	}
 	if (Order.Num() == 0)
 	{
 		return nullptr;
@@ -193,6 +215,62 @@ const FSlateBrush* FVoxelUIAssetLibrary::RequestBackground(int32 Index)
 	// which for a crossfade means the incoming image simply starts at zero
 	// opacity for a few frames longer, and for the menu means one flat frame
 	// before the art appears.
+	return nullptr;
+}
+
+const FSlateBrush* FVoxelUIAssetLibrary::RequestImageFile(const FString& AbsolutePath)
+{
+	// See RequestBackground: same reason, and this one also MUTATES Entries and
+	// ExtraByPath on a miss.
+	if (!IsInGameThread())
+	{
+		return nullptr;
+	}
+	if (AbsolutePath.IsEmpty() || FVoxelFrontEndSwitches::Get().bNoAssets)
+	{
+		return nullptr;
+	}
+
+	int32 EntryIndex = INDEX_NONE;
+	if (const int32* Found = ExtraByPath.Find(AbsolutePath))
+	{
+		EntryIndex = *Found;
+	}
+	else
+	{
+		// EXISTENCE IS CHECKED ONCE, HERE, rather than left to the decode. The
+		// map raster is optional by design and a missing file is the normal
+		// case on a checkout that never generated one; letting it become a
+		// decode failure would log a warning every time the map opened.
+		if (!IFileManager::Get().FileExists(*AbsolutePath))
+		{
+			UE_LOG(LogVoxelUI, Log, TEXT("UI image %s not present; the caller draws its fallback."), *AbsolutePath);
+			ExtraByPath.Add(AbsolutePath, INDEX_NONE);
+			return nullptr;
+		}
+		FEntry Entry;
+		Entry.Path = AbsolutePath;
+		EntryIndex = Entries.Add(MoveTemp(Entry));
+		ExtraByPath.Add(AbsolutePath, EntryIndex);
+	}
+
+	if (EntryIndex == INDEX_NONE || !Entries.IsValidIndex(EntryIndex))
+	{
+		return nullptr;
+	}
+	FEntry& Entry = Entries[EntryIndex];
+	if (Entry.Brush.IsValid())
+	{
+		return Entry.Brush.Get();
+	}
+	if (Entry.bDecodeFailed)
+	{
+		return nullptr;
+	}
+	if (!Entry.bDecodeStarted)
+	{
+		BeginDecode(EntryIndex);
+	}
 	return nullptr;
 }
 

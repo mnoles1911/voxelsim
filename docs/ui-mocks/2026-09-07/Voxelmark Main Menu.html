@@ -1,0 +1,106 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Main Menu" subtitle="Title screen — hover-tracking gold cartouche, patch callout, version stamp" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Voxelmark — Main Menu</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  /* Title screen opts out of body-level pixelated rendering so concept-art
+     backdrops render smoothly. Everything else (chrome, type) is still
+     sharp via the explicit shadow stacks. */
+  html,body{ margin:0; padding:0; height:100%; background:#000; overflow:hidden; }
+  body{ image-rendering:auto; -webkit-font-smoothing:antialiased; font-smooth:auto; }
+
+  /* Fit-stage scaler — design lives in a fixed 2560×1440 frame (1920×1080 authored, scaled ×1.333) and is
+     scaled uniformly to fit any viewport, letterboxed on black. Same
+     pattern as deck-stage / game UIs rendered at a target resolution. */
+  .fit-viewport{
+    position:fixed; inset:0;
+    display:flex; align-items:center; justify-content:center;
+    background:#000;
+  }
+  .stage{
+    position:relative;
+    width:1920px; height:1080px; zoom:1.33333;
+    transform-origin:center center;
+    overflow:hidden;
+    background:#000;
+    flex-shrink:0;
+  }
+
+  /* logo block — top-right, V1 scale */
+  .stage .title-logo{ position:absolute; top:80px; right:100px; z-index:5; }
+  /* menu list — right-aligned under the logo */
+  .stage .title-menu{ position:absolute; top:400px; right:160px; width:640px; z-index:5; }
+  /* patch-notes callout — top-left */
+  .stage .callout-news{ position:absolute; top:80px; left:60px; z-index:5; }
+
+  /* scene layers stay confined to the stage, not the viewport */
+  .stage .scene-bg,
+  .stage .scene-tint,
+  .stage .scene-vignette,
+  .stage .bg-grain{ position:absolute; }
+</style>
+</head>
+<body>
+  <div class="fit-viewport">
+    <div class="stage" id="stage">
+    <!-- atmospheric backdrop -->
+    <div class="scene-bg" style="background-image:url('assets/menu_backgrounds/cave_background1.jpg')"></div>
+    <div class="scene-vignette"></div>
+    <div class="scene-tint"></div>
+    <div class="bg-grain"></div>
+
+    <!-- patch / news callout -->
+    <aside class="callout-news">
+      <div class="callout-news__glyph">✦</div>
+      <div class="callout-news__body">
+        <div class="callout-news__tag">PATCH 0.18 — THE BRONZE AGE</div>
+        <div class="callout-news__title">Metalsmithing Update</div>
+        <div class="callout-news__copy">
+          Copper and tin now spawn in surface veins. Smelt them together for
+          bronze: a full tool tier that mines faster and lasts four times as
+          long as stone. New crafting stations — bloomery, crucible and anvil.
+          Worn tools can be reforged instead of thrown away.
+        </div>
+      </div>
+    </aside>
+
+    <!-- hero logo -->
+    <header class="title-logo">
+      <div class="title-logo__name">VOXELMARK</div>
+    </header>
+
+    <!-- menu -->
+    <nav class="title-menu">
+      <button class="title-menu__item">CONTINUE</button>
+      <button class="title-menu__item active">NEW GAME</button>
+      <button class="title-menu__item">LOAD GAME</button>
+      <button class="title-menu__item">SETTINGS</button>
+      <button class="title-menu__item">HELP</button>
+      <button class="title-menu__item">CREDITS</button>
+      <button class="title-menu__item quit">QUIT</button>
+    </nav>
+
+    <div class="version-stamp bl">DEV BUILD v0.18.2</div>
+    </div><!-- /.stage -->
+  </div><!-- /.fit-viewport -->
+
+  <script>
+    // Uniformly scale the 2560×1440 stage to fit any viewport.
+    (function fitStage(){
+      const stage = document.getElementById('stage');
+      function fit(){
+        const sx = window.innerWidth  / 2560;
+        const sy = window.innerHeight / 1440;
+        const s  = Math.min(sx, sy);
+        stage.style.transform = `scale(${s})`;
+      }
+      window.addEventListener('resize', fit, { passive:true });
+      fit();
+    })();
+  </script>
+</body>
+</html>

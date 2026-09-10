@@ -1453,14 +1453,20 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 
 bool AVoxelClipmapActor::GetCameraLocationUU(FVector& OutCameraLocationUU) const
 {
-	// Same fallback chain as AVoxelOceanActor::UpdateFollowPlane.
+	// Same fallback chain as AVoxelOceanActor::UpdateFollowPlane, with the
+	// VoxelGI guard: the camera cache is the ORIGIN until its first update
+	// (GetCameraCacheTime() == 0), and on 2026-09-08 an unattended leg died on
+	// frame 1 because IsCameraUnderRock walked IsSolidAtVoxel up a column at
+	// (0,0), whose tile is not baked (Saved/capture-chainproof-boat2.log). The
+	// pawn is posed from the frame it exists, so it is the truthful camera
+	// until the manager has run once.
 	UWorld* World = GetWorld();
 	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
 	if (!PC || !PC->GetPawn())
 	{
 		return false;
 	}
-	if (PC->PlayerCameraManager)
+	if (PC->PlayerCameraManager && PC->PlayerCameraManager->GetCameraCacheTime() > 0.f)
 	{
 		OutCameraLocationUU = PC->PlayerCameraManager->GetCameraLocation();
 		return true;
@@ -1606,6 +1612,19 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 		{
 			CaveLamp->SetRelativeLocation(CameraLocUU - GetActorLocation());
 		}
+	}
+
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): everything
+	// from here down is real per-frame terrain-mesh work (recenter snapping
+	// plus round-robin RebuildLevel) with no vista to build while the front
+	// end holds the world. The veil block above stays: IsCameraUnderRock
+	// already fails open under IsWorldHeldForMenu (see its own gate at
+	// :722-ish above) and is cheap either way.
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
+	{
+		return;
 	}
 
 	// CONCENTRIC recenter (the ring-seam fix). ALL levels share ONE

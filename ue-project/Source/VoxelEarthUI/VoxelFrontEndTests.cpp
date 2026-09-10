@@ -8,6 +8,11 @@
 // that maps an odd name onto an empty string writes into the saves root itself.
 // Those are what this file covers.
 //
+// 2026-09-08 adds two of the same shape: the world stamp's ordinal, and the
+// journal fixture's dates. A placeholder journal card dated one day into the
+// FUTURE is the purest example of the class -- it is a correct-looking screen
+// and there is no frame in which it looks wrong.
+//
 // It is also the only part of this work that a machine with no display can run,
 // which matters given the whole front end was written somewhere with no engine
 // at all.
@@ -16,6 +21,8 @@
 //   UnrealEditor-Cmd.exe VoxelEarth.uproject -unattended -nullrhi -nop4 \
 //     -ExecCmds="Automation RunTests VoxelEarth.FrontEnd; Quit"
 
+#include "VoxelScreenData.h"
+#include "VoxelUIStrings.h"
 #include "VoxelUITheme.h"
 #include "VoxelWorldReadyProbe.h"
 #include "VoxelSaveLibrary.h"
@@ -260,6 +267,168 @@ bool FVoxelFrontEndSwitchPolicyTest::RunTest(const FString& Parameters)
 	// The match is case-sensitive by construction; a lowercase spelling is a
 	// different switch and must not inherit the classification.
 	TestFalse(TEXT("classification is case-sensitive"), IsSelfDrivingSwitchName(TEXT("Voxelgicavetest")));
+
+	return true;
+}
+
+// --- The world stamp and the journal's dates ---------------------------------
+//
+// WHY THIS IS HERE AND THE REST OF THE JOURNAL IS NOT. Everything else about
+// that screen is pixels, and pixels are the owner's to judge on a capture. What
+// is testable is the pair of pure functions underneath it: the ordinal, whose
+// 11/12/13 exception is the thing every inline version gets wrong, and
+// SeedJournal's date anchoring, which is INVISIBLE when it breaks -- a
+// placeholder card dated one day into the future looks exactly like a
+// placeholder card dated correctly, and it shipped that way.
+//
+// Both take their calendar as arguments, so neither needs a world, a sky
+// subsystem or a viewport.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFrontEndWorldStampTest, "VoxelEarth.FrontEnd.WorldStamp",
+                                 VoxelFrontEndTestsDetail::kTestFlags)
+
+bool FVoxelFrontEndWorldStampTest::RunTest(const FString& Parameters)
+{
+	// 1. THE ORDINAL. The first three take their own suffix; 11, 12 and 13 do
+	// not, despite ending in 1, 2 and 3; and the exception repeats every century,
+	// which is the half a last-digit-only implementation gets wrong.
+	TestEqual(TEXT("1st"), VoxelUIStrings::Ordinal(1).ToString(), FString(TEXT("1st")));
+	TestEqual(TEXT("2nd"), VoxelUIStrings::Ordinal(2).ToString(), FString(TEXT("2nd")));
+	TestEqual(TEXT("3rd"), VoxelUIStrings::Ordinal(3).ToString(), FString(TEXT("3rd")));
+	TestEqual(TEXT("4th"), VoxelUIStrings::Ordinal(4).ToString(), FString(TEXT("4th")));
+	TestEqual(TEXT("11th, not 11st"), VoxelUIStrings::Ordinal(11).ToString(), FString(TEXT("11th")));
+	TestEqual(TEXT("12th, not 12nd"), VoxelUIStrings::Ordinal(12).ToString(), FString(TEXT("12th")));
+	TestEqual(TEXT("13th, not 13rd"), VoxelUIStrings::Ordinal(13).ToString(), FString(TEXT("13th")));
+	TestEqual(TEXT("21st"), VoxelUIStrings::Ordinal(21).ToString(), FString(TEXT("21st")));
+	TestEqual(TEXT("the mock's own year"), VoxelUIStrings::Ordinal(18).ToString(), FString(TEXT("18th")));
+	TestEqual(TEXT("111th, the repeat of the exception"),
+	          VoxelUIStrings::Ordinal(111).ToString(), FString(TEXT("111th")));
+	// UNGROUPED. FText::AsNumber's default would make this "1,000th".
+	TestEqual(TEXT("a four-digit year does not group"),
+	          VoxelUIStrings::Ordinal(1000).ToString(), FString(TEXT("1000th")));
+
+	// 2. THE FOUR SEASON LABELS, in VoxelSky::SeasonIndexFromDayOfYear's own
+	// numbering. An index outside 0..3 is EMPTY, not a guess -- WorldStamp reads
+	// that emptiness as "there was no sky to ask" and drops the season half.
+	TestEqual(TEXT("index 0 is spring"), VoxelUIStrings::SeasonLabel(0).ToString(), FString(TEXT("Spring")));
+	TestEqual(TEXT("index 1 is summer"), VoxelUIStrings::SeasonLabel(1).ToString(), FString(TEXT("Summer")));
+	TestEqual(TEXT("index 2 is autumn"), VoxelUIStrings::SeasonLabel(2).ToString(), FString(TEXT("Autumn")));
+	TestEqual(TEXT("index 3 is winter"), VoxelUIStrings::SeasonLabel(3).ToString(), FString(TEXT("Winter")));
+	TestTrue(TEXT("INDEX_NONE names no season"), VoxelUIStrings::SeasonLabel(INDEX_NONE).IsEmpty());
+
+	// 3. THE STAMP ITSELF. The mock's own line, reproduced exactly, is the
+	// clearest statement of what this composes -- both Voxelmark Journal.html and
+	// Voxelmark Death Screen.html print it for day 12 of the 18th year.
+	TestEqual(TEXT("the mock's stamp, reproduced"),
+	          VoxelUIStrings::WorldStamp(12, VoxelUIStrings::SeasonLabel(1), 18).ToString(),
+	          FString(TEXT("Day 12 · Summer, 18th Year of the Second Age")));
+
+	// 4. THE TWO WAYS IT DEGRADES, both of which a capture leg with no sky
+	// subsystem actually hits. Day 0 means "this session cannot name a day" and
+	// every caller omits the stamp entirely rather than drawing a blank one; a
+	// missing season or year falls back to the day alone rather than printing
+	// "Day 11 · , 0th Year of the Second Age".
+	TestTrue(TEXT("day zero produces no stamp at all"),
+	         VoxelUIStrings::WorldStamp(0, VoxelUIStrings::SeasonLabel(1), 18).IsEmpty());
+	TestEqual(TEXT("no season falls back to the day"),
+	          VoxelUIStrings::WorldStamp(11, FText::GetEmpty(), 18).ToString(),
+	          FString(TEXT("Day 11")));
+	TestEqual(TEXT("no year falls back to the day"),
+	          VoxelUIStrings::WorldStamp(11, VoxelUIStrings::SeasonLabel(1), 0).ToString(),
+	          FString(TEXT("Day 11")));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFrontEndJournalSeedTest, "VoxelEarth.FrontEnd.JournalSeed",
+                                 VoxelFrontEndTestsDetail::kTestFlags)
+
+bool FVoxelFrontEndJournalSeedTest::RunTest(const FString& Parameters)
+{
+	using VoxelScreenData::SeedJournal;
+
+	auto Calendar = [](int32 Day, int32 Year, int32 SeasonIndex)
+	{
+		FVoxelSeedCalendar C;
+		C.Day = Day;
+		C.Year = Year;
+		C.Season = VoxelUIStrings::SeasonLabel(SeasonIndex);
+		return C;
+	};
+
+	// THE DEFECT THIS FILE WAS EXTENDED FOR. The owner's session was on day 11
+	// and the newest placeholder card was stamped day 12: an entry from tomorrow,
+	// in a journal a player cannot tell from a real one. The invariant is not
+	// "the newest card says 11" but "no card is dated after today", which is what
+	// stays true when somebody changes the fixture's shape.
+	{
+		const FVoxelJournalData Data = SeedJournal(FText::GetEmpty(), Calendar(11, 1, 1));
+		TestEqual(TEXT("three placeholder cards"), Data.Entries.Num(), 3);
+		for (const FVoxelJournalEntry& E : Data.Entries)
+		{
+			TestTrue(TEXT("no entry is dated after the live day"), E.Day <= 11);
+			TestTrue(TEXT("no entry is dated before day one"), E.Day >= 1);
+		}
+		TestEqual(TEXT("the newest card IS today"), Data.Entries[0].Day, 11);
+		TestEqual(TEXT("and it is stamped with today's calendar"),
+		          Data.Entries[0].Stamp.ToString(),
+		          FString(TEXT("Day 11 · Summer, 1st Year of the Second Age")));
+	}
+
+	// A RE-ANCHORING, NOT A REWRITE. On a world that really is on day 12 the
+	// three cards are the mock's own 12 / 9 / 1, which is what makes it safe to
+	// compare a capture taken after this change against one taken before it.
+	{
+		const FVoxelJournalData Data = SeedJournal(FText::GetEmpty(), Calendar(12, 18, 1));
+		TestEqual(TEXT("newest is the mock's 12"), Data.Entries[0].Day, 12);
+		TestEqual(TEXT("middle is the mock's 9"), Data.Entries[1].Day, 9);
+		TestEqual(TEXT("oldest is the mock's 1"), Data.Entries[2].Day, 1);
+		TestEqual(TEXT("and the mock's own stamp comes back"),
+		          Data.Entries[0].Stamp.ToString(),
+		          FString(TEXT("Day 12 · Summer, 18th Year of the Second Age")));
+	}
+
+	// A WORLD YOUNGER THAN THE FIXTURE'S SPACING. Day 2 collapses the middle card
+	// onto the first; a duplicate date is deliberate and an entry dated after
+	// today is not. Day 1 is the tightest case there is.
+	{
+		const FVoxelJournalData Data = SeedJournal(FText::GetEmpty(), Calendar(2, 1, 3));
+		TestEqual(TEXT("newest follows the live day down"), Data.Entries[0].Day, 2);
+		TestTrue(TEXT("the middle card cannot go below day one"), Data.Entries[1].Day >= 1);
+		TestTrue(TEXT("nothing is dated after day two"),
+		         Data.Entries[0].Day <= 2 && Data.Entries[1].Day <= 2 && Data.Entries[2].Day <= 2);
+	}
+	{
+		const FVoxelJournalData Data = SeedJournal(FText::GetEmpty(), Calendar(1, 1, 0));
+		for (const FVoxelJournalEntry& E : Data.Entries)
+		{
+			TestTrue(TEXT("on day one every card is day one"), E.Day == 1);
+		}
+	}
+
+	// NO CALENDAR AT ALL -- an unattended capture leg with no sky subsystem. The
+	// fixture falls back to the mock's 12 / Summer / 18 rather than dating
+	// everything day zero, because a -VoxelScreenShot of the journal has to
+	// photograph a journal with dates in it.
+	{
+		const FVoxelJournalData Data = SeedJournal(FText::GetEmpty(), FVoxelSeedCalendar());
+		TestEqual(TEXT("falls back to the mock's newest day"), Data.Entries[0].Day, 12);
+		TestEqual(TEXT("and to the mock's whole stamp"),
+		          Data.Entries[0].Stamp.ToString(),
+		          FString(TEXT("Day 12 · Summer, 18th Year of the Second Age")));
+	}
+
+	// DETERMINISTIC. Same calendar in, same journal out -- the property that lets
+	// a capture of this screen be compared with an earlier one at all.
+	{
+		const FVoxelJournalData A = SeedJournal(FText::GetEmpty(), Calendar(7, 3, 2));
+		const FVoxelJournalData B = SeedJournal(FText::GetEmpty(), Calendar(7, 3, 2));
+		TestEqual(TEXT("same card count"), A.Entries.Num(), B.Entries.Num());
+		for (int32 I = 0; I < A.Entries.Num(); ++I)
+		{
+			TestEqual(TEXT("same day"), A.Entries[I].Day, B.Entries[I].Day);
+			TestEqual(TEXT("same stamp"), A.Entries[I].Stamp.ToString(), B.Entries[I].Stamp.ToString());
+		}
+	}
 
 	return true;
 }

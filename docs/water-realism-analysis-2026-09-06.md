@@ -796,6 +796,77 @@ and the owner judges frames.
 * **A/B.** Four captures at one pose: baseline; `SkyLightAtGroundZ 1`;
   `FogInSkyCapture 0`; both. OFF arm = the shipped defaults, byte-identical.
 
+#### MEASURED 2026-09-07 (session: R2/R3/R5). VERDICT PENDING OWNER.
+
+**No code change was made and none is needed to run this.** R2 is written up
+above as C++ work; it is not. Both cvars already exist, both are already applied
+live every frame, and both say in their own help text that they are live
+*specifically so this sweep could be shot* through `-ExecCmds`
+(`VoxelSkySubsystem.cpp:786-811`, `ApplySkyLightPlacement` at `:4232`,
+`ApplyFogFromState`'s capture flag at `:4486-4492`). The shipped defaults are
+untouched: flipping them is an appearance change and belongs to the owner, on
+these frames.
+
+Four arms, one settled pose (`-65102,-51084`, +6 m, pitch -18, yaw 45, 75 s
+settle, frozen 12:00 03-20), all four shot against **one identical water
+material** (md5 `C316CBC8…`, verified unchanged across every arm and verified
+free of the other session's debug arms via the regen log's `SHORE FX ARM: ON` /
+no-debug-marker check).
+
+| arm | frame | far water dRGB | mid water dRGB | near water dRGB | sky ctrl | land ctrl |
+|---|---|---|---|---|---|---|
+| baseline | `VoxelVerify00874.png` | — | — | — | — | — |
+| `SkyLightAtGroundZ 1` | `VoxelVerify00884.png` | +5.95/+5.97/+5.61 | +18.6/+21.8/+25.1 | -14.0/-10.8/-10.3 | 0.08 | 0.32 |
+| `FogInSkyCapture 0` | `VoxelVerify00888.png` | +7.90/+7.37/+6.43 | +30.3/+32.0/+32.9 | -5.5/-2.6/-1.0 | 0.05 | 0.20 |
+| both | `VoxelVerify00890.png` | +6.07/+6.09/+5.79 | +19.2/+22.5/+26.6 | -13.7/-10.4/-9.1 | 0.08 | 0.31 |
+
+(Frames in `ue-project/Saved/Screenshots/WindowsEditor/`; logs
+`Saved/capture-r2-*.log`. dRGB is the mean 0-255 change against the baseline.)
+
+**The engagement proof passed, and it is a read-back, not an echo.**
+`SkyLightAtGroundZ 1` logs the capture point moving `z=0.0 m -> z=1644.2 m` read
+back off the actor; `FogInSkyCapture 0` logs `inRealTimeSkyCapture=1 -> 0` read
+back off the component. The two controls did not move: the sky band by 0.05-0.08
+and the land band by 0.20-0.32 out of 255, i.e. nothing. **The exposure did not
+move, so the pair is valid** — and the slab breakdown puts the whole difference
+in the water (top slab, sky and dunes, mean |diff| 0.86; the water slabs 12-45).
+
+**The null of `VoxelMarchRenderer.cpp:1016-1021` genuinely does not transfer, as
+predicted.** That sweep found nothing on marched faces. On a water pose the same
+two cvars move the mid-water band by up to **32/255**. R2's reasoning for
+re-running it was correct.
+
+**Direction: it does what the section predicted, and more than predicted.** Far
+and mid water get **brighter and bluer** — in the mid band the blue channel
+gains most (+25.1 against red's +18.6 for `SkyLightAtGroundZ`, +26.6 vs +19.2
+for both), which is exactly "stop mirroring grey soup and start mirroring an
+actual sky". The near field gets **darker** (-9 to -14), which is the same
+mechanism read the other way: the near water is looking at a steeper part of the
+cubemap and no longer picks up the fog's flat grey lift.
+
+**The single biggest arm is `FogInSkyCapture 0` ALONE, not both together, and
+that is not a measurement error.** `nofog` moves the mid band +31.7 mean; `both`
+moves it +22.8. The arms are strongly non-additive because they are two ways of
+fixing the *same* defect: once the capture is lifted to ground z the fog around
+it is thin anyway, so removing the fog from it adds almost nothing. `both` lands
+essentially on top of `groundz` alone (mid +22.8 vs +21.8), confirming this.
+If the owner wants one cvar rather than two, `FogInSkyCapture 0` is the one
+carrying the picture.
+
+**A correction to this section's arithmetic, from the run's own log.** The
+"2187.6 m below the player / 15.7 fog units / 1960x" figures are for the seed
+this document was written against. At the pose actually shot the spawn column's
+ground is **1644.2 m**, and the fog APPLIED line reports the effective density
+at the capture point as **2.387** against the player's **0.0078** — a factor of
+**305x**, not 1960x. The mechanism and the direction are unchanged; the
+magnitude is a third of the quoted one. Anyone re-deriving should read the log
+line rather than this paragraph.
+
+**UNVERIFIED, and R2 asks for it explicitly: the NIGHT pair was not shot.** The
+risk this section names — that the night exposure rungs were calibrated against
+today's ambient — is untested here. Every frame above is frozen noon. A night
+pair is the remaining work before this can be judged safe to default.
+
 ---
 
 ### R3 — Distance/variance-driven roughness on the water
@@ -843,6 +914,79 @@ and the owner judges frames.
   `/Game/Voxel/M_WaterVoxel` with no MID, so in the ON arm the near field and the
   far field will disagree. For a clean whole-water arm, either regenerate both
   ways or shoot a pose where only sheet water is visible.
+
+#### BUILT AND MEASURED 2026-09-07 (session: R2/R3/R5). VERDICT PENDING OWNER.
+
+**Built as specified**, in `create_water_voxel_material.py` at the roughness
+block: four new `scalar_param`s — `WaterRoughnessFar` (0.30),
+`WaterRoughnessFadeStartM` (60), `WaterRoughnessFadeEndM` (400),
+`WaterRoughnessFarGain` (**0.0**) — lerping the calm arm from 0.08 toward the far
+value over a camera-distance ramp, reusing `water_caustics_graph.py:405-432`'s
+idiom (the one deliberate difference is that this is a ramp that GROWS with
+distance, so it has no closing `OneMinus`). The foam lerp is untouched
+downstream. Regenerated water-only through
+`tools/voxel-sky-chain-regen.ps1 -Only create_water_voxel_material.py`.
+
+**THE OFF ARM IS PROVEN IDENTICAL, not asserted.** Pre-change shipping baseline
+`VoxelVerify00874` against post-regen `WaterRoughnessFarGain:0`
+`VoxelVerify00902`: **mid water dRGB 0.00/0.00/0.00, near water 0.00, sky 0.00,
+land 0.00**, far 0.10. The gate multiplies the ramp by the gain, so at gain 0 the
+alpha is identically zero and `lerp(a, b, 0) == a` exactly; the frame confirms
+it. The material left on disk is therefore safe for every other agent using it.
+
+**The A/B as this section specifies it is a NULL — and the reason is a scale
+error in this section, not in the mechanism.**
+
+| arm | frame | far dRGB | mid dRGB | near dRGB |
+|---|---|---|---|---|
+| `FarGain:1` (ramp 60->400 m, as specified) | `00904` | -0.26/-0.16/-0.13 | -0.01 | 0.00 |
+| ramp rescaled to 10->120 m | `00912` | -4.19/-2.51/-2.27 | -0.01 | 0.00 |
+| ramp collapsed, roughness 0.30 everywhere | `00908` | slab -60.8 | -16.0/-10.5/-16.6 | -11.6/-8.1/-14.0 |
+| ramp collapsed, roughness 0.90 everywhere | `00910` | slab -68.7 | -46.1/-25.5/-43.3 | -45.0/-30.3/-47.1 |
+
+Engagement is proven on every arm by the probe's own log line, and the collapsed
+arms show **roughness is nowhere near inert on this water** — it moves the mid
+band by up to 46/255. So the null of the specified arm is not "roughness does
+nothing"; it is **"the 60 m dead zone contains the entire visible lake."**
+
+**Why: the shipping lake pose is 0.7 m above the surface, so the water in frame
+spans metres, not hundreds of metres.** At `+6 m / -18 deg` the camera sits 0.7 m
+above the lake (the harness measures altitude from the lakebed at 1644.2 m; the
+surface is 5.32 m above that). For a camera height *h* the ground distance at
+depression θ is *h*/tan θ, so with h = 0.7 m the near band (~39° depression) is
+about **0.9 m** away, the mid band about **2 m**, and even the far band just
+below the waterline about **7 m**. Ramping from 60 m to 400 m on a scene whose
+visible water ends inside ~30 m is why nothing moved. This section's instruction
+to "ramp over hundreds of metres, not tens" is right about avoiding a visible
+matte ring, but it was written without a number for how far this pose can
+actually see.
+
+**So R3 is not refuted and not confirmed. It has not yet been tested at a pose
+where its premise holds.** Either judge it from an aerial pose with hundreds of
+metres of water in frame, or rescale the defaults to this pose (roughly
+2 m -> 30 m). The defaults are left at 60/400 and the gain at 0.0, so nothing
+ships either way.
+
+**A REAL WARNING FOR THE OWNER'S JUDGEMENT, from the saturated arms: R3 fights
+R1.** At roughness 0.90 across the whole sheet (`VoxelVerify00910`) the bright
+white SSR reflections of the dunes — the thing R1 was shipped to add, and the
+thing that currently makes this water read as a surface — are **gone**, and the
+lake becomes a flat deep-teal field. Every collapsed arm moves the water
+*darker*, not brighter (mid -16 at roughness 0.30, -46 at 0.90), which is the
+opposite of this section's predicted "keep more of its own colour AND start to
+sparkle". Whatever far-field roughness eventually ships has to be small enough
+to keep the reflections R1 bought.
+
+**Tooling defect found and fixed while running this, and it invalidates other
+people's arms.** `-VoxelWaterMatScalar` applied **only its first `Name:Value`
+pair**: `FParse::Value`'s `bShouldStopOnSeparator` defaults to true and stops at
+the comma, so multi-pair specs were silently truncated while the log printed one
+healthy-looking assignment line. Fixed at `VoxelWaterSheetActor.cpp:325`
+(`bShouldStopOnSeparator=false`), built clean, and proven: the same command line
+that produced one `material scalar ... set` line now produces four, and its frame
+moves 20x further. The whole "collapsed ramp" row above is only measurable
+because of that fix. See `docs/water-ocean-tides-plan-2026-09-04.md`'s 06:00
+entry for which earlier ladder arms this voids.
 
 ---
 
@@ -911,6 +1055,54 @@ and the owner judges frames.
 * **A/B.** `BathyDepthAuthority` ladder first (free, no regen). Then, if built,
   `BakedScatterGain 0` vs `1`.
 
+#### STEP 1 MEASURED 2026-09-07 (session: R2/R3/R5). ANSWER: **IT IS THE SCATTERING.**
+
+R5's step 1 is a measurement and this is it, run exactly as specified and before
+touching anything: `-VoxelWaterMatScalar=BathyDepthAuthority:1.0` against the
+shipped 0.85, same settled lake pose and same material as R2's sweep above.
+
+* baseline `VoxelVerify00874.png`, authority 1.0 `VoxelVerify00894.png`
+* engagement proof: `Lake sheets: material scalar 'BathyDepthAuthority' set to
+  1.0000 (diagnostic override).` in `Saved/capture-r5-auth100.log`
+* controls: sky **0.00**, land **0.01** out of 255. This is the cleanest pair in
+  the session — a sheets-only scalar moves nothing but the sheets.
+
+The metric is a **vertical band-pass on luma** (mean `|I - 9-tap vertical box
+blur|`), which is the right instrument for this artefact and not an impression:
+the contour rings are thin, near-horizontal, dark lines sitting on a smooth
+top-to-bottom depth gradient, so a vertical high-pass keeps the rings and
+discards the gradient they ride on.
+
+| band | contour energy, authority 0.85 | at 1.0 | change |
+|---|---|---|---|
+| near | 0.3264 | 0.3590 | **+0.033** |
+| mid | 0.3749 | 0.4511 | **+0.076** |
+| far | 12.02 | 9.95 | -2.08 (see below) |
+
+**The lines SURVIVE at authority 1.0 — they do not vanish, and they do not
+move. In the near and mid bands the contour energy goes slightly UP.** By this
+section's own decision ladder that is the first branch: *"If the lines survive
+at 1.0 -> it is the scattering, and the fix below applies."* The 15% absorption
+residue is exonerated: taking the engine's absorption share to zero did not
+remove the staircase, so the staircase is being drawn by the term that still
+reads `WaterVolumeDepth`, which is the in-scatter. The third branch (the lines
+MOVE, i.e. the wave field's `BreakSurfFloorM`) is also excluded — the rings are
+in the same place in both frames.
+
+The far band's -2.08 is **not** evidence about contour lines. That band is the
+bright near-horizon strip where the metric is dominated by SSR streaks and wave
+texture (its absolute value, ~12, is thirty times the mid band's); it moves
+because raising the baked authority brightens the far water overall. Read the
+near and mid rows, which is where the owner's "map contour lines" actually are.
+
+**So the R5 fix as written is the indicated change**, with everything this
+section already says about it standing: it contradicts `SCATTERING IS NEVER
+SPLIT` at `create_water_voxel_material.py:995-999`, that reasoning is not wrong,
+and it trades a physically better in-scatter drawn on a staircase for a cruder
+one that is smooth. **NOT BUILT IN THIS SESSION** — the owner is being asked to
+judge that trade on R2's and R3's frames first, and the build is gated behind
+`BakedScatterGain` default 0.0 when it happens.
+
 ---
 
 ### R6 — Make the bed visible again: ladder the slant elongation cap
@@ -945,6 +1137,67 @@ and the owner judges frames.
   reflection work, because a surface that reflects a sky hides its own bed for
   free and physically.
 * **A/B.** The three-rung ladder above, one pose, byte-identical OFF arm = 1.0.
+
+#### R6 MEASURED 2026-09-07 — four rungs, one pose. VERDICT PENDING OWNER.
+
+**THE POSE HAD TO MOVE FIRST, and the reason is worth writing down because it
+would have produced a confident null.** The lake harness at **+2 m / -25 deg is
+SUBMERGED**: `capture-r6-invn2-100.log` reads *"Ocean: camera entered water
+(camera z=164691.4 UU, worldgen ground z=164421.8 UU, submerged depth 3.32 m,
+treatment=M_Underwater)"*. The lake surface at that column stands 5.32 m above
+the ground the spawn measures from, so everything in the frame is drawn by the
+underwater post-process and `BathyRefractInvN2` — a parameter on the
+ABOVE-water sheet material — moves nothing in it. **This also settles
+`VoxelVerify00840`: that frame is not debug paint, it is the underwater view**,
+and the flat blue terraces in it are the lakebed. The ladder therefore ran at
+**+6 m / -18 deg**, which is above the surface, is the shipping baseline, and is
+the grazing framing the owner complained about — where the secant bites hardest.
+
+**The metric is the BED'S OWN STRUCTURE showing through the water.** ADR-0008
+fixes every voxel face at one flat colour, so what a visible bed contributes is
+the 10 cm contour terrace, the per-voxel jitter and AO. The water's own grading
+is a smooth wide-band exponential (observation 5) and contributes almost none of
+it. `det31` below is the standard deviation of the luma high-pass at the terrace
+scale (a 31 px box residual; the terraces are 50-100 px wide at this pose),
+measured over three horizontal bands of the water, band 5 nearest.
+
+    BathyRefractInvN2   det31 band3   band4   band5     G      B    Rshare  frame
+      1.0  (shipped)      0.00190   0.00267  0.00276  .3190  .4405  .1890   00870
+      0.8                 0.00335   0.00372  0.00374  .3283  .4520  .1845   00872
+      0.565 (Snell)       0.00554   0.00555  0.00498  .3398  .4638  .1797   00876
+      0.4                 0.00740   0.00686  0.00588  .3478  .4708  .1768   00878
+
+    frames: ue-project/Saved/Screenshots/WindowsEditor/VoxelVerify0087{0,2,6,8}.png
+    logs:   Saved/capture-r6b-invn2-{100,080,0565,040}.log
+    arms:   -VoxelWaterMatScalar=BathyRefractInvN2:<v>, one pose (+6 m / -18 deg,
+            yaw 45, settle 75 s, frozen noon), voxel.March.Caustics 0 on all four
+            so the ladder moves ONE lever. Each log carries its own
+            "Lake sheets: material scalar 'BathyRefractInvN2' set to N.NNNN"
+            line -- the override is proved per rung, not assumed.
+            LADDER CLEAN: one water material (regen 04:24:32) across all frames.
+
+**Monotone in every band and every column.** Reverting the secant to Snell
+(0.565) multiplies the visible bed structure by **2.9x** in the mid-water band
+and 1.8x nearest; 0.4 takes it to 3.9x. **Red does not move** (.1770 -> .1758)
+and that is the physics, not a null: at 1.118 per metre red is gone at every
+path length on this ladder, so the bed can only come back in green and blue,
+which is exactly what the G and B columns do (+9.0% and +6.9% at Snell).
+
+**And it is visible, not just measurable.** At 1.0 the lower half of the frame
+is featureless dark blue-grey; by 0.4 the bed's stair-stepped contours are
+legible through it and the far shore grows a distinct pale-cyan shallow band
+that the shipped arm does not have. That is the owner's own ask -- "the shallow
+water should read as shallow instead of as more blue paint".
+
+**What this does NOT settle**, and it is the trade R6 was ranked below R1-R3
+for: reverting the secant re-opens the "water is too transparent" complaint the
+secant shipped to answer on 2026-09-05. The ladder says what the lever buys; it
+does not say the owner wants to spend it. The recommendation in this section --
+move the CAP (0.05 -> 0.20) rather than the curve -- was **not** measured,
+because the cap is a bare `b.const(0.05)` inside `bathy_field_graph.
+build_slant_depth` and moving it needs a water-material regeneration, which is
+another session's file. If the owner likes the 0.565 look but not at
+steep angles, the cap is the next experiment and it is one line plus a regen.
 
 ---
 
@@ -992,6 +1245,159 @@ visible — caustics on an invisible bed are invisible caustics.**
   corrected at the same time. Note also that the 2026-09-05 owner verdict on
   F1 — "00734 looks good" (plan `:898`) — was a verdict on a frame in which the
   caustic term contributed **nothing**, so it is not evidence that caustics work.
+
+#### R7 IMPLEMENTED 2026-09-07 — the marcher half. VERDICT PENDING OWNER.
+
+**What changed.** Five files; the field itself is written once and shared.
+
+* **`ue-project/Shaders/VoxelCaustics.ush` (new).** The caustic derivation as
+  HLSL: `VoxelCausticField()` (three panned, mutually-warped interference
+  layers) and `VoxelCausticLight()` (the sun-altitude gate, the submersion
+  gate, the distance fade, and the sun-ray absorption). The field's body sits
+  between two marker lines and is **byte-identical** to
+  `water_caustics_graph.CAUSTIC_CODE`.
+* **`ue-project/Shaders/VoxelMarch.usf`.** `#include`s it, declares the seven
+  new loose parameters beside `MarchVis` under `#if VOXEL_MARCH_CAUSTICS`, and
+  adds the term to `Emissive` in `VoxelMarchEmitPS` immediately before
+  `OutSceneColor` is written. Additive on emissive, not folded into BaseColor —
+  it is a light arriving at the floor, and BaseColor would multiply it by AO
+  and the diffuse response.
+* **`VoxelMarchRenderer.cpp/.h`.** Seven parameters on
+  `FVoxelMarchEmitParameters`; `MakeMarchCaustics()` derives them; six cvars
+  (below); and `VoxelMarchPublishBathyField()`, the game→render wire.
+* **`VoxelBathyField.cpp`.** Calls that wire from `PublishWindow` (same tick as
+  the pixel upload, carrying the origin in **double** rather than through the
+  float the MPC can hold) and from `PublishInvalid`.
+
+**The knobs.** `voxel.Water.Caustics` (unchanged, default 0.5) still gates
+everything; `voxel.March.Caustics` (new, default 1.0) is the marcher's own half
+of the switch, and 0 on either makes the emit byte-identical to the pre-R7 pass
+— the shader skips the whole block. The fade window is `voxel.March.
+CausticFadeStartM` 150 / `CausticFadeEndM` 400, **not** the material's 40/64
+(R7's "fix the fade window"): the bound that matters is the bathy window's
+±480 m, outside which there is no depth to read, and the fade end is clamped
+host-side to 0.9 of the window half-extent so no cvar setting can draw a hard
+square edge around the camera. `voxel.March.CausticScaleM` / `Speed` /
+`Sharpness` mirror `water_caustics_graph.DEFAULTS`.
+
+**Engagement is logged, because armed-and-inert is the failure this would
+otherwise present as.** Five named declines and one engagement line, each said
+once:
+
+    Caustics (R7): ENGAGED. intensity 0.500 (march 1.00 x water 0.50),
+    sin(sunAlt) 0.617, fade 150-400 m, field scale 2.60 m speed 0.55
+    sharpness 6.0, absorb/m (1.118 0.458 0.291), window origin rel camera
+    (-49324 -48600) UU size 96000 UU.
+
+`absorb/m` is **derived** in C++ from `ABSORPTION_DISTANCE_M` and
+`ABSORPTION_COLOR` exactly as `water_optics.absorption_per_m` derives it, not
+pasted — the numbers above are the arithmetic, checkable by hand.
+
+**THE HAND-OFF THAT IS NOT DONE, stated rather than discovered later.**
+`water_caustics_graph.py` still carries its own copy of the field as
+`CAUSTIC_CODE`. It is byte-identical to the `.ush` block today and there is
+nothing to see in a frame, but that is exactly the drift this project has a
+four-times-repeated rule about. The `.ush` header names the one-function hook
+that closes it (`CAUSTIC_CODE = _read_field_body("VoxelCaustics.ush")`, slicing
+between the marker lines, raising if either marker is missing). It was left
+undone deliberately: the water material generators were owned by another
+session on the day this landed, and the marcher half neither needs it nor may
+wait for it. **Whoever owns those generators should take it.** Two smaller items
+travel with it: the material's `CausticFadeStartM`/`EndM` should be overridden
+to match the marcher's window (an instance override, not a regeneration), and
+`create_voxel_material.py:69-70`'s premise plus the F1 rows in
+`docs/water-ocean-tides-plan-2026-09-04.md` are still wrong as written.
+
+**KNOWN BOUND, inherited not invented.** A bathy texel is a COLUMN: it says how
+deep the water at this XY is, not whether *this* point is under it. A boulder
+standing proud in a lake gets caustics on its top. That is the same
+approximation `create_voxel_material.py` makes with the same channel; closing it
+needs a water-surface Z the marcher does not have.
+
+#### R7 MEASURED 2026-09-07 — the term is LIVE and it is SUB-VISIBLE at this lake.
+
+**Cost first, because R7 asked for it and no figure existed anywhere.** The emit
+pass's own GPU time, from `voxel.March.Stats` fired at t+70 s by
+`-VoxelExecAfter` (the only way to get it out of a headless run — the census is
+an on-demand console command and `-ExecCmds` lands at t=0 when `emitFrames` is
+still 0):
+
+    arm                                        emitMs   marchMs
+    caustics 0, submerged  (00868)              0.214    1.871
+    caustics 0, +6 m/-18   (00870)              0.228    4.021
+    caustics 0, +6 m/-18   (00876, invN2 .565)  0.223    3.848
+    caustics 1, submerged  (00880)              0.269    1.864
+    caustics 1, +6 m/-18   (00882, invN2 .565)  0.273    3.852
+
+**+0.05 ms, i.e. +22% of the emit pass and about 0.5% of the frame.** That is
+the whole cost of the term and it is now on the record.
+
+**The A/B, and it is an honest disappointment.** `voxel.March.Caustics` 0 vs 1
+at the submerged pose — the frame where the bed is fully visible because there
+is no water column between the camera and it, and no wave surface to add
+run-to-run noise:
+
+    00868 (off) vs 00880 (on):  mean delta RGB +0.00038 +0.00043 +0.00046
+                                3.91% of pixels move >1/255, 0.02% >4/255,
+                                NONE >12/255.
+
+**Below the visible threshold.** The above-water pair (00876 vs 00882) cannot
+even be read: the wave surface's phase differs between two launches and swamps
+the term at +/-0.40 luma.
+
+**So an ENGAGEMENT PROOF was shot instead, at 8x gain** (`voxel.March.Caustics
+8`, i.e. intensity 4.0), `VoxelVerify00886.png`, delta image at
+`Saved/r7-caustic-delta-x8.png`:
+
+    mean delta RGB   +0.00003  +0.00041  +0.00141     <- R:G:B ~ 1:14:47
+    p99 blue delta   +0.0196 (5/255) ; max luma +0.043
+    structure ratio (stddev/mean) in the near band: 3.71
+
+Three things follow, and together they are conclusive. The delta is **strongly
+blue-weighted in exactly the ratio the sun-ray absorption predicts** (red 1.118,
+green 0.458, blue 0.291 per metre). It is **structured, not a flat lift** — a
+stddev 3.7x its own mean is a filament pattern, which is what a caustic field
+is and what a uniform brightening is not. And it **scales with the gain**. The
+term is wired, bound, engaged (its own log line says so on every run) and
+drawing the right thing.
+
+**WHY IT IS INVISIBLE, and this is the finding, not the bug.** The chain
+`water_caustics_graph` specifies attenuates the caustic down the SUN ray by
+`exp(-absorb * depth / sunZ)`. This lake is **5.3 m deep at the harness column**;
+at noon (sin alt 0.617) that is an 8.1 m sun path, and the survival fractions
+are 0.0001 / 0.024 / 0.094 RGB. **The term is being divided by roughly 500
+before it reaches the floor.** It is designed for shallows — at 0.5 m the same
+factors are 0.40 / 0.69 / 0.79 — and the harness lake is not shallow. So the
+caustic light is now demonstrably ON the floor the player stands beside, which
+is what R7 set out to fix and what observation 4d proved had never happened; it
+is not yet *seen*, because at 5 m of this water nothing is.
+
+**The three levers, all the owner's call, none of them a code fix:**
+
+1. **A shallower pose.** The one thing that would settle it in one frame is a
+   shoreline camera over 0.3-1 m of water. **One attempt was made and missed:**
+   `-SpawnAt '-64961,-50943'` (200 m along yaw 45 toward the shore) found ground
+   2.9 m higher — so the basin does shallow that way — but still put the camera
+   under the surface (`VoxelVerify00892.png`, a clean underwater frame with the
+   bed and the surface both in shot, shot at 8x gain). Finding a genuine 0.3-1 m
+   waterline column needs the bathy field consulted rather than a guess, and it
+   is the obvious next capture.
+2. **Intensity.** `voxel.Water.Caustics` is a live cvar, no rebuild, no regen.
+   At 5 m it would take roughly 8-16x to read.
+3. **The absorption itself.** Real caustics are clearly visible on a 5 m bottom
+   in clear water; ours is calibrated to `ABSORPTION_DISTANCE_M = 3.5` — the
+   "somewhere in between" midpoint the owner approved 2026-08-12 as a
+   *vertical-depth* table. Whether the caustic term should carry that full
+   coefficient down the sun ray, or a fraction of it, is a look decision and
+   `water_optics.py` is its single authority. **Do not fix it by typing a second
+   coefficient in the marcher.**
+
+**Also worth saying plainly, because it is what the owner asked about:** at the
+shipped `voxel.Water.Caustics 0.5` nothing in the picture changes that a person
+would notice. The pre-R7 answer was "the light lands on a material that draws
+nothing"; the post-R7 answer is "the light lands on the floor and the water eats
+it". Those are different problems with different fixes, and only the second one
+is now a tuning question.
 
 ---
 

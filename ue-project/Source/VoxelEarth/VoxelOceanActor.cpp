@@ -288,6 +288,18 @@ void AVoxelOceanActor::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): BuildOceanGrid
+	// and UpdateFollowPlane below are real per-frame mesh rebuild / transform
+	// work with no camera-relative water surface to follow while the front
+	// end holds the world (UpdateUnderwaterState already gates itself at
+	// :733-ish below; this early return makes that redundant but harmless).
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
+	{
+		return;
+	}
+
 	// ---- THE DETAIL TOGGLE, CHECKED AGAINST THE MESH AND NOT AGAINST A FLAG --
 	//
 	// One integer compare per tick, and it is the whole rebuild trigger. The
@@ -646,7 +658,9 @@ void AVoxelOceanActor::UpdateFollowPlane()
 	}
 
 	FVector CameraLoc;
-	if (PC->PlayerCameraManager)
+	// Cache-time guard as in UpdateUnderwaterState below: before the manager's
+	// first update the cache is the origin, and the pawn is the camera.
+	if (PC->PlayerCameraManager && PC->PlayerCameraManager->GetCameraCacheTime() > 0.f)
 	{
 		CameraLoc = PC->PlayerCameraManager->GetCameraLocation();
 	}
@@ -737,7 +751,16 @@ void AVoxelOceanActor::UpdateUnderwaterState(float DeltaTime)
 
 	FVector CameraPos = FVector::ZeroVector;
 	bool bHaveCamera = false;
-	if (PC->PlayerCameraManager)
+	// THE CAMERA CACHE IS THE ORIGIN UNTIL ITS FIRST UPDATE. On 2026-09-08 an
+	// unattended capture leg died on frame 1: the pawn had its spawn pose
+	// applied, but PlayerCameraManager had not run UpdateCamera yet, so
+	// GetCameraLocation() answered (0,0,0), the underwater test asked worldgen
+	// for fine pixel (-2,-2), and tile (-1,-1) is not baked -- a fatal gate leak
+	// under -unattended (Saved/capture-chainproof-boat.log). GetCameraCacheTime()
+	// is 0 exactly until that first update, so until then the pawn's own
+	// location is the truthful camera, and with no pawn there is nothing to be
+	// underwater in front of.
+	if (PC->PlayerCameraManager && PC->PlayerCameraManager->GetCameraCacheTime() > 0.f)
 	{
 		CameraPos = PC->PlayerCameraManager->GetCameraLocation();
 		bHaveCamera = true;

@@ -735,6 +735,14 @@ VECTOR_PARAMS = [
     # Partner of the two RippleField scalars above. Zero is as good a default as
     # any -- with RippleFieldGain at 0 nothing reads it.
     ("RippleFieldOrigin", 0.0, 0.0, 0.0, 0.0),
+    # THE HULL RIPPLE MASK (water_hull_mask_graph.build_hull_ripple_mask,
+    # 2026-09-08): the boat's plan ellipse in world XY, pushed per tick by
+    # AVoxelBoat::PushHullRippleMask. A = (centreX, centreY, cos yaw, sin yaw);
+    # B = (half-length UU, half-beam UU, enabled, edge band UU). Enabled
+    # DEFAULTS TO 0 so a world with no boat, or a boat built before this
+    # parameter existed, multiplies the ripple WPO and foam by exactly 1.0.
+    ("HullEllipseA", 0.0, 0.0, 1.0, 0.0),
+    ("HullEllipseB", 0.0, 0.0, 0.0, 10.0),
 ]
 
 

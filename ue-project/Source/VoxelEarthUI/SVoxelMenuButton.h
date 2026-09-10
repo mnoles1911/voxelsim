@@ -22,6 +22,41 @@
 #include "Framework/SlateDelegates.h" // FOnClicked
 #include "Styling/SlateColor.h"
 
+// WHICH CHROME THIS BUTTON WEARS. One widget, four looks, because focus,
+// navigation, the enabled ladder and the click plumbing are identical across
+// all of them and a second widget class is how two of those start disagreeing.
+enum class EVoxelMenuButtonVariant : uint8
+{
+	// UIStyles.apply_menu_button(): the oak plate with a 2 px stacked border.
+	// Still what every sub-panel control uses.
+	Oak,
+	// .title-menu__item (2026-09-07 title screen). No box: right-aligned
+	// parchment text over the scene art, and on hover or keyboard focus a
+	// translucent gold "cartouche" -- a soft gold fill between a 1 px gold rule
+	// above and below -- with the face growing to ActiveFontSize.
+	Cartouche,
+	// The overlay family's action plate: .se-act / .sv-act / .ld-btn /
+	// .ld-cancel / .ld-filter. A leather-gradient fill inside a 1 px
+	// --leather-edge rule; lit (hover or focus) it takes a --warm-primary
+	// border and a gold label. Primary swaps the fill for the warm plate.
+	Leather,
+	// .pa-btn, the pause list line: no box at all, a "›" chevron, the label
+	// left-aligned, and a hairline rule underneath.
+	PauseItem,
+	// .menu-tab (2026-09-07 wave 2): one tab of the in-game screen bar. An iron
+	// plate with no bottom border, which goes oak with a 3 px gold underline
+	// when it is the open screen. KeyLabel puts the shortcut letter in front of
+	// the name, in the mono face, exactly as the mock's `.menu-tab .key` does.
+	Tab,
+	// .filter-tab / .sect / .subtab / .cat / .sk-class-item / .mode-toggle
+	// button. FIVE MOCK CLASSES, ONE VARIANT: all five are a small iron plate
+	// with a tracked serif label that turns gold on an oak ground when
+	// selected, and four of them additionally carry a count. They differ only
+	// in font size and padding, which are arguments -- the same call made for
+	// Leather, and for the same reason.
+	Chip,
+};
+
 class VOXELEARTHUI_API SVoxelMenuButton : public SCompoundWidget
 {
 public:
@@ -30,11 +65,45 @@ public:
 		, _MinHeight(56.f)
 		, _MinWidth(0.f)
 		, _TextColorOverride()
+		, _Variant(EVoxelMenuButtonVariant::Oak)
+		, _Muted(false)
+		, _Primary(false)
+		, _Danger(false)
+		, _Active(false)
+		, _ContentPadding(FMargin(0.f))
+		, _ActiveFontSize(0)
+		, _LetterSpacing(0)
 	{}
 		SLATE_ATTRIBUTE(FText, Text)
 		SLATE_ARGUMENT(int32, FontSize)
 		SLATE_ARGUMENT(float, MinHeight)
 		SLATE_ARGUMENT(float, MinWidth)
+		SLATE_ARGUMENT(EVoxelMenuButtonVariant, Variant)
+		// Cartouche: the QUIT item -- dimmer at rest, and it does NOT take the
+		// cartouche on hover (the mock's .quit:hover).
+		SLATE_ARGUMENT(bool, Muted)
+		// Leather: the .primary plate -- a --warm-primary/--warm-secondary fill
+		// with #fff8e0 text. The affirmative action of each dialog.
+		SLATE_ARGUMENT(bool, Primary)
+		// Leather and PauseItem: the destructive label colour (.pa-btn.danger,
+		// .ld-btn.del). Independent of Primary; no dialog has both.
+		SLATE_ARGUMENT(bool, Danger)
+		// Leather: .ld-filter.on -- the selected filter chip, which paints like
+		// Primary. AN ATTRIBUTE, not a flag, because exactly one chip of a group
+		// is on at a time and the group's state lives in the panel, not here.
+		SLATE_ATTRIBUTE(bool, Active)
+		// Leather: the plate's own padding (.se-act is 9px 24px, .ld-btn 8/14).
+		// Zero means the variant's default.
+		SLATE_ARGUMENT(FMargin, ContentPadding)
+		// Tab: the shortcut letter drawn before the name (.menu-tab .key).
+		// Chip: the tally drawn after it (.filter-tab .n). Both are empty by
+		// default and both are ATTRIBUTES, because a filter chip's count
+		// changes as the pack is searched.
+		SLATE_ATTRIBUTE(FText, KeyLabel)
+		SLATE_ATTRIBUTE(FText, CountLabel)
+		SLATE_ARGUMENT(int32, ActiveFontSize)
+		// FSlateFontInfo::LetterSpacing units (1/1000 em).
+		SLATE_ARGUMENT(int32, LetterSpacing)
 		// The per-save DELETE button paints its label HP_BRIGHT rather than
 		// INK. Unset means the ordinary INK/GOLD/GOLD_DEEP/INK_MUTE ladder.
 		SLATE_ARGUMENT(TOptional<FLinearColor>, TextColorOverride)
@@ -75,6 +144,64 @@ private:
 	// voxel.UI.HoverSlide: the mock's translateX(4px). Zero by default.
 	FMargin GetHoverSlidePadding() const;
 
+	// "Lit" means hovered or keyboard-focused AND enabled -- the one predicate
+	// every variant's fill, rule, colour and font size keys off, so they cannot
+	// disagree about the state. The Cartouche variant additionally excludes
+	// Muted; that exception lives inside the function rather than at four call
+	// sites.
+	bool IsLit() const;
+	// THE CARTOUCHE HAS TWO WAYS ON, AND ONLY ONE OF THEM IS THE POINTER.
+	//
+	// `.title-menu__item.active` and `.dlg-option.selected` are STATES the mock
+	// sets on the current selection; they are not `:hover`. Keying the gold
+	// band off IsLit() alone made the only selection indicator on the title
+	// screen and in the dialogue overlay depend on the inner SButton holding
+	// keyboard focus -- so anything that takes focus elsewhere (a viewport
+	// click, a capture harness, a panel that focuses its own default) erases
+	// it, which is exactly what the 2026-09-07 captures show on both screens.
+	//
+	// Kept separate from IsLit rather than folded into it: the Leather variant
+	// already reads the same Active attribute through IsWarmPlate, and making
+	// Active imply "lit" there would give a selected filter chip the HOVER
+	// plate as well as the selected one.
+	bool IsCartoucheOn() const;
+	FSlateColor GetCartoucheLabelColour() const;
+	FSlateColor GetCartoucheFillColour() const;
+	FSlateColor GetCartoucheRuleColour() const;
+	FSlateFontInfo GetCartoucheFont() const;
+
+	// Leather (.se-act / .ld-btn / .sv-act / .ld-filter). Whether the plate is
+	// painted warm is Primary OR the Active attribute -- a selected filter chip
+	// is the same plate as a primary action.
+	bool IsWarmPlate() const;
+	FSlateColor GetLeatherFillColour() const;
+	FSlateColor GetLeatherBorderColour() const;
+	FSlateColor GetLeatherLabelColour() const;
+
+	// Tab and Chip (.menu-tab / .filter-tab). Both key off the Active attribute
+	// rather than off IsLit, because a tab is "the open screen" whether or not
+	// the cursor is over it -- the one place in this widget where selection and
+	// lit-ness are different questions.
+	bool IsSelected() const;
+	FSlateColor GetTabFillColour() const;
+	FSlateColor GetTabEdgeColour() const;
+	FSlateColor GetTabLabelColour() const;
+	FSlateColor GetTabKeyColour() const;
+	FSlateColor GetTabUnderlineColour() const;
+
+	// PauseItem (.pa-btn): the label, the chevron, and the chevron's 4 px slide.
+	FSlateColor GetPauseLabelColour() const;
+	FSlateColor GetPauseChevronColour() const;
+	FMargin GetPauseChevronPadding() const;
+
 	TSharedPtr<class SButton> Button;
 	TOptional<FLinearColor> TextColorOverride;
+	EVoxelMenuButtonVariant Variant = EVoxelMenuButtonVariant::Oak;
+	bool bMuted = false;
+	bool bPrimary = false;
+	bool bDanger = false;
+	TAttribute<bool> ActiveAttribute;
+	int32 RestFontSize = 24;
+	int32 ActiveFontSize = 24;
+	int32 LetterSpacing = 0;
 };

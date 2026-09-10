@@ -29,16 +29,27 @@
     tools\voxel-ui-capture.ps1 -Shot Fallback
     tools\voxel-ui-capture.ps1 -Shot Hourglass
     tools\voxel-ui-capture.ps1 -Shot Loading -At '0.5,6,20'
+    tools\voxel-ui-capture.ps1 -Shot Pause
+    tools\voxel-ui-capture.ps1 -Shot Pause -Panel save
+    tools\voxel-ui-capture.ps1 -Shot Screen
+    tools\voxel-ui-capture.ps1 -Shot Screen -Panel map
+    tools\voxel-ui-capture.ps1 -Shot Death
+    tools\voxel-ui-capture.ps1 -Shot Dialogue
+    tools\voxel-ui-capture.ps1 -Shot Hud
     tools\voxel-ui-capture.ps1 -Shot GateSweep -GateRing 2 -MaxHold 180
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Menu', 'Panel', 'Fallback', 'Hourglass', 'Loading', 'GateSweep')]
+    [ValidateSet('Menu', 'Panel', 'Fallback', 'Hourglass', 'Loading', 'GateSweep', 'Pause',
+                 'Screen', 'Death', 'Dialogue', 'Hud')]
     [string]$Shot,
 
-    # -Shot Panel only: which sub-panel to open before the shutter.
-    [ValidateSet('load', 'help', 'credits', 'settings')]
+    # -Shot Panel: which title-screen sub-panel to open before the shutter.
+    # -Shot Pause: which of the pause overlay's four screens.
+    # -Shot Screen: which of the five in-game screens.
+    [ValidateSet('load', 'help', 'credits', 'settings', 'pause', 'save',
+                 'map', 'journal', 'inventory', 'player', 'codex')]
     [string]$Panel = 'load',
 
     # -Shot Loading only: comma-separated seconds to capture at. The default
@@ -48,6 +59,27 @@ param(
 
     # -Shot Hourglass only: comma-separated progress values.
     [string]$Progress = '0.0,0.25,0.5,0.75,1.0',
+
+    # Put a fabricated set of saves in front of the LOAD list and the save
+    # dialog. A capture box has no saves, so without this every picture of the
+    # LOAD dialog is a picture of its empty state -- no tags, no filter chips
+    # doing anything, and no way to see the overwrite band at all. Also
+    # suppresses -VoxelNoLoad on `-Shot Panel -Panel load`, which exists to
+    # guarantee the opposite.
+    [switch]$DemoSaves,
+
+    # Draw the HUD's health and hunger bars, and its interaction prompt, at
+    # fabricated values. Same job as -DemoSaves and the same justification:
+    # this game has no health, hunger or interaction system, so the HUD gates
+    # all three off in play -- a full health bar is a claim, not a decoration --
+    # and without this every picture of the HUD is a picture of its empty
+    # state. Implied by -Shot Hud, which exists to be reviewed against the
+    # mock; pass -NoDemoVitals to photograph the honest in-play HUD instead.
+    [switch]$DemoVitals,
+    [switch]$NoDemoVitals,
+    # 0..100, comma-separated: hp,hunger,wound. Default is the HUD mock's own
+    # TWEAK_DEFAULTS.
+    [string]$Vitals = '100,100,0',
 
     # Hard ceiling on the whole run, seconds. NOT a tuning knob -- it is the
     # backstop that stops a finished-but-unexited editor holding the box all
@@ -65,7 +97,20 @@ param(
     # to check against.
     [string]$Engine = 'D:/UE_5.8',
     [string]$Project,
+    # THE CAPTURE'S RESOLUTION, and -ResX/-ResY are aliases because that is what
+    # the engine switches are called and what a caller reaches for.
+    #
+    # A REQUEST HERE WAS INERT UNTIL 2026-09-08 AND SAID NOTHING. The default
+    # game window is BORDERLESS FULLSCREEN (Saved/Config/WindowsEditor/
+    # GameUserSettings.ini carries FullscreenMode=1), and borderless fullscreen
+    # is by definition the desktop's resolution -- so -ResX=1920 -ResY=1080 was
+    # accepted, echoed in the banner, and produced a 2560x1440 image. See the
+    # -windowed decision and the size check at the bottom of this script: the
+    # request now takes, and a run whose image is not the requested size says so
+    # instead of handing back a picture of a different screen.
+    [Alias('ResX')]
     [int]$Width = 2560,
+    [Alias('ResY')]
     [int]$Height = 1440,
     # Settle before the menu shutter. The background art decodes on a worker
     # and glyphs rasterise lazily, so frame one is a half-built menu.
@@ -132,7 +177,7 @@ switch ($Shot) {
         # An empty LOAD list is the interesting case for a fresh checkout, and
         # -VoxelNoLoad guarantees it rather than depending on what happens to
         # be in Saved/.
-        if ($Panel -eq 'load') { $argList += '-VoxelNoLoad' }
+        if ($Panel -eq 'load' -and -not $DemoSaves) { $argList += '-VoxelNoLoad' }
     }
     'Fallback' {
         # The degraded path: no font, no art. It is the arm nobody exercises
@@ -145,6 +190,53 @@ switch ($Shot) {
     'Loading' {
         $argList += "-VoxelLoadingShotAt=$At"
     }
+    'Pause' {
+        # THE ONE SHOT THAT NEEDS A WORLD. The pause overlay only exists after
+        # hand-off, so this arm drives NEW GAME, skips the load theatre, waits
+        # out the settle twice (once for the world, once for the overlay's
+        # glyphs) and photographs whichever of the four screens -Panel names.
+        #
+        # -VoxelSpawnAt IS MANDATORY, not a tuning knob: the world origin has no
+        # fine tiles and the spawn gate is fatal there. -61440,-61440 is the
+        # column every in-game capture in this repository uses.
+        $argList += @("-VoxelPauseShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+        # -Panel's default is 'load', which is right for -Shot Panel and wrong
+        # here; an unspecified pause shot wants the pause list itself.
+        $pausePanel = if ($PSBoundParameters.ContainsKey('Panel')) { $Panel } else { 'pause' }
+        $argList += "-VoxelPausePanel=$pausePanel"
+    }
+    'Screen' {
+        # THE FOUR ARMS BELOW ALL NEED A WORLD, exactly as 'Pause' does, and
+        # carry the same mandatory -VoxelSpawnAt for the same reason: the world
+        # origin has no fine tiles and the spawn gate is fatal there.
+        $argList += @("-VoxelScreenShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+        # -Panel's default is 'load', which belongs to -Shot Panel; an
+        # unspecified screen shot wants INVENTORY, the one tab with a real
+        # backing system behind it.
+        $screenPanel = if ($PSBoundParameters.ContainsKey('Panel')) { $Panel } else { 'inventory' }
+        $argList += "-VoxelScreenPanel=$screenPanel"
+    }
+    'Death' {
+        $argList += @("-VoxelDeathShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+    }
+    'Dialogue' {
+        $argList += @("-VoxelDialogueShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+    }
+    'Hud' {
+        # Opens nothing: the HUD installs itself as soon as the player has a
+        # pawn, so this arm only has to reach Playing and wait out the settle.
+        $argList += @("-VoxelHudShot=$(Inv $SettleSec)", '-VoxelLoadTheatre=0',
+                      '-VoxelSpawnAt=-61440,-61440')
+        # The vitals bars are the half of this screen the owner is reviewing
+        # and the half nothing can fill, so this shot demos them by default --
+        # the mirror of `-Shot Panel -Panel load` passing -VoxelNoLoad to
+        # guarantee the opposite.
+        if (-not $NoDemoVitals) { $DemoVitals = $true }
+    }
     'GateSweep' {
         # No shutter at all: this arm is a MEASUREMENT, and its output is the
         # VoxelLoadGate lines in the log rather than a picture. Feeds
@@ -155,6 +247,24 @@ switch ($Shot) {
     }
 }
 
+# -windowed WHEN, AND ONLY WHEN, THE REQUEST IS NOT THE DESKTOP'S OWN SIZE.
+# Borderless fullscreen cannot be any size but the desktop's, so a smaller
+# request is only reachable in a real window. The default (2560x1440 on this
+# box) therefore keeps the borderless path every previous capture was taken on
+# -- a windowed 2560x1440 is NOT the same picture, because the window chrome
+# eats ~48 px of height, the shortest side becomes 1392, and the engine's UI
+# scale curve reads 1.29 instead of 1.333 (see docs/adr/0011-scale-tolerant-ui.md).
+$DesktopW = 0; $DesktopH = 0
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $DesktopW = $bounds.Width; $DesktopH = $bounds.Height
+} catch { }
+$Windowed = ($DesktopW -gt 0) -and (($Width -ne $DesktopW) -or ($Height -ne $DesktopH))
+if ($Windowed) { $argList += '-windowed' }
+
+if ($DemoSaves) { $argList += '-VoxelDemoSaves' }
+if ($DemoVitals) { $argList += "-VoxelDemoVitals=$Vitals" }
 if ($ExtraArgs) { $argList += $ExtraArgs }
 
 Write-Host ''
@@ -163,6 +273,8 @@ Write-Host "  shot     : $Shot"
 Write-Host "  editor   : $EditorExe"
 Write-Host "  project  : $Project"
 Write-Host "  log      : $LogPath"
+Write-Host "  requested: ${Width}x${Height}$(if ($Windowed) { ' (windowed)' } else { ' (borderless fullscreen = desktop size)' })"
+Write-Host "  desktop  : $(if ($DesktopW) { "${DesktopW}x${DesktopH}" } else { 'unknown' })"
 Write-Host "  switches : $($argList -join ' ')"
 Write-Host '==============================================================='
 Write-Host ''
@@ -223,7 +335,29 @@ if (Test-Path $ShotDir) {
 if ($new) {
     Write-Host ''
     Write-Host "captured $($new.Count) image(s):"
-    $new | ForEach-Object { Write-Host ("  " + $_.FullName) }
+    # THE SIZE IS MEASURED, NOT ASSUMED. The banner above echoes the parameter;
+    # this reads the pixels. A capture whose image is not the requested size is
+    # a picture of a resolution nobody asked for, and every measurement taken
+    # off it -- an ADR-0011 shell width above all -- is attributed to the wrong
+    # screen. voxel-run-flight-leg.ps1 grew the same check on 2026-08-25 after
+    # exactly this failure, and this script did not have it.
+    $mismatch = $false
+    try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop } catch { }
+    $new | ForEach-Object {
+        $size = ''
+        try {
+            $img = [System.Drawing.Image]::FromFile($_.FullName)
+            $size = " -- $($img.Width)x$($img.Height)"
+            if ($img.Width -ne $Width -or $img.Height -ne $Height) { $mismatch = $true }
+            $img.Dispose()
+        } catch { }
+        Write-Host ("  " + $_.FullName + $size)
+    }
+    if ($mismatch) {
+        Write-Warning ("RESOLUTION MISMATCH: ${Width}x${Height} was requested and the image(s) above are not that size.")
+        Write-Warning ("  Quote the size printed above, never the request. Borderless fullscreen ignores -ResX/-ResY;")
+        Write-Warning ("  a windowed request larger than the desktop work area is shrunk to fit it.")
+    }
 } elseif ($Shot -ne 'GateSweep') {
     Write-Warning "No new screenshot appeared in $ShotDir. Check the log above."
 }

@@ -433,6 +433,35 @@ def build_terrain_base_color(
         # read as a black rim.
         wet = b.mul(wet, b.saturate(inland))
         base = b.mul(base, b.lerp(b.const(1.0), "", b.scalar("WetShoreDarken", 0.55), "", wet))
+    # --- (2) SUBMERGED-BED DARKENING (owner-directed 2026-09-08) --------------
+    #
+    # The WATER side of the wet-shore term above: wherever the baked field says
+    # there is water over this ground, darken the bed. The owner's diagnosis
+    # of the live session was that a white (albedo ~0.9) bed under 10-40 cm of
+    # water reads as no water at all; his ruling: "i accept darkening the
+    # voxel bed colors under any water". A submerged surface IS darker --
+    # the water film fills the microstructure exactly as on the wet band, and
+    # at any real depth the down-and-back path takes more -- so this is the
+    # same Lagarde argument as WetShoreDarken with the depth as its driver:
+    #
+    #     submerged = saturate(depth_m / SubmergedRampM) * validity      (dry -> dark within 0.3 m)
+    #     base     *= lerp(1, SubmergedDarken, submerged)                (then the floor)
+    #
+    # SubmergedDarken 1.0 is the previous terrain bit for bit. Deliberately
+    # OUTSIDE the VOXEL_SHORE_FX arm: it is not a shoreline effect, and a
+    # shore A/B must not silently take the lake bed with it.
+    #
+    # ONE COLOUR AUTHORITY (2026-08-30 ruling): this is not a second colour
+    # source -- it multiplies whatever colour the authority produced, by a
+    # factor that is a function of the baked water depth only. The near-field
+    # bed is drawn by the ray marcher, which applies THE SAME factor with THE
+    # SAME two numbers from the same bathy channel (Shaders/VoxelMarch.usf,
+    # VOXEL_MARCH_SUBMERGED_*). Change both or neither.
+    if bathy is not None:
+        submerged = b.mul(
+            b.saturate(b.div(bathy["depth_m"], b.scalar("SubmergedRampM", 0.30))),
+            bathy["validity"])
+        base = b.mul(base, b.lerp(b.const(1.0), "", b.scalar("SubmergedDarken", 0.45), "", submerged))
 
     # --- generation-time debug bisect ---------------------------------------
     #

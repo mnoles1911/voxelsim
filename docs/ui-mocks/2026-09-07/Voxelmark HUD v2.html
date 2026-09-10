@@ -1,0 +1,251 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark HUD v2" subtitle="Minimalist HUD — wide compass strip, health + hunger over a 10-slot hotbar" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Voxelmark — HUD v2</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  @font-face{font-family:"Macondo Swash Caps";src:url("fonts/MacondoSwashCaps-Regular.ttf") format("truetype");font-weight:400;font-style:normal;font-display:swap}
+  /* VOXELMARK — minimalist HUD
+     Two elements only: a thin top compass strip, and one bottom row of
+     [ HP | HUNGER ] sitting directly on a 10-slot hotbar (1…0).
+     One readable typeface (VT323) throughout. */
+  :root{
+    --bronze:#b07a3a; --bronze-deep:#6b4520; --gold:#f0c14b; --gold-deep:#a87320;
+    --hp:#b8302a; --hp-bright:#e84a3a; --hp-deep:#5a1410; --hp-wound:#5a1410;
+    --stam:#6fb8d8; --stam-deep:#2a5a78;
+    --ink:#f3e6c4; --ink-dim:#b09a72; --ink-mute:#786649;
+    --serif:"Macondo Swash Caps", serif;
+    --mono:"VT323", ui-monospace, monospace;
+    --pixel:"Press Start 2P", monospace;
+    --hotbar-w:694px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#000;overflow:hidden}
+  body{font-family:var(--mono);color:var(--ink);image-rendering:pixelated;-webkit-font-smoothing:none;user-select:none}
+  .fit-viewport{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000}
+  .stage{position:relative;width:1920px;height:1080px;zoom:1.33333;transform-origin:center center;overflow:hidden;background:#000;flex-shrink:0}
+
+  /* world placeholder */
+  .scene{position:absolute;inset:0;z-index:0;background:#0d0a07}
+  .scene-unused{position:absolute;inset:0;z-index:0;background:radial-gradient(120% 60% at 50% 78%, rgba(120,70,30,0.4), transparent 60%),linear-gradient(180deg,#1a1208 0%,#2a1a0c 18%,#4a2a14 38%,#7a4820 52%,#5a3a1c 60%,#2a1e10 72%,#14100a 100%)}
+  .sun{position:absolute;right:14%;top:18%;width:80px;height:80px;background:#f0c14b;box-shadow:0 0 0 6px rgba(240,193,75,0.18),0 0 0 18px rgba(240,193,75,0.08),0 0 80px 28px rgba(240,140,40,0.35)}
+  .skyline{position:absolute;left:0;right:0;bottom:46%;height:140px;background:linear-gradient(90deg,#1a1208 0 4%,#2a1a0c 4% 7%,#1a1208 7% 12%,#2a1a0c 12% 18%,#1a1208 18% 22%,#2a1a0c 22% 28%,#1a1208 28% 35%,#2a1a0c 35% 42%,#1a1208 42% 48%,#2a1a0c 48% 56%,#1a1208 56% 62%,#2a1a0c 62% 70%,#1a1208 70% 78%,#2a1a0c 78% 86%,#1a1208 86% 94%,#2a1a0c 94% 100%);mask:linear-gradient(180deg,#000 60%,transparent 100%);opacity:0.6}
+  .voxel-ground{position:absolute;left:0;right:0;bottom:0;height:55%;background:linear-gradient(180deg,transparent 0%,rgba(0,0,0,0.55) 100%),conic-gradient(from 0deg at 50% 50%,#2a1c10 0deg,#1a1208 90deg,#2a1c10 180deg,#1a1208 270deg);background-size:auto,56px 56px;transform:perspective(800px) rotateX(60deg);transform-origin:50% 100%}
+  .grain{position:absolute;inset:0;pointer-events:none;z-index:2;background:radial-gradient(120% 80% at 50% 60%, transparent 50%, rgba(0,0,0,0.55) 100%),repeating-linear-gradient(0deg, rgba(255,180,80,0.02) 0 1px, transparent 1px 3px);mix-blend-mode:multiply}
+
+  .hud{position:absolute;inset:0;z-index:5;pointer-events:none}
+  .hud > *{pointer-events:auto}
+
+  /* ---------- COMPASS: exact v1 strip ---------- */
+  .compass{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:6}
+  .compass-frame{width:560px;height:24px;position:relative;background:linear-gradient(180deg,rgba(40,28,16,0.85) 0%,rgba(20,14,8,0.85) 100%);border:2px solid #1a0d05;box-shadow:inset 0 0 0 1px var(--bronze-deep),inset 0 0 0 2px rgba(0,0,0,0.6),inset 0 0 0 3px var(--bronze),0 2px 6px rgba(0,0,0,0.6);overflow:hidden}
+  .compass-frame::before,.compass-frame::after{content:"";position:absolute;top:50%;transform:translateY(-50%);width:12px;height:19px;background:linear-gradient(180deg,var(--gold) 0%,var(--bronze) 45%,var(--bronze-deep) 100%);border:1.5px solid #1a0d05;clip-path:polygon(0 30%,50% 0,100% 30%,100% 70%,50% 100%,0 70%)}
+  .compass-frame::before{left:-8px}
+  .compass-frame::after{right:-8px}
+  .compass::before{content:"";position:absolute;left:50%;top:-8px;transform:translateX(-50%);width:11px;height:11px;background:linear-gradient(180deg,var(--gold) 0%,var(--bronze-deep) 100%);clip-path:polygon(50% 0,100% 35%,100% 100%,0 100%,0 35%);border:1px solid #1a0d05;z-index:1}
+  .compass-ticks{position:absolute;inset:0;display:flex;align-items:center;padding-left:50%;transition:transform .12s linear;white-space:nowrap}
+  .compass-ticks .seg{display:inline-flex;align-items:center;justify-content:center;flex:0 0 60px;font-family:var(--serif);font-weight:700;font-size:12px;line-height:1;letter-spacing:3px;color:var(--ink-dim);text-shadow:1px 1px 0 #000;position:relative}
+  .compass-ticks .seg.card{color:var(--gold);font-size:14px}
+  .compass-ticks .seg::after{content:"";position:absolute;right:-1px;top:50%;transform:translateY(-50%);width:1px;height:8px;background:rgba(200,160,90,0.35)}
+  .compass-needle{position:absolute;left:50%;top:0;bottom:0;width:2px;background:var(--gold);transform:translateX(-50%);box-shadow:0 0 8px rgba(240,193,75,0.6);z-index:2}
+  .compass-needle::before{content:"";position:absolute;left:50%;top:-4px;transform:translateX(-50%);width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid var(--gold)}
+
+  /* ---------- VITALS + HOTBAR (bottom-center) ---------- */
+  .dock{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;align-items:center;gap:5px;z-index:6}
+  .bars{width:var(--hotbar-w);display:flex;flex-direction:row;gap:10px}
+  .bars .bar{flex:1;min-width:0}
+  .dock{--hotbar-w:694px}
+  .bar{position:relative;height:11px;background:#0a0805;border:1px solid #1a0d05;box-shadow:inset 0 0 0 1px var(--bronze-deep),inset 0 1px 0 rgba(0,0,0,0.5);overflow:hidden}
+  .bar .fill{position:relative;z-index:1;height:100%;transition:width .2s linear,filter .35s}
+  .bar.hp .fill{background:linear-gradient(180deg,#d44a3a 0%,var(--hp) 50%,var(--hp-deep) 100%);box-shadow:inset 0 1px 0 rgba(255,180,160,0.25),inset 0 -1px 0 rgba(0,0,0,0.4);filter:saturate(0.85) brightness(0.92)}
+  .bar.hp[data-state="warning"] .fill{filter:none}
+  .bar.hp[data-state="critical"] .fill{filter:saturate(1.1) brightness(1.05);animation:hpPulse 1.2s ease-in-out infinite}
+  @keyframes hpPulse{0%,100%{filter:saturate(1) brightness(0.95)}50%{filter:saturate(1.3) brightness(1.2)}}
+  .bar.hp .wound{position:absolute;top:0;bottom:0;left:0;background:linear-gradient(180deg,#6a1a14 0%,var(--hp-wound) 100%);z-index:0}
+  .bar.hp.second-wind::after{content:"";position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 0 1px rgba(240,193,75,0.65),0 0 10px rgba(240,160,40,0.4);animation:swPulse 1.6s ease-in-out infinite}
+  @keyframes swPulse{0%,100%{opacity:.6}50%{opacity:1}}
+  .bar.stam .fill{position:absolute;right:0;top:0;background:linear-gradient(180deg,#bfe6f5 0%,var(--stam) 55%,var(--stam-deep) 100%);box-shadow:inset 0 1px 0 rgba(230,248,255,0.45),inset 0 -1px 0 rgba(0,0,0,0.4)}
+  .bar.stam[data-state="critical"] .fill{animation:stamPulse .9s ease-in-out infinite}
+  @keyframes stamPulse{0%,100%{filter:brightness(0.9)}50%{filter:brightness(1.3)}}
+  .bar.stam.stagger .fill{background:linear-gradient(180deg,#ff8a4a 0%,#c84a14 60%,#5a1a00 100%);animation:staggerFlash .5s ease-in-out 3}
+  @keyframes staggerFlash{0%,100%{filter:brightness(0.9)}50%{filter:brightness(1.6)}}
+  /* ten 10% increments per bar */
+  .bar::after{content:"";position:absolute;inset:0;z-index:3;pointer-events:none;background:repeating-linear-gradient(90deg,transparent 0 calc(10% - 1px),rgba(0,0,0,0.55) calc(10% - 1px) 10%)}
+
+  /* hotbar */
+  .hotbar{display:flex;gap:6px;width:auto}
+  .slot{position:relative;width:64px;height:64px;background:linear-gradient(180deg,#1a1410 0%,#0a0805 100%);border:2px solid #1a0d05;box-shadow:inset 0 0 0 1px var(--bronze-deep),inset 0 0 0 2px rgba(0,0,0,0.55),inset 0 0 0 3px var(--bronze),0 3px 8px rgba(0,0,0,0.5);transition:box-shadow .14s}
+  .slot:hover{box-shadow:inset 0 0 0 1px var(--gold-deep),inset 0 0 0 2px rgba(0,0,0,0.55),inset 0 0 0 3px var(--gold),0 3px 12px rgba(240,193,75,0.28)}
+  .slot.active{box-shadow:inset 0 0 0 1px var(--gold-deep),inset 0 0 0 2px rgba(0,0,0,0.55),inset 0 0 0 3px var(--gold),0 0 14px rgba(240,193,75,0.4)}
+  .slot .num{position:absolute;left:5px;top:5px;font-family:var(--pixel);font-size:9px;color:var(--ink-mute);text-shadow:1px 1px 0 #000}
+  .slot.active .num{color:var(--gold)}
+  .slot .glyph{position:absolute;inset:15px;image-rendering:pixelated}
+  .slot .qty{position:absolute;right:5px;bottom:5px;font-family:var(--pixel);font-size:10px;color:var(--ink);text-shadow:1px 1px 0 #000}
+
+  /* item glyph placeholders */
+  .gl-sword{background:linear-gradient(180deg,transparent 0 8%,#d8d4c8 8% 60%,#8a8378 60% 64%,transparent 64%),linear-gradient(180deg,transparent 0 60%,#6b4520 60% 78%,#b07a3a 78% 84%,#6b4520 84% 100%);clip-path:polygon(45% 0,55% 0,60% 60%,75% 60%,75% 68%,60% 68%,60% 100%,40% 100%,40% 68%,25% 68%,25% 60%,40% 60%)}
+  .gl-potion-hp{background:linear-gradient(180deg,#6b4520 0 14%,#b07a3a 14% 22%,#d8d4c8 22% 30%,#b8302a 30% 86%,#5a1410 86% 100%);clip-path:polygon(38% 0,62% 0,62% 22%,80% 36%,80% 100%,20% 100%,20% 36%,38% 22%)}
+  .gl-axe{background:linear-gradient(180deg,#c8c0b0 0 50%,#8a8378 50% 60%,#6b4520 60% 100%);clip-path:polygon(20% 0,80% 0,100% 20%,100% 50%,60% 50%,60% 100%,40% 100%,40% 50%,0 50%,0 20%)}
+  .gl-torch{background:radial-gradient(circle at 50% 22%, #f0c14b 0 14%, #e84a3a 14% 22%, transparent 22%),linear-gradient(180deg,transparent 0 30%,#6b4520 30% 100%)}
+  .gl-bow{background:radial-gradient(ellipse at 50% 50%, transparent 50%, #6b4520 50% 60%, transparent 60%),linear-gradient(90deg,transparent 48%,#d8d4c8 48% 52%,transparent 52%)}
+  .gl-meat{background:radial-gradient(ellipse at 50% 50%, #c88848 0 50%, #8a5a28 50% 100%);clip-path:polygon(20% 30%,80% 30%,100% 50%,80% 70%,50% 100%,20% 70%,0 50%)}
+  .gl-pick{background:linear-gradient(180deg,#c8c0b0 0 22%,transparent 22%),linear-gradient(180deg,transparent 0 20%,#6b4520 20% 100%);clip-path:polygon(0 22%,100% 22%,100% 34%,56% 34%,56% 100%,44% 100%,44% 34%,0 34%)}
+  .gl-plank{background:repeating-linear-gradient(180deg,#8a5a28 0 30%,#6b4520 30% 34%,#a06a30 34% 64%,#6b4520 64% 68%,#8a5a28 68% 100%)}
+  .gl-stone{background:conic-gradient(from 20deg at 50% 50%,#8a8378 0deg,#6e6358 120deg,#a09888 240deg,#6e6358 360deg)}
+  .gl-bread{background:radial-gradient(ellipse at 50% 40%, #d8a35a 0 55%, #a06a30 55% 100%);clip-path:polygon(14% 40%,50% 12%,86% 40%,86% 84%,14% 84%)}
+
+  /* low-HP vignette */
+  .low-hp{position:absolute;inset:0;z-index:3;pointer-events:none;box-shadow:inset 0 0 200px rgba(184,48,42,0);transition:box-shadow .8s ease-in-out}
+  .low-hp.on{box-shadow:inset 0 0 280px rgba(184,48,42,0.6);animation:pulseBlood 1.2s ease-in-out infinite}
+  @keyframes pulseBlood{0%,100%{box-shadow:inset 0 0 200px rgba(184,48,42,0.45)}50%{box-shadow:inset 0 0 320px rgba(184,48,42,0.8)}}
+
+  /* world-space interaction prompt */
+  .interact{position:absolute;left:62%;top:54%;transform:translate(-50%,-50%);display:flex;align-items:center;gap:7px;font-family:Georgia,"Cormorant Garamond",serif;font-style:italic;font-size:14px;color:#f0e3bf;text-shadow:0 1px 0 #000,0 0 12px rgba(0,0,0,0.85);z-index:5}
+  .interact kbd{display:inline-flex;align-items:center;justify-content:center;width:21px;height:21px;font-family:var(--pixel);font-size:9px;background:rgba(20,14,8,0.85);border:1.5px solid var(--bronze);box-shadow:inset 0 0 0 1px rgba(0,0,0,0.7),0 2px 0 rgba(0,0,0,0.5);color:var(--gold)}
+  a{color:var(--gold)}a:hover{color:var(--ink)}
+</style>
+</head>
+<body>
+  <div class="fit-viewport">
+    <div class="stage" id="stage">
+      <div class="scene"></div>
+      <div class="grain"></div>
+      <div class="low-hp" id="lowHp"></div>
+
+      <div class="hud">
+        <div class="compass" id="compass">
+          <div class="compass-frame"><div class="compass-ticks" id="ticks"></div><div class="compass-needle"></div></div>
+        </div>
+
+        <div class="interact" id="interact"><kbd>E</kbd> Examine the cairn</div>
+
+        <div class="dock">
+          <div class="bars">
+            <div class="bar hp" id="hpBar">
+              <div class="wound" id="wound" style="width:0%"></div>
+              <div class="fill" id="hpFill" style="width:100%"></div>
+            </div>
+            <div class="bar stam" id="stBar" title="Hunger">
+              <div class="fill" id="stFill" style="width:100%"></div>
+            </div>
+          </div>
+          <div class="hotbar" id="hotbar">
+            <div class="slot active" title="Sword"><div class="num">1</div><div class="glyph gl-sword"></div></div>
+            <div class="slot" title="Pickaxe"><div class="num">2</div><div class="glyph gl-pick"></div></div>
+            <div class="slot" title="Axe"><div class="num">3</div><div class="glyph gl-axe"></div></div>
+            <div class="slot" title="Bow"><div class="num">4</div><div class="glyph gl-bow"></div></div>
+            <div class="slot" title="Torch"><div class="num">5</div><div class="glyph gl-torch"></div><div class="qty">8</div></div>
+            <div class="slot" title="Healing draught"><div class="num">6</div><div class="glyph gl-potion-hp"></div><div class="qty">3</div></div>
+            <div class="slot" title="Salted meat"><div class="num">7</div><div class="glyph gl-meat"></div><div class="qty">5</div></div>
+            <div class="slot" title="Bread"><div class="num">8</div><div class="glyph gl-bread"></div><div class="qty">2</div></div>
+            <div class="slot" title="Stone"><div class="num">9</div><div class="glyph gl-stone"></div><div class="qty">64</div></div>
+            <div class="slot" title="Planks"><div class="num">0</div><div class="glyph gl-plank"></div><div class="qty">32</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+
+  <script>
+  (function buildCompass(){
+    const dirs = [[0,'N'],[30,null],[60,null],[90,'E'],[120,null],[150,null],[180,'S'],[210,null],[240,null],[270,'W'],[300,null],[330,null]];
+    const tape = [];
+    for (let pass=0; pass<2; pass++) for (const [deg,name] of dirs) tape.push({deg:deg+pass*360,name});
+    tape.push({deg:720,name:'N'});
+    document.getElementById('ticks').innerHTML = tape.map(({deg,name}) =>
+      `<div class="seg${name?' card':''}" data-deg="${deg}">${name ?? deg}</div>`).join('');
+    setHeading(45);
+  })();
+  function setHeading(deg){
+    document.getElementById('ticks').style.transform = `translateX(${-(deg/30)*60}px)`;
+  }
+  // hotbar selection: click or number keys 1..9,0
+  (function hotbar(){
+    const slots = [...document.querySelectorAll('#hotbar .slot')];
+    const select = i => slots.forEach((s,n) => s.classList.toggle('active', n===i));
+    slots.forEach((s,i) => s.addEventListener('click', () => select(i)));
+    window.addEventListener('keydown', e => {
+      const k = e.key;
+      if (k === '0') return select(9);
+      if (k >= '1' && k <= '9') select(+k - 1);
+    });
+  })();
+  </script>
+
+  <script type="text/babel">
+    const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "hp": 100,
+      "wound": 0,
+      "endurance": 100,
+      "heading": 113,
+      "showInteract": true,
+      "showCompass": true,
+      "lowHpPulse": false,
+      "secondWindAvailable": true,
+      "stagger": false
+    }/*EDITMODE-END*/;
+
+    function App() {
+      const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+      React.useEffect(() => {
+        const hp = Math.min(t.hp, 100 - t.wound);
+        document.getElementById('hpFill').style.width = hp + '%';
+        document.getElementById('wound').style.width = t.wound + '%';
+        const st = t.endurance;
+        document.getElementById('stFill').style.width = st + '%';
+        const hpBar = document.getElementById('hpBar');
+        hpBar.dataset.state = hp > 70 ? 'healthy' : hp > 30 ? 'warning' : 'critical';
+        hpBar.classList.toggle('second-wind', t.secondWindAvailable && hp < 30);
+        const stBar = document.getElementById('stBar');
+        stBar.dataset.state = st < 15 ? 'critical' : 'normal';
+        stBar.classList.toggle('stagger', t.stagger);
+        document.getElementById('lowHp').classList.toggle('on', hp < 10 || t.lowHpPulse);
+        document.getElementById('compass').style.display = t.showCompass ? '' : 'none';
+        setHeading(t.heading);
+        document.getElementById('interact').style.display = t.showInteract ? '' : 'none';
+      }, [t]);
+
+      return (
+        <TweaksPanel title="HUD Tweaks">
+          <TweakSection label="Vitals" />
+          <TweakSlider label="HP" value={t.hp} min={0} max={100} unit="%" onChange={(v) => setTweak('hp', v)} />
+          <TweakSlider label="Wound HP" value={t.wound} min={0} max={60} unit="%" onChange={(v) => setTweak('wound', v)} />
+          <TweakSlider label="Hunger" value={t.endurance} min={0} max={100} unit="%" onChange={(v) => setTweak('endurance', v)} />
+          <TweakToggle label="Force low-HP vignette" value={t.lowHpPulse} onChange={(v) => setTweak('lowHpPulse', v)} />
+          <TweakToggle label="Second Wind available" value={t.secondWindAvailable} onChange={(v) => setTweak('secondWindAvailable', v)} />
+          <TweakToggle label="Starving flash (0 hunger)" value={t.stagger} onChange={(v) => setTweak('stagger', v)} />
+          <TweakSection label="World orientation" />
+          <TweakSlider label="Heading" value={t.heading} min={0} max={359} unit="°" onChange={(v) => setTweak('heading', v)} />
+          <TweakToggle label="Show compass" value={t.showCompass} onChange={(v) => setTweak('showCompass', v)} />
+          <TweakSection label="Prompts" />
+          <TweakToggle label="Show interaction prompt" value={t.showInteract} onChange={(v) => setTweak('showInteract', v)} />
+        </TweaksPanel>
+      );
+    }
+    const root = document.createElement('div');
+    document.body.appendChild(root);
+    ReactDOM.createRoot(root).render(<App />);
+  </script>
+
+  <script>
+    (function fitStage(){
+      const stage = document.getElementById('stage');
+      function fit(){
+        stage.style.transform = `scale(${Math.min(window.innerWidth/2560, window.innerHeight/1440)})`;
+      }
+      window.addEventListener('resize', fit, { passive:true });
+      fit();
+    })();
+  </script>
+</body>
+</html>

@@ -8,6 +8,16 @@ FText Title() { return LOCTEXT("MenuTitle", "VOXELMARK"); }
 FText Subtitle() { return LOCTEXT("MenuSubtitle", "Mira-Thal Trilogy · Game One"); }
 FText VersionStamp() { return LOCTEXT("MenuVersion", "Milestone 5-3D — dev build"); }
 
+FText CalloutTag() { return LOCTEXT("CalloutTag", "PATCH 0.18 — THE BRONZE AGE"); }
+FText CalloutTitle() { return LOCTEXT("CalloutTitle", "Metalsmithing Update"); }
+FText CalloutCopy()
+{
+	return LOCTEXT("CalloutCopy",
+	               "Copper and tin now spawn in surface veins. Smelt them together for bronze: a full tool tier that "
+	               "mines faster and lasts four times as long as stone. New crafting stations — bloomery, crucible "
+	               "and anvil. Worn tools can be reforged instead of thrown away.");
+}
+
 FText ButtonContinue() { return LOCTEXT("BtnContinue", "CONTINUE"); }
 FText ButtonNewGame() { return LOCTEXT("BtnNewGame", "NEW GAME"); }
 FText ButtonLoadGame() { return LOCTEXT("BtnLoadGame", "LOAD GAME"); }
@@ -20,6 +30,89 @@ FText ButtonDelete() { return LOCTEXT("BtnDelete", "DELETE"); }
 FText ButtonCancel() { return LOCTEXT("BtnCancel", "CANCEL"); }
 FText ButtonBack() { return LOCTEXT("BtnBack", "BACK"); }
 
+// --- Overlay family (2026-09-07 mocks) --------------------------------------
+FText SettingsSectionAudio() { return LOCTEXT("SetSecAudio", "AUDIO"); }
+FText SettingsSectionDisplay() { return LOCTEXT("SetSecDisplay", "DISPLAY"); }
+FText SettingsSectionGraphics() { return LOCTEXT("SetSecGraphics", "GRAPHICS"); }
+FText SettingsMasterLabel() { return LOCTEXT("SetMaster", "MASTER"); }
+FText SettingsMusicLabel() { return LOCTEXT("SetMusic", "MUSIC"); }
+FText SettingsFullscreenLabel() { return LOCTEXT("SetFullscreen", "FULLSCREEN"); }
+// The one row on this panel that does NOT take effect as you touch it, said out
+// loud rather than left for the player to discover by not noticing.
+FText SettingsFullscreenHint() { return LOCTEXT("SetFullscreenHint", "Takes effect on APPLY."); }
+FText SettingsUIScaleLabel() { return LOCTEXT("SetUIScale", "INTERFACE SIZE"); }
+// Says what the row does and no more. Under ADR-0011 the engine already sizes
+// the interface for the screen, so 100% is "what was designed for this display"
+// rather than a sharpness claim -- the earlier wording promised a
+// pixel-exactness that continuous scaling does not deliver at any setting.
+FText SettingsUIScaleHint()
+{
+	return LOCTEXT("SetUIScaleHint",
+	               "How large the menus and the HUD are drawn. 100% is the size chosen for your "
+	               "screen; raise it if the text is small, lower it for more room.");
+}
+FText SettingsSectionInterface() { return LOCTEXT("SetSecInterface", "INTERFACE"); }
+FText SettingsMenuSizeLabel() { return LOCTEXT("SetMenuSize", "MENU SIZE"); }
+// NAMES THE LIVE SHORTCUT, because a dial buried in a settings panel is not how
+// anyone actually finds the size they want -- they find it by looking at the
+// screen they are resizing. The row and the shortcut are the same setting.
+FText SettingsMenuSizeHint()
+{
+	return LOCTEXT("SetMenuSizeHint",
+	               "How large the map, journal, inventory, player and codex screens are drawn. "
+	               "While one of them is open you can drag its bottom-right corner, or its right "
+	               "or bottom edge, to resize it; Ctrl and the mouse wheel, or Ctrl with plus and "
+	               "minus, does the same, and Ctrl and 0 puts it back.");
+}
+FText SettingsPercent(int32 Percent)
+{
+	return FText::Format(LOCTEXT("SetPercent", "{0}%"), FText::AsNumber(Percent));
+}
+FText ButtonApply() { return LOCTEXT("BtnApply", "APPLY"); }
+FText ButtonSaveAndLeave() { return LOCTEXT("BtnSaveLeave", "SAVE & LEAVE"); }
+FText SettingsBackHint() { return LOCTEXT("SetBackHint", "back"); }
+FText KeyEscape() { return LOCTEXT("KeyEsc", "ESC"); }
+FText KeyEnter() { return LOCTEXT("KeyEnter", "ENTER"); }
+
+FText PauseTitle() { return LOCTEXT("PauseTitle", "— PAUSED —"); }
+FText ButtonResume() { return LOCTEXT("BtnResume", "RESUME"); }
+FText ButtonSave() { return LOCTEXT("BtnSave", "SAVE"); }
+FText ButtonExitToMenu() { return LOCTEXT("BtnExitToMenu", "EXIT TO MENU"); }
+FText PauseFooter(int32 DayNumber)
+{
+	return FText::Format(LOCTEXT("PauseFooter", "Day {0}"), FText::AsNumber(DayNumber));
+}
+
+FText SaveDialogTitle() { return LOCTEXT("SaveDialogTitle", "— SAVE GAME —"); }
+FText SaveDialogPrompt() { return LOCTEXT("SaveDialogPrompt", "NAME THIS SAVE"); }
+FText SaveDialogCounter(int32 Used, int32 Max)
+{
+	// AsNumber would group at a thousand; these are two- and three-digit counts
+	// in a monospace readout and a separator would be noise.
+	return FText::FromString(FString::Printf(TEXT("%d / %d"), Used, Max));
+}
+FText SaveOverwritePrefix() { return LOCTEXT("SaveOverwritePrefix", "A save named"); }
+FText SaveOverwriteSuffix() { return LOCTEXT("SaveOverwriteSuffix", "already exists. Confirm to overwrite it."); }
+FText SaveKeysConfirm() { return LOCTEXT("SaveKeysConfirm", "to confirm"); }
+FText SaveKeysCancel() { return LOCTEXT("SaveKeysCancel", "to cancel"); }
+FText ButtonConfirm() { return LOCTEXT("BtnConfirm", "CONFIRM"); }
+FText DefaultSaveName(const FText& Context, int32 DayNumber)
+{
+	return FText::Format(LOCTEXT("DefaultSaveName", "{0} Day {1}"), Context, FText::AsNumber(DayNumber));
+}
+
+FText LoadFilterAll() { return LOCTEXT("LoadFilterAll", "ALL"); }
+FText LoadFilterManual() { return LOCTEXT("LoadFilterManual", "MANUAL"); }
+FText LoadFilterAuto() { return LOCTEXT("LoadFilterAuto", "AUTO"); }
+FText LoadSearchHint() { return LOCTEXT("LoadSearchHint", "Search…"); }
+FText LoadCountTotal(int32 Total)
+{
+	return FText::Format(LOCTEXT("LoadCountTotal", "/ {0}"), FText::AsNumber(Total));
+}
+FText LoadTagLatest() { return LOCTEXT("LoadTagLatest", "LATEST"); }
+FText LoadTagAuto() { return LOCTEXT("LoadTagAuto", "AUTO"); }
+FText LoadNoMatch() { return LOCTEXT("LoadNoMatch", "No saves match."); }
+FText LoadAutosaveName() { return LOCTEXT("LoadAutosaveName", "Autosave"); }
 FText LoadPanelTitle() { return LOCTEXT("LoadPanelTitle", "LOAD GAME"); }
 FText LoadPanelEmpty() { return LOCTEXT("LoadPanelEmpty", "No saves yet. Start a New Game to begin."); }
 FText HelpPanelTitle() { return LOCTEXT("HelpPanelTitle", "HELP"); }
@@ -74,7 +167,6 @@ FText CreditsPanelBody()
 		"project.\n");
 }
 FText SettingsPanelTitle() { return LOCTEXT("SettingsPanelTitle", "SETTINGS"); }
-FText SettingsPanelBody() { return LOCTEXT("SettingsPanelBody", "Settings coming soon."); }
 FText SettingsFineDetailLabel() { return LOCTEXT("SettingsFineDetailLabel", "Fine Detail Smoothing"); }
 FText SettingsFineDetailDesc()
 {
@@ -106,7 +198,10 @@ FText SettingsOceanDetailDesc()
 	               "close to the camera; the horizon reaches just as far either way.");
 }
 
-FText LoadingTitle() { return LOCTEXT("LoadingTitle", "L O A D I N G"); }
+// "LOADING", tracked by FSlateFontInfo::LetterSpacing (FVoxelMenuLayout::
+// LoadingTitleLetterSpacing) rather than by literal spaces: UE5 has real
+// tracking, which the Godot-era note in the header predates.
+FText LoadingTitle() { return LOCTEXT("LoadingTitle", "LOADING"); }
 FText TipPrefix() { return LOCTEXT("TipPrefix", "TIP"); }
 
 const TArray<FText>& LoadingQuips()
@@ -162,6 +257,450 @@ const TArray<FText>& GameplayTips()
 		LOCTEXT("Tip13", "Press Q / E to cycle quick slots. Shovels won't break stone."),
 	};
 	return Tips;
+}
+// --- In-game screens (2026-09-07 wave 2) ------------------------------------
+
+FText ScreenTabMap()       { return LOCTEXT("ScrTabMap", "MAP"); }
+FText ScreenTabJournal()   { return LOCTEXT("ScrTabJournal", "JOURNAL"); }
+FText ScreenTabInventory() { return LOCTEXT("ScrTabInventory", "INVENTORY"); }
+FText ScreenTabPlayer()    { return LOCTEXT("ScrTabPlayer", "PLAYER"); }
+FText ScreenTabCodex()     { return LOCTEXT("ScrTabCodex", "CODEX"); }
+// THE MOCK DRAWS NO KEY LETTERS. `.menu-tab .key` is styled in menus_shared.css
+// and every one of the five files leaves the span out, so the shortcut set is
+// chosen by this port rather than copied -- see SVoxelScreenShell::TabKey.
+FText ScreenKeyMap()       { return LOCTEXT("ScrKeyMap", "M"); }
+FText ScreenKeyJournal()   { return LOCTEXT("ScrKeyJournal", "J"); }
+FText ScreenKeyInventory() { return LOCTEXT("ScrKeyInventory", "I"); }
+FText ScreenKeyPlayer()    { return LOCTEXT("ScrKeyPlayer", "P"); }
+FText ScreenKeyCodex()     { return LOCTEXT("ScrKeyCodex", "K"); }
+FText ScreenActionClose()  { return LOCTEXT("ScrActClose", "Exit"); }
+FText ScreenActionPage()   { return LOCTEXT("ScrActPage", "Switch screen"); }
+
+FText InvPack()          { return LOCTEXT("InvPack", "PACK"); }
+FText InvCrafting()      { return LOCTEXT("InvCrafting", "CRAFTING"); }
+FText InvCharacter()     { return LOCTEXT("InvCharacter", "CHARACTER"); }
+FText InvModeCraft()     { return LOCTEXT("InvModeCraft", "CRAFT"); }
+FText InvModeCharacter() { return LOCTEXT("InvModeChar", "CHARACTER"); }
+FText InvCraftButton()   { return LOCTEXT("InvCraftBtn", "CRAFT"); }
+FText InvCraftHint()     { return LOCTEXT("InvCraftHint", "Drag from the pack into the grid."); }
+FText InvNoRecipe()      { return LOCTEXT("InvNoRecipe", "NO MATCH"); }
+FText InvNoEquipment()
+{
+	// Said on the screen rather than only in a comment: the paperdoll is drawn
+	// with eight empty sockets and no way to fill them, and a player looking at
+	// it deserves to be told that rather than left to conclude they have lost
+	// their gear.
+	return LOCTEXT("InvNoEquip", "No equipment system yet — these sockets are chrome.");
+}
+
+const TArray<FText>& InvFilterNames()
+{
+	static const TArray<FText> Names = {
+		LOCTEXT("InvFilterAll", "All"),
+		LOCTEXT("InvFilterWeapons", "Weapons"),
+		LOCTEXT("InvFilterArmor", "Armor"),
+		LOCTEXT("InvFilterTools", "Tools"),
+		LOCTEXT("InvFilterFood", "Food"),
+		LOCTEXT("InvFilterMaterials", "Materials"),
+		LOCTEXT("InvFilterQuest", "Quest"),
+	};
+	return Names;
+}
+
+const TArray<FText>& InvEquipSlotNames()
+{
+	static const TArray<FText> Names = {
+		LOCTEXT("InvEqHead", "HEAD"),   LOCTEXT("InvEqNeck", "NECK"),
+		LOCTEXT("InvEqChest", "CHEST"), LOCTEXT("InvEqHands", "HANDS"),
+		LOCTEXT("InvEqMain", "MAIN"),   LOCTEXT("InvEqOff", "OFF"),
+		LOCTEXT("InvEqRing", "RING"),   LOCTEXT("InvEqFeet", "FEET"),
+	};
+	return Names;
+}
+
+const TArray<FText>& PlayerEquipSlotNames()
+{
+	static const TArray<FText> Names = {
+		LOCTEXT("PlEqHead", "HEAD"),   LOCTEXT("PlEqChest", "CHEST"),
+		LOCTEXT("PlEqHands", "HANDS"), LOCTEXT("PlEqLegs", "LEGS"),
+		LOCTEXT("PlEqMain", "MAIN"),   LOCTEXT("PlEqOff", "OFF"),
+		LOCTEXT("PlEqRing", "RING"),   LOCTEXT("PlEqFeet", "FEET"),
+	};
+	return Names;
+}
+
+// The mock's `#invSearch` placeholder is the bare "Search…"; the longer
+// sentence read as a label rather than as a hint next to a 280 px field.
+FText InvSearchHint() { return LOCTEXT("InvSearch", "Search…"); }
+
+// `.slot .qty` is built in the mock as `'×' + it.qty` -- the count is
+// always prefixed, so a lone "16" in the corner of a cell reads as an index
+// rather than as a quantity. U+00D7 is in the cmap of all four shipped faces
+// (checked 2026-09-07), unlike the mocks' U+2726 and U+2205.
+FText ItemStackCount(int32 Count)
+{
+	return FText::Format(LOCTEXT("ItemStackCount", "×{0}"), FText::AsNumber(Count));
+}
+
+FText InvWeight(float CarriedKg)
+{
+	// THE MOCK'S "112 / 180" LOSES ITS DENOMINATOR. Mass is real -- every
+	// FVoxelItemDef carries MassKg -- but this project has no carry limit, so
+	// there is no 180 to print and inventing one would be inventing a system.
+	return FText::Format(LOCTEXT("InvWeight", "{0} kg"),
+	                     FText::AsNumber(FMath::RoundToInt(CarriedKg)));
+}
+
+FText MapSavedPlaces()   { return LOCTEXT("MapSaved", "SAVED PLACES"); }
+FText MapNoPlaces()      { return LOCTEXT("MapNoPlaces", "No places saved yet."); }
+FText MapLabelPosition() { return LOCTEXT("MapLabPos", "POSITION"); }
+FText MapLabelGeo()      { return LOCTEXT("MapLabGeo", "LATITUDE / LONGITUDE"); }
+FText MapLabelAltitude() { return LOCTEXT("MapLabAlt", "SURFACE"); }
+FText MapLabelChunk()    { return LOCTEXT("MapLabChunk", "CHUNK"); }
+FText MapLabelHeading()  { return LOCTEXT("MapLabHeading", "HEADING"); }
+FText MapLabelSeed()     { return LOCTEXT("MapLabSeed", "SEED"); }
+FText MapNoRaster()
+{
+	return LOCTEXT("MapNoRaster", "No terrain raster — position readout only");
+}
+
+FText MapOverviewNote()
+{
+	// WAS "World overview - your position is on the right", which stopped being
+	// true on 2026-09-08: the sheet pans, zooms and carries the player's own
+	// marker. NORTH UP is worth stating because the offline raster is rendered
+	// south-up and the sheet flips it -- anyone comparing the screen against
+	// the PNG in world-maps/ will find them mirrored and should know which one
+	// is the map. The gestures are on the caps beside this line.
+	return LOCTEXT("MapOverview", "North up — your marker is live");
+}
+
+FText MapActionZoom()   { return LOCTEXT("MapActZoom", "zoom · or +/-"); }
+FText MapActionPan()    { return LOCTEXT("MapActPan", "drag to pan · click to mark"); }
+FText MapKeyWheel()     { return LOCTEXT("MapKeyWheel", "WHEEL"); }
+FText MapKeyRightDrag() { return LOCTEXT("MapKeyRmb", "RMB"); }
+
+FText MapCtxPlaceTitle() { return LOCTEXT("MapCtxPlace", "THIS PLACE"); }
+FText MapCtxMarkHere()   { return LOCTEXT("MapCtxMark", "Mark this place"); }
+FText MapCtxRename()     { return LOCTEXT("MapCtxRename", "Rename"); }
+FText MapCtxRemove()     { return LOCTEXT("MapCtxRemove", "Remove"); }
+FText MapCtxCancel()     { return LOCTEXT("MapCtxCancel", "Cancel"); }
+
+FText MapNameTitle() { return LOCTEXT("MapNameTitle", "NAME THIS PLACE"); }
+FText MapNameHint()  { return LOCTEXT("MapNameHint", "Camp by the river…"); }
+FText MapNameKeys()  { return LOCTEXT("MapNameKeys", "ENTER to keep · ESC to cancel"); }
+FText MapMarkDefaultName() { return LOCTEXT("MapMarkDefault", "Unnamed place"); }
+
+FText MapScaleValue(double MetresAcross)
+{
+	// KILOMETRES ABOVE 1 km, METRES BELOW, and no decimal on the metre form.
+	// The zoom range is 500 m to 261 km, so a single unit would print either
+	// "0.5 km" at one end or "261120 m" at the other, and both read as noise.
+	FNumberFormattingOptions Opts;
+	Opts.MinimumFractionalDigits = 1;
+	Opts.MaximumFractionalDigits = 1;
+	if (MetresAcross >= 1000.0)
+	{
+		return FText::Format(LOCTEXT("MapScaleKm", "{0} km across"),
+		                     FText::AsNumber(MetresAcross / 1000.0, &Opts));
+	}
+	return FText::Format(LOCTEXT("MapScaleM", "{0} m across"),
+	                     FText::AsNumber(FMath::RoundToInt(MetresAcross)));
+}
+
+FText MapPositionValue(const FVector& World)
+{
+	// Metres, not Unreal units: a player reading a position wants a number they
+	// can pace out, and VoxelCoords::VoxelSizeUU makes one voxel 10 uu = 0.1 m.
+	//
+	// THREE LINES, NOT ONE. The first capture ran the three axes together and
+	// the readout card clipped the third off at its right edge -- 61 km from
+	// the origin is a six-digit metre count and three of them do not fit a
+	// 250 px column at any font this screen uses.
+	return FText::Format(LOCTEXT("MapPosVal", "E {0}\nN {1}\nUp {2}"),
+	                     FText::AsNumber(FMath::RoundToInt(World.X / 100.0)),
+	                     FText::AsNumber(FMath::RoundToInt(World.Y / 100.0)),
+	                     FText::AsNumber(FMath::RoundToInt(World.Z / 100.0)));
+}
+
+FText MapSeedValue(uint64 Seed)
+{
+	// NO GROUPING SEPARATORS. FText::AsNumber renders 20260719 as "20,260,719",
+	// which reads as a quantity; a seed is an identifier and has to be
+	// copy-pasteable back into -VoxelSeed=.
+	return FText::FromString(FString::Printf(TEXT("%llu"), (unsigned long long)Seed));
+}
+
+FText MapGeoValue(double LatitudeDeg, double LongitudeDeg)
+{
+	FNumberFormattingOptions Opts;
+	Opts.MinimumFractionalDigits = 4;
+	Opts.MaximumFractionalDigits = 4;
+	return FText::Format(LOCTEXT("MapGeoVal", "{0}° {1}   {2}° {3}"),
+	                     FText::AsNumber(FMath::Abs(LatitudeDeg), &Opts),
+	                     LatitudeDeg >= 0.0 ? LOCTEXT("MapN", "N") : LOCTEXT("MapS", "S"),
+	                     FText::AsNumber(FMath::Abs(LongitudeDeg), &Opts),
+	                     LongitudeDeg >= 0.0 ? LOCTEXT("MapE", "E") : LOCTEXT("MapW", "W"));
+}
+
+FText MapChunkValue(const FIntVector& Chunk)
+{
+	return FText::Format(LOCTEXT("MapChunkVal", "{0}, {1}, {2}"),
+	                     FText::AsNumber(Chunk.X), FText::AsNumber(Chunk.Y), FText::AsNumber(Chunk.Z));
+}
+
+FText MapHeadingValue(float Degrees)
+{
+	static const TCHAR* const kPoints[] = {TEXT("N"), TEXT("NE"), TEXT("E"), TEXT("SE"),
+	                                       TEXT("S"), TEXT("SW"), TEXT("W"), TEXT("NW")};
+	const float Wrapped = FMath::Fmod(Degrees + 360.f, 360.f);
+	const int32 Index = FMath::RoundToInt(Wrapped / 45.f) % 8;
+	return FText::Format(LOCTEXT("MapHeadingVal", "{0}°  {1}"),
+	                     FText::AsNumber(FMath::RoundToInt(Wrapped)),
+	                     FText::FromString(kPoints[Index]));
+}
+
+const TArray<FText>& MapCompassLetters()
+{
+	static const TArray<FText> Letters = {
+		LOCTEXT("MapCompassN", "N"), LOCTEXT("MapCompassE", "E"),
+		LOCTEXT("MapCompassS", "S"), LOCTEXT("MapCompassW", "W"),
+	};
+	return Letters;
+}
+
+FText JournalSectionEntries()  { return LOCTEXT("JrSecEntries", "PLAYER'S ENTRIES"); }
+FText JournalSectionGoals()    { return LOCTEXT("JrSecGoals", "GOALS"); }
+FText JournalTracked()         { return LOCTEXT("JrTracked", "Tracked"); }
+FText JournalUntracked()       { return LOCTEXT("JrUntracked", "Untracked"); }
+FText JournalEntriesTab()      { return LOCTEXT("JrEntriesTab", "Entries"); }
+FText JournalNewEntry()        { return LOCTEXT("JrNewEntry", "NEW ENTRY"); }
+FText JournalWriteHere()       { return LOCTEXT("JrWrite", "Write in the journal"); }
+FText JournalEmpty()           { return LOCTEXT("JrEmpty", "Nothing written yet."); }
+FText JournalNothingTracked()  { return LOCTEXT("JrNoTracked", "Nothing tracked."); }
+FText JournalNothingUntracked(){ return LOCTEXT("JrNoUntracked", "Nothing hidden."); }
+FText JournalSteps()           { return LOCTEXT("JrSteps", "Steps"); }
+FText JournalTrack()           { return LOCTEXT("JrTrack", "TRACK"); }
+FText JournalUntrack()         { return LOCTEXT("JrUntrack", "UNTRACK"); }
+FText JournalKindEntry()       { return LOCTEXT("JrKindEntry", "PLAYER'S ENTRIES"); }
+FText JournalKindTracked()     { return LOCTEXT("JrKindTracked", "TRACKED GOAL"); }
+FText JournalKindUntracked()   { return LOCTEXT("JrKindUntracked", "UNTRACKED GOAL"); }
+
+FText JournalStepProgress(int32 Done, int32 Total, const FText& Place)
+{
+	return FText::Format(LOCTEXT("JrStepProgress", "{0} of {1} steps · {2}"),
+	                     FText::AsNumber(Done), FText::AsNumber(Total), Place);
+}
+
+FText JournalCardStamp(int32 Day, const FText& Season)
+{
+	// `${e.season.toUpperCase()}` -- the whole stamp is upper case in the mock,
+	// and half-capitalising it ("DAY 12 . Summer") reads as a mistake rather
+	// than as a style.
+	return FText::Format(LOCTEXT("JrCardStamp", "DAY {0} · {1}"),
+	                     FText::AsNumber(Day), Season.ToUpper());
+}
+
+FText PlayerSubStats()      { return LOCTEXT("PlSubStats", "STATS"); }
+FText PlayerSubSkills()     { return LOCTEXT("PlSubSkills", "SKILLS"); }
+FText PlayerSubPerks()      { return LOCTEXT("PlSubPerks", "PERKS"); }
+FText PlayerSubReputation() { return LOCTEXT("PlSubRep", "REPUTATION"); }
+FText PlayerMainLevel()     { return LOCTEXT("PlMainLevel", "MAIN LEVEL"); }
+FText PlayerXp()            { return LOCTEXT("PlXp", "XP"); }
+FText PlayerSkillPoints()   { return LOCTEXT("PlSkillPts", "SKILL POINTS"); }
+FText PlayerDisciplines()   { return LOCTEXT("PlDisciplines", "Disciplines"); }
+FText PlayerColumnName()    { return LOCTEXT("PlColName", "NAME"); }
+FText PlayerColumnLevel()   { return LOCTEXT("PlColLevel", "LEVEL"); }
+FText PlayerColumnStatus()  { return LOCTEXT("PlColStatus", "STATUS"); }
+FText PlayerColumnFaction() { return LOCTEXT("PlColFaction", "FACTION"); }
+FText PlayerColumnStanding(){ return LOCTEXT("PlColStanding", "STANDING"); }
+FText PlayerColumnValue()   { return LOCTEXT("PlColValue", "VALUE"); }
+FText PlayerStatusOwned()   { return LOCTEXT("PlOwned", "Owned"); }
+FText PlayerStatusLocked()  { return LOCTEXT("PlLocked", "Locked"); }
+
+FText PlayerXpValue(int32 Current, int32 Next)
+{
+	return FText::Format(LOCTEXT("PlXpVal", "{0} / {1}"),
+	                     FText::AsNumber(Current), FText::AsNumber(Next));
+}
+
+FText PlayerRankLine(int32 From, int32 To)
+{
+	return FText::Format(LOCTEXT("PlRankLine", "Rank {0} → Rank {1}"),
+	                     FText::AsNumber(From), FText::AsNumber(To));
+}
+
+FText PlayerUnlockCost(int32 Points)
+{
+	return FText::Format(LOCTEXT("PlUnlock", "UNLOCK · {0} PT"), FText::AsNumber(Points));
+}
+
+FText PlayerRankBadge(int32 Rank, int32 MaxRank)
+{
+	return FText::Format(LOCTEXT("PlRankBadge", "{0}/{1}"),
+	                     FText::AsNumber(Rank), FText::AsNumber(MaxRank));
+}
+
+FText PlayerDisciplineTally(int32 Unlocked, int32 Total)
+{
+	return FText::Format(LOCTEXT("PlDiscTally", "{0}/{1}"),
+	                     FText::AsNumber(Unlocked), FText::AsNumber(Total));
+}
+
+FText CodexRecipes()     { return LOCTEXT("CdRecipes", "Recipes"); }
+FText CodexPlaces()      { return LOCTEXT("CdPlaces", "Places"); }
+FText CodexIngredients() { return LOCTEXT("CdIngredients", "INGREDIENTS"); }
+FText CodexYieldLabel()  { return LOCTEXT("CdYieldLab", "YIELD"); }
+// SHORT ENOUGH FOR THE COLUMN IT SITS IN. The mock's "Search recipes or
+// ingredients…" was clipped to "Search recipes or ingredi" by the 260 px entry
+// list in the first codex capture; the search still matches ingredient names.
+FText CodexSearchHint()  { return LOCTEXT("CdSearch", "Search recipes"); }
+FText CodexNoRecipe()    { return LOCTEXT("CdNoRecipe", "No recipe matches that."); }
+FText CodexLocked()      { return LOCTEXT("CdLocked", "Not yet discovered."); }
+
+FText CodexMadeAt(const FText& Station)
+{
+	return FText::Format(LOCTEXT("CdMadeAt", "Made at {0}"), Station);
+}
+
+FText CodexYield(const FText& Category, int32 Count)
+{
+	return FText::Format(LOCTEXT("CdYield", "{0} · yields {1}"), Category, FText::AsNumber(Count));
+}
+
+FText CodexIngredientLine(int32 Needed, const FText& Name)
+{
+	return FText::Format(LOCTEXT("CdIngLine", "{0} × {1}"), FText::AsNumber(Needed), Name);
+}
+
+FText CodexHeldLine(int32 Held)
+{
+	return FText::Format(LOCTEXT("CdHeld", "{0} in pack"), FText::AsNumber(Held));
+}
+
+FText CodexHeldUnknown()
+{
+	// A recipe ingredient that names nothing in FVoxelItemRegistry cannot be
+	// counted, and printing "0 in pack" would be a claim rather than a gap.
+	return LOCTEXT("CdHeldUnknown", "not an item yet");
+}
+
+// --- The world stamp ---------------------------------------------------------
+// See the header for what is real here and what is the mock's fiction.
+
+FText SeasonLabel(int32 SeasonIndex)
+{
+	switch (SeasonIndex)
+	{
+	case 0: return LOCTEXT("SeasonSpring", "Spring");
+	case 1: return LOCTEXT("SeasonSummer", "Summer");
+	case 2: return LOCTEXT("SeasonAutumn", "Autumn");
+	case 3: return LOCTEXT("SeasonWinter", "Winter");
+	default: break;
+	}
+	// Not a guess and not "Spring". An index this function does not recognise
+	// means the caller had no sky to ask, and WorldStamp drops the season half
+	// when it is empty.
+	return FText::GetEmpty();
+}
+
+FText Ordinal(int32 Number)
+{
+	// UNGROUPED. FText::AsNumber's default groups at a thousand, which would
+	// print the 1000th year as "1,000th" -- the same trap SaveDialogCounter
+	// above sidesteps with Printf.
+	FNumberFormattingOptions Plain;
+	Plain.SetUseGrouping(false);
+	const FText Digits = FText::AsNumber(Number, &Plain);
+
+	// 11, 12 and 13 TAKE "th" DESPITE ENDING IN 1, 2 AND 3, and so does every
+	// hundred above them (111th, 212th). Testing mod 100 before mod 10 is the
+	// whole of the rule; an inline version that tests only the last digit is
+	// wrong exactly once per century and looks right the rest of the time.
+	const int32 Mod100 = FMath::Abs(Number) % 100;
+	if (Mod100 < 11 || Mod100 > 13)
+	{
+		switch (FMath::Abs(Number) % 10)
+		{
+		case 1: return FText::Format(LOCTEXT("OrdinalSt", "{0}st"), Digits);
+		case 2: return FText::Format(LOCTEXT("OrdinalNd", "{0}nd"), Digits);
+		case 3: return FText::Format(LOCTEXT("OrdinalRd", "{0}rd"), Digits);
+		default: break;
+		}
+	}
+	return FText::Format(LOCTEXT("OrdinalTh", "{0}th"), Digits);
+}
+
+FText WorldStamp(int32 DayNumber, const FText& Season, int32 YearNumber)
+{
+	if (DayNumber <= 0)
+	{
+		return FText::GetEmpty();
+	}
+	FNumberFormattingOptions Plain;
+	Plain.SetUseGrouping(false);
+	const FText Day = FText::AsNumber(DayNumber, &Plain);
+
+	// THE SEASON AND THE YEAR DEGRADE SEPARATELY. A session with a day but no
+	// sky subsystem (an unattended leg, a world torn down mid-frame) gets
+	// "Day 11" rather than "Day 11 · , 0th Year of the Second Age", which is the
+	// same rule the death card's own stamp follows one level up: say the part
+	// that is true, omit the rest.
+	if (Season.IsEmpty() || YearNumber <= 0)
+	{
+		return FText::Format(LOCTEXT("WorldStampDayOnly", "Day {0}"), Day);
+	}
+	// The interpunct is the mocks' own separator (`Day ${d.day} · ${d.season}`).
+	return FText::Format(LOCTEXT("WorldStamp", "Day {0} · {1}, {2} Year of the Second Age"),
+	                     Day, Season, Ordinal(YearNumber));
+}
+
+FText DeathTitle()   { return LOCTEXT("DeathTitle", "YOU DIED"); }
+FText DeathRespawn() { return LOCTEXT("DeathRespawn", "RESPAWN"); }
+FText DeathQuit()    { return LOCTEXT("DeathQuit", "QUIT"); }
+
+const TArray<FText>& DeathQuips()
+{
+	static const TArray<FText> Quips = {
+		LOCTEXT("DQ01", "Try not to starve next time."),
+		LOCTEXT("DQ02", "The world does not keep notes on how hard you tried."),
+		LOCTEXT("DQ03", "Somewhere out there, your tools are still in a chest."),
+		LOCTEXT("DQ04", "You lasted longer than most. Not much longer."),
+		LOCTEXT("DQ05", "Consider a wall. Walls have worked before."),
+		LOCTEXT("DQ06", "Nothing out here was ever on your side."),
+		LOCTEXT("DQ07", "Eat something. Sleep somewhere. Build a door."),
+		LOCTEXT("DQ08", "Your camp is exactly where you left it. So is everything else."),
+		LOCTEXT("DQ09", "Being brave and being prepared are different projects."),
+		LOCTEXT("DQ10", "The night was always going to win one of these."),
+	};
+	return Quips;
+}
+
+FText DlgBandEasy()      { return LOCTEXT("DlgEasy", "EASY"); }
+FText DlgBandMedium()    { return LOCTEXT("DlgMedium", "MEDIUM"); }
+FText DlgBandHard()      { return LOCTEXT("DlgHard", "HARD"); }
+FText DlgActionSelect()  { return LOCTEXT("DlgSelect", "Choose a reply"); }
+
+FText HudDemoInteract()    { return LOCTEXT("HudInteract", "Examine the cairn"); }
+FText HudDemoInteractKey() { return LOCTEXT("HudInteractKey", "E"); }
+
+FText HudMusicPrevTip()  { return LOCTEXT("HudMusicPrev",  "Previous track  [ , ]"); }
+FText HudMusicPlayTip()  { return LOCTEXT("HudMusicPlay",  "Play  [ . ]"); }
+FText HudMusicPauseTip() { return LOCTEXT("HudMusicPause", "Pause  [ . ]"); }
+FText HudMusicNextTip()  { return LOCTEXT("HudMusicNext",  "Next track  [ / ]"); }
+
+FText SettingsHideMusicUILabel() { return LOCTEXT("SetHideMusicUI", "HIDE MUSIC UI"); }
+FText SettingsHideMusicUIHint()
+{
+	return LOCTEXT("SetHideMusicUIHint",
+	               "Takes the track name and the back, play and next buttons off the screen. "
+	               "The music keeps playing, and the , . and / keys still control it.");
+}
+FText SettingsHideCompassUILabel() { return LOCTEXT("SetHideCompassUI", "HIDE COMPASS UI"); }
+FText SettingsHideCompassUIHint()
+{
+	return LOCTEXT("SetHideCompassUIHint",
+	               "Takes the heading strip off the top of the screen. Nothing else in the HUD moves.");
 }
 } // namespace VoxelUIStrings
 

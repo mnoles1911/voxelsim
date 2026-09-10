@@ -110,6 +110,14 @@
 //   no "Voxel frame phase" line, with -VoxelFramePhase=1
 //                       -> the hook was not applied. Nothing here ran.
 //   frames=0            -> the hook is present but not called.
+//   seg=MENU n=0, on a -Shot Menu leg
+//                       -> HOOK 0 (NoteMenuFrame) is not being called from the
+//                          front end's Menu-state tick. This is the ONE
+//                          segment a menu-only leg can populate -- FILL and
+//                          both SETTLED rows read n=0 there by construction,
+//                          since HOOK 1 never runs before NEW GAME -- so
+//                          seg=MENU n=0 on such a leg is not a quiet corner
+//                          case, it is the whole leg saying nothing.
 //   seg=SETTLED-MOVING n=0
 //                       -> THE LEG NEVER FLEW AFTER SETTLE, or hook 1 is not
 //                          receiving anchor speed. NO >100 FPS CLAIM MAY BE
@@ -268,6 +276,80 @@ inline double SteadyPct()
 
 // The out-of-line body. Never called with Mode() == 0.
 void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpeedUUPerSec);
+
+// HOOK 0, from the front end's Menu-state tick -- the ONLY place this file's
+// data reaches before NEW GAME.
+//
+// WHY THIS HOOK HAD TO BE ADDED, NOT FOUND. HOOK 1 below is called from the
+// end of the streaming tick (VoxelWorldSubsystem.cpp), which returns before
+// doing anything while UVoxelWorldSubsystem::ChunkOwner is null -- exactly the
+// state the front end leaves it in for as long as the menu holds the world.
+// So the menu was a total blind spot: no "Voxel frame dist" line, ever, said
+// anything about it, and this file's own FAILING READINGS could not tell an
+// untouched hook from a mute menu. seg=MENU below is that fourth segment,
+// fed independently of FILL/SETTLED-PARKED/SETTLED-MOVING (those three stay
+// exactly as printed; see the reading rule at the end of this list).
+//
+// FrameMs is passed in ALREADY COMPUTED (DeltaTime*1000 from the front end's
+// own Tick), unlike HOOK 1 which diffs its own clock. The front end's
+// DeltaTime is already a trustworthy per-call value; a second clock here
+// diffing FPlatformTime::Seconds() a second time could disagree with it for
+// no reason, which is exactly the kind of second opinion this project keeps
+// getting bitten by.
+VOXELEARTH_API void NoteMenuFrameImpl(double FrameMs);
+
+FORCEINLINE void NoteMenuFrame(double FrameMs)
+{
+	if (Mode() != 0)
+	{
+		NoteMenuFrameImpl(FrameMs);
+	}
+}
+
+// HOOK 0b, from the front end's LOADING-state tick -- and it does NOT measure a
+// frame.
+//
+// IT MEASURES THE INTERVAL BETWEEN TWO PAINTS OF THE LOADING CURTAIN, and the
+// distinction is the whole reason the row exists. Owner, 2026-09-07: "Happy to
+// have player sit on loading screen for more than a minute ... However, the
+// loading screen should not feel chunky or hitching." That is two statements:
+// the GAME thread may take as long as it likes behind the curtain, and the
+// CURTAIN must keep moving anyway. A game-frame row could not express it --
+// under FILL those frames are seconds long by design and always will be.
+//
+// So the value passed in is the wall-clock gap between successive
+// SVoxelLoadingScreen paints, recorded by VoxelLoadingCurtain::NotePaint from
+// whichever thread painted (the game thread on ordinary frames; the engine's
+// Slate loading thread inside an armed block, where SWidget::Paint ticks the
+// widget for us) and drained on the game thread by the front end. Two rows in
+// ONE log then answer the Phase 4 gate:
+//
+//     seg=LOADING p99 < 33 ms   AND   seg=FILL still showing multi-second frames
+//
+// If they do not diverge, the thread move did nothing -- and with
+// -VoxelLoadingScreenThread=0 the same instrument reads seconds, which is what
+// makes this a test that can fail rather than a confirmation that cannot.
+//
+// FAILING READINGS:
+//   seg=LOADING n=0   -> this hook is not being called. The leg says nothing
+//                        about the loading screen, and no smoothness claim may
+//                        be made from it.
+//   seg=LOADING n>0 but the run never showed a curtain
+//                     -> stale intervals from a previous show; the front end
+//                        resets the paint clock at BeginLoad, so this means the
+//                        reset did not run.
+//   paintOverflow>0 on the "LoadScreen: curtain thread" line
+//                     -> samples were DROPPED between two drains, from exactly
+//                        the worst window. Do not quote a p99 over it.
+VOXELEARTH_API void NoteLoadingFrameImpl(double PaintIntervalMs);
+
+FORCEINLINE void NoteLoadingFrame(double PaintIntervalMs)
+{
+	if (Mode() != 0)
+	{
+		NoteLoadingFrameImpl(PaintIntervalMs);
+	}
+}
 
 // HOOK 1, at the end of the streaming tick, with three values the caller has
 // already computed.

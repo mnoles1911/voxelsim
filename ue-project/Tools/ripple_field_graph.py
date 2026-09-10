@@ -139,6 +139,18 @@ MPC_GAIN = "RippleFieldGain"
 FADE_START = 0.42
 FADE_END = 0.485
 
+# THE FETCH ITSELF. Kept at module scope so the exact HLSL the water and the
+# ocean run is greppable and diffable without reading a graph. The argument for
+# hand-writing it at all is at the call site in sample_ripple_field.
+#
+# .rg = (dH/dx, dH/dy); .b = H in metres. .a is NOT read -- the canvas draw path
+# only guarantees the three emissive channels (see the module docstring).
+RIPPLE_FETCH_HLSL = """// The interactive ripple field, fetched at the coordinate the graph computed
+// and nothing else. UV arrives as an ordinary float2 local; mip 0 is explicit,
+// so there is no derivative chain and this is legal in the vertex shader too
+// (height feeds World Position Offset). RGBA16f render target, 1 mip.
+return Texture2DSampleLevel(RippleFieldTex, RippleFieldTexSampler, UV, 0);"""
+
 
 def sample_ripple_field(b):
     """Sample the ripple field at this pixel's world XY. Returns a dict.
@@ -179,11 +191,60 @@ def sample_ripple_field(b):
     origin_xy = b.mask(origin, "", r=True, g=True)
     uv = b.mul(b.sub(world_xy, origin_xy), inv_size)
 
+    # --- THE FETCH IS HAND-WRITTEN HLSL, AND THAT IS THE WHOLE BUG FIX -------
+    #
+    # THE DEFECT (2026-09-07, eight instrumented frames, every one carrying a
+    # must-fire control in its own pixels -- the table is in
+    # docs/water-ocean-tides-plan-2026-09-04.md):
+    #
+    #   A MaterialExpressionTextureSampleParameter2D bound to
+    #   /Game/Voxel/RT_VoxelRippleField returned the injected data when its UVs
+    #   input was a CONSTANT (`constprobe`, VoxelVerify00954 -- the whole lake
+    #   lights at the literal (0.615, 0.605)) or the SCREEN's uv (`fieldpic`,
+    #   VoxelVerify00942 -- the five discs, right place, right 1.85:1 aspect),
+    #   and returned NOTHING when its UVs input was the expression built two
+    #   lines above -- whose per-pixel VALUE at those very pixels is pinned to
+    #   (0.615, 0.605) by two 1.5 m-wide bands (`bandprobe`, VoxelVerify00952)
+    #   and whose orientation, offset and scale are each separately measured
+    #   (`uvpin`, VoxelVerify00946). Fresh sampler nodes, a plain WorldPosition
+    #   in place of the no-offsets one, LOD forced to mip 0, and the LWC-safe
+    #   camera-relative rewrite all reproduced the failure
+    #   (`bothtap`/`mipprobe`/`fixprobe`, VoxelVerify00948/950/956).
+    #
+    # A sampler cannot return two answers for one coordinate. So the value the
+    # ARITHMETIC produces and the value the compiled FETCH receives were not the
+    # same value: the defect is in the texture-sample the MATERIAL COMPILER
+    # EMITS for this parameter, not in anything this graph can be asked for.
+    #
+    # THE PROOF THAT THIS IS THE FIX, in ONE frame with the defect and the
+    # control in the same pixels (`customtap`, VoxelVerify00960, shipping-pose
+    # capture with five 8 m rings injected and frozen):
+    #   R = this Custom-HLSL fetch at the uv below ......... 51.98% of the frame
+    #   G = the ordinary sampler at THE SAME uv expression .  0.0000%
+    #   B = the ordinary sampler at a CONSTANT uv .......... all water
+    # One node apart, one frame, one set of pixels.
+    #
+    # WHY THIS FORM AND NOT ANOTHER. The Custom node's UV arrives as an ordinary
+    # float2 local -- the same chunk the threshold instruments read, which is
+    # exactly the value that was proven correct -- and the fetch is one line of
+    # HLSL with no coordinate re-derivation, no derivative autogen and no LOD
+    # chain of the compiler's choosing. Mip 0 is explicit: the render target has
+    # a single mip (create_ripple_field_materials.py never asks for more), so
+    # nothing is lost, and an explicit level is what makes this same expression
+    # legal in the VERTEX shader -- which matters, because height_m below feeds
+    # World Position Offset while grad_xy feeds the normal, and BOTH must come
+    # off ONE read (see the module docstring's "ONE tap" argument).
+    #
+    # THE BINDING IS UNCHANGED. A MaterialExpressionTextureObjectParameter under
+    # the SAME parameter name, with the same asset and the same sampler type, is
+    # the same baked default the "WHY AN ASSET" section above requires -- the
+    # far-field sheet still gets the field with no MID. The precedent for the
+    # object -> Custom -> `<InputName>Sampler` convention in this project is
+    # create_sunshadow_lf_material.py:106-131, which ships on it.
+    #
     # SAMPLERTYPE_LINEAR_COLOR: these are metres and slopes, not colours, and a
     # colour sampler would apply a gamma curve to a signed height field. Same
     # argument, same sampler type, as the bathy texture.
-    tex = b.node(unreal.MaterialExpressionTextureSampleParameter2D)
-    tex.set_editor_property("parameter_name", FIELD_TEXTURE_PARAM)
     texture = unreal.load_object(None, FIELD_TEXTURE)
     if texture is None:
         raise RuntimeError(
@@ -192,9 +253,27 @@ def sample_ripple_field(b):
             "either fail to compile or silently default its texture parameter to whatever "
             "the engine picks, which would add an unrelated image to the water's normal "
             "on every pixel." % FIELD_TEXTURE)
-    tex.set_editor_property("texture", texture)
-    tex.set_editor_property("sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
-    b.link(uv, "", tex, "UVs")
+    tex_obj = b.node(unreal.MaterialExpressionTextureObjectParameter)
+    tex_obj.set_editor_property("parameter_name", FIELD_TEXTURE_PARAM)
+    tex_obj.set_editor_property("texture", texture)
+    tex_obj.set_editor_property(
+        "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+
+    tex = b.node(unreal.MaterialExpressionCustom)
+    tex.set_editor_property("description", "SampleRippleField")
+    tex.set_editor_property("code", RIPPLE_FETCH_HLSL)
+    tex.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT4)
+    _inputs = []
+    for _name in ("RippleFieldTex", "UV"):
+        _ci = unreal.CustomInput()
+        _ci.set_editor_property("input_name", _name)
+        _inputs.append(_ci)
+    tex.set_editor_property("inputs", _inputs)
+    # b.link raises on a failed connect, which is the behaviour this needs: the
+    # input NAMES are what the HLSL above reads, so a rename that misses one end
+    # must fail loudly rather than compile against a stale local.
+    b.link(tex_obj, "", tex, "RippleFieldTex")
+    b.link(uv, "", tex, "UV")
 
     # Chebyshev distance from the window centre, so the fade follows the SQUARE
     # window rather than a circle inscribed in it -- bathy_field_graph.py:120-123
@@ -216,12 +295,20 @@ def sample_ripple_field(b):
     # way to zero anyway. The wave field's patch term omits its own derivative
     # for the same kind of reason (create_water_voxel_material.py:2526-2529) and
     # quotes its own number; this is that number for this term.
+    height_raw = b.mask(tex, "", b=True)
     grad_xy = b.mul(b.mask(tex, "", r=True, g=True), weight)
-    height_m = b.mul(b.mask(tex, "", b=True), weight)
+    height_m = b.mul(height_raw, weight)
 
+    # height_raw / weight are the two HALVES of height_m, returned so an
+    # instrument can ask which of them is zero without building a second
+    # sampler that would not be the same fetch. Nothing shipping reads them --
+    # a consumer that wants the ripple wants it gained and faded -- and adding
+    # them changes not one node in the graph.
     return {
         "grad_xy": grad_xy,
         "height_m": height_m,
+        "height_raw": height_raw,
+        "weight": weight,
         "uv": uv,
     }
 
@@ -234,19 +321,61 @@ def sample_ripple_field(b):
 # by the field itself, so a moving boat trails a white wedge, rings read as
 # white circles, and a splash flashes white and fades with the field's own
 # decay -- no new state, no new timing, the sim already animates it.
+#
+# THE RESPONSE HAS A THRESHOLD, AND THE 2026-09-07 GREY-BLOB VERDICT IS WHY.
+#
+# The first shipped form was saturate((|grad| + |h| * 4) * 8): a straight line
+# through the origin. Any texel above raw 0.125 -- 3 cm of ripple, or a slope
+# of 1 in 8 -- pinned to FULL foam, and there was no value the field could hold
+# that read as "barely disturbed". The boat leg that produced VoxelVerify00974
+# logged its wake at max |grad| 0.19 and max |h| 0.044 m (`field verified LIVE
+# -- centre patch max field value 0.1919, max state height 0.0436 m`), i.e.
+# raw 0.36 at the hull, 2.9x past saturation before the gain had even done its
+# work; and the sim's spread-out remainder -- millimetres of height across the
+# whole 51 m window after eight seconds under way -- was ALSO past saturation.
+# The owner's "hard grey blob ... a grey plane covering almost the entire
+# world map" is that: a window-shaped mask of every texel the field had ever
+# touched, cut off by the window's own 3.3 m edge fade. Whitewater is not a
+# mask of "has the water moved"; it sits on the steep crests and nowhere else.
+#
+# So the response is now
+#
+#     x    = |grad| + |height_m| * HeightWeight
+#     foam = saturate((x - Threshold) * Gain * Enabled)
+#
+# which is the same family the wind whitecaps already use (water_wave_graph.
+# build_whitecap_foam: saturate((|gradient| - SlopeThresh) / (SlopeFull -
+# SlopeThresh))): a dead band below Threshold, a linear knee above it. Texels
+# the field has merely touched sit in the dead band and draw NOTHING, so the
+# window edge is invisible by construction on undisturbed water -- the fade
+# no longer has to hide anything and its width (FADE_START/FADE_END) is left
+# alone, since widening it would also soften the ripple NORMAL for no reason.
+#
+# ALL FOUR NUMBERS ARE ScalarParameters, so the whole ladder runs on
+# -VoxelWaterMatScalar=Name:Value[,Name:Value] against ONE regenerated asset
+# (sheet material only -- the ocean takes the baked defaults). Read the
+# sheet's "material scalar '<Name>' set to" echo for EVERY pair; a missing
+# echo is a void arm, not a null (the 2026-09-07 06:00 first-pair-only trap).
 DISTURBANCE_FOAM_DEFAULTS = {
-    # saturate((|grad| + |height_m| * HeightWeight) * Gain * Enabled).
-    # THE GAIN DEFAULT IS DERIVED, NOT GUESSED: the debug frames measured the
-    # field's wake values at ~0.06-0.3 (gradient units, RippleFieldGain in the
-    # loop). 8.0 puts the wedge's faint tail (0.06) at 0.48 foam and anything
-    # over 0.125 at FULL white -- deliberately vivid, per the owner's brief
-    # ("he wants to SEE it"); he dials it live via the MID probe
-    # (-VoxelWaterMatScalar=DisturbanceFoamGain:<v>).
-    "DisturbanceFoamGain": 8.0,
-    # Metres of ripple height that count like slope 1.0 (1/0.25 m). Baked, not
-    # a parameter: the gain above is the one knob, and gradient is the
-    # dominant term for a wake anyway (a wake is steep before it is tall).
-    "DisturbanceFoamHeightWeight": 4.0,
+    # Slope of the knee above the threshold: foam reaches 1.0 at
+    # Threshold + 1/Gain. OWNER-DIRECTED 2026-09-08 after the live session
+    # ("surface foam ... way too prevalent and spreads out in a circle
+    # everywhere from the boat ... should only be near the wake and pretty
+    # small"): threshold 0.05 -> 0.2, gain 6 -> 3, height weight 1 -> 0, so
+    # only the crests (|grad| * RippleFieldGain > 0.2) carry foam and full
+    # white needs 0.53. Ladder on the next launch as scalars.
+    "DisturbanceFoamGain": 3.0,
+    # Metres of ripple height that count like slope 1.0. Was 4.0 (a baked
+    # constant); now a parameter, and 1.0 -- a wake is steep before it is
+    # tall (the hull's 0.044 m is 0.044 of slope-equivalent against a
+    # gradient of 0.19), so the gradient is the driver and the height is a
+    # tie-breaker for a tall slow swell the gradient under-reads.
+    "DisturbanceFoamHeightWeight": 0.0,
+    # The dead band. Nothing below this raw value draws any foam at all.
+    # 0.05 is a 1-in-20 slope or 5 cm of ripple with HeightWeight 1: above
+    # the spread remainder of a wake (millimetres, slopes of ~0.01) and well
+    # below its crests. PROVISIONAL, same ladder.
+    "DisturbanceFoamThreshold": 0.2,
     # The arm's off switch, FoamV2Enabled-style: a pixel-identical off for
     # A/Bs without a regeneration. The real inert default is upstream --
     # RippleFieldGain 0 on an undriven collection zeroes the taps themselves.
@@ -266,22 +395,26 @@ def build_disturbance_foam(b, grad_xy, height_m, defaults=None):
     the C++ sim's, so a frozen-arm capture shows the wake foam still moving
     -- the arm freezes the material's own animation, which this is not.
 
-    Returns {"foam": expr} -- max() it into the existing foam composite (the
-    lake's signal stack, the ocean's chain), per the standing max-not-add
-    doctrine there: disturbed water breaking over an already-foamy crest is
-    one patch of white, not two whites summed past 1. Riding the composite
-    also buys the full foam contract for free: colour, opacity AND roughness
-    move together, which is what makes the wedge read as whitewater rather
-    than as paint.
+    Returns {"foam": expr, "raw": expr} -- max() `foam` into the existing foam
+    composite (the lake's signal stack, the ocean's chain), per the standing
+    max-not-add doctrine there: disturbed water breaking over an already-foamy
+    crest is one patch of white, not two whites summed past 1. Riding the
+    composite also buys the full foam contract for free: colour, opacity AND
+    roughness move together, which is what makes the wedge read as whitewater
+    rather than as paint. `raw` is the pre-threshold x, exposed for
+    instruments only; nothing shipping reads it.
     """
     d = dict(DISTURBANCE_FOAM_DEFAULTS)
     if defaults:
         d.update(defaults)
     g2 = b.binary(unreal.MaterialExpressionDotProduct, grad_xy, "", grad_xy, "")
     gmag = b.unary(unreal.MaterialExpressionSquareRoot, g2)
-    hterm = b.mul(b.abs_(height_m), b.const(d["DisturbanceFoamHeightWeight"]))
+    height_weight = b.scalar("DisturbanceFoamHeightWeight", d["DisturbanceFoamHeightWeight"])
+    hterm = b.mul(b.abs_(height_m), height_weight)
     raw = b.add(gmag, hterm)
+    threshold = b.scalar("DisturbanceFoamThreshold", d["DisturbanceFoamThreshold"])
     gain = b.scalar("DisturbanceFoamGain", d["DisturbanceFoamGain"])
     enabled = b.scalar("DisturbanceFoamEnabled", d["DisturbanceFoamEnabled"])
-    foam = b.saturate(b.mul(b.mul(raw, gain), enabled))
-    return {"foam": foam}
+    knee = b.sub(raw, threshold)
+    foam = b.saturate(b.mul(b.mul(knee, gain), enabled))
+    return {"foam": foam, "raw": raw}

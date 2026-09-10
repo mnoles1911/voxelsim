@@ -1311,6 +1311,43 @@ namespace VoxelSky
 	constexpr int32 kDaysBeforeMonth[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
 	constexpr int32 kDaysInMonth[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
+	// ASTRONOMICAL CONVENTION -- seasons run solstice to equinox -- and not the
+	// meteorological one (whole months, spring = Mar/Apr/May), because the
+	// boundaries then ARE the solar declination's extremes and zero crossings,
+	// which is what the ephemeris this reads from is built on (VoxelEphemeris.h:
+	// 119-124). A season named on any other convention could disagree with the sun
+	// the frame is actually lit by.
+	//
+	//     79  = 20 Mar, March equinox        172 = 21 Jun, June solstice
+	//     265 = 22 Sep, September equinox    355 = 21 Dec, December solstice
+	//
+	// (20 March and not 21: reference year 2000 is a LEAP year, the same fact
+	// kDaysBeforeMonth above exists to carry.)
+	//
+	// MOVED HERE FROM VoxelEarthHUD.cpp's ANONYMOUS NAMESPACE on 2026-09-08, when
+	// the journal and death stamps became the second consumer. See the header for
+	// why the boundaries live in one place and the display names do not.
+	int32 SeasonIndexFromDayOfYear(int32 DayOfYear, double LatitudeDeg)
+	{
+		const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
+		const bool bNorth = LatitudeDeg >= 0.0;
+		if (Doy >= 79 && Doy < 172)
+		{
+			return bNorth ? 0 : 2; // spring / autumn
+		}
+		if (Doy >= 172 && Doy < 265)
+		{
+			return bNorth ? 1 : 3; // summer / winter
+		}
+		if (Doy >= 265 && Doy < 355)
+		{
+			return bNorth ? 2 : 0; // autumn / spring
+		}
+		// Wraps the year end: 355..365 and 0..78, i.e. December solstice to March
+		// equinox.
+		return bNorth ? 3 : 1; // winter / summer
+	}
+
 	void MonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay)
 	{
 		const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
@@ -2822,7 +2859,10 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 	// (VoxelEarthGameMode.cpp:54-92) so the two cannot drift apart.
 	double SpawnColumnXUU = 0.0;
 	double SpawnColumnYUU = 0.0;
-	VoxelEarthSpawn::ParseSpawnColumnUU(SpawnColumnXUU, SpawnColumnYUU); // stays (0,0) if the switch is absent
+	// Resolve, not Parse (2026-09-07): the spawn rule can move an ordinary
+	// launch's column to a fine-baked tile, and the rig must follow it for the
+	// same reason it follows -VoxelSpawnAt. Stays (0,0) when neither applies.
+	VoxelEarthSpawn::ResolveSpawnColumnUU(GetWorld(), SpawnColumnXUU, SpawnColumnYUU);
 	Impl->ObserverXUU = SpawnColumnXUU;
 	Impl->ObserverYUU = SpawnColumnYUU;
 
@@ -3456,6 +3496,23 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 		}
 	}
 
+	// menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): the
+	// ephemeris computation and MPC writes below have no visible sky to feed
+	// -- the menu background is SVoxelCoverImage, a plain 2D Slate brush over
+	// SVoxelMainMenu, never a scene capture of the world -- and every reader
+	// found for GetSkyState() (VoxelEarthHUD, VoxelPauseUISubsystem's and
+	// VoxelScreensUISubsystem's day counters, VoxelFluidSubsystem,
+	// VoxelWaterSubsystem, VoxelWeatherSubsystem [gated separately, above])
+	// is gameplay-only and cannot run while the front end holds the world.
+	// This is placed AFTER the deferred-rig check on purpose: that block's
+	// own job is to notice the moment IsWorldHeldForMenu goes false and stop
+	// deferring, so it must keep running while held.
+	// -VoxelMenuTickGates=0 is the A/B off arm: same build, this early return
+	// never taken.
+	if (VoxelFrontEnd::MenuTickGatesEnabled() && VoxelFrontEnd::IsWorldHeldForMenu(GetWorld()))
+	{
+		return;
+	}
     // Simulation time is authoritative even when the sky rendering feature is disabled.
     const double TimeScale = Impl->ClockRate();
     const double DayLength = Impl->ClockDay();

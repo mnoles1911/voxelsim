@@ -294,15 +294,43 @@ if ($VoxelCoreLib -and (Test-Path $VoxelCoreRoot)) {
 if (-not $KeepEditLog) {
     $worldDir = Join-Path (Split-Path $Project) 'Saved\VoxelWorlds'
     if (Test-Path $worldDir) {
-        $stale = @(Get-ChildItem $worldDir -Include *.vxlog, *.vxwater -File -Recurse -ErrorAction SilentlyContinue)
-        if ($stale.Count -gt 0) {
+        # AND THE SESSION CHECKPOINTS, WHICH THIS BLOCK DID NOT CLEAR AND WHICH ARE
+        # THE SAME BUG A THIRD TIME (2026-09-07). The session-persistence merge
+        # added two more pieces of persisted world state beside the edit log: a
+        # `<seed>.vxlog.checkpoints/` DIRECTORY of committed checkpoint
+        # generations, and `<seed>.vxlog.detached-<hash>.bin` sidecars. Clearing
+        # the `.vxlog` while leaving those behind does not produce a fresh world;
+        # it produces a world the new loader classifies as UNREADABLE --
+        # "No complete supported checkpoint generation could be loaded" --
+        # whereupon VoxelSessionCheckpoint::Fail disables simulation and
+        # checkpoint writes and BeginPlayerSession returns early, so the player
+        # session never starts and fine-tile streaming stalls at the spawn tile.
+        #
+        # Measured on 2026-09-07: every capture after the first post-merge
+        # session refused (`Session load refused`) and came up with 1 fine tile
+        # resident against 4 in the runs before it, and a three-arm shore-foam
+        # ladder photographed a different shoreline than its own baseline. The
+        # checkpoint generation it tripped over had been written 00:49:18 by
+        # the previous CAPTURE session on exit -- fixture artefacts, not player
+        # progress, exactly as the `.vxlog` this block already discards is.
+        #
+        # The loader's refusal is arguably correct for a real player (a log that
+        # vanished from under committed checkpoints IS suspicious); the fixture
+        # clear is what has to be complete. -KeepEditLog keeps all of it, as it
+        # always kept the log.
+        $stale = @(Get-ChildItem $worldDir -Include *.vxlog, *.vxwater, *.vxlog.detached-*.bin -File -Recurse -ErrorAction SilentlyContinue)
+        $staleDirs = @(Get-ChildItem $worldDir -Directory -Recurse -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -like '*.vxlog.checkpoints' })
+        if (($stale.Count + $staleDirs.Count) -gt 0) {
             # Say what was discarded. "Discarded 4.1 MB of water blob" is the line
             # that tells you the previous run actually poured something, and it is
             # the only warning that a comparison you were about to make had a
             # contaminated baseline.
-            $what = ($stale | ForEach-Object { "{0} ({1:N0} B)" -f $_.Name, $_.Length }) -join ', '
+            $what = (@($stale | ForEach-Object { "{0} ({1:N0} B)" -f $_.Name, $_.Length }) +
+                     @($staleDirs | ForEach-Object { "{0}/ (checkpoint dir)" -f $_.Name })) -join ', '
             Write-Host "  cleared persisted world state: $what" -ForegroundColor DarkGray
             $stale | Remove-Item -Force
+            $staleDirs | Remove-Item -Recurse -Force
         }
     }
 }

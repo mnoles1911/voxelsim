@@ -68,6 +68,58 @@ VOXELEARTHUI_API void SetWaterWaveDetail(bool bEnabled);
 VOXELEARTHUI_API bool GetOceanMeshDetail();
 VOXELEARTHUI_API void SetOceanMeshDetail(bool bEnabled);
 
+// "Interface Size" -- THE ONE ROW HERE THAT IS NOT A CVAR, and the one the
+// player is most likely to touch.
+//
+// WHAT IT MULTIPLIES. Per ADR-0011 the engine picks a CONTINUOUS DPI scale from
+// [/Script/Engine.UserInterfaceSettings] in DefaultEngine.ini -- ShortestSide,
+// anchored 1.0 at 1080, so a 1440p screen gets 1.333 and the interface occupies
+// the proportion the 1080p-authored mocks intended. This setting is
+// FSlateApplication's application scale, which MULTIPLIES that curve; it does
+// not replace it.
+//
+// SO THE DEFAULT IS 1.00 AND MUST STAY 1.00. At 1.00 the player sees exactly
+// what the curve chose for their screen, which is the designed framing. The row
+// exists because that framing is still a matter of taste and eyesight, and
+// ADR-0011 decision 5 makes the manual override the escape hatch rather than a
+// constant somebody edits.
+//
+// Range 0.75 to 1.50 in 0.05 steps, snapped and clamped by SetUIScale so the
+// stored value is always one of the sixteen the row can produce.
+VOXELEARTHUI_API float GetUIScale();
+VOXELEARTHUI_API void SetUIScale(float Scale);
+// The row's own bounds, exported so the SETTINGS panel maps its slider onto
+// them rather than restating them -- one authority for the range, as with the
+// cvar spellings above.
+VOXELEARTHUI_API float UIScaleMin();
+VOXELEARTHUI_API float UIScaleMax();
+VOXELEARTHUI_API float UIScaleStep();
+
+// "Hide Music UI" / "Hide Compass UI" -- THE TWO ROWS HERE THAT ARE NOT A
+// CVAR AND NOT A RENDER TRADE. Owner directive, 2026-09-08, after confirming the
+// transport works: two switches that take HUD furniture off the screen.
+//
+// WHY THEY LIVE HERE RATHER THAN IN VoxelAudioUserSettings. HIDING THE MUSIC UI
+// IS NOT MUTING THE MUSIC. This pair is about what is drawn -- the same question
+// INTERFACE SIZE answers -- and the transport hotkeys keep working with the
+// plates hidden, exactly as the volume sliders keep working with the panel shut.
+// Filing them under audio would invite the next reader to make hiding the
+// buttons stop the soundtrack.
+//
+// BOTH DEFAULT FALSE: nothing is hidden until the player says so, and a missing
+// ini key must therefore read as "shown". The HUD reads them every frame through
+// its own visibility attributes, so a toggle is live with no apply step -- which
+// is why neither appears in ApplyAll's cvar list below.
+//
+// HIDDEN WINS OVER EVERY OTHER GATE in the music cluster: over the cursor gate,
+// over hold-Tab, over the death screen exception. "Hidden" is the player's own
+// instruction and nothing else in the HUD is entitled to overrule it.
+VOXELEARTHUI_API bool GetHideMusicUI();
+VOXELEARTHUI_API void SetHideMusicUI(bool bHidden);
+
+VOXELEARTHUI_API bool GetHideCompassUI();
+VOXELEARTHUI_API void SetHideCompassUI(bool bHidden);
+
 // Push every persisted setting into its cvar. Idempotent; called from
 // UVoxelFrontEndSubsystem::Initialize so a fresh process honours the player's
 // saved choices before the first marched frame, and from every Set* so a

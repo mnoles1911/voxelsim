@@ -1229,6 +1229,34 @@ public:
 	static void EnsureCreated_RenderThread(FRHICommandListImmediate& RHICmdList,
 	                                       const FVoxelBrickPoolBuffersRef& Buffers);
 
+	// --- THE MENU PRE-WARM (2026-09-08) --------------------------------------
+	//
+	// GAME THREAD. Initialises the pool with its default config if nothing has
+	// yet, then ENQUEUES the arena creation as an ordinary render command and
+	// RETURNS IMMEDIATELY -- it does not flush, it does not block, and the
+	// caller's frame does not wait for the RHI. That is the whole point: the
+	// title screen is a static 2D image over a held world, so a ~1 GiB
+	// zero-initialised commit landing on the render thread while it is up is
+	// invisible, and the same commit landing inside the first streaming frames
+	// is not.
+	//
+	// WHY THIS IS SAFE TO CALL WITH THE WORLD HELD. The pool's config is
+	// world-independent -- the lazy path already self-initialises with
+	// `FVoxelBrickPoolConfig{}` (see AddChunkFromCpu / AddChunkFromGpu), so
+	// pre-warming picks the SAME config the first chunk would have picked. It
+	// adds no chunks, publishes no index entries and touches no world state;
+	// only the allocation moves earlier in wall-clock time.
+	//
+	// IDEMPOTENT. EnsureCreated_RenderThread is already a no-op on a pool whose
+	// buffers exist, so a second call costs one render command and one branch.
+	//
+	// ENGAGEMENT READING (both directions, and both can fail):
+	//   `BrickPool: arenas created in ... ms` with no `(pre-warmed)` marker on
+	//   a NEW GAME leg means the pre-warm did NOT run and the commit is still
+	//   inside the load. `BrickPool: arenas already created (pre-warmed)` on
+	//   the first streaming flush is the proof it did.
+	void PrewarmArenas();
+
 	// Drops every allocation and queues a clear of nothing -- the records are
 	// rotated into a fresh holder. Callers must first quiesce producers and detach
 	// their index; queued RT commands retain the old holder until retirement.

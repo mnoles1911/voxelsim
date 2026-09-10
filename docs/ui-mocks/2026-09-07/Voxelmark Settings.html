@@ -1,0 +1,299 @@
+<!doctype html>
+<!-- @dsCard group="Brand" name="Voxelmark Settings" subtitle="Settings overlay — audio, display and controls" viewport="2560x1440" -->
+<html lang="en">
+<head>
+<style id="ui-scale-2k">/* authored at 1080p, rendered for a 1440p / 2K screen */html{zoom:1.33333}</style>
+<meta charset="utf-8" />
+<title>Voxelmark — Settings</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<link rel="stylesheet" href="menus_shared.css" />
+<style>
+  body{font-family:var(--hand);color:var(--parchment);background:#000;overflow:hidden;user-select:none}
+  a{color:var(--warm-highlight);text-decoration:none}a:hover{color:var(--parchment)}
+
+  /* dimmed paused gameworld behind */
+  .bg{
+    position:absolute;inset:0;
+    background:url("assets/menu_backgrounds/cave_background1.jpg") center/cover no-repeat;
+    filter:blur(8px) brightness(0.32) saturate(0.6);
+  }
+  .vignette{position:absolute;inset:0;pointer-events:none;box-shadow:inset 0 0 200px rgba(0,0,0,0.65)}
+  .grain{position:absolute;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg, rgba(255,180,80,0.015) 0 1px, transparent 1px 3px);mix-blend-mode:overlay}
+
+  /* ============ SETTINGS PANEL ============ */
+  .se-panel{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:600px;max-height:calc(100vh - 24px);
+    background:linear-gradient(180deg,rgba(28,18,10,0.96),rgba(14,8,4,0.98));
+    border:2px solid #000;
+    box-shadow:
+      inset 0 0 0 1px var(--leather-edge),
+      inset 0 0 0 3px var(--leather-1),
+      0 8px 24px rgba(0,0,0,0.8);
+    padding:18px 32px 14px;
+    display:flex;flex-direction:column;gap:10px;
+  }
+  .se-title{
+    font-family:var(--serif);font-size:24px;letter-spacing:4px;color:var(--warm-highlight);
+    text-align:center;text-shadow:2px 2px 0 #000;
+  }
+  .se-rule{height:1px;background:var(--leather-edge);margin:-2px 0 2px}
+
+  .se-section{
+    font-family:var(--serif);font-size:13px;letter-spacing:2px;
+    color:var(--warm-primary);text-shadow:1px 1px 0 #000;
+    margin-top:2px;display:flex;align-items:center;gap:10px;
+  }
+  .se-section::after{
+    content:"";flex:1;height:1px;background:linear-gradient(90deg,var(--leather-edge),transparent);
+  }
+
+  /* slider rows */
+  .sl-row{
+    display:grid;grid-template-columns:130px 1fr 50px;gap:14px;align-items:center;
+    padding:1px 0;
+  }
+  .sl-label{
+    font-family:var(--serif);font-size:18px;letter-spacing:1px;color:var(--parchment);
+    text-shadow:1px 1px 0 #000;
+  }
+  .sl-track{
+    position:relative;height:18px;
+    background:linear-gradient(180deg,#1a0e04,#0a0502);
+    border:1px solid #000;
+    box-shadow:inset 0 0 0 1px var(--leather-edge),inset 0 2px 3px rgba(0,0,0,0.6);
+    cursor:pointer;
+  }
+  .sl-fill{
+    position:absolute;left:0;top:0;bottom:0;
+    background:linear-gradient(180deg,var(--warm-primary) 0%,var(--warm-secondary) 100%);
+    box-shadow:inset 0 1px 0 rgba(255,220,160,0.3);
+    pointer-events:none;
+  }
+  .sl-knob{
+    position:absolute;top:50%;width:14px;height:24px;
+    transform:translate(-50%,-50%);
+    background:linear-gradient(180deg,var(--warm-highlight),var(--warm-primary));
+    border:1px solid #000;
+    box-shadow:0 1px 2px rgba(0,0,0,0.6),inset 0 1px 0 rgba(255,240,200,0.4);
+    pointer-events:none;
+  }
+  .sl-val{
+    font-family:"Courier New",monospace;font-size:14px;color:var(--warm-highlight);
+    text-align:right;letter-spacing:1px;
+  }
+
+  /* checkbox row */
+  .ck-row{
+    display:flex;align-items:center;gap:14px;cursor:pointer;
+    padding:2px 0;
+  }
+  .ck-box{
+    width:22px;height:22px;flex:none;
+    background:linear-gradient(180deg,#1a0e04,#0a0502);
+    border:1px solid #000;
+    box-shadow:inset 0 0 0 1px var(--leather-edge),inset 0 2px 3px rgba(0,0,0,0.5);
+    display:grid;place-items:center;
+  }
+  .ck-box::after{
+    content:"";width:14px;height:14px;
+    background:linear-gradient(135deg,var(--warm-highlight),var(--warm-primary));
+    box-shadow:0 0 6px rgba(245,208,110,0.5);
+    transform:scale(0);transition:transform .12s ease-out;
+  }
+  .ck-row.on .ck-box::after{transform:scale(1)}
+  .ck-label{
+    font-family:var(--serif);font-size:18px;letter-spacing:1px;color:var(--parchment);
+    text-shadow:1px 1px 0 #000;
+  }
+  .ck-hint{
+    font-family:var(--hand);font-style:italic;font-size:13px;color:var(--ink-mute);
+    margin-left:6px;
+  }
+
+  /* mining anchor cycler */
+  .mn-row{
+    display:grid;grid-template-columns:130px 1fr;gap:14px;align-items:flex-start;
+    padding:1px 0;
+  }
+  .mn-cycler{
+    display:flex;flex-direction:column;gap:4px;
+  }
+  .mn-btn{
+    font-family:var(--serif);font-size:15px;letter-spacing:2px;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    color:var(--parchment);border:1px solid var(--leather-edge);
+    padding:8px 14px;cursor:pointer;text-align:left;
+    text-shadow:1px 1px 0 #000;display:flex;align-items:center;justify-content:space-between;gap:10px;
+  }
+  .mn-btn:hover{border-color:var(--warm-primary)}
+  .mn-btn.depth{color:#b6e8a0}
+  .mn-btn.depth .badge{
+    font-family:var(--serif);font-size:11px;letter-spacing:2px;
+    background:rgba(150,210,120,0.18);color:#b6e8a0;
+    border:1px solid rgba(150,210,120,0.4);
+    padding:2px 8px;
+  }
+  .mn-btn.center{color:var(--warm-highlight)}
+  .mn-btn.center .badge{
+    font-family:var(--hand);font-style:italic;font-size:12px;
+    color:var(--ink-mute);background:transparent;border:none;padding:0;
+  }
+  .mn-help{
+    font-family:var(--hand);font-style:italic;font-size:12px;color:var(--ink-mute);
+    line-height:1.5;
+  }
+  .mn-help b{color:var(--parchment);font-style:normal;font-weight:normal;}
+
+  /* footer buttons */
+  .se-foot{
+    display:flex;gap:12px;justify-content:flex-end;margin-top:4px;padding-top:10px;
+    border-top:1px solid var(--leather-edge);
+  }
+  .se-act{
+    font-family:var(--serif);font-size:15px;letter-spacing:3px;
+    background:linear-gradient(180deg,var(--leather-1),var(--leather-2));
+    color:var(--parchment);border:1px solid var(--leather-edge);
+    padding:9px 24px;cursor:pointer;text-shadow:1px 1px 0 #000;
+  }
+  .se-act:hover{border-color:var(--warm-primary);color:var(--warm-highlight)}
+  .se-act.primary{
+    background:linear-gradient(180deg,var(--warm-primary),var(--warm-secondary));
+    color:#fff8e0;border-color:#000;
+    box-shadow:inset 0 1px 0 rgba(255,220,160,0.3),0 2px 6px rgba(0,0,0,0.5);
+  }
+  .se-act.primary:hover{
+    background:linear-gradient(180deg,var(--warm-highlight),var(--warm-primary));
+    color:var(--parchment-ink);
+  }
+  .se-esc{
+    font-family:var(--hand);font-style:italic;font-size:13px;color:var(--ink-mute);
+    align-self:center;margin-right:auto;
+  }
+  .se-esc kbd{
+    font-family:var(--serif);font-style:normal;letter-spacing:2px;
+    color:var(--warm-highlight);background:var(--leather-2);
+    border:1px solid var(--leather-edge);padding:2px 8px;font-size:11px;
+  }
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="vignette"></div>
+  <div class="grain"></div>
+
+  <div class="se-panel">
+    <div class="se-title">SETTINGS</div>
+    <div class="se-rule"></div>
+
+    <div class="se-section">AUDIO</div>
+
+    <div class="sl-row" data-slider="master" data-value="0.8">
+      <div class="sl-label">MASTER</div>
+      <div class="sl-track"><div class="sl-fill"></div><div class="sl-knob"></div></div>
+      <div class="sl-val">80</div>
+    </div>
+
+    <div class="sl-row" data-slider="music" data-value="0.7">
+      <div class="sl-label">MUSIC</div>
+      <div class="sl-track"><div class="sl-fill"></div><div class="sl-knob"></div></div>
+      <div class="sl-val">70</div>
+    </div>
+
+    <div class="sl-row" data-slider="sfx" data-value="1.0">
+      <div class="sl-label">SFX</div>
+      <div class="sl-track"><div class="sl-fill"></div><div class="sl-knob"></div></div>
+      <div class="sl-val">100</div>
+    </div>
+
+    <div class="se-section">DISPLAY</div>
+
+    <div class="ck-row on" id="fullscreen-row">
+      <div class="ck-box"></div>
+      <div class="ck-label">FULLSCREEN</div>
+
+    </div>
+
+    <div class="se-section">GAMEPLAY</div>
+
+    <div class="mn-row">
+      <div class="sl-label" style="padding-top:8px">MINING</div>
+      <div class="mn-cycler">
+        <button class="mn-btn depth" id="mn-btn">
+          <span>Depth-biased</span>
+          <span class="badge">DEFAULT</span>
+        </button>
+        <div class="mn-help" id="mn-help">Carves into terrain. 27 of 27 voxels.</div>
+      </div>
+    </div>
+
+    <div class="se-foot">
+      <div class="se-esc"><kbd>ESC</kbd> back</div>
+      <button class="se-act">APPLY</button>
+      <button class="se-act primary">SAVE &amp; LEAVE</button>
+    </div>
+  </div>
+
+  <div class="version-stamp bl">DEV BUILD v0.18.2</div>
+<script>
+  // sliders — drag to set value
+  document.querySelectorAll('.sl-row').forEach(row=>{
+    const track = row.querySelector('.sl-track');
+    const fill  = row.querySelector('.sl-fill');
+    const knob  = row.querySelector('.sl-knob');
+    const val   = row.querySelector('.sl-val');
+    let dragging = false;
+
+    function setFromX(clientX){
+      const r = track.getBoundingClientRect();
+      const t = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+      fill.style.width = (t*100) + '%';
+      knob.style.left  = (t*100) + '%';
+      val.textContent  = Math.round(t*100);
+      row.dataset.value = t.toFixed(3);
+    }
+
+    // init from data-value
+    const init = parseFloat(row.dataset.value);
+    fill.style.width = (init*100) + '%';
+    knob.style.left  = (init*100) + '%';
+
+    track.addEventListener('mousedown',e=>{ dragging = true; setFromX(e.clientX); });
+    window.addEventListener('mousemove',e=>{ if(dragging) setFromX(e.clientX); });
+    window.addEventListener('mouseup',()=>{ dragging = false; });
+  });
+
+  // fullscreen checkbox toggle
+  document.getElementById('fullscreen-row').addEventListener('click',function(){
+    this.classList.toggle('on');
+  });
+
+  // mining anchor cycler
+  const mnBtn = document.getElementById('mn-btn');
+  const mnHelp = document.getElementById('mn-help');
+  const ANCHOR = {
+    depth: {
+      label: 'Depth-biased',
+      badge: 'DEFAULT',
+      cls: 'depth',
+      help: 'Carves into terrain. 27 of 27 voxels.'
+    },
+    center: {
+      label: 'Centered',
+      badge: '',
+      cls: 'center',
+      help: 'Centers on the aimed voxel. 18 of 27 voxels.'
+    }
+  };
+  let anchorMode = 'depth';
+  mnBtn.addEventListener('click',()=>{
+    anchorMode = anchorMode === 'depth' ? 'center' : 'depth';
+    const a = ANCHOR[anchorMode];
+    mnBtn.classList.remove('depth','center');
+    mnBtn.classList.add(a.cls);
+    mnBtn.innerHTML = `<span>${a.label}</span><span class="badge">${a.badge}</span>`;
+    mnHelp.innerHTML = a.help;
+  });
+</script>
+</body>
+</html>

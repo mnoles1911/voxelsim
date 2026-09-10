@@ -135,6 +135,7 @@
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "LocalVertexFactory.h" // hitch isolation: FLocalVertexFactory::StaticType for the BeginPlay PSO precache warmup
+#include "VoxelQuadVertexFactory.h" // 2026-09-08: FVoxelQuadVertexFactory::StaticType -- the POOLED draw path's half of that same precache
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Misc/App.h" // FApp::IsUnattended() -- fine-tier gate-leak policy, see MakeFineTileStreamer
@@ -1713,6 +1714,79 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler
 	};
 }
 
+// Overlay-aware COARSE chunk sampler -- the game-thread counterpart of
+// FCoarseChunkGridSampler, and the reason a shoreline edit no longer parks the
+// game thread for minutes (backlog §14).
+//
+// MakeOverlayAwareLevelSampler above is the 8^L mip recursion with World::brickAt
+// as its level-0 source, and it was still the ONLY level>=1 game-thread sampler
+// after the worker path went coarse (-VoxelCoarseMinLevel default 1, 2026-08).
+// Its cost is the one MakeCoarseLevelSampler's comment already prices, times a
+// worse level-0 source: a chunk plus mesher apron is 6x6x6 level-L bricks, so
+// level L folds (6*2^L)^3 level-0 bricks, each one a World::brickAt that
+// re-derives its own 8x8 amplifier column grid (world.h: gen_.makeBrick(key),
+// no grid argument, no cache). Measured off Saved/capture-shore-B-shelf2.log,
+// one 3x3x3 edit at a lake shore: L3 1.4s, L4 10.5s, L5 79.5s, L6 never
+// returned -- 8x per level, and level 6's 56.6M level-0 bricks would also have
+// to fit in the recursion's job-local map.
+//
+// The fix is the rule the worker already ships, not a new one. Every level>=1
+// chunk in the world is meshed by FCoarseChunkGridSampler; re-meshing an edited
+// one through the MIP rule was also a silent rule swap (coarse is nearest-
+// neighbour at the representative voxel, mip is a majority vote -- generator.h
+// documents them as separate paths with separate goldens), so a distant dig
+// changed the shape of terrain it did not touch. This composes the SAME coarse
+// grid and overrides only the cells whose representative level-0 voxel lands in
+// an edited brick, where the overlay's stored value is World::materialAt at that
+// voxel by construction (world.h: the overlay brick is gen_.makeBrick with the
+// edit's cells written over it, assets included).
+//
+// Game thread only, same constraint as MakeOverlayAwareLevelSampler and for the
+// same reason: World's overlay is not thread-safe. The coarse half reads
+// GeneratedWorld only and is passed no FSharedColumnGridCache -- the column grid
+// is edit-invariant (see FSharedColumnGridCache's residency comment) so sharing
+// would be sound, but it is gated on a dispatch-time residency verdict this path
+// has no equivalent of, and 1156 columns is not what was costing minutes.
+struct FOverlayCoarseChunkSampler
+{
+	using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
+	static constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+
+	FOverlayCoarseChunkSampler(const vxc::World<B>& InVoxels, int32 InLevel, const VoxelCoords::FVoxelChunkKey& Key)
+		: Coarse(InVoxels.generated(), InLevel, Key, /*PerfCounters*/ nullptr)
+		, Overlay(InVoxels.editedBricks())
+		, Level(InLevel)
+	{
+	}
+
+	vxc::MaterialId operator()(int64 X, int64 Y, int64 Z) const
+	{
+		// One hash probe per voxel against the edit overlay, which is what
+		// World::materialAt costs at level 0 -- and it is skipped outright in a
+		// session that has never edited. The rep coordinates are the coarse
+		// rule's own (FCoarseChunkGridSampler's derivation), so an edited brick
+		// is consulted exactly where the coarse rule would have sampled the
+		// generator.
+		if (Overlay.size() > 0)
+		{
+			const int64 RX = GenT::coarseRep(X, Level);
+			const int64 RY = GenT::coarseRep(Y, Level);
+			const int64 RZ = GenT::coarseRep(Z, Level);
+			const vxc::BrickKey EditedKey = vxc::ChunkMap<B>::keyForVoxel(RX, RY, RZ);
+			if (const vxc::Brick<B>* Edited = Overlay.find(EditedKey))
+			{
+				return Edited->get(int(vxc::floorMod(RX, B)), int(vxc::floorMod(RY, B)),
+				                   int(vxc::floorMod(RZ, B)));
+			}
+		}
+		return Coarse(X, Y, Z);
+	}
+
+	FCoarseChunkGridSampler Coarse;
+	const vxc::ChunkMap<B>& Overlay;
+	int32 Level;
+};
+
 // Track B2 ("real .vxtl terrain tiles as a selectable tile source"): builds
 // the ITileSampler FVoxelWorldImpl::Tiles owns for this run.
 //
@@ -1930,6 +2004,13 @@ TUniquePtr<FVoxelFineTileStreamer> MakeFineTileStreamer(uint64 Seed, const FStri
 	auto Streamer = MakeUnique<FVoxelFineTileStreamer>(
 		FineTileDir, FineProviderId, Seed,
 		FineBudgetBytes != 0 ? FineBudgetBytes : FVoxelFineTileStreamer::kDefaultBudgetBytes, ClimateSource);
+	// Initialize() resolves this through
+	// FVoxelFineTileStreamer::RingRadiusFromCommandLine(), the switch's only
+	// reader, so in practice it is always >= 0 and this always fires. The guard
+	// is kept as the parameter's contract: a caller that has no opinion passes
+	// <0 and gets kDefaultFineRingRadiusTiles, which is what the member already
+	// holds. Do NOT reintroduce an FParse here -- see the comment at the call
+	// site, and VoxelRasterAtlas.cpp's FineRingRadiusTiles().
 	if (FineRingRadius >= 0)
 	{
 		Streamer->SetRingRadiusTiles(FineRingRadius);
@@ -1973,11 +2054,16 @@ TUniquePtr<FVoxelFineTileStreamer> MakeFineTileStreamer(uint64 Seed, const FStri
 	                  : TEXT("log an Error and continue (interactive)"));
 
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("Fine tier ENABLED: root=%s provider=%s seed=%llu pitch=%d mm/px ringRadius=%d budget=%.2f GiB. ")
+	       TEXT("Fine tier ENABLED: root=%s provider=%s seed=%llu pitch=%d mm/px ringRadius=%d budget=%.2f GiB ")
+	       // async= is the arm's identity on every leg: 0 is the synchronous
+	       // loader, byte-identical to before; 1 is the worker loader whose
+	       // engagement the window line's asyncLaunched= must then prove.
+	       TEXT("async=%d inFlightCap=%d perTick=%d. ")
 	       TEXT("Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess."),
 	       *FineTileDir, *FineProviderId, (unsigned long long)Seed,
 	       vxc::tilePixelSizeMm(vxc::kFineTileScale), Streamer->RingRadiusTiles(),
-	       double(Streamer->BudgetBytes()) / double(1ull << 30));
+	       double(Streamer->BudgetBytes()) / double(1ull << 30),
+	       Streamer->AsyncEnabled() ? 1 : 0, Streamer->AsyncInFlightCap(), Streamer->AsyncPerTickCap());
 	return Streamer;
 }
 
@@ -9613,6 +9699,7 @@ struct FVoxelWorldImpl
 	int64 DispatchExitCapSinceLog = 0;
 	int64 DispatchExitEmptySinceLog = 0;
 	int64 DispatchExitBacklogSinceLog = 0;
+	int64 DispatchExitBudgetSinceLog = 0;   // voxel.Stream.DispatchBudgetMs elapsed (2026-09-09), the FOURTH exit
 	int64 DispatchCpuLaunchedSinceLog = 0;
 	int64 DispatchGpuForkedSinceLog = 0;
 	// -VoxelBandSeedCpu traffic: fork-eligible level-0 chunks kept on the CPU
@@ -10123,6 +10210,7 @@ struct FVoxelWorldImpl
 	int32 DispatchExitCapSincePanel = 0;
 	int32 DispatchExitEmptySincePanel = 0;
 	int32 DispatchExitBacklogSincePanel = 0;
+	int32 DispatchExitBudgetSincePanel = 0;
 
 	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() /
 	// IsRingsEnabled() so the off-transition can drop every component's MID
@@ -11408,11 +11496,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		if (VoxelDebug::GetStreamBatchRecompute() != 0)
 		{
 			UVoxelGpuPoolComponent::FScopedBatch RecomputeBatch(GpuPool.Get());
-			RecomputeDesiredSet(Anchor);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet); RecomputeDesiredSet(Anchor); }
 		}
 		else
 		{
-			RecomputeDesiredSet(Anchor);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_RecomputeDesiredSet); RecomputeDesiredSet(Anchor); }
 		}
 		// -VoxelRecomputeDutyPct: feed the bound what this call actually cost.
 		// ThisFrameRecomputeMs is stamped at the END of RecomputeDesiredSet and
@@ -11523,6 +11611,29 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				RasterAtlas->Init(ActiveTiles().pixelSizeMm(),
 				                  int64(FineOuterMeters * 1000.0), LastFineRing,
 				                  AdmitCentreReachMm, CoveragePadChunks);
+				// THE ASYNC-LOADER AMENDMENT to the atlas's worker-admission proof
+				// (FVoxelRasterAtlasCpu::IsPageAsyncSafe): with -VoxelFineTileAsync=1
+				// a ring tile can be in flight, so "inside the pinned ring" no
+				// longer implies "resident". Wired ONLY on the async arm, so the
+				// synchronous arm's atlas is byte-identical. Atlas pixels are the
+				// fine pitch here (this atlas is built over ActiveTiles(), the fine
+				// sampler when the fine tier is live); the rect is inclusive in
+				// pixels and IsFootprintResident takes a half-open world-mm rect,
+				// hence the +1 on the far corner. Captures the streamer by raw
+				// pointer: the atlas is declared after FineStreamer in this class
+				// and therefore destroyed before it.
+				if (FineStreamer && FineStreamer->AsyncEnabled())
+				{
+					const int64 AtlasPitchMm = int64(ActiveTiles().pixelSizeMm());
+					FVoxelFineTileStreamer* StreamerPtr = FineStreamer.Get();
+					RasterAtlas->SetPixelRectResidentCallback(
+						[StreamerPtr, AtlasPitchMm](int64 PxX0, int64 PxY0, int64 PxX1, int64 PxY1)
+						{
+							return StreamerPtr->IsFootprintResident(PxX0 * AtlasPitchMm, PxY0 * AtlasPitchMm,
+							                                        (PxX1 + 1) * AtlasPitchMm,
+							                                        (PxY1 + 1) * AtlasPitchMm);
+						});
+				}
 
 				// THE COARSE-TIER ATLAS. Created alongside so its init line is
 				// on every log from the day the rule landed, not from the day a
@@ -11586,6 +11697,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				CVarVoxelStreamAtlasPrefetchAhead.GetValueOnGameThread();
 			if (PrefetchPagesPerTick > 0)
 			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_AtlasPrefetchAhead);
 				RasterAtlas->PrefetchAhead(ActiveTiles(),
 				                           int64(Anchor.X) * 10, int64(Anchor.Y) * 10,
 				                           int64(PredictedAnchorLocation.X) * 10,
@@ -11625,7 +11737,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// free-then-reallocate-within-one-frame race, which is what makes any
 		// widening of this scope safe.
 		UVoxelGpuPoolComponent::FScopedBatch PoolBatch(GpuPool.Get());
-		DispatchJobs();
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DispatchJobs); DispatchJobs(); }
 		// Poll the GPU runner BETWEEN dispatch and drain (Wave D / D4).
 		//
 		// Order matters and this is the only correct slot. Tick() is what calls
@@ -11681,9 +11793,9 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		{
 			// The batch is already open (see T0 above); this block keeps its
 			// original bounds for readability and for the T2/T3 timing points.
-			DrainResults(Owner, Root, Material);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainResults); DrainResults(Owner, Root, Material); }
 			T2 = FPlatformTime::Seconds();
-			DrainGameThreadMesh(Owner, Root, Material);
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainGameThreadMesh); DrainGameThreadMesh(Owner, Root, Material); }
 			T3 = FPlatformTime::Seconds();
 
 		// Second DispatchJobs() pass (voxel.Stream.DispatchAfterDrain, default
@@ -11727,11 +11839,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			T3b = T3;
 			if (VoxelDebug::GetStreamDispatchAfterDrain() != 0 && PendingJobNum() > 0)
 			{
-				DispatchJobs();
+				{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DispatchJobs); DispatchJobs(); }
 				T3b = FPlatformTime::Seconds();
 			}
 
-			DrainUnloads();
+			{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainUnloads); DrainUnloads(); }
 		}
 		} // PoolBatch closes here -- the tick's single publication happens now.
 		const double T4 = FPlatformTime::Seconds();
@@ -11878,8 +11990,19 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// tick's submits look at it, and a drain placed after the walk would let the
 	// walk re-probe footprints whose answers were already sitting in the queue.
 	// Off, this is one integer compare (see DrainWarmShadingResults).
-	DrainWarmShadingResults();
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_DrainWarmShading); DrainWarmShadingResults(); }
 	WarmShadingAheadTick();
+
+	// THE ASYNC FINE-TILE LOADER'S PER-FRAME PUMP (-VoxelFineTileAsync=1). The
+	// residency tick only runs on anchor movement and RequestFootprint only
+	// when something asks, so a tile whose worker finished while the player
+	// stood still would otherwise sit in the queue until the next move. Off,
+	// this is one branch inside the streamer; with nothing in flight, one
+	// empty-map test.
+	if (FineStreamer)
+	{
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelStream_PumpAsyncTiles); FineStreamer->PumpAsyncLoads(); }
+	}
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
 	// -VoxelWorkerPool arm: same prune, same reason (WaitForInFlightTasks'
@@ -12131,7 +12254,15 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	}
 	if (FrameMs > VoxelDebug::kHitchThresholdMs)
 	{
-		const float ElsewhereMs = FMath::Max(0.f, FrameMs - TickMsSoFar);
+		// THE FRAME BEING REPORTED IS THE PREVIOUS ONE (FrameMs is DeltaTime), so the
+		// world tick that belongs to it is PrevTickMs, not this tick's TickMsSoFar.
+		// Until 2026-09-09 this line printed TickMsSoFar and called the rest "elsewhere",
+		// which read an 8.5 s streaming tick as "subsystemTickMs=8.91 elsewhereMs=391"
+		// (Insights trace Saved/loading-leg4.utrace: the whole frame was UVoxelWorldSubsystem).
+		// The per-phase ThisFrame* counters below are still THIS tick's; the trace scopes
+		// (VoxelStream_*) are the honest attribution for the long ones.
+		const float ReportedTickMs = PrevTickMs;
+		const float ElsewhereMs = FMath::Max(0.f, FrameMs - ReportedTickMs);
 		// M1 gate attribution (docs/status.md M1 gate row): the engine's own
 		// per-thread frame timers, set once/frame in FViewport::Draw (so they
 		// describe the PREVIOUS frame -- a one-frame lag is immaterial for
@@ -12150,7 +12281,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		       TEXT("renderMs=%.2f renderWaitMs=%.2f rhiMs=%.2f gameWaitMs=%.2f | ")
 		       TEXT("dispatchMs=%.2f applyMs=%.2f remeshMs=%.2f unloadMs=%.2f | ")
 		       TEXT("componentsApplied=%d proxiesCreated=%d editRemeshes=%d unloads=%d poolReuses=%d poolSize=%d"),
-		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, RenderMs, RenderWaitMs, RHIMs, GameWaitMs,
+		       FrameMs, VoxelDebug::kHitchThresholdMs, ReportedTickMs, ElsewhereMs, RenderMs, RenderWaitMs, RHIMs, GameWaitMs,
 		       ThisFrameDispatchMs, ThisFrameApplyMs, ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker,
 		       ThisFrameProxiesCreated, ThisFrameEditRemeshes, ThisFrameUnloads, ThisFramePoolReuses, ComponentPool.Num());
 
@@ -12248,6 +12379,15 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
     // Close admission and retain every borrower until completion. A stuck
     // scheduler may block shutdown, but cannot turn timeout into freed memory.
     DrainCpuWorkers();
+	// The async fine-tile loader's in-flight reads, under the same
+	// prune/deadline/report discipline (its own 30 s budget, its own line). A
+	// no-op on the synchronous arm. Done here, before Impl's members go, so a
+	// worker mid-read is joined rather than left to enqueue into a freed queue
+	// -- the streamer's destructor calls it again, idempotently, as the belt.
+	if (FineStreamer)
+	{
+		FineStreamer->ShutdownAsync();
+	}
     if(WorkerPool){WorkerPool->Destroy();delete WorkerPool;WorkerPool=nullptr;}
 
 	// --- GPU-meshed jobs (Wave D / D4) --------------------------------------
@@ -13432,14 +13572,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       // reading pair for that gate lives on its accessor; the twin
 	       // backlog= column is on the job-flow line.
 	       TEXT("Voxel dispatch loop (window): passes=%lld exitCap=%lld exitEmpty=%lld cpuLaunched=%lld gpuForked=%lld cap=%d cpuInFlightExactNow=%d ")
-	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld seedCpu=%lld"),
+	       TEXT("cpuJobSec=%.1f effConc=%.2f wkPri=%d pool=%d exitBacklog=%lld exitBudget=%lld seedCpu=%lld"),
 	       (long long)DispatchPassesSinceLog, (long long)DispatchExitCapSinceLog, (long long)DispatchExitEmptySinceLog,
 	       (long long)DispatchCpuLaunchedSinceLog, (long long)DispatchGpuForkedSinceLog,
 	       MaxJobsInFlightCap(), CpuJobsInFlightCounter.GetValue(),
 	       AccumCpuWorkerJobMsSinceLog / 1000.0,
 	       ThisLogWindowSeconds > 0.f ? AccumCpuWorkerJobMsSinceLog / (1000.0 * ThisLogWindowSeconds) : 0.0,
 	       VoxelStreamAdmission::WorkerTaskPriority(), VoxelStreamAdmission::WorkerPoolThreads(),
-	       (long long)DispatchExitBacklogSinceLog, (long long)DispatchBandSeedCpuSinceLog);
+	       (long long)DispatchExitBacklogSinceLog, (long long)DispatchExitBudgetSinceLog, (long long)DispatchBandSeedCpuSinceLog);
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the 'Voxel ring dispatch' line above (no longer
@@ -13474,6 +13614,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	DispatchExitCapSinceLog = 0;
 	DispatchExitEmptySinceLog = 0;
 	DispatchExitBacklogSinceLog = 0;
+	DispatchExitBudgetSinceLog = 0;
 	DispatchCpuLaunchedSinceLog = 0;
 	DispatchGpuForkedSinceLog = 0;
 	DispatchBandSeedCpuSinceLog = 0;
@@ -16934,7 +17075,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       // 1.2 km inside a 15.36 km tile. ringCentre=(-2147483648,...)
 		       // is the sentinel for "the residency tick has never run", which
 		       // is a third, genuinely broken state that used to look the same.
-		       TEXT("| blockingLoads=%llu gateLeaks=%llu | ringRadius=%d ringCentre=(%d,%d) ringMoves=%llu"),
+		       TEXT("| blockingLoads=%llu gateLeaks=%llu | ringRadius=%d ringCentre=(%d,%d) ringMoves=%llu")
+		       // The async loader's fields, APPENDED AT THE END per the
+		       // old-leg-grep rule. async= is the arm; asyncLaunched= is its
+		       // engagement (0 with async=1 across a tile crossing means the
+		       // arm did not run); asyncJoins= is the safety net firing;
+		       // asyncWorkerMs= is the read+decode time that left the game
+		       // thread and asyncPublishMs= what adopting it cost there.
+		       TEXT(" | async=%d inFlight=%d asyncLaunched=%llu asyncPublished=%llu asyncJoins=%llu ")
+		       TEXT("asyncFailed=%llu asyncDropped=%llu asyncCapRefusals=%llu asyncPublishMs=%.2f ")
+		       TEXT("asyncWorkerMs=%.1f asyncInFlightPeak=%d"),
 		       (unsigned long long)FineStreamer->ResidentTileCount(),
 		       double(FineStreamer->ResidentBytes()) / double(1ull << 30),
 		       double(FineStreamer->BudgetBytes()) / double(1ull << 30),
@@ -16953,7 +17103,17 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (unsigned long long)FineStreamer->GateLeaksSinceStart(),
 		       FineStreamer->RingRadiusTiles(), FineStreamer->RingCentreTile().x,
 		       FineStreamer->RingCentreTile().y,
-		       (unsigned long long)FineStreamer->RingCentreMovesSinceStart());
+		       (unsigned long long)FineStreamer->RingCentreMovesSinceStart(),
+		       FineStreamer->AsyncEnabled() ? 1 : 0, FineStreamer->AsyncInFlightCount(),
+		       (unsigned long long)FineStreamer->AsyncLaunchedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncPublishedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncJoinsSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncFailedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncDroppedSinceStart(),
+		       (unsigned long long)FineStreamer->AsyncCapRefusalsSinceStart(),
+		       double(FineStreamer->AsyncPublishNsSinceStart()) / 1.0e6,
+		       double(FineStreamer->AsyncWorkerNsSinceStart()) / 1.0e6,
+		       FineStreamer->AsyncInFlightPeak());
 
 		// THE AFTER-THE-FACT CHECK, now reported against GateLeaksSinceStart()
 		// rather than the sampler's missingTileQueries.
@@ -21003,7 +21163,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const int64 AnchorMmX = WorldToMm(Anchor.X);
 		const int64 AnchorMmY = WorldToMm(Anchor.Y);
 		const double FineT0 = FPlatformTime::Seconds();
-		FineStreamer->TickResidencyAndEviction(FVoxelFineTileStreamer::CoarseTileForWorldMm(AnchorMmX, AnchorMmY));
+		{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_FineResidency); FineStreamer->TickResidencyAndEviction(FVoxelFineTileStreamer::CoarseTileForWorldMm(AnchorMmX, AnchorMmY)); }
 		// A tile load is a synchronous ~200 MB read plus a whole-tile decode
 		// (VoxelFineTileStreamer.h, threading rule 1), so a cold ring shift is a
 		// multi-second GAME THREAD STALL, not a hitch. Reported rather than
@@ -21369,6 +21529,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// else. See ThisFrameExitScanMs' doc comment for what the old number
 	// bundled in.
 	const double ExitWalkT0 = FPlatformTime::Seconds();
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_ExitScanAndFilter);
 	// PHASE 3, BUCKETED EVICTION (2026-08-23). The verdict below is a pure
 	// function of (Level, ChunkX, ChunkY) and the anchor's XY for every record
 	// that is not bDeepAnchorRelative, so most of this walk re-derives "keep"
@@ -21707,6 +21868,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	int32 OuterScansUsed = 0;
 
 	const int32 MaxRingLevel = UVoxelWorldSubsystem::GetMaxRingLevel();
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_AdmissionAndBeyond);
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		if (Level > MaxRingLevel)
@@ -22674,10 +22836,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		LiveOutcome.AdmitMs += float((FPlatformTime::Seconds() - LiveAdmitT0) * 1000.0);
 	}
 
-	PruneFootprintZRangeCache(Anchor);
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_PruneZRange); PruneFootprintZRangeCache(Anchor); }
 
 	const double SortT0 = FPlatformTime::Seconds();
-	SortPendingQueues(Anchor);
+	{ TRACE_CPUPROFILER_EVENT_SCOPE(VoxelRecompute_Sort); SortPendingQueues(Anchor); }
 	// Bounded admission gate (b) -- must run immediately after the sort, which
 	// is what puts the farthest (lowest-priority) entries at the front and
 	// leaves each level queue's cached distances aligned with the anchor. Timed inside
@@ -25586,14 +25748,29 @@ void FVoxelWorldImpl::DispatchJobs()
 	};
 
 	const double DispatchLoopStart = FPlatformTime::Seconds();
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Loop);
 	// Which exit the loop takes this pass -- see the DispatchExit* counters'
 	// doc comment for the competing readings this settles. The loop has
 	// exactly THREE ways out, each with its own counter, or the exitCap
 	// arithmetic (exitCap = passes - exitEmpty - exitBacklog) silently lies.
 	bool bLoopExitedQueueEmpty = false;
 	bool bLoopExitedBacklog = false;
+	// THE FOURTH EXIT (2026-09-09): a wall-clock budget, voxel.Stream.DispatchBudgetMs.
+	// 0 (shipped) is unbounded and byte-identical to before. The loading theatre
+	// sets it because one pass of this loop ran 6-9 s under the curtain (Insights,
+	// Saved/loading-leg7.utrace: ~1300 iterations at 5-7 ms in the per-chunk
+	// submit). Checked at the top of every iteration, after the previous one has
+	// been counted, so a pass always dispatches at least one chunk. Counted as
+	// exitBudget= so passes = exitCap + exitEmpty + exitBacklog + exitBudget holds.
+	const double DispatchBudgetSeconds = double(VoxelDebug::GetStreamDispatchBudgetMs()) / 1000.0;
+	bool bLoopExitedBudget = false;
 	while (CpuJobsOutstanding() < MaxJobsInFlight)
 	{
+		if (DispatchBudgetSeconds > 0.0 && FPlatformTime::Seconds() - DispatchLoopStart > DispatchBudgetSeconds)
+		{
+			bLoopExitedBudget = true;
+			break;
+		}
 		// Dispatch-ahead gate, FIRST and INSIDE the loop -- the while condition
 		// cannot carry it because the fork deliberately bypasses the CPU budget
 		// (a pass can fork thousands of GPU jobs while CpuJobsOutstanding never
@@ -25635,6 +25812,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// candidate for a fixed per-candidate cost -- exactly the shape `other`
 		// showed.
 		const double PickStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Pick);
 		int32 PickLevel = INDEX_NONE;
 		if (bRingQuota)
 		{
@@ -25814,6 +25992,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// recompute and dispatch, may have made this chunk (or one of its
 		// mip ancestors) edited-only.
 		const double OverlayStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Overlay);
 		const auto RenderContext=CaptureProductionRenderContext();
         if(!ProductionRenderSupported(LevelKey,RenderContext)){DeferredOwnership[PickLevel].Add(PoppedEntry);continue;}
         const bool bNeedsOverlay = NeedsOverlayAwarePath(LevelKey);
@@ -25854,6 +26033,7 @@ void FVoxelWorldImpl::DispatchJobs()
 			VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled();
 		bool bPredictedEmpty = false;
 		const double BandStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Band);
 		if (bComputeBand && LevelKey.Level == 0)
 		{
 			if (const VoxelStreaming::FFootprintBand* Band = FootprintBandCache.Find(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
@@ -25947,6 +26127,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// this number is read; the short-circuit means it is skipped entirely
 		// when the sky-band skip is off, which the bracket will also show.
 		const double AirProofStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_AirProof);
 		const bool bSkyBandSkip = VoxelSkyBand::GetSkipEnabled() && IsChunkProvablyAllAir(LevelKey);
 		ThisFrameDispatchAirProofMs += float((FPlatformTime::Seconds() - AirProofStart) * 1000.0);
 		if (bSkyBandSkip)
@@ -26295,6 +26476,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		// fixes: a predicate that is too expensive gets memoised, a submit that
 		// is too expensive gets batched or moved off the game thread.
 		const double SubmitStart = FPlatformTime::Seconds();
+		TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_Submit);
 		ON_SCOPE_EXIT
 		{
 			ThisFrameDispatchSubmitMs += float((FPlatformTime::Seconds() - SubmitStart) * 1000.0);
@@ -27276,11 +27458,16 @@ void FVoxelWorldImpl::DispatchJobs()
 	{
 		++DispatchExitBacklogSincePanel;
 	}
+	else if (bLoopExitedBudget)
+	{
+		++DispatchExitBudgetSincePanel;
+	}
 	else
 	{
 		++DispatchExitCapSincePanel;
 	}
 	ThisFrameDispatchLoopMs += float((FPlatformTime::Seconds() - DispatchLoopStart) * 1000.0);
+	TRACE_CPUPROFILER_EVENT_SCOPE(VoxelDispatch_PostLoop);
 
 	// Exit attribution (see the DispatchExit* doc comment). Falling out of the
 	// while condition IS the cap exit -- the loop's only other ends are the
@@ -27293,6 +27480,14 @@ void FVoxelWorldImpl::DispatchJobs()
 	else if (bLoopExitedBacklog)
 	{
 		++DispatchExitBacklogSinceLog;
+	}
+	else if (bLoopExitedBudget)
+	{
+		if (DispatchExitBudgetSinceLog == 0 && DispatchExitBudgetSincePanel == 1)
+		{
+			UE_LOG(LogVoxelStream, Log, TEXT("Voxel dispatch loop: wall-clock budget ENGAGED (voxel.Stream.DispatchBudgetMs=%.1f); passes now exit on time, counted as exitBudget=."), VoxelDebug::GetStreamDispatchBudgetMs());
+		}
+		++DispatchExitBudgetSinceLog;
 	}
 	else
 	{
@@ -29885,34 +30080,67 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		else
 		{
 			// M2 wave 2 item 2 ("Distant-edit mip propagation"): overlay-aware
-			// level>=1 sampler over World::brickAt, game-thread only (see
-			// MakeOverlayAwareLevelSampler's doc comment) -- this is what
-			// closes the wave-1 "R1+ never shows edits" limitation. Logged
-			// (not Verbose): this is a rare, edit-triggered event, and the
-			// log line is the headless-run evidence that a distant edit
-			// actually re-meshed a mip ring chunk.
-			const auto OverlaySampler = MakeOverlayAwareLevelSampler(Voxels, LevelKey.Level);
-			if (bRetireQuads)
+			// level>=1 sampler, game-thread only (World's overlay is not
+			// thread-safe) -- this is what closes the wave-1 "R1+ never shows
+			// edits" limitation. Logged (not Verbose): this is a rare,
+			// edit-triggered event, and the log line is the headless-run
+			// evidence that a distant edit actually re-meshed a mip ring chunk.
+			//
+			// WHICH SAMPLER IS THE SAME QUESTION THE WORKER ASKS, and it was not
+			// being asked here (backlog §14). The worker went coarse for every
+			// level>=GetCoarseMinLevel() (default 1) because the mip recursion's
+			// 8^L fold capped the voxel radius at ~250m; this path kept folding,
+			// on the game thread, with a level-0 source that rebuilds its own
+			// column grid per brick -- 79.5s for one level-5 chunk, measured, and
+			// level 6 never returned. Matching the worker's predicate also ends a
+			// silent rule swap: an edited distant chunk was re-meshed under the
+			// majority-vote mip rule while every chunk around it kept the coarse
+			// representative-sample rule.
+			const bool bCoarseLevel = LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel();
+			const double RemeshStartSeconds = FPlatformTime::Seconds();
+			// One body, two sampler types: the four arms below are the worker's
+			// arms verbatim, and the only thing the level check picks is which
+			// concrete functor they are handed.
+			auto MeshWithOverlaySampler = [&](const auto& OverlaySampler)
 			{
-				BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, OverlaySampler);
-			}
-			else if (bPackBricksOnCpu && bReuseMesherVoxels)
+				if (bRetireQuads)
+				{
+					BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, OverlaySampler);
+				}
+				else if (bPackBricksOnCpu && bReuseMesherVoxels)
+				{
+					vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
+					MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters, /*RingSkirtMask*/ 0,
+					                FNeverSkipBrick(), VoxelBrickCpuArm::FDenseChunkSink{ Dense });
+					BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+				}
+				else
+				{
+					MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters);
+					if (bPackBricksOnCpu)
+					{
+						BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, OverlaySampler);
+					}
+				}
+			};
+			if (bCoarseLevel)
 			{
-				vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
-				MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters, /*RingSkirtMask*/ 0,
-				                FNeverSkipBrick(), VoxelBrickCpuArm::FDenseChunkSink{ Dense });
-				BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+				MeshWithOverlaySampler(FOverlayCoarseChunkSampler(Voxels, LevelKey.Level, LevelKey.Key));
 			}
 			else
 			{
-				MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters);
-				if (bPackBricksOnCpu)
-				{
-					BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, OverlaySampler);
-				}
+				// -VoxelCoarseMinLevel=99 restores the pre-coarse mip behaviour on
+				// this path too, so the A/B stays a rule A/B on both producers.
+				MeshWithOverlaySampler(MakeOverlayAwareLevelSampler(Voxels, LevelKey.Level));
 			}
-			UE_LOG(LogVoxelEdit, Log, TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d"), LevelKey.Level,
-			       LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num());
+			// ms= is the §14 measurement, kept in the shipping line rather than
+			// behind a switch: the failure it names was a single re-mesh, and a
+			// per-level wall time is the only thing that distinguishes this path
+			// working from this path hanging.
+			UE_LOG(LogVoxelEdit, Log,
+			       TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d coarse=%d ms=%.1f"),
+			       LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num(),
+			       bCoarseLevel ? 1 : 0, (FPlatformTime::Seconds() - RemeshStartSeconds) * 1000.0);
 		}
 		// Same first-settle sample as DrainResults takes before ITS apply: this
 		// queue carries both FIRST loads (chunks born edited, routed here
@@ -31869,7 +32097,8 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 		{
 			WaterSubsystem->NotifyTerrainVoxelsCleared(RemovedVoxels);
 			WaterSubsystem->NotifyTerrainRegionEdited(VoxelCoords::FVoxelCoord{MinX, MinY, MinZ},
-			                                          VoxelCoords::FVoxelCoord{MaxX, MaxY, MaxZ});
+			                                          VoxelCoords::FVoxelCoord{MaxX, MaxY, MaxZ},
+			                                          TEXT("PromoteDetachedIslands"));
 		}
 	}
 
@@ -32238,7 +32467,13 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	//                              nine tiles and ~3 GB. Raise it only with
 	//                              that in mind; correctness does not depend
 	//                              on it (RequestFootprint pulls in whatever a
-	//                              footprint needs regardless).
+	//                              footprint needs regardless). PARSED IN ONE
+	//                              PLACE ONLY:
+	//                              FVoxelFineTileStreamer::RingRadiusFromCommandLine().
+	//                              The raster atlas reads the same accessor to
+	//                              size its mode-3 admission margin, so
+	//                              changing the default is one edit to
+	//                              kDefaultFineRingRadiusTiles.
 	// INI FALLBACK ADDED 2026-08-01, and the paragraph above is the reason it
 	// needs justifying rather than just doing. That text argued command-line
 	// only "so it must never become a silent standing default the way
@@ -32293,8 +32528,14 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	double FineBudgetGB = 0.0;
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileCacheBudgetGB="), FineBudgetGB);
 	const uint64 FineBudgetBytes = FineBudgetGB > 0.0 ? uint64(FineBudgetGB * 1024.0 * 1024.0 * 1024.0) : 0;
-	int32 FineRingRadius = -1; // <0 => leave the streamer's own default
-	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), FineRingRadius);
+	// -VoxelFineTileRingRadius= IS NOT PARSED HERE. It has one reader,
+	// FVoxelFineTileStreamer::RingRadiusFromCommandLine(), because the raster
+	// atlas needs the same number to size its mode-3 admission margin and has
+	// no streamer to ask; two FParse sites for one switch is one default flip
+	// away from an atlas admitting pages the streamer never pinned. The
+	// accessor resolves absent/negative to kDefaultFineRingRadiusTiles, so this
+	// is always >= 0 and the streamer is always told explicitly.
+	const int32 FineRingRadius = int32(FVoxelFineTileStreamer::RingRadiusFromCommandLine());
 
     // Explicit transport/automation fixture; avoids depending on baked tiles
     // for an intentionally unique test seed. Ordinary launches keep their tier.
@@ -32649,6 +32890,31 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		// time, not a Static-mobility variant that would go unused.
 		TerrainPrecacheParams.SetMobility(EComponentMobility::Movable);
 		ChunkMaterial->PrecachePSOs(&FLocalVertexFactory::StaticType, TerrainPrecacheParams);
+
+		// --- THE POOLED PATH'S PSO, WHICH WAS NEVER PRECACHED (2026-09-08) ---
+		//
+		// The line above precaches M_VoxelTerrain against FLocalVertexFactory,
+		// which is the PER-CHUNK component path. The shipping draw path has not
+		// been that for a long time: terrain streams as ranges in ONE primitive
+		// through FVoxelGpuPoolSceneProxy, and that proxy draws with
+		// FVoxelQuadVertexFactory. Nothing has ever asked for THAT pair's
+		// pipeline state, so it compiles the first time a pooled chunk reaches
+		// GetDynamicMeshElements -- which is inside the load, on the render
+		// thread, exactly where the 2026-09-08 hitches live.
+		//
+		// SAME CONTRACT AS THE LINE ABOVE, and that is why it sits here rather
+		// than anywhere else: BeginPlay is before ChunkOwner exists, the request
+		// is asynchronous (PrecachePSOs only enqueues shader-compile graph
+		// events; it never waits), and the whole menu + load theatre is
+		// available for it to finish in. Same -VoxelNoPSOPrecache switch, so the
+		// A/B arm covers both requests together.
+		//
+		// FAILING READING: this cannot be proved from a log line of its own --
+		// the engine owns the precache bookkeeping. What it CAN be judged on is
+		// the render-thread hitch profile of the first seconds after NEW GAME
+		// with and without -VoxelNoPSOPrecache, which is the same instrument
+		// the line above was landed on.
+		ChunkMaterial->PrecachePSOs(&FVoxelQuadVertexFactory::StaticType, TerrainPrecacheParams);
 	}
 
 	// THE STREAMING GATE (docs/front-end-plan.md). Everything above this point
@@ -32683,6 +32949,44 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		StartWorldSession(ProbePath);
 	}
 	else StartWorldSession(GetWorldSaveFilePath(Seed));
+}
+
+// See the declaration for the whole argument, including what this deliberately
+// does NOT reach and why that is logged rather than passed over.
+void UVoxelWorldSubsystem::PrewarmGpuPools()
+{
+	check(IsInGameThread());
+
+	// THE BRICK POOL. Init (if it has not run) + one enqueued render command.
+	// The pool's own instrument prints the millisecond cost on the render
+	// thread; what this line proves is that the CALL happened at all, and on
+	// which side of NEW GAME.
+	const double T0 = FPlatformTime::Seconds();
+	FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
+	const bool bWasInitialised = BrickPool.IsInitialised();
+	BrickPool.PrewarmArenas();
+	const FVoxelBrickPoolConfig& Cfg = BrickPool.GetConfig();
+	// The same four arenas EnsureCreated_RenderThread commits, in the same
+	// arithmetic the pool's own `... MiB committed` line uses.
+	const double BrickMiB =
+		(double(Cfg.ChunkCapacity) * double(FVoxelBrickPool::kBricksPerChunk) * 8.0
+		 + double(Cfg.OccWordCapacity) * 4.0
+		 + double(Cfg.MatWordCapacity) * 4.0
+		 + double(Cfg.ChunkCapacity) * double(FVoxelBrickPool::kChunkRecordDwords) * 4.0)
+		/ (1024.0 * 1024.0);
+	const double EnqueueMs = (FPlatformTime::Seconds() - T0) * 1000.0;
+
+	// ONE LINE, AND IT CAN FAIL. `quad SKIPPED` is the honest half: the quad
+	// pool genuinely is not reachable with the world held, and a pre-warm that
+	// printed a quad number here would be claiming work it did not do.
+	UE_LOG(LogVoxelStream, Log,
+	       TEXT("VoxelWorld: GPU pools pre-warmed under the menu: brick %.0f MiB in %.0f ms (enqueue only -- ")
+	       TEXT("the commit lands on the render thread; read `BrickPool: arenas created` for its cost), ")
+	       TEXT("quad SKIPPED (0 MB in 0 ms): the terrain quad pool's buffers are created by its scene proxy ")
+	       TEXT("and the proxy needs a UVoxelGpuPoolComponent that GetOrCreateGpuPool spawns off ChunkOwner -- ")
+	       TEXT("ChunkOwner is null while the world is HELD, which is the point of holding it. Pool was %s ")
+	       TEXT("before this call."),
+	       BrickMiB, EnqueueMs, bWasInitialised ? TEXT("ALREADY INITIALISED") : TEXT("uninitialised"));
 }
 
 void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
@@ -32836,6 +33140,20 @@ bool UVoxelWorldSubsystem::IsChunkPresentableAt(const FVector& WorldPos) const
 		return false;
 	}
 	return true;
+}
+
+bool UVoxelWorldSubsystem::IsFineRingSettled(int32& OutSettledTiles, int32& OutRingTiles) const
+{
+	OutSettledTiles = 0;
+	OutRingTiles = 0;
+	if (!Impl || !Impl->FineStreamer)
+	{
+		return true; // no fine tier: nothing to wait for, and nothing to print
+	}
+	int32 Outstanding = 0;
+	const bool bSettled = Impl->FineStreamer->IsRingSettled(Outstanding, OutRingTiles);
+	OutSettledTiles = OutRingTiles - Outstanding;
+	return bSettled;
 }
 
 void UVoxelWorldSubsystem::Tick(float DeltaTime)
@@ -33424,7 +33742,7 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeEditVoxelBounds(DugCells, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("TryDig"));
 			}
 		}
 	}
@@ -33481,7 +33799,7 @@ bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FV
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeEditVoxelBounds(PlacedCells, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("TryPlace"));
 			}
 		}
 	}
@@ -33889,7 +34207,7 @@ int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeEditVoxelBounds(CarvedCells, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("CarveSphere"));
 			}
 		}
 	}
@@ -33975,7 +34293,7 @@ int32 UVoxelWorldSubsystem::SpawnTreeFixtureAt(double WorldX, double WorldY)
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeVoxelCoordBounds(Coords, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("SpawnTreeFixtureAt"));
 			}
 		}
 	}
@@ -34060,7 +34378,7 @@ int32 UVoxelWorldSubsystem::SpawnStructureFixtureAt(double WorldX, double WorldY
 			VoxelCoords::FVoxelCoord EditMin, EditMax;
 			if (ComputeVoxelCoordBounds(Coords, EditMin, EditMax))
 			{
-				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax, TEXT("SpawnStructureFixtureAt"));
 			}
 		}
 	}

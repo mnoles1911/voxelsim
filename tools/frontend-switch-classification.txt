@@ -58,6 +58,33 @@ VoxelFineTileDir
 VoxelFineTileGateFatal
 VoxelFineTileProviderId
 VoxelFineTileRingRadius
+# --- 2026-09-07: the async fine-tile loader (VoxelFineTileStreamer) ---------
+# -VoxelFineTileAsync=0|1 picks the loader (0 = synchronous, byte-identical
+# default); the other two are its caps. All three are tuning/configuration
+# and none drives, poses or ends a run; they are meant for ordinary interactive
+# launches (tools/voxel-editor.ps1 will pass -VoxelFineTileAsync=1). THE
+# IN-FLIGHT CAP IS NAMED *AsyncCap, NOT *AsyncInFlight, ON PURPOSE: "Flight"
+# is in kSelfDrivingSubstrings, and the plan's original name would have
+# suppressed the main menu on every launch that tuned it -- the same trap
+# -VoxelGpuMeshInFlight records below. Renamed rather than excepted.
+VoxelFineTileAsync
+VoxelFineTileAsyncCap
+VoxelFineTileAsyncPerTick
+# -VoxelLoadGateFineRing=0|1: the loading screen's third gate ("the fine ring
+# has settled"), FVoxelReadyProbeConfig::bRequireFineRing. Configuration for
+# the ready probe, like VoxelLoadGateMaxRing; 0 is the A/B control arm.
+VoxelLoadGateFineRing
+# --- 2026-09-07: the water wake injection's parameters (VoxelRippleField.cpp)
+# Left unclassified by the water session; recorded by the loader session so
+# the lint is green again. Radius, strength, step count, heading and a freeze
+# toggle for the wake that -VoxelRippleWakeAfter (acknowledged below, under
+# SUBSTRING-MATCHED) injects. Configuration for a capture some OTHER switch
+# drives; passing any of them alone injects nothing and quits nothing.
+VoxelRippleWakeFreeze
+VoxelRippleWakeRadiusM
+VoxelRippleWakeSteps
+VoxelRippleWakeStrengthM
+VoxelRippleWakeYaw
 VoxelFlySpeedStep
 VoxelForceUnderwaterSpawn
 VoxelGIBreach
@@ -214,11 +241,63 @@ VoxelNoMenu
 VoxelMenuPanel
 VoxelMenuAutoStart
 VoxelMenuWatchdog
+# 2026-09-08: -VoxelMenuPrewarm=0|1 (default 1). Configuration. Commits the
+# brick pool's GPU arenas while the title screen is up instead of inside the
+# first streaming frames of a load. Its call site is EnterMenu, so it needs a
+# human at the menu by construction and can never drive a headless run; =0 is
+# the control arm of the loading-screen A/B.
+VoxelMenuPrewarm
+# menu tick gate 2026-09-07 (docs/backlog.md §0.0o-adjacent): the A/B switch
+# for whether the menu's per-frame ticker gates are active. Configuration, not
+# a driver -- it changes what a run DOES while parked at the menu, never
+# whether the menu appears or the run exits on its own.
+VoxelMenuTickGates
+# menu scalability drop 2026-09-07 (plan Phase 2 step 3): 0 = off (the A/B
+# control arm), 1 = default (drop the render cost while the menu and the
+# loading curtain own the screen, restore at the reveal), 2 = dry run (log the
+# cvar list it would set and set nothing). Configuration, not a driver -- it
+# changes how expensively the menu RENDERS, never whether the menu appears or
+# whether the run ends on its own. See VoxelMenuScalability.h.
+VoxelMenuScalability
+# --- 2026-09-08: the music pool system (docs/music-design.md) ---------------
+# -VoxelMusicPool=<Explore|Cave|Town|Water|Combat|Menu|Stingers|Cinematic>
+# pins which pool owns the music, ignoring the world's signals.
+# -VoxelMusicGap=<seconds> replaces the design's authored silence (45-120 s for
+# Explore/Cave/Town/Water, 20-40 s for Menu) with a fixed duration; 0 restores
+# the pre-2026-09-08 back-to-back behaviour, which is the A/B control arm.
+#
+# BOTH ARE CONFIGURATION. Neither poses a camera, captures anything, or ends a
+# run -- they change what the game SOUNDS like on an ordinary interactive
+# launch. They exist because the shipped gaps make the pool machinery
+# unprovable from a log in reasonable time and because the Cave and Water pools
+# otherwise need the player to be under rock or aboard a boat.
+#
+# NAMED WITHOUT A RULE-5 SUBSTRING ON PURPOSE, the same trap
+# -VoxelFineTileAsyncCap records above: the obvious alternative names for a
+# diagnostic like this ("-VoxelMusicPoolCheck", "-VoxelMusicProbe") contain
+# Check and Probe, would be classified self-driving, and would suppress the
+# main menu on every launch that tuned them -- which for a MUSIC switch would
+# also remove the menu music the switch was arming.
+VoxelMusicPool
+VoxelMusicGap
 VoxelUINoAssets
 VoxelLoadGateMaxRing
 VoxelLoadMinHold
 VoxelLoadMaxHold
 VoxelLoadTheatre
+# The three below arrived with the 2026-09-07 overlay family and were missed
+# when it landed; the lint has been reporting them since. They are all
+# configuration for a capture that some OTHER switch drives -- passing
+# -VoxelPausePanel on its own opens nothing and quits nothing.
+VoxelPausePanel
+VoxelDemoSaves
+# Fabricates the HUD's health, hunger and interaction prompt for a capture, the
+# way -VoxelDemoSaves fabricates save rows. It draws nothing on its own and
+# quits nothing -- it is configuration for whichever shot is driving the run.
+VoxelDemoVitals
+# Which of the five in-game screens -VoxelScreenShot opens. Same shape as
+# -VoxelMenuPanel and -VoxelPausePanel above, and inert without its shot.
+VoxelScreenPanel
 
 # --- 2026-08-23: far-clipmap appearance (docs/backlog.md 0.0d) ---------------
 # All tuning, diagnosis or configuration; none of them drives the run, so all of
@@ -411,6 +490,25 @@ VoxelEnvironmentLODKeepOpen
 VoxelEnvironmentLODValidate
 VoxelTreeFelling
 
+# --- 2026-09-07: the threaded loading curtain and the load gate's ceiling ---
+# -VoxelLoadingScreenThread=0|1 chooses which thread paints the loading screen
+# (1, the default: the engine's Slate loading thread across long world ticks;
+# 0: the game-thread viewport widget, i.e. the control arm). It changes nothing
+# about what a run does -- only where the curtain is drawn -- and an unattended
+# capture that passes it still needs -VoxelMenuAutoStart to reach the curtain
+# at all.
+#
+# CHECK THE NAME BEFORE YOU WORRY ABOUT IT: rule 5's needle is "Screenshot",
+# not "Screen", so this does NOT match and does not suppress the menu. That is
+# the intended outcome, not a near miss -- an interactive launch tuning it must
+# still get a main menu. The same trap in the other direction is recorded above
+# for -VoxelFineTileAsyncCap.
+#
+# -VoxelLoadGateMaxWait=<s> is the readiness probe's ceiling (default 300, was
+# 60 and was borrowed from -VoxelLoadMaxHold). Configuration; it makes a run
+# WAIT longer, it never ends one.
+VoxelLoadingScreenThread
+VoxelLoadGateMaxWait
 # Input to VoxelObjectsNetVerify: test-driver barriers for deletion/server exit.
 # Ignored without that fixture driver; this path alone must not skip the menu.
 VoxelObjectsNetGateFile
@@ -439,6 +537,11 @@ VoxelPlayerProfile
 # would break leg commands, tools and docs other agents are running against
 # right now. Each accidental entry names the rename it wants and the owner.
 VoxelAutoDigAfter = Timed action inside a self-driving run: it fires at an offset and the run ends itself.
+VoxelPauseShot = Front-end capture: reaches Playing, opens the pause overlay, photographs it and quits. Matches by intent, not by accident; it was simply never recorded when the overlay family landed on 2026-09-07.
+VoxelScreenShot = Front-end capture: reaches Playing, opens the in-game tab stack on -VoxelScreenPanel's screen, photographs it and quits.
+VoxelDeathShot = Front-end capture: reaches Playing, opens the death screen and quits. It is the death screen's ONLY caller -- nothing in this project can kill the player.
+VoxelDialogueShot = Front-end capture: reaches Playing, opens the dialogue overlay on the seeded node and quits. Also the overlay's only caller; there is no conversation system.
+VoxelHudShot = Front-end capture: reaches Playing, settles so the compass tape and hotbar glyphs have rasterised, photographs the world with only the HUD on it and quits. Opens nothing, because the HUD installs itself as soon as the player has a pawn.
 VoxelBreachTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
 VoxelBucketedExitScanVerify = ACCIDENTAL ('Verify'). Correctness arm for the bucketed exit scan in the eviction index; verifies during a normal run. Owner: VoxelEvictionIndex.*
 VoxelCaveTest = Fixture: drives the run and exits on its own; the naming convention is doing exactly what it was designed to do.
@@ -528,6 +631,13 @@ VoxelDumpIndexKeys = ACCIDENTAL ('Dump'): passive resident index-key logging ins
 VoxelSkyMarkVerify = ACCIDENTAL ('Verify'): runtime sky-band correctness sampling during normal streaming; does not drive or end a run.
 VoxelSkyMarkVerifyGrid = ACCIDENTAL ('Verify'): sample-grid size for the passive sky-band correctness check.
 VoxelSkyMarkVerifyStride = ACCIDENTAL ('Verify'): sample cadence for the passive sky-band correctness check.
+# --- 2026-09-07: the water wake injection (VoxelRippleField.cpp) ------------
+# Left unclassified by the water session; recorded here by the loader session
+# so the lint is green again. -VoxelRippleWakeAfter=<s> injects a wake into
+# the ripple field at an offset inside a capture run (the plan's wake legs pair
+# it with -VoxelScreenshotAfter); the five parameters below only shape that
+# injection and are inert without it.
+VoxelRippleWakeAfter = Timed action inside a self-driving capture run: injects a wake at an offset; the run is ended by the capture switch it is paired with. Matches 'After' by intent, not by accident.
 
 VoxelSessionVerify = Fixture: verifies encrypted player restart or selected-seed world travel and exits through its harness.
 VoxelSessionVerifyDir = Fixture output directory and stop marker for the session process harness.

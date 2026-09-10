@@ -3,14 +3,22 @@
 // the per-frame work in its _process.
 //
 // Layered bottom-up: a crossfading pair of background images, a 62% black
-// tint, a centred column (hourglass, "L O A D I N G", rotating quip, progress
-// bar, percentage), and a TIP footer pinned to the bottom. The Godot build's
+// tint, a column in the upper third (the self-turning hourglass, "LOADING",
+// a line of text that changes once per turn of the glass), and a TIP footer
+// pinned to the bottom with the version stamp bottom-left. The Godot build's
 // top-right FPS readout is DEBUG-ONLY now (owner directive, 2026-09-05):
 // absent by default, restored by voxel.UI.LoadingFps -- see the flag's
 // comment in the .cpp.
 //
-// TWO PERFORMANCE SIMPLIFICATIONS ARE CARRIED FORWARD AS DECISIONS, and they
-// are the reason this screen looks slightly plainer than the HTML mock:
+// NO PROGRESS BAR AND NO PERCENTAGE (owner directive, 2026-09-07): "the latest
+// Voxelmark Loading Screen html asset does not have a loading bar at all and
+// now only has a rotating hourglass icon". The 2026-09-06 smooth-bar directive
+// is superseded by the mock; the theatre progress model
+// (ComputeTheatreProgress) still runs and still gates the curtain, it simply
+// no longer draws anything. SetProgress stays so the caller is unchanged.
+//
+// ONE PERFORMANCE SIMPLIFICATION IS CARRIED FORWARD AS A DECISION, and it is
+// the reason this screen looks slightly plainer than the HTML mock:
 //
 //   * NO VIGNETTE. The mock's `box-shadow: inset 0 0 240px rgba(0,0,0,0.7)`
 //     was implemented in the Godot build as a full-screen radial-darken
@@ -21,19 +29,13 @@
 //     GDScript's own recommendation stands: bake it offline and draw it as one
 //     full-screen image, which FVoxelUIAssetLibrary can now load trivially.
 //
-//   * FLAT PROGRESS BAR. The mock's `linear-gradient(90deg, sand-deep,
-//     sand-bright)` plus a trailing white highlight went the same way, for the
-//     same reason. Slate's MakeCustomVerts would give per-vertex colour for
-//     free, so the gradient COULD come back cheaply here -- but only with a
-//     measurement, and never silently.
-//
-// The reason to write both of those down is that each looks like an omission
-// and is in fact a decision somebody already paid for once.
+// The reason to write that down is that it looks like an omission and is in
+// fact a decision somebody already paid for once.
 
 #include "CoreMinimal.h"
+#include "Math/RandomStream.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
-#include "Types/SlateStructs.h" // FOptionalSize, used in the bar-fill accessor
 
 class VOXELEARTHUI_API SVoxelLoadingScreen : public SCompoundWidget
 {
@@ -74,8 +76,11 @@ private:
 	FText GetQuipText() const;
 	FSlateColor GetQuipColour() const;
 	FText GetTipText() const;
-	FText GetPercentText() const;
-	FOptionalSize GetBarFillWidth() const;
+	// Bound to SVoxelHourglass::OnFlipped: starts the quip's fade-out; the swap
+	// and fade-in follow in Tick. The line changes once per turn of the glass
+	// (about every 7.8 s), never on its own timer -- the mock's rotateTip() is
+	// only ever called from the flip phase.
+	void OnHourglassFlipped();
 	// The bob, expressed as top padding inside the hourglass wrapper. Slate
 	// exposes RenderTransform as a construction ARGUMENT rather than a bound
 	// attribute, so an animated offset has to move through layout -- and the
@@ -95,6 +100,17 @@ private:
 	// fading up. Indices walk forward through the shuffled library order.
 	int32 BackgroundIndexA = 0;
 	int32 BackgroundIndexB = 1;
+	// LAST BRUSH RESOLVED ON THE GAME THREAD, per slot. The curtain is painted from the
+	// Slate loading thread while the world ticks (VoxelLoadingCurtainThread), and
+	// FVoxelUIAssetLibrary::RequestBackground refuses any caller off the game thread
+	// (it may start a decode and mutate its tables). Without a cache every off-thread
+	// paint drew NO image and the backdrop flickered to black between game-thread
+	// paints (owner, live, 2026-09-07 night: "background image constantly flickers
+	// between visible and blackness ... hourglass and overlay text appear fine"). The
+	// brush object is owned by the library and lives for the load; caching the pointer
+	// is what lets an off-thread paint show the image the game thread last resolved.
+	mutable const FSlateBrush* CachedBackgroundA = nullptr;
+	mutable const FSlateBrush* CachedBackgroundB = nullptr;
 	float BackgroundTimer = 0.f;
 	float CrossfadeAlpha = 0.f;  // 0 = A fully visible, 1 = B fully visible
 	bool bCrossfading = false;
@@ -102,13 +118,30 @@ private:
 	// --- Text rotators ------------------------------------------------------
 	TArray<int32> QuipOrder;
 	int32 QuipCursor = 0;
+	// The quip fades out, swaps, and fades back in (QuipFade each way); the
+	// tip is a hard cut. Idle: alpha held at 1. FadingOut/FadingIn: QuipTimer
+	// runs 0..QuipFade. Kicked off by OnHourglassFlipped, never by a timer.
+	enum class EQuipPhase : uint8 { Idle, FadingOut, FadingIn };
+	EQuipPhase QuipPhase = EQuipPhase::Idle;
 	float QuipTimer = 0.f;
-	// The quip fades out, swaps, and fades back in; the tip is a hard cut.
 	float QuipFadeAlpha = 1.f;
 
 	TArray<int32> TipOrder;
 	int32 TipCursor = 0;
 	float TipTimer = 0.f;
+
+	// RESHUFFLE ON WRAP (2026-09-07, Phase 4). Seeded once per show from
+	// MakeVoxelUIRandomStream -- so it is clock-seeded interactively and FIXED
+	// under -unattended, which is what keeps the capture strips diffable -- and
+	// then ADVANCED rather than re-created, so the second pass through a list
+	// is not the first pass again. Held here rather than made locally for
+	// exactly that reason: a fresh MakeVoxelUIRandomStream() at every wrap
+	// would produce the same "shuffle" every time under -unattended.
+	//
+	// Why it matters now: 15 tips on an 8 s timer is 120 s per cycle, and the
+	// load gate's ceiling is now 300 s. Before this, a player waiting out a
+	// cold cascade saw the tip list twice and a half IN THE SAME ORDER.
+	FRandomStream RotationStream;
 
 	// --- Hourglass bob ------------------------------------------------------
 	float BobTime = 0.f;

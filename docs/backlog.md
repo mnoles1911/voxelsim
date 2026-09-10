@@ -41,6 +41,61 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0p 2026-09-07 evening: five commits, and the open list is in one place
+
+Water wake tap (fe51c15, image FAILED owner judgment, code kept), menu instrument +
+tick gates (d2965c2), async fine-tile loader default OFF (ab24732; only the worst
+frame clears the A/A floor; the PREFETCH RING is the win), menu scalability (668c96a,
+-36%), threaded loading curtain (cf6dc9a; seg=LOADING p99 23.9 ms through 7.6 s world
+stalls). UI scaling doctrine is ADR-0011 (scale-tolerant, owner-directed). **Everything
+open, grouped by who can close it, is in `docs/HANDOVER-2026-09-07-evening.md`** --
+read that before adding items here, several of today's findings are already listed.
+
+### 0.0o CORRECTION 2026-09-07 -- the lake-session hitches were NOT synchronous tile loads (warm cache)
+
+The 2026-09-07 12:57 session closed by telling the owner that "each 1 to 6 second
+freeze lines up with a fine tile being read: 200 to 300 MB per tile, decoded on
+the game thread". Its own log says otherwise. The log is preserved at
+`docs/evidence/2026-09-07-lake-session-VoxelEarth.log` (md5
+010a9300e3efaa10d1810515e1e355c8; the "copy" that session announced was never
+made, and the next launch rotates the original).
+
+- **Four** `Fine tile (x,y) resident ... full decode` lines in the whole session,
+  all inside a 10 s window after NEW GAME, **262-277 ms each**, `blockingLoads=3`,
+  `ringMoves=0`. No tile loaded again afterwards.
+- The multi-second stalls are **render-thread waits**: `renderWaitMs=6319.56` at
+  16:50:26 with `fineMs=0.05`; 1931 ms at 16:50:20; 1255 ms at 16:50:16.
+  `frameMs=400.00` is the instrument's clamp.
+- One ring-5 entry recompute of 512 ms (`entryMs R5=512.54 footprints R5=1285`).
+- Raster-atlas fills at 1,460-1,552 ms of game thread per 5 s window during the
+  fill phase (the known stutter owner), settling to ~35 ms.
+- Steady state after ~15 s: p50 8.1 ms, p95 13.6 ms, p99 27.1 ms.
+
+What was supposed to keep the async-loader recommendation alive: that run had the
+tiles in the Windows file cache, so off a cold SATA HDD a 200-340 MB read should
+be ~2 s per tile on the game thread, four tiles at the lake spawn.
+
+**That prediction is still untested, and the leg meant to test it did not.** The
+post-reboot measured launch (2026-09-07 14:23, first editor launch after the
+13:03 boot) reproduced the warm session tile for tile -- 7.49 s of bounded
+tile-load time against the warm run's 7.12 s -- because the file cache was not
+cold: the standby list held 41.5 GB, and a 468 MB tile file in a namespace that
+leg never opened read back at 4015 MB/s. Three of the four implied per-tile read
+rates exceed the SATA link, so no clean cold number exists. Worse for the
+recommendation, `fineMs` is 0.02-0.03 ms on **every** `Hitch frame recompute` in
+that run, and the largest stall (`renderWaitMs=50626.63`) has no tile load
+anywhere near it. Full table, bracket arithmetic and the stall-vs-load timeline
+are in `docs/tile-loading-async-2026-09-07.md`.
+
+So the async loader is **not** currently justified by a measurement. The live
+tile-side anomaly worth chasing first is tile (-5,-3): ~4.8 s unattributed, in
+both sessions, on the *smallest* of the four reads -- a cost that scales with
+neither bytes nor disk. Instrument the streamer's read separately from its parse
+before building the async arm on top of it.
+
+The SSD-move recommendation is dropped: the tile cache is 17 GB (not 6.5) and C:
+has 25.8 GB free.
+
 ### 0.0n A capture run that finishes its work never exits -- symptom bounded, cause open
 
 `-VoxelLoadingShotAt` does not quit after its last shot when that shot lands
@@ -2822,3 +2877,252 @@ and `VoxelEditedLaneGate.h` — the designed fix for exactly that — is dead co
 (never included, `FLevelGate` never instantiated) while
 `VoxelResidencyGpu.h:195-207` carries counters wired to a gate that does not
 exist.
+
+## 14. FIXED 2026-09-07 — GAME-THREAD MIP RE-MESH CASCADE ON EDITS (found the same day)
+
+**Symptom.** An unattended shore-foam capture (`Saved/capture-shore-B-shelf2.log`,
+spawn `-65102,-51084` +6 m, no input, fresh world, no dig switch) stopped
+producing frames at frame 710 and never took its shot; the harness gave up at
+420 s. Its twin arm A (`capture-shore-A-ship.log`, identical apart from one
+material scalar) ran ~900 frames and captured. Same family as §13's hang, and
+very likely the half of it the front-containment did not address.
+
+**Mechanism (read off the log, not inferred).** At frame 709, 0.4 s after
+`Lake sheets: DRAINED build` and `OceanConnect`, a 3x3x3 voxel edit landed at the
+pawn's column (`[-651009,-510840,16439]..[-651007,-510838,16441]`, 30 cm under
+ground top) with NO dig/tool/carve log line of its own — the only edit sources
+that print are absent, so the writer is silent; the water subsystem's own
+implicit→CA conversion is the leading suspect (`Mobilized 24 cavern water
+brick(s) on edit`, `VoxelWaterSubsystem.cpp:7822`, fired on that region, and the
+CA bucket came up at the same spot). The edit then ran the normal edit pipeline:
+`Destruction: region=` (`VoxelWorldSubsystem.cpp:29693`), `Distant-edit mip
+propagation` levels 1..7, and `Distant-edit mip re-mesh` — which is documented
+game-thread only (`:28846`, overlay-aware `World::brickAt` sampler) and whose
+cost grows with the level's footprint:
+
+| level | chunk | wall time to log | delta |
+|---|---|---|---|
+| 1 | (-10173,-7982,256) x2 | 05:42:04.2 | — |
+| 2 | (-5086,-3991,128) x2 | 05:42:04.5 / 04.7 | 0.2 s each |
+| 3 | (-2544,-1996,64) x2 | 05:42:06.1 / 07.5 | 1.4 s each |
+| 4 | (-1272,-998,32) | 05:42:18.0 | 10.5 s |
+| 5 | (-636,-499,16) | 05:43:37.6 | **79.5 s** |
+| 6 | (-318,-250,8) marked | never logged | > 70 s at harness kill |
+
+The frame counter sat at 710 throughout: this is a synchronous stall, not a
+slowdown, and it is triggered by any edit near enough to the player for a mip
+ancestor to be resident.
+
+`quads=0` on every line is NOT evidence that the re-mesh had nothing to do, and
+the first reading of this entry took it that way. `voxel.Terrain.RetireQuads` is
+the default (`VoxelApplyBatch.h:78`), so `bRetireQuads` sends every one of these
+through `PackChunkMaterialising` and `Quads` is empty by construction at every
+level, edited or not. There was no empty diff to early-out on.
+
+### FIXED 2026-09-07 — the game thread was still folding 8^L bricks the worker retired in August
+
+**Root cause, and the water is a bystander.** `DrainGameThreadMesh`'s level>=1
+arm was the ONLY level>=1 sampler in the project still on the mip recursion.
+`MakeCoarseLevelSampler`'s own comment (`VoxelWorldSubsystem.cpp:1001-1031`) had
+already priced that recursion and retired it — *"a level-L brick is folded from
+8^L level-0 bricks ... R3 1543ms, R4 15901ms"* — and `-VoxelCoarseMinLevel`
+(default 1) moved every worker job to the direct coarse path. Nothing moved this
+one. Worse, its level-0 source is `World::brickAt`, which is
+`gen_.makeBrick(key)` with NO column grid argument (`world.h:138`), so each of
+those bricks also re-derives its own 8x8 amplifier column grid — the worker's
+`FJobColumnGridCache` does not exist on this path. A chunk plus the mesher's
+apron is 6x6x6 level-L bricks, i.e. (6*2^L)^3 level-0 bricks: 110k at level 3,
+885k at level 4, 7.1M at level 5, 56.6M at level 6. The measured table divides
+out to ~11 us per level-0 brick at every level, which is what an 8x-per-level
+curve looks like when it is real work and not a hang.
+
+Two consequences, one of them silent: level 6 was ~10 minutes of game thread,
+and its 56.6M `Brick<8>` job-local map would not have fit in memory either. And
+because coarse and mip are DIFFERENT RULES (`generator.h`: nearest-neighbour at
+the representative voxel vs. majority vote, separate goldens), an edited distant
+chunk was being re-meshed under a rule none of its neighbours use — a dig
+changed the shape of terrain it never touched.
+
+**The fix is the rule the worker already ships.** `FOverlayCoarseChunkSampler`
+(`VoxelWorldSubsystem.cpp:1714`) composes `FCoarseChunkGridSampler` — the same
+concrete functor the worker meshes every level>=1 chunk with — and overrides
+only the cells whose representative level-0 voxel lands in an edited brick,
+where the overlay's stored value is `World::materialAt` at that voxel by
+construction. One overlay hash probe per voxel, skipped entirely in a session
+that has never edited. `DrainGameThreadMesh` picks it on the worker's own
+predicate (`Level >= GetCoarseMinLevel()`), so `-VoxelCoarseMinLevel=99` still
+restores the mip rule on BOTH producers and the A/B stays a rule A/B.
+`MakeOverlayAwareLevelSampler` is kept for exactly that arm.
+
+**Measured, `-VoxelHeadlessDigTest` at the §14 spawn**
+(`Saved/capture-s14-digtest.log`, r=10 m carve, 2,149,398 voxels — four orders of
+magnitude more edited voxels than the 27 that stalled arm B, because the cost is
+per CHUNK and not per voxel):
+
+| level | before (§14 arm B, per chunk) | after (per chunk) | chunks re-meshed after |
+|---|---|---|---|
+| 1 | 39 / 32 ms | 1.42 ms mean, 2.0 max | 48 |
+| 2 | 240 / 210 ms | 1.79 ms mean, 2.4 max | 12 |
+| 3 | 1,411 / 1,382 ms | 2.50 ms mean, 2.7 max | 2 |
+| 4 | 10,522 ms | 2.0 ms | 1 |
+| 5 | **79,526 ms** | 2.2 ms | 1 |
+| 6 | never returned (>70 s at kill) | 4.3 ms | 1 |
+| 7 | never reached | 3.3 ms | 1 |
+
+The whole 66-chunk cascade, levels 1 through 7, cost 107 ms of game thread and
+finished 127 ms after the carve, spread over frames 879-887 by the existing
+`voxel.Stream.MaxRemeshesPerFrame` budget. Cost is now FLAT in level, which is
+the coarse rule's whole claim. The run captured; the frame counter went on
+advancing through the cascade.
+
+RUN TWICE, and the second run is why the numbers above are the second one's. A
+stale runner re-ran the same leg 8 minutes later and overwrote the log; the two
+legs agree within the ~15% this box's timings move (L1 mean 1.57 vs 1.42, L5 2.6
+vs 2.2, L6 4.8 vs 4.3, L7 3.7 vs 3.3; 115 ms vs 107 ms for the same 66 chunks),
+so the table cites the log that is actually on disk rather than the one that is
+not. `coarse=0` appears nowhere in either — every level>=1 re-mesh took the new
+path.
+
+The `Distant-edit mip re-mesh` line now carries `coarse=` and `ms=`, in the
+shipping line rather than behind a switch: the failure this entry names was a
+single re-mesh, and a per-level wall time is the only thing that separates this
+path working from this path hanging.
+
+**Also done: the writer now names itself.**
+`UVoxelWaterSubsystem::NotifyTerrainRegionEdited` takes an `EditSource` literal
+and prints it on both the `Mobilized ... on edit` line and the wake line; the six
+call sites in `VoxelWorldSubsystem.cpp` pass `TryDig` / `TryPlace` /
+`CarveSphere` / `PromoteDetachedIslands` / `SpawnTreeFixtureAt` /
+`SpawnStructureFixtureAt`. That set is the answer to arm B's mystery on its own:
+NONE of `CarveSphere` or `PromoteDetachedIslands` logs a line of its own, which
+is why the forensic pass found a silent writer. Compiled but NOT exercised at
+runtime — the dig-test run mobilized no cavern water, so no `source=` line was
+printed. The next shoreline hang will name it.
+
+**Left open, deliberately.** `MaxRemeshesPerFrame` is still 4 and was tuned when
+every entry on that queue was a ~1.5 ms level-0 chunk; a coarse level-7 chunk is
+~5 ms, so a worst-case frame is now ~20 ms of re-mesh. That is a tuning question
+with a real measurement behind it and it did not need answering to remove the
+stall. `FCoarseChunkGridSampler` also resolves its asset shortlist inline here
+(`PreResolved` is null) where the worker gets it from `AssetResolveCache`; the
+game thread could peek that same cache, but at 2.0-4.8 ms per chunk across both
+legs the resolve is visibly not the term that matters. No `Voxel.*` automation test covers
+distant-edit propagation — the evidence is the log line, as it has been since M2
+wave 2.
+
+
+## 15. WATER LOOK — after the 2026-09-07 grey-rings fix (water-look agent)
+
+Context: `docs/water-ocean-tides-plan-2026-09-04.md`, the 2026-09-07 night
+section. Left undone there:
+
+* **The SLW surface layer reads black at full coverage on this water** (the
+  "black band"; `BasePassPixelShader.usf:1480-1492` says it is forward-lit, the
+  frames say it is not). Until it is found, every foam here is emissive paint
+  with no sun/shadow on it. Instrument: a coverage-1 pixel with
+  `DisturbanceFoamEmissive:0` / `ShoreFoamEmissive:0`; suspects are the
+  forward light grid / screen-space shadow mask the water pass reads against
+  a depth buffer the marcher writes late, and the SkyLight capture at z=0.
+* **Foam does not move the scattering coefficient.** Epic's Water_Material
+  drives "Foam Scattering" / "Foam Scatter Bias" alongside opacity, roughness
+  and emissive. Cheap to add as `lerp(scatter, scatter*k, foam)` in
+  `water_optics`; needs an owner frame.
+* **Ocean parity.** `create_ocean_material.py` takes the new disturbance-foam
+  defaults but has neither the foam breakup nor a depth-keyed shore term, and
+  has no `-VoxelWaterMatScalar` reach (the MID probe is sheet-only). Extend the
+  probe to `AVoxelOceanActor` before laddering ocean foam.
+* **A live owner dial.** There is no console path to any water material scalar
+  today; design a cvar that pokes the live MIDs on both the sheet and the
+  ocean once the look is settled, not before.
+* **A real foam texture + normal** in place of the procedural breakup, if the
+  owner likes the breakup's shape.
+* **A darker-shore capture site** for judging shore foam: the vista lake at
+  `-65102,-51084` is snow-rimmed alpine ground (1644 m, PALETTE authority,
+  tan/orange voxels along the line), which is a poor backdrop for white foam;
+  the surveyed coastal sites in the tides doc need their fine tiles baked
+  first.
+
+### 15a. Left undone when the owner paused live wake/ripple tuning (2026-09-07 night)
+
+* **The swept-splat deposit fix is UNBUILT** (`VoxelRippleField.cpp`
+  `AddSweptDisturbance`, +30/-1): build it and re-run the C1 command line
+  without `-Cvars`, or `git checkout` the file before the next leg. Until it
+  is in, a moving hull deposits one full ring per station per tick and the
+  wake amplitude depends on frame rate.
+* **No instrument reads the ripple field at the shutter.** Health sampling
+  stops at first verification (t+0.25 s after boarding); the capture
+  injector's `fieldMaxAbs` reprints that stale value. Add a `voxel.Water.
+  Ripple.Stat`-style whole-field max/mean readback that can be scheduled at
+  `-VoxelScreenshotAfter - 1 s`, so an amplitude claim can be a number.
+* **`voxel.Boat.WakeGain` 3.0 and `voxel.Water.Ripple.Gain` 2.5** were both
+  chosen against readbacks taken before the boat moved; re-derive both after
+  the deposit fix, from a shutter-time readback, and update the Ripple.Gain
+  help text ("1 is shipped strength") to match whatever ships.
+* **The `DisturbanceFoam*` defaults (Threshold 0.05, HeightWeight 1, Gain 6)
+  are provisional**: the ladder that was to settle them never ran, and B0 at
+  those defaults still showed a window-wide foam at WakeGain 3.
+* **Arm A1** (`DisturbanceFoamEmissive:0` at full coverage) never ran; it
+  decides whether foam can ever be lit albedo here or only emissive.
+* **`M_WaterVoxel.uasset` on disk is regenerated (17:46:42) and `M_Ocean.
+  uasset` is not**; the ocean's next regen picks up the new helper defaults.
+  Restore or regenerate before the pair is judged together.
+* **The boat leg is not pose-reproducible across a regen** (boarding point
+  and heading moved on the first post-regen leg, `FRAMING NOT AS REQUESTED`);
+  pin the boat's spawn transform and heading explicitly in the harness before
+  using region means across regens.
+
+### 15b. Left open by the 2026-09-08 turbidity / bed-darkening / extinction pass
+
+* **Marcher bed darkening is two `#define`s** (`VoxelMarch.usf` `VOXEL_MARCH_SUBMERGED_DARKEN 0.45` / `RAMP_M 0.30`). Making it a live dial that tracks the terrain materials' `SubmergedDarken` / `SubmergedRampM` means two loose floats bound beside the caustic bindings in `VoxelMarchRenderer` (C++), fed from the same cvar. Until then, change the three in step by hand.
+* **Marcher bed darkening rides the caustic bathy sample**, so it is gated by the `VOXEL_MARCH_CAUSTICS` permutation, `voxel.Water.Caustics > 0` and the caustic fade distance; caustics OFF turns the marcher's darkening off. Decoupling is the same C++ change (its own gate and fade).
+* **`water_caustics_graph` does not see `ABSORPTION_CHANNEL_SCALE`** -- it derives attenuation from `ABSORPTION_COLOR` alone; the caustic term is now on slightly clearer water than the surface. Route it through `water_optics.absorption_per_m()`.
+* **Turbidity floor and body colour are not yet owner-judged**; the ladder is in the water doc (2026-09-08 section). The body floor is emissive-only (unlit) by design until the SLW surface-layer question (arm A1) is answered.
+
+### 15c. Music: stingers and short cues (owner-directed backlog, 2026-09-08)
+
+Sub-30 s cues are deferred by the owner ("im not worried about sound effects and tracks
+that are only a couple seconds long"). When picked up: discovery chime, level/skill-up,
+quest accepted / completed, boss reveal, death (the 0:17 `Defeat _ Game Over` exists),
+enter-town and enter-cave transition swells. They belong in the Stingers pool (priority 1,
+play over whatever is running, never cycled) per `docs/music-design.md` §2. Also deferred
+from that doc: per-biome Explore weighting, a settlement-bounds signal for Town,
+Interior/Sacred cues 21-24, and the Cinematic/Ending sets 49-59.
+
+**Deferred by the 2026-09-08 implementation pass** (the pool system itself shipped; see
+`docs/music-design.md` §8 "Implemented 2026-09-08"):
+
+* **`17 — Lirien-Thal _ The Silverwood.mp4` is still unplayable.** `ffmpeg` is not on this
+  machine's PATH and was not found installed, so the re-encode to 16-bit PCM 48 kHz stereo
+  did not happen. The file sits in the root of `Content/Audio/Music/`, outside every pool
+  folder, so it is never scanned and cannot break anything. The exact command and its
+  destination folder (`Explore/Day`) are in `Content/Audio/Music/MUSIC_CREDITS.md`.
+* **Three signals are stubbed predicates that cannot fire**, each named so it is one line
+  to wire: `IsCombatThreatActive` (no combat exists), `IsInsideSettlement` (no settlement
+  bounds -- this is the Town row above, restated at the call site), `IsRaining`
+  (`UVoxelWeatherSubsystem` publishes wind only; there is no precipitation state). Seven
+  Town cues and two Combat cues are on disk and unreachable until they do.
+* **`Discovery_Wonder` has not had its ear check.** `docs/music-design.md` §6 flags it as
+  ambiguous for Explore; it is in `Explore/Day` on the research pass's word. Also unjudged:
+  `11 — The Sorrowmarsh` is 7:59 against §5's three-to-six-minute rule, and 87.8 MB.
+* **Night is one cue on repeat.** `Explore/Night` holds only `Camp_Rest`, its borrow chain
+  is Dusk (empty), and §4 does not let Night borrow Day. Until §7's six Night cues exist,
+  a night in game is that one cue with 45-120 s of silence between plays. This is the
+  largest content gap in the library and is content, not code.
+* **No settings row for the music pools.** Nothing player-facing exposes the gap length,
+  the crossfade, or a "no authored silence" arm -- only `-VoxelMusicGap=` does, which is a
+  command-line switch. If the owner judges the 45-120 s silence too long or too short in
+  play, the standing settings-panel policy says that becomes a row.
+* **The pool machinery has not been run.** Nothing was built or launched this pass (a live
+  game window held the DLL pair); the headless tests cover the pure half only, and the
+  crossfade, the gap timer and the boat/cave signal transitions have never executed. The
+  selection log line is what a first attended launch should be read against.
+
+### 15d. Music: the 2026-09-09 restart (survival and building OST)
+
+The 59-cue story-era plan is archived (`docs/music-prompts-rpg-era-2026-05-16.md`); the new
+`docs/music-prompts.md` carries 31 slow, background cues in one instrument family. Left to do:
+the `Archive/` folder and moving the 13 story-era files into it (unscanned); rename the `Town`
+folder and enum to Hearth and `Combat` to Danger together with their signals (Hearth = "near
+your own structures", Danger = a threat); a precipitation signal for Rain; the 60-150 s gap
+(code has 45-120); audition World Map _ Travel and Discovery_Wonder against the six Explore
+rules; a Settings row for gap length.

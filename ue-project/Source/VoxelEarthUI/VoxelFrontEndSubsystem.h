@@ -10,6 +10,10 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+// By value, not TUniquePtr: a complete type here costs nothing (the header
+// pulls in no MoviePlayer type -- see it) and avoids repeating the incomplete-
+// type destructor dance ReadyProbe needed below.
+#include "VoxelLoadingCurtainThread.h"
 #include "VoxelFrontEndSubsystem.generated.h"
 
 UENUM()
@@ -111,7 +115,13 @@ private:
 	void RestoreStreamingBudget();
 
 	// Removes the menu from the viewport and hands input back to the game.
-	void TeardownMenu();
+	//
+	// bKeepMusic is the ONE thing that differs between the hand-off call and
+	// every other one. Hand-off is not an exit -- the player is carrying on into
+	// a world that is meant to keep the soundtrack -- so it passes true and the
+	// music survives; a quit, a Deinitialize or a run that ends on the loading
+	// screen passes the default and the track is stopped as it always was.
+	void TeardownMenu(bool bKeepMusic = false);
 
 	EVoxelFrontEndState State = EVoxelFrontEndState::Inactive;
 
@@ -125,6 +135,16 @@ private:
 	FString PendingEditLogPath;
 	TOptional<FTransform> PendingSpawnTransform;
 	float LoadElapsedSeconds = 0.f;
+	// THE SAME LOAD, ON THE WALL CLOCK, and the pair exists because they
+	// disagree by 7.5x under a heavy load. On the 2026-09-07 live session the
+	// readiness probe -- which accumulates the same DeltaSeconds this field
+	// does -- reported "READY after 16.02s" at a wall-clock 119.9 s after it
+	// started: the tick delta is clamped, so a 41.4 s theatre roll had about
+	// five more WALL minutes to run before the curtain would have lifted. The
+	// theatre duration is a quantity of the player's life, so it is measured
+	// against the player's clock; see TickLoading.
+	double LoadWallStartSeconds = 0.0;
+	float LoadWallSeconds = 0.f;
 	// Never allowed to decrease -- see ComputeTheatreProgress.
 	float LastProgress = 0.f;
 	float HandOffSeconds = 0.f;
@@ -146,8 +166,27 @@ private:
 	// backstop for every path that never reaches one.
 	bool bStreamBudgetCapped = false;
 	float SavedApplyBudgetMs = 0.f;
+	// The third theatre cap (2026-09-09): voxel.Stream.DispatchBudgetMs. Own flag,
+	// same reason as the other two.
+	bool bDispatchBudgetCapped = false;
+	float SavedDispatchBudgetMs = 0.f;
+
+	// The second theatre cap (2026-09-08): the raster atlas's per-tick page
+	// sweep, voxel.Stream.AtlasFillMs. Separate flag from the apply budget's on
+	// purpose -- either cap may decline to engage, and one restore path must
+	// not be able to skip the other. The saved value may legitimately be
+	// NEGATIVE: -1 is the cvar's "use the latched -VoxelGpuRasterAtlasFillMs"
+	// sentinel and restoring it is how an ordinary run gets its 2.0 ms back.
+	bool bAtlasFillCapped = false;
+	float SavedAtlasFillMs = -1.f;
 
 	TUniquePtr<class FVoxelWorldReadyProbe> ReadyProbe;
+
+	// --- The threaded loading curtain, 2026-09-07 (Phase 4) -----------------
+	// Live only between BeginLoad and TeardownMenu. Inert unless
+	// -VoxelLoadingScreenThread=1 AND the process can honour it (it cannot in
+	// PIE); see VoxelLoadingCurtainThread.h.
+	FVoxelLoadingCurtainThread CurtainThread;
 
 	// The player controller may not exist on the tick OnWorldBeginPlay runs,
 	// so cursor/input-mode/HUD setup is deferred to the first tick that finds

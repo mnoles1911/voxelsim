@@ -1,0 +1,276 @@
+diff --git a/ue-project/Source/VoxelEarth/VoxelRippleField.cpp b/ue-project/Source/VoxelEarth/VoxelRippleField.cpp
+index 70f8a11..8ae11a3 100644
+--- a/ue-project/Source/VoxelEarth/VoxelRippleField.cpp
++++ b/ue-project/Source/VoxelEarth/VoxelRippleField.cpp
+@@ -912,9 +912,33 @@ void UVoxelRippleFieldSubsystem::AddSweptDisturbance(const FVector& StartWorld,
+ 		NumSplats = kMaxSweptSplats;
+ 	}
+ 
+-	// N == 1 is the zero-length case and is not a special case: the loop below
+-	// runs once at t = 0, i.e. exactly AddDisturbance(StartWorld, ...). A boat
+-	// that is not moving still leaves the ring it displaces.
++	// THE DEPOSIT IS PER METRE OF TRAVEL, NOT PER CALL (fixed 2026-09-07).
++	//
++	// This function is called once per TICK per hull station, with the sweep
++	// that tick covered. At 2 m/s and 60 Hz that sweep is 3.3 cm against a
++	// 30 cm spacing, so the line above rounds it UP to one splat -- and the
++	// old text below it made that a feature ("a boat that is not moving still
++	// leaves the ring it displaces"). The result was one FULL-STRENGTH ring
++	// per station per tick on nearly the same texels: nine times the deposit
++	// the spacing intends per metre, sixty rings a second into one spot from a
++	// moored hull, and a wake whose amplitude depended on the frame rate.
++	// Measured as the owner's "hard grey blob": with voxel.Boat.WakeGain 3 the
++	// whole 51 m ripple window sat 0.4-0.6 m proud of the lake as a foam-white
++	// dome with the canoe buried to its gunwales (VoxelVerify00988); at gain 1
++	// the dome went and the window was still solid foam (VoxelVerify00990).
++	//
++	// So a sweep shorter than one spacing deposits its FRACTION of a ring:
++	// StrengthM * Length / Spacing. Consecutive ticks then sum to exactly one
++	// ring per spacing of travel whatever the tick rate, a sweep of one
++	// spacing or more is unchanged, and a stationary call (Length 0) deposits
++	// nothing -- which is the physics: a hull that is not moving displaces no
++	// new water. The caller already gates on WakeMinSpeedUU, so a zero-length
++	// call is the exception, not the moored case, and it lands in
++	// DroppedInert through AddDisturbance's own StrengthM == 0 door.
++	if (NumSplats == 1 && LengthUU < SpacingUU)
++	{
++		StrengthM = static_cast<float>(double(StrengthM) * (LengthUU / SpacingUU));
++	}
+ 	const double InvSteps = (NumSplats > 1) ? 1.0 / double(NumSplats - 1) : 0.0;
+ 	for (int32 I = 0; I < NumSplats; ++I)
+ 	{
+diff --git a/ue-project/Tools/create_water_voxel_material.py b/ue-project/Tools/create_water_voxel_material.py
+index c6a4d5f..86bef0b 100644
+--- a/ue-project/Tools/create_water_voxel_material.py
++++ b/ue-project/Tools/create_water_voxel_material.py
+@@ -1762,7 +1762,16 @@ def main():
+             "texture lookup is the expensive part, which on this material it is not."
+             % ([n for n in dir(unreal.NoiseFunction) if n.startswith("NOISEFUNCTION")],))
+     shore_noise.set_editor_property("noise_function", _nf)
+-    shore_noise.set_editor_property("scale", 0.35)
++    # THE SCALE IS IN 1/CENTIMETRES, NOT 1/METRES (fixed 2026-09-07). The Noise
++    # node's Position input is unconnected, so it is the world position in UU,
++    # and Common.ush:1799 does `Position *= Scale` before the lookup. 0.35 was
++    # therefore a ~3 cm feature, i.e. per-pixel speckle at any shoreline
++    # distance this material is judged at -- the "+/-0.9 m irregular
++    # waterline" the comment below promises was never drawn; a per-pixel
++    # +/-0.9 m jitter on a 6 m band is what shipped. 0.0035 is the ~3 m and
++    # ~1.4 m (level scale 2) the comment always meant. BathyFoamNoiseM:0 is
++    # the zero arm for both the old and the new value.
++    shore_noise.set_editor_property("scale", 0.0035)
+     shore_noise.set_editor_property("levels", 2)
+     shore_noise.set_editor_property("output_min", -1.0)
+     shore_noise.set_editor_property("output_max", 1.0)
+@@ -1816,6 +1825,88 @@ def main():
+     shore_foam = bathy_b.mul(bathy_b.mul(bathy_b.mul(shore_band, shelf_gate), shore_gain),
+                              bathy["validity"])
+ 
++    # --- FOAM BREAKUP (2026-09-07, objective 2) --------------------------------
++    #
++    # Every foam signal in this graph is a smooth SCALAR, and a smooth scalar
++    # painted in one tint is paint, not whitewater. Epic's own Water_Material
++    # never draws foam as a scalar: it multiplies a depth/velocity mask by a
++    # tiling foam TEXTURE with its own normal (T_WaterFlow_01_Foam_Tiled +
++    # _N; the parameter names "Foam Texture Blend Min/Width", "Foam
++    # MacroScale", "FoamContrast" are the knobs on that product), and the
++    # community guides do the same with "multiple foam textures at different
++    # scales". This project ships no foam texture and its water is generated,
++    # so the texture is a procedural one: a slowly drifting 3-level turbulent
++    # gradient noise at ~0.6 m features, applied as a MULTIPLIER to the shore,
++    # shallow and disturbance foam. Not to the whitecaps (they carry their own
++    # coverage product) and not to the ocean (untouched this pass).
++    #
++    # DARK BY DEFAULT. FoamBreakupGain 0 makes `breakup` lerp(1, n, 0) == 1
++    # exactly, so every multiply below is a multiply by 1.0 and the OFF arm is
++    # bit-identical to a graph without the term. The owner judges the ON arm
++    # from -VoxelWaterMatScalar=FoamBreakupGain:1 frames before any default
++    # moves. Cost: one Noise evaluation per water pixel (~100 instructions at
++    # 3 levels), unmeasured; image before timing.
++    #
++    # THE DRIFT REUSES THE ONE Time NODE (`ripple_time`), because the regen
++    # gate at the bottom of this file counts MaterialExpressionTime nodes and
++    # refuses a second one -- and because under VOXEL_WATER_FREEZE_TIME that
++    # node is a constant, which is exactly what a frozen-arm capture wants.
++    breakup_gain = scalar_param("FoamBreakupGain", 0.0, -1300, 420)
++    breakup_scale = scalar_param("FoamBreakupScaleM", 0.6, -1300, 480)   # feature size, metres
++    breakup_drift = scalar_param("FoamBreakupDriftMPS", 0.15, -1300, 540)  # metres per second
++    # Position = world UU + time * drift, as a float3. 100 UU per metre.
++    drift_uu = bathy_b.mul(bathy_b.mul(ripple_time, breakup_drift), bathy_b.const(100.0))
++    drift_xy = bathy_b.append(drift_uu, "", bathy_b.mul(drift_uu, bathy_b.const(0.37)), "")
++    drift_xyz = bathy_b.append(drift_xy, "", bathy_b.const(0.0), "")
++    breakup_pos = bathy_b.add(world_pos_abs, drift_xyz)
++    # The Noise node's Scale is a baked float, not an input, so the metres
++    # knob is applied to the POSITION instead: position / (ScaleM * 100)
++    # gives one noise period per ScaleM metres at Scale 1.0.
++    breakup_pos = bathy_b.div(breakup_pos, bathy_b.mul(breakup_scale, bathy_b.const(100.0)))
++    breakup_noise = bathy_b.node(unreal.MaterialExpressionNoise)
++    breakup_noise.set_editor_property("noise_function", _nf)
++    breakup_noise.set_editor_property("scale", 1.0)
++    breakup_noise.set_editor_property("levels", 3)
++    breakup_noise.set_editor_property("output_min", 0.0)
++    breakup_noise.set_editor_property("output_max", 1.0)
++    breakup_noise.set_editor_property("turbulence", True)
++    bathy_b.link(breakup_pos, "", breakup_noise, "World Position")
++    # Contrast: turbulence noise sits mostly in 0.2-0.6; stretch it so the
++    # multiplier has real holes and real full-strength streaks.
++    breakup_contrast = scalar_param("FoamBreakupContrast", 2.2, -1300, 600)
++    breakup_shaped = bathy_b.saturate(
++        bathy_b.mul(bathy_b.sub(breakup_noise, bathy_b.const(0.25)), breakup_contrast))
++    breakup = bathy_b.lerp(bathy_b.const(1.0), "", breakup_shaped, "", breakup_gain)
++    shore_foam = bathy_b.mul(shore_foam, breakup)
++
++    # --- SHALLOW FOAM: DEPTH-DRIVEN, THE WAY EVERYONE ELSE DRIVES IT --------
++    #
++    # The shore band above is keyed on DISTANCE to the waterline. Epic's
++    # Water_Material keys its shore foam on DEPTH ("Depth for DF Foam", "Foam
++    # Depth Min", "Foam Distance", WaterOpacityMaskFromDepth), the Unity/UE
++    # community guides key it on SceneDepth - PixelDepth, and the physics
++    # agrees: surf whitens where the water is SHALLOW, which on a 1:40 shelf
++    # is a wide apron and on a cliff-edged pool is nothing. The distance band
++    # cannot tell those two shores apart -- and the 2026-09-07 record says
++    # exactly that ("a one-texel ribbon on any shore steeper than about
++    # 1:20"). So: a second term on the baked depth, max()ed into the same
++    # shore foam so it rides the same emissive route, the same gain ladder
++    # and the same off arms.
++    #
++    # DARK BY DEFAULT (ShallowFoamGain 0 -> shallow_foam == 0 exactly ->
++    # max(shore_foam, 0) == shore_foam bit for bit, since shore_foam >= 0).
++    # Ladder via -VoxelWaterMatScalar=ShallowFoamGain:<g>,ShallowFoamDepthM:<d>.
++    shallow_depth = scalar_param("ShallowFoamDepthM", 0.6, -1300, 660)
++    shallow_gain = scalar_param("ShallowFoamGain", 0.0, -1300, 720)
++    shallow_band = bathy_b.one_minus(
++        bathy_b.ramp(bathy["depth_m"], "", bathy_b.const(0.0), shallow_depth))
++    # Same land-side sign test as the shore band (x8: a 12.5 cm cutoff).
++    shallow_band = bathy_b.mul(
++        shallow_band, bathy_b.saturate(bathy_b.mul(bathy["shore_m"], bathy_b.const(8.0))))
++    shallow_foam = bathy_b.mul(bathy_b.mul(bathy_b.mul(shallow_band, shallow_gain),
++                                           bathy["validity"]), breakup)
++    shore_foam = bathy_b.maximum(shore_foam, shallow_foam)
++
+     # MAX, not add: the signals describe the same physical thing from different
+     # directions, and a steep, active front should be fully foamed rather than
+     # 1.6x foamed and clipped -- clipping would flatten the distinction between
+@@ -1951,6 +2042,10 @@ def main():
+         # taps, so foam and displacement are one channel on one knob.
+         disturbance_foam = build_disturbance_foam(
+             bathy_b, ripple_grad_gated, ripple_height_gated)
++        # ...times the foam breakup built with the shore band above (a
++        # multiply by exactly 1.0 at FoamBreakupGain 0), so the wake's white
++        # is streaked like the shore's rather than a second, smoother paint.
++        disturbance_foam["foam"] = bathy_b.mul(disturbance_foam["foam"], breakup)
+ 
+     # SIGNAL 5 (Phase F2, 2026-09-05): WIND-DRIVEN WHITECAPS, the fifth
+     # direction on the same physical thing, maxed in like the other four.
+diff --git a/ue-project/Tools/ripple_field_graph.py b/ue-project/Tools/ripple_field_graph.py
+index b04cec2..80dff30 100644
+--- a/ue-project/Tools/ripple_field_graph.py
++++ b/ue-project/Tools/ripple_field_graph.py
+@@ -321,19 +321,59 @@ def sample_ripple_field(b):
+ # by the field itself, so a moving boat trails a white wedge, rings read as
+ # white circles, and a splash flashes white and fades with the field's own
+ # decay -- no new state, no new timing, the sim already animates it.
++#
++# THE RESPONSE HAS A THRESHOLD, AND THE 2026-09-07 GREY-BLOB VERDICT IS WHY.
++#
++# The first shipped form was saturate((|grad| + |h| * 4) * 8): a straight line
++# through the origin. Any texel above raw 0.125 -- 3 cm of ripple, or a slope
++# of 1 in 8 -- pinned to FULL foam, and there was no value the field could hold
++# that read as "barely disturbed". The boat leg that produced VoxelVerify00974
++# logged its wake at max |grad| 0.19 and max |h| 0.044 m (`field verified LIVE
++# -- centre patch max field value 0.1919, max state height 0.0436 m`), i.e.
++# raw 0.36 at the hull, 2.9x past saturation before the gain had even done its
++# work; and the sim's spread-out remainder -- millimetres of height across the
++# whole 51 m window after eight seconds under way -- was ALSO past saturation.
++# The owner's "hard grey blob ... a grey plane covering almost the entire
++# world map" is that: a window-shaped mask of every texel the field had ever
++# touched, cut off by the window's own 3.3 m edge fade. Whitewater is not a
++# mask of "has the water moved"; it sits on the steep crests and nowhere else.
++#
++# So the response is now
++#
++#     x    = |grad| + |height_m| * HeightWeight
++#     foam = saturate((x - Threshold) * Gain * Enabled)
++#
++# which is the same family the wind whitecaps already use (water_wave_graph.
++# build_whitecap_foam: saturate((|gradient| - SlopeThresh) / (SlopeFull -
++# SlopeThresh))): a dead band below Threshold, a linear knee above it. Texels
++# the field has merely touched sit in the dead band and draw NOTHING, so the
++# window edge is invisible by construction on undisturbed water -- the fade
++# no longer has to hide anything and its width (FADE_START/FADE_END) is left
++# alone, since widening it would also soften the ripple NORMAL for no reason.
++#
++# ALL FOUR NUMBERS ARE ScalarParameters, so the whole ladder runs on
++# -VoxelWaterMatScalar=Name:Value[,Name:Value] against ONE regenerated asset
++# (sheet material only -- the ocean takes the baked defaults). Read the
++# sheet's "material scalar '<Name>' set to" echo for EVERY pair; a missing
++# echo is a void arm, not a null (the 2026-09-07 06:00 first-pair-only trap).
+ DISTURBANCE_FOAM_DEFAULTS = {
+-    # saturate((|grad| + |height_m| * HeightWeight) * Gain * Enabled).
+-    # THE GAIN DEFAULT IS DERIVED, NOT GUESSED: the debug frames measured the
+-    # field's wake values at ~0.06-0.3 (gradient units, RippleFieldGain in the
+-    # loop). 8.0 puts the wedge's faint tail (0.06) at 0.48 foam and anything
+-    # over 0.125 at FULL white -- deliberately vivid, per the owner's brief
+-    # ("he wants to SEE it"); he dials it live via the MID probe
+-    # (-VoxelWaterMatScalar=DisturbanceFoamGain:<v>).
+-    "DisturbanceFoamGain": 8.0,
+-    # Metres of ripple height that count like slope 1.0 (1/0.25 m). Baked, not
+-    # a parameter: the gain above is the one knob, and gradient is the
+-    # dominant term for a wake anyway (a wake is steep before it is tall).
+-    "DisturbanceFoamHeightWeight": 4.0,
++    # Slope of the knee above the threshold: foam reaches 1.0 at
++    # Threshold + 1/Gain. PROVISIONAL until the 2026-09-07 ladder in
++    # docs/water-ocean-tides-plan-2026-09-04.md lands its verdict rows; the
++    # value here is the arithmetic starting point (hull crest 0.19-0.36 raw
++    # should be full white, a 0.08 tail should be about a third).
++    "DisturbanceFoamGain": 6.0,
++    # Metres of ripple height that count like slope 1.0. Was 4.0 (a baked
++    # constant); now a parameter, and 1.0 -- a wake is steep before it is
++    # tall (the hull's 0.044 m is 0.044 of slope-equivalent against a
++    # gradient of 0.19), so the gradient is the driver and the height is a
++    # tie-breaker for a tall slow swell the gradient under-reads.
++    "DisturbanceFoamHeightWeight": 1.0,
++    # The dead band. Nothing below this raw value draws any foam at all.
++    # 0.05 is a 1-in-20 slope or 5 cm of ripple with HeightWeight 1: above
++    # the spread remainder of a wake (millimetres, slopes of ~0.01) and well
++    # below its crests. PROVISIONAL, same ladder.
++    "DisturbanceFoamThreshold": 0.05,
+     # The arm's off switch, FoamV2Enabled-style: a pixel-identical off for
+     # A/Bs without a regeneration. The real inert default is upstream --
+     # RippleFieldGain 0 on an undriven collection zeroes the taps themselves.
+@@ -353,22 +393,26 @@ def build_disturbance_foam(b, grad_xy, height_m, defaults=None):
+     the C++ sim's, so a frozen-arm capture shows the wake foam still moving
+     -- the arm freezes the material's own animation, which this is not.
+ 
+-    Returns {"foam": expr} -- max() it into the existing foam composite (the
+-    lake's signal stack, the ocean's chain), per the standing max-not-add
+-    doctrine there: disturbed water breaking over an already-foamy crest is
+-    one patch of white, not two whites summed past 1. Riding the composite
+-    also buys the full foam contract for free: colour, opacity AND roughness
+-    move together, which is what makes the wedge read as whitewater rather
+-    than as paint.
++    Returns {"foam": expr, "raw": expr} -- max() `foam` into the existing foam
++    composite (the lake's signal stack, the ocean's chain), per the standing
++    max-not-add doctrine there: disturbed water breaking over an already-foamy
++    crest is one patch of white, not two whites summed past 1. Riding the
++    composite also buys the full foam contract for free: colour, opacity AND
++    roughness move together, which is what makes the wedge read as whitewater
++    rather than as paint. `raw` is the pre-threshold x, exposed for
++    instruments only; nothing shipping reads it.
+     """
+     d = dict(DISTURBANCE_FOAM_DEFAULTS)
+     if defaults:
+         d.update(defaults)
+     g2 = b.binary(unreal.MaterialExpressionDotProduct, grad_xy, "", grad_xy, "")
+     gmag = b.unary(unreal.MaterialExpressionSquareRoot, g2)
+-    hterm = b.mul(b.abs_(height_m), b.const(d["DisturbanceFoamHeightWeight"]))
++    height_weight = b.scalar("DisturbanceFoamHeightWeight", d["DisturbanceFoamHeightWeight"])
++    hterm = b.mul(b.abs_(height_m), height_weight)
+     raw = b.add(gmag, hterm)
++    threshold = b.scalar("DisturbanceFoamThreshold", d["DisturbanceFoamThreshold"])
+     gain = b.scalar("DisturbanceFoamGain", d["DisturbanceFoamGain"])
+     enabled = b.scalar("DisturbanceFoamEnabled", d["DisturbanceFoamEnabled"])
+-    foam = b.saturate(b.mul(b.mul(raw, gain), enabled))
+-    return {"foam": foam}
++    knee = b.sub(raw, threshold)
++    foam = b.saturate(b.mul(b.mul(knee, gain), enabled))
++    return {"foam": foam, "raw": raw}

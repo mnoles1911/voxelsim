@@ -391,4 +391,15 @@ bool IsWorldHeldForMenu(const UWorld* World)
 	}
 	return !Terrain->HasWorldSessionSettled();
 }
+
+bool MenuTickGatesEnabled()
+{
+	static const bool bLatched = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelMenuTickGates="), Value);
+		return FMath::Clamp(Value, 0, 1) != 0;
+	}();
+	return bLatched;
+}
 } // namespace VoxelFrontEnd

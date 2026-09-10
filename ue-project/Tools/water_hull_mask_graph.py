@@ -197,3 +197,117 @@ def build_hull_mask(b, defaults=None):
         "keep": cull,
         "cull_node": cull,
     }
+
+# =============================================================================
+# THE HULL RIPPLE MASK -- the SECOND half of "the inside of the boat is dry"
+# (owner, live 2026-09-08: "there is water and wake, surface effects inside
+# the canoe. the inside of the boat should be dry and not affected").
+# =============================================================================
+#
+# WHAT THE STENCIL MASK ABOVE CANNOT DO. build_hull_mask culls water pixels
+# that lie BEHIND the exclusion lid, and the lid stands voxel.Boat.HullMaskLidUU
+# (6 UU) above the AMBIENT drawn surface -- the wave mirror's height, which is
+# the only height the C++ side can place a station against. The ripple field's
+# height is ADDED to that surface as World Position Offset (both waters:
+# `ripple_height_gated` summed into the wave height before WPO), so a wake
+# crest inside the cockpit lifts the sheet ABOVE the lid; those pixels are now
+# in FRONT of the lid, fail the `behind > 0` test, survive the cull, and the
+# disturbance foam (built from the same ripple taps) paints them white. That is
+# exactly the picture the owner reported, and no lid height fixes it in both
+# directions (the comment at AVoxelBoat::UpdateWaterExclusion says why).
+#
+# THE MECHANISM: an analytic ellipse in WORLD XY, the hull's plan footprint,
+# published by the boat through MPC_VoxelSky every tick. Inside it the ripple
+# WPO half is multiplied to zero and so is the disturbance foam, so the sheet
+# inside the cockpit sits on the ambient surface again -- back under the lid,
+# where the stencil mask handles it as it did before the wake existed. The
+# ripple GRADIENT (the normal tilt) is deliberately left alone: it moves no
+# geometry and the lid covers it, and the wedge should still shade right up to
+# the planking outside. The shore foam, the whitecaps and the CustomDepth mask
+# are untouched.
+#
+# WHY AN MPC AND NOT A PER-MATERIAL PARAMETER. The ocean draws its sections
+# with the BASE material (AVoxelOceanActor: SetMaterial(0, OceanMaterial), no
+# MID), the implicit near-field lakes likewise (VoxelWaterSubsystem's two
+# SetMaterial sites), and the far-field sheet only grows a MID under a
+# diagnostic switch. A vector parameter on the material would need a MID
+# minted on every one of those paths and a push to each; the MPC reaches all
+# of them with one UKismetMaterialLibrary::SetVectorParameterValue per
+# parameter per tick, which is the argument create_sky_material.py makes for
+# the sun vector and the one the ripple window's own origin already rides on.
+#
+# ENCODING (two float4 vectors on MPC_VoxelSky, create_sky_material.py):
+#   HullEllipseA = (centreX UU, centreY UU, cos(yaw), sin(yaw))
+#   HullEllipseB = (half-length UU, half-beam UU, enabled 0/1, edge band UU)
+# Defaults enabled = 0, so a world with no boat multiplies by exactly 1.0.
+#
+# THE OFF ARM is voxel.Boat.HullRippleMask 0 (the boat pushes enabled 0) and is
+# pixel-identical to the mask never having existed; the A/B for "is the cockpit
+# dry because of THIS" is that switch against the same pose.
+
+HULL_ELLIPSE_A = "HullEllipseA"
+HULL_ELLIPSE_B = "HullEllipseB"
+
+HULL_RIPPLE_MASK_CODE = """
+// keep-mask: 0 inside the boat's plan ellipse, 1 outside, a soft edge of
+// EllB.w UU (measured along the minor axis) on the boundary. World-XY
+// analytic, published per tick by AVoxelBoat::PushHullRippleMask through
+// MPC_VoxelSky (see water_hull_mask_graph.py). Multiplies the ripple WPO and
+// the disturbance foam only.
+float2 d = WorldXY - EllA.xy;
+float halfLen = max(EllB.x, 1.0);
+float halfBeam = max(EllB.y, 1.0);
+float u = dot(d, EllA.zw) / halfLen;
+float v = dot(d, float2(-EllA.w, EllA.z)) / halfBeam;
+float r = sqrt(u * u + v * v);
+float inside = 1.0 - saturate((r - 1.0) * halfBeam / max(EllB.w, 1.0));
+return 1.0 - inside * saturate(EllB.z);
+"""
+
+
+def build_hull_ripple_mask(b):
+    """The ripple/foam keep-mask for the hull's plan ellipse. Returns a dict.
+
+    `b` must be a SkyGraphBuilder (sky_star_graph.py): the two vectors are MPC
+    bindings and the binding is name-checked, for the reason ripple_field_graph
+    spells out at MPC_ORIGIN (an unresolved CollectionParameter compiles to a
+    CONSTANT, and a constant ellipse would silently mask one fixed patch of
+    lake forever).
+
+    Returns keys:
+      keep       float, 1 everywhere with no boat (enabled defaults to 0) --
+                 MULTIPLY into the ripple WPO height and the disturbance foam.
+      mask_node  the Custom node, for read-back checks.
+    """
+    ell_a = b.collection_param(HULL_ELLIPSE_A)
+    ell_b = b.collection_param(HULL_ELLIPSE_B)
+
+    # No-offsets world position, for the same reason sample_ripple_field gives:
+    # this value gates a World Position Offset term, and a position that
+    # already carried this material's WPO would feed the term its own output.
+    world_pos = b.node(unreal.MaterialExpressionWorldPosition)
+    world_pos.set_editor_property(
+        "world_position_shader_offset",
+        unreal.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS)
+    world_xy = b.mask(world_pos, "", r=True, g=True)
+
+    mask = b.node(unreal.MaterialExpressionCustom)
+    mask.set_editor_property("description", "HullRippleMask")
+    mask.set_editor_property("code", HULL_RIPPLE_MASK_CODE)
+    mask.set_editor_property("output_type",
+                             unreal.CustomMaterialOutputType.CMOT_FLOAT1)
+    ins = []
+    for nm in ("WorldXY", "EllA", "EllB"):
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", nm)
+        ins.append(ci)
+    mask.set_editor_property("inputs", ins)
+    b.link(world_xy, "", mask, "WorldXY")
+    b.link(ell_a, "", mask, "EllA")
+    b.link(ell_b, "", mask, "EllB")
+
+    return {
+        "keep": mask,
+        "mask_node": mask,
+    }
+

@@ -150,6 +150,21 @@ struct FDist
 FDist FillWindow, FillTotal;
 FDist ParkWindow, ParkTotal;      // SETTLED, anchor speed below the threshold
 FDist MoveWindow, MoveTotal;      // SETTLED, anchor speed at or above it -- THE GATE
+// THE FOURTH SEGMENT, HOOK 0's own. Fed from the front end's Menu-state tick,
+// which runs before FILL/PARKED/MOVING can exist at all (HOOK 1 never fires
+// pre-NEW-GAME) -- so this is not a fourth slice of the same population, it is
+// the only population a menu-only leg can ever have. No gate: GOAL 3 is a
+// gameplay statement and the menu makes no >100 FPS claim.
+FDist MenuWindow, MenuTotal;
+// THE FIFTH SEGMENT, HOOK 0b's own, and the only row in this file that is not
+// a FRAME time: it is the interval between two paints of the loading curtain.
+// Kept in the same FDist so the quantiles, the hitch/stutter counts and the
+// reading rules are the ones everybody here already knows -- but read the
+// header before comparing it with any other row. Under
+// -VoxelLoadingScreenThread=1 the painter may be the Slate loading thread
+// while seg=FILL's frames are seconds long, and those two rows describing the
+// same wall-clock second is the intended result, not a contradiction.
+FDist LoadWindow, LoadTotal;
 bool bSettled = false;
 double SettleSeconds = -1.0;
 int64 SelfCheckFailures = 0;      // hitches > n, ever. See EmitDist.
@@ -438,8 +453,20 @@ void Flush(double Now)
 		EmitDist(TEXT("FILL"),           TEXT("total"),  FillTotal,  false);
 		EmitDist(TEXT("SETTLED-PARKED"), TEXT("total"),  ParkTotal,  false);
 		EmitDist(TEXT("SETTLED-MOVING"), TEXT("total"),  MoveTotal,  true);
+		// MENU, appended rather than interleaved so every row above is
+		// byte-identical to before this segment existed. No gate (bGate=false):
+		// GOAL 3 is a settled-moving gameplay statement and does not apply here.
+		EmitDist(TEXT("MENU"),           TEXT("window"), MenuWindow, false);
+		EmitDist(TEXT("MENU"),           TEXT("total"),  MenuTotal,  false);
+		// LOADING, appended after MENU for the same reason MENU was appended
+		// after the first three: every row above stays byte-identical to what
+		// it printed before this segment existed. No gate -- GOAL 3 is a
+		// settled-moving gameplay statement, and this row is not even a frame
+		// time. Its own gate is the Phase 4 one, stated in the header.
+		EmitDist(TEXT("LOADING"),        TEXT("window"), LoadWindow, false);
+		EmitDist(TEXT("LOADING"),        TEXT("total"),  LoadTotal,  false);
 
-		FillWindow = ParkWindow = MoveWindow = FDist{};
+		FillWindow = ParkWindow = MoveWindow = MenuWindow = LoadWindow = FDist{};
 	}
 
 	if (Mode() & kModeReconcile)
@@ -591,6 +618,72 @@ void NoteFrameImpl(double VoxelTickMs, int32 AppliesThisFrame, double AnchorSpee
 	if (FrameMs - VoxelTickMs - FMath::Max(0.0, GameMs - VoxelTickMs) - GameWaitMs < -1.0)
 	{
 		++NegativeResidualFrames;
+	}
+
+	if (Now - LastLogSeconds >= 5.0)
+	{
+		Flush(Now);
+	}
+}
+
+void NoteMenuFrameImpl(double FrameMs)
+{
+	const double Now = FPlatformTime::Seconds();
+
+	// SAME FIRST-CALL SHAPE AS NoteFrameImpl, AND FOR THE SAME REASON: the
+	// menu is (almost always) the very first caller into this file for the
+	// whole process, so LastLogSeconds is still its zero-init default here.
+	// Without this guard the first-ever call would see Now - 0.0 as a huge
+	// elapsed time and flush an instant, one-frame "5 s" window. Seed the
+	// clock only; record nothing.
+	if (LastLogSeconds <= 0.0)
+	{
+		LastLogSeconds = Now;
+		return;
+	}
+
+	// THE DISTRIBUTION ONLY -- there is no reconciliation counterpart for the
+	// menu. kModeReconcile reads GRenderThreadTime/GGameThreadTime, which are
+	// FViewport::Draw globals with no defined relationship to a Slate-only
+	// frame that never calls FViewport::Draw for a game view; extending that
+	// half of the file to the menu would be inventing a second, unverified
+	// instrument rather than reusing this one, and Task 1's ask is the
+	// distribution row only ("seg=MENU in the Voxel frame dist... lines").
+	if (Mode() & kModeDistribution)
+	{
+		MenuWindow.Add(FrameMs, 0.0); // no anchor on the menu; speed fields read 0, unused (bGate=false)
+		MenuTotal.Add(FrameMs, 0.0);
+	}
+
+	if (Now - LastLogSeconds >= 5.0)
+	{
+		Flush(Now);
+	}
+}
+
+void NoteLoadingFrameImpl(double PaintIntervalMs)
+{
+	const double Now = FPlatformTime::Seconds();
+
+	// SAME FIRST-CALL SHAPE AS THE OTHER TWO HOOKS. On a run with no main menu
+	// (-VoxelNoMenu, or a suppressed front end that still raises a curtain) this
+	// is the first caller into the file and LastLogSeconds is still zero, which
+	// would flush an instant one-sample "5 s" window.
+	if (LastLogSeconds <= 0.0)
+	{
+		LastLogSeconds = Now;
+		return;
+	}
+
+	// THE DISTRIBUTION ONLY, for the same reason the menu hook gives: the
+	// reconciliation half reads GRenderThreadTime/GGameThreadTime, which are
+	// FViewport::Draw globals describing a game frame. There is no honest way
+	// to attribute a Slate-loading-thread paint interval to them, and inventing
+	// one would be a second, unverified instrument rather than a reuse of this.
+	if (Mode() & kModeDistribution)
+	{
+		LoadWindow.Add(PaintIntervalMs, 0.0); // no anchor behind a curtain; speed fields unused (bGate=false)
+		LoadTotal.Add(PaintIntervalMs, 0.0);
 	}
 
 	if (Now - LastLogSeconds >= 5.0)

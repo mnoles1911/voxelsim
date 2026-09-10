@@ -548,6 +548,34 @@ namespace VoxelSky
 	// world classify as desert. One table, one definition, one answer.
 	VOXELEARTH_API void MonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay);
 
+	// FVoxelSkyState::DayOfYear (0..365) + the observer's latitude -> which of the
+	// four seasons: 0 spring, 1 summer, 2 autumn, 3 winter. An index rather than a
+	// string because the two callers want it in different registers -- the F1
+	// overlay prints "summer" mid-sentence, the journal and death stamps print
+	// "Summer" -- and a shared string would force one of them to re-case text it
+	// does not own.
+	//
+	// EXPORTED FOR THE SAME REASON MonthDayFromDayOfYear ABOVE IS. The BOUNDARIES
+	// are the thing that must not be copied: they are the solar declination's own
+	// extremes and zero crossings in the ephemeris's reference year 2000 (79, 172,
+	// 265, 355), and a second table drifting from this one would name a season the
+	// sun in the frame disagrees with. Display names are per-caller; boundaries
+	// are here, once.
+	//
+	// THE 365-DAY YEAR IS NOT AN ASSUMPTION, and the note this replaces in
+	// VoxelUIStrings.h said it was. DayOfYear is frac(Epoch / (DayLength x
+	// DaysPerYear)) x 365.2425 -- an ASTRONOMICAL index that always spans 0..365
+	// whatever voxel.Sky.DaysPerYear is (see DayOfYearFromEpoch). DaysPerYear sets
+	// how FAST it advances, never its range, so these boundaries are correct at 48
+	// days per year exactly as they are at 365.
+	//
+	// THE SOUTHERN HEMISPHERE IS INVERTED, and that is not hypothetical:
+	// FVoxelSkyState::LatitudeDeg is resolved from the player's position every
+	// tick, so a long enough southward flight legitimately crosses the equator.
+	// Latitude exactly 0 falls to the northern naming; the equator has no seasons
+	// to get wrong.
+	VOXELEARTH_API int32 SeasonIndexFromDayOfYear(int32 DayOfYear, double LatitudeDeg);
+
 	VOXELEARTH_API double GetOriginLatitudeDeg();
 	VOXELEARTH_API double GetOriginLongitudeDeg();
 	VOXELEARTH_API bool IsMoonEnabled();

@@ -54,7 +54,7 @@ void UVoxelSurvivalUISubsystem::Tick(float)
 	PC->PushInputComponent(Input);
 	Hotbar = SVoxelSurvivalPanel::MakeHotbar(Controller);
 	// The passive hotbar never catches mouse input over the world.
-	Hotbar->SetVisibility(EVisibility::HitTestInvisible);
+	Hotbar->SetVisibility(HotbarVisibility());
 	GetWorld()->GetGameViewport()->AddViewportWidgetContent(Hotbar.ToSharedRef(), 15);
 }
 
@@ -91,7 +91,22 @@ void UVoxelSurvivalUISubsystem::CloseInventory()
 		Controller->bShowMouseCursor = bSavedCursor;
 		Controller->SetInputMode(FInputModeGameOnly());
 	}
-	if (Hotbar) Hotbar->SetVisibility(EVisibility::HitTestInvisible);
+	if (Hotbar) Hotbar->SetVisibility(HotbarVisibility());
+}
+
+EVisibility UVoxelSurvivalUISubsystem::HotbarVisibility() const
+{
+	return bHiddenForOverlay ? EVisibility::Collapsed : EVisibility::HitTestInvisible;
+}
+
+void UVoxelSurvivalUISubsystem::SetHiddenForOverlay(bool bHidden)
+{
+	if (bHiddenForOverlay == bHidden) return;
+	bHiddenForOverlay = bHidden;
+	// An inventory open when the pause menu arrives would sit UNDER it holding
+	// its own UI input mode, and the two would fight over the cursor on resume.
+	if (bHidden) CloseInventory();
+	if (Hotbar) Hotbar->SetVisibility(HotbarVisibility());
 }
 
 void UVoxelSurvivalUISubsystem::Detach()
